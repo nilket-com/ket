@@ -857,6 +857,124 @@ along with the forward-sequence rewrite.
   existing SELECT query corpus byte-identical pre/post-
   ADR-029. The nine-phase migration is materialized in
   `plans/impl/029_create_table_ddl.md`.
+- **ADR 030 — SQL `INSERT INTO ... VALUES (...)`
+  (Literal-Only DML Surface).** Promoted. **First DML
+  ADR in Toron** — paired companion to ADR 029, lifting
+  D14: `CREATE TABLE; INSERT; SELECT` becomes testable
+  end-to-end. Accepted SQL is narrow:
+  `INSERT INTO [schema.]table [(col, ...)] VALUES (literal, ...), ...`
+  with no `INSERT ... SELECT`, no `RETURNING`, no
+  `ON CONFLICT`, no defaults, no distributed execution.
+  Sixteen decisions D1-D16. **D5 critical decision:**
+  new `StorageWrite` trait beside `StorageScan` —
+  `Catalog` stays metadata-only (D6 + D14); data-plane
+  writes do NOT extend `Catalog`. **D4 critical
+  decision:** `ExecutionPlan::Insert` carries
+  `Vec<Vec<ScalarValue>>`, NOT `RecordBatch` —
+  preserves serde derivation; coordinator write helper
+  materializes the Arrow batch from `(schema, rows)`
+  immediately before `StorageWrite::write`. **D7
+  critical decision:** Wendelon synthetic columns stay
+  server-owned — Toron MUST NOT construct the five
+  `__row_*__` columns and MUST NOT import `blake3`;
+  architecture guards source-check
+  `coordinator/write.rs` for absence of `STORAGE_ROW_*`
+  references and `crates/toron/Cargo.toml` for absence
+  of `blake3` declaration. **D8 critical decision:**
+  `WendelonStorageWrite` uses the high-level
+  `wendelon_client::Client::table_write(tenant_id, descriptor, payload, options)`
+  wrapper, NOT the low-level
+  `wendelon::client::WendelonClient::table_write(TableWriteRequest)`
+  — the wrapper handles `parent_write_id`,
+  `client_hlc`, `expected_epoch`, `schema_generation`,
+  row-count encoding, etc.; architecture guard asserts
+  no `TableWriteRequest {` construction in
+  `crates/toron/src/`. **D9 critical decision:**
+  `WriteOptions { await_finalization: true, ..Default::default() }`
+  overrides the wrapper default — SQL `INSERT` returns
+  only after Wendelon commit confirmation so the user-
+  evidence payoff fixture has read-after-write
+  semantics. **D11 critical decision:**
+  `InMemoryTableStorage` is additive
+  (`Mutex<HashMap<TableId, InMemoryTableData>>` —
+  multi-table); existing `InMemoryStorageScan`
+  untouched. **D12 critical decision:** local
+  `QueryCoordinator` intercepts INSERT **BEFORE** the
+  SELECT descriptor-evolution retry loop — INSERT does
+  NOT retry on descriptor evolution in v1. **D13
+  critical decision:** distributed INSERT returns a
+  stable unsupported diagnostic **BEFORE**
+  `fragment_plan` — mirrors ADR 029's
+  `WendelonCatalog::create_table → AdminUnavailable`
+  pattern. **D15 critical decision:**
+  `TABLE_WRITE_MAX_ROWS = 65_536` bind-time row cap,
+  matching Wendelon's constant. **D16 critical
+  decision:** materialization in new
+  `coordinator/write.rs` private submodule —
+  coordinator write routing already has the
+  `ExecutionContext` needed to build `WriteRequest`;
+  storage stays shape-neutral. **`InsertLiteral` IR carrier**
+  (`Null` / `Boolean(bool)` / `Int64(i64)` / `UInt64(u64)` /
+  `Float64(f64)` / `Utf8(String)`) — does NOT reuse
+  `Expr` for VALUES (parallel anti-delegation
+  discipline to ADR 029 D11). DML-specific
+  `lower_insert` / `lower_insert_target_name` /
+  `lower_insert_literal` helpers — do NOT delegate to
+  SELECT-side lowering. Binder owns target-schema-aware
+  coercion via `coerce_insert_literal` over ADR 029's
+  six-type lattice; typed-NULL fill for omitted
+  nullable columns; reject omitted NOT NULL; row cap +
+  empty-VALUES rejects. Four iterations with **one
+  substantive flip-flop** (Codex iter-1 self-correction:
+  `RecordBatch` → `Vec<Vec<ScalarValue>>` in
+  `ExecutionPlan::Insert` to preserve serde derivation)
+  and **two iter-2 retractions from Claude** (C1
+  wrapper crate path — iter-1 read the low-level
+  `WendelonClient` source rather than the
+  `wendelon-client` wrapper Toron actually imports; C4
+  `From<wendelon_client::ClientError> for StorageError`
+  already exists at `error.rs:48`). Narrowest flip-flop
+  profile post-ADR-029. **Fifth consecutive cycle of
+  Gemini iter-1/2 retraction streak** (ADR 025 / 026 /
+  028 / 029 / 030) — Gemini iter-3 explicitly retracted
+  its iter-2 D5 (`Catalog::insert_rows`), D6 (Toron-
+  side `__row_*__` construction), and D7 (BLAKE3 row
+  identity derivation). **Second consecutive pre-
+  existing-Wendelon-types cycle** (after ADR 029).
+  **New cycle property recorded** — cross-ring ADRs
+  need **two-pass Wendelon-side verification**: at
+  least one iteration surface-reading the relevant
+  API + at least one peer iter to catch wrong-file or
+  wrong-import errors (ADR 029: iter-3 surfaced
+  `PhysicalDescriptorFingerprint::from_bytes` is
+  crate-private; ADR 030: Claude iter-2 retracted C1/C4
+  wrong-source-file). Twelfth instance of the ADR 015
+  cycle. Three-way council convergence reached across
+  four iterations. Twelve new ADR 030 architecture
+  guards + two adjusted ADR 029 guards (statement
+  catch-all widens to `"only SELECT, CREATE TABLE, and
+  INSERT are supported"`; variant counts 10→11 / 8→9).
+  SoA-readiness invariants preserved.
+  `WendelonStorageWrite` error mapping mirrors
+  `WendelonStorageScan` (TableNotFound for missing
+  descriptor, DescriptorEvolved for identity mismatch,
+  Internal for Arrow/schema failure). Distributed
+  INSERT explicitly unsupported in v1 (D13); future
+  cross-ring distributed-write-context ADR lifts.
+  Read-your-writes session HLC advancement deferred
+  (D12 + Codex iter-3 residual Q3); `WriteOutcome`
+  discards `commit_hlc`. Per-statement durability
+  override deferred (uses wrapper default
+  `DurabilityClass::QUORUM`). No new IR expression
+  variant; no new aggregate kernel; no fragmenter
+  detector change for SELECT paths; no PBC opcode
+  change; no cross-ring metadata-write engagement; no
+  Toron-side Wendelon row-identity construction; no
+  `blake3` dependency; no `RecordBatch` inside any
+  `ExecutionPlan` variant. Existing SELECT corpus plan
+  digests byte-identical pre/post-ADR-030. The ten-
+  phase migration is materialized in
+  `plans/impl/030_insert_into_values.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -924,7 +1042,307 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 029 promoted; ADR 030 candidates
+### ADR 030 promoted; ADR 031 candidates
+
+ADR 030 selected and promoted **SQL `INSERT INTO ...
+VALUES (...)` (Literal-Only DML Surface)** — Toron's
+**first DML ADR** — the paired companion to ADR 029.
+Lifts ADR 029 D14: `CREATE TABLE; INSERT; SELECT`
+becomes testable end-to-end against `InMemoryTableStorage`
+(in-memory test path) and against Wendelon (production
+path via `wendelon_client::Client::table_write`). The
+accepted shape is narrow — literal-only `VALUES`, no
+`INSERT ... SELECT`, no `RETURNING`, no `ON CONFLICT`,
+no defaults, no distributed execution. Sixteen
+decisions D1-D16.
+
+**D5 critical decision:** new `StorageWrite` trait
+beside `StorageScan` —
+`async fn write(WriteRequest) -> Result<WriteOutcome, StorageError>`
+single-method trait; `WriteOutcome` is
+`#[non_exhaustive]` with `rows: usize` only (forward-
+compatible for future `commit_hlc`). **D6 + D14 critical
+decision:** `Catalog` stays metadata-only — data-plane
+writes do NOT extend `Catalog`; ADR 029's metadata/
+data-plane separation extends to writes.
+
+**D4 critical decision:** `ExecutionPlan::Insert`
+carries `Vec<Vec<ScalarValue>>`, NOT `RecordBatch` —
+preserves serde derivation (`ExecutionPlan` derives
+`Serialize + Deserialize` at `ir/execution.rs:24`). The
+coordinator write helper materializes the Arrow batch
+from `(schema, rows)` immediately before
+`StorageWrite::write`.
+
+**D7 critical decision:** Wendelon synthetic columns
+stay server-owned. Toron MUST NOT construct the five
+`__row_*__` columns; Toron MUST NOT import `blake3`.
+Architecture guards source-check `coordinator/write.rs`
+for absence of `STORAGE_ROW_*` references and
+`crates/toron/Cargo.toml` for absence of `blake3`
+declaration. Wendelon's `pack_admitted_record_batch_by_bucket*`
+owns row identity and synthetic column injection per
+Wendelon ADR 045.
+
+**D8 critical decision:** `WendelonStorageWrite` uses
+the high-level
+`wendelon_client::Client::table_write(tenant_id, descriptor, payload, options)`
+wrapper (`crates/wendelon/crates/wendelon-client/src/lib.rs:574`),
+NOT the low-level
+`wendelon::client::WendelonClient::table_write(TableWriteRequest)`
+(`crates/wendelon/src/client/core.rs:447`). The
+wrapper handles `parent_write_id`, `client_hlc`,
+`expected_epoch`, `schema_generation`, `child_ordinal_base`,
+`proxy_source`, row-count encoding, `proxy_hop`,
+`durability`, and `await_finalization` internally.
+Architecture guard asserts no `TableWriteRequest {`
+construction in `crates/toron/src/`.
+
+**D9 critical decision:**
+`WriteOptions { await_finalization: true, ..Default::default() }`
+overrides the wrapper default (`false`). SQL `INSERT`
+returns only after Wendelon commit confirmation — the
+user-evidence payoff fixture
+(`CREATE TABLE; INSERT; SELECT`) requires read-after-
+write semantics that `await_finalization: false`
+would race against.
+
+**D11 critical decision:** `InMemoryTableStorage` is
+additive (multi-table via
+`Mutex<HashMap<TableId, InMemoryTableData>>`); existing
+`InMemoryStorageScan` is untouched. ADR 030 does NOT
+refactor the read-side InMemory backend — the
+additive-not-consolidate discipline preserves all ADR
+029 fixtures unchanged.
+
+**D12 critical decision:** local `QueryCoordinator`
+intercepts INSERT **BEFORE** the SELECT descriptor-
+evolution retry loop. INSERT does NOT retry on
+descriptor evolution in v1; write-retry semantics
+defer to a future idempotency ADR. Default
+constructor wires a private `UnsupportedStorageWrite`
+sentinel; new `with_writer` constructor for tests +
+server wiring.
+
+**D13 critical decision:** distributed INSERT returns
+a stable unsupported diagnostic **BEFORE**
+`fragment_plan`. Mirrors ADR 029's
+`WendelonCatalog::create_table → AdminUnavailable`
+pattern. Lifts in a future cross-ring-write-context
+ADR that threads tenant / session / HLC through
+`DistributedQueryCoordinator`.
+
+**D15 critical decision:**
+`TABLE_WRITE_MAX_ROWS = 65_536` bind-time row cap,
+matching Wendelon's
+`wendelon/src/schema/table.rs:46` constant. Bind-time
+enforcement keeps in-memory and Wendelon-backed
+semantics aligned.
+
+**D16 critical decision:** materialization lives in
+`coordinator/write.rs` (new private submodule), NOT
+in `storage.rs`. Coordinator write routing already has
+the `ExecutionContext` needed to build `WriteRequest`;
+storage stays shape-neutral.
+
+**`InsertLiteral` IR carrier** (`Null` / `Boolean(bool)` /
+`Int64(i64)` / `UInt64(u64)` / `Float64(f64)` /
+`Utf8(String)`) — does NOT reuse `Expr` for VALUES
+(parallel anti-delegation discipline to ADR 029 D11).
+DML-specific `lower_insert` / `lower_insert_target_name`
+/ `lower_insert_literal` helpers — do NOT delegate to
+SELECT-side `lower_expr` or `table_ref_from_object_name`.
+Binder owns target-schema-aware coercion via
+`coerce_insert_literal` over ADR 029's six-type
+lattice; typed-NULL fill for omitted nullable columns;
+reject omitted NOT NULL; row cap + empty-VALUES
+rejects. INSERT column lists can only name fields that
+exist in the target schema, so ADR 029 D12's storage-
+synthetic-name reject at CREATE-TABLE time is the
+layered protection — ADR 030 needs no additional
+runtime reject for these names.
+
+Four iterations with **one substantive flip-flop**
+(Codex iter-1 self-correction: `RecordBatch` →
+`Vec<Vec<ScalarValue>>` in `ExecutionPlan::Insert` to
+preserve serde derivation) and **two iter-2 retractions
+from Claude** (C1 wrapper crate path — iter-1 read the
+low-level `WendelonClient` source rather than the
+`wendelon-client` wrapper Toron actually imports; C4
+`From<wendelon_client::ClientError> for StorageError`
+already exists at `error.rs:48`). The topic-concession-
+compresses-next-cycle pattern from ADR 029's D1 / D15
+sequencing made the topic question never reopen —
+narrowest flip-flop profile post-ADR-029 (4 iters with
+1 substantive flip-flop; ADR 029 had 4 iters with 0).
+
+**Fifth consecutive cycle of Gemini iter-1/2 retraction
+streak** (ADR 025 / 026 / 028 / 029 / 030): Gemini
+iter-3 explicitly retracted its iter-2 D5
+(`Catalog::insert_rows`), D6 (Toron-side `__row_*__`
+construction), and D7 (BLAKE3 row identity derivation).
+Stable cycle property recorded: Gemini's wider-scope
+iter-1/2 framings surface the alternate-design space
+the council needs to reject explicitly; useful for
+collective understanding but should not be load-bearing
+for promotion.
+
+**Second consecutive pre-existing-Wendelon-types
+cycle** (after ADR 029). **New cycle property recorded
+— two-pass Wendelon-side verification:** cross-ring
+ADRs need at least one iteration surface-reading the
+relevant API + at least one peer iter to catch wrong-
+file or wrong-import errors. ADR 029 had this with
+iter-3 surfacing
+`PhysicalDescriptorFingerprint::from_bytes` is crate-
+private. ADR 030 had this with Claude iter-2
+retracting C1 / C4 (wrong source file: looked at
+`crates/wendelon/src/client/core.rs` rather than the
+`crates/wendelon/crates/wendelon-client/` wrapper
+Toron's `Cargo.toml:25` actually imports). Future
+cross-ring ADRs should budget the wrong-import-
+discovery peer iter explicitly.
+
+Twelfth instance of the ADR 015 cycle (statement
+catch-all narrows to
+`"only SELECT, CREATE TABLE, and INSERT are supported"`).
+Twelve new ADR 030 architecture guards + two adjusted
+ADR 029 guards (statement catch-all wording + variant
+counts 10→11 / 8→9 with `Insert {` content
+assertions). SoA-readiness invariants preserved.
+`WendelonStorageWrite` error mapping mirrors
+`WendelonStorageScan` (TableNotFound for missing
+descriptor, DescriptorEvolved for identity mismatch,
+Internal for Arrow/schema failure); `TenantId`
+conversion uses
+`wendelon::schema::TenantId::new(request.tenant_id.0)`
+— exact mirror of scan path at `storage.rs:206`.
+Distributed INSERT explicitly unsupported in v1 (D13).
+Read-your-writes session HLC advancement deferred
+(D12 + Codex iter-3 residual Q3) — `WriteOutcome`
+discards `TableWriteReceipt.commit_hlc`. Per-statement
+durability override deferred (uses wrapper default
+`DurabilityClass::QUORUM`). Float NaN/inf permitted
+(mirror Arrow native semantics). No new IR expression
+variant; no new aggregate kernel; no fragmenter
+detector change for SELECT paths; no PBC opcode
+change; no cross-ring metadata-write engagement; no
+Toron-side Wendelon row-identity construction; no
+`blake3` dependency; no `RecordBatch` inside any
+`ExecutionPlan` variant. Existing SELECT corpus plan
+digests byte-identical pre/post-ADR-030. The ten-phase
+migration is materialized in
+`plans/impl/030_insert_into_values.md`.
+
+ADR 031 selection remains **firmly committed** by ADR
+029's D1 / D15 sequencing decision and Codex iter-0
+ADR 029's `BoundExprProgram` seed doc. Brainstorm 004's
+narrow realization is the cycle's expected substrate-
+introducing work — the third consecutive instance of
+the topic-concession-compresses-next-cycle pattern
+(ADR 020 → 021; ADR 027 → 028; ADR 029 → 031).
+
+**ADR 031 lead candidate (committed):**
+
+- **ADR 031 — Bound Expression Program** (Brainstorm
+  004's narrow realization). Codex's iter-0 ADR 029
+  doc seeded this cycle. Substrate-introducing
+  expression-IR work that addresses the Box-everywhere
+  baseline raised across ADR 023 / 024 / 025 / 026 /
+  028 cycles. Expect 4+ iterations with multi flip-flop
+  per the substrate-introducing cadence hypothesis.
+  Per the ADR 029 + ADR 030-established cycle pattern,
+  budget at least one wrong-import-discovery peer iter
+  if the work touches Wendelon-defined types.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **Hidden-aggregate `ORDER BY` keys ADR.** Loosens
+  ADR 023's `"ORDER BY <aggregate-call> requires the
+  aggregate to appear in the SELECT list"` reject
+  (preserved by ADR 027 D3 + ADR 028 ratification +
+  ADR 029 + ADR 030 carry-forwards). Plan-shape ADR;
+  composes with the ratified ADR 028 signature
+  substrate via `AggregateOutputCatalog::resolve_for_order_by`.
+- **Non-aggregate computed `ORDER BY` ADR.** ADR 027
+  D10 deferred.
+- **PBC partial-pushdown of computed-arg aggregates**
+  (cross-ring; workload-evidence-pressured).
+- **Brainstorm 004 — Memory Arenas / Index-based IR**
+  (alternate framing — broader than ADR 031's
+  `BoundExprProgram` narrow realization). Multiple
+  cycles surfaced the Box-everywhere pattern; the
+  council may choose to land ADR 031's narrow
+  realization first and revisit the broader system-
+  wide migration after evidence accumulates.
+
+**Substrate candidates carried forward:**
+
+- **`INSERT INTO ... SELECT`** — composes ADR 029 +
+  ADR 030 + read-side ADRs. The most natural
+  immediate DML extension after ADR 030.
+- **`UPDATE` / `DELETE`** — DML siblings to ADR 030.
+  `__row_tombstone__` becomes load-bearing for
+  DELETE; Wendelon-side already owns tombstone
+  stamping per ADR 030 D7.
+- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
+  extensions; need PK / unique-constraint substrate
+  first.
+- **`RETURNING` clause** — DML result-shape extension;
+  shifts ADR 030's `Ok(Vec::new())` contract.
+- **Utf8 ↔ numeric CAST + TRY_CAST.**
+- **Boolean ↔ numeric CAST + TRY_CAST.**
+- **`DROP TABLE` / `ALTER TABLE` / `CREATE INDEX` /
+  `CREATE VIEW` / `CREATE TABLE AS SELECT (CTAS)`** —
+  DDL siblings to ADR 029.
+- **Constraints** (PRIMARY KEY / FOREIGN KEY / CHECK /
+  column-level UNIQUE) / DEFAULT / GENERATED columns
+  — DDL siblings to ADR 029; `DEFAULT` interacts with
+  ADR 030's "reject omitted NOT NULL" rule.
+- **HAVING alias visibility ADR.** Loosens ADR 023's
+  `"HAVING does not resolve SELECT aliases"` reject
+  (preserved by ADR 027 D7 + ADR 028 D11 + ADR 029 +
+  ADR 030 carry-forwards).
+- **Temporal column types (DATE, TIMESTAMP)** for
+  ADR 029's type lattice + ADR 030's INSERT coercion
+  lattice.
+- **DECIMAL** for ADR 029's type lattice + ADR 030's
+  INSERT coercion lattice.
+- **Cross-ring metadata-write contract ADR** — needed
+  to lift `WendelonCatalog::create_table` from
+  `AdminUnavailable`.
+- **Cross-ring distributed-write-context ADR** —
+  needed to lift ADR 030 D13's distributed INSERT
+  reject. Threads tenant / session / HLC context
+  through `DistributedQueryCoordinator`.
+- **Read-your-writes session HLC advancement ADR** —
+  defines whether coordinators consume
+  `wendelon_client::TableWriteReceipt.commit_hlc` to
+  advance session read bounds. Touches
+  `ExecutionContext` (currently `read_bound`-named),
+  distributed retry contracts, and plan-digest
+  stability if HLC bounds enter binding.
+- **Richer Toron `Hlc` type** — `HlcBound(pub u64)`
+  is lossy vs Wendelon's `HybridTimestamp` (16 bytes).
+  Prerequisite for the read-your-writes ADR.
+- **Idempotency / write-retry-after-descriptor-evolution
+  ADR** — ADR 030 D12 explicitly does not retry INSERT
+  on descriptor evolution; a future ADR defines the
+  semantic + interacts with the
+  `parent_write_id` idempotency key the
+  `wendelon-client` wrapper already constructs.
+- **Per-statement `durability` override** — ADR 030
+  uses wrapper default `DurabilityClass::QUORUM`; a
+  future ADR adds SQL syntax for per-statement
+  override.
+- **Wendelon AGG consumer wiring (ADR 02X)**
+  (cross-ring).
+
+The post-ADR-029 archived selection notes below
+(forward-sequence content from the prior planning
+pass) remain unchanged.
+
+#### ADR 029 → ADR 030 archived selection notes
 
 ADR 029 selected and promoted **SQL `CREATE TABLE`
 (Narrow DDL Surface)** — Toron's **first DDL ADR** —
