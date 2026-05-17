@@ -625,6 +625,140 @@ along with the forward-sequence rewrite.
   (gate bypass for `Column` / `Literal` keys). The
   seven-step migration is materialized in
   `plans/impl/027_order_by_computed_expressions.md`.
+- **ADR 028 — Computed Aggregate Arguments
+  (`SUM(x + y)` / `SUM(TRY_CAST(amount AS BIGINT))`).**
+  Promoted. **First substrate-introducing ADR since
+  ADR 024** after three substrate-downstream cycles
+  (025 / 026 / 027). Lifts the longest-standing
+  evidence-pressure reject in Toron: the ADR 024 D6
+  rule that `"aggregate arguments must be simple
+  column references"`, preserved verbatim by ADR 025 /
+  026 / 027. The stable aggregate kernel family
+  (`CountAll` plus one-arg `Sum` / `Count` / `Avg` /
+  `Min` / `Max`) accepts the lowered `Expr` surface as
+  arguments: `SELECT SUM(amount + tax) FROM sales`,
+  `SELECT region, SUM(TRY_CAST(amount AS BIGINT)) FROM
+  sales GROUP BY region`, `SELECT AVG(price * 1.1)
+  FROM sales`. Eleven decisions D1-D11 cover column-
+  only reject removal, visitor-based planner-private
+  signature key, binder-owned type-domain validation,
+  post-lowering structural equality, nested-aggregate
+  SQL-walk-time reject, `COUNT(*)` zero-arg signature
+  with logical placeholder preserved, kernel-name-only
+  output names, row-layer executor seam reuse, null/
+  error/PBC inheritance through composition, plan-
+  digest backward compat for column-only-arg queries,
+  qualified-reference policy unchanged. **D2 critical
+  decision (visitor-based, no parallel key types):**
+  `GroupedAggregateSignature` becomes a struct
+  `{ kernel: StableAggregateKernel, args: Vec<Expr> }`
+  with planner-private custom `PartialEq` + `Eq` +
+  `Hash` impls implemented via six visitor helpers
+  over the existing `Expr` tree. Public
+  `AggregateFunction` / `Expr` / `ScalarValue` remain
+  non-`Eq` / non-`Hash` — visitors are standalone
+  helpers, NOT trait impls. `StableAggregateKernel`
+  (already `Eq + Hash`) keys function side,
+  sidestepping the `AggregateFunction::ApproxQuantile(f64)`
+  float-derive blocker and type-segregating
+  experimental kernels (`stable_kernel_for_function`
+  returns `None` for `ApproxQuantile` / `LinearRegress`).
+  Float bit-pattern handling encapsulated planner-
+  private via `Option::map(f32::to_bits)` /
+  `Option::map(f64::to_bits)`. Zero parallel-IR
+  allocation. Five iterations total with two flip-
+  flops: D2 P1 vs P2 (Gemini iter-0/1/2 advocated
+  public manual `Eq + Hash`; retracted iter-3 to
+  planner-private — third consecutive cycle of
+  Gemini's "wider trait surface" retraction matching
+  ADR 025 / 026 patterns), and **iter-4 user-
+  evidence-pressured D2 realization flip-flop**: iter-3
+  ratified D2 P1 with a materialized `AggregateArgKey`
+  tree (Box-everywhere); iter-4 refined to the
+  visitor approach after user evidence flagged the
+  "Box everything" concern at merge staging. First
+  user-evidence-pressured substrate refinement at
+  staging in the cycle's history; scoped re-open of
+  D2's implementation shape preserved D1, D3-D11 from
+  iter-3. Iter-5 folded four Codex precision items
+  (P1-P4) including a load-bearing correctness fix on
+  `data_type_structural_eq` reflexivity (P3 —
+  `matches!` with arm restrictions would violate `Eq`
+  contract for hand-built non-lattice `DataType`
+  values; body must be `left == right`). Fifth
+  consecutive cycle of Codex correctness-clarification
+  pattern (iter-0 + iter-3 + iter-5 surfacing — most
+  distributed in the cycle's history). Tenth instance
+  of the ADR 015 cycle (after 016 / 017 / 018 / 019 /
+  022 / 023 / 024 / 025 / 026 / 027). Three-way
+  council convergence reached across five iterations.
+  Substrate-introducing cadence hypothesis confirmed
+  (4+ iters with at least one flip-flop); ADR 028
+  came in at 5 iters with 2 flip-flops, stretched
+  by one user-evidence-pressured iteration but
+  produced a strictly-better realization. Nested
+  aggregate calls reject at SQL-walk time with
+  stable diagnostic `"aggregate arguments must not
+  contain aggregate calls"` (D5). Binder retains
+  per-kernel type-domain validation authority (D3 —
+  `SUM(amount > 0)` rejects as Boolean not
+  SumNumeric; `AVG(TRY_CAST(x AS INT))` OK).
+  Structural equality is post-lowering (D4 — no
+  algebraic normalization; `SUM(amount + tax) ≠
+  SUM(tax + amount)`). `COUNT(*)` produces a zero-
+  arg signature `{ kernel: CountAll, args: Vec::new() }`
+  ignoring input args; **`lower_count_aggregate`'s
+  synthetic `Expr::column("count")` placeholder for
+  `COUNT(*)` is preserved verbatim** in the
+  `LogicalPlan` shape (D6 + iter-3 precision) so that
+  column-only-arg plan digests remain byte-identical
+  (D10). Output names stay kernel-name strings
+  (`sum` / `count` / `min` / `max` / `avg`); no
+  HAVING alias visibility introduced (D7 — ADR 023
+  reject preserved). Row-layer executor seam reused
+  verbatim — existing `evaluate_expr` /
+  `evaluate_bound_expr` already handle `Vec<Expr>` /
+  `Vec<ExecutionExpr>` aggregate arguments per-batch
+  before kernel accumulation (D8 — no new operator,
+  no hidden pre-aggregate `Project`). Computed-arg
+  aggregates inherit ADR 022 sticky-NaN / ADR 024
+  arithmetic loud-failure / ADR 024 D8 div/0 null /
+  ADR 025 strict Cast `cast_failed` / ADR 026
+  TryCast fail-to-null + D11 inner-Cast-error
+  propagation; remain PBC-residual via Cast / TryCast
+  / arithmetic ineligibility composition (D9).
+  Qualified-reference policy preserved verbatim
+  (D11). Eleven new ADR 028 architecture guards (column-
+  only diagnostic removal, planner-private visitor
+  surface, exhaustive visitor coverage, float-bit
+  preservation, `data_type_structural_eq` reflexivity
+  correctness boundary from P3, `CountAll` zero-arg
+  signature + placeholder preservation, nested-
+  aggregate SQL-walk reject, experimental-kernel
+  exclusion, kernel-name-only output, binder/executor
+  seam preservation, public IR non-`Eq` / non-`Hash`).
+  Two existing guards adjusted (ADR 024 D6 column-
+  only-rule + ADR 020 AVG signature shape — Codex
+  caught the AVG adjustment at iter-3). SoA-readiness
+  invariants preserved (catalog untouched; no row-
+  path dyn dispatch; per-kernel dispatch operates on
+  already-bound `ArrayRef`s). **Brainstorm 004
+  (Memory Arenas) strengthens as a future ADR
+  candidate** — multiple cycles (ADR 023 / 024 /
+  025 / 026 / 028 iter-3 → iter-4) have now surfaced
+  the Box-everywhere expression-IR pattern; the
+  cumulative pressure is well-prepared for an arena-
+  introducing cycle when workload evidence triggers
+  it. No new `LogicalPlan` / `ExecutionPlan` variant;
+  no new `ExecutionError` / `TaskFailureKind`
+  variant; no new `AggregateOutputRule` variant; no
+  new `StableAggregateKernel` row; no `AggState`
+  shape change; no fragmenter detector change; no
+  cross-ring engagement; no PBC opcode change. Plan
+  digests for column-only-argument queries byte-
+  identical pre/post-ADR-028. The seven-phase
+  migration is materialized in
+  `plans/impl/028_computed_aggregate_arguments.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -692,7 +826,159 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 027 promoted; ADR 028 candidates
+### ADR 028 promoted; ADR 029 candidates
+
+ADR 028 selected and promoted **Computed Aggregate
+Arguments** — the first substrate-introducing ADR since
+ADR 024 after three substrate-downstream cycles (025 /
+026 / 027). Lifts the ADR 024 D6 column-only rule
+preserved verbatim by ADR 025 / 026 / 027 — the
+longest-standing evidence-pressure reject in Toron.
+The stable aggregate kernel family (`CountAll` plus
+one-arg `Sum` / `Count` / `Avg` / `Min` / `Max`) now accepts the
+lowered `Expr` surface as arguments (`SUM(amount +
+tax)`, `SUM(TRY_CAST(amount AS BIGINT))`, `AVG(price *
+1.1)`, etc.). Eleven decisions D1-D11. **D2 critical
+decision:** `GroupedAggregateSignature` becomes a
+planner-private struct keyed by `StableAggregateKernel
++ Vec<Expr>` with custom `PartialEq` / `Eq` / `Hash`
+impls implemented via six visitor helpers
+(`hash_expr_structural`, `expr_structural_eq`,
+`hash_scalar_structural`, `scalar_structural_eq`,
+`hash_data_type_structural`, `data_type_structural_eq`).
+**Public `AggregateFunction` / `Expr` / `ScalarValue`
+remain non-`Eq` / non-`Hash`**; visitors are standalone
+planner-private helpers, NOT trait impls on IR types.
+Five iterations with two flip-flops: D2 P1 vs P2
+(Gemini iter-0/1/2 advocated public manual `Eq + Hash`;
+retracted iter-3 to planner-private — third consecutive
+cycle of Gemini's "wider trait surface" retraction
+pattern) and **iter-4 user-evidence-pressured D2
+realization flip-flop** (iter-3 ratified materialized
+`AggregateArgKey` tree; iter-4 refined to visitor
+approach on `Vec<Expr>` after user flagged the "Box
+everything" concern at merge staging — first user-
+evidence-pressured substrate refinement in the cycle's
+history; scoped re-open preserved D1, D3-D11 from
+iter-3). Iter-5 folded four Codex precision items
+including the load-bearing `data_type_structural_eq`
+reflexivity correctness fix (P3 — `matches!` with arm
+restrictions would violate `Eq` for hand-built non-
+lattice `DataType` values; body must delegate to
+`left == right`). Tenth instance of the ADR 015 cycle.
+Three-way council convergence across five iterations.
+Substrate-introducing cadence hypothesis confirmed
+(4+ iters, at least one flip-flop). Five-of-five Codex
+correctness-clarification cycle continues (most
+distributed surfacing yet: iter-0 + iter-3 + iter-5).
+Three-of-three Gemini "wider trait surface" retraction
+pattern confirms. Topic-concession-compresses-next-
+cycle pattern at 2-of-2 (ADR 020 → 021; ADR 027 → 028).
+**Brainstorm 004 (Memory Arenas) strengthens as a
+post-ADR-028 candidate** — multiple cycles have now
+surfaced the Box-everywhere expression-IR pattern.
+Nested aggregate calls reject at SQL-walk time with
+stable diagnostic `"aggregate arguments must not
+contain aggregate calls"` (D5). `COUNT(*)` produces a
+zero-arg signature; `lower_count_aggregate`'s synthetic
+placeholder is preserved verbatim for column-only-arg
+plan-digest stability (D6 + D10). Row-layer executor
+seam reused — no new operator, no hidden pre-aggregate
+`Project` (D8). Computed-arg aggregates inherit ADR
+022 sticky-NaN / ADR 024 arithmetic loud-failure /
+ADR 025 / 026 Cast / TryCast policies through
+composition; remain PBC-residual (D9). Experimental
+kernels (`LinearRegress`, `ApproxQuantile`) remain
+excluded from grouped aggregate signature matching via
+D2 type segregation through `stable_kernel_for_function`
+returning `None`. Eleven
+new ADR 028 architecture guards + two adjusted
+(ADR 024 D6 column-only + ADR 020 AVG signature
+shape). No new IR variant; no new operator; no new
+kernel; no fragmenter detector change; no Eq/Hash
+refactor; no public IR trait widening; no cross-ring
+engagement; no PBC opcode change. Plan digests for
+column-only-argument queries byte-identical pre/post-
+ADR-028. The seven-phase migration is materialized in
+`plans/impl/028_computed_aggregate_arguments.md`.
+
+ADR 029 selection starts from the post-ADR-028
+remainder. The Box-everywhere pattern has now surfaced
+across multiple cycles, with ADR 028 iter-4's user-
+evidence pressure making the case for an arena ADR
+substantive. The substrate-downstream candidates from
+ADR 028 (PBC partial-pushdown, hidden-aggregate
+ORDER BY, non-aggregate computed ORDER BY) compose
+naturally with the freshly-ratified signature
+substrate.
+
+**Substrate-introducing lead candidate (Brainstorm-
+seam-strengthened):**
+
+- **Brainstorm 004 — Memory Arenas / Index-based IR
+  ADR.** Multiple recent cycles (ADR 023 / 024 / 025 /
+  026 / 028 iter-3 → iter-4) have surfaced the Box-
+  everywhere expression-IR pattern. ADR 028 iter-4's
+  user-evidence-pressured refinement avoided *adding*
+  to the pattern but didn't address the existing
+  baseline. A system-wide arena/index migration ADR
+  would shift `Expr` / `LogicalPlan` / `ExecutionPlan`
+  children from `Box<T>` to `Vec<Node>` + `u32`
+  indices, eliminating per-node allocation churn on
+  the planner hot path. **Substrate-introducing ADR**
+  — expect 4+ iterations with multi flip-flop;
+  comparable scope to ADR 024 (which took 4+ iters).
+  Promotes if the cumulative Box-pattern evidence
+  outweighs the absence of bench-quantified planner
+  allocation cost.
+
+**Code-evidence-driven candidates from ADR 028
+remainder:**
+
+- **Hidden-aggregate `ORDER BY` keys ADR.** Loosens
+  ADR 023's `"ORDER BY <aggregate-call> requires the
+  aggregate to appear in the SELECT list"` reject
+  (preserved by ADR 027 D3 and ADR 028 ratification).
+  Plan-shape ADR; now composes naturally with the
+  ratified ADR 028 signature substrate via
+  `AggregateOutputCatalog::resolve_for_order_by`.
+- **Non-aggregate computed `ORDER BY` ADR.** ADR 027
+  D10 deferred. Generalizes the ADR 027 hidden-
+  projection mechanism off the
+  `aggregate_output_catalog.is_some()` gate.
+- **PBC partial-pushdown of computed-arg aggregates**
+  (cross-ring; workload-evidence-pressured). Now that
+  computed-arg aggregates exist (ADR 028), the cross-
+  ring ADR can consider whether PBC bytecode should
+  grow arithmetic / Cast / TryCast opcodes to push
+  `SUM(amount + tax)`-style computation to Wendelon.
+
+**Substrate candidates carried forward:**
+
+- **Utf8 ↔ numeric CAST + TRY_CAST.** Adds Utf8 source
+  and target paths to ADR 025 / 026 lattices
+  simultaneously. Parsing semantics ADR — locale,
+  whitespace handling, scientific-notation acceptance.
+  Extends both strict and tolerant variants. Computed-
+  aggregate-argument acceptance inherits via ADR 028
+  D2 visitor exhaustive-match.
+- **Boolean ↔ numeric CAST + TRY_CAST.** Truth-table
+  semantics. Extends both lattices.
+
+**Carried substrate candidates from ADR 023's
+named-deferred set:**
+
+- **HAVING alias visibility ADR.** Loosens ADR 023's
+  `"HAVING does not resolve SELECT aliases"` reject
+  (preserved verbatim by ADR 027 D7 and ADR 028 D11).
+  SQL-compat surface; own planner name-resolution
+  decision matrix.
+
+The post-ADR-027 archived selection notes below
+(forward-sequence content from the prior planning
+pass) remain unchanged.
+
+#### ADR 027 → ADR 028 archived selection notes
 
 ADR 027 selected and promoted **`ORDER BY` Computed
 Expressions over Aggregate Output** — the third consecutive
@@ -752,102 +1038,18 @@ cross-ring engagement; no new `LogicalPlan` /
 seven-step migration is materialized in
 `plans/impl/027_order_by_computed_expressions.md`.
 
-ADR 028 selection starts from the post-ADR-027 remainder
-with the iter-0 / iter-1 topic concession on the table:
-the substrate-introducing candidate that Claude led with
-at iter-0 (computed aggregate arguments) is the natural
-ADR 028 lead under the cycle's "ordered candidates"
-convention, parallel to the ADR 020 → 021 split where
-Gemini's deferred substrate carried forward to lead the
-next cycle.
-
-**Substrate-introducing lead candidate (carried from
-ADR 027 iter-0):**
-
-- **Computed aggregate arguments ADR.** `SUM(x + y)`,
-  `SUM(TRY_CAST(amount AS BIGINT))`,
-  `AVG(price * 100)`. Requires the derive-Eq/Hash refactor
-  on `AggregateFunction` (blocked by `ApproxQuantile(f64)`)
-  and `Expr` (blocked by `ScalarValue::Float32`/`Float64`)
-  plus `GroupedAggregateSignature` widening to
-  `(AggregateFunction, Vec<Expr>)`. Composes naturally
-  with ADR 024 + 025 + 026 once the signature substrate
-  exists, and lifts ADR 024 D6's column-only aggregate-
-  argument reject preserved by ADR 025 / 026 / 027.
-  **Substrate-introducing ADR** — expect 4+ iterations
-  with at least one flip-flop per the cadence hypothesis;
-  ADR 023 (4 + consolidation) and ADR 024 (4+, multi
-  flip-flop) are the prior templates. ADR 028 will be the
-  next test of the substrate-introducing cadence after
-  three consecutive substrate-downstream cycles (025 /
-  026 / 027).
-
-**Other code-evidence-driven candidates from ADR 027
-remainder:**
-
-- **Hidden-aggregate `ORDER BY` keys ADR.** Loosens
-  ADR 023's `"ORDER BY <aggregate-call> requires the
-  aggregate to appear in the SELECT list"` reject
-  (preserved by ADR 027 D3). Plan-shape ADR; either
-  hidden-sort-columns or Project-above-Sort design. Now
-  composes naturally with the ratified hidden-projection
-  contract (D6), so the design surface narrows.
-- **Non-aggregate computed `ORDER BY` ADR.** D10 deferred.
-  Generalizes the ADR 027 mechanism off the
-  `aggregate_output_catalog.is_some()` gate. Smaller
-  surface than the aggregate case (no visible-output
-  schema to validate against); awaits workload evidence.
-
-**Substrate candidates carried forward:**
-
-- **Utf8 ↔ numeric CAST + TRY_CAST.** Adds Utf8 source
-  and target paths to ADR 025 / 026 lattices
-  simultaneously. Parsing semantics ADR — locale,
-  whitespace handling, scientific-notation acceptance,
-  what counts as a parse failure. Extends both strict and
-  tolerant variants in one cycle.
-- **Boolean ↔ numeric CAST + TRY_CAST.** Truth-table
-  semantics ADR — dialect-specific spellings (`'t'` /
-  `'1'` / `'yes'`); CAST(Boolean AS Int) convention
-  (`true → 1`, `false → 0` is near-universal but
-  explicit). Extends both lattices.
-
-**Carried substrate candidates from ADR 023's
-named-deferred set:**
-
-- **HAVING alias visibility ADR.** Loosens ADR 023's
-  `"HAVING does not resolve SELECT aliases"` reject
-  (preserved verbatim by ADR 027 D7). SQL-compat surface;
-  own planner name-resolution decision matrix. Promotes
-  on user-survey or query-corpus evidence that the form
-  is workload-pressured.
-
-**Newly-deferred siblings to ADR 024 arithmetic (inherit
-ADR 027 acceptance once they lower per D8):**
-
-- **Unary negation (`-x`).** Small surface; could bundle
-  with modulo. Adds `Expr::Neg` IR variant; reuses the
-  numeric-domain restriction from ADR 024.
-- **Integer modulo (`%`).** Has its own /0 decision
-  (matches Div); signed-modulo semantic (Rust `%` follows
-  dividend sign).
-- **`CASE WHEN ... THEN ... ELSE ... END`.** Substantial
-  own decision matrix — branch type unification, null
-  handling, multi-branch evaluation. Reuses ADR 024's
-  lattice for branch result type unification.
-- **`COALESCE` / `IFNULL` / `NULLIF`.** Null-handling
-  functions.
-- **Wendelon PBC arithmetic and Cast opcode extension.**
-  Cross-ring ADR — adds arithmetic opcodes to PBC
-  bytecode for filter pushdown. Promotes when workload
-  evidence shows arithmetic-predicate filtering would
-  meaningfully reduce cross-ring transfer bytes.
-
-The full historical ADR 026 → ADR 027 selection narrative
-that produced the iter-0 split + iter-1 concession is
-preserved in git history. The retained substrate /
-kernel-domain / cross-ring / V1.x carry-forward sections
-below remain unchanged from the prior planning pass.
+The post-ADR-027 candidate set (computed-aggregate-args
+substrate lead, hidden-aggregate ORDER BY keys,
+non-aggregate computed ORDER BY, Utf8 / Boolean CAST +
+TRY_CAST, HAVING alias visibility, ADR 024 arithmetic
+siblings, Wendelon PBC opcode extension) folded into
+the ADR 029 selection set at the top. Computed-
+aggregate-args led the round and promoted as ADR 028;
+the surviving candidates carry forward to ADR 029.
+Brainstorm 004 (Memory Arenas) added as a new
+substrate-introducing lead candidate after ADR 028
+iter-4's user-evidence pressure made the Box-everywhere
+pattern an explicit cycle property.
 
 #### ADR 026 → ADR 027 archived selection notes
 
