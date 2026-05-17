@@ -759,6 +759,104 @@ along with the forward-sequence rewrite.
   identical pre/post-ADR-028. The seven-phase
   migration is materialized in
   `plans/impl/028_computed_aggregate_arguments.md`.
+- **ADR 029 — SQL `CREATE TABLE` (Narrow DDL Surface).**
+  Promoted. **First DDL ADR in Toron** — widens the
+  statement layer from SELECT-only to also accept the
+  narrow `CREATE TABLE [IF NOT EXISTS] [schema.]table_name
+  (column TYPE [NULL | NOT NULL], ...)` shape after five
+  consecutive expression-IR cycles (ADR 024 / 025 / 026 /
+  027 / 028) without touching the DDL surface. User-
+  evidence framing surfaced the priority gap: "we should
+  be able to create tables before going super deep into
+  approximate quantiles." Fifteen decisions D1-D15
+  cover narrow SQL shape with explicit out-of-scope set;
+  statement planner widens with exhaustive
+  `sqlparser::ast::CreateTable` destructure (no `..`)
+  guarding against silent acceptance on dependency
+  upgrades; `LogicalPlan::CreateTable` + `ExecutionPlan::CreateTable`
+  leaf variants carrying `arrow::datatypes::SchemaRef`;
+  **DDL is coordinator-only** (`QueryCoordinator` +
+  `DistributedQueryCoordinator` both in
+  `crates/toron/src/coordinator.rs` intercept BEFORE
+  their respective downstream stages; `Executor` +
+  `Fragmenter` defensive rejects); `Catalog::create_table`
+  returns `Result<TableBinding, CatalogError>`;
+  `MockCatalog` becomes `RwLock<MockCatalogInner>`
+  interior-mutable; **`mock_table_identity` helper**
+  derives `PhysicalDescriptorFingerprint` through
+  `TableSchemaDescriptor::new_with_layout` because
+  `from_bytes` is crate-private to Wendelon; `IF NOT
+  EXISTS` uses strict Arrow `Schema` equality; **DDL-
+  specific name + type lowering helpers** (separate from
+  read-side `table_ref_from_object_name` and ADR 025's
+  `lower_cast_target_type`); **MockCatalog reference
+  insertion uses `entry(...).or_insert(...)` for the
+  unqualified-alias path** (no silent overwrite); 6-type
+  column lattice (`Int32` / `Int64` / `Float32` /
+  `Float64` / `Utf8` / `Boolean`); narrow column options
+  (`NULL` / `NOT NULL` only); **storage synthetic column
+  name reject at planner time** (`__row_hlc__` /
+  `__row_key_id__` / `__row_routing_locality__` /
+  `__row_table_object_id__` / `__row_tombstone__`); DDL
+  success returns `Ok(Vec::new())` from coordinators;
+  **`SELECT * FROM newly_created_table` NOT promised**
+  by ADR 029 (catalog visibility only; readback awaits
+  ADR 030 = INSERT); existing SELECT plan digests
+  byte-identical (SELECT bind stays inside descriptor-
+  evolution retry loop). **`TableId` is tuple-struct
+  `TableId(pub u64)`** (use tuple construction, not
+  `TableId::new`); **`TableRef` has no `Display`** (use
+  crate-private `table_name(&TableRef)` helper for
+  diagnostics). `WendelonCatalog::create_table` returns
+  `CatalogError::AdminUnavailable` until a cross-ring
+  metadata-write ADR engages. Four iterations with
+  **zero substantive flip-flops** on D1-D15 after iter-2
+  council convergence (iter-0 topic split BoundExprProgram
+  vs CREATE TABLE resolved cleanly at iter-1 via
+  sequencing commitment; iter-3 was pure code-evidence
+  precision-folding). Narrowest substrate-introducing
+  flip-flop profile to date (ADR 023: 1; ADR 024: multi;
+  ADR 028: 2). **Sixth consecutive cycle of Codex
+  correctness-clarification pattern** — six precision
+  items across iter-2 and iter-3 (coordinator/catalog
+  ownership, MockCatalog interior mutability, DDL-
+  specific helpers, descriptor-derived fingerprint,
+  alias-no-overwrite, storage-synthetic-name reject),
+  most code-evidence-grounded surfacing of any cycle.
+  **Fourth consecutive cycle of Gemini "wider trait
+  surface" iter-1 → iter-2 retraction pattern** (D4 /
+  D5 / D9 / D14 explicitly labeled "I retract my
+  Iteration 1 design" at iter-2). **Third consecutive
+  topic-concession-compresses-next-cycle pattern** (ADR
+  020 → 021; ADR 027 → 028; ADR 029 → 031 via Codex
+  iter-0 `BoundExprProgram` doc seeding the ADR 031
+  cycle). **New process pattern recorded** — pre-
+  existing-Wendelon-types ADRs need a code-evidence
+  pass on the Wendelon-side API surface, not just
+  Toron-side; ADR 030 (INSERT) and the eventual cross-
+  ring AGG consumer wiring ADR will share this
+  characteristic. Eleventh instance of the ADR 015
+  cycle. Three-way council convergence reached across
+  four iterations. Substrate-introducing cadence
+  hypothesis confirmed (4+ iters with at least one
+  flip-flop tolerance; ADR 029 came in at 4 iters with
+  0 flip-flops via topic concession). Fifteen new ADR
+  029 architecture guards + one adjusted statement-
+  catch-all guard. SoA-readiness invariants preserved
+  (catalog stays pure metadata for kernels; no row-path
+  dyn dispatch; `#[repr(u8)]` on `StableAggregateKernel`
+  unchanged). **Sequencing commitment:** ADR 030 =
+  `INSERT INTO ... VALUES (...)` (paired with this cycle
+  — CREATE TABLE alone is unusable without INSERT);
+  ADR 031 = `BoundExprProgram` (Brainstorm 004's narrow
+  realization from Codex iter-0). No new IR expression
+  variant; no new aggregate kernel; no fragmenter
+  detector change for SELECT paths; no PBC opcode
+  change; no cross-ring engagement; no Wendelon
+  persistent descriptor writes. Plan digests for
+  existing SELECT query corpus byte-identical pre/post-
+  ADR-029. The nine-phase migration is materialized in
+  `plans/impl/029_create_table_ddl.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -826,7 +924,169 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 028 promoted; ADR 029 candidates
+### ADR 029 promoted; ADR 030 candidates
+
+ADR 029 selected and promoted **SQL `CREATE TABLE`
+(Narrow DDL Surface)** — Toron's **first DDL ADR** —
+widening the statement layer from SELECT-only after
+five consecutive expression-IR cycles (ADR 024 / 025 /
+026 / 027 / 028) without DDL-surface work. User-evidence
+framing surfaced the priority gap: "we should be able
+to create tables before going super deep into
+approximate quantiles." The accepted shape is narrow —
+`CREATE TABLE [IF NOT EXISTS] [schema.]table_name
+(column TYPE [NULL | NOT NULL], ...)` — with all other
+DDL/DML strictly out of scope. Fifteen decisions D1-D15.
+**D2 critical decision:** statement planner widens with
+**exhaustive `sqlparser::ast::CreateTable` destructure
+without `..`** as the compile-time guard against silent
+acceptance when sqlparser dependency upgrades introduce
+new clauses. **D4 critical decision:** DDL is
+coordinator-only — both `QueryCoordinator` and
+`DistributedQueryCoordinator` (both in
+`crates/toron/src/coordinator.rs`) intercept BEFORE
+their respective downstream stages; the data-plane
+`Executor` + `Fragmenter` carry defensive rejects only.
+**D7 critical decision:** `mock_table_identity` helper
+derives `PhysicalDescriptorFingerprint` via
+`TableSchemaDescriptor::new_with_layout` because
+`PhysicalDescriptorFingerprint::from_bytes` is crate-
+private to Wendelon. **D10 critical decision:**
+`MockCatalog` reference insertion uses
+`entry(...).or_insert(...)` for the unqualified-alias
+path so schema-qualified creates never overwrite
+existing aliases. **D12 critical elaboration:** the
+five Wendelon storage synthetic column names
+(`__row_hlc__` / `__row_key_id__` /
+`__row_routing_locality__` / `__row_table_object_id__`
+/ `__row_tombstone__`) reject at planner time, before
+descriptor construction. **D14 critical decision:**
+`SELECT * FROM newly_created_table` is NOT promised by
+ADR 029 — catalog visibility only; readback requires
+ADR 030 (INSERT). Four iterations with **zero
+substantive flip-flops** on D1-D15 content after iter-2
+council convergence (iter-0 topic split BoundExprProgram
+vs CREATE TABLE resolved cleanly at iter-1 via explicit
+sequencing commitment; iter-3 was pure code-evidence
+precision-folding). Narrowest substrate-introducing
+flip-flop profile in the cycle's history. Sixth
+consecutive cycle of the Codex correctness-clarification
+pattern — six precision items across iter-2 and iter-3
+(coordinator/catalog ownership, MockCatalog interior
+mutability, DDL-specific name + type helpers,
+descriptor-derived fingerprint, alias-no-overwrite,
+storage-synthetic-name reject) all surfaced from actual
+codebase inspection. Fourth consecutive cycle of Gemini
+"wider trait surface" iter-1 → iter-2 retraction (Gemini
+iter-2 explicitly labels four "I retract my Iteration 1"
+framings: D4 / D5 / D9 / D14). **New process pattern
+recorded** — pre-existing-Wendelon-types ADRs need a
+code-evidence pass on the Wendelon-side API surface,
+not just Toron-side; ADR 030 (INSERT) and the eventual
+cross-ring AGG consumer wiring ADR will share this
+characteristic. Eleventh instance of the ADR 015 cycle.
+Fifteen new ADR 029 architecture guards + one adjusted
+statement-level catch-all guard. SoA-readiness
+invariants preserved. **`WendelonCatalog::create_table`
+returns `CatalogError::AdminUnavailable`** until a
+cross-ring metadata-write contract ADR engages. No new
+IR expression variant; no new aggregate kernel; no
+fragmenter detector change for SELECT paths; no PBC
+opcode change; no cross-ring engagement; no Wendelon
+persistent descriptor writes. Existing SELECT query
+corpus plan digests byte-identical pre/post-ADR-029.
+The nine-phase migration is materialized in
+`plans/impl/029_create_table_ddl.md`.
+
+ADR 030 selection is **firmly committed** by ADR 029's
+D1 / D15 sequencing decision. `CREATE TABLE` alone is
+unusable without a way to populate the table; `INSERT
+INTO ... VALUES (...)` is the paired companion.
+
+**ADR 030 lead candidate (committed):**
+
+- **ADR 030 — `INSERT INTO ... VALUES (...)`.** Narrow
+  insert surface — single-statement, literal-only
+  value lists, no `INSERT ... SELECT`, no `RETURNING`,
+  no `ON CONFLICT`, no batched multi-row optimizations
+  beyond the natural parser-level form. Routes through
+  the same planner → binder → coordinator → catalog
+  path established by ADR 029, with a new
+  `LogicalPlan::Insert` / `ExecutionPlan::Insert` leaf
+  variant and a new `Catalog::insert_rows` or similar
+  trait extension. Expected to be a **pre-existing-
+  Wendelon-types ADR** (touches the storage-write
+  surface — `RecordBatch` materialization, row-identity
+  metadata population including the five
+  `__row_*__` columns reserved by ADR 029 D12,
+  fingerprint discipline). Substrate-introducing
+  scope at the statement layer; expect 3-4 iterations
+  with at least one code-evidence Wendelon-side pass
+  at iter-2 (per the ADR 029-established new pattern).
+
+**ADR 031 lead candidate (committed):**
+
+- **ADR 031 — Bound Expression Program** (Brainstorm
+  004's narrow realization). Codex's iter-0 ADR 029
+  doc seeded this cycle the same way Gemini iter-0
+  ADR 020 seeded ADR 021 and Claude iter-0 ADR 027
+  seeded ADR 028 — third consecutive instance of the
+  topic-concession-compresses-next-cycle pattern.
+  Substrate-introducing expression-IR work that
+  addresses the Box-everywhere baseline raised across
+  ADR 023 / 024 / 025 / 026 / 028 cycles. Expect 4+
+  iterations with multi flip-flop per the substrate-
+  introducing cadence hypothesis.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **Hidden-aggregate `ORDER BY` keys ADR.** Loosens
+  ADR 023's `"ORDER BY <aggregate-call> requires the
+  aggregate to appear in the SELECT list"` reject
+  (preserved by ADR 027 D3 + ADR 028 ratification +
+  ADR 029 carry-forward). Plan-shape ADR; composes
+  with the ratified ADR 028 signature substrate via
+  `AggregateOutputCatalog::resolve_for_order_by`.
+- **Non-aggregate computed `ORDER BY` ADR.** ADR 027
+  D10 deferred.
+- **PBC partial-pushdown of computed-arg aggregates**
+  (cross-ring; workload-evidence-pressured).
+- **Brainstorm 004 — Memory Arenas / Index-based IR**
+  (alternate framing — broader than ADR 031's
+  `BoundExprProgram` narrow realization). Multiple
+  cycles surfaced the Box-everywhere pattern; the
+  council may choose to land ADR 031's narrow
+  realization first and revisit the broader system-
+  wide migration after evidence accumulates.
+
+**Substrate candidates carried forward:**
+
+- **Utf8 ↔ numeric CAST + TRY_CAST.**
+- **Boolean ↔ numeric CAST + TRY_CAST.**
+- **`DROP TABLE` / `ALTER TABLE` / `CREATE INDEX` /
+  `CREATE VIEW` / `CREATE TABLE AS SELECT (CTAS)`** —
+  DDL siblings to ADR 029.
+- **Constraints** (PRIMARY KEY / FOREIGN KEY / CHECK /
+  column-level UNIQUE) / DEFAULT / GENERATED columns
+  — DDL siblings to ADR 029.
+- **HAVING alias visibility ADR.** Loosens ADR 023's
+  `"HAVING does not resolve SELECT aliases"` reject
+  (preserved verbatim by ADR 027 D7 + ADR 028 D11 +
+  ADR 029 carry-forward).
+- **Temporal column types (DATE, TIMESTAMP)** for
+  ADR 029's type lattice.
+- **DECIMAL** for ADR 029's type lattice.
+- **Cross-ring metadata-write contract ADR** — needed
+  to lift `WendelonCatalog::create_table` from
+  `AdminUnavailable`.
+- **Wendelon AGG consumer wiring (ADR 02X)**
+  (cross-ring).
+
+The post-ADR-028 archived selection notes below
+(forward-sequence content from the prior planning
+pass) remain unchanged.
+
+#### ADR 028 → ADR 029 archived selection notes
 
 ADR 028 selected and promoted **Computed Aggregate
 Arguments** — the first substrate-introducing ADR since
