@@ -1225,18 +1225,32 @@ impl SqlPlanner {
 }
 
 fn sort_needs_hidden_projection(order_by: &[SortExpr]) -> bool {
-	order_by.iter().any(|key| {
-		!sort_key_is_direct_output_reference(&key.expr) && expr_contains_cast_family(&key.expr)
-	})
+	order_by
+		.iter()
+		.any(|key| !sort_key_is_direct_output_reference(&key.expr))
 }
 
 fn sort_key_is_direct_output_reference(expr: &Expr) -> bool {
 	matches!(expr, Expr::Column(_) | Expr::Literal(_))
 }
 
-fn expr_contains_cast_family(expr: &Expr) -> bool {
+fn validate_hidden_sort_key_refs(
+	expr: &Expr,
+	visible_names: &HashSet<String>,
+) -> Result<(), FrontendError> {
 	match expr {
-		Expr::Cast(_, _) | Expr::TryCast(_, _) => true,
+		Expr::Column(column) => {
+			if column.qualifier.is_some() || !visible_names.contains(&column.name.0) {
+				return Err(unsupported(
+					"ORDER BY computed aggregate expression must reference visible output columns",
+				));
+			}
+			Ok(())
+		}
+		Expr::Literal(_) => Ok(()),
+		Expr::Cast(inner, _) | Expr::TryCast(inner, _) => {
+			validate_hidden_sort_key_refs(inner, visible_names)
+		}
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -1248,12 +1262,14 @@ fn expr_contains_cast_family(expr: &Expr) -> bool {
 		| Expr::Gt(left, right)
 		| Expr::Gte(left, right)
 		| Expr::And(left, right)
-		| Expr::Or(left, right) => expr_contains_cast_family(left) || expr_contains_cast_family(right),
+		| Expr::Or(left, right) => {
+			validate_hidden_sort_key_refs(left, visible_names)?;
+			validate_hidden_sort_key_refs(right, visible_names)
+		}
 		Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::TimeBucket(_, inner) => expr_contains_cast_family(inner),
-		Expr::Column(_) | Expr::Literal(_) => false,
+		| Expr::TimeBucket(_, inner) => validate_hidden_sort_key_refs(inner, visible_names),
 	}
 }
 
@@ -1271,6 +1287,7 @@ fn add_hidden_sort_projection(
 		));
 	}
 
+	let visible_names = output_names.iter().cloned().collect::<HashSet<_>>();
 	let mut used_names = output_names.iter().cloned().collect::<HashSet<_>>();
 	let mut projected_exprs = output_names
 		.iter()
@@ -1290,6 +1307,7 @@ fn add_hidden_sort_projection(
 			continue;
 		}
 
+		validate_hidden_sort_key_refs(&key.expr, &visible_names)?;
 		let hidden_name = unique_hidden_sort_name(idx, &mut used_names);
 		projected_exprs.push(key.expr);
 		projected_output_names.push(Some(hidden_name.clone()));

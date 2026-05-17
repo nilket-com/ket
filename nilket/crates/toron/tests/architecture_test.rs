@@ -1062,15 +1062,15 @@ fn adr025_order_by_cast_uses_hidden_sort_projection() {
 		.next()
 		.expect("sort_needs_hidden_projection body")
 		.1;
-	assert!(hidden_gate.contains("expr_contains_cast_family(&key.expr)"));
+	assert!(hidden_gate.contains("!sort_key_is_direct_output_reference(&key.expr)"));
 
-	let contains_cast = brace_blocks_after_marker(&planner, "fn expr_contains_cast_family")
+	let validator = brace_blocks_after_marker(&planner, "fn validate_hidden_sort_key_refs")
 		.into_iter()
 		.next()
-		.expect("expr_contains_cast_family body")
+		.expect("validate_hidden_sort_key_refs body")
 		.1;
-	assert!(contains_cast.contains("Expr::Cast(_, _) | Expr::TryCast(_, _) => true"));
-	assert!(contains_cast.contains("Expr::Add(left, right)"));
+	assert!(validator.contains("Expr::Cast(inner, _) | Expr::TryCast(inner, _)"));
+	assert!(!planner.contains("fn expr_contains_cast_family"));
 
 	let hidden_projection = brace_blocks_after_marker(&planner, "fn add_hidden_sort_projection")
 		.into_iter()
@@ -1501,22 +1501,90 @@ fn adr026_try_cast_pbc_declines() {
 fn adr026_try_cast_order_by_uses_hidden_sort_projection() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
-	assert!(planner.contains("fn expr_contains_cast_family"));
-	assert!(!planner.contains("fn expr_contains_cast("));
-
-	let cast_family = brace_blocks_after_marker(&planner, "fn expr_contains_cast_family")
-		.into_iter()
-		.next()
-		.expect("expr_contains_cast_family body")
-		.1;
-	assert!(cast_family.contains("Expr::Cast(_, _) | Expr::TryCast(_, _) => true"));
+	assert!(!planner.contains("fn expr_contains_cast_family"));
 
 	let sort_gate = brace_blocks_after_marker(&planner, "fn sort_needs_hidden_projection")
 		.into_iter()
 		.next()
 		.expect("sort_needs_hidden_projection body")
 		.1;
-	assert!(sort_gate.contains("expr_contains_cast_family(&key.expr)"));
+	assert!(sort_gate.contains("!sort_key_is_direct_output_reference(&key.expr)"));
+
+	let validator = brace_blocks_after_marker(&planner, "fn validate_hidden_sort_key_refs")
+		.into_iter()
+		.next()
+		.expect("validate_hidden_sort_key_refs body")
+		.1;
+	assert!(validator.contains("Expr::Cast(inner, _) | Expr::TryCast(inner, _)"));
+}
+
+#[test]
+fn adr027_hidden_sort_projection_gate_is_generalized() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+
+	let gate = brace_blocks_after_marker(&planner, "fn sort_needs_hidden_projection")
+		.into_iter()
+		.next()
+		.expect("sort_needs_hidden_projection body")
+		.1;
+	assert!(gate.contains("!sort_key_is_direct_output_reference(&key.expr)"));
+	assert!(!gate.contains("expr_contains_cast_family"));
+	assert!(!planner.contains("fn expr_contains_cast_family"));
+}
+
+#[test]
+fn adr027_hidden_sort_key_refs_are_visible_outputs() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+
+	let validator = brace_blocks_after_marker(&planner, "fn validate_hidden_sort_key_refs")
+		.into_iter()
+		.next()
+		.expect("validate_hidden_sort_key_refs body")
+		.1;
+
+	assert!(validator.contains("column.qualifier.is_some()"));
+	assert!(validator.contains("visible_names.contains(&column.name.0)"));
+	assert!(
+		validator.contains(
+			"ORDER BY computed aggregate expression must reference visible output columns"
+		)
+	);
+	assert!(validator.contains("Expr::Literal(_) => Ok(())"));
+	assert!(validator.contains("Expr::Cast(inner, _) | Expr::TryCast(inner, _)"));
+	for op in ["Add", "Sub", "Mul", "Div"] {
+		assert!(validator.contains(&format!("Expr::{op}(left, right)")));
+	}
+	for op in ["Eq", "Neq", "Lt", "Lte", "Gt", "Gte", "And", "Or"] {
+		assert!(validator.contains(&format!("Expr::{op}(left, right)")));
+	}
+	for op in ["Not", "IsNull", "IsNotNull"] {
+		assert!(validator.contains(&format!("Expr::{op}(inner)")));
+	}
+	assert!(validator.contains("Expr::TimeBucket(_, inner)"));
+}
+
+#[test]
+fn adr027_hidden_sort_projection_contract_is_pinned() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+
+	assert!(planner.contains("fn visible_output_names"));
+	assert!(planner.contains("fn has_duplicate_names"));
+	assert!(planner.contains("fn unique_hidden_sort_name"));
+
+	let mechanism = brace_blocks_after_marker(&planner, "fn add_hidden_sort_projection")
+		.into_iter()
+		.next()
+		.expect("add_hidden_sort_projection body")
+		.1;
+	assert!(mechanism.contains("validate_hidden_sort_key_refs"));
+	assert!(planner.contains("__toron_order_key_"));
+	assert!(
+		planner.contains("ORDER BY computed aggregate expression requires unique output names")
+	);
+	assert!(mechanism.contains("FinalProjection"));
 }
 
 #[test]

@@ -755,11 +755,33 @@ fn having_without_group_by_and_without_aggregate_still_rejects() {
 #[test]
 fn scalar_aggregate_order_by_computed_aggregate_call_arithmetic_lowers() {
 	let plan = plan_sql("SELECT SUM(amount) FROM sales ORDER BY SUM(amount) + 100");
-	let LogicalPlan::Sort { order_by, .. } = plan else {
+	let LogicalPlan::Project {
+		input,
+		exprs,
+		output_names,
+	} = plan
+	else {
+		panic!("expected final project stripping hidden ORDER BY key");
+	};
+	assert_eq!(exprs.len(), 1);
+	assert_column(&exprs[0], "sum");
+	assert_eq!(output_names, vec![Some("sum".to_string())]);
+	let LogicalPlan::Sort {
+		input, order_by, ..
+	} = input.as_ref()
+	else {
 		panic!("expected scalar aggregate sort");
 	};
+	assert_column(&order_by[0].expr, "__toron_order_key_0");
+	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected terminal exchange");
+	};
+	let LogicalPlan::Project { exprs, .. } = input.as_ref() else {
+		panic!("expected hidden sort-key project");
+	};
+	assert_column(&exprs[0], "sum");
 	assert!(matches!(
-		&order_by[0].expr,
+		&exprs[1],
 		Expr::Add(left, right)
 			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
 				&& matches!(right.as_ref(), Expr::Literal(ScalarValue::Int32(Some(100))))
@@ -839,11 +861,38 @@ fn order_by_computed_aggregate_call_arithmetic_lowers() {
 	let plan = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) + 100",
 	);
-	let LogicalPlan::Sort { order_by, .. } = plan else {
+	let LogicalPlan::Project {
+		input,
+		exprs,
+		output_names,
+	} = plan
+	else {
+		panic!("expected final project stripping hidden ORDER BY key");
+	};
+	assert_eq!(exprs.len(), 2);
+	assert_column(&exprs[0], "region");
+	assert_column(&exprs[1], "sum");
+	assert_eq!(
+		output_names,
+		vec![Some("region".to_string()), Some("sum".to_string())]
+	);
+	let LogicalPlan::Sort {
+		input, order_by, ..
+	} = input.as_ref()
+	else {
 		panic!("expected grouped aggregate sort");
 	};
+	assert_column(&order_by[0].expr, "__toron_order_key_0");
+	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected terminal exchange");
+	};
+	let LogicalPlan::Project { exprs, .. } = input.as_ref() else {
+		panic!("expected hidden sort-key project");
+	};
+	assert_column(&exprs[0], "region");
+	assert_column(&exprs[1], "sum");
 	assert!(matches!(
-		&order_by[0].expr,
+		&exprs[2],
 		Expr::Add(left, right)
 			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
 				&& matches!(right.as_ref(), Expr::Literal(ScalarValue::Int32(Some(100))))
@@ -1627,6 +1676,123 @@ async fn order_by_try_cast_aggregate_uses_hidden_projection() {
 			(Some("west".to_string()), Some(20)),
 			(None, Some(7)),
 		]
+	);
+}
+
+#[tokio::test]
+async fn order_by_computed_aggregate_expressions_execute() {
+	for sql in [
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) + 100 DESC",
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) * 1.5 DESC",
+		"SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region ORDER BY SUM(amount) / COUNT(*) DESC",
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) + 1 DESC, region",
+	] {
+		let ordered = run_logical(&plan_sql(sql)).await;
+		assert_eq!(
+			ordered_region_sum_rows(&ordered),
+			vec![
+				(Some("east".to_string()), Some(40)),
+				(Some("west".to_string()), Some(20)),
+				(None, Some(7)),
+			],
+			"{sql}"
+		);
+	}
+
+	let having = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 HAVING SUM(amount) > 10 ORDER BY SUM(amount) + 1 DESC",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&having),
+		vec![
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+		]
+	);
+}
+
+#[tokio::test]
+async fn order_by_alias_and_literal_only_computed_keys_execute() {
+	let alias = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) AS s FROM sales GROUP BY region ORDER BY s + 1 DESC",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&alias),
+		vec![
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+			(None, Some(7)),
+		]
+	);
+
+	let scalar = run_logical(&plan_sql("SELECT SUM(amount) FROM sales ORDER BY 1 + 1")).await;
+	assert_eq!(scalar_sum_rows(&scalar), vec![Some(67)]);
+
+	let grouped = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY 1 + 1, region",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&grouped),
+		vec![
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+			(None, Some(7)),
+		]
+	);
+}
+
+#[test]
+fn order_by_computed_aggregate_refs_must_be_visible_outputs() {
+	for sql in [
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY amount + 1",
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY sales.region + 1",
+	] {
+		assert_unsupported_message(
+			sql,
+			"ORDER BY computed aggregate expression must reference visible output columns",
+		);
+	}
+}
+
+#[test]
+fn order_by_computed_aggregate_preserves_structural_rejects() {
+	assert_unsupported_message(
+		"SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY SUM(amount) + 1",
+		"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list",
+	);
+	assert_unsupported_message(
+		"SELECT region, region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) + 1",
+		"ORDER BY computed aggregate expression requires unique output names",
+	);
+	assert_unsupported_message(
+		"SELECT SUM(CAST(amount AS BIGINT)) FROM sales",
+		"aggregate arguments must be simple column references",
+	);
+	assert_unsupported_message(
+		"SELECT SUM(TRY_CAST(amount AS BIGINT)) FROM sales",
+		"aggregate arguments must be simple column references",
+	);
+}
+
+#[tokio::test]
+async fn non_aggregate_computed_order_by_remains_out_of_scope() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT amount FROM sales ORDER BY amount + 1");
+
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("non-aggregate computed ORDER BY should remain unsupported");
+	assert!(
+		matches!(
+			&err,
+			BindingError::UnsupportedExpression { message }
+				if message == "ORDER BY keys must reference output columns or positive ordinals"
+		),
+		"expected ORDER BY catch-all, got {err}"
 	);
 }
 
