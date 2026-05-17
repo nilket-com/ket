@@ -351,7 +351,7 @@ along with the forward-sequence rewrite.
   materialized in
   `plans/impl/024_scalar_arithmetic_expression_ir.md`.
 - **ADR 025 — SQL `CAST(x AS T)` Syntax — Numeric Primitive
-  Lattice.** Promoted.
+  Lattice.** Promoted + implemented.
   First substrate-downstream ADR after ADR 024's
   binder-only widening Cast IR substrate; lifts the
   `SqlExpr::Cast` reject named in ADR 024's
@@ -433,6 +433,111 @@ along with the forward-sequence rewrite.
   no-CAST queries byte-identical (additive surface). The
   five-phase migration is materialized in
   `plans/impl/025_sql_cast_numeric_primitive_lattice.md`.
+- **ADR 026 — `TRY_CAST(x AS T)` / `SAFE_CAST(x AS T)` —
+  Error-Tolerant Numeric Primitive Cast.** Promoted.
+  First substrate-downstream ADR after ADR 025 that lifts
+  both `TRY_CAST` and `SAFE_CAST` reject arms pinned by
+  ADR 025's `cast_syntax_variants_are_rejected` guard.
+  Exposes the SQL error-tolerant variant under the same
+  16-cell numeric primitive lattice (D3 alias: both
+  `CastKind::TryCast` and `CastKind::SafeCast` lower to
+  the same `Expr::TryCast`). Eleven numbered decisions
+  D1-D11 cover IR shape, failure-modes-that-null,
+  SQL surface, preserved rejects, nullability,
+  aggregate-argument shape, identity preservation, executor
+  strategy, PBC ineligibility, cast-family hidden-sort-key
+  gate, and inner-error propagation. Adds new
+  `Expr::TryCast(Box<Expr>, DataType)` IR variant + twin
+  `ExecutionExpr::TryCast` variant (D1) — pure-addition;
+  Expr enum 9 → 10. Five ADR 025 data-domain failure modes
+  become NULL under TryCast: integer narrowing overflow,
+  float-to-int NaN/Inf/out-of-range, Float64 → Float32
+  finite overflow (D2). Critical contract: "every ADR 025
+  strict Cast data-domain error becomes NULL under
+  TryCast; every ADR 025 strict Cast success stays
+  identical." `TryCast.nullable() = true` regardless of
+  inner.nullable() (D5) — key divergence from ADR 025 D7
+  passthrough. Aggregate-argument column-only rule
+  preserved — `SUM(TRY_CAST(amount AS BIGINT))` continues
+  to reject (D6). **No bind-time identity elision** (D7,
+  parallel to ADR 025 D8): `WHERE TRY_CAST(id AS INT) = 1`
+  preserves `ExecutionExpr::TryCast` at bind time,
+  preventing PBC-pushability. Executor strategy: 6 new
+  per-pair `try_cast_*` fail-to-null kernels for fallible
+  cells (`Int64→Int32`, `Float64→Float32`, four float-to-
+  int paths); 6 infallible cells reuse ADR 025 strict
+  kernels directly (D8). Reuses ADR 025's `F64_I32_UPPER`
+  / `F64_I64_UPPER` exclusive-upper-bound constants and
+  truncation-toward-zero semantic. **Do not implement
+  TryCast by wrapping `evaluate_cast` with catch-and-null**
+  — would (a) stop at first failure instead of per-row
+  NULLs, (b) swallow internal executor bugs, (c) violate
+  D11. PBC remains ineligible with widened diagnostic
+  `"arithmetic, Cast, and TryCast are not PBC-eligible"`
+  (D9). **D10: cast-family hidden-sort-key gate
+  extension** — ADR 025's implementation added the
+  hidden-projection mechanism (`expr_contains_cast` +
+  `sort_needs_hidden_projection` + helpers) for
+  `ORDER BY CAST(SUM(amount) AS Float32) DESC`; ADR 026
+  renames `expr_contains_cast` to
+  `expr_contains_cast_family` and widens the match to
+  `Cast | TryCast` (narrow extension; the broader "ORDER
+  BY computed expressions" cycle remains future work).
+  The `adr026_try_cast_order_by_uses_hidden_sort_projection`
+  guard extends ADR 025's Cast-only source-read coverage
+  for the hidden-projection mechanism to the cast-family
+  case; broader computed-expression coverage remains for
+  a dedicated future ADR.
+  **D11: inner strict Cast errors propagate, NOT
+  swallowed by outer TryCast** (Codex iter-1 critical
+  clarification promoted to numbered decision at
+  iter-2): `TRY_CAST(CAST(big_amount AS INT) AS BIGINT)`
+  with overflowing inner Cast fails with the inner
+  Cast's `ExecutionError::Kernel`; outer TryCast does
+  NOT null this. Structurally enforced via natural `?`
+  operator dispatch in evaluator. Spelling-neutral
+  binder diagnostic `"unsupported TRY_CAST/SAFE_CAST: ..."`
+  (binder no longer knows which spelling once both kinds
+  collapse to `Expr::TryCast`). Eighth instance of the
+  ADR 015 cycle (after 016 / 017 / 018 / 019 / 022 /
+  023 / 024 / 025). Three-way council convergence
+  reached across three iterations; substantive shape at
+  iter-2 on D1-D10, D11 promoted from Codex iter-1
+  clarification, iter-3 closed three implementation-
+  precision items (logical-IR `is_pbc_pushdown_eligible`
+  arm, binder ancillary helpers `collect_expr_columns` +
+  `rewrite_expr_ordinals`, hidden-projection guard
+  naming as a new extension guard, not a rename). One implementation-shape
+  dissent (Gemini iter-1/2 `null_on_failure: bool`
+  flag-on-strict-kernel) retracted at iter-3 in favor of
+  separate `try_cast_*` kernels; pattern matches ADR 025
+  Dissent B retraction. Confirms substrate-downstream
+  cadence hypothesis (2-3 iterations; ADR 025 took 2,
+  ADR 026 took 3). Third consecutive ADR cycle where a
+  Codex iter-1/2 correctness argument surfaces a load-
+  bearing semantic boundary at design time (ADR 024:
+  aggregate-argument shape guard; ADR 025: identity-Cast
+  PBC boundary + float-to-int exclusive bound; ADR 026:
+  inner-Cast-error propagation). SoA-readiness invariants
+  preserved (catalog untouched; per-(source, target)
+  TryCast kernel dispatch preserves JIT specialization
+  seam from ADR 025). Seven new architecture guards
+  (TryCast IR surface, planner lowering, binder policy,
+  numeric primitive lattice, null-only-data-domain-
+  failures, PBC declines, hidden-sort-key gate). Two
+  existing guards adjusted (one renamed). Three new
+  integration tests (`pbc_declines_try_cast_filter`,
+  `pbc_declines_identity_try_cast_filter`,
+  `order_by_try_cast_aggregate_uses_hidden_projection`).
+  No new `LogicalPlan` / `ExecutionPlan` variant; no
+  new `ExecutionError` variant; no new `TaskFailureKind`
+  variant; no new `AggregateOutputRule` variant; no new
+  `StableAggregateKernel` row; no `AggState` change; no
+  fragmenter detector change; no cross-ring engagement;
+  no `GroupedAggregateSignature` widening. Plan digests
+  for no-TryCast queries byte-identical (additive
+  surface). The six-phase migration is materialized in
+  `plans/impl/026_try_cast_numeric_primitive_lattice.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -500,144 +605,156 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 025 promoted; ADR 026 candidates
+### ADR 026 promoted; ADR 027 candidates
 
-ADR 025 selected and promoted **SQL `CAST(x AS T)`
-Syntax — Numeric Primitive Lattice** — the first
-substrate-downstream ADR after ADR 024 that lifts
-the `SqlExpr::Cast` reject ADR 024 pinned in its
-`arithmetic_bind_injects_only_widening_casts`
-negative fixture. Exposes standard SQL `CAST(expr
-AS type)` for Toron's four primitive numeric types
-(`Int32`, `Int64`, `Float32`, `Float64`); extends
-the conversion lattice from ADR 024's 4-cell
-widening to the full 16-cell numeric primitive
-matrix (4 identity + 4 widening inherited + 1
-integer narrowing + 1 float narrowing + 4
-float-to-int + 2 int-to-Float32 lossy). 8 new
-evaluator paths beyond ADR 024's 4. SQL type-name
-normalization for the four numeric primitives;
-bare `FLOAT`/`FLOAT(n)` rejected (precision
-ambiguous across dialects). `TRY_CAST`/`SAFE_CAST`/
-`::`/`FORMAT` rejected with stable per-kind
-diagnostics. Overflow/domain-violation returns
-`ExecutionError::Kernel { message: "cast failed:
-{Source} to {Target}: {cause}" }` (reuses ADR 020/
-022/024 precedent). Float-to-int rejects
-NaN/Inf/out-of-range and truncates toward zero;
-`Float64 → Float32` preserves NaN/±Inf and rejects
-finite overflow. Binder policy split:
-`cast_if_needed` + `is_widening_cast` remain ADR
-024-pristine; new `bind_explicit_cast` +
-`is_supported_explicit_numeric_cast` cover the 16
-cells. **No identity-cast elision in
-`bind_explicit_cast`** (Codex iter-2 correctness
-correction adopted 3/3 against Claude iter-1 +
-Gemini iter-2): preserving `ExecutionExpr::Cast(x,
-T)` for `source == target` keeps the
-PBC-ineligibility boundary visible, preventing
-user-written `CAST(int_col AS Int32)` predicates
-from becoming PBC-pushable. Identity short-circuit
-lives in `evaluate_cast` only. **Exclusive upper
-bound for float-to-int range check** (Codex iter-2
-correctness correction): `F64_I32_UPPER =
-2147483648.0` and `F64_I64_UPPER =
-9223372036854775808.0` (`i*::MAX + 1` exact in
-f64); strict-less-than comparator rules out the
-`i32::MAX as f32 = 2147483648.0` off-by-one trap;
-`Float32 → Int*` kernels convert to f64 before
-range check. Manual per-pair kernels (3/3 ratified
-over Gemini iter-1's `arrow_cast::cast_with_options`
-delegation, which Gemini iter-2 retracted along
-with broader Utf8/Boolean scope). Aggregate-
-argument column-only rule preserved
-(`SUM(CAST(amount AS BIGINT))` continues to
-reject; widening to computed aggregate arguments
-stays deferred). Cast remains PBC-ineligible. Post-
-aggregate CAST allowed (composes with ADR 023).
-Seven new architecture guards (SQL lowering, target-
-type normalization, policy split with no-identity-
-elision negative assertion, 16-cell lattice,
-kernel-error prefix, syntax rejects, float-to-int
-exclusive bound). Two ADR 024 guards adjusted (one
-renamed: `cast_is_binder_only_widening` →
-`adr025_binder_arithmetic_cast_remains_widening_only`,
-SQL-lowering-absence sub-assertion dropped).
-Seventh instance of the ADR 015 cycle (after
-016 / 017 / 018 / 019 / 022 / 023 / 024). Three-way
-council convergence reached across two iterations;
-faster cadence than ADR 023/024 attributed to
-substrate-downstream nature (ADR 024 already
-shipped the `Cast(Box<Expr>, DataType)` IR variant
-unchanged — council decisions were entirely at SQL
-surface + binder policy + executor kernel layer).
-Two correctness corrections from Codex iter-2
-ratified 3/3 at iter-2; one scope reversal recorded
-(Gemini iter-1's broader Utf8/Boolean scope + Arrow-
-kernel delegation retracted by Gemini iter-2).
-SoA-readiness invariants from ADR 021 preserved
-(catalog untouched; per-(source, target) kernel
-dispatch preserves JIT specialization seam from
-ADR 024). No new IR variant; no new `LogicalPlan` /
+ADR 026 selected and promoted
+**`TRY_CAST(x AS T)` / `SAFE_CAST(x AS T)` — Error-
+Tolerant Numeric Primitive Cast** — the first substrate-
+downstream ADR after ADR 025 that lifts both
+`TRY_CAST` and `SAFE_CAST` reject arms ADR 025
+pinned in its `cast_syntax_variants_are_rejected`
+guard. Exposes the SQL error-tolerant cast variant
+under the same 16-cell numeric primitive lattice
+that ADR 025 established. Both `TRY_CAST` and
+`SAFE_CAST` lower to the same `Expr::TryCast` IR
+variant as syntactic aliases. Decisions D1-D11
+cover IR shape (D1 — new variant pair, not flag on
+Cast), failure modes (D2 — 5 ADR 025 data-domain
+errors become NULL), SQL surface (D3 — alias
+bundle), preserved rejects (D4 — `::` + FORMAT
+stay rejected), nullability (D5 — always nullable),
+aggregate-arg shape (D6 — column-only preserved),
+identity preservation (D7 — no bind-time elision,
+parallel to ADR 025 D8), executor strategy (D8 —
+6 fail-to-null + 6 strict-reuse kernels), PBC
+ineligibility (D9 — widened diagnostic), cast-
+family hidden-sort-key gate (D10), and inner-error
+propagation (D11 — `TRY_CAST(CAST(...))` propagates
+inner Cast errors, NOT swallowed). New
+`Expr::TryCast(Box<Expr>, DataType)` IR variant
+(Expr enum 9 → 10) with twin `ExecutionExpr::TryCast`.
+`TryCast.nullable() = true` regardless of inner —
+key divergence from ADR 025 D7. **D11 critical
+clarification** (Codex iter-1 → iter-2 promotion):
+inner strict Cast errors propagate via the natural
+`?` operator dispatch in the evaluator; outer
+TryCast only nulls its OWN per-pair conversion
+failures, NOT child errors. Six new per-pair
+`try_cast_*` fail-to-null kernels for fallible
+cells; 6 infallible cells reuse ADR 025 strict
+kernels directly. Reuses ADR 025's `F64_I32_UPPER`
+/ `F64_I64_UPPER` exclusive-upper-bound constants
+and `cast_failed` Kernel-error prefix. **Do not
+implement TryCast by wrapping `evaluate_cast` with
+catch-and-null** — would (a) stop at first failure
+instead of per-row NULLs, (b) swallow internal
+executor bugs, (c) violate D11. PBC diagnostic
+widens to `"arithmetic, Cast, and TryCast are not
+PBC-eligible"`. **D10 cast-family gate extension**
+extends ADR 025's hidden-projection guard coverage for
+the cast-family case via
+`expr_contains_cast_family` (renamed from
+`expr_contains_cast`, body widened to
+`Cast | TryCast`); the broader retroactive
+ratification of the full mechanism (general
+computed-expression gate, hidden-column naming,
+etc.) remains future work. Eighth instance of the
+ADR 015 cycle (after 016 / 017 / 018 / 019 / 022 /
+023 / 024 / 025). Three-way council convergence
+reached across three iterations; substantive shape
+at iter-2 on D1-D10, D11 promoted from Codex iter-1
+correctness clarification at iter-2, iter-3 closed
+three implementation-precision items (logical-IR
+`is_pbc_pushdown_eligible` arm, binder ancillary
+helpers `collect_expr_columns` /
+`rewrite_expr_ordinals`, hidden-projection guard
+as a new extension guard rather than a rename). One implementation-
+shape dissent (Gemini iter-1/2 `null_on_failure:
+bool` flag-on-strict-kernel) retracted at iter-3 in
+favor of separate `try_cast_*` kernels; pattern
+matches ADR 025 Dissent B retraction. Confirms
+substrate-downstream cadence hypothesis (ADR 025:
+2 iters; ADR 026: 3 iters). Third consecutive
+cycle where a Codex iter-1/2 correctness argument
+surfaces a load-bearing semantic boundary at design
+time (ADR 024: aggregate-arg shape guard; ADR 025:
+identity-Cast PBC + float-to-int exclusive bound;
+ADR 026: inner-Cast-error propagation). Seven new
+architecture guards (TryCast IR surface, planner
+lowering, binder policy, numeric primitive lattice,
+null-only-data-domain-failures, PBC declines,
+hidden-sort-key gate). Two existing guards
+adjusted (one renamed:
+`adr025_cast_syntax_variants_are_rejected →
+adr026_cast_syntax_doublecolon_and_format_remain_rejected`).
+Three new integration tests. SoA-readiness
+invariants preserved (catalog untouched; per-
+(source, target) TryCast kernel dispatch preserves
+JIT specialization seam). No new `LogicalPlan` /
 `ExecutionPlan` variant; no new `ExecutionError`
 variant; no new `TaskFailureKind` variant; no new
 `AggregateOutputRule` variant; no new
 `StableAggregateKernel` row; no `AggState` change;
 no fragmenter detector change; no cross-ring
 engagement; no `GroupedAggregateSignature` widening.
-Plan digests for no-CAST queries byte-identical
-(additive surface). The five-phase migration is
+Plan digests for no-TryCast queries byte-identical
+(additive surface). The six-phase migration is
 materialized in
-`plans/impl/025_sql_cast_numeric_primitive_lattice.md`.
+`plans/impl/026_try_cast_numeric_primitive_lattice.md`.
 
-ADR 026 selection starts from the post-ADR-025
+ADR 027 selection starts from the post-ADR-026
 remainder:
 
-**Substrate candidates newly named-deferred by ADR
-025:**
+**Code-evidence-driven candidate from ADR 025 +
+ADR 026 implementation review:**
 
-- **`TRY_CAST(x AS T)`.** Error-tolerant variant —
-  returns NULL on overflow / domain-violation
-  instead of erroring. Reuses ADR 025's 16-cell
-  numeric lattice with `nullable_on_failure =
-  true`. Decision matrix: does `TRY_CAST` null on
-  NaN→Int, on parse failures (if a future ADR
-  adds Utf8→numeric), on `Float64 → Float32`
-  finite overflow but preserve NaN/Inf? Adds the
-  `SqlExpr::Cast { kind: CastKind::TryCast, .. }`
-  lowering arm; reverses ADR 025's `TRY_CAST`
-  reject diagnostic. Either a flag on the existing
-  `Expr::Cast` variant or a separate `TryCast`
-  variant (own decision). **Lowest-friction
-  substrate-downstream candidate after ADR 025** —
-  reuses lattice + kernels + most of the binder
-  policy without IR reshape; users who hit
-  ADR 025's "cast failed: ..." error want
-  `TRY_CAST` as the natural escape valve.
+- **ORDER BY computed-expressions-on-aggregate-
+  output ratification ADR.** ADR 025's
+  implementation introduced the hidden-projection
+  mechanism (7 helpers in `sql_planner.rs`,
+  including `add_hidden_sort_projection`,
+  `visible_output_names`, `unique_hidden_sort_name`,
+  hidden-column naming `__toron_order_key_{idx}`,
+  duplicate-name detection) and pinned the Cast-only
+  gate. ADR 026 D10 extends that guard coverage to
+  the cast-family case only (`expr_contains_cast_family`).
+  The broader ratification — generalizing the gate to
+  all computed expressions over aggregate output
+  (arithmetic, unary negation, future computed-expression
+  families), adding architecture guards for the full
+  mechanism's shape, deciding hidden-column naming
+  convention as a contract — remains pending.
+  **Code-evidence-driven candidate**; promotes if not
+  absorbed by the hidden-aggregate-keys ADR cycle.
+
+**Substrate candidates carried from ADR 025 / 026
+remainder:**
+
 - **Computed aggregate arguments ADR.** `SUM(x +
-  y)`, `SUM(CAST(amount AS BIGINT))`. Bundled with
-  the derive-Eq/Hash refactor on
-  `AggregateFunction` (blocked by
-  `ApproxQuantile(f64)`) and `Expr` (blocked by
-  `ScalarValue::Float32`/`Float64`).
-  `GroupedAggregateSignature` widening to
-  `(AggregateFunction, Vec<Expr>)` is the
-  signature-shape companion. Composes naturally
-  with ADR 024 + 025 once the signature substrate
-  exists. Promotes when computed-argument workload
+  y)`, `SUM(TRY_CAST(amount AS BIGINT))`. Requires
+  derive-Eq/Hash refactor on `AggregateFunction`
+  (blocked by `ApproxQuantile(f64)`) and `Expr`
+  (blocked by `ScalarValue::Float32`/`Float64`)
+  plus `GroupedAggregateSignature` widening to
+  `(AggregateFunction, Vec<Expr>)`. Composes
+  naturally with ADR 024 + 025 + 026 once the
+  signature substrate exists. **Substrate-
+  introducing ADR** — expect 4+ iterations with at
+  least one flip-flop per the cadence hypothesis.
+  Promotes when computed-argument workload
   evidence surfaces.
-- **Utf8 ↔ numeric CAST.** Adds Utf8 source and
-  target paths to ADR 025's lattice. Parsing
-  semantics ADR — locale, whitespace handling,
-  scientific-notation acceptance, what counts as a
-  parse failure. Bundleable with `TRY_CAST` (parse
-  failures map cleanly to `nullable_on_failure`)
-  or kept separable.
-- **Boolean ↔ numeric CAST.** Truth-table
-  semantics ADR — dialect-specific spellings
+- **Utf8 ↔ numeric CAST + TRY_CAST.** Adds Utf8
+  source and target paths to ADR 025/026 lattices
+  simultaneously. Parsing semantics ADR — locale,
+  whitespace handling, scientific-notation
+  acceptance, what counts as a parse failure.
+  Extends both strict and tolerant variants in one
+  cycle.
+- **Boolean ↔ numeric CAST + TRY_CAST.** Truth-
+  table semantics ADR — dialect-specific spellings
   (`'t'` / `'1'` / `'yes'`); CAST(Boolean AS Int)
-  convention (`true → 1`, `false → 0` is
-  near-universal but explicit).
+  convention (`true → 1`, `false → 0` is near-
+  universal but explicit). Extends both lattices.
 
 **Carried substrate candidates from ADR 023's
 named-deferred set:**
