@@ -195,6 +195,15 @@ impl<'a> Binder<'a> {
 					on,
 					strategy,
 				} => self.bind_join(left, right, *kind, on, *strategy).await,
+				LogicalPlan::CreateTable {
+					name,
+					schema,
+					if_not_exists,
+				} => Ok(ExecutionPlan::CreateTable {
+					name: name.clone(),
+					schema: schema.clone(),
+					if_not_exists: *if_not_exists,
+				}),
 			}
 		})
 	}
@@ -503,6 +512,7 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 				collect_qualifiers(right, qualifiers);
 			}
 		},
+		LogicalPlan::CreateTable { .. } => {}
 	}
 }
 
@@ -646,7 +656,9 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &[ExecutionExpr])> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. } => terminal_exchange(input),
-		ExecutionPlan::Scan { .. } | ExecutionPlan::Join { .. } => None,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::Join { .. }
+		| ExecutionPlan::CreateTable { .. } => None,
 	}
 }
 
@@ -944,6 +956,18 @@ fn optimize_for_required(
 				output_remap,
 			))
 		}
+		ExecutionPlan::CreateTable {
+			name,
+			schema,
+			if_not_exists,
+		} => Ok((
+			ExecutionPlan::CreateTable {
+				name,
+				schema,
+				if_not_exists,
+			},
+			OrdinalRemap::new(),
+		)),
 	}
 }
 

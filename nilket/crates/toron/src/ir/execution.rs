@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::TableRef;
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{AggregateFunction, JoinKind, JoinStrategy, ScalarValue};
 use crate::ir::{QueryProfileHint, TableId};
@@ -121,6 +122,11 @@ pub enum ExecutionPlan {
 		strategy: JoinStrategy,
 		output_schema: SchemaRef,
 	},
+	CreateTable {
+		name: TableRef,
+		schema: SchemaRef,
+		if_not_exists: bool,
+	},
 }
 
 impl ExecutionPlan {
@@ -133,6 +139,7 @@ impl ExecutionPlan {
 			Self::Exchange { input, .. } => input.schema(),
 			Self::Sort { output_schema, .. } => output_schema.clone(),
 			Self::Join { output_schema, .. } => output_schema.clone(),
+			Self::CreateTable { .. } => Arc::new(Schema::empty()),
 		}
 	}
 }

@@ -766,6 +766,7 @@ fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFing
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
 		}
+		ExecutionPlan::CreateTable { .. } => None,
 	}
 }
 

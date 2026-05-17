@@ -458,6 +458,7 @@ fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 			assert_scan_has_no_pbc(left);
 			assert_scan_has_no_pbc(right);
 		}
+		ExecutionPlan::CreateTable { .. } => panic!("CREATE TABLE has no scan"),
 	}
 }
 

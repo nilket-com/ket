@@ -117,6 +117,12 @@ pub enum CatalogError {
 	TableNotFound { table: String },
 	#[error("schema not found: {schema}")]
 	SchemaNotFound { schema: String },
+	#[error("table already exists: {table}")]
+	TableAlreadyExists { table: String },
+	#[error("existing table schema does not match CREATE TABLE IF NOT EXISTS: {table}")]
+	SchemaMismatch { table: String },
+	#[error("catalog admin operation unavailable: {message}")]
+	AdminUnavailable { message: String },
 	#[error("fingerprint resolution failed: {message}")]
 	FingerprintResolution { message: String },
 	#[error(transparent)]

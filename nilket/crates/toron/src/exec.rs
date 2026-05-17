@@ -554,6 +554,9 @@ impl Executor {
 				LogicalPlan::Join { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical join execution",
 				}),
+				LogicalPlan::CreateTable { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound CREATE TABLE execution",
+				}),
 			}
 		})
 	}
@@ -705,6 +708,9 @@ impl Executor {
 					)
 					.await
 				}
+				ExecutionPlan::CreateTable { .. } => Err(ExecutionError::NotImplemented {
+					feature: "CREATE TABLE execution is coordinator-only",
+				}),
 			}
 		})
 	}

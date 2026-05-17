@@ -1,12 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CatalogError;
 use crate::ir::{ColumnOrdinal, TableId};
-use wendelon::schema::{PhysicalDescriptorFingerprint, TableObjectId};
+use wendelon::schema::{
+	LocalityPolicy, MultiRowLayoutDescriptor, PhysicalDescriptorFingerprint, RecordLayoutPolicy,
+	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableRef {
@@ -105,12 +109,34 @@ pub trait Catalog: Send + Sync {
 	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError>;
 
 	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError>;
+
+	async fn create_table(
+		&self,
+		name: &TableRef,
+		schema: SchemaRef,
+		if_not_exists: bool,
+	) -> Result<TableBinding, CatalogError>;
 }
 
 #[derive(Default)]
 pub struct MockCatalog {
+	inner: RwLock<MockCatalogInner>,
+}
+
+struct MockCatalogInner {
 	by_ref: HashMap<TableRef, TableId>,
 	by_id: HashMap<TableId, TableBinding>,
+	next_table_id: u64,
+}
+
+impl Default for MockCatalogInner {
+	fn default() -> Self {
+		Self {
+			by_ref: HashMap::new(),
+			by_id: HashMap::new(),
+			next_table_id: 1,
+		}
+	}
 }
 
 impl MockCatalog {
@@ -126,10 +152,12 @@ impl MockCatalog {
 		let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
 		let unqualified_ref = TableRef::new(&descriptor.table_name);
 		let binding = TableBinding::from_descriptor(legacy_table_id, &descriptor)?;
+		let inner = self.inner.get_mut().expect("MockCatalog lock poisoned");
 
-		self.by_ref.insert(table_ref, legacy_table_id);
-		self.by_ref.insert(unqualified_ref, legacy_table_id);
-		self.by_id.insert(legacy_table_id, binding);
+		inner.by_ref.insert(table_ref, legacy_table_id);
+		inner.by_ref.insert(unqualified_ref, legacy_table_id);
+		inner.by_id.insert(legacy_table_id, binding);
+		bump_next_table_id(inner, legacy_table_id);
 		Ok(())
 	}
 
@@ -139,8 +167,11 @@ impl MockCatalog {
 		binding: TableBinding,
 	) -> Result<(), CatalogError> {
 		let legacy_table_id = binding.legacy_table_id;
-		self.by_ref.insert(table_ref, legacy_table_id);
-		self.by_id.insert(legacy_table_id, binding);
+		let inner = self.inner.get_mut().expect("MockCatalog lock poisoned");
+
+		inner.by_ref.insert(table_ref, legacy_table_id);
+		inner.by_id.insert(legacy_table_id, binding);
+		bump_next_table_id(inner, legacy_table_id);
 		Ok(())
 	}
 }
@@ -148,22 +179,93 @@ impl MockCatalog {
 #[async_trait::async_trait]
 impl Catalog for MockCatalog {
 	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
-		let table_id = self
-			.by_ref
-			.get(table)
+		let inner = self.inner.read().expect("MockCatalog lock poisoned");
+		let table_id =
+			inner
+				.by_ref
+				.get(table)
+				.copied()
+				.ok_or_else(|| CatalogError::TableNotFound {
+					table: table_name(table),
+				})?;
+		inner
+			.by_id
+			.get(&table_id)
+			.cloned()
 			.ok_or_else(|| CatalogError::TableNotFound {
 				table: table_name(table),
-			})?;
-		self.resolve_table_id(*table_id).await
+			})
 	}
 
 	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError> {
-		self.by_id
+		let inner = self.inner.read().expect("MockCatalog lock poisoned");
+		inner
+			.by_id
 			.get(&table)
 			.cloned()
 			.ok_or_else(|| CatalogError::TableNotFound {
 				table: format!("{table:?}"),
 			})
+	}
+
+	async fn create_table(
+		&self,
+		name: &TableRef,
+		schema: SchemaRef,
+		if_not_exists: bool,
+	) -> Result<TableBinding, CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+
+		if let Some(existing_id) = inner.by_ref.get(name).copied() {
+			let existing = inner
+				.by_id
+				.get(&existing_id)
+				.expect("MockCatalog by_ref/by_id consistency invariant")
+				.clone();
+			if if_not_exists {
+				if existing.schema.as_ref() == schema.as_ref() {
+					return Ok(existing);
+				}
+				return Err(CatalogError::SchemaMismatch {
+					table: table_name(name),
+				});
+			}
+			return Err(CatalogError::TableAlreadyExists {
+				table: table_name(name),
+			});
+		}
+
+		while inner.by_id.contains_key(&TableId(inner.next_table_id)) {
+			inner.next_table_id = inner
+				.next_table_id
+				.checked_add(1)
+				.expect("TableId overflow");
+		}
+		let legacy_table_id = TableId(inner.next_table_id);
+		inner.next_table_id = inner
+			.next_table_id
+			.checked_add(1)
+			.expect("TableId overflow");
+
+		let (table_object_id, fingerprint) =
+			mock_table_identity(name, schema.as_ref(), legacy_table_id)?;
+		let binding = TableBinding::new(
+			legacy_table_id,
+			table_object_id,
+			fingerprint,
+			schema.clone(),
+		);
+
+		inner.by_ref.insert(name.clone(), legacy_table_id);
+		if name.schema.is_some() {
+			inner
+				.by_ref
+				.entry(TableRef::new(name.table.clone()))
+				.or_insert(legacy_table_id);
+		}
+		inner.by_id.insert(legacy_table_id, binding.clone());
+
+		Ok(binding)
 	}
 }
 
@@ -211,6 +313,17 @@ impl Catalog for WendelonCatalog {
 				table: format!("{table:?}"),
 			})
 	}
+
+	async fn create_table(
+		&self,
+		_name: &TableRef,
+		_schema: SchemaRef,
+		_if_not_exists: bool,
+	) -> Result<TableBinding, CatalogError> {
+		Err(CatalogError::AdminUnavailable {
+			message: "CREATE TABLE is not wired to Wendelon catalog administration".to_string(),
+		})
+	}
 }
 
 fn table_name(table: &TableRef) -> String {
@@ -218,6 +331,39 @@ fn table_name(table: &TableRef) -> String {
 		Some(schema) => format!("{schema}.{}", table.table),
 		None => table.table.clone(),
 	}
+}
+
+fn bump_next_table_id(inner: &mut MockCatalogInner, table_id: TableId) {
+	inner.next_table_id = inner
+		.next_table_id
+		.max(table_id.0.checked_add(1).expect("TableId overflow"));
+}
+
+fn mock_table_identity(
+	name: &TableRef,
+	schema: &Schema,
+	legacy_table_id: TableId,
+) -> Result<(TableObjectId, PhysicalDescriptorFingerprint), CatalogError> {
+	let mut object_id = [0_u8; 16];
+	object_id[8..].copy_from_slice(&legacy_table_id.0.to_be_bytes());
+	let table_object_id = TableObjectId::new(object_id);
+
+	let descriptor = TableSchemaDescriptor::new_with_layout(
+		table_object_id,
+		1,
+		name.schema.as_deref().unwrap_or("default"),
+		&name.table,
+		schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicyV1::AdditiveOnly,
+	)
+	.map_err(|error| CatalogError::FingerprintResolution {
+		message: error.to_string(),
+	})?;
+
+	Ok((table_object_id, descriptor.physical_descriptor_fingerprint))
 }
 
 fn pbc_eligible_columns(schema: &Schema) -> HashSet<ColumnOrdinal> {

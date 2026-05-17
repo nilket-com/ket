@@ -563,8 +563,9 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 9);
+	assert_eq!(enum_variant_count(logical_plan), 10);
 	assert!(logical_plan.contains("Sort {"));
+	assert!(logical_plan.contains("CreateTable {"));
 	assert!(logical_plan.contains("output_names: Vec<Option<String>>"));
 	assert!(logical_source.contains("pub struct SortExpr"));
 
@@ -575,8 +576,9 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 7);
+	assert_eq!(enum_variant_count(execution_plan), 8);
 	assert!(execution_plan.contains("Sort {"));
+	assert!(execution_plan.contains("CreateTable {"));
 	assert!(execution_source.contains("pub struct ExecutionSortKey"));
 }
 
@@ -2264,6 +2266,318 @@ fn broadcast_join_fragmenter_input_shape_is_architecture_guarded() {
 	);
 	assert!(broadcast.contains("partition_id: PartitionId::new(0)"));
 	assert!(!broadcast.contains("share: None"));
+}
+
+#[test]
+fn adr029_sql_planner_accepts_only_select_and_create_table() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let plan_body = brace_blocks_after_marker(&planner, "pub fn plan")
+		.into_iter()
+		.next()
+		.expect("SqlPlanner::plan body")
+		.1;
+
+	assert!(plan_body.contains("Statement::Query(query)"));
+	assert!(plan_body.contains("Statement::CreateTable(create_table)"));
+	assert!(
+		plan_body.contains("unsupported SQL statement; only SELECT and CREATE TABLE are supported")
+	);
+	assert!(!plan_body.contains("only SELECT is supported"));
+}
+
+#[test]
+fn adr029_create_table_destructure_is_exhaustive() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_create_table(")
+		.into_iter()
+		.next()
+		.expect("lower_create_table body")
+		.1;
+
+	for marker in [
+		"query",
+		"like",
+		"clone",
+		"primary_key",
+		"partition_by",
+		"with_tags",
+	] {
+		assert!(body.contains(marker), "lower_create_table missing {marker}");
+	}
+	assert!(!body.contains(".."));
+}
+
+#[test]
+fn adr029_create_table_ir_surface_is_narrow() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+
+	assert!(logical.contains("CreateTable {\n\t\tname: TableRef,\n\t\tschema: SchemaRef,"));
+	assert!(execution.contains("CreateTable {\n\t\tname: TableRef,\n\t\tschema: SchemaRef,"));
+	assert!(!logical.contains("ColumnSpec"));
+	assert!(!logical.contains("CreateTableColumn"));
+	assert!(!execution.contains("ColumnSpec"));
+	assert!(!execution.contains("CreateTableColumn"));
+}
+
+#[test]
+fn adr029_create_table_name_lowering_is_strict() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_name")
+		.into_iter()
+		.next()
+		.expect("lower_create_table_name body")
+		.1;
+
+	assert!(body.contains("[table]"));
+	assert!(body.contains("[schema, table]"));
+	assert!(body.contains("CREATE TABLE supports only one- or two-part table names"));
+	assert!(!body.contains("table_ref_from_object_name"));
+}
+
+#[test]
+fn adr029_create_table_type_lattice_is_ddl_specific() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_data_type")
+		.into_iter()
+		.next()
+		.expect("lower_create_table_data_type body")
+		.1;
+
+	for marker in [
+		"Ok(DataType::Int32)",
+		"Ok(DataType::Int64)",
+		"Ok(DataType::Float32)",
+		"Ok(DataType::Float64)",
+		"Ok(DataType::Utf8)",
+		"Ok(DataType::Boolean)",
+		"SqlDataType::Float(_)",
+		"SqlDataType::Decimal(_)",
+	] {
+		assert!(body.contains(marker), "DDL type lattice missing {marker}");
+	}
+	assert!(!body.contains("lower_cast_target_type"));
+}
+
+#[test]
+fn adr029_create_table_column_options_are_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_column_nullability")
+		.into_iter()
+		.next()
+		.expect("lower_create_table_column_nullability body")
+		.1;
+
+	for marker in [
+		"ColumnOption::Null => true",
+		"ColumnOption::NotNull => false",
+		"ColumnOption::Default",
+		"ColumnOption::Unique",
+		"ColumnOption::Check",
+		"ColumnOption::ForeignKey",
+		"ColumnOption::Generated",
+		"named constraint",
+	] {
+		assert!(
+			body.contains(marker),
+			"DDL column option guard missing {marker}"
+		);
+	}
+}
+
+#[test]
+fn adr029_create_table_rejects_storage_synthetic_column_names() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+
+	for marker in [
+		"STORAGE_ROW_HLC_COLUMN",
+		"STORAGE_ROW_KEY_ID_COLUMN",
+		"STORAGE_ROW_ROUTING_LOCALITY_COLUMN",
+		"STORAGE_ROW_TABLE_OBJECT_ID_COLUMN",
+		"STORAGE_ROW_TOMBSTONE_COLUMN",
+		"STORAGE_SYNTHETIC_COLUMN_NAMES.contains",
+		"reserved for storage metadata",
+	] {
+		assert!(
+			planner.contains(marker),
+			"storage synthetic guard missing {marker}"
+		);
+	}
+}
+
+#[test]
+fn adr029_catalog_create_table_returns_binding() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let error =
+		std::fs::read_to_string(manifest_dir().join("src/error.rs")).expect("read error source");
+
+	assert!(catalog.contains("async fn create_table("));
+	assert!(catalog.contains(") -> Result<TableBinding, CatalogError>;"));
+	assert!(error.contains("TableAlreadyExists"));
+	assert!(error.contains("SchemaMismatch"));
+	assert!(error.contains("AdminUnavailable"));
+	assert!(error.contains("FingerprintResolution"));
+}
+
+#[test]
+fn adr029_mock_catalog_is_interior_mutable() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+
+	assert!(catalog.contains("inner: RwLock<MockCatalogInner>"));
+	assert!(catalog.contains("next_table_id: u64"));
+	assert!(catalog.contains("self.inner.get_mut()"));
+	assert!(catalog.contains("bump_next_table_id(inner, legacy_table_id)"));
+}
+
+#[test]
+fn adr029_mock_catalog_identity_uses_descriptor_fingerprint() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let body = brace_blocks_after_marker(&catalog, "fn mock_table_identity")
+		.into_iter()
+		.next()
+		.expect("mock_table_identity body")
+		.1;
+
+	assert!(body.contains("TableObjectId::new"));
+	assert!(body.contains("TableSchemaDescriptor::new_with_layout"));
+	assert!(body.contains("physical_descriptor_fingerprint"));
+	assert!(!catalog.contains("PhysicalDescriptorFingerprint::from_bytes"));
+}
+
+#[test]
+fn adr029_mock_catalog_reference_insertion_does_not_overwrite() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let impl_block = catalog
+		.split("impl Catalog for MockCatalog")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Catalog for WendelonCatalog").next())
+		.expect("MockCatalog Catalog impl");
+	let create_body = brace_blocks_after_marker(impl_block, "async fn create_table")
+		.into_iter()
+		.next()
+		.expect("MockCatalog::create_table body")
+		.1;
+
+	assert!(create_body.contains("inner.by_ref.insert(name.clone(), legacy_table_id)"));
+	assert!(create_body.contains(".entry(TableRef::new(name.table.clone()))"));
+	assert!(create_body.contains(".or_insert(legacy_table_id)"));
+	assert_eq!(create_body.matches("by_ref.insert").count(), 1);
+}
+
+#[test]
+fn adr029_wendelon_catalog_create_table_is_admin_unavailable() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let impl_block = catalog
+		.split("impl Catalog for WendelonCatalog")
+		.nth(1)
+		.expect("WendelonCatalog Catalog impl");
+	let body = brace_blocks_after_marker(impl_block, "async fn create_table")
+		.into_iter()
+		.next()
+		.expect("WendelonCatalog::create_table body")
+		.1;
+
+	assert!(body.contains("CatalogError::AdminUnavailable"));
+	assert!(body.contains("CREATE TABLE is not wired to Wendelon catalog administration"));
+}
+
+#[test]
+fn adr029_coordinators_intercept_create_table() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let ddl_branch = query_impl
+		.find("matches!(plan, LogicalPlan::CreateTable")
+		.expect("local DDL branch");
+	let retry_loop = query_impl
+		.find("let mut retried_descriptor_evolution = false")
+		.expect("descriptor retry loop");
+	assert!(ddl_branch < retry_loop);
+	assert!(query_impl.contains("execute_catalog_plan(self.catalog.as_ref(), &bound).await"));
+
+	let distributed_impl = coordinator
+		.split("impl<Registry, Transport> DistributedQueryCoordinator")
+		.nth(1)
+		.expect("DistributedQueryCoordinator impl");
+	let distributed_branch = distributed_impl
+		.find("ExecutionPlan::CreateTable")
+		.expect("distributed DDL branch");
+	let fragment_call = distributed_impl
+		.find("fragment_plan(")
+		.expect("fragmenter call");
+	assert!(distributed_branch < fragment_call);
+	assert!(distributed_impl.contains("execute_catalog_plan(self.catalog.as_ref(), &bound).await"));
+
+	let helper_body = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
+		.into_iter()
+		.next()
+		.expect("execute_catalog_plan helper body")
+		.1;
+	assert!(helper_body.contains(".create_table(name, schema.clone(), *if_not_exists)"));
+	assert!(helper_body.contains("Ok(Vec::new())"));
+	assert_eq!(
+		coordinator
+			.matches("create_table(name, schema.clone(), *if_not_exists)")
+			.count(),
+		1
+	);
+}
+
+#[test]
+fn adr029_executor_and_fragmenter_reject_create_table() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
+		.into_iter()
+		.next()
+		.expect("fragment_plan body")
+		.1;
+
+	assert!(exec.contains("CREATE TABLE execution is coordinator-only"));
+	assert!(fragmenter.contains("CreateTableNotFragmentable"));
+	assert!(fragment_plan.contains("ExecutionPlan::CreateTable"));
+	assert!(
+		fragment_plan.find("ExecutionPlan::CreateTable").unwrap()
+			< fragment_plan.find("count_exchanges").unwrap()
+	);
+}
+
+#[test]
+fn adr029_select_retry_loop_is_preserved() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let loop_body = query_impl
+		.split("loop {")
+		.nth(1)
+		.and_then(|rest| rest.split("match self.executor.execute_bound").next())
+		.expect("descriptor-evolution retry loop body");
+
+	assert!(
+		loop_body.contains("let bound = bind(plan, self.catalog.as_ref(), &self.config).await?")
+	);
 }
 
 struct RecordingStorageScan {

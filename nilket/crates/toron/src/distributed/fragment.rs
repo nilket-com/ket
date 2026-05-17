@@ -60,12 +60,18 @@ pub enum FragmentError {
 	BroadcastNonInner { kind: JoinKind },
 	#[error("broadcast build input must terminate in a single-partition exchange")]
 	BroadcastBuildNotPublished,
+	#[error("CREATE TABLE is a coordinator-only catalog operation")]
+	CreateTableNotFragmentable,
 }
 
 pub fn fragment_plan(
 	plan: ExecutionPlan,
 	config: FragmentPlanConfig,
 ) -> Result<Vec<StagePlan>, FragmentError> {
+	if matches!(plan, ExecutionPlan::CreateTable { .. }) {
+		return Err(FragmentError::CreateTableNotFragmentable);
+	}
+
 	if contains_join(&plan) {
 		return fragment_join_plan(plan, config);
 	}
@@ -848,7 +854,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. } => first_join(input),
-		ExecutionPlan::Scan { .. } => None,
+		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => None,
 	}
 }
 
@@ -885,7 +891,7 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		ExecutionPlan::Join { left, right, .. } => {
 			find_exchange(left).or_else(|| find_exchange(right))
 		}
-		ExecutionPlan::Scan { .. } => None,
+		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => None,
 	}
 }
 
@@ -897,7 +903,7 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
-		ExecutionPlan::Scan { .. } => 0,
+		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => 0,
 	}
 }
 
@@ -923,6 +929,7 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
+		ExecutionPlan::CreateTable { .. } => None,
 	}
 }
 
@@ -1005,7 +1012,7 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			strategy,
 			output_schema,
 		},
-		ExecutionPlan::Scan { .. } => plan,
+		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => plan,
 	}
 }
 
@@ -1063,7 +1070,7 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 			offset,
 			output_schema,
 		},
-		ExecutionPlan::Scan { .. } => plan,
+		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => plan,
 	}
 }
 

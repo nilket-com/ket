@@ -1,6 +1,6 @@
 use crate::catalog::TableRef;
 pub use crate::distributed::identity::{QueryId, StageId};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 #[path = "ir/execution.rs"]
@@ -209,6 +209,11 @@ pub enum LogicalPlan {
 		kind: JoinKind,
 		on: Vec<(Expr, Expr)>,
 		strategy: JoinStrategy,
+	},
+	CreateTable {
+		name: TableRef,
+		schema: SchemaRef,
+		if_not_exists: bool,
 	},
 }
 

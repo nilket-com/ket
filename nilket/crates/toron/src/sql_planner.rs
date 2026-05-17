@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use crate::aggregate_kernel;
 use crate::catalog::TableRef;
@@ -7,15 +8,20 @@ use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
-	BinaryOperator, CastKind, DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, Function,
-	FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
-	JoinConstraint, JoinOperator, ObjectName, OrderBy, Query, Select, SelectItem, SetExpr,
+	BinaryOperator, CastKind, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable,
+	DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, Function, FunctionArg,
+	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
+	Ident, JoinConstraint, JoinOperator, ObjectName, OrderBy, Query, Select, SelectItem, SetExpr,
 	Statement, TableAlias, TableFactor, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use wendelon::schema::{
+	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
+};
 
 fn unsupported(message: impl Into<String>) -> FrontendError {
 	FrontendError::Unsupported {
@@ -29,6 +35,13 @@ const DEFAULT_AGGREGATE_PARTITION_COUNT: u32 = DEFAULT_JOIN_PARTITION_COUNT;
 const AGGREGATE_ARGUMENT_SHAPE_MESSAGE: &str = "unsupported aggregate argument";
 const NESTED_AGGREGATE_ARGUMENT_MESSAGE: &str =
 	"aggregate arguments must not contain aggregate calls";
+const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
+	STORAGE_ROW_HLC_COLUMN,
+	STORAGE_ROW_KEY_ID_COLUMN,
+	STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+	STORAGE_ROW_TOMBSTONE_COLUMN,
+];
 
 fn validate_simple_aggregate_arg(arg: &FunctionArg) -> Result<(), FrontendError> {
 	match arg {
@@ -100,6 +113,145 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 	}
 }
 
+fn lower_create_table_name(name: &ObjectName) -> Result<TableRef, FrontendError> {
+	match name.0.as_slice() {
+		[table] => Ok(TableRef::new(table.value.clone())),
+		[schema, table] => Ok(TableRef::with_schema(
+			schema.value.clone(),
+			table.value.clone(),
+		)),
+		_ => Err(unsupported(
+			"CREATE TABLE supports only one- or two-part table names",
+		)),
+	}
+}
+
+fn lower_create_table_column(column: &ColumnDef) -> Result<Field, FrontendError> {
+	let column_name = &column.name.value;
+
+	if matches!(&column.data_type, SqlDataType::Unspecified) {
+		return Err(unsupported("CREATE TABLE column type is required"));
+	}
+	if STORAGE_SYNTHETIC_COLUMN_NAMES.contains(&column_name.as_str()) {
+		return Err(unsupported(format!(
+			"CREATE TABLE column name is reserved for storage metadata: {column_name}"
+		)));
+	}
+	if column.collation.is_some() {
+		return Err(unsupported(
+			"unsupported CREATE TABLE column option: COLLATE",
+		));
+	}
+
+	let data_type = lower_create_table_data_type(&column.data_type)?;
+	let nullable = lower_create_table_column_nullability(&column.options)?;
+
+	Ok(Field::new(column_name.clone(), data_type, nullable))
+}
+
+fn lower_create_table_column_nullability(
+	options: &[ColumnOptionDef],
+) -> Result<bool, FrontendError> {
+	let mut nullable = None;
+	for option_def in options {
+		if option_def.name.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE column option: named constraint",
+			));
+		}
+		let new_nullable = match &option_def.option {
+			ColumnOption::Null => true,
+			ColumnOption::NotNull => false,
+			ColumnOption::Default(_) => {
+				return Err(unsupported(
+					"unsupported CREATE TABLE column option: DEFAULT",
+				));
+			}
+			ColumnOption::Unique { .. } => {
+				return Err(unsupported(
+					"unsupported CREATE TABLE column option: UNIQUE / PRIMARY KEY",
+				));
+			}
+			ColumnOption::ForeignKey { .. } => {
+				return Err(unsupported(
+					"unsupported CREATE TABLE column option: REFERENCES",
+				));
+			}
+			ColumnOption::Check(_) => {
+				return Err(unsupported("unsupported CREATE TABLE column option: CHECK"));
+			}
+			ColumnOption::Generated { .. } => {
+				return Err(unsupported(
+					"unsupported CREATE TABLE column option: GENERATED",
+				));
+			}
+			ColumnOption::Materialized(_)
+			| ColumnOption::Ephemeral(_)
+			| ColumnOption::Alias(_)
+			| ColumnOption::DialectSpecific(_)
+			| ColumnOption::CharacterSet(_)
+			| ColumnOption::Comment(_)
+			| ColumnOption::OnUpdate(_)
+			| ColumnOption::Options(_)
+			| ColumnOption::Identity(_)
+			| ColumnOption::OnConflict(_)
+			| ColumnOption::Policy(_)
+			| ColumnOption::Tags(_) => {
+				return Err(unsupported("unsupported CREATE TABLE column option"));
+			}
+		};
+		if nullable.is_some() {
+			return Err(unsupported(
+				"CREATE TABLE column nullability is specified more than once",
+			));
+		}
+		nullable = Some(new_nullable);
+	}
+	Ok(nullable.unwrap_or(true))
+}
+
+fn lower_create_table_data_type(data_type: &SqlDataType) -> Result<DataType, FrontendError> {
+	match data_type {
+		SqlDataType::Int(_)
+		| SqlDataType::Integer(_)
+		| SqlDataType::Int4(_)
+		| SqlDataType::Int32 => Ok(DataType::Int32),
+		SqlDataType::BigInt(_) | SqlDataType::Int8(_) | SqlDataType::Int64 => Ok(DataType::Int64),
+		SqlDataType::Real | SqlDataType::Float4 | SqlDataType::Float32 => Ok(DataType::Float32),
+		SqlDataType::Double(_)
+		| SqlDataType::DoublePrecision
+		| SqlDataType::Float8
+		| SqlDataType::Float64 => Ok(DataType::Float64),
+		SqlDataType::Text
+		| SqlDataType::String(_)
+		| SqlDataType::Varchar(_)
+		| SqlDataType::Char(_)
+		| SqlDataType::Character(_)
+		| SqlDataType::CharVarying(_)
+		| SqlDataType::CharacterVarying(_) => Ok(DataType::Utf8),
+		SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Boolean),
+		SqlDataType::Decimal(_) | SqlDataType::Numeric(_) => {
+			Err(unsupported("unsupported CREATE TABLE column type: DECIMAL"))
+		}
+		SqlDataType::Float(_) => Err(unsupported(
+			"unsupported CREATE TABLE column type: FLOAT (precision ambiguous; use REAL or DOUBLE)",
+		)),
+		other => Err(unsupported(format!(
+			"unsupported CREATE TABLE column type: {other}"
+		))),
+	}
+}
+
+fn check_unique_column_names(fields: &[Field]) -> Result<(), FrontendError> {
+	let mut seen = HashSet::new();
+	for field in fields {
+		if !seen.insert(field.name().as_str()) {
+			return Err(unsupported("CREATE TABLE column names must be unique"));
+		}
+	}
+	Ok(())
+}
+
 pub struct SqlPlanner;
 
 impl SqlPlanner {
@@ -119,10 +271,235 @@ impl SqlPlanner {
 
 		match &ast[0] {
 			Statement::Query(query) => self.lower_query(query),
+			Statement::CreateTable(create_table) => self.lower_create_table(create_table),
 			_ => Err(unsupported(
-				"unsupported SQL statement; only SELECT is supported",
+				"unsupported SQL statement; only SELECT and CREATE TABLE are supported",
 			)),
 		}
+	}
+
+	fn lower_create_table(&self, create_table: &CreateTable) -> Result<LogicalPlan, FrontendError> {
+		let CreateTable {
+			or_replace,
+			temporary,
+			external,
+			global,
+			if_not_exists,
+			transient,
+			volatile,
+			name,
+			columns,
+			constraints,
+			hive_distribution,
+			hive_formats,
+			table_properties,
+			with_options,
+			file_format,
+			location,
+			query,
+			without_rowid,
+			like,
+			clone,
+			engine,
+			comment,
+			auto_increment_offset,
+			default_charset,
+			collation,
+			on_commit,
+			on_cluster,
+			primary_key,
+			order_by,
+			partition_by,
+			cluster_by,
+			clustered_by,
+			options,
+			strict,
+			copy_grants,
+			enable_schema_evolution,
+			change_tracking,
+			data_retention_time_in_days,
+			max_data_extension_time_in_days,
+			default_ddl_collation,
+			with_aggregation_policy,
+			with_row_access_policy,
+			with_tags,
+		} = create_table;
+
+		if *or_replace {
+			return Err(unsupported("unsupported CREATE TABLE clause: OR REPLACE"));
+		}
+		if *temporary {
+			return Err(unsupported("unsupported CREATE TABLE clause: TEMPORARY"));
+		}
+		if *external {
+			return Err(unsupported("unsupported CREATE TABLE clause: EXTERNAL"));
+		}
+		if global.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: GLOBAL/LOCAL"));
+		}
+		if *transient {
+			return Err(unsupported("unsupported CREATE TABLE clause: TRANSIENT"));
+		}
+		if *volatile {
+			return Err(unsupported("unsupported CREATE TABLE clause: VOLATILE"));
+		}
+		if !constraints.is_empty() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: table-level constraints",
+			));
+		}
+		if hive_formats.as_ref().is_some_and(|formats| {
+			formats.row_format.is_some()
+				|| formats
+					.serde_properties
+					.as_ref()
+					.is_some_and(|properties| !properties.is_empty())
+				|| formats.storage.is_some()
+				|| formats.location.is_some()
+		}) {
+			return Err(unsupported("unsupported CREATE TABLE clause: HIVE FORMATS"));
+		}
+		if !table_properties.is_empty() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: TBLPROPERTIES",
+			));
+		}
+		if !with_options.is_empty() {
+			return Err(unsupported("unsupported CREATE TABLE clause: WITH options"));
+		}
+		if file_format.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: STORED AS"));
+		}
+		if location.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: LOCATION"));
+		}
+		if query.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: AS SELECT (CTAS)",
+			));
+		}
+		if *without_rowid {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: WITHOUT ROWID",
+			));
+		}
+		if like.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: LIKE"));
+		}
+		if clone.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CLONE"));
+		}
+		if engine.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: ENGINE"));
+		}
+		if comment.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: COMMENT"));
+		}
+		if auto_increment_offset.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: AUTO_INCREMENT",
+			));
+		}
+		if default_charset.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: DEFAULT CHARSET",
+			));
+		}
+		if collation.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: COLLATE"));
+		}
+		if on_commit.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: ON COMMIT"));
+		}
+		if on_cluster.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: ON CLUSTER"));
+		}
+		if primary_key.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: table-level PRIMARY KEY",
+			));
+		}
+		if order_by.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: ORDER BY"));
+		}
+		if partition_by.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: PARTITION BY"));
+		}
+		if cluster_by.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CLUSTER BY"));
+		}
+		if clustered_by.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CLUSTERED BY"));
+		}
+		if options.as_ref().is_some_and(|options| !options.is_empty()) {
+			return Err(unsupported("unsupported CREATE TABLE clause: OPTIONS"));
+		}
+		if *strict {
+			return Err(unsupported("unsupported CREATE TABLE clause: STRICT"));
+		}
+		if *copy_grants {
+			return Err(unsupported("unsupported CREATE TABLE clause: COPY GRANTS"));
+		}
+		if enable_schema_evolution.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: ENABLE SCHEMA EVOLUTION",
+			));
+		}
+		if change_tracking.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: CHANGE TRACKING",
+			));
+		}
+		if data_retention_time_in_days.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: DATA RETENTION",
+			));
+		}
+		if max_data_extension_time_in_days.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: MAX DATA EXTENSION",
+			));
+		}
+		if default_ddl_collation.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: DEFAULT DDL COLLATION",
+			));
+		}
+		if with_aggregation_policy.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: AGGREGATION POLICY",
+			));
+		}
+		if with_row_access_policy.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: ROW ACCESS POLICY",
+			));
+		}
+		if with_tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+			return Err(unsupported("unsupported CREATE TABLE clause: WITH TAGS"));
+		}
+		if !matches!(hive_distribution, HiveDistributionStyle::NONE) {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: Hive distribution",
+			));
+		}
+		if columns.is_empty() {
+			return Err(unsupported("CREATE TABLE requires at least one column"));
+		}
+
+		let table_ref = lower_create_table_name(name)?;
+		let fields = columns
+			.iter()
+			.map(lower_create_table_column)
+			.collect::<Result<Vec<_>, _>>()?;
+		check_unique_column_names(&fields)?;
+		let schema = Arc::new(Schema::new(fields));
+
+		Ok(LogicalPlan::CreateTable {
+			name: table_ref,
+			schema,
+			if_not_exists: *if_not_exists,
+		})
 	}
 
 	fn lower_query(&self, query: &Query) -> Result<LogicalPlan, FrontendError> {
@@ -2304,6 +2681,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			on: _,
 			strategy: _,
 		} => true,
+		LogicalPlan::CreateTable { .. } => false,
 	}
 }
 
@@ -2577,7 +2955,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 				qualifiers
 			}
 		},
-		LogicalPlan::Scan { .. } => Vec::new(),
+		LogicalPlan::Scan { .. } | LogicalPlan::CreateTable { .. } => Vec::new(),
 	}
 }
 

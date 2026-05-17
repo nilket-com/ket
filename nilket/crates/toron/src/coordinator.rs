@@ -12,7 +12,7 @@ use crate::distributed::scheduler::{DistributedScheduler, SchedulerError};
 use crate::distributed::worker_registry::WorkerRegistry;
 use crate::error::{ExecutionError, QueryError, StorageError};
 use crate::exec::Executor;
-use crate::ir::{LogicalPlan, MorselId};
+use crate::ir::{ExecutionPlan, LogicalPlan, MorselId};
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
 use crate::storage::ScanStream;
 
@@ -60,6 +60,10 @@ where
 
 	pub async fn execute_query(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, QueryError> {
 		let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
+		if matches!(bound, ExecutionPlan::CreateTable { .. }) {
+			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
+		}
+
 		let stages = fragment_plan(
 			bound,
 			FragmentPlanConfig::new(
@@ -103,6 +107,27 @@ fn scheduler_error(error: SchedulerError) -> QueryError {
 	}
 }
 
+async fn execute_catalog_plan(
+	catalog: &dyn Catalog,
+	bound: &ExecutionPlan,
+) -> Result<Vec<RecordBatch>, QueryError> {
+	match bound {
+		ExecutionPlan::CreateTable {
+			name,
+			schema,
+			if_not_exists,
+		} => {
+			catalog
+				.create_table(name, schema.clone(), *if_not_exists)
+				.await?;
+			Ok(Vec::new())
+		}
+		other => Err(QueryError::Internal {
+			message: format!("execute_catalog_plan called with non-DDL plan: {other:?}"),
+		}),
+	}
+}
+
 pub struct QueryCoordinator {
 	catalog: Arc<dyn Catalog>,
 	executor: Executor,
@@ -123,6 +148,11 @@ impl QueryCoordinator {
 		plan: &LogicalPlan,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
+		if matches!(plan, LogicalPlan::CreateTable { .. }) {
+			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
+			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
+		}
+
 		let mut retried_descriptor_evolution = false;
 		loop {
 			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
