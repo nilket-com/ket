@@ -334,6 +334,7 @@ fn install_minimal_primitives(
 		AllowProfile::ToronAuthoring => {
 			context.install(rune::modules::core::module()?)?;
 			context.install(rune::modules::cmp::module()?)?;
+			context.install(rune::modules::clone::module()?)?;
 			context.install(rune::modules::num::module()?)?;
 			context.install(rune::modules::i64::module()?)?;
 			context.install(rune::modules::f64::module()?)?;
