@@ -1294,6 +1294,207 @@ along with the forward-sequence rewrite.
   stabilization). The nine-step migration is
   materialized in
   `plans/impl/032_insert_into_select.md`.
+- **ADR 033 — SQL `CREATE TABLE AS SELECT` (Local DDL +
+  DML Composition).** Promoted. **Second composition
+  ADR** after ADR 032, completing the local DDL/DML
+  composition loop: ADR 029 creates a catalog table
+  from a declared schema; ADR 030 writes literal rows
+  via `StorageWrite`; ADR 032 writes SELECT output
+  into an existing table; ADR 033 creates a table
+  whose schema is inferred from the SELECT and writes
+  the SELECT output in one statement. Fourteen
+  decisions D1-D14 + ten Codex R-items (R1-R7 at iter-
+  0; R1-R3 at iter-1).
+  **D1 topic decision:** local `CREATE TABLE AS SELECT`.
+  **D11 critical decision:** local-coordinator-only;
+  `QueryCoordinator::execute_query` intercepts
+  `LogicalPlan::CreateTableAsSelect` before the SELECT
+  retry loop; distributed coordinator rejects before
+  `fragment_plan` with stable diagnostic `"distributed
+  CREATE TABLE AS SELECT execution is not wired to a
+  write-context-bearing coordinator"`; fragmenter
+  rejects via new
+  `FragmentError::CreateTableAsSelectNotFragmentable`;
+  defensive executor rejects for unbound + bound
+  uncoordinated reach.
+  **D2 critical decision (Shape A):** separate IR
+  variants alongside (not replacing) ADR 029
+  `CreateTable` and ADR 032 `InsertSelect` variants.
+  New `LogicalPlan::CreateTableAsSelect { table:
+  TableRef, source: Box<LogicalPlan> }` and new
+  `ExecutionPlan::CreateTableAsSelect { table:
+  TableRef, schema: SchemaRef, source: Box<ExecutionPlan> }`.
+  **The bound variant deliberately does NOT carry
+  `TableId`, `TableObjectId`, or `PhysicalDescriptorFingerprint`**
+  (Codex iter-0 R1) — binding cannot mutate catalog;
+  coordinator obtains binding from `create_table` and
+  uses it to populate `WriteRequest`.
+  `LogicalPlan` 12 → 13; `ExecutionPlan` 10 → 11.
+  **D3 critical decision (narrow SQL surface):** v1
+  supports bare `CREATE TABLE name AS <query>` only;
+  rejects non-empty `CreateTable.columns` (Codex
+  iter-0 R3 — sqlparser's `columns` field is
+  `Vec<ColumnDef>`, not a clean alias list; supporting
+  "column list means aliases under CTAS but typed
+  columns elsewhere" muddles ADR 029's DDL surface);
+  rejects `IF NOT EXISTS` (Codex iter-0 R4 —
+  `Catalog::create_table` returns `TableBinding` not
+  "created vs already existed"; `IF NOT EXISTS` could
+  accidentally append SELECT rows into an existing
+  table); rejects `OR REPLACE` / `LIKE` / `CLONE` /
+  constraints / storage options / etc. via existing
+  ADR 029 reject path. Column renaming uses SELECT
+  aliases (`CREATE TABLE dst AS SELECT x AS a, y AS
+  b FROM src`).
+  **D4 critical decision (schema inference):** target
+  schema inferred from bound source SELECT output —
+  names, types, nullability inherited verbatim;
+  validated against ADR 029 lattice (six types) +
+  duplicate-name reject + Wendelon synthetic name
+  reject.
+  **D5 critical decision (Codex iter-0 R2):** binder
+  binds source SELECT BEFORE any catalog mutation;
+  `CREATE TABLE dst AS SELECT * FROM missing` must
+  fail without leaving phantom catalog entry. Binding
+  cheap; execution potentially expensive.
+  **D6 critical decision (Codex iter-1 R1):**
+  coordinator sequence — `catalog.create_table` →
+  `executor.execute_bound(source, None)` →
+  `materialize_insert_select_batch` (Some) or
+  `materialize_empty_record_batch` (None) → single
+  `writer.write` → `Ok(Vec::new())`. **Create-before-
+  execute is intentional** (fails fast on table-exists
+  / admin-unavailable before spending source SELECT
+  work); load-bearing safety invariant is source
+  BINDING before catalog mutation (D5), not source
+  EXECUTION before catalog mutation.
+  **D7 critical decision (Codex iter-0 R7):** non-
+  atomic catalog-then-write explicitly documented;
+  `create_table` success + write failure = phantom
+  table (v1 limitation; rollback needs future `DROP
+  TABLE` ADR or transactional metadata-write contract
+  ADR).
+  **D8 critical decision (Codex iter-0 R6 + Claude
+  iter-1 C1):** empty source SELECT must create
+  queryable empty table via zero-row write through
+  new sibling helper `materialize_empty_record_batch(schema)`
+  in `coordinator/write.rs`. **ADR 032's
+  `materialize_insert_select_batch` contract preserved
+  verbatim** — still returns `Ok(None)` for zero rows;
+  the CTAS branch handles `None` via sibling helper.
+  No modification to ADR 032 helper. Sibling helper
+  reuses existing private `typed_null_array(_, 0, _)`
+  for empty typed array construction.
+  **D9 critical decision (Codex iter-1 R2 + Claude
+  iter-2 A1):** Wendelon storage synthetic name
+  reject site is the binder's schema-inference path;
+  binder imports the five Wendelon constants directly
+  (or via neutral helper); **forking `__row_*__`
+  literals in `binder.rs` is forbidden** — silent-
+  drift risk between two enforcement sites.
+  Architecture guard #7 enforces via negative-pattern
+  check.
+  **D10 critical decision (Codex iter-1 R3):** no
+  source-to-target type coercion in CTAS — target
+  schema IS source schema by construction; CTAS
+  passes identity `ColumnOrdinal` target columns to
+  `materialize_insert_select_batch`; users spell
+  `CAST` in SELECT if they want type adjustments. The
+  `evaluate_cast` `pub(crate)` visibility ADR 032 D13
+  introduced is not even consumed by the CTAS path.
+  **D11-D14 carry-forwards:** local-only execution
+  (D11 mirrors ADR 029 D4 + ADR 030 D12 + ADR 032
+  D1); binder optimizer may descend into source while
+  distributed walkers treat CTAS as leaf (D12 mirrors
+  ADR 032 D11); outer morsels do not partition CTAS
+  source (D13 mirrors ADR 030 + ADR 032 carry-
+  forward); SELECT plan-digest stability resumes (D14
+  mirrors ADR 032 D10 — composition cycles are zero-
+  break by construction).
+  Three iterations / 0 flip-flops — **ties ADR 032
+  as the fastest cycle in council history**. **First
+  three-way independent iter-0 topic convergence in
+  council history** — all three council members
+  picked CTAS as lead at iter-0 with no topic
+  dissent. Three factors drove the speed: three-way
+  topic convergence (no iter-1 topic reopen); pure-
+  Toron and pure-local (no Wendelon-side discovery
+  pass; ADR 029 catalog path + ADR 032 materialization
+  helper directly reused); Codex iter-0 R1-R7
+  absorbed wholesale by Claude/Gemini iter-1 with
+  three additional Codex iter-1 R-items at the
+  coordinator-ordering and synthetic-name discipline
+  layer. **Sixth consecutive cycle of Codex
+  correctness-clarification pattern** — 10 R-items
+  total across iter-0 + iter-1, each from code-
+  evidence audit of catalog / binder / coordinator
+  boundary. **First cycle where Claude iter-0 was
+  retracted four-for-four on load-bearing v1-surface
+  defaults** (D3 column rename, D5 all-nullable, D7
+  atomicity wording, D8 empty-source no-write —
+  Codex iter-0 R3/R5/R4/R6 corrected each); recorded
+  as cycle property: composition cycles over
+  substrate-rich foundations (ADR 029 / 030 / 031 /
+  032 stack) have more subtle code-evidence
+  constraints than substrate cycles. **Gemini iter-
+  1/2 retraction streak still broken at 6-of-8**:
+  Gemini iter-1 absorbed Codex iter-0 wholesale on
+  the stricter v1 surface with no broader-scope
+  framings — second consecutive composition cycle
+  confirming broader-scope framings are a **substrate-
+  cycle phenomenon**. **Topic-concession-compresses-
+  next-cycle pattern still broken at 3-of-5**: ADR
+  032 → 033 also generated no iter-0 alt-topic seed
+  — second consecutive composition cycle confirming
+  the seed pattern is also substrate-cycle-specific.
+  **Second consecutive zero-substrate-invariant-break
+  cycle**: composition cycles are zero-break by
+  construction (now two data points: 032 + 033).
+  **Three Claude iter-1/iter-2 contributions
+  promoted**: iter-1 C1 → D8 + sibling helper +
+  guard #13; iter-1 C4 → 4 required composition
+  fixtures; iter-2 A1 → architecture guard #7 strict
+  negative-pattern wording.
+  Eighteen new ADR 033 architecture guards + one
+  paired adjustment to the existing
+  `architecture_guards_unchanged_plus_sort_variant`
+  variant-count catch-all = 19 architecture guard
+  touchpoints. Four required end-to-end composition
+  fixtures for Definition of Done: Fixture A (SUM
+  grouped aggregate source), Fixture B (INNER JOIN
+  source), Fixture C (empty-source initialization —
+  empirical verification of D8), Fixture D (failure-
+  before-catalog — regression test for D5). New test
+  file `crates/toron/tests/ctas_test.rs` (Claude
+  iter-2 A2; preserves `insert_test.rs` scope at ADR
+  030 + 032).
+  Fifteenth instance of the ADR 015 cycle. SoA-
+  readiness invariants preserved. Brainstorm-seam
+  touch check: 001 (Cranelift JIT) untouched; 002
+  (WeakControlRing) untouched; 003 (Disaggregated
+  Compute) touched but preserved (one new distributed
+  reject arm); 004 (Memory Arenas) untouched. No new
+  SQL syntax beyond bare `CREATE TABLE name AS
+  <query>`; no new IR expression variant; no new
+  aggregate kernel; no PBC opcode change; no
+  fragmenter detector change for SELECT paths; no
+  cross-ring engagement; no Wendelon-side change;
+  no `RecordBatch` field added to any plan variant;
+  no streaming `StorageWrite` overload; no row-count
+  or RETURNING result; no `blake3` dependency; no
+  external allocator crate added; no source-to-
+  target type coercion at CTAS layer. ADR 029
+  catalog metadata-only preserved; ADR 030
+  `ExecutionPlan::Insert` expression-free preserved;
+  ADR 031 `BoundExprProgram` `PartialEq`-only
+  preserved; ADR 032
+  `materialize_insert_select_batch` `Ok(None)` zero-
+  row contract preserved (guard #17); `StorageWrite`
+  trait shape unchanged. Existing SELECT corpus plan
+  digests byte-identical pre/post-ADR-033 (D14 re-
+  stabilization). The eight-phase migration is
+  materialized in
+  `plans/impl/033_create_table_as_select.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -1361,7 +1562,268 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 032 promoted; ADR 033 candidates
+### ADR 033 promoted; ADR 034 candidates
+
+ADR 033 selected and promoted **SQL `CREATE TABLE AS
+SELECT` (Local DDL + DML Composition)** — Toron's
+**second composition ADR** after ADR 032. Completes the
+local DDL/DML composition loop: ADR 029 creates a
+catalog table from a declared schema; ADR 030 writes
+literal rows via `StorageWrite`; ADR 032 writes SELECT
+output into an existing table; ADR 033 creates a table
+whose schema is inferred from the SELECT and writes the
+SELECT output in a single statement.
+
+Fourteen decisions D1-D14 + ten Codex R-items (R1-R7
+at iter-0; R1-R3 at iter-1) cover: separate IR variants
+alongside (not replacing) ADR 029 / 030 / 032 variants;
+no pre-create table identity in the bound CTAS variant
+(binding cannot mutate catalog; coordinator obtains
+binding from `create_table`); narrow v1 SQL surface (no
+column rename list, no `IF NOT EXISTS`, no `OR REPLACE`
+/ `LIKE` / `CLONE` / constraints); schema inferred
+verbatim from bound source SELECT output (names, types,
+nullability) and validated against ADR 029 lattice +
+duplicate-name reject + Wendelon synthetic-name reject;
+source binds before catalog mutation (so missing-source-
+table failures don't leave phantom catalog entries);
+coordinator sequence catalog.create_table → execute_bound(source,
+None) → materialize_insert_select_batch (Some) /
+materialize_empty_record_batch (None) → single
+writer.write → Ok(Vec::new()); non-atomic catalog-then-
+write explicitly documented as v1 limitation; empty
+source creates queryable empty table via new sibling
+helper (ADR 032's helper contract preserved); Wendelon
+synthetic constants reused directly or via neutral
+helper with no forked literals; no source-to-target
+type coercion (target
+schema IS source schema by construction); local-
+coordinator-only with three independent distributed
+reject sites; binder optimizer may descend into source
+while distributed walkers treat CTAS as leaf; SELECT
+plan-digest stability resumes at post-ADR-032 baseline.
+
+Three iterations / 0 flip-flops — **ties ADR 032 as the
+fastest cycle in council history**. **First three-way
+independent iter-0 topic convergence** in council
+history: Claude / Codex / Gemini all picked CTAS as
+lead at iter-0 with no topic dissent or iter-1 topic
+reopen. Three factors drove the speed:
+
+1. **Three-way iter-0 topic convergence.** No iter-1
+   topic-reopen needed.
+2. **Pure-Toron and pure-local.** No Wendelon-side
+   discovery pass; no distributed-write-context
+   threading; ADR 029 catalog path + ADR 032
+   materialization helper directly reused.
+3. **Codex iter-0 R1-R7 absorbed wholesale.** Claude
+   iter-1 and Gemini iter-1 ratified Codex iter-0's
+   seven precision items without amendment; Codex
+   iter-1 added three more R-items at the coordinator-
+   ordering and synthetic-name discipline layer.
+
+**Sixth consecutive cycle of Codex correctness-
+clarification pattern** — 10 R-items total across
+iter-0 (R1 no pre-create identity, R2 bind source
+before catalog mutation, R3 no v1 column list, R4 no v1
+`IF NOT EXISTS`, R5 schema validation with lattice +
+name rules, R6 empty source initializes queryable
+table, R7 non-atomicity acceptable if named) + iter-1
+(R1 create-before-source-execution intentional, R2
+Wendelon constants reused without forked literals, R3
+no coercion in CTAS). Each surfaced from
+code-evidence audit of catalog / binder / coordinator
+boundary.
+
+**First cycle where Claude iter-0 was retracted four-
+for-four on load-bearing v1-surface defaults** — D3
+(column rename list accepted), D5 (all-nullable target),
+D7 (atomicity wording), D8 (empty-source no-write).
+Codex iter-0 R3 / R5 / R4 / R6 corrected each. All
+four retracted cleanly at iter-1 without further
+reopen. Recorded as cycle property: **composition
+cycles over substrate-rich foundations have more
+subtle code-evidence constraints than substrate cycles**
+because the substrate already introduced the carriers,
+helpers, and contracts that the composition layer must
+respect. Iter-0 design sketches at the composition
+layer benefit from deferring v1-surface defaults to
+iter-1 code-evidence audits.
+
+**Gemini iter-1/2 retraction streak still broken at
+6-of-8.** Second consecutive composition cycle (032 +
+033) where Gemini did not propose broader-scope framings
+(no Plan Arena push, no streaming `StorageWrite` push,
+no distributed-write-context push). Updated cycle
+property after two composition-cycle data points:
+**broader-scope framings are a substrate-cycle
+phenomenon, not a universal cycle phenomenon.**
+
+**Topic-concession-compresses-next-cycle pattern still
+broken at 3-of-5.** Second consecutive composition cycle
+generating no iter-0 alt-topic seed. Updated cycle
+property: **seed-carry-forward is also substrate-cycle-
+specific.**
+
+**Second consecutive zero-substrate-invariant-break
+cycle.** ADR 032 + ADR 033 are both composition cycles.
+Pattern: composition cycles are zero-break by
+construction. Two data points.
+
+**Three Claude iter-1/iter-2 contributions promoted:**
+
+- iter-1 C1 empty-source sibling helper shape → D8 +
+  new helper `materialize_empty_record_batch` +
+  architecture guard #13.
+- iter-1 C4 + iter-2 fixture additions → 4 required
+  composition fixtures (A SUM / B JOIN / C empty / D
+  failure-before-catalog).
+- iter-2 A1 strict-pin guard wording for synthetic-
+  name reject → architecture guard #7 negative-
+  pattern enforcement against forked `__row_*__`
+  literals.
+
+Iter-1 C2 ordering pins were absorbed into Codex iter-1
+architecture guards #6 + #11; iter-2 A2 (`ctas_test.rs`
+file adoption), A3 (helper-reuse table for implementer),
+A4 (variant-count guard pairing) were folded into the
+impl plan.
+
+Fifteenth instance of the ADR 015 cycle. Eighteen new
+ADR 033 architecture guards + one paired adjustment to
+the existing
+`architecture_guards_unchanged_plus_sort_variant`
+variant-count catch-all = 19 architecture guard
+touchpoints. SoA-readiness invariants preserved.
+Brainstorm-seam touch check: 001 + 002 + 004 untouched;
+003 touched but preserved (one new distributed reject
+arm).
+
+No new SQL syntax beyond bare `CREATE TABLE name AS
+<query>`; no new IR expression variant; no new aggregate
+kernel; no PBC opcode change; no fragmenter detector
+change for SELECT paths; no cross-ring engagement; no
+Wendelon-side change; no `RecordBatch` field added to
+any plan variant; no streaming `StorageWrite` overload;
+no row-count or RETURNING result; no `blake3`
+dependency; no external allocator crate added; no
+source-to-target type coercion at CTAS layer. ADR 029
+/ 030 / 031 / 032 invariants preserved. Existing SELECT
+corpus plan digests byte-identical pre/post-ADR-033
+(D14 re-stabilization). The eight-phase migration is
+materialized in
+`plans/impl/033_create_table_as_select.md`.
+
+ADR 034 selection opens a new space. The local DDL/DML
+composition loop is now complete:
+
+- CREATE TABLE with declared schema (ADR 029);
+- INSERT VALUES literal rows (ADR 030);
+- INSERT INTO ... SELECT from query output (ADR 032);
+- CREATE TABLE AS SELECT with inferred schema (ADR 033).
+
+The next composition layer is data-modifying DML
+(UPDATE / DELETE) or result-shape extension (RETURNING).
+The next substrate layer is cross-ring distributed-
+write-context (lifts ADR 030 D13 + ADR 032 D1 + ADR 033
+D11) or DROP TABLE (enables OR REPLACE for CTAS and
+rollback-after-write-failure semantics).
+
+**ADR 034 lead candidates (no firm commitment):**
+
+- **`DELETE WHERE`** — completes the basic CRUD set
+  (CREATE / INSERT / READ / DELETE); engages
+  `__row_tombstone__` substrate Wendelon already owns
+  per ADR 030 D7; establishes the row-identification
+  predicate substrate UPDATE will need. Substrate-
+  introducing-ish (predicate carrier is new). Likely
+  3-4 iterations with one flip-flop on predicate
+  shape.
+- **`DROP TABLE`** — first DDL deletion ADR;
+  prerequisite for `OR REPLACE` and for any rollback-
+  on-write-failure CTAS extension; engages catalog
+  mutation semantics. Pure composition over ADR 029
+  catalog path. Likely 3-iteration cycle.
+- **Cross-ring distributed-write-context ADR** —
+  lifts ADR 030 D13 + ADR 032 D1 + ADR 033 D11
+  distributed rejects. Threads tenant / session / HLC
+  context through `DistributedQueryCoordinator`.
+  Cross-ring substrate work; two-pass Wendelon-API
+  discovery budget required. Slower cycle (4+ iters).
+  No current workload evidence pressuring it.
+- **`INSERT ... RETURNING` / `CTAS ... RETURNING`** —
+  DML result-shape extension; shifts ADR 030 / 032 /
+  033 `Ok(Vec::new())` contract. Composes naturally
+  with ADR 032 / 033 materialize-before-write paths.
+  Modest user value until DEFAULT / GENERATED columns
+  or sequences exist.
+
+**Substrate candidates carried forward:**
+
+- **Hidden-aggregate `ORDER BY` keys ADR.** Loosens
+  ADR 023 reject; narrow composition over ADR 028
+  signature substrate.
+- **HAVING alias visibility ADR.** Loosens ADR 023
+  reject; pairs with hidden-aggregate ORDER BY.
+- **Non-aggregate computed `ORDER BY` ADR.** ADR 027
+  D10 deferred.
+- **`UPDATE WHERE`** — DML sibling to DELETE; needs
+  row-identification predicate substrate (DELETE
+  establishes) + new partial-write contract.
+- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
+  extensions; need PK / unique-constraint substrate
+  first.
+- **Streaming / multi-batch `StorageWrite::write`** —
+  lifts ADR 032 D5 + D6 + ADR 033 D8 single-batch cap
+  for bulk loads.
+- **Write retries after descriptor evolution** — ADR
+  030 D12 + ADR 032 + ADR 033 carry-forward.
+- **Read-your-writes session HLC advancement ADR.**
+- **Per-statement `durability` override.**
+- **Cross-ring metadata-write contract ADR** — needed
+  to lift `WendelonCatalog::create_table` from
+  `AdminUnavailable`; engages transactional CTAS.
+- **Richer Toron `Hlc` type** — prerequisite for
+  read-your-writes.
+- **Idempotency / write-retry-after-descriptor-
+  evolution ADR.**
+- **Temporal column types (DATE, TIMESTAMP)** for
+  ADR 029 / 030 / 032 / 033 type lattices.
+- **DECIMAL** for ADR 029 / 030 / 032 / 033 type
+  lattices.
+- **Utf8 ↔ numeric CAST + TRY_CAST.**
+- **Boolean ↔ numeric CAST + TRY_CAST.**
+- **`ALTER TABLE` / `CREATE INDEX` / `CREATE VIEW`**
+  — DDL siblings to ADR 029 / 033.
+- **Constraints** (PRIMARY KEY / FOREIGN KEY / CHECK
+  / column-level UNIQUE) / DEFAULT / GENERATED
+  columns.
+- **Wendelon AGG consumer wiring** — cross-ring;
+  PBC partial-pushdown.
+- **Kernel graduations** (`LinearRegress`,
+  `ApproxQuantile`).
+
+**Code-evidence-driven candidates carried forward:**
+
+- **Typed expression tape / opcode interpreter** —
+  Brainstorm 004 deeper realization over ADR 031's
+  `BoundExprProgram`.
+- **Common subexpression elimination (CSE) + literal
+  deduplication** — ADR 031 D8 carry-forward.
+- **Cranelift JIT compilation** (Brainstorm 001).
+- **Logical `Expr` arena migration** — Brainstorm
+  004 broader framing.
+- **Plan Arena / index-based plan IR** — Brainstorm
+  004 broader framing; ADR 032 + 033 added a combined
+  ~22 walker leaf arms; pressure is growing but still
+  bounded.
+- **PBC partial-pushdown of computed-arg aggregates**
+  — cross-ring; workload-evidence-pressured.
+
+The archived selection notes below preserve forward-
+sequence content from prior planning passes.
+
+#### ADR 032 → ADR 033 archived selection notes
 
 ADR 032 selected and promoted **SQL `INSERT INTO ...
 SELECT` (Local Read-Write Composition)** — Toron's
