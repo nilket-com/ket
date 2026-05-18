@@ -565,6 +565,9 @@ impl Executor {
 				LogicalPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound INSERT execution",
 				}),
+				LogicalPlan::InsertSelect { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound INSERT INTO ... SELECT execution",
+				}),
 			}
 		})
 	}
@@ -718,6 +721,9 @@ impl Executor {
 				}),
 				ExecutionPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "INSERT execution is coordinator-only",
+				}),
+				ExecutionPlan::InsertSelect { .. } => Err(ExecutionError::NotImplemented {
+					feature: "INSERT INTO ... SELECT execution is coordinator-only",
 				}),
 			}
 		})
@@ -3905,7 +3911,10 @@ fn evaluate_unbound_arithmetic(
 	evaluate_arithmetic(op, &left, &right, &output_type)
 }
 
-fn evaluate_cast(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, ExecutionError> {
+pub(crate) fn evaluate_cast(
+	array: &ArrayRef,
+	target: &DataType,
+) -> Result<ArrayRef, ExecutionError> {
 	if array.data_type() == target {
 		return Ok(array.clone());
 	}

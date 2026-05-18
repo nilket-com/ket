@@ -1263,9 +1263,9 @@ along with the forward-sequence rewrite.
   may-descend exception, R4 runtime null-check vs
   schema null-check — all non-obvious refinements
   Claude iter-0 missed; healthy collaboration sign).
-  Fourteen architecture guards (12 ADR-032-specific +
-  2 composition guards verifying ADR 030 + ADR 031
-  invariants survive). Two required end-to-end
+  Fourteen ADR-032-specific architecture guards, plus
+  in-place updates to existing LogicalPlan /
+  ExecutionPlan variant-count coverage. Two required end-to-end
   composition fixtures: **Fixture A (grouped
   aggregate source — SUM)** exercises ADR 028
   signature substrate + ADR 031 `BoundExprProgram`
@@ -1486,9 +1486,9 @@ partition DML) — all non-obvious refinements Claude
 iter-0 missed.
 
 Fourteenth instance of the ADR 015 cycle. Fourteen
-architecture guards (12 ADR-032-specific + 2
-composition guards verifying ADR 030 + ADR 031
-invariants survive ADR 032). Two required end-to-end
+ADR-032-specific architecture guards, plus in-place
+updates to existing LogicalPlan / ExecutionPlan
+variant-count coverage. Two required end-to-end
 composition fixtures for Definition of Done: Fixture
 A (grouped aggregate source — SUM) exercises ADR 028
 signature substrate + ADR 031 `BoundExprProgram`

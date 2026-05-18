@@ -71,6 +71,12 @@ where
 					.to_string(),
 			});
 		}
+		if matches!(bound, ExecutionPlan::InsertSelect { .. }) {
+			return Err(QueryError::Internal {
+				message: "distributed INSERT INTO ... SELECT execution is not wired to a write-context-bearing coordinator"
+					.to_string(),
+			});
+		}
 
 		let stages = fragment_plan(
 			bound,
@@ -171,7 +177,10 @@ impl QueryCoordinator {
 			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
 			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
 		}
-		if matches!(plan, LogicalPlan::Insert { .. }) {
+		if matches!(
+			plan,
+			LogicalPlan::Insert { .. } | LogicalPlan::InsertSelect { .. }
+		) {
 			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
 			return self.execute_write_plan(&bound).await;
 		}
@@ -207,6 +216,39 @@ impl QueryCoordinator {
 				rows,
 			} => {
 				let payload = write::materialize_insert_batch(schema, rows)?;
+				let context = self.executor.context();
+				self.writer
+					.write(WriteRequest {
+						session_id: context.session_id,
+						query_id: context.query_id,
+						tenant_id: context.tenant_id,
+						table_id: *legacy_table_id,
+						table_object_id: *table,
+						physical_descriptor_fingerprint: *fingerprint,
+						payload,
+						profile_hint: context.profile_hint,
+						trace_context: context.trace_context.clone(),
+					})
+					.await?;
+				Ok(Vec::new())
+			}
+			ExecutionPlan::InsertSelect {
+				legacy_table_id,
+				table,
+				fingerprint,
+				schema,
+				target_columns,
+				source,
+			} => {
+				let source_batches = self.executor.execute_bound(source, None).await?;
+				let Some(payload) = write::materialize_insert_select_batch(
+					schema,
+					target_columns,
+					&source_batches,
+				)?
+				else {
+					return Ok(Vec::new());
+				};
 				let context = self.executor.context();
 				self.writer
 					.write(WriteRequest {

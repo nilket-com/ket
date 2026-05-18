@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -14,7 +14,8 @@ use toron::distributed::worker_registry::StaticWorkerRegistry;
 use toron::error::{BindingError, ExecutionError, QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	ExecutionPlan, InsertLiteral, LogicalPlan, QueryProfileHint, ScalarValue, SessionId, TableId,
+	ColumnOrdinal, ExecutionPlan, InsertLiteral, LogicalPlan, QueryProfileHint, ScalarValue,
+	SessionId, TableId,
 };
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
@@ -58,6 +59,26 @@ fn planner_accepts_literal_insert_surface() {
 }
 
 #[test]
+fn planner_accepts_insert_select_surface() {
+	let plan = SqlPlanner::new()
+		.plan("INSERT INTO dst (b, a) SELECT x, y FROM src")
+		.expect("plan insert select");
+
+	let LogicalPlan::InsertSelect {
+		table,
+		columns,
+		source,
+	} = plan
+	else {
+		panic!("expected insert select plan");
+	};
+
+	assert_eq!(table, TableRef::new("dst"));
+	assert_eq!(columns, Some(vec!["b".to_string(), "a".to_string()]));
+	assert!(matches!(*source, LogicalPlan::Project { .. }));
+}
+
+#[test]
 fn planner_accepts_full_column_null_and_negative_literals() {
 	let plan = SqlPlanner::new()
 		.plan("INSERT INTO readings VALUES (NULL, -1)")
@@ -83,7 +104,6 @@ fn planner_accepts_full_column_null_and_negative_literals() {
 #[test]
 fn planner_rejects_unsupported_insert_shapes() {
 	for (sql, diagnostic) in [
-		("INSERT INTO t SELECT 1", "INSERT source must be VALUES"),
 		("INSERT t (a) VALUES (1)", "missing INTO"),
 		("INSERT INTO TABLE t (a) VALUES (1)", "TABLE keyword"),
 		("INSERT INTO t (a) VALUES (1) RETURNING a", "RETURNING"),
@@ -189,6 +209,70 @@ async fn binder_coerces_all_create_table_types() {
 			ScalarValue::Boolean(Some(true)),
 		]]
 	);
+}
+
+#[tokio::test]
+async fn binder_emits_insert_select_target_columns_in_source_order() {
+	let catalog = insert_select_catalog().await;
+	let plan = SqlPlanner::new()
+		.plan("INSERT INTO dst (b, a) SELECT x, y FROM src")
+		.expect("plan insert select");
+
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind insert select");
+	let ExecutionPlan::InsertSelect {
+		schema,
+		target_columns,
+		source,
+		..
+	} = bound
+	else {
+		panic!("expected insert select execution plan");
+	};
+
+	assert_eq!(schema.field(0).name(), "a");
+	assert_eq!(schema.field(1).name(), "b");
+	assert_eq!(
+		target_columns
+			.iter()
+			.map(|column| column.0)
+			.collect::<Vec<_>>(),
+		vec![1, 0]
+	);
+	assert_eq!(source.schema().fields().len(), 2);
+}
+
+#[tokio::test]
+async fn binder_rejects_invalid_insert_select_bindings() {
+	for (sql, diagnostic) in [
+		(
+			"INSERT INTO dst (a, b) SELECT x FROM src",
+			"source has 1 columns; expected 2",
+		),
+		(
+			"INSERT INTO dst (missing) SELECT x FROM src",
+			"unknown column",
+		),
+		(
+			"INSERT INTO dst (b) SELECT label FROM src",
+			"omits non-nullable column",
+		),
+		(
+			"INSERT INTO dst (a) SELECT label FROM src",
+			"not compatible",
+		),
+	] {
+		let catalog = insert_select_catalog().await;
+		let plan = SqlPlanner::new().plan(sql).expect("plan insert select");
+		let err = bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.expect_err("bind should reject");
+		assert!(
+			err.to_string().contains(diagnostic),
+			"expected diagnostic {diagnostic:?}, got {err}"
+		);
+	}
 }
 
 #[tokio::test]
@@ -325,6 +409,282 @@ async fn query_coordinator_executes_insert_and_select_round_trip() {
 }
 
 #[tokio::test]
+async fn query_coordinator_executes_insert_select_composition_fixtures() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), storage.clone());
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE src (id INT NOT NULL, amount BIGINT NOT NULL)",
+		"CREATE TABLE totals (id INT NOT NULL, total BIGINT NOT NULL)",
+		"INSERT INTO src VALUES (1, 100), (1, 200), (2, 50)",
+		"INSERT INTO totals (id, total) SELECT id, SUM(amount) FROM src GROUP BY id",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+	let totals = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT id, total FROM totals ORDER BY id",
+	)
+	.await;
+	let ids = totals
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("id column");
+	let totals_values = totals
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("total column");
+	assert_eq!(ids.values(), &[1, 2]);
+	assert_eq!(totals_values.values(), &[300, 50]);
+
+	for sql in [
+		"CREATE TABLE left_table (id INT NOT NULL, label TEXT)",
+		"CREATE TABLE right_table (left_id INT NOT NULL, score BIGINT NOT NULL)",
+		"CREATE TABLE joined (id INT NOT NULL, label TEXT, score BIGINT NOT NULL)",
+		"INSERT INTO left_table VALUES (1, 'a'), (2, 'b')",
+		"INSERT INTO right_table VALUES (1, 100), (2, 200)",
+		"INSERT INTO joined (score, id, label) SELECT score, id, label FROM left_table INNER JOIN right_table ON left_table.id = right_table.left_id",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+	let joined = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT id, label, score FROM joined ORDER BY id",
+	)
+	.await;
+	let joined_ids = joined
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("id column");
+	let labels = joined
+		.column(1)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("label column");
+	let scores = joined
+		.column(2)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("score column");
+	assert_eq!(joined_ids.values(), &[1, 2]);
+	assert_eq!(labels.value(0), "a");
+	assert_eq!(labels.value(1), "b");
+	assert_eq!(scores.values(), &[100, 200]);
+}
+
+#[tokio::test]
+async fn query_coordinator_insert_select_reorders_and_fills_nullable_targets() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), storage.clone());
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE src (x INT NOT NULL, y TEXT)",
+		"CREATE TABLE dst (a TEXT, b INT NOT NULL, c BIGINT)",
+		"INSERT INTO src VALUES (7, 'seven')",
+		"INSERT INTO dst (b, a) SELECT x, y FROM src",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let batch = concat_query(&coordinator, &planner, "SELECT a, b, c FROM dst").await;
+	let labels = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("a column");
+	let values = batch
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("b column");
+	let omitted = batch
+		.column(2)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("c column");
+	assert_eq!(labels.value(0), "seven");
+	assert_eq!(values.value(0), 7);
+	assert!(omitted.is_null(0));
+}
+
+#[tokio::test]
+async fn query_coordinator_insert_select_empty_source_does_not_write() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), storage.clone());
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE src (id INT NOT NULL)",
+		"CREATE TABLE dst (id INT NOT NULL)",
+		"INSERT INTO src VALUES (1)",
+		"INSERT INTO dst SELECT id FROM src WHERE id > 10",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let err = coordinator
+		.execute_query(
+			&planner.plan("SELECT id FROM dst").expect("plan select"),
+			None,
+		)
+		.await
+		.expect_err("empty source must not initialize table storage");
+	assert!(
+		err.to_string().contains("table not found"),
+		"unexpected error: {err}"
+	);
+}
+
+#[tokio::test]
+async fn query_coordinator_insert_select_rejects_runtime_null_and_cast_overflow_before_write() {
+	for (setup, insert_sql, diagnostic) in [
+		(
+			vec![
+				"CREATE TABLE src (id INT)",
+				"CREATE TABLE dst (id INT NOT NULL)",
+				"INSERT INTO src VALUES (NULL)",
+			],
+			"INSERT INTO dst SELECT id FROM src",
+			"non-nullable column",
+		),
+		(
+			vec![
+				"CREATE TABLE src (id BIGINT NOT NULL)",
+				"CREATE TABLE dst (id INT NOT NULL)",
+				"INSERT INTO src VALUES (2147483648)",
+			],
+			"INSERT INTO dst SELECT id FROM src",
+			"cast failed",
+		),
+	] {
+		let catalog = Arc::new(MockCatalog::new());
+		let storage = Arc::new(InMemoryTableStorage::new());
+		let executor = Executor::new(storage.clone());
+		let coordinator = QueryCoordinator::with_writer(
+			catalog,
+			executor,
+			PlannerConfig::default(),
+			storage.clone(),
+		);
+		let planner = SqlPlanner::new();
+
+		for sql in setup {
+			coordinator
+				.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+				.await
+				.expect(sql);
+		}
+
+		let err = coordinator
+			.execute_query(&planner.plan(insert_sql).expect("plan insert select"), None)
+			.await
+			.expect_err("insert select should reject before write");
+		assert!(
+			err.to_string().contains(diagnostic),
+			"expected diagnostic {diagnostic:?}, got {err}"
+		);
+		let select_err = coordinator
+			.execute_query(
+				&planner.plan("SELECT id FROM dst").expect("plan select"),
+				None,
+			)
+			.await
+			.expect_err("target should not be written");
+		assert!(select_err.to_string().contains("table not found"));
+	}
+}
+
+#[tokio::test]
+async fn query_coordinator_insert_select_enforces_total_row_cap_before_write() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator = QueryCoordinator::with_writer(
+		catalog.clone(),
+		executor,
+		PlannerConfig::default(),
+		storage.clone(),
+	);
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE src (id INT NOT NULL)",
+		"CREATE TABLE dst (id INT NOT NULL)",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let binding = catalog
+		.resolve_table(&TableRef::new("src"))
+		.await
+		.expect("resolve src");
+	let payload = RecordBatch::try_new(
+		binding.schema.clone(),
+		vec![Arc::new(Int32Array::from(
+			(0..=TABLE_WRITE_MAX_ROWS as i32).collect::<Vec<_>>(),
+		))],
+	)
+	.expect("source payload");
+	storage
+		.write(write_request(&binding, payload))
+		.await
+		.expect("seed oversized source");
+
+	let err = coordinator
+		.execute_query(
+			&planner
+				.plan("INSERT INTO dst SELECT id FROM src")
+				.expect("plan insert select"),
+			None,
+		)
+		.await
+		.expect_err("row cap should reject");
+	assert!(
+		err.to_string().contains("exceeds maximum"),
+		"unexpected error: {err}"
+	);
+	let select_err = coordinator
+		.execute_query(
+			&planner.plan("SELECT id FROM dst").expect("plan select"),
+			None,
+		)
+		.await
+		.expect_err("target should not be written");
+	assert!(select_err.to_string().contains("table not found"));
+}
+
+#[tokio::test]
 async fn in_memory_table_storage_seeds_appends_and_rejects_invalid_writes() {
 	let binding = people_catalog()
 		.await
@@ -453,6 +813,33 @@ async fn distributed_query_coordinator_rejects_insert_before_dispatch() {
 }
 
 #[tokio::test]
+async fn distributed_query_coordinator_rejects_insert_select_before_dispatch() {
+	let catalog = Arc::new(insert_select_catalog().await);
+	let coordinator = DistributedQueryCoordinator::new(
+		catalog,
+		Arc::new(StaticWorkerRegistry::new([])),
+		Arc::new(MemoryManager::new(1, 1024 * 1024)),
+		Arc::new(FailingTransport),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let plan = SqlPlanner::new()
+		.plan("INSERT INTO dst (a, b) SELECT x, y FROM src")
+		.expect("plan insert select");
+
+	let err = coordinator
+		.execute_query(&plan)
+		.await
+		.expect_err("distributed insert select should reject");
+
+	assert!(
+		err.to_string()
+			.contains("distributed INSERT INTO ... SELECT execution is not wired"),
+		"unexpected error: {err}"
+	);
+}
+
+#[tokio::test]
 async fn executor_rejects_direct_insert_execution() {
 	let executor = Executor::with_context(
 		empty_storage(),
@@ -493,6 +880,41 @@ async fn executor_rejects_direct_insert_execution() {
 }
 
 #[tokio::test]
+async fn executor_rejects_direct_insert_select_execution() {
+	let executor = Executor::with_context(
+		empty_storage(),
+		ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(1),
+			TenantId(1),
+			HlcBound(1),
+		),
+	);
+	let catalog = insert_select_catalog().await;
+	let src = catalog
+		.resolve_table(&TableRef::new("src"))
+		.await
+		.expect("resolve src");
+	let dst = catalog
+		.resolve_table(&TableRef::new("dst"))
+		.await
+		.expect("resolve dst");
+	let plan = insert_select_plan(&dst, scan_plan(&src));
+
+	let err = executor
+		.execute_bound(&plan, None)
+		.await
+		.expect_err("executor should reject insert select");
+
+	assert!(matches!(
+		err,
+		ExecutionError::NotImplemented {
+			feature: "INSERT INTO ... SELECT execution is coordinator-only"
+		}
+	));
+}
+
+#[tokio::test]
 async fn fragmenter_rejects_direct_insert_fragmentation() {
 	let binding = people_catalog()
 		.await
@@ -522,6 +944,31 @@ async fn fragmenter_rejects_direct_insert_fragmentation() {
 	assert_eq!(err, FragmentError::InsertNotFragmentable);
 }
 
+#[tokio::test]
+async fn fragmenter_rejects_direct_insert_select_fragmentation() {
+	let catalog = insert_select_catalog().await;
+	let src = catalog
+		.resolve_table(&TableRef::new("src"))
+		.await
+		.expect("resolve src");
+	let dst = catalog
+		.resolve_table(&TableRef::new("dst"))
+		.await
+		.expect("resolve dst");
+	let plan = insert_select_plan(&dst, scan_plan(&src));
+
+	let err = fragment_plan(
+		plan,
+		FragmentPlanConfig::new(
+			QueryId::from_u128(1),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect_err("fragmenter should reject insert select");
+
+	assert_eq!(err, FragmentError::InsertSelectNotFragmentable);
+}
+
 async fn people_catalog() -> MockCatalog {
 	let catalog = MockCatalog::new();
 	catalog
@@ -536,6 +983,47 @@ async fn people_catalog() -> MockCatalog {
 		.await
 		.expect("create people");
 	catalog
+}
+
+async fn insert_select_catalog() -> MockCatalog {
+	let catalog = MockCatalog::new();
+	catalog
+		.create_table(
+			&TableRef::new("src"),
+			schema(&[
+				Field::new("x", DataType::Int32, false),
+				Field::new("y", DataType::Int32, false),
+				Field::new("label", DataType::Utf8, true),
+			]),
+			false,
+		)
+		.await
+		.expect("create src");
+	catalog
+		.create_table(
+			&TableRef::new("dst"),
+			schema(&[
+				Field::new("a", DataType::Int32, false),
+				Field::new("b", DataType::Int32, true),
+			]),
+			false,
+		)
+		.await
+		.expect("create dst");
+	catalog
+}
+
+async fn concat_query(
+	coordinator: &QueryCoordinator,
+	planner: &SqlPlanner,
+	sql: &str,
+) -> RecordBatch {
+	let results = coordinator
+		.execute_query(&planner.plan(sql).expect("plan query"), None)
+		.await
+		.expect("execute query");
+	let schema = results[0].schema();
+	arrow::compute::concat_batches(&schema, results.iter()).expect("concat query results")
 }
 
 fn assert_frontend_error(sql: &str, diagnostic: &str) {
@@ -598,6 +1086,17 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 		pbc_program: None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![],
+	}
+}
+
+fn insert_select_plan(binding: &TableBinding, source: ExecutionPlan) -> ExecutionPlan {
+	ExecutionPlan::InsertSelect {
+		legacy_table_id: binding.legacy_table_id,
+		table: binding.table,
+		fingerprint: binding.fingerprint,
+		schema: binding.schema.clone(),
+		target_columns: vec![ColumnOrdinal(0), ColumnOrdinal(1)],
+		source: Box::new(source),
 	}
 }
 

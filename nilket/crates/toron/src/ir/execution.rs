@@ -207,6 +207,14 @@ pub enum ExecutionPlan {
 		schema: SchemaRef,
 		rows: Vec<Vec<ScalarValue>>,
 	},
+	InsertSelect {
+		legacy_table_id: TableId,
+		table: TableObjectId,
+		fingerprint: PhysicalDescriptorFingerprint,
+		schema: SchemaRef,
+		target_columns: Vec<ColumnOrdinal>,
+		source: Box<ExecutionPlan>,
+	},
 }
 
 impl ExecutionPlan {
@@ -221,6 +229,7 @@ impl ExecutionPlan {
 			Self::Join { output_schema, .. } => output_schema.clone(),
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
 			Self::Insert { .. } => Arc::new(Schema::empty()),
+			Self::InsertSelect { .. } => Arc::new(Schema::empty()),
 		}
 	}
 }

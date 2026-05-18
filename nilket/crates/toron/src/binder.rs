@@ -203,6 +203,14 @@ impl<'a> Binder<'a> {
 					columns,
 					rows,
 				} => self.bind_insert(table, columns.as_deref(), rows).await,
+				LogicalPlan::InsertSelect {
+					table,
+					columns,
+					source,
+				} => {
+					self.bind_insert_select(table, columns.as_deref(), source)
+						.await
+				}
 			}
 		})
 	}
@@ -230,22 +238,11 @@ impl<'a> Binder<'a> {
 
 		let schema = binding.schema.clone();
 		let schema_fields = schema.fields();
-		let target_indices = match columns {
-			None => (0..schema_fields.len()).collect::<Vec<_>>(),
-			Some(columns) => {
-				let mut seen = HashSet::new();
-				let mut indices = Vec::with_capacity(columns.len());
-				for column in columns {
-					if !seen.insert(column.clone()) {
-						return Err(BindingError::UnsupportedExpression {
-							message: format!("duplicate INSERT target column: {column}"),
-						});
-					}
-					indices.push(resolve_column(column, &schema)?.ordinal.0 as usize);
-				}
-				indices
-			}
-		};
+		let target_columns = resolve_insert_target_columns(&schema, columns)?;
+		let target_indices = target_columns
+			.iter()
+			.map(|column| column.0 as usize)
+			.collect::<Vec<_>>();
 		let expected_arity = target_indices.len();
 
 		let mut bound_rows = Vec::with_capacity(rows.len());
@@ -304,6 +301,54 @@ impl<'a> Binder<'a> {
 		})
 	}
 
+	async fn bind_insert_select(
+		&self,
+		table: &TableRef,
+		columns: Option<&[String]>,
+		source: &LogicalPlan,
+	) -> Result<ExecutionPlan, BindingError> {
+		let binding = self.catalog.resolve_table(table).await?;
+		let schema = binding.schema.clone();
+		let target_columns = resolve_insert_target_columns(&schema, columns)?;
+		validate_omitted_insert_target_columns(&schema, &target_columns)?;
+		let source = self.bind_plan(source).await?;
+		let source_schema = source.schema();
+		if source_schema.fields().len() != target_columns.len() {
+			return Err(BindingError::TypeMismatch {
+				message: format!(
+					"INSERT SELECT source has {} columns; expected {}",
+					source_schema.fields().len(),
+					target_columns.len()
+				),
+			});
+		}
+
+		for (source_index, target_column) in target_columns.iter().enumerate() {
+			let source_field = source_schema.field(source_index);
+			let target_field = schema.field(target_column.0 as usize);
+			if !is_insert_select_coercible(source_field.data_type(), target_field.data_type()) {
+				return Err(BindingError::TypeMismatch {
+					message: format!(
+						"INSERT SELECT source column {} type {:?} is not compatible with target column {} type {:?}",
+						source_index + 1,
+						source_field.data_type(),
+						target_field.name(),
+						target_field.data_type()
+					),
+				});
+			}
+		}
+
+		Ok(ExecutionPlan::InsertSelect {
+			legacy_table_id: binding.legacy_table_id,
+			table: binding.table,
+			fingerprint: binding.fingerprint,
+			schema,
+			target_columns,
+			source: Box::new(source),
+		})
+	}
+
 	async fn bind_join(
 		&self,
 		left: &LogicalPlan,
@@ -346,6 +391,47 @@ impl<'a> Binder<'a> {
 			output_schema: join_schema(kind, &left_scope.schema, &right_scope.schema),
 		})
 	}
+}
+
+fn resolve_insert_target_columns(
+	schema: &SchemaRef,
+	columns: Option<&[String]>,
+) -> Result<Vec<ColumnOrdinal>, BindingError> {
+	let schema_fields = schema.fields();
+	let target_columns = match columns {
+		None => (0..schema_fields.len())
+			.map(|index| ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow")))
+			.collect::<Vec<_>>(),
+		Some(columns) => {
+			let mut seen = HashSet::new();
+			let mut target_columns = Vec::with_capacity(columns.len());
+			for column in columns {
+				if !seen.insert(column.clone()) {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("duplicate INSERT target column: {column}"),
+					});
+				}
+				target_columns.push(resolve_column(column, schema)?.ordinal);
+			}
+			target_columns
+		}
+	};
+	Ok(target_columns)
+}
+
+fn validate_omitted_insert_target_columns(
+	schema: &SchemaRef,
+	target_columns: &[ColumnOrdinal],
+) -> Result<(), BindingError> {
+	for (field_index, field) in schema.fields().iter().enumerate() {
+		let ordinal = ColumnOrdinal(u32::try_from(field_index).expect("column ordinal overflow"));
+		if !target_columns.contains(&ordinal) && !field.is_nullable() {
+			return Err(BindingError::TypeMismatch {
+				message: format!("INSERT omits non-nullable column: {}", field.name()),
+			});
+		}
+	}
+	Ok(())
 }
 
 fn bind_sort_keys(
@@ -639,7 +725,9 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 				collect_qualifiers(right, qualifiers);
 			}
 		},
-		LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => {}
+		LogicalPlan::CreateTable { .. }
+		| LogicalPlan::Insert { .. }
+		| LogicalPlan::InsertSelect { .. } => {}
 	}
 }
 
@@ -786,7 +874,8 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::CreateTable { .. }
-		| ExecutionPlan::Insert { .. } => None,
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => None,
 	}
 }
 
@@ -1093,6 +1182,27 @@ fn optimize_for_required(
 			},
 			OrdinalRemap::new(),
 		)),
+		ExecutionPlan::InsertSelect {
+			legacy_table_id,
+			table,
+			fingerprint,
+			schema,
+			target_columns,
+			source,
+		} => {
+			let (source, _) = optimize_for_required(*source, None)?;
+			Ok((
+				ExecutionPlan::InsertSelect {
+					legacy_table_id,
+					table,
+					fingerprint,
+					schema,
+					target_columns,
+					source: Box::new(source),
+				},
+				OrdinalRemap::new(),
+			))
+		}
 	}
 }
 
@@ -1643,6 +1753,25 @@ fn is_supported_explicit_numeric_cast(source: &DataType, target: &DataType) -> b
 			| (DataType::Float64, DataType::Float32)
 			| (DataType::Float64, DataType::Float64)
 	)
+}
+
+fn is_insert_select_coercible(source: &DataType, target: &DataType) -> bool {
+	source == target
+		|| matches!(
+			(source, target),
+			(DataType::Int32, DataType::Int64)
+				| (DataType::Int32, DataType::Float32)
+				| (DataType::Int32, DataType::Float64)
+				| (DataType::Int64, DataType::Int32)
+				| (DataType::Int64, DataType::Float32)
+				| (DataType::Int64, DataType::Float64)
+				| (DataType::Float32, DataType::Int32)
+				| (DataType::Float32, DataType::Int64)
+				| (DataType::Float32, DataType::Float64)
+				| (DataType::Float64, DataType::Int32)
+				| (DataType::Float64, DataType::Int64)
+				| (DataType::Float64, DataType::Float32)
+		)
 }
 
 fn coerce_insert_literal(

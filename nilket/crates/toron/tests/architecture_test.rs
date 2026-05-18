@@ -563,10 +563,11 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 11);
+	assert_eq!(enum_variant_count(logical_plan), 12);
 	assert!(logical_plan.contains("Sort {"));
 	assert!(logical_plan.contains("CreateTable {"));
 	assert!(logical_plan.contains("Insert {"));
+	assert!(logical_plan.contains("InsertSelect {"));
 	assert!(logical_plan.contains("output_names: Vec<Option<String>>"));
 	assert!(logical_source.contains("pub struct SortExpr"));
 	assert!(logical_source.contains("pub enum InsertLiteral"));
@@ -578,10 +579,11 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 9);
+	assert_eq!(enum_variant_count(execution_plan), 10);
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("CreateTable {"));
 	assert!(execution_plan.contains("Insert {"));
+	assert!(execution_plan.contains("InsertSelect {"));
 	assert!(execution_plan.contains("predicate: BoundExprProgram"));
 	assert!(execution_plan.contains("exprs: BoundExprProgram"));
 	assert!(execution_plan.contains("group_expr: BoundExprProgram"));
@@ -2977,7 +2979,7 @@ fn adr030_local_coordinator_intercepts_insert_before_retry_loop() {
 		.nth(1)
 		.expect("QueryCoordinator impl");
 	let insert_branch = query_impl
-		.find("matches!(plan, LogicalPlan::Insert")
+		.find("LogicalPlan::Insert { .. }")
 		.expect("local INSERT branch");
 	let retry_loop = query_impl
 		.find("let mut retried_descriptor_evolution = false")
@@ -3026,6 +3028,372 @@ fn adr030_executor_and_fragmenter_reject_insert() {
 		fragment_plan.find("ExecutionPlan::Insert").unwrap()
 			< fragment_plan.find("count_exchanges").unwrap()
 	);
+}
+
+#[test]
+fn adr032_logical_plan_variant_count_is_12() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let logical_plan = logical
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("pub fn project_plan").next())
+		.expect("LogicalPlan enum");
+
+	assert_eq!(enum_variant_count(logical_plan), 12);
+	assert!(logical_plan.contains("InsertSelect {"));
+	assert!(logical_plan.contains("table: TableRef,"));
+	assert!(logical_plan.contains("columns: Option<Vec<String>>,"));
+	assert!(logical_plan.contains("source: Box<LogicalPlan>,"));
+}
+
+#[test]
+fn adr032_execution_plan_variant_count_is_10() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+	assert_eq!(enum_variant_count(execution_plan), 10);
+	assert!(execution_plan.contains("InsertSelect {"));
+}
+
+#[test]
+fn adr032_insert_stays_values_only() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let logical_plan = logical
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("pub fn project_plan").next())
+		.expect("LogicalPlan enum");
+	let logical_insert = logical_plan
+		.split("Insert {")
+		.nth(1)
+		.and_then(|rest| rest.split("InsertSelect {").next())
+		.expect("LogicalPlan::Insert body");
+	assert!(logical_insert.contains("rows: Vec<Vec<InsertLiteral>>"));
+	assert!(!logical_insert.contains("source:"));
+
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+	let execution_insert = execution_plan
+		.split("Insert {")
+		.nth(1)
+		.and_then(|rest| rest.split("InsertSelect {").next())
+		.expect("ExecutionPlan::Insert body");
+	assert!(execution_insert.contains("rows: Vec<Vec<ScalarValue>>,"));
+	assert!(!execution_insert.contains("BoundExprProgram"));
+	assert!(!execution_insert.contains("PbcProgram"));
+	assert!(!execution_insert.contains("RecordBatch"));
+}
+
+#[test]
+fn adr032_insert_select_carries_target_columns() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+
+	assert!(execution_plan.contains("InsertSelect {"));
+	assert!(execution_plan.contains("legacy_table_id: TableId,"));
+	assert!(execution_plan.contains("table: TableObjectId,"));
+	assert!(execution_plan.contains("fingerprint: PhysicalDescriptorFingerprint,"));
+	assert!(execution_plan.contains("schema: SchemaRef,"));
+	assert!(execution_plan.contains("target_columns: Vec<ColumnOrdinal>,"));
+	assert!(execution_plan.contains("source: Box<ExecutionPlan>,"));
+}
+
+#[test]
+fn adr032_insert_select_no_direct_bound_expr_program() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let insert_select = brace_blocks_after_marker(&execution, "InsertSelect {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::InsertSelect body")
+		.1;
+	assert!(!insert_select.contains("BoundExprProgram"));
+	assert!(!insert_select.contains("PbcProgram"));
+	assert!(!insert_select.contains("RecordBatch"));
+	assert!(!insert_select.contains("payload"));
+}
+
+#[test]
+fn adr032_storage_write_trait_unchanged() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let write_request = brace_blocks_after_marker(&storage, "pub struct WriteRequest")
+		.into_iter()
+		.next()
+		.expect("WriteRequest body")
+		.1;
+	let storage_write = brace_blocks_after_marker(&storage, "pub trait StorageWrite")
+		.into_iter()
+		.next()
+		.expect("StorageWrite trait")
+		.1;
+	assert!(write_request.contains("pub payload: RecordBatch,"));
+	assert!(storage_write.contains("async fn write(&self, request: WriteRequest)"));
+	assert!(!storage_write.contains("insert_select"));
+	assert!(!storage_write.contains("write_select"));
+}
+
+#[test]
+fn adr032_sql_planner_splits_values_and_select_sources() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lowered_source = planner
+		.split("enum LoweredInsertSource")
+		.nth(1)
+		.and_then(|rest| rest.split("fn lower_insert(").next())
+		.expect("LoweredInsertSource block");
+	assert!(lowered_source.contains("Values(Vec<Vec<InsertLiteral>>)"));
+	assert!(lowered_source.contains("Select(LogicalPlan)"));
+
+	let lower_insert = brace_blocks_after_marker(&planner, "fn lower_insert(")
+		.into_iter()
+		.next()
+		.expect("lower_insert body")
+		.1;
+	assert!(lower_insert.contains("LoweredInsertSource::Values(rows) => Ok(LogicalPlan::Insert"));
+	assert!(
+		lower_insert
+			.contains("LoweredInsertSource::Select(source) => Ok(LogicalPlan::InsertSelect")
+	);
+	let lower_insert_source = brace_blocks_after_marker(&planner, "fn lower_insert_source")
+		.into_iter()
+		.next()
+		.expect("lower_insert_source body")
+		.1;
+	assert!(lower_insert_source.contains("SetExpr::Values"));
+	assert!(lower_insert_source.contains("planner.lower_query(query)"));
+	assert!(!lower_insert_source.contains("INSERT source must be VALUES"));
+}
+
+#[test]
+fn adr032_binder_enforces_source_target_arity() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let bind_insert_select = brace_blocks_after_marker(&binder, "async fn bind_insert_select")
+		.into_iter()
+		.next()
+		.expect("bind_insert_select body")
+		.1;
+
+	assert!(bind_insert_select.contains("resolve_insert_target_columns(&schema, columns)?"));
+	assert!(bind_insert_select.contains("validate_omitted_insert_target_columns"));
+	assert!(bind_insert_select.contains("self.bind_plan(source).await?"));
+	assert!(bind_insert_select.contains("source_schema.fields().len() != target_columns.len()"));
+	assert!(bind_insert_select.contains("is_insert_select_coercible"));
+	assert!(bind_insert_select.contains("ExecutionPlan::InsertSelect"));
+	assert!(bind_insert_select.contains("target_columns,"));
+	assert!(bind_insert_select.contains("source: Box::new(source)"));
+
+	let insert_select_policy = brace_blocks_after_marker(&binder, "fn is_insert_select_coercible")
+		.into_iter()
+		.next()
+		.expect("is_insert_select_coercible body")
+		.1;
+	assert!(insert_select_policy.contains("source == target"));
+	for conversion in [
+		"(DataType::Int32, DataType::Int64)",
+		"(DataType::Int64, DataType::Int32)",
+		"(DataType::Float64, DataType::Float32)",
+	] {
+		assert!(
+			insert_select_policy.contains(conversion),
+			"INSERT SELECT numeric policy missing {conversion}"
+		);
+	}
+}
+
+#[test]
+fn adr032_local_coordinator_intercepts_before_retry() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let insert_select_branch = query_impl
+		.find("LogicalPlan::InsertSelect { .. }")
+		.expect("local INSERT SELECT branch");
+	let retry_loop = query_impl
+		.find("let mut retried_descriptor_evolution = false")
+		.expect("descriptor retry loop");
+	assert!(insert_select_branch < retry_loop);
+
+	let execute_write = brace_blocks_after_marker(query_impl, "async fn execute_write_plan")
+		.into_iter()
+		.next()
+		.expect("execute_write_plan body")
+		.1;
+	assert!(execute_write.contains("ExecutionPlan::InsertSelect"));
+	assert!(execute_write.contains("self.executor.execute_bound(source, None).await?"));
+	assert!(execute_write.contains("materialize_insert_select_batch"));
+	assert!(execute_write.contains("write(WriteRequest"));
+}
+
+#[test]
+fn adr032_distributed_coordinator_rejects_before_fragment() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let distributed_impl = coordinator
+		.split("impl<Registry, Transport> DistributedQueryCoordinator")
+		.nth(1)
+		.expect("DistributedQueryCoordinator impl");
+	let insert_select_reject = distributed_impl
+		.find("ExecutionPlan::InsertSelect")
+		.expect("distributed INSERT SELECT reject");
+	let fragment_call = distributed_impl
+		.find("fragment_plan(")
+		.expect("fragment plan call");
+
+	assert!(insert_select_reject < fragment_call);
+	assert!(distributed_impl.contains("distributed INSERT INTO ... SELECT execution is not wired"));
+}
+
+#[test]
+fn adr032_fragmenter_rejects_before_join_or_exchange() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
+		.into_iter()
+		.next()
+		.expect("fragment_plan body")
+		.1;
+
+	assert!(exec.contains("INSERT INTO ... SELECT execution is coordinator-only"));
+	assert!(fragmenter.contains("InsertSelectNotFragmentable"));
+	assert!(fragment_plan.contains("ExecutionPlan::InsertSelect"));
+	assert!(
+		fragment_plan.find("ExecutionPlan::InsertSelect").unwrap()
+			< fragment_plan.find("count_exchanges").unwrap()
+	);
+}
+
+#[test]
+fn adr032_distributed_walkers_treat_insert_select_as_leaf() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	for (function, marker) in [
+		(
+			"fn first_join",
+			"| ExecutionPlan::InsertSelect { .. } => None",
+		),
+		(
+			"fn find_exchange",
+			"| ExecutionPlan::InsertSelect { .. } => None",
+		),
+		(
+			"fn count_exchanges",
+			"| ExecutionPlan::InsertSelect { .. } => 0",
+		),
+		(
+			"fn first_scan_metadata",
+			"| ExecutionPlan::InsertSelect { .. } => None",
+		),
+		(
+			"fn replace_exchange_with_scan",
+			"| ExecutionPlan::InsertSelect { .. } => plan",
+		),
+		(
+			"fn replace_first_join",
+			"| ExecutionPlan::InsertSelect { .. } => plan",
+		),
+	] {
+		let body = brace_blocks_after_marker(&fragmenter, function)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{function} body"))
+			.1;
+		assert!(body.contains(marker), "{function} missing {marker}");
+	}
+
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	for (function, marker) in [
+		(
+			"fn join_strategy_label",
+			"| ExecutionPlan::InsertSelect { .. } => None",
+		),
+		(
+			"fn contains_join",
+			"| ExecutionPlan::InsertSelect { .. } => false",
+		),
+		(
+			"fn contains_broadcast_join",
+			"| ExecutionPlan::InsertSelect { .. } => false",
+		),
+		(
+			"fn scan_schema_for_table_id",
+			"| ExecutionPlan::InsertSelect { .. } => None",
+		),
+	] {
+		let body = brace_blocks_after_marker(&server, function)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{function} body"))
+			.1;
+		assert!(body.contains(marker), "{function} missing {marker}");
+	}
+	assert!(server.contains("ExecutionPlan::InsertSelect { .. } => \"insert_select\""));
+
+	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let first_scan_fingerprint = brace_blocks_after_marker(&scheduler, "fn first_scan_fingerprint")
+		.into_iter()
+		.next()
+		.expect("first_scan_fingerprint body")
+		.1;
+	assert!(first_scan_fingerprint.contains("| ExecutionPlan::InsertSelect { .. } => None"));
+}
+
+#[test]
+fn adr032_coordinator_uses_only_evaluate_cast() {
+	let coordinator_write =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
+			.expect("read coordinator/write.rs");
+	let materialize = brace_blocks_after_marker(
+		&coordinator_write,
+		"pub(super) fn materialize_insert_select_batch",
+	)
+	.into_iter()
+	.next()
+	.expect("materialize_insert_select_batch body")
+	.1;
+	assert!(materialize.contains("TABLE_WRITE_MAX_ROWS"));
+	assert!(materialize.contains("coerce_insert_select_array"));
+	assert!(materialize.contains("typed_null_array"));
+	assert!(materialize.contains("validate_non_null_targets"));
+	assert!(coordinator_write.contains("evaluate_cast"));
+	assert!(!coordinator_write.contains("evaluate_try_cast"));
+	assert!(!coordinator_write.contains("blake3"));
+}
+
+#[test]
+fn adr032_insert_select_does_not_add_plan_arena_dependency() {
+	let cargo =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read toron Cargo.toml");
+	for forbidden in ["bumpalo", "typed-arena", "generational-arena", "slab"] {
+		assert!(
+			!cargo.contains(forbidden),
+			"unexpected arena dependency {forbidden}"
+		);
+	}
 }
 
 #[test]

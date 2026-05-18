@@ -621,13 +621,14 @@ SELECT id, total FROM dst ORDER BY id;
 
 ```sql
 CREATE TABLE left_table (id INT, label TEXT);
-CREATE TABLE right_table (id INT, score BIGINT);
+CREATE TABLE right_table (left_id INT, score BIGINT);
 CREATE TABLE dst (id INT, label TEXT, score BIGINT);
 INSERT INTO left_table VALUES (1, 'a'), (2, 'b');
 INSERT INTO right_table VALUES (1, 100), (2, 200);
-INSERT INTO dst (id, label, score)
-SELECT l.id, l.label, r.score
-FROM left_table l INNER JOIN right_table r ON l.id = r.id;
+INSERT INTO dst (score, id, label)
+SELECT score, id, label
+FROM left_table INNER JOIN right_table
+ON left_table.id = right_table.left_id;
 SELECT id, label, score FROM dst ORDER BY id;
 -- Expected: (1, 'a', 100), (2, 'b', 200)
 ```
@@ -636,43 +637,48 @@ Both fixtures must pass before promotion.
 
 ### Architecture guards in `architecture_test.rs`
 
-14 guards total. Each guard's diagnostic string names
-ADR 032 + the specific decision.
+14 ADR-032-specific guards total. Existing ADR 030 /
+ADR 031 preservation guards continue to run, but are not
+counted as new ADR 032 guards. Each new guard's
+diagnostic string names ADR 032 + the specific decision.
 
-**ADR-032-specific (12):**
+**ADR-032-specific (14):**
 
 1. `adr032_logical_plan_variant_count_is_12` — pin
    `LogicalPlan` variant count growth 11 → 12.
 2. `adr032_execution_plan_variant_count_is_10` — pin
    `ExecutionPlan` variant count growth 9 → 10.
-3. `adr032_insert_stays_values_only` — source-check
+3. `adr032_sql_planner_splits_values_and_select_sources`
+   — source-check `lower_insert_source` keeps VALUES
+   literal lowering separate from SELECT lowering.
+4. `adr032_insert_stays_values_only` — source-check
    `ExecutionPlan::Insert` still contains `rows:
    Vec<Vec<ScalarValue>>`; absence of `BoundExprProgram`
    / `PbcProgram` in the variant body.
-4. `adr032_insert_select_carries_target_columns` —
+5. `adr032_insert_select_carries_target_columns` —
    source-check `ExecutionPlan::InsertSelect` contains
    `target_columns: Vec<ColumnOrdinal>` + `source:
    Box<ExecutionPlan>`.
-5. `adr032_insert_select_no_direct_bound_expr_program`
+6. `adr032_insert_select_no_direct_bound_expr_program`
    — source-check `InsertSelect` variant body for
    absence of direct `BoundExprProgram` / `PbcProgram`
    field.
-6. `adr032_local_coordinator_intercepts_before_retry`
+7. `adr032_local_coordinator_intercepts_before_retry`
    — source-check `coordinator.rs` `execute_query`
    body: `InsertSelect` match arm precedes the SELECT
    retry loop marker.
-7. `adr032_distributed_coordinator_rejects_before_fragment`
+8. `adr032_distributed_coordinator_rejects_before_fragment`
    — source-check distributed coordinator body:
    `InsertSelect` reject precedes `fragment_plan`
    call.
-8. `adr032_fragmenter_rejects_before_join_or_exchange`
+9. `adr032_fragmenter_rejects_before_join_or_exchange`
    — source-check `distributed/fragment.rs`:
    `InsertSelectNotFragmentable` reject precedes
    `contains_join` / `count_exchanges`.
-9. `adr032_distributed_walkers_treat_insert_select_as_leaf`
+10. `adr032_distributed_walkers_treat_insert_select_as_leaf`
    — source-check distributed / server / scheduler
    walker match arms return leaf for `InsertSelect`.
-10. `adr032_coordinator_uses_only_evaluate_cast`:
+11. `adr032_coordinator_uses_only_evaluate_cast`:
 
     ```rust
     #[test]
@@ -691,7 +697,7 @@ ADR 032 + the specific decision.
     }
     ```
 
-11. `adr032_binder_enforces_source_target_arity`:
+12. `adr032_binder_enforces_source_target_arity`:
 
     ```rust
     #[test]
@@ -715,19 +721,12 @@ ADR 032 + the specific decision.
     }
     ```
 
-12. `adr032_storage_write_trait_unchanged` — source-
+13. `adr032_storage_write_trait_unchanged` — source-
     check `storage.rs` for unchanged `StorageWrite`
     trait signature with single `RecordBatch` payload.
-
-**Composition guards (2):**
-
-13. `adr030_insert_stays_expression_free` — extend the
-    existing ADR 030 D4 guard wording to assert that
-    ADR 032 did not slip `BoundExprProgram` into the
-    `Insert` variant.
-14. `adr031_bound_expr_program_partial_eq_only` — verify-
-    only re-run of the existing ADR 031 D7 guard to
-    confirm no derive drift through ADR 032.
+14. `adr032_insert_select_does_not_add_plan_arena_dependency`
+    — source-check `Cargo.toml` for no new arena
+    dependency while deferring the plan-arena substrate.
 
 **Verification:**
 

@@ -230,6 +230,11 @@ pub enum LogicalPlan {
 		columns: Option<Vec<String>>,
 		rows: Vec<Vec<InsertLiteral>>,
 	},
+	InsertSelect {
+		table: TableRef,
+		columns: Option<Vec<String>>,
+		source: Box<LogicalPlan>,
+	},
 }
 
 pub fn project_plan(

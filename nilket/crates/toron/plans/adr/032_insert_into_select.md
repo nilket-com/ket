@@ -132,9 +132,9 @@ In scope:
 - Telemetry labels for distributed / server / scheduler
   walker `InsertSelect` arms use `"insert_select"` (not
   `"insert"`, which ADR 030 already owns).
-- 14 architecture guards (12 ADR 032 specific + 2
-  composition guards verifying preserved invariants
-  from ADR 030 + ADR 031).
+- 14 ADR-032-specific architecture guards, plus
+  in-place updates to existing LogicalPlan /
+  ExecutionPlan variant-count coverage.
 - Two required end-to-end composition fixtures: SUM
   grouped aggregate source and INNER JOIN source.
 
@@ -585,14 +585,16 @@ narrowed beyond the explicit lift.
 
 ## Architecture Guard Set
 
-14 guards total: 12 ADR-032-specific + 2 composition
-guards verifying ADR 030 + ADR 031 invariants survive
-ADR 032.
+14 ADR-032-specific guards total. Existing ADR 030 /
+ADR 031 preservation guards remain in the suite, and the
+pre-existing variant-count coverage is updated in place for
+the `InsertSelect` growth.
 
 | Guard | Pins | File anchor |
 |---|---|---|
 | `adr032_logical_plan_variant_count_is_12` | `LogicalPlan` 11 → 12 growth | `ir.rs` |
 | `adr032_execution_plan_variant_count_is_10` | `ExecutionPlan` 9 → 10 growth | `ir/execution.rs` |
+| `adr032_sql_planner_splits_values_and_select_sources` | `lower_insert_source` keeps VALUES literal lowering separate from SELECT lowering | `sql_planner.rs` |
 | `adr032_insert_stays_values_only` | `ExecutionPlan::Insert` still contains `rows: Vec<Vec<ScalarValue>>` with no `BoundExprProgram` or `PbcProgram` | `ir/execution.rs` |
 | `adr032_insert_select_carries_target_columns` | `ExecutionPlan::InsertSelect` contains `target_columns: Vec<ColumnOrdinal>` + `source: Box<ExecutionPlan>` | `ir/execution.rs` |
 | `adr032_insert_select_no_direct_bound_expr_program` | `InsertSelect` variant body has no direct `BoundExprProgram` or `PbcProgram` field | `ir/execution.rs` |
@@ -603,13 +605,7 @@ ADR 032.
 | `adr032_coordinator_uses_only_evaluate_cast` | `coordinator/write.rs` calls `evaluate_cast` and does not call `evaluate_try_cast` | `coordinator/write.rs` |
 | `adr032_binder_enforces_source_target_arity` | `bind_insert_select` body references `target_columns.len()` and source arity for the arity check | `binder.rs` |
 | `adr032_storage_write_trait_unchanged` | `StorageWrite::write` signature stable; single `RecordBatch` payload | `storage.rs` |
-
-Composition guards verifying preserved invariants:
-
-| Guard | Pins | File anchor |
-|---|---|---|
-| `adr030_insert_stays_expression_free` | ADR 030 D4 + ADR 031 D10 invariant survives ADR 032 | `ir/execution.rs` |
-| `adr031_bound_expr_program_partial_eq_only` | ADR 031 D7 invariant survives ADR 032 | `ir/execution.rs` |
+| `adr032_insert_select_does_not_add_plan_arena_dependency` | ADR 032 does not pull in arena-allocation crates while deferring the plan-arena substrate | `Cargo.toml` |
 
 Each guard's diagnostic string names ADR 032 + the
 specific decision it enforces, per the ADR 015 cycle
@@ -643,13 +639,14 @@ output; ADR 015-style terminal ORDER BY on the readback.
 
 ```sql
 CREATE TABLE left_table (id INT, label TEXT);
-CREATE TABLE right_table (id INT, score BIGINT);
+CREATE TABLE right_table (left_id INT, score BIGINT);
 CREATE TABLE dst (id INT, label TEXT, score BIGINT);
 INSERT INTO left_table VALUES (1, 'a'), (2, 'b');
 INSERT INTO right_table VALUES (1, 100), (2, 200);
-INSERT INTO dst (id, label, score)
-SELECT l.id, l.label, r.score
-FROM left_table l INNER JOIN right_table r ON l.id = r.id;
+INSERT INTO dst (score, id, label)
+SELECT score, id, label
+FROM left_table INNER JOIN right_table
+ON left_table.id = right_table.left_id;
 SELECT id, label, score FROM dst ORDER BY id;
 -- Expected: (1, 'a', 100), (2, 'b', 200)
 ```
@@ -658,7 +655,7 @@ Exercises ADR 008 / 009 join substrate (inner equi-join);
 ADR 030 VALUES write (initial seed of both source tables);
 ADR 032 InsertSelect write of join output; ADR 015-style
 terminal ORDER BY on the readback. The explicit target
-column list `(id, label, score)` exercises the
+column list `(score, id, label)` exercises the
 `target_columns` carrier (D3 / R1).
 
 The two fixtures together validate that the substrate arc
@@ -1037,9 +1034,10 @@ arc:
       end-to-end.**
 - [ ] **Fixture B (INNER JOIN source) passes end-to-
       end.**
-- [ ] 12 ADR-032-specific architecture guards pass.
-- [ ] 2 composition guards verifying ADR 030 + ADR
-      031 invariants survive ADR 032 pass.
+- [ ] 14 ADR-032-specific architecture guards pass.
+- [ ] Existing ADR 030 / ADR 031 preservation guards
+      remain green; variant-count coverage is updated
+      in place for `InsertSelect`.
 - [ ] Existing VALUES INSERT tests remain green; no
       VALUES architecture guard adjusted.
 - [ ] Existing SELECT-only plan-digest fixtures

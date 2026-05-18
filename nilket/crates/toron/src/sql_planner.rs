@@ -153,31 +153,37 @@ fn lower_insert_column_list(columns: &[Ident]) -> Option<Vec<String>> {
 	}
 }
 
-fn lower_insert_source(source: Option<&Query>) -> Result<Vec<Vec<InsertLiteral>>, FrontendError> {
+enum LoweredInsertSource {
+	Values(Vec<Vec<InsertLiteral>>),
+	Select(LogicalPlan),
+}
+
+fn lower_insert_source(
+	planner: &SqlPlanner,
+	source: Option<&Query>,
+) -> Result<LoweredInsertSource, FrontendError> {
 	let query = source.ok_or_else(|| unsupported("INSERT requires a VALUES clause"))?;
-	if query.with.is_some()
-		|| query.order_by.is_some()
-		|| query.limit.is_some()
-		|| !query.limit_by.is_empty()
-		|| query.offset.is_some()
-		|| query.fetch.is_some()
-		|| !query.locks.is_empty()
-		|| query.for_clause.is_some()
-		|| query.settings.is_some()
-		|| query.format_clause.is_some()
-	{
-		return Err(unsupported(
-			"unsupported INSERT source: must be VALUES only",
-		));
-	}
 
 	let values = match query.body.as_ref() {
-		SetExpr::Values(values) => values,
-		_ => {
-			return Err(unsupported(
-				"INSERT source must be VALUES (INSERT ... SELECT not supported)",
-			));
+		SetExpr::Values(values) => {
+			if query.with.is_some()
+				|| query.order_by.is_some()
+				|| query.limit.is_some()
+				|| !query.limit_by.is_empty()
+				|| query.offset.is_some()
+				|| query.fetch.is_some()
+				|| !query.locks.is_empty()
+				|| query.for_clause.is_some()
+				|| query.settings.is_some()
+				|| query.format_clause.is_some()
+			{
+				return Err(unsupported(
+					"unsupported INSERT source: must be VALUES only",
+				));
+			}
+			values
 		}
+		_ => return planner.lower_query(query).map(LoweredInsertSource::Select),
 	};
 	if values.explicit_row {
 		return Err(unsupported(
@@ -201,7 +207,8 @@ fn lower_insert_source(source: Option<&Query>) -> Result<Vec<Vec<InsertLiteral>>
 				.map(lower_insert_literal)
 				.collect::<Result<Vec<_>, _>>()
 		})
-		.collect()
+		.collect::<Result<Vec<_>, _>>()
+		.map(LoweredInsertSource::Values)
 }
 
 fn lower_insert_literal(expr: &SqlExpr) -> Result<InsertLiteral, FrontendError> {
@@ -488,11 +495,20 @@ impl SqlPlanner {
 			return Err(unsupported("unsupported INSERT clause: FORMAT"));
 		}
 
-		Ok(LogicalPlan::Insert {
-			table: lower_insert_target_name(table)?,
-			columns: lower_insert_column_list(columns),
-			rows: lower_insert_source(source.as_deref())?,
-		})
+		let table = lower_insert_target_name(table)?;
+		let columns = lower_insert_column_list(columns);
+		match lower_insert_source(self, source.as_deref())? {
+			LoweredInsertSource::Values(rows) => Ok(LogicalPlan::Insert {
+				table,
+				columns,
+				rows,
+			}),
+			LoweredInsertSource::Select(source) => Ok(LogicalPlan::InsertSelect {
+				table,
+				columns,
+				source: Box::new(source),
+			}),
+		}
 	}
 
 	fn lower_create_table(&self, create_table: &CreateTable) -> Result<LogicalPlan, FrontendError> {
@@ -2898,7 +2914,9 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			on: _,
 			strategy: _,
 		} => true,
-		LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => false,
+		LogicalPlan::CreateTable { .. }
+		| LogicalPlan::Insert { .. }
+		| LogicalPlan::InsertSelect { .. } => false,
 	}
 }
 
@@ -3172,9 +3190,10 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 				qualifiers
 			}
 		},
-		LogicalPlan::Scan { .. } | LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => {
-			Vec::new()
-		}
+		LogicalPlan::Scan { .. }
+		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::Insert { .. }
+		| LogicalPlan::InsertSelect { .. } => Vec::new(),
 	}
 }
 

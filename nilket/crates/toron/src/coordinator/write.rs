@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use arrow::array::{
-	ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
-	StringBuilder,
+	ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float32Builder, Float64Array,
+	Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use crate::error::StorageError;
-use crate::ir::ScalarValue;
+use crate::binder::TABLE_WRITE_MAX_ROWS;
+use crate::error::{ExecutionError, StorageError};
+use crate::exec::evaluate_cast;
+use crate::ir::{ColumnOrdinal, ScalarValue};
 
 pub(super) fn materialize_insert_batch(
 	schema: &SchemaRef,
@@ -19,6 +21,171 @@ pub(super) fn materialize_insert_batch(
 		columns.push(build_array(field.data_type(), rows, field_index)?);
 	}
 	RecordBatch::try_new(schema.clone(), columns).map_err(StorageError::Arrow)
+}
+
+pub(super) fn materialize_insert_select_batch(
+	target_schema: &SchemaRef,
+	target_columns: &[ColumnOrdinal],
+	source_batches: &[RecordBatch],
+) -> Result<Option<RecordBatch>, ExecutionError> {
+	let total_rows = source_batches
+		.iter()
+		.map(RecordBatch::num_rows)
+		.sum::<usize>();
+	if total_rows > TABLE_WRITE_MAX_ROWS {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"INSERT INTO ... SELECT produced {total_rows} rows; exceeds maximum {TABLE_WRITE_MAX_ROWS}"
+			),
+		});
+	}
+	if total_rows == 0 {
+		return Ok(None);
+	}
+
+	let mut source_by_target = vec![None; target_schema.fields().len()];
+	for (source_index, target_column) in target_columns.iter().enumerate() {
+		let target_index = target_column.0 as usize;
+		let Some(slot) = source_by_target.get_mut(target_index) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"INSERT target column ordinal {} out of bounds",
+					target_column.0
+				),
+			});
+		};
+		if slot.is_some() {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!("duplicate INSERT target column ordinal {}", target_column.0),
+			});
+		}
+		*slot = Some(source_index);
+	}
+
+	let mut coerced_batches = Vec::with_capacity(source_batches.len());
+	for batch in source_batches {
+		if batch.num_columns() != target_columns.len() {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"INSERT INTO ... SELECT batch has {} columns; expected {}",
+					batch.num_columns(),
+					target_columns.len()
+				),
+			});
+		}
+
+		let mut columns = Vec::with_capacity(target_schema.fields().len());
+		for (target_index, field) in target_schema.fields().iter().enumerate() {
+			let array = match source_by_target[target_index] {
+				Some(source_index) => coerce_insert_select_array(
+					batch.column(source_index),
+					field.data_type(),
+					field.name(),
+				)?,
+				None => {
+					if !field.is_nullable() {
+						return Err(ExecutionError::InvalidExpression {
+							message: format!("INSERT omits non-nullable column: {}", field.name()),
+						});
+					}
+					typed_null_array(field.data_type(), batch.num_rows(), field.name())?
+				}
+			};
+			columns.push(array);
+		}
+		validate_non_null_arrays(target_schema, &columns)?;
+		coerced_batches.push(RecordBatch::try_new(target_schema.clone(), columns)?);
+	}
+
+	let payload = if coerced_batches.len() == 1 {
+		coerced_batches.pop().expect("one coerced batch")
+	} else {
+		arrow::compute::concat_batches(target_schema, coerced_batches.iter())?
+	};
+	validate_non_null_targets(&payload)?;
+	Ok(Some(payload))
+}
+
+fn coerce_insert_select_array(
+	array: &ArrayRef,
+	target: &DataType,
+	column: &str,
+) -> Result<ArrayRef, ExecutionError> {
+	if !is_supported_insert_select_target(target) {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!("unsupported INSERT target type for column {column}: {target:?}"),
+		});
+	}
+	if array.data_type() == target {
+		return Ok(array.clone());
+	}
+	if is_numeric_type(array.data_type()) && is_numeric_type(target) {
+		return evaluate_cast(array, target);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"INSERT INTO ... SELECT source type {:?} is not compatible with column {column} type {target:?}",
+			array.data_type()
+		),
+	})
+}
+
+fn typed_null_array(
+	data_type: &DataType,
+	rows: usize,
+	column: &str,
+) -> Result<ArrayRef, ExecutionError> {
+	match data_type {
+		DataType::Boolean => Ok(Arc::new(BooleanArray::from(vec![None::<bool>; rows]))),
+		DataType::Int32 => Ok(Arc::new(Int32Array::from(vec![None::<i32>; rows]))),
+		DataType::Int64 => Ok(Arc::new(Int64Array::from(vec![None::<i64>; rows]))),
+		DataType::Float32 => Ok(Arc::new(Float32Array::from(vec![None::<f32>; rows]))),
+		DataType::Float64 => Ok(Arc::new(Float64Array::from(vec![None::<f64>; rows]))),
+		DataType::Utf8 => Ok(Arc::new(StringArray::from(vec![None::<&str>; rows]))),
+		target => Err(ExecutionError::InvalidExpression {
+			message: format!("unsupported INSERT target type for column {column}: {target:?}"),
+		}),
+	}
+}
+
+fn validate_non_null_targets(batch: &RecordBatch) -> Result<(), ExecutionError> {
+	validate_non_null_arrays(&batch.schema(), batch.columns())
+}
+
+fn validate_non_null_arrays(
+	schema: &SchemaRef,
+	columns: &[ArrayRef],
+) -> Result<(), ExecutionError> {
+	for (field, array) in schema.fields().iter().zip(columns) {
+		if !field.is_nullable() && array.null_count() > 0 {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"INSERT INTO ... SELECT produced NULL for non-nullable column: {}",
+					field.name()
+				),
+			});
+		}
+	}
+	Ok(())
+}
+
+fn is_supported_insert_select_target(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Boolean
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::Float32
+			| DataType::Float64
+			| DataType::Utf8
+	)
+}
+
+fn is_numeric_type(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+	)
 }
 
 fn build_array(
