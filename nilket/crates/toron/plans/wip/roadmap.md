@@ -1993,6 +1993,248 @@ along with the forward-sequence rewrite.
   invariant). The nine-phase migration is
   materialized in
   `plans/impl/036_sql_delete_where.md`.
+- **ADR 037 — Distributed Write Context (Cross-Ring
+  Substrate for Distributed DML).** Promoted.
+  **Fourth cross-ring substrate cycle** after ADR
+  029 + 030 + 035, matching the 4-iter cross-ring
+  substrate cadence (now four data points: ADR 029
+  + 030 + 035 + 037). **First cross-ring substrate
+  cycle with two Codex self-retractions on the
+  same field** (`TaskExecutionContext` shape:
+  iter-1 4-field → iter-2 2-field narrowing →
+  iter-3 4-field correction). Lifts four
+  accumulated distributed-DML rejects plus
+  Wendelon CREATE Plan A, partially
+  lifts one + explicitly defers one to ADR 038 —
+  the highest reject-lift count in council
+  history. Fourteen decisions D1-D14.
+  **D1 critical decision:** distributed writes
+  remain **coordinator-owned**. Workers are
+  read/shuffle executors only; the distributed
+  coordinator is the sole caller of
+  `Catalog::create_table`,
+  `StorageWrite::write`, and
+  `StorageDeleteRows::delete_rows`. Bind once,
+  mutate once: task retry never becomes write
+  retry; mutation idempotency stays inside
+  Wendelon's existing `Client::table_write` /
+  `table_delete` paths.
+  **D2 critical decision:**
+  `DistributedQueryCoordinator` becomes context-
+  bearing. Production construction passes real
+  `ExecutionContext` (`session_id`, `query_id`,
+  `tenant_id`, `read_bound`, optional
+  `profile_hint`, optional storage
+  `trace_context`); test / read-only construction
+  may use an explicit test helper. The coordinator
+  uses one `query_id` consistently for fragment
+  plan config, task identities, write requests,
+  and delete requests.
+  **D3 critical decision (Codex iter-3 audit,
+  Claude iter-2 C15 retracted):**
+  `TaskExecutionContext` substrate has exactly
+  four fields — `session_id: SessionId`,
+  `tenant_id: TenantId`, `read_bound: HlcBound`,
+  `trace_context: Option<storage::TraceContext>`.
+  The
+  iter-2 two-field narrowing (`{query_id,
+  profile_hint}`) was the iter-3 substrate
+  failure: `Executor::execute_bound(Scan)` builds
+  `ScanRequest` from
+  `ExecutionContext.{session_id, tenant_id,
+  read_bound}`, so workers receiving only those
+  two fields would still use `local_test()`
+  defaults for session/tenant/read_bound,
+  defeating the substrate. `query_id` comes from
+  `TaskSpec.identity.query_id` (not duplicated;
+  guard #5 asserts equality); `profile_hint`
+  comes from `ExecutionPlan::Scan`;
+  `runtime_filter` comes from
+  `TaskInputBinding::Scan`. The task context MUST
+  NOT carry receipts, client write IDs,
+  durability, finalization, retry counters, row-
+  identity policy, runtime filters, table pins,
+  task telemetry, or join spill configuration
+  (architecture guard #7 enforces).
+  **D4 critical decision:** `WriteRequest` and
+  `DeleteRowsRequest` storage request shapes
+  remain **byte-identical pre/post-ADR-037**. No
+  `client_write_id` / `durability` /
+  `await_finalization` public fields added.
+  Existing fields suffice. Read-your-writes and
+  receipt surfacing are deferred.
+  **D5 critical decision:**
+  `DistributedQueryCoordinator` gains explicit
+  writer/deleter sink wiring (`with_writer` /
+  `with_writer_and_deleter` constructors mirror
+  local coordinator pattern from ADR 030 / 035 /
+  036). Read-only deployments reuse unsupported-
+  adapter diagnostics
+  (`"INSERT execution requires a configured
+  StorageWrite"` / `"DELETE execution requires
+  a configured StorageDeleteRows"`); DML fails at
+  the storage capability boundary, not at the
+  old top-level distributed reject strings.
+  **D6 critical decision:** shared mutation
+  driver lives behind a private
+  `#[async_trait]` `MutationSourceExecutor`
+  seam:
+  `async fn execute_read_plan(&self, plan:
+  &ExecutionPlan) -> Result<Vec<RecordBatch>,
+  QueryError>`. Local impl wraps
+  `Executor::execute_bound`; distributed impl
+  wraps fragment + schedule + collect. Both
+  coordinators invoke the same shared driver for
+  insert literal materialization, insert-select
+  materialization + target-column reorder, CTAS
+  ordering, DELETE candidate extraction +
+  identity extraction. **Third byte-identical
+  refactor invariant in council history** (after
+  ADR 035 D5 + ADR 036 D6): all ADR 030 / 032 /
+  033 / 036 fixture pass counts must match
+  pre/post-refactor. Use async trait (not closure
+  parameters) to keep `Send + Sync` clean.
+  **D7 critical decision:** distributed
+  `INSERT ... VALUES` **does not fragment** — no
+  source read; payload materialization + write
+  happen coordinator-side. Simplest lift of ADR
+  030 D13.
+  **D8 critical decision:** distributed
+  `INSERT ... SELECT` and CTAS fragment **only
+  the SELECT source**. CTAS preserves ADR 033
+  local ordering: source read → catalog create →
+  materialize payload → write. ADR 033 D7
+  non-transactional partial-failure behavior
+  preserved verbatim (no compensation; manual
+  cleanup via DROP per ADR 034).
+  **D9 critical decision:** `ExecutionPlan::Scan`
+  gains `row_identity: RowIdentityProjection`
+  (8 → 9 fields). Normal scan constructors
+  default to `None`. Only the internal DELETE
+  candidate plan builder sets `Append`. DELETE
+  candidate planning shape: pushdown-only is
+  `Scan { row_identity: Append, pbc_program:
+  Some(pushed), ... }` with no runtime filter
+  supplied during candidate execution;
+  residual is `Filter { predicate, input:
+  Box<Scan { row_identity: Append, pbc_program:
+  None, ... }> }` (the trailing
+  `__row_key_id__` column survives `Filter`
+  because ADR 036's
+  `filter_batches_with_bound_predicate`
+  preserves all input columns); no predicate is
+  `Scan { row_identity: Append, pbc_program:
+  None, ... }`. Runtime-filter exclusion is an
+  execution / scan-input invariant, not an
+  `ExecutionPlan::Scan` field. SQL
+  invisibility carry-forward (ADR 029 D12 + ADR
+  030 D7 + ADR 035 D11 + ADR 036 guard #22).
+  **D10 critical decision (Claude C11 + A3
+  carry-forward; task-context variant added):**
+  DELETE candidate scans set `runtime_filter:
+  None` literally and MUST NOT inherit ambient
+  runtime filters from coordinator context,
+  task context, or worker context. Positive
+  literal guard + negative guards for
+  `self.context.runtime_filter` /
+  `context.runtime_filter` /
+  `spec.context.runtime_filter` inheritance.
+  Runtime filters remain read accelerators only.
+  **D11 critical decision:** fragmenter
+  `FragmentError::*NotFragmentable` rejects
+  remain defensive for raw `Insert` /
+  `InsertSelect` / `CreateTableAsSelect` /
+  `Delete` / `CreateTable` / `DropTable`. ADR
+  037 routes distributed DML around the
+  fragmenter except for derived read-only source
+  / candidate plans.
+  **D12 critical decision (Plan A / Plan B hard
+  contingency):** Wendelon CREATE Plan A lands
+  only if `submit_table_schema_update` accepts a
+  real `TableSchemaDescriptor::new_with_layout`
+  and a defensible `table_object_id` allocation
+  path exists. Plan B preserves
+  `WendelonCatalog::create_table`
+  `AdminUnavailable` verbatim; distributed CTAS
+  still functional against mock + local
+  catalog; Wendelon CREATE deferred to ADR 038.
+  **Do not invent `table_object_id` allocation
+  policy inside ADR 037.**
+  **D13 critical decision:** Wendelon-known
+  DROP remains `AdminUnavailable`. No
+  `WendelonCatalog::drop_table` change. ADR 034
+  distributed DROP routing already lifted by
+  ADR 034 itself; ADR 037 confirms (partially
+  lifted reject category).
+  **D14 critical decision:** ADR 038 = Storage-
+  Admin / Reclaim Substrate. ADR 038 absorbs
+  Wendelon DROP / physical reclaim, catalog
+  refresh after admin mutation, any deferred
+  Wendelon CREATE object-id work (Plan B), and
+  groundwork before higher-level composition
+  (e.g., `CREATE OR REPLACE TABLE`). Read-your-
+  writes and partial-write recovery follow the
+  storage-admin decision unless ADR 037
+  implementation evidence proves otherwise.
+  Four iterations / 0 flip-flops — **fourth
+  consecutive cross-ring substrate cycle at the
+  4-iter cadence** matching ADR 029 + 030 + 035.
+  **Tenth consecutive cycle of the Codex
+  correctness-clarification pattern.** Codex
+  iter-0 reframed the substrate from
+  "coordinator-local writer" to "coordinator-
+  owned mutations + distributed candidate reads"
+  (the load-bearing iter-0 finding). **First
+  cycle in council history with three Claude
+  substantive retractions** (C2 coordinator-local
+  writer → Codex D1+D7 coordinator-owned
+  mutations; D4 Wendelon DROP wiring → Codex
+  D14 defer-to-ADR-038; C15 2-field
+  `TaskExecutionContext` → Codex iter-3 4-field
+  shape). **First cycle in council history with
+  two Codex self-retractions on the same
+  field**: Codex iter-1 4-field → Codex iter-2
+  2-field narrowing → Codex iter-3 4-field
+  correction after deeper call-graph audit
+  through `Executor::execute_bound`. **Gemini
+  iter-1/2 retraction streak advances to 10-of-12**
+  after the 9-of-11 ADR 036 mark — Gemini iter-3
+  followed Codex iter-2 narrowing one beat late
+  into the wrong shape; Gemini iter-3 retracted
+  cleanly with formal "I retract Iteration 1/2
+  position" wording. Nineteenth instance of the
+  ADR 015 cycle. **25 ADR-037-specific
+  architecture guards + 1 paired adjustment**
+  to the existing variant-count catch-all = 26
+  architecture guard touchpoints. **9 required
+  functional fixtures + 2-3 optional Plan A
+  Wendelon fixtures** in new
+  `crates/toron/tests/distributed_write_context_test.rs`.
+  **Topic-concession-compresses-next-cycle
+  pattern advances to 6-of-8** — substrate-defer
+  ADRs seed the next cycle (ADR 034 D15 → ADR
+  035; ADR 035 D15 → ADR 036; ADR 036 D14 → ADR
+  037; ADR 037 D14 → ADR 038). **Trilogy
+  alternation hypothesis breaks** — ADR 037 + 038
+  are two consecutive substrate cycles,
+  suggesting substrate work accumulates in pairs
+  when deferred-debt is sufficiently backed up
+  (Wendelon CREATE + DROP + reclaim debt
+  triggered the pair). No new SQL syntax; no new
+  IR expression variant; no new aggregate
+  kernel; no PBC opcode change; no new
+  `StorageWrite` / `StorageDeleteRows` trait
+  method; no new `StorageError` variant; no new
+  public field on `WriteRequest` /
+  `DeleteRowsRequest`; no Wendelon storage
+  reclaim trait or helper introduced. ADR 029 /
+  030 / 031 / 032 / 033 / 034 / 035 / 036
+  invariants preserved. Local DML fixture pass
+  counts byte-identical pre/post-refactor (Phase
+  4 byte-identical refactor invariant — third
+  council instance). The nine-phase migration is
+  materialized in
+  `plans/impl/037_distributed_write_context.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -2060,7 +2302,335 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 036 promoted; ADR 037 candidates
+### ADR 037 promoted; ADR 038 candidates
+
+ADR 037 selected and promoted **Distributed Write
+Context (Cross-Ring Substrate for Distributed DML)**
+— Toron's **fourth cross-ring substrate cycle**
+after ADR 029 + 030 + 035, matching the 4-iter
+cross-ring substrate cadence. Lifts five
+accumulated distributed-DML rejects (ADR 030 D13
+distributed INSERT; ADR 032 D1 distributed INSERT
+SELECT; ADR 033 D11 distributed CTAS; ADR 036 D10
+distributed DELETE; ADR 029 D6
+`WendelonCatalog::create_table` `AdminUnavailable`
+via Plan A) + partially lifts ADR 034 D12 (catalog
+DROP routing already done) + explicitly defers
+ADR 034 D7 Wendelon DROP `AdminUnavailable` to
+ADR 038 per D14 sequencing commitment. **First
+cross-ring substrate cycle with two Codex self-
+retractions on the same field** and **first cycle
+in council history with three Claude substantive
+retractions in one cycle**.
+
+Fourteen decisions D1-D14 cover: coordinator-owned
+mutations (workers stay read/shuffle only;
+distributed coordinator is sole caller of
+`Catalog::create_table` /
+`StorageWrite::write` /
+`StorageDeleteRows::delete_rows`); context-
+bearing `DistributedQueryCoordinator` (explicit
+`ExecutionContext` argument or `with_context`
+constructor; production passes real context);
+4-field `TaskExecutionContext` substrate
+(`session_id` + `tenant_id` + `read_bound` +
+optional `trace_context`; `query_id` from
+`TaskSpec.identity`, `profile_hint` from
+`ExecutionPlan::Scan`, `runtime_filter` from
+`TaskInputBinding::Scan`; negative invariant
+against receipt / client-write / durability /
+finalization / retry / runtime-filter / row-
+identity / table-pin / telemetry / spill fields);
+**unchanged storage request shapes** (no
+`client_write_id` / `durability` /
+`await_finalization` public fields added —
+read-your-writes deferred); explicit
+writer/deleter sinks (`with_writer` /
+`with_writer_and_deleter` constructors mirror
+local pattern; unsupported-adapter strings reused
+from local coordinator); shared mutation driver
+via private `#[async_trait]`
+`MutationSourceExecutor` seam (local impl wraps
+`Executor::execute_bound`; distributed impl
+wraps fragment + schedule + collect; **third
+byte-identical refactor invariant** after ADR
+035 D5 + ADR 036 D6); `INSERT VALUES` does not
+fragment (no source read; coordinator-side
+materialization + write); `INSERT SELECT` and
+CTAS fragment only SELECT source (CTAS
+preserves ADR 033 source → catalog create →
+write ordering; non-transactional ADR 033 D7
+carry-forward); `ExecutionPlan::Scan` gains
+`row_identity: RowIdentityProjection` (8 → 9
+fields; normal scans default `None`; only
+internal DELETE candidate plan builder sets
+`Append`; SQL invisibility carry-forward from
+ADR 029 / 030 / 035 / 036); DELETE candidate
+execution supplies `runtime_filter: None` at the
+scan-input boundary + negative guard against
+`self.context` / `context` / `spec.context`
+runtime-filter inheritance (Claude C11 + A3
+carry-forward; task-context variant added);
+fragmenter `*NotFragmentable` rejects
+remain defensive for raw DML / catalog
+mutations; Wendelon CREATE Plan A via
+`Client::submit_table_schema_update` +
+`TableSchemaDescriptor::new_with_layout` (Plan B
+contingency preserves `AdminUnavailable` if
+`table_object_id` allocation needs policy
+invention — **do not invent inside ADR 037**);
+Wendelon DROP remains `AdminUnavailable` (D13;
+deferred to ADR 038); **ADR 038 = Storage-Admin /
+Reclaim Substrate** firmly committed (D14
+sequencing pin: Wendelon DROP, physical reclaim,
+catalog refresh after admin mutation, deferred
+Wendelon CREATE object-id work if Plan B,
+groundwork for `CREATE OR REPLACE TABLE`).
+
+Four iterations / 0 flip-flops — **fourth
+consecutive cross-ring substrate cycle at the
+4-iter cadence** matching ADR 029 + 030 + 035.
+**First cross-ring substrate cycle with two Codex
+self-retractions on the same field**: Codex
+iter-1 4-field `TaskExecutionContext` → Codex
+iter-2 2-field narrowing → Codex iter-3 4-field
+correction. The iter-3 audit through
+`Executor::execute_bound`'s call graph caught a
+substrate failure that the iter-2 type-shape
+narrowing would have introduced: workers receiving
+only `{query_id, profile_hint}` would still use
+`ExecutionContext::local_test()` defaults for
+session/tenant/read_bound when
+`Executor::execute_bound(Scan)` constructs
+`ScanRequest`. **Tenth consecutive cycle of the
+Codex correctness-clarification pattern.** Codex
+iter-0 reframed the substrate from "coordinator-
+local writer" to "coordinator-owned mutations +
+distributed candidate reads" (the load-bearing
+iter-0 finding that re-shaped Claude C2 + D4).
+
+**First cycle in council history with three
+Claude substantive retractions:**
+
+1. **C2 coordinator-local writer retracted** at
+   iter-1 in favor of Codex D1 + D7 coordinator-
+   owned mutations + distributed candidate reads.
+2. **D4 Wendelon DROP wiring retracted** at
+   iter-1 in favor of Codex D14 defer-to-ADR-038
+   (Wendelon consensus state machine rejects
+   schema drops by design: `"table schema drops
+   require an explicit data-rewrite migration"`).
+3. **C15 2-field `TaskExecutionContext`
+   retracted** at iter-3 in favor of 4-field
+   shape after Codex iter-3 audit through
+   `Executor::execute_bound`'s call graph (the
+   iter-2 narrowing was a substrate failure that
+   the council followed in lockstep before Codex
+   self-audited).
+
+**Gemini iter-1/2 retraction streak advances to
+10-of-12** after the 9-of-11 ADR 036 mark.
+Gemini iter-3 followed Codex iter-2 narrowing
+one beat late into the wrong shape; Gemini
+iter-3 retracted cleanly with formal "I retract
+Iteration 1/2 position" wording when Codex
+iter-3 self-corrected.
+
+Nineteenth instance of the ADR 015 cycle. **25
+ADR-037-specific architecture guards + 1 paired
+adjustment** to the existing variant-count
+catch-all = 26 architecture guard touchpoints.
+**9 required functional fixtures + 2-3 optional
+Plan A Wendelon fixtures** live in new
+`crates/toron/tests/distributed_write_context_test.rs`.
+
+**Topic-concession-compresses-next-cycle pattern
+advances to 6-of-8.** ADR 037 D14 → ADR 038
+generates the Storage-Admin / Reclaim Substrate
+seed. Pattern: substrate-defer ADRs seed the
+next cycle (ADR 034 D15 → ADR 035; ADR 035 D15 →
+ADR 036; ADR 036 D14 → ADR 037; ADR 037 D14 →
+ADR 038). **Trilogy alternation hypothesis
+breaks** — ADR 037 + 038 are two consecutive
+substrate cycles. Hypothesis test fails:
+substrate (035) → composition (036) → substrate
+(037) → substrate (038) suggests substrate work
+accumulates in pairs when deferred-debt is
+sufficiently backed up (Wendelon CREATE + DROP +
+reclaim debt triggered the pair).
+
+**Cross-ring substrate-cycle properties at 4 data
+points (stable):**
+
+1. **Cross-ring substrate cycles converge in 4
+   iterations.** (4 data points: ADR 029 + 030 +
+   035 + 037)
+2. **Cross-ring substrate cycles add 0-1 fields
+   to a single trait-request struct.** (ADR 029 +
+   030 + 035: 1 field each on `ScanRequest`,
+   `WriteRequest`, `ScanRequest`; ADR 037 adds
+   `row_identity` to `ExecutionPlan::Scan` plus
+   new `TaskExecutionContext`; storage request
+   shapes byte-identical)
+3. **Cross-ring substrate cycles attract Codex
+   iter-0 audit-shaped reframings.** (ADR 029 +
+   030 + 035 + 037: each had a load-bearing
+   iter-0 correctness reframing.)
+4. **Cross-ring substrate cycles permit Codex
+   self-retraction.** (ADR 037 is the first
+   instance with two self-retractions on the
+   same field — cycle property data point at 1
+   instance.)
+
+No new SQL syntax; no new IR expression variant;
+no new aggregate kernel; no PBC opcode change;
+no new `StorageWrite` / `StorageDeleteRows`
+trait method; no new `StorageError` variant; no
+new public field on `WriteRequest` /
+`DeleteRowsRequest`; no Wendelon storage reclaim
+trait or helper; no `blake3` dependency; no
+external allocator crate added. ADR 029 / 030 /
+031 / 032 / 033 / 034 / 035 / 036 invariants
+preserved (including ADR 030 D7 Toron-side
+synthetic-column construction prohibition; ADR
+034 `lower_ddl_table_name` helper preserved;
+ADR 035 substrate types / trait / helper names
+preserved; ADR 036 helper split preserved; ADR
+036 SQL DELETE fixtures byte-identical pre/post-
+ADR-037 via Phase 4 byte-identical refactor
+invariant). The nine-phase migration is
+materialized in
+`plans/impl/037_distributed_write_context.md`.
+
+ADR 038 selection is **firmly committed** by ADR
+037 D14 sequencing commitment. Storage-Admin /
+Reclaim Substrate. Lifts the remaining
+accumulated catalog-admin / physical-reclaim
+debt:
+
+1. ADR 034 D7 `WendelonCatalog::drop_table`
+   `AdminUnavailable` (carry-forward through
+   ADR 037 D13);
+2. ADR 034 D9 + ADR 035 D9 physical storage
+   reclaim (deferred across multiple cycles);
+3. catalog refresh after admin mutation
+   (groundwork for higher-level composition);
+4. (Plan B contingency) ADR 037 D12 deferred
+   Wendelon CREATE object-id work, if Plan A
+   did not land in ADR 037.
+
+Unblocks atomic DROP + reclaim + (if Plan B from
+ADR 037) Wendelon CREATE simultaneously, plus
+groundwork for `CREATE OR REPLACE TABLE`.
+
+**ADR 038 lead candidate (committed):**
+
+- **ADR 038 — Storage-Admin / Reclaim Substrate.**
+  Substrate-introducing cross-ring cycle (Wendelon
+  admin consensus + physical reclaim engagement).
+  Expected to be a 4-iter cycle per the cross-
+  ring substrate cadence (now four data points
+  pre-cycle: ADR 029 + 030 + 035 + 037). Two-pass
+  Wendelon-API discovery budget required —
+  specifically `submit_table_schema_drop` (if
+  any) and physical file-deletion / tombstone-
+  collection surface. Carries forward ADR 037
+  D14 commitment.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate + new partial-write
+  contract. Likely a two-ADR sequence: partial-
+  write substrate cycle + SQL UPDATE composition.
+- **`CREATE OR REPLACE TABLE`** — lower to `DROP
+  IF EXISTS x; CREATE TABLE x AS SELECT ...`.
+  Composition over ADR 029 / 033 / 034 / 036 /
+  037. Small cycle; waiting on ADR 038 reclaim
+  substrate. Carries forward to a later
+  composition slot.
+- **`INSERT ... RETURNING` / `CTAS ... RETURNING`
+  / `DELETE ... RETURNING`** — DML result-shape
+  extension; modest user value until DEFAULT or
+  GENERATED columns or sequences exist. Future
+  RETURNING substrate + composition pair.
+- **Subqueries in DELETE WHERE clause** (e.g.
+  `DELETE FROM t WHERE id IN (SELECT ...)`).
+  Future correlated-subquery substrate ADR.
+
+**Substrate candidates carried forward:**
+
+- **Stale-bound-plan invalidation ADR.**
+- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
+  extensions; need PK / unique-constraint
+  substrate first.
+- **Streaming / multi-batch `StorageWrite::write`
+  / `StorageDeleteRows::delete_rows`** — lifts
+  ADR 032 D5 + D6 + ADR 033 D8 + ADR 035 single-
+  batch cap for bulk loads / deletes.
+- **Write retries after descriptor evolution /
+  mutation idempotency** — ADR 030 D12 + ADR 032
+  + ADR 033 + ADR 034 + ADR 035 + ADR 036 + ADR
+  037 carry-forward (read-your-writes deferred).
+- **Read-your-writes session HLC advancement
+  ADR.** ADR 037 D4 carry-forward (no public
+  `client_write_id` / receipt surfacing).
+- **Per-statement `durability` override.** ADR
+  037 D4 carry-forward.
+- **Richer Toron `Hlc` type** — prerequisite for
+  read-your-writes.
+- **Hidden-aggregate `ORDER BY` keys ADR.**
+- **HAVING alias visibility ADR.**
+- **Non-aggregate computed `ORDER BY` ADR.** ADR
+  027 D10 deferred.
+- **Temporal column types (DATE, TIMESTAMP)** for
+  ADR 029 / 030 / 032 / 033 type lattices.
+- **DECIMAL** for ADR 029 / 030 / 032 / 033
+  type lattices.
+- **Utf8 ↔ numeric CAST + TRY_CAST.**
+- **Boolean ↔ numeric CAST + TRY_CAST.**
+- **`ALTER TABLE` / `CREATE INDEX` / `CREATE VIEW`
+  / `DROP VIEW` / `DROP SCHEMA` / `DROP INDEX`** —
+  DDL siblings using the renamed
+  `lower_ddl_table_name` helper pattern from ADR
+  034 D4.
+- **Constraints** (PRIMARY KEY / FOREIGN KEY /
+  CHECK / column-level UNIQUE) / DEFAULT /
+  GENERATED columns.
+- **`USING` clause / `ORDER BY` + `LIMIT` /
+  table aliases / `RETURNING` / `TRUNCATE` in
+  DELETE** — deferred per ADR 036 D1 out-of-
+  scope.
+- **Wendelon AGG consumer wiring** — cross-ring;
+  PBC partial-pushdown.
+- **Kernel graduations** (`LinearRegress`,
+  `ApproxQuantile`).
+
+**Code-evidence-driven candidates (substrate-debt):**
+
+- **Plan Arena / index-based plan IR.** Brainstorm
+  004 broader framing; ADR 032 + 033 + 034 + 036
+  added a combined ~46 walker leaf arms (~11 per
+  cycle); ADR 035 + ADR 037 added zero walker
+  arms (substrate cycles were additive). Pressure
+  remains bounded.
+- **Typed expression tape / opcode interpreter.**
+  Brainstorm 004 deeper realization over ADR
+  031's `BoundExprProgram`.
+- **Common subexpression elimination (CSE) +
+  literal deduplication.** ADR 031 D8 carry-
+  forward.
+- **Cranelift JIT compilation.** Brainstorm 001.
+- **Logical `Expr` arena migration.** Brainstorm
+  004 broader framing.
+- **PBC partial-pushdown of computed-arg
+  aggregates** — cross-ring; workload-evidence-
+  pressured.
+
+The archived selection notes below preserve forward-
+sequence content from prior planning passes.
+
+#### ADR 036 → ADR 037 archived selection notes
 
 ADR 036 selected and promoted **SQL `DELETE WHERE`**
 — Toron's **fourth composition cycle** after ADR 032
@@ -2244,145 +2814,6 @@ WHERE filter fixtures byte-identical pre/post-ADR-
 036 via Phase 4 byte-identical refactor
 invariant). The nine-phase migration is materialized
 in `plans/impl/036_sql_delete_where.md`.
-
-ADR 037 selection is **firmly committed** by ADR
-036 D14 sequencing commitment. Cross-ring
-distributed-write-context substrate cycle. Lifts
-five accumulated local-only write rejects + one
-catalog admin unavailable:
-
-1. ADR 030 D13 distributed INSERT reject;
-2. ADR 032 D1 distributed INSERT SELECT reject;
-3. ADR 033 D11 distributed CTAS reject;
-4. ADR 034 D12 distributed DROP TABLE reject + ADR
-   034 D7 `WendelonCatalog::drop_table`
-   `AdminUnavailable`;
-5. ADR 036 D10 distributed DELETE reject.
-
-Unblocks distributed write execution +
-transactional CTAS + atomic DROP simultaneously
-without entangling UPDATE or RETURNING. Pure
-substrate cycle (no SQL surface), like ADR 031
-was.
-
-**ADR 037 lead candidate (committed):**
-
-- **ADR 037 — Cross-ring distributed-write-context
-  substrate.** Substrate-introducing cross-ring
-  cycle (involves Wendelon API surface inspection
-  to settle the write-context wire shape; lifts
-  the local-only / `AdminUnavailable` rejects
-  accumulated across ADR 030 / 032 / 033 / 034 /
-  036). Expected to be a 4-iter cycle per the
-  cross-ring substrate cadence (ADR 029 + 030 +
-  035 — three data points already). Two-pass
-  Wendelon-API discovery budget required. Trilogy
-  alternation hypothesis test: substrate (035) →
-  composition (036) → substrate (037) tests
-  whether alternation collapsed to 1-cycle
-  granularity after the first trilogy pair.
-
-**Code-evidence-driven candidates carried forward:**
-
-- **`UPDATE WHERE`** — composition over ADR 035
-  row-identity substrate + new partial-write
-  contract. Likely a two-ADR sequence: partial-
-  write substrate cycle + SQL UPDATE composition.
-- **`CREATE OR REPLACE TABLE`** — lower to `DROP
-  IF EXISTS x; CREATE TABLE x AS SELECT ...`.
-  Composition over ADR 029 / 033 / 034 / 036.
-  Small cycle; carries forward to a later
-  composition slot.
-- **`INSERT ... RETURNING` / `CTAS ... RETURNING`
-  / `DELETE ... RETURNING`** — DML result-shape
-  extension; modest user value until DEFAULT or
-  GENERATED columns or sequences exist. Future
-  RETURNING substrate + composition pair.
-- **Subqueries in DELETE WHERE clause** (e.g.
-  `DELETE FROM t WHERE id IN (SELECT ...)`).
-  Future correlated-subquery substrate ADR.
-
-**Substrate candidates carried forward:**
-
-- **Storage reclaim ADR.** Physical file deletion,
-  in-memory storage map cleanup, Wendelon
-  descriptor deletion, tombstone collection; lifts
-  ADR 034 D9 + ADR 035 D9 carry-forward.
-- **Stale-bound-plan invalidation ADR.**
-- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
-  extensions; need PK / unique-constraint
-  substrate first.
-- **Streaming / multi-batch `StorageWrite::write`
-  / `StorageDeleteRows::delete_rows`** — lifts
-  ADR 032 D5 + D6 + ADR 033 D8 + ADR 035 single-
-  batch cap for bulk loads / deletes.
-- **Write retries after descriptor evolution /
-  mutation idempotency** — ADR 030 D12 + ADR 032
-  + ADR 033 + ADR 034 + ADR 035 + ADR 036 carry-
-  forward.
-- **Read-your-writes session HLC advancement
-  ADR.**
-- **Per-statement `durability` override.**
-- **Cross-ring metadata-write contract ADR.**
-  Needed to lift `WendelonCatalog::create_table`
-  + `WendelonCatalog::drop_table` from
-  `AdminUnavailable`; engages transactional CTAS
-  + atomic DROP. (Likely bundled with or
-  immediately following ADR 037.)
-- **Richer Toron `Hlc` type** — prerequisite for
-  read-your-writes.
-- **Hidden-aggregate `ORDER BY` keys ADR.**
-- **HAVING alias visibility ADR.**
-- **Non-aggregate computed `ORDER BY` ADR.** ADR
-  027 D10 deferred.
-- **Temporal column types (DATE, TIMESTAMP)** for
-  ADR 029 / 030 / 032 / 033 type lattices.
-- **DECIMAL** for ADR 029 / 030 / 032 / 033
-  type lattices.
-- **Utf8 ↔ numeric CAST + TRY_CAST.**
-- **Boolean ↔ numeric CAST + TRY_CAST.**
-- **`ALTER TABLE` / `CREATE INDEX` / `CREATE VIEW`
-  / `DROP VIEW` / `DROP SCHEMA` / `DROP INDEX`** —
-  DDL siblings using the renamed
-  `lower_ddl_table_name` helper pattern from ADR
-  034 D4.
-- **Constraints** (PRIMARY KEY / FOREIGN KEY /
-  CHECK / column-level UNIQUE) / DEFAULT /
-  GENERATED columns.
-- **`USING` clause / `ORDER BY` + `LIMIT` /
-  table aliases / `RETURNING` / `TRUNCATE` in
-  DELETE** — deferred per ADR 036 D1 out-of-
-  scope.
-- **Wendelon AGG consumer wiring** — cross-ring;
-  PBC partial-pushdown.
-- **Kernel graduations** (`LinearRegress`,
-  `ApproxQuantile`).
-
-**Code-evidence-driven candidates (substrate-debt):**
-
-- **Plan Arena / index-based plan IR.** Brainstorm
-  004 broader framing; ADR 032 + 033 + 034 + 036
-  added a combined ~46 walker leaf arms (~11 per
-  cycle); ADR 035 added zero walker arms
-  (substrate cycle was additive). Pressure is
-  growing but still bounded; ADR 037 cross-ring
-  substrate is expected to be light on walker
-  pressure.
-- **Typed expression tape / opcode interpreter.**
-  Brainstorm 004 deeper realization over ADR
-  031's `BoundExprProgram`.
-- **Common subexpression elimination (CSE) +
-  literal deduplication.** ADR 031 D8 carry-
-  forward.
-- **Cranelift JIT compilation.** Brainstorm 001.
-- **Logical `Expr` arena migration.** Brainstorm
-  004 broader framing.
-- **PBC partial-pushdown of computed-arg
-  aggregates** — cross-ring; workload-evidence-
-  pressured.
-
-The archived selection notes below preserve forward-
-sequence content from prior planning passes.
 
 #### ADR 035 → ADR 036 archived selection notes
 
