@@ -212,6 +212,10 @@ impl<'a> Binder<'a> {
 				LogicalPlan::CreateTableAsSelect { table, source } => {
 					self.bind_create_table_as_select(table, source).await
 				}
+				LogicalPlan::DropTable { name, if_exists } => Ok(ExecutionPlan::DropTable {
+					name: name.clone(),
+					if_exists: *if_exists,
+				}),
 				LogicalPlan::Insert {
 					table,
 					columns,
@@ -811,6 +815,7 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 		},
 		LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
+		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => {}
 	}
@@ -960,6 +965,7 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -1267,6 +1273,10 @@ fn optimize_for_required(
 				OrdinalRemap::new(),
 			))
 		}
+		ExecutionPlan::DropTable { name, if_exists } => Ok((
+			ExecutionPlan::DropTable { name, if_exists },
+			OrdinalRemap::new(),
+		)),
 		ExecutionPlan::Insert {
 			legacy_table_id,
 			table,

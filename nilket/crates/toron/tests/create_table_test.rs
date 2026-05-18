@@ -158,14 +158,13 @@ fn planner_rejects_storage_synthetic_column_names() {
 #[test]
 fn planner_preserves_non_create_table_statement_rejects() {
 	for sql in [
-		"DROP TABLE t",
 		"ALTER TABLE t ADD COLUMN b INT",
 		"CREATE INDEX i ON t (a)",
 		"CREATE VIEW v AS SELECT 1",
 	] {
 		assert_frontend_error(
 			sql,
-			"unsupported SQL statement; only SELECT, CREATE TABLE, and INSERT are supported",
+			"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, and DROP TABLE are supported",
 		);
 	}
 }

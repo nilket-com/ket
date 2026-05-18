@@ -116,6 +116,12 @@ pub trait Catalog: Send + Sync {
 		schema: SchemaRef,
 		if_not_exists: bool,
 	) -> Result<TableBinding, CatalogError>;
+
+	async fn drop_table(
+		&self,
+		name: &TableRef,
+		if_exists: bool,
+	) -> Result<Option<TableBinding>, CatalogError>;
 }
 
 #[derive(Default)]
@@ -267,6 +273,32 @@ impl Catalog for MockCatalog {
 
 		Ok(binding)
 	}
+
+	async fn drop_table(
+		&self,
+		name: &TableRef,
+		if_exists: bool,
+	) -> Result<Option<TableBinding>, CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+
+		let Some(table_id) = inner.by_ref.get(name).copied() else {
+			if if_exists {
+				return Ok(None);
+			}
+			return Err(CatalogError::TableNotFound {
+				table: table_name(name),
+			});
+		};
+
+		let binding = inner
+			.by_id
+			.remove(&table_id)
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: table_name(name),
+			})?;
+		inner.by_ref.retain(|_, id| *id != table_id);
+		Ok(Some(binding))
+	}
 }
 
 #[derive(Default)]
@@ -323,6 +355,25 @@ impl Catalog for WendelonCatalog {
 		Err(CatalogError::AdminUnavailable {
 			message: "CREATE TABLE is not wired to Wendelon catalog administration".to_string(),
 		})
+	}
+
+	async fn drop_table(
+		&self,
+		name: &TableRef,
+		if_exists: bool,
+	) -> Result<Option<TableBinding>, CatalogError> {
+		if self.by_ref.contains_key(name) {
+			return Err(CatalogError::AdminUnavailable {
+				message: "DROP TABLE is not wired to Wendelon catalog administration".to_string(),
+			});
+		}
+		if if_exists {
+			Ok(None)
+		} else {
+			Err(CatalogError::TableNotFound {
+				table: table_name(name),
+			})
+		}
 	}
 }
 

@@ -563,10 +563,11 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 13);
+	assert_eq!(enum_variant_count(logical_plan), 14);
 	assert!(logical_plan.contains("Sort {"));
 	assert!(logical_plan.contains("CreateTable {"));
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
+	assert!(logical_plan.contains("DropTable {"));
 	assert!(logical_plan.contains("Insert {"));
 	assert!(logical_plan.contains("InsertSelect {"));
 	assert!(logical_plan.contains("output_names: Vec<Option<String>>"));
@@ -580,10 +581,11 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 11);
+	assert_eq!(enum_variant_count(execution_plan), 12);
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("CreateTable {"));
 	assert!(execution_plan.contains("CreateTableAsSelect {"));
+	assert!(execution_plan.contains("DropTable {"));
 	assert!(execution_plan.contains("Insert {"));
 	assert!(execution_plan.contains("InsertSelect {"));
 	assert!(execution_plan.contains("predicate: BoundExprProgram"));
@@ -2508,8 +2510,9 @@ fn adr029_sql_planner_accepts_only_select_and_create_table() {
 	assert!(plan_body.contains("Statement::Query(query)"));
 	assert!(plan_body.contains("Statement::CreateTable(create_table)"));
 	assert!(plan_body.contains("Statement::Insert(insert)"));
+	assert!(plan_body.contains("Statement::Drop { .. }"));
 	assert!(plan_body.contains(
-		"unsupported SQL statement; only SELECT, CREATE TABLE, and INSERT are supported"
+		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, and DROP TABLE are supported"
 	));
 	assert!(!plan_body.contains("only SELECT and CREATE TABLE are supported"));
 	assert!(!plan_body.contains("only SELECT is supported"));
@@ -2557,15 +2560,15 @@ fn adr029_create_table_ir_surface_is_narrow() {
 fn adr029_create_table_name_lowering_is_strict() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
-	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_name")
+	let body = brace_blocks_after_marker(&planner, "fn lower_ddl_table_name")
 		.into_iter()
 		.next()
-		.expect("lower_create_table_name body")
+		.expect("lower_ddl_table_name body")
 		.1;
 
 	assert!(body.contains("[table]"));
 	assert!(body.contains("[schema, table]"));
-	assert!(body.contains("CREATE TABLE supports only one- or two-part table names"));
+	assert!(body.contains("DDL table names support only one- or two-part table names"));
 	assert!(!body.contains("table_ref_from_object_name"));
 }
 
@@ -2733,7 +2736,7 @@ fn adr029_coordinators_intercept_create_table() {
 		.nth(1)
 		.expect("QueryCoordinator impl");
 	let ddl_branch = query_impl
-		.find("matches!(plan, LogicalPlan::CreateTable")
+		.find("LogicalPlan::CreateTable")
 		.expect("local DDL branch");
 	let retry_loop = query_impl
 		.find("let mut retried_descriptor_evolution = false")
@@ -3042,8 +3045,9 @@ fn adr032_logical_plan_retains_insert_select_variant() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 13);
+	assert_eq!(enum_variant_count(logical_plan), 14);
 	assert!(logical_plan.contains("InsertSelect {"));
+	assert!(logical_plan.contains("DropTable {"));
 	assert!(logical_plan.contains("table: TableRef,"));
 	assert!(logical_plan.contains("columns: Option<Vec<String>>,"));
 	assert!(logical_plan.contains("source: Box<LogicalPlan>,"));
@@ -3058,8 +3062,9 @@ fn adr032_execution_plan_retains_insert_select_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 11);
+	assert_eq!(enum_variant_count(execution_plan), 12);
 	assert!(execution_plan.contains("InsertSelect {"));
+	assert!(execution_plan.contains("DropTable {"));
 }
 
 #[test]
@@ -3408,10 +3413,11 @@ fn adr033_logical_variant_count_is_13() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 13);
+	assert_eq!(enum_variant_count(logical_plan), 14);
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
 	assert!(logical_plan.contains("table: TableRef,"));
 	assert!(logical_plan.contains("source: Box<LogicalPlan>,"));
+	assert!(logical_plan.contains("DropTable {"));
 }
 
 #[test]
@@ -3424,8 +3430,9 @@ fn adr033_execution_variant_count_is_11() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 11);
+	assert_eq!(enum_variant_count(execution_plan), 12);
 	assert!(execution_plan.contains("CreateTableAsSelect {"));
+	assert!(execution_plan.contains("DropTable {"));
 }
 
 #[test]
@@ -3860,6 +3867,419 @@ fn adr033_does_not_add_plan_arena_dependency() {
 		assert!(
 			!cargo.contains(forbidden),
 			"unexpected arena dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr034_sql_planner_accepts_drop_table() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let plan_body = brace_blocks_after_marker(&planner, "pub fn plan")
+		.into_iter()
+		.next()
+		.expect("SqlPlanner::plan body")
+		.1;
+
+	assert!(plan_body.contains("Statement::Drop { .. }"));
+	assert!(plan_body.contains("self.lower_drop_table(&ast[0])"));
+	assert!(plan_body.contains("DROP TABLE"));
+}
+
+#[test]
+fn adr034_drop_table_destructure_is_exhaustive() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_drop_table")
+		.into_iter()
+		.next()
+		.expect("lower_drop_table body")
+		.1;
+
+	for marker in [
+		"object_type",
+		"if_exists",
+		"names",
+		"cascade",
+		"restrict",
+		"purge",
+		"temporary",
+	] {
+		assert!(body.contains(marker), "lower_drop_table missing {marker}");
+	}
+	assert!(!body.contains(".."));
+}
+
+#[test]
+fn adr034_drop_table_reject_surface_is_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_drop_table")
+		.into_iter()
+		.next()
+		.expect("lower_drop_table body")
+		.1;
+
+	for marker in [
+		"ObjectType::Table",
+		"names.len() != 1",
+		"*cascade",
+		"*restrict",
+		"*purge",
+		"*temporary",
+	] {
+		assert!(
+			body.contains(marker),
+			"DROP TABLE reject lattice missing {marker}"
+		);
+	}
+}
+
+#[test]
+fn adr034_drop_table_name_lowering_is_ddl_specific() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let helper = brace_blocks_after_marker(&planner, "fn lower_ddl_table_name")
+		.into_iter()
+		.next()
+		.expect("lower_ddl_table_name body")
+		.1;
+	let lower_drop = brace_blocks_after_marker(&planner, "fn lower_drop_table")
+		.into_iter()
+		.next()
+		.expect("lower_drop_table body")
+		.1;
+
+	assert!(helper.contains("[table]"));
+	assert!(helper.contains("[schema, table]"));
+	assert!(helper.contains("DDL table names support only one- or two-part table names"));
+	assert!(lower_drop.contains("lower_ddl_table_name(&names[0])?"));
+	assert_eq!(planner.matches("lower_ddl_table_name(").count(), 4);
+	assert!(!planner.contains("fn lower_create_table_name"));
+	assert!(!helper.contains("table_ref_from_object_name"));
+}
+
+#[test]
+fn adr034_logical_variant_count_is_14() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let logical_plan = logical
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("pub fn project_plan").next())
+		.expect("LogicalPlan enum");
+
+	assert_eq!(enum_variant_count(logical_plan), 14);
+	assert!(logical_plan.contains("DropTable {"));
+	assert!(logical_plan.contains("name: TableRef,"));
+	assert!(logical_plan.contains("if_exists: bool,"));
+}
+
+#[test]
+fn adr034_execution_variant_count_is_12() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+
+	assert_eq!(enum_variant_count(execution_plan), 12);
+	assert!(execution_plan.contains("DropTable {"));
+}
+
+#[test]
+fn adr034_execution_drop_table_has_no_identity_or_box() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+	let drop_table = brace_blocks_after_marker(execution_plan, "DropTable {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::DropTable body")
+		.1;
+
+	assert!(drop_table.contains("name: TableRef,"));
+	assert!(drop_table.contains("if_exists: bool,"));
+	for forbidden in [
+		"TableId",
+		"TableObjectId",
+		"PhysicalDescriptorFingerprint",
+		"SchemaRef",
+		"Box<",
+	] {
+		assert!(
+			!drop_table.contains(forbidden),
+			"DROP TABLE execution variant must not carry {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr034_binder_drop_table_is_pass_through() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let drop_arm = binder
+		.split("LogicalPlan::DropTable")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Insert").next())
+		.expect("DropTable bind arm");
+
+	assert!(drop_arm.contains("Ok(ExecutionPlan::DropTable"));
+	assert!(drop_arm.contains("name: name.clone()"));
+	assert!(drop_arm.contains("if_exists: *if_exists"));
+	assert!(!drop_arm.contains(".resolve_table("));
+	assert!(!drop_arm.contains(".resolve_table_id("));
+	assert!(!drop_arm.contains(".drop_table("));
+}
+
+#[test]
+fn adr034_catalog_drop_table_returns_optional_binding() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let trait_block = catalog
+		.split("pub trait Catalog")
+		.nth(1)
+		.and_then(|rest| rest.split("}").next())
+		.expect("Catalog trait");
+
+	assert!(trait_block.contains("async fn drop_table("));
+	assert!(trait_block.contains(") -> Result<Option<TableBinding>, CatalogError>;"));
+}
+
+#[test]
+fn adr034_mock_catalog_drop_table_cleans_aliases() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let impl_block = catalog
+		.split("impl Catalog for MockCatalog")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Catalog for WendelonCatalog").next())
+		.expect("MockCatalog Catalog impl");
+	let drop_body = brace_blocks_after_marker(impl_block, "async fn drop_table")
+		.into_iter()
+		.next()
+		.expect("MockCatalog::drop_table body")
+		.1;
+
+	assert!(drop_body.contains(".remove(&table_id)"));
+	assert!(drop_body.contains("inner.by_ref.retain"));
+	assert!(drop_body.contains("*id != table_id"));
+	assert!(!drop_body.contains("by_ref.insert"));
+	assert!(!drop_body.contains("or_insert"));
+}
+
+#[test]
+fn adr034_wendelon_catalog_drop_table_is_admin_unavailable() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let impl_block = catalog
+		.split("impl Catalog for WendelonCatalog")
+		.nth(1)
+		.expect("WendelonCatalog Catalog impl");
+	let drop_body = brace_blocks_after_marker(impl_block, "async fn drop_table")
+		.into_iter()
+		.next()
+		.expect("WendelonCatalog::drop_table body")
+		.1;
+
+	assert!(drop_body.contains("CatalogError::AdminUnavailable"));
+	assert!(drop_body.contains("DROP TABLE is not wired to Wendelon catalog administration"));
+	assert!(drop_body.contains("if_exists"));
+	assert!(drop_body.contains("Ok(None)"));
+	assert!(drop_body.contains("CatalogError::TableNotFound"));
+}
+
+#[test]
+fn adr034_coordinators_intercept_drop_table() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let drop_branch = query_impl
+		.find("LogicalPlan::DropTable")
+		.expect("local DROP branch");
+	let retry_loop = query_impl
+		.find("let mut retried_descriptor_evolution = false")
+		.expect("descriptor retry loop");
+	assert!(drop_branch < retry_loop);
+
+	let distributed_impl = coordinator
+		.split("impl<Registry, Transport> DistributedQueryCoordinator")
+		.nth(1)
+		.expect("DistributedQueryCoordinator impl");
+	let distributed_drop = distributed_impl
+		.find("ExecutionPlan::DropTable")
+		.expect("distributed DROP branch");
+	let fragment_call = distributed_impl
+		.find("fragment_plan(")
+		.expect("fragmenter call");
+	assert!(distributed_drop < fragment_call);
+
+	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
+		.into_iter()
+		.next()
+		.expect("execute_catalog_plan helper body")
+		.1;
+	assert!(helper.contains("ExecutionPlan::DropTable"));
+	assert!(helper.contains(".drop_table(name, *if_exists)"));
+	assert!(helper.contains("Ok(Vec::new())"));
+}
+
+#[test]
+fn adr034_executor_and_fragmenter_reject_drop_table() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
+		.into_iter()
+		.next()
+		.expect("fragment_plan body")
+		.1;
+
+	assert!(exec.contains("unbound DROP TABLE execution"));
+	assert!(exec.contains("DROP TABLE execution is coordinator-only"));
+	assert!(fragmenter.contains("DropTableNotFragmentable"));
+	assert!(fragment_plan.contains("ExecutionPlan::DropTable"));
+	assert!(
+		fragment_plan.find("ExecutionPlan::DropTable").unwrap()
+			< fragment_plan.find("contains_join").unwrap()
+	);
+	assert!(
+		fragment_plan.find("ExecutionPlan::DropTable").unwrap()
+			< fragment_plan.find("count_exchanges").unwrap()
+	);
+}
+
+#[test]
+fn adr034_distributed_walkers_treat_drop_table_as_leaf() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	for function in [
+		"fn first_join",
+		"fn find_exchange",
+		"fn count_exchanges",
+		"fn first_scan_metadata",
+		"fn replace_exchange_with_scan",
+		"fn replace_first_join",
+	] {
+		let body = brace_blocks_after_marker(&fragmenter, function)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{function} body"))
+			.1;
+		assert!(
+			body.contains("| ExecutionPlan::DropTable { .. }"),
+			"{function} missing DropTable leaf arm"
+		);
+	}
+
+	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let first_scan_fingerprint = brace_blocks_after_marker(&scheduler, "fn first_scan_fingerprint")
+		.into_iter()
+		.next()
+		.expect("first_scan_fingerprint body")
+		.1;
+	assert!(first_scan_fingerprint.contains("| ExecutionPlan::DropTable { .. }"));
+
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	for function in [
+		"fn join_strategy_label",
+		"fn contains_join",
+		"fn contains_broadcast_join",
+		"fn scan_schema_for_table_id",
+	] {
+		let body = brace_blocks_after_marker(&server, function)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{function} body"))
+			.1;
+		assert!(
+			body.contains("| ExecutionPlan::DropTable { .. }"),
+			"{function} missing DropTable leaf arm"
+		);
+	}
+}
+
+#[test]
+fn adr034_operator_label_is_drop_table() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let operator_kind = brace_blocks_after_marker(&server, "fn operator_kind_label")
+		.into_iter()
+		.next()
+		.expect("operator_kind_label body")
+		.1;
+
+	assert!(operator_kind.contains("ExecutionPlan::DropTable { .. } => \"drop_table\""));
+}
+
+#[test]
+fn adr034_does_not_add_storage_reclaim_or_plan_arena() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	for forbidden in [
+		"StorageReclaim",
+		"StorageDrop",
+		"drop_table",
+		"delete_table",
+		"reclaim_table",
+	] {
+		assert!(
+			!storage.contains(forbidden),
+			"unexpected storage reclaim surface {forbidden}"
+		);
+	}
+
+	let cargo =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read toron Cargo.toml");
+	for forbidden in [
+		"blake3",
+		"bumpalo",
+		"typed-arena",
+		"generational-arena",
+		"slab",
+	] {
+		assert!(
+			!cargo.contains(forbidden),
+			"unexpected dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr034_catalog_trait_grows_by_exactly_one_method() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let trait_block = catalog
+		.split("pub trait Catalog")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive(Default)]").next())
+		.expect("Catalog trait");
+
+	assert!(trait_block.contains("async fn drop_table"));
+	for forbidden in [
+		"async fn truncate_table",
+		"async fn replace_table",
+		"async fn drop_schema",
+		"async fn alter_table",
+		"async fn rename_table",
+		"async fn drop_table_outcome",
+	] {
+		assert!(
+			!trait_block.contains(forbidden),
+			"ADR 034: Catalog must not grow beyond drop_table (found {forbidden})"
 		);
 	}
 }

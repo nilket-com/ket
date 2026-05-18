@@ -565,6 +565,9 @@ impl Executor {
 				LogicalPlan::CreateTableAsSelect { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound CREATE TABLE AS SELECT execution",
 				}),
+				LogicalPlan::DropTable { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound DROP TABLE execution",
+				}),
 				LogicalPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound INSERT execution",
 				}),
@@ -724,6 +727,9 @@ impl Executor {
 				}),
 				ExecutionPlan::CreateTableAsSelect { .. } => Err(ExecutionError::NotImplemented {
 					feature: "CREATE TABLE AS SELECT execution is coordinator-only",
+				}),
+				ExecutionPlan::DropTable { .. } => Err(ExecutionError::NotImplemented {
+					feature: "DROP TABLE execution is coordinator-only",
 				}),
 				ExecutionPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "INSERT execution is coordinator-only",
@@ -4562,7 +4568,7 @@ fn as_boolean<'a>(
 mod tests {
 	use super::*;
 	use crate::binder::{PlannerConfig, bind};
-	use crate::catalog::MockCatalog;
+	use crate::catalog::{MockCatalog, TableRef};
 	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 	use crate::error::StorageError;
 	use crate::ir::{ColumnOrdinal, QueryId, QueryProfileHint, SessionId, TableId};
@@ -4581,6 +4587,29 @@ mod tests {
 		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
 	};
+
+	#[tokio::test]
+	async fn execute_rejects_unbound_drop_table() {
+		let executor = Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		}));
+		let plan = LogicalPlan::DropTable {
+			name: TableRef::new("sales"),
+			if_exists: false,
+		};
+
+		let err = executor
+			.execute(&plan, None)
+			.await
+			.expect_err("executor should reject unbound DROP TABLE");
+
+		assert!(matches!(
+			err,
+			ExecutionError::NotImplemented {
+				feature: "unbound DROP TABLE execution"
+			}
+		));
+	}
 
 	#[test]
 	fn numeric_cast_kernels_truncate_preserve_nulls_and_reject_edges() {

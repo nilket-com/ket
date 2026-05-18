@@ -14,8 +14,8 @@ use sqlparser::ast::{
 	BinaryOperator, CastKind, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable,
 	DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, Function, FunctionArg,
 	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
-	Ident, Insert, JoinConstraint, JoinOperator, ObjectName, OrderBy, Query, Select, SelectItem,
-	SetExpr, Statement, TableAlias, TableFactor, TableObject, UnaryOperator, Value,
+	Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectType, OrderBy, Query, Select,
+	SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -114,7 +114,7 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 	}
 }
 
-fn lower_create_table_name(name: &ObjectName) -> Result<TableRef, FrontendError> {
+fn lower_ddl_table_name(name: &ObjectName) -> Result<TableRef, FrontendError> {
 	match name.0.as_slice() {
 		[table] => Ok(TableRef::new(table.value.clone())),
 		[schema, table] => Ok(TableRef::with_schema(
@@ -122,7 +122,7 @@ fn lower_create_table_name(name: &ObjectName) -> Result<TableRef, FrontendError>
 			table.value.clone(),
 		)),
 		_ => Err(unsupported(
-			"CREATE TABLE supports only one- or two-part table names",
+			"DDL table names support only one- or two-part table names",
 		)),
 	}
 }
@@ -411,8 +411,9 @@ impl SqlPlanner {
 			Statement::Query(query) => self.lower_query(query),
 			Statement::CreateTable(create_table) => self.lower_create_table(create_table),
 			Statement::Insert(insert) => self.lower_insert(insert),
+			Statement::Drop { .. } => self.lower_drop_table(&ast[0]),
 			_ => Err(unsupported(
-				"unsupported SQL statement; only SELECT, CREATE TABLE, and INSERT are supported",
+				"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, and DROP TABLE are supported",
 			)),
 		}
 	}
@@ -718,7 +719,7 @@ impl SqlPlanner {
 			return Err(unsupported("CREATE TABLE requires at least one column"));
 		}
 
-		let table_ref = lower_create_table_name(name)?;
+		let table_ref = lower_ddl_table_name(name)?;
 		let fields = columns
 			.iter()
 			.map(lower_create_table_column)
@@ -948,11 +949,55 @@ impl SqlPlanner {
 		let query = query
 			.as_deref()
 			.ok_or_else(|| unsupported("CREATE TABLE AS SELECT requires a query"))?;
-		let table = lower_create_table_name(name)?;
+		let table = lower_ddl_table_name(name)?;
 		let source = self.lower_query(query)?;
 		Ok(LogicalPlan::CreateTableAsSelect {
 			table,
 			source: Box::new(source),
+		})
+	}
+
+	fn lower_drop_table(&self, statement: &Statement) -> Result<LogicalPlan, FrontendError> {
+		let Statement::Drop {
+			object_type,
+			if_exists,
+			names,
+			cascade,
+			restrict,
+			purge,
+			temporary,
+		} = statement
+		else {
+			return Err(unsupported(
+				"internal planner error: expected DROP statement",
+			));
+		};
+
+		if !matches!(object_type, ObjectType::Table) {
+			return Err(unsupported(
+				"unsupported DROP object type: only TABLE is supported",
+			));
+		}
+		if names.len() != 1 {
+			return Err(unsupported("DROP TABLE supports exactly one target table"));
+		}
+		if *cascade {
+			return Err(unsupported("unsupported DROP TABLE clause: CASCADE"));
+		}
+		if *restrict {
+			return Err(unsupported("unsupported DROP TABLE clause: RESTRICT"));
+		}
+		if *purge {
+			return Err(unsupported("unsupported DROP TABLE clause: PURGE"));
+		}
+		if *temporary {
+			return Err(unsupported("unsupported DROP TABLE clause: TEMPORARY"));
+		}
+
+		let name = lower_ddl_table_name(&names[0])?;
+		Ok(LogicalPlan::DropTable {
+			name,
+			if_exists: *if_exists,
 		})
 	}
 
@@ -3137,6 +3182,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 		} => true,
 		LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
+		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => false,
 	}
@@ -3415,6 +3461,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
+		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => Vec::new(),
 	}

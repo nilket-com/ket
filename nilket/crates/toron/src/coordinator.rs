@@ -62,7 +62,10 @@ where
 
 	pub async fn execute_query(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, QueryError> {
 		let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
-		if matches!(bound, ExecutionPlan::CreateTable { .. }) {
+		if matches!(
+			bound,
+			ExecutionPlan::CreateTable { .. } | ExecutionPlan::DropTable { .. }
+		) {
 			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
 		}
 		if matches!(bound, ExecutionPlan::Insert { .. }) {
@@ -142,6 +145,10 @@ async fn execute_catalog_plan(
 				.await?;
 			Ok(Vec::new())
 		}
+		ExecutionPlan::DropTable { name, if_exists } => {
+			catalog.drop_table(name, *if_exists).await?;
+			Ok(Vec::new())
+		}
 		other => Err(QueryError::Internal {
 			message: format!("execute_catalog_plan called with non-DDL plan: {other:?}"),
 		}),
@@ -179,7 +186,10 @@ impl QueryCoordinator {
 		plan: &LogicalPlan,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		if matches!(plan, LogicalPlan::CreateTable { .. }) {
+		if matches!(
+			plan,
+			LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. }
+		) {
 			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
 			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
 		}

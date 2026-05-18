@@ -462,6 +462,7 @@ fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 		ExecutionPlan::CreateTableAsSelect { .. } => {
 			panic!("CREATE TABLE AS SELECT has no scan")
 		}
+		ExecutionPlan::DropTable { .. } => panic!("DROP TABLE has no scan"),
 		ExecutionPlan::Insert { .. } => panic!("INSERT has no scan"),
 		ExecutionPlan::InsertSelect { .. } => panic!("INSERT INTO ... SELECT has no scan"),
 	}

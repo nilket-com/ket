@@ -205,6 +205,10 @@ pub enum ExecutionPlan {
 		schema: SchemaRef,
 		source: Box<ExecutionPlan>,
 	},
+	DropTable {
+		name: TableRef,
+		if_exists: bool,
+	},
 	Insert {
 		legacy_table_id: TableId,
 		table: TableObjectId,
@@ -234,6 +238,7 @@ impl ExecutionPlan {
 			Self::Join { output_schema, .. } => output_schema.clone(),
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
 			Self::CreateTableAsSelect { .. } => Arc::new(Schema::empty()),
+			Self::DropTable { .. } => Arc::new(Schema::empty()),
 			Self::Insert { .. } => Arc::new(Schema::empty()),
 			Self::InsertSelect { .. } => Arc::new(Schema::empty()),
 		}

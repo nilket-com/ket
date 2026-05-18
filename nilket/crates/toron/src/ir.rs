@@ -229,6 +229,10 @@ pub enum LogicalPlan {
 		table: TableRef,
 		source: Box<LogicalPlan>,
 	},
+	DropTable {
+		name: TableRef,
+		if_exists: bool,
+	},
 	Insert {
 		table: TableRef,
 		columns: Option<Vec<String>>,
