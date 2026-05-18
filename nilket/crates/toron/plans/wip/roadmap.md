@@ -1495,6 +1495,167 @@ along with the forward-sequence rewrite.
   stabilization). The eight-phase migration is
   materialized in
   `plans/impl/033_create_table_as_select.md`.
+- **ADR 034 — SQL `DROP TABLE` (Local DDL Deletion).**
+  Promoted. **Third composition ADR** after ADR 032 +
+  033, completing the post-substrate composition
+  trilogy. Narrow metadata-only DDL deletion: removes
+  catalog reachability via `Catalog::drop_table`; no
+  row deletion, no storage reclaim, no Wendelon
+  metadata administration. Sixteen decisions D1-D16.
+  **D1 critical decision:** narrow `DROP TABLE [IF
+  EXISTS] table_name` only; rejects `CASCADE` /
+  explicit `RESTRICT` / `PURGE` / `TEMPORARY` /
+  multi-name / non-table object types with stable
+  diagnostics; exhaustive `Statement::Drop`
+  destructure (no `..`).
+  **D4 critical decision (Claude iter-1 C2):** DDL
+  name helper renamed `lower_create_table_name` →
+  `lower_ddl_table_name`; CREATE TABLE (ADR 029) +
+  CTAS (ADR 033) + DROP TABLE (ADR 034) all use the
+  neutral helper; sets the pattern for future ALTER
+  TABLE / CREATE INDEX / CREATE VIEW DDL ADRs.
+  **D5 critical decision:** leaf IR variants
+  `LogicalPlan::DropTable { name, if_exists }` +
+  `ExecutionPlan::DropTable { name, if_exists }` —
+  **no `TableId` / `TableObjectId` /
+  `PhysicalDescriptorFingerprint` / boxed source
+  child** (mirrors ADR 033 R1 symmetry; catalog
+  resolves identity at mutation time).
+  **D6 critical decision:** binder pass-through; no
+  catalog calls in the binder arm; existence and
+  `IF EXISTS` semantics centralize in the catalog
+  mutation.
+  **D7 critical decision (Codex iter-1 R1):**
+  `Catalog::drop_table(name, if_exists) ->
+  Result<Option<TableBinding>, CatalogError>`;
+  existing → `Ok(Some(binding))`; missing with
+  `IF EXISTS` → `Ok(None)`; missing without `IF
+  EXISTS` → `TableNotFound`; Wendelon known →
+  `AdminUnavailable` (mirrors ADR 029
+  `create_table`); Wendelon unknown with `IF
+  EXISTS` → `Ok(None)`.
+  **D8 critical decision:** `MockCatalog::drop_table`
+  removes from `by_id`; uses `by_ref.retain` to
+  remove every alias pointing to the dropped table
+  id; **no alias repointing**; no `next_table_id`
+  reuse — recreate-after-drop gets a fresh
+  monotonic id so stale in-memory storage data for
+  the old id is unreachable through the new
+  binding.
+  **D9 critical decision:** no storage reclaim
+  guarantee — catalog reachability only; physical
+  file deletion, in-memory storage map cleanup,
+  Wendelon descriptor deletion, stale-bound-plan
+  invalidation, automatic CTAS rollback all
+  deferred to future storage-admin ADR.
+  **D10 critical decision:** coordinator routing
+  via shared `execute_catalog_plan` helper
+  (extended from ADR 029); both local and
+  distributed coordinators intercept DROP and
+  route through metadata helper before SELECT
+  retry loop / `fragment_plan`.
+  **D13 critical decision (Claude iter-0 C2):**
+  telemetry label `"drop_table"` (distinct from
+  CREATE TABLE's `"catalog"`; mirrors ADR 032 /
+  033 per-statement-form discipline).
+  **D14 critical decision:** CTAS cleanup
+  composition test required — proves the manual
+  recovery path ADR 033 D7 named for non-atomic
+  CTAS failures (Claude iter-0 C1 promoted to
+  test coverage by Codex iter-1).
+  **D15 critical decision (Claude iter-0 C4):**
+  ADR 035 sequencing commitment — ADR 035 = row-
+  identity / predicate-delete substrate cycle that
+  settles five questions (row-key-id discovery
+  path, identity carrier shape,
+  `StorageDeleteRows` trait, in-memory deletion
+  semantics, delete-count result mapping). Then
+  ADR 036 = SQL `DELETE WHERE` as a narrow
+  composition over the substrate. **Restores the
+  topic-concession-compresses-next-cycle pattern at
+  4-of-6** — substrate-defer ADRs seed the next
+  cycle.
+  **D16 critical decision:** Plan Arena remains
+  named debt; DROP adds one leaf variant + no
+  boxed child; no `bumpalo` / `typed-arena` /
+  `slab` / `generational-arena` / `blake3` /
+  storage synthetic row construction.
+  **`LogicalPlan` 13 → 14; `ExecutionPlan` 11 →
+  12.** Three iterations / 0 flip-flops — **third
+  consecutive composition cycle at 3-iter cadence**
+  matching ADR 032 + 033. **Iter-0 topic split**
+  (Claude + Codex on DROP TABLE; Gemini on DELETE
+  WHERE) resolved decisively at iter-1 when Gemini
+  engaged Codex iter-0's E1 code-evidence audit
+  documenting Wendelon's row-key-id-based delete
+  API (`wendelon::client::TableDeleteRowsRequest
+  { row_key_ids: Vec<Identity> }`) + Toron's
+  user-schema-only scan boundary + ADR 030 D7's
+  prohibition on Toron-side synthetic column
+  construction. **Gemini iter-1/2 retraction
+  streak restored at 7-of-9** after the 6-of-8
+  plateau; Claude iter-0 C5 prediction confirmed
+  verbatim. **Seventh consecutive cycle of Codex
+  correctness-clarification pattern**: Codex
+  iter-0 was unusually complete (13 D-level
+  sketches + E1 audit); Codex iter-1 added three
+  R-items (D14 CTAS test, D15 sequencing, D16
+  Plan Arena guardrail). **Seven Claude iter-0 /
+  iter-1 contributions promoted**: iter-0 C2 →
+  D13 telemetry label; iter-0 C4 → D15 sequencing
+  commitment; iter-0 C1 → D14 CTAS cleanup test
+  coverage; iter-0 Q7 → architecture guard #16
+  storage-reclaim negative-pattern; iter-1 C1 →
+  architecture guard #17 catalog-trait
+  narrowness; iter-1 C2 → D4 DDL helper rename;
+  iter-1 A3 → test-file naming convention
+  codified. **Composition trilogy complete** (ADR
+  032 + 033 + 034); ADR 029 → 030 → 031 was the
+  substrate trilogy. ADR 035 starts a new
+  substrate phase with the row-identity /
+  predicate-delete cycle. **Composition-cycle
+  properties at 3 data points:** (1) zero-
+  substrate-invariant-break by construction; (2)
+  3-iter convergence floor; (3) Plan Arena
+  preserved as named-debt; (4) broader-scope
+  framings are substrate-cycle phenomena
+  (reinforced by Gemini iter-1 retraction); (5)
+  topic-concession-seed pattern returns when cycle
+  defers substrate work (ADR 034 → 035 generates
+  seed via D15). Sixteenth instance of the ADR
+  015 cycle. **17 ADR-034-specific architecture
+  guards + 1 paired adjustment** to the existing
+  `architecture_guards_unchanged_plus_sort_variant`
+  variant-count catch-all = 18 architecture guard
+  touchpoints. 11 required functional fixtures
+  (planner / binder / catalog / coordinator /
+  distributed / Wendelon / defensive-reject /
+  CTAS-cleanup-composition). New test file
+  `crates/toron/tests/drop_table_test.rs` (Claude
+  iter-1 A3 file-naming convention: one statement
+  form, one test file). SoA-readiness invariants
+  preserved. Brainstorm-seam touch check: 001 +
+  002 + 004 untouched; 003 touched but preserved
+  (one new metadata-routing arm). No new SQL
+  syntax beyond bare `DROP TABLE [IF EXISTS]
+  table_name`; no new IR expression variant; no
+  new aggregate kernel; no PBC opcode change; no
+  fragmenter detector change for SELECT paths; no
+  cross-ring engagement; no Wendelon-side change;
+  no new `StorageWrite` overload; no row-count or
+  RETURNING result; no `blake3` dependency; no
+  external allocator crate added; no storage
+  reclaim trait or helper introduced. ADR 029 /
+  030 / 031 / 032 / 033 invariants preserved
+  (including ADR 032
+  `materialize_insert_select_batch` `Ok(None)`
+  zero-row contract + ADR 033
+  `materialize_empty_record_batch` sibling
+  helper). Existing SELECT corpus plan digests
+  byte-identical pre/post-ADR-034 (composition-
+  cycle carry-forward). The nine-phase migration
+  is materialized in
+  `plans/impl/034_drop_table.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -1562,7 +1723,297 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 033 promoted; ADR 034 candidates
+### ADR 034 promoted; ADR 035 candidates
+
+ADR 034 selected and promoted **SQL `DROP TABLE`
+(Local DDL Deletion)** — Toron's **third composition
+ADR** after ADR 032 + 033, completing the post-
+substrate composition trilogy. Narrow metadata-only
+DDL deletion that closes the catalog-reachability
+gap accumulated by ADR 029 (CREATE TABLE) + ADR 033
+(CTAS): removes catalog entries via
+`Catalog::drop_table`; no row deletion, no storage
+reclaim, no Wendelon metadata administration.
+
+Sixteen decisions D1-D16 cover: narrow `DROP TABLE
+[IF EXISTS] table_name` SQL surface with all other
+DROP clauses (CASCADE / explicit RESTRICT / PURGE /
+TEMPORARY / multi-name / non-table object types)
+rejected at planner; exhaustive `Statement::Drop`
+destructure (no `..`); DDL name helper renamed
+`lower_create_table_name` → `lower_ddl_table_name`
+with CREATE / CTAS / DROP all calling the neutral
+helper; leaf IR variants with no pre-drop table
+identity (mirrors ADR 033 R1 symmetry); binder
+pass-through with no catalog calls; new
+`Catalog::drop_table` trait method returning
+`Result<Option<TableBinding>, CatalogError>` with
+clean `IF EXISTS` semantics + `AdminUnavailable` for
+Wendelon known tables; `MockCatalog::drop_table`
+exact alias cleanup using `by_ref.retain` with no
+alias repointing + no `next_table_id` reuse; no
+storage reclaim guarantee (catalog reachability
+only); coordinator routing via shared
+`execute_catalog_plan` helper extended from ADR 029;
+defensive executor + fragmenter rejects with new
+`FragmentError::DropTableNotFragmentable`;
+distinct telemetry label `"drop_table"`; CTAS
+cleanup composition fixture required (proves the
+manual recovery path ADR 033 D7 named); ADR 035
+sequencing commitment for the row-identity /
+predicate-delete substrate cycle; Plan Arena
+remains named debt.
+
+Three iterations / 0 flip-flops — **third consecutive
+composition cycle at the 3-iter cadence** matching
+ADR 032 + 033. Iter-0 produced a topic split
+(Claude + Codex on DROP TABLE vs Gemini on DELETE
+WHERE) that resolved decisively at iter-1 when
+Gemini engaged Codex iter-0's E1 code-evidence
+audit and retracted. Iter-1 settled the load-
+bearing shape via Codex iter-1's D1-D16 absorbed
+wholesale by Claude / Gemini iter-1. Iter-2 was
+promotion-drafting.
+
+**Gemini iter-1/2 retraction streak restored at
+7-of-9** after the 6-of-8 plateau. Gemini iter-0
+DELETE WHERE framing under-engaged Codex's
+substrate audit; once Gemini read E1 at iter-1,
+retraction was immediate. **Claude iter-0 C5
+prediction confirmed verbatim** — first cycle in
+council history where iter-0 process predictions
+came true exactly. Updated cycle property:
+broader-scope framings emerge when there is
+substrate ambiguity (composition trilogy data
+points 032 + 033 had no substrate ambiguity for
+Gemini to engage with; ADR 034's topic question
+itself was substrate-vs-composition framing, and
+Gemini iter-0 chose substrate without auditing the
+boundary).
+
+**Seventh consecutive cycle of Codex correctness-
+clarification pattern.** Codex iter-0 was unusually
+complete (13 D-level sketches + E1 code-evidence
+audit documenting `wendelon::client::TableDeleteRowsRequest`'s
+row-key-id-based delete API + Toron's user-schema
+scan boundary + ADR 030 D7's prohibition on
+Toron-side synthetic column construction). The E1
+audit was decisive: it demonstrated DELETE WHERE
+is not a small DML widening but a substrate cycle
+requiring either row-identity discovery or a new
+predicate-delete storage contract. Codex iter-1
+added three R-items (D14 CTAS test, D15
+sequencing, D16 Plan Arena guardrail).
+
+**Topic-concession-compresses-next-cycle pattern
+back at 4-of-6.** ADR 034 → 035 generates the
+row-identity / predicate-delete substrate seed via
+D15. Updated cycle property: the seed pattern
+returns when a cycle explicitly defers substrate
+work to the next cycle. Substrate-defer ADRs seed;
+pure composition cycles don't.
+
+**Seven Claude iter-0 / iter-1 contributions
+promoted:**
+
+- iter-0 C2 telemetry label `"drop_table"` → D13.
+- iter-0 C4 ADR 035 sequencing commitment → D15.
+- iter-0 C1 three-deferred-item unblock list →
+  D14 CTAS cleanup test coverage.
+- iter-0 Q7 negative-pattern storage-reclaim
+  guard → architecture guard #16.
+- iter-1 C1 catalog-trait narrowness guard →
+  architecture guard #17.
+- iter-1 C2 DDL helper rename → D4.
+- iter-1 A3 test-file naming convention →
+  codified in impl Phase 7 + naming pattern
+  established for future DDL ADRs.
+
+iter-0 C3 (stale-bound-plan wording) absorbed by
+Codex iter-1 D9. iter-0 C5 (Gemini retraction
+prediction) confirmed verbatim — not a promoted
+item but a cycle property data point.
+
+**Composition trilogy complete.** ADR 029 → 030 →
+031 was the substrate trilogy (DDL + DML +
+expression-IR-replacing). ADR 032 → 033 → 034 is
+the composition trilogy (INSERT SELECT + CTAS +
+DROP TABLE) over that substrate. ADR 035 starts a
+new substrate phase with the row-identity /
+predicate-delete cycle.
+
+**Composition-cycle properties at 3 data points
+(stable):**
+
+1. **Composition cycles are zero-substrate-
+   invariant-break by construction.** (3 data
+   points)
+2. **Composition cycles converge in 3 iterations.**
+   (3 data points)
+3. **Composition cycles preserve Plan Arena as
+   named-debt-not-yet-pressured.** (3 data points)
+4. **Broader-scope framings are substrate-cycle
+   phenomena, not universal.** (Reinforced by ADR
+   034 Gemini retraction)
+5. **Topic-concession-seed pattern returns when a
+   cycle explicitly defers substrate work to the
+   next cycle.** (1 data point in the new pattern
+   form; ADR 034 D15 generates the ADR 035 seed)
+
+Sixteenth instance of the ADR 015 cycle. **17 ADR-
+034-specific architecture guards + 1 paired
+adjustment** to the existing
+`architecture_guards_unchanged_plus_sort_variant`
+variant-count catch-all = 18 architecture guard
+touchpoints. 11 required functional fixtures live
+in new `crates/toron/tests/drop_table_test.rs`
+(Claude iter-1 A3 file-naming convention: one
+statement form, one test file).
+
+No new SQL syntax beyond bare `DROP TABLE [IF
+EXISTS] table_name`; no new IR expression variant;
+no new aggregate kernel; no PBC opcode change; no
+fragmenter detector change for SELECT paths; no
+cross-ring engagement; no Wendelon-side change; no
+new `StorageWrite` overload; no row-count or
+RETURNING result; no `blake3` dependency; no
+external allocator crate added; no storage reclaim
+trait or helper introduced. ADR 029 / 030 / 031 /
+032 / 033 invariants preserved (including ADR 032
+`materialize_insert_select_batch` `Ok(None)` zero-
+row contract + ADR 033 `materialize_empty_record_batch`
+sibling helper). Existing SELECT corpus plan
+digests byte-identical pre/post-ADR-034
+(composition-cycle carry-forward). The nine-phase
+migration is materialized in
+`plans/impl/034_drop_table.md`.
+
+ADR 035 selection is **firmly committed** by ADR
+034 D15 sequencing commitment. The row-identity /
+predicate-delete substrate cycle settles the five
+load-bearing questions Codex iter-0 D13 sketched:
+
+1. how Toron discovers visible row key ids for
+   SQL predicates;
+2. whether row identity travels as a privileged
+   side-channel or hidden column;
+3. how a `StorageDeleteRows` trait maps to
+   Wendelon's `TableDeleteRowsRequest`;
+4. local in-memory deletion behavior;
+5. delete-count result semantics.
+
+Then ADR 036 = SQL `DELETE WHERE` as a narrow
+composition over the substrate.
+
+**ADR 035 lead candidate (committed):**
+
+- **ADR 035 — Row Identity / Predicate-Delete
+  Substrate.** Substrate-introducing cross-ring
+  cycle (involves Wendelon API surface inspection
+  to settle the `StorageDeleteRows` trait shape +
+  potential new identity-side-channel contract on
+  the storage boundary). Expected to be a 4+ iter
+  cycle with at least one substrate-shape flip-
+  flop per the substrate-cycle cadence hypothesis.
+  Two-pass Wendelon-API discovery budget required.
+  Substrate trilogy resumes after the composition
+  trilogy complete.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **`CREATE OR REPLACE TABLE`** — lower to `DROP
+  IF EXISTS x; CREATE TABLE x AS SELECT ...` once
+  DROP exists. Composition over ADR 029 / 033 /
+  034. Small cycle; carries forward to a later
+  composition slot.
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate + new partial-write
+  contract. Sequence: ADR 035 → 036 (DELETE) →
+  later UPDATE ADR.
+- **`INSERT ... RETURNING` / `CTAS ... RETURNING`
+  / `DELETE ... RETURNING`** — DML result-shape
+  extension; modest user value until DEFAULT or
+  GENERATED columns or sequences exist.
+- **Cross-ring distributed-write-context ADR.**
+  Lifts ADR 030 D13 + ADR 032 D1 + ADR 033 D11
+  distributed write rejects. ADR 034's Wendelon
+  `drop_table` `AdminUnavailable` belongs to the
+  metadata-write contract below.
+
+**Substrate candidates carried forward:**
+
+- **Storage reclaim ADR.** Physical file
+  deletion, in-memory storage map cleanup,
+  Wendelon descriptor deletion; lifts ADR 034 D9
+  carry-forward.
+- **Stale-bound-plan invalidation ADR.**
+- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
+  extensions; need PK / unique-constraint
+  substrate first.
+- **Streaming / multi-batch `StorageWrite::write`**
+  — lifts ADR 032 D5 + D6 + ADR 033 D8 single-
+  batch cap for bulk loads.
+- **Write retries after descriptor evolution** —
+  ADR 030 D12 + ADR 032 + ADR 033 + ADR 034
+  carry-forward.
+- **Read-your-writes session HLC advancement
+  ADR.**
+- **Per-statement `durability` override.**
+- **Cross-ring metadata-write contract ADR.**
+  Needed to lift `WendelonCatalog::create_table` +
+  `WendelonCatalog::drop_table` from
+  `AdminUnavailable`; engages transactional CTAS +
+  atomic DROP.
+- **Richer Toron `Hlc` type** — prerequisite for
+  read-your-writes.
+- **Idempotency / write-retry-after-descriptor-
+  evolution ADR.**
+- **Hidden-aggregate `ORDER BY` keys ADR.**
+- **HAVING alias visibility ADR.**
+- **Non-aggregate computed `ORDER BY` ADR.** ADR
+  027 D10 deferred.
+- **Temporal column types (DATE, TIMESTAMP)** for
+  ADR 029 / 030 / 032 / 033 type lattices.
+- **DECIMAL** for ADR 029 / 030 / 032 / 033
+  type lattices.
+- **Utf8 ↔ numeric CAST + TRY_CAST.**
+- **Boolean ↔ numeric CAST + TRY_CAST.**
+- **`ALTER TABLE` / `CREATE INDEX` / `CREATE VIEW`
+  / `DROP VIEW` / `DROP SCHEMA` / `DROP INDEX`** —
+  DDL siblings using the renamed
+  `lower_ddl_table_name` helper pattern from ADR
+  034 D4.
+- **Constraints** (PRIMARY KEY / FOREIGN KEY /
+  CHECK / column-level UNIQUE) / DEFAULT /
+  GENERATED columns.
+- **Wendelon AGG consumer wiring** — cross-ring;
+  PBC partial-pushdown.
+- **Kernel graduations** (`LinearRegress`,
+  `ApproxQuantile`).
+
+**Code-evidence-driven candidates (substrate-debt):**
+
+- **Plan Arena / index-based plan IR.** Brainstorm
+  004 broader framing; ADR 032 + 033 + 034 added
+  a combined ~33 walker leaf arms (~11 per cycle);
+  pressure is growing but still bounded.
+- **Typed expression tape / opcode interpreter.**
+  Brainstorm 004 deeper realization over ADR
+  031's `BoundExprProgram`.
+- **Common subexpression elimination (CSE) +
+  literal deduplication.** ADR 031 D8 carry-
+  forward.
+- **Cranelift JIT compilation.** Brainstorm 001.
+- **Logical `Expr` arena migration.** Brainstorm
+  004 broader framing.
+- **PBC partial-pushdown of computed-arg
+  aggregates** — cross-ring; workload-evidence-
+  pressured.
+
+The archived selection notes below preserve forward-
+sequence content from prior planning passes.
+
+#### ADR 033 → ADR 034 archived selection notes
 
 ADR 033 selected and promoted **SQL `CREATE TABLE AS
 SELECT` (Local DDL + DML Composition)** — Toron's
