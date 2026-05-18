@@ -225,6 +225,10 @@ pub enum LogicalPlan {
 		schema: SchemaRef,
 		if_not_exists: bool,
 	},
+	CreateTableAsSelect {
+		table: TableRef,
+		source: Box<LogicalPlan>,
+	},
 	Insert {
 		table: TableRef,
 		columns: Option<Vec<String>>,

@@ -66,6 +66,8 @@ pub enum FragmentError {
 	InsertNotFragmentable,
 	#[error("INSERT INTO ... SELECT is a coordinator-only data-plane operation")]
 	InsertSelectNotFragmentable,
+	#[error("CREATE TABLE AS SELECT is a coordinator-only data-plane operation")]
+	CreateTableAsSelectNotFragmentable,
 }
 
 pub fn fragment_plan(
@@ -80,6 +82,9 @@ pub fn fragment_plan(
 	}
 	if matches!(plan, ExecutionPlan::InsertSelect { .. }) {
 		return Err(FragmentError::InsertSelectNotFragmentable);
+	}
+	if matches!(plan, ExecutionPlan::CreateTableAsSelect { .. }) {
+		return Err(FragmentError::CreateTableAsSelectNotFragmentable);
 	}
 
 	if contains_join(&plan) {
@@ -866,6 +871,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Sort { input, .. } => first_join(input),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -906,6 +912,7 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		}
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -921,6 +928,7 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => 0,
 	}
@@ -949,6 +957,7 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
 		ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -1035,6 +1044,7 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 		},
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => plan,
 	}
@@ -1096,6 +1106,7 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 		},
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => plan,
 	}

@@ -18,8 +18,19 @@ use crate::ir::{
 	arithmetic_output_type, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
+use wendelon::schema::{
+	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
+};
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
+const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
+	STORAGE_ROW_HLC_COLUMN,
+	STORAGE_ROW_KEY_ID_COLUMN,
+	STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+	STORAGE_ROW_TOMBSTONE_COLUMN,
+];
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlannerConfig {
@@ -198,6 +209,9 @@ impl<'a> Binder<'a> {
 					schema: schema.clone(),
 					if_not_exists: *if_not_exists,
 				}),
+				LogicalPlan::CreateTableAsSelect { table, source } => {
+					self.bind_create_table_as_select(table, source).await
+				}
 				LogicalPlan::Insert {
 					table,
 					columns,
@@ -212,6 +226,22 @@ impl<'a> Binder<'a> {
 						.await
 				}
 			}
+		})
+	}
+
+	async fn bind_create_table_as_select(
+		&self,
+		table: &TableRef,
+		source: &LogicalPlan,
+	) -> Result<ExecutionPlan, BindingError> {
+		let source = self.bind_plan(source).await?;
+		let source_schema = source.schema();
+		let schema = infer_ctas_schema(&source_schema)?;
+
+		Ok(ExecutionPlan::CreateTableAsSelect {
+			table: table.clone(),
+			schema,
+			source: Box::new(source),
 		})
 	}
 
@@ -432,6 +462,60 @@ fn validate_omitted_insert_target_columns(
 		}
 	}
 	Ok(())
+}
+
+fn infer_ctas_schema(source_schema: &SchemaRef) -> Result<SchemaRef, BindingError> {
+	let mut seen = HashSet::new();
+	let mut fields = Vec::with_capacity(source_schema.fields().len());
+	for field in source_schema.fields() {
+		validate_ctas_column_name(field.name())?;
+		if !seen.insert(field.name().clone()) {
+			return Err(BindingError::UnsupportedExpression {
+				message: format!("duplicate CTAS output column: {}", field.name()),
+			});
+		}
+		if !is_supported_ctas_column_type(field.data_type()) {
+			return Err(BindingError::TypeMismatch {
+				message: format!(
+					"unsupported CTAS output column type for {}: {:?}",
+					field.name(),
+					field.data_type()
+				),
+			});
+		}
+		fields.push(Field::new(
+			field.name().clone(),
+			field.data_type().clone(),
+			field.is_nullable(),
+		));
+	}
+	Ok(Arc::new(Schema::new(fields)))
+}
+
+fn validate_ctas_column_name(name: &str) -> Result<(), BindingError> {
+	if name.is_empty() {
+		return Err(BindingError::UnsupportedExpression {
+			message: "CTAS output column name must not be empty".to_string(),
+		});
+	}
+	if STORAGE_SYNTHETIC_COLUMN_NAMES.contains(&name) {
+		return Err(BindingError::UnsupportedExpression {
+			message: format!("CTAS output column name is reserved for storage metadata: {name}"),
+		});
+	}
+	Ok(())
+}
+
+fn is_supported_ctas_column_type(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Boolean
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::Float32
+			| DataType::Float64
+			| DataType::Utf8
+	)
 }
 
 fn bind_sort_keys(
@@ -726,6 +810,7 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 			}
 		},
 		LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => {}
 	}
@@ -874,6 +959,7 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -1166,6 +1252,21 @@ fn optimize_for_required(
 			},
 			OrdinalRemap::new(),
 		)),
+		ExecutionPlan::CreateTableAsSelect {
+			table,
+			schema,
+			source,
+		} => {
+			let (source, _) = optimize_for_required(*source, None)?;
+			Ok((
+				ExecutionPlan::CreateTableAsSelect {
+					table,
+					schema,
+					source: Box::new(source),
+				},
+				OrdinalRemap::new(),
+			))
+		}
 		ExecutionPlan::Insert {
 			legacy_table_id,
 			table,

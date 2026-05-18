@@ -106,6 +106,16 @@ pub(super) fn materialize_insert_select_batch(
 	Ok(Some(payload))
 }
 
+pub(super) fn materialize_empty_record_batch(
+	schema: &SchemaRef,
+) -> Result<RecordBatch, ExecutionError> {
+	let mut columns = Vec::with_capacity(schema.fields().len());
+	for field in schema.fields() {
+		columns.push(typed_null_array(field.data_type(), 0, field.name())?);
+	}
+	RecordBatch::try_new(schema.clone(), columns).map_err(ExecutionError::from)
+}
+
 fn coerce_insert_select_array(
 	array: &ArrayRef,
 	target: &DataType,

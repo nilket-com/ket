@@ -200,6 +200,11 @@ pub enum ExecutionPlan {
 		schema: SchemaRef,
 		if_not_exists: bool,
 	},
+	CreateTableAsSelect {
+		table: TableRef,
+		schema: SchemaRef,
+		source: Box<ExecutionPlan>,
+	},
 	Insert {
 		legacy_table_id: TableId,
 		table: TableObjectId,
@@ -228,6 +233,7 @@ impl ExecutionPlan {
 			Self::Sort { output_schema, .. } => output_schema.clone(),
 			Self::Join { output_schema, .. } => output_schema.clone(),
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
+			Self::CreateTableAsSelect { .. } => Arc::new(Schema::empty()),
 			Self::Insert { .. } => Arc::new(Schema::empty()),
 			Self::InsertSelect { .. } => Arc::new(Schema::empty()),
 		}

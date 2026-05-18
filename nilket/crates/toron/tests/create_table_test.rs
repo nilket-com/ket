@@ -94,10 +94,6 @@ fn planner_rejects_unsupported_create_table_shapes() {
 			"unsupported CREATE TABLE clause: TEMPORARY",
 		),
 		(
-			"CREATE TABLE t AS SELECT 1",
-			"unsupported CREATE TABLE clause: AS SELECT",
-		),
-		(
 			"CREATE TABLE t LIKE other",
 			"unsupported CREATE TABLE clause: LIKE",
 		),

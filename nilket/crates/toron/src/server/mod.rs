@@ -572,6 +572,7 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		| ExecutionPlan::Sort { input, .. } => join_strategy_label(input),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -587,6 +588,7 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Sort { input, .. } => contains_join(input),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => false,
 	}
@@ -605,6 +607,7 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::Scan { .. } => "scan",
 			ExecutionPlan::Join { .. } => "join",
 			ExecutionPlan::CreateTable { .. } => "catalog",
+			ExecutionPlan::CreateTableAsSelect { .. } => "create_table_as_select",
 			ExecutionPlan::Insert { .. } => "insert",
 			ExecutionPlan::InsertSelect { .. } => "insert_select",
 		}
@@ -760,6 +763,7 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Sort { input, .. } => contains_broadcast_join(input),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => false,
 	}
@@ -1081,6 +1085,7 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 			.or_else(|| scan_schema_for_table_id(right, table_id)),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}

@@ -14,7 +14,7 @@ use crate::distributed::scheduler::{DistributedScheduler, SchedulerError};
 use crate::distributed::worker_registry::WorkerRegistry;
 use crate::error::{ExecutionError, QueryError, StorageError};
 use crate::exec::Executor;
-use crate::ir::{ExecutionPlan, LogicalPlan, MorselId};
+use crate::ir::{ColumnOrdinal, ExecutionPlan, LogicalPlan, MorselId};
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
 use crate::storage::{ScanStream, StorageWrite, WriteOutcome, WriteRequest};
 
@@ -74,6 +74,12 @@ where
 		if matches!(bound, ExecutionPlan::InsertSelect { .. }) {
 			return Err(QueryError::Internal {
 				message: "distributed INSERT INTO ... SELECT execution is not wired to a write-context-bearing coordinator"
+					.to_string(),
+			});
+		}
+		if matches!(bound, ExecutionPlan::CreateTableAsSelect { .. }) {
+			return Err(QueryError::Internal {
+				message: "distributed CREATE TABLE AS SELECT execution is not wired to a write-context-bearing coordinator"
 					.to_string(),
 			});
 		}
@@ -179,7 +185,9 @@ impl QueryCoordinator {
 		}
 		if matches!(
 			plan,
-			LogicalPlan::Insert { .. } | LogicalPlan::InsertSelect { .. }
+			LogicalPlan::Insert { .. }
+				| LogicalPlan::InsertSelect { .. }
+				| LogicalPlan::CreateTableAsSelect { .. }
 		) {
 			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
 			return self.execute_write_plan(&bound).await;
@@ -258,6 +266,45 @@ impl QueryCoordinator {
 						table_id: *legacy_table_id,
 						table_object_id: *table,
 						physical_descriptor_fingerprint: *fingerprint,
+						payload,
+						profile_hint: context.profile_hint,
+						trace_context: context.trace_context.clone(),
+					})
+					.await?;
+				Ok(Vec::new())
+			}
+			ExecutionPlan::CreateTableAsSelect {
+				table,
+				schema,
+				source,
+			} => {
+				let binding = self
+					.catalog
+					.create_table(table, schema.clone(), false)
+					.await?;
+				let source_batches = self.executor.execute_bound(source, None).await?;
+				let target_columns = (0..schema.fields().len())
+					.map(|index| {
+						ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow"))
+					})
+					.collect::<Vec<_>>();
+				let payload = match write::materialize_insert_select_batch(
+					schema,
+					&target_columns,
+					&source_batches,
+				)? {
+					Some(payload) => payload,
+					None => write::materialize_empty_record_batch(schema)?,
+				};
+				let context = self.executor.context();
+				self.writer
+					.write(WriteRequest {
+						session_id: context.session_id,
+						query_id: context.query_id,
+						tenant_id: context.tenant_id,
+						table_id: binding.legacy_table_id,
+						table_object_id: binding.table,
+						physical_descriptor_fingerprint: binding.fingerprint,
 						payload,
 						profile_hint: context.profile_hint,
 						trace_context: context.trace_context.clone(),

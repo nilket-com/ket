@@ -562,6 +562,9 @@ impl Executor {
 				LogicalPlan::CreateTable { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound CREATE TABLE execution",
 				}),
+				LogicalPlan::CreateTableAsSelect { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound CREATE TABLE AS SELECT execution",
+				}),
 				LogicalPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound INSERT execution",
 				}),
@@ -718,6 +721,9 @@ impl Executor {
 				}
 				ExecutionPlan::CreateTable { .. } => Err(ExecutionError::NotImplemented {
 					feature: "CREATE TABLE execution is coordinator-only",
+				}),
+				ExecutionPlan::CreateTableAsSelect { .. } => Err(ExecutionError::NotImplemented {
+					feature: "CREATE TABLE AS SELECT execution is coordinator-only",
 				}),
 				ExecutionPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "INSERT execution is coordinator-only",

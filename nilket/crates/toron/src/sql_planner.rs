@@ -607,9 +607,7 @@ impl SqlPlanner {
 			return Err(unsupported("unsupported CREATE TABLE clause: LOCATION"));
 		}
 		if query.is_some() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: AS SELECT (CTAS)",
-			));
+			return self.lower_create_table_as_select(create_table);
 		}
 		if *without_rowid {
 			return Err(unsupported(
@@ -732,6 +730,229 @@ impl SqlPlanner {
 			name: table_ref,
 			schema,
 			if_not_exists: *if_not_exists,
+		})
+	}
+
+	fn lower_create_table_as_select(
+		&self,
+		create_table: &CreateTable,
+	) -> Result<LogicalPlan, FrontendError> {
+		let CreateTable {
+			or_replace,
+			temporary,
+			external,
+			global,
+			if_not_exists,
+			transient,
+			volatile,
+			name,
+			columns,
+			constraints,
+			hive_distribution,
+			hive_formats,
+			table_properties,
+			with_options,
+			file_format,
+			location,
+			query,
+			without_rowid,
+			like,
+			clone,
+			engine,
+			comment,
+			auto_increment_offset,
+			default_charset,
+			collation,
+			on_commit,
+			on_cluster,
+			primary_key,
+			order_by,
+			partition_by,
+			cluster_by,
+			clustered_by,
+			options,
+			strict,
+			copy_grants,
+			enable_schema_evolution,
+			change_tracking,
+			data_retention_time_in_days,
+			max_data_extension_time_in_days,
+			default_ddl_collation,
+			with_aggregation_policy,
+			with_row_access_policy,
+			with_tags,
+		} = create_table;
+
+		if *if_not_exists {
+			return Err(unsupported("CTAS does not support IF NOT EXISTS in v1"));
+		}
+		if !columns.is_empty() {
+			return Err(unsupported(
+				"CTAS does not support explicit column lists in v1; use SELECT aliases for column names",
+			));
+		}
+		if *or_replace {
+			return Err(unsupported("unsupported CREATE TABLE clause: OR REPLACE"));
+		}
+		if *temporary {
+			return Err(unsupported("unsupported CREATE TABLE clause: TEMPORARY"));
+		}
+		if *external {
+			return Err(unsupported("unsupported CREATE TABLE clause: EXTERNAL"));
+		}
+		if global.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: GLOBAL/LOCAL"));
+		}
+		if *transient {
+			return Err(unsupported("unsupported CREATE TABLE clause: TRANSIENT"));
+		}
+		if *volatile {
+			return Err(unsupported("unsupported CREATE TABLE clause: VOLATILE"));
+		}
+		if !constraints.is_empty() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: table-level constraints",
+			));
+		}
+		if hive_formats.as_ref().is_some_and(|formats| {
+			formats.row_format.is_some()
+				|| formats
+					.serde_properties
+					.as_ref()
+					.is_some_and(|properties| !properties.is_empty())
+				|| formats.storage.is_some()
+				|| formats.location.is_some()
+		}) {
+			return Err(unsupported("unsupported CREATE TABLE clause: HIVE FORMATS"));
+		}
+		if !table_properties.is_empty() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: TBLPROPERTIES",
+			));
+		}
+		if !with_options.is_empty() {
+			return Err(unsupported("unsupported CREATE TABLE clause: WITH options"));
+		}
+		if file_format.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: STORED AS"));
+		}
+		if location.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: LOCATION"));
+		}
+		if *without_rowid {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: WITHOUT ROWID",
+			));
+		}
+		if like.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: LIKE"));
+		}
+		if clone.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CLONE"));
+		}
+		if engine.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: ENGINE"));
+		}
+		if comment.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: COMMENT"));
+		}
+		if auto_increment_offset.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: AUTO_INCREMENT",
+			));
+		}
+		if default_charset.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: DEFAULT CHARSET",
+			));
+		}
+		if collation.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: COLLATE"));
+		}
+		if on_commit.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: ON COMMIT"));
+		}
+		if on_cluster.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: ON CLUSTER"));
+		}
+		if primary_key.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: table-level PRIMARY KEY",
+			));
+		}
+		if order_by.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: ORDER BY"));
+		}
+		if partition_by.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: PARTITION BY"));
+		}
+		if cluster_by.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CLUSTER BY"));
+		}
+		if clustered_by.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CLUSTERED BY"));
+		}
+		if options.as_ref().is_some_and(|options| !options.is_empty()) {
+			return Err(unsupported("unsupported CREATE TABLE clause: OPTIONS"));
+		}
+		if *strict {
+			return Err(unsupported("unsupported CREATE TABLE clause: STRICT"));
+		}
+		if *copy_grants {
+			return Err(unsupported("unsupported CREATE TABLE clause: COPY GRANTS"));
+		}
+		if enable_schema_evolution.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: ENABLE SCHEMA EVOLUTION",
+			));
+		}
+		if change_tracking.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: CHANGE TRACKING",
+			));
+		}
+		if data_retention_time_in_days.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: DATA RETENTION",
+			));
+		}
+		if max_data_extension_time_in_days.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: MAX DATA EXTENSION",
+			));
+		}
+		if default_ddl_collation.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: DEFAULT DDL COLLATION",
+			));
+		}
+		if with_aggregation_policy.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: AGGREGATION POLICY",
+			));
+		}
+		if with_row_access_policy.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: ROW ACCESS POLICY",
+			));
+		}
+		if with_tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+			return Err(unsupported("unsupported CREATE TABLE clause: WITH TAGS"));
+		}
+		if !matches!(hive_distribution, HiveDistributionStyle::NONE) {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: Hive distribution",
+			));
+		}
+
+		let query = query
+			.as_deref()
+			.ok_or_else(|| unsupported("CREATE TABLE AS SELECT requires a query"))?;
+		let table = lower_create_table_name(name)?;
+		let source = self.lower_query(query)?;
+		Ok(LogicalPlan::CreateTableAsSelect {
+			table,
+			source: Box::new(source),
 		})
 	}
 
@@ -2915,6 +3136,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			strategy: _,
 		} => true,
 		LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => false,
 	}
@@ -3192,6 +3414,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		},
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => Vec::new(),
 	}

@@ -563,9 +563,10 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 12);
+	assert_eq!(enum_variant_count(logical_plan), 13);
 	assert!(logical_plan.contains("Sort {"));
 	assert!(logical_plan.contains("CreateTable {"));
+	assert!(logical_plan.contains("CreateTableAsSelect {"));
 	assert!(logical_plan.contains("Insert {"));
 	assert!(logical_plan.contains("InsertSelect {"));
 	assert!(logical_plan.contains("output_names: Vec<Option<String>>"));
@@ -579,9 +580,10 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 10);
+	assert_eq!(enum_variant_count(execution_plan), 11);
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("CreateTable {"));
+	assert!(execution_plan.contains("CreateTableAsSelect {"));
 	assert!(execution_plan.contains("Insert {"));
 	assert!(execution_plan.contains("InsertSelect {"));
 	assert!(execution_plan.contains("predicate: BoundExprProgram"));
@@ -3031,7 +3033,7 @@ fn adr030_executor_and_fragmenter_reject_insert() {
 }
 
 #[test]
-fn adr032_logical_plan_variant_count_is_12() {
+fn adr032_logical_plan_retains_insert_select_variant() {
 	let logical =
 		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
 	let logical_plan = logical
@@ -3040,7 +3042,7 @@ fn adr032_logical_plan_variant_count_is_12() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 12);
+	assert_eq!(enum_variant_count(logical_plan), 13);
 	assert!(logical_plan.contains("InsertSelect {"));
 	assert!(logical_plan.contains("table: TableRef,"));
 	assert!(logical_plan.contains("columns: Option<Vec<String>>,"));
@@ -3048,7 +3050,7 @@ fn adr032_logical_plan_variant_count_is_12() {
 }
 
 #[test]
-fn adr032_execution_plan_variant_count_is_10() {
+fn adr032_execution_plan_retains_insert_select_variant() {
 	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
 	let execution_plan = execution
@@ -3056,7 +3058,7 @@ fn adr032_execution_plan_variant_count_is_10() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 10);
+	assert_eq!(enum_variant_count(execution_plan), 11);
 	assert!(execution_plan.contains("InsertSelect {"));
 }
 
@@ -3386,6 +3388,472 @@ fn adr032_coordinator_uses_only_evaluate_cast() {
 
 #[test]
 fn adr032_insert_select_does_not_add_plan_arena_dependency() {
+	let cargo =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read toron Cargo.toml");
+	for forbidden in ["bumpalo", "typed-arena", "generational-arena", "slab"] {
+		assert!(
+			!cargo.contains(forbidden),
+			"unexpected arena dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr033_logical_variant_count_is_13() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let logical_plan = logical
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("pub fn project_plan").next())
+		.expect("LogicalPlan enum");
+
+	assert_eq!(enum_variant_count(logical_plan), 13);
+	assert!(logical_plan.contains("CreateTableAsSelect {"));
+	assert!(logical_plan.contains("table: TableRef,"));
+	assert!(logical_plan.contains("source: Box<LogicalPlan>,"));
+}
+
+#[test]
+fn adr033_execution_variant_count_is_11() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+
+	assert_eq!(enum_variant_count(execution_plan), 11);
+	assert!(execution_plan.contains("CreateTableAsSelect {"));
+}
+
+#[test]
+fn adr033_execution_ctas_has_no_precreate_identity() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+	let ctas = brace_blocks_after_marker(execution_plan, "CreateTableAsSelect {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::CreateTableAsSelect body")
+		.1;
+
+	for required in [
+		"table: TableRef,",
+		"schema: SchemaRef,",
+		"source: Box<ExecutionPlan>,",
+	] {
+		assert!(ctas.contains(required), "CTAS body missing {required}");
+	}
+	for forbidden in [
+		"legacy_table_id",
+		"TableId",
+		"TableObjectId",
+		"fingerprint",
+		"PhysicalDescriptorFingerprint",
+	] {
+		assert!(
+			!ctas.contains(forbidden),
+			"ADR 033: bound CTAS must not carry pre-create identity field {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr033_planner_routes_only_query_create_table_to_ctas() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lower_create_table = brace_blocks_after_marker(&planner, "fn lower_create_table(")
+		.into_iter()
+		.next()
+		.expect("lower_create_table body")
+		.1;
+	let lower_ctas = brace_blocks_after_marker(&planner, "fn lower_create_table_as_select")
+		.into_iter()
+		.next()
+		.expect("lower_create_table_as_select body")
+		.1;
+
+	assert!(lower_create_table.contains("if query.is_some()"));
+	assert!(lower_create_table.contains("return self.lower_create_table_as_select(create_table);"));
+	assert!(lower_ctas.contains("self.lower_query(query)?"));
+	assert!(lower_ctas.contains("LogicalPlan::CreateTableAsSelect"));
+}
+
+#[test]
+fn adr033_planner_rejects_ctas_column_list_and_if_not_exists() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lower_ctas = brace_blocks_after_marker(&planner, "fn lower_create_table_as_select")
+		.into_iter()
+		.next()
+		.expect("lower_create_table_as_select body")
+		.1;
+
+	assert!(lower_ctas.contains("if *if_not_exists"));
+	assert!(lower_ctas.contains("CTAS does not support IF NOT EXISTS in v1"));
+	assert!(lower_ctas.contains("if !columns.is_empty()"));
+	assert!(lower_ctas.contains("CTAS does not support explicit column lists in v1"));
+}
+
+#[test]
+fn adr033_binder_binds_source_before_inferring_schema() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let body = brace_blocks_after_marker(&binder, "async fn bind_create_table_as_select")
+		.into_iter()
+		.next()
+		.expect("bind_create_table_as_select body")
+		.1;
+	let bind_source = body
+		.find("self.bind_plan(source).await?")
+		.expect("source bind");
+	let infer_schema = body.find("infer_ctas_schema").expect("schema inference");
+
+	assert!(bind_source < infer_schema);
+	assert!(!body.contains(".create_table("));
+	assert!(!body.contains(".resolve_table("));
+}
+
+#[test]
+fn adr033_schema_inference_rejects_synthetic_names() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let infer = brace_blocks_after_marker(&binder, "fn infer_ctas_schema")
+		.into_iter()
+		.next()
+		.expect("infer_ctas_schema body")
+		.1;
+	let validate = brace_blocks_after_marker(&binder, "fn validate_ctas_column_name")
+		.into_iter()
+		.next()
+		.expect("validate_ctas_column_name body")
+		.1;
+
+	for literal in [
+		"\"__row_hlc__\"",
+		"\"__row_key_id__\"",
+		"\"__row_routing_locality__\"",
+		"\"__row_table_object_id__\"",
+		"\"__row_tombstone__\"",
+	] {
+		assert!(
+			!binder.contains(literal),
+			"ADR 033: binder must not fork Wendelon synthetic literal {literal}"
+		);
+	}
+	for constant in [
+		"STORAGE_ROW_HLC_COLUMN",
+		"STORAGE_ROW_KEY_ID_COLUMN",
+		"STORAGE_ROW_ROUTING_LOCALITY_COLUMN",
+		"STORAGE_ROW_TABLE_OBJECT_ID_COLUMN",
+		"STORAGE_ROW_TOMBSTONE_COLUMN",
+	] {
+		assert!(
+			binder.contains(constant),
+			"ADR 033: binder must reuse Wendelon constant {constant}"
+		);
+	}
+	assert!(infer.contains("validate_ctas_column_name"));
+	assert!(validate.contains("STORAGE_SYNTHETIC_COLUMN_NAMES.contains"));
+	assert!(validate.contains("reserved for storage metadata"));
+}
+
+#[test]
+fn adr033_schema_inference_rejects_duplicate_names() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let infer = brace_blocks_after_marker(&binder, "fn infer_ctas_schema")
+		.into_iter()
+		.next()
+		.expect("infer_ctas_schema body")
+		.1;
+
+	assert!(infer.contains("seen.insert"));
+	assert!(infer.contains("duplicate CTAS output column"));
+}
+
+#[test]
+fn adr033_schema_inference_uses_adr029_type_lattice() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let type_lattice = brace_blocks_after_marker(&binder, "fn is_supported_ctas_column_type")
+		.into_iter()
+		.next()
+		.expect("is_supported_ctas_column_type body")
+		.1;
+
+	for data_type in [
+		"DataType::Boolean",
+		"DataType::Int32",
+		"DataType::Int64",
+		"DataType::Float32",
+		"DataType::Float64",
+		"DataType::Utf8",
+	] {
+		assert!(
+			type_lattice.contains(data_type),
+			"CTAS type lattice missing {data_type}"
+		);
+	}
+	assert!(!type_lattice.contains("DataType::Date32"));
+	assert!(!type_lattice.contains("DataType::UInt32"));
+}
+
+#[test]
+fn adr033_local_coordinator_intercepts_before_retry() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let ctas_branch = query_impl
+		.find("LogicalPlan::CreateTableAsSelect { .. }")
+		.expect("local CTAS branch");
+	let retry_loop = query_impl
+		.find("let mut retried_descriptor_evolution = false")
+		.expect("descriptor retry loop");
+
+	assert!(ctas_branch < retry_loop);
+	assert!(query_impl.contains("execute_write_plan(&bound).await"));
+}
+
+#[test]
+fn adr033_coordinator_creates_table_before_source_execution() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let execute_write = brace_blocks_after_marker(query_impl, "async fn execute_write_plan")
+		.into_iter()
+		.next()
+		.expect("execute_write_plan body")
+		.1;
+	let ctas_arm = execute_write
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.and_then(|rest| rest.split("other =>").next())
+		.expect("CTAS arm");
+	let create_table = ctas_arm.find(".create_table(").expect("create_table call");
+	let execute_source = ctas_arm
+		.find("execute_bound(source, None)")
+		.expect("source execution");
+
+	assert!(create_table < execute_source);
+}
+
+#[test]
+fn adr033_coordinator_uses_create_table_binding_for_write() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let execute_write = brace_blocks_after_marker(query_impl, "async fn execute_write_plan")
+		.into_iter()
+		.next()
+		.expect("execute_write_plan body")
+		.1;
+	let ctas_arm = execute_write
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.and_then(|rest| rest.split("other =>").next())
+		.expect("CTAS arm");
+
+	assert!(ctas_arm.contains("let binding = self"));
+	assert!(ctas_arm.contains("table_id: binding.legacy_table_id"));
+	assert!(ctas_arm.contains("table_object_id: binding.table"));
+	assert!(ctas_arm.contains("physical_descriptor_fingerprint: binding.fingerprint"));
+}
+
+#[test]
+fn adr033_empty_source_ctas_writes_zero_row_batch() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let execute_write = brace_blocks_after_marker(query_impl, "async fn execute_write_plan")
+		.into_iter()
+		.next()
+		.expect("execute_write_plan body")
+		.1;
+	let ctas_arm = execute_write
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.and_then(|rest| rest.split("other =>").next())
+		.expect("CTAS arm");
+
+	assert!(ctas_arm.contains("materialize_insert_select_batch"));
+	assert!(ctas_arm.contains("None => write::materialize_empty_record_batch(schema)?"));
+	assert!(ctas_arm.contains("write(WriteRequest"));
+
+	let coordinator_write =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
+			.expect("read coordinator/write.rs");
+	let empty_helper =
+		brace_blocks_after_marker(&coordinator_write, "fn materialize_empty_record_batch")
+			.into_iter()
+			.next()
+			.expect("materialize_empty_record_batch body")
+			.1;
+	assert!(empty_helper.contains("typed_null_array(field.data_type(), 0, field.name())"));
+}
+
+#[test]
+fn adr033_distributed_coordinator_rejects_before_fragment() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let distributed_impl = coordinator
+		.split("impl<Registry, Transport> DistributedQueryCoordinator")
+		.nth(1)
+		.expect("DistributedQueryCoordinator impl");
+	let ctas_reject = distributed_impl
+		.find("ExecutionPlan::CreateTableAsSelect")
+		.expect("distributed CTAS reject");
+	let fragment_call = distributed_impl
+		.find("fragment_plan(")
+		.expect("fragmenter call");
+
+	assert!(ctas_reject < fragment_call);
+	assert!(distributed_impl.contains("distributed CREATE TABLE AS SELECT execution is not wired"));
+}
+
+#[test]
+fn adr033_fragmenter_rejects_before_join_or_exchange() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
+		.into_iter()
+		.next()
+		.expect("fragment_plan body")
+		.1;
+
+	assert!(exec.contains("CREATE TABLE AS SELECT execution is coordinator-only"));
+	assert!(fragmenter.contains("CreateTableAsSelectNotFragmentable"));
+	assert!(fragment_plan.contains("ExecutionPlan::CreateTableAsSelect"));
+	assert!(
+		fragment_plan
+			.find("ExecutionPlan::CreateTableAsSelect")
+			.unwrap() < fragment_plan.find("contains_join").unwrap()
+	);
+	assert!(
+		fragment_plan
+			.find("ExecutionPlan::CreateTableAsSelect")
+			.unwrap() < fragment_plan.find("count_exchanges").unwrap()
+	);
+}
+
+#[test]
+fn adr033_distributed_walkers_treat_ctas_as_leaf() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	for (function, marker) in [
+		(
+			"fn first_join",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+		(
+			"fn find_exchange",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+		(
+			"fn count_exchanges",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+		(
+			"fn first_scan_metadata",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+		(
+			"fn replace_exchange_with_scan",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+		(
+			"fn replace_first_join",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+	] {
+		let body = brace_blocks_after_marker(&fragmenter, function)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{function} body"))
+			.1;
+		assert!(body.contains(marker), "{function} missing {marker}");
+	}
+
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	for (function, marker) in [
+		(
+			"fn join_strategy_label",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+		(
+			"fn contains_join",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+		(
+			"fn contains_broadcast_join",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+		(
+			"fn scan_schema_for_table_id",
+			"| ExecutionPlan::CreateTableAsSelect { .. }",
+		),
+	] {
+		let body = brace_blocks_after_marker(&server, function)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{function} body"))
+			.1;
+		assert!(body.contains(marker), "{function} missing {marker}");
+	}
+	assert!(
+		server.contains("ExecutionPlan::CreateTableAsSelect { .. } => \"create_table_as_select\"")
+	);
+
+	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let first_scan_fingerprint = brace_blocks_after_marker(&scheduler, "fn first_scan_fingerprint")
+		.into_iter()
+		.next()
+		.expect("first_scan_fingerprint body")
+		.1;
+	assert!(first_scan_fingerprint.contains("| ExecutionPlan::CreateTableAsSelect { .. }"));
+}
+
+#[test]
+fn adr033_does_not_modify_insert_select_empty_contract() {
+	let coordinator_write =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
+			.expect("read coordinator/write.rs");
+	let materialize = brace_blocks_after_marker(
+		&coordinator_write,
+		"pub(super) fn materialize_insert_select_batch",
+	)
+	.into_iter()
+	.next()
+	.expect("materialize_insert_select_batch body")
+	.1;
+
+	assert!(materialize.contains("return Ok(None);"));
+}
+
+#[test]
+fn adr033_does_not_add_plan_arena_dependency() {
 	let cargo =
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read toron Cargo.toml");
 	for forbidden in ["bumpalo", "typed-arena", "generational-arena", "slab"] {
