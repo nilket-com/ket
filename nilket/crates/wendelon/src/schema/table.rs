@@ -231,7 +231,10 @@ pub struct TableQueryRequestMeta {
 	/// newtypes intentionally stay non-Pod.
 	pub physical_descriptor_fingerprint: [u8; 32], // 32 bytes
 	pub consistency: crate::schema::Consistency, //  1 byte
-	pub _pad: [u8; 7],                  //  7 bytes
+	/// Row-identity projection selector. See
+	/// [`crate::client::RowIdentityProjection`].
+	pub row_identity_projection: u8, //  1 byte
+	pub _pad: [u8; 6],                  //  6 bytes
 	/// Length of the PBC bytecode in the trailing section.
 	pub bytecode_len: u32, //  4 bytes
 	/// Length of the optional runtime-filter descriptor after the PBC bytecode.

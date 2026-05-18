@@ -21,8 +21,8 @@ use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
-	HlcBound, InMemoryStorageScan, InMemoryTableStorage, ScanRequest, StorageScan, StorageWrite,
-	TenantId, WriteRequest,
+	HlcBound, InMemoryStorageScan, InMemoryTableStorage, RowIdentityProjection, ScanRequest,
+	StorageScan, StorageWrite, TenantId, WriteRequest,
 };
 use wendelon::schema::TableObjectId;
 
@@ -1070,6 +1070,7 @@ fn scan_request(binding: &TableBinding) -> ScanRequest {
 		projected_columns: None,
 		pbc_predicate: None,
 		runtime_filter: None,
+		row_identity: RowIdentityProjection::None,
 		profile_hint: None,
 		trace_context: None,
 		morsel: None,

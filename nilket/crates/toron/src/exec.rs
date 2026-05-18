@@ -15,7 +15,9 @@ use crate::ir::{
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
-use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
+use crate::storage::{
+	HlcBound, RowIdentityProjection, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext,
+};
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
 	Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -225,6 +227,7 @@ impl Executor {
 						projected_columns: None,
 						pbc_predicate: None,
 						runtime_filter: self.context.runtime_filter.clone(),
+						row_identity: RowIdentityProjection::None,
 						profile_hint: self.context.profile_hint,
 						trace_context: self.context.trace_context.clone(),
 						morsel,
@@ -607,6 +610,7 @@ impl Executor {
 						projected_columns: projection.clone(),
 						pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
 						runtime_filter: self.context.runtime_filter.clone(),
+						row_identity: RowIdentityProjection::None,
 						profile_hint: Some(*profile_hint),
 						trace_context: self.context.trace_context.clone(),
 						morsel,

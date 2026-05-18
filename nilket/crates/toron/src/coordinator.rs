@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 
+mod delete;
 mod write;
 
 use crate::binder::{PlannerConfig, bind};
@@ -16,7 +17,10 @@ use crate::error::{ExecutionError, QueryError, StorageError};
 use crate::exec::Executor;
 use crate::ir::{ColumnOrdinal, ExecutionPlan, LogicalPlan, MorselId};
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
-use crate::storage::{ScanStream, StorageWrite, WriteOutcome, WriteRequest};
+use crate::storage::{
+	DeleteRowsOutcome, DeleteRowsRequest, ScanStream, StorageDeleteRows, StorageWrite,
+	WriteOutcome, WriteRequest,
+};
 
 pub(crate) async fn materialize_scan_stream(
 	stream: ScanStream,
@@ -160,11 +164,19 @@ pub struct QueryCoordinator {
 	executor: Executor,
 	config: PlannerConfig,
 	writer: Arc<dyn StorageWrite>,
+	#[allow(dead_code)]
+	deleter: Arc<dyn StorageDeleteRows>,
 }
 
 impl QueryCoordinator {
 	pub fn new(catalog: Arc<dyn Catalog>, executor: Executor, config: PlannerConfig) -> Self {
-		Self::with_writer(catalog, executor, config, Arc::new(UnsupportedStorageWrite))
+		Self::with_writer_and_deleter(
+			catalog,
+			executor,
+			config,
+			Arc::new(UnsupportedStorageWrite),
+			Arc::new(UnsupportedStorageDeleteRows),
+		)
 	}
 
 	pub fn with_writer(
@@ -173,11 +185,28 @@ impl QueryCoordinator {
 		config: PlannerConfig,
 		writer: Arc<dyn StorageWrite>,
 	) -> Self {
+		Self::with_writer_and_deleter(
+			catalog,
+			executor,
+			config,
+			writer,
+			Arc::new(UnsupportedStorageDeleteRows),
+		)
+	}
+
+	pub fn with_writer_and_deleter(
+		catalog: Arc<dyn Catalog>,
+		executor: Executor,
+		config: PlannerConfig,
+		writer: Arc<dyn StorageWrite>,
+		deleter: Arc<dyn StorageDeleteRows>,
+	) -> Self {
 		Self {
 			catalog,
 			executor,
 			config,
 			writer,
+			deleter,
 		}
 	}
 
@@ -336,6 +365,20 @@ impl StorageWrite for UnsupportedStorageWrite {
 	async fn write(&self, _request: WriteRequest) -> Result<WriteOutcome, StorageError> {
 		Err(StorageError::Internal {
 			message: "INSERT execution requires a configured StorageWrite".to_string(),
+		})
+	}
+}
+
+struct UnsupportedStorageDeleteRows;
+
+#[async_trait::async_trait]
+impl StorageDeleteRows for UnsupportedStorageDeleteRows {
+	async fn delete_rows(
+		&self,
+		_request: DeleteRowsRequest,
+	) -> Result<DeleteRowsOutcome, StorageError> {
+		Err(StorageError::Internal {
+			message: "DELETE execution requires a configured StorageDeleteRows".to_string(),
 		})
 	}
 }

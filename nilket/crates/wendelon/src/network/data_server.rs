@@ -41,6 +41,7 @@ use crate::audit::{
 	AuditAuthority, AuditEvent, AuditOperation, AuditOutcome, AuditSchema, AuditSink,
 	DataAccessKind, DataAccessPhase, DataAccessSchema, NoopAuditSink,
 };
+use crate::client::RowIdentityProjection;
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::{SmState, WendelonLogStore};
 use crate::consensus::{
@@ -143,8 +144,8 @@ use crate::storage::{
 	validate_expression_types,
 };
 use arrow::array::{
-	Array, FixedSizeBinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeBinaryBuilder,
-	UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
+	Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray,
+	LargeBinaryBuilder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
 };
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -5803,6 +5804,17 @@ impl WendelonDataServer {
 		runtime_filter: DecodedRuntimeFilter,
 	) -> std::io::Result<QueryExecutionPlan> {
 		let range_meta = table_query_as_range_query(meta);
+		let row_identity_projection =
+			match RowIdentityProjection::from_u8(meta.row_identity_projection) {
+				Some(projection) => projection,
+				None => {
+					return Ok(query_plan_error(
+						&range_meta,
+						ReadStatus::QUERY_INVALID_PROGRAM,
+						self.local_node,
+					));
+				}
+			};
 		let admission = self.admission_snapshot();
 		let current_epoch = admission.current_epoch;
 		if meta.expected_epoch < current_epoch {
@@ -5949,49 +5961,54 @@ impl WendelonDataServer {
 			user_column_count,
 		);
 
-		let projected_execution = QueryProjectedExecution::Pbc {
-			requirement,
-			user_column_count,
-			runtime_filter,
+		let projected_execution = match row_identity_projection {
+			RowIdentityProjection::None => QueryProjectedExecution::Pbc {
+				requirement,
+				user_column_count,
+				runtime_filter,
+			},
+			RowIdentityProjection::Append => QueryProjectedExecution::Disabled,
 		};
-		if let Some(access_plan) = secondary_index_access_plan.as_ref() {
-			match plan_table_query_execution_by_secondary_index(
-				&self.slab,
-				self.local_node,
-				&range_meta,
-				&program,
-				&ranges,
-				QueryExecutionBudget::default(),
-				&descriptor,
-				&projected_execution,
-				effective_retention.floor,
-				access_plan,
-			)
-			.await
-			{
-				Ok(plan) => {
-					metrics().observe_storage_secondary_index_query_plan(
-						meta.tenant_id,
-						access_plan.descriptor.table_object_id,
-						access_plan.descriptor.index_object_id,
-						"indexed",
-					);
-					return Ok(plan);
-				}
-				Err(err) => {
-					metrics().observe_storage_secondary_index_query_plan(
-						meta.tenant_id,
-						access_plan.descriptor.table_object_id,
-						access_plan.descriptor.index_object_id,
-						"fallback_full_scan",
-					);
-					tracing::warn!(
-						tenant_id = meta.tenant_id.get(),
-						table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
-						index_object_id = %format_bytes_hex(access_plan.descriptor.index_object_id.as_bytes()),
-						error = %err,
-						"secondary index table-query execution failed; falling back to full scan"
-					);
+		if row_identity_projection == RowIdentityProjection::None {
+			if let Some(access_plan) = secondary_index_access_plan.as_ref() {
+				match plan_table_query_execution_by_secondary_index(
+					&self.slab,
+					self.local_node,
+					&range_meta,
+					&program,
+					&ranges,
+					QueryExecutionBudget::default(),
+					&descriptor,
+					&projected_execution,
+					effective_retention.floor,
+					access_plan,
+				)
+				.await
+				{
+					Ok(plan) => {
+						metrics().observe_storage_secondary_index_query_plan(
+							meta.tenant_id,
+							access_plan.descriptor.table_object_id,
+							access_plan.descriptor.index_object_id,
+							"indexed",
+						);
+						return Ok(plan);
+					}
+					Err(err) => {
+						metrics().observe_storage_secondary_index_query_plan(
+							meta.tenant_id,
+							access_plan.descriptor.table_object_id,
+							access_plan.descriptor.index_object_id,
+							"fallback_full_scan",
+						);
+						tracing::warn!(
+							tenant_id = meta.tenant_id.get(),
+							table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+							index_object_id = %format_bytes_hex(access_plan.descriptor.index_object_id.as_bytes()),
+							error = %err,
+							"secondary index table-query execution failed; falling back to full scan"
+						);
+					}
 				}
 			}
 		}
@@ -6005,6 +6022,7 @@ impl WendelonDataServer {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			projected_execution,
+			row_identity_projection,
 			effective_retention.floor,
 		)
 		.await?;
@@ -6136,6 +6154,7 @@ impl WendelonDataServer {
 			aggregate_query_budget(&request.budgets),
 			Some(&prepared.descriptor),
 			projected_execution,
+			RowIdentityProjection::None,
 			prepared.retention_floor,
 		)
 		.await?;
@@ -10685,6 +10704,7 @@ where
 struct RebatchGroup {
 	schema: Arc<Schema>,
 	batches: Vec<RecordBatch>,
+	row_key_ids: Vec<Identity>,
 	max_hlc: HybridTimestamp,
 	input_rows: u64,
 }
@@ -10836,6 +10856,56 @@ fn apply_runtime_filter_to_batch(
 	})?;
 	metrics().observe_storage_runtime_filter_rows(input_rows as u64, filtered.num_rows() as u64);
 	Ok(filtered)
+}
+
+fn filter_row_key_ids_by_mask(
+	row_key_ids: &[Identity],
+	mask: &arrow::array::BooleanArray,
+) -> Vec<Identity> {
+	row_key_ids
+		.iter()
+		.enumerate()
+		.filter_map(|(row, row_key_id)| {
+			(!mask.is_null(row) && mask.value(row)).then_some(*row_key_id)
+		})
+		.collect()
+}
+
+fn append_query_row_identity_column(
+	batch: RecordBatch,
+	row_key_ids: &[Identity],
+) -> std::io::Result<RecordBatch> {
+	if row_key_ids.len() != batch.num_rows() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"row identity projection cardinality does not match query batch",
+		));
+	}
+	let mut builder = FixedSizeBinaryBuilder::with_capacity(row_key_ids.len(), 32);
+	for row_key_id in row_key_ids {
+		builder.append_value(row_key_id.as_bytes()).map_err(|err| {
+			Error::new(ErrorKind::InvalidData, format!("row key id append: {err}"))
+		})?;
+	}
+	let mut fields = batch
+		.schema()
+		.fields()
+		.iter()
+		.map(|field| field.as_ref().clone())
+		.collect::<Vec<_>>();
+	fields.push(Field::new(
+		STORAGE_ROW_KEY_ID_COLUMN,
+		DataType::FixedSizeBinary(32),
+		false,
+	));
+	let mut columns = batch.columns().to_vec();
+	columns.push(Arc::new(builder.finish()) as ArrayRef);
+	RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("row identity projection batch: {err}"),
+		)
+	})
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -11711,6 +11781,7 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 		budget,
 		None,
 		QueryProjectedExecution::Disabled,
+		RowIdentityProjection::None,
 		None,
 	)
 	.await
@@ -12371,6 +12442,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	budget: QueryExecutionBudget,
 	table_descriptor: Option<&TableSchemaDescriptor>,
 	projected_execution: QueryProjectedExecution,
+	row_identity_projection: RowIdentityProjection,
 	logical_retention_floor: Option<HybridTimestamp>,
 ) -> std::io::Result<QueryExecutionPlan> {
 	let budget = QueryExecutionBudget {
@@ -12548,6 +12620,11 @@ async fn plan_query_execution_for_ranges_with_program(
 			};
 			let mut batch =
 				materialize_record_location_batch(&storage_batch, location.record_row_index)?;
+			let batch_row_key_ids = if row_identity_projection == RowIdentityProjection::Append {
+				vec![key_identity; batch.num_rows()]
+			} else {
+				Vec::new()
+			};
 			if was_multirow {
 				metrics().observe_storage_multirow_decode(
 					batch.num_rows() as u64,
@@ -12597,10 +12674,12 @@ async fn plan_query_execution_for_ranges_with_program(
 				}
 				group.input_rows = group.input_rows.saturating_add(input_rows);
 				group.batches.push(batch);
+				group.row_key_ids.extend(batch_row_key_ids);
 			} else {
 				rebatch_groups.push(RebatchGroup {
 					schema: batch.schema(),
 					batches: vec![batch],
+					row_key_ids: batch_row_key_ids,
 					max_hlc: location.hlc,
 					input_rows,
 				});
@@ -12610,7 +12689,21 @@ async fn plan_query_execution_for_ranges_with_program(
 	for group in rebatch_groups {
 		let concatenated = concat_batches(&group.schema, &group.batches)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
-		let result = match pbc::execute_program(program, &concatenated) {
+		let mut row_key_ids = Vec::new();
+		if row_identity_projection == RowIdentityProjection::Append {
+			let mask = match pbc::survival_mask(program, &concatenated) {
+				Ok(mask) => mask,
+				Err(_) => {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_INVALID_PROGRAM,
+						local_node,
+					));
+				}
+			};
+			row_key_ids = filter_row_key_ids_by_mask(&group.row_key_ids, &mask);
+		}
+		let mut result = match pbc::execute_program(program, &concatenated) {
 			Ok(result) => result,
 			Err(_) => {
 				return Ok(query_plan_error(
@@ -12620,6 +12713,9 @@ async fn plan_query_execution_for_ranges_with_program(
 				));
 			}
 		};
+		if row_identity_projection == RowIdentityProjection::Append {
+			result = append_query_row_identity_column(result, &row_key_ids)?;
+		}
 		if result.num_rows() == 0 {
 			continue;
 		}
@@ -13148,12 +13244,14 @@ fn query_error_meta(
 }
 
 fn table_query_as_range_query(meta: &TableQueryRequestMeta) -> QueryRequestMeta {
+	let mut pad = [0; 7];
+	pad[..meta._pad.len()].copy_from_slice(&meta._pad);
 	QueryRequestMeta {
 		min_hlc: meta.min_hlc,
 		expected_epoch: meta.expected_epoch,
 		tenant_id: meta.tenant_id,
 		consistency: meta.consistency,
-		_pad: meta._pad,
+		_pad: pad,
 		locality_range_start: 0,
 		locality_range_end: u64::MAX,
 		bytecode_len: meta.bytecode_len,
@@ -15360,7 +15458,8 @@ mod tests {
 			schema_generation: descriptor.schema_generation,
 			physical_descriptor_fingerprint: *descriptor.physical_descriptor_fingerprint.as_bytes(),
 			consistency: Consistency::SERIALIZABLE,
-			_pad: [0; 7],
+			row_identity_projection: RowIdentityProjection::None.as_u8(),
+			_pad: [0; 6],
 			bytecode_len: bytecode_len as u32,
 			runtime_filter_len: 0,
 			as_of_hlc,
@@ -16902,6 +17001,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			None,
 			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
 			Some(hlc(80, 0, 1)),
 		)
 		.await
@@ -17845,6 +17945,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -17898,6 +17999,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -17957,6 +18059,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18025,6 +18128,7 @@ mod tests {
 				user_column_count,
 				runtime_filter: None,
 			},
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18150,6 +18254,7 @@ mod tests {
 			},
 			Some(&descriptor),
 			projected_execution,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18330,6 +18435,7 @@ mod tests {
 			},
 			Some(&descriptor),
 			projected_execution,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18384,6 +18490,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18408,6 +18515,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18448,6 +18556,7 @@ mod tests {
 				user_column_count,
 				runtime_filter: None,
 			},
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18540,6 +18649,7 @@ mod tests {
 			aggregate_query_budget(&request.budgets),
 			Some(&descriptor),
 			projected_execution,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18590,6 +18700,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -18650,6 +18761,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
 			None,
 		)
 		.await
@@ -20678,7 +20790,8 @@ mod tests {
 			schema_generation: descriptor.schema_generation,
 			physical_descriptor_fingerprint: *descriptor.physical_descriptor_fingerprint.as_bytes(),
 			consistency: Consistency::SERIALIZABLE,
-			_pad: [0; 7],
+			row_identity_projection: RowIdentityProjection::None.as_u8(),
+			_pad: [0; 6],
 			bytecode_len: bytecode.len() as u32,
 			runtime_filter_len: 0,
 			as_of_hlc: hlc(0, 0, 0),

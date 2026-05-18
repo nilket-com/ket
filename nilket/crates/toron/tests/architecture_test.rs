@@ -4285,6 +4285,286 @@ fn adr034_catalog_trait_grows_by_exactly_one_method() {
 }
 
 #[test]
+fn adr035_no_sql_delete_yet() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+
+	assert!(!planner.contains("Statement::Delete"));
+	assert!(!logical.contains("Delete {"));
+	assert!(!execution.contains("Delete {"));
+}
+
+#[test]
+fn adr035_scan_request_uses_row_identity_enum() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let scan_request = storage
+		.split("pub struct ScanRequest")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct WriteRequest").next())
+		.expect("ScanRequest block");
+
+	assert!(storage.contains("pub enum RowIdentityProjection"));
+	assert!(scan_request.contains("pub row_identity: RowIdentityProjection,"));
+}
+
+#[test]
+fn adr035_no_include_row_key_id_bool() {
+	for (path, line, text) in source_lines(&manifest_dir().join("src")) {
+		assert!(
+			!text.contains("include_row_key_id: bool"),
+			"ADR 035 must use RowIdentityProjection, not a bool: {}:{line}",
+			path.display()
+		);
+	}
+}
+
+#[test]
+fn adr035_delete_request_uses_vec_identity() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let request = storage
+		.split("pub struct DeleteRowsRequest")
+		.nth(1)
+		.and_then(|rest| rest.split("#[non_exhaustive]").next())
+		.expect("DeleteRowsRequest block");
+
+	assert!(request.contains("pub row_key_ids: Vec<Identity>,"));
+}
+
+#[test]
+fn adr035_delete_request_has_no_record_batch_payload() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let request = storage
+		.split("pub struct DeleteRowsRequest")
+		.nth(1)
+		.and_then(|rest| rest.split("#[non_exhaustive]").next())
+		.expect("DeleteRowsRequest block");
+
+	assert!(!request.contains("RecordBatch"));
+	assert!(!request.contains("payload"));
+}
+
+#[test]
+fn adr035_delete_outcome_preserves_four_counters() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let outcome = storage
+		.split("pub struct DeleteRowsOutcome")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct ScanStream").next())
+		.expect("DeleteRowsOutcome block");
+
+	for field in [
+		"pub requested: usize,",
+		"pub deleted: usize,",
+		"pub already_deleted: usize,",
+		"pub not_found: usize,",
+	] {
+		assert!(outcome.contains(field), "missing ADR 035 counter {field}");
+	}
+}
+
+#[test]
+fn adr035_storage_delete_rows_trait_is_separate() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let trait_body = storage
+		.split("pub trait StorageDeleteRows")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct InMemoryStorageScan").next())
+		.expect("StorageDeleteRows trait block");
+
+	assert!(trait_body.contains("async fn delete_rows("));
+	assert!(trait_body.contains("request: DeleteRowsRequest,"));
+	assert!(trait_body.contains("Result<DeleteRowsOutcome, StorageError>"));
+}
+
+#[test]
+fn adr035_storage_write_trait_unchanged() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let write_trait = storage
+		.split("pub trait StorageWrite")
+		.nth(1)
+		.and_then(|rest| rest.split("pub trait StorageDeleteRows").next())
+		.expect("StorageWrite trait block");
+
+	assert!(write_trait.contains(
+		"async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError>;"
+	));
+	assert!(!write_trait.contains("delete_rows"));
+}
+
+#[test]
+fn adr035_no_blake3_or_hash_identity_generation_in_toron() {
+	let manifest_dir = manifest_dir();
+	let sources = [
+		manifest_dir.join("src/storage.rs"),
+		manifest_dir.join("src/coordinator/delete.rs"),
+		manifest_dir.join("Cargo.toml"),
+	];
+
+	for source_path in sources {
+		let source = std::fs::read_to_string(&source_path).expect("read source");
+		for forbidden in [
+			"blake3",
+			"Identity::blake3",
+			"Identity::blake3_tenant",
+			"Identity::blake3_keyed",
+			"sha",
+			"DefaultHasher",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"ADR 035 in-memory identities must be deterministic prefix/suffix, found {forbidden} in {}",
+				source_path.display()
+			);
+		}
+	}
+}
+
+#[test]
+fn adr035_in_memory_identity_layout_is_prefix_suffix() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let body = storage
+		.split("fn in_memory_row_identity")
+		.nth(1)
+		.and_then(|rest| rest.split("fn take_record_batch_rows").next())
+		.expect("in_memory_row_identity body");
+
+	assert!(body.contains("bytes[0..16].copy_from_slice(table_object_id.as_bytes())"));
+	assert!(body.contains("bytes[24..32].copy_from_slice(&ordinal.to_be_bytes())"));
+}
+
+#[test]
+fn adr035_in_memory_storage_tracks_row_ids_and_tombstones() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let data = storage
+		.split("struct InMemoryTableData")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct InMemoryTableStorage").next())
+		.expect("InMemoryTableData block");
+
+	for field in ["row_key_ids", "deleted_row_key_ids", "next_row_key_ordinal"] {
+		assert!(data.contains(field), "missing ADR 035 field {field}");
+	}
+}
+
+#[test]
+fn adr035_identity_scan_rejects_user_projection() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+
+	assert!(storage.contains("request.row_identity == RowIdentityProjection::Append"));
+	assert!(storage.contains("request.projected_columns.is_some()"));
+	assert!(storage.contains("StorageError::Internal"));
+	assert!(
+		storage.contains("scan with row_identity=Append cannot be combined with projected_columns")
+	);
+}
+
+#[test]
+fn adr035_coordinator_delete_module_exists() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let delete = std::fs::read_to_string(manifest_dir().join("src/coordinator/delete.rs"))
+		.expect("read delete coordinator source");
+
+	assert!(coordinator.contains("mod delete;"));
+	assert!(delete.contains("materialize_delete_row_key_ids"));
+}
+
+#[test]
+fn adr035_materializer_validates_identity_column_shape() {
+	let delete = std::fs::read_to_string(manifest_dir().join("src/coordinator/delete.rs"))
+		.expect("read delete coordinator source");
+
+	assert!(delete.contains("STORAGE_ROW_KEY_ID_COLUMN"));
+	assert!(delete.contains("DataType::FixedSizeBinary(32)"));
+	assert!(delete.contains("null_count() != 0"));
+}
+
+#[test]
+fn adr035_select_scan_uses_row_identity_none() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let scan_requests = brace_blocks_after_marker(&exec, "ScanRequest {");
+	assert!(
+		!scan_requests.is_empty(),
+		"ADR 035 guard expected ScanRequest constructors"
+	);
+	for (line, block) in scan_requests {
+		assert!(
+			block.contains("row_identity: RowIdentityProjection::None"),
+			"ADR 035 ScanRequest at exec.rs:{line} must set row_identity None"
+		);
+	}
+}
+
+#[test]
+fn adr035_wendelon_adapter_calls_table_delete() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let adapter = storage
+		.split("impl StorageDeleteRows for WendelonStorageDeleteRows")
+		.nth(1)
+		.and_then(|rest| rest.split("fn append_projection").next())
+		.expect("WendelonStorageDeleteRows adapter block");
+
+	assert!(adapter.contains(".table_delete("));
+	assert!(!adapter.contains(".table_delete_rows("));
+}
+
+#[test]
+fn adr035_wendelon_projection_change_is_privileged() {
+	let columnar = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/columnar.rs"))
+		.expect("read Wendelon columnar source");
+	let insert_required = columnar
+		.split("fn insert_required_column")
+		.nth(1)
+		.and_then(|rest| rest.split("fn remap_column_fetch_requirement").next())
+		.expect("insert_required_column body");
+	let core = std::fs::read_to_string(wendelon_manifest_dir().join("src/client/core.rs"))
+		.expect("read Wendelon client core source");
+	let table = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema source");
+	let client =
+		std::fs::read_to_string(wendelon_manifest_dir().join("crates/wendelon-client/src/lib.rs"))
+			.expect("read Wendelon client wrapper source");
+
+	assert!(columnar.contains("cannot appear in PBC PROJECT output"));
+	assert!(insert_required.contains("RequirementColumn::Storage"));
+	assert!(insert_required.contains("requirement.storage_columns.insert(storage_column)"));
+	assert!(core.contains("pub row_identity: RowIdentityProjection,"));
+	assert!(table.contains("pub row_identity_projection: u8,"));
+	assert!(client.contains("pub row_identity: RowIdentityProjection,"));
+	assert!(client.contains("row_identity_projection: options.row_identity.as_u8()"));
+	assert!(client.contains("row_identity: options.row_identity"));
+}
+
+#[test]
+fn adr035_synthetic_names_remain_rejected_in_sql() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+
+	for source in [&planner, &binder] {
+		assert!(source.contains("STORAGE_SYNTHETIC_COLUMN_NAMES"));
+		assert!(source.contains("STORAGE_ROW_KEY_ID_COLUMN"));
+		assert!(source.contains("STORAGE_ROW_HLC_COLUMN"));
+	}
+}
+
+#[test]
 fn adr029_select_retry_loop_is_preserved() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");

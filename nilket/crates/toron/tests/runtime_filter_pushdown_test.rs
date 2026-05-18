@@ -23,7 +23,9 @@ use toron::ir::{Expr, JoinKind, JoinStrategy, LogicalPlan, QueryProfileHint, Ses
 use toron::server::{
 	NetworkTaskDispatcher, ToronWorker, memory::MemoryManager, transport::TcpTransport,
 };
-use toron::storage::{HlcBound, ScanRequest, ScanStream, StorageScan, TenantId};
+use toron::storage::{
+	HlcBound, RowIdentityProjection, ScanRequest, ScanStream, StorageScan, TenantId,
+};
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterBloom,
@@ -483,6 +485,7 @@ fn scan_request(
 		projected_columns: None,
 		pbc_predicate: None,
 		runtime_filter,
+		row_identity: RowIdentityProjection::None,
 		profile_hint: Some(QueryProfileHint::Scan),
 		trace_context: None,
 		morsel: None,

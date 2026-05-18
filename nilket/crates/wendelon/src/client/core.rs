@@ -317,6 +317,33 @@ pub struct TableDeleteRowsResult {
 	pub finalization: Option<FinalizationMarker>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RowIdentityProjection {
+	#[default]
+	None,
+	Append,
+}
+
+impl RowIdentityProjection {
+	pub const NONE: u8 = 0;
+	pub const APPEND: u8 = 1;
+
+	pub const fn as_u8(self) -> u8 {
+		match self {
+			Self::None => Self::NONE,
+			Self::Append => Self::APPEND,
+		}
+	}
+
+	pub const fn from_u8(value: u8) -> Option<Self> {
+		match value {
+			Self::NONE => Some(Self::None),
+			Self::APPEND => Some(Self::Append),
+			_ => None,
+		}
+	}
+}
+
 /// Client-visible typed table scan request for ADR 037.
 #[derive(Clone, Debug)]
 pub struct TableQueryRequest {
@@ -324,6 +351,7 @@ pub struct TableQueryRequest {
 	pub descriptor: TableSchemaDescriptor,
 	pub pbc: Vec<u8>,
 	pub runtime_filter: Option<RuntimeFilterDescriptor>,
+	pub row_identity: RowIdentityProjection,
 }
 
 /// Client-visible point read request for the Data Ring wire API.
@@ -1567,6 +1595,12 @@ fn validate_table_query_request(request: &TableQueryRequest) -> std::io::Result<
 			"TABLE_QUERY_REQ physical_descriptor_fingerprint does not match descriptor",
 		));
 	}
+	if request.meta.row_identity_projection != request.row_identity.as_u8() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_QUERY_REQ row_identity_projection does not match typed request",
+		));
+	}
 	let bytecode_len = u32::try_from(request.pbc.len()).map_err(|_| {
 		Error::new(
 			ErrorKind::InvalidInput,
@@ -2353,7 +2387,8 @@ mod tests {
 					.physical_descriptor_fingerprint
 					.as_bytes(),
 				consistency: Consistency::LINEARIZABLE,
-				_pad: [0; 7],
+				row_identity_projection: RowIdentityProjection::None.as_u8(),
+				_pad: [0; 6],
 				bytecode_len: 2,
 				runtime_filter_len: 0,
 				as_of_hlc: bytemuck::Zeroable::zeroed(),
@@ -2361,6 +2396,7 @@ mod tests {
 			descriptor,
 			pbc: vec![0x01, 0x02],
 			runtime_filter: None,
+			row_identity: RowIdentityProjection::None,
 		};
 		validate_table_query_request(&request).unwrap();
 

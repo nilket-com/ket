@@ -14,8 +14,8 @@ use tokio::sync::watch;
 use uuid::Uuid;
 use wendelon::client::{
 	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, DATA_RETRY_BUDGET, ReadRequest,
-	TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient, WendelonClientConfig,
-	WriteRequest,
+	TableDeleteRowsRequest, TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient,
+	WendelonClientConfig, WriteRequest,
 };
 use wendelon::network::control_server::{CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire};
 use wendelon::network::core::{HRFT_MAGIC, read_frame, write_frame};
@@ -32,13 +32,15 @@ use wendelon::network::transport::{
 use wendelon::network::wire;
 use wendelon::schema::{
 	ClientWriteId, FinalizationMarker, FrameHeader, HybridTimestamp, Identity, MsgType, NodeId,
-	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus, TableQueryRequestMeta,
-	TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
-	encode_table_schema_descriptor_v1, encode_table_write_row_count, read_key_schema,
-	write_payload_schema,
+	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus,
+	TableDeleteRowsRequestMeta, TableQueryRequestMeta, TableWriteRequestMeta, TenantId,
+	WriteRequestMeta, WriteStatus, encode_table_schema_descriptor_v1, encode_table_write_row_count,
+	read_key_schema, write_payload_schema,
 };
 
-pub use wendelon::client::{CdcFrame, CdcSubscription, QueryLocalityRange, StreamingQueryResult};
+pub use wendelon::client::{
+	CdcFrame, CdcSubscription, QueryLocalityRange, RowIdentityProjection, StreamingQueryResult,
+};
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
 	ComputeTraceContextV1, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
@@ -153,6 +155,7 @@ pub struct TableQueryOptions {
 	pub as_of_hlc: Option<HybridTimestamp>,
 	pub stats_pruning_enabled: bool,
 	pub physical_descriptor_fingerprint: Option<PhysicalDescriptorFingerprint>,
+	pub row_identity: RowIdentityProjection,
 }
 
 impl Default for TableQueryOptions {
@@ -163,6 +166,7 @@ impl Default for TableQueryOptions {
 			as_of_hlc: None,
 			stats_pruning_enabled: true,
 			physical_descriptor_fingerprint: None,
+			row_identity: RowIdentityProjection::None,
 		}
 	}
 }
@@ -184,6 +188,23 @@ pub struct TableWriteReceipt {
 	pub table_object_id: TableObjectId,
 	pub schema_generation: u64,
 	pub rows: usize,
+	pub duplicate: bool,
+	pub requested_durability: DurabilityClass,
+	pub log_index: u64,
+	pub term: u64,
+	pub epoch: u64,
+	pub commit_hlc: HybridTimestamp,
+	pub finalization: Option<FinalizationMarker>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableDeleteRowsReceipt {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub requested: usize,
+	pub deleted_count: u32,
+	pub already_deleted_count: u32,
+	pub not_found_count: u32,
 	pub duplicate: bool,
 	pub requested_durability: DurabilityClass,
 	pub log_index: u64,
@@ -636,6 +657,79 @@ impl Client {
 		}
 	}
 
+	pub async fn table_delete(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		row_key_ids: Vec<Identity>,
+		options: WriteOptions,
+	) -> Result<TableDeleteRowsReceipt, ClientError> {
+		let requested = row_key_ids.len();
+		let row_count = u32::try_from(requested).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"table delete row key count exceeds u32 length",
+			)
+		})?;
+		let sequence_no = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+		let request = TableDeleteRowsRequest {
+			meta: TableDeleteRowsRequestMeta {
+				parent_write_id: ClientWriteId {
+					client_uuid: self.client_uuid,
+					sequence_no,
+					idempotency_ttl_ms: 60_000,
+					_pad: 0,
+				},
+				client_hlc: options.client_hlc.unwrap_or_else(default_client_hlc),
+				expected_epoch: self.inner.epoch(),
+				tenant_id,
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				row_count,
+				durability: options.durability,
+				await_finalization: u8::from(options.await_finalization),
+				_pad: [0; 10],
+			},
+			descriptor: descriptor.clone(),
+			row_key_ids,
+		};
+		let result = self.inner.table_delete(request).await?;
+		if result.response.reject_code != PbcRejectCode::NONE.0 {
+			return Err(ClientError::TableWriteRejected {
+				reject_code: PbcRejectCode(result.response.reject_code),
+			});
+		}
+		let response = result.response.write;
+		match response.status {
+			s if s == WriteStatus::OK || s == WriteStatus::DUPLICATE => {
+				Ok(TableDeleteRowsReceipt {
+					table_object_id: descriptor.table_object_id,
+					schema_generation: descriptor.schema_generation,
+					requested,
+					deleted_count: result.response.deleted_count,
+					already_deleted_count: result.response.already_deleted_count,
+					not_found_count: result.response.not_found_count,
+					duplicate: response.status == WriteStatus::DUPLICATE,
+					requested_durability: options.durability,
+					log_index: response.log_index,
+					term: response.term,
+					epoch: response.epoch,
+					commit_hlc: response.commit_hlc,
+					finalization: result.finalization,
+				})
+			}
+			s if s == WriteStatus::QUOTA_EXCEEDED => Err(ClientError::QuotaExceeded { tenant_id }),
+			s if s == WriteStatus::TENANT_SUSPENDED => {
+				Err(ClientError::TenantSuspended { tenant_id })
+			}
+			s if s == WriteStatus::TENANT_UNAVAILABLE => {
+				Err(ClientError::TenantUnavailable { tenant_id })
+			}
+			s if s == WriteStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
+			status => Err(ClientError::WriteFailed { status }),
+		}
+	}
+
 	pub async fn read(
 		&self,
 		tenant_id: TenantId,
@@ -771,7 +865,7 @@ impl Client {
 			}
 			None => 0,
 		};
-		let mut pad = [0; 7];
+		let mut pad = [0; 6];
 		if !options.stats_pruning_enabled {
 			pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
 		}
@@ -785,6 +879,7 @@ impl Client {
 				physical_descriptor_fingerprint: *expected_physical_descriptor_fingerprint
 					.as_bytes(),
 				consistency: options.consistency,
+				row_identity_projection: options.row_identity.as_u8(),
 				_pad: pad,
 				bytecode_len,
 				runtime_filter_len,
@@ -793,6 +888,7 @@ impl Client {
 			descriptor: descriptor.clone(),
 			pbc,
 			runtime_filter,
+			row_identity: options.row_identity,
 		};
 		match self.inner.table_query(request).await {
 			Ok(result) => Ok(result),

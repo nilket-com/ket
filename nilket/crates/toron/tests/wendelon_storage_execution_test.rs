@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -33,13 +33,13 @@ use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RUNTIME_FILTER_HASH_SEED,
 	RUNTIME_FILTER_KEY_ENCODING_VERSION, RecordBodyCompressionPolicy, RowIdentityPolicy,
 	RuntimeFilterBloom, RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
-	encode_runtime_filter_key, encode_table_schema_descriptor_v1,
+	STORAGE_ROW_KEY_ID_COLUMN, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	TenantId as WendelonTenantId, encode_runtime_filter_key, encode_table_schema_descriptor_v1,
 	insert_runtime_filter_encoded_key,
 	pbc::{OP_GT, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT},
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
-use wendelon_client::{Client, TableQueryOptions, WriteOptions};
+use wendelon_client::{Client, RowIdentityProjection, TableQueryOptions, WriteOptions};
 
 const LIVE_TENANT: WendelonTenantId = WendelonTenantId::new(1);
 const OTHER_TENANT: WendelonTenantId = WendelonTenantId::new(2);
@@ -202,6 +202,47 @@ async fn wendelon_table_query_runtime_filter_reduces_boundary_rows() {
 		"adr013_production_wendelon_runtime_filter rows_off={unfiltered_rows} rows_on={filtered_rows} bytes_off={unfiltered_bytes} bytes_on={filtered_bytes} digest={}",
 		hex32(unfiltered_digest.get()),
 	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn wendelon_table_query_appends_row_identity_for_filter_candidates() {
+	let fixture = LiveWendelonFixture::start(39).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let mut options = TableQueryOptions::default();
+	options.physical_descriptor_fingerprint = Some(descriptor.physical_descriptor_fingerprint);
+	options.row_identity = RowIdentityProjection::Append;
+	let first = fixture
+		.client
+		.table_query(LIVE_TENANT, &descriptor, pbc_amount_gt_100(), options)
+		.await
+		.expect("row identity table query");
+	let second = fixture
+		.client
+		.table_query(LIVE_TENANT, &descriptor, pbc_amount_gt_100(), options)
+		.await
+		.expect("row identity table query");
+
+	assert_eq!(first.batches.len(), 1);
+	let batch = &first.batches[0];
+	assert_eq!(
+		batch.num_columns(),
+		descriptor.arrow_schema().unwrap().fields().len() + 1
+	);
+	let schema = batch.schema();
+	let identity_field = schema.field(batch.num_columns() - 1);
+	assert_eq!(identity_field.name(), STORAGE_ROW_KEY_ID_COLUMN);
+	assert_eq!(identity_field.data_type(), &DataType::FixedSizeBinary(32));
+	assert_eq!(ids_from_single_column(&first.batches), vec![2, 4]);
+	let first_ids = row_key_id_bytes(batch);
+	let second_ids = row_key_id_bytes(&second.batches[0]);
+	assert_eq!(first_ids, second_ids);
+	assert_eq!(first_ids.len(), 2);
 
 	fixture.node.handles.abort();
 	let _ = std::fs::remove_dir_all(fixture.data_dir);
@@ -498,6 +539,18 @@ fn ids_from_single_column(batches: &[RecordBatch]) -> Vec<i64> {
 		.downcast_ref::<Int64Array>()
 		.expect("id column");
 	ids.values().to_vec()
+}
+
+fn row_key_id_bytes(batch: &RecordBatch) -> Vec<[u8; 32]> {
+	let row_key_ids = batch
+		.column(batch.num_columns() - 1)
+		.as_any()
+		.downcast_ref::<FixedSizeBinaryArray>()
+		.expect("row key id column");
+	assert_eq!(row_key_ids.null_count(), 0);
+	(0..row_key_ids.len())
+		.map(|row| row_key_ids.value(row).try_into().expect("32-byte row id"))
+		.collect()
 }
 
 fn amounts_from_single_column(batches: &[RecordBatch]) -> Vec<i32> {
@@ -862,6 +915,16 @@ fn pbc_project_amounts_gt_100() -> Vec<u8> {
 	bytecode.push(OP_PROJECT);
 	bytecode.extend_from_slice(&1_u16.to_le_bytes());
 	bytecode.extend_from_slice(&1_u32.to_le_bytes());
+	bytecode
+}
+
+fn pbc_amount_gt_100() -> Vec<u8> {
+	let mut bytecode = Vec::new();
+	bytecode.push(OP_PUSH_COL);
+	bytecode.extend_from_slice(&1_u32.to_le_bytes());
+	bytecode.push(OP_PUSH_INT);
+	bytecode.extend_from_slice(&100_i64.to_le_bytes());
+	bytecode.push(OP_GT);
 	bytecode
 }
 
