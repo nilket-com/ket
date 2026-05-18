@@ -12,10 +12,11 @@ use crate::ir::{
 use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
 	BinaryOperator, CastKind, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable,
-	DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, Function, FunctionArg,
-	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
-	Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectType, OrderBy, Query, Select,
-	SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject, UnaryOperator, Value,
+	DataType as SqlDataType, Delete, ExactNumberInfo, Expr as SqlExpr, FromTable, Function,
+	FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
+	HiveDistributionStyle, Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectType,
+	OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject,
+	UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -124,6 +125,22 @@ fn lower_ddl_table_name(name: &ObjectName) -> Result<TableRef, FrontendError> {
 		_ => Err(unsupported(
 			"DDL table names support only one- or two-part table names",
 		)),
+	}
+}
+
+fn lower_table_ref_object_name(
+	name: &ObjectName,
+	context: &'static str,
+) -> Result<TableRef, FrontendError> {
+	match name.0.as_slice() {
+		[table] => Ok(TableRef::new(table.value.clone())),
+		[schema, table] => Ok(TableRef::with_schema(
+			schema.value.clone(),
+			table.value.clone(),
+		)),
+		_ => Err(unsupported(format!(
+			"{context} supports only one- or two-part table names"
+		))),
 	}
 }
 
@@ -411,11 +428,103 @@ impl SqlPlanner {
 			Statement::Query(query) => self.lower_query(query),
 			Statement::CreateTable(create_table) => self.lower_create_table(create_table),
 			Statement::Insert(insert) => self.lower_insert(insert),
+			Statement::Delete(delete) => self.lower_delete(delete),
 			Statement::Drop { .. } => self.lower_drop_table(&ast[0]),
 			_ => Err(unsupported(
-				"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, and DROP TABLE are supported",
+				"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, DELETE, and DROP TABLE are supported",
 			)),
 		}
+	}
+
+	fn lower_delete(&self, delete: &Delete) -> Result<LogicalPlan, FrontendError> {
+		let Delete {
+			tables,
+			from,
+			using,
+			selection,
+			returning,
+			order_by,
+			limit,
+		} = delete;
+
+		if !tables.is_empty() {
+			return Err(unsupported("DELETE supports exactly one target table"));
+		}
+		if using.is_some() {
+			return Err(unsupported("unsupported DELETE clause: USING"));
+		}
+		if returning.is_some() {
+			return Err(unsupported("unsupported DELETE clause: RETURNING"));
+		}
+		if !order_by.is_empty() {
+			return Err(unsupported("unsupported DELETE clause: ORDER BY"));
+		}
+		if limit.is_some() {
+			return Err(unsupported("unsupported DELETE clause: LIMIT"));
+		}
+
+		let target = match from {
+			FromTable::WithFromKeyword(target) => target,
+			FromTable::WithoutKeyword(_) => {
+				return Err(unsupported("DELETE requires FROM keyword"));
+			}
+		};
+		if target.len() != 1 {
+			return Err(unsupported("DELETE supports exactly one target table"));
+		}
+		let table_with_joins = &target[0];
+		if !table_with_joins.joins.is_empty() {
+			return Err(unsupported(
+				"unsupported DELETE target: joins not supported",
+			));
+		}
+
+		let TableFactor::Table {
+			name,
+			alias,
+			args,
+			with_hints,
+			version,
+			with_ordinality,
+			partitions,
+			json_path,
+			sample,
+		} = &table_with_joins.relation
+		else {
+			return Err(unsupported("DELETE target must be a single table"));
+		};
+
+		if alias.is_some() {
+			return Err(unsupported("unsupported DELETE target: table alias"));
+		}
+		if args.is_some() {
+			return Err(unsupported("unsupported DELETE target: table arguments"));
+		}
+		if !with_hints.is_empty() {
+			return Err(unsupported("unsupported DELETE target: table hints"));
+		}
+		if version.is_some() {
+			return Err(unsupported("unsupported DELETE target: table version"));
+		}
+		if *with_ordinality {
+			return Err(unsupported("unsupported DELETE target: WITH ORDINALITY"));
+		}
+		if !partitions.is_empty() {
+			return Err(unsupported("unsupported DELETE target: partitions"));
+		}
+		if json_path.is_some() {
+			return Err(unsupported("unsupported DELETE target: json path"));
+		}
+		if sample.is_some() {
+			return Err(unsupported("unsupported DELETE target: sample"));
+		}
+
+		let table = lower_table_ref_object_name(name, "DELETE")?;
+		let predicate = selection
+			.as_ref()
+			.map(|expr| self.lower_expr(expr))
+			.transpose()?;
+		Ok(LogicalPlan::Delete { table, predicate })
 	}
 
 	fn lower_insert(&self, insert: &Insert) -> Result<LogicalPlan, FrontendError> {
@@ -3183,6 +3292,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 		LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => false,
 	}
@@ -3462,6 +3572,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		| LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => Vec::new(),
 	}

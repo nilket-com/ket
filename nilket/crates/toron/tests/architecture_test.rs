@@ -563,7 +563,7 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 14);
+	assert_eq!(enum_variant_count(logical_plan), 15);
 	assert!(logical_plan.contains("Sort {"));
 	assert!(logical_plan.contains("CreateTable {"));
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
@@ -581,7 +581,7 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 12);
+	assert_eq!(enum_variant_count(execution_plan), 13);
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("CreateTable {"));
 	assert!(execution_plan.contains("CreateTableAsSelect {"));
@@ -2510,9 +2510,10 @@ fn adr029_sql_planner_accepts_only_select_and_create_table() {
 	assert!(plan_body.contains("Statement::Query(query)"));
 	assert!(plan_body.contains("Statement::CreateTable(create_table)"));
 	assert!(plan_body.contains("Statement::Insert(insert)"));
+	assert!(plan_body.contains("Statement::Delete(delete)"));
 	assert!(plan_body.contains("Statement::Drop { .. }"));
 	assert!(plan_body.contains(
-		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, and DROP TABLE are supported"
+		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, DELETE, and DROP TABLE are supported"
 	));
 	assert!(!plan_body.contains("only SELECT and CREATE TABLE are supported"));
 	assert!(!plan_body.contains("only SELECT is supported"));
@@ -3045,7 +3046,7 @@ fn adr032_logical_plan_retains_insert_select_variant() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 14);
+	assert_eq!(enum_variant_count(logical_plan), 15);
 	assert!(logical_plan.contains("InsertSelect {"));
 	assert!(logical_plan.contains("DropTable {"));
 	assert!(logical_plan.contains("table: TableRef,"));
@@ -3062,7 +3063,7 @@ fn adr032_execution_plan_retains_insert_select_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 12);
+	assert_eq!(enum_variant_count(execution_plan), 13);
 	assert!(execution_plan.contains("InsertSelect {"));
 	assert!(execution_plan.contains("DropTable {"));
 }
@@ -3413,7 +3414,7 @@ fn adr033_logical_variant_count_is_13() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 14);
+	assert_eq!(enum_variant_count(logical_plan), 15);
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
 	assert!(logical_plan.contains("table: TableRef,"));
 	assert!(logical_plan.contains("source: Box<LogicalPlan>,"));
@@ -3430,7 +3431,7 @@ fn adr033_execution_variant_count_is_11() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 12);
+	assert_eq!(enum_variant_count(execution_plan), 13);
 	assert!(execution_plan.contains("CreateTableAsSelect {"));
 	assert!(execution_plan.contains("DropTable {"));
 }
@@ -3969,7 +3970,7 @@ fn adr034_logical_variant_count_is_14() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 14);
+	assert_eq!(enum_variant_count(logical_plan), 15);
 	assert!(logical_plan.contains("DropTable {"));
 	assert!(logical_plan.contains("name: TableRef,"));
 	assert!(logical_plan.contains("if_exists: bool,"));
@@ -3985,7 +3986,7 @@ fn adr034_execution_variant_count_is_12() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 12);
+	assert_eq!(enum_variant_count(execution_plan), 13);
 	assert!(execution_plan.contains("DropTable {"));
 }
 
@@ -4285,17 +4286,470 @@ fn adr034_catalog_trait_grows_by_exactly_one_method() {
 }
 
 #[test]
-fn adr035_no_sql_delete_yet() {
+fn adr036_sql_planner_accepts_delete() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
+
+	assert!(planner.contains("Statement::Delete(delete) => self.lower_delete(delete)"));
+	assert!(planner.contains("SELECT, CREATE TABLE, INSERT, DELETE, and DROP TABLE"));
+}
+
+#[test]
+fn adr036_delete_destructure_is_exhaustive() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lower_delete = brace_blocks_after_marker(&planner, "fn lower_delete")
+		.into_iter()
+		.next()
+		.expect("lower_delete body")
+		.1;
+
+	for field in [
+		"tables",
+		"from",
+		"using",
+		"selection",
+		"returning",
+		"order_by",
+		"limit",
+	] {
+		assert!(lower_delete.contains(field), "DELETE missing field {field}");
+	}
+	assert!(
+		!lower_delete.contains(".."),
+		"DELETE lowering must exhaustively destructure sqlparser::ast::Delete"
+	);
+}
+
+#[test]
+fn adr036_delete_target_table_destructure_is_exhaustive() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lower_delete = brace_blocks_after_marker(&planner, "fn lower_delete")
+		.into_iter()
+		.next()
+		.expect("lower_delete body")
+		.1;
+
+	for field in [
+		"name",
+		"alias",
+		"args",
+		"with_hints",
+		"version",
+		"with_ordinality",
+		"partitions",
+		"json_path",
+		"sample",
+	] {
+		assert!(
+			lower_delete.contains(field),
+			"DELETE target table destructure missing {field}"
+		);
+	}
+	assert!(
+		!lower_delete.contains("TableFactor::Table { .. }"),
+		"DELETE target table destructure must not use a rest pattern"
+	);
+}
+
+#[test]
+fn adr036_delete_reject_surface_is_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lower_delete = brace_blocks_after_marker(&planner, "fn lower_delete")
+		.into_iter()
+		.next()
+		.expect("lower_delete body")
+		.1;
+
+	for diagnostic in [
+		"DELETE supports exactly one target table",
+		"unsupported DELETE clause: USING",
+		"unsupported DELETE clause: RETURNING",
+		"unsupported DELETE clause: ORDER BY",
+		"unsupported DELETE clause: LIMIT",
+		"DELETE requires FROM keyword",
+		"unsupported DELETE target: joins not supported",
+		"DELETE target must be a single table",
+		"unsupported DELETE target: table alias",
+		"unsupported DELETE target: table arguments",
+		"unsupported DELETE target: table hints",
+		"unsupported DELETE target: table version",
+		"unsupported DELETE target: WITH ORDINALITY",
+		"unsupported DELETE target: partitions",
+		"unsupported DELETE target: json path",
+		"unsupported DELETE target: sample",
+	] {
+		assert!(
+			lower_delete.contains(diagnostic),
+			"DELETE lowering missing reject diagnostic {diagnostic}"
+		);
+	}
+}
+
+#[test]
+fn adr036_logical_variant_count_is_15() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let logical_plan = logical
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("pub fn project_plan").next())
+		.expect("LogicalPlan enum");
+
+	assert_eq!(enum_variant_count(logical_plan), 15);
+	assert!(logical_plan.contains("Delete {"));
+	assert!(logical_plan.contains("table: TableRef,"));
+	assert!(logical_plan.contains("predicate: Option<Expr>,"));
+}
+
+#[test]
+fn adr036_execution_variant_count_is_13() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+
+	assert_eq!(enum_variant_count(execution_plan), 13);
+	assert!(execution_plan.contains("Delete {"));
+}
+
+#[test]
+fn adr036_ir_delete_variants_are_leafs() {
 	let logical =
 		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
 	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
+	let logical_delete = brace_blocks_after_marker(&logical, "Delete {")
+		.into_iter()
+		.next()
+		.expect("LogicalPlan::Delete body")
+		.1;
+	let execution_delete = brace_blocks_after_marker(&execution, "Delete {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::Delete body")
+		.1;
 
-	assert!(!planner.contains("Statement::Delete"));
-	assert!(!logical.contains("Delete {"));
-	assert!(!execution.contains("Delete {"));
+	for body in [&logical_delete, &execution_delete] {
+		assert!(!body.contains("Box<"), "DELETE must remain a leaf plan");
+		assert!(
+			!body.contains("input:"),
+			"DELETE must not carry an input child"
+		);
+		assert!(
+			!body.contains("source:"),
+			"DELETE must not carry a source child"
+		);
+	}
+}
+
+#[test]
+fn adr036_execution_delete_carries_shape_a_identity() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_delete = brace_blocks_after_marker(&execution, "Delete {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::Delete body")
+		.1;
+
+	for field in [
+		"legacy_table_id: TableId",
+		"table: TableObjectId",
+		"fingerprint: PhysicalDescriptorFingerprint",
+		"schema: SchemaRef",
+		"predicate: Option<BoundExprProgram>",
+		"pbc_program: Option<PbcProgram>",
+		"profile_hint: QueryProfileHint",
+	] {
+		assert!(execution_delete.contains(field), "DELETE missing {field}");
+	}
+}
+
+#[test]
+fn adr036_delete_has_no_filter_disposition_field() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_delete = brace_blocks_after_marker(&execution, "Delete {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::Delete body")
+		.1;
+
+	assert!(!execution_delete.contains("FilterDisposition"));
+	assert!(!execution_delete.contains("disposition"));
+}
+
+#[test]
+fn adr036_binder_delete_uses_boolean_root_validator() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let bind_delete = brace_blocks_after_marker(&binder, "async fn bind_delete")
+		.into_iter()
+		.next()
+		.expect("bind_delete body")
+		.1;
+	let validator = brace_blocks_after_marker(&binder, "fn require_single_boolean_root")
+		.into_iter()
+		.next()
+		.expect("require_single_boolean_root body")
+		.1;
+
+	assert!(bind_delete.contains("require_single_boolean_root(&program, \"DELETE WHERE\")?"));
+	assert!(!bind_delete.contains("DataType::Boolean"));
+	assert!(validator.contains("program.root_count() != 1"));
+	assert!(validator.contains("program.root_type(0)"));
+	assert!(validator.contains("DataType::Boolean"));
+}
+
+#[test]
+fn adr036_binder_delete_allows_residual_predicates() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let bind_delete = brace_blocks_after_marker(&binder, "async fn bind_delete")
+		.into_iter()
+		.next()
+		.expect("bind_delete body")
+		.1;
+
+	assert!(bind_delete.contains("bound_predicate.as_ref().and_then(compile_pbc)"));
+	for forbidden in [
+		"PBC pushdown required",
+		"pushdown-only DELETE",
+		"not pushdown",
+	] {
+		assert!(
+			!bind_delete.contains(forbidden),
+			"DELETE binder must not reject residual predicates via {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr036_delete_candidate_scan_uses_append_only() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let execute_write = coordinator
+		.split("async fn execute_write_plan")
+		.nth(1)
+		.expect("execute_write_plan body");
+	let delete_arm = execute_write
+		.split("ExecutionPlan::Delete {")
+		.nth(1)
+		.and_then(|rest| rest.split("other => Err").next())
+		.expect("ExecutionPlan::Delete write arm");
+
+	assert!(delete_arm.contains("projected_columns: None"));
+	assert!(delete_arm.contains("row_identity: RowIdentityProjection::Append"));
+}
+
+#[test]
+fn adr036_delete_candidate_scan_uses_no_runtime_filter() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let execute_write = coordinator
+		.split("async fn execute_write_plan")
+		.nth(1)
+		.expect("execute_write_plan body");
+	let delete_arm = execute_write
+		.split("ExecutionPlan::Delete {")
+		.nth(1)
+		.and_then(|rest| rest.split("other => Err").next())
+		.expect("ExecutionPlan::Delete write arm");
+
+	assert!(delete_arm.contains("runtime_filter: None"));
+	assert!(!delete_arm.contains("self.context.runtime_filter"));
+	assert!(!delete_arm.contains("context.runtime_filter"));
+}
+
+#[test]
+fn adr036_delete_residual_filter_before_identity_extraction() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let execute_write = coordinator
+		.split("async fn execute_write_plan")
+		.nth(1)
+		.expect("execute_write_plan body");
+	let delete_arm = execute_write
+		.split("ExecutionPlan::Delete {")
+		.nth(1)
+		.and_then(|rest| rest.split("other => Err").next())
+		.expect("ExecutionPlan::Delete write arm");
+	let filter = delete_arm
+		.find("filter_batches_with_bound_predicate")
+		.expect("residual filter call");
+	let extract = delete_arm
+		.find("extract_delete_row_key_ids")
+		.expect("identity extraction call");
+
+	assert!(filter < extract);
+}
+
+#[test]
+fn adr036_adr035_materializer_name_preserved() {
+	let delete_source = std::fs::read_to_string(manifest_dir().join("src/coordinator/delete.rs"))
+		.expect("read coordinator delete source");
+	let materializer = brace_blocks_after_marker(
+		&delete_source,
+		"pub(crate) async fn materialize_delete_row_key_ids",
+	)
+	.into_iter()
+	.next()
+	.expect("materialize_delete_row_key_ids body")
+	.1;
+	let materialize_candidates = materializer
+		.find("materialize_delete_candidate_batches")
+		.expect("candidate materializer call");
+	let extract = materializer
+		.find("extract_delete_row_key_ids")
+		.expect("identity extraction call");
+
+	assert!(materialize_candidates < extract);
+}
+
+#[test]
+fn adr036_delete_uses_execute_delete_with_candidates() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let execute_write = coordinator
+		.split("async fn execute_write_plan")
+		.nth(1)
+		.expect("execute_write_plan body");
+	let delete_arm = execute_write
+		.split("ExecutionPlan::Delete {")
+		.nth(1)
+		.and_then(|rest| rest.split("other => Err").next())
+		.expect("ExecutionPlan::Delete write arm");
+
+	assert!(delete_arm.contains("execute_delete_with_candidates"));
+}
+
+#[test]
+fn adr036_delete_result_uses_deleted_only() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let execute_write = coordinator
+		.split("async fn execute_write_plan")
+		.nth(1)
+		.expect("execute_write_plan body");
+	let delete_arm = execute_write
+		.split("ExecutionPlan::Delete {")
+		.nth(1)
+		.and_then(|rest| rest.split("other => Err").next())
+		.expect("ExecutionPlan::Delete write arm");
+
+	assert!(delete_arm.contains("delete_count_batch(outcome.deleted)"));
+	for forbidden in [
+		"outcome.requested",
+		"outcome.already_deleted",
+		"outcome.not_found",
+	] {
+		assert!(
+			!delete_arm.contains(forbidden),
+			"DELETE result count must not use {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr036_distributed_delete_rejected_before_fragment() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let distributed_impl = coordinator
+		.split("impl<Registry, Transport> DistributedQueryCoordinator")
+		.nth(1)
+		.expect("DistributedQueryCoordinator impl");
+	let delete_reject = distributed_impl
+		.find("ExecutionPlan::Delete")
+		.expect("distributed DELETE reject");
+	let fragment_call = distributed_impl
+		.find("fragment_plan(")
+		.expect("fragment_plan call");
+
+	assert!(delete_reject < fragment_call);
+	assert!(distributed_impl.contains("distributed DELETE execution is not wired"));
+}
+
+#[test]
+fn adr036_fragmenter_delete_defensive_reject() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
+		.into_iter()
+		.next()
+		.expect("fragment_plan body")
+		.1;
+	let delete_reject = fragment_plan
+		.find("ExecutionPlan::Delete")
+		.expect("fragmenter DELETE reject");
+
+	assert!(fragmenter.contains("DeleteNotFragmentable"));
+	assert!(delete_reject < fragment_plan.find("contains_join").unwrap());
+	assert!(delete_reject < fragment_plan.find("count_exchanges").unwrap());
+}
+
+#[test]
+fn adr036_executor_delete_defensive_arms() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+
+	assert!(exec.contains("unbound DELETE execution"));
+	assert!(exec.contains("DELETE execution is coordinator-only"));
+}
+
+#[test]
+fn adr036_operator_label_is_delete() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let operator_kind = brace_blocks_after_marker(&server, "fn operator_kind_label")
+		.into_iter()
+		.next()
+		.expect("operator_kind_label body")
+		.1;
+
+	assert!(operator_kind.contains("ExecutionPlan::Delete { .. } => \"delete\""));
+}
+
+#[test]
+fn adr036_synthetic_identity_still_not_sql_visible() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+
+	for source in [&planner, &binder] {
+		assert!(source.contains("STORAGE_SYNTHETIC_COLUMN_NAMES"));
+		assert!(source.contains("STORAGE_ROW_KEY_ID_COLUMN"));
+		assert!(source.contains("STORAGE_ROW_HLC_COLUMN"));
+	}
+}
+
+#[test]
+fn adr036_filter_helper_preserves_execution_plan_filter() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let helper =
+		brace_blocks_after_marker(&exec, "pub(crate) fn filter_batches_with_bound_predicate")
+			.into_iter()
+			.next()
+			.expect("filter_batches_with_bound_predicate body")
+			.1;
+	let execute_bound = brace_blocks_after_marker(&exec, "pub fn execute_bound")
+		.into_iter()
+		.next()
+		.expect("execute_bound body")
+		.1;
+
+	assert!(helper.contains("downcast_ref::<BooleanArray>()"));
+	assert!(helper.contains("{context} must return boolean"));
+	assert!(execute_bound.contains("filter_batches_with_bound_predicate("));
+	assert!(execute_bound.contains("\"filter predicate\""));
+	assert!(execute_bound.contains("FilterDisposition::FullyPushed"));
 }
 
 #[test]

@@ -18,8 +18,8 @@ use crate::exec::Executor;
 use crate::ir::{ColumnOrdinal, ExecutionPlan, LogicalPlan, MorselId};
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
 use crate::storage::{
-	DeleteRowsOutcome, DeleteRowsRequest, ScanStream, StorageDeleteRows, StorageWrite,
-	WriteOutcome, WriteRequest,
+	DeleteRowsOutcome, DeleteRowsRequest, RowIdentityProjection, ScanRequest, ScanStream,
+	StorageDeleteRows, StorageWrite, WriteOutcome, WriteRequest,
 };
 
 pub(crate) async fn materialize_scan_stream(
@@ -87,6 +87,12 @@ where
 		if matches!(bound, ExecutionPlan::CreateTableAsSelect { .. }) {
 			return Err(QueryError::Internal {
 				message: "distributed CREATE TABLE AS SELECT execution is not wired to a write-context-bearing coordinator"
+					.to_string(),
+			});
+		}
+		if matches!(bound, ExecutionPlan::Delete { .. }) {
+			return Err(QueryError::Internal {
+				message: "distributed DELETE execution is not wired to a write-context-bearing coordinator"
 					.to_string(),
 			});
 		}
@@ -164,7 +170,6 @@ pub struct QueryCoordinator {
 	executor: Executor,
 	config: PlannerConfig,
 	writer: Arc<dyn StorageWrite>,
-	#[allow(dead_code)]
 	deleter: Arc<dyn StorageDeleteRows>,
 }
 
@@ -227,6 +232,7 @@ impl QueryCoordinator {
 			LogicalPlan::Insert { .. }
 				| LogicalPlan::InsertSelect { .. }
 				| LogicalPlan::CreateTableAsSelect { .. }
+				| LogicalPlan::Delete { .. }
 		) {
 			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
 			return self.execute_write_plan(&bound).await;
@@ -350,6 +356,67 @@ impl QueryCoordinator {
 					})
 					.await?;
 				Ok(Vec::new())
+			}
+			ExecutionPlan::Delete {
+				legacy_table_id,
+				table,
+				fingerprint,
+				schema: _,
+				predicate,
+				pbc_program,
+				profile_hint,
+			} => {
+				let context = self.executor.context();
+				let scan_request = ScanRequest {
+					session_id: context.session_id,
+					query_id: context.query_id,
+					tenant_id: context.tenant_id,
+					table_id: *legacy_table_id,
+					table_object_id: *table,
+					physical_descriptor_fingerprint: *fingerprint,
+					read_bound: context.read_bound,
+					projected_columns: None,
+					pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
+					runtime_filter: None,
+					row_identity: RowIdentityProjection::Append,
+					profile_hint: Some(*profile_hint),
+					trace_context: context.trace_context.clone(),
+					morsel: None,
+				};
+				let row_key_ids = if let (Some(predicate), None) =
+					(predicate.as_ref(), pbc_program.as_ref())
+				{
+					let mut batches = delete::materialize_delete_candidate_batches(
+						self.executor.storage(),
+						scan_request,
+					)
+					.await?;
+					batches = self.executor.filter_batches_with_bound_predicate(
+						predicate,
+						batches,
+						"delete predicate",
+					)?;
+					delete::extract_delete_row_key_ids(&batches)?
+				} else {
+					delete::materialize_delete_row_key_ids(self.executor.storage(), scan_request)
+						.await?
+				};
+				let outcome = delete::execute_delete_with_candidates(
+					self.deleter.as_ref(),
+					DeleteRowsRequest {
+						session_id: context.session_id,
+						query_id: context.query_id,
+						tenant_id: context.tenant_id,
+						table_id: *legacy_table_id,
+						table_object_id: *table,
+						physical_descriptor_fingerprint: *fingerprint,
+						row_key_ids,
+						profile_hint: Some(*profile_hint),
+						trace_context: context.trace_context.clone(),
+					},
+				)
+				.await?;
+				Ok(vec![delete::delete_count_batch(outcome.deleted)?])
 			}
 			other => Err(QueryError::Internal {
 				message: format!("execute_write_plan called with non-DML plan: {other:?}"),

@@ -209,6 +209,15 @@ pub enum ExecutionPlan {
 		name: TableRef,
 		if_exists: bool,
 	},
+	Delete {
+		legacy_table_id: TableId,
+		table: TableObjectId,
+		fingerprint: PhysicalDescriptorFingerprint,
+		schema: SchemaRef,
+		predicate: Option<BoundExprProgram>,
+		pbc_program: Option<PbcProgram>,
+		profile_hint: QueryProfileHint,
+	},
 	Insert {
 		legacy_table_id: TableId,
 		table: TableObjectId,
@@ -239,10 +248,15 @@ impl ExecutionPlan {
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
 			Self::CreateTableAsSelect { .. } => Arc::new(Schema::empty()),
 			Self::DropTable { .. } => Arc::new(Schema::empty()),
+			Self::Delete { .. } => result_count_schema_int64("deleted"),
 			Self::Insert { .. } => Arc::new(Schema::empty()),
 			Self::InsertSelect { .. } => Arc::new(Schema::empty()),
 		}
 	}
+}
+
+fn result_count_schema_int64(name: &'static str) -> SchemaRef {
+	Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]))
 }
 
 impl BoundExprProgramBuilder {

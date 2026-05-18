@@ -1,24 +1,39 @@
-use arrow::array::{Array, FixedSizeBinaryArray};
-use arrow::datatypes::DataType;
+use std::sync::Arc;
+
+use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use wendelon::schema::{Identity, STORAGE_ROW_KEY_ID_COLUMN};
 
-use crate::error::StorageError;
+use crate::error::{ExecutionError, StorageError};
 use crate::storage::{
 	DeleteRowsOutcome, DeleteRowsRequest, RowIdentityProjection, ScanRequest, StorageDeleteRows,
 	StorageScan,
 };
 
-#[allow(dead_code)]
 pub(crate) async fn materialize_delete_row_key_ids(
 	storage: &dyn StorageScan,
 	scan_request: ScanRequest,
 ) -> Result<Vec<Identity>, StorageError> {
+	let batches = materialize_delete_candidate_batches(storage, scan_request).await?;
+	extract_delete_row_key_ids(&batches)
+}
+
+pub(crate) async fn materialize_delete_candidate_batches(
+	storage: &dyn StorageScan,
+	scan_request: ScanRequest,
+) -> Result<Vec<RecordBatch>, StorageError> {
 	if scan_request.row_identity != RowIdentityProjection::Append {
 		return Err(StorageError::Internal {
 			message: "delete candidate materializer requires row_identity=Append".to_string(),
 		});
 	}
-	let batches = super::materialize_scan_stream(storage.scan(scan_request).await?).await?;
+	super::materialize_scan_stream(storage.scan(scan_request).await?).await
+}
+
+pub(crate) fn extract_delete_row_key_ids(
+	batches: &[RecordBatch],
+) -> Result<Vec<Identity>, StorageError> {
 	let mut row_key_ids = Vec::new();
 	for batch in batches {
 		if batch.num_columns() == 0 {
@@ -69,7 +84,6 @@ pub(crate) async fn materialize_delete_row_key_ids(
 	Ok(row_key_ids)
 }
 
-#[allow(dead_code)]
 pub(crate) async fn execute_delete_with_candidates(
 	storage: &dyn StorageDeleteRows,
 	request: DeleteRowsRequest,
@@ -83,6 +97,19 @@ pub(crate) async fn execute_delete_with_candidates(
 		});
 	}
 	storage.delete_rows(request).await
+}
+
+pub(crate) fn delete_count_batch(count: usize) -> Result<RecordBatch, ExecutionError> {
+	let value = i64::try_from(count).map_err(|_| ExecutionError::Kernel {
+		message: format!("delete count {count} exceeds Int64 range"),
+	})?;
+	let schema = Arc::new(Schema::new(vec![Field::new(
+		"deleted",
+		DataType::Int64,
+		false,
+	)]));
+	let array = Arc::new(Int64Array::from(vec![value])) as ArrayRef;
+	RecordBatch::try_new(schema, vec![array]).map_err(ExecutionError::from)
 }
 
 #[cfg(test)]

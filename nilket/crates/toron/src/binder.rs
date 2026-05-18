@@ -216,6 +216,9 @@ impl<'a> Binder<'a> {
 					name: name.clone(),
 					if_exists: *if_exists,
 				}),
+				LogicalPlan::Delete { table, predicate } => {
+					self.bind_delete(table, predicate.as_ref()).await
+				}
 				LogicalPlan::Insert {
 					table,
 					columns,
@@ -246,6 +249,41 @@ impl<'a> Binder<'a> {
 			table: table.clone(),
 			schema,
 			source: Box::new(source),
+		})
+	}
+
+	async fn bind_delete(
+		&self,
+		table: &TableRef,
+		predicate: Option<&Expr>,
+	) -> Result<ExecutionPlan, BindingError> {
+		let binding = self.catalog.resolve_table(table).await?;
+		let bound_predicate = match predicate {
+			Some(expr) => {
+				let program =
+					bind_expr_program(std::slice::from_ref(expr), &binding.schema, self.config)?;
+				require_single_boolean_root(&program, "DELETE WHERE")?;
+				Some(program)
+			}
+			None => None,
+		};
+		let pbc_program = bound_predicate.as_ref().and_then(compile_pbc);
+		let profile_hint = match bound_predicate.as_ref() {
+			Some(program) => {
+				let scan = scan_plan(binding.clone(), None);
+				scan_profile_hint(program, &scan).unwrap_or(QueryProfileHint::Scan)
+			}
+			None => QueryProfileHint::Scan,
+		};
+
+		Ok(ExecutionPlan::Delete {
+			legacy_table_id: binding.legacy_table_id,
+			table: binding.table,
+			fingerprint: binding.fingerprint,
+			schema: binding.schema,
+			predicate: bound_predicate,
+			pbc_program,
+			profile_hint,
 		})
 	}
 
@@ -666,6 +704,32 @@ fn scan_profile_hint(
 	}
 }
 
+fn require_single_boolean_root(
+	program: &BoundExprProgram,
+	context: &'static str,
+) -> Result<(), BindingError> {
+	if program.root_count() != 1 {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"{context} predicate must have exactly one root, found {}",
+				program.root_count()
+			),
+		});
+	}
+	let Some(root_type) = program.root_type(0) else {
+		return Err(BindingError::TypeMismatch {
+			message: format!("{context} predicate root type is missing"),
+		});
+	};
+	if root_type == &DataType::Boolean {
+		Ok(())
+	} else {
+		Err(BindingError::TypeMismatch {
+			message: format!("{context} predicate must return Boolean, found {root_type:?}"),
+		})
+	}
+}
+
 fn apply_scan_profile_hint(plan: &mut ExecutionPlan, profile_hint: Option<QueryProfileHint>) {
 	if let Some(next_profile_hint) = profile_hint {
 		if let ExecutionPlan::Scan { profile_hint, .. } = plan {
@@ -816,6 +880,7 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 		LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => {}
 	}
@@ -966,6 +1031,7 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -1275,6 +1341,26 @@ fn optimize_for_required(
 		}
 		ExecutionPlan::DropTable { name, if_exists } => Ok((
 			ExecutionPlan::DropTable { name, if_exists },
+			OrdinalRemap::new(),
+		)),
+		ExecutionPlan::Delete {
+			legacy_table_id,
+			table,
+			fingerprint,
+			schema,
+			predicate,
+			pbc_program,
+			profile_hint,
+		} => Ok((
+			ExecutionPlan::Delete {
+				legacy_table_id,
+				table,
+				fingerprint,
+				schema,
+				predicate,
+				pbc_program,
+				profile_hint,
+			},
 			OrdinalRemap::new(),
 		)),
 		ExecutionPlan::Insert {

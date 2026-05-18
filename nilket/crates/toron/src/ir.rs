@@ -233,6 +233,10 @@ pub enum LogicalPlan {
 		name: TableRef,
 		if_exists: bool,
 	},
+	Delete {
+		table: TableRef,
+		predicate: Option<Expr>,
+	},
 	Insert {
 		table: TableRef,
 		columns: Option<Vec<String>>,

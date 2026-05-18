@@ -190,6 +190,30 @@ impl Executor {
 		&self.context
 	}
 
+	pub(crate) fn storage(&self) -> &dyn StorageScan {
+		self.storage.as_ref()
+	}
+
+	pub(crate) fn filter_batches_with_bound_predicate(
+		&self,
+		predicate: &BoundExprProgram,
+		batches: Vec<RecordBatch>,
+		context: &'static str,
+	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		let mut output = Vec::with_capacity(batches.len());
+		for batch in batches {
+			let mask = self.evaluate_bound_single_root(predicate, &batch, context)?;
+			let mask_bool = mask
+				.as_any()
+				.downcast_ref::<BooleanArray>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: format!("{context} must return boolean"),
+				})?;
+			output.push(filter_record_batch(&batch, mask_bool)?);
+		}
+		Ok(output)
+	}
+
 	#[cfg(test)]
 	fn legacy_scan_table_pin(&self, table: TableId) -> Result<ScanTablePin, ExecutionError> {
 		self.context
@@ -571,6 +595,9 @@ impl Executor {
 				LogicalPlan::DropTable { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound DROP TABLE execution",
 				}),
+				LogicalPlan::Delete { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound DELETE execution",
+				}),
 				LogicalPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound INSERT execution",
 				}),
@@ -628,19 +655,11 @@ impl Executor {
 						return Ok(input_batches);
 					}
 
-					let mut output = Vec::new();
-					for batch in input_batches {
-						let mask =
-							self.evaluate_bound_single_root(predicate, &batch, "filter predicate")?;
-						let mask_bool =
-							mask.as_any()
-								.downcast_ref::<BooleanArray>()
-								.ok_or_else(|| ExecutionError::InvalidExpression {
-									message: "filter predicate must return boolean".to_string(),
-								})?;
-						output.push(filter_record_batch(&batch, mask_bool)?);
-					}
-					Ok(output)
+					self.filter_batches_with_bound_predicate(
+						predicate,
+						input_batches,
+						"filter predicate",
+					)
 				}
 				ExecutionPlan::Project {
 					input,
@@ -734,6 +753,9 @@ impl Executor {
 				}),
 				ExecutionPlan::DropTable { .. } => Err(ExecutionError::NotImplemented {
 					feature: "DROP TABLE execution is coordinator-only",
+				}),
+				ExecutionPlan::Delete { .. } => Err(ExecutionError::NotImplemented {
+					feature: "DELETE execution is coordinator-only",
 				}),
 				ExecutionPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "INSERT execution is coordinator-only",
