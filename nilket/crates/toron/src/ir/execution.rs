@@ -7,7 +7,8 @@ use crate::catalog::TableRef;
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{AggregateFunction, JoinKind, JoinStrategy, ScalarValue};
 use crate::ir::{QueryProfileHint, TableId};
-use wendelon::schema::{PhysicalDescriptorFingerprint, TableObjectId};
+use crate::storage::RowIdentityProjection;
+use wendelon::schema::{PhysicalDescriptorFingerprint, STORAGE_ROW_KEY_ID_COLUMN, TableObjectId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ColumnOrdinal(pub u32);
@@ -18,7 +19,7 @@ pub struct ColumnName(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PbcProgram(pub Vec<u8>);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub u128);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,6 +156,7 @@ pub enum ExecutionPlan {
 		schema: SchemaRef,
 		projection: Option<Vec<ColumnOrdinal>>,
 		pbc_program: Option<PbcProgram>,
+		row_identity: RowIdentityProjection,
 		profile_hint: QueryProfileHint,
 		primary_key_columns: Vec<ColumnOrdinal>,
 	},
@@ -238,7 +240,11 @@ pub enum ExecutionPlan {
 impl ExecutionPlan {
 	pub fn schema(&self) -> SchemaRef {
 		match self {
-			Self::Scan { schema, .. } => schema.clone(),
+			Self::Scan {
+				schema,
+				row_identity,
+				..
+			} => scan_output_schema(schema, *row_identity),
 			Self::Filter { input, .. } => input.schema(),
 			Self::Project { output_schema, .. } => output_schema.clone(),
 			Self::Aggregate { output_schema, .. } => output_schema.clone(),
@@ -251,6 +257,25 @@ impl ExecutionPlan {
 			Self::Delete { .. } => result_count_schema_int64("deleted"),
 			Self::Insert { .. } => Arc::new(Schema::empty()),
 			Self::InsertSelect { .. } => Arc::new(Schema::empty()),
+		}
+	}
+}
+
+fn scan_output_schema(schema: &SchemaRef, row_identity: RowIdentityProjection) -> SchemaRef {
+	match row_identity {
+		RowIdentityProjection::None => schema.clone(),
+		RowIdentityProjection::Append => {
+			let mut fields = schema
+				.fields()
+				.iter()
+				.map(|field| field.as_ref().clone())
+				.collect::<Vec<_>>();
+			fields.push(Field::new(
+				STORAGE_ROW_KEY_ID_COLUMN,
+				DataType::FixedSizeBinary(32),
+				false,
+			));
+			Arc::new(Schema::new(fields))
 		}
 	}
 }

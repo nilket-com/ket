@@ -9,17 +9,18 @@ mod write;
 use crate::binder::{PlannerConfig, bind};
 use crate::catalog::Catalog;
 use crate::distributed::budget::{QueryBudget, TaskBudget};
+use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use crate::distributed::identity::QueryId;
 use crate::distributed::scheduler::{DistributedScheduler, SchedulerError};
 use crate::distributed::worker_registry::WorkerRegistry;
 use crate::error::{ExecutionError, QueryError, StorageError};
-use crate::exec::Executor;
-use crate::ir::{ColumnOrdinal, ExecutionPlan, LogicalPlan, MorselId};
+use crate::exec::{ExecutionContext, Executor};
+use crate::ir::{ColumnOrdinal, ExecutionPlan, FilterDisposition, LogicalPlan, MorselId};
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
 use crate::storage::{
-	DeleteRowsOutcome, DeleteRowsRequest, RowIdentityProjection, ScanRequest, ScanStream,
-	StorageDeleteRows, StorageWrite, WriteOutcome, WriteRequest,
+	DeleteRowsOutcome, DeleteRowsRequest, RowIdentityProjection, ScanStream, StorageDeleteRows,
+	StorageWrite, WriteOutcome, WriteRequest,
 };
 
 pub(crate) async fn materialize_scan_stream(
@@ -39,6 +40,9 @@ where
 	transport: Arc<Transport>,
 	config: PlannerConfig,
 	query_budget: QueryBudget,
+	context: ExecutionContext,
+	writer: Arc<dyn StorageWrite>,
+	deleter: Arc<dyn StorageDeleteRows>,
 }
 
 impl<Registry, Transport> DistributedQueryCoordinator<Registry, Transport>
@@ -54,6 +58,97 @@ where
 		config: PlannerConfig,
 		query_budget: QueryBudget,
 	) -> Self {
+		Self::with_context_writer_and_deleter(
+			catalog,
+			registry,
+			memory,
+			transport,
+			config,
+			query_budget,
+			default_distributed_execution_context(),
+			Arc::new(UnsupportedStorageWrite),
+			Arc::new(UnsupportedStorageDeleteRows),
+		)
+	}
+
+	pub fn with_context(
+		catalog: Arc<dyn Catalog>,
+		registry: Arc<Registry>,
+		memory: Arc<MemoryManager>,
+		transport: Arc<Transport>,
+		config: PlannerConfig,
+		query_budget: QueryBudget,
+		context: ExecutionContext,
+	) -> Self {
+		Self::with_context_writer_and_deleter(
+			catalog,
+			registry,
+			memory,
+			transport,
+			config,
+			query_budget,
+			context,
+			Arc::new(UnsupportedStorageWrite),
+			Arc::new(UnsupportedStorageDeleteRows),
+		)
+	}
+
+	pub fn with_writer(
+		catalog: Arc<dyn Catalog>,
+		registry: Arc<Registry>,
+		memory: Arc<MemoryManager>,
+		transport: Arc<Transport>,
+		config: PlannerConfig,
+		query_budget: QueryBudget,
+		writer: Arc<dyn StorageWrite>,
+	) -> Self {
+		Self::with_context_writer_and_deleter(
+			catalog,
+			registry,
+			memory,
+			transport,
+			config,
+			query_budget,
+			default_distributed_execution_context(),
+			writer,
+			Arc::new(UnsupportedStorageDeleteRows),
+		)
+	}
+
+	pub fn with_writer_and_deleter(
+		catalog: Arc<dyn Catalog>,
+		registry: Arc<Registry>,
+		memory: Arc<MemoryManager>,
+		transport: Arc<Transport>,
+		config: PlannerConfig,
+		query_budget: QueryBudget,
+		writer: Arc<dyn StorageWrite>,
+		deleter: Arc<dyn StorageDeleteRows>,
+	) -> Self {
+		Self::with_context_writer_and_deleter(
+			catalog,
+			registry,
+			memory,
+			transport,
+			config,
+			query_budget,
+			default_distributed_execution_context(),
+			writer,
+			deleter,
+		)
+	}
+
+	pub fn with_context_writer_and_deleter(
+		catalog: Arc<dyn Catalog>,
+		registry: Arc<Registry>,
+		memory: Arc<MemoryManager>,
+		transport: Arc<Transport>,
+		config: PlannerConfig,
+		query_budget: QueryBudget,
+		context: ExecutionContext,
+		writer: Arc<dyn StorageWrite>,
+		deleter: Arc<dyn StorageDeleteRows>,
+	) -> Self {
 		Self {
 			catalog,
 			registry,
@@ -61,6 +156,9 @@ where
 			transport,
 			config,
 			query_budget,
+			context,
+			writer,
+			deleter,
 		}
 	}
 
@@ -73,38 +171,43 @@ where
 			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
 		}
 		if matches!(bound, ExecutionPlan::Insert { .. }) {
-			return Err(QueryError::Internal {
-				message: "distributed INSERT execution is not wired to a write-context-bearing coordinator"
-					.to_string(),
-			});
+			let source_executor = DistributedMutationSourceExecutor { coordinator: self };
+			return execute_write_plan_with_source(
+				self.catalog.as_ref(),
+				self.writer.as_ref(),
+				self.deleter.as_ref(),
+				&self.context,
+				&source_executor,
+				&bound,
+			)
+			.await;
 		}
-		if matches!(bound, ExecutionPlan::InsertSelect { .. }) {
-			return Err(QueryError::Internal {
-				message: "distributed INSERT INTO ... SELECT execution is not wired to a write-context-bearing coordinator"
-					.to_string(),
-			});
-		}
-		if matches!(bound, ExecutionPlan::CreateTableAsSelect { .. }) {
-			return Err(QueryError::Internal {
-				message: "distributed CREATE TABLE AS SELECT execution is not wired to a write-context-bearing coordinator"
-					.to_string(),
-			});
-		}
-		if matches!(bound, ExecutionPlan::Delete { .. }) {
-			return Err(QueryError::Internal {
-				message: "distributed DELETE execution is not wired to a write-context-bearing coordinator"
-					.to_string(),
-			});
+		if matches!(
+			bound,
+			ExecutionPlan::InsertSelect { .. }
+				| ExecutionPlan::CreateTableAsSelect { .. }
+				| ExecutionPlan::Delete { .. }
+		) {
+			let source_executor = DistributedMutationSourceExecutor { coordinator: self };
+			return execute_write_plan_with_source(
+				self.catalog.as_ref(),
+				self.writer.as_ref(),
+				self.deleter.as_ref(),
+				&self.context,
+				&source_executor,
+				&bound,
+			)
+			.await;
 		}
 
-		let stages = fragment_plan(
-			bound,
-			FragmentPlanConfig::new(
-				QueryId::new(),
-				TaskBudget::from_query_budget(self.query_budget),
-			),
-		)
-		.map_err(fragment_error)?;
+		self.execute_bound_distributed(bound).await
+	}
+
+	async fn execute_bound_distributed(
+		&self,
+		bound: ExecutionPlan,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		let stages = fragment_plan(bound, self.fragment_config()).map_err(fragment_error)?;
 		let mut scheduler = DistributedScheduler::new(self.registry.clone());
 		let mut dispatcher =
 			NetworkTaskDispatcher::new(self.memory.clone(), self.transport.clone());
@@ -113,6 +216,14 @@ where
 			.await
 			.map_err(scheduler_error)?;
 		Ok(run.final_results)
+	}
+
+	fn fragment_config(&self) -> FragmentPlanConfig {
+		FragmentPlanConfig::new(
+			self.context.query_id,
+			TaskBudget::from_query_budget(self.query_budget),
+		)
+		.with_task_context(TaskExecutionContext::from_execution_context(&self.context))
 	}
 }
 
@@ -162,6 +273,250 @@ async fn execute_catalog_plan(
 		other => Err(QueryError::Internal {
 			message: format!("execute_catalog_plan called with non-DDL plan: {other:?}"),
 		}),
+	}
+}
+
+fn default_distributed_execution_context() -> ExecutionContext {
+	ExecutionContext::new(
+		crate::ir::SessionId(1),
+		QueryId::new(),
+		crate::storage::TenantId(1),
+		crate::storage::HlcBound(1),
+	)
+}
+
+#[async_trait::async_trait]
+trait MutationSourceExecutor: Sync {
+	async fn execute_read_plan(&self, plan: &ExecutionPlan)
+	-> Result<Vec<RecordBatch>, QueryError>;
+
+	async fn execute_delete_candidate_plan(
+		&self,
+		plan: &ExecutionPlan,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		self.execute_read_plan(plan).await
+	}
+}
+
+struct LocalMutationSourceExecutor<'a> {
+	executor: &'a Executor,
+}
+
+#[async_trait::async_trait]
+impl MutationSourceExecutor for LocalMutationSourceExecutor<'_> {
+	async fn execute_read_plan(
+		&self,
+		plan: &ExecutionPlan,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		self.executor
+			.execute_bound(plan, None)
+			.await
+			.map_err(QueryError::Execution)
+	}
+
+	async fn execute_delete_candidate_plan(
+		&self,
+		plan: &ExecutionPlan,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		let context = self.executor.context().clone().with_runtime_filter(None);
+		let executor = Executor::with_context(self.executor.storage_arc(), context);
+		executor
+			.execute_bound(plan, None)
+			.await
+			.map_err(QueryError::Execution)
+	}
+}
+
+struct DistributedMutationSourceExecutor<'a, Registry, Transport>
+where
+	Registry: WorkerRegistry + ?Sized,
+	Transport: ToronTransport + ?Sized,
+{
+	coordinator: &'a DistributedQueryCoordinator<Registry, Transport>,
+}
+
+#[async_trait::async_trait]
+impl<Registry, Transport> MutationSourceExecutor
+	for DistributedMutationSourceExecutor<'_, Registry, Transport>
+where
+	Registry: WorkerRegistry + ?Sized,
+	Transport: ToronTransport + ?Sized,
+{
+	async fn execute_read_plan(
+		&self,
+		plan: &ExecutionPlan,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		self.coordinator
+			.execute_bound_distributed(plan.clone())
+			.await
+	}
+}
+
+async fn execute_write_plan_with_source(
+	catalog: &dyn Catalog,
+	writer: &dyn StorageWrite,
+	deleter: &dyn StorageDeleteRows,
+	context: &ExecutionContext,
+	source_executor: &dyn MutationSourceExecutor,
+	bound: &ExecutionPlan,
+) -> Result<Vec<RecordBatch>, QueryError> {
+	match bound {
+		ExecutionPlan::Insert {
+			legacy_table_id,
+			table,
+			fingerprint,
+			schema,
+			rows,
+		} => {
+			let payload = write::materialize_insert_batch(schema, rows)?;
+			writer
+				.write(WriteRequest {
+					session_id: context.session_id,
+					query_id: context.query_id,
+					tenant_id: context.tenant_id,
+					table_id: *legacy_table_id,
+					table_object_id: *table,
+					physical_descriptor_fingerprint: *fingerprint,
+					payload,
+					profile_hint: context.profile_hint,
+					trace_context: context.trace_context,
+				})
+				.await?;
+			Ok(Vec::new())
+		}
+		ExecutionPlan::InsertSelect {
+			legacy_table_id,
+			table,
+			fingerprint,
+			schema,
+			target_columns,
+			source,
+		} => {
+			let source_batches = source_executor.execute_read_plan(source).await?;
+			let Some(payload) =
+				write::materialize_insert_select_batch(schema, target_columns, &source_batches)?
+			else {
+				return Ok(Vec::new());
+			};
+			writer
+				.write(WriteRequest {
+					session_id: context.session_id,
+					query_id: context.query_id,
+					tenant_id: context.tenant_id,
+					table_id: *legacy_table_id,
+					table_object_id: *table,
+					physical_descriptor_fingerprint: *fingerprint,
+					payload,
+					profile_hint: context.profile_hint,
+					trace_context: context.trace_context,
+				})
+				.await?;
+			Ok(Vec::new())
+		}
+		ExecutionPlan::CreateTableAsSelect {
+			table,
+			schema,
+			source,
+		} => {
+			let source_batches = source_executor.execute_read_plan(source).await?;
+			let binding = catalog.create_table(table, schema.clone(), false).await?;
+			let target_columns = (0..schema.fields().len())
+				.map(|index| ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow")))
+				.collect::<Vec<_>>();
+			let payload = match write::materialize_insert_select_batch(
+				schema,
+				&target_columns,
+				&source_batches,
+			)? {
+				Some(payload) => payload,
+				None => write::materialize_empty_record_batch(schema)?,
+			};
+			writer
+				.write(WriteRequest {
+					session_id: context.session_id,
+					query_id: context.query_id,
+					tenant_id: context.tenant_id,
+					table_id: binding.legacy_table_id,
+					table_object_id: binding.table,
+					physical_descriptor_fingerprint: binding.fingerprint,
+					payload,
+					profile_hint: context.profile_hint,
+					trace_context: context.trace_context,
+				})
+				.await?;
+			Ok(Vec::new())
+		}
+		ExecutionPlan::Delete {
+			legacy_table_id,
+			table,
+			fingerprint,
+			profile_hint,
+			..
+		} => {
+			let candidate_plan = derive_delete_candidate_plan(bound)?;
+			let candidate_batches = source_executor
+				.execute_delete_candidate_plan(&candidate_plan)
+				.await?;
+			let row_key_ids = delete::extract_delete_row_key_ids(&candidate_batches)?;
+			let outcome = delete::execute_delete_with_candidates(
+				deleter,
+				DeleteRowsRequest {
+					session_id: context.session_id,
+					query_id: context.query_id,
+					tenant_id: context.tenant_id,
+					table_id: *legacy_table_id,
+					table_object_id: *table,
+					physical_descriptor_fingerprint: *fingerprint,
+					row_key_ids,
+					profile_hint: Some(*profile_hint),
+					trace_context: context.trace_context,
+				},
+			)
+			.await?;
+			Ok(vec![delete::delete_count_batch(outcome.deleted)?])
+		}
+		other => Err(QueryError::Internal {
+			message: format!("execute_write_plan called with non-DML plan: {other:?}"),
+		}),
+	}
+}
+
+fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, QueryError> {
+	let ExecutionPlan::Delete {
+		legacy_table_id,
+		table,
+		fingerprint,
+		schema,
+		predicate,
+		pbc_program,
+		profile_hint,
+	} = bound
+	else {
+		return Err(QueryError::Internal {
+			message: format!("derive_delete_candidate_plan called with non-DELETE plan: {bound:?}"),
+		});
+	};
+
+	let scan = ExecutionPlan::Scan {
+		legacy_table_id: *legacy_table_id,
+		table: *table,
+		fingerprint: *fingerprint,
+		schema: schema.clone(),
+		projection: None,
+		pbc_program: pbc_program.clone(),
+		row_identity: RowIdentityProjection::Append,
+		profile_hint: *profile_hint,
+		primary_key_columns: Vec::new(),
+	};
+
+	if let (Some(predicate), None) = (predicate, pbc_program) {
+		Ok(ExecutionPlan::Filter {
+			input: Box::new(scan),
+			predicate: predicate.clone(),
+			disposition: FilterDisposition::EvaluateInToron,
+		})
+	} else {
+		Ok(scan)
 	}
 }
 
@@ -260,168 +615,18 @@ impl QueryCoordinator {
 		&self,
 		bound: &ExecutionPlan,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		match bound {
-			ExecutionPlan::Insert {
-				legacy_table_id,
-				table,
-				fingerprint,
-				schema,
-				rows,
-			} => {
-				let payload = write::materialize_insert_batch(schema, rows)?;
-				let context = self.executor.context();
-				self.writer
-					.write(WriteRequest {
-						session_id: context.session_id,
-						query_id: context.query_id,
-						tenant_id: context.tenant_id,
-						table_id: *legacy_table_id,
-						table_object_id: *table,
-						physical_descriptor_fingerprint: *fingerprint,
-						payload,
-						profile_hint: context.profile_hint,
-						trace_context: context.trace_context.clone(),
-					})
-					.await?;
-				Ok(Vec::new())
-			}
-			ExecutionPlan::InsertSelect {
-				legacy_table_id,
-				table,
-				fingerprint,
-				schema,
-				target_columns,
-				source,
-			} => {
-				let source_batches = self.executor.execute_bound(source, None).await?;
-				let Some(payload) = write::materialize_insert_select_batch(
-					schema,
-					target_columns,
-					&source_batches,
-				)?
-				else {
-					return Ok(Vec::new());
-				};
-				let context = self.executor.context();
-				self.writer
-					.write(WriteRequest {
-						session_id: context.session_id,
-						query_id: context.query_id,
-						tenant_id: context.tenant_id,
-						table_id: *legacy_table_id,
-						table_object_id: *table,
-						physical_descriptor_fingerprint: *fingerprint,
-						payload,
-						profile_hint: context.profile_hint,
-						trace_context: context.trace_context.clone(),
-					})
-					.await?;
-				Ok(Vec::new())
-			}
-			ExecutionPlan::CreateTableAsSelect {
-				table,
-				schema,
-				source,
-			} => {
-				let binding = self
-					.catalog
-					.create_table(table, schema.clone(), false)
-					.await?;
-				let source_batches = self.executor.execute_bound(source, None).await?;
-				let target_columns = (0..schema.fields().len())
-					.map(|index| {
-						ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow"))
-					})
-					.collect::<Vec<_>>();
-				let payload = match write::materialize_insert_select_batch(
-					schema,
-					&target_columns,
-					&source_batches,
-				)? {
-					Some(payload) => payload,
-					None => write::materialize_empty_record_batch(schema)?,
-				};
-				let context = self.executor.context();
-				self.writer
-					.write(WriteRequest {
-						session_id: context.session_id,
-						query_id: context.query_id,
-						tenant_id: context.tenant_id,
-						table_id: binding.legacy_table_id,
-						table_object_id: binding.table,
-						physical_descriptor_fingerprint: binding.fingerprint,
-						payload,
-						profile_hint: context.profile_hint,
-						trace_context: context.trace_context.clone(),
-					})
-					.await?;
-				Ok(Vec::new())
-			}
-			ExecutionPlan::Delete {
-				legacy_table_id,
-				table,
-				fingerprint,
-				schema: _,
-				predicate,
-				pbc_program,
-				profile_hint,
-			} => {
-				let context = self.executor.context();
-				let scan_request = ScanRequest {
-					session_id: context.session_id,
-					query_id: context.query_id,
-					tenant_id: context.tenant_id,
-					table_id: *legacy_table_id,
-					table_object_id: *table,
-					physical_descriptor_fingerprint: *fingerprint,
-					read_bound: context.read_bound,
-					projected_columns: None,
-					pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
-					runtime_filter: None,
-					row_identity: RowIdentityProjection::Append,
-					profile_hint: Some(*profile_hint),
-					trace_context: context.trace_context.clone(),
-					morsel: None,
-				};
-				let row_key_ids = if let (Some(predicate), None) =
-					(predicate.as_ref(), pbc_program.as_ref())
-				{
-					let mut batches = delete::materialize_delete_candidate_batches(
-						self.executor.storage(),
-						scan_request,
-					)
-					.await?;
-					batches = self.executor.filter_batches_with_bound_predicate(
-						predicate,
-						batches,
-						"delete predicate",
-					)?;
-					delete::extract_delete_row_key_ids(&batches)?
-				} else {
-					delete::materialize_delete_row_key_ids(self.executor.storage(), scan_request)
-						.await?
-				};
-				let outcome = delete::execute_delete_with_candidates(
-					self.deleter.as_ref(),
-					DeleteRowsRequest {
-						session_id: context.session_id,
-						query_id: context.query_id,
-						tenant_id: context.tenant_id,
-						table_id: *legacy_table_id,
-						table_object_id: *table,
-						physical_descriptor_fingerprint: *fingerprint,
-						row_key_ids,
-						profile_hint: Some(*profile_hint),
-						trace_context: context.trace_context.clone(),
-					},
-				)
-				.await?;
-				Ok(vec![delete::delete_count_batch(outcome.deleted)?])
-			}
-			other => Err(QueryError::Internal {
-				message: format!("execute_write_plan called with non-DML plan: {other:?}"),
-			}),
-		}
+		let source_executor = LocalMutationSourceExecutor {
+			executor: &self.executor,
+		};
+		execute_write_plan_with_source(
+			self.catalog.as_ref(),
+			self.writer.as_ref(),
+			self.deleter.as_ref(),
+			self.executor.context(),
+			&source_executor,
+			bound,
+		)
+		.await
 	}
 }
 

@@ -11,6 +11,7 @@ use crate::storage::{
 	StorageScan,
 };
 
+#[allow(dead_code)]
 pub(crate) async fn materialize_delete_row_key_ids(
 	storage: &dyn StorageScan,
 	scan_request: ScanRequest,
@@ -19,6 +20,7 @@ pub(crate) async fn materialize_delete_row_key_ids(
 	extract_delete_row_key_ids(&batches)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn materialize_delete_candidate_batches(
 	storage: &dyn StorageScan,
 	scan_request: ScanRequest,

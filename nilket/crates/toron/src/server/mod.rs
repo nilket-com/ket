@@ -133,10 +133,16 @@ impl ToronWorker {
 			task.counters.left_shuffle_bytes = shuffle_telemetry.left_shuffle_bytes;
 			task.counters.right_shuffle_bytes = shuffle_telemetry.right_shuffle_bytes;
 		});
-		let task_context = ExecutionContext::local_test()
-			.with_task_budget(spec.budget)
-			.with_task_telemetry(telemetry.clone())
-			.with_runtime_filter(scan_runtime_filter(spec));
+		let mut task_context = ExecutionContext::new(
+			spec.context.session_id,
+			spec.identity.query_id,
+			spec.context.tenant_id,
+			spec.context.read_bound,
+		)
+		.with_task_budget(spec.budget)
+		.with_task_telemetry(telemetry.clone())
+		.with_runtime_filter(scan_runtime_filter(spec));
+		task_context.trace_context = spec.context.trace_context;
 		let results = if overrides.is_empty() {
 			let executor = Executor::with_context(self.storage.clone(), task_context);
 			executor.execute_bound(&spec.plan, morsel).await?
@@ -824,6 +830,7 @@ mod tests {
 				AttemptId::first(),
 			),
 			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
 			plan,
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -869,6 +876,7 @@ mod tests {
 				AttemptId::first(),
 			),
 			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
 			plan: ExecutionPlan::Join {
 				left: Box::new(scan(TableId(1), 1)),
 				right: Box::new(scan(TableId(2), 2)),
@@ -958,6 +966,7 @@ mod tests {
 				AttemptId::first(),
 			),
 			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1019,6 +1028,7 @@ mod tests {
 			schema,
 			projection: None,
 			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		}

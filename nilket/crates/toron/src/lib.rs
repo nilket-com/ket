@@ -1484,6 +1484,7 @@ mod tests {
 				AttemptId::first(),
 			),
 			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
 			plan,
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,

@@ -3944,7 +3944,11 @@ mod tests {
 			56
 		);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, consistency), 88);
-		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad), 89);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, row_identity_projection),
+			89
+		);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad), 90);
 		assert_eq!(
 			std::mem::offset_of!(TableQueryRequestMeta, bytecode_len),
 			96

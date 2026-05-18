@@ -208,7 +208,7 @@ async fn coordinator_empty_candidate_set_short_circuits() {
 }
 
 #[tokio::test]
-async fn distributed_coordinator_rejects_delete() {
+async fn distributed_coordinator_delete_uses_distributed_candidate_path() {
 	let catalog = Arc::new(people_catalog().await);
 	let coordinator = DistributedQueryCoordinator::new(
 		catalog,
@@ -225,11 +225,15 @@ async fn distributed_coordinator_rejects_delete() {
 	let err = coordinator
 		.execute_query(&plan)
 		.await
-		.expect_err("distributed delete should reject");
+		.expect_err("distributed delete should request candidate workers");
 	assert!(
-		err.to_string()
-			.contains("distributed DELETE execution is not wired"),
+		err.to_string().contains("no live worker available"),
 		"unexpected error: {err}"
+	);
+	assert!(
+		!err.to_string()
+			.contains("distributed DELETE execution is not wired"),
+		"old coordinator reject should be lifted: {err}"
 	);
 }
 

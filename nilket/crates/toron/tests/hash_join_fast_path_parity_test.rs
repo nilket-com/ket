@@ -319,6 +319,7 @@ fn scan_plan(table_id: TableId, schema: SchemaRef, object_byte: u8) -> Execution
 		schema,
 		projection: None,
 		pbc_program: None,
+		row_identity: toron::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![ColumnOrdinal(0)],
 	}

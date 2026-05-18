@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::distributed::budget::{ByteCount, TaskBudget};
+use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::identity::{
 	AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId, TaskIdentity, WorkerId,
 };
@@ -128,6 +129,7 @@ pub struct ScanShare {
 pub struct TaskSpec {
 	pub identity: TaskIdentity,
 	pub partition: Option<PartitionId>,
+	pub context: TaskExecutionContext,
 	pub plan: ExecutionPlan,
 	pub inputs: Vec<TaskInputBinding>,
 	pub output: TaskOutputBinding,

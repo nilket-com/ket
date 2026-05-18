@@ -3,6 +3,7 @@ use thiserror::Error;
 use wendelon::schema::{PhysicalDescriptorFingerprint, TableObjectId};
 
 use crate::distributed::budget::TaskBudget;
+use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::identity::{
 	AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId, TaskIdentity,
 };
@@ -20,6 +21,7 @@ use crate::ir::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentPlanConfig {
 	pub query_id: QueryId,
+	pub task_context: TaskExecutionContext,
 	pub task_budget: TaskBudget,
 	pub worker_count: u32,
 	pub runtime_filters_enabled: bool,
@@ -29,10 +31,16 @@ impl FragmentPlanConfig {
 	pub const fn new(query_id: QueryId, task_budget: TaskBudget) -> Self {
 		Self {
 			query_id,
+			task_context: TaskExecutionContext::local_test(),
 			task_budget,
 			worker_count: 1,
 			runtime_filters_enabled: true,
 		}
+	}
+
+	pub const fn with_task_context(mut self, task_context: TaskExecutionContext) -> Self {
+		self.task_context = task_context;
+		self
 	}
 
 	pub const fn with_worker_count(mut self, worker_count: u32) -> Self {
@@ -136,6 +144,7 @@ pub fn fragment_plan(
 			AttemptId::first(),
 		),
 		partition: None,
+		context: config.task_context,
 		plan: ExecutionPlan::Exchange {
 			input: Box::new(boundary.input),
 			partition_count: boundary.partition_count,
@@ -165,6 +174,7 @@ pub fn fragment_plan(
 					AttemptId::first(),
 				),
 				partition: Some(partition_id),
+				context: config.task_context,
 				plan: consumer_plan.clone(),
 				inputs: vec![TaskInputBinding::ShuffleConsumer {
 					exchange_id,
@@ -285,6 +295,7 @@ fn fragment_hash_join_plan(
 					AttemptId::first(),
 				),
 				partition: Some(partition_id),
+				context: config.task_context,
 				plan: consumer_plan.clone(),
 				inputs: vec![
 					TaskInputBinding::ShuffleConsumer {
@@ -416,6 +427,7 @@ fn fragment_broadcast_join_plan(
 					AttemptId::first(),
 				),
 				partition: None,
+				context: config.task_context,
 				plan: consumer_plan.clone(),
 				inputs: vec![
 					TaskInputBinding::Scan {
@@ -476,6 +488,7 @@ fn producer_task(
 			AttemptId::first(),
 		),
 		partition: None,
+		context: config.task_context,
 		plan: ExecutionPlan::Exchange {
 			input: Box::new(boundary.input),
 			partition_count: boundary.partition_count,
@@ -507,6 +520,7 @@ fn single_task_stage(plan: ExecutionPlan, config: FragmentPlanConfig) -> StagePl
 				AttemptId::first(),
 			),
 			partition: None,
+			context: config.task_context,
 			plan,
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -747,6 +761,7 @@ fn fragment_terminal_sort_over_grouped_aggregate(
 					AttemptId::first(),
 				),
 				partition: Some(partition_id),
+				context: config.task_context,
 				plan: aggregate_plan.clone(),
 				inputs: vec![TaskInputBinding::ShuffleConsumer {
 					exchange_id: group_exchange_id,
@@ -816,6 +831,7 @@ fn terminal_sort_stage(
 				AttemptId::first(),
 			),
 			partition: Some(PartitionId::new(0)),
+			context: config.task_context,
 			plan: sort_plan,
 			inputs: vec![TaskInputBinding::ShuffleConsumer {
 				exchange_id,
@@ -993,6 +1009,7 @@ fn shuffle_input_scan(
 		schema,
 		projection: None,
 		pbc_program: None,
+		row_identity: crate::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: Vec::new(),
 	}
@@ -1506,6 +1523,7 @@ mod tests {
 			schema,
 			projection: None,
 			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		}
@@ -1545,6 +1563,7 @@ mod tests {
 			schema,
 			projection: None,
 			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		}

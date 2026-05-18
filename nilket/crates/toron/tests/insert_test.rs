@@ -786,7 +786,7 @@ async fn query_coordinator_default_writer_rejects_insert() {
 }
 
 #[tokio::test]
-async fn distributed_query_coordinator_rejects_insert_before_dispatch() {
+async fn distributed_query_coordinator_default_writer_rejects_insert_values() {
 	let catalog = Arc::new(people_catalog().await);
 	let coordinator = DistributedQueryCoordinator::new(
 		catalog,
@@ -803,17 +803,17 @@ async fn distributed_query_coordinator_rejects_insert_before_dispatch() {
 	let err = coordinator
 		.execute_query(&plan)
 		.await
-		.expect_err("distributed insert should reject");
+		.expect_err("distributed insert should reach writer boundary");
 
 	assert!(
 		err.to_string()
-			.contains("distributed INSERT execution is not wired"),
+			.contains("INSERT execution requires a configured StorageWrite"),
 		"unexpected error: {err}"
 	);
 }
 
 #[tokio::test]
-async fn distributed_query_coordinator_rejects_insert_select_before_dispatch() {
+async fn distributed_query_coordinator_insert_select_uses_distributed_source_path() {
 	let catalog = Arc::new(insert_select_catalog().await);
 	let coordinator = DistributedQueryCoordinator::new(
 		catalog,
@@ -830,12 +830,16 @@ async fn distributed_query_coordinator_rejects_insert_select_before_dispatch() {
 	let err = coordinator
 		.execute_query(&plan)
 		.await
-		.expect_err("distributed insert select should reject");
+		.expect_err("distributed insert select should request source workers");
 
 	assert!(
-		err.to_string()
-			.contains("distributed INSERT INTO ... SELECT execution is not wired"),
+		err.to_string().contains("no live worker available"),
 		"unexpected error: {err}"
+	);
+	assert!(
+		!err.to_string()
+			.contains("distributed INSERT INTO ... SELECT execution is not wired"),
+		"old coordinator reject should be lifted: {err}"
 	);
 }
 
@@ -1085,6 +1089,7 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 		schema: binding.schema.clone(),
 		projection: None,
 		pbc_program: None,
+		row_identity: toron::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![],
 	}

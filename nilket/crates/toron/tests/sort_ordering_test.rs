@@ -544,6 +544,7 @@ fn scan_with_schema(table_id: TableId, schema: SchemaRef, object_byte: u8) -> Ex
 		schema,
 		projection: None,
 		pbc_program: None,
+		row_identity: toron::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![ColumnOrdinal(0)],
 	}

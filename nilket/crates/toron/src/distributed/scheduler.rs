@@ -864,6 +864,7 @@ mod tests {
 				AttemptId::first(),
 			),
 			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
 			plan: ExecutionPlan::Scan {
 				legacy_table_id: crate::ir::TableId(1),
 				table: TableObjectId::new([1; 16]),
@@ -871,6 +872,7 @@ mod tests {
 				schema: Arc::new(Schema::empty()),
 				projection: None,
 				pbc_program: None,
+				row_identity: crate::storage::RowIdentityProjection::None,
 				profile_hint: crate::ir::QueryProfileHint::Scan,
 				primary_key_columns: Vec::new(),
 			},

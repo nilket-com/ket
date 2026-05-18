@@ -15,9 +15,7 @@ use crate::ir::{
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
-use crate::storage::{
-	HlcBound, RowIdentityProjection, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext,
-};
+use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
 	Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -190,8 +188,13 @@ impl Executor {
 		&self.context
 	}
 
+	#[allow(dead_code)]
 	pub(crate) fn storage(&self) -> &dyn StorageScan {
 		self.storage.as_ref()
+	}
+
+	pub(crate) fn storage_arc(&self) -> Arc<dyn StorageScan> {
+		self.storage.clone()
 	}
 
 	pub(crate) fn filter_batches_with_bound_predicate(
@@ -251,7 +254,7 @@ impl Executor {
 						projected_columns: None,
 						pbc_predicate: None,
 						runtime_filter: self.context.runtime_filter.clone(),
-						row_identity: RowIdentityProjection::None,
+						row_identity: crate::storage::RowIdentityProjection::None,
 						profile_hint: self.context.profile_hint,
 						trace_context: self.context.trace_context.clone(),
 						morsel,
@@ -623,6 +626,7 @@ impl Executor {
 					fingerprint,
 					projection,
 					pbc_program,
+					row_identity,
 					profile_hint,
 					..
 				} => {
@@ -637,7 +641,7 @@ impl Executor {
 						projected_columns: projection.clone(),
 						pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
 						runtime_filter: self.context.runtime_filter.clone(),
-						row_identity: RowIdentityProjection::None,
+						row_identity: *row_identity,
 						profile_hint: Some(*profile_hint),
 						trace_context: self.context.trace_context.clone(),
 						morsel,
@@ -4808,6 +4812,7 @@ mod tests {
 			schema: batch.schema(),
 			projection: None,
 			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		};
@@ -5791,6 +5796,7 @@ mod tests {
 			schema,
 			projection: None,
 			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		}

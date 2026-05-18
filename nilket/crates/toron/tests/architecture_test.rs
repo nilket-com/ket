@@ -2997,22 +2997,23 @@ fn adr030_local_coordinator_intercepts_insert_before_retry_loop() {
 }
 
 #[test]
-fn adr030_distributed_coordinator_rejects_insert_before_fragment_plan() {
+fn adr030_distributed_coordinator_routes_insert_before_fragment_plan() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
 	let distributed_impl = coordinator
 		.split("impl<Registry, Transport> DistributedQueryCoordinator")
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
-	let insert_reject = distributed_impl
+	let insert_route = distributed_impl
 		.find("ExecutionPlan::Insert")
-		.expect("distributed INSERT reject");
+		.expect("distributed INSERT route");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
 		.expect("fragment plan call");
 
-	assert!(insert_reject < fragment_call);
-	assert!(distributed_impl.contains("distributed INSERT execution is not wired"));
+	assert!(insert_route < fragment_call);
+	assert!(distributed_impl.contains("execute_write_plan_with_source"));
+	assert!(!distributed_impl.contains("distributed INSERT execution is not wired"));
 }
 
 #[test]
@@ -3247,29 +3248,41 @@ fn adr032_local_coordinator_intercepts_before_retry() {
 		.next()
 		.expect("execute_write_plan body")
 		.1;
-	assert!(execute_write.contains("ExecutionPlan::InsertSelect"));
-	assert!(execute_write.contains("self.executor.execute_bound(source, None).await?"));
-	assert!(execute_write.contains("materialize_insert_select_batch"));
-	assert!(execute_write.contains("write(WriteRequest"));
+	assert!(execute_write.contains("LocalMutationSourceExecutor"));
+	assert!(execute_write.contains("execute_write_plan_with_source"));
+
+	let shared_write =
+		brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+			.into_iter()
+			.next()
+			.expect("execute_write_plan_with_source body")
+			.1;
+	assert!(shared_write.contains("ExecutionPlan::InsertSelect"));
+	assert!(shared_write.contains("source_executor.execute_read_plan(source).await?"));
+	assert!(shared_write.contains("materialize_insert_select_batch"));
+	assert!(shared_write.contains("write(WriteRequest"));
 }
 
 #[test]
-fn adr032_distributed_coordinator_rejects_before_fragment() {
+fn adr032_distributed_coordinator_routes_before_fragment() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
 	let distributed_impl = coordinator
 		.split("impl<Registry, Transport> DistributedQueryCoordinator")
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
-	let insert_select_reject = distributed_impl
+	let insert_select_route = distributed_impl
 		.find("ExecutionPlan::InsertSelect")
-		.expect("distributed INSERT SELECT reject");
+		.expect("distributed INSERT SELECT route");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
 		.expect("fragment plan call");
 
-	assert!(insert_select_reject < fragment_call);
-	assert!(distributed_impl.contains("distributed INSERT INTO ... SELECT execution is not wired"));
+	assert!(insert_select_route < fragment_call);
+	assert!(distributed_impl.contains("execute_write_plan_with_source"));
+	assert!(
+		!distributed_impl.contains("distributed INSERT INTO ... SELECT execution is not wired")
+	);
 }
 
 #[test]
@@ -3633,18 +3646,15 @@ fn adr033_local_coordinator_intercepts_before_retry() {
 }
 
 #[test]
-fn adr033_coordinator_creates_table_before_source_execution() {
+fn adr033_coordinator_reads_source_before_create_table() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
-	let query_impl = coordinator
-		.split("impl QueryCoordinator")
-		.nth(1)
-		.expect("QueryCoordinator impl");
-	let execute_write = brace_blocks_after_marker(query_impl, "async fn execute_write_plan")
-		.into_iter()
-		.next()
-		.expect("execute_write_plan body")
-		.1;
+	let execute_write =
+		brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+			.into_iter()
+			.next()
+			.expect("execute_write_plan_with_source body")
+			.1;
 	let ctas_arm = execute_write
 		.split("ExecutionPlan::CreateTableAsSelect")
 		.nth(1)
@@ -3652,32 +3662,29 @@ fn adr033_coordinator_creates_table_before_source_execution() {
 		.expect("CTAS arm");
 	let create_table = ctas_arm.find(".create_table(").expect("create_table call");
 	let execute_source = ctas_arm
-		.find("execute_bound(source, None)")
+		.find("source_executor.execute_read_plan(source)")
 		.expect("source execution");
 
-	assert!(create_table < execute_source);
+	assert!(execute_source < create_table);
 }
 
 #[test]
 fn adr033_coordinator_uses_create_table_binding_for_write() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
-	let query_impl = coordinator
-		.split("impl QueryCoordinator")
-		.nth(1)
-		.expect("QueryCoordinator impl");
-	let execute_write = brace_blocks_after_marker(query_impl, "async fn execute_write_plan")
-		.into_iter()
-		.next()
-		.expect("execute_write_plan body")
-		.1;
+	let execute_write =
+		brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+			.into_iter()
+			.next()
+			.expect("execute_write_plan_with_source body")
+			.1;
 	let ctas_arm = execute_write
 		.split("ExecutionPlan::CreateTableAsSelect")
 		.nth(1)
 		.and_then(|rest| rest.split("other =>").next())
 		.expect("CTAS arm");
 
-	assert!(ctas_arm.contains("let binding = self"));
+	assert!(ctas_arm.contains("let binding = catalog.create_table"));
 	assert!(ctas_arm.contains("table_id: binding.legacy_table_id"));
 	assert!(ctas_arm.contains("table_object_id: binding.table"));
 	assert!(ctas_arm.contains("physical_descriptor_fingerprint: binding.fingerprint"));
@@ -3687,15 +3694,12 @@ fn adr033_coordinator_uses_create_table_binding_for_write() {
 fn adr033_empty_source_ctas_writes_zero_row_batch() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
-	let query_impl = coordinator
-		.split("impl QueryCoordinator")
-		.nth(1)
-		.expect("QueryCoordinator impl");
-	let execute_write = brace_blocks_after_marker(query_impl, "async fn execute_write_plan")
-		.into_iter()
-		.next()
-		.expect("execute_write_plan body")
-		.1;
+	let execute_write =
+		brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+			.into_iter()
+			.next()
+			.expect("execute_write_plan_with_source body")
+			.1;
 	let ctas_arm = execute_write
 		.split("ExecutionPlan::CreateTableAsSelect")
 		.nth(1)
@@ -3719,22 +3723,25 @@ fn adr033_empty_source_ctas_writes_zero_row_batch() {
 }
 
 #[test]
-fn adr033_distributed_coordinator_rejects_before_fragment() {
+fn adr033_distributed_coordinator_routes_before_fragment() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
 	let distributed_impl = coordinator
 		.split("impl<Registry, Transport> DistributedQueryCoordinator")
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
-	let ctas_reject = distributed_impl
+	let ctas_route = distributed_impl
 		.find("ExecutionPlan::CreateTableAsSelect")
-		.expect("distributed CTAS reject");
+		.expect("distributed CTAS route");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
 		.expect("fragmenter call");
 
-	assert!(ctas_reject < fragment_call);
-	assert!(distributed_impl.contains("distributed CREATE TABLE AS SELECT execution is not wired"));
+	assert!(ctas_route < fragment_call);
+	assert!(distributed_impl.contains("execute_write_plan_with_source"));
+	assert!(
+		!distributed_impl.contains("distributed CREATE TABLE AS SELECT execution is not wired")
+	);
 }
 
 #[test]
@@ -4534,60 +4541,68 @@ fn adr036_binder_delete_allows_residual_predicates() {
 fn adr036_delete_candidate_scan_uses_append_only() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
-	let execute_write = coordinator
-		.split("async fn execute_write_plan")
-		.nth(1)
-		.expect("execute_write_plan body");
-	let delete_arm = execute_write
-		.split("ExecutionPlan::Delete {")
-		.nth(1)
-		.and_then(|rest| rest.split("other => Err").next())
-		.expect("ExecutionPlan::Delete write arm");
+	let delete_candidate =
+		brace_blocks_after_marker(&coordinator, "fn derive_delete_candidate_plan")
+			.into_iter()
+			.next()
+			.expect("derive_delete_candidate_plan body")
+			.1;
 
-	assert!(delete_arm.contains("projected_columns: None"));
-	assert!(delete_arm.contains("row_identity: RowIdentityProjection::Append"));
+	assert!(delete_candidate.contains("projection: None"));
+	assert!(delete_candidate.contains("row_identity: RowIdentityProjection::Append"));
 }
 
 #[test]
 fn adr036_delete_candidate_scan_uses_no_runtime_filter() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
-	let execute_write = coordinator
-		.split("async fn execute_write_plan")
-		.nth(1)
-		.expect("execute_write_plan body");
-	let delete_arm = execute_write
-		.split("ExecutionPlan::Delete {")
-		.nth(1)
-		.and_then(|rest| rest.split("other => Err").next())
-		.expect("ExecutionPlan::Delete write arm");
+	let local_source = brace_blocks_after_marker(
+		&coordinator,
+		"impl MutationSourceExecutor for LocalMutationSourceExecutor",
+	)
+	.into_iter()
+	.next()
+	.expect("local mutation source executor body")
+	.1;
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let single_task = brace_blocks_after_marker(&fragmenter, "fn single_task_stage")
+		.into_iter()
+		.next()
+		.expect("single_task_stage body")
+		.1;
 
-	assert!(delete_arm.contains("runtime_filter: None"));
-	assert!(!delete_arm.contains("self.context.runtime_filter"));
-	assert!(!delete_arm.contains("context.runtime_filter"));
+	assert!(local_source.contains("with_runtime_filter(None)"));
+	assert!(single_task.contains("runtime_filter: None"));
+	assert!(!local_source.contains("self.context.runtime_filter"));
+	assert!(!local_source.contains("spec.context.runtime_filter"));
 }
 
 #[test]
 fn adr036_delete_residual_filter_before_identity_extraction() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
-	let execute_write = coordinator
-		.split("async fn execute_write_plan")
-		.nth(1)
-		.expect("execute_write_plan body");
-	let delete_arm = execute_write
-		.split("ExecutionPlan::Delete {")
-		.nth(1)
-		.and_then(|rest| rest.split("other => Err").next())
-		.expect("ExecutionPlan::Delete write arm");
-	let filter = delete_arm
-		.find("filter_batches_with_bound_predicate")
-		.expect("residual filter call");
-	let extract = delete_arm
+	let delete_candidate =
+		brace_blocks_after_marker(&coordinator, "fn derive_delete_candidate_plan")
+			.into_iter()
+			.next()
+			.expect("derive_delete_candidate_plan body")
+			.1;
+	let shared_write =
+		brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+			.into_iter()
+			.next()
+			.expect("execute_write_plan_with_source body")
+			.1;
+	let candidate_execution = shared_write
+		.find("execute_delete_candidate_plan")
+		.expect("candidate plan execution");
+	let extract = shared_write
 		.find("extract_delete_row_key_ids")
 		.expect("identity extraction call");
 
-	assert!(filter < extract);
+	assert!(delete_candidate.contains("FilterDisposition::EvaluateInToron"));
+	assert!(candidate_execution < extract);
 }
 
 #[test]
@@ -4657,22 +4672,23 @@ fn adr036_delete_result_uses_deleted_only() {
 }
 
 #[test]
-fn adr036_distributed_delete_rejected_before_fragment() {
+fn adr036_distributed_delete_routes_before_fragment() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
 	let distributed_impl = coordinator
 		.split("impl<Registry, Transport> DistributedQueryCoordinator")
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
-	let delete_reject = distributed_impl
+	let delete_route = distributed_impl
 		.find("ExecutionPlan::Delete")
-		.expect("distributed DELETE reject");
+		.expect("distributed DELETE route");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
 		.expect("fragment_plan call");
 
-	assert!(delete_reject < fragment_call);
-	assert!(distributed_impl.contains("distributed DELETE execution is not wired"));
+	assert!(delete_route < fragment_call);
+	assert!(distributed_impl.contains("execute_write_plan_with_source"));
+	assert!(!distributed_impl.contains("distributed DELETE execution is not wired"));
 }
 
 #[test]
@@ -4750,6 +4766,470 @@ fn adr036_filter_helper_preserves_execution_plan_filter() {
 	assert!(execute_bound.contains("filter_batches_with_bound_predicate("));
 	assert!(execute_bound.contains("\"filter predicate\""));
 	assert!(execute_bound.contains("FilterDisposition::FullyPushed"));
+}
+
+#[test]
+fn adr037_task_execution_context_has_exact_field_set() {
+	let context = std::fs::read_to_string(manifest_dir().join("src/distributed/context.rs"))
+		.expect("read distributed context source");
+	let task_context = brace_blocks_after_marker(&context, "pub struct TaskExecutionContext")
+		.into_iter()
+		.next()
+		.expect("TaskExecutionContext body")
+		.1;
+
+	for field in [
+		"pub session_id: SessionId",
+		"pub tenant_id: TenantId",
+		"pub read_bound: HlcBound",
+		"pub trace_context: Option<TraceContext>",
+	] {
+		assert!(task_context.contains(field), "missing {field}");
+	}
+	for forbidden in [
+		"query_id",
+		"profile_hint",
+		"runtime_filter",
+		"row_identity",
+		"task_budget",
+		"task_telemetry",
+		"legacy_table_pins",
+		"join_spill",
+	] {
+		assert!(
+			!task_context.contains(forbidden),
+			"TaskExecutionContext must not carry {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr037_task_spec_carries_task_execution_context() {
+	let task =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/task.rs")).expect("task");
+	let task_spec = brace_blocks_after_marker(&task, "pub struct TaskSpec")
+		.into_iter()
+		.next()
+		.expect("TaskSpec body")
+		.1;
+
+	assert!(task.contains("use crate::distributed::context::TaskExecutionContext;"));
+	assert!(task_spec.contains("pub context: TaskExecutionContext"));
+}
+
+#[test]
+fn adr037_distributed_context_module_is_wired() {
+	let module =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/mod.rs")).expect("mod");
+
+	assert!(module.contains("pub mod context;"));
+}
+
+#[test]
+fn adr037_fragment_config_carries_task_context() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("fragmenter");
+	let config = brace_blocks_after_marker(&fragmenter, "pub struct FragmentPlanConfig")
+		.into_iter()
+		.next()
+		.expect("FragmentPlanConfig body")
+		.1;
+
+	assert!(config.contains("pub task_context: TaskExecutionContext"));
+	assert!(fragmenter.contains("pub const fn with_task_context"));
+}
+
+#[test]
+fn adr037_fragmenter_stamps_every_task_spec_with_context() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("fragmenter");
+	let task_specs = fragmenter.matches("TaskSpec {").count();
+	let stamped = fragmenter.matches("context: config.task_context").count();
+
+	assert!(task_specs > 0, "fragmenter should emit TaskSpec literals");
+	assert_eq!(
+		stamped, task_specs,
+		"every fragment TaskSpec must be stamped"
+	);
+}
+
+#[test]
+fn adr037_worker_context_comes_from_task_spec_not_local_test() {
+	let server = std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("server");
+	let execute_task =
+		brace_blocks_after_marker(&server, "async fn execute_task_local_with_telemetry")
+			.into_iter()
+			.next()
+			.expect("execute_task_local_with_telemetry body")
+			.1;
+
+	assert!(execute_task.contains("ExecutionContext::new("));
+	assert!(execute_task.contains("spec.context.session_id"));
+	assert!(execute_task.contains("spec.identity.query_id"));
+	assert!(execute_task.contains("spec.context.tenant_id"));
+	assert!(execute_task.contains("spec.context.read_bound"));
+	assert!(execute_task.contains("task_context.trace_context = spec.context.trace_context"));
+	assert!(!execute_task.contains("ExecutionContext::local_test()"));
+}
+
+#[test]
+fn adr037_task_context_derives_from_execution_context_without_query_id() {
+	let context = std::fs::read_to_string(manifest_dir().join("src/distributed/context.rs"))
+		.expect("distributed context");
+	let from_execution = brace_blocks_after_marker(&context, "pub fn from_execution_context")
+		.into_iter()
+		.next()
+		.expect("from_execution_context body")
+		.1;
+
+	assert!(from_execution.contains("context.session_id"));
+	assert!(from_execution.contains("context.tenant_id"));
+	assert!(from_execution.contains("context.read_bound"));
+	assert!(from_execution.contains("context.trace_context"));
+	assert!(!from_execution.contains("context.query_id"));
+}
+
+#[test]
+fn adr037_distributed_coordinator_is_context_and_sink_bearing() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let struct_body =
+		brace_blocks_after_marker(&coordinator, "pub struct DistributedQueryCoordinator")
+			.into_iter()
+			.next()
+			.expect("DistributedQueryCoordinator body")
+			.1;
+
+	assert!(struct_body.contains("context: ExecutionContext"));
+	assert!(struct_body.contains("writer: Arc<dyn StorageWrite>"));
+	assert!(struct_body.contains("deleter: Arc<dyn StorageDeleteRows>"));
+}
+
+#[test]
+fn adr037_distributed_coordinator_exposes_write_sink_constructors() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+
+	assert!(coordinator.contains("pub fn with_context("));
+	assert!(coordinator.contains("pub fn with_writer("));
+	assert!(coordinator.contains("pub fn with_writer_and_deleter("));
+	assert!(coordinator.contains("pub fn with_context_writer_and_deleter("));
+}
+
+#[test]
+fn adr037_distributed_dml_routes_to_shared_driver() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let execute_query = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
+		.into_iter()
+		.find(|(_, block)| block.contains("DistributedMutationSourceExecutor"))
+		.expect("distributed execute_query body")
+		.1;
+
+	for variant in [
+		"ExecutionPlan::Insert",
+		"ExecutionPlan::InsertSelect",
+		"ExecutionPlan::CreateTableAsSelect",
+		"ExecutionPlan::Delete",
+	] {
+		assert!(execute_query.contains(variant), "missing {variant}");
+	}
+	assert!(execute_query.contains("DistributedMutationSourceExecutor"));
+	assert!(execute_query.contains("execute_write_plan_with_source"));
+}
+
+#[test]
+fn adr037_distributed_read_executor_wraps_fragment_scheduler() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let distributed_source = brace_blocks_after_marker(
+		&coordinator,
+		"impl<Registry, Transport> MutationSourceExecutor",
+	)
+	.into_iter()
+	.next()
+	.expect("distributed source executor body")
+	.1;
+
+	assert!(distributed_source.contains("execute_bound_distributed(plan.clone())"));
+	assert!(distributed_source.contains(".await"));
+}
+
+#[test]
+fn adr037_distributed_fragment_config_uses_execution_context() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let fragment_config = brace_blocks_after_marker(&coordinator, "fn fragment_config")
+		.into_iter()
+		.next()
+		.expect("fragment_config body")
+		.1;
+
+	assert!(fragment_config.contains("self.context.query_id"));
+	assert!(fragment_config.contains("TaskExecutionContext::from_execution_context"));
+	assert!(fragment_config.contains("TaskBudget::from_query_budget(self.query_budget)"));
+}
+
+#[test]
+fn adr037_mutation_source_executor_is_async_trait() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+
+	assert!(coordinator.contains("#[async_trait::async_trait]\ntrait MutationSourceExecutor"));
+	assert!(coordinator.contains("async fn execute_read_plan"));
+	assert!(coordinator.contains("async fn execute_delete_candidate_plan"));
+}
+
+#[test]
+fn adr037_local_mutation_source_wraps_executor() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let local_source = brace_blocks_after_marker(
+		&coordinator,
+		"impl MutationSourceExecutor for LocalMutationSourceExecutor",
+	)
+	.into_iter()
+	.next()
+	.expect("local source executor body")
+	.1;
+
+	assert!(local_source.contains("self.executor"));
+	assert!(local_source.contains("execute_bound(plan, None)"));
+}
+
+#[test]
+fn adr037_local_delete_candidate_execution_clears_runtime_filter() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let local_source = brace_blocks_after_marker(
+		&coordinator,
+		"impl MutationSourceExecutor for LocalMutationSourceExecutor",
+	)
+	.into_iter()
+	.next()
+	.expect("local source executor body")
+	.1;
+
+	assert!(local_source.contains("with_runtime_filter(None)"));
+	assert!(!local_source.contains("spec.context.runtime_filter"));
+}
+
+#[test]
+fn adr037_shared_driver_handles_all_mutation_variants() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let shared = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+		.into_iter()
+		.next()
+		.expect("shared mutation driver body")
+		.1;
+
+	for variant in [
+		"ExecutionPlan::Insert",
+		"ExecutionPlan::InsertSelect",
+		"ExecutionPlan::CreateTableAsSelect",
+		"ExecutionPlan::Delete",
+	] {
+		assert!(shared.contains(variant), "missing {variant}");
+	}
+}
+
+#[test]
+fn adr037_insert_values_does_not_execute_source_plan() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let shared = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+		.into_iter()
+		.next()
+		.expect("shared mutation driver body")
+		.1;
+	let insert_arm = shared
+		.split("ExecutionPlan::Insert {")
+		.nth(1)
+		.and_then(|rest| rest.split("ExecutionPlan::InsertSelect").next())
+		.expect("insert values arm");
+
+	assert!(insert_arm.contains("materialize_insert_batch"));
+	assert!(insert_arm.contains("write(WriteRequest"));
+	assert!(!insert_arm.contains("execute_read_plan"));
+	assert!(!insert_arm.contains("fragment_plan"));
+}
+
+#[test]
+fn adr037_ctas_reads_source_before_catalog_create() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let shared = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+		.into_iter()
+		.next()
+		.expect("shared mutation driver body")
+		.1;
+	let ctas_arm = shared
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
+		.expect("CTAS arm");
+	let read = ctas_arm
+		.find("source_executor.execute_read_plan(source)")
+		.expect("source read");
+	let create = ctas_arm
+		.find("catalog.create_table")
+		.expect("catalog create");
+
+	assert!(read < create);
+}
+
+#[test]
+fn adr037_delete_candidate_plan_sets_row_identity_append() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let derive = brace_blocks_after_marker(&coordinator, "fn derive_delete_candidate_plan")
+		.into_iter()
+		.next()
+		.expect("delete candidate builder")
+		.1;
+
+	assert!(derive.contains("ExecutionPlan::Scan"));
+	assert!(derive.contains("projection: None"));
+	assert!(derive.contains("row_identity: RowIdentityProjection::Append"));
+}
+
+#[test]
+fn adr037_delete_candidate_plan_wraps_residual_filter() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let derive = brace_blocks_after_marker(&coordinator, "fn derive_delete_candidate_plan")
+		.into_iter()
+		.next()
+		.expect("delete candidate builder")
+		.1;
+
+	assert!(derive.contains("if let (Some(predicate), None)"));
+	assert!(derive.contains("ExecutionPlan::Filter"));
+	assert!(derive.contains("FilterDisposition::EvaluateInToron"));
+}
+
+#[test]
+fn adr037_execution_scan_carries_row_identity_field() {
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("execution ir");
+	let scan = brace_blocks_after_marker(&execution, "Scan {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::Scan body")
+		.1;
+
+	assert!(scan.contains("row_identity: RowIdentityProjection"));
+}
+
+#[test]
+fn adr037_scan_schema_appends_identity_only_when_requested() {
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("execution ir");
+	let helper = brace_blocks_after_marker(&execution, "fn scan_output_schema")
+		.into_iter()
+		.next()
+		.expect("scan_output_schema body")
+		.1;
+
+	assert!(helper.contains("RowIdentityProjection::None => schema.clone()"));
+	assert!(helper.contains("RowIdentityProjection::Append"));
+	assert!(helper.contains("STORAGE_ROW_KEY_ID_COLUMN"));
+	assert!(helper.contains("DataType::FixedSizeBinary(32)"));
+}
+
+#[test]
+fn adr037_binder_default_scans_use_no_row_identity() {
+	let binder = std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("binder");
+	let scan_plan = brace_blocks_after_marker(&binder, "fn scan_plan")
+		.into_iter()
+		.next()
+		.expect("scan_plan body")
+		.1;
+
+	assert!(scan_plan.contains("row_identity: crate::storage::RowIdentityProjection::None"));
+}
+
+#[test]
+fn adr037_executor_threads_scan_row_identity_to_storage() {
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("exec");
+	let execute_bound = brace_blocks_after_marker(&exec, "pub fn execute_bound")
+		.into_iter()
+		.next()
+		.expect("execute_bound body")
+		.1;
+
+	assert!(execute_bound.contains("row_identity,"));
+	assert!(execute_bound.contains("row_identity: *row_identity"));
+}
+
+#[test]
+fn adr037_shuffle_input_scans_do_not_request_row_identity() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("fragmenter");
+	let shuffle_scan = brace_blocks_after_marker(&fragmenter, "fn shuffle_input_scan")
+		.into_iter()
+		.next()
+		.expect("shuffle_input_scan body")
+		.1;
+
+	assert!(shuffle_scan.contains("row_identity: crate::storage::RowIdentityProjection::None"));
+}
+
+#[test]
+fn adr037_fragmenter_still_rejects_raw_mutation_plans() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("fragmenter");
+	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
+		.into_iter()
+		.next()
+		.expect("fragment_plan body")
+		.1;
+
+	for variant in [
+		"ExecutionPlan::CreateTable",
+		"ExecutionPlan::DropTable",
+		"ExecutionPlan::Delete",
+		"ExecutionPlan::Insert",
+		"ExecutionPlan::InsertSelect",
+		"ExecutionPlan::CreateTableAsSelect",
+	] {
+		assert!(fragment_plan.contains(variant), "missing {variant}");
+	}
+}
+
+#[test]
+fn adr037_old_distributed_dml_reject_strings_are_removed() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+
+	for removed in [
+		"distributed INSERT execution is not wired",
+		"distributed INSERT INTO ... SELECT execution is not wired",
+		"distributed CREATE TABLE AS SELECT execution is not wired",
+		"distributed DELETE execution is not wired",
+	] {
+		assert!(
+			!coordinator.contains(removed),
+			"old reject remains: {removed}"
+		);
+	}
+}
+
+#[test]
+fn adr037_functional_fixtures_cover_distributed_write_context() {
+	let fixture =
+		std::fs::read_to_string(manifest_dir().join("tests/distributed_write_context_test.rs"))
+			.expect("distributed write context test");
+
+	for fixture_name in [
+		"distributed_insert_values_writes_without_dispatch",
+		"distributed_insert_select_fragments_source_and_writes_once",
+		"distributed_ctas_fragments_source_then_creates_and_writes",
+		"distributed_delete_fragments_candidate_read_and_deletes_once",
+	] {
+		assert!(fixture.contains(fixture_name), "missing {fixture_name}");
+	}
 }
 
 #[test]
@@ -4957,8 +5437,9 @@ fn adr035_select_scan_uses_row_identity_none() {
 	);
 	for (line, block) in scan_requests {
 		assert!(
-			block.contains("row_identity: RowIdentityProjection::None"),
-			"ADR 035 ScanRequest at exec.rs:{line} must set row_identity None"
+			block.contains("RowIdentityProjection::None")
+				|| block.contains("row_identity: *row_identity"),
+			"ADR 035/037 ScanRequest at exec.rs:{line} must set row_identity explicitly"
 		);
 	}
 }

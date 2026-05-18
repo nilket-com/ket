@@ -329,7 +329,7 @@ async fn query_coordinator_ctas_write_failure_leaves_catalog_entry_without_stora
 }
 
 #[tokio::test]
-async fn distributed_coordinator_rejects_ctas_before_dispatch() {
+async fn distributed_coordinator_ctas_uses_distributed_source_path() {
 	let catalog = Arc::new(people_catalog().await);
 	let coordinator = DistributedQueryCoordinator::new(
 		catalog,
@@ -346,12 +346,16 @@ async fn distributed_coordinator_rejects_ctas_before_dispatch() {
 	let err = coordinator
 		.execute_query(&plan)
 		.await
-		.expect_err("distributed CTAS should reject");
+		.expect_err("distributed CTAS should request source workers");
 
 	assert!(
-		err.to_string()
-			.contains("distributed CREATE TABLE AS SELECT execution is not wired"),
+		err.to_string().contains("no live worker available"),
 		"unexpected error: {err}"
+	);
+	assert!(
+		!err.to_string()
+			.contains("distributed CREATE TABLE AS SELECT execution is not wired"),
+		"old coordinator reject should be lifted: {err}"
 	);
 }
 
@@ -479,6 +483,7 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 		schema: binding.schema.clone(),
 		projection: None,
 		pbc_program: None,
+		row_identity: toron::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![],
 	}

@@ -674,6 +674,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		schema: binding.schema,
 		projection,
 		pbc_program: None,
+		row_identity: crate::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: sorted_columns(&binding.primary_key_columns),
 	}
@@ -1115,6 +1116,7 @@ fn optimize_for_required(
 			schema,
 			projection: _,
 			pbc_program,
+			row_identity,
 			profile_hint,
 			primary_key_columns,
 		} => {
@@ -1136,6 +1138,7 @@ fn optimize_for_required(
 					schema,
 					projection: Some(requested),
 					pbc_program,
+					row_identity,
 					profile_hint,
 					primary_key_columns,
 				},
