@@ -3360,6 +3360,165 @@ along with the forward-sequence rewrite.
   unmodified).
   The ten-phase migration is materialized in
   `plans/impl/044_authenticated_remote_toron_quic_listeners.md`.
+- **ADR 045 — Toron Daemon Observability Listeners.**
+  Promoted. **First pure-composition ADR over ADR
+  044's TLS policy substrate.** Four council
+  iterations on a composition-class topic: iter-0
+  topic-shape survey (Shape A composition selected
+  over Shapes B refactor-only `tls-pki`
+  extraction, C multi-tenant routing, D `inspect`
+  wiring, E live cert rotation); iter-1 Claude
+  three retractions after code audit of Wendelon's
+  observability handlers — R1 committed to
+  hand-rolled HTTP/1.1 over `tokio_rustls` (no
+  hyper / axum / actix), R2 `/health` body
+  `"OK\n"` → `"ok\n"` byte-identical with
+  Wendelon, R3 metric scrape counting narrowed to
+  `/metrics` only while keeping metric names
+  brand-clean; iter-2 D-set / guards /
+  fixtures locked with three preemptive
+  sharpenings (D1 port-collision validation, D4
+  HTTP method handling pinned to 404 for unknown
+  paths and 405 for unsupported methods, D6
+  low-cardinality drain-state semantics surfaced);
+  iter-3 DoS-hardening sharpening (D4
+  5-second per-request read timeout preventing
+  slowloris attacks against externally reachable
+  `/ready` and `/metrics` listeners, new guard
+  12 + new gating fixture 9); iter-4 final triple
+  ratification, no new content. Final promoted
+  D-set: **10 decisions, 12 architecture guards
+  + 1 convention guard, 9 required integration
+  fixtures + 2 V1-evidence optional fixtures**.
+  **Shape A selected (observability listeners as
+  composition over ADR 044's TLS policy
+  substrate).** Shape B (refactor-only `tls-pki`
+  extraction) deferred — no operator-visible
+  functionality; Shape C (multi-tenant routing)
+  deferred — substantial substrate cycle (4+
+  iterations); Shape D (`inspect` wiring) deferred
+  as ADR 046 lead candidate — composes over ADR
+  045's `ReadinessSnapshot`; Shape E (live
+  cert rotation) deferred — no deployment
+  pressure yet.
+  **D1 critical decision:** add `[observability.listeners]`
+  config section with three separate bind
+  addresses (`/health`, `/ready`, `/metrics`).
+  Missing `[observability.listeners]` keeps ADR
+  042 / 043 / 044 behavior **byte-identical**.
+  Port-collision
+  validation enforces pairwise-distinct binds
+  across all five Toron listener addresses.
+  **D2 critical decision:** `/health` is
+  unauthenticated, always plaintext HTTP/1.1,
+  **always loopback-only** (Kubernetes liveness
+  probe shape); `/ready` and `/metrics` require
+  ADR 044 TLS whenever observability listeners
+  are configured. `/health` response body is
+  `"ok\n"` (lowercase) byte-identical with
+  Wendelon.
+  **D3 critical decision:** new `monitor-<principal>.<cluster_domain>`
+  SAN prefix extends ADR 044's `admit_san`
+  exact-shape verifier; admission set becomes
+  `<prefix>` ∈ {`toron`, `client`, `monitor`}.
+  Per-listener admission: `/ready` and `/metrics`
+  admit `monitor-` only. **First SAN-prefix
+  divergence from Wendelon** (Wendelon uses
+  `ActorPermission` + `ActorTrustRoots`).
+  Documented as non-carry-over with operator-cost
+  rationale.
+  **D4 critical decision:** hand-rolled HTTP/1.1
+  over `tokio_rustls`. **No** hyper / axum /
+  actix-web in dep graph. Mirror Wendelon's
+  `read_request` / `write_response` /
+  `parse_request_line` helper shape. Unknown
+  paths return 404; unsupported methods return
+  405. **5-second per-request
+  read timeout** (iter-3 sharpening) wraps every
+  `read_request` invocation preventing
+  slowloris-style DoS against externally
+  reachable observability listeners.
+  **D5 critical decision:** Prometheus 0.0.4
+  text exposition format. **No** histograms,
+  **no** per-tenant labels, **no** OpenMetrics
+  protobuf. Metric names are functional and
+  brand-clean, not `toron_*`.
+  Closed `{reason}` label cardinality
+  (`mtls_handshake_failure`, `peer_unknown_ca`,
+  `san_shape_rejected`, `san_role_rejected`,
+  `bind_unavailable`, `request_timeout`).
+  **D6 critical decision:** `/ready` JSON
+  snapshot mirrors Wendelon's `to_json()` shape
+  using `serde_json::Map` insertion-ordering;
+  `is_ready()` + `http_status()` derivation
+  pattern parallel to Wendelon's. Toron-
+  appropriate low-cardinality fields (no raft,
+  no daemon identity fields). **Drain-state
+  semantics:** on SIGTERM, `degraded_reason`
+  flips to `Some("draining")` immediately;
+  `/ready` returns 503; `/health` continues 200
+  (liveness ≠ readiness). Operator-essential for
+  Kubernetes rolling deployments.
+  **D7 critical decision:** three explicit
+  Wendelon-pattern non-carry-overs: no
+  `RevocationSnapshot` (preserves ADR 044 D7);
+  no `AuditSink` per-scrape emission (Toron has
+  no audit subsystem; preserves ADR 042 D13
+  tracing-only-observability stance); no OTLP
+  traces export. Single triple-forbidden-import
+  source-text guard enforces.
+  **D8 critical decision:** preserve ADR 042 D12
+  `READY <worker>` and ADR 043 D16 `SQL_READY
+  <sql>` lines **byte-identical**; append fourth
+  stdout line `OBSERVABILITY_READY health=<addr>
+  ready=<addr> metrics=<addr>` after them.
+  Format pinned byte-identical; source-text
+  guard asserts exactly one occurrence in
+  `daemon.rs`. Backward compatible with any
+  external supervisor parsing the ADR 042 / 043
+  lines.
+  **D9 critical decision:** reuse ADR 044's
+  one-cert-per-daemon invariant; the daemon's
+  `toron-<worker_id>` cert serves as TLS server
+  identity for `/ready` and `/metrics` listeners
+  too. No `[observability.tls]` independent
+  config section. Extends ADR 044 D11 / guard 13
+  to a fourth listener class.
+  **D10 critical decision:** tight initial metric
+  surface. No surface-widening (histograms /
+  per-tenant labels / per-table cardinality) in
+  V1; defer to ADR 047+ once V1 shape is proven.
+  **Single-plan posture.** No Plan A / Plan B
+  framing. Composition cycle over ADR 044 — no
+  new substrate.
+  **Twelve architecture guards + 1 convention
+  guard** including guard 7
+  (`adr045_no_revocation_no_audit_no_traces_in_observability`)
+  pinning the triple Wendelon non-carry-over,
+  guard 11
+  (`adr045_ready_snapshot_excludes_high_cardinality_identity_fields`)
+  pinning the low-cardinality readiness surface,
+  and the iter-3 sharpening guard 12
+  (`adr045_observability_http_has_per_request_read_timeout`)
+  pinning the slowloris-protection contract.
+  **Nine required integration fixtures + 2
+  optional V1-evidence** including the iter-3
+  sharpening witness
+  `toron_observability_listener_closes_slow_client_after_read_timeout`
+  (closes the slowloris DoS attack surface
+  end-to-end through TCP) and the optional drain-
+  state witness
+  `toron_ready_endpoint_returns_503_during_drain`
+  (exercise D6 drain-state hook end-to-end via
+  SIGTERM).
+  **Byte-identical refactor-invariant chain
+  extends to ten preserved cycles** (ADRs
+  035 / 036 / 037 / 038 / 039 / 041 / 042 / 043 /
+  044 / 045 all preserve the local DML fixture
+  pass count + leave `toron_fixture_worker.rs`
+  source unmodified).
+  The ten-phase migration is materialized in
+  `plans/impl/045_toron_daemon_observability_listeners.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -3427,7 +3586,258 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 044 promoted; ADR 045 candidates
+### ADR 045 promoted; ADR 046 candidates
+
+ADR 045 selected and promoted **Toron Daemon
+Observability Listeners** — the first pure-
+composition ADR over ADR 044's TLS policy
+substrate. Four council iterations on a
+composition-class topic with narrow scope:
+iter-0 topic-shape survey (Shape A composition
+selected over Shapes B / C / D / E); iter-1
+Claude three retractions after code audit of
+Wendelon's observability handlers (R1 hand-rolled
+HTTP/1.1 over `tokio_rustls`; R2 `/health` body
+`"ok\n"` byte-identical with Wendelon; R3 metric
+scrape counting narrowed to `/metrics` only while
+keeping metric names brand-clean); iter-2 D-set /
+guards / fixtures locked with three preemptive
+sharpenings (port-collision validation, HTTP
+method handling, drain-state semantics); iter-3
+DoS-hardening sharpening (5-second per-request
+read timeout); iter-4 final triple ratification,
+no new content. Final D-set: **10 decisions,
+12 architecture guards + 1 convention guard, 9
+required integration fixtures + 2 V1-evidence
+optional fixtures**.
+
+**Composition-cycle discipline applied for the
+first time over ADR 044's substrate.** ADR 044
+shipped the TLS policy substrate; ADR 045 ships
+the first composition cycle over it by extending
+`admit_san` with one new SAN prefix (`monitor-`)
+and reusing the one-cert-per-daemon invariant
+(ADR 044 D11) for a fourth listener class. No new
+substrate is introduced. The cycle establishes
+the discipline for future composition cycles over
+ADR 044: extend the admission set; preserve the
+byte-identical readiness-line continuity
+invariant; add listener-class-specific stdout
+readiness lines as new fourth+ position;
+preserve the fixture-worker source-isolation
+invariant.
+
+**Wendelon-parity carry-overs.** Six shapes
+carry over from Wendelon's observability surface
+where they fit Toron's ADR 044 conventions:
+HTTP path constants (`/health`, `/ready`,
+`/metrics`); `/health` body literal (`"ok\n"`);
+hand-rolled HTTP helper shape (`read_request` /
+`write_response` / `parse_request_line`);
+`ReadinessSnapshot.to_json()` derivation pattern
+(`serde_json::Map` insertion-ordering +
+`is_ready()` + `http_status()`);
+scrape-counting selectivity (counted on
+`/metrics` only, not `/ready`);
+`tokio_rustls::TlsAcceptor` for `/ready` and
+`/metrics`. Operators provisioning a
+Toron+Wendelon cluster reuse the same scrape
+topology mental model.
+
+**Wendelon-pattern non-carry-overs (explicit).**
+Seven shapes are deliberately not threaded into
+Toron V1: `RevocationSnapshot` (preserves ADR
+044 D7); `ActorPermission` model (Toron stays
+with ADR 044's SAN-prefix admission model);
+`AuditSink` per-scrape emission (Toron has no
+audit subsystem); `[observability.traces]` OTLP
+push exporter; `ReadinessSnapshot` raft fields
+(`epoch`, `leader_id`, `cluster_members`);
+`display_node_id("n-NN")` formatting helper; and
+high-cardinality readiness identity fields.
+Each non-carry-over carries explicit rationale in
+ADR §D3 / §D6 / §D7.
+
+**Iter-3 DoS-hardening sharpening.** The
+5-second `READ_REQUEST_TIMEOUT` wraps every
+`read_request` invocation in
+`tokio::time::timeout`. Prevents slowloris-style
+attacks where a client opens a TCP connection,
+completes TLS handshake, then sends bytes
+one-at-a-time over minutes — tying up daemon
+file descriptors without ever completing a
+request. Wendelon doesn't enforce this either,
+but Wendelon's observability listeners sit
+inside the storage ring's operator-controlled
+scrape topology; Toron's listeners can sit
+behind a cluster's exposed edge. The fixture
+`toron_observability_listener_closes_slow_client_after_read_timeout`
+witnesses the protection end-to-end through TCP.
+
+**ADR 044 `admit_san` extension.** The admission
+set extends from `<prefix>` ∈ {`toron`, `client`}
+to `<prefix>` ∈ {`toron`, `client`, `monitor`}.
+Per-listener admission: worker task listener
+accepts `toron-` only; SQL listener accepts
+`client-` only (ADR 044 D5 tightening preserved);
+`/ready` and `/metrics` accept `monitor-` only.
+Same exact-shape attack-rejection guarantees as
+ADR 044 D5 (subdomain injection, wildcard abuse,
+underscore confused-deputy, malformed id_token).
+ADR 044 guards 7 + 15 continue to pass.
+
+**Drain-state semantics.** On SIGTERM,
+`degraded_reason` flips to `Some("draining")`
+immediately before the listener-task abort loop
+begins. `/ready` returns 503 with the drain
+reason; `/health` continues 200 (liveness ≠
+readiness). Operator value: Kubernetes rolling
+deployments route traffic away from a draining
+pod within one `/ready` poll interval (typically
+5-10s); in-flight queries finish per ADR 042
+D11 drain semantics; pod terminates cleanly.
+
+**Architectural invariants preserved through
+this cycle:**
+
+- ADR 040 reservation continuity (`inspect`
+  byte-identical pre/post-ADR 045; remains the
+  last ADR 040 reservation; ADR 046 lead
+  candidate composes over `ReadinessSnapshot`).
+- ADR 040 D4 root-runtime-free
+  (`crates/nilket` stays runtime-free; ADR 045
+  adds no nilket-root deps).
+- ADR 038 / 039 registry convergence (single
+  shared `Arc<WendelonDescriptorRegistry>`
+  unchanged).
+- ADR 042 D12 / ADR 043 D16 / ADR 044 D8
+  readiness lines **byte-identical** pre/post
+  ADR 045 (`OBSERVABILITY_READY` appended as
+  fourth stdout line; first three lines
+  unchanged).
+- ADR 042 D13 tracing-only observability
+  extended (not replaced) by scrape-pull
+  metrics; preserved invariant.
+- ADR 043 D9 / ADR 044 D4 server-stamped
+  tenant. Metric labels don't include
+  `tenant_id` cardinality.
+- ADR 044 D6 wire-invariant (no SqlMessage /
+  SqlError changes).
+- ADR 044 D7 no-revocation invariant
+  (observability listeners don't read
+  `RevocationSnapshot`).
+- ADR 044 D9 single TLS material set
+  (observability listeners reuse the daemon
+  cert).
+- ADR 044 D11 one cert per daemon (extended to
+  cover observability listener server identity).
+- ADR 039 D5 / ADR 042 / ADR 043 / ADR 044
+  no-V1-suffix convention (carries forward to
+  `ObservabilityConfig`, `ObservabilityListeners`,
+  `ReadinessSnapshot`, `MetricsRegistry`,
+  `READ_REQUEST_TIMEOUT`; **tenth consecutive
+  cycle** — ADRs 039 / 041 / 042 / 043 / 044 /
+  045).
+- ADR 035 – 044 byte-identical refactor-
+  invariant chain (extends to ten preserved
+  cycles; `toron_fixture_worker.rs` source
+  unchanged).
+- Cross-ring discipline (Toron's observability
+  is intra-ring; Wendelon's observability
+  subsystem unaffected; Wendelon admin
+  orchestration boundary preserved).
+
+The ten-phase migration is materialized in
+`plans/impl/045_toron_daemon_observability_listeners.md`.
+
+**ADR 046 lead candidate:**
+
+- **ADR 046 — `nilket toron inspect` real wiring
+  composing over `ReadinessSnapshot`.**
+  Lifts the **last ADR 040 reservation** (after
+  ADR 042 lifted `start` and ADR 043 lifted
+  `sql`). Composes over ADR 045's
+  `ReadinessSnapshot` shape; surfaces the
+  same data through a CLI inspection path
+  instead of an HTTP/JSON path. Small
+  composition cycle; 2-iteration projected
+  budget. The third consecutive ADR 040
+  reservation lift; completes the ADR 040
+  reservation set.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **Multi-tenant routing.** Now genuinely
+  unblocked by ADR 044 + ADR 045's `monitor-`
+  admission pattern (per-tenant scraper identity
+  becomes provisionable). Still ADR 047+ pending
+  per-tenant catalog isolation policy.
+- **Wendelon descriptor discovery / refresh.**
+  Cross-ring substrate cycle; orthogonal.
+- **Live cert rotation without daemon restart.**
+  Retracted from ADR 044 in iter-1. Future ADR
+  over ADR 044's policy substrate.
+- **CRL parsing / OCSP stapling / runtime-
+  mutable revocation list.** Same follow-up
+  cycle as live cert rotation.
+- **Extract shared `tls-pki` workspace crate**
+  consumed by both Wendelon and Toron. ADR 044
+  Phase 0 audit decided W-C (Toron-local copy);
+  W-B follow-up extraction ADR may now also
+  bring ADR 045's HTTP helpers into the shared
+  crate.
+- **OTLP traces export** (`[observability.traces]`).
+  Wendelon has this; Toron deferred in ADR 045
+  D7. Future ADR if a deployment surfaces need.
+- **Audit subsystem.** Toron deferred in ADR 045
+  D7. Future ADR if deployment surfaces need.
+- **Prometheus histogram metrics.** Surface-
+  widening ADR 047+ once V1 shape is proven.
+- **OpenMetrics protobuf format.** Same.
+- **Per-tenant metric labels.** Bundles with
+  multi-tenant routing.
+- **`ActorPermission` model parallel to
+  Wendelon's.** Future ADR if per-listener role
+  admission needs to evolve beyond SAN prefix.
+- **Token-based auth (bearer / JWT / OIDC).**
+  Future ADR over ADR 044 listener policy
+  substrate.
+- **CTAS `IF NOT EXISTS`** (`sql_planner.rs:897`
+  reject preserved by ADR 041 D3; tiny
+  composition cycle).
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate.
+- **`INSERT ... RETURNING` / `CTAS ...
+  RETURNING` / `DELETE ... RETURNING`** — DML
+  result-shape extension.
+- **Subqueries in DELETE WHERE clause.** Future
+  correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern.
+- **Cascading secondary-index DROP substrate.**
+- **Atomic Wendelon-side replacement protocol.**
+- **Persistent SQL connections / pipelined
+  statements.**
+- **Prepared statements / parameterized
+  queries.**
+- **gRPC / Arrow Flight / Postgres wire
+  protocol frontends.**
+- **Strong cross-worker in-flight cancellation
+  semantics.**
+- **Distributed tracing context propagation
+  across worker task dispatch.**
+- **HTTP/2 / HTTP/3 / pipelining / keep-alive**
+  for observability listeners.
+
+**Substrate candidates carried forward:**
+(identical to ADR 044's carry-forward list —
+re-listed below unchanged because ADR 045 was
+pure composition over ADR 044's substrate, not
+substrate-class itself, and touched none of
+these seams)
+
+### ADR 044 promoted; ADR 045 candidates (HISTORICAL)
 
 ADR 044 selected and promoted **Authenticated
 Remote Toron QUIC Listeners** — the third ADR
