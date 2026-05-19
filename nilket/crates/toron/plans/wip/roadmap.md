@@ -2905,6 +2905,135 @@ along with the forward-sequence rewrite.
   composition has no half-state worth shipping.
   The ten-phase migration is materialized in
   `plans/impl/041_create_or_replace_table.md`.
+- **ADR 042 — Toron Compute Daemon Substrate.**
+  Promoted. **First ADR that lifts an ADR 040
+  reservation** (`nilket toron start`). Three
+  council iterations on a pre-aligned topic
+  (Toron Compute Daemon Substrate was already the
+  ADR 041 carry-forward lead candidate after ADR
+  041's triple-swap deferred it). Iter-0 pre-
+  alignment on topic with three open scope
+  decisions named explicitly (descriptor discovery
+  posture, observability listener inclusion,
+  public SQL listener inclusion); iter-1 Claude
+  retraction of Plan A/B framing in favor of
+  Codex's loopback-only model + Codex's load-
+  bearing descriptor-bootstrap-product-type
+  correction; iter-2 Claude double-retraction
+  (READY line stream → stdout; descriptor bootstrap
+  shape → product type with explicit table_ids)
+  and final convergence. Gemini retained two
+  minority positions through iter-1 (inert
+  no-listener Plan B; `[coordinator]` static
+  worker registry config) resolved 2-of-3 in
+  iter-2 by user acclamation. Final promoted
+  D-set: **15 decisions**.
+  **D1 critical decision:** lift only `nilket
+  toron start <toron.toml>`. `sql` and `inspect`
+  remain reserved with **byte-identical ADR 040
+  diagnostic text** (reservation continuity
+  invariant; guard 2 source-asserts).
+  **D2 critical decision:** Toron owns the async
+  runtime internally; `crates/nilket` stays
+  runtime-free (preserves ADR 040 D4 invariant).
+  **D3-D4 critical decisions:** Toron-owned
+  config surface (`crates/toron/src/config.rs`)
+  with `ToronBootstrapConfig` product type;
+  example-config render/write helpers mirror
+  Wendelon ergonomics. **No `[coordinator]`
+  section** — static worker registry entries are
+  inert without a query-admitting coordinator
+  service and defer to ADR 043+.
+  **D5 critical decision (Codex iter-1 correction
+  ratified):** descriptor bootstrap is a Toron
+  product type `ToronDescriptorBootstrap` with
+  `tables: Vec<ToronDescriptorBootstrapTable {
+  table_id, descriptor }>`. **Not raw
+  `Vec<TableSchemaDescriptor>`** —
+  `WendelonDescriptorRegistry::from_descriptors`
+  needs explicit `(TableId, descriptor)` pairs;
+  raw vector form would make table identity
+  order-dependent. **No `*V1` suffix** on the
+  type name (carries forward ADR 039 user
+  directive).
+  **D6-D7 critical decisions:** descriptor
+  bootstrap is startup-only (no Wendelon list-
+  descriptors RPC or refresh loops); daemon
+  constructs exactly one shared
+  `Arc<WendelonDescriptorRegistry>` cloned into
+  catalog/scan/write/delete/admin adapters
+  (preserves ADR 038/039 registry-convergence
+  invariant).
+  **D8-D10 critical decisions:** worker task
+  listener is in scope; public SQL listener is
+  out. Existing TCP task listener is **loopback-
+  only** in ADR 042; non-loopback bind addresses
+  fail startup with the stable diagnostic
+  `toron worker listener requires authenticated
+  transport for non-loopback bind address`.
+  Authenticated remote task transport
+  (`TlsToronTransport`) is a follow-up ADR.
+  **No inert no-listener Plan B** — Plan B
+  framing was rejected 2-of-3 in iter-1 (Codex +
+  Claude); a daemon that accepts no work is not a
+  meaningful lift of `toron start`.
+  **D11 critical decision:** deterministic
+  `ToronDaemon` handle. Tests construct daemons
+  on `127.0.0.1:0` and shut them down without
+  `tokio::signal::ctrl_c`; CLI blocks on Ctrl-C
+  and calls `shutdown()`. Drain semantics:
+  refuse new connections; complete in-flight
+  tasks up to `drain_timeout_seconds` (default
+  30s); force-abort remaining after timeout.
+  **D12 critical decision:** machine-readable
+  `READY <worker-task-endpoint>` line on
+  **stdout** (matches existing fixture-worker
+  contract; stderr is the tracing channel).
+  **D13 critical decision:** tracing-only
+  observability (no health/ready/metrics
+  listeners). TLS material story defers to
+  ADR 043+ alongside the public SQL listener.
+  **D14 critical decision (byte-identical
+  refactor-invariant chain preserved):**
+  `crates/toron/src/bin/toron_fixture_worker.rs`
+  source is **not modified** by ADR 042. Sixth
+  consecutive cycle preserving the invariant
+  after ADRs 035/036/037/038/039/041.
+  **D15 critical decision:** Toron daemon uses
+  `wendelon_client::Client` only; does **not**
+  construct `WendelonNode`, import Wendelon raft
+  storage, open slab managers, or host Wendelon
+  state-machine internals.
+  **Fifteen architecture guards** including the
+  Codex iter-1 unique guard 6
+  `adr042_descriptor_bootstrap_is_product_type_with_table_ids`
+  (pins D5 correctness fix), guard 7
+  `adr042_descriptor_bootstrap_has_no_v1_type_suffix`
+  (carries forward ADR 039 user directive), and
+  guard 10
+  `adr042_unauthenticated_task_listener_is_loopback_only`
+  (pins D9 loopback floor). **Thirteen required
+  integration fixtures** including the load-
+  bearing wire-correctness witness
+  `toron_daemon_accepts_cancel_task_over_loopback`
+  (proves listener + worker wire loop without
+  pulling fixture storage into daemon tests).
+  **Two optional V1-evidence fixtures**
+  (non-gating, post-promotion):
+  `toron_started_worker_executes_no_scan_task_over_loopback`
+  and
+  `toron_started_worker_sigkill_retry_digest_is_canonical`
+  — the V1 target signal (multi-process SIGKILL
+  byte-identical-retry-digest).
+  **Single-plan posture** — no Plan A / Plan B.
+  Loopback-only is the substrate floor; either
+  the daemon binds it (always) or rejects the
+  bind with the stable diagnostic. Substrate
+  cycle discipline does not apply because the
+  reservation itself is binary — either lifted
+  with real substrate, or not.
+  The ten-phase migration is materialized in
+  `plans/impl/042_toron_compute_daemon_substrate.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -2972,7 +3101,135 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 041 promoted; ADR 042 candidates
+### ADR 042 promoted; ADR 043 candidates
+
+ADR 042 selected and promoted **Toron Compute Daemon
+Substrate** — the **first ADR that lifts an ADR 040
+reservation**. Three council iterations on a
+pre-aligned topic (carried forward from ADR 041's
+triple-swap that deferred this candidate). Iter-1
+saw Claude retract Plan A/B framing in favor of
+Codex's loopback-only model; iter-2 saw Claude
+double-retract (READY stream → stdout; descriptor
+bootstrap → product type with explicit table_ids).
+Final D-set: **15 decisions, 15 architecture
+guards, 13 required integration fixtures + 2
+V1-evidence optional fixtures**.
+
+**Reservation-lift discipline established.**
+ADR 040 introduced the role-scoped reservation
+pattern; ADR 042 establishes how reservations
+lift: each lift produces a **real substrate**
+(never inert), preserves **byte-identical
+diagnostic text** for the still-reserved siblings,
+and uses a **single-plan posture** rather than
+Plan A / Plan B framing (substrate cycle
+discipline does not apply because the reservation
+itself is binary — either lifted with real
+substrate, or not). Future ADR 040 reservation
+lifts (`sql` → ADR 043 lead candidate; `inspect`
+→ ADR 044+) inherit this discipline.
+
+**Byte-identical refactor-invariant chain extends
+to six consecutive cycles.** ADRs 035/036/037/
+038/039/041 preserved the local DML fixture pass
+count byte-identical pre/post-refactor; ADR 042
+extends the chain by leaving
+`crates/toron/src/bin/toron_fixture_worker.rs`
+source unmodified (D14, guard 15).
+
+**ADR 039 user directive carried forward.** The
+no-V1-suffix convention from ADR 039 D5 applies
+to `ToronDescriptorBootstrap` (the new product
+type introduced in ADR 042 D5). Guard 7 source-
+asserts the absence of `ToronDescriptorBootstrapV1`.
+
+**Architectural invariants preserved through this
+cycle:**
+- ADR 038/039 registry convergence (single shared
+  `Arc<WendelonDescriptorRegistry>` cloned across
+  catalog/scan/write/delete/admin adapters).
+- ADR 040 D4 (no shared runtime in `crates/nilket`
+  root binary; `tokio` stays inside Toron's
+  daemon module).
+- ADR 040 reservation-pattern stability (`sql`,
+  `inspect` diagnostic text byte-identical
+  pre/post-ADR 042).
+- ADR 039 D5 no-V1-suffix convention (carried
+  forward to `ToronDescriptorBootstrap`).
+- ADR 035-041 byte-identical fixture-worker
+  refactor invariant.
+
+The ten-phase migration is materialized in
+`plans/impl/042_toron_compute_daemon_substrate.md`.
+
+**ADR 043 lead candidate:**
+
+- **ADR 043 — Public Toron SQL Listener +
+  `nilket toron sql` real wiring.** Lifts the
+  remaining ADR 040 reservation that the
+  Prioritization philosophy ranks as the
+  highest-evidence-pressure operator-surface gap
+  after ADR 042. Composes the ADR 042 daemon
+  substrate + a new public listener with SQL
+  text framing, Arrow result framing, tenant /
+  session binding, authentication, cancellation,
+  and error stability. **Substrate-class** (six
+  adjacent decisions each require their own
+  iter-0 alignment work). Likely 4-5 iteration
+  cycle. Bundles `TlsToronTransport` for the
+  worker listener as well, OR splits to a
+  separate ADR if scope creep emerges during
+  iter-0 surveying.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **CTAS `IF NOT EXISTS`** (`sql_planner.rs:897`
+  reject preserved by ADR 041 D3; tiny
+  composition cycle).
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate + new partial-write
+  contract. Two-cycle minimum: partial-write
+  substrate cycle + SQL UPDATE composition.
+- **`INSERT ... RETURNING` / `CTAS ... RETURNING`
+  / `DELETE ... RETURNING`** — DML result-shape
+  extension.
+- **Subqueries in DELETE WHERE clause** — future
+  correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern.
+- **`nilket toron inspect` real wiring** — ADR
+  040 reservation; needs Toron inspect surface
+  defined.
+- **Cascading secondary-index DROP substrate** —
+  ADR 039 D12 follow-up; weak operator pressure
+  until SQL `CREATE INDEX` exists.
+- **Atomic Wendelon-side replacement protocol** —
+  C1b from ADR 041 iter-0; only if later
+  requirements demand stronger semantics than ADR
+  041's documented non-atomic composition.
+- **Authenticated remote Toron task transport
+  (`TlsToronTransport`).** Lifts the ADR 042 D9
+  loopback-only floor. Could bundle with ADR 043
+  public SQL listener OR ship as a standalone
+  ADR depending on iter-0 scope analysis.
+- **Wendelon descriptor discovery / refresh.**
+  Lifts the ADR 042 D6 startup-only bootstrap.
+  Needs a Wendelon-side list-descriptors RPC
+  (Wendelon ADR scope).
+- **Toron daemon observability listeners
+  (health / ready / metrics).** Lifts the ADR
+  042 D13 tracing-only floor. Needs TLS material
+  story shared with the public SQL listener.
+
+**Substrate candidates carried forward:** (identical
+to ADR 041's carry-forward list — re-listed below
+unchanged because ADR 042 was operator-surface +
+daemon-substrate composition, not pure substrate,
+and touched none of these seams)
+
+### ADR 041 promoted; ADR 042 candidates (HISTORICAL)
 
 ADR 041 selected and promoted **CREATE OR REPLACE
 TABLE** — Toron's **first SQL composition cycle
