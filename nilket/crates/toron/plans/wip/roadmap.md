@@ -3815,6 +3815,132 @@ along with the forward-sequence rewrite.
   unmodified).
   The eleven-phase migration is materialized in
   `plans/impl/047_shared_tls_pki_workspace_crate.md`.
+- **ADR 048 — Shared `observability-http` Workspace Crate.**
+  Promoted. **Second refactor cycle in the ADR
+  040-onward sequence** (after ADR 047 TLS/PKI)
+  and the second cross-ring extraction. Pays
+  down observed HTTP/1.1 duplication across
+  three sites (Toron `observability_http` +
+  Wendelon `metrics/observability` + Wendelon
+  `metrics/exporter`); prevents the imminent
+  fourth-site duplication that ADR 049 (Shape
+  A, `nilket wendelon inspect` parity) would
+  otherwise create. Three council iterations
+  on a refactor-class topic: iter-0 three-way
+  split (Codex `observability-http` extraction;
+  Claude `nilket wendelon inspect` parity;
+  Gemini multi-tenant routing); iter-1 Claude
+  R1 retraction (Shape A demoted to ADR 049
+  lead candidate; Codex's `observability-http`
+  extraction adopted as ADR 048 lead because
+  Wendelon has no client-side HTTP/1.1 parser
+  and Shape A would otherwise create a fourth
+  duplication site or violate cross-ring
+  discipline), Claude S1 sharpening (Wendelon
+  production code fully untouched for V1, not
+  "opportunistic", because three observable
+  divergences gate behavior-preserving
+  migration — request parser shape, request-
+  line return shape, response header casing);
+  iter-2 dual ADR+impl convergence Codex+Claude
+  2-of-3; iter-3 three small sharpenings — S1
+  D8 enumerates 17 promotion-locked diagnostic
+  strings explicitly, S2 new guard 5
+  (`adr048_observability_http_public_surface_is_small`)
+  pinning the 10-required / 12-forbidden
+  public-surface boundary, S3 fixture 3 split
+  into happy-path + missing-parts-reject.
+  Codex iter-3 + Codex iter-4 ratified the
+  same shape; Gemini iter-3 held multi-tenant
+  routing position; outvoted 2-of-3 again,
+  carried forward as ADR 050+ candidate. Final
+  promoted D-set: **10 decisions, 12
+  architecture guards + 1 convention guard, 12
+  required integration fixtures + 0 V1-evidence
+  optional fixtures**.
+  **D1 critical decision:** `crates/observability-http/`
+  workspace crate with **four submodules**
+  (`lib.rs` + `request.rs` + `response.rs` +
+  `writer.rs`). Brand-clean name; **thirteenth
+  consecutive cycle** — ADRs 039 / 041 / 042 /
+  043 / 044 / 045 / 046 / 047 / 048.
+  **D2 critical decision:** policy-neutral
+  substrate. No TLS, routing, status-code
+  semantics, timeout policy, metrics, audit,
+  daemon lifecycle.
+  **D3 critical decision:** caller-owned
+  timeout policy. Toron keeps
+  `READ_REQUEST_TIMEOUT` in the shim file
+  (preserves ADR 045 guard 4 source-text-
+  match); `CONNECT_TIMEOUT` stays in
+  `cli.rs` (preserves ADR 046 guard 12
+  source-text-match).
+  **D4 critical decision:** Toron consumes via
+  a compatibility shim at the existing path
+  `crates/toron/src/network/observability_http.rs`.
+  Toron's imports stay on the existing shim path; the
+  observability route-matching sites perform the small
+  tuple-to-field rewrite required by `RequestLine`.
+  **D5 critical decision:** Wendelon
+  production code is **fully untouched** in
+  V1. Production Wendelon modules must not
+  import `observability_http` in this cycle.
+  Future ADR can decide between ratifying
+  Wendelon behavior change or extending
+  `observability-http` with a Wendelon-shape
+  compatibility layer.
+  **D6 critical decision:** single dependency
+  — local Tokio `io-util` only. Forbidden:
+  `hyper`, `hyper-util`, `axum`, `actix-web`,
+  `tower`, `reqwest`, `ureq`, `h2`, `http`,
+  `httparse`, `bytes`, `tokio-util`, `rustls`,
+  `tokio-rustls`, `quinn`, `tls-pki`, `tracing`.
+  **D7 critical decision:** status
+  interpretation caller-owned. `read_response`
+  returns numeric `status_code: u16`.
+  **D8 critical decision:** **17 diagnostic
+  strings** pinned in the shared crate, byte-
+  identical to Toron's pre-extraction strings.
+  `parse_request_line` rejects missing
+  method/path/version but does NOT validate
+  version content. `read_response` DOES reject
+  non-`HTTP/1.1` response versions. Chunked-
+  wins rule when both `Transfer-Encoding:
+  chunked` and `Content-Length` are present.
+  **D9 critical decision:** single-plan
+  posture. Cross-ring discipline preserved.
+  **D10 critical decision:** workspace lints /
+  clippy / formatting consistency.
+  `#![deny(unsafe_code)]` in `lib.rs`.
+  **Twelve architecture guards + 1 convention
+  guard** including the iter-3 sharpening
+  guard 5
+  (`adr048_observability_http_public_surface_is_small`),
+  the meta-guard 12
+  (`adr048_prior_adr04x_guards_continue_to_pass`),
+  and the convention guard
+  (`adr048_new_observability_http_types_are_brand_clean_and_no_v1_suffix`)
+  carrying forward the no-V1-suffix convention
+  for the thirteenth consecutive cycle.
+  **Twelve required fixtures + 0 V1-evidence
+  optional** including the iter-3 fixture-3
+  split (happy-path
+  `observability_http_parses_request_line_with_version_field`
+  + error-paths
+  `observability_http_rejects_missing_request_line_parts`)
+  and the three preservation/sweep fixtures
+  (`toron_observability_ready_metrics_preserve_responses_post_extraction`,
+  `toron_inspect_preserves_ready_fetch_post_extraction`,
+  `prior_adr04x_architecture_guards_pass_post_http_extraction`).
+  **Byte-identical refactor-invariant chain
+  extends to thirteen preserved cycles** (ADRs
+  035 / 036 / 037 / 038 / 039 / 041 / 042 /
+  043 / 044 / 045 / 046 / 047 / 048 all
+  preserve the local DML fixture pass count +
+  leave `toron_fixture_worker.rs` source
+  unmodified).
+  The eight-phase migration is materialized in
+  `plans/impl/048_shared_observability_http_workspace_crate.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -3882,7 +4008,322 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 047 promoted; ADR 048 candidates
+### ADR 048 promoted; ADR 049 candidates
+
+ADR 048 selected and promoted **Shared
+`observability-http` Workspace Crate** — the
+**second refactor cycle in the ADR 040-onward
+sequence** (after ADR 047 TLS/PKI) and the
+second cross-ring extraction. Three council
+iterations on a refactor-class topic: iter-0
+three-way split (Codex `observability-http`
+extraction; Claude `nilket wendelon inspect`
+parity; Gemini multi-tenant routing); iter-1
+Claude R1 retraction (Shape A demoted to
+ADR 049 lead candidate; Codex's
+`observability-http` extraction adopted as
+ADR 048 lead because Wendelon has no client-
+side HTTP/1.1 parser and Shape A would
+otherwise create a fourth duplication site or
+violate cross-ring discipline); iter-1 Claude
+S1 sharpening (Wendelon production code fully
+untouched for V1, not "opportunistic", because
+three observable divergences gate behavior-
+preserving migration); iter-2 dual ADR+impl
+convergence Codex+Claude 2-of-3; iter-3 three
+small sharpenings — S1 D8 enumerates 17
+promotion-locked diagnostic strings explicitly,
+S2 new guard 5
+(`adr048_observability_http_public_surface_is_small`)
+pinning the 10-required / 12-forbidden public-
+surface boundary, S3 fixture 3 split into
+happy-path + missing-parts-reject. Codex
+iter-3 + Codex iter-4 ratified the same shape;
+Gemini iter-3 held multi-tenant routing
+position; outvoted 2-of-3 again, carried
+forward as ADR 050+ candidate. Final D-set:
+**10 decisions, 12 architecture guards + 1
+convention guard, 12 required integration
+fixtures + 0 V1-evidence optional fixtures**.
+
+**Second refactor cycle.** ADR 048 is pure
+behavior-preserving extraction: zero functional
+changes, zero wire changes, zero config
+changes, zero new operator-visible
+functionality. All prior ADR 040-047
+architecture guards and ADR 042-047 fixture
+suites continue to pass byte-identical pre/post
+the extraction. Meta-guard 12
+(`adr048_prior_adr04x_guards_continue_to_pass`)
+and meta-fixture 12
+(`prior_adr04x_architecture_guards_pass_post_http_extraction`)
+gate promotion on byte-identical comparison.
+The 17 D8 diagnostic strings are byte-identical
+pre/post.
+
+**D1 critical decision:** `crates/observability-http/`
+workspace crate with **four submodules** (`lib.rs`
++ `request.rs` + `response.rs` + `writer.rs`).
+Brand-clean name; **thirteenth consecutive
+cycle** preserving the no-V1-suffix convention
+— ADRs 039 / 041 / 042 / 043 / 044 / 045 /
+046 / 047 / 048.
+
+**D2 critical decision:** `observability-http`
+is **policy-neutral substrate** — exports the
+bounded HTTP/1.1 helpers but **not** any of:
+TLS, routing, status-code semantics, timeout
+policy, metrics, audit, daemon lifecycle. ADR
+045 `/health` / `/ready` / `/metrics` route
+constants stay Toron-local. ADR 046's 200/503
+closed-status surface stays Toron-local.
+
+**D3 critical decision:** caller-owned timeout
+policy. `observability-http` does not import
+`Duration` or `tokio::time`. Toron keeps
+`READ_REQUEST_TIMEOUT` in the shim file
+(`crates/toron/src/network/observability_http.rs`)
+preserving ADR 045 guard 4 source-text-match.
+`CONNECT_TIMEOUT` stays in
+`crates/toron/src/cli.rs` (ADR 046's pinned
+location); ADR 048 does not move it.
+
+**D4 critical decision:** Toron consumes via a
+**compatibility shim** at the existing path
+`crates/toron/src/network/observability_http.rs`.
+The shim re-exports the shared helpers and
+keeps the `READ_REQUEST_TIMEOUT` constant
+Toron-local. Toron's imports stay on the shim
+path; the observability route-matching sites
+perform the small tuple-to-field rewrite
+required by `RequestLine`.
+
+**D5 critical decision:** Wendelon production
+code is **fully untouched** in V1. Wendelon's
+`crates/wendelon/src/metrics/observability.rs`
++ `crates/wendelon/src/metrics/exporter.rs`
+helpers stay as-is. Production Wendelon
+modules must not import `observability_http`
+in this cycle. Reason: three observable
+divergences (request parser shape — Wendelon's
+one-read probe vs Toron's terminator-detecting
+parser; request-line return shape —
+`(method, path)` tuple vs `RequestLine` struct;
+response header casing — lowercase vs Title-
+Case) gate behavior-preserving migration.
+
+**D6 critical decision:** single dependency —
+local Tokio `io-util` only. Architecture
+guard 2 asserts presence of `tokio` with
+`features = ["io-util"]` and absence of every
+forbidden token: `hyper`, `hyper-util`, `axum`,
+`actix-web`, `tower`, `reqwest`, `ureq`, `h2`,
+`http`, `httparse`, `bytes`, `tokio-util`,
+`rustls`, `tokio-rustls`, `quinn`, `tls-pki`,
+`tracing`.
+
+**D7 critical decision:** status interpretation
+caller-owned. `read_response` returns numeric
+`status_code: u16`. Toron's CLI maps `200 →
+ready`, `503 → degraded`, anything else →
+exit 2 (ADR 046 D7).
+
+**D8 critical decision:** 17 diagnostic strings
+pinned in the shared crate, byte-identical to
+Toron's pre-extraction strings.
+`parse_request_line` rejects missing
+method/path/version but does NOT validate
+version content. `read_response` DOES reject
+non-`HTTP/1.1` response versions. Chunked-wins
+rule when both `Transfer-Encoding: chunked` and
+`Content-Length` are present.
+
+**D9 critical decision:** single-plan posture.
+Cross-ring discipline preserved: no ring-
+internal types in `observability-http`.
+
+**D10 critical decision:** workspace lints /
+clippy / formatting consistency.
+`#![deny(unsafe_code)]` in `lib.rs`.
+
+**Twelve architecture guards + 1 convention
+guard** including the iter-3 sharpening guard 5
+(`adr048_observability_http_public_surface_is_small`)
+pinning the 10-required / 12-forbidden public-
+surface boundary, the meta-guard 12
+(`adr048_prior_adr04x_guards_continue_to_pass`),
+and the convention guard
+(`adr048_new_observability_http_types_are_brand_clean_and_no_v1_suffix`)
+carrying forward the no-V1-suffix convention
+for the thirteenth consecutive cycle.
+
+**Twelve required fixtures + 0 V1-evidence
+optional** including the iter-3 fixture-3 split
+(happy-path
+`observability_http_parses_request_line_with_version_field`
++ error-paths
+`observability_http_rejects_missing_request_line_parts`)
+and the three preservation/sweep fixtures.
+
+**Byte-identical refactor-invariant chain
+extends to thirteen preserved cycles** (ADRs
+035 / 036 / 037 / 038 / 039 / 041 / 042 / 043
+/ 044 / 045 / 046 / 047 / 048 all preserve the
+local DML fixture pass count + leave
+`toron_fixture_worker.rs` source unmodified).
+
+**Architectural invariants preserved through
+this cycle:**
+
+- ADR 040 reservation continuity preserved.
+- ADR 040 D4 / ADR 042 D2 / ADR 043 D2 / ADR
+  045 D9 / ADR 046 D10 / ADR 047 root-runtime-
+  free (`crates/nilket/Cargo.toml` untouched;
+  new `observability-http` crate is `io-util`
+  only).
+- ADR 038 / 039 registry convergence
+  unchanged.
+- ADR 042-046 readiness lines + tracing-only
+  observability + server-stamped tenant
+  invariants unchanged.
+- ADR 044 D5 exact-shape SAN admission
+  unchanged; ADR 047 substrate consumption
+  unchanged.
+- ADR 045 D4 server-side `READ_REQUEST_TIMEOUT
+  = 5s` preserved at the same file path; ADR
+  045 guard 4 source-text-match preserved.
+- ADR 045 D5 8 KiB request-header cap byte-
+  stable through the shared crate.
+- ADR 045 D6 `ReadinessSnapshot` shape +
+  metric exposition format unchanged.
+- ADR 046 D6 stdout/stderr separation +
+  exit-code surface unchanged; D7 symmetric
+  5-second timeouts unchanged; `CONNECT_TIMEOUT`
+  stays in `cli.rs` (ADR 046 guard 12 source-
+  text-match preserved); D9 `Host:` header +
+  `Connection: close` shape preserved byte-
+  identical.
+- ADR 047 `tls-pki` substrate consumption
+  unchanged; ADR 048 does not import
+  `tls-pki` into `observability-http`
+  (guard 2 enforces).
+- No-V1-suffix convention (thirteenth
+  consecutive cycle).
+- ADR 035 – 047 byte-identical refactor-
+  invariant chain (extends to thirteen
+  preserved cycles).
+- Cross-ring discipline preserved
+  (`observability-http` exports policy-
+  neutral substrate only; Wendelon production
+  code untouched per D5).
+
+The eight-phase migration is materialized in
+`plans/impl/048_shared_observability_http_workspace_crate.md`.
+
+**ADR 049 candidates (lead candidate emerged
+during ADR 048 iter-1):**
+
+After ADR 048, the cross-ring HTTP/1.1
+substrate is consolidated (Toron-side; Wendelon-
+side production code stays unchanged for V1).
+ADR 048 explicitly prepared ADR 049's lead
+candidate by extracting the shared substrate
+that prevents the imminent fourth-site
+duplication.
+
+- **`nilket wendelon inspect` parity (LEAD).**
+  Composition cycle mirroring ADR 046 to the
+  storage ring. Composes over ADR 048
+  `observability-http` (client-side helpers
+  `write_request` + `read_response`) + ADR 047
+  `tls-pki` (client config + cert chain
+  verifier) + Wendelon's existing `/ready`
+  endpoint (`metrics/observability.rs:239`
+  `handle_ready_connection`) and
+  `ReadinessSnapshot` struct
+  (`metrics/observability.rs:52`). CLI-only;
+  zero new Wendelon daemon-side wire surface.
+  Mirrors ADR 046 D5 / D6 / D7 / D10 surface
+  (exit codes 0/1/2, symmetric 5s timeouts,
+  TLS-flags-together requirement, JSON pass-
+  through, hand-rolled HTTP/1.1 client).
+  Validates ADR 048's substrate as the second
+  consumer; validates ADR 047's `tls-pki`
+  substrate as a cross-ring client-side
+  consumer.
+- **Multi-tenant routing** (Gemini's lead
+  through ADR 048; carried forward as ADR
+  050+ candidate). Now genuinely unblocked by
+  ADR 044 + ADR 045 `monitor-` admission +
+  ADR 046 cert reuse + ADR 047 shared
+  `tls-pki` + ADR 048 shared HTTP/1.1
+  substrate. Substantial substrate cycle (4+
+  iterations expected); requires per-tenant
+  catalog isolation policy + scoped catalog
+  decorator + mTLS tenant extraction.
+- **OTLP traces export**
+  (`[observability.traces]`). Wendelon has
+  this; Toron deferred in ADR 045 D7.
+- **Audit subsystem.** Wendelon has this;
+  Toron deferred in ADR 045 D7.
+- **Live cert rotation / CRL / OCSP.**
+  Retracted from ADR 044 iter-1.
+- **`tls-pki` Wendelon-side full migration.**
+  Wendelon-side inline DER/CBOR for actor
+  claims grandfathered for V1 in ADR 047;
+  future ADR can extend the sole-ownership
+  guard to Wendelon-side.
+- **Wendelon-side `observability-http`
+  migration.** Defer until a behavior-change
+  policy is decided per ADR 048 §"Out of
+  Scope".
+- **`ActorPermission` parity Toron-side.**
+  Future ADR if per-listener role admission
+  needs to evolve beyond SAN prefix.
+- **SQL surface widening** — CTAS `IF NOT
+  EXISTS`; `UPDATE WHERE`; `INSERT ...
+  RETURNING` / `CTAS ... RETURNING` /
+  `DELETE ... RETURNING`.
+- **Token-based auth (bearer / JWT / OIDC).**
+- **gRPC / Arrow Flight / Postgres wire
+  protocol frontends.**
+- **Strong cross-worker in-flight cancellation
+  semantics.**
+- **Prepared statements / parameterized
+  queries.**
+- **Subqueries in DELETE WHERE clause.**
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).**
+- **Cascading secondary-index DROP substrate.**
+- **Atomic Wendelon-side replacement protocol.**
+- **Persistent SQL connections / pipelined
+  statements.**
+- **Distributed tracing context propagation
+  across worker task dispatch.**
+- **`/inspect` daemon-side endpoint with
+  richer detail.**
+- **`/info` or `/version` endpoint.**
+- **Prometheus histogram metrics.**
+- **OpenMetrics protobuf format.**
+- **Per-tenant metric labels.**
+- **HTTP/2 / HTTP/3 / pipelining / keep-alive**
+  for observability listeners.
+- **`--watch` / streaming mode** for inspect
+  CLIs.
+- **Cluster-wide aggregate inspect.**
+- **Sub-subcommands.**
+- **Toron CLI consolidation**
+  (`SqlClientTlsOptions` + `InspectTlsOptions`
+  merge). Rejected from ADR 047.
+- **`GenericCertVerifier<F>` closure-based
+  verifier revisit.** Rejected from ADR 047.
+
+**Substrate candidates carried forward:**
+(identical to ADR 047's carry-forward list —
+re-listed in the ADR 047 historical section
+below)
+
+### ADR 047 promoted; ADR 048 candidates (HISTORICAL)
 
 ADR 047 selected and promoted **Shared `tls-pki`
 Workspace Crate** — the **first refactor cycle

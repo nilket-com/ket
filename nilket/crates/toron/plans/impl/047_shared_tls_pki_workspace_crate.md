@@ -58,9 +58,11 @@ Resolve the following before Phase 1; capture in
    peer-CA chain verification.
 6. **Toron-side verifier construction.** Read Toron's
    post-ADR-046 `build_rustls_server_config` for existing
-   per-role verifier construction. Confirm `allowed_san_prefixes`
-   parameterization is byte-identical with
-   `tls-pki` trust-chain helper and caller-owned verifier boundary.
+   per-role verifier construction. Confirm Toron keeps
+   `allowed_san_prefixes` / SAN-shape policy in its local
+   wrapper while delegating peer-CA chain verification to the
+   `tls-pki` trust-chain helper and caller-owned verifier
+   boundary.
 7. **Toron-side inline DER parsing check.** Confirm Toron does
    not currently do any inline DER parsing (search for
    `DerReader`, `der_parser::`, `x509-parser::` usage in
@@ -798,11 +800,13 @@ Materialize `plans/impl/047_*_evidence.md` with:
    types). Mitigation: Phase 0 audit captures import sites;
    migration done in phases (Phase 2 first, validate; Phase 3
    next, validate; etc.).
-8. **D8 caller-owned verifier sketch wrong.** The
-   `WendelonClientCertVerifier` shape in D8 is a Claude
-   prediction. Phase 0 audit may surface a different
-   composition shape. Mitigation: D8 documented as the
-   sketch; Phase 0 audit confirms or refines.
+8. **D8 caller-owned verifier boundary accidentally narrows
+   into shared policy.** The promoted shape is trust-chain
+   helpers plus ring-local policy wrappers, not a shared
+   SAN-shape or actor-policy verifier. Mitigation: keep
+   `build_client_cert_chain_verifier` /
+   `build_server_cert_chain_verifier` policy-neutral and
+   compose Toron/Wendelon identity checks at ring boundaries.
 9. **`PkiError` leaks into Toron public policy surface.**
    ADR 044 guards expect Toron's `pub enum TlsError` and local
    role-rejection tokens. Mitigation: keep `TlsError` local and
