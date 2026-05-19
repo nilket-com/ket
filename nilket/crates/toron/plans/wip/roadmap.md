@@ -2723,6 +2723,99 @@ along with the forward-sequence rewrite.
   ADR 038 byte-identical). The nine-phase
   migration is materialized in
   `plans/impl/039_wendelon_drop_migration_substrate.md`.
+- **ADR 040 — Unified Nilket CLI Entrypoint.**
+  Promoted. **First operator-surface ADR** in the
+  project — introduces a new ADR category alongside
+  substrate, composition, and component-internal.
+  Iter 0 through final iter 3 on a converging D-set,
+  then **user-directed iter-2 simplification** that
+  collapsed the multiplexer from a top-level `clap`
+  parser with reserved client verbs to a strict
+  two-noun hand-rolled router. Final promoted
+  D-set: **11 decisions**. Adds a new leaf crate
+  `crates/nilket` whose only binary is a
+  synchronous router with exactly two valid first
+  arguments (`wendelon`, `toron`); each role crate
+  exposes a `cli::run(program, args) -> ExitCode`
+  library runner that owns its own argument
+  parsing and (if needed) its own async runtime.
+  **Second cycle in council history with a user-
+  directed simplification at promotion drafting**
+  after ADR 039 iter-3. Where ADR 039's
+  redirection was load-bearing (Toron-orchestrated
+  → Wendelon-orchestrated choreography), ADR 040's
+  was scope-paring (an over-scoped D-set with top-
+  level client verbs + clap + runtime panic → the
+  final 11-decision D-set with strict two-noun
+  delegation + no shared runtime).
+  **D1-D4 critical decisions:** leaf-crate
+  aggregation; one product binary, two process
+  roles; strict two-noun root taxonomy
+  (`wendelon`, `toron` only); **no shared runtime
+  in root binary** (no `clap`, no `tokio`, no
+  `tracing` in `crates/nilket`).
+  **D5 critical decision:** hand-rolled delegated
+  parsing. The multiplexer intercepts `--version`
+  and `--help`, then matches on first argument and
+  forwards the remaining iterator to the role's
+  runner.
+  **D6 critical decision:** library-runner
+  extraction in both role crates. Wendelon's
+  `crates/wendelon/src/main.rs` decomposes into
+  `crates/wendelon/src/cli.rs` (the runner) plus
+  either a thin shim or no binary at all. Toron
+  gains a new `crates/toron/src/cli.rs` exporting
+  the same runner signature.
+  **D7 critical decision:** role-scoped client
+  verbs. SQL belongs to Toron (`nilket toron sql
+  ...`); `nilket sql ...` rejected at root;
+  `nilket wendelon sql ...` rejected by Wendelon's
+  parser. Audit verifier stays under Wendelon
+  (`nilket wendelon audit verify ...`); no top-
+  level `diag` namespace introduced.
+  **D8 critical decision:** role-scoped
+  reservation pattern. `nilket toron start / sql
+  / inspect` parsed by Toron's CLI and returned
+  with stable "is reserved; not wired in ADR 040"
+  diagnostics. Namespace claimed; backend deferred.
+  **D9 critical decision:** single version
+  coordinate as packaging claim. `nilket
+  --version` prints exactly one string. ADR does
+  not mandate workspace-wide `version.workspace =
+  true` migration.
+  **D10 critical decision:** Plan A / Plan B
+  audit phasing. Phase 0 audits downstream tooling
+  for references to the existing `wendelon`
+  binary. Plan A (no references) deletes the
+  legacy binary; Plan B (references found) keeps a
+  five-line shim that calls `wendelon::cli::run`
+  for one transition cycle.
+  **D11 critical decision:** source-read
+  architecture guards as primary boundary. No
+  runtime process-global role flag. Same
+  enforcement posture as ADR 039.
+  **Nine architecture guards**:
+  `adr040_nilket_is_leaf_workspace_package`,
+  `adr040_nilket_root_has_no_role_runtime_dependencies`,
+  `adr040_nilket_delegates_to_two_roles`,
+  `adr040_no_extra_root_commands`,
+  `adr040_wendelon_cli_module_exists`,
+  `adr040_toron_cli_module_exists`,
+  `adr040_wendelon_cli_does_not_import_toron_runtime`,
+  `adr040_toron_cli_does_not_import_wendelon_runtime`,
+  `adr040_wendelon_binary_delegates_to_cli_runner`
+  (Plan B only). **Eight integration fixtures**
+  pinning root usage, version, reserved Toron
+  verbs, root SQL rejection, role-scoped SQL
+  rejection on Wendelon, and Wendelon byte-
+  identical helper-output. The seven-phase
+  migration is materialized in
+  `plans/impl/040_unified_nilket_cli_entrypoint.md`.
+  Retires the previously-predicted "ADR 040 =
+  Wendelon Server-Side DROP Orchestrator" Plan-B
+  contingency (ADR 039 D13) as an automatic next
+  topic: ADR 039 landed Plan A, so ADR 041 returns
+  to ordinary candidate selection.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -2790,7 +2883,108 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 039 promoted; ADR 040 candidates
+### ADR 040 promoted; ADR 041 candidates
+
+ADR 040 selected and promoted **Unified Nilket CLI
+Entrypoint** — Toron's **first operator-surface
+ADR**. Iter 0 through final iter 3 on a converging
+D-set, then **user-directed iter-2 scope-paring**
+that collapsed the multiplexer from a top-level
+`clap` parser with top-level client verbs to a
+strict two-noun hand-rolled router with no
+arg-parsing or async-runtime dependencies. Final
+promoted D-set: **11 decisions**. Adds a new leaf
+crate `crates/nilket` whose only binary is a
+synchronous router; each role crate exposes a
+`cli::run(program, args) -> ExitCode` library
+runner that owns its own parsing and runtime.
+
+**Second cycle in council history with a user-
+directed shape change at promotion drafting**
+after ADR 039 iter-3. ADR 039's redirection was
+load-bearing (Toron-orchestrated → Wendelon-
+orchestrated cross-ring choreography); ADR 040's
+was scope-paring (an over-scoped D-set with top-level
+client verbs + `clap` + runtime panic → the final
+11-decision D-set with strict two-noun delegation + no
+shared runtime + role-scoped reservation).
+Together they form the **user-directed
+simplification pattern** at promotion: the
+council converges on a structurally-sound but
+over-scoped D-set; the user names which slice to
+keep; final-iter authors document retractions and
+ratifications explicitly.
+
+**Operator-surface ADR category established.**
+Prior ADRs are either substrate (037/038/039
+cross-ring infrastructure), composition (036 SQL
+DELETE composing 035 row-identity), or component-
+internal (the rest). ADR 040 introduces the
+fourth category and defines its discipline:
+source-read guards (no runtime checks), role-
+scoped reservation pattern, leaf-crate
+aggregation with hand-rolled delegation, no
+shared runtime in the product entrypoint, and
+explicit Plan A / Plan B audit phasing for
+downstream-tooling deprecation. Future operator-
+surface ADRs (config formats, telemetry shapes,
+deploy descriptors) inherit this discipline.
+
+The seven-phase migration is materialized in
+`plans/impl/040_unified_nilket_cli_entrypoint.md`.
+
+The previously-predicted "ADR 040 = Wendelon
+Server-Side DROP Orchestrator" candidate (ADR
+039 D13, committed only under Plan B carry-forward)
+is historical, not the ADR 041 default. ADR 039
+landed Plan A, so no Plan-B carry-forward
+commitment is active. If later implementation
+evidence exposes a missing Wendelon DROP enablement
+slice, it can re-enter the candidate list on
+evidence; ordinary candidate selection applies.
+
+**Code-evidence-driven candidates carried
+forward:**
+
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate + new partial-write
+  contract. Likely a two-ADR sequence: partial-
+  write substrate cycle + SQL UPDATE composition.
+- **`CREATE OR REPLACE TABLE`** — lower to `DROP
+  IF EXISTS x; CREATE TABLE x AS SELECT ...`.
+  Composition over ADR 029 / 033 / 034 / 036 /
+  037 / 038 / 039. Available immediately because
+  ADR 039 shipped Plan A.
+- **`INSERT ... RETURNING` / `CTAS ... RETURNING`
+  / `DELETE ... RETURNING`** — DML result-shape
+  extension; modest user value until DEFAULT or
+  GENERATED columns or sequences exist.
+- **Subqueries in DELETE WHERE clause** (e.g.
+  `DELETE FROM t WHERE id IN (SELECT ...)`).
+  Future correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern: Toron submits one
+  high-level request; Wendelon owns internal
+  choreography.
+- **`nilket toron sql` real wiring.** Composition
+  over ADR 040's reservation pattern; needs the
+  real Toron SQL client surface (currently
+  in-process only; this ADR would expose a
+  network client). Operator-surface + composition
+  hybrid.
+- **`nilket toron start` real wiring.** Adds a
+  production Toron daemon binary. Composition
+  over the ADR 040 reservation pattern; needs
+  Toron's coordinator/worker process model
+  hardened for production.
+
+**Substrate candidates carried forward:** (identical
+to ADR 039's carry-forward list — re-listed below
+unchanged because ADR 040 was operator-surface,
+not substrate, and touched none of these seams)
+
+### ADR 039 promoted; ADR 040 candidates (HISTORICAL)
 
 ADR 039 selected and promoted **Wendelon DROP
 Migration Substrate** — Toron's **sixth cross-ring
