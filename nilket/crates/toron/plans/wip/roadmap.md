@@ -3034,6 +3034,162 @@ along with the forward-sequence rewrite.
   with real substrate, or not.
   The ten-phase migration is materialized in
   `plans/impl/042_toron_compute_daemon_substrate.md`.
+- **ADR 043 — Public Toron SQL Listener.**
+  Promoted. **Second ADR that lifts an ADR 040
+  reservation** (`nilket toron sql`); first cycle
+  where the ADR 042 task listener becomes
+  **load-bearing** for an operator-facing service.
+  Four council iterations on a substrate-class
+  topic: iter-0 topic-shape survey (Shape A
+  bundled mega-ADR vs Shape B transport-first vs
+  Shape C SQL-listener-first); iter-1 Codex spine
+  + Claude four-retraction convergence; iter-2
+  Claude two within-cycle retractions + 2-of-3
+  resolution of Gemini's narrow disagreements;
+  iter-3 final triple ratification with two
+  Codex-iter-2-trial-position retractions
+  (toyed with no-cancel-frame and single-buffered
+  Result; both retracted in favor of Claude
+  iter-2 positions). Final promoted D-set:
+  **20 decisions**.
+  **Shape C selected (loopback-only QUIC SQL
+  listener; defer remote auth policy to ADR 044)**
+  mirroring the ADR 042
+  substrate-lift discipline. Codex iter-0's
+  observation that "a daemon without SQL service
+  is operationally inert" pressured Shape C over
+  Shape B (transport-first); the Prioritization
+  philosophy "mega-scopes get split" precluded
+  Shape A bundled cycle.
+  **D1 critical decision:** lift only `nilket
+  toron sql`; `inspect` remains reserved with
+  **byte-identical ADR 040 diagnostic text**
+  (third consecutive reservation preserved
+  through ADRs 040 → 042 → 043).
+  **D2 critical decision:** CLI is a client, not
+  an in-process query runner. `nilket toron sql`
+  dials the daemon; does not construct
+  `QueryCoordinator` / `DistributedQueryCoordinator`
+  / Wendelon clients / catalogs / storage
+  adapters / descriptor registries in the nilket
+  process. Preserves ADR 040 D4 root-runtime-free
+  invariant (`crates/nilket` Cargo.toml lacks
+  `tokio` / `clap` / `tracing`).
+  **D5 critical decision:** SQL listener is
+  loopback-only; non-loopback binds fail config
+  validation with stable diagnostic mirroring
+  ADR 042 D9. **No inert no-listener fallback.**
+  QUIC is the default transport; authenticated
+  remote SQL belongs in ADR 044.
+  **D7 critical decision:** custom framed wire
+  protocol (length-prefixed postcard +
+  Arrow IPC payloads). **No gRPC / Arrow Flight /
+  Postgres wire frontend.** Gemini iter-0
+  proposed gRPC; rejected 2-of-3 (Codex +
+  Claude). Future ADR can wrap `ToronSqlFrame`
+  with a Postgres-wire or gRPC frontend without
+  changing the daemon. Wire types
+  (`ToronSqlFrame` / `ToronSqlMessage::{Execute,
+  Cancel, ResultBatch, Complete, Error}`) have
+  **no `*V1` suffix** (carries forward ADR 039
+  user directive; seventh consecutive cycle).
+  **D11 critical decision (Codex iter-1 spine
+  contribution):** SQL execution uses
+  `DistributedQueryCoordinator`, **not a local
+  bypass**. This makes the ADR 042 task listener
+  **load-bearing**: SELECT causes the daemon to
+  dispatch tasks to itself (via
+  `include_self_worker = true`) or to sibling
+  loopback workers over QUIC, exercising the
+  multi-process execution mechanics the V1 target
+  text requires.
+  **D13 critical decision:** the Wendelon access
+  path for SQL-enabled daemon mode is no longer
+  the ADR 042 empty-provider placeholder.
+  **Closes the ADR 042 known gap**
+  (`providers: HashMap::new()` from ADR 042
+  shipped real bind/accept/CancelTask but
+  couldn't execute Wendelon-backed scans). Phase
+  0 audit decides between Plan A (real
+  `wendelon_client::Client::connect_quic`) and
+  Plan B (sanctioned in-process Wendelon test
+  harness with named QUIC provider follow-up ADR
+  for QuicIoUring wiring).
+  **D15 critical decision:** cancellation is
+  **protocol-shape + best-effort**, not a full
+  runtime guarantee. `ToronSqlCancelRequest`
+  carries the target query id and routes through
+  whatever scheduler/worker cancel seams exist;
+  stable `Cancelled` / `CancellationUnsupported`
+  are both valid outcomes. Strong cross-worker
+  in-flight cancellation is a future runtime ADR.
+  **D16 critical decision:** preserve ADR 042's
+  `READY <worker-task-endpoint>` line
+  **byte-identical**; append second
+  `SQL_READY <sql-endpoint>` line when `[sql]`
+  binds. Backward compatible with any external
+  supervisor parsing the ADR 042 line. Gemini
+  iter-1 proposed key-value `READY worker=<>`
+  format; rejected 2-of-3 (Codex + Claude) in
+  favor of backward compatibility.
+  **D17 critical decision:** one statement per
+  CLI invocation; one-shot QUIC stream per
+  `nilket toron sql` invocation. Wire frame
+  types still admit persistent sessions later
+  (no V1 lock-in to one-shot at the wire level),
+  but the V1 CLI client is one-shot.
+  **D18 critical decision (Plan A / Plan B
+  sub-lift):** Wendelon QUIC provider maturity
+  decided at Phase 0 audit. Single-axis sub-lift
+  framing — only fixture 11's witness mechanism
+  differs between plans (real Wendelon cluster
+  under Plan A; sanctioned test harness under
+  Plan B); the rest of ADR 043 ships unchanged.
+  **D19 critical decision:** SQL wire encoding
+  reuses ADR 039 `wire::encode` / `wire::decode`
+  conventions. No new serialization framework.
+  **D20 critical decision:** DDL/DML result
+  shape pinned. SELECT → `ResultBatch` frames +
+  `Complete`; CREATE/DROP/INSERT/DELETE/CTAS →
+  `Complete { row_count }`. CLI renders
+  `OK rows=<n>` / `OK` / pretty-table + row-count
+  footer deterministically.
+  **Twenty-one architecture guards**
+  including the Codex unique guard 15
+  `adr043_sql_uses_distributed_coordinator_not_local_bypass`
+  (pins D11 load-bearing-task-listener), guard 18
+  `adr043_wendelon_client_has_real_provider_mode_for_sql`
+  (pins D13 ADR 042 gap closure), guard 20
+  `adr043_sql_ready_does_not_mutate_adr042_ready_line`
+  (pins D16 backward compatibility), and the
+  Claude unique guard 21
+  `adr043_sql_wire_uses_existing_wire_crate`
+  (pins D19). **Fourteen required integration
+  fixtures** including the load-bearing
+  wire-correctness witness
+  `toron_sql_select_from_bootstrapped_descriptor_executes_over_wire`
+  (table-backed SELECT through the full SQL wire
+  + coordinator + worker dispatch path; replaces
+  the iter-1 `SELECT 1` anchor after Codex
+  flagged that Toron rejects `SELECT without
+  FROM`). **Four optional V1-evidence
+  fixtures** (non-gating, post-promotion)
+  including `toron_sql_worker_sigkill_retry_digest_is_canonical`
+  — the V1 target signal now reachable through
+  SQL submission.
+  **Single-axis Plan A / Plan B sub-lift** on
+  Wendelon QUIC provider maturity. The reservation-
+  lift discipline established in ADR 042
+  (real substrate floor, never inert; byte-
+  identical reservation continuity for siblings)
+  extends unchanged.
+  **Byte-identical refactor-invariant chain
+  extends to eight preserved cycles** (ADRs
+  035/036/037/038/039/041/042/043 all preserve
+  the local DML fixture pass count + leave
+  `toron_fixture_worker.rs` source unmodified).
+  The ten-phase migration is materialized in
+  `plans/impl/043_public_toron_sql_listener.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -3101,7 +3257,183 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 042 promoted; ADR 043 candidates
+### ADR 043 promoted; ADR 044 candidates
+
+ADR 043 selected and promoted **Public Toron SQL
+Listener** — the **second ADR that lifts an ADR
+040 reservation** (after ADR 042 lifted `start`)
+and the first cycle where the ADR 042 task
+listener becomes **load-bearing** for an
+operator-facing service. Four council iterations
+on a substrate-class topic: iter-0 topic-shape
+survey (Shape A bundled vs Shape B transport-
+first vs Shape C SQL-listener-first); iter-1
+Codex spine + Claude four-retraction
+convergence; iter-2 Claude two within-cycle
+retractions + 2-of-3 resolution of Gemini's
+narrow disagreements; iter-3 triple ratification.
+Final D-set: **20 decisions, 21 architecture
+guards, 14 required integration fixtures + 4
+V1-evidence optional fixtures**.
+
+**Reservation-lift discipline applied for the
+second time.** ADR 040 introduced the role-scoped
+reservation pattern; ADR 042 established the
+reservation-lift discipline (real substrate, never
+inert; byte-identical sibling diagnostic
+continuity). ADR 043 applies that discipline to
+lift `sql` while preserving `inspect`
+byte-identically. Its only Plan A / Plan B axis
+is the D18 Wendelon provider witness mechanism,
+not whether the SQL reservation is lifted. Third
+consecutive cycle preserving the ADR 040
+reservation continuity invariant.
+
+**ADR 042 known gap closed.** ADR 042 shipped
+the daemon with `providers: HashMap::new()` —
+real bind/accept/CancelTask wire works but
+Wendelon-backed scans don't. ADR 043 D13 replaces
+that empty-provider execution path with real
+`wendelon_client::Client::connect_quic` (Plan A)
+or a sanctioned in-process Wendelon test harness
+plus named QUIC provider follow-up
+(Plan B) per Phase 0 audit.
+The wire-correctness witness fixture
+`toron_sql_select_from_bootstrapped_descriptor_executes_over_wire`
+exercises the full SQL wire + coordinator +
+worker dispatch + Wendelon connectivity path
+end-to-end.
+
+**Load-bearing task listener.** ADR 043 D11
+makes the ADR 042 task listener load-bearing for
+SQL: SELECT causes the daemon to dispatch tasks
+to itself (via `include_self_worker = true`) or
+to sibling loopback workers over QUIC, exercising
+the multi-process execution mechanics the V1
+target text requires. The two ADRs compose into
+the substrate the V1 target depends on.
+
+**Wire-protocol shape locked.** Custom framed
+length-prefixed postcard over QUIC streams +
+Arrow IPC payloads;
+reuses ADR 039 `wire::encode` / `wire::decode`
+conventions; no `*V1` suffix on `ToronSqlFrame` /
+`ToronSqlMessage` / `ToronSqlErrorCode`. gRPC /
+Arrow Flight / Postgres wire frontends are
+future-ADR wrappers that don't change daemon
+behavior. Gemini iter-0 proposed gRPC; rejected
+2-of-3.
+
+**Architectural invariants preserved through
+this cycle:**
+- ADR 040 reservation-pattern stability
+  (`inspect` byte-identical pre/post-ADR 043;
+  guard 2).
+- ADR 040 D4 root-runtime-free (`crates/nilket`
+  stays runtime-free; CLI is a client; guard 4
+  and guard 5).
+- ADR 038/039 registry convergence (single
+  shared `Arc<WendelonDescriptorRegistry>` across
+  catalog/scan/write/delete/admin + SQL coordinator;
+  extends ADR 042 D7 invariant; guard 14).
+- ADR 039 D5 no-V1-suffix convention (carried
+  forward to `ToronSqlFrame` / `ToronSqlMessage`
+  / `ToronSqlErrorCode`; guard 11).
+- ADR 035-043 byte-identical fixture-worker
+  refactor invariant (extends to eight preserved
+  cycles; `toron_fixture_worker.rs`
+  source unchanged).
+- ADR 042 daemon shape (task listener remains
+  loopback-only; ADR 043's SQL-driven path uses
+  QUIC by default; `READY <worker>` byte-
+  identical first line; guard 8 and guard 20).
+- ADR 041 D10 reservation continuity discipline
+  (multiple reservation siblings preserve text
+  byte-identical through their reservation
+  period).
+
+The ten-phase migration is materialized in
+`plans/impl/043_public_toron_sql_listener.md`.
+
+**ADR 044 lead candidate:**
+
+- **ADR 044 — Authenticated Remote Toron QUIC
+  Listeners.** Lifts the ADR 042 D9 loopback floor
+  for the worker task listener AND the ADR 043 D5
+  loopback floor for the SQL listener under a
+  shared remote-auth policy. Bundles mTLS/peer
+  identity, remote bind admission, cluster-domain
+  naming, cert/key/CA paths, and tenant-claim
+  handling. **Substrate-class** (peer identity,
+  tenant claims, and remote worker dispatch each
+  require alignment work). Likely 3-4 iteration
+  cycle. Could split into ADR 044a (remote QUIC
+  auth policy) + ADR 044b (listener applications)
+  if iter-0 surveying reveals scope creep.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **Multi-tenant routing.** Requires
+  authenticated remote QUIC transport carrying
+  tenant claims; ADR 045+ after ADR 044 exists.
+- **Wendelon descriptor discovery / refresh.**
+  Lifts ADR 042 D6 + ADR 043 D14 startup-only
+  bootstrap. Needs a Wendelon-side list-
+  descriptors RPC (cross-ring substrate cycle).
+- **Toron daemon observability listeners
+  (health / ready / metrics).** Shares TLS
+  material story with public SQL listener;
+  bundles with ADR 044 or follows it
+  immediately.
+- **`nilket toron inspect` real wiring.** ADR
+  040 reservation; orthogonal to SQL; needs
+  Toron inspect surface defined.
+- **CTAS `IF NOT EXISTS`** (`sql_planner.rs:897`
+  reject preserved by ADR 041 D3; tiny
+  composition cycle; now becomes user-visible
+  through the ADR 043 SQL surface).
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate + new partial-write
+  contract. Two-cycle minimum.
+- **`INSERT ... RETURNING` / `CTAS ...
+  RETURNING` / `DELETE ... RETURNING`** — DML
+  result-shape extension; modest user value
+  until DEFAULT or GENERATED columns or
+  sequences exist.
+- **Subqueries in DELETE WHERE clause** —
+  future correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern.
+- **Cascading secondary-index DROP substrate** —
+  ADR 039 D12 follow-up; weak operator pressure
+  until SQL `CREATE INDEX` exists.
+- **Atomic Wendelon-side replacement protocol** —
+  C1b from ADR 041 iter-0; only if later
+  requirements demand stronger semantics than
+  ADR 041's documented non-atomic composition.
+- **Persistent SQL connections / pipelined
+  statements** — ADR 043 wire types admit
+  extension; future ADR composes over the V1
+  wire surface.
+- **Prepared statements / parameterized
+  queries** — future composition ADR over the V1
+  wire protocol.
+- **gRPC / Arrow Flight / Postgres wire
+  protocol frontends** — future ADR(s) wrap
+  `ToronSqlFrame` without changing daemon
+  behavior.
+- **Strong cross-worker in-flight cancellation
+  semantics** — future runtime ADR. ADR 043 D15
+  ships protocol-shape + best-effort only.
+
+**Substrate candidates carried forward:** (identical
+to ADR 042's carry-forward list — re-listed below
+unchanged because ADR 043 was substrate-class +
+operator-surface continuation, not pure substrate,
+and touched none of these seams)
+
+### ADR 042 promoted; ADR 043 candidates (HISTORICAL)
 
 ADR 042 selected and promoted **Toron Compute Daemon
 Substrate** — the **first ADR that lifts an ADR 040
