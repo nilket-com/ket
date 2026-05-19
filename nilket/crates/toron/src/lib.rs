@@ -2,6 +2,7 @@ mod aggregate_kernel;
 
 pub mod binder;
 pub mod catalog;
+pub mod cli;
 pub mod coordinator;
 pub mod distributed;
 pub mod error;

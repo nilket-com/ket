@@ -147,4 +147,4 @@ Required in `crates/nilket/tests/cli_integration.rs`:
 
 This is the **first operator-surface ADR** in the project. Prior ADRs are either substrate (037/038/039 cross-ring infrastructure), composition (036 SQL DELETE), or component-internal (the rest). ADR 040 introduces the category and establishes its discipline: source-read guards, role-scoped reservation, leaf-crate aggregation, no shared runtime, and explicit Plan A / Plan B audit phasing.
 
-**Audit outcome and Plan A/B choice to be appended here at implementation time** as a one-paragraph note before merge.
+**Implementation audit outcome:** Phase 0 found repo-local references that still build, package, or verify the `wendelon` binary, including `crates/wendelon/ci/check_fips_symbol_sweep.sh`, `crates/wendelon/ci/generate_regulated_release_evidence.sh`, `crates/wendelon/ci/verify_regulated_release_evidence.sh`, and compliance/runbook docs. ADR 040 therefore ships **Plan B**: keep the legacy `wendelon` binary as a shim delegating to `wendelon::cli::run`, while `nilket wendelon ...` becomes the authoritative operator path.

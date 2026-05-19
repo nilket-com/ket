@@ -558,6 +558,7 @@ fn error_label(err: &ClientError) -> String {
 		ClientError::SchemaUpdateRejected { reason_code, .. } => {
 			format!("schema_update_rejected_{reason_code}")
 		}
+		ClientError::Admin(error) => format!("admin_{error:?}"),
 	}
 }
 

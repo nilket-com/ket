@@ -5768,6 +5768,134 @@ fn adr039_no_drop_table_storage_proof_type() {
 }
 
 #[test]
+fn adr040_nilket_is_leaf_workspace_package() {
+	let nilket_cargo_path = workspace_root_dir().join("crates/nilket/Cargo.toml");
+	let nilket_cargo = std::fs::read_to_string(&nilket_cargo_path).expect("read nilket Cargo.toml");
+
+	assert!(nilket_cargo.contains("name = \"nilket\""));
+	assert!(nilket_cargo.contains("toron = { path = \"../toron\" }"));
+	assert!(nilket_cargo.contains("wendelon = { path = \"../wendelon\" }"));
+
+	let mut offenders = Vec::new();
+	for cargo_path in workspace_cargo_tomls() {
+		if cargo_path == nilket_cargo_path {
+			continue;
+		}
+		let source = std::fs::read_to_string(&cargo_path).expect("read Cargo.toml");
+		if source.lines().any(|line| {
+			let trimmed = line.trim();
+			trimmed.starts_with("nilket ") || trimmed.starts_with("nilket=")
+		}) {
+			offenders.push((cargo_path, 1, "depends on nilket".to_string()));
+		}
+	}
+
+	assert!(
+		offenders.is_empty(),
+		"workspace crate depends on nilket:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+fn adr040_nilket_root_has_no_role_runtime_dependencies() {
+	let cargo = std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+		.expect("read nilket Cargo.toml");
+
+	for forbidden in ["clap", "tokio", "tracing"] {
+		assert!(
+			!cargo
+				.lines()
+				.any(|line| line.trim_start().starts_with(forbidden)),
+			"nilket root has forbidden direct dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr040_nilket_delegates_to_two_roles() {
+	let main = std::fs::read_to_string(workspace_root_dir().join("crates/nilket/src/main.rs"))
+		.expect("read nilket main");
+
+	assert!(main.contains("Some(\"wendelon\") => wendelon::cli::run("));
+	assert!(main.contains("Some(\"toron\") => toron::cli::run("));
+}
+
+#[test]
+fn adr040_no_extra_root_commands() {
+	let main = std::fs::read_to_string(workspace_root_dir().join("crates/nilket/src/main.rs"))
+		.expect("read nilket main");
+
+	for forbidden in [
+		"Some(\"query\")",
+		"Some(\"sql\")",
+		"Some(\"inspect\")",
+		"Some(\"diag\")",
+		"Some(\"standalone\")",
+		"Some(\"local\")",
+	] {
+		assert!(
+			!main.contains(forbidden),
+			"nilket root dispatches {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr040_wendelon_cli_module_exists() {
+	let cli = std::fs::read_to_string(wendelon_manifest_dir().join("src/cli.rs"))
+		.expect("read Wendelon CLI source");
+
+	assert!(cli.contains("pub fn run<I>(program: &str, args: I) -> ExitCode"));
+}
+
+#[test]
+fn adr040_toron_cli_module_exists() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(cli.contains("pub fn run<I>(program: &str, args: I) -> ExitCode"));
+}
+
+#[test]
+fn adr040_wendelon_cli_does_not_import_toron_runtime() {
+	let cli = std::fs::read_to_string(wendelon_manifest_dir().join("src/cli.rs"))
+		.expect("read Wendelon CLI source");
+
+	assert!(!cli.contains("use toron::"));
+}
+
+#[test]
+fn adr040_toron_cli_does_not_import_wendelon_runtime() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	for forbidden in [
+		"use wendelon::",
+		"WendelonNode",
+		"SlabManager",
+		"TableDropPrepareRequest",
+		"TableReclaimCompletionRequest",
+		"TableDropFinalizeRequest",
+	] {
+		assert!(!cli.contains(forbidden), "Toron CLI contains {forbidden}");
+	}
+}
+
+#[test]
+fn adr040_wendelon_binary_delegates_to_cli_runner() {
+	let main = wendelon_manifest_dir().join("src/main.rs");
+	if !main.exists() {
+		return;
+	}
+	let source = std::fs::read_to_string(main).expect("read Wendelon main");
+
+	assert!(source.contains("wendelon::cli::run"));
+	assert!(!source.contains("tokio::main"));
+	assert!(!source.contains("WendelonNode::bootstrap"));
+}
+
+#[test]
 fn adr038_strict_admin_sink_default_is_unsupported_storage_admin() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
@@ -6160,6 +6288,31 @@ fn wendelon_manifest_dir() -> PathBuf {
 		.parent()
 		.expect("crates directory")
 		.join("wendelon")
+}
+
+fn workspace_root_dir() -> PathBuf {
+	manifest_dir()
+		.parent()
+		.expect("crates directory")
+		.parent()
+		.expect("workspace root")
+		.to_path_buf()
+}
+
+fn workspace_cargo_tomls() -> Vec<PathBuf> {
+	let workspace_root = workspace_root_dir();
+	let mut manifests = Vec::new();
+	for relative_root in ["crates", "crates/wendelon/crates"] {
+		let root = workspace_root.join(relative_root);
+		for entry in std::fs::read_dir(root).expect("read workspace crate dir") {
+			let path = entry.expect("read dir entry").path();
+			let cargo_toml = path.join("Cargo.toml");
+			if cargo_toml.exists() {
+				manifests.push(cargo_toml);
+			}
+		}
+	}
+	manifests
 }
 
 fn descriptor() -> TableSchemaDescriptor {

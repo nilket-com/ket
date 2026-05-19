@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod backup;
 pub mod build_info;
+pub mod cli;
 pub mod client;
 pub mod config;
 pub mod consensus;
