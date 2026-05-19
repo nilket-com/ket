@@ -6069,11 +6069,272 @@ fn adr041_toron_cli_reservations_preserved() {
 		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
 
 	assert!(cli.contains("is reserved; production execution is not wired in ADR 040"));
-	assert!(cli.contains("[verb] if verb == \"start\" => reserved(\"start\")"));
 	assert!(cli.contains("[verb, rest @ ..] if verb == \"sql\" && !rest.is_empty()"));
 	assert!(cli.contains("[verb] if verb == \"sql\" => reserved(\"sql\")"));
 	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
 	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
+}
+
+#[test]
+fn adr042_toron_start_is_not_reserved() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(cli.contains("crate::daemon::run_start(PathBuf::from(config_path))"));
+	assert!(!cli.contains("[verb] if verb == \"start\" => reserved(\"start\")"));
+}
+
+#[test]
+fn adr042_toron_sql_and_inspect_remain_reserved() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(cli.contains("is reserved; production execution is not wired in ADR 040"));
+	assert!(cli.contains("[verb, rest @ ..] if verb == \"sql\" && !rest.is_empty()"));
+	assert!(cli.contains("[verb] if verb == \"sql\" => reserved(\"sql\")"));
+	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
+	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
+}
+
+#[test]
+fn adr042_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+	let nilket_src =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/src/main.rs"))
+			.expect("read nilket main");
+
+	for forbidden in ["tokio", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct {forbidden} dependency"
+		);
+		assert!(
+			!nilket_src.contains(forbidden),
+			"nilket root source gained direct {forbidden} runtime surface"
+		);
+	}
+}
+
+#[test]
+fn adr042_toron_cli_owns_runtime_not_nilket() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let nilket_src =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/src/main.rs"))
+			.expect("read nilket main");
+
+	assert!(daemon.contains("tokio::runtime::Builder::new_multi_thread()"));
+	assert!(cli.contains("crate::daemon::run_start"));
+	assert!(!nilket_src.contains("tokio::runtime"));
+}
+
+#[test]
+fn adr042_toron_config_surface_exists() {
+	let lib = std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib");
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(lib.contains("pub mod config;"));
+	assert!(config.contains("pub struct ToronBootstrapConfig"));
+	assert!(config.contains("pub fn load_toron_bootstrap_config"));
+	assert!(config.contains("pub fn render_example_config"));
+	assert!(config.contains("pub fn write_example_config"));
+}
+
+#[test]
+fn adr042_descriptor_bootstrap_is_product_type_with_table_ids() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(config.contains("pub struct ToronDescriptorBootstrap"));
+	assert!(config.contains("pub tables: Vec<ToronDescriptorBootstrapTable>"));
+	assert!(config.contains("pub struct ToronDescriptorBootstrapTable"));
+	assert!(config.contains("pub table_id: u64"));
+	assert!(config.contains("pub descriptor: wendelon_client::TableSchemaDescriptor"));
+	assert!(config.contains("Vec<(TableId, wendelon_client::TableSchemaDescriptor)>"));
+}
+
+#[test]
+fn adr042_descriptor_bootstrap_has_no_v1_type_suffix() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(!config.contains("ToronDescriptorBootstrapV1"));
+	assert!(!config.contains("ToronDescriptorBootstrapTableV1"));
+}
+
+#[test]
+fn adr042_daemon_uses_single_descriptor_registry() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let startup = brace_blocks_after_marker(&daemon, "pub async fn start")
+		.into_iter()
+		.next()
+		.expect("ToronDaemon::start")
+		.1;
+
+	assert_eq!(
+		startup
+			.matches("WendelonDescriptorRegistry::from_descriptors")
+			.count(),
+		1
+	);
+	assert!(startup.contains("let registry = Arc::new("));
+	assert!(startup.contains("WendelonCatalog::with_client_and_registry"));
+	assert!(startup.contains("WendelonStorageScan::with_descriptor_registry"));
+	assert!(startup.contains("WendelonStorageWrite::with_descriptor_registry"));
+	assert!(startup.contains("WendelonStorageDeleteRows::with_descriptor_registry"));
+	assert!(startup.contains("WendelonStorageAdmin::new"));
+	assert!(startup.matches("Arc::clone(&registry)").count() >= 5);
+}
+
+#[test]
+fn adr042_descriptor_bootstrap_is_startup_only() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let startup = brace_blocks_after_marker(&daemon, "pub async fn start")
+		.into_iter()
+		.next()
+		.expect("ToronDaemon::start")
+		.1;
+
+	assert!(startup.contains("load_descriptor_bootstrap(path)?"));
+	for forbidden in [
+		"list_descriptors",
+		"refresh_descriptor",
+		"watch_descriptor",
+		"refresh_topology",
+	] {
+		assert!(
+			!daemon.contains(forbidden),
+			"daemon contains descriptor discovery/refresh token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr042_unauthenticated_task_listener_is_loopback_only() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert!(config.contains("NON_LOOPBACK_BIND_DIAGNOSTIC"));
+	assert!(config.contains(".parse::<SocketAddr>()"));
+	assert!(config.contains("task_listener_bind.ip().is_loopback()"));
+	assert!(daemon.contains("TcpListener::bind(config.worker.task_listener_bind)"));
+}
+
+#[test]
+fn adr042_no_public_query_service() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			[
+				"ToronQueryService",
+				"ExecuteSqlRequest",
+				"SqlListener",
+				"QueryListener",
+				"ArrowResultService",
+			]
+			.iter()
+			.any(|symbol| line.contains(symbol))
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"Toron source contains ADR 042 public query service symbol(s):\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn adr042_no_observability_listeners() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			[
+				"observability::spawn",
+				"health_listener",
+				"ready_listener",
+				"metrics_listener",
+				"TlsAcceptor",
+			]
+			.iter()
+			.any(|symbol| line.contains(symbol))
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"Toron source contains ADR 042 observability listener symbol(s):\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn adr042_no_fixture_storage_in_production_daemon() {
+	let manifest_dir = manifest_dir();
+	let daemon = std::fs::read_to_string(manifest_dir.join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let config = std::fs::read_to_string(manifest_dir.join("src/config.rs"))
+		.expect("read Toron config source");
+	let production = format!("{daemon}\n{config}");
+
+	for forbidden in [
+		"toron_fixture_worker",
+		"FixtureStorageScan",
+		"vals",
+		"orders",
+		"customers",
+	] {
+		assert!(
+			!production.contains(forbidden),
+			"production daemon/config contains fixture token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr042_no_wendelon_node_in_toron_start() {
+	let manifest_dir = manifest_dir();
+	let daemon = std::fs::read_to_string(manifest_dir.join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let config = std::fs::read_to_string(manifest_dir.join("src/config.rs"))
+		.expect("read Toron config source");
+	let production = format!("{daemon}\n{config}");
+
+	for forbidden in ["WendelonNode", "raft_storage", "SlabManager", "data_server"] {
+		assert!(
+			!production.contains(forbidden),
+			"Toron start production source contains Wendelon server token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr042_fixture_worker_source_remains_isolated() {
+	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker source");
+
+	for forbidden in [
+		"crate::daemon",
+		"toron::daemon",
+		"crate::config",
+		"toron::config",
+	] {
+		assert!(
+			!fixture.contains(forbidden),
+			"fixture worker imports production daemon/config token {forbidden}"
+		);
+	}
 }
 
 #[test]

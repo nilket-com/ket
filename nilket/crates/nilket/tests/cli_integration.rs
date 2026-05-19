@@ -1,5 +1,6 @@
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,10 @@ fn nilket(args: &[&str]) -> Output {
 		.args(args)
 		.output()
 		.expect("run nilket")
+}
+
+fn nilket_command() -> Command {
+	Command::new(env!("CARGO_BIN_EXE_nilket"))
 }
 
 fn stdout(output: &Output) -> String {
@@ -34,6 +39,31 @@ fn fresh_dir(tag: &str) -> PathBuf {
 		std::env::temp_dir().join(format!("nilket-cli-{tag}-{}-{}", std::process::id(), nanos));
 	std::fs::create_dir_all(&dir).expect("create temp dir");
 	dir
+}
+
+fn minimal_toron_config(task_listener_bind: &str) -> String {
+	format!(
+		r#"[node]
+worker_id = "00000000-0000-0000-0000-000000000042"
+tenant_id = 1
+drain_timeout_seconds = 1
+
+[worker]
+task_listener_bind = "{task_listener_bind}"
+memory_budget_bytes = 1048576
+
+[storage.wendelon]
+bootstrap_peers = [
+  {{ node_id = 1, address = "127.0.0.1:7001" }},
+]
+
+[catalog]
+
+[observability]
+level = "info"
+format = "pretty"
+"#
+	)
 }
 
 fn node(id: u32) -> NodeId {
@@ -97,12 +127,57 @@ fn nilket_toron_sql_reaches_toron_branch() {
 }
 
 #[test]
-fn nilket_toron_sql_start_inspect_still_reserved() {
-	for (args, stderr_expected) in [
-		(
-			&["toron", "start"][..],
-			"toron start is reserved; production execution is not wired in ADR 040\n",
+fn nilket_toron_start_requires_config_path() {
+	let output = nilket(&["toron", "start"]);
+
+	assert_eq!(output.status.code(), Some(2), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert_eq!(
+		stderr(&output),
+		"toron start requires <path/to/toron.toml>\n"
+	);
+}
+
+#[test]
+fn nilket_toron_start_rejects_missing_config_file() {
+	let dir = fresh_dir("toron-missing-config");
+	let missing = dir.join("missing.toml");
+	let output = nilket(&[
+		"toron",
+		"start",
+		missing.to_str().expect("utf8 missing config path"),
+	]);
+
+	assert_eq!(output.status.code(), Some(2), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	let stderr = stderr(&output);
+	assert!(
+		stderr.contains(&format!("failed to load {}", missing.display())),
+		"{stderr}"
+	);
+}
+
+#[test]
+fn nilket_toron_start_rejects_non_loopback_bind() {
+	let dir = fresh_dir("toron-non-loopback");
+	let path = dir.join("toron.toml");
+	std::fs::write(&path, minimal_toron_config("0.0.0.0:0")).expect("write toron config");
+
+	let output = nilket(&["toron", "start", path.to_str().expect("utf8 config path")]);
+
+	assert_eq!(output.status.code(), Some(2), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert!(
+		stderr(&output).contains(
+			"toron worker listener requires authenticated transport for non-loopback bind address"
 		),
+		"{output:?}"
+	);
+}
+
+#[test]
+fn nilket_toron_sql_and_inspect_still_reserved() {
+	for (args, stderr_expected) in [
 		(
 			&["toron", "sql", "SELECT 1"][..],
 			"toron sql is reserved; production execution is not wired in ADR 040\n",
@@ -117,6 +192,60 @@ fn nilket_toron_sql_start_inspect_still_reserved() {
 		assert!(stdout(&output).is_empty(), "{output:?}");
 		assert_eq!(stderr(&output), stderr_expected);
 	}
+}
+
+#[test]
+fn nilket_toron_print_example_config() {
+	let output = nilket(&["toron", "--print-example-config"]);
+
+	assert!(output.status.success(), "{output:?}");
+	assert_eq!(stdout(&output), toron::config::render_example_config());
+	assert!(stderr(&output).is_empty(), "{output:?}");
+}
+
+#[test]
+fn nilket_toron_write_example_config_refuses_overwrite() {
+	let dir = fresh_dir("toron-write-example");
+	let path = dir.join("toron.toml");
+	let path_str = path.to_str().expect("utf8 config path");
+
+	let first = nilket(&["toron", "--write-example-config", path_str]);
+	assert!(first.status.success(), "{first:?}");
+	assert_eq!(
+		std::fs::read_to_string(&path).expect("read written config"),
+		toron::config::render_example_config()
+	);
+
+	let second = nilket(&["toron", "--write-example-config", path_str]);
+	assert_eq!(second.status.code(), Some(2), "{second:?}");
+	assert!(
+		stderr(&second).contains("failed to write starter config"),
+		"{second:?}"
+	);
+}
+
+#[test]
+fn toron_daemon_prints_ready_endpoint() {
+	let dir = fresh_dir("toron-ready");
+	let path = dir.join("toron.toml");
+	std::fs::write(&path, minimal_toron_config("127.0.0.1:0")).expect("write toron config");
+	let mut child = nilket_command()
+		.args(["toron", "start", path.to_str().expect("utf8 config path")])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn nilket toron start");
+	let stdout = child.stdout.take().expect("child stdout");
+	let mut reader = BufReader::new(stdout);
+	let mut line = String::new();
+	reader.read_line(&mut line).expect("read READY line");
+	let _ = child.kill();
+	let _ = child.wait();
+
+	assert!(
+		line.starts_with("READY 127.0.0.1:"),
+		"unexpected READY line: {line:?}"
+	);
 }
 
 #[test]

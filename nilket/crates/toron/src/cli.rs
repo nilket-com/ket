@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const RESERVED_MESSAGE_SUFFIX: &str = "is reserved; production execution is not wired in ADR 040";
@@ -20,7 +21,29 @@ where
 			println!("toron {}", env!("CARGO_PKG_VERSION"));
 			ExitCode::SUCCESS
 		}
-		[verb] if verb == "start" => reserved("start"),
+		[flag] if flag == "--print-example-config" => {
+			print!("{}", crate::config::render_example_config());
+			ExitCode::SUCCESS
+		}
+		[flag, path] if flag == "--write-example-config" => {
+			match crate::config::write_example_config(Path::new(path)) {
+				Ok(()) => {
+					eprintln!("toron: wrote starter config to {path}");
+					ExitCode::SUCCESS
+				}
+				Err(error) => {
+					eprintln!("failed to write starter config to {path}: {error}");
+					ExitCode::from(2)
+				}
+			}
+		}
+		[verb, config_path] if verb == "start" => {
+			crate::daemon::run_start(PathBuf::from(config_path))
+		}
+		[verb] if verb == "start" => {
+			eprintln!("toron start requires <path/to/toron.toml>");
+			ExitCode::from(2)
+		}
 		[verb, rest @ ..] if verb == "sql" && !rest.is_empty() => reserved("sql"),
 		[verb] if verb == "sql" => reserved("sql"),
 		[verb] if verb == "inspect" => reserved("inspect"),
@@ -40,6 +63,6 @@ fn reserved(verb: &str) -> ExitCode {
 
 fn print_usage(program: &str) {
 	eprintln!(
-		"usage:\n  {program} start\n  {program} sql <statement...>\n  {program} inspect [target]\n\nAll Toron role commands are reserved in ADR 040."
+		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql <statement...>\n  {program} inspect [target]\n\nToron sql and inspect are reserved in ADR 040."
 	);
 }
