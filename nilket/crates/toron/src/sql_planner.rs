@@ -668,8 +668,10 @@ impl SqlPlanner {
 			with_tags,
 		} = create_table;
 
-		if *or_replace {
-			return Err(unsupported("unsupported CREATE TABLE clause: OR REPLACE"));
+		if *or_replace && *if_not_exists {
+			return Err(unsupported(
+				"CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS",
+			));
 		}
 		if *temporary {
 			return Err(unsupported("unsupported CREATE TABLE clause: TEMPORARY"));
@@ -840,6 +842,7 @@ impl SqlPlanner {
 			name: table_ref,
 			schema,
 			if_not_exists: *if_not_exists,
+			or_replace: *or_replace,
 		})
 	}
 
@@ -893,6 +896,11 @@ impl SqlPlanner {
 			with_tags,
 		} = create_table;
 
+		if *or_replace && *if_not_exists {
+			return Err(unsupported(
+				"CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS",
+			));
+		}
 		if *if_not_exists {
 			return Err(unsupported("CTAS does not support IF NOT EXISTS in v1"));
 		}
@@ -900,9 +908,6 @@ impl SqlPlanner {
 			return Err(unsupported(
 				"CTAS does not support explicit column lists in v1; use SELECT aliases for column names",
 			));
-		}
-		if *or_replace {
-			return Err(unsupported("unsupported CREATE TABLE clause: OR REPLACE"));
 		}
 		if *temporary {
 			return Err(unsupported("unsupported CREATE TABLE clause: TEMPORARY"));
@@ -1062,6 +1067,7 @@ impl SqlPlanner {
 		let source = self.lower_query(query)?;
 		Ok(LogicalPlan::CreateTableAsSelect {
 			table,
+			or_replace: *or_replace,
 			source: Box::new(source),
 		})
 	}

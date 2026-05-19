@@ -201,10 +201,12 @@ pub enum ExecutionPlan {
 		name: TableRef,
 		schema: SchemaRef,
 		if_not_exists: bool,
+		or_replace: bool,
 	},
 	CreateTableAsSelect {
 		table: TableRef,
 		schema: SchemaRef,
+		or_replace: bool,
 		source: Box<ExecutionPlan>,
 	},
 	DropTable {

@@ -97,6 +97,29 @@ fn nilket_toron_sql_reaches_toron_branch() {
 }
 
 #[test]
+fn nilket_toron_sql_start_inspect_still_reserved() {
+	for (args, stderr_expected) in [
+		(
+			&["toron", "start"][..],
+			"toron start is reserved; production execution is not wired in ADR 040\n",
+		),
+		(
+			&["toron", "sql", "SELECT 1"][..],
+			"toron sql is reserved; production execution is not wired in ADR 040\n",
+		),
+		(
+			&["toron", "inspect", "workers"][..],
+			"toron inspect is reserved; production execution is not wired in ADR 040\n",
+		),
+	] {
+		let output = nilket(args);
+		assert_eq!(output.status.code(), Some(2), "{output:?}");
+		assert!(stdout(&output).is_empty(), "{output:?}");
+		assert_eq!(stderr(&output), stderr_expected);
+	}
+}
+
+#[test]
 fn nilket_wendelon_sql_is_rejected_by_wendelon() {
 	let output = nilket(&["wendelon", "sql", "SELECT 1"]);
 

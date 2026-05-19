@@ -224,9 +224,11 @@ pub enum LogicalPlan {
 		name: TableRef,
 		schema: SchemaRef,
 		if_not_exists: bool,
+		or_replace: bool,
 	},
 	CreateTableAsSelect {
 		table: TableRef,
+		or_replace: bool,
 		source: Box<LogicalPlan>,
 	},
 	DropTable {

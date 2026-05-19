@@ -16,7 +16,7 @@ use toron::ir::{ExecutionPlan, LogicalPlan, SessionId, TableId};
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
-use toron::storage::{HlcBound, InMemoryStorageScan, TenantId};
+use toron::storage::{HlcBound, InMemoryStorageScan, InMemoryTableStorage, TenantId};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
 	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
@@ -41,6 +41,7 @@ fn planner_accepts_create_table_surface() {
 		name,
 		schema,
 		if_not_exists,
+		or_replace,
 	} = plan
 	else {
 		panic!("expected create table plan");
@@ -48,6 +49,7 @@ fn planner_accepts_create_table_surface() {
 
 	assert_eq!(name, TableRef::new("sales"));
 	assert!(!if_not_exists);
+	assert!(!or_replace);
 	assert_field(&schema, 0, "id", &DataType::Int32, true);
 	assert_field(&schema, 1, "amount", &DataType::Int64, true);
 	assert_field(&schema, 2, "price", &DataType::Float64, true);
@@ -66,6 +68,7 @@ fn planner_accepts_if_not_exists_qualified_name_and_nullability() {
 		name,
 		schema,
 		if_not_exists,
+		or_replace,
 	} = plan
 	else {
 		panic!("expected create table plan");
@@ -73,8 +76,31 @@ fn planner_accepts_if_not_exists_qualified_name_and_nullability() {
 
 	assert_eq!(name, TableRef::with_schema("app", "sales"));
 	assert!(if_not_exists);
+	assert!(!or_replace);
 	assert_field(&schema, 0, "id", &DataType::Int32, false);
 	assert_field(&schema, 1, "note", &DataType::Utf8, true);
+}
+
+#[test]
+fn planner_accepts_create_or_replace_table_surface() {
+	let plan = SqlPlanner::new()
+		.plan("CREATE OR REPLACE TABLE sales (id INT NOT NULL)")
+		.expect("plan create or replace table");
+
+	let LogicalPlan::CreateTable {
+		name,
+		schema,
+		if_not_exists,
+		or_replace,
+	} = plan
+	else {
+		panic!("expected create table plan");
+	};
+
+	assert_eq!(name, TableRef::new("sales"));
+	assert!(!if_not_exists);
+	assert!(or_replace);
+	assert_field(&schema, 0, "id", &DataType::Int32, false);
 }
 
 #[test]
@@ -153,6 +179,14 @@ fn planner_rejects_storage_synthetic_column_names() {
 			"reserved for storage metadata",
 		);
 	}
+}
+
+#[test]
+fn create_or_replace_table_rejects_if_not_exists_combo() {
+	assert_frontend_error(
+		"CREATE OR REPLACE TABLE IF NOT EXISTS sales (id INT)",
+		"CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS",
+	);
 }
 
 #[test]
@@ -309,6 +343,88 @@ async fn query_coordinator_executes_create_table_as_catalog_operation() {
 }
 
 #[tokio::test]
+async fn create_or_replace_table_creates_when_absent() {
+	let (catalog, _storage, coordinator, planner) = storage_coordinator();
+
+	let results = coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE OR REPLACE TABLE sales (id INT NOT NULL)")
+				.expect("plan create or replace"),
+			None,
+		)
+		.await
+		.expect("create or replace absent");
+
+	assert!(results.is_empty());
+	let binding = catalog
+		.resolve_table(&TableRef::new("sales"))
+		.await
+		.expect("created table is visible");
+	assert_field(&binding.schema, 0, "id", &DataType::Int32, false);
+}
+
+#[tokio::test]
+async fn create_or_replace_table_replaces_existing_schema() {
+	let (catalog, _storage, coordinator, planner) = storage_coordinator();
+
+	for sql in [
+		"CREATE TABLE sales (id INT NOT NULL)",
+		"CREATE OR REPLACE TABLE sales (amount BIGINT, note TEXT)",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let binding = catalog
+		.resolve_table(&TableRef::new("sales"))
+		.await
+		.expect("replacement binding");
+	assert_eq!(binding.schema.fields().len(), 2);
+	assert_field(&binding.schema, 0, "amount", &DataType::Int64, true);
+	assert_field(&binding.schema, 1, "note", &DataType::Utf8, true);
+}
+
+#[tokio::test]
+async fn create_or_replace_table_produces_fresh_object_id() {
+	let (catalog, _storage, coordinator, planner) = storage_coordinator();
+
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE sales (id INT NOT NULL)")
+				.expect("plan create"),
+			None,
+		)
+		.await
+		.expect("create table");
+	let before = catalog
+		.resolve_table(&TableRef::new("sales"))
+		.await
+		.expect("resolve before replace");
+
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE OR REPLACE TABLE sales (id INT NOT NULL)")
+				.expect("plan replace"),
+			None,
+		)
+		.await
+		.expect("replace table");
+	let after = catalog
+		.resolve_table(&TableRef::new("sales"))
+		.await
+		.expect("resolve after replace");
+
+	assert_ne!(before.legacy_table_id, after.legacy_table_id);
+	assert_ne!(before.table, after.table);
+	assert_ne!(before.fingerprint, after.fingerprint);
+}
+
+#[tokio::test]
 async fn distributed_query_coordinator_intercepts_create_table_before_dispatch() {
 	let catalog = Arc::new(MockCatalog::new());
 	let coordinator = DistributedQueryCoordinator::new(
@@ -350,6 +466,7 @@ async fn executor_rejects_direct_create_table_execution() {
 		name: TableRef::new("sales"),
 		schema: schema(&[Field::new("id", DataType::Int32, false)]),
 		if_not_exists: false,
+		or_replace: false,
 	};
 
 	let err = executor
@@ -371,6 +488,7 @@ fn fragmenter_rejects_direct_create_table_fragmentation() {
 		name: TableRef::new("sales"),
 		schema: schema(&[Field::new("id", DataType::Int32, false)]),
 		if_not_exists: false,
+		or_replace: false,
 	};
 
 	let err = fragment_plan(
@@ -415,6 +533,25 @@ fn empty_storage() -> Arc<InMemoryStorageScan> {
 	let schema = Arc::new(Schema::empty());
 	let batch = RecordBatch::new_empty(schema);
 	Arc::new(InMemoryStorageScan { table_data: batch })
+}
+
+fn storage_coordinator() -> (
+	Arc<MockCatalog>,
+	Arc<InMemoryTableStorage>,
+	QueryCoordinator,
+	SqlPlanner,
+) {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator = QueryCoordinator::with_writer(
+		catalog.clone(),
+		executor,
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(storage.clone());
+	(catalog, storage, coordinator, SqlPlanner::new())
 }
 
 fn binding_for(table_id: TableId, name: &TableRef, schema: &Schema) -> TableBinding {

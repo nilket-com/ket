@@ -4147,8 +4147,17 @@ fn adr034_coordinators_intercept_drop_table() {
 		.next()
 		.expect("execute_catalog_plan helper body")
 		.1;
+	let drop_helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn drop_existing_table_with_storage_admin",
+	)
+	.into_iter()
+	.next()
+	.expect("drop_existing_table_with_storage_admin helper body")
+	.1;
 	assert!(helper.contains("ExecutionPlan::DropTable"));
-	assert!(helper.contains(".drop_table(name, false)"));
+	assert!(helper.contains("drop_existing_table_with_storage_admin"));
+	assert!(drop_helper.contains(".drop_table(name, false)"));
 	assert!(helper.contains("Ok(Vec::new())"));
 }
 
@@ -5554,11 +5563,14 @@ fn adr038_execution_drop_table_remains_identity_free() {
 fn adr038_coordinator_resolves_drop_identity_at_execution() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
-	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
-		.into_iter()
-		.next()
-		.expect("execute_catalog_plan helper body")
-		.1;
+	let helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn drop_existing_table_with_storage_admin",
+	)
+	.into_iter()
+	.next()
+	.expect("drop_existing_table_with_storage_admin helper body")
+	.1;
 
 	assert!(helper.contains("catalog.resolve_table(name).await"));
 	assert!(helper.contains("DropTableStorageRequest"));
@@ -5585,11 +5597,14 @@ fn adr038_in_memory_storage_admin_removes_table_entry() {
 fn adr038_drop_table_storage_first_catalog_second() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
-	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
-		.into_iter()
-		.next()
-		.expect("execute_catalog_plan helper body")
-		.1;
+	let helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn drop_existing_table_with_storage_admin",
+	)
+	.into_iter()
+	.next()
+	.expect("drop_existing_table_with_storage_admin helper body")
+	.1;
 
 	assert!(
 		helper.find(".drop_table_storage").unwrap()
@@ -5896,6 +5911,217 @@ fn adr040_wendelon_binary_delegates_to_cli_runner() {
 }
 
 #[test]
+fn adr041_schema_create_or_replace_no_longer_rejected() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_create_table(")
+		.into_iter()
+		.next()
+		.expect("lower_create_table body")
+		.1;
+
+	assert!(body.contains("or_replace: *or_replace"));
+	assert!(!body.contains("unsupported CREATE TABLE clause: OR REPLACE"));
+}
+
+#[test]
+fn adr041_ctas_or_replace_no_longer_rejected() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_as_select")
+		.into_iter()
+		.next()
+		.expect("lower_create_table_as_select body")
+		.1;
+
+	assert!(body.contains("or_replace: *or_replace"));
+	assert!(!body.contains("unsupported CREATE TABLE clause: OR REPLACE"));
+}
+
+#[test]
+fn adr041_ctas_if_not_exists_remains_rejected() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_as_select")
+		.into_iter()
+		.next()
+		.expect("lower_create_table_as_select body")
+		.1;
+
+	assert!(body.contains("CTAS does not support IF NOT EXISTS in v1"));
+	assert!(body.contains("if *if_not_exists"));
+}
+
+#[test]
+fn adr041_or_replace_if_not_exists_is_explicitly_rejected() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+
+	assert!(planner.contains("CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS"));
+	assert_eq!(
+		planner
+			.matches("CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS")
+			.count(),
+		2
+	);
+}
+
+#[test]
+fn adr041_no_statement_sequence_ir() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+
+	assert!(!logical.contains("LogicalPlan::Sequence"));
+	assert!(!logical.contains("Sequence {"));
+	assert!(!execution.contains("ExecutionPlan::Sequence"));
+	assert!(!execution.contains("Sequence {"));
+}
+
+#[test]
+fn adr041_no_wendelon_replace_request() {
+	let mut offenders = source_lines(&manifest_dir().join("src"));
+	offenders.extend(source_lines(&wendelon_manifest_dir().join("src")));
+	offenders.retain(|(_, _, line)| {
+		[
+			"TableSchemaReplaceRequest",
+			"submit_table_replace",
+			"drop_table_with_replacement",
+		]
+		.iter()
+		.any(|forbidden| line.contains(forbidden))
+	});
+
+	assert!(
+		offenders.is_empty(),
+		"replacement protocol symbol found:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+fn adr041_replace_reuses_storage_admin_drop() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn drop_existing_table_with_storage_admin",
+	)
+	.into_iter()
+	.next()
+	.expect("drop_existing_table_with_storage_admin helper")
+	.1;
+	let catalog = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
+		.into_iter()
+		.next()
+		.expect("execute_catalog_plan helper")
+		.1;
+	let create_arm = catalog
+		.split("ExecutionPlan::CreateTable")
+		.nth(1)
+		.and_then(|rest| rest.split("ExecutionPlan::DropTable").next())
+		.expect("CreateTable arm");
+	let drop_arm = catalog
+		.split("ExecutionPlan::DropTable")
+		.nth(1)
+		.and_then(|rest| rest.split("other =>").next())
+		.expect("DropTable arm");
+
+	assert_eq!(coordinator.matches("DropTableStorageRequest {").count(), 1);
+	assert!(helper.contains("DropTableStorageRequest {"));
+	assert!(create_arm.contains("drop_existing_table_with_storage_admin"));
+	assert!(drop_arm.contains("drop_existing_table_with_storage_admin"));
+	assert!(!create_arm.contains("DropTableStorageRequest {"));
+}
+
+#[test]
+fn adr041_ctas_replace_materializes_source_before_drop() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let shared = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+		.into_iter()
+		.next()
+		.expect("shared write driver")
+		.1;
+	let ctas_arm = shared
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
+		.expect("CTAS arm");
+	let source = ctas_arm
+		.find("source_executor.execute_read_plan(source)")
+		.expect("source materialization");
+	let drop = ctas_arm
+		.find("drop_existing_table_with_storage_admin")
+		.expect("replace drop helper");
+	let create = ctas_arm
+		.find("catalog.create_table")
+		.expect("catalog create");
+
+	assert!(source < drop);
+	assert!(drop < create);
+}
+
+#[test]
+fn adr041_toron_cli_reservations_preserved() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(cli.contains("is reserved; production execution is not wired in ADR 040"));
+	assert!(cli.contains("[verb] if verb == \"start\" => reserved(\"start\")"));
+	assert!(cli.contains("[verb, rest @ ..] if verb == \"sql\" && !rest.is_empty()"));
+	assert!(cli.contains("[verb] if verb == \"sql\" => reserved(\"sql\")"));
+	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
+	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
+}
+
+#[test]
+fn adr041_replace_uses_fresh_table_object_id() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn drop_existing_table_with_storage_admin",
+	)
+	.into_iter()
+	.next()
+	.expect("drop_existing_table_with_storage_admin helper")
+	.1;
+	let create = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
+		.into_iter()
+		.next()
+		.expect("execute_catalog_plan helper")
+		.1;
+	let write = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+		.into_iter()
+		.next()
+		.expect("shared write driver")
+		.1;
+
+	assert!(helper.contains(") -> Result<bool, QueryError>"));
+	assert!(!helper.contains("Result<Option<TableBinding>"));
+	for arm in [
+		create
+			.split("ExecutionPlan::CreateTable")
+			.nth(1)
+			.and_then(|rest| rest.split("ExecutionPlan::DropTable").next())
+			.expect("CreateTable arm"),
+		write
+			.split("ExecutionPlan::CreateTableAsSelect")
+			.nth(1)
+			.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
+			.expect("CTAS arm"),
+	] {
+		let drop = arm
+			.find("drop_existing_table_with_storage_admin")
+			.expect("replace helper");
+		let create = arm.find(".create_table").expect("fresh create");
+		assert!(drop < create);
+	}
+}
+
+#[test]
 fn adr038_strict_admin_sink_default_is_unsupported_storage_admin() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
@@ -5925,11 +6151,14 @@ fn adr038_no_background_gc_or_scheduler() {
 		.next()
 		.expect("registry impl")
 		.1;
-	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
-		.into_iter()
-		.next()
-		.expect("execute_catalog_plan helper")
-		.1;
+	let helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn drop_existing_table_with_storage_admin",
+	)
+	.into_iter()
+	.next()
+	.expect("drop_existing_table_with_storage_admin helper")
+	.1;
 
 	for body in [storage_admin, registry, helper] {
 		assert!(!body.contains("tokio::spawn"));
@@ -5938,7 +6167,7 @@ fn adr038_no_background_gc_or_scheduler() {
 }
 
 #[test]
-fn adr038_no_create_or_replace_sql_surface() {
+fn adr038_no_dedicated_create_or_replace_sql_surface() {
 	let manifest_dir = manifest_dir();
 	for path in [
 		manifest_dir.join("src/ir.rs"),
@@ -5948,7 +6177,8 @@ fn adr038_no_create_or_replace_sql_surface() {
 	] {
 		let source = std::fs::read_to_string(&path).expect("read source");
 		assert!(!source.contains("CreateOrReplaceTable"));
-		assert!(!source.contains("CREATE OR REPLACE"));
+		assert!(!source.contains("TableSchemaReplaceRequest"));
+		assert!(!source.contains("drop_table_with_replacement"));
 	}
 }
 
@@ -6067,11 +6297,14 @@ fn adr038_drop_does_not_invalidate_bound_plans() {
 fn adr038_catalog_drop_table_only_called_from_routing_helper() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
-	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
-		.into_iter()
-		.next()
-		.expect("execute_catalog_plan helper")
-		.1;
+	let helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn drop_existing_table_with_storage_admin",
+	)
+	.into_iter()
+	.next()
+	.expect("drop_existing_table_with_storage_admin helper")
+	.1;
 
 	assert_eq!(coordinator.matches(".drop_table(").count(), 1);
 	assert!(helper.contains("catalog.drop_table(name, false).await"));

@@ -204,13 +204,20 @@ impl<'a> Binder<'a> {
 					name,
 					schema,
 					if_not_exists,
+					or_replace,
 				} => Ok(ExecutionPlan::CreateTable {
 					name: name.clone(),
 					schema: schema.clone(),
 					if_not_exists: *if_not_exists,
+					or_replace: *or_replace,
 				}),
-				LogicalPlan::CreateTableAsSelect { table, source } => {
-					self.bind_create_table_as_select(table, source).await
+				LogicalPlan::CreateTableAsSelect {
+					table,
+					or_replace,
+					source,
+				} => {
+					self.bind_create_table_as_select(table, *or_replace, source)
+						.await
 				}
 				LogicalPlan::DropTable { name, if_exists } => Ok(ExecutionPlan::DropTable {
 					name: name.clone(),
@@ -239,6 +246,7 @@ impl<'a> Binder<'a> {
 	async fn bind_create_table_as_select(
 		&self,
 		table: &TableRef,
+		or_replace: bool,
 		source: &LogicalPlan,
 	) -> Result<ExecutionPlan, BindingError> {
 		let source = self.bind_plan(source).await?;
@@ -248,6 +256,7 @@ impl<'a> Binder<'a> {
 		Ok(ExecutionPlan::CreateTableAsSelect {
 			table: table.clone(),
 			schema,
+			or_replace,
 			source: Box::new(source),
 		})
 	}
@@ -1319,17 +1328,20 @@ fn optimize_for_required(
 			name,
 			schema,
 			if_not_exists,
+			or_replace,
 		} => Ok((
 			ExecutionPlan::CreateTable {
 				name,
 				schema,
 				if_not_exists,
+				or_replace,
 			},
 			OrdinalRemap::new(),
 		)),
 		ExecutionPlan::CreateTableAsSelect {
 			table,
 			schema,
+			or_replace,
 			source,
 		} => {
 			let (source, _) = optimize_for_required(*source, None)?;
@@ -1337,6 +1349,7 @@ fn optimize_for_required(
 				ExecutionPlan::CreateTableAsSelect {
 					table,
 					schema,
+					or_replace,
 					source: Box::new(source),
 				},
 				OrdinalRemap::new(),

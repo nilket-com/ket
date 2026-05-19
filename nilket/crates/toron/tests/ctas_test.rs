@@ -28,11 +28,37 @@ fn planner_accepts_create_table_as_select_surface() {
 		.plan("CREATE TABLE copy AS SELECT id, name FROM people")
 		.expect("plan CTAS");
 
-	let LogicalPlan::CreateTableAsSelect { table, source } = plan else {
+	let LogicalPlan::CreateTableAsSelect {
+		table,
+		or_replace,
+		source,
+	} = plan
+	else {
 		panic!("expected CTAS logical plan");
 	};
 
 	assert_eq!(table, TableRef::new("copy"));
+	assert!(!or_replace);
+	assert!(matches!(*source, LogicalPlan::Project { .. }));
+}
+
+#[test]
+fn planner_accepts_create_or_replace_table_as_select_surface() {
+	let plan = SqlPlanner::new()
+		.plan("CREATE OR REPLACE TABLE copy AS SELECT id, name FROM people")
+		.expect("plan CTAS replace");
+
+	let LogicalPlan::CreateTableAsSelect {
+		table,
+		or_replace,
+		source,
+	} = plan
+	else {
+		panic!("expected CTAS logical plan");
+	};
+
+	assert_eq!(table, TableRef::new("copy"));
+	assert!(or_replace);
 	assert!(matches!(*source, LogicalPlan::Project { .. }));
 }
 
@@ -47,15 +73,27 @@ fn planner_rejects_unsupported_ctas_shapes() {
 			"CREATE TABLE IF NOT EXISTS copy AS SELECT id FROM people",
 			"IF NOT EXISTS",
 		),
-		(
-			"CREATE OR REPLACE TABLE copy AS SELECT id FROM people",
-			"OR REPLACE",
-		),
 		("CREATE TABLE copy LIKE people", "LIKE"),
 		("CREATE TABLE copy CLONE people", "CLONE"),
 	] {
 		assert_frontend_error(sql, diagnostic);
 	}
+}
+
+#[test]
+fn ctas_if_not_exists_remains_rejected() {
+	assert_frontend_error(
+		"CREATE TABLE IF NOT EXISTS copy AS SELECT id FROM people",
+		"CTAS does not support IF NOT EXISTS in v1",
+	);
+}
+
+#[test]
+fn ctas_or_replace_rejects_if_not_exists_combo() {
+	assert_frontend_error(
+		"CREATE OR REPLACE TABLE IF NOT EXISTS copy AS SELECT id FROM people",
+		"CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS",
+	);
 }
 
 #[tokio::test]
@@ -71,6 +109,7 @@ async fn binder_infers_ctas_schema_without_target_identity() {
 	let ExecutionPlan::CreateTableAsSelect {
 		table,
 		schema,
+		or_replace,
 		source,
 	} = bound
 	else {
@@ -78,10 +117,130 @@ async fn binder_infers_ctas_schema_without_target_identity() {
 	};
 
 	assert_eq!(table, TableRef::new("copy"));
+	assert!(!or_replace);
 	assert_eq!(schema.fields().len(), 2);
 	assert_field(&schema, 0, "id", &DataType::Int32, false);
 	assert_field(&schema, 1, "name", &DataType::Utf8, true);
 	assert!(matches!(*source, ExecutionPlan::Project { .. }));
+}
+
+#[tokio::test]
+async fn create_or_replace_table_as_select_creates_when_absent() {
+	let (_catalog, _storage, coordinator, planner) = coordinator();
+
+	for sql in [
+		"CREATE TABLE people (id INT NOT NULL, name TEXT)",
+		"INSERT INTO people VALUES (1, 'Alice'), (2, 'Bob')",
+		"CREATE OR REPLACE TABLE copy AS SELECT id, name FROM people",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT id, name FROM copy ORDER BY id",
+	)
+	.await;
+	assert_eq!(int32_column(&batch, 0).values(), &[1, 2]);
+	assert_eq!(string_column(&batch, 1).value(0), "Alice");
+	assert_eq!(string_column(&batch, 1).value(1), "Bob");
+}
+
+#[tokio::test]
+async fn create_or_replace_table_as_select_replaces_existing_table() {
+	let (catalog, storage, coordinator, planner) = coordinator();
+
+	for sql in [
+		"CREATE TABLE people (id INT NOT NULL, name TEXT)",
+		"INSERT INTO people VALUES (1, 'Alice'), (2, 'Bob')",
+		"CREATE TABLE copy (old_id INT NOT NULL)",
+		"INSERT INTO copy VALUES (99)",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+	let before = catalog
+		.resolve_table(&TableRef::new("copy"))
+		.await
+		.expect("resolve old copy");
+
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE OR REPLACE TABLE copy AS SELECT name FROM people")
+				.expect("plan replace CTAS"),
+			None,
+		)
+		.await
+		.expect("replace CTAS");
+
+	let after = catalog
+		.resolve_table(&TableRef::new("copy"))
+		.await
+		.expect("resolve new copy");
+	assert_ne!(before.table, after.table);
+	assert_eq!(storage.table_count(), 2);
+	assert_field(&after.schema, 0, "name", &DataType::Utf8, true);
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT name FROM copy ORDER BY name",
+	)
+	.await;
+	assert_eq!(string_column(&batch, 0).value(0), "Alice");
+	assert_eq!(string_column(&batch, 0).value(1), "Bob");
+}
+
+#[tokio::test]
+async fn ctas_or_replace_source_failure_preserves_existing_table() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+
+	for sql in [
+		"CREATE TABLE target (id INT NOT NULL)",
+		"INSERT INTO target VALUES (7)",
+		"CREATE TABLE source_without_storage (id INT NOT NULL)",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+	let before = catalog
+		.resolve_table(&TableRef::new("target"))
+		.await
+		.expect("resolve target before replace");
+
+	let err = coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE OR REPLACE TABLE target AS SELECT id FROM source_without_storage")
+				.expect("plan replace CTAS"),
+			None,
+		)
+		.await
+		.expect_err("source storage failure should reject");
+	assert!(
+		err.to_string().contains("table not found"),
+		"unexpected error: {err}"
+	);
+
+	let after = catalog
+		.resolve_table(&TableRef::new("target"))
+		.await
+		.expect("target remains after source failure");
+	assert_eq!(before.legacy_table_id, after.legacy_table_id);
+	assert_eq!(before.table, after.table);
+	assert_eq!(before.fingerprint, after.fingerprint);
+
+	let batch = concat_query(&coordinator, &planner, "SELECT id FROM target").await;
+	assert_eq!(int32_column(&batch, 0).values(), &[7]);
 }
 
 #[tokio::test]
@@ -369,6 +528,7 @@ async fn executor_and_fragmenter_reject_direct_ctas_execution() {
 	let plan = ExecutionPlan::CreateTableAsSelect {
 		table: TableRef::new("copy"),
 		schema: source.schema.clone(),
+		or_replace: false,
 		source: Box::new(scan_plan(&source)),
 	};
 	let executor = Executor::with_context(
@@ -433,7 +593,8 @@ fn coordinator() -> (
 		executor,
 		PlannerConfig::default(),
 		storage.clone(),
-	);
+	)
+	.with_storage_admin(storage.clone());
 	(catalog, storage, coordinator, SqlPlanner::new())
 }
 

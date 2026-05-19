@@ -520,6 +520,100 @@ async fn drop_admin_failure_then_retry_succeeds() {
 	);
 }
 
+#[tokio::test]
+async fn or_replace_uses_storage_admin_drop_before_catalog_removal() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let admin = Arc::new(CatalogVisibilityStorageAdmin::new(catalog.clone()));
+	let executor = Executor::new(storage.clone());
+	let coordinator = QueryCoordinator::with_writer_deleter_and_admin(
+		catalog.clone(),
+		executor,
+		PlannerConfig::default(),
+		storage.clone(),
+		storage,
+		admin.clone(),
+	);
+	let planner = SqlPlanner::new();
+
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE sales (id INT NOT NULL)")
+				.expect("plan create"),
+			None,
+		)
+		.await
+		.expect("create table");
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE OR REPLACE TABLE sales (amount BIGINT)")
+				.expect("plan replace"),
+			None,
+		)
+		.await
+		.expect("replace table");
+
+	assert_eq!(admin.call_count(), 1);
+	assert!(
+		admin.saw_catalog_binding_during_admin(),
+		"catalog binding should still be reachable while storage admin drop runs"
+	);
+	let binding = catalog
+		.resolve_table(&TableRef::new("sales"))
+		.await
+		.expect("replacement binding");
+	assert_field(&binding.schema, 0, "amount", &DataType::Int64, true);
+}
+
+#[tokio::test]
+async fn wendelon_dependent_index_reject_propagates_through_replace() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let admin = Arc::new(DependentIndexStorageAdmin);
+	let executor = Executor::new(storage.clone());
+	let coordinator = QueryCoordinator::with_writer_deleter_and_admin(
+		catalog.clone(),
+		executor,
+		PlannerConfig::default(),
+		storage.clone(),
+		storage,
+		admin,
+	);
+	let planner = SqlPlanner::new();
+
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE sales (id INT NOT NULL)")
+				.expect("plan create"),
+			None,
+		)
+		.await
+		.expect("create table");
+
+	let err = coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE OR REPLACE TABLE sales (amount BIGINT)")
+				.expect("plan replace"),
+			None,
+		)
+		.await
+		.expect_err("dependent index rejection should propagate");
+
+	assert!(matches!(
+		err,
+		QueryError::Storage(StorageError::Internal { ref message })
+			if message.contains("active dependent indexes") && message.contains("drop them first")
+	));
+	assert!(
+		catalog.resolve_table(&TableRef::new("sales")).await.is_ok(),
+		"storage-admin rejection must preserve catalog reachability"
+	);
+}
+
 #[test]
 fn wendelon_create_uses_append_only_row_identity_policy() {
 	let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/catalog.rs"))
@@ -720,6 +814,61 @@ impl StorageAdmin for ToggleStorageAdmin {
 	}
 }
 
+struct CatalogVisibilityStorageAdmin {
+	catalog: Arc<MockCatalog>,
+	calls: AtomicUsize,
+	saw_catalog_binding: AtomicBool,
+}
+
+impl CatalogVisibilityStorageAdmin {
+	fn new(catalog: Arc<MockCatalog>) -> Self {
+		Self {
+			catalog,
+			calls: AtomicUsize::new(0),
+			saw_catalog_binding: AtomicBool::new(false),
+		}
+	}
+
+	fn call_count(&self) -> usize {
+		self.calls.load(Ordering::SeqCst)
+	}
+
+	fn saw_catalog_binding_during_admin(&self) -> bool {
+		self.saw_catalog_binding.load(Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl StorageAdmin for CatalogVisibilityStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		self.calls.fetch_add(1, Ordering::SeqCst);
+		let visible = self
+			.catalog
+			.resolve_table_id(request.table_id)
+			.await
+			.is_ok();
+		self.saw_catalog_binding.store(visible, Ordering::SeqCst);
+		Ok(DropTableStorageOutcome::new(0))
+	}
+}
+
+struct DependentIndexStorageAdmin;
+
+#[async_trait]
+impl StorageAdmin for DependentIndexStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		_request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		Err(StorageError::Internal {
+			message: "table sales has 1 active dependent indexes; drop them first".to_string(),
+		})
+	}
+}
+
 async fn concat_query(
 	coordinator: &QueryCoordinator,
 	planner: &SqlPlanner,
@@ -746,6 +895,13 @@ fn expect_drop_catalog_err(result: Result<Option<TableBinding>, CatalogError>) -
 		Ok(_) => panic!("expected catalog error"),
 		Err(error) => error,
 	}
+}
+
+fn assert_field(schema: &SchemaRef, idx: usize, name: &str, data_type: &DataType, nullable: bool) {
+	let field = schema.field(idx);
+	assert_eq!(field.name(), name);
+	assert_eq!(field.data_type(), data_type);
+	assert_eq!(field.is_nullable(), nullable);
 }
 
 fn schema(fields: &[Field]) -> SchemaRef {

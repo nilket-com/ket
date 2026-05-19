@@ -245,6 +245,7 @@ where
 				self.catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
+				self.admin.as_ref(),
 				&self.context,
 				&source_executor,
 				&bound,
@@ -262,6 +263,7 @@ where
 				self.catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
+				self.admin.as_ref(),
 				&self.context,
 				&source_executor,
 				&bound,
@@ -331,38 +333,58 @@ async fn execute_catalog_plan(
 			name,
 			schema,
 			if_not_exists,
+			or_replace,
 		} => {
+			if *or_replace {
+				drop_existing_table_with_storage_admin(catalog, admin, context, name, true).await?;
+			}
 			catalog
 				.create_table(name, schema.clone(), *if_not_exists)
 				.await?;
 			Ok(Vec::new())
 		}
 		ExecutionPlan::DropTable { name, if_exists } => {
-			let binding = match catalog.resolve_table(name).await {
-				Ok(binding) => binding,
-				Err(CatalogError::TableNotFound { .. }) if *if_exists => return Ok(Vec::new()),
-				Err(error) => return Err(QueryError::Catalog(error)),
-			};
-			admin
-				.drop_table_storage(DropTableStorageRequest {
-					session_id: context.session_id,
-					query_id: context.query_id,
-					tenant_id: context.tenant_id,
-					table_id: binding.legacy_table_id,
-					table_object_id: binding.table,
-					schema_generation: binding.schema_generation,
-					physical_descriptor_fingerprint: binding.fingerprint,
-					profile_hint: context.profile_hint,
-					trace_context: context.trace_context,
-				})
+			drop_existing_table_with_storage_admin(catalog, admin, context, name, *if_exists)
 				.await?;
-			catalog.drop_table(name, false).await?;
 			Ok(Vec::new())
 		}
 		other => Err(QueryError::Internal {
 			message: format!("execute_catalog_plan called with non-DDL plan: {other:?}"),
 		}),
 	}
+}
+
+async fn drop_existing_table_with_storage_admin(
+	catalog: &dyn Catalog,
+	admin: &dyn StorageAdmin,
+	context: &ExecutionContext,
+	name: &crate::catalog::TableRef,
+	if_exists: bool,
+) -> Result<bool, QueryError> {
+	let binding = match catalog.resolve_table(name).await {
+		Ok(binding) => binding,
+		Err(CatalogError::TableNotFound { .. }) if if_exists => return Ok(false),
+		Err(error) => return Err(QueryError::Catalog(error)),
+	};
+	match admin
+		.drop_table_storage(DropTableStorageRequest {
+			session_id: context.session_id,
+			query_id: context.query_id,
+			tenant_id: context.tenant_id,
+			table_id: binding.legacy_table_id,
+			table_object_id: binding.table,
+			schema_generation: binding.schema_generation,
+			physical_descriptor_fingerprint: binding.fingerprint,
+			profile_hint: context.profile_hint,
+			trace_context: context.trace_context,
+		})
+		.await
+	{
+		Ok(_) | Err(StorageError::TableNotFound { .. }) => {}
+		Err(error) => return Err(QueryError::Storage(error)),
+	}
+	catalog.drop_table(name, false).await?;
+	Ok(true)
 }
 
 fn default_distributed_execution_context() -> ExecutionContext {
@@ -445,6 +467,7 @@ async fn execute_write_plan_with_source(
 	catalog: &dyn Catalog,
 	writer: &dyn StorageWrite,
 	deleter: &dyn StorageDeleteRows,
+	admin: &dyn StorageAdmin,
 	context: &ExecutionContext,
 	source_executor: &dyn MutationSourceExecutor,
 	bound: &ExecutionPlan,
@@ -505,9 +528,14 @@ async fn execute_write_plan_with_source(
 		ExecutionPlan::CreateTableAsSelect {
 			table,
 			schema,
+			or_replace,
 			source,
 		} => {
 			let source_batches = source_executor.execute_read_plan(source).await?;
+			if *or_replace {
+				drop_existing_table_with_storage_admin(catalog, admin, context, table, true)
+					.await?;
+			}
 			let binding = catalog.create_table(table, schema.clone(), false).await?;
 			let target_columns = (0..schema.fields().len())
 				.map(|index| ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow")))
@@ -744,6 +772,7 @@ impl QueryCoordinator {
 			self.catalog.as_ref(),
 			self.writer.as_ref(),
 			self.deleter.as_ref(),
+			self.admin.as_ref(),
 			self.executor.context(),
 			&source_executor,
 			bound,
