@@ -44,7 +44,7 @@ pub struct ObservabilityShutdownReceivers {
 	pub metrics: oneshot::Receiver<()>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct ReadinessSnapshot {
 	pub ready: bool,
 	pub worker_listener_bound: bool,

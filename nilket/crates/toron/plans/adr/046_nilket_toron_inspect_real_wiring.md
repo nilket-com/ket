@@ -15,8 +15,9 @@ pinned with stable diagnostic; iter-2 three preemptive
 sharpenings — D7 response status code mapping pinned (200/503
 expected, any other → exit 2 with stable diagnostic), D9 `Host:`
 header value pinned to endpoint host:port per RFC 7230 §5.4, D6
-stdout/stderr separation pinned, plus D10 explicit non-refactor
-of ADR 043 TLS construction; iter-3 connect-timeout symmetry
+stdout/stderr separation pinned, plus D10 public TLS API
+separation for SQL vs inspect with shared internal rustls config
+construction allowed; iter-3 connect-timeout symmetry
 sharpening — D7 wraps `TcpStream::connect` in 5-second
 `tokio::time::timeout` symmetric with ADR 045 D4
 `READ_REQUEST_TIMEOUT`; iter-4 not needed; promoted directly from
@@ -40,8 +41,13 @@ readiness state (0 ready, 1 degraded, 2 usage / config /
 connectivity / protocol error). Diagnostics emit on stderr.
 
 Reuses ADR 043 D12's `--server-name` / `--cert` / `--key` / `--ca`
-client TLS flag plumbing pattern as a **parallel** construction
-path (not a shared refactor — preserves ADR 043 stability).
+client TLS flag plumbing pattern as a **parallel public API and
+CLI parsing path**. SQL keeps `client_config_from_paths` returning
+QUIC client config; inspect adds `http_client_config_from_paths`
+returning rustls HTTP client config. Both may share a private
+rustls `ClientConfig` builder parameterized by ALPN so the common
+certificate loading and exact server verifier semantics do not
+fork.
 Reuses ADR 045's hand-rolled HTTP/1.1 helpers extended with
 client-side `write_request` + `read_response` mirroring the
 existing `read_request` + `write_response` server-side shape.
@@ -56,7 +62,8 @@ ureq client.
 **No** new revocation surface (preserves ADR 044 D7 / ADR 045
 D7). **No** watch / streaming / cluster-wide aggregation.
 **No** sub-subcommands. **No** auto-discovery of cert paths.
-**No** ADR 043 TLS construction refactor in this cycle.
+**No** ADR 043 CLI parser or public TLS API refactor in this
+cycle.
 
 ## Motivation
 
@@ -321,24 +328,30 @@ endpoint, **not** from the TLS SNI server name. Matches RFC 7230
 **no** tower, **no** ureq. Guard 9 enforces via Cargo.toml
 source-text check.
 
-**D10: `crates/nilket` stays runtime-free; ADR 043 TLS construction not refactored in this cycle.**
+**D10: `crates/nilket` stays runtime-free; SQL and inspect TLS APIs stay parallel with a shared internal rustls builder.**
 
 ADR 040 D4 / ADR 042 D2 / ADR 043 D2 / ADR 045 invariants carry
 forward. `crates/nilket/Cargo.toml` is not touched by ADR 046.
 Tokio / tracing / TLS / JSON deps all stay in
 `crates/toron`.
 
-**ADR 043 TLS construction non-refactor:** ADR 046's
-`build_inspect_tls` keeps a **parallel** construction path to
-ADR 043's SQL client TLS construction. Reasons:
+**ADR 043 TLS stability boundary:** ADR 046 keeps the SQL and
+inspect **public** construction paths parallel:
 
-1. Preserves ADR 043 stability — no risk of refactor regression
-   surfacing in `nilket toron sql`.
-2. Keeps ADR 046 a pure composition cycle (operator-surface
-   continuation), not a refactor cycle.
-3. The ~20 lines of duplication are tolerable; a future
-   refactoring ADR (alongside Plan W-B `tls-pki` extraction) can
-   consolidate at once.
+1. `client_config_from_paths` remains the SQL/QUIC client API and
+   `nilket toron sql` parsing is not restructured.
+2. `http_client_config_from_paths` is added for inspect/HTTP and
+   returns rustls `ClientConfig`.
+3. Both paths share a private `build_rustls_client_config`
+   helper parameterized by ALPN. This is an internal
+   behavior-preserving extraction of common rustls certificate,
+   root-store, client-auth, and exact server verifier setup; it
+   does not alter ADR 043's public API or CLI behavior.
+
+A future refactoring ADR (alongside Plan W-B `tls-pki`
+extraction) can still consolidate CLI option parsing, public
+TLS-PKI APIs, or cross-crate TLS material ownership. Those broader
+refactors remain out of scope for ADR 046.
 
 **D11: One-shot CLI; no watch mode, no streaming.**
 
@@ -388,27 +401,38 @@ Post-promotion convention guard:
   — eleventh consecutive cycle preserving the no-V1-suffix
   convention (ADRs 039 / 041 / 042 / 043 / 044 / 045 / 046).
 
-## Integration Fixtures (10 required + 2 V1-evidence optional)
+## Integration Fixtures (10 required targets + 2 V1-evidence optional)
 
-**Required (gates promotion):**
+**Required targets (gates promotion):**
 
-1. `nilket_toron_inspect_dials_endpoint_from_flag`
-2. `nilket_toron_inspect_dials_endpoint_from_env`
-3. `nilket_toron_inspect_requires_all_four_tls_flags_together`
-4. `nilket_toron_inspect_reports_connection_failure` —
+Implemented inline in `crates/toron/src/cli.rs::tests` to access
+the private hand-rolled parser, renderer, and deterministic
+connect-timeout helper without widening production API surface.
+
+1. `inspect_fetches_ready_from_flag_endpoint_and_preserves_json_body`
+   — dials the flag-selected endpoint and preserves the daemon
+   JSON body.
+2. `inspect_endpoint_env_and_flags_precedence` — covers
+   `TORON_INSPECT_ENDPOINT`, TLS env vars, `--json`, and flag >
+   env precedence.
+3. `inspect_requires_complete_tls_options_even_on_loopback` —
+   missing any TLS field fails before dialing with the stable
+   diagnostic.
+4. `inspect_reports_connection_failure_exit_two` —
    unreachable endpoint returning ECONNREFUSED → exit 2 +
    stable diagnostic.
-5. `nilket_toron_inspect_rejects_peer_without_monitor_san_client_cert`
-6. `nilket_toron_inspect_renders_text_output_with_stable_field_order`
-   — output on stdout.
-7. `nilket_toron_inspect_emits_json_passthrough_with_json_flag`
-   — output on stdout.
-8. `nilket_toron_inspect_exit_zero_on_ready_one_on_degraded` —
+5. `inspect_rejects_peer_without_monitor_san_client_cert`.
+6. `inspect_text_renderer_is_stable` — stable field order and
+   JSON-style `degraded_reason` escaping.
+7. `adr046_toron_inspect_renders_text_by_default_json_with_flag`
+   — source-text guard for JSON pass-through with exactly one
+   trailing newline, no trim / pretty / envelope behavior.
+8. `inspect_exit_zero_on_ready_one_on_degraded` —
    degraded path output on stdout (no stderr diagnostic).
-9. `nilket_toron_inspect_rejects_unexpected_http_status_code` —
+9. `inspect_unexpected_status_returns_exit_two` —
    fixture daemon returns HTTP 418; inspect surfaces exit 2 +
    stable diagnostic.
-10. **`nilket_toron_inspect_reports_connect_timeout`** — iter-3
+10. **`inspect_connect_timeout_maps_to_stable_error`** — iter-3
     sharpening witness; exercises the timeout branch through a
     deterministic pending-connect helper or test-only injectable
     connector rather than relying on external routing behavior.
@@ -439,9 +463,10 @@ Post-promotion convention guard:
   phases.
 
 Matches ADR 042 / 043 / 044 / 045 single-plan posture. Pure
-composition over ADR 045 — no new substrate. ADR 043 TLS
-construction NOT refactored in this cycle (D10 non-refactor
-decision).
+composition over ADR 045 — no new daemon-side substrate. ADR 043
+SQL CLI parsing and public TLS API are preserved; only the
+private rustls client-config builder is shared between QUIC and
+HTTP client paths (D10).
 
 ## Out of Scope (Recorded for Future ADRs)
 
@@ -464,9 +489,11 @@ decision).
   D7 / ADR 045 D7 deferrals.
 - **`/info` or `/version` endpoints exposing build metadata.**
 - **Cross-ring `nilket wendelon inspect`.**
-- **Shared TLS construction helper extraction** consolidating
-  ADR 043 + ADR 046 paths. **Future refactor ADR** (likely
-  alongside Plan W-B `tls-pki` extraction).
+- **Broader TLS construction consolidation** beyond the private
+  rustls client-config builder: CLI option parser consolidation,
+  public TLS-PKI API extraction, or cross-crate TLS material
+  ownership. **Future refactor ADR** (likely alongside Plan W-B
+  `tls-pki` extraction).
 - **OpenAPI / machine-readable schema for `/ready` response.**
 
 ## Council History
@@ -494,12 +521,14 @@ decision).
   endpoint-host:port per RFC 7230 §5.4 (not TLS SNI server
   name); D6 stdout/stderr separation pinned (output to stdout
   including degraded path; diagnostics to stderr on error
-  paths only). D10 sharpened with explicit non-refactor
-  decision: ADR 043 TLS construction kept parallel, not
-  consolidated in this cycle. New guard 11
+  paths only). D10 sharpened with public-path separation:
+  ADR 043 SQL parsing and public TLS API stay parallel while a
+  private rustls client-config builder may be shared by SQL/QUIC
+  and inspect/HTTP paths. New guard 11
   (`adr046_inspect_handles_only_200_and_503_status_codes`)
   preempts unexpected-status drift. New gating fixture 9
-  (`nilket_toron_inspect_rejects_unexpected_http_status_code`).
+  (`inspect_unexpected_status_returns_exit_two` in the shipped
+  inline CLI test organization).
   Guards 10 + 1 → 11 + 1. Required fixtures 8 → 9. No
   retractions.
 - **Iter 3:** Final triple ratification. One sharpening, no
@@ -510,9 +539,9 @@ decision).
   client connect side. New guard 12
   (`adr046_inspect_has_tcp_connect_timeout`). New gating
   fixture 10
-  (`nilket_toron_inspect_reports_connect_timeout`) using a
-  deterministic pending-connect helper or test-only injectable
-  connector. D-set locked at 11. Guard
+  (`inspect_connect_timeout_maps_to_stable_error` in the shipped
+  inline CLI test organization) using a deterministic
+  pending-connect helper. D-set locked at 11. Guard
   set locked at 12 + 1 convention. Fixture set locked at 10
   required + 2 V1-evidence optional. Ready to promote.
 
@@ -542,8 +571,8 @@ ADR 046 ships:
   failed dials);
 - zero new daemon-side wire surface;
 - zero new daemon-side config sections;
-- ADR 043 TLS construction kept parallel (not refactored) for
-  ADR 043 stability;
+- ADR 043 SQL CLI parsing and public TLS API kept parallel for
+  ADR 043 stability, with a shared private rustls builder;
 - byte-identical preservation of ADR 042 / 043 / 044 / 045
   invariants;
 - 12 promoted architecture guards + 1 convention guard + 10

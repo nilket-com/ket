@@ -11,8 +11,8 @@ boundary). Extend `crates/toron/src/network/observability_http.rs`
 with two new client-side helpers (`write_request`,
 `read_response`) parallel to the existing server-side helpers
 (`read_request`, `write_response`). Construct TLS client config
-via a **parallel** path to ADR 043's SQL client TLS construction
-(no refactor in this cycle per D10 non-refactor decision). Parse
+via **parallel public** SQL/inspect APIs while sharing the private
+rustls client-config builder parameterized by ALPN (D10). Parse
 the `/ready` JSON response into `ReadinessSnapshot` (ADR 045 D6
 shape) with forward-compatible serde tolerance for unknown
 fields. Render as line-per-field text to **stdout** by default,
@@ -39,9 +39,12 @@ Resolve the following before Phase 1; capture in
    level.
 2. **ADR 043 client TLS flag plumbing seam.** Read
    `crates/toron/src/cli.rs::sql` (or sibling) for the existing
-   flag/env precedence and `tokio_rustls::TlsConnector`
-   construction. Identify the construction shape but do NOT
-   refactor into a shared helper in this cycle (D10).
+   flag/env precedence and QUIC client TLS construction. Identify
+   the public API boundary that must remain stable:
+   `client_config_from_paths` stays the SQL/QUIC API, while
+   inspect adds `http_client_config_from_paths`. A private
+   rustls `ClientConfig` builder may be shared beneath both APIs
+   to avoid verifier/ALPN drift (D10).
 3. **ADR 045 `ReadinessSnapshot` JSON serialization.** Read
    `crates/toron/src/network/observability.rs::ReadinessSnapshot::to_json`
    for the byte-level format. Confirm forward-compatible JSON
@@ -147,16 +150,20 @@ arms in the current hand-rolled parser.
 [verb, rest @ ..] if verb == "inspect" => run_inspect(rest),
 ```
 
-Add a private parsed-args type:
+Add private parsed option types:
 
 ```rust
-struct InspectArgs {
-    endpoint: Option<SocketAddr>,
-    server_name: Option<String>,
-    cert: Option<PathBuf>,
-    key: Option<PathBuf>,
-    ca: Option<PathBuf>,
+struct InspectOptions {
+    endpoint: SocketAddr,
+    tls: InspectTlsOptions,
     json: bool,
+}
+
+struct InspectTlsOptions {
+    server_name: String,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    ca_path: PathBuf,
 }
 ```
 
@@ -194,7 +201,6 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 ```rust
 enum InspectError {
-    Usage(String),
     Connectivity { action: &'static str, source: io::Error },
     UnexpectedStatus(u16),
 }
@@ -203,29 +209,37 @@ enum InspectError {
 **Dispatch:**
 
 ```rust
-fn run_inspect_sync(args: InspectArgs) -> ExitCode {
+fn run_inspect(args: &[String]) -> ExitCode {
+    let options = match parse_inspect_args(args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("inspect runtime");
-    runtime.block_on(run_inspect_async(args))
+        .expect("runtime");
+    runtime.block_on(run_inspect_async(options))
 }
 
-async fn run_inspect_async(args: InspectArgs) -> ExitCode {
-    let endpoint = resolve_endpoint(args.endpoint);
-    let tls = match build_inspect_tls(&args) {
-        Ok(t) => t,
-        Err(InspectError::Usage(msg)) => {
-            eprintln!("{msg}");
-            return ExitCode::from(2);
-        }
-        Err(e) => unreachable!("build_inspect_tls only emits Usage errors: {e:?}"),
-    };
-    match dial_and_render(endpoint, tls, args.json).await {
-        Ok(exit) => exit,
-        Err(InspectError::Usage(msg)) => {
-            eprintln!("{msg}");
-            ExitCode::from(2)
+async fn run_inspect_async(options: InspectOptions) -> ExitCode {
+    match fetch_ready(&options).await {
+        Ok(response) => {
+            if options.json {
+                print!("{}", response.body);
+                if !response.body.ends_with('\n') {
+                    println!();
+                }
+            } else {
+                print!("{}", render_readiness_text(&response.snapshot));
+            }
+            if response.snapshot.ready {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
         }
         Err(InspectError::Connectivity { action, source }) => {
             // For the "within timeout" action variants, don't include source details
@@ -248,13 +262,17 @@ async fn run_inspect_async(args: InspectArgs) -> ExitCode {
 **Dial path (iter-3 connect-timeout + iter-2 status code mapping):**
 
 ```rust
-async fn dial_and_render(
-    endpoint: SocketAddr,
-    tls: InspectTlsConfig,
-    json_flag: bool,
-) -> Result<ExitCode, InspectError> {
+async fn fetch_ready_with_tcp_connect<F>(
+    options: &InspectOptions,
+    connect: F,
+    connect_timeout: Duration,
+) -> Result<InspectReadyResponse, InspectError>
+where
+    F: Future<Output = io::Result<TcpStream>>,
+{
+    let tls = build_inspect_tls(&options.tls)?;
     // iter-3 sharpening: wrap TcpStream::connect in CONNECT_TIMEOUT.
-    let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint)).await {
+    let tcp = match tokio::time::timeout(connect_timeout, connect).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return Err(InspectError::Connectivity {
             action: "connect to endpoint",
@@ -276,7 +294,7 @@ async fn dial_and_render(
         .map_err(|e| InspectError::Connectivity { action: "complete TLS handshake", source: e })?;
 
     // D9: Host header is endpoint host:port form, not SNI server name.
-    observability_http::write_request(&mut stream, "GET", "/ready", &endpoint.to_string()).await
+    observability_http::write_request(&mut stream, "GET", READY_PATH, &options.endpoint.to_string()).await
         .map_err(|e| InspectError::Connectivity { action: "write request", source: e })?;
 
     let response = tokio::time::timeout(
@@ -301,22 +319,12 @@ async fn dial_and_render(
             source: io::Error::new(io::ErrorKind::InvalidData, e),
         })?;
 
-    // D6 stdout/stderr separation: success-path output to stdout.
-    if json_flag {
-        let stdout_body = std::str::from_utf8(&response.body)
-            .map_err(|e| InspectError::Connectivity {
-                action: "decode JSON response as UTF-8",
-                source: io::Error::new(io::ErrorKind::InvalidData, e),
-            })?;
-        print!("{stdout_body}");
-        if !stdout_body.ends_with('\n') {
-            println!();
-        }
-    } else {
-        render_text(&snapshot);
-    }
-
-    Ok(if snapshot.ready { ExitCode::SUCCESS } else { ExitCode::from(1) })
+    let body = String::from_utf8(response.body)
+        .map_err(|e| InspectError::Connectivity {
+            action: "parse readiness snapshot",
+            source: io::Error::new(io::ErrorKind::InvalidData, e),
+        })?;
+    Ok(InspectReadyResponse { body, snapshot })
 }
 ```
 
@@ -325,11 +333,13 @@ async fn dial_and_render(
 JSON parsing: `serde_json::from_slice` tolerates unknown fields
 by default.
 
-## Phase 4: TLS Client Config Construction (Parallel to ADR 043)
+## Phase 4: TLS Client Config Construction (Parallel Public APIs, Shared Internal Builder)
 
-Per D10 non-refactor decision, ADR 046 keeps a parallel
-construction path to ADR 043's SQL client TLS construction.
-Implement the HTTP rustls client config inside
+Per D10, ADR 046 keeps the ADR 043 SQL/QUIC public API and CLI
+parsing path stable while adding a parallel inspect/HTTP public
+API. The two paths share only a private rustls `ClientConfig`
+builder parameterized by ALPN. Implement the HTTP rustls client
+config inside
 `crates/toron/src/network/tls.rs`, where the existing private
 PEM loading and verifier helpers already live:
 
@@ -344,8 +354,14 @@ pub fn http_client_config_from_paths(
 The helper reuses `reject_env_interpolation`, `TlsMaterial::load`,
 the existing exact server verifier semantics, and sets
 `OBSERVABILITY_HTTP_ALPN`. It returns rustls `ClientConfig`, not
-quinn `ClientConfig`. This shares low-level TLS material loading
-without refactoring the SQL CLI parser or changing SQL behavior.
+quinn `ClientConfig`.
+
+The existing SQL path keeps `client_config_from_paths` returning
+`quinn::ClientConfig`, but both SQL and inspect may call a private
+`build_rustls_client_config(material, alpn)` helper for the common
+certificate chain, root store, client-auth, and exact server
+verifier setup. This is a behavior-preserving internal extraction,
+not a SQL CLI parser refactor or public API consolidation.
 
 ```rust
 struct InspectTlsConfig {
@@ -353,22 +369,11 @@ struct InspectTlsConfig {
     server_name: String,
 }
 
-fn build_inspect_tls(args: &InspectArgs) -> Result<InspectTlsConfig, InspectError> {
-    let cert_path = args.cert.as_ref();
-    let key_path = args.key.as_ref();
-    let ca_path = args.ca.as_ref();
-    let server_name = args.server_name.as_ref();
-
-    if cert_path.is_none() || key_path.is_none() || ca_path.is_none() || server_name.is_none() {
-        return Err(InspectError::Usage(
-            "toron inspect requires --server-name, --cert, --key, and --ca".into()
-        ));
-    }
-
+fn build_inspect_tls(options: &InspectTlsOptions) -> Result<InspectTlsConfig, InspectError> {
     let rustls_config = crate::network::tls::http_client_config_from_paths(
-        cert_path.expect("checked above"),
-        key_path.expect("checked above"),
-        ca_path.expect("checked above"),
+        &options.cert_path,
+        &options.key_path,
+        &options.ca_path,
     )
     .map_err(|error| InspectError::Connectivity {
         action: "initialize mTLS client",
@@ -376,39 +381,43 @@ fn build_inspect_tls(args: &InspectArgs) -> Result<InspectTlsConfig, InspectErro
     })?;
     Ok(InspectTlsConfig {
         rustls_config,
-        server_name: server_name.expect("checked above").clone(),
+        server_name: options.server_name.clone(),
     })
 }
 ```
 
 The CLI parsing paths remain parallel to preserve ADR 043
 stability. A future refactor ADR (alongside Plan W-B `tls-pki`
-extraction) can consolidate SQL and inspect option parsing.
+extraction) can consolidate SQL and inspect option parsing,
+public TLS-PKI APIs, or cross-crate TLS material ownership.
 
 ## Phase 5: Text Rendering
 
 ```rust
-fn render_text(snapshot: &ReadinessSnapshot) {
-    println!("ready: {}", snapshot.ready);
-    println!("worker_listener_bound: {}", snapshot.worker_listener_bound);
-    println!("sql_listener_bound: {}", snapshot.sql_listener_bound);
-    println!("observability_listeners_bound: {}", snapshot.observability_listeners_bound);
-    println!("descriptors_loaded: {}", snapshot.descriptors_loaded);
-    println!("static_workers_configured: {}", snapshot.static_workers_configured);
-    println!("uptime_seconds: {}", snapshot.uptime_seconds);
-    match &snapshot.degraded_reason {
-        None => println!("degraded_reason: null"),
-        Some(reason) => println!(
-            "degraded_reason: {}",
-            serde_json::to_string(reason).expect("serialize degraded reason")
-        ),
-    }
+fn render_readiness_text(snapshot: &ReadinessSnapshot) -> String {
+    let degraded_reason = snapshot
+        .degraded_reason
+        .as_ref()
+        .map(|reason| serde_json::to_string(reason).expect("serialize degraded reason"))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "ready: {}\nworker_listener_bound: {}\nsql_listener_bound: {}\nobservability_listeners_bound: {}\ndescriptors_loaded: {}\nstatic_workers_configured: {}\nuptime_seconds: {}\ndegraded_reason: {}\n",
+        snapshot.ready,
+        snapshot.worker_listener_bound,
+        snapshot.sql_listener_bound,
+        snapshot.observability_listeners_bound,
+        snapshot.descriptors_loaded,
+        snapshot.static_workers_configured,
+        snapshot.uptime_seconds,
+        degraded_reason
+    )
 }
 ```
 
-Field order pinned byte-identical to ADR 045 D6 declaration. All
-`println!` writes go to stdout (D6 separation). Fixture 6
-asserts byte-identical output against a known payload.
+Field order pinned byte-identical to ADR 045 D6 declaration.
+`run_inspect_async` prints the returned string to stdout (D6
+separation). Fixture 6 asserts byte-identical output against a
+known payload.
 
 ## Phase 6: Architecture Guards
 
@@ -491,35 +500,42 @@ Source-text guards (#1, #3, #4, #5, #6, #7, #8, #9, #10, #11,
 (#2 — client-only) exercises absence of daemon constructors in
 inspect dispatch.
 
-## Phase 7: Integration Fixtures
+## Phase 7: Inline Fixture Coverage
 
-### `crates/toron/tests/toron_inspect_cli_test.rs` (new)
+### `crates/toron/src/cli.rs::tests`
 
-Ten required fixtures:
+The shipped implementation keeps inspect fixtures inline in the
+CLI module so tests can exercise the private hand-rolled parser,
+renderer, mTLS fetch helper, and deterministic connect-timeout
+helper without widening production API surface. Ten required
+fixture targets are covered by the following test/guard names:
 
-1. `nilket_toron_inspect_dials_endpoint_from_flag`
-2. `nilket_toron_inspect_dials_endpoint_from_env`
-3. `nilket_toron_inspect_requires_all_four_tls_flags_together`
-4. `nilket_toron_inspect_reports_connection_failure`
-5. `nilket_toron_inspect_rejects_peer_without_monitor_san_client_cert`
-6. `nilket_toron_inspect_renders_text_output_with_stable_field_order`
-7. `nilket_toron_inspect_emits_json_passthrough_with_json_flag`
-8. `nilket_toron_inspect_exit_zero_on_ready_one_on_degraded`
-9. `nilket_toron_inspect_rejects_unexpected_http_status_code`
-10. `nilket_toron_inspect_reports_connect_timeout` — exercises
+1. `inspect_fetches_ready_from_flag_endpoint_and_preserves_json_body`
+2. `inspect_endpoint_env_and_flags_precedence`
+3. `inspect_requires_complete_tls_options_even_on_loopback`
+4. `inspect_reports_connection_failure_exit_two`
+5. `inspect_rejects_peer_without_monitor_san_client_cert`
+6. `inspect_text_renderer_is_stable`
+7. `adr046_toron_inspect_renders_text_by_default_json_with_flag`
+   (source-text guard for JSON pass-through: no trim / pretty /
+   envelope behavior, exactly one trailing newline if missing)
+8. `inspect_exit_zero_on_ready_one_on_degraded`
+9. `inspect_unexpected_status_returns_exit_two`
+10. `inspect_connect_timeout_maps_to_stable_error` — exercises
     the timeout branch through a deterministic pending-connect
-    helper or test-only injectable connector; asserts exit 2 +
-    stable diagnostic `toron inspect: failed to connect to
+    helper; asserts the stable timeout action that maps to exit 2
+    and diagnostic `toron inspect: failed to connect to
     endpoint within timeout`.
 
-**Test infrastructure:** Most fixtures use a mock HTTP server
+**Test infrastructure:** Most fixtures use a minimal HTTP server
 (thin TCP listener accepting connection, optionally performing
 mTLS handshake, returning canned HTTP response). Mock reuses ADR
 045's `observability_http::write_response`. Cert generation via
 `rcgen` mirrors ADR 044 / 045 patterns.
 
-Fixture 5 (SAN rejection) uses a full Toron daemon instance via
-ADR 045 observability listener spawn.
+Fixture 5 (SAN rejection) uses the ADR 045 observability listener
+TLS policy through a minimal mTLS server and verifies `client-`
+SAN rejection.
 
 Fixture 9 (unexpected status) uses mock server returning HTTP
 418 with small JSON body.
@@ -544,7 +560,8 @@ Capture in `plans/impl/046_*_evidence.md`:
 2. **Phase 1-5 evidence:** `cargo test -p toron --tests` green;
    `cargo clippy -p toron -- -D warnings` clean.
 3. **Phase 6 evidence:** all 12 + 1 architecture guards pass.
-4. **Phase 7 evidence:** all 10 required fixtures pass; optional
+4. **Phase 7 evidence:** all 10 required fixture targets pass;
+   inline CLI test organization recorded; optional
    V1-evidence fixtures captured separately.
 5. **ADR 042 / 043 / 044 / 045 invariant preservation:**
    - example configs without `[observability]` boot byte-
@@ -587,8 +604,9 @@ Materialize `plans/impl/046_*_evidence.md` with:
 
 - [ ] Phase 0 audit captures HTTP helper signature parity
       decision.
-- [ ] Phase 0 audit confirms ADR 043 TLS plumbing kept parallel
-      (no refactor).
+- [ ] Phase 0 audit confirms ADR 043 SQL/QUIC public API and CLI
+      parsing stay parallel; private rustls builder sharing is
+      allowed.
 - [ ] Phase 0 audit confirms `ReadinessSnapshot` is forward-
       compatible (no `deny_unknown_fields`).
 - [ ] Phase 0 audit pins `CONNECT_TIMEOUT` placement.
@@ -604,13 +622,13 @@ Materialize `plans/impl/046_*_evidence.md` with:
       routes other codes to `InspectError::UnexpectedStatus`.
 - [ ] Phase 4 TLS client config requires all four flags
       together; fails fast with stable diagnostic.
-- [ ] Phase 4 TLS client config kept parallel to ADR 043 (no
-      refactor).
+- [ ] Phase 4 TLS public APIs kept parallel to ADR 043; shared
+      private rustls builder does not change SQL behavior.
 - [ ] Phase 5 text renderer emits fields in pinned order to
       stdout.
 - [ ] Phase 5 error diagnostics emit to stderr only.
 - [ ] Phase 6 all 12 ADR 046 guards + 1 convention guard pass.
-- [ ] Phase 7 all 10 required fixtures pass.
+- [ ] Phase 7 all 10 required inline fixture targets pass.
 - [ ] `toron_fixture_worker.rs` source unchanged (11th preserved
       cycle).
 - [ ] ADR 042 / 043 / 044 / 045 guards continue to pass.
@@ -639,15 +657,20 @@ Materialize `plans/impl/046_*_evidence.md` with:
 - Sub-subcommands.
 - Live cert rotation / CRL / OCSP.
 - `/info` / `/version` daemon endpoints.
-- Shared TLS construction helper extraction (future refactor
-  ADR).
+- Broader TLS construction consolidation beyond the private
+  rustls client-config builder: CLI option parser consolidation,
+  public TLS-PKI API extraction, or cross-crate TLS material
+  ownership.
 
 ## Risk Register
 
 1. **ADR 043 TLS construction refactor risk (mitigated).** D10
-   non-refactor decision commits to parallel construction. ~20
-   lines of duplication tolerable; future refactor ADR
-   consolidates alongside Plan W-B `tls-pki` extraction.
+   keeps ADR 043's SQL CLI parsing and public
+   `client_config_from_paths` API stable. The only shared piece is
+   a private rustls `ClientConfig` builder parameterized by ALPN;
+   SQL fixture coverage protects the behavior-preserving
+   extraction. Broader consolidation remains a future refactor ADR
+   alongside Plan W-B `tls-pki` extraction.
 2. **Hand-rolled HTTP response parser correctness.**
    `read_response` must correctly handle Content-Length, status
    lines, and reject chunked encoding. Mitigation: 64 KiB body

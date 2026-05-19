@@ -3543,8 +3543,9 @@ along with the forward-sequence rewrite.
   other → exit 2), D9 `Host:` header pinned to
   endpoint host:port per RFC 7230 §5.4, D6
   stdout/stderr separation pinned, plus D10
-  explicit non-refactor of ADR 043 TLS
-  construction; iter-3 connect-timeout symmetry
+  SQL/inspect public TLS API separation with
+  shared private rustls client-config
+  construction allowed; iter-3 connect-timeout symmetry
   sharpening — D7 wraps `TcpStream::connect`
   in 5-second `tokio::time::timeout` symmetric
   with ADR 045 D4 `READ_REQUEST_TIMEOUT`. Final
@@ -3616,11 +3617,17 @@ along with the forward-sequence rewrite.
   **D10 critical decision:** `crates/nilket`
   stays runtime-free (ADR 040 D4 / ADR 042 D2 /
   ADR 043 D2 / ADR 045 invariants carry
-  forward). ADR 043 TLS construction kept
-  **parallel** (not refactored) to preserve
-  ADR 043 stability; future refactor ADR
-  consolidates alongside Plan W-B `tls-pki`
-  extraction.
+  forward). ADR 043 SQL CLI parsing and public
+  `client_config_from_paths` API stay stable;
+  inspect adds a parallel
+  `http_client_config_from_paths` API. Both
+  paths may share a private
+  `build_rustls_client_config(material, alpn)`
+  helper for common rustls setup. Future
+  refactor ADR consolidates CLI option parsing,
+  public TLS-PKI APIs, or cross-crate TLS
+  material ownership alongside Plan W-B
+  `tls-pki` extraction.
   **D11 critical decision:** one-shot CLI; no
   watch mode, no streaming, no periodic
   re-poll. Mirrors ADR 043 D17.
@@ -3635,15 +3642,16 @@ along with the forward-sequence rewrite.
   the iter-3 sharpening guard 12
   (`adr046_inspect_has_tcp_connect_timeout`)
   pinning the symmetric phase-timeout contract.
-  **Ten required integration fixtures + 2
-  optional V1-evidence** including the iter-3
-  sharpening witness
-  `nilket_toron_inspect_reports_connect_timeout`
+  **Ten required fixture targets + 2 optional
+  V1-evidence** implemented inline in
+  `crates/toron/src/cli.rs::tests` plus the
+  ADR 046 JSON pass-through architecture guard.
+  The iter-3 sharpening witness is
+  `inspect_connect_timeout_maps_to_stable_error`
   (exercises the timeout branch through a
-  deterministic pending-connect helper or
-  test-only injectable connector, avoiding
+  deterministic pending-connect helper, avoiding
   host routing flakiness) and the optional drain-
-  state witness
+  state witness remains
   `nilket_toron_inspect_reports_drain_state`
   (full composition with ADR 045 D6 drain
   semantics via SIGTERM).
@@ -3739,13 +3747,14 @@ rolled HTTP/1.1 client commit, four-TLS-flags
 requirement); iter-2 three preemptive
 sharpenings (response status code mapping,
 `Host:` header pinning, stdout/stderr
-separation) plus D10 explicit non-refactor of
-ADR 043 TLS construction; iter-3 symmetric
+separation) plus D10 SQL/inspect public TLS API
+separation with shared private rustls config
+construction; iter-3 symmetric
 connect-timeout sharpening matching ADR 045
 D4 response-read timeout. Final D-set:
 **11 decisions, 12 architecture guards + 1
-convention guard, 10 required integration
-fixtures + 2 V1-evidence optional fixtures**.
+convention guard, 10 required fixture targets
++ 2 V1-evidence optional fixtures**.
 
 **ADR 040 reservation pattern fully
 discharged.** After ADR 046, all three ADR 040
@@ -3866,7 +3875,7 @@ this cycle:**
   `serde(default)` on new fields).
 - ADR 039 D5 / ADR 042 / ADR 043 / ADR 044 /
   ADR 045 no-V1-suffix convention (carries
-  forward to `InspectArgs`, `InspectError`,
+  forward to `InspectOptions`, `InspectError`,
   `InspectTlsConfig`, `HttpResponse`,
   `CONNECT_TIMEOUT`; **eleventh consecutive
   cycle** — ADRs 039 / 041 / 042 / 043 / 044 /

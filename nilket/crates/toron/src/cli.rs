@@ -1,12 +1,20 @@
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use rustls::pki_types::ServerName;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
-const RESERVED_MESSAGE_SUFFIX: &str = "is reserved; production execution is not wired in ADR 040";
 const DEFAULT_SQL_ENDPOINT: &str = "127.0.0.1:7742";
+const DEFAULT_INSPECT_ENDPOINT: &str = "127.0.0.1:7781";
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTHENTICATED_CONNECTION_ERROR_PREFIX: &str =
 	"failed to establish authenticated connection to";
 
@@ -20,6 +28,38 @@ struct SqlClientTlsOptions {
 	cert_path: PathBuf,
 	key_path: PathBuf,
 	ca_path: PathBuf,
+}
+
+struct InspectOptions {
+	endpoint: SocketAddr,
+	tls: InspectTlsOptions,
+	json: bool,
+}
+
+struct InspectTlsOptions {
+	server_name: String,
+	cert_path: PathBuf,
+	key_path: PathBuf,
+	ca_path: PathBuf,
+}
+
+struct InspectTlsConfig {
+	server_name: String,
+	rustls_config: rustls::ClientConfig,
+}
+
+struct InspectReadyResponse {
+	body: String,
+	snapshot: crate::network::observability::ReadinessSnapshot,
+}
+
+#[derive(Debug)]
+enum InspectError {
+	Connectivity {
+		action: &'static str,
+		source: io::Error,
+	},
+	UnexpectedStatus(u16),
 }
 
 pub fn run<I>(program: &str, args: I) -> ExitCode
@@ -68,8 +108,7 @@ where
 			eprintln!("toron sql requires <statement...>");
 			ExitCode::from(2)
 		}
-		[verb] if verb == "inspect" => reserved("inspect"),
-		[verb, _rest @ ..] if verb == "inspect" => reserved("inspect"),
+		[verb, rest @ ..] if verb == "inspect" => run_inspect(rest),
 		[unknown, ..] => {
 			eprintln!("unknown toron command: {unknown}");
 			print_usage(program);
@@ -78,9 +117,284 @@ where
 	}
 }
 
-fn reserved(verb: &str) -> ExitCode {
-	eprintln!("toron {verb} {RESERVED_MESSAGE_SUFFIX}");
-	ExitCode::from(2)
+fn run_inspect(args: &[String]) -> ExitCode {
+	let options = match parse_inspect_args(args) {
+		Ok(options) => options,
+		Err(message) => {
+			eprintln!("{message}");
+			return ExitCode::from(2);
+		}
+	};
+	let runtime = match tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+	{
+		Ok(runtime) => runtime,
+		Err(error) => {
+			eprintln!("failed to initialize Toron runtime: {error}");
+			return ExitCode::from(2);
+		}
+	};
+	runtime.block_on(run_inspect_async(options))
+}
+
+fn parse_inspect_args(args: &[String]) -> Result<InspectOptions, String> {
+	let mut endpoint_flag: Option<SocketAddr> = None;
+	let mut server_name_flag: Option<String> = None;
+	let mut cert_flag: Option<PathBuf> = None;
+	let mut key_flag: Option<PathBuf> = None;
+	let mut ca_flag: Option<PathBuf> = None;
+	let mut json = false;
+	let mut index = 0usize;
+
+	while let Some(arg) = args.get(index) {
+		match arg.as_str() {
+			"--endpoint" => {
+				let value = args
+					.get(index + 1)
+					.ok_or_else(|| "toron inspect --endpoint requires <socket-addr>".to_string())?;
+				endpoint_flag = Some(
+					value
+						.parse::<SocketAddr>()
+						.map_err(|error| format!("invalid toron inspect endpoint: {error}"))?,
+				);
+				index += 2;
+			}
+			"--server-name" => {
+				server_name_flag = Some(
+					args.get(index + 1)
+						.ok_or_else(|| {
+							"toron inspect --server-name requires <dns-name>".to_string()
+						})?
+						.clone(),
+				);
+				index += 2;
+			}
+			"--cert" => {
+				cert_flag =
+					Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
+						"toron inspect --cert requires <path>".to_string()
+					})?));
+				index += 2;
+			}
+			"--key" => {
+				key_flag =
+					Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
+						"toron inspect --key requires <path>".to_string()
+					})?));
+				index += 2;
+			}
+			"--ca" => {
+				ca_flag =
+					Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
+						"toron inspect --ca requires <path>".to_string()
+					})?));
+				index += 2;
+			}
+			"--json" => {
+				json = true;
+				index += 1;
+			}
+			flag if flag.starts_with("--") => {
+				return Err(format!("unknown toron inspect option: {flag}"));
+			}
+			_ => return Err("toron inspect does not accept positional arguments".to_string()),
+		}
+	}
+
+	let endpoint = match endpoint_flag {
+		Some(endpoint) => endpoint,
+		None => match std::env::var("TORON_INSPECT_ENDPOINT") {
+			Ok(value) => value
+				.parse::<SocketAddr>()
+				.map_err(|error| format!("invalid TORON_INSPECT_ENDPOINT: {error}"))?,
+			Err(_) => DEFAULT_INSPECT_ENDPOINT
+				.parse::<SocketAddr>()
+				.expect("compiled default inspect endpoint is valid"),
+		},
+	};
+	let server_name = server_name_flag.or_else(|| std::env::var("TORON_INSPECT_SERVER_NAME").ok());
+	let cert_path = cert_flag.or_else(|| {
+		std::env::var("TORON_INSPECT_CLIENT_CERT")
+			.ok()
+			.map(PathBuf::from)
+	});
+	let key_path = key_flag.or_else(|| {
+		std::env::var("TORON_INSPECT_CLIENT_KEY")
+			.ok()
+			.map(PathBuf::from)
+	});
+	let ca_path = ca_flag.or_else(|| std::env::var("TORON_INSPECT_CA").ok().map(PathBuf::from));
+	if server_name.is_none() || cert_path.is_none() || key_path.is_none() || ca_path.is_none() {
+		return Err("toron inspect requires --server-name, --cert, --key, and --ca".to_string());
+	}
+	Ok(InspectOptions {
+		endpoint,
+		tls: InspectTlsOptions {
+			server_name: server_name.expect("checked above"),
+			cert_path: cert_path.expect("checked above"),
+			key_path: key_path.expect("checked above"),
+			ca_path: ca_path.expect("checked above"),
+		},
+		json,
+	})
+}
+
+async fn run_inspect_async(options: InspectOptions) -> ExitCode {
+	match fetch_ready(&options).await {
+		Ok(response) => {
+			if options.json {
+				print!("{}", response.body);
+				if !response.body.ends_with('\n') {
+					println!();
+				}
+			} else {
+				print!("{}", render_readiness_text(&response.snapshot));
+			}
+			if response.snapshot.ready {
+				ExitCode::SUCCESS
+			} else {
+				ExitCode::from(1)
+			}
+		}
+		Err(InspectError::Connectivity { action, source }) => {
+			if action.contains("within timeout") {
+				eprintln!("toron inspect: failed to {action}");
+			} else {
+				eprintln!("toron inspect: failed to {action}: {source}");
+			}
+			ExitCode::from(2)
+		}
+		Err(InspectError::UnexpectedStatus(status_code)) => {
+			eprintln!(
+				"toron inspect: failed to read /ready response: unexpected HTTP status {status_code}"
+			);
+			ExitCode::from(2)
+		}
+	}
+}
+
+async fn fetch_ready(options: &InspectOptions) -> Result<InspectReadyResponse, InspectError> {
+	fetch_ready_with_tcp_connect(
+		options,
+		TcpStream::connect(options.endpoint),
+		CONNECT_TIMEOUT,
+	)
+	.await
+}
+
+async fn fetch_ready_with_tcp_connect<F>(
+	options: &InspectOptions,
+	connect: F,
+	connect_timeout: Duration,
+) -> Result<InspectReadyResponse, InspectError>
+where
+	F: Future<Output = io::Result<TcpStream>>,
+{
+	let tls = build_inspect_tls(&options.tls)?;
+	let tcp = match tokio::time::timeout(connect_timeout, connect).await {
+		Ok(Ok(stream)) => stream,
+		Ok(Err(source)) => {
+			return Err(InspectError::Connectivity {
+				action: "connect to endpoint",
+				source,
+			});
+		}
+		Err(_) => {
+			return Err(InspectError::Connectivity {
+				action: "connect to endpoint within timeout",
+				source: io::Error::new(io::ErrorKind::TimedOut, "5s"),
+			});
+		}
+	};
+	let connector = TlsConnector::from(Arc::new(tls.rustls_config));
+	let server_name = ServerName::try_from(tls.server_name.clone()).map_err(|error| {
+		InspectError::Connectivity {
+			action: "complete TLS handshake",
+			source: io::Error::new(io::ErrorKind::InvalidInput, error),
+		}
+	})?;
+	let mut stream =
+		connector
+			.connect(server_name, tcp)
+			.await
+			.map_err(|error| InspectError::Connectivity {
+				action: "complete TLS handshake",
+				source: io::Error::other(error),
+			})?;
+	crate::network::observability_http::write_request(
+		&mut stream,
+		"GET",
+		crate::network::observability::READY_PATH,
+		&options.endpoint.to_string(),
+	)
+	.await
+	.map_err(|source| InspectError::Connectivity {
+		action: "write request",
+		source,
+	})?;
+	let response = tokio::time::timeout(
+		crate::network::observability_http::READ_REQUEST_TIMEOUT,
+		crate::network::observability_http::read_response(&mut stream),
+	)
+	.await
+	.map_err(|_| InspectError::Connectivity {
+		action: "receive response within timeout",
+		source: io::Error::new(io::ErrorKind::TimedOut, "5s"),
+	})?
+	.map_err(|source| InspectError::Connectivity {
+		action: "parse HTTP response",
+		source,
+	})?;
+	if response.status_code != 200 && response.status_code != 503 {
+		return Err(InspectError::UnexpectedStatus(response.status_code));
+	}
+	let snapshot =
+		serde_json::from_slice::<crate::network::observability::ReadinessSnapshot>(&response.body)
+			.map_err(|error| InspectError::Connectivity {
+				action: "parse readiness snapshot",
+				source: io::Error::new(io::ErrorKind::InvalidData, error),
+			})?;
+	let body = String::from_utf8(response.body).map_err(|error| InspectError::Connectivity {
+		action: "parse readiness snapshot",
+		source: io::Error::new(io::ErrorKind::InvalidData, error),
+	})?;
+	Ok(InspectReadyResponse { body, snapshot })
+}
+
+fn build_inspect_tls(options: &InspectTlsOptions) -> Result<InspectTlsConfig, InspectError> {
+	let rustls_config = crate::network::tls::http_client_config_from_paths(
+		&options.cert_path,
+		&options.key_path,
+		&options.ca_path,
+	)
+	.map_err(|error| InspectError::Connectivity {
+		action: "initialize mTLS client",
+		source: io::Error::new(io::ErrorKind::InvalidInput, error),
+	})?;
+	Ok(InspectTlsConfig {
+		server_name: options.server_name.clone(),
+		rustls_config,
+	})
+}
+
+fn render_readiness_text(snapshot: &crate::network::observability::ReadinessSnapshot) -> String {
+	let degraded_reason = snapshot
+		.degraded_reason
+		.as_ref()
+		.map(|reason| serde_json::to_string(reason).expect("serialize degraded reason"))
+		.unwrap_or_else(|| "null".to_string());
+	format!(
+		"ready: {}\nworker_listener_bound: {}\nsql_listener_bound: {}\nobservability_listeners_bound: {}\ndescriptors_loaded: {}\nstatic_workers_configured: {}\nuptime_seconds: {}\ndegraded_reason: {}\n",
+		snapshot.ready,
+		snapshot.worker_listener_bound,
+		snapshot.sql_listener_bound,
+		snapshot.observability_listeners_bound,
+		snapshot.descriptors_loaded,
+		snapshot.static_workers_configured,
+		snapshot.uptime_seconds,
+		degraded_reason
+	)
 }
 
 fn run_sql(args: &[String]) -> ExitCode {
@@ -359,7 +673,7 @@ fn render_batches(batches: &[RecordBatch]) -> Result<(), arrow::error::ArrowErro
 
 fn print_usage(program: &str) {
 	eprintln!(
-		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql [--endpoint <socket-addr>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] <statement...>\n  {program} inspect [target]\n\nToron inspect is reserved in ADR 040."
+		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql [--endpoint <socket-addr>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] <statement...>\n  {program} inspect [--endpoint <socket-addr>] --server-name <dns-name> --cert <path> --key <path> --ca <path> [--json]"
 	);
 }
 
@@ -375,12 +689,20 @@ mod tests {
 	};
 
 	static SQL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+	static INSPECT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 	const SQL_ENV_KEYS: [&str; 5] = [
 		"TORON_SQL_ENDPOINT",
 		"TORON_SQL_SERVER_NAME",
 		"TORON_SQL_CLIENT_CERT",
 		"TORON_SQL_CLIENT_KEY",
 		"TORON_SQL_CA",
+	];
+	const INSPECT_ENV_KEYS: [&str; 5] = [
+		"TORON_INSPECT_ENDPOINT",
+		"TORON_INSPECT_SERVER_NAME",
+		"TORON_INSPECT_CLIENT_CERT",
+		"TORON_INSPECT_CLIENT_KEY",
+		"TORON_INSPECT_CA",
 	];
 
 	fn args(values: &[&str]) -> Vec<String> {
@@ -391,6 +713,15 @@ mod tests {
 		for key in SQL_ENV_KEYS {
 			unsafe {
 				// SAFETY: SQL option tests serialize TORON_SQL_* mutations with SQL_ENV_LOCK.
+				std::env::remove_var(key);
+			}
+		}
+	}
+
+	fn clear_inspect_env() {
+		for key in INSPECT_ENV_KEYS {
+			unsafe {
+				// SAFETY: Inspect option tests serialize TORON_INSPECT_* mutations with INSPECT_ENV_LOCK.
 				std::env::remove_var(key);
 			}
 		}
@@ -541,9 +872,494 @@ mod tests {
 		std::fs::write(key_path, cert.serialize_private_key_pem()).expect("write key");
 	}
 
+	struct CliInspectPki {
+		ca_cert: PathBuf,
+		daemon_cert: PathBuf,
+		daemon_key: PathBuf,
+		monitor_cert: PathBuf,
+		monitor_key: PathBuf,
+		client_cert: PathBuf,
+		client_key: PathBuf,
+	}
+
+	impl CliInspectPki {
+		fn generate(worker_id: crate::distributed::identity::WorkerId, principal: &str) -> Self {
+			let dir = fresh_inspect_cli_dir();
+			let ca = ca_cert();
+			let daemon_dns = crate::network::tls::canonical_daemon_dns_name(
+				&worker_id,
+				crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+			);
+			let daemon = leaf_cert(&daemon_dns, &[ExtendedKeyUsagePurpose::ServerAuth]);
+			let monitor_dns = crate::network::tls::canonical_monitor_dns_name(
+				principal,
+				crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+			);
+			let monitor = leaf_cert(&monitor_dns, &[ExtendedKeyUsagePurpose::ClientAuth]);
+			let client_dns = crate::network::tls::canonical_client_dns_name(
+				principal,
+				crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+			);
+			let client = leaf_cert(&client_dns, &[ExtendedKeyUsagePurpose::ClientAuth]);
+			let pki = Self {
+				ca_cert: dir.join("ca.pem"),
+				daemon_cert: dir.join("daemon.pem"),
+				daemon_key: dir.join("daemon.key"),
+				monitor_cert: dir.join("monitor.pem"),
+				monitor_key: dir.join("monitor.key"),
+				client_cert: dir.join("client.pem"),
+				client_key: dir.join("client.key"),
+			};
+			std::fs::write(&pki.ca_cert, ca.serialize_pem().expect("CA PEM")).expect("write CA");
+			write_signed_cert(&pki.daemon_cert, &pki.daemon_key, &daemon, &ca);
+			write_signed_cert(&pki.monitor_cert, &pki.monitor_key, &monitor, &ca);
+			write_signed_cert(&pki.client_cert, &pki.client_key, &client, &ca);
+			pki
+		}
+	}
+
+	struct MinimalReadyServer {
+		listener: tokio::net::TcpListener,
+		acceptor: tokio_rustls::TlsAcceptor,
+		connect_addr: SocketAddr,
+	}
+
+	impl MinimalReadyServer {
+		async fn start(
+			worker_id: crate::distributed::identity::WorkerId,
+			pki: &CliInspectPki,
+		) -> Self {
+			let tls_config = crate::config::TlsConfig {
+				listener_cert: pki.daemon_cert.clone(),
+				listener_key: pki.daemon_key.clone(),
+				peer_ca: pki.ca_cert.clone(),
+				cluster_domain: crate::network::tls::DEFAULT_CLUSTER_DOMAIN.to_string(),
+			};
+			let policy = crate::network::tls::ListenerPolicy::load(&tls_config, &worker_id)
+				.expect("load observability listener policy");
+			let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+				.await
+				.expect("bind ready listener");
+			let local_addr = listener.local_addr().expect("ready local addr");
+			let connect_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_addr.port());
+			Self {
+				listener,
+				acceptor: tokio_rustls::TlsAcceptor::from(
+					policy
+						.rustls_server_config_for(crate::network::tls::ListenerRole::Observability),
+				),
+				connect_addr,
+			}
+		}
+
+		fn spawn_response_once(
+			self,
+			status: &'static str,
+			body: String,
+		) -> tokio::task::JoinHandle<io::Result<Vec<u8>>> {
+			tokio::spawn(async move {
+				let (stream, _) = self.listener.accept().await?;
+				let mut stream = self
+					.acceptor
+					.accept(stream)
+					.await
+					.map_err(io::Error::other)?;
+				let request = crate::network::observability_http::read_request(&mut stream).await?;
+				crate::network::observability_http::write_response(
+					&mut stream,
+					status,
+					"application/json",
+					&body,
+				)
+				.await?;
+				Ok(request)
+			})
+		}
+	}
+
+	fn fresh_inspect_cli_dir() -> PathBuf {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("system time after epoch")
+			.as_nanos();
+		let dir =
+			std::env::temp_dir().join(format!("toron-inspectcli-{}-{nanos}", std::process::id()));
+		std::fs::create_dir_all(&dir).expect("create temp dir");
+		dir
+	}
+
+	fn readiness_snapshot(
+		ready: bool,
+		degraded_reason: Option<&str>,
+	) -> crate::network::observability::ReadinessSnapshot {
+		crate::network::observability::ReadinessSnapshot {
+			ready,
+			worker_listener_bound: true,
+			sql_listener_bound: true,
+			observability_listeners_bound: true,
+			descriptors_loaded: 12,
+			static_workers_configured: 2,
+			uptime_seconds: 47,
+			degraded_reason: degraded_reason.map(str::to_string),
+		}
+	}
+
+	fn inspect_options(
+		endpoint: SocketAddr,
+		server_name: String,
+		cert_path: PathBuf,
+		key_path: PathBuf,
+		ca_path: PathBuf,
+		json: bool,
+	) -> InspectOptions {
+		InspectOptions {
+			endpoint,
+			tls: InspectTlsOptions {
+				server_name,
+				cert_path,
+				key_path,
+				ca_path,
+			},
+			json,
+		}
+	}
+
 	async fn assert_successful_sql_client(options: SqlClientOptions, statement: String) {
 		let exit = run_sql_async(options, statement).await;
 		assert_eq!(exit, ExitCode::SUCCESS);
+	}
+
+	#[test]
+	fn inspect_requires_complete_tls_options_even_on_loopback() {
+		let _guard = INSPECT_ENV_LOCK.lock().expect("lock inspect env");
+		clear_inspect_env();
+
+		let missing = match parse_inspect_args(&[]) {
+			Ok(_) => panic!("inspect without TLS must fail"),
+			Err(error) => error,
+		};
+		assert_eq!(
+			missing,
+			"toron inspect requires --server-name, --cert, --key, and --ca"
+		);
+
+		let partial_args = args(&[
+			"--endpoint",
+			"127.0.0.1:7781",
+			"--server-name",
+			"toron-00000000-0000-0000-0000-000000000046.cluster.local",
+		]);
+		let partial = match parse_inspect_args(&partial_args) {
+			Ok(_) => panic!("partial inspect TLS must fail"),
+			Err(error) => error,
+		};
+		assert_eq!(
+			partial,
+			"toron inspect requires --server-name, --cert, --key, and --ca"
+		);
+
+		let positional = match parse_inspect_args(&args(&["127.0.0.1:7781"])) {
+			Ok(_) => panic!("positional inspect endpoint must fail"),
+			Err(error) => error,
+		};
+		assert_eq!(
+			positional,
+			"toron inspect does not accept positional arguments"
+		);
+	}
+
+	#[test]
+	fn inspect_endpoint_env_and_flags_precedence() {
+		let _guard = INSPECT_ENV_LOCK.lock().expect("lock inspect env");
+		clear_inspect_env();
+		unsafe {
+			// SAFETY: Inspect option tests serialize TORON_INSPECT_* mutations with INSPECT_ENV_LOCK.
+			std::env::set_var("TORON_INSPECT_ENDPOINT", "127.0.0.1:7782");
+			std::env::set_var(
+				"TORON_INSPECT_SERVER_NAME",
+				"toron-00000000-0000-0000-0000-000000000046.cluster.local",
+			);
+			std::env::set_var("TORON_INSPECT_CLIENT_CERT", "env-monitor.pem");
+			std::env::set_var("TORON_INSPECT_CLIENT_KEY", "env-monitor.key");
+			std::env::set_var("TORON_INSPECT_CA", "env-ca.pem");
+		}
+
+		let env_options = parse_inspect_args(&args(&["--json"])).expect("env inspect options");
+		assert_eq!(env_options.endpoint, "127.0.0.1:7782".parse().unwrap());
+		assert!(env_options.json);
+		assert_eq!(
+			env_options.tls.server_name,
+			"toron-00000000-0000-0000-0000-000000000046.cluster.local"
+		);
+		assert_eq!(env_options.tls.cert_path, PathBuf::from("env-monitor.pem"));
+		assert_eq!(env_options.tls.key_path, PathBuf::from("env-monitor.key"));
+		assert_eq!(env_options.tls.ca_path, PathBuf::from("env-ca.pem"));
+
+		let flag_options = parse_inspect_args(&args(&[
+			"--endpoint",
+			"127.0.0.1:7783",
+			"--server-name",
+			"toron-00000000-0000-0000-0000-000000000047.cluster.local",
+			"--cert",
+			"flag-monitor.pem",
+			"--key",
+			"flag-monitor.key",
+			"--ca",
+			"flag-ca.pem",
+		]))
+		.expect("flag inspect options");
+		assert_eq!(flag_options.endpoint, "127.0.0.1:7783".parse().unwrap());
+		assert!(!flag_options.json);
+		assert_eq!(
+			flag_options.tls.server_name,
+			"toron-00000000-0000-0000-0000-000000000047.cluster.local"
+		);
+		assert_eq!(
+			flag_options.tls.cert_path,
+			PathBuf::from("flag-monitor.pem")
+		);
+		assert_eq!(flag_options.tls.key_path, PathBuf::from("flag-monitor.key"));
+		assert_eq!(flag_options.tls.ca_path, PathBuf::from("flag-ca.pem"));
+
+		clear_inspect_env();
+	}
+
+	#[test]
+	fn inspect_text_renderer_is_stable() {
+		let ready = readiness_snapshot(true, None);
+		assert_eq!(
+			render_readiness_text(&ready),
+			"ready: true\nworker_listener_bound: true\nsql_listener_bound: true\nobservability_listeners_bound: true\ndescriptors_loaded: 12\nstatic_workers_configured: 2\nuptime_seconds: 47\ndegraded_reason: null\n"
+		);
+
+		let degraded = readiness_snapshot(false, Some("warming\n\"quoted\""));
+		assert_eq!(
+			render_readiness_text(&degraded),
+			"ready: false\nworker_listener_bound: true\nsql_listener_bound: true\nobservability_listeners_bound: true\ndescriptors_loaded: 12\nstatic_workers_configured: 2\nuptime_seconds: 47\ndegraded_reason: \"warming\\n\\\"quoted\\\"\"\n"
+		);
+	}
+
+	#[test]
+	fn inspect_json_parser_ignores_unknown_fields() {
+		let parsed = serde_json::from_str::<crate::network::observability::ReadinessSnapshot>(
+			"{\"ready\":true,\"worker_listener_bound\":true,\"sql_listener_bound\":true,\"observability_listeners_bound\":true,\"descriptors_loaded\":0,\"static_workers_configured\":0,\"uptime_seconds\":1,\"degraded_reason\":null,\"future_field\":\"ignored\"}",
+		)
+		.expect("forward-compatible readiness snapshot");
+
+		assert!(parsed.ready);
+		assert_eq!(parsed.degraded_reason, None);
+	}
+
+	#[tokio::test]
+	async fn inspect_fetches_ready_from_flag_endpoint_and_preserves_json_body() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(46);
+		let pki = CliInspectPki::generate(worker_id, "operator");
+		let server = MinimalReadyServer::start(worker_id, &pki).await;
+		let body = readiness_snapshot(true, None).to_json();
+		let endpoint = server.connect_addr;
+		let handle = server.spawn_response_once("200 OK", body.clone());
+		let server_name = crate::network::tls::canonical_daemon_dns_name(
+			&worker_id,
+			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+		);
+		let options = inspect_options(
+			endpoint,
+			server_name,
+			pki.monitor_cert.clone(),
+			pki.monitor_key.clone(),
+			pki.ca_cert.clone(),
+			true,
+		);
+
+		let response = fetch_ready(&options).await.expect("ready response");
+		let request = handle.await.expect("ready server task").expect("request");
+		let request = String::from_utf8(request).expect("request utf8");
+
+		assert_eq!(response.body, body);
+		assert_eq!(response.snapshot, readiness_snapshot(true, None));
+		assert!(request.starts_with("GET /ready HTTP/1.1\r\n"));
+		assert!(request.contains(&format!("Host: {}\r\n", options.endpoint)));
+	}
+
+	#[tokio::test]
+	async fn inspect_exit_zero_on_ready_one_on_degraded() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(47);
+		let pki = CliInspectPki::generate(worker_id, "operator");
+		let server_name = crate::network::tls::canonical_daemon_dns_name(
+			&worker_id,
+			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+		);
+
+		let ready_server = MinimalReadyServer::start(worker_id, &pki).await;
+		let ready_endpoint = ready_server.connect_addr;
+		let ready_handle =
+			ready_server.spawn_response_once("200 OK", readiness_snapshot(true, None).to_json());
+		let ready_exit = run_inspect_async(inspect_options(
+			ready_endpoint,
+			server_name.clone(),
+			pki.monitor_cert.clone(),
+			pki.monitor_key.clone(),
+			pki.ca_cert.clone(),
+			false,
+		))
+		.await;
+		assert_eq!(ready_exit, ExitCode::SUCCESS);
+		ready_handle
+			.await
+			.expect("ready server task")
+			.expect("ready request");
+
+		let degraded_server = MinimalReadyServer::start(worker_id, &pki).await;
+		let degraded_endpoint = degraded_server.connect_addr;
+		let degraded_handle = degraded_server.spawn_response_once(
+			"503 Service Unavailable",
+			readiness_snapshot(false, Some("warming")).to_json(),
+		);
+		let degraded_exit = run_inspect_async(inspect_options(
+			degraded_endpoint,
+			server_name,
+			pki.monitor_cert.clone(),
+			pki.monitor_key.clone(),
+			pki.ca_cert.clone(),
+			false,
+		))
+		.await;
+		assert_eq!(degraded_exit, ExitCode::from(1));
+		degraded_handle
+			.await
+			.expect("degraded server task")
+			.expect("degraded request");
+	}
+
+	#[tokio::test]
+	async fn inspect_unexpected_status_returns_exit_two() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(48);
+		let pki = CliInspectPki::generate(worker_id, "operator");
+		let server = MinimalReadyServer::start(worker_id, &pki).await;
+		let endpoint = server.connect_addr;
+		let handle = server
+			.spawn_response_once("418 I'm a Teapot", readiness_snapshot(true, None).to_json());
+		let server_name = crate::network::tls::canonical_daemon_dns_name(
+			&worker_id,
+			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+		);
+
+		let exit = run_inspect_async(inspect_options(
+			endpoint,
+			server_name,
+			pki.monitor_cert.clone(),
+			pki.monitor_key.clone(),
+			pki.ca_cert.clone(),
+			false,
+		))
+		.await;
+
+		assert_eq!(exit, ExitCode::from(2));
+		handle
+			.await
+			.expect("teapot server task")
+			.expect("teapot request");
+	}
+
+	#[tokio::test]
+	async fn inspect_rejects_peer_without_monitor_san_client_cert() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(49);
+		let pki = CliInspectPki::generate(worker_id, "operator");
+		let server = MinimalReadyServer::start(worker_id, &pki).await;
+		let endpoint = server.connect_addr;
+		let handle = server.spawn_response_once("200 OK", readiness_snapshot(true, None).to_json());
+		let server_name = crate::network::tls::canonical_daemon_dns_name(
+			&worker_id,
+			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+		);
+		let options = inspect_options(
+			endpoint,
+			server_name,
+			pki.client_cert.clone(),
+			pki.client_key.clone(),
+			pki.ca_cert.clone(),
+			false,
+		);
+
+		let error = match fetch_ready(&options).await {
+			Ok(_) => panic!("client- SAN must not be admitted to observability listener"),
+			Err(error) => error,
+		};
+
+		assert!(matches!(error, InspectError::Connectivity { .. }));
+		assert!(
+			tokio::time::timeout(Duration::from_secs(2), handle)
+				.await
+				.expect("server observed rejected client")
+				.expect("server task")
+				.is_err()
+		);
+	}
+
+	#[tokio::test]
+	async fn inspect_reports_connection_failure_exit_two() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(50);
+		let pki = CliInspectPki::generate(worker_id, "operator");
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+			.await
+			.expect("bind unused port");
+		let endpoint = listener.local_addr().expect("unused local addr");
+		drop(listener);
+		let server_name = crate::network::tls::canonical_daemon_dns_name(
+			&worker_id,
+			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+		);
+
+		let exit = run_inspect_async(inspect_options(
+			endpoint,
+			server_name,
+			pki.monitor_cert.clone(),
+			pki.monitor_key.clone(),
+			pki.ca_cert.clone(),
+			false,
+		))
+		.await;
+
+		assert_eq!(exit, ExitCode::from(2));
+	}
+
+	#[tokio::test]
+	async fn inspect_connect_timeout_maps_to_stable_error() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(51);
+		let pki = CliInspectPki::generate(worker_id, "operator");
+		let server_name = crate::network::tls::canonical_daemon_dns_name(
+			&worker_id,
+			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+		);
+		let options = inspect_options(
+			"127.0.0.1:7781".parse().expect("endpoint"),
+			server_name,
+			pki.monitor_cert.clone(),
+			pki.monitor_key.clone(),
+			pki.ca_cert.clone(),
+			false,
+		);
+
+		let error = match fetch_ready_with_tcp_connect(
+			&options,
+			std::future::pending::<io::Result<TcpStream>>(),
+			Duration::from_millis(1),
+		)
+		.await
+		{
+			Ok(_) => panic!("pending connect must time out"),
+			Err(error) => error,
+		};
+
+		match error {
+			InspectError::Connectivity { action, source } => {
+				assert_eq!(action, "connect to endpoint within timeout");
+				assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+			}
+			InspectError::UnexpectedStatus(status) => {
+				panic!("unexpected status error from connect timeout: {status}")
+			}
+		}
 	}
 
 	#[test]

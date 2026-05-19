@@ -6112,11 +6112,11 @@ fn adr041_toron_cli_reservations_preserved() {
 	let cli =
 		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
 
-	assert!(cli.contains("is reserved; production execution is not wired in ADR 040"));
 	assert!(cli.contains("[verb, rest @ ..] if verb == \"sql\" && !rest.is_empty()"));
 	assert!(cli.contains("run_sql(rest)"));
-	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
-	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
+	assert!(cli.contains("[verb, rest @ ..] if verb == \"inspect\" => run_inspect(rest)"));
+	assert!(!cli.contains("is reserved; production execution is not wired in ADR 040"));
+	assert!(!cli.contains("reserved(\"inspect\")"));
 }
 
 #[test]
@@ -6133,11 +6133,10 @@ fn adr042_toron_inspect_remains_reserved_after_sql_lift() {
 	let cli =
 		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
 
-	assert!(cli.contains("is reserved; production execution is not wired in ADR 040"));
 	assert!(cli.contains("[verb, rest @ ..] if verb == \"sql\" && !rest.is_empty()"));
 	assert!(cli.contains("run_sql(rest)"));
-	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
-	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
+	assert!(cli.contains("[verb, rest @ ..] if verb == \"inspect\" => run_inspect(rest)"));
+	assert!(!cli.contains("reserved(\"inspect\")"));
 }
 
 #[test]
@@ -6288,8 +6287,8 @@ fn adr043_toron_inspect_remains_reserved() {
 	let cli =
 		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
 
-	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
-	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
+	assert!(cli.contains("[verb, rest @ ..] if verb == \"inspect\" => run_inspect(rest)"));
+	assert!(!cli.contains("reserved(\"inspect\")"));
 }
 
 #[test]
@@ -6760,7 +6759,6 @@ fn adr045_observability_listeners_use_hand_rolled_http_no_hyper_no_axum() {
 			"tower",
 			"Request<",
 			"Response<",
-			"chunked",
 			"keep-alive",
 			"http2",
 			"quinn",
@@ -6968,6 +6966,309 @@ fn adr045_new_observability_types_are_brand_clean_and_no_v1_suffix() {
 		"ObservabilityConfigV1",
 		"ReadinessSnapshotV1",
 		"MetricsRegistryV1",
+	]);
+}
+
+#[test]
+fn adr046_toron_inspect_is_not_reserved() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(cli.contains("[verb, rest @ ..] if verb == \"inspect\" => run_inspect(rest)"));
+	assert!(cli.contains("fn run_inspect(args: &[String]) -> ExitCode"));
+	assert!(!cli.contains("reserved(\"inspect\")"));
+	assert!(!cli.contains("Toron inspect is reserved in ADR 040"));
+}
+
+#[test]
+fn adr046_toron_inspect_is_client_only() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let inspect_body = brace_blocks_after_marker(&cli, "async fn fetch_ready_with_tcp_connect")
+		.into_iter()
+		.next()
+		.expect("fetch_ready_with_tcp_connect body")
+		.1;
+
+	assert!(cli.contains("TcpStream::connect(options.endpoint)"));
+	for required in ["TlsConnector::from", "read_response"] {
+		assert!(
+			inspect_body.contains(required),
+			"inspect client missing {required}"
+		);
+	}
+	for forbidden in [
+		"ToronDaemon",
+		"ToronWorker",
+		"DistributedQueryCoordinator",
+		"WendelonCatalog",
+		"DescriptorRegistry",
+		"MetricsRegistry",
+		"StorageScan",
+	] {
+		assert!(
+			!inspect_body.contains(forbidden),
+			"inspect client constructs daemon machinery token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr046_toron_inspect_dials_ready_endpoint() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let inspect_body = brace_blocks_after_marker(&cli, "async fn fetch_ready_with_tcp_connect")
+		.into_iter()
+		.next()
+		.expect("fetch_ready_with_tcp_connect body")
+		.1;
+
+	assert!(inspect_body.contains("crate::network::observability::READY_PATH"));
+	assert!(inspect_body.contains("write_request("));
+	assert!(inspect_body.contains("&options.endpoint.to_string()"));
+	assert!(!inspect_body.contains("&tls.server_name"));
+	for forbidden in [
+		"HEALTH_PATH",
+		"METRICS_PATH",
+		"\"/inspect\"",
+		"\"/workers\"",
+		"\"/config\"",
+	] {
+		assert!(
+			!inspect_body.contains(forbidden),
+			"inspect client must not dial {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr046_toron_inspect_endpoint_precedence_flag_env_default() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let parse_body = brace_blocks_after_marker(&cli, "fn parse_inspect_args")
+		.into_iter()
+		.next()
+		.expect("parse_inspect_args body")
+		.1;
+
+	assert!(cli.contains("const DEFAULT_INSPECT_ENDPOINT: &str = \"127.0.0.1:7781\";"));
+	assert!(parse_body.contains("\"--endpoint\""));
+	assert!(parse_body.contains("std::env::var(\"TORON_INSPECT_ENDPOINT\")"));
+	assert!(parse_body.contains("DEFAULT_INSPECT_ENDPOINT"));
+	assert!(parse_body.contains("invalid TORON_INSPECT_ENDPOINT"));
+}
+
+#[test]
+fn adr046_toron_inspect_requires_all_four_tls_flags_together() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let parse_body = brace_blocks_after_marker(&cli, "fn parse_inspect_args")
+		.into_iter()
+		.next()
+		.expect("parse_inspect_args body")
+		.1;
+
+	for required in [
+		"TORON_INSPECT_SERVER_NAME",
+		"TORON_INSPECT_CLIENT_CERT",
+		"TORON_INSPECT_CLIENT_KEY",
+		"TORON_INSPECT_CA",
+		"toron inspect requires --server-name, --cert, --key, and --ca",
+	] {
+		assert!(parse_body.contains(required), "missing {required}");
+	}
+	assert!(!parse_body.contains("endpoint.ip().is_loopback()"));
+	let tls = std::fs::read_to_string(manifest_dir().join("src/network/tls.rs"))
+		.expect("read TLS source");
+
+	assert!(tls.contains("canonical_monitor_dns_name"));
+	assert!(tls.contains("\"monitor\""));
+	assert!(!tls.contains("inspect-"));
+	assert!(!cli.contains("inspect-"));
+}
+
+#[test]
+fn adr046_toron_inspect_renders_text_by_default_json_with_flag() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let render_body = brace_blocks_after_marker(&cli, "fn render_readiness_text")
+		.into_iter()
+		.next()
+		.expect("render_readiness_text body")
+		.1;
+
+	for required in [
+		"ready:",
+		"worker_listener_bound:",
+		"sql_listener_bound:",
+		"observability_listeners_bound:",
+		"descriptors_loaded:",
+		"static_workers_configured:",
+		"uptime_seconds:",
+		"degraded_reason:",
+		"serde_json::to_string",
+		"null",
+	] {
+		assert!(render_body.contains(required), "missing {required}");
+	}
+	for forbidden in [
+		"endpoint",
+		"worker_id",
+		"tenant_id",
+		"query_id",
+		"task_id",
+		"table",
+		"sql_text",
+		"certificate",
+		"uuid",
+	] {
+		assert!(
+			!render_body.contains(forbidden),
+			"inspect text renderer leaks {forbidden}"
+		);
+	}
+	let run_body = brace_blocks_after_marker(&cli, "async fn run_inspect_async")
+		.into_iter()
+		.next()
+		.expect("run_inspect_async body")
+		.1;
+
+	assert!(run_body.contains("print!(\"{}\", response.body)"));
+	assert!(run_body.contains("!response.body.ends_with('\\n')"));
+	assert!(!run_body.contains("trim_end"));
+	assert!(!run_body.contains("pretty"));
+	assert!(!run_body.contains("envelope"));
+
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability source");
+	assert!(observability.contains("serde::Deserialize"));
+	assert!(cli.contains("serde_json::from_slice"));
+	assert!(!observability.contains("deny_unknown_fields"));
+	assert!(!cli.contains("deny_unknown_fields"));
+}
+
+#[test]
+fn adr046_toron_inspect_exit_codes_are_pinned_to_0_1_2() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let run_body = brace_blocks_after_marker(&cli, "async fn run_inspect_async")
+		.into_iter()
+		.next()
+		.expect("run_inspect_async body")
+		.1;
+
+	assert!(run_body.contains("ExitCode::SUCCESS"));
+	assert!(run_body.contains("ExitCode::from(1)"));
+	assert!(run_body.contains("ExitCode::from(2)"));
+	assert!(!run_body.contains("ExitCode::from(3)"));
+}
+
+#[test]
+fn adr046_inspect_handles_only_200_and_503_status_codes() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let inspect_body = brace_blocks_after_marker(&cli, "async fn fetch_ready_with_tcp_connect")
+		.into_iter()
+		.next()
+		.expect("fetch_ready_with_tcp_connect body")
+		.1;
+
+	assert!(inspect_body.contains("response.status_code != 200"));
+	assert!(inspect_body.contains("response.status_code != 503"));
+	assert!(inspect_body.contains("InspectError::UnexpectedStatus"));
+	assert!(cli.contains("unexpected HTTP status {status_code}"));
+}
+
+#[test]
+fn adr046_inspect_has_tcp_connect_timeout() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(cli.contains("pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);"));
+	assert!(cli.contains("tokio::time::timeout(connect_timeout, connect)"));
+	assert!(cli.contains("TcpStream::connect(options.endpoint)"));
+	assert!(cli.contains("CONNECT_TIMEOUT"));
+}
+
+#[test]
+fn adr046_no_new_daemon_wire_surface_in_observability_module() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability source");
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+
+	for forbidden in ["INSPECT_PATH", "INFO_PATH", "VERSION_PATH", "WORKERS_PATH"] {
+		assert!(
+			!observability.contains(forbidden),
+			"ADR 046 must not add observability endpoint {forbidden}"
+		);
+	}
+	assert!(daemon.contains("println!(\"READY {}\", daemon.handle().worker_endpoint);"));
+	assert!(daemon.contains("println!(\"SQL_READY {sql_endpoint}\");"));
+	assert!(daemon.contains("\"OBSERVABILITY_READY health={} ready={} metrics={}\""));
+	assert!(!sql_wire.contains("Inspect"));
+	assert!(!sql_wire.contains("AuthToken"));
+}
+
+#[test]
+fn adr046_inspect_uses_hand_rolled_http_no_http_crate_no_hyper_no_reqwest() {
+	let cargo =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Cargo.toml");
+	let http = std::fs::read_to_string(manifest_dir().join("src/network/observability_http.rs"))
+		.expect("read observability HTTP source");
+
+	for forbidden in [
+		"http =",
+		"hyper",
+		"reqwest",
+		"ureq",
+		"tower",
+		"axum",
+		"actix-web",
+		"hyper-util",
+	] {
+		assert!(
+			!cargo.contains(forbidden),
+			"Toron Cargo.toml must not include {forbidden}"
+		);
+	}
+	for required in ["write_request", "read_response", "HttpResponse"] {
+		assert!(
+			http.contains(required),
+			"missing HTTP client helper {required}"
+		);
+	}
+}
+
+#[test]
+fn adr046_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "clap", "tracing", "rustls", "tokio-rustls"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr046_new_inspect_types_are_brand_clean_and_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronInspect",
+		"ToronReadyClient",
+		"ToronHttpResponse",
+		"InspectOptionsV1",
+		"InspectTlsOptionsV1",
+		"InspectErrorV1",
+		"ReadyClientV1",
+		"HttpResponseV1",
 	]);
 }
 

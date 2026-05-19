@@ -243,6 +243,18 @@ pub fn client_config_from_paths(
 	client_config(&material)
 }
 
+pub fn http_client_config_from_paths(
+	cert_path: &Path,
+	key_path: &Path,
+	ca_path: &Path,
+) -> Result<ClientConfig, TlsError> {
+	for path in [cert_path, key_path, ca_path] {
+		reject_env_interpolation(path)?;
+	}
+	let material = TlsMaterial::load(cert_path, key_path, ca_path)?;
+	build_rustls_client_config(&material, OBSERVABILITY_HTTP_ALPN)
+}
+
 struct TlsMaterial {
 	cert_chain: Vec<CertificateDer<'static>>,
 	key: PrivateKeyDer<'static>,
@@ -317,6 +329,16 @@ fn build_rustls_server_config(
 }
 
 fn client_config(material: &TlsMaterial) -> Result<quinn::ClientConfig, TlsError> {
+	let rustls_config = build_rustls_client_config(material, AUTH_QUIC_ALPN)?;
+	let quic_config = QuicClientConfig::try_from(rustls_config)
+		.map_err(|error| TlsError::Config(format!("QUIC client config: {error}")))?;
+	Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
+}
+
+fn build_rustls_client_config(
+	material: &TlsMaterial,
+	alpn: &[u8],
+) -> Result<ClientConfig, TlsError> {
 	install_rustls_provider();
 	let verifier = WebPkiServerVerifier::builder(material.ca_roots.clone())
 		.build()
@@ -327,10 +349,8 @@ fn client_config(material: &TlsMaterial) -> Result<quinn::ClientConfig, TlsError
 		.with_custom_certificate_verifier(exact_server_verifier)
 		.with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
 		.map_err(|error| TlsError::Config(format!("client cert/key: {error}")))?;
-	rustls_config.alpn_protocols = vec![AUTH_QUIC_ALPN.to_vec()];
-	let quic_config = QuicClientConfig::try_from(rustls_config)
-		.map_err(|error| TlsError::Config(format!("QUIC client config: {error}")))?;
-	Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
+	rustls_config.alpn_protocols = vec![alpn.to_vec()];
+	Ok(rustls_config)
 }
 
 fn install_rustls_provider() {
