@@ -3664,6 +3664,156 @@ along with the forward-sequence rewrite.
   unmodified).
   The nine-phase migration is materialized in
   `plans/impl/046_nilket_toron_inspect_real_wiring.md`.
+- **ADR 047 — Shared `tls-pki` Workspace Crate.**
+  Promoted. **First refactor cycle in the ADR
+  040-onward sequence** and the first
+  cross-ring extraction. Pays down the
+  accumulated parallel TLS construction across
+  ADR 043 + ADR 044 + ADR 045 + ADR 046 (ADR 046
+  D10's internal `build_rustls_client_config`
+  helper was the half-step extraction this
+  cycle completes). Three council iterations on
+  a refactor-class topic: iter-0 topic-shape
+  survey (Shape A `tls-pki` workspace-crate
+  extraction selected over Shapes B Toron-local
+  factor, C TLS+observability mega-crate, D
+  defer to ADR 048+, E Wendelon-only extraction,
+  F mTLS-only without ASN.1/CBOR); iter-1 three
+  Claude retractions — R1 Shape A full
+  cross-ring migration retracted after Wendelon
+  `network::tls.rs` audit (~30% shareable, not
+  ~70%; Wendelon-side migration becomes
+  minimal-import-only), R2 shared `TlsError`
+  enum retracted because Wendelon returns
+  `std::io::Result<T>` (Wendelon call sites map
+  `PkiError` to `std::io::Error` to preserve
+  Wendelon's error shape), R3
+  Plan A / Plan B framing collapsed to
+  single-plan posture; iter-2 three preemptive
+  sharpenings — D5 error conversion direction
+  pinned, D6 `PeerIdentity` open struct
+  confirmed, D8 caller-owned verifier boundary
+  pinned (ring-local policy over Gemini's
+  closure pattern);
+  iter-3 two convergence sharpenings driven by
+  Codex iter-3 + Gemini iter-3 — D1 module
+  scope expanded from five to seven submodules
+  adding `asn1` + `cbor` per Codex+Gemini
+  2-of-3 convergence (Gemini's
+  `GenericCertVerifier<F>` closure rejected
+  2-of-3 Codex+Claude as too narrow for
+  Wendelon's subject/extension-based admission;
+  Gemini's Toron CLI consolidation rejected
+  2-of-3 Codex+Claude as out-of-scope for
+  cross-ring substrate ADR), shared-crate
+  error type named `PkiError` to reflect
+  expanded scope while Toron's `TlsError`
+  remains local.
+  Final promoted D-set: **10 decisions, 11
+  architecture guards + 1 convention guard, 6
+  required integration fixtures + 2 V1-evidence
+  optional fixtures**.
+  **Shape A selected (`tls-pki` workspace
+  crate).** Shape B (Toron-local refactor)
+  rejected — leaves Wendelon-side TLS plumbing
+  duplicated. Shape C (TLS + observability
+  mega-crate) rejected — bundles two refactor
+  concerns; violates ADR-by-ADR cadence. Shape
+  D (defer to ADR 048+) rejected — visible
+  accumulated debt across ADR 043+. Shape E
+  (Wendelon-only) rejected — Wendelon-side
+  migration is minimal-import-only. Shape F
+  (mTLS-only without ASN.1/CBOR) rejected
+  2-of-3 (Codex+Gemini accepted ASN.1/CBOR
+  primitives).
+  **D1 critical decision:** `crates/tls-pki/`
+  workspace crate with **seven submodules**
+  (`material`, `asn1`, `cbor`, `san`,
+  `config_builder`, `verifier`, `error`).
+  Brand-clean name (no `nilket-` / `toron-` /
+  `wendelon-` prefix; no V1 suffix; **twelfth
+  consecutive cycle** — ADRs 039 / 041 / 042 /
+  043 / 044 / 045 / 046 / 047).
+  **D2 critical decision:** `tls-pki` is
+  policy-neutral substrate. Wendelon's
+  ring-internal machinery (`ActorPermission`,
+  `RevocationSnapshot`, `authorize_actor`,
+  `ACTOR_CLAIMS_OID_DOTTED`, `ActorIdentity`,
+  `ActorTrustRoots`, `VerifiedTransportPeer`,
+  `authorize_break_glass_scope`, `HRFT_ALPN`)
+  stays Wendelon-internal. Toron's ALPN
+  constants plus `ExactServerCertVerifier` /
+  `SanClientCertVerifier` policy wrappers stay
+  Toron-internal.
+  **D3 critical decision:** no quinn / tokio /
+  tracing dependencies in `tls-pki`. Pure-sync
+  rustls / asn1 / cbor substrate library.
+  **D4 critical decision:** Wendelon-side
+  migration is **minimal-import-only** —
+  shared-substrate imports + one
+  `canonical_node_dns_name` wrapper + local
+  `PkiError` to `std::io::Error` mapping
+  helpers. Wendelon's
+  inline DER/CBOR parsing for actor claims is
+  grandfathered for V1.
+  **D5 critical decision:** `PkiError` (renamed
+  from `TlsError` in iter-3) is the canonical
+  substrate error type. Toron keeps its
+  existing `TlsError` wrapper and maps
+  `PkiError` at the boundary; Wendelon converts
+  to `std::io::Error` at call sites.
+  **D6 critical decision:** `PeerIdentity` is
+  an open struct (`prefix`, `id_token`,
+  `cluster_domain`). Reusable across Toron-side
+  and Wendelon-side. Toron's UUID post-check
+  stays Toron-local.
+  **D7 critical decision:** `canonical_dns_name`
+  parameterized by `prefix: &str`. Toron wraps
+  through existing canonical daemon/client/
+  monitor helpers; Wendelon wraps as
+  `canonical_node_dns_name`.
+  **D8 critical decision:** rustls config
+  builders accept caller-owned verifier policy
+  and `tls-pki` exposes trust-chain verifier
+  helpers; rejected `GenericCertVerifier<F>`
+  closure pattern 2-of-3 Codex+Claude.
+  **D9 critical decision:** ASN.1/DER + CBOR
+  parsing primitives owned by `tls-pki`
+  (iter-3 sharpening per Codex+Gemini 2-of-3).
+  **D10 critical decision:** ALPN values stay
+  ring-local. `tls-pki` does not declare
+  `AUTH_QUIC_ALPN`, `OBSERVABILITY_HTTP_ALPN`,
+  `HRFT_ALPN`.
+  **Single-plan posture.** No Plan A / Plan B
+  framing (retracted in iter-1 R3).
+  **Eleven architecture guards + 1 convention
+  guard** including the iter-3 sharpening guard
+  11
+  (`adr047_toron_der_and_cbor_parsing_delegates_to_tls_pki`)
+  and the meta-guard 10
+  (`adr047_byte_identical_post_extraction_with_prior_cycle_guards`)
+  pinning the byte-identical pre/post promotion
+  gate.
+  **Six required fixtures + 2 V1-evidence
+  optional** including the meta-fixture 6
+  (`tls_pki_byte_identical_post_extraction_with_prior_cycle_guards`)
+  that captures baseline pre-extraction test
+  output and asserts byte-identical post-
+  extraction diff (the promotion-gating
+  critical evidence). Optional V1-evidence
+  fixtures are
+  `wendelon_tls_pki_imports_compose_with_actor_permission`
+  and
+  `wendelon_actor_claims_parse_through_tls_pki_asn1_cbor`.
+  **Byte-identical refactor-invariant chain
+  extends to twelve preserved cycles** (ADRs
+  035 / 036 / 037 / 038 / 039 / 041 / 042 /
+  043 / 044 / 045 / 046 / 047 all preserve the
+  local DML fixture pass count + leave
+  `toron_fixture_worker.rs` source
+  unmodified).
+  The eleven-phase migration is materialized in
+  `plans/impl/047_shared_tls_pki_workspace_crate.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -3731,7 +3881,415 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 046 promoted; ADR 047 candidates
+### ADR 047 promoted; ADR 048 candidates
+
+ADR 047 selected and promoted **Shared `tls-pki`
+Workspace Crate** — the **first refactor cycle
+in the ADR 040-onward sequence** and the first
+cross-ring extraction. Three council iterations
+on a refactor-class topic: iter-0 topic-shape
+survey (Shape A `tls-pki` workspace-crate
+extraction selected over Shapes B Toron-local
+factor, C TLS+observability mega-crate, D defer
+to ADR 048+, E Wendelon-only extraction, F mTLS
+substrate without ASN.1/CBOR); iter-1 three
+Claude retractions — R1 Shape A full
+cross-ring migration retracted after Wendelon
+`network::tls.rs` audit (~30% shareable, not
+~70%; Wendelon-side migration becomes
+minimal-import-only); R2 shared `TlsError` enum
+retracted because Wendelon-side returns
+`std::io::Result<T>` (Wendelon call sites map
+`PkiError` to `std::io::Error` to preserve
+Wendelon's error shape); R3 Plan
+A / Plan B framing collapsed to single-plan
+posture; iter-2 three preemptive sharpenings —
+D5 error conversion direction pinned (`tls-pki`
+owns `PkiError`; Wendelon-boundary converts to
+`std::io::Error`), D6 `PeerIdentity` open struct
+confirmed, D8 caller-owned verifier boundary
+pinned (ring-local policy over Gemini's
+closure pattern); iter-3
+two convergence sharpenings driven by Codex
+iter-3 + Gemini iter-3 — D1 module scope
+expanded from five to seven submodules adding
+`asn1` + `cbor` per Codex+Gemini 2-of-3
+convergence (Gemini's `GenericCertVerifier<F>`
+closure rejected 2-of-3 Codex+Claude as too
+narrow for Wendelon's subject/extension-based
+admission; Gemini's Toron CLI consolidation
+rejected 2-of-3 Codex+Claude as out-of-scope
+for cross-ring substrate ADR), shared-crate
+error type named `PkiError` to reflect expanded
+scope (TLS material + ASN.1/DER + CBOR
+primitives + rustls config errors) while
+Toron's `TlsError` remains local. Final D-set: **10
+decisions, 11 architecture guards + 1
+convention guard, 6 required integration
+fixtures + 2 V1-evidence optional fixtures**.
+
+**First refactor cycle.** ADR 047 is pure
+behavior-preserving extraction: zero functional
+changes, zero wire changes, zero config
+changes, zero new operator-visible
+functionality. All ADR 042/043/044/045/046
+architecture guards and integration fixtures
+continue to pass byte-identical pre/post the
+extraction. Meta-guard 10
+(`adr047_byte_identical_post_extraction_with_prior_cycle_guards`)
+and meta-fixture 6
+(`tls_pki_byte_identical_post_extraction_with_prior_cycle_guards`)
+capture baseline test output pre-extraction
+and re-run post-extraction asserting
+byte-identical diff. Promotion gates on the
+byte-identical comparison.
+
+**Shape A selected (`tls-pki` workspace
+crate).** Shape B (Toron-local refactor)
+rejected — leaves Wendelon-side TLS plumbing
+duplicated; doesn't pay down the cross-ring
+debt. Shape C (TLS + observability mega-crate)
+rejected — bundles two refactor concerns into
+one cycle; violates ADR-by-ADR cadence. Shape
+D (defer to ADR 048+) rejected — accumulated
+parallel TLS construction across ADR 043 + ADR
+044 + ADR 045 + ADR 046 created visible debt
+that ADR 046 D10 already half-stepped toward
+extracting (internal `build_rustls_client_config`
+helper). Shape E (Wendelon-only extraction)
+rejected — Wendelon-side migration is
+minimal-import-only per R1 retraction; doesn't
+justify a workspace crate. Shape F (mTLS
+substrate without ASN.1/CBOR) rejected
+2-of-3 (Codex+Gemini accepted `asn1` + `cbor`
+submodules over Claude iter-2 framing).
+
+**D1 critical decision:** `crates/tls-pki/`
+workspace crate with **seven submodules**
+(`material`, `asn1`, `cbor`, `san`,
+`config_builder`, `verifier`, `error`).
+Brand-clean name (no `nilket-` / `toron-` /
+`wendelon-` prefix; no V1 suffix; twelfth
+consecutive cycle preserving the convention).
+
+**D2 critical decision:** `tls-pki` is
+**policy-neutral substrate** — exports the
+machinery (PEM loaders, rustls config builders,
+ASN.1/DER primitives, CBOR primitives, SAN
+admission, trust-chain helpers) but **not**
+ring-specific policy. Wendelon's
+`ActorPermission` + `RevocationSnapshot` +
+`authorize_actor` + `ACTOR_CLAIMS_OID_DOTTED`
++ `ActorIdentity` + `ActorTrustRoots` +
+`VerifiedTransportPeer` + `authorize_break_glass_scope`
++ `HRFT_ALPN` stay Wendelon-internal. Toron's
+ALPN constants (`AUTH_QUIC_ALPN`,
+`OBSERVABILITY_HTTP_ALPN`) and
+`ExactServerCertVerifier` /
+`SanClientCertVerifier` policy wrappers stay
+Toron-internal.
+
+**D3 critical decision:** no quinn / tokio /
+tracing dependencies in `tls-pki`. Pure-sync
+rustls / asn1 / cbor substrate library. ALPN
+values are caller-supplied parameters (`alpn:
+&[u8]`), not constants in `tls-pki`.
+
+**D4 critical decision:** Wendelon-side
+migration is **minimal-import-only**:
+shared-substrate imports plus one
+`canonical_node_dns_name` wrapper (carries the
+`"node"` prefix) plus local `PkiError` to
+`std::io::Error` mapping helpers. Wendelon's
+ring-internal machinery
+stays untouched. Wendelon's inline DER/CBOR
+parsing for actor claims is **grandfathered
+for V1** (per Codex iter-3 deferral framing);
+future ADR can extend the
+`adr047_toron_der_and_cbor_parsing_delegates_to_tls_pki`
+guard to Wendelon-side if pressure surfaces.
+
+**D5 critical decision:** `PkiError` (renamed
+from `TlsError` in iter-3) is the canonical
+substrate error type. Toron keeps its existing
+`TlsError` wrapper and maps `PkiError` at the
+boundary; Wendelon call sites convert to
+`std::io::Error` (preserves Wendelon's existing
+`std::io::Result<T>` shape). New variants:
+`DerParse { reason }`, `CborParse { reason }`
+for the ASN.1/CBOR primitives.
+
+**D6 critical decision:** `PeerIdentity` is an
+open struct (`prefix`, `id_token`,
+`cluster_domain` — all `String`). Reusable
+across Toron-side (carrying `prefix ==
+"toron"` / `"client"` / `"monitor"` and
+UUID-shaped `id_token`) and Wendelon-side
+(carrying `prefix == "node"` and arbitrary
+`id_token`). Toron's UUID post-check stays
+Toron-local (per-cert post-admission via
+`Uuid::parse_str(&peer.id_token)`).
+
+**D7 critical decision:** `canonical_dns_name`
+parameterized by `prefix: &str`. Toron keeps
+its existing canonical daemon/client/monitor
+wrappers; Wendelon wraps as
+`canonical_node_dns_name`.
+One function, two ring-distinct call patterns.
+
+**D8 critical decision:** rustls config builders
+accept caller-owned verifier policy, and
+`tls-pki` exposes trust-chain verifier helpers.
+Toron's `SanClientCertVerifier` /
+`ExactServerCertVerifier` policy stays
+Toron-internal; Wendelon's actor verifier stays
+Wendelon-internal.
+
+**D9 critical decision:** ASN.1/DER + CBOR
+parsing primitives owned by `tls-pki`. Iter-3
+sharpening per Codex+Gemini 2-of-3:
+`tls_pki::asn1::{DerReader, extract_dns_sans,
+extract_subject, extract_extension}` and
+`tls_pki::cbor::CborReader`. The verifier-
+internal SAN extraction uses
+`tls_pki::asn1::extract_dns_sans`. Wendelon's
+inline DER/CBOR parsing is grandfathered for
+V1 (future ADR can enforce the migration).
+
+**D10 critical decision:** ALPN values stay
+ring-local. `tls-pki` does not declare
+`AUTH_QUIC_ALPN`, `OBSERVABILITY_HTTP_ALPN`,
+or `HRFT_ALPN`. Callers pass ALPN as a
+parameter to `build_rustls_server_config` /
+`build_rustls_client_config`.
+
+**Single-plan posture.** No Plan A / Plan B
+framing (retracted in iter-1 R3). Wendelon-side
+migration scope is part of the single plan
+(minimal-import-only).
+
+**Eleven architecture guards + 1 convention
+guard** including the iter-3 sharpening guard
+11
+(`adr047_toron_der_and_cbor_parsing_delegates_to_tls_pki`)
+pinning Toron-side DER/CBOR delegation to
+`tls-pki` (Wendelon-side grandfathered for
+V1), the meta-guard 10
+(`adr047_byte_identical_post_extraction_with_prior_cycle_guards`)
+asserting all prior-cycle architecture guards
+continue to pass byte-identical pre/post the
+extraction, and the convention guard
+(`adr047_new_tls_pki_types_are_brand_clean_and_no_v1_suffix`)
+carrying forward the no-V1-suffix convention
+for the twelfth consecutive cycle.
+
+**Six required fixtures + 2 V1-evidence
+optional** including the meta-fixture 6
+(`tls_pki_byte_identical_post_extraction_with_prior_cycle_guards`)
+that captures baseline pre-extraction test
+output and asserts byte-identical post-
+extraction diff (the promotion-gating
+critical evidence), and the iter-3 sharpening
+fixture 5
+(`tls_pki_build_rustls_client_config_accepts_alpn_parameter`)
+that exercises both `b"sql-task-auth"` and
+`b"http/1.1"` ALPN values through the shared
+config builder. The optional V1-evidence
+fixtures are
+`wendelon_tls_pki_imports_compose_with_actor_permission`
+(Wendelon-side cleanly-composes verification)
+and
+`wendelon_actor_claims_parse_through_tls_pki_asn1_cbor`
+(Wendelon-side future-migration witness for
+`tls_pki::asn1` + `tls_pki::cbor` adoption;
+deferred V1).
+
+**Byte-identical refactor-invariant chain
+extends to twelve preserved cycles** (ADRs
+035 / 036 / 037 / 038 / 039 / 041 / 042 /
+043 / 044 / 045 / 046 / 047 all preserve the
+local DML fixture pass count + leave
+`toron_fixture_worker.rs` source unmodified).
+
+**Architectural invariants preserved through
+this cycle:**
+
+- ADR 040 reservation continuity: all three
+  reservations remain lifted (ADR 047 is a
+  pure refactor; CLI surface unchanged).
+- ADR 040 D4 / ADR 042 D2 / ADR 043 D2 / ADR
+  045 D9 / ADR 046 D10 root-runtime-free
+  (`crates/nilket/Cargo.toml` untouched; new
+  `tls-pki` crate is sync-only).
+- ADR 038 / 039 registry convergence
+  unchanged.
+- ADR 042 D12 / ADR 043 D16 / ADR 044 D8 /
+  ADR 045 D8 / ADR 046 readiness lines
+  byte-identical pre/post ADR 047.
+- ADR 042 D13 tracing-only observability
+  unchanged.
+- ADR 043 D9 / ADR 044 D4 server-stamped
+  tenant unchanged.
+- ADR 044 D5 exact-shape SAN admission
+  attack-class rejections preserved
+  byte-identical through the extraction
+  (now exercised through `tls_pki::admit_san`).
+- ADR 044 D6 wire-invariant (no SqlMessage /
+  SqlError changes).
+- ADR 044 D7 / ADR 045 D7 no-revocation
+  invariant.
+- ADR 044 D11 one cert per daemon.
+- ADR 045 D3 `admit_san` admission set
+  unchanged.
+- ADR 045 D6 `ReadinessSnapshot` low-
+  cardinality shape preserved.
+- ADR 046 D6 stdout/stderr separation +
+  exit-code surface unchanged.
+- ADR 046 D7 symmetric 5-second
+  `CONNECT_TIMEOUT` / `READ_REQUEST_TIMEOUT`
+  unchanged.
+- ADR 039 D5 / ADR 042 / ADR 043 / ADR 044 /
+  ADR 045 / ADR 046 no-V1-suffix convention
+  (twelfth consecutive cycle — ADRs 039 /
+  041 / 042 / 043 / 044 / 045 / 046 / 047).
+- ADR 035 – 046 byte-identical refactor-
+  invariant chain (extends to twelve
+  preserved cycles).
+- Cross-ring discipline preserved (`tls-pki`
+  exports policy-neutral substrate only;
+  ring-internal admission policy stays in
+  Toron / Wendelon respectively).
+
+The eleven-phase migration is materialized in
+`plans/impl/047_shared_tls_pki_workspace_crate.md`.
+
+**ADR 048 candidates (no single lead candidate
+emerged; selection by evidence pressure):**
+
+After ADR 047, the architectural substrate is
+consolidated. The ADR 040 reservation pattern
+is fully discharged; the cross-ring TLS/PKI
+substrate is shared; the byte-identical
+refactor-invariant chain extends to twelve
+preserved cycles. ADR 048 selects among the
+substantive substrate / composition / feature
+candidates per evidence pressure:
+
+- **OTLP traces export** (`[observability.traces]`).
+  Wendelon has this; Toron deferred in ADR
+  045 D7. Future substrate cycle if a
+  deployment surfaces need.
+- **Audit subsystem.** Wendelon has this;
+  Toron deferred in ADR 045 D7. Future
+  substrate cycle.
+- **Multi-tenant routing.** Now genuinely
+  unblocked by ADR 044 + ADR 045's `monitor-`
+  admission pattern + ADR 046's `monitor-`
+  cert reuse + ADR 047's shared `tls-pki`
+  substrate. Substantial substrate cycle
+  (4+ iterations); requires per-tenant catalog
+  isolation policy design.
+- **Live cert rotation / CRL / OCSP.**
+  Retracted from ADR 044 in iter-1; future
+  ADR over ADR 044 policy substrate +
+  ADR 047 `tls-pki` substrate.
+- **`nilket wendelon inspect` parity.**
+  Wendelon-side composition cycle; orthogonal
+  to ADR 046; now easier with ADR 047's
+  shared `http_client_config_from_paths`-shape
+  helper potentially extracted from Toron's
+  ADR 046 path.
+- **SQL surface widening** — CTAS `IF NOT
+  EXISTS` (`sql_planner.rs:897` reject
+  preserved by ADR 041 D3; tiny composition
+  cycle); `UPDATE WHERE` (composition over
+  ADR 035 row-identity substrate); `INSERT
+  ... RETURNING` / `CTAS ... RETURNING` /
+  `DELETE ... RETURNING` (DML result-shape
+  extension).
+- **`ActorPermission` parity Toron-side.**
+  Future ADR if per-listener role admission
+  needs to evolve beyond SAN prefix; would
+  pair with `tls_pki::asn1::extract_extension`
+  for Toron-side claim-bearing certs.
+- **`observability-http` extraction** —
+  HTTP/1.1 helper shared crate. Toron's
+  `observability_http.rs` (server-side from
+  ADR 045, client-side from ADR 046) could
+  migrate to a shared `crates/http-1-1`
+  workspace crate for future `nilket wendelon
+  inspect` parity reuse. Pairs with the
+  ADR 047 cross-ring extraction pattern.
+- **Token-based auth (bearer / JWT / OIDC).**
+  Future ADR over ADR 044 listener policy
+  substrate + ADR 047 `tls-pki` substrate.
+- **gRPC / Arrow Flight / Postgres wire
+  protocol frontends.**
+- **Strong cross-worker in-flight cancellation
+  semantics.**
+- **Prepared statements / parameterized
+  queries.**
+- **Subqueries in DELETE WHERE clause.**
+  Future correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern.
+- **Cascading secondary-index DROP substrate.**
+- **Atomic Wendelon-side replacement protocol.**
+- **Persistent SQL connections / pipelined
+  statements.**
+- **Distributed tracing context propagation
+  across worker task dispatch.**
+- **`/inspect` daemon-side endpoint with
+  richer detail** (worker enumeration, query
+  introspection, descriptor browsing).
+  Deferred from ADR 046 D8.
+- **`/info` or `/version` endpoint** exposing
+  build metadata. Small composition cycle.
+- **Prometheus histogram metrics.** Surface-
+  widening ADR over ADR 045 metric set.
+- **OpenMetrics protobuf format.** Surface-
+  widening ADR over ADR 045 metric exposition.
+- **Per-tenant metric labels.** Bundles with
+  multi-tenant routing.
+- **HTTP/2 / HTTP/3 / pipelining / keep-alive**
+  for observability listeners.
+- **`--watch` / streaming mode** for
+  `nilket toron inspect`.
+- **Cluster-wide aggregate inspect** across
+  multiple daemons.
+- **Sub-subcommands** (`nilket toron inspect
+  workers` etc.).
+- **Toron CLI consolidation** (`SqlClientTlsOptions`
+  + `InspectTlsOptions` merge into shared
+  `TlsCliOptions`; `parse_tls_args` helper).
+  Rejected from ADR 047 (Gemini's iter-3
+  proposal; rejected 2-of-3 Codex+Claude as
+  Toron-local cleanup; should not ride on
+  cross-ring substrate ADR). Future Toron-
+  side cleanup ADR can take it on if
+  pressure surfaces.
+- **`tls-pki` Wendelon-side full migration.**
+  Wendelon-side inline DER/CBOR for actor
+  claims is grandfathered for V1; future ADR
+  can extend
+  `adr047_toron_der_and_cbor_parsing_delegates_to_tls_pki`
+  guard to Wendelon-side and migrate the
+  inline parsing.
+- **`GenericCertVerifier<F>` closure-based
+  verifier.** Rejected from ADR 047 (Gemini's
+  iter-3 proposal; rejected 2-of-3 Codex+Claude
+  as too narrow for Wendelon's
+  subject/extension-based admission). Future
+  ADR can revisit if a third ring or new
+  admission model surfaces pressure.
+
+**Substrate candidates carried forward:**
+(identical to ADR 046's carry-forward list —
+re-listed in the ADR 046 historical section
+below)
+
+### ADR 046 promoted; ADR 047 candidates (HISTORICAL)
 
 ADR 046 selected and promoted **Nilket Toron
 Inspect Real Wiring** — the third consecutive
