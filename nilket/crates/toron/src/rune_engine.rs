@@ -19,15 +19,10 @@ fn rune_runtime_error(error: impl std::fmt::Display) -> FrontendError {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum AllowProfile {
+	#[default]
 	ToronAuthoring,
-}
-
-impl Default for AllowProfile {
-	fn default() -> Self {
-		Self::ToronAuthoring
-	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

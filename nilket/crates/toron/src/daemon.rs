@@ -31,6 +31,7 @@ use crate::distributed::worker_registry::{
 use crate::error::{BindingError, CatalogError, FrontendError, QueryError};
 use crate::exec::ExecutionContext;
 use crate::ir::{LogicalPlan, SessionId};
+use crate::network::tls::{ListenerPolicy, ListenerRole, TlsError};
 use crate::quic::{QuicEndpoint, QuicStream};
 use crate::server::transport::QuicTransport;
 use crate::server::{ToronWorker, memory::MemoryManager};
@@ -60,6 +61,8 @@ pub enum ToronDaemonError {
 	Query(#[from] QueryError),
 	#[error("Wendelon client error: {0}")]
 	WendelonClient(#[from] wendelon_client::ClientError),
+	#[error(transparent)]
+	Tls(#[from] TlsError),
 	#[error("toron daemon shutdown exceeded configured drain timeout")]
 	DrainTimeoutExceeded,
 	#[error("{message}")]
@@ -118,6 +121,12 @@ impl ToronDaemon {
 		config: ToronBootstrapConfig,
 		client: Arc<wendelon_client::Client>,
 	) -> Result<Self, ToronDaemonError> {
+		let tls_policy = config
+			.tls
+			.as_ref()
+			.map(|tls| ListenerPolicy::load(tls, &config.node.worker_id))
+			.transpose()?
+			.map(Arc::new);
 		let descriptor_pairs = match &config.catalog.descriptor_bootstrap_path {
 			Some(path) => load_descriptor_bootstrap(path)?,
 			None => Vec::new(),
@@ -151,9 +160,25 @@ impl ToronDaemon {
 			Arc::clone(&registry),
 		));
 
-		let listener = TcpListener::bind(config.worker.task_listener_bind).await?;
-		let worker_endpoint = listener.local_addr()?;
-		let quic_worker_endpoint = QuicEndpoint::bind(worker_endpoint)?;
+		let loopback_task_listener = config.worker.task_listener_bind.ip().is_loopback();
+		let listener = if loopback_task_listener {
+			Some(TcpListener::bind(config.worker.task_listener_bind).await?)
+		} else {
+			None
+		};
+		let worker_bind_endpoint = if let Some(listener) = &listener {
+			listener.local_addr()?
+		} else {
+			config.worker.task_listener_bind
+		};
+		let quic_worker_endpoint = match (&tls_policy, worker_bind_endpoint.ip().is_loopback()) {
+			(Some(policy), false) => QuicEndpoint::bind_authenticated(
+				worker_bind_endpoint,
+				policy.server_config_for(ListenerRole::WorkerTask),
+			)?,
+			_ => QuicEndpoint::bind_loopback(worker_bind_endpoint)?,
+		};
+		let worker_endpoint = quic_worker_endpoint.local_addr()?;
 		let advertised_endpoint = config
 			.worker
 			.advertised_endpoint
@@ -182,7 +207,12 @@ impl ToronDaemon {
 			config.worker.memory_budget_bytes,
 		);
 		let worker_registry = Arc::new(StaticWorkerRegistry::new(registry_workers));
-		let transport = Arc::new(QuicTransport::new()?);
+		let transport = Arc::new(match &tls_policy {
+			Some(policy) => {
+				QuicTransport::authenticated(policy.client_config(), policy.cluster_domain())?
+			}
+			None => QuicTransport::new()?,
+		});
 		let coordinator_catalog: Arc<dyn crate::catalog::Catalog> = catalog.clone();
 		let coordinator_writer: Arc<dyn crate::storage::StorageWrite> = writer.clone();
 		let coordinator_deleter: Arc<dyn crate::storage::StorageDeleteRows> = deleter.clone();
@@ -203,14 +233,16 @@ impl ToronDaemon {
 		let mut shutdown_txs = Vec::new();
 		let mut listener_tasks = Vec::new();
 
-		let (tcp_shutdown_tx, tcp_shutdown_rx) = oneshot::channel();
-		shutdown_txs.push(tcp_shutdown_tx);
-		listener_tasks.push(tokio::spawn(run_accept_loop(
-			Arc::clone(&worker),
-			listener,
-			tcp_shutdown_rx,
-			Arc::clone(&connection_tasks),
-		)));
+		if let Some(listener) = listener {
+			let (tcp_shutdown_tx, tcp_shutdown_rx) = oneshot::channel();
+			shutdown_txs.push(tcp_shutdown_tx);
+			listener_tasks.push(tokio::spawn(run_accept_loop(
+				Arc::clone(&worker),
+				listener,
+				tcp_shutdown_rx,
+				Arc::clone(&connection_tasks),
+			)));
+		}
 
 		let (quic_worker_shutdown_tx, quic_worker_shutdown_rx) = oneshot::channel();
 		shutdown_txs.push(quic_worker_shutdown_tx);
@@ -222,7 +254,14 @@ impl ToronDaemon {
 		)));
 
 		let sql_endpoint = if let Some(sql_config) = config.sql.clone() {
-			let sql_quic_endpoint = QuicEndpoint::bind(sql_config.listener_bind)?;
+			let sql_quic_endpoint = match (&tls_policy, sql_config.listener_bind.ip().is_loopback())
+			{
+				(Some(policy), false) => QuicEndpoint::bind_authenticated(
+					sql_config.listener_bind,
+					policy.server_config_for(ListenerRole::Sql),
+				)?,
+				_ => QuicEndpoint::bind_loopback(sql_config.listener_bind)?,
+			};
 			let sql_endpoint = sql_quic_endpoint.local_addr()?;
 			let (sql_shutdown_tx, sql_shutdown_rx) = oneshot::channel();
 			shutdown_txs.push(sql_shutdown_tx);
@@ -608,11 +647,9 @@ fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {
 		QueryError::Binding(_) => SqlErrorCode::BindingError,
 		QueryError::Catalog(_) => SqlErrorCode::CatalogError,
 		QueryError::Storage(_) => SqlErrorCode::StorageError,
-		QueryError::Runtime(crate::error::RuntimeError::TaskFailure { kind })
-			if matches!(kind, crate::error::TaskFailureKind::Cancelled) =>
-		{
-			SqlErrorCode::Cancelled
-		}
+		QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
+			kind: crate::error::TaskFailureKind::Cancelled,
+		}) => SqlErrorCode::Cancelled,
 		QueryError::Internal { message } if message.contains("no live worker") => {
 			SqlErrorCode::NoLiveWorker
 		}

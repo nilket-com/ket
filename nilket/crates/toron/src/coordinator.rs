@@ -120,6 +120,7 @@ where
 		)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub fn with_writer_and_deleter(
 		catalog: Arc<dyn Catalog>,
 		registry: Arc<Registry>,
@@ -149,6 +150,7 @@ where
 		self
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub fn with_writer_deleter_and_admin(
 		catalog: Arc<dyn Catalog>,
 		registry: Arc<Registry>,
@@ -174,6 +176,7 @@ where
 		)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub fn with_context_writer_and_deleter(
 		catalog: Arc<dyn Catalog>,
 		registry: Arc<Registry>,
@@ -199,6 +202,7 @@ where
 		)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub fn with_context_writer_deleter_and_admin(
 		catalog: Arc<dyn Catalog>,
 		registry: Arc<Registry>,

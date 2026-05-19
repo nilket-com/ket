@@ -41,14 +41,13 @@ pub(crate) fn build_runtime_filter_fragment(
 		for row in 0..batch.num_rows() {
 			if let Some(encoded) =
 				encode_runtime_filter_key(array.as_ref(), row).map_err(runtime_filter_error)?
+				&& exact_keys.insert(encoded.clone())
 			{
-				if exact_keys.insert(encoded.clone()) {
-					exact_payload_bytes = exact_payload_bytes
-						.saturating_add(exact_payload_len(&encoded).map_err(runtime_filter_error)?);
-					if exact_payload_bytes > EXACT_FILTER_MAX_BYTES {
-						exact_overflow = true;
-						break;
-					}
+				exact_payload_bytes = exact_payload_bytes
+					.saturating_add(exact_payload_len(&encoded).map_err(runtime_filter_error)?);
+				if exact_payload_bytes > EXACT_FILTER_MAX_BYTES {
+					exact_overflow = true;
+					break;
 				}
 			}
 		}

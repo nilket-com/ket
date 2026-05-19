@@ -405,6 +405,7 @@ where
 		}
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn accept_dispatch_completion(
 		&mut self,
 		spec: &TaskSpec,
@@ -637,10 +638,10 @@ where
 				entry.insert(RuntimeFilterMerge::Active(fragment));
 			}
 			std::collections::hash_map::Entry::Occupied(mut entry) => {
-				if let RuntimeFilterMerge::Active(active) = entry.get_mut() {
-					if !merge_fragments(active, &fragment) {
-						entry.insert(RuntimeFilterMerge::Dropped);
-					}
+				if let RuntimeFilterMerge::Active(active) = entry.get_mut()
+					&& !merge_fragments(active, &fragment)
+				{
+					entry.insert(RuntimeFilterMerge::Dropped);
 				}
 			}
 		}

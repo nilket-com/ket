@@ -12,14 +12,17 @@ use uuid::Uuid;
 use crate::distributed::identity::WorkerId;
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::ir::TableId;
+use crate::network::tls::{
+	DEFAULT_CLUSTER_DOMAIN, reject_env_interpolation, validate_cluster_domain,
+};
 use crate::storage::TenantId;
 
 pub const NON_LOOPBACK_BIND_DIAGNOSTIC: &str =
-	"toron worker listener requires authenticated transport for non-loopback bind address";
+	"worker listener requires authenticated transport for non-loopback bind address";
 pub const NON_LOOPBACK_SQL_BIND_DIAGNOSTIC: &str =
-	"toron sql listener requires authenticated transport for non-loopback bind address";
+	"sql listener requires authenticated transport for non-loopback bind address";
 pub const NON_LOOPBACK_STATIC_WORKER_DIAGNOSTIC: &str =
-	"toron coordinator static workers require authenticated transport for non-loopback endpoints";
+	"coordinator static workers require authenticated transport for non-loopback endpoints";
 
 const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -64,6 +67,12 @@ include_self_worker = true
 # worker_id = "00000000-0000-0000-0000-000000000043"
 # endpoint = "127.0.0.1:9101"
 
+# [tls]
+# listener_cert = "certs/listener.pem"
+# listener_key = "certs/listener.key"
+# peer_ca = "certs/peer-ca.pem"
+# cluster_domain = "cluster.local"
+
 [observability]
 level = "info"
 format = "pretty"
@@ -89,6 +98,7 @@ pub struct ToronBootstrapConfig {
 	pub catalog: ToronCatalogConfig,
 	pub sql: Option<SqlConfig>,
 	pub coordinator: CoordinatorConfig,
+	pub tls: Option<TlsConfig>,
 	pub observability: ToronObservabilityConfig,
 }
 
@@ -164,6 +174,14 @@ pub struct StaticWorkerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+	pub listener_cert: PathBuf,
+	pub listener_key: PathBuf,
+	pub peer_ca: PathBuf,
+	pub cluster_domain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToronObservabilityConfig {
 	pub level: String,
 	pub format: ToronTracingFormat,
@@ -197,6 +215,7 @@ struct RawToronBootstrapConfig {
 	sql: Option<RawSqlConfig>,
 	#[serde(default)]
 	coordinator: RawCoordinatorConfig,
+	tls: Option<RawTlsConfig>,
 	#[serde(default)]
 	observability: RawToronObservabilityConfig,
 }
@@ -274,6 +293,15 @@ struct RawCoordinatorConfig {
 struct RawStaticWorkerConfig {
 	worker_id: String,
 	endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTlsConfig {
+	listener_cert: PathBuf,
+	listener_key: PathBuf,
+	peer_ca: PathBuf,
+	#[serde(default = "default_tls_cluster_domain")]
+	cluster_domain: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,12 +408,16 @@ fn normalize_config(
 	} else {
 		Duration::from_secs(raw.node.drain_timeout_seconds)
 	};
+	let tls = raw
+		.tls
+		.map(|tls| normalize_tls_config(tls, base_dir))
+		.transpose()?;
 	let task_listener_bind = raw
 		.worker
 		.task_listener_bind
 		.parse::<SocketAddr>()
 		.map_err(|error| invalid(format!("invalid task_listener_bind: {error}")))?;
-	if !task_listener_bind.ip().is_loopback() {
+	if !task_listener_bind.ip().is_loopback() && tls.is_none() {
 		return Err(invalid(NON_LOOPBACK_BIND_DIAGNOSTIC));
 	}
 	if raw.worker.memory_budget_bytes == 0 {
@@ -403,7 +435,10 @@ fn normalize_config(
 			base_dir.join(path)
 		}
 	});
-	let sql = raw.sql.map(normalize_sql_config).transpose()?;
+	let sql = raw
+		.sql
+		.map(|sql| normalize_sql_config(sql, tls.is_some()))
+		.transpose()?;
 	let mut static_workers = Vec::with_capacity(raw.coordinator.static_workers.len());
 	for worker in raw.coordinator.static_workers {
 		let worker_id = WorkerId::from_uuid(
@@ -415,7 +450,7 @@ fn normalize_config(
 				"invalid coordinator static worker endpoint: {error}"
 			))
 		})?;
-		if !endpoint.ip().is_loopback() {
+		if !endpoint.ip().is_loopback() && tls.is_none() {
 			return Err(invalid(NON_LOOPBACK_STATIC_WORKER_DIAGNOSTIC));
 		}
 		static_workers.push(StaticWorkerConfig {
@@ -477,6 +512,7 @@ fn normalize_config(
 			include_self_worker: raw.coordinator.include_self_worker,
 			static_workers,
 		},
+		tls,
 		observability: ToronObservabilityConfig {
 			level: raw.observability.level,
 			format,
@@ -484,7 +520,10 @@ fn normalize_config(
 	})
 }
 
-fn normalize_sql_config(raw: RawSqlConfig) -> Result<SqlConfig, ToronConfigError> {
+fn normalize_sql_config(
+	raw: RawSqlConfig,
+	tls_present: bool,
+) -> Result<SqlConfig, ToronConfigError> {
 	let transport = match raw.transport.as_str() {
 		"quic" => SqlTransport::Quic,
 		other => return Err(invalid(format!("unsupported sql transport: {other}"))),
@@ -493,7 +532,7 @@ fn normalize_sql_config(raw: RawSqlConfig) -> Result<SqlConfig, ToronConfigError
 		.listener_bind
 		.parse::<SocketAddr>()
 		.map_err(|error| invalid(format!("invalid sql listener_bind: {error}")))?;
-	if !listener_bind.ip().is_loopback() {
+	if !listener_bind.ip().is_loopback() && !tls_present {
 		return Err(invalid(NON_LOOPBACK_SQL_BIND_DIAGNOSTIC));
 	}
 	if raw.statement_timeout_seconds == 0 {
@@ -537,6 +576,34 @@ fn normalize_wendelon_tls_config(
 			"storage.wendelon TLS config requires tls_cert_path, tls_key_path, and tls_ca_path together",
 		)),
 	}
+}
+
+fn normalize_tls_config(raw: RawTlsConfig, base_dir: &Path) -> Result<TlsConfig, ToronConfigError> {
+	validate_cluster_domain(&raw.cluster_domain).map_err(|error| invalid(error.to_string()))?;
+	for path in [&raw.listener_cert, &raw.listener_key, &raw.peer_ca] {
+		reject_env_interpolation(path).map_err(|error| invalid(error.to_string()))?;
+	}
+	let listener_cert = resolve_config_path(raw.listener_cert, base_dir);
+	let listener_key = resolve_config_path(raw.listener_key, base_dir);
+	let peer_ca = resolve_config_path(raw.peer_ca, base_dir);
+	for (label, path) in [
+		("tls cert file not found or unreadable", &listener_cert),
+		(
+			"tls listener_key file not found or unreadable",
+			&listener_key,
+		),
+		("tls peer_ca file not found or unreadable", &peer_ca),
+	] {
+		if std::fs::File::open(path).is_err() {
+			return Err(invalid(format!("{label}: {}", path.display())));
+		}
+	}
+	Ok(TlsConfig {
+		listener_cert,
+		listener_key,
+		peer_ca,
+		cluster_domain: raw.cluster_domain,
+	})
 }
 
 fn resolve_config_path(path: PathBuf, base_dir: &Path) -> PathBuf {
@@ -583,6 +650,10 @@ fn default_wendelon_client_bind() -> String {
 
 fn default_wendelon_cluster_domain() -> String {
 	wendelon::network::tls::DEFAULT_CLUSTER_DOMAIN.to_string()
+}
+
+fn default_tls_cluster_domain() -> String {
+	DEFAULT_CLUSTER_DOMAIN.to_string()
 }
 
 fn default_sql_transport() -> String {

@@ -164,7 +164,7 @@ pub struct InMemoryPartitionStore {
 	budget: BudgetTracker,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PartitionStoreInner {
 	manifests: HashMap<ManifestKey, PartitionManifest>,
 	partitions: HashMap<PartitionAddress, PartitionPayload>,
@@ -192,17 +192,6 @@ impl InMemoryPartitionStore {
 impl Default for InMemoryPartitionStore {
 	fn default() -> Self {
 		Self::new()
-	}
-}
-
-impl Default for PartitionStoreInner {
-	fn default() -> Self {
-		Self {
-			manifests: HashMap::new(),
-			partitions: HashMap::new(),
-			reservations: HashMap::new(),
-			cancelled_queries: HashSet::new(),
-		}
 	}
 }
 
@@ -322,7 +311,7 @@ pub struct EncryptedSpillPartitionStore {
 	next_spill_id: AtomicU64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct EncryptedSpillInner {
 	manifests: HashMap<ManifestKey, PartitionManifest>,
 	partitions: HashMap<PartitionAddress, SpilledPartition>,
@@ -407,7 +396,7 @@ impl EncryptedSpillPartitionStore {
 
 	fn decrypt_payload(
 		&self,
-		ciphertext: &mut Vec<u8>,
+		ciphertext: &mut [u8],
 		nonce_bytes: [u8; 12],
 	) -> Result<Vec<u8>, PartitionMissingReason> {
 		let nonce = Nonce::assume_unique_for_key(nonce_bytes);
@@ -416,17 +405,6 @@ impl EncryptedSpillPartitionStore {
 			.open_in_place(nonce, Aad::empty(), ciphertext)
 			.map_err(|_| PartitionMissingReason::StoreEvicted)?;
 		Ok(plaintext.to_vec())
-	}
-}
-
-impl Default for EncryptedSpillInner {
-	fn default() -> Self {
-		Self {
-			manifests: HashMap::new(),
-			partitions: HashMap::new(),
-			reservations: HashMap::new(),
-			cancelled_queries: HashSet::new(),
-		}
 	}
 }
 

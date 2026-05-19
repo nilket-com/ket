@@ -103,10 +103,15 @@ impl<'a> Binder<'a> {
 					let profile_hint = scan_profile_hint(&bound_predicate, &input);
 					apply_scan_profile_hint(&mut input, profile_hint);
 					let (input, disposition) = match compile_pbc(&bound_predicate) {
-						Some(program) => match attach_pbc_program(input, program) {
-							Ok(input) => (input, FilterDisposition::FullyPushed),
-							Err(input) => (input, FilterDisposition::EvaluateInToron),
-						},
+						Some(program) => {
+							let (input, attached) = attach_pbc_program(input, program);
+							let disposition = if attached {
+								FilterDisposition::FullyPushed
+							} else {
+								FilterDisposition::EvaluateInToron
+							};
+							(input, disposition)
+						}
 						None => (input, FilterDisposition::EvaluateInToron),
 					};
 
@@ -662,16 +667,13 @@ fn compile_pbc(predicate: &BoundExprProgram) -> Option<PbcProgram> {
 		.map(PbcProgram)
 }
 
-fn attach_pbc_program(
-	mut plan: ExecutionPlan,
-	program: PbcProgram,
-) -> Result<ExecutionPlan, ExecutionPlan> {
+fn attach_pbc_program(mut plan: ExecutionPlan, program: PbcProgram) -> (ExecutionPlan, bool) {
 	match &mut plan {
 		ExecutionPlan::Scan { pbc_program, .. } => {
 			*pbc_program = Some(program);
-			Ok(plan)
+			(plan, true)
 		}
-		_ => Err(plan),
+		_ => (plan, false),
 	}
 }
 
@@ -741,10 +743,10 @@ fn require_single_boolean_root(
 }
 
 fn apply_scan_profile_hint(plan: &mut ExecutionPlan, profile_hint: Option<QueryProfileHint>) {
-	if let Some(next_profile_hint) = profile_hint {
-		if let ExecutionPlan::Scan { profile_hint, .. } = plan {
-			*profile_hint = next_profile_hint;
-		}
+	if let Some(next_profile_hint) = profile_hint
+		&& let ExecutionPlan::Scan { profile_hint, .. } = plan
+	{
+		*profile_hint = next_profile_hint;
 	}
 }
 

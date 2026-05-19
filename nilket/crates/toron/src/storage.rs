@@ -503,7 +503,7 @@ fn scan_in_memory_batch(
 
 	if let Some((morsel_id, total_morsels)) = request.morsel {
 		let total_rows = batch.num_rows();
-		let rows_per_morsel = (total_rows + total_morsels as usize - 1) / total_morsels as usize;
+		let rows_per_morsel = total_rows.div_ceil(total_morsels as usize);
 		let start_row = (morsel_id.0 as usize) * rows_per_morsel;
 		let end_row = std::cmp::min(start_row + rows_per_morsel, total_rows);
 
@@ -520,21 +520,19 @@ fn scan_in_memory_batch(
 		}
 	}
 
-	if let Some(runtime_filter) = &request.runtime_filter {
-		if validate_runtime_filter_descriptor(
+	if let Some(runtime_filter) = &request.runtime_filter
+		&& validate_runtime_filter_descriptor(
 			runtime_filter,
 			batch.schema().as_ref(),
 			request.physical_descriptor_fingerprint,
 		)
 		.is_ok()
-		{
-			if let Ok(mask) = build_runtime_filter_mask_for_batch(&batch, runtime_filter) {
-				if let Some(context) = &mut identity_context {
-					context.row_key_ids = filter_row_key_ids(&context.row_key_ids, &mask);
-				}
-				batch = arrow::compute::filter_record_batch(&batch, &mask)?;
-			}
+		&& let Ok(mask) = build_runtime_filter_mask_for_batch(&batch, runtime_filter)
+	{
+		if let Some(context) = &mut identity_context {
+			context.row_key_ids = filter_row_key_ids(&context.row_key_ids, &mask);
 		}
+		batch = arrow::compute::filter_record_batch(&batch, &mask)?;
 	}
 
 	if let Some(pbc) = request.pbc_predicate {

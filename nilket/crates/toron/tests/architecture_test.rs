@@ -6,9 +6,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::MockCatalog;
+use toron::distributed::identity::WorkerId;
 use toron::error::{BindingError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{Expr, LogicalPlan, ScalarValue, TableId};
+use toron::network::tls::{
+	DEFAULT_CLUSTER_DOMAIN, ListenerRole, PeerKind, admit_san, canonical_client_dns_name,
+	canonical_daemon_dns_name,
+};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -1504,11 +1509,27 @@ fn adr025_float_to_int_uses_exclusive_upper_bound() {
 	assert!(exec.contains("const F64_I64_LOWER: f64 = i64::MIN as f64"));
 	assert!(exec.contains("const F64_I64_UPPER: f64 = 9223372036854775808.0"));
 
-	for (marker, bound) in [
-		("fn cast_f32_to_i32", "trunc < F64_I32_UPPER"),
-		("fn cast_f32_to_i64", "trunc < F64_I64_UPPER"),
-		("fn cast_f64_to_i32", "trunc < F64_I32_UPPER"),
-		("fn cast_f64_to_i64", "trunc < F64_I64_UPPER"),
+	for (marker, bound, range_bound) in [
+		(
+			"fn cast_f32_to_i32",
+			"trunc < F64_I32_UPPER",
+			"(F64_I32_LOWER..F64_I32_UPPER).contains(&trunc)",
+		),
+		(
+			"fn cast_f32_to_i64",
+			"trunc < F64_I64_UPPER",
+			"(F64_I64_LOWER..F64_I64_UPPER).contains(&trunc)",
+		),
+		(
+			"fn cast_f64_to_i32",
+			"trunc < F64_I32_UPPER",
+			"(F64_I32_LOWER..F64_I32_UPPER).contains(&trunc)",
+		),
+		(
+			"fn cast_f64_to_i64",
+			"trunc < F64_I64_UPPER",
+			"(F64_I64_LOWER..F64_I64_UPPER).contains(&trunc)",
+		),
 	] {
 		let body = brace_blocks_after_marker(&exec, marker)
 			.into_iter()
@@ -1516,7 +1537,7 @@ fn adr025_float_to_int_uses_exclusive_upper_bound() {
 			.unwrap_or_else(|| panic!("{marker} body"))
 			.1;
 		assert!(
-			body.contains(bound),
+			body.contains(bound) || body.contains(range_bound),
 			"{marker} missing exclusive upper bound"
 		);
 		assert!(
@@ -1679,18 +1700,37 @@ fn adr026_try_cast_nulls_only_data_domain_failures() {
 		assert!(body.contains("return None"), "{kernel} must emit None");
 	}
 
-	for (kernel, bound) in [
-		("fn try_cast_f32_to_i32", "trunc < F64_I32_UPPER"),
-		("fn try_cast_f32_to_i64", "trunc < F64_I64_UPPER"),
-		("fn try_cast_f64_to_i32", "trunc < F64_I32_UPPER"),
-		("fn try_cast_f64_to_i64", "trunc < F64_I64_UPPER"),
+	for (kernel, bound, range_bound) in [
+		(
+			"fn try_cast_f32_to_i32",
+			"trunc < F64_I32_UPPER",
+			"(F64_I32_LOWER..F64_I32_UPPER).contains(&trunc)",
+		),
+		(
+			"fn try_cast_f32_to_i64",
+			"trunc < F64_I64_UPPER",
+			"(F64_I64_LOWER..F64_I64_UPPER).contains(&trunc)",
+		),
+		(
+			"fn try_cast_f64_to_i32",
+			"trunc < F64_I32_UPPER",
+			"(F64_I32_LOWER..F64_I32_UPPER).contains(&trunc)",
+		),
+		(
+			"fn try_cast_f64_to_i64",
+			"trunc < F64_I64_UPPER",
+			"(F64_I64_LOWER..F64_I64_UPPER).contains(&trunc)",
+		),
 	] {
 		let body = brace_blocks_after_marker(&exec, kernel)
 			.into_iter()
 			.next()
 			.unwrap_or_else(|| panic!("{kernel} body"))
 			.1;
-		assert!(body.contains(bound), "{kernel} missing bound {bound}");
+		assert!(
+			body.contains(bound) || body.contains(range_bound),
+			"{kernel} missing bound {bound}"
+		);
 	}
 	assert!(
 		brace_blocks_after_marker(&exec, "fn try_cast_f64_to_f32")
@@ -6295,7 +6335,7 @@ fn adr043_toron_cli_sql_is_client_only() {
 			"Toron CLI SQL client must not construct {forbidden}"
 		);
 	}
-	assert!(cli.contains("QuicEndpoint::client()"));
+	assert!(cli.contains("QuicEndpoint::client_loopback()"));
 }
 
 #[test]
@@ -6327,6 +6367,7 @@ fn adr043_sql_listener_is_loopback_only() {
 
 	assert!(config.contains("NON_LOOPBACK_SQL_BIND_DIAGNOSTIC"));
 	assert!(config.contains("listener_bind.ip().is_loopback()"));
+	assert!(config.contains("!listener_bind.ip().is_loopback() && !tls_present"));
 	assert!(config.contains("sql.statement_timeout_seconds must be greater than 0"));
 }
 
@@ -6337,10 +6378,429 @@ fn adr043_task_transport_is_quic_by_default_and_loopback_only() {
 	let transport = std::fs::read_to_string(manifest_dir().join("src/server/transport.rs"))
 		.expect("read Toron transport source");
 
-	assert!(daemon.contains("QuicEndpoint::bind(worker_endpoint)"));
+	assert!(daemon.contains("QuicEndpoint::bind_loopback(worker_bind_endpoint)"));
 	assert!(daemon.contains("QuicTransport::new()?"));
 	assert!(transport.contains("pub struct QuicTransport"));
-	assert!(transport.contains("connect_stream(remote).await"));
+	assert!(transport.contains("QuicEndpoint::client_loopback()?"));
+	assert!(transport.contains("connect_worker"));
+}
+
+#[test]
+fn adr044_toron_tls_config_surface_exists_and_is_optional() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	for required in [
+		"pub tls: Option<TlsConfig>",
+		"pub struct TlsConfig",
+		"# [tls]",
+		"DEFAULT_CLUSTER_DOMAIN",
+		"normalize_tls_config",
+		"!task_listener_bind.ip().is_loopback() && tls.is_none()",
+		"normalize_sql_config(sql, tls.is_some())",
+		"!endpoint.ip().is_loopback() && tls.is_none()",
+	] {
+		assert!(
+			config.contains(required),
+			"missing ADR 044 TLS config token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr044_tls_policy_uses_exact_san_admission_per_listener() {
+	let tls = std::fs::read_to_string(manifest_dir().join("src/network/tls.rs"))
+		.expect("read TLS policy");
+
+	for required in [
+		"pub enum ListenerRole",
+		"WorkerTask",
+		"Sql",
+		"pub enum PeerKind",
+		"pub struct ListenerPolicy",
+		"pub enum TlsError",
+		"AUTH_QUIC_ALPN",
+		"canonical_daemon_dns_name",
+		"canonical_client_dns_name",
+		"ExactServerCertVerifier",
+		"SanClientCertVerifier",
+		"admit_san",
+		"(\"toron\", ListenerRole::WorkerTask)",
+		"(\"toron\", ListenerRole::Sql) => Err(TlsError::SanRoleRejected)",
+		"(\"client\", ListenerRole::Sql)",
+		"(\"client\", ListenerRole::WorkerTask) => Err(TlsError::SanRoleRejected)",
+		"Uuid::parse_str(id_token)",
+	] {
+		assert!(
+			tls.contains(required),
+			"missing ADR 044 TLS policy token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr044_daemon_selects_authenticated_quic_only_for_non_loopback_tls_listeners() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let transport = std::fs::read_to_string(manifest_dir().join("src/server/transport.rs"))
+		.expect("read Toron transport source");
+
+	assert!(daemon.contains("ListenerPolicy::load"));
+	assert!(daemon.contains("QuicEndpoint::bind_authenticated"));
+	assert!(daemon.contains("server_config_for(ListenerRole::WorkerTask)"));
+	assert!(daemon.contains("server_config_for(ListenerRole::Sql)"));
+	assert!(daemon.contains("QuicEndpoint::bind_loopback"));
+	assert!(daemon.contains("QuicTransport::authenticated"));
+	assert!(transport.contains("connect_stream_with_server_name(remote, &server_name)"));
+	assert!(transport.contains("canonical_daemon_dns_name(&worker.worker_id, cluster_domain)"));
+}
+
+#[test]
+fn adr044_sql_cli_remote_tls_flags_do_not_add_nilket_runtime_dependencies() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for required in [
+		"--server-name",
+		"--cert",
+		"--key",
+		"--ca",
+		"TORON_SQL_SERVER_NAME",
+		"TORON_SQL_CLIENT_CERT",
+		"TORON_SQL_CLIENT_KEY",
+		"TORON_SQL_CA",
+		"client_config_from_paths",
+		"client_authenticated",
+		"failed to establish authenticated connection to",
+	] {
+		assert!(
+			cli.contains(required),
+			"missing ADR 044 SQL CLI token {required}"
+		);
+	}
+	for forbidden in ["tokio", "quinn", "rustls", "arrow-cast"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr044_does_not_change_sql_wire_or_add_token_auth_models() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+
+	for forbidden in ["Tls", "Auth", "Principal", "Certificate", "client_cert"] {
+		assert!(
+			!wire.contains(forbidden),
+			"SQL wire gained ADR 044-forbidden token {forbidden}"
+		);
+	}
+	for path in [
+		"src/cli.rs",
+		"src/daemon.rs",
+		"src/quic.rs",
+		"src/network/tls.rs",
+		"src/server/transport.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir().join(path)).expect("read source");
+		for forbidden in [
+			"TORON_SQL_TOKEN",
+			"Authorization",
+			"Bearer",
+			"TOFU",
+			"fingerprint",
+			"SPIFFE",
+			"OIDC",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{path} gained ADR 044-forbidden token auth model {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr044_no_cert_reload_or_revocation_scope_creep() {
+	assert_toron_sources_do_not_contain(&[
+		"reload_cert",
+		"watch_cert",
+		"refresh_cert",
+		"CRL",
+		"OCSP",
+	]);
+}
+
+#[test]
+fn adr044_san_admission_is_exact_shape_per_listener() {
+	let worker_id = WorkerId::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0000);
+	let daemon_san = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+	let admitted = admit_san(
+		&daemon_san,
+		ListenerRole::WorkerTask,
+		DEFAULT_CLUSTER_DOMAIN,
+	)
+	.expect("admit daemon SAN");
+	assert_eq!(admitted, PeerKind::SiblingDaemon { worker_id });
+
+	let client_san = canonical_client_dns_name("analytics", DEFAULT_CLUSTER_DOMAIN);
+	let admitted = admit_san(&client_san, ListenerRole::Sql, DEFAULT_CLUSTER_DOMAIN)
+		.expect("admit client SAN");
+	assert_eq!(
+		admitted,
+		PeerKind::Client {
+			principal: "analytics".to_string(),
+		}
+	);
+
+	for (san, role) in [
+		(
+			"toron-550e8400-e29b-41d4-a716-446655440000.evil.cluster.local",
+			ListenerRole::WorkerTask,
+		),
+		("*.cluster.local", ListenerRole::WorkerTask),
+		("client-analytics_dev.cluster.local", ListenerRole::Sql),
+		("toron-not-a-uuid.cluster.local", ListenerRole::WorkerTask),
+		("foo-analytics.cluster.local", ListenerRole::Sql),
+	] {
+		assert!(
+			admit_san(san, role, DEFAULT_CLUSTER_DOMAIN).is_err(),
+			"{san} should not be admitted for {role:?}"
+		);
+	}
+	assert!(
+		admit_san(
+			&client_san,
+			ListenerRole::WorkerTask,
+			DEFAULT_CLUSTER_DOMAIN
+		)
+		.is_err()
+	);
+	assert!(admit_san(&daemon_san, ListenerRole::Sql, DEFAULT_CLUSTER_DOMAIN).is_err());
+}
+
+#[test]
+fn adr044_loopback_diagnostic_text_is_brand_clean_and_stable() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	for required in [
+		"worker listener requires authenticated transport for non-loopback bind address",
+		"sql listener requires authenticated transport for non-loopback bind address",
+		"coordinator static workers require authenticated transport for non-loopback endpoints",
+	] {
+		assert!(config.contains(required), "missing diagnostic {required}");
+	}
+	for forbidden in [
+		"Toron TLS",
+		"toron TLS",
+		"ToronTls",
+		"toron-tls",
+		"remote SQL auth",
+	] {
+		assert!(
+			!config.contains(forbidden),
+			"config diagnostic surface contains project-branded TLS token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr044_tenant_id_remains_server_stamped() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+
+	assert!(
+		daemon
+			.contains("let tenant_id = wendelon::schema::TenantId::new(config.node.tenant_id.0);")
+	);
+	assert!(daemon.contains("config.node.tenant_id,"));
+	for source in [daemon.as_str(), wire.as_str()] {
+		for forbidden in [
+			"client_tenant",
+			"tenant_claim",
+			"SqlTenant",
+			"tenant_id: Option",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"ADR 044 must not add client-selected tenant token {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr044_ready_lines_are_unchanged() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert_eq!(
+		daemon
+			.matches("println!(\"READY {}\", daemon.handle().worker_endpoint);")
+			.count(),
+		1
+	);
+	assert_eq!(
+		daemon
+			.matches("println!(\"SQL_READY {sql_endpoint}\");")
+			.count(),
+		1
+	);
+}
+
+#[test]
+fn adr044_no_observability_listener_in_this_adr() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			[
+				"health_listener",
+				"metrics_listener",
+				"ready_listener",
+				"prometheus_listener",
+				"observability_listener",
+			]
+			.iter()
+			.any(|symbol| line.contains(symbol))
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"Toron source contains ADR 044 observability listener token(s):\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn adr044_remote_static_worker_requires_tls_and_san_binding() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let transport = std::fs::read_to_string(manifest_dir().join("src/server/transport.rs"))
+		.expect("read Toron transport source");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(config.contains("NON_LOOPBACK_STATIC_WORKER_DIAGNOSTIC"));
+	assert!(config.contains("!endpoint.ip().is_loopback() && tls.is_none()"));
+	assert!(transport.contains("async fn connect_worker("));
+	assert!(transport.contains("canonical_daemon_dns_name(&worker.worker_id, cluster_domain)"));
+	assert!(transport.contains("connect_stream_with_server_name(remote, &server_name)"));
+	assert!(server.contains("transport.connect_worker(worker).await"));
+}
+
+#[test]
+fn adr044_one_tls_material_set_per_daemon() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert!(config.contains("tls: Option<RawTlsConfig>"));
+	assert!(config.contains("pub tls: Option<TlsConfig>"));
+	for forbidden in ["[worker.tls]", "[sql.tls]", "worker_tls", "sql_tls"] {
+		assert!(
+			!config.contains(forbidden),
+			"ADR 044 must use one shared TLS material set, found {forbidden}"
+		);
+	}
+	assert_eq!(daemon.matches("ListenerPolicy::load").count(), 1);
+	assert!(daemon.contains("server_config_for(ListenerRole::WorkerTask)"));
+	assert!(daemon.contains("server_config_for(ListenerRole::Sql)"));
+	assert!(daemon.contains("policy.client_config()"));
+}
+
+#[test]
+fn adr044_san_convention_mirrors_wendelon_shape() {
+	let worker_id = WorkerId::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0000);
+	assert_eq!(
+		canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN),
+		"toron-550e8400-e29b-41d4-a716-446655440000.cluster.local"
+	);
+	assert_eq!(
+		canonical_client_dns_name("analytics", DEFAULT_CLUSTER_DOMAIN),
+		"client-analytics.cluster.local"
+	);
+
+	let wendelon_tls = std::fs::read_to_string(wendelon_manifest_dir().join("src/network/tls.rs"))
+		.expect("read Wendelon TLS source");
+	assert!(wendelon_tls.contains("pub fn canonical_node_dns_name"));
+	assert!(wendelon_tls.contains("format!(\"node-{node_id}.{cluster_domain}\")"));
+}
+
+#[test]
+fn adr044_sql_listener_client_admission_is_client_prefix_only() {
+	assert!(
+		admit_san(
+			"client-analytics.cluster.local",
+			ListenerRole::Sql,
+			DEFAULT_CLUSTER_DOMAIN
+		)
+		.is_ok()
+	);
+	for san in [
+		"toron-550e8400-e29b-41d4-a716-446655440000.cluster.local",
+		"node-7.cluster.local",
+		"service-analytics.cluster.local",
+		"client-.cluster.local",
+	] {
+		assert!(
+			admit_san(san, ListenerRole::Sql, DEFAULT_CLUSTER_DOMAIN).is_err(),
+			"SQL listener should reject {san}"
+		);
+	}
+}
+
+#[test]
+fn adr044_no_spiffe_svid_or_uri_san_identity_model() {
+	for path in [
+		"src/network/tls.rs",
+		"src/cli.rs",
+		"src/daemon.rs",
+		"src/server/transport.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir().join(path)).expect("read source");
+		for forbidden in [
+			"SPIFFE",
+			"spiffe",
+			"SVID",
+			"uniformResourceIdentifier",
+			"UriSan",
+			"URI SAN",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{path} contains ADR 044-forbidden identity model token {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr044_new_tls_policy_names_are_brand_clean_and_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronTlsConfig",
+		"ToronTlsListenerPolicy",
+		"ToronTlsError",
+		"RawToronTlsConfig",
+		"DEFAULT_TORON_CLUSTER_DOMAIN",
+		"TORON_AUTH_QUIC_ALPN",
+		"canonical_toron_dns_name",
+		"canonical_toron_client_dns_name",
+		"ToronQuicTls",
+		"ToronMtls",
+		"TlsConfigV1",
+		"ListenerPolicyV1",
+	]);
 }
 
 #[test]

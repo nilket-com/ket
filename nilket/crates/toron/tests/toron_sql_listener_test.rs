@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,14 +8,23 @@ use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use rcgen::{
+	BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+	KeyUsagePurpose,
+};
 use toron::config::{
-	CoordinatorConfig, SqlConfig, SqlTransport, ToronBootstrapConfig, ToronCatalogConfig,
-	ToronDescriptorBootstrap, ToronDescriptorBootstrapTable, ToronNodeConfig,
+	CoordinatorConfig, SqlConfig, SqlTransport, TlsConfig, ToronBootstrapConfig,
+	ToronCatalogConfig, ToronDescriptorBootstrap, ToronDescriptorBootstrapTable, ToronNodeConfig,
 	ToronObservabilityConfig, ToronStorageConfig, ToronTracingFormat, ToronWendelonBootstrapPeer,
 	ToronWendelonStorageConfig, ToronWorkerConfig,
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::identity::{QueryId, WorkerId};
+use toron::network::tls::{
+	DEFAULT_CLUSTER_DOMAIN, canonical_client_dns_name, canonical_daemon_dns_name,
+	client_config_from_paths,
+};
+use toron::quic::QuicEndpoint;
 use toron::sql_wire::{
 	Complete, SqlError, SqlErrorCode, SqlFrame, SqlMessage, read_frame as read_sql_frame,
 	write_frame as write_sql_frame,
@@ -63,6 +73,49 @@ async fn toron_sql_select_from_bootstrapped_descriptor_executes_over_wire() {
 	)
 	.await
 	.expect("SQL select response");
+
+	assert_eq!(response.complete.row_count, 2);
+	let mut rows = projected_rows(&response.batches);
+	rows.sort();
+	assert_eq!(
+		rows,
+		vec![
+			(2, Some(150), Some("east".to_string())),
+			(4, Some(200), Some("west".to_string())),
+		]
+	);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toron_sql_select_executes_over_authenticated_remote_listener() {
+	let fixture = LiveWendelonFixture::start(45).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let worker_id = WorkerId::from_u128(45);
+	let pki = TestPki::generate(worker_id, "alice");
+	let config = toron_config_with_descriptor_tls(descriptor.clone(), worker_id, &pki);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = connectable_loopback_addr(daemon.handle().sql_endpoint.expect("sql endpoint"));
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = execute_sql_authenticated(
+		endpoint,
+		&server_name,
+		&pki.client_cert,
+		&pki.client_key,
+		&pki.ca_cert,
+		"SELECT id, amount, region FROM storage_execution WHERE amount > 100",
+	)
+	.await
+	.expect("SQL select response over mTLS");
 
 	assert_eq!(response.complete.row_count, 2);
 	let mut rows = projected_rows(&response.batches);
@@ -199,6 +252,49 @@ async fn execute_sql(
 	}
 }
 
+async fn execute_sql_authenticated(
+	endpoint: SocketAddr,
+	server_name: &str,
+	cert: &Path,
+	key: &Path,
+	ca: &Path,
+	statement: &str,
+) -> Result<SqlResponse, SqlError> {
+	let client_config = client_config_from_paths(cert, key, ca).expect("client TLS config");
+	let client = QuicEndpoint::client_authenticated(client_config).expect("authenticated client");
+	let mut stream = client
+		.connect_stream_with_server_name(endpoint, server_name)
+		.await
+		.expect("connect authenticated sql");
+	let query_id = QueryId::new();
+	write_sql_frame(
+		&mut stream,
+		&SqlFrame::execute(query_id, statement.to_string(), None),
+	)
+	.await
+	.expect("write sql request");
+	stream.finish().await.expect("finish sql request");
+
+	let mut batches = Vec::new();
+	loop {
+		let frame = read_sql_frame(&mut stream)
+			.await
+			.expect("read sql response");
+		match frame.message {
+			SqlMessage::ResultBatch(batch) => {
+				let reader = StreamReader::try_new(batch.arrow_ipc_bytes.as_slice(), None)
+					.expect("open Arrow IPC stream");
+				for batch in reader {
+					batches.push(batch.expect("read Arrow IPC batch"));
+				}
+			}
+			SqlMessage::Complete(complete) => return Ok(SqlResponse { batches, complete }),
+			SqlMessage::Error(error) => return Err(error),
+			other => panic!("unexpected SQL response frame: {other:?}"),
+		}
+	}
+}
+
 fn projected_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<i32>, Option<String>)> {
 	let mut rows = Vec::new();
 	for batch in batches {
@@ -226,6 +322,59 @@ fn projected_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<i32>, Option<Stri
 		}
 	}
 	rows
+}
+
+struct TestPki {
+	ca_cert: PathBuf,
+	daemon_cert: PathBuf,
+	daemon_key: PathBuf,
+	client_cert: PathBuf,
+	client_key: PathBuf,
+}
+
+impl TestPki {
+	fn generate(worker_id: WorkerId, principal: &str) -> Self {
+		let dir = fresh_dir("tls-sql");
+		let ca = ca_cert();
+		let daemon_dns = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+		let daemon = leaf_cert(
+			&daemon_dns,
+			&[
+				ExtendedKeyUsagePurpose::ServerAuth,
+				ExtendedKeyUsagePurpose::ClientAuth,
+			],
+		);
+		let client_dns = canonical_client_dns_name(principal, DEFAULT_CLUSTER_DOMAIN);
+		let client = leaf_cert(&client_dns, &[ExtendedKeyUsagePurpose::ClientAuth]);
+		let pki = Self {
+			ca_cert: dir.join("ca.pem"),
+			daemon_cert: dir.join("daemon.pem"),
+			daemon_key: dir.join("daemon.key"),
+			client_cert: dir.join("client.pem"),
+			client_key: dir.join("client.key"),
+		};
+		std::fs::write(&pki.ca_cert, ca.serialize_pem().expect("CA PEM")).expect("write CA");
+		write_signed_cert(&pki.daemon_cert, &pki.daemon_key, &daemon, &ca);
+		write_signed_cert(&pki.client_cert, &pki.client_key, &client, &ca);
+		pki
+	}
+}
+
+fn toron_config_with_descriptor_tls(
+	descriptor: TableSchemaDescriptor,
+	worker_id: WorkerId,
+	pki: &TestPki,
+) -> ToronBootstrapConfig {
+	let mut config = toron_config_with_descriptor(descriptor, true);
+	config.node.worker_id = worker_id;
+	config.sql.as_mut().expect("sql config").listener_bind = "0.0.0.0:0".parse().expect("sql bind");
+	config.tls = Some(TlsConfig {
+		listener_cert: pki.daemon_cert.clone(),
+		listener_key: pki.daemon_key.clone(),
+		peer_ca: pki.ca_cert.clone(),
+		cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+	});
+	config
 }
 
 fn toron_config_with_descriptor(
@@ -269,11 +418,46 @@ fn toron_config_with_descriptor(
 			include_self_worker,
 			static_workers: Vec::new(),
 		},
+		tls: None,
 		observability: ToronObservabilityConfig {
 			level: "info".to_string(),
 			format: ToronTracingFormat::Pretty,
 		},
 	}
+}
+
+fn ca_cert() -> Certificate {
+	let mut params = CertificateParams::new(Vec::new());
+	params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+	params.key_usages = vec![
+		KeyUsagePurpose::DigitalSignature,
+		KeyUsagePurpose::KeyCertSign,
+	];
+	params
+		.distinguished_name
+		.push(DnType::CommonName, "toron-sql-listener-test-ca");
+	Certificate::from_params(params).expect("CA cert")
+}
+
+fn leaf_cert(dns_name: &str, extended_key_usages: &[ExtendedKeyUsagePurpose]) -> Certificate {
+	let mut params = CertificateParams::new(vec![dns_name.to_string()]);
+	params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+	params.extended_key_usages = extended_key_usages.to_vec();
+	params.distinguished_name.push(DnType::CommonName, dns_name);
+	Certificate::from_params(params).expect("leaf cert")
+}
+
+fn write_signed_cert(cert_path: &Path, key_path: &Path, cert: &Certificate, ca: &Certificate) {
+	std::fs::write(
+		cert_path,
+		cert.serialize_pem_with_signer(ca).expect("signed cert PEM"),
+	)
+	.expect("write cert");
+	std::fs::write(key_path, cert.serialize_private_key_pem()).expect("write key");
+}
+
+fn connectable_loopback_addr(addr: SocketAddr) -> SocketAddr {
+	SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
 }
 
 fn write_descriptor_bootstrap(descriptor: TableSchemaDescriptor) -> PathBuf {

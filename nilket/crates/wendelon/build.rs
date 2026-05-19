@@ -20,10 +20,8 @@ fn find_package_version(lock: &str, package: &str) -> Option<String> {
 			matched_package = parse_lock_string(name) == package;
 			continue;
 		}
-		if matched_package {
-			if let Some(version) = trimmed.strip_prefix("version = ") {
-				return Some(parse_lock_string(version));
-			}
+		if matched_package && let Some(version) = trimmed.strip_prefix("version = ") {
+			return Some(parse_lock_string(version));
 		}
 	}
 	None

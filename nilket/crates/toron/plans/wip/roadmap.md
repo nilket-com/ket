@@ -2971,8 +2971,8 @@ along with the forward-sequence rewrite.
   fail startup with the stable diagnostic
   `toron worker listener requires authenticated
   transport for non-loopback bind address`.
-  Authenticated remote task transport
-  (`TlsToronTransport`) is a follow-up ADR.
+  Authenticated remote task transport is a
+  follow-up ADR.
   **No inert no-listener Plan B** — Plan B
   framing was rejected 2-of-3 in iter-1 (Codex +
   Claude); a daemon that accepts no work is not a
@@ -3242,8 +3242,9 @@ along with the forward-sequence rewrite.
   ADR 043 example configs without modification.
   **D2 critical decision:** non-loopback bind
   admitted **iff** `[tls]` is configured. Pinned
-  diagnostic strings byte-identical with ADR 042
-  D9 / ADR 043 D5 for the no-TLS path.
+  no-TLS diagnostics are ADR 044 stable and
+  brand-clean, superseding the older
+  toron-prefixed ADR 042 / ADR 043 strings.
   **D3 critical decision:** mTLS only. No tokens
   / JWT / OIDC / SPIFFE-URI SAN parsing / TOFU /
   fingerprint pinning. Gemini iter-0 predicted to
@@ -3468,8 +3469,8 @@ non-loopback binds + remote static-worker dials
 behind mTLS exact-shape SAN admission.
 
 **Wendelon-parity SAN convention.** D5's SAN
-helper `canonical_toron_dns_name(uuid,
-cluster_domain) → "toron-<uuid>.<cluster_domain>"`
+helper `canonical_daemon_dns_name(worker_id,
+cluster_domain) → "toron-<worker_id>.<cluster_domain>"`
 is structurally parallel to Wendelon's
 `canonical_node_dns_name(node_id, cluster_domain)
 → "node-<node_id>.<cluster_domain>"`
@@ -3526,17 +3527,19 @@ this cycle:**
   shared `Arc<WendelonDescriptorRegistry>`
   unchanged).
 - ADR 039 D5 / ADR 042 / ADR 043 no-V1-suffix
+  convention and no-project-name-in-protocols
   convention (carries forward to
-  `ToronTlsListenerPolicy` / `ToronTlsConfig` /
-  `canonical_toron_dns_name`; ninth consecutive
+  `ListenerPolicy` / `TlsConfig` /
+  `canonical_daemon_dns_name`; ninth consecutive
   cycle).
 - ADR 035-043 byte-identical fixture-worker
   refactor invariant (extends to nine preserved
   cycles; `toron_fixture_worker.rs` source
   unchanged).
-- ADR 042 D9 / ADR 043 D5 diagnostic strings
-  for non-loopback bind without TLS remain
-  byte-identical (guard 3).
+- ADR 044 non-loopback-without-TLS diagnostics
+  are stable and brand-clean, superseding the
+  older toron-prefixed ADR 042 D9 / ADR 043 D5
+  wording (guard 8).
 - ADR 042 D12 / ADR 043 D16 `READY <worker>` /
   `SQL_READY <sql>` stdout lines byte-identical
   pre/post ADR 044 (guard 10).
@@ -3892,10 +3895,10 @@ The ten-phase migration is materialized in
   and error stability. **Substrate-class** (six
   adjacent decisions each require their own
   iter-0 alignment work). Likely 4-5 iteration
-  cycle. Bundles `TlsToronTransport` for the
-  worker listener as well, OR splits to a
-  separate ADR if scope creep emerges during
-  iter-0 surveying.
+  cycle. Bundles authenticated remote task
+  transport for the worker listener as well, OR
+  splits to a separate ADR if scope creep emerges
+  during iter-0 surveying.
 
 **Code-evidence-driven candidates carried forward:**
 
@@ -3924,9 +3927,9 @@ The ten-phase migration is materialized in
   C1b from ADR 041 iter-0; only if later
   requirements demand stronger semantics than ADR
   041's documented non-atomic composition.
-- **Authenticated remote Toron task transport
-  (`TlsToronTransport`).** Lifts the ADR 042 D9
-  loopback-only floor. Could bundle with ADR 043
+- **Authenticated remote task transport.** Lifts
+  the ADR 042 D9 loopback-only floor. Could
+  bundle with ADR 043
   public SQL listener OR ship as a standalone
   ADR depending on iter-0 scope analysis.
 - **Wendelon descriptor discovery / refresh.**

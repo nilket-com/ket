@@ -216,7 +216,7 @@ fn nilket_toron_start_rejects_non_loopback_bind() {
 	assert!(stdout(&output).is_empty(), "{output:?}");
 	assert!(
 		stderr(&output).contains(
-			"toron worker listener requires authenticated transport for non-loopback bind address"
+			"worker listener requires authenticated transport for non-loopback bind address"
 		),
 		"{output:?}"
 	);

@@ -27,8 +27,8 @@ shared `[tls]` policy section. Add a TLS-policy module — placement
 decided at Phase 0 audit (Plan W-B preferred: a sanctioned shared
 `tls-pki` workspace crate that both Wendelon and Toron consume; Plan
 W-C fallback: a Toron-local copy under `crates/toron/src/network/tls.rs`)
-— carrying `ToronTlsListenerPolicy`, the canonical SAN helper
-`canonical_toron_dns_name`, the listener-cert loader, the peer-CA
+— carrying `ListenerPolicy`, the canonical SAN helper
+`canonical_daemon_dns_name`, the listener-cert loader, the peer-CA
 verifier, and the SAN-admission exact-shape verifier. Extend
 `crates/toron/src/config.rs` with a `[tls]` section. Extend
 `crates/toron/src/daemon.rs`'s worker task listener and SQL listener
@@ -105,9 +105,9 @@ cluster_domain = "cluster.local"
 Stable diagnostic strings:
 
 ```text
-toron tls listener_key must be unencrypted PEM PKCS#8
-toron tls config paths do not interpolate environment variables
-toron tls cluster_domain must not be empty
+tls listener_key must be unencrypted PEM PKCS#8
+tls config paths do not interpolate environment variables
+tls cluster_domain must not be empty
 ```
 
 **D2: Non-loopback bind admitted iff `[tls]` is configured.**
@@ -118,14 +118,18 @@ For each of `[worker].task_listener_bind` and `[sql].listener_bind`:
 | ------------- | --------------- | ------- |
 | loopback      | no              | accept  |
 | loopback      | yes             | accept  |
-| non-loopback  | no              | **reject** with stable diagnostic byte-identical to ADR 042 D9 / ADR 043 D5 |
+| non-loopback  | no              | **reject** with ADR 044 stable, brand-clean diagnostic |
 | non-loopback  | yes             | accept  |
 
-Pinned diagnostic strings (byte-identical with ADR 042 D9 / ADR 043 D5):
+ADR 044 lifts the ADR 042 D9 and ADR 043 D5 loopback floors while
+superseding their older toron-prefixed diagnostics with brand-clean
+strings, per `plans/conventions/no-project-name-in-protocols.md`.
+
+Pinned ADR 044 diagnostic strings:
 
 ```text
-toron worker listener requires authenticated transport for non-loopback bind address
-toron sql listener requires authenticated transport for non-loopback bind address
+worker listener requires authenticated transport for non-loopback bind address
+sql listener requires authenticated transport for non-loopback bind address
 ```
 
 **D3: mTLS only. No tokens, no SPIFFE-URI SAN parsing.**
@@ -160,7 +164,7 @@ client-<principal>.<cluster_domain>
 `<principal>` is operator-assigned, alphanumeric + `-`. Helper:
 
 ```rust
-pub fn canonical_toron_dns_name(worker_id: &Uuid, cluster_domain: &str) -> String {
+pub fn canonical_daemon_dns_name(worker_id: &Uuid, cluster_domain: &str) -> String {
     format!("toron-{worker_id}.{cluster_domain}")
 }
 ```
@@ -218,7 +222,7 @@ surface, used for diagnostics only). Non-zero exit.
 
 **D7: Cert rotation is daemon-restart. No CRL / OCSP in V1.**
 
-`ToronTlsListenerPolicy` loads cert/key/CA at startup and never reloads.
+`ListenerPolicy` loads cert/key/CA at startup and never reloads.
 
 - **No** `reload_tls` method, **no** SIGHUP handler, **no** inotify
   watch, **no** `quinn::ServerConfig` swap.
@@ -305,27 +309,34 @@ missing. Loopback SQL with no TLS flags keeps ADR 043 client behavior.
 
 Added to `crates/toron/tests/architecture_test.rs`:
 
-1. `adr044_tls_section_is_optional_for_loopback_only_config` — guards
+1. `adr044_toron_tls_config_surface_exists_and_is_optional` — guards
    D1 backward compat; ADR 042 / ADR 043 minimal configs continue
-   to load byte-identical.
-2. `adr044_non_loopback_bind_requires_tls` — guards D2 admission rule.
-3. `adr044_loopback_diagnostic_text_byte_identical_with_adr042_and_adr043`
-   — guards D2 stable diagnostic strings.
-4. `adr044_only_mtls_no_token_auth` — guards D3; no bearer / JWT /
-   OIDC imports.
-5. `adr044_no_spiffe_svid_uri_parsing` — guards D3.
-6. `adr044_tenant_id_remains_server_stamped` — guards D4.
+   to load byte-identical, and non-loopback endpoints require `[tls]`.
+2. `adr044_tls_policy_uses_exact_san_admission_per_listener` — guards
+   D3 / D5 policy shape: mTLS, exact DNS-SAN admission, role-aware
+   listener policy, and canonical daemon/client DNS helpers.
+3. `adr044_daemon_selects_authenticated_quic_only_for_non_loopback_tls_listeners`
+   — guards D2 acceptor wiring; non-loopback worker-task and SQL
+   listeners use authenticated QUIC, while loopback fallback remains.
+4. `adr044_sql_cli_remote_tls_flags_do_not_add_nilket_runtime_dependencies`
+   — guards D12 and ADR 040 D4; remote SQL TLS flags/env live in
+   `crates/toron`, and `crates/nilket` remains runtime-free.
+5. `adr044_does_not_change_sql_wire_or_add_token_auth_models` — guards
+   D3 / D6; no bearer/JWT/OIDC token auth and no SQL wire or
+   `SqlError` expansion.
+6. `adr044_no_cert_reload_or_revocation_scope_creep` — guards D7; no
+   reload method, no CRL parsing, no OCSP, no runtime-mutable
+   revocation surface.
 7. `adr044_san_admission_is_exact_shape_per_listener` — guards D5;
    the exact-shape verifier (iter-3 sharpening) runs in the listener
    accept path; rejects subdomain injection, wildcards, underscore
    confused-deputy, malformed UUID.
-8. `adr044_no_new_sql_wire_message_variants_or_error_codes` — guards
-   D6; `SqlMessage` and `SqlError` byte-identical to ADR 043.
-9. `adr044_no_live_cert_rotation_no_crl_no_ocsp` — guards D7; no
-   reload method, no CRL parsing, no OCSP, no runtime-mutable
-   revocation surface.
-10. `adr044_ready_lines_byte_identical_pre_post` — guards D8 source-
-    text invariant.
+8. `adr044_loopback_diagnostic_text_is_brand_clean_and_stable` —
+   guards D2 and D10 stable diagnostics, including the coordinator
+   static-worker non-loopback-without-TLS diagnostic.
+9. `adr044_tenant_id_remains_server_stamped` — guards D4.
+10. `adr044_ready_lines_are_unchanged` — guards D8 source-text
+    invariant.
 11. `adr044_no_observability_listener_in_this_adr` — guards D9.
 12. `adr044_remote_static_worker_requires_tls_and_san_binding` —
     guards D10.
@@ -338,18 +349,17 @@ Added to `crates/toron/tests/architecture_test.rs`:
 15. `adr044_sql_listener_client_admission_is_client_prefix_only` —
     guards D5; a daemon `toron-` certificate is a SQL server identity,
     not a SQL client credential in ADR 044.
-16. `adr044_sql_cli_remote_requires_tls_material_and_server_name` —
-    guards D12; non-loopback `nilket toron sql` requires cert, key, CA,
-    and explicit server name.
+16. `adr044_no_spiffe_svid_or_uri_san_identity_model` — guards D3; no
+    SPIFFE/SVID/URI-SAN identity model is introduced.
 
 Post-promotion convention guard:
 
 - **`adr044_new_tls_policy_names_are_brand_clean_and_no_v1_suffix`** —
-  `ToronTlsListenerPolicy`, `ToronTlsConfig`, `canonical_toron_dns_name`
-  carry no `V1` suffix and no `ToronQuicTls*` / `ToronMtls*` brand
-  prefixes beyond the natural `Toron` crate-scoping prefix. Ninth
-  consecutive cycle preserving the no-V1-suffix convention (ADRs
-  039 / 041 / 042 / 043 / 044).
+  `ListenerPolicy`, `TlsConfig`, `canonical_daemon_dns_name`
+  carry no `V1` suffix and introduce no `Toron*` brand prefix into
+  the new TLS policy type/helper surface. Ninth consecutive cycle
+  preserving the no-V1-suffix convention (ADRs 039 / 041 / 042 / 043 /
+  044).
 
 ## Integration Fixtures (12 required + 2 V1-evidence optional)
 
@@ -358,7 +368,7 @@ Post-promotion convention guard:
 1. `toron_config_missing_tls_section_loads_byte_identical_to_adr043` —
    ADR 042 / ADR 043 example configs still load unchanged.
 2. `toron_config_non_loopback_bind_without_tls_rejected` — diagnostic
-   byte-identical to ADR 042 D9 / ADR 043 D5.
+   matches ADR 044's stable, brand-clean wording.
 3. `toron_config_non_loopback_bind_with_tls_loads` — happy path.
 4. `toron_config_missing_cert_file_fails_with_stable_diagnostic`
 5. `toron_config_encrypted_key_fails_with_stable_diagnostic` —
@@ -393,7 +403,7 @@ Post-promotion convention guard:
   admission exercised. Reachable in this ADR because D10 admits
   remote static-worker dial.
 - `toron_san_helper_matches_wendelon_shape` — parity fixture asserting
-  `canonical_toron_dns_name(uuid, "cluster.local")` returns
+  `canonical_daemon_dns_name(uuid, "cluster.local")` returns
   `"toron-<uuid>.cluster.local"`, structurally parallel to
   `wendelon::canonical_node_dns_name(1, "cluster.local")` returning
   `"node-1.cluster.local"`.
@@ -494,7 +504,7 @@ ADR 044 ships:
 
 - one shared `[tls]` config section that lifts ADR 042 D9 and ADR 043 D5
   loopback floors simultaneously;
-- one `ToronTlsListenerPolicy` substrate threaded into both listener
+- one `ListenerPolicy` substrate threaded into both listener
   accept paths AND the static-worker dial path;
 - SAN convention harmonized with Wendelon's `node-<id>.<cluster_domain>`
   shape via `toron-<worker_id>.<cluster_domain>`;
@@ -529,8 +539,8 @@ ADR 044 is the **third ADR that lifts an ADR 042/043 substrate floor**
 ADR 043 lifting the `nilket toron sql` reservation + the
 `providers: HashMap::new()` execution gap). It establishes a
 discipline for transport-substrate cycles: lift the loopback floor
-behind a single shared policy substrate; preserve the byte-identical
-diagnostic continuity invariant; preserve the no-V1-suffix convention;
+behind a single shared policy substrate; preserve stable, brand-clean
+diagnostics; preserve the no-V1-suffix convention;
 preserve the fixture-worker source-isolation invariant (ninth
 consecutive cycle).
 

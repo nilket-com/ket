@@ -351,7 +351,7 @@ impl ToronWorker {
 									u64::try_from(idx).expect("record batch index fits u64"),
 								);
 								let batch_encode_started = Instant::now();
-								let encoded_batch = encode_record_batch(&batch)?;
+								let encoded_batch = encode_record_batch(batch)?;
 								report.telemetry.phases.batch_encode_micros = report
 									.telemetry
 									.phases
@@ -1146,7 +1146,7 @@ where
 		worker: &crate::distributed::worker_registry::WorkerEntry,
 		spec: &TaskSpec,
 	) -> DispatchOutcome {
-		let stream = match self.transport.connect(worker.endpoint.as_str()).await {
+		let stream = match self.transport.connect_worker(worker).await {
 			Ok(stream) => stream,
 			Err(error) => return DispatchOutcome::Failed(dispatch_failure_kind(error)),
 		};

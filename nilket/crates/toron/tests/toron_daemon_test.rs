@@ -52,6 +52,7 @@ fn config() -> ToronBootstrapConfig {
 			include_self_worker: true,
 			static_workers: Vec::new(),
 		},
+		tls: None,
 		observability: ToronObservabilityConfig {
 			level: "info".to_string(),
 			format: ToronTracingFormat::Pretty,

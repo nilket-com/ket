@@ -10,6 +10,7 @@ pub mod distributed;
 pub mod error;
 pub mod exec;
 pub mod ir;
+pub mod network;
 pub mod pbc;
 pub mod planner;
 pub mod quic;

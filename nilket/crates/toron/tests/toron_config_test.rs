@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -25,6 +25,22 @@ fn fresh_dir(tag: &str) -> PathBuf {
 	));
 	std::fs::create_dir_all(&dir).expect("create temp dir");
 	dir
+}
+
+fn write_toron_tls_placeholders(dir: &Path) {
+	for name in ["listener.pem", "listener.key", "peer-ca.pem"] {
+		std::fs::write(dir.join(name), "placeholder").expect("write TLS placeholder");
+	}
+}
+
+fn toron_tls_section() -> &'static str {
+	r#"
+[tls]
+listener_cert = "listener.pem"
+listener_key = "listener.key"
+peer_ca = "peer-ca.pem"
+cluster_domain = "cluster.local"
+"#
 }
 
 fn descriptor() -> TableSchemaDescriptor {
@@ -65,6 +81,7 @@ fn toron_example_config_loads() {
 			.is_loopback()
 	);
 	assert!(config.coordinator.include_self_worker);
+	assert!(config.tls.is_none());
 }
 
 #[test]
@@ -81,8 +98,165 @@ fn toron_sql_listener_rejects_non_loopback_bind() {
 
 	assert!(
 		error.to_string().contains(
-			"toron sql listener requires authenticated transport for non-loopback bind address"
+			"sql listener requires authenticated transport for non-loopback bind address"
 		),
+		"{error}"
+	);
+}
+
+#[test]
+fn toron_worker_listener_rejects_non_loopback_bind_without_tls() {
+	let dir = fresh_dir("worker-non-loopback");
+	let path = dir.join("toron.toml");
+	let config = render_example_config().replace(
+		"task_listener_bind = \"127.0.0.1:0\"",
+		"task_listener_bind = \"0.0.0.0:0\"",
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let error = load_toron_bootstrap_config(&path).expect_err("non-loopback worker bind must fail");
+
+	assert!(
+		error.to_string().contains(
+			"worker listener requires authenticated transport for non-loopback bind address"
+		),
+		"{error}"
+	);
+}
+
+#[test]
+fn toron_worker_listener_allows_non_loopback_bind_with_tls() {
+	let dir = fresh_dir("worker-non-loopback-tls");
+	write_toron_tls_placeholders(&dir);
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}{}",
+		render_example_config().replace(
+			"task_listener_bind = \"127.0.0.1:0\"",
+			"task_listener_bind = \"0.0.0.0:0\"",
+		),
+		toron_tls_section()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load TLS remote worker config");
+
+	assert!(!config.worker.task_listener_bind.ip().is_loopback());
+	assert!(config.tls.is_some());
+}
+
+#[test]
+fn toron_sql_listener_allows_non_loopback_bind_with_tls() {
+	let dir = fresh_dir("sql-non-loopback-tls");
+	write_toron_tls_placeholders(&dir);
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}{}",
+		render_example_config().replace(
+			"listener_bind = \"127.0.0.1:7742\"",
+			"listener_bind = \"0.0.0.0:7742\"",
+		),
+		toron_tls_section()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load TLS remote SQL config");
+
+	assert!(
+		!config
+			.sql
+			.expect("sql config")
+			.listener_bind
+			.ip()
+			.is_loopback()
+	);
+	assert!(config.tls.is_some());
+}
+
+#[test]
+fn toron_static_worker_rejects_non_loopback_endpoint_without_tls() {
+	let dir = fresh_dir("static-worker-non-loopback");
+	let path = dir.join("toron.toml");
+	let config = render_example_config().replace(
+		"# [[coordinator.static_workers]]\n# worker_id = \"00000000-0000-0000-0000-000000000043\"\n# endpoint = \"127.0.0.1:9101\"",
+		"[[coordinator.static_workers]]\nworker_id = \"00000000-0000-0000-0000-000000000043\"\nendpoint = \"10.0.0.42:9101\"",
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let error =
+		load_toron_bootstrap_config(&path).expect_err("non-loopback static worker must fail");
+
+	assert!(
+		error.to_string().contains(
+			"coordinator static workers require authenticated transport for non-loopback endpoints"
+		),
+		"{error}"
+	);
+}
+
+#[test]
+fn toron_static_worker_allows_non_loopback_endpoint_with_tls() {
+	let dir = fresh_dir("static-worker-non-loopback-tls");
+	write_toron_tls_placeholders(&dir);
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}{}",
+		render_example_config().replace(
+			"# [[coordinator.static_workers]]\n# worker_id = \"00000000-0000-0000-0000-000000000043\"\n# endpoint = \"127.0.0.1:9101\"",
+			"[[coordinator.static_workers]]\nworker_id = \"00000000-0000-0000-0000-000000000043\"\nendpoint = \"10.0.0.42:9101\"",
+		),
+		toron_tls_section()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load TLS remote static worker config");
+
+	assert_eq!(config.coordinator.static_workers.len(), 1);
+	assert!(
+		!config.coordinator.static_workers[0]
+			.endpoint
+			.ip()
+			.is_loopback()
+	);
+	assert!(config.tls.is_some());
+}
+
+#[test]
+fn toron_tls_missing_cert_file_fails_with_stable_diagnostic() {
+	let dir = fresh_dir("tls-missing-cert");
+	write_toron_tls_placeholders(&dir);
+	std::fs::remove_file(dir.join("listener.pem")).expect("remove listener cert");
+	let path = dir.join("toron.toml");
+	let config = format!("{}{}", render_example_config(), toron_tls_section());
+	std::fs::write(&path, config).expect("write config");
+
+	let error = load_toron_bootstrap_config(&path).expect_err("missing cert must fail");
+
+	assert!(
+		error
+			.to_string()
+			.contains("tls cert file not found or unreadable"),
+		"{error}"
+	);
+}
+
+#[test]
+fn toron_tls_paths_reject_env_interpolation() {
+	let dir = fresh_dir("tls-env-interpolation");
+	write_toron_tls_placeholders(&dir);
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[tls]\nlistener_cert = \"${{TORON_CERT}}\"\nlistener_key = \"listener.key\"\npeer_ca = \"peer-ca.pem\"\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let error = load_toron_bootstrap_config(&path).expect_err("env interpolation must fail");
+
+	assert!(
+		error
+			.to_string()
+			.contains("tls config paths do not interpolate environment variables"),
 		"{error}"
 	);
 }

@@ -643,7 +643,7 @@ impl Executor {
 						runtime_filter: self.context.runtime_filter.clone(),
 						row_identity: *row_identity,
 						profile_hint: Some(*profile_hint),
-						trace_context: self.context.trace_context.clone(),
+						trace_context: self.context.trace_context,
 						morsel,
 					};
 					let stream = self.storage.scan(req).await?;
@@ -1630,6 +1630,7 @@ fn record_task_telemetry(
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_hash_join(
 	left_schema: arrow::datatypes::SchemaRef,
 	right_schema: arrow::datatypes::SchemaRef,
@@ -2218,6 +2219,7 @@ fn join_build_memory_fits(key_arrays: &[ArrayRef], rows: usize, memory_cap: u64)
 	estimated_build_hash_bytes(key_arrays, rows) <= memory_cap
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_spilled_hash_join(
 	kind: JoinKind,
 	left_batch: &RecordBatch,
@@ -4097,7 +4099,7 @@ fn cast_f32_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 				));
 			}
 			let trunc = f64::from(value).trunc();
-			if !(F64_I32_LOWER <= trunc && trunc < F64_I32_UPPER) {
+			if !(F64_I32_LOWER..F64_I32_UPPER).contains(&trunc) {
 				return Err(cast_failed(
 					&DataType::Float32,
 					&DataType::Int32,
@@ -4133,7 +4135,7 @@ fn cast_f32_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 				));
 			}
 			let trunc = f64::from(value).trunc();
-			if !(F64_I64_LOWER <= trunc && trunc < F64_I64_UPPER) {
+			if !(F64_I64_LOWER..F64_I64_UPPER).contains(&trunc) {
 				return Err(cast_failed(
 					&DataType::Float32,
 					&DataType::Int64,
@@ -4175,7 +4177,7 @@ fn cast_f64_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 				));
 			}
 			let trunc = value.trunc();
-			if !(F64_I32_LOWER <= trunc && trunc < F64_I32_UPPER) {
+			if !(F64_I32_LOWER..F64_I32_UPPER).contains(&trunc) {
 				return Err(cast_failed(
 					&DataType::Float64,
 					&DataType::Int32,
@@ -4211,7 +4213,7 @@ fn cast_f64_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 				));
 			}
 			let trunc = value.trunc();
-			if !(F64_I64_LOWER <= trunc && trunc < F64_I64_UPPER) {
+			if !(F64_I64_LOWER..F64_I64_UPPER).contains(&trunc) {
 				return Err(cast_failed(
 					&DataType::Float64,
 					&DataType::Int64,
@@ -4288,7 +4290,7 @@ fn try_cast_f32_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 				return None;
 			}
 			let trunc = f64::from(value).trunc();
-			if !(F64_I32_LOWER <= trunc && trunc < F64_I32_UPPER) {
+			if !(F64_I32_LOWER..F64_I32_UPPER).contains(&trunc) {
 				return None;
 			}
 			Some(trunc as i32)
@@ -4310,7 +4312,7 @@ fn try_cast_f32_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 				return None;
 			}
 			let trunc = f64::from(value).trunc();
-			if !(F64_I64_LOWER <= trunc && trunc < F64_I64_UPPER) {
+			if !(F64_I64_LOWER..F64_I64_UPPER).contains(&trunc) {
 				return None;
 			}
 			Some(trunc as i64)
@@ -4332,7 +4334,7 @@ fn try_cast_f64_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 				return None;
 			}
 			let trunc = value.trunc();
-			if !(F64_I32_LOWER <= trunc && trunc < F64_I32_UPPER) {
+			if !(F64_I32_LOWER..F64_I32_UPPER).contains(&trunc) {
 				return None;
 			}
 			Some(trunc as i32)
@@ -4354,7 +4356,7 @@ fn try_cast_f64_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 				return None;
 			}
 			let trunc = value.trunc();
-			if !(F64_I64_LOWER <= trunc && trunc < F64_I64_UPPER) {
+			if !(F64_I64_LOWER..F64_I64_UPPER).contains(&trunc) {
 				return None;
 			}
 			Some(trunc as i64)

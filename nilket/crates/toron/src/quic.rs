@@ -26,16 +26,40 @@ pub struct QuicEndpoint {
 
 impl QuicEndpoint {
 	pub fn bind(bind_addr: SocketAddr) -> std::io::Result<Self> {
+		Self::bind_loopback(bind_addr)
+	}
+
+	pub fn bind_loopback(bind_addr: SocketAddr) -> std::io::Result<Self> {
 		let server_config = loopback_server_config()?;
 		Ok(Self {
 			inner: quinn::Endpoint::server(server_config, bind_addr)?,
 		})
 	}
 
+	pub fn bind_authenticated(
+		bind_addr: SocketAddr,
+		server_config: quinn::ServerConfig,
+	) -> std::io::Result<Self> {
+		Ok(Self {
+			inner: quinn::Endpoint::server(server_config, bind_addr)?,
+		})
+	}
+
 	pub fn client() -> std::io::Result<Self> {
+		Self::client_loopback()
+	}
+
+	pub fn client_loopback() -> std::io::Result<Self> {
 		let mut endpoint =
 			quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
 		endpoint.set_default_client_config(loopback_client_config()?);
+		Ok(Self { inner: endpoint })
+	}
+
+	pub fn client_authenticated(client_config: quinn::ClientConfig) -> std::io::Result<Self> {
+		let mut endpoint =
+			quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+		endpoint.set_default_client_config(client_config);
 		Ok(Self { inner: endpoint })
 	}
 
@@ -68,9 +92,18 @@ impl QuicEndpoint {
 	}
 
 	pub async fn connect_stream(&self, remote: SocketAddr) -> std::io::Result<QuicStream> {
+		self.connect_stream_with_server_name(remote, LOOPBACK_QUIC_SERVER_NAME)
+			.await
+	}
+
+	pub async fn connect_stream_with_server_name(
+		&self,
+		remote: SocketAddr,
+		server_name: &str,
+	) -> std::io::Result<QuicStream> {
 		let connection = self
 			.inner
-			.connect(remote, LOOPBACK_QUIC_SERVER_NAME)
+			.connect(remote, server_name)
 			.map_err(|error| Error::new(ErrorKind::InvalidInput, error))?
 			.await
 			.map_err(|error| Error::new(ErrorKind::ConnectionRefused, error))?;

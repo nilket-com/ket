@@ -9,7 +9,7 @@ single shared mTLS policy. Add a TLS-policy module (placement decided
 at Phase 0: Plan W-B shared `tls-pki` workspace crate preferred; Plan
 W-C Toron-local copy as fallback). The module owns cert loading,
 peer-CA verification, the canonical SAN helper
-(`canonical_toron_dns_name`), and the per-listener SAN-admission
+(`canonical_daemon_dns_name`), and the per-listener SAN-admission
 exact-shape verifier (no subdomain injection, no wildcard abuse, no
 underscore confused-deputy, no malformed UUID under `toron-`). Extend
 `crates/toron/src/config.rs` with a `[tls]` section. Thread the policy
@@ -125,8 +125,8 @@ pub mod network {
 ```
 
 Under Plan W-B the module is a thin Toron-side wrapper that
-re-exports `tls_pki::ToronTlsListenerPolicy` and provides Toron-
-specific helpers like `canonical_toron_dns_name`. Under Plan W-C the
+re-exports `tls_pki::ListenerPolicy` and provides daemon-specific
+helpers like `canonical_daemon_dns_name`. Under Plan W-C the
 module owns the verifier implementation directly.
 
 **Do not** touch `crates/nilket/Cargo.toml`. ADR 040 D4
@@ -141,28 +141,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub const DEFAULT_TORON_CLUSTER_DOMAIN: &str = "cluster.local";
+pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 /// Canonical DNS SAN for a Toron daemon. Structurally parallel to
 /// `wendelon::network::tls::canonical_node_dns_name`.
-pub fn canonical_toron_dns_name(worker_id: &Uuid, cluster_domain: &str) -> String {
+pub fn canonical_daemon_dns_name(worker_id: &Uuid, cluster_domain: &str) -> String {
     format!("toron-{worker_id}.{cluster_domain}")
 }
 
 /// Canonical DNS SAN for an external SQL client principal.
-pub fn canonical_toron_client_dns_name(principal: &str, cluster_domain: &str) -> String {
+pub fn canonical_client_dns_name(principal: &str, cluster_domain: &str) -> String {
     format!("client-{principal}.{cluster_domain}")
 }
 
 #[derive(Debug, Clone)]
-pub struct ToronTlsConfig {
+pub struct TlsConfig {
     pub listener_cert: PathBuf,
     pub listener_key: PathBuf,
     pub peer_ca: PathBuf,
     pub cluster_domain: String,
 }
 
-pub struct ToronTlsListenerPolicy {
+pub struct ListenerPolicy {
     cluster_domain: String,
     server_config_worker_task: Arc<rustls::ServerConfig>,
     server_config_sql: Arc<rustls::ServerConfig>,
@@ -182,25 +182,25 @@ pub enum PeerKind {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ToronTlsError {
-    #[error("toron tls listener_key must be unencrypted PEM PKCS#8")]
+pub enum TlsError {
+    #[error("tls listener_key must be unencrypted PEM PKCS#8")]
     KeyNotPkcs8,
-    #[error("toron tls config paths do not interpolate environment variables")]
+    #[error("tls config paths do not interpolate environment variables")]
     EnvInterpolation,
-    #[error("toron tls cluster_domain must not be empty")]
+    #[error("tls cluster_domain must not be empty")]
     ClusterDomainEmpty,
-    #[error("toron tls cert file not found or unreadable: {0}")]
+    #[error("tls cert file not found or unreadable: {0}")]
     CertFile(PathBuf),
-    #[error("toron tls peer_ca file not found or unreadable: {0}")]
+    #[error("tls peer_ca file not found or unreadable: {0}")]
     PeerCaFile(PathBuf),
-    #[error("toron tls peer cert SAN admission rejected")]
+    #[error("tls peer cert SAN admission rejected")]
     SanShapeRejected,
-    #[error("toron tls peer cert SAN role rejected for listener")]
+    #[error("tls peer cert SAN role rejected for listener")]
     SanRoleRejected,
 }
 
-impl ToronTlsListenerPolicy {
-    pub fn load(config: &ToronTlsConfig) -> Result<Self, ToronTlsError> {
+impl ListenerPolicy {
+    pub fn load(config: &TlsConfig, worker_id: &WorkerId) -> Result<Self, TlsError> {
         // 1. Validate cluster_domain non-empty.
         // 2. Reject ${VAR} patterns in any path.
         // 3. Parse listener_cert as PEM cert chain (reject empty/malformed).
@@ -220,7 +220,7 @@ impl ToronTlsListenerPolicy {
     }
 
     pub fn client_config_for_worker_dial(&self) -> Arc<rustls::ClientConfig> {
-        // Callers pass `canonical_toron_dns_name(worker_id, cluster_domain)`
+        // Callers pass `canonical_daemon_dns_name(worker_id, cluster_domain)`
         // as the quinn/rustls server name when connecting.
         self.client_config_dial.clone()
     }
@@ -230,40 +230,40 @@ impl ToronTlsListenerPolicy {
 **Exact-shape SAN admission verifier (iter-3 sharpening, D5):**
 
 ```rust
-fn admit_san(san: &str, role: ListenerRole, cluster_domain: &str) -> Result<PeerKind, ToronTlsError> {
+fn admit_san(san: &str, role: ListenerRole, cluster_domain: &str) -> Result<PeerKind, TlsError> {
     let suffix = format!(".{cluster_domain}");
     let leading = san
         .strip_suffix(&suffix)
-        .ok_or(ToronTlsError::SanShapeRejected)?;
+        .ok_or(TlsError::SanShapeRejected)?;
 
     // Exact-shape: leading must contain no dots (no extra subdomain).
     if leading.contains('.') {
-        return Err(ToronTlsError::SanShapeRejected);
+        return Err(TlsError::SanShapeRejected);
     }
 
     let (prefix, id_token) = leading
         .split_once('-')
-        .ok_or(ToronTlsError::SanShapeRejected)?;
+        .ok_or(TlsError::SanShapeRejected)?;
 
     // id_token must be [A-Za-z0-9-]+ — no dots, underscores, wildcards.
     if id_token.is_empty()
         || !id_token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
-        return Err(ToronTlsError::SanShapeRejected);
+        return Err(TlsError::SanShapeRejected);
     }
 
     match (prefix, role) {
         ("toron", ListenerRole::WorkerTask) => {
             let worker_id = Uuid::parse_str(id_token)
-                .map_err(|_| ToronTlsError::SanShapeRejected)?;
+                .map_err(|_| TlsError::SanShapeRejected)?;
             Ok(PeerKind::SiblingDaemon { worker_id })
         }
-        ("toron", ListenerRole::Sql) => Err(ToronTlsError::SanRoleRejected),
+        ("toron", ListenerRole::Sql) => Err(TlsError::SanRoleRejected),
         ("client", ListenerRole::Sql) => {
             Ok(PeerKind::Client { principal: id_token.to_owned() })
         }
-        ("client", ListenerRole::WorkerTask) => Err(ToronTlsError::SanRoleRejected),
-        _ => Err(ToronTlsError::SanShapeRejected),
+        ("client", ListenerRole::WorkerTask) => Err(TlsError::SanRoleRejected),
+        _ => Err(TlsError::SanShapeRejected),
     }
 }
 ```
@@ -283,11 +283,11 @@ Add the optional section to `ToronBootstrapConfig`:
 pub struct ToronBootstrapConfig {
     // existing fields...
     #[serde(default)]
-    pub tls: Option<ToronTlsConfig>,
+    pub tls: Option<TlsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronTlsConfig {
+pub struct TlsConfig {
     pub listener_cert: PathBuf,
     pub listener_key: PathBuf,
     pub peer_ca: PathBuf,
@@ -310,8 +310,8 @@ Extend `validate_bootstrap_config`:
    `[sql].listener_bind`):
    - parse to `SocketAddr`;
    - if `is_loopback()` → accept;
-   - else if `[tls]` is `None` → reject with the byte-identical-with-
-     ADR-042-D9 / ADR-043-D5 diagnostic string;
+   - else if `[tls]` is `None` → reject with ADR 044's stable,
+     brand-clean diagnostic string;
    - else → accept (TLS-policy load deferred to daemon start).
 4. For each `[[coordinator.static_workers]]` entry:
    - parse endpoint to `SocketAddr`;
@@ -375,7 +375,7 @@ for static_worker in config.coordinator.static_workers.iter() {
         (None, true) => None,  // ADR 043 D12 unauthenticated loopback QUIC path preserved
         (None, false) => unreachable!("config validation rejects this"),
     };
-    let server_name = canonical_toron_dns_name(&static_worker.worker_id, &cluster_domain);
+    let server_name = canonical_daemon_dns_name(&static_worker.worker_id, &cluster_domain);
     // Build the dial endpoint using client_config; rustls's
     // ServerCertVerifier requires the peer's cert SAN exact-shape
     // match `toron-<worker_id>.<cluster_domain>` (verified through
@@ -426,13 +426,15 @@ Add to `crates/toron/tests/architecture_test.rs`. Sixteen ADR 044
 guards + one convention guard, structurally mirroring ADR 043's
 implementation pattern.
 
+Promoted guard names:
+
 ```rust
-#[test]
-fn adr044_tls_section_is_optional_for_loopback_only_config() {
-    let config_text = include_str!("../examples/loopback_only.toml");
-    let parsed: ToronBootstrapConfig = toml::from_str(config_text).unwrap();
-    assert!(parsed.tls.is_none());
-}
+fn adr044_toron_tls_config_surface_exists_and_is_optional() { /* ... */ }
+fn adr044_tls_policy_uses_exact_san_admission_per_listener() { /* ... */ }
+fn adr044_daemon_selects_authenticated_quic_only_for_non_loopback_tls_listeners() { /* ... */ }
+fn adr044_sql_cli_remote_tls_flags_do_not_add_nilket_runtime_dependencies() { /* ... */ }
+fn adr044_does_not_change_sql_wire_or_add_token_auth_models() { /* ... */ }
+fn adr044_no_cert_reload_or_revocation_scope_creep() { /* ... */ }
 
 #[test]
 fn adr044_san_admission_is_exact_shape_per_listener() {
@@ -470,27 +472,34 @@ fn adr044_san_convention_mirrors_wendelon_shape() {
 }
 
 #[test]
-fn adr044_loopback_diagnostic_text_byte_identical_with_adr042_and_adr043() {
+fn adr044_loopback_diagnostic_text_is_brand_clean_and_stable() {
     let src = include_str!("../src/config.rs");
-    assert!(src.contains("toron worker listener requires authenticated transport for non-loopback bind address"));
-    assert!(src.contains("toron sql listener requires authenticated transport for non-loopback bind address"));
+    assert!(src.contains("worker listener requires authenticated transport for non-loopback bind address"));
+    assert!(src.contains("sql listener requires authenticated transport for non-loopback bind address"));
+    assert!(src.contains("coordinator static workers require authenticated transport for non-loopback endpoints"));
 }
 
-// ... remaining 12 + convention guard ...
+fn adr044_tenant_id_remains_server_stamped() { /* ... */ }
+fn adr044_ready_lines_are_unchanged() { /* ... */ }
+fn adr044_no_observability_listener_in_this_adr() { /* ... */ }
+fn adr044_remote_static_worker_requires_tls_and_san_binding() { /* ... */ }
+fn adr044_one_tls_material_set_per_daemon() { /* ... */ }
+fn adr044_sql_listener_client_admission_is_client_prefix_only() { /* ... */ }
+fn adr044_no_spiffe_svid_or_uri_san_identity_model() { /* ... */ }
+fn adr044_new_tls_policy_names_are_brand_clean_and_no_v1_suffix() { /* ... */ }
 ```
 
-Source-text guards (#3, #8, #9, #10, #11, #13, #14, #15, convention)
-assert absence / presence of specific strings in source files. Runtime
-guards (#1, #2, #4, #5, #6, #7, #12, #16) exercise the loader /
-verifier / listener admission / SQL CLI option paths in unit test scope.
+Source-text guards assert absence / presence of specific strings in
+source files. Runtime guards exercise the loader / verifier / listener
+admission / SQL CLI option paths in unit test scope.
 
 ## Phase 7: Integration Fixtures
 
 ### `crates/toron/tests/toron_tls_config_test.rs` (new)
 
 1. `toron_config_missing_tls_section_loads_byte_identical_to_adr043`
-2. `toron_config_non_loopback_bind_without_tls_rejected` (pinned
-   diagnostic string match)
+2. `toron_config_non_loopback_bind_without_tls_rejected` (ADR 044
+   stable, brand-clean diagnostic string match)
 3. `toron_config_non_loopback_bind_with_tls_loads`
 4. `toron_config_missing_cert_file_fails_with_stable_diagnostic`
 5. `toron_config_encrypted_key_fails_with_stable_diagnostic`
@@ -536,7 +545,7 @@ verifier / listener admission / SQL CLI option paths in unit test scope.
   SIGKILL the worker mid-task, observe canonical retry digest. The
   V1 target signal over remote mTLS QUIC.
 - `toron_san_helper_matches_wendelon_shape` — parity helper test
-  asserting `canonical_toron_dns_name(uuid, "cluster.local")` returns
+  asserting `canonical_daemon_dns_name(uuid, "cluster.local")` returns
   `"toron-<uuid>.cluster.local"`, structurally parallel to
   `wendelon::canonical_node_dns_name(1, "cluster.local")` returning
   `"node-1.cluster.local"`.
@@ -591,12 +600,11 @@ Materialize `plans/impl/044_evidence.md` with:
 - [ ] Phase 2 TLS policy module compiles clean (`cargo clippy
       -- -D warnings`).
 - [ ] Phase 3 config validation rejects non-loopback bind without
-      `[tls]` with byte-identical-with-ADR-042-D9 / ADR-043-D5
-      diagnostic strings.
+      `[tls]` with ADR 044 stable, brand-clean diagnostic strings.
 - [ ] Phase 4 listener acceptors thread the policy through;
       loopback-only path byte-identical when `[tls]` absent.
 - [ ] Phase 5 coordinator dial path validates SAN binding to
-      `worker_id` byte-identical via `canonical_toron_dns_name`.
+      `worker_id` byte-identical via `canonical_daemon_dns_name`.
 - [ ] Phase 5b SQL CLI remote client flags/env and explicit server-name
       verification implemented in `crates/toron`.
 - [ ] Phase 6 all 16 ADR 044 guards + 1 convention guard pass.

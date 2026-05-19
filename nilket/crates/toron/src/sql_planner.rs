@@ -409,6 +409,12 @@ fn check_unique_column_names(fields: &[Field]) -> Result<(), FrontendError> {
 
 pub struct SqlPlanner;
 
+impl Default for SqlPlanner {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 impl SqlPlanner {
 	pub fn new() -> Self {
 		Self
@@ -1551,7 +1557,6 @@ impl SqlPlanner {
 		let final_projection = self.lower_final_aggregate_projection(projection, mode, &catalog)?;
 		let project_required = final_projection.required;
 		let aggr_expr = catalog.aggr_expr();
-		let mut catalog = catalog;
 		let final_output_names = if project_required {
 			final_projection.derived_output_names()
 		} else {
@@ -1654,16 +1659,16 @@ impl SqlPlanner {
 		if let Some(alias) = alias {
 			catalog.add_select_alias(alias);
 		}
-		if let SqlExpr::Function(function) = strip_nested_sql_expr(expr) {
-			if aggregate_function_name(&function.name).is_some() {
-				let (function, args) = self.lower_aggregate_function(function, mode)?;
-				let visible_name = alias
-					.map(|alias| alias.value.clone())
-					.unwrap_or_else(|| aggregate_output_name(&function).to_string());
-				let index = catalog.add_requirement(function, args, AggregateSource::Select);
-				catalog.mark_order_by_visible(index, visible_name);
-				return Ok(());
-			}
+		if let SqlExpr::Function(function) = strip_nested_sql_expr(expr)
+			&& aggregate_function_name(&function.name).is_some()
+		{
+			let (function, args) = self.lower_aggregate_function(function, mode)?;
+			let visible_name = alias
+				.map(|alias| alias.value.clone())
+				.unwrap_or_else(|| aggregate_output_name(&function).to_string());
+			let index = catalog.add_requirement(function, args, AggregateSource::Select);
+			catalog.mark_order_by_visible(index, visible_name);
+			return Ok(());
 		}
 		self.discover_aggregate_calls(expr, mode, AggregateSource::Select, catalog)
 	}
@@ -2071,17 +2076,17 @@ impl SqlPlanner {
 		inner_qualifiers: &[TableRef],
 	) -> Result<ExistsConjunct, FrontendError> {
 		let conjunct = strip_nested_sql_expr(conjunct);
-		if let SqlExpr::BinaryOp { left, op, right } = conjunct {
-			if *op == BinaryOperator::Eq {
-				let left_column = scoped_column_expr(left, outer_qualifiers, inner_qualifiers)?;
-				let right_column = scoped_column_expr(right, outer_qualifiers, inner_qualifiers)?;
-				match (left_column, right_column) {
-					(Some((ColumnScope::Outer, outer)), Some((ColumnScope::Inner, inner)))
-					| (Some((ColumnScope::Inner, inner)), Some((ColumnScope::Outer, outer))) => {
-						return Ok(ExistsConjunct::CorrelatedPair { outer, inner });
-					}
-					_ => {}
+		if let SqlExpr::BinaryOp { left, op, right } = conjunct
+			&& *op == BinaryOperator::Eq
+		{
+			let left_column = scoped_column_expr(left, outer_qualifiers, inner_qualifiers)?;
+			let right_column = scoped_column_expr(right, outer_qualifiers, inner_qualifiers)?;
+			match (left_column, right_column) {
+				(Some((ColumnScope::Outer, outer)), Some((ColumnScope::Inner, inner)))
+				| (Some((ColumnScope::Inner, inner)), Some((ColumnScope::Outer, outer))) => {
+					return Ok(ExistsConjunct::CorrelatedPair { outer, inner });
 				}
+				_ => {}
 			}
 		}
 
@@ -2487,15 +2492,14 @@ impl AggregateOutputCatalog {
 		source: AggregateSource,
 	) -> usize {
 		let signature = grouped_aggregate_signature(&function, &args);
-		if let Some(signature) = signature.as_ref() {
-			if let Some(index) = self
+		if let Some(signature) = signature.as_ref()
+			&& let Some(index) = self
 				.entries
 				.iter()
 				.position(|entry| entry.signature.as_ref() == Some(signature))
-			{
-				self.entries[index].mark_source(source);
-				return index;
-			}
+		{
+			self.entries[index].mark_source(source);
+			return index;
 		}
 
 		let natural_name = aggregate_output_name(&function).to_string();
@@ -2521,10 +2525,10 @@ impl AggregateOutputCatalog {
 	}
 
 	fn mark_order_by_visible(&mut self, index: usize, output_name: String) {
-		if let Some(entry) = self.entries.get_mut(index) {
-			if !entry.order_by_visible_names.contains(&output_name) {
-				entry.order_by_visible_names.push(output_name);
-			}
+		if let Some(entry) = self.entries.get_mut(index)
+			&& !entry.order_by_visible_names.contains(&output_name)
+		{
+			entry.order_by_visible_names.push(output_name);
 		}
 	}
 
@@ -3400,14 +3404,14 @@ fn validate_exists_projection(projection: &[SelectItem]) -> Result<(), FrontendE
 }
 
 fn exists_projection_expr_supported(expr: &SqlExpr) -> bool {
-	match strip_nested_sql_expr(expr) {
+	matches!(
+		strip_nested_sql_expr(expr),
 		SqlExpr::Identifier(_)
-		| SqlExpr::CompoundIdentifier(_)
-		| SqlExpr::Value(Value::Number(_, _))
-		| SqlExpr::Value(Value::SingleQuotedString(_))
-		| SqlExpr::Value(Value::Boolean(_)) => true,
-		_ => false,
-	}
+			| SqlExpr::CompoundIdentifier(_)
+			| SqlExpr::Value(Value::Number(_, _))
+			| SqlExpr::Value(Value::SingleQuotedString(_))
+			| SqlExpr::Value(Value::Boolean(_))
+	)
 }
 
 fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
