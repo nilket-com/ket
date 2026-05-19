@@ -1,3 +1,4 @@
+use crate::integration::compute::DropOperationId;
 use crate::schema::{HybridTimestamp, TableObjectId, TenantId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -170,6 +171,19 @@ pub struct TableLifecycleCatalog {
 	by_id: BTreeMap<TableLifecycleKey, TableLifecyclePolicy>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropFence {
+	pub operation_id: DropOperationId,
+	pub fence_log_index: u64,
+	pub reclaim_completion_log_index: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropFenceCatalog {
+	#[serde(default)]
+	by_id: BTreeMap<TableLifecycleKey, TableDropFence>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableLifecyclePolicyCounts {
 	pub inherit_cluster: usize,
@@ -271,6 +285,149 @@ impl TableLifecycleCatalog {
 		counts
 	}
 }
+
+impl TableDropFenceCatalog {
+	pub fn get(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> Option<&TableDropFence> {
+		self.by_id
+			.get(&TableLifecycleKey::new(tenant_id, table_object_id))
+	}
+
+	pub fn is_fenced(&self, tenant_id: TenantId, table_object_id: TableObjectId) -> bool {
+		self.get(tenant_id, table_object_id).is_some()
+	}
+
+	pub fn prepare(
+		&mut self,
+		operation_id: DropOperationId,
+		fence_log_index: u64,
+	) -> Result<TableDropFence, TableDropFenceError> {
+		let key = TableLifecycleKey::new(operation_id.tenant_id, operation_id.table_object_id);
+		if let Some(existing) = self.by_id.get(&key).copied() {
+			if existing.operation_id == operation_id {
+				return Ok(existing);
+			}
+			return Err(TableDropFenceError::AlreadyDropping {
+				existing_operation_id: existing.operation_id,
+			});
+		}
+		let fence = TableDropFence {
+			operation_id,
+			fence_log_index,
+			reclaim_completion_log_index: None,
+		};
+		self.by_id.insert(key, fence);
+		Ok(fence)
+	}
+
+	pub fn complete_reclaim(
+		&mut self,
+		operation_id: DropOperationId,
+		fence_log_index: u64,
+		reclaim_completion_log_index: u64,
+	) -> Result<TableDropFence, TableDropFenceError> {
+		let key = TableLifecycleKey::new(operation_id.tenant_id, operation_id.table_object_id);
+		let Some(fence) = self.by_id.get_mut(&key) else {
+			return Err(TableDropFenceError::MissingFence);
+		};
+		if fence.operation_id != operation_id {
+			return Err(TableDropFenceError::AlreadyDropping {
+				existing_operation_id: fence.operation_id,
+			});
+		}
+		if fence.fence_log_index != fence_log_index {
+			return Err(TableDropFenceError::FenceLogIndexMismatch {
+				expected: fence.fence_log_index,
+				observed: fence_log_index,
+			});
+		}
+		if let Some(existing) = fence.reclaim_completion_log_index {
+			if existing != reclaim_completion_log_index {
+				return Err(TableDropFenceError::ReclaimCompletionLogIndexMismatch {
+					expected: existing,
+					observed: reclaim_completion_log_index,
+				});
+			}
+			return Ok(*fence);
+		}
+		fence.reclaim_completion_log_index = Some(reclaim_completion_log_index);
+		Ok(*fence)
+	}
+
+	pub fn finalize(
+		&mut self,
+		operation_id: DropOperationId,
+		fence_log_index: u64,
+		reclaim_completion_log_index: u64,
+	) -> Result<TableDropFence, TableDropFenceError> {
+		let key = TableLifecycleKey::new(operation_id.tenant_id, operation_id.table_object_id);
+		let Some(fence) = self.by_id.get(&key).copied() else {
+			return Err(TableDropFenceError::MissingFence);
+		};
+		if fence.operation_id != operation_id {
+			return Err(TableDropFenceError::AlreadyDropping {
+				existing_operation_id: fence.operation_id,
+			});
+		}
+		if fence.fence_log_index != fence_log_index {
+			return Err(TableDropFenceError::FenceLogIndexMismatch {
+				expected: fence.fence_log_index,
+				observed: fence_log_index,
+			});
+		}
+		if fence.reclaim_completion_log_index != Some(reclaim_completion_log_index) {
+			return Err(TableDropFenceError::ReclaimCompletionLogIndexMismatch {
+				expected: fence.reclaim_completion_log_index.unwrap_or(0),
+				observed: reclaim_completion_log_index,
+			});
+		}
+		self.by_id.remove(&key);
+		Ok(fence)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableDropFenceError {
+	AlreadyDropping {
+		existing_operation_id: DropOperationId,
+	},
+	MissingFence,
+	FenceLogIndexMismatch {
+		expected: u64,
+		observed: u64,
+	},
+	ReclaimCompletionLogIndexMismatch {
+		expected: u64,
+		observed: u64,
+	},
+}
+
+impl fmt::Display for TableDropFenceError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::AlreadyDropping {
+				existing_operation_id,
+			} => write!(
+				f,
+				"table is already dropping under operation_id {existing_operation_id:?}"
+			),
+			Self::MissingFence => write!(f, "table drop fence is missing"),
+			Self::FenceLogIndexMismatch { expected, observed } => write!(
+				f,
+				"table drop fence_log_index mismatch: expected {expected}, observed {observed}"
+			),
+			Self::ReclaimCompletionLogIndexMismatch { expected, observed } => write!(
+				f,
+				"table drop reclaim_completion_log_index mismatch: expected {expected}, observed {observed}"
+			),
+		}
+	}
+}
+
+impl std::error::Error for TableDropFenceError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableLifecycleSetError {

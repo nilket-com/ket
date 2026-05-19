@@ -1559,7 +1559,8 @@ impl WendelonNode {
 			)
 			.with_protocol_window(cfg.protocol)
 			.with_lease_authority(lease_authority.clone())
-			.with_transfer_authority(transfer_authority.clone()),
+			.with_transfer_authority(transfer_authority.clone())
+			.with_storage_manager(slab.clone()),
 		);
 
 		// 13. Ring-aware dispatch — the single `HrftService` the QUIC

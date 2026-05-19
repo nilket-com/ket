@@ -40,7 +40,7 @@
 //! * S3 tier handoff: the `sealed` map is as far as records travel
 //!   for now; remote upload is ADR 006's problem.
 
-use crate::consensus::MigratedRangeTombstone;
+use crate::consensus::{MigratedRangeTombstone, TieredSlab};
 use crate::crypto::{
 	CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary,
 	SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE, TieredColumnStatsBlock, TieredMultiRangeReadPlan,
@@ -428,6 +428,14 @@ pub struct RetentionPruningReport {
 	pub reclaimed_bytes: u64,
 }
 
+/// Outcome of one explicit table-drop reclaim pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableDropReclaimReport {
+	pub compacted_slabs: usize,
+	pub reclaimed_records: usize,
+	pub reclaimed_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetentionCompactionStats {
 	pub pruned_data_rows: usize,
@@ -467,6 +475,25 @@ pub(crate) enum PreparedTieredRetentionRewrite {
 	},
 	Observe {
 		retention_stats: RetentionCompactionStats,
+	},
+}
+
+pub(crate) enum PreparedTieredTableDropRewrite {
+	Rewrite {
+		slab_id: SlabId,
+		old_l2_uri: String,
+		encrypted_bytes: Vec<u8>,
+		payload_hash: [u8; 32],
+		tombstone_metadata: TombstoneMetadata,
+		supersession_metadata: SupersessionMetadata,
+		reclaimed_records: usize,
+		reclaimed_bytes: u64,
+	},
+	Retire {
+		slab_id: SlabId,
+		old_l2_uri: String,
+		reclaimed_records: usize,
+		reclaimed_bytes: u64,
 	},
 }
 
@@ -6034,6 +6061,229 @@ impl SlabManager {
 		Ok(report)
 	}
 
+	pub async fn reclaim_table_drop_storage(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		table_schemas: &TableSchemaCatalogV1,
+		secondary_indexes: &SecondaryIndexCatalog,
+		max_slabs: usize,
+	) -> std::io::Result<TableDropReclaimReport> {
+		descriptor.validate()?;
+		if descriptor.table_object_id == TableObjectId::DEFAULT_KV || max_slabs == 0 {
+			return Ok(TableDropReclaimReport::default());
+		}
+		let _ = self.seal_active_for_table_drop_reclaim().await?;
+
+		let sealed = {
+			let state = self.state.lock().await;
+			let mut slabs = state
+				.sealed
+				.iter()
+				.map(|entry| (*entry.key(), entry.value().clone()))
+				.collect::<Vec<_>>();
+			slabs.sort_by_key(|(slab_id, _)| *slab_id);
+			slabs
+		};
+
+		let mut report = TableDropReclaimReport::default();
+		for (slab_id, slab) in sealed {
+			if report.compacted_slabs >= max_slabs {
+				break;
+			}
+			if let Some(outcome) = self
+				.reclaim_one_sealed_table_drop_slab(
+					slab_id,
+					slab,
+					tenant_id,
+					descriptor,
+					table_schemas,
+					secondary_indexes,
+				)
+				.await?
+			{
+				report.compacted_slabs += 1;
+				report.reclaimed_records = report
+					.reclaimed_records
+					.saturating_add(outcome.reclaimed_records);
+				report.reclaimed_bytes = report
+					.reclaimed_bytes
+					.saturating_add(outcome.reclaimed_bytes);
+			}
+		}
+		Ok(report)
+	}
+
+	pub async fn reclaim_table_drop_tiered_storage(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		table_schemas: &TableSchemaCatalogV1,
+		committer: &dyn TierCommitter,
+		max_slabs: usize,
+	) -> std::io::Result<TableDropReclaimReport> {
+		descriptor.validate()?;
+		if descriptor.table_object_id == TableObjectId::DEFAULT_KV || max_slabs == 0 {
+			return Ok(TableDropReclaimReport::default());
+		}
+		let pointers = self.list_tiered_slabs().await;
+		if pointers.is_empty() {
+			return Ok(TableDropReclaimReport::default());
+		}
+		let object_store = self.config.l2.clone().ok_or_else(|| {
+			Error::new(
+				ErrorKind::NotFound,
+				"table drop tiered reclaim requires an L2 object store",
+			)
+		})?;
+
+		let mut report = TableDropReclaimReport::default();
+		for pointer in pointers {
+			if report.compacted_slabs >= max_slabs {
+				break;
+			}
+			let Some(prepared) = self
+				.prepare_tiered_table_drop_rewrite(&pointer, tenant_id, descriptor, table_schemas)
+				.await?
+			else {
+				continue;
+			};
+			match prepared {
+				PreparedTieredTableDropRewrite::Rewrite {
+					slab_id,
+					old_l2_uri,
+					encrypted_bytes,
+					payload_hash,
+					tombstone_metadata,
+					supersession_metadata,
+					reclaimed_records,
+					reclaimed_bytes,
+				} => {
+					let key = self.table_drop_rewritten_key(slab_id);
+					let new_uri = object_store.put(&key, &encrypted_bytes).await?;
+					let fetched = object_store.get(&new_uri).await?;
+					let fetched_hash = crate::hash::content::digest(&fetched);
+					if fetched_hash != payload_hash {
+						let _ = Self::delete_l2_object_if_present(object_store.as_ref(), &new_uri)
+							.await;
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"table drop rewrite hash mismatch for slab {}: expected {:02x?}, got {:02x?}",
+								slab_id,
+								&payload_hash[..4],
+								&fetched_hash[..4],
+							),
+						));
+					}
+					let footer = self
+						.encrypted_tiered_footer_summary(&encrypted_bytes)?
+						.ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidData,
+								format!(
+									"table drop rewrite for slab {} did not produce an encrypted footer",
+									slab_id
+								),
+							)
+						})?;
+					let (stats_format_version, stats_block_len, stats_block_hash128) =
+						stats_advisory_fields(footer.stats_locator);
+					let tier = TieredSlab {
+						slab_id,
+						l2_uri: new_uri.clone(),
+						payload_hash,
+						is_encrypted: true,
+						tenant_id: Some(footer.tenant_id),
+						tenant_kek_id: Some(footer.tenant_kek_id),
+						stats_format_version,
+						stats_block_len,
+						stats_block_hash128,
+						tombstone_metadata,
+						supersession_metadata,
+					};
+					if let Err(error) = committer.commit_tier_slab(tier).await {
+						if !self
+							.tier_pointer(slab_id)
+							.await
+							.is_some_and(|pointer| pointer.l2_uri == new_uri)
+						{
+							let _ =
+								Self::delete_l2_object_if_present(object_store.as_ref(), &new_uri)
+									.await;
+						}
+						return Err(error);
+					}
+					if old_l2_uri != new_uri {
+						if let Err(error) =
+							Self::delete_l2_object_if_present(object_store.as_ref(), &old_l2_uri)
+								.await
+						{
+							tracing::warn!(
+								slab_id = slab_id.get(),
+								l2_uri = %old_l2_uri,
+								error = %error,
+								"table drop tiered rewrite committed but old object cleanup failed"
+							);
+						} else {
+							self.clear_retired_tiered_cleanup(slab_id);
+						}
+					} else {
+						self.clear_retired_tiered_cleanup(slab_id);
+					}
+					report.compacted_slabs += 1;
+					report.reclaimed_records =
+						report.reclaimed_records.saturating_add(reclaimed_records);
+					report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(reclaimed_bytes);
+				}
+				PreparedTieredTableDropRewrite::Retire {
+					slab_id,
+					old_l2_uri,
+					reclaimed_records,
+					reclaimed_bytes,
+				} => {
+					committer.retire_tiered_slab(slab_id).await?;
+					if let Err(error) =
+						Self::delete_l2_object_if_present(object_store.as_ref(), &old_l2_uri).await
+					{
+						tracing::warn!(
+							slab_id = slab_id.get(),
+							l2_uri = %old_l2_uri,
+							error = %error,
+							"table drop tiered retirement committed but old object cleanup failed"
+						);
+					} else {
+						self.clear_retired_tiered_cleanup(slab_id);
+					}
+					report.compacted_slabs += 1;
+					report.reclaimed_records =
+						report.reclaimed_records.saturating_add(reclaimed_records);
+					report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(reclaimed_bytes);
+				}
+			}
+		}
+		Ok(report)
+	}
+
+	fn table_drop_rewritten_key(&self, slab_id: SlabId) -> String {
+		format!(
+			"table_drop/slab_{:016x}_{}.wnd",
+			slab_id,
+			uuid::Uuid::new_v4().simple()
+		)
+	}
+
+	async fn delete_l2_object_if_present(
+		object_store: &dyn ObjectStore,
+		uri: &str,
+	) -> std::io::Result<()> {
+		match object_store.delete(uri).await {
+			Ok(()) => Ok(()),
+			Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+			Err(error) => Err(error),
+		}
+	}
+
 	pub async fn recluster_sealed_table_layout(
 		&self,
 		tenant_id: TenantId,
@@ -7323,11 +7573,172 @@ impl SlabManager {
 		}))
 	}
 
+	pub(crate) async fn prepare_tiered_table_drop_rewrite(
+		&self,
+		pointer: &TieredSlabPointer,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		table_schemas: &TableSchemaCatalogV1,
+	) -> std::io::Result<Option<PreparedTieredTableDropRewrite>> {
+		let old_blob = self
+			.config
+			.l2
+			.clone()
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					format!(
+						"cannot rewrite tiered slab {} without an L2 object store",
+						pointer.slab_id
+					),
+				)
+			})?
+			.get(&pointer.l2_uri)
+			.await?;
+		validate_tiered_blob(pointer, &old_blob)?;
+		let plaintext = Zeroizing::new(decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			&old_blob,
+		)?);
+		let mut records = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
+			.into_iter()
+			.map(|entry| CompactionRecord {
+				tenant_id: entry.tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: self.recovered_entry_routing_locality(&entry),
+				old_location: entry.location,
+				reclaim: false,
+				retention_ambiguous: false,
+				retention_lag_seconds: 0,
+			})
+			.collect::<Vec<_>>();
+		self.mark_records_for_table_drop_from_blob(
+			&plaintext,
+			&mut records,
+			tenant_id,
+			descriptor,
+		)?;
+		records.sort_by_key(|record| record.old_location.offset);
+		let physical_groups = physical_compaction_groups(&records);
+		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();
+		let survivors = records.iter().filter(|record| !record.reclaim).count();
+		if reclaimed_records == 0 {
+			return Ok(None);
+		}
+		if survivors == 0 {
+			return Ok(Some(PreparedTieredTableDropRewrite::Retire {
+				slab_id: pointer.slab_id,
+				old_l2_uri: pointer.l2_uri.clone(),
+				reclaimed_records,
+				reclaimed_bytes: old_blob.len() as u64,
+			}));
+		}
+
+		let tmp_path = table_drop_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let mut multirow_recompact_count = 0_u64;
+		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
+			let rewritten = Arc::new(
+				LocalSlabStore::open(
+					&tmp_path,
+					pointer.slab_id,
+					self.file_ops.clone(),
+					self.config.group_commit.clone(),
+				)
+				.await?,
+			);
+			for group in physical_groups.values() {
+				let Some(first) = group.first().copied() else {
+					continue;
+				};
+				let frame =
+					Zeroizing::new(extract_record_from_blob(&plaintext, first.old_location)?);
+				let Some(compacted) = compact_physical_record_frame(
+					frame.as_ref(),
+					group,
+					Some(table_schemas),
+					&self.config.row_group_writer,
+					&self.config.encoding_writer,
+					&self.config.l2_chunk_layout,
+				)?
+				else {
+					continue;
+				};
+				if compacted.was_multirow {
+					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
+				}
+				rewritten
+					.append(
+						compacted.tenant_id,
+						compacted.key_identity,
+						compacted.hlc,
+						&compacted.frame,
+					)
+					.await?;
+			}
+			rewritten.fsync().await?;
+			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
+		}
+		.await;
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let rewritten_plaintext = rewrite_result?;
+		if multirow_recompact_count > 0 {
+			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
+		}
+		let encrypted = self.encrypt_tiered_object_blob_with_table_stats(
+			pointer.slab_id,
+			rewritten_plaintext.as_ref(),
+			table_schemas,
+		)?;
+		let row_tombstone_metadata =
+			row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref(), pointer.slab_id)?;
+		Ok(Some(PreparedTieredTableDropRewrite::Rewrite {
+			slab_id: pointer.slab_id,
+			old_l2_uri: pointer.l2_uri.clone(),
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
+			tombstone_metadata: merge_row_tombstone_metadata(
+				pointer.tombstone_metadata,
+				row_tombstone_metadata,
+			),
+			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
+			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
+			reclaimed_records,
+			encrypted_bytes: encrypted.bytes,
+		}))
+	}
+
 	async fn reserve_slab_id(&self) -> SlabId {
 		let mut state = self.state.lock().await;
 		let next_id = state.next_slab_id;
 		state.next_slab_id = state.next_slab_id.saturating_add(1);
 		next_id
+	}
+
+	async fn seal_active_for_table_drop_reclaim(&self) -> std::io::Result<Option<SlabId>> {
+		let mut state = self.state.lock().await;
+		if state.active.write_cursor() == 0 {
+			return Ok(None);
+		}
+		state.active.fsync().await?;
+		let sealed = state.active.clone();
+		let sealed_id = sealed.slab_id();
+		let sealed_size = sealed.write_cursor();
+		let next_id = state.next_slab_id;
+		let next = Arc::new(
+			LocalSlabStore::open(
+				slab_path(&self.config.dir, next_id),
+				next_id,
+				self.file_ops.clone(),
+				self.config.group_commit.clone(),
+			)
+			.await?,
+		);
+		state.active = next;
+		state.sealed.insert(sealed_id, sealed);
+		state.next_slab_id = next_id.saturating_add(1);
+		self.record_l0_compaction_run(sealed_id, sealed_size);
+		Ok(Some(sealed_id))
 	}
 
 	async fn compact_one_sealed_slab(
@@ -7367,6 +7778,52 @@ impl SlabManager {
 			.await
 	}
 
+	async fn reclaim_one_sealed_table_drop_slab(
+		&self,
+		slab_id: SlabId,
+		slab: Arc<LocalSlabStore>,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		table_schemas: &TableSchemaCatalogV1,
+		secondary_indexes: &SecondaryIndexCatalog,
+	) -> std::io::Result<Option<CompactionOutcome>> {
+		let mut records: Vec<CompactionRecord> = slab
+			.index
+			.iter()
+			.flat_map(|entry| {
+				let (record_tenant_id, key_identity) = *entry.key();
+				let routing_locality =
+					self.routing_locality_for_key(record_tenant_id, key_identity);
+				entry
+					.value()
+					.iter()
+					.map(move |loc| CompactionRecord {
+						tenant_id: record_tenant_id,
+						key_identity,
+						routing_locality,
+						old_location: *loc,
+						reclaim: false,
+						retention_ambiguous: false,
+						retention_lag_seconds: 0,
+					})
+					.collect::<Vec<_>>()
+			})
+			.collect();
+		self.mark_records_for_table_drop(&slab, &mut records, tenant_id, descriptor)
+			.await?;
+		records.sort_by_key(|record| record.old_location.offset);
+		self.compact_sealed_slab_records(
+			slab_id,
+			slab,
+			&records,
+			Some(SecondaryIndexCompactionContext {
+				table_schemas,
+				secondary_indexes,
+			}),
+		)
+		.await
+	}
+
 	async fn prune_one_sealed_slab(
 		&self,
 		slab_id: SlabId,
@@ -7404,6 +7861,99 @@ impl SlabManager {
 
 		self.compact_sealed_slab_records(slab_id, slab, &records, None)
 			.await
+	}
+
+	async fn mark_records_for_table_drop(
+		&self,
+		slab: &Arc<LocalSlabStore>,
+		records: &mut [CompactionRecord],
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+	) -> std::io::Result<()> {
+		if records.is_empty() {
+			return Ok(());
+		}
+		let groups = physical_compaction_group_indices(records);
+		for indices in groups.values() {
+			let Some(first_idx) = indices.first().copied() else {
+				continue;
+			};
+			let frame = slab.read(records[first_idx].old_location).await?;
+			self.mark_record_group_for_table_drop(&frame, indices, records, tenant_id, descriptor)?;
+		}
+		Ok(())
+	}
+
+	fn mark_records_for_table_drop_from_blob(
+		&self,
+		plaintext: &[u8],
+		records: &mut [CompactionRecord],
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+	) -> std::io::Result<()> {
+		if records.is_empty() {
+			return Ok(());
+		}
+		let groups = physical_compaction_group_indices(records);
+		for indices in groups.values() {
+			let Some(first_idx) = indices.first().copied() else {
+				continue;
+			};
+			let frame = extract_record_from_blob(plaintext, records[first_idx].old_location)?;
+			self.mark_record_group_for_table_drop(&frame, indices, records, tenant_id, descriptor)?;
+		}
+		Ok(())
+	}
+
+	fn mark_record_group_for_table_drop(
+		&self,
+		frame: &[u8],
+		indices: &[usize],
+		records: &mut [CompactionRecord],
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+	) -> std::io::Result<()> {
+		if storage_multirow_index_entries_from_frame(frame)?.is_some() {
+			let batch = decode_record_batch(frame)?;
+			for idx in indices {
+				let record = records[*idx];
+				if record.tenant_id != tenant_id {
+					continue;
+				}
+				let stored_table_object_id =
+					storage_row_table_object_id_at(&batch, record.old_location.record_row_index)?;
+				if stored_table_object_id == Some(descriptor.table_object_id) {
+					records[*idx].reclaim = true;
+				}
+			}
+			return Ok(());
+		}
+
+		let Ok(batch) = decode_record_batch(frame) else {
+			return Ok(());
+		};
+		for idx in indices {
+			let record = records[*idx];
+			if record.tenant_id != tenant_id {
+				continue;
+			}
+			let Ok(row) =
+				materialize_record_location_batch(&batch, record.old_location.record_row_index)
+			else {
+				continue;
+			};
+			if descriptor_matches_tiered_row(
+				descriptor,
+				record.tenant_id,
+				record.key_identity,
+				record.routing_locality,
+				None,
+				&row,
+			)? {
+				records[*idx].reclaim = true;
+			}
+		}
+		Ok(())
 	}
 
 	async fn prune_one_sealed_slab_for_retention(
@@ -13812,6 +14362,23 @@ fn retention_rewrite_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd.retention.tmp", slab_id))
 }
 
+fn table_drop_rewrite_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
+	dir.join(format!("slab_{:016x}.wnd.table_drop.tmp", slab_id))
+}
+
+fn stats_advisory_fields(
+	locator: Option<crate::crypto::TieredStatsBlockLocator>,
+) -> (Option<u16>, Option<u32>, Option<[u8; 16]>) {
+	match locator {
+		Some(locator) => (
+			Some(locator.stats_format_version),
+			Some(locator.stats_block_len),
+			Some(locator.stats_block_hash128),
+		),
+		None => (None, None, None),
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LsmSourceFrameKey {
 	slab_id: SlabId,
@@ -14648,12 +15215,19 @@ mod tests {
 	}
 
 	fn append_only_retention_descriptor(table_object_id: TableObjectId) -> TableSchemaDescriptor {
+		append_only_retention_descriptor_named(table_object_id, "append_events")
+	}
+
+	fn append_only_retention_descriptor_named(
+		table_object_id: TableObjectId,
+		table_name: &str,
+	) -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![Field::new("value", DataType::UInt64, false)]);
 		TableSchemaDescriptor::new_with_layout(
 			table_object_id,
 			1,
 			"analytics",
-			"append_events",
+			table_name,
 			&schema,
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
@@ -14820,6 +15394,35 @@ mod tests {
 				.apply_lsm_manifest_compaction_commit(&commit)
 				.map(|_| ())
 				.map_err(Error::other)
+		}
+	}
+
+	struct DirectTierCommitter {
+		manager: Arc<SlabManager>,
+	}
+
+	#[async_trait]
+	impl TierCommitter for DirectTierCommitter {
+		async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+			self.manager
+				.apply_tier_slab(TieredSlabPointer {
+					slab_id: tier.slab_id,
+					l2_uri: tier.l2_uri,
+					payload_hash: tier.payload_hash,
+					is_encrypted: tier.is_encrypted,
+					tenant_id: tier.tenant_id,
+					tenant_kek_id: tier.tenant_kek_id,
+					stats_format_version: tier.stats_format_version,
+					stats_block_len: tier.stats_block_len,
+					stats_block_hash128: tier.stats_block_hash128,
+					tombstone_metadata: tier.tombstone_metadata,
+					supersession_metadata: tier.supersession_metadata,
+				})
+				.await
+		}
+
+		async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+			self.manager.retire_tiered_slab(slab_id).await.map(|_| ())
 		}
 	}
 
@@ -16930,6 +17533,164 @@ mod tests {
 				.unwrap(),
 			b"new-a"
 		);
+	}
+
+	#[tokio::test]
+	async fn table_drop_reclaim_removes_target_table_rows() {
+		let mgr = fresh_manager().await;
+		let target = append_only_retention_descriptor(TableObjectId::new([0x39; 16]));
+		let other =
+			append_only_retention_descriptor_named(TableObjectId::new([0x40; 16]), "other_events");
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), target.clone()).unwrap();
+		schemas.upsert(tenant(), other.clone()).unwrap();
+
+		let target_key_a = id(0x391);
+		let target_key_b = id(0x392);
+		let other_key = id(0x401);
+		let target_frame = encode_test_append_only_storage_frame(
+			target.table_object_id,
+			&[
+				(target_key_a, Locality::new(10), hlc(10), 100, false),
+				(target_key_b, Locality::new(11), hlc(11), 200, false),
+			],
+		);
+		let target_entries = storage_multirow_index_entries_from_frame(&target_frame)
+			.unwrap()
+			.expect("target table entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &target_frame, &target_entries)
+			.await
+			.unwrap();
+		let other_frame = encode_test_append_only_storage_frame(
+			other.table_object_id,
+			&[(other_key, Locality::new(20), hlc(20), 300, false)],
+		);
+		let other_entries = storage_multirow_index_entries_from_frame(&other_frame)
+			.unwrap()
+			.expect("other table entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &other_frame, &other_entries)
+			.await
+			.unwrap();
+
+		let report = mgr
+			.reclaim_table_drop_storage(
+				tenant(),
+				&target,
+				&schemas,
+				&SecondaryIndexCatalog::default(),
+				usize::MAX,
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.reclaimed_records, 2);
+		assert!(mgr.lookup(tenant(), target_key_a).is_none());
+		assert!(mgr.lookup(tenant(), target_key_b).is_none());
+		assert!(mgr.lookup(tenant(), other_key).is_some());
+	}
+
+	#[tokio::test]
+	async fn table_drop_reclaim_rewrites_tiered_target_rows() {
+		let l1_dir = fresh_dir("drop-reclaim-l1");
+		let l2_root = fresh_dir("drop-reclaim-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let target = append_only_retention_descriptor(TableObjectId::new([0x41; 16]));
+		let other =
+			append_only_retention_descriptor_named(TableObjectId::new([0x42; 16]), "tier_other");
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), target.clone()).unwrap();
+		schemas.upsert(tenant(), other.clone()).unwrap();
+
+		let target_key_a = id(0x411);
+		let target_key_b = id(0x412);
+		let other_key = id(0x421);
+		let target_frame = encode_test_append_only_storage_frame(
+			target.table_object_id,
+			&[
+				(target_key_a, Locality::new(30), hlc(30), 100, false),
+				(target_key_b, Locality::new(31), hlc(31), 200, false),
+			],
+		);
+		let target_entries = storage_multirow_index_entries_from_frame(&target_frame)
+			.unwrap()
+			.expect("target table entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &target_frame, &target_entries)
+			.await
+			.unwrap();
+		let other_frame = encode_test_append_only_storage_frame(
+			other.table_object_id,
+			&[(other_key, Locality::new(40), hlc(40), 300, false)],
+		);
+		let other_entries = storage_multirow_index_entries_from_frame(&other_frame)
+			.unwrap()
+			.expect("other table entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &other_frame, &other_entries)
+			.await
+			.unwrap();
+
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let old_encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let old_uri = l2
+			.put(
+				&format!("tier/drop_reclaim_{slab_id:016x}.wnd"),
+				&old_encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: old_uri.clone(),
+			payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_encrypted.tenant_kek_id),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(old_pointer).await.unwrap();
+
+		let committer = DirectTierCommitter {
+			manager: mgr.clone(),
+		};
+		let report = mgr
+			.reclaim_table_drop_tiered_storage(tenant(), &target, &schemas, &committer, usize::MAX)
+			.await
+			.unwrap();
+
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.reclaimed_records, 2);
+		assert!(mgr.lookup(tenant(), target_key_a).is_none());
+		assert!(mgr.lookup(tenant(), target_key_b).is_none());
+		assert!(mgr.lookup(tenant(), other_key).is_some());
+		let rewritten = mgr.tier_pointer(slab_id).await.expect("rewritten pointer");
+		assert_ne!(rewritten.l2_uri, old_uri);
+		assert!(l2.get(&old_uri).await.is_err());
 	}
 
 	#[tokio::test]

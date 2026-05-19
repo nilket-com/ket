@@ -350,6 +350,7 @@ async fn execute_catalog_plan(
 					tenant_id: context.tenant_id,
 					table_id: binding.legacy_table_id,
 					table_object_id: binding.table,
+					schema_generation: binding.schema_generation,
 					physical_descriptor_fingerprint: binding.fingerprint,
 					profile_hint: context.profile_hint,
 					trace_context: context.trace_context,

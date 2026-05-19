@@ -607,6 +607,8 @@ impl MsgType {
 	pub const SCHEMA_UPDATE_RESP: Self = Self(0x2F);
 	pub const REVOCATION_ADMIN_REQ: Self = Self(0x30);
 	pub const REVOCATION_ADMIN_RESP: Self = Self(0x31);
+	pub const SCHEMA_DROP_REQ: Self = Self(0x3A);
+	pub const SCHEMA_DROP_RESP: Self = Self(0x3B);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);

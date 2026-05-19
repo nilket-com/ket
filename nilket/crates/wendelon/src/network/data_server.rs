@@ -5846,6 +5846,16 @@ impl WendelonDataServer {
 			}
 		}
 		let sm_peek = self.state_machine.state_snapshot().await;
+		if sm_peek
+			.table_drop_fences
+			.is_fenced(meta.tenant_id, meta.table_object_id)
+		{
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::QUERY_INVALID_PROGRAM,
+				self.local_node,
+			));
+		}
 		let Some(descriptor) = sm_peek
 			.table_schemas
 			.get(meta.tenant_id, meta.table_object_id, meta.schema_generation)
@@ -6355,6 +6365,12 @@ impl WendelonDataServer {
 		};
 
 		let sm_peek = self.state_machine.state_snapshot().await;
+		if sm_peek
+			.table_drop_fences
+			.is_fenced(request.tenant_id, request.table_object_id)
+		{
+			return Ok(Err(AggRejectCode::SchemaUnknown));
+		}
 		let descriptor = match sm_peek.table_schemas.get(
 			request.tenant_id,
 			request.table_object_id,
@@ -7539,19 +7555,28 @@ impl WendelonDataServer {
 			}
 		};
 		let requested_logical_schema_fingerprint = req.decoded_logical_schema_fingerprint();
-		let (descriptor, effective_retention) = {
+		let (descriptor, drop_fenced, effective_retention) = {
 			let state = self.state_machine.state_snapshot().await;
 			let descriptor = state
 				.table_schemas
 				.latest_by_id(req.tenant_id, req.table_object_id)
 				.cloned();
+			let drop_fenced = state
+				.table_drop_fences
+				.is_fenced(req.tenant_id, req.table_object_id);
 			let retention = self.table_effective_retention_from_state(
 				&state,
 				req.tenant_id,
 				req.table_object_id,
 			);
-			(descriptor, retention)
+			(descriptor, drop_fenced, retention)
 		};
+		if drop_fenced {
+			let reject = CdcRejectMeta::new(subscription_id, CdcRejectCode::UnknownTable);
+			cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+			stream.finish().await?;
+			return Ok(());
+		}
 		let Some(descriptor) = descriptor else {
 			let reject = CdcRejectMeta::new(subscription_id, CdcRejectCode::UnknownTable);
 			cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
@@ -9405,13 +9430,16 @@ impl WendelonDataServer {
 			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 		}
 
-		let (descriptor, effective_retention, secondary_index_descriptors) = {
+		let (descriptor, drop_fenced, effective_retention, secondary_index_descriptors) = {
 			let state = self.state_machine.state_snapshot().await;
 			let effective_retention = self.table_effective_retention_from_state(
 				&state,
 				meta.tenant_id,
 				meta.table_object_id,
 			);
+			let drop_fenced = state
+				.table_drop_fences
+				.is_fenced(meta.tenant_id, meta.table_object_id);
 			let descriptor = state
 				.table_schemas
 				.latest_by_id(meta.tenant_id, meta.table_object_id)
@@ -9426,8 +9454,23 @@ impl WendelonDataServer {
 					)
 				})
 				.unwrap_or_default();
-			(descriptor, effective_retention, secondary_index_descriptors)
+			(
+				descriptor,
+				drop_fenced,
+				effective_retention,
+				secondary_index_descriptors,
+			)
 		};
+		if drop_fenced {
+			return Ok((
+				self.table_write_error_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+				),
+				None,
+			));
+		}
 		let Some(descriptor) = descriptor else {
 			return Ok((
 				self.table_write_error_response(
@@ -9824,19 +9867,32 @@ impl WendelonDataServer {
 			));
 		}
 
-		let (descriptor, effective_retention) = {
+		let (descriptor, drop_fenced, effective_retention) = {
 			let state = self.state_machine.state_snapshot().await;
 			let effective_retention = self.table_effective_retention_from_state(
 				&state,
 				meta.tenant_id,
 				meta.table_object_id,
 			);
+			let drop_fenced = state
+				.table_drop_fences
+				.is_fenced(meta.tenant_id, meta.table_object_id);
 			let descriptor = state
 				.table_schemas
 				.latest_by_id(meta.tenant_id, meta.table_object_id)
 				.cloned();
-			(descriptor, effective_retention)
+			(descriptor, drop_fenced, effective_retention)
 		};
+		if drop_fenced {
+			return Ok((
+				self.table_delete_error_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+				),
+				None,
+			));
+		}
 		let Some(descriptor) = descriptor else {
 			return Ok((
 				self.table_delete_error_response(

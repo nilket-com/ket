@@ -8,7 +8,7 @@ use crate::network::cert_issuance_policy::{
 	CertIssuancePolicy, CertIssueRequest, PreparedCertIssue, QUERY_SESSION_CERT_MAX_TTL,
 };
 use crate::network::tls::{ACTOR_CLAIMS_OID_DOTTED, ActorIdentity, ActorRole};
-use crate::schema::{ReadStatus, TenantId, WriteStatus};
+use crate::schema::{IndexObjectId, ReadStatus, TableObjectId, TenantId, WriteStatus};
 use serde::{Deserialize, Serialize};
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
@@ -122,6 +122,66 @@ impl From<SchemaGeneration> for u64 {
 	fn from(value: SchemaGeneration) -> Self {
 		value.0
 	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DropOperationId {
+	pub tenant_id: TenantId,
+	pub table_object_id: TableObjectId,
+	pub schema_generation: SchemaGeneration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TableSchemaDropRequest {
+	V1 {
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		expected_generation: SchemaGeneration,
+		operation_id: DropOperationId,
+	},
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableSchemaDropFields {
+	pub tenant_id: TenantId,
+	pub table_object_id: TableObjectId,
+	pub expected_generation: SchemaGeneration,
+	pub operation_id: DropOperationId,
+}
+
+impl TableSchemaDropRequest {
+	pub fn current(fields: TableSchemaDropFields) -> Self {
+		Self::V1 {
+			tenant_id: fields.tenant_id,
+			table_object_id: fields.table_object_id,
+			expected_generation: fields.expected_generation,
+			operation_id: fields.operation_id,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WendelonAdminError {
+	TableMissing {
+		table_object_id: TableObjectId,
+	},
+	GenerationMismatch {
+		expected: SchemaGeneration,
+		committed: SchemaGeneration,
+	},
+	TableAlreadyDropping {
+		table_object_id: TableObjectId,
+		existing_operation_id: DropOperationId,
+	},
+	TableAlreadyDropped {
+		table_object_id: TableObjectId,
+	},
+	DependentIndexesPresent {
+		indexes: Vec<IndexObjectId>,
+	},
+	Transport {
+		message: String,
+	},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

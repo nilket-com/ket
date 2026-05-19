@@ -92,6 +92,7 @@ pub struct DropTableStorageRequest {
 	pub tenant_id: TenantId,
 	pub table_id: TableId,
 	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
 	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
@@ -382,6 +383,67 @@ impl StorageAdmin for InMemoryTableStorage {
 		}
 		tables.remove(&request.table_id);
 		Ok(DropTableStorageOutcome::new(1))
+	}
+}
+
+pub struct WendelonStorageAdmin {
+	client: Arc<wendelon_client::Client>,
+	registry: Arc<WendelonDescriptorRegistry>,
+}
+
+impl WendelonStorageAdmin {
+	pub fn new(
+		client: Arc<wendelon_client::Client>,
+		registry: Arc<WendelonDescriptorRegistry>,
+	) -> Self {
+		Self { client, registry }
+	}
+}
+
+#[async_trait::async_trait]
+impl StorageAdmin for WendelonStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
+		let operation_id = wendelon_client::DropOperationId {
+			tenant_id,
+			table_object_id: request.table_object_id,
+			schema_generation: wendelon_client::SchemaGeneration::new(request.schema_generation),
+		};
+		self.client
+			.drop_table_schema(wendelon_client::TableSchemaDropRequest::current(
+				wendelon_client::TableSchemaDropFields {
+					tenant_id,
+					table_object_id: request.table_object_id,
+					expected_generation: wendelon_client::SchemaGeneration::new(
+						request.schema_generation,
+					),
+					operation_id,
+				},
+			))
+			.await
+			.map_err(|error| map_wendelon_admin_error_to_storage(request.table_id, error))?;
+		self.registry
+			.mark_finalized_drop(request.table_id, operation_id)
+			.map_err(|error| StorageError::Internal {
+				message: error.to_string(),
+			})?;
+		Ok(DropTableStorageOutcome::new(1))
+	}
+}
+
+fn map_wendelon_admin_error_to_storage(
+	table_id: TableId,
+	error: wendelon_client::ClientError,
+) -> StorageError {
+	match error {
+		wendelon_client::ClientError::Admin(
+			wendelon_client::WendelonAdminError::TableMissing { .. }
+			| wendelon_client::WendelonAdminError::TableAlreadyDropped { .. },
+		) => StorageError::TableNotFound { table: table_id },
+		other => StorageError::from(other),
 	}
 }
 

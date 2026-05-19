@@ -1,4 +1,5 @@
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
+use crate::integration::compute::{DropOperationId, SchemaGeneration};
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId, PolicyGeneration,
@@ -72,6 +73,115 @@ pub struct TieredSlab {
 	/// short-circuit visibility.
 	#[serde(default)]
 	pub supersession_metadata: SupersessionMetadata,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TableDropPrepareRequest {
+	V1 {
+		operation_id: DropOperationId,
+		expected_generation: SchemaGeneration,
+	},
+}
+
+impl TableDropPrepareRequest {
+	pub fn current(operation_id: DropOperationId, expected_generation: SchemaGeneration) -> Self {
+		Self::V1 {
+			operation_id,
+			expected_generation,
+		}
+	}
+
+	pub fn operation_id(self) -> DropOperationId {
+		match self {
+			Self::V1 { operation_id, .. } => operation_id,
+		}
+	}
+
+	pub fn expected_generation(self) -> SchemaGeneration {
+		match self {
+			Self::V1 {
+				expected_generation,
+				..
+			} => expected_generation,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TableReclaimCompletionRequest {
+	V1 {
+		operation_id: DropOperationId,
+		fence_log_index: u64,
+	},
+}
+
+impl TableReclaimCompletionRequest {
+	pub fn current(operation_id: DropOperationId, fence_log_index: u64) -> Self {
+		Self::V1 {
+			operation_id,
+			fence_log_index,
+		}
+	}
+
+	pub fn operation_id(self) -> DropOperationId {
+		match self {
+			Self::V1 { operation_id, .. } => operation_id,
+		}
+	}
+
+	pub fn fence_log_index(self) -> u64 {
+		match self {
+			Self::V1 {
+				fence_log_index, ..
+			} => fence_log_index,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TableDropFinalizeRequest {
+	V1 {
+		operation_id: DropOperationId,
+		fence_log_index: u64,
+		reclaim_completion_log_index: u64,
+	},
+}
+
+impl TableDropFinalizeRequest {
+	pub fn current(
+		operation_id: DropOperationId,
+		fence_log_index: u64,
+		reclaim_completion_log_index: u64,
+	) -> Self {
+		Self::V1 {
+			operation_id,
+			fence_log_index,
+			reclaim_completion_log_index,
+		}
+	}
+
+	pub fn operation_id(self) -> DropOperationId {
+		match self {
+			Self::V1 { operation_id, .. } => operation_id,
+		}
+	}
+
+	pub fn fence_log_index(self) -> u64 {
+		match self {
+			Self::V1 {
+				fence_log_index, ..
+			} => fence_log_index,
+		}
+	}
+
+	pub fn reclaim_completion_log_index(self) -> u64 {
+		match self {
+			Self::V1 {
+				reclaim_completion_log_index,
+				..
+			} => reclaim_completion_log_index,
+		}
+	}
 }
 
 /// Payload of a `RetireTieredSlab` Raft entry.
@@ -408,6 +518,12 @@ pub enum WendelonRequest {
 	/// engine mutation surface. User-facing policy syntax is resolved
 	/// by client tools before this request is submitted.
 	SetTableRetentionPolicy(SetTableRetentionPolicy),
+	/// ADR 039 Wendelon-internal DROP prepare/fence stage.
+	TableDropPrepare(TableDropPrepareRequest),
+	/// ADR 039 Wendelon-internal DROP reclaim-completion stage.
+	TableReclaimCompletion(TableReclaimCompletionRequest),
+	/// ADR 039 Wendelon-internal DROP finalize stage.
+	TableDropFinalize(TableDropFinalizeRequest),
 }
 
 /// The response returned to the client after a Raft command is committed.

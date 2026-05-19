@@ -41,6 +41,82 @@ fn has_rust_identifier(identifiers: &[String], ident: &str) -> bool {
 }
 
 #[test]
+fn test_adr039_wendelon_drop_migration_substrate_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let compute = fs::read_to_string(manifest_dir.join("src/integration/compute.rs")).unwrap();
+	let consensus_core = fs::read_to_string(manifest_dir.join("src/consensus/core.rs")).unwrap();
+	let raft_storage =
+		fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let control_server =
+		fs::read_to_string(manifest_dir.join("src/network/control_server.rs")).unwrap();
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let storage_manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let table_schema = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	let lifecycle = fs::read_to_string(manifest_dir.join("src/schema/lifecycle.rs")).unwrap();
+
+	assert!(compute.contains("pub enum TableSchemaDropRequest"));
+	assert!(compute.contains("pub struct DropOperationId"));
+	assert!(compute.contains("pub tenant_id: TenantId"));
+	assert!(compute.contains("pub table_object_id: TableObjectId"));
+	assert!(compute.contains("pub schema_generation: SchemaGeneration"));
+	assert!(!compute.contains("TableSchemaDropRequestV1"));
+	assert!(!compute.contains("query_id"));
+
+	assert!(consensus_core.contains("pub enum TableDropPrepareRequest"));
+	assert!(consensus_core.contains("pub enum TableReclaimCompletionRequest"));
+	assert!(consensus_core.contains("pub enum TableDropFinalizeRequest"));
+	assert!(consensus_core.contains("TableDropPrepare(TableDropPrepareRequest)"));
+	assert!(consensus_core.contains("TableReclaimCompletion(TableReclaimCompletionRequest)"));
+	assert!(consensus_core.contains("TableDropFinalize(TableDropFinalizeRequest)"));
+
+	assert!(raft_storage.contains("pub table_drop_fences: TableDropFenceCatalog"));
+	assert!(raft_storage.contains("apply_request_at_log_index"));
+	assert!(raft_storage.contains("apply_table_drop_prepare"));
+	assert!(raft_storage.contains("apply_table_reclaim_completion"));
+	assert!(raft_storage.contains("apply_table_drop_finalize"));
+	assert!(raft_storage.contains("entry.log_id.index"));
+	assert!(
+		raft_storage.contains("table schema update rejected because table drop is in progress")
+	);
+	assert!(
+		raft_storage.contains("secondary index create rejected because table drop is in progress")
+	);
+	assert!(
+		raft_storage
+			.contains("table retention policy update rejected because table drop is in progress")
+	);
+	assert!(table_schema.contains("pub fn unbind_latest_name"));
+	assert!(lifecycle.contains("pub struct TableDropFenceCatalog"));
+	let drop_fence_block = lifecycle
+		.split_once("pub struct TableDropFenceCatalog")
+		.and_then(|(_, rest)| rest.split_once("pub struct TableLifecyclePolicyCounts"))
+		.map(|(block, _)| block)
+		.expect("drop fence definitions");
+	assert!(!drop_fence_block.contains("TableRetentionPolicy"));
+
+	assert!(control_server.contains("SCHEMA_DROP_REQ"));
+	assert!(control_server.contains("SCHEMA_DROP_RESP"));
+	assert!(control_server.contains("run_table_schema_drop"));
+	assert!(control_server.contains("drive_table_drop_physical_reclaim"));
+	assert!(control_server.contains(".reclaim_table_drop_storage("));
+	assert!(control_server.contains(".reclaim_table_drop_tiered_storage("));
+	assert!(control_server.contains("RaftCommitter::new"));
+	assert!(control_server.contains("WendelonAdminError"));
+	assert!(control_server.contains("TableSchemaDropResponseWire"));
+	assert!(control_server.contains("with_storage_manager"));
+	assert!(storage_manager.contains("pub struct TableDropReclaimReport"));
+	assert!(storage_manager.contains("pub async fn reclaim_table_drop_storage"));
+	assert!(storage_manager.contains("pub async fn reclaim_table_drop_tiered_storage"));
+	assert!(storage_manager.contains("prepare_tiered_table_drop_rewrite"));
+	assert!(storage_manager.contains("PreparedTieredTableDropRewrite"));
+	assert!(storage_manager.contains("mark_record_group_for_table_drop"));
+	assert!(node.contains(".with_storage_manager(slab.clone())"));
+	assert!(data_server.matches("table_drop_fences").count() >= 5);
+	assert!(data_server.matches(".is_fenced(").count() >= 5);
+}
+
+#[test]
 fn test_adr055_lsm_compaction_substrate_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();

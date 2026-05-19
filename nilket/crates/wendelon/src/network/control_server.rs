@@ -11,12 +11,16 @@ use crate::audit::{AuditChainHead, AuditSink};
 use crate::client::topology::{ClusterPeerWire, ClusterStatusWire};
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, EpochPeer, MigrationLedgerEntry, MigrationState,
-	RevokeActorKey, SeedMigration, TenantLifecycleState, TenantRecord, UpdateTenantQuota,
+	RevokeActorKey, SeedMigration, TableDropFinalizeRequest, TableDropPrepareRequest,
+	TableReclaimCompletionRequest, TenantLifecycleState, TenantRecord, UpdateTenantQuota,
 	WendelonRaft, WendelonRequest, WendelonResponse,
 };
 use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
-use crate::integration::compute::{SchemaMutationKindV1, decode_schema_update_envelope_v1};
+use crate::integration::compute::{
+	SchemaMutationKindV1, TableSchemaDropRequest, WendelonAdminError,
+	decode_schema_update_envelope_v1,
+};
 use crate::metrics::{TableRetentionMetricPolicy, global as metrics};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
@@ -42,6 +46,7 @@ use crate::schema::{
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
+use crate::storage::{RaftCommitter, manager::SlabManager};
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
@@ -76,6 +81,7 @@ enum ControlOperation {
 	AdvanceEpoch,
 	Join,
 	SchemaUpdate,
+	SchemaDrop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +132,17 @@ pub struct SchemaUpdateResponseWire {
 	pub accepted: bool,
 	pub reason_code: u8,
 	pub leader_hint: Option<u32>,
+	#[serde(default)]
+	pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSchemaDropResponseWire {
+	pub accepted: bool,
+	pub reason_code: u8,
+	pub leader_hint: Option<u32>,
+	#[serde(default)]
+	pub admin_error: Option<WendelonAdminError>,
 	#[serde(default)]
 	pub message: Option<String>,
 }
@@ -248,6 +265,7 @@ pub struct WendelonControlServer {
 	audit_sink: Arc<dyn AuditSink>,
 	lease_authority: Arc<LeaseAuthority>,
 	transfer_authority: Arc<TransferAuthority>,
+	storage_manager: Option<Arc<SlabManager>>,
 	protocol: ProtocolVersionWindow,
 	reconcile_lock: Mutex<()>,
 }
@@ -280,6 +298,7 @@ impl WendelonControlServer {
 			audit_sink,
 			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
 			transfer_authority: Arc::new(TransferAuthority::dev_single_node(local_node)),
+			storage_manager: None,
 			protocol: ProtocolVersionWindow::default(),
 			reconcile_lock: Mutex::new(()),
 		}
@@ -297,6 +316,11 @@ impl WendelonControlServer {
 
 	pub fn with_transfer_authority(mut self, authority: Arc<TransferAuthority>) -> Self {
 		self.transfer_authority = authority;
+		self
+	}
+
+	pub fn with_storage_manager(mut self, storage_manager: Arc<SlabManager>) -> Self {
+		self.storage_manager = Some(storage_manager);
 		self
 	}
 
@@ -323,7 +347,9 @@ impl WendelonControlServer {
 			| ControlOperation::Transfer
 			| ControlOperation::AdvanceEpoch
 			| ControlOperation::Join => ActorPermission::ClusterControl,
-			ControlOperation::SchemaUpdate => ActorPermission::TenantAdminMutation,
+			ControlOperation::SchemaUpdate | ControlOperation::SchemaDrop => {
+				ActorPermission::TenantAdminMutation
+			}
 		};
 		authorize_actor(&context.actor, permission).map_err(|error| {
 			Error::new(
@@ -402,6 +428,29 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn build_schema_drop_frame(
+		&self,
+		stream_id: u32,
+		resp: &TableSchemaDropResponseWire,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, resp)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::SCHEMA_DROP_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
 	fn tenant_admin_rejection(
 		&self,
 		frame: &HrftFrame,
@@ -455,6 +504,25 @@ impl WendelonControlServer {
 				reason_code,
 				leader_hint: leader_hint.map(|node| node.id),
 				message: Some(message.into()),
+			},
+		)
+	}
+
+	fn schema_drop_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		admin_error: WendelonAdminError,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		self.build_schema_drop_frame(
+			frame.header.stream_id,
+			&TableSchemaDropResponseWire {
+				accepted: false,
+				reason_code,
+				leader_hint: leader_hint.map(|node| node.id),
+				message: Some(format!("{admin_error:?}")),
+				admin_error: Some(admin_error),
 			},
 		)
 	}
@@ -585,6 +653,17 @@ impl WendelonControlServer {
 			CONTROL_REASON_INVALID_TARGET
 		} else {
 			CONTROL_REASON_INVALID_CONFIG
+		}
+	}
+
+	fn table_schema_drop_reason(error: &WendelonAdminError) -> u8 {
+		match error {
+			WendelonAdminError::TableMissing { .. }
+			| WendelonAdminError::TableAlreadyDropped { .. } => CONTROL_REASON_NOT_FOUND,
+			WendelonAdminError::GenerationMismatch { .. }
+			| WendelonAdminError::TableAlreadyDropping { .. }
+			| WendelonAdminError::DependentIndexesPresent { .. } => CONTROL_REASON_INVALID_TARGET,
+			WendelonAdminError::Transport { .. } => CONTROL_REASON_INTERNAL_ERROR,
 		}
 	}
 
@@ -941,6 +1020,251 @@ impl WendelonControlServer {
 				err.to_string(),
 				None,
 			),
+		}
+	}
+
+	async fn handle_schema_drop(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"SCHEMA_DROP_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		let request = match wire::decode::<TableSchemaDropRequest>(&frame.meta) {
+			Ok(request) => request,
+			Err(err) => {
+				return self.schema_drop_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					WendelonAdminError::Transport {
+						message: err.to_string(),
+					},
+					None,
+				);
+			}
+		};
+		let tenant_id = match request {
+			TableSchemaDropRequest::V1 { tenant_id, .. } => tenant_id,
+		};
+		if let Some(claimed_tenant) = context.actor.claimed_tenant_id()? {
+			if claimed_tenant != tenant_id {
+				return self.schema_drop_rejection(
+					&frame,
+					CONTROL_REASON_AUTHORIZATION_FAILED,
+					WendelonAdminError::Transport {
+						message: format!(
+							"actor tenant {} is not allowed to drop schema for tenant {}",
+							claimed_tenant.get(),
+							tenant_id.get()
+						),
+					},
+					None,
+				);
+			}
+		}
+		if !self.is_leader().await {
+			return self.schema_drop_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				WendelonAdminError::Transport {
+					message: "schema drops must be sent to the current leader".to_string(),
+				},
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+
+		match self.run_table_schema_drop(request).await {
+			Ok(()) => self.build_schema_drop_frame(
+				frame.header.stream_id,
+				&TableSchemaDropResponseWire {
+					accepted: true,
+					reason_code: CONTROL_REASON_GRANTED,
+					leader_hint: Some(self.local_node.id),
+					admin_error: None,
+					message: None,
+				},
+			),
+			Err(error) => self.schema_drop_rejection(
+				&frame,
+				Self::table_schema_drop_reason(&error),
+				error,
+				None,
+			),
+		}
+	}
+
+	async fn run_table_schema_drop(
+		&self,
+		request: TableSchemaDropRequest,
+	) -> Result<(), WendelonAdminError> {
+		let TableSchemaDropRequest::V1 {
+			tenant_id,
+			table_object_id,
+			expected_generation,
+			operation_id,
+		} = request;
+		if operation_id.tenant_id != tenant_id
+			|| operation_id.table_object_id != table_object_id
+			|| operation_id.schema_generation != expected_generation
+		{
+			return Err(WendelonAdminError::Transport {
+				message: "DROP operation_id must match request target".to_string(),
+			});
+		}
+
+		let snapshot = self.state_machine.state_snapshot().await;
+		let descriptor = snapshot
+			.table_schemas
+			.latest_by_id(tenant_id, table_object_id)
+			.ok_or(WendelonAdminError::TableMissing { table_object_id })?;
+		let descriptor = descriptor.clone();
+		if descriptor.schema_generation != expected_generation.get() {
+			return Err(WendelonAdminError::GenerationMismatch {
+				expected: expected_generation,
+				committed: crate::integration::compute::SchemaGeneration::new(
+					descriptor.schema_generation,
+				),
+			});
+		}
+		if !snapshot.table_schemas.is_latest_name_bound(
+			tenant_id,
+			&descriptor.namespace,
+			&descriptor.table_name,
+			table_object_id,
+			descriptor.schema_generation,
+		) {
+			return Err(WendelonAdminError::TableAlreadyDropped { table_object_id });
+		}
+		let dependent_indexes = snapshot
+			.secondary_indexes
+			.for_table(tenant_id, table_object_id)
+			.into_iter()
+			.map(|row| row.descriptor.index_object_id)
+			.collect::<Vec<_>>();
+		if !dependent_indexes.is_empty() {
+			return Err(WendelonAdminError::DependentIndexesPresent {
+				indexes: dependent_indexes,
+			});
+		}
+
+		let existing_fence = snapshot
+			.table_drop_fences
+			.get(tenant_id, table_object_id)
+			.copied();
+		let fence = if let Some(fence) = existing_fence {
+			if fence.operation_id != operation_id {
+				return Err(WendelonAdminError::TableAlreadyDropping {
+					table_object_id,
+					existing_operation_id: fence.operation_id,
+				});
+			}
+			fence
+		} else {
+			let log_index = self
+				.submit_table_drop_stage(WendelonRequest::TableDropPrepare(
+					TableDropPrepareRequest::current(operation_id, expected_generation),
+				))
+				.await?;
+			crate::schema::TableDropFence {
+				operation_id,
+				fence_log_index: log_index,
+				reclaim_completion_log_index: None,
+			}
+		};
+
+		self.drive_table_drop_physical_reclaim(tenant_id, &descriptor)
+			.await?;
+
+		let reclaim_completion_log_index =
+			if let Some(reclaim_completion_log_index) = fence.reclaim_completion_log_index {
+				reclaim_completion_log_index
+			} else {
+				self.submit_table_drop_stage(WendelonRequest::TableReclaimCompletion(
+					TableReclaimCompletionRequest::current(operation_id, fence.fence_log_index),
+				))
+				.await?
+			};
+
+		self.submit_table_drop_stage(WendelonRequest::TableDropFinalize(
+			TableDropFinalizeRequest::current(
+				operation_id,
+				fence.fence_log_index,
+				reclaim_completion_log_index,
+			),
+		))
+		.await?;
+		Ok(())
+	}
+
+	async fn drive_table_drop_physical_reclaim(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+	) -> Result<(), WendelonAdminError> {
+		let Some(storage_manager) = self.storage_manager.as_ref() else {
+			return Err(WendelonAdminError::Transport {
+				message: "schema drop requires a configured Wendelon storage manager".to_string(),
+			});
+		};
+		let snapshot = self.state_machine.state_snapshot().await;
+		storage_manager
+			.reclaim_tombstoned_ranges(&snapshot.tombstones, usize::MAX)
+			.await
+			.map_err(|err| WendelonAdminError::Transport {
+				message: format!("schema drop tombstone reclaim failed: {err}"),
+			})?;
+		storage_manager
+			.reclaim_table_drop_storage(
+				tenant_id,
+				descriptor,
+				&snapshot.table_schemas,
+				&snapshot.secondary_indexes,
+				usize::MAX,
+			)
+			.await
+			.map_err(|err| WendelonAdminError::Transport {
+				message: format!("schema drop table storage reclaim failed: {err}"),
+			})?;
+		let committer = RaftCommitter::new(self.raft.clone());
+		storage_manager
+			.reclaim_table_drop_tiered_storage(
+				tenant_id,
+				descriptor,
+				&snapshot.table_schemas,
+				&committer,
+				usize::MAX,
+			)
+			.await
+			.map_err(|err| WendelonAdminError::Transport {
+				message: format!("schema drop tiered table storage reclaim failed: {err}"),
+			})?;
+		Ok(())
+	}
+
+	async fn submit_table_drop_stage(
+		&self,
+		request: WendelonRequest,
+	) -> Result<u64, WendelonAdminError> {
+		match self.raft.client_write(request).await {
+			Ok(resp) => match resp.data {
+				WendelonResponse::Success => Ok(resp.log_id.index),
+				WendelonResponse::Error(message) => Err(WendelonAdminError::Transport { message }),
+				WendelonResponse::LeaseDenied => Err(WendelonAdminError::Transport {
+					message: "unexpected LeaseDenied response from schema drop".to_string(),
+				}),
+			},
+			Err(err) if !self.is_leader().await => Err(WendelonAdminError::Transport {
+				message: format!("schema drop leadership changed: {err}"),
+			}),
+			Err(err) => Err(WendelonAdminError::Transport {
+				message: err.to_string(),
+			}),
 		}
 	}
 
@@ -2663,6 +2987,10 @@ impl ControlRingServer for WendelonControlServer {
 			MsgType::SCHEMA_UPDATE_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::SchemaUpdate)?;
 				self.handle_schema_update(&context, frame).await?
+			}
+			MsgType::SCHEMA_DROP_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::SchemaDrop)?;
+				self.handle_schema_drop(&context, frame).await?
 			}
 			MsgType::TENANT_ADMIN_REQ => self.handle_tenant_admin(&context, frame).await?,
 			_ => {

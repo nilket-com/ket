@@ -13,7 +13,9 @@ use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, PhysicalDescriptorFingerprint, RecordLayoutPolicy,
 	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId,
 };
-use wendelon_client::{Client, ClientError, TableSchemaUpdateRequest};
+use wendelon_client::{
+	Client, ClientError, DropOperationId, SchemaGeneration, TableSchemaUpdateRequest,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableRef {
@@ -41,6 +43,7 @@ impl TableRef {
 pub struct TableBinding {
 	pub legacy_table_id: TableId,
 	pub table: TableObjectId,
+	pub schema_generation: u64,
 	pub fingerprint: PhysicalDescriptorFingerprint,
 	pub schema: SchemaRef,
 	pub pbc_eligible_columns: HashSet<ColumnOrdinal>,
@@ -63,6 +66,7 @@ impl TableBinding {
 		Ok(Self::new_with_primary_key_columns(
 			legacy_table_id,
 			descriptor.table_object_id,
+			descriptor.schema_generation,
 			descriptor.physical_descriptor_fingerprint,
 			schema,
 			primary_key_columns,
@@ -75,9 +79,20 @@ impl TableBinding {
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
 	) -> Self {
+		Self::new_with_schema_generation(legacy_table_id, table, 0, fingerprint, schema)
+	}
+
+	pub fn new_with_schema_generation(
+		legacy_table_id: TableId,
+		table: TableObjectId,
+		schema_generation: u64,
+		fingerprint: PhysicalDescriptorFingerprint,
+		schema: SchemaRef,
+	) -> Self {
 		Self::new_with_primary_key_columns(
 			legacy_table_id,
 			table,
+			schema_generation,
 			fingerprint,
 			schema,
 			HashSet::new(),
@@ -87,6 +102,7 @@ impl TableBinding {
 	pub fn new_with_primary_key_columns(
 		legacy_table_id: TableId,
 		table: TableObjectId,
+		schema_generation: u64,
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
 		primary_key_columns: HashSet<ColumnOrdinal>,
@@ -95,6 +111,7 @@ impl TableBinding {
 		Self {
 			legacy_table_id,
 			table,
+			schema_generation,
 			fingerprint,
 			schema,
 			pbc_eligible_columns,
@@ -329,6 +346,7 @@ struct WendelonDescriptorState {
 	by_ref: HashMap<TableRef, TableId>,
 	by_id: HashMap<TableId, TableBinding>,
 	descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
+	finalized_drops: HashMap<TableId, DropOperationId>,
 	next_table_id: u64,
 }
 
@@ -338,6 +356,7 @@ impl Default for WendelonDescriptorState {
 			by_ref: HashMap::new(),
 			by_id: HashMap::new(),
 			descriptors: HashMap::new(),
+			finalized_drops: HashMap::new(),
 			next_table_id: 1,
 		}
 	}
@@ -472,6 +491,68 @@ impl WendelonDescriptorRegistry {
 			binding,
 			descriptor,
 		)
+	}
+
+	pub fn mark_finalized_drop(
+		&self,
+		table: TableId,
+		operation_id: DropOperationId,
+	) -> Result<(), CatalogError> {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		if !state.by_id.contains_key(&table) {
+			return Err(CatalogError::TableNotFound {
+				table: format!("{table:?}"),
+			});
+		}
+		state.finalized_drops.insert(table, operation_id);
+		Ok(())
+	}
+
+	pub fn consume_finalized_drop(
+		&self,
+		table: TableId,
+		operation_id: DropOperationId,
+	) -> Result<(), CatalogError> {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		match state.finalized_drops.get(&table).copied() {
+			Some(existing) if existing == operation_id => {
+				state.finalized_drops.remove(&table);
+				Ok(())
+			}
+			Some(existing) => Err(CatalogError::AdminFailed {
+				message: format!(
+					"finalized DROP marker for {table:?} has operation_id {existing:?}, expected {operation_id:?}",
+				),
+			}),
+			None => Err(CatalogError::AdminFailed {
+				message: format!(
+					"missing finalized DROP marker for {table:?}; Wendelon DROP must complete before local descriptor removal",
+				),
+			}),
+		}
+	}
+
+	pub fn remove_table(&self, table: TableId) -> Result<TableBinding, CatalogError> {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let binding = state
+			.by_id
+			.remove(&table)
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: format!("{table:?}"),
+			})?;
+		state.by_ref.retain(|_, table_id| *table_id != table);
+		state.descriptors.remove(&table);
+		state.finalized_drops.remove(&table);
+		Ok(binding)
 	}
 }
 
@@ -611,18 +692,24 @@ impl Catalog for WendelonCatalog {
 		name: &TableRef,
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError> {
-		if self.registry.try_resolve_table(name).is_some() {
-			return Err(CatalogError::AdminUnavailable {
-				message: "DROP TABLE is not wired to Wendelon catalog administration".to_string(),
-			});
-		}
-		if if_exists {
-			Ok(None)
-		} else {
-			Err(CatalogError::TableNotFound {
-				table: table_name(name),
-			})
-		}
+		let binding = match self.registry.try_resolve_table(name) {
+			Some(binding) => binding,
+			None if if_exists => return Ok(None),
+			None => {
+				return Err(CatalogError::TableNotFound {
+					table: table_name(name),
+				});
+			}
+		};
+		let operation_id = DropOperationId {
+			tenant_id: self.tenant_id,
+			table_object_id: binding.table,
+			schema_generation: SchemaGeneration::new(binding.schema_generation),
+		};
+		self.registry
+			.consume_finalized_drop(binding.legacy_table_id, operation_id)?;
+		self.registry.remove_table(binding.legacy_table_id)?;
+		Ok(Some(binding))
 	}
 }
 
@@ -646,18 +733,44 @@ fn bump_next_wendelon_table_id(state: &mut WendelonDescriptorState, table_id: Ta
 }
 
 fn map_wendelon_admin_error(table: &TableRef, error: ClientError) -> CatalogError {
-	match &error {
-		ClientError::SchemaUpdateRejected { message, .. }
-			if message.contains("cannot replace an existing table")
-				|| (message.contains("expected_generation")
-					&& message.contains("current generation")) =>
-		{
-			CatalogError::TableAlreadyExists {
-				table: table_name(table),
+	match error {
+		ClientError::Admin(
+			wendelon_client::WendelonAdminError::TableMissing { .. }
+			| wendelon_client::WendelonAdminError::TableAlreadyDropped { .. },
+		) => CatalogError::TableNotFound {
+			table: table_name(table),
+		},
+		ClientError::Admin(wendelon_client::WendelonAdminError::GenerationMismatch { .. }) => {
+			CatalogError::AdminFailed {
+				message: format!(
+					"table {} schema generation changed during admin operation",
+					table_name(table)
+				),
 			}
 		}
-		_ => CatalogError::AdminFailed {
-			message: error.to_string(),
+		ClientError::Admin(wendelon_client::WendelonAdminError::TableAlreadyDropping {
+			existing_operation_id,
+			..
+		}) => CatalogError::AdminFailed {
+			message: format!(
+				"table {} drop already in progress under operation {existing_operation_id:?}",
+				table_name(table),
+			),
+		},
+		ClientError::Admin(wendelon_client::WendelonAdminError::DependentIndexesPresent {
+			indexes,
+		}) => CatalogError::AdminFailed {
+			message: format!(
+				"table {} has {} active dependent indexes; drop them first",
+				table_name(table),
+				indexes.len(),
+			),
+		},
+		ClientError::Admin(wendelon_client::WendelonAdminError::Transport { message }) => {
+			CatalogError::AdminFailed { message }
+		}
+		other => CatalogError::AdminFailed {
+			message: other.to_string(),
 		},
 	}
 }

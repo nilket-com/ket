@@ -56,12 +56,16 @@ impl From<wendelon_client::ClientError> for StorageError {
 			| source @ ClientError::TenantSuspended { .. }
 			| source @ ClientError::TenantUnavailable { .. }
 			| source @ ClientError::Io(_) => Self::Unavailable { source },
+			source @ ClientError::Admin(wendelon_client::WendelonAdminError::Transport {
+				..
+			}) => Self::Unavailable { source },
 			source @ ClientError::ReadFailed { .. } => Self::ReadBoundUnavailable { source },
 			source @ ClientError::TableWriteRejected { .. } => {
 				Self::InvalidPbcForDescriptor { source }
 			}
 			source @ ClientError::WriteFailed { .. }
-			| source @ ClientError::SchemaUpdateRejected { .. } => Self::Client { source },
+			| source @ ClientError::SchemaUpdateRejected { .. }
+			| source @ ClientError::Admin(_) => Self::Client { source },
 		}
 	}
 }

@@ -17,7 +17,9 @@ use wendelon::client::{
 	TableDeleteRowsRequest, TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient,
 	WendelonClientConfig, WriteRequest,
 };
-use wendelon::network::control_server::{CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire};
+use wendelon::network::control_server::{
+	CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire, TableSchemaDropResponseWire,
+};
 use wendelon::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
@@ -43,18 +45,19 @@ pub use wendelon::client::{
 };
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
-	ComputeTraceContextV1, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
+	ComputeTraceContextV1, DropOperationId, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
 	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
-	StorageQuotaMetadataV1, StorageStatusKind, decode_schema_update_envelope_v1,
-	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
-	prepare_query_session_handoff, validate_query_session_audit_attribution, validate_traceparent,
+	StorageQuotaMetadataV1, StorageStatusKind, TableSchemaDropFields, TableSchemaDropRequest,
+	WendelonAdminError, decode_schema_update_envelope_v1, encode_schema_update_envelope_v1,
+	map_read_status_for_compute, map_write_status_for_compute, prepare_query_session_handoff,
+	validate_query_session_audit_attribution, validate_traceparent,
 };
 pub use wendelon::schema::{
 	CdcCursor, CdcRejectCode, CdcSubscribeBound, Consistency as ReadConsistency,
-	DurabilityLevel as DurabilityClass, LocalityPolicy, LogicalSchemaFingerprint, PbcRejectCode,
-	PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy,
-	RuntimeFilterDescriptor, SchemaEvolutionPolicyV1, StateDigest, TableObjectId,
-	TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
+	DurabilityLevel as DurabilityClass, IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint,
+	PbcRejectCode, PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1,
+	RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicyV1, StateDigest,
+	TableObjectId, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -325,6 +328,8 @@ pub enum ClientError {
 	},
 	#[error("schema update rejected with reason {reason_code}: {message}")]
 	SchemaUpdateRejected { reason_code: u8, message: String },
+	#[error("admin operation rejected: {0:?}")]
+	Admin(WendelonAdminError),
 	#[error("read failed with status {status:?}")]
 	ReadFailed { status: ReadStatus },
 }
@@ -342,6 +347,7 @@ impl ClientError {
 			Self::TableWriteRejected { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableDescriptorEvolved { .. } => StorageStatusKind::TerminalStorageError,
 			Self::SchemaUpdateRejected { .. } => StorageStatusKind::TerminalStorageError,
+			Self::Admin(_) => StorageStatusKind::TerminalStorageError,
 			Self::ReadFailed { status } => map_read_status_for_compute(*status),
 		}
 	}
@@ -494,6 +500,49 @@ impl Client {
 		})
 	}
 
+	pub async fn drop_table_schema(
+		&self,
+		request: TableSchemaDropRequest,
+	) -> Result<(), ClientError> {
+		let payload = wire::encode(&request)?;
+		let mut preferred_target = self.inner.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = if let Some(target) = preferred_target {
+				target
+			} else {
+				self.inner.refresh_topology().await?;
+				self.inner.leader().ok_or_else(|| {
+					std::io::Error::new(
+						std::io::ErrorKind::NotConnected,
+						"schema drop requires a known control-ring leader",
+					)
+				})?
+			};
+			let response = self.submit_schema_drop_once(target, &payload).await?;
+			if response.accepted {
+				return Ok(());
+			}
+			if response.reason_code == CONTROL_REASON_NOT_LEADER && attempt + 1 < DATA_RETRY_BUDGET
+			{
+				preferred_target = response.leader_hint.map(|id| NodeId { id, _reserved: 0 });
+				self.inner.refresh_topology().await?;
+				continue;
+			}
+			return Err(ClientError::Admin(response.admin_error.unwrap_or_else(
+				|| {
+					WendelonAdminError::Transport {
+						message: response
+							.message
+							.unwrap_or_else(|| "schema drop rejected".to_owned()),
+					}
+				},
+			)));
+		}
+		Err(ClientError::Admin(WendelonAdminError::Transport {
+			message: "schema drop retry budget exhausted".to_owned(),
+		}))
+	}
+
 	async fn submit_schema_update_once(
 		&self,
 		target: NodeId,
@@ -536,6 +585,43 @@ impl Client {
 			.into());
 		}
 		Ok(wire::decode::<SchemaUpdateResponseWire>(&frame.meta)?)
+	}
+
+	async fn submit_schema_drop_once(
+		&self,
+		target: NodeId,
+		payload: &[u8],
+	) -> Result<TableSchemaDropResponseWire, ClientError> {
+		let conn = self.inner.factory().get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::SCHEMA_DROP_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: payload.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, payload, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+
+		let frame = read_frame(&mut *stream, self.inner.pool()).await?;
+		if frame.header.msg_type != MsgType::SCHEMA_DROP_RESP.0 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"expected SCHEMA_DROP_RESP, got msg_type=0x{:02x}",
+					frame.header.msg_type
+				),
+			)
+			.into());
+		}
+		Ok(wire::decode::<TableSchemaDropResponseWire>(&frame.meta)?)
 	}
 
 	pub async fn write(

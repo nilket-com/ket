@@ -22,9 +22,10 @@ use toron::storage::{
 	DropTableStorageOutcome, DropTableStorageRequest, HlcBound, InMemoryStorageScan,
 	InMemoryTableStorage, StorageAdmin, TenantId,
 };
+use wendelon::integration::compute::{DropOperationId, SchemaGeneration};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
 };
 
 #[test]
@@ -545,19 +546,39 @@ async fn wendelon_catalog_drop_table_semantics() {
 		schema(&[Field::new("id", DataType::Int32, false)]).as_ref(),
 		table_object_id(TableId(7)),
 	);
-	let catalog =
-		WendelonCatalog::from_descriptors([(TableId(7), descriptor)]).expect("wendelon catalog");
+	let table_object_id = descriptor.table_object_id;
+	let schema_generation = descriptor.schema_generation;
+	let catalog = WendelonCatalog::from_descriptors([(TableId(7), descriptor.clone())])
+		.expect("wendelon catalog");
 
 	let known = expect_drop_catalog_err(
 		catalog
 			.drop_table(&TableRef::with_schema("bench", "orders"), true)
 			.await,
 	);
-	assert!(matches!(known, CatalogError::AdminUnavailable { .. }));
+	assert!(matches!(known, CatalogError::AdminFailed { .. }));
+	assert!(known.to_string().contains("missing finalized DROP marker"));
+
+	let operation_id = DropOperationId {
+		tenant_id: WendelonTenantId::new(1),
+		table_object_id,
+		schema_generation: SchemaGeneration::new(schema_generation),
+	};
+	catalog
+		.descriptor_registry()
+		.mark_finalized_drop(TableId(7), operation_id)
+		.expect("mark finalized drop");
+	let dropped = catalog
+		.drop_table(&TableRef::with_schema("bench", "orders"), true)
+		.await
+		.expect("guarded local descriptor drop")
+		.expect("dropped binding");
+	assert_eq!(dropped.legacy_table_id, TableId(7));
 	assert!(
-		known
-			.to_string()
-			.contains("DROP TABLE is not wired to Wendelon catalog administration")
+		catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.is_err()
 	);
 
 	let missing = catalog

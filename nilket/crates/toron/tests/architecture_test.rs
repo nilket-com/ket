@@ -4090,7 +4090,7 @@ fn adr034_mock_catalog_drop_table_cleans_aliases() {
 }
 
 #[test]
-fn adr034_wendelon_catalog_drop_table_is_admin_unavailable() {
+fn adr039_wendelon_catalog_drop_table_consumes_finalized_marker() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
 		.expect("read catalog source");
 	let impl_block = catalog
@@ -4103,8 +4103,11 @@ fn adr034_wendelon_catalog_drop_table_is_admin_unavailable() {
 		.expect("WendelonCatalog::drop_table body")
 		.1;
 
-	assert!(drop_body.contains("CatalogError::AdminUnavailable"));
-	assert!(drop_body.contains("DROP TABLE is not wired to Wendelon catalog administration"));
+	assert!(!drop_body.contains("CatalogError::AdminUnavailable"));
+	assert!(drop_body.contains("DropOperationId"));
+	assert!(drop_body.contains("consume_finalized_drop"));
+	assert!(drop_body.contains("remove_table"));
+	assert!(!drop_body.contains("drop_table_schema"));
 	assert!(drop_body.contains("if_exists"));
 	assert!(drop_body.contains("Ok(None)"));
 	assert!(drop_body.contains("CatalogError::TableNotFound"));
@@ -5497,6 +5500,7 @@ fn adr038_drop_table_storage_request_shape_is_context_only() {
 		"pub tenant_id: TenantId,",
 		"pub table_id: TableId,",
 		"pub table_object_id: TableObjectId,",
+		"pub schema_generation: u64,",
 		"pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,",
 		"pub profile_hint: Option<QueryProfileHint>,",
 		"pub trace_context: Option<TraceContext>,",
@@ -5622,6 +5626,7 @@ fn adr038_wendelon_descriptor_registry_shared_by_all_adapters() {
 		"pub struct WendelonStorageScan",
 		"pub struct WendelonStorageWrite",
 		"pub struct WendelonStorageDeleteRows",
+		"pub struct WendelonStorageAdmin",
 	] {
 		let body = brace_blocks_after_marker(&storage, adapter)
 			.into_iter()
@@ -5676,13 +5681,90 @@ fn adr038_drop_route_uses_storage_admin_sink_when_configured() {
 }
 
 #[test]
-fn adr038_wendelon_drop_remains_admin_unavailable_until_adr_039() {
+fn adr039_wendelon_drop_admin_unavailable_lifted() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
 		.expect("read catalog source");
 	let drop_body = wendelon_catalog_method_body(&catalog, "async fn drop_table");
 
-	assert!(drop_body.contains("CatalogError::AdminUnavailable"));
-	assert!(drop_body.contains("DROP TABLE is not wired to Wendelon catalog administration"));
+	assert!(!drop_body.contains("CatalogError::AdminUnavailable"));
+	assert!(drop_body.contains("consume_finalized_drop"));
+	assert!(drop_body.contains("remove_table"));
+}
+
+#[test]
+fn adr039_wendelon_admin_error_mapping_is_structured() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let catalog_body = brace_blocks_after_marker(&catalog, "fn map_wendelon_admin_error")
+		.into_iter()
+		.next()
+		.expect("catalog admin error mapper")
+		.1;
+	let storage_body =
+		brace_blocks_after_marker(&storage, "fn map_wendelon_admin_error_to_storage")
+			.into_iter()
+			.next()
+			.expect("storage admin error mapper")
+			.1;
+
+	for body in [catalog_body, storage_body] {
+		assert!(body.contains("ClientError::Admin"));
+		assert!(body.contains("WendelonAdminError::"));
+		assert!(!body.contains(".contains("));
+	}
+}
+
+#[test]
+fn adr039_no_table_schema_drop_request_v1_in_toron() {
+	assert_toron_sources_do_not_contain(&["TableSchemaDropRequestV1"]);
+}
+
+#[test]
+fn adr039_toron_does_not_import_wendelon_internal_stage_types() {
+	assert_toron_sources_do_not_contain(&[
+		"TableDropPrepareRequest",
+		"TableReclaimCompletionRequest",
+		"TableDropFinalizeRequest",
+		"DropStage",
+	]);
+}
+
+#[test]
+fn adr039_toron_does_not_orchestrate_wendelon_drop_stages() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let body = brace_blocks_after_marker(&storage, "impl StorageAdmin for WendelonStorageAdmin")
+		.into_iter()
+		.next()
+		.expect("WendelonStorageAdmin StorageAdmin impl")
+		.1;
+
+	assert!(body.contains(".drop_table_schema("));
+	assert!(body.contains("TableSchemaDropRequest::current"));
+	assert!(!body.contains("TableSchemaDropRequest::V1"));
+	for forbidden in [
+		"submit_table_drop_prepare",
+		"submit_table_reclaim_completion",
+		"submit_table_drop_finalize",
+		"submit_table_schema_drop",
+		"TableDropPrepareRequest",
+		"TableReclaimCompletionRequest",
+		"TableDropFinalizeRequest",
+	] {
+		assert!(!body.contains(forbidden), "unexpected {forbidden}");
+	}
+}
+
+#[test]
+fn adr039_no_catalog_drop_table_with_proof_method() {
+	assert_toron_sources_do_not_contain(&["drop_table_with_proof"]);
+}
+
+#[test]
+fn adr039_no_drop_table_storage_proof_type() {
+	assert_toron_sources_do_not_contain(&["DropTableStorageProof"]);
 }
 
 #[test]
@@ -5973,6 +6055,32 @@ fn source_lines(root: &Path) -> Vec<(PathBuf, usize, String)> {
 				.collect::<Vec<_>>()
 		})
 		.collect()
+}
+
+fn toron_source_lines_for_adr039_negative_guards() -> Vec<(PathBuf, usize, String)> {
+	let manifest_dir = manifest_dir();
+	let architecture_test = manifest_dir.join("tests/architecture_test.rs");
+	let mut lines = source_lines(&manifest_dir.join("src"));
+	lines.extend(
+		source_lines(&manifest_dir.join("tests"))
+			.into_iter()
+			.filter(|(path, _, _)| path != &architecture_test),
+	);
+	lines
+}
+
+fn assert_toron_sources_do_not_contain(forbidden: &[&str]) {
+	let manifest_dir = manifest_dir();
+	let offenders = toron_source_lines_for_adr039_negative_guards()
+		.into_iter()
+		.filter(|(_, _, line)| forbidden.iter().any(|symbol| line.contains(symbol)))
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"Toron source contains ADR 039 forbidden symbol(s):\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
 }
 
 fn source_files(root: &Path) -> Vec<PathBuf> {

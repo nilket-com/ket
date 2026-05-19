@@ -2031,6 +2031,25 @@ impl TableSchemaCatalogV1 {
 		self.by_id.get(key)
 	}
 
+	pub fn is_latest_name_bound(
+		&self,
+		tenant_id: TenantId,
+		namespace: &str,
+		table_name: &str,
+		table_object_id: TableObjectId,
+		schema_generation: u64,
+	) -> bool {
+		self.latest_by_name
+			.get(&TableNameCatalogKey {
+				tenant_id,
+				namespace: namespace.to_owned(),
+				table_name: table_name.to_owned(),
+			})
+			.is_some_and(|key| {
+				key.table_object_id == table_object_id && key.schema_generation == schema_generation
+			})
+	}
+
 	pub fn latest_by_id(
 		&self,
 		tenant_id: TenantId,
@@ -2050,6 +2069,40 @@ impl TableSchemaCatalogV1 {
 			.range(start..=end)
 			.next_back()
 			.map(|(_, descriptor)| descriptor)
+	}
+
+	pub fn unbind_latest_name(
+		&mut self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		expected_generation: u64,
+	) -> std::io::Result<Option<TableSchemaDescriptor>> {
+		let Some(descriptor) = self.latest_by_id(tenant_id, table_object_id).cloned() else {
+			return Ok(None);
+		};
+		if descriptor.schema_generation != expected_generation {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"table schema expected_generation {expected_generation} does not match current generation {}",
+					descriptor.schema_generation
+				),
+			));
+		}
+		let name_key = TableNameCatalogKey {
+			tenant_id,
+			namespace: descriptor.namespace.clone(),
+			table_name: descriptor.table_name.clone(),
+		};
+		let latest_key = TableSchemaCatalogKey {
+			tenant_id,
+			table_object_id,
+			schema_generation: expected_generation,
+		};
+		if self.latest_by_name.get(&name_key) == Some(&latest_key) {
+			self.latest_by_name.remove(&name_key);
+		}
+		Ok(Some(descriptor))
 	}
 
 	pub fn descriptors_for_tenant(&self, tenant_id: TenantId) -> Vec<TableSchemaDescriptor> {

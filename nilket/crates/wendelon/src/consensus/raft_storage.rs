@@ -54,8 +54,9 @@ use crate::audit::{
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
 	MigrationLedgerEntry, MigrationState, RevokeActorKey, RevokedActorKeyId, SeedMigration,
-	SetTableRetentionPolicy, TenantFinalization, TenantLifecycleState, TenantRecord, TieredSlab,
-	UpdateTenantQuota, WendelonRequest, WendelonResponse, WendelonTypeConfig,
+	SetTableRetentionPolicy, TableDropFinalizeRequest, TableDropPrepareRequest,
+	TableReclaimCompletionRequest, TenantFinalization, TenantLifecycleState, TenantRecord,
+	TieredSlab, UpdateTenantQuota, WendelonRequest, WendelonResponse, WendelonTypeConfig,
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::integration::compute::{
@@ -68,9 +69,9 @@ use crate::schema::{
 	FinalizationMarker, HybridTimestamp, IndexObjectId, Locality, LogEntryKind,
 	NodeId as SchemaNodeId, RaftLogEntryFixed, RowIdentityPolicy,
 	SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SecondaryIndexCatalog, SecondaryIndexDescriptor,
-	SecondaryIndexState, SlabId, SnapshotHeader, TableLifecycleCatalog, TableRetentionPolicy,
-	TableSchemaCatalogV1, TableSchemaDescriptor, TenantId, TenantKekId, WALRecordHeader,
-	decode_secondary_index_descriptor, decode_secondary_index_drop_request,
+	SecondaryIndexState, SlabId, SnapshotHeader, TableDropFenceCatalog, TableLifecycleCatalog,
+	TableRetentionPolicy, TableSchemaCatalogV1, TableSchemaDescriptor, TenantId, TenantKekId,
+	WALRecordHeader, decode_secondary_index_descriptor, decode_secondary_index_drop_request,
 	decode_secondary_index_lifecycle_complete, decode_table_schema_descriptor_v1,
 	validate_table_schema_evolution,
 };
@@ -1541,6 +1542,11 @@ pub struct SmState {
 	/// Retention is current lifecycle authority and intentionally stays
 	/// outside schema descriptors and schema generations.
 	pub table_lifecycle: TableLifecycleCatalog,
+	/// ADR 039 table DROP fence state keyed by durable table identity.
+	/// This is distinct from retention policy and is consulted by
+	/// Wendelon-owned DROP orchestration and data-path admission.
+	#[serde(default)]
+	pub table_drop_fences: TableDropFenceCatalog,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2744,7 +2750,9 @@ fn apply_entry_to_state(
 ) -> (WendelonResponse, Option<TierObserverEvent>) {
 	match &entry.payload {
 		EntryPayload::Blank => (WendelonResponse::Success, None),
-		EntryPayload::Normal(req) => apply_request(state, req.clone()),
+		EntryPayload::Normal(req) => {
+			apply_request_at_log_index(state, req.clone(), entry.log_id.index)
+		}
 		EntryPayload::Membership(membership) => {
 			state.last_membership = StoredMembership::new(Some(entry.log_id), membership.clone());
 			(WendelonResponse::Success, None)
@@ -3741,9 +3749,18 @@ fn checkpoint_observation_from_state(
 	})
 }
 
+#[cfg(test)]
 fn apply_request(
 	state: &mut SmState,
 	req: WendelonRequest,
+) -> (WendelonResponse, Option<TierObserverEvent>) {
+	apply_request_at_log_index(state, req, 0)
+}
+
+fn apply_request_at_log_index(
+	state: &mut SmState,
+	req: WendelonRequest,
+	entry_log_index: u64,
 ) -> (WendelonResponse, Option<TierObserverEvent>) {
 	match req {
 		WendelonRequest::Finalize(finalization) => {
@@ -3833,6 +3850,17 @@ fn apply_request(
 			Ok(()) => (WendelonResponse::Success, None),
 			Err(err) => (WendelonResponse::Error(err), None),
 		},
+		WendelonRequest::TableDropPrepare(request) => (
+			apply_table_drop_prepare(state, request, entry_log_index),
+			None,
+		),
+		WendelonRequest::TableReclaimCompletion(request) => (
+			apply_table_reclaim_completion(state, request, entry_log_index),
+			None,
+		),
+		WendelonRequest::TableDropFinalize(request) => {
+			(apply_table_drop_finalize(state, request), None)
+		}
 		WendelonRequest::TierSlab(tier) => {
 			// Idempotent replays keep the existing mapping; pointer
 			// refreshes (for re-encryption or URI/hash repair) update
@@ -4054,6 +4082,15 @@ fn apply_table_schema_update(
 				.as_ref()
 				.map(|descriptor| descriptor.schema_generation)
 				.unwrap_or(0);
+			if let Some(descriptor) = current_descriptor.as_ref()
+				&& state
+					.table_drop_fences
+					.is_fenced(envelope.tenant_id, descriptor.table_object_id)
+			{
+				return Err(
+					"table schema update rejected because table drop is in progress".to_owned(),
+				);
+			}
 			if current_generation != envelope.expected_generation.get() {
 				return Err(format!(
 					"schema expected_generation {} does not match current generation {}",
@@ -4125,6 +4162,141 @@ fn apply_table_schema_update(
 	}
 }
 
+fn apply_table_drop_prepare(
+	state: &mut SmState,
+	request: TableDropPrepareRequest,
+	entry_log_index: u64,
+) -> WendelonResponse {
+	let operation_id = request.operation_id();
+	if operation_id.schema_generation != request.expected_generation() {
+		return WendelonResponse::Error(format!(
+			"drop operation schema_generation {} does not match expected_generation {}",
+			operation_id.schema_generation.get(),
+			request.expected_generation().get()
+		));
+	}
+	let Some(descriptor) = state
+		.table_schemas
+		.latest_by_id(operation_id.tenant_id, operation_id.table_object_id)
+	else {
+		return WendelonResponse::Error(format!(
+			"table {:?} is missing",
+			operation_id.table_object_id
+		));
+	};
+	if descriptor.schema_generation != request.expected_generation().get() {
+		return WendelonResponse::Error(format!(
+			"schema expected_generation {} does not match current generation {}",
+			request.expected_generation().get(),
+			descriptor.schema_generation
+		));
+	}
+	if !state.table_schemas.is_latest_name_bound(
+		operation_id.tenant_id,
+		&descriptor.namespace,
+		&descriptor.table_name,
+		operation_id.table_object_id,
+		descriptor.schema_generation,
+	) {
+		return WendelonResponse::Error(format!(
+			"table {:?} is already dropped",
+			operation_id.table_object_id
+		));
+	}
+	let dependent_indexes = state
+		.secondary_indexes
+		.for_table(operation_id.tenant_id, operation_id.table_object_id);
+	if !dependent_indexes.is_empty() {
+		let indexes = dependent_indexes
+			.iter()
+			.map(|row| format!("{:?}", row.descriptor.index_object_id))
+			.collect::<Vec<_>>()
+			.join(", ");
+		return WendelonResponse::Error(format!(
+			"dependent secondary indexes present for table {:?}: {indexes}",
+			operation_id.table_object_id
+		));
+	}
+	match state
+		.table_drop_fences
+		.prepare(operation_id, entry_log_index)
+	{
+		Ok(_) => WendelonResponse::Success,
+		Err(err) => WendelonResponse::Error(err.to_string()),
+	}
+}
+
+fn apply_table_reclaim_completion(
+	state: &mut SmState,
+	request: TableReclaimCompletionRequest,
+	entry_log_index: u64,
+) -> WendelonResponse {
+	match state.table_drop_fences.complete_reclaim(
+		request.operation_id(),
+		request.fence_log_index(),
+		entry_log_index,
+	) {
+		Ok(_) => WendelonResponse::Success,
+		Err(err) => WendelonResponse::Error(err.to_string()),
+	}
+}
+
+fn apply_table_drop_finalize(
+	state: &mut SmState,
+	request: TableDropFinalizeRequest,
+) -> WendelonResponse {
+	let operation_id = request.operation_id();
+	let Some(fence) = state
+		.table_drop_fences
+		.get(operation_id.tenant_id, operation_id.table_object_id)
+		.copied()
+	else {
+		return WendelonResponse::Error("table drop fence is missing".to_string());
+	};
+	if fence.operation_id != operation_id {
+		return WendelonResponse::Error(format!(
+			"table is already dropping under operation_id {:?}",
+			fence.operation_id
+		));
+	}
+	if fence.fence_log_index != request.fence_log_index() {
+		return WendelonResponse::Error(format!(
+			"table drop fence_log_index mismatch: expected {}, observed {}",
+			fence.fence_log_index,
+			request.fence_log_index()
+		));
+	}
+	if fence.reclaim_completion_log_index != Some(request.reclaim_completion_log_index()) {
+		return WendelonResponse::Error(format!(
+			"table drop reclaim_completion_log_index mismatch: expected {}, observed {}",
+			fence.reclaim_completion_log_index.unwrap_or(0),
+			request.reclaim_completion_log_index()
+		));
+	}
+	let expected_generation = operation_id.schema_generation.get();
+	if let Err(err) = state.table_schemas.unbind_latest_name(
+		operation_id.tenant_id,
+		operation_id.table_object_id,
+		expected_generation,
+	) {
+		return WendelonResponse::Error(err.to_string());
+	}
+	state
+		.table_lifecycle
+		.remove(operation_id.tenant_id, operation_id.table_object_id);
+	match state.table_drop_fences.finalize(
+		operation_id,
+		request.fence_log_index(),
+		request.reclaim_completion_log_index(),
+	) {
+		Ok(_) => {
+			observe_table_retention_active_tables(&state.table_lifecycle);
+			WendelonResponse::Success
+		}
+		Err(err) => WendelonResponse::Error(err.to_string()),
+	}
+}
+
 fn apply_index_schema_update(
 	state: &mut SmState,
 	envelope: SchemaUpdateEnvelopeV1,
@@ -4133,6 +4305,14 @@ fn apply_index_schema_update(
 		SchemaMutationKindV1::Create => {
 			let descriptor = decode_secondary_index_descriptor(&envelope.payload)
 				.map_err(|err| err.to_string())?;
+			if state
+				.table_drop_fences
+				.is_fenced(envelope.tenant_id, descriptor.table_object_id)
+			{
+				return Err(
+					"secondary index create rejected because table drop is in progress".to_owned(),
+				);
+			}
 			if descriptor.namespace != envelope.object.namespace
 				|| descriptor.index_name != envelope.object.name
 			{
@@ -4165,6 +4345,15 @@ fn apply_index_schema_update(
 			{
 				return Err("secondary index drop object does not match schema envelope".to_owned());
 			}
+			if let Some(row) = existing.as_ref()
+				&& state
+					.table_drop_fences
+					.is_fenced(envelope.tenant_id, row.descriptor.table_object_id)
+			{
+				return Err(
+					"secondary index drop rejected because table drop is in progress".to_owned(),
+				);
+			}
 			state
 				.secondary_indexes
 				.mark_dropping(envelope.tenant_id, request.index_object_id)
@@ -4186,6 +4375,16 @@ fn apply_index_schema_update(
 				.secondary_indexes
 				.get(envelope.tenant_id, complete.index_object_id)
 				.cloned();
+			if let Some(row) = before.as_ref()
+				&& state
+					.table_drop_fences
+					.is_fenced(envelope.tenant_id, row.descriptor.table_object_id)
+			{
+				return Err(
+					"secondary index backfill completion rejected because table drop is in progress"
+						.to_owned(),
+				);
+			}
 			state
 				.secondary_indexes
 				.mark_backfill_complete(envelope.tenant_id, complete.index_object_id)
@@ -4211,6 +4410,16 @@ fn apply_index_schema_update(
 				.secondary_indexes
 				.get(envelope.tenant_id, complete.index_object_id)
 				.cloned();
+			if let Some(row) = before.as_ref()
+				&& state
+					.table_drop_fences
+					.is_fenced(envelope.tenant_id, row.descriptor.table_object_id)
+			{
+				return Err(
+					"secondary index drop GC completion rejected because table drop is in progress"
+						.to_owned(),
+				);
+			}
 			state
 				.secondary_indexes
 				.mark_drop_gc_complete(
@@ -4282,6 +4491,14 @@ fn apply_set_table_retention_policy(
 			update.tenant_id.get()
 		));
 	};
+	if state
+		.table_drop_fences
+		.is_fenced(update.tenant_id, update.table_object_id)
+	{
+		return WendelonResponse::Error(
+			"table retention policy update rejected because table drop is in progress".to_string(),
+		);
+	}
 	if matches!(
 		descriptor.row_identity_policy,
 		RowIdentityPolicy::PrimaryKey(_)
@@ -5424,6 +5641,9 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		EntryPayload::Normal(WendelonRequest::SetTableRetentionPolicy(_)) => {
 			(LogEntryKind::APPEND, 0)
 		}
+		EntryPayload::Normal(WendelonRequest::TableDropPrepare(_))
+		| EntryPayload::Normal(WendelonRequest::TableReclaimCompletion(_))
+		| EntryPayload::Normal(WendelonRequest::TableDropFinalize(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SeedMigration(s)) => {
 			(LogEntryKind::APPEND, s.entry.to_epoch)
 		}
@@ -5739,8 +5959,8 @@ mod schema_state_tests {
 	use super::*;
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::integration::compute::{
-		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
-		SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+		COMPUTE_STORAGE_CONTRACT_VERSION, DropOperationId, SchemaGeneration, SchemaIntentId,
+		SchemaIntentOrigin, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
@@ -6623,6 +6843,195 @@ mod schema_state_tests {
 		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
 		assert!(err.contains("drops require"));
 		assert!(state.table_schemas.is_empty());
+	}
+
+	#[test]
+	fn table_drop_protocol_fences_completes_and_finalizes() {
+		let descriptor = table_descriptor(1);
+		let mut state = state_with_descriptor(&descriptor);
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: SchemaGeneration::new(descriptor.schema_generation),
+		};
+
+		assert_eq!(
+			apply_table_drop_prepare(
+				&mut state,
+				TableDropPrepareRequest::current(
+					operation_id,
+					SchemaGeneration::new(descriptor.schema_generation),
+				),
+				10,
+			),
+			WendelonResponse::Success
+		);
+		let fence = state
+			.table_drop_fences
+			.get(TenantId::new(7), descriptor.table_object_id)
+			.expect("drop fence");
+		assert_eq!(fence.fence_log_index, 10);
+		assert_eq!(fence.reclaim_completion_log_index, None);
+
+		assert_eq!(
+			apply_table_reclaim_completion(
+				&mut state,
+				TableReclaimCompletionRequest::current(operation_id, 10),
+				11,
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			state
+				.table_drop_fences
+				.get(TenantId::new(7), descriptor.table_object_id)
+				.and_then(|fence| fence.reclaim_completion_log_index),
+			Some(11)
+		);
+
+		assert_eq!(
+			apply_table_drop_finalize(
+				&mut state,
+				TableDropFinalizeRequest::current(operation_id, 10, 11),
+			),
+			WendelonResponse::Success
+		);
+		assert!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "events")
+				.is_none()
+		);
+		assert!(
+			state
+				.table_schemas
+				.latest_by_id(TenantId::new(7), descriptor.table_object_id)
+				.is_some()
+		);
+		assert!(
+			state
+				.table_drop_fences
+				.get(TenantId::new(7), descriptor.table_object_id)
+				.is_none()
+		);
+		assert!(
+			state
+				.table_lifecycle
+				.get(TenantId::new(7), descriptor.table_object_id)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn table_drop_prepare_rejects_dependent_secondary_indexes() {
+		let descriptor = table_descriptor(1);
+		let mut state = state_with_descriptor(&descriptor);
+		let index = index_descriptor(&descriptor);
+		state
+			.secondary_indexes
+			.create(TenantId::new(7), index, &state.table_schemas)
+			.expect("create secondary index");
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: SchemaGeneration::new(descriptor.schema_generation),
+		};
+
+		let response = apply_table_drop_prepare(
+			&mut state,
+			TableDropPrepareRequest::current(
+				operation_id,
+				SchemaGeneration::new(descriptor.schema_generation),
+			),
+			10,
+		);
+
+		assert!(
+			matches!(response, WendelonResponse::Error(message) if message.contains("dependent secondary indexes"))
+		);
+		assert!(
+			state
+				.table_drop_fences
+				.get(TenantId::new(7), descriptor.table_object_id)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn table_drop_fence_rejects_concurrent_table_admin_mutations() {
+		let descriptor = table_descriptor(1);
+		let mut state = state_with_descriptor(&descriptor);
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: SchemaGeneration::new(descriptor.schema_generation),
+		};
+		assert_eq!(
+			apply_table_drop_prepare(
+				&mut state,
+				TableDropPrepareRequest::current(
+					operation_id,
+					SchemaGeneration::new(descriptor.schema_generation),
+				),
+				10,
+			),
+			WendelonResponse::Success
+		);
+
+		let mut retuned = descriptor.clone();
+		retuned.schema_generation = 2;
+		retuned.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		retuned.refresh_descriptor_fingerprints().unwrap();
+		let err = apply_schema_update(
+			&mut state,
+			&schema_envelope(&retuned, 1, 2, SchemaMutationKindV1::Alter),
+		)
+		.unwrap_err();
+		assert!(err.contains("drop is in progress"));
+		assert_eq!(
+			state
+				.table_schemas
+				.latest_by_id(TenantId::new(7), descriptor.table_object_id)
+				.expect("descriptor")
+				.schema_generation,
+			1
+		);
+
+		let index = index_descriptor(&descriptor);
+		let err = apply_schema_update(
+			&mut state,
+			&index_schema_envelope(
+				&index,
+				0,
+				1,
+				SchemaMutationKindV1::Create,
+				encode_secondary_index_descriptor(&index).unwrap(),
+			),
+		)
+		.unwrap_err();
+		assert!(err.contains("drop is in progress"));
+		assert!(
+			state
+				.secondary_indexes
+				.get(TenantId::new(7), index.index_object_id)
+				.is_none()
+		);
+
+		let update = SetTableRetentionPolicy {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			expected_policy_generation: PolicyGeneration::ZERO,
+			new_policy: TableRetentionPolicy::InheritCluster,
+			updated_at_hlc: HybridTimestamp {
+				physical_ms: 42,
+				logical: 1,
+				node_id: 2,
+			},
+		};
+		let response = apply_set_table_retention_policy(&mut state, update);
+		assert!(
+			matches!(response, WendelonResponse::Error(message) if message.contains("drop is in progress"))
+		);
 	}
 
 	#[test]
