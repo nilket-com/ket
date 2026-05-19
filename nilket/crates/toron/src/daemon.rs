@@ -13,12 +13,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::EnvFilter;
 
 use crate::catalog::{WendelonCatalog, WendelonDescriptorRegistry};
 use crate::config::{
-	ToronBootstrapConfig, ToronConfigError, ToronWendelonStorageConfig, load_descriptor_bootstrap,
-	load_toron_bootstrap_config,
+	OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC, ToronBootstrapConfig, ToronConfigError,
+	ToronWendelonStorageConfig, load_descriptor_bootstrap, load_toron_bootstrap_config,
 };
 use crate::coordinator::DistributedQueryCoordinator;
 use crate::distributed::budget::{ByteCount, QueryBudget};
@@ -31,6 +32,10 @@ use crate::distributed::worker_registry::{
 use crate::error::{BindingError, CatalogError, FrontendError, QueryError};
 use crate::exec::ExecutionContext;
 use crate::ir::{LogicalPlan, SessionId};
+use crate::network::observability::{
+	ListenerName, MetricsRegistry, ObservabilityEndpoints, ObservabilityShutdownReceivers,
+	ReadinessState,
+};
 use crate::network::tls::{ListenerPolicy, ListenerRole, TlsError};
 use crate::quic::{QuicEndpoint, QuicStream};
 use crate::server::transport::QuicTransport;
@@ -73,6 +78,7 @@ pub enum ToronDaemonError {
 pub struct ToronDaemonHandle {
 	pub worker_endpoint: SocketAddr,
 	pub sql_endpoint: Option<SocketAddr>,
+	pub observability_endpoints: Option<ObservabilityEndpoints>,
 }
 
 #[allow(dead_code)]
@@ -93,6 +99,7 @@ pub struct ToronDaemon {
 	listener_tasks: Vec<JoinHandle<()>>,
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
 	drain_timeout: std::time::Duration,
+	readiness: Arc<ReadinessState>,
 }
 
 impl ToronDaemon {
@@ -127,10 +134,16 @@ impl ToronDaemon {
 			.map(|tls| ListenerPolicy::load(tls, &config.node.worker_id))
 			.transpose()?
 			.map(Arc::new);
+		if config.observability.listeners.is_some() && tls_policy.is_none() {
+			return Err(ToronDaemonError::Invalid {
+				message: OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC.to_string(),
+			});
+		}
 		let descriptor_pairs = match &config.catalog.descriptor_bootstrap_path {
 			Some(path) => load_descriptor_bootstrap(path)?,
 			None => Vec::new(),
 		};
+		let descriptors_loaded = descriptor_pairs.len() as u64;
 		let registry = Arc::new(WendelonDescriptorRegistry::from_descriptors(
 			descriptor_pairs,
 		)?);
@@ -232,6 +245,17 @@ impl ToronDaemon {
 		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
 		let mut shutdown_txs = Vec::new();
 		let mut listener_tasks = Vec::new();
+		let metrics = Arc::new(MetricsRegistry::new(
+			descriptors_loaded,
+			config.coordinator.static_workers.len() as u64,
+		));
+		let readiness = Arc::new(ReadinessState::new(
+			true,
+			true,
+			config.observability.listeners.is_some(),
+			descriptors_loaded,
+			config.coordinator.static_workers.len() as u64,
+		));
 
 		if let Some(listener) = listener {
 			let (tcp_shutdown_tx, tcp_shutdown_rx) = oneshot::channel();
@@ -241,6 +265,7 @@ impl ToronDaemon {
 				listener,
 				tcp_shutdown_rx,
 				Arc::clone(&connection_tasks),
+				Arc::clone(&metrics),
 			)));
 		}
 
@@ -251,6 +276,7 @@ impl ToronDaemon {
 			quic_worker_endpoint.clone(),
 			quic_worker_shutdown_rx,
 			Arc::clone(&connection_tasks),
+			Arc::clone(&metrics),
 		)));
 
 		let sql_endpoint = if let Some(sql_config) = config.sql.clone() {
@@ -270,6 +296,7 @@ impl ToronDaemon {
 				sql_quic_endpoint,
 				sql_shutdown_rx,
 				Arc::clone(&connection_tasks),
+				Arc::clone(&metrics),
 				config.node.tenant_id,
 				sql_config.statement_timeout,
 			)));
@@ -277,11 +304,49 @@ impl ToronDaemon {
 		} else {
 			None
 		};
+		let observability_endpoints =
+			if let Some(observability_listeners) = config.observability.listeners.clone() {
+				let policy = tls_policy
+					.as_ref()
+					.ok_or_else(|| ToronDaemonError::Invalid {
+						message: OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC.to_string(),
+					})?;
+				let (health_tx, health_rx) = oneshot::channel();
+				let (ready_tx, ready_rx) = oneshot::channel();
+				let (metrics_tx, metrics_rx) = oneshot::channel();
+				let handles = crate::network::observability::spawn(
+					observability_listeners,
+					TlsAcceptor::from(policy.rustls_server_config_for(ListenerRole::Observability)),
+					Arc::clone(&readiness),
+					Arc::clone(&metrics),
+					ObservabilityShutdownReceivers {
+						health: health_rx,
+						ready: ready_rx,
+						metrics: metrics_rx,
+					},
+				)
+				.await?;
+				let endpoints = ObservabilityEndpoints {
+					health: handles.health.local_addr,
+					ready: handles.ready.local_addr,
+					metrics: handles.metrics.local_addr,
+				};
+				shutdown_txs.extend([health_tx, ready_tx, metrics_tx]);
+				listener_tasks.extend([
+					handles.health.task,
+					handles.ready.task,
+					handles.metrics.task,
+				]);
+				Some(endpoints)
+			} else {
+				None
+			};
 
 		Ok(Self {
 			handle: ToronDaemonHandle {
 				worker_endpoint,
 				sql_endpoint,
+				observability_endpoints,
 			},
 			services: ToronDaemonServices {
 				catalog,
@@ -295,6 +360,7 @@ impl ToronDaemon {
 			listener_tasks,
 			connection_tasks,
 			drain_timeout: config.node.drain_timeout,
+			readiness,
 		})
 	}
 
@@ -303,6 +369,9 @@ impl ToronDaemon {
 	}
 
 	pub async fn shutdown(mut self) -> Result<(), ToronDaemonError> {
+		self.readiness
+			.set_degraded_reason(Some("draining".to_string()))
+			.await;
 		for tx in self.shutdown_txs.drain(..) {
 			let _ = tx.send(());
 		}
@@ -366,6 +435,12 @@ async fn run_start_async(config_path: PathBuf) -> ExitCode {
 	if let Some(sql_endpoint) = daemon.handle().sql_endpoint {
 		println!("SQL_READY {sql_endpoint}");
 	}
+	if let Some(observability) = daemon.handle().observability_endpoints {
+		println!(
+			"OBSERVABILITY_READY health={} ready={} metrics={}",
+			observability.health, observability.ready, observability.metrics
+		);
+	}
 
 	let _ = tokio::signal::ctrl_c().await;
 	eprintln!("toron: draining");
@@ -386,12 +461,14 @@ async fn run_accept_loop(
 	listener: TcpListener,
 	mut shutdown_rx: oneshot::Receiver<()>,
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
+	metrics: Arc<MetricsRegistry>,
 ) {
 	loop {
 		tokio::select! {
 			_ = &mut shutdown_rx => break,
 			accepted = listener.accept() => match accepted {
 				Ok((stream, _peer)) => {
+					metrics.increment_accept(ListenerName::Worker);
 					let worker = Arc::clone(&worker);
 					connection_tasks.lock().await.spawn(async move {
 						if let Err(error) = handle_worker_connection(worker, stream).await {
@@ -420,6 +497,7 @@ async fn run_quic_worker_accept_loop(
 	endpoint: QuicEndpoint,
 	mut shutdown_rx: oneshot::Receiver<()>,
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
+	metrics: Arc<MetricsRegistry>,
 ) {
 	loop {
 		tokio::select! {
@@ -429,6 +507,7 @@ async fn run_quic_worker_accept_loop(
 			}
 			accepted = endpoint.accept_connection() => match accepted {
 				Ok(connection) => {
+					metrics.increment_accept(ListenerName::Worker);
 					let worker = Arc::clone(&worker);
 					connection_tasks.lock().await.spawn(async move {
 						match QuicEndpoint::accept_stream_on(&connection).await {
@@ -465,6 +544,7 @@ async fn run_sql_accept_loop(
 	endpoint: QuicEndpoint,
 	mut shutdown_rx: oneshot::Receiver<()>,
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
+	metrics: Arc<MetricsRegistry>,
 	tenant_id: crate::storage::TenantId,
 	statement_timeout: std::time::Duration,
 ) {
@@ -476,6 +556,7 @@ async fn run_sql_accept_loop(
 			}
 			accepted = endpoint.accept_connection() => match accepted {
 				Ok(connection) => {
+					metrics.increment_accept(ListenerName::Sql);
 					let coordinator = Arc::clone(&coordinator);
 					connection_tasks.lock().await.spawn(async move {
 						match QuicEndpoint::accept_stream_on(&connection).await {
@@ -693,7 +774,7 @@ fn encode_sql_batch(batch: &RecordBatch) -> Result<Vec<u8>, QueryError> {
 
 fn install_tracing(config: &ToronBootstrapConfig) {
 	match config.observability.format {
-		crate::config::ToronTracingFormat::Pretty => {}
+		crate::config::TracingFormat::Pretty => {}
 	}
 	let filter = EnvFilter::try_from_default_env()
 		.unwrap_or_else(|_| EnvFilter::new(config.observability.level.clone()));

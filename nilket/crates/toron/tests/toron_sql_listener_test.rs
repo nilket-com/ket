@@ -13,10 +13,10 @@ use rcgen::{
 	KeyUsagePurpose,
 };
 use toron::config::{
-	CoordinatorConfig, SqlConfig, SqlTransport, TlsConfig, ToronBootstrapConfig,
-	ToronCatalogConfig, ToronDescriptorBootstrap, ToronDescriptorBootstrapTable, ToronNodeConfig,
-	ToronObservabilityConfig, ToronStorageConfig, ToronTracingFormat, ToronWendelonBootstrapPeer,
-	ToronWendelonStorageConfig, ToronWorkerConfig,
+	CoordinatorConfig, ObservabilityConfig, SqlConfig, SqlTransport, TlsConfig,
+	ToronBootstrapConfig, ToronCatalogConfig, ToronDescriptorBootstrap,
+	ToronDescriptorBootstrapTable, ToronNodeConfig, ToronStorageConfig, ToronWendelonBootstrapPeer,
+	ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::identity::{QueryId, WorkerId};
@@ -419,9 +419,10 @@ fn toron_config_with_descriptor(
 			static_workers: Vec::new(),
 		},
 		tls: None,
-		observability: ToronObservabilityConfig {
+		observability: ObservabilityConfig {
 			level: "info".to_string(),
-			format: ToronTracingFormat::Pretty,
+			format: TracingFormat::Pretty,
+			listeners: None,
 		},
 	}
 }

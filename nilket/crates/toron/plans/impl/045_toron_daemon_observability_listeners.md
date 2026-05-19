@@ -62,8 +62,8 @@ Resolve the following before Phase 1; capture in
    threaded into the listener accept loops + `admit_san` rejection
    paths.
 
-7. **Drain-state interior mutability shape.** `ReadinessReporter`
-   trait must expose a `set_degraded_reason` mutator. Choose between
+7. **Drain-state interior mutability shape.** `ReadinessState`
+   must expose a `set_degraded_reason` mutator. Choose between
    `RwLock<Option<String>>` and `arc-swap::ArcSwapOption<String>`.
    Phase 0 decides; both work for V1 (lock-free under arc-swap is
    nice-to-have but not load-bearing).
@@ -151,7 +151,7 @@ pub const HEALTH_PATH: &str = "/health";
 pub const READY_PATH: &str = "/ready";
 pub const METRICS_PATH: &str = "/metrics";
 
-pub struct ObservabilityListenerAddresses {
+pub struct ObservabilityListeners {
     pub health: SocketAddr,
     pub ready: SocketAddr,
     pub metrics: SocketAddr,
@@ -192,17 +192,25 @@ impl ReadinessSnapshot {
         if self.is_ready() { "200 OK" } else { "503 Service Unavailable" }
     }
     pub fn to_json(&self) -> String {
-        let mut body = serde_json::Map::new();
-        body.insert("ready".into(), Value::Bool(self.ready));
-        body.insert("worker_listener_bound".into(), Value::Bool(self.worker_listener_bound));
-        body.insert("sql_listener_bound".into(), Value::Bool(self.sql_listener_bound));
-        body.insert("observability_listeners_bound".into(), Value::Bool(self.observability_listeners_bound));
-        body.insert("descriptors_loaded".into(), Value::from(self.descriptors_loaded));
-        body.insert("static_workers_configured".into(), Value::from(self.static_workers_configured));
-        body.insert("uptime_seconds".into(), Value::from(self.uptime_seconds));
-        body.insert("degraded_reason".into(),
-            self.degraded_reason.as_ref().map(|r| Value::String(r.clone())).unwrap_or(Value::Null));
-        serde_json::Value::Object(body).to_string()
+        // Emit a stable object in the ADR-pinned field order. Do not
+        // rely on serde_json::Map iteration order unless the ordered
+        // map feature is deliberately enabled.
+        let degraded_reason = self
+            .degraded_reason
+            .as_ref()
+            .map(|reason| serde_json::to_string(reason).expect("serialize degraded reason"))
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            "{{\"ready\":{},\"worker_listener_bound\":{},\"sql_listener_bound\":{},\"observability_listeners_bound\":{},\"descriptors_loaded\":{},\"static_workers_configured\":{},\"uptime_seconds\":{},\"degraded_reason\":{}}}",
+            self.ready,
+            self.worker_listener_bound,
+            self.sql_listener_bound,
+            self.observability_listeners_bound,
+            self.descriptors_loaded,
+            self.static_workers_configured,
+            self.uptime_seconds,
+            degraded_reason
+        )
     }
 }
 ```
@@ -212,10 +220,11 @@ IDs, task IDs, table names, certificate subjects, or UUIDs in the V1
 readiness JSON.
 
 ```rust
-#[async_trait]
-pub trait ReadinessReporter: Send + Sync {
-    async fn snapshot(&self) -> ReadinessSnapshot;
-    fn set_degraded_reason(&self, reason: Option<String>);
+pub struct ReadinessState { ... }
+
+impl ReadinessState {
+    pub async fn snapshot(&self) -> ReadinessSnapshot;
+    pub async fn set_degraded_reason(&self, reason: Option<String>);
 }
 ```
 
@@ -224,9 +233,9 @@ only plaintext path:
 
 ```rust
 pub async fn spawn(
-    addresses: ObservabilityListenerAddresses,
+    addresses: ObservabilityListeners,
     tls_acceptor: TlsAcceptor,
-    reporter: Arc<dyn ReadinessReporter>,
+    readiness: Arc<ReadinessState>,
     metrics: Arc<MetricsRegistry>,
     cluster_domain: String,
 ) -> std::io::Result<ObservabilityHandles> { /* ... */ }
@@ -581,20 +590,19 @@ convention) assert string presence/absence. Runtime guards (#1, #2,
 
 ## Phase 8: Integration Fixtures
 
-### `crates/toron/tests/toron_observability_config_test.rs` (new)
+### `crates/toron/tests/toron_observability_listener_test.rs` (new)
 
 1. `toron_config_missing_observability_section_loads_byte_identical_to_adr044`
 2. `toron_health_endpoint_rejects_non_loopback_bind` — config-time.
-3. `toron_config_observability_port_collision_rejected`
-
-### `crates/toron/tests/toron_observability_listener_test.rs` (new)
-
-4. `toron_health_endpoint_returns_200_ok_with_lowercase_ok_body`
-5. `toron_ready_endpoint_emits_json_snapshot_with_expected_fields_in_stable_order`
-6. `toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_names`
-7. `toron_ready_and_metrics_reject_peer_without_monitor_san_prefix`
-8. `toron_observability_ready_stdout_line_appended_after_sql_ready_with_pinned_format`
-9. `toron_observability_listener_closes_slow_client_after_read_timeout`
+3. `toron_ready_and_metrics_require_tls_when_configured` — config-time
+   witness for D2's stricter TLS requirement even on loopback.
+4. `toron_config_observability_port_collision_rejected`
+5. `toron_health_endpoint_returns_200_ok_with_lowercase_ok_body`
+6. `toron_ready_endpoint_emits_json_snapshot_with_expected_fields_in_stable_order`
+7. `toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_names`
+8. `toron_ready_and_metrics_reject_peer_without_monitor_san_prefix`
+9. `toron_observability_ready_stdout_line_appended_after_sql_ready_with_pinned_format`
+10. `toron_observability_listener_closes_slow_client_after_read_timeout`
    — iter-3 sharpening witness; open a TCP connection to `/health`,
    write 5 bytes, pause 6 seconds; expect EOF on read (server closed
    connection without writing response).
@@ -614,7 +622,7 @@ Capture in `plans/impl/045_*_evidence.md`:
 2. **Phase 1-6 evidence:** `cargo test -p toron --tests` green;
    `cargo clippy -p toron -- -D warnings` clean.
 3. **Phase 7 evidence:** all 12 + 1 architecture guards pass.
-4. **Phase 8 evidence:** all 9 required fixtures pass; optional
+4. **Phase 8 evidence:** all 10 required fixtures pass; optional
    V1-evidence fixtures captured separately.
 5. **ADR 042 / 043 / 044 invariant preservation:**
    - example configs without `[observability]` boot byte-identical;
@@ -626,7 +634,7 @@ Capture in `plans/impl/045_*_evidence.md`:
 6. **Hyper / axum / actix absence:** `cargo tree -p toron` confirms
    no HTTP framework in transitive deps beyond what was already
    present.
-7. **Slowloris read-timeout effective:** fixture 9 passes; manual
+7. **Slowloris read-timeout effective:** slow-client fixture passes; manual
    spot-check with `nc` confirms hung connection is closed by server
    after ~5 seconds.
 
@@ -667,7 +675,7 @@ with:
 - [ ] Phase 6 drain-state hook flips `/ready` to 503 within one poll
       interval on SIGTERM.
 - [ ] Phase 7 all 12 ADR 045 guards + 1 convention guard pass.
-- [ ] Phase 8 all 9 required fixtures pass.
+- [ ] Phase 8 all 10 required fixtures pass.
 - [ ] `toron_fixture_worker.rs` source unchanged (10th preserved
       cycle).
 - [ ] ADR 042 / 043 / 044 guards continue to pass.

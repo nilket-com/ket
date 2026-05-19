@@ -23,6 +23,14 @@ pub const NON_LOOPBACK_SQL_BIND_DIAGNOSTIC: &str =
 	"sql listener requires authenticated transport for non-loopback bind address";
 pub const NON_LOOPBACK_STATIC_WORKER_DIAGNOSTIC: &str =
 	"coordinator static workers require authenticated transport for non-loopback endpoints";
+pub const OBSERVABILITY_LISTENERS_ALL_OR_NONE_DIAGNOSTIC: &str =
+	"observability listeners require health, ready, and metrics bind addresses together";
+pub const OBSERVABILITY_HEALTH_LOOPBACK_DIAGNOSTIC: &str =
+	"observability health listener must bind a loopback address";
+pub const OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC: &str =
+	"observability ready and metrics listeners require authenticated transport";
+pub const LISTENER_BIND_COLLISION_DIAGNOSTIC: &str =
+	"listener bind addresses must be pairwise distinct";
 
 const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -76,6 +84,14 @@ include_self_worker = true
 [observability]
 level = "info"
 format = "pretty"
+
+# [observability.listeners]
+# /health is plaintext and loopback-only.
+# /ready and /metrics require [tls] and admit scraper client certs
+# whose DNS SAN matches monitor-<principal>.<cluster_domain>.
+# health = "127.0.0.1:7780"
+# ready = "127.0.0.1:7781"
+# metrics = "127.0.0.1:7782"
 "#;
 
 #[derive(Debug, Error)]
@@ -99,7 +115,7 @@ pub struct ToronBootstrapConfig {
 	pub sql: Option<SqlConfig>,
 	pub coordinator: CoordinatorConfig,
 	pub tls: Option<TlsConfig>,
-	pub observability: ToronObservabilityConfig,
+	pub observability: ObservabilityConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,14 +198,22 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToronObservabilityConfig {
+pub struct ObservabilityConfig {
 	pub level: String,
-	pub format: ToronTracingFormat,
+	pub format: TracingFormat,
+	pub listeners: Option<ObservabilityListeners>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToronTracingFormat {
+pub enum TracingFormat {
 	Pretty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityListeners {
+	pub health: SocketAddr,
+	pub ready: SocketAddr,
+	pub metrics: SocketAddr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,7 +241,7 @@ struct RawToronBootstrapConfig {
 	coordinator: RawCoordinatorConfig,
 	tls: Option<RawTlsConfig>,
 	#[serde(default)]
-	observability: RawToronObservabilityConfig,
+	observability: RawObservabilityConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,11 +329,19 @@ struct RawTlsConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawToronObservabilityConfig {
+struct RawObservabilityConfig {
 	#[serde(default = "default_observability_level")]
 	level: String,
 	#[serde(default = "default_observability_format")]
 	format: String,
+	listeners: Option<RawObservabilityListeners>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawObservabilityListeners {
+	health: Option<String>,
+	ready: Option<String>,
+	metrics: Option<String>,
 }
 
 impl Default for RawToronNodeConfig {
@@ -332,11 +364,12 @@ impl Default for RawToronWorkerConfig {
 	}
 }
 
-impl Default for RawToronObservabilityConfig {
+impl Default for RawObservabilityConfig {
 	fn default() -> Self {
 		Self {
 			level: default_observability_level(),
 			format: default_observability_format(),
+			listeners: None,
 		}
 	}
 }
@@ -465,14 +498,13 @@ fn normalize_config(
 		raw.storage.wendelon.tls_ca_path,
 		base_dir,
 	)?;
-	let format = match raw.observability.format.as_str() {
-		"pretty" => ToronTracingFormat::Pretty,
-		other => {
-			return Err(invalid(format!(
-				"unsupported observability format: {other}"
-			)));
-		}
-	};
+	let observability = normalize_observability_config(raw.observability, tls.is_some())?;
+	let listener_addresses = listener_bind_addresses(
+		task_listener_bind,
+		sql.as_ref(),
+		observability.listeners.as_ref(),
+	);
+	validate_pairwise_distinct_listeners(&listener_addresses)?;
 
 	Ok(ToronBootstrapConfig {
 		node: ToronNodeConfig {
@@ -513,10 +545,95 @@ fn normalize_config(
 			static_workers,
 		},
 		tls,
-		observability: ToronObservabilityConfig {
-			level: raw.observability.level,
-			format,
-		},
+		observability,
+	})
+}
+
+fn listener_bind_addresses(
+	task_listener_bind: SocketAddr,
+	sql: Option<&SqlConfig>,
+	observability: Option<&ObservabilityListeners>,
+) -> Vec<SocketAddr> {
+	let mut addresses = vec![task_listener_bind];
+	if let Some(sql) = sql {
+		addresses.push(sql.listener_bind);
+	}
+	if let Some(observability) = observability {
+		addresses.extend([
+			observability.health,
+			observability.ready,
+			observability.metrics,
+		]);
+	}
+	addresses
+}
+
+fn validate_pairwise_distinct_listeners(addresses: &[SocketAddr]) -> Result<(), ToronConfigError> {
+	let mut seen = HashSet::new();
+	for address in addresses {
+		if address.port() == 0 {
+			continue;
+		}
+		if !seen.insert(*address) {
+			return Err(invalid(LISTENER_BIND_COLLISION_DIAGNOSTIC));
+		}
+	}
+	Ok(())
+}
+
+fn normalize_observability_config(
+	raw: RawObservabilityConfig,
+	tls_present: bool,
+) -> Result<ObservabilityConfig, ToronConfigError> {
+	let format = match raw.format.as_str() {
+		"pretty" => TracingFormat::Pretty,
+		other => {
+			return Err(invalid(format!(
+				"unsupported observability format: {other}"
+			)));
+		}
+	};
+	let listeners = raw
+		.listeners
+		.map(|listeners| normalize_observability_listeners(listeners, tls_present))
+		.transpose()?;
+	Ok(ObservabilityConfig {
+		level: raw.level,
+		format,
+		listeners,
+	})
+}
+
+fn normalize_observability_listeners(
+	raw: RawObservabilityListeners,
+	tls_present: bool,
+) -> Result<ObservabilityListeners, ToronConfigError> {
+	let (Some(health), Some(ready), Some(metrics)) = (raw.health, raw.ready, raw.metrics) else {
+		return Err(invalid(OBSERVABILITY_LISTENERS_ALL_OR_NONE_DIAGNOSTIC));
+	};
+	let health = health.parse::<SocketAddr>().map_err(|error| {
+		invalid(format!(
+			"invalid observability health bind address: {error}"
+		))
+	})?;
+	let ready = ready
+		.parse::<SocketAddr>()
+		.map_err(|error| invalid(format!("invalid observability ready bind address: {error}")))?;
+	let metrics = metrics.parse::<SocketAddr>().map_err(|error| {
+		invalid(format!(
+			"invalid observability metrics bind address: {error}"
+		))
+	})?;
+	if !health.ip().is_loopback() {
+		return Err(invalid(OBSERVABILITY_HEALTH_LOOPBACK_DIAGNOSTIC));
+	}
+	if !tls_present {
+		return Err(invalid(OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC));
+	}
+	Ok(ObservabilityListeners {
+		health,
+		ready,
+		metrics,
 	})
 }
 

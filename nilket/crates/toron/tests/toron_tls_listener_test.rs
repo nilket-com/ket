@@ -9,9 +9,9 @@ use rcgen::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use toron::config::{
-	CoordinatorConfig, SqlConfig, SqlTransport, TlsConfig, ToronBootstrapConfig,
-	ToronCatalogConfig, ToronNodeConfig, ToronObservabilityConfig, ToronStorageConfig,
-	ToronTracingFormat, ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig,
+	CoordinatorConfig, ObservabilityConfig, SqlConfig, SqlTransport, TlsConfig,
+	ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig, ToronStorageConfig,
+	ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::identity::{AttemptId, QueryId, StageId, TaskId, TaskIdentity, WorkerId};
@@ -475,9 +475,10 @@ fn tls_config(
 			peer_ca: pki.ca_cert.clone(),
 			cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
 		}),
-		observability: ToronObservabilityConfig {
+		observability: ObservabilityConfig {
 			level: "info".to_string(),
-			format: ToronTracingFormat::Pretty,
+			format: TracingFormat::Pretty,
+			listeners: None,
 		},
 	}
 }

@@ -21,6 +21,7 @@ use crate::distributed::identity::WorkerId;
 
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 pub const AUTH_QUIC_ALPN: &[u8] = b"sql-task-auth";
+pub const OBSERVABILITY_HTTP_ALPN: &[u8] = b"http/1.1";
 
 const SUBJECT_ALT_NAME_OID: &[u8] = &[0x55, 0x1D, 0x11];
 const DNS_NAME_TAG: u8 = 0x82;
@@ -52,12 +53,14 @@ pub enum TlsError {
 pub enum ListenerRole {
 	WorkerTask,
 	Sql,
+	Observability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerKind {
 	SiblingDaemon { worker_id: WorkerId },
 	Client { principal: String },
+	Monitor { principal: String },
 }
 
 pub fn canonical_daemon_dns_name(worker_id: &WorkerId, cluster_domain: &str) -> String {
@@ -66,6 +69,10 @@ pub fn canonical_daemon_dns_name(worker_id: &WorkerId, cluster_domain: &str) -> 
 
 pub fn canonical_client_dns_name(principal: &str, cluster_domain: &str) -> String {
 	format!("client-{principal}.{cluster_domain}")
+}
+
+pub fn canonical_monitor_dns_name(principal: &str, cluster_domain: &str) -> String {
+	format!("monitor-{principal}.{cluster_domain}")
 }
 
 pub fn validate_cluster_domain(cluster_domain: &str) -> Result<(), TlsError> {
@@ -124,10 +131,16 @@ pub fn admit_san(
 			})
 		}
 		("toron", ListenerRole::Sql) => Err(TlsError::SanRoleRejected),
+		("toron", ListenerRole::Observability) => Err(TlsError::SanRoleRejected),
 		("client", ListenerRole::Sql) => Ok(PeerKind::Client {
 			principal: id_token.to_string(),
 		}),
 		("client", ListenerRole::WorkerTask) => Err(TlsError::SanRoleRejected),
+		("client", ListenerRole::Observability) => Err(TlsError::SanRoleRejected),
+		("monitor", ListenerRole::Observability) => Ok(PeerKind::Monitor {
+			principal: id_token.to_string(),
+		}),
+		("monitor", ListenerRole::WorkerTask | ListenerRole::Sql) => Err(TlsError::SanRoleRejected),
 		_ => Err(TlsError::SanShapeRejected),
 	}
 }
@@ -136,6 +149,7 @@ pub struct ListenerPolicy {
 	cluster_domain: String,
 	server_config_worker_task: quinn::ServerConfig,
 	server_config_sql: quinn::ServerConfig,
+	server_config_observability: Arc<ServerConfig>,
 	client_config: quinn::ClientConfig,
 }
 
@@ -160,6 +174,12 @@ impl ListenerPolicy {
 				ListenerRole::Sql,
 				&config.cluster_domain,
 			)?,
+			server_config_observability: Arc::new(build_rustls_server_config(
+				&material,
+				ListenerRole::Observability,
+				&config.cluster_domain,
+				OBSERVABILITY_HTTP_ALPN,
+			)?),
 			client_config: client_config(&material)?,
 		})
 	}
@@ -172,6 +192,18 @@ impl ListenerPolicy {
 		match role {
 			ListenerRole::WorkerTask => self.server_config_worker_task.clone(),
 			ListenerRole::Sql => self.server_config_sql.clone(),
+			ListenerRole::Observability => {
+				panic!("observability uses rustls_server_config_for")
+			}
+		}
+	}
+
+	pub fn rustls_server_config_for(&self, role: ListenerRole) -> Arc<ServerConfig> {
+		match role {
+			ListenerRole::Observability => Arc::clone(&self.server_config_observability),
+			ListenerRole::WorkerTask | ListenerRole::Sql => {
+				panic!("worker and SQL listeners use QUIC server_config_for")
+			}
 		}
 	}
 
@@ -255,6 +287,18 @@ fn server_config_for(
 	role: ListenerRole,
 	cluster_domain: &str,
 ) -> Result<quinn::ServerConfig, TlsError> {
+	let rustls_config = build_rustls_server_config(material, role, cluster_domain, AUTH_QUIC_ALPN)?;
+	let quic_config = QuicServerConfig::try_from(rustls_config)
+		.map_err(|error| TlsError::Config(format!("QUIC server config: {error}")))?;
+	Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_config)))
+}
+
+fn build_rustls_server_config(
+	material: &TlsMaterial,
+	role: ListenerRole,
+	cluster_domain: &str,
+	alpn: &[u8],
+) -> Result<ServerConfig, TlsError> {
 	install_rustls_provider();
 	let verifier = WebPkiClientVerifier::builder(material.ca_roots.clone())
 		.build()
@@ -268,10 +312,8 @@ fn server_config_for(
 		.with_client_cert_verifier(role_verifier)
 		.with_single_cert(material.cert_chain.clone(), material.key.clone_key())
 		.map_err(|error| TlsError::Config(format!("server cert/key: {error}")))?;
-	rustls_config.alpn_protocols = vec![AUTH_QUIC_ALPN.to_vec()];
-	let quic_config = QuicServerConfig::try_from(rustls_config)
-		.map_err(|error| TlsError::Config(format!("QUIC server config: {error}")))?;
-	Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_config)))
+	rustls_config.alpn_protocols = vec![alpn.to_vec()];
+	Ok(rustls_config)
 }
 
 fn client_config(material: &TlsMaterial) -> Result<quinn::ClientConfig, TlsError> {
@@ -624,6 +666,33 @@ mod tests {
 			),
 			Err(TlsError::SanRoleRejected)
 		));
+	}
+
+	#[test]
+	fn observability_listener_admits_only_monitor_principal_sans() {
+		let admitted = admit_san(
+			"monitor-prometheus.cluster.local",
+			ListenerRole::Observability,
+			DOMAIN,
+		)
+		.expect("admit monitor");
+
+		assert_eq!(
+			admitted,
+			PeerKind::Monitor {
+				principal: "prometheus".to_string(),
+			}
+		);
+		let daemon_san = format!("toron-{WORKER_UUID}.{DOMAIN}");
+		for san in ["client-analytics.cluster.local", daemon_san.as_str()] {
+			assert!(
+				matches!(
+					admit_san(san, ListenerRole::Observability, DOMAIN),
+					Err(TlsError::SanRoleRejected)
+				),
+				"{san} should be rejected for observability"
+			);
+		}
 	}
 
 	#[test]

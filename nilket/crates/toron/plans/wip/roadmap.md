@@ -3385,10 +3385,10 @@ along with the forward-sequence rewrite.
   5-second per-request read timeout preventing
   slowloris attacks against externally reachable
   `/ready` and `/metrics` listeners, new guard
-  12 + new gating fixture 9); iter-4 final triple
+  12 + new slow-client gating fixture); iter-4 final triple
   ratification, no new content. Final promoted
   D-set: **10 decisions, 12 architecture guards
-  + 1 convention guard, 9 required integration
+  + 1 convention guard, 10 required integration
   fixtures + 2 V1-evidence optional fixtures**.
   **Shape A selected (observability listeners as
   composition over ADR 044's TLS policy
@@ -3449,7 +3449,7 @@ along with the forward-sequence rewrite.
   `bind_unavailable`, `request_timeout`).
   **D6 critical decision:** `/ready` JSON
   snapshot mirrors Wendelon's `to_json()` shape
-  using `serde_json::Map` insertion-ordering;
+  using stable field ordering;
   `is_ready()` + `http_status()` derivation
   pattern parallel to Wendelon's. Toron-
   appropriate low-cardinality fields (no raft,
@@ -3459,14 +3459,16 @@ along with the forward-sequence rewrite.
   `/ready` returns 503; `/health` continues 200
   (liveness ≠ readiness). Operator-essential for
   Kubernetes rolling deployments.
-  **D7 critical decision:** three explicit
+  **D7 critical decision:** four explicit
   Wendelon-pattern non-carry-overs: no
   `RevocationSnapshot` (preserves ADR 044 D7);
   no `AuditSink` per-scrape emission (Toron has
   no audit subsystem; preserves ADR 042 D13
   tracing-only-observability stance); no OTLP
-  traces export. Single triple-forbidden-import
-  source-text guard enforces.
+  traces export; no Wendelon-style
+  project-prefixed metric names. Guard 7 enforces
+  the runtime-scope non-carry-overs; guard 10
+  enforces brand-clean metric names.
   **D8 critical decision:** preserve ADR 042 D12
   `READY <worker>` and ADR 043 D16 `SQL_READY
   <sql>` lines **byte-identical**; append fourth
@@ -3494,14 +3496,14 @@ along with the forward-sequence rewrite.
   **Twelve architecture guards + 1 convention
   guard** including guard 7
   (`adr045_no_revocation_no_audit_no_traces_in_observability`)
-  pinning the triple Wendelon non-carry-over,
+  pinning the runtime-scope Wendelon non-carry-overs,
   guard 11
   (`adr045_ready_snapshot_excludes_high_cardinality_identity_fields`)
   pinning the low-cardinality readiness surface,
   and the iter-3 sharpening guard 12
   (`adr045_observability_http_has_per_request_read_timeout`)
   pinning the slowloris-protection contract.
-  **Nine required integration fixtures + 2
+  **Ten required integration fixtures + 2
   optional V1-evidence** including the iter-3
   sharpening witness
   `toron_observability_listener_closes_slow_client_after_read_timeout`
@@ -3607,7 +3609,7 @@ method handling, drain-state semantics); iter-3
 DoS-hardening sharpening (5-second per-request
 read timeout); iter-4 final triple ratification,
 no new content. Final D-set: **10 decisions,
-12 architecture guards + 1 convention guard, 9
+12 architecture guards + 1 convention guard, 10
 required integration fixtures + 2 V1-evidence
 optional fixtures**.
 
@@ -3635,8 +3637,8 @@ HTTP path constants (`/health`, `/ready`,
 hand-rolled HTTP helper shape (`read_request` /
 `write_response` / `parse_request_line`);
 `ReadinessSnapshot.to_json()` derivation pattern
-(`serde_json::Map` insertion-ordering +
-`is_ready()` + `http_status()`);
+(stable field ordering + `is_ready()` +
+`http_status()`);
 scrape-counting selectivity (counted on
 `/metrics` only, not `/ready`);
 `tokio_rustls::TlsAcceptor` for `/ready` and
@@ -3645,13 +3647,14 @@ Toron+Wendelon cluster reuse the same scrape
 topology mental model.
 
 **Wendelon-pattern non-carry-overs (explicit).**
-Seven shapes are deliberately not threaded into
+Eight shapes are deliberately not threaded into
 Toron V1: `RevocationSnapshot` (preserves ADR
 044 D7); `ActorPermission` model (Toron stays
 with ADR 044's SAN-prefix admission model);
 `AuditSink` per-scrape emission (Toron has no
 audit subsystem); `[observability.traces]` OTLP
-push exporter; `ReadinessSnapshot` raft fields
+push exporter; Wendelon-style project-prefixed
+metric family names; `ReadinessSnapshot` raft fields
 (`epoch`, `leader_id`, `cluster_members`);
 `display_node_id("n-NN")` formatting helper; and
 high-cardinality readiness identity fields.

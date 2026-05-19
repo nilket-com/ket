@@ -12,7 +12,7 @@ use toron::exec::Executor;
 use toron::ir::{Expr, LogicalPlan, ScalarValue, TableId};
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, ListenerRole, PeerKind, admit_san, canonical_client_dns_name,
-	canonical_daemon_dns_name,
+	canonical_daemon_dns_name, canonical_monitor_dns_name,
 };
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -6657,28 +6657,318 @@ fn adr044_ready_lines_are_unchanged() {
 }
 
 #[test]
-fn adr044_no_observability_listener_in_this_adr() {
-	let manifest_dir = manifest_dir();
-	let offenders = source_lines(&manifest_dir.join("src"))
-		.into_iter()
-		.filter(|(_, _, line)| {
-			[
-				"health_listener",
-				"metrics_listener",
-				"ready_listener",
-				"prometheus_listener",
-				"observability_listener",
-			]
-			.iter()
-			.any(|symbol| line.contains(symbol))
-		})
-		.collect::<Vec<_>>();
+fn adr045_observability_section_is_optional_for_backward_compat() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	for required in [
+		"pub struct ObservabilityConfig",
+		"pub struct ObservabilityListeners",
+		"pub listeners: Option<ObservabilityListeners>",
+		"listeners: Option<RawObservabilityListeners>",
+		"listeners: None",
+		"[observability]",
+		"# [observability.listeners]",
+		"normalize_observability_config(raw.observability, tls.is_some())",
+	] {
+		assert!(
+			config.contains(required),
+			"missing ADR 045 optional config token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr045_health_listener_is_loopback_only_always() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(config.contains("OBSERVABILITY_HEALTH_LOOPBACK_DIAGNOSTIC"));
+	assert!(config.contains("!health.ip().is_loopback()"));
+	assert!(config.contains("observability health listener must bind a loopback address"));
+}
+
+#[test]
+fn adr045_ready_and_metrics_require_tls_when_configured() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert!(config.contains("OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC"));
+	assert!(config.contains("if !tls_present"));
+	assert!(daemon.contains("config.observability.listeners.is_some() && tls_policy.is_none()"));
+	assert!(daemon.contains("rustls_server_config_for(ListenerRole::Observability)"));
+	assert!(daemon.contains("TlsAcceptor::from"));
+}
+
+#[test]
+fn adr045_monitor_san_prefix_admission_is_per_listener() {
+	let monitor_san = canonical_monitor_dns_name("prometheus", DEFAULT_CLUSTER_DOMAIN);
+	let admitted = admit_san(
+		&monitor_san,
+		ListenerRole::Observability,
+		DEFAULT_CLUSTER_DOMAIN,
+	)
+	.expect("admit monitor SAN");
+	assert_eq!(
+		admitted,
+		PeerKind::Monitor {
+			principal: "prometheus".to_string(),
+		}
+	);
 
 	assert!(
-		offenders.is_empty(),
-		"Toron source contains ADR 044 observability listener token(s):\n{}",
-		format_offenders(&manifest_dir, &offenders)
+		admit_san(
+			&monitor_san,
+			ListenerRole::WorkerTask,
+			DEFAULT_CLUSTER_DOMAIN
+		)
+		.is_err()
 	);
+	assert!(admit_san(&monitor_san, ListenerRole::Sql, DEFAULT_CLUSTER_DOMAIN).is_err());
+
+	let worker_id = WorkerId::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0000);
+	let daemon_san = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+	let client_san = canonical_client_dns_name("analytics", DEFAULT_CLUSTER_DOMAIN);
+	for san in [
+		daemon_san.as_str(),
+		client_san.as_str(),
+		"monitor_ops.cluster.local",
+	] {
+		assert!(
+			admit_san(san, ListenerRole::Observability, DEFAULT_CLUSTER_DOMAIN).is_err(),
+			"observability listener should reject {san}"
+		);
+	}
+}
+
+#[test]
+fn adr045_observability_listeners_use_hand_rolled_http_no_hyper_no_axum() {
+	let manifest_dir = manifest_dir();
+	for path in [
+		"src/network/observability.rs",
+		"src/network/observability_http.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir.join(path)).expect("read source");
+		assert!(source.contains("read_request"));
+		assert!(source.contains("write_response"));
+		for forbidden in [
+			"hyper",
+			"axum",
+			"actix",
+			"tower",
+			"Request<",
+			"Response<",
+			"chunked",
+			"keep-alive",
+			"http2",
+			"quinn",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{path} contains ADR 045-forbidden HTTP framework/protocol token {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr045_metrics_uses_prometheus_text_format_no_histograms() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability source");
+
+	assert!(observability.contains("text/plain; version=0.0.4; charset=utf-8"));
+	assert!(observability.contains("# TYPE daemon_ready gauge"));
+	assert!(observability.contains("listener_accepts_total"));
+	assert!(observability.contains("metrics_scrapes_total"));
+	for forbidden in ["_bucket", "_sum", "_count", "histogram", "Histogram"] {
+		assert!(
+			!observability.contains(forbidden),
+			"ADR 045 metrics must not introduce histogram token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr045_no_revocation_no_audit_no_traces_in_observability() {
+	for path in [
+		"src/network/observability.rs",
+		"src/network/observability_http.rs",
+		"src/network/tls.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir().join(path)).expect("read source");
+		for forbidden in [
+			"RevocationSnapshot",
+			"CRL",
+			"OCSP",
+			"AuditSink",
+			"audit_event",
+			"opentelemetry",
+			"OTLP",
+			"ActorPermission",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{path} contains ADR 045-forbidden observability expansion token {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr045_observability_ready_line_is_appended_not_replaced() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	let ready = daemon
+		.find("println!(\"READY {}\", daemon.handle().worker_endpoint);")
+		.expect("READY line");
+	let sql_ready = daemon
+		.find("println!(\"SQL_READY {sql_endpoint}\");")
+		.expect("SQL_READY line");
+	let observability_ready = daemon
+		.find("\"OBSERVABILITY_READY health={} ready={} metrics={}\"")
+		.expect("OBSERVABILITY_READY line");
+	assert!(ready < sql_ready);
+	assert!(sql_ready < observability_ready);
+}
+
+#[test]
+fn adr045_one_tls_material_set_per_daemon_still_holds() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let tls = std::fs::read_to_string(manifest_dir().join("src/network/tls.rs"))
+		.expect("read TLS source");
+
+	assert_eq!(config.matches("tls: Option<RawTlsConfig>").count(), 1);
+	assert_eq!(config.matches("pub tls: Option<TlsConfig>").count(), 1);
+	assert_eq!(daemon.matches("ListenerPolicy::load").count(), 1);
+	assert!(tls.contains("server_config_worker_task"));
+	assert!(tls.contains("server_config_sql"));
+	assert!(tls.contains("server_config_observability"));
+	for forbidden in [
+		"[observability.tls]",
+		"observability_tls",
+		"ready_tls",
+		"metrics_tls",
+	] {
+		assert!(
+			!config.contains(forbidden) && !daemon.contains(forbidden),
+			"ADR 045 must reuse daemon TLS material set, found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr045_initial_metric_set_is_functional_brand_clean_and_stable() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability source");
+
+	for required in [
+		"daemon_ready",
+		"daemon_uptime_seconds",
+		"listener_up",
+		"listener_accepts_total",
+		"listener_rejects_total",
+		"metrics_scrapes_total",
+		"descriptors_loaded",
+		"static_workers_configured",
+		"listener=\\\"{}\\\"",
+		"reason=\\\"{}\\\"",
+	] {
+		assert!(
+			observability.contains(required),
+			"missing ADR 045 metric token {required}"
+		);
+	}
+	for forbidden in [
+		"toron_",
+		"tenant_id",
+		"worker_id",
+		"query_id",
+		"task_id",
+		"table_id",
+		"sql_text",
+		"certificate",
+	] {
+		assert!(
+			!observability.contains(forbidden),
+			"ADR 045 metrics include forbidden high-cardinality/branded token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr045_ready_snapshot_excludes_high_cardinality_identity_fields() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability source");
+
+	for required in [
+		"pub struct ReadinessSnapshot",
+		"pub ready: bool",
+		"pub worker_listener_bound: bool",
+		"pub sql_listener_bound: bool",
+		"pub observability_listeners_bound: bool",
+		"pub descriptors_loaded: u64",
+		"pub static_workers_configured: u32",
+		"pub uptime_seconds: u64",
+		"pub degraded_reason: Option<String>",
+	] {
+		assert!(
+			observability.contains(required),
+			"missing ADR 045 readiness field {required}"
+		);
+	}
+	for forbidden in [
+		"worker_id",
+		"tenant_id",
+		"query_id",
+		"task_id",
+		"table_id",
+		"sql_text",
+		"certificate",
+		"endpoint",
+		"uuid",
+	] {
+		assert!(
+			!observability.contains(forbidden),
+			"ADR 045 readiness surface includes forbidden token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr045_observability_http_has_per_request_read_timeout() {
+	let http = std::fs::read_to_string(manifest_dir().join("src/network/observability_http.rs"))
+		.expect("read observability HTTP source");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability source");
+
+	assert!(http.contains("pub const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);"));
+	assert!(http.contains("const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;"));
+	assert!(observability.contains("timeout(READ_REQUEST_TIMEOUT, read_request(stream))"));
+}
+
+#[test]
+fn adr045_new_observability_types_are_brand_clean_and_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronObservabilityConfig",
+		"ToronTracingFormat",
+		"RawToronObservabilityConfig",
+		"ToronReadinessSnapshot",
+		"ToronMetricsRegistry",
+		"ToronObservabilityListeners",
+		"ObservabilityConfigV1",
+		"ReadinessSnapshotV1",
+		"MetricsRegistryV1",
+	]);
 }
 
 #[test]
@@ -7004,28 +7294,20 @@ fn adr042_no_public_query_service() {
 }
 
 #[test]
-fn adr042_no_observability_listeners() {
-	let manifest_dir = manifest_dir();
-	let offenders = source_lines(&manifest_dir.join("src"))
-		.into_iter()
-		.filter(|(_, _, line)| {
-			[
-				"observability::spawn",
-				"health_listener",
-				"ready_listener",
-				"metrics_listener",
-				"TlsAcceptor",
-			]
-			.iter()
-			.any(|symbol| line.contains(symbol))
-		})
-		.collect::<Vec<_>>();
+fn adr042_observability_tracing_section_is_extended_not_replaced() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
 
-	assert!(
-		offenders.is_empty(),
-		"Toron source contains ADR 042 observability listener symbol(s):\n{}",
-		format_offenders(&manifest_dir, &offenders)
-	);
+	assert!(config.contains("[observability]"));
+	assert!(config.contains("level = \"info\""));
+	assert!(config.contains("format = \"pretty\""));
+	assert!(config.contains("pub level: String"));
+	assert!(config.contains("pub format: TracingFormat"));
+	assert!(daemon.contains("install_tracing"));
+	assert!(daemon.contains("tracing_subscriber::fmt()"));
+	assert!(daemon.contains("observability::spawn"));
 }
 
 #[test]

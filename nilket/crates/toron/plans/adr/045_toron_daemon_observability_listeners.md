@@ -11,13 +11,15 @@ B-E; iter-1 Claude three retractions — R1 committed to hand-rolled
 HTTP/1.1 over `tokio_rustls` after Wendelon helper-shape audit, R2
 `/health` body `"OK\n"` → `"ok\n"` byte-identical with Wendelon, R3
 metric scrape counting narrowed to `/metrics` only while keeping
-metric names brand-clean; iter-2
+metric names brand-clean, later implementation review records R4
+dropping Wendelon-style project-prefixed metric names entirely;
+iter-2
 D-set / guards / fixtures locked with three preemptive sharpenings —
 D1 port-collision validation, D4 HTTP method handling pinned to
 404 for unknown paths and 405 for unsupported methods, D6
 low-cardinality drain-state semantics surfaced;
 iter-3 DoS-hardening sharpening — D4 5-second per-request read
-timeout preventing slowloris, fixture 9 + guard 12; iter-4 final
+timeout preventing slowloris, slow-client fixture + guard 12; iter-4 final
 ratification, no new content).
 **Category:** Composition ADR over ADR 044 (operator-facing
 observability surface; no new substrate).
@@ -305,9 +307,11 @@ pub struct ReadinessSnapshot {
 }
 ```
 
-`to_json()` uses `serde_json::Map` (insertion-ordered) with the
-above field order. `is_ready()` returns true iff `ready` is true,
-listeners are bound, and `degraded_reason.is_none()`.
+`to_json()` emits a stable JSON object in the above field order; the
+implementation must not depend on map iteration order unless the
+ordered-map feature is explicitly enabled. `is_ready()` returns true
+iff `ready` is true, listeners are bound, and
+`degraded_reason.is_none()`.
 `http_status()` returns
 `"200 OK"` or `"503 Service Unavailable"`. Content-Type:
 `application/json; charset=utf-8`. Structurally parallel to Wendelon's
@@ -340,7 +344,7 @@ ADRs may extend.
 
 **D7: Wendelon-pattern non-carry-overs.**
 
-Three explicit non-carry-overs:
+Four explicit non-carry-overs:
 
 1. **No `RevocationSnapshot`** threaded into `/ready` or `/metrics`
    verifiers. Preserves ADR 044 D7 (no runtime-mutable revocation in
@@ -352,8 +356,13 @@ Three explicit non-carry-overs:
    042 D13 tracing-only-observability stance).
 3. **No OTLP traces export.** Wendelon's `[observability.traces]`
    subsystem is a separate concern; Toron V1 declines.
+4. **No Wendelon-style project-prefixed metric names.** Wendelon's
+   `wendelon_<noun>_<unit>` metric family convention predates ADR
+   044's no-project-name-in-protocols rule. Toron starts with
+   functional brand-clean names from D5 (`daemon_ready`,
+   `listener_up{...}`, etc.) and guard 10 forbids `toron_`.
 
-Single guard (#7) asserts all three non-carry-overs through a
+Guard #7 asserts the runtime-scope non-carry-overs through a
 forbidden-import source-text check on the observability module:
 
 ```rust
@@ -423,7 +432,7 @@ Added to `crates/toron/tests/architecture_test.rs`:
    guards D5; metrics module emits text exposition; no `_bucket`
    suffixed series in the registry.
 7. `adr045_no_revocation_no_audit_no_traces_in_observability` —
-   guards D7; triple-forbidden-import source-text guard.
+   guards D7; runtime-scope forbidden-import source-text guard.
 8. `adr045_observability_ready_line_is_appended_not_replaced` —
    guards D8; source-text invariant that `OBSERVABILITY_READY` is
    emitted **after** `READY` and `SQL_READY`; previous lines remain
@@ -449,7 +458,7 @@ Post-promotion convention guard:
   — tenth consecutive cycle preserving the no-V1-suffix convention
   (ADRs 039 / 041 / 042 / 043 / 044 / 045).
 
-## Integration Fixtures (9 required + 2 V1-evidence optional)
+## Integration Fixtures (10 required + 2 V1-evidence optional)
 
 **Required (gates promotion):**
 
@@ -459,15 +468,18 @@ Post-promotion convention guard:
    asserts byte-identical `"ok\n"` body.
 3. `toron_health_endpoint_rejects_non_loopback_bind` — config-time
    rejection regardless of TLS posture.
-4. `toron_config_observability_port_collision_rejected` — supports
+4. `toron_ready_and_metrics_require_tls_when_configured` —
+   config-time witness for D2's stricter TLS requirement even on
+   loopback.
+5. `toron_config_observability_port_collision_rejected` — supports
    D1 port-collision sharpening.
-5. `toron_ready_endpoint_emits_json_snapshot_with_expected_fields_in_stable_order`
-6. `toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_names`
-7. `toron_ready_and_metrics_reject_peer_without_monitor_san_prefix`
+6. `toron_ready_endpoint_emits_json_snapshot_with_expected_fields_in_stable_order`
+7. `toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_names`
+8. `toron_ready_and_metrics_reject_peer_without_monitor_san_prefix`
    — folds wrong-CA, wrong-prefix, malformed-SAN rejection variants
    into one handshake-time admission gate.
-8. `toron_observability_ready_stdout_line_appended_after_sql_ready_with_pinned_format`
-9. **`toron_observability_listener_closes_slow_client_after_read_timeout`**
+9. `toron_observability_ready_stdout_line_appended_after_sql_ready_with_pinned_format`
+10. **`toron_observability_listener_closes_slow_client_after_read_timeout`**
    — iter-3 sharpening witness; open a TCP connection to `/health`,
    write 5 bytes, pause 6 seconds; expect connection closed by
    server without HTTP response.
@@ -495,10 +507,11 @@ Post-promotion convention guard:
   `to_json()` derivation pattern mirroring Wendelon's;
 - drain-state semantics (`/ready` returns 503 with
   `degraded_reason: "draining"` immediately on SIGTERM);
-- tight initial metric surface (10 series, closed-cardinality
-  labels);
+- tight initial brand-clean metric surface with closed-cardinality
+  labels;
 - explicit Wendelon-pattern non-carry-overs (no revocation, no
-  audit, no OTLP, no `ActorPermission`).
+  audit, no OTLP, no `ActorPermission`, no project-prefixed metric
+  names).
 
 Matches ADR 044 single-plan posture. Pure composition over ADR 044
 — no new substrate.
@@ -552,13 +565,12 @@ Matches ADR 044 single-plan posture. Pure composition over ADR 044
   byte-identical with Wendelon; R3 — scrape counter
   scrape counting narrowed to `/metrics` only while preserving
   brand-clean metric names.
-  Five sharpenings: D6 `/ready` JSON shape mirrored from Wendelon's
-  `to_json()` pattern with `serde_json::Map` insertion-ordering; D3
+  Four sharpenings: D6 `/ready` JSON shape mirrored from Wendelon's
+  `to_json()` pattern with stable field ordering; D3
   acknowledged as first SAN-prefix divergence from Wendelon's
-  `ActorPermission`; D5 metric naming pinned to functional
-  brand-clean names with new guard 11; D7 triple-forbidden-import
-  guard; D8 stdout line format pinned. D-set count unchanged at 10; guards
-  10+1 → 11+1; required fixtures unchanged at 8.
+  `ActorPermission`; D7 runtime-scope forbidden-import guard; D8
+  stdout line format pinned. D-set count unchanged at 10; guards 10+1
+  → 11+1; required fixtures unchanged at 8.
 - **Iter 2:** D-set / guards / fixtures locked at iter-1 shape.
   Three preemptive sharpenings: D1 port-collision config validation
   (preempts Codex-style sharpening over bind-address conflicts);
@@ -571,13 +583,17 @@ Matches ADR 044 single-plan posture. Pure composition over ADR 044
   per-request `tokio::time::timeout` wrapping `read_request`
   preventing slowloris-style attacks against externally reachable
   `/ready` and `/metrics` listeners. New guard 12; new gating
-  fixture 9. D1 cosmetic addition: example-config comment block
+  slow-client fixture. D1 cosmetic addition: example-config comment block
   showing the canonical `monitor-` SAN provisioning recipe.
 - **Iter 4:** Final triple ratification. No new sharpenings, no
   retractions, no new decisions. Three-of-three council voices
   ratify iter-3 unchanged. D-set locked at 10. Guard set locked at
-  12 + 1 convention. Fixture set locked at 9 required + 2
+  12 + 1 convention. Fixture set locked at 10 required + 2
   V1-evidence optional. Ready to promote.
+- **Implementation review addendum:** R4 — retracted Wendelon-style
+  `toron_<noun>_<unit>` metric naming in favor of ADR 044-consistent
+  functional brand-clean names. This is recorded as an explicit
+  Wendelon non-carry-over in D7 and enforced by guard 10.
 
 ## Conclusion
 
@@ -602,11 +618,12 @@ ADR 045 ships:
 - closed `{reason}` label cardinality; no histograms; no per-tenant
   labels;
 - explicit Wendelon-pattern non-carry-overs (no revocation, no
-  audit, no OTLP, no `ActorPermission`);
+  audit, no OTLP, no `ActorPermission`, no project-prefixed metric
+  names);
 - byte-identical preservation of ADR 042 `READY <worker>` + ADR 043
   `SQL_READY <sql>` stdout lines; one appended `OBSERVABILITY_READY`
   line;
-- 12 promoted architecture guards + 1 convention guard + 9 required
+- 12 promoted architecture guards + 1 convention guard + 10 required
   integration fixtures + 2 V1-evidence optional fixtures;
 - single-plan substrate posture;
 - tenth consecutive cycle preserving the no-V1-suffix convention

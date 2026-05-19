@@ -3,9 +3,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use toron::config::{
-	CoordinatorConfig, SqlConfig, SqlTransport, ToronBootstrapConfig, ToronCatalogConfig,
-	ToronNodeConfig, ToronObservabilityConfig, ToronStorageConfig, ToronTracingFormat,
-	ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig,
+	CoordinatorConfig, ObservabilityConfig, SqlConfig, SqlTransport, ToronBootstrapConfig,
+	ToronCatalogConfig, ToronNodeConfig, ToronStorageConfig, ToronWendelonBootstrapPeer,
+	ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::identity::{AttemptId, QueryId, StageId, TaskId, TaskIdentity, WorkerId};
@@ -53,9 +53,10 @@ fn config() -> ToronBootstrapConfig {
 			static_workers: Vec::new(),
 		},
 		tls: None,
-		observability: ToronObservabilityConfig {
+		observability: ObservabilityConfig {
 			level: "info".to_string(),
-			format: ToronTracingFormat::Pretty,
+			format: TracingFormat::Pretty,
+			listeners: None,
 		},
 	}
 }
