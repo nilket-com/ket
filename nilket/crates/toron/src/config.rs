@@ -16,11 +16,17 @@ use crate::storage::TenantId;
 
 pub const NON_LOOPBACK_BIND_DIAGNOSTIC: &str =
 	"toron worker listener requires authenticated transport for non-loopback bind address";
+pub const NON_LOOPBACK_SQL_BIND_DIAGNOSTIC: &str =
+	"toron sql listener requires authenticated transport for non-loopback bind address";
+pub const NON_LOOPBACK_STATIC_WORKER_DIAGNOSTIC: &str =
+	"toron coordinator static workers require authenticated transport for non-loopback endpoints";
 
 const DEFAULT_DRAIN_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_POOL_MAX_RETAINED: usize = 64;
 const DEFAULT_POOL_MAX_CAP_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_SQL_LISTENER_BIND: &str = "127.0.0.1:7742";
+const DEFAULT_SQL_STATEMENT_TIMEOUT_SECONDS: u64 = 60;
 
 const EXAMPLE_CONFIG: &str = r#"[node]
 worker_id = "00000000-0000-0000-0000-000000000042"
@@ -36,11 +42,27 @@ memory_budget_bytes = 67108864
 bootstrap_peers = [
   { node_id = 1, address = "127.0.0.1:7001" },
 ]
+client_bind = "127.0.0.1:0"
+# tls_cert_path = "certs/client.crt"
+# tls_key_path = "certs/client.key"
+# tls_ca_path = "certs/ca.crt"
+# cluster_domain = "cluster.local"
 pool_max_retained = 64
 pool_max_cap_bytes = 8388608
 
 [catalog]
 # descriptor_bootstrap_path = "descriptors.json"
+
+[sql]
+transport = "quic"
+listener_bind = "127.0.0.1:7742"
+statement_timeout_seconds = 60
+
+[coordinator]
+include_self_worker = true
+# [[coordinator.static_workers]]
+# worker_id = "00000000-0000-0000-0000-000000000043"
+# endpoint = "127.0.0.1:9101"
 
 [observability]
 level = "info"
@@ -65,6 +87,8 @@ pub struct ToronBootstrapConfig {
 	pub worker: ToronWorkerConfig,
 	pub storage: ToronStorageConfig,
 	pub catalog: ToronCatalogConfig,
+	pub sql: Option<SqlConfig>,
+	pub coordinator: CoordinatorConfig,
 	pub observability: ToronObservabilityConfig,
 }
 
@@ -90,8 +114,18 @@ pub struct ToronStorageConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToronWendelonStorageConfig {
 	pub bootstrap_peers: Vec<ToronWendelonBootstrapPeer>,
+	pub client_bind: SocketAddr,
+	pub tls: Option<WendelonTlsConfig>,
+	pub cluster_domain: String,
 	pub pool_max_retained: usize,
 	pub pool_max_cap_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WendelonTlsConfig {
+	pub cert_path: PathBuf,
+	pub key_path: PathBuf,
+	pub ca_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +137,30 @@ pub struct ToronWendelonBootstrapPeer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToronCatalogConfig {
 	pub descriptor_bootstrap_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlConfig {
+	pub transport: SqlTransport,
+	pub listener_bind: SocketAddr,
+	pub statement_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlTransport {
+	Quic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatorConfig {
+	pub include_self_worker: bool,
+	pub static_workers: Vec<StaticWorkerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticWorkerConfig {
+	pub worker_id: WorkerId,
+	pub endpoint: SocketAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +194,9 @@ struct RawToronBootstrapConfig {
 	storage: RawToronStorageConfig,
 	#[serde(default)]
 	catalog: RawToronCatalogConfig,
+	sql: Option<RawSqlConfig>,
+	#[serde(default)]
+	coordinator: RawCoordinatorConfig,
 	#[serde(default)]
 	observability: RawToronObservabilityConfig,
 }
@@ -167,6 +228,13 @@ struct RawToronStorageConfig {
 struct RawToronWendelonStorageConfig {
 	#[serde(default)]
 	bootstrap_peers: Vec<RawToronWendelonBootstrapPeer>,
+	#[serde(default = "default_wendelon_client_bind")]
+	client_bind: String,
+	tls_cert_path: Option<PathBuf>,
+	tls_key_path: Option<PathBuf>,
+	tls_ca_path: Option<PathBuf>,
+	#[serde(default = "default_wendelon_cluster_domain")]
+	cluster_domain: String,
 	#[serde(default = "default_pool_max_retained")]
 	pool_max_retained: usize,
 	#[serde(default = "default_pool_max_cap_bytes")]
@@ -182,6 +250,30 @@ struct RawToronWendelonBootstrapPeer {
 #[derive(Debug, Default, Deserialize)]
 struct RawToronCatalogConfig {
 	descriptor_bootstrap_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSqlConfig {
+	#[serde(default = "default_sql_transport")]
+	transport: String,
+	#[serde(default = "default_sql_listener_bind")]
+	listener_bind: String,
+	#[serde(default = "default_sql_statement_timeout_seconds")]
+	statement_timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCoordinatorConfig {
+	#[serde(default = "default_include_self_worker")]
+	include_self_worker: bool,
+	#[serde(default)]
+	static_workers: Vec<RawStaticWorkerConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStaticWorkerConfig {
+	worker_id: String,
+	endpoint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +309,15 @@ impl Default for RawToronObservabilityConfig {
 		Self {
 			level: default_observability_level(),
 			format: default_observability_format(),
+		}
+	}
+}
+
+impl Default for RawCoordinatorConfig {
+	fn default() -> Self {
+		Self {
+			include_self_worker: default_include_self_worker(),
+			static_workers: Vec::new(),
 		}
 	}
 }
@@ -302,6 +403,33 @@ fn normalize_config(
 			base_dir.join(path)
 		}
 	});
+	let sql = raw.sql.map(normalize_sql_config).transpose()?;
+	let mut static_workers = Vec::with_capacity(raw.coordinator.static_workers.len());
+	for worker in raw.coordinator.static_workers {
+		let worker_id = WorkerId::from_uuid(
+			Uuid::parse_str(&worker.worker_id)
+				.map_err(|error| invalid(format!("invalid coordinator worker_id: {error}")))?,
+		);
+		let endpoint = worker.endpoint.parse::<SocketAddr>().map_err(|error| {
+			invalid(format!(
+				"invalid coordinator static worker endpoint: {error}"
+			))
+		})?;
+		if !endpoint.ip().is_loopback() {
+			return Err(invalid(NON_LOOPBACK_STATIC_WORKER_DIAGNOSTIC));
+		}
+		static_workers.push(StaticWorkerConfig {
+			worker_id,
+			endpoint,
+		});
+	}
+	let wendelon_client_bind = normalize_wendelon_client_bind(&raw.storage.wendelon.client_bind)?;
+	let wendelon_tls = normalize_wendelon_tls_config(
+		raw.storage.wendelon.tls_cert_path,
+		raw.storage.wendelon.tls_key_path,
+		raw.storage.wendelon.tls_ca_path,
+		base_dir,
+	)?;
 	let format = match raw.observability.format.as_str() {
 		"pretty" => ToronTracingFormat::Pretty,
 		other => {
@@ -334,6 +462,9 @@ fn normalize_config(
 						address: peer.address,
 					})
 					.collect(),
+				client_bind: wendelon_client_bind,
+				tls: wendelon_tls,
+				cluster_domain: raw.storage.wendelon.cluster_domain,
 				pool_max_retained: raw.storage.wendelon.pool_max_retained,
 				pool_max_cap_bytes: raw.storage.wendelon.pool_max_cap_bytes,
 			},
@@ -341,11 +472,79 @@ fn normalize_config(
 		catalog: ToronCatalogConfig {
 			descriptor_bootstrap_path,
 		},
+		sql,
+		coordinator: CoordinatorConfig {
+			include_self_worker: raw.coordinator.include_self_worker,
+			static_workers,
+		},
 		observability: ToronObservabilityConfig {
 			level: raw.observability.level,
 			format,
 		},
 	})
+}
+
+fn normalize_sql_config(raw: RawSqlConfig) -> Result<SqlConfig, ToronConfigError> {
+	let transport = match raw.transport.as_str() {
+		"quic" => SqlTransport::Quic,
+		other => return Err(invalid(format!("unsupported sql transport: {other}"))),
+	};
+	let listener_bind = raw
+		.listener_bind
+		.parse::<SocketAddr>()
+		.map_err(|error| invalid(format!("invalid sql listener_bind: {error}")))?;
+	if !listener_bind.ip().is_loopback() {
+		return Err(invalid(NON_LOOPBACK_SQL_BIND_DIAGNOSTIC));
+	}
+	if raw.statement_timeout_seconds == 0 {
+		return Err(invalid(
+			"sql.statement_timeout_seconds must be greater than 0",
+		));
+	}
+	Ok(SqlConfig {
+		transport,
+		listener_bind,
+		statement_timeout: Duration::from_secs(raw.statement_timeout_seconds),
+	})
+}
+
+fn normalize_wendelon_client_bind(raw: &str) -> Result<SocketAddr, ToronConfigError> {
+	let addr = raw
+		.parse::<SocketAddr>()
+		.map_err(|error| invalid(format!("invalid storage.wendelon.client_bind: {error}")))?;
+	if !addr.ip().is_loopback() {
+		return Err(invalid(
+			"storage.wendelon.client_bind must remain loopback until authenticated remote transport is configured",
+		));
+	}
+	Ok(addr)
+}
+
+fn normalize_wendelon_tls_config(
+	cert_path: Option<PathBuf>,
+	key_path: Option<PathBuf>,
+	ca_path: Option<PathBuf>,
+	base_dir: &Path,
+) -> Result<Option<WendelonTlsConfig>, ToronConfigError> {
+	match (cert_path, key_path, ca_path) {
+		(None, None, None) => Ok(None),
+		(Some(cert_path), Some(key_path), Some(ca_path)) => Ok(Some(WendelonTlsConfig {
+			cert_path: resolve_config_path(cert_path, base_dir),
+			key_path: resolve_config_path(key_path, base_dir),
+			ca_path: resolve_config_path(ca_path, base_dir),
+		})),
+		_ => Err(invalid(
+			"storage.wendelon TLS config requires tls_cert_path, tls_key_path, and tls_ca_path together",
+		)),
+	}
+}
+
+fn resolve_config_path(path: PathBuf, base_dir: &Path) -> PathBuf {
+	if path.is_absolute() {
+		path
+	} else {
+		base_dir.join(path)
+	}
 }
 
 fn invalid(message: impl Into<String>) -> ToronConfigError {
@@ -376,6 +575,30 @@ fn default_pool_max_retained() -> usize {
 
 fn default_pool_max_cap_bytes() -> usize {
 	DEFAULT_POOL_MAX_CAP_BYTES
+}
+
+fn default_wendelon_client_bind() -> String {
+	"127.0.0.1:0".to_string()
+}
+
+fn default_wendelon_cluster_domain() -> String {
+	wendelon::network::tls::DEFAULT_CLUSTER_DOMAIN.to_string()
+}
+
+fn default_sql_transport() -> String {
+	"quic".to_string()
+}
+
+fn default_sql_listener_bind() -> String {
+	DEFAULT_SQL_LISTENER_BIND.to_string()
+}
+
+fn default_sql_statement_timeout_seconds() -> u64 {
+	DEFAULT_SQL_STATEMENT_TIMEOUT_SECONDS
+}
+
+fn default_include_self_worker() -> bool {
+	true
 }
 
 fn default_observability_level() -> String {

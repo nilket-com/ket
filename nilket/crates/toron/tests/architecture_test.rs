@@ -4972,7 +4972,10 @@ fn adr037_distributed_read_executor_wraps_fragment_scheduler() {
 	.expect("distributed source executor body")
 	.1;
 
-	assert!(distributed_source.contains("execute_bound_distributed(plan.clone())"));
+	assert!(
+		distributed_source
+			.contains("execute_bound_distributed_with_context(plan.clone(), self.context)")
+	);
 	assert!(distributed_source.contains(".await"));
 }
 
@@ -4986,8 +4989,9 @@ fn adr037_distributed_fragment_config_uses_execution_context() {
 		.expect("fragment_config body")
 		.1;
 
-	assert!(fragment_config.contains("self.context.query_id"));
+	assert!(fragment_config.contains("context.query_id"));
 	assert!(fragment_config.contains("TaskExecutionContext::from_execution_context"));
+	assert!(fragment_config.contains("context"));
 	assert!(fragment_config.contains("TaskBudget::from_query_budget(self.query_budget)"));
 }
 
@@ -6070,7 +6074,7 @@ fn adr041_toron_cli_reservations_preserved() {
 
 	assert!(cli.contains("is reserved; production execution is not wired in ADR 040"));
 	assert!(cli.contains("[verb, rest @ ..] if verb == \"sql\" && !rest.is_empty()"));
-	assert!(cli.contains("[verb] if verb == \"sql\" => reserved(\"sql\")"));
+	assert!(cli.contains("run_sql(rest)"));
 	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
 	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
 }
@@ -6085,13 +6089,13 @@ fn adr042_toron_start_is_not_reserved() {
 }
 
 #[test]
-fn adr042_toron_sql_and_inspect_remain_reserved() {
+fn adr042_toron_inspect_remains_reserved_after_sql_lift() {
 	let cli =
 		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
 
 	assert!(cli.contains("is reserved; production execution is not wired in ADR 040"));
 	assert!(cli.contains("[verb, rest @ ..] if verb == \"sql\" && !rest.is_empty()"));
-	assert!(cli.contains("[verb] if verb == \"sql\" => reserved(\"sql\")"));
+	assert!(cli.contains("run_sql(rest)"));
 	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
 	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
 }
@@ -6171,10 +6175,10 @@ fn adr042_descriptor_bootstrap_has_no_v1_type_suffix() {
 fn adr042_daemon_uses_single_descriptor_registry() {
 	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
 		.expect("read Toron daemon source");
-	let startup = brace_blocks_after_marker(&daemon, "pub async fn start")
+	let startup = brace_blocks_after_marker(&daemon, "async fn start_with_client")
 		.into_iter()
 		.next()
-		.expect("ToronDaemon::start")
+		.expect("ToronDaemon::start_with_client")
 		.1;
 
 	assert_eq!(
@@ -6196,10 +6200,10 @@ fn adr042_daemon_uses_single_descriptor_registry() {
 fn adr042_descriptor_bootstrap_is_startup_only() {
 	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
 		.expect("read Toron daemon source");
-	let startup = brace_blocks_after_marker(&daemon, "pub async fn start")
+	let startup = brace_blocks_after_marker(&daemon, "async fn start_with_client")
 		.into_iter()
 		.next()
-		.expect("ToronDaemon::start")
+		.expect("ToronDaemon::start_with_client")
 		.1;
 
 	assert!(startup.contains("load_descriptor_bootstrap(path)?"));
@@ -6227,6 +6231,291 @@ fn adr042_unauthenticated_task_listener_is_loopback_only() {
 	assert!(config.contains(".parse::<SocketAddr>()"));
 	assert!(config.contains("task_listener_bind.ip().is_loopback()"));
 	assert!(daemon.contains("TcpListener::bind(config.worker.task_listener_bind)"));
+}
+
+#[test]
+fn adr043_toron_sql_is_not_reserved() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(cli.contains("run_sql(rest)"));
+	assert!(cli.contains("toron sql requires <statement...>"));
+	assert!(!cli.contains("reserved(\"sql\")"));
+}
+
+#[test]
+fn adr043_toron_inspect_remains_reserved() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(cli.contains("[verb] if verb == \"inspect\" => reserved(\"inspect\")"));
+	assert!(cli.contains("[verb, _rest @ ..] if verb == \"inspect\""));
+}
+
+#[test]
+fn adr043_nilket_root_sql_stays_rejected() {
+	let nilket_src =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/src/main.rs"))
+			.expect("read nilket main");
+
+	assert!(!nilket_src.contains("Some(\"sql\")"));
+	assert!(nilket_src.contains("Some(\"toron\") => toron::cli::run"));
+}
+
+#[test]
+fn adr043_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "arrow-cast"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr043_toron_cli_sql_is_client_only() {
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+	for forbidden in [
+		"DistributedQueryCoordinator",
+		"QueryCoordinator",
+		"WendelonCatalog",
+		"WendelonStorageScan",
+		"WendelonStorageWrite",
+		"WendelonStorageDeleteRows",
+		"WendelonStorageAdmin",
+		"WendelonDescriptorRegistry",
+	] {
+		assert!(
+			!cli.contains(forbidden),
+			"Toron CLI SQL client must not construct {forbidden}"
+		);
+	}
+	assert!(cli.contains("QuicEndpoint::client()"));
+}
+
+#[test]
+fn adr043_sql_listener_config_surface_exists() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	for required in [
+		"pub struct SqlConfig",
+		"pub enum SqlTransport",
+		"pub struct CoordinatorConfig",
+		"pub struct StaticWorkerConfig",
+		"pub sql: Option<SqlConfig>",
+		"pub coordinator: CoordinatorConfig",
+		"transport = \"quic\"",
+		"listener_bind = \"127.0.0.1:7742\"",
+	] {
+		assert!(
+			config.contains(required),
+			"missing ADR 043 config token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr043_sql_listener_is_loopback_only() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(config.contains("NON_LOOPBACK_SQL_BIND_DIAGNOSTIC"));
+	assert!(config.contains("listener_bind.ip().is_loopback()"));
+	assert!(config.contains("sql.statement_timeout_seconds must be greater than 0"));
+}
+
+#[test]
+fn adr043_task_transport_is_quic_by_default_and_loopback_only() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let transport = std::fs::read_to_string(manifest_dir().join("src/server/transport.rs"))
+		.expect("read Toron transport source");
+
+	assert!(daemon.contains("QuicEndpoint::bind(worker_endpoint)"));
+	assert!(daemon.contains("QuicTransport::new()?"));
+	assert!(transport.contains("pub struct QuicTransport"));
+	assert!(transport.contains("connect_stream(remote).await"));
+}
+
+#[test]
+fn adr043_sql_wire_uses_length_prefixed_postcard() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+
+	assert!(wire.contains("encode_payload(frame)"));
+	assert!(wire.contains("decode_payload(&payload)"));
+	assert!(wire.contains("to_le_bytes()"));
+	assert!(wire.contains("u32::from_le_bytes"));
+}
+
+#[test]
+fn adr043_sql_wire_uses_arrow_ipc_not_row_strings() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+
+	assert!(wire.contains("pub arrow_ipc_bytes: ByteBuf"));
+	assert!(!wire.contains("Vec<String>"));
+	assert!(!wire.contains("rows: Vec"));
+}
+
+#[test]
+fn adr043_sql_wire_types_have_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"SqlFrameV1",
+		"SqlMessageV1",
+		"SqlErrorCodeV1",
+		"ExecuteRequestV1",
+	]);
+}
+
+#[test]
+fn adr043_new_sql_protocol_names_are_brand_clean() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronSql",
+		"ToronQuic",
+		"TORON_QUIC",
+		"toron-loopback",
+		"ToronCoordinatorConfig",
+		"ToronStaticWorker",
+		"ToronWendelonTlsConfig",
+		"RawToronSql",
+		"RawToronCoordinator",
+		"RawToronStatic",
+	]);
+}
+
+#[test]
+fn adr043_no_grpc_protobuf_or_arrow_flight() {
+	assert_toron_sources_do_not_contain(&["tonic", "prost", "arrow_flight", "arrow-flight"]);
+}
+
+#[test]
+fn adr043_no_remote_sql_auth_policy() {
+	for path in [
+		"src/cli.rs",
+		"src/daemon.rs",
+		"src/sql_wire.rs",
+		"src/quic.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir().join(path)).expect("read source");
+		for forbidden in [
+			"TORON_SQL_TOKEN",
+			"Authorization",
+			"Bearer",
+			"client_tenant",
+			"tenant_claim",
+			"remote_sql_auth",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{path} contains remote SQL auth policy token {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr043_daemon_uses_single_descriptor_registry_for_sql() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	let startup = brace_blocks_after_marker(&daemon, "async fn start_with_client")
+		.into_iter()
+		.next()
+		.expect("ToronDaemon::start_with_client")
+		.1;
+
+	assert_eq!(
+		startup
+			.matches("WendelonDescriptorRegistry::from_descriptors")
+			.count(),
+		1
+	);
+	assert!(startup.matches("Arc::clone(&registry)").count() >= 5);
+	assert!(startup.contains("DistributedQueryCoordinator"));
+}
+
+#[test]
+fn adr043_sql_uses_distributed_coordinator_not_local_bypass() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert!(daemon.contains("DistributedQueryCoordinator"));
+	assert!(daemon.contains("sql_execution_context(tenant_id, frame.query_id)"));
+	assert!(daemon.contains("coordinator.execute_query_with_context(&plan, context)"));
+	assert!(!daemon.contains("QueryCoordinator::new"));
+	assert!(!daemon.contains("Executor::new("));
+}
+
+#[test]
+fn adr043_static_worker_registry_config_is_coordinator_scoped() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert!(config.contains("pub struct CoordinatorConfig"));
+	assert!(config.contains("static_workers: Vec<RawStaticWorkerConfig>"));
+	assert!(daemon.contains("StaticWorkerRegistry::new(registry_workers)"));
+}
+
+#[test]
+fn adr043_no_wendelon_descriptor_refresh() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+	for forbidden in [
+		"list_descriptors",
+		"refresh_descriptor",
+		"watch_descriptor",
+		"refresh_topology",
+	] {
+		assert!(
+			!daemon.contains(forbidden),
+			"daemon contains descriptor refresh token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr043_wendelon_client_has_real_provider_mode_for_sql() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert!(daemon.contains("Client::connect_quic(client_config).await"));
+	assert!(!daemon.contains("providers: HashMap::new()"));
+}
+
+#[test]
+fn adr043_no_fixture_storage_in_production_sql() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert!(!daemon.contains("InMemoryTableStorage"));
+	assert!(!daemon.contains("FixtureStorageScan"));
+	assert!(!daemon.contains("toron_fixture_worker"));
+}
+
+#[test]
+fn adr043_sql_ready_does_not_mutate_adr042_ready_line() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs"))
+		.expect("read Toron daemon source");
+
+	assert!(daemon.contains("println!(\"READY {}\", daemon.handle().worker_endpoint);"));
+	assert!(daemon.contains("println!(\"SQL_READY {sql_endpoint}\");"));
+}
+
+#[test]
+fn adr043_sql_wire_uses_existing_wire_crate() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+
+	assert!(wire.contains("use crate::wire::{decode_payload, encode_payload};"));
+	assert!(!wire.contains("wendelon::"));
 }
 
 #[test]
@@ -6700,7 +6989,7 @@ fn assert_toron_sources_do_not_contain(forbidden: &[&str]) {
 
 	assert!(
 		offenders.is_empty(),
-		"Toron source contains ADR 039 forbidden symbol(s):\n{}",
+		"Toron source contains forbidden symbol(s):\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
 }

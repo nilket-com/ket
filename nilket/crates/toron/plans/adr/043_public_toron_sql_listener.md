@@ -7,7 +7,7 @@
 
 ## Summary
 
-Lift the ADR 040 `nilket toron sql` reservation. Add `crates/toron/src/sql_wire.rs` (custom framed product types: `ToronSqlFrame` / `ToronSqlMessage::{Execute, Cancel, ResultBatch, Complete, Error}` — length-prefixed postcard via the ADR 039 `wire` crate, no `*V1` suffix). Extend `crates/toron/src/config.rs` with `[sql]` and `[coordinator]` sections; non-loopback SQL bind addresses fail validation at config-load time with a stable diagnostic mirroring ADR 042 D9. Extend `crates/toron/src/daemon.rs` to bind a loopback QUIC SQL listener, close ADR 042's empty-provider execution gap through the D18 Plan A / Plan B Wendelon access path, construct a `DistributedQueryCoordinator` with `StaticWorkerRegistry` from config, and route incoming SQL through coordinator → QUIC task dispatch → worker → Arrow IPC result frames. Wire `crates/toron/src/cli.rs`'s `sql` arm to a one-shot client (`nilket toron sql --endpoint <addr> "<statement>"`) that dials the daemon over QUIC, sends one `Execute` frame, receives result frames, renders Arrow batches as a pretty table or `OK rows=<n>` shape for non-SELECT. Emit `READY <worker-task-endpoint>` byte-identical to ADR 042, append a second `SQL_READY <sql-endpoint>` line. Reserve `nilket toron inspect` byte-identically.
+Lift the ADR 040 `nilket toron sql` reservation. Add `crates/toron/src/sql_wire.rs` (custom framed product types: `SqlFrame` / `SqlMessage::{Execute, Cancel, ResultBatch, Complete, Error}` — length-prefixed postcard via the ADR 039 `wire` crate, no `*V1` suffix). Extend `crates/toron/src/config.rs` with `[sql]` and `[coordinator]` sections; non-loopback SQL bind addresses fail validation at config-load time with a stable diagnostic mirroring ADR 042 D9. Extend `crates/toron/src/daemon.rs` to bind a loopback QUIC SQL listener, close ADR 042's empty-provider execution gap through the D18 Plan A / Plan B Wendelon access path, construct a `DistributedQueryCoordinator` with `StaticWorkerRegistry` from config, and route incoming SQL through coordinator → QUIC task dispatch → worker → Arrow IPC result frames. Wire `crates/toron/src/cli.rs`'s `sql` arm to a one-shot client (`nilket toron sql --endpoint <addr> "<statement>"`) that dials the daemon over QUIC, sends one `Execute` frame, receives result frames, renders Arrow batches as a pretty table or `OK rows=<n>` shape for non-SELECT. Emit `READY <worker-task-endpoint>` byte-identical to ADR 042, append a second `SQL_READY <sql-endpoint>` line. Reserve `nilket toron inspect` byte-identically.
 
 **No** remote mTLS / token-auth policy. **No** non-loopback SQL listener. **No** non-loopback static worker endpoint. **No** multi-tenant client claims. **No** prepared statements / transactions / persistent sessions / pipelining. **No** Wendelon descriptor discovery / refresh. **No** observability listeners. **No** gRPC / Arrow Flight / Postgres wire frontend. **No** `WendelonNode` in-process. **No** `SELECT without FROM` SQL-surface widening. Those are follow-up ADRs.
 
@@ -63,24 +63,24 @@ ADR 043 must not weaken ADR 042. QUIC is the default task transport for ADR 043'
 Add `crates/toron/src/sql_wire.rs` with no `*V1` suffix. Length-prefixed postcard frames ride on QUIC streams and mirror Toron's existing task wire payload style:
 
 ```rust
-pub struct ToronSqlFrame {
-    pub protocol_version: ToronSqlProtocolVersion,
+pub struct SqlFrame {
+    pub protocol_version: SqlProtocolVersion,
     pub query_id: QueryId,
-    pub message: ToronSqlMessage,
+    pub message: SqlMessage,
 }
 
-pub enum ToronSqlMessage {
-    Execute(ToronSqlExecuteRequest),
-    Cancel(ToronSqlCancelRequest),
-    ResultBatch(ToronSqlResultBatch),
-    Complete(ToronSqlComplete),
-    Error(ToronSqlError),
+pub enum SqlMessage {
+    Execute(ExecuteRequest),
+    Cancel(CancelRequest),
+    ResultBatch(ResultBatch),
+    Complete(Complete),
+    Error(SqlError),
 }
 ```
 
 `ResultBatch` carries Arrow IPC stream bytes (via `serde_bytes` or equivalent); never stringified rows. `Complete` carries `row_count: u64` for DDL/DML statements that don't return data.
 
-`ToronSqlCancelRequest` carries the target `query_id: QueryId`; the enclosing `ToronSqlFrame::query_id` remains the frame/query correlation id. Stable error codes include `SyntaxError`, `PlanningError`, `BindingError`, `CatalogError`, `StorageError`, `TenantMismatch`, `StatementTimeout`, `Cancelled`, `CancellationUnsupported`, `NoLiveWorker`, and `Internal`.
+`CancelRequest` carries the target `query_id: QueryId`; the enclosing `SqlFrame::query_id` remains the frame/query correlation id. Stable error codes include `SyntaxError`, `PlanningError`, `BindingError`, `CatalogError`, `StorageError`, `TenantMismatch`, `StatementTimeout`, `Cancelled`, `CancellationUnsupported`, `NoLiveWorker`, and `Internal`.
 
 **D8: CLI text rendering is stable but not the wire contract.**
 The daemon returns Arrow IPC frames. The CLI renders those batches with a stable table formatter (likely `arrow-cast::pretty::print_batches` for SELECT; `OK rows=<n>` or `OK` shape for non-SELECT). The renderer lives in Toron, not nilket root. **The wire contract is Arrow IPC + structured frames; the stdout rendering is a CLI concern.**
@@ -122,7 +122,7 @@ Direct daemon unit tests may retain a static no-dial client seam for wire-only t
 No Wendelon descriptor discovery / list-descriptors RPC / refresh loop / watch loop. SQL executes against the ADR 042 `ToronDescriptorBootstrap` registry loaded at startup. Stale descriptors fail through existing descriptor evolution checks.
 
 **D15: Cancellation is protocol-shape + best-effort in V1.**
-The wire includes `Cancel(ToronSqlCancelRequest { query_id: <target> })`. The daemon records in-flight query ids and routes cancellation through whatever scheduler/worker cancel seams exist. If fine-grained cancellation is not available through all execution paths, the daemon returns a stable `ToronSqlErrorCode::Cancelled` or `ToronSqlErrorCode::CancellationUnsupported`. Strong cross-worker in-flight cancellation is a follow-up runtime ADR.
+The wire includes `Cancel(CancelRequest { query_id: <target> })`. The daemon records in-flight query ids and routes cancellation through whatever scheduler/worker cancel seams exist. If fine-grained cancellation is not available through all execution paths, the daemon returns a stable `SqlErrorCode::Cancelled` or `SqlErrorCode::CancellationUnsupported`. Strong cross-worker in-flight cancellation is a follow-up runtime ADR.
 
 **D16: Readiness line compatibility.**
 Preserve ADR 042's first stdout readiness line exactly:
@@ -140,7 +140,7 @@ SQL_READY <sql-endpoint>
 External supervisors parsing the ADR 042 line continue to work unchanged.
 
 **D17: One statement per CLI invocation.**
-ADR 043 supports one SQL statement per `nilket toron sql` invocation. No multi-statement sessions, prepared statements, pipelining, or transaction state on the CLI path. The wire types admit extension to persistent sessions later (extra `ToronSqlMessage` variants), but V1 is one-shot.
+ADR 043 supports one SQL statement per `nilket toron sql` invocation. No multi-statement sessions, prepared statements, pipelining, or transaction state on the CLI path. The wire types admit extension to persistent sessions later (extra `SqlMessage` variants), but V1 is one-shot.
 
 **D18: Wendelon transport provider Plan A / Plan B.**
 Codex D13 mandates a QUIC-capable Wendelon access path. The exact provider shape depends on `wendelon_client` production-readiness:
@@ -151,12 +151,12 @@ Codex D13 mandates a QUIC-capable Wendelon access path. The exact provider shape
 Decision rule lives in Phase 0 of the impl plan: audit `wendelon_client::Client::connect_quic` (or equivalent constructor) for production-readiness; if mature, Plan A; if seams remain, Plan B + a named follow-up ADR.
 
 **D19: SQL wire encoding reuses ADR 039 `wire` crate conventions.**
-ADR 039's `TableSchemaDropRequest::V1` wire types use a shared `wire::encode` / `wire::decode` postcard-based encoding. ADR 043's `ToronSqlFrame` and related types use the **same encoding crate and conventions** — no new serialization framework introduced.
+ADR 039's `TableSchemaDropRequest::V1` wire types use a shared `wire::encode` / `wire::decode` postcard-based encoding. ADR 043's `SqlFrame` and related types use the **same encoding crate and conventions** — no new serialization framework introduced.
 
 **D20: DDL/DML result shape pinned.**
-- `SELECT ...` → daemon emits `ToronSqlMessage::ResultBatch` frames (one or more), then `ToronSqlMessage::Complete { row_count }`.
-- `CREATE TABLE`, `DROP TABLE`, `CREATE TABLE AS SELECT`, `CREATE OR REPLACE TABLE`, `CREATE TABLE IF NOT EXISTS` → daemon emits `ToronSqlMessage::Complete { row_count }` (with `row_count = 0` for DDL).
-- `INSERT INTO ... VALUES`, `INSERT INTO ... SELECT`, `DELETE FROM ... WHERE ...` → daemon emits `ToronSqlMessage::Complete { row_count }` with `row_count = <affected rows>`.
+- `SELECT ...` → daemon emits `SqlMessage::ResultBatch` frames (one or more), then `SqlMessage::Complete { row_count }`.
+- `CREATE TABLE`, `DROP TABLE`, `CREATE TABLE AS SELECT`, `CREATE OR REPLACE TABLE`, `CREATE TABLE IF NOT EXISTS` → daemon emits `SqlMessage::Complete { row_count }` (with `row_count = 0` for DDL).
+- `INSERT INTO ... VALUES`, `INSERT INTO ... SELECT`, `DELETE FROM ... WHERE ...` → daemon emits `SqlMessage::Complete { row_count }` with `row_count = <affected rows>`.
 - CLI renders `Complete { row_count: 0 }` as `OK`; `Complete { row_count: n > 0 }` as `OK rows=<n>`; result batches as a pretty table followed by `(<n> rows)` footer.
 
 Deterministic across all statement types. No statement-specific prose in multiple places.
@@ -187,6 +187,10 @@ Adopt the converged 21-guard set:
 20. `adr043_sql_ready_does_not_mutate_adr042_ready_line`
 21. **`adr043_sql_wire_uses_existing_wire_crate`** — `sql_wire.rs` reuses the shared `wire::encode` / `wire::decode` conventions from ADR 039.
 
+Post-promotion convention guard:
+
+- **`adr043_new_sql_protocol_names_are_brand_clean`** — ADR 043's new SQL/QUIC protocol, wire, and config type identifiers do not introduce brand-prefixed `ToronSql*`, `ToronQuic*`, or similar project-name protocol names. Operator command names (`nilket toron sql`, `TORON_SQL_ENDPOINT`, readiness text) remain product surface, not internal protocol identifiers.
+
 ## Integration Fixtures (14 required + 4 optional V1-evidence)
 
 Adopt Codex iter-1's fixture set with one addition (DDL/DML result-shape coverage from D20).
@@ -202,7 +206,7 @@ Adopt Codex iter-1's fixture set with one addition (DDL/DML result-shape coverag
 7. `toron_sql_listener_rejects_non_loopback_bind` — config with non-loopback SQL bind fails validation.
 8. `toron_daemon_prints_sql_ready_endpoint` — daemon emits both `READY <worker>` and `SQL_READY <sql>` on stdout.
 9. `toron_sql_wire_round_trips_arrow_ipc_batch` — daemon-side wire encoding round-trips through `wire::encode` / `wire::decode`.
-10. `toron_sql_syntax_error_emits_stable_error_code` — malformed SQL → `ToronSqlError { code: SyntaxError, ... }`.
+10. `toron_sql_syntax_error_emits_stable_error_code` — malformed SQL → `SqlError { code: SyntaxError, ... }`.
 11. **`toron_sql_select_from_bootstrapped_descriptor_executes_over_wire`** — daemon with `descriptor_bootstrap_path` + sanctioned Wendelon test harness; SQL `SELECT * FROM <bootstrapped_table>` over the QUIC SQL listener returns Arrow batches matching expected rows. **Wire-correctness witness.**
 12. `toron_sql_uses_self_worker_registry_entry` — daemon with `include_self_worker = true`; SQL submission dispatches a task back to the self worker; observable via tracing.
 13. `toron_daemon_without_sql_section_preserves_worker_only_start` — ADR 042 backward compat: config missing `[sql]` boots a worker-only daemon successfully.
@@ -230,7 +234,7 @@ Adopt Codex iter-1's fixture set with one addition (DDL/DML result-shape coverag
 - **Prepared statements / parameterized queries** — future composition ADR.
 - **Multi-statement transactions** — substantial future cycle constrained by ADR 037.
 - **Persistent SQL connections / pipelined statements** — wire admits extension; V1 CLI is one-shot.
-- **gRPC / Arrow Flight protocol frontend** — future ADR can wrap `ToronSqlFrame` without changing daemon behavior.
+- **gRPC / Arrow Flight protocol frontend** — future ADR can wrap `SqlFrame` without changing daemon behavior.
 - **Postgres wire protocol frontend** — same future-frontend story.
 - **`nilket toron inspect` real wiring** — ADR 040 reservation; orthogonal cycle.
 - **Toron daemon observability listeners** — shares TLS material story with public SQL listener; bundles with ADR 044.
@@ -250,7 +254,7 @@ Adopt Codex iter-1's fixture set with one addition (DDL/DML result-shape coverag
 ADR 043 ships:
 
 - one `nilket toron sql <statement>` lifts the second ADR 040 reservation (after `start` in ADR 042; `inspect` remains)
-- loopback-only QUIC SQL listener — real substrate, never inert; production-shaped `ToronSqlFrame` wire protocol
+- loopback-only QUIC SQL listener — real substrate, never inert; production-shaped `SqlFrame` wire protocol
 - `nilket toron sql` is a client; daemon is the server; nilket root stays runtime-free
 - `inspect` byte-identically reserved (continuity invariant; third consecutive reservation preserved)
 - single shared `Arc<WendelonDescriptorRegistry>` across catalog/scan/write/delete/admin (extends ADR 042 D7 invariant)
@@ -260,7 +264,7 @@ ADR 043 ships:
 - structured error codes; no `*V1` suffix; same encoding crate as ADR 039 wire types
 - `READY <worker>` preserved byte-identical; `SQL_READY <sql>` added as second line (backward compat)
 - one-shot CLI client; persistent sessions left for future ADR
-- 21 architecture guards + 14 required integration fixtures + 4 V1-evidence optional
+- 21 promoted architecture guards + 1 convention guard + 14 required integration fixtures + 4 V1-evidence optional
 - Plan A / Plan B sub-lift on Wendelon QUIC provider maturity (Phase 0 audit decides)
 
 Authentication, multi-tenant routing, descriptor refresh, observability listeners, prepared statements, transactions, gRPC / Postgres wire frontends, and `inspect` wiring all remain follow-up ADRs with clear scope boundaries.

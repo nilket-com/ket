@@ -56,6 +56,35 @@ fn toron_example_config_loads() {
 	assert!(config.worker.task_listener_bind.ip().is_loopback());
 	assert_eq!(config.storage.wendelon.bootstrap_peers.len(), 1);
 	assert!(config.catalog.descriptor_bootstrap_path.is_none());
+	assert!(
+		config
+			.sql
+			.expect("example sql config")
+			.listener_bind
+			.ip()
+			.is_loopback()
+	);
+	assert!(config.coordinator.include_self_worker);
+}
+
+#[test]
+fn toron_sql_listener_rejects_non_loopback_bind() {
+	let dir = fresh_dir("sql-non-loopback");
+	let path = dir.join("toron.toml");
+	let config = render_example_config().replace(
+		"listener_bind = \"127.0.0.1:7742\"",
+		"listener_bind = \"0.0.0.0:7742\"",
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let error = load_toron_bootstrap_config(&path).expect_err("non-loopback SQL bind must fail");
+
+	assert!(
+		error.to_string().contains(
+			"toron sql listener requires authenticated transport for non-loopback bind address"
+		),
+		"{error}"
+	);
 }
 
 #[test]

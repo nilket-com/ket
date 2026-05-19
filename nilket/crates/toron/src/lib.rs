@@ -12,9 +12,11 @@ pub mod exec;
 pub mod ir;
 pub mod pbc;
 pub mod planner;
+pub mod quic;
 pub mod rune_engine;
 pub mod server;
 pub mod sql_planner;
+pub mod sql_wire;
 pub mod storage;
 pub mod wire;
 

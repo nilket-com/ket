@@ -226,6 +226,15 @@ where
 	}
 
 	pub async fn execute_query(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, QueryError> {
+		self.execute_query_with_context(plan, self.context.clone())
+			.await
+	}
+
+	pub async fn execute_query_with_context(
+		&self,
+		plan: &LogicalPlan,
+		context: ExecutionContext,
+	) -> Result<Vec<RecordBatch>, QueryError> {
 		let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
 		if matches!(
 			bound,
@@ -234,19 +243,22 @@ where
 			return execute_catalog_plan(
 				self.catalog.as_ref(),
 				self.admin.as_ref(),
-				&self.context,
+				&context,
 				&bound,
 			)
 			.await;
 		}
 		if matches!(bound, ExecutionPlan::Insert { .. }) {
-			let source_executor = DistributedMutationSourceExecutor { coordinator: self };
+			let source_executor = DistributedMutationSourceExecutor {
+				coordinator: self,
+				context: &context,
+			};
 			return execute_write_plan_with_source(
 				self.catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
 				self.admin.as_ref(),
-				&self.context,
+				&context,
 				&source_executor,
 				&bound,
 			)
@@ -258,27 +270,32 @@ where
 				| ExecutionPlan::CreateTableAsSelect { .. }
 				| ExecutionPlan::Delete { .. }
 		) {
-			let source_executor = DistributedMutationSourceExecutor { coordinator: self };
+			let source_executor = DistributedMutationSourceExecutor {
+				coordinator: self,
+				context: &context,
+			};
 			return execute_write_plan_with_source(
 				self.catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
 				self.admin.as_ref(),
-				&self.context,
+				&context,
 				&source_executor,
 				&bound,
 			)
 			.await;
 		}
 
-		self.execute_bound_distributed(bound).await
+		self.execute_bound_distributed_with_context(bound, &context)
+			.await
 	}
 
-	async fn execute_bound_distributed(
+	async fn execute_bound_distributed_with_context(
 		&self,
 		bound: ExecutionPlan,
+		context: &ExecutionContext,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let stages = fragment_plan(bound, self.fragment_config()).map_err(fragment_error)?;
+		let stages = fragment_plan(bound, self.fragment_config(context)).map_err(fragment_error)?;
 		let mut scheduler = DistributedScheduler::new(self.registry.clone());
 		let mut dispatcher =
 			NetworkTaskDispatcher::new(self.memory.clone(), self.transport.clone());
@@ -289,12 +306,12 @@ where
 		Ok(run.final_results)
 	}
 
-	fn fragment_config(&self) -> FragmentPlanConfig {
+	fn fragment_config(&self, context: &ExecutionContext) -> FragmentPlanConfig {
 		FragmentPlanConfig::new(
-			self.context.query_id,
+			context.query_id,
 			TaskBudget::from_query_budget(self.query_budget),
 		)
-		.with_task_context(TaskExecutionContext::from_execution_context(&self.context))
+		.with_task_context(TaskExecutionContext::from_execution_context(context))
 	}
 }
 
@@ -444,6 +461,7 @@ where
 	Transport: ToronTransport + ?Sized,
 {
 	coordinator: &'a DistributedQueryCoordinator<Registry, Transport>,
+	context: &'a ExecutionContext,
 }
 
 #[async_trait::async_trait]
@@ -458,7 +476,7 @@ where
 		plan: &ExecutionPlan,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		self.coordinator
-			.execute_bound_distributed(plan.clone())
+			.execute_bound_distributed_with_context(plan.clone(), self.context)
 			.await
 	}
 }
@@ -481,7 +499,7 @@ async fn execute_write_plan_with_source(
 			rows,
 		} => {
 			let payload = write::materialize_insert_batch(schema, rows)?;
-			writer
+			let outcome = writer
 				.write(WriteRequest {
 					session_id: context.session_id,
 					query_id: context.query_id,
@@ -494,7 +512,7 @@ async fn execute_write_plan_with_source(
 					trace_context: context.trace_context,
 				})
 				.await?;
-			Ok(Vec::new())
+			Ok(vec![write::affected_count_batch(outcome.rows)?])
 		}
 		ExecutionPlan::InsertSelect {
 			legacy_table_id,
@@ -508,9 +526,9 @@ async fn execute_write_plan_with_source(
 			let Some(payload) =
 				write::materialize_insert_select_batch(schema, target_columns, &source_batches)?
 			else {
-				return Ok(Vec::new());
+				return Ok(vec![write::affected_count_batch(0)?]);
 			};
-			writer
+			let outcome = writer
 				.write(WriteRequest {
 					session_id: context.session_id,
 					query_id: context.query_id,
@@ -523,7 +541,7 @@ async fn execute_write_plan_with_source(
 					trace_context: context.trace_context,
 				})
 				.await?;
-			Ok(Vec::new())
+			Ok(vec![write::affected_count_batch(outcome.rows)?])
 		}
 		ExecutionPlan::CreateTableAsSelect {
 			table,

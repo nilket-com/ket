@@ -53,56 +53,56 @@ use crate::distributed::identity::QueryId;
 use crate::storage::TenantId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronSqlFrame {
-    pub protocol_version: ToronSqlProtocolVersion,
+pub struct SqlFrame {
+    pub protocol_version: SqlProtocolVersion,
     pub query_id: QueryId,
-    pub message: ToronSqlMessage,
+    pub message: SqlMessage,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ToronSqlProtocolVersion {
+pub enum SqlProtocolVersion {
     Current,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ToronSqlMessage {
-    Execute(ToronSqlExecuteRequest),
-    Cancel(ToronSqlCancelRequest),
-    ResultBatch(ToronSqlResultBatch),
-    Complete(ToronSqlComplete),
-    Error(ToronSqlError),
+pub enum SqlMessage {
+    Execute(ExecuteRequest),
+    Cancel(CancelRequest),
+    ResultBatch(ResultBatch),
+    Complete(Complete),
+    Error(SqlError),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronSqlExecuteRequest {
+pub struct ExecuteRequest {
     pub statement: String,
     pub statement_timeout_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronSqlCancelRequest {
+pub struct CancelRequest {
     pub query_id: QueryId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronSqlResultBatch {
+pub struct ResultBatch {
     pub batch_index: u32,
     pub arrow_ipc_bytes: ByteBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronSqlComplete {
+pub struct Complete {
     pub row_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronSqlError {
-    pub code: ToronSqlErrorCode,
+pub struct SqlError {
+    pub code: SqlErrorCode,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ToronSqlErrorCode {
+pub enum SqlErrorCode {
     SyntaxError,
     PlanningError,
     BindingError,
@@ -120,8 +120,8 @@ pub enum ToronSqlErrorCode {
 Public helpers for length-prefixed framing (reuse `wire::encode` / `wire::decode` from ADR 039):
 
 ```rust
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &ToronSqlFrame) -> io::Result<()>;
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<ToronSqlFrame>;
+pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &SqlFrame) -> io::Result<()>;
+pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<SqlFrame>;
 ```
 
 Length prefix: u32 little-endian (matches existing Toron task wire convention).
@@ -137,26 +137,26 @@ pub struct ToronBootstrapConfig {
     pub storage: ToronStorageConfig,
     pub catalog: ToronCatalogConfig,
     pub observability: ToronObservabilityConfig,
-    pub sql: Option<ToronSqlConfig>,        // NEW
-    pub coordinator: ToronCoordinatorConfig, // NEW
+    pub sql: Option<SqlConfig>,        // NEW
+    pub coordinator: CoordinatorConfig, // NEW
 }
 
-pub struct ToronSqlConfig {
-    pub transport: ToronSqlTransport,
+pub struct SqlConfig {
+    pub transport: SqlTransport,
     pub listener_bind: SocketAddr,
     pub statement_timeout: Duration,
 }
 
-pub enum ToronSqlTransport {
+pub enum SqlTransport {
     Quic,
 }
 
-pub struct ToronCoordinatorConfig {
+pub struct CoordinatorConfig {
     pub include_self_worker: bool,        // default true
-    pub static_workers: Vec<ToronStaticWorker>,
+    pub static_workers: Vec<StaticWorkerConfig>,
 }
 
-pub struct ToronStaticWorker {
+pub struct StaticWorkerConfig {
     pub worker_id: WorkerId,
     pub endpoint: SocketAddr,
 }
@@ -189,7 +189,7 @@ include_self_worker = true
 
 Missing `[sql]` section → `sql: None`; daemon binds worker-only (preserves ADR 042 backward compat per fixture 13).
 
-Missing `[coordinator]` section → default `ToronCoordinatorConfig { include_self_worker: true, static_workers: Vec::new() }`. Backward compat.
+Missing `[coordinator]` section → default `CoordinatorConfig { include_self_worker: true, static_workers: Vec::new() }`. Backward compat.
 
 ## Phase 4: `crates/toron/src/daemon.rs` — QUIC SQL Listener + Wendelon Access Path + Coordinator
 
@@ -262,8 +262,8 @@ if let Some(sql_config) = &config.sql {
 async fn run_sql_accept_loop(
     coordinator: Arc<DistributedQueryCoordinator<...>>,
     daemon_tenant_id: TenantId,
-    sql_config: ToronSqlConfig,
-    endpoint: ToronQuicEndpoint,
+    sql_config: SqlConfig,
+    endpoint: QuicEndpoint,
     mut shutdown_rx: oneshot::Receiver<()>,
     sql_connection_tasks: Arc<Mutex<JoinSet<()>>>,
 ) {
@@ -291,22 +291,22 @@ async fn run_sql_accept_loop(
 
 `handle_sql_connection` (one-shot per D17):
 
-1. `read_frame(stream)` → `ToronSqlFrame`.
+1. `read_frame(stream)` → `SqlFrame`.
 2. If the message is `Cancel(req)`, route `req.query_id` through the best-effort cancellation path and return `Cancelled` or `CancellationUnsupported`.
-3. If the message is not `Execute(req)`, emit `ToronSqlErrorCode::Internal` or a narrow protocol-error mapping if one is introduced locally.
+3. If the message is not `Execute(req)`, emit `SqlErrorCode::Internal` or a narrow protocol-error mapping if one is introduced locally.
 4. Stamp `tenant_id` from `daemon_tenant_id` (D9 server-stamped).
 5. Parse `req.statement` via `SqlPlanner::plan_sql_text(&req.statement)?` → `LogicalPlan`.
 6. Bind via `Binder` → `ExecutionPlan`.
 7. Execute via `coordinator.execute_query(&plan, statement_timeout).await?` → `Vec<RecordBatch>`.
 8. Encode batches as Arrow IPC stream (`arrow::ipc::writer::StreamWriter`):
-   - For each batch (or for the combined buffered stream — Gemini's iter-1 buffered position; D20-compatible), emit `ToronSqlMessage::ResultBatch { batch_index, arrow_ipc_bytes }`.
-9. Emit `ToronSqlMessage::Complete { row_count }`.
-10. On error at any step, emit `ToronSqlMessage::Error { code, message }` mapped per the stable error code table.
+   - For each batch (or for the combined buffered stream — Gemini's iter-1 buffered position; D20-compatible), emit `SqlMessage::ResultBatch { batch_index, arrow_ipc_bytes }`.
+9. Emit `SqlMessage::Complete { row_count }`.
+10. On error at any step, emit `SqlMessage::Error { code, message }` mapped per the stable error code table.
 11. Close connection (one-shot).
 
 Error mapping:
 
-| Internal error | `ToronSqlErrorCode` |
+| Internal error | `SqlErrorCode` |
 |---|---|
 | `SqlPlanner` parse error | `SyntaxError` |
 | `SqlPlanner` lowering error | `PlanningError` |
@@ -389,7 +389,7 @@ async fn run_sql_client_async(statement: String, endpoint_override: Option<Socke
     let endpoint = resolve_endpoint(endpoint_override);
 
     // 2. Dial daemon over QUIC.
-    let mut stream = match ToronSqlQuicClient::connect(endpoint).await {
+    let mut stream = match QuicEndpoint::client()?.connect_stream(endpoint).await {
         Ok(s) => s,
         Err(err) => {
             eprintln!("failed to connect to toron sql endpoint {endpoint}: {err}");
@@ -398,10 +398,10 @@ async fn run_sql_client_async(statement: String, endpoint_override: Option<Socke
     };
 
     // 3. Send Execute frame.
-    let frame = ToronSqlFrame {
-        protocol_version: ToronSqlProtocolVersion::Current,
+    let frame = SqlFrame {
+        protocol_version: SqlProtocolVersion::Current,
         query_id: QueryId::new(),
-        message: ToronSqlMessage::Execute(ToronSqlExecuteRequest {
+        message: SqlMessage::Execute(ExecuteRequest {
             statement,
             statement_timeout_seconds: None,
         }),
@@ -411,18 +411,18 @@ async fn run_sql_client_async(statement: String, endpoint_override: Option<Socke
     // 4. Read response frames; collect ResultBatch arrow IPC bytes; render on Complete; print error on Error.
     let mut batches: Vec<RecordBatch> = Vec::new();
     let mut row_count: Option<u64> = None;
-    let mut error: Option<ToronSqlError> = None;
+    let mut error: Option<SqlError> = None;
     loop {
         match read_frame(&mut stream).await? {
-            ToronSqlFrame { message: ToronSqlMessage::ResultBatch(batch), .. } => {
+            SqlFrame { message: SqlMessage::ResultBatch(batch), .. } => {
                 let reader = StreamReader::try_new(&batch.arrow_ipc_bytes[..], None)?;
                 for record in reader { batches.push(record?); }
             }
-            ToronSqlFrame { message: ToronSqlMessage::Complete(complete), .. } => {
+            SqlFrame { message: SqlMessage::Complete(complete), .. } => {
                 row_count = Some(complete.row_count);
                 break;
             }
-            ToronSqlFrame { message: ToronSqlMessage::Error(err), .. } => {
+            SqlFrame { message: SqlMessage::Error(err), .. } => {
                 error = Some(err);
                 break;
             }
@@ -464,12 +464,12 @@ CLI flag parsing for `--endpoint`: add to the `sql` arm match in `cli.rs`. If `-
 
 ## Phase 6: Architecture Guards
 
-Add the 21 guards to `crates/toron/tests/architecture_test.rs`. Forbidden-token sets per guard:
+Add the 21 promoted guards to `crates/toron/tests/architecture_test.rs`, plus the ADR 043 convention guard for brand-clean new protocol/type identifiers. Forbidden-token sets per guard:
 
 - **Guard 5 (`adr043_toron_cli_sql_is_client_only`):** `crates/nilket/src/main.rs` and `crates/toron/src/cli.rs` SQL arm do not import `DistributedQueryCoordinator`, `QueryCoordinator`, `WendelonCatalog`, `WendelonStorageScan`, `WendelonStorageWrite`, `WendelonStorageDeleteRows`, `WendelonStorageAdmin`, `WendelonDescriptorRegistry`.
 - **Guard 8 (`adr043_task_transport_is_quic_by_default_and_loopback_only`):** ADR 043 SQL and task-dispatch paths use the QUIC transport by default; any remaining `TcpTransport` use is confined to ADR 042 compatibility tests/fixtures and not the production SQL path.
 - **Guard 9 (`adr043_sql_wire_uses_length_prefixed_postcard`):** `sql_wire.rs` contains `postcard` usage AND length-prefix framing (`u32` LE prefix or equivalent).
-- **Guard 10 (`adr043_sql_wire_uses_arrow_ipc_not_row_strings`):** `ToronSqlResultBatch` carries `arrow_ipc_bytes: ByteBuf` (or `Vec<u8>` with `#[serde(with = "serde_bytes")]`); no `Vec<String>` row format.
+- **Guard 10 (`adr043_sql_wire_uses_arrow_ipc_not_row_strings`):** `ResultBatch` carries `arrow_ipc_bytes: ByteBuf` (or `Vec<u8>` with `#[serde(with = "serde_bytes")]`); no `Vec<String>` row format.
 - **Guard 12 (`adr043_no_grpc_protobuf_or_arrow_flight`):** Toron source contains no `tonic`, `prost`, `arrow_flight` imports.
 - **Guard 13 (`adr043_no_remote_sql_auth_policy`):** Toron SQL source contains no token-auth helpers, client tenant-claim admission, or non-loopback remote-auth policy. QUIC protocol TLS material is allowed; remote authorization policy remains ADR 044.
 - **Guard 14 (`adr043_daemon_uses_single_descriptor_registry_for_sql`):** Daemon source contains exactly one `WendelonDescriptorRegistry::from_descriptors` call; SQL coordinator construction uses `Arc::clone(&registry)`.
@@ -478,6 +478,7 @@ Add the 21 guards to `crates/toron/tests/architecture_test.rs`. Forbidden-token 
 - **Guard 18 (`adr043_wendelon_client_has_real_provider_mode_for_sql`):** `build_wendelon_client` (or equivalent) does NOT contain `providers: HashMap::new()` for the SQL-enabled production path; either real provider registration (Plan A) or sanctioned test harness (Plan B with documented test-only gating).
 - **Guard 20 (`adr043_sql_ready_does_not_mutate_adr042_ready_line`):** Daemon source emits the literal `println!("READY {}` (worker line) followed by optional `println!("SQL_READY {}` — separate print calls, not a single combined line.
 - **Guard 21 (`adr043_sql_wire_uses_existing_wire_crate`):** `sql_wire.rs` imports / uses `wire::encode` / `wire::decode` or equivalent shared helpers from a sanctioned ADR 039 wire boundary, not a Wendelon-private module.
+- **Convention guard (`adr043_new_sql_protocol_names_are_brand_clean`):** New ADR 043 protocol, wire, and config identifiers avoid `ToronSql*`, `ToronQuic*`, `ToronCoordinatorConfig`, `ToronStaticWorker`, `ToronWendelonTlsConfig`, and related raw-config prefixes; project names remain only in operator-facing command/env/readiness text.
 
 Prefer source-read assertions over broad semantic greps. For guards 14, 15, 18, 20, use narrow source-block extraction around the daemon startup sequence (brace-block technique from ADRs 038/041/042).
 
@@ -487,15 +488,15 @@ Add the 14 required fixtures across existing + new test files.
 
 ### `crates/toron/tests/toron_sql_wire_test.rs` (new)
 
-- `toron_sql_wire_round_trips_arrow_ipc_batch` — construct `ToronSqlFrame` with a `ResultBatch` carrying real Arrow IPC bytes; round-trip through `write_frame` / `read_frame`; assert byte-identical reconstruction.
+- `toron_sql_wire_round_trips_arrow_ipc_batch` — construct `SqlFrame` with a `ResultBatch` carrying real Arrow IPC bytes; round-trip through `write_frame` / `read_frame`; assert byte-identical reconstruction.
 
 ### `crates/toron/tests/toron_sql_listener_test.rs` (new)
 
 - `toron_sql_listener_rejects_non_loopback_bind` — config with non-loopback SQL bind fails validation with D5 diagnostic.
 - `toron_daemon_prints_sql_ready_endpoint` — spawn `nilket toron start` as subprocess with `[sql]` enabled; parse both `READY <worker>` and `SQL_READY <sql>` from stdout.
 - `toron_daemon_without_sql_section_preserves_worker_only_start` — config missing `[sql]`; daemon binds worker only; no `SQL_READY` line emitted. ADR 042 backward compat.
-- `toron_sql_select_from_bootstrapped_descriptor_executes_over_wire` — daemon with `descriptor_bootstrap_path` (one table) + sanctioned Wendelon harness; submit `SELECT * FROM <table>` via the QUIC SQL listener + `ToronSqlFrame`; assert Arrow batches deserialize and match expected rows. **Wire-correctness witness.**
-- `toron_sql_syntax_error_emits_stable_error_code` — submit malformed SQL; observe `ToronSqlError { code: SyntaxError, ... }`.
+- `toron_sql_select_from_bootstrapped_descriptor_executes_over_wire` — daemon with `descriptor_bootstrap_path` (one table) + sanctioned Wendelon harness; submit `SELECT * FROM <table>` via the QUIC SQL listener + `SqlFrame`; assert Arrow batches deserialize and match expected rows. **Wire-correctness witness.**
+- `toron_sql_syntax_error_emits_stable_error_code` — submit malformed SQL; observe `SqlError { code: SyntaxError, ... }`.
 - `toron_sql_uses_self_worker_registry_entry` — daemon with `include_self_worker = true`; submit SQL; observe via tracing that a task dispatches to the self-worker endpoint.
 - `toron_sql_complete_frame_carries_stable_row_count` — submit `CREATE TABLE`, `INSERT INTO ... VALUES (1)`, `DELETE FROM ... WHERE id = 1`, `DROP TABLE`; observe `Complete { row_count }` for each; CLI renders `OK rows=<n>` / `OK` shape per D20.
 
@@ -550,9 +551,9 @@ Before promotion / merge, affirm:
 - [ ] SQL path routes through `DistributedQueryCoordinator`, not a local bypass.
 - [ ] Real Wendelon transport providers wired (Plan A) or sanctioned test harness with named provider follow-up (Plan B).
 - [ ] No `tonic`, `prost`, `arrow_flight`, token-auth, client tenant-claim admission, or non-loopback remote-auth policy in Toron source.
-- [ ] No `*V1` suffix on `ToronSqlFrame` / `ToronSqlMessage` / `ToronSqlErrorCode` / etc.
+- [ ] No `*V1` suffix on `SqlFrame` / `SqlMessage` / `SqlErrorCode` / etc.
 - [ ] `toron_fixture_worker.rs` source unchanged (extends the ADR 035-043 byte-identical refactor-invariant chain to eight preserved cycles).
-- [ ] All 21 architecture guards green; all 14 required integration fixtures green.
+- [ ] All 21 promoted architecture guards plus the ADR 043 convention guard are green; all 14 required integration fixtures green.
 
 ## Acceptance Checklist
 

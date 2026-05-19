@@ -3,12 +3,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use toron::config::{
-	ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig, ToronObservabilityConfig,
-	ToronStorageConfig, ToronTracingFormat, ToronWendelonBootstrapPeer, ToronWendelonStorageConfig,
-	ToronWorkerConfig,
+	CoordinatorConfig, SqlConfig, SqlTransport, ToronBootstrapConfig, ToronCatalogConfig,
+	ToronNodeConfig, ToronObservabilityConfig, ToronStorageConfig, ToronTracingFormat,
+	ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig,
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::identity::{AttemptId, QueryId, StageId, TaskId, TaskIdentity, WorkerId};
+use toron::sql_wire::{
+	SqlErrorCode, SqlFrame, SqlMessage, read_frame as read_sql_frame,
+	write_frame as write_sql_frame,
+};
 use toron::storage::TenantId;
 use toron::wire::{
 	CancelTaskPayload, EnvelopeIdentity, MessageKind, TaskCancelledPayload, WireEnvelope,
@@ -33,12 +37,20 @@ fn config() -> ToronBootstrapConfig {
 					node_id: 1,
 					address: "127.0.0.1:7001".to_string(),
 				}],
+				client_bind: "127.0.0.1:0".parse().expect("client bind"),
+				tls: None,
+				cluster_domain: wendelon::network::tls::DEFAULT_CLUSTER_DOMAIN.to_string(),
 				pool_max_retained: 64,
 				pool_max_cap_bytes: 8 * 1024 * 1024,
 			},
 		},
 		catalog: ToronCatalogConfig {
 			descriptor_bootstrap_path: None,
+		},
+		sql: None,
+		coordinator: CoordinatorConfig {
+			include_self_worker: true,
+			static_workers: Vec::new(),
 		},
 		observability: ToronObservabilityConfig {
 			level: "info".to_string(),
@@ -56,6 +68,16 @@ fn task_identity() -> TaskIdentity {
 	)
 }
 
+fn config_with_sql() -> ToronBootstrapConfig {
+	let mut config = config();
+	config.sql = Some(SqlConfig {
+		transport: SqlTransport::Quic,
+		listener_bind: "127.0.0.1:0".parse().expect("sql bind"),
+		statement_timeout: Duration::from_secs(1),
+	});
+	config
+}
+
 #[tokio::test]
 async fn toron_daemon_binds_loopback_ephemeral_port() {
 	let daemon = ToronDaemon::start(config()).await.expect("start daemon");
@@ -63,6 +85,48 @@ async fn toron_daemon_binds_loopback_ephemeral_port() {
 
 	assert!(endpoint.ip().is_loopback());
 	assert_ne!(endpoint.port(), 0);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn toron_daemon_binds_sql_loopback_ephemeral_port() {
+	let daemon = ToronDaemon::start(config_with_sql())
+		.await
+		.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	assert!(endpoint.ip().is_loopback());
+	assert_ne!(endpoint.port(), 0);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn toron_sql_syntax_error_emits_stable_error_code() {
+	let daemon = ToronDaemon::start(config_with_sql())
+		.await
+		.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = toron::quic::QuicEndpoint::client().expect("sql client");
+	let mut stream = client.connect_stream(endpoint).await.expect("connect sql");
+	let query_id = QueryId::new();
+
+	write_sql_frame(
+		&mut stream,
+		&SqlFrame::execute(query_id, "SELEC * FROM nope".to_string(), None),
+	)
+	.await
+	.expect("write sql");
+	stream.finish().await.expect("finish sql request");
+	let response = read_sql_frame(&mut stream)
+		.await
+		.expect("read sql response");
+
+	match response.message {
+		SqlMessage::Error(error) => assert_eq!(error.code, SqlErrorCode::SyntaxError),
+		other => panic!("unexpected SQL response: {other:?}"),
+	}
 
 	daemon.shutdown().await.expect("shutdown daemon");
 }

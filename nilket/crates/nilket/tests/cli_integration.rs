@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,6 +66,56 @@ format = "pretty"
 	)
 }
 
+fn minimal_toron_config_with_sql(task_listener_bind: &str, sql_listener_bind: &str) -> String {
+	let mut config = minimal_toron_config(task_listener_bind);
+	config.push_str(&format!(
+		r#"
+[sql]
+transport = "quic"
+listener_bind = "{sql_listener_bind}"
+statement_timeout_seconds = 60
+
+[coordinator]
+include_self_worker = true
+"#
+	));
+	config
+}
+
+fn spawn_toron_sql_daemon(tag: &str) -> (Child, String) {
+	let dir = fresh_dir(tag);
+	let path = dir.join("toron.toml");
+	std::fs::write(
+		&path,
+		minimal_toron_config_with_sql("127.0.0.1:0", "127.0.0.1:0"),
+	)
+	.expect("write toron config");
+	let mut child = nilket_command()
+		.args(["toron", "start", path.to_str().expect("utf8 config path")])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn nilket toron start");
+	let stdout = child.stdout.take().expect("child stdout");
+	let mut reader = BufReader::new(stdout);
+	let mut ready_line = String::new();
+	let mut sql_ready_line = String::new();
+	reader.read_line(&mut ready_line).expect("read READY line");
+	reader
+		.read_line(&mut sql_ready_line)
+		.expect("read SQL_READY line");
+	assert!(
+		ready_line.starts_with("READY 127.0.0.1:"),
+		"unexpected READY line: {ready_line:?}"
+	);
+	let sql_endpoint = sql_ready_line
+		.strip_prefix("SQL_READY ")
+		.unwrap_or_else(|| panic!("unexpected SQL_READY line: {sql_ready_line:?}"))
+		.trim()
+		.to_string();
+	(child, sql_endpoint)
+}
+
 fn node(id: u32) -> NodeId {
 	NodeId { id, _reserved: 0 }
 }
@@ -104,7 +154,7 @@ fn nilket_version_prints_single_coordinate() {
 }
 
 #[test]
-fn nilket_root_sql_is_rejected() {
+fn nilket_root_sql_still_rejected() {
 	let output = nilket(&["sql", "SELECT 1"]);
 
 	assert_eq!(output.status.code(), Some(2), "{output:?}");
@@ -115,15 +165,12 @@ fn nilket_root_sql_is_rejected() {
 }
 
 #[test]
-fn nilket_toron_sql_reaches_toron_branch() {
-	let output = nilket(&["toron", "sql", "SELECT 1"]);
+fn nilket_toron_sql_requires_statement() {
+	let output = nilket(&["toron", "sql"]);
 
 	assert_eq!(output.status.code(), Some(2), "{output:?}");
 	assert!(stdout(&output).is_empty(), "{output:?}");
-	assert_eq!(
-		stderr(&output),
-		"toron sql is reserved; production execution is not wired in ADR 040\n"
-	);
+	assert_eq!(stderr(&output), "toron sql requires <statement...>\n");
 }
 
 #[test]
@@ -176,22 +223,77 @@ fn nilket_toron_start_rejects_non_loopback_bind() {
 }
 
 #[test]
-fn nilket_toron_sql_and_inspect_still_reserved() {
-	for (args, stderr_expected) in [
-		(
-			&["toron", "sql", "SELECT 1"][..],
-			"toron sql is reserved; production execution is not wired in ADR 040\n",
-		),
-		(
-			&["toron", "inspect", "workers"][..],
-			"toron inspect is reserved; production execution is not wired in ADR 040\n",
-		),
-	] {
-		let output = nilket(args);
-		assert_eq!(output.status.code(), Some(2), "{output:?}");
-		assert!(stdout(&output).is_empty(), "{output:?}");
-		assert_eq!(stderr(&output), stderr_expected);
-	}
+fn nilket_toron_sql_dials_endpoint_from_flag() {
+	let (mut child, endpoint) = spawn_toron_sql_daemon("toron-sql-flag");
+	let output = nilket_command()
+		.args([
+			"toron",
+			"sql",
+			"--endpoint",
+			&endpoint,
+			"SELEC * FROM missing",
+		])
+		.env("TORON_SQL_ENDPOINT", "127.0.0.1:9")
+		.output()
+		.expect("run nilket toron sql");
+	let _ = child.kill();
+	let _ = child.wait();
+
+	assert_eq!(output.status.code(), Some(1), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert!(
+		stderr(&output).contains("toron sql error [SyntaxError]"),
+		"{output:?}"
+	);
+}
+
+#[test]
+fn nilket_toron_sql_dials_endpoint_from_env() {
+	let (mut child, endpoint) = spawn_toron_sql_daemon("toron-sql-env");
+	let output = nilket_command()
+		.args(["toron", "sql", "SELEC * FROM missing"])
+		.env("TORON_SQL_ENDPOINT", endpoint)
+		.output()
+		.expect("run nilket toron sql");
+	let _ = child.kill();
+	let _ = child.wait();
+
+	assert_eq!(output.status.code(), Some(1), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert!(
+		stderr(&output).contains("toron sql error [SyntaxError]"),
+		"{output:?}"
+	);
+}
+
+#[test]
+fn nilket_toron_sql_reports_connection_failure() {
+	let output = nilket(&[
+		"toron",
+		"sql",
+		"--endpoint",
+		"127.0.0.1:9",
+		"SELECT * FROM missing",
+	]);
+
+	assert_eq!(output.status.code(), Some(2), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert!(
+		stderr(&output).contains("failed to connect to toron sql endpoint 127.0.0.1:9"),
+		"{output:?}"
+	);
+}
+
+#[test]
+fn nilket_toron_inspect_still_reserved() {
+	let output = nilket(&["toron", "inspect", "workers"]);
+
+	assert_eq!(output.status.code(), Some(2), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert_eq!(
+		stderr(&output),
+		"toron inspect is reserved; production execution is not wired in ADR 040\n"
+	);
 }
 
 #[test]
@@ -245,6 +347,42 @@ fn toron_daemon_prints_ready_endpoint() {
 	assert!(
 		line.starts_with("READY 127.0.0.1:"),
 		"unexpected READY line: {line:?}"
+	);
+}
+
+#[test]
+fn toron_daemon_prints_sql_ready_endpoint() {
+	let dir = fresh_dir("toron-sql-ready");
+	let path = dir.join("toron.toml");
+	std::fs::write(
+		&path,
+		minimal_toron_config_with_sql("127.0.0.1:0", "127.0.0.1:0"),
+	)
+	.expect("write toron config");
+	let mut child = nilket_command()
+		.args(["toron", "start", path.to_str().expect("utf8 config path")])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn nilket toron start");
+	let stdout = child.stdout.take().expect("child stdout");
+	let mut reader = BufReader::new(stdout);
+	let mut ready_line = String::new();
+	let mut sql_ready_line = String::new();
+	reader.read_line(&mut ready_line).expect("read READY line");
+	reader
+		.read_line(&mut sql_ready_line)
+		.expect("read SQL_READY line");
+	let _ = child.kill();
+	let _ = child.wait();
+
+	assert!(
+		ready_line.starts_with("READY 127.0.0.1:"),
+		"unexpected READY line: {ready_line:?}"
+	);
+	assert!(
+		sql_ready_line.starts_with("SQL_READY 127.0.0.1:"),
+		"unexpected SQL_READY line: {sql_ready_line:?}"
 	);
 }
 

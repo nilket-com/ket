@@ -12,6 +12,17 @@ use crate::error::{ExecutionError, StorageError};
 use crate::exec::evaluate_cast;
 use crate::ir::{ColumnOrdinal, ScalarValue};
 
+pub(super) fn affected_count_batch(count: usize) -> Result<RecordBatch, ExecutionError> {
+	let value = i64::try_from(count).map_err(|_| ExecutionError::Kernel {
+		message: format!("affected row count {count} exceeds Int64 range"),
+	})?;
+	let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+		arrow::datatypes::Field::new("affected", DataType::Int64, false),
+	]));
+	let array = Arc::new(Int64Array::from(vec![value])) as ArrayRef;
+	RecordBatch::try_new(schema, vec![array]).map_err(ExecutionError::from)
+}
+
 pub(super) fn materialize_insert_batch(
 	schema: &SchemaRef,
 	rows: &[Vec<ScalarValue>],
