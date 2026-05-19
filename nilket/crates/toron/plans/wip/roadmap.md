@@ -2378,7 +2378,7 @@ along with the forward-sequence rewrite.
   **D14 critical decision**: ADR 039 = Wendelon
   DROP Migration Substrate. ADR 039 lifts
   `WendelonCatalog::drop_table` `AdminUnavailable`
-  + Wendelon-side `TableSchemaDropRequestV1`
+  + Wendelon-side dedicated `TableSchemaDropRequest`
   payload + consensus apply migration precondition
   + `TableSchemaCatalogV1::unbind_latest_name`
   primitive + lifecycle removal. Primary ADR 039
@@ -2469,6 +2469,260 @@ along with the forward-sequence rewrite.
   D6 + ADR 037 D6). The ten-phase migration is
   materialized in
   `plans/impl/038_storage_admin_reclaim_substrate.md`.
+- **ADR 039 — Wendelon DROP Migration Substrate.**
+  Promoted. **Sixth cross-ring substrate cycle**
+  after ADR 029 + 030 + 035 + 037 + 038.
+  Three council iterations on a 17-decision D-set,
+  then **user-directed iter-3 architectural
+  redirection** that moved the 3-stage DROP
+  protocol entirely server-side into Wendelon.
+  Final promoted D-set: **14 decisions**. Lifts
+  ADR 038 D13's deferred L3 via a single high-
+  level Wendelon admin RPC; Wendelon owns the
+  internal choreography end-to-end.
+  **First cycle in council history with a user-
+  directed architectural redirection at promotion
+  drafting.** ADR 037 / ADR 038 user touchpoints
+  were process directives (lift naming, no-V1-
+  suffix); ADR 039 iter-3 is the first time a user
+  direction reshaped a load-bearing architectural
+  decision (Toron-orchestrated choreography →
+  Wendelon-orchestrated choreography). The
+  redirection deleted 3 of 17 council-converged
+  decisions, restructured 2, shrunk the
+  architecture guard set by ~7 guards, shifted
+  scope mass from Toron-side to Wendelon-side, and
+  memorialized the cross-ring admin orchestration
+  boundary in writing.
+  **D1 critical decision:** Wendelon-internal 3-stage
+  protocol — prepare/fence → reclaim + completion
+  → finalize. **All four sub-stages run server-side
+  inside Wendelon.** Toron makes one client call.
+  **D2 critical decision:** all three apply paths
+  are pure committed-metadata. No I/O during raft
+  apply. Architecture guard source-asserts no
+  `lsm.*` / `storage_io.*` / file-system symbols
+  in apply bodies.
+  **D3 critical decision:** raft log indexes as
+  receipts (`fence_log_index`,
+  `reclaim_completion_log_index`); not
+  cryptographic blobs. **Receipts live entirely
+  inside Wendelon's lifecycle catalog** — not
+  surfaced to Toron. No HMAC, no PKI, no shared
+  secrets.
+  **D4 critical decision:** dedicated typed DROP
+  request surface; `TableSchemaUpdateRequest::envelope`
+  Drop reject preserved. One Toron-facing root type
+  (`TableSchemaDropRequest`); two Wendelon-private
+  internal types (`TableDropPrepareRequest`,
+  `TableReclaimCompletionRequest`).
+  **D5 critical decision (user directive
+  ratified):** **root request type names are
+  unsuffixed.** Versioning lives inside sum-type
+  variant + `::current(fields)` constructor.
+  `crates/toron` never imports or constructs
+  `*V1`-suffixed symbols.
+  **D6 critical decision:** target-derived
+  `DropOperationId { tenant_id, table_object_id,
+  schema_generation }`. Toron passes this in
+  `TableSchemaDropRequest`; Wendelon uses
+  `(DropOperationId, DropStage)` internally for
+  idempotency. `query_id` retains trace-only role
+  — Codex iter-2 D6 catch on Claude iter-1's
+  `derive_idempotency_key(query_id, ...)`.
+  **D7 critical decision:** explicit
+  `schema_generation: u64` field on `TableBinding`
+  + `DropTableStorageRequest`. **NEVER derived
+  from `PhysicalDescriptorFingerprint`** — Codex
+  iter-2 D5 catch on Claude iter-1's
+  `schema_generation_from_fingerprint` (fingerprint
+  is opaque 32-byte BLAKE3, non-invertible). Gemini
+  iter-2 #2 (also fingerprint-derivation)
+  retracted at iter-3.
+  **D8 critical decision:** name stays bound
+  through Wendelon-internal prepare + reclaim;
+  only the internal finalize stage calls
+  `TableSchemaCatalogV1::unbind_latest_name`.
+  Preserves retry-by-name; rejects same-name
+  CREATE during dropping.
+  **D9 critical decision:** lifecycle drop-state
+  is **separate from `TableRetentionPolicy`** —
+  either extend `TableLifecycleCatalog` with
+  availability state OR add sibling
+  `TableDropFenceCatalog`. Not encoded as
+  `TableRetentionPolicy::Disabled`.
+  **D10 critical decision (L1b sub-lift):**
+  Wendelon data-path admission consults the fence
+  on table write / delete / scan / secondary-
+  index maintenance / CDC paths. Rejects fenced
+  `table_object_id`s immediately with
+  `WendelonAdminError::TableAlreadyDropping`.
+  Required for Plan A enablement.
+  **D11 critical decision:** structured
+  `WendelonAdminError` enum (6 variants) replaces
+  ADR 038's substring matching in
+  `map_wendelon_admin_error`: `TableMissing`,
+  `GenerationMismatch`, `TableAlreadyDropping`,
+  `TableAlreadyDropped`, `DependentIndexesPresent`,
+  `Transport`. Wendelon-internal failure modes
+  (reclaim-evidence mismatch, fence-not-found-
+  during-completion) stay inside Wendelon and
+  don't surface to Toron.
+  **D12 critical decision:** conservative reject
+  when dependent secondary indexes are active.
+  Cascade deferred to future "Cascading Index
+  DROP Substrate" ADR.
+  **D13 critical decision:** sub-lift discipline.
+  L1 (Wendelon-internal complete protocol —
+  including server-side reclaim orchestrator and
+  L1b data-path admission) + L2 (Toron-side thin
+  wrapper). **Plan A** (default) ships both.
+  **Plan B fallback** ships Wendelon-side typed
+  payloads + structured errors + raft-entry-index
+  plumbing only — **no server-side orchestrator,
+  no L1b data-path admission, no Toron-side
+  wrapper**. `WendelonCatalog::drop_table`
+  `AdminUnavailable` safety block **preserved**
+  under Plan B. ADR 040 = Wendelon Server-Side
+  DROP Orchestrator + L1b + Final Enablement.
+  Plan B asymmetry sharper than ADR 038's:
+  **Toron does not ship code that orchestrates a
+  Wendelon admin protocol; if Wendelon can't own
+  the full internal protocol, Toron doesn't try
+  to fill the gap.**
+  **D14 critical decision (user-directed iter-3
+  redirection):** **Wendelon owns the entire
+  DROP choreography.** Toron submits one
+  high-level Wendelon admin RPC per `DROP TABLE`:
+  `client.drop_table_schema(TableSchemaDropRequest::current(...)).await`.
+  Toron does NOT submit
+  `TableDropPrepareRequest`,
+  `TableReclaimCompletionRequest`, or any
+  intermediate-stage payload. Toron does NOT
+  hold or thread Wendelon-internal receipts
+  (`fence_log_index`, `reclaim_completion_log_index`).
+  Toron does NOT define a `DropTableStorageProof`
+  carrier — the proof stays inside Wendelon. ADR
+  038 `Catalog::drop_table` trait shape unchanged
+  (no `drop_table_with_proof` widening). ADR 038
+  `StorageAdmin::DropTableStorageOutcome` shape
+  unchanged (no `proof` field).
+  `WendelonStorageAdmin::drop_table_storage` body
+  is a thin wrapper (~15 lines, one client call).
+  `WendelonCatalog::drop_table` body consumes a
+  finalized-drop handoff marker recorded by
+  `WendelonStorageAdmin`, then removes the local
+  registry descriptor (Wendelon-authoritative drop
+  already happened in the prior admin call).
+  Three council iterations on a 17-decision D-set
+  + user-directed iter-3 redirection. **Twelfth
+  consecutive cycle of the Codex correctness-
+  clarification pattern**, with high density:
+  three load-bearing iter-N catches (iter-0 fence
+  requirement, iter-2 type-confusion on
+  generation, iter-2 lifecycle-confusion on
+  idempotency). User-directed iter-3 redirection
+  is a separate, fourth corrective signal.
+  **Gemini iter-1 retraction streak advances to
+  13-of-15** after the 11-of-13 ADR 038 mark.
+  Two clean Gemini iter-N retractions: iter-0
+  cryptographic-token framing → iter-1 (Claude C1
+  raft-state reference); iter-2
+  fingerprint-to-generation answer → iter-3
+  (Codex iter-2 D5 explicit field).
+  **Claude iter-1 / iter-2 / iter-3 substantive
+  retractions: four**, all from the Toron
+  orchestration pseudocode block:
+  `schema_generation_from_fingerprint` (iter-2),
+  `derive_idempotency_key(query_id, ...)`
+  (iter-2), full Toron-orchestrated 3-stage
+  sketch (iter-3, user redirection), proof
+  carrier trait widening (iter-3, user
+  redirection). **Cycle-property hypothesis
+  confirmed at 2 data points: Claude substrate-
+  cycle retractions concentrate in pseudocode-
+  sketch sections**, not protocol-design prose.
+  Future cycles should treat pseudocode as
+  contestable artifact.
+  **First cycle in council history with a
+  user-directed architectural redirection at
+  promotion drafting.** ADR 037 / ADR 038 user
+  touchpoints were process directives; ADR 039
+  iter-3 is the first time a user direction
+  reshaped a load-bearing architectural decision.
+  Recorded as unique cycle artifact.
+  **Cross-ring admin orchestration boundary
+  memorialized** (with Gemini iter-5 disjoint-
+  hardware framing). ADR 038 D6 established the
+  single-call pattern for Wendelon CREATE; ADR
+  039 D14 extends it as a general principle:
+  Wendelon admin operations are choreographed by
+  Wendelon, not by Toron. **Disjoint-hardware
+  rationale**: Toron and Wendelon run on
+  separate machines and scale independently;
+  many Toron compute nodes route admin RPCs to
+  Wendelon storage nodes. Corollary: **no Toron-
+  side cache for transient Wendelon admin
+  state**. A local fenced map on one Toron node
+  cannot protect other Toron nodes in the
+  compute ring; cross-Toron cache invalidation
+  is an anti-pattern (rejected in this cycle
+  AND future cycles). Concurrent queries during
+  a drop route to Wendelon and get rejected
+  there with structured `TableFenced` /
+  `TableAlreadyDropping`. Future Wendelon admin
+  substrate cycles (ALTER, RENAME, etc.) inherit
+  the boundary.
+  **Topic-concession-compresses-next-cycle
+  pattern advances to 8-of-10** if Plan B lands
+  (D13 → ADR 040 seed). Stays at 7-of-9 if Plan A
+  lands.
+  **Cross-ring substrate-cycle properties at 6
+  data points (refined):**
+  1. **Full-scope cross-ring substrate cycles
+     converge in 4 iterations.** 4 data points
+     (029, 030, 035, 037).
+  2. **Partial-scope cross-ring substrate cycles
+     (one lift deferred) converge in 2-3
+     iterations.** 2 data points (038, 039).
+  3. **Cross-ring substrate cycles add 0-1 fields
+     to a single trait-request struct.** ADR 039
+     adds `schema_generation` to `TableBinding` +
+     `DropTableStorageRequest`. ADR 038
+     `StorageAdmin` / `Catalog` trait shapes
+     unchanged.
+  4. **Cross-ring substrate cycles attract Codex
+     iter-0 audit-shaped reframings.** 5-of-6
+     cycles.
+  5. **Cross-ring substrate cycles permit user-
+     directed architectural redirection.** ADR
+     039 first data point: user redirection at
+     iter-3 promotion drafting reshaped 3 of 17
+     council-converged decisions.
+  Twenty-first instance of the ADR 015 cycle.
+  **~25 ADR-039-specific architecture guards + 1
+  paired ADR 038 guard 13 adjustment.** **~22
+  required functional fixtures** (~10 Toron-side
+  + ~12 Wendelon-side). No new SQL syntax; no new
+  IR expression variant; no new aggregate kernel;
+  no PBC opcode change; no new `LogicalPlan` /
+  `ExecutionPlan` variant; **no new `StorageAdmin`
+  / `Catalog` trait methods** (the iter-2
+  proof-carrier trait widening deleted at iter-3
+  redirection); no `blake3` dependency; no
+  external allocator crate. ADR 029 / 030 / 031 /
+  032 / 033 / 034 / 035 / 036 / 037 / 038
+  invariants preserved including ADR 038 D9
+  (registry mutation IS the catalog refresh),
+  ADR 038 D11 (single-call-site for
+  `catalog.drop_table`), ADR 038 `Catalog` trait
+  shape byte-identical. Local DML fixture pass
+  counts byte-identical pre/post-refactor
+  (**fifth byte-identical refactor invariant**
+  after ADR 035 D5 + ADR 036 D6 + ADR 037 D6 +
+  ADR 038 byte-identical). The nine-phase
+  migration is materialized in
+  `plans/impl/039_wendelon_drop_migration_substrate.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -2536,7 +2790,216 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 038 promoted; ADR 039 candidates
+### ADR 039 promoted; ADR 040 candidates
+
+ADR 039 selected and promoted **Wendelon DROP
+Migration Substrate** — Toron's **sixth cross-ring
+substrate cycle** after ADR 029 + 030 + 035 + 037 +
+038. Three council iterations on a 17-decision
+D-set, then **user-directed iter-3 architectural
+redirection** moved the 3-stage DROP protocol
+entirely server-side into Wendelon. Final promoted
+D-set: **14 decisions**. Lifts ADR 038 D13's
+deferred L3 via a single high-level Wendelon admin
+RPC: `client.drop_table_schema(TableSchemaDropRequest::current(...))`.
+Wendelon owns the internal choreography end-to-end
+(prepare/fence → physical reclaim + reclaim-
+completion commit → finalize).
+
+**First cycle in council history with a user-
+directed architectural redirection at promotion
+drafting.** ADR 037 / ADR 038 user touchpoints were
+process directives (lift naming at promotion, no-V1-
+suffix convention). ADR 039 iter-3 is the first
+time a user direction reshaped a load-bearing
+architectural decision (Toron-orchestrated
+choreography → Wendelon-orchestrated choreography).
+The redirection deleted 3 of 17 council-converged
+decisions (proof carrier, catalog trait widening,
+registry transient fenced state), restructured 2
+(sub-lift discipline + enablement gating became
+D13/D14), shrunk the architecture guard set by ~7
+guards, shifted scope mass from Toron-side to
+Wendelon-side, and memorialized the cross-ring
+admin orchestration boundary in writing as a
+general principle (Wendelon admin choreography
+lives inside Wendelon; Toron makes one high-level
+RPC per admin op; future ALTER/RENAME inherit).
+
+Fourteen decisions D1-D14. D14 critical decision
+pins **Wendelon owns the entire DROP choreography**.
+`WendelonStorageAdmin::drop_table_storage` is a
+~15-line thin wrapper around a single
+`client.drop_table_schema(...)` call. ADR 038
+`Catalog::drop_table` trait shape, `StorageAdmin`
+trait shape, and `DropTableStorageOutcome` shape
+all preserved byte-identical (no
+`drop_table_with_proof` widening; no
+`DropTableStorageOutcome.proof` field; no
+`DropTableStorageProof` carrier type).
+`WendelonCatalog::drop_table` body consumes a
+finalized-drop handoff marker recorded by
+`WendelonStorageAdmin`, then removes the local
+registry descriptor (Wendelon-authoritative drop
+already completed in the prior admin call). Plan B
+fallback is sharper than ADR 038's: substrate-
+only, **no Toron-side wrapper shipped**.
+**Toron does not ship code that orchestrates a
+Wendelon admin protocol** — if Wendelon can't own
+the full internal protocol, Toron doesn't try to
+fill the gap.
+
+The nine-phase migration is materialized in
+`plans/impl/039_wendelon_drop_migration_substrate.md`.
+
+ADR 040 selection depends on which plan landed:
+
+**Under Plan A** (full L1 + L2 ship; ADR 038 D13
+safety block removed): ADR 040 is **named-but-
+not-committed**. Next cycle returns to ordinary
+candidate selection (composition or substrate
+based on evidence pressure).
+
+**Under Plan B** (substrate-only ships; ADR 038
+D13 safety block preserved): ADR 040 is **firmly
+committed by ADR 039 D13**. ADR 040 = Wendelon
+Server-Side DROP Orchestrator + L1b Data-Path
+Fence Enforcement + Final Enablement. Lifts the
+remaining work to enable Wendelon-backed DROP
+TABLE.
+
+**ADR 040 lead candidate (committed only under
+Plan B):**
+
+- **ADR 040 — Wendelon Server-Side DROP
+  Orchestrator + Final Enablement.** Adds the
+  Wendelon server-side reclaim orchestrator,
+  data-path fence admission on writes/deletes/
+  scans/index-maintenance/CDC, and Toron-side
+  thin wrapper. Expected 2-3 iteration cycle
+  (partial-scope cadence; substrate already
+  shipped). Carries forward ADR 039 D13
+  commitment.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate + new partial-write
+  contract. Likely a two-ADR sequence: partial-
+  write substrate cycle + SQL UPDATE composition.
+- **`CREATE OR REPLACE TABLE`** — lower to `DROP
+  IF EXISTS x; CREATE TABLE x AS SELECT ...`.
+  Composition over ADR 029 / 033 / 034 / 036 /
+  037 / 038 / 039. Small cycle; waits on ADR 040
+  if Plan B; available immediately if Plan A.
+- **`INSERT ... RETURNING` / `CTAS ... RETURNING`
+  / `DELETE ... RETURNING`** — DML result-shape
+  extension; modest user value until DEFAULT or
+  GENERATED columns or sequences exist. Future
+  RETURNING substrate + composition pair.
+- **Subqueries in DELETE WHERE clause** (e.g.
+  `DELETE FROM t WHERE id IN (SELECT ...)`).
+  Future correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern: Toron submits one
+  high-level request; Wendelon owns internal
+  choreography.
+
+**Substrate candidates carried forward:**
+
+- **Stale-bound-plan invalidation ADR.** ADR 038
+  D10 invariant preserved through ADR 039;
+  future cycle owns the lift.
+- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
+  extensions; need PK / unique-constraint
+  substrate first.
+- **Streaming / multi-batch `StorageWrite::write`
+  / `StorageDeleteRows::delete_rows`** — lifts
+  ADR 032 D5 + D6 + ADR 033 D8 + ADR 035 single-
+  batch cap for bulk loads / deletes.
+- **Write retries after descriptor evolution /
+  mutation idempotency** — ADR 030 D12 + ADR 032
+  + ADR 033 + ADR 034 + ADR 035 + ADR 036 + ADR
+  037 + ADR 038 + ADR 039 carry-forward (read-
+  your-writes deferred).
+- **Read-your-writes session HLC advancement
+  ADR.** ADR 037 D4 + ADR 038 + ADR 039 carry-
+  forward.
+- **Per-statement `durability` override.** ADR
+  037 D4 + ADR 038 + ADR 039 carry-forward.
+- **Richer Toron `Hlc` type** — prerequisite for
+  read-your-writes.
+- **PRIMARY KEY / UNIQUE constraint substrate.**
+  Widens ADR 038 D7 `RowIdentityPolicy::AppendOnly`
+  to `RowIdentityPolicy::PrimaryKey(...)` once
+  the SQL surface exists.
+- **Tombstone reaping / per-row compaction.**
+  Out of scope through ADR 039; future
+  substrate ADR.
+- **Cascading secondary-index DROP substrate.**
+  Lifts ADR 039 D12 conservative reject once
+  Wendelon's index-lifecycle audit confirms
+  reclaim ownership.
+- **Hidden-aggregate `ORDER BY` keys ADR.**
+- **HAVING alias visibility ADR.**
+- **Non-aggregate computed `ORDER BY` ADR.** ADR
+  027 D10 deferred.
+- **Temporal column types (DATE, TIMESTAMP)** for
+  ADR 029 / 030 / 032 / 033 type lattices.
+- **DECIMAL** for ADR 029 / 030 / 032 / 033
+  type lattices.
+- **Utf8 ↔ numeric CAST + TRY_CAST.**
+- **Boolean ↔ numeric CAST + TRY_CAST.**
+- **`ALTER TABLE` / `CREATE INDEX` / `CREATE VIEW`
+  / `DROP VIEW` / `DROP SCHEMA` / `DROP INDEX`** —
+  DDL siblings; ALTER/RENAME inherit ADR 039 D14
+  single-call pattern.
+- **Constraints** (PRIMARY KEY / FOREIGN KEY /
+  CHECK / column-level UNIQUE) / DEFAULT /
+  GENERATED columns.
+- **`USING` clause / `ORDER BY` + `LIMIT` /
+  table aliases / `RETURNING` / `TRUNCATE` in
+  DELETE** — deferred per ADR 036 D1 out-of-
+  scope.
+- **Transactional DDL.** Lifts ADR 033 D7 + ADR
+  037 D8 + ADR 038 D3 non-transactional
+  partial-failure modes.
+- **Schema history retention policy ADR.** ADR
+  039 D8 preserves `by_id` history; future
+  retention ADR may garbage-collect.
+- **Wendelon AGG consumer wiring** — cross-ring;
+  PBC partial-pushdown.
+- **Kernel graduations** (`LinearRegress`,
+  `ApproxQuantile`).
+
+**Code-evidence-driven candidates (substrate-debt):**
+
+- **Plan Arena / index-based plan IR.** Brainstorm
+  004 broader framing; ADR 032 + 033 + 034 + 036
+  added a combined ~46 walker leaf arms (~11 per
+  cycle); ADR 035 + 037 + 038 + 039 added zero
+  walker arms (substrate cycles were additive).
+  Pressure remains bounded — eighth consecutive
+  cycle preserving Plan Arena as named-debt-
+  not-yet-pressured.
+- **Typed expression tape / opcode interpreter.**
+  Brainstorm 004 deeper realization over ADR
+  031's `BoundExprProgram`.
+- **Common subexpression elimination (CSE) +
+  literal deduplication.** ADR 031 D8 carry-
+  forward.
+- **Cranelift JIT compilation.** Brainstorm 001.
+- **Logical `Expr` arena migration.** Brainstorm
+  004 broader framing.
+- **PBC partial-pushdown of computed-arg
+  aggregates** — cross-ring; workload-evidence-
+  pressured.
+
+The archived selection notes below preserve forward-
+sequence content from prior planning passes.
+
+#### ADR 038 → ADR 039 archived selection notes
 
 ADR 038 selected and promoted **Storage-Admin /
 Reclaim Substrate** — Toron's **fifth cross-ring
@@ -2613,7 +3076,7 @@ call site, inside the coordinator routing helper
 fragmenter reject unchanged; **L3 explicitly
 deferred to ADR 039**; **ADR 039 = Wendelon DROP
 Migration Substrate** firmly committed (D14
-sequencing pin: Wendelon `TableSchemaDropRequestV1`
+sequencing pin: Wendelon dedicated `TableSchemaDropRequest`
 payload + consensus apply migration precondition
 + `TableSchemaCatalogV1::unbind_latest_name`
 primitive + lifecycle removal; primary ADR 039
@@ -2731,178 +3194,6 @@ invariant — **fourth council instance** after
 ADR 035 D5 + ADR 036 D6 + ADR 037 D6). The
 ten-phase migration is materialized in
 `plans/impl/038_storage_admin_reclaim_substrate.md`.
-
-ADR 039 selection is **firmly committed** by ADR
-038 D14 sequencing commitment. **Wendelon DROP
-Migration Substrate.** Lifts the remaining
-accumulated Wendelon admin debt:
-
-1. ADR 034 D7 / ADR 037 D13 / ADR 038 D13
-   `WendelonCatalog::drop_table` `AdminUnavailable`
-   (multi-cycle carry-forward; the Wendelon-side
-   reject is what makes this a substrate cycle,
-   not a wrapper-fix cycle).
-2. Wendelon-side `TableSchemaDropRequestV1`
-   payload design (NOT a widened
-   `TableSchemaUpdateRequest::envelope` per ADR
-   038 negative invariant — separate request
-   type, mirroring the secondary-index drop-
-   request precedent).
-3. Wendelon consensus `apply_table_schema_update`
-   migration precondition — **ADR 039 primary
-   decision**: α reclaim-completion-token
-   (opaque token validated at consensus apply
-   time; emitted by prior storage-reclaim
-   action) vs β empty-table-precondition (drop
-   succeeds only against zero-live-row tables;
-   reclaim happens as a separate Wendelon op
-   first) vs γ (new candidate discovered at
-   iter-0 audit).
-4. Wendelon `TableSchemaCatalogV1::unbind_latest_name`
-   (or equivalent narrow primitive). The
-   existing `TableSchemaCatalogV1` has `upsert`,
-   `get`, `latest_by_name`, `latest_by_id`,
-   tenant listing — no removal / unbind today.
-5. Wendelon `TableLifecycleCatalog::remove`
-   invocation sequencing in the drop consensus
-   apply path. Primitive already exists.
-6. Toron-side wiring: `WendelonStorageAdmin`
-   impl that calls the new Wendelon DROP
-   client helper; `WendelonDescriptorRegistry`
-   write-lock mutation after Wendelon success;
-   `WendelonCatalog::drop_table`
-   `AdminUnavailable` arm removed.
-
-ADR 039 inherits the cross-ring substrate
-cadence (expected 4 iterations — full-scope this
-time, no deferral candidates identified) and the
-iter-0 Wendelon-API discovery budget pattern
-from ADR 029 / 030 / 035 / 037.
-
-**ADR 039 lead candidate (committed):**
-
-- **ADR 039 — Wendelon DROP Migration
-  Substrate.** Cross-ring substrate cycle
-  (Wendelon admin consensus engagement; new
-  schema-drop payload type; new
-  `TableSchemaCatalogV1` primitive). Expected
-  4-iter cycle. Two-pass Wendelon-API discovery
-  budget required — specifically the existing
-  consensus reject path
-  (`apply_table_schema_update` drop-arm) and
-  the schema-catalog primitive surface. Carries
-  forward ADR 038 D14 commitment + ADR 037 D14
-  + ADR 034 D7 multi-cycle debt.
-
-**Code-evidence-driven candidates carried forward:**
-
-- **`UPDATE WHERE`** — composition over ADR 035
-  row-identity substrate + new partial-write
-  contract. Likely a two-ADR sequence: partial-
-  write substrate cycle + SQL UPDATE composition.
-- **`CREATE OR REPLACE TABLE`** — lower to `DROP
-  IF EXISTS x; CREATE TABLE x AS SELECT ...`.
-  Composition over ADR 029 / 033 / 034 / 036 /
-  037 / 038 / (039). Small cycle; waits on ADR
-  039 Wendelon DROP migration before promotion.
-- **`INSERT ... RETURNING` / `CTAS ... RETURNING`
-  / `DELETE ... RETURNING`** — DML result-shape
-  extension; modest user value until DEFAULT or
-  GENERATED columns or sequences exist. Future
-  RETURNING substrate + composition pair.
-- **Subqueries in DELETE WHERE clause** (e.g.
-  `DELETE FROM t WHERE id IN (SELECT ...)`).
-  Future correlated-subquery substrate ADR.
-
-**Substrate candidates carried forward:**
-
-- **Stale-bound-plan invalidation ADR.** ADR 038
-  D10 explicitly preserved the design space;
-  future cycle owns the lift once composition
-  pressure surfaces user-confusing stale-
-  failure cases.
-- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
-  extensions; need PK / unique-constraint
-  substrate first.
-- **Streaming / multi-batch `StorageWrite::write`
-  / `StorageDeleteRows::delete_rows`** — lifts
-  ADR 032 D5 + D6 + ADR 033 D8 + ADR 035 single-
-  batch cap for bulk loads / deletes.
-- **Write retries after descriptor evolution /
-  mutation idempotency** — ADR 030 D12 + ADR 032
-  + ADR 033 + ADR 034 + ADR 035 + ADR 036 + ADR
-  037 + ADR 038 carry-forward (read-your-writes
-  deferred).
-- **Read-your-writes session HLC advancement
-  ADR.** ADR 037 D4 + ADR 038 carry-forward (no
-  public `client_write_id` / receipt surfacing).
-- **Per-statement `durability` override.** ADR
-  037 D4 + ADR 038 carry-forward.
-- **Richer Toron `Hlc` type** — prerequisite for
-  read-your-writes.
-- **PRIMARY KEY / UNIQUE constraint substrate.**
-  Widens ADR 038 D7 `RowIdentityPolicy::AppendOnly`
-  to `RowIdentityPolicy::PrimaryKey(...)` once
-  the SQL surface exists.
-- **Tombstone reaping / per-row compaction.**
-  ADR 038 D4 explicitly out of scope; future
-  substrate ADR.
-- **Hidden-aggregate `ORDER BY` keys ADR.**
-- **HAVING alias visibility ADR.**
-- **Non-aggregate computed `ORDER BY` ADR.** ADR
-  027 D10 deferred.
-- **Temporal column types (DATE, TIMESTAMP)** for
-  ADR 029 / 030 / 032 / 033 type lattices.
-- **DECIMAL** for ADR 029 / 030 / 032 / 033
-  type lattices.
-- **Utf8 ↔ numeric CAST + TRY_CAST.**
-- **Boolean ↔ numeric CAST + TRY_CAST.**
-- **`ALTER TABLE` / `CREATE INDEX` / `CREATE VIEW`
-  / `DROP VIEW` / `DROP SCHEMA` / `DROP INDEX`** —
-  DDL siblings using the renamed
-  `lower_ddl_table_name` helper pattern from ADR
-  034 D4.
-- **Constraints** (PRIMARY KEY / FOREIGN KEY /
-  CHECK / column-level UNIQUE) / DEFAULT /
-  GENERATED columns.
-- **`USING` clause / `ORDER BY` + `LIMIT` /
-  table aliases / `RETURNING` / `TRUNCATE` in
-  DELETE** — deferred per ADR 036 D1 out-of-
-  scope.
-- **Transactional DDL.** Lifts ADR 033 D7 + ADR
-  037 D8 + ADR 038 D3 non-transactional
-  partial-failure modes. Substrate ADR with its
-  own decision matrix.
-- **Wendelon AGG consumer wiring** — cross-ring;
-  PBC partial-pushdown.
-- **Kernel graduations** (`LinearRegress`,
-  `ApproxQuantile`).
-
-**Code-evidence-driven candidates (substrate-debt):**
-
-- **Plan Arena / index-based plan IR.** Brainstorm
-  004 broader framing; ADR 032 + 033 + 034 + 036
-  added a combined ~46 walker leaf arms (~11 per
-  cycle); ADR 035 + ADR 037 + ADR 038 added zero
-  walker arms (substrate cycles were additive).
-  Pressure remains bounded — sixth consecutive
-  cycle preserving Plan Arena as named-debt-
-  not-yet-pressured.
-- **Typed expression tape / opcode interpreter.**
-  Brainstorm 004 deeper realization over ADR
-  031's `BoundExprProgram`.
-- **Common subexpression elimination (CSE) +
-  literal deduplication.** ADR 031 D8 carry-
-  forward.
-- **Cranelift JIT compilation.** Brainstorm 001.
-- **Logical `Expr` arena migration.** Brainstorm
-  004 broader framing.
-- **PBC partial-pushdown of computed-arg
-  aggregates** — cross-ring; workload-evidence-
-  pressured.
-
-The archived selection notes below preserve forward-
-sequence content from prior planning passes.
 
 #### ADR 037 → ADR 038 archived selection notes
 
