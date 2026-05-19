@@ -3034,8 +3034,8 @@ along with the forward-sequence rewrite.
   with real substrate, or not.
   The ten-phase migration is materialized in
   `plans/impl/042_toron_compute_daemon_substrate.md`.
-- **ADR 043 — Public Toron SQL Listener.**
-  Promoted. **Second ADR that lifts an ADR 040
+- **ADR 043 — Public Toron SQL Listener.** Promoted.
+  **Second ADR that lifts an ADR 040
   reservation** (`nilket toron sql`); first cycle
   where the ADR 042 task listener becomes
   **load-bearing** for an operator-facing service.
@@ -3190,6 +3190,175 @@ along with the forward-sequence rewrite.
   `toron_fixture_worker.rs` source unmodified).
   The ten-phase migration is materialized in
   `plans/impl/043_public_toron_sql_listener.md`.
+- **ADR 044 — Authenticated Remote Toron QUIC Listeners.**
+  Promoted. **Third ADR that lifts a substrate
+  floor from the ADR 042 / ADR 043 substrate
+  chain** (after ADR 042 lifting `nilket toron
+  start` and ADR 043 lifting `nilket toron sql` +
+  the ADR 042 empty-provider execution gap).
+  Three council iterations on a substrate-class
+  topic: iter-0 topic-shape survey (Shape A
+  bundled-remote-auth selected, Shapes B / C / D
+  surveyed and rejected); iter-1 Claude three
+  retractions — R1 SAN convention harmonized with
+  Wendelon's `node-<id>.<cluster_domain>` shape
+  via `toron-<worker_id>.<cluster_domain>` after
+  code audit of `crates/wendelon/src/network/tls.rs:623-628`,
+  R2 Plan A live-cert-rotation seam collapsed to
+  single-plan, R3 new SqlError codes withdrawn
+  since TLS handshake rejection happens before
+  the SqlFrame layer exists; iter-2 D-set /
+  guards / fixtures locked with D7 sharpened to
+  exclude CRL / OCSP / runtime-mutable revocation
+  (preempting a Codex-style sharpening over
+  Wendelon's `RevocationSnapshot` machinery at
+  `crates/wendelon/src/node.rs:1898+`); iter-3
+  final triple ratification with one Phase-2
+  SAN-admission exact-shape sharpening preventing
+  subdomain injection (`toron-foo.evil.cluster.local`
+  masquerade), wildcard abuse, underscore
+  confused-deputy, and malformed UUID under
+  `toron-`; Codex post-merge review pinned remote
+  SQL client TLS options and client-only SQL
+  admission. Final promoted D-set: **12
+  decisions, 16 architecture guards + 1
+  convention guard, 12 required integration
+  fixtures + 2 V1-evidence optional fixtures**.
+  **Shape A selected (bundled remote-auth
+  substrate lifting both ADR 042 D9 + ADR 043 D5
+  loopback floors).** Shape B (split substrate +
+  apply) rejected on "never inert" discipline
+  inherited from ADR 042; Shape C (worker-
+  listener-first) rejected because SQL is the
+  operator-facing surface; Shape D (SQL-first
+  with loopback worker) rejected as incoherent
+  given ADR 043 D11 load-bearing task listener.
+  **D1 critical decision:** add a shared `[tls]`
+  config section that lifts ADR 042 D9 and ADR
+  043 D5 loopback floors simultaneously. Missing
+  `[tls]` keeps ADR 042 + ADR 043 worker-only /
+  SQL-loopback behavior **byte-identical**.
+  Backward compatibility preserved for ADR 042 /
+  ADR 043 example configs without modification.
+  **D2 critical decision:** non-loopback bind
+  admitted **iff** `[tls]` is configured. Pinned
+  diagnostic strings byte-identical with ADR 042
+  D9 / ADR 043 D5 for the no-TLS path.
+  **D3 critical decision:** mTLS only. No tokens
+  / JWT / OIDC / SPIFFE-URI SAN parsing / TOFU /
+  fingerprint pinning. Gemini iter-0 predicted to
+  push for OIDC; rejected 2-of-3 (Codex +
+  Claude). Future ADR can add token surface over
+  the same listener policy substrate.
+  **D5 critical decision:** SAN convention
+  mirrors Wendelon's flat `<ring-prefix>-<id>.<cluster_domain>`
+  shape via `toron-<worker_id>.<cluster_domain>`.
+  Per-listener client-certificate admission by
+  SAN prefix (`toron-` only for worker task
+  listener; `client-` only for SQL listener).
+  The SQL listener still presents the daemon's
+  `toron-<worker_id>` certificate as server
+  identity; remote SQL clients use
+  `client-<principal>` certs plus explicit
+  server-name verification.
+  Iter-3 sharpening: exact-shape verifier
+  (no subdomain injection, no wildcard abuse, no
+  underscore confused-deputy, no malformed UUID
+  under `toron-`). Operators provisioning a
+  Toron+Wendelon cluster reuse Wendelon's
+  cluster_domain and CA-management patterns.
+  **D6 critical decision:** no new wire frames,
+  no new SqlError codes. `SqlMessage` and
+  `SqlError` enums **byte-identical** to ADR 043.
+  TLS handshake failures happen before SqlFrame
+  layer exists; surface client-side only as
+  connection-establishment errors with stable
+  wrapper diagnostic.
+  **D7 critical decision:** cert rotation is
+  daemon-restart only. **No** CRL parsing,
+  **no** OCSP stapling, **no** runtime-mutable
+  revocation list. Wendelon's `RevocationSnapshot`
+  machinery intentionally **not** threaded into
+  Toron V1. Revocation is operator-effected by
+  rebuilding `peer_ca` and restarting.
+  **D8 critical decision:** `READY <worker>` /
+  `SQL_READY <sql>` stdout lines **byte-
+  identical** to ADR 042 D12 / ADR 043 D16. ADR
+  044 changes which bind addresses are
+  admissible, not how the daemon announces them.
+  **D9 critical decision:** **no observability
+  listener in this ADR.** Bundles in ADR 045 as
+  composition cycle over ADR 044's TLS policy.
+  Gemini iter-0 predicted to push for bundled
+  observability; rejected 2-of-3 (Codex +
+  Claude) on cycle-shape discipline (HTTP /
+  Prometheus exposition belongs in a separate
+  cycle from transport substrate).
+  **D10 critical decision:** remote
+  `[[coordinator.static_workers]]` admitted
+  **iff** `[tls]` is configured AND the dialed
+  peer's cert SAN exact-shape matches
+  `toron-<worker_id>.<cluster_domain>`. Lifts
+  the ADR 043 D12 gate. No static-IP pinning.
+  **D11 critical decision:** one cert per
+  daemon, both server identity (accept side)
+  and dial identity (D10). No separate
+  `[worker.tls]` / `[sql.tls]` / `[client.tls]`
+  sections. One daemon = one principal.
+  **D12 critical decision:** `nilket toron sql`
+  gains remote mTLS client flags/env
+  (`--server-name`, `--cert`, `--key`, `--ca`
+  and `TORON_SQL_*` equivalents). Non-loopback
+  SQL endpoints require cert, key, CA, and
+  explicit server name together; loopback SQL
+  without TLS flags remains ADR 043-compatible.
+  `crates/nilket` stays runtime-free.
+  **Single-plan posture.** No Plan A / Plan B
+  framing. The iter-0 Plan A live-cert-rotation
+  seam was retracted in iter-1 (R2). Matches
+  ADR 042 promotion-locked single-plan posture.
+  Substrate is real, never inert.
+  **Phase 0 implementation-shape decision** (not
+  an ADR-decision sub-lift): TLS policy module
+  placement — Plan W-B (extract shared
+  `tls-pki` workspace crate; preferred long-term
+  shape) vs Plan W-C (Toron-local copy; V1
+  fallback if extraction has unresolved seams).
+  ADR ships identical decision surface either
+  way; only the file-system placement differs.
+  **Sixteen architecture guards + 1 convention
+  guard** including the iter-3 sharpening guard
+  7 (`adr044_san_admission_is_exact_shape_per_listener`)
+  pinning the four attack-shape rejections, the
+  Wendelon-parity guard 14
+  (`adr044_san_convention_mirrors_wendelon_shape`)
+  pinning the canonical helper format string
+  parallel to Wendelon's, guard 15 pinning SQL
+  client admission to `client-` certs only,
+  guard 16 pinning remote SQL TLS material and
+  server-name requirements, and the convention
+  guard preserving the no-V1-suffix discipline
+  for the ninth consecutive cycle (ADRs
+  039 / 041 / 042 / 043 / 044).
+  **Twelve required integration fixtures + 2
+  V1-evidence optional** including the iter-3
+  sharpening witness
+  `toron_daemon_rejects_peer_with_subdomain_injection_san`
+  (closes the subdomain-injection attack
+  surface end-to-end through rustls's
+  handshake), the remote SQL CLI TLS fixtures,
+  and the V1-target signal
+  `toron_remote_two_daemon_sigkill_retry_digest_is_canonical`
+  (now reachable through remote mTLS QUIC
+  because D10 admits remote static-worker dial).
+  **Byte-identical refactor-invariant chain
+  extends to nine preserved cycles** (ADRs
+  035 / 036 / 037 / 038 / 039 / 041 / 042 / 043 /
+  044 all preserve the local DML fixture pass
+  count + leave `toron_fixture_worker.rs` source
+  unmodified).
+  The ten-phase migration is materialized in
+  `plans/impl/044_authenticated_remote_toron_quic_listeners.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -3257,7 +3426,221 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 043 promoted; ADR 044 candidates
+### ADR 044 promoted; ADR 045 candidates
+
+ADR 044 selected and promoted **Authenticated
+Remote Toron QUIC Listeners** — the third ADR
+that lifts a substrate floor from the ADR 042 /
+ADR 043 substrate chain. Three council
+iterations on a substrate-class topic with
+narrow scope: iter-0 topic-shape survey (Shape A
+bundled-remote-auth selected over Shapes B / C /
+D); iter-1 Claude three retractions (R1 SAN
+convention harmonized with Wendelon's
+`node-<id>.<cluster_domain>` shape after code
+audit; R2 Plan A live-cert-rotation seam
+collapsed to single-plan; R3 new SqlError codes
+withdrawn since TLS handshake rejection happens
+before the SqlFrame layer exists); iter-2 D-set
+/ guards / fixtures locked with D7 sharpened to
+exclude CRL / OCSP / runtime-mutable revocation;
+iter-3 final triple ratification with one
+Phase-2 SAN-admission exact-shape sharpening;
+Codex post-merge review pinned remote SQL client
+TLS options and client-only SQL admission. Final
+D-set: **12 decisions, 16 architecture guards plus
+1 convention guard, 12 required integration fixtures,
+and 2 V1-evidence optional fixtures**.
+
+**Substrate floor lifting discipline applied for
+the third time.** ADR 042 established the
+discipline (real substrate floor, never inert;
+byte-identical reservation-sibling continuity);
+ADR 043 applied it to lift `sql` while
+preserving `inspect` byte-identical; ADR 044
+applies it to lift loopback-only restrictions
+across both worker task and SQL listeners under
+a shared mTLS policy. The substrate is real,
+never inert — configs without `[tls]` keep ADR
+042 + ADR 043 loopback-only behavior byte-
+identical; configs with `[tls]` admit
+non-loopback binds + remote static-worker dials
+behind mTLS exact-shape SAN admission.
+
+**Wendelon-parity SAN convention.** D5's SAN
+helper `canonical_toron_dns_name(uuid,
+cluster_domain) → "toron-<uuid>.<cluster_domain>"`
+is structurally parallel to Wendelon's
+`canonical_node_dns_name(node_id, cluster_domain)
+→ "node-<node_id>.<cluster_domain>"`
+(`crates/wendelon/src/network/tls.rs:623-628`).
+Operators provisioning a Toron+Wendelon cluster
+reuse the same cluster_domain default
+(`"cluster.local"`) and CA-management patterns
+they already know. Guard 14 pins the helper
+source-text parallel structure.
+
+**Remote SQL client identity.** SQL listener
+client-certificate admission is `client-` only;
+the daemon's `toron-<worker_id>` cert remains
+the SQL server identity. `nilket toron sql`
+supplies cert, key, CA, and explicit server name
+through flags or `TORON_SQL_*` env vars for
+non-loopback endpoints while keeping
+`crates/nilket` runtime-free.
+
+**Iter-3 exact-shape SAN admission.** The
+verifier rejects four attack shapes at
+handshake: subdomain injection
+(`toron-foo.evil.cluster.local`), wildcard abuse
+(`toron-*.cluster.local`), underscore
+confused-deputy (`toron-foo_bar.cluster.local`),
+and malformed UUID under `toron-`
+(`toron-notauuid.cluster.local`). The fixture
+`toron_daemon_rejects_peer_with_subdomain_injection_san`
+closes the subdomain-injection attack surface
+end-to-end through rustls's handshake.
+
+**ADR 042 task listener and ADR 043 SQL
+listener become reachable from remote operator
+consoles.** ADR 044 D10 admits remote
+`[[coordinator.static_workers]]` under SAN
+binding, making the V1-target signal
+`toron_remote_two_daemon_sigkill_retry_digest_is_canonical`
+reachable over remote mTLS QUIC instead of
+loopback. The V1 target text (multi-process
+SIGKILL byte-identical retry digest) becomes
+testable as a deployable shape, not just a
+single-host loopback shape.
+
+**Architectural invariants preserved through
+this cycle:**
+
+- ADR 040 reservation continuity (`inspect`
+  byte-identical pre/post-ADR 044; ADR 044 is
+  substrate-class, not a reservation lift).
+- ADR 040 D4 root-runtime-free (`crates/nilket`
+  stays runtime-free; ADR 044 touches no
+  nilket-root Cargo.toml lines).
+- ADR 038 / 039 registry convergence (single
+  shared `Arc<WendelonDescriptorRegistry>`
+  unchanged).
+- ADR 039 D5 / ADR 042 / ADR 043 no-V1-suffix
+  convention (carries forward to
+  `ToronTlsListenerPolicy` / `ToronTlsConfig` /
+  `canonical_toron_dns_name`; ninth consecutive
+  cycle).
+- ADR 035-043 byte-identical fixture-worker
+  refactor invariant (extends to nine preserved
+  cycles; `toron_fixture_worker.rs` source
+  unchanged).
+- ADR 042 D9 / ADR 043 D5 diagnostic strings
+  for non-loopback bind without TLS remain
+  byte-identical (guard 3).
+- ADR 042 D12 / ADR 043 D16 `READY <worker>` /
+  `SQL_READY <sql>` stdout lines byte-identical
+  pre/post ADR 044 (guard 10).
+- Cross-ring discipline (Toron compute ring
+  owns intra-ring listener policy; Wendelon
+  admin orchestration unaffected; Toron's TLS-
+  client behavior toward Wendelon via
+  `[storage.wendelon]` unchanged).
+
+The ten-phase migration is materialized in
+`plans/impl/044_authenticated_remote_toron_quic_listeners.md`.
+
+**ADR 045 lead candidate:**
+
+- **ADR 045 — Toron Daemon Observability
+  Listeners.** Composition cycle over ADR 044's
+  TLS policy. Bundles health / ready / metrics
+  endpoint listeners (HTTP / Prometheus
+  exposition over the shared `[tls]` material).
+  Small cycle; 2-iteration projected budget.
+  Rejected from ADR 044 in iter-0 / iter-1 /
+  iter-2 / iter-3 on cycle-shape discipline
+  (HTTP exposition library decisions don't
+  belong in a transport-substrate cycle).
+
+**Code-evidence-driven candidates carried forward:**
+
+- **Multi-tenant routing.** Now genuinely
+  unblocked by ADR 044 authenticated remote
+  QUIC carrying peer identity. Still ADR 045+
+  pending per-tenant isolation policy
+  (per-tenant catalog, per-tenant quota,
+  per-tenant memory budget).
+- **Wendelon descriptor discovery / refresh.**
+  Lifts ADR 042 D6 + ADR 043 D14 startup-only
+  bootstrap. Needs a Wendelon-side
+  list-descriptors RPC (cross-ring substrate
+  cycle).
+- **`nilket toron inspect` real wiring.** Last
+  ADR 040 reservation; orthogonal to TLS;
+  needs Toron inspect surface defined.
+- **Live cert rotation without daemon restart.**
+  Retracted from ADR 044 in iter-1 (R2). Future
+  ADR over ADR 044's policy substrate when a
+  deployment surfaces need (typical signal:
+  monthly or shorter cert lifetimes).
+- **CRL parsing / OCSP stapling / runtime-
+  mutable revocation list.** Same follow-up
+  cycle as live cert rotation. Wendelon's
+  `RevocationSnapshot` machinery exists but
+  was intentionally not threaded into Toron V1
+  (D7).
+- **Extract shared `tls-pki` workspace crate**
+  consumed by both Wendelon and Toron. Phase 0
+  audit of ADR 044 decides W-B (extract
+  in-cycle) vs W-C (Toron-local copy; defer
+  extraction to a named follow-up refactoring
+  ADR).
+- **Token-based auth (bearer / JWT / OIDC)** —
+  future ADR over the same listener policy
+  substrate if a use case emerges. Gemini
+  iter-0 of ADR 044 proposed OIDC; rejected
+  2-of-3.
+- **CTAS `IF NOT EXISTS`** (`sql_planner.rs:897`
+  reject preserved by ADR 041 D3; tiny
+  composition cycle).
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate + new partial-write
+  contract.
+- **`INSERT ... RETURNING` / `CTAS ...
+  RETURNING` / `DELETE ... RETURNING`** — DML
+  result-shape extension.
+- **Subqueries in DELETE WHERE clause** —
+  future correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern.
+- **Cascading secondary-index DROP substrate** —
+  ADR 039 D12 follow-up.
+- **Atomic Wendelon-side replacement
+  protocol** — C1b from ADR 041 iter-0.
+- **Persistent SQL connections / pipelined
+  statements** — ADR 043 wire types admit
+  extension.
+- **Prepared statements / parameterized
+  queries** — future composition ADR over the
+  ADR 043 wire protocol.
+- **gRPC / Arrow Flight / Postgres wire
+  protocol frontends** — future ADR(s) wrap
+  `ToronSqlFrame` after ADR 044's admission
+  policy is settled (now in place).
+- **Strong cross-worker in-flight cancellation
+  semantics** — future runtime ADR. ADR 043
+  D15 shipped protocol-shape + best-effort
+  only.
+
+**Substrate candidates carried forward:**
+(identical to ADR 043's carry-forward list —
+re-listed below unchanged because ADR 044 was
+substrate-class + operator-surface continuation,
+not pure substrate, and touched none of these
+seams)
+
+### ADR 043 promoted; ADR 044 candidates (HISTORICAL)
 
 ADR 043 selected and promoted **Public Toron SQL
 Listener** — the **second ADR that lifts an ADR
