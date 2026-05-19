@@ -1,3 +1,4 @@
+use crate::catalog::WendelonDescriptorRegistry;
 use crate::error::StorageError;
 use crate::ir::{ColumnOrdinal, MorselId, QueryId, QueryProfileHint, SessionId, TableId};
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryBuilder, UInt32Array};
@@ -84,6 +85,18 @@ pub struct DeleteRowsRequest {
 	pub trace_context: Option<TraceContext>,
 }
 
+#[derive(Debug)]
+pub struct DropTableStorageRequest {
+	pub session_id: SessionId,
+	pub query_id: QueryId,
+	pub tenant_id: TenantId,
+	pub table_id: TableId,
+	pub table_object_id: TableObjectId,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub profile_hint: Option<QueryProfileHint>,
+	pub trace_context: Option<TraceContext>,
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteOutcome {
@@ -97,6 +110,18 @@ pub struct DeleteRowsOutcome {
 	pub deleted: usize,
 	pub already_deleted: usize,
 	pub not_found: usize,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTableStorageOutcome {
+	pub reclaimed_tables: usize,
+}
+
+impl DropTableStorageOutcome {
+	pub fn new(reclaimed_tables: usize) -> Self {
+		Self { reclaimed_tables }
+	}
 }
 
 pub struct ScanStream {
@@ -158,6 +183,14 @@ pub trait StorageDeleteRows: Send + Sync {
 	) -> Result<DeleteRowsOutcome, StorageError>;
 }
 
+#[async_trait::async_trait]
+pub trait StorageAdmin: Send + Sync {
+	async fn drop_table_storage(
+		&self,
+		request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError>;
+}
+
 pub struct InMemoryStorageScan {
 	pub table_data: RecordBatch,
 }
@@ -187,6 +220,13 @@ impl InMemoryTableStorage {
 		Self {
 			tables: Mutex::new(HashMap::new()),
 		}
+	}
+
+	pub fn table_count(&self) -> usize {
+		self.tables
+			.lock()
+			.expect("InMemoryTableStorage lock poisoned")
+			.len()
 	}
 }
 
@@ -315,6 +355,46 @@ impl StorageDeleteRows for InMemoryTableStorage {
 			deleted,
 			already_deleted,
 			not_found,
+		})
+	}
+}
+
+#[async_trait::async_trait]
+impl StorageAdmin for InMemoryTableStorage {
+	async fn drop_table_storage(
+		&self,
+		request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		let mut tables = self
+			.tables
+			.lock()
+			.expect("InMemoryTableStorage lock poisoned");
+		let data = tables
+			.get(&request.table_id)
+			.ok_or(StorageError::TableNotFound {
+				table: request.table_id,
+			})?;
+		if data.table_object_id != request.table_object_id {
+			return Err(StorageError::DescriptorEvolved);
+		}
+		if data.physical_descriptor_fingerprint != request.physical_descriptor_fingerprint {
+			return Err(StorageError::DescriptorEvolved);
+		}
+		tables.remove(&request.table_id);
+		Ok(DropTableStorageOutcome::new(1))
+	}
+}
+
+pub struct UnsupportedStorageAdmin;
+
+#[async_trait::async_trait]
+impl StorageAdmin for UnsupportedStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		_request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		Err(StorageError::Internal {
+			message: "DROP TABLE physical reclaim requires a configured StorageAdmin".to_string(),
 		})
 	}
 }
@@ -535,7 +615,7 @@ fn append_row_identity_column(
 
 pub struct WendelonStorageScan {
 	client: Arc<wendelon_client::Client>,
-	descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
+	descriptor_registry: Arc<WendelonDescriptorRegistry>,
 }
 
 impl WendelonStorageScan {
@@ -543,9 +623,20 @@ impl WendelonStorageScan {
 		client: Arc<wendelon_client::Client>,
 		descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
 	) -> Self {
+		let descriptor_registry = Arc::new(
+			WendelonDescriptorRegistry::from_descriptors(descriptors)
+				.expect("WendelonStorageScan descriptors must be valid table schema descriptors"),
+		);
+		Self::with_descriptor_registry(client, descriptor_registry)
+	}
+
+	pub fn with_descriptor_registry(
+		client: Arc<wendelon_client::Client>,
+		descriptor_registry: Arc<WendelonDescriptorRegistry>,
+	) -> Self {
 		Self {
 			client,
-			descriptors,
+			descriptor_registry,
 		}
 	}
 }
@@ -561,12 +652,7 @@ impl StorageScan for WendelonStorageScan {
 					.to_string(),
 			});
 		}
-		let descriptor =
-			self.descriptors
-				.get(&request.table_id)
-				.ok_or(StorageError::TableNotFound {
-					table: request.table_id,
-				})?;
+		let descriptor = self.descriptor_registry.descriptor(request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
 			return Err(StorageError::DescriptorEvolved);
 		}
@@ -599,7 +685,7 @@ impl StorageScan for WendelonStorageScan {
 			.client
 			.table_query_with_runtime_filter(
 				tenant_id,
-				descriptor,
+				&descriptor,
 				pbc,
 				request.runtime_filter.clone(),
 				options,
@@ -628,7 +714,7 @@ impl StorageScan for WendelonStorageScan {
 
 pub struct WendelonStorageWrite {
 	client: Arc<wendelon_client::Client>,
-	descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
+	descriptor_registry: Arc<WendelonDescriptorRegistry>,
 }
 
 impl WendelonStorageWrite {
@@ -636,9 +722,20 @@ impl WendelonStorageWrite {
 		client: Arc<wendelon_client::Client>,
 		descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
 	) -> Self {
+		let descriptor_registry = Arc::new(
+			WendelonDescriptorRegistry::from_descriptors(descriptors)
+				.expect("WendelonStorageWrite descriptors must be valid table schema descriptors"),
+		);
+		Self::with_descriptor_registry(client, descriptor_registry)
+	}
+
+	pub fn with_descriptor_registry(
+		client: Arc<wendelon_client::Client>,
+		descriptor_registry: Arc<WendelonDescriptorRegistry>,
+	) -> Self {
 		Self {
 			client,
-			descriptors,
+			descriptor_registry,
 		}
 	}
 }
@@ -646,12 +743,7 @@ impl WendelonStorageWrite {
 #[async_trait::async_trait]
 impl StorageWrite for WendelonStorageWrite {
 	async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError> {
-		let descriptor =
-			self.descriptors
-				.get(&request.table_id)
-				.ok_or(StorageError::TableNotFound {
-					table: request.table_id,
-				})?;
+		let descriptor = self.descriptor_registry.descriptor(request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
 			return Err(StorageError::DescriptorEvolved);
 		}
@@ -676,7 +768,7 @@ impl StorageWrite for WendelonStorageWrite {
 			.client
 			.table_write(
 				tenant_id,
-				descriptor,
+				&descriptor,
 				request.payload,
 				wendelon_client::WriteOptions {
 					await_finalization: true,
@@ -692,7 +784,7 @@ impl StorageWrite for WendelonStorageWrite {
 
 pub struct WendelonStorageDeleteRows {
 	client: Arc<wendelon_client::Client>,
-	descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
+	descriptor_registry: Arc<WendelonDescriptorRegistry>,
 }
 
 impl WendelonStorageDeleteRows {
@@ -700,9 +792,21 @@ impl WendelonStorageDeleteRows {
 		client: Arc<wendelon_client::Client>,
 		descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
 	) -> Self {
+		let descriptor_registry = Arc::new(
+			WendelonDescriptorRegistry::from_descriptors(descriptors).expect(
+				"WendelonStorageDeleteRows descriptors must be valid table schema descriptors",
+			),
+		);
+		Self::with_descriptor_registry(client, descriptor_registry)
+	}
+
+	pub fn with_descriptor_registry(
+		client: Arc<wendelon_client::Client>,
+		descriptor_registry: Arc<WendelonDescriptorRegistry>,
+	) -> Self {
 		Self {
 			client,
-			descriptors,
+			descriptor_registry,
 		}
 	}
 }
@@ -713,12 +817,7 @@ impl StorageDeleteRows for WendelonStorageDeleteRows {
 		&self,
 		request: DeleteRowsRequest,
 	) -> Result<DeleteRowsOutcome, StorageError> {
-		let descriptor =
-			self.descriptors
-				.get(&request.table_id)
-				.ok_or(StorageError::TableNotFound {
-					table: request.table_id,
-				})?;
+		let descriptor = self.descriptor_registry.descriptor(request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
 			return Err(StorageError::DescriptorEvolved);
 		}
@@ -731,7 +830,7 @@ impl StorageDeleteRows for WendelonStorageDeleteRows {
 			.client
 			.table_delete(
 				tenant_id,
-				descriptor,
+				&descriptor,
 				request.row_key_ids,
 				wendelon_client::WriteOptions {
 					await_finalization: true,

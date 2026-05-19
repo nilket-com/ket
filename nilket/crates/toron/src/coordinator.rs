@@ -14,13 +14,14 @@ use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_p
 use crate::distributed::identity::QueryId;
 use crate::distributed::scheduler::{DistributedScheduler, SchedulerError};
 use crate::distributed::worker_registry::WorkerRegistry;
-use crate::error::{ExecutionError, QueryError, StorageError};
+use crate::error::{CatalogError, ExecutionError, QueryError, StorageError};
 use crate::exec::{ExecutionContext, Executor};
 use crate::ir::{ColumnOrdinal, ExecutionPlan, FilterDisposition, LogicalPlan, MorselId};
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
 use crate::storage::{
-	DeleteRowsOutcome, DeleteRowsRequest, RowIdentityProjection, ScanStream, StorageDeleteRows,
-	StorageWrite, WriteOutcome, WriteRequest,
+	DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest, RowIdentityProjection,
+	ScanStream, StorageAdmin, StorageDeleteRows, StorageWrite, UnsupportedStorageAdmin,
+	WriteOutcome, WriteRequest,
 };
 
 pub(crate) async fn materialize_scan_stream(
@@ -43,6 +44,7 @@ where
 	context: ExecutionContext,
 	writer: Arc<dyn StorageWrite>,
 	deleter: Arc<dyn StorageDeleteRows>,
+	admin: Arc<dyn StorageAdmin>,
 }
 
 impl<Registry, Transport> DistributedQueryCoordinator<Registry, Transport>
@@ -58,7 +60,7 @@ where
 		config: PlannerConfig,
 		query_budget: QueryBudget,
 	) -> Self {
-		Self::with_context_writer_and_deleter(
+		Self::with_context_writer_deleter_and_admin(
 			catalog,
 			registry,
 			memory,
@@ -68,6 +70,7 @@ where
 			default_distributed_execution_context(),
 			Arc::new(UnsupportedStorageWrite),
 			Arc::new(UnsupportedStorageDeleteRows),
+			Arc::new(UnsupportedStorageAdmin),
 		)
 	}
 
@@ -80,7 +83,7 @@ where
 		query_budget: QueryBudget,
 		context: ExecutionContext,
 	) -> Self {
-		Self::with_context_writer_and_deleter(
+		Self::with_context_writer_deleter_and_admin(
 			catalog,
 			registry,
 			memory,
@@ -90,6 +93,7 @@ where
 			context,
 			Arc::new(UnsupportedStorageWrite),
 			Arc::new(UnsupportedStorageDeleteRows),
+			Arc::new(UnsupportedStorageAdmin),
 		)
 	}
 
@@ -102,7 +106,7 @@ where
 		query_budget: QueryBudget,
 		writer: Arc<dyn StorageWrite>,
 	) -> Self {
-		Self::with_context_writer_and_deleter(
+		Self::with_context_writer_deleter_and_admin(
 			catalog,
 			registry,
 			memory,
@@ -112,6 +116,7 @@ where
 			default_distributed_execution_context(),
 			writer,
 			Arc::new(UnsupportedStorageDeleteRows),
+			Arc::new(UnsupportedStorageAdmin),
 		)
 	}
 
@@ -125,7 +130,7 @@ where
 		writer: Arc<dyn StorageWrite>,
 		deleter: Arc<dyn StorageDeleteRows>,
 	) -> Self {
-		Self::with_context_writer_and_deleter(
+		Self::with_context_writer_deleter_and_admin(
 			catalog,
 			registry,
 			memory,
@@ -135,6 +140,37 @@ where
 			default_distributed_execution_context(),
 			writer,
 			deleter,
+			Arc::new(UnsupportedStorageAdmin),
+		)
+	}
+
+	pub fn with_storage_admin(mut self, admin: Arc<dyn StorageAdmin>) -> Self {
+		self.admin = admin;
+		self
+	}
+
+	pub fn with_writer_deleter_and_admin(
+		catalog: Arc<dyn Catalog>,
+		registry: Arc<Registry>,
+		memory: Arc<MemoryManager>,
+		transport: Arc<Transport>,
+		config: PlannerConfig,
+		query_budget: QueryBudget,
+		writer: Arc<dyn StorageWrite>,
+		deleter: Arc<dyn StorageDeleteRows>,
+		admin: Arc<dyn StorageAdmin>,
+	) -> Self {
+		Self::with_context_writer_deleter_and_admin(
+			catalog,
+			registry,
+			memory,
+			transport,
+			config,
+			query_budget,
+			default_distributed_execution_context(),
+			writer,
+			deleter,
+			admin,
 		)
 	}
 
@@ -149,6 +185,32 @@ where
 		writer: Arc<dyn StorageWrite>,
 		deleter: Arc<dyn StorageDeleteRows>,
 	) -> Self {
+		Self::with_context_writer_deleter_and_admin(
+			catalog,
+			registry,
+			memory,
+			transport,
+			config,
+			query_budget,
+			context,
+			writer,
+			deleter,
+			Arc::new(UnsupportedStorageAdmin),
+		)
+	}
+
+	pub fn with_context_writer_deleter_and_admin(
+		catalog: Arc<dyn Catalog>,
+		registry: Arc<Registry>,
+		memory: Arc<MemoryManager>,
+		transport: Arc<Transport>,
+		config: PlannerConfig,
+		query_budget: QueryBudget,
+		context: ExecutionContext,
+		writer: Arc<dyn StorageWrite>,
+		deleter: Arc<dyn StorageDeleteRows>,
+		admin: Arc<dyn StorageAdmin>,
+	) -> Self {
 		Self {
 			catalog,
 			registry,
@@ -159,6 +221,7 @@ where
 			context,
 			writer,
 			deleter,
+			admin,
 		}
 	}
 
@@ -168,7 +231,13 @@ where
 			bound,
 			ExecutionPlan::CreateTable { .. } | ExecutionPlan::DropTable { .. }
 		) {
-			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
+			return execute_catalog_plan(
+				self.catalog.as_ref(),
+				self.admin.as_ref(),
+				&self.context,
+				&bound,
+			)
+			.await;
 		}
 		if matches!(bound, ExecutionPlan::Insert { .. }) {
 			let source_executor = DistributedMutationSourceExecutor { coordinator: self };
@@ -253,6 +322,8 @@ fn scheduler_error(error: SchedulerError) -> QueryError {
 
 async fn execute_catalog_plan(
 	catalog: &dyn Catalog,
+	admin: &dyn StorageAdmin,
+	context: &ExecutionContext,
 	bound: &ExecutionPlan,
 ) -> Result<Vec<RecordBatch>, QueryError> {
 	match bound {
@@ -267,7 +338,24 @@ async fn execute_catalog_plan(
 			Ok(Vec::new())
 		}
 		ExecutionPlan::DropTable { name, if_exists } => {
-			catalog.drop_table(name, *if_exists).await?;
+			let binding = match catalog.resolve_table(name).await {
+				Ok(binding) => binding,
+				Err(CatalogError::TableNotFound { .. }) if *if_exists => return Ok(Vec::new()),
+				Err(error) => return Err(QueryError::Catalog(error)),
+			};
+			admin
+				.drop_table_storage(DropTableStorageRequest {
+					session_id: context.session_id,
+					query_id: context.query_id,
+					tenant_id: context.tenant_id,
+					table_id: binding.legacy_table_id,
+					table_object_id: binding.table,
+					physical_descriptor_fingerprint: binding.fingerprint,
+					profile_hint: context.profile_hint,
+					trace_context: context.trace_context,
+				})
+				.await?;
+			catalog.drop_table(name, false).await?;
 			Ok(Vec::new())
 		}
 		other => Err(QueryError::Internal {
@@ -526,16 +614,18 @@ pub struct QueryCoordinator {
 	config: PlannerConfig,
 	writer: Arc<dyn StorageWrite>,
 	deleter: Arc<dyn StorageDeleteRows>,
+	admin: Arc<dyn StorageAdmin>,
 }
 
 impl QueryCoordinator {
 	pub fn new(catalog: Arc<dyn Catalog>, executor: Executor, config: PlannerConfig) -> Self {
-		Self::with_writer_and_deleter(
+		Self::with_writer_deleter_and_admin(
 			catalog,
 			executor,
 			config,
 			Arc::new(UnsupportedStorageWrite),
 			Arc::new(UnsupportedStorageDeleteRows),
+			Arc::new(UnsupportedStorageAdmin),
 		)
 	}
 
@@ -545,12 +635,13 @@ impl QueryCoordinator {
 		config: PlannerConfig,
 		writer: Arc<dyn StorageWrite>,
 	) -> Self {
-		Self::with_writer_and_deleter(
+		Self::with_writer_deleter_and_admin(
 			catalog,
 			executor,
 			config,
 			writer,
 			Arc::new(UnsupportedStorageDeleteRows),
+			Arc::new(UnsupportedStorageAdmin),
 		)
 	}
 
@@ -567,6 +658,30 @@ impl QueryCoordinator {
 			config,
 			writer,
 			deleter,
+			admin: Arc::new(UnsupportedStorageAdmin),
+		}
+	}
+
+	pub fn with_storage_admin(mut self, admin: Arc<dyn StorageAdmin>) -> Self {
+		self.admin = admin;
+		self
+	}
+
+	pub fn with_writer_deleter_and_admin(
+		catalog: Arc<dyn Catalog>,
+		executor: Executor,
+		config: PlannerConfig,
+		writer: Arc<dyn StorageWrite>,
+		deleter: Arc<dyn StorageDeleteRows>,
+		admin: Arc<dyn StorageAdmin>,
+	) -> Self {
+		Self {
+			catalog,
+			executor,
+			config,
+			writer,
+			deleter,
+			admin,
 		}
 	}
 
@@ -580,7 +695,13 @@ impl QueryCoordinator {
 			LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. }
 		) {
 			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
-			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
+			return execute_catalog_plan(
+				self.catalog.as_ref(),
+				self.admin.as_ref(),
+				self.executor.context(),
+				&bound,
+			)
+			.await;
 		}
 		if matches!(
 			plan,

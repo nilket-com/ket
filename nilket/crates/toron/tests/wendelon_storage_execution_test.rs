@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::WendelonCatalog;
+use toron::catalog::{Catalog, TableRef, WendelonCatalog};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
@@ -84,6 +84,38 @@ async fn wendelon_storage_scan_keeps_live_tenants_isolated() {
 
 	assert_eq!(live_ids, vec![2, 4]);
 	assert_eq!(other_ids, vec![11]);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+#[ignore = "simulated fixture does not yet expose authenticated schema-update admin operations"]
+async fn wendelon_catalog_create_table_submits_schema_update_request() {
+	let fixture = LiveWendelonFixture::start(39).await;
+	let catalog = WendelonCatalog::with_client(
+		fixture.client.clone(),
+		LIVE_TENANT,
+		std::iter::empty::<(TableId, TableSchemaDescriptor)>(),
+	)
+	.expect("wendelon catalog");
+	let table = TableRef::with_schema("bench", "adr038_created");
+	let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+	let binding = catalog
+		.create_table(&table, schema.clone(), false)
+		.await
+		.expect("create table through Wendelon schema update");
+
+	assert_eq!(binding.schema.as_ref(), schema.as_ref());
+	assert_eq!(
+		catalog
+			.resolve_table(&table)
+			.await
+			.expect("registry updated after create")
+			.legacy_table_id,
+		binding.legacy_table_id
+	);
 
 	fixture.node.handles.abort();
 	let _ = std::fs::remove_dir_all(fixture.data_dir);

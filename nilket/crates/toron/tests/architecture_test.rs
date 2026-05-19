@@ -2658,6 +2658,7 @@ fn adr029_catalog_create_table_returns_binding() {
 	assert!(error.contains("TableAlreadyExists"));
 	assert!(error.contains("SchemaMismatch"));
 	assert!(error.contains("AdminUnavailable"));
+	assert!(error.contains("AdminFailed"));
 	assert!(error.contains("FingerprintResolution"));
 }
 
@@ -2710,7 +2711,7 @@ fn adr029_mock_catalog_reference_insertion_does_not_overwrite() {
 }
 
 #[test]
-fn adr029_wendelon_catalog_create_table_is_admin_unavailable() {
+fn adr029_wendelon_catalog_create_table_has_admin_boundary() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
 		.expect("read catalog source");
 	let impl_block = catalog
@@ -2723,8 +2724,9 @@ fn adr029_wendelon_catalog_create_table_is_admin_unavailable() {
 		.expect("WendelonCatalog::create_table body")
 		.1;
 
-	assert!(body.contains("CatalogError::AdminUnavailable"));
-	assert!(body.contains("CREATE TABLE is not wired to Wendelon catalog administration"));
+	assert!(body.contains("TableSchemaUpdateRequest::create"));
+	assert!(body.contains("submit_table_schema_update"));
+	assert!(!body.contains("CatalogError::AdminUnavailable"));
 }
 
 #[test]
@@ -2743,7 +2745,9 @@ fn adr029_coordinators_intercept_create_table() {
 		.find("let mut retried_descriptor_evolution = false")
 		.expect("descriptor retry loop");
 	assert!(ddl_branch < retry_loop);
-	assert!(query_impl.contains("execute_catalog_plan(self.catalog.as_ref(), &bound).await"));
+	assert!(query_impl.contains("execute_catalog_plan("));
+	assert!(query_impl.contains("self.catalog.as_ref()"));
+	assert!(query_impl.contains("self.admin.as_ref()"));
 
 	let distributed_impl = coordinator
 		.split("impl<Registry, Transport> DistributedQueryCoordinator")
@@ -2756,7 +2760,9 @@ fn adr029_coordinators_intercept_create_table() {
 		.find("fragment_plan(")
 		.expect("fragmenter call");
 	assert!(distributed_branch < fragment_call);
-	assert!(distributed_impl.contains("execute_catalog_plan(self.catalog.as_ref(), &bound).await"));
+	assert!(distributed_impl.contains("execute_catalog_plan("));
+	assert!(distributed_impl.contains("self.catalog.as_ref()"));
+	assert!(distributed_impl.contains("self.admin.as_ref()"));
 
 	let helper_body = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
 		.into_iter()
@@ -2971,9 +2977,10 @@ fn adr030_wendelon_storage_write_mirrors_scan_error_mapping() {
 			.expect("WendelonStorageWrite impl")
 			.1;
 
-	assert!(write_impl.contains("StorageError::TableNotFound"));
+	assert!(write_impl.contains("descriptor_registry.descriptor(request.table_id)?"));
 	assert!(write_impl.contains("StorageError::DescriptorEvolved"));
 	assert!(write_impl.contains("StorageError::Internal"));
+	assert!(storage.contains("StorageError::TableNotFound"));
 }
 
 #[test]
@@ -4138,7 +4145,7 @@ fn adr034_coordinators_intercept_drop_table() {
 		.expect("execute_catalog_plan helper body")
 		.1;
 	assert!(helper.contains("ExecutionPlan::DropTable"));
-	assert!(helper.contains(".drop_table(name, *if_exists)"));
+	assert!(helper.contains(".drop_table(name, false)"));
 	assert!(helper.contains("Ok(Vec::new())"));
 }
 
@@ -4240,7 +4247,6 @@ fn adr034_does_not_add_storage_reclaim_or_plan_arena() {
 	for forbidden in [
 		"StorageReclaim",
 		"StorageDrop",
-		"drop_table",
 		"delete_table",
 		"reclaim_table",
 	] {
@@ -4903,6 +4909,7 @@ fn adr037_distributed_coordinator_is_context_and_sink_bearing() {
 	assert!(struct_body.contains("context: ExecutionContext"));
 	assert!(struct_body.contains("writer: Arc<dyn StorageWrite>"));
 	assert!(struct_body.contains("deleter: Arc<dyn StorageDeleteRows>"));
+	assert!(struct_body.contains("admin: Arc<dyn StorageAdmin>"));
 }
 
 #[test]
@@ -4914,6 +4921,8 @@ fn adr037_distributed_coordinator_exposes_write_sink_constructors() {
 	assert!(coordinator.contains("pub fn with_writer("));
 	assert!(coordinator.contains("pub fn with_writer_and_deleter("));
 	assert!(coordinator.contains("pub fn with_context_writer_and_deleter("));
+	assert!(coordinator.contains("pub fn with_storage_admin("));
+	assert!(coordinator.contains("pub fn with_writer_deleter_and_admin("));
 }
 
 #[test]
@@ -5459,6 +5468,406 @@ fn adr035_wendelon_adapter_calls_table_delete() {
 }
 
 #[test]
+fn adr038_storage_admin_trait_has_one_method() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let trait_body = storage
+		.split("pub trait StorageAdmin")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct InMemoryStorageScan").next())
+		.expect("StorageAdmin trait block");
+
+	assert_eq!(trait_body.matches("async fn").count(), 1);
+	assert!(trait_body.contains("async fn drop_table_storage("));
+}
+
+#[test]
+fn adr038_drop_table_storage_request_shape_is_context_only() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let request = storage
+		.split("pub struct DropTableStorageRequest")
+		.nth(1)
+		.and_then(|rest| rest.split("#[non_exhaustive]").next())
+		.expect("DropTableStorageRequest block");
+
+	for field in [
+		"pub session_id: SessionId,",
+		"pub query_id: QueryId,",
+		"pub tenant_id: TenantId,",
+		"pub table_id: TableId,",
+		"pub table_object_id: TableObjectId,",
+		"pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,",
+		"pub profile_hint: Option<QueryProfileHint>,",
+		"pub trace_context: Option<TraceContext>,",
+	] {
+		assert!(request.contains(field), "missing request field {field}");
+	}
+	for forbidden in [
+		"client_write_id",
+		"durability",
+		"await_finalization",
+		"retry",
+		"runtime_filter",
+		"payload",
+	] {
+		assert!(
+			!request.contains(forbidden),
+			"DropTableStorageRequest must not contain {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr038_execution_drop_table_remains_identity_free() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+	let drop_table = brace_blocks_after_marker(execution_plan, "DropTable {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::DropTable body")
+		.1;
+
+	assert!(drop_table.contains("name: TableRef,"));
+	assert!(drop_table.contains("if_exists: bool,"));
+	for forbidden in [
+		"TableId",
+		"TableObjectId",
+		"PhysicalDescriptorFingerprint",
+		"SchemaRef",
+		"Box<",
+	] {
+		assert!(!drop_table.contains(forbidden), "unexpected {forbidden}");
+	}
+}
+
+#[test]
+fn adr038_coordinator_resolves_drop_identity_at_execution() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
+		.into_iter()
+		.next()
+		.expect("execute_catalog_plan helper body")
+		.1;
+
+	assert!(helper.contains("catalog.resolve_table(name).await"));
+	assert!(helper.contains("DropTableStorageRequest"));
+	assert!(
+		helper.find("catalog.resolve_table(name).await").unwrap()
+			< helper.find(".drop_table_storage").unwrap()
+	);
+}
+
+#[test]
+fn adr038_in_memory_storage_admin_removes_table_entry() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let body = brace_blocks_after_marker(&storage, "impl StorageAdmin for InMemoryTableStorage")
+		.into_iter()
+		.next()
+		.expect("InMemoryTableStorage StorageAdmin impl")
+		.1;
+
+	assert!(body.contains("tables.remove(&request.table_id)"));
+}
+
+#[test]
+fn adr038_drop_table_storage_first_catalog_second() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
+		.into_iter()
+		.next()
+		.expect("execute_catalog_plan helper body")
+		.1;
+
+	assert!(
+		helper.find(".drop_table_storage").unwrap()
+			< helper.find("catalog.drop_table(name, false)").unwrap()
+	);
+}
+
+#[test]
+fn adr038_fragmenter_drop_table_defensive_reject_remains() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
+		.into_iter()
+		.next()
+		.expect("fragment_plan body")
+		.1;
+
+	assert!(fragmenter.contains("DropTableNotFragmentable"));
+	assert!(fragment_plan.contains("ExecutionPlan::DropTable"));
+}
+
+#[test]
+fn adr038_wendelon_descriptor_registry_shared_by_all_adapters() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+
+	assert!(catalog.contains("pub struct WendelonDescriptorRegistry"));
+	assert!(
+		catalog.contains("descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>")
+	);
+	for adapter in [
+		"pub struct WendelonStorageScan",
+		"pub struct WendelonStorageWrite",
+		"pub struct WendelonStorageDeleteRows",
+	] {
+		let body = brace_blocks_after_marker(&storage, adapter)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{adapter} body"))
+			.1;
+		assert!(body.contains("WendelonDescriptorRegistry"));
+		assert!(!body.contains("HashMap<TableId, wendelon_client::TableSchemaDescriptor>"));
+	}
+}
+
+#[test]
+fn adr038_wendelon_create_table_admin_unavailable_removed() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let create_body = wendelon_catalog_method_body(&catalog, "async fn create_table");
+
+	assert!(!create_body.contains("CatalogError::AdminUnavailable"));
+	assert!(!create_body.contains("CREATE TABLE is not wired"));
+}
+
+#[test]
+fn adr038_wendelon_create_uses_table_schema_update_request_create() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let create_body = wendelon_catalog_method_body(&catalog, "async fn create_table");
+
+	assert!(create_body.contains("TableSchemaUpdateRequest::create"));
+	assert!(create_body.contains("submit_table_schema_update"));
+}
+
+#[test]
+fn adr038_wendelon_create_uses_uuid_object_id_not_fingerprint() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let create_body = wendelon_catalog_method_body(&catalog, "async fn create_table");
+
+	assert!(create_body.contains("Uuid::new_v4"));
+	for forbidden in ["blake3", "xxh3", "Sha2", "Sha3"] {
+		assert!(!create_body.contains(forbidden), "unexpected {forbidden}");
+	}
+}
+
+#[test]
+fn adr038_drop_route_uses_storage_admin_sink_when_configured() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+
+	assert!(coordinator.contains("admin: Arc<dyn StorageAdmin>"));
+	assert!(coordinator.contains("self.admin.as_ref()"));
+	assert!(coordinator.contains(".drop_table_storage"));
+}
+
+#[test]
+fn adr038_wendelon_drop_remains_admin_unavailable_until_adr_039() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let drop_body = wendelon_catalog_method_body(&catalog, "async fn drop_table");
+
+	assert!(drop_body.contains("CatalogError::AdminUnavailable"));
+	assert!(drop_body.contains("DROP TABLE is not wired to Wendelon catalog administration"));
+}
+
+#[test]
+fn adr038_strict_admin_sink_default_is_unsupported_storage_admin() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+
+	assert!(coordinator.contains("UnsupportedStorageAdmin"));
+	assert!(coordinator.contains("Arc::new(UnsupportedStorageAdmin)"));
+	assert!(coordinator.contains("pub fn with_storage_admin("));
+	assert!(coordinator.contains("pub fn with_writer_deleter_and_admin("));
+}
+
+#[test]
+fn adr038_no_background_gc_or_scheduler() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let storage_admin =
+		brace_blocks_after_marker(&storage, "impl StorageAdmin for InMemoryTableStorage")
+			.into_iter()
+			.next()
+			.expect("InMemoryTableStorage admin impl")
+			.1;
+	let registry = brace_blocks_after_marker(&catalog, "impl WendelonDescriptorRegistry")
+		.into_iter()
+		.next()
+		.expect("registry impl")
+		.1;
+	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
+		.into_iter()
+		.next()
+		.expect("execute_catalog_plan helper")
+		.1;
+
+	for body in [storage_admin, registry, helper] {
+		assert!(!body.contains("tokio::spawn"));
+		assert!(!body.contains("std::thread::spawn"));
+	}
+}
+
+#[test]
+fn adr038_no_create_or_replace_sql_surface() {
+	let manifest_dir = manifest_dir();
+	for path in [
+		manifest_dir.join("src/ir.rs"),
+		manifest_dir.join("src/ir/execution.rs"),
+		manifest_dir.join("src/sql_planner.rs"),
+		manifest_dir.join("src/binder.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read source");
+		assert!(!source.contains("CreateOrReplaceTable"));
+		assert!(!source.contains("CREATE OR REPLACE"));
+	}
+}
+
+#[test]
+fn adr038_no_write_receipt_or_read_your_writes_fields() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let request = storage
+		.split("pub struct DropTableStorageRequest")
+		.nth(1)
+		.and_then(|rest| rest.split("#[non_exhaustive]").next())
+		.expect("DropTableStorageRequest block");
+	let outcome = storage
+		.split("pub struct DropTableStorageOutcome")
+		.nth(1)
+		.and_then(|rest| rest.split("impl DropTableStorageOutcome").next())
+		.expect("DropTableStorageOutcome block");
+
+	for forbidden in [
+		"receipt",
+		"client_write_id",
+		"durability",
+		"await_finalization",
+		"read_your_writes",
+	] {
+		assert!(!request.contains(forbidden), "request contains {forbidden}");
+		assert!(!outcome.contains(forbidden), "outcome contains {forbidden}");
+	}
+	assert!(outcome.contains("pub reclaimed_tables: usize,"));
+}
+
+#[test]
+fn adr038_no_blake3_or_name_hash_object_ids() {
+	let cargo =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Cargo.toml");
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+
+	assert!(!cargo.contains("blake3"));
+	for forbidden in ["blake3", "Sha2", "Sha3", "xxh3"] {
+		assert!(!catalog.contains(forbidden), "unexpected {forbidden}");
+	}
+}
+
+#[test]
+fn adr038_no_table_object_id_reuse() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let create_body = wendelon_catalog_method_body(&catalog, "async fn create_table");
+
+	assert!(create_body.contains("TableObjectId::new(*Uuid::new_v4().as_bytes())"));
+	assert!(!create_body.contains("existing.table"));
+	assert!(!create_body.contains("descriptor.table_object_id"));
+}
+
+#[test]
+fn adr038_in_memory_admin_validates_object_id_and_fingerprint() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let body = brace_blocks_after_marker(&storage, "impl StorageAdmin for InMemoryTableStorage")
+		.into_iter()
+		.next()
+		.expect("InMemoryTableStorage StorageAdmin impl")
+		.1;
+
+	assert!(body.contains("data.table_object_id != request.table_object_id"));
+	assert!(
+		body.contains("data.physical_descriptor_fingerprint")
+			&& body.contains("request.physical_descriptor_fingerprint")
+	);
+}
+
+#[test]
+fn adr038_wendelon_create_uses_append_only_row_identity_policy() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let create_body = wendelon_catalog_method_body(&catalog, "async fn create_table");
+
+	assert!(create_body.contains("RowIdentityPolicy::AppendOnly"));
+	assert!(!create_body.contains("RowIdentityPolicy::PrimaryKey"));
+	assert!(!create_body.contains("RowIdentityPolicy::ByOrdinal"));
+}
+
+#[test]
+fn adr038_no_separate_catalog_cache_after_admin() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+
+	for forbidden in ["invalidate_table", "refresh_catalog", "evict_descriptor"] {
+		assert!(
+			!catalog.contains(forbidden),
+			"unexpected helper {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr038_drop_does_not_invalidate_bound_plans() {
+	for path in [
+		manifest_dir().join("src/catalog.rs"),
+		manifest_dir().join("src/storage.rs"),
+		manifest_dir().join("src/coordinator.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read source");
+		for forbidden in ["TaskSpec", "plan_cache", "invalidate_plan"] {
+			assert!(
+				!source.contains(forbidden),
+				"{} contains {forbidden}",
+				path.display()
+			);
+		}
+	}
+}
+
+#[test]
+fn adr038_catalog_drop_table_only_called_from_routing_helper() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
+		.into_iter()
+		.next()
+		.expect("execute_catalog_plan helper")
+		.1;
+
+	assert_eq!(coordinator.matches(".drop_table(").count(), 1);
+	assert!(helper.contains("catalog.drop_table(name, false).await"));
+}
+
+#[test]
 fn adr035_wendelon_projection_change_is_privileged() {
 	let columnar = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/columnar.rs"))
 		.expect("read Wendelon columnar source");
@@ -5537,6 +5946,18 @@ impl StorageScan for RecordingStorageScan {
 			vec![self.batch.clone()],
 		))
 	}
+}
+
+fn wendelon_catalog_method_body(source: &str, method: &str) -> String {
+	let impl_block = source
+		.split("impl Catalog for WendelonCatalog")
+		.nth(1)
+		.expect("WendelonCatalog Catalog impl");
+	brace_blocks_after_marker(impl_block, method)
+		.into_iter()
+		.next()
+		.unwrap_or_else(|| panic!("{method} body"))
+		.1
 }
 
 fn source_lines(root: &Path) -> Vec<(PathBuf, usize, String)> {

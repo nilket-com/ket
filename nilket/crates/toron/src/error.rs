@@ -123,6 +123,8 @@ pub enum CatalogError {
 	SchemaMismatch { table: String },
 	#[error("catalog admin operation unavailable: {message}")]
 	AdminUnavailable { message: String },
+	#[error("catalog admin operation failed: {message}")]
+	AdminFailed { message: String },
 	#[error("fingerprint resolution failed: {message}")]
 	FingerprintResolution { message: String },
 	#[error(transparent)]

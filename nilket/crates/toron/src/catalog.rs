@@ -4,13 +4,16 @@ use std::sync::RwLock;
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::error::CatalogError;
+use crate::error::{CatalogError, StorageError};
 use crate::ir::{ColumnOrdinal, TableId};
+use wendelon::integration::compute::SchemaIntentId;
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, PhysicalDescriptorFingerprint, RecordLayoutPolicy,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId,
 };
+use wendelon_client::{Client, ClientError, TableSchemaUpdateRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableRef {
@@ -301,44 +304,97 @@ impl Catalog for MockCatalog {
 	}
 }
 
-#[derive(Default)]
 pub struct WendelonCatalog {
-	by_ref: HashMap<TableRef, TableId>,
-	by_id: HashMap<TableId, TableBinding>,
+	client: Option<Arc<Client>>,
+	tenant_id: TenantId,
+	registry: Arc<WendelonDescriptorRegistry>,
 }
 
-impl WendelonCatalog {
+impl Default for WendelonCatalog {
+	fn default() -> Self {
+		Self {
+			client: None,
+			tenant_id: TenantId::new(1),
+			registry: Arc::new(WendelonDescriptorRegistry::default()),
+		}
+	}
+}
+
+#[derive(Default)]
+pub struct WendelonDescriptorRegistry {
+	inner: RwLock<WendelonDescriptorState>,
+}
+
+struct WendelonDescriptorState {
+	by_ref: HashMap<TableRef, TableId>,
+	by_id: HashMap<TableId, TableBinding>,
+	descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
+	next_table_id: u64,
+}
+
+impl Default for WendelonDescriptorState {
+	fn default() -> Self {
+		Self {
+			by_ref: HashMap::new(),
+			by_id: HashMap::new(),
+			descriptors: HashMap::new(),
+			next_table_id: 1,
+		}
+	}
+}
+
+impl WendelonDescriptorRegistry {
 	pub fn from_descriptors(
 		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptor)>,
 	) -> Result<Self, CatalogError> {
-		let mut catalog = Self::default();
+		let registry = Self::default();
 		for (table_id, descriptor) in descriptors {
 			let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
 			let unqualified_ref = TableRef::new(&descriptor.table_name);
 			let binding = TableBinding::from_descriptor(table_id, &descriptor)?;
-
-			catalog.by_ref.insert(table_ref, table_id);
-			catalog.by_ref.insert(unqualified_ref, table_id);
-			catalog.by_id.insert(table_id, binding);
+			let mut state = registry
+				.inner
+				.write()
+				.expect("WendelonDescriptorRegistry lock poisoned");
+			insert_wendelon_descriptor_locked(
+				&mut state,
+				table_ref,
+				Some(unqualified_ref),
+				table_id,
+				binding,
+				descriptor,
+			)?;
 		}
-		Ok(catalog)
+		Ok(registry)
 	}
-}
 
-#[async_trait::async_trait]
-impl Catalog for WendelonCatalog {
-	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
-		let table_id = self
+	pub fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let table_id = state
 			.by_ref
 			.get(table)
 			.ok_or_else(|| CatalogError::TableNotFound {
 				table: table_name(table),
 			})?;
-		self.resolve_table_id(*table_id).await
+		state
+			.by_id
+			.get(table_id)
+			.cloned()
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: table_name(table),
+			})
 	}
 
-	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError> {
-		self.by_id
+	pub fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError> {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		state
+			.by_id
 			.get(&table)
 			.cloned()
 			.ok_or_else(|| CatalogError::TableNotFound {
@@ -346,15 +402,208 @@ impl Catalog for WendelonCatalog {
 			})
 	}
 
+	pub fn descriptor(
+		&self,
+		table: TableId,
+	) -> Result<wendelon_client::TableSchemaDescriptor, StorageError> {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		state
+			.descriptors
+			.get(&table)
+			.cloned()
+			.ok_or(StorageError::TableNotFound { table })
+	}
+
+	fn try_resolve_table(&self, table: &TableRef) -> Option<TableBinding> {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let table_id = state.by_ref.get(table)?;
+		state.by_id.get(table_id).cloned()
+	}
+
+	fn allocate_table_id(&self) -> TableId {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		while state.by_id.contains_key(&TableId(state.next_table_id)) {
+			state.next_table_id = state
+				.next_table_id
+				.checked_add(1)
+				.expect("TableId overflow");
+		}
+		let table_id = TableId(state.next_table_id);
+		state.next_table_id = state
+			.next_table_id
+			.checked_add(1)
+			.expect("TableId overflow");
+		table_id
+	}
+
+	fn insert_descriptor(
+		&self,
+		name: TableRef,
+		binding: TableBinding,
+		descriptor: wendelon_client::TableSchemaDescriptor,
+	) -> Result<(), CatalogError> {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		if state.by_ref.contains_key(&name) {
+			return Err(CatalogError::TableAlreadyExists {
+				table: table_name(&name),
+			});
+		}
+		let unqualified_ref = name
+			.schema
+			.is_some()
+			.then(|| TableRef::new(name.table.clone()));
+		insert_wendelon_descriptor_locked(
+			&mut state,
+			name,
+			unqualified_ref,
+			binding.legacy_table_id,
+			binding,
+			descriptor,
+		)
+	}
+}
+
+fn insert_wendelon_descriptor_locked(
+	state: &mut WendelonDescriptorState,
+	table_ref: TableRef,
+	unqualified_ref: Option<TableRef>,
+	table_id: TableId,
+	binding: TableBinding,
+	descriptor: wendelon_client::TableSchemaDescriptor,
+) -> Result<(), CatalogError> {
+	if state.by_ref.contains_key(&table_ref) || state.by_id.contains_key(&table_id) {
+		return Err(CatalogError::TableAlreadyExists {
+			table: table_name(&table_ref),
+		});
+	}
+
+	state.by_ref.insert(table_ref, table_id);
+	if let Some(unqualified_ref) = unqualified_ref {
+		state.by_ref.entry(unqualified_ref).or_insert(table_id);
+	}
+	state.by_id.insert(table_id, binding);
+	state.descriptors.insert(table_id, descriptor);
+	bump_next_wendelon_table_id(state, table_id);
+	Ok(())
+}
+
+impl WendelonCatalog {
+	pub fn from_descriptors(
+		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptor)>,
+	) -> Result<Self, CatalogError> {
+		Ok(Self {
+			registry: Arc::new(WendelonDescriptorRegistry::from_descriptors(descriptors)?),
+			..Self::default()
+		})
+	}
+
+	pub fn with_client(
+		client: Arc<Client>,
+		tenant_id: TenantId,
+		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptor)>,
+	) -> Result<Self, CatalogError> {
+		Ok(Self {
+			client: Some(client),
+			tenant_id,
+			registry: Arc::new(WendelonDescriptorRegistry::from_descriptors(descriptors)?),
+		})
+	}
+
+	pub fn with_client_and_registry(
+		client: Arc<Client>,
+		tenant_id: TenantId,
+		registry: Arc<WendelonDescriptorRegistry>,
+	) -> Self {
+		Self {
+			client: Some(client),
+			tenant_id,
+			registry,
+		}
+	}
+
+	pub fn descriptor_registry(&self) -> Arc<WendelonDescriptorRegistry> {
+		self.registry.clone()
+	}
+}
+
+#[async_trait::async_trait]
+impl Catalog for WendelonCatalog {
+	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		self.registry.resolve_table(table)
+	}
+
+	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError> {
+		self.registry.resolve_table_id(table)
+	}
+
 	async fn create_table(
 		&self,
-		_name: &TableRef,
-		_schema: SchemaRef,
-		_if_not_exists: bool,
+		name: &TableRef,
+		schema: SchemaRef,
+		if_not_exists: bool,
 	) -> Result<TableBinding, CatalogError> {
-		Err(CatalogError::AdminUnavailable {
-			message: "CREATE TABLE is not wired to Wendelon catalog administration".to_string(),
-		})
+		if let Some(existing) = self.registry.try_resolve_table(name) {
+			if if_not_exists {
+				if existing.schema.as_ref() == schema.as_ref() {
+					return Ok(existing);
+				}
+				return Err(CatalogError::SchemaMismatch {
+					table: table_name(name),
+				});
+			}
+			return Err(CatalogError::TableAlreadyExists {
+				table: table_name(name),
+			});
+		}
+
+		let client = self
+			.client
+			.as_ref()
+			.ok_or_else(|| CatalogError::AdminFailed {
+				message: "CREATE TABLE requires a configured Wendelon catalog admin client"
+					.to_string(),
+			})?;
+		let legacy_table_id = self.registry.allocate_table_id();
+		let table_object_id = TableObjectId::new(*Uuid::new_v4().as_bytes());
+		let descriptor = TableSchemaDescriptor::new_with_layout(
+			table_object_id,
+			1,
+			name.schema.as_deref().unwrap_or("default"),
+			&name.table,
+			schema.as_ref(),
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicy::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.map_err(|error| CatalogError::FingerprintResolution {
+			message: error.to_string(),
+		})?;
+		let intent_id = SchemaIntentId::new(*Uuid::new_v4().as_bytes());
+		let request =
+			TableSchemaUpdateRequest::create(self.tenant_id, descriptor.clone(), intent_id);
+
+		client
+			.submit_table_schema_update(request)
+			.await
+			.map_err(|error| map_wendelon_admin_error(name, error))?;
+
+		let binding = TableBinding::from_descriptor(legacy_table_id, &descriptor)?;
+		self.registry
+			.insert_descriptor(name.clone(), binding.clone(), descriptor)?;
+		Ok(binding)
 	}
 
 	async fn drop_table(
@@ -362,7 +611,7 @@ impl Catalog for WendelonCatalog {
 		name: &TableRef,
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError> {
-		if self.by_ref.contains_key(name) {
+		if self.registry.try_resolve_table(name).is_some() {
 			return Err(CatalogError::AdminUnavailable {
 				message: "DROP TABLE is not wired to Wendelon catalog administration".to_string(),
 			});
@@ -388,6 +637,29 @@ fn bump_next_table_id(inner: &mut MockCatalogInner, table_id: TableId) {
 	inner.next_table_id = inner
 		.next_table_id
 		.max(table_id.0.checked_add(1).expect("TableId overflow"));
+}
+
+fn bump_next_wendelon_table_id(state: &mut WendelonDescriptorState, table_id: TableId) {
+	state.next_table_id = state
+		.next_table_id
+		.max(table_id.0.checked_add(1).expect("TableId overflow"));
+}
+
+fn map_wendelon_admin_error(table: &TableRef, error: ClientError) -> CatalogError {
+	match &error {
+		ClientError::SchemaUpdateRejected { message, .. }
+			if message.contains("cannot replace an existing table")
+				|| (message.contains("expected_generation")
+					&& message.contains("current generation")) =>
+		{
+			CatalogError::TableAlreadyExists {
+				table: table_name(table),
+			}
+		}
+		_ => CatalogError::AdminFailed {
+			message: error.to_string(),
+		},
+	}
 }
 
 fn mock_table_identity(

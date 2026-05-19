@@ -18,7 +18,7 @@ rune = "0.14"
 sqlparser = "0.54"
 rand = "0.10"
 thiserror = "2"
-uuid = { version = "1.23", features = ["serde", "v7"] }
+uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
 aws-lc-rs = { version = "1.14", default-features = false }
 wendelon = { path = "../wendelon" }

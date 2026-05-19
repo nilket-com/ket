@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arrow::array::{Array, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -11,13 +12,16 @@ use toron::distributed::budget::{QueryBudget, TaskBudget};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::QueryId;
 use toron::distributed::worker_registry::StaticWorkerRegistry;
-use toron::error::{CatalogError, ExecutionError, QueryError};
+use toron::error::{CatalogError, ExecutionError, QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{ExecutionPlan, LogicalPlan, SessionId, TableId};
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
-use toron::storage::{HlcBound, InMemoryStorageScan, InMemoryTableStorage, TenantId};
+use toron::storage::{
+	DropTableStorageOutcome, DropTableStorageRequest, HlcBound, InMemoryStorageScan,
+	InMemoryTableStorage, StorageAdmin, TenantId,
+};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
 	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
@@ -152,7 +156,7 @@ async fn mock_catalog_drop_table_schema_alias_cleanup_is_exact() {
 
 #[tokio::test]
 async fn query_coordinator_executes_drop_table() {
-	let (catalog, _storage, coordinator, planner) = coordinator();
+	let (catalog, storage, coordinator, planner) = coordinator();
 
 	for sql in [
 		"CREATE TABLE sales (id INT NOT NULL)",
@@ -165,6 +169,7 @@ async fn query_coordinator_executes_drop_table() {
 	}
 	let before_drop = concat_query(&coordinator, &planner, "SELECT id FROM sales").await;
 	assert_eq!(int32_column(&before_drop, 0).values(), &[1]);
+	assert_eq!(storage.table_count(), 1);
 
 	let dropped = coordinator
 		.execute_query(
@@ -174,6 +179,7 @@ async fn query_coordinator_executes_drop_table() {
 		.await
 		.expect("execute drop table");
 	assert!(dropped.is_empty());
+	assert_eq!(storage.table_count(), 0);
 
 	let err = coordinator
 		.execute_query(
@@ -273,6 +279,7 @@ async fn distributed_coordinator_executes_drop_table_before_fragment() {
 		)
 		.await
 		.expect("create table");
+	let admin = Arc::new(SpyStorageAdmin::new());
 	let coordinator = DistributedQueryCoordinator::new(
 		catalog.clone(),
 		Arc::new(StaticWorkerRegistry::new([])),
@@ -280,7 +287,8 @@ async fn distributed_coordinator_executes_drop_table_before_fragment() {
 		Arc::new(FailingTransport),
 		PlannerConfig::default(),
 		QueryBudget::test_default(),
-	);
+	)
+	.with_storage_admin(admin.clone());
 	let plan = SqlPlanner::new()
 		.plan("DROP TABLE sales")
 		.expect("plan drop table");
@@ -291,12 +299,243 @@ async fn distributed_coordinator_executes_drop_table_before_fragment() {
 		.expect("distributed drop table");
 
 	assert!(results.is_empty());
+	assert_eq!(admin.call_count(), 1);
 	assert!(
 		catalog
 			.resolve_table(&TableRef::new("sales"))
 			.await
 			.is_err()
 	);
+}
+
+#[tokio::test]
+async fn drop_table_if_exists_missing_does_not_call_storage_admin() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let spy = Arc::new(SpyStorageAdmin::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), storage)
+			.with_storage_admin(spy.clone());
+	let planner = SqlPlanner::new();
+
+	let result = coordinator
+		.execute_query(
+			&planner
+				.plan("DROP TABLE IF EXISTS missing")
+				.expect("plan drop missing"),
+			None,
+		)
+		.await
+		.expect("drop missing if exists");
+
+	assert!(result.is_empty());
+	assert_eq!(spy.call_count(), 0);
+}
+
+#[tokio::test]
+async fn drop_table_storage_failure_preserves_catalog_reachability() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let failing = Arc::new(AlwaysFailStorageAdmin);
+	let executor = Executor::new(storage.clone());
+	let coordinator = QueryCoordinator::with_writer_deleter_and_admin(
+		catalog.clone(),
+		executor,
+		PlannerConfig::default(),
+		storage.clone(),
+		storage,
+		failing,
+	);
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE sales (id INT NOT NULL)",
+		"INSERT INTO sales VALUES (1)",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let first = coordinator
+		.execute_query(
+			&planner.plan("DROP TABLE sales").expect("plan drop table"),
+			None,
+		)
+		.await
+		.expect_err("storage failure should surface");
+	assert!(matches!(
+		first,
+		QueryError::Storage(StorageError::Internal { .. })
+	));
+	assert!(catalog.resolve_table(&TableRef::new("sales")).await.is_ok());
+
+	let retry = coordinator
+		.execute_query(&planner.plan("DROP TABLE sales").expect("plan retry"), None)
+		.await
+		.expect_err("retry still fails at storage");
+	assert!(matches!(
+		retry,
+		QueryError::Storage(StorageError::Internal { .. })
+	));
+}
+
+#[tokio::test]
+async fn drop_table_stale_scan_returns_table_not_found() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator = QueryCoordinator::with_writer_deleter_and_admin(
+		catalog.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+		storage.clone(),
+		storage.clone(),
+	);
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE sales (id INT NOT NULL)",
+		"INSERT INTO sales VALUES (1)",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let select = planner.plan("SELECT id FROM sales").expect("plan select");
+	let bound = bind(&select, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind select");
+	let first = executor
+		.execute_bound(&bound, None)
+		.await
+		.expect("first execute");
+	assert_eq!(int32_column(&first[0], 0).values(), &[1]);
+
+	coordinator
+		.execute_query(
+			&planner.plan("DROP TABLE sales").expect("plan drop table"),
+			None,
+		)
+		.await
+		.expect("drop table");
+
+	let stale = executor
+		.execute_bound(&bound, None)
+		.await
+		.expect_err("stale scan should fail");
+	assert!(matches!(
+		stale,
+		ExecutionError::Storage(StorageError::TableNotFound { .. })
+	));
+}
+
+#[tokio::test]
+async fn drop_with_no_admin_sink_returns_capability_diagnostic() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), storage);
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE sales (id INT NOT NULL)",
+		"INSERT INTO sales VALUES (1)",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let err = coordinator
+		.execute_query(
+			&planner.plan("DROP TABLE sales").expect("plan drop table"),
+			None,
+		)
+		.await
+		.expect_err("default admin sink should reject");
+	assert!(matches!(
+		err,
+		QueryError::Storage(StorageError::Internal { ref message })
+			if message == "DROP TABLE physical reclaim requires a configured StorageAdmin"
+	));
+}
+
+#[tokio::test]
+async fn drop_admin_failure_then_retry_succeeds() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let toggle = Arc::new(ToggleStorageAdmin::new(storage.clone()));
+	let executor = Executor::new(storage.clone());
+	let coordinator = QueryCoordinator::with_writer_deleter_and_admin(
+		catalog.clone(),
+		executor,
+		PlannerConfig::default(),
+		storage.clone(),
+		storage,
+		toggle,
+	);
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE sales (id INT NOT NULL)",
+		"INSERT INTO sales VALUES (1)",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let first = coordinator
+		.execute_query(
+			&planner.plan("DROP TABLE sales").expect("plan drop table"),
+			None,
+		)
+		.await
+		.expect_err("first admin attempt fails");
+	assert!(matches!(
+		first,
+		QueryError::Storage(StorageError::Internal { .. })
+	));
+	assert!(catalog.resolve_table(&TableRef::new("sales")).await.is_ok());
+
+	coordinator
+		.execute_query(&planner.plan("DROP TABLE sales").expect("plan retry"), None)
+		.await
+		.expect("retry succeeds");
+	assert!(
+		catalog
+			.resolve_table(&TableRef::new("sales"))
+			.await
+			.is_err()
+	);
+}
+
+#[test]
+fn wendelon_create_uses_append_only_row_identity_policy() {
+	let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/catalog.rs"))
+		.expect("read catalog source");
+	let impl_block = source
+		.split("impl Catalog for WendelonCatalog")
+		.nth(1)
+		.expect("WendelonCatalog Catalog impl");
+	let create_body = impl_block
+		.split("async fn create_table")
+		.nth(1)
+		.and_then(|rest| rest.split("async fn drop_table").next())
+		.expect("WendelonCatalog::create_table body");
+
+	assert!(create_body.contains("RowIdentityPolicy::AppendOnly"));
+	assert!(!create_body.contains("RowIdentityPolicy::PrimaryKey"));
+	assert!(!create_body.contains("RowIdentityPolicy::ByOrdinal"));
 }
 
 #[tokio::test]
@@ -385,8 +624,79 @@ fn coordinator() -> (
 		executor,
 		PlannerConfig::default(),
 		storage.clone(),
-	);
+	)
+	.with_storage_admin(storage.clone());
 	(catalog, storage, coordinator, SqlPlanner::new())
+}
+
+struct SpyStorageAdmin {
+	calls: AtomicUsize,
+}
+
+impl SpyStorageAdmin {
+	fn new() -> Self {
+		Self {
+			calls: AtomicUsize::new(0),
+		}
+	}
+
+	fn call_count(&self) -> usize {
+		self.calls.load(Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl StorageAdmin for SpyStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		_request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		self.calls.fetch_add(1, Ordering::SeqCst);
+		Ok(DropTableStorageOutcome::new(0))
+	}
+}
+
+struct AlwaysFailStorageAdmin;
+
+#[async_trait]
+impl StorageAdmin for AlwaysFailStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		_request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		Err(StorageError::Internal {
+			message: "admin failure".to_string(),
+		})
+	}
+}
+
+struct ToggleStorageAdmin {
+	storage: Arc<InMemoryTableStorage>,
+	failed: AtomicBool,
+}
+
+impl ToggleStorageAdmin {
+	fn new(storage: Arc<InMemoryTableStorage>) -> Self {
+		Self {
+			storage,
+			failed: AtomicBool::new(false),
+		}
+	}
+}
+
+#[async_trait]
+impl StorageAdmin for ToggleStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		if !self.failed.swap(true, Ordering::SeqCst) {
+			return Err(StorageError::Internal {
+				message: "transient admin failure".to_string(),
+			});
+		}
+		self.storage.drop_table_storage(request).await
+	}
 }
 
 async fn concat_query(

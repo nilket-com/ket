@@ -267,7 +267,7 @@ async fn mock_catalog_schema_qualified_alias_does_not_overwrite() {
 }
 
 #[tokio::test]
-async fn wendelon_catalog_create_table_is_admin_unavailable() {
+async fn wendelon_catalog_create_table_requires_admin_client() {
 	let catalog = WendelonCatalog::default();
 	let err = expect_catalog_err(
 		catalog
@@ -279,7 +279,11 @@ async fn wendelon_catalog_create_table_is_admin_unavailable() {
 			.await,
 	);
 
-	assert!(matches!(err, CatalogError::AdminUnavailable { .. }));
+	assert!(matches!(err, CatalogError::AdminFailed { .. }));
+	assert!(
+		err.to_string()
+			.contains("CREATE TABLE requires a configured Wendelon catalog admin client")
+	);
 }
 
 #[tokio::test]
