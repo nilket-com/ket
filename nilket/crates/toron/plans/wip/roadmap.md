@@ -2816,6 +2816,95 @@ along with the forward-sequence rewrite.
   contingency (ADR 039 D13) as an automatic next
   topic: ADR 039 landed Plan A, so ADR 041 returns
   to ordinary candidate selection.
+- **ADR 041 — CREATE OR REPLACE TABLE.**
+  Promoted. **First SQL composition cycle after
+  the 037/038/039/040 substrate-and-operator-
+  surface run.** Four council iterations producing
+  the most-stress-tested D-set in council history:
+  iter-0 split 1-vs-2 (Claude → CREATE OR REPLACE;
+  Codex + Gemini → Toron Compute Daemon Substrate);
+  iter-1 **triple-swap** (Codex and Gemini both
+  yielded to Claude's candidate; Claude yielded to
+  theirs); iter-2 **Claude double-reversal** back
+  to CREATE OR REPLACE after weighing Codex iter-1's
+  counter ("daemon without SQL service is
+  operationally inert"); iter-3 final convergence
+  with Gemini yielding on CTAS `IF NOT EXISTS`
+  defer. Final promoted D-set: **10 decisions**.
+  Every load-bearing decision was argued at least
+  once from the opposing side before being adopted
+  — the **first cycle in council history with a
+  complete topic-swap-and-back pattern**.
+  **D1/D2 critical decisions:** lift the two
+  `unsupported CREATE TABLE clause: OR REPLACE`
+  rejects at `sql_planner.rs:671-672` (schema-only)
+  and `:904-905` (CTAS). Pure SQL composition over
+  the ADR 029/033/034/036/037/038/039 stack with
+  no new substrate.
+  **D3 critical decision (user-philosophy-driven
+  defer):** CTAS `IF NOT EXISTS` reject at
+  `sql_planner.rs:897` stays. Different idempotency
+  contract (skip-source-on-existence vs. destructive-
+  replacement); bundling violates the narrow-single-
+  decision-contract Prioritization discipline.
+  Resolved 3-of-3 after iter-3.
+  **D4 critical decision:** `OR REPLACE` and
+  `IF NOT EXISTS` are mutually exclusive; stable
+  diagnostic `CREATE TABLE cannot combine OR
+  REPLACE and IF NOT EXISTS` emitted before either
+  individual modifier branch.
+  **D5 critical decision:** replacement is fresh-
+  identity creation. New `TableObjectId`, schema
+  generation, and physical descriptor fingerprint.
+  Preserves ADR 029/033/038/039 identity invariants.
+  **D6 critical decision:** replacement is non-
+  atomic. Failure window between DROP and CREATE
+  documented and accepted for V1; operator retry
+  against current state is the recovery path, not
+  transactional snapshot replay.
+  C1b (atomic Wendelon-side replace) deferred —
+  would be "a massive substrate cycle, not a
+  composition cycle" (Gemini iter-1).
+  **D7 critical decision:** explicit `or_replace:
+  bool` flag on `LogicalPlan::CreateTable`,
+  `LogicalPlan::CreateTableAsSelect`, and their
+  `ExecutionPlan` counterparts. **No
+  `LogicalPlan::Sequence` IR.** Anti-pattern guard
+  call: introducing a transaction-shaped sequencer
+  for a one-clause ADR is exactly the scope creep
+  the Prioritization philosophy warns against.
+  **D8 critical decision:** reuse the ADR 039 D14
+  single-call Wendelon admin boundary. Toron
+  composes existing high-level operations
+  (`StorageAdmin::drop_table_storage` →
+  `Catalog::drop_table` → `Catalog::create_table`).
+  **No `TableSchemaReplaceRequest`**; no Toron-side
+  stage orchestration; no replacement proof carrier.
+  Cross-ring single-call invariant preserved at the
+  composition layer.
+  **D9 critical decision:** existing
+  `DependentIndexesPresent` rejection (ADR 039 D12)
+  propagates through the replace path unchanged.
+  Cascading secondary-index drop stays deferred.
+  **D10 critical decision:** ADR 040 Toron CLI
+  reservations (`start`, `sql`, `inspect`) remain
+  byte-identical. Toron daemon substrate carried
+  forward as the ADR 042 lead candidate.
+  **Ten architecture guards** including the
+  `adr041_ctas_if_not_exists_remains_rejected`
+  (pins D3 defer at source level) and
+  `adr041_replace_uses_fresh_table_object_id`
+  (pins D5). **Eleven integration fixtures**
+  including
+  `ctas_or_replace_source_failure_preserves_existing_table`
+  (the runtime witness for D2's source-first
+  ordering) and
+  `create_or_replace_table_produces_fresh_object_id`
+  (the runtime witness for D5). **Single-plan
+  posture** — no Plan A / Plan B framing; pure
+  composition has no half-state worth shipping.
+  The ten-phase migration is materialized in
+  `plans/impl/041_create_or_replace_table.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -2883,7 +2972,135 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 040 promoted; ADR 041 candidates
+### ADR 041 promoted; ADR 042 candidates
+
+ADR 041 selected and promoted **CREATE OR REPLACE
+TABLE** — Toron's **first SQL composition cycle
+after the 037/038/039/040 substrate-and-operator-
+surface run**. Four council iterations producing
+the most-stress-tested D-set in council history:
+iter-0 split 1-vs-2 (Claude → CREATE OR REPLACE;
+Codex + Gemini → Toron Compute Daemon Substrate);
+iter-1 **triple-swap** (Codex and Gemini both
+yielded to Claude's candidate; Claude yielded to
+theirs); iter-2 **Claude double-reversal** back
+to CREATE OR REPLACE after weighing Codex iter-1's
+counter ("daemon without SQL service is
+operationally inert"); iter-3 final convergence
+with Gemini yielding on CTAS `IF NOT EXISTS`
+defer. Final promoted D-set: **10 decisions**.
+
+**First cycle in council history with a complete
+topic-swap-and-back pattern.** ADR 039 iter-3 saw
+a user-directed architectural redirection
+(Toron-orchestrated → Wendelon-orchestrated
+choreography). ADR 040 iter-2 saw a user-directed
+scope-paring (top-level clap parser → strict
+two-noun delegation). ADR 041 iter-1 saw a
+council-internal **collective yield** without
+user intervention: all three members independently
+yielded to a peer's iter-0 topic, producing a
+triple-swap that resolved through Claude's iter-2
+double-reversal. Every load-bearing decision was
+argued at least once from the opposing side
+before being adopted; the deferred topics carry
+forward as lead candidates for ADR 042+. This is
+the **discipline-by-restraint** signal working as
+intended.
+
+**SQL composition cycle pacing reaffirmed.** After
+three back-to-back cross-ring substrate cycles
+(037/038/039) and one operator-surface cycle (040),
+ADR 041 lifts two `unsupported` planner rejects
+without introducing new substrate, new Wendelon
+protocol, or new IR variants. The two reject-lifts
+(`sql_planner.rs:671-672` schema-only;
+`:904-905` CTAS) are the ADR 015 cycle-shape
+pattern at its purest — concrete file:line evidence,
+narrow single-contract scope, composition over
+seven prior ADRs. Codex iter-1's `or_replace: bool`
+flag approach (rather than `LogicalPlan::Sequence`
+IR) preserved the anti-transaction-substrate
+discipline.
+
+**Architectural invariants preserved through this
+cycle:**
+- ADR 029/033 fresh-identity-on-create
+  (`TableObjectId` + schema generation + physical
+  descriptor fingerprint).
+- ADR 038/039 single-call-site for
+  `catalog.drop_table` (preserved by the shared
+  `drop_existing_table_with_storage_admin` helper
+  used by both standalone DROP and replacement).
+- ADR 039 D14 cross-ring single-call invariant
+  (no Toron-side Wendelon-stage orchestration; no
+  `TableSchemaReplaceRequest` admin RPC).
+- ADR 040 reservation-pattern stability
+  (`nilket toron start/sql/inspect` diagnostic text
+  byte-identical pre/post-ADR 041).
+
+The ten-phase migration is materialized in
+`plans/impl/041_create_or_replace_table.md`.
+
+**ADR 042 lead candidate:**
+
+- **ADR 042 — Toron Compute Daemon Substrate.**
+  V1-blocker per the V1 target text ("multi-
+  process coordinator/worker mechanics surviving a
+  worker SIGKILL with byte-identical normalized
+  output"). Lifts the `nilket toron start` ADR 040
+  reservation. Scope decisions required at iter-0
+  drafting: descriptor discovery posture
+  (lazy-empty registry vs. explicit bootstrap file
+  path), observability listener inclusion (parity
+  with Wendelon vs. tracing-only), public SQL
+  listener inclusion (in-scope vs. defer to ADR
+  043). Codex iter-0 D-set + Gemini iter-0 framing
+  + Claude iter-1 A1-A6 refinement set seed the
+  next cycle's iter-0 alignment work.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **CTAS `IF NOT EXISTS`** (`sql_planner.rs:897`
+  reject preserved by ADR 041 D3; tiny composition
+  cycle; could ride along with the daemon ADR or
+  be its own narrow cycle).
+- **`UPDATE WHERE`** — composition over ADR 035
+  row-identity substrate + new partial-write
+  contract. Two-cycle minimum: partial-write
+  substrate cycle + SQL UPDATE composition.
+- **`INSERT ... RETURNING` / `CTAS ... RETURNING`
+  / `DELETE ... RETURNING`** — DML result-shape
+  extension; modest user value until DEFAULT or
+  GENERATED columns or sequences exist.
+- **Subqueries in DELETE WHERE clause** (e.g.
+  `DELETE FROM t WHERE id IN (SELECT ...)`).
+  Future correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern: Toron submits one
+  high-level request; Wendelon owns internal
+  choreography.
+- **`nilket toron sql` real wiring.** Composition
+  over ADR 040's reservation pattern + ADR 042
+  daemon substrate; needs the real Toron SQL
+  client surface (currently in-process only; this
+  ADR would expose a network client). Operator-
+  surface + composition hybrid.
+- **Cascading secondary-index DROP substrate** —
+  ADR 039 D12 follow-up; weak operator pressure
+  until SQL `CREATE INDEX` exists.
+- **Atomic Wendelon-side replacement protocol** —
+  C1b from ADR 041 iter-0; only if later
+  requirements demand stronger semantics than ADR
+  041's documented non-atomic composition.
+
+**Substrate candidates carried forward:** (identical
+to ADR 040's carry-forward list — re-listed below
+unchanged because ADR 041 was pure composition,
+not substrate, and touched none of these seams)
+
+### ADR 040 promoted; ADR 041 candidates (HISTORICAL)
 
 ADR 040 selected and promoted **Unified Nilket CLI
 Entrypoint** — Toron's **first operator-surface
