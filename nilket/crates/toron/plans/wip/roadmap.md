@@ -3521,6 +3521,141 @@ along with the forward-sequence rewrite.
   source unmodified).
   The ten-phase migration is materialized in
   `plans/impl/045_toron_daemon_observability_listeners.md`.
+- **ADR 046 — Nilket Toron Inspect Real Wiring.**
+  Promoted. **Third consecutive ADR 040
+  reservation lift** (after ADR 042 lifted
+  `start` and ADR 043 lifted `sql`); **first
+  reservation lift with zero daemon-side
+  changes**. Three council iterations on a
+  pure-composition-class topic: iter-0 topic-
+  shape survey (Shape A `/ready` client lift
+  selected over Shapes B new `/inspect`
+  endpoint, C in-process config printer, D defer
+  ADR 046, E bundled endpoint + CLI); iter-1
+  three sharpenings — D7 connectivity error
+  class enumerated with stable `failed to
+  <action>:` diagnostic prefix, D9 hand-rolled
+  HTTP/1.1 client committed (mirrors ADR 045
+  D4 server-side posture), D4 four-TLS-flags-
+  together requirement pinned; iter-2 three
+  preemptive sharpenings — D7 response status
+  code mapping pinned (200/503 expected, any
+  other → exit 2), D9 `Host:` header pinned to
+  endpoint host:port per RFC 7230 §5.4, D6
+  stdout/stderr separation pinned, plus D10
+  explicit non-refactor of ADR 043 TLS
+  construction; iter-3 connect-timeout symmetry
+  sharpening — D7 wraps `TcpStream::connect`
+  in 5-second `tokio::time::timeout` symmetric
+  with ADR 045 D4 `READ_REQUEST_TIMEOUT`. Final
+  promoted D-set: **11 decisions, 12
+  architecture guards + 1 convention guard, 10
+  required integration fixtures + 2 V1-evidence
+  optional fixtures**.
+  **Shape A selected (CLI `/ready` client
+  lift).** Shape B (new `/inspect` daemon
+  endpoint) deferred — mixes operator-surface
+  with substrate; richer detail re-litigates
+  ADR 045 D6 low-cardinality design; Shape C
+  (in-process config printer) rejected as
+  operationally useless; Shape D (defer ADR
+  046) rejected — leaves ADR 040 reservation
+  pattern partially discharged; Shape E
+  (bundled endpoint + CLI) rejected on
+  cycle-shape discipline.
+  **D1 critical decision:** lift `nilket toron
+  inspect`. After ADR 046, all three ADR 040
+  reservations are lifted; the reservation
+  pattern discharges cleanly.
+  **D2 critical decision:** the CLI is a
+  client, not an in-process introspection tool.
+  Mirrors ADR 043 D2 (root-runtime-free
+  preserved; CLI dials daemon, never
+  constructs daemon machinery).
+  **D5 critical decision:** reuses ADR 045's
+  `monitor-` SAN prefix; **no new
+  `inspect-` prefix.** `admit_san` admission
+  set remains `<prefix>` ∈ {`toron`, `client`,
+  `monitor`}. Inspect is read-only observation,
+  same role as Prometheus scrape; operators
+  provision one `monitor-` cert per principal.
+  **D6 critical decision:** line-per-field
+  human text output to stdout by default;
+  `--json` flag passes through daemon's JSON
+  body byte-identical to stdout. Diagnostics
+  on stderr only on error paths (exit 2);
+  no stderr noise on degraded path (exit 1).
+  Field order pinned byte-identical to ADR
+  045 D6 `ReadinessSnapshot` declaration.
+  **D7 critical decision:** three exit code
+  branches distinguishing ready (0) /
+  degraded (1) / usage-config-connectivity-
+  protocol failure (2). Closed enum of expected
+  HTTP status codes (200/503); any other
+  status routes to exit 2 with pinned
+  diagnostic `toron inspect: failed to read
+  /ready response: unexpected HTTP status
+  <code>`. Symmetric 5-second timeouts on
+  both TCP connect and response-read phases
+  (total wall-clock upper bound ~10s for
+  failed dials).
+  **D8 critical decision:** zero new daemon-
+  side wire surface. ADR 046 ships only CLI-
+  side changes. No new HTTP endpoint, no
+  changes to `/ready`/`/health`/`/metrics`,
+  no SqlMessage / SqlError changes, no new
+  config sections.
+  **D9 critical decision:** hand-rolled
+  HTTP/1.1 client extending ADR 045's existing
+  `observability_http.rs` module. No http /
+  hyper / reqwest / tower / axum / ureq.
+  `Host:` header pinned
+  to endpoint host:port per RFC 7230 §5.4
+  (not TLS SNI server name) — independent of
+  mTLS server-name binding.
+  **D10 critical decision:** `crates/nilket`
+  stays runtime-free (ADR 040 D4 / ADR 042 D2 /
+  ADR 043 D2 / ADR 045 invariants carry
+  forward). ADR 043 TLS construction kept
+  **parallel** (not refactored) to preserve
+  ADR 043 stability; future refactor ADR
+  consolidates alongside Plan W-B `tls-pki`
+  extraction.
+  **D11 critical decision:** one-shot CLI; no
+  watch mode, no streaming, no periodic
+  re-poll. Mirrors ADR 043 D17.
+  **Single-plan posture.** No Plan A / Plan B
+  framing. Pure composition over ADR 045 —
+  no new substrate.
+  **Twelve architecture guards + 1 convention
+  guard** including the iter-2 sharpening
+  guard 11
+  (`adr046_inspect_handles_only_200_and_503_status_codes`)
+  pinning the closed status code enum, and
+  the iter-3 sharpening guard 12
+  (`adr046_inspect_has_tcp_connect_timeout`)
+  pinning the symmetric phase-timeout contract.
+  **Ten required integration fixtures + 2
+  optional V1-evidence** including the iter-3
+  sharpening witness
+  `nilket_toron_inspect_reports_connect_timeout`
+  (exercises the timeout branch through a
+  deterministic pending-connect helper or
+  test-only injectable connector, avoiding
+  host routing flakiness) and the optional drain-
+  state witness
+  `nilket_toron_inspect_reports_drain_state`
+  (full composition with ADR 045 D6 drain
+  semantics via SIGTERM).
+  **Byte-identical refactor-invariant chain
+  extends to eleven preserved cycles** (ADRs
+  035 / 036 / 037 / 038 / 039 / 041 / 042 /
+  043 / 044 / 045 / 046 all preserve the local
+  DML fixture pass count + leave
+  `toron_fixture_worker.rs` source
+  unmodified).
+  The nine-phase migration is materialized in
+  `plans/impl/046_nilket_toron_inspect_real_wiring.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -3588,7 +3723,266 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 045 promoted; ADR 046 candidates
+### ADR 046 promoted; ADR 047 candidates
+
+ADR 046 selected and promoted **Nilket Toron
+Inspect Real Wiring** — the third consecutive
+ADR 040 reservation lift (after ADR 042 lifted
+`start` and ADR 043 lifted `sql`) and the
+first reservation lift with **zero daemon-side
+changes**. Three council iterations on a pure-
+composition-class topic: iter-0 topic-shape
+survey (Shape A `/ready` client lift selected
+over Shapes B-E); iter-1 three sharpenings
+(connectivity error class enumeration, hand-
+rolled HTTP/1.1 client commit, four-TLS-flags
+requirement); iter-2 three preemptive
+sharpenings (response status code mapping,
+`Host:` header pinning, stdout/stderr
+separation) plus D10 explicit non-refactor of
+ADR 043 TLS construction; iter-3 symmetric
+connect-timeout sharpening matching ADR 045
+D4 response-read timeout. Final D-set:
+**11 decisions, 12 architecture guards + 1
+convention guard, 10 required integration
+fixtures + 2 V1-evidence optional fixtures**.
+
+**ADR 040 reservation pattern fully
+discharged.** After ADR 046, all three ADR 040
+reservations are lifted:
+
+- `nilket toron start` (ADR 042) — daemon
+  lifecycle.
+- `nilket toron sql` (ADR 043) — query
+  workload.
+- `nilket toron inspect` (ADR 046) — health
+  observation.
+
+The reservation pattern that ADR 040 introduced
+(real substrate, never inert; byte-identical
+sibling reservation diagnostics through the
+lift) has been applied to all three CLI role
+surfaces. Each cycle preserved byte-identical
+diagnostic text for the still-reserved siblings
+through its own lift. Future CLI commands can
+be added through composition ADRs without
+needing a new reservation pattern.
+
+**V1 operator-facing CLI surface complete.**
+After ADR 046:
+
+- `nilket toron start <config>` — daemon
+  lifecycle with TLS + observability
+  configuration.
+- `nilket toron sql --endpoint <addr>
+  [--server-name <name> --cert ... --key ...
+  --ca ...] "SELECT ..."` — operator-driven
+  query workload.
+- `nilket toron inspect [--endpoint <addr>]
+  --server-name <name> --cert ... --key ...
+  --ca ...` — operator-driven health
+  observation (TLS values may also come from
+  `TORON_INSPECT_*` env vars).
+
+Each backed by real substrate (ADR 042 / 043 /
+045 respectively). Each one-shot CLI. Each
+runtime-free at the `crates/nilket` boundary
+(ADR 040 D4 invariant preserved through six
+cycles). Each emitting brand-clean stable
+diagnostic text on stderr for usage errors
+and connectivity errors.
+
+**Pure composition over ADR 045.** ADR 046
+introduced no new substrate: no new SAN prefix
+(`monitor-` reused from ADR 045 D3), no new
+HTTP endpoint, no new wire frames, no new
+configuration sections. The cycle extended
+`crates/toron/src/network/observability_http.rs`
+with client-side `write_request` /
+`read_response` helpers mirroring ADR 045 D4's
+server-side `read_request` / `write_response`
+shape, and extended `crates/toron/src/cli.rs`
+with a new `inspect` arm parallel to the ADR
+043 `sql` arm. Pure composition cycle.
+
+**Symmetric phase timeout bounding (iter-3
+sharpening).** Both TCP connect phase and
+response-read phase wrap in 5-second
+`tokio::time::timeout`:
+
+- `CONNECT_TIMEOUT = Duration::from_secs(5)`
+  — prevents indefinite hang on non-routable
+  / silent-SYN-drop addresses.
+- `READ_REQUEST_TIMEOUT = Duration::from_secs(5)`
+  — reused from ADR 045 D4; prevents
+  slowloris-style server-side hold-open.
+
+Total wall-clock upper bound for failed dials:
+~10 seconds. Shell-script idiom `nilket toron
+inspect && deploy.sh` survives operator-
+provided wrong addresses without hanging.
+
+**Wendelon-divergence preserved.** ADR 045's
+SAN admission divergence from Wendelon (Toron
+uses SAN-prefix admission; Wendelon uses
+`ActorPermission`) carries forward unchanged
+through ADR 046. Toron's `admit_san` admission
+set remains `<prefix>` ∈ {`toron`, `client`,
+`monitor`}; no new `inspect-` prefix
+introduced.
+
+**Architectural invariants preserved through
+this cycle:**
+
+- ADR 040 reservation continuity: all three
+  reservations now lifted (the discipline
+  retires cleanly after the third consecutive
+  cycle).
+- ADR 040 D4 / ADR 042 D2 / ADR 043 D2 / ADR
+  045 D9 root-runtime-free
+  (`crates/nilket/Cargo.toml` untouched).
+- ADR 038 / 039 registry convergence
+  unchanged.
+- ADR 042 D12 / ADR 043 D16 / ADR 044 D8 /
+  ADR 045 D8 readiness lines **byte-
+  identical** pre/post ADR 046 (ADR 046 is
+  CLI-only; daemon-side stdout unchanged).
+- ADR 042 D13 tracing-only observability
+  extended (not replaced).
+- ADR 043 D9 / ADR 044 D4 server-stamped
+  tenant.
+- ADR 044 D6 wire-invariant (no SqlMessage /
+  SqlError changes).
+- ADR 044 D7 / ADR 045 D7 no-revocation
+  invariant.
+- ADR 044 D11 one cert per daemon.
+- ADR 045 D3 `admit_san` admission set
+  unchanged (still 3 prefixes; no new prefix
+  added by ADR 046).
+- ADR 045 D6 `ReadinessSnapshot` low-
+  cardinality shape preserved (ADR 046
+  consumes it, doesn't extend it; future ADRs
+  may extend forward-compatibly via
+  `serde(default)` on new fields).
+- ADR 039 D5 / ADR 042 / ADR 043 / ADR 044 /
+  ADR 045 no-V1-suffix convention (carries
+  forward to `InspectArgs`, `InspectError`,
+  `InspectTlsConfig`, `HttpResponse`,
+  `CONNECT_TIMEOUT`; **eleventh consecutive
+  cycle** — ADRs 039 / 041 / 042 / 043 / 044 /
+  045 / 046).
+- ADR 035 – 045 byte-identical refactor-
+  invariant chain (extends to eleven preserved
+  cycles; `toron_fixture_worker.rs` source
+  unchanged).
+- Cross-ring discipline (Toron's CLI dials
+  Toron's daemon; Wendelon unaffected;
+  Wendelon admin orchestration boundary
+  preserved).
+
+The nine-phase migration is materialized in
+`plans/impl/046_nilket_toron_inspect_real_wiring.md`.
+
+**ADR 047 candidates (no single lead candidate
+emerged; selection by evidence pressure):**
+
+After ADR 046, the ADR 040 reservation pattern
+is fully discharged and the V1 operator-facing
+CLI surface is complete. ADR 047 selects among
+the substrate / surface-widening / refactor
+candidates carried forward through cycles.
+Likely candidates in rough priority order:
+
+- **Extract shared `tls-pki` workspace crate**
+  consumed by both Wendelon and Toron. ADR 044
+  Plan W-B follow-up; consolidates ADR 043 +
+  ADR 046 parallel TLS construction paths
+  (Toron-side) and Wendelon's `network::tls`
+  helpers (Wendelon-side). Refactor cycle;
+  no operator-visible new functionality but
+  pays down accumulated architectural debt.
+  Likely consolidates ADR 045's
+  `observability_http.rs` helpers into the
+  shared crate too.
+- **OTLP traces export** (`[observability.traces]`).
+  Wendelon has this; Toron deferred in ADR
+  045 D7. Future substrate cycle if a
+  deployment surfaces need.
+- **Audit subsystem.** Wendelon has this;
+  Toron deferred in ADR 045 D7. Future
+  substrate cycle.
+- **Multi-tenant routing.** Now genuinely
+  unblocked by ADR 044 + ADR 045's `monitor-`
+  admission pattern + ADR 046's `monitor-`
+  cert reuse. Substantial substrate cycle
+  (4+ iterations); requires per-tenant catalog
+  isolation policy design.
+- **Live cert rotation / CRL / OCSP.**
+  Retracted from ADR 044 in iter-1; future
+  ADR over ADR 044 policy substrate.
+- **`/inspect` daemon-side endpoint with
+  richer detail** (worker enumeration, query
+  introspection, descriptor browsing).
+  Deferred from ADR 046 D8; future substrate
+  cycle if operator pressure surfaces.
+- **`nilket wendelon inspect` parity.**
+  Wendelon-side composition cycle; orthogonal
+  to ADR 046.
+- **`/info` or `/version` endpoint** exposing
+  build metadata. Small composition cycle.
+- **Prometheus histogram metrics.** Surface-
+  widening ADR over ADR 045 metric set.
+- **OpenMetrics protobuf format.** Surface-
+  widening ADR over ADR 045 metric exposition.
+- **Per-tenant metric labels.** Bundles with
+  multi-tenant routing.
+- **`ActorPermission` model parallel to
+  Wendelon's.** Future ADR if per-listener
+  role admission needs to evolve beyond SAN
+  prefix.
+- **Token-based auth (bearer / JWT / OIDC).**
+  Future ADR over ADR 044 listener policy
+  substrate.
+- **CTAS `IF NOT EXISTS`** (`sql_planner.rs:897`
+  reject preserved by ADR 041 D3; tiny
+  composition cycle).
+- **`UPDATE WHERE`** — composition over ADR
+  035 row-identity substrate.
+- **`INSERT ... RETURNING` / `CTAS ...
+  RETURNING` / `DELETE ... RETURNING`** —
+  DML result-shape extension.
+- **Subqueries in DELETE WHERE clause.**
+  Future correlated-subquery substrate ADR.
+- **Future Wendelon admin substrates (ALTER
+  TABLE, RENAME TABLE).** Inherit ADR 039 D14
+  single-call pattern.
+- **Cascading secondary-index DROP substrate.**
+- **Atomic Wendelon-side replacement protocol.**
+- **Persistent SQL connections / pipelined
+  statements.**
+- **Prepared statements / parameterized
+  queries.**
+- **gRPC / Arrow Flight / Postgres wire
+  protocol frontends.**
+- **Strong cross-worker in-flight cancellation
+  semantics.**
+- **Distributed tracing context propagation
+  across worker task dispatch.**
+- **HTTP/2 / HTTP/3 / pipelining / keep-alive**
+  for observability listeners.
+- **`--watch` / streaming mode** for
+  `nilket toron inspect`.
+- **Cluster-wide aggregate inspect** across
+  multiple daemons.
+- **Sub-subcommands** (`nilket toron inspect
+  workers` etc.).
+
+**Substrate candidates carried forward:**
+(identical to ADR 045's carry-forward list —
+re-listed in the ADR 045 historical section
+below)
+
+### ADR 045 promoted; ADR 046 candidates (HISTORICAL)
 
 ADR 045 selected and promoted **Toron Daemon
 Observability Listeners** — the first pure-
