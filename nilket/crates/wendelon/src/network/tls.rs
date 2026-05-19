@@ -41,21 +41,20 @@
 use crate::consensus::raft_storage::RevocationSnapshot;
 use crate::schema::{NodeId, TenantId};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime, pem::PemObject};
-use rustls::server::WebPkiClientVerifier;
+use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
+pub use tls_pki::DEFAULT_CLUSTER_DOMAIN;
 
 /// Single ALPN token advertised on every HRFT QUIC connection.
 /// Short, versionless; the framing header already carries a protocol
 /// version if we need to bump the wire format without reshuffling
 /// ALPN.
 pub const HRFT_ALPN: &[u8] = b"wendelon-hrft";
-pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 pub const ACTOR_CLAIMS_OID_DOTTED: &str = "1.3.6.1.4.1.55555.1.1";
 
 const SUBJECT_ALT_NAME_OID: &[u8] = &[0x55, 0x1D, 0x11];
@@ -68,7 +67,6 @@ const ACTOR_CLAIMS_SCOPES_FIELD: &str = "scopes";
 const ACTOR_CLAIMS_TENANT_ID_FIELD: &str = "tenant_id";
 const ACTOR_CLAIMS_KEY_ID_FIELD: &str = "key_id";
 const DNS_NAME_TAG: u8 = 0x82;
-static INSTALL_RUSTLS_PROVIDER: Once = Once::new();
 
 // ============================================================
 //  ACTOR IDENTITY
@@ -181,8 +179,10 @@ impl ActorTrustRoots {
 		data_ca_path: impl AsRef<Path>,
 		ops_ca_path: impl AsRef<Path>,
 	) -> std::io::Result<Self> {
-		let data_roots = Arc::new(load_ca_roots(data_ca_path.as_ref())?);
-		let ops_roots = Arc::new(load_ca_roots(ops_ca_path.as_ref())?);
+		let data_roots =
+			Arc::new(tls_pki::load_ca_roots(data_ca_path.as_ref()).map_err(pki_error_to_io)?);
+		let ops_roots =
+			Arc::new(tls_pki::load_ca_roots(ops_ca_path.as_ref()).map_err(pki_error_to_io)?);
 		Ok(Self {
 			data_roots,
 			ops_roots,
@@ -477,62 +477,40 @@ pub fn authorize_actor(actor: &ActorIdentity, permission: ActorPermission) -> st
 	))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedTransportPeer {
-	pub node_id: NodeId,
-	pub actor_identity: ActorIdentity,
+fn pki_error_to_io(error: tls_pki::PkiError) -> std::io::Error {
+	Error::new(ErrorKind::InvalidData, error)
 }
 
-// ============================================================
-//  MATERIAL
-// ============================================================
-
-/// Owned in-memory copy of the material needed to build mTLS
-/// configs for this node: its own leaf + chain, its private key,
-/// and the trusted root pool used to verify the peer.
-///
-/// Callers typically load this once at boot and pass references
-/// into both [`server_config`] and [`client_config`]; those
-/// builders copy the chain and key out via `PrivateKeyDer::clone_key`.
-/// `TlsMaterial` itself is not `Clone` because `PrivateKeyDer` is
-/// intentionally move-only — wrap it in an `Arc` if you need shared
-/// ownership.
-pub struct TlsMaterial {
-	/// Leaf-first chain up to (but not including) the root.
-	pub cert_chain: Vec<CertificateDer<'static>>,
-	/// PKCS#8 / RSA / SEC1 private key matching the leaf cert.
-	pub key: PrivateKeyDer<'static>,
-	/// Trust anchors used to verify the remote peer (both when we
-	/// are the client and when we are the server).
-	pub ca_roots: Arc<RootCertStore>,
-}
+pub struct TlsMaterial(tls_pki::TlsMaterial);
 
 impl TlsMaterial {
-	/// Load cert chain, private key, and CA bundle from PEM files
-	/// on disk. Convenience for the happy path where an operator
-	/// drops three PEMs into `/etc/wendelon/certs/`; programmatic
-	/// setups (tests, KMS-fetched keys) should construct
-	/// `TlsMaterial` by hand.
 	pub fn load(
 		cert_path: impl AsRef<Path>,
 		key_path: impl AsRef<Path>,
 		ca_path: impl AsRef<Path>,
 	) -> std::io::Result<Self> {
-		let cert_chain = load_cert_chain(cert_path.as_ref())?;
-		if cert_chain.is_empty() {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!("no certificates found in {}", cert_path.as_ref().display()),
-			));
-		}
-		let key = load_private_key(key_path.as_ref())?;
-		let ca_roots = load_ca_roots(ca_path.as_ref())?;
-		Ok(Self {
-			cert_chain,
-			key,
-			ca_roots: Arc::new(ca_roots),
-		})
+		tls_pki::TlsMaterial::load(cert_path.as_ref(), key_path.as_ref(), ca_path.as_ref())
+			.map(Self)
+			.map_err(pki_error_to_io)
 	}
+
+	fn as_pki(&self) -> &tls_pki::TlsMaterial {
+		&self.0
+	}
+}
+
+impl std::ops::Deref for TlsMaterial {
+	type Target = tls_pki::TlsMaterial;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTransportPeer {
+	pub node_id: NodeId,
+	pub actor_identity: ActorIdentity,
 }
 
 // ============================================================
@@ -555,17 +533,10 @@ pub fn rustls_server_config_with_peer_roots(
 	peer_roots: Arc<RootCertStore>,
 	alpn_protocols: Vec<Vec<u8>>,
 ) -> std::io::Result<ServerConfig> {
-	install_rustls_provider();
-	let verifier = WebPkiClientVerifier::builder(peer_roots)
-		.build()
-		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client verifier: {e}")))?;
-
-	let mut rustls_cfg = ServerConfig::builder()
-		.with_client_cert_verifier(verifier)
-		.with_single_cert(material.cert_chain.clone(), material.key.clone_key())
-		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("server cert/key: {e}")))?;
-	rustls_cfg.alpn_protocols = alpn_protocols;
-	Ok(rustls_cfg)
+	let verifier =
+		tls_pki::build_client_cert_chain_verifier(peer_roots).map_err(pki_error_to_io)?;
+	tls_pki::build_rustls_server_config_with_alpns(material.as_pki(), verifier, alpn_protocols)
+		.map_err(pki_error_to_io)
 }
 
 pub fn rustls_client_config(material: &TlsMaterial) -> std::io::Result<ClientConfig> {
@@ -576,19 +547,10 @@ pub fn rustls_client_config_with_alpn(
 	material: &TlsMaterial,
 	alpn_protocols: Vec<Vec<u8>>,
 ) -> std::io::Result<ClientConfig> {
-	install_rustls_provider();
-	let mut rustls_cfg = ClientConfig::builder()
-		.with_root_certificates((*material.ca_roots).clone())
-		.with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
-		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client cert/key: {e}")))?;
-	rustls_cfg.alpn_protocols = alpn_protocols;
-	Ok(rustls_cfg)
-}
-
-fn install_rustls_provider() {
-	INSTALL_RUSTLS_PROVIDER.call_once(|| {
-		let _ = rustls::crypto::ring::default_provider().install_default();
-	});
+	let verifier = tls_pki::build_server_cert_chain_verifier(material.ca_roots.clone())
+		.map_err(pki_error_to_io)?;
+	tls_pki::build_rustls_client_config_with_alpns(material.as_pki(), verifier, alpn_protocols)
+		.map_err(pki_error_to_io)
 }
 
 /// Build a `quinn::ServerConfig` that:
@@ -625,7 +587,7 @@ pub fn client_config(material: &TlsMaterial) -> std::io::Result<quinn::ClientCon
 /// The first-wave identity contract is rigid:
 /// `node-<id>.<cluster_domain>`.
 pub fn canonical_node_dns_name(node_id: u32, cluster_domain: &str) -> String {
-	format!("node-{node_id}.{cluster_domain}")
+	tls_pki::canonical_dns_name("node", &node_id.to_string(), cluster_domain)
 }
 
 /// Convenience for the default first-wave cluster domain.
@@ -907,66 +869,6 @@ pub fn verified_peer_node_id_from_chain(
 	})
 }
 
-fn load_cert_chain(path: &Path) -> std::io::Result<Vec<CertificateDer<'static>>> {
-	let certs = CertificateDer::pem_file_iter(path)
-		.map_err(|e| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("reading {}: {e}", path.display()),
-			)
-		})?
-		.collect::<Result<Vec<_>, _>>()
-		.map_err(|e| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("reading {}: {e}", path.display()),
-			)
-		})?;
-	Ok(certs)
-}
-
-fn load_private_key(path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
-	PrivateKeyDer::from_pem_file(path).map_err(|e| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("reading {}: {e}", path.display()),
-		)
-	})
-}
-
-fn load_ca_roots(path: &Path) -> std::io::Result<RootCertStore> {
-	let certs = CertificateDer::pem_file_iter(path)
-		.map_err(|e| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("reading {}: {e}", path.display()),
-			)
-		})?
-		.collect::<Result<Vec<_>, _>>()
-		.map_err(|e| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("reading {}: {e}", path.display()),
-			)
-		})?;
-	let mut roots = RootCertStore::empty();
-	for cert in certs {
-		roots.add(cert).map_err(|e| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("adding CA cert from {}: {e}", path.display()),
-			)
-		})?;
-	}
-	if roots.is_empty() {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("no CA certificates found in {}", path.display()),
-		));
-	}
-	Ok(roots)
-}
-
 fn detect_actor_trust_domain(
 	cert_chain: &[CertificateDer<'_>],
 	trust_roots: &ActorTrustRoots,
@@ -991,10 +893,7 @@ fn verify_chain_against_roots(
 	cert_chain: &[CertificateDer<'_>],
 	roots: Arc<RootCertStore>,
 ) -> std::io::Result<bool> {
-	install_rustls_provider();
-	let verifier = WebPkiClientVerifier::builder(roots)
-		.build()
-		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client verifier: {e}")))?;
+	let verifier = tls_pki::build_client_cert_chain_verifier(roots).map_err(pki_error_to_io)?;
 	let Some((end_entity, intermediates)) = cert_chain.split_first() else {
 		return Err(Error::new(
 			ErrorKind::InvalidData,

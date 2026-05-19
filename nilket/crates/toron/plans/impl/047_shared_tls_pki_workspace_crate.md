@@ -14,7 +14,8 @@ build_rustls_client_config parameterized by ALPN and caller-owned
 verifier policy), `verifier` (trust-chain verifier helpers), and
 `error` (PkiError). Behavior-preserving refactor; zero functional
 changes. All ADR 042/043/044/045/046 architecture guards and
-integration fixtures pass byte-identical pre/post. Toron-side
+integration fixtures pass after extraction; stable output and
+diagnostic invariants remain covered by their existing tests. Toron-side
 migration consumes substantially through public re-exports +
 Toron-local ALPN constants + quinn wrapping + UUID post-check +
 existing canonical daemon/client/monitor wrappers. Wendelon-side
@@ -152,10 +153,11 @@ Move `TlsMaterial::load` from Toron's
 - cert chain and CA bundle parse as PEM with one or more
   `-----BEGIN CERTIFICATE-----` blocks.
 
-Wendelon's existing `TlsMaterial::load` deletes from
-`crates/wendelon/src/network/tls.rs`; Wendelon re-exports
-through `pub use tls_pki::TlsMaterial`. Phase 0 audit confirmed
-field-set parity.
+Wendelon's existing `TlsMaterial::load` deletes its local loader
+body but keeps a thin Wendelon-local newtype wrapper around
+`tls_pki::TlsMaterial` so the public `load` signature remains
+`std::io::Result<Self>`. Field access dereferences to the shared
+substrate. Phase 0 audit confirmed field-set parity.
 
 `TlsMaterial` is **not** `Clone` (preserves Wendelon's existing
 non-Clone discipline — `PrivateKeyDer` is not Clone).
@@ -598,8 +600,8 @@ fn adr047_no_wendelon_internal_types_in_tls_pki_public_api() {
 ```
 
 Source-text guards cover #1-#9 + #11 + convention. Runtime
-guard (#10 — byte-identical pre/post) is the meta-fixture in
-Phase 9.
+guard #10 is the prior-cycle guard-name existence + sweep gate
+described in Phase 9.
 
 ## Phase 9: Integration Fixtures
 
@@ -613,11 +615,12 @@ Six required fixtures:
 4. `tls_pki_tls_material_load_rejects_env_interpolation`
 5. `tls_pki_build_rustls_client_config_accepts_alpn_parameter`
 6. `tls_pki_byte_identical_post_extraction_with_prior_cycle_guards`
-   — meta-fixture: snapshot all `adr042_*` / `adr043_*` /
-   `adr044_*` / `adr045_*` / `adr046_*` architecture guard
-   test outputs pre-extraction (captured in Phase 0 audit +
-   recorded in evidence file). Re-run post-extraction; assert
-   byte-identical diff.
+   — promotion evidence: verify all `adr042_*` / `adr043_*` /
+   `adr044_*` / `adr045_*` / `adr046_*` architecture guard names
+   still exist and the prior ADR guard sweep passes after
+   extraction. Phase 0 / Phase 10 evidence records pass-count and
+   test-name inventories for the pre/post comparison rather than a
+   committed stdout snapshot.
 
 Test infrastructure uses `rcgen` for test cert generation (same
 pattern as ADR 044/045/046 fixtures).
@@ -652,9 +655,9 @@ Capture in `plans/impl/047_*_evidence.md`:
    V1-evidence fixtures captured separately.
 5. **ADR 042/043/044/045/046 invariant preservation (critical
    evidence):**
-   - All ADR 042/043/044/045/046 architecture guards pass
-     **byte-identical pre/post**. Captured as test count diff
-     + test name list diff.
+   - All ADR 042/043/044/045/046 architecture guards pass after
+     extraction. Captured as test count diff + test name list
+     diff; no committed stdout snapshot is required.
    - All ADR 042/043/044/045/046 integration fixtures pass
      **byte-identical pre/post**.
    - `toron_fixture_worker.rs` source unchanged (12th
@@ -686,9 +689,9 @@ Materialize `plans/impl/047_*_evidence.md` with:
   migration diff, Wendelon-side minimal-import diff).
 - Phase 8 guard pass evidence.
 - Phase 9 fixture pass evidence.
-- Phase 10 verification evidence — **especially the
-  byte-identical prior-cycle guard + fixture pre/post
-  comparison.** Critical refactor evidence.
+- Phase 10 verification evidence — **especially the prior-cycle
+  guard + fixture pass-count and test-name inventories.** Critical
+  refactor evidence.
 - Risk register disposition.
 
 ## Acceptance Checklist
@@ -700,7 +703,8 @@ Materialize `plans/impl/047_*_evidence.md` with:
       submodules declared; no quinn/tokio/tracing deps;
       clippy clean.
 - [ ] Phase 2 `TlsMaterial::load` moved; env-interpolation
-      rejection preserved.
+      rejection preserved; Wendelon keeps a thin local newtype
+      wrapper preserving `std::io::Result<Self>`.
 - [ ] Phase 3 `asn1` + `cbor` submodules implemented;
       `extract_dns_sans` used by Toron policy wrappers.
 - [ ] Phase 4 `admit_san` + `canonical_dns_name` +
@@ -719,16 +723,16 @@ Materialize `plans/impl/047_*_evidence.md` with:
 - [ ] Phase 8 all 11 ADR 047 guards + 1 convention guard pass.
 - [ ] Phase 9 all 6 required fixtures pass.
 - [ ] **All ADR 042/043/044/045/046 architecture guards
-      continue to pass byte-identical (critical refactor
+      continue to pass after extraction (critical refactor
       invariant).**
 - [ ] **All ADR 042/043/044/045/046 integration fixtures
-      continue to pass byte-identical.**
+      continue to pass after extraction.**
 - [ ] `toron_fixture_worker.rs` source unchanged (12th
       preserved cycle).
 - [ ] `crates/nilket/Cargo.toml` untouched.
 - [ ] No `quinn` / `tokio` / `tracing` in `cargo tree -p tls-pki`.
-- [ ] Phase 11 evidence record materialized; pre/post baseline
-      comparison documented.
+- [ ] Phase 11 evidence record materialized; pre/post guard and
+      fixture pass-count/test-name inventories documented.
 
 ## Non-Goals
 

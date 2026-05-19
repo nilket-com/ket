@@ -31,6 +31,7 @@ rcgen = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.10"
 tokio-rustls = "0.26"
+tls-pki = { path = "../tls-pki" }
 wendelon = { path = "../wendelon" }
 wendelon-client = { path = "../wendelon/crates/wendelon-client" }
 

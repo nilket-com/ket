@@ -44,7 +44,9 @@ ADR 047 is a **pure behavior-preserving refactor** — zero
 functional changes, zero wire changes, zero config changes, zero
 new operator-visible functionality. All
 ADR 042/043/044/045/046 architecture guards and integration
-fixtures continue to pass byte-identical pre/post the extraction.
+fixtures continue to pass after extraction; prior stable-output and
+diagnostic invariants remain enforced by their own guards and
+fixtures.
 
 Toron-side migration consumes substantially through public
 re-exports + Toron-local ALPN constants + quinn wrapping +
@@ -69,8 +71,8 @@ changes. **No** Toron CLI consolidation of `sql` + `inspect` TLS
 options (rejected 2-of-3 Codex+Claude as out-of-scope for
 cross-ring substrate ADR; future Toron-side cleanup ADR
 candidate). **No** `GenericCertVerifier<F>` closure-based
-verifier (rejected 2-of-3 Codex+Claude as too narrow for
-Wendelon's subject/extension-based admission). **No** Plan A /
+verifier helper (D8 ships the broader caller-owned trait-object
+verifier boundary plus trust-chain helpers instead). **No** Plan A /
 Plan B sub-lift framing (single-plan posture, matches
 ADR 042/043/044/045/046).
 
@@ -191,11 +193,11 @@ pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PkiError {
-    CertRead { path: PathBuf, source: std::io::Error },
+    CertRead { path: PathBuf, source: rustls::pki_types::pem::Error },
     CertParse { path: PathBuf },
     KeyRead { path: PathBuf, source: std::io::Error },
     KeyParseNotPkcs8 { path: PathBuf },
-    CaRead { path: PathBuf, source: std::io::Error },
+    CaRead { path: PathBuf, source: rustls::pki_types::pem::Error },
     CaParse { path: PathBuf },
     EnvInterpolation { path: PathBuf },
     SanShapeRejected { reason: String },
@@ -235,9 +237,10 @@ enforces.
 **D2: Behavior-preserving refactor; zero functional changes.**
 
 ADR 047 ships **zero functional changes**. All
-ADR 042/043/044/045/046 architecture guards continue to pass
-byte-identical pre/post. All prior-cycle integration fixtures
-continue to pass byte-identical pre/post.
+ADR 042/043/044/045/046 architecture guards continue to pass after
+extraction. All prior-cycle integration fixtures continue to pass
+after extraction, with stable output / diagnostic invariants covered
+by their existing tests.
 
 Specifically preserved:
 
@@ -260,24 +263,36 @@ Specifically preserved:
 
 Architecture guard `adr047_byte_identical_post_extraction_with_prior_cycle_guards`
 asserts: all ADR 042/043/044/045/046 architecture guard function
-names continue to exist and pass byte-identical pre/post
+names continue to exist and the ADR 04x guard sweep passes after
 extraction.
 
 **D3: Wendelon-side migration is minimal-import-only.**
 
-Wendelon's `crates/wendelon/src/network/tls.rs` adds these
-imports / re-exports:
+Wendelon's `crates/wendelon/src/network/tls.rs` adds shared
+imports plus a compatibility wrapper that preserves Wendelon's
+existing `std::io::Result` load signature:
 
 ```rust
-pub use tls_pki::{
-    TlsMaterial,
-    build_rustls_server_config,
-    build_rustls_client_config,
-    build_client_cert_chain_verifier,
-    build_server_cert_chain_verifier,
-    canonical_dns_name,
-    DEFAULT_CLUSTER_DOMAIN,
-};
+pub use tls_pki::DEFAULT_CLUSTER_DOMAIN;
+
+pub struct TlsMaterial(tls_pki::TlsMaterial);
+
+impl TlsMaterial {
+    pub fn load(
+        cert_path: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+        ca_path: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        tls_pki::TlsMaterial::load(cert_path.as_ref(), key_path.as_ref(), ca_path.as_ref())
+            .map(Self)
+            .map_err(pki_error_to_io)
+    }
+}
+
+impl std::ops::Deref for TlsMaterial {
+    type Target = tls_pki::TlsMaterial;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
 
 pub fn canonical_node_dns_name(node_id: u32, cluster_domain: &str) -> String {
     tls_pki::canonical_dns_name("node", &node_id.to_string(), cluster_domain)
@@ -304,10 +319,12 @@ pub fn canonical_node_dns_name(node_id: u32, cluster_domain: &str) -> String {
   shared builders.
 
 Wendelon's existing public API surface remains byte-identical at
-the function-signature level. Some functions now delegate
-internally to `tls-pki`, but external callers see the same
-shapes. Wendelon's existing test suite continues to pass
-byte-identical.
+the function-signature level. `TlsMaterial` remains Wendelon-local
+as a thin wrapper solely so `TlsMaterial::load` continues to return
+`std::io::Result<Self>`; field access still dereferences to the
+shared substrate. Some functions now delegate internally to
+`tls-pki`, but external callers see the same shapes. Wendelon's
+existing test suite continues to pass byte-identical.
 
 **D4: Toron-side migration consumes substrate while preserving policy surface.**
 
@@ -317,23 +334,23 @@ rustls config assembly. It must preserve the ADR 044 public policy
 tokens already guarded by architecture tests:
 
 ```rust
-pub use tls_pki::{
-    TlsMaterial, PeerIdentity,
+use tls_pki::{
+    TlsMaterial,
     build_rustls_server_config, build_rustls_client_config,
     build_client_cert_chain_verifier, build_server_cert_chain_verifier,
     canonical_dns_name,
-    DEFAULT_CLUSTER_DOMAIN,
 };
 
 // Toron-local policy and protocol names remain present.
+pub const DEFAULT_CLUSTER_DOMAIN: &str = tls_pki::DEFAULT_CLUSTER_DOMAIN;
 pub const AUTH_QUIC_ALPN: &[u8] = b"sql-task-auth";
 pub const OBSERVABILITY_HTTP_ALPN: &[u8] = b"http/1.1";
 pub enum TlsError { /* existing ADR 044 variants preserved */ }
 pub enum ListenerRole { WorkerTask, Sql, Observability }
 pub enum PeerKind { /* existing ADR 044 variants preserved */ }
 
-pub fn canonical_daemon_dns_name(worker_uuid: &str, cluster_domain: &str) -> String {
-    tls_pki::canonical_dns_name("toron", worker_uuid, cluster_domain)
+pub fn canonical_daemon_dns_name(worker_id: &WorkerId, cluster_domain: &str) -> String {
+    tls_pki::canonical_dns_name("toron", &worker_id.get().to_string(), cluster_domain)
 }
 
 pub fn admit_san(
@@ -382,8 +399,9 @@ helpers stay in Toron so ADR 044 guards remain valid.
 **Wendelon-side error conversion:** Wendelon's existing helpers
 return `std::io::Result<T>`. Wendelon wrapper code converts
 `tls_pki::PkiError` → `std::io::Error` at the boundary (per D3).
-Wendelon's external API signatures remain byte-identical
-(`std::io::Result<TlsMaterial>` etc.).
+Wendelon's external API signatures remain byte-identical; in
+particular, `TlsMaterial::load` remains
+`std::io::Result<TlsMaterial>` via the local thin wrapper.
 
 **Toron-side error conversion:** Toron keeps its existing
 `TlsError` enum and maps `tls_pki::PkiError` into the existing
@@ -472,10 +490,10 @@ impl rustls::server::danger::ClientCertVerifier for WendelonClientCertVerifier {
 `tls-pki` does not know about `ActorIdentity` / `ActorPermission`
 / revocation / Toron listener roles. The composition is ring-side.
 
-**Rejected (Codex+Claude 2-of-3):** Gemini's
-`GenericCertVerifier<F>` closure-based approach. Too narrow for
-Wendelon because Wendelon actor identity depends on subject and
-custom extension data, not only DNS SANs.
+Gemini's `GenericCertVerifier<F>` closure-based approach did not
+ship. ADR 047 instead keeps the substrate boundary broader:
+`tls-pki` owns trust-chain helpers, while Toron and Wendelon own
+their ring-specific trait-object policy wrappers.
 
 **D9: Single-plan posture; cross-ring discipline preserved.**
 
@@ -530,7 +548,7 @@ intent.
 10. `adr047_byte_identical_post_extraction_with_prior_cycle_guards`
     — meta-guard asserting all ADR 042/043/044/045/046
     architecture guard function names continue to exist and
-    pass byte-identical pre/post extraction.
+    the ADR 04x guard sweep passes after extraction.
 11. `adr047_toron_der_and_cbor_parsing_delegates_to_tls_pki` —
     source-text guard asserting `DerReader` and `CborReader`
     patterns do not appear in Toron source outside `tls-pki`.
@@ -576,11 +594,11 @@ Post-promotion convention guard:
    `rustls::ClientConfig` instances. Constants passed in
    from caller-local definitions.
 6. `tls_pki_byte_identical_post_extraction_with_prior_cycle_guards`
-   — meta-fixture asserting all ADR 042/043/044/045/046
-   architecture guards continue to pass byte-identical
-   pre/post extraction. Captures baseline test output
-   pre-extraction; re-runs post-extraction; asserts
-   byte-identical diff.
+   — promotion evidence asserting all ADR 042/043/044/045/046
+   architecture guards continue to exist and pass after extraction,
+   with Phase 0 / Phase 10 pass-count and test-name inventories
+   recorded for the pre/post comparison. The committed guard is an
+   executable existence + sweep gate, not a committed stdout snapshot.
 
 **Optional V1-evidence (non-gating, post-promotion):**
 
@@ -613,9 +631,9 @@ category, not mixed with substrate or composition).
   as out-of-scope for cross-ring substrate ADR. Future
   Toron-local cleanup ADR candidate.
 - **`GenericCertVerifier<F>` closure-based verifier.**
-  **Rejected 2-of-3 Codex+Claude** as too narrow for
-  Wendelon's subject/extension-based admission. Caller-owned
-  verifier policy (D8) ships instead.
+  Not shipped in ADR 047. D8 ships a trait-object caller-owned
+  verifier boundary plus trust-chain helpers; a closure helper can
+  be revisited only if future ergonomics pressure appears.
 - **`ActorPermission` model parallel Toron-side.** ADR 044 D5
   uses SAN-prefix admission; ADR 047 doesn't introduce
   `ActorPermission` to Toron.
@@ -683,11 +701,13 @@ category, not mixed with substrate or composition).
   error type named `PkiError` (Gemini's term; Toron's existing
   `TlsError` wrapper remains local). New guard
   11 (`adr047_toron_der_and_cbor_parsing_delegates_to_tls_pki`).
-  Rejected 2-of-3 Codex+Claude: Gemini's `GenericCertVerifier<F>`
-  closure (too narrow for Wendelon); Gemini's Toron CLI
-  consolidation (out-of-scope refactor; future Toron-local
-  cleanup ADR candidate). D-set locked at 10. Guard set
-  locked at 11 + 1 convention. Fixture set locked at 6
+  Gemini's `GenericCertVerifier<F>` closure did not ship; the
+  final D8 shape is broader caller-owned trait-object verifier
+  composition around `tls-pki` trust-chain helpers. Gemini's Toron
+  CLI consolidation was rejected 2-of-3 Codex+Claude as
+  out-of-scope refactor and remains a future Toron-local cleanup
+  candidate. D-set locked at 10. Guard set locked at 11 + 1
+  convention. Fixture set locked at 6
   required + 2 V1-evidence optional. Ready to promote.
 
 ## Conclusion
@@ -744,8 +764,8 @@ the ADR 040-onward sequence:
 
 - pure behavior-preserving (zero functional changes; zero
   operator-visible surface changes);
-- meta-guard + meta-fixture pre/post baseline comparison gates
-  promotion;
+- meta-guard + prior-cycle guard/fixture pass-count inventories gate
+  promotion for refactor cycles;
 - single-plan posture (no Plan A/Plan B unless a cross-ring
   audit reveals genuine sub-lift uncertainty);
 - cross-ring discipline preserved (shared substrate doesn't

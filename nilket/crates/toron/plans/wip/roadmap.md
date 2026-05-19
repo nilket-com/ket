@@ -3693,19 +3693,20 @@ along with the forward-sequence rewrite.
   sharpenings — D5 error conversion direction
   pinned, D6 `PeerIdentity` open struct
   confirmed, D8 caller-owned verifier boundary
-  pinned (ring-local policy over Gemini's
-  closure pattern);
+  pinned (trust-chain helpers plus ring-local
+  trait-object policy composition; no shared
+  SAN-shape verifier);
   iter-3 two convergence sharpenings driven by
   Codex iter-3 + Gemini iter-3 — D1 module
   scope expanded from five to seven submodules
   adding `asn1` + `cbor` per Codex+Gemini
   2-of-3 convergence (Gemini's
-  `GenericCertVerifier<F>` closure rejected
-  2-of-3 Codex+Claude as too narrow for
-  Wendelon's subject/extension-based admission;
-  Gemini's Toron CLI consolidation rejected
-  2-of-3 Codex+Claude as out-of-scope for
-  cross-ring substrate ADR), shared-crate
+  `GenericCertVerifier<F>` closure did not ship;
+  final D8 uses the broader caller-owned
+  trait-object verifier boundary; Gemini's Toron
+  CLI consolidation rejected 2-of-3 Codex+Claude
+  as out-of-scope for cross-ring substrate ADR),
+  shared-crate
   error type named `PkiError` to reflect
   expanded scope while Toron's `TlsError`
   remains local.
@@ -3751,9 +3752,10 @@ along with the forward-sequence rewrite.
   **D4 critical decision:** Wendelon-side
   migration is **minimal-import-only** —
   shared-substrate imports + one
-  `canonical_node_dns_name` wrapper + local
-  `PkiError` to `std::io::Error` mapping
-  helpers. Wendelon's
+  `canonical_node_dns_name` wrapper + a thin
+  local `TlsMaterial` wrapper preserving
+  `std::io::Result<Self>` + local `PkiError` to
+  `std::io::Error` mapping helpers. Wendelon's
   inline DER/CBOR parsing for actor claims is
   grandfathered for V1.
   **D5 critical decision:** `PkiError` (renamed
@@ -3775,8 +3777,8 @@ along with the forward-sequence rewrite.
   **D8 critical decision:** rustls config
   builders accept caller-owned verifier policy
   and `tls-pki` exposes trust-chain verifier
-  helpers; rejected `GenericCertVerifier<F>`
-  closure pattern 2-of-3 Codex+Claude.
+  helpers. Ring-specific SAN and actor policy
+  wrappers stay in Toron/Wendelon.
   **D9 critical decision:** ASN.1/DER + CBOR
   parsing primitives owned by `tls-pki`
   (iter-3 sharpening per Codex+Gemini 2-of-3).
@@ -3792,16 +3794,15 @@ along with the forward-sequence rewrite.
   (`adr047_toron_der_and_cbor_parsing_delegates_to_tls_pki`)
   and the meta-guard 10
   (`adr047_byte_identical_post_extraction_with_prior_cycle_guards`)
-  pinning the byte-identical pre/post promotion
-  gate.
+  asserting prior-cycle guard functions remain
+  present while the ADR 04x guard sweep passes
+  post-extraction.
   **Six required fixtures + 2 V1-evidence
-  optional** including the meta-fixture 6
-  (`tls_pki_byte_identical_post_extraction_with_prior_cycle_guards`)
-  that captures baseline pre-extraction test
-  output and asserts byte-identical post-
-  extraction diff (the promotion-gating
-  critical evidence). Optional V1-evidence
-  fixtures are
+  optional** including promotion evidence for
+  prior-cycle guard/fixture pass-count and
+  test-name inventory continuity; no committed
+  stdout snapshot is required. Optional
+  V1-evidence fixtures are
   `wendelon_tls_pki_imports_compose_with_actor_permission`
   and
   `wendelon_actor_claims_parse_through_tls_pki_asn1_cbor`.
@@ -3908,18 +3909,19 @@ D5 error conversion direction pinned (`tls-pki`
 owns `PkiError`; Wendelon-boundary converts to
 `std::io::Error`), D6 `PeerIdentity` open struct
 confirmed, D8 caller-owned verifier boundary
-pinned (ring-local policy over Gemini's
-closure pattern); iter-3
+pinned (trust-chain helpers plus ring-local
+trait-object policy composition; no shared
+SAN-shape verifier); iter-3
 two convergence sharpenings driven by Codex
 iter-3 + Gemini iter-3 — D1 module scope
 expanded from five to seven submodules adding
 `asn1` + `cbor` per Codex+Gemini 2-of-3
 convergence (Gemini's `GenericCertVerifier<F>`
-closure rejected 2-of-3 Codex+Claude as too
-narrow for Wendelon's subject/extension-based
-admission; Gemini's Toron CLI consolidation
-rejected 2-of-3 Codex+Claude as out-of-scope
-for cross-ring substrate ADR), shared-crate
+closure did not ship; final D8 uses the broader
+caller-owned trait-object verifier boundary;
+Gemini's Toron CLI consolidation rejected 2-of-3
+Codex+Claude as out-of-scope for cross-ring
+substrate ADR), shared-crate
 error type named `PkiError` to reflect expanded
 scope (TLS material + ASN.1/DER + CBOR
 primitives + rustls config errors) while
@@ -3934,15 +3936,12 @@ changes, zero wire changes, zero config
 changes, zero new operator-visible
 functionality. All ADR 042/043/044/045/046
 architecture guards and integration fixtures
-continue to pass byte-identical pre/post the
-extraction. Meta-guard 10
+continue to pass after extraction. Meta-guard 10
 (`adr047_byte_identical_post_extraction_with_prior_cycle_guards`)
-and meta-fixture 6
-(`tls_pki_byte_identical_post_extraction_with_prior_cycle_guards`)
-capture baseline test output pre-extraction
-and re-run post-extraction asserting
-byte-identical diff. Promotion gates on the
-byte-identical comparison.
+asserts prior-cycle guard functions remain
+present, and promotion evidence records pre/post
+pass-count and test-name inventories for prior
+guard and fixture sweeps.
 
 **Shape A selected (`tls-pki` workspace
 crate).** Shape B (Toron-local refactor)
@@ -3999,8 +3998,10 @@ values are caller-supplied parameters (`alpn:
 migration is **minimal-import-only**:
 shared-substrate imports plus one
 `canonical_node_dns_name` wrapper (carries the
-`"node"` prefix) plus local `PkiError` to
-`std::io::Error` mapping helpers. Wendelon's
+`"node"` prefix) plus a thin local
+`TlsMaterial` wrapper preserving
+`std::io::Result<Self>` plus local `PkiError`
+to `std::io::Error` mapping helpers. Wendelon's
 ring-internal machinery
 stays untouched. Wendelon's inline DER/CBOR
 parsing for actor claims is **grandfathered
@@ -4076,21 +4077,19 @@ pinning Toron-side DER/CBOR delegation to
 `tls-pki` (Wendelon-side grandfathered for
 V1), the meta-guard 10
 (`adr047_byte_identical_post_extraction_with_prior_cycle_guards`)
-asserting all prior-cycle architecture guards
-continue to pass byte-identical pre/post the
-extraction, and the convention guard
+asserting prior-cycle architecture guard
+functions remain present while the ADR 04x
+guard sweep passes after extraction, and the
+convention guard
 (`adr047_new_tls_pki_types_are_brand_clean_and_no_v1_suffix`)
 carrying forward the no-V1-suffix convention
 for the twelfth consecutive cycle.
 
 **Six required fixtures + 2 V1-evidence
-optional** including the meta-fixture 6
-(`tls_pki_byte_identical_post_extraction_with_prior_cycle_guards`)
-that captures baseline pre-extraction test
-output and asserts byte-identical post-
-extraction diff (the promotion-gating
-critical evidence), and the iter-3 sharpening
-fixture 5
+optional** including promotion evidence for
+prior-cycle guard/fixture pass-count and
+test-name inventory continuity, plus the
+iter-3 sharpening fixture 5
 (`tls_pki_build_rustls_client_config_accepts_alpn_parameter`)
 that exercises both `b"sql-task-auth"` and
 `b"http/1.1"` ALPN values through the shared
@@ -4277,12 +4276,11 @@ candidates per evidence pressure:
   guard to Wendelon-side and migrate the
   inline parsing.
 - **`GenericCertVerifier<F>` closure-based
-  verifier.** Rejected from ADR 047 (Gemini's
-  iter-3 proposal; rejected 2-of-3 Codex+Claude
-  as too narrow for Wendelon's
-  subject/extension-based admission). Future
-  ADR can revisit if a third ring or new
-  admission model surfaces pressure.
+  verifier.** Not shipped in ADR 047; D8 chose
+  a broader caller-owned trait-object verifier
+  boundary plus trust-chain helpers. Future ADR
+  can revisit a closure helper if ergonomic
+  pressure surfaces.
 
 **Substrate candidates carried forward:**
 (identical to ADR 046's carry-forward list —

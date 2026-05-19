@@ -1,31 +1,28 @@
-use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{
-	CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime, pem::PemObject,
-};
-use rustls::server::WebPkiClientVerifier;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{
 	CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, Error as RustlsError,
-	RootCertStore, ServerConfig, SignatureScheme,
+	ServerConfig, SignatureScheme,
+};
+use tls_pki::{
+	PkiError, TlsMaterial, build_client_cert_chain_verifier,
+	build_rustls_client_config as build_pki_rustls_client_config,
+	build_rustls_server_config as build_pki_rustls_server_config, build_server_cert_chain_verifier,
+	canonical_dns_name, extract_dns_sans,
 };
 use uuid::Uuid;
 
 use crate::config::TlsConfig;
 use crate::distributed::identity::WorkerId;
 
-pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+pub const DEFAULT_CLUSTER_DOMAIN: &str = tls_pki::DEFAULT_CLUSTER_DOMAIN;
 pub const AUTH_QUIC_ALPN: &[u8] = b"sql-task-auth";
 pub const OBSERVABILITY_HTTP_ALPN: &[u8] = b"http/1.1";
-
-const SUBJECT_ALT_NAME_OID: &[u8] = &[0x55, 0x1D, 0x11];
-const DNS_NAME_TAG: u8 = 0x82;
-static INSTALL_RUSTLS_PROVIDER: Once = Once::new();
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -49,6 +46,26 @@ pub enum TlsError {
 	Config(String),
 }
 
+impl From<PkiError> for TlsError {
+	fn from(error: PkiError) -> Self {
+		match error {
+			PkiError::KeyRead { .. } | PkiError::KeyParseNotPkcs8 { .. } => TlsError::KeyNotPkcs8,
+			PkiError::EnvInterpolation { .. } => TlsError::EnvInterpolation,
+			PkiError::CertRead { path, .. } | PkiError::CertParse { path } => {
+				TlsError::CertFile(path)
+			}
+			PkiError::CaRead { path, .. } | PkiError::CaParse { path } => {
+				TlsError::PeerCaFile(path)
+			}
+			PkiError::SanShapeRejected { .. }
+			| PkiError::SanPrefixRejected { .. }
+			| PkiError::DerParse { .. }
+			| PkiError::CborParse { .. } => TlsError::SanShapeRejected,
+			PkiError::Config(message) => TlsError::Config(message),
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListenerRole {
 	WorkerTask,
@@ -64,15 +81,15 @@ pub enum PeerKind {
 }
 
 pub fn canonical_daemon_dns_name(worker_id: &WorkerId, cluster_domain: &str) -> String {
-	format!("toron-{}.{cluster_domain}", worker_id.get())
+	canonical_dns_name("toron", &worker_id.get().to_string(), cluster_domain)
 }
 
 pub fn canonical_client_dns_name(principal: &str, cluster_domain: &str) -> String {
-	format!("client-{principal}.{cluster_domain}")
+	canonical_dns_name("client", principal, cluster_domain)
 }
 
 pub fn canonical_monitor_dns_name(principal: &str, cluster_domain: &str) -> String {
-	format!("monitor-{principal}.{cluster_domain}")
+	canonical_dns_name("monitor", principal, cluster_domain)
 }
 
 pub fn validate_cluster_domain(cluster_domain: &str) -> Result<(), TlsError> {
@@ -95,11 +112,7 @@ pub fn validate_cluster_domain(cluster_domain: &str) -> Result<(), TlsError> {
 }
 
 pub fn reject_env_interpolation(path: &Path) -> Result<(), TlsError> {
-	let raw = path.to_string_lossy();
-	if raw.contains("${") {
-		return Err(TlsError::EnvInterpolation);
-	}
-	Ok(())
+	tls_pki::material::reject_env_interpolation(path).map_err(TlsError::from)
 }
 
 pub fn admit_san(
@@ -107,21 +120,10 @@ pub fn admit_san(
 	role: ListenerRole,
 	cluster_domain: &str,
 ) -> Result<PeerKind, TlsError> {
-	let suffix = format!(".{cluster_domain}");
-	let leading = san
-		.strip_suffix(&suffix)
-		.ok_or(TlsError::SanShapeRejected)?;
-	if leading.contains('.') {
-		return Err(TlsError::SanShapeRejected);
-	}
-	let (prefix, id_token) = leading.split_once('-').ok_or(TlsError::SanShapeRejected)?;
-	if id_token.is_empty()
-		|| !id_token
-			.chars()
-			.all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-	{
-		return Err(TlsError::SanShapeRejected);
-	}
+	let identity = tls_pki::admit_san(san, cluster_domain, &["toron", "client", "monitor"])
+		.map_err(|_| TlsError::SanShapeRejected)?;
+	let prefix = identity.prefix.as_str();
+	let id_token = identity.id_token.as_str();
 
 	match (prefix, role) {
 		("toron", ListenerRole::WorkerTask) => {
@@ -222,7 +224,7 @@ fn validate_listener_cert_identity(
 		.cert_chain
 		.first()
 		.ok_or(TlsError::ListenerSanMismatch)?;
-	let dns_sans = extract_dns_sans(leaf.as_ref()).map_err(|_| TlsError::SanShapeRejected)?;
+	let dns_sans = extract_dns_sans(leaf).map_err(TlsError::from)?;
 	if dns_sans.iter().any(|san| {
 		san == &expected && admit_san(san, ListenerRole::WorkerTask, cluster_domain).is_ok()
 	}) {
@@ -255,45 +257,6 @@ pub fn http_client_config_from_paths(
 	build_rustls_client_config(&material, OBSERVABILITY_HTTP_ALPN)
 }
 
-struct TlsMaterial {
-	cert_chain: Vec<CertificateDer<'static>>,
-	key: PrivateKeyDer<'static>,
-	ca_roots: Arc<RootCertStore>,
-}
-
-impl TlsMaterial {
-	fn load(cert_path: &Path, key_path: &Path, ca_path: &Path) -> Result<Self, TlsError> {
-		let cert_chain = CertificateDer::pem_file_iter(cert_path)
-			.map_err(|_| TlsError::CertFile(cert_path.to_path_buf()))?
-			.collect::<Result<Vec<_>, _>>()
-			.map_err(|_| TlsError::CertFile(cert_path.to_path_buf()))?;
-		if cert_chain.is_empty() {
-			return Err(TlsError::CertFile(cert_path.to_path_buf()));
-		}
-		let key = PrivatePkcs8KeyDer::from_pem_file(key_path)
-			.map(PrivateKeyDer::from)
-			.map_err(|_| TlsError::KeyNotPkcs8)?;
-		let certs = CertificateDer::pem_file_iter(ca_path)
-			.map_err(|_| TlsError::PeerCaFile(ca_path.to_path_buf()))?
-			.collect::<Result<Vec<_>, _>>()
-			.map_err(|_| TlsError::PeerCaFile(ca_path.to_path_buf()))?;
-		let mut ca_roots = RootCertStore::empty();
-		for cert in certs {
-			ca_roots
-				.add(cert)
-				.map_err(|_| TlsError::PeerCaFile(ca_path.to_path_buf()))?;
-		}
-		if ca_roots.is_empty() {
-			return Err(TlsError::PeerCaFile(ca_path.to_path_buf()));
-		}
-		Ok(Self {
-			cert_chain,
-			key,
-			ca_roots: Arc::new(ca_roots),
-		})
-	}
-}
-
 fn server_config_for(
 	material: &TlsMaterial,
 	role: ListenerRole,
@@ -311,21 +274,13 @@ fn build_rustls_server_config(
 	cluster_domain: &str,
 	alpn: &[u8],
 ) -> Result<ServerConfig, TlsError> {
-	install_rustls_provider();
-	let verifier = WebPkiClientVerifier::builder(material.ca_roots.clone())
-		.build()
-		.map_err(|error| TlsError::Config(format!("client verifier: {error}")))?;
+	let verifier = build_client_cert_chain_verifier(material.ca_roots.clone())?;
 	let role_verifier = Arc::new(SanClientCertVerifier {
 		inner: verifier,
 		role,
 		cluster_domain: cluster_domain.to_string(),
 	});
-	let mut rustls_config = ServerConfig::builder()
-		.with_client_cert_verifier(role_verifier)
-		.with_single_cert(material.cert_chain.clone(), material.key.clone_key())
-		.map_err(|error| TlsError::Config(format!("server cert/key: {error}")))?;
-	rustls_config.alpn_protocols = vec![alpn.to_vec()];
-	Ok(rustls_config)
+	build_pki_rustls_server_config(material, role_verifier, alpn).map_err(TlsError::from)
 }
 
 fn client_config(material: &TlsMaterial) -> Result<quinn::ClientConfig, TlsError> {
@@ -339,24 +294,9 @@ fn build_rustls_client_config(
 	material: &TlsMaterial,
 	alpn: &[u8],
 ) -> Result<ClientConfig, TlsError> {
-	install_rustls_provider();
-	let verifier = WebPkiServerVerifier::builder(material.ca_roots.clone())
-		.build()
-		.map_err(|error| TlsError::Config(format!("server verifier: {error}")))?;
+	let verifier = build_server_cert_chain_verifier(material.ca_roots.clone())?;
 	let exact_server_verifier = Arc::new(ExactServerCertVerifier { inner: verifier });
-	let mut rustls_config = ClientConfig::builder()
-		.dangerous()
-		.with_custom_certificate_verifier(exact_server_verifier)
-		.with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
-		.map_err(|error| TlsError::Config(format!("client cert/key: {error}")))?;
-	rustls_config.alpn_protocols = vec![alpn.to_vec()];
-	Ok(rustls_config)
-}
-
-fn install_rustls_provider() {
-	INSTALL_RUSTLS_PROVIDER.call_once(|| {
-		let _ = rustls::crypto::ring::default_provider().install_default();
-	});
+	build_pki_rustls_client_config(material, exact_server_verifier, alpn).map_err(TlsError::from)
 }
 
 #[derive(Debug)]
@@ -391,7 +331,7 @@ impl ServerCertVerifier for ExactServerCertVerifier {
 				CertificateError::ApplicationVerificationFailure,
 			));
 		};
-		let dns_sans = extract_dns_sans(end_entity.as_ref()).map_err(|_| {
+		let dns_sans = extract_dns_sans(end_entity).map_err(|_| {
 			RustlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
 		})?;
 		if dns_sans.iter().any(|san| {
@@ -447,7 +387,7 @@ impl ClientCertVerifier for SanClientCertVerifier {
 	) -> Result<ClientCertVerified, RustlsError> {
 		self.inner
 			.verify_client_cert(end_entity, intermediates, now)?;
-		let dns_sans = extract_dns_sans(end_entity.as_ref()).map_err(|_| {
+		let dns_sans = extract_dns_sans(end_entity).map_err(|_| {
 			RustlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
 		})?;
 		if dns_sans
@@ -481,161 +421,6 @@ impl ClientCertVerifier for SanClientCertVerifier {
 
 	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
 		self.inner.supported_verify_schemes()
-	}
-}
-
-fn extract_dns_sans(cert_der: &[u8]) -> std::io::Result<Vec<String>> {
-	let mut cert = DerReader::new(cert_der);
-	let certificate = cert.read_tlv(0x30, "certificate")?;
-	let mut certificate = DerReader::new(certificate);
-	let tbs = certificate.read_tlv(0x30, "tbsCertificate")?;
-	let mut tbs = DerReader::new(tbs);
-
-	if tbs.peek_tag() == Some(0xA0) {
-		tbs.read_any_tlv("version")?;
-	}
-	for field in [
-		"serialNumber",
-		"signature",
-		"issuer",
-		"validity",
-		"subject",
-		"subjectPublicKeyInfo",
-	] {
-		tbs.read_any_tlv(field)?;
-	}
-	while matches!(tbs.peek_tag(), Some(0x81 | 0x82 | 0xA1 | 0xA2)) {
-		tbs.read_any_tlv("uniqueId")?;
-	}
-	if tbs.peek_tag() != Some(0xA3) {
-		return Ok(Vec::new());
-	}
-
-	let extensions = tbs.read_tlv(0xA3, "extensions")?;
-	let mut extensions = DerReader::new(extensions);
-	let extensions = extensions.read_tlv(0x30, "extensions sequence")?;
-	let mut extensions = DerReader::new(extensions);
-	let mut dns_sans = Vec::new();
-
-	while !extensions.is_empty() {
-		let extension = extensions.read_tlv(0x30, "extension")?;
-		let mut extension = DerReader::new(extension);
-		let oid = extension.read_tlv(0x06, "extension oid")?;
-		if extension.peek_tag() == Some(0x01) {
-			extension.read_any_tlv("extension critical")?;
-		}
-		let value = extension.read_tlv(0x04, "extension value")?;
-		if oid == SUBJECT_ALT_NAME_OID {
-			let mut san_value = DerReader::new(value);
-			let general_names = san_value.read_tlv(0x30, "subjectAltName")?;
-			let mut general_names = DerReader::new(general_names);
-			while !general_names.is_empty() {
-				let (tag, value) = general_names.read_any_tlv("generalName")?;
-				if tag == DNS_NAME_TAG {
-					let dns_name = std::str::from_utf8(value).map_err(|error| {
-						Error::new(
-							ErrorKind::InvalidData,
-							format!("DNS SAN is not valid UTF-8/IA5: {error}"),
-						)
-					})?;
-					dns_sans.push(dns_name.to_string());
-				}
-			}
-		}
-	}
-
-	Ok(dns_sans)
-}
-
-struct DerReader<'a> {
-	input: &'a [u8],
-	pos: usize,
-}
-
-impl<'a> DerReader<'a> {
-	fn new(input: &'a [u8]) -> Self {
-		Self { input, pos: 0 }
-	}
-
-	fn is_empty(&self) -> bool {
-		self.pos >= self.input.len()
-	}
-
-	fn peek_tag(&self) -> Option<u8> {
-		self.input.get(self.pos).copied()
-	}
-
-	fn read_tlv(&mut self, expected_tag: u8, what: &str) -> std::io::Result<&'a [u8]> {
-		let (tag, value) = self.read_any_tlv(what)?;
-		if tag != expected_tag {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"invalid DER for {what}: expected tag 0x{expected_tag:02x}, got 0x{tag:02x}"
-				),
-			));
-		}
-		Ok(value)
-	}
-
-	fn read_any_tlv(&mut self, what: &str) -> std::io::Result<(u8, &'a [u8])> {
-		if self.is_empty() {
-			return Err(Error::new(
-				ErrorKind::UnexpectedEof,
-				format!("truncated DER while reading {what}"),
-			));
-		}
-		let tag = self.input[self.pos];
-		self.pos += 1;
-		let len = self.read_len(what)?;
-		let end = self.pos.checked_add(len).ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("DER length overflow while reading {what}"),
-			)
-		})?;
-		if end > self.input.len() {
-			return Err(Error::new(
-				ErrorKind::UnexpectedEof,
-				format!("truncated DER payload while reading {what}"),
-			));
-		}
-		let value = &self.input[self.pos..end];
-		self.pos = end;
-		Ok((tag, value))
-	}
-
-	fn read_len(&mut self, what: &str) -> std::io::Result<usize> {
-		if self.is_empty() {
-			return Err(Error::new(
-				ErrorKind::UnexpectedEof,
-				format!("truncated DER length while reading {what}"),
-			));
-		}
-		let first = self.input[self.pos];
-		self.pos += 1;
-		if first & 0x80 == 0 {
-			return Ok(first as usize);
-		}
-		let width = (first & 0x7F) as usize;
-		if width == 0 {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!("indefinite DER length is not allowed for {what}"),
-			));
-		}
-		if width > std::mem::size_of::<usize>() || self.pos + width > self.input.len() {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!("invalid DER length width for {what}"),
-			));
-		}
-		let mut len = 0usize;
-		for _ in 0..width {
-			len = (len << 8) | self.input[self.pos] as usize;
-			self.pos += 1;
-		}
-		Ok(len)
 	}
 }
 

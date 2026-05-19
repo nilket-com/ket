@@ -7215,6 +7215,260 @@ fn adr046_no_new_daemon_wire_surface_in_observability_module() {
 }
 
 #[test]
+fn adr047_tls_pki_crate_exists_under_workspace_glob() {
+	let root_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("Cargo.toml")).expect("read workspace");
+	assert!(root_manifest.contains("\"crates/*\""));
+	assert!(
+		workspace_root_dir()
+			.join("crates/tls-pki/Cargo.toml")
+			.exists()
+	);
+}
+
+#[test]
+fn adr047_tls_pki_has_no_quinn_no_tokio_no_tracing_deps() {
+	let manifest = std::fs::read_to_string(workspace_root_dir().join("crates/tls-pki/Cargo.toml"))
+		.expect("read tls-pki manifest");
+
+	for forbidden in [
+		"quinn",
+		"tokio",
+		"tokio-rustls",
+		"tracing",
+		"async-trait",
+		"reqwest",
+		"hyper",
+		"axum",
+		"actix-web",
+	] {
+		assert!(
+			!manifest.contains(forbidden),
+			"tls-pki manifest must not contain dependency token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr047_toron_tls_module_consumes_tls_pki_substrate() {
+	let tls = std::fs::read_to_string(manifest_dir().join("src/network/tls.rs"))
+		.expect("read Toron TLS source");
+
+	for required in [
+		"use tls_pki::",
+		"TlsMaterial",
+		"build_client_cert_chain_verifier",
+		"build_server_cert_chain_verifier",
+		"build_pki_rustls_server_config",
+		"build_pki_rustls_client_config",
+		"canonical_dns_name",
+		"extract_dns_sans",
+		"pub enum TlsError",
+		"pub enum ListenerRole",
+		"pub enum PeerKind",
+		"ExactServerCertVerifier",
+		"SanClientCertVerifier",
+		"canonical_daemon_dns_name",
+		"canonical_client_dns_name",
+		"canonical_monitor_dns_name",
+		"AUTH_QUIC_ALPN",
+		"OBSERVABILITY_HTTP_ALPN",
+	] {
+		assert!(
+			tls.contains(required),
+			"Toron TLS source missing {required}"
+		);
+	}
+}
+
+#[test]
+fn adr047_wendelon_tls_module_consumes_tls_pki_substrate() {
+	let tls = std::fs::read_to_string(wendelon_manifest_dir().join("src/network/tls.rs"))
+		.expect("read Wendelon TLS source");
+
+	for required in [
+		"pub use tls_pki::DEFAULT_CLUSTER_DOMAIN",
+		"pub struct TlsMaterial(tls_pki::TlsMaterial)",
+		"tls_pki::TlsMaterial::load",
+		"tls_pki::load_ca_roots",
+		"tls_pki::build_client_cert_chain_verifier",
+		"tls_pki::build_server_cert_chain_verifier",
+		"tls_pki::build_rustls_server_config_with_alpns",
+		"tls_pki::build_rustls_client_config_with_alpns",
+		"tls_pki::canonical_dns_name(\"node\"",
+		"HRFT_ALPN",
+		"ActorIdentity",
+		"ActorTrustRoots",
+		"VerifiedTransportPeer",
+	] {
+		assert!(
+			tls.contains(required),
+			"Wendelon TLS source missing {required}"
+		);
+	}
+}
+
+#[test]
+fn adr047_no_wendelon_internal_types_in_tls_pki_public_api() {
+	let source = tls_pki_source_text();
+
+	for forbidden in [
+		"RevocationSnapshot",
+		"ActorPermission",
+		"ActorIdentity",
+		"ActorTrustRoots",
+		"VerifiedTransportPeer",
+		"ACTOR_CLAIMS_OID_DOTTED",
+		"WendelonNode",
+		"NodeId",
+		"authorize_break_glass_scope",
+		"authorize_actor",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"tls-pki public/source surface contains Wendelon-internal token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr047_no_toron_internal_types_in_tls_pki_public_api() {
+	let source = tls_pki_source_text();
+
+	for forbidden in [
+		"WorkerId",
+		"tenant_id",
+		"ToronWorker",
+		"ToronDaemon",
+		"SqlClientTlsOptions",
+		"InspectTlsOptions",
+		"quinn::",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"tls-pki public/source surface contains Toron-internal token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr047_admit_san_accepts_parameterized_prefix_set() {
+	let san = std::fs::read_to_string(workspace_root_dir().join("crates/tls-pki/src/san.rs"))
+		.expect("read tls-pki san source");
+
+	assert!(san.contains("pub fn admit_san("));
+	assert!(san.contains("allowed_prefixes: &[&str]"));
+	assert!(san.contains("allowed_prefixes.contains(&prefix)"));
+	assert_eq!(
+		tls_pki::admit_san("node-7.cluster.local", DEFAULT_CLUSTER_DOMAIN, &["node"])
+			.expect("admit node")
+			.id_token,
+		"7"
+	);
+	assert!(
+		tls_pki::admit_san("node-7.cluster.local", DEFAULT_CLUSTER_DOMAIN, &["client"]).is_err()
+	);
+}
+
+#[test]
+fn adr047_canonical_dns_name_parameterized_by_prefix() {
+	let san = std::fs::read_to_string(workspace_root_dir().join("crates/tls-pki/src/san.rs"))
+		.expect("read tls-pki san source");
+
+	assert!(san.contains("pub fn canonical_dns_name("));
+	assert!(san.contains("prefix: &str"));
+	assert_eq!(
+		tls_pki::canonical_dns_name("node", "7", DEFAULT_CLUSTER_DOMAIN),
+		"node-7.cluster.local"
+	);
+	assert_eq!(
+		tls_pki::canonical_dns_name(
+			"toron",
+			"550e8400-e29b-41d4-a716-446655440000",
+			DEFAULT_CLUSTER_DOMAIN
+		),
+		"toron-550e8400-e29b-41d4-a716-446655440000.cluster.local"
+	);
+}
+
+#[test]
+fn adr047_no_alpn_constants_in_tls_pki() {
+	let source = tls_pki_source_text();
+
+	for forbidden in ["HRFT_ALPN", "AUTH_QUIC_ALPN", "OBSERVABILITY_HTTP_ALPN"] {
+		assert!(
+			!source.contains(forbidden),
+			"tls-pki must not declare ring-local ALPN constant {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr047_byte_identical_post_extraction_with_prior_cycle_guards() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in ["adr042_", "adr043_", "adr044_", "adr045_", "adr046_"] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	for required in [
+		"adr044_tls_policy_uses_exact_san_admission_per_listener",
+		"adr045_ready_snapshot_excludes_high_cardinality_identity_fields",
+		"adr046_toron_inspect_exit_codes_are_pinned_to_0_1_2",
+	] {
+		assert!(
+			architecture_test.contains(required),
+			"prior-cycle guard {required} must remain present"
+		);
+	}
+}
+
+#[test]
+fn adr047_toron_der_and_cbor_parsing_delegates_to_tls_pki() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("DerReader")
+				|| line.contains("CborReader")
+				|| line.contains("SUBJECT_ALT_NAME_OID")
+				|| line.contains("DNS_NAME_TAG")
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"Toron source must delegate DER/CBOR parsing to tls-pki:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn adr047_new_tls_pki_types_are_brand_clean_and_no_v1_suffix() {
+	let source = tls_pki_source_text();
+
+	for forbidden in [
+		"ToronTls",
+		"WendelonTls",
+		"NilketTls",
+		"ToronPki",
+		"WendelonPki",
+		"TlsMaterialV1",
+		"PkiErrorV1",
+		"PeerIdentityV1",
+		"DerReaderV1",
+		"CborReaderV1",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"tls-pki contains forbidden branded/V1 token {forbidden}"
+		);
+	}
+}
+
+#[test]
 fn adr046_inspect_uses_hand_rolled_http_no_http_crate_no_hyper_no_reqwest() {
 	let cargo =
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Cargo.toml");
@@ -7325,7 +7579,7 @@ fn adr044_san_convention_mirrors_wendelon_shape() {
 	let wendelon_tls = std::fs::read_to_string(wendelon_manifest_dir().join("src/network/tls.rs"))
 		.expect("read Wendelon TLS source");
 	assert!(wendelon_tls.contains("pub fn canonical_node_dns_name"));
-	assert!(wendelon_tls.contains("format!(\"node-{node_id}.{cluster_domain}\")"));
+	assert!(wendelon_tls.contains("canonical_dns_name(\"node\""));
 }
 
 #[test]
@@ -8123,6 +8377,15 @@ fn workspace_root_dir() -> PathBuf {
 		.parent()
 		.expect("workspace root")
 		.to_path_buf()
+}
+
+fn tls_pki_source_text() -> String {
+	let src_dir = workspace_root_dir().join("crates/tls-pki/src");
+	source_files(&src_dir)
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read tls-pki source"))
+		.collect::<Vec<_>>()
+		.join("\n")
 }
 
 fn workspace_cargo_tomls() -> Vec<PathBuf> {
