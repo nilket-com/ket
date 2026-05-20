@@ -4168,9 +4168,66 @@ along with the forward-sequence rewrite.
   `crates/nilket` runtime-free; `toron_fixture_worker.rs` source
   unchanged; no per-tenant metric labels. Placement: Exterior
   Substrate → Toron home. The `from_tenant_descriptors` atomic
-  constructor is the seam a future live-sync ADR reuses. The
-  seven-phase migration is materialized in
+  constructor seeds **startup** descriptors; a future live-sync
+  *consumer* needs an **in-place** registry merge (e.g.
+  `sync_descriptor_for_tenant`) under the registry write lock —
+  **not** this fresh constructor and **not** an `Arc` swap
+  (corrected by ADR 052 D15). The seven-phase migration is
+  materialized in
   `plans/impl/051_tenant_explicit_descriptor_bootstrap.md`.
+
+- **ADR 052 — Per-Tenant Concurrency Admission and Bounded
+  Resource Observability.**
+  Promoted. Extends the multi-tenant arc (ADR 049 routing +
+  ADR 050 memory governance + ADR 051 descriptor source) on its
+  **resource-isolation** axis: per-tenant **query concurrency
+  admission** at the Toron coordinator. Each tenant carries a
+  node-local `max_concurrent_queries` (added to `[tenant_budgets]`
+  / `TenantBudget`), reserved alongside the ADR 050 aggregate
+  memory reservation **before bind** at the `coordinator.rs`
+  `admit_query` seam, and surfaced through the existing
+  `SqlErrorCode::ResourceExhausted` (diagnostic *"tenant
+  concurrency limit exhausted"*). Closes ADR 050's deferred
+  concurrency vector (D10): a tenant could saturate coordinator
+  query slots with no memory pressure. Source-not-mechanism — a
+  count reservation (`TenantConcurrencyAccountant` /
+  `TenantConcurrencyReservation`) beside the byte reservation; no
+  new coordinator architecture. Three council iterations: iter-0
+  topic split (Claude+Gemini governance Phase 2; Codex live
+  descriptor sync); iter-1 Codex retracted his liveness lead →
+  3-of-3 on governance Phase 2, sequencing live sync Wendelon-first;
+  iter-2 unified D-set. Final D-set: **15 decisions, 15 architecture
+  guards + 3 convention guards, 14 required integration fixtures +
+  1 optional**.
+  **D11/D13 critical decision:** lift ADR 050's no-per-tenant-label
+  deferral (D11) **only** for the named resource-governance metric
+  families (`tenant_memory_bytes_*`, `tenant_concurrency_*`,
+  `tenant_admission_rejections_total`), under a **config-bounded**
+  cardinality rule (configured tenant id or `"other"` for
+  unconfigured tenants; series count `O(configured_tenants + 1)`).
+  The ADR 049/050/051
+  `*_no_per_tenant_metric_labels` guards are retargeted in place
+  (continuous-refactoring): no *unbounded/general* labels.
+  **D12 critical decision:** general daemon + listener metrics
+  (`listener_accepts_total`, `daemon_ready`, `descriptors_loaded`,
+  …) stay aggregate — the listener-label question resolved
+  **2-of-3 Claude+Codex** (pre-auth / failed-auth connections lack
+  a stable tenant); Gemini's broader-labels proposal recorded as
+  the minority view.
+  **D3 critical decision:** coordinator scale, single daemon — no
+  cluster-wide caps, distributed semaphore, queueing, borrowing, or
+  fair-share.
+  **D15 critical decision:** live Wendelon → Toron descriptor sync
+  is **sequenced, not rejected** — a Wendelon-sequence
+  descriptor read/snapshot producer ADR first, then a later Toron
+  bind-miss consumer (Codex's iter-0 design) over the real producer
+  API, using an in-place `sync_descriptor_for_tenant` merge.
+  **Single-plan posture; Toron-ring only.** No Wendelon production
+  change; no SQL wire change (reuses `ResourceExhausted`);
+  `crates/nilket` runtime-free; `toron_fixture_worker.rs` source
+  unchanged. Placement: Exterior Substrate → Toron home. The
+  six-phase migration is materialized in
+  `plans/impl/052_per_tenant_concurrency_admission.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4255,7 +4312,83 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 051 promoted; ADR 052 candidates
+### ADR 052 promoted; ADR 053 candidates
+
+ADR 052 selected and promoted **Per-Tenant Concurrency Admission
+and Bounded Resource Observability** — the resource-isolation
+extension of the multi-tenant arc (ADR 049 routing + ADR 050
+memory governance + ADR 051 descriptor source). Per-tenant
+`max_concurrent_queries` is reserved at the `coordinator.rs`
+`admit_query` seam alongside the ADR 050 memory reservation,
+before bind, and surfaced through the existing
+`SqlErrorCode::ResourceExhausted` (*"tenant concurrency limit
+exhausted"*). It closes ADR 050's deferred concurrency vector
+(D10) and lifts the no-per-tenant-label deferral (D11) **only**
+for the named resource-governance metrics, under a config-bounded
+cardinality rule (configured id or `"other"` for unconfigured
+tenants). The topic
+converged 3-of-3 (Codex retracted his iter-0 live-sync lead once
+the producer was recognized as Wendelon-gated); the metrics scope
+settled 2-of-3 Claude+Codex toward aggregate listener/general
+metrics. Final D-set: **15 decisions, 15 architecture guards + 3
+convention guards, 14 required fixtures + 1 optional**.
+
+**Pure Toron-ring substrate; coordinator scale; zero Wendelon
+change, zero SQL wire change.**
+
+**Architectural invariants preserved through this cycle:**
+
+- ADR 040 / 042–051 root-runtime-free (`crates/nilket/Cargo.toml`
+  untouched); `toron_fixture_worker.rs` source unchanged.
+- ADR 049 SQL tenant source (mTLS remote; loopback
+  `config.node.tenant_id`) and execution-time scoping unchanged.
+- ADR 050 memory admission unchanged; concurrency is a sibling
+  count reservation, not a rewrite.
+- The no-per-tenant-label invariant is **narrowly** superseded:
+  the ADR 049/050/051 `*_no_per_tenant_metric_labels` guards are
+  retargeted in place to "no *unbounded/general* labels"; general
+  + listener families stay aggregate (D12).
+- Reuses `ResourceExhausted`; no new `SqlErrorCode` / `SqlMessage`
+  / SQL tenant field / syntax.
+- Placement: Exterior Substrate → Toron home.
+
+The six-phase migration is materialized in
+`plans/impl/052_per_tenant_concurrency_admission.md`.
+
+**ADR 053 candidates:**
+
+After ADR 052, Toron's single-coordinator multi-tenant gateway is
+hardened on routing (049), memory (050), descriptor source (051),
+and query concurrency (052). The open frontiers:
+
+- **Live Wendelon → Toron descriptor sync (LEAD)** — the
+  descriptor-liveness gap ADR 051 left to startup and ADR 052
+  sequenced. Starts with a **Wendelon-sequence** descriptor
+  read/snapshot *producer* ADR (Control-Ring read-only, exact-name
+  `(tenant, namespace, table)` → latest descriptor, `TenantAdminRead`
+  authz, leader-hint retry — Codex's iter-0 design), then a **Toron**
+  bind-miss *consumer* ADR (`resolve_table` miss → one scoped fetch
+  → in-place `sync_descriptor_for_tenant` merge → retry once).
+  Gated on the producer; no Toron stub before it.
+- **Per-tenant governance Phase 3** — CPU wall-time, connection
+  caps, rate limits, storage quotas (storage is cross-ring),
+  queue / borrow / fair-share (deferred from ADR 052 D14 / ADR 050
+  D7/D10).
+- **Listener / general per-tenant observability** — the broader
+  metric-label surface ADR 052 D12 kept aggregate (needs a stable
+  tenant for pre-auth / failed-auth connection edges); Gemini's
+  minority view.
+- **OTLP traces export**, **audit subsystem** (deferred since
+  ADR 045 D7; the prerequisite for any disciplined runtime
+  catalog-write / operator-pushed ingestion).
+- **SQL surface widening** — CTAS `IF NOT EXISTS`, `UPDATE WHERE`,
+  `INSERT/CTAS/DELETE … RETURNING`.
+- **Live cert rotation / CRL / OCSP**; **token-based tenant claims
+  (JWT/OIDC/SPIFFE)**; gRPC / Arrow Flight / Postgres frontends;
+  strong cross-worker cancellation; prepared statements (carried
+  forward).
+
+### ADR 051 promoted; ADR 052 candidates (HISTORICAL)
 
 ADR 051 selected and promoted **Tenant-Explicit Descriptor
 Bootstrap** — the startup-config completion of the multi-tenant
