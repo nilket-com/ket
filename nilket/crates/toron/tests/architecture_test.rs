@@ -6950,7 +6950,7 @@ fn adr045_observability_http_has_per_request_read_timeout() {
 			.expect("read observability source");
 
 	assert!(http.contains("pub const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);"));
-	assert!(http.contains("const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;"));
+	assert!(http.contains("MAX_REQUEST_HEADER_BYTES"));
 	assert!(observability.contains("timeout(READ_REQUEST_TIMEOUT, read_request(stream))"));
 }
 
@@ -7469,6 +7469,341 @@ fn adr047_new_tls_pki_types_are_brand_clean_and_no_v1_suffix() {
 }
 
 #[test]
+fn adr048_observability_http_crate_exists_under_workspace_glob() {
+	let root_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("Cargo.toml")).expect("read workspace");
+	assert!(root_manifest.contains("\"crates/*\""));
+	assert!(
+		workspace_root_dir()
+			.join("crates/observability-http/Cargo.toml")
+			.exists()
+	);
+}
+
+#[test]
+fn adr048_observability_http_depends_only_on_tokio_io() {
+	let manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/observability-http/Cargo.toml"))
+			.expect("read observability-http manifest");
+	let dependencies = manifest
+		.split("[dependencies]")
+		.nth(1)
+		.expect("dependencies section")
+		.split("[dev-dependencies]")
+		.next()
+		.expect("dependencies before dev-dependencies");
+	let dependency_lines = dependencies
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty())
+		.collect::<Vec<_>>();
+	assert_eq!(
+		dependency_lines,
+		vec![r#"tokio = { version = "1.37", default-features = false, features = ["io-util"] }"#]
+	);
+	assert!(manifest.contains(
+		r#"tokio = { version = "1.37", default-features = false, features = ["io-util", "macros", "rt"] }"#
+	));
+	for forbidden in [
+		"hyper",
+		"hyper-util",
+		"axum",
+		"actix-web",
+		"tower",
+		"reqwest",
+		"ureq",
+		"h2",
+		"http =",
+		"httparse",
+		"bytes",
+		"tokio-util",
+		"rustls",
+		"tokio-rustls",
+		"quinn",
+		"tls-pki",
+		"tracing",
+	] {
+		assert!(
+			!manifest.contains(forbidden),
+			"observability-http manifest must not contain dependency token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr048_observability_http_has_bounded_header_and_body_limits() {
+	let lib =
+		std::fs::read_to_string(workspace_root_dir().join("crates/observability-http/src/lib.rs"))
+			.expect("read observability-http lib");
+
+	for required in [
+		"pub const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;",
+		"pub const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;",
+		"pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;",
+	] {
+		assert!(lib.contains(required), "missing bounded limit {required}");
+	}
+}
+
+#[test]
+fn adr048_observability_http_does_not_own_timeouts() {
+	let source = observability_http_source_text();
+
+	for forbidden in [
+		"Duration",
+		"tokio::time",
+		"timeout",
+		"READ_REQUEST_TIMEOUT",
+		"CONNECT_TIMEOUT",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"observability-http must not own timeout token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr048_observability_http_public_surface_is_small() {
+	let source = observability_http_source_text();
+
+	for required in [
+		"pub const MAX_REQUEST_HEADER_BYTES",
+		"pub const MAX_RESPONSE_HEADER_BYTES",
+		"pub const MAX_RESPONSE_BODY_BYTES",
+		"pub struct RequestLine",
+		"pub struct HttpResponse",
+		"pub async fn read_request",
+		"pub fn parse_request_line",
+		"pub async fn read_response",
+		"pub async fn write_request",
+		"pub async fn write_response",
+	] {
+		assert!(
+			source.contains(required),
+			"observability-http must expose {required}"
+		);
+	}
+	for forbidden in [
+		"pub struct Router",
+		"pub struct Listener",
+		"pub fn listen",
+		"pub fn dispatch",
+		"pub fn route",
+		"pub struct StatusCode",
+		"pub enum Status",
+		"rustls::",
+		"quinn::",
+		"tls_pki::",
+		"tracing::",
+		"TcpListener",
+		"TcpStream",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"observability-http must not expose {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr048_toron_observability_http_module_is_shim_only() {
+	let http = std::fs::read_to_string(manifest_dir().join("src/network/observability_http.rs"))
+		.expect("read observability HTTP shim");
+
+	assert!(http.contains("pub const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);"));
+	assert!(http.contains("pub use observability_http::"));
+	for required in [
+		"HttpResponse",
+		"MAX_REQUEST_HEADER_BYTES",
+		"MAX_RESPONSE_HEADER_BYTES",
+		"MAX_RESPONSE_BODY_BYTES",
+		"RequestLine",
+		"parse_request_line",
+		"read_request",
+		"read_response",
+		"write_request",
+		"write_response",
+	] {
+		assert!(http.contains(required), "shim missing re-export {required}");
+	}
+	for forbidden in ["header_end", "content_length", "body_len", "loop {"] {
+		assert!(
+			!http.contains(forbidden),
+			"observability HTTP shim contains parser token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr048_toron_observability_and_inspect_use_shared_http_helper() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability source");
+	let cli =
+		std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI source");
+
+	assert!(observability.contains("observability_http::parse_request_line"));
+	assert!(cli.contains("observability_http::write_request"));
+	assert!(cli.contains("observability_http::read_response"));
+}
+
+#[test]
+fn adr048_no_new_toron_observability_routes() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability source");
+
+	for required in [
+		"pub const HEALTH_PATH: &str = \"/health\";",
+		"pub const READY_PATH: &str = \"/ready\";",
+		"pub const METRICS_PATH: &str = \"/metrics\";",
+	] {
+		assert!(
+			observability.contains(required),
+			"missing observability route {required}"
+		);
+	}
+	assert_eq!(observability.matches("_PATH: &str").count(), 3);
+	assert!(!observability.contains("INSPECT_PATH"));
+	assert!(!observability.contains("INFO_PATH"));
+	assert!(!observability.contains("VERSION_PATH"));
+	assert!(!observability.contains("WORKERS_PATH"));
+}
+
+#[test]
+fn adr048_no_nilket_root_runtime_dependency_change() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in [
+		"tokio",
+		"clap",
+		"tracing",
+		"rustls",
+		"tokio-rustls",
+		"observability-http",
+	] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr048_no_wendelon_inspect_branch_this_cycle() {
+	let cli = std::fs::read_to_string(wendelon_manifest_dir().join("src/cli.rs"))
+		.expect("read Wendelon CLI source");
+
+	assert!(!cli.contains("verb == \"inspect\""));
+	assert!(!cli.contains("[cmd, rest @ ..] if cmd == \"inspect\""));
+	assert!(!cli.contains("WendelonInspect"));
+}
+
+#[test]
+fn adr048_wendelon_observability_http_helpers_remain_local() {
+	let observability =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/metrics/observability.rs"))
+			.expect("read Wendelon observability source");
+	let exporter = std::fs::read_to_string(wendelon_manifest_dir().join("src/metrics/exporter.rs"))
+		.expect("read Wendelon exporter source");
+
+	for required in [
+		"async fn read_request<S",
+		"fn parse_request_line(",
+		"async fn write_response<S",
+	] {
+		assert!(
+			observability.contains(required),
+			"Wendelon observability source missing local helper {required}"
+		);
+	}
+	assert!(exporter.contains("async fn handle_connection("));
+	assert!(exporter.contains("content-type: text/plain"));
+	assert!(!observability.contains("observability_http"));
+	assert!(!exporter.contains("observability_http"));
+}
+
+#[test]
+fn adr048_prior_adr04x_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr040_", "adr041_", "adr042_", "adr043_", "adr044_", "adr045_", "adr046_", "adr047_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	for required in [
+		"adr040_nilket_root_has_no_role_runtime_dependencies",
+		"adr045_ready_snapshot_excludes_high_cardinality_identity_fields",
+		"adr046_toron_inspect_exit_codes_are_pinned_to_0_1_2",
+		"adr047_byte_identical_post_extraction_with_prior_cycle_guards",
+	] {
+		assert!(
+			architecture_test.contains(required),
+			"prior-cycle guard {required} must remain present"
+		);
+	}
+}
+
+#[test]
+fn prior_adr04x_architecture_guards_pass_post_http_extraction() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr040_", "adr041_", "adr042_", "adr043_", "adr044_", "adr045_", "adr046_", "adr047_",
+		"adr048_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing ADR guard prefix {prefix}");
+	}
+	for required in [
+		"toron_observability_ready_metrics_preserve_responses_post_extraction",
+		"toron_inspect_preserves_ready_fetch_post_extraction",
+		"prior_adr04x_architecture_guards_pass_post_http_extraction",
+	] {
+		assert!(
+			architecture_test.contains(required)
+				|| std::fs::read_to_string(
+					manifest_dir().join("tests/toron_observability_listener_test.rs")
+				)
+				.expect("read observability listener test")
+				.contains(required)
+				|| std::fs::read_to_string(manifest_dir().join("src/cli.rs"))
+					.expect("read cli source")
+					.contains(required),
+			"ADR 048 preservation fixture {required} must remain present"
+		);
+	}
+}
+
+#[test]
+fn adr048_new_observability_http_types_are_brand_clean_and_no_v1_suffix() {
+	let source = observability_http_source_text();
+
+	for forbidden in [
+		"ToronHttp",
+		"WendelonHttp",
+		"NilketHttp",
+		"HttpResponseV1",
+		"RequestLineV1",
+		"ObservabilityHttpV1",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"observability-http contains forbidden branded/V1 token {forbidden}"
+		);
+	}
+}
+
+#[test]
 fn adr046_inspect_uses_hand_rolled_http_no_http_crate_no_hyper_no_reqwest() {
 	let cargo =
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Cargo.toml");
@@ -7485,6 +7820,16 @@ fn adr046_inspect_uses_hand_rolled_http_no_http_crate_no_hyper_no_reqwest() {
 		"actix-web",
 		"hyper-util",
 	] {
+		if forbidden == "http =" {
+			assert!(
+				!cargo
+					.lines()
+					.map(str::trim)
+					.any(|line| line.starts_with("http =")),
+				"Toron Cargo.toml must not include a direct http crate dependency"
+			);
+			continue;
+		}
 		assert!(
 			!cargo.contains(forbidden),
 			"Toron Cargo.toml must not include {forbidden}"
@@ -8384,6 +8729,15 @@ fn tls_pki_source_text() -> String {
 	source_files(&src_dir)
 		.into_iter()
 		.map(|path| std::fs::read_to_string(path).expect("read tls-pki source"))
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+fn observability_http_source_text() -> String {
+	let src_dir = workspace_root_dir().join("crates/observability-http/src");
+	source_files(&src_dir)
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read observability-http source"))
 		.collect::<Vec<_>>()
 		.join("\n")
 }

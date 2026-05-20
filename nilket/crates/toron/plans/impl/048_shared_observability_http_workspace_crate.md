@@ -275,7 +275,7 @@ paths at runtime; Phase 6.4 verifies the full 17-string set.
 
 ## Phase 3: Convert Toron module to compatibility shim
 
-Wire Toron's existing call sites to the shared helpers via
+Wire Toron's existing import paths to the shared helpers via
 re-exports, keeping `READ_REQUEST_TIMEOUT` Toron-local.
 
 **Tasks:**
@@ -531,7 +531,10 @@ ADR 047's meta-guard. Read
 `crates/toron/tests/architecture_test.rs`; assert presence
 of `fn adr04[2-7]_` prefixes (existence inventory). Mirror
 ADR 047 guard 10's existence-check shape, not a baseline-
-snapshot comparison.
+snapshot comparison. Prior-cycle guard function names stay
+stable; assertion content may relax only when a literal
+moves behind a shared helper or re-export and a new ADR
+guard pins the new storage site.
 
 **5.13** Convention guard
 (`adr048_new_observability_http_types_are_brand_clean_and_no_v1_suffix`):
@@ -580,8 +583,12 @@ Triage:
 - If divergence is in Toron call-site behavior → confirm
   shim re-exports are wired correctly.
 - If divergence is in a prior-cycle guard's source-text
-  expectation → adjust shim layout to preserve guard's
-  byte-identical expectations.
+  expectation because a literal storage site moved behind
+  the shared crate/shim → keep the prior guard function
+  name stable, minimally relax the assertion to the new
+  re-export/helper boundary, and add an ADR 048 guard that
+  pins the shared storage site. For any other divergence,
+  adjust shim layout to preserve the prior expectation.
 
 **6.6** Re-run after triage; confirm full pre/post
 equality.
@@ -590,8 +597,8 @@ equality.
 
 - ADR 045 + ADR 046 integration fixtures pass-count
   byte-identical pre/post.
-- ADR 040-047 architecture-test pass-count byte-identical
-  pre/post.
+- ADR 040-047 architecture-test function names and pass
+  count preserved pre/post.
 - 17 diagnostic strings byte-identical pre/post.
 - New ADR 048 fixtures (Phase 4) + new architecture guards
   (Phase 5) all pass.
@@ -651,7 +658,7 @@ gates — non-blocking but useful in the same commit window.
 | Risk | Mitigation |
 |------|-----------|
 | Diagnostic-string byte-drift between Toron's pre-extraction strings and the 17-string D8 enumeration | Phase 0.2 verifies match; triage Phase 2 if drift surfaces |
-| ADR 045 guard 4 source-text-match breaks if shim layout differs from pre-extraction | Phase 3.1 explicitly preserves `READ_REQUEST_TIMEOUT` at the same file path; Phase 6.5 triage rewinds layout if guard fails |
+| ADR 045 guard source-text expectations break if shim layout differs from pre-extraction | Phase 3.1 explicitly preserves `READ_REQUEST_TIMEOUT` at the same file path. If a literal moves behind the shared crate/re-export, Phase 6.5 allows minimal assertion relaxation while ADR 048 guards pin the new shared storage site |
 | ADR 046 guard 12 source-text-match breaks if `CONNECT_TIMEOUT` moves | Phase 3.4 explicitly leaves `CONNECT_TIMEOUT` in `cli.rs` (its ADR 046 location) |
 | `RequestLine.version` exposure creates future API churn | D1 documents that Toron's parser already requires a third request-line token; exposing that token as a field keeps version policy caller-owned without adding a status or route surface |
 | Tokio dependency conflict if `tokio.workspace = true` is configured | D6 specifies local dependency with `io-util` only, bypassing workspace feature unification |
@@ -698,9 +705,10 @@ gates — non-blocking but useful in the same commit window.
 - [ ] Phase 5 architecture guards added and passing (12 +
       1 convention; includes iter-3 guard 5 public-surface-
       is-small).
-- [ ] Phase 6 byte-identical pre/post comparison verified
-      (ADR 045 + ADR 046 fixtures + ADR 040-047
-      architecture sweep + 17 diagnostic strings).
+- [ ] Phase 6 pre/post comparison verified (ADR 045 +
+      ADR 046 fixtures byte-identical, ADR 040-047
+      architecture guard names/pass count preserved, 17
+      diagnostic strings byte-identical).
 - [ ] Phase 7 evidence record committed; ADR + impl +
       roadmap promoted.
 - [ ] Optional: ADR 047 D8 reconciliation in roadmap.

@@ -3879,8 +3879,11 @@ along with the forward-sequence rewrite.
   a compatibility shim at the existing path
   `crates/toron/src/network/observability_http.rs`.
   Toron's imports stay on the existing shim path; the
-  observability route-matching sites perform the small
-  tuple-to-field rewrite required by `RequestLine`.
+  three observability route-matching sites perform
+  the small tuple-to-field rewrite required by
+  `RequestLine`: bind `let line =
+  parse_request_line(...)`, then match
+  `(line.method, line.path)`.
   **D5 critical decision:** Wendelon
   production code is **fully untouched** in
   V1. Production Wendelon modules must not
@@ -3922,6 +3925,12 @@ along with the forward-sequence rewrite.
   (`adr048_new_observability_http_types_are_brand_clean_and_no_v1_suffix`)
   carrying forward the no-V1-suffix convention
   for the thirteenth consecutive cycle.
+  ADR 048 makes the ADR 047/048 refactor-guard
+  pattern explicit: prior-cycle guard function
+  names stay stable; assertion content may relax
+  only when a literal moves behind a shared
+  helper/re-export and the new ADR guards pin the
+  new storage site.
   **Twelve required fixtures + 0 V1-evidence
   optional** including the iter-3 fixture-3
   split (happy-path
@@ -4050,14 +4059,16 @@ fixtures + 0 V1-evidence optional fixtures**.
 behavior-preserving extraction: zero functional
 changes, zero wire changes, zero config
 changes, zero new operator-visible
-functionality. All prior ADR 040-047
-architecture guards and ADR 042-047 fixture
-suites continue to pass byte-identical pre/post
-the extraction. Meta-guard 12
+functionality. All ADR 042-047 fixture suites
+continue to pass byte-identical pre/post the
+extraction. Prior ADR 040-047 architecture
+guard function names, coverage, and pass count
+are preserved by meta-guard 12
 (`adr048_prior_adr04x_guards_continue_to_pass`)
 and meta-fixture 12
 (`prior_adr04x_architecture_guards_pass_post_http_extraction`)
-gate promotion on byte-identical comparison.
+gate promotion on inventory/pass-count
+preservation.
 The 17 D8 diagnostic strings are byte-identical
 pre/post.
 
@@ -4094,9 +4105,11 @@ location); ADR 048 does not move it.
 The shim re-exports the shared helpers and
 keeps the `READ_REQUEST_TIMEOUT` constant
 Toron-local. Toron's imports stay on the shim
-path; the observability route-matching sites
-perform the small tuple-to-field rewrite
-required by `RequestLine`.
+path; the three observability route-matching
+sites perform the small tuple-to-field rewrite
+required by `RequestLine`: bind `let line =
+parse_request_line(...)`, then match
+`(line.method, line.path)`.
 
 **D5 critical decision:** Wendelon production
 code is **fully untouched** in V1. Wendelon's
@@ -4156,6 +4169,11 @@ and the convention guard
 (`adr048_new_observability_http_types_are_brand_clean_and_no_v1_suffix`)
 carrying forward the no-V1-suffix convention
 for the thirteenth consecutive cycle.
+ADR 048 codifies the ADR 047/048 refactor-guard
+pattern: prior-cycle guard function names remain
+stable; assertion content may relax only when a
+literal moves behind a shared helper/re-export
+and the new ADR guards pin the new storage site.
 
 **Twelve required fixtures + 0 V1-evidence
 optional** including the iter-3 fixture-3 split

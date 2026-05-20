@@ -536,7 +536,8 @@ async fn handle_ready_connection(
 	let Some(req) = request_or_close(&mut stream, ListenerName::Ready, &metrics).await? else {
 		return Ok(());
 	};
-	match crate::network::observability_http::parse_request_line(&req)? {
+	let line = crate::network::observability_http::parse_request_line(&req)?;
+	match (line.method, line.path) {
 		("GET", READY_PATH) => {
 			let snapshot = readiness.snapshot().await;
 			write_response(
@@ -587,7 +588,8 @@ async fn handle_metrics_connection(
 	let Some(req) = request_or_close(&mut stream, ListenerName::Metrics, &metrics).await? else {
 		return Ok(());
 	};
-	match crate::network::observability_http::parse_request_line(&req)? {
+	let line = crate::network::observability_http::parse_request_line(&req)?;
+	match (line.method, line.path) {
 		("GET", METRICS_PATH) => {
 			let snapshot = readiness.snapshot().await;
 			metrics.increment_metrics_scrapes();
@@ -637,7 +639,8 @@ async fn write_route_response<S: AsyncRead + AsyncWrite + Unpin>(
 	content_type: &str,
 	body: &str,
 ) -> std::io::Result<()> {
-	match crate::network::observability_http::parse_request_line(req)? {
+	let line = crate::network::observability_http::parse_request_line(req)?;
+	match (line.method, line.path) {
 		("GET", path) if path == expected_path => {
 			write_response(stream, "200 OK", content_type, body).await
 		}

@@ -2241,6 +2241,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "observability-http"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3929,6 +3936,7 @@ dependencies = [
  "aws-lc-rs",
  "bytemuck",
  "futures",
+ "observability-http",
  "postcard",
  "quinn",
  "rand 0.10.1",

@@ -1182,6 +1182,37 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn toron_inspect_preserves_ready_fetch_post_extraction() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(52);
+		let pki = CliInspectPki::generate(worker_id, "operator");
+		let server = MinimalReadyServer::start(worker_id, &pki).await;
+		let body = readiness_snapshot(true, None).to_json();
+		let endpoint = server.connect_addr;
+		let handle = server.spawn_response_once("200 OK", body.clone());
+		let server_name = crate::network::tls::canonical_daemon_dns_name(
+			&worker_id,
+			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+		);
+		let options = inspect_options(
+			endpoint,
+			server_name,
+			pki.monitor_cert.clone(),
+			pki.monitor_key.clone(),
+			pki.ca_cert.clone(),
+			true,
+		);
+
+		let response = fetch_ready(&options).await.expect("ready response");
+		let request = handle.await.expect("ready server task").expect("request");
+		let request = String::from_utf8(request).expect("request utf8");
+
+		assert_eq!(response.body, body);
+		assert_eq!(response.snapshot, readiness_snapshot(true, None));
+		assert!(request.starts_with("GET /ready HTTP/1.1\r\n"));
+		assert!(request.contains(&format!("Host: {}\r\n", options.endpoint)));
+	}
+
+	#[tokio::test]
 	async fn inspect_exit_zero_on_ready_one_on_degraded() {
 		let worker_id = crate::distributed::identity::WorkerId::from_u128(47);
 		let pki = CliInspectPki::generate(worker_id, "operator");

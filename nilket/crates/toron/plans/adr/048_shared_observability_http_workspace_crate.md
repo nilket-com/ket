@@ -41,9 +41,12 @@ ADR 048 is a **pure behavior-preserving refactor** — zero
 functional changes, zero wire changes, zero config changes,
 zero new operator-visible functionality. All ADR
 042/043/044/045/046/047 integration fixtures continue to
-pass byte-identical pre/post the extraction, and ADR 040-047
-architecture-guard coverage is preserved by the promotion
-meta-guard.
+pass byte-identical pre/post the extraction. ADR 040-047
+architecture-guard function names, coverage, and pass count
+are preserved by the promotion meta-guard; assertion content
+may relax only where a literal storage site moves behind a
+shared helper or re-export and the new ADR guards pin the
+new storage site.
 
 Wendelon production observability code (`metrics/observability.rs`
 + `metrics/exporter.rs`) is **fully untouched** in V1. Three
@@ -261,7 +264,12 @@ Specifically preserved:
 Architecture guard 12
 (`adr048_prior_adr04x_guards_continue_to_pass`) asserts ADR
 040-047 architecture guard function names continue to exist
-and pass byte-identical pre/post extraction.
+and the guard sweep pass count is preserved pre/post
+extraction. ADR 048 follows the ADR 047 refactor precedent:
+prior-cycle guard function names remain stable; assertion
+content may be minimally relaxed only when a literal storage
+site moves behind a shared helper or re-export and the
+guard's semantic intent is pinned by the new cycle's guards.
 
 **D3: Caller-owned timeout policy.**
 
@@ -312,21 +320,22 @@ pub use observability_http::{
 The shim approach (Codex iter-0 D4 / Claude iter-1 S3) is
 chosen over absorb-the-call-site-rewrite because:
 
-1. Preserves ADR 045 guard 4 source-text-match byte-
-   identical.
+1. Preserves ADR 045 guard 4's timeout source-text intent
+   while moving the request-header-cap literal behind the
+   shared crate re-export.
 2. Keeps timeout policy operator-facing and ring-local
    (Toron may evolve its timeout values independently of
    any future Wendelon timeout policy).
 3. Lower-churn diff; smaller blast radius.
 
-Toron's existing call sites (`crates/toron/src/network/observability.rs`
-for `/ready` / `/metrics`; `crates/toron/src/cli.rs` for
-inspect) continue to import via
-`use crate::network::observability_http::{...}` which now
-resolves through the shim re-exports.
-The observability route-matching sites perform the small
-tuple-to-field rewrite required by `RequestLine { method,
-path, version }`; inspect already consumes only
+Toron's existing import paths continue unchanged:
+`use crate::network::observability_http::{...}` now resolves
+through the shim re-exports. The three observability
+route-matching sites in `crates/toron/src/network/observability.rs`
+perform the small tuple-to-field rewrite required by
+`RequestLine { method, path, version }`: bind
+`let line = parse_request_line(...)`, then match
+`(line.method, line.path)`. Inspect already consumes only
 `write_request` and `read_response`.
 
 **D5: Wendelon production code stays Wendelon-local.**
@@ -529,7 +538,10 @@ clippy allow-lists.
 12. `adr048_prior_adr04x_guards_continue_to_pass` — meta-
     guard asserting all ADR 040-047 architecture guard
     function names continue to exist and the ADR 04x guard
-    sweep passes byte-identical pre/post.
+    sweep pass count is preserved pre/post. Prior-cycle
+    assertion content may relax only when a literal moves
+    behind a shared helper or re-export and a new ADR guard
+    pins the new storage site.
 
 **Post-promotion convention guard:**
 
@@ -590,7 +602,9 @@ clippy allow-lists.
     — meta-fixture matching ADR 047's approach: prior-cycle
     architecture guard function-name inventory + pass count
     preserved (asserts ADR 040-047 architecture-test
-    function names present and the guard sweep passes).
+    function names present and the guard sweep passes). This
+    is a guard-inventory/pass-count fixture, not a source-
+    assertion byte-snapshot.
 
 **Optional V1-evidence (non-gating, post-promotion):**
 
@@ -730,7 +744,8 @@ Matches ADR 042/043/044/045/046/047 single-plan posture.
    consecutive cycle: ADRs 039 / 041 / 042 / 043 / 044 /
    045 / 046 / 047 / 048).
 7. **ADR 040-047 invariants preserved.** Refactor is
-   behavior-preserving; pre/post baseline comparison gates
+   behavior-preserving; fixture baseline comparison plus
+   architecture guard name/pass-count preservation gates
    promotion.
 8. **`toron_fixture_worker.rs` source unchanged**
    (thirteenth preserved cycle invariant).
@@ -749,8 +764,9 @@ duplication across three sites (Toron `observability_http`
 the imminent fourth-site duplication that ADR 049 (Shape A,
 `nilket wendelon inspect` parity) would otherwise create.
 Behavior-preserving; promotion gated on byte-identical
-pre/post comparison of ADR 042-047 guards and fixtures, and
-on byte-identical preservation of the 17 pinned diagnostic
+pre/post comparison of ADR 042-047 fixtures, preservation
+of ADR 040-047 architecture guard names/pass count, and
+byte-identical preservation of the 17 pinned diagnostic
 strings.
 
 The eight-phase migration is materialized in

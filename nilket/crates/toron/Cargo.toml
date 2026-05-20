@@ -17,6 +17,7 @@ postcard.workspace = true
 toml = "0.8"
 bytemuck = { version = "1.16", features = ["derive"] }
 futures = "0.3"
+observability-http = { path = "../observability-http" }
 rune = "0.14"
 sqlparser = "0.54"
 rand = "0.10"

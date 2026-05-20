@@ -289,6 +289,52 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 }
 
 #[tokio::test]
+async fn toron_observability_ready_metrics_preserve_responses_post_extraction() {
+	let worker_id = WorkerId::from_u128(54);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let daemon = ToronDaemon::start(observability_config(worker_id, &pki))
+		.await
+		.expect("start daemon");
+	let endpoints = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints");
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let ready_response = mtls_http_request(
+		endpoints.ready,
+		&server_name,
+		&pki.monitor_cert,
+		&pki.monitor_key,
+		&pki.ca_cert,
+		"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await
+	.expect("ready response");
+	let metrics_response = mtls_http_request(
+		endpoints.metrics,
+		&server_name,
+		&pki.monitor_cert,
+		&pki.monitor_key,
+		&pki.ca_cert,
+		"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await
+	.expect("metrics response");
+
+	assert!(ready_response.starts_with("HTTP/1.1 200 OK\r\n"));
+	assert!(ready_response.contains("Content-Type: application/json; charset=utf-8\r\n"));
+	assert!(response_body(&ready_response).contains("\"ready\":true"));
+	assert!(metrics_response.starts_with("HTTP/1.1 200 OK\r\n"));
+	assert!(
+		metrics_response.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n")
+	);
+	assert!(response_body(&metrics_response).contains("metrics_scrapes_total 1\n"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
 async fn toron_ready_and_metrics_reject_peer_without_monitor_san_prefix() {
 	let worker_id = WorkerId::from_u128(51);
 	let pki = TestPki::generate(worker_id, "prometheus");
