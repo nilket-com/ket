@@ -32,6 +32,12 @@ fields, or amending an ADR; flag violations in code review.
 - [capability-vs-feature-naming.md](capability-vs-feature-naming.md)
   — code uses "capability" precisely (the Rune sandbox's gated
   abilities); "feature" is for marketing or casual prose.
+- [ring-product-placement.md](ring-product-placement.md) — an
+  ADR's home directory follows what kind of product it is
+  (Interior/shared → Toron aggregator; Exterior/ring-specific →
+  that ring's sequence), not which council process drafted it.
+  Includes the Leap Rule for substrate-leaps disguised as
+  composition.
 
 ## Adding a convention
 
