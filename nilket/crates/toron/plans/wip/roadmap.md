@@ -4105,6 +4105,72 @@ along with the forward-sequence rewrite.
   preserved). Placement: Exterior Substrate → Toron home.
   The eight-phase migration is materialized in
   `plans/impl/050_per_tenant_memory_governance.md`.
+- **ADR 051 — Tenant-Explicit Descriptor Bootstrap.**
+  Promoted. Completes the multi-tenant arc (ADR 049 routing +
+  ADR 050 governance) by making Toron's **startup** descriptor
+  bootstrap tenant-explicit: each
+  `[catalog].descriptor_bootstrap_path` JSON entry carries a
+  required, nonzero `tenant_id` (+ `table_id`, `descriptor`),
+  loaded atomically into the ADR-049 tenant-keyed
+  `WendelonDescriptorRegistry`. Retires ADR 049's single-tenant
+  bootstrap (its D11 gap: the daemon applied every descriptor to
+  `config.node.tenant_id`) so one daemon can serve multiple
+  tenants' pre-existing tables. The source-not-mechanism
+  completion: fix the static single-tenant descriptor *source*;
+  add no new mechanism. Three council iterations: iter-0 3-way
+  (Codex+Claude startup config-file bootstrap; Gemini runtime SQL
+  management-message); iter-1 Claude resolved the mechanism 2-of-3
+  to the startup bootstrap (audit confirmed the flat format is
+  test-only — a contained pre-V1 supersession); iter-2 dual
+  converged on the shape; iter-3 two settlements. Final D-set:
+  **14 decisions, 17 architecture guards + 3 convention guards,
+  15 required integration fixtures + 2 V1-evidence optional**.
+  **D2 critical decision:** startup-only ingestion — no file
+  watch, reload endpoint, Wendelon descriptor-listing RPC, runtime
+  SQL admin message, or descriptor-management SQL.
+  **D3/D5 critical decision:** required nonzero `tenant_id` per
+  entry; loader returns `(TenantId, TableId, descriptor)` triples
+  and no longer reads `config.node.tenant_id`. Missing `tenant_id`
+  is a stable validation failure, **not** a fallback to
+  `[node].tenant_id`.
+  **D4 critical decision:** brand-clean rename
+  `ToronDescriptorBootstrap*` → `DescriptorBootstrap` /
+  `DescriptorBootstrapEntry`, traveling with this cycle per
+  `plans/conventions/continuous-refactoring.md` (the bootstrap
+  shape is already changing; adjacent mechanical rename in scope).
+  **D6/D7 critical decision:** the daemon uses
+  `WendelonDescriptorRegistry::from_tenant_descriptors` (atomic,
+  all-or-nothing) at `daemon.rs:142-149`; it must **not** default
+  descriptors to `TenantId(1)` / `[node].tenant_id` (named main
+  risk; guard 10). `config.node.tenant_id` stays the loopback SQL
+  tenant (ADR 049) — unchanged.
+  **D8 critical decision:** within-tenant duplicate rejection on
+  **registry index keys only** — `(tenant_id, table_id)` and
+  `(tenant_id, namespace, table_name)`; same keys allowed across
+  tenants. *No `table_object_id` validation* — that is Wendelon's
+  tenant-scoped durable identity, backstopped at runtime by
+  `request.table_object_id != descriptor.table_object_id` →
+  `DescriptorEvolved` (iter-3 Settlement 2; mirrors ADR 047 D8 /
+  ADR 049 D7 / ADR 050 D2 — validate at the layer that owns the
+  key, don't add machinery to police another layer's invariant).
+  **D11/D12 critical decision:** SQL tenant *source* and
+  execution-time scoping remain ADR 049 only; ADR 051 seeds
+  initial descriptors and nothing else.
+  *(Rejected 2-of-3 Codex+Claude: Gemini's runtime
+  `SqlMessage::Admin` ingestion + **`Monitor`-role** authorization
+  + new SQL error codes — a SQL wire surface plus a privilege
+  escalation, since `Monitor` is ADR 045's read-only observability
+  role; deferred to a future ADR over a proper catalog-write role
+  + audit. Also rejected: dual-shape backward compat; implicit
+  `[node].tenant_id` fallback.)*
+  **Single-plan posture; Toron-ring only.** No Wendelon production
+  change; no SQL wire change; no runtime ingestion;
+  `crates/nilket` runtime-free; `toron_fixture_worker.rs` source
+  unchanged; no per-tenant metric labels. Placement: Exterior
+  Substrate → Toron home. The `from_tenant_descriptors` atomic
+  constructor is the seam a future live-sync ADR reuses. The
+  seven-phase migration is materialized in
+  `plans/impl/051_tenant_explicit_descriptor_bootstrap.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4189,7 +4255,94 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 050 promoted; ADR 051 candidates
+### ADR 051 promoted; ADR 052 candidates
+
+ADR 051 selected and promoted **Tenant-Explicit Descriptor
+Bootstrap** — the startup-config completion of the multi-tenant
+arc (ADR 049 routing + ADR 050 governance). Each
+`[catalog].descriptor_bootstrap_path` JSON entry now carries a
+required, nonzero `tenant_id` (+ `table_id`, `descriptor`),
+loaded atomically into the ADR-049 tenant-keyed
+`WendelonDescriptorRegistry` via the new
+`from_tenant_descriptors` constructor. This retires ADR 049's
+single-tenant bootstrap (its D11 gap: the daemon applied every
+descriptor to `config.node.tenant_id`) so one daemon serves
+multiple tenants' pre-existing tables. The source-not-mechanism
+completion: fix the static single-tenant descriptor *source*; add
+no new mechanism. The mechanism split resolved 2-of-3
+Codex+Claude toward the startup config-file bootstrap over
+Gemini's runtime `SqlMessage::Admin` + `Monitor`-role ingestion
+(a SQL wire surface + a privilege escalation — `Monitor` is
+read-only observability; deferred to a future ADR over a proper
+catalog-write role + audit). Iter-3 also dropped the
+`table_object_id` duplicate check (validate registry index keys
+only — Wendelon backstops at runtime). Final D-set:
+**14 decisions, 17 architecture guards + 3 convention guards,
+15 required fixtures + 2 V1-evidence optional**.
+
+**Pure Toron-ring substrate; startup-only; zero Wendelon change,
+zero SQL wire change, zero runtime ingestion.** The brand-clean
+rename `ToronDescriptorBootstrap*` → `DescriptorBootstrap` /
+`DescriptorBootstrapEntry` travels with this cycle per
+`plans/conventions/continuous-refactoring.md`.
+
+**Architectural invariants preserved through this cycle:**
+
+- ADR 040 D4 / ADR 042-050 root-runtime-free
+  (`crates/nilket/Cargo.toml` untouched).
+- ADR 049 SQL tenant *source* (mTLS client cert remote;
+  `config.node.tenant_id` loopback) and execution-time scoping
+  unchanged — ADR 051 seeds initial descriptors only.
+- ADR 049/050 tenant routing + per-tenant budget paths unchanged.
+- ADR 045/049 metrics low-cardinality (no per-tenant labels).
+- No SQL wire change; no new `SqlMessage` variant; no runtime
+  ingestion / reload / file watch.
+- The daemon bootstrap must not default descriptors to
+  `TenantId(1)` / `[node].tenant_id` (named main risk; guard 10).
+- ADR 042 name-pin guards keep their names, assertions updated to
+  the brand-clean product types (meta-guard 17).
+- `toron_fixture_worker.rs` source unchanged; brand-clean / no-V1.
+- Placement: Exterior Substrate → Toron home
+  (ring-product-placement convention).
+
+The seven-phase migration is materialized in
+`plans/impl/051_tenant_explicit_descriptor_bootstrap.md`.
+
+**ADR 052 candidates:**
+
+After ADR 051, Toron's multi-tenant SQL gateway is complete for
+startup-known tables: logical routing (ADR 049), memory
+governance (ADR 050), and tenant-explicit descriptor seeding
+(ADR 051). The remaining descriptor gap is *liveness* — tables
+created in Wendelon after daemon start.
+
+- **Live Wendelon → Toron descriptor sync (LEAD)** — the
+  cross-ring successor: a Wendelon descriptor-query/snapshot API
+  (Wendelon sequence) + a Toron sync consumer reusing the
+  `from_tenant_descriptors` atomic seam. Gated on the new Wendelon
+  producer surface; closes the post-startup descriptor-discovery
+  gap that ADR 051 deliberately left to startup config.
+- **Runtime descriptor ingestion over a proper privilege model** —
+  a catalog-write role (NOT `Monitor`) + audit, the disciplined
+  form of Gemini's rejected runtime push. Distinct from sync
+  (operator-pushed vs. Wendelon-pulled).
+- **Per-tenant governance Phase 2** — CPU / rate-limiting /
+  connection caps / storage quotas / shared-pool borrowing /
+  queuing (deferred from ADR 050 D7/D10).
+- **Per-tenant metric labels** — bounded-cardinality budget-
+  utilization observability (deferred from ADR 050 D11 / ADR 045
+  posture).
+- **OTLP traces export**, **audit subsystem** (Toron deferred in
+  ADR 045 D7).
+- **SQL surface widening** — CTAS `IF NOT EXISTS`, `UPDATE WHERE`,
+  `INSERT/CTAS/DELETE ... RETURNING`.
+- **Live cert rotation / CRL / OCSP**; **token-based tenant claims
+  (JWT/OIDC/SPIFFE)**; **`observability-http` / `tls-pki`
+  Wendelon-side full migration**; gRPC / Arrow Flight / Postgres
+  frontends; strong cross-worker cancellation; prepared statements
+  (carried forward).
+
+### ADR 050 promoted; ADR 051 candidates (HISTORICAL)
 
 ADR 050 selected and promoted **Per-Tenant Memory Governance
 for Toron SQL** — the resource-isolation follow-through to
