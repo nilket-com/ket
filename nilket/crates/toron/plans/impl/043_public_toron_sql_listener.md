@@ -490,7 +490,7 @@ Add the 14 required fixtures across existing + new test files.
 
 - `toron_sql_wire_round_trips_arrow_ipc_batch` — construct `SqlFrame` with a `ResultBatch` carrying real Arrow IPC bytes; round-trip through `write_frame` / `read_frame`; assert byte-identical reconstruction.
 
-### `crates/toron/tests/toron_sql_listener_test.rs` (new)
+### `crates/toron/tests/sql_listener_test.rs` (new)
 
 - `toron_sql_listener_rejects_non_loopback_bind` — config with non-loopback SQL bind fails validation with D5 diagnostic.
 - `toron_daemon_prints_sql_ready_endpoint` — spawn `nilket toron start` as subprocess with `[sql]` enabled; parse both `READY <worker>` and `SQL_READY <sql>` from stdout.
@@ -523,8 +523,8 @@ cargo fmt --all
 cargo check -p toron -p nilket
 cargo test -p toron --test architecture_test adr043
 cargo test -p toron --test toron_sql_wire_test
-cargo test -p toron --test toron_sql_listener_test
-cargo test -p toron --test toron_config_test
+cargo test -p toron --test sql_listener_test
+cargo test -p toron --test config_test
 cargo test -p toron --test toron_daemon_test
 cargo test -p nilket
 git diff --check

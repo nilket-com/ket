@@ -51,9 +51,9 @@ The SAN wire convention remains the ADR 044 convention:
 
 Passed:
 
-- `cargo test -p toron --test toron_config_test`
+- `cargo test -p toron --test config_test`
   - 11 passed
-- `cargo test -p toron --test toron_tls_listener_test`
+- `cargo test -p toron --test tls_listener_test`
   - 9 passed
 - `cargo test -p toron --test architecture_test adr044`
   - 17 passed
@@ -72,12 +72,12 @@ Passed:
 
 Fixture coverage:
 
-- Required fixtures 1-5: covered by `toron_config_test` plus listener
+- Required fixtures 1-5: covered by `config_test` plus listener
   startup tests for encrypted/non-PKCS8 key rejection.
 - Required fixtures 6, 11, 12: covered by `cli::tests`, including
   mTLS flag success, env success, flag-over-env success, and unknown-CA
   connection-failure exit.
-- Required fixtures 7, 9, 10: covered by `toron_tls_listener_test`.
+- Required fixtures 7, 9, 10: covered by `tls_listener_test`.
 - Required fixture 8: covered by
   `toron_sql_select_executes_over_authenticated_remote_listener`.
 - Optional SAN helper evidence: covered by

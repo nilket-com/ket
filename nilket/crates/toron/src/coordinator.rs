@@ -239,18 +239,14 @@ where
 		plan: &LogicalPlan,
 		context: ExecutionContext,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
+		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
+		let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 		if matches!(
 			bound,
 			ExecutionPlan::CreateTable { .. } | ExecutionPlan::DropTable { .. }
 		) {
-			return execute_catalog_plan(
-				self.catalog.as_ref(),
-				self.admin.as_ref(),
-				&context,
-				&bound,
-			)
-			.await;
+			return execute_catalog_plan(catalog.as_ref(), self.admin.as_ref(), &context, &bound)
+				.await;
 		}
 		if matches!(bound, ExecutionPlan::Insert { .. }) {
 			let source_executor = DistributedMutationSourceExecutor {
@@ -258,7 +254,7 @@ where
 				context: &context,
 			};
 			return execute_write_plan_with_source(
-				self.catalog.as_ref(),
+				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
 				self.admin.as_ref(),
@@ -279,7 +275,7 @@ where
 				context: &context,
 			};
 			return execute_write_plan_with_source(
-				self.catalog.as_ref(),
+				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
 				self.admin.as_ref(),
@@ -741,13 +737,14 @@ impl QueryCoordinator {
 		plan: &LogicalPlan,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
+		let catalog = Arc::clone(&self.catalog).scoped(self.executor.context().tenant_id);
 		if matches!(
 			plan,
 			LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. }
 		) {
-			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
+			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			return execute_catalog_plan(
-				self.catalog.as_ref(),
+				catalog.as_ref(),
 				self.admin.as_ref(),
 				self.executor.context(),
 				&bound,
@@ -761,13 +758,13 @@ impl QueryCoordinator {
 				| LogicalPlan::CreateTableAsSelect { .. }
 				| LogicalPlan::Delete { .. }
 		) {
-			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
-			return self.execute_write_plan(&bound).await;
+			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			return self.execute_write_plan(catalog.as_ref(), &bound).await;
 		}
 
 		let mut retried_descriptor_evolution = false;
 		loop {
-			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
+			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			match self.executor.execute_bound(&bound, morsel).await {
 				Ok(results) => return Ok(results),
 				Err(ExecutionError::Storage(StorageError::DescriptorEvolved))
@@ -785,13 +782,14 @@ impl QueryCoordinator {
 
 	async fn execute_write_plan(
 		&self,
+		catalog: &dyn Catalog,
 		bound: &ExecutionPlan,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let source_executor = LocalMutationSourceExecutor {
 			executor: &self.executor,
 		};
 		execute_write_plan_with_source(
-			self.catalog.as_ref(),
+			catalog,
 			self.writer.as_ref(),
 			self.deleter.as_ref(),
 			self.admin.as_ref(),

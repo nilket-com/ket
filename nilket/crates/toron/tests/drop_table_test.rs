@@ -660,7 +660,7 @@ async fn wendelon_catalog_drop_table_semantics() {
 	};
 	catalog
 		.descriptor_registry()
-		.mark_finalized_drop(TableId(7), operation_id)
+		.mark_finalized_drop(TenantId(1), TableId(7), operation_id)
 		.expect("mark finalized drop");
 	let dropped = catalog
 		.drop_table(&TableRef::with_schema("bench", "orders"), true)

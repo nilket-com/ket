@@ -8,6 +8,7 @@ use toron::config::{
 	load_toron_bootstrap_config, render_example_config,
 };
 use toron::ir::TableId;
+use toron::storage::TenantId;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
@@ -301,7 +302,7 @@ fn toron_descriptor_bootstrap_loads_registry() {
 	let registry =
 		WendelonDescriptorRegistry::from_descriptors(descriptors).expect("descriptor registry");
 	let binding = registry
-		.resolve_table(&TableRef::with_schema("config_test", "sales"))
+		.resolve_table(TenantId(1), &TableRef::with_schema("config_test", "sales"))
 		.expect("resolve descriptor");
 	assert_eq!(binding.legacy_table_id, TableId(7));
 }

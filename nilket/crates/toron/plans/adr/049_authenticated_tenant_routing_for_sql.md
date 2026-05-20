@@ -314,6 +314,16 @@ source unchanged; brand-clean names, no V1 suffix
 14. `storage_descriptor_lookup_uses_request_tenant`
 15. `task_dispatch_preserves_admitted_tenant_in_task_context`
 
+Promotion note: fixtures 1-10 and 12-15 execute as tests.
+Fixture 11 is accepted by code-inspection / architecture-guard
+coverage of `WendelonCatalog::create_table` using
+`wendelon_tenant_id(self.tenant_id)` plus the ignored live fixture
+`wendelon_catalog_create_table_submits_schema_update_request`;
+the live fixture remains ignored because the simulated Wendelon
+fixture does not yet expose authenticated schema-update admin
+operations. This is an explicitly accepted coverage substitution,
+not a silently green executing fixture.
+
 **Optional V1-evidence (non-gating):**
 
 - `real_mtls_sql_round_trip_tenant_7_and_8` — full mTLS SQL
@@ -381,7 +391,10 @@ mirrors the ADR 047 D8 caller-owned-policy resolution).
 1. D-set locked at 12 (Codex+Claude convergent; Gemini-aligned
    except the scoped-catalog mechanism, resolved 2-of-3).
 2. Guard set 18 + 3 convention.
-3. Fixture set 15 required + 2 V1-evidence.
+3. Fixture set 15 required + 2 V1-evidence, with fixture 11
+   covered by accepted code-inspection / architecture-guard
+   evidence because the live Wendelon admin fixture remains
+   ignored for fixture-surface reasons.
 4. Single-plan, Toron-ring; no Wendelon production change.
 5. Placement: Exterior Substrate → Toron home (convention).
 6. No-V1-suffix convention; `toron_fixture_worker.rs` unchanged;

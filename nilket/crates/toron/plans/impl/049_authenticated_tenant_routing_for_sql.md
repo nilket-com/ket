@@ -239,8 +239,12 @@ optional real mTLS round-trip.
   where ADR 049 supersedes them (Phase 0.6 inventory). Document
   which prior guard/fixture names change in the evidence record.
 
-**Acceptance:** `cargo test -p toron` passes the 15 required;
-optional round-trip passes or is documented deferred.
+**Acceptance:** `cargo test -p toron` passes the required
+executing fixtures; fixture 11's live Wendelon admin round-trip
+is documented as an accepted code-inspection / architecture-guard
+coverage substitution while the simulated fixture remains unable
+to expose authenticated schema-update admin operations. Optional
+round-trip passes or is documented deferred.
 
 ## Phase 8: Evidence + promotion
 
@@ -281,7 +285,9 @@ supersession note).
   source (daemon.rs); registry tenant-keying + `Catalog::scoped`
   + `WendelonCatalog::scoped` (catalog.rs); coordinator bind-site
   (1 line, coordinator).
-- 18 guards + 3 convention; 15 required fixtures + 2 optional.
+- 18 guards + 3 convention; 15 required fixture targets + 2
+  optional, with fixture 11 covered by accepted code-inspection
+  evidence rather than an executing live admin fixture.
 
 ## Acceptance checklist
 
@@ -295,7 +301,8 @@ supersession note).
       + DDL under scoped tenant.
 - [ ] Phase 5 admitted tenant into `sql_execution_context`.
 - [ ] Phase 6 18 + 3 guards pass; ADR 040-048 guards pass.
-- [ ] Phase 7 15 required fixtures pass; legacy SAN supersession
+- [ ] Phase 7 required fixtures pass where executable; fixture 11
+      code-inspection substitution and legacy SAN supersession
       documented.
 - [ ] Phase 8 ADR + impl + roadmap promoted; evidence.
 

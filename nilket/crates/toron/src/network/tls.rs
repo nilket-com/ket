@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::config::TlsConfig;
 use crate::distributed::identity::WorkerId;
+use crate::storage::TenantId;
 
 pub const DEFAULT_CLUSTER_DOMAIN: &str = tls_pki::DEFAULT_CLUSTER_DOMAIN;
 pub const AUTH_QUIC_ALPN: &[u8] = b"sql-task-auth";
@@ -75,9 +76,16 @@ pub enum ListenerRole {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerKind {
-	SiblingDaemon { worker_id: WorkerId },
-	Client { principal: String },
-	Monitor { principal: String },
+	SiblingDaemon {
+		worker_id: WorkerId,
+	},
+	Client {
+		principal: String,
+		tenant_id: TenantId,
+	},
+	Monitor {
+		principal: String,
+	},
 }
 
 pub fn canonical_daemon_dns_name(worker_id: &WorkerId, cluster_domain: &str) -> String {
@@ -134,9 +142,13 @@ pub fn admit_san(
 		}
 		("toron", ListenerRole::Sql) => Err(TlsError::SanRoleRejected),
 		("toron", ListenerRole::Observability) => Err(TlsError::SanRoleRejected),
-		("client", ListenerRole::Sql) => Ok(PeerKind::Client {
-			principal: id_token.to_string(),
-		}),
+		("client", ListenerRole::Sql) => {
+			let tenant_id = parse_sql_tenant_id(id_token)?;
+			Ok(PeerKind::Client {
+				principal: id_token.to_string(),
+				tenant_id,
+			})
+		}
 		("client", ListenerRole::WorkerTask) => Err(TlsError::SanRoleRejected),
 		("client", ListenerRole::Observability) => Err(TlsError::SanRoleRejected),
 		("monitor", ListenerRole::Observability) => Ok(PeerKind::Monitor {
@@ -145,6 +157,45 @@ pub fn admit_san(
 		("monitor", ListenerRole::WorkerTask | ListenerRole::Sql) => Err(TlsError::SanRoleRejected),
 		_ => Err(TlsError::SanShapeRejected),
 	}
+}
+
+fn parse_sql_tenant_id(id_token: &str) -> Result<TenantId, TlsError> {
+	if id_token.is_empty()
+		|| id_token.starts_with('0')
+		|| !id_token.chars().all(|ch| ch.is_ascii_digit())
+	{
+		return Err(TlsError::SanShapeRejected);
+	}
+	let tenant_id = id_token
+		.parse::<u64>()
+		.map_err(|_| TlsError::SanShapeRejected)?;
+	Ok(TenantId(tenant_id))
+}
+
+pub fn accepted_sql_tenant(
+	connection: &quinn::Connection,
+	cluster_domain: &str,
+) -> Result<TenantId, TlsError> {
+	let peer_identity = connection
+		.peer_identity()
+		.ok_or(TlsError::SanShapeRejected)?;
+	let certs = peer_identity
+		.downcast::<Vec<CertificateDer<'static>>>()
+		.map_err(|_| TlsError::SanShapeRejected)?;
+	let leaf = certs.first().ok_or(TlsError::SanShapeRejected)?;
+	let dns_sans = extract_dns_sans(leaf).map_err(TlsError::from)?;
+	let mut tenant_id = None;
+	for san in dns_sans {
+		if let Ok(PeerKind::Client {
+			tenant_id: admitted,
+			..
+		}) = admit_san(&san, ListenerRole::Sql, cluster_domain)
+			&& tenant_id.replace(admitted).is_some()
+		{
+			return Err(TlsError::SanShapeRejected);
+		}
+	}
+	tenant_id.ok_or(TlsError::SanShapeRejected)
 }
 
 pub struct ListenerPolicy {
@@ -453,14 +504,15 @@ mod tests {
 	}
 
 	#[test]
-	fn sql_listener_admits_only_client_principal_sans() {
-		let admitted = admit_san("client-analytics.cluster.local", ListenerRole::Sql, DOMAIN)
-			.expect("admit client");
+	fn sql_listener_admits_only_numeric_client_tenant_sans() {
+		let admitted =
+			admit_san("client-7.cluster.local", ListenerRole::Sql, DOMAIN).expect("admit client");
 
 		assert_eq!(
 			admitted,
 			PeerKind::Client {
-				principal: "analytics".to_string(),
+				principal: "7".to_string(),
+				tenant_id: TenantId(7),
 			}
 		);
 		assert!(matches!(
@@ -471,6 +523,21 @@ mod tests {
 			),
 			Err(TlsError::SanRoleRejected)
 		));
+		for san in [
+			"client-analytics.cluster.local",
+			"client-007.cluster.local",
+			"client-0.cluster.local",
+			"client-+7.cluster.local",
+			"client-0x7.cluster.local",
+		] {
+			assert!(
+				matches!(
+					admit_san(san, ListenerRole::Sql, DOMAIN),
+					Err(TlsError::SanShapeRejected)
+				),
+				"{san} should be rejected for SQL"
+			);
+		}
 	}
 
 	#[test]

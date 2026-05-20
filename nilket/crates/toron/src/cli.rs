@@ -1535,7 +1535,7 @@ mod tests {
 	#[tokio::test]
 	async fn remote_sql_endpoint_dials_with_mtls_flags_and_env() {
 		let worker_id = crate::distributed::identity::WorkerId::from_u128(54);
-		let pki = CliSqlPki::generate(worker_id, "alice");
+		let pki = CliSqlPki::generate(worker_id, "1");
 		let server_name = crate::network::tls::canonical_daemon_dns_name(
 			&worker_id,
 			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
@@ -1641,7 +1641,7 @@ mod tests {
 	#[tokio::test]
 	async fn remote_sql_endpoint_unknown_ca_returns_connection_failure_exit() {
 		let worker_id = crate::distributed::identity::WorkerId::from_u128(55);
-		let pki = CliSqlPki::generate(worker_id, "alice");
+		let pki = CliSqlPki::generate(worker_id, "1");
 		let server = MinimalSqlServer::start(worker_id, &pki);
 		let server_name = crate::network::tls::canonical_daemon_dns_name(
 			&worker_id,

@@ -42,6 +42,8 @@ struct TestPki {
 	wrong_prefix_client_key: PathBuf,
 	subdomain_client_cert: PathBuf,
 	subdomain_client_key: PathBuf,
+	multiple_valid_client_cert: PathBuf,
+	multiple_valid_client_key: PathBuf,
 	subdomain_daemon_cert: PathBuf,
 	subdomain_daemon_key: PathBuf,
 	unknown_ca_client_cert: PathBuf,
@@ -51,7 +53,7 @@ struct TestPki {
 #[tokio::test]
 async fn remote_sql_listener_accepts_client_san_and_rejects_toron_san() {
 	let worker_id = WorkerId::from_u128(44);
-	let pki = TestPki::generate(worker_id, "analytics");
+	let pki = TestPki::generate(worker_id, "1");
 	let daemon = ToronDaemon::start(tls_config(
 		worker_id,
 		&pki,
@@ -99,7 +101,7 @@ async fn remote_sql_listener_accepts_client_san_and_rejects_toron_san() {
 #[tokio::test]
 async fn remote_worker_task_listener_accepts_toron_peer_san() {
 	let worker_id = WorkerId::from_u128(45);
-	let pki = TestPki::generate(worker_id, "analytics");
+	let pki = TestPki::generate(worker_id, "1");
 	let daemon = ToronDaemon::start(tls_config(
 		worker_id,
 		&pki,
@@ -133,7 +135,7 @@ async fn remote_worker_task_listener_accepts_toron_peer_san() {
 #[tokio::test]
 async fn remote_worker_task_listener_rejects_client_san() {
 	let worker_id = WorkerId::from_u128(46);
-	let pki = TestPki::generate(worker_id, "analytics");
+	let pki = TestPki::generate(worker_id, "1");
 	let daemon = ToronDaemon::start(tls_config(
 		worker_id,
 		&pki,
@@ -167,7 +169,7 @@ async fn remote_worker_task_listener_rejects_client_san() {
 #[tokio::test]
 async fn remote_worker_task_listener_rejects_subdomain_injection_san() {
 	let worker_id = WorkerId::from_u128(47);
-	let pki = TestPki::generate(worker_id, "analytics");
+	let pki = TestPki::generate(worker_id, "1");
 	let daemon = ToronDaemon::start(tls_config(
 		worker_id,
 		&pki,
@@ -201,7 +203,7 @@ async fn remote_worker_task_listener_rejects_subdomain_injection_san() {
 #[tokio::test]
 async fn remote_sql_listener_rejects_malformed_client_sans_and_unknown_ca() {
 	let worker_id = WorkerId::from_u128(48);
-	let pki = TestPki::generate(worker_id, "analytics");
+	let pki = TestPki::generate(worker_id, "1");
 	let daemon = ToronDaemon::start(tls_config(
 		worker_id,
 		&pki,
@@ -250,9 +252,45 @@ async fn remote_sql_listener_rejects_malformed_client_sans_and_unknown_ca() {
 }
 
 #[tokio::test]
-async fn daemon_rejects_wildcard_listener_cert() {
+async fn remote_sql_listener_rejects_multiple_valid_client_tenant_sans() {
 	let worker_id = WorkerId::from_u128(49);
-	let pki = TestPki::generate_with_daemon_dns("analytics", "*.cluster.local");
+	let pki = TestPki::generate(worker_id, "1");
+	let daemon = ToronDaemon::start(tls_config(
+		worker_id,
+		&pki,
+		"127.0.0.1:0".parse().expect("worker bind"),
+		Some("0.0.0.0:0".parse().expect("sql bind")),
+	))
+	.await
+	.expect("start TLS SQL daemon");
+	let endpoint = connectable_loopback_addr(daemon.handle().sql_endpoint.expect("sql endpoint"));
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let rejected = tokio::time::timeout(
+		Duration::from_secs(2),
+		execute_sql_with_tls(
+			endpoint,
+			&server_name,
+			&pki.multiple_valid_client_cert,
+			&pki.multiple_valid_client_key,
+			&pki.ca_cert,
+		),
+	)
+	.await;
+	match rejected {
+		Ok(Ok(message)) => {
+			panic!("SQL listener accepted ambiguous client tenant cert: {message:?}")
+		}
+		Ok(Err(_)) | Err(_) => {}
+	}
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn daemon_rejects_wildcard_listener_cert() {
+	let worker_id = WorkerId::from_u128(50);
+	let pki = TestPki::generate_with_daemon_dns("1", "*.cluster.local");
 	expect_daemon_start_error_contains(
 		tls_config(
 			worker_id,
@@ -267,9 +305,9 @@ async fn daemon_rejects_wildcard_listener_cert() {
 
 #[tokio::test]
 async fn daemon_rejects_listener_cert_for_different_worker_id() {
-	let worker_id = WorkerId::from_u128(50);
-	let wrong_worker_id = WorkerId::from_u128(51);
-	let pki = TestPki::generate(wrong_worker_id, "analytics");
+	let worker_id = WorkerId::from_u128(51);
+	let wrong_worker_id = WorkerId::from_u128(52);
+	let pki = TestPki::generate(wrong_worker_id, "1");
 	expect_daemon_start_error_contains(
 		tls_config(
 			worker_id,
@@ -284,8 +322,8 @@ async fn daemon_rejects_listener_cert_for_different_worker_id() {
 
 #[tokio::test]
 async fn daemon_rejects_non_pkcs8_listener_key() {
-	let worker_id = WorkerId::from_u128(52);
-	let pki = TestPki::generate(worker_id, "analytics");
+	let worker_id = WorkerId::from_u128(53);
+	let pki = TestPki::generate(worker_id, "1");
 	std::fs::write(&pki.daemon_key, "not a PEM PKCS8 private key").expect("overwrite key");
 	expect_daemon_start_error_contains(
 		tls_config(
@@ -301,8 +339,8 @@ async fn daemon_rejects_non_pkcs8_listener_key() {
 
 #[tokio::test]
 async fn daemon_rejects_encrypted_listener_key() {
-	let worker_id = WorkerId::from_u128(53);
-	let pki = TestPki::generate(worker_id, "analytics");
+	let worker_id = WorkerId::from_u128(54);
+	let pki = TestPki::generate(worker_id, "1");
 	std::fs::write(
 		&pki.daemon_key,
 		"-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIB\n-----END ENCRYPTED PRIVATE KEY-----\n",
@@ -368,6 +406,13 @@ impl TestPki {
 			"client-analytics.evil.cluster.local",
 			&[ExtendedKeyUsagePurpose::ClientAuth],
 		);
+		let multiple_valid_client = leaf_cert_many(
+			&[
+				canonical_client_dns_name("7", DEFAULT_CLUSTER_DOMAIN),
+				canonical_client_dns_name("8", DEFAULT_CLUSTER_DOMAIN),
+			],
+			&[ExtendedKeyUsagePurpose::ClientAuth],
+		);
 		let subdomain_daemon = leaf_cert(
 			"toron-foo.evil.cluster.local",
 			&[ExtendedKeyUsagePurpose::ClientAuth],
@@ -385,6 +430,8 @@ impl TestPki {
 			wrong_prefix_client_key: dir.join("wrong-prefix-client.key"),
 			subdomain_client_cert: dir.join("subdomain-client.pem"),
 			subdomain_client_key: dir.join("subdomain-client.key"),
+			multiple_valid_client_cert: dir.join("multiple-valid-client.pem"),
+			multiple_valid_client_key: dir.join("multiple-valid-client.key"),
 			subdomain_daemon_cert: dir.join("subdomain-daemon.pem"),
 			subdomain_daemon_key: dir.join("subdomain-daemon.key"),
 			unknown_ca_client_cert: dir.join("unknown-ca-client.pem"),
@@ -409,6 +456,12 @@ impl TestPki {
 			&pki.subdomain_client_cert,
 			&pki.subdomain_client_key,
 			&subdomain,
+			&ca,
+		);
+		write_signed_cert(
+			&pki.multiple_valid_client_cert,
+			&pki.multiple_valid_client_key,
+			&multiple_valid_client,
 			&ca,
 		);
 		write_signed_cert(
@@ -497,10 +550,19 @@ fn ca_cert() -> Certificate {
 }
 
 fn leaf_cert(dns_name: &str, extended_key_usages: &[ExtendedKeyUsagePurpose]) -> Certificate {
-	let mut params = CertificateParams::new(vec![dns_name.to_string()]);
+	leaf_cert_many(&[dns_name.to_string()], extended_key_usages)
+}
+
+fn leaf_cert_many(
+	dns_names: &[String],
+	extended_key_usages: &[ExtendedKeyUsagePurpose],
+) -> Certificate {
+	let mut params = CertificateParams::new(dns_names.to_vec());
 	params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
 	params.extended_key_usages = extended_key_usages.to_vec();
-	params.distinguished_name.push(DnType::CommonName, dns_name);
+	params
+		.distinguished_name
+		.push(DnType::CommonName, &dns_names[0]);
 	Certificate::from_params(params).expect("leaf cert")
 }
 

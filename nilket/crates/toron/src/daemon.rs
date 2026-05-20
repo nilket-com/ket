@@ -36,7 +36,7 @@ use crate::network::observability::{
 	ListenerName, MetricsRegistry, ObservabilityEndpoints, ObservabilityShutdownReceivers,
 	ReadinessState,
 };
-use crate::network::tls::{ListenerPolicy, ListenerRole, TlsError};
+use crate::network::tls::{ListenerPolicy, ListenerRole, TlsError, accepted_sql_tenant};
 use crate::quic::{QuicEndpoint, QuicStream};
 use crate::server::transport::QuicTransport;
 use crate::server::{ToronWorker, memory::MemoryManager};
@@ -144,12 +144,13 @@ impl ToronDaemon {
 			None => Vec::new(),
 		};
 		let descriptors_loaded = descriptor_pairs.len() as u64;
-		let registry = Arc::new(WendelonDescriptorRegistry::from_descriptors(
+		let registry = Arc::new(WendelonDescriptorRegistry::from_descriptors_for_tenant(
+			config.node.tenant_id,
 			descriptor_pairs,
 		)?);
 		tracing::info!("descriptor_registry_constructed");
 
-		let tenant_id = wendelon::schema::TenantId::new(config.node.tenant_id.0);
+		let tenant_id = config.node.tenant_id;
 
 		let catalog = Arc::new(WendelonCatalog::with_client_and_registry(
 			Arc::clone(&client),
@@ -280,6 +281,14 @@ impl ToronDaemon {
 		)));
 
 		let sql_endpoint = if let Some(sql_config) = config.sql.clone() {
+			let authenticated_sql =
+				tls_policy.is_some() && !sql_config.listener_bind.ip().is_loopback();
+			let sql_tenant_source = match (&tls_policy, authenticated_sql) {
+				(Some(policy), true) => SqlTenantSource::AuthenticatedPeer {
+					cluster_domain: policy.cluster_domain().to_string(),
+				},
+				_ => SqlTenantSource::LoopbackConfig(config.node.tenant_id),
+			};
 			let sql_quic_endpoint = match (&tls_policy, sql_config.listener_bind.ip().is_loopback())
 			{
 				(Some(policy), false) => QuicEndpoint::bind_authenticated(
@@ -297,7 +306,7 @@ impl ToronDaemon {
 				sql_shutdown_rx,
 				Arc::clone(&connection_tasks),
 				Arc::clone(&metrics),
-				config.node.tenant_id,
+				sql_tenant_source,
 				sql_config.statement_timeout,
 			)));
 			Some(sql_endpoint)
@@ -539,13 +548,30 @@ async fn handle_quic_worker_connection(
 	worker.handle_connection(stream).await
 }
 
+#[derive(Clone)]
+enum SqlTenantSource {
+	LoopbackConfig(TenantId),
+	AuthenticatedPeer { cluster_domain: String },
+}
+
+impl SqlTenantSource {
+	fn resolve(&self, connection: &quinn::Connection) -> Result<TenantId, TlsError> {
+		match self {
+			Self::LoopbackConfig(tenant_id) => Ok(*tenant_id),
+			Self::AuthenticatedPeer { cluster_domain } => {
+				accepted_sql_tenant(connection, cluster_domain)
+			}
+		}
+	}
+}
+
 async fn run_sql_accept_loop(
 	coordinator: Arc<DistributedQueryCoordinator<StaticWorkerRegistry, QuicTransport>>,
 	endpoint: QuicEndpoint,
 	mut shutdown_rx: oneshot::Receiver<()>,
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
 	metrics: Arc<MetricsRegistry>,
-	tenant_id: crate::storage::TenantId,
+	tenant_source: SqlTenantSource,
 	statement_timeout: std::time::Duration,
 ) {
 	loop {
@@ -557,6 +583,18 @@ async fn run_sql_accept_loop(
 			accepted = endpoint.accept_connection() => match accepted {
 				Ok(connection) => {
 					metrics.increment_accept(ListenerName::Sql);
+					let tenant_id = match tenant_source.resolve(&connection) {
+						Ok(tenant_id) => tenant_id,
+						Err(error) => {
+							metrics.increment_reject(
+								ListenerName::Sql,
+								crate::network::observability::RejectReason::SanShapeRejected,
+							);
+							tracing::warn!(error = %error, "sql peer tenant extraction failed");
+							connection.close(0_u32.into(), b"sql tenant rejected");
+							continue;
+						}
+					};
 					let coordinator = Arc::clone(&coordinator);
 					connection_tasks.lock().await.spawn(async move {
 						match QuicEndpoint::accept_stream_on(&connection).await {

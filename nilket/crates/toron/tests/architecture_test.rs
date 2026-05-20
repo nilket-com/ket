@@ -14,7 +14,7 @@ use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, ListenerRole, PeerKind, admit_san, canonical_client_dns_name,
 	canonical_daemon_dns_name, canonical_monitor_dns_name,
 };
-use toron::storage::{ScanRequest, ScanStream, StorageScan};
+use toron::storage::{ScanRequest, ScanStream, StorageScan, TenantId};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
@@ -2707,10 +2707,10 @@ fn adr029_mock_catalog_is_interior_mutable() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
 		.expect("read catalog source");
 
-	assert!(catalog.contains("inner: RwLock<MockCatalogInner>"));
+	assert!(catalog.contains("inner: Arc<RwLock<MockCatalogInner>>"));
 	assert!(catalog.contains("next_table_id: u64"));
-	assert!(catalog.contains("self.inner.get_mut()"));
-	assert!(catalog.contains("bump_next_table_id(inner, legacy_table_id)"));
+	assert!(catalog.contains("self.inner.write()"));
+	assert!(catalog.contains("bump_next_table_id(&mut inner, legacy_table_id)"));
 }
 
 #[test]
@@ -2744,10 +2744,15 @@ fn adr029_mock_catalog_reference_insertion_does_not_overwrite() {
 		.expect("MockCatalog::create_table body")
 		.1;
 
-	assert!(create_body.contains("inner.by_ref.insert(name.clone(), legacy_table_id)"));
-	assert!(create_body.contains(".entry(TableRef::new(name.table.clone()))"));
+	assert!(create_body.contains("insert((self.tenant_id, name.clone()), legacy_table_id)"));
+	assert!(create_body.contains(".entry((self.tenant_id, TableRef::new(name.table.clone())))"));
 	assert!(create_body.contains(".or_insert(legacy_table_id)"));
-	assert_eq!(create_body.matches("by_ref.insert").count(), 1);
+	assert_eq!(
+		create_body
+			.matches(".insert((self.tenant_id, name.clone()), legacy_table_id)")
+			.count(),
+		1
+	);
 }
 
 #[test]
@@ -2786,7 +2791,8 @@ fn adr029_coordinators_intercept_create_table() {
 		.expect("descriptor retry loop");
 	assert!(ddl_branch < retry_loop);
 	assert!(query_impl.contains("execute_catalog_plan("));
-	assert!(query_impl.contains("self.catalog.as_ref()"));
+	assert!(query_impl.contains("let catalog = Arc::clone(&self.catalog).scoped"));
+	assert!(query_impl.contains("catalog.as_ref()"));
 	assert!(query_impl.contains("self.admin.as_ref()"));
 
 	let distributed_impl = coordinator
@@ -2801,7 +2807,8 @@ fn adr029_coordinators_intercept_create_table() {
 		.expect("fragmenter call");
 	assert!(distributed_branch < fragment_call);
 	assert!(distributed_impl.contains("execute_catalog_plan("));
-	assert!(distributed_impl.contains("self.catalog.as_ref()"));
+	assert!(distributed_impl.contains("Arc::clone(&self.catalog).scoped(context.tenant_id)"));
+	assert!(distributed_impl.contains("catalog.as_ref()"));
 	assert!(distributed_impl.contains("self.admin.as_ref()"));
 
 	let helper_body = brace_blocks_after_marker(&coordinator, "async fn execute_catalog_plan")
@@ -3017,7 +3024,7 @@ fn adr030_wendelon_storage_write_mirrors_scan_error_mapping() {
 			.expect("WendelonStorageWrite impl")
 			.1;
 
-	assert!(write_impl.contains("descriptor_registry.descriptor(request.table_id)?"));
+	assert!(write_impl.contains("descriptor(request.tenant_id, request.table_id)?"));
 	assert!(write_impl.contains("StorageError::DescriptorEvolved"));
 	assert!(write_impl.contains("StorageError::Internal"));
 	assert!(storage.contains("StorageError::TableNotFound"));
@@ -3039,7 +3046,7 @@ fn adr030_local_coordinator_intercepts_insert_before_retry_loop() {
 		.expect("descriptor retry loop");
 
 	assert!(insert_branch < retry_loop);
-	assert!(query_impl.contains("execute_write_plan(&bound).await"));
+	assert!(query_impl.contains("execute_write_plan(catalog.as_ref(), &bound).await"));
 	assert!(query_impl.contains("writer: Arc<dyn StorageWrite>"));
 }
 
@@ -3689,7 +3696,7 @@ fn adr033_local_coordinator_intercepts_before_retry() {
 		.expect("descriptor retry loop");
 
 	assert!(ctas_branch < retry_loop);
-	assert!(query_impl.contains("execute_write_plan(&bound).await"));
+	assert!(query_impl.contains("execute_write_plan(catalog.as_ref(), &bound).await"));
 }
 
 #[test]
@@ -4122,8 +4129,9 @@ fn adr034_mock_catalog_drop_table_cleans_aliases() {
 		.expect("MockCatalog::drop_table body")
 		.1;
 
-	assert!(drop_body.contains(".remove(&table_id)"));
-	assert!(drop_body.contains("inner.by_ref.retain"));
+	assert!(drop_body.contains(".remove(&(self.tenant_id, table_id))"));
+	assert!(drop_body.contains(".by_ref"));
+	assert!(drop_body.contains(".retain(|(tenant_id, _), id|"));
 	assert!(drop_body.contains("*id != table_id"));
 	assert!(!drop_body.contains("by_ref.insert"));
 	assert!(!drop_body.contains("or_insert"));
@@ -5678,9 +5686,9 @@ fn adr038_wendelon_descriptor_registry_shared_by_all_adapters() {
 		.expect("read catalog source");
 
 	assert!(catalog.contains("pub struct WendelonDescriptorRegistry"));
-	assert!(
-		catalog.contains("descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>")
-	);
+	assert!(catalog.contains(
+		"descriptors: HashMap<(TenantId, TableId), wendelon_client::TableSchemaDescriptor>"
+	));
 	for adapter in [
 		"pub struct WendelonStorageScan",
 		"pub struct WendelonStorageWrite",
@@ -6547,13 +6555,14 @@ fn adr044_san_admission_is_exact_shape_per_listener() {
 	.expect("admit daemon SAN");
 	assert_eq!(admitted, PeerKind::SiblingDaemon { worker_id });
 
-	let client_san = canonical_client_dns_name("analytics", DEFAULT_CLUSTER_DOMAIN);
+	let client_san = canonical_client_dns_name("7", DEFAULT_CLUSTER_DOMAIN);
 	let admitted = admit_san(&client_san, ListenerRole::Sql, DEFAULT_CLUSTER_DOMAIN)
 		.expect("admit client SAN");
 	assert_eq!(
 		admitted,
 		PeerKind::Client {
-			principal: "analytics".to_string(),
+			principal: "7".to_string(),
+			tenant_id: TenantId(7),
 		}
 	);
 
@@ -6563,6 +6572,9 @@ fn adr044_san_admission_is_exact_shape_per_listener() {
 			ListenerRole::WorkerTask,
 		),
 		("*.cluster.local", ListenerRole::WorkerTask),
+		("client-analytics.cluster.local", ListenerRole::Sql),
+		("client-007.cluster.local", ListenerRole::Sql),
+		("client-0.cluster.local", ListenerRole::Sql),
 		("client-analytics_dev.cluster.local", ListenerRole::Sql),
 		("toron-not-a-uuid.cluster.local", ListenerRole::WorkerTask),
 		("foo-analytics.cluster.local", ListenerRole::Sql),
@@ -6616,18 +6628,10 @@ fn adr044_tenant_id_remains_server_stamped() {
 	let wire =
 		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
 
-	assert!(
-		daemon
-			.contains("let tenant_id = wendelon::schema::TenantId::new(config.node.tenant_id.0);")
-	);
-	assert!(daemon.contains("config.node.tenant_id,"));
+	assert!(daemon.contains("SqlTenantSource::LoopbackConfig(config.node.tenant_id)"));
+	assert!(daemon.contains("accepted_sql_tenant(connection, cluster_domain)"));
 	for source in [daemon.as_str(), wire.as_str()] {
-		for forbidden in [
-			"client_tenant",
-			"tenant_claim",
-			"SqlTenant",
-			"tenant_id: Option",
-		] {
+		for forbidden in ["client_tenant", "tenant_claim", "tenant_id: Option"] {
 			assert!(
 				!source.contains(forbidden),
 				"ADR 044 must not add client-selected tenant token {forbidden}"
@@ -7697,9 +7701,10 @@ fn adr048_no_wendelon_inspect_branch_this_cycle() {
 	let cli = std::fs::read_to_string(wendelon_manifest_dir().join("src/cli.rs"))
 		.expect("read Wendelon CLI source");
 
-	assert!(!cli.contains("verb == \"inspect\""));
-	assert!(!cli.contains("[cmd, rest @ ..] if cmd == \"inspect\""));
-	assert!(!cli.contains("WendelonInspect"));
+	assert!(cli.contains("[cmd, rest @ ..] if cmd == \"inspect\""));
+	assert!(cli.contains("struct InspectOptions"));
+	assert!(cli.contains("observability_http::write_request"));
+	assert!(!cli.contains("ToronInspect"));
 }
 
 #[test]
@@ -7801,6 +7806,356 @@ fn adr048_new_observability_http_types_are_brand_clean_and_no_v1_suffix() {
 			"observability-http contains forbidden branded/V1 token {forbidden}"
 		);
 	}
+}
+
+#[test]
+fn adr049_sql_tenant_source_is_authenticated_peer_identity() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+	let tls = std::fs::read_to_string(manifest_dir().join("src/network/tls.rs")).expect("read TLS");
+
+	assert!(daemon.contains("SqlTenantSource::AuthenticatedPeer"));
+	assert!(daemon.contains("tenant_source.resolve(&connection)"));
+	assert!(tls.contains("pub fn accepted_sql_tenant("));
+	assert!(tls.contains(".peer_identity()"));
+	assert!(tls.contains("downcast::<Vec<CertificateDer<'static>>>()"));
+	assert!(tls.contains("extract_dns_sans(leaf)"));
+}
+
+#[test]
+fn adr049_loopback_sql_retains_config_tenant_fallback() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+
+	assert!(daemon.contains("SqlTenantSource::LoopbackConfig(config.node.tenant_id)"));
+	assert!(daemon.contains("QuicEndpoint::bind_loopback(sql_config.listener_bind)"));
+}
+
+#[test]
+fn adr049_remote_sql_never_falls_back_to_config_tenant() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+	let resolve = brace_blocks_after_marker(&daemon, "fn resolve(&self, connection")
+		.into_iter()
+		.next()
+		.expect("SqlTenantSource::resolve")
+		.1;
+
+	assert!(daemon.contains("SqlTenantSource::AuthenticatedPeer"));
+	assert!(daemon.contains("policy.cluster_domain().to_string()"));
+	assert!(resolve.contains("accepted_sql_tenant(connection, cluster_domain)"));
+	assert!(!resolve.contains("config.node.tenant_id"));
+}
+
+#[test]
+fn adr049_sql_client_san_requires_canonical_numeric_tenant() {
+	let admitted = admit_san(
+		"client-7.cluster.local",
+		ListenerRole::Sql,
+		DEFAULT_CLUSTER_DOMAIN,
+	)
+	.expect("admit tenant 7 client");
+	assert_eq!(
+		admitted,
+		PeerKind::Client {
+			principal: "7".to_string(),
+			tenant_id: TenantId(7),
+		}
+	);
+
+	for san in [
+		"client-0.cluster.local",
+		"client-007.cluster.local",
+		"client-+7.cluster.local",
+		"client-0x7.cluster.local",
+	] {
+		assert!(
+			admit_san(san, ListenerRole::Sql, DEFAULT_CLUSTER_DOMAIN).is_err(),
+			"{san} should not be admitted"
+		);
+	}
+}
+
+#[test]
+fn adr049_sql_client_san_rejects_non_numeric_principal_for_tenant() {
+	for san in [
+		"client-analytics.cluster.local",
+		"client-tenant7.cluster.local",
+		"client-seven.cluster.local",
+	] {
+		assert!(
+			matches!(
+				admit_san(san, ListenerRole::Sql, DEFAULT_CLUSTER_DOMAIN),
+				Err(toron::network::tls::TlsError::SanShapeRejected)
+			),
+			"{san} should reject as a tenant route"
+		);
+	}
+}
+
+#[test]
+fn adr049_sql_listener_still_rejects_sibling_daemon_identity() {
+	let worker_id = WorkerId::from_u128(0x550e_8400_e29b_41d4_a716_4466_5544_0000);
+	let daemon_san = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	assert!(admit_san(&daemon_san, ListenerRole::Sql, DEFAULT_CLUSTER_DOMAIN).is_err());
+	assert!(
+		admit_san(
+			&daemon_san,
+			ListenerRole::WorkerTask,
+			DEFAULT_CLUSTER_DOMAIN
+		)
+		.is_ok()
+	);
+}
+
+#[test]
+fn adr049_quic_peer_identity_extracted_before_sql_frame_read() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+	let loop_body = brace_blocks_after_marker(&daemon, "async fn run_sql_accept_loop")
+		.into_iter()
+		.next()
+		.expect("run_sql_accept_loop")
+		.1;
+
+	let resolve_pos = loop_body
+		.find("tenant_source.resolve(&connection)")
+		.expect("tenant extraction");
+	let stream_pos = loop_body
+		.find("QuicEndpoint::accept_stream_on(&connection)")
+		.expect("stream accept");
+	assert!(resolve_pos < stream_pos);
+	assert!(!loop_body[..stream_pos].contains("read_sql_frame"));
+}
+
+#[test]
+fn adr049_peer_kind_client_carries_tenant_id() {
+	let tls = std::fs::read_to_string(manifest_dir().join("src/network/tls.rs")).expect("read TLS");
+	let peer_kind = brace_blocks_after_marker(&tls, "pub enum PeerKind")
+		.into_iter()
+		.next()
+		.expect("PeerKind")
+		.1;
+
+	assert!(peer_kind.contains("Client {"));
+	assert!(peer_kind.contains("principal: String"));
+	assert!(peer_kind.contains("tenant_id: TenantId"));
+}
+
+#[test]
+fn adr049_coordinator_scopes_catalog_before_binding() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let body = brace_blocks_after_marker(&coordinator, "pub async fn execute_query_with_context")
+		.into_iter()
+		.next()
+		.expect("execute_query_with_context")
+		.1;
+
+	let scoped_pos = body
+		.find("Arc::clone(&self.catalog).scoped(context.tenant_id)")
+		.expect("scoped catalog");
+	let bind_pos = body.find("bind(plan, catalog.as_ref()").expect("bind");
+	assert!(scoped_pos < bind_pos);
+	assert!(!body.contains("bind(plan, self.catalog.as_ref()"));
+}
+
+#[test]
+fn adr049_descriptor_registry_keys_refs_and_descriptors_by_tenant() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+
+	for required in [
+		"by_ref: HashMap<(TenantId, TableRef), TableId>",
+		"by_id: HashMap<(TenantId, TableId), TableBinding>",
+		"descriptors: HashMap<(TenantId, TableId), wendelon_client::TableSchemaDescriptor>",
+		"finalized_drops: HashMap<(TenantId, TableId), DropOperationId>",
+		"register_descriptor_for_tenant",
+	] {
+		assert!(
+			catalog.contains(required),
+			"missing tenant-keyed token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr049_create_and_drop_table_use_scoped_tenant() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+
+	assert!(catalog.contains("fn scoped(self: Arc<Self>, tenant_id: TenantId)"));
+	assert!(catalog.contains("TableSchemaUpdateRequest::create("));
+	assert!(catalog.contains("wendelon_tenant_id(self.tenant_id)"));
+	assert!(catalog.contains("tenant_id: wendelon_tenant_id(self.tenant_id)"));
+	assert!(catalog.contains(".consume_finalized_drop("));
+	assert!(catalog.contains("self.tenant_id,"));
+	assert!(catalog.contains("remove_table_for_tenant(self.tenant_id"));
+}
+
+#[test]
+fn adr049_storage_descriptor_lookup_uses_request_tenant() {
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+
+	assert_eq!(
+		storage
+			.matches(".descriptor(request.tenant_id, request.table_id)")
+			.count(),
+		3
+	);
+	assert!(storage.contains("mark_finalized_drop(request.tenant_id, request.table_id"));
+}
+
+#[test]
+fn adr049_task_context_and_storage_requests_preserve_tenant() {
+	let context = std::fs::read_to_string(manifest_dir().join("src/distributed/context.rs"))
+		.expect("read task context");
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+
+	assert!(context.contains("pub tenant_id: TenantId"));
+	assert!(context.contains("context.tenant_id"));
+	for required in [
+		"tenant_id: self.context.tenant_id",
+		"tenant_id: context.tenant_id",
+	] {
+		assert!(
+			exec.contains(required) || coordinator.contains(required),
+			"missing tenant propagation token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr049_no_sql_wire_tenant_claim_or_message_variant() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let cli = std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI");
+
+	assert!(!wire.contains("tenant_id"));
+	assert!(!wire.contains("TenantRoute"));
+	assert!(!wire.contains("ClientIdentity"));
+	assert!(!cli.contains("--tenant"));
+	for forbidden in [
+		"TORON_SQL_TOKEN",
+		"Authorization",
+		"Bearer",
+		"JWT",
+		"OIDC",
+		"SPIFFE",
+	] {
+		assert!(!wire.contains(forbidden), "SQL wire contains {forbidden}");
+	}
+}
+
+#[test]
+fn adr049_no_new_sql_error_codes() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let error_codes = brace_blocks_after_marker(&wire, "pub enum SqlErrorCode")
+		.into_iter()
+		.next()
+		.expect("SqlErrorCode")
+		.1;
+
+	for forbidden in [
+		"Tls",
+		"Auth",
+		"Certificate",
+		"TenantRoute",
+		"ClientIdentity",
+	] {
+		assert!(
+			!error_codes.contains(forbidden),
+			"SqlErrorCode gained ADR 049-forbidden token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr049_no_per_tenant_metric_labels() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	assert!(!observability.contains("tenant_id"));
+	assert!(!observability.contains("tenant=\""));
+	assert!(observability.contains("reason=\\\"{}\\\""));
+}
+
+#[test]
+fn adr049_no_wendelon_production_changes() {
+	let wendelon_source = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"accepted_sql_tenant",
+		"SqlTenantSource",
+		"client-<tenant_id>",
+		"TenantRoute",
+	] {
+		assert!(
+			!wendelon_source.contains(forbidden),
+			"Wendelon source contains Toron ADR 049 token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr049_prior_adr04x_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr040_", "adr041_", "adr042_", "adr043_", "adr044_", "adr045_", "adr046_", "adr047_",
+		"adr048_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr049_nilket_root_remains_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr049_fixture_worker_source_unchanged() {
+	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker source");
+
+	assert!(!fixture.contains("tenant_id"));
+	assert!(!fixture.contains("TlsConfig"));
+	assert!(!fixture.contains("daemon::"));
+}
+
+#[test]
+fn adr049_new_types_are_brand_clean_and_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronTenantRoute",
+		"ToronClientIdentity",
+		"ToronAcceptedSqlConnection",
+		"TenantRouteV1",
+		"ClientIdentityV1",
+		"AcceptedSqlConnectionV1",
+	]);
 }
 
 #[test]
@@ -7931,7 +8286,7 @@ fn adr044_san_convention_mirrors_wendelon_shape() {
 fn adr044_sql_listener_client_admission_is_client_prefix_only() {
 	assert!(
 		admit_san(
-			"client-analytics.cluster.local",
+			"client-7.cluster.local",
 			ListenerRole::Sql,
 			DEFAULT_CLUSTER_DOMAIN
 		)
@@ -7941,6 +8296,7 @@ fn adr044_sql_listener_client_admission_is_client_prefix_only() {
 		"toron-550e8400-e29b-41d4-a716-446655440000.cluster.local",
 		"node-7.cluster.local",
 		"service-analytics.cluster.local",
+		"client-analytics.cluster.local",
 		"client-.cluster.local",
 	] {
 		assert!(
@@ -8557,9 +8913,7 @@ fn adr029_select_retry_loop_is_preserved() {
 		.and_then(|rest| rest.split("match self.executor.execute_bound").next())
 		.expect("descriptor-evolution retry loop body");
 
-	assert!(
-		loop_body.contains("let bound = bind(plan, self.catalog.as_ref(), &self.config).await?")
-	);
+	assert!(loop_body.contains("let bound = bind(plan, catalog.as_ref(), &self.config).await?"));
 }
 
 struct RecordingStorageScan {

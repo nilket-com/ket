@@ -495,7 +495,7 @@ admission / SQL CLI option paths in unit test scope.
 
 ## Phase 7: Integration Fixtures
 
-### `crates/toron/tests/toron_tls_config_test.rs` (new)
+### `crates/toron/tests/config_test.rs` (new)
 
 1. `toron_config_missing_tls_section_loads_byte_identical_to_adr043`
 2. `toron_config_non_loopback_bind_without_tls_rejected` (ADR 044
@@ -504,7 +504,7 @@ admission / SQL CLI option paths in unit test scope.
 4. `toron_config_missing_cert_file_fails_with_stable_diagnostic`
 5. `toron_config_encrypted_key_fails_with_stable_diagnostic`
 
-### `crates/toron/tests/toron_tls_listener_test.rs` (new)
+### `crates/toron/tests/tls_listener_test.rs` (new)
 
 6. `toron_daemon_rejects_peer_with_unknown_ca` — dial with a cert
    signed by an unrelated CA; assert client-side wrapper diagnostic

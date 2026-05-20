@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::{Catalog, TableRef, WendelonCatalog};
+use toron::catalog::{Catalog, TableRef, WendelonCatalog, WendelonDescriptorRegistry};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
@@ -382,20 +382,23 @@ async fn query_ids_gt(
 	tenant: WendelonTenantId,
 	threshold: i32,
 ) -> Vec<i64> {
-	let catalog =
-		WendelonCatalog::from_descriptors([(TableId(1), descriptor.clone())]).expect("catalog");
-	let mut descriptors = HashMap::new();
-	descriptors.insert(TableId(1), descriptor.clone());
-	let storage = Arc::new(WendelonStorageScan::new(
+	let tenant_id = toron_tenant_id(tenant);
+	let registry = descriptor_registry_for_tenant(tenant, descriptor);
+	let catalog = WendelonCatalog::with_client_and_registry(
 		fixture.client.clone(),
-		descriptors,
+		tenant_id,
+		Arc::clone(&registry),
+	);
+	let storage = Arc::new(WendelonStorageScan::with_descriptor_registry(
+		fixture.client.clone(),
+		registry,
 	));
 	let executor = Executor::with_context(
 		storage,
 		ExecutionContext::new(
 			SessionId(10),
 			QueryId::from_u128(20),
-			ToronTenantId(tenant.get()),
+			tenant_id,
 			HlcBound(0),
 		),
 	);
@@ -447,11 +450,9 @@ async fn execute_wendelon_plan(
 	tenant: WendelonTenantId,
 	bound: &ExecutionPlan,
 ) -> Vec<RecordBatch> {
-	let mut descriptors = HashMap::new();
-	descriptors.insert(TableId(1), descriptor.clone());
-	let storage = Arc::new(WendelonStorageScan::new(
+	let storage = Arc::new(WendelonStorageScan::with_descriptor_registry(
 		fixture.client.clone(),
-		descriptors,
+		descriptor_registry_for_tenant(tenant, descriptor),
 	));
 	let executor = Executor::with_context(storage, execution_context(tenant));
 	executor
@@ -498,9 +499,26 @@ fn execution_context(tenant: WendelonTenantId) -> ExecutionContext {
 	ExecutionContext::new(
 		SessionId(10),
 		QueryId::from_u128(20),
-		ToronTenantId(tenant.get()),
+		toron_tenant_id(tenant),
 		HlcBound(0),
 	)
+}
+
+fn descriptor_registry_for_tenant(
+	tenant: WendelonTenantId,
+	descriptor: &TableSchemaDescriptor,
+) -> Arc<WendelonDescriptorRegistry> {
+	Arc::new(
+		WendelonDescriptorRegistry::from_descriptors_for_tenant(
+			toron_tenant_id(tenant),
+			[(TableId(1), descriptor.clone())],
+		)
+		.expect("descriptor registry"),
+	)
+}
+
+fn toron_tenant_id(tenant: WendelonTenantId) -> ToronTenantId {
+	ToronTenantId(tenant.get())
 }
 
 fn assert_filter_declined_without_pbc(plan: &ExecutionPlan) {

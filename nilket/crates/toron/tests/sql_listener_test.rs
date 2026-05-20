@@ -97,7 +97,7 @@ async fn toron_sql_select_executes_over_authenticated_remote_listener() {
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
 	let worker_id = WorkerId::from_u128(45);
-	let pki = TestPki::generate(worker_id, "alice");
+	let pki = TestPki::generate(worker_id, "1");
 	let config = toron_config_with_descriptor_tls(descriptor.clone(), worker_id, &pki);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -126,6 +126,82 @@ async fn toron_sql_select_executes_over_authenticated_remote_listener() {
 			(2, Some(150), Some("east".to_string())),
 			(4, Some(200), Some("west".to_string())),
 		]
+	);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_client_tenant_7_observed_in_execution_context() {
+	let fixture = LiveWendelonFixture::start(46).await;
+	let tenant = WendelonTenantId::new(7);
+	create_live_tenant(&fixture.node, tenant).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, tenant, &descriptor).await;
+	write_rows(&fixture.client, tenant, &descriptor, batch()).await;
+
+	let worker_id = WorkerId::from_u128(46);
+	let pki = TestPki::generate(worker_id, "7");
+	let mut config = toron_config_with_descriptor_tls(descriptor.clone(), worker_id, &pki);
+	config.node.tenant_id = ToronTenantId(7);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = connectable_loopback_addr(daemon.handle().sql_endpoint.expect("sql endpoint"));
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = execute_sql_authenticated(
+		endpoint,
+		&server_name,
+		&pki.client_cert,
+		&pki.client_key,
+		&pki.ca_cert,
+		"SELECT id, amount, region FROM storage_execution WHERE amount > 100",
+	)
+	.await
+	.expect("SQL select response over mTLS");
+	assert_eq!(response.complete.row_count, 2);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_client_tenant_8_observed_proves_not_daemon_static() {
+	let fixture = LiveWendelonFixture::start(47).await;
+	let tenant = WendelonTenantId::new(7);
+	create_live_tenant(&fixture.node, tenant).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, tenant, &descriptor).await;
+	write_rows(&fixture.client, tenant, &descriptor, batch()).await;
+
+	let worker_id = WorkerId::from_u128(47);
+	let pki = TestPki::generate(worker_id, "8");
+	let mut config = toron_config_with_descriptor_tls(descriptor, worker_id, &pki);
+	config.node.tenant_id = ToronTenantId(7);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = connectable_loopback_addr(daemon.handle().sql_endpoint.expect("sql endpoint"));
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let error = execute_sql_authenticated(
+		endpoint,
+		&server_name,
+		&pki.client_cert,
+		&pki.client_key,
+		&pki.ca_cert,
+		"SELECT id, amount, region FROM storage_execution WHERE amount > 100",
+	)
+	.await
+	.expect_err("tenant 8 must not see tenant 7 bootstrapped descriptor");
+	assert_eq!(error.code, SqlErrorCode::CatalogError);
+	assert!(
+		error.message.contains("storage_execution") || error.message.contains("TableId"),
+		"{error:?}"
 	);
 
 	daemon.shutdown().await.expect("shutdown daemon");

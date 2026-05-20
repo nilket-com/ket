@@ -29,11 +29,11 @@ cargo test -p toron --test toron_observability_listener_test
 cargo test -p toron --test architecture_test adr045
 cargo test -p toron --test architecture_test
 cargo test -p toron --test toron_daemon_test
-cargo test -p toron --test toron_tls_listener_test
-cargo test -p toron --test toron_sql_listener_test --no-run
+cargo test -p toron --test tls_listener_test
+cargo test -p toron --test sql_listener_test --no-run
 cargo test -p toron --lib network::tls::tests
-cargo test -p toron --test toron_sql_listener_test
-cargo test -p toron --test toron_config_test
+cargo test -p toron --test sql_listener_test
+cargo test -p toron --test config_test
 cargo clippy -p toron -- -D warnings
 ```
 

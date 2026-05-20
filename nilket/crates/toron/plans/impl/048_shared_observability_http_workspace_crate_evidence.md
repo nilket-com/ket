@@ -38,8 +38,8 @@ cargo test -p toron --test architecture_test
 cargo test -p toron --test toron_observability_listener_test
 cargo test -p toron --lib inspect
 cargo test -p toron --test toron_daemon_test
-cargo test -p toron --test toron_sql_listener_test
-cargo test -p toron --test toron_tls_listener_test
+cargo test -p toron --test sql_listener_test
+cargo test -p toron --test tls_listener_test
 cargo test -p toron
 cargo clippy -p observability-http -- -D warnings
 git diff --check

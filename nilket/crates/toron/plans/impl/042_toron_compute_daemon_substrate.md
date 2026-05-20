@@ -314,7 +314,7 @@ For guards 8 and 9, use narrow source-block extraction around the daemon startup
 
 ## Phase 8: Integration Fixtures (13 required)
 
-### `crates/toron/tests/toron_config_test.rs` (new)
+### `crates/toron/tests/config_test.rs` (new)
 
 - `toron_example_config_loads`
 - `toron_write_example_config_refuses_overwrite`
@@ -351,7 +351,7 @@ For guards 8 and 9, use narrow source-block extraction around the daemon startup
 cargo fmt --all
 cargo check -p toron -p nilket
 cargo test -p toron --test architecture_test adr042
-cargo test -p toron --test toron_config_test
+cargo test -p toron --test config_test
 cargo test -p toron --test toron_daemon_test
 cargo test -p toron --test distributed_process_test
 cargo test -p nilket

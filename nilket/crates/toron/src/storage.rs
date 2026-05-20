@@ -426,7 +426,7 @@ impl StorageAdmin for WendelonStorageAdmin {
 			.await
 			.map_err(|error| map_wendelon_admin_error_to_storage(request.table_id, error))?;
 		self.registry
-			.mark_finalized_drop(request.table_id, operation_id)
+			.mark_finalized_drop(request.tenant_id, request.table_id, operation_id)
 			.map_err(|error| StorageError::Internal {
 				message: error.to_string(),
 			})?;
@@ -712,7 +712,9 @@ impl StorageScan for WendelonStorageScan {
 					.to_string(),
 			});
 		}
-		let descriptor = self.descriptor_registry.descriptor(request.table_id)?;
+		let descriptor = self
+			.descriptor_registry
+			.descriptor(request.tenant_id, request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
 			return Err(StorageError::DescriptorEvolved);
 		}
@@ -803,7 +805,9 @@ impl WendelonStorageWrite {
 #[async_trait::async_trait]
 impl StorageWrite for WendelonStorageWrite {
 	async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError> {
-		let descriptor = self.descriptor_registry.descriptor(request.table_id)?;
+		let descriptor = self
+			.descriptor_registry
+			.descriptor(request.tenant_id, request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
 			return Err(StorageError::DescriptorEvolved);
 		}
@@ -877,7 +881,9 @@ impl StorageDeleteRows for WendelonStorageDeleteRows {
 		&self,
 		request: DeleteRowsRequest,
 	) -> Result<DeleteRowsOutcome, StorageError> {
-		let descriptor = self.descriptor_registry.descriptor(request.table_id)?;
+		let descriptor = self
+			.descriptor_registry
+			.descriptor(request.tenant_id, request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
 			return Err(StorageError::DescriptorEvolved);
 		}
