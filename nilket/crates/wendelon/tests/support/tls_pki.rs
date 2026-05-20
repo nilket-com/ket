@@ -22,6 +22,8 @@ pub struct TestPkiPaths {
 	pub operator_on_node_ca_key: PathBuf,
 	pub data_node_on_ops_ca_cert: PathBuf,
 	pub data_node_on_ops_ca_key: PathBuf,
+	pub query_session_cert: PathBuf,
+	pub query_session_key: PathBuf,
 }
 
 pub fn write_test_pki(dir: &Path) -> TestPkiPaths {
@@ -45,6 +47,8 @@ pub fn write_test_pki_with_server_dns(dir: &Path, server_dns_name: &str) -> Test
 		operator_on_node_ca_key: dir.join("operator_on_node_ca.key"),
 		data_node_on_ops_ca_cert: dir.join("data_node_on_ops_ca.crt"),
 		data_node_on_ops_ca_key: dir.join("data_node_on_ops_ca.key"),
+		query_session_cert: dir.join("query_session.crt"),
+		query_session_key: dir.join("query_session.key"),
 	};
 
 	let data_ca_key = dir.join("ca.key");
@@ -139,6 +143,21 @@ pub fn write_test_pki_with_server_dns(dir: &Path, server_dns_name: &str) -> Test
 			ca_cert_path: &paths.ops_ca_cert,
 			ca_key_path: &ops_ca_key,
 			serial: 2003,
+		},
+		dir,
+	);
+	generate_leaf(
+		LeafSpec {
+			common_name: "query-session",
+			role: "query_session",
+			node_dns_name: None,
+			key_id: vec![21, 22, 23, 24],
+			scopes: vec!["cluster"],
+			cert_path: &paths.query_session_cert,
+			key_path: &paths.query_session_key,
+			ca_cert_path: &paths.ca_cert,
+			ca_key_path: &data_ca_key,
+			serial: 1004,
 		},
 		dir,
 	);

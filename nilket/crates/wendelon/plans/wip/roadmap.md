@@ -35,17 +35,20 @@ live at
 Toron-pivot stretch continues to pull compute-adjacent storage
 primitives ahead of OLTP-shaped access surfaces.
 
-**ADR 071 (`nilket wendelon inspect`) promoted — ops/observability
-CLI composition, not a storage-engine continuation.** Planning is
-complete (`plans/adr/071_nilket_wendelon_inspect_real_wiring.md`
-+ `plans/impl/071_*`); implementation pending. It adds a one-shot
+**ADR 071 (`nilket wendelon inspect`) implemented — ops/observability
+CLI composition, not a storage-engine continuation.** Planning and
+implementation are complete
+(`plans/adr/071_nilket_wendelon_inspect_real_wiring.md` +
+`plans/impl/071_nilket_wendelon_inspect_real_wiring.md`; evidence in
+`plans/impl/071_nilket_wendelon_inspect_real_wiring_evidence.md`).
+It adds a one-shot
 operator CLI that dials Wendelon's existing mTLS `/ready` listener
 (ADR 027 observability posture), composing over the Toron-sequence
 cross-ring substrates ADR 047 `tls-pki` + ADR 048
 `observability-http`. Drafted via the Toron operator-plane council
 process (3 iterations, Codex+Claude 2-of-3) and relocated to the
 Wendelon sequence at promotion because Wendelon owns the consumer
-ADR. When implemented, it completes the symmetric operator-plane
+ADR. It completes the symmetric operator-plane
 inspect surface (`nilket toron inspect` (Toron ADR 046) +
 `nilket wendelon inspect` (this ADR)). Zero daemon-side change;
 all code lands in `crates/wendelon`.
@@ -149,10 +152,21 @@ follow-ups. CDC follow-up ADRs and vector embeddings are
 deliberately deferred behind the storage hierarchy in this
 stretch.
 
+**Ring-product placement (cross-ring convention:
+`../../../toron/plans/conventions/ring-product-placement.md`).**
+Storage-engine ADRs are Exterior Substrate and stay in this
+Wendelon sequence. Operator-facing Wendelon features (Exterior
+Composition — e.g. `nilket wendelon inspect`, ADR 071) also live
+here, even when drafted through the Toron operator-plane council:
+placement follows code-locality + server-side parentage (ADR 071's
+`/ready` target is Wendelon ADR 027), not which wip dir the council
+ran in. Only workspace-shared Interior substrate (`tls-pki`,
+`observability-http`) lives in the Toron aggregator sequence.
+
 ## Forward sequence
 
-**Promoted, implementation pending — ADR 071 `nilket wendelon
-inspect` (ops/observability CLI composition).** Off the
+**Implemented — ADR 071 `nilket wendelon inspect`
+(ops/observability CLI composition).** Off the
 storage-engine track: a one-shot operator CLI dialing Wendelon's
 existing mTLS `/ready` listener (ADR 027), composing over
 ADR 047 `tls-pki` + ADR 048 `observability-http`. Mirrors Toron
@@ -162,9 +176,10 @@ daemon-side change. **15 decisions, 16 architecture guards + 1
 convention guard (in `crates/wendelon/tests/architecture_test.rs`),
 15 required fixtures + 2 V1-evidence optional.** Plans:
 `plans/adr/071_nilket_wendelon_inspect_real_wiring.md` +
-`plans/impl/071_nilket_wendelon_inspect_real_wiring.md`. Drafted
-via the Toron operator-plane council; relocated to the Wendelon
-sequence at promotion (Wendelon owns the consumer ADR). The
+`plans/impl/071_nilket_wendelon_inspect_real_wiring.md`; evidence:
+`plans/impl/071_nilket_wendelon_inspect_real_wiring_evidence.md`.
+Drafted via the Toron operator-plane council; relocated to the
+Wendelon sequence at promotion (Wendelon owns the consumer ADR). The
 storage-engine forward items below continue independently.
 
 1. **All-null page-skip for nullable sparse projection** —

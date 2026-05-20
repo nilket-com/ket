@@ -4416,6 +4416,7 @@ dependencies = [
  "io-uring",
  "libc",
  "lz4_flex",
+ "observability-http",
  "opendal",
  "openraft",
  "postcard",

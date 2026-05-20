@@ -33,6 +33,7 @@ http = { version = "1", optional = true }
 io-uring = "0.7.11"
 libc = "0.2"
 lz4_flex = "0.13"
+observability-http = { path = "../observability-http" }
 opendal = { version = "0.55", features = ["services-b2", "services-gcs", "services-s3"] }
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 postcard = { workspace = true }

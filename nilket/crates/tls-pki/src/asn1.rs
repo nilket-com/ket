@@ -172,7 +172,7 @@ fn decode_subject_attribute_value(tag: u8, value: &[u8]) -> Result<String, PkiEr
 				})
 		}
 		0x1E => {
-			if value.len() % 2 != 0 {
+			if !value.len().is_multiple_of(2) {
 				return Err(PkiError::DerParse {
 					reason: "certificate BMPString subject has odd byte length".to_string(),
 				});

@@ -319,6 +319,7 @@ swapped):
 wendelon inspect requires --server-name, --cert, --key, and --ca
 wendelon inspect: failed to connect to endpoint: <details>
 wendelon inspect: failed to connect to endpoint within timeout
+wendelon inspect: failed to initialize mTLS client: <details>
 wendelon inspect: failed to complete TLS handshake: <details>
 wendelon inspect: failed to write request: <details>
 wendelon inspect: failed to receive response within timeout

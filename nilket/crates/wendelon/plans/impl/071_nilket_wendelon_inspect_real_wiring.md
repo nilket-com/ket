@@ -1,6 +1,8 @@
 # Implementation Plan: ADR 071 — Nilket Wendelon Inspect Real Wiring
 
-**Status:** Promoted (paired with `plans/adr/071_nilket_wendelon_inspect_real_wiring.md`).
+**Status:** Implemented (paired with
+`plans/adr/071_nilket_wendelon_inspect_real_wiring.md`; evidence in
+`plans/impl/071_nilket_wendelon_inspect_real_wiring_evidence.md`).
 
 ## Overview
 
@@ -313,29 +315,34 @@ sequence; both roadmaps updated.
   `crates/wendelon/tests/architecture_test.rs`.
 - 15 required fixtures (inline unit + `crates/wendelon/tests/`
   integration) + 2 optional V1-evidence.
-- Zero changes to `crates/nilket/`.
+- Zero changes to `crates/nilket/Cargo.toml` and nilket runtime
+  source. The root CLI integration test was updated to retire a
+  stale ADR 040-era Toron inspect reservation assertion and to
+  cover `nilket wendelon inspect` dispatch.
 - Zero changes to `crates/wendelon/src/metrics/`.
 - Zero changes to `crates/wendelon/src/network/`.
 - Zero changes to Toron's inspect implementation (the
   operator-plane mirror is a cross-reference, not shared code).
 - Zero changes to `observability-http` / `tls-pki` public
-  APIs.
+  APIs. One internal `tls-pki` clippy lint was fixed during
+  verification.
 
 ## Acceptance checklist
 
-- [ ] Phase 0 audit maps ADR 046 shape + Wendelon substrate +
+- [x] Phase 0 audit maps ADR 046 shape + Wendelon substrate +
       cert-helper API + dispatch insertion point.
-- [ ] Phase 1 dispatch arm + Cargo dep; bare `inspect` routes
+- [x] Phase 1 dispatch arm + Cargo dep; bare `inspect` routes
       correctly (not daemon boot).
-- [ ] Phase 2 arg parsing + precedence + all-or-none TLS.
-- [ ] Phase 3 fetch_ready with empty-ALPN client config +
+- [x] Phase 2 arg parsing + precedence + all-or-none TLS.
+- [x] Phase 3 fetch_ready with empty-ALPN client config +
       symmetric timeouts.
-- [ ] Phase 4 body-authoritative readiness + compact-JSON
+- [x] Phase 4 body-authoritative readiness + compact-JSON
       render + exit codes.
-- [ ] Phase 5 16 guards + 1 convention guard pass (in
+- [x] Phase 5 16 guards + 1 convention guard pass (in
       `crates/wendelon/tests/architecture_test.rs`).
-- [ ] Phase 6 15 required fixtures pass.
-- [ ] Phase 7 ADR + impl promoted in Wendelon sequence; both
-      roadmaps updated.
+- [x] Phase 6 15 required fixtures pass.
+- [x] Phase 7 ADR + impl promoted in Wendelon sequence; both
+      roadmaps updated. Evidence:
+      `071_nilket_wendelon_inspect_real_wiring_evidence.md`.
 
 Ready for implementation.

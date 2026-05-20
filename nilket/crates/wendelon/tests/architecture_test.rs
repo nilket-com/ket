@@ -5978,3 +5978,296 @@ fn test_adr063_page_level_predicate_stats_guards() {
 		violations.join("\n")
 	);
 }
+
+fn workspace_root() -> PathBuf {
+	Path::new(env!("CARGO_MANIFEST_DIR"))
+		.parent()
+		.and_then(Path::parent)
+		.expect("workspace root")
+		.to_path_buf()
+}
+
+fn read_workspace(path: &str) -> String {
+	fs::read_to_string(workspace_root().join(path)).unwrap_or_else(|err| {
+		panic!("{path}: failed to read workspace file: {err}");
+	})
+}
+
+fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+	source
+		.split_once(start)
+		.unwrap_or_else(|| panic!("missing source start marker {start:?}"))
+		.1
+		.split_once(end)
+		.unwrap_or_else(|| panic!("missing source end marker {end:?} after {start:?}"))
+		.0
+}
+
+fn wendelon_cli_source() -> String {
+	read_workspace("crates/wendelon/src/cli.rs")
+}
+
+fn wendelon_inspect_region(cli: &str) -> &str {
+	source_region(cli, "fn run_inspect(args: &[String])", "fn verify_audit")
+}
+
+fn wendelon_inspect_fetch_region(cli: &str) -> &str {
+	source_region(
+		cli,
+		"async fn fetch_ready_with_tcp_connect",
+		"fn parse_readiness_view",
+	)
+}
+
+#[test]
+fn adr071_wendelon_inspect_branch_exists() {
+	let cli = wendelon_cli_source();
+	assert!(cli.contains("[cmd, rest @ ..] if cmd == \"inspect\" => run_inspect(rest)"));
+	assert!(cli.contains("fn run_inspect(args: &[String]) -> ExitCode"));
+	assert!(cli.contains("{program} inspect [--endpoint <addr>]"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_is_client_only() {
+	let cli = wendelon_cli_source();
+	let inspect = wendelon_inspect_region(&cli);
+	for forbidden in [
+		"WendelonNode",
+		"NodeBootstrapConfig",
+		"load_node_bootstrap_config",
+		"observability::spawn",
+		"LocalAuditSink",
+		"ReadinessReporter",
+		"start_daemon",
+	] {
+		assert!(
+			!inspect.contains(forbidden),
+			"inspect path must not construct daemon-side machinery token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_wendelon_inspect_endpoint_precedence_is_pinned() {
+	let cli = wendelon_cli_source();
+	let parse = source_region(&cli, "fn parse_inspect_args", "async fn run_inspect_async");
+	assert!(cli.contains("const DEFAULT_INSPECT_ENDPOINT: &str = \"127.0.0.1:7432\";"));
+	assert!(parse.contains("WENDELON_INSPECT_ENDPOINT"));
+	assert!(parse.contains("endpoint_flag"));
+	assert!(parse.contains("invalid WENDELON_INSPECT_ENDPOINT"));
+	assert!(parse.contains("DEFAULT_INSPECT_ENDPOINT"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_tls_flags_are_all_or_none() {
+	let cli = wendelon_cli_source();
+	let parse = source_region(&cli, "fn parse_inspect_args", "async fn run_inspect_async");
+	assert!(cli.contains("wendelon inspect requires --server-name, --cert, --key, and --ca"));
+	for required in [
+		"WENDELON_INSPECT_SERVER_NAME",
+		"WENDELON_INSPECT_CLIENT_CERT",
+		"WENDELON_INSPECT_CLIENT_KEY",
+		"WENDELON_INSPECT_CA",
+		"server_name.is_none() || cert_path.is_none() || key_path.is_none() || ca_path.is_none()",
+	] {
+		assert!(
+			parse.contains(required),
+			"missing TLS parse token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr071_wendelon_inspect_uses_existing_actor_authorization() {
+	let tls = read_workspace("crates/wendelon/src/network/tls.rs");
+	let observability = read_workspace("crates/wendelon/src/metrics/observability.rs");
+	let cli = wendelon_cli_source();
+	assert!(tls.contains("ActorPermission::ObservabilityReady"));
+	assert!(observability.contains("ActorPermission::ObservabilityReady"));
+	assert!(observability.contains("authorize_actor(&actor, permission)"));
+	assert!(!tls.contains("Inspect"));
+	assert!(!cli.contains("monitor-"));
+	assert!(!tls.contains("inspect-"));
+	assert!(
+		!read_workspace("crates/wendelon/src/network/cert_issuance_policy.rs").contains("inspect-")
+	);
+}
+
+#[test]
+fn adr071_wendelon_inspect_uses_empty_alpn() {
+	let cli = wendelon_cli_source();
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	assert!(fetch.contains("rustls_client_config_with_alpn(&material, Vec::new())"));
+	assert!(!fetch.contains("HRFT_ALPN"));
+	assert!(!fetch.contains("http/1.1"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_uses_observability_http_client_helpers() {
+	let cli = wendelon_cli_source();
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	assert!(fetch.contains("observability_http::write_request"));
+	assert!(fetch.contains("observability_http::read_response"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_does_not_use_generic_http_clients() {
+	let cli = wendelon_cli_source();
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	for forbidden in [
+		"reqwest",
+		"hyper",
+		"h2",
+		"http::Request",
+		"http::Response",
+		"tower",
+		"ureq",
+	] {
+		assert!(
+			!fetch.contains(forbidden),
+			"inspect fetch path must not use generic HTTP client token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_wendelon_inspect_accepts_only_200_and_503() {
+	let cli = wendelon_cli_source();
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	assert!(fetch.contains("response.status_code != 200 && response.status_code != 503"));
+	assert!(fetch.contains("InspectError::UnexpectedStatus(response.status_code)"));
+	assert!(cli.contains(
+		"wendelon inspect: failed to read /ready response: unexpected HTTP status {status_code}"
+	));
+}
+
+#[test]
+fn adr071_wendelon_inspect_exit_codes_are_pinned_to_0_1_2() {
+	let cli = wendelon_cli_source();
+	let inspect = wendelon_inspect_region(&cli);
+	assert!(inspect.contains("ExitCode::SUCCESS"));
+	assert!(inspect.contains("ExitCode::from(1)"));
+	assert!(inspect.contains("ExitCode::from(2)"));
+	assert!(!inspect.contains("ExitCode::from(3)"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_text_and_json_output_are_pinned() {
+	let cli = wendelon_cli_source();
+	let render = source_region(&cli, "fn render_inspect_output", "fn verify_audit");
+	for required in [
+		"out.push(b'\\n')",
+		"render_readiness_text",
+		"node_id",
+		"epoch",
+		"leader_id",
+		"cluster_members",
+		"drain_state",
+		"audit_materialization_lag_entries",
+		"degraded_reason",
+		"fips_mode",
+		"fips_self_test_last_ts",
+		"serde_json::to_string(value)",
+	] {
+		assert!(render.contains(required), "missing render token {required}");
+	}
+	let run = source_region(
+		&cli,
+		"async fn run_inspect_async",
+		"fn inspect_error_message",
+	);
+	assert!(run.contains("io::stdout().write_all"));
+	assert!(run.contains("eprintln!(\"wendelon inspect: failed to write output: {err}\")"));
+}
+
+#[test]
+fn adr071_wendelon_inspect_has_symmetric_timeouts() {
+	let cli = wendelon_cli_source();
+	assert!(cli.contains("pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);"));
+	assert!(cli.contains("pub const READ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);"));
+	let fetch = wendelon_inspect_fetch_region(&cli);
+	assert!(fetch.contains("tokio::time::timeout(connect_timeout, connect)"));
+	assert!(fetch.contains("tokio::time::timeout(read_timeout, observability_http::read_response"));
+}
+
+#[test]
+fn adr071_no_new_wendelon_observability_routes() {
+	let observability = read_workspace("crates/wendelon/src/metrics/observability.rs");
+	assert!(!observability.contains("INSPECT_PATH"));
+	assert!(!observability.contains("\"/inspect\""));
+	assert!(observability.contains("pub const READY_PATH: &str = \"/ready\";"));
+	assert!(observability.contains("pub const METRICS_PATH: &str = \"/metrics\";"));
+}
+
+#[test]
+fn adr071_wendelon_observability_server_helpers_remain_local() {
+	let observability = read_workspace("crates/wendelon/src/metrics/observability.rs");
+	let exporter = read_workspace("crates/wendelon/src/metrics/exporter.rs");
+	assert!(observability.contains("async fn read_request"));
+	assert!(observability.contains("fn parse_request_line"));
+	assert!(observability.contains("async fn write_response"));
+	assert!(!observability.contains("observability_http"));
+	assert!(!exporter.contains("observability_http"));
+}
+
+#[test]
+fn adr071_nilket_root_stays_runtime_free() {
+	let nilket_manifest = read_workspace("crates/nilket/Cargo.toml");
+	for forbidden in [
+		"tokio",
+		"tokio-rustls",
+		"rustls",
+		"observability-http",
+		"tls-pki",
+		"serde_json",
+	] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket root manifest must stay runtime-free; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_prior_adr_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn test_adr039_wendelon_drop_migration_substrate_guards",
+		"fn test_adr055_lsm_compaction_substrate_guards",
+		"fn test_adr063_page_level_predicate_stats_guards",
+		"fn test_adr066_fsst_evaluator_guards",
+		"fn test_adr067_row_safe_fsst_guards",
+		"fn test_adr068_fsst_row_safe_estimator_guards",
+		"fn test_adr069_encoded_validity_sparse_projection_guards",
+		"fn test_adr070_all_null_page_skip_sparse_projection_guards",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior guard {required}"
+		);
+	}
+}
+
+#[test]
+fn adr071_new_inspect_types_are_brand_clean_and_no_v1_suffix() {
+	let cli = wendelon_cli_source();
+	let inspect = wendelon_inspect_region(&cli);
+	for required in ["InspectOptions", "InspectError", "ReadinessView"] {
+		assert!(
+			inspect.contains(required),
+			"missing inspect type {required}"
+		);
+	}
+	for forbidden in [
+		"WendelonInspect",
+		"InspectOptionsV1",
+		"InspectErrorV1",
+		"ReadinessViewV1",
+		"InspectV1",
+	] {
+		assert!(
+			!inspect.contains(forbidden),
+			"inspect surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}

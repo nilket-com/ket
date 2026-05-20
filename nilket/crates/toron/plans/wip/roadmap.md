@@ -3950,14 +3950,14 @@ along with the forward-sequence rewrite.
   unmodified).
   The eight-phase migration is materialized in
   `plans/impl/048_shared_observability_http_workspace_crate.md`.
-- **`nilket wendelon inspect` → promoted as Wendelon
+- **`nilket wendelon inspect` → implemented as Wendelon
   ADR 071 (cross-reference).** The storage-ring inspect-parity
-  consumer that will complete the symmetric operator-plane
+  consumer that completes the symmetric operator-plane
   inspect surface (`nilket toron inspect` +
   `nilket wendelon inspect`)
-  was promoted in the **Wendelon** sequence as **ADR 071**, not
-  as a Toron ADR. It is a Wendelon-ring feature (all code lands
-  in `crates/wendelon`; guards + fixtures in
+  was promoted and implemented in the **Wendelon** sequence as
+  **ADR 071**, not as a Toron ADR. It is a Wendelon-ring feature
+  (all code lands in `crates/wendelon`; guards + fixtures in
   `crates/wendelon/tests/`), composing over ADR 047 `tls-pki` +
   ADR 048 `observability-http` + Wendelon ADR 027 observability
   posture. It was drafted through the Toron operator-plane
@@ -4014,6 +4014,23 @@ section after Status and before Context. The decomposition makes
 scope-creep into adjacent boundaries visible at review time and
 sharpens ADR selection: the same operator at different scales is
 a different contract.
+
+**Ring-product placement (convention:
+`plans/conventions/ring-product-placement.md`).** Classify every
+candidate on the Interior/Exterior × Substrate/Composition matrix
+at topic selection, and name the quadrant in the ADR's Category
+line. **Interior** products (shared substrate like `tls-pki` /
+`observability-http`, or coordination glue) file in this Toron
+sequence acting as the workspace aggregator; **Exterior**
+ring-specific products "return home" to their own ring's ADR
+sequence — even when the council ran from `crates/toron/plans/wip/`.
+Placement follows code-locality + server-side parentage, not
+process-locality (precedent: `nilket wendelon inspect` drafted as
+Toron ADR 049, relocated to Wendelon ADR 071). **Leap Rule:** a
+candidate that looks like Composition but needs new interior
+mechanism (e.g. multi-tenant routing's tenant-isolation logic) is
+a Substrate leap — scope the interior "How" before the
+user-facing "What".
 
 **Minimize strategic rework, not ADR scope.** When two narrow
 ADR shapes are otherwise equivalent, prefer the one that
@@ -4261,14 +4278,14 @@ After ADR 048, the cross-ring HTTP/1.1
 substrate is consolidated (Toron-side; Wendelon-
 side production code stays unchanged for V1).
 The `nilket wendelon inspect` parity candidate
-that originally led this slot was **promoted in
-the Wendelon sequence as Wendelon ADR 071**
+that originally led this slot was **promoted and
+implemented in the Wendelon sequence as Wendelon ADR 071**
 (it's a Wendelon-ring feature — all code lands
 in `crates/wendelon`; its server-side `/ready`
 counterpart is Wendelon ADR 027 observability
 posture; it composes over ADR 047 `tls-pki` +
-ADR 048 `observability-http`). It will complete the
-symmetric operator-plane inspect surface when implemented
+ADR 048 `observability-http`). It completes the
+symmetric operator-plane inspect surface
 (`nilket toron inspect` + `nilket wendelon
 inspect`) without occupying a Toron ADR slot.
 See
@@ -4289,9 +4306,9 @@ The Toron ADR 049 slot is therefore open;
   SAN) + tenant-aware `DistributedQueryCoordinator`
   binding. Likely needs a Phase-1 cut to fit a
   tight cycle.
-- **`nilket wendelon inspect` parity — PROMOTED
+- **`nilket wendelon inspect` parity — IMPLEMENTED
   as Wendelon ADR 071** (cross-reference, not a
-  Toron ADR; implementation pending). Mirrors
+  Toron ADR). Mirrors
   ADR 046 to the storage ring: composes over
   ADR 048 `observability-http`
   (client helpers `write_request` +

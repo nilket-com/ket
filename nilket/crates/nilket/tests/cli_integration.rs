@@ -285,14 +285,26 @@ fn nilket_toron_sql_reports_connection_failure() {
 }
 
 #[test]
-fn nilket_toron_inspect_still_reserved() {
+fn nilket_toron_inspect_routes_to_toron_cli() {
 	let output = nilket(&["toron", "inspect", "workers"]);
 
 	assert_eq!(output.status.code(), Some(2), "{output:?}");
 	assert!(stdout(&output).is_empty(), "{output:?}");
 	assert_eq!(
 		stderr(&output),
-		"toron inspect is reserved; production execution is not wired in ADR 040\n"
+		"toron inspect does not accept positional arguments\n"
+	);
+}
+
+#[test]
+fn nilket_wendelon_inspect_routes_to_wendelon_cli() {
+	let output = nilket(&["wendelon", "inspect"]);
+
+	assert_eq!(output.status.code(), Some(2), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert_eq!(
+		stderr(&output),
+		"wendelon inspect requires --server-name, --cert, --key, and --ca\n"
 	);
 }
 
