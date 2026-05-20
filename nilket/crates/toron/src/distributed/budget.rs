@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use crate::distributed::identity::FrameByteLen;
+use crate::storage::TenantId;
 
 #[derive(
 	Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
@@ -93,6 +95,73 @@ impl QueryBudget {
 impl Default for QueryBudget {
 	fn default() -> Self {
 		Self::test_default()
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantBudget {
+	pub memory_per_task: ByteCount,
+	pub aggregate_memory: ByteCount,
+}
+
+impl TenantBudget {
+	pub const fn new(memory_per_task: ByteCount, aggregate_memory: ByteCount) -> Self {
+		Self {
+			memory_per_task,
+			aggregate_memory,
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantBudgetPolicy {
+	pub default: TenantBudget,
+	pub per_tenant: HashMap<TenantId, TenantBudget>,
+}
+
+impl TenantBudgetPolicy {
+	pub fn omitted_config(worker_memory_budget: ByteCount) -> Self {
+		let base = QueryBudget::default();
+		let aggregate_memory = worker_memory_budget.max(base.memory_per_task);
+		Self {
+			default: TenantBudget::new(base.memory_per_task, aggregate_memory),
+			per_tenant: HashMap::new(),
+		}
+	}
+
+	/// Builds the conservative bare-coordinator fallback policy.
+	///
+	/// This is intentionally single-query-per-tenant because callers without
+	/// node-local `[tenant_budgets]` config have no independent aggregate cap.
+	/// Daemon construction must override this with the normalized config policy.
+	pub fn from_query_budget(query_budget: QueryBudget) -> Self {
+		Self {
+			default: TenantBudget::new(query_budget.memory_per_task, query_budget.memory_per_task),
+			per_tenant: HashMap::new(),
+		}
+	}
+
+	pub fn new(default: TenantBudget, per_tenant: HashMap<TenantId, TenantBudget>) -> Self {
+		Self {
+			default,
+			per_tenant,
+		}
+	}
+
+	pub fn budget_for(&self, tenant_id: TenantId) -> TenantBudget {
+		self.per_tenant
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(self.default)
+	}
+
+	pub fn query_budget_for(&self, tenant_id: TenantId) -> QueryBudget {
+		self.query_budget_for_base(tenant_id, QueryBudget::default())
+	}
+
+	pub fn query_budget_for_base(&self, tenant_id: TenantId, mut base: QueryBudget) -> QueryBudget {
+		base.memory_per_task = self.budget_for(tenant_id).memory_per_task;
+		base
 	}
 }
 
@@ -225,6 +294,93 @@ impl Drop for BudgetReservation {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct TenantMemoryAccountant {
+	policy: TenantBudgetPolicy,
+	used: Arc<Mutex<HashMap<TenantId, ByteCount>>>,
+}
+
+impl TenantMemoryAccountant {
+	pub fn new(policy: TenantBudgetPolicy) -> Self {
+		Self {
+			policy,
+			used: Arc::new(Mutex::new(HashMap::new())),
+		}
+	}
+
+	pub fn try_reserve(
+		&self,
+		tenant_id: TenantId,
+		amount: ByteCount,
+	) -> Result<TenantMemoryReservation, BudgetRejection> {
+		let mut used = self.used.lock().expect("tenant memory accountant poisoned");
+		let current = used.get(&tenant_id).copied().unwrap_or(ByteCount::ZERO);
+		let limit = self.policy.budget_for(tenant_id).aggregate_memory;
+		let available = limit.saturating_sub(current);
+		if amount > available {
+			return Err(BudgetRejection {
+				dimension: BudgetDimension::Memory,
+				requested: amount,
+				available,
+			});
+		}
+		used.insert(tenant_id, ByteCount::new(current.get() + amount.get()));
+		Ok(TenantMemoryReservation {
+			used: Arc::clone(&self.used),
+			tenant_id,
+			amount,
+			released: false,
+		})
+	}
+
+	pub fn used(&self, tenant_id: TenantId) -> ByteCount {
+		self.used
+			.lock()
+			.expect("tenant memory accountant poisoned")
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(ByteCount::ZERO)
+	}
+}
+
+#[derive(Debug)]
+pub struct TenantMemoryReservation {
+	used: Arc<Mutex<HashMap<TenantId, ByteCount>>>,
+	tenant_id: TenantId,
+	amount: ByteCount,
+	released: bool,
+}
+
+impl TenantMemoryReservation {
+	pub fn release(mut self) {
+		self.release_once();
+	}
+
+	fn release_once(&mut self) {
+		if self.released {
+			return;
+		}
+		let mut used = self.used.lock().expect("tenant memory accountant poisoned");
+		let current = used
+			.get(&self.tenant_id)
+			.copied()
+			.unwrap_or(ByteCount::ZERO);
+		let updated = current.saturating_sub(self.amount);
+		if updated == ByteCount::ZERO {
+			used.remove(&self.tenant_id);
+		} else {
+			used.insert(self.tenant_id, updated);
+		}
+		self.released = true;
+	}
+}
+
+impl Drop for TenantMemoryReservation {
+	fn drop(&mut self) {
+		self.release_once();
+	}
+}
+
 impl BudgetState {
 	fn limit_for(&self, dimension: BudgetDimension) -> ByteCount {
 		match dimension {
@@ -329,5 +485,78 @@ mod tests {
 				available: ByteCount::new(5),
 			}
 		);
+	}
+
+	#[test]
+	fn tenant_budget_policy_preserves_non_memory_budget_dimensions() {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(32)),
+		);
+		let policy = TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(16), ByteCount::new(64)),
+			per_tenant,
+		);
+		let mut base = QueryBudget::test_default();
+		base.shuffle_bytes_published_per_task = ByteCount::new(99);
+
+		let budget = policy.query_budget_for_base(TenantId(7), base);
+
+		assert_eq!(budget.memory_per_task, ByteCount::new(8));
+		assert_eq!(budget.shuffle_bytes_published_per_task, ByteCount::new(99));
+	}
+
+	#[test]
+	fn tenant_memory_accountant_releases_on_drop() {
+		let policy = TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(10)),
+			HashMap::new(),
+		);
+		let accountant = TenantMemoryAccountant::new(policy);
+
+		let reservation = accountant
+			.try_reserve(TenantId(7), ByteCount::new(7))
+			.expect("reserve");
+		assert_eq!(accountant.used(TenantId(7)), ByteCount::new(7));
+
+		drop(reservation);
+
+		assert_eq!(accountant.used(TenantId(7)), ByteCount::ZERO);
+	}
+
+	#[test]
+	fn tenant_memory_accountant_isolated_by_tenant() {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+		);
+		per_tenant.insert(
+			TenantId(8),
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(16)),
+		);
+		let policy = TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+			per_tenant,
+		);
+		let accountant = TenantMemoryAccountant::new(policy);
+
+		let _tenant_7 = accountant
+			.try_reserve(TenantId(7), ByteCount::new(8))
+			.expect("tenant 7 reserve");
+		assert!(matches!(
+			accountant.try_reserve(TenantId(7), ByteCount::new(1)),
+			Err(BudgetRejection {
+				dimension: BudgetDimension::Memory,
+				requested: ByteCount(1),
+				available: ByteCount(0),
+			})
+		));
+
+		let _tenant_8 = accountant
+			.try_reserve(TenantId(8), ByteCount::new(8))
+			.expect("tenant 8 still has budget");
+		assert_eq!(accountant.used(TenantId(8)), ByteCount::new(8));
 	}
 }

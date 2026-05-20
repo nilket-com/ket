@@ -22,7 +22,7 @@ use crate::config::{
 	ToronWendelonStorageConfig, load_descriptor_bootstrap, load_toron_bootstrap_config,
 };
 use crate::coordinator::DistributedQueryCoordinator;
-use crate::distributed::budget::{ByteCount, QueryBudget};
+use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget};
 use crate::distributed::identity::{LeaseEpoch, QueryId};
 use crate::distributed::partition_store::InMemoryPartitionStore;
 use crate::distributed::worker_registry::{
@@ -231,17 +231,20 @@ impl ToronDaemon {
 		let coordinator_writer: Arc<dyn crate::storage::StorageWrite> = writer.clone();
 		let coordinator_deleter: Arc<dyn crate::storage::StorageDeleteRows> = deleter.clone();
 		let coordinator_admin: Arc<dyn crate::storage::StorageAdmin> = admin.clone();
-		let coordinator = Arc::new(DistributedQueryCoordinator::with_writer_deleter_and_admin(
-			coordinator_catalog,
-			worker_registry,
-			Arc::clone(&memory),
-			transport,
-			crate::binder::PlannerConfig::default(),
-			QueryBudget::default(),
-			coordinator_writer,
-			coordinator_deleter,
-			coordinator_admin,
-		));
+		let coordinator = Arc::new(
+			DistributedQueryCoordinator::with_writer_deleter_and_admin(
+				coordinator_catalog,
+				worker_registry,
+				Arc::clone(&memory),
+				transport,
+				crate::binder::PlannerConfig::default(),
+				QueryBudget::default(),
+				coordinator_writer,
+				coordinator_deleter,
+				coordinator_admin,
+			)
+			.with_tenant_budget_policy(config.tenant_budgets.clone()),
+		);
 
 		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
 		let mut shutdown_txs = Vec::new();
@@ -766,6 +769,17 @@ fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {
 		QueryError::Binding(_) => SqlErrorCode::BindingError,
 		QueryError::Catalog(_) => SqlErrorCode::CatalogError,
 		QueryError::Storage(_) => SqlErrorCode::StorageError,
+		QueryError::Execution(crate::error::ExecutionError::BudgetExhausted {
+			dimension: BudgetDimension::Memory,
+			..
+		}) => SqlErrorCode::ResourceExhausted,
+		QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
+			kind:
+				crate::error::TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::Memory,
+					..
+				},
+		}) => SqlErrorCode::ResourceExhausted,
 		QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
 			kind: crate::error::TaskFailureKind::Cancelled,
 		}) => SqlErrorCode::Cancelled,
@@ -774,7 +788,12 @@ fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {
 		}
 		_ => SqlErrorCode::Internal,
 	};
-	(code, error.to_string())
+	let message = if code == SqlErrorCode::ResourceExhausted {
+		"tenant memory budget exhausted".to_string()
+	} else {
+		error.to_string()
+	};
+	(code, message)
 }
 
 fn sql_plan_returns_rows(plan: &LogicalPlan) -> bool {
@@ -955,4 +974,38 @@ async fn build_wendelon_client(
 		inner,
 		client_uuid,
 	))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::distributed::budget::{BudgetDimension, ByteCount};
+	use crate::error::{ExecutionError, RuntimeError, TaskFailureKind};
+
+	#[test]
+	fn budget_exhausted_maps_to_resource_exhausted_sql_error() {
+		let (code, message) =
+			map_sql_query_error(QueryError::Execution(ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				requested: ByteCount::new(16),
+				available: ByteCount::new(8),
+			}));
+
+		assert_eq!(code, SqlErrorCode::ResourceExhausted);
+		assert_eq!(message, "tenant memory budget exhausted");
+	}
+
+	#[test]
+	fn distributed_task_budget_exhausted_maps_to_resource_exhausted_sql_error() {
+		let (code, message) = map_sql_query_error(QueryError::Runtime(RuntimeError::TaskFailure {
+			kind: TaskFailureKind::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				requested: ByteCount::new(16),
+				available: ByteCount::new(8),
+			},
+		}));
+
+		assert_eq!(code, SqlErrorCode::ResourceExhausted);
+		assert_eq!(message, "tenant memory budget exhausted");
+	}
 }

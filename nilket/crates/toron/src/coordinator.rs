@@ -8,7 +8,10 @@ mod write;
 
 use crate::binder::{PlannerConfig, bind};
 use crate::catalog::Catalog;
-use crate::distributed::budget::{QueryBudget, TaskBudget};
+use crate::distributed::budget::{
+	BudgetRejection, QueryBudget, TaskBudget, TenantBudgetPolicy, TenantMemoryAccountant,
+	TenantMemoryReservation,
+};
 use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use crate::distributed::identity::QueryId;
@@ -20,7 +23,7 @@ use crate::ir::{ColumnOrdinal, ExecutionPlan, FilterDisposition, LogicalPlan, Mo
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
 use crate::storage::{
 	DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest, RowIdentityProjection,
-	ScanStream, StorageAdmin, StorageDeleteRows, StorageWrite, UnsupportedStorageAdmin,
+	ScanStream, StorageAdmin, StorageDeleteRows, StorageWrite, TenantId, UnsupportedStorageAdmin,
 	WriteOutcome, WriteRequest,
 };
 
@@ -41,6 +44,8 @@ where
 	transport: Arc<Transport>,
 	config: PlannerConfig,
 	query_budget: QueryBudget,
+	tenant_budgets: TenantBudgetPolicy,
+	tenant_memory: TenantMemoryAccountant,
 	context: ExecutionContext,
 	writer: Arc<dyn StorageWrite>,
 	deleter: Arc<dyn StorageDeleteRows>,
@@ -222,11 +227,25 @@ where
 			transport,
 			config,
 			query_budget,
+			tenant_budgets: TenantBudgetPolicy::from_query_budget(query_budget),
+			tenant_memory: TenantMemoryAccountant::new(TenantBudgetPolicy::from_query_budget(
+				query_budget,
+			)),
 			context,
 			writer,
 			deleter,
 			admin,
 		}
+	}
+
+	pub fn with_tenant_budget_policy(mut self, tenant_budgets: TenantBudgetPolicy) -> Self {
+		self.tenant_memory = TenantMemoryAccountant::new(tenant_budgets.clone());
+		self.tenant_budgets = tenant_budgets;
+		self
+	}
+
+	pub fn tenant_memory_used(&self, tenant_id: TenantId) -> crate::distributed::budget::ByteCount {
+		self.tenant_memory.used(tenant_id)
 	}
 
 	pub async fn execute_query(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, QueryError> {
@@ -238,6 +257,21 @@ where
 		&self,
 		plan: &LogicalPlan,
 		context: ExecutionContext,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		let admitted = self.admit_query(&context)?;
+		let query_budget = admitted.query_budget;
+		let result = self
+			.execute_query_with_admission(plan, context, query_budget)
+			.await;
+		drop(admitted);
+		result
+	}
+
+	async fn execute_query_with_admission(
+		&self,
+		plan: &LogicalPlan,
+		context: ExecutionContext,
+		query_budget: QueryBudget,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
 		let bound = bind(plan, catalog.as_ref(), &self.config).await?;
@@ -252,6 +286,7 @@ where
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
+				query_budget,
 			};
 			return execute_write_plan_with_source(
 				catalog.as_ref(),
@@ -273,6 +308,7 @@ where
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
+				query_budget,
 			};
 			return execute_write_plan_with_source(
 				catalog.as_ref(),
@@ -286,16 +322,32 @@ where
 			.await;
 		}
 
-		self.execute_bound_distributed_with_context(bound, &context)
+		self.execute_bound_distributed_with_context(bound, &context, query_budget)
 			.await
+	}
+
+	fn admit_query(&self, context: &ExecutionContext) -> Result<AdmittedQuery, QueryError> {
+		let query_budget = self
+			.tenant_budgets
+			.query_budget_for_base(context.tenant_id, self.query_budget);
+		let reservation = self
+			.tenant_memory
+			.try_reserve(context.tenant_id, query_budget.memory_per_task)
+			.map_err(budget_rejection_query_error)?;
+		Ok(AdmittedQuery {
+			query_budget,
+			_reservation: reservation,
+		})
 	}
 
 	async fn execute_bound_distributed_with_context(
 		&self,
 		bound: ExecutionPlan,
 		context: &ExecutionContext,
+		query_budget: QueryBudget,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let stages = fragment_plan(bound, self.fragment_config(context)).map_err(fragment_error)?;
+		let stages = fragment_plan(bound, self.fragment_config(context, query_budget))
+			.map_err(fragment_error)?;
 		let mut scheduler = DistributedScheduler::new(self.registry.clone());
 		let mut dispatcher =
 			NetworkTaskDispatcher::new(self.memory.clone(), self.transport.clone());
@@ -306,13 +358,30 @@ where
 		Ok(run.final_results)
 	}
 
-	fn fragment_config(&self, context: &ExecutionContext) -> FragmentPlanConfig {
+	fn fragment_config(
+		&self,
+		context: &ExecutionContext,
+		query_budget: QueryBudget,
+	) -> FragmentPlanConfig {
 		FragmentPlanConfig::new(
 			context.query_id,
-			TaskBudget::from_query_budget(self.query_budget),
+			TaskBudget::from_query_budget(query_budget),
 		)
 		.with_task_context(TaskExecutionContext::from_execution_context(context))
 	}
+}
+
+struct AdmittedQuery {
+	query_budget: QueryBudget,
+	_reservation: TenantMemoryReservation,
+}
+
+fn budget_rejection_query_error(rejection: BudgetRejection) -> QueryError {
+	QueryError::Execution(ExecutionError::BudgetExhausted {
+		dimension: rejection.dimension,
+		requested: rejection.requested,
+		available: rejection.available,
+	})
 }
 
 fn fragment_error(error: FragmentError) -> QueryError {
@@ -462,6 +531,7 @@ where
 {
 	coordinator: &'a DistributedQueryCoordinator<Registry, Transport>,
 	context: &'a ExecutionContext,
+	query_budget: QueryBudget,
 }
 
 #[async_trait::async_trait]
@@ -476,7 +546,7 @@ where
 		plan: &ExecutionPlan,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		self.coordinator
-			.execute_bound_distributed_with_context(plan.clone(), self.context)
+			.execute_bound_distributed_with_context(plan.clone(), self.context, self.query_budget)
 			.await
 	}
 }
@@ -829,8 +899,11 @@ impl StorageDeleteRows for UnsupportedStorageDeleteRows {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::catalog::MockCatalog;
+	use crate::catalog::{MockCatalog, TableRef};
+	use crate::distributed::budget::{BudgetDimension, ByteCount, TenantBudget};
+	use crate::distributed::worker_registry::StaticWorkerRegistry;
 	use crate::ir::{AggregateFunction, Expr, QueryId, SessionId, TableId};
+	use crate::server::transport::TcpTransport;
 	use crate::storage::{HlcBound, ScanRequest, ScanStream, StorageScan, TenantId};
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
@@ -886,6 +959,132 @@ mod tests {
 		assert!(matches!(err, QueryError::SchemaInstability));
 	}
 
+	#[test]
+	fn distributed_coordinator_selects_query_budget_by_tenant() {
+		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+
+		let tenant_7 = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let tenant_8 = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(8),
+			TenantId(8),
+			HlcBound(1),
+		);
+
+		let admitted_7 = coordinator
+			.admit_query(&tenant_7)
+			.expect("tenant 7 admitted");
+		let admitted_8 = coordinator
+			.admit_query(&tenant_8)
+			.expect("tenant 8 admitted");
+
+		assert_eq!(admitted_7.query_budget.memory_per_task, ByteCount::new(8));
+		assert_eq!(admitted_8.query_budget.memory_per_task, ByteCount::new(16));
+	}
+
+	#[tokio::test]
+	async fn aggregate_admission_rejects_before_bind_or_execution() {
+		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let _held = coordinator
+			.tenant_memory
+			.try_reserve(TenantId(7), ByteCount::new(8))
+			.expect("saturate tenant 7");
+
+		let err = coordinator
+			.execute_query_with_context(&count_plan(), context)
+			.await
+			.expect_err("tenant aggregate should reject before catalog bind");
+
+		assert!(matches!(
+			err,
+			QueryError::Execution(ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				requested: ByteCount(8),
+				available: ByteCount(0),
+			})
+		));
+	}
+
+	#[tokio::test]
+	async fn aggregate_reservation_released_on_error() {
+		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(8),
+			TenantId(8),
+			HlcBound(1),
+		);
+
+		let err = coordinator
+			.execute_query_with_context(&count_plan(), context)
+			.await
+			.expect_err("missing descriptor should fail after admission");
+
+		assert!(matches!(err, QueryError::Binding(_)));
+		assert_eq!(coordinator.tenant_memory_used(TenantId(8)), ByteCount::ZERO);
+	}
+
+	#[tokio::test]
+	async fn aggregate_reservation_released_on_successful_completion() {
+		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(9),
+			TenantId(8),
+			HlcBound(1),
+		);
+		let plan = LogicalPlan::CreateTable {
+			name: TableRef::new("budget_success"),
+			schema: Arc::new(Schema::empty()),
+			if_not_exists: false,
+			or_replace: false,
+		};
+
+		let result = coordinator
+			.execute_query_with_context(&plan, context)
+			.await
+			.expect("DDL succeeds after admission");
+
+		assert!(result.is_empty());
+		assert_eq!(coordinator.tenant_memory_used(TenantId(8)), ByteCount::ZERO);
+	}
+
+	#[test]
+	fn one_tenant_saturated_does_not_block_another() {
+		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let _tenant_7 = coordinator
+			.tenant_memory
+			.try_reserve(TenantId(7), ByteCount::new(8))
+			.expect("saturate tenant 7");
+		let tenant_8 = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(8),
+			TenantId(8),
+			HlcBound(1),
+		);
+
+		let admitted_8 = coordinator
+			.admit_query(&tenant_8)
+			.expect("tenant 8 admitted");
+
+		assert_eq!(admitted_8.query_budget.memory_per_task, ByteCount::new(16));
+		assert_eq!(
+			coordinator.tenant_memory_used(TenantId(8)),
+			ByteCount::new(16)
+		);
+	}
+
 	fn coordinator(batch: RecordBatch, descriptor_failures: usize) -> QueryCoordinator {
 		let mut catalog = MockCatalog::new();
 		catalog
@@ -904,6 +1103,36 @@ mod tests {
 			),
 		);
 		QueryCoordinator::new(Arc::new(catalog), executor, PlannerConfig::default())
+	}
+
+	fn distributed_coordinator_with_policy(
+		policy: TenantBudgetPolicy,
+	) -> DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport> {
+		DistributedQueryCoordinator::new(
+			Arc::new(MockCatalog::new()),
+			Arc::new(StaticWorkerRegistry::new(Vec::new())),
+			Arc::new(MemoryManager::new(1, 1024)),
+			Arc::new(TcpTransport::new()),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_tenant_budget_policy(policy)
+	}
+
+	fn tenant_policy() -> TenantBudgetPolicy {
+		let mut per_tenant = std::collections::HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+		);
+		per_tenant.insert(
+			TenantId(8),
+			TenantBudget::new(ByteCount::new(16), ByteCount::new(32)),
+		);
+		TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(64), ByteCount::new(64)),
+			per_tenant,
+		)
 	}
 
 	fn count_plan() -> LogicalPlan {

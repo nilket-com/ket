@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::distributed::budget::{ByteCount, TenantBudget, TenantBudgetPolicy};
 use crate::distributed::identity::WorkerId;
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::ir::TableId;
@@ -48,6 +49,15 @@ drain_timeout_seconds = 30
 task_listener_bind = "127.0.0.1:0"
 memory_budget_bytes = 67108864
 # advertised_endpoint = "127.0.0.1:0"
+
+# [tenant_budgets.default]
+# memory_per_task_bytes = 67108864
+# aggregate_memory_bytes = 268435456
+
+# [[tenant_budgets.tenants]]
+# tenant_id = 7
+# memory_per_task_bytes = 16777216
+# aggregate_memory_bytes = 67108864
 
 [storage.wendelon]
 bootstrap_peers = [
@@ -110,6 +120,7 @@ pub enum ToronConfigError {
 pub struct ToronBootstrapConfig {
 	pub node: ToronNodeConfig,
 	pub worker: ToronWorkerConfig,
+	pub tenant_budgets: TenantBudgetPolicy,
 	pub storage: ToronStorageConfig,
 	pub catalog: ToronCatalogConfig,
 	pub sql: Option<SqlConfig>,
@@ -233,6 +244,7 @@ struct RawToronBootstrapConfig {
 	node: RawToronNodeConfig,
 	#[serde(default)]
 	worker: RawToronWorkerConfig,
+	tenant_budgets: Option<RawTenantBudgetPolicy>,
 	storage: RawToronStorageConfig,
 	#[serde(default)]
 	catalog: RawToronCatalogConfig,
@@ -260,6 +272,26 @@ struct RawToronWorkerConfig {
 	advertised_endpoint: Option<String>,
 	#[serde(default = "default_memory_budget_bytes")]
 	memory_budget_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTenantBudgetPolicy {
+	default: Option<RawTenantBudget>,
+	#[serde(default)]
+	tenants: Vec<RawTenantBudgetEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTenantBudget {
+	memory_per_task_bytes: u64,
+	aggregate_memory_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTenantBudgetEntry {
+	tenant_id: u64,
+	memory_per_task_bytes: u64,
+	aggregate_memory_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +488,10 @@ fn normalize_config(
 	if raw.worker.memory_budget_bytes == 0 {
 		return Err(invalid("memory_budget_bytes must be greater than 0"));
 	}
+	let tenant_budgets = normalize_tenant_budget_policy(
+		raw.tenant_budgets,
+		ByteCount::new(raw.worker.memory_budget_bytes),
+	)?;
 	if raw.storage.wendelon.bootstrap_peers.is_empty() {
 		return Err(invalid(
 			"storage.wendelon.bootstrap_peers must contain at least one peer",
@@ -517,6 +553,7 @@ fn normalize_config(
 			advertised_endpoint: raw.worker.advertised_endpoint.map(WorkerEndpoint::new),
 			memory_budget_bytes: raw.worker.memory_budget_bytes,
 		},
+		tenant_budgets,
 		storage: ToronStorageConfig {
 			wendelon: ToronWendelonStorageConfig {
 				bootstrap_peers: raw
@@ -547,6 +584,62 @@ fn normalize_config(
 		tls,
 		observability,
 	})
+}
+
+fn normalize_tenant_budget_policy(
+	raw: Option<RawTenantBudgetPolicy>,
+	worker_memory_budget: ByteCount,
+) -> Result<TenantBudgetPolicy, ToronConfigError> {
+	let Some(raw) = raw else {
+		return Ok(TenantBudgetPolicy::omitted_config(worker_memory_budget));
+	};
+	let default = raw
+		.default
+		.ok_or_else(|| invalid("tenant_budgets.default is required"))?;
+	let default = normalize_tenant_budget(
+		default.memory_per_task_bytes,
+		default.aggregate_memory_bytes,
+	)?;
+	let mut per_tenant = HashMap::new();
+	for tenant in raw.tenants {
+		if tenant.tenant_id == 0 {
+			return Err(invalid("tenant_budgets tenant_id must be greater than 0"));
+		}
+		let tenant_id = TenantId(tenant.tenant_id);
+		let budget =
+			normalize_tenant_budget(tenant.memory_per_task_bytes, tenant.aggregate_memory_bytes)?;
+		if per_tenant.insert(tenant_id, budget).is_some() {
+			return Err(invalid(format!(
+				"duplicate tenant_budgets entry for tenant_id {}",
+				tenant.tenant_id
+			)));
+		}
+	}
+	Ok(TenantBudgetPolicy::new(default, per_tenant))
+}
+
+fn normalize_tenant_budget(
+	memory_per_task_bytes: u64,
+	aggregate_memory_bytes: u64,
+) -> Result<TenantBudget, ToronConfigError> {
+	if memory_per_task_bytes == 0 {
+		return Err(invalid(
+			"tenant_budgets memory_per_task_bytes must be greater than 0",
+		));
+	}
+	if aggregate_memory_bytes == 0 {
+		return Err(invalid(
+			"tenant_budgets aggregate_memory_bytes must be greater than 0",
+		));
+	}
+	let memory_per_task = ByteCount::new(memory_per_task_bytes);
+	let aggregate_memory = ByteCount::new(aggregate_memory_bytes);
+	if memory_per_task > aggregate_memory {
+		return Err(invalid(
+			"tenant_budgets memory_per_task_bytes must be less than or equal to aggregate_memory_bytes",
+		));
+	}
+	Ok(TenantBudget::new(memory_per_task, aggregate_memory))
 }
 
 fn listener_bind_addresses(

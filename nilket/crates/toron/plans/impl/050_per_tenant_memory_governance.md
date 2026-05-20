@@ -49,8 +49,9 @@ query-memory chokepoint (only `read_envelope` wire buffers,
 `execute_query_with_context(&self, plan, context)` (ADR 049) —
 the admission chokepoint for D6.
 
-**0.4** Confirm `SqlErrorCode` baseline = 11 variants (for the
-only-new-code guard); `map_sql_query_error` is the mapping site.
+**0.4** Confirm pre-ADR-050 `SqlErrorCode` baseline = 10 variants
+(for the only-new-code guard; ADR 050 adds `ResourceExhausted` as
+the 11th); `map_sql_query_error` is the mapping site.
 
 **Acceptance:** reuse points confirmed; `MemoryManager`-is-wire-buffers
 confirmed; `SqlErrorCode` baseline recorded.

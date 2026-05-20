@@ -8,6 +8,7 @@ use toron::config::{
 	ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
 use toron::daemon::ToronDaemon;
+use toron::distributed::budget::{ByteCount, TenantBudgetPolicy};
 use toron::distributed::identity::{AttemptId, QueryId, StageId, TaskId, TaskIdentity, WorkerId};
 use toron::sql_wire::{
 	SqlErrorCode, SqlFrame, SqlMessage, read_frame as read_sql_frame,
@@ -31,6 +32,7 @@ fn config() -> ToronBootstrapConfig {
 			advertised_endpoint: None,
 			memory_budget_bytes: 1024 * 1024,
 		},
+		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(1024 * 1024)),
 		storage: ToronStorageConfig {
 			wendelon: ToronWendelonStorageConfig {
 				bootstrap_peers: vec![ToronWendelonBootstrapPeer {

@@ -14,6 +14,7 @@ use toron::config::{
 	ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
 use toron::daemon::ToronDaemon;
+use toron::distributed::budget::{ByteCount, TenantBudgetPolicy};
 use toron::distributed::identity::{AttemptId, QueryId, StageId, TaskId, TaskIdentity, WorkerId};
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, canonical_client_dns_name, canonical_daemon_dns_name,
@@ -497,6 +498,7 @@ fn tls_config(
 			advertised_endpoint: None,
 			memory_budget_bytes: 1024 * 1024,
 		},
+		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(1024 * 1024)),
 		storage: ToronStorageConfig {
 			wendelon: ToronWendelonStorageConfig {
 				bootstrap_peers: vec![ToronWendelonBootstrapPeer {

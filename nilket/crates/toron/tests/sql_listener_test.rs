@@ -19,6 +19,7 @@ use toron::config::{
 	ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
 use toron::daemon::ToronDaemon;
+use toron::distributed::budget::{ByteCount, TenantBudget, TenantBudgetPolicy};
 use toron::distributed::identity::{QueryId, WorkerId};
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, canonical_client_dns_name, canonical_daemon_dns_name,
@@ -203,6 +204,38 @@ async fn sql_client_tenant_8_observed_proves_not_daemon_static() {
 		error.message.contains("storage_execution") || error.message.contains("TableId"),
 		"{error:?}"
 	);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_over_per_task_budget_returns_resource_exhausted() {
+	let fixture = LiveWendelonFixture::start(48).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let mut config = toron_config_with_descriptor(descriptor, true);
+	config.tenant_budgets = TenantBudgetPolicy::new(
+		TenantBudget::new(ByteCount::new(1), ByteCount::new(1)),
+		HashMap::new(),
+	);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	let error = execute_sql(
+		endpoint,
+		"SELECT id, amount, region FROM storage_execution ORDER BY amount",
+	)
+	.await
+	.expect_err("sort should exceed tenant per-task budget");
+
+	assert_eq!(error.code, SqlErrorCode::ResourceExhausted);
+	assert_eq!(error.message, "tenant memory budget exhausted");
 
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();
@@ -469,6 +502,7 @@ fn toron_config_with_descriptor(
 			advertised_endpoint: None,
 			memory_budget_bytes: 64 * 1024 * 1024,
 		},
+		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(64 * 1024 * 1024)),
 		storage: ToronStorageConfig {
 			wendelon: ToronWendelonStorageConfig {
 				bootstrap_peers: vec![ToronWendelonBootstrapPeer {

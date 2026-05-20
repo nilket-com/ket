@@ -7,6 +7,7 @@ use toron::config::{
 	ToronDescriptorBootstrap, ToronDescriptorBootstrapTable, load_descriptor_bootstrap,
 	load_toron_bootstrap_config, render_example_config,
 };
+use toron::distributed::budget::{ByteCount, QueryBudget};
 use toron::ir::TableId;
 use toron::storage::TenantId;
 use wendelon::schema::{
@@ -83,6 +84,85 @@ fn toron_example_config_loads() {
 	);
 	assert!(config.coordinator.include_self_worker);
 	assert!(config.tls.is_none());
+	assert_eq!(
+		config.tenant_budgets.default.memory_per_task,
+		QueryBudget::default().memory_per_task
+	);
+	assert_eq!(
+		config.tenant_budgets.default.aggregate_memory,
+		ByteCount::new(67_108_864)
+	);
+}
+
+#[test]
+fn tenant_budget_policy_config_round_trips() {
+	let dir = fresh_dir("tenant-budget-round-trip");
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load tenant budget config");
+
+	assert_eq!(
+		config.tenant_budgets.default.memory_per_task,
+		ByteCount::new(1024)
+	);
+	assert_eq!(
+		config.tenant_budgets.default.aggregate_memory,
+		ByteCount::new(4096)
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.budget_for(TenantId(7))
+			.memory_per_task,
+		ByteCount::new(512)
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.budget_for(TenantId(7))
+			.aggregate_memory,
+		ByteCount::new(2048)
+	);
+}
+
+#[test]
+fn tenant_budget_config_rejects_zero_duplicate_and_per_task_over_aggregate() {
+	for (tag, snippet, expected) in [
+		(
+			"zero-tenant",
+			"[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\n\n[[tenant_budgets.tenants]]\ntenant_id = 0\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\n",
+			"tenant_budgets tenant_id must be greater than 0",
+		),
+		(
+			"zero-budget",
+			"[tenant_budgets.default]\nmemory_per_task_bytes = 0\naggregate_memory_bytes = 4096\n",
+			"tenant_budgets memory_per_task_bytes must be greater than 0",
+		),
+		(
+			"duplicate",
+			"[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\n",
+			"duplicate tenant_budgets entry for tenant_id 7",
+		),
+		(
+			"per-task-over-aggregate",
+			"[tenant_budgets.default]\nmemory_per_task_bytes = 4097\naggregate_memory_bytes = 4096\n",
+			"tenant_budgets memory_per_task_bytes must be less than or equal to aggregate_memory_bytes",
+		),
+	] {
+		let dir = fresh_dir(tag);
+		let path = dir.join("toron.toml");
+		std::fs::write(&path, format!("{}\n{snippet}", render_example_config()))
+			.expect("write config");
+
+		let error = load_toron_bootstrap_config(&path).expect_err("invalid tenant budget");
+
+		assert!(error.to_string().contains(expected), "{error}");
+	}
 }
 
 #[test]

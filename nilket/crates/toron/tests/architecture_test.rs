@@ -4989,11 +4989,12 @@ fn adr037_distributed_coordinator_exposes_write_sink_constructors() {
 fn adr037_distributed_dml_routes_to_shared_driver() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
-	let execute_query = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
-		.into_iter()
-		.find(|(_, block)| block.contains("DistributedMutationSourceExecutor"))
-		.expect("distributed execute_query body")
-		.1;
+	let execute_query =
+		brace_blocks_after_marker(&coordinator, "async fn execute_query_with_admission")
+			.into_iter()
+			.find(|(_, block)| block.contains("DistributedMutationSourceExecutor"))
+			.expect("distributed execute_query_with_admission body")
+			.1;
 
 	for variant in [
 		"ExecutionPlan::Insert",
@@ -5020,10 +5021,9 @@ fn adr037_distributed_read_executor_wraps_fragment_scheduler() {
 	.expect("distributed source executor body")
 	.1;
 
-	assert!(
-		distributed_source
-			.contains("execute_bound_distributed_with_context(plan.clone(), self.context)")
-	);
+	assert!(distributed_source.contains(
+		"execute_bound_distributed_with_context(plan.clone(), self.context, self.query_budget)"
+	));
 	assert!(distributed_source.contains(".await"));
 }
 
@@ -5040,7 +5040,8 @@ fn adr037_distributed_fragment_config_uses_execution_context() {
 	assert!(fragment_config.contains("context.query_id"));
 	assert!(fragment_config.contains("TaskExecutionContext::from_execution_context"));
 	assert!(fragment_config.contains("context"));
-	assert!(fragment_config.contains("TaskBudget::from_query_budget(self.query_budget)"));
+	assert!(fragment_config.contains("query_budget: QueryBudget"));
+	assert!(fragment_config.contains("TaskBudget::from_query_budget(query_budget)"));
 }
 
 #[test]
@@ -7947,10 +7948,10 @@ fn adr049_peer_kind_client_carries_tenant_id() {
 fn adr049_coordinator_scopes_catalog_before_binding() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator");
-	let body = brace_blocks_after_marker(&coordinator, "pub async fn execute_query_with_context")
+	let body = brace_blocks_after_marker(&coordinator, "async fn execute_query_with_admission")
 		.into_iter()
 		.next()
-		.expect("execute_query_with_context")
+		.expect("execute_query_with_admission")
 		.1;
 
 	let scoped_pos = body
@@ -8155,6 +8156,293 @@ fn adr049_new_types_are_brand_clean_and_no_v1_suffix() {
 		"TenantRouteV1",
 		"ClientIdentityV1",
 		"AcceptedSqlConnectionV1",
+	]);
+}
+
+#[test]
+fn adr050_tenant_budget_policy_config_is_node_local() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	for required in [
+		"pub tenant_budgets: TenantBudgetPolicy",
+		"tenant_budgets: Option<RawTenantBudgetPolicy>",
+		"[tenant_budgets.default]",
+		"[[tenant_budgets.tenants]]",
+		"memory_per_task_bytes",
+		"aggregate_memory_bytes",
+	] {
+		assert!(
+			config.contains(required),
+			"missing tenant budget config token {required}"
+		);
+	}
+	assert!(config.contains("TenantBudgetPolicy::omitted_config"));
+}
+
+#[test]
+fn adr050_tenant_budget_config_validates_default_duplicates_and_nonzero() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	for required in [
+		"tenant_budgets.default is required",
+		"tenant_budgets tenant_id must be greater than 0",
+		"tenant_budgets memory_per_task_bytes must be greater than 0",
+		"tenant_budgets aggregate_memory_bytes must be greater than 0",
+		"duplicate tenant_budgets entry for tenant_id",
+		"memory_per_task_bytes must be less than or equal to aggregate_memory_bytes",
+	] {
+		assert!(
+			config.contains(required),
+			"missing tenant budget validation token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr050_query_memory_governed_by_query_budget_not_memory_manager() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let memory =
+		std::fs::read_to_string(manifest_dir().join("src/server/memory.rs")).expect("read memory");
+
+	assert!(coordinator.contains("query_budget_for_base(context.tenant_id, self.query_budget)"));
+	assert!(coordinator.contains("TaskBudget::from_query_budget(query_budget)"));
+	assert!(!coordinator.contains("MemoryManager::scoped"));
+	assert!(!memory.contains("TenantId"));
+	assert!(!memory.contains("TenantMemory"));
+}
+
+#[test]
+fn adr050_per_query_budget_sourced_by_tenant_at_coordinator() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+
+	for required in [
+		"fn admit_query(&self, context: &ExecutionContext)",
+		"query_budget_for_base(context.tenant_id, self.query_budget)",
+		"execute_query_with_admission(plan, context, query_budget)",
+		"fragment_config(context, query_budget)",
+	] {
+		assert!(
+			coordinator.contains(required),
+			"missing tenant query budget source token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr050_aggregate_admission_reserves_and_releases_by_tenant() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+
+	for required in [
+		"pub struct TenantMemoryAccountant",
+		"pub fn try_reserve(",
+		"pub struct TenantMemoryReservation",
+		"impl Drop for TenantMemoryReservation",
+		"self.release_once();",
+	] {
+		assert!(
+			budget.contains(required),
+			"missing tenant memory accountant token {required}"
+		);
+	}
+	assert!(coordinator.contains(".try_reserve(context.tenant_id, query_budget.memory_per_task)"));
+}
+
+#[test]
+fn adr050_aggregate_admission_rejects_before_bind_or_execution() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let execute_query =
+		brace_blocks_after_marker(&coordinator, "pub async fn execute_query_with_context")
+			.into_iter()
+			.next()
+			.expect("execute_query_with_context")
+			.1;
+	let helper = brace_blocks_after_marker(&coordinator, "async fn execute_query_with_admission")
+		.into_iter()
+		.next()
+		.expect("execute_query_with_admission")
+		.1;
+
+	assert!(execute_query.contains("let admitted = self.admit_query(&context)?;"));
+	assert!(execute_query.contains(".execute_query_with_admission(plan, context, query_budget)"));
+	assert!(helper.contains("bind(plan, catalog.as_ref(), &self.config).await?"));
+}
+
+#[test]
+fn adr050_budget_exhaustion_maps_to_resource_exhausted() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	for required in [
+		"SqlErrorCode::ResourceExhausted",
+		"ExecutionError::BudgetExhausted",
+		"TaskFailureKind::BudgetExhausted",
+		"BudgetDimension::Memory",
+		"tenant memory budget exhausted",
+	] {
+		assert!(
+			daemon.contains(required),
+			"missing ResourceExhausted mapping token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr050_resource_exhausted_is_only_new_sql_error_code() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let error_codes = brace_blocks_after_marker(&wire, "pub enum SqlErrorCode")
+		.into_iter()
+		.next()
+		.expect("SqlErrorCode")
+		.1;
+	let variants = error_codes
+		.lines()
+		.map(str::trim)
+		.filter(|line| line.ends_with(','))
+		.collect::<Vec<_>>();
+
+	assert!(variants.contains(&"ResourceExhausted,"));
+	assert_eq!(
+		variants.len(),
+		12,
+		"SqlErrorCode should be 11 baseline + ResourceExhausted"
+	);
+	assert!(!wire.contains("TenantBudgetMessage"));
+	assert!(!wire.contains("ResourceQuota"));
+}
+
+#[test]
+fn adr050_default_and_loopback_tenants_use_default_budget() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(budget.contains("pub fn budget_for(&self, tenant_id: TenantId) -> TenantBudget"));
+	assert!(budget.contains(".unwrap_or(self.default)"));
+	assert!(config.contains("TenantBudgetPolicy::omitted_config(worker_memory_budget)"));
+	assert!(daemon.contains("SqlTenantSource::LoopbackConfig(config.node.tenant_id)"));
+	assert!(daemon.contains(".with_tenant_budget_policy(config.tenant_budgets.clone())"));
+}
+
+#[test]
+fn adr050_memory_only_no_cpu_rate_connection_or_storage_quotas() {
+	let source = [
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config"),
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord"),
+		std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+			.expect("read budget"),
+	]
+	.join("\n");
+
+	for forbidden in [
+		"CpuBudget",
+		"cpu_quota",
+		"RateLimit",
+		"rate_limit",
+		"connection_quota",
+		"storage_quota",
+		"fair_share",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 050 must remain memory-only; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr050_no_per_tenant_metric_labels() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	assert!(!observability.contains("tenant_id"));
+	assert!(!observability.contains("tenant=\""));
+	assert!(!observability.contains("tenant_id=\\\"{}\\\""));
+}
+
+#[test]
+fn adr050_no_wendelon_production_changes() {
+	let wendelon_source = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"TenantMemoryAccountant",
+		"ResourceExhausted",
+		"tenant_budgets",
+		"SqlErrorCode",
+	] {
+		assert!(
+			!wendelon_source.contains(forbidden),
+			"Wendelon source contains Toron ADR 050 token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr050_prior_adr04x_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr040_", "adr041_", "adr042_", "adr043_", "adr044_", "adr045_", "adr046_", "adr047_",
+		"adr048_", "adr049_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr050_nilket_root_remains_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr050_fixture_worker_source_unchanged() {
+	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker source");
+
+	assert!(!fixture.contains("TenantBudgetPolicy"));
+	assert!(!fixture.contains("tenant_budgets"));
+	assert!(!fixture.contains("ResourceExhausted"));
+}
+
+#[test]
+fn adr050_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronTenantBudget",
+		"ToronTenantMemory",
+		"ToronResourceExhausted",
+		"TenantBudgetPolicyV1",
+		"TenantBudgetV1",
+		"TenantMemoryAccountantV1",
+		"TenantMemoryReservationV1",
+		"ResourceExhaustedV1",
 	]);
 }
 

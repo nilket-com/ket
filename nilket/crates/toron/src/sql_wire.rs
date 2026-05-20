@@ -89,6 +89,7 @@ pub enum SqlErrorCode {
 	Cancelled,
 	CancellationUnsupported,
 	NoLiveWorker,
+	ResourceExhausted,
 	Internal,
 }
 
