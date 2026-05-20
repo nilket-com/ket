@@ -4229,6 +4229,50 @@ along with the forward-sequence rewrite.
   six-phase migration is materialized in
   `plans/impl/052_per_tenant_concurrency_admission.md`.
 
+- **ADR 053 — Governed Bind-Miss Descriptor Sync Consumer.**
+  Promoted. The Toron **consumer** of the Wendelon ADR 072 producer —
+  the second half of the ADR 052 §D15 / Wendelon ADR 072 §D14 sequence,
+  now ungated.
+  `WendelonCatalog::resolve_table` becomes self-healing: on a local
+  registry miss for the scoped tenant it fetches the exact
+  `(tenant_id, namespace, table_name)` descriptor via the public
+  `Client::get_table_schema_descriptor` (072) facade, **in-place
+  insert-only** merges it into the shared `WendelonDescriptorRegistry`
+  with a freshly allocated local `TableId`, and returns the binding —
+  so a table created in Wendelon after daemon start is queryable
+  without a restart, closing ADR 051's startup-only gap. **Governed
+  resource:** per-tenant `max_concurrent_descriptor_syncs` (RAII
+  `TenantDescriptorSyncAccountant`, derive `min(2,
+  max_concurrent_queries)`), **single-flight outer / budget inner** so
+  a miss storm spends one reservation + one Wendelon RPC. Four council
+  iterations (dual adr+impl from iter-2): iter-0 split (Codex+Gemini
+  consumer; Claude Governance Phase 3); iter-1 3-of-3 on the consumer,
+  Claude's "sync is a governed resource" made load-bearing + the
+  insert-only/fail-closed scope locked; iter-2 resolved throttle→
+  resource-exhaustion, retry-in-`resolve_table`, single-flight-outer;
+  iter-3 settled the error seam. Final D-set: **13 decisions, 19
+  architecture guards + 3 convention guards, 29 required fixtures + 1
+  optional**.
+  **D9/D11 critical decision:** the merge is **insert-only** — it fills
+  a miss, never refreshes/overwrites; an already-cached descriptor that
+  Wendelon later evolved/dropped is **not** refreshed (deferred ADR) and
+  **fails closed** at the storage path via the unchanged
+  `DescriptorEvolved` (ADR 051 D8). Wendelon stays authoritative; Toron
+  is a lazy, insert-only, fail-closed cache (cross-ring "one RPC, no
+  Toron-managed mirror" boundary).
+  **D10 critical decision:** a throttled sync is **resource
+  exhaustion, not absence** — `CatalogError::ResourceExhausted`
+  (*"tenant descriptor sync limit exhausted"*) →
+  `SqlErrorCode::ResourceExhausted`, **not** `TableNotFound`. Retry is
+  internal to `resolve_table`; the coordinator bind path and
+  `DescriptorEvolved` loop are untouched.
+  **Single-plan posture; Toron-ring only.** Consumes 072; no Wendelon
+  server change; no SQL wire/DDL change; no negative cache / refresh /
+  TTL / background sync (future ADRs); `crates/nilket` runtime-free;
+  `toron_fixture_worker.rs` unchanged. Placement: Exterior Substrate →
+  Toron home. The six-phase migration is materialized in
+  `plans/impl/053_governed_bind_miss_descriptor_sync_consumer.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -4312,7 +4356,68 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 052 promoted; ADR 053 candidates
+### ADR 053 promoted; ADR 054 candidates
+
+ADR 053 selected and promoted **Governed Bind-Miss Descriptor Sync
+Consumer** — the Toron consumer of the Wendelon ADR 072 producer, the
+second half of the ADR 052 §D15 / Wendelon ADR 072 §D14 sequence, now
+ungated. It completes the
+descriptor-liveness arc: `WendelonCatalog::resolve_table` self-heals a
+bind miss by fetching the exact descriptor from Wendelon and
+in-place-merging it (insert-only) into the shared registry, governed by
+a per-tenant `max_concurrent_descriptor_syncs` budget + single-flight.
+A throttled sync is `ResourceExhausted` (not `TableNotFound`); staleness
+is fail-closed via the unchanged `DescriptorEvolved`. The topic
+converged 3-of-3 (Claude withdrew an iter-0 Governance-Phase-3 contest
+once 072 made the consumer ungated); the error seam settled on
+`CatalogError::ResourceExhausted` (iter-3). Final D-set: **13 decisions,
+19 architecture guards + 3 convention guards, 29 required fixtures + 1
+optional**.
+
+**Pure Toron-ring substrate; node-local; consumes 072; zero Wendelon
+server change, zero SQL wire change.**
+
+**Architectural invariants preserved through this cycle:**
+
+- ADR 049 tenant source, 050 memory budget, 051 startup bootstrap, 052
+  query concurrency — all unchanged; the sync budget is a sibling RAII
+  accountant, not a rewrite.
+- **Insert-only / fail-closed:** the merge fills a miss, never refreshes;
+  a stale cached descriptor fails closed via the unchanged
+  `DescriptorEvolved` (ADR 051 D8). Wendelon stays authoritative.
+- Trigger is `resolve_table` miss only — not `resolve_table_id`,
+  storage, `DescriptorEvolved`, create/drop, coordinator, or background.
+- No negative cache, refresh, TTL, inventory, watch/reload, registry
+  `Arc` swap, or `from_tenant_descriptors` reuse.
+- `crates/nilket` runtime-free; `toron_fixture_worker.rs` unchanged;
+  brand-clean / no-`*V1`.
+- Placement: Exterior Substrate → Toron home.
+
+The six-phase migration is materialized in
+`plans/impl/053_governed_bind_miss_descriptor_sync_consumer.md`.
+
+**ADR 054 candidates:**
+
+The multi-tenant arc (049 routing → 050 memory → 051 bootstrap → 052
+concurrency → 072 producer → 053 live consumer) is now complete for
+startup-known and runtime-discovered tables. Open frontiers:
+
+- **Per-tenant governance Phase 3** — fair-share / weighted admission,
+  rate limits (QPS / token bucket), connection caps, borrowing,
+  queueing (deferred from ADR 050 D7/D10 and ADR 052; Claude's ADR 053
+  iter-0 contest, parked here).
+- **Descriptor refresh / invalidation** — the deferred other half of
+  liveness: refresh an already-cached descriptor on evolution, external
+  DROP invalidation, TTL (ADR 053 deferred these as fail-closed-only).
+- **OTLP traces export**, **audit subsystem** (deferred since ADR 045
+  D7).
+- **SQL surface widening** — CTAS `IF NOT EXISTS`, `UPDATE WHERE`,
+  `INSERT/CTAS/DELETE … RETURNING`.
+- **Live cert rotation / CRL / OCSP**; **token-based tenant claims
+  (JWT/OIDC/SPIFFE)**; gRPC / Arrow Flight / Postgres frontends; strong
+  cross-worker cancellation; prepared statements (carried forward).
+
+### ADR 052 promoted; ADR 053 candidates (HISTORICAL)
 
 ADR 052 selected and promoted **Per-Tenant Concurrency Admission
 and Bounded Resource Observability** — the resource-isolation
