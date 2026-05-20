@@ -3950,6 +3950,23 @@ along with the forward-sequence rewrite.
   unmodified).
   The eight-phase migration is materialized in
   `plans/impl/048_shared_observability_http_workspace_crate.md`.
+- **`nilket wendelon inspect` → promoted as Wendelon
+  ADR 071 (cross-reference).** The storage-ring inspect-parity
+  consumer that will complete the symmetric operator-plane
+  inspect surface (`nilket toron inspect` +
+  `nilket wendelon inspect`)
+  was promoted in the **Wendelon** sequence as **ADR 071**, not
+  as a Toron ADR. It is a Wendelon-ring feature (all code lands
+  in `crates/wendelon`; guards + fixtures in
+  `crates/wendelon/tests/`), composing over ADR 047 `tls-pki` +
+  ADR 048 `observability-http` + Wendelon ADR 027 observability
+  posture. It was drafted through the Toron operator-plane
+  council process (3 iterations, Codex+Claude 2-of-3) and
+  relocated to the Wendelon sequence at promotion because
+  Wendelon owns the consumer ADR. See
+  `crates/wendelon/plans/adr/071_nilket_wendelon_inspect_real_wiring.md`.
+  The Toron ADR 049 slot is therefore open (multi-tenant
+  routing is the lead candidate; see the forward sequence).
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4238,47 +4255,55 @@ this cycle:**
 The eight-phase migration is materialized in
 `plans/impl/048_shared_observability_http_workspace_crate.md`.
 
-**ADR 049 candidates (lead candidate emerged
-during ADR 048 iter-1):**
+**ADR 049 candidates:**
 
 After ADR 048, the cross-ring HTTP/1.1
 substrate is consolidated (Toron-side; Wendelon-
 side production code stays unchanged for V1).
-ADR 048 explicitly prepared ADR 049's lead
-candidate by extracting the shared substrate
-that prevents the imminent fourth-site
-duplication.
+The `nilket wendelon inspect` parity candidate
+that originally led this slot was **promoted in
+the Wendelon sequence as Wendelon ADR 071**
+(it's a Wendelon-ring feature — all code lands
+in `crates/wendelon`; its server-side `/ready`
+counterpart is Wendelon ADR 027 observability
+posture; it composes over ADR 047 `tls-pki` +
+ADR 048 `observability-http`). It will complete the
+symmetric operator-plane inspect surface when implemented
+(`nilket toron inspect` + `nilket wendelon
+inspect`) without occupying a Toron ADR slot.
+See
+`crates/wendelon/plans/adr/071_nilket_wendelon_inspect_real_wiring.md`.
+The Toron ADR 049 slot is therefore open;
+**multi-tenant routing** is the lead candidate.
 
-- **`nilket wendelon inspect` parity (LEAD).**
-  Composition cycle mirroring ADR 046 to the
-  storage ring. Composes over ADR 048
-  `observability-http` (client-side helpers
-  `write_request` + `read_response`) + ADR 047
-  `tls-pki` (client config + cert chain
-  verifier) + Wendelon's existing `/ready`
-  endpoint (`metrics/observability.rs:239`
-  `handle_ready_connection`) and
-  `ReadinessSnapshot` struct
-  (`metrics/observability.rs:52`). CLI-only;
-  zero new Wendelon daemon-side wire surface.
-  Mirrors ADR 046 D5 / D6 / D7 / D10 surface
-  (exit codes 0/1/2, symmetric 5s timeouts,
-  TLS-flags-together requirement, JSON pass-
-  through, hand-rolled HTTP/1.1 client).
-  Validates ADR 048's substrate as the second
-  consumer; validates ADR 047's `tls-pki`
-  substrate as a cross-ring client-side
-  consumer.
-- **Multi-tenant routing** (Gemini's lead
-  through ADR 048; carried forward as ADR
-  050+ candidate). Now genuinely unblocked by
-  ADR 044 + ADR 045 `monitor-` admission +
-  ADR 046 cert reuse + ADR 047 shared
-  `tls-pki` + ADR 048 shared HTTP/1.1
-  substrate. Substantial substrate cycle (4+
-  iterations expected); requires per-tenant
-  catalog isolation policy + scoped catalog
-  decorator + mTLS tenant extraction.
+- **Multi-tenant routing (LEAD).** Gemini's lead
+  through ADR 048; now the leading Toron
+  large-substrate candidate. Genuinely unblocked
+  by ADR 044 + ADR 045 `monitor-` admission +
+  ADR 046 cert reuse + ADR 047 shared `tls-pki`
+  + ADR 048 shared HTTP/1.1 substrate.
+  Substantial substrate cycle (4+ iterations
+  expected); requires per-tenant catalog
+  isolation policy + scoped catalog decorator +
+  mTLS tenant extraction (`client-<tenant_id>.<domain>`
+  SAN) + tenant-aware `DistributedQueryCoordinator`
+  binding. Likely needs a Phase-1 cut to fit a
+  tight cycle.
+- **`nilket wendelon inspect` parity — PROMOTED
+  as Wendelon ADR 071** (cross-reference, not a
+  Toron ADR; implementation pending). Mirrors
+  ADR 046 to the storage ring: composes over
+  ADR 048 `observability-http`
+  (client helpers `write_request` +
+  `read_response`) + ADR 047 `tls-pki` +
+  Wendelon's existing `/ready` endpoint
+  (`metrics/observability.rs:239`) and
+  `ReadinessSnapshot` (`:52`). CLI-only; zero new
+  Wendelon daemon-side wire surface; exit codes
+  0/1/2; symmetric 5s timeouts; empty ALPN;
+  `ObservabilityReady` admission. Drafted via the
+  Toron operator-plane council process, promoted
+  in the Wendelon sequence.
 - **OTLP traces export**
   (`[observability.traces]`). Wendelon has
   this; Toron deferred in ADR 045 D7.

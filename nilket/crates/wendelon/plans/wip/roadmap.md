@@ -35,6 +35,21 @@ live at
 Toron-pivot stretch continues to pull compute-adjacent storage
 primitives ahead of OLTP-shaped access surfaces.
 
+**ADR 071 (`nilket wendelon inspect`) promoted — ops/observability
+CLI composition, not a storage-engine continuation.** Planning is
+complete (`plans/adr/071_nilket_wendelon_inspect_real_wiring.md`
++ `plans/impl/071_*`); implementation pending. It adds a one-shot
+operator CLI that dials Wendelon's existing mTLS `/ready` listener
+(ADR 027 observability posture), composing over the Toron-sequence
+cross-ring substrates ADR 047 `tls-pki` + ADR 048
+`observability-http`. Drafted via the Toron operator-plane council
+process (3 iterations, Codex+Claude 2-of-3) and relocated to the
+Wendelon sequence at promotion because Wendelon owns the consumer
+ADR. When implemented, it completes the symmetric operator-plane
+inspect surface (`nilket toron inspect` (Toron ADR 046) +
+`nilket wendelon inspect` (this ADR)). Zero daemon-side change;
+all code lands in `crates/wendelon`.
+
 ## Shipped foundations
 
 One-line index. Full context in each ADR; bench evidence under
@@ -135,6 +150,22 @@ deliberately deferred behind the storage hierarchy in this
 stretch.
 
 ## Forward sequence
+
+**Promoted, implementation pending — ADR 071 `nilket wendelon
+inspect` (ops/observability CLI composition).** Off the
+storage-engine track: a one-shot operator CLI dialing Wendelon's
+existing mTLS `/ready` listener (ADR 027), composing over
+ADR 047 `tls-pki` + ADR 048 `observability-http`. Mirrors Toron
+ADR 046 to the storage ring; body-authoritative readiness; exit
+codes 0/1/2; empty ALPN; `ObservabilityReady` admission; zero
+daemon-side change. **15 decisions, 16 architecture guards + 1
+convention guard (in `crates/wendelon/tests/architecture_test.rs`),
+15 required fixtures + 2 V1-evidence optional.** Plans:
+`plans/adr/071_nilket_wendelon_inspect_real_wiring.md` +
+`plans/impl/071_nilket_wendelon_inspect_real_wiring.md`. Drafted
+via the Toron operator-plane council; relocated to the Wendelon
+sequence at promotion (Wendelon owns the consumer ADR). The
+storage-engine forward items below continue independently.
 
 1. **All-null page-skip for nullable sparse projection** —
    ADR 070 implemented after four Claude / Codex / Gemini
