@@ -53,6 +53,35 @@ inspect surface (`nilket toron inspect` (Toron ADR 046) +
 `nilket wendelon inspect` (this ADR)). Zero daemon-side change;
 all code lands in `crates/wendelon`.
 
+**ADR 072 (Table Descriptor Snapshot Producer) promoted — the
+producer half of cross-ring descriptor liveness, not a
+storage-engine continuation.** Plans at
+`plans/adr/072_table_descriptor_snapshot_producer.md` +
+`plans/impl/072_table_descriptor_snapshot_producer.md`. A read-only
+Control Ring RPC (`MsgType::TABLE_DESCRIPTOR_GET_REQ` 0x3C /
+`_RESP` 0x3D) answering `(tenant_id, namespace, table_name)` →
+latest `TableSchemaDescriptor` (or not-found) against the Raft
+**leader's** applied `TableSchemaCatalogV1::latest_by_name`, with
+the full descriptor Postcard-encoded in the response trailing
+section. **Authz:** a descriptor-get helper whose V1 role matrix
+delegates to existing `TenantAdminRead` admission for Toron's current
+no-claim `Operator` Wendelon identity, plus a tenant-isolation overlay
+via `claimed_tenant_id` (tenant-scoped principals read only their own
+tenant; a no-claim cluster actor may target any). **Serializable-at-
+leader**, bypasses the Raft log (read-only against applied state);
+followers return `NOT_LEADER` + `leader_hint`. Reuses existing Control
+Ring reason codes (`NOT_FOUND`, `AUTHORIZATION_FAILED`,
+`INVALID_CONFIG`) and adds aggregate-only metrics. Seeded by Toron ADR
+052 §D15; drafted via the Toron operator-plane council (3 iterations,
+3-of-3) and relocated to the Wendelon sequence at promotion (ADR 071
+precedent). **14 decisions, 16 architecture guards + 3 convention
+guards, 12 required fixtures + 1 optional.** Read-only; no consensus
+write; no Data Ring change; no Toron production change. The **Toron
+bind-miss consumer** that calls this producer (in-place
+`sync_descriptor_for_tenant` registry merge, not ADR 051's fresh
+constructor) is the next **Toron** ADR (053), cross-referenced from
+the Toron roadmap.
+
 ## Shipped foundations
 
 One-line index. Full context in each ADR; bench evidence under
@@ -164,6 +193,18 @@ ran in. Only workspace-shared Interior substrate (`tls-pki`,
 `observability-http`) lives in the Toron aggregator sequence.
 
 ## Forward sequence
+
+**Promoted — ADR 072 Table Descriptor Snapshot Producer
+(cross-ring descriptor-liveness producer).** Read-only Control Ring
+RPC (0x3C/0x3D) returning the latest `TableSchemaDescriptor` by
+`(tenant, namespace, table)` from the Raft leader's applied catalog;
+descriptor-get authorization helper + tenant-isolation; full
+descriptor in the trailing section with a pinned `descriptor_len`.
+Seeded by Toron ADR 052 §D15; relocated to the Wendelon sequence at
+promotion (ADR 071 precedent). Status block above; plans at
+`plans/adr/072_*` + `plans/impl/072_*`. **Next consumer:** the
+Toron bind-miss ADR (Toron sequence, 053) — cross-referenced, not
+owned here.
 
 **Implemented — ADR 071 `nilket wendelon inspect`
 (ops/observability CLI composition).** Off the
