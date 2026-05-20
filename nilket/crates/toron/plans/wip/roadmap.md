@@ -4034,6 +4034,77 @@ along with the forward-sequence rewrite.
   `Connection::peer_identity()` and spiked in Phase 0.
   The eight-phase migration is materialized in
   `plans/impl/049_authenticated_tenant_routing_for_sql.md`.
+- **ADR 050 — Per-Tenant Memory Governance for Toron SQL.**
+  Promoted. The resource-isolation follow-through to ADR
+  049's logical isolation: one admitted tenant cannot
+  consume the shared daemon's query memory unchecked
+  (noisy-neighbor). Per-query `QueryBudget.memory_per_task`
+  is sourced from a node-local per-tenant policy keyed by
+  ADR 049's `tenant_id`, and a per-tenant **aggregate**
+  admission accountant reserves each query's budget against
+  the tenant's pool at coordinator admission (RAII release),
+  rejecting over-budget queries before binding/execution.
+  Three council iterations: iter-0 3-way (Claude + Gemini
+  lead governance; Codex leads descriptor ingestion); iter-1
+  a live-code audit **reframed the mechanism** — `MemoryManager`/
+  `BufPool` governs wire buffers, not query memory; query
+  memory is already enforced via `QueryBudget` /
+  `TaskBudget.memory` + `ExecutionError::BudgetExhausted`
+  (`exec.rs:2387`), sourced statically daemon-wide — so the
+  cut is "source the budget per-tenant + add aggregate
+  admission," reusing the existing enforcement (the ADR 049
+  source-not-mechanism pattern); iter-2 Codex converged on
+  the governance lead with the QueryBudget mechanism
+  (deferring his descriptor-ingestion lead to ADR 051). Final
+  D-set: **12 decisions, 13 architecture guards + 3 convention
+  guards, 13 required integration fixtures + 1 V1-evidence
+  optional fixture**.
+  **D2 critical decision:** govern query memory through
+  `QueryBudget`, **not** `MemoryManager`. *(Rejected 2-of-3
+  Codex+Claude: Gemini's `MemoryManager::scoped(tenant_id)`
+  buffer-pool views — the `BufPool` backs wire/`PooledBuf`,
+  not the RecordBatch query memory the executor already
+  budgets; mirrors the ADR 047 D8 / ADR 049 D7 resolutions
+  favoring reuse of existing higher-layer enforcement over a
+  low-level scoped view.)*
+  **D3 critical decision:** node-local `[tenant_budgets]`
+  policy (default + per-tenant overrides;
+  `memory_per_task_bytes` + `aggregate_memory_bytes`;
+  validated, not sum-capped); if omitted, synthesize a
+  default preserving `QueryBudget::default()` per-task +
+  `max([worker].memory_budget_bytes, QueryBudget::default().memory_per_task)`
+  as the default aggregate (valid and backward-compatible
+  without a shim).
+  **D4 critical decision:** `[worker].memory_budget_bytes`
+  stays the node physical cap, distinct from the per-tenant
+  policy.
+  **D5/D6 critical decision:** per-query budget selected by
+  `context.tenant_id` at coordinator admission; per-tenant
+  aggregate reserved up front with RAII release (the
+  noisy-neighbor cap — per-query budgets alone don't bound
+  concurrency).
+  **D7 critical decision:** hard reject — no queue, borrow,
+  spill, or weighted fairness.
+  **D8 critical decision:** one deliberate wire addition —
+  `SqlErrorCode::ResourceExhausted` (admission rejection +
+  `ExecutionError::BudgetExhausted` map to it; distributed
+  `TaskFailureKind::BudgetExhausted { dimension: Memory, .. }`
+  maps to it at the SQL boundary); distributed
+  `TaskFailureKind::BudgetExhausted` remains unchanged on the
+  distributed wire.
+  **D10 critical decision:** memory-only Phase 1 (CPU /
+  rate-limit / connection / storage quotas deferred).
+  **D12 critical decision:** descriptor discovery deferred —
+  Codex's tenant-explicit descriptor ingestion (Toron-local)
+  is the ADR 051 lead.
+  **Single-plan posture; Toron-ring only.** Reuses the
+  existing `QueryBudget` / `TaskBudget` / `BudgetExhausted`
+  enforcement; no Wendelon production change; `crates/nilket`
+  runtime-free; `toron_fixture_worker.rs` source unchanged;
+  no per-tenant metric labels (ADR 045/049 low-cardinality
+  preserved). Placement: Exterior Substrate → Toron home.
+  The eight-phase migration is materialized in
+  `plans/impl/050_per_tenant_memory_governance.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4118,7 +4189,92 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 049 promoted; ADR 050 candidates
+### ADR 050 promoted; ADR 051 candidates
+
+ADR 050 selected and promoted **Per-Tenant Memory Governance
+for Toron SQL** — the resource-isolation follow-through to
+ADR 049's logical isolation. Per-query `QueryBudget.memory_per_task`
+is sourced from a node-local per-tenant policy keyed by the
+mTLS-admitted `tenant_id`, and a per-tenant aggregate admission
+accountant reserves each query's budget against the tenant's
+pool at coordinator admission (RAII release), rejecting
+over-budget queries before binding/execution. The iter-1
+live-code audit was pivotal: `MemoryManager`/`BufPool` governs
+wire buffers, not query memory; the real query-memory budget
+(`QueryBudget` / `TaskBudget.memory` +
+`ExecutionError::BudgetExhausted`) was already enforced but
+sourced daemon-wide — so ADR 050 reuses that enforcement and
+makes the source per-tenant (the ADR 049 source-not-mechanism
+pattern). 2-of-3 Codex+Claude on the QueryBudget mechanism over
+Gemini's `MemoryManager::scoped` buffer-pool views (the
+ADR 047 D8 / ADR 049 D7 reuse-over-low-level-scoped resolution).
+Final D-set: **12 decisions, 13 architecture guards + 3
+convention guards, 13 required fixtures + 1 V1-evidence
+optional**.
+
+**Pure Toron-ring substrate; reuses the existing budget
+enforcement; zero Wendelon change.** The one operator-visible
+surface is `SqlErrorCode::ResourceExhausted` (admission
+rejection + `ExecutionError::BudgetExhausted` map to it);
+distributed `TaskFailureKind::BudgetExhausted { dimension:
+Memory, .. }` maps to it at the SQL boundary while the
+distributed failure type remains unchanged.
+Memory-only Phase 1.
+
+**Architectural invariants preserved through this cycle:**
+
+- ADR 040 D4 / ADR 042-049 root-runtime-free
+  (`crates/nilket/Cargo.toml` untouched).
+- ADR 049 per-connection `tenant_id` (`ExecutionContext` /
+  `TaskExecutionContext`) is the policy-lookup key; no new
+  tenant source (no CLI flag / SQL claim / token).
+- ADR 045/049 metrics low-cardinality (no per-tenant labels).
+- No SQL wire change beyond the one `ResourceExhausted` code;
+  no new `SqlMessage` variant.
+- `MemoryManager`/`BufPool` unchanged; no Wendelon production
+  change; `toron_fixture_worker.rs` source unchanged;
+  brand-clean / no-V1.
+- Placement: Exterior Substrate → Toron home
+  (ring-product-placement convention).
+
+The eight-phase migration is materialized in
+`plans/impl/050_per_tenant_memory_governance.md`.
+
+**ADR 051 candidates:**
+
+After ADR 050, Toron's SQL gateway has both logical (ADR 049)
+and memory-resource (ADR 050) tenant isolation.
+
+- **Tenant-explicit descriptor ingestion (LEAD)** — Codex's
+  ADR 050 iter-0 Option 1, Toron-local: a tenant-explicit
+  `(tenant_id, table_id, descriptor)` bundle applied atomically
+  into the tenant-keyed registry, retiring ADR 049's
+  single-tenant config bootstrap. Closes the descriptor-
+  discovery gap without a Wendelon API (unlike live sync).
+- **Live Wendelon → Toron descriptor sync** — the cross-ring
+  successor: a Wendelon descriptor-query/snapshot API (Wendelon
+  sequence) + a Toron sync consumer. Gated on the new Wendelon
+  producer surface.
+- **Per-tenant governance Phase 2** — CPU / rate-limiting /
+  connection caps / storage quotas / shared-pool borrowing /
+  queuing (deferred from ADR 050 D7/D10).
+- **Per-tenant metric labels** — bounded-cardinality budget-
+  utilization observability (deferred from ADR 050 D11 / ADR
+  045 posture).
+- **OTLP traces export**, **audit subsystem** (Toron deferred
+  in ADR 045 D7).
+- **SQL surface widening** — CTAS `IF NOT EXISTS`, `UPDATE
+  WHERE`, `INSERT/CTAS/DELETE ... RETURNING`.
+- **Live cert rotation / CRL / OCSP**; **token-based tenant
+  claims (JWT/OIDC/SPIFFE)**; **`observability-http` / `tls-pki`
+  Wendelon-side full migration**; gRPC / Arrow Flight / Postgres
+  frontends; strong cross-worker cancellation; prepared
+  statements (carried forward).
+
+**Substrate candidates carried forward:** (re-listed in the
+ADR 048 historical section below)
+
+### ADR 049 promoted; ADR 050 candidates (HISTORICAL)
 
 ADR 049 selected and promoted **Authenticated Tenant Routing
 for SQL** — a Toron compute-ring substrate cycle filling
