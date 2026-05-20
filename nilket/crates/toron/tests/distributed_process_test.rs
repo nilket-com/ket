@@ -621,7 +621,7 @@ async fn run_test_logical_process_query(
 	start_offset: usize,
 	plan: LogicalPlan,
 ) -> ProcessRun {
-	let mut workers = vec![
+	let mut workers = [
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
 	];
@@ -1076,7 +1076,7 @@ async fn run_hash_join_kind_process_query(
 	partition_count: u32,
 	start_offset: usize,
 ) -> JoinProcessRun {
-	let mut workers = vec![
+	let mut workers = [
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
 	];
@@ -1365,7 +1365,7 @@ async fn run_hash_join_worker_loss_query(worker_id_base: u128) -> JoinProcessRun
 }
 
 async fn run_producer_kill_query(worker_id_base: u128) -> ProcessRun {
-	let mut workers = vec![
+	let mut workers = [
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
 	];

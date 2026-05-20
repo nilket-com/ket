@@ -168,8 +168,10 @@ async fn wendelon_table_query_runtime_filter_fetches_omitted_probe_key() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let mut options = TableQueryOptions::default();
-	options.physical_descriptor_fingerprint = Some(descriptor.physical_descriptor_fingerprint);
+	let options = TableQueryOptions {
+		physical_descriptor_fingerprint: Some(descriptor.physical_descriptor_fingerprint),
+		..TableQueryOptions::default()
+	};
 	let pbc = pbc_project_amounts_gt_100();
 	let filtered = fixture
 		.client
@@ -246,9 +248,11 @@ async fn wendelon_table_query_appends_row_identity_for_filter_candidates() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let mut options = TableQueryOptions::default();
-	options.physical_descriptor_fingerprint = Some(descriptor.physical_descriptor_fingerprint);
-	options.row_identity = RowIdentityProjection::Append;
+	let options = TableQueryOptions {
+		physical_descriptor_fingerprint: Some(descriptor.physical_descriptor_fingerprint),
+		row_identity: RowIdentityProjection::Append,
+		..TableQueryOptions::default()
+	};
 	let first = fixture
 		.client
 		.table_query(LIVE_TENANT, &descriptor, pbc_amount_gt_100(), options)
@@ -479,8 +483,10 @@ async fn table_query_id_amounts(
 	descriptor: &TableSchemaDescriptor,
 	runtime_filter: Option<RuntimeFilterDescriptor>,
 ) -> Vec<RecordBatch> {
-	let mut options = TableQueryOptions::default();
-	options.physical_descriptor_fingerprint = Some(descriptor.physical_descriptor_fingerprint);
+	let options = TableQueryOptions {
+		physical_descriptor_fingerprint: Some(descriptor.physical_descriptor_fingerprint),
+		..TableQueryOptions::default()
+	};
 	fixture
 		.client
 		.table_query_with_runtime_filter(
@@ -697,8 +703,10 @@ async fn wendelon_storage_scan_maps_server_descriptor_evolution() {
 		descriptor.physical_descriptor_fingerprint
 	);
 	let pbc = Vec::new();
-	let mut options = TableQueryOptions::default();
-	options.physical_descriptor_fingerprint = Some(evolved.physical_descriptor_fingerprint);
+	let options = TableQueryOptions {
+		physical_descriptor_fingerprint: Some(evolved.physical_descriptor_fingerprint),
+		..TableQueryOptions::default()
+	};
 	let err = fixture
 		.client
 		.table_query(LIVE_TENANT, &evolved, pbc, options)

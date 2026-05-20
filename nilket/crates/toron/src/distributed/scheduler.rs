@@ -1747,7 +1747,7 @@ mod tests {
 		let mut scheduler = DistributedScheduler::new(failover_registry());
 		let mut first_dispatch = ScriptedDispatcher::new([completed()]);
 		scheduler
-			.dispatch_loop(&[stage.clone()], &mut first_dispatch)
+			.dispatch_loop(std::slice::from_ref(&stage), &mut first_dispatch)
 			.await
 			.expect("first dispatch");
 		scheduler.mark_worker_lost(lost_worker_id);

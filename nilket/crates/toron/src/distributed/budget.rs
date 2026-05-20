@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,10 @@ impl ByteCount {
 
 	pub const fn saturating_sub(self, other: Self) -> Self {
 		Self(self.0.saturating_sub(other.0))
+	}
+
+	pub const fn saturating_add(self, other: Self) -> Self {
+		Self(self.0.saturating_add(other.0))
 	}
 }
 
@@ -102,15 +108,39 @@ impl Default for QueryBudget {
 pub struct TenantBudget {
 	pub memory_per_task: ByteCount,
 	pub aggregate_memory: ByteCount,
+	pub max_concurrent_queries: NonZeroU32,
 }
 
 impl TenantBudget {
-	pub const fn new(memory_per_task: ByteCount, aggregate_memory: ByteCount) -> Self {
+	pub fn new(memory_per_task: ByteCount, aggregate_memory: ByteCount) -> Self {
+		Self::with_max_concurrent_queries(
+			memory_per_task,
+			aggregate_memory,
+			derive_max_concurrent_queries(memory_per_task, aggregate_memory),
+		)
+	}
+
+	pub const fn with_max_concurrent_queries(
+		memory_per_task: ByteCount,
+		aggregate_memory: ByteCount,
+		max_concurrent_queries: NonZeroU32,
+	) -> Self {
 		Self {
 			memory_per_task,
 			aggregate_memory,
+			max_concurrent_queries,
 		}
 	}
+}
+
+pub fn derive_max_concurrent_queries(
+	memory_per_task: ByteCount,
+	aggregate_memory: ByteCount,
+) -> NonZeroU32 {
+	let per_task = memory_per_task.get().max(1);
+	let slots = (aggregate_memory.get() / per_task).max(1);
+	let slots = u32::try_from(slots).unwrap_or(u32::MAX);
+	NonZeroU32::new(slots).expect("derived concurrency is nonzero")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +166,11 @@ impl TenantBudgetPolicy {
 	/// Daemon construction must override this with the normalized config policy.
 	pub fn from_query_budget(query_budget: QueryBudget) -> Self {
 		Self {
-			default: TenantBudget::new(query_budget.memory_per_task, query_budget.memory_per_task),
+			default: TenantBudget::with_max_concurrent_queries(
+				query_budget.memory_per_task,
+				query_budget.memory_per_task,
+				NonZeroU32::new(1).expect("one is nonzero"),
+			),
 			per_tenant: HashMap::new(),
 		}
 	}
@@ -153,6 +187,16 @@ impl TenantBudgetPolicy {
 			.get(&tenant_id)
 			.copied()
 			.unwrap_or(self.default)
+	}
+
+	pub fn is_configured_tenant(&self, tenant_id: TenantId) -> bool {
+		self.per_tenant.contains_key(&tenant_id)
+	}
+
+	pub fn configured_tenant_ids(&self) -> Vec<TenantId> {
+		let mut tenant_ids = self.per_tenant.keys().copied().collect::<Vec<_>>();
+		tenant_ids.sort_by_key(|tenant_id| tenant_id.0);
+		tenant_ids
 	}
 
 	pub fn query_budget_for(&self, tenant_id: TenantId) -> QueryBudget {
@@ -193,6 +237,85 @@ pub struct BudgetRejection {
 	pub dimension: BudgetDimension,
 	pub requested: ByteCount,
 	pub available: ByteCount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantConcurrencyRejection {
+	pub tenant_id: TenantId,
+	pub requested: u32,
+	pub available: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionResource {
+	Memory,
+	Concurrency,
+}
+
+#[derive(Debug, Clone)]
+pub struct TenantAdmissionRejectionCounters {
+	inner: Arc<TenantAdmissionRejectionCounterState>,
+}
+
+#[derive(Debug)]
+struct TenantAdmissionRejectionCounterState {
+	configured: HashMap<TenantId, TenantResourceRejectionCounters>,
+	other: TenantResourceRejectionCounters,
+}
+
+#[derive(Debug, Default)]
+struct TenantResourceRejectionCounters {
+	memory: AtomicU64,
+	concurrency: AtomicU64,
+}
+
+impl TenantAdmissionRejectionCounters {
+	pub fn new(policy: &TenantBudgetPolicy) -> Self {
+		let configured = policy
+			.configured_tenant_ids()
+			.into_iter()
+			.map(|tenant_id| (tenant_id, TenantResourceRejectionCounters::default()))
+			.collect();
+		Self {
+			inner: Arc::new(TenantAdmissionRejectionCounterState {
+				configured,
+				other: TenantResourceRejectionCounters::default(),
+			}),
+		}
+	}
+
+	pub fn increment(&self, tenant_id: TenantId, resource: AdmissionResource) {
+		let counters = self
+			.inner
+			.configured
+			.get(&tenant_id)
+			.unwrap_or(&self.inner.other);
+		counters.increment(resource);
+	}
+
+	pub fn get(&self, tenant_id: Option<TenantId>, resource: AdmissionResource) -> u64 {
+		let counters = tenant_id
+			.and_then(|tenant_id| self.inner.configured.get(&tenant_id))
+			.unwrap_or(&self.inner.other);
+		counters.get(resource)
+	}
+}
+
+impl TenantResourceRejectionCounters {
+	fn increment(&self, resource: AdmissionResource) {
+		self.counter(resource).fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn get(&self, resource: AdmissionResource) -> u64 {
+		self.counter(resource).load(Ordering::Relaxed)
+	}
+
+	fn counter(&self, resource: AdmissionResource) -> &AtomicU64 {
+		match resource {
+			AdmissionResource::Memory => &self.memory,
+			AdmissionResource::Concurrency => &self.concurrency,
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +464,13 @@ impl TenantMemoryAccountant {
 			.copied()
 			.unwrap_or(ByteCount::ZERO)
 	}
+
+	pub fn snapshot(&self) -> HashMap<TenantId, ByteCount> {
+		self.used
+			.lock()
+			.expect("tenant memory accountant poisoned")
+			.clone()
+	}
 }
 
 #[derive(Debug)]
@@ -376,6 +506,104 @@ impl TenantMemoryReservation {
 }
 
 impl Drop for TenantMemoryReservation {
+	fn drop(&mut self) {
+		self.release_once();
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct TenantConcurrencyAccountant {
+	policy: TenantBudgetPolicy,
+	active: Arc<Mutex<HashMap<TenantId, u32>>>,
+}
+
+impl TenantConcurrencyAccountant {
+	pub fn new(policy: TenantBudgetPolicy) -> Self {
+		Self {
+			policy,
+			active: Arc::new(Mutex::new(HashMap::new())),
+		}
+	}
+
+	pub fn try_reserve(
+		&self,
+		tenant_id: TenantId,
+	) -> Result<TenantConcurrencyReservation, TenantConcurrencyRejection> {
+		let mut active = self
+			.active
+			.lock()
+			.expect("tenant concurrency accountant poisoned");
+		let current = active.get(&tenant_id).copied().unwrap_or(0);
+		let limit = self
+			.policy
+			.budget_for(tenant_id)
+			.max_concurrent_queries
+			.get();
+		let available = limit.saturating_sub(current);
+		if available == 0 {
+			return Err(TenantConcurrencyRejection {
+				tenant_id,
+				requested: 1,
+				available,
+			});
+		}
+		active.insert(tenant_id, current + 1);
+		Ok(TenantConcurrencyReservation {
+			active: Arc::clone(&self.active),
+			tenant_id,
+			released: false,
+		})
+	}
+
+	pub fn active(&self, tenant_id: TenantId) -> u32 {
+		self.active
+			.lock()
+			.expect("tenant concurrency accountant poisoned")
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(0)
+	}
+
+	pub fn snapshot(&self) -> HashMap<TenantId, u32> {
+		self.active
+			.lock()
+			.expect("tenant concurrency accountant poisoned")
+			.clone()
+	}
+}
+
+#[derive(Debug)]
+pub struct TenantConcurrencyReservation {
+	active: Arc<Mutex<HashMap<TenantId, u32>>>,
+	tenant_id: TenantId,
+	released: bool,
+}
+
+impl TenantConcurrencyReservation {
+	pub fn release(mut self) {
+		self.release_once();
+	}
+
+	fn release_once(&mut self) {
+		if self.released {
+			return;
+		}
+		let mut active = self
+			.active
+			.lock()
+			.expect("tenant concurrency accountant poisoned");
+		let current = active.get(&self.tenant_id).copied().unwrap_or(0);
+		let updated = current.saturating_sub(1);
+		if updated == 0 {
+			active.remove(&self.tenant_id);
+		} else {
+			active.insert(self.tenant_id, updated);
+		}
+		self.released = true;
+	}
+}
+
+impl Drop for TenantConcurrencyReservation {
 	fn drop(&mut self) {
 		self.release_once();
 	}
@@ -508,6 +736,18 @@ mod tests {
 	}
 
 	#[test]
+	fn tenant_budget_derives_concurrency_from_memory_ratio() {
+		let budget = TenantBudget::new(ByteCount::new(8), ByteCount::new(32));
+		assert_eq!(budget.max_concurrent_queries.get(), 4);
+
+		let fallback = TenantBudgetPolicy::from_query_budget(QueryBudget {
+			memory_per_task: ByteCount::new(8),
+			..QueryBudget::test_default()
+		});
+		assert_eq!(fallback.default.max_concurrent_queries.get(), 1);
+	}
+
+	#[test]
 	fn tenant_memory_accountant_releases_on_drop() {
 		let policy = TenantBudgetPolicy::new(
 			TenantBudget::new(ByteCount::new(8), ByteCount::new(10)),
@@ -558,5 +798,59 @@ mod tests {
 			.try_reserve(TenantId(8), ByteCount::new(8))
 			.expect("tenant 8 still has budget");
 		assert_eq!(accountant.used(TenantId(8)), ByteCount::new(8));
+	}
+
+	#[test]
+	fn tenant_concurrency_accountant_releases_on_drop() {
+		let policy = TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(16)),
+			HashMap::new(),
+		);
+		let accountant = TenantConcurrencyAccountant::new(policy);
+
+		let reservation = accountant.try_reserve(TenantId(7)).expect("reserve");
+		assert_eq!(accountant.active(TenantId(7)), 1);
+
+		drop(reservation);
+
+		assert_eq!(accountant.active(TenantId(7)), 0);
+	}
+
+	#[test]
+	fn tenant_concurrency_accountant_isolated_by_tenant() {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+		);
+		per_tenant.insert(
+			TenantId(8),
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(16)),
+		);
+		let policy = TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+			per_tenant,
+		);
+		let accountant = TenantConcurrencyAccountant::new(policy);
+
+		let _tenant_7 = accountant
+			.try_reserve(TenantId(7))
+			.expect("tenant 7 reserve");
+		assert!(matches!(
+			accountant.try_reserve(TenantId(7)),
+			Err(TenantConcurrencyRejection {
+				tenant_id: TenantId(7),
+				requested: 1,
+				available: 0,
+			})
+		));
+
+		let _tenant_8_a = accountant
+			.try_reserve(TenantId(8))
+			.expect("tenant 8 first reserve");
+		let _tenant_8_b = accountant
+			.try_reserve(TenantId(8))
+			.expect("tenant 8 second reserve");
+		assert_eq!(accountant.active(TenantId(8)), 2);
 	}
 }

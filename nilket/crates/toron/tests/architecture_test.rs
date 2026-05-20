@@ -6894,7 +6894,6 @@ fn adr045_initial_metric_set_is_functional_brand_clean_and_stable() {
 	}
 	for forbidden in [
 		"toron_",
-		"tenant_id",
 		"worker_id",
 		"query_id",
 		"task_id",
@@ -6907,6 +6906,7 @@ fn adr045_initial_metric_set_is_functional_brand_clean_and_stable() {
 			"ADR 045 metrics include forbidden high-cardinality/branded token {forbidden}"
 		);
 	}
+	assert_bounded_resource_tenant_labels_only(&observability);
 }
 
 #[test]
@@ -6931,6 +6931,18 @@ fn adr045_ready_snapshot_excludes_high_cardinality_identity_fields() {
 			"missing ADR 045 readiness field {required}"
 		);
 	}
+	let readiness_struct =
+		brace_blocks_after_marker(&observability, "pub struct ReadinessSnapshot")
+			.into_iter()
+			.next()
+			.expect("ReadinessSnapshot")
+			.1;
+	let readiness_json = brace_blocks_after_marker(&observability, "pub fn to_json")
+		.into_iter()
+		.next()
+		.expect("ReadinessSnapshot::to_json")
+		.1;
+	let readiness_surface = format!("{readiness_struct}\n{readiness_json}");
 	for forbidden in [
 		"worker_id",
 		"tenant_id",
@@ -6943,7 +6955,7 @@ fn adr045_ready_snapshot_excludes_high_cardinality_identity_fields() {
 		"uuid",
 	] {
 		assert!(
-			!observability.contains(forbidden),
+			!readiness_surface.contains(forbidden),
 			"ADR 045 readiness surface includes forbidden token {forbidden}"
 		);
 	}
@@ -8085,7 +8097,7 @@ fn adr049_no_per_tenant_metric_labels() {
 		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
 			.expect("read observability");
 
-	assert!(!observability.contains("tenant_id"));
+	assert_bounded_resource_tenant_labels_only(&observability);
 	assert!(!observability.contains("tenant=\""));
 	assert!(observability.contains("reason=\\\"{}\\\""));
 }
@@ -8370,9 +8382,8 @@ fn adr050_no_per_tenant_metric_labels() {
 		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
 			.expect("read observability");
 
-	assert!(!observability.contains("tenant_id"));
+	assert_bounded_resource_tenant_labels_only(&observability);
 	assert!(!observability.contains("tenant=\""));
-	assert!(!observability.contains("tenant_id=\\\"{}\\\""));
 }
 
 #[test]
@@ -8676,9 +8687,8 @@ fn adr051_no_per_tenant_metric_labels() {
 			.expect("read observability");
 
 	assert!(observability.contains("descriptors_loaded"));
-	assert!(!observability.contains("tenant_id"));
+	assert_bounded_resource_tenant_labels_only(&observability);
 	assert!(!observability.contains("tenant=\""));
-	assert!(!observability.contains("tenant_id=\\\"{}\\\""));
 }
 
 #[test]
@@ -8749,6 +8759,292 @@ fn adr051_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 		"DescriptorBootstrapV1",
 		"DescriptorBootstrapEntryV1",
 		"TenantDescriptorBootstrapV1",
+	]);
+}
+
+#[test]
+fn adr052_tenant_budget_policy_has_concurrency_limit() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget source");
+
+	assert!(budget.contains("max_concurrent_queries: NonZeroU32"));
+	assert!(budget.contains("derive_max_concurrent_queries"));
+	assert!(budget.contains("pub fn budget_for(&self, tenant_id: TenantId) -> TenantBudget"));
+	assert!(budget.contains("pub fn from_query_budget(query_budget: QueryBudget) -> Self"));
+}
+
+#[test]
+fn adr052_concurrency_config_validates_nonzero() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config source");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config tests");
+
+	assert!(config.contains("max_concurrent_queries: Option<u32>"));
+	assert!(config.contains("tenant_budgets max_concurrent_queries must be greater than 0"));
+	assert!(config_test.contains("zero-concurrency"));
+	assert!(config_test.contains("tenant_concurrency_policy_config_round_trips"));
+	assert!(config_test.contains("tenant_concurrency_config_rejects_zero"));
+}
+
+#[test]
+fn adr052_omitted_config_derives_bounded_concurrency_default() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget source");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config tests");
+
+	assert!(budget.contains("aggregate_memory.get() / per_task"));
+	assert!(budget.contains("u32::try_from(slots).unwrap_or(u32::MAX)"));
+	assert!(budget.contains("NonZeroU32::new(1).expect(\"one is nonzero\")"));
+	assert!(config_test.contains("tenant_concurrency_omitted_config_derives_default"));
+}
+
+#[test]
+fn adr052_concurrency_accountant_is_tenant_keyed_and_raii() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget source");
+
+	assert!(budget.contains("pub struct TenantConcurrencyAccountant"));
+	assert!(budget.contains("active: Arc<Mutex<HashMap<TenantId, u32>>>"));
+	assert!(budget.contains("pub fn try_reserve("));
+	assert!(budget.contains("pub struct TenantConcurrencyReservation"));
+	assert!(budget.contains("impl Drop for TenantConcurrencyReservation"));
+	assert!(budget.contains("pub struct TenantConcurrencyRejection"));
+	assert!(!budget.contains("BudgetDimension::Concurrency"));
+}
+
+#[test]
+fn adr052_concurrency_admission_rejects_before_bind_or_execution() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let admit = brace_blocks_after_marker(&coordinator, "fn admit_query")
+		.into_iter()
+		.next()
+		.expect("admit_query")
+		.1;
+
+	let concurrency_pos = admit
+		.find("tenant_concurrency")
+		.expect("concurrency reserve");
+	let memory_pos = admit.find("tenant_memory").expect("memory reserve");
+	assert!(
+		concurrency_pos < memory_pos,
+		"concurrency must be reserved before memory"
+	);
+	assert!(coordinator.contains("tenant_concurrency_limit_rejects_before_bind"));
+	assert!(coordinator.contains("execute_query_with_context(&count_plan(), context)"));
+}
+
+#[test]
+fn adr052_admitted_query_holds_memory_and_concurrency_reservations() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+
+	assert!(coordinator.contains("_concurrency_reservation: TenantConcurrencyReservation"));
+	assert!(coordinator.contains("_reservation: TenantMemoryReservation"));
+	assert!(coordinator.contains("memory_rejection_releases_concurrency_reservation"));
+	assert!(coordinator.contains("tenant_concurrency_reservation_releases_on_error"));
+	assert!(coordinator.contains("tenant_concurrency_reservation_releases_on_success"));
+	assert!(coordinator.contains("tenant_concurrency_active(TenantId(8)), 0"));
+}
+
+#[test]
+fn adr052_concurrency_exhaustion_maps_to_resource_exhausted() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+
+	assert!(daemon.contains("ExecutionError::ConcurrencyExhausted"));
+	assert!(daemon.contains("SqlErrorCode::ResourceExhausted"));
+	assert!(daemon.contains("tenant concurrency limit exhausted"));
+	assert!(daemon.contains("sql_concurrency_exhaustion_returns_resource_exhausted"));
+}
+
+#[test]
+fn adr052_resource_exhausted_reuses_existing_sql_error_code() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let error_codes = brace_blocks_after_marker(&wire, "pub enum SqlErrorCode")
+		.into_iter()
+		.next()
+		.expect("SqlErrorCode")
+		.1;
+
+	assert!(error_codes.contains("ResourceExhausted"));
+	assert!(!error_codes.contains("Concurrency"));
+	assert!(!wire.contains("tenant_id: TenantId"));
+}
+
+#[test]
+fn adr052_one_tenant_saturated_does_not_block_another() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+
+	assert!(coordinator.contains("one_tenant_saturated_does_not_block_another"));
+	assert!(coordinator.contains("one_tenant_concurrency_saturation_does_not_block_another"));
+}
+
+#[test]
+fn adr052_resource_metrics_have_bounded_tenant_labels() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+
+	assert_bounded_resource_tenant_labels_only(&observability);
+	assert!(observability.contains("configured_tenant_ids()"));
+	assert!(observability.contains("\"other\""));
+	assert!(observability_test.contains("resource_metrics_label_configured_tenant"));
+	assert!(observability_test.contains("resource_metrics_bucket_unconfigured_tenant_as_other"));
+	assert!(observability_test.contains("resource_metrics_expose_memory_and_concurrency_limits"));
+	assert!(observability_test.contains("resource_admission_rejections_are_labeled_by_resource"));
+}
+
+#[test]
+fn adr052_general_daemon_metrics_remain_tenant_label_free() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+
+	assert_bounded_resource_tenant_labels_only(&observability);
+	assert!(observability_test.contains("general_daemon_metrics_do_not_gain_tenant_labels"));
+	for forbidden in [
+		"listener_accepts_total{{tenant_id",
+		"listener_rejects_total{{tenant_id",
+		"daemon_ready{{tenant_id",
+		"daemon_uptime_seconds{{tenant_id",
+		"descriptors_loaded{{tenant_id",
+		"static_workers_configured{{tenant_id",
+	] {
+		assert!(
+			!observability.contains(forbidden),
+			"general metric gained tenant label pattern {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr052_no_cpu_rate_connection_storage_queue_or_fair_share() {
+	let source = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"CpuBudget",
+		"cpu_quota",
+		"RateLimit",
+		"rate_limit",
+		"connection_quota",
+		"storage_quota",
+		"fair_share",
+		"TenantQueue",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 052 must stay concurrency-only; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr052_no_wendelon_production_changes() {
+	let wendelon_source = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"TenantConcurrencyAccountant",
+		"max_concurrent_queries",
+		"tenant_admission_rejections_total",
+		"ConcurrencyExhausted",
+	] {
+		assert!(
+			!wendelon_source.contains(forbidden),
+			"Wendelon source contains Toron ADR 052 token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr052_no_descriptor_sync_stub_or_runtime_ingestion() {
+	let source = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"sync_descriptor_for_tenant",
+		"DescriptorSource",
+		"watch_descriptor",
+		"reload_descriptor",
+		"runtime_descriptor",
+		"descriptor_reload",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 052 must not add descriptor sync machinery; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr052_prior_adr04x_05x_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr040_", "adr041_", "adr042_", "adr043_", "adr044_", "adr045_", "adr046_", "adr047_",
+		"adr048_", "adr049_", "adr050_", "adr051_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr052_nilket_root_remains_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr052_fixture_worker_source_unchanged() {
+	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker source");
+
+	assert!(!fixture.contains("TenantConcurrencyAccountant"));
+	assert!(!fixture.contains("max_concurrent_queries"));
+	assert!(!fixture.contains("tenant_budgets"));
+}
+
+#[test]
+fn adr052_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronTenantConcurrencyAccountant",
+		"ToronTenantConcurrencyReservation",
+		"TenantConcurrencyAccountantV1",
+		"TenantConcurrencyReservationV1",
+		"TenantConcurrencyRejectionV1",
+		"TenantAdmissionRejectionCountersV1",
 	]);
 }
 
@@ -9582,6 +9878,43 @@ fn assert_toron_sources_do_not_contain(forbidden: &[&str]) {
 		"Toron source contains forbidden symbol(s):\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
+}
+
+fn assert_bounded_resource_tenant_labels_only(observability: &str) {
+	for metric in [
+		"tenant_memory_bytes_used",
+		"tenant_memory_bytes_limit",
+		"tenant_concurrency_active",
+		"tenant_concurrency_limit",
+		"tenant_admission_rejections_total",
+	] {
+		assert!(
+			observability.contains(metric),
+			"resource metric {metric} missing from observability source"
+		);
+	}
+	for general_metric in [
+		"listener_up",
+		"listener_accepts_total",
+		"listener_rejects_total",
+		"metrics_scrapes_total",
+		"daemon_ready",
+		"daemon_uptime_seconds",
+		"descriptors_loaded",
+		"static_workers_configured",
+	] {
+		let offenders = observability
+			.lines()
+			.filter(|line| line.contains(general_metric) && line.contains("tenant_id"))
+			.collect::<Vec<_>>();
+		assert!(
+			offenders.is_empty(),
+			"general metric {general_metric} gained a tenant_id label: {offenders:?}"
+		);
+	}
+	assert!(observability.contains("tenant_id=\\\"{label}\\\""));
+	assert!(observability.contains("\"other\""));
+	assert!(observability.contains("configured_tenant_ids"));
 }
 
 fn source_files(root: &Path) -> Vec<PathBuf> {

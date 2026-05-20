@@ -290,6 +290,7 @@ struct BenchRow {
 	wall_ms: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_case(
 	join_kind: JoinKind,
 	strategy: BenchStrategy,
@@ -724,14 +725,12 @@ impl StorageScan for Fixture {
 				batch.slice(0, 0)
 			};
 		}
-		if self.apply_runtime_filters {
-			if let Some(runtime_filter) = &request.runtime_filter {
-				if runtime_filter.probe_descriptor_fingerprint
-					== request.physical_descriptor_fingerprint
-				{
-					batch = apply_runtime_filter(&batch, runtime_filter)?;
-				}
-			}
+		if self.apply_runtime_filters
+			&& let Some(runtime_filter) = &request.runtime_filter
+			&& runtime_filter.probe_descriptor_fingerprint
+				== request.physical_descriptor_fingerprint
+		{
+			batch = apply_runtime_filter(&batch, runtime_filter)?;
 		}
 		if let Some(columns) = &request.projected_columns {
 			let indices = columns

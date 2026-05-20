@@ -164,16 +164,16 @@ Confirm the seams (verified at promotion):
 
 ## Acceptance checklist
 
-- [ ] Phase 1 config + `NonZeroU32` runtime field + nonzero
+- [x] Phase 1 config + `NonZeroU32` runtime field + nonzero
       validation + derived-default; ADR 050 configs still valid.
-- [ ] Phase 2 concurrency accountant + reservation + dedicated
+- [x] Phase 2 concurrency accountant + reservation + dedicated
       rejection + named error variant (no `BudgetDimension` reuse).
-- [ ] Phase 3 admission reserves concurrency+memory before bind;
+- [x] Phase 3 admission reserves concurrency+memory before bind;
       both held by `AdmittedQuery`; failure drops the other;
       distinct `ResourceExhausted` message.
-- [ ] Phase 4 bounded resource metrics; general/listener metrics
+- [x] Phase 4 bounded resource metrics; general/listener metrics
       unchanged.
-- [ ] Phase 5 15+3 guards pass; ADR 049/050/051 no-label guards
+- [x] Phase 5 15+3 guards pass; ADR 049/050/051 no-label guards
       retargeted; ADR 040–051 guards pass.
-- [ ] Phase 6 14 required fixtures pass; ADR + impl + roadmap
+- [x] Phase 6 14 required fixtures pass; ADR + impl + roadmap
       promoted; evidence recorded.

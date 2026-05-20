@@ -408,7 +408,7 @@ mod tests {
 		)
 		.unwrap();
 		let key = key_expr(DataType::Int32, true);
-		let fragment = build_runtime_filter_fragment(&[batch.clone()], &key)
+		let fragment = build_runtime_filter_fragment(std::slice::from_ref(&batch), &key)
 			.unwrap()
 			.expect("fragment");
 		let RuntimeFilterKind::ExactSet(exact_set) = &fragment.kind else {
@@ -576,7 +576,7 @@ mod tests {
 		let key = key_expr(DataType::Int64, true);
 
 		let start = std::time::Instant::now();
-		let fragment = build_runtime_filter_fragment(&[batch.clone()], &key)
+		let fragment = build_runtime_filter_fragment(std::slice::from_ref(&batch), &key)
 			.unwrap()
 			.expect("fragment");
 		let elapsed = start.elapsed();

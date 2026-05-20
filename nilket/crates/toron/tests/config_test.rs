@@ -101,14 +101,18 @@ fn toron_example_config_loads() {
 		config.tenant_budgets.default.aggregate_memory,
 		ByteCount::new(67_108_864)
 	);
+	assert_eq!(
+		config.tenant_budgets.default.max_concurrent_queries.get(),
+		1
+	);
 }
 
 #[test]
-fn tenant_budget_policy_config_round_trips() {
+fn tenant_concurrency_policy_config_round_trips() {
 	let dir = fresh_dir("tenant-budget-round-trip");
 	let path = dir.join("toron.toml");
 	let config = format!(
-		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\n",
+		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 3\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nmax_concurrent_queries = 2\n",
 		render_example_config()
 	);
 	std::fs::write(&path, config).expect("write config");
@@ -124,6 +128,10 @@ fn tenant_budget_policy_config_round_trips() {
 		ByteCount::new(4096)
 	);
 	assert_eq!(
+		config.tenant_budgets.default.max_concurrent_queries.get(),
+		3
+	);
+	assert_eq!(
 		config
 			.tenant_budgets
 			.budget_for(TenantId(7))
@@ -136,6 +144,57 @@ fn tenant_budget_policy_config_round_trips() {
 			.budget_for(TenantId(7))
 			.aggregate_memory,
 		ByteCount::new(2048)
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.budget_for(TenantId(7))
+			.max_concurrent_queries
+			.get(),
+		2
+	);
+}
+
+#[test]
+fn tenant_concurrency_omitted_config_derives_default() {
+	let dir = fresh_dir("tenant-budget-derived-concurrency");
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load tenant budget config");
+
+	assert_eq!(
+		config.tenant_budgets.default.max_concurrent_queries.get(),
+		4
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.budget_for(TenantId(7))
+			.max_concurrent_queries
+			.get(),
+		4
+	);
+}
+
+#[test]
+fn tenant_concurrency_config_rejects_zero() {
+	let dir = fresh_dir("tenant-concurrency-zero");
+	let path = dir.join("toron.toml");
+	let snippet = "[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 0\n";
+	std::fs::write(&path, format!("{}\n{snippet}", render_example_config())).expect("write config");
+
+	let error = load_toron_bootstrap_config(&path).expect_err("zero concurrency must be rejected");
+
+	assert!(
+		error
+			.to_string()
+			.contains("tenant_budgets max_concurrent_queries must be greater than 0"),
+		"{error}"
 	);
 }
 
@@ -161,6 +220,11 @@ fn tenant_budget_config_rejects_zero_duplicate_and_per_task_over_aggregate() {
 			"per-task-over-aggregate",
 			"[tenant_budgets.default]\nmemory_per_task_bytes = 4097\naggregate_memory_bytes = 4096\n",
 			"tenant_budgets memory_per_task_bytes must be less than or equal to aggregate_memory_bytes",
+		),
+		(
+			"zero-concurrency",
+			"[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 0\n",
+			"tenant_budgets max_concurrent_queries must be greater than 0",
 		),
 	] {
 		let dir = fresh_dir(tag);

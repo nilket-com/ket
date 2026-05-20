@@ -251,6 +251,10 @@ impl ToronDaemon {
 		let metrics = Arc::new(MetricsRegistry::new(
 			descriptors_loaded,
 			config.coordinator.static_workers.len() as u64,
+			config.tenant_budgets.clone(),
+			coordinator.tenant_memory_accountant(),
+			coordinator.tenant_concurrency_accountant(),
+			coordinator.admission_rejection_counters(),
 		));
 		let readiness = Arc::new(ReadinessState::new(
 			true,
@@ -761,38 +765,48 @@ async fn write_sql_error(
 }
 
 fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {
-	let code = match &error {
-		QueryError::Frontend(FrontendError::SqlParse { .. }) => SqlErrorCode::SyntaxError,
-		QueryError::Frontend(_) => SqlErrorCode::PlanningError,
-		QueryError::Binding(BindingError::Catalog(_)) => SqlErrorCode::CatalogError,
-		QueryError::Binding(_) => SqlErrorCode::BindingError,
-		QueryError::Catalog(_) => SqlErrorCode::CatalogError,
-		QueryError::Storage(_) => SqlErrorCode::StorageError,
+	let (code, message) = match &error {
+		QueryError::Frontend(FrontendError::SqlParse { .. }) => (SqlErrorCode::SyntaxError, None),
+		QueryError::Frontend(_) => (SqlErrorCode::PlanningError, None),
+		QueryError::Binding(BindingError::Catalog(_)) => (SqlErrorCode::CatalogError, None),
+		QueryError::Binding(_) => (SqlErrorCode::BindingError, None),
+		QueryError::Catalog(_) => (SqlErrorCode::CatalogError, None),
+		QueryError::Storage(_) => (SqlErrorCode::StorageError, None),
 		QueryError::Execution(crate::error::ExecutionError::BudgetExhausted {
 			dimension: BudgetDimension::Memory,
 			..
-		}) => SqlErrorCode::ResourceExhausted,
+		}) => (
+			SqlErrorCode::ResourceExhausted,
+			Some("tenant memory budget exhausted"),
+		),
+		QueryError::Execution(crate::error::ExecutionError::ConcurrencyExhausted { .. }) => (
+			SqlErrorCode::ResourceExhausted,
+			Some("tenant concurrency limit exhausted"),
+		),
 		QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
 			kind:
 				crate::error::TaskFailureKind::BudgetExhausted {
 					dimension: BudgetDimension::Memory,
 					..
 				},
-		}) => SqlErrorCode::ResourceExhausted,
+		}) => (
+			SqlErrorCode::ResourceExhausted,
+			Some("tenant memory budget exhausted"),
+		),
 		QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
 			kind: crate::error::TaskFailureKind::Cancelled,
-		}) => SqlErrorCode::Cancelled,
+		}) => (SqlErrorCode::Cancelled, None),
 		QueryError::Internal { message } if message.contains("no live worker") => {
-			SqlErrorCode::NoLiveWorker
+			(SqlErrorCode::NoLiveWorker, None)
 		}
-		_ => SqlErrorCode::Internal,
+		_ => (SqlErrorCode::Internal, None),
 	};
-	let message = if code == SqlErrorCode::ResourceExhausted {
-		"tenant memory budget exhausted".to_string()
-	} else {
-		error.to_string()
-	};
-	(code, message)
+	(
+		code,
+		message
+			.map(ToString::to_string)
+			.unwrap_or_else(|| error.to_string()),
+	)
 }
 
 fn sql_plan_returns_rows(plan: &LogicalPlan) -> bool {
@@ -992,6 +1006,20 @@ mod tests {
 
 		assert_eq!(code, SqlErrorCode::ResourceExhausted);
 		assert_eq!(message, "tenant memory budget exhausted");
+	}
+
+	#[test]
+	fn sql_concurrency_exhaustion_returns_resource_exhausted() {
+		let (code, message) = map_sql_query_error(QueryError::Execution(
+			ExecutionError::ConcurrencyExhausted {
+				tenant_id: TenantId(7),
+				requested: 1,
+				available: 0,
+			},
+		));
+
+		assert_eq!(code, SqlErrorCode::ResourceExhausted);
+		assert_eq!(message, "tenant concurrency limit exhausted");
 	}
 
 	#[test]

@@ -11,7 +11,12 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ObservabilityListeners;
+use crate::distributed::budget::{
+	AdmissionResource, ByteCount, TenantAdmissionRejectionCounters, TenantBudgetPolicy,
+	TenantConcurrencyAccountant, TenantMemoryAccountant,
+};
 use crate::network::observability_http::{READ_REQUEST_TIMEOUT, read_request, write_response};
+use crate::storage::TenantId;
 
 pub const HEALTH_PATH: &str = "/health";
 pub const READY_PATH: &str = "/ready";
@@ -153,10 +158,18 @@ pub struct MetricsRegistry {
 	metrics_scrapes_total: AtomicU64,
 	descriptors_loaded: AtomicU64,
 	static_workers_configured: AtomicU64,
+	resource_metrics: ResourceMetrics,
 }
 
 impl MetricsRegistry {
-	pub fn new(descriptors_loaded: u64, static_workers_configured: u64) -> Self {
+	pub fn new(
+		descriptors_loaded: u64,
+		static_workers_configured: u64,
+		tenant_budgets: TenantBudgetPolicy,
+		tenant_memory: TenantMemoryAccountant,
+		tenant_concurrency: TenantConcurrencyAccountant,
+		admission_rejections: TenantAdmissionRejectionCounters,
+	) -> Self {
 		Self {
 			started_at: Instant::now(),
 			listener_accepts: ListenerCounters::default(),
@@ -164,6 +177,12 @@ impl MetricsRegistry {
 			metrics_scrapes_total: AtomicU64::new(0),
 			descriptors_loaded: AtomicU64::new(descriptors_loaded),
 			static_workers_configured: AtomicU64::new(static_workers_configured),
+			resource_metrics: ResourceMetrics {
+				tenant_budgets,
+				tenant_memory,
+				tenant_concurrency,
+				admission_rejections,
+			},
 		}
 	}
 
@@ -224,8 +243,121 @@ impl MetricsRegistry {
 			"static_workers_configured {}\n",
 			self.static_workers_configured.load(Ordering::Relaxed)
 		));
+		self.resource_metrics.render_text(&mut out);
 		out
 	}
+}
+
+struct ResourceMetrics {
+	tenant_budgets: TenantBudgetPolicy,
+	tenant_memory: TenantMemoryAccountant,
+	tenant_concurrency: TenantConcurrencyAccountant,
+	admission_rejections: TenantAdmissionRejectionCounters,
+}
+
+impl ResourceMetrics {
+	fn render_text(&self, out: &mut String) {
+		out.push_str("# TYPE tenant_memory_bytes_used gauge\n");
+		out.push_str("# TYPE tenant_memory_bytes_limit gauge\n");
+		out.push_str("# TYPE tenant_concurrency_active gauge\n");
+		out.push_str("# TYPE tenant_concurrency_limit gauge\n");
+		out.push_str("# TYPE tenant_admission_rejections_total counter\n");
+
+		let slots = self.resource_slots();
+		for slot in &slots {
+			let label = &slot.label;
+			out.push_str(&format!(
+				"tenant_memory_bytes_used{{tenant_id=\"{label}\"}} {}\n",
+				slot.memory_used.get()
+			));
+		}
+		for slot in &slots {
+			let label = &slot.label;
+			out.push_str(&format!(
+				"tenant_memory_bytes_limit{{tenant_id=\"{label}\"}} {}\n",
+				slot.memory_limit.get()
+			));
+		}
+		for slot in &slots {
+			let label = &slot.label;
+			out.push_str(&format!(
+				"tenant_concurrency_active{{tenant_id=\"{label}\"}} {}\n",
+				slot.concurrency_active
+			));
+		}
+		for slot in &slots {
+			let label = &slot.label;
+			out.push_str(&format!(
+				"tenant_concurrency_limit{{tenant_id=\"{label}\"}} {}\n",
+				slot.concurrency_limit
+			));
+		}
+		for slot in &slots {
+			let label = &slot.label;
+			for (resource, resource_label) in [
+				(AdmissionResource::Memory, "memory"),
+				(AdmissionResource::Concurrency, "concurrency"),
+			] {
+				out.push_str(&format!(
+					"tenant_admission_rejections_total{{tenant_id=\"{label}\",resource=\"{resource_label}\"}} {}\n",
+					self.admission_rejections.get(slot.tenant_id, resource)
+				));
+			}
+		}
+	}
+
+	fn resource_slots(&self) -> Vec<TenantResourceSlot> {
+		let memory_used = self.tenant_memory.snapshot();
+		let concurrency_active = self.tenant_concurrency.snapshot();
+		let mut slots = Vec::new();
+		for tenant_id in self.tenant_budgets.configured_tenant_ids() {
+			let budget = self.tenant_budgets.budget_for(tenant_id);
+			slots.push(TenantResourceSlot {
+				label: tenant_id.0.to_string(),
+				memory_used: memory_used
+					.get(&tenant_id)
+					.copied()
+					.unwrap_or(ByteCount::ZERO),
+				memory_limit: budget.aggregate_memory,
+				concurrency_active: u64::from(
+					concurrency_active.get(&tenant_id).copied().unwrap_or(0),
+				),
+				concurrency_limit: u64::from(budget.max_concurrent_queries.get()),
+				tenant_id: Some(tenant_id),
+			});
+		}
+
+		let other_memory = memory_used
+			.iter()
+			.filter(|(tenant_id, _)| !self.tenant_budgets.is_configured_tenant(**tenant_id))
+			.fold(ByteCount::ZERO, |total, (_, used)| {
+				total.saturating_add(*used)
+			});
+		let other_concurrency = concurrency_active
+			.iter()
+			.filter(|(tenant_id, _)| !self.tenant_budgets.is_configured_tenant(**tenant_id))
+			.fold(0_u64, |total, (_, active)| {
+				total.saturating_add(u64::from(*active))
+			});
+		slots.push(TenantResourceSlot {
+			label: "other".to_string(),
+			memory_used: other_memory,
+			memory_limit: self.tenant_budgets.default.aggregate_memory,
+			concurrency_active: other_concurrency,
+			concurrency_limit: u64::from(self.tenant_budgets.default.max_concurrent_queries.get()),
+			tenant_id: None,
+		});
+		slots
+	}
+}
+
+struct TenantResourceSlot {
+	label: String,
+	memory_used: ByteCount,
+	memory_limit: ByteCount,
+	concurrency_active: u64,
+	concurrency_limit: u64,
+	tenant_id: Option<TenantId>,
 }
 
 #[derive(Default)]

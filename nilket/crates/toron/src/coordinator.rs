@@ -9,8 +9,9 @@ mod write;
 use crate::binder::{PlannerConfig, bind};
 use crate::catalog::Catalog;
 use crate::distributed::budget::{
-	BudgetRejection, QueryBudget, TaskBudget, TenantBudgetPolicy, TenantMemoryAccountant,
-	TenantMemoryReservation,
+	AdmissionResource, BudgetRejection, QueryBudget, TaskBudget, TenantAdmissionRejectionCounters,
+	TenantBudgetPolicy, TenantConcurrencyAccountant, TenantConcurrencyRejection,
+	TenantConcurrencyReservation, TenantMemoryAccountant, TenantMemoryReservation,
 };
 use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
@@ -46,6 +47,8 @@ where
 	query_budget: QueryBudget,
 	tenant_budgets: TenantBudgetPolicy,
 	tenant_memory: TenantMemoryAccountant,
+	tenant_concurrency: TenantConcurrencyAccountant,
+	admission_rejections: TenantAdmissionRejectionCounters,
 	context: ExecutionContext,
 	writer: Arc<dyn StorageWrite>,
 	deleter: Arc<dyn StorageDeleteRows>,
@@ -220,6 +223,7 @@ where
 		deleter: Arc<dyn StorageDeleteRows>,
 		admin: Arc<dyn StorageAdmin>,
 	) -> Self {
+		let tenant_budgets = TenantBudgetPolicy::from_query_budget(query_budget);
 		Self {
 			catalog,
 			registry,
@@ -227,10 +231,10 @@ where
 			transport,
 			config,
 			query_budget,
-			tenant_budgets: TenantBudgetPolicy::from_query_budget(query_budget),
-			tenant_memory: TenantMemoryAccountant::new(TenantBudgetPolicy::from_query_budget(
-				query_budget,
-			)),
+			tenant_memory: TenantMemoryAccountant::new(tenant_budgets.clone()),
+			tenant_concurrency: TenantConcurrencyAccountant::new(tenant_budgets.clone()),
+			admission_rejections: TenantAdmissionRejectionCounters::new(&tenant_budgets),
+			tenant_budgets,
 			context,
 			writer,
 			deleter,
@@ -240,12 +244,30 @@ where
 
 	pub fn with_tenant_budget_policy(mut self, tenant_budgets: TenantBudgetPolicy) -> Self {
 		self.tenant_memory = TenantMemoryAccountant::new(tenant_budgets.clone());
+		self.tenant_concurrency = TenantConcurrencyAccountant::new(tenant_budgets.clone());
+		self.admission_rejections = TenantAdmissionRejectionCounters::new(&tenant_budgets);
 		self.tenant_budgets = tenant_budgets;
 		self
 	}
 
 	pub fn tenant_memory_used(&self, tenant_id: TenantId) -> crate::distributed::budget::ByteCount {
 		self.tenant_memory.used(tenant_id)
+	}
+
+	pub fn tenant_concurrency_active(&self, tenant_id: TenantId) -> u32 {
+		self.tenant_concurrency.active(tenant_id)
+	}
+
+	pub fn tenant_memory_accountant(&self) -> TenantMemoryAccountant {
+		self.tenant_memory.clone()
+	}
+
+	pub fn tenant_concurrency_accountant(&self) -> TenantConcurrencyAccountant {
+		self.tenant_concurrency.clone()
+	}
+
+	pub fn admission_rejection_counters(&self) -> TenantAdmissionRejectionCounters {
+		self.admission_rejections.clone()
 	}
 
 	pub async fn execute_query(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, QueryError> {
@@ -330,12 +352,25 @@ where
 		let query_budget = self
 			.tenant_budgets
 			.query_budget_for_base(context.tenant_id, self.query_budget);
+		let concurrency_reservation = self
+			.tenant_concurrency
+			.try_reserve(context.tenant_id)
+			.map_err(|rejection| {
+				self.admission_rejections
+					.increment(context.tenant_id, AdmissionResource::Concurrency);
+				concurrency_rejection_query_error(rejection)
+			})?;
 		let reservation = self
 			.tenant_memory
 			.try_reserve(context.tenant_id, query_budget.memory_per_task)
-			.map_err(budget_rejection_query_error)?;
+			.map_err(|rejection| {
+				self.admission_rejections
+					.increment(context.tenant_id, AdmissionResource::Memory);
+				budget_rejection_query_error(rejection)
+			})?;
 		Ok(AdmittedQuery {
 			query_budget,
+			_concurrency_reservation: concurrency_reservation,
 			_reservation: reservation,
 		})
 	}
@@ -373,12 +408,21 @@ where
 
 struct AdmittedQuery {
 	query_budget: QueryBudget,
+	_concurrency_reservation: TenantConcurrencyReservation,
 	_reservation: TenantMemoryReservation,
 }
 
 fn budget_rejection_query_error(rejection: BudgetRejection) -> QueryError {
 	QueryError::Execution(ExecutionError::BudgetExhausted {
 		dimension: rejection.dimension,
+		requested: rejection.requested,
+		available: rejection.available,
+	})
+}
+
+fn concurrency_rejection_query_error(rejection: TenantConcurrencyRejection) -> QueryError {
+	QueryError::Execution(ExecutionError::ConcurrencyExhausted {
+		tenant_id: rejection.tenant_id,
 		requested: rejection.requested,
 		available: rejection.available,
 	})
@@ -1017,7 +1061,67 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn aggregate_reservation_released_on_error() {
+	async fn tenant_concurrency_limit_rejects_before_bind() {
+		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let _held = coordinator
+			.tenant_concurrency
+			.try_reserve(TenantId(7))
+			.expect("saturate tenant 7 concurrency");
+
+		let err = coordinator
+			.execute_query_with_context(&count_plan(), context)
+			.await
+			.expect_err("tenant concurrency should reject before catalog bind");
+
+		assert!(matches!(
+			err,
+			QueryError::Execution(ExecutionError::ConcurrencyExhausted {
+				tenant_id: TenantId(7),
+				requested: 1,
+				available: 0,
+			})
+		));
+		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
+	}
+
+	#[tokio::test]
+	async fn memory_rejection_releases_concurrency_reservation() {
+		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let _held_memory = coordinator
+			.tenant_memory
+			.try_reserve(TenantId(7), ByteCount::new(8))
+			.expect("saturate tenant 7 memory");
+
+		let err = coordinator
+			.execute_query_with_context(&count_plan(), context)
+			.await
+			.expect_err("tenant memory should reject after concurrency admission");
+
+		assert!(matches!(
+			err,
+			QueryError::Execution(ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				requested: ByteCount(8),
+				available: ByteCount(0),
+			})
+		));
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+	}
+
+	#[tokio::test]
+	async fn tenant_concurrency_reservation_releases_on_error() {
 		let coordinator = distributed_coordinator_with_policy(tenant_policy());
 		let context = ExecutionContext::new(
 			SessionId(1),
@@ -1033,10 +1137,11 @@ mod tests {
 
 		assert!(matches!(err, QueryError::Binding(_)));
 		assert_eq!(coordinator.tenant_memory_used(TenantId(8)), ByteCount::ZERO);
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(8)), 0);
 	}
 
 	#[tokio::test]
-	async fn aggregate_reservation_released_on_successful_completion() {
+	async fn tenant_concurrency_reservation_releases_on_success() {
 		let coordinator = distributed_coordinator_with_policy(tenant_policy());
 		let context = ExecutionContext::new(
 			SessionId(1),
@@ -1058,6 +1163,7 @@ mod tests {
 
 		assert!(result.is_empty());
 		assert_eq!(coordinator.tenant_memory_used(TenantId(8)), ByteCount::ZERO);
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(8)), 0);
 	}
 
 	#[test]
@@ -1083,6 +1189,28 @@ mod tests {
 			coordinator.tenant_memory_used(TenantId(8)),
 			ByteCount::new(16)
 		);
+	}
+
+	#[test]
+	fn one_tenant_concurrency_saturation_does_not_block_another() {
+		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let _tenant_7 = coordinator
+			.tenant_concurrency
+			.try_reserve(TenantId(7))
+			.expect("saturate tenant 7 concurrency");
+		let tenant_8 = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(8),
+			TenantId(8),
+			HlcBound(1),
+		);
+
+		let admitted_8 = coordinator
+			.admit_query(&tenant_8)
+			.expect("tenant 8 admitted");
+
+		assert_eq!(admitted_8.query_budget.memory_per_task, ByteCount::new(16));
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(8)), 1);
 	}
 
 	fn coordinator(batch: RecordBatch, descriptor_failures: usize) -> QueryCoordinator {

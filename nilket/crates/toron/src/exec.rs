@@ -256,7 +256,7 @@ impl Executor {
 						runtime_filter: self.context.runtime_filter.clone(),
 						row_identity: crate::storage::RowIdentityProjection::None,
 						profile_hint: self.context.profile_hint,
-						trace_context: self.context.trace_context.clone(),
+						trace_context: self.context.trace_context,
 						morsel,
 					};
 					let stream = self.storage.scan(req).await?;
@@ -1170,11 +1170,11 @@ impl Executor {
 			for (agg_idx, ((function, _), input)) in
 				aggr_expr.iter().zip(aggr_arrays.iter()).enumerate()
 			{
-				if aggregate_output_types[agg_idx].is_none() {
-					if let Some(array) = input {
-						aggregate_output_types[agg_idx] =
-							Some(legacy_aggregate_output_type(function, array.data_type()));
-					}
+				if aggregate_output_types[agg_idx].is_none()
+					&& let Some(array) = input
+				{
+					aggregate_output_types[agg_idx] =
+						Some(legacy_aggregate_output_type(function, array.data_type()));
 				}
 			}
 
@@ -1288,13 +1288,12 @@ impl Executor {
 				}
 			}
 			let field_name = aggregate_state_output_name(function);
-			let field_type =
-				aggregate_output_types[agg_idx]
-					.clone()
-					.unwrap_or_else(|| match function {
-						AggregateFunction::Avg => arrow::datatypes::DataType::Float64,
-						_ => arrow::datatypes::DataType::Int64,
-					});
+			let field_type = aggregate_output_types[agg_idx]
+				.clone()
+				.unwrap_or(match function {
+					AggregateFunction::Avg => arrow::datatypes::DataType::Float64,
+					_ => arrow::datatypes::DataType::Int64,
+				});
 			fields.push(arrow::datatypes::Field::new(
 				field_name,
 				field_type,

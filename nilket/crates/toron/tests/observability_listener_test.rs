@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -24,8 +25,12 @@ use toron::config::{
 	load_toron_bootstrap_config,
 };
 use toron::daemon::ToronDaemon;
-use toron::distributed::budget::{ByteCount, TenantBudgetPolicy};
+use toron::distributed::budget::{
+	AdmissionResource, ByteCount, TenantAdmissionRejectionCounters, TenantBudget,
+	TenantBudgetPolicy, TenantConcurrencyAccountant, TenantMemoryAccountant,
+};
 use toron::distributed::identity::WorkerId;
+use toron::network::observability::{MetricsRegistry, ReadinessSnapshot};
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, canonical_client_dns_name, canonical_daemon_dns_name,
 	canonical_monitor_dns_name,
@@ -41,6 +46,58 @@ struct TestPki {
 	monitor_key: PathBuf,
 	client_cert: PathBuf,
 	client_key: PathBuf,
+}
+
+fn ready_snapshot() -> ReadinessSnapshot {
+	ReadinessSnapshot {
+		ready: true,
+		worker_listener_bound: true,
+		sql_listener_bound: true,
+		observability_listeners_bound: true,
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		uptime_seconds: 0,
+		degraded_reason: None,
+	}
+}
+
+fn sample_resource_metrics_body() -> String {
+	let mut per_tenant = HashMap::new();
+	per_tenant.insert(
+		TenantId(7),
+		TenantBudget::new(ByteCount::new(8), ByteCount::new(16)),
+	);
+	let policy = TenantBudgetPolicy::new(
+		TenantBudget::new(ByteCount::new(8), ByteCount::new(32)),
+		per_tenant,
+	);
+	let tenant_memory = TenantMemoryAccountant::new(policy.clone());
+	let tenant_concurrency = TenantConcurrencyAccountant::new(policy.clone());
+	let admission_rejections = TenantAdmissionRejectionCounters::new(&policy);
+	let _configured_memory = tenant_memory
+		.try_reserve(TenantId(7), ByteCount::new(8))
+		.expect("reserve configured memory");
+	let _other_memory = tenant_memory
+		.try_reserve(TenantId(9), ByteCount::new(8))
+		.expect("reserve other memory");
+	let _configured_concurrency = tenant_concurrency
+		.try_reserve(TenantId(7))
+		.expect("reserve configured concurrency");
+	let _other_concurrency = tenant_concurrency
+		.try_reserve(TenantId(9))
+		.expect("reserve other concurrency");
+	admission_rejections.increment(TenantId(7), AdmissionResource::Memory);
+	admission_rejections.increment(TenantId(9), AdmissionResource::Concurrency);
+	let metrics = MetricsRegistry::new(
+		0,
+		0,
+		policy,
+		tenant_memory,
+		tenant_concurrency,
+		admission_rejections,
+	);
+
+	metrics.render_text(&ready_snapshot())
 }
 
 #[test]
@@ -269,17 +326,16 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 		"metrics_scrapes_total 1\n",
 		"descriptors_loaded 0\n",
 		"static_workers_configured 0\n",
+		"tenant_memory_bytes_used{tenant_id=\"other\"} 0\n",
+		"tenant_memory_bytes_limit{tenant_id=\"other\"} 67108864\n",
+		"tenant_concurrency_active{tenant_id=\"other\"} 0\n",
+		"tenant_concurrency_limit{tenant_id=\"other\"} 1\n",
+		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"memory\"} 0\n",
+		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"concurrency\"} 0\n",
 	] {
 		assert!(body.contains(metric), "missing metric {metric} in {body}");
 	}
-	for forbidden in [
-		"toron_",
-		"tenant_id",
-		"query_id",
-		"task_id",
-		"sql_text",
-		"_bucket",
-	] {
+	for forbidden in ["toron_", "query_id", "task_id", "sql_text", "_bucket"] {
 		assert!(
 			!body.contains(forbidden),
 			"{forbidden} leaked into /metrics"
@@ -287,6 +343,77 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 	}
 
 	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[test]
+fn resource_metrics_label_configured_tenant() {
+	let body = sample_resource_metrics_body();
+
+	for metric in [
+		"tenant_memory_bytes_used{tenant_id=\"7\"} 8\n",
+		"tenant_memory_bytes_limit{tenant_id=\"7\"} 16\n",
+		"tenant_concurrency_active{tenant_id=\"7\"} 1\n",
+		"tenant_concurrency_limit{tenant_id=\"7\"} 2\n",
+		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"memory\"} 1\n",
+		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"concurrency\"} 0\n",
+	] {
+		assert!(body.contains(metric), "missing metric {metric} in {body}");
+	}
+}
+
+#[test]
+fn resource_metrics_bucket_unconfigured_tenant_as_other() {
+	let body = sample_resource_metrics_body();
+
+	for metric in [
+		"tenant_memory_bytes_used{tenant_id=\"other\"} 8\n",
+		"tenant_concurrency_active{tenant_id=\"other\"} 1\n",
+		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"concurrency\"} 1\n",
+	] {
+		assert!(body.contains(metric), "missing metric {metric} in {body}");
+	}
+	assert!(!body.contains("tenant_id=\"9\""));
+}
+
+#[test]
+fn resource_metrics_expose_memory_and_concurrency_limits() {
+	let body = sample_resource_metrics_body();
+
+	for metric in [
+		"tenant_memory_bytes_limit{tenant_id=\"7\"} 16\n",
+		"tenant_concurrency_limit{tenant_id=\"7\"} 2\n",
+		"tenant_memory_bytes_limit{tenant_id=\"other\"} 32\n",
+		"tenant_concurrency_limit{tenant_id=\"other\"} 4\n",
+	] {
+		assert!(body.contains(metric), "missing metric {metric} in {body}");
+	}
+}
+
+#[test]
+fn resource_admission_rejections_are_labeled_by_resource() {
+	let body = sample_resource_metrics_body();
+
+	for metric in [
+		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"memory\"} 1\n",
+		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"concurrency\"} 0\n",
+		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"memory\"} 0\n",
+		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"concurrency\"} 1\n",
+	] {
+		assert!(body.contains(metric), "missing metric {metric} in {body}");
+	}
+}
+
+#[test]
+fn general_daemon_metrics_do_not_gain_tenant_labels() {
+	let body = sample_resource_metrics_body();
+
+	assert!(body.contains("listener_accepts_total{listener=\"metrics\"} 0\n"));
+	assert!(!body.contains("listener_accepts_total{tenant_id"));
+	assert!(!body.contains("listener_rejects_total{tenant_id"));
+	assert!(!body.contains("daemon_ready{tenant_id"));
+	assert!(!body.contains("daemon_uptime_seconds{tenant_id"));
+	assert!(!body.contains("descriptors_loaded{tenant_id"));
+	assert!(!body.contains("static_workers_configured{tenant_id"));
 }
 
 #[tokio::test]

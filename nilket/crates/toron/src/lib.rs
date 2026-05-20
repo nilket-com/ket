@@ -839,8 +839,8 @@ mod tests {
 		assert_eq!(pulled_batch.num_rows(), w1_partitions[1].num_rows());
 
 		// 3. Verification
-		assert!(w1_partitions.len() >= 1);
-		assert!(w2_partitions.len() >= 1);
+		assert!(!w1_partitions.is_empty());
+		assert!(!w2_partitions.is_empty());
 	}
 
 	#[tokio::test]
@@ -1530,7 +1530,7 @@ mod tests {
 		let temp_dir = std::env::temp_dir().join(format!("toron_spill_{}", rand::random::<u64>()));
 		std::fs::create_dir_all(&temp_dir).unwrap();
 
-		let file_ops = Arc::new(BlockingFileOps::default());
+		let file_ops = Arc::new(BlockingFileOps);
 		let spill_manager = SpillManager::new(file_ops.clone(), temp_dir.clone()).unwrap();
 
 		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));

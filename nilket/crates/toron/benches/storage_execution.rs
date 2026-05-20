@@ -24,7 +24,7 @@ use toron::ir::{
 	AggregateFunction, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, LogicalPlan,
 	MorselId, QueryProfileHint, ScalarValue, TableId,
 };
-use toron::storage::{ScanRequest, ScanStream, StorageScan};
+use toron::storage::{RowIdentityProjection, ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
@@ -276,6 +276,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			pbc_program: None,
 			profile_hint,
 			primary_key_columns,
+			row_identity: RowIdentityProjection::None,
 		},
 		ExecutionPlan::Filter {
 			input, predicate, ..
@@ -343,6 +344,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			strategy,
 			output_schema,
 		},
+		other => other,
 	}
 }
 
@@ -510,6 +512,7 @@ fn cases() -> Vec<BenchCase> {
 			plan: LogicalPlan::Project {
 				input: Box::new(filter_scan("amount", 500)),
 				exprs: vec![Expr::column("id")],
+				output_names: vec![None],
 			},
 			expect_pbc: true,
 		},
@@ -688,9 +691,12 @@ fn column(name: &str) -> Expr {
 }
 
 fn project_scan(columns: Vec<&str>) -> LogicalPlan {
+	let exprs = columns.into_iter().map(column).collect::<Vec<_>>();
+	let output_names = vec![None; exprs.len()];
 	LogicalPlan::Project {
 		input: Box::new(scan()),
-		exprs: columns.into_iter().map(column).collect(),
+		exprs,
+		output_names,
 	}
 }
 

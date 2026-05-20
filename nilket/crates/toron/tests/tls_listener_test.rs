@@ -91,9 +91,8 @@ async fn remote_sql_listener_accepts_client_san_and_rejects_toron_san() {
 		),
 	)
 	.await;
-	match rejected {
-		Ok(Ok(message)) => panic!("SQL listener accepted toron-* daemon cert: {message:?}"),
-		Ok(Err(_)) | Err(_) => {}
+	if let Ok(Ok(message)) = rejected {
+		panic!("SQL listener accepted toron-* daemon cert: {message:?}");
 	}
 
 	daemon.shutdown().await.expect("shutdown daemon");
@@ -159,9 +158,8 @@ async fn remote_worker_task_listener_rejects_client_san() {
 		),
 	)
 	.await;
-	match rejected {
-		Ok(Ok(response)) => panic!("worker listener accepted client-* cert: {response:?}"),
-		Ok(Err(_)) | Err(_) => {}
+	if let Ok(Ok(response)) = rejected {
+		panic!("worker listener accepted client-* cert: {response:?}");
 	}
 
 	daemon.shutdown().await.expect("shutdown daemon");
@@ -193,9 +191,8 @@ async fn remote_worker_task_listener_rejects_subdomain_injection_san() {
 		),
 	)
 	.await;
-	match rejected {
-		Ok(Ok(response)) => panic!("worker listener accepted subdomain SAN: {response:?}"),
-		Ok(Err(_)) | Err(_) => {}
+	if let Ok(Ok(response)) = rejected {
+		panic!("worker listener accepted subdomain SAN: {response:?}");
 	}
 
 	daemon.shutdown().await.expect("shutdown daemon");
@@ -243,9 +240,8 @@ async fn remote_sql_listener_rejects_malformed_client_sans_and_unknown_ca() {
 			execute_sql_with_tls(endpoint, &server_name, cert, key, &pki.ca_cert),
 		)
 		.await;
-		match rejected {
-			Ok(Ok(message)) => panic!("SQL listener accepted {label} cert: {message:?}"),
-			Ok(Err(_)) | Err(_) => {}
+		if let Ok(Ok(message)) = rejected {
+			panic!("SQL listener accepted {label} cert: {message:?}");
 		}
 	}
 
@@ -278,11 +274,8 @@ async fn remote_sql_listener_rejects_multiple_valid_client_tenant_sans() {
 		),
 	)
 	.await;
-	match rejected {
-		Ok(Ok(message)) => {
-			panic!("SQL listener accepted ambiguous client tenant cert: {message:?}")
-		}
-		Ok(Err(_)) | Err(_) => {}
+	if let Ok(Ok(message)) = rejected {
+		panic!("SQL listener accepted ambiguous client tenant cert: {message:?}");
 	}
 
 	daemon.shutdown().await.expect("shutdown daemon");

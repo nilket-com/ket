@@ -174,6 +174,14 @@ pub enum ExecutionError {
 		requested: crate::distributed::budget::ByteCount,
 		available: crate::distributed::budget::ByteCount,
 	},
+	#[error(
+		"tenant concurrency exhausted: tenant {tenant_id:?}, requested {requested}, available {available}"
+	)]
+	ConcurrencyExhausted {
+		tenant_id: crate::storage::TenantId,
+		requested: u32,
+		available: u32,
+	},
 }
 
 #[derive(Debug, Error)]
