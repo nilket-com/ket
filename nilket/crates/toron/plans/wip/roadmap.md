@@ -3965,8 +3965,75 @@ along with the forward-sequence rewrite.
   relocated to the Wendelon sequence at promotion because
   Wendelon owns the consumer ADR. See
   `crates/wendelon/plans/adr/071_nilket_wendelon_inspect_real_wiring.md`.
-  The Toron ADR 049 slot is therefore open (multi-tenant
-  routing is the lead candidate; see the forward sequence).
+  The Toron ADR 049 slot was instead filled by multi-tenant
+  routing (below).
+- **ADR 049 — Authenticated Tenant Routing for SQL.**
+  Promoted. The reclaimed Toron ADR 049 slot (after
+  `nilket wendelon inspect` → Wendelon ADR 071). A **Toron
+  compute-ring substrate cycle** making authenticated remote
+  SQL tenant-scoped by mTLS identity: the tenant is derived
+  from the SQL client cert SAN
+  (`client-<tenant_id>.<cluster_domain>`), threaded through the
+  already-existing `ExecutionContext.tenant_id` substrate, and
+  used to scope catalog resolution before binding; Toron's
+  tenant-flat `WendelonDescriptorRegistry` becomes tenant-keyed.
+  Four council iterations: iter-0 3-of-3 convergence on
+  multi-tenant SQL routing as the reclaimed slot; iter-1 a
+  live-code audit resolved the load-bearing question — Wendelon
+  already enforces tenant isolation
+  (`TableLifecycleKey{tenant_id, table_object_id}` +
+  `tenant_scoped` identity hashing), so this delivers **real
+  isolation, not just attribution**, and **no paired Wendelon
+  ADR is needed** (Claude R1/R2 retractions); iter-2 dual
+  converged on `Catalog::scoped`, tenant-keyed Toron registry,
+  Quinn `peer_identity()` extraction, strict numeric SQL client
+  SANs, loopback fallback, no SQL wire change; iter-3 ratified
+  the `scoped()` factory as **implementation-owned tenant
+  views** (Codex+Claude 2-of-3 over Gemini's generic
+  `ScopedCatalog` decorator — echoing the ADR 047 D8
+  caller-owned-policy resolution), added exactly-one-tenant-SAN
+  ambiguity rejection, and a storage-path request-tenant
+  descriptor-lookup guard. Final D-set: **12 decisions, 18
+  architecture guards + 3 convention guards, 15 required
+  integration fixtures + 2 V1-evidence optional fixtures**.
+  **D2/D3 critical decision:** tenant from
+  `client-<tenant_id>.<cluster_domain>` SAN (canonical decimal
+  `u64`, ids start at 1, `0`/leading-zeros/non-numeric
+  rejected) → `PeerKind::Client { principal, tenant_id }`;
+  supersedes ADR 044's free-form SQL `client-<principal>`.
+  **D4 critical decision:** extraction via Quinn
+  `Connection::peer_identity()` → downcast cert chain →
+  `extract_dns_sans` → `admit_san(Sql)`, **after handshake,
+  before SQL frame**, requiring exactly one admitted tenant SAN
+  (ambiguous multi-SAN rejected); no rustls verifier side
+  channel.
+  **D5 critical decision:** strict authenticated remote tenancy
+  (never falls back to `[node].tenant_id`); loopback
+  unauthenticated dev keeps the config tenant.
+  **D7/D8 critical decision:** `Catalog::scoped(self: Arc<Self>,
+  tenant_id) -> Arc<dyn Catalog>` — implementation-owned tenant
+  views (`WendelonCatalog::scoped` clones with the tenant over
+  the shared registry; no generic decorator); the coordinator
+  scopes the long-lived catalog at `execute_query_with_context`
+  before binding; planner/binder stay tenant-unaware.
+  **D9 critical decision:** `WendelonDescriptorRegistry` keyed
+  by `(TenantId, TableRef)` / `(TenantId, TableId)`; two tenants
+  may share a table name on one daemon; `TenantId(0)` reserved.
+  **D10 critical decision:** DDL + storage-path descriptor
+  lookups use the scoped/request tenant.
+  **D12 critical decision:** no SQL wire tenant claim, no new
+  `SqlMessage` variants / `SqlErrorCode` values, no per-tenant
+  metric labels, no new crate, no Wendelon production change,
+  `crates/nilket` runtime-free, `toron_fixture_worker.rs`
+  source unchanged, brand-clean / no-V1.
+  **Single-plan posture; Toron-ring only** (Wendelon isolation
+  already enforced; no paired Wendelon ADR). Placement: Exterior
+  Substrate → Toron home (ring-product-placement convention).
+  The one implementation risk (exposing the admitted peer
+  identity from the QUIC accept layer) is grounded on Quinn
+  `Connection::peer_identity()` and spiked in Phase 0.
+  The eight-phase migration is materialized in
+  `plans/impl/049_authenticated_tenant_routing_for_sql.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4051,7 +4118,94 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 048 promoted; ADR 049 candidates
+### ADR 049 promoted; ADR 050 candidates
+
+ADR 049 selected and promoted **Authenticated Tenant Routing
+for SQL** — a Toron compute-ring substrate cycle filling
+the reclaimed ADR 049 slot (after `nilket wendelon inspect`
+moved to Wendelon ADR 071). Authenticated remote SQL becomes
+tenant-scoped by mTLS identity: tenant from the
+`client-<tenant_id>.<cluster_domain>` cert SAN → threaded
+through the existing `ExecutionContext.tenant_id` substrate →
+scopes catalog resolution before binding; Toron's tenant-flat
+`WendelonDescriptorRegistry` becomes tenant-keyed. Four
+council iterations (3-of-3 topic; Codex+Claude 2-of-3 D-set):
+iter-1's live-code audit resolved the load-bearing question —
+Wendelon already enforces tenant isolation
+(`TableLifecycleKey{tenant_id, table_object_id}` +
+`tenant_scoped` identity), so this delivers real isolation, not
+attribution, and no paired Wendelon ADR is needed; iter-3
+ratified `Catalog::scoped` as implementation-owned tenant views
+(over Gemini's generic decorator, echoing ADR 047 D8). Final
+D-set: **12 decisions, 18 architecture guards + 3 convention
+guards, 15 required fixtures + 2 V1-evidence optional**.
+
+**Pure Toron-ring substrate; zero Wendelon production change.**
+The execution-layer `tenant_id` propagation already existed;
+ADR 049 adds the tenant *source* (SQL client cert) and
+tenant-scoped catalog resolution. Wendelon's durable
+tenant-keyed schema/storage is consumed unchanged. Real SQL
+catalog isolation (two tenants on one daemon cannot resolve
+each other's tables through a reused unqualified name).
+
+**Architectural invariants preserved through this cycle:**
+
+- ADR 040 D4 / ADR 042-048 root-runtime-free
+  (`crates/nilket/Cargo.toml` untouched).
+- ADR 043 SQL listener + ADR 044 mTLS admission consumed and
+  **narrowed** (SQL `client-` SAN now requires a canonical
+  numeric tenant; supersedes the free-form `client-<principal>`
+  SQL identity — prior ADR 043/044 SQL fixtures updated to
+  numeric tenant SANs where superseded).
+- ADR 045 observability low-cardinality preserved (no
+  per-tenant metric labels).
+- ADR 047 `tls-pki` `extract_dns_sans` / `admit_san` reused for
+  the accept-loop tenant extraction; no `tls-pki` change.
+- No SQL wire change (no new `SqlMessage` variants /
+  `SqlErrorCode` values).
+- `toron_fixture_worker.rs` source unchanged; no new crate; no
+  Wendelon production change; brand-clean / no-V1.
+- Cross-ring discipline + ring-product-placement convention:
+  compute-ring SQL admission + catalog binding is Toron's;
+  Wendelon's storage-layer tenant enforcement stays in the
+  Wendelon sequence.
+
+The eight-phase migration is materialized in
+`plans/impl/049_authenticated_tenant_routing_for_sql.md`.
+
+**ADR 050 candidates:**
+
+After ADR 049, Toron's SQL gateway is multi-tenant over the
+already-tenant-keyed Wendelon substrate. Candidates carried
+forward / newly unblocked:
+
+- **Per-tenant resource governance** — quotas, rate limits,
+  per-tenant memory/storage pools. Now unblocked by ADR 049's
+  per-connection tenant identity; explicitly deferred from
+  ADR 049.
+- **Live Wendelon → Toron descriptor sync** — multi-tenant
+  descriptor *discovery* (ADR 049 kept config bootstrap
+  single-tenant; tests seed tenant bindings directly).
+- **Per-tenant metric labels** — bounded-cardinality tenant
+  observability (deferred from ADR 049 D12 / ADR 045
+  low-cardinality posture).
+- **OTLP traces export** (Toron deferred in ADR 045 D7).
+- **Audit subsystem** (Toron deferred in ADR 045 D7).
+- **SQL surface widening** — CTAS `IF NOT EXISTS`, `UPDATE
+  WHERE`, `INSERT/CTAS/DELETE ... RETURNING`.
+- **Live cert rotation / CRL / OCSP** (retracted from ADR 044
+  iter-1).
+- **Token-based tenant claims (JWT / OIDC / SPIFFE)** — a
+  future tenant-source ADR over ADR 049's mTLS-cert path.
+- **`observability-http` / `tls-pki` Wendelon-side full
+  migration**, gRPC / Arrow Flight / Postgres frontends, strong
+  cross-worker cancellation, prepared statements, etc.
+  (carried forward).
+
+**Substrate candidates carried forward:** (re-listed in the
+ADR 048 historical section below)
+
+### ADR 048 promoted; ADR 049 candidates (HISTORICAL)
 
 ADR 048 selected and promoted **Shared
 `observability-http` Workspace Crate** — the
