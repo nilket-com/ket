@@ -25,10 +25,10 @@ Commands run on 2026-05-19:
 
 ```text
 cargo check -p toron
-cargo test -p toron --test toron_observability_listener_test
+cargo test -p toron --test observability_listener_test
 cargo test -p toron --test architecture_test adr045
 cargo test -p toron --test architecture_test
-cargo test -p toron --test toron_daemon_test
+cargo test -p toron --test daemon_test
 cargo test -p toron --test tls_listener_test
 cargo test -p toron --test sql_listener_test --no-run
 cargo test -p toron --lib network::tls::tests

@@ -333,7 +333,7 @@ For guards 8 and 9, use narrow source-block extraction around the daemon startup
 - `nilket_toron_print_example_config`
 - `nilket_toron_write_example_config_refuses_overwrite`
 
-### `crates/toron/tests/toron_daemon_test.rs` (new)
+### `crates/toron/tests/daemon_test.rs` (new)
 
 - `toron_daemon_binds_loopback_ephemeral_port`
 - `toron_daemon_prints_ready_endpoint` — spawn subprocess; parse `READY <addr>\n` from **stdout**.
@@ -352,7 +352,7 @@ cargo fmt --all
 cargo check -p toron -p nilket
 cargo test -p toron --test architecture_test adr042
 cargo test -p toron --test config_test
-cargo test -p toron --test toron_daemon_test
+cargo test -p toron --test daemon_test
 cargo test -p toron --test distributed_process_test
 cargo test -p nilket
 git diff --check

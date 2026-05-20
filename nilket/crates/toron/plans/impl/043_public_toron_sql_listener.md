@@ -525,7 +525,7 @@ cargo test -p toron --test architecture_test adr043
 cargo test -p toron --test toron_sql_wire_test
 cargo test -p toron --test sql_listener_test
 cargo test -p toron --test config_test
-cargo test -p toron --test toron_daemon_test
+cargo test -p toron --test daemon_test
 cargo test -p nilket
 git diff --check
 ```

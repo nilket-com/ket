@@ -38,6 +38,11 @@ fields, or amending an ADR; flag violations in code review.
   that ring's sequence), not which council process drafted it.
   Includes the Leap Rule for substrate-leaps disguised as
   composition.
+- [continuous-refactoring.md](continuous-refactoring.md) — small,
+  mechanical, behavior-neutral cleanup may travel with the ADR
+  that already touches the affected surface; update docs, guards,
+  evidence, and command snippets instead of preserving stale
+  pre-V1 names.
 
 ## Adding a convention
 

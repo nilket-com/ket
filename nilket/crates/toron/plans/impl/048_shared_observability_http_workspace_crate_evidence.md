@@ -35,9 +35,9 @@ Commands run:
 ```text
 cargo test -p observability-http
 cargo test -p toron --test architecture_test
-cargo test -p toron --test toron_observability_listener_test
+cargo test -p toron --test observability_listener_test
 cargo test -p toron --lib inspect
-cargo test -p toron --test toron_daemon_test
+cargo test -p toron --test daemon_test
 cargo test -p toron --test sql_listener_test
 cargo test -p toron --test tls_listener_test
 cargo test -p toron

@@ -7778,7 +7778,7 @@ fn prior_adr04x_architecture_guards_pass_post_http_extraction() {
 		assert!(
 			architecture_test.contains(required)
 				|| std::fs::read_to_string(
-					manifest_dir().join("tests/toron_observability_listener_test.rs")
+					manifest_dir().join("tests/observability_listener_test.rs")
 				)
 				.expect("read observability listener test")
 				.contains(required)

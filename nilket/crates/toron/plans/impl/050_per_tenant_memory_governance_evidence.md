@@ -33,7 +33,7 @@ cargo test -p toron --test config_test tenant_budget -- --nocapture
 cargo test -p toron --test architecture_test adr050 -- --nocapture
 cargo test -p toron --test sql_listener_test query_over_per_task_budget_returns_resource_exhausted -- --nocapture
 cargo test -p toron --test architecture_test
-cargo test -p toron --test config_test --test sql_listener_test --test tls_listener_test --test toron_daemon_test --test toron_observability_listener_test
+cargo test -p toron --test config_test --test sql_listener_test --test tls_listener_test --test daemon_test --test observability_listener_test
 cargo test -p toron --quiet
 cargo clippy -p toron -- -D warnings
 ```
@@ -46,8 +46,8 @@ Observed results:
 - `config_test`: 13 passed.
 - `sql_listener_test`: 8 passed.
 - `tls_listener_test`: 10 passed.
-- `toron_daemon_test`: 5 passed.
-- `toron_observability_listener_test`: 11 passed.
+- `daemon_test`: 5 passed.
+- `observability_listener_test`: 11 passed.
 - Full `cargo test -p toron --quiet`: passed all Toron suites, including 224 lib tests, 419 architecture guards, all integration suites, and the existing Wendelon-backed storage fixture suite with 9 passed / 1 ignored.
 - `cargo clippy -p toron -- -D warnings`: passed.
 

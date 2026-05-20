@@ -590,7 +590,7 @@ convention) assert string presence/absence. Runtime guards (#1, #2,
 
 ## Phase 8: Integration Fixtures
 
-### `crates/toron/tests/toron_observability_listener_test.rs` (new)
+### `crates/toron/tests/observability_listener_test.rs` (new)
 
 1. `toron_config_missing_observability_section_loads_byte_identical_to_adr044`
 2. `toron_health_endpoint_rejects_non_loopback_bind` — config-time.
