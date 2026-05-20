@@ -17044,7 +17044,7 @@ mod tests {
 
 		assert!(stats.is_none());
 		assert!(
-			metrics().pbc_slab_stats_pointer_drift_total.get() >= drift_before + 1,
+			metrics().pbc_slab_stats_pointer_drift_total.get() > drift_before,
 			"pointer drift metric should increment when advisories disagree with footer locator"
 		);
 	}

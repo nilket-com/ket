@@ -469,7 +469,7 @@ async fn property_backpressure_retries_stay_bounded_without_topology_refresh() {
 	assert_eq!(result.response.status, WriteStatus::BACKPRESSURED);
 	assert_eq!(
 		service.calls(),
-		DATA_RETRY_BUDGET as usize,
+		DATA_RETRY_BUDGET,
 		"backpressure retries must remain bounded by the client retry budget"
 	);
 	assert_eq!(

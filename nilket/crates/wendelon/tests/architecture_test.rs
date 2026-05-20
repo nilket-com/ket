@@ -648,10 +648,10 @@ fn test_forbidden_word_count() {
 	let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
 	walk_dir(&src_dir, &mut |path| {
-		if path.extension().map_or(false, |ext| ext == "rs") {
-			if let Ok(content) = fs::read_to_string(path) {
-				total_occurrences += content.matches(forbidden_word).count();
-			}
+		if path.extension().is_some_and(|ext| ext == "rs")
+			&& let Ok(content) = fs::read_to_string(path)
+		{
+			total_occurrences += content.matches(forbidden_word).count();
 		}
 	});
 
@@ -1349,10 +1349,10 @@ fn test_adr046_state_digest_substrate_boundaries() {
 			continue;
 		}
 		walk_dir(&root_path, &mut |path| {
-			if !path
+			if path
 				.extension()
 				.and_then(|ext| ext.to_str())
-				.is_some_and(|ext| ext == "rs")
+				.is_none_or(|ext| ext != "rs")
 			{
 				return;
 			}
@@ -1381,10 +1381,10 @@ fn test_adr046_state_digest_substrate_boundaries() {
 
 	let src_dir = manifest_dir.join("src");
 	walk_dir(&src_dir, &mut |path| {
-		if !path
+		if path
 			.extension()
 			.and_then(|ext| ext.to_str())
-			.is_some_and(|ext| ext == "rs")
+			.is_none_or(|ext| ext != "rs")
 		{
 			return;
 		}
@@ -2188,10 +2188,10 @@ fn test_adr052_secondary_index_architecture_guards() {
 			continue;
 		}
 		walk_dir(&root_path, &mut |path| {
-			if !path
+			if path
 				.extension()
 				.and_then(|ext| ext.to_str())
-				.is_some_and(|ext| ext == "rs")
+				.is_none_or(|ext| ext != "rs")
 			{
 				return;
 			}
@@ -2528,10 +2528,10 @@ fn test_adr053_wire_ipc_compression_architecture_guards() {
 			continue;
 		}
 		walk_dir(&root_path, &mut |path| {
-			if !path
+			if path
 				.extension()
 				.and_then(|ext| ext.to_str())
-				.is_some_and(|ext| ext == "rs")
+				.is_none_or(|ext| ext != "rs")
 			{
 				return;
 			}
@@ -6268,6 +6268,285 @@ fn adr071_new_inspect_types_are_brand_clean_and_no_v1_suffix() {
 		assert!(
 			!inspect.contains(forbidden),
 			"inspect surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+fn adr072_control_descriptor_get_handler_region(control: &str) -> &str {
+	source_region(
+		control,
+		"async fn handle_table_descriptor_get",
+		"async fn run_table_schema_drop",
+	)
+}
+
+fn adr072_descriptor_get_auth_region(control: &str) -> &str {
+	source_region(
+		control,
+		"fn authorize_descriptor_get_actor",
+		"async fn handle_table_descriptor_get",
+	)
+}
+
+#[test]
+fn adr072_descriptor_get_msg_types_are_unique() {
+	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_GET_REQ: Self = Self(0x3C);"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_GET_RESP: Self = Self(0x3D);"));
+	assert_eq!(schema_core.matches("Self(0x3C)").count(), 1);
+	assert_eq!(schema_core.matches("Self(0x3D)").count(), 1);
+
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_REQ.0"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_RESP.0"));
+}
+
+#[test]
+fn adr072_descriptor_get_response_meta_has_no_bool_and_pins_descriptor_len() {
+	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let response = source_region(
+		&schema_core,
+		"pub struct TableDescriptorGetResponseMeta",
+		"// ============================================================\n//  ROLLING-UPGRADE VERSION WINDOW",
+	);
+	assert!(response.contains("pub accepted: u8"));
+	assert!(response.contains("pub reason_code: u8"));
+	assert!(response.contains("pub leader_hint: NodeId"));
+	assert!(response.contains("pub descriptor_len: u32"));
+	assert!(!response.contains("bool"));
+	assert!(schema_core.contains("size_of::<TableDescriptorGetRequestMeta>() == 264"));
+	assert!(schema_core.contains("size_of::<TableDescriptorGetResponseMeta>() == 24"));
+}
+
+#[test]
+fn adr072_descriptor_get_uses_descriptor_authorization_helper() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	assert!(control.contains("fn authorize_descriptor_get_actor"));
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("Self::authorize_descriptor_get_actor(&context.actor"));
+	assert!(!handler.contains("TenantAdminRequestWire"));
+}
+
+#[test]
+fn adr072_descriptor_get_enforces_tenant_isolation() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let auth = adr072_descriptor_get_auth_region(&control);
+	assert!(auth.contains("authorize_actor(actor, ActorPermission::TenantAdminRead)"));
+	assert!(auth.contains("actor.claimed_tenant_id()?"));
+	assert!(auth.contains("claimed_tenant != tenant_id"));
+}
+
+#[test]
+fn adr072_descriptor_get_is_leader_only_with_leader_hint() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("!self.is_leader().await"));
+	assert!(handler.contains("CONTROL_REASON_NOT_LEADER"));
+	assert!(handler.contains("self.leader_hint()"));
+	assert!(handler.contains("leader_hint"));
+}
+
+#[test]
+fn adr072_descriptor_get_bypasses_raft_log() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(!handler.contains("client_write"));
+	assert!(!handler.contains("WendelonRequest"));
+	assert!(!handler.contains("SchemaUpdate"));
+	assert!(handler.contains("self.state_machine.state_snapshot().await"));
+}
+
+#[test]
+fn adr072_descriptor_get_returns_latest_by_name() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("table_schemas.latest_by_name"));
+	assert!(handler.contains("request.namespace.as_str()"));
+	assert!(handler.contains("request.table_name.as_str()"));
+}
+
+#[test]
+fn adr072_descriptor_get_not_found_is_control_reason_not_found() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("CONTROL_REASON_NOT_FOUND"));
+	assert!(handler.contains("table_descriptor_get_rejection"));
+}
+
+#[test]
+fn adr072_descriptor_get_tenant_mismatch_is_authorization_failed() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let auth = adr072_descriptor_get_auth_region(&control);
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(auth.contains("claimed_tenant != tenant_id"));
+	assert!(handler.contains("CONTROL_REASON_AUTHORIZATION_FAILED"));
+}
+
+#[test]
+fn adr072_descriptor_get_malformed_name_is_invalid_config() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("decode_table_descriptor_get_request"));
+	assert!(handler.contains("CONTROL_REASON_INVALID_CONFIG"));
+}
+
+#[test]
+fn adr072_descriptor_get_returns_catalog_descriptor_without_mutation() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(handler.contains("encode_table_schema_descriptor_v1(descriptor)"));
+	assert!(!handler.contains("refresh_descriptor_fingerprints"));
+	assert!(!handler.contains("compute_logical_schema_fingerprint"));
+	assert!(!handler.contains("compute_physical_descriptor_fingerprint"));
+}
+
+#[test]
+fn adr072_descriptor_get_payload_is_full_descriptor_v1_postcard() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	assert!(control.contains("encode_table_schema_descriptor_v1(descriptor)"));
+	assert!(client.contains("decode_table_schema_descriptor_v1(&trailing[..])"));
+	assert!(client.contains("response.descriptor_len as usize != trailing.len()"));
+}
+
+#[test]
+fn adr072_metrics_track_descriptor_get_outcomes() {
+	let metrics = read_workspace("crates/wendelon/src/metrics/registry.rs");
+	for required in [
+		"control_descriptor_get_requests_total",
+		"control_descriptor_get_success_total",
+		"control_descriptor_get_not_found_total",
+		"control_descriptor_get_not_leader_total",
+		"control_descriptor_get_authorization_failed_total",
+		"control_descriptor_get_invalid_request_total",
+		"wendelon_control_descriptor_get_requests_total",
+		"wendelon_control_descriptor_get_success_total",
+		"wendelon_control_descriptor_get_not_found_total",
+		"wendelon_control_descriptor_get_not_leader_total",
+		"wendelon_control_descriptor_get_authorization_failed_total",
+		"wendelon_control_descriptor_get_invalid_request_total",
+	] {
+		assert!(metrics.contains(required), "missing metric {required}");
+	}
+	for line in metrics
+		.lines()
+		.filter(|line| line.contains("control_descriptor_get"))
+	{
+		assert!(
+			!line.contains("tenant") && !line.contains("table"),
+			"descriptor-get metrics must stay aggregate-only: {line}"
+		);
+	}
+}
+
+#[test]
+fn adr072_no_data_ring_or_bulk_or_object_id_descriptor_lookup() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let handler = adr072_control_descriptor_get_handler_region(&control);
+	assert!(!data_server.contains("TABLE_DESCRIPTOR_GET"));
+	assert!(!handler.contains("descriptors_for_tenant"));
+	assert!(!handler.contains("latest_by_id"));
+	assert!(!handler.contains("table_object_id"));
+}
+
+#[test]
+fn adr072_schema_update_and_drop_paths_stay_unchanged() {
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let schema_update = source_region(
+		&control,
+		"async fn handle_schema_update",
+		"async fn handle_schema_drop",
+	);
+	let schema_drop = source_region(
+		&control,
+		"async fn handle_schema_drop",
+		"fn decode_table_descriptor_get_request",
+	);
+	assert!(schema_update.contains("WendelonRequest::SchemaUpdate(frame.meta.to_vec())"));
+	assert!(schema_drop.contains("run_table_schema_drop"));
+	assert!(!schema_update.contains("TABLE_DESCRIPTOR_GET"));
+	assert!(!schema_drop.contains("TABLE_DESCRIPTOR_GET"));
+}
+
+#[test]
+fn adr072_no_toron_descriptor_sync_stub() {
+	let root = workspace_root().join("crates/toron/src");
+	let mut violations = Vec::new();
+	walk_dir(&root, &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let Ok(content) = fs::read_to_string(path) else {
+			return;
+		};
+		for forbidden in [
+			"get_table_schema_descriptor",
+			"sync_descriptor_for_tenant",
+			"DescriptorSource",
+		] {
+			if content.contains(forbidden) {
+				violations.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	});
+	assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn adr072_nilket_root_stays_runtime_free() {
+	adr071_nilket_root_stays_runtime_free();
+}
+
+#[test]
+fn adr072_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	let combined = format!("{schema_core}\n{control}\n{client}");
+	let identifiers = rust_identifiers_from_source("adr072 combined surface", &combined);
+	for required in [
+		"TableDescriptorGetRequestMeta",
+		"TableDescriptorGetResponseMeta",
+		"TableDescriptorGetRequest",
+		"TableDescriptorGetResult",
+	] {
+		assert!(
+			has_rust_identifier(&identifiers, required),
+			"missing descriptor-get type {required}"
+		);
+	}
+	for forbidden in [
+		"WendelonTableDescriptorGetRequest",
+		"WendelonTableDescriptorGetResponse",
+		"TableDescriptorGetRequestMetaV1",
+		"TableDescriptorGetResponseMetaV1",
+		"TableDescriptorGetRequestV1",
+		"TableDescriptorGetResultV1",
+	] {
+		assert!(
+			!has_rust_identifier(&identifiers, forbidden),
+			"descriptor-get surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr072_prior_adr_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr071_wendelon_inspect_branch_exists",
+		"fn adr071_prior_adr_guards_continue_to_pass",
+		"fn test_adr063_page_level_predicate_stats_guards",
+		"fn test_adr066_fsst_evaluator_guards",
+		"fn test_adr067_row_safe_fsst_guards",
+		"fn test_adr068_fsst_row_safe_estimator_guards",
+		"fn test_adr069_encoded_validity_sparse_projection_guards",
+		"fn test_adr070_all_null_page_skip_sparse_projection_guards",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior guard {required}"
 		);
 	}
 }

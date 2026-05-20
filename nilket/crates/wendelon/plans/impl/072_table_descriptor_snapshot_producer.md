@@ -142,16 +142,16 @@ Confirm the seams (verified at promotion):
 
 ## Acceptance checklist
 
-- [ ] Phase 1 MsgType 0x3C/0x3D + fixed-Pod metas with no `bool` +
+- [x] Phase 1 MsgType 0x3C/0x3D + fixed-Pod metas with no `bool` +
       existing reason-code mappings pinned.
-- [ ] Phase 2 handler: descriptor-get auth helper + tenant-isolation
+- [x] Phase 2 handler: descriptor-get auth helper + tenant-isolation
       overlay + leader-only + latest_by_name + descriptor_len-pinned
       trailing-section descriptor + no Raft write.
-- [ ] Phase 3 router routes 0x3C request frames to control only; 0x3D
+- [x] Phase 3 router routes 0x3C request frames to control only; 0x3D
       is a client-decoded response opcode.
-- [ ] Phase 4 aggregate outcome metrics, no labels.
-- [ ] Phase 5 client helper with leader-hint retry + `Ok(None)` on
+- [x] Phase 4 aggregate outcome metrics, no labels.
+- [x] Phase 5 client helper with leader-hint retry + `Ok(None)` on
       not-found.
-- [ ] Phase 6 16+3 guards pass; 12 fixtures pass; schema
+- [x] Phase 6 16+3 guards pass; 12 fixtures pass; schema
       update/drop + data ring unchanged; prior Wendelon guards pass;
       evidence + roadmap recorded.

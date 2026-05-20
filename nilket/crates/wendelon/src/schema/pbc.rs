@@ -1937,7 +1937,7 @@ mod tests {
 					out.extend_from_slice(&n.to_le_bytes());
 				}
 				Instr::Project(indices) => {
-					let indices: &[u32] = *indices;
+					let indices: &[u32] = indices;
 					out.push(OP_PROJECT);
 					out.extend_from_slice(&(indices.len() as u16).to_le_bytes());
 					for idx in indices {
@@ -1991,7 +1991,7 @@ mod tests {
 		]));
 		let mut identities = FixedSizeBinaryBuilder::with_capacity(4, 32);
 		for fill in [0x11_u8, 0x22, 0x33, 0x44] {
-			identities.append_value(&[fill; 32]).unwrap();
+			identities.append_value([fill; 32]).unwrap();
 		}
 		let localities = UInt64Array::from(vec![1_u64, 2, 3, 4]);
 		let labels = StringArray::from(vec![Some("a"), None, Some("b"), Some("c")]);
@@ -2346,7 +2346,7 @@ mod tests {
 			.filter(|case| case.reference.is_some())
 			.map(|case| case.bytecode.as_slice())
 			.collect::<Vec<_>>();
-		let mut rng = rand::rngs::StdRng::seed_from_u64(0xD1CE_F00D_005EED);
+		let mut rng = rand::rngs::StdRng::seed_from_u64(0x00D1_CEF0_0D00_5EED);
 
 		for sample in 0..sample_count {
 			if sample % 8 == 0 {

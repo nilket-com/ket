@@ -154,7 +154,7 @@ fn bench_array(rows: usize, column: usize) -> ArrayRef {
 		DataType::Int64 => {
 			let values = (0..rows)
 				.map(|row| {
-					if column % 4 == 0 {
+					if column.is_multiple_of(4) {
 						row as i64
 					} else {
 						(row % 16) as i64
@@ -1113,7 +1113,7 @@ fn bench_selection_cpu(config: &BenchConfig) -> std::io::Result<()> {
 }
 
 fn bench_enabled_cascade_ablation(config: &BenchConfig) -> std::io::Result<()> {
-	let iterations = config.iterations.min(10).max(1);
+	let iterations = config.iterations.clamp(1, 10);
 	for case in [
 		BenchCase {
 			rows: 8_192,
@@ -1159,7 +1159,7 @@ fn bench_simd_page_tuning(config: &BenchConfig) -> std::io::Result<()> {
 	};
 	let batch = bench_batch(case.rows, case.columns)?;
 	let descriptor = descriptor(batch.schema().as_ref(), case.columns)?;
-	let iterations = config.iterations.min(10).max(1);
+	let iterations = config.iterations.clamp(1, 10);
 	for page_values in [512_u32, 1024, 2048] {
 		let tuning_config = EncodingWriterConfig {
 			enabled: true,

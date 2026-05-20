@@ -436,17 +436,17 @@ async fn handle_request(
 			drop(attempts);
 
 			let mut fail_map = state.fail_puts_remaining.lock().await;
-			if let Some(remaining) = fail_map.get_mut(&path) {
-				if *remaining > 0 {
-					*remaining -= 1;
-					return write_response(
-						stream,
-						"503 Service Unavailable",
-						&[("Content-Type", "application/xml".into())],
-						b"<Error><Code>SlowDown</Code></Error>",
-					)
-					.await;
-				}
+			if let Some(remaining) = fail_map.get_mut(&path)
+				&& *remaining > 0
+			{
+				*remaining -= 1;
+				return write_response(
+					stream,
+					"503 Service Unavailable",
+					&[("Content-Type", "application/xml".into())],
+					b"<Error><Code>SlowDown</Code></Error>",
+				)
+				.await;
 			}
 			drop(fail_map);
 

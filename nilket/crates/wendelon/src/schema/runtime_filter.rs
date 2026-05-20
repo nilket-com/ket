@@ -805,7 +805,7 @@ mod tests {
 		let impossible_count = RuntimeFilterExactSet {
 			byte_budget: 16 * 1024,
 			encoded_key_count: 2,
-			encoded_keys: exact_payload(&[one.clone()]),
+			encoded_keys: exact_payload(std::slice::from_ref(&one)),
 		};
 		assert_eq!(
 			validate_runtime_filter_exact_set_shape(&impossible_count).unwrap_err(),
@@ -840,8 +840,8 @@ mod tests {
 		);
 
 		let mask = build_runtime_filter_mask(&descriptor, &[array.as_ref()]).unwrap();
-		assert_eq!(mask.value(0), true);
-		assert_eq!(mask.value(1), false);
+		assert!(mask.value(0));
+		assert!(!mask.value(1));
 	}
 
 	#[test]

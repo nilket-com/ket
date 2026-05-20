@@ -25,7 +25,7 @@ fn row(key: u8, ms: u64, is_tombstone: bool) -> VisibleDomainRow {
 #[test]
 fn lsm_digest_visible_domain_ignores_rewritten_locations() {
 	let before = [row(1, 10, false), row(2, 20, false)];
-	let after = before.clone();
+	let after = before;
 
 	let summary = compaction_visible_domain_summary(before, after);
 

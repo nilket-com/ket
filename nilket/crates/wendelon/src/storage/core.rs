@@ -1539,7 +1539,7 @@ mod tests {
 		let path = dir.join("slab_0000000000000000.wnd");
 		let file_ops = Arc::new(BlockingFileOps);
 		let row = Identity::new([6; 32]);
-		let frames = vec![
+		let frames = [
 			multirow_storage_frame(row, Identity::new([10; 32]), hlc(10, 0), hlc(10, 1)),
 			row_tombstone_marker_frame(row, hlc(20, 0)),
 			multirow_storage_frame(row, Identity::new([12; 32]), hlc(30, 0), hlc(30, 1)),

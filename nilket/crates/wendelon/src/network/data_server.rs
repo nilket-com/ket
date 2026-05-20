@@ -18022,11 +18022,11 @@ mod tests {
 			}
 		);
 		assert!(
-			metrics().pbc_slab_stats_consulted_total.get() >= consulted_before + 1,
+			metrics().pbc_slab_stats_consulted_total.get() > consulted_before,
 			"tiered stats should be consulted before L2 row reads"
 		);
 		assert!(
-			metrics().pbc_slab_stats_pruned_total.get() >= pruned_before + 1,
+			metrics().pbc_slab_stats_pruned_total.get() > pruned_before,
 			"the slab-level id min/max should rule out id >= 100"
 		);
 
@@ -18063,7 +18063,7 @@ mod tests {
 
 		assert_eq!(second.response.status, ReadStatus::KEY_NOT_FOUND);
 		assert!(
-			metrics().pbc_slab_stats_cache_hits_total.get() >= cache_hits_before + 1,
+			metrics().pbc_slab_stats_cache_hits_total.get() > cache_hits_before,
 			"second query should reuse the parsed stats block cached by the slab manager"
 		);
 	}
@@ -21538,7 +21538,7 @@ mod tests {
 		assert!(
 			metrics()
 				.storage_table_retention_read_floor_rejects_total
-				.get() >= floor_rejects_before + 1,
+				.get() > floor_rejects_before,
 			"aggregate retention admission should increment the read-floor reject metric"
 		);
 
@@ -21774,7 +21774,7 @@ mod tests {
 		assert_eq!(response.diagnostics.slabs_answered_from_csb, 1);
 		assert_eq!(response.diagnostics.rows_admitted, 2);
 		assert!(
-			metrics().agg_csb_short_circuit_total.get() >= metric_before + 1,
+			metrics().agg_csb_short_circuit_total.get() > metric_before,
 			"CSB direct answer should increment the global counter at least once"
 		);
 		assert_eq!(response.partials[0].state.as_slice(), &2_u64.to_be_bytes());
@@ -25987,7 +25987,7 @@ mod tests {
 		// same range).
 		let stored_id = [0xBB_u8; 16];
 		let mut id_builder = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
-		id_builder.append_value(&stored_id).unwrap();
+		id_builder.append_value(stored_id).unwrap();
 		let id_array = Arc::new(id_builder.finish()) as arrow::array::ArrayRef;
 		let value_array =
 			Arc::new(arrow::array::Int64Array::from(vec![1])) as arrow::array::ArrayRef;
@@ -26041,7 +26041,7 @@ mod tests {
 		// Row stamped with a sibling PK descriptor's table_object_id.
 		let stored_id = [0xBB_u8; 16];
 		let mut id_builder = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
-		id_builder.append_value(&stored_id).unwrap();
+		id_builder.append_value(stored_id).unwrap();
 		let stamp_array = Arc::new(id_builder.finish()) as arrow::array::ArrayRef;
 		let id_array = Arc::new(arrow::array::LargeBinaryArray::from(vec![&b"k1"[..]]))
 			as arrow::array::ArrayRef;
@@ -26097,7 +26097,7 @@ mod tests {
 		.unwrap();
 		let stored_id = [0x45_u8; 16];
 		let mut id_builder = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
-		id_builder.append_value(&stored_id).unwrap();
+		id_builder.append_value(stored_id).unwrap();
 		let id_array = Arc::new(id_builder.finish()) as arrow::array::ArrayRef;
 		let value_array =
 			Arc::new(arrow::array::Int64Array::from(vec![1])) as arrow::array::ArrayRef;

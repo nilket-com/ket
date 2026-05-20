@@ -6,6 +6,8 @@
 //! promotion matrix: writer overhead, page-directory planning, Phase B
 //! survival-mask evaluation, and masked Phase C materialization.
 
+#![allow(clippy::too_many_arguments)]
+
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt8Array, UInt16Array,
 	UInt32Array,
@@ -296,7 +298,7 @@ fn bench_array(rows: usize, data_type: DataType, column: usize) -> ArrayRef {
 		}
 		DataType::Boolean => {
 			let values = (0..rows)
-				.map(|row| (row + column) % 3 == 0)
+				.map(|row| (row + column).is_multiple_of(3))
 				.collect::<Vec<_>>();
 			Arc::new(BooleanArray::from(values))
 		}
@@ -1654,7 +1656,7 @@ fn sparse_projection_page_selected(
 		SparseProjectionMaskShape::RandomOnePercent => {
 			let mut row = page_start.div_ceil(100) * 100;
 			while row < page_end.min(rows) {
-				if row % 100 == 0 {
+				if row.is_multiple_of(100) {
 					return true;
 				}
 				row = row.saturating_add(100);
@@ -2188,9 +2190,9 @@ fn sparse_projection_runtime_cascades(
 
 fn sparse_projection_runtime_iterations(config: &BenchConfig, rows: usize) -> usize {
 	if rows >= 1_000_000 {
-		config.iterations.min(3).max(1)
+		config.iterations.clamp(1, 3)
 	} else {
-		config.iterations.min(10).max(1)
+		config.iterations.clamp(1, 10)
 	}
 }
 
@@ -3345,9 +3347,9 @@ fn adr064_nullable_sparse_projection_rows(config: &BenchConfig) -> &'static [usi
 
 fn adr064_runtime_iterations(config: &BenchConfig, rows: usize) -> usize {
 	if rows >= 1_000_000 {
-		config.iterations.min(3).max(1)
+		config.iterations.clamp(1, 3)
 	} else {
-		config.iterations.min(10).max(1)
+		config.iterations.clamp(1, 10)
 	}
 }
 
@@ -3386,24 +3388,24 @@ fn adr064_cell_is_null(
 ) -> bool {
 	match distribution {
 		Adr064NullDistribution::AllValidSelectedPages => {
-			row >= rows / 2 && (row + projection_index) % 20 == 0
+			row >= rows / 2 && (row + projection_index).is_multiple_of(20)
 		}
 		Adr064NullDistribution::NoNullRowGroup => false,
-		Adr064NullDistribution::Alternating => (row + projection_index) % 2 == 0,
+		Adr064NullDistribution::Alternating => (row + projection_index).is_multiple_of(2),
 		Adr064NullDistribution::AlternatingPagesAllNull => {
-			(row / page_values as usize + projection_index) % 2 == 0
+			(row / page_values as usize + projection_index).is_multiple_of(2)
 		}
 		Adr064NullDistribution::ClusteredNulls => row < rows.saturating_mul(5).div_ceil(100),
 		Adr064NullDistribution::AllNullSelectedPage => row < page_values as usize,
 		Adr064NullDistribution::DivergentSelectedPage => {
 			projection_index == 0 && row < page_values as usize
 		}
-		Adr064NullDistribution::RandomFivePercent => (row + projection_index) % 20 == 0,
+		Adr064NullDistribution::RandomFivePercent => (row + projection_index).is_multiple_of(20),
 		Adr064NullDistribution::RandomFiftyPercent => {
 			let hash = row
 				.wrapping_mul(1_103_515_245)
 				.wrapping_add(projection_index.wrapping_mul(12_345));
-			hash % 2 == 0
+			hash.is_multiple_of(2)
 		}
 	}
 }
@@ -3768,11 +3770,11 @@ fn adr064_rebased_validity_bit(
 	Ok((byte & (1_u8 << (source_bit % 8))) != 0)
 }
 
-fn adr064_selected_pages<'a>(
-	column: &'a Adr064RuntimeColumn,
+fn adr064_selected_pages(
+	column: &Adr064RuntimeColumn,
 	shape: SparseProjectionMaskShape,
 	rows: usize,
-) -> Vec<&'a EncodingPageDescriptor> {
+) -> Vec<&EncodingPageDescriptor> {
 	column
 		.pages
 		.iter()
@@ -4030,11 +4032,10 @@ fn adr064_sparse_projection_runtime(
 			.expect("ADR 064 prechecked value range");
 		for page in selected_pages {
 			value_ranges.push(encoded_page_body_range(value_buffer_range, encoding, *page));
-			if column.nullable {
-				if let Some(validity_range) = column.null_buffer_range {
-					validity_ranges
-						.push(adr064_validity_body_range_for_page(validity_range, *page)?);
-				}
+			if column.nullable
+				&& let Some(validity_range) = column.null_buffer_range
+			{
+				validity_ranges.push(adr064_validity_body_range_for_page(validity_range, *page)?);
 			}
 		}
 	}
@@ -4342,11 +4343,10 @@ fn adr070_sparse_projection_runtime(
 			}
 			selected_value_pages = selected_value_pages.saturating_add(1);
 			value_ranges.push(encoded_page_body_range(value_buffer_range, encoding, *page));
-			if column.nullable {
-				if let Some(validity_range) = column.null_buffer_range {
-					validity_ranges
-						.push(adr064_validity_body_range_for_page(validity_range, *page)?);
-				}
+			if column.nullable
+				&& let Some(validity_range) = column.null_buffer_range
+			{
+				validity_ranges.push(adr064_validity_body_range_for_page(validity_range, *page)?);
 			}
 		}
 	}
@@ -4827,7 +4827,7 @@ fn adr065_dense_oracle_batch(
 	mask: &BooleanArray,
 ) -> std::io::Result<RecordBatch> {
 	let columns = std::iter::once(1_usize)
-		.chain((2..2 + dataset.shape.projection_columns()).map(|column| column as usize))
+		.chain(2..2 + dataset.shape.projection_columns())
 		.collect::<Vec<_>>();
 	adr065_projected_batch_for_columns(fixture, &columns, mask)?
 		.user_visible()
@@ -4872,9 +4872,7 @@ fn adr065_zip_runtime(
 	for fixture in &dataset.fixtures {
 		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
 		let predicate = adr065_projected_batch_for_columns(fixture, &[1], &mask)?;
-		let projection_columns = (2..2 + dataset.shape.projection_columns())
-			.map(|column| column as usize)
-			.collect::<Vec<_>>();
+		let projection_columns = (2..2 + dataset.shape.projection_columns()).collect::<Vec<_>>();
 		let projection = adr065_projected_batch_for_columns(fixture, &projection_columns, &mask)?;
 		let zipped = zip_predicate_and_projection_columns(&predicate, &projection, &requirement)?;
 		let dense_oracle = adr065_dense_oracle_batch(fixture, dataset, &mask)?;
@@ -6902,7 +6900,7 @@ fn bench_adr063_cascade_gate_matrix() {
 fn bench_adr063_writer_cost(config: &BenchConfig) -> std::io::Result<()> {
 	let rows = ROW_GROUP_SCAN_TARGET_ROWS as usize;
 	let columns = 1;
-	let iterations = config.iterations.min(10).max(1);
+	let iterations = config.iterations.clamp(1, 10);
 	let batch = adr063_bench_batch(rows, columns, Adr063Distribution::Clustered, 5)?;
 	let table_descriptor = descriptor(batch.schema().as_ref(), columns)?;
 	let source_rows = ordered_source_rows(rows);

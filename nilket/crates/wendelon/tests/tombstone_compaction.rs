@@ -164,10 +164,10 @@ async fn wait_for_migration_state(
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
 		let snapshot = node.state_machine.state_snapshot().await;
-		if let Some(entry) = snapshot.migrations.get(&migration_id) {
-			if entry.state == state {
-				return entry.clone();
-			}
+		if let Some(entry) = snapshot.migrations.get(&migration_id)
+			&& entry.state == state
+		{
+			return entry.clone();
 		}
 		assert!(
 			tokio::time::Instant::now() < deadline,

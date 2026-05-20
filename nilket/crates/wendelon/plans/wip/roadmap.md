@@ -53,11 +53,12 @@ inspect surface (`nilket toron inspect` (Toron ADR 046) +
 `nilket wendelon inspect` (this ADR)). Zero daemon-side change;
 all code lands in `crates/wendelon`.
 
-**ADR 072 (Table Descriptor Snapshot Producer) promoted — the
+**ADR 072 (Table Descriptor Snapshot Producer) implemented — the
 producer half of cross-ring descriptor liveness, not a
 storage-engine continuation.** Plans at
 `plans/adr/072_table_descriptor_snapshot_producer.md` +
-`plans/impl/072_table_descriptor_snapshot_producer.md`. A read-only
+`plans/impl/072_table_descriptor_snapshot_producer.md`; evidence at
+`plans/impl/072_table_descriptor_snapshot_producer_evidence.md`. A read-only
 Control Ring RPC (`MsgType::TABLE_DESCRIPTOR_GET_REQ` 0x3C /
 `_RESP` 0x3D) answering `(tenant_id, namespace, table_name)` →
 latest `TableSchemaDescriptor` (or not-found) against the Raft
@@ -194,7 +195,7 @@ ran in. Only workspace-shared Interior substrate (`tls-pki`,
 
 ## Forward sequence
 
-**Promoted — ADR 072 Table Descriptor Snapshot Producer
+**Implemented — ADR 072 Table Descriptor Snapshot Producer
 (cross-ring descriptor-liveness producer).** Read-only Control Ring
 RPC (0x3C/0x3D) returning the latest `TableSchemaDescriptor` by
 `(tenant, namespace, table)` from the Raft leader's applied catalog;
@@ -202,7 +203,9 @@ descriptor-get authorization helper + tenant-isolation; full
 descriptor in the trailing section with a pinned `descriptor_len`.
 Seeded by Toron ADR 052 §D15; relocated to the Wendelon sequence at
 promotion (ADR 071 precedent). Status block above; plans at
-`plans/adr/072_*` + `plans/impl/072_*`. **Next consumer:** the
+`plans/adr/072_*` + `plans/impl/072_*`; evidence at
+`plans/impl/072_table_descriptor_snapshot_producer_evidence.md`.
+**Next consumer:** the
 Toron bind-miss ADR (Toron sequence, 053) — cross-referenced, not
 owned here.
 

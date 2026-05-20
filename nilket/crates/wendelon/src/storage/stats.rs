@@ -1945,7 +1945,7 @@ mod tests {
 			payload,
 		};
 
-		let encoded = encode_column_stats_block(&header, &[column.clone()]).unwrap();
+		let encoded = encode_column_stats_block(&header, std::slice::from_ref(&column)).unwrap();
 		assert_eq!(
 			encoded.len(),
 			COLUMN_STATS_BLOCK_HEADER_BYTES + 9 + column.payload.len()

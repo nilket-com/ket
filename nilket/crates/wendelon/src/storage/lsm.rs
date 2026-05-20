@@ -878,7 +878,7 @@ mod tests {
 	fn compaction_merge_key_sorts_by_hlc_key_and_row_index() {
 		let key_a = Identity::new([1; 32]);
 		let key_b = Identity::new([2; 32]);
-		let mut keys = vec![
+		let mut keys = [
 			CompactionMergeKey::new(hlc(2), key_a, RecordRowIndex::ZERO),
 			CompactionMergeKey::new(hlc(1), key_b, RecordRowIndex::ZERO),
 			CompactionMergeKey::new(hlc(1), key_a, RecordRowIndex::new(2)),

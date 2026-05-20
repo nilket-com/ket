@@ -2145,7 +2145,9 @@ struct TableNameCatalogKey {
 	table_name: String,
 }
 
-fn validate_descriptor_name(label: &str, value: &str) -> std::io::Result<()> {
+pub(crate) const TABLE_DESCRIPTOR_NAME_BYTES: usize = 128;
+
+pub(crate) fn validate_descriptor_name(label: &str, value: &str) -> std::io::Result<()> {
 	if value.is_empty() || value.len() > 128 {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -2162,6 +2164,34 @@ fn validate_descriptor_name(label: &str, value: &str) -> std::io::Result<()> {
 		));
 	}
 	Ok(())
+}
+
+pub(crate) fn encode_descriptor_wire_name(
+	label: &str,
+	value: &str,
+) -> std::io::Result<[u8; TABLE_DESCRIPTOR_NAME_BYTES]> {
+	validate_descriptor_name(label, value)?;
+	let mut raw = [0u8; TABLE_DESCRIPTOR_NAME_BYTES];
+	raw[..value.len()].copy_from_slice(value.as_bytes());
+	Ok(raw)
+}
+
+pub(crate) fn decode_descriptor_wire_name(
+	label: &str,
+	raw: &[u8; TABLE_DESCRIPTOR_NAME_BYTES],
+) -> std::io::Result<String> {
+	let end = raw
+		.iter()
+		.rposition(|byte| *byte != 0)
+		.map_or(0, |idx| idx + 1);
+	let value = std::str::from_utf8(&raw[..end]).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("{label} is not valid UTF-8: {err}"),
+		)
+	})?;
+	validate_descriptor_name(label, value)?;
+	Ok(value.to_string())
 }
 
 fn validate_row_identity_policy(

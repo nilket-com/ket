@@ -94,7 +94,7 @@ async fn cdc_live_tail_finalization_cleanup_counts_entries_already_evicted_from_
 	let before = metrics().cdc_pending_finalization_evicted_total.get();
 	assert_eq!(observer.on_finalized(100).await, 0);
 	assert!(
-		metrics().cdc_pending_finalization_evicted_total.get() >= before + 1,
+		metrics().cdc_pending_finalization_evicted_total.get() > before,
 		"finalization cleanup must count staged entries already evicted by ring overflow"
 	);
 
@@ -104,7 +104,7 @@ async fn cdc_live_tail_finalization_cleanup_counts_entries_already_evicted_from_
 	let before = metrics().cdc_pending_finalization_evicted_total.get();
 	assert_eq!(observer.on_terminal_failure(101).await, 1);
 	assert!(
-		metrics().cdc_pending_finalization_evicted_total.get() >= before + 1,
+		metrics().cdc_pending_finalization_evicted_total.get() > before,
 		"terminal cleanup must count staged entries already evicted by ring overflow"
 	);
 }

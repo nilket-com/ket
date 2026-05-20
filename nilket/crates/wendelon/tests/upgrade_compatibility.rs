@@ -136,10 +136,11 @@ async fn wait_for_failover_leader(left: &WendelonNode, right: &WendelonNode, pre
 	loop {
 		let left_leader = left.raft.current_leader().await;
 		let right_leader = right.raft.current_leader().await;
-		if let (Some(left_leader), Some(right_leader)) = (left_leader, right_leader) {
-			if left_leader == right_leader && left_leader != previous {
-				return left_leader;
-			}
+		if let (Some(left_leader), Some(right_leader)) = (left_leader, right_leader)
+			&& left_leader == right_leader
+			&& left_leader != previous
+		{
+			return left_leader;
 		}
 		assert!(
 			tokio::time::Instant::now() < deadline,

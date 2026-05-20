@@ -281,6 +281,7 @@ impl TransportProvider for RefusingProvider {
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bootstrap_cfg(
 	tag: &str,
 	node_id: u32,

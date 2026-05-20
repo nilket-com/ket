@@ -324,10 +324,10 @@ async fn wait_for_shared_leader(nodes: &BTreeMap<u32, WendelonNode>, exclude: Op
 	loop {
 		let mut leaders = BTreeSet::new();
 		for node in nodes.values() {
-			if let Some(leader) = node.raft.current_leader().await {
-				if exclude != Some(leader) {
-					leaders.insert(leader);
-				}
+			if let Some(leader) = node.raft.current_leader().await
+				&& exclude != Some(leader)
+			{
+				leaders.insert(leader);
 			}
 		}
 		if leaders.len() == 1 {
@@ -536,10 +536,11 @@ async fn run_leader_partition_and_rejoin(seed: u64) -> std::result::Result<(), C
 	let new_leader = loop {
 		let left = survivors[0].1.raft.current_leader().await;
 		let right = survivors[1].1.raft.current_leader().await;
-		if let (Some(left), Some(right)) = (left, right) {
-			if left == right && left != original_leader {
-				break left;
-			}
+		if let (Some(left), Some(right)) = (left, right)
+			&& left == right
+			&& left != original_leader
+		{
+			break left;
 		}
 		if tokio::time::Instant::now() >= deadline {
 			cluster.shutdown().await;
@@ -660,10 +661,11 @@ async fn run_leader_partition_restart_and_rejoin(
 	let new_leader = loop {
 		let left = survivors[0].1.raft.current_leader().await;
 		let right = survivors[1].1.raft.current_leader().await;
-		if let (Some(left), Some(right)) = (left, right) {
-			if left == right && left != original_leader {
-				break left;
-			}
+		if let (Some(left), Some(right)) = (left, right)
+			&& left == right
+			&& left != original_leader
+		{
+			break left;
 		}
 		if tokio::time::Instant::now() >= deadline {
 			cluster.shutdown().await;
@@ -1169,7 +1171,7 @@ async fn run_rolling_kill(seed: u64) -> std::result::Result<(), ChaosFailure> {
 		}
 	};
 	let mut rng = StdRng::seed_from_u64(seed);
-	let mut kill_order = vec![1u32, 2, 3];
+	let mut kill_order = [1u32, 2, 3];
 	kill_order.shuffle(&mut rng);
 
 	for (iteration, node_id) in kill_order.iter().copied().enumerate() {

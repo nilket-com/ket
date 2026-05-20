@@ -660,7 +660,7 @@ fn run_register_scenario(
 
 	while executed < ops {
 		let remaining = ops - executed;
-		let batch_len = remaining.min(6).max(1);
+		let batch_len = remaining.clamp(1, 6);
 		let mut states: BTreeMap<String, Option<i64>> = BTreeMap::from([
 			("tenant/register/0".to_string(), None),
 			("tenant/register/1".to_string(), None),
@@ -1104,7 +1104,7 @@ async fn run_transport_scenario(seed: u64, ops: u64) -> std::result::Result<u64,
 }
 
 async fn run_replay_ordering_scenario(seed: u64, ops: u64) -> std::result::Result<u64, SimFailure> {
-	let iterations = ops.max(1).min(16);
+	let iterations = ops.clamp(1, 16);
 	for iteration in 0..iterations {
 		let dir = tempdir(&format!("replay-ordering-{seed}-{iteration}"));
 		let wal = dir.join("control.wal");
@@ -1238,7 +1238,7 @@ async fn run_apply_order_races_scenario(
 	seed: u64,
 	ops: u64,
 ) -> std::result::Result<u64, SimFailure> {
-	let iterations = ops.max(1).min(8);
+	let iterations = ops.clamp(1, 8);
 	for iteration in 0..iterations {
 		let target_dir = tempdir(&format!("apply-order-target-{seed}-{iteration}"));
 		let wal = target_dir.join("control.wal");
@@ -1456,17 +1456,17 @@ async fn run_apply_order_races_scenario(
 			));
 		}
 		for (epoch, watermark) in after_apply.e_safe_watermarks.iter() {
-			if let Some(next) = after_install.e_safe_watermarks.get(epoch) {
-				if next < watermark {
-					return Err(SimFailure::new(
-						"apply_order_races",
-						seed,
-						iteration + 1,
-						format!(
-							"snapshot install regressed watermark for epoch {epoch}: before={watermark:?} after={next:?}"
-						),
-					));
-				}
+			if let Some(next) = after_install.e_safe_watermarks.get(epoch)
+				&& next < watermark
+			{
+				return Err(SimFailure::new(
+					"apply_order_races",
+					seed,
+					iteration + 1,
+					format!(
+						"snapshot install regressed watermark for epoch {epoch}: before={watermark:?} after={next:?}"
+					),
+				));
 			}
 		}
 		let expected_epoch_two = HybridTimestamp {
@@ -1495,7 +1495,7 @@ async fn run_interrupted_finalization_recovery_scenario(
 	seed: u64,
 	ops: u64,
 ) -> std::result::Result<u64, SimFailure> {
-	let iterations = ops.max(1).min(6);
+	let iterations = ops.clamp(1, 6);
 	for iteration in 0..iterations {
 		let node_id = 800 + ((seed as u32).wrapping_add(iteration as u32) % 100);
 		let cfg = NodeBootstrapConfig::dev(

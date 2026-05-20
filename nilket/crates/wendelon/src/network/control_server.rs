@@ -29,7 +29,7 @@ use crate::network::pool::BufPool;
 use crate::network::ring::RingState;
 use crate::network::router::ControlRingServer;
 use crate::network::server::RequestContext;
-use crate::network::tls::{ActorPermission, ActorTrustDomain, authorize_actor};
+use crate::network::tls::{ActorIdentity, ActorPermission, ActorTrustDomain, authorize_actor};
 use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use crate::network::transfer_signing::TransferAuthority;
 use crate::network::transport::{
@@ -37,12 +37,14 @@ use crate::network::transport::{
 	TransportTierSet,
 };
 use crate::network::wire;
+use crate::schema::table::decode_descriptor_wire_name;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
 	LeaseDescriptor, LeaseStatus, MsgType, NodeId, PolicyGeneration, ProtocolVersionWindow,
-	ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TableObjectId, TableRetentionPolicy,
-	TableSchemaDescriptor, TenantId, TenantKekId, TransferToken, decode_table_schema_descriptor_v1,
-	epoch_entry_var_schema,
+	ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TableDescriptorGetRequestMeta,
+	TableDescriptorGetResponseMeta, TableObjectId, TableRetentionPolicy, TableSchemaDescriptor,
+	TenantId, TenantKekId, TransferToken, decode_table_schema_descriptor_v1,
+	encode_table_schema_descriptor_v1, epoch_entry_var_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -82,6 +84,13 @@ enum ControlOperation {
 	Join,
 	SchemaUpdate,
 	SchemaDrop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableDescriptorGetRequest {
+	tenant_id: TenantId,
+	namespace: String,
+	table_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,6 +460,38 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn build_table_descriptor_get_frame(
+		&self,
+		stream_id: u32,
+		meta: TableDescriptorGetResponseMeta,
+		descriptor: Option<&[u8]>,
+	) -> std::io::Result<HrftFrame> {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let trailing = descriptor.map(|bytes| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec().extend_from_slice(bytes);
+			buf
+		});
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_DESCRIPTOR_GET_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0),
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing,
+		})
+	}
+
 	fn tenant_admin_rejection(
 		&self,
 		frame: &HrftFrame,
@@ -525,6 +566,45 @@ impl WendelonControlServer {
 				admin_error: Some(admin_error),
 			},
 		)
+	}
+
+	fn table_descriptor_get_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		Self::observe_table_descriptor_get_reason(reason_code);
+		self.build_table_descriptor_get_frame(
+			frame.header.stream_id,
+			TableDescriptorGetResponseMeta {
+				accepted: 0,
+				reason_code,
+				_pad1: [0; 6],
+				leader_hint: leader_hint.unwrap_or(NodeId {
+					id: 0,
+					_reserved: 0,
+				}),
+				descriptor_len: 0,
+				_pad2: [0; 4],
+			},
+			None,
+		)
+	}
+
+	fn observe_table_descriptor_get_reason(reason_code: u8) {
+		match reason_code {
+			CONTROL_REASON_GRANTED => metrics().control_descriptor_get_success_total.inc(),
+			CONTROL_REASON_NOT_FOUND => metrics().control_descriptor_get_not_found_total.inc(),
+			CONTROL_REASON_NOT_LEADER => metrics().control_descriptor_get_not_leader_total.inc(),
+			CONTROL_REASON_AUTHORIZATION_FAILED => metrics()
+				.control_descriptor_get_authorization_failed_total
+				.inc(),
+			CONTROL_REASON_INVALID_CONFIG => {
+				metrics().control_descriptor_get_invalid_request_total.inc()
+			}
+			_ => {}
+		}
 	}
 
 	fn revoked_actor_keys_wire(
@@ -1097,6 +1177,120 @@ impl WendelonControlServer {
 				None,
 			),
 		}
+	}
+
+	fn decode_table_descriptor_get_request(
+		meta: TableDescriptorGetRequestMeta,
+	) -> std::io::Result<TableDescriptorGetRequest> {
+		Ok(TableDescriptorGetRequest {
+			tenant_id: meta.tenant_id,
+			namespace: decode_descriptor_wire_name("namespace", &meta.namespace)?,
+			table_name: decode_descriptor_wire_name("table name", &meta.table_name)?,
+		})
+	}
+
+	fn authorize_descriptor_get_actor(
+		actor: &ActorIdentity,
+		tenant_id: TenantId,
+	) -> std::io::Result<()> {
+		authorize_actor(actor, ActorPermission::TenantAdminRead)?;
+		if let Some(claimed_tenant) = actor.claimed_tenant_id()? {
+			if claimed_tenant != tenant_id {
+				return Err(Error::new(
+					ErrorKind::PermissionDenied,
+					format!(
+						"actor tenant {} is not allowed to read table descriptors for tenant {}",
+						claimed_tenant.get(),
+						tenant_id.get()
+					),
+				));
+			}
+		}
+		Ok(())
+	}
+
+	async fn handle_table_descriptor_get(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		metrics().control_descriptor_get_requests_total.inc();
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return self.table_descriptor_get_rejection(
+				&frame,
+				CONTROL_REASON_INVALID_CONFIG,
+				None,
+			);
+		}
+
+		let raw_meta: TableDescriptorGetRequestMeta =
+			if frame.meta.len() == std::mem::size_of::<TableDescriptorGetRequestMeta>() {
+				*bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<TableDescriptorGetRequestMeta>()],
+				)
+			} else {
+				return self.table_descriptor_get_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					None,
+				);
+			};
+		if Self::authorize_descriptor_get_actor(&context.actor, raw_meta.tenant_id).is_err() {
+			return self.table_descriptor_get_rejection(
+				&frame,
+				CONTROL_REASON_AUTHORIZATION_FAILED,
+				None,
+			);
+		}
+
+		let request = match Self::decode_table_descriptor_get_request(raw_meta) {
+			Ok(request) => request,
+			Err(_) => {
+				return self.table_descriptor_get_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					None,
+				);
+			}
+		};
+		if !self.is_leader().await {
+			return self.table_descriptor_get_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+
+		let snapshot = self.state_machine.state_snapshot().await;
+		let Some(descriptor) = snapshot.table_schemas.latest_by_name(
+			request.tenant_id,
+			request.namespace.as_str(),
+			request.table_name.as_str(),
+		) else {
+			return self.table_descriptor_get_rejection(&frame, CONTROL_REASON_NOT_FOUND, None);
+		};
+		let descriptor_bytes = encode_table_schema_descriptor_v1(descriptor)?;
+		let descriptor_len = u32::try_from(descriptor_bytes.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"encoded table descriptor exceeds u32 wire length",
+			)
+		})?;
+		Self::observe_table_descriptor_get_reason(CONTROL_REASON_GRANTED);
+		self.build_table_descriptor_get_frame(
+			frame.header.stream_id,
+			TableDescriptorGetResponseMeta {
+				accepted: 1,
+				reason_code: CONTROL_REASON_GRANTED,
+				_pad1: [0; 6],
+				leader_hint: self.local_node,
+				descriptor_len,
+				_pad2: [0; 4],
+			},
+			Some(&descriptor_bytes),
+		)
 	}
 
 	async fn run_table_schema_drop(
@@ -2992,6 +3186,9 @@ impl ControlRingServer for WendelonControlServer {
 				self.authorize_control_operation(&context, ControlOperation::SchemaDrop)?;
 				self.handle_schema_drop(&context, frame).await?
 			}
+			MsgType::TABLE_DESCRIPTOR_GET_REQ => {
+				self.handle_table_descriptor_get(&context, frame).await?
+			}
 			MsgType::TENANT_ADMIN_REQ => self.handle_tenant_admin(&context, frame).await?,
 			_ => {
 				return Err(Error::new(
@@ -3516,10 +3713,13 @@ mod tests {
 	use super::*;
 	use crate::consensus::TieredSlab;
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
+	use crate::network::tls::{ActorIdentity, ActorRole, ActorTrustDomain};
 	use crate::network::transport::{TransportTier, TransportTierSet};
+	use crate::schema::table::{decode_descriptor_wire_name, encode_descriptor_wire_name};
 	use crate::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RetentionWindowMillis,
-		RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId,
+		RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableSchemaCatalogV1,
+		decode_table_schema_descriptor_v1, encode_table_schema_descriptor_v1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -3533,6 +3733,29 @@ mod tests {
 			logical: 0,
 			node_id: 7,
 		}
+	}
+
+	fn descriptor_for_get(
+		table_object_id: TableObjectId,
+		schema_generation: u64,
+		namespace: &str,
+		table_name: &str,
+	) -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("payload", DataType::Utf8, true),
+		]);
+		TableSchemaDescriptor::new(
+			table_object_id,
+			schema_generation,
+			namespace,
+			table_name,
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
 	}
 
 	fn membership(epoch: u64, node_ids: &[u32]) -> MembershipEpoch {
@@ -3551,6 +3774,229 @@ mod tests {
 			);
 		}
 		MembershipEpoch { epoch, peers }
+	}
+
+	#[test]
+	fn descriptor_get_leader_returns_latest_descriptor() {
+		let tenant_id = TenantId::new(7);
+		let table_object_id = TableObjectId::new([0x72; 16]);
+		let v1 = descriptor_for_get(table_object_id, 1, "analytics", "events");
+		let v2 = descriptor_for_get(table_object_id, 2, "analytics", "events");
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant_id, v1).unwrap();
+		catalog.upsert(tenant_id, v2.clone()).unwrap();
+
+		assert_eq!(
+			catalog.latest_by_name(tenant_id, "analytics", "events"),
+			Some(&v2)
+		);
+	}
+
+	#[test]
+	fn descriptor_get_returns_latest_not_historical_after_update() {
+		let tenant_id = TenantId::new(7);
+		let table_object_id = TableObjectId::new([0x73; 16]);
+		let old = descriptor_for_get(table_object_id, 1, "analytics", "events");
+		let latest = descriptor_for_get(table_object_id, 3, "analytics", "events");
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant_id, old.clone()).unwrap();
+		catalog.upsert(tenant_id, latest.clone()).unwrap();
+
+		let actual = catalog
+			.latest_by_name(tenant_id, "analytics", "events")
+			.unwrap();
+		assert_eq!(actual.schema_generation, 3);
+		assert_ne!(actual.schema_generation, old.schema_generation);
+	}
+
+	#[test]
+	fn descriptor_get_follower_returns_not_leader_with_hint() {
+		let leader = NodeId {
+			id: 9,
+			_reserved: 0,
+		};
+		let response = TableDescriptorGetResponseMeta {
+			accepted: 0,
+			reason_code: CONTROL_REASON_NOT_LEADER,
+			_pad1: [0; 6],
+			leader_hint: leader,
+			descriptor_len: 0,
+			_pad2: [0; 4],
+		};
+
+		assert_eq!(response.accepted, 0);
+		assert_eq!(response.reason_code, CONTROL_REASON_NOT_LEADER);
+		assert_eq!(response.leader_hint, leader);
+		assert_eq!(response.descriptor_len, 0);
+	}
+
+	#[test]
+	fn descriptor_get_missing_table_is_not_found() {
+		let tenant_id = TenantId::new(7);
+		let table_object_id = TableObjectId::new([0x74; 16]);
+		let descriptor = descriptor_for_get(table_object_id, 1, "analytics", "events");
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant_id, descriptor).unwrap();
+
+		assert!(
+			catalog
+				.latest_by_name(TenantId::new(8), "analytics", "events")
+				.is_none()
+		);
+		assert!(catalog.latest_by_name(tenant_id, "ops", "events").is_none());
+		assert!(
+			catalog
+				.latest_by_name(tenant_id, "analytics", "missing")
+				.is_none()
+		);
+
+		catalog
+			.unbind_latest_name(tenant_id, table_object_id, 1)
+			.unwrap();
+		assert!(
+			catalog
+				.latest_by_name(tenant_id, "analytics", "events")
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn descriptor_get_uses_descriptor_authorization_helper() {
+		let tenant_id = TenantId::new(7);
+		let unauthorized = ActorIdentity {
+			role: ActorRole::QuerySession,
+			trust_domain: ActorTrustDomain::Data,
+			cert_subject: None,
+			node_id: None,
+			tenant_id: Some("7".to_string()),
+			scopes: vec!["query_session".to_string()],
+			key_id: vec![1],
+			break_glass: false,
+		};
+		let authorized = ActorIdentity {
+			role: ActorRole::TenantAdmin,
+			trust_domain: ActorTrustDomain::Ops,
+			cert_subject: None,
+			node_id: None,
+			tenant_id: Some("7".to_string()),
+			scopes: Vec::new(),
+			key_id: vec![2],
+			break_glass: false,
+		};
+
+		assert!(
+			WendelonControlServer::authorize_descriptor_get_actor(&unauthorized, tenant_id)
+				.is_err()
+		);
+		assert!(
+			WendelonControlServer::authorize_descriptor_get_actor(&authorized, tenant_id).is_ok()
+		);
+	}
+
+	#[test]
+	fn descriptor_get_cross_tenant_claim_is_authorization_failed() {
+		let actor = ActorIdentity {
+			role: ActorRole::TenantAdmin,
+			trust_domain: ActorTrustDomain::Ops,
+			cert_subject: None,
+			node_id: None,
+			tenant_id: Some("7".to_string()),
+			scopes: Vec::new(),
+			key_id: vec![3],
+			break_glass: false,
+		};
+
+		let err = WendelonControlServer::authorize_descriptor_get_actor(&actor, TenantId::new(8))
+			.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+	}
+
+	#[test]
+	fn descriptor_get_cluster_actor_reads_any_tenant() {
+		let actor = ActorIdentity {
+			role: ActorRole::Operator,
+			trust_domain: ActorTrustDomain::Ops,
+			cert_subject: None,
+			node_id: None,
+			tenant_id: None,
+			scopes: Vec::new(),
+			key_id: vec![4],
+			break_glass: false,
+		};
+
+		assert!(
+			WendelonControlServer::authorize_descriptor_get_actor(&actor, TenantId::new(7)).is_ok()
+		);
+		assert!(
+			WendelonControlServer::authorize_descriptor_get_actor(&actor, TenantId::new(8)).is_ok()
+		);
+	}
+
+	#[test]
+	fn descriptor_get_overlong_or_invalid_name_is_rejected() {
+		let overlong = "a".repeat(129);
+		assert!(encode_descriptor_wire_name("namespace", &overlong).is_err());
+
+		let mut invalid_utf8 = [0u8; 128];
+		invalid_utf8[0] = 0xFF;
+		assert!(decode_descriptor_wire_name("namespace", &invalid_utf8).is_err());
+
+		let invalid_character = encode_descriptor_wire_name("table name", "bad/name");
+		assert!(invalid_character.is_err());
+	}
+
+	#[test]
+	fn descriptor_get_returns_catalog_descriptor_unchanged() {
+		let tenant_id = TenantId::new(7);
+		let descriptor =
+			descriptor_for_get(TableObjectId::new([0x75; 16]), 4, "analytics", "events");
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant_id, descriptor.clone()).unwrap();
+
+		let latest = catalog
+			.latest_by_name(tenant_id, "analytics", "events")
+			.unwrap();
+		let encoded = encode_table_schema_descriptor_v1(latest).unwrap();
+		let decoded = decode_table_schema_descriptor_v1(&encoded).unwrap();
+
+		assert_eq!(decoded, descriptor);
+		assert_eq!(decoded.table_object_id, descriptor.table_object_id);
+		assert_eq!(decoded.schema_generation, descriptor.schema_generation);
+		assert_eq!(
+			decoded.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+	}
+
+	#[test]
+	fn descriptor_get_metrics_count_aggregate_outcomes() {
+		let registry = crate::metrics::MetricsRegistry::default();
+		registry.control_descriptor_get_requests_total.inc();
+		registry.control_descriptor_get_success_total.inc();
+		registry.control_descriptor_get_not_found_total.inc();
+		registry.control_descriptor_get_not_leader_total.inc();
+		registry
+			.control_descriptor_get_authorization_failed_total
+			.inc();
+		registry.control_descriptor_get_invalid_request_total.inc();
+
+		let rendered = registry.render_prometheus();
+		for metric in [
+			"wendelon_control_descriptor_get_requests_total 1",
+			"wendelon_control_descriptor_get_success_total 1",
+			"wendelon_control_descriptor_get_not_found_total 1",
+			"wendelon_control_descriptor_get_not_leader_total 1",
+			"wendelon_control_descriptor_get_authorization_failed_total 1",
+			"wendelon_control_descriptor_get_invalid_request_total 1",
+		] {
+			assert!(rendered.contains(metric), "missing metric sample {metric}");
+		}
+		for line in rendered
+			.lines()
+			.filter(|line| line.contains("wendelon_control_descriptor_get"))
+		{
+			assert!(!line.contains('{'));
+		}
 	}
 
 	#[test]

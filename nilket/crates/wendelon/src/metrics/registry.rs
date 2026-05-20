@@ -2436,6 +2436,12 @@ pub struct MetricsRegistry {
 	pub data_ring_read_requests_total: Counter,
 	pub data_ring_query_requests_total: Counter,
 	pub data_ring_migrate_requests_total: Counter,
+	pub control_descriptor_get_requests_total: Counter,
+	pub control_descriptor_get_success_total: Counter,
+	pub control_descriptor_get_not_found_total: Counter,
+	pub control_descriptor_get_not_leader_total: Counter,
+	pub control_descriptor_get_authorization_failed_total: Counter,
+	pub control_descriptor_get_invalid_request_total: Counter,
 	data_ring_write_outcomes: WriteOutcomeCounters,
 	pub data_ring_lease_refresh_passes_total: Counter,
 	pub data_ring_lease_grants_total: Counter,
@@ -2694,6 +2700,12 @@ impl Default for MetricsRegistry {
 			data_ring_read_requests_total: Counter::default(),
 			data_ring_query_requests_total: Counter::default(),
 			data_ring_migrate_requests_total: Counter::default(),
+			control_descriptor_get_requests_total: Counter::default(),
+			control_descriptor_get_success_total: Counter::default(),
+			control_descriptor_get_not_found_total: Counter::default(),
+			control_descriptor_get_not_leader_total: Counter::default(),
+			control_descriptor_get_authorization_failed_total: Counter::default(),
+			control_descriptor_get_invalid_request_total: Counter::default(),
 			data_ring_write_outcomes: WriteOutcomeCounters::default(),
 			data_ring_lease_refresh_passes_total: Counter::default(),
 			data_ring_lease_grants_total: Counter::default(),
@@ -4230,6 +4242,42 @@ impl MetricsRegistry {
 			"wendelon_transport_active_stream_handlers",
 			"Inbound stream handler tasks currently admitted by the transport server.",
 			self.transport_active_stream_handlers.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_descriptor_get_requests_total",
+			"Control Ring table descriptor get requests handled.",
+			self.control_descriptor_get_requests_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_descriptor_get_success_total",
+			"Control Ring table descriptor get requests that returned a descriptor.",
+			self.control_descriptor_get_success_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_descriptor_get_not_found_total",
+			"Control Ring table descriptor get requests for absent table names.",
+			self.control_descriptor_get_not_found_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_descriptor_get_not_leader_total",
+			"Control Ring table descriptor get requests rejected by non-leaders.",
+			self.control_descriptor_get_not_leader_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_descriptor_get_authorization_failed_total",
+			"Control Ring table descriptor get requests rejected by authorization.",
+			self.control_descriptor_get_authorization_failed_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_descriptor_get_invalid_request_total",
+			"Control Ring table descriptor get requests rejected as malformed.",
+			self.control_descriptor_get_invalid_request_total.get(),
 		);
 		render_counter(
 			&mut out,

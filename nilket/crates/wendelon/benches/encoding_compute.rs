@@ -1381,8 +1381,10 @@ fn bench_fsst_row_safe_declined_paths(config: &BenchConfig, rows: usize) -> std:
 			string_atom(PredicateAtomOp::Eq, &target_literal),
 		),
 	];
-	let mut enabled_config = EncodingComputeConfig::default();
-	enabled_config.enabled = true;
+	let mut enabled_config = EncodingComputeConfig {
+		enabled: true,
+		..Default::default()
+	};
 	enabled_config
 		.enabled_predicate_evaluators
 		.insert(EncodingComputeEvaluatorKind::FsstRowSafe);
@@ -2105,8 +2107,10 @@ fn bench_fsst_declined_paths(config: &BenchConfig, rows: usize) -> std::io::Resu
 			string_atom(PredicateAtomOp::Eq, &target_literal),
 		),
 	];
-	let mut enabled_config = EncodingComputeConfig::default();
-	enabled_config.enabled = true;
+	let mut enabled_config = EncodingComputeConfig {
+		enabled: true,
+		..Default::default()
+	};
 	enabled_config
 		.enabled_predicate_evaluators
 		.insert(EncodingComputeEvaluatorKind::FsstWholeBuffer);
@@ -2445,8 +2449,10 @@ fn bench_config_kernel_disabled(config: &BenchConfig, fixture: &Fixture) -> std:
 	// config-set check inserted between the cascade-kind lookup and the
 	// dense path; the delta vs. classify_then_fallback bounds the
 	// kill-switch's incremental overhead.
-	let mut config_disabled = EncodingComputeConfig::default();
-	config_disabled.enabled = true;
+	let mut config_disabled = EncodingComputeConfig {
+		enabled: true,
+		..Default::default()
+	};
 	config_disabled
 		.enabled_predicate_evaluators
 		.remove(&EncodingComputeEvaluatorKind::BitPacked);
@@ -3017,7 +3023,7 @@ fn fsst_dense_string_compare(decoded: &[u8], offsets: &[i32], atom: &PredicateAt
 			match atom.op {
 				PredicateAtomOp::Eq => value == literal_values[0],
 				PredicateAtomOp::Neq => value != literal_values[0],
-				PredicateAtomOp::InList => literal_values.iter().any(|literal| value == *literal),
+				PredicateAtomOp::InList => literal_values.contains(&value),
 				PredicateAtomOp::Lt => value < literal_values[0],
 				PredicateAtomOp::Lte => value <= literal_values[0],
 				PredicateAtomOp::Gt => value > literal_values[0],
@@ -3636,7 +3642,7 @@ impl EncodedValidityNullShape {
 					.wrapping_add(0x9e37_79b9_7f4a_7c15);
 				(mixed >> 63) != 0
 			}
-			Self::AlternatingBit => row % 2 == 0,
+			Self::AlternatingBit => row.is_multiple_of(2),
 		}
 	}
 }

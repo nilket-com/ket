@@ -68,6 +68,22 @@ struct BenchRow {
 	table_object_id: Option<TableObjectId>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetentionBenchContext<'a> {
+	config: &'a BenchConfig,
+	tenant: TenantId,
+	catalog: &'a TableLifecycleCatalog,
+	cluster: MvccRetentionPolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RetentionBenchCase<'a> {
+	case: &'a str,
+	rows: usize,
+	density_percent: u8,
+	stored_rows: &'a [BenchRow],
+}
+
 #[derive(Clone, Debug, Default)]
 struct RetentionOutcome {
 	inspected_rows: usize,
@@ -117,6 +133,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let catalog = lifecycle_catalog(tenant, tables)?;
 	let cluster = MvccRetentionPolicy::FixedWindow(Duration::from_millis(CLUSTER_WINDOW_MS));
 	let layout = MultiRowLayoutDescriptor::new(512, 4096, 2 * 1024 * 1024)?;
+	let bench_context = RetentionBenchContext {
+		config: &config,
+		tenant,
+		catalog: &catalog,
+		cluster,
+	};
 
 	for rows in config.rows.iter().copied() {
 		bench_read_admission(&config, rows, tenant, tables, &catalog, cluster);
@@ -125,14 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 		let single = append_rows(tenant, &[tables.short], rows, 0, OwnershipMode::Known)?;
 		bench_l1_pruning(
-			&config,
-			"single-fixed",
-			rows,
-			0,
-			tenant,
-			&single,
-			&catalog,
-			cluster,
+			bench_context,
+			retention_bench_case("single-fixed", rows, 0, &single),
 		);
 		bench_digest_reverse(
 			&config,
@@ -153,17 +169,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			OwnershipMode::Known,
 		)?;
 		bench_l1_pruning(
-			&config, "disabled", rows, 0, tenant, &disabled, &catalog, cluster,
+			bench_context,
+			retention_bench_case("disabled", rows, 0, &disabled),
 		);
 		bench_l2_rewrite(
-			&config,
-			"disabled-retain-all",
-			rows,
-			0,
-			tenant,
-			&disabled,
-			&catalog,
-			cluster,
+			bench_context,
+			retention_bench_case("disabled-retain-all", rows, 0, &disabled),
 			layout,
 		)?;
 
@@ -176,14 +187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			OwnershipMode::Known,
 		)?;
 		bench_l2_rewrite(
-			&config,
-			"retire-all",
-			rows,
-			0,
-			tenant,
-			&retire_all,
-			&catalog,
-			cluster,
+			bench_context,
+			retention_bench_case("retire-all", rows, 0, &retire_all),
 			layout,
 		)?;
 
@@ -196,24 +201,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			OwnershipMode::AmbiguousEvery(1),
 		)?;
 		bench_l1_pruning(
-			&config,
-			"ambiguous-retain",
-			rows,
-			0,
-			tenant,
-			&ambiguous,
-			&catalog,
-			cluster,
+			bench_context,
+			retention_bench_case("ambiguous-retain", rows, 0, &ambiguous),
 		);
 		bench_l2_rewrite(
-			&config,
-			"ambiguous-retain-all",
-			rows,
-			0,
-			tenant,
-			&ambiguous,
-			&catalog,
-			cluster,
+			bench_context,
+			retention_bench_case("ambiguous-retain-all", rows, 0, &ambiguous),
 			layout,
 		)?;
 
@@ -226,17 +219,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				OwnershipMode::Known,
 			)?;
 			bench_l1_pruning(
-				&config, "mixed", rows, density, tenant, &mixed, &catalog, cluster,
+				bench_context,
+				retention_bench_case("mixed", rows, density, &mixed),
 			);
 			bench_l2_rewrite(
-				&config,
-				"mixed-partial",
-				rows,
-				density,
-				tenant,
-				&mixed,
-				&catalog,
-				cluster,
+				bench_context,
+				retention_bench_case("mixed-partial", rows, density, &mixed),
 				layout,
 			)?;
 			bench_digest_reverse(&config, "mixed", rows, tenant, &mixed, &catalog, cluster);
@@ -311,16 +299,33 @@ fn lifecycle_catalog(
 	Ok(catalog)
 }
 
-fn bench_l1_pruning(
-	config: &BenchConfig,
-	case: &str,
+fn retention_bench_case<'a>(
+	case: &'a str,
 	rows: usize,
 	density_percent: u8,
-	tenant: TenantId,
-	stored_rows: &[BenchRow],
-	catalog: &TableLifecycleCatalog,
-	cluster: MvccRetentionPolicy,
-) {
+	stored_rows: &'a [BenchRow],
+) -> RetentionBenchCase<'a> {
+	RetentionBenchCase {
+		case,
+		rows,
+		density_percent,
+		stored_rows,
+	}
+}
+
+fn bench_l1_pruning(context: RetentionBenchContext<'_>, input: RetentionBenchCase<'_>) {
+	let RetentionBenchContext {
+		config,
+		tenant,
+		catalog,
+		cluster,
+	} = context;
+	let RetentionBenchCase {
+		case,
+		rows,
+		density_percent,
+		stored_rows,
+	} = input;
 	for _ in 0..WARMUP_ITERS {
 		black_box(mark_append_retention(stored_rows, tenant, catalog, cluster));
 	}
@@ -358,16 +363,22 @@ fn bench_l1_pruning(
 }
 
 fn bench_l2_rewrite(
-	config: &BenchConfig,
-	case: &str,
-	rows: usize,
-	density_percent: u8,
-	tenant: TenantId,
-	stored_rows: &[BenchRow],
-	catalog: &TableLifecycleCatalog,
-	cluster: MvccRetentionPolicy,
+	context: RetentionBenchContext<'_>,
+	input: RetentionBenchCase<'_>,
 	layout: MultiRowLayoutDescriptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
+	let RetentionBenchContext {
+		config,
+		tenant,
+		catalog,
+		cluster,
+	} = context;
+	let RetentionBenchCase {
+		case,
+		rows,
+		density_percent,
+		stored_rows,
+	} = input;
 	let batch = user_batch(stored_rows.len())?;
 	for _ in 0..WARMUP_ITERS {
 		black_box(simulate_l2_rewrite(
@@ -447,7 +458,8 @@ fn simulate_l2_rewrite(
 	let survivors = stored_rows
 		.iter()
 		.zip(reclaim.iter())
-		.filter_map(|(row, reclaim)| (!*reclaim).then(|| source_row(*row)))
+		.filter(|(_, reclaim)| !**reclaim)
+		.map(|(row, _)| source_row(*row))
 		.collect::<Vec<_>>();
 	if survivors.is_empty() {
 		return Ok(RewriteOutcome {
@@ -818,13 +830,11 @@ fn classify_pairs(
 		outcome.survivor_rows = outcome.inspected_rows;
 		return outcome;
 	};
-	for (data_hlc, delete_hlc) in pairs {
+	for (_data_hlc, delete_hlc) in pairs {
 		if *delete_hlc < floor {
 			outcome.pair_drops += 1;
 			outcome.data_pruned += 1;
 			outcome.tombstone_pruned += 1;
-		} else if *data_hlc < floor {
-			outcome.survivor_rows += 2;
 		} else {
 			outcome.survivor_rows += 2;
 		}
@@ -1042,7 +1052,7 @@ fn table_for_ownership(
 ) -> Option<TableObjectId> {
 	match ownership {
 		OwnershipMode::Known => Some(table),
-		OwnershipMode::AmbiguousEvery(stride) if stride > 0 && row % stride == 0 => None,
+		OwnershipMode::AmbiguousEvery(stride) if stride > 0 && row.is_multiple_of(stride) => None,
 		OwnershipMode::AmbiguousEvery(_) => Some(table),
 	}
 }

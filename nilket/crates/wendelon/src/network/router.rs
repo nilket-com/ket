@@ -168,10 +168,18 @@ impl HrftService for MsgRouter {
 				Some(h) => h.handle_control_frame(context, frame).await,
 				None => Err(unhandled("Control Ring", msg_type)),
 			},
-			x if x == MsgType::REVOCATION_ADMIN_REQ.0 => match &self.control {
-				Some(h) => h.handle_control_frame(context, frame).await,
-				None => Err(unhandled("Control Ring", msg_type)),
-			},
+			x if x == MsgType::REVOCATION_ADMIN_REQ.0
+				|| x == MsgType::TABLE_DESCRIPTOR_GET_REQ.0 =>
+			{
+				match &self.control {
+					Some(h) => h.handle_control_frame(context, frame).await,
+					None => Err(unhandled("Control Ring", msg_type)),
+				}
+			}
+			x if x == MsgType::TABLE_DESCRIPTOR_GET_RESP.0 => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("unexpected response HRFT msg_type=0x{:02x}", msg_type),
+			)),
 			0x20..=0x2F => match &self.raft {
 				Some(h) => h.handle_raft_frame(context, frame).await,
 				None => Err(unhandled("Raft internal", msg_type)),

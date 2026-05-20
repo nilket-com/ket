@@ -17,7 +17,7 @@ fn row_key(byte: u8) -> Identity {
 #[test]
 fn cdc_cursor_ordering_orders_by_hlc_key_then_record_row_index() {
 	let base = hlc(10, 0, 1);
-	let mut cursors = vec![
+	let mut cursors = [
 		CdcCursor::new(base, row_key(7), RecordRowIndex::new(1)),
 		CdcCursor::new(hlc(9, 9, 9), row_key(255), RecordRowIndex::MAX),
 		CdcCursor::new(base, row_key(5), RecordRowIndex::new(9)),
