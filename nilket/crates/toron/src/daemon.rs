@@ -139,14 +139,13 @@ impl ToronDaemon {
 				message: OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC.to_string(),
 			});
 		}
-		let descriptor_pairs = match &config.catalog.descriptor_bootstrap_path {
+		let descriptor_triples = match &config.catalog.descriptor_bootstrap_path {
 			Some(path) => load_descriptor_bootstrap(path)?,
 			None => Vec::new(),
 		};
-		let descriptors_loaded = descriptor_pairs.len() as u64;
-		let registry = Arc::new(WendelonDescriptorRegistry::from_descriptors_for_tenant(
-			config.node.tenant_id,
-			descriptor_pairs,
+		let descriptors_loaded = descriptor_triples.len() as u64;
+		let registry = Arc::new(WendelonDescriptorRegistry::from_tenant_descriptors(
+			descriptor_triples,
 		)?);
 		tracing::info!("descriptor_registry_constructed");
 

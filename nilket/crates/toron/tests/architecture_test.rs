@@ -6202,12 +6202,13 @@ fn adr042_descriptor_bootstrap_is_product_type_with_table_ids() {
 	let config =
 		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
 
-	assert!(config.contains("pub struct ToronDescriptorBootstrap"));
-	assert!(config.contains("pub tables: Vec<ToronDescriptorBootstrapTable>"));
-	assert!(config.contains("pub struct ToronDescriptorBootstrapTable"));
+	assert!(config.contains("pub struct DescriptorBootstrap"));
+	assert!(config.contains("pub tables: Vec<DescriptorBootstrapEntry>"));
+	assert!(config.contains("pub struct DescriptorBootstrapEntry"));
+	assert!(config.contains("pub tenant_id: u64"));
 	assert!(config.contains("pub table_id: u64"));
 	assert!(config.contains("pub descriptor: wendelon_client::TableSchemaDescriptor"));
-	assert!(config.contains("Vec<(TableId, wendelon_client::TableSchemaDescriptor)>"));
+	assert!(config.contains("Vec<(TenantId, TableId, wendelon_client::TableSchemaDescriptor)>"));
 }
 
 #[test]
@@ -6217,6 +6218,8 @@ fn adr042_descriptor_bootstrap_has_no_v1_type_suffix() {
 
 	assert!(!config.contains("ToronDescriptorBootstrapV1"));
 	assert!(!config.contains("ToronDescriptorBootstrapTableV1"));
+	assert!(!config.contains("DescriptorBootstrapV1"));
+	assert!(!config.contains("DescriptorBootstrapEntryV1"));
 }
 
 #[test]
@@ -6231,7 +6234,7 @@ fn adr042_daemon_uses_single_descriptor_registry() {
 
 	assert_eq!(
 		startup
-			.matches("WendelonDescriptorRegistry::from_descriptors")
+			.matches("WendelonDescriptorRegistry::from_tenant_descriptors")
 			.count(),
 		1
 	);
@@ -8447,6 +8450,309 @@ fn adr050_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 }
 
 #[test]
+fn adr051_descriptor_bootstrap_entries_are_tenant_explicit() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(config.contains("pub struct DescriptorBootstrap"));
+	assert!(config.contains("pub struct DescriptorBootstrapEntry"));
+	assert!(config.contains("pub tenant_id: u64"));
+	assert!(config.contains("pub table_id: u64"));
+	assert!(config.contains("tenant_id: Option<u64>"));
+	assert!(config.contains("table_id: Option<u64>"));
+}
+
+#[test]
+fn adr051_descriptor_bootstrap_uses_brand_clean_names() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronDescriptorBootstrap",
+		"ToronDescriptorBootstrapTable",
+		"DescriptorBootstrapV1",
+		"DescriptorBootstrapEntryV1",
+	]);
+}
+
+#[test]
+fn adr051_descriptor_bootstrap_rejects_missing_tenant_and_table_id() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config test");
+
+	for required in [
+		"descriptor bootstrap tenant_id is required",
+		"descriptor bootstrap table_id is required",
+		"descriptor_bootstrap_requires_tenant_id",
+		"descriptor_bootstrap_requires_table_id",
+	] {
+		assert!(
+			config.contains(required) || config_test.contains(required),
+			"missing required-id guard token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr051_descriptor_bootstrap_rejects_zero_tenant_and_table_id() {
+	let source = [
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config"),
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog"),
+		std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+			.expect("read config test"),
+	]
+	.join("\n");
+
+	for required in [
+		"descriptor bootstrap tenant_id 0 is reserved",
+		"descriptor bootstrap table_id 0 is reserved",
+		"descriptor_bootstrap_rejects_zero_tenant",
+		"descriptor_bootstrap_rejects_zero_table_id",
+	] {
+		assert!(
+			source.contains(required),
+			"missing zero-id guard token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr051_descriptor_bootstrap_rejects_duplicate_table_id_within_tenant() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config test");
+
+	assert!(catalog.contains("duplicate descriptor bootstrap table_id {} for tenant {}"));
+	assert!(catalog.contains("state.by_id.contains_key(&(tenant_id, table_id))"));
+	assert!(config_test.contains("descriptor_bootstrap_rejects_duplicate_table_id_within_tenant"));
+}
+
+#[test]
+fn adr051_descriptor_bootstrap_rejects_duplicate_table_name_within_tenant() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config test");
+
+	assert!(catalog.contains("duplicate descriptor bootstrap table {} for tenant {}"));
+	assert!(catalog.contains("state.by_ref.contains_key(&(tenant_id, table_ref.clone()))"));
+	assert!(
+		config_test.contains("descriptor_bootstrap_rejects_duplicate_table_name_within_tenant")
+	);
+}
+
+#[test]
+fn adr051_descriptor_bootstrap_allows_duplicate_keys_across_tenants() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config test");
+
+	assert!(catalog.contains("by_id: HashMap<(TenantId, TableId), TableBinding>"));
+	assert!(catalog.contains("by_ref: HashMap<(TenantId, TableRef), TableId>"));
+	assert!(config_test.contains("descriptor_bootstrap_allows_same_table_id_across_tenants"));
+	assert!(config_test.contains("descriptor_bootstrap_allows_same_table_name_across_tenants"));
+	assert!(!catalog.contains("HashSet<(TenantId, TableObjectId)>"));
+}
+
+#[test]
+fn adr051_loader_returns_tenant_table_descriptor_triples() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(config.contains("pub fn load_descriptor_bootstrap"));
+	assert!(config.contains("Vec<(TenantId, TableId, wendelon_client::TableSchemaDescriptor)>"));
+	assert!(
+		config.contains(
+			"descriptors.push((TenantId(tenant_id), TableId(table_id), table.descriptor))"
+		)
+	);
+}
+
+#[test]
+fn adr051_daemon_uses_tenant_explicit_registry_constructor() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let startup = brace_blocks_after_marker(&daemon, "async fn start_with_client")
+		.into_iter()
+		.next()
+		.expect("ToronDaemon::start_with_client")
+		.1;
+
+	assert!(startup.contains("WendelonDescriptorRegistry::from_tenant_descriptors"));
+	assert!(startup.contains("descriptor_triples"));
+	assert!(!startup.contains("WendelonDescriptorRegistry::from_descriptors("));
+}
+
+#[test]
+fn adr051_daemon_bootstrap_does_not_default_to_node_tenant() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let startup = brace_blocks_after_marker(&daemon, "async fn start_with_client")
+		.into_iter()
+		.next()
+		.expect("ToronDaemon::start_with_client")
+		.1;
+
+	assert!(!startup.contains("from_descriptors_for_tenant"));
+	assert!(!startup.contains("from_tenant_descriptors(config.node.tenant_id"));
+	assert!(startup.contains("SqlTenantSource::LoopbackConfig(config.node.tenant_id)"));
+}
+
+#[test]
+fn adr051_registry_constructor_is_atomic_for_bootstrap() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let constructor = brace_blocks_after_marker(&catalog, "pub fn from_tenant_descriptors")
+		.into_iter()
+		.next()
+		.expect("from_tenant_descriptors")
+		.1;
+
+	assert!(constructor.contains("let registry = Self::default();"));
+	assert!(constructor.contains("Ok(registry)"));
+	assert!(constructor.contains("insert_wendelon_descriptor_locked("));
+	assert!(!constructor.contains("&self"));
+}
+
+#[test]
+fn adr051_descriptor_identity_fields_are_preserved() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config test");
+
+	assert!(config.contains("table.descriptor"));
+	assert!(catalog.contains("TableBinding::from_descriptor(table_id, &descriptor)?"));
+	assert!(config_test.contains("descriptor_bootstrap_preserves_physical_fingerprint"));
+	assert!(!config.contains("table_object_id ="));
+}
+
+#[test]
+fn adr051_no_sql_wire_or_tenant_source_changes() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let cli = std::fs::read_to_string(manifest_dir().join("src/cli.rs")).expect("read Toron CLI");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	assert!(!wire.contains("tenant_id"));
+	assert!(!wire.contains("TenantRoute"));
+	assert!(!wire.contains("Admin"));
+	assert!(!cli.contains("--tenant"));
+	assert!(daemon.contains("SqlTenantSource::AuthenticatedPeer"));
+	assert!(daemon.contains("SqlTenantSource::LoopbackConfig(config.node.tenant_id)"));
+}
+
+#[test]
+fn adr051_no_live_descriptor_sync_or_reload() {
+	let source = [
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon"),
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config"),
+	]
+	.join("\n");
+
+	for forbidden in [
+		"list_descriptors",
+		"refresh_descriptor",
+		"watch_descriptor",
+		"reload_descriptor",
+		"descriptor_reload",
+		"SqlMessage::Admin",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 051 must stay startup-only; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr051_no_per_tenant_metric_labels() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	assert!(observability.contains("descriptors_loaded"));
+	assert!(!observability.contains("tenant_id"));
+	assert!(!observability.contains("tenant=\""));
+	assert!(!observability.contains("tenant_id=\\\"{}\\\""));
+}
+
+#[test]
+fn adr051_no_wendelon_production_changes() {
+	let wendelon_source = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"DescriptorBootstrap",
+		"load_descriptor_bootstrap",
+		"from_tenant_descriptors",
+		"SqlTenantSource",
+	] {
+		assert!(
+			!wendelon_source.contains(forbidden),
+			"Wendelon source contains Toron ADR 051 token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr051_prior_adr04x_and_adr050_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr040_", "adr041_", "adr042_", "adr043_", "adr044_", "adr045_", "adr046_", "adr047_",
+		"adr048_", "adr049_", "adr050_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr051_nilket_root_remains_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr051_fixture_worker_source_unchanged() {
+	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker source");
+
+	assert!(!fixture.contains("DescriptorBootstrap"));
+	assert!(!fixture.contains("load_descriptor_bootstrap"));
+	assert!(!fixture.contains("tenant_id"));
+}
+
+#[test]
+fn adr051_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronDescriptorBootstrap",
+		"ToronDescriptorBootstrapTable",
+		"DescriptorBootstrapV1",
+		"DescriptorBootstrapEntryV1",
+		"TenantDescriptorBootstrapV1",
+	]);
+}
+
+#[test]
 fn adr046_inspect_uses_hand_rolled_http_no_http_crate_no_hyper_no_reqwest() {
 	let cargo =
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Cargo.toml");
@@ -8726,7 +9032,7 @@ fn adr043_daemon_uses_single_descriptor_registry_for_sql() {
 
 	assert_eq!(
 		startup
-			.matches("WendelonDescriptorRegistry::from_descriptors")
+			.matches("WendelonDescriptorRegistry::from_tenant_descriptors")
 			.count(),
 		1
 	);

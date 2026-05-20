@@ -13,10 +13,10 @@ use rcgen::{
 	KeyUsagePurpose,
 };
 use toron::config::{
-	CoordinatorConfig, ObservabilityConfig, SqlConfig, SqlTransport, TlsConfig,
-	ToronBootstrapConfig, ToronCatalogConfig, ToronDescriptorBootstrap,
-	ToronDescriptorBootstrapTable, ToronNodeConfig, ToronStorageConfig, ToronWendelonBootstrapPeer,
-	ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
+	CoordinatorConfig, DescriptorBootstrap, DescriptorBootstrapEntry, ObservabilityConfig,
+	SqlConfig, SqlTransport, TlsConfig, ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig,
+	ToronStorageConfig, ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig,
+	TracingFormat,
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::budget::{ByteCount, TenantBudget, TenantBudgetPolicy};
@@ -134,7 +134,7 @@ async fn toron_sql_select_executes_over_authenticated_remote_listener() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sql_client_tenant_7_observed_in_execution_context() {
+async fn tenant_7_sql_resolves_tenant_7_bootstrapped_descriptor() {
 	let fixture = LiveWendelonFixture::start(46).await;
 	let tenant = WendelonTenantId::new(7);
 	create_live_tenant(&fixture.node, tenant).await;
@@ -144,7 +144,12 @@ async fn sql_client_tenant_7_observed_in_execution_context() {
 
 	let worker_id = WorkerId::from_u128(46);
 	let pki = TestPki::generate(worker_id, "7");
-	let mut config = toron_config_with_descriptor_tls(descriptor.clone(), worker_id, &pki);
+	let mut config = toron_config_with_descriptor_tls_for_tenant(
+		descriptor.clone(),
+		ToronTenantId(7),
+		worker_id,
+		&pki,
+	);
 	config.node.tenant_id = ToronTenantId(7);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -170,7 +175,48 @@ async fn sql_client_tenant_7_observed_in_execution_context() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sql_client_tenant_8_observed_proves_not_daemon_static() {
+async fn tenant_8_sql_resolves_tenant_8_bootstrapped_descriptor() {
+	let fixture = LiveWendelonFixture::start(49).await;
+	let tenant = WendelonTenantId::new(8);
+	create_live_tenant(&fixture.node, tenant).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, tenant, &descriptor).await;
+	write_rows(&fixture.client, tenant, &descriptor, batch()).await;
+
+	let worker_id = WorkerId::from_u128(49);
+	let pki = TestPki::generate(worker_id, "8");
+	let mut config = toron_config_with_descriptor_tls_for_tenant(
+		descriptor.clone(),
+		ToronTenantId(8),
+		worker_id,
+		&pki,
+	);
+	config.node.tenant_id = ToronTenantId(7);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = connectable_loopback_addr(daemon.handle().sql_endpoint.expect("sql endpoint"));
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = execute_sql_authenticated(
+		endpoint,
+		&server_name,
+		&pki.client_cert,
+		&pki.client_key,
+		&pki.ca_cert,
+		"SELECT id, amount, region FROM storage_execution WHERE amount > 100",
+	)
+	.await
+	.expect("tenant 8 SQL select response over mTLS");
+	assert_eq!(response.complete.row_count, 2);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tenant_8_cannot_resolve_tenant_7_only_bootstrapped_descriptor() {
 	let fixture = LiveWendelonFixture::start(47).await;
 	let tenant = WendelonTenantId::new(7);
 	create_live_tenant(&fixture.node, tenant).await;
@@ -180,7 +226,8 @@ async fn sql_client_tenant_8_observed_proves_not_daemon_static() {
 
 	let worker_id = WorkerId::from_u128(47);
 	let pki = TestPki::generate(worker_id, "8");
-	let mut config = toron_config_with_descriptor_tls(descriptor, worker_id, &pki);
+	let mut config =
+		toron_config_with_descriptor_tls_for_tenant(descriptor, ToronTenantId(7), worker_id, &pki);
 	config.node.tenant_id = ToronTenantId(7);
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
@@ -204,6 +251,36 @@ async fn sql_client_tenant_8_observed_proves_not_daemon_static() {
 		error.message.contains("storage_execution") || error.message.contains("TableId"),
 		"{error:?}"
 	);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_sql_uses_config_tenant_for_bootstrapped_descriptor() {
+	let fixture = LiveWendelonFixture::start(50).await;
+	let tenant = WendelonTenantId::new(7);
+	create_live_tenant(&fixture.node, tenant).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, tenant, &descriptor).await;
+	write_rows(&fixture.client, tenant, &descriptor, batch()).await;
+
+	let mut config = toron_config_with_descriptor_for_tenant(descriptor, ToronTenantId(7), true);
+	config.node.tenant_id = ToronTenantId(7);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	let response = execute_sql(
+		endpoint,
+		"SELECT id, amount, region FROM storage_execution WHERE amount > 100",
+	)
+	.await
+	.expect("loopback tenant 7 SQL select response");
+
+	assert_eq!(response.complete.row_count, 2);
 
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();
@@ -474,7 +551,16 @@ fn toron_config_with_descriptor_tls(
 	worker_id: WorkerId,
 	pki: &TestPki,
 ) -> ToronBootstrapConfig {
-	let mut config = toron_config_with_descriptor(descriptor, true);
+	toron_config_with_descriptor_tls_for_tenant(descriptor, ToronTenantId(1), worker_id, pki)
+}
+
+fn toron_config_with_descriptor_tls_for_tenant(
+	descriptor: TableSchemaDescriptor,
+	bootstrap_tenant: ToronTenantId,
+	worker_id: WorkerId,
+	pki: &TestPki,
+) -> ToronBootstrapConfig {
+	let mut config = toron_config_with_descriptor_for_tenant(descriptor, bootstrap_tenant, true);
 	config.node.worker_id = worker_id;
 	config.sql.as_mut().expect("sql config").listener_bind = "0.0.0.0:0".parse().expect("sql bind");
 	config.tls = Some(TlsConfig {
@@ -490,7 +576,15 @@ fn toron_config_with_descriptor(
 	descriptor: TableSchemaDescriptor,
 	include_self_worker: bool,
 ) -> ToronBootstrapConfig {
-	let descriptor_path = write_descriptor_bootstrap(descriptor);
+	toron_config_with_descriptor_for_tenant(descriptor, ToronTenantId(1), include_self_worker)
+}
+
+fn toron_config_with_descriptor_for_tenant(
+	descriptor: TableSchemaDescriptor,
+	bootstrap_tenant: ToronTenantId,
+	include_self_worker: bool,
+) -> ToronBootstrapConfig {
+	let descriptor_path = write_descriptor_bootstrap_for_tenant(bootstrap_tenant, descriptor);
 	ToronBootstrapConfig {
 		node: ToronNodeConfig {
 			worker_id: WorkerId::new(),
@@ -571,11 +665,15 @@ fn connectable_loopback_addr(addr: SocketAddr) -> SocketAddr {
 	SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
 }
 
-fn write_descriptor_bootstrap(descriptor: TableSchemaDescriptor) -> PathBuf {
+fn write_descriptor_bootstrap_for_tenant(
+	tenant_id: ToronTenantId,
+	descriptor: TableSchemaDescriptor,
+) -> PathBuf {
 	let dir = fresh_dir("descriptor-bootstrap");
 	let path = dir.join("descriptors.json");
-	let bootstrap = ToronDescriptorBootstrap {
-		tables: vec![ToronDescriptorBootstrapTable {
+	let bootstrap = DescriptorBootstrap {
+		tables: vec![DescriptorBootstrapEntry {
+			tenant_id: tenant_id.0,
 			table_id: 1,
 			descriptor,
 		}],

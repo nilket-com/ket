@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow::datatypes::{DataType, Field, Schema};
 use toron::catalog::{TableRef, WendelonDescriptorRegistry};
 use toron::config::{
-	ToronDescriptorBootstrap, ToronDescriptorBootstrapTable, load_descriptor_bootstrap,
+	DescriptorBootstrap, DescriptorBootstrapEntry, load_descriptor_bootstrap,
 	load_toron_bootstrap_config, render_example_config,
 };
 use toron::distributed::budget::{ByteCount, QueryBudget};
@@ -46,15 +46,24 @@ cluster_domain = "cluster.local"
 }
 
 fn descriptor() -> TableSchemaDescriptor {
+	descriptor_with_identity(0x42, 1, "config_test", "sales")
+}
+
+fn descriptor_with_identity(
+	object_byte: u8,
+	generation: u64,
+	namespace: &str,
+	table_name: &str,
+) -> TableSchemaDescriptor {
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("amount", DataType::Int32, true),
 	]);
 	TableSchemaDescriptor::new(
-		TableObjectId::new([0x42; 16]),
-		1,
-		"config_test",
-		"sales",
+		TableObjectId::new([object_byte; 16]),
+		generation,
+		namespace,
+		table_name,
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 		LocalityPolicy::default_table_spread(),
@@ -343,46 +352,329 @@ fn toron_tls_paths_reject_env_interpolation() {
 }
 
 #[test]
-fn toron_descriptor_bootstrap_requires_table_ids() {
-	let dir = fresh_dir("descriptor-table-id");
-	let path = dir.join("descriptors.json");
-	let missing_table_id = serde_json::json!({
-		"tables": [
-			{ "descriptor": descriptor() }
-		]
-	});
-	std::fs::write(
-		&path,
-		serde_json::to_string_pretty(&missing_table_id).unwrap(),
-	)
-	.expect("write descriptor bootstrap");
+fn descriptor_bootstrap_requires_tenant_id() {
+	let path = write_descriptor_bootstrap_json(
+		"descriptor-missing-tenant-id",
+		serde_json::json!({
+			"tables": [
+				{ "table_id": 7, "descriptor": descriptor() }
+			]
+		}),
+	);
 
-	let error = load_descriptor_bootstrap(&path).expect_err("missing table_id must fail");
+	let error = load_descriptor_bootstrap(&path).expect_err("missing tenant_id must fail");
 
-	assert!(error.to_string().contains("missing field `table_id`"));
+	assert!(
+		error
+			.to_string()
+			.contains("descriptor bootstrap tenant_id is required"),
+		"{error}"
+	);
 }
 
 #[test]
-fn toron_descriptor_bootstrap_loads_registry() {
-	let dir = fresh_dir("descriptor-registry");
-	let path = dir.join("descriptors.json");
-	let bootstrap = ToronDescriptorBootstrap {
-		tables: vec![ToronDescriptorBootstrapTable {
-			table_id: 7,
+fn descriptor_bootstrap_requires_table_id() {
+	let path = write_descriptor_bootstrap_json(
+		"descriptor-missing-table-id",
+		serde_json::json!({
+			"tables": [
+				{ "tenant_id": 7, "descriptor": descriptor() }
+			]
+		}),
+	);
+
+	let error = load_descriptor_bootstrap(&path).expect_err("missing table_id must fail");
+
+	assert!(
+		error
+			.to_string()
+			.contains("descriptor bootstrap table_id is required"),
+		"{error}"
+	);
+}
+
+#[test]
+fn descriptor_bootstrap_rejects_zero_tenant() {
+	let path = write_descriptor_bootstrap_json(
+		"descriptor-zero-tenant-id",
+		serde_json::json!({
+			"tables": [
+				{ "tenant_id": 0, "table_id": 7, "descriptor": descriptor() }
+			]
+		}),
+	);
+
+	let error = load_descriptor_bootstrap(&path).expect_err("zero tenant_id must fail");
+
+	assert!(
+		error
+			.to_string()
+			.contains("descriptor bootstrap tenant_id 0 is reserved"),
+		"{error}"
+	);
+}
+
+#[test]
+fn descriptor_bootstrap_rejects_zero_table_id() {
+	let path = write_descriptor_bootstrap_json(
+		"descriptor-zero-table-id",
+		serde_json::json!({
+			"tables": [
+				{ "tenant_id": 7, "table_id": 0, "descriptor": descriptor() }
+			]
+		}),
+	);
+
+	let error = load_descriptor_bootstrap(&path).expect_err("zero table_id must fail");
+
+	assert!(
+		error
+			.to_string()
+			.contains("descriptor bootstrap table_id 0 is reserved"),
+		"{error}"
+	);
+}
+
+#[test]
+fn descriptor_bootstrap_rejects_duplicate_table_id_within_tenant() {
+	let first = descriptor_with_identity(0xA1, 1, "config_test", "sales");
+	let second = descriptor_with_identity(0xA2, 1, "config_test", "refunds");
+	let error = registry_from_entries(vec![
+		DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 11,
+			descriptor: first,
+		},
+		DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 11,
+			descriptor: second,
+		},
+	])
+	.err()
+	.expect("duplicate table_id must fail");
+
+	assert!(
+		error
+			.to_string()
+			.contains("duplicate descriptor bootstrap table_id 11 for tenant 7"),
+		"{error}"
+	);
+}
+
+#[test]
+fn descriptor_bootstrap_rejects_duplicate_table_name_within_tenant() {
+	let first = descriptor_with_identity(0xB1, 1, "config_test", "sales");
+	let second = descriptor_with_identity(0xB2, 2, "config_test", "sales");
+	let error = registry_from_entries(vec![
+		DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 11,
+			descriptor: first,
+		},
+		DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 12,
+			descriptor: second,
+		},
+	])
+	.err()
+	.expect("duplicate table name must fail");
+
+	assert!(
+		error
+			.to_string()
+			.contains("duplicate descriptor bootstrap table config_test.sales for tenant 7"),
+		"{error}"
+	);
+}
+
+#[test]
+fn descriptor_bootstrap_allows_same_table_id_across_tenants() {
+	let registry = registry_from_entries(vec![
+		DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 11,
+			descriptor: descriptor_with_identity(0xC7, 1, "config_test", "sales"),
+		},
+		DescriptorBootstrapEntry {
+			tenant_id: 8,
+			table_id: 11,
+			descriptor: descriptor_with_identity(0xC8, 1, "config_test", "refunds"),
+		},
+	])
+	.expect("same table_id across tenants");
+
+	assert!(
+		registry
+			.resolve_table(TenantId(7), &TableRef::with_schema("config_test", "sales"))
+			.is_ok()
+	);
+	assert!(
+		registry
+			.resolve_table(
+				TenantId(8),
+				&TableRef::with_schema("config_test", "refunds")
+			)
+			.is_ok()
+	);
+}
+
+#[test]
+fn descriptor_bootstrap_allows_same_table_name_across_tenants() {
+	let registry = registry_from_entries(vec![
+		DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 11,
+			descriptor: descriptor_with_identity(0xD7, 1, "config_test", "sales"),
+		},
+		DescriptorBootstrapEntry {
+			tenant_id: 8,
+			table_id: 12,
+			descriptor: descriptor_with_identity(0xD8, 1, "config_test", "sales"),
+		},
+	])
+	.expect("same table name across tenants");
+
+	assert!(
+		registry
+			.resolve_table(TenantId(7), &TableRef::with_schema("config_test", "sales"))
+			.is_ok()
+	);
+	assert!(
+		registry
+			.resolve_table(TenantId(8), &TableRef::with_schema("config_test", "sales"))
+			.is_ok()
+	);
+}
+
+#[test]
+fn descriptor_bootstrap_loads_two_tenants_into_one_registry() {
+	let tenant_7_descriptor = descriptor_with_identity(0xE7, 7, "config_test", "sales");
+	let tenant_8_descriptor = descriptor_with_identity(0xE8, 8, "config_test", "sales");
+	let registry = registry_from_entries(vec![
+		DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 1,
+			descriptor: tenant_7_descriptor.clone(),
+		},
+		DescriptorBootstrapEntry {
+			tenant_id: 8,
+			table_id: 1,
+			descriptor: tenant_8_descriptor.clone(),
+		},
+	])
+	.expect("two-tenant descriptor registry");
+
+	let tenant_7 = registry
+		.resolve_table(TenantId(7), &TableRef::with_schema("config_test", "sales"))
+		.expect("tenant 7 table");
+	let tenant_8 = registry
+		.resolve_table(TenantId(8), &TableRef::with_schema("config_test", "sales"))
+		.expect("tenant 8 table");
+	assert_eq!(tenant_7.table, tenant_7_descriptor.table_object_id);
+	assert_eq!(tenant_8.table, tenant_8_descriptor.table_object_id);
+}
+
+#[test]
+fn descriptor_bootstrap_preserves_physical_fingerprint() {
+	let descriptor = descriptor_with_identity(0xF7, 7, "config_test", "sales");
+	let registry = registry_from_entries(vec![DescriptorBootstrapEntry {
+		tenant_id: 7,
+		table_id: 9,
+		descriptor: descriptor.clone(),
+	}])
+	.expect("descriptor registry");
+
+	let binding = registry
+		.resolve_table(TenantId(7), &TableRef::with_schema("config_test", "sales"))
+		.expect("resolve descriptor");
+
+	assert_eq!(binding.legacy_table_id, TableId(9));
+	assert_eq!(binding.table, descriptor.table_object_id);
+	assert_eq!(
+		binding.fingerprint,
+		descriptor.physical_descriptor_fingerprint
+	);
+}
+
+#[test]
+fn old_single_tenant_descriptor_bootstrap_shape_is_rejected() {
+	let path = write_descriptor_bootstrap_json(
+		"descriptor-old-single-tenant-shape",
+		serde_json::json!({
+			"tables": [
+				{ "table_id": 7, "descriptor": descriptor() }
+			]
+		}),
+	);
+
+	let error = load_descriptor_bootstrap(&path).expect_err("old shape must fail");
+
+	assert!(
+		error
+			.to_string()
+			.contains("descriptor bootstrap tenant_id is required"),
+		"{error}"
+	);
+}
+
+#[test]
+fn descriptor_bootstrap_json_example_round_trips() {
+	let bootstrap = DescriptorBootstrap {
+		tables: vec![DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 1,
 			descriptor: descriptor(),
 		}],
 	};
-	std::fs::write(&path, serde_json::to_string_pretty(&bootstrap).unwrap())
-		.expect("write descriptor bootstrap");
 
+	let encoded = serde_json::to_string_pretty(&bootstrap).expect("encode bootstrap");
+	let decoded: DescriptorBootstrap = serde_json::from_str(&encoded).expect("decode bootstrap");
+
+	assert_eq!(decoded.tables.len(), 1);
+	assert_eq!(decoded.tables[0].tenant_id, 7);
+	assert_eq!(decoded.tables[0].table_id, 1);
+}
+
+#[test]
+fn same_table_object_id_across_different_tenants_is_allowed() {
+	let tenant_7 = descriptor_with_identity(0xAA, 7, "config_test", "sales");
+	let tenant_8 = descriptor_with_identity(0xAA, 8, "config_test", "sales");
+	let registry = registry_from_entries(vec![
+		DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 1,
+			descriptor: tenant_7,
+		},
+		DescriptorBootstrapEntry {
+			tenant_id: 8,
+			table_id: 1,
+			descriptor: tenant_8,
+		},
+	])
+	.expect("same object id across tenants");
+
+	assert!(registry.descriptor(TenantId(7), TableId(1)).is_ok());
+	assert!(registry.descriptor(TenantId(8), TableId(1)).is_ok());
+}
+
+fn registry_from_entries(
+	entries: Vec<DescriptorBootstrapEntry>,
+) -> Result<WendelonDescriptorRegistry, toron::error::CatalogError> {
+	let path = write_descriptor_bootstrap_json(
+		"descriptor-registry",
+		serde_json::to_value(DescriptorBootstrap { tables: entries })
+			.expect("serialize descriptor bootstrap"),
+	);
 	let descriptors = load_descriptor_bootstrap(&path).expect("load descriptor bootstrap");
-	assert_eq!(descriptors.len(), 1);
-	assert_eq!(descriptors[0].0, TableId(7));
+	WendelonDescriptorRegistry::from_tenant_descriptors(descriptors)
+}
 
-	let registry =
-		WendelonDescriptorRegistry::from_descriptors(descriptors).expect("descriptor registry");
-	let binding = registry
-		.resolve_table(TenantId(1), &TableRef::with_schema("config_test", "sales"))
-		.expect("resolve descriptor");
-	assert_eq!(binding.legacy_table_id, TableId(7));
+fn write_descriptor_bootstrap_json(tag: &str, value: serde_json::Value) -> PathBuf {
+	let dir = fresh_dir(tag);
+	let path = dir.join("descriptors.json");
+	std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap())
+		.expect("write descriptor bootstrap");
+	path
 }

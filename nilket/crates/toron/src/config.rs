@@ -228,14 +228,27 @@ pub struct ObservabilityListeners {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronDescriptorBootstrap {
-	pub tables: Vec<ToronDescriptorBootstrapTable>,
+pub struct DescriptorBootstrap {
+	pub tables: Vec<DescriptorBootstrapEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToronDescriptorBootstrapTable {
+pub struct DescriptorBootstrapEntry {
+	pub tenant_id: u64,
 	pub table_id: u64,
 	pub descriptor: wendelon_client::TableSchemaDescriptor,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDescriptorBootstrap {
+	tables: Vec<RawDescriptorBootstrapEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDescriptorBootstrapEntry {
+	tenant_id: Option<u64>,
+	table_id: Option<u64>,
+	descriptor: wendelon_client::TableSchemaDescriptor,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,22 +450,23 @@ pub fn write_example_config(path: impl AsRef<Path>) -> Result<(), ToronConfigErr
 
 pub fn load_descriptor_bootstrap(
 	path: impl AsRef<Path>,
-) -> Result<Vec<(TableId, wendelon_client::TableSchemaDescriptor)>, ToronConfigError> {
-	let bootstrap: ToronDescriptorBootstrap =
-		serde_json::from_str(&std::fs::read_to_string(path)?)?;
-	let mut seen = HashSet::new();
+) -> Result<Vec<(TenantId, TableId, wendelon_client::TableSchemaDescriptor)>, ToronConfigError> {
+	let bootstrap: RawDescriptorBootstrap = serde_json::from_str(&std::fs::read_to_string(path)?)?;
 	let mut descriptors = Vec::with_capacity(bootstrap.tables.len());
 	for table in bootstrap.tables {
-		if table.table_id == 0 {
+		let tenant_id = table
+			.tenant_id
+			.ok_or_else(|| invalid("descriptor bootstrap tenant_id is required"))?;
+		if tenant_id == 0 {
+			return Err(invalid("descriptor bootstrap tenant_id 0 is reserved"));
+		}
+		let table_id = table
+			.table_id
+			.ok_or_else(|| invalid("descriptor bootstrap table_id is required"))?;
+		if table_id == 0 {
 			return Err(invalid("descriptor bootstrap table_id 0 is reserved"));
 		}
-		if !seen.insert(table.table_id) {
-			return Err(invalid(format!(
-				"duplicate descriptor bootstrap table_id {}",
-				table.table_id
-			)));
-		}
-		descriptors.push((TableId(table.table_id), table.descriptor));
+		descriptors.push((TenantId(tenant_id), TableId(table_id), table.descriptor));
 	}
 	Ok(descriptors)
 }

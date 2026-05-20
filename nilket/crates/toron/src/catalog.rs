@@ -429,6 +429,60 @@ impl WendelonDescriptorRegistry {
 		Ok(registry)
 	}
 
+	pub fn from_tenant_descriptors(
+		descriptors: impl IntoIterator<
+			Item = (TenantId, TableId, wendelon_client::TableSchemaDescriptor),
+		>,
+	) -> Result<Self, CatalogError> {
+		let registry = Self::default();
+		for (tenant_id, table_id, descriptor) in descriptors {
+			if tenant_id.0 == 0 {
+				return Err(CatalogError::AdminFailed {
+					message: "descriptor bootstrap tenant_id 0 is reserved".to_string(),
+				});
+			}
+			if table_id.0 == 0 {
+				return Err(CatalogError::AdminFailed {
+					message: "descriptor bootstrap table_id 0 is reserved".to_string(),
+				});
+			}
+			let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
+			let unqualified_ref = TableRef::new(&descriptor.table_name);
+			let binding = TableBinding::from_descriptor(table_id, &descriptor)?;
+			let mut state = registry
+				.inner
+				.write()
+				.expect("WendelonDescriptorRegistry lock poisoned");
+			if state.by_id.contains_key(&(tenant_id, table_id)) {
+				return Err(CatalogError::AdminFailed {
+					message: format!(
+						"duplicate descriptor bootstrap table_id {} for tenant {}",
+						table_id.0, tenant_id.0
+					),
+				});
+			}
+			if state.by_ref.contains_key(&(tenant_id, table_ref.clone())) {
+				return Err(CatalogError::AdminFailed {
+					message: format!(
+						"duplicate descriptor bootstrap table {} for tenant {}",
+						table_name(&table_ref),
+						tenant_id.0
+					),
+				});
+			}
+			insert_wendelon_descriptor_locked(
+				&mut state,
+				tenant_id,
+				table_ref,
+				Some(unqualified_ref),
+				table_id,
+				binding,
+				descriptor,
+			)?;
+		}
+		Ok(registry)
+	}
+
 	pub fn register_descriptor_for_tenant(
 		&self,
 		tenant_id: TenantId,
