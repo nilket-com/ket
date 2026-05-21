@@ -445,6 +445,14 @@ where
 					.increment(rejection.tenant_id, AdmissionResource::Concurrency);
 				concurrency_rejection_query_error(rejection)
 			}
+			TenantAdmissionRejection::RateLimited { tenant_id } => {
+				self.admission_rejections
+					.increment(tenant_id, AdmissionResource::Rate);
+				resource_exhausted_query_error(format!(
+					"tenant query rate limit exhausted for tenant {}",
+					tenant_id.0
+				))
+			}
 			TenantAdmissionRejection::QueueDisabled { tenant_id } => {
 				resource_exhausted_query_error(format!(
 					"tenant admission queue disabled for tenant {}",
@@ -1288,6 +1296,81 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn rate_flood_of_cheap_queries_rejects_without_concurrency_saturation() {
+		let coordinator = distributed_coordinator_with_policy(rate_policy(1, 1));
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let admitted = coordinator
+			.admit_query(&context)
+			.await
+			.expect("first cheap query admitted");
+		drop(admitted);
+
+		let err = coordinator
+			.execute_query_with_context(&count_plan(), context)
+			.await
+			.expect_err("second cheap query hits rate gate");
+
+		assert_rate_limited(err, TenantId(7));
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
+	}
+
+	#[tokio::test]
+	async fn token_consumed_on_pass_not_refunded_on_bind_error() {
+		let coordinator = distributed_coordinator_with_policy(rate_policy(1, 1));
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+
+		let first = coordinator
+			.execute_query_with_context(&named_scan_plan(), context.clone())
+			.await
+			.expect_err("first query consumes rate then fails bind");
+		assert!(matches!(first, QueryError::Binding(_)));
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+
+		let second = coordinator
+			.execute_query_with_context(&named_scan_plan(), context)
+			.await
+			.expect_err("rate token was not refunded after bind error");
+
+		assert_rate_limited(second, TenantId(7));
+	}
+
+	#[tokio::test]
+	async fn token_consumed_on_pass_not_refunded_on_execution_error() {
+		let coordinator = distributed_coordinator_with_policy(rate_policy(1, 1));
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+
+		let first = coordinator
+			.execute_query_with_context(&count_plan(), context.clone())
+			.await
+			.expect_err("first query consumes rate then fails execution");
+		assert!(!is_rate_limited(&first));
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+
+		let second = coordinator
+			.execute_query_with_context(&count_plan(), context)
+			.await
+			.expect_err("rate token was not refunded after execution error");
+
+		assert_rate_limited(second, TenantId(7));
+	}
+
+	#[tokio::test]
 	async fn adr054_evolved_retry_stays_inside_one_admission_reservation() {
 		let attempts = Arc::new(AtomicUsize::new(0));
 		let coordinator = DistributedQueryCoordinator::new(
@@ -1308,7 +1391,7 @@ mod tests {
 			PlannerConfig::default(),
 			QueryBudget::test_default(),
 		)
-		.with_tenant_budget_policy(tenant_policy())
+		.with_tenant_budget_policy(rate_policy(1, 1))
 		.with_admission_policy(Some(coordinator_admission_policy()));
 		let context = ExecutionContext::new(
 			SessionId(1),
@@ -1327,6 +1410,54 @@ mod tests {
 		assert_eq!(results[0].num_rows(), 3);
 		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
 		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+	}
+
+	#[tokio::test]
+	async fn reads_and_writes_each_spend_one_top_level_token() {
+		let read_coordinator = distributed_coordinator_with_policy(rate_policy(1, 1));
+		let read_context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let read = read_coordinator
+			.execute_query_with_context(&named_scan_plan(), read_context.clone())
+			.await
+			.expect_err("read spends one token then fails bind");
+		assert!(matches!(read, QueryError::Binding(_)));
+		assert_rate_limited(
+			read_coordinator
+				.execute_query_with_context(&named_scan_plan(), read_context)
+				.await
+				.expect_err("second read has no token"),
+			TenantId(7),
+		);
+
+		let write_coordinator = distributed_coordinator_with_policy(rate_policy(1, 1));
+		let write_context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(8),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let create = LogicalPlan::CreateTable {
+			name: TableRef::new("rate_write"),
+			schema: Arc::new(Schema::empty()),
+			if_not_exists: false,
+			or_replace: false,
+		};
+		write_coordinator
+			.execute_query_with_context(&create, write_context.clone())
+			.await
+			.expect("write spends one token and succeeds");
+		assert_rate_limited(
+			write_coordinator
+				.execute_query_with_context(&create, write_context)
+				.await
+				.expect_err("second write has no token"),
+			TenantId(7),
+		);
 	}
 
 	#[tokio::test]
@@ -1716,6 +1847,58 @@ mod tests {
 			TenantBudget::new(ByteCount::new(64), ByteCount::new(64)),
 			per_tenant,
 		)
+	}
+
+	fn rate_policy(max_queries_per_second: u32, query_burst_capacity: u32) -> TenantBudgetPolicy {
+		let mut per_tenant = std::collections::HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			rate_budget(8, 64, 8, max_queries_per_second, query_burst_capacity),
+		);
+		TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(64), ByteCount::new(64)),
+			per_tenant,
+		)
+	}
+
+	fn rate_budget(
+		memory_per_task: u64,
+		aggregate_memory: u64,
+		max_concurrent_queries: u32,
+		max_queries_per_second: u32,
+		query_burst_capacity: u32,
+	) -> TenantBudget {
+		let mut budget = TenantBudget::with_max_concurrent_queries(
+			ByteCount::new(memory_per_task),
+			ByteCount::new(aggregate_memory),
+			NonZeroU32::new(max_concurrent_queries).expect("nonzero"),
+		);
+		budget.max_queries_per_second = max_queries_per_second;
+		budget.query_burst_capacity = query_burst_capacity;
+		budget
+	}
+
+	fn is_rate_limited(error: &QueryError) -> bool {
+		matches!(
+			error,
+			QueryError::Catalog(CatalogError::ResourceExhausted { message })
+				if message.starts_with("tenant query rate limit exhausted for tenant ")
+		)
+	}
+
+	fn assert_rate_limited(error: QueryError, tenant_id: TenantId) {
+		match error {
+			QueryError::Catalog(CatalogError::ResourceExhausted { message }) => {
+				assert_eq!(
+					message,
+					format!(
+						"tenant query rate limit exhausted for tenant {}",
+						tenant_id.0
+					)
+				);
+			}
+			other => panic!("expected rate-limit ResourceExhausted, got {other:?}"),
+		}
 	}
 
 	fn count_plan() -> LogicalPlan {

@@ -84,6 +84,7 @@ fn sample_resource_metrics_body() -> String {
 		other => panic!("expected other admission grant, got {other:?}"),
 	};
 	admission_rejections.increment(TenantId(7), AdmissionResource::Memory);
+	admission_rejections.increment(TenantId(7), AdmissionResource::Rate);
 	admission_rejections.increment(TenantId(9), AdmissionResource::Concurrency);
 	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
 		descriptors_loaded: 0,
@@ -330,6 +331,7 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 		"tenant_concurrency_limit{tenant_id=\"other\"} 1\n",
 		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"memory\"} 0\n",
 		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"concurrency\"} 0\n",
+		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"rate\"} 0\n",
 	] {
 		assert!(body.contains(metric), "missing metric {metric} in {body}");
 	}
@@ -354,6 +356,7 @@ fn resource_metrics_label_configured_tenant() {
 		"tenant_concurrency_limit{tenant_id=\"7\"} 2\n",
 		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"memory\"} 1\n",
 		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"concurrency\"} 0\n",
+		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"rate\"} 1\n",
 	] {
 		assert!(body.contains(metric), "missing metric {metric} in {body}");
 	}
@@ -367,6 +370,7 @@ fn resource_metrics_bucket_unconfigured_tenant_as_other() {
 		"tenant_memory_bytes_used{tenant_id=\"other\"} 8\n",
 		"tenant_concurrency_active{tenant_id=\"other\"} 1\n",
 		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"concurrency\"} 1\n",
+		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"rate\"} 0\n",
 	] {
 		assert!(body.contains(metric), "missing metric {metric} in {body}");
 	}
@@ -389,16 +393,28 @@ fn resource_metrics_expose_memory_and_concurrency_limits() {
 
 #[test]
 fn resource_admission_rejections_are_labeled_by_resource() {
+	assert_rate_rejection_metric_uses_configured_plus_other_and_resource_rate();
+}
+
+#[test]
+fn rate_rejection_metric_uses_configured_plus_other_and_resource_rate() {
+	assert_rate_rejection_metric_uses_configured_plus_other_and_resource_rate();
+}
+
+fn assert_rate_rejection_metric_uses_configured_plus_other_and_resource_rate() {
 	let body = sample_resource_metrics_body();
 
 	for metric in [
 		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"memory\"} 1\n",
 		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"concurrency\"} 0\n",
+		"tenant_admission_rejections_total{tenant_id=\"7\",resource=\"rate\"} 1\n",
 		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"memory\"} 0\n",
 		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"concurrency\"} 1\n",
+		"tenant_admission_rejections_total{tenant_id=\"other\",resource=\"rate\"} 0\n",
 	] {
 		assert!(body.contains(metric), "missing metric {metric} in {body}");
 	}
+	assert!(!body.contains("tenant_rate_limit_rejections_total"));
 }
 
 #[test]
@@ -415,6 +431,8 @@ fn queue_and_borrow_metrics_are_configured_plus_other_no_table_labels() {
 			1,
 			ByteCount::new(8),
 			1,
+			0,
+			0,
 		),
 	);
 	let policy = TenantBudgetPolicy::new(

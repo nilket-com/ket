@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Debug;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -115,6 +117,8 @@ pub struct TenantBudget {
 	pub max_queued_queries: u32,
 	pub max_borrowed_memory: ByteCount,
 	pub max_borrowed_concurrent_queries: u32,
+	pub max_queries_per_second: u32,
+	pub query_burst_capacity: u32,
 }
 
 impl TenantBudget {
@@ -157,6 +161,8 @@ impl TenantBudget {
 			0,
 			ByteCount::ZERO,
 			0,
+			0,
+			0,
 		)
 	}
 
@@ -170,6 +176,8 @@ impl TenantBudget {
 		max_queued_queries: u32,
 		max_borrowed_memory: ByteCount,
 		max_borrowed_concurrent_queries: u32,
+		max_queries_per_second: u32,
+		query_burst_capacity: u32,
 	) -> Self {
 		Self {
 			memory_per_task,
@@ -180,6 +188,22 @@ impl TenantBudget {
 			max_queued_queries,
 			max_borrowed_memory,
 			max_borrowed_concurrent_queries,
+			max_queries_per_second,
+			query_burst_capacity,
+		}
+	}
+
+	pub const fn rate_enabled(self) -> bool {
+		self.max_queries_per_second != 0
+	}
+
+	pub const fn effective_burst(self) -> u32 {
+		if self.max_queries_per_second == 0 {
+			0
+		} else if self.query_burst_capacity == 0 {
+			self.max_queries_per_second
+		} else {
+			self.query_burst_capacity
 		}
 	}
 }
@@ -323,6 +347,7 @@ pub struct TenantDescriptorSyncRejection {
 pub enum AdmissionResource {
 	Memory,
 	Concurrency,
+	Rate,
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +365,7 @@ struct TenantAdmissionRejectionCounterState {
 struct TenantResourceRejectionCounters {
 	memory: AtomicU64,
 	concurrency: AtomicU64,
+	rate: AtomicU64,
 }
 
 impl TenantAdmissionRejectionCounters {
@@ -387,7 +413,31 @@ impl TenantResourceRejectionCounters {
 		match resource {
 			AdmissionResource::Memory => &self.memory,
 			AdmissionResource::Concurrency => &self.concurrency,
+			AdmissionResource::Rate => &self.rate,
 		}
+	}
+}
+
+trait AdmissionClock: Debug + Send + Sync {
+	fn now_millis(&self) -> u64;
+}
+
+#[derive(Debug)]
+struct SystemAdmissionClock {
+	start: Instant,
+}
+
+impl SystemAdmissionClock {
+	fn new() -> Self {
+		Self {
+			start: Instant::now(),
+		}
+	}
+}
+
+impl AdmissionClock for SystemAdmissionClock {
+	fn now_millis(&self) -> u64 {
+		u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
 	}
 }
 
@@ -419,6 +469,7 @@ pub struct TenantAdmissionController {
 struct TenantAdmissionControllerInner {
 	policy: TenantBudgetPolicy,
 	admission: Option<AdmissionPolicy>,
+	clock: Arc<dyn AdmissionClock>,
 	state: Mutex<AdmissionState>,
 }
 
@@ -429,6 +480,7 @@ struct AdmissionState {
 	borrowed_memory: HashMap<TenantId, ByteCount>,
 	borrowed_concurrency: HashMap<TenantId, u32>,
 	queues: HashMap<TenantId, VecDeque<Waiter>>,
+	rate_buckets: HashMap<RateBucketKey, TokenBucket>,
 	deficits: HashMap<TenantId, i64>,
 	next_waiter_id: u64,
 	next_sequence: u64,
@@ -442,6 +494,18 @@ struct AdmissionState {
 enum TenantMetricKey {
 	Configured(TenantId),
 	Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RateBucketKey {
+	Configured(TenantId),
+	Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenBucket {
+	tokens: u32,
+	last_refill_millis: u64,
 }
 
 #[derive(Debug)]
@@ -484,6 +548,9 @@ pub enum TenantAdmissionRejection {
 		tenant_id: TenantId,
 	},
 	GrantCanceled {
+		tenant_id: TenantId,
+	},
+	RateLimited {
 		tenant_id: TenantId,
 	},
 }
@@ -540,6 +607,23 @@ impl TenantAdmissionController {
 			inner: Arc::new(TenantAdmissionControllerInner {
 				policy,
 				admission,
+				clock: Arc::new(SystemAdmissionClock::new()),
+				state: Mutex::new(AdmissionState::default()),
+			}),
+		}
+	}
+
+	#[cfg(test)]
+	fn with_clock(
+		policy: TenantBudgetPolicy,
+		admission: Option<AdmissionPolicy>,
+		clock: Arc<dyn AdmissionClock>,
+	) -> Self {
+		Self {
+			inner: Arc::new(TenantAdmissionControllerInner {
+				policy,
+				admission,
+				clock,
 				state: Mutex::new(AdmissionState::default()),
 			}),
 		}
@@ -668,21 +752,20 @@ impl TenantAdmissionController {
 impl TenantAdmissionControllerInner {
 	fn try_admit(self: &Arc<Self>, tenant_id: TenantId, memory: ByteCount) -> AdmissionAttempt {
 		let budget = self.policy.budget_for(tenant_id);
+		let mut state = self
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned");
+		if let Err(rejection) = self.try_consume_rate(&mut state, tenant_id, budget) {
+			return AdmissionAttempt::Rejected(rejection);
+		}
 		let Some(admission) = self.admission else {
-			let mut state = self
-				.state
-				.lock()
-				.expect("tenant admission controller poisoned");
 			return match self.try_grant_owned_legacy_order(&mut state, tenant_id, memory, budget) {
 				Ok(reservation) => AdmissionAttempt::Granted(reservation),
 				Err(rejection) => AdmissionAttempt::Rejected(rejection),
 			};
 		};
 
-		let mut state = self
-			.state
-			.lock()
-			.expect("tenant admission controller poisoned");
 		if !state.has_waiters(tenant_id)
 			&& let Ok(reservation) =
 				self.try_grant_owned_legacy_order(&mut state, tenant_id, memory, budget)
@@ -740,6 +823,34 @@ impl TenantAdmissionControllerInner {
 				cleanup: true,
 			})
 		}
+	}
+
+	fn try_consume_rate(
+		&self,
+		state: &mut AdmissionState,
+		tenant_id: TenantId,
+		budget: TenantBudget,
+	) -> Result<(), TenantAdmissionRejection> {
+		if !budget.rate_enabled() {
+			return Ok(());
+		}
+		let rate = budget.max_queries_per_second;
+		let burst = budget.effective_burst();
+		if burst == 0 {
+			return Ok(());
+		}
+		let now = self.clock.now_millis();
+		let key = self.rate_bucket_key(tenant_id);
+		let bucket = state.rate_buckets.entry(key).or_insert(TokenBucket {
+			tokens: burst,
+			last_refill_millis: now,
+		});
+		refill_rate_bucket(bucket, now, rate, burst);
+		if bucket.tokens == 0 {
+			return Err(TenantAdmissionRejection::RateLimited { tenant_id });
+		}
+		bucket.tokens = bucket.tokens.saturating_sub(1);
+		Ok(())
 	}
 
 	fn try_grant_owned_legacy_order(
@@ -938,6 +1049,27 @@ impl TenantAdmissionControllerInner {
 			TenantMetricKey::Other
 		}
 	}
+
+	fn rate_bucket_key(&self, tenant_id: TenantId) -> RateBucketKey {
+		if self.policy.is_configured_tenant(tenant_id) {
+			RateBucketKey::Configured(tenant_id)
+		} else {
+			RateBucketKey::Other
+		}
+	}
+}
+
+fn refill_rate_bucket(bucket: &mut TokenBucket, now: u64, rate: u32, burst: u32) {
+	let elapsed = now.saturating_sub(bucket.last_refill_millis);
+	let added = u128::from(elapsed) * u128::from(rate) / 1_000;
+	if added == 0 {
+		return;
+	}
+	let added_tokens = u32::try_from(added).unwrap_or(u32::MAX);
+	bucket.tokens = bucket.tokens.saturating_add(added_tokens).min(burst);
+	let consumed_millis = added.saturating_mul(1_000) / u128::from(rate);
+	let advance = u64::try_from(consumed_millis).unwrap_or(u64::MAX);
+	bucket.last_refill_millis = bucket.last_refill_millis.saturating_add(advance);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1690,6 +1822,23 @@ impl BudgetState {
 mod tests {
 	use super::*;
 
+	#[derive(Debug, Default)]
+	struct ManualAdmissionClock {
+		now_millis: AtomicU64,
+	}
+
+	impl ManualAdmissionClock {
+		fn advance_millis(&self, millis: u64) {
+			self.now_millis.fetch_add(millis, Ordering::Relaxed);
+		}
+	}
+
+	impl AdmissionClock for ManualAdmissionClock {
+		fn now_millis(&self) -> u64 {
+			self.now_millis.load(Ordering::Relaxed)
+		}
+	}
+
 	#[test]
 	fn reservation_releases_on_drop() {
 		let tracker = BudgetTracker::new(QueryBudget {
@@ -1960,6 +2109,163 @@ mod tests {
 		assert!(matches!(
 			controller.try_admit(TenantId(7), ByteCount::new(8)),
 			AdmissionAttempt::Rejected(TenantAdmissionRejection::QueueDisabled {
+				tenant_id: TenantId(7),
+			})
+		));
+	}
+
+	#[test]
+	fn default_zero_rate_preserves_current_admission_behavior() {
+		let controller = TenantAdmissionController::new(single_tenant_policy(), None);
+		let _held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::Concurrency(_))
+		));
+	}
+
+	#[test]
+	fn burst_capacity_admits_then_rejects() {
+		let controller = TenantAdmissionController::new(
+			TenantBudgetPolicy::new(rate_budget(8, 128, 8, 60, 2), HashMap::new()),
+			None,
+		);
+		let _first = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _second = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited {
+				tenant_id: TenantId(7),
+			})
+		));
+	}
+
+	#[test]
+	fn tokens_refill_with_injected_clock() {
+		let clock = Arc::new(ManualAdmissionClock::default());
+		let controller = TenantAdmissionController::with_clock(
+			TenantBudgetPolicy::new(rate_budget(8, 128, 8, 2, 1), HashMap::new()),
+			None,
+			clock.clone(),
+		);
+		let _first = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited { .. })
+		));
+
+		clock.advance_millis(500);
+
+		let _second = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+	}
+
+	#[test]
+	fn slow_subgranularity_rate_still_accrues_over_time() {
+		let clock = Arc::new(ManualAdmissionClock::default());
+		let controller = TenantAdmissionController::with_clock(
+			TenantBudgetPolicy::new(rate_budget(8, 128, 8, 1, 1), HashMap::new()),
+			None,
+			clock.clone(),
+		);
+		let _first = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		clock.advance_millis(400);
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited { .. })
+		));
+		clock.advance_millis(400);
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited { .. })
+		));
+		clock.advance_millis(200);
+
+		let _second = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+	}
+
+	#[test]
+	fn rate_rejected_query_never_enters_admission_queue() {
+		let controller = TenantAdmissionController::new(
+			TenantBudgetPolicy::new(rate_budget(8, 8, 1, 1, 1), HashMap::new()),
+			Some(admission_policy()),
+		);
+		let _held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited {
+				tenant_id: TenantId(7),
+			})
+		));
+		assert_eq!(controller.metric_slots()[0].queue_depth, 0);
+	}
+
+	#[test]
+	fn token_consumed_on_pass_not_refunded_on_queue_timeout() {
+		let mut budget = admission_budget(8, 8, 1, 0, 0, 1);
+		budget.max_queries_per_second = 1;
+		budget.query_burst_capacity = 2;
+		let clock = Arc::new(ManualAdmissionClock::default());
+		let controller = TenantAdmissionController::with_clock(
+			TenantBudgetPolicy::new(budget, HashMap::new()),
+			Some(admission_policy()),
+			clock,
+		);
+		let held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let mut queued = expect_queued(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		queued.cancel_due_to_timeout();
+		drop(held);
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited {
+				tenant_id: TenantId(7),
+			})
+		));
+	}
+
+	#[test]
+	fn unconfigured_tenants_share_other_rate_bucket() {
+		let controller = TenantAdmissionController::new(
+			TenantBudgetPolicy::new(rate_budget(8, 128, 8, 100, 2), HashMap::new()),
+			None,
+		);
+		let _tenant_7 = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _tenant_8 = expect_granted(controller.try_admit(TenantId(8), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(9), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited {
+				tenant_id: TenantId(9),
+			})
+		));
+	}
+
+	#[test]
+	fn configured_tenant_rate_bucket_isolated_from_other() {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(TenantId(7), rate_budget(8, 128, 8, 100, 2));
+		let controller = TenantAdmissionController::new(
+			TenantBudgetPolicy::new(rate_budget(8, 128, 8, 100, 1), per_tenant),
+			None,
+		);
+		let _other = expect_granted(controller.try_admit(TenantId(8), ByteCount::new(8)));
+		assert!(matches!(
+			controller.try_admit(TenantId(9), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited {
+				tenant_id: TenantId(9),
+			})
+		));
+
+		let _configured_a = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _configured_b = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RateLimited {
 				tenant_id: TenantId(7),
 			})
 		));
@@ -2316,7 +2622,26 @@ mod tests {
 			max_queued_queries,
 			ByteCount::new(max_borrowed_memory),
 			max_borrowed_concurrent_queries,
+			0,
+			0,
 		)
+	}
+
+	fn rate_budget(
+		memory_per_task: u64,
+		aggregate_memory: u64,
+		max_concurrent_queries: u32,
+		max_queries_per_second: u32,
+		query_burst_capacity: u32,
+	) -> TenantBudget {
+		let mut budget = TenantBudget::with_max_concurrent_queries(
+			ByteCount::new(memory_per_task),
+			ByteCount::new(aggregate_memory),
+			NonZeroU32::new(max_concurrent_queries).expect("nonzero"),
+		);
+		budget.max_queries_per_second = max_queries_per_second;
+		budget.query_burst_capacity = query_burst_capacity;
+		budget
 	}
 
 	fn expect_granted(attempt: AdmissionAttempt) -> AdmissionReservation {

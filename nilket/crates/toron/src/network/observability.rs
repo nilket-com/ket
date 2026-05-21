@@ -339,6 +339,7 @@ impl ResourceMetrics {
 			for (resource, resource_label) in [
 				(AdmissionResource::Memory, "memory"),
 				(AdmissionResource::Concurrency, "concurrency"),
+				(AdmissionResource::Rate, "rate"),
 			] {
 				out.push_str(&format!(
 					"tenant_admission_rejections_total{{tenant_id=\"{label}\",resource=\"{resource_label}\"}} {}\n",

@@ -167,13 +167,13 @@ Optional: `rate_gate_works_with_055_queue_disabled`.
 
 ## Acceptance checklist
 
-- [ ] Phase 1: `TenantBudget` rate fields parse; disabled default; burst
+- [x] Phase 1: `TenantBudget` rate fields parse; disabled default; burst
       derive; back-compat.
-- [ ] Phase 2: injectable monotonic clock; 055 construction unchanged.
-- [ ] Phase 3: rate-first before the admission branch; consume-on-pass;
+- [x] Phase 2: injectable monotonic clock; 055 construction unchanged.
+- [x] Phase 3: rate-first before the admission branch; consume-on-pass;
       remainder-preserving refill; shared `"other"`; no Drop/refund.
-- [ ] Phase 4: `RateLimited` → `AdmissionResource::Rate` → `Resource
+- [x] Phase 4: `RateLimited` → `AdmissionResource::Rate` → `Resource
       Exhausted`; 054 retry no re-spend.
-- [ ] Phase 5: existing bounded `resource="rate"` metric; no new family/gauge.
-- [ ] Phase 6-8: 14+3 guards, 055 guard retarget, 14 fixtures, prior guards
+- [x] Phase 5: existing bounded `resource="rate"` metric; no new family/gauge.
+- [x] Phase 6-8: 14+3 guards, 055 guard retarget, 14 fixtures, prior guards
       pass, evidence + roadmap; no parser/listener/cluster drift.

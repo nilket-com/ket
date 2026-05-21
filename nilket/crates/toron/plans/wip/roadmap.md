@@ -4381,7 +4381,10 @@ along with the forward-sequence rewrite.
   Out-of-Scope, routed to a post-057 listener throttle on evidence.
   **Single-plan posture; Toron-ring only; node-local.** Placement: Exterior
   Substrate → Toron home. Migration:
-  `plans/impl/056_per_tenant_query_rate_admission.md`.
+  `plans/impl/056_per_tenant_query_rate_admission.md`; implementation
+  evidence is recorded in
+  `plans/impl/056_per_tenant_query_rate_admission_evidence.md`, including a
+  passing full `cargo test -p toron -- --test-threads=6` run.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4508,7 +4511,10 @@ zero Wendelon server change, zero SQL wire change.**
   brand-clean / no-`*V1`. Placement: Exterior Substrate → Toron home.
 
 The migration is materialized in
-`plans/impl/056_per_tenant_query_rate_admission.md`.
+`plans/impl/056_per_tenant_query_rate_admission.md`; implementation
+evidence is recorded in
+`plans/impl/056_per_tenant_query_rate_admission_evidence.md`, including a
+passing full `cargo test -p toron -- --test-threads=6` run.
 
 **ADR 057 candidates:**
 

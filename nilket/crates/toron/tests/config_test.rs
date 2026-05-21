@@ -126,6 +126,8 @@ fn toron_example_config_loads() {
 			.max_borrowed_concurrent_queries,
 		0
 	);
+	assert_eq!(config.tenant_budgets.default.max_queries_per_second, 0);
+	assert_eq!(config.tenant_budgets.default.query_burst_capacity, 0);
 	assert!(config.admission.is_none());
 }
 
@@ -228,6 +230,27 @@ fn tenant_admission_policy_config_round_trips() {
 	assert_eq!(tenant.max_queued_queries, 5);
 	assert_eq!(tenant.max_borrowed_memory, ByteCount::new(256));
 	assert_eq!(tenant.max_borrowed_concurrent_queries, 1);
+}
+
+#[test]
+fn tenant_query_rate_policy_config_round_trips() {
+	let dir = fresh_dir("tenant-rate-round-trip");
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_queries_per_second = 30\nquery_burst_capacity = 60\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nmax_queries_per_second = 10\nquery_burst_capacity = 0\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load tenant rate config");
+
+	assert_eq!(config.tenant_budgets.default.max_queries_per_second, 30);
+	assert_eq!(config.tenant_budgets.default.query_burst_capacity, 60);
+	assert_eq!(config.tenant_budgets.default.effective_burst(), 60);
+	let tenant = config.tenant_budgets.budget_for(TenantId(7));
+	assert_eq!(tenant.max_queries_per_second, 10);
+	assert_eq!(tenant.query_burst_capacity, 0);
+	assert_eq!(tenant.effective_burst(), 10);
 }
 
 #[test]

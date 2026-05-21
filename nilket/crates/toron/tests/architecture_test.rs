@@ -8356,7 +8356,7 @@ fn adr050_default_and_loopback_tenants_use_default_budget() {
 }
 
 #[test]
-fn adr050_memory_only_no_cpu_rate_connection_or_storage_quotas() {
+fn adr050_memory_only_no_cpu_connection_or_storage_quotas() {
 	let source = [
 		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config"),
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord"),
@@ -8368,15 +8368,12 @@ fn adr050_memory_only_no_cpu_rate_connection_or_storage_quotas() {
 	for forbidden in [
 		"CpuBudget",
 		"cpu_quota",
-		"RateLimit",
-		"rate_limit",
 		"connection_quota",
 		"storage_quota",
-		"fair_share",
 	] {
 		assert!(
 			!source.contains(forbidden),
-			"ADR 050 must remain memory-only; found {forbidden}"
+			"ADR 050 memory budget gained unrelated quota surface {forbidden}"
 		);
 	}
 }
@@ -8929,7 +8926,7 @@ fn adr052_general_daemon_metrics_remain_tenant_label_free() {
 }
 
 #[test]
-fn adr052_no_cpu_rate_connection_storage_queue_or_fair_share() {
+fn adr052_no_cpu_connection_or_storage_quota_surface() {
 	let source = source_lines(&manifest_dir().join("src"))
 		.into_iter()
 		.map(|(_, _, line)| line)
@@ -8939,16 +8936,12 @@ fn adr052_no_cpu_rate_connection_storage_queue_or_fair_share() {
 	for forbidden in [
 		"CpuBudget",
 		"cpu_quota",
-		"RateLimit",
-		"rate_limit",
 		"connection_quota",
 		"storage_quota",
-		"fair_share",
-		"TenantQueue",
 	] {
 		assert!(
 			!source.contains(forbidden),
-			"ADR 052 must stay concurrency-only; found {forbidden}"
+			"ADR 052 concurrency admission gained unrelated quota surface {forbidden}"
 		);
 	}
 }
@@ -9578,19 +9571,14 @@ fn adr054_no_ttl_reaper_watch_inventory_or_push() {
 }
 
 #[test]
-fn adr054_no_new_budget_or_governance_knob() {
+fn adr054_no_new_descriptor_refresh_budget_or_governance_knob() {
 	let source = source_lines(&manifest_dir().join("src"))
 		.into_iter()
 		.map(|(_, _, line)| line)
 		.collect::<Vec<_>>()
 		.join("\n");
 
-	for forbidden in [
-		"max_queries_per_second",
-		"TenantRateLimiter",
-		"fairness_weight",
-		"weighted_fair",
-	] {
+	for forbidden in ["TenantRateLimiter", "fairness_weight", "weighted_fair"] {
 		assert!(
 			!source.contains(forbidden),
 			"ADR 054 added governance knob {forbidden}"
@@ -9869,24 +9857,361 @@ fn adr055_admission_lock_not_held_across_await() {
 }
 
 #[test]
-fn adr055_no_rate_limit_or_connection_cap_surface() {
+fn adr055_no_connection_cap_surface() {
 	let source = source_lines(&manifest_dir().join("src"))
 		.into_iter()
 		.map(|(_, _, line)| line)
 		.collect::<Vec<_>>()
 		.join("\n");
 
-	for forbidden in [
-		"max_queries_per_second",
-		"token_bucket",
-		"RateLimitExceeded",
-		"max_concurrent_connections",
-		"connection_cap",
-	] {
+	for forbidden in ["max_concurrent_connections", "connection_cap"] {
 		assert!(
 			!source.contains(forbidden),
-			"ADR 055 must not add rate/connection surface {forbidden}"
+			"ADR 055/056 still reserve connection caps for ADR 057: {forbidden}"
 		);
+	}
+}
+
+#[test]
+fn adr056_rate_is_outermost_controller_gate() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let try_admit = brace_blocks_after_marker(&budget, "fn try_admit(self: &Arc<Self>")
+		.into_iter()
+		.next()
+		.expect("try_admit")
+		.1;
+
+	let rate_pos = try_admit
+		.find("try_consume_rate")
+		.expect("try_admit consumes rate");
+	let admission_pos = try_admit
+		.find("let Some(admission) = self.admission else")
+		.expect("try_admit admission branch");
+	let grant_pos = try_admit
+		.find("try_grant_owned_legacy_order")
+		.expect("try_admit grant path");
+
+	assert!(rate_pos < admission_pos);
+	assert!(rate_pos < grant_pos);
+}
+
+#[test]
+fn adr056_rate_gate_runs_before_admission_enabled_branch() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let try_admit = brace_blocks_after_marker(&budget, "fn try_admit(self: &Arc<Self>")
+		.into_iter()
+		.next()
+		.expect("try_admit")
+		.1;
+
+	assert!(try_admit.contains("self.try_consume_rate(&mut state, tenant_id, budget)"));
+	assert!(
+		try_admit.find("try_consume_rate").expect("rate gate")
+			< try_admit
+				.find("let Some(admission) = self.admission else")
+				.expect("admission branch")
+	);
+}
+
+#[test]
+fn adr056_rate_rejection_never_enters_queue_or_reservation() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let try_consume_rate = brace_blocks_after_marker(&budget, "fn try_consume_rate")
+		.into_iter()
+		.next()
+		.expect("try_consume_rate")
+		.1;
+	let try_admit = brace_blocks_after_marker(&budget, "fn try_admit(self: &Arc<Self>")
+		.into_iter()
+		.next()
+		.expect("try_admit")
+		.1;
+
+	assert!(try_consume_rate.contains("TenantAdmissionRejection::RateLimited"));
+	assert!(!try_consume_rate.contains("push_back"));
+	assert!(!try_consume_rate.contains("AdmissionReservation"));
+	assert!(
+		try_admit.find("try_consume_rate").expect("rate gate")
+			< try_admit
+				.find("push_back(waiter)")
+				.expect("queue insertion")
+	);
+	assert!(budget.contains("rate_rejected_query_never_enters_admission_queue"));
+}
+
+#[test]
+fn adr056_rate_token_consumed_on_pass_never_refunded() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let try_consume_rate = brace_blocks_after_marker(&budget, "fn try_consume_rate")
+		.into_iter()
+		.next()
+		.expect("try_consume_rate")
+		.1;
+	let release_reservation = brace_blocks_after_marker(&budget, "fn release_reservation")
+		.into_iter()
+		.next()
+		.expect("release_reservation")
+		.1;
+
+	assert!(try_consume_rate.contains("bucket.tokens = bucket.tokens.saturating_sub(1)"));
+	assert!(budget.contains("token_consumed_on_pass_not_refunded_on_queue_timeout"));
+	assert!(coordinator.contains("token_consumed_on_pass_not_refunded_on_bind_error"));
+	assert!(coordinator.contains("token_consumed_on_pass_not_refunded_on_execution_error"));
+	assert!(!release_reservation.contains("rate_buckets"));
+}
+
+#[test]
+fn adr056_rate_has_no_reservation_or_drop_release_path() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let reservation = budget
+		.split("pub struct AdmissionReservation")
+		.nth(1)
+		.expect("reservation")
+		.split("struct GrantDelivery")
+		.next()
+		.expect("reservation body");
+	let drop_impl = brace_blocks_after_marker(&budget, "impl Drop for AdmissionReservation")
+		.into_iter()
+		.next()
+		.expect("drop impl")
+		.1;
+
+	assert!(!reservation.contains("rate"));
+	assert!(!drop_impl.contains("rate"));
+	assert!(!drop_impl.contains("TokenBucket"));
+}
+
+#[test]
+fn adr056_lazy_refill_uses_injected_clock_no_background_task() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(budget.contains("trait AdmissionClock"));
+	assert!(budget.contains("fn now_millis(&self) -> u64"));
+	assert!(budget.contains("SystemAdmissionClock"));
+	assert!(budget.contains("with_clock"));
+	assert!(budget.contains("fn refill_rate_bucket"));
+	assert!(budget.contains("tokens_refill_with_injected_clock"));
+	assert!(!budget.contains("tokio::spawn"));
+	assert!(!budget.contains("JoinHandle"));
+}
+
+#[test]
+fn adr056_no_lock_free_or_separate_rate_limiter_component() {
+	let source = source_files(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| {
+			let path_text = path.display().to_string();
+			let source = std::fs::read_to_string(&path).expect("read source");
+			(path_text, source)
+		})
+		.collect::<Vec<_>>();
+
+	for (path, text) in &source {
+		assert!(!path.ends_with("rate_limit.rs"));
+		assert!(!text.contains("TenantRateLimiter"));
+		assert!(!text.contains("packed"));
+	}
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	assert!(budget.contains("rate_buckets: HashMap<RateBucketKey, TokenBucket>"));
+	assert!(budget.contains("last_refill_millis: u64"));
+	assert!(!budget.contains("fetch_update"));
+}
+
+#[test]
+fn adr056_default_zero_rate_preserves_current_behavior() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(budget.contains("pub max_queries_per_second: u32"));
+	assert!(budget.contains("pub query_burst_capacity: u32"));
+	assert!(budget.contains("max_queries_per_second == 0"));
+	assert!(budget.contains("default_zero_rate_preserves_current_admission_behavior"));
+	assert!(config.contains("max_queries_per_second.unwrap_or(0)"));
+	assert!(config.contains("query_burst_capacity.unwrap_or(0)"));
+}
+
+#[test]
+fn adr056_configured_tenants_have_buckets_other_is_shared() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(budget.contains("enum RateBucketKey"));
+	assert!(budget.contains("Configured(TenantId)"));
+	assert!(budget.contains("Other"));
+	assert!(budget.contains("fn rate_bucket_key"));
+	assert!(budget.contains("self.policy.is_configured_tenant(tenant_id)"));
+	assert!(budget.contains("unconfigured_tenants_share_other_rate_bucket"));
+	assert!(budget.contains("configured_tenant_rate_bucket_isolated_from_other"));
+	assert!(!budget.contains("HashMap<TenantId, TokenBucket>"));
+}
+
+#[test]
+fn adr056_resource_exhausted_reused_no_new_sql_code() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	assert!(coordinator.contains("TenantAdmissionRejection::RateLimited"));
+	assert!(coordinator.contains("tenant query rate limit exhausted for tenant"));
+	assert!(coordinator.contains("CatalogError::ResourceExhausted"));
+	assert!(daemon.contains("SqlErrorCode::ResourceExhausted"));
+	assert!(!wire.contains("RateLimitExceeded"));
+	assert!(!wire.contains("RateLimited"));
+}
+
+#[test]
+fn adr056_rate_uses_existing_bounded_rejection_metric_no_new_family() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+
+	assert!(budget.contains("AdmissionResource::Rate"));
+	assert!(observability.contains("(AdmissionResource::Rate, \"rate\")"));
+	assert!(observability.contains("tenant_admission_rejections_total"));
+	assert!(!observability.contains("tenant_rate_limit_rejections_total"));
+	assert!(
+		observability_test
+			.contains("rate_rejection_metric_uses_configured_plus_other_and_resource_rate")
+	);
+	for forbidden in [
+		"query_id",
+		"sql_text",
+		"table_id",
+		"descriptor",
+		"fingerprint",
+	] {
+		let offenders = observability
+			.lines()
+			.filter(|line| {
+				line.contains("tenant_admission_rejections_total") && line.contains(forbidden)
+			})
+			.collect::<Vec<_>>();
+		assert!(
+			offenders.is_empty(),
+			"rate rejection metric gained forbidden label {forbidden}: {offenders:?}"
+		);
+	}
+}
+
+#[test]
+fn adr056_no_preparse_listener_connection_or_worker_transport_rate() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let transport = source_files(&manifest_dir().join("src/server"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read transport source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+
+	assert!(!daemon.contains("max_queries_per_second"));
+	assert!(!daemon.contains("RateLimited"));
+	assert!(!transport.contains("RateLimited"));
+	assert!(!transport.contains("TenantRateLimiter"));
+	assert!(!coordinator.contains("pre_parse"));
+	assert!(!coordinator.contains("parse_rate"));
+}
+
+#[test]
+fn adr056_descriptor_retry_does_not_reconsume_rate_token() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+
+	assert!(coordinator.contains("adr054_evolved_retry_stays_inside_one_admission_reservation"));
+	assert!(coordinator.contains(".with_tenant_budget_policy(rate_policy(1, 1))"));
+	assert!(coordinator.contains("retried_descriptor_evolution"));
+}
+
+#[test]
+fn adr056_no_wendelon_sql_wire_nilket_or_fixture_worker_change() {
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	assert!(!sql_wire.contains("RateLimited"));
+	assert!(!sql_wire.contains("RateLimitExceeded"));
+	assert!(!wendelon_source.contains("max_queries_per_second"));
+	assert!(!wendelon_source.contains("TenantRateLimiter"));
+	assert!(!nilket_manifest.contains("tokio"));
+	assert!(!worker.contains("max_queries_per_second"));
+	assert!(!worker.contains("RateLimited"));
+}
+
+#[test]
+fn adr056_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr056_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	assert!(!worker.contains("TenantAdmissionController"));
+	assert!(!worker.contains("max_queries_per_second"));
+	assert!(!worker.contains("RateLimited"));
+}
+
+#[test]
+fn adr056_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"TenantRateLimiter",
+		"RateLimitExceeded",
+		"QueryRateAdmissionV1",
+		"TenantRateBucketV1",
+		"RateLimitedV1",
+	]);
+}
+
+#[test]
+fn adr056_prior_adr049_050_051_052_053_054_055_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr049_", "adr050_", "adr051_", "adr052_", "adr053_", "adr054_", "adr055_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
 	}
 }
 

@@ -63,6 +63,8 @@ memory_budget_bytes = 67108864
 # max_queued_queries = 0
 # max_borrowed_memory_bytes = 0
 # max_borrowed_concurrent_queries = 0
+# max_queries_per_second = 0
+# query_burst_capacity = 0
 
 # [[tenant_budgets.tenants]]
 # tenant_id = 7
@@ -74,6 +76,8 @@ memory_budget_bytes = 67108864
 # max_queued_queries = 0
 # max_borrowed_memory_bytes = 0
 # max_borrowed_concurrent_queries = 0
+# max_queries_per_second = 0
+# query_burst_capacity = 0
 
 # [admission]
 # max_queued_queries = 0
@@ -328,6 +332,8 @@ struct RawTenantBudget {
 	max_queued_queries: Option<u32>,
 	max_borrowed_memory_bytes: Option<u64>,
 	max_borrowed_concurrent_queries: Option<u32>,
+	max_queries_per_second: Option<u32>,
+	query_burst_capacity: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,6 +347,8 @@ struct RawTenantBudgetEntry {
 	max_queued_queries: Option<u32>,
 	max_borrowed_memory_bytes: Option<u64>,
 	max_borrowed_concurrent_queries: Option<u32>,
+	max_queries_per_second: Option<u32>,
+	query_burst_capacity: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -669,6 +677,8 @@ fn normalize_tenant_budget_policy(
 		default.max_queued_queries,
 		default.max_borrowed_memory_bytes,
 		default.max_borrowed_concurrent_queries,
+		default.max_queries_per_second,
+		default.query_burst_capacity,
 	)?;
 	let mut per_tenant = HashMap::new();
 	for tenant in raw.tenants {
@@ -685,6 +695,8 @@ fn normalize_tenant_budget_policy(
 			tenant.max_queued_queries,
 			tenant.max_borrowed_memory_bytes,
 			tenant.max_borrowed_concurrent_queries,
+			tenant.max_queries_per_second,
+			tenant.query_burst_capacity,
 		)?;
 		if per_tenant.insert(tenant_id, budget).is_some() {
 			return Err(invalid(format!(
@@ -706,6 +718,8 @@ fn normalize_tenant_budget(
 	max_queued_queries: Option<u32>,
 	max_borrowed_memory_bytes: Option<u64>,
 	max_borrowed_concurrent_queries: Option<u32>,
+	max_queries_per_second: Option<u32>,
+	query_burst_capacity: Option<u32>,
 ) -> Result<TenantBudget, ToronConfigError> {
 	if memory_per_task_bytes == 0 {
 		return Err(invalid(
@@ -760,6 +774,8 @@ fn normalize_tenant_budget(
 		max_queued_queries.unwrap_or(0),
 		ByteCount::new(max_borrowed_memory_bytes.unwrap_or(0)),
 		max_borrowed_concurrent_queries.unwrap_or(0),
+		max_queries_per_second.unwrap_or(0),
+		query_burst_capacity.unwrap_or(0),
 	))
 }
 
