@@ -195,6 +195,43 @@ ran in. Only workspace-shared Interior substrate (`tls-pki`,
 
 ## Forward sequence
 
+**Promoted (plan) — ADR 073 Table-Query Request Cancellation
+Producer Contract (cross-ring cancellation producer).** The
+deferred half of Toron ADR 059's honesty boundary: 059 made Toron
+worker cancellation real but did **not** cancel already-issued
+Wendelon storage reads. Because `handle_table_query` materializes
+(concatenates) the result *before* writing `TABLE_QUERY_RESP`, a
+dropped Toron client stream is observed too late — the scan
+already ran. 073 adds an **explicit** primitive for
+`TABLE_QUERY_REQ`: a Wendelon-owned, per-attempt
+`TableQueryRequestId` grown into the fixed `TableQueryRequestMeta`
+as a Pod-compatible u128 newtype with zero rejected by validation
+(no extension/compat path — no-premature-backward-compat); a
+data-server active-request registry keyed `(TenantId,
+TableQueryRequestId)` with RAII removal + a bounded TTL/count
+pending-cancel tombstone; `TABLE_QUERY_CANCEL_REQ = 0x3E` /
+`TABLE_QUERY_CANCEL_RESP = 0x3F` on the existing bidi data ring
+(not `0x1F`, not Control Ring); a `tokio_util` `CancellationToken`
+checked at execution boundaries (planning / migration-pull / scan
+/ row-group / concat / encode — not in FSST/decompression
+kernels); `ReadStatus::QUERY_CANCELLED` (no Arrow body);
+oracle-safe `ACCEPTED`/`TERMINAL` cancel response; RAII resource
+release; aggregate-only metrics; no rollback (reads are
+side-effect-free). Stop-on-client-drop retained only as a
+fallback. **Carries the ADR 059 review lessons** onto the storage
+ring: `CancellationToken` (not a hand-rolled lost-wakeup-prone
+`Notify`), bounded tombstone, oracle-safety, RAII. **Producer-only
+— no Toron production change.** Seeded by Toron ADR 059;
+**relocated to / owned in the Wendelon sequence at promotion** (the
+ADR 072 precedent). Council: **3-of-3 (Claude, Codex, Gemini)** —
+the strongest-aligned promotion of the cancellation arc; **19
+decisions, 22 architecture guards + 1 meta guard, 19 required
+fixtures**. Plans: `plans/adr/073_table_query_request_cancellation.md`
++ `plans/impl/073_table_query_request_cancellation.md`.
+**Next consumer:** Toron ADR 060 — wires Toron ADR 059
+cancellation into this primitive (Toron sequence, cross-referenced,
+not owned here).
+
 **Implemented — ADR 072 Table Descriptor Snapshot Producer
 (cross-ring descriptor-liveness producer).** Read-only Control Ring
 RPC (0x3C/0x3D) returning the latest `TableSchemaDescriptor` by
