@@ -436,6 +436,18 @@ impl Client {
 		Ok(())
 	}
 
+	pub async fn get_table_schema_descriptor(
+		&self,
+		tenant_id: TenantId,
+		namespace: &str,
+		table_name: &str,
+	) -> Result<Option<TableSchemaDescriptor>, ClientError> {
+		self.inner
+			.get_table_schema_descriptor(tenant_id, namespace, table_name)
+			.await
+			.map_err(ClientError::from)
+	}
+
 	pub fn identity_for_key(tenant_id: TenantId, key: &[u8]) -> Identity {
 		Identity::blake3_tenant(tenant_id, key)
 	}

@@ -11,7 +11,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::distributed::budget::{
-	ByteCount, TenantBudget, TenantBudgetPolicy, derive_max_concurrent_queries,
+	ByteCount, TenantBudget, TenantBudgetPolicy, derive_max_concurrent_descriptor_syncs,
+	derive_max_concurrent_queries,
 };
 use crate::distributed::identity::WorkerId;
 use crate::distributed::worker_registry::WorkerEndpoint;
@@ -57,12 +58,14 @@ memory_budget_bytes = 67108864
 # memory_per_task_bytes = 67108864
 # aggregate_memory_bytes = 268435456
 # max_concurrent_queries = 4
+# max_concurrent_descriptor_syncs = 2
 
 # [[tenant_budgets.tenants]]
 # tenant_id = 7
 # memory_per_task_bytes = 16777216
 # aggregate_memory_bytes = 67108864
 # max_concurrent_queries = 4
+# max_concurrent_descriptor_syncs = 2
 
 [storage.wendelon]
 bootstrap_peers = [
@@ -304,6 +307,7 @@ struct RawTenantBudget {
 	memory_per_task_bytes: u64,
 	aggregate_memory_bytes: u64,
 	max_concurrent_queries: Option<u32>,
+	max_concurrent_descriptor_syncs: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +316,7 @@ struct RawTenantBudgetEntry {
 	memory_per_task_bytes: u64,
 	aggregate_memory_bytes: u64,
 	max_concurrent_queries: Option<u32>,
+	max_concurrent_descriptor_syncs: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -621,6 +626,7 @@ fn normalize_tenant_budget_policy(
 		default.memory_per_task_bytes,
 		default.aggregate_memory_bytes,
 		default.max_concurrent_queries,
+		default.max_concurrent_descriptor_syncs,
 	)?;
 	let mut per_tenant = HashMap::new();
 	for tenant in raw.tenants {
@@ -632,6 +638,7 @@ fn normalize_tenant_budget_policy(
 			tenant.memory_per_task_bytes,
 			tenant.aggregate_memory_bytes,
 			tenant.max_concurrent_queries,
+			tenant.max_concurrent_descriptor_syncs,
 		)?;
 		if per_tenant.insert(tenant_id, budget).is_some() {
 			return Err(invalid(format!(
@@ -647,6 +654,7 @@ fn normalize_tenant_budget(
 	memory_per_task_bytes: u64,
 	aggregate_memory_bytes: u64,
 	max_concurrent_queries: Option<u32>,
+	max_concurrent_descriptor_syncs: Option<u32>,
 ) -> Result<TenantBudget, ToronConfigError> {
 	if memory_per_task_bytes == 0 {
 		return Err(invalid(
@@ -674,10 +682,20 @@ fn normalize_tenant_budget(
 		Some(value) => NonZeroU32::new(value).expect("zero rejected"),
 		None => derive_max_concurrent_queries(memory_per_task, aggregate_memory),
 	};
-	Ok(TenantBudget::with_max_concurrent_queries(
+	let max_concurrent_descriptor_syncs = match max_concurrent_descriptor_syncs {
+		Some(0) => {
+			return Err(invalid(
+				"tenant_budgets max_concurrent_descriptor_syncs must be greater than 0",
+			));
+		}
+		Some(value) => NonZeroU32::new(value).expect("zero rejected"),
+		None => derive_max_concurrent_descriptor_syncs(max_concurrent_queries),
+	};
+	Ok(TenantBudget::with_query_and_descriptor_sync_limits(
 		memory_per_task,
 		aggregate_memory,
 		max_concurrent_queries,
+		max_concurrent_descriptor_syncs,
 	))
 }
 

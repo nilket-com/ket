@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
+use crate::catalog::DescriptorSyncMetrics;
 use crate::config::ObservabilityListeners;
 use crate::distributed::budget::{
 	AdmissionResource, ByteCount, TenantAdmissionRejectionCounters, TenantBudgetPolicy,
@@ -158,6 +159,7 @@ pub struct MetricsRegistry {
 	metrics_scrapes_total: AtomicU64,
 	descriptors_loaded: AtomicU64,
 	static_workers_configured: AtomicU64,
+	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	resource_metrics: ResourceMetrics,
 }
 
@@ -166,6 +168,7 @@ impl MetricsRegistry {
 		descriptors_loaded: u64,
 		static_workers_configured: u64,
 		tenant_budgets: TenantBudgetPolicy,
+		descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 		tenant_memory: TenantMemoryAccountant,
 		tenant_concurrency: TenantConcurrencyAccountant,
 		admission_rejections: TenantAdmissionRejectionCounters,
@@ -177,6 +180,7 @@ impl MetricsRegistry {
 			metrics_scrapes_total: AtomicU64::new(0),
 			descriptors_loaded: AtomicU64::new(descriptors_loaded),
 			static_workers_configured: AtomicU64::new(static_workers_configured),
+			descriptor_sync_metrics,
 			resource_metrics: ResourceMetrics {
 				tenant_budgets,
 				tenant_memory,
@@ -243,8 +247,24 @@ impl MetricsRegistry {
 			"static_workers_configured {}\n",
 			self.static_workers_configured.load(Ordering::Relaxed)
 		));
+		self.render_descriptor_sync_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
 		out
+	}
+
+	fn render_descriptor_sync_metrics(&self, out: &mut String) {
+		let snapshot = self.descriptor_sync_metrics.snapshot();
+		out.push_str("# TYPE catalog_descriptor_sync_requests_total counter\n");
+		for (outcome, count) in [
+			("success", snapshot.success),
+			("not_found", snapshot.not_found),
+			("throttled", snapshot.throttled),
+			("error", snapshot.error),
+		] {
+			out.push_str(&format!(
+				"catalog_descriptor_sync_requests_total{{outcome=\"{outcome}\"}} {count}\n"
+			));
+		}
 	}
 }
 

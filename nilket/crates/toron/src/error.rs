@@ -129,6 +129,8 @@ pub enum CatalogError {
 	AdminUnavailable { message: String },
 	#[error("catalog admin operation failed: {message}")]
 	AdminFailed { message: String },
+	#[error("catalog resource exhausted: {message}")]
+	ResourceExhausted { message: String },
 	#[error("fingerprint resolution failed: {message}")]
 	FingerprintResolution { message: String },
 	#[error(transparent)]

@@ -4104,11 +4104,11 @@ fn adr034_binder_drop_table_is_pass_through() {
 fn adr034_catalog_drop_table_returns_optional_binding() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
 		.expect("read catalog source");
-	let trait_block = catalog
-		.split("pub trait Catalog")
-		.nth(1)
-		.and_then(|rest| rest.split("}").next())
-		.expect("Catalog trait");
+	let trait_block = brace_blocks_after_marker(&catalog, "pub trait Catalog")
+		.into_iter()
+		.next()
+		.expect("Catalog trait")
+		.1;
 
 	assert!(trait_block.contains("async fn drop_table("));
 	assert!(trait_block.contains(") -> Result<Option<TableBinding>, CatalogError>;"));
@@ -5625,11 +5625,12 @@ fn adr038_coordinator_resolves_drop_identity_at_execution() {
 	.expect("drop_existing_table_with_storage_admin helper body")
 	.1;
 
-	assert!(helper.contains("catalog.resolve_table(name).await"));
+	assert!(helper.contains("catalog.resolve_table_local(name).await"));
 	assert!(helper.contains("DropTableStorageRequest"));
 	assert!(
-		helper.find("catalog.resolve_table(name).await").unwrap()
-			< helper.find(".drop_table_storage").unwrap()
+		helper
+			.find("catalog.resolve_table_local(name).await")
+			.unwrap() < helper.find(".drop_table_storage").unwrap()
 	);
 }
 
@@ -8983,7 +8984,6 @@ fn adr052_no_descriptor_sync_stub_or_runtime_ingestion() {
 		.join("\n");
 
 	for forbidden in [
-		"sync_descriptor_for_tenant",
 		"DescriptorSource",
 		"watch_descriptor",
 		"reload_descriptor",
@@ -8995,6 +8995,10 @@ fn adr052_no_descriptor_sync_stub_or_runtime_ingestion() {
 			"ADR 052 must not add descriptor sync machinery; found {forbidden}"
 		);
 	}
+	assert!(
+		source.contains("sync_descriptor_for_tenant"),
+		"ADR 053 promotion should provide the governed descriptor-sync consumer"
+	);
 }
 
 #[test]
@@ -9045,6 +9049,378 @@ fn adr052_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 		"TenantConcurrencyReservationV1",
 		"TenantConcurrencyRejectionV1",
 		"TenantAdmissionRejectionCountersV1",
+	]);
+}
+
+#[test]
+fn adr053_descriptor_sync_lives_in_toron_consumer() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let wendelon_server = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(catalog.contains("async fn resolve_table_after_local_miss"));
+	assert!(catalog.contains("DescriptorSyncFlights"));
+	assert!(catalog.contains("sync_descriptor_for_tenant"));
+	assert!(!wendelon_server.contains("TenantDescriptorSyncAccountant"));
+	assert!(!wendelon_server.contains("CatalogError::ResourceExhausted"));
+}
+
+#[test]
+fn adr053_wendelon_server_descriptor_get_surface_unchanged() {
+	let wendelon_core = std::fs::read_to_string(wendelon_manifest_dir().join("src/client/core.rs"))
+		.expect("read Wendelon client core");
+	let wendelon_network = source_lines(&wendelon_manifest_dir().join("src/network"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(wendelon_core.contains("pub async fn get_table_schema_descriptor"));
+	assert!(wendelon_core.contains("CONTROL_REASON_NOT_FOUND => return Ok(None)"));
+	assert!(wendelon_network.contains("TableDescriptorGetRequestMeta"));
+	assert!(wendelon_network.contains("TableDescriptorGetResponseMeta"));
+	assert!(!wendelon_network.contains("max_concurrent_descriptor_syncs"));
+}
+
+#[test]
+fn adr053_resolve_table_miss_is_only_sync_trigger() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let resolve_table = wendelon_catalog_method_body(&catalog, "async fn resolve_table");
+	let resolve_table_id = wendelon_catalog_method_body(&catalog, "async fn resolve_table_id");
+	let create_table = wendelon_catalog_method_body(&catalog, "async fn create_table");
+	let drop_table = wendelon_catalog_method_body(&catalog, "async fn drop_table");
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+
+	assert!(resolve_table.contains("resolve_table_after_local_miss"));
+	assert!(resolve_table.contains("Err(CatalogError::TableNotFound"));
+	for body in [resolve_table_id, create_table, drop_table] {
+		assert!(!body.contains("resolve_table_after_local_miss"));
+		assert!(!body.contains("get_table_schema_descriptor"));
+	}
+	assert!(!storage.contains("resolve_table_after_local_miss"));
+	assert!(!storage.contains("get_table_schema_descriptor"));
+}
+
+#[test]
+fn adr053_descriptor_sync_key_is_tenant_and_exact_name() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let key = brace_blocks_after_marker(&catalog, "struct DescriptorSyncKey")
+		.into_iter()
+		.next()
+		.expect("DescriptorSyncKey")
+		.1;
+	let key_impl = brace_blocks_after_marker(&catalog, "impl DescriptorSyncKey")
+		.into_iter()
+		.next()
+		.expect("DescriptorSyncKey impl")
+		.1;
+
+	assert!(key.contains("tenant_id: TenantId"));
+	assert!(key.contains("namespace: String"));
+	assert!(key.contains("table_name: String"));
+	assert!(key_impl.contains(".schema"));
+	assert!(key_impl.contains(".clone()"));
+	assert!(key_impl.contains("unwrap_or_else(|| \"default\".to_string())"));
+	assert!(key_impl.contains("table.table.clone()"));
+	assert!(!key_impl.contains("list"));
+	assert!(!key_impl.contains("enumer"));
+}
+
+#[test]
+fn adr053_unqualified_bind_miss_uses_default_namespace() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+
+	assert!(catalog.contains("unwrap_or_else(|| \"default\".to_string())"));
+	assert!(catalog.contains("fn canonical_table_ref"));
+	assert!(catalog.contains("unwrap_or(\"default\")"));
+	assert!(catalog.contains("resolve_table_unqualified_miss_fetches_default_namespace"));
+}
+
+#[test]
+fn adr053_singleflight_shared_across_scoped_catalogs() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let scoped = wendelon_catalog_method_body(&catalog, "fn scoped");
+
+	assert!(catalog.contains("descriptor_sync_flights: Option<Arc<DescriptorSyncFlights>>"));
+	assert!(scoped.contains("descriptor_sync_flights: self.descriptor_sync_flights.clone()"));
+	assert!(scoped.contains("descriptor_sync_metrics: Arc::clone(&self.descriptor_sync_metrics)"));
+}
+
+#[test]
+fn adr053_singleflight_waiters_do_not_consume_sync_budget() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let miss = brace_blocks_after_marker(&catalog, "async fn resolve_table_after_local_miss")
+		.into_iter()
+		.next()
+		.expect("resolve_table_after_local_miss")
+		.1;
+	let owner = brace_blocks_after_marker(&catalog, "async fn resolve_table_sync_owner")
+		.into_iter()
+		.next()
+		.expect("resolve_table_sync_owner")
+		.1;
+
+	assert!(miss.contains("DescriptorSyncParticipant::Waiter"));
+	assert!(!miss.contains("try_reserve"));
+	assert!(owner.contains("owner.flights.accountant.try_reserve"));
+	assert!(catalog.contains("concurrent_same_table_bind_misses_issue_one_descriptor_get"));
+}
+
+#[test]
+fn adr053_descriptor_sync_budget_is_nonzero_configured() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config tests");
+
+	assert!(budget.contains("max_concurrent_descriptor_syncs: NonZeroU32"));
+	assert!(budget.contains("derive_max_concurrent_descriptor_syncs"));
+	assert!(budget.contains("pub struct TenantDescriptorSyncAccountant"));
+	assert!(config.contains("max_concurrent_descriptor_syncs: Option<u32>"));
+	assert!(
+		config.contains("tenant_budgets max_concurrent_descriptor_syncs must be greater than 0")
+	);
+	assert!(config_test.contains("zero-descriptor-sync"));
+}
+
+#[test]
+fn adr053_sync_budget_rejection_maps_resource_exhausted() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let error = std::fs::read_to_string(manifest_dir().join("src/error.rs")).expect("read error");
+
+	assert!(error.contains("ResourceExhausted { message: String }"));
+	assert!(catalog.contains("tenant descriptor sync limit exhausted"));
+	assert!(daemon.contains("CatalogError::ResourceExhausted"));
+	assert!(daemon.contains("SqlErrorCode::ResourceExhausted"));
+	assert!(daemon.contains("catalog_resource_exhausted_maps_to_resource_exhausted_sql_error"));
+}
+
+#[test]
+fn adr053_descriptor_sync_uses_client_facade() {
+	let toron_catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let client =
+		std::fs::read_to_string(wendelon_manifest_dir().join("crates/wendelon-client/src/lib.rs"))
+			.expect("read Wendelon client facade");
+
+	assert!(client.contains("pub async fn get_table_schema_descriptor"));
+	assert!(client.contains("self.inner"));
+	assert!(toron_catalog.contains("trait DescriptorSyncClient"));
+	assert!(toron_catalog.contains("impl DescriptorSyncClient for Client"));
+	assert!(toron_catalog.contains(".get_table_schema_descriptor("));
+}
+
+#[test]
+fn adr053_sync_merges_registry_in_place_no_arc_swap() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let helper = brace_blocks_after_marker(&catalog, "pub fn sync_descriptor_for_tenant")
+		.into_iter()
+		.next()
+		.expect("sync_descriptor_for_tenant")
+		.1;
+
+	assert!(helper.contains("let mut state = self"));
+	assert!(helper.contains(".inner"));
+	assert!(helper.contains(".write()"));
+	assert!(helper.contains("insert_wendelon_descriptor_locked"));
+	assert!(!helper.contains("Arc::new"));
+	assert!(!helper.contains("self.registry"));
+}
+
+#[test]
+fn adr053_runtime_sync_does_not_call_from_tenant_descriptors() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let helper = brace_blocks_after_marker(&catalog, "pub fn sync_descriptor_for_tenant")
+		.into_iter()
+		.next()
+		.expect("sync_descriptor_for_tenant")
+		.1;
+	let miss = brace_blocks_after_marker(&catalog, "async fn resolve_table_after_local_miss")
+		.into_iter()
+		.next()
+		.expect("resolve_table_after_local_miss")
+		.1;
+
+	assert!(!helper.contains("from_tenant_descriptors"));
+	assert!(!miss.contains("from_tenant_descriptors"));
+}
+
+#[test]
+fn adr053_no_background_watch_reload_inventory_or_negative_cache() {
+	let source = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"watch_descriptor",
+		"reload_descriptor",
+		"descriptor_reload",
+		"list_descriptors",
+		"DescriptorInventory",
+		"negative_cache",
+		"NegativeCache",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 053 must not add background/inventory/negative-cache machinery; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr053_create_drop_do_not_trigger_descriptor_sync() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	for method in ["async fn create_table", "async fn drop_table"] {
+		let body = wendelon_catalog_method_body(&catalog, method);
+		assert!(!body.contains("get_table_schema_descriptor"));
+		assert!(!body.contains("resolve_table_after_local_miss"));
+		assert!(!body.contains("DescriptorSyncParticipant"));
+	}
+}
+
+#[test]
+fn adr053_resolve_table_id_and_storage_do_not_trigger_descriptor_sync() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let resolve_id = wendelon_catalog_method_body(&catalog, "async fn resolve_table_id");
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+
+	assert!(!resolve_id.contains("get_table_schema_descriptor"));
+	assert!(!resolve_id.contains("resolve_table_after_local_miss"));
+	assert!(!storage.contains("get_table_schema_descriptor"));
+	assert!(!storage.contains("resolve_table_after_local_miss"));
+}
+
+#[test]
+fn adr053_descriptor_evolved_path_stays_unchanged() {
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(storage.contains("StorageError::DescriptorEvolved"));
+	assert!(storage.contains("physical_descriptor_fingerprint"));
+	assert!(coordinator.contains("StorageError::DescriptorEvolved"));
+	assert!(!coordinator.contains("get_table_schema_descriptor"));
+	assert!(!storage.contains("sync_descriptor_for_tenant"));
+}
+
+#[test]
+fn adr053_catalog_liveness_metrics_have_no_tenant_or_table_labels() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+
+	assert!(observability.contains("catalog_descriptor_sync_requests_total"));
+	assert!(observability.contains("outcome=\\\"{outcome}\\\""));
+	for forbidden in ["tenant_id", "namespace", "table_name", "table_object_id"] {
+		let offenders = observability
+			.lines()
+			.filter(|line| {
+				line.contains("catalog_descriptor_sync_requests_total") && line.contains(forbidden)
+			})
+			.collect::<Vec<_>>();
+		assert!(
+			offenders.is_empty(),
+			"descriptor sync metric gained forbidden label {forbidden}: {offenders:?}"
+		);
+	}
+	assert!(
+		observability_test.contains("catalog_descriptor_sync_metrics_are_aggregate_outcome_only")
+	);
+}
+
+#[test]
+fn adr053_retry_is_internal_to_resolve_table_not_coordinator() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let resolve_table = wendelon_catalog_method_body(&catalog, "async fn resolve_table");
+
+	assert!(resolve_table.contains("resolve_table_after_local_miss"));
+	assert!(!coordinator.contains("resolve_table_after_local_miss"));
+	assert!(!coordinator.contains("get_table_schema_descriptor"));
+}
+
+#[test]
+fn adr053_prior_adr049_050_051_052_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in ["adr049_", "adr050_", "adr051_", "adr052_"] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr053_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr053_toron_fixture_worker_source_unchanged() {
+	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker source");
+
+	for forbidden in [
+		"DescriptorSync",
+		"max_concurrent_descriptor_syncs",
+		"sync_descriptor_for_tenant",
+		"get_table_schema_descriptor",
+	] {
+		assert!(
+			!fixture.contains(forbidden),
+			"fixture worker contains {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr053_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronDescriptorSync",
+		"ToronDescriptorSyncAccountant",
+		"TenantDescriptorSyncAccountantV1",
+		"TenantDescriptorSyncReservationV1",
+		"TenantDescriptorSyncRejectionV1",
+		"DescriptorSyncMetricsV1",
+		"DescriptorSyncFlightsV1",
 	]);
 }
 

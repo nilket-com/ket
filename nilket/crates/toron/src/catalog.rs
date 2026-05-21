@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
+use crate::distributed::budget::{QueryBudget, TenantBudgetPolicy, TenantDescriptorSyncAccountant};
 use crate::error::{CatalogError, StorageError};
 use crate::ir::{ColumnOrdinal, TableId};
 use crate::storage::TenantId;
@@ -132,6 +134,10 @@ pub trait Catalog: Send + Sync {
 
 	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError>;
 
+	async fn resolve_table_local(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		self.resolve_table(table).await
+	}
+
 	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError>;
 
 	async fn create_table(
@@ -146,6 +152,71 @@ pub trait Catalog: Send + Sync {
 		name: &TableRef,
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError>;
+}
+
+#[async_trait::async_trait]
+trait DescriptorSyncClient: Send + Sync {
+	async fn get_table_schema_descriptor(
+		&self,
+		tenant_id: WendelonTenantId,
+		namespace: &str,
+		table_name: &str,
+	) -> Result<Option<wendelon_client::TableSchemaDescriptor>, ClientError>;
+}
+
+#[async_trait::async_trait]
+impl DescriptorSyncClient for Client {
+	async fn get_table_schema_descriptor(
+		&self,
+		tenant_id: WendelonTenantId,
+		namespace: &str,
+		table_name: &str,
+	) -> Result<Option<wendelon_client::TableSchemaDescriptor>, ClientError> {
+		Client::get_table_schema_descriptor(self, tenant_id, namespace, table_name).await
+	}
+}
+
+#[derive(Default)]
+pub struct DescriptorSyncMetrics {
+	success: AtomicU64,
+	not_found: AtomicU64,
+	throttled: AtomicU64,
+	error: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorSyncMetricSnapshot {
+	pub success: u64,
+	pub not_found: u64,
+	pub throttled: u64,
+	pub error: u64,
+}
+
+impl DescriptorSyncMetrics {
+	pub fn snapshot(&self) -> DescriptorSyncMetricSnapshot {
+		DescriptorSyncMetricSnapshot {
+			success: self.success.load(Ordering::Relaxed),
+			not_found: self.not_found.load(Ordering::Relaxed),
+			throttled: self.throttled.load(Ordering::Relaxed),
+			error: self.error.load(Ordering::Relaxed),
+		}
+	}
+
+	fn record_success(&self) {
+		self.success.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn record_not_found(&self) {
+		self.not_found.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn record_throttled(&self) {
+		self.throttled.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn record_error(&self) {
+		self.error.fetch_add(1, Ordering::Relaxed);
+	}
 }
 
 pub struct MockCatalog {
@@ -370,8 +441,162 @@ impl Catalog for MockCatalog {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DescriptorSyncKey {
+	tenant_id: TenantId,
+	namespace: String,
+	table_name: String,
+}
+
+impl DescriptorSyncKey {
+	fn from_table(tenant_id: TenantId, table: &TableRef) -> Self {
+		Self {
+			tenant_id,
+			namespace: table
+				.schema
+				.clone()
+				.unwrap_or_else(|| "default".to_string()),
+			table_name: table.table.clone(),
+		}
+	}
+
+	fn table_ref(&self) -> TableRef {
+		TableRef::with_schema(self.namespace.clone(), self.table_name.clone())
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DescriptorSyncOutcome {
+	Synced,
+	NotFound,
+	Throttled,
+	Failed(String),
+}
+
+struct DescriptorSyncFlight {
+	outcome: Mutex<Option<DescriptorSyncOutcome>>,
+	notify: Notify,
+}
+
+impl DescriptorSyncFlight {
+	fn new() -> Self {
+		Self {
+			outcome: Mutex::new(None),
+			notify: Notify::new(),
+		}
+	}
+
+	async fn wait(&self) -> DescriptorSyncOutcome {
+		loop {
+			let notified = self.notify.notified();
+			tokio::pin!(notified);
+			if let Some(outcome) = self
+				.outcome
+				.lock()
+				.expect("descriptor sync flight poisoned")
+				.clone()
+			{
+				return outcome;
+			}
+			notified.as_mut().await;
+		}
+	}
+}
+
+struct DescriptorSyncFlights {
+	accountant: TenantDescriptorSyncAccountant,
+	inflight: Mutex<HashMap<DescriptorSyncKey, Arc<DescriptorSyncFlight>>>,
+}
+
+impl DescriptorSyncFlights {
+	fn new(accountant: TenantDescriptorSyncAccountant) -> Self {
+		Self {
+			accountant,
+			inflight: Mutex::new(HashMap::new()),
+		}
+	}
+
+	fn join_or_own(self: &Arc<Self>, key: DescriptorSyncKey) -> DescriptorSyncParticipant {
+		let mut inflight = self
+			.inflight
+			.lock()
+			.expect("descriptor sync flights poisoned");
+		if let Some(flight) = inflight.get(&key) {
+			return DescriptorSyncParticipant::Waiter(Arc::clone(flight));
+		}
+
+		let flight = Arc::new(DescriptorSyncFlight::new());
+		inflight.insert(key.clone(), Arc::clone(&flight));
+		DescriptorSyncParticipant::Owner(DescriptorSyncOwner {
+			flights: Arc::clone(self),
+			key,
+			flight,
+			completed: false,
+		})
+	}
+
+	fn finish(
+		&self,
+		key: &DescriptorSyncKey,
+		flight: &Arc<DescriptorSyncFlight>,
+		outcome: DescriptorSyncOutcome,
+	) {
+		*flight
+			.outcome
+			.lock()
+			.expect("descriptor sync flight poisoned") = Some(outcome);
+		let mut inflight = self
+			.inflight
+			.lock()
+			.expect("descriptor sync flights poisoned");
+		if inflight
+			.get(key)
+			.is_some_and(|current| Arc::ptr_eq(current, flight))
+		{
+			inflight.remove(key);
+		}
+		flight.notify.notify_waiters();
+	}
+}
+
+enum DescriptorSyncParticipant {
+	Owner(DescriptorSyncOwner),
+	Waiter(Arc<DescriptorSyncFlight>),
+}
+
+struct DescriptorSyncOwner {
+	flights: Arc<DescriptorSyncFlights>,
+	key: DescriptorSyncKey,
+	flight: Arc<DescriptorSyncFlight>,
+	completed: bool,
+}
+
+impl DescriptorSyncOwner {
+	fn finish(mut self, outcome: DescriptorSyncOutcome) {
+		self.flights.finish(&self.key, &self.flight, outcome);
+		self.completed = true;
+	}
+}
+
+impl Drop for DescriptorSyncOwner {
+	fn drop(&mut self) {
+		if !self.completed {
+			self.flights.finish(
+				&self.key,
+				&self.flight,
+				DescriptorSyncOutcome::Failed(
+					"descriptor sync failed: owner cancelled".to_string(),
+				),
+			);
+		}
+	}
+}
+
 pub struct WendelonCatalog {
 	client: Option<Arc<Client>>,
+	descriptor_sync_client: Option<Arc<dyn DescriptorSyncClient>>,
+	descriptor_sync_flights: Option<Arc<DescriptorSyncFlights>>,
+	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	tenant_id: TenantId,
 	registry: Arc<WendelonDescriptorRegistry>,
 }
@@ -380,6 +605,9 @@ impl Default for WendelonCatalog {
 	fn default() -> Self {
 		Self {
 			client: None,
+			descriptor_sync_client: None,
+			descriptor_sync_flights: None,
+			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 			tenant_id: TenantId(1),
 			registry: Arc::new(WendelonDescriptorRegistry::default()),
 		}
@@ -505,6 +733,69 @@ impl WendelonDescriptorRegistry {
 			binding,
 			descriptor,
 		)
+	}
+
+	pub fn sync_descriptor_for_tenant(
+		&self,
+		tenant_id: TenantId,
+		requested: &TableRef,
+		descriptor: wendelon_client::TableSchemaDescriptor,
+	) -> Result<TableBinding, CatalogError> {
+		let table_ref = canonical_table_ref(requested);
+		let namespace = table_ref
+			.schema
+			.as_deref()
+			.expect("canonical table ref has schema");
+		if descriptor.namespace != namespace || descriptor.table_name != table_ref.table {
+			return Err(CatalogError::AdminFailed {
+				message: format!(
+					"descriptor sync failed: requested {}, got {}.{}",
+					table_name(&table_ref),
+					descriptor.namespace,
+					descriptor.table_name
+				),
+			});
+		}
+
+		let unqualified_ref = TableRef::new(&descriptor.table_name);
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+
+		if let Some(existing_table_id) = state.by_ref.get(&(tenant_id, table_ref.clone())).copied()
+		{
+			let existing = state
+				.by_id
+				.get(&(tenant_id, existing_table_id))
+				.cloned()
+				.ok_or_else(|| CatalogError::TableNotFound {
+					table: table_name(&table_ref),
+				})?;
+			let candidate = TableBinding::from_descriptor(existing_table_id, &descriptor)?;
+			if same_descriptor_identity(&existing, &candidate) {
+				return Ok(existing);
+			}
+			return Err(CatalogError::AdminFailed {
+				message: format!(
+					"descriptor sync failed: table {} already exists with a different descriptor identity",
+					table_name(&table_ref)
+				),
+			});
+		}
+
+		let table_id = allocate_wendelon_table_id_locked(&mut state);
+		let binding = TableBinding::from_descriptor(table_id, &descriptor)?;
+		insert_wendelon_descriptor_locked(
+			&mut state,
+			tenant_id,
+			table_ref,
+			Some(unqualified_ref),
+			table_id,
+			binding.clone(),
+			descriptor,
+		)?;
+		Ok(binding)
 	}
 
 	pub fn resolve_table(
@@ -736,6 +1027,40 @@ fn insert_wendelon_descriptor_locked(
 	Ok(())
 }
 
+fn allocate_wendelon_table_id_locked(state: &mut WendelonDescriptorState) -> TableId {
+	while state
+		.by_id
+		.keys()
+		.any(|(_, table_id)| *table_id == TableId(state.next_table_id))
+	{
+		state.next_table_id = state
+			.next_table_id
+			.checked_add(1)
+			.expect("TableId overflow");
+	}
+	let table_id = TableId(state.next_table_id);
+	state.next_table_id = state
+		.next_table_id
+		.checked_add(1)
+		.expect("TableId overflow");
+	table_id
+}
+
+fn same_descriptor_identity(existing: &TableBinding, candidate: &TableBinding) -> bool {
+	existing.table == candidate.table
+		&& existing.schema_generation == candidate.schema_generation
+		&& existing.fingerprint == candidate.fingerprint
+		&& existing.schema.as_ref() == candidate.schema.as_ref()
+}
+
+fn default_descriptor_sync_flights() -> Arc<DescriptorSyncFlights> {
+	Arc::new(DescriptorSyncFlights::new(
+		TenantDescriptorSyncAccountant::new(TenantBudgetPolicy::from_query_budget(
+			QueryBudget::default(),
+		)),
+	))
+}
+
 impl WendelonCatalog {
 	pub fn from_descriptors(
 		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptor)>,
@@ -752,8 +1077,12 @@ impl WendelonCatalog {
 		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptor)>,
 	) -> Result<Self, CatalogError> {
 		let tenant_id = tenant_id.into();
+		let descriptor_sync_client: Arc<dyn DescriptorSyncClient> = client.clone();
 		Ok(Self {
 			client: Some(client),
+			descriptor_sync_client: Some(descriptor_sync_client),
+			descriptor_sync_flights: Some(default_descriptor_sync_flights()),
+			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 			tenant_id,
 			registry: Arc::new(WendelonDescriptorRegistry::from_descriptors_for_tenant(
 				tenant_id,
@@ -767,8 +1096,30 @@ impl WendelonCatalog {
 		tenant_id: TenantId,
 		registry: Arc<WendelonDescriptorRegistry>,
 	) -> Self {
+		Self::with_client_and_registry_and_descriptor_sync_accountant(
+			client,
+			tenant_id,
+			registry,
+			TenantDescriptorSyncAccountant::new(TenantBudgetPolicy::from_query_budget(
+				QueryBudget::default(),
+			)),
+		)
+	}
+
+	pub fn with_client_and_registry_and_descriptor_sync_accountant(
+		client: Arc<Client>,
+		tenant_id: TenantId,
+		registry: Arc<WendelonDescriptorRegistry>,
+		descriptor_sync_accountant: TenantDescriptorSyncAccountant,
+	) -> Self {
+		let descriptor_sync_client: Arc<dyn DescriptorSyncClient> = client.clone();
 		Self {
 			client: Some(client),
+			descriptor_sync_client: Some(descriptor_sync_client),
+			descriptor_sync_flights: Some(Arc::new(DescriptorSyncFlights::new(
+				descriptor_sync_accountant,
+			))),
+			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 			tenant_id,
 			registry,
 		}
@@ -777,6 +1128,110 @@ impl WendelonCatalog {
 	pub fn descriptor_registry(&self) -> Arc<WendelonDescriptorRegistry> {
 		self.registry.clone()
 	}
+
+	pub fn descriptor_sync_metrics(&self) -> Arc<DescriptorSyncMetrics> {
+		Arc::clone(&self.descriptor_sync_metrics)
+	}
+
+	async fn resolve_table_after_local_miss(
+		&self,
+		table: &TableRef,
+	) -> Result<TableBinding, CatalogError> {
+		let Some(client) = self.descriptor_sync_client.as_ref() else {
+			return Err(CatalogError::TableNotFound {
+				table: table_name(table),
+			});
+		};
+		let Some(flights) = self.descriptor_sync_flights.as_ref() else {
+			return Err(CatalogError::TableNotFound {
+				table: table_name(table),
+			});
+		};
+
+		let key = DescriptorSyncKey::from_table(self.tenant_id, table);
+		let table_ref = key.table_ref();
+		match Arc::clone(flights).join_or_own(key.clone()) {
+			DescriptorSyncParticipant::Owner(owner) => {
+				self.resolve_table_sync_owner(client, owner, key).await
+			}
+			DescriptorSyncParticipant::Waiter(flight) => match flight.wait().await {
+				DescriptorSyncOutcome::Synced => {
+					self.registry.resolve_table(self.tenant_id, &table_ref)
+				}
+				DescriptorSyncOutcome::NotFound => Err(CatalogError::TableNotFound {
+					table: table_name(&table_ref),
+				}),
+				DescriptorSyncOutcome::Throttled => Err(descriptor_sync_resource_exhausted()),
+				DescriptorSyncOutcome::Failed(message) => {
+					Err(CatalogError::AdminFailed { message })
+				}
+			},
+		}
+	}
+
+	async fn resolve_table_sync_owner(
+		&self,
+		client: &Arc<dyn DescriptorSyncClient>,
+		owner: DescriptorSyncOwner,
+		key: DescriptorSyncKey,
+	) -> Result<TableBinding, CatalogError> {
+		let table_ref = key.table_ref();
+		let reservation = match owner.flights.accountant.try_reserve(self.tenant_id) {
+			Ok(reservation) => reservation,
+			Err(_) => {
+				self.descriptor_sync_metrics.record_throttled();
+				owner.finish(DescriptorSyncOutcome::Throttled);
+				return Err(descriptor_sync_resource_exhausted());
+			}
+		};
+
+		let descriptor_result = client
+			.get_table_schema_descriptor(
+				wendelon_tenant_id(self.tenant_id),
+				&key.namespace,
+				&key.table_name,
+			)
+			.await;
+
+		let result = match descriptor_result {
+			Ok(Some(descriptor)) => self
+				.registry
+				.sync_descriptor_for_tenant(self.tenant_id, &table_ref, descriptor)
+				.map_err(|error| descriptor_sync_admin_failed(&table_ref, error)),
+			Ok(None) => Err(CatalogError::TableNotFound {
+				table: table_name(&table_ref),
+			}),
+			Err(error) => Err(descriptor_sync_admin_failed(&table_ref, error)),
+		};
+		drop(reservation);
+
+		match result {
+			Ok(binding) => {
+				self.descriptor_sync_metrics.record_success();
+				owner.finish(DescriptorSyncOutcome::Synced);
+				Ok(binding)
+			}
+			Err(CatalogError::TableNotFound { table }) => {
+				self.descriptor_sync_metrics.record_not_found();
+				owner.finish(DescriptorSyncOutcome::NotFound);
+				Err(CatalogError::TableNotFound { table })
+			}
+			Err(error) => {
+				self.descriptor_sync_metrics.record_error();
+				let message = match &error {
+					CatalogError::AdminFailed { message } => message.clone(),
+					other => {
+						format!(
+							"descriptor sync failed for {}: {other}",
+							table_name(&table_ref)
+						)
+					}
+				};
+				owner.finish(DescriptorSyncOutcome::Failed(message));
+				Err(error)
+			}
+		}
+	}
 }
 
 #[async_trait::async_trait]
@@ -784,12 +1239,25 @@ impl Catalog for WendelonCatalog {
 	fn scoped(self: Arc<Self>, tenant_id: TenantId) -> Arc<dyn Catalog> {
 		Arc::new(Self {
 			client: self.client.clone(),
+			descriptor_sync_client: self.descriptor_sync_client.clone(),
+			descriptor_sync_flights: self.descriptor_sync_flights.clone(),
+			descriptor_sync_metrics: Arc::clone(&self.descriptor_sync_metrics),
 			tenant_id,
 			registry: Arc::clone(&self.registry),
 		})
 	}
 
 	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		match self.registry.resolve_table(self.tenant_id, table) {
+			Ok(binding) => Ok(binding),
+			Err(CatalogError::TableNotFound { .. }) => {
+				self.resolve_table_after_local_miss(table).await
+			}
+			Err(error) => Err(error),
+		}
+	}
+
+	async fn resolve_table_local(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
 		self.registry.resolve_table(self.tenant_id, table)
 	}
 
@@ -906,6 +1374,25 @@ fn table_name(table: &TableRef) -> String {
 	match &table.schema {
 		Some(schema) => format!("{schema}.{}", table.table),
 		None => table.table.clone(),
+	}
+}
+
+fn canonical_table_ref(table: &TableRef) -> TableRef {
+	TableRef::with_schema(
+		table.schema.as_deref().unwrap_or("default"),
+		table.table.clone(),
+	)
+}
+
+fn descriptor_sync_resource_exhausted() -> CatalogError {
+	CatalogError::ResourceExhausted {
+		message: "tenant descriptor sync limit exhausted".to_string(),
+	}
+}
+
+fn descriptor_sync_admin_failed(table: &TableRef, error: impl std::fmt::Display) -> CatalogError {
+	CatalogError::AdminFailed {
+		message: format!("descriptor sync failed for {}: {error}", table_name(table)),
 	}
 }
 
@@ -1047,11 +1534,157 @@ fn is_pbc_eligible_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::binder::{PlannerConfig, bind};
+	use crate::distributed::budget::{ByteCount, TenantBudget};
+	use crate::sql_planner::SqlPlanner;
 	use arrow::datatypes::{Field, Schema};
+	use std::collections::VecDeque;
+	use std::num::NonZeroU32;
+	use std::sync::atomic::Ordering;
+	use std::time::Duration;
+	use tokio::time::{sleep, timeout};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
 	};
+
+	struct FakeDescriptorSyncClient {
+		responses: tokio::sync::Mutex<VecDeque<Result<Option<TableSchemaDescriptor>, ClientError>>>,
+		requests: tokio::sync::Mutex<Vec<(WendelonTenantId, String, String)>>,
+		calls: AtomicU64,
+		active: AtomicU64,
+		max_active: AtomicU64,
+		started: Notify,
+		release: Notify,
+		hold_until_released: bool,
+	}
+
+	impl FakeDescriptorSyncClient {
+		fn new(
+			responses: impl IntoIterator<Item = Result<Option<TableSchemaDescriptor>, ClientError>>,
+		) -> Self {
+			Self {
+				responses: tokio::sync::Mutex::new(responses.into_iter().collect()),
+				requests: tokio::sync::Mutex::new(Vec::new()),
+				calls: AtomicU64::new(0),
+				active: AtomicU64::new(0),
+				max_active: AtomicU64::new(0),
+				started: Notify::new(),
+				release: Notify::new(),
+				hold_until_released: false,
+			}
+		}
+
+		fn held(
+			responses: impl IntoIterator<Item = Result<Option<TableSchemaDescriptor>, ClientError>>,
+		) -> Self {
+			Self {
+				hold_until_released: true,
+				..Self::new(responses)
+			}
+		}
+
+		fn call_count(&self) -> u64 {
+			self.calls.load(Ordering::SeqCst)
+		}
+
+		fn max_active(&self) -> u64 {
+			self.max_active.load(Ordering::SeqCst)
+		}
+
+		async fn requests(&self) -> Vec<(WendelonTenantId, String, String)> {
+			self.requests.lock().await.clone()
+		}
+
+		async fn wait_until_started(&self) {
+			self.wait_until_calls(1).await;
+		}
+
+		async fn wait_until_calls(&self, expected: u64) {
+			while self.call_count() < expected {
+				self.started.notified().await;
+			}
+		}
+
+		fn release(&self) {
+			self.release.notify_waiters();
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl DescriptorSyncClient for FakeDescriptorSyncClient {
+		async fn get_table_schema_descriptor(
+			&self,
+			tenant_id: WendelonTenantId,
+			namespace: &str,
+			table_name: &str,
+		) -> Result<Option<TableSchemaDescriptor>, ClientError> {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+			let mut max_active = self.max_active.load(Ordering::SeqCst);
+			while active > max_active
+				&& self
+					.max_active
+					.compare_exchange(max_active, active, Ordering::SeqCst, Ordering::SeqCst)
+					.is_err()
+			{
+				max_active = self.max_active.load(Ordering::SeqCst);
+			}
+			self.requests.lock().await.push((
+				tenant_id,
+				namespace.to_string(),
+				table_name.to_string(),
+			));
+			self.started.notify_waiters();
+			if self.hold_until_released {
+				self.release.notified().await;
+			}
+			self.active.fetch_sub(1, Ordering::SeqCst);
+			self.responses
+				.lock()
+				.await
+				.pop_front()
+				.expect("fake descriptor response")
+		}
+	}
+
+	fn catalog_with_fake_client(
+		tenant_id: TenantId,
+		registry: Arc<WendelonDescriptorRegistry>,
+		client: Arc<FakeDescriptorSyncClient>,
+		accountant: TenantDescriptorSyncAccountant,
+	) -> WendelonCatalog {
+		WendelonCatalog {
+			client: None,
+			descriptor_sync_client: Some(client),
+			descriptor_sync_flights: Some(Arc::new(DescriptorSyncFlights::new(accountant))),
+			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+			tenant_id,
+			registry,
+		}
+	}
+
+	fn descriptor_sync_accountant(limit: u32) -> TenantDescriptorSyncAccountant {
+		TenantDescriptorSyncAccountant::new(TenantBudgetPolicy::new(
+			TenantBudget::with_query_and_descriptor_sync_limits(
+				ByteCount::new(8),
+				ByteCount::new(16),
+				NonZeroU32::new(2).expect("nonzero"),
+				NonZeroU32::new(limit).expect("nonzero"),
+			),
+			HashMap::new(),
+		))
+	}
+
+	fn expect_catalog_error(
+		result: Result<TableBinding, CatalogError>,
+		message: &str,
+	) -> CatalogError {
+		match result {
+			Ok(_) => panic!("{message}"),
+			Err(error) => error,
+		}
+	}
 
 	#[tokio::test]
 	async fn mock_catalog_resolves_descriptor_identity_by_name_and_id() {
@@ -1107,6 +1740,648 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn resolve_table_bind_miss_fetches_descriptor_and_returns_binding() {
+		let descriptor = descriptor();
+		let client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(
+			descriptor.clone(),
+		))]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor");
+
+		assert_eq!(client.call_count(), 1);
+		assert_eq!(resolved.table, descriptor.table_object_id);
+		assert_eq!(
+			resolved.fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+		assert_eq!(catalog.descriptor_sync_metrics().snapshot().success, 1);
+	}
+
+	#[tokio::test]
+	async fn resolve_table_local_hit_does_not_call_wendelon() {
+		let descriptor = descriptor();
+		let registry = Arc::new(
+			WendelonDescriptorRegistry::from_descriptors_for_tenant(
+				TenantId(7),
+				[(TableId(9), descriptor.clone())],
+			)
+			.expect("registry"),
+		);
+		let client = Arc::new(FakeDescriptorSyncClient::new([]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			registry,
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("local hit");
+
+		assert_eq!(client.call_count(), 0);
+		assert_eq!(resolved.table, descriptor.table_object_id);
+		assert_eq!(catalog.descriptor_sync_metrics().snapshot().success, 0);
+	}
+
+	#[tokio::test]
+	async fn resolve_table_unqualified_miss_fetches_default_namespace() {
+		let descriptor = default_descriptor_with_identity(0xD0, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(descriptor))]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		catalog
+			.resolve_table(&TableRef::new("orders"))
+			.await
+			.expect("resolve default");
+
+		assert_eq!(
+			client.requests().await,
+			vec![(
+				WendelonTenantId::new(7),
+				"default".to_string(),
+				"orders".to_string()
+			)]
+		);
+	}
+
+	#[tokio::test]
+	async fn resolve_table_qualified_miss_fetches_exact_namespace() {
+		let descriptor = descriptor();
+		let client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(descriptor))]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve exact");
+
+		assert_eq!(
+			client.requests().await,
+			vec![(
+				WendelonTenantId::new(7),
+				"bench".to_string(),
+				"orders".to_string()
+			)]
+		);
+	}
+
+	#[tokio::test]
+	async fn resolve_table_not_found_remains_table_not_found() {
+		let client = Arc::new(FakeDescriptorSyncClient::new([Ok(None)]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let error = expect_catalog_error(
+			catalog
+				.resolve_table(&TableRef::with_schema("bench", "missing"))
+				.await,
+			"missing",
+		);
+
+		assert!(matches!(error, CatalogError::TableNotFound { .. }));
+		assert_eq!(catalog.descriptor_sync_metrics().snapshot().not_found, 1);
+	}
+
+	#[tokio::test]
+	async fn resolve_table_fetch_error_is_admin_failed() {
+		let client = Arc::new(FakeDescriptorSyncClient::new([Err(ClientError::Io(
+			std::io::Error::new(std::io::ErrorKind::BrokenPipe, "offline"),
+		))]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let error = expect_catalog_error(
+			catalog
+				.resolve_table(&TableRef::with_schema("bench", "orders"))
+				.await,
+			"transport error",
+		);
+
+		assert!(matches!(error, CatalogError::AdminFailed { .. }));
+		assert_eq!(catalog.descriptor_sync_metrics().snapshot().error, 1);
+	}
+
+	#[tokio::test]
+	async fn resolve_table_auth_error_is_not_table_not_found() {
+		let client = Arc::new(FakeDescriptorSyncClient::new([Err(
+			ClientError::AuthorizationFailed,
+		)]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let error = expect_catalog_error(
+			catalog
+				.resolve_table(&TableRef::with_schema("bench", "orders"))
+				.await,
+			"auth error",
+		);
+
+		assert!(matches!(error, CatalogError::AdminFailed { .. }));
+	}
+
+	#[tokio::test]
+	async fn resolve_table_throttled_is_resource_exhausted() {
+		let accountant = descriptor_sync_accountant(1);
+		let _held = accountant.try_reserve(TenantId(7)).expect("hold slot");
+		let client = Arc::new(FakeDescriptorSyncClient::new([]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			accountant,
+		);
+
+		let error = expect_catalog_error(
+			catalog
+				.resolve_table(&TableRef::with_schema("bench", "orders"))
+				.await,
+			"throttled",
+		);
+
+		assert!(matches!(error, CatalogError::ResourceExhausted { .. }));
+		assert_eq!(client.call_count(), 0);
+		assert_eq!(catalog.descriptor_sync_metrics().snapshot().throttled, 1);
+	}
+
+	#[tokio::test]
+	async fn concurrent_same_table_bind_misses_issue_one_descriptor_get() {
+		let descriptor = default_descriptor_with_identity(0xD1, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::held([Ok(Some(descriptor))]));
+		let catalog = Arc::new(catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		));
+
+		let owner_catalog = Arc::clone(&catalog);
+		let owner =
+			tokio::spawn(
+				async move { owner_catalog.resolve_table(&TableRef::new("orders")).await },
+			);
+		client.wait_until_started().await;
+
+		let waiter_catalog = Arc::clone(&catalog);
+		let waiter = tokio::spawn(async move {
+			waiter_catalog
+				.resolve_table(&TableRef::with_schema("default", "orders"))
+				.await
+		});
+		sleep(Duration::from_millis(10)).await;
+		client.release();
+
+		let owner = owner.await.expect("owner task").expect("owner result");
+		let waiter = waiter.await.expect("waiter task").expect("waiter result");
+
+		assert_eq!(client.call_count(), 1);
+		assert_eq!(client.max_active(), 1);
+		assert_eq!(owner.legacy_table_id, waiter.legacy_table_id);
+		assert_eq!(catalog.descriptor_sync_metrics().snapshot().success, 1);
+	}
+
+	#[tokio::test]
+	async fn concurrent_same_table_bind_misses_share_one_sync_reservation() {
+		let descriptor = default_descriptor_with_identity(0xD2, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::held([Ok(Some(descriptor))]));
+		let accountant = descriptor_sync_accountant(1);
+		let catalog = Arc::new(catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			accountant.clone(),
+		));
+
+		let owner_catalog = Arc::clone(&catalog);
+		let owner =
+			tokio::spawn(
+				async move { owner_catalog.resolve_table(&TableRef::new("orders")).await },
+			);
+		client.wait_until_started().await;
+
+		let waiter_catalog = Arc::clone(&catalog);
+		let waiter = tokio::spawn(async move {
+			waiter_catalog
+				.resolve_table(&TableRef::with_schema("default", "orders"))
+				.await
+		});
+		sleep(Duration::from_millis(10)).await;
+
+		assert_eq!(accountant.active(TenantId(7)), 1);
+		client.release();
+		owner.await.expect("owner task").expect("owner result");
+		waiter.await.expect("waiter task").expect("waiter result");
+		assert_eq!(accountant.active(TenantId(7)), 0);
+	}
+
+	#[tokio::test]
+	async fn concurrent_same_table_bind_misses_converge_to_one_local_table_id() {
+		let descriptor = default_descriptor_with_identity(0xD3, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::held([Ok(Some(descriptor))]));
+		let catalog = Arc::new(catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		));
+
+		let owner_catalog = Arc::clone(&catalog);
+		let owner =
+			tokio::spawn(
+				async move { owner_catalog.resolve_table(&TableRef::new("orders")).await },
+			);
+		client.wait_until_started().await;
+		let waiter_catalog = Arc::clone(&catalog);
+		let waiter = tokio::spawn(async move {
+			waiter_catalog
+				.resolve_table(&TableRef::with_schema("default", "orders"))
+				.await
+		});
+		sleep(Duration::from_millis(10)).await;
+		client.release();
+
+		let owner = owner.await.expect("owner task").expect("owner result");
+		let waiter = waiter.await.expect("waiter task").expect("waiter result");
+
+		assert_eq!(owner.legacy_table_id, waiter.legacy_table_id);
+		assert_eq!(owner.legacy_table_id, TableId(1));
+	}
+
+	#[tokio::test]
+	async fn qualified_default_and_unqualified_bind_misses_share_singleflight() {
+		let descriptor = default_descriptor_with_identity(0xD4, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::held([Ok(Some(descriptor))]));
+		let catalog = Arc::new(catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		));
+
+		let unqualified = Arc::clone(&catalog);
+		let unqualified =
+			tokio::spawn(async move { unqualified.resolve_table(&TableRef::new("orders")).await });
+		client.wait_until_started().await;
+		let qualified = Arc::clone(&catalog);
+		let qualified = tokio::spawn(async move {
+			qualified
+				.resolve_table(&TableRef::with_schema("default", "orders"))
+				.await
+		});
+		sleep(Duration::from_millis(10)).await;
+		client.release();
+
+		unqualified
+			.await
+			.expect("unqualified task")
+			.expect("unqualified");
+		qualified.await.expect("qualified task").expect("qualified");
+		assert_eq!(client.call_count(), 1);
+	}
+
+	#[tokio::test]
+	async fn tenant_descriptor_sync_accountant_releases_on_cancelled_flight() {
+		let descriptor = default_descriptor_with_identity(0xD5, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::held([Ok(Some(descriptor))]));
+		let accountant = descriptor_sync_accountant(1);
+		let catalog = Arc::new(catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			accountant.clone(),
+		));
+
+		let first_catalog = Arc::clone(&catalog);
+		let first =
+			tokio::spawn(
+				async move { first_catalog.resolve_table(&TableRef::new("orders")).await },
+			);
+		client.wait_until_started().await;
+		assert_eq!(accountant.active(TenantId(7)), 1);
+		first.abort();
+		let _ = first.await;
+		assert_eq!(accountant.active(TenantId(7)), 0);
+
+		let second_catalog = Arc::clone(&catalog);
+		let second =
+			tokio::spawn(
+				async move { second_catalog.resolve_table(&TableRef::new("orders")).await },
+			);
+		client.wait_until_calls(2).await;
+		client.release();
+		second.await.expect("second task").expect("second resolve");
+	}
+
+	#[tokio::test]
+	async fn descriptor_sync_waiter_observes_cancelled_owner() {
+		let descriptor = default_descriptor_with_identity(0xD6, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::held([Ok(Some(descriptor))]));
+		let catalog = Arc::new(catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		));
+
+		let owner_catalog = Arc::clone(&catalog);
+		let owner =
+			tokio::spawn(
+				async move { owner_catalog.resolve_table(&TableRef::new("orders")).await },
+			);
+		client.wait_until_started().await;
+
+		let waiter_catalog = Arc::clone(&catalog);
+		let waiter = tokio::spawn(async move {
+			waiter_catalog
+				.resolve_table(&TableRef::with_schema("default", "orders"))
+				.await
+		});
+		sleep(Duration::from_millis(10)).await;
+		owner.abort();
+		let _ = owner.await;
+
+		let result = timeout(Duration::from_secs(1), waiter)
+			.await
+			.expect("waiter completed")
+			.expect("waiter task");
+		let Err(error) = result else {
+			panic!("waiter should observe cancelled owner");
+		};
+		match error {
+			CatalogError::AdminFailed { message } => {
+				assert!(message.contains("owner cancelled"));
+			}
+			other => panic!("unexpected waiter error: {other}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn storage_scan_uses_synced_descriptor_after_bind_miss() {
+		let descriptor = default_descriptor_with_identity(0xD7, 1);
+		let registry = Arc::new(WendelonDescriptorRegistry::default());
+		let client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(
+			descriptor.clone(),
+		))]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::clone(&registry),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let binding = catalog
+			.resolve_table(&TableRef::new("orders"))
+			.await
+			.expect("resolve synced");
+		let stored = registry
+			.descriptor(TenantId(7), binding.legacy_table_id)
+			.expect("storage-visible descriptor");
+
+		assert_eq!(stored.table_object_id, descriptor.table_object_id);
+		assert_eq!(
+			stored.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+	}
+
+	#[tokio::test]
+	async fn sql_select_binds_wendelon_table_missing_from_startup_bootstrap() {
+		let descriptor = default_descriptor_with_identity(0xD8, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(
+			descriptor.clone(),
+		))]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+		let plan = SqlPlanner::new()
+			.plan("SELECT id, amount FROM orders")
+			.expect("plan select");
+
+		bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind select");
+
+		assert_eq!(client.call_count(), 1);
+	}
+
+	#[tokio::test]
+	async fn sql_insert_binds_wendelon_table_missing_from_startup_bootstrap() {
+		let descriptor = default_descriptor_with_identity(0xD9, 1);
+		let client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(descriptor))]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+		let plan = SqlPlanner::new()
+			.plan("INSERT INTO orders (id, amount, region) VALUES (1, 20, 'west')")
+			.expect("plan insert");
+
+		bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind insert");
+
+		assert_eq!(client.call_count(), 1);
+	}
+
+	#[tokio::test]
+	async fn create_if_not_exists_local_miss_does_not_descriptor_get() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let client = Arc::new(FakeDescriptorSyncClient::new([]));
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let error = expect_catalog_error(
+			catalog
+				.create_table(&TableRef::new("orders"), schema, true)
+				.await,
+			"admin client missing",
+		);
+
+		assert!(matches!(error, CatalogError::AdminFailed { .. }));
+		assert_eq!(client.call_count(), 0);
+	}
+
+	#[tokio::test]
+	async fn registry_sync_descriptor_for_tenant_rejects_name_mismatch() {
+		let registry = WendelonDescriptorRegistry::default();
+
+		let error = expect_catalog_error(
+			registry.sync_descriptor_for_tenant(
+				TenantId(7),
+				&TableRef::with_schema("bench", "invoices"),
+				descriptor(),
+			),
+			"name mismatch",
+		);
+
+		assert!(matches!(error, CatalogError::AdminFailed { .. }));
+	}
+
+	#[tokio::test]
+	async fn registry_sync_descriptor_for_tenant_allocates_fresh_local_table_id() {
+		let descriptor = descriptor();
+		let registry = WendelonDescriptorRegistry::from_descriptors_for_tenant(
+			TenantId(7),
+			[(
+				TableId(7),
+				named_descriptor_with_identity(0xA1, 1, "bench", "customers"),
+			)],
+		)
+		.expect("registry");
+
+		let resolved = registry
+			.sync_descriptor_for_tenant(
+				TenantId(7),
+				&TableRef::with_schema("bench", "orders"),
+				descriptor.clone(),
+			)
+			.expect("sync descriptor");
+
+		assert_ne!(resolved.legacy_table_id, TableId(7));
+		assert_eq!(resolved.legacy_table_id, TableId(8));
+		assert_eq!(resolved.table, descriptor.table_object_id);
+	}
+
+	#[tokio::test]
+	async fn registry_sync_descriptor_for_tenant_preserves_physical_fingerprint() {
+		let descriptor = descriptor();
+		let registry = WendelonDescriptorRegistry::default();
+
+		let resolved = registry
+			.sync_descriptor_for_tenant(
+				TenantId(7),
+				&TableRef::with_schema("bench", "orders"),
+				descriptor.clone(),
+			)
+			.expect("sync descriptor");
+
+		assert_eq!(resolved.table, descriptor.table_object_id);
+		assert_eq!(
+			resolved.fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+	}
+
+	#[tokio::test]
+	async fn registry_sync_descriptor_for_tenant_returns_existing_same_identity() {
+		let descriptor = descriptor();
+		let registry = WendelonDescriptorRegistry::from_descriptors_for_tenant(
+			TenantId(7),
+			[(TableId(9), descriptor.clone())],
+		)
+		.expect("registry");
+
+		let resolved = registry
+			.sync_descriptor_for_tenant(
+				TenantId(7),
+				&TableRef::with_schema("bench", "orders"),
+				descriptor,
+			)
+			.expect("same identity");
+
+		assert_eq!(resolved.legacy_table_id, TableId(9));
+	}
+
+	#[tokio::test]
+	async fn registry_sync_descriptor_for_tenant_rejects_existing_conflict() {
+		let registry = WendelonDescriptorRegistry::from_descriptors_for_tenant(
+			TenantId(7),
+			[(TableId(9), descriptor_with_identity(0xCA, 3))],
+		)
+		.expect("registry");
+
+		let error = expect_catalog_error(
+			registry.sync_descriptor_for_tenant(
+				TenantId(7),
+				&TableRef::with_schema("bench", "orders"),
+				descriptor_with_identity(0xCB, 3),
+			),
+			"conflict",
+		);
+
+		assert!(matches!(error, CatalogError::AdminFailed { .. }));
+	}
+
+	#[tokio::test]
+	async fn descriptor_sync_is_tenant_scoped_across_same_table_name() {
+		let tenant_7_descriptor = default_descriptor_with_identity(0xE7, 1);
+		let tenant_8_descriptor = default_descriptor_with_identity(0xE8, 1);
+		let registry = Arc::new(WendelonDescriptorRegistry::default());
+		let tenant_7_client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(
+			tenant_7_descriptor.clone(),
+		))]));
+		let tenant_8_client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(
+			tenant_8_descriptor.clone(),
+		))]));
+		let tenant_7 = catalog_with_fake_client(
+			TenantId(7),
+			Arc::clone(&registry),
+			Arc::clone(&tenant_7_client),
+			descriptor_sync_accountant(1),
+		);
+		let tenant_8 = catalog_with_fake_client(
+			TenantId(8),
+			registry,
+			Arc::clone(&tenant_8_client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved_7 = tenant_7
+			.resolve_table(&TableRef::new("orders"))
+			.await
+			.expect("tenant 7");
+		let resolved_8 = tenant_8
+			.resolve_table(&TableRef::new("orders"))
+			.await
+			.expect("tenant 8");
+
+		assert_eq!(resolved_7.table, tenant_7_descriptor.table_object_id);
+		assert_eq!(resolved_8.table, tenant_8_descriptor.table_object_id);
+		assert_ne!(resolved_7.table, resolved_8.table);
+	}
+
+	#[tokio::test]
 	async fn wendelon_catalog_scoped_views_resolve_same_table_name_per_tenant() {
 		let tenant_7_descriptor = descriptor_with_identity(0xA7, 7);
 		let tenant_8_descriptor = descriptor_with_identity(0xA8, 8);
@@ -1119,6 +2394,9 @@ mod tests {
 			.expect("tenant 8 descriptor");
 		let catalog = Arc::new(WendelonCatalog {
 			client: None,
+			descriptor_sync_client: None,
+			descriptor_sync_flights: None,
+			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 			tenant_id: TenantId(1),
 			registry,
 		});
@@ -1167,7 +2445,20 @@ mod tests {
 		descriptor_with_identity(0xCA, 3)
 	}
 
+	fn default_descriptor_with_identity(id_byte: u8, generation: u64) -> TableSchemaDescriptor {
+		named_descriptor_with_identity(id_byte, generation, "default", "orders")
+	}
+
 	fn descriptor_with_identity(id_byte: u8, generation: u64) -> TableSchemaDescriptor {
+		named_descriptor_with_identity(id_byte, generation, "bench", "orders")
+	}
+
+	fn named_descriptor_with_identity(
+		id_byte: u8,
+		generation: u64,
+		namespace: &str,
+		table_name: &str,
+	) -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("amount", DataType::Int32, true),
@@ -1177,8 +2468,8 @@ mod tests {
 		TableSchemaDescriptor::new(
 			TableObjectId::new([id_byte; 16]),
 			generation,
-			"bench",
-			"orders",
+			namespace,
+			table_name,
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicy::default_table_spread(),

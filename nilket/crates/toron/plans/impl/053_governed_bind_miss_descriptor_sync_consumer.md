@@ -1,6 +1,6 @@
 # Impl Plan 053: Governed Bind-Miss Descriptor Sync Consumer
 
-**Status:** Promoted, paired with
+**Status:** Promoted + implemented, paired with
 `plans/adr/053_governed_bind_miss_descriptor_sync_consumer.md`.
 **Posture:** Single plan, Toron-ring only. Consumes the Wendelon 072
 producer. No Wendelon server change, no SQL wire change. Six phases,
@@ -103,7 +103,15 @@ flight (owner: `try_reserve` → on full `CatalogError::ResourceExhausted
 { "tenant descriptor sync limit exhausted" }`; `get_table_schema_descriptor`;
 `Ok(None)`→`TableNotFound`; `Ok(Some)`→`sync_descriptor_for_tenant`→
 return binding; `Err`→`AdminFailed` "descriptor sync failed"); waiter:
-await flight, re-resolve once. No coordinator change.
+await flight, re-resolve once. No coordinator bind-path change.
+
+DDL exception discovered during implementation: the storage-admin
+`DROP TABLE` helper resolves table identity at execution time, but D14
+requires create/drop paths to stay off descriptor sync. The narrow fix is
+a `Catalog::resolve_table_local` default method plus a `WendelonCatalog`
+override that reads only the local registry; the drop helper uses this
+local-only lookup before storage reclaim. The coordinator bind path and
+descriptor-evolved retry loop remain unchanged.
 
 `daemon.rs::map_sql_query_error`: add an arm matching
 `QueryError::Binding(BindingError::Catalog(CatalogError::ResourceExhausted{..}))`
@@ -142,14 +150,14 @@ extend the unit tests.
 
 ## Acceptance checklist
 
-- [ ] Phase 1 client facade + tests.
-- [ ] Phase 2 config + `max_concurrent_descriptor_syncs` + sync
+- [x] Phase 1 client facade + tests.
+- [x] Phase 2 config + `max_concurrent_descriptor_syncs` + sync
       accountant + `CatalogError::ResourceExhausted`.
-- [ ] Phase 3 single-flight shared via `scoped()`, owner-only
+- [x] Phase 3 single-flight shared via `scoped()`, owner-only
       reservation, cancellation-clears-flight.
-- [ ] Phase 4 insert-only `sync_descriptor_for_tenant` returning the
+- [x] Phase 4 insert-only `sync_descriptor_for_tenant` returning the
       binding.
-- [ ] Phase 5 `resolve_table` integration + daemon ResourceExhausted
-      arm; no coordinator change.
-- [ ] Phase 6 19+3 guards, 29 fixtures, prior ADR guards pass, evidence
+- [x] Phase 5 `resolve_table` integration + daemon ResourceExhausted
+      arm; DROP identity lookup is local-only via `resolve_table_local`.
+- [x] Phase 6 19+3 guards, 29 fixtures, prior ADR guards pass, evidence
       + roadmap.

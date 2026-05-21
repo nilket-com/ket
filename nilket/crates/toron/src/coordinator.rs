@@ -491,7 +491,7 @@ async fn drop_existing_table_with_storage_admin(
 	name: &crate::catalog::TableRef,
 	if_exists: bool,
 ) -> Result<bool, QueryError> {
-	let binding = match catalog.resolve_table(name).await {
+	let binding = match catalog.resolve_table_local(name).await {
 		Ok(binding) => binding,
 		Err(CatalogError::TableNotFound { .. }) if if_exists => return Ok(false),
 		Err(error) => return Err(QueryError::Catalog(error)),

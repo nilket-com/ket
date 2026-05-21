@@ -105,6 +105,14 @@ fn toron_example_config_loads() {
 		config.tenant_budgets.default.max_concurrent_queries.get(),
 		1
 	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.default
+			.max_concurrent_descriptor_syncs
+			.get(),
+		1
+	);
 }
 
 #[test]
@@ -112,7 +120,7 @@ fn tenant_concurrency_policy_config_round_trips() {
 	let dir = fresh_dir("tenant-budget-round-trip");
 	let path = dir.join("toron.toml");
 	let config = format!(
-		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 3\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nmax_concurrent_queries = 2\n",
+		"{}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 3\nmax_concurrent_descriptor_syncs = 2\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nmax_concurrent_queries = 2\nmax_concurrent_descriptor_syncs = 1\n",
 		render_example_config()
 	);
 	std::fs::write(&path, config).expect("write config");
@@ -130,6 +138,14 @@ fn tenant_concurrency_policy_config_round_trips() {
 	assert_eq!(
 		config.tenant_budgets.default.max_concurrent_queries.get(),
 		3
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.default
+			.max_concurrent_descriptor_syncs
+			.get(),
+		2
 	);
 	assert_eq!(
 		config
@@ -153,6 +169,14 @@ fn tenant_concurrency_policy_config_round_trips() {
 			.get(),
 		2
 	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.budget_for(TenantId(7))
+			.max_concurrent_descriptor_syncs
+			.get(),
+		1
+	);
 }
 
 #[test]
@@ -174,10 +198,26 @@ fn tenant_concurrency_omitted_config_derives_default() {
 	assert_eq!(
 		config
 			.tenant_budgets
+			.default
+			.max_concurrent_descriptor_syncs
+			.get(),
+		2
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
 			.budget_for(TenantId(7))
 			.max_concurrent_queries
 			.get(),
 		4
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.budget_for(TenantId(7))
+			.max_concurrent_descriptor_syncs
+			.get(),
+		2
 	);
 }
 
@@ -195,6 +235,62 @@ fn tenant_concurrency_config_rejects_zero() {
 			.to_string()
 			.contains("tenant_budgets max_concurrent_queries must be greater than 0"),
 		"{error}"
+	);
+}
+
+#[test]
+fn tenant_budget_config_accepts_descriptor_sync_limit() {
+	let dir = fresh_dir("tenant-descriptor-sync-accepts");
+	let path = dir.join("toron.toml");
+	let snippet = "[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 4\nmax_concurrent_descriptor_syncs = 2\n";
+	std::fs::write(&path, format!("{}\n{snippet}", render_example_config())).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load config");
+
+	assert_eq!(
+		config
+			.tenant_budgets
+			.default
+			.max_concurrent_descriptor_syncs
+			.get(),
+		2
+	);
+}
+
+#[test]
+fn tenant_budget_config_rejects_zero_descriptor_sync_limit() {
+	let dir = fresh_dir("tenant-descriptor-sync-zero");
+	let path = dir.join("toron.toml");
+	let snippet = "[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_descriptor_syncs = 0\n";
+	std::fs::write(&path, format!("{}\n{snippet}", render_example_config())).expect("write config");
+
+	let error =
+		load_toron_bootstrap_config(&path).expect_err("zero descriptor sync must be rejected");
+
+	assert!(
+		error
+			.to_string()
+			.contains("tenant_budgets max_concurrent_descriptor_syncs must be greater than 0"),
+		"{error}"
+	);
+}
+
+#[test]
+fn tenant_budget_config_derives_descriptor_sync_limit_when_omitted() {
+	let dir = fresh_dir("tenant-descriptor-sync-derived");
+	let path = dir.join("toron.toml");
+	let snippet = "[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 4\n";
+	std::fs::write(&path, format!("{}\n{snippet}", render_example_config())).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load config");
+
+	assert_eq!(
+		config
+			.tenant_budgets
+			.default
+			.max_concurrent_descriptor_syncs
+			.get(),
+		2
 	);
 }
 
@@ -225,6 +321,11 @@ fn tenant_budget_config_rejects_zero_duplicate_and_per_task_over_aggregate() {
 			"zero-concurrency",
 			"[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_queries = 0\n",
 			"tenant_budgets max_concurrent_queries must be greater than 0",
+		),
+		(
+			"zero-descriptor-sync",
+			"[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_descriptor_syncs = 0\n",
+			"tenant_budgets max_concurrent_descriptor_syncs must be greater than 0",
 		),
 	] {
 		let dir = fresh_dir(tag);

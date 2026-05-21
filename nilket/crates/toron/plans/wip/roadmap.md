@@ -4230,9 +4230,9 @@ along with the forward-sequence rewrite.
   `plans/impl/052_per_tenant_concurrency_admission.md`.
 
 - **ADR 053 — Governed Bind-Miss Descriptor Sync Consumer.**
-  Promoted. The Toron **consumer** of the Wendelon ADR 072 producer —
-  the second half of the ADR 052 §D15 / Wendelon ADR 072 §D14 sequence,
-  now ungated.
+  Promoted + implemented. The Toron **consumer** of the Wendelon ADR 072
+  producer — the second half of the ADR 052 §D15 / Wendelon ADR 072
+  §D14 sequence, now ungated.
   `WendelonCatalog::resolve_table` becomes self-healing: on a local
   registry miss for the scoped tenant it fetches the exact
   `(tenant_id, namespace, table_name)` descriptor via the public
@@ -4271,7 +4271,9 @@ along with the forward-sequence rewrite.
   TTL / background sync (future ADRs); `crates/nilket` runtime-free;
   `toron_fixture_worker.rs` unchanged. Placement: Exterior Substrate →
   Toron home. The six-phase migration is materialized in
-  `plans/impl/053_governed_bind_miss_descriptor_sync_consumer.md`.
+  `plans/impl/053_governed_bind_miss_descriptor_sync_consumer.md`;
+  evidence:
+  `plans/impl/053_governed_bind_miss_descriptor_sync_consumer_evidence.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4356,16 +4358,17 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 053 promoted; ADR 054 candidates
+### ADR 053 implemented; ADR 054 candidates
 
-ADR 053 selected and promoted **Governed Bind-Miss Descriptor Sync
-Consumer** — the Toron consumer of the Wendelon ADR 072 producer, the
-second half of the ADR 052 §D15 / Wendelon ADR 072 §D14 sequence, now
-ungated. It completes the
+ADR 053 selected, promoted, and implemented **Governed Bind-Miss
+Descriptor Sync Consumer** — the Toron consumer of the Wendelon ADR 072
+producer, the second half of the ADR 052 §D15 / Wendelon ADR 072 §D14
+sequence, now ungated. It completes the
 descriptor-liveness arc: `WendelonCatalog::resolve_table` self-heals a
 bind miss by fetching the exact descriptor from Wendelon and
-in-place-merging it (insert-only) into the shared registry, governed by
-a per-tenant `max_concurrent_descriptor_syncs` budget + single-flight.
+in-place-merging it through `sync_descriptor_for_tenant` (insert-only)
+into the shared registry, governed by a per-tenant
+`max_concurrent_descriptor_syncs` budget + single-flight.
 A throttled sync is `ResourceExhausted` (not `TableNotFound`); staleness
 is fail-closed via the unchanged `DescriptorEvolved`. The topic
 converged 3-of-3 (Claude withdrew an iter-0 Governance-Phase-3 contest
@@ -4394,7 +4397,9 @@ server change, zero SQL wire change.**
 - Placement: Exterior Substrate → Toron home.
 
 The six-phase migration is materialized in
-`plans/impl/053_governed_bind_miss_descriptor_sync_consumer.md`.
+`plans/impl/053_governed_bind_miss_descriptor_sync_consumer.md`; evidence
+is recorded in
+`plans/impl/053_governed_bind_miss_descriptor_sync_consumer_evidence.md`.
 
 **ADR 054 candidates:**
 

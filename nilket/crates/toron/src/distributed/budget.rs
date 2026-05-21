@@ -109,6 +109,7 @@ pub struct TenantBudget {
 	pub memory_per_task: ByteCount,
 	pub aggregate_memory: ByteCount,
 	pub max_concurrent_queries: NonZeroU32,
+	pub max_concurrent_descriptor_syncs: NonZeroU32,
 }
 
 impl TenantBudget {
@@ -125,10 +126,25 @@ impl TenantBudget {
 		aggregate_memory: ByteCount,
 		max_concurrent_queries: NonZeroU32,
 	) -> Self {
+		Self::with_query_and_descriptor_sync_limits(
+			memory_per_task,
+			aggregate_memory,
+			max_concurrent_queries,
+			derive_max_concurrent_descriptor_syncs(max_concurrent_queries),
+		)
+	}
+
+	pub const fn with_query_and_descriptor_sync_limits(
+		memory_per_task: ByteCount,
+		aggregate_memory: ByteCount,
+		max_concurrent_queries: NonZeroU32,
+		max_concurrent_descriptor_syncs: NonZeroU32,
+	) -> Self {
 		Self {
 			memory_per_task,
 			aggregate_memory,
 			max_concurrent_queries,
+			max_concurrent_descriptor_syncs,
 		}
 	}
 }
@@ -141,6 +157,20 @@ pub fn derive_max_concurrent_queries(
 	let slots = (aggregate_memory.get() / per_task).max(1);
 	let slots = u32::try_from(slots).unwrap_or(u32::MAX);
 	NonZeroU32::new(slots).expect("derived concurrency is nonzero")
+}
+
+pub const fn derive_max_concurrent_descriptor_syncs(
+	max_concurrent_queries: NonZeroU32,
+) -> NonZeroU32 {
+	let slots = if max_concurrent_queries.get() < 2 {
+		max_concurrent_queries.get()
+	} else {
+		2
+	};
+	match NonZeroU32::new(slots) {
+		Some(slots) => slots,
+		None => unreachable!(),
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,9 +196,10 @@ impl TenantBudgetPolicy {
 	/// Daemon construction must override this with the normalized config policy.
 	pub fn from_query_budget(query_budget: QueryBudget) -> Self {
 		Self {
-			default: TenantBudget::with_max_concurrent_queries(
+			default: TenantBudget::with_query_and_descriptor_sync_limits(
 				query_budget.memory_per_task,
 				query_budget.memory_per_task,
+				NonZeroU32::new(1).expect("one is nonzero"),
 				NonZeroU32::new(1).expect("one is nonzero"),
 			),
 			per_tenant: HashMap::new(),
@@ -241,6 +272,13 @@ pub struct BudgetRejection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantConcurrencyRejection {
+	pub tenant_id: TenantId,
+	pub requested: u32,
+	pub available: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantDescriptorSyncRejection {
 	pub tenant_id: TenantId,
 	pub requested: u32,
 	pub available: u32,
@@ -609,6 +647,104 @@ impl Drop for TenantConcurrencyReservation {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct TenantDescriptorSyncAccountant {
+	policy: TenantBudgetPolicy,
+	active: Arc<Mutex<HashMap<TenantId, u32>>>,
+}
+
+impl TenantDescriptorSyncAccountant {
+	pub fn new(policy: TenantBudgetPolicy) -> Self {
+		Self {
+			policy,
+			active: Arc::new(Mutex::new(HashMap::new())),
+		}
+	}
+
+	pub fn try_reserve(
+		&self,
+		tenant_id: TenantId,
+	) -> Result<TenantDescriptorSyncReservation, TenantDescriptorSyncRejection> {
+		let mut active = self
+			.active
+			.lock()
+			.expect("tenant descriptor sync accountant poisoned");
+		let current = active.get(&tenant_id).copied().unwrap_or(0);
+		let limit = self
+			.policy
+			.budget_for(tenant_id)
+			.max_concurrent_descriptor_syncs
+			.get();
+		let available = limit.saturating_sub(current);
+		if available == 0 {
+			return Err(TenantDescriptorSyncRejection {
+				tenant_id,
+				requested: 1,
+				available,
+			});
+		}
+		active.insert(tenant_id, current + 1);
+		Ok(TenantDescriptorSyncReservation {
+			active: Arc::clone(&self.active),
+			tenant_id,
+			released: false,
+		})
+	}
+
+	pub fn active(&self, tenant_id: TenantId) -> u32 {
+		self.active
+			.lock()
+			.expect("tenant descriptor sync accountant poisoned")
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(0)
+	}
+
+	pub fn snapshot(&self) -> HashMap<TenantId, u32> {
+		self.active
+			.lock()
+			.expect("tenant descriptor sync accountant poisoned")
+			.clone()
+	}
+}
+
+#[derive(Debug)]
+pub struct TenantDescriptorSyncReservation {
+	active: Arc<Mutex<HashMap<TenantId, u32>>>,
+	tenant_id: TenantId,
+	released: bool,
+}
+
+impl TenantDescriptorSyncReservation {
+	pub fn release(mut self) {
+		self.release_once();
+	}
+
+	fn release_once(&mut self) {
+		if self.released {
+			return;
+		}
+		let mut active = self
+			.active
+			.lock()
+			.expect("tenant descriptor sync accountant poisoned");
+		let current = active.get(&self.tenant_id).copied().unwrap_or(0);
+		let updated = current.saturating_sub(1);
+		if updated == 0 {
+			active.remove(&self.tenant_id);
+		} else {
+			active.insert(self.tenant_id, updated);
+		}
+		self.released = true;
+	}
+}
+
+impl Drop for TenantDescriptorSyncReservation {
+	fn drop(&mut self) {
+		self.release_once();
+	}
+}
+
 impl BudgetState {
 	fn limit_for(&self, dimension: BudgetDimension) -> ByteCount {
 		match dimension {
@@ -739,12 +875,14 @@ mod tests {
 	fn tenant_budget_derives_concurrency_from_memory_ratio() {
 		let budget = TenantBudget::new(ByteCount::new(8), ByteCount::new(32));
 		assert_eq!(budget.max_concurrent_queries.get(), 4);
+		assert_eq!(budget.max_concurrent_descriptor_syncs.get(), 2);
 
 		let fallback = TenantBudgetPolicy::from_query_budget(QueryBudget {
 			memory_per_task: ByteCount::new(8),
 			..QueryBudget::test_default()
 		});
 		assert_eq!(fallback.default.max_concurrent_queries.get(), 1);
+		assert_eq!(fallback.default.max_concurrent_descriptor_syncs.get(), 1);
 	}
 
 	#[test]
@@ -851,6 +989,71 @@ mod tests {
 		let _tenant_8_b = accountant
 			.try_reserve(TenantId(8))
 			.expect("tenant 8 second reserve");
+		assert_eq!(accountant.active(TenantId(8)), 2);
+	}
+
+	#[test]
+	fn tenant_descriptor_sync_accountant_releases_on_drop() {
+		let policy = TenantBudgetPolicy::new(
+			TenantBudget::with_query_and_descriptor_sync_limits(
+				ByteCount::new(8),
+				ByteCount::new(16),
+				NonZeroU32::new(2).expect("nonzero"),
+				NonZeroU32::new(1).expect("nonzero"),
+			),
+			HashMap::new(),
+		);
+		let accountant = TenantDescriptorSyncAccountant::new(policy);
+
+		let reservation = accountant.try_reserve(TenantId(7)).expect("reserve");
+		assert_eq!(accountant.active(TenantId(7)), 1);
+		assert!(accountant.try_reserve(TenantId(7)).is_err());
+
+		drop(reservation);
+
+		assert_eq!(accountant.active(TenantId(7)), 0);
+		assert!(accountant.try_reserve(TenantId(7)).is_ok());
+	}
+
+	#[test]
+	fn tenant_descriptor_sync_accountant_isolated_by_tenant() {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			TenantBudget::with_query_and_descriptor_sync_limits(
+				ByteCount::new(8),
+				ByteCount::new(16),
+				NonZeroU32::new(2).expect("nonzero"),
+				NonZeroU32::new(1).expect("nonzero"),
+			),
+		);
+		per_tenant.insert(
+			TenantId(8),
+			TenantBudget::with_query_and_descriptor_sync_limits(
+				ByteCount::new(8),
+				ByteCount::new(16),
+				NonZeroU32::new(2).expect("nonzero"),
+				NonZeroU32::new(2).expect("nonzero"),
+			),
+		);
+		let policy = TenantBudgetPolicy::new(
+			TenantBudget::with_query_and_descriptor_sync_limits(
+				ByteCount::new(8),
+				ByteCount::new(16),
+				NonZeroU32::new(2).expect("nonzero"),
+				NonZeroU32::new(1).expect("nonzero"),
+			),
+			per_tenant,
+		);
+		let accountant = TenantDescriptorSyncAccountant::new(policy);
+
+		let _tenant_7 = accountant.try_reserve(TenantId(7)).expect("tenant 7");
+		let _tenant_8_a = accountant.try_reserve(TenantId(8)).expect("tenant 8 a");
+		let _tenant_8_b = accountant.try_reserve(TenantId(8)).expect("tenant 8 b");
+
+		assert!(accountant.try_reserve(TenantId(7)).is_err());
+		assert!(accountant.try_reserve(TenantId(8)).is_err());
+		assert_eq!(accountant.active(TenantId(7)), 1);
 		assert_eq!(accountant.active(TenantId(8)), 2);
 	}
 }

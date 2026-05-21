@@ -22,7 +22,9 @@ use crate::config::{
 	ToronWendelonStorageConfig, load_descriptor_bootstrap, load_toron_bootstrap_config,
 };
 use crate::coordinator::DistributedQueryCoordinator;
-use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget};
+use crate::distributed::budget::{
+	BudgetDimension, ByteCount, QueryBudget, TenantDescriptorSyncAccountant,
+};
 use crate::distributed::identity::{LeaseEpoch, QueryId};
 use crate::distributed::partition_store::InMemoryPartitionStore;
 use crate::distributed::worker_registry::{
@@ -150,12 +152,17 @@ impl ToronDaemon {
 		tracing::info!("descriptor_registry_constructed");
 
 		let tenant_id = config.node.tenant_id;
+		let descriptor_sync_accountant =
+			TenantDescriptorSyncAccountant::new(config.tenant_budgets.clone());
 
-		let catalog = Arc::new(WendelonCatalog::with_client_and_registry(
-			Arc::clone(&client),
-			tenant_id,
-			Arc::clone(&registry),
-		));
+		let catalog = Arc::new(
+			WendelonCatalog::with_client_and_registry_and_descriptor_sync_accountant(
+				Arc::clone(&client),
+				tenant_id,
+				Arc::clone(&registry),
+				descriptor_sync_accountant,
+			),
+		);
 		let scanner = Arc::new(WendelonStorageScan::with_descriptor_registry(
 			Arc::clone(&client),
 			Arc::clone(&registry),
@@ -252,6 +259,7 @@ impl ToronDaemon {
 			descriptors_loaded,
 			config.coordinator.static_workers.len() as u64,
 			config.tenant_budgets.clone(),
+			catalog.descriptor_sync_metrics(),
 			coordinator.tenant_memory_accountant(),
 			coordinator.tenant_concurrency_accountant(),
 			coordinator.admission_rejection_counters(),
@@ -768,6 +776,10 @@ fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {
 	let (code, message) = match &error {
 		QueryError::Frontend(FrontendError::SqlParse { .. }) => (SqlErrorCode::SyntaxError, None),
 		QueryError::Frontend(_) => (SqlErrorCode::PlanningError, None),
+		QueryError::Binding(BindingError::Catalog(CatalogError::ResourceExhausted { message }))
+		| QueryError::Catalog(CatalogError::ResourceExhausted { message }) => {
+			(SqlErrorCode::ResourceExhausted, Some(message.as_str()))
+		}
 		QueryError::Binding(BindingError::Catalog(_)) => (SqlErrorCode::CatalogError, None),
 		QueryError::Binding(_) => (SqlErrorCode::BindingError, None),
 		QueryError::Catalog(_) => (SqlErrorCode::CatalogError, None),
@@ -1020,6 +1032,17 @@ mod tests {
 
 		assert_eq!(code, SqlErrorCode::ResourceExhausted);
 		assert_eq!(message, "tenant concurrency limit exhausted");
+	}
+
+	#[test]
+	fn catalog_resource_exhausted_maps_to_resource_exhausted_sql_error() {
+		let (code, message) =
+			map_sql_query_error(QueryError::Catalog(CatalogError::ResourceExhausted {
+				message: "tenant descriptor sync limit exhausted".to_string(),
+			}));
+
+		assert_eq!(code, SqlErrorCode::ResourceExhausted);
+		assert_eq!(message, "tenant descriptor sync limit exhausted");
 	}
 
 	#[test]

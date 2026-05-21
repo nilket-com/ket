@@ -16,6 +16,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use toron::catalog::DescriptorSyncMetrics;
 use toron::config::{
 	CoordinatorConfig, LISTENER_BIND_COLLISION_DIAGNOSTIC,
 	OBSERVABILITY_HEALTH_LOOPBACK_DIAGNOSTIC, OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC,
@@ -92,6 +93,7 @@ fn sample_resource_metrics_body() -> String {
 		0,
 		0,
 		policy,
+		Arc::new(DescriptorSyncMetrics::default()),
 		tenant_memory,
 		tenant_concurrency,
 		admission_rejections,
@@ -414,6 +416,28 @@ fn general_daemon_metrics_do_not_gain_tenant_labels() {
 	assert!(!body.contains("daemon_uptime_seconds{tenant_id"));
 	assert!(!body.contains("descriptors_loaded{tenant_id"));
 	assert!(!body.contains("static_workers_configured{tenant_id"));
+}
+
+#[test]
+fn catalog_descriptor_sync_metrics_are_aggregate_outcome_only() {
+	let body = sample_resource_metrics_body();
+
+	for metric in [
+		"catalog_descriptor_sync_requests_total{outcome=\"success\"} 0\n",
+		"catalog_descriptor_sync_requests_total{outcome=\"not_found\"} 0\n",
+		"catalog_descriptor_sync_requests_total{outcome=\"throttled\"} 0\n",
+		"catalog_descriptor_sync_requests_total{outcome=\"error\"} 0\n",
+	] {
+		assert!(body.contains(metric), "missing metric {metric} in {body}");
+	}
+	for forbidden in [
+		"catalog_descriptor_sync_requests_total{tenant_id",
+		"catalog_descriptor_sync_requests_total{namespace",
+		"catalog_descriptor_sync_requests_total{table",
+		"catalog_descriptor_sync_requests_total{object",
+	] {
+		assert!(!body.contains(forbidden), "{forbidden} leaked into metrics");
+	}
 }
 
 #[tokio::test]
