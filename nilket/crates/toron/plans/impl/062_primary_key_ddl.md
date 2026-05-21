@@ -1,6 +1,7 @@
 # Impl Plan 062: Primary-Key DDL for Toron-Created Tables
 
-**Status:** Promoted, paired with `plans/adr/062_primary_key_ddl.md`.
+**Status:** Implemented, paired with `plans/adr/062_primary_key_ddl.md`.
+Evidence: `plans/impl/062_primary_key_ddl_evidence.md`.
 **Posture:** Toron SQL/coordinator + catalog only. Exposes Wendelon's existing
 PK substrate via DDL; **no new Wendelon wire/storage primitive, no worker
 protocol, no DDL type-surface widening.** Six implementation phases after a
@@ -110,17 +111,17 @@ planner -> IR -> catalog, and the catalog mapping PK to
 
 ## Acceptance checklist
 
-- [ ] Phase 1: `CreateTableRowIdentity` (IR) + `TableRowIdentity` (binding).
-- [ ] Phase 2: planner helper validates single-col / NOT-NULL / supported-type
+- [x] Phase 1: `CreateTableRowIdentity` (IR) + `TableRowIdentity` (binding).
+- [x] Phase 2: planner helper validates single-col / NOT-NULL / supported-type
       / exists; column + table syntax; rejects composite/dup/UNIQUE/CTAS-PK/
       nullable/unsupported-type.
-- [ ] Phase 3: `row_identity` on Logical + Execution CreateTable; binder
+- [x] Phase 3: `row_identity` on Logical + Execution CreateTable; binder
       preserves.
-- [ ] Phase 4: catalog create accepts identity; Wendelon maps PK →
+- [x] Phase 4: catalog create accepts identity; Wendelon maps PK →
       `PrimaryKeyDescriptorV1::single`; no-PK → AppendOnly; 061 outcome + D12
       preserved.
-- [ ] Phase 5: `TableRowIdentity` binding; IF-NOT-EXISTS compat compares
+- [x] Phase 5: `TableRowIdentity` binding; IF-NOT-EXISTS compat compares
       identity; fail-closed content-hash.
-- [ ] Phase 6: 18 + 3 + meta guards; ADR 038 + CREATE-TABLE-PK test retargets;
+- [x] Phase 6: 18 + 3 + meta guards; ADR 038 + CREATE-TABLE-PK test retargets;
       16 fixtures; evidence + roadmap; no UPDATE / RETURNING / CTAS-PK / DDL-
       type-widening / Wendelon-storage drift.

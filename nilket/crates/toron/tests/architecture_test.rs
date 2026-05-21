@@ -9,7 +9,7 @@ use toron::catalog::MockCatalog;
 use toron::distributed::identity::WorkerId;
 use toron::error::{BindingError, StorageError};
 use toron::exec::Executor;
-use toron::ir::{Expr, LogicalPlan, ScalarValue, TableId};
+use toron::ir::{CreateTableRowIdentity, Expr, LogicalPlan, ScalarValue, TableId};
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, ListenerRole, PeerKind, admit_san, canonical_client_dns_name,
 	canonical_daemon_dns_name, canonical_monitor_dns_name,
@@ -2645,10 +2645,10 @@ fn adr029_create_table_type_lattice_is_ddl_specific() {
 fn adr029_create_table_column_options_are_narrow() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
-	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_column_nullability")
+	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_column_options")
 		.into_iter()
 		.next()
-		.expect("lower_create_table_column_nullability body")
+		.expect("lower_create_table_column_options body")
 		.1;
 
 	for marker in [
@@ -2656,6 +2656,7 @@ fn adr029_create_table_column_options_are_narrow() {
 		"ColumnOption::NotNull => false",
 		"ColumnOption::Default",
 		"ColumnOption::Unique",
+		"is_primary",
 		"ColumnOption::Check",
 		"ColumnOption::ForeignKey",
 		"ColumnOption::Generated",
@@ -2727,7 +2728,8 @@ fn adr029_mock_catalog_identity_uses_descriptor_fingerprint() {
 		.1;
 
 	assert!(body.contains("TableObjectId::new"));
-	assert!(body.contains("TableSchemaDescriptor::new_with_layout"));
+	assert!(body.contains("create_table_descriptor"));
+	assert!(catalog.contains("TableSchemaDescriptor::new_with_layout"));
 	assert!(body.contains("physical_descriptor_fingerprint"));
 	assert!(!catalog.contains("PhysicalDescriptorFingerprint::from_bytes"));
 }
@@ -2819,13 +2821,12 @@ fn adr029_coordinators_intercept_create_table() {
 		.next()
 		.expect("execute_catalog_plan helper body")
 		.1;
-	assert!(helper_body.contains(".create_table(name, schema.clone(), *if_not_exists)"));
+	assert!(helper_body.contains(".create_table_with_outcome("));
+	assert!(helper_body.contains("row_identity.clone()"));
 	assert!(helper_body.contains("Ok(Vec::new())"));
 	assert_eq!(
-		coordinator
-			.matches("create_table(name, schema.clone(), *if_not_exists)")
-			.count(),
-		1
+		coordinator.matches(".create_table_with_outcome(").count(),
+		2
 	);
 }
 
@@ -11676,6 +11677,311 @@ fn adr061_prior_adr033_to_060_guards_continue_to_pass_except_retarget() {
 }
 
 #[test]
+fn adr062_create_table_row_identity_type_is_toron_local() {
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+
+	assert!(logical.contains("pub enum CreateTableRowIdentity"));
+	assert!(logical.contains("AppendOnly"));
+	assert!(logical.contains("PrimaryKey { column: String }"));
+	assert!(!logical.contains("RowIdentityPolicy"));
+	assert!(!execution.contains("RowIdentityPolicy"));
+}
+
+#[test]
+fn adr062_logical_create_table_carries_row_identity() {
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let create = brace_blocks_after_marker(&logical, "CreateTable {")
+		.into_iter()
+		.next()
+		.expect("logical CreateTable")
+		.1;
+
+	assert!(create.contains("row_identity: CreateTableRowIdentity,"));
+}
+
+#[test]
+fn adr062_execution_create_table_carries_row_identity() {
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+	let create = brace_blocks_after_marker(&execution, "CreateTable {")
+		.into_iter()
+		.next()
+		.expect("execution CreateTable")
+		.1;
+
+	assert!(create.contains("row_identity: CreateTableRowIdentity,"));
+}
+
+#[test]
+fn adr062_binder_preserves_create_table_row_identity() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+
+	assert!(binder.contains("row_identity: row_identity.clone()"));
+	assert!(binder.contains("row_identity,"));
+}
+
+#[test]
+fn adr062_sql_planner_accepts_column_primary_key() {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE TABLE pk_column (id INT NOT NULL PRIMARY KEY, note TEXT)")
+		.expect("column PK should plan");
+
+	let LogicalPlan::CreateTable { row_identity, .. } = plan else {
+		panic!("expected create table");
+	};
+	assert_eq!(
+		row_identity,
+		CreateTableRowIdentity::PrimaryKey {
+			column: "id".to_string()
+		}
+	);
+}
+
+#[test]
+fn adr062_sql_planner_accepts_table_primary_key() {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE TABLE pk_table (id BIGINT NOT NULL, PRIMARY KEY(id))")
+		.expect("table PK should plan");
+
+	let LogicalPlan::CreateTable { row_identity, .. } = plan else {
+		panic!("expected create table");
+	};
+	assert_eq!(
+		row_identity,
+		CreateTableRowIdentity::PrimaryKey {
+			column: "id".to_string()
+		}
+	);
+}
+
+#[test]
+fn adr062_sql_planner_rejects_duplicate_primary_key() {
+	let err = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, PRIMARY KEY(id))")
+		.expect_err("duplicate PK should reject");
+
+	assert!(err.to_string().contains("PRIMARY KEY more than once"));
+}
+
+#[test]
+fn adr062_sql_planner_rejects_composite_primary_key() {
+	let err = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE TABLE t (id INT NOT NULL, sku TEXT NOT NULL, PRIMARY KEY(id, sku))")
+		.expect_err("composite PK should reject");
+
+	assert!(
+		err.to_string()
+			.contains("PRIMARY KEY must reference exactly one column")
+	);
+}
+
+#[test]
+fn adr062_sql_planner_requires_primary_key_not_null() {
+	for sql in [
+		"CREATE TABLE t (id INT PRIMARY KEY)",
+		"CREATE TABLE t (id INT, PRIMARY KEY(id))",
+		"CREATE TABLE t (id INT NULL PRIMARY KEY)",
+	] {
+		let err = toron::sql_planner::SqlPlanner::new()
+			.plan(sql)
+			.expect_err("nullable PK should reject");
+		assert!(
+			err.to_string()
+				.contains("PRIMARY KEY column must be declared NOT NULL")
+		);
+	}
+}
+
+#[test]
+fn adr062_sql_planner_rejects_unsupported_primary_key_types() {
+	let err = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE TABLE t (active BOOLEAN NOT NULL PRIMARY KEY)")
+		.expect_err("unsupported PK type should reject");
+
+	assert!(
+		err.to_string()
+			.contains("unsupported CREATE TABLE PRIMARY KEY column type")
+	);
+}
+
+#[test]
+fn adr062_ctas_has_no_primary_key_identity_surface() {
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+
+	for source in [&logical, &execution] {
+		let ctas = brace_blocks_after_marker(source, "CreateTableAsSelect {")
+			.into_iter()
+			.next()
+			.expect("CTAS block")
+			.1;
+		assert!(!ctas.contains("row_identity"));
+	}
+	assert!(planner.contains("CTAS does not support explicit column lists"));
+	assert!(planner.contains("unsupported CREATE TABLE clause: table-level PRIMARY KEY"));
+}
+
+#[test]
+fn adr062_catalog_create_request_carries_row_identity() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let trait_body = brace_blocks_after_marker(&catalog, "pub trait Catalog")
+		.into_iter()
+		.next()
+		.expect("Catalog trait")
+		.1;
+
+	assert!(trait_body.contains("row_identity: CreateTableRowIdentity"));
+	assert!(catalog.contains("create_table_row_identity_policy"));
+}
+
+#[test]
+fn adr062_wendelon_catalog_maps_primary_key_descriptor() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+
+	assert!(catalog.contains("CreateTableRowIdentity::PrimaryKey"));
+	assert!(catalog.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single"));
+	assert!(catalog.contains("RowIdentityPolicy::AppendOnly"));
+}
+
+#[test]
+fn adr062_if_not_exists_compares_row_identity() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+
+	assert!(catalog.contains("matches_create_identity(&row_identity)"));
+	assert!(catalog.contains("CatalogError::SchemaMismatch"));
+	assert!(catalog.contains("TableRowIdentity::Unsupported"));
+}
+
+#[test]
+fn adr062_no_pk_create_remains_append_only() {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE TABLE no_pk (id INT NOT NULL)")
+		.expect("no-PK create should plan");
+
+	let LogicalPlan::CreateTable { row_identity, .. } = plan else {
+		panic!("expected create table");
+	};
+	assert_eq!(row_identity, CreateTableRowIdentity::AppendOnly);
+}
+
+#[test]
+fn adr062_update_surface_remains_absent() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+
+	assert!(!planner.contains("Statement::Update"));
+	assert!(!logical.contains("Update {"));
+	assert!(!execution.contains("Update {"));
+}
+
+#[test]
+fn adr062_returning_surface_remains_absent() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+
+	assert!(planner.contains("unsupported DELETE clause: RETURNING"));
+	assert!(!logical.contains("Returning"));
+	assert!(!execution.contains("Returning"));
+}
+
+#[test]
+fn adr062_prior_adr038_append_only_guard_retargeted() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	assert!(architecture_test.contains(
+		"adr038_wendelon_create_row_identity_policy_is_create_request_driven_after_adr062"
+	));
+	let old_guard = [
+		"fn ",
+		"adr038_wendelon_create_uses_append_only",
+		"_row_identity_policy",
+	]
+	.concat();
+	assert!(!architecture_test.contains(&old_guard));
+	assert!(architecture_test.contains("adr062_no_pk_create_remains_append_only"));
+}
+
+#[test]
+fn adr062_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing", "arrow"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr062_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	for forbidden in [
+		"CreateTableRowIdentity",
+		"TableRowIdentity",
+		"PrimaryKeyDescriptorV1",
+		"PRIMARY KEY",
+	] {
+		assert!(
+			!worker.contains(forbidden),
+			"fixture worker gained {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr062_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"CreateTableRowIdentityV1",
+		"TableRowIdentityV1",
+		"PrimaryKeyDdlV1",
+		"CreateTablePrimaryKeyV1",
+		"CreateTableRowIdentityPolicyV1",
+	]);
+}
+
+#[test]
+fn adr062_prior_adr033_to_061_guards_continue_to_pass_except_retarget() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr033_", "adr034_", "adr035_", "adr036_", "adr037_", "adr038_", "adr039_", "adr040_",
+		"adr041_", "adr042_", "adr043_", "adr044_", "adr045_", "adr046_", "adr047_", "adr048_",
+		"adr049_", "adr050_", "adr051_", "adr052_", "adr053_", "adr054_", "adr055_", "adr056_",
+		"adr057_", "adr058_", "adr059_", "adr060_", "adr061_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	assert!(architecture_test.contains(
+		"adr038_wendelon_create_row_identity_policy_is_create_request_driven_after_adr062"
+	));
+}
+
+#[test]
 fn adr058_request_frame_limit_is_server_inbound_only() {
 	let daemon =
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
@@ -13064,14 +13370,15 @@ fn adr038_in_memory_admin_validates_object_id_and_fingerprint() {
 }
 
 #[test]
-fn adr038_wendelon_create_uses_append_only_row_identity_policy() {
+fn adr038_wendelon_create_row_identity_policy_is_create_request_driven_after_adr062() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
 		.expect("read catalog source");
-	let create_body = wendelon_catalog_method_body(&catalog, "async fn create_table");
 
-	assert!(create_body.contains("RowIdentityPolicy::AppendOnly"));
-	assert!(!create_body.contains("RowIdentityPolicy::PrimaryKey"));
-	assert!(!create_body.contains("RowIdentityPolicy::ByOrdinal"));
+	assert!(catalog.contains("CreateTableRowIdentity::AppendOnly"));
+	assert!(catalog.contains("CreateTableRowIdentity::PrimaryKey"));
+	assert!(catalog.contains("RowIdentityPolicy::AppendOnly"));
+	assert!(catalog.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single"));
+	assert!(!catalog.contains("RowIdentityPolicy::ByOrdinal"));
 }
 
 #[test]

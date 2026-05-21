@@ -16,7 +16,7 @@ use toron::distributed::identity::QueryId;
 use toron::distributed::worker_registry::StaticWorkerRegistry;
 use toron::error::{CatalogError, ExecutionError, QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
-use toron::ir::{ExecutionPlan, LogicalPlan, QueryProfileHint, SessionId};
+use toron::ir::{CreateTableRowIdentity, ExecutionPlan, LogicalPlan, QueryProfileHint, SessionId};
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
@@ -889,13 +889,23 @@ async fn catalog_create_outcome_reports_created_true_and_false() {
 	let table_schema = schema(&[Field::new("id", DataType::Int32, false)]);
 
 	let created = catalog
-		.create_table_with_outcome(&table, table_schema.clone(), true)
+		.create_table_with_outcome(
+			&table,
+			table_schema.clone(),
+			CreateTableRowIdentity::AppendOnly,
+			true,
+		)
 		.await
 		.expect("fresh create");
 	assert!(created.created);
 
 	let existing = catalog
-		.create_table_with_outcome(&table, table_schema, true)
+		.create_table_with_outcome(
+			&table,
+			table_schema,
+			CreateTableRowIdentity::AppendOnly,
+			true,
+		)
 		.await
 		.expect("compatible existing");
 	assert!(!existing.created);
@@ -1068,6 +1078,7 @@ impl Catalog for RacingCatalog {
 		&self,
 		name: &TableRef,
 		schema: SchemaRef,
+		row_identity: CreateTableRowIdentity,
 		if_not_exists: bool,
 	) -> Result<CreateTableOutcome, CatalogError> {
 		if if_not_exists && name == &self.target {
@@ -1077,7 +1088,7 @@ impl Catalog for RacingCatalog {
 				.await?;
 		}
 		self.inner
-			.create_table_with_outcome(name, schema, if_not_exists)
+			.create_table_with_outcome(name, schema, row_identity, if_not_exists)
 			.await
 	}
 

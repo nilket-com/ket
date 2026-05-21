@@ -7,7 +7,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::{Catalog, TableRef, WendelonCatalog, WendelonDescriptorRegistry};
+use toron::catalog::{
+	Catalog, MockCatalog, TableBinding, TableRef, TableRowIdentity, WendelonCatalog,
+	WendelonDescriptorRegistry,
+};
+use toron::coordinator::QueryCoordinator;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
@@ -16,6 +20,7 @@ use toron::ir::{
 };
 use toron::storage::{
 	HlcBound, InMemoryStorageScan, TenantId as ToronTenantId, WendelonStorageScan,
+	WendelonStorageWrite,
 };
 use wendelon::client::{ClusterPeerWire, ClusterStatusWire, StaticTopologySource};
 use wendelon::consensus::WendelonRequest;
@@ -30,12 +35,12 @@ use wendelon::network::transport::{
 };
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RUNTIME_FILTER_HASH_SEED,
-	RUNTIME_FILTER_KEY_ENCODING_VERSION, RecordBodyCompressionPolicy, RowIdentityPolicy,
-	RuntimeFilterBloom, RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind,
-	STORAGE_ROW_KEY_ID_COLUMN, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
-	TenantId as WendelonTenantId, encode_runtime_filter_key, encode_table_schema_descriptor_v1,
-	insert_runtime_filter_encoded_key,
+	LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RUNTIME_FILTER_HASH_SEED,
+	RUNTIME_FILTER_KEY_ENCODING_VERSION, RecordBodyCompressionPolicy, RecordLayoutPolicy,
+	RowIdentityPolicy, RuntimeFilterBloom, RuntimeFilterDescriptor, RuntimeFilterKeyType,
+	RuntimeFilterKind, STORAGE_ROW_KEY_ID_COLUMN, SchemaEvolutionPolicyV1, TableObjectId,
+	TableSchemaDescriptor, TenantId as WendelonTenantId, encode_runtime_filter_key,
+	encode_table_schema_descriptor_v1, insert_runtime_filter_encoded_key,
 	pbc::{OP_GT, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT},
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
@@ -116,6 +121,92 @@ async fn wendelon_catalog_create_table_submits_schema_update_request() {
 			.legacy_table_id,
 		binding.legacy_table_id
 	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn sql_created_pk_table_insert_supersedes_visible_row() {
+	let fixture = LiveWendelonFixture::start(41).await;
+	let catalog = Arc::new(MockCatalog::new());
+	let planner = toron::sql_planner::SqlPlanner::new();
+	let create_coordinator = QueryCoordinator::new(
+		catalog.clone(),
+		Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		})),
+		PlannerConfig::default(),
+	);
+
+	create_coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE bench.sql_pk (id BIGINT NOT NULL PRIMARY KEY, note TEXT)")
+				.expect("plan SQL PK create"),
+			None,
+		)
+		.await
+		.expect("execute SQL PK create");
+
+	let table = TableRef::with_schema("bench", "sql_pk");
+	let binding = catalog
+		.resolve_table(&table)
+		.await
+		.expect("resolve SQL-created PK table");
+	let descriptor = descriptor_from_sql_created_binding(&table, &binding);
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	fixture
+		.node
+		.data_server
+		.refresh_leases_once(&fixture.node.ring, &*fixture.node.clock, 60_000)
+		.await;
+
+	let descriptors = HashMap::from([(binding.legacy_table_id, descriptor)]);
+	let registry = Arc::new(
+		WendelonDescriptorRegistry::from_descriptors(descriptors)
+			.expect("registry from SQL-created descriptor"),
+	);
+	let executor = Executor::with_context(
+		Arc::new(WendelonStorageScan::with_descriptor_registry(
+			fixture.client.clone(),
+			registry.clone(),
+		)),
+		ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(62),
+			ToronTenantId(1),
+			HlcBound(u64::MAX),
+		),
+	);
+	let writer = Arc::new(WendelonStorageWrite::with_descriptor_registry(
+		fixture.client.clone(),
+		registry,
+	));
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), writer);
+
+	for sql in [
+		"INSERT INTO bench.sql_pk (id, note) VALUES (1, 'old')",
+		"INSERT INTO bench.sql_pk (id, note) VALUES (1, 'new')",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan insert"), None)
+			.await
+			.expect("execute insert");
+	}
+
+	let result = coordinator
+		.execute_query(
+			&planner
+				.plan("SELECT id, note FROM bench.sql_pk WHERE id = 1")
+				.expect("plan select"),
+			None,
+		)
+		.await
+		.expect("select superseded row");
+
+	assert_eq!(id_notes_from_batches(&result), vec![(1, "new".to_string())]);
 
 	fixture.node.handles.abort();
 	let _ = std::fs::remove_dir_all(fixture.data_dir);
@@ -900,6 +991,32 @@ fn descriptor() -> TableSchemaDescriptor {
 	.expect("descriptor")
 }
 
+fn descriptor_from_sql_created_binding(
+	table: &TableRef,
+	binding: &TableBinding,
+) -> TableSchemaDescriptor {
+	let row_identity = match &binding.row_identity {
+		TableRowIdentity::PrimaryKey { column, .. } => {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(column.as_str()))
+		}
+		TableRowIdentity::AppendOnly => RowIdentityPolicy::AppendOnly,
+		TableRowIdentity::Unsupported => panic!("SQL-created descriptor has unsupported identity"),
+	};
+
+	TableSchemaDescriptor::new_with_layout(
+		binding.table,
+		binding.schema_generation,
+		table.schema.as_deref().unwrap_or("default"),
+		&table.table,
+		binding.schema.as_ref(),
+		row_identity,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		SchemaEvolutionPolicyV1::AdditiveOnly,
+	)
+	.expect("descriptor from SQL-created binding")
+}
+
 fn schema() -> Schema {
 	Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
@@ -944,6 +1061,26 @@ fn batch_from_rows(rows: &[(i64, Option<i32>, Option<&str>, i64)]) -> RecordBatc
 		],
 	)
 	.expect("batch")
+}
+
+fn id_notes_from_batches(batches: &[RecordBatch]) -> Vec<(i64, String)> {
+	let mut rows = Vec::new();
+	for batch in batches {
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id column");
+		let notes = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("note column");
+		for row in 0..batch.num_rows() {
+			rows.push((ids.value(row), notes.value(row).to_string()));
+		}
+	}
+	rows
 }
 
 fn selective_batch(rows: i64) -> RecordBatch {

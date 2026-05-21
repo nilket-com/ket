@@ -20,6 +20,12 @@ pub enum QueryProfileHint {
 	Scan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CreateTableRowIdentity {
+	AppendOnly,
+	PrimaryKey { column: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScalarValue {
 	Boolean(Option<bool>),
@@ -223,6 +229,7 @@ pub enum LogicalPlan {
 	CreateTable {
 		name: TableRef,
 		schema: SchemaRef,
+		row_identity: CreateTableRowIdentity,
 		if_not_exists: bool,
 		or_replace: bool,
 	},

@@ -3,8 +3,10 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use toron::binder::PlannerConfig;
-use toron::catalog::{Catalog, MockCatalog, TableBinding, TableRef, WendelonCatalog};
+use toron::binder::{PlannerConfig, bind};
+use toron::catalog::{
+	Catalog, MockCatalog, TableBinding, TableRef, TableRowIdentity, WendelonCatalog,
+};
 use toron::coordinator::{DistributedQueryCoordinator, QueryCoordinator};
 use toron::distributed::budget::{QueryBudget, TaskBudget};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
@@ -12,7 +14,10 @@ use toron::distributed::identity::QueryId;
 use toron::distributed::worker_registry::StaticWorkerRegistry;
 use toron::error::{CatalogError, ExecutionError, QueryError};
 use toron::exec::{ExecutionContext, Executor};
-use toron::ir::{ExecutionPlan, LogicalPlan, SessionId, TableId};
+use toron::ir::{
+	ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan, LogicalPlan, QueryProfileHint, SessionId,
+	TableId,
+};
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
@@ -40,6 +45,7 @@ fn planner_accepts_create_table_surface() {
 	let LogicalPlan::CreateTable {
 		name,
 		schema,
+		row_identity,
 		if_not_exists,
 		or_replace,
 	} = plan
@@ -50,6 +56,7 @@ fn planner_accepts_create_table_surface() {
 	assert_eq!(name, TableRef::new("sales"));
 	assert!(!if_not_exists);
 	assert!(!or_replace);
+	assert_eq!(row_identity, CreateTableRowIdentity::AppendOnly);
 	assert_field(&schema, 0, "id", &DataType::Int32, true);
 	assert_field(&schema, 1, "amount", &DataType::Int64, true);
 	assert_field(&schema, 2, "price", &DataType::Float64, true);
@@ -67,6 +74,7 @@ fn planner_accepts_if_not_exists_qualified_name_and_nullability() {
 	let LogicalPlan::CreateTable {
 		name,
 		schema,
+		row_identity,
 		if_not_exists,
 		or_replace,
 	} = plan
@@ -77,6 +85,7 @@ fn planner_accepts_if_not_exists_qualified_name_and_nullability() {
 	assert_eq!(name, TableRef::with_schema("app", "sales"));
 	assert!(if_not_exists);
 	assert!(!or_replace);
+	assert_eq!(row_identity, CreateTableRowIdentity::AppendOnly);
 	assert_field(&schema, 0, "id", &DataType::Int32, false);
 	assert_field(&schema, 1, "note", &DataType::Utf8, true);
 }
@@ -90,6 +99,7 @@ fn planner_accepts_create_or_replace_table_surface() {
 	let LogicalPlan::CreateTable {
 		name,
 		schema,
+		row_identity,
 		if_not_exists,
 		or_replace,
 	} = plan
@@ -100,7 +110,68 @@ fn planner_accepts_create_or_replace_table_surface() {
 	assert_eq!(name, TableRef::new("sales"));
 	assert!(!if_not_exists);
 	assert!(or_replace);
+	assert_eq!(row_identity, CreateTableRowIdentity::AppendOnly);
 	assert_field(&schema, 0, "id", &DataType::Int32, false);
+}
+
+#[test]
+fn planner_accepts_column_primary_key() {
+	let plan = SqlPlanner::new()
+		.plan("CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, note TEXT)")
+		.expect("plan column primary key");
+
+	let LogicalPlan::CreateTable {
+		name,
+		schema,
+		row_identity,
+		if_not_exists,
+		or_replace,
+	} = plan
+	else {
+		panic!("expected create table plan");
+	};
+
+	assert_eq!(name, TableRef::new("sales"));
+	assert!(!if_not_exists);
+	assert!(!or_replace);
+	assert_eq!(
+		row_identity,
+		CreateTableRowIdentity::PrimaryKey {
+			column: "id".to_string()
+		}
+	);
+	assert_field(&schema, 0, "id", &DataType::Int32, false);
+	assert_field(&schema, 1, "note", &DataType::Utf8, true);
+}
+
+#[test]
+fn planner_accepts_table_primary_key() {
+	let plan = SqlPlanner::new()
+		.plan("CREATE TABLE sales (id BIGINT NOT NULL, note TEXT, PRIMARY KEY (id))")
+		.expect("plan table primary key");
+
+	let LogicalPlan::CreateTable {
+		name,
+		schema,
+		row_identity,
+		if_not_exists,
+		or_replace,
+	} = plan
+	else {
+		panic!("expected create table plan");
+	};
+
+	assert_eq!(name, TableRef::new("sales"));
+	assert!(!if_not_exists);
+	assert!(!or_replace);
+	assert_eq!(
+		row_identity,
+		CreateTableRowIdentity::PrimaryKey {
+			column: "id".to_string()
+		}
+	);
+	assert_field(&schema, 0, "id", &DataType::Int64, false);
+	assert_field(&schema, 1, "note", &DataType::Utf8, true);
 }
 
 #[test]
@@ -124,14 +195,11 @@ fn planner_rejects_unsupported_create_table_shapes() {
 			"unsupported CREATE TABLE clause: LIKE",
 		),
 		(
-			"CREATE TABLE t (a INT, PRIMARY KEY(a))",
-			"table-level constraints",
-		),
-		(
 			"CREATE TABLE t (a INT DEFAULT 1)",
 			"unsupported CREATE TABLE column option: DEFAULT",
 		),
-		("CREATE TABLE t (a INT PRIMARY KEY)", "UNIQUE / PRIMARY KEY"),
+		("CREATE TABLE t (a INT UNIQUE)", "column option: UNIQUE"),
+		("CREATE TABLE t (a INT, UNIQUE(a))", "table-level UNIQUE"),
 		(
 			"CREATE TABLE t (a INT CHECK (a > 0))",
 			"unsupported CREATE TABLE column option: CHECK",
@@ -163,6 +231,68 @@ fn planner_rejects_unsupported_create_table_shapes() {
 	] {
 		assert_frontend_error(sql, diagnostic);
 	}
+}
+
+#[test]
+fn planner_rejects_primary_key_without_not_null_column_form() {
+	assert_frontend_error(
+		"CREATE TABLE t (id INT PRIMARY KEY)",
+		"PRIMARY KEY column must be declared NOT NULL",
+	);
+}
+
+#[test]
+fn planner_rejects_primary_key_without_not_null_table_form() {
+	assert_frontend_error(
+		"CREATE TABLE t (id INT, PRIMARY KEY(id))",
+		"PRIMARY KEY column must be declared NOT NULL",
+	);
+}
+
+#[test]
+fn planner_rejects_null_primary_key_conflict() {
+	assert_frontend_error(
+		"CREATE TABLE t (id INT NULL PRIMARY KEY)",
+		"PRIMARY KEY column must be declared NOT NULL",
+	);
+}
+
+#[test]
+fn planner_rejects_composite_primary_key() {
+	assert_frontend_error(
+		"CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(id, name))",
+		"PRIMARY KEY must reference exactly one column",
+	);
+}
+
+#[test]
+fn planner_rejects_duplicate_primary_key_declarations() {
+	assert_frontend_error(
+		"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, PRIMARY KEY(id))",
+		"PRIMARY KEY more than once",
+	);
+}
+
+#[test]
+fn planner_rejects_unique_constraint() {
+	assert_frontend_error("CREATE TABLE t (id INT UNIQUE)", "column option: UNIQUE");
+	assert_frontend_error("CREATE TABLE t (id INT, UNIQUE(id))", "table-level UNIQUE");
+}
+
+#[test]
+fn planner_rejects_unsupported_primary_key_type() {
+	assert_frontend_error(
+		"CREATE TABLE t (active BOOLEAN NOT NULL PRIMARY KEY)",
+		"unsupported CREATE TABLE PRIMARY KEY column type",
+	);
+}
+
+#[test]
+fn planner_rejects_ctas_primary_key() {
+	assert_frontend_error(
+		"CREATE TABLE t (id INT NOT NULL PRIMARY KEY) AS SELECT 1",
+		"CTAS does not support explicit column lists",
+	);
 }
 
 #[test]
@@ -231,6 +361,46 @@ async fn mock_catalog_create_table_resolves_binding() {
 		binding.fingerprint,
 		mock_descriptor(&name, schema.as_ref(), binding.table).physical_descriptor_fingerprint
 	);
+	assert_eq!(binding.row_identity, TableRowIdentity::AppendOnly);
+	assert!(binding.primary_key_columns.is_empty());
+}
+
+#[tokio::test]
+async fn catalog_create_with_pk_builds_primary_key_descriptor() {
+	let catalog = MockCatalog::new();
+	let schema = schema(&[
+		Field::new("id", DataType::Int64, false),
+		Field::new("note", DataType::Utf8, true),
+	]);
+	let name = TableRef::new("sales");
+
+	let outcome = catalog
+		.create_table_with_outcome(
+			&name,
+			schema.clone(),
+			CreateTableRowIdentity::PrimaryKey {
+				column: "id".to_string(),
+			},
+			false,
+		)
+		.await
+		.expect("create primary-key table");
+
+	assert!(outcome.created);
+	assert_eq!(
+		outcome.binding.row_identity,
+		TableRowIdentity::PrimaryKey {
+			column: "id".to_string(),
+			ordinal: ColumnOrdinal(0),
+		}
+	);
+	assert!(
+		outcome
+			.binding
+			.primary_key_columns
+			.contains(&ColumnOrdinal(0))
+	);
+	assert_eq!(outcome.binding.schema.as_ref(), schema.as_ref());
 }
 
 #[tokio::test]
@@ -268,6 +438,77 @@ async fn mock_catalog_create_table_if_not_exists_semantics() {
 	assert!(matches!(
 		exists,
 		CatalogError::TableAlreadyExists { ref table } if table == "sales"
+	));
+}
+
+#[tokio::test]
+async fn if_not_exists_same_schema_same_identity_skips() {
+	let catalog = MockCatalog::new();
+	let name = TableRef::new("sales");
+	let schema = schema(&[
+		Field::new("id", DataType::Int64, false),
+		Field::new("sku", DataType::Utf8, false),
+	]);
+	let identity = CreateTableRowIdentity::PrimaryKey {
+		column: "id".to_string(),
+	};
+
+	let created = catalog
+		.create_table_with_outcome(&name, schema.clone(), identity.clone(), true)
+		.await
+		.expect("create primary-key table");
+	let existing = catalog
+		.create_table_with_outcome(&name, schema.clone(), identity, true)
+		.await
+		.expect("same schema and identity skips");
+
+	assert!(created.created);
+	assert!(!existing.created);
+	assert_eq!(
+		created.binding.legacy_table_id,
+		existing.binding.legacy_table_id
+	);
+}
+
+#[tokio::test]
+async fn if_not_exists_same_schema_different_identity_schema_mismatch() {
+	let catalog = MockCatalog::new();
+	let name = TableRef::new("sales");
+	let schema = schema(&[
+		Field::new("id", DataType::Int64, false),
+		Field::new("sku", DataType::Utf8, false),
+	]);
+
+	catalog
+		.create_table_with_outcome(
+			&name,
+			schema.clone(),
+			CreateTableRowIdentity::PrimaryKey {
+				column: "id".to_string(),
+			},
+			false,
+		)
+		.await
+		.expect("create primary-key table");
+
+	let mismatch = match catalog
+		.create_table_with_outcome(
+			&name,
+			schema,
+			CreateTableRowIdentity::PrimaryKey {
+				column: "sku".to_string(),
+			},
+			true,
+		)
+		.await
+	{
+		Ok(_) => panic!("different identity should mismatch"),
+		Err(error) => error,
+	};
+
+	assert!(matches!(
+		mismatch,
+		CatalogError::SchemaMismatch { ref table } if table == "sales"
 	));
 }
 
@@ -340,6 +581,45 @@ async fn query_coordinator_executes_create_table_as_catalog_operation() {
 		.await
 		.expect("created table is visible in catalog");
 	assert_field(&resolved.schema, 0, "id", &DataType::Int32, false);
+	assert_eq!(resolved.row_identity, TableRowIdentity::AppendOnly);
+}
+
+#[tokio::test]
+async fn sql_created_pk_descriptor_enables_point_read_profile() {
+	let catalog = Arc::new(MockCatalog::new());
+	let executor = Executor::new(empty_storage());
+	let coordinator = QueryCoordinator::new(catalog.clone(), executor, PlannerConfig::default());
+	let planner = SqlPlanner::new();
+
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, note TEXT)")
+				.expect("plan primary-key create"),
+			None,
+		)
+		.await
+		.expect("execute primary-key create");
+
+	let binding = catalog
+		.resolve_table(&TableRef::new("sales"))
+		.await
+		.expect("created table is visible");
+	assert_eq!(
+		binding.row_identity,
+		TableRowIdentity::PrimaryKey {
+			column: "id".to_string(),
+			ordinal: ColumnOrdinal(0),
+		}
+	);
+
+	let select = planner
+		.plan("SELECT note FROM sales WHERE id = 1")
+		.expect("plan point read");
+	let bound = bind(&select, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind point read");
+	assert_point_read_scan(&bound);
 }
 
 #[tokio::test]
@@ -465,6 +745,7 @@ async fn executor_rejects_direct_create_table_execution() {
 	let plan = ExecutionPlan::CreateTable {
 		name: TableRef::new("sales"),
 		schema: schema(&[Field::new("id", DataType::Int32, false)]),
+		row_identity: CreateTableRowIdentity::AppendOnly,
 		if_not_exists: false,
 		or_replace: false,
 	};
@@ -487,6 +768,7 @@ fn fragmenter_rejects_direct_create_table_fragmentation() {
 	let plan = ExecutionPlan::CreateTable {
 		name: TableRef::new("sales"),
 		schema: schema(&[Field::new("id", DataType::Int32, false)]),
+		row_identity: CreateTableRowIdentity::AppendOnly,
 		if_not_exists: false,
 		or_replace: false,
 	};
@@ -523,6 +805,23 @@ fn assert_field(schema: &SchemaRef, idx: usize, name: &str, data_type: &DataType
 	assert_eq!(field.name(), name);
 	assert_eq!(field.data_type(), data_type);
 	assert_eq!(field.is_nullable(), nullable);
+}
+
+fn assert_point_read_scan(plan: &ExecutionPlan) {
+	match plan {
+		ExecutionPlan::Project { input, .. } | ExecutionPlan::Filter { input, .. } => {
+			assert_point_read_scan(input)
+		}
+		ExecutionPlan::Scan {
+			profile_hint,
+			primary_key_columns,
+			..
+		} => {
+			assert_eq!(*profile_hint, QueryProfileHint::PointRead);
+			assert_eq!(primary_key_columns.as_slice(), &[ColumnOrdinal(0)]);
+		}
+		other => panic!("expected point-read scan under plan, got {other:?}"),
+	}
 }
 
 fn schema(fields: &[Field]) -> SchemaRef {

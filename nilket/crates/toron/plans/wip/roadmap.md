@@ -4560,7 +4560,7 @@ along with the forward-sequence rewrite.
   in `plans/impl/061_ctas_if_not_exists_evidence.md`, including passing full
   `cargo test -p toron -- --test-threads=6`.
 - **ADR 062 — Primary-Key DDL for Toron-Created Tables.**
-  Promoted. The table-identity-policy Phase 0 that ADR 061 carried before
+  Implemented. The table-identity-policy Phase 0 that ADR 061 carried before
   `UPDATE`: schema-only `CREATE TABLE` can declare a **single-column,
   explicit-`NOT NULL` primary key**, creating a `RowIdentityPolicy::PrimaryKey`
   descriptor (vs the append-only default) — so the tables users create carry
@@ -4590,7 +4590,9 @@ along with the forward-sequence rewrite.
   tests retargeted; meta-guard scoped `…_except_retarget`. **Toron SQL/catalog
   only; no Wendelon wire/storage/worker change; no UPDATE/RETURNING.**
   Placement: Exterior Substrate → Toron home. Migration:
-  `plans/impl/062_primary_key_ddl.md`.
+  `plans/impl/062_primary_key_ddl.md`; implementation evidence is recorded in
+  `plans/impl/062_primary_key_ddl_evidence.md`, including passing full
+  `cargo test -p toron -- --test-threads=6`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4675,9 +4677,9 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 062 promoted; ADR 063 candidates
+### ADR 062 implemented; ADR 063 candidates
 
-ADR 062 selected and promoted **Primary-Key DDL for Toron-Created Tables** —
+ADR 062 implemented **Primary-Key DDL for Toron-Created Tables** —
 the table-identity-policy Phase 0 that ADR 061 carried before `UPDATE`.
 Schema-only `CREATE TABLE` can declare a **single-column, explicit-`NOT NULL`
 primary key**, creating a `RowIdentityPolicy::PrimaryKey` descriptor instead
@@ -4722,7 +4724,8 @@ widening; no UPDATE/RETURNING.**
 - `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
   no-`*V1`. Placement: Exterior Substrate → Toron home.
 
-The migration is materialized in `plans/impl/062_primary_key_ddl.md`.
+The migration is materialized in `plans/impl/062_primary_key_ddl.md`; evidence
+is recorded in `plans/impl/062_primary_key_ddl_evidence.md`.
 
 **ADR 063 candidates:**
 

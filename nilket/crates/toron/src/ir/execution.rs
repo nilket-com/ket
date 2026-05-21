@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::TableRef;
 pub use crate::distributed::identity::QueryId;
-use crate::ir::{AggregateFunction, JoinKind, JoinStrategy, ScalarValue};
+use crate::ir::{AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, ScalarValue};
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
 use wendelon::schema::{PhysicalDescriptorFingerprint, STORAGE_ROW_KEY_ID_COLUMN, TableObjectId};
@@ -200,6 +200,7 @@ pub enum ExecutionPlan {
 	CreateTable {
 		name: TableRef,
 		schema: SchemaRef,
+		row_identity: CreateTableRowIdentity,
 		if_not_exists: bool,
 		or_replace: bool,
 	},

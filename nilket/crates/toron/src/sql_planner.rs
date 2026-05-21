@@ -6,8 +6,8 @@ use crate::aggregate_kernel;
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, Expr, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan, ScalarValue,
-	SortExpr,
+	AggregateFunction, CreateTableRowIdentity, Expr, InsertLiteral, JoinKind, JoinStrategy,
+	LogicalPlan, ScalarValue, SortExpr,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
@@ -15,8 +15,8 @@ use sqlparser::ast::{
 	DataType as SqlDataType, Delete, ExactNumberInfo, Expr as SqlExpr, FromTable, Function,
 	FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
 	HiveDistributionStyle, Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectType,
-	OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject,
-	UnaryOperator, Value,
+	OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableConstraint,
+	TableFactor, TableObject, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -281,7 +281,14 @@ fn parse_insert_number(text: &str, negate: bool) -> Result<InsertLiteral, Fronte
 		.map_err(|_| unsupported(format!("INSERT VALUES literal not representable: {text}")))
 }
 
-fn lower_create_table_column(column: &ColumnDef) -> Result<Field, FrontendError> {
+struct LoweredCreateTableColumn {
+	field: Field,
+	primary_key: bool,
+}
+
+fn lower_create_table_column(
+	column: &ColumnDef,
+) -> Result<LoweredCreateTableColumn, FrontendError> {
 	let column_name = &column.name.value;
 
 	if matches!(&column.data_type, SqlDataType::Unspecified) {
@@ -299,15 +306,19 @@ fn lower_create_table_column(column: &ColumnDef) -> Result<Field, FrontendError>
 	}
 
 	let data_type = lower_create_table_data_type(&column.data_type)?;
-	let nullable = lower_create_table_column_nullability(&column.options)?;
+	let (nullable, primary_key) = lower_create_table_column_options(&column.options)?;
 
-	Ok(Field::new(column_name.clone(), data_type, nullable))
+	Ok(LoweredCreateTableColumn {
+		field: Field::new(column_name.clone(), data_type, nullable),
+		primary_key,
+	})
 }
 
-fn lower_create_table_column_nullability(
+fn lower_create_table_column_options(
 	options: &[ColumnOptionDef],
-) -> Result<bool, FrontendError> {
+) -> Result<(bool, bool), FrontendError> {
 	let mut nullable = None;
+	let mut primary_key = false;
 	for option_def in options {
 		if option_def.name.is_some() {
 			return Err(unsupported(
@@ -322,10 +333,27 @@ fn lower_create_table_column_nullability(
 					"unsupported CREATE TABLE column option: DEFAULT",
 				));
 			}
-			ColumnOption::Unique { .. } => {
-				return Err(unsupported(
-					"unsupported CREATE TABLE column option: UNIQUE / PRIMARY KEY",
-				));
+			ColumnOption::Unique {
+				is_primary,
+				characteristics,
+			} => {
+				if !is_primary {
+					return Err(unsupported(
+						"unsupported CREATE TABLE column option: UNIQUE",
+					));
+				}
+				if characteristics.is_some() {
+					return Err(unsupported(
+						"unsupported CREATE TABLE column option: PRIMARY KEY characteristics",
+					));
+				}
+				if primary_key {
+					return Err(unsupported(
+						"CREATE TABLE specifies PRIMARY KEY more than once",
+					));
+				}
+				primary_key = true;
+				continue;
 			}
 			ColumnOption::ForeignKey { .. } => {
 				return Err(unsupported(
@@ -362,7 +390,7 @@ fn lower_create_table_column_nullability(
 		}
 		nullable = Some(new_nullable);
 	}
-	Ok(nullable.unwrap_or(true))
+	Ok((nullable.unwrap_or(true), primary_key))
 }
 
 fn lower_create_table_data_type(data_type: &SqlDataType) -> Result<DataType, FrontendError> {
@@ -405,6 +433,132 @@ fn check_unique_column_names(fields: &[Field]) -> Result<(), FrontendError> {
 		}
 	}
 	Ok(())
+}
+
+fn lower_create_table_schema_and_identity(
+	columns: &[ColumnDef],
+	constraints: &[TableConstraint],
+	primary_key: Option<&SqlExpr>,
+) -> Result<(Arc<Schema>, CreateTableRowIdentity), FrontendError> {
+	let mut fields = Vec::with_capacity(columns.len());
+	let mut primary_key_declarations = Vec::new();
+
+	for column in columns {
+		let lowered = lower_create_table_column(column)?;
+		if lowered.primary_key {
+			primary_key_declarations.push(column.name.value.clone());
+		}
+		fields.push(lowered.field);
+	}
+
+	for constraint in constraints {
+		match constraint {
+			TableConstraint::PrimaryKey {
+				name,
+				index_name,
+				index_type,
+				columns,
+				index_options,
+				characteristics,
+			} => {
+				if name.is_some() {
+					return Err(unsupported(
+						"unsupported CREATE TABLE clause: named PRIMARY KEY constraint",
+					));
+				}
+				if index_name.is_some()
+					|| index_type.is_some()
+					|| !index_options.is_empty()
+					|| characteristics.is_some()
+				{
+					return Err(unsupported(
+						"unsupported CREATE TABLE clause: PRIMARY KEY options",
+					));
+				}
+				let [column] = columns.as_slice() else {
+					return Err(unsupported(
+						"CREATE TABLE PRIMARY KEY must reference exactly one column",
+					));
+				};
+				primary_key_declarations.push(column.value.clone());
+			}
+			TableConstraint::Unique { .. } => {
+				return Err(unsupported(
+					"unsupported CREATE TABLE clause: table-level UNIQUE",
+				));
+			}
+			_ => {
+				return Err(unsupported(
+					"unsupported CREATE TABLE clause: table-level constraints",
+				));
+			}
+		}
+	}
+
+	if let Some(primary_key) = primary_key {
+		primary_key_declarations.push(lower_create_table_primary_key_expr(primary_key)?);
+	}
+
+	check_unique_column_names(&fields)?;
+	let schema = Arc::new(Schema::new(fields));
+
+	let row_identity = match primary_key_declarations.as_slice() {
+		[] => CreateTableRowIdentity::AppendOnly,
+		[column] => {
+			let ordinal = schema.index_of(column).map_err(|_| {
+				unsupported(format!(
+					"CREATE TABLE PRIMARY KEY column does not exist: {column}"
+				))
+			})?;
+			let field = schema.field(ordinal);
+			if field.is_nullable() {
+				return Err(unsupported("PRIMARY KEY column must be declared NOT NULL"));
+			}
+			if !primary_key_type_is_supported(field.data_type()) {
+				return Err(unsupported(
+					"unsupported CREATE TABLE PRIMARY KEY column type",
+				));
+			}
+			CreateTableRowIdentity::PrimaryKey {
+				column: column.clone(),
+			}
+		}
+		_ => {
+			return Err(unsupported(
+				"CREATE TABLE specifies PRIMARY KEY more than once",
+			));
+		}
+	};
+
+	Ok((schema, row_identity))
+}
+
+fn lower_create_table_primary_key_expr(expr: &SqlExpr) -> Result<String, FrontendError> {
+	match expr {
+		SqlExpr::Identifier(ident) => Ok(ident.value.clone()),
+		SqlExpr::Nested(inner) => lower_create_table_primary_key_expr(inner),
+		SqlExpr::Tuple(exprs) => {
+			let [expr] = exprs.as_slice() else {
+				return Err(unsupported(
+					"CREATE TABLE PRIMARY KEY must reference exactly one column",
+				));
+			};
+			lower_create_table_primary_key_expr(expr)
+		}
+		SqlExpr::CompoundIdentifier(_) => Err(unsupported(
+			"CREATE TABLE PRIMARY KEY column must be unqualified",
+		)),
+		_ => Err(unsupported(
+			"unsupported CREATE TABLE clause: PRIMARY KEY expression",
+		)),
+	}
+}
+
+fn primary_key_type_is_supported(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Int32 | DataType::Int64 | DataType::Utf8
+	)
 }
 
 pub struct SqlPlanner;
@@ -694,11 +848,6 @@ impl SqlPlanner {
 		if *volatile {
 			return Err(unsupported("unsupported CREATE TABLE clause: VOLATILE"));
 		}
-		if !constraints.is_empty() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: table-level constraints",
-			));
-		}
 		if hive_formats.as_ref().is_some_and(|formats| {
 			formats.row_format.is_some()
 				|| formats
@@ -762,11 +911,6 @@ impl SqlPlanner {
 		}
 		if on_cluster.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: ON CLUSTER"));
-		}
-		if primary_key.is_some() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: table-level PRIMARY KEY",
-			));
 		}
 		if order_by.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: ORDER BY"));
@@ -837,16 +981,13 @@ impl SqlPlanner {
 		}
 
 		let table_ref = lower_ddl_table_name(name)?;
-		let fields = columns
-			.iter()
-			.map(lower_create_table_column)
-			.collect::<Result<Vec<_>, _>>()?;
-		check_unique_column_names(&fields)?;
-		let schema = Arc::new(Schema::new(fields));
+		let (schema, row_identity) =
+			lower_create_table_schema_and_identity(columns, constraints, primary_key.as_deref())?;
 
 		Ok(LogicalPlan::CreateTable {
 			name: table_ref,
 			schema,
+			row_identity,
 			if_not_exists: *if_not_exists,
 			or_replace: *or_replace,
 		})

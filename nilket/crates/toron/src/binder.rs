@@ -208,11 +208,13 @@ impl<'a> Binder<'a> {
 				LogicalPlan::CreateTable {
 					name,
 					schema,
+					row_identity,
 					if_not_exists,
 					or_replace,
 				} => Ok(ExecutionPlan::CreateTable {
 					name: name.clone(),
 					schema: schema.clone(),
+					row_identity: row_identity.clone(),
 					if_not_exists: *if_not_exists,
 					or_replace: *or_replace,
 				}),
@@ -1332,12 +1334,14 @@ fn optimize_for_required(
 		ExecutionPlan::CreateTable {
 			name,
 			schema,
+			row_identity,
 			if_not_exists,
 			or_replace,
 		} => Ok((
 			ExecutionPlan::CreateTable {
 				name,
 				schema,
+				row_identity,
 				if_not_exists,
 				or_replace,
 			},

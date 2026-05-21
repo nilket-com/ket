@@ -591,7 +591,7 @@ async fn toron_sql_complete_frame_carries_stable_row_count() {
 	let create_existing = execute_sql(
 		endpoint,
 		"CREATE TABLE IF NOT EXISTS storage_execution \
-		 (id BIGINT NOT NULL, amount INT, region TEXT, ts BIGINT NOT NULL)",
+		 (id BIGINT NOT NULL PRIMARY KEY, amount INT, region TEXT, ts BIGINT NOT NULL)",
 	)
 	.await
 	.expect("create-if-not-exists response");

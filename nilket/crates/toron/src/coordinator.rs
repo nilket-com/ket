@@ -28,7 +28,10 @@ use crate::error::{
 	CatalogError, ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind,
 };
 use crate::exec::{ExecutionContext, Executor};
-use crate::ir::{ColumnOrdinal, ExecutionPlan, FilterDisposition, LogicalPlan, MorselId, TableId};
+use crate::ir::{
+	ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan, FilterDisposition, LogicalPlan, MorselId,
+	TableId,
+};
 use crate::server::{
 	NetworkTaskDispatcher, ToronCoordinator, memory::MemoryManager, transport::ToronTransport,
 };
@@ -803,6 +806,7 @@ async fn execute_catalog_plan(
 		ExecutionPlan::CreateTable {
 			name,
 			schema,
+			row_identity,
 			if_not_exists,
 			or_replace,
 		} => {
@@ -810,7 +814,12 @@ async fn execute_catalog_plan(
 				drop_existing_table_with_storage_admin(catalog, admin, context, name, true).await?;
 			}
 			catalog
-				.create_table(name, schema.clone(), *if_not_exists)
+				.create_table_with_outcome(
+					name,
+					schema.clone(),
+					row_identity.clone(),
+					*if_not_exists,
+				)
 				.await?;
 			Ok(Vec::new())
 		}
@@ -1039,7 +1048,12 @@ async fn execute_write_plan_with_source(
 					.await?;
 			}
 			let outcome = catalog
-				.create_table_with_outcome(table, schema.clone(), *if_not_exists)
+				.create_table_with_outcome(
+					table,
+					schema.clone(),
+					CreateTableRowIdentity::AppendOnly,
+					*if_not_exists,
+				)
 				.await?;
 			if !outcome.created {
 				return Ok(Vec::new());
@@ -1813,6 +1827,7 @@ mod tests {
 		let create = LogicalPlan::CreateTable {
 			name: TableRef::new("rate_write"),
 			schema: Arc::new(Schema::empty()),
+			row_identity: CreateTableRowIdentity::AppendOnly,
 			if_not_exists: false,
 			or_replace: false,
 		};
@@ -2045,6 +2060,7 @@ mod tests {
 		let plan = LogicalPlan::CreateTable {
 			name: TableRef::new("budget_success"),
 			schema: Arc::new(Schema::empty()),
+			row_identity: CreateTableRowIdentity::AppendOnly,
 			if_not_exists: false,
 			or_replace: false,
 		};
@@ -2721,6 +2737,7 @@ mod tests {
 			&self,
 			_name: &TableRef,
 			_schema: SchemaRef,
+			_row_identity: CreateTableRowIdentity,
 			_if_not_exists: bool,
 		) -> Result<crate::catalog::CreateTableOutcome, CatalogError> {
 			Err(CatalogError::AdminFailed {

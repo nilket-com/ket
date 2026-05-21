@@ -9,13 +9,13 @@ use uuid::Uuid;
 
 use crate::distributed::budget::{QueryBudget, TenantBudgetPolicy, TenantDescriptorSyncAccountant};
 use crate::error::{CatalogError, StorageError};
-use crate::ir::{ColumnOrdinal, TableId};
+use crate::ir::{ColumnOrdinal, CreateTableRowIdentity, TableId};
 use crate::storage::TenantId;
 use wendelon::integration::compute::SchemaIntentId;
 use wendelon::schema::{
-	LocalityPolicy, MultiRowLayoutDescriptor, PhysicalDescriptorFingerprint, RecordLayoutPolicy,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
-	TenantId as WendelonTenantId,
+	LocalityPolicy, MultiRowLayoutDescriptor, PhysicalDescriptorFingerprint,
+	PrimaryKeyDescriptorV1, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+	TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
 };
 use wendelon_client::{
 	Client, ClientError, DropOperationId, SchemaGeneration, SchemaUpdateReceipt,
@@ -44,6 +44,31 @@ impl TableRef {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableRowIdentity {
+	AppendOnly,
+	PrimaryKey {
+		column: String,
+		ordinal: ColumnOrdinal,
+	},
+	Unsupported,
+}
+
+impl TableRowIdentity {
+	fn matches_create_identity(&self, row_identity: &CreateTableRowIdentity) -> bool {
+		match (self, row_identity) {
+			(Self::AppendOnly, CreateTableRowIdentity::AppendOnly) => true,
+			(
+				Self::PrimaryKey { column, .. },
+				CreateTableRowIdentity::PrimaryKey {
+					column: requested_column,
+				},
+			) => column == requested_column,
+			_ => false,
+		}
+	}
+}
+
 #[derive(Clone)]
 pub struct TableBinding {
 	pub legacy_table_id: TableId,
@@ -51,6 +76,7 @@ pub struct TableBinding {
 	pub schema_generation: u64,
 	pub fingerprint: PhysicalDescriptorFingerprint,
 	pub schema: SchemaRef,
+	pub row_identity: TableRowIdentity,
 	pub pbc_eligible_columns: HashSet<ColumnOrdinal>,
 	pub primary_key_columns: HashSet<ColumnOrdinal>,
 }
@@ -66,14 +92,16 @@ impl TableBinding {
 			}
 		})?);
 
+		let row_identity = table_row_identity(&schema, descriptor)?;
 		let primary_key_columns = primary_key_columns(&schema, descriptor)?;
 
-		Ok(Self::new_with_primary_key_columns(
+		Ok(Self::new_with_row_identity(
 			legacy_table_id,
 			descriptor.table_object_id,
 			descriptor.schema_generation,
 			descriptor.physical_descriptor_fingerprint,
 			schema,
+			row_identity,
 			primary_key_columns,
 		))
 	}
@@ -112,6 +140,31 @@ impl TableBinding {
 		schema: SchemaRef,
 		primary_key_columns: HashSet<ColumnOrdinal>,
 	) -> Self {
+		let row_identity = if primary_key_columns.is_empty() {
+			TableRowIdentity::AppendOnly
+		} else {
+			TableRowIdentity::Unsupported
+		};
+		Self::new_with_row_identity(
+			legacy_table_id,
+			table,
+			schema_generation,
+			fingerprint,
+			schema,
+			row_identity,
+			primary_key_columns,
+		)
+	}
+
+	pub fn new_with_row_identity(
+		legacy_table_id: TableId,
+		table: TableObjectId,
+		schema_generation: u64,
+		fingerprint: PhysicalDescriptorFingerprint,
+		schema: SchemaRef,
+		row_identity: TableRowIdentity,
+		primary_key_columns: HashSet<ColumnOrdinal>,
+	) -> Self {
 		let pbc_eligible_columns = pbc_eligible_columns(&schema);
 		Self {
 			legacy_table_id,
@@ -119,6 +172,7 @@ impl TableBinding {
 			schema_generation,
 			fingerprint,
 			schema,
+			row_identity,
 			pbc_eligible_columns,
 			primary_key_columns,
 		}
@@ -166,6 +220,7 @@ pub trait Catalog: Send + Sync {
 		&self,
 		name: &TableRef,
 		schema: SchemaRef,
+		row_identity: CreateTableRowIdentity,
 		if_not_exists: bool,
 	) -> Result<CreateTableOutcome, CatalogError>;
 
@@ -175,9 +230,14 @@ pub trait Catalog: Send + Sync {
 		schema: SchemaRef,
 		if_not_exists: bool,
 	) -> Result<TableBinding, CatalogError> {
-		self.create_table_with_outcome(name, schema, if_not_exists)
-			.await
-			.map(|outcome| outcome.binding)
+		self.create_table_with_outcome(
+			name,
+			schema,
+			CreateTableRowIdentity::AppendOnly,
+			if_not_exists,
+		)
+		.await
+		.map(|outcome| outcome.binding)
 	}
 
 	async fn drop_table(
@@ -468,6 +528,7 @@ impl Catalog for MockCatalog {
 		&self,
 		name: &TableRef,
 		schema: SchemaRef,
+		row_identity: CreateTableRowIdentity,
 		if_not_exists: bool,
 	) -> Result<CreateTableOutcome, CatalogError> {
 		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
@@ -479,7 +540,9 @@ impl Catalog for MockCatalog {
 				.expect("MockCatalog by_ref/by_id consistency invariant")
 				.clone();
 			if if_not_exists {
-				if existing.schema.as_ref() == schema.as_ref() {
+				if existing.schema.as_ref() == schema.as_ref()
+					&& existing.row_identity.matches_create_identity(&row_identity)
+				{
 					return Ok(CreateTableOutcome {
 						binding: existing,
 						created: false,
@@ -511,13 +574,11 @@ impl Catalog for MockCatalog {
 			.expect("TableId overflow");
 
 		let (table_object_id, fingerprint) =
-			mock_table_identity(name, schema.as_ref(), legacy_table_id)?;
-		let binding = TableBinding::new(
-			legacy_table_id,
-			table_object_id,
-			fingerprint,
-			schema.clone(),
-		);
+			mock_table_identity(name, schema.as_ref(), &row_identity, legacy_table_id)?;
+		let descriptor =
+			create_table_descriptor(name, schema.as_ref(), &row_identity, table_object_id)?;
+		let mut binding = TableBinding::from_descriptor(legacy_table_id, &descriptor)?;
+		binding.fingerprint = fingerprint;
 
 		inner
 			.by_ref
@@ -1453,11 +1514,14 @@ impl Catalog for WendelonCatalog {
 		&self,
 		name: &TableRef,
 		schema: SchemaRef,
+		row_identity: CreateTableRowIdentity,
 		if_not_exists: bool,
 	) -> Result<CreateTableOutcome, CatalogError> {
 		if let Some(existing) = self.registry.try_resolve_table(self.tenant_id, name) {
 			if if_not_exists {
-				if existing.schema.as_ref() == schema.as_ref() {
+				if existing.schema.as_ref() == schema.as_ref()
+					&& existing.row_identity.matches_create_identity(&row_identity)
+				{
 					return Ok(CreateTableOutcome {
 						binding: existing,
 						created: false,
@@ -1481,13 +1545,15 @@ impl Catalog for WendelonCatalog {
 			})?;
 		let legacy_table_id = self.registry.allocate_table_id();
 		let table_object_id = TableObjectId::new(*Uuid::new_v4().as_bytes());
+		let row_identity_policy =
+			create_table_row_identity_policy(name, schema.as_ref(), &row_identity)?;
 		let descriptor = TableSchemaDescriptor::new_with_layout(
 			table_object_id,
 			1,
 			name.schema.as_deref().unwrap_or("default"),
 			&name.table,
 			schema.as_ref(),
-			RowIdentityPolicy::AppendOnly,
+			row_identity_policy,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
@@ -1509,7 +1575,9 @@ impl Catalog for WendelonCatalog {
 				&& schema_update_rejected
 				&& let Ok(existing) = self.resolve_table_after_local_miss(name).await
 			{
-				if existing.schema.as_ref() == schema.as_ref() {
+				if existing.schema.as_ref() == schema.as_ref()
+					&& existing.row_identity.matches_create_identity(&row_identity)
+				{
 					return Ok(CreateTableOutcome {
 						binding: existing,
 						created: false,
@@ -1659,28 +1727,86 @@ fn map_wendelon_admin_error(table: &TableRef, error: ClientError) -> CatalogErro
 fn mock_table_identity(
 	name: &TableRef,
 	schema: &Schema,
+	row_identity: &CreateTableRowIdentity,
 	legacy_table_id: TableId,
 ) -> Result<(TableObjectId, PhysicalDescriptorFingerprint), CatalogError> {
 	let mut object_id = [0_u8; 16];
 	object_id[8..].copy_from_slice(&legacy_table_id.0.to_be_bytes());
 	let table_object_id = TableObjectId::new(object_id);
 
-	let descriptor = TableSchemaDescriptor::new_with_layout(
+	let descriptor = create_table_descriptor(name, schema, row_identity, table_object_id)?;
+
+	Ok((table_object_id, descriptor.physical_descriptor_fingerprint))
+}
+
+fn create_table_descriptor(
+	name: &TableRef,
+	schema: &Schema,
+	row_identity: &CreateTableRowIdentity,
+	table_object_id: TableObjectId,
+) -> Result<TableSchemaDescriptor, CatalogError> {
+	let row_identity_policy = create_table_row_identity_policy(name, schema, row_identity)?;
+	TableSchemaDescriptor::new_with_layout(
 		table_object_id,
 		1,
 		name.schema.as_deref().unwrap_or("default"),
 		&name.table,
 		schema,
-		RowIdentityPolicy::AppendOnly,
+		row_identity_policy,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.map_err(|error| CatalogError::FingerprintResolution {
 		message: error.to_string(),
-	})?;
+	})
+}
 
-	Ok((table_object_id, descriptor.physical_descriptor_fingerprint))
+fn create_table_row_identity_policy(
+	table: &TableRef,
+	schema: &Schema,
+	row_identity: &CreateTableRowIdentity,
+) -> Result<RowIdentityPolicy, CatalogError> {
+	match row_identity {
+		CreateTableRowIdentity::AppendOnly => Ok(RowIdentityPolicy::AppendOnly),
+		CreateTableRowIdentity::PrimaryKey { column } => {
+			schema
+				.index_of(column)
+				.map_err(|_| CatalogError::SchemaMismatch {
+					table: table_name(table),
+				})?;
+			Ok(RowIdentityPolicy::PrimaryKey(
+				PrimaryKeyDescriptorV1::single(column.as_str()),
+			))
+		}
+	}
+}
+
+fn table_row_identity(
+	schema: &Schema,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> Result<TableRowIdentity, CatalogError> {
+	match &descriptor.row_identity_policy {
+		RowIdentityPolicy::AppendOnly => Ok(TableRowIdentity::AppendOnly),
+		RowIdentityPolicy::PrimaryKey(primary_key) => {
+			let [column] = primary_key.columns.as_slice() else {
+				return Ok(TableRowIdentity::Unsupported);
+			};
+			let ordinal =
+				schema
+					.index_of(column)
+					.map_err(|_| CatalogError::FingerprintResolution {
+						message: format!(
+							"primary key column {column:?} missing from descriptor schema"
+						),
+					})?;
+			Ok(TableRowIdentity::PrimaryKey {
+				column: column.clone(),
+				ordinal: ColumnOrdinal(u32::try_from(ordinal).expect("column ordinal overflow")),
+			})
+		}
+		RowIdentityPolicy::AppendOnlyContentHash => Ok(TableRowIdentity::Unsupported),
+	}
 }
 
 fn pbc_eligible_columns(schema: &Schema) -> HashSet<ColumnOrdinal> {
@@ -2509,7 +2635,14 @@ mod tests {
 		};
 
 		let outcome = catalog
-			.create_table_with_outcome(&TableRef::new("orders"), schema.clone(), true)
+			.create_table_with_outcome(
+				&TableRef::new("orders"),
+				schema.clone(),
+				CreateTableRowIdentity::PrimaryKey {
+					column: "id".to_string(),
+				},
+				true,
+			)
 			.await
 			.expect("compatible remote create race should resolve existing descriptor");
 

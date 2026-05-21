@@ -615,22 +615,15 @@ async fn wendelon_dependent_index_reject_propagates_through_replace() {
 }
 
 #[test]
-fn wendelon_create_uses_append_only_row_identity_policy() {
+fn wendelon_create_row_identity_policy_is_request_driven_after_adr062() {
 	let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/catalog.rs"))
 		.expect("read catalog source");
-	let impl_block = source
-		.split("impl Catalog for WendelonCatalog")
-		.nth(1)
-		.expect("WendelonCatalog Catalog impl");
-	let create_body = impl_block
-		.split("async fn create_table")
-		.nth(1)
-		.and_then(|rest| rest.split("async fn drop_table").next())
-		.expect("WendelonCatalog::create_table body");
 
-	assert!(create_body.contains("RowIdentityPolicy::AppendOnly"));
-	assert!(!create_body.contains("RowIdentityPolicy::PrimaryKey"));
-	assert!(!create_body.contains("RowIdentityPolicy::ByOrdinal"));
+	assert!(source.contains("CreateTableRowIdentity::AppendOnly"));
+	assert!(source.contains("CreateTableRowIdentity::PrimaryKey"));
+	assert!(source.contains("RowIdentityPolicy::AppendOnly"));
+	assert!(source.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single"));
+	assert!(!source.contains("RowIdentityPolicy::ByOrdinal"));
 }
 
 #[tokio::test]
