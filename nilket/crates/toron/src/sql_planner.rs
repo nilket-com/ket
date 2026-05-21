@@ -11,12 +11,12 @@ use crate::ir::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
-	BinaryOperator, CastKind, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable,
-	DataType as SqlDataType, Delete, ExactNumberInfo, Expr as SqlExpr, FromTable, Function,
-	FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
-	HiveDistributionStyle, Ident, Insert, JoinConstraint, JoinOperator, ObjectName, ObjectType,
-	OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableConstraint,
-	TableFactor, TableObject, UnaryOperator, Value,
+	Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnDef, ColumnOption,
+	ColumnOptionDef, CreateTable, DataType as SqlDataType, Delete, ExactNumberInfo,
+	Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+	FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident, Insert, JoinConstraint,
+	JoinOperator, ObjectName, ObjectType, OrderBy, Query, Select, SelectItem, SetExpr, Statement,
+	TableAlias, TableConstraint, TableFactor, TableObject, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -168,6 +168,118 @@ fn lower_insert_column_list(columns: &[Ident]) -> Option<Vec<String>> {
 	} else {
 		Some(columns.iter().map(|ident| ident.value.clone()).collect())
 	}
+}
+
+fn lower_update_target_table(
+	table: &sqlparser::ast::TableWithJoins,
+) -> Result<TableRef, FrontendError> {
+	let TableFactor::Table {
+		name,
+		alias,
+		args,
+		with_hints,
+		version,
+		with_ordinality,
+		partitions,
+		json_path,
+		sample,
+	} = &table.relation
+	else {
+		return Err(unsupported("UPDATE target must be a single table"));
+	};
+
+	if alias.is_some() {
+		return Err(unsupported("unsupported UPDATE target: table alias"));
+	}
+	if args.is_some() {
+		return Err(unsupported("unsupported UPDATE target: table arguments"));
+	}
+	if !with_hints.is_empty() {
+		return Err(unsupported("unsupported UPDATE target: table hints"));
+	}
+	if version.is_some() {
+		return Err(unsupported("unsupported UPDATE target: table version"));
+	}
+	if *with_ordinality {
+		return Err(unsupported("unsupported UPDATE target: WITH ORDINALITY"));
+	}
+	if !partitions.is_empty() {
+		return Err(unsupported("unsupported UPDATE target: partitions"));
+	}
+	if json_path.is_some() {
+		return Err(unsupported("unsupported UPDATE target: json path"));
+	}
+	if sample.is_some() {
+		return Err(unsupported("unsupported UPDATE target: sample"));
+	}
+
+	lower_table_ref_object_name(name, "UPDATE")
+}
+
+fn lower_update_assignments(
+	planner: &SqlPlanner,
+	assignments: &[Assignment],
+) -> Result<Vec<(String, Expr)>, FrontendError> {
+	if assignments.is_empty() {
+		return Err(unsupported("UPDATE requires at least one assignment"));
+	}
+
+	let mut seen = HashSet::new();
+	let mut lowered = Vec::with_capacity(assignments.len());
+	for assignment in assignments {
+		let column = lower_update_assignment_target(&assignment.target)?;
+		if !seen.insert(column.clone()) {
+			return Err(unsupported(format!(
+				"duplicate UPDATE assignment target: {column}"
+			)));
+		}
+		let value = lower_update_assignment_expr(planner, &assignment.value)?;
+		lowered.push((column, value));
+	}
+	Ok(lowered)
+}
+
+fn lower_update_assignment_target(target: &AssignmentTarget) -> Result<String, FrontendError> {
+	match target {
+		AssignmentTarget::ColumnName(name) => match name.0.as_slice() {
+			[column] => Ok(column.value.clone()),
+			_ => Err(unsupported(
+				"unsupported UPDATE assignment target: qualified column",
+			)),
+		},
+		AssignmentTarget::Tuple(_) => Err(unsupported(
+			"unsupported UPDATE assignment target: tuple assignment",
+		)),
+	}
+}
+
+fn lower_update_assignment_expr(
+	planner: &SqlPlanner,
+	expr: &SqlExpr,
+) -> Result<Expr, FrontendError> {
+	if matches!(strip_nested_sql_expr(expr), SqlExpr::Value(Value::Null)) {
+		return Ok(update_null_placeholder());
+	}
+	if expr_contains_aggregate_call(expr) {
+		return Err(unsupported(
+			"unsupported UPDATE assignment expression: aggregate functions",
+		));
+	}
+	if expr_contains_subquery(expr) {
+		return Err(unsupported(
+			"unsupported UPDATE assignment expression: subqueries",
+		));
+	}
+	if expr_contains_window_function(expr) {
+		return Err(unsupported(
+			"unsupported UPDATE assignment expression: window functions",
+		));
+	}
+	planner.lower_expr(expr)
+}
+
+fn update_null_placeholder() -> Expr {
+	Expr::Literal(ScalarValue::Utf8(None))
 }
 
 enum LoweredInsertSource {
@@ -589,10 +701,56 @@ impl SqlPlanner {
 			Statement::CreateTable(create_table) => self.lower_create_table(create_table),
 			Statement::Insert(insert) => self.lower_insert(insert),
 			Statement::Delete(delete) => self.lower_delete(delete),
+			Statement::Update { .. } => self.lower_update(&ast[0]),
 			Statement::Drop { .. } => self.lower_drop_table(&ast[0]),
 			_ => Err(unsupported(
-				"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, DELETE, and DROP TABLE are supported",
+				"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported",
 			)),
+		}
+	}
+
+	fn lower_update(&self, statement: &Statement) -> Result<LogicalPlan, FrontendError> {
+		let Statement::Update {
+			table,
+			assignments,
+			from,
+			selection,
+			returning,
+			or,
+		} = statement
+		else {
+			return Err(unsupported(
+				"internal planner error: expected UPDATE statement",
+			));
+		};
+
+		if from.is_some() {
+			return Err(unsupported("unsupported UPDATE clause: FROM"));
+		}
+		if returning.is_some() {
+			return Err(unsupported("unsupported UPDATE clause: RETURNING"));
+		}
+		if or.is_some() {
+			return Err(unsupported(
+				"unsupported UPDATE clause: OR (ROLLBACK/ABORT/REPLACE/...)",
+			));
+		}
+		if table.joins.is_empty() {
+			let target = lower_update_target_table(table)?;
+			let assignments = lower_update_assignments(self, assignments)?;
+			let predicate = selection
+				.as_ref()
+				.ok_or_else(|| unsupported("UPDATE requires a WHERE clause"))
+				.and_then(|expr| self.lower_expr(expr))?;
+			Ok(LogicalPlan::Update {
+				table: target,
+				assignments,
+				predicate,
+			})
+		} else {
+			Err(unsupported(
+				"unsupported UPDATE target: joins not supported",
+			))
 		}
 	}
 
@@ -3210,6 +3368,81 @@ fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 	}
 }
 
+fn expr_contains_subquery(expr: &SqlExpr) -> bool {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => true,
+		SqlExpr::BinaryOp { left, right, .. } => {
+			expr_contains_subquery(left) || expr_contains_subquery(right)
+		}
+		SqlExpr::Cast { expr, .. } => expr_contains_subquery(expr),
+		SqlExpr::UnaryOp { expr, .. }
+		| SqlExpr::IsNull(expr)
+		| SqlExpr::IsNotNull(expr)
+		| SqlExpr::Nested(expr) => expr_contains_subquery(expr),
+		SqlExpr::Function(function) => function_args_contain_subquery(function),
+		_ => false,
+	}
+}
+
+fn expr_contains_window_function(expr: &SqlExpr) -> bool {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Function(function) => {
+			function.over.is_some()
+				|| function
+					.filter
+					.as_deref()
+					.is_some_and(expr_contains_window_function)
+				|| function_args_contain_window_function(function)
+		}
+		SqlExpr::BinaryOp { left, right, .. } => {
+			expr_contains_window_function(left) || expr_contains_window_function(right)
+		}
+		SqlExpr::Cast { expr, .. } => expr_contains_window_function(expr),
+		SqlExpr::UnaryOp { expr, .. }
+		| SqlExpr::IsNull(expr)
+		| SqlExpr::IsNotNull(expr)
+		| SqlExpr::Nested(expr) => expr_contains_window_function(expr),
+		_ => false,
+	}
+}
+
+fn function_args_contain_subquery(function: &Function) -> bool {
+	match &function.args {
+		FunctionArguments::Subquery(_) => true,
+		FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
+			FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+			| FunctionArg::Named {
+				arg: FunctionArgExpr::Expr(expr),
+				..
+			}
+			| FunctionArg::ExprNamed {
+				arg: FunctionArgExpr::Expr(expr),
+				..
+			} => expr_contains_subquery(expr),
+			_ => false,
+		}),
+		_ => false,
+	}
+}
+
+fn function_args_contain_window_function(function: &Function) -> bool {
+	let FunctionArguments::List(list) = &function.args else {
+		return false;
+	};
+	list.args.iter().any(|arg| match arg {
+		FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+		| FunctionArg::Named {
+			arg: FunctionArgExpr::Expr(expr),
+			..
+		}
+		| FunctionArg::ExprNamed {
+			arg: FunctionArgExpr::Expr(expr),
+			..
+		} => expr_contains_window_function(expr),
+		_ => false,
+	})
+}
+
 fn reject_global_aggregate_projection_columns(
 	projection: &[SelectItem],
 ) -> Result<(), FrontendError> {
@@ -3442,6 +3675,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => false,
 	}
@@ -3722,6 +3956,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => Vec::new(),
 	}

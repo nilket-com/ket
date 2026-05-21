@@ -8,7 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use crate::aggregate_kernel::{
 	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
 };
-use crate::catalog::{Catalog, TableBinding, TableRef};
+use crate::catalog::{Catalog, TableBinding, TableRef, TableRowIdentity};
 use crate::error::BindingError;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
@@ -234,6 +234,11 @@ impl<'a> Binder<'a> {
 				LogicalPlan::Delete { table, predicate } => {
 					self.bind_delete(table, predicate.as_ref()).await
 				}
+				LogicalPlan::Update {
+					table,
+					assignments,
+					predicate,
+				} => self.bind_update(table, assignments, predicate).await,
 				LogicalPlan::Insert {
 					table,
 					columns,
@@ -440,6 +445,108 @@ impl<'a> Binder<'a> {
 		})
 	}
 
+	async fn bind_update(
+		&self,
+		table: &TableRef,
+		assignments: &[(String, Expr)],
+		predicate: &Expr,
+	) -> Result<ExecutionPlan, BindingError> {
+		let binding = self.catalog.resolve_table(table).await?;
+		let TableRowIdentity::PrimaryKey {
+			ordinal: primary_key_ordinal,
+			..
+		} = &binding.row_identity
+		else {
+			return Err(BindingError::UnsupportedExpression {
+				message: "UPDATE requires a PRIMARY KEY table".to_string(),
+			});
+		};
+		if !binding.primary_key_columns.contains(primary_key_ordinal) {
+			return Err(BindingError::UnsupportedExpression {
+				message: "UPDATE requires a PRIMARY KEY table".to_string(),
+			});
+		}
+
+		let schema = binding.schema.clone();
+		let mut seen = HashSet::new();
+		let mut assigned = HashMap::new();
+		for (column, expr) in assignments {
+			if STORAGE_SYNTHETIC_COLUMN_NAMES.contains(&column.as_str()) {
+				return Err(BindingError::UnsupportedExpression {
+					message: format!(
+						"UPDATE target column is reserved for storage metadata: {column}"
+					),
+				});
+			}
+			if !seen.insert(column.clone()) {
+				return Err(BindingError::UnsupportedExpression {
+					message: format!("duplicate UPDATE target column: {column}"),
+				});
+			}
+			let resolved = resolve_column(column, &schema)?;
+			if resolved.ordinal == *primary_key_ordinal {
+				return Err(BindingError::UnsupportedExpression {
+					message: "UPDATE cannot modify the PRIMARY KEY column".to_string(),
+				});
+			}
+			let field = schema.field(resolved.ordinal.0 as usize);
+			assigned.insert(resolved.ordinal, typed_update_null_for_target(expr, field)?);
+		}
+
+		let mut source_exprs = Vec::with_capacity(schema.fields().len());
+		let mut output_names = Vec::with_capacity(schema.fields().len());
+		for (field_index, field) in schema.fields().iter().enumerate() {
+			let ordinal =
+				ColumnOrdinal(u32::try_from(field_index).expect("column ordinal overflow"));
+			source_exprs.push(
+				assigned
+					.remove(&ordinal)
+					.unwrap_or_else(|| Expr::column(field.name().clone())),
+			);
+			output_names.push(Some(field.name().clone()));
+		}
+
+		let bound_predicate =
+			bind_expr_program(std::slice::from_ref(predicate), &schema, self.config)?;
+		require_single_boolean_root(&bound_predicate, "UPDATE WHERE")?;
+		let mut scan = scan_plan(binding.clone(), None);
+		let profile_hint =
+			scan_profile_hint(&bound_predicate, &scan).unwrap_or(QueryProfileHint::Scan);
+		apply_scan_profile_hint(&mut scan, Some(profile_hint));
+		let (filter_input, disposition) = match compile_pbc(&bound_predicate) {
+			Some(program) => {
+				let (input, attached) = attach_pbc_program(scan, program);
+				let disposition = if attached {
+					FilterDisposition::FullyPushed
+				} else {
+					FilterDisposition::EvaluateInToron
+				};
+				(input, disposition)
+			}
+			None => (scan, FilterDisposition::EvaluateInToron),
+		};
+		let filtered = ExecutionPlan::Filter {
+			input: Box::new(filter_input),
+			predicate: bound_predicate,
+			disposition,
+		};
+		let exprs = bind_expr_program(&source_exprs, &filtered.schema(), self.config)?;
+		let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
+
+		Ok(ExecutionPlan::Update {
+			legacy_table_id: binding.legacy_table_id,
+			table: binding.table,
+			fingerprint: binding.fingerprint,
+			schema,
+			source: Box::new(ExecutionPlan::Project {
+				input: Box::new(filtered),
+				exprs,
+				output_schema,
+			}),
+			profile_hint,
+		})
+	}
+
 	async fn bind_join(
 		&self,
 		left: &LogicalPlan,
@@ -523,6 +630,29 @@ fn validate_omitted_insert_target_columns(
 		}
 	}
 	Ok(())
+}
+
+fn typed_update_null_for_target(expr: &Expr, field: &Field) -> Result<Expr, BindingError> {
+	if !matches!(expr, Expr::Literal(ScalarValue::Utf8(None))) {
+		return Ok(expr.clone());
+	}
+	let value = match field.data_type() {
+		DataType::Boolean => ScalarValue::Boolean(None),
+		DataType::Int32 => ScalarValue::Int32(None),
+		DataType::Int64 => ScalarValue::Int64(None),
+		DataType::Float32 => ScalarValue::Float32(None),
+		DataType::Float64 => ScalarValue::Float64(None),
+		DataType::Utf8 => ScalarValue::Utf8(None),
+		other => {
+			return Err(BindingError::TypeMismatch {
+				message: format!(
+					"unsupported UPDATE target type for column {}: {other:?}",
+					field.name()
+				),
+			});
+		}
+	};
+	Ok(Expr::Literal(value))
 }
 
 fn infer_ctas_schema(source_schema: &SchemaRef) -> Result<SchemaRef, BindingError> {
@@ -898,6 +1028,7 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
 		| LogicalPlan::Insert { .. }
 		| LogicalPlan::InsertSelect { .. } => {}
 	}
@@ -1049,6 +1180,7 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -1390,6 +1522,27 @@ fn optimize_for_required(
 			},
 			OrdinalRemap::new(),
 		)),
+		ExecutionPlan::Update {
+			legacy_table_id,
+			table,
+			fingerprint,
+			schema,
+			source,
+			profile_hint,
+		} => {
+			let (source, _) = optimize_for_required(*source, None)?;
+			Ok((
+				ExecutionPlan::Update {
+					legacy_table_id,
+					table,
+					fingerprint,
+					schema,
+					source: Box::new(source),
+					profile_hint,
+				},
+				OrdinalRemap::new(),
+			))
+		}
 		ExecutionPlan::Insert {
 			legacy_table_id,
 			table,

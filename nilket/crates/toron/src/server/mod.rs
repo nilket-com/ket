@@ -656,6 +656,7 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}
@@ -674,6 +675,7 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => false,
 	}
@@ -695,6 +697,7 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::CreateTableAsSelect { .. } => "create_table_as_select",
 			ExecutionPlan::DropTable { .. } => "drop_table",
 			ExecutionPlan::Delete { .. } => "delete",
+			ExecutionPlan::Update { .. } => "update",
 			ExecutionPlan::Insert { .. } => "insert",
 			ExecutionPlan::InsertSelect { .. } => "insert_select",
 		}
@@ -853,6 +856,7 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => false,
 	}
@@ -1274,6 +1278,7 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}

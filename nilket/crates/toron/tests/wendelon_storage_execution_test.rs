@@ -213,6 +213,104 @@ async fn sql_created_pk_table_insert_supersedes_visible_row() {
 }
 
 #[tokio::test]
+async fn live_wendelon_sql_pk_update_supersedes_visible_row() {
+	let fixture = LiveWendelonFixture::start(52).await;
+	let catalog = Arc::new(MockCatalog::new());
+	let planner = toron::sql_planner::SqlPlanner::new();
+	let create_coordinator = QueryCoordinator::new(
+		catalog.clone(),
+		Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		})),
+		PlannerConfig::default(),
+	);
+
+	create_coordinator
+		.execute_query(
+			&planner
+				.plan(
+					"CREATE TABLE bench.sql_pk_update (id BIGINT NOT NULL PRIMARY KEY, note TEXT)",
+				)
+				.expect("plan SQL PK create"),
+			None,
+		)
+		.await
+		.expect("execute SQL PK create");
+
+	let table = TableRef::with_schema("bench", "sql_pk_update");
+	let binding = catalog
+		.resolve_table(&table)
+		.await
+		.expect("resolve SQL-created PK table");
+	let descriptor = descriptor_from_sql_created_binding(&table, &binding);
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	fixture
+		.node
+		.data_server
+		.refresh_leases_once(&fixture.node.ring, &*fixture.node.clock, 60_000)
+		.await;
+
+	let descriptors = HashMap::from([(binding.legacy_table_id, descriptor)]);
+	let registry = Arc::new(
+		WendelonDescriptorRegistry::from_descriptors(descriptors)
+			.expect("registry from SQL-created descriptor"),
+	);
+	let executor = Executor::with_context(
+		Arc::new(WendelonStorageScan::with_descriptor_registry(
+			fixture.client.clone(),
+			registry.clone(),
+		)),
+		ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(63),
+			ToronTenantId(1),
+			HlcBound(u64::MAX),
+		),
+	);
+	let writer = Arc::new(WendelonStorageWrite::with_descriptor_registry(
+		fixture.client.clone(),
+		registry,
+	));
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), writer);
+
+	coordinator
+		.execute_query(
+			&planner
+				.plan("INSERT INTO bench.sql_pk_update (id, note) VALUES (1, 'old')")
+				.expect("plan insert"),
+			None,
+		)
+		.await
+		.expect("execute insert");
+	let update = coordinator
+		.execute_query(
+			&planner
+				.plan("UPDATE bench.sql_pk_update SET note = 'new' WHERE id = 1")
+				.expect("plan update"),
+			None,
+		)
+		.await
+		.expect("execute update");
+	assert_eq!(affected_count_from_batches(&update), 1);
+
+	let result = coordinator
+		.execute_query(
+			&planner
+				.plan("SELECT id, note FROM bench.sql_pk_update WHERE id = 1")
+				.expect("plan select"),
+			None,
+		)
+		.await
+		.expect("select superseded row");
+
+	assert_eq!(id_notes_from_batches(&result), vec![(1, "new".to_string())]);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
 async fn wendelon_declined_time_bucket_filter_matches_in_memory_baseline() {
 	let fixture = LiveWendelonFixture::start(34).await;
 	let descriptor = descriptor();
@@ -652,6 +750,7 @@ fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 		}
 		ExecutionPlan::DropTable { .. } => panic!("DROP TABLE has no scan"),
 		ExecutionPlan::Delete { .. } => panic!("DELETE has no scan"),
+		ExecutionPlan::Update { .. } => panic!("UPDATE has no scan"),
 		ExecutionPlan::Insert { .. } => panic!("INSERT has no scan"),
 		ExecutionPlan::InsertSelect { .. } => panic!("INSERT INTO ... SELECT has no scan"),
 	}
@@ -1081,6 +1180,17 @@ fn id_notes_from_batches(batches: &[RecordBatch]) -> Vec<(i64, String)> {
 		}
 	}
 	rows
+}
+
+fn affected_count_from_batches(batches: &[RecordBatch]) -> i64 {
+	assert_eq!(batches.len(), 1);
+	let affected = batches[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("affected column");
+	assert_eq!(affected.len(), 1);
+	affected.value(0)
 }
 
 fn selective_batch(rows: i64) -> RecordBatch {

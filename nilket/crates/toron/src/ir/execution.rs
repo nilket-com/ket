@@ -224,6 +224,14 @@ pub enum ExecutionPlan {
 		pbc_program: Option<PbcProgram>,
 		profile_hint: QueryProfileHint,
 	},
+	Update {
+		legacy_table_id: TableId,
+		table: TableObjectId,
+		fingerprint: PhysicalDescriptorFingerprint,
+		schema: SchemaRef,
+		source: Box<ExecutionPlan>,
+		profile_hint: QueryProfileHint,
+	},
 	Insert {
 		legacy_table_id: TableId,
 		table: TableObjectId,
@@ -259,6 +267,7 @@ impl ExecutionPlan {
 			Self::CreateTableAsSelect { .. } => Arc::new(Schema::empty()),
 			Self::DropTable { .. } => Arc::new(Schema::empty()),
 			Self::Delete { .. } => result_count_schema_int64("deleted"),
+			Self::Update { .. } => Arc::new(Schema::empty()),
 			Self::Insert { .. } => Arc::new(Schema::empty()),
 			Self::InsertSelect { .. } => Arc::new(Schema::empty()),
 		}

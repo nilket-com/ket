@@ -568,11 +568,12 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 15);
+	assert_eq!(enum_variant_count(logical_plan), 16);
 	assert!(logical_plan.contains("Sort {"));
 	assert!(logical_plan.contains("CreateTable {"));
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
 	assert!(logical_plan.contains("DropTable {"));
+	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("Insert {"));
 	assert!(logical_plan.contains("InsertSelect {"));
 	assert!(logical_plan.contains("output_names: Vec<Option<String>>"));
@@ -586,11 +587,12 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 13);
+	assert_eq!(enum_variant_count(execution_plan), 14);
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("CreateTable {"));
 	assert!(execution_plan.contains("CreateTableAsSelect {"));
 	assert!(execution_plan.contains("DropTable {"));
+	assert!(execution_plan.contains("Update {"));
 	assert!(execution_plan.contains("Insert {"));
 	assert!(execution_plan.contains("InsertSelect {"));
 	assert!(execution_plan.contains("predicate: BoundExprProgram"));
@@ -2556,7 +2558,7 @@ fn adr029_sql_planner_accepts_only_select_and_create_table() {
 	assert!(plan_body.contains("Statement::Delete(delete)"));
 	assert!(plan_body.contains("Statement::Drop { .. }"));
 	assert!(plan_body.contains(
-		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, DELETE, and DROP TABLE are supported"
+		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported"
 	));
 	assert!(!plan_body.contains("only SELECT and CREATE TABLE are supported"));
 	assert!(!plan_body.contains("only SELECT is supported"));
@@ -3105,9 +3107,10 @@ fn adr032_logical_plan_retains_insert_select_variant() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 15);
+	assert_eq!(enum_variant_count(logical_plan), 16);
 	assert!(logical_plan.contains("InsertSelect {"));
 	assert!(logical_plan.contains("DropTable {"));
+	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("table: TableRef,"));
 	assert!(logical_plan.contains("columns: Option<Vec<String>>,"));
 	assert!(logical_plan.contains("source: Box<LogicalPlan>,"));
@@ -3122,9 +3125,10 @@ fn adr032_execution_plan_retains_insert_select_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 13);
+	assert_eq!(enum_variant_count(execution_plan), 14);
 	assert!(execution_plan.contains("InsertSelect {"));
 	assert!(execution_plan.contains("DropTable {"));
+	assert!(execution_plan.contains("Update {"));
 }
 
 #[test]
@@ -3446,14 +3450,12 @@ fn adr032_coordinator_uses_only_evaluate_cast() {
 	let coordinator_write =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
 			.expect("read coordinator/write.rs");
-	let materialize = brace_blocks_after_marker(
-		&coordinator_write,
-		"pub(super) fn materialize_insert_select_batch",
-	)
-	.into_iter()
-	.next()
-	.expect("materialize_insert_select_batch body")
-	.1;
+	let materialize =
+		brace_blocks_after_marker(&coordinator_write, "fn materialize_write_select_batch")
+			.into_iter()
+			.next()
+			.expect("materialize_write_select_batch body")
+			.1;
 	assert!(materialize.contains("TABLE_WRITE_MAX_ROWS"));
 	assert!(materialize.contains("coerce_insert_select_array"));
 	assert!(materialize.contains("typed_null_array"));
@@ -3485,8 +3487,9 @@ fn adr033_logical_variant_count_is_13() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 15);
+	assert_eq!(enum_variant_count(logical_plan), 16);
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
+	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("table: TableRef,"));
 	assert!(logical_plan.contains("if_not_exists: bool,"));
 	assert!(logical_plan.contains("source: Box<LogicalPlan>,"));
@@ -3503,9 +3506,10 @@ fn adr033_execution_variant_count_is_11() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 13);
+	assert_eq!(enum_variant_count(execution_plan), 14);
 	assert!(execution_plan.contains("CreateTableAsSelect {"));
 	assert!(execution_plan.contains("DropTable {"));
+	assert!(execution_plan.contains("Update {"));
 }
 
 #[test]
@@ -3918,14 +3922,12 @@ fn adr033_does_not_modify_insert_select_empty_contract() {
 	let coordinator_write =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
 			.expect("read coordinator/write.rs");
-	let materialize = brace_blocks_after_marker(
-		&coordinator_write,
-		"pub(super) fn materialize_insert_select_batch",
-	)
-	.into_iter()
-	.next()
-	.expect("materialize_insert_select_batch body")
-	.1;
+	let materialize =
+		brace_blocks_after_marker(&coordinator_write, "fn materialize_write_select_batch")
+			.into_iter()
+			.next()
+			.expect("materialize_write_select_batch body")
+			.1;
 
 	assert!(materialize.contains("return Ok(None);"));
 }
@@ -4040,8 +4042,9 @@ fn adr034_logical_variant_count_is_14() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 15);
+	assert_eq!(enum_variant_count(logical_plan), 16);
 	assert!(logical_plan.contains("DropTable {"));
+	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("name: TableRef,"));
 	assert!(logical_plan.contains("if_exists: bool,"));
 }
@@ -4056,8 +4059,9 @@ fn adr034_execution_variant_count_is_12() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 13);
+	assert_eq!(enum_variant_count(execution_plan), 14);
 	assert!(execution_plan.contains("DropTable {"));
+	assert!(execution_plan.contains("Update {"));
 }
 
 #[test]
@@ -4373,7 +4377,7 @@ fn adr036_sql_planner_accepts_delete() {
 		.expect("read SQL planner source");
 
 	assert!(planner.contains("Statement::Delete(delete) => self.lower_delete(delete)"));
-	assert!(planner.contains("SELECT, CREATE TABLE, INSERT, DELETE, and DROP TABLE"));
+	assert!(planner.contains("SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE"));
 }
 
 #[test]
@@ -4480,8 +4484,9 @@ fn adr036_logical_variant_count_is_15() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 15);
+	assert_eq!(enum_variant_count(logical_plan), 16);
 	assert!(logical_plan.contains("Delete {"));
+	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("table: TableRef,"));
 	assert!(logical_plan.contains("predicate: Option<Expr>,"));
 }
@@ -4496,8 +4501,9 @@ fn adr036_execution_variant_count_is_13() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 13);
+	assert_eq!(enum_variant_count(execution_plan), 14);
 	assert!(execution_plan.contains("Delete {"));
+	assert!(execution_plan.contains("Update {"));
 }
 
 #[test]
@@ -11874,16 +11880,28 @@ fn adr062_no_pk_create_remains_append_only() {
 }
 
 #[test]
-fn adr062_update_surface_remains_absent() {
+fn adr062_update_surface_is_present_under_pk_update_contract_after_adr063() {
 	let planner =
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
 	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
 	let execution =
 		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
 
-	assert!(!planner.contains("Statement::Update"));
-	assert!(!logical.contains("Update {"));
-	assert!(!execution.contains("Update {"));
+	assert!(planner.contains("Statement::Update { .. } => self.lower_update(&ast[0])"));
+	assert!(logical.contains("Update {"));
+	assert!(execution.contains("Update {"));
+	assert!(planner.contains("UPDATE requires a WHERE clause"));
+	assert!(planner.contains("unsupported UPDATE clause: RETURNING"));
+	assert!(binder.contains("UPDATE requires a PRIMARY KEY table"));
+	assert!(binder.contains("UPDATE cannot modify the PRIMARY KEY column"));
+	assert!(fragmenter.contains("UpdateNotFragmentable"));
+	assert!(server.contains("ExecutionPlan::Update { .. } => \"update\""));
 }
 
 #[test]
@@ -11979,6 +11997,523 @@ fn adr062_prior_adr033_to_061_guards_continue_to_pass_except_retarget() {
 	assert!(architecture_test.contains(
 		"adr038_wendelon_create_row_identity_policy_is_create_request_driven_after_adr062"
 	));
+}
+
+#[test]
+fn adr063_sql_planner_accepts_statement_update() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let plan_body = brace_blocks_after_marker(&planner, "pub fn plan")
+		.into_iter()
+		.next()
+		.expect("plan body")
+		.1;
+
+	assert!(plan_body.contains("Statement::Update { .. } => self.lower_update(&ast[0])"));
+}
+
+#[test]
+fn adr063_sql_planner_destructures_sqlparser_054_update_fields() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
+		.into_iter()
+		.next()
+		.expect("lower_update")
+		.1;
+
+	assert!(lower_update.contains("let Statement::Update {"));
+	for field in [
+		"table",
+		"assignments",
+		"from",
+		"selection",
+		"returning",
+		"or",
+	] {
+		assert!(
+			lower_update.contains(field),
+			"UPDATE destructure lost sqlparser 0.54 field {field}"
+		);
+	}
+}
+
+#[test]
+fn adr063_sqlparser_062_upgrade_is_not_part_of_update_surface() {
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
+
+	assert!(manifest.contains("sqlparser = \"0.54\""));
+	assert!(!manifest.contains("sqlparser = \"0.62\""));
+}
+
+#[test]
+fn adr063_unsupported_statement_text_lists_update() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let plan_body = brace_blocks_after_marker(&planner, "pub fn plan")
+		.into_iter()
+		.next()
+		.expect("plan body")
+		.1;
+
+	assert!(plan_body.contains("SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE"));
+}
+
+#[test]
+fn adr063_update_requires_where_and_delete_semantics_unchanged() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
+		.into_iter()
+		.next()
+		.expect("lower_update")
+		.1;
+	let lower_delete = brace_blocks_after_marker(&planner, "fn lower_delete")
+		.into_iter()
+		.next()
+		.expect("lower_delete")
+		.1;
+
+	assert!(lower_update.contains("UPDATE requires a WHERE clause"));
+	assert!(lower_update.contains("selection"));
+	assert!(lower_delete.contains("let predicate = selection"));
+	assert!(lower_delete.contains(".map(|expr| self.lower_expr(expr))"));
+	assert!(!lower_delete.contains("DELETE requires a WHERE clause"));
+}
+
+#[test]
+fn adr063_update_rejects_unsupported_clauses() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
+		.into_iter()
+		.next()
+		.expect("lower_update")
+		.1;
+
+	for clause in [
+		"unsupported UPDATE clause: FROM",
+		"unsupported UPDATE clause: RETURNING",
+		"unsupported UPDATE clause: OR",
+	] {
+		assert!(lower_update.contains(clause), "missing {clause}");
+	}
+}
+
+#[test]
+fn adr063_update_rejects_target_alias_joins_and_qualified_targets() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_target = brace_blocks_after_marker(&planner, "fn lower_update_target_table")
+		.into_iter()
+		.next()
+		.expect("lower_update_target_table")
+		.1;
+	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
+		.into_iter()
+		.next()
+		.expect("lower_update")
+		.1;
+	let lower_assignment = brace_blocks_after_marker(&planner, "fn lower_update_assignment_target")
+		.into_iter()
+		.next()
+		.expect("lower_update_assignment_target")
+		.1;
+
+	for target_reject in [
+		"unsupported UPDATE target: table alias",
+		"unsupported UPDATE target: table arguments",
+		"unsupported UPDATE target: table hints",
+		"unsupported UPDATE target: table version",
+		"unsupported UPDATE target: WITH ORDINALITY",
+		"unsupported UPDATE target: partitions",
+		"unsupported UPDATE target: json path",
+		"unsupported UPDATE target: sample",
+	] {
+		assert!(
+			lower_target.contains(target_reject),
+			"missing {target_reject}"
+		);
+	}
+	assert!(lower_update.contains("unsupported UPDATE target: joins not supported"));
+	assert!(lower_assignment.contains("unsupported UPDATE assignment target: qualified column"));
+}
+
+#[test]
+fn adr063_update_rejects_duplicate_and_empty_assignments() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_assignments = brace_blocks_after_marker(&planner, "fn lower_update_assignments")
+		.into_iter()
+		.next()
+		.expect("lower_update_assignments")
+		.1;
+	let lower_assignment = brace_blocks_after_marker(&planner, "fn lower_update_assignment_target")
+		.into_iter()
+		.next()
+		.expect("lower_update_assignment_target")
+		.1;
+
+	assert!(lower_assignments.contains("UPDATE requires at least one assignment"));
+	assert!(lower_assignments.contains("duplicate UPDATE assignment target"));
+	assert!(lower_assignment.contains("unsupported UPDATE assignment target: tuple assignment"));
+}
+
+#[test]
+fn adr063_logical_update_shape_is_name_based() {
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let update = brace_blocks_after_marker(&logical, "Update {")
+		.into_iter()
+		.next()
+		.expect("logical update")
+		.1;
+
+	assert!(update.contains("table: TableRef"));
+	assert!(update.contains("assignments: Vec<(String, Expr)>"));
+	assert!(update.contains("predicate: Expr"));
+}
+
+#[test]
+fn adr063_execution_update_shape_is_source_bearing() {
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+	let update = brace_blocks_after_marker(&execution, "Update {")
+		.into_iter()
+		.next()
+		.expect("execution update")
+		.1;
+
+	for required in [
+		"legacy_table_id: TableId",
+		"table: TableObjectId",
+		"fingerprint: PhysicalDescriptorFingerprint",
+		"schema: SchemaRef",
+		"source: Box<ExecutionPlan>",
+		"profile_hint: QueryProfileHint",
+	] {
+		assert!(update.contains(required), "missing {required}");
+	}
+}
+
+#[test]
+fn adr063_logical_update_has_no_wendelon_identity_types() {
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let update = brace_blocks_after_marker(&logical, "Update {")
+		.into_iter()
+		.next()
+		.expect("logical update")
+		.1;
+
+	for forbidden in [
+		"TableRowIdentity",
+		"RowIdentityPolicy",
+		"RowIdentityProjection",
+		"TableObjectId",
+		"PhysicalDescriptorFingerprint",
+	] {
+		assert!(
+			!update.contains(forbidden),
+			"logical UPDATE leaked {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr063_binder_requires_primary_key_row_identity() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+
+	assert!(bind_update.contains("TableRowIdentity::PrimaryKey"));
+	assert!(bind_update.contains("primary_key_columns.contains(primary_key_ordinal)"));
+	assert!(bind_update.contains("UPDATE requires a PRIMARY KEY table"));
+}
+
+#[test]
+fn adr063_binder_rejects_primary_key_assignment() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+
+	assert!(bind_update.contains("UPDATE cannot modify the PRIMARY KEY column"));
+	assert!(bind_update.contains("STORAGE_SYNTHETIC_COLUMN_NAMES.contains(&column.as_str())"));
+}
+
+#[test]
+fn adr063_binder_builds_full_row_source_projection() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+
+	assert!(bind_update.contains("source_exprs"));
+	assert!(bind_update.contains("schema.fields().iter().enumerate()"));
+	assert!(bind_update.contains(".remove(&ordinal)"));
+	assert!(bind_update.contains("Expr::column(field.name().clone())"));
+	assert!(bind_update.contains("output_names.push(Some(field.name().clone()))"));
+	assert!(bind_update.contains("ExecutionPlan::Project"));
+}
+
+#[test]
+fn adr063_update_source_scan_does_not_request_append_identity() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+
+	assert!(bind_update.contains("scan_plan(binding.clone(), None)"));
+	assert!(!bind_update.contains("RowIdentityProjection::Append"));
+	assert!(!bind_update.contains("TableRowIdentity::AppendOnly"));
+}
+
+#[test]
+fn adr063_update_reuses_existing_point_read_profile() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+
+	assert!(bind_update.contains("scan_profile_hint(&bound_predicate, &scan)"));
+	assert!(bind_update.contains("apply_scan_profile_hint(&mut scan, Some(profile_hint))"));
+	assert!(!bind_update.contains("update_profile_hint"));
+}
+
+#[test]
+fn adr063_update_reuses_write_source_coercion_policy() {
+	let write = std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
+		.expect("read write helpers");
+
+	assert!(write.contains("pub(super) fn materialize_update_select_batch"));
+	assert!(write.contains("materialize_write_select_batch(\"UPDATE\""));
+	assert!(write.contains("coerce_insert_select_array("));
+	assert!(write.contains("validate_non_null_targets(operation"));
+}
+
+#[test]
+fn adr063_coordinator_update_uses_storage_write_not_delete() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let update_start = coordinator
+		.find("ExecutionPlan::Update {\n\t\t\tlegacy")
+		.expect("coordinator update arm start");
+	let update_end = update_start
+		+ coordinator[update_start..]
+			.find("ExecutionPlan::CreateTableAsSelect")
+			.expect("coordinator update arm end");
+	let update_arm = &coordinator[update_start..update_end];
+
+	assert!(update_arm.contains("source_executor.execute_read_plan(source).await?"));
+	assert!(update_arm.contains("write::materialize_update_select_batch(schema, &source_batches)"));
+	assert!(update_arm.contains("write(WriteRequest"));
+	assert!(update_arm.contains("profile_hint: Some(*profile_hint)"));
+	assert!(update_arm.contains("affected_count_batch(outcome.rows)"));
+	assert!(!update_arm.contains("delete_rows"));
+	assert!(!update_arm.contains("StorageDeleteRows"));
+}
+
+#[test]
+fn adr063_descriptor_evolved_invalidates_without_retry() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let write_helper = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan(")
+		.into_iter()
+		.next()
+		.expect("execute_write_plan")
+		.1;
+
+	assert!(coordinator.contains("LogicalPlan::Update { .. }"));
+	assert!(
+		write_helper.contains("invalidate_descriptor_evolution_on_error(catalog, error).await?")
+	);
+	assert!(!write_helper.contains("loop"));
+	assert!(!write_helper.contains("retry"));
+}
+
+#[test]
+fn adr063_update_remains_non_fragmentable_and_worker_rejected() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+
+	assert!(fragmenter.contains("UpdateNotFragmentable"));
+	assert!(fragmenter.contains("matches!(plan, ExecutionPlan::Update { .. })"));
+	assert!(server.contains("ExecutionPlan::Update { .. } => \"update\""));
+	assert!(exec.contains("UPDATE execution is coordinator-only"));
+	assert!(exec.contains("unbound UPDATE execution"));
+}
+
+#[test]
+fn adr063_sql_response_is_complete_only_no_returning() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+	let sql_listener_test =
+		std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
+			.expect("read SQL listener tests");
+
+	assert!(planner.contains("unsupported UPDATE clause: RETURNING"));
+	assert!(!logical.contains("Returning"));
+	assert!(!execution.contains("Returning"));
+	assert!(sql_listener_test.contains("sql_listener_update_complete_frame_carries_row_count"));
+	assert!(sql_listener_test.contains("SqlMessage::Complete"));
+}
+
+#[test]
+fn adr063_no_wendelon_wire_storage_or_descriptor_change() {
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"LogicalPlan::Update",
+		"ExecutionPlan::Update",
+		"Statement::Update",
+		"UpdateNotFragmentable",
+		"StorageUpdate",
+		"TableUpdateRequest",
+		"TableUpdateResponse",
+	] {
+		assert!(
+			!wendelon_source.contains(forbidden),
+			"ADR 063 leaked UPDATE surface into Wendelon: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr063_no_transaction_lock_compare_swap_or_no_where_surface() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
+		.into_iter()
+		.next()
+		.expect("lower_update")
+		.1;
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+	let update_start = coordinator
+		.find("ExecutionPlan::Update {\n\t\t\tlegacy")
+		.expect("coordinator update arm start");
+	let update_end = update_start
+		+ coordinator[update_start..]
+			.find("ExecutionPlan::CreateTableAsSelect")
+			.expect("coordinator update arm end");
+	let update_arm = &coordinator[update_start..update_end];
+
+	assert!(lower_update.contains("UPDATE requires a WHERE clause"));
+	for forbidden in [
+		"CompareSwap",
+		"compare_swap",
+		"lost_update",
+		"transaction",
+		"rollback",
+		"StorageDeleteRows",
+		"delete_rows",
+	] {
+		assert!(
+			!bind_update.contains(forbidden),
+			"bind UPDATE gained {forbidden}"
+		);
+		assert!(
+			!update_arm.contains(forbidden),
+			"coordinator UPDATE gained {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr063_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing", "arrow"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr063_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	for forbidden in [
+		"LogicalPlan::Update",
+		"ExecutionPlan::Update",
+		"UPDATE",
+		"UpdateNotFragmentable",
+	] {
+		assert!(
+			!worker.contains(forbidden),
+			"fixture worker gained UPDATE surface {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr063_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"UpdateV1",
+		"SqlUpdateV1",
+		"LogicalUpdateV1",
+		"ExecutionUpdateV1",
+		"UpdateRequestV1",
+	]);
+}
+
+#[test]
+fn adr063_prior_adr054_to_062_guards_continue_to_pass_except_retarget() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr054_", "adr055_", "adr056_", "adr057_", "adr058_", "adr059_", "adr060_", "adr061_",
+		"adr062_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	assert!(
+		architecture_test
+			.contains("adr062_update_surface_is_present_under_pk_update_contract_after_adr063")
+	);
+	let stale_guard = ["fn ", "adr062_update_surface", "_remains_absent"].concat();
+	assert!(!architecture_test.contains(&stale_guard));
 }
 
 #[test]

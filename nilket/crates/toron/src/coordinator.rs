@@ -407,6 +407,7 @@ where
 			LogicalPlan::InsertSelect { .. }
 				| LogicalPlan::CreateTableAsSelect { .. }
 				| LogicalPlan::Delete { .. }
+				| LogicalPlan::Update { .. }
 		) {
 			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			let source_executor = DistributedMutationSourceExecutor {
@@ -1020,6 +1021,34 @@ async fn execute_write_plan_with_source(
 				.await?;
 			Ok(vec![write::affected_count_batch(outcome.rows)?])
 		}
+		ExecutionPlan::Update {
+			legacy_table_id,
+			table,
+			fingerprint,
+			schema,
+			source,
+			profile_hint,
+		} => {
+			let source_batches = source_executor.execute_read_plan(source).await?;
+			let Some(payload) = write::materialize_update_select_batch(schema, &source_batches)?
+			else {
+				return Ok(vec![write::affected_count_batch(0)?]);
+			};
+			let outcome = writer
+				.write(WriteRequest {
+					session_id: context.session_id,
+					query_id: context.query_id,
+					tenant_id: context.tenant_id,
+					table_id: *legacy_table_id,
+					table_object_id: *table,
+					physical_descriptor_fingerprint: *fingerprint,
+					payload,
+					profile_hint: Some(*profile_hint),
+					trace_context: context.trace_context,
+				})
+				.await?;
+			Ok(vec![write::affected_count_batch(outcome.rows)?])
+		}
 		ExecutionPlan::CreateTableAsSelect {
 			table,
 			schema,
@@ -1261,6 +1290,7 @@ impl QueryCoordinator {
 				| LogicalPlan::InsertSelect { .. }
 				| LogicalPlan::CreateTableAsSelect { .. }
 				| LogicalPlan::Delete { .. }
+				| LogicalPlan::Update { .. }
 		) {
 			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			return self.execute_write_plan(catalog.as_ref(), &bound).await;

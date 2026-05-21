@@ -247,6 +247,11 @@ pub enum LogicalPlan {
 		table: TableRef,
 		predicate: Option<Expr>,
 	},
+	Update {
+		table: TableRef,
+		assignments: Vec<(String, Expr)>,
+		predicate: Expr,
+	},
 	Insert {
 		table: TableRef,
 		columns: Option<Vec<String>>,

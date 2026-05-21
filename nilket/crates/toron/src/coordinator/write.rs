@@ -39,6 +39,30 @@ pub(super) fn materialize_insert_select_batch(
 	target_columns: &[ColumnOrdinal],
 	source_batches: &[RecordBatch],
 ) -> Result<Option<RecordBatch>, ExecutionError> {
+	materialize_write_select_batch(
+		"INSERT INTO ... SELECT",
+		target_schema,
+		target_columns,
+		source_batches,
+	)
+}
+
+pub(super) fn materialize_update_select_batch(
+	target_schema: &SchemaRef,
+	source_batches: &[RecordBatch],
+) -> Result<Option<RecordBatch>, ExecutionError> {
+	let target_columns = (0..target_schema.fields().len())
+		.map(|index| ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow")))
+		.collect::<Vec<_>>();
+	materialize_write_select_batch("UPDATE", target_schema, &target_columns, source_batches)
+}
+
+fn materialize_write_select_batch(
+	operation: &'static str,
+	target_schema: &SchemaRef,
+	target_columns: &[ColumnOrdinal],
+	source_batches: &[RecordBatch],
+) -> Result<Option<RecordBatch>, ExecutionError> {
 	let total_rows = source_batches
 		.iter()
 		.map(RecordBatch::num_rows)
@@ -46,7 +70,7 @@ pub(super) fn materialize_insert_select_batch(
 	if total_rows > TABLE_WRITE_MAX_ROWS {
 		return Err(ExecutionError::InvalidExpression {
 			message: format!(
-				"INSERT INTO ... SELECT produced {total_rows} rows; exceeds maximum {TABLE_WRITE_MAX_ROWS}"
+				"{operation} produced {total_rows} rows; exceeds maximum {TABLE_WRITE_MAX_ROWS}"
 			),
 		});
 	}
@@ -78,7 +102,7 @@ pub(super) fn materialize_insert_select_batch(
 		if batch.num_columns() != target_columns.len() {
 			return Err(ExecutionError::InvalidExpression {
 				message: format!(
-					"INSERT INTO ... SELECT batch has {} columns; expected {}",
+					"{operation} batch has {} columns; expected {}",
 					batch.num_columns(),
 					target_columns.len()
 				),
@@ -89,6 +113,7 @@ pub(super) fn materialize_insert_select_batch(
 		for (target_index, field) in target_schema.fields().iter().enumerate() {
 			let array = match source_by_target[target_index] {
 				Some(source_index) => coerce_insert_select_array(
+					operation,
 					batch.column(source_index),
 					field.data_type(),
 					field.name(),
@@ -96,7 +121,10 @@ pub(super) fn materialize_insert_select_batch(
 				None => {
 					if !field.is_nullable() {
 						return Err(ExecutionError::InvalidExpression {
-							message: format!("INSERT omits non-nullable column: {}", field.name()),
+							message: format!(
+								"{operation} omits non-nullable column: {}",
+								field.name()
+							),
 						});
 					}
 					typed_null_array(field.data_type(), batch.num_rows(), field.name())?
@@ -104,7 +132,7 @@ pub(super) fn materialize_insert_select_batch(
 			};
 			columns.push(array);
 		}
-		validate_non_null_arrays(target_schema, &columns)?;
+		validate_non_null_arrays(operation, target_schema, &columns)?;
 		coerced_batches.push(RecordBatch::try_new(target_schema.clone(), columns)?);
 	}
 
@@ -113,7 +141,7 @@ pub(super) fn materialize_insert_select_batch(
 	} else {
 		arrow::compute::concat_batches(target_schema, coerced_batches.iter())?
 	};
-	validate_non_null_targets(&payload)?;
+	validate_non_null_targets(operation, &payload)?;
 	Ok(Some(payload))
 }
 
@@ -128,13 +156,14 @@ pub(super) fn materialize_empty_record_batch(
 }
 
 fn coerce_insert_select_array(
+	operation: &'static str,
 	array: &ArrayRef,
 	target: &DataType,
 	column: &str,
 ) -> Result<ArrayRef, ExecutionError> {
 	if !is_supported_insert_select_target(target) {
 		return Err(ExecutionError::InvalidExpression {
-			message: format!("unsupported INSERT target type for column {column}: {target:?}"),
+			message: format!("unsupported {operation} target type for column {column}: {target:?}"),
 		});
 	}
 	if array.data_type() == target {
@@ -145,7 +174,7 @@ fn coerce_insert_select_array(
 	}
 	Err(ExecutionError::InvalidExpression {
 		message: format!(
-			"INSERT INTO ... SELECT source type {:?} is not compatible with column {column} type {target:?}",
+			"{operation} source type {:?} is not compatible with column {column} type {target:?}",
 			array.data_type()
 		),
 	})
@@ -169,11 +198,15 @@ fn typed_null_array(
 	}
 }
 
-fn validate_non_null_targets(batch: &RecordBatch) -> Result<(), ExecutionError> {
-	validate_non_null_arrays(&batch.schema(), batch.columns())
+fn validate_non_null_targets(
+	operation: &'static str,
+	batch: &RecordBatch,
+) -> Result<(), ExecutionError> {
+	validate_non_null_arrays(operation, &batch.schema(), batch.columns())
 }
 
 fn validate_non_null_arrays(
+	operation: &'static str,
 	schema: &SchemaRef,
 	columns: &[ArrayRef],
 ) -> Result<(), ExecutionError> {
@@ -181,7 +214,7 @@ fn validate_non_null_arrays(
 		if !field.is_nullable() && array.null_count() > 0 {
 			return Err(ExecutionError::InvalidExpression {
 				message: format!(
-					"INSERT INTO ... SELECT produced NULL for non-nullable column: {}",
+					"{operation} produced NULL for non-nullable column: {}",
 					field.name()
 				),
 			});

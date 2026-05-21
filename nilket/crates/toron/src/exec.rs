@@ -617,6 +617,9 @@ impl Executor {
 				LogicalPlan::Delete { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound DELETE execution",
 				}),
+				LogicalPlan::Update { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound UPDATE execution",
+				}),
 				LogicalPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound INSERT execution",
 				}),
@@ -777,6 +780,9 @@ impl Executor {
 				}),
 				ExecutionPlan::Delete { .. } => Err(ExecutionError::NotImplemented {
 					feature: "DELETE execution is coordinator-only",
+				}),
+				ExecutionPlan::Update { .. } => Err(ExecutionError::NotImplemented {
+					feature: "UPDATE execution is coordinator-only",
 				}),
 				ExecutionPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
 					feature: "INSERT execution is coordinator-only",

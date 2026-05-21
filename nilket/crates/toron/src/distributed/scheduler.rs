@@ -769,6 +769,7 @@ fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFing
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => None,
 	}

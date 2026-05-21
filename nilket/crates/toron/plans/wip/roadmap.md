@@ -4594,7 +4594,7 @@ along with the forward-sequence rewrite.
   `plans/impl/062_primary_key_ddl_evidence.md`, including passing full
   `cargo test -p toron -- --test-threads=6`.
 - **ADR 063 — PK-Table `UPDATE … WHERE` via Full-Row Upsert.**
-  Promoted. The direct consumer ADR 062 was built to unlock — completing the
+  Implemented. The direct consumer ADR 062 was built to unlock — completing the
   core DML suite. `UPDATE <table> SET <col> = <expr>[, …] WHERE <pred>` on
   **PK tables**: the binder rewrites it as a **full-row projection over the
   matched rows** (assigned columns ← `SET` exprs; unassigned + the **PK** pass
@@ -4623,7 +4623,9 @@ along with the forward-sequence rewrite.
   the build (broad AST drift), so it's a separate migration ADR, guarded.
   **Toron SQL only; no Wendelon wire/storage/descriptor/worker change; no new
   storage primitive; no transaction model.** Placement: Exterior Composition →
-  Toron home. Migration: `plans/impl/063_pk_table_update.md`.
+  Toron home. Migration: `plans/impl/063_pk_table_update.md`; implementation
+  evidence is recorded in `plans/impl/063_pk_table_update_evidence.md`,
+  including passing full `cargo test -p toron -- --test-threads=6`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4708,9 +4710,9 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 063 promoted; ADR 064 candidates
+### ADR 063 implemented; ADR 064 candidates
 
-ADR 063 selected and promoted **PK-Table `UPDATE … WHERE` via Full-Row
+ADR 063 selected and implemented **PK-Table `UPDATE … WHERE` via Full-Row
 Upsert** — the direct consumer ADR 062 was built to unlock, **completing the
 core DML suite** (SELECT / INSERT / DELETE / UPDATE / CTAS) for primary-key
 tables. UPDATE on a PK table is a coordinator-owned full-row rewrite: the
@@ -4750,7 +4752,10 @@ model; no sqlparser upgrade.**
 - `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
   no-`*V1`. Placement: Exterior Composition → Toron home.
 
-The migration is materialized in `plans/impl/063_pk_table_update.md`.
+The migration is materialized in `plans/impl/063_pk_table_update.md`;
+implementation evidence is recorded in
+`plans/impl/063_pk_table_update_evidence.md`, including passing full
+`cargo test -p toron -- --test-threads=6`.
 
 **ADR 064 candidates:**
 
