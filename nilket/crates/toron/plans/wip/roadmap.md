@@ -4660,6 +4660,38 @@ along with the forward-sequence rewrite.
   `plans/impl/064_dml_returning.md`; implementation evidence is recorded in
   `plans/impl/064_dml_returning_evidence.md`, including passing full
   `cargo test -p toron -- --test-threads=6`.
+- **ADR 065 — `crates/observability` Namespace and Audit Substrate.**
+  Promoted (plan). The oldest substantive deferral (ADR 045 D7), unblocked now
+  that the DML surface is complete — and the start of the **production-
+  readiness / compliance** track. Establishes a shared **`crates/observability`**
+  namespace crate (interior shared substrate, the 047 `tls-pki` / 048
+  `observability-http` precedent) with non-default feature-gated modules
+  **`observability::{http, audit}`** (and a reserved future
+  `observability::telemetry` for OTLP — telemetry ⊂ observability). It (a)
+  **migrates ADR 048's HTTP helper** into `observability::http` and **removes
+  the flat `observability-http` crate** (one home), and (b) **extracts
+  Wendelon's crypto-chained audit *mechanics*** (envelope, hash-chain,
+  `AuditSink`, sink configs, NDJSON sink, archive/syslog/kafka sinks, verify +
+  signed chain-root) into `observability::audit`, with Wendelon's typed
+  operations/schema staying **ring-owned** as a `WendelonPayload` through the
+  shared envelope. **Behavior-preserving / byte-equivalent** — Wendelon's
+  `AUDIT_SCHEMA_VERSION=4`, hash tags (`blake3-256`/`sha256`), chain-root tag
+  (`wendelon-audit-chain-root-v1`), `ed25519` root-sig, JSON field order, and
+  verifier codes are unchanged (no schema bump); the genesis tag becomes a
+  consumer-provided parameter. **Precise feature invariant** (Cargo features
+  unify per-package, so: `default=[]`, per-feature `cargo check` builds,
+  `audit ⊀ http`, no cross-module source references). **No Toron audit
+  emission** (Toron gets the HTTP retarget only) and **no async/fail-open
+  policy in the substrate** — both deferred to the ADR 066 consumer. Final
+  D-set: **14 decisions, 25 architecture + 3 convention + meta guards**, with
+  048-retarget + audit-substrate + Wendelon-byte-equivalence + Toron-negative
+  fixtures. Council: **3-of-3 (Claude, Codex, Gemini)** — one ADR because the
+  decision *is* the `observability` namespace boundary (048 retargets in +
+  audit lands beside it). **Prior-guard reconciliation:** the ADR 048 (+071)
+  `observability-http` crate/path guards are **retargeted** to
+  `observability::http`; meta scoped `…_except_adr048_retarget`; self-enforcing.
+  Placement: Interior Substrate → Toron-aggregator home. Migration:
+  `plans/impl/065_observability_namespace_audit_substrate.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4744,7 +4776,70 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 064 implemented; ADR 065 candidates
+### ADR 065 promoted; ADR 066 candidates
+
+ADR 065 selected and promoted **`crates/observability` Namespace and Audit
+Substrate** — the oldest substantive deferral (045 D7), unblocked now that the
+DML surface is complete, and the **pivot from "First Query with Integrity" to
+the production-readiness / compliance track**. It establishes a shared
+**`crates/observability`** namespace crate with feature-gated
+**`observability::{http, audit}`** (reserving `observability::telemetry` for
+future OTLP), **migrating ADR 048's HTTP helper in** (and removing the flat
+crate) and **extracting Wendelon's crypto-chained audit mechanics** into
+`observability::audit` — **byte-equivalently**, with Wendelon's typed schema
+staying ring-owned. **No Toron emission** (→ ADR 066). Final D-set: **14
+decisions, 25 architecture + 3 convention + meta guards**.
+
+**Interior shared substrate (047/048 precedent); behavior-preserving /
+byte-equivalent for Wendelon; zero Toron audit emission, zero async policy in
+the substrate, zero Wendelon-type leakage into the shared crate.**
+
+**Key decisions / invariants:**
+
+- **Promoted 3-of-3 (Claude, Codex, Gemini).** One ADR because the decision
+  *is* the `observability` namespace boundary — 048 HTTP must retarget *into*
+  it and audit must land *beside* it without coupling; splitting would leave
+  the flat `observability-http` crate as contrary evidence.
+- **Naming:** `observability`, not `telemetry` — audit is durable *evidence*,
+  not emitted *signal*; a future OTLP export nests as `observability::telemetry`
+  (telemetry ⊂ observability). Distinct from the existing execution-`*Telemetry`
+  types (internal collection).
+- **Byte-equivalence is the whole risk surface** — `AUDIT_SCHEMA_VERSION=4`,
+  `blake3-256`/`sha256` hash tags, `wendelon-audit-chain-root-v1`, `ed25519`
+  root-sig, JSON field order, verifier codes all preserved (no schema bump);
+  Wendelon payload serialization moves *verbatim*; genesis tag becomes a
+  consumer-provided parameter.
+- **Precise feature invariant** (Codex's correction): Cargo features unify
+  per-package, so the invariant is `default=[]` + per-feature `cargo check`
+  builds + `audit ⊀ http` + no cross-module source references — *not* "each
+  consumer compiles only its module."
+- **Mechanics shared, schema ring-owned;** the shared crate imports no
+  Wendelon `NodeId`/`TenantId`/`Identity`/`ActorIdentity`/metrics/clock types.
+- **Prior-guard reconciliation:** ADR 048 (+071) `observability-http` crate/
+  path guards **retargeted** to `observability::http`; meta scoped
+  `…_except_adr048_retarget`; self-enforcing.
+- `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
+  no-`*V1`. Placement: Interior Substrate → Toron-aggregator home.
+
+The migration is materialized in
+`plans/impl/065_observability_namespace_audit_substrate.md`.
+
+**ADR 066 candidates:**
+
+- **Toron Audit Emission Consumer** (the lead — the 065 consumer): Toron
+  `[audit]` config (default-disabled), `ToronPayload`, the event taxonomy
+  (lifecycle + edge-denial + query-outcome, no raw SQL/PII), the **async
+  `try_send` fail-open** posture for non-authoritative events + **fail-closed
+  for authoritative local security denials** (the deferred authority-split
+  fork), aggregate-only metrics. This is where Gemini's hot-path non-blocking
+  design + the fail-open/closed split land.
+- **`observability::telemetry` / OTLP export** (the reserved facet);
+  **no-WHERE UPDATE** (063 symmetry); composite-PK / DDL widening / `ALTER` /
+  standalone `UNIQUE`; sqlparser-0.62 migration; typed `QUERY_CANCELLED`
+  mapping; precise per-row DELETE RETURNING; CTAS row-count cleanup;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends — all carried.
+
+### ADR 064 implemented; ADR 065 candidates (HISTORICAL)
 
 ADR 064 selected and implemented **DML `RETURNING` Rows** — the smallest
 user-visible completion of the mutation suite 063 unlocked, **completing the
