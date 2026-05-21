@@ -4385,6 +4385,38 @@ along with the forward-sequence rewrite.
   evidence is recorded in
   `plans/impl/056_per_tenant_query_rate_admission_evidence.md`, including a
   passing full `cargo test -p toron -- --test-threads=6` run.
+- **ADR 057 — Two-Tier SQL Connection Admission.**
+  Promoted. Governance moves from the coordinator (050/052/055/056, all at
+  `admit_query`) to the **SQL listener edge** — the first ADR at a new seam.
+  Two default-disabled, node-local, hard-reject caps: **Tier 1**, a
+  tenant-agnostic global SQL cap enforced at the `quinn::Incoming` seam
+  **before** the handshake; **Tier 2**, a per-tenant cap **after** mTLS/
+  loopback tenant resolution. Reject = transport **refuse/close**, never a
+  SQL `ResourceExhausted` frame (Tier 1 has no stream/`query_id`; sending a
+  frame would accept a stream = burn the resource the cap protects). **SQL
+  listener only** — never worker `ToronTransport` (shuffle deadlock) or
+  observability. `SqlConnectionLimiter` lives at the listener (not the
+  coordinator), one short lock over global + bounded `Configured|"other"`
+  counters (not per-bucket atomics), RAII permits, no reaper. Inert when
+  both caps unset. Final D-set: **15 decisions, 18 architecture guards + 3
+  convention guards, 18 required fixtures + 1 optional**.
+  **Key code finding (iter-2):** `QuicEndpoint::accept_connection()` awaits
+  the handshake *unconditionally*, so the existing idle timeout bounds fd
+  *dwell* but not handshake-work *rate* — only a pre-handshake
+  `Incoming::refuse()` (Tier 1) bounds it. Identity is the 052 D12 wrinkle:
+  no stable tenant until the mTLS SAN, so pre-auth connections count only
+  against Tier 1.
+  **Promoted 2-of-3 (Claude + Codex);** Gemini's minority (coordinator-owned
+  tracker, `HashMap<_, AtomicUsize>` per-bucket atomics, a SQL
+  `ResourceExhausted` reject frame, and no Tier 1) was adjudicated against
+  on the merits — wrong layer (listener-edge lifetime, not query lifetime),
+  atomics can't make the cross-tier grant atomic, a SQL frame burns the
+  protected resource, and per-tenant-only leaves the pre-auth handshake hole
+  the roadmap assigned 057 to own. Recorded as minority, not adopted.
+  **Single-plan posture; Toron-ring only; node-local.** Placement: Exterior
+  Substrate → Toron home. Migration:
+  `plans/impl/057_sql_connection_admission.md`. Parser/front-end throttling
+  (deferred from 056) stays the named, evidence-gated follow-up.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4469,7 +4501,70 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 056 promoted; ADR 057 candidates
+### ADR 057 promoted; ADR 058 candidates
+
+ADR 057 selected and promoted **Two-Tier SQL Connection Admission** — the
+first governance ADR at the **SQL listener edge**, moving beyond the
+coordinator `admit_query` seam used by 050/052/055/056. Two
+default-disabled, node-local, hard-reject caps: Tier 1 (tenant-agnostic
+global) at the `quinn::Incoming` seam before the handshake, and Tier 2
+(per-tenant) after mTLS/loopback tenant resolution. Reject = transport
+refuse/close, never a SQL `ResourceExhausted` frame. SQL listener only —
+never worker `ToronTransport` or observability.
+`SqlConnectionLimiter` at the listener, one lock over global +
+`Configured|"other"` counters, RAII permits. Final D-set: **15 decisions,
+18 architecture guards + 3 convention guards, 18 required fixtures + 1
+optional**.
+
+**Pure Toron-ring substrate; node-local; new listener-edge seam; zero
+Wendelon server change, zero SQL wire change.**
+
+**Key decisions / invariants:**
+
+- **Promoted 2-of-3 (Claude + Codex)**; Gemini's minority (coordinator-owned
+  tracker, per-bucket `AtomicUsize`, SQL-frame reject, no Tier 1) was
+  adjudicated against on the merits: wrong layer (listener-edge vs query
+  lifetime); atomics can't make the cross-tier global+per-tenant grant
+  atomic; a SQL frame requires accepting a stream = burning the protected
+  resource; per-tenant-only leaves the pre-auth handshake hole 057 owns.
+  Recorded as minority, not adopted.
+- **Code finding (iter-2):** `accept_connection()` drives the handshake
+  unconditionally, so the idle timeout bounds fd dwell but not handshake
+  work rate — only a pre-handshake `Incoming::refuse()` (Tier 1) bounds it.
+  This corrected Claude's iter-1 concession and re-converged the council on
+  two tiers.
+- **052 D12 identity:** no stable tenant until the mTLS SAN; pre-auth
+  connections count only against Tier 1. Tier 1 diagnostic is metrics/log
+  only (`Incoming::refuse()` carries no app reason); Tier 2 closes with a
+  stable reason phrase.
+- **Default-disabled (`Option<NonZeroU32>`):** both caps unset ⇒
+  byte-for-byte current listener behavior. Idle-timeout guard (D14) keeps
+  Tier 1's concurrency cap from being undermined by infinite dwell.
+- `crates/nilket` runtime-free; `toron_fixture_worker.rs` unchanged;
+  brand-clean / no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in
+`plans/impl/057_sql_connection_admission.md`.
+
+**ADR 058 candidates:**
+
+- **Parser / front-end throttle (committed-conditional)** — the pre-parse
+  rate shedding deferred from 056 and 057; a *statement-read* limit at the
+  SQL frontend on the 057 connection seam, **only if measured parser-CPU
+  pressure appears**. Evidence-gated, not automatic.
+- **Pre-TLS / IP-based connection throttle** — the unauthenticated-flood
+  guard below Tier 1; deferred (breaks multi-tenant proxies; no measured
+  pre-auth pressure).
+- **Descriptor refresh hardening** (proactive TTL / external-DROP push, *if*
+  measured staleness without a `DescriptorEvolved` signal),
+  **OTLP traces export**, **audit subsystem** (deferred since ADR 045 D7),
+  **SQL surface widening** (CTAS `IF NOT EXISTS`, `UPDATE WHERE`,
+  `INSERT/CTAS/DELETE … RETURNING`), **live cert rotation / CRL / OCSP**,
+  **token-based tenant claims (JWT/OIDC/SPIFFE)**, gRPC / Arrow Flight /
+  Postgres frontends, strong cross-worker cancellation, prepared statements
+  — all carried forward.
+
+### ADR 056 promoted; ADR 057 candidates (HISTORICAL)
 
 ADR 056 selected and promoted **Per-Tenant Query-Rate Admission** — the
 third orthogonal hard-reject admission dimension (arrival rate), folded into
