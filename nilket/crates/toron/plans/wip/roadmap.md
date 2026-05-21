@@ -4350,6 +4350,38 @@ along with the forward-sequence rewrite.
   evidence is recorded in
   `plans/impl/055_bounded_fair_admission_queue_evidence.md`, including a
   passing full `cargo test -p toron -- --test-threads=6` run.
+- **ADR 056 — Per-Tenant Query-Rate Admission.**
+  Promoted. The third orthogonal **hard-reject** admission dimension
+  050/052/055 are blind to: arrival rate. A flood of cheap, fast queries is
+  admitted, runs briefly, releases, and the next is admitted — saturating
+  the coordinator while memory/concurrency read "fine." 056 adds a
+  per-tenant **token bucket** as the **first check inside
+  `TenantAdmissionController::try_admit`** (before the `admission` branch, so
+  it gates the queue-disabled path too); **consume-on-pass, never refund**
+  (no `Drop`/release — the deliberate asymmetry vs memory/concurrency);
+  **lazy refill from an injected monotonic clock, no background task**;
+  configured tenants get dedicated buckets, unconfigured share one bounded
+  `"other"` bucket. Reuses `ResourceExhausted` + `AdmissionResource::Rate`
+  on the existing bounded rejection family — no new SQL code/wire, no new
+  metric family. **Inert by default** (`max_queries_per_second = 0`). Not a
+  reversal; its per-tenant rate telemetry closes the ADR 055 D18 tuning
+  loop. Final D-set: **14 decisions, 14 architecture guards + 3 convention
+  guards, 14 required fixtures + 1 optional**.
+  **Controller-lock, not lock-free (D7):** a token bucket is two fields that
+  move together (`tokens`, `last_refill`); it lives under the controller's
+  existing synchronous lock that already makes 055's multi-resource grant
+  atomic — no separate limiter, no packed-`AtomicU64`.
+  **Promoted 2-of-3 (Claude + Codex);** Gemini's minority (pre-parse
+  placement, separate lock-free `TenantRateLimiter`, separate metric family)
+  was adjudicated against on the merits — "pre-parse in the coordinator" is
+  self-contradictory (the coordinator already holds a parsed `LogicalPlan`),
+  the packed-`AtomicU64` wraps a 32-bit ms timestamp in ~49.7 days and loses
+  the refill remainder, and `HashMap<TenantId, _>` reopens the unbounded-
+  `"other"` growth 055 just fixed. Parser-flood protection is named
+  Out-of-Scope, routed to a post-057 listener throttle on evidence.
+  **Single-plan posture; Toron-ring only; node-local.** Placement: Exterior
+  Substrate → Toron home. Migration:
+  `plans/impl/056_per_tenant_query_rate_admission.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4434,7 +4466,69 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 055 promoted; ADR 056/057 candidates
+### ADR 056 promoted; ADR 057 candidates
+
+ADR 056 selected and promoted **Per-Tenant Query-Rate Admission** — the
+third orthogonal hard-reject admission dimension (arrival rate), folded into
+the ADR 055 `TenantAdmissionController` as the outermost gate in
+`try_admit`. Per-tenant token bucket, **consume-on-pass / never-refund**,
+lazy refill from an injected clock, **no background task**, controller-lock
+(not lock-free), configured buckets + one shared `"other"` bucket. Reuses
+`ResourceExhausted` + `AdmissionResource::Rate`. **Inert by default.** Not a
+reversal; closes the 055 D18 tuning loop. Final D-set: **14 decisions, 14
+architecture guards + 3 convention guards, 14 required fixtures + 1
+optional**.
+
+**Pure Toron-ring substrate; node-local; folds into the 055 controller;
+zero Wendelon server change, zero SQL wire change.**
+
+**Key decisions / invariants:**
+
+- **Promoted 2-of-3 (Claude + Codex)**; Gemini's minority (pre-parse,
+  separate lock-free `TenantRateLimiter`, separate metric family) was
+  adjudicated against on concrete defects: "pre-parse in the coordinator" is
+  self-contradictory (coordinator holds a parsed `LogicalPlan`); the
+  packed-`AtomicU64` wraps a 32-bit ms timestamp in ~49.7 days and drops the
+  refill remainder (repeated sub-interval attempts can prevent the next
+  whole token from accruing); the per-tenant map reopens the
+  unbounded-`"other"` growth 055 just fixed; a separate metric
+  family fragments admission telemetry. Recorded as minority, not adopted.
+- **Rate-first (D4):** checked before the `admission` Some/None branch, so
+  rate gates both the legacy (queue-disabled) and 055-queued paths; a
+  rate-rejected query never enters the queue or gets a reservation.
+- **Consume-on-pass / never-refund (D5):** no rate `Drop`/release path —
+  rate governs *arrival*, not success. (After the 055 borrow-release bug,
+  "nothing to keep symmetric" is a feature.)
+- **Controller-lock, not lock-free (D7):** reuse the one short lock that
+  already makes 055's grant atomic; a lock-free fast path is a later
+  optimization on evidence, not a correctness requirement.
+- **Default-disabled (D8):** `max_queries_per_second = 0` ⇒ byte-for-byte
+  current behavior; opt-in per tenant.
+- `crates/nilket` runtime-free; `toron_fixture_worker.rs` unchanged;
+  brand-clean / no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in
+`plans/impl/056_per_tenant_query_rate_admission.md`.
+
+**ADR 057 candidates:**
+
+- **Per-Tenant Connection Caps (client listener edge) (LEAD, committed)** —
+  client-edge (QUIC / SQL TLS) concurrent-connection cap; owns the pre-auth
+  tenant-identity question (052 D12: pre-auth / failed-auth connections lack
+  a stable tenant). Strictly client-facing — never the worker
+  `ToronTransport` (shuffle-deadlock risk). May also host the **pre-parse /
+  frontend rate throttle** deferred from 056, *if* measured parser-CPU
+  pressure appears.
+- **Descriptor refresh hardening** (proactive TTL / external-DROP push, *if*
+  measured staleness without a `DescriptorEvolved` signal appears),
+  **OTLP traces export**, **audit subsystem** (deferred since ADR 045 D7),
+  **SQL surface widening** (CTAS `IF NOT EXISTS`, `UPDATE WHERE`,
+  `INSERT/CTAS/DELETE … RETURNING`), **live cert rotation / CRL / OCSP**,
+  **token-based tenant claims (JWT/OIDC/SPIFFE)**, gRPC / Arrow Flight /
+  Postgres frontends, strong cross-worker cancellation, prepared statements
+  — all carried forward.
+
+### ADR 055 promoted; ADR 056/057 candidates (HISTORICAL)
 
 ADR 055 selected and promoted **Bounded Fair Admission Queue** — the ADR
 050 D7 / ADR 052 D3 hard-reject *reversal*, as ADR 054 D17 named it. When a
