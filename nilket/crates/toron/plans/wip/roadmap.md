@@ -4453,15 +4453,13 @@ along with the forward-sequence rewrite.
   `plans/impl/058_bounded_sql_request_ingress_evidence.md`, including a
   passing full `cargo test -p toron -- --test-threads=6` run.
 - **ADR 059 — Distributed Query Cancellation Completeness.**
-  Promoted. Makes cancellation **real** for already-dispatched distributed
+  Promoted and implemented. Makes cancellation **real** for already-dispatched distributed
   work: a query the coordinator stops waiting for (statement timeout, client
   disconnect, SQL `Cancel`) will **abort its worker tasks** instead of
-  letting them run to natural completion and discarding the output once
-  implemented. Closes
-  the verified leak the 058 audit surfaced — today `CancelTask` is
-  **ack-only** (no worker active-task registry), statement-timeout drops the
-  coordinator future with no propagation, and SQL `Cancel` returns
-  `CancellationUnsupported`. **Spine:** a worker active-task registry keyed
+  letting them run to natural completion and discarding the output. Closes
+  the verified leak the 058 audit surfaced — `CancelTask` is no longer
+  ack-only, statement-timeout now propagates cancellation before returning,
+  and SQL `Cancel` returns `Cancelled`. **Spine:** a worker active-task registry keyed
   by `TaskIdentity` that actually aborts the inline task (drop-at-await +
   pre-publish suppression; no operator-wide token threading), plus one
   idempotent coordinator handle keyed by `(TenantId, QueryId)` for all three
@@ -4486,7 +4484,10 @@ along with the forward-sequence rewrite.
   SQL-surface scope.
   **Single-plan posture; Toron-ring only; node-local.** Placement: Exterior
   Substrate → Toron home. Migration:
-  `plans/impl/059_distributed_query_cancellation.md`.
+  `plans/impl/059_distributed_query_cancellation.md`; implementation
+  evidence is recorded in
+  `plans/impl/059_distributed_query_cancellation_evidence.md`, including a
+  passing full `cargo test -p toron -- --test-threads=6` run.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4571,11 +4572,11 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 059 promoted; ADR 060 candidates
+### ADR 059 implemented; ADR 060 candidates
 
-ADR 059 selected and promoted **Distributed Query Cancellation
-Completeness** — making cancellation real for already-dispatched distributed
-work (statement timeout / client disconnect / SQL `Cancel` will abort worker
+ADR 059 selected, promoted, and implemented **Distributed Query Cancellation
+Completeness** — cancellation is now real for already-dispatched distributed
+work (statement timeout / client disconnect / SQL `Cancel` abort worker
 tasks under the promoted design, not just stop the coordinator waiting).
 Worker active-task registry
 (`TaskIdentity`) that aborts the inline task (drop-at-await + pre-publish
@@ -4585,7 +4586,8 @@ QueryId)`; out-of-band cancel over a fresh **bidirectional** stream on the
 tombstone for the early-cancel race; client-never-blocks + bounded background
 fan-out; oracle-safe SQL `Cancel`; no Wendelon storage-cancellation claim.
 Final D-set: **22 decisions, 20 architecture guards + 3 convention guards,
-19 required fixtures**.
+19 required fixtures**. Implementation evidence:
+`plans/impl/059_distributed_query_cancellation_evidence.md`.
 
 **Pure Toron-ring substrate; node-local; reuses the existing cancel wire;
 zero new SQL wire variant / protocol; zero transport-abstraction change.**

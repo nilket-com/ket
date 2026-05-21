@@ -14,6 +14,10 @@ use crate::distributed::budget::{
 	QueryBudget, TaskBudget, TenantAdmissionController, TenantAdmissionRejection,
 	TenantAdmissionRejectionCounters, TenantBudgetPolicy, TenantConcurrencyRejection,
 };
+use crate::distributed::cancellation::{
+	ActiveQueryHandle, ActiveQueryRegistry, CancellationMetrics, CancellationOutcome,
+	CancellationTrigger, QueryCancellation, RemoteTaskCancellation,
+};
 use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use crate::distributed::identity::QueryId;
@@ -24,12 +28,19 @@ use crate::error::{
 };
 use crate::exec::{ExecutionContext, Executor};
 use crate::ir::{ColumnOrdinal, ExecutionPlan, FilterDisposition, LogicalPlan, MorselId, TableId};
-use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
+use crate::server::{
+	NetworkTaskDispatcher, ToronCoordinator, memory::MemoryManager, transport::ToronTransport,
+};
 use crate::storage::{
 	DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest, RowIdentityProjection,
 	ScanStream, StorageAdmin, StorageDeleteRows, StorageWrite, TenantId, UnsupportedStorageAdmin,
 	WriteOutcome, WriteRequest,
 };
+use tokio::sync::Semaphore;
+
+const REMOTE_CANCEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+const REMOTE_CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_REMOTE_CANCEL_FANOUTS: usize = 64;
 
 pub(crate) async fn materialize_scan_stream(
 	stream: ScanStream,
@@ -52,6 +63,9 @@ where
 	admission_policy: Option<AdmissionPolicy>,
 	tenant_admission: TenantAdmissionController,
 	admission_rejections: TenantAdmissionRejectionCounters,
+	active_queries: ActiveQueryRegistry,
+	cancellation_metrics: Option<Arc<CancellationMetrics>>,
+	cancel_fanout_permits: Arc<Semaphore>,
 	context: ExecutionContext,
 	writer: Arc<dyn StorageWrite>,
 	deleter: Arc<dyn StorageDeleteRows>,
@@ -237,6 +251,9 @@ where
 			admission_policy: None,
 			tenant_admission: TenantAdmissionController::new(tenant_budgets.clone(), None),
 			admission_rejections: TenantAdmissionRejectionCounters::new(&tenant_budgets),
+			active_queries: ActiveQueryRegistry::new(),
+			cancellation_metrics: None,
+			cancel_fanout_permits: Arc::new(Semaphore::new(MAX_REMOTE_CANCEL_FANOUTS)),
 			tenant_budgets,
 			context,
 			writer,
@@ -257,6 +274,11 @@ where
 		self.admission_policy = admission;
 		self.tenant_admission =
 			TenantAdmissionController::new(self.tenant_budgets.clone(), admission);
+		self
+	}
+
+	pub fn with_cancellation_metrics(mut self, metrics: Arc<CancellationMetrics>) -> Self {
+		self.cancellation_metrics = Some(metrics);
 		self
 	}
 
@@ -288,11 +310,32 @@ where
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let admitted = self.admit_query(&context).await?;
 		let query_budget = admitted.query_budget;
+		let active_query = self
+			.active_queries
+			.register(context.tenant_id, context.query_id);
+		let active_query_handle = active_query.handle();
 		let result = self
-			.execute_query_with_admission(plan, context, query_budget)
+			.execute_query_with_admission(plan, context, query_budget, Some(active_query_handle))
 			.await;
+		drop(active_query);
 		drop(admitted);
 		result
+	}
+
+	pub fn cancel_query_for_tenant(
+		&self,
+		tenant_id: TenantId,
+		query_id: QueryId,
+		trigger: CancellationTrigger,
+	) -> QueryCancellation
+	where
+		Transport: 'static,
+	{
+		let cancellation = self.active_queries.cancel(tenant_id, query_id, trigger);
+		if cancellation.first_request && !cancellation.remote_tasks.is_empty() {
+			self.spawn_remote_cancel_fanout(trigger, cancellation.remote_tasks.clone());
+		}
+		cancellation
 	}
 
 	async fn execute_query_with_admission(
@@ -300,6 +343,7 @@ where
 		plan: &LogicalPlan,
 		context: ExecutionContext,
 		query_budget: QueryBudget,
+		active_query: Option<ActiveQueryHandle>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
 		if matches!(
@@ -316,6 +360,7 @@ where
 				coordinator: self,
 				context: &context,
 				query_budget,
+				active_query: active_query.clone(),
 			};
 			let result = execute_write_plan_with_source(
 				catalog.as_ref(),
@@ -343,6 +388,7 @@ where
 				coordinator: self,
 				context: &context,
 				query_budget,
+				active_query: active_query.clone(),
 			};
 			let result = execute_write_plan_with_source(
 				catalog.as_ref(),
@@ -368,7 +414,12 @@ where
 				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
 			}
 			match self
-				.execute_bound_distributed_with_context(bound, &context, query_budget)
+				.execute_bound_distributed_with_context(
+					bound,
+					&context,
+					query_budget,
+					active_query.clone(),
+				)
 				.await
 			{
 				Ok(results) => return Ok(results),
@@ -485,17 +536,114 @@ where
 		bound: ExecutionPlan,
 		context: &ExecutionContext,
 		query_budget: QueryBudget,
+		active_query: Option<ActiveQueryHandle>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let stages = fragment_plan(bound, self.fragment_config(context, query_budget))
 			.map_err(fragment_error)?;
 		let mut scheduler = DistributedScheduler::new(self.registry.clone());
 		let mut dispatcher =
-			NetworkTaskDispatcher::new(self.memory.clone(), self.transport.clone());
-		let run = scheduler
-			.dispatch_loop(&stages, &mut dispatcher)
-			.await
-			.map_err(scheduler_error)?;
+			NetworkTaskDispatcher::new(self.memory.clone(), self.transport.clone())
+				.with_active_query(active_query.clone());
+		let run = match scheduler.dispatch_loop(&stages, &mut dispatcher).await {
+			Ok(run) => run,
+			Err(error) => {
+				if active_query
+					.as_ref()
+					.is_some_and(ActiveQueryHandle::is_cancelled)
+				{
+					scheduler.cancel_query(context.query_id);
+				}
+				return Err(scheduler_error(error));
+			}
+		};
 		Ok(run.final_results)
+	}
+
+	fn spawn_remote_cancel_fanout(
+		&self,
+		trigger: CancellationTrigger,
+		remote_tasks: Vec<RemoteTaskCancellation>,
+	) where
+		Transport: 'static,
+	{
+		let Ok(permit) = self.cancel_fanout_permits.clone().try_acquire_owned() else {
+			if let Some(metrics) = &self.cancellation_metrics {
+				for _ in &remote_tasks {
+					metrics.record(trigger, CancellationOutcome::RemoteError);
+				}
+			}
+			tracing::warn!("remote cancel fan-out limit exhausted");
+			return;
+		};
+		let transport = Arc::clone(&self.transport);
+		let memory = Arc::clone(&self.memory);
+		let metrics = self.cancellation_metrics.clone();
+		tokio::spawn(async move {
+			let _permit = permit;
+			let coordinator = ToronCoordinator::new(memory);
+			for task in remote_tasks {
+				let stream = match tokio::time::timeout(
+					REMOTE_CANCEL_CONNECT_TIMEOUT,
+					transport.connect_worker(&task.worker),
+				)
+				.await
+				{
+					Ok(Ok(stream)) => stream,
+					Ok(Err(error)) => {
+						if let Some(metrics) = &metrics {
+							metrics.record(trigger, CancellationOutcome::RemoteError);
+						}
+						tracing::warn!(
+							error = %error,
+							identity = ?task.identity,
+							"remote cancel connect failed"
+						);
+						continue;
+					}
+					Err(_) => {
+						if let Some(metrics) = &metrics {
+							metrics.record(trigger, CancellationOutcome::RemoteTimeout);
+						}
+						tracing::warn!(
+							identity = ?task.identity,
+							"remote cancel connect timed out"
+						);
+						continue;
+					}
+				};
+				match tokio::time::timeout(
+					REMOTE_CANCEL_ACK_TIMEOUT,
+					coordinator.cancel_task_on_worker(stream, task.identity),
+				)
+				.await
+				{
+					Ok(Ok(())) => {
+						if let Some(metrics) = &metrics {
+							metrics.record(trigger, CancellationOutcome::RemoteAck);
+						}
+					}
+					Ok(Err(error)) => {
+						if let Some(metrics) = &metrics {
+							metrics.record(trigger, CancellationOutcome::RemoteError);
+						}
+						tracing::warn!(
+							error = %error,
+							identity = ?task.identity,
+							"remote cancel acknowledgement failed"
+						);
+					}
+					Err(_) => {
+						if let Some(metrics) = &metrics {
+							metrics.record(trigger, CancellationOutcome::RemoteTimeout);
+						}
+						tracing::warn!(
+							identity = ?task.identity,
+							"remote cancel acknowledgement timed out"
+						);
+					}
+				}
+			}
+		});
 	}
 
 	fn fragment_config(
@@ -747,6 +895,7 @@ where
 	coordinator: &'a DistributedQueryCoordinator<Registry, Transport>,
 	context: &'a ExecutionContext,
 	query_budget: QueryBudget,
+	active_query: Option<ActiveQueryHandle>,
 }
 
 #[async_trait::async_trait]
@@ -761,7 +910,12 @@ where
 		plan: &ExecutionPlan,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		self.coordinator
-			.execute_bound_distributed_with_context(plan.clone(), self.context, self.query_budget)
+			.execute_bound_distributed_with_context(
+				plan.clone(),
+				self.context,
+				self.query_budget,
+				self.active_query.clone(),
+			)
 			.await
 	}
 }
@@ -1132,7 +1286,9 @@ mod tests {
 	use super::*;
 	use crate::catalog::{DescriptorRefreshMetrics, MockCatalog, TableBinding, TableRef};
 	use crate::distributed::budget::{BudgetDimension, ByteCount, DurationMillis, TenantBudget};
-	use crate::distributed::identity::{LeaseEpoch, StreamSeq, WorkerId};
+	use crate::distributed::identity::{
+		AttemptId, LeaseEpoch, StageId, StreamSeq, TaskId, TaskIdentity, WorkerId,
+	};
 	use crate::distributed::task::TaskCompletionOutput;
 	use crate::distributed::worker_registry::StaticWorkerRegistry;
 	use crate::distributed::worker_registry::{
@@ -1147,16 +1303,18 @@ mod tests {
 		WriteRequest,
 	};
 	use crate::wire::{
-		ArrowIpcBytes, EnvelopeIdentity, MessageKind, StartTaskPayload, TaskBatchPayload,
-		TaskCompletePayload, TaskFailedPayload, TaskStartedPayload, WireEnvelope, decode_payload,
-		encode_payload,
+		ArrowIpcBytes, CancelTaskPayload, EnvelopeIdentity, MessageKind, StartTaskPayload,
+		TaskBatchPayload, TaskCancelledPayload, TaskCompletePayload, TaskFailedPayload,
+		TaskStartedPayload, WireEnvelope, decode_payload, encode_payload,
 	};
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 	use arrow::ipc::writer::StreamWriter;
 	use std::num::NonZeroU32;
+	use std::sync::Mutex as StdMutex;
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex as test_duplex};
+	use tokio::sync::Notify;
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
@@ -1408,6 +1566,166 @@ mod tests {
 		assert_eq!(attempts.load(Ordering::SeqCst), 2);
 		assert_eq!(results.len(), 1);
 		assert_eq!(results[0].num_rows(), 3);
+		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+	}
+
+	#[tokio::test]
+	async fn remote_cancel_fanout_uses_existing_wire_and_records_ack_metric() {
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(77),
+			StageId::new(0),
+			TaskId::new(0),
+			AttemptId::first(),
+		);
+		let metrics = Arc::new(CancellationMetrics::default());
+		let seen = Arc::new(StdMutex::new(Vec::new()));
+		let acked = Arc::new(Notify::new());
+		let coordinator = DistributedQueryCoordinator::new(
+			Arc::new(MockCatalog::new()),
+			Arc::new(StaticWorkerRegistry::new([scripted_worker()])),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			Arc::new(CancelRecordingTransport {
+				seen: Arc::clone(&seen),
+				acked: Arc::clone(&acked),
+			}),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_cancellation_metrics(Arc::clone(&metrics));
+
+		coordinator.spawn_remote_cancel_fanout(
+			CancellationTrigger::SqlCancel,
+			vec![RemoteTaskCancellation {
+				identity,
+				worker: scripted_worker(),
+			}],
+		);
+
+		tokio::time::timeout(std::time::Duration::from_secs(1), acked.notified())
+			.await
+			.expect("remote cancel ack observed");
+		wait_for_metric(
+			&metrics,
+			CancellationTrigger::SqlCancel,
+			CancellationOutcome::RemoteAck,
+		)
+		.await;
+		assert_eq!(seen.lock().expect("seen lock").as_slice(), &[identity]);
+	}
+
+	#[tokio::test]
+	async fn remote_cancel_fanout_records_error_when_connect_fails() {
+		let metrics = Arc::new(CancellationMetrics::default());
+		let coordinator = DistributedQueryCoordinator::new(
+			Arc::new(MockCatalog::new()),
+			Arc::new(StaticWorkerRegistry::new([scripted_worker()])),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			Arc::new(FailingCancelTransport),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_cancellation_metrics(Arc::clone(&metrics));
+
+		coordinator.spawn_remote_cancel_fanout(
+			CancellationTrigger::StatementTimeout,
+			vec![RemoteTaskCancellation {
+				identity: TaskIdentity::new(
+					QueryId::from_u128(77),
+					StageId::new(0),
+					TaskId::new(0),
+					AttemptId::first(),
+				),
+				worker: scripted_worker(),
+			}],
+		);
+
+		wait_for_metric(
+			&metrics,
+			CancellationTrigger::StatementTimeout,
+			CancellationOutcome::RemoteError,
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn pre_admission_rejects_emit_no_cancel_task() {
+		let connect_calls = Arc::new(AtomicUsize::new(0));
+		let coordinator = DistributedQueryCoordinator::new(
+			Arc::new(MockCatalog::new()),
+			Arc::new(StaticWorkerRegistry::new([scripted_worker()])),
+			Arc::new(MemoryManager::new(1, 1024)),
+			Arc::new(CountingTransport {
+				connect_calls: Arc::clone(&connect_calls),
+			}),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_tenant_budget_policy(memory_only_rejection_policy());
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let _held = coordinator
+			.admit_query(&context)
+			.await
+			.expect("saturate tenant admission before execution");
+
+		let err = coordinator
+			.execute_query_with_context(&count_plan(), context.clone())
+			.await
+			.expect_err("pre-admission rejection");
+
+		assert!(matches!(
+			err,
+			QueryError::Execution(ExecutionError::BudgetExhausted { .. })
+		));
+		assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+		assert!(
+			!coordinator
+				.cancel_query_for_tenant(
+					context.tenant_id,
+					context.query_id,
+					CancellationTrigger::StatementTimeout
+				)
+				.was_active
+		);
+	}
+
+	#[tokio::test]
+	async fn admission_and_memory_release_after_cancellation() {
+		let coordinator = DistributedQueryCoordinator::new(
+			Arc::new(RefreshingCatalog::new(
+				descriptor_with_identity(TableId(1), TableObjectId::new([1; 16]), 1),
+				RefreshOutcome::Missing,
+			)),
+			Arc::new(StaticWorkerRegistry::new([scripted_worker()])),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			Arc::new(CancelledTaskTransport),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_tenant_budget_policy(tenant_policy());
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+
+		let err = coordinator
+			.execute_query_with_context(&named_scan_plan(), context)
+			.await
+			.expect_err("cancelled task surfaces");
+
+		assert!(matches!(
+			err,
+			QueryError::Runtime(RuntimeError::TaskFailure {
+				kind: TaskFailureKind::Cancelled
+			})
+		));
 		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
 		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
 	}
@@ -1958,6 +2276,130 @@ mod tests {
 			},
 			status: WorkerStatus::Live,
 		}
+	}
+
+	struct CancelRecordingTransport {
+		seen: Arc<StdMutex<Vec<TaskIdentity>>>,
+		acked: Arc<Notify>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for CancelRecordingTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			let (client, mut server) = test_duplex(1024 * 1024);
+			let seen = Arc::clone(&self.seen);
+			let acked = Arc::clone(&self.acked);
+			tokio::spawn(async move {
+				let cancel = read_test_envelope(&mut server)
+					.await
+					.expect("read cancel task");
+				assert_eq!(cancel.kind, MessageKind::CancelTask);
+				let payload: CancelTaskPayload =
+					decode_payload(&cancel.payload).expect("decode cancel task");
+				seen.lock().expect("seen lock").push(payload.identity);
+				send_test_payload(
+					&mut server,
+					MessageKind::TaskCancelled,
+					EnvelopeIdentity::task(payload.identity),
+					None,
+					&TaskCancelledPayload {
+						identity: payload.identity,
+					},
+				)
+				.await
+				.expect("send task cancelled");
+				acked.notify_waiters();
+			});
+			Ok(Box::new(client))
+		}
+	}
+
+	struct FailingCancelTransport;
+
+	#[async_trait::async_trait]
+	impl ToronTransport for FailingCancelTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			Err(QueryError::Internal {
+				message: "cancel connect failed".to_string(),
+			})
+		}
+	}
+
+	struct CountingTransport {
+		connect_calls: Arc<AtomicUsize>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for CountingTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			self.connect_calls.fetch_add(1, Ordering::SeqCst);
+			Err(QueryError::Internal {
+				message: "unexpected dispatch".to_string(),
+			})
+		}
+	}
+
+	struct CancelledTaskTransport;
+
+	#[async_trait::async_trait]
+	impl ToronTransport for CancelledTaskTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			let (client, server) = test_duplex(1024 * 1024);
+			tokio::spawn(async move {
+				if let Err(error) = run_scripted_cancelled_worker(server).await {
+					panic!("scripted cancelled worker failed: {error:?}");
+				}
+			});
+			Ok(Box::new(client))
+		}
+	}
+
+	async fn wait_for_metric(
+		metrics: &CancellationMetrics,
+		trigger: CancellationTrigger,
+		outcome: CancellationOutcome,
+	) {
+		let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+		loop {
+			if metrics.get(trigger, outcome) == 1 {
+				return;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"metric {trigger:?}/{outcome:?} was not recorded"
+			);
+			tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+		}
+	}
+
+	async fn run_scripted_cancelled_worker(mut stream: DuplexStream) -> Result<(), QueryError> {
+		let start = read_test_envelope(&mut stream).await?;
+		if start.kind != MessageKind::StartTask {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "StartTask",
+			});
+		}
+		let payload: StartTaskPayload = decode_payload(&start.payload)?;
+		let identity = payload.spec.identity;
+		send_test_payload(
+			&mut stream,
+			MessageKind::TaskStarted,
+			EnvelopeIdentity::task(identity),
+			None,
+			&TaskStartedPayload { identity },
+		)
+		.await?;
+		send_test_payload(
+			&mut stream,
+			MessageKind::TaskFailed,
+			EnvelopeIdentity::task(identity),
+			None,
+			&TaskFailedPayload {
+				identity,
+				kind: TaskFailureKind::Cancelled,
+			},
+		)
+		.await
 	}
 
 	struct ScriptedDescriptorTransport {

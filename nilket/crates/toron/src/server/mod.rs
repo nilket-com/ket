@@ -7,6 +7,7 @@ use self::transport::ToronTransport;
 use crate::binder::PlannerConfig;
 use crate::catalog::Catalog;
 use crate::distributed::budget::{BudgetDimension, ByteCount};
+use crate::distributed::cancellation::{ActiveQueryHandle, ActiveTaskRegistry};
 use crate::distributed::identity::{FrameByteLen, PartitionId, StreamSeq, TaskIdentity, WorkerId};
 use crate::distributed::partition_store::{
 	InMemoryPartitionStore, PartitionPayload, PartitionStore, PartitionStoreError,
@@ -45,6 +46,7 @@ pub struct ToronWorker {
 	storage: Arc<dyn StorageScan>,
 	memory: Arc<MemoryManager>,
 	partition_store: Arc<dyn PartitionStore>,
+	active_tasks: ActiveTaskRegistry,
 	worker_id: WorkerId,
 	endpoint: WorkerEndpoint,
 }
@@ -104,6 +106,7 @@ impl ToronWorker {
 			storage,
 			memory,
 			partition_store,
+			active_tasks: ActiveTaskRegistry::new(),
 			worker_id,
 			endpoint,
 		}
@@ -334,6 +337,12 @@ impl ToronWorker {
 							expected: "StartTask route matching TaskSpec identity",
 						});
 					}
+					let active_task = self.active_tasks.register(identity);
+					if active_task.cancelled_before_start {
+						self.partition_store.cancel_query(identity.query_id);
+						send_task_failed(&mut stream, identity, cancelled_task_error()).await?;
+						continue;
+					}
 
 					send_payload(
 						&mut stream,
@@ -345,9 +354,22 @@ impl ToronWorker {
 					.await?;
 					let task_setup_micros = duration_micros(task_started);
 
-					match self.execute_task_local_with_telemetry(&payload.spec).await {
+					let execution = self.execute_task_local_with_telemetry(&payload.spec);
+					tokio::pin!(execution);
+					let execution_result = tokio::select! {
+						result = &mut execution => result,
+						_ = active_task.signal.cancelled() => Err(cancelled_task_error()),
+					};
+
+					match execution_result {
 						Ok(mut report) => {
 							for (idx, batch) in report.results.iter().enumerate() {
+								if active_task.signal.is_cancelled() {
+									self.partition_store.cancel_query(identity.query_id);
+									send_task_failed(&mut stream, identity, cancelled_task_error())
+										.await?;
+									break;
+								}
 								let stream_seq = StreamSeq::new(
 									u64::try_from(idx).expect("record batch index fits u64"),
 								);
@@ -377,11 +399,30 @@ impl ToronWorker {
 									.batch_send_micros
 									.saturating_add(duration_micros(batch_send_started));
 							}
+							if active_task.signal.is_cancelled() {
+								continue;
+							}
 
 							let publish_started = Instant::now();
+							if active_task.signal.is_cancelled() {
+								self.partition_store.cancel_query(identity.query_id);
+								send_task_failed(&mut stream, identity, cancelled_task_error())
+									.await?;
+								continue;
+							}
 							match self.publish_task_output(identity, &payload.spec, &report.results)
 							{
 								Ok(output) => {
+									if active_task.signal.is_cancelled() {
+										self.partition_store.cancel_query(identity.query_id);
+										send_task_failed(
+											&mut stream,
+											identity,
+											cancelled_task_error(),
+										)
+										.await?;
+										continue;
+									}
 									report.telemetry.phases.output_publish_micros =
 										duration_micros(publish_started);
 									report.telemetry.counters.published_shuffle_bytes =
@@ -409,12 +450,29 @@ impl ToronWorker {
 							}
 						}
 						Err(error) => {
+							if matches!(
+								error,
+								QueryError::Runtime(RuntimeError::TaskFailure {
+									kind: TaskFailureKind::Cancelled
+								})
+							) {
+								self.partition_store.cancel_query(identity.query_id);
+							}
 							send_task_failed(&mut stream, identity, error).await?;
 						}
 					}
+					drop(active_task.guard);
 				}
 				MessageKind::CancelTask => {
 					let identity = task_envelope_identity(envelope.identity)?;
+					let payload: CancelTaskPayload = decode_payload(&envelope.payload)?;
+					if payload.identity != identity {
+						return Err(QueryError::UnexpectedMessage {
+							expected: "CancelTask for requested task",
+						});
+					}
+					self.active_tasks.cancel(identity);
+					self.partition_store.cancel_query(identity.query_id);
 					send_payload(
 						&mut stream,
 						MessageKind::TaskCancelled,
@@ -797,6 +855,7 @@ mod tests {
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Arc;
+	use tokio::io::duplex as test_duplex;
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterBloom,
 		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicyV1,
@@ -1027,6 +1086,80 @@ mod tests {
 			.expect("worker ok");
 	}
 
+	#[tokio::test]
+	async fn cancel_task_before_registration_tombstones_and_prevents_execution() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch =
+			RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))])
+				.expect("batch");
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan { table_data: batch }),
+			memory.clone(),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(7),
+			WorkerEndpoint::new("127.0.0.1:0"),
+		));
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(77),
+			StageId::new(0),
+			TaskId::new(0),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (mut client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		send_payload(
+			&mut client,
+			MessageKind::CancelTask,
+			EnvelopeIdentity::task(identity),
+			None,
+			&CancelTaskPayload { identity },
+		)
+		.await
+		.expect("send cancel task");
+		let cancelled = read_envelope(&mut client, memory.as_ref())
+			.await
+			.expect("read cancellation ack");
+		assert_eq!(cancelled.kind, MessageKind::TaskCancelled);
+
+		send_payload(
+			&mut client,
+			MessageKind::StartTask,
+			EnvelopeIdentity::task(identity),
+			None,
+			&StartTaskPayload { spec },
+		)
+		.await
+		.expect("send start task");
+		let failed = read_envelope(&mut client, memory.as_ref())
+			.await
+			.expect("read pre-cancel failure");
+		assert_eq!(failed.kind, MessageKind::TaskFailed);
+		let payload: TaskFailedPayload =
+			decode_payload(&failed.payload).expect("decode task failed");
+		assert!(matches!(payload.kind, TaskFailureKind::Cancelled));
+
+		drop(client);
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
 	fn scan(table_id: TableId, object_byte: u8) -> ExecutionPlan {
 		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 		let descriptor = TableSchemaDescriptor::new(
@@ -1144,6 +1277,7 @@ pub struct RemoteTaskCompletion {
 pub struct NetworkTaskDispatcher<Transport> {
 	coordinator: ToronCoordinator,
 	transport: Transport,
+	active_query: Option<ActiveQueryHandle>,
 }
 
 impl<Transport> NetworkTaskDispatcher<Transport> {
@@ -1151,7 +1285,13 @@ impl<Transport> NetworkTaskDispatcher<Transport> {
 		Self {
 			coordinator: ToronCoordinator::new(memory),
 			transport,
+			active_query: None,
 		}
+	}
+
+	pub fn with_active_query(mut self, active_query: Option<ActiveQueryHandle>) -> Self {
+		self.active_query = active_query;
+		self
 	}
 }
 
@@ -1165,10 +1305,23 @@ where
 		worker: &crate::distributed::worker_registry::WorkerEntry,
 		spec: &TaskSpec,
 	) -> DispatchOutcome {
+		if self
+			.active_query
+			.as_ref()
+			.is_some_and(ActiveQueryHandle::is_cancelled)
+		{
+			return DispatchOutcome::Failed(TaskFailureKind::Cancelled);
+		}
 		let stream = match self.transport.connect_worker(worker).await {
 			Ok(stream) => stream,
 			Err(error) => return DispatchOutcome::Failed(dispatch_failure_kind(error)),
 		};
+		if let Some(active_query) = &self.active_query {
+			active_query.record_remote_task(worker.clone(), spec.identity);
+			if active_query.is_cancelled() {
+				return DispatchOutcome::Failed(TaskFailureKind::Cancelled);
+			}
+		}
 
 		match self
 			.coordinator
@@ -1477,6 +1630,12 @@ where
 		&TaskFailedPayload::new_worker_emitted(identity, kind).expect("kind is worker-emittable"),
 	)
 	.await
+}
+
+fn cancelled_task_error() -> QueryError {
+	QueryError::Runtime(RuntimeError::TaskFailure {
+		kind: TaskFailureKind::Cancelled,
+	})
 }
 
 fn task_envelope_identity(identity: EnvelopeIdentity) -> Result<TaskIdentity, QueryError> {

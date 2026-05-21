@@ -26,6 +26,9 @@ use crate::coordinator::DistributedQueryCoordinator;
 use crate::distributed::budget::{
 	BudgetDimension, ByteCount, QueryBudget, TenantDescriptorSyncAccountant,
 };
+use crate::distributed::cancellation::{
+	CancellationMetrics, CancellationOutcome, CancellationTrigger, QueryCancellation,
+};
 use crate::distributed::identity::{LeaseEpoch, QueryId};
 use crate::distributed::partition_store::InMemoryPartitionStore;
 use crate::distributed::worker_registry::{
@@ -239,6 +242,7 @@ impl ToronDaemon {
 		let coordinator_writer: Arc<dyn crate::storage::StorageWrite> = writer.clone();
 		let coordinator_deleter: Arc<dyn crate::storage::StorageDeleteRows> = deleter.clone();
 		let coordinator_admin: Arc<dyn crate::storage::StorageAdmin> = admin.clone();
+		let cancellation_metrics = Arc::new(CancellationMetrics::default());
 		let coordinator = Arc::new(
 			DistributedQueryCoordinator::with_writer_deleter_and_admin(
 				coordinator_catalog,
@@ -252,7 +256,8 @@ impl ToronDaemon {
 				coordinator_admin,
 			)
 			.with_tenant_budget_policy(config.tenant_budgets.clone())
-			.with_admission_policy(config.admission),
+			.with_admission_policy(config.admission)
+			.with_cancellation_metrics(Arc::clone(&cancellation_metrics)),
 		);
 
 		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
@@ -270,6 +275,7 @@ impl ToronDaemon {
 			tenant_budgets: config.tenant_budgets.clone(),
 			descriptor_sync_metrics: catalog.descriptor_sync_metrics(),
 			descriptor_refresh_metrics: catalog.descriptor_refresh_metrics(),
+			cancellation_metrics,
 			sql_connection_limiter: sql_connection_limiter.clone(),
 			tenant_admission: coordinator.tenant_admission_controller(),
 			admission_rejections: coordinator.admission_rejection_counters(),
@@ -604,6 +610,14 @@ struct SqlAcceptOptions {
 	max_statement_bytes: NonZeroU32,
 }
 
+#[derive(Clone, Copy)]
+struct SqlConnectionOptions {
+	tenant_id: TenantId,
+	statement_timeout: std::time::Duration,
+	max_request_frame_bytes: NonZeroU32,
+	max_statement_bytes: NonZeroU32,
+}
+
 async fn run_sql_accept_loop(
 	coordinator: Arc<DistributedQueryCoordinator<StaticWorkerRegistry, QuicTransport>>,
 	endpoint: QuicEndpoint,
@@ -663,9 +677,12 @@ async fn run_sql_accept_loop(
 						}
 					};
 					let coordinator = Arc::clone(&coordinator);
-					let statement_timeout = options.statement_timeout;
-					let max_request_frame_bytes = options.max_request_frame_bytes;
-					let max_statement_bytes = options.max_statement_bytes;
+					let connection_options = SqlConnectionOptions {
+						tenant_id,
+						statement_timeout: options.statement_timeout,
+						max_request_frame_bytes: options.max_request_frame_bytes,
+						max_statement_bytes: options.max_statement_bytes,
+					};
 					let metrics = Arc::clone(&metrics);
 					connection_tasks.lock().await.spawn(async move {
 						let _connection_permits = (tier1_permit, tier2_permit);
@@ -674,10 +691,8 @@ async fn run_sql_accept_loop(
 								if let Err(error) = handle_sql_connection(
 									coordinator,
 									stream,
-									tenant_id,
-									statement_timeout,
-									max_request_frame_bytes,
-									max_statement_bytes,
+									connection.clone(),
+									connection_options,
 									metrics,
 								).await {
 									tracing::warn!(error = %error, "sql connection error");
@@ -702,25 +717,25 @@ async fn run_sql_accept_loop(
 async fn handle_sql_connection(
 	coordinator: Arc<DistributedQueryCoordinator<StaticWorkerRegistry, QuicTransport>>,
 	mut stream: QuicStream,
-	tenant_id: TenantId,
-	statement_timeout: std::time::Duration,
-	max_request_frame_bytes: NonZeroU32,
-	max_statement_bytes: NonZeroU32,
+	connection: quinn::Connection,
+	options: SqlConnectionOptions,
 	metrics: Arc<MetricsRegistry>,
 ) -> Result<(), QueryError> {
-	let frame = match read_request_frame_bounded(&mut stream, max_request_frame_bytes).await? {
-		Ok(frame) => frame,
-		Err(error) => {
-			metrics.increment_reject(ListenerName::Sql, RejectReason::RequestFrameTooLarge);
-			tracing::warn!(
-				declared_len = error.declared_len,
-				max_len = error.max_len.get(),
-				"sql request frame too large"
-			);
-			let _ = stream.finish().await;
-			return Ok(());
-		}
-	};
+	let tenant_id = options.tenant_id;
+	let frame =
+		match read_request_frame_bounded(&mut stream, options.max_request_frame_bytes).await? {
+			Ok(frame) => frame,
+			Err(error) => {
+				metrics.increment_reject(ListenerName::Sql, RejectReason::RequestFrameTooLarge);
+				tracing::warn!(
+					declared_len = error.declared_len,
+					max_len = error.max_len.get(),
+					"sql request frame too large"
+				);
+				let _ = stream.finish().await;
+				return Ok(());
+			}
+		};
 	if frame.protocol_version != crate::sql_wire::SqlProtocolVersion::Current {
 		return write_sql_error(
 			&mut stream,
@@ -734,7 +749,7 @@ async fn handle_sql_connection(
 	match frame.message {
 		SqlMessage::Execute(request) => {
 			if request.statement.len()
-				> usize::try_from(max_statement_bytes.get()).expect("u32 fits usize")
+				> usize::try_from(options.max_statement_bytes.get()).expect("u32 fits usize")
 			{
 				metrics.increment_reject(ListenerName::Sql, RejectReason::StatementTooLarge);
 				return write_sql_error(
@@ -748,7 +763,7 @@ async fn handle_sql_connection(
 			let timeout_duration = request
 				.statement_timeout_seconds
 				.map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
-				.unwrap_or(statement_timeout);
+				.unwrap_or(options.statement_timeout);
 			let planner = SqlPlanner::new();
 			let plan = match planner.plan(&request.statement) {
 				Ok(plan) => plan,
@@ -766,18 +781,24 @@ async fn handle_sql_connection(
 			};
 			let context = sql_execution_context(tenant_id, frame.query_id);
 			let returns_rows = sql_plan_returns_rows(&plan);
-			let execution = timeout(
-				timeout_duration,
-				coordinator.execute_query_with_context(&plan, context),
-			)
-			.await;
-			let batches = match execution {
-				Ok(Ok(batches)) => batches,
-				Ok(Err(error)) => {
-					let (code, message) = map_sql_query_error(error);
-					return write_sql_error(&mut stream, frame.query_id, code, message).await;
-				}
-				Err(_) => {
+			let execution = coordinator.execute_query_with_context(&plan, context);
+			tokio::pin!(execution);
+			let timeout_sleep = tokio::time::sleep(timeout_duration);
+			tokio::pin!(timeout_sleep);
+			let connection_closed = connection.closed();
+			tokio::pin!(connection_closed);
+			let execution = tokio::select! {
+				result = &mut execution => Some(result),
+				_ = &mut timeout_sleep => {
+					let cancellation = coordinator.cancel_query_for_tenant(
+						tenant_id,
+						frame.query_id,
+						CancellationTrigger::StatementTimeout,
+					);
+					metrics.record_cancellation(
+						CancellationTrigger::StatementTimeout,
+						cancellation_request_outcome(&cancellation),
+					);
 					return write_sql_error(
 						&mut stream,
 						frame.query_id,
@@ -786,6 +807,26 @@ async fn handle_sql_connection(
 					)
 					.await;
 				}
+				_ = &mut connection_closed => {
+					let cancellation = coordinator.cancel_query_for_tenant(
+						tenant_id,
+						frame.query_id,
+						CancellationTrigger::ClientDisconnect,
+					);
+					metrics.record_cancellation(
+						CancellationTrigger::ClientDisconnect,
+						cancellation_request_outcome(&cancellation),
+					);
+					return Ok(());
+				}
+			};
+			let batches = match execution {
+				Some(Ok(batches)) => batches,
+				Some(Err(error)) => {
+					let (code, message) = map_sql_query_error(error);
+					return write_sql_error(&mut stream, frame.query_id, code, message).await;
+				}
+				None => unreachable!("SQL execution select always returns or exits"),
 			};
 			if returns_rows {
 				for (batch_index, batch) in batches.iter().enumerate() {
@@ -814,12 +855,21 @@ async fn handle_sql_connection(
 			write_sql_frame(&mut stream, &response).await?;
 			stream.finish().await?;
 		}
-		SqlMessage::Cancel(_) => {
+		SqlMessage::Cancel(request) => {
+			let cancellation = coordinator.cancel_query_for_tenant(
+				tenant_id,
+				request.query_id,
+				CancellationTrigger::SqlCancel,
+			);
+			metrics.record_cancellation(
+				CancellationTrigger::SqlCancel,
+				cancellation_request_outcome(&cancellation),
+			);
 			write_sql_error(
 				&mut stream,
 				frame.query_id,
-				SqlErrorCode::CancellationUnsupported,
-				"SQL cancellation is not available in this runtime",
+				SqlErrorCode::Cancelled,
+				"query cancellation accepted",
 			)
 			.await?;
 		}
@@ -907,6 +957,14 @@ fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {
 			.map(ToString::to_string)
 			.unwrap_or_else(|| error.to_string()),
 	)
+}
+
+fn cancellation_request_outcome(cancellation: &QueryCancellation) -> CancellationOutcome {
+	if cancellation.first_request {
+		CancellationOutcome::Requested
+	} else {
+		CancellationOutcome::AlreadyTerminal
+	}
 }
 
 fn sql_plan_returns_rows(plan: &LogicalPlan) -> bool {

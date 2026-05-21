@@ -31,6 +31,9 @@ use toron::distributed::budget::{
 	AdmissionAttempt, AdmissionResource, ByteCount, TenantAdmissionController,
 	TenantAdmissionRejectionCounters, TenantBudget, TenantBudgetPolicy,
 };
+use toron::distributed::cancellation::{
+	CancellationMetrics, CancellationOutcome, CancellationTrigger,
+};
 use toron::distributed::identity::WorkerId;
 use toron::network::connection::SqlConnectionLimiter;
 use toron::network::observability::{
@@ -95,6 +98,7 @@ fn sample_resource_metrics_body() -> String {
 		tenant_budgets: policy,
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections,
@@ -113,6 +117,7 @@ fn request_ingress_metrics_use_bounded_reasons_and_omit_sql_text() {
 		tenant_budgets: policy.clone(),
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
@@ -135,6 +140,53 @@ fn request_ingress_metrics_use_bounded_reasons_and_omit_sql_text() {
 			!body.contains(forbidden),
 			"request ingress reject metrics leaked forbidden token {forbidden}"
 		);
+	}
+}
+
+#[test]
+fn cancellation_metrics_are_aggregate_trigger_outcome_only() {
+	let policy = TenantBudgetPolicy::omitted_config(ByteCount::new(1024));
+	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy.clone(),
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		sql_connection_limiter: None,
+		tenant_admission,
+		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
+	});
+	metrics.record_cancellation(
+		CancellationTrigger::StatementTimeout,
+		CancellationOutcome::Requested,
+	);
+	metrics.record_cancellation(
+		CancellationTrigger::SqlCancel,
+		CancellationOutcome::RemoteAck,
+	);
+
+	let body = metrics.render_text(&ready_snapshot());
+
+	assert!(body.contains(
+		"query_cancellations_total{trigger=\"statement_timeout\",outcome=\"requested\"} 1\n"
+	));
+	assert!(
+		body.contains(
+			"query_cancellations_total{trigger=\"sql_cancel\",outcome=\"remote_ack\"} 1\n"
+		)
+	);
+	for forbidden in [
+		"query_cancellations_total{query_id",
+		"query_cancellations_total{task_id",
+		"query_cancellations_total{worker_id",
+		"query_cancellations_total{tenant_id",
+		"query_cancellations_total{table",
+		"query_cancellations_total{endpoint",
+		"SELECT",
+	] {
+		assert!(!body.contains(forbidden), "{forbidden} leaked into metrics");
 	}
 }
 
@@ -463,6 +515,7 @@ fn sql_connection_metrics_are_configured_plus_other() {
 		tenant_budgets: policy.clone(),
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		sql_connection_limiter: Some(limiter),
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
@@ -552,6 +605,7 @@ fn queue_and_borrow_metrics_are_configured_plus_other_no_table_labels() {
 		tenant_budgets: policy,
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&TenantBudgetPolicy::new(

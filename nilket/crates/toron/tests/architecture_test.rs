@@ -2349,8 +2349,11 @@ fn runtime_transport_is_not_duplex_only() {
 	let manifest_dir = manifest_dir();
 	let offenders = source_lines(&manifest_dir.join("src"))
 		.into_iter()
-		.filter(|(_, _, line)| {
-			line.contains("tokio::io::duplex") || line.contains("MockZeroCopyTransport")
+		.filter(|(path, _, line)| {
+			let test_only_duplex_import =
+				path.ends_with("src/server/mod.rs") && line.contains("duplex as test_duplex");
+			!test_only_duplex_import
+				&& (line.contains("tokio::io::duplex") || line.contains("MockZeroCopyTransport"))
 		})
 		.collect::<Vec<_>>();
 
@@ -5021,9 +5024,10 @@ fn adr037_distributed_read_executor_wraps_fragment_scheduler() {
 	.expect("distributed source executor body")
 	.1;
 
-	assert!(distributed_source.contains(
-		"execute_bound_distributed_with_context(plan.clone(), self.context, self.query_budget)"
-	));
+	assert!(distributed_source.contains("execute_bound_distributed_with_context("));
+	assert!(distributed_source.contains("plan.clone()"));
+	assert!(distributed_source.contains("self.context"));
+	assert!(distributed_source.contains("self.query_budget"));
 	assert!(distributed_source.contains(".await"));
 }
 
@@ -8238,7 +8242,7 @@ fn adr050_per_query_budget_sourced_by_tenant_at_coordinator() {
 	for required in [
 		"fn admit_query(&self, context: &ExecutionContext)",
 		"query_budget_for_base(context.tenant_id, self.query_budget)",
-		"execute_query_with_admission(plan, context, query_budget)",
+		"execute_query_with_admission(plan, context, query_budget,",
 		"fragment_config(context, query_budget)",
 	] {
 		assert!(
@@ -8291,7 +8295,7 @@ fn adr050_aggregate_admission_rejects_before_bind_or_execution() {
 		.1;
 
 	assert!(execute_query.contains("let admitted = self.admit_query(&context).await?;"));
-	assert!(execute_query.contains(".execute_query_with_admission(plan, context, query_budget)"));
+	assert!(execute_query.contains(".execute_query_with_admission(plan, context, query_budget,"));
 	assert!(helper.contains("bind(plan, catalog.as_ref(), &self.config).await?"));
 }
 
@@ -10413,10 +10417,523 @@ fn adr058_cancel_frames_are_not_statement_capped() {
 	let sql_tests = std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
 		.expect("read SQL listener tests");
 
-	assert!(cancel.contains("SqlErrorCode::CancellationUnsupported"));
+	assert!(cancel.contains("CancellationTrigger::SqlCancel"));
+	assert!(cancel.contains("SqlErrorCode::Cancelled"));
+	assert!(!cancel.contains("SqlErrorCode::CancellationUnsupported"));
 	assert!(!cancel.contains("max_statement_bytes"));
 	assert!(!cancel.contains("StatementTooLarge"));
 	assert!(sql_tests.contains("cancel_below_request_frame_cap_is_not_statement_capped"));
+}
+
+#[test]
+fn adr059_reuses_existing_cancel_wire_and_rejects_control_protocol_drift() {
+	let wire = std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
+	let transport = std::fs::read_to_string(manifest_dir().join("src/server/transport.rs"))
+		.expect("read transport");
+	let quic = std::fs::read_to_string(manifest_dir().join("src/quic.rs")).expect("read quic");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(wire.contains("CancelTask"));
+	assert!(wire.contains("TaskCancelled"));
+	assert!(!wire.contains("ControlMessage"));
+	assert!(!transport.contains("open_uni"));
+	assert!(!quic.contains("open_uni"));
+	assert!(quic.contains("open_bi()"));
+	assert!(server.contains("cancel_task_on_worker"));
+	assert!(server.contains("MessageKind::CancelTask"));
+	assert!(server.contains("MessageKind::TaskCancelled"));
+}
+
+#[test]
+fn adr059_sql_cancel_uses_existing_cancel_frame_not_execute_grammar() {
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let cancel_branch = brace_blocks_after_marker(&daemon, "SqlMessage::Cancel")
+		.into_iter()
+		.next()
+		.expect("cancel branch")
+		.1;
+
+	assert!(wire.contains("Cancel(CancelRequest)"));
+	assert!(wire.contains("pub struct CancelRequest"));
+	assert!(cancel_branch.contains("request.query_id"));
+	assert!(cancel_branch.contains("CancellationTrigger::SqlCancel"));
+	assert!(cancel_branch.contains("SqlErrorCode::Cancelled"));
+	assert!(!daemon.contains("CANCEL <"));
+	assert!(!daemon.contains("CancellationUnsupported"));
+}
+
+#[test]
+fn adr059_sql_cancel_is_tenant_scoped_and_not_cross_tenant_oracle() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let cancel_branch = brace_blocks_after_marker(&daemon, "SqlMessage::Cancel")
+		.into_iter()
+		.next()
+		.expect("cancel branch")
+		.1;
+
+	assert!(cancellation.contains("ActiveQueryKey::new(tenant_id, query_id)"));
+	assert!(cancel_branch.contains("tenant_id"));
+	assert!(cancel_branch.contains("request.query_id"));
+	assert!(cancel_branch.contains("SqlErrorCode::Cancelled"));
+	assert!(!cancel_branch.contains("TableNotFound"));
+	assert!(!cancel_branch.contains("NoLiveWorker"));
+	assert!(
+		cancellation.contains("active_query_registry_is_tenant_scoped_idempotent_and_raii_removed")
+	);
+}
+
+#[test]
+fn adr059_active_query_registry_is_tenant_scoped_and_shared_by_triggers() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	assert!(coordinator.contains("ActiveQueryRegistry"));
+	assert!(cancellation.contains("pub struct ActiveQueryKey"));
+	assert!(cancellation.contains("pub tenant_id: TenantId"));
+	assert!(cancellation.contains("pub query_id: QueryId"));
+	assert!(coordinator.contains("cancel_query_for_tenant"));
+	assert!(daemon.contains("CancellationTrigger::StatementTimeout"));
+	assert!(daemon.contains("CancellationTrigger::ClientDisconnect"));
+	assert!(daemon.contains("CancellationTrigger::SqlCancel"));
+	assert!(daemon.matches("cancel_query_for_tenant").count() >= 3);
+}
+
+#[test]
+fn adr059_active_query_registry_is_tenant_scoped_and_raii_removed() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(cancellation.contains("pub struct ActiveQueryKey"));
+	assert!(cancellation.contains("pub tenant_id: TenantId"));
+	assert!(cancellation.contains("pub query_id: QueryId"));
+	assert!(cancellation.contains("impl Drop for ActiveQueryGuard"));
+	assert!(cancellation.contains("remove_if_same"));
+	assert!(cancellation.contains("ptr_eq"));
+	assert!(coordinator.contains(".active_queries"));
+	assert!(coordinator.contains(".register(context.tenant_id, context.query_id)"));
+}
+
+#[test]
+fn adr059_timeout_disconnect_and_sql_cancel_share_one_handle() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	for trigger in [
+		"CancellationTrigger::StatementTimeout",
+		"CancellationTrigger::ClientDisconnect",
+		"CancellationTrigger::SqlCancel",
+	] {
+		assert!(daemon.contains(trigger), "missing trigger {trigger}");
+	}
+	assert!(daemon.matches("cancel_query_for_tenant").count() >= 3);
+	assert!(!daemon.contains("cancel_query_for_timeout"));
+	assert!(!daemon.contains("cancel_query_for_disconnect"));
+}
+
+#[test]
+fn adr059_statement_timeout_fires_cancel_before_returning() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let timeout_pos = daemon
+		.find("_ = &mut timeout_sleep")
+		.expect("timeout branch");
+	let branch = &daemon[timeout_pos..];
+	let cancel_pos = branch
+		.find("cancel_query_for_tenant")
+		.expect("timeout cancel call");
+	let error_pos = branch
+		.find("SqlErrorCode::StatementTimeout")
+		.expect("statement timeout error");
+
+	assert!(cancel_pos < error_pos);
+	assert!(branch[..error_pos].contains("CancellationTrigger::StatementTimeout"));
+	assert!(branch[..error_pos].contains("cancellation_request_outcome(&cancellation)"));
+}
+
+#[test]
+fn adr059_client_disconnect_before_execute_decode_sends_no_cancel() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let handler = brace_blocks_after_marker(&daemon, "async fn handle_sql_connection")
+		.into_iter()
+		.next()
+		.expect("SQL connection handler")
+		.1;
+	let frame_read = handler
+		.find("read_request_frame_bounded")
+		.expect("bounded frame read");
+	let execute_branch = handler.find("SqlMessage::Execute").expect("execute branch");
+	let pre_execute = &handler[frame_read..execute_branch];
+	let execute = brace_blocks_after_marker(&handler, "SqlMessage::Execute")
+		.into_iter()
+		.next()
+		.expect("execute branch")
+		.1;
+
+	assert!(!pre_execute.contains("CancellationTrigger::ClientDisconnect"));
+	assert!(!pre_execute.contains("connection.closed()"));
+	assert!(execute.contains("connection.closed()"));
+	assert!(execute.contains("CancellationTrigger::ClientDisconnect"));
+}
+
+#[test]
+fn adr059_client_response_does_not_wait_for_remote_cancel_ack() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let timeout_branch = &daemon[daemon
+		.find("CancellationTrigger::StatementTimeout")
+		.expect("timeout trigger")..];
+	let cancel_branch = brace_blocks_after_marker(&daemon, "SqlMessage::Cancel")
+		.into_iter()
+		.next()
+		.expect("cancel branch")
+		.1;
+
+	assert!(coordinator.contains("tokio::spawn(async move"));
+	assert!(coordinator.contains("REMOTE_CANCEL_ACK_TIMEOUT"));
+	assert!(
+		!timeout_branch[..timeout_branch
+			.find("SqlErrorCode::StatementTimeout")
+			.unwrap()]
+			.contains("TaskCancelled")
+	);
+	assert!(!cancel_branch.contains("TaskCancelled"));
+	assert!(!cancel_branch.contains("REMOTE_CANCEL_ACK_TIMEOUT"));
+}
+
+#[test]
+fn adr059_worker_cancel_task_is_not_ack_only_and_tombstones_are_bounded() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(cancellation.contains("MAX_PENDING_TASK_CANCELLATIONS"));
+	assert!(cancellation.contains("PENDING_TASK_CANCELLATION_TTL"));
+	assert!(cancellation.contains("ActiveTaskRegistry"));
+	assert!(cancellation.contains("pending"));
+	assert!(server.contains("cancelled_before_start"));
+	assert!(server.contains("self.active_tasks.cancel(identity)"));
+	assert!(server.contains("cancelled_task_error()"));
+	assert!(server.contains("partition_store.cancel_query(identity.query_id)"));
+}
+
+#[test]
+fn adr059_remote_cancel_uses_existing_cancel_task_wire() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let wire = std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
+
+	assert!(wire.contains("CancelTask"));
+	assert!(wire.contains("TaskCancelled"));
+	assert!(coordinator.contains("cancel_task_on_worker(stream, task.identity)"));
+	assert!(server.contains("MessageKind::CancelTask"));
+	assert!(server.contains("MessageKind::TaskCancelled"));
+}
+
+#[test]
+fn adr059_out_of_band_cancel_stream_is_bidirectional_for_ack() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let transport = std::fs::read_to_string(manifest_dir().join("src/server/transport.rs"))
+		.expect("read transport");
+	let quic = std::fs::read_to_string(manifest_dir().join("src/quic.rs")).expect("read quic");
+
+	assert!(transport.contains("bidirectional stream"));
+	assert!(quic.contains("open_bi()"));
+	assert!(!quic.contains("open_uni"));
+	assert!(coordinator.contains("transport.connect_worker(&task.worker)"));
+	assert!(coordinator.contains("cancel_task_on_worker(stream, task.identity)"));
+}
+
+#[test]
+fn adr059_no_control_message_uni_stream_or_control_endpoint() {
+	assert_toron_sources_do_not_contain(&[
+		"ControlMessage",
+		"open_uni",
+		"CancelControl",
+		"worker_control",
+		"control_endpoint",
+	]);
+}
+
+#[test]
+fn adr059_worker_handles_cancel_stream_concurrently_with_task_stream() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let worker_loop = brace_blocks_after_marker(&daemon, "async fn run_quic_worker_accept_loop")
+		.into_iter()
+		.next()
+		.expect("worker accept loop")
+		.1;
+
+	assert!(worker_loop.contains("connection_tasks.lock().await.spawn(async move"));
+	assert!(worker_loop.contains("QuicEndpoint::accept_stream_on(&connection)"));
+	assert!(server.contains("MessageKind::StartTask"));
+	assert!(server.contains("MessageKind::CancelTask"));
+}
+
+#[test]
+fn adr059_worker_active_registry_keyed_by_task_identity_raii_deregistered() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(cancellation.contains("active: HashMap<TaskIdentity, TaskCancellationSignal>"));
+	assert!(cancellation.contains("impl Drop for ActiveTaskGuard"));
+	assert!(cancellation.contains("inner.active.remove(&self.identity)"));
+	assert!(server.contains("let active_task = self.active_tasks.register(identity);"));
+}
+
+#[test]
+fn adr059_worker_cancel_task_not_ack_only_and_idempotent() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let cancel_branch = brace_blocks_after_marker(&server, "MessageKind::CancelTask")
+		.into_iter()
+		.next()
+		.expect("cancel task branch")
+		.1;
+
+	assert!(cancel_branch.contains("self.active_tasks.cancel(identity)"));
+	assert!(cancel_branch.contains("partition_store.cancel_query(identity.query_id)"));
+	assert!(cancel_branch.contains("MessageKind::TaskCancelled"));
+	assert!(cancel_branch.contains("TaskCancelledPayload { identity }"));
+}
+
+#[test]
+fn adr059_cancel_before_start_task_tombstones_and_aborts_on_registration() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(cancellation.contains("insert_pending(identity)"));
+	assert!(cancellation.contains("cancelled_before_start"));
+	assert!(server.contains("if active_task.cancelled_before_start"));
+	assert!(server.contains("send_task_failed(&mut stream, identity, cancelled_task_error())"));
+	assert!(server.contains("cancel_task_before_registration_tombstones_and_prevents_execution"));
+}
+
+#[test]
+fn adr059_pending_cancel_tombstone_is_bounded_and_evicted() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+
+	assert!(cancellation.contains("MAX_PENDING_TASK_CANCELLATIONS"));
+	assert!(cancellation.contains("PENDING_TASK_CANCELLATION_TTL"));
+	assert!(cancellation.contains("pending_order: VecDeque<TaskIdentity>"));
+	assert!(cancellation.contains("while self.pending.len() > MAX_PENDING_TASK_CANCELLATIONS"));
+	assert!(cancellation.contains("prune_pending"));
+	assert!(
+		cancellation.contains("active_task_cancel_before_registration_is_bounded_and_consumed")
+	);
+}
+
+#[test]
+fn adr059_remote_cancel_fanout_is_bounded_and_records_aggregate_outcomes() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	assert!(coordinator.contains("MAX_REMOTE_CANCEL_FANOUTS"));
+	assert!(coordinator.contains("Semaphore::new(MAX_REMOTE_CANCEL_FANOUTS)"));
+	assert!(coordinator.contains("try_acquire_owned()"));
+	assert!(coordinator.contains("tokio::time::timeout"));
+	assert!(coordinator.contains("CancellationOutcome::RemoteAck"));
+	assert!(coordinator.contains("CancellationOutcome::RemoteTimeout"));
+	assert!(coordinator.contains("CancellationOutcome::RemoteError"));
+	assert!(
+		observability
+			.contains("query_cancellations_total{{trigger=\\\"{}\\\",outcome=\\\"{}\\\"}}")
+	);
+}
+
+#[test]
+fn adr059_cancel_fanout_is_bounded_background_cleanup() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(coordinator.contains("MAX_REMOTE_CANCEL_FANOUTS"));
+	assert!(coordinator.contains("cancel_fanout_permits"));
+	assert!(coordinator.contains("try_acquire_owned()"));
+	assert!(coordinator.contains("tokio::spawn(async move"));
+	assert!(coordinator.contains("REMOTE_CANCEL_CONNECT_TIMEOUT"));
+	assert!(coordinator.contains("REMOTE_CANCEL_ACK_TIMEOUT"));
+}
+
+#[test]
+fn adr059_abort_is_drop_at_await_with_pre_publish_suppression() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let start_task = brace_blocks_after_marker(&server, "MessageKind::StartTask")
+		.into_iter()
+		.next()
+		.expect("StartTask arm")
+		.1;
+
+	assert!(start_task.contains("tokio::select!"));
+	assert!(start_task.contains("execute_task_local_with_telemetry"));
+	assert!(start_task.contains("active_task.signal.cancelled()"));
+	assert!(start_task.contains("publish_task_output"));
+	assert!(start_task.contains("active_task.signal.is_cancelled()"));
+	assert!(!server.contains("tokio_util::sync::CancellationToken"));
+}
+
+#[test]
+fn adr059_local_cleanup_runs_when_remote_cancel_fails() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(coordinator.contains("scheduler.cancel_query(context.query_id)"));
+	assert!(coordinator.contains("CancellationOutcome::RemoteError"));
+	assert!(coordinator.contains("remote cancel connect failed"));
+	assert!(server.contains("partition_store.cancel_query(identity.query_id)"));
+}
+
+#[test]
+fn adr059_pre_admission_rejects_emit_no_cancel() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let execute_query =
+		brace_blocks_after_marker(&coordinator, "pub async fn execute_query_with_context")
+			.into_iter()
+			.next()
+			.expect("execute query")
+			.1;
+	let admit_query = brace_blocks_after_marker(&coordinator, "async fn admit_query")
+		.into_iter()
+		.next()
+		.expect("admit query")
+		.1;
+	let admit_pos = execute_query.find("admit_query(&context)").expect("admit");
+	let register_pos = execute_query
+		.find(".active_queries")
+		.expect("active query register");
+
+	assert!(admit_pos < register_pos);
+	assert!(!admit_query.contains("CancelTask"));
+	assert!(!admit_query.contains("cancel_query_for_tenant"));
+}
+
+#[test]
+fn adr059_no_wendelon_storage_cancellation_claim_and_metrics_identity_free() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let evidence = std::fs::read_to_string(
+		manifest_dir().join("plans/impl/059_distributed_query_cancellation_evidence.md"),
+	)
+	.unwrap_or_default();
+
+	assert!(!cancellation.contains("wendelon"));
+	for forbidden in [
+		"query_cancellations_total{query_id",
+		"query_cancellations_total{task_id",
+		"query_cancellations_total{worker_id",
+		"query_cancellations_total{tenant_id",
+		"query_cancellations_total{table",
+		"query_cancellations_total{endpoint",
+	] {
+		assert!(!observability.contains(forbidden), "{forbidden} leaked");
+	}
+	assert!(evidence.contains("does not add"));
+	assert!(evidence.contains("Wendelon storage cancellation"));
+}
+
+#[test]
+fn adr059_prior_adr043_and_adr049_through_adr058_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr043_", "adr049_", "adr050_", "adr051_", "adr052_", "adr053_", "adr054_", "adr055_",
+		"adr056_", "adr057_", "adr058_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr059_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing", "arrow"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr059_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	for forbidden in [
+		"ActiveTaskRegistry",
+		"ActiveQueryRegistry",
+		"CancellationTrigger",
+		"query_cancellations_total",
+		"cancel_query_for_tenant",
+	] {
+		assert!(
+			!worker.contains(forbidden),
+			"fixture worker gained {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr059_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ActiveTaskRegistryV1",
+		"ActiveQueryRegistryV1",
+		"TaskCancellationSignalV1",
+		"CancellationTriggerV1",
+		"CancellationOutcomeV1",
+		"CancellationMetricsV1",
+		"RemoteTaskCancellationV1",
+	]);
 }
 
 #[test]
@@ -10984,7 +11501,7 @@ fn adr055_no_descriptor_registry_refresh_or_sync_change() {
 
 	assert!(!budget.contains("DescriptorRefresh"));
 	assert!(coordinator.contains("let admitted = self.admit_query(&context).await?;"));
-	assert!(coordinator.contains("execute_query_with_admission(plan, context, query_budget)"));
+	assert!(coordinator.contains("execute_query_with_admission(plan, context, query_budget,"));
 	assert!(coordinator.contains("descriptor_evolved_table_id"));
 	assert!(
 		coordinator

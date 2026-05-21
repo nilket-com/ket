@@ -444,7 +444,7 @@ async fn cancel_below_request_frame_cap_is_not_statement_capped() {
 		.expect("read cancel response");
 	match frame.message {
 		SqlMessage::Error(error) => {
-			assert_eq!(error.code, SqlErrorCode::CancellationUnsupported);
+			assert_eq!(error.code, SqlErrorCode::Cancelled);
 		}
 		other => panic!("unexpected cancel response: {other:?}"),
 	}

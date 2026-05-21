@@ -16,6 +16,9 @@ use crate::distributed::budget::{
 	AdmissionResource, ByteCount, TenantAdmissionController, TenantAdmissionRejectionCounters,
 	TenantBudgetPolicy,
 };
+use crate::distributed::cancellation::{
+	CancellationMetrics, CancellationOutcome, CancellationTrigger,
+};
 use crate::network::connection::SqlConnectionLimiter;
 use crate::network::observability_http::{READ_REQUEST_TIMEOUT, read_request, write_response};
 use crate::storage::TenantId;
@@ -162,6 +165,7 @@ pub struct MetricsRegistry {
 	static_workers_configured: AtomicU64,
 	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
+	cancellation_metrics: Arc<CancellationMetrics>,
 	sql_connection_limiter: Option<SqlConnectionLimiter>,
 	resource_metrics: ResourceMetrics,
 }
@@ -172,6 +176,7 @@ pub struct MetricsRegistryConfig {
 	pub tenant_budgets: TenantBudgetPolicy,
 	pub descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	pub descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
+	pub cancellation_metrics: Arc<CancellationMetrics>,
 	pub sql_connection_limiter: Option<SqlConnectionLimiter>,
 	pub tenant_admission: TenantAdmissionController,
 	pub admission_rejections: TenantAdmissionRejectionCounters,
@@ -188,6 +193,7 @@ impl MetricsRegistry {
 			static_workers_configured: AtomicU64::new(config.static_workers_configured),
 			descriptor_sync_metrics: config.descriptor_sync_metrics,
 			descriptor_refresh_metrics: config.descriptor_refresh_metrics,
+			cancellation_metrics: config.cancellation_metrics,
 			sql_connection_limiter: config.sql_connection_limiter,
 			resource_metrics: ResourceMetrics {
 				tenant_budgets: config.tenant_budgets,
@@ -207,6 +213,10 @@ impl MetricsRegistry {
 
 	pub fn increment_metrics_scrapes(&self) {
 		self.metrics_scrapes_total.fetch_add(1, Ordering::Relaxed);
+	}
+
+	pub fn record_cancellation(&self, trigger: CancellationTrigger, outcome: CancellationOutcome) {
+		self.cancellation_metrics.record(trigger, outcome);
 	}
 
 	pub fn render_text(&self, snapshot: &ReadinessSnapshot) -> String {
@@ -256,6 +266,7 @@ impl MetricsRegistry {
 		));
 		self.render_descriptor_sync_metrics(&mut out);
 		self.render_descriptor_refresh_metrics(&mut out);
+		self.render_cancellation_metrics(&mut out);
 		self.render_sql_connection_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
 		out
@@ -287,6 +298,20 @@ impl MetricsRegistry {
 			out.push_str(&format!(
 				"catalog_descriptor_refresh_requests_total{{outcome=\"{outcome}\"}} {count}\n"
 			));
+		}
+	}
+
+	fn render_cancellation_metrics(&self, out: &mut String) {
+		out.push_str("# TYPE query_cancellations_total counter\n");
+		for trigger in CancellationTrigger::ALL {
+			for outcome in CancellationOutcome::ALL {
+				out.push_str(&format!(
+					"query_cancellations_total{{trigger=\"{}\",outcome=\"{}\"}} {}\n",
+					trigger.as_str(),
+					outcome.as_str(),
+					self.cancellation_metrics.get(trigger, outcome)
+				));
+			}
 		}
 	}
 
