@@ -4525,6 +4525,38 @@ along with the forward-sequence rewrite.
   `plans/impl/060_wendelon_table_query_cancellation_consumer_evidence.md`,
   including passing full `cargo test -p toron -- --test-threads=6` and
   `cargo test -p wendelon -- --test-threads=6` runs.
+- **ADR 061 — CTAS `IF NOT EXISTS` with Race-Safe Catalog Create Outcome.**
+  Promoted. The SQL-surface-widening pivot after the governance/cancellation
+  arc: `CREATE TABLE IF NOT EXISTS … AS SELECT …` (rejected today at
+  `sql_planner.rs:911`) is now accepted. The substance is a **race-correctness
+  cut**, not parser polish — CTAS executes the source **before** creating the
+  target, so a compatible target can race in. Fix: a catalog
+  **`CreateTableOutcome { binding, created }`** — CTAS **writes payload rows
+  only when it created the table** (`created == true`); `created == false`
+  (compatible existing or raced-in) → empty success, no write. **Bind-always**
+  (source parse/bind/type/schema errors surface even when the target exists —
+  deterministic static validation, not Postgres skip-entirely); **pre-
+  execution skip** (compatible existing target → empty success without reading
+  source rows) is the optimization, the `created` outcome the correctness
+  backstop. Exact Arrow-schema compatibility (incompatible → `SchemaMismatch`,
+  reusing schema-only `CREATE TABLE IF NOT EXISTS`); the **Wendelon-backed
+  create race** is reconciled (descriptor resolve/sync → created=false /
+  mismatch / surface-admin-error). Coordinator-owned, non-fragmentable; empty-
+  success result shape (no row count / `RETURNING`); OR-REPLACE+IF-NOT-EXISTS
+  and explicit CTAS column lists stay rejected. Final D-set: **16 decisions,
+  11 architecture + 3 convention + meta guards, 12 required fixtures.**
+  Council: **3-of-3 (Claude, Codex, Gemini)** — a productive divergence
+  (Claude `UPDATE`, Codex CTAS, Gemini audit) resolved on the verified fact
+  that **Toron-created tables are append-only / no-PK** (`catalog.rs:1443/
+  1609`), so `UPDATE`-by-PK-supersession can't serve them; Gemini conceded
+  UPDATE→CTAS at iter-4. **Prior-guard reconciliation:** `adr033` keeps the
+  CTAS column-list reject but drops the IF-NOT-EXISTS claim; `adr041` flips to
+  positive support (OR-REPLACE conflict preserved); the
+  `ctas_if_not_exists_remains_rejected` fixture is retargeted; meta-guard
+  scoped `…_except_retarget`. **Toron SQL/coordinator only; no Wendelon
+  server/wire or worker-protocol change; no new storage primitive.**
+  Placement: Exterior Substrate → Toron home. Migration:
+  `plans/impl/061_ctas_if_not_exists.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4609,7 +4641,73 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 060 promoted; ADR 061 candidates
+### ADR 061 promoted; ADR 062 candidates
+
+ADR 061 selected and promoted **CTAS `IF NOT EXISTS` with Race-Safe Catalog
+Create Outcome** — the SQL-surface-widening pivot after the long governance/
+cancellation arc. `CREATE TABLE IF NOT EXISTS … AS SELECT …` (rejected today
+at `sql_planner.rs:911`) is now accepted, with the substance being a
+**race-correctness cut**: CTAS executes the source *before* creating the
+target, so a compatible target can race in; the fix is a catalog
+**`CreateTableOutcome { binding, created }`** gating the write
+(`created == true` only). **Bind-always** diagnostics + a **pre-execution
+skip** optimization; exact-schema compatibility (incompatible →
+`SchemaMismatch`); the **Wendelon-backed create race** reconciled via
+descriptor resolve/sync. Coordinator-owned, non-fragmentable; empty-success
+result shape. Final D-set: **16 decisions, 11 architecture + 3 convention +
+meta guards, 12 required fixtures**.
+
+**Toron SQL/coordinator only; reuses existing catalog IF-NOT-EXISTS
+semantics; zero new storage primitive / SQL wire / worker protocol / Wendelon
+server or wire change.**
+
+**Key decisions / invariants:**
+
+- **Promoted 3-of-3 (Claude, Codex, Gemini)** out of a productive iter-0
+  divergence — Claude `UPDATE`, Codex CTAS, Gemini audit. Resolved on the
+  verified fact that **Toron-created tables are append-only / no-PK**
+  (`catalog.rs:1443/1609`; PK upsert is bootstrapped-PK-only), so
+  `UPDATE`-by-PK-supersession can't serve the tables users create. Gemini
+  conceded audit (iter-1) then UPDATE→CTAS (iter-4).
+- **Write-only-if-`created`** is the correctness backstop (handles the
+  local *and* Wendelon-descriptor-layer create race); the pre-execution skip
+  is an optimization, not the correctness mechanism.
+- **Bind-always:** static source errors surface even when the target exists
+  (deterministic static validation — deliberately not Postgres
+  skip-entirely); only row execution/write is skipped.
+- **Coordinator-owned, non-fragmentable** — no worker-local write-back / new
+  distributed mutation protocol.
+- **Prior-guard reconciliation:** `adr033` keeps the CTAS column-list reject
+  but drops the IF-NOT-EXISTS claim; `adr041` flips to positive support
+  (OR-REPLACE conflict preserved); the `ctas_if_not_exists_remains_rejected`
+  fixture retargeted; meta-guard scoped `…_except_retarget`.
+- `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
+  no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in `plans/impl/061_ctas_if_not_exists.md`.
+
+**ADR 062 candidates:**
+
+- **`UPDATE … WHERE`** (the lead) — behind a **table-identity-policy Phase 0**:
+  bootstrapped-PK-only (awkward — can't update the table you just created) vs
+  append-only delete-by-row-id + insert (works on Toron tables; new row
+  identity; two-op) vs add **PK create-table DDL** (lift the ADR 038
+  append-only pin — biggest, cleanest long-term). Plus lock **coordinator-
+  owned full-row rewrite vs worker-local write-back** (the current mutation
+  path is coordinator-owned, workers read-only), SET-can't-modify-PK, strip
+  storage-metadata, reject content-hash, no RETURNING/FROM/subquery-RHS/
+  transaction.
+- **Mutation `RETURNING`** — cross-cutting INSERT/UPDATE/DELETE/CTAS result-
+  shape contract; its own ADR.
+- **Audit subsystem** (045 D7) — parallel compliance track (shared
+  `observability-audit` crate, crypto-chained, fail-open, archive/syslog), not
+  the SQL lane.
+- **Typed `QUERY_CANCELLED` mapping** (ADR 060 follow-up — replace the
+  string-match), parser/front-end throttle (evidence-gated), OTLP traces,
+  descriptor-refresh hardening, JWT/OIDC/SPIFFE, gRPC/Arrow Flight/Postgres
+  frontends, prepared statements — carried.
+
+### ADR 060 promoted; ADR 061 candidates (HISTORICAL)
 
 ADR 060 selected and promoted **Wendelon Table-Query Cancellation Consumer**
 — the thin Toron consumer that closes the **059 → 073 → 060** end-to-end
