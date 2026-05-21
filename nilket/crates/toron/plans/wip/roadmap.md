@@ -4452,6 +4452,41 @@ along with the forward-sequence rewrite.
   is recorded in
   `plans/impl/058_bounded_sql_request_ingress_evidence.md`, including a
   passing full `cargo test -p toron -- --test-threads=6` run.
+- **ADR 059 — Distributed Query Cancellation Completeness.**
+  Promoted. Makes cancellation **real** for already-dispatched distributed
+  work: a query the coordinator stops waiting for (statement timeout, client
+  disconnect, SQL `Cancel`) will **abort its worker tasks** instead of
+  letting them run to natural completion and discarding the output once
+  implemented. Closes
+  the verified leak the 058 audit surfaced — today `CancelTask` is
+  **ack-only** (no worker active-task registry), statement-timeout drops the
+  coordinator future with no propagation, and SQL `Cancel` returns
+  `CancellationUnsupported`. **Spine:** a worker active-task registry keyed
+  by `TaskIdentity` that actually aborts the inline task (drop-at-await +
+  pre-publish suppression; no operator-wide token threading), plus one
+  idempotent coordinator handle keyed by `(TenantId, QueryId)` for all three
+  triggers. Remote cancel is **out-of-band over a fresh bidirectional
+  stream** using the **existing** `CancelTask`/`TaskCancelled` wire — **no**
+  new `ControlMessage`, unidirectional stream, or worker control endpoint
+  (the transport is `open_bi`-only). Bounded pending-cancel **tombstone** for
+  the `CancelTask`-before-`StartTask` race; client never blocks on remote
+  acks (detached bounded fan-out); local cleanup always runs; SQL `Cancel` is
+  tenant-scoped and **oracle-safe** (never leaks cross-tenant existence). No
+  Wendelon storage-cancellation claim (the deferred half). Final D-set: **22
+  decisions, 20 architecture guards + 3 convention guards, 19 required
+  fixtures**.
+  **Promoted 2-of-3 (Claude + Codex);** the council's strongest-aligned
+  start (3-of-3 on the spine), converging on the existing-wire design.
+  Gemini held a **`ControlMessage` / unidirectional-stream / worker-control-
+  listener / textual-`CANCEL`** redesign through iter-6 — recorded as a
+  minority *future-transport* position, not adopted: the transport exposes
+  **no `open_uni`** (it's a transport+protocol redesign for a cancel the
+  existing bidi wire already carries *with* its ack), a bare `QueryId`
+  registry is a cross-tenant oracle, and textual `CANCEL` is separate
+  SQL-surface scope.
+  **Single-plan posture; Toron-ring only; node-local.** Placement: Exterior
+  Substrate → Toron home. Migration:
+  `plans/impl/059_distributed_query_cancellation.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4536,7 +4571,69 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 058 promoted; ADR 059 candidates
+### ADR 059 promoted; ADR 060 candidates
+
+ADR 059 selected and promoted **Distributed Query Cancellation
+Completeness** — making cancellation real for already-dispatched distributed
+work (statement timeout / client disconnect / SQL `Cancel` will abort worker
+tasks under the promoted design, not just stop the coordinator waiting).
+Worker active-task registry
+(`TaskIdentity`) that aborts the inline task (drop-at-await + pre-publish
+suppression); one idempotent coordinator handle keyed by `(TenantId,
+QueryId)`; out-of-band cancel over a fresh **bidirectional** stream on the
+**existing** `CancelTask`/`TaskCancelled` wire; bounded pending-cancel
+tombstone for the early-cancel race; client-never-blocks + bounded background
+fan-out; oracle-safe SQL `Cancel`; no Wendelon storage-cancellation claim.
+Final D-set: **22 decisions, 20 architecture guards + 3 convention guards,
+19 required fixtures**.
+
+**Pure Toron-ring substrate; node-local; reuses the existing cancel wire;
+zero new SQL wire variant / protocol; zero transport-abstraction change.**
+
+**Key decisions / invariants:**
+
+- **Promoted 2-of-3 (Claude + Codex)** on the existing-wire design (the
+  council's strongest-aligned start — 3-of-3 on the spine). Gemini held a
+  **`ControlMessage` / unidirectional-stream / worker-control-listener /
+  textual-`CANCEL`** redesign through iter-6; recorded as a minority
+  *future-transport* position, not adopted — the transport is `open_bi`-only
+  (no `open_uni`), the existing bidi wire already carries the cancel + ack, a
+  bare `QueryId` registry is a cross-tenant oracle, and textual `CANCEL` is
+  separate SQL-surface scope.
+- **Spine = worker active-task abort:** today `CancelTask` is ack-only with
+  no registry; 059 adds the registry + drop-at-await abort + pre-publish
+  suppression (no operator-wide token threading).
+- **Early-cancel race** (`CancelTask` before `StartTask`, flagged 3-of-3):
+  register-before-`TaskStarted` + a **bounded** pending-cancel tombstone
+  (consumed on `StartTask`, TTL-evicted — no new unbounded map).
+- **Client never blocks on remote acks;** fan-out is detached *bounded*
+  background cleanup; local cleanup always runs even when remote fan-out
+  fails. No pre-admission cancel (055–058 reject before dispatch).
+- **Honest Wendelon boundary:** dropping a Toron future stops Toron work;
+  already-issued Wendelon storage work is the deferred half (an ADR 060
+  candidate).
+- `crates/nilket` runtime-free; `toron_fixture_worker.rs` unchanged;
+  brand-clean / no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in
+`plans/impl/059_distributed_query_cancellation.md`.
+
+**ADR 060 candidates:**
+
+- **Wendelon storage-request cancellation** — the deferred half of 059's
+  honesty boundary: a Wendelon-side primitive to cancel already-issued
+  storage work, so a cancelled Toron query also stops its downstream
+  Wendelon reads. Cross-ring; needs a Wendelon producer ADR first.
+- **Audit subsystem** (045 D7) — shared `observability-audit` crate,
+  crypto-chained, fail-open, archive/syslog; its own compliance sequence.
+- **Parser/front-end rate throttle** (evidence-gated; 058 byte caps came
+  first), **pre-TLS/IP throttle** (deferred; 057 Tier 1 covers it),
+  **descriptor-refresh hardening**, **OTLP traces export**, **SQL surface
+  widening** (`UPDATE WHERE`, `… RETURNING`, CTAS `IF NOT EXISTS`),
+  **JWT/OIDC/SPIFFE tenant claims**, gRPC / Arrow Flight / Postgres
+  frontends, prepared statements — all carried forward.
+
+### ADR 058 promoted; ADR 059 candidates (HISTORICAL)
 
 ADR 058 selected and promoted **Bounded SQL Request Ingress** — an acute,
 in-hand frontend safety defect (`read_frame` allocates from an untrusted
