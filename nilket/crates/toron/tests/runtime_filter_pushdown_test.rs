@@ -489,6 +489,7 @@ fn scan_request(
 		profile_hint: Some(QueryProfileHint::Scan),
 		trace_context: None,
 		morsel: None,
+		downstream_cancellation: None,
 	}
 }
 

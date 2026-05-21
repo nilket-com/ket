@@ -4520,7 +4520,11 @@ along with the forward-sequence rewrite.
   **This retires 059's no-Wendelon-storage-cancellation caveat.**
   **Toron-ring consumer; node-local; no new wire / Control-Ring / transport.**
   Placement: Exterior Substrate → Toron home. Migration:
-  `plans/impl/060_wendelon_table_query_cancellation_consumer.md`.
+  `plans/impl/060_wendelon_table_query_cancellation_consumer.md`;
+  implementation evidence is recorded in
+  `plans/impl/060_wendelon_table_query_cancellation_consumer_evidence.md`,
+  including passing full `cargo test -p toron -- --test-threads=6` and
+  `cargo test -p wendelon -- --test-threads=6` runs.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical

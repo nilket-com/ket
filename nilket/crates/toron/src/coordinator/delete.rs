@@ -150,6 +150,7 @@ mod tests {
 				profile_hint: None,
 				trace_context: None,
 				morsel: None,
+				downstream_cancellation: None,
 			},
 		)
 		.await

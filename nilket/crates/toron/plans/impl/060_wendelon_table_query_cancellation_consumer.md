@@ -148,17 +148,17 @@ owned downstream-attempt registry + the Wendelon-client attempt hook
 
 ## Acceptance checklist
 
-- [ ] Phase 1: facade attempt-hook (lower-loop impl, before write, returns
+- [x] Phase 1: facade attempt-hook (lower-loop impl, before write, returns
       RAII guard) + facade cancel helper; ordinary APIs unchanged.
-- [ ] Phase 2: `DownstreamAttemptRegistry` + RAII `AttemptGuard` + bounded
+- [x] Phase 2: `DownstreamAttemptRegistry` + RAII `AttemptGuard` + bounded
       detached idempotent fan-out + identity-free outcomes.
-- [ ] Phase 3: attached to `ActiveQueryHandle`; cancel snapshots downstream +
+- [x] Phase 3: attached to `ActiveQueryHandle`; cancel snapshots downstream +
       remote-task without blocking.
-- [ ] Phase 4: beside the worker active-task signal; fires on `CancelTask`
+- [x] Phase 4: beside the worker active-task signal; fires on `CancelTask`
       before drop-at-await.
-- [ ] Phase 5: optional context on `ExecutionContext`/`ScanRequest`; in-memory
+- [x] Phase 5: optional context on `ExecutionContext`/`ScanRequest`; in-memory
       ignores; scan registers via hook + checks already-cancelled.
-- [ ] Phase 6: `QUERY_CANCELLED`→`Cancelled`; separate identity-free counter.
-- [ ] Phase 7-8: 20+3+meta guards, 059-guard retarget, 14 fixtures, evidence
+- [x] Phase 6: `QUERY_CANCELLED`→`Cancelled`; separate identity-free counter.
+- [x] Phase 7-8: 20+3+meta guards, 059-guard retarget, 14 fixtures, evidence
       + roadmap; end-to-end closure; no generate-in-scan / scan-watcher /
       new-wire / Toron-identity drift.

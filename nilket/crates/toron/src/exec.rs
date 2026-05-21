@@ -2,6 +2,7 @@
 use crate::aggregate_kernel;
 use crate::coordinator::materialize_scan_stream;
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
+use crate::distributed::cancellation::DownstreamCancellationContext;
 use crate::distributed::task::TaskTelemetry;
 use crate::error::ExecutionError;
 #[cfg(test)]
@@ -92,6 +93,7 @@ pub struct ExecutionContext {
 	pub task_budget: TaskBudget,
 	pub task_telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
 	pub runtime_filter: Option<RuntimeFilterDescriptor>,
+	pub downstream_cancellation: Option<DownstreamCancellationContext>,
 	join_spill_file_ops: Arc<dyn AsyncFileOps>,
 	join_spill_dir: PathBuf,
 }
@@ -108,6 +110,10 @@ impl fmt::Debug for ExecutionContext {
 			.field("legacy_table_pins", &self.legacy_table_pins)
 			.field("task_budget", &self.task_budget)
 			.field("runtime_filter", &self.runtime_filter)
+			.field(
+				"downstream_cancellation",
+				&self.downstream_cancellation.is_some(),
+			)
 			.field("join_spill_dir", &self.join_spill_dir)
 			.finish_non_exhaustive()
 	}
@@ -131,6 +137,7 @@ impl ExecutionContext {
 			task_budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			task_telemetry: None,
 			runtime_filter: None,
+			downstream_cancellation: None,
 			join_spill_file_ops: Arc::new(BlockingFileOps),
 			join_spill_dir: std::env::temp_dir().join("toron_join_spill"),
 		}
@@ -148,6 +155,14 @@ impl ExecutionContext {
 
 	pub fn with_runtime_filter(mut self, runtime_filter: Option<RuntimeFilterDescriptor>) -> Self {
 		self.runtime_filter = runtime_filter;
+		self
+	}
+
+	pub fn with_downstream_cancellation(
+		mut self,
+		downstream_cancellation: Option<DownstreamCancellationContext>,
+	) -> Self {
+		self.downstream_cancellation = downstream_cancellation;
 		self
 	}
 
@@ -258,6 +273,7 @@ impl Executor {
 						profile_hint: self.context.profile_hint,
 						trace_context: self.context.trace_context,
 						morsel,
+						downstream_cancellation: self.context.downstream_cancellation.clone(),
 					};
 					let stream = self.storage.scan(req).await?;
 					Ok(materialize_scan_stream(stream).await?)
@@ -645,6 +661,7 @@ impl Executor {
 						profile_hint: Some(*profile_hint),
 						trace_context: self.context.trace_context,
 						morsel,
+						downstream_cancellation: self.context.downstream_cancellation.clone(),
 					};
 					let stream = self.storage.scan(req).await?;
 					Ok(materialize_scan_stream(stream).await?)

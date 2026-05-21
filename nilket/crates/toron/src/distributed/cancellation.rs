@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -6,10 +7,16 @@ use std::time::{Duration, Instant};
 use crate::distributed::identity::{QueryId, TaskIdentity};
 use crate::distributed::worker_registry::WorkerEntry;
 use crate::storage::TenantId;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+use wendelon::schema::{
+	NodeId, TableQueryCancelResponseMeta, TableQueryCancelStatus, TableQueryRequestId,
+	TenantId as WendelonTenantId,
+};
 
 const MAX_PENDING_TASK_CANCELLATIONS: usize = 1024;
 const PENDING_TASK_CANCELLATION_TTL: Duration = Duration::from_secs(60);
+pub(crate) const DOWNSTREAM_CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_DOWNSTREAM_CANCEL_FANOUTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CancellationTrigger {
@@ -84,6 +91,395 @@ impl CancellationMetrics {
 			CancellationTrigger::StatementTimeout => &self.statement_timeout,
 			CancellationTrigger::ClientDisconnect => &self.client_disconnect,
 			CancellationTrigger::SqlCancel => &self.sql_cancel,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DownstreamCancellationTrigger {
+	StatementTimeout,
+	ClientDisconnect,
+	SqlCancel,
+	WorkerCancelTask,
+}
+
+impl DownstreamCancellationTrigger {
+	pub const ALL: [Self; 4] = [
+		Self::StatementTimeout,
+		Self::ClientDisconnect,
+		Self::SqlCancel,
+		Self::WorkerCancelTask,
+	];
+
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::StatementTimeout => "statement_timeout",
+			Self::ClientDisconnect => "client_disconnect",
+			Self::SqlCancel => "sql_cancel",
+			Self::WorkerCancelTask => "worker_cancel_task",
+		}
+	}
+}
+
+impl From<CancellationTrigger> for DownstreamCancellationTrigger {
+	fn from(trigger: CancellationTrigger) -> Self {
+		match trigger {
+			CancellationTrigger::StatementTimeout => Self::StatementTimeout,
+			CancellationTrigger::ClientDisconnect => Self::ClientDisconnect,
+			CancellationTrigger::SqlCancel => Self::SqlCancel,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DownstreamCancellationOutcome {
+	Accepted,
+	AlreadyTerminal,
+	RemoteTimeout,
+	RemoteError,
+}
+
+impl DownstreamCancellationOutcome {
+	pub const ALL: [Self; 4] = [
+		Self::Accepted,
+		Self::AlreadyTerminal,
+		Self::RemoteTimeout,
+		Self::RemoteError,
+	];
+
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Accepted => "accepted",
+			Self::AlreadyTerminal => "already_terminal",
+			Self::RemoteTimeout => "remote_timeout",
+			Self::RemoteError => "remote_error",
+		}
+	}
+}
+
+#[derive(Debug, Default)]
+pub struct DownstreamCancellationMetrics {
+	statement_timeout: DownstreamCancellationOutcomeCounters,
+	client_disconnect: DownstreamCancellationOutcomeCounters,
+	sql_cancel: DownstreamCancellationOutcomeCounters,
+	worker_cancel_task: DownstreamCancellationOutcomeCounters,
+}
+
+impl DownstreamCancellationMetrics {
+	pub fn record(
+		&self,
+		trigger: DownstreamCancellationTrigger,
+		outcome: DownstreamCancellationOutcome,
+	) {
+		self.counters(trigger).increment(outcome);
+	}
+
+	pub fn get(
+		&self,
+		trigger: DownstreamCancellationTrigger,
+		outcome: DownstreamCancellationOutcome,
+	) -> u64 {
+		self.counters(trigger).get(outcome)
+	}
+
+	fn counters(
+		&self,
+		trigger: DownstreamCancellationTrigger,
+	) -> &DownstreamCancellationOutcomeCounters {
+		match trigger {
+			DownstreamCancellationTrigger::StatementTimeout => &self.statement_timeout,
+			DownstreamCancellationTrigger::ClientDisconnect => &self.client_disconnect,
+			DownstreamCancellationTrigger::SqlCancel => &self.sql_cancel,
+			DownstreamCancellationTrigger::WorkerCancelTask => &self.worker_cancel_task,
+		}
+	}
+}
+
+#[derive(Debug, Default)]
+struct DownstreamCancellationOutcomeCounters {
+	accepted: AtomicU64,
+	already_terminal: AtomicU64,
+	remote_timeout: AtomicU64,
+	remote_error: AtomicU64,
+}
+
+impl DownstreamCancellationOutcomeCounters {
+	fn increment(&self, outcome: DownstreamCancellationOutcome) {
+		self.counter(outcome).fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn get(&self, outcome: DownstreamCancellationOutcome) -> u64 {
+		self.counter(outcome).load(Ordering::Relaxed)
+	}
+
+	fn counter(&self, outcome: DownstreamCancellationOutcome) -> &AtomicU64 {
+		match outcome {
+			DownstreamCancellationOutcome::Accepted => &self.accepted,
+			DownstreamCancellationOutcome::AlreadyTerminal => &self.already_terminal,
+			DownstreamCancellationOutcome::RemoteTimeout => &self.remote_timeout,
+			DownstreamCancellationOutcome::RemoteError => &self.remote_error,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WendelonTableQueryAttempt {
+	pub target: NodeId,
+	pub tenant_id: WendelonTenantId,
+	pub request_id: TableQueryRequestId,
+}
+
+#[async_trait::async_trait]
+pub trait WendelonTableQueryCancelSender: Send + Sync {
+	async fn cancel_table_query_attempt(
+		&self,
+		target: NodeId,
+		tenant_id: WendelonTenantId,
+		request_id: TableQueryRequestId,
+	) -> Result<TableQueryCancelResponseMeta, wendelon_client::ClientError>;
+}
+
+#[async_trait::async_trait]
+impl WendelonTableQueryCancelSender for wendelon_client::Client {
+	async fn cancel_table_query_attempt(
+		&self,
+		target: NodeId,
+		tenant_id: WendelonTenantId,
+		request_id: TableQueryRequestId,
+	) -> Result<TableQueryCancelResponseMeta, wendelon_client::ClientError> {
+		self.cancel_table_query_attempt(target, tenant_id, request_id)
+			.await
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownstreamRegistrationError {
+	AlreadyCancelled,
+}
+
+impl fmt::Display for DownstreamRegistrationError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::AlreadyCancelled => {
+				f.write_str("downstream table-query attempt already cancelled")
+			}
+		}
+	}
+}
+
+impl std::error::Error for DownstreamRegistrationError {}
+
+#[derive(Clone)]
+pub struct DownstreamCancellationContext {
+	registry: DownstreamAttemptRegistry,
+}
+
+impl DownstreamCancellationContext {
+	pub fn is_cancelled(&self) -> bool {
+		self.registry.is_cancelled()
+	}
+
+	pub fn register_wendelon_table_query_attempt(
+		&self,
+		sender: Arc<dyn WendelonTableQueryCancelSender>,
+		attempt: WendelonTableQueryAttempt,
+	) -> Result<DownstreamAttemptGuard, DownstreamRegistrationError> {
+		self.registry.register_table_query_attempt(sender, attempt)
+	}
+}
+
+impl fmt::Debug for DownstreamCancellationContext {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("DownstreamCancellationContext")
+			.field("cancelled", &self.is_cancelled())
+			.finish_non_exhaustive()
+	}
+}
+
+#[derive(Clone)]
+pub struct DownstreamAttemptRegistry {
+	inner: Arc<Mutex<DownstreamAttemptRegistryInner>>,
+	fanout_permits: Arc<Semaphore>,
+	metrics: Option<Arc<DownstreamCancellationMetrics>>,
+}
+
+#[derive(Default)]
+struct DownstreamAttemptRegistryInner {
+	cancelled: bool,
+	next_registration_id: u64,
+	attempts: HashMap<u64, RegisteredDownstreamAttempt>,
+}
+
+#[derive(Clone)]
+struct RegisteredDownstreamAttempt {
+	sender: Arc<dyn WendelonTableQueryCancelSender>,
+	attempt: WendelonTableQueryAttempt,
+}
+
+pub struct DownstreamAttemptGuard {
+	registry: Weak<Mutex<DownstreamAttemptRegistryInner>>,
+	registration_id: u64,
+}
+
+impl DownstreamAttemptRegistry {
+	pub fn new(
+		fanout_permits: Arc<Semaphore>,
+		metrics: Option<Arc<DownstreamCancellationMetrics>>,
+	) -> Self {
+		Self {
+			inner: Arc::new(Mutex::new(DownstreamAttemptRegistryInner::default())),
+			fanout_permits,
+			metrics,
+		}
+	}
+
+	pub fn with_default_limits(metrics: Option<Arc<DownstreamCancellationMetrics>>) -> Self {
+		Self::new(
+			Arc::new(Semaphore::new(MAX_DOWNSTREAM_CANCEL_FANOUTS)),
+			metrics,
+		)
+	}
+
+	pub fn context(&self) -> DownstreamCancellationContext {
+		DownstreamCancellationContext {
+			registry: self.clone(),
+		}
+	}
+
+	pub fn is_cancelled(&self) -> bool {
+		self.inner
+			.lock()
+			.expect("downstream attempt registry poisoned")
+			.cancelled
+	}
+
+	pub fn active_len(&self) -> usize {
+		self.inner
+			.lock()
+			.expect("downstream attempt registry poisoned")
+			.attempts
+			.len()
+	}
+
+	pub fn register_table_query_attempt(
+		&self,
+		sender: Arc<dyn WendelonTableQueryCancelSender>,
+		attempt: WendelonTableQueryAttempt,
+	) -> Result<DownstreamAttemptGuard, DownstreamRegistrationError> {
+		let mut inner = self
+			.inner
+			.lock()
+			.expect("downstream attempt registry poisoned");
+		if inner.cancelled {
+			return Err(DownstreamRegistrationError::AlreadyCancelled);
+		}
+		let registration_id = inner.next_registration_id;
+		inner.next_registration_id = inner.next_registration_id.wrapping_add(1);
+		inner.attempts.insert(
+			registration_id,
+			RegisteredDownstreamAttempt { sender, attempt },
+		);
+		Ok(DownstreamAttemptGuard {
+			registry: Arc::downgrade(&self.inner),
+			registration_id,
+		})
+	}
+
+	pub fn cancel_registered_attempts(&self, trigger: DownstreamCancellationTrigger) {
+		let attempts = {
+			let mut inner = self
+				.inner
+				.lock()
+				.expect("downstream attempt registry poisoned");
+			if inner.cancelled {
+				return;
+			}
+			inner.cancelled = true;
+			inner.attempts.values().cloned().collect::<Vec<_>>()
+		};
+		if attempts.is_empty() {
+			return;
+		}
+		let Ok(permit) = self.fanout_permits.clone().try_acquire_owned() else {
+			if let Some(metrics) = &self.metrics {
+				for _ in &attempts {
+					metrics.record(trigger, DownstreamCancellationOutcome::RemoteError);
+				}
+			}
+			tracing::warn!("downstream Wendelon table-query cancel fan-out limit exhausted");
+			return;
+		};
+		let metrics = self.metrics.clone();
+		tokio::spawn(async move {
+			let _permit = permit;
+			for registered in attempts {
+				let result = tokio::time::timeout(
+					DOWNSTREAM_CANCEL_ACK_TIMEOUT,
+					registered.sender.cancel_table_query_attempt(
+						registered.attempt.target,
+						registered.attempt.tenant_id,
+						registered.attempt.request_id,
+					),
+				)
+				.await;
+				let outcome = match result {
+					Ok(Ok(response)) if response.status == TableQueryCancelStatus::ACCEPTED => {
+						DownstreamCancellationOutcome::Accepted
+					}
+					Ok(Ok(response)) if response.status == TableQueryCancelStatus::TERMINAL => {
+						DownstreamCancellationOutcome::AlreadyTerminal
+					}
+					Ok(Ok(response)) => {
+						tracing::warn!(
+							status = response.status.0,
+							"downstream Wendelon table-query cancel returned unknown status"
+						);
+						DownstreamCancellationOutcome::RemoteError
+					}
+					Ok(Err(error)) => {
+						tracing::warn!(
+							error = %error,
+							"downstream Wendelon table-query cancel failed"
+						);
+						DownstreamCancellationOutcome::RemoteError
+					}
+					Err(_) => {
+						tracing::warn!("downstream Wendelon table-query cancel timed out");
+						DownstreamCancellationOutcome::RemoteTimeout
+					}
+				};
+				if let Some(metrics) = &metrics {
+					metrics.record(trigger, outcome);
+				}
+			}
+		});
+	}
+}
+
+impl fmt::Debug for DownstreamAttemptRegistry {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("DownstreamAttemptRegistry")
+			.field("cancelled", &self.is_cancelled())
+			.field("active_len", &self.active_len())
+			.finish_non_exhaustive()
+	}
+}
+
+impl fmt::Debug for DownstreamAttemptGuard {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("DownstreamAttemptGuard")
+			.field("registration_id", &self.registration_id)
+			.finish_non_exhaustive()
+	}
+}
+
+impl Drop for DownstreamAttemptGuard {
+	fn drop(&mut self) {
+		let Some(registry) = self.registry.upgrade() else {
+			return;
+		};
+		if let Ok(mut inner) = registry.lock() {
+			inner.attempts.remove(&self.registration_id);
 		}
 	}
 }
@@ -170,18 +566,27 @@ impl Default for TaskCancellationSignal {
 #[derive(Debug, Clone)]
 pub struct ActiveTaskRegistry {
 	inner: Arc<Mutex<ActiveTaskRegistryInner>>,
+	downstream_fanout_permits: Arc<Semaphore>,
+	downstream_metrics: Option<Arc<DownstreamCancellationMetrics>>,
 }
 
 #[derive(Debug, Default)]
 struct ActiveTaskRegistryInner {
-	active: HashMap<TaskIdentity, TaskCancellationSignal>,
+	active: HashMap<TaskIdentity, ActiveTaskState>,
 	pending: HashMap<TaskIdentity, Instant>,
 	pending_order: VecDeque<TaskIdentity>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTaskState {
+	signal: TaskCancellationSignal,
+	downstream: DownstreamAttemptRegistry,
 }
 
 #[derive(Debug)]
 pub struct ActiveTaskRegistration {
 	pub signal: TaskCancellationSignal,
+	pub downstream: DownstreamAttemptRegistry,
 	pub guard: ActiveTaskGuard,
 	pub cancelled_before_start: bool,
 }
@@ -196,20 +601,43 @@ impl ActiveTaskRegistry {
 	pub fn new() -> Self {
 		Self {
 			inner: Arc::new(Mutex::new(ActiveTaskRegistryInner::default())),
+			downstream_fanout_permits: Arc::new(Semaphore::new(MAX_DOWNSTREAM_CANCEL_FANOUTS)),
+			downstream_metrics: None,
+		}
+	}
+
+	pub fn with_downstream_cancellation_metrics(
+		metrics: Option<Arc<DownstreamCancellationMetrics>>,
+	) -> Self {
+		Self {
+			inner: Arc::new(Mutex::new(ActiveTaskRegistryInner::default())),
+			downstream_fanout_permits: Arc::new(Semaphore::new(MAX_DOWNSTREAM_CANCEL_FANOUTS)),
+			downstream_metrics: metrics,
 		}
 	}
 
 	pub fn register(&self, identity: TaskIdentity) -> ActiveTaskRegistration {
 		let signal = TaskCancellationSignal::new();
+		let downstream = DownstreamAttemptRegistry::new(
+			self.downstream_fanout_permits.clone(),
+			self.downstream_metrics.clone(),
+		);
 		let mut inner = self.inner.lock().expect("active task registry poisoned");
 		inner.prune_pending(Instant::now());
 		let cancelled_before_start = inner.pending.remove(&identity).is_some();
 		if cancelled_before_start {
 			signal.cancel();
 		}
-		inner.active.insert(identity, signal.clone());
+		inner.active.insert(
+			identity,
+			ActiveTaskState {
+				signal: signal.clone(),
+				downstream: downstream.clone(),
+			},
+		);
 		ActiveTaskRegistration {
 			signal,
+			downstream,
 			guard: ActiveTaskGuard {
 				registry: Arc::downgrade(&self.inner),
 				identity,
@@ -221,8 +649,11 @@ impl ActiveTaskRegistry {
 	pub fn cancel(&self, identity: TaskIdentity) -> bool {
 		let mut inner = self.inner.lock().expect("active task registry poisoned");
 		inner.prune_pending(Instant::now());
-		if let Some(signal) = inner.active.get(&identity) {
-			signal.cancel();
+		if let Some(state) = inner.active.get(&identity) {
+			state
+				.downstream
+				.cancel_registered_attempts(DownstreamCancellationTrigger::WorkerCancelTask);
+			state.signal.cancel();
 			return true;
 		}
 		inner.insert_pending(identity);
@@ -324,6 +755,7 @@ struct ActiveQueryState {
 	cancelled: AtomicBool,
 	notify: Notify,
 	remote_tasks: Mutex<Vec<RemoteTaskCancellation>>,
+	downstream: DownstreamAttemptRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -353,8 +785,21 @@ impl ActiveQueryRegistry {
 	}
 
 	pub fn register(&self, tenant_id: TenantId, query_id: QueryId) -> ActiveQueryGuard {
+		self.register_with_downstream(
+			tenant_id,
+			query_id,
+			DownstreamAttemptRegistry::with_default_limits(None),
+		)
+	}
+
+	pub fn register_with_downstream(
+		&self,
+		tenant_id: TenantId,
+		query_id: QueryId,
+		downstream: DownstreamAttemptRegistry,
+	) -> ActiveQueryGuard {
 		let key = ActiveQueryKey::new(tenant_id, query_id);
-		let handle = ActiveQueryHandle::new(key);
+		let handle = ActiveQueryHandle::new(key, downstream);
 		let mut inner = self.inner.lock().expect("active query registry poisoned");
 		inner.insert(key, handle.clone());
 		ActiveQueryGuard {
@@ -384,7 +829,7 @@ impl ActiveQueryRegistry {
 				remote_tasks: Vec::new(),
 			};
 		};
-		let (first_request, remote_tasks) = handle.cancel();
+		let (first_request, remote_tasks) = handle.cancel(_trigger);
 		QueryCancellation {
 			was_active: true,
 			first_request,
@@ -429,13 +874,14 @@ impl Drop for ActiveQueryGuard {
 }
 
 impl ActiveQueryHandle {
-	fn new(key: ActiveQueryKey) -> Self {
+	fn new(key: ActiveQueryKey, downstream: DownstreamAttemptRegistry) -> Self {
 		Self {
 			inner: Arc::new(ActiveQueryState {
 				key,
 				cancelled: AtomicBool::new(false),
 				notify: Notify::new(),
 				remote_tasks: Mutex::new(Vec::new()),
+				downstream,
 			}),
 		}
 	}
@@ -460,10 +906,17 @@ impl ActiveQueryHandle {
 		}
 	}
 
-	pub fn cancel(&self) -> (bool, Vec<RemoteTaskCancellation>) {
+	pub fn downstream_cancellation_context(&self) -> DownstreamCancellationContext {
+		self.inner.downstream.context()
+	}
+
+	pub fn cancel(&self, trigger: CancellationTrigger) -> (bool, Vec<RemoteTaskCancellation>) {
 		let first_request = !self.inner.cancelled.swap(true, Ordering::SeqCst);
 		if first_request {
 			self.inner.notify.notify_waiters();
+			self.inner
+				.downstream
+				.cancel_registered_attempts(trigger.into());
 		}
 		let remote_tasks = self
 			.inner
@@ -574,11 +1027,314 @@ mod tests {
 		let registry = ActiveQueryRegistry::new();
 		let guard = registry.register(TenantId(7), QueryId::from_u128(10));
 		let handle = guard.handle();
-		handle.cancel();
+		handle.cancel(CancellationTrigger::SqlCancel);
 
 		tokio::time::timeout(Duration::from_millis(50), handle.cancelled())
 			.await
 			.expect("pre-cancelled query handle must not park");
+	}
+
+	#[tokio::test]
+	async fn statement_timeout_cancels_dispatched_wendelon_table_query_attempt() {
+		let metrics = Arc::new(DownstreamCancellationMetrics::default());
+		let registry = DownstreamAttemptRegistry::with_default_limits(Some(metrics.clone()));
+		let sender = Arc::new(FakeWendelonCancelSender::new(
+			TableQueryCancelStatus::ACCEPTED,
+		));
+		let sender_dyn: Arc<dyn WendelonTableQueryCancelSender> = sender.clone();
+		let attempt = table_query_attempt(11);
+		let _guard = registry
+			.register_table_query_attempt(sender_dyn, attempt)
+			.expect("register attempt");
+
+		registry.cancel_registered_attempts(DownstreamCancellationTrigger::StatementTimeout);
+		sender.wait_for_calls(1).await;
+
+		assert_eq!(sender.calls(), vec![attempt]);
+		assert_eq!(
+			metrics.get(
+				DownstreamCancellationTrigger::StatementTimeout,
+				DownstreamCancellationOutcome::Accepted
+			),
+			1
+		);
+	}
+
+	#[tokio::test]
+	async fn sql_cancel_cancels_same_tenant_wendelon_table_query_attempt() {
+		let metrics = Arc::new(DownstreamCancellationMetrics::default());
+		let downstream = DownstreamAttemptRegistry::with_default_limits(Some(metrics));
+		let registry = ActiveQueryRegistry::new();
+		let guard =
+			registry.register_with_downstream(TenantId(7), QueryId::from_u128(70), downstream);
+		let handle = guard.handle();
+		let sender = Arc::new(FakeWendelonCancelSender::new(
+			TableQueryCancelStatus::ACCEPTED,
+		));
+		let sender_dyn: Arc<dyn WendelonTableQueryCancelSender> = sender.clone();
+		let attempt = table_query_attempt(70);
+		let _attempt_guard = handle
+			.downstream_cancellation_context()
+			.register_wendelon_table_query_attempt(sender_dyn, attempt)
+			.expect("register downstream attempt");
+
+		let wrong_tenant = registry.cancel(
+			TenantId(8),
+			QueryId::from_u128(70),
+			CancellationTrigger::SqlCancel,
+		);
+		assert!(!wrong_tenant.was_active);
+		let cancellation = registry.cancel(
+			TenantId(7),
+			QueryId::from_u128(70),
+			CancellationTrigger::SqlCancel,
+		);
+		assert!(cancellation.was_active);
+		assert!(cancellation.first_request);
+		sender.wait_for_calls(1).await;
+
+		assert_eq!(sender.calls(), vec![attempt]);
+	}
+
+	#[tokio::test]
+	async fn worker_cancel_task_cancels_inflight_wendelon_table_query_before_future_drop() {
+		let metrics = Arc::new(DownstreamCancellationMetrics::default());
+		let registry = ActiveTaskRegistry::with_downstream_cancellation_metrics(Some(metrics));
+		let registration = registry.register(identity(77));
+		let sender = Arc::new(FakeWendelonCancelSender::new(
+			TableQueryCancelStatus::ACCEPTED,
+		));
+		let sender_dyn: Arc<dyn WendelonTableQueryCancelSender> = sender.clone();
+		let attempt = table_query_attempt(77);
+		let _attempt_guard = registration
+			.downstream
+			.context()
+			.register_wendelon_table_query_attempt(sender_dyn, attempt)
+			.expect("register downstream attempt");
+
+		assert!(registry.cancel(identity(77)));
+		assert!(registration.signal.is_cancelled());
+		sender.wait_for_calls(1).await;
+		assert_eq!(sender.calls(), vec![attempt]);
+	}
+
+	#[test]
+	fn cancel_before_wendelon_scan_start_sends_no_table_query_req() {
+		let registry = DownstreamAttemptRegistry::with_default_limits(None);
+		registry.cancel_registered_attempts(DownstreamCancellationTrigger::SqlCancel);
+		let sender = Arc::new(FakeWendelonCancelSender::new(
+			TableQueryCancelStatus::ACCEPTED,
+		));
+		let sender_dyn: Arc<dyn WendelonTableQueryCancelSender> = sender;
+
+		let error = registry
+			.context()
+			.register_wendelon_table_query_attempt(sender_dyn, table_query_attempt(1))
+			.expect_err("cancelled context rejects registration");
+
+		assert_eq!(error, DownstreamRegistrationError::AlreadyCancelled);
+		assert_eq!(registry.active_len(), 0);
+	}
+
+	#[tokio::test]
+	async fn wendelon_redirect_retry_replaces_attempt_registration() {
+		let registry = DownstreamAttemptRegistry::with_default_limits(None);
+		let sender = Arc::new(FakeWendelonCancelSender::new(
+			TableQueryCancelStatus::ACCEPTED,
+		));
+		let sender_dyn: Arc<dyn WendelonTableQueryCancelSender> = sender.clone();
+		let first = table_query_attempt(1);
+		let second = table_query_attempt(2);
+		let first_guard = registry
+			.register_table_query_attempt(sender_dyn.clone(), first)
+			.expect("register first attempt");
+		drop(first_guard);
+		let _second_guard = registry
+			.register_table_query_attempt(sender_dyn, second)
+			.expect("register replacement attempt");
+
+		registry.cancel_registered_attempts(DownstreamCancellationTrigger::StatementTimeout);
+		sender.wait_for_calls(1).await;
+
+		assert_eq!(sender.calls(), vec![second]);
+	}
+
+	#[test]
+	fn downstream_attempt_raii_removes_on_success_error_redirect_and_drop() {
+		let registry = DownstreamAttemptRegistry::with_default_limits(None);
+		let sender = Arc::new(FakeWendelonCancelSender::new(
+			TableQueryCancelStatus::ACCEPTED,
+		));
+		let sender_dyn: Arc<dyn WendelonTableQueryCancelSender> = sender;
+
+		let success_guard = registry
+			.register_table_query_attempt(sender_dyn.clone(), table_query_attempt(1))
+			.expect("register success attempt");
+		let error_guard = registry
+			.register_table_query_attempt(sender_dyn.clone(), table_query_attempt(2))
+			.expect("register error attempt");
+		let redirect_guard = registry
+			.register_table_query_attempt(sender_dyn, table_query_attempt(3))
+			.expect("register redirect attempt");
+		assert_eq!(registry.active_len(), 3);
+
+		drop(success_guard);
+		drop(error_guard);
+		drop(redirect_guard);
+
+		assert_eq!(registry.active_len(), 0);
+	}
+
+	#[tokio::test]
+	async fn downstream_cancel_racing_completion_is_terminal_or_ack_without_error() {
+		let metrics = Arc::new(DownstreamCancellationMetrics::default());
+		let registry = DownstreamAttemptRegistry::with_default_limits(Some(metrics.clone()));
+		let sender = Arc::new(FakeWendelonCancelSender::new(
+			TableQueryCancelStatus::TERMINAL,
+		));
+		let sender_dyn: Arc<dyn WendelonTableQueryCancelSender> = sender.clone();
+		let _guard = registry
+			.register_table_query_attempt(sender_dyn, table_query_attempt(99))
+			.expect("register attempt");
+
+		registry.cancel_registered_attempts(DownstreamCancellationTrigger::ClientDisconnect);
+		sender.wait_for_calls(1).await;
+
+		assert_eq!(
+			metrics.get(
+				DownstreamCancellationTrigger::ClientDisconnect,
+				DownstreamCancellationOutcome::AlreadyTerminal
+			),
+			1
+		);
+	}
+
+	#[tokio::test]
+	async fn downstream_cancel_fanout_timeout_does_not_delay_sql_cancel_response() {
+		let metrics = Arc::new(DownstreamCancellationMetrics::default());
+		let registry = DownstreamAttemptRegistry::with_default_limits(Some(metrics.clone()));
+		let sender = Arc::new(
+			FakeWendelonCancelSender::new(TableQueryCancelStatus::ACCEPTED).with_hung_ack(),
+		);
+		let sender_dyn: Arc<dyn WendelonTableQueryCancelSender> = sender;
+		let _guard = registry
+			.register_table_query_attempt(sender_dyn, table_query_attempt(101))
+			.expect("register attempt");
+		let started = Instant::now();
+
+		registry.cancel_registered_attempts(DownstreamCancellationTrigger::SqlCancel);
+
+		assert!(started.elapsed() < Duration::from_millis(20));
+		wait_for_downstream_metric(
+			&metrics,
+			DownstreamCancellationTrigger::SqlCancel,
+			DownstreamCancellationOutcome::RemoteTimeout,
+			1,
+		)
+		.await;
+		assert_eq!(
+			metrics.get(
+				DownstreamCancellationTrigger::SqlCancel,
+				DownstreamCancellationOutcome::RemoteTimeout
+			),
+			1
+		);
+	}
+
+	struct FakeWendelonCancelSender {
+		status: TableQueryCancelStatus,
+		hang_ack: bool,
+		calls: Mutex<Vec<WendelonTableQueryAttempt>>,
+		notify: Notify,
+	}
+
+	impl FakeWendelonCancelSender {
+		fn new(status: TableQueryCancelStatus) -> Self {
+			Self {
+				status,
+				hang_ack: false,
+				calls: Mutex::new(Vec::new()),
+				notify: Notify::new(),
+			}
+		}
+
+		fn with_hung_ack(mut self) -> Self {
+			self.hang_ack = true;
+			self
+		}
+
+		fn calls(&self) -> Vec<WendelonTableQueryAttempt> {
+			self.calls.lock().expect("calls poisoned").clone()
+		}
+
+		async fn wait_for_calls(&self, expected: usize) {
+			tokio::time::timeout(Duration::from_secs(1), async {
+				loop {
+					if self.calls.lock().expect("calls poisoned").len() >= expected {
+						return;
+					}
+					self.notify.notified().await;
+				}
+			})
+			.await
+			.expect("timed out waiting for downstream cancel calls");
+		}
+	}
+
+	async fn wait_for_downstream_metric(
+		metrics: &DownstreamCancellationMetrics,
+		trigger: DownstreamCancellationTrigger,
+		outcome: DownstreamCancellationOutcome,
+		expected: u64,
+	) {
+		tokio::time::timeout(Duration::from_secs(1), async {
+			loop {
+				if metrics.get(trigger, outcome) >= expected {
+					return;
+				}
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("timed out waiting for downstream cancellation metric");
+	}
+
+	#[async_trait::async_trait]
+	impl WendelonTableQueryCancelSender for FakeWendelonCancelSender {
+		async fn cancel_table_query_attempt(
+			&self,
+			target: NodeId,
+			tenant_id: WendelonTenantId,
+			request_id: TableQueryRequestId,
+		) -> Result<TableQueryCancelResponseMeta, wendelon_client::ClientError> {
+			if self.hang_ack {
+				std::future::pending::<()>().await;
+			}
+			self.calls
+				.lock()
+				.expect("calls poisoned")
+				.push(WendelonTableQueryAttempt {
+					target,
+					tenant_id,
+					request_id,
+				});
+			self.notify.notify_waiters();
+			Ok(TableQueryCancelResponseMeta {
+				status: self.status,
+				_pad: [0; 7],
+			})
+		}
+	}
+
+	fn table_query_attempt(request_id: u128) -> WendelonTableQueryAttempt {
+		WendelonTableQueryAttempt {
+			target: NodeId {
+				id: 42,
+				_reserved: 0,
+			},
+			tenant_id: WendelonTenantId::new(7),
+			request_id: TableQueryRequestId::from_u128(request_id),
+		}
 	}
 
 	fn identity(value: u128) -> TaskIdentity {

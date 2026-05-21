@@ -1,4 +1,7 @@
 use crate::catalog::WendelonDescriptorRegistry;
+use crate::distributed::cancellation::{
+	DownstreamCancellationContext, WendelonTableQueryAttempt, WendelonTableQueryCancelSender,
+};
 use crate::error::StorageError;
 use crate::ir::{ColumnOrdinal, MorselId, QueryId, QueryProfileHint, SessionId, TableId};
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryBuilder, UInt32Array};
@@ -57,6 +60,7 @@ pub struct ScanRequest {
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
 	pub morsel: Option<(MorselId, u32)>,
+	pub downstream_cancellation: Option<DownstreamCancellationContext>,
 }
 
 #[derive(Debug)]
@@ -469,6 +473,13 @@ fn map_wendelon_client_error_to_storage(
 	error: wendelon_client::ClientError,
 ) -> StorageError {
 	match error {
+		wendelon_client::ClientError::Io(error)
+			if error.kind() == std::io::ErrorKind::Interrupted
+				&& (error.to_string().contains("QUERY_CANCELLED")
+					|| error.to_string().contains("TABLE_QUERY_CANCELLED")) =>
+		{
+			StorageError::Cancelled
+		}
 		wendelon_client::ClientError::TableDescriptorEvolved { .. } => {
 			StorageError::DescriptorEvolved { table_id }
 		}
@@ -775,18 +786,58 @@ impl StorageScan for WendelonStorageScan {
 		};
 
 		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
+		if request
+			.downstream_cancellation
+			.as_ref()
+			.is_some_and(DownstreamCancellationContext::is_cancelled)
+		{
+			return Err(StorageError::Cancelled);
+		}
 
-		let query_result = self
-			.client
-			.table_query_with_runtime_filter(
-				tenant_id,
-				&descriptor,
-				pbc,
-				request.runtime_filter.clone(),
-				options,
-			)
-			.await
-			.map_err(|error| map_wendelon_client_error_to_storage(request.table_id, error))?;
+		let query_result = if let Some(downstream_cancellation) =
+			request.downstream_cancellation.clone()
+		{
+			let client = Arc::clone(&self.client);
+			let cancel_sender: Arc<dyn WendelonTableQueryCancelSender> = client;
+			self.client
+				.table_query_with_runtime_filter_and_attempt_hook(
+					tenant_id,
+					&descriptor,
+					pbc,
+					request.runtime_filter.clone(),
+					options,
+					move |attempt| {
+						let guard = downstream_cancellation
+							.register_wendelon_table_query_attempt(
+								Arc::clone(&cancel_sender),
+								WendelonTableQueryAttempt {
+									target: attempt.target,
+									tenant_id: attempt.tenant_id,
+									request_id: attempt.request_id,
+								},
+							)
+							.map_err(|error| {
+								std::io::Error::new(
+									std::io::ErrorKind::Interrupted,
+									format!("TABLE_QUERY_CANCELLED before request write: {error}"),
+								)
+							})?;
+						Ok(Box::new(guard) as wendelon_client::TableQueryAttemptGuard)
+					},
+				)
+				.await
+		} else {
+			self.client
+				.table_query_with_runtime_filter(
+					tenant_id,
+					&descriptor,
+					pbc,
+					request.runtime_filter.clone(),
+					options,
+				)
+				.await
+		}
+		.map_err(|error| map_wendelon_client_error_to_storage(request.table_id, error))?;
 		let schema = if let Some(batch) = query_result.batches.first() {
 			batch.schema()
 		} else {
@@ -978,6 +1029,9 @@ fn append_projection(
 mod tests {
 	use super::*;
 
+	use crate::distributed::cancellation::{
+		DownstreamAttemptRegistry, DownstreamCancellationTrigger,
+	};
 	use arrow::array::{ArrayRef, Int32Array};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use wendelon::schema::{
@@ -1014,6 +1068,35 @@ mod tests {
 		let batches = collect_test_batches(stream).await;
 
 		assert_eq!(projected_values(&batches), vec![40, 50, 60]);
+	}
+
+	#[tokio::test]
+	async fn in_memory_storage_scan_ignores_cancellation_context() {
+		let storage = InMemoryStorageScan {
+			table_data: test_batch(),
+		};
+		let registry = DownstreamAttemptRegistry::with_default_limits(None);
+		registry.cancel_registered_attempts(DownstreamCancellationTrigger::SqlCancel);
+		let mut request = test_request(None);
+		request.downstream_cancellation = Some(registry.context());
+
+		let stream = storage.scan(request).await.expect("scan");
+		let batches = collect_test_batches(stream).await;
+
+		assert_eq!(projected_values(&batches), vec![40, 50, 60]);
+	}
+
+	#[test]
+	fn wendelon_query_cancelled_maps_to_toron_cancelled() {
+		let error = map_wendelon_client_error_to_storage(
+			TableId(4),
+			wendelon_client::ClientError::Io(std::io::Error::new(
+				std::io::ErrorKind::Interrupted,
+				"Wendelon query failed: QUERY_CANCELLED",
+			)),
+		);
+
+		assert!(matches!(error, StorageError::Cancelled));
 	}
 
 	#[tokio::test]
@@ -1266,6 +1349,7 @@ mod tests {
 			profile_hint: None,
 			trace_context: None,
 			morsel: None,
+			downstream_cancellation: None,
 		}
 	}
 
@@ -1305,6 +1389,7 @@ mod tests {
 			profile_hint: None,
 			trace_context: None,
 			morsel: Some((MorselId(1), 2)),
+			downstream_cancellation: None,
 		}
 	}
 

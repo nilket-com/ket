@@ -73,6 +73,7 @@ use arrow::array::{Array, FixedSizeBinaryBuilder, LargeBinaryArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use std::any::Any;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, RwLock};
@@ -575,6 +576,27 @@ impl WendelonClient {
 		&self,
 		request: TableQueryRequest,
 	) -> std::io::Result<StreamingQueryResult> {
+		self.table_query_with_attempt_hook_internal(request, None)
+			.await
+	}
+
+	pub async fn table_query_with_attempt_hook<F>(
+		&self,
+		request: TableQueryRequest,
+		mut hook: F,
+	) -> std::io::Result<StreamingQueryResult>
+	where
+		F: FnMut(TableQueryAttempt) -> std::io::Result<TableQueryAttemptGuard> + Send,
+	{
+		self.table_query_with_attempt_hook_internal(request, Some(&mut hook))
+			.await
+	}
+
+	async fn table_query_with_attempt_hook_internal(
+		&self,
+		request: TableQueryRequest,
+		mut hook: Option<&mut TableQueryAttemptHook<'_>>,
+	) -> std::io::Result<StreamingQueryResult> {
 		let mut validation_request = request.clone();
 		if validation_request.meta.request_id.is_zero() {
 			validation_request.meta.request_id = TableQueryRequestId::random();
@@ -598,7 +620,18 @@ impl WendelonClient {
 			};
 			attempt_request.meta.request_id = TableQueryRequestId::random();
 			validate_table_query_request(&attempt_request)?;
-			match self.table_query_once(target, &attempt_request).await? {
+			let attempt_guard = match hook.as_deref_mut() {
+				Some(hook) => Some(hook(TableQueryAttempt {
+					target,
+					tenant_id: attempt_request.meta.tenant_id,
+					request_id: attempt_request.meta.request_id,
+				})?),
+				None => None,
+			};
+			match self
+				.table_query_once(target, &attempt_request, attempt_guard)
+				.await?
+			{
 				QueryOutcome::Ok(result) => return Ok(result),
 				QueryOutcome::Redirect(retry) => {
 					if attempt + 1 == DATA_RETRY_BUDGET {
@@ -1054,6 +1087,7 @@ impl WendelonClient {
 		&self,
 		target: NodeId,
 		request: &TableQueryRequest,
+		attempt_guard: Option<TableQueryAttemptGuard>,
 	) -> std::io::Result<QueryOutcome> {
 		let conn = self.factory.get_connection(target).await?;
 		let mut stream = conn.open_bi().await?;
@@ -1102,7 +1136,13 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 
 		let resp = read_frame(&mut *stream, &self.pool).await?;
-		decode_initial_query_response(resp, stream, self.pool.clone(), MsgType::TABLE_QUERY_RESP)
+		decode_initial_query_response(
+			resp,
+			stream,
+			self.pool.clone(),
+			MsgType::TABLE_QUERY_RESP,
+			attempt_guard,
+		)
 	}
 
 	async fn bulk_write_group(
@@ -1263,7 +1303,19 @@ pub struct StreamingQueryResult {
 	stream: Option<Box<dyn TransportStream>>,
 	pool: Arc<BufPool>,
 	expected_msg_type: MsgType,
+	_table_query_attempt_guard: Option<TableQueryAttemptGuard>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TableQueryAttempt {
+	pub target: NodeId,
+	pub tenant_id: TenantId,
+	pub request_id: TableQueryRequestId,
+}
+
+pub type TableQueryAttemptGuard = Box<dyn Any + Send + Sync + 'static>;
+pub type TableQueryAttemptHook<'a> =
+	dyn FnMut(TableQueryAttempt) -> std::io::Result<TableQueryAttemptGuard> + Send + 'a;
 
 pub struct CdcSubscription {
 	stream: Option<Box<dyn TransportStream>>,
@@ -1585,7 +1637,7 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 
 		let resp = read_frame(&mut *stream, &self.pool).await?;
-		decode_initial_query_response(resp, stream, self.pool.clone(), MsgType::QUERY_RESP)
+		decode_initial_query_response(resp, stream, self.pool.clone(), MsgType::QUERY_RESP, None)
 	}
 }
 
@@ -1673,6 +1725,7 @@ fn decode_initial_query_response(
 	stream: Box<dyn TransportStream>,
 	pool: Arc<BufPool>,
 	expected_msg_type: MsgType,
+	attempt_guard: Option<TableQueryAttemptGuard>,
 ) -> std::io::Result<QueryOutcome> {
 	if resp.header.msg_type != expected_msg_type.0 {
 		return Err(Error::new(
@@ -1726,6 +1779,7 @@ fn decode_initial_query_response(
 				stream: if is_end { None } else { Some(stream) },
 				pool,
 				expected_msg_type,
+				_table_query_attempt_guard: attempt_guard,
 			}))
 		}
 		_ if retry.is_some() => Ok(QueryOutcome::Redirect(retry.expect("retry checked above"))),
@@ -1737,6 +1791,7 @@ fn decode_initial_query_response(
 			stream: None,
 			pool,
 			expected_msg_type,
+			_table_query_attempt_guard: attempt_guard,
 		})),
 		other => Err(query_failure_error(other)),
 	}

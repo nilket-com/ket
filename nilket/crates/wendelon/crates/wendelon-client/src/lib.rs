@@ -35,13 +35,15 @@ use wendelon::network::wire;
 use wendelon::schema::{
 	ClientWriteId, FinalizationMarker, FrameHeader, HybridTimestamp, Identity, MsgType, NodeId,
 	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus,
-	TableDeleteRowsRequestMeta, TableQueryRequestId, TableQueryRequestMeta, TableWriteRequestMeta,
-	TenantId, WriteRequestMeta, WriteStatus, encode_table_schema_descriptor_v1,
-	encode_table_write_row_count, read_key_schema, write_payload_schema,
+	TableDeleteRowsRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
+	TableQueryRequestMeta, TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
+	encode_table_schema_descriptor_v1, encode_table_write_row_count, read_key_schema,
+	write_payload_schema,
 };
 
 pub use wendelon::client::{
 	CdcFrame, CdcSubscription, QueryLocalityRange, RowIdentityProjection, StreamingQueryResult,
+	TableQueryAttempt as WendelonTableQueryAttempt, TableQueryAttemptGuard,
 };
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
@@ -1001,6 +1003,53 @@ impl Client {
 		}
 	}
 
+	pub async fn table_query_stream_with_runtime_filter_and_attempt_hook<F>(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		pbc: Vec<u8>,
+		runtime_filter: Option<RuntimeFilterDescriptor>,
+		options: TableQueryOptions,
+		mut attempt_hook: F,
+	) -> Result<StreamingQueryResult, ClientError>
+	where
+		F: FnMut(WendelonTableQueryAttempt) -> std::io::Result<TableQueryAttemptGuard> + Send,
+	{
+		let expected_physical_descriptor_fingerprint = options
+			.physical_descriptor_fingerprint
+			.unwrap_or(descriptor.physical_descriptor_fingerprint);
+		if descriptor.physical_descriptor_fingerprint != expected_physical_descriptor_fingerprint {
+			return Err(ClientError::TableDescriptorEvolved {
+				expected: expected_physical_descriptor_fingerprint,
+				observed: Some(descriptor.physical_descriptor_fingerprint),
+			});
+		}
+
+		let request = table_query_request(
+			self,
+			tenant_id,
+			descriptor,
+			pbc,
+			runtime_filter,
+			options,
+			expected_physical_descriptor_fingerprint,
+		)?;
+		match self
+			.inner
+			.table_query_with_attempt_hook(request, &mut attempt_hook)
+			.await
+		{
+			Ok(result) => Ok(result),
+			Err(error) if is_table_descriptor_evolved_error(&error) => {
+				Err(ClientError::TableDescriptorEvolved {
+					expected: expected_physical_descriptor_fingerprint,
+					observed: None,
+				})
+			}
+			Err(error) => Err(error.into()),
+		}
+	}
+
 	pub async fn table_query(
 		&self,
 		tenant_id: TenantId,
@@ -1052,6 +1101,52 @@ impl Client {
 		})
 	}
 
+	pub async fn table_query_with_runtime_filter_and_attempt_hook<F>(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		pbc: Vec<u8>,
+		runtime_filter: Option<RuntimeFilterDescriptor>,
+		options: TableQueryOptions,
+		attempt_hook: F,
+	) -> Result<QueryResult, ClientError>
+	where
+		F: FnMut(WendelonTableQueryAttempt) -> std::io::Result<TableQueryAttemptGuard> + Send,
+	{
+		let stream = self
+			.table_query_stream_with_runtime_filter_and_attempt_hook(
+				tenant_id,
+				descriptor,
+				pbc,
+				runtime_filter,
+				options,
+				attempt_hook,
+			)
+			.await?;
+		let epoch = stream.epoch;
+		let value_hlc = stream.value_hlc;
+		let rows = stream.rows;
+		let batches = stream.collect_all().await?;
+		Ok(QueryResult {
+			epoch,
+			value_hlc,
+			rows,
+			batches,
+		})
+	}
+
+	pub async fn cancel_table_query_attempt(
+		&self,
+		target: NodeId,
+		tenant_id: TenantId,
+		request_id: TableQueryRequestId,
+	) -> Result<TableQueryCancelResponseMeta, ClientError> {
+		Ok(self
+			.inner
+			.cancel_table_query_attempt(target, tenant_id, request_id)
+			.await?)
+	}
+
 	pub async fn cdc_subscribe(
 		&self,
 		tenant_id: TenantId,
@@ -1073,6 +1168,65 @@ impl Client {
 			)
 			.await?)
 	}
+}
+
+fn table_query_request(
+	client: &Client,
+	tenant_id: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	pbc: Vec<u8>,
+	runtime_filter: Option<RuntimeFilterDescriptor>,
+	options: TableQueryOptions,
+	expected_physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+) -> std::io::Result<TableQueryRequest> {
+	let bytecode_len = u32::try_from(pbc.len()).map_err(|_| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidInput,
+			"table query PBC bytecode exceeds u32 length",
+		)
+	})?;
+	let runtime_filter_len = match &runtime_filter {
+		Some(runtime_filter) => {
+			let encoded = postcard::to_allocvec(runtime_filter).map_err(|err| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidInput,
+					format!("table query runtime filter encode failed: {err}"),
+				)
+			})?;
+			u32::try_from(encoded.len()).map_err(|_| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidInput,
+					"table query runtime filter exceeds u32 length",
+				)
+			})?
+		}
+		None => 0,
+	};
+	let mut pad = [0; 6];
+	if !options.stats_pruning_enabled {
+		pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
+	}
+	Ok(TableQueryRequest {
+		meta: TableQueryRequestMeta {
+			min_hlc: options.min_hlc.unwrap_or_else(zero_hlc),
+			expected_epoch: client.inner.epoch(),
+			tenant_id,
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: *expected_physical_descriptor_fingerprint.as_bytes(),
+			consistency: options.consistency,
+			row_identity_projection: options.row_identity.as_u8(),
+			_pad: pad,
+			bytecode_len,
+			runtime_filter_len,
+			as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
+			request_id: TableQueryRequestId::ZERO,
+		},
+		descriptor: descriptor.clone(),
+		pbc,
+		runtime_filter,
+		row_identity: options.row_identity,
+	})
 }
 
 fn bootstrap_snapshot(bootstrap: &[BootstrapPeer]) -> ClusterStatusWire {

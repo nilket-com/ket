@@ -918,10 +918,7 @@ impl TenantAdmissionControllerInner {
 
 	fn pump_locked(self: &Arc<Self>, state: &mut AdmissionState) -> Vec<GrantDelivery> {
 		let mut deliveries = Vec::new();
-		loop {
-			let Some((tenant_id, resources)) = self.pick_grantable_waiter(state) else {
-				break;
-			};
+		while let Some((tenant_id, resources)) = self.pick_grantable_waiter(state) {
 			let Some(waiter) = state
 				.queues
 				.get_mut(&tenant_id)

@@ -1083,6 +1083,7 @@ fn scan_request(binding: &TableBinding) -> ScanRequest {
 		profile_hint: None,
 		trace_context: None,
 		morsel: None,
+		downstream_cancellation: None,
 	}
 }
 

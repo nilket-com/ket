@@ -27,7 +27,8 @@ use crate::distributed::budget::{
 	BudgetDimension, ByteCount, QueryBudget, TenantDescriptorSyncAccountant,
 };
 use crate::distributed::cancellation::{
-	CancellationMetrics, CancellationOutcome, CancellationTrigger, QueryCancellation,
+	CancellationMetrics, CancellationOutcome, CancellationTrigger, DownstreamCancellationMetrics,
+	QueryCancellation,
 };
 use crate::distributed::identity::{LeaseEpoch, QueryId};
 use crate::distributed::partition_store::InMemoryPartitionStore;
@@ -217,13 +218,17 @@ impl ToronDaemon {
 			})?;
 		let memory = Arc::new(MemoryManager::new(32, memory_budget_bytes));
 		let worker_storage: Arc<dyn StorageScan> = scanner.clone();
-		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
-			worker_storage,
-			Arc::clone(&memory),
-			Arc::new(InMemoryPartitionStore::new()),
-			config.node.worker_id,
-			advertised_endpoint.clone(),
-		));
+		let downstream_cancellation_metrics = Arc::new(DownstreamCancellationMetrics::default());
+		let worker = Arc::new(
+			ToronWorker::with_partition_store_and_endpoint(
+				worker_storage,
+				Arc::clone(&memory),
+				Arc::new(InMemoryPartitionStore::new()),
+				config.node.worker_id,
+				advertised_endpoint.clone(),
+			)
+			.with_downstream_cancellation_metrics(Arc::clone(&downstream_cancellation_metrics)),
+		);
 
 		let registry_workers = coordinator_workers(
 			&config,
@@ -257,7 +262,8 @@ impl ToronDaemon {
 			)
 			.with_tenant_budget_policy(config.tenant_budgets.clone())
 			.with_admission_policy(config.admission)
-			.with_cancellation_metrics(Arc::clone(&cancellation_metrics)),
+			.with_cancellation_metrics(Arc::clone(&cancellation_metrics))
+			.with_downstream_cancellation_metrics(Arc::clone(&downstream_cancellation_metrics)),
 		);
 
 		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
@@ -276,6 +282,7 @@ impl ToronDaemon {
 			descriptor_sync_metrics: catalog.descriptor_sync_metrics(),
 			descriptor_refresh_metrics: catalog.descriptor_refresh_metrics(),
 			cancellation_metrics,
+			downstream_cancellation_metrics,
 			sql_connection_limiter: sql_connection_limiter.clone(),
 			tenant_admission: coordinator.tenant_admission_controller(),
 			admission_rejections: coordinator.admission_rejection_counters(),
@@ -921,6 +928,10 @@ fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {
 		QueryError::Binding(BindingError::Catalog(_)) => (SqlErrorCode::CatalogError, None),
 		QueryError::Binding(_) => (SqlErrorCode::BindingError, None),
 		QueryError::Catalog(_) => (SqlErrorCode::CatalogError, None),
+		QueryError::Storage(crate::error::StorageError::Cancelled)
+		| QueryError::Execution(crate::error::ExecutionError::Storage(
+			crate::error::StorageError::Cancelled,
+		)) => (SqlErrorCode::Cancelled, None),
 		QueryError::Storage(_) => (SqlErrorCode::StorageError, None),
 		QueryError::Execution(crate::error::ExecutionError::BudgetExhausted {
 			dimension: BudgetDimension::Memory,

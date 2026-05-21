@@ -7,7 +7,10 @@ use self::transport::ToronTransport;
 use crate::binder::PlannerConfig;
 use crate::catalog::Catalog;
 use crate::distributed::budget::{BudgetDimension, ByteCount};
-use crate::distributed::cancellation::{ActiveQueryHandle, ActiveTaskRegistry};
+use crate::distributed::cancellation::{
+	ActiveQueryHandle, ActiveTaskRegistry, DownstreamCancellationContext,
+	DownstreamCancellationMetrics,
+};
 use crate::distributed::identity::{FrameByteLen, PartitionId, StreamSeq, TaskIdentity, WorkerId};
 use crate::distributed::partition_store::{
 	InMemoryPartitionStore, PartitionPayload, PartitionStore, PartitionStoreError,
@@ -112,11 +115,19 @@ impl ToronWorker {
 		}
 	}
 
+	pub fn with_downstream_cancellation_metrics(
+		mut self,
+		metrics: Arc<DownstreamCancellationMetrics>,
+	) -> Self {
+		self.active_tasks = ActiveTaskRegistry::with_downstream_cancellation_metrics(Some(metrics));
+		self
+	}
+
 	pub async fn execute_task_local(
 		&self,
 		spec: &TaskSpec,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		self.execute_task_local_with_telemetry(spec)
+		self.execute_task_local_with_telemetry(spec, None)
 			.await
 			.map(|report| report.results)
 	}
@@ -124,6 +135,7 @@ impl ToronWorker {
 	async fn execute_task_local_with_telemetry(
 		&self,
 		spec: &TaskSpec,
+		downstream_cancellation: Option<DownstreamCancellationContext>,
 	) -> Result<TaskExecutionReport, QueryError> {
 		let task_started = Instant::now();
 		let telemetry = Arc::new(Mutex::new(task_telemetry_for_spec(spec)));
@@ -145,7 +157,8 @@ impl ToronWorker {
 		)
 		.with_task_budget(spec.budget)
 		.with_task_telemetry(telemetry.clone())
-		.with_runtime_filter(scan_runtime_filter(spec));
+		.with_runtime_filter(scan_runtime_filter(spec))
+		.with_downstream_cancellation(downstream_cancellation);
 		task_context.trace_context = spec.context.trace_context;
 		let results = if overrides.is_empty() {
 			let executor = Executor::with_context(self.storage.clone(), task_context);
@@ -354,7 +367,10 @@ impl ToronWorker {
 					.await?;
 					let task_setup_micros = duration_micros(task_started);
 
-					let execution = self.execute_task_local_with_telemetry(&payload.spec);
+					let execution = self.execute_task_local_with_telemetry(
+						&payload.spec,
+						Some(active_task.downstream.context()),
+					);
 					tokio::pin!(execution);
 					let execution_result = tokio::select! {
 						result = &mut execution => result,
@@ -1618,6 +1634,8 @@ where
 				current: None,
 			}
 		}
+		QueryError::Execution(ExecutionError::Storage(StorageError::Cancelled))
+		| QueryError::Storage(StorageError::Cancelled) => TaskFailureKind::Cancelled,
 		_ => TaskFailureKind::Internal {
 			reason: error.to_string(),
 		},
@@ -1695,6 +1713,8 @@ fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {
 				current: None,
 			}
 		}
+		QueryError::Execution(ExecutionError::Storage(StorageError::Cancelled))
+		| QueryError::Storage(StorageError::Cancelled) => TaskFailureKind::Cancelled,
 		QueryError::Runtime(RuntimeError::ProtocolMismatch { .. }) => {
 			TaskFailureKind::ProtocolMismatch
 		}

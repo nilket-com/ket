@@ -32,7 +32,8 @@ use toron::distributed::budget::{
 	TenantAdmissionRejectionCounters, TenantBudget, TenantBudgetPolicy,
 };
 use toron::distributed::cancellation::{
-	CancellationMetrics, CancellationOutcome, CancellationTrigger,
+	CancellationMetrics, CancellationOutcome, CancellationTrigger, DownstreamCancellationMetrics,
+	DownstreamCancellationOutcome, DownstreamCancellationTrigger,
 };
 use toron::distributed::identity::WorkerId;
 use toron::network::connection::SqlConnectionLimiter;
@@ -99,6 +100,7 @@ fn sample_resource_metrics_body() -> String {
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections,
@@ -118,6 +120,7 @@ fn request_ingress_metrics_use_bounded_reasons_and_omit_sql_text() {
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
@@ -154,6 +157,7 @@ fn cancellation_metrics_are_aggregate_trigger_outcome_only() {
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
@@ -184,6 +188,53 @@ fn cancellation_metrics_are_aggregate_trigger_outcome_only() {
 		"query_cancellations_total{tenant_id",
 		"query_cancellations_total{table",
 		"query_cancellations_total{endpoint",
+		"SELECT",
+	] {
+		assert!(!body.contains(forbidden), "{forbidden} leaked into metrics");
+	}
+}
+
+#[test]
+fn downstream_cancellation_metrics_are_aggregate_trigger_outcome_only() {
+	let policy = TenantBudgetPolicy::omitted_config(ByteCount::new(1024));
+	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
+	let downstream_metrics = Arc::new(DownstreamCancellationMetrics::default());
+	downstream_metrics.record(
+		DownstreamCancellationTrigger::WorkerCancelTask,
+		DownstreamCancellationOutcome::Accepted,
+	);
+	downstream_metrics.record(
+		DownstreamCancellationTrigger::SqlCancel,
+		DownstreamCancellationOutcome::AlreadyTerminal,
+	);
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy.clone(),
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: downstream_metrics,
+		sql_connection_limiter: None,
+		tenant_admission,
+		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
+	});
+
+	let body = metrics.render_text(&ready_snapshot());
+
+	assert!(body.contains(
+		"toron_downstream_storage_cancellations_total{trigger=\"worker_cancel_task\",outcome=\"accepted\"} 1\n"
+	));
+	assert!(body.contains(
+		"toron_downstream_storage_cancellations_total{trigger=\"sql_cancel\",outcome=\"already_terminal\"} 1\n"
+	));
+	for forbidden in [
+		"toron_downstream_storage_cancellations_total{query_id",
+		"toron_downstream_storage_cancellations_total{task_id",
+		"toron_downstream_storage_cancellations_total{worker_id",
+		"toron_downstream_storage_cancellations_total{tenant_id",
+		"toron_downstream_storage_cancellations_total{table",
+		"toron_downstream_storage_cancellations_total{endpoint",
 		"SELECT",
 	] {
 		assert!(!body.contains(forbidden), "{forbidden} leaked into metrics");
@@ -426,9 +477,15 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 	] {
 		assert!(body.contains(metric), "missing metric {metric} in {body}");
 	}
+	assert!(body.contains("toron_downstream_storage_cancellations_total"));
+	let legacy_brand_body = body
+		.lines()
+		.filter(|line| !line.contains("toron_downstream_storage_cancellations_total"))
+		.collect::<Vec<_>>()
+		.join("\n");
 	for forbidden in ["toron_", "query_id", "task_id", "sql_text", "_bucket"] {
 		assert!(
-			!body.contains(forbidden),
+			!legacy_brand_body.contains(forbidden),
 			"{forbidden} leaked into /metrics"
 		);
 	}
@@ -516,6 +573,7 @@ fn sql_connection_metrics_are_configured_plus_other() {
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: Some(limiter),
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
@@ -606,6 +664,7 @@ fn queue_and_borrow_metrics_are_configured_plus_other_no_table_labels() {
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&TenantBudgetPolicy::new(

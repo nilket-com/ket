@@ -6879,6 +6879,10 @@ fn adr045_initial_metric_set_is_functional_brand_clean_and_stable() {
 	let observability =
 		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
 			.expect("read observability source");
+	let adr045_stable_observability = observability.replace(
+		"toron_downstream_storage_cancellations_total",
+		"downstream_storage_cancellations_total",
+	);
 
 	for required in [
 		"daemon_ready",
@@ -6907,7 +6911,7 @@ fn adr045_initial_metric_set_is_functional_brand_clean_and_stable() {
 		"certificate",
 	] {
 		assert!(
-			!observability.contains(forbidden),
+			!adr045_stable_observability.contains(forbidden),
 			"ADR 045 metrics include forbidden high-cardinality/branded token {forbidden}"
 		);
 	}
@@ -10526,7 +10530,9 @@ fn adr059_active_query_registry_is_tenant_scoped_and_raii_removed() {
 	assert!(cancellation.contains("remove_if_same"));
 	assert!(cancellation.contains("ptr_eq"));
 	assert!(coordinator.contains(".active_queries"));
-	assert!(coordinator.contains(".register(context.tenant_id, context.query_id)"));
+	assert!(coordinator.contains("register_with_downstream"));
+	assert!(coordinator.contains("context.tenant_id"));
+	assert!(coordinator.contains("context.query_id"));
 }
 
 #[test]
@@ -10704,7 +10710,8 @@ fn adr059_worker_active_registry_keyed_by_task_identity_raii_deregistered() {
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
 
-	assert!(cancellation.contains("active: HashMap<TaskIdentity, TaskCancellationSignal>"));
+	assert!(cancellation.contains("active: HashMap<TaskIdentity, ActiveTaskState>"));
+	assert!(cancellation.contains("signal: TaskCancellationSignal"));
 	assert!(cancellation.contains("impl Drop for ActiveTaskGuard"));
 	assert!(cancellation.contains("inner.active.remove(&self.identity)"));
 	assert!(server.contains("let active_task = self.active_tasks.register(identity);"));
@@ -10848,19 +10855,24 @@ fn adr059_pre_admission_rejects_emit_no_cancel() {
 }
 
 #[test]
-fn adr059_no_wendelon_storage_cancellation_claim_and_metrics_identity_free() {
+fn adr059_wendelon_storage_cancellation_claim_is_retargeted_and_metrics_identity_free() {
 	let cancellation =
 		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
 			.expect("read cancellation");
 	let observability =
 		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
 			.expect("read observability");
-	let evidence = std::fs::read_to_string(
-		manifest_dir().join("plans/impl/059_distributed_query_cancellation_evidence.md"),
+	let adr060 = std::fs::read_to_string(
+		manifest_dir().join("plans/adr/060_wendelon_table_query_cancellation_consumer.md"),
 	)
-	.unwrap_or_default();
+	.expect("read adr060");
 
-	assert!(!cancellation.contains("wendelon"));
+	assert!(cancellation.contains("WendelonTableQueryAttempt"));
+	assert!(cancellation.contains("WendelonTableQueryAttempt"));
+	assert!(cancellation.contains("cancel_table_query_attempt"));
+	assert!(adr060.contains("no-Wendelon caveat"));
+	assert!(adr060.contains("best-effort"));
+	assert!(adr060.contains("checkpoint-bounded"));
 	for forbidden in [
 		"query_cancellations_total{query_id",
 		"query_cancellations_total{task_id",
@@ -10871,8 +10883,6 @@ fn adr059_no_wendelon_storage_cancellation_claim_and_metrics_identity_free() {
 	] {
 		assert!(!observability.contains(forbidden), "{forbidden} leaked");
 	}
-	assert!(evidence.contains("does not add"));
-	assert!(evidence.contains("Wendelon storage cancellation"));
 }
 
 #[test]
@@ -10934,6 +10944,451 @@ fn adr059_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 		"CancellationMetricsV1",
 		"RemoteTaskCancellationV1",
 	]);
+}
+
+#[test]
+fn adr060_consumes_wendelon_adr073_without_new_wire() {
+	let wire = std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let wendelon_client = std::fs::read_to_string(
+		workspace_root_dir().join("crates/wendelon/crates/wendelon-client/src/lib.rs"),
+	)
+	.expect("read wendelon-client facade");
+
+	assert!(cancellation.contains("WendelonTableQueryAttempt"));
+	assert!(wendelon_client.contains("cancel_table_query_attempt"));
+	assert!(!wire.contains("TableQueryCancel"));
+	assert!(!sql_wire.contains("TableQueryCancel"));
+	assert_toron_sources_do_not_contain(&["TABLE_QUERY_CANCEL_REQ", "TABLE_QUERY_CANCEL_RESP"]);
+}
+
+#[test]
+fn adr060_client_hook_exposes_attempt_without_retry_duplication() {
+	let facade = std::fs::read_to_string(
+		workspace_root_dir().join("crates/wendelon/crates/wendelon-client/src/lib.rs"),
+	)
+	.expect("read wendelon-client facade");
+	let core =
+		std::fs::read_to_string(workspace_root_dir().join("crates/wendelon/src/client/core.rs"))
+			.expect("read wendelon client core");
+
+	assert!(facade.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(core.contains("pub struct TableQueryAttempt"));
+	assert!(core.contains("attempt_request.meta.request_id = TableQueryRequestId::random();"));
+	assert!(core.contains("hook(TableQueryAttempt"));
+	assert!(core.contains("table_query_once(target, &attempt_request, attempt_guard)"));
+	assert!(
+		!std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+			.unwrap()
+			.contains("TableQueryRequestId::random()")
+	);
+}
+
+#[test]
+fn adr060_hook_returns_or_holds_raii_attempt_guard() {
+	let core =
+		std::fs::read_to_string(workspace_root_dir().join("crates/wendelon/src/client/core.rs"))
+			.expect("read wendelon client core");
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+
+	assert!(core.contains("pub type TableQueryAttemptGuard"));
+	assert!(core.contains("_table_query_attempt_guard: Option<TableQueryAttemptGuard>"));
+	assert!(storage.contains("Ok(Box::new(guard) as wendelon_client::TableQueryAttemptGuard)"));
+	assert!(cancellation.contains("pub struct DownstreamAttemptGuard"));
+	assert!(cancellation.contains("impl Drop for DownstreamAttemptGuard"));
+}
+
+#[test]
+fn adr060_attempt_identity_is_target_tenant_request_id_only() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let attempt = brace_blocks_after_marker(&cancellation, "pub struct WendelonTableQueryAttempt")
+		.into_iter()
+		.next()
+		.expect("attempt struct")
+		.1;
+
+	for required in [
+		"pub target: NodeId",
+		"pub tenant_id: WendelonTenantId",
+		"pub request_id: TableQueryRequestId",
+	] {
+		assert!(attempt.contains(required), "missing {required}");
+	}
+	for forbidden in [
+		"QueryId",
+		"TaskIdentity",
+		"SessionId",
+		"TableId",
+		"fingerprint",
+		"endpoint",
+		"sql",
+	] {
+		assert!(
+			!attempt.contains(forbidden),
+			"{forbidden} leaked into attempt identity"
+		);
+	}
+}
+
+#[test]
+fn adr060_no_toron_identity_crosses_wendelon_cancel_wire() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let fanout = brace_blocks_after_marker(&cancellation, "tokio::spawn(async move")
+		.into_iter()
+		.find(|(_, block)| block.contains("cancel_table_query_attempt"))
+		.expect("downstream fanout")
+		.1;
+
+	assert!(fanout.contains("registered.attempt.target"));
+	assert!(fanout.contains("registered.attempt.tenant_id"));
+	assert!(fanout.contains("registered.attempt.request_id"));
+	for forbidden in [
+		"query_id",
+		"TaskIdentity",
+		"SessionId",
+		"TableId",
+		"fingerprint",
+		"endpoint",
+	] {
+		assert!(
+			!fanout.contains(forbidden),
+			"{forbidden} crossed cancel fanout"
+		);
+	}
+}
+
+#[test]
+fn adr060_attempt_registers_before_table_query_write() {
+	let core =
+		std::fs::read_to_string(workspace_root_dir().join("crates/wendelon/src/client/core.rs"))
+			.expect("read wendelon client core");
+	let hook_pos = core.find("hook(TableQueryAttempt").expect("hook call");
+	let request_pos = core
+		.find("table_query_once(target, &attempt_request, attempt_guard)")
+		.expect("table query once call");
+	let table_query_once = brace_blocks_after_marker(&core, "async fn table_query_once")
+		.into_iter()
+		.next()
+		.expect("table_query_once")
+		.1;
+
+	assert!(hook_pos < request_pos);
+	assert!(table_query_once.contains("write_frame(&mut *stream"));
+}
+
+#[test]
+fn adr060_retry_redirect_replaces_attempt_registration() {
+	let core =
+		std::fs::read_to_string(workspace_root_dir().join("crates/wendelon/src/client/core.rs"))
+			.expect("read wendelon client core");
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+
+	assert!(core.contains("for attempt in 0..DATA_RETRY_BUDGET"));
+	assert!(core.contains("let attempt_guard = match hook.as_deref_mut()"));
+	assert!(core.contains("QueryOutcome::Redirect(retry)"));
+	assert!(cancellation.contains("wendelon_redirect_retry_replaces_attempt_registration"));
+}
+
+#[test]
+fn adr060_raii_removes_attempt_on_terminal_paths() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+
+	assert!(cancellation.contains("registration_id"));
+	assert!(cancellation.contains("inner.attempts.remove(&self.registration_id)"));
+	assert!(
+		cancellation.contains("downstream_attempt_raii_removes_on_success_error_redirect_and_drop")
+	);
+}
+
+#[test]
+fn adr060_cancel_is_parent_fired_not_scan_watcher_primary() {
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+
+	assert!(cancellation.contains("ActiveQueryHandle"));
+	assert!(cancellation.contains("ActiveTaskRegistry"));
+	assert!(cancellation.contains("cancel_registered_attempts(trigger.into())"));
+	assert!(cancellation.contains("DownstreamCancellationTrigger::WorkerCancelTask"));
+	assert!(!storage.contains("tokio::spawn"));
+	assert!(!storage.contains("AbortOnDrop"));
+}
+
+#[test]
+fn adr060_coordinator_cancel_triggers_share_downstream_path() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	assert!(coordinator.contains("DownstreamAttemptRegistry::new"));
+	assert!(coordinator.contains("downstream_cancellation_context"));
+	for trigger in [
+		"CancellationTrigger::StatementTimeout",
+		"CancellationTrigger::ClientDisconnect",
+		"CancellationTrigger::SqlCancel",
+	] {
+		assert!(daemon.contains(trigger), "missing trigger {trigger}");
+	}
+}
+
+#[test]
+fn adr060_worker_cancel_task_fires_downstream_before_drop_at_await() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let cancel_pos = cancellation
+		.find("DownstreamCancellationTrigger::WorkerCancelTask")
+		.expect("worker downstream cancel");
+	let signal_pos = cancellation[cancel_pos..]
+		.find("state.signal.cancel()")
+		.expect("signal cancel");
+
+	assert!(signal_pos > 0);
+	assert!(server.contains("Some(active_task.downstream.context())"));
+	assert!(server.contains("active_task.signal.cancelled()"));
+}
+
+#[test]
+fn adr060_pre_admission_rejects_emit_no_wendelon_cancel() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let execute_query =
+		brace_blocks_after_marker(&coordinator, "pub async fn execute_query_with_context")
+			.into_iter()
+			.next()
+			.expect("execute query")
+			.1;
+	let admit_pos = execute_query.find("admit_query(&context)").expect("admit");
+	let downstream_pos = execute_query
+		.find("DownstreamAttemptRegistry::new")
+		.expect("downstream registry");
+
+	assert!(admit_pos < downstream_pos);
+}
+
+#[test]
+fn adr060_already_cancelled_before_scan_sends_no_table_query_req() {
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let scan = brace_blocks_after_marker(&storage, "impl StorageScan for WendelonStorageScan")
+		.into_iter()
+		.next()
+		.expect("wendelon scan impl")
+		.1;
+	let cancelled_pos = scan.find("is_cancelled").expect("cancelled check");
+	let query_pos = scan
+		.find("table_query_with_runtime_filter_and_attempt_hook")
+		.expect("table query call");
+
+	assert!(cancelled_pos < query_pos);
+	assert!(scan.contains("return Err(StorageError::Cancelled)"));
+}
+
+#[test]
+fn adr060_wendelon_query_cancelled_maps_to_toron_cancelled() {
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	assert!(storage.contains("QUERY_CANCELLED"));
+	assert!(storage.contains("StorageError::Cancelled"));
+	assert!(server.contains("StorageError::Cancelled) => TaskFailureKind::Cancelled"));
+	assert!(daemon.contains("StorageError::Cancelled"));
+}
+
+#[test]
+fn adr060_downstream_cancel_fanout_is_bounded_and_nonblocking() {
+	let cancellation =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/cancellation.rs"))
+			.expect("read cancellation");
+
+	assert!(cancellation.contains("MAX_DOWNSTREAM_CANCEL_FANOUTS"));
+	assert!(cancellation.contains("DOWNSTREAM_CANCEL_ACK_TIMEOUT"));
+	assert!(cancellation.contains("try_acquire_owned()"));
+	assert!(cancellation.contains("tokio::spawn(async move"));
+	assert!(
+		cancellation
+			.contains("downstream_cancel_fanout_timeout_does_not_delay_sql_cancel_response")
+	);
+}
+
+#[test]
+fn adr060_stream_drop_is_fallback_not_primary() {
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let wendelon_router =
+		std::fs::read_to_string(workspace_root_dir().join("crates/wendelon/src/network/router.rs"))
+			.expect("read wendelon router");
+
+	assert!(storage.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(storage.contains("register_wendelon_table_query_attempt"));
+	assert!(wendelon_router.contains("stream_dropped"));
+	assert!(!storage.contains("stream_dropped"));
+}
+
+#[test]
+fn adr060_metrics_are_aggregate_only() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+
+	assert!(observability.contains("toron_downstream_storage_cancellations_total"));
+	assert!(observability.contains("DownstreamCancellationTrigger::ALL"));
+	assert!(observability.contains("DownstreamCancellationOutcome::ALL"));
+	assert!(
+		observability_test
+			.contains("downstream_cancellation_metrics_are_aggregate_trigger_outcome_only")
+	);
+	for forbidden in [
+		"toron_downstream_storage_cancellations_total{query_id",
+		"toron_downstream_storage_cancellations_total{task_id",
+		"toron_downstream_storage_cancellations_total{worker_id",
+		"toron_downstream_storage_cancellations_total{tenant_id",
+		"toron_downstream_storage_cancellations_total{table",
+		"toron_downstream_storage_cancellations_total{endpoint",
+	] {
+		assert!(!observability.contains(forbidden), "{forbidden} leaked");
+	}
+}
+
+#[test]
+fn adr060_no_writes_cdc_admin_agg_or_legacy_query_scope() {
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let wendelon_core =
+		std::fs::read_to_string(workspace_root_dir().join("crates/wendelon/src/client/core.rs"))
+			.expect("read wendelon core");
+
+	assert!(storage.contains("impl StorageScan for WendelonStorageScan"));
+	assert!(storage.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(!storage.contains("aggregate_with_attempt_hook"));
+	assert!(!storage.contains("write_with_attempt_hook"));
+	assert!(!storage.contains("delete_with_attempt_hook"));
+	assert!(!storage.contains("cdc_subscribe_with_attempt_hook"));
+	assert!(wendelon_core.contains("MsgType::QUERY_RESP, None"));
+}
+
+#[test]
+fn adr060_no_control_ring_uni_stream_sidecar_or_sql_grammar() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+
+	assert!(coordinator.contains("DownstreamAttemptRegistry"));
+	assert!(!sql_wire.contains("CancelWendelon"));
+	assert_toron_sources_do_not_contain(&[
+		"open_uni",
+		"ControlMessage",
+		"storage_cancel_listener",
+		"wendelon_cancel_listener",
+		"CancelWendelon",
+	]);
+}
+
+#[test]
+fn adr060_retargets_adr059_no_wendelon_claim_narrowly() {
+	let adr059_guard = std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+		.expect("read architecture test");
+	let adr060 = std::fs::read_to_string(
+		manifest_dir().join("plans/adr/060_wendelon_table_query_cancellation_consumer.md"),
+	)
+	.expect("read adr060");
+
+	assert!(adr059_guard.contains(
+		"adr059_wendelon_storage_cancellation_claim_is_retargeted_and_metrics_identity_free"
+	));
+	assert!(adr060.contains("best-effort and checkpoint-bounded"));
+	assert!(adr060.contains("no broader claim"));
+}
+
+#[test]
+fn adr060_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing", "arrow"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr060_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	for forbidden in [
+		"DownstreamAttemptRegistry",
+		"WendelonTableQueryAttempt",
+		"toron_downstream_storage_cancellations_total",
+		"cancel_table_query_attempt",
+	] {
+		assert!(
+			!worker.contains(forbidden),
+			"fixture worker gained {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr060_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"DownstreamAttemptRegistryV1",
+		"DownstreamCancellationContextV1",
+		"DownstreamCancellationMetricsV1",
+		"WendelonTableQueryAttemptV1",
+		"TableQueryCancelSenderV1",
+		"StorageCancellationV1",
+	]);
+}
+
+#[test]
+fn adr060_prior_adr049_to_059_guards_continue_to_pass_except_retarget() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr049_", "adr050_", "adr051_", "adr052_", "adr053_", "adr054_", "adr055_", "adr056_",
+		"adr057_", "adr058_", "adr059_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	assert!(architecture_test.contains(
+		"adr059_wendelon_storage_cancellation_claim_is_retargeted_and_metrics_identity_free"
+	));
 }
 
 #[test]

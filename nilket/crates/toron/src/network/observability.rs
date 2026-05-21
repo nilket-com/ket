@@ -17,7 +17,8 @@ use crate::distributed::budget::{
 	TenantBudgetPolicy,
 };
 use crate::distributed::cancellation::{
-	CancellationMetrics, CancellationOutcome, CancellationTrigger,
+	CancellationMetrics, CancellationOutcome, CancellationTrigger, DownstreamCancellationMetrics,
+	DownstreamCancellationOutcome, DownstreamCancellationTrigger,
 };
 use crate::network::connection::SqlConnectionLimiter;
 use crate::network::observability_http::{READ_REQUEST_TIMEOUT, read_request, write_response};
@@ -166,6 +167,7 @@ pub struct MetricsRegistry {
 	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
 	cancellation_metrics: Arc<CancellationMetrics>,
+	downstream_cancellation_metrics: Arc<DownstreamCancellationMetrics>,
 	sql_connection_limiter: Option<SqlConnectionLimiter>,
 	resource_metrics: ResourceMetrics,
 }
@@ -177,6 +179,7 @@ pub struct MetricsRegistryConfig {
 	pub descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	pub descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
 	pub cancellation_metrics: Arc<CancellationMetrics>,
+	pub downstream_cancellation_metrics: Arc<DownstreamCancellationMetrics>,
 	pub sql_connection_limiter: Option<SqlConnectionLimiter>,
 	pub tenant_admission: TenantAdmissionController,
 	pub admission_rejections: TenantAdmissionRejectionCounters,
@@ -194,6 +197,7 @@ impl MetricsRegistry {
 			descriptor_sync_metrics: config.descriptor_sync_metrics,
 			descriptor_refresh_metrics: config.descriptor_refresh_metrics,
 			cancellation_metrics: config.cancellation_metrics,
+			downstream_cancellation_metrics: config.downstream_cancellation_metrics,
 			sql_connection_limiter: config.sql_connection_limiter,
 			resource_metrics: ResourceMetrics {
 				tenant_budgets: config.tenant_budgets,
@@ -267,6 +271,7 @@ impl MetricsRegistry {
 		self.render_descriptor_sync_metrics(&mut out);
 		self.render_descriptor_refresh_metrics(&mut out);
 		self.render_cancellation_metrics(&mut out);
+		self.render_downstream_cancellation_metrics(&mut out);
 		self.render_sql_connection_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
 		out
@@ -310,6 +315,20 @@ impl MetricsRegistry {
 					trigger.as_str(),
 					outcome.as_str(),
 					self.cancellation_metrics.get(trigger, outcome)
+				));
+			}
+		}
+	}
+
+	fn render_downstream_cancellation_metrics(&self, out: &mut String) {
+		out.push_str("# TYPE toron_downstream_storage_cancellations_total counter\n");
+		for trigger in DownstreamCancellationTrigger::ALL {
+			for outcome in DownstreamCancellationOutcome::ALL {
+				out.push_str(&format!(
+					"toron_downstream_storage_cancellations_total{{trigger=\"{}\",outcome=\"{}\"}} {}\n",
+					trigger.as_str(),
+					outcome.as_str(),
+					self.downstream_cancellation_metrics.get(trigger, outcome)
 				));
 			}
 		}

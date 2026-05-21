@@ -16,7 +16,8 @@ use crate::distributed::budget::{
 };
 use crate::distributed::cancellation::{
 	ActiveQueryHandle, ActiveQueryRegistry, CancellationMetrics, CancellationOutcome,
-	CancellationTrigger, QueryCancellation, RemoteTaskCancellation,
+	CancellationTrigger, DownstreamAttemptRegistry, DownstreamCancellationMetrics,
+	QueryCancellation, RemoteTaskCancellation,
 };
 use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
@@ -65,7 +66,9 @@ where
 	admission_rejections: TenantAdmissionRejectionCounters,
 	active_queries: ActiveQueryRegistry,
 	cancellation_metrics: Option<Arc<CancellationMetrics>>,
+	downstream_cancellation_metrics: Option<Arc<DownstreamCancellationMetrics>>,
 	cancel_fanout_permits: Arc<Semaphore>,
+	downstream_cancel_fanout_permits: Arc<Semaphore>,
 	context: ExecutionContext,
 	writer: Arc<dyn StorageWrite>,
 	deleter: Arc<dyn StorageDeleteRows>,
@@ -253,7 +256,9 @@ where
 			admission_rejections: TenantAdmissionRejectionCounters::new(&tenant_budgets),
 			active_queries: ActiveQueryRegistry::new(),
 			cancellation_metrics: None,
+			downstream_cancellation_metrics: None,
 			cancel_fanout_permits: Arc::new(Semaphore::new(MAX_REMOTE_CANCEL_FANOUTS)),
+			downstream_cancel_fanout_permits: Arc::new(Semaphore::new(MAX_REMOTE_CANCEL_FANOUTS)),
 			tenant_budgets,
 			context,
 			writer,
@@ -279,6 +284,14 @@ where
 
 	pub fn with_cancellation_metrics(mut self, metrics: Arc<CancellationMetrics>) -> Self {
 		self.cancellation_metrics = Some(metrics);
+		self
+	}
+
+	pub fn with_downstream_cancellation_metrics(
+		mut self,
+		metrics: Arc<DownstreamCancellationMetrics>,
+	) -> Self {
+		self.downstream_cancellation_metrics = Some(metrics);
 		self
 	}
 
@@ -310,10 +323,19 @@ where
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let admitted = self.admit_query(&context).await?;
 		let query_budget = admitted.query_budget;
-		let active_query = self
-			.active_queries
-			.register(context.tenant_id, context.query_id);
+		let downstream = DownstreamAttemptRegistry::new(
+			self.downstream_cancel_fanout_permits.clone(),
+			self.downstream_cancellation_metrics.clone(),
+		);
+		let active_query = self.active_queries.register_with_downstream(
+			context.tenant_id,
+			context.query_id,
+			downstream,
+		);
 		let active_query_handle = active_query.handle();
+		let context = context.with_downstream_cancellation(Some(
+			active_query_handle.downstream_cancellation_context(),
+		));
 		let result = self
 			.execute_query_with_admission(plan, context, query_budget, Some(active_query_handle))
 			.await;

@@ -6574,8 +6574,13 @@ fn adr073_plan_region(data_server: &str) -> &str {
 fn adr073_table_query_cancel_is_wendelon_home_producer_only() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
 	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let adr060 =
+		read_workspace("crates/toron/plans/adr/060_wendelon_table_query_cancellation_consumer.md");
 	assert!(schema.contains("pub struct TableQueryRequestId"));
 	assert!(data_server.contains("ActiveTableQueryRegistry"));
+	assert!(adr060.contains("073 remains producer"));
+	assert!(adr060.contains("owner; 060 retargets"));
+	assert!(adr060.contains("No Wendelon/transport change"));
 
 	let mut toron_hits = Vec::new();
 	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
@@ -6584,11 +6589,11 @@ fn adr073_table_query_cancel_is_wendelon_home_producer_only() {
 		}
 		let content = fs::read_to_string(path).unwrap();
 		for forbidden in [
-			"TableQueryRequestId",
-			"TableQueryCancel",
-			"TABLE_QUERY_CANCEL",
-			"cancel_table_query_attempt",
-			"QUERY_CANCELLED",
+			"TABLE_QUERY_CANCEL_REQ",
+			"TABLE_QUERY_CANCEL_RESP",
+			"MsgType::TABLE_QUERY_CANCEL",
+			"handle_table_query_cancel",
+			"ActiveTableQueryRegistry",
 		] {
 			if content.contains(forbidden) {
 				toron_hits.push(format!("{} contains {forbidden}", path.display()));
@@ -6596,6 +6601,10 @@ fn adr073_table_query_cancel_is_wendelon_home_producer_only() {
 		}
 	});
 	assert!(toron_hits.is_empty(), "{}", toron_hits.join("\n"));
+
+	let toron_consumer = read_workspace("crates/toron/src/distributed/cancellation.rs");
+	assert!(toron_consumer.contains("WendelonTableQueryCancelSender"));
+	assert!(toron_consumer.contains("cancel_table_query_attempt"));
 }
 
 #[test]
@@ -6857,19 +6866,25 @@ fn adr073_no_writes_cdc_admin_agg_or_legacy_query_scope() {
 }
 
 #[test]
-fn adr073_no_toron_storage_scan_consumer_claim() {
+fn adr073_toron_storage_scan_consumer_claim_is_retargeted_by_adr060() {
+	let adr060 =
+		read_workspace("crates/toron/plans/adr/060_wendelon_table_query_cancellation_consumer.md");
+	let storage = read_workspace("crates/toron/src/storage.rs");
+	let cancellation = read_workspace("crates/toron/src/distributed/cancellation.rs");
+	assert!(adr060.contains("Toron consumer of Wendelon 073"));
+	assert!(adr060.contains("best-effort"));
+	assert!(adr060.contains("checkpoint-bounded"));
+	assert!(storage.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(storage.contains("register_wendelon_table_query_attempt"));
+	assert!(cancellation.contains("DownstreamAttemptRegistry"));
+
 	let mut violations = Vec::new();
 	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
 		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
 			return;
 		}
 		let content = fs::read_to_string(path).unwrap();
-		for forbidden in [
-			"cancel_table_query_attempt",
-			"TABLE_QUERY_CANCEL_REQ",
-			"TableQueryRequestId",
-			"QUERY_CANCELLED",
-		] {
+		for forbidden in ["TABLE_QUERY_CANCEL_REQ", "TABLE_QUERY_CANCEL_RESP"] {
 			if content.contains(forbidden) {
 				violations.push(format!("{} contains {forbidden}", path.display()));
 			}

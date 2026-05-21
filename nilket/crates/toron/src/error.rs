@@ -12,6 +12,8 @@ pub enum StorageError {
 	TableNotFound { table: TableId },
 	#[error("descriptor evolved for {table_id:?} during query planning/execution")]
 	DescriptorEvolved { table_id: TableId },
+	#[error("storage operation cancelled")]
+	Cancelled,
 	#[error("read bound unavailable")]
 	ReadBoundUnavailable {
 		#[source]
@@ -51,6 +53,13 @@ impl From<wendelon_client::ClientError> for StorageError {
 
 		match source {
 			source @ ClientError::AuthorizationFailed => Self::PermissionDenied { source },
+			ClientError::Io(error)
+				if error.kind() == std::io::ErrorKind::Interrupted
+					&& (error.to_string().contains("QUERY_CANCELLED")
+						|| error.to_string().contains("TABLE_QUERY_CANCELLED")) =>
+			{
+				Self::Cancelled
+			}
 			ClientError::TableDescriptorEvolved { .. } => Self::Internal {
 				message: "descriptor evolved without table context".to_string(),
 			},
