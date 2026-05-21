@@ -907,9 +907,6 @@ impl SqlPlanner {
 				"CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS",
 			));
 		}
-		if *if_not_exists {
-			return Err(unsupported("CTAS does not support IF NOT EXISTS in v1"));
-		}
 		if !columns.is_empty() {
 			return Err(unsupported(
 				"CTAS does not support explicit column lists in v1; use SELECT aliases for column names",
@@ -1073,6 +1070,7 @@ impl SqlPlanner {
 		let source = self.lower_query(query)?;
 		Ok(LogicalPlan::CreateTableAsSelect {
 			table,
+			if_not_exists: *if_not_exists,
 			or_replace: *or_replace,
 			source: Box::new(source),
 		})

@@ -218,10 +218,11 @@ impl<'a> Binder<'a> {
 				}),
 				LogicalPlan::CreateTableAsSelect {
 					table,
+					if_not_exists,
 					or_replace,
 					source,
 				} => {
-					self.bind_create_table_as_select(table, *or_replace, source)
+					self.bind_create_table_as_select(table, *if_not_exists, *or_replace, source)
 						.await
 				}
 				LogicalPlan::DropTable { name, if_exists } => Ok(ExecutionPlan::DropTable {
@@ -251,6 +252,7 @@ impl<'a> Binder<'a> {
 	async fn bind_create_table_as_select(
 		&self,
 		table: &TableRef,
+		if_not_exists: bool,
 		or_replace: bool,
 		source: &LogicalPlan,
 	) -> Result<ExecutionPlan, BindingError> {
@@ -261,6 +263,7 @@ impl<'a> Binder<'a> {
 		Ok(ExecutionPlan::CreateTableAsSelect {
 			table: table.clone(),
 			schema,
+			if_not_exists,
 			or_replace,
 			source: Box::new(source),
 		})
@@ -1343,6 +1346,7 @@ fn optimize_for_required(
 		ExecutionPlan::CreateTableAsSelect {
 			table,
 			schema,
+			if_not_exists,
 			or_replace,
 			source,
 		} => {
@@ -1351,6 +1355,7 @@ fn optimize_for_required(
 				ExecutionPlan::CreateTableAsSelect {
 					table,
 					schema,
+					if_not_exists,
 					or_replace,
 					source: Box::new(source),
 				},

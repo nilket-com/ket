@@ -3487,6 +3487,7 @@ fn adr033_logical_variant_count_is_13() {
 	assert_eq!(enum_variant_count(logical_plan), 15);
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
 	assert!(logical_plan.contains("table: TableRef,"));
+	assert!(logical_plan.contains("if_not_exists: bool,"));
 	assert!(logical_plan.contains("source: Box<LogicalPlan>,"));
 	assert!(logical_plan.contains("DropTable {"));
 }
@@ -3524,6 +3525,7 @@ fn adr033_execution_ctas_has_no_precreate_identity() {
 	for required in [
 		"table: TableRef,",
 		"schema: SchemaRef,",
+		"if_not_exists: bool,",
 		"source: Box<ExecutionPlan>,",
 	] {
 		assert!(ctas.contains(required), "CTAS body missing {required}");
@@ -3564,7 +3566,7 @@ fn adr033_planner_routes_only_query_create_table_to_ctas() {
 }
 
 #[test]
-fn adr033_planner_rejects_ctas_column_list_and_if_not_exists() {
+fn adr033_planner_rejects_ctas_column_list_while_allowing_if_not_exists() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
 	let lower_ctas = brace_blocks_after_marker(&planner, "fn lower_create_table_as_select")
@@ -3573,8 +3575,8 @@ fn adr033_planner_rejects_ctas_column_list_and_if_not_exists() {
 		.expect("lower_create_table_as_select body")
 		.1;
 
-	assert!(lower_ctas.contains("if *if_not_exists"));
-	assert!(lower_ctas.contains("CTAS does not support IF NOT EXISTS in v1"));
+	assert!(lower_ctas.contains("if_not_exists: *if_not_exists"));
+	assert!(!lower_ctas.contains("CTAS does not support IF NOT EXISTS in v1"));
 	assert!(lower_ctas.contains("if !columns.is_empty()"));
 	assert!(lower_ctas.contains("CTAS does not support explicit column lists in v1"));
 }
@@ -3717,7 +3719,9 @@ fn adr033_coordinator_reads_source_before_create_table() {
 		.nth(1)
 		.and_then(|rest| rest.split("other =>").next())
 		.expect("CTAS arm");
-	let create_table = ctas_arm.find(".create_table(").expect("create_table call");
+	let create_table = ctas_arm
+		.find(".create_table_with_outcome(")
+		.expect("create_table_with_outcome call");
 	let execute_source = ctas_arm
 		.find("source_executor.execute_read_plan(source)")
 		.expect("source execution");
@@ -3741,7 +3745,8 @@ fn adr033_coordinator_uses_create_table_binding_for_write() {
 		.and_then(|rest| rest.split("other =>").next())
 		.expect("CTAS arm");
 
-	assert!(ctas_arm.contains("let binding = catalog.create_table"));
+	assert!(ctas_arm.contains("let outcome = catalog"));
+	assert!(ctas_arm.contains("let binding = outcome.binding"));
 	assert!(ctas_arm.contains("table_id: binding.legacy_table_id"));
 	assert!(ctas_arm.contains("table_object_id: binding.table"));
 	assert!(ctas_arm.contains("physical_descriptor_fingerprint: binding.fingerprint"));
@@ -5151,7 +5156,7 @@ fn adr037_ctas_reads_source_before_catalog_create() {
 		.find("source_executor.execute_read_plan(source)")
 		.expect("source read");
 	let create = ctas_arm
-		.find("catalog.create_table")
+		.find("create_table_with_outcome")
 		.expect("catalog create");
 
 	assert!(read < create);
@@ -5997,7 +6002,7 @@ fn adr041_ctas_or_replace_no_longer_rejected() {
 }
 
 #[test]
-fn adr041_ctas_if_not_exists_remains_rejected() {
+fn adr041_ctas_if_not_exists_is_supported_after_adr061() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
 	let body = brace_blocks_after_marker(&planner, "fn lower_create_table_as_select")
@@ -6006,8 +6011,8 @@ fn adr041_ctas_if_not_exists_remains_rejected() {
 		.expect("lower_create_table_as_select body")
 		.1;
 
-	assert!(body.contains("CTAS does not support IF NOT EXISTS in v1"));
-	assert!(body.contains("if *if_not_exists"));
+	assert!(body.contains("if_not_exists: *if_not_exists"));
+	assert!(!body.contains("CTAS does not support IF NOT EXISTS in v1"));
 }
 
 #[test]
@@ -6114,7 +6119,7 @@ fn adr041_ctas_replace_materializes_source_before_drop() {
 		.find("drop_existing_table_with_storage_admin")
 		.expect("replace drop helper");
 	let create = ctas_arm
-		.find("catalog.create_table")
+		.find("create_table_with_outcome")
 		.expect("catalog create");
 
 	assert!(source < drop);
@@ -9099,10 +9104,15 @@ fn adr053_resolve_table_miss_is_only_sync_trigger() {
 
 	assert!(resolve_table.contains("resolve_table_after_local_miss"));
 	assert!(resolve_table.contains("Err(CatalogError::TableNotFound"));
-	for body in [resolve_table_id, create_table, drop_table] {
+	for body in [resolve_table_id, drop_table] {
 		assert!(!body.contains("resolve_table_after_local_miss"));
 		assert!(!body.contains("get_table_schema_descriptor"));
 	}
+	assert!(!create_table.contains("get_table_schema_descriptor"));
+	assert!(create_table.contains("ClientError::SchemaUpdateRejected"));
+	assert!(create_table.contains("if if_not_exists"));
+	assert!(create_table.contains("&& schema_update_rejected"));
+	assert!(create_table.contains("resolve_table_after_local_miss(name).await"));
 	assert!(!storage.contains("resolve_table_after_local_miss"));
 	assert!(!storage.contains("get_table_schema_descriptor"));
 }
@@ -9287,15 +9297,22 @@ fn adr053_no_background_watch_reload_inventory_or_negative_cache() {
 }
 
 #[test]
-fn adr053_create_drop_do_not_trigger_descriptor_sync() {
+fn adr053_create_drop_do_not_trigger_descriptor_sync_except_adr061_race_reconciliation() {
 	let catalog =
 		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
-	for method in ["async fn create_table", "async fn drop_table"] {
-		let body = wendelon_catalog_method_body(&catalog, method);
-		assert!(!body.contains("get_table_schema_descriptor"));
-		assert!(!body.contains("resolve_table_after_local_miss"));
-		assert!(!body.contains("DescriptorSyncParticipant"));
-	}
+	let create_table = wendelon_catalog_method_body(&catalog, "async fn create_table");
+	let drop_table = wendelon_catalog_method_body(&catalog, "async fn drop_table");
+
+	assert!(!create_table.contains("get_table_schema_descriptor"));
+	assert!(create_table.contains("ClientError::SchemaUpdateRejected"));
+	assert!(create_table.contains("if if_not_exists"));
+	assert!(create_table.contains("&& schema_update_rejected"));
+	assert!(create_table.contains("resolve_table_after_local_miss(name).await"));
+	assert!(!create_table.contains("DescriptorSyncParticipant"));
+
+	assert!(!drop_table.contains("get_table_schema_descriptor"));
+	assert!(!drop_table.contains("resolve_table_after_local_miss"));
+	assert!(!drop_table.contains("DescriptorSyncParticipant"));
 }
 
 #[test]
@@ -11389,6 +11406,273 @@ fn adr060_prior_adr049_to_059_guards_continue_to_pass_except_retarget() {
 	assert!(architecture_test.contains(
 		"adr059_wendelon_storage_cancellation_claim_is_retargeted_and_metrics_identity_free"
 	));
+}
+
+#[test]
+fn adr061_ctas_if_not_exists_is_accepted() {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id FROM people")
+		.expect("CTAS IF NOT EXISTS should plan");
+
+	let LogicalPlan::CreateTableAsSelect { if_not_exists, .. } = plan else {
+		panic!("expected CTAS logical plan");
+	};
+
+	assert!(if_not_exists);
+}
+
+#[test]
+fn adr061_ctas_ir_carries_if_not_exists() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR");
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR");
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+
+	for source in [&logical, &execution] {
+		let ctas = brace_blocks_after_marker(source, "CreateTableAsSelect {")
+			.into_iter()
+			.next()
+			.expect("CTAS variant")
+			.1;
+		assert!(ctas.contains("if_not_exists: bool,"));
+	}
+	assert!(planner.contains("if_not_exists: *if_not_exists"));
+	assert!(binder.contains("if_not_exists: *if_not_exists"));
+	assert!(binder.contains("if_not_exists,"));
+}
+
+#[test]
+fn adr061_or_replace_if_not_exists_remains_rejected() {
+	let err = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE OR REPLACE TABLE IF NOT EXISTS copy AS SELECT id FROM people")
+		.expect_err("OR REPLACE plus IF NOT EXISTS should reject");
+
+	assert!(
+		err.to_string()
+			.contains("CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS")
+	);
+}
+
+#[test]
+fn adr061_ctas_column_list_remains_rejected() {
+	let err = toron::sql_planner::SqlPlanner::new()
+		.plan("CREATE TABLE copy (id INT) AS SELECT id FROM people")
+		.expect_err("CTAS column list should reject");
+
+	assert!(err.to_string().contains("explicit column lists"));
+}
+
+#[test]
+fn adr061_catalog_create_exposes_created_outcome() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let outcome = brace_blocks_after_marker(&catalog, "pub struct CreateTableOutcome")
+		.into_iter()
+		.next()
+		.expect("CreateTableOutcome")
+		.1;
+
+	assert!(outcome.contains("pub binding: TableBinding,"));
+	assert!(outcome.contains("pub created: bool,"));
+	assert!(catalog.contains("async fn create_table_with_outcome("));
+	assert!(catalog.contains(".map(|outcome| outcome.binding)"));
+	assert!(catalog.contains("created: false"));
+	assert!(catalog.contains("created: true"));
+}
+
+#[test]
+fn adr061_ctas_write_is_gated_on_created_outcome() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let execute_write =
+		brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+			.into_iter()
+			.next()
+			.expect("execute_write_plan_with_source")
+			.1;
+	let ctas_arm = execute_write
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
+		.expect("CTAS arm");
+	let outcome = ctas_arm
+		.find("let outcome = catalog")
+		.expect("created outcome");
+	let write_gate = ctas_arm
+		.find("if !outcome.created")
+		.expect("created=false write gate");
+	let writer = ctas_arm.find(".write(WriteRequest").expect("writer call");
+
+	assert!(outcome < write_gate);
+	assert!(write_gate < writer);
+}
+
+#[test]
+fn adr061_ctas_binds_source_before_existing_target_skip() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let bind_body = brace_blocks_after_marker(&binder, "async fn bind_create_table_as_select")
+		.into_iter()
+		.next()
+		.expect("bind_create_table_as_select")
+		.1;
+	let bind_source = bind_body
+		.find("self.bind_plan(source).await?")
+		.expect("source bind");
+	let infer_schema = bind_body
+		.find("infer_ctas_schema")
+		.expect("schema inference");
+	let ctas_arm =
+		brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+			.into_iter()
+			.next()
+			.expect("execute_write_plan_with_source")
+			.1;
+
+	assert!(bind_source < infer_schema);
+	assert!(!bind_body.contains("resolve_table"));
+	assert!(ctas_arm.contains("if *if_not_exists"));
+	assert!(ctas_arm.contains("source_executor.execute_read_plan(source)"));
+}
+
+#[test]
+fn adr061_ctas_uses_exact_schema_compatibility() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(catalog.contains("existing.schema.as_ref() == schema.as_ref()"));
+	assert!(coordinator.contains("existing.schema.as_ref() == schema.as_ref()"));
+	assert!(catalog.contains("CatalogError::SchemaMismatch"));
+	assert!(coordinator.contains("CatalogError::SchemaMismatch"));
+	assert!(!catalog.contains("can_cast_types"));
+	assert!(!coordinator.contains("can_cast_types"));
+}
+
+#[test]
+fn adr061_ctas_remains_coordinator_owned_non_fragmentable() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter");
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+
+	assert!(coordinator.contains("ExecutionPlan::CreateTableAsSelect"));
+	assert!(coordinator.contains("create_table_with_outcome"));
+	assert!(coordinator.contains(".write(WriteRequest"));
+	assert!(fragment.contains("CreateTableAsSelectNotFragmentable"));
+	assert!(exec.contains("CREATE TABLE AS SELECT execution is coordinator-only"));
+}
+
+#[test]
+fn adr061_no_wendelon_wire_worker_or_sql_protocol_change() {
+	let wire = std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let wendelon_sources = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for source in [&wire, &sql_wire, &server, &wendelon_sources] {
+		assert!(!source.contains("CreateTableOutcome"));
+		assert!(!source.contains("create_table_with_outcome"));
+		assert!(!source.contains("CtasIfNotExists"));
+	}
+}
+
+#[test]
+fn adr061_retargets_prior_ctas_if_not_exists_reject_guards() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+	let ctas_test =
+		std::fs::read_to_string(manifest_dir().join("tests/ctas_test.rs")).expect("read ctas test");
+
+	assert!(
+		architecture_test
+			.contains("adr033_planner_rejects_ctas_column_list_while_allowing_if_not_exists")
+	);
+	assert!(architecture_test.contains("adr041_ctas_if_not_exists_is_supported_after_adr061"));
+	let old_adr041_guard = ["fn ", "adr041_ctas_if_not_exists", "_remains_rejected"].concat();
+	assert!(!architecture_test.contains(&old_adr041_guard));
+	assert!(!ctas_test.contains("fn ctas_if_not_exists_remains_rejected"));
+	assert!(ctas_test.contains("fn ctas_if_not_exists_is_accepted"));
+}
+
+#[test]
+fn adr061_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing", "arrow"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr061_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	for forbidden in [
+		"CreateTableOutcome",
+		"create_table_with_outcome",
+		"CTAS IF NOT EXISTS",
+		"if_not_exists",
+	] {
+		assert!(
+			!worker.contains(forbidden),
+			"fixture worker gained {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr061_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"CreateTableOutcomeV1",
+		"CreateTableAsSelectV1",
+		"CtasIfNotExistsV1",
+		"CtasOutcomeV1",
+		"CreateTableWithOutcomeV1",
+	]);
+}
+
+#[test]
+fn adr061_prior_adr033_to_060_guards_continue_to_pass_except_retarget() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr033_", "adr034_", "adr035_", "adr036_", "adr037_", "adr038_", "adr039_", "adr040_",
+		"adr041_", "adr042_", "adr043_", "adr044_", "adr045_", "adr046_", "adr047_", "adr048_",
+		"adr049_", "adr050_", "adr051_", "adr052_", "adr053_", "adr054_", "adr055_", "adr056_",
+		"adr057_", "adr058_", "adr059_", "adr060_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	assert!(
+		architecture_test
+			.contains("adr033_planner_rejects_ctas_column_list_while_allowing_if_not_exists")
+	);
+	assert!(architecture_test.contains("adr041_ctas_if_not_exists_is_supported_after_adr061"));
 }
 
 #[test]

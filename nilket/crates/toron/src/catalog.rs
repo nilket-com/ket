@@ -18,7 +18,8 @@ use wendelon::schema::{
 	TenantId as WendelonTenantId,
 };
 use wendelon_client::{
-	Client, ClientError, DropOperationId, SchemaGeneration, TableSchemaUpdateRequest,
+	Client, ClientError, DropOperationId, SchemaGeneration, SchemaUpdateReceipt,
+	TableSchemaUpdateRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -136,6 +137,12 @@ pub struct InvalidatedDescriptor {
 	pub refs: Vec<TableRef>,
 }
 
+#[derive(Clone)]
+pub struct CreateTableOutcome {
+	pub binding: TableBinding,
+	pub created: bool,
+}
+
 #[async_trait::async_trait]
 pub trait Catalog: Send + Sync {
 	fn scoped(self: Arc<Self>, tenant_id: TenantId) -> Arc<dyn Catalog>;
@@ -155,18 +162,47 @@ pub trait Catalog: Send + Sync {
 		table: TableId,
 	) -> Result<Option<InvalidatedDescriptor>, CatalogError>;
 
+	async fn create_table_with_outcome(
+		&self,
+		name: &TableRef,
+		schema: SchemaRef,
+		if_not_exists: bool,
+	) -> Result<CreateTableOutcome, CatalogError>;
+
 	async fn create_table(
 		&self,
 		name: &TableRef,
 		schema: SchemaRef,
 		if_not_exists: bool,
-	) -> Result<TableBinding, CatalogError>;
+	) -> Result<TableBinding, CatalogError> {
+		self.create_table_with_outcome(name, schema, if_not_exists)
+			.await
+			.map(|outcome| outcome.binding)
+	}
 
 	async fn drop_table(
 		&self,
 		name: &TableRef,
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError>;
+}
+
+#[async_trait::async_trait]
+trait SchemaUpdateClient: Send + Sync {
+	async fn submit_table_schema_update(
+		&self,
+		request: TableSchemaUpdateRequest,
+	) -> Result<SchemaUpdateReceipt, ClientError>;
+}
+
+#[async_trait::async_trait]
+impl SchemaUpdateClient for Client {
+	async fn submit_table_schema_update(
+		&self,
+		request: TableSchemaUpdateRequest,
+	) -> Result<SchemaUpdateReceipt, ClientError> {
+		Client::submit_table_schema_update(self, request).await
+	}
 }
 
 #[async_trait::async_trait]
@@ -428,12 +464,12 @@ impl Catalog for MockCatalog {
 		}))
 	}
 
-	async fn create_table(
+	async fn create_table_with_outcome(
 		&self,
 		name: &TableRef,
 		schema: SchemaRef,
 		if_not_exists: bool,
-	) -> Result<TableBinding, CatalogError> {
+	) -> Result<CreateTableOutcome, CatalogError> {
 		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
 
 		if let Some(existing_id) = inner.by_ref.get(&(self.tenant_id, name.clone())).copied() {
@@ -444,7 +480,10 @@ impl Catalog for MockCatalog {
 				.clone();
 			if if_not_exists {
 				if existing.schema.as_ref() == schema.as_ref() {
-					return Ok(existing);
+					return Ok(CreateTableOutcome {
+						binding: existing,
+						created: false,
+					});
 				}
 				return Err(CatalogError::SchemaMismatch {
 					table: table_name(name),
@@ -493,7 +532,10 @@ impl Catalog for MockCatalog {
 			.by_id
 			.insert((self.tenant_id, legacy_table_id), binding.clone());
 
-		Ok(binding)
+		Ok(CreateTableOutcome {
+			binding,
+			created: true,
+		})
 	}
 
 	async fn drop_table(
@@ -677,7 +719,7 @@ impl Drop for DescriptorSyncOwner {
 }
 
 pub struct WendelonCatalog {
-	client: Option<Arc<Client>>,
+	client: Option<Arc<dyn SchemaUpdateClient>>,
 	descriptor_sync_client: Option<Arc<dyn DescriptorSyncClient>>,
 	descriptor_sync_flights: Option<Arc<DescriptorSyncFlights>>,
 	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
@@ -1191,9 +1233,10 @@ impl WendelonCatalog {
 		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptor)>,
 	) -> Result<Self, CatalogError> {
 		let tenant_id = tenant_id.into();
+		let schema_update_client: Arc<dyn SchemaUpdateClient> = client.clone();
 		let descriptor_sync_client: Arc<dyn DescriptorSyncClient> = client.clone();
 		Ok(Self {
-			client: Some(client),
+			client: Some(schema_update_client),
 			descriptor_sync_client: Some(descriptor_sync_client),
 			descriptor_sync_flights: Some(default_descriptor_sync_flights()),
 			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
@@ -1228,8 +1271,9 @@ impl WendelonCatalog {
 		descriptor_sync_accountant: TenantDescriptorSyncAccountant,
 	) -> Self {
 		let descriptor_sync_client: Arc<dyn DescriptorSyncClient> = client.clone();
+		let schema_update_client: Arc<dyn SchemaUpdateClient> = client;
 		Self {
-			client: Some(client),
+			client: Some(schema_update_client),
 			descriptor_sync_client: Some(descriptor_sync_client),
 			descriptor_sync_flights: Some(Arc::new(DescriptorSyncFlights::new(
 				descriptor_sync_accountant,
@@ -1405,16 +1449,19 @@ impl Catalog for WendelonCatalog {
 		Ok(invalidated)
 	}
 
-	async fn create_table(
+	async fn create_table_with_outcome(
 		&self,
 		name: &TableRef,
 		schema: SchemaRef,
 		if_not_exists: bool,
-	) -> Result<TableBinding, CatalogError> {
+	) -> Result<CreateTableOutcome, CatalogError> {
 		if let Some(existing) = self.registry.try_resolve_table(self.tenant_id, name) {
 			if if_not_exists {
 				if existing.schema.as_ref() == schema.as_ref() {
-					return Ok(existing);
+					return Ok(CreateTableOutcome {
+						binding: existing,
+						created: false,
+					});
 				}
 				return Err(CatalogError::SchemaMismatch {
 					table: table_name(name),
@@ -1455,10 +1502,25 @@ impl Catalog for WendelonCatalog {
 			intent_id,
 		);
 
-		client
-			.submit_table_schema_update(request)
-			.await
-			.map_err(|error| map_wendelon_admin_error(name, error))?;
+		if let Err(error) = client.submit_table_schema_update(request).await {
+			let schema_update_rejected = matches!(error, ClientError::SchemaUpdateRejected { .. });
+			let original_error = map_wendelon_admin_error(name, error);
+			if if_not_exists
+				&& schema_update_rejected
+				&& let Ok(existing) = self.resolve_table_after_local_miss(name).await
+			{
+				if existing.schema.as_ref() == schema.as_ref() {
+					return Ok(CreateTableOutcome {
+						binding: existing,
+						created: false,
+					});
+				}
+				return Err(CatalogError::SchemaMismatch {
+					table: table_name(name),
+				});
+			}
+			return Err(original_error);
+		}
 
 		let binding = TableBinding::from_descriptor(legacy_table_id, &descriptor)?;
 		self.registry.insert_descriptor(
@@ -1467,7 +1529,10 @@ impl Catalog for WendelonCatalog {
 			binding.clone(),
 			descriptor,
 		)?;
-		Ok(binding)
+		Ok(CreateTableOutcome {
+			binding,
+			created: true,
+		})
 	}
 
 	async fn drop_table(
@@ -1785,6 +1850,41 @@ mod tests {
 				.await
 				.pop_front()
 				.expect("fake descriptor response")
+		}
+	}
+
+	struct FakeSchemaUpdateClient {
+		responses: tokio::sync::Mutex<VecDeque<Result<SchemaUpdateReceipt, ClientError>>>,
+		calls: AtomicU64,
+	}
+
+	impl FakeSchemaUpdateClient {
+		fn new(
+			responses: impl IntoIterator<Item = Result<SchemaUpdateReceipt, ClientError>>,
+		) -> Self {
+			Self {
+				responses: tokio::sync::Mutex::new(responses.into_iter().collect()),
+				calls: AtomicU64::new(0),
+			}
+		}
+
+		fn call_count(&self) -> u64 {
+			self.calls.load(Ordering::SeqCst)
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl SchemaUpdateClient for FakeSchemaUpdateClient {
+		async fn submit_table_schema_update(
+			&self,
+			_request: TableSchemaUpdateRequest,
+		) -> Result<SchemaUpdateReceipt, ClientError> {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			self.responses
+				.lock()
+				.await
+				.pop_front()
+				.expect("fake schema update response")
 		}
 	}
 
@@ -2381,6 +2481,43 @@ mod tests {
 
 		assert!(matches!(error, CatalogError::AdminFailed { .. }));
 		assert_eq!(client.call_count(), 0);
+	}
+
+	#[tokio::test]
+	async fn wendelon_catalog_if_not_exists_recovers_compatible_remote_create_race() {
+		let descriptor = default_descriptor_with_identity(0xDA, 1);
+		let schema = Arc::new(descriptor.arrow_schema().expect("descriptor schema"));
+		let admin = Arc::new(FakeSchemaUpdateClient::new([Err(
+			ClientError::SchemaUpdateRejected {
+				reason_code: 3,
+				message: "table schema create cannot replace an existing table".to_string(),
+			},
+		)]));
+		let descriptor_sync = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(
+			descriptor.clone(),
+		))]));
+		let catalog = WendelonCatalog {
+			client: Some(admin.clone()),
+			descriptor_sync_client: Some(descriptor_sync.clone()),
+			descriptor_sync_flights: Some(Arc::new(DescriptorSyncFlights::new(
+				descriptor_sync_accountant(1),
+			))),
+			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+			descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+			tenant_id: TenantId(7),
+			registry: Arc::new(WendelonDescriptorRegistry::default()),
+		};
+
+		let outcome = catalog
+			.create_table_with_outcome(&TableRef::new("orders"), schema.clone(), true)
+			.await
+			.expect("compatible remote create race should resolve existing descriptor");
+
+		assert!(!outcome.created);
+		assert_eq!(outcome.binding.schema.as_ref(), schema.as_ref());
+		assert_eq!(outcome.binding.table, descriptor.table_object_id);
+		assert_eq!(admin.call_count(), 1);
+		assert_eq!(descriptor_sync.call_count(), 1);
 	}
 
 	#[tokio::test]

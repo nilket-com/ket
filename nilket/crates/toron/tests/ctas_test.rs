@@ -5,13 +5,16 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::{Catalog, MockCatalog, TableBinding, TableRef};
+use toron::catalog::{
+	Catalog, CreateTableOutcome, DescriptorRefreshMetrics, InvalidatedDescriptor, MockCatalog,
+	TableBinding, TableRef,
+};
 use toron::coordinator::{DistributedQueryCoordinator, QueryCoordinator};
 use toron::distributed::budget::{QueryBudget, TaskBudget};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::QueryId;
 use toron::distributed::worker_registry::StaticWorkerRegistry;
-use toron::error::{ExecutionError, QueryError, StorageError};
+use toron::error::{CatalogError, ExecutionError, QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{ExecutionPlan, LogicalPlan, QueryProfileHint, SessionId};
 use toron::server::memory::MemoryManager;
@@ -30,6 +33,7 @@ fn planner_accepts_create_table_as_select_surface() {
 
 	let LogicalPlan::CreateTableAsSelect {
 		table,
+		if_not_exists,
 		or_replace,
 		source,
 	} = plan
@@ -38,6 +42,7 @@ fn planner_accepts_create_table_as_select_surface() {
 	};
 
 	assert_eq!(table, TableRef::new("copy"));
+	assert!(!if_not_exists);
 	assert!(!or_replace);
 	assert!(matches!(*source, LogicalPlan::Project { .. }));
 }
@@ -50,6 +55,7 @@ fn planner_accepts_create_or_replace_table_as_select_surface() {
 
 	let LogicalPlan::CreateTableAsSelect {
 		table,
+		if_not_exists,
 		or_replace,
 		source,
 	} = plan
@@ -58,6 +64,7 @@ fn planner_accepts_create_or_replace_table_as_select_surface() {
 	};
 
 	assert_eq!(table, TableRef::new("copy"));
+	assert!(!if_not_exists);
 	assert!(or_replace);
 	assert!(matches!(*source, LogicalPlan::Project { .. }));
 }
@@ -69,10 +76,6 @@ fn planner_rejects_unsupported_ctas_shapes() {
 			"CREATE TABLE copy (id INT) AS SELECT id FROM people",
 			"explicit column lists",
 		),
-		(
-			"CREATE TABLE IF NOT EXISTS copy AS SELECT id FROM people",
-			"IF NOT EXISTS",
-		),
 		("CREATE TABLE copy LIKE people", "LIKE"),
 		("CREATE TABLE copy CLONE people", "CLONE"),
 	] {
@@ -81,11 +84,32 @@ fn planner_rejects_unsupported_ctas_shapes() {
 }
 
 #[test]
-fn ctas_if_not_exists_remains_rejected() {
-	assert_frontend_error(
-		"CREATE TABLE IF NOT EXISTS copy AS SELECT id FROM people",
-		"CTAS does not support IF NOT EXISTS in v1",
-	);
+fn planner_accepts_create_table_if_not_exists_as_select() {
+	let plan = SqlPlanner::new()
+		.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id FROM people")
+		.expect("plan CTAS IF NOT EXISTS");
+
+	let LogicalPlan::CreateTableAsSelect {
+		table,
+		if_not_exists,
+		or_replace,
+		source,
+	} = plan
+	else {
+		panic!("expected CTAS logical plan");
+	};
+
+	assert_eq!(table, TableRef::new("copy"));
+	assert!(if_not_exists);
+	assert!(!or_replace);
+	assert!(matches!(*source, LogicalPlan::Project { .. }));
+}
+
+#[test]
+fn ctas_if_not_exists_is_accepted() {
+	SqlPlanner::new()
+		.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id FROM people")
+		.expect("CTAS IF NOT EXISTS should now plan");
 }
 
 #[test]
@@ -93,6 +117,22 @@ fn ctas_or_replace_rejects_if_not_exists_combo() {
 	assert_frontend_error(
 		"CREATE OR REPLACE TABLE IF NOT EXISTS copy AS SELECT id FROM people",
 		"CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS",
+	);
+}
+
+#[test]
+fn planner_rejects_create_or_replace_if_not_exists_ctas() {
+	assert_frontend_error(
+		"CREATE OR REPLACE TABLE IF NOT EXISTS copy AS SELECT id FROM people",
+		"CREATE TABLE cannot combine OR REPLACE and IF NOT EXISTS",
+	);
+}
+
+#[test]
+fn planner_still_rejects_ctas_explicit_column_list() {
+	assert_frontend_error(
+		"CREATE TABLE copy (id INT) AS SELECT id FROM people",
+		"explicit column lists",
 	);
 }
 
@@ -109,6 +149,7 @@ async fn binder_infers_ctas_schema_without_target_identity() {
 	let ExecutionPlan::CreateTableAsSelect {
 		table,
 		schema,
+		if_not_exists,
 		or_replace,
 		source,
 	} = bound
@@ -117,11 +158,121 @@ async fn binder_infers_ctas_schema_without_target_identity() {
 	};
 
 	assert_eq!(table, TableRef::new("copy"));
+	assert!(!if_not_exists);
 	assert!(!or_replace);
 	assert_eq!(schema.fields().len(), 2);
 	assert_field(&schema, 0, "id", &DataType::Int32, false);
 	assert_field(&schema, 1, "name", &DataType::Utf8, true);
 	assert!(matches!(*source, ExecutionPlan::Project { .. }));
+}
+
+#[tokio::test]
+async fn ctas_if_not_exists_binder_surfaces_source_errors_when_target_exists() {
+	let (_catalog, _storage, coordinator, planner) = coordinator();
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE copy (id INT NOT NULL)")
+				.expect("plan target"),
+			None,
+		)
+		.await
+		.expect("create target");
+
+	let err = coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id FROM missing")
+				.expect("plan CTAS IF NOT EXISTS"),
+			None,
+		)
+		.await
+		.expect_err("source bind error should surface");
+
+	assert!(
+		err.to_string().contains("table not found"),
+		"unexpected error: {err}"
+	);
+}
+
+#[tokio::test]
+async fn ctas_if_not_exists_compatible_existing_target_skips_source_execution() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+	catalog
+		.create_table(
+			&TableRef::new("people"),
+			schema(&[
+				Field::new("id", DataType::Int32, false),
+				Field::new("name", DataType::Utf8, true),
+			]),
+			false,
+		)
+		.await
+		.expect("register source descriptor only");
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE copy (id INT NOT NULL, name TEXT)")
+				.expect("plan target"),
+			None,
+		)
+		.await
+		.expect("create compatible target");
+
+	let results = coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id, name FROM people")
+				.expect("plan CTAS IF NOT EXISTS"),
+			None,
+		)
+		.await
+		.expect("compatible target should skip source execution");
+
+	assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn ctas_if_not_exists_incompatible_existing_target_returns_schema_mismatch() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+	catalog
+		.create_table(
+			&TableRef::new("people"),
+			schema(&[
+				Field::new("id", DataType::Int32, false),
+				Field::new("name", DataType::Utf8, true),
+			]),
+			false,
+		)
+		.await
+		.expect("register source descriptor only");
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE copy (id BIGINT NOT NULL)")
+				.expect("plan target"),
+			None,
+		)
+		.await
+		.expect("create incompatible target");
+
+	let err = coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id, name FROM people")
+				.expect("plan CTAS IF NOT EXISTS"),
+			None,
+		)
+		.await
+		.expect_err("incompatible target should fail");
+
+	assert!(
+		matches!(
+			err,
+			QueryError::Catalog(CatalogError::SchemaMismatch { .. })
+		),
+		"unexpected error: {err}"
+	);
 }
 
 #[tokio::test]
@@ -324,6 +475,139 @@ async fn query_coordinator_executes_projection_ctas() {
 }
 
 #[tokio::test]
+async fn ctas_if_not_exists_absent_target_creates_and_writes_like_current_ctas() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+
+	for sql in [
+		"CREATE TABLE people (id INT NOT NULL, name TEXT)",
+		"INSERT INTO people VALUES (1, 'Alice'), (2, 'Bob')",
+		"CREATE TABLE IF NOT EXISTS copy AS SELECT id, name FROM people",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let binding = catalog
+		.resolve_table(&TableRef::new("copy"))
+		.await
+		.expect("resolve CTAS table");
+	assert_field(&binding.schema, 0, "id", &DataType::Int32, false);
+	assert_field(&binding.schema, 1, "name", &DataType::Utf8, true);
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT id, name FROM copy ORDER BY id",
+	)
+	.await;
+	assert_eq!(int32_column(&batch, 0).values(), &[1, 2]);
+	assert_eq!(string_column(&batch, 1).value(0), "Alice");
+	assert_eq!(string_column(&batch, 1).value(1), "Bob");
+}
+
+#[tokio::test]
+async fn ctas_if_not_exists_compatible_raced_in_target_succeeds_without_writing() {
+	let base = Arc::new(MockCatalog::new());
+	let racing_catalog = Arc::new(RacingCatalog::new(
+		base,
+		TableRef::new("copy"),
+		schema(&[
+			Field::new("id", DataType::Int32, false),
+			Field::new("name", DataType::Utf8, true),
+		]),
+	));
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let setup = QueryCoordinator::with_writer(
+		racing_catalog.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(storage.clone());
+	let planner = SqlPlanner::new();
+	for sql in [
+		"CREATE TABLE people (id INT NOT NULL, name TEXT)",
+		"INSERT INTO people VALUES (1, 'Alice')",
+	] {
+		setup
+			.execute_query(&planner.plan(sql).expect("plan setup"), None)
+			.await
+			.expect(sql);
+	}
+	let no_write = QueryCoordinator::with_writer(
+		racing_catalog.clone(),
+		Executor::new(storage),
+		PlannerConfig::default(),
+		Arc::new(FailingWrite),
+	);
+
+	let results = no_write
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id, name FROM people")
+				.expect("plan raced CTAS"),
+			None,
+		)
+		.await
+		.expect("compatible raced-in table should skip write");
+
+	assert!(results.is_empty());
+	let binding = racing_catalog
+		.resolve_table(&TableRef::new("copy"))
+		.await
+		.expect("raced target registered");
+	assert_field(&binding.schema, 0, "id", &DataType::Int32, false);
+	assert_field(&binding.schema, 1, "name", &DataType::Utf8, true);
+}
+
+#[tokio::test]
+async fn ctas_if_not_exists_incompatible_raced_in_target_returns_schema_mismatch() {
+	let base = Arc::new(MockCatalog::new());
+	let racing_catalog = Arc::new(RacingCatalog::new(
+		base,
+		TableRef::new("copy"),
+		schema(&[Field::new("id", DataType::Int64, false)]),
+	));
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let coordinator = QueryCoordinator::with_writer(
+		racing_catalog,
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage,
+	);
+	let planner = SqlPlanner::new();
+	for sql in [
+		"CREATE TABLE people (id INT NOT NULL, name TEXT)",
+		"INSERT INTO people VALUES (1, 'Alice')",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan setup"), None)
+			.await
+			.expect(sql);
+	}
+
+	let err = coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id, name FROM people")
+				.expect("plan raced CTAS"),
+			None,
+		)
+		.await
+		.expect_err("incompatible raced-in table should fail");
+
+	assert!(
+		matches!(
+			err,
+			QueryError::Catalog(CatalogError::SchemaMismatch { .. })
+		),
+		"unexpected error: {err}"
+	);
+}
+
+#[tokio::test]
 async fn query_coordinator_executes_aggregate_and_join_ctas() {
 	let (_catalog, _storage, coordinator, planner) = coordinator();
 
@@ -519,6 +803,40 @@ async fn distributed_coordinator_ctas_uses_distributed_source_path() {
 }
 
 #[tokio::test]
+async fn distributed_ctas_if_not_exists_existing_target_does_not_request_workers() {
+	let catalog = Arc::new(people_catalog().await);
+	catalog
+		.create_table(
+			&TableRef::new("copy"),
+			schema(&[
+				Field::new("id", DataType::Int32, false),
+				Field::new("name", DataType::Utf8, true),
+			]),
+			false,
+		)
+		.await
+		.expect("create compatible target");
+	let coordinator = DistributedQueryCoordinator::new(
+		catalog,
+		Arc::new(StaticWorkerRegistry::new([])),
+		Arc::new(MemoryManager::new(1, 1024 * 1024)),
+		Arc::new(FailingTransport),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let plan = SqlPlanner::new()
+		.plan("CREATE TABLE IF NOT EXISTS copy AS SELECT id, name FROM people")
+		.expect("plan CTAS IF NOT EXISTS");
+
+	let results = coordinator
+		.execute_query(&plan)
+		.await
+		.expect("compatible target should skip distributed source workers");
+
+	assert!(results.is_empty());
+}
+
+#[tokio::test]
 async fn executor_and_fragmenter_reject_direct_ctas_execution() {
 	let catalog = people_catalog().await;
 	let source = catalog
@@ -528,6 +846,7 @@ async fn executor_and_fragmenter_reject_direct_ctas_execution() {
 	let plan = ExecutionPlan::CreateTableAsSelect {
 		table: TableRef::new("copy"),
 		schema: source.schema.clone(),
+		if_not_exists: false,
 		or_replace: false,
 		source: Box::new(scan_plan(&source)),
 	};
@@ -561,6 +880,29 @@ async fn executor_and_fragmenter_reject_direct_ctas_execution() {
 	)
 	.expect_err("fragmenter should reject CTAS");
 	assert_eq!(err, FragmentError::CreateTableAsSelectNotFragmentable);
+}
+
+#[tokio::test]
+async fn catalog_create_outcome_reports_created_true_and_false() {
+	let catalog = MockCatalog::new();
+	let table = TableRef::new("copy");
+	let table_schema = schema(&[Field::new("id", DataType::Int32, false)]);
+
+	let created = catalog
+		.create_table_with_outcome(&table, table_schema.clone(), true)
+		.await
+		.expect("fresh create");
+	assert!(created.created);
+
+	let existing = catalog
+		.create_table_with_outcome(&table, table_schema, true)
+		.await
+		.expect("compatible existing");
+	assert!(!existing.created);
+	assert_eq!(
+		created.binding.legacy_table_id,
+		existing.binding.legacy_table_id
+	);
 }
 
 async fn people_catalog() -> MockCatalog {
@@ -672,6 +1014,80 @@ fn string_column(batch: &RecordBatch, index: usize) -> &StringArray {
 		.as_any()
 		.downcast_ref::<StringArray>()
 		.expect("Utf8 column")
+}
+
+struct RacingCatalog {
+	inner: Arc<MockCatalog>,
+	target: TableRef,
+	raced_schema: SchemaRef,
+}
+
+impl RacingCatalog {
+	fn new(inner: Arc<MockCatalog>, target: TableRef, raced_schema: SchemaRef) -> Self {
+		Self {
+			inner,
+			target,
+			raced_schema,
+		}
+	}
+}
+
+#[async_trait]
+impl Catalog for RacingCatalog {
+	fn scoped(self: Arc<Self>, _tenant_id: TenantId) -> Arc<dyn Catalog> {
+		self
+	}
+
+	fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics> {
+		self.inner.descriptor_refresh_metrics()
+	}
+
+	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_table(table).await
+	}
+
+	async fn resolve_table_local(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_table_local(table).await
+	}
+
+	async fn resolve_table_id(
+		&self,
+		table: toron::ir::TableId,
+	) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_table_id(table).await
+	}
+
+	async fn invalidate_table_descriptor(
+		&self,
+		table: toron::ir::TableId,
+	) -> Result<Option<InvalidatedDescriptor>, CatalogError> {
+		self.inner.invalidate_table_descriptor(table).await
+	}
+
+	async fn create_table_with_outcome(
+		&self,
+		name: &TableRef,
+		schema: SchemaRef,
+		if_not_exists: bool,
+	) -> Result<CreateTableOutcome, CatalogError> {
+		if if_not_exists && name == &self.target {
+			let _ = self
+				.inner
+				.create_table(name, self.raced_schema.clone(), true)
+				.await?;
+		}
+		self.inner
+			.create_table_with_outcome(name, schema, if_not_exists)
+			.await
+	}
+
+	async fn drop_table(
+		&self,
+		name: &TableRef,
+		if_exists: bool,
+	) -> Result<Option<TableBinding>, CatalogError> {
+		self.inner.drop_table(name, if_exists).await
+	}
 }
 
 struct FailingTransport;

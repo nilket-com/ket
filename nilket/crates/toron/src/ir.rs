@@ -228,6 +228,7 @@ pub enum LogicalPlan {
 	},
 	CreateTableAsSelect {
 		table: TableRef,
+		if_not_exists: bool,
 		or_replace: bool,
 		source: Box<LogicalPlan>,
 	},

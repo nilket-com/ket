@@ -4526,7 +4526,7 @@ along with the forward-sequence rewrite.
   including passing full `cargo test -p toron -- --test-threads=6` and
   `cargo test -p wendelon -- --test-threads=6` runs.
 - **ADR 061 — CTAS `IF NOT EXISTS` with Race-Safe Catalog Create Outcome.**
-  Promoted. The SQL-surface-widening pivot after the governance/cancellation
+  Implemented. The SQL-surface-widening pivot after the governance/cancellation
   arc: `CREATE TABLE IF NOT EXISTS … AS SELECT …` (rejected today at
   `sql_planner.rs:911`) is now accepted. The substance is a **race-correctness
   cut**, not parser polish — CTAS executes the source **before** creating the
@@ -4556,7 +4556,9 @@ along with the forward-sequence rewrite.
   scoped `…_except_retarget`. **Toron SQL/coordinator only; no Wendelon
   server/wire or worker-protocol change; no new storage primitive.**
   Placement: Exterior Substrate → Toron home. Migration:
-  `plans/impl/061_ctas_if_not_exists.md`.
+  `plans/impl/061_ctas_if_not_exists.md`; implementation evidence is recorded
+  in `plans/impl/061_ctas_if_not_exists_evidence.md`, including passing full
+  `cargo test -p toron -- --test-threads=6`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4641,12 +4643,13 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 061 promoted; ADR 062 candidates
+### ADR 061 implemented; ADR 062 candidates
 
-ADR 061 selected and promoted **CTAS `IF NOT EXISTS` with Race-Safe Catalog
-Create Outcome** — the SQL-surface-widening pivot after the long governance/
-cancellation arc. `CREATE TABLE IF NOT EXISTS … AS SELECT …` (rejected today
-at `sql_planner.rs:911`) is now accepted, with the substance being a
+ADR 061 selected, promoted, and implemented **CTAS `IF NOT EXISTS` with
+Race-Safe Catalog Create Outcome** — the SQL-surface-widening pivot after the
+long governance/cancellation arc. `CREATE TABLE IF NOT EXISTS … AS SELECT …`
+(rejected today at `sql_planner.rs:911`) is now accepted, with the substance
+being a
 **race-correctness cut**: CTAS executes the source *before* creating the
 target, so a compatible target can race in; the fix is a catalog
 **`CreateTableOutcome { binding, created }`** gating the write
@@ -4684,7 +4687,9 @@ server or wire change.**
 - `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
   no-`*V1`. Placement: Exterior Substrate → Toron home.
 
-The migration is materialized in `plans/impl/061_ctas_if_not_exists.md`.
+The migration is materialized in `plans/impl/061_ctas_if_not_exists.md`; the
+implementation evidence is recorded in
+`plans/impl/061_ctas_if_not_exists_evidence.md`.
 
 **ADR 062 candidates:**
 

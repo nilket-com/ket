@@ -858,6 +858,13 @@ async fn drop_existing_table_with_storage_admin(
 	Ok(true)
 }
 
+fn query_table_name(table: &crate::catalog::TableRef) -> String {
+	match &table.schema {
+		Some(schema) => format!("{schema}.{}", table.table),
+		None => table.table.clone(),
+	}
+}
+
 fn default_distributed_execution_context() -> ExecutionContext {
 	ExecutionContext::new(
 		crate::ir::SessionId(1),
@@ -1007,15 +1014,37 @@ async fn execute_write_plan_with_source(
 		ExecutionPlan::CreateTableAsSelect {
 			table,
 			schema,
+			if_not_exists,
 			or_replace,
 			source,
 		} => {
+			if *if_not_exists {
+				match catalog.resolve_table(table).await {
+					Ok(existing) => {
+						if existing.schema.as_ref() == schema.as_ref() {
+							return Ok(Vec::new());
+						}
+						return Err(CatalogError::SchemaMismatch {
+							table: query_table_name(table),
+						}
+						.into());
+					}
+					Err(CatalogError::TableNotFound { .. }) => {}
+					Err(error) => return Err(error.into()),
+				}
+			}
 			let source_batches = source_executor.execute_read_plan(source).await?;
 			if *or_replace {
 				drop_existing_table_with_storage_admin(catalog, admin, context, table, true)
 					.await?;
 			}
-			let binding = catalog.create_table(table, schema.clone(), false).await?;
+			let outcome = catalog
+				.create_table_with_outcome(table, schema.clone(), *if_not_exists)
+				.await?;
+			if !outcome.created {
+				return Ok(Vec::new());
+			}
+			let binding = outcome.binding;
 			let target_columns = (0..schema.fields().len())
 				.map(|index| ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow")))
 				.collect::<Vec<_>>();
@@ -2688,12 +2717,12 @@ mod tests {
 			}))
 		}
 
-		async fn create_table(
+		async fn create_table_with_outcome(
 			&self,
 			_name: &TableRef,
 			_schema: SchemaRef,
 			_if_not_exists: bool,
-		) -> Result<TableBinding, CatalogError> {
+		) -> Result<crate::catalog::CreateTableOutcome, CatalogError> {
 			Err(CatalogError::AdminFailed {
 				message: "RefreshingCatalog does not create tables".to_string(),
 			})
