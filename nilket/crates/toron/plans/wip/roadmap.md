@@ -4488,6 +4488,39 @@ along with the forward-sequence rewrite.
   evidence is recorded in
   `plans/impl/059_distributed_query_cancellation_evidence.md`, including a
   passing full `cargo test -p toron -- --test-threads=6` run.
+- **ADR 060 — Wendelon Table-Query Cancellation Consumer.**
+  Promoted. The **consumer** that closes the **059 → 073 → 060** end-to-end
+  cancellation chain: when a Toron query is cancelled (timeout / disconnect /
+  SQL `Cancel` / worker `CancelTask`), Toron now **actively cancels its
+  in-flight Wendelon `TABLE_QUERY_REQ` reads** by calling Wendelon ADR 073's
+  `cancel_table_query_attempt`, instead of letting them run to completion
+  (Wendelon **materializes before responding**, so the dropped stream is
+  observed too late). **Spine:** a Wendelon-client **hook** surfaces the
+  concrete `(NodeId, TenantId, TableQueryRequestId)` attempt the lower retry
+  loop chose (after selection, before write — Toron **surfaces, does not
+  generate**, since `client/core.rs:599` regenerates per attempt and would
+  overwrite a Toron-made id → no-op cancel); `WendelonStorageScan` registers
+  it (RAII guard) with a **downstream-attempt registry** owned by the parent
+  ADR 059 cancellation state; the parent's `cancel()` **snapshots and fires**
+  bounded detached cancels — the same fan-out discipline as 059's worker
+  cancels, client never waiting on the ack (059 D17). **Trigger is
+  parent-fired**, not a scan-drop guard or per-scan `AbortOnDrop` watcher
+  (both raced by 059's `select!` teardown). `QUERY_CANCELLED` →
+  `TaskFailureKind::Cancelled`; cancel-before-scan → no request; no
+  pre-admission cancel; no Toron identity on the Wendelon wire; aggregate-only
+  separate counter. **Producer-only boundary respected** — no 073 change.
+  Final D-set: **22 decisions, 20 architecture + 3 convention + meta guards,
+  14 required fixtures.** Council: **3-of-3 (Claude, Codex, Gemini)** — the
+  run's second straight clean convergence (Gemini conceded its per-scan
+  watcher to the parent-fired registry). **Prior-guard reconciliation:**
+  `adr059_no_wendelon_storage_cancellation_claim` is **retargeted** (it would
+  otherwise go false) to the honest residual — Toron cancels in-flight
+  **table-query** reads, best-effort/checkpoint-bounded (073 covers
+  `TABLE_QUERY_REQ` only); the meta-guard is scoped `…_except_retarget`.
+  **This retires 059's no-Wendelon-storage-cancellation caveat.**
+  **Toron-ring consumer; node-local; no new wire / Control-Ring / transport.**
+  Placement: Exterior Substrate → Toron home. Migration:
+  `plans/impl/060_wendelon_table_query_cancellation_consumer.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4572,7 +4605,79 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 059 implemented; ADR 060 candidates
+### ADR 060 promoted; ADR 061 candidates
+
+ADR 060 selected and promoted **Wendelon Table-Query Cancellation Consumer**
+— the thin Toron consumer that closes the **059 → 073 → 060** end-to-end
+cancellation chain. A cancelled Toron query (timeout / disconnect / SQL
+`Cancel` / worker `CancelTask`) now **actively cancels its in-flight Wendelon
+`TABLE_QUERY_REQ` reads** via Wendelon ADR 073's `cancel_table_query_attempt`
+— Wendelon materializes before responding, so the dropped stream is too late.
+A Wendelon-client **hook** surfaces the concrete `(NodeId, TenantId,
+TableQueryRequestId)` attempt (Toron **surfaces, does not generate** — the
+lower client regenerates per attempt at `client/core.rs:599`); a
+**downstream-attempt registry** owned by the parent 059 cancellation state
+holds it (RAII), and the parent's `cancel()` snapshots + fires **bounded
+detached** cancels (059's fan-out discipline; client never waits on the ack).
+Final D-set: **22 decisions, 20 architecture + 3 convention + meta guards,
+14 required fixtures**.
+
+**Toron-ring consumer; node-local; reuses Wendelon 073's existing cancel
+wire; zero new SQL wire variant / Control-Ring RPC / transport change; no
+073-producer change.**
+
+**Key decisions / invariants:**
+
+- **Promoted 3-of-3 (Claude, Codex, Gemini)** — the run's second straight
+  clean convergence (after Wendelon 073). Gemini conceded its per-scan
+  `AbortOnDrop` watcher to the parent-fired registry.
+- **Trigger is parent-fired**, not a scan-drop guard or per-scan watcher —
+  059's `select!` drops the whole task future, racing/bypassing any
+  scan-local trigger; the parent `cancel()` fires synchronously.
+- **Surface, not generate:** a Toron-generated id would be overwritten by the
+  lower client's per-attempt `random()` (`core.rs:599`) → a no-op cancel; the
+  hook surfaces the id actually sent.
+- **Worker fires on `CancelTask` before drop-at-await;** cancel-before-scan →
+  no `TABLE_QUERY_REQ`; no pre-admission cancel; `QUERY_CANCELLED` →
+  `TaskFailureKind::Cancelled`.
+- **Cross-ring boundary intact:** one cancel per in-flight attempt; **no
+  Toron identity** (`QueryId`/`TaskIdentity`) on the Wendelon wire or in
+  metric labels; aggregate-only separate counter.
+- **Prior-guard reconciliation:** `adr059_no_wendelon_storage_cancellation_
+  claim` **retargeted** (would otherwise go false) to the honest residual —
+  best-effort table-query read cancellation; meta-guard scoped
+  `…_except_retarget`. **Retires 059's no-Wendelon caveat.**
+- `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
+  no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in
+`plans/impl/060_wendelon_table_query_cancellation_consumer.md`.
+
+**ADR 061 candidates:**
+
+- **Audit subsystem** (045 D7) — shared `observability-audit` crate,
+  crypto-chained, fail-open, archive/syslog; its own compliance sequence.
+  Carried since 045; the most-deferred substantive item.
+- **SQL surface widening** — `UPDATE … WHERE`, `… RETURNING`, CTAS `IF NOT
+  EXISTS`; concrete First-Query-with-Integrity completeness gaps.
+- **Parser/front-end rate throttle** (evidence-gated; 058 byte caps landed
+  first); **pre-TLS/IP throttle** (057 Tier 1 covers the connection axis);
+  **OTLP trace export**; **descriptor-refresh hardening**; **JWT/OIDC/SPIFFE
+  tenant claims**; gRPC / Arrow Flight / Postgres frontends; prepared
+  statements — all carried forward.
+- **Wendelon-side follow-ons** (Wendelon sequence, cross-referenced): extend
+  073's cancellation beyond `TABLE_QUERY_REQ` to legacy `QUERY_REQ` /
+  `AGG_REQ` if a consumer appears.
+
+The cross-ring **distributed query cancellation arc is now complete**:
+ADR 059 (Toron worker abort) → Wendelon ADR 073 (storage-read abort
+producer) → ADR 060 (Toron consumer). A compute-level cancel now has an
+explicit bounded path to both Toron worker abort and Wendelon table-query
+abort; Wendelon read termination remains ADR 073's best-effort,
+checkpoint-bounded contract rather than a broader storage-cancellation
+claim.
+
+### ADR 059 implemented; ADR 060 candidates (HISTORICAL)
 
 ADR 059 selected, promoted, and implemented **Distributed Query Cancellation
 Completeness** — cancellation is now real for already-dispatched distributed
