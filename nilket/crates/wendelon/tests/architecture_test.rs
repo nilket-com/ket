@@ -6471,26 +6471,13 @@ fn adr072_schema_update_and_drop_paths_stay_unchanged() {
 
 #[test]
 fn adr072_no_toron_descriptor_sync_stub() {
-	let root = workspace_root().join("crates/toron/src");
-	let mut violations = Vec::new();
-	walk_dir(&root, &mut |path| {
-		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-			return;
-		}
-		let Ok(content) = fs::read_to_string(path) else {
-			return;
-		};
-		for forbidden in [
-			"get_table_schema_descriptor",
-			"sync_descriptor_for_tenant",
-			"DescriptorSource",
-		] {
-			if content.contains(forbidden) {
-				violations.push(format!("{} contains {forbidden}", path.display()));
-			}
-		}
-	});
-	assert!(violations.is_empty(), "{}", violations.join("\n"));
+	let catalog = read_workspace("crates/toron/src/catalog.rs");
+	assert!(catalog.contains("trait DescriptorSyncClient"));
+	assert!(catalog.contains("Client::get_table_schema_descriptor"));
+	assert!(catalog.contains("sync_descriptor_for_tenant"));
+	assert!(!catalog.contains("DescriptorSource"));
+	assert!(!catalog.contains("todo!(\"descriptor sync"));
+	assert!(!catalog.contains("unimplemented!(\"descriptor sync"));
 }
 
 #[test]
@@ -6547,6 +6534,427 @@ fn adr072_prior_adr_guards_continue_to_pass() {
 		assert!(
 			architecture.contains(required),
 			"missing prior guard {required}"
+		);
+	}
+}
+
+fn adr073_active_registry_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"struct ActiveTableQueryRegistry",
+		"#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum LeaseGateResult",
+	)
+}
+
+fn adr073_table_query_handler_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"async fn handle_table_query",
+		"async fn handle_table_query_cancel",
+	)
+}
+
+fn adr073_cancel_handler_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"async fn handle_table_query_cancel",
+		"async fn handle_aggregate",
+	)
+}
+
+fn adr073_plan_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"async fn prepare_table_query_execution_plan_with_migration_with_cancellation",
+		"async fn execute_aggregate_with_migration_merge",
+	)
+}
+
+#[test]
+fn adr073_table_query_cancel_is_wendelon_home_producer_only() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	assert!(schema.contains("pub struct TableQueryRequestId"));
+	assert!(data_server.contains("ActiveTableQueryRegistry"));
+
+	let mut toron_hits = Vec::new();
+	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let content = fs::read_to_string(path).unwrap();
+		for forbidden in [
+			"TableQueryRequestId",
+			"TableQueryCancel",
+			"TABLE_QUERY_CANCEL",
+			"cancel_table_query_attempt",
+			"QUERY_CANCELLED",
+		] {
+			if content.contains(forbidden) {
+				toron_hits.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	});
+	assert!(toron_hits.is_empty(), "{}", toron_hits.join("\n"));
+}
+
+#[test]
+fn adr073_table_query_request_id_is_wendelon_owned_not_toron() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	assert!(schema.contains("pub struct TableQueryRequestId([u8; 16]);"));
+	assert!(schema.contains("pub fn from_u128(value: u128) -> Self"));
+	assert!(schema.contains("pub fn get(self) -> u128"));
+	for forbidden in ["QueryId", "TaskIdentity", "ClientWriteId"] {
+		let region = source_region(
+			&schema,
+			"pub struct TableQueryRequestId",
+			"// ============================================================\n//  TABLE WRITE WIRE METADATA AND ADMISSION",
+		);
+		assert!(
+			!region.contains(forbidden),
+			"request id must not import {forbidden}"
+		);
+	}
+	assert!(client.contains("attempt_request.meta.request_id = TableQueryRequestId::random();"));
+}
+
+#[test]
+fn adr073_table_query_request_id_is_required_fixed_meta() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let meta = source_region(
+		&schema,
+		"pub struct TableQueryRequestMeta",
+		"pub struct TableQueryCancelStatus",
+	);
+	assert!(meta.contains("pub request_id: TableQueryRequestId"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 136"));
+	assert!(schema.contains("offset_of!(TableQueryRequestMeta, request_id), 120"));
+	assert!(client.contains("TABLE_QUERY_REQ request_id must be non-zero"));
+	assert!(data_server.contains("TABLE_QUERY_REQ request_id must be non-zero"));
+}
+
+#[test]
+fn adr073_no_table_query_meta_extension_or_compat_path() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	assert!(!schema.contains("TableQueryRequestMetaExtension"));
+	assert!(!schema.contains("TableQueryRequestMetaV1"));
+	assert!(!data_server.contains("TABLE_QUERY_META_EXTENSION"));
+	assert!(!data_server.contains("uncancellable"));
+	assert!(data_server.contains(
+		"*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableQueryRequestMeta>()])"
+	));
+}
+
+#[test]
+fn adr073_table_query_cancel_msg_types_are_3e_3f_not_1f() {
+	let core = read_workspace("crates/wendelon/src/schema/core.rs");
+	assert!(core.contains("pub const AUDIT_CHAIN_HEAD_RESP: Self = Self(0x1F);"));
+	assert!(core.contains("pub const TABLE_QUERY_CANCEL_REQ: Self = Self(0x3E);"));
+	assert!(core.contains("pub const TABLE_QUERY_CANCEL_RESP: Self = Self(0x3F);"));
+	assert_eq!(core.matches("Self(0x3E)").count(), 1);
+	assert_eq!(core.matches("Self(0x3F)").count(), 1);
+	assert!(!core.contains("TABLE_QUERY_CANCEL_REQ: Self = Self(0x1F)"));
+}
+
+#[test]
+fn adr073_cancel_wire_uses_data_ring_bidi_not_control_plane() {
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	assert!(router.contains("MsgType::TABLE_QUERY_CANCEL_REQ.0"));
+	assert!(router.contains("Some(h) => h.handle_data_frame(context, frame).await"));
+	assert!(data_server.contains("MsgType::TABLE_QUERY_CANCEL_REQ => self"));
+	assert!(data_server.contains("handle_table_query_cancel"));
+	assert!(!control.contains("TABLE_QUERY_CANCEL"));
+}
+
+#[test]
+fn adr073_no_uni_stream_sidecar_listener_or_transport_redesign() {
+	let combined = format!(
+		"{}\n{}",
+		read_workspace("crates/wendelon/src/network/data_server.rs"),
+		read_workspace("crates/wendelon/src/network/router.rs")
+	);
+	for forbidden in [
+		"open_uni",
+		"accept_uni",
+		"TABLE_QUERY_CANCEL_LISTENER",
+		"table_query_cancel_listener",
+		"CancelTransport",
+	] {
+		assert!(
+			!combined.contains(forbidden),
+			"cancel wire must not add transport sidecar: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr073_active_table_query_registry_is_tenant_scoped_raii_removed() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let registry = adr073_active_registry_region(&data_server);
+	assert!(
+		data_server.contains("type TableQueryCancellationKey = (TenantId, TableQueryRequestId);")
+	);
+	assert!(registry.contains("struct ActiveTableQueryGuard"));
+	assert!(registry.contains("impl Drop for ActiveTableQueryGuard"));
+	assert!(registry.contains("state.active.remove(&key)"));
+	assert!(registry.contains("Arc::ptr_eq(active, token)"));
+	assert!(adr073_table_query_handler_region(&data_server).contains("let active_query = match"));
+}
+
+#[test]
+fn adr073_cancel_before_register_tombstone_is_bounded_and_consumed() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let registry = adr073_active_registry_region(&data_server);
+	assert!(registry.contains("TABLE_QUERY_CANCEL_TOMBSTONE_TTL"));
+	assert!(registry.contains("TABLE_QUERY_CANCEL_TOMBSTONE_CAP"));
+	assert!(registry.contains("pending: HashMap<TableQueryCancellationKey, Instant>"));
+	assert!(registry.contains("order: VecDeque<TableQueryTombstoneOrder>"));
+	assert!(registry.contains("state.pending.remove(&key).is_some()"));
+	assert!(registry.contains("Self::prune_locked(state, now)"));
+}
+
+#[test]
+fn adr073_cancellation_signal_uses_cancellation_token() {
+	let cargo = read_workspace("crates/wendelon/Cargo.toml");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let registry = adr073_active_registry_region(&data_server);
+	assert!(cargo.contains("tokio-util = \"0.7\""));
+	assert!(data_server.contains("use tokio_util::sync::CancellationToken;"));
+	assert!(registry.contains("Arc<CancellationToken>"));
+	assert!(registry.contains("token.cancel();"));
+	assert!(!registry.contains("Notify"));
+	assert!(!registry.contains("notify_waiters"));
+}
+
+#[test]
+fn adr073_cancel_is_idempotent_for_terminal_and_missing_requests() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let registry = adr073_active_registry_region(&data_server);
+	let cancel = source_region(registry, "fn cancel(", "fn finish(");
+	assert!(cancel.contains("state.active.get(&key)"));
+	assert!(cancel.contains("return TableQueryCancelStatus::ACCEPTED;"));
+	assert!(cancel.contains("state.terminal.contains_key(&key)"));
+	assert!(cancel.contains("return TableQueryCancelStatus::TERMINAL;"));
+	assert!(cancel.contains("TableQueryTombstoneKind::Pending"));
+	assert!(cancel.contains("TableQueryCancelStatus::ACCEPTED"));
+}
+
+#[test]
+fn adr073_cancel_response_is_oracle_safe() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let handler = adr073_cancel_handler_region(&data_server);
+	assert!(handler.contains("TableQueryCancelStatus::TERMINAL"));
+	assert!(handler.contains("authorize_actor_for_data"));
+	assert!(handler.contains("enforce_read_policy"));
+	assert!(handler.contains(".cancel(meta.tenant_id, meta.request_id)"));
+	assert!(!handler.contains("TableQueryRequestId::get"));
+	assert!(!handler.contains("table_object_id"));
+}
+
+#[test]
+fn adr073_table_query_checks_cancel_at_execution_boundaries() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let plan = adr073_plan_region(&data_server);
+	let ranged = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"// 4. Empty result is a legitimate answer.",
+	);
+	assert!(plan.matches("cancellation_token.is_cancelled()").count() >= 5);
+	assert!(ranged.matches("cancel.is_cancelled()").count() >= 7);
+	assert!(plan.contains("pull_migration_range"));
+	assert!(plan.contains("plan_table_query_execution_by_secondary_index"));
+	assert!(ranged.contains("for range in ranges"));
+	assert!(ranged.contains("for (key_identity, locality, location) in scanned"));
+	assert!(ranged.contains("for group in rebatch_groups"));
+}
+
+#[test]
+fn adr073_cancelled_table_query_has_stable_read_status() {
+	let core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	assert!(core.contains("pub const QUERY_CANCELLED: Self = Self(15);"));
+	assert!(core.contains("Self::QUERY_CANCELLED => \"query_cancelled\""));
+	assert!(client.contains("Wendelon query failed: QUERY_CANCELLED"));
+	assert!(client.contains("ErrorKind::Interrupted"));
+	assert!(data_server.contains("ReadStatus::QUERY_CANCELLED"));
+	assert!(adr073_table_query_handler_region(&data_server).contains("FRAME_FLAG_STREAM_END"));
+	assert!(adr073_table_query_handler_region(&data_server).contains("None"));
+}
+
+#[test]
+fn adr073_stream_drop_is_fallback_not_primary_mechanism() {
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	assert!(router.contains("observe_table_query_cancellation(\"stream_dropped\")"));
+	assert!(router.contains("resp.header.msg_type == MsgType::TABLE_QUERY_RESP.0"));
+	assert!(data_server.contains("TABLE_QUERY_CANCEL_REQ"));
+	assert!(data_server.contains("cancellation_token.is_cancelled()"));
+}
+
+#[test]
+fn adr073_cancel_releases_admission_buffers_and_scratch() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let handler = adr073_table_query_handler_region(&data_server);
+	let registry = adr073_active_registry_region(&data_server);
+	assert!(handler.contains("let active_query = match"));
+	assert!(registry.contains("impl Drop for ActiveTableQueryGuard"));
+	assert!(registry.contains("state.active.remove(&key)"));
+	assert!(data_server.contains("let _admission = match self.try_admit_data_request"));
+	assert!(!data_server.contains("std::mem::forget(active_query)"));
+	assert!(!data_server.contains("Box::leak"));
+}
+
+#[test]
+fn adr073_metrics_are_aggregate_only() {
+	let metrics = read_workspace("crates/wendelon/src/metrics/registry.rs");
+	assert!(metrics.contains("wendelon_table_query_cancellations_total"));
+	assert!(metrics.contains("TABLE_QUERY_CANCELLATION_OUTCOMES"));
+	assert!(metrics.contains("\"accepted\""));
+	assert!(metrics.contains("\"terminal\""));
+	assert!(metrics.contains("\"cancelled_response\""));
+	assert!(metrics.contains("\"stream_dropped\""));
+	for line in metrics
+		.lines()
+		.filter(|line| line.contains("table_query_cancellation"))
+	{
+		for forbidden in [
+			"(\"tenant\"",
+			"(\"table\"",
+			"(\"request_id\"",
+			"(\"node_id\"",
+			"(\"fingerprint\"",
+			"(\"endpoint\"",
+			"(\"sql\"",
+			"(\"peer\"",
+		] {
+			assert!(
+				!line.contains(forbidden),
+				"table-query cancellation metric must stay aggregate-only: {line}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr073_no_writes_cdc_admin_agg_or_legacy_query_scope() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	assert!(!schema.contains("WRITE_CANCEL"));
+	assert!(!schema.contains("AGG_CANCEL"));
+	assert!(!schema.contains("CDC_CANCEL"));
+	assert!(!schema.contains("pub const QUERY_CANCEL_REQ"));
+	assert!(!data_server.contains("MsgType::AGG_CANCEL"));
+	assert!(!data_server.contains("MsgType::QUERY_CANCEL_REQ"));
+	assert!(!data_server.contains("MsgType::WRITE_CANCEL"));
+}
+
+#[test]
+fn adr073_no_toron_storage_scan_consumer_claim() {
+	let mut violations = Vec::new();
+	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let content = fs::read_to_string(path).unwrap();
+		for forbidden in [
+			"cancel_table_query_attempt",
+			"TABLE_QUERY_CANCEL_REQ",
+			"TableQueryRequestId",
+			"QUERY_CANCELLED",
+		] {
+			if content.contains(forbidden) {
+				violations.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	});
+	assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn adr073_nilket_root_stays_runtime_free() {
+	adr072_nilket_root_stays_runtime_free();
+}
+
+#[test]
+fn adr073_fixture_worker_source_unchanged() {
+	let fixture = read_workspace("crates/toron/src/bin/toron_fixture_worker.rs");
+	for forbidden in [
+		"TableQueryRequestId",
+		"TableQueryCancel",
+		"TABLE_QUERY_CANCEL",
+		"QUERY_CANCELLED",
+	] {
+		assert!(
+			!fixture.contains(forbidden),
+			"fixture worker must not grow ADR073 surface: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr073_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	let combined = format!(
+		"{}\n{}\n{}\n{}",
+		read_workspace("crates/wendelon/src/schema/table.rs"),
+		read_workspace("crates/wendelon/src/schema/core.rs"),
+		read_workspace("crates/wendelon/src/client/core.rs"),
+		read_workspace("crates/wendelon/src/network/data_server.rs")
+	);
+	let identifiers = rust_identifiers_from_source("adr073 combined surface", &combined);
+	for required in [
+		"TableQueryRequestId",
+		"TableQueryCancelStatus",
+		"TableQueryCancelRequestMeta",
+		"TableQueryCancelResponseMeta",
+		"ActiveTableQueryRegistry",
+		"ActiveTableQueryGuard",
+	] {
+		assert!(
+			has_rust_identifier(&identifiers, required),
+			"missing table-query cancellation type {required}"
+		);
+	}
+	for forbidden in [
+		"WendelonTableQueryRequestId",
+		"WendelonTableQueryCancelRequest",
+		"TableQueryRequestIdV1",
+		"TableQueryCancelStatusV1",
+		"TableQueryCancelRequestMetaV1",
+		"TableQueryCancelResponseMetaV1",
+		"CancelRequest",
+		"CancelResponse",
+	] {
+		assert!(
+			!has_rust_identifier(&identifiers, forbidden),
+			"new cancellation surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr073_prior_wendelon_protocol_and_architecture_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr072_descriptor_get_msg_types_are_unique",
+		"fn adr072_prior_adr_guards_continue_to_pass",
+		"fn adr071_wendelon_inspect_branch_exists",
+		"fn test_adr070_all_null_page_skip_sparse_projection_guards",
+		"fn test_adr069_encoded_validity_sparse_projection_guards",
+		"fn test_adr068_fsst_row_safe_estimator_guards",
+		"fn test_adr067_row_safe_fsst_guards",
+		"fn test_adr066_fsst_evaluator_guards",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior Wendelon guard {required}"
 		);
 	}
 }

@@ -35,9 +35,9 @@ use wendelon::network::wire;
 use wendelon::schema::{
 	ClientWriteId, FinalizationMarker, FrameHeader, HybridTimestamp, Identity, MsgType, NodeId,
 	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus,
-	TableDeleteRowsRequestMeta, TableQueryRequestMeta, TableWriteRequestMeta, TenantId,
-	WriteRequestMeta, WriteStatus, encode_table_schema_descriptor_v1, encode_table_write_row_count,
-	read_key_schema, write_payload_schema,
+	TableDeleteRowsRequestMeta, TableQueryRequestId, TableQueryRequestMeta, TableWriteRequestMeta,
+	TenantId, WriteRequestMeta, WriteStatus, encode_table_schema_descriptor_v1,
+	encode_table_write_row_count, read_key_schema, write_payload_schema,
 };
 
 pub use wendelon::client::{
@@ -982,6 +982,7 @@ impl Client {
 				bytecode_len,
 				runtime_filter_len,
 				as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
+				request_id: TableQueryRequestId::ZERO,
 			},
 			descriptor: descriptor.clone(),
 			pbc,

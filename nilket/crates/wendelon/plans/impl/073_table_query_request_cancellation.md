@@ -1,6 +1,7 @@
 # Impl Plan 073: Table-Query Request Cancellation Producer Contract
 
-**Status:** Promoted, paired with
+**Status:** Implemented 2026-05-21; evidence recorded in
+`plans/impl/073_table_query_request_cancellation_evidence.md`. Paired with
 `plans/adr/073_table_query_request_cancellation.md`.
 **Posture:** Wendelon-ring only. Explicit cancel primitive for
 `TABLE_QUERY_REQ`; reuses the bidirectional data-ring transport; **no
@@ -136,17 +137,17 @@ Mirror Toron 059's `cancellation.rs`, with the **fixed** signal:
 
 ## Acceptance checklist
 
-- [ ] Phase 1: `TableQueryRequestId` (Pod-compatible u128 newtype, zero
+- [x] Phase 1: `TableQueryRequestId` (Pod-compatible u128 newtype, zero
       rejected by validation); meta grown + layout guard updated; `0x3E/0x3F`
       + `ReadStatus::QUERY_CANCELLED`.
-- [ ] Phase 2: registry + RAII guard + bounded tombstone + `CancellationToken`
+- [x] Phase 2: registry + RAII guard + bounded tombstone + `CancellationToken`
       (no hand-rolled `Notify`).
-- [ ] Phase 3: register-before-plan; checkpoints at D13 boundaries;
+- [x] Phase 3: register-before-plan; checkpoints at D13 boundaries;
       `QUERY_CANCELLED` no-body on pre-emission cancel; RAII resource release;
       stream-drop fallback.
-- [ ] Phase 4: oracle-safe idempotent cancel handler on the data ring.
-- [ ] Phase 5: per-attempt id; producer-only client cancel helper; no Toron
+- [x] Phase 4: oracle-safe idempotent cancel handler on the data ring.
+- [x] Phase 5: per-attempt id; producer-only client cancel helper; no Toron
       change.
-- [ ] Phase 6: aggregate-only metrics.
-- [ ] Phase 7: 22+meta guards, 19 fixtures, evidence + roadmap; no
+- [x] Phase 6: aggregate-only metrics.
+- [x] Phase 7: 22+meta guards, 19 fixtures, evidence + roadmap; no
       control-plane / legacy-query / Toron / audit-subsystem drift.

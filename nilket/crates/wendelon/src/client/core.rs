@@ -61,11 +61,13 @@ use crate::schema::{
 	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
 	ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN, StateDigest,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta,
-	TableDescriptorGetResponseMeta, TableObjectId, TableQueryRequestMeta, TableSchemaDescriptor,
-	TableWriteRequestMeta, TableWriteResponseMeta, TenantId, WriteRequestMeta, WriteResponseMeta,
-	WriteStatus, WriterNodeId, column_projection_prefix_ranges, decode_table_schema_descriptor_v1,
-	read_key_schema, read_value_schema, table_spread_prefix_ranges,
-	validate_table_write_request_batch, write_payload_schema,
+	TableDescriptorGetResponseMeta, TableObjectId, TableQueryCancelRequestMeta,
+	TableQueryCancelResponseMeta, TableQueryRequestId, TableQueryRequestMeta,
+	TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
+	WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
+	column_projection_prefix_ranges, decode_table_schema_descriptor_v1, read_key_schema,
+	read_value_schema, table_spread_prefix_ranges, validate_table_write_request_batch,
+	write_payload_schema,
 };
 use arrow::array::{Array, FixedSizeBinaryBuilder, LargeBinaryArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -573,7 +575,11 @@ impl WendelonClient {
 		&self,
 		request: TableQueryRequest,
 	) -> std::io::Result<StreamingQueryResult> {
-		validate_table_query_request(&request)?;
+		let mut validation_request = request.clone();
+		if validation_request.meta.request_id.is_zero() {
+			validation_request.meta.request_id = TableQueryRequestId::random();
+		}
+		validate_table_query_request(&validation_request)?;
 		let route_locality =
 			table_query_route_locality(request.meta.tenant_id, &request.descriptor)?;
 		let requested_stats_pruning =
@@ -583,13 +589,15 @@ impl WendelonClient {
 			let target = preferred_target.unwrap_or(self.target_for_locality(route_locality)?);
 			let effective_stats_pruning =
 				self.slab_stats_pruning_for_target(target, requested_stats_pruning);
-			let attempt_request = if effective_stats_pruning == requested_stats_pruning {
+			let mut attempt_request = if effective_stats_pruning == requested_stats_pruning {
 				request.clone()
 			} else {
 				let mut adjusted = request.clone();
 				adjusted.meta._pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
 				adjusted
 			};
+			attempt_request.meta.request_id = TableQueryRequestId::random();
+			validate_table_query_request(&attempt_request)?;
 			match self.table_query_once(target, &attempt_request).await? {
 				QueryOutcome::Ok(result) => return Ok(result),
 				QueryOutcome::Redirect(retry) => {
@@ -602,6 +610,50 @@ impl WendelonClient {
 			}
 		}
 		unreachable!("bounded retry loop must return within budget")
+	}
+
+	pub async fn cancel_table_query_attempt(
+		&self,
+		target: NodeId,
+		tenant_id: TenantId,
+		request_id: TableQueryRequestId,
+	) -> std::io::Result<TableQueryCancelResponseMeta> {
+		if request_id.is_zero() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"TABLE_QUERY_CANCEL_REQ request_id must be non-zero",
+			));
+		}
+		let request = TableQueryCancelRequestMeta {
+			tenant_id,
+			request_id,
+		};
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_QUERY_CANCEL_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<TableQueryCancelRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(&request),
+			None,
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_table_query_cancel_response_frame(frame)
 	}
 
 	/// Open a CDC subscription stream for one tenant table.
@@ -1605,6 +1657,10 @@ fn query_failure_error(status: ReadStatus) -> Error {
 			ErrorKind::Other,
 			"Wendelon query failed: QUERY_BUDGET_EXCEEDED",
 		),
+		s if s == ReadStatus::QUERY_CANCELLED => Error::new(
+			ErrorKind::Interrupted,
+			"Wendelon query failed: QUERY_CANCELLED",
+		),
 		other => Error::new(
 			ErrorKind::Other,
 			format!("Wendelon query failed: status={}", other.0),
@@ -1688,6 +1744,12 @@ fn decode_initial_query_response(
 
 fn validate_table_query_request(request: &TableQueryRequest) -> std::io::Result<()> {
 	request.descriptor.validate()?;
+	if request.meta.request_id.is_zero() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_QUERY_REQ request_id must be non-zero",
+		));
+	}
 	if request.meta.table_object_id != request.descriptor.table_object_id {
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
@@ -2109,6 +2171,35 @@ fn decode_table_descriptor_get_response_frame(
 		response,
 		descriptor,
 	})
+}
+
+fn decode_table_query_cancel_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<TableQueryCancelResponseMeta> {
+	if frame.header.msg_type != MsgType::TABLE_QUERY_CANCEL_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected TABLE_QUERY_CANCEL_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() != std::mem::size_of::<TableQueryCancelResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_QUERY_CANCEL_RESP meta size mismatch",
+		));
+	}
+	if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_QUERY_CANCEL_RESP must not carry payload bytes",
+		));
+	}
+	let response: TableQueryCancelResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableQueryCancelResponseMeta>()]);
+	Ok(response)
 }
 
 fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
@@ -2840,6 +2931,7 @@ mod tests {
 		assert!(retry_read_status(ReadStatus::QUERY_BUDGET_EXCEEDED, zero).is_none());
 		assert!(retry_read_status(ReadStatus::RETENTION_EXPIRED, zero).is_none());
 		assert!(retry_read_status(ReadStatus::TABLE_DESCRIPTOR_EVOLVED, zero).is_none());
+		assert!(retry_read_status(ReadStatus::QUERY_CANCELLED, zero).is_none());
 	}
 
 	#[test]
@@ -2904,6 +2996,7 @@ mod tests {
 				bytecode_len: 2,
 				runtime_filter_len: 0,
 				as_of_hlc: bytemuck::Zeroable::zeroed(),
+				request_id: TableQueryRequestId::from_u128(1),
 			},
 			descriptor,
 			pbc: vec![0x01, 0x02],
@@ -2919,6 +3012,11 @@ mod tests {
 
 		let mut bad = request.clone();
 		bad.meta.physical_descriptor_fingerprint = [0xFF; 32];
+		let err = validate_table_query_request(&bad).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+		let mut bad = request.clone();
+		bad.meta.request_id = TableQueryRequestId::ZERO;
 		let err = validate_table_query_request(&bad).unwrap_err();
 		assert_eq!(err.kind(), ErrorKind::InvalidInput);
 	}
@@ -3076,6 +3174,10 @@ mod tests {
 		assert_eq!(
 			query_failure_error(ReadStatus::TABLE_DESCRIPTOR_EVOLVED).to_string(),
 			"Wendelon query failed: TABLE_DESCRIPTOR_EVOLVED"
+		);
+		assert_eq!(
+			query_failure_error(ReadStatus::QUERY_CANCELLED).to_string(),
+			"Wendelon query failed: QUERY_CANCELLED"
 		);
 		assert_eq!(
 			query_failure_error(ReadStatus::TENANT_UNAVAILABLE).to_string(),

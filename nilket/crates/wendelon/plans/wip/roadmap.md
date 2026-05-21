@@ -195,7 +195,7 @@ ran in. Only workspace-shared Interior substrate (`tls-pki`,
 
 ## Forward sequence
 
-**Promoted (plan) — ADR 073 Table-Query Request Cancellation
+**Implemented — ADR 073 Table-Query Request Cancellation
 Producer Contract (cross-ring cancellation producer).** The
 deferred half of Toron ADR 059's honesty boundary: 059 made Toron
 worker cancellation real but did **not** cancel already-issued
@@ -227,7 +227,8 @@ ADR 072 precedent). Council: **3-of-3 (Claude, Codex, Gemini)** —
 the strongest-aligned promotion of the cancellation arc; **19
 decisions, 22 architecture guards + 1 meta guard, 19 required
 fixtures**. Plans: `plans/adr/073_table_query_request_cancellation.md`
-+ `plans/impl/073_table_query_request_cancellation.md`.
++ `plans/impl/073_table_query_request_cancellation.md`; evidence:
+`plans/impl/073_table_query_request_cancellation_evidence.md`.
 **Next consumer:** Toron ADR 060 — wires Toron ADR 059
 cancellation into this primitive (Toron sequence, cross-referenced,
 not owned here).

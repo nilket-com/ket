@@ -121,6 +121,78 @@ impl From<TableObjectId> for [u8; 16] {
 	}
 }
 
+#[derive(
+	Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable, Serialize, Deserialize,
+)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct TableQueryRequestId([u8; 16]);
+
+impl TableQueryRequestId {
+	pub const ZERO: Self = Self([0; 16]);
+
+	pub const fn new(bytes: [u8; 16]) -> Self {
+		Self(bytes)
+	}
+
+	pub fn from_u128(value: u128) -> Self {
+		Self(value.to_be_bytes())
+	}
+
+	pub fn random() -> Self {
+		loop {
+			let id = Self(*uuid::Uuid::new_v4().as_bytes());
+			if !id.is_zero() {
+				return id;
+			}
+		}
+	}
+
+	pub const fn as_bytes(&self) -> &[u8; 16] {
+		&self.0
+	}
+
+	pub const fn into_bytes(self) -> [u8; 16] {
+		self.0
+	}
+
+	pub fn get(self) -> u128 {
+		u128::from_be_bytes(self.0)
+	}
+
+	pub const fn is_zero(self) -> bool {
+		let bytes = self.0;
+		bytes[0] == 0
+			&& bytes[1] == 0
+			&& bytes[2] == 0
+			&& bytes[3] == 0
+			&& bytes[4] == 0
+			&& bytes[5] == 0
+			&& bytes[6] == 0
+			&& bytes[7] == 0
+			&& bytes[8] == 0
+			&& bytes[9] == 0
+			&& bytes[10] == 0
+			&& bytes[11] == 0
+			&& bytes[12] == 0
+			&& bytes[13] == 0
+			&& bytes[14] == 0
+			&& bytes[15] == 0
+	}
+}
+
+impl From<[u8; 16]> for TableQueryRequestId {
+	fn from(value: [u8; 16]) -> Self {
+		Self::new(value)
+	}
+}
+
+impl From<TableQueryRequestId> for [u8; 16] {
+	fn from(value: TableQueryRequestId) -> Self {
+		value.0
+	}
+}
+
 // ============================================================
 //  TABLE WRITE WIRE METADATA AND ADMISSION
 // ============================================================
@@ -241,9 +313,46 @@ pub struct TableQueryRequestMeta {
 	pub runtime_filter_len: u32, //  4 bytes
 	/// Time-travel upper bound (zero = latest).
 	pub as_of_hlc: HybridTimestamp, // 16 bytes
+	/// Client-generated attempt identity for TABLE_QUERY_CANCEL_REQ.
+	pub request_id: TableQueryRequestId, // 16 bytes
 }
 
-const _: () = assert!(std::mem::size_of::<TableQueryRequestMeta>() == 120);
+const _: () = assert!(std::mem::size_of::<TableQueryRequestMeta>() == 136);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct TableQueryCancelStatus(pub u8);
+
+impl TableQueryCancelStatus {
+	pub const ACCEPTED: Self = Self(0);
+	pub const TERMINAL: Self = Self(1);
+
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::ACCEPTED => "accepted",
+			Self::TERMINAL => "terminal",
+			_ => "unknown",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct TableQueryCancelRequestMeta {
+	pub tenant_id: TenantId,             //  8 bytes
+	pub request_id: TableQueryRequestId, // 16 bytes
+}
+
+const _: () = assert!(std::mem::size_of::<TableQueryCancelRequestMeta>() == 24);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct TableQueryCancelResponseMeta {
+	pub status: TableQueryCancelStatus, //  1 byte
+	pub _pad: [u8; 7],                  //  7 bytes
+}
+
+const _: () = assert!(std::mem::size_of::<TableQueryCancelResponseMeta>() == 8);
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -4007,7 +4116,10 @@ mod tests {
 
 	#[test]
 	fn table_query_wire_contract_carries_descriptor_pin_pbc_and_runtime_filter_len() {
-		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 120);
+		assert_eq!(TableQueryRequestId::from_u128(42).get(), 42);
+		assert!(TableQueryRequestId::ZERO.is_zero());
+
+		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 136);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, min_hlc), 0);
 		assert_eq!(
 			std::mem::offset_of!(TableQueryRequestMeta, expected_epoch),
@@ -4041,6 +4153,21 @@ mod tests {
 			100
 		);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, as_of_hlc), 104);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, request_id), 120);
+		assert_eq!(std::mem::size_of::<TableQueryCancelRequestMeta>(), 24);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryCancelRequestMeta, tenant_id),
+			0
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryCancelRequestMeta, request_id),
+			8
+		);
+		assert_eq!(std::mem::size_of::<TableQueryCancelResponseMeta>(), 8);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryCancelResponseMeta, status),
+			0
+		);
 	}
 
 	#[test]

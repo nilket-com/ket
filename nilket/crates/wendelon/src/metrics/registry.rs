@@ -1667,6 +1667,13 @@ impl StaticLabelCounters {
 	}
 }
 
+const TABLE_QUERY_CANCELLATION_OUTCOMES: &[&str] = &[
+	"accepted",
+	"terminal",
+	"cancelled_response",
+	"stream_dropped",
+];
+
 const ROW_GROUP_FETCH_STRATEGIES: &[&str] = &["row_group", "columnar_buffer", "whole_record"];
 const RUNTIME_FILTER_EVENTS: &[&str] = &["present", "applied"];
 const RUNTIME_FILTER_DROP_REASONS: &[&str] = &[
@@ -2455,6 +2462,7 @@ pub struct MetricsRegistry {
 	pub data_ring_backpressure_rejections_actor_total: Counter,
 	pub data_ring_backpressure_active_tenant_requests: Gauge,
 	pub data_ring_backpressure_active_actor_requests: Gauge,
+	table_query_cancellations: StaticLabelCounters,
 	pbc_rows_scanned: PbcRuntimeCounters,
 	pbc_rows_returned: PbcRuntimeCounters,
 	pbc_exec_micros: PbcRuntimeHistograms,
@@ -2719,6 +2727,7 @@ impl Default for MetricsRegistry {
 			data_ring_backpressure_rejections_actor_total: Counter::default(),
 			data_ring_backpressure_active_tenant_requests: Gauge::default(),
 			data_ring_backpressure_active_actor_requests: Gauge::default(),
+			table_query_cancellations: StaticLabelCounters::default(),
 			pbc_rows_scanned: PbcRuntimeCounters::default(),
 			pbc_rows_returned: PbcRuntimeCounters::default(),
 			pbc_exec_micros: PbcRuntimeHistograms::default(),
@@ -2979,6 +2988,10 @@ impl Default for MetricsRegistry {
 impl MetricsRegistry {
 	pub fn observe_write_outcome(&self, status: WriteStatus) {
 		self.data_ring_write_outcomes.observe(status);
+	}
+
+	pub fn observe_table_query_cancellation(&self, outcome: &'static str) {
+		self.table_query_cancellations.inc(outcome);
 	}
 
 	pub fn set_pending_finalization_backlog(&self, value: u64) {
@@ -3970,8 +3983,10 @@ impl MetricsRegistry {
 			.add(codec, encoded_bytes);
 		self.storage_compression_encode_micros
 			.observe_duration(codec, duration);
-		if plaintext_bytes > 0 {
-			let ratio_milli = encoded_bytes.saturating_mul(1000) / plaintext_bytes;
+		if let Some(ratio_milli) = encoded_bytes
+			.saturating_mul(1000)
+			.checked_div(plaintext_bytes)
+		{
 			self.storage_compression_ratio
 				.observe_value(codec, ratio_milli);
 		}
@@ -4342,6 +4357,13 @@ impl MetricsRegistry {
 		);
 		self.data_ring_pending_finalization_replay.render(&mut out);
 		self.data_ring_migration_proxy_reads.render(&mut out);
+		self.table_query_cancellations.render(
+			&mut out,
+			"wendelon_table_query_cancellations_total",
+			"TABLE_QUERY_REQ cancellations observed by the Data Ring.",
+			"outcome",
+			TABLE_QUERY_CANCELLATION_OUTCOMES,
+		);
 		render_counter_family_header(
 			&mut out,
 			"wendelon_data_ring_backpressure_rejections_total",

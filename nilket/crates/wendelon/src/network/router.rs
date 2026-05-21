@@ -74,15 +74,27 @@ pub trait DataRingServer: Send + Sync + 'static {
 		let frame = read_frame_from_header(&mut *stream, &pool, first_header).await?;
 		match self.handle_data_frame(context, frame).await? {
 			Some(resp) => {
-				write_frame(
+				let is_table_query_response = resp.header.msg_type == MsgType::TABLE_QUERY_RESP.0;
+				if let Err(err) = write_frame(
 					&mut *stream,
 					&resp.header,
 					&resp.meta,
 					resp.arrow_payload.as_deref(),
 					resp.trailing.as_deref(),
 				)
-				.await?;
-				stream.finish().await?;
+				.await
+				{
+					if is_table_query_response {
+						crate::metrics::global().observe_table_query_cancellation("stream_dropped");
+					}
+					return Err(err);
+				}
+				if let Err(err) = stream.finish().await {
+					if is_table_query_response {
+						crate::metrics::global().observe_table_query_cancellation("stream_dropped");
+					}
+					return Err(err);
+				}
 			}
 			None => {
 				stream.finish().await?;
@@ -150,6 +162,8 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::TABLE_REPLICATE_RESP.0
 				|| x == MsgType::TABLE_QUERY_REQ.0
 				|| x == MsgType::TABLE_QUERY_RESP.0
+				|| x == MsgType::TABLE_QUERY_CANCEL_REQ.0
+				|| x == MsgType::TABLE_QUERY_CANCEL_RESP.0
 				|| x == MsgType::TABLE_DELETE_REQ.0
 				|| x == MsgType::TABLE_DELETE_RESP.0
 				|| x == MsgType::AGG_REQ.0
@@ -211,15 +225,27 @@ impl HrftService for MsgRouter {
 		let frame = read_frame_from_header(&mut *stream, &pool, header).await?;
 		match self.handle_frame(context, frame).await? {
 			Some(resp) => {
-				write_frame(
+				let is_table_query_response = resp.header.msg_type == MsgType::TABLE_QUERY_RESP.0;
+				if let Err(err) = write_frame(
 					&mut *stream,
 					&resp.header,
 					&resp.meta,
 					resp.arrow_payload.as_deref(),
 					resp.trailing.as_deref(),
 				)
-				.await?;
-				stream.finish().await?;
+				.await
+				{
+					if is_table_query_response {
+						crate::metrics::global().observe_table_query_cancellation("stream_dropped");
+					}
+					return Err(err);
+				}
+				if let Err(err) = stream.finish().await {
+					if is_table_query_response {
+						crate::metrics::global().observe_table_query_cancellation("stream_dropped");
+					}
+					return Err(err);
+				}
 			}
 			None => {
 				stream.finish().await?;

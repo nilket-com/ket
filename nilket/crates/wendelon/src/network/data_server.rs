@@ -92,15 +92,17 @@ use crate::schema::{
 	RowCount, RowIdentityPolicy, RuntimeFilterDescriptor, RuntimeFilterDropReason,
 	STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog, SecondaryIndexDescriptor,
 	SecondaryIndexState, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
-	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
-	TableReplicaWriteMeta, TableSchemaDescriptor, TableWriteAdmission, TableWriteRequestMeta,
-	TableWriteResponseMeta, TableWriteValidationError, TenantId, WriteRequestMeta,
-	WriteResponseMeta, WriteStatus, WriterNodeId, build_runtime_filter_mask,
-	build_runtime_filter_mask_for_batch, cdc_cursor_in_catchup_window, cdc_event_batch,
-	cdc_tombstone_event_batch, cdc_visible_rows_digest, column_projection_predicate_ranges,
-	column_projection_prefix_ranges, encode_aggregate_state, encode_table_write_row_count,
-	migration_record_schema, pbc, query_request_stats_pruning_enabled, read_key_schema,
-	runtime_filter_key_type, table_spread_prefix_ranges, validate_runtime_filter_descriptor,
+	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId,
+	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryCancelStatus,
+	TableQueryRequestId, TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptor,
+	TableWriteAdmission, TableWriteRequestMeta, TableWriteResponseMeta, TableWriteValidationError,
+	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
+	build_runtime_filter_mask, build_runtime_filter_mask_for_batch, cdc_cursor_in_catchup_window,
+	cdc_event_batch, cdc_tombstone_event_batch, cdc_visible_rows_digest,
+	column_projection_predicate_ranges, column_projection_prefix_ranges, encode_aggregate_state,
+	encode_table_write_row_count, migration_record_schema, pbc,
+	query_request_stats_pruning_enabled, read_key_schema, runtime_filter_key_type,
+	table_spread_prefix_ranges, validate_runtime_filter_descriptor,
 	validate_table_write_request_batch, write_payload_schema,
 };
 #[cfg(test)]
@@ -156,16 +158,15 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use serde_json::json;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedMutexGuard, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::network::core::HrftFrame;
@@ -883,6 +884,8 @@ pub struct WendelonDataServer {
 	/// that keeps racing hot reads and sweeper passes from issuing
 	/// duplicate `MIGRATE_REQ` round-trips.
 	migration_registry: Arc<MigrationRegistry>,
+	/// Active TABLE_QUERY_REQ attempts and bounded cancel tombstones.
+	table_query_cancellation: Arc<ActiveTableQueryRegistry>,
 	/// Reconciled copy of the authoritative tenant table. Reads and
 	/// writes consult this cache on the fast path; a background sweep
 	/// refreshes it from the state machine.
@@ -964,6 +967,173 @@ const LOCAL_PERSISTENCE_DISTRUST_FILE: &str = "local_persistence_distrust.flag";
 /// migration range per pass keeps the sweeper from competing with
 /// foreground reads/writes or the tier sweeper for disk/network.
 pub const MIGRATION_SWEEP_MAX_PER_PASS: usize = 1;
+const TABLE_QUERY_CANCEL_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+const TABLE_QUERY_CANCEL_TOMBSTONE_CAP: usize = 1024;
+
+type TableQueryCancellationKey = (TenantId, TableQueryRequestId);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableQueryTombstoneKind {
+	Pending,
+	Terminal,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TableQueryTombstoneOrder {
+	key: TableQueryCancellationKey,
+	kind: TableQueryTombstoneKind,
+	expires_at: Instant,
+}
+
+#[derive(Default)]
+struct ActiveTableQueryRegistryState {
+	active: HashMap<TableQueryCancellationKey, Arc<CancellationToken>>,
+	pending: HashMap<TableQueryCancellationKey, Instant>,
+	terminal: HashMap<TableQueryCancellationKey, Instant>,
+	order: VecDeque<TableQueryTombstoneOrder>,
+}
+
+#[derive(Default)]
+struct ActiveTableQueryRegistry {
+	state: StdMutex<ActiveTableQueryRegistryState>,
+}
+
+enum ActiveTableQueryRegistration {
+	Active(ActiveTableQueryGuard),
+	CancelledBeforeStart,
+}
+
+struct ActiveTableQueryGuard {
+	registry: Arc<ActiveTableQueryRegistry>,
+	key: TableQueryCancellationKey,
+	token: Arc<CancellationToken>,
+}
+
+impl ActiveTableQueryGuard {
+	fn token(&self) -> CancellationToken {
+		self.token.as_ref().clone()
+	}
+}
+
+impl Drop for ActiveTableQueryGuard {
+	fn drop(&mut self) {
+		self.registry.finish(self.key, &self.token);
+	}
+}
+
+impl ActiveTableQueryRegistry {
+	fn register(
+		self: &Arc<Self>,
+		tenant_id: TenantId,
+		request_id: TableQueryRequestId,
+	) -> ActiveTableQueryRegistration {
+		let key = (tenant_id, request_id);
+		let now = Instant::now();
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+			tracing::error!("recovering poisoned table-query cancellation registry");
+			poisoned.into_inner()
+		});
+		Self::prune_locked(&mut state, now);
+		state.terminal.remove(&key);
+		if state.pending.remove(&key).is_some() {
+			return ActiveTableQueryRegistration::CancelledBeforeStart;
+		}
+		let token = Arc::new(CancellationToken::new());
+		if let Some(previous) = state.active.insert(key, token.clone()) {
+			previous.cancel();
+		}
+		ActiveTableQueryRegistration::Active(ActiveTableQueryGuard {
+			registry: self.clone(),
+			key,
+			token,
+		})
+	}
+
+	fn cancel(
+		&self,
+		tenant_id: TenantId,
+		request_id: TableQueryRequestId,
+	) -> TableQueryCancelStatus {
+		let key = (tenant_id, request_id);
+		let now = Instant::now();
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+			tracing::error!("recovering poisoned table-query cancellation registry");
+			poisoned.into_inner()
+		});
+		Self::prune_locked(&mut state, now);
+		if let Some(token) = state.active.get(&key) {
+			token.cancel();
+			return TableQueryCancelStatus::ACCEPTED;
+		}
+		if state.terminal.contains_key(&key) {
+			return TableQueryCancelStatus::TERMINAL;
+		}
+		Self::insert_tombstone_locked(&mut state, key, TableQueryTombstoneKind::Pending, now);
+		TableQueryCancelStatus::ACCEPTED
+	}
+
+	fn finish(&self, key: TableQueryCancellationKey, token: &Arc<CancellationToken>) {
+		let now = Instant::now();
+		let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+			tracing::error!("recovering poisoned table-query cancellation registry");
+			poisoned.into_inner()
+		});
+		let remove = state
+			.active
+			.get(&key)
+			.is_some_and(|active| Arc::ptr_eq(active, token));
+		if remove {
+			state.active.remove(&key);
+			Self::insert_tombstone_locked(&mut state, key, TableQueryTombstoneKind::Terminal, now);
+		}
+	}
+
+	fn insert_tombstone_locked(
+		state: &mut ActiveTableQueryRegistryState,
+		key: TableQueryCancellationKey,
+		kind: TableQueryTombstoneKind,
+		now: Instant,
+	) {
+		let expires_at = now + TABLE_QUERY_CANCEL_TOMBSTONE_TTL;
+		match kind {
+			TableQueryTombstoneKind::Pending => {
+				state.pending.insert(key, expires_at);
+			}
+			TableQueryTombstoneKind::Terminal => {
+				state.terminal.insert(key, expires_at);
+			}
+		}
+		state.order.push_back(TableQueryTombstoneOrder {
+			key,
+			kind,
+			expires_at,
+		});
+		Self::prune_locked(state, now);
+	}
+
+	fn prune_locked(state: &mut ActiveTableQueryRegistryState, now: Instant) {
+		while let Some(entry) = state.order.front().copied() {
+			let over_cap = state.pending.len().saturating_add(state.terminal.len())
+				> TABLE_QUERY_CANCEL_TOMBSTONE_CAP;
+			if entry.expires_at > now && !over_cap {
+				break;
+			}
+			let entry = state.order.pop_front().expect("front was present");
+			match entry.kind {
+				TableQueryTombstoneKind::Pending => {
+					if state.pending.get(&entry.key) == Some(&entry.expires_at) {
+						state.pending.remove(&entry.key);
+					}
+				}
+				TableQueryTombstoneKind::Terminal => {
+					if state.terminal.get(&entry.key) == Some(&entry.expires_at) {
+						state.terminal.remove(&entry.key);
+					}
+				}
+			}
+		}
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LeaseGateResult {
@@ -1070,6 +1240,7 @@ impl Clone for WendelonDataServer {
 			lease_gate_enabled: self.lease_gate_enabled,
 			lease_authority: self.lease_authority.clone(),
 			migration_registry: self.migration_registry.clone(),
+			table_query_cancellation: self.table_query_cancellation.clone(),
 			tenant_policy_cache: self.tenant_policy_cache.clone(),
 			tenant_inflight: self.tenant_inflight.clone(),
 			tenant_request_inflight: self.tenant_request_inflight.clone(),
@@ -1836,6 +2007,7 @@ impl WendelonDataServer {
 			lease_gate_enabled: false,
 			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
 			migration_registry: Arc::new(MigrationRegistry::new()),
+			table_query_cancellation: Arc::new(ActiveTableQueryRegistry::default()),
 			tenant_policy_cache: Arc::new(RwLock::new(TenantPolicyCacheState::default())),
 			tenant_inflight: Arc::new(DashMap::new()),
 			tenant_request_inflight: Arc::new(DashMap::new()),
@@ -3705,17 +3877,43 @@ impl WendelonDataServer {
 		metrics().data_ring_query_requests_total.inc();
 		let (meta, bytecode, runtime_filter) = self.decode_table_query_request_frame(&frame)?;
 		let audit_meta = table_query_as_range_query(&meta);
+		let active_query = match self
+			.table_query_cancellation
+			.register(meta.tenant_id, meta.request_id)
+		{
+			ActiveTableQueryRegistration::Active(guard) => guard,
+			ActiveTableQueryRegistration::CancelledBeforeStart => {
+				let response =
+					query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
+				metrics().observe_table_query_cancellation("cancelled_response");
+				self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+				return Ok(self.build_query_response_frame_with_type(
+					MsgType::TABLE_QUERY_RESP,
+					frame.header.stream_id,
+					response,
+					None,
+					FRAME_FLAG_STREAM_END,
+				));
+			}
+		};
+		let cancellation_token = active_query.token();
 		let span = tracing::info_span!(
 			"data_ring.table_query.request",
 			stream_id = frame.header.stream_id,
 			tenant_id = meta.tenant_id.get(),
+			request_id = %format!("{:032x}", meta.request_id.get()),
 			table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
 			schema_generation = meta.schema_generation,
 			expected_epoch = meta.expected_epoch,
 			consistency = meta.consistency.0,
 		);
 		let plan = match self
-			.prepare_table_query_execution_plan_with_migration(&meta, &bytecode, runtime_filter)
+			.prepare_table_query_execution_plan_with_migration_with_cancellation(
+				&meta,
+				&bytecode,
+				runtime_filter,
+				&cancellation_token,
+			)
 			.instrument(span)
 			.await
 		{
@@ -3737,6 +3935,9 @@ impl WendelonDataServer {
 			}
 		};
 		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
+			if plan.response.status == ReadStatus::QUERY_CANCELLED {
+				metrics().observe_table_query_cancellation("cancelled_response");
+			}
 			self.emit_query_completion_audit(actor, &audit_meta, &plan.response, 0)?;
 			self.emit_row_group_fetch_sampled_audit(
 				actor,
@@ -3757,11 +3958,50 @@ impl WendelonDataServer {
 			));
 		}
 
+		if cancellation_token.is_cancelled() {
+			let response =
+				query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
+			metrics().observe_table_query_cancellation("cancelled_response");
+			self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+			return Ok(self.build_query_response_frame_with_type(
+				MsgType::TABLE_QUERY_RESP,
+				frame.header.stream_id,
+				response,
+				None,
+				FRAME_FLAG_STREAM_END,
+			));
+		}
 		let schema = plan.batches[0].schema();
 		let concatenated = concat_batches(&schema, &plan.batches)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("table query concat: {e}")))?;
+		if cancellation_token.is_cancelled() {
+			let response =
+				query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
+			metrics().observe_table_query_cancellation("cancelled_response");
+			self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+			return Ok(self.build_query_response_frame_with_type(
+				MsgType::TABLE_QUERY_RESP,
+				frame.header.stream_id,
+				response,
+				None,
+				FRAME_FLAG_STREAM_END,
+			));
+		}
 		let arrow_bytes =
 			wire_encode_batch_for_path(&concatenated, NetworkCompressionPath::QueryResponse)?;
+		if cancellation_token.is_cancelled() {
+			let response =
+				query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
+			metrics().observe_table_query_cancellation("cancelled_response");
+			self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+			return Ok(self.build_query_response_frame_with_type(
+				MsgType::TABLE_QUERY_RESP,
+				frame.header.stream_id,
+				response,
+				None,
+				FRAME_FLAG_STREAM_END,
+			));
+		}
 		let response = QueryResponseMeta {
 			arrow_len: arrow_bytes.len() as u32,
 			..plan.response
@@ -3780,6 +4020,26 @@ impl WendelonDataServer {
 			Some(arrow_bytes),
 			FRAME_FLAG_STREAM_END,
 		))
+	}
+
+	async fn handle_table_query_cancel(
+		&self,
+		actor: &ActorIdentity,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		let meta = self.decode_table_query_cancel_request_frame(&frame)?;
+		let authorized = self
+			.authorize_actor_for_data(actor, Some(meta.tenant_id), DataOperation::Query)
+			.is_ok();
+		let tenant_visible = authorized && self.enforce_read_policy(meta.tenant_id).await.is_ok();
+		let status = if !tenant_visible {
+			TableQueryCancelStatus::TERMINAL
+		} else {
+			self.table_query_cancellation
+				.cancel(meta.tenant_id, meta.request_id)
+		};
+		metrics().observe_table_query_cancellation(status.as_str());
+		Ok(self.build_table_query_cancel_response_frame(frame.header.stream_id, status))
 	}
 
 	async fn handle_aggregate(
@@ -3897,6 +4157,12 @@ impl WendelonDataServer {
 		}
 		let meta: TableQueryRequestMeta =
 			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableQueryRequestMeta>()]);
+		if meta.request_id.is_zero() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_QUERY_REQ request_id must be non-zero",
+			));
+		}
 		let bytecode_len = meta.bytecode_len as usize;
 		let runtime_filter_len = meta.runtime_filter_len as usize;
 		let declared_trailing_len =
@@ -3951,6 +4217,34 @@ impl WendelonDataServer {
 			}
 		};
 		Ok((meta, bytecode, runtime_filter))
+	}
+
+	fn decode_table_query_cancel_request_frame(
+		&self,
+		frame: &HrftFrame,
+	) -> std::io::Result<TableQueryCancelRequestMeta> {
+		if frame.meta.len() != std::mem::size_of::<TableQueryCancelRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_QUERY_CANCEL_REQ meta size mismatch",
+			));
+		}
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_QUERY_CANCEL_REQ must not carry payload bytes",
+			));
+		}
+		let meta: TableQueryCancelRequestMeta = *bytemuck::from_bytes(
+			&frame.meta[..std::mem::size_of::<TableQueryCancelRequestMeta>()],
+		);
+		if meta.request_id.is_zero() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_QUERY_CANCEL_REQ request_id must be non-zero",
+			));
+		}
+		Ok(meta)
 	}
 
 	fn decode_aggregate_request_frame(
@@ -4021,6 +4315,35 @@ impl WendelonDataServer {
 			},
 			meta: body,
 			arrow_payload,
+			trailing: None,
+		}
+	}
+
+	fn build_table_query_cancel_response_frame(
+		&self,
+		stream_id: u32,
+		status: TableQueryCancelStatus,
+	) -> HrftFrame {
+		let response = TableQueryCancelResponseMeta {
+			status,
+			_pad: [0; 7],
+		};
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&response));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_CANCEL_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: body,
+			arrow_payload: None,
 			trailing: None,
 		}
 	}
@@ -5797,13 +6120,38 @@ impl WendelonDataServer {
 		.await
 	}
 
+	#[cfg(test)]
 	async fn prepare_table_query_execution_plan_with_migration(
 		&self,
 		meta: &TableQueryRequestMeta,
 		bytecode: &[u8],
 		runtime_filter: DecodedRuntimeFilter,
 	) -> std::io::Result<QueryExecutionPlan> {
+		let cancellation_token = CancellationToken::new();
+		self.prepare_table_query_execution_plan_with_migration_with_cancellation(
+			meta,
+			bytecode,
+			runtime_filter,
+			&cancellation_token,
+		)
+		.await
+	}
+
+	async fn prepare_table_query_execution_plan_with_migration_with_cancellation(
+		&self,
+		meta: &TableQueryRequestMeta,
+		bytecode: &[u8],
+		runtime_filter: DecodedRuntimeFilter,
+		cancellation_token: &CancellationToken,
+	) -> std::io::Result<QueryExecutionPlan> {
 		let range_meta = table_query_as_range_query(meta);
+		if cancellation_token.is_cancelled() {
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::QUERY_CANCELLED,
+				self.local_node,
+			));
+		}
 		let row_identity_projection =
 			match RowIdentityProjection::from_u8(meta.row_identity_projection) {
 				Some(projection) => projection,
@@ -5827,6 +6175,13 @@ impl WendelonDataServer {
 		if let Err(status) = self.enforce_read_policy(meta.tenant_id).await {
 			return Ok(query_plan_error(&range_meta, status, self.local_node));
 		}
+		if cancellation_token.is_cancelled() {
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::QUERY_CANCELLED,
+				self.local_node,
+			));
+		}
 		if meta.consistency == Consistency::LINEARIZABLE {
 			let watermark = admission
 				.e_safe_watermarks
@@ -5846,6 +6201,13 @@ impl WendelonDataServer {
 			}
 		}
 		let sm_peek = self.state_machine.state_snapshot().await;
+		if cancellation_token.is_cancelled() {
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::QUERY_CANCELLED,
+				self.local_node,
+			));
+		}
 		if sm_peek
 			.table_drop_fences
 			.is_fenced(meta.tenant_id, meta.table_object_id)
@@ -5927,6 +6289,13 @@ impl WendelonDataServer {
 
 		for entry in &pending {
 			for range in &ranges {
+				if cancellation_token.is_cancelled() {
+					return Ok(query_plan_error(
+						&range_meta,
+						ReadStatus::QUERY_CANCELLED,
+						self.local_node,
+					));
+				}
 				let rs = entry.range_start.max(range.start.get());
 				let re = entry.range_end.min(range.end.get());
 				if rs > re {
@@ -5981,6 +6350,13 @@ impl WendelonDataServer {
 		};
 		if row_identity_projection == RowIdentityProjection::None {
 			if let Some(access_plan) = secondary_index_access_plan.as_ref() {
+				if cancellation_token.is_cancelled() {
+					return Ok(query_plan_error(
+						&range_meta,
+						ReadStatus::QUERY_CANCELLED,
+						self.local_node,
+					));
+				}
 				match plan_table_query_execution_by_secondary_index(
 					&self.slab,
 					self.local_node,
@@ -5992,6 +6368,7 @@ impl WendelonDataServer {
 					&projected_execution,
 					effective_retention.floor,
 					access_plan,
+					Some(cancellation_token),
 				)
 				.await
 				{
@@ -6023,7 +6400,7 @@ impl WendelonDataServer {
 			}
 		}
 
-		let mut plan = plan_query_execution_for_ranges_with_program(
+		let mut plan = plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			&self.slab,
 			self.local_node,
 			&range_meta,
@@ -6034,6 +6411,7 @@ impl WendelonDataServer {
 			projected_execution,
 			row_identity_projection,
 			effective_retention.floor,
+			Some(cancellation_token),
 		)
 		.await?;
 		plan.secondary_index_access_plan = secondary_index_access_plan;
@@ -7207,6 +7585,10 @@ impl DataRingServer for WendelonDataServer {
 					.await
 					.map(Some)
 			}
+			MsgType::TABLE_QUERY_CANCEL_REQ => self
+				.handle_table_query_cancel(&context.actor, frame)
+				.await
+				.map(Some),
 			MsgType::AGG_REQ => {
 				let request = self.decode_aggregate_request_frame(&frame)?;
 				let audit_meta =
@@ -11854,6 +12236,7 @@ async fn plan_table_query_execution_by_secondary_index(
 	projected_execution: &QueryProjectedExecution,
 	logical_retention_floor: Option<HybridTimestamp>,
 	access_plan: &SecondaryIndexAccessPlan,
+	cancellation_token: Option<&CancellationToken>,
 ) -> std::io::Result<QueryExecutionPlan> {
 	let budget = QueryExecutionBudget {
 		stats_pruning_enabled: budget.stats_pruning_enabled
@@ -11876,6 +12259,15 @@ async fn plan_table_query_execution_by_secondary_index(
 	let mut encoding_materialize_audit = Vec::new();
 	let mut seen = BTreeSet::new();
 	metrics().observe_pbc_locality_arcs_scanned(ranges.len() as u64);
+	if let Some(cancel) = cancellation_token {
+		if cancel.is_cancelled() {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_CANCELLED,
+				local_node,
+			));
+		}
+	}
 
 	let request = TableLookupByIndexRequest::from_descriptor(
 		meta.tenant_id,
@@ -11892,6 +12284,15 @@ async fn plan_table_query_execution_by_secondary_index(
 		.await?;
 	let mut indexed_rows = Vec::new();
 	for row in &lookup.rows {
+		if let Some(cancel) = cancellation_token {
+			if cancel.is_cancelled() {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_CANCELLED,
+					local_node,
+				));
+			}
+		}
 		if logical_retention_floor.is_some_and(|floor| row.row_hlc < floor) {
 			metrics().observe_storage_table_retention_read_filtered_rows(1);
 			continue;
@@ -11926,6 +12327,15 @@ async fn plan_table_query_execution_by_secondary_index(
 	)
 	.await?
 	{
+		if let Some(cancel) = cancellation_token {
+			if cancel.is_cancelled() {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_CANCELLED,
+					local_node,
+				));
+			}
+		}
 		row_group_fetch_audit.merge(result.row_group_fetch_audit);
 		encoding_materialize_audit.extend(result.encoding_materialize_audit);
 		let result = result.batch;
@@ -11957,6 +12367,15 @@ async fn plan_table_query_execution_by_secondary_index(
 		.secondary_index_tail_source_slabs(meta.tenant_id, &access_plan.descriptor)
 		.await;
 	for range in ranges {
+		if let Some(cancel) = cancellation_token {
+			if cancel.is_cancelled() {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_CANCELLED,
+					local_node,
+				));
+			}
+		}
 		let scanned = slab.scan_as_of_with_identity_and_locality(
 			meta.tenant_id,
 			range.start,
@@ -11964,6 +12383,15 @@ async fn plan_table_query_execution_by_secondary_index(
 			meta.as_of_hlc,
 		);
 		for (key_identity, locality, location) in scanned {
+			if let Some(cancel) = cancellation_token {
+				if cancel.is_cancelled() {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_CANCELLED,
+						local_node,
+					));
+				}
+			}
 			if !tail_source_slabs.contains(&location.slab_id) {
 				continue;
 			}
@@ -12501,6 +12929,35 @@ async fn plan_query_execution_for_ranges_with_program(
 	row_identity_projection: RowIdentityProjection,
 	logical_retention_floor: Option<HybridTimestamp>,
 ) -> std::io::Result<QueryExecutionPlan> {
+	plan_query_execution_for_ranges_with_program_maybe_cancelled(
+		slab,
+		local_node,
+		meta,
+		program,
+		ranges,
+		budget,
+		table_descriptor,
+		projected_execution,
+		row_identity_projection,
+		logical_retention_floor,
+		None,
+	)
+	.await
+}
+
+async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
+	slab: &SlabManager,
+	local_node: NodeId,
+	meta: &QueryRequestMeta,
+	program: &pbc::Program,
+	ranges: &[QueryScanRange],
+	budget: QueryExecutionBudget,
+	table_descriptor: Option<&TableSchemaDescriptor>,
+	projected_execution: QueryProjectedExecution,
+	row_identity_projection: RowIdentityProjection,
+	logical_retention_floor: Option<HybridTimestamp>,
+	cancellation_token: Option<&CancellationToken>,
+) -> std::io::Result<QueryExecutionPlan> {
 	let budget = QueryExecutionBudget {
 		stats_pruning_enabled: budget.stats_pruning_enabled
 			&& query_request_stats_pruning_enabled(meta),
@@ -12523,7 +12980,25 @@ async fn plan_query_execution_for_ranges_with_program(
 	let mut stats_prune_cache = QueryStatsPruneCache::default();
 	let mut rebatch_groups: Vec<RebatchGroup> = Vec::new();
 	let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
+	if let Some(cancel) = cancellation_token {
+		if cancel.is_cancelled() {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_CANCELLED,
+				local_node,
+			));
+		}
+	}
 	for range in ranges {
+		if let Some(cancel) = cancellation_token {
+			if cancel.is_cancelled() {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_CANCELLED,
+					local_node,
+				));
+			}
+		}
 		let scanned = slab.scan_as_of_with_identity_and_locality(
 			meta.tenant_id,
 			range.start,
@@ -12531,6 +13006,15 @@ async fn plan_query_execution_for_ranges_with_program(
 			meta.as_of_hlc,
 		);
 		for (key_identity, locality, location) in scanned {
+			if let Some(cancel) = cancellation_token {
+				if cancel.is_cancelled() {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_CANCELLED,
+						local_node,
+					));
+				}
+			}
 			if logical_retention_floor.is_some_and(|floor| location.hlc < floor) {
 				metrics().observe_storage_table_retention_read_filtered_rows(1);
 				continue;
@@ -12642,6 +13126,15 @@ async fn plan_query_execution_for_ranges_with_program(
 				)
 				.await?
 				{
+					if let Some(cancel) = cancellation_token {
+						if cancel.is_cancelled() {
+							return Ok(query_plan_error(
+								meta,
+								ReadStatus::QUERY_CANCELLED,
+								local_node,
+							));
+						}
+					}
 					row_group_fetch_audit.merge(result.row_group_fetch_audit);
 					encoding_materialize_audit.extend(result.encoding_materialize_audit);
 					let result = result.batch;
@@ -12662,6 +13155,15 @@ async fn plan_query_execution_for_ranges_with_program(
 					}
 					batches.push(result);
 					continue;
+				}
+			}
+			if let Some(cancel) = cancellation_token {
+				if cancel.is_cancelled() {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_CANCELLED,
+						local_node,
+					));
 				}
 			}
 			let bytes = slab.read(location).await?;
@@ -12743,6 +13245,15 @@ async fn plan_query_execution_for_ranges_with_program(
 		}
 	}
 	for group in rebatch_groups {
+		if let Some(cancel) = cancellation_token {
+			if cancel.is_cancelled() {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_CANCELLED,
+					local_node,
+				));
+			}
+		}
 		let concatenated = concat_batches(&group.schema, &group.batches)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
 		let mut row_key_ids = Vec::new();
@@ -12771,6 +13282,15 @@ async fn plan_query_execution_for_ranges_with_program(
 		};
 		if row_identity_projection == RowIdentityProjection::Append {
 			result = append_query_row_identity_column(result, &row_key_ids)?;
+		}
+		if let Some(cancel) = cancellation_token {
+			if cancel.is_cancelled() {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_CANCELLED,
+					local_node,
+				));
+			}
 		}
 		if result.num_rows() == 0 {
 			continue;
@@ -15519,6 +16039,7 @@ mod tests {
 			bytecode_len: bytecode_len as u32,
 			runtime_filter_len: 0,
 			as_of_hlc,
+			request_id: TableQueryRequestId::from_u128(1),
 		}
 	}
 
@@ -15657,6 +16178,69 @@ mod tests {
 	}
 
 	#[test]
+	fn table_query_cancel_before_register_is_consumed_once() {
+		let registry = Arc::new(ActiveTableQueryRegistry::default());
+		let tenant_id = TenantId::new(7);
+		let request_id = TableQueryRequestId::from_u128(11);
+
+		assert_eq!(
+			registry.cancel(tenant_id, request_id),
+			TableQueryCancelStatus::ACCEPTED
+		);
+		assert!(matches!(
+			registry.register(tenant_id, request_id),
+			ActiveTableQueryRegistration::CancelledBeforeStart
+		));
+		let registration = registry.register(tenant_id, request_id);
+		let ActiveTableQueryRegistration::Active(guard) = registration else {
+			panic!("pending tombstone should be consumed by the first register");
+		};
+		assert!(!guard.token().is_cancelled());
+	}
+
+	#[test]
+	fn table_query_cancel_active_signals_then_terminal_after_guard_drop() {
+		let registry = Arc::new(ActiveTableQueryRegistry::default());
+		let tenant_id = TenantId::new(7);
+		let request_id = TableQueryRequestId::from_u128(12);
+		let registration = registry.register(tenant_id, request_id);
+		let ActiveTableQueryRegistration::Active(guard) = registration else {
+			panic!("fresh request should register active");
+		};
+		let token = guard.token();
+
+		assert_eq!(
+			registry.cancel(tenant_id, request_id),
+			TableQueryCancelStatus::ACCEPTED
+		);
+		assert!(token.is_cancelled());
+		drop(guard);
+		assert_eq!(
+			registry.cancel(tenant_id, request_id),
+			TableQueryCancelStatus::TERMINAL
+		);
+	}
+
+	#[test]
+	fn table_query_cancel_tombstones_prune_to_bounded_cap() {
+		let registry = Arc::new(ActiveTableQueryRegistry::default());
+		for i in 1..=(TABLE_QUERY_CANCEL_TOMBSTONE_CAP + 16) {
+			let id = TableQueryRequestId::from_u128(i as u128);
+			assert_eq!(
+				registry.cancel(TenantId::new(7), id),
+				TableQueryCancelStatus::ACCEPTED
+			);
+		}
+		let state = registry.state.lock().expect("registry mutex");
+		assert!(state.pending.len() <= TABLE_QUERY_CANCEL_TOMBSTONE_CAP);
+		assert!(state.terminal.len() <= TABLE_QUERY_CANCEL_TOMBSTONE_CAP);
+		assert!(
+			state.pending.len().saturating_add(state.terminal.len())
+				<= TABLE_QUERY_CANCEL_TOMBSTONE_CAP
+		);
+	}
+
+	#[test]
 	fn table_query_decode_splits_pbc_and_runtime_filter_trailing_bytes() {
 		let descriptor = typed_table_descriptor();
 		let bytecode = pk_eq_program(7);
@@ -15681,6 +16265,53 @@ mod tests {
 			DecodedRuntimeFilter::Decoded(decoded) => assert_eq!(decoded, runtime_filter),
 			other => panic!("expected decoded runtime filter, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn table_query_decode_rejects_zero_request_id() {
+		let descriptor = typed_table_descriptor();
+		let bytecode = pk_eq_program(13);
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), bytecode.len());
+		meta.request_id = TableQueryRequestId::ZERO;
+		let frame = table_query_frame_for_decode_test(meta, Some(bytecode));
+
+		let err = WendelonDataServer::decode_table_query_request_frame_parts(&frame)
+			.expect_err("zero table-query request id must fail framing");
+
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(err.to_string().contains("request_id must be non-zero"));
+	}
+
+	#[tokio::test]
+	async fn table_query_cancelled_before_planning_returns_query_cancelled() {
+		let dir = bootstrap_tempdir("table-query-cancel-pre-plan");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			73,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let descriptor = typed_table_descriptor();
+		let bytecode = pk_eq_program(13);
+		let meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), bytecode.len());
+		let cancellation_token = CancellationToken::new();
+		cancellation_token.cancel();
+
+		let plan = node
+			.data_server
+			.prepare_table_query_execution_plan_with_migration_with_cancellation(
+				&meta,
+				&bytecode,
+				DecodedRuntimeFilter::Absent,
+				&cancellation_token,
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::QUERY_CANCELLED);
+		assert_eq!(plan.response.rows, 0);
+		node.handles.abort();
 	}
 
 	#[test]
@@ -20851,6 +21482,7 @@ mod tests {
 			bytecode_len: bytecode.len() as u32,
 			runtime_filter_len: 0,
 			as_of_hlc: hlc(0, 0, 0),
+			request_id: TableQueryRequestId::from_u128(2),
 		};
 		let mut bad_query_meta = query_meta;
 		bad_query_meta.physical_descriptor_fingerprint = [0xFF; 32];

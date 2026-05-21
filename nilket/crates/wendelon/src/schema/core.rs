@@ -633,6 +633,8 @@ impl MsgType {
 	pub const SCHEMA_DROP_RESP: Self = Self(0x3B);
 	pub const TABLE_DESCRIPTOR_GET_REQ: Self = Self(0x3C);
 	pub const TABLE_DESCRIPTOR_GET_RESP: Self = Self(0x3D);
+	pub const TABLE_QUERY_CANCEL_REQ: Self = Self(0x3E);
+	pub const TABLE_QUERY_CANCEL_RESP: Self = Self(0x3F);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -1004,6 +1006,8 @@ impl ReadStatus {
 	/// descriptor fingerprint that no longer matches the server's
 	/// descriptor for the requested table generation.
 	pub const TABLE_DESCRIPTOR_EVOLVED: Self = Self(14);
+	/// The table-query request was cancelled through TABLE_QUERY_CANCEL_REQ.
+	pub const QUERY_CANCELLED: Self = Self(15);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -1022,6 +1026,7 @@ impl ReadStatus {
 			Self::RETENTION_EXPIRED => "retention_expired",
 			Self::BACKPRESSURED => "backpressured",
 			Self::TABLE_DESCRIPTOR_EVOLVED => "table_descriptor_evolved",
+			Self::QUERY_CANCELLED => "query_cancelled",
 			_ => "unknown",
 		}
 	}
@@ -1538,8 +1543,8 @@ const _: () = assert!(std::mem::size_of::<SnapshotHeader>() == 80);
 #[cfg(test)]
 mod tests {
 	use super::{
-		MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, TableDescriptorGetRequestMeta,
-		TableDescriptorGetResponseMeta,
+		MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadStatus,
+		TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
 	};
 
 	#[test]
@@ -1564,6 +1569,10 @@ mod tests {
 		assert_eq!(MsgType::QUERY_RESP.0, 0x0C);
 		assert_eq!(MsgType::AGG_REQ.0, 0x32);
 		assert_eq!(MsgType::AGG_RESP.0, 0x33);
+		assert_eq!(MsgType::TABLE_QUERY_CANCEL_REQ.0, 0x3E);
+		assert_eq!(MsgType::TABLE_QUERY_CANCEL_RESP.0, 0x3F);
+		assert_eq!(ReadStatus::QUERY_CANCELLED.0, 15);
+		assert_eq!(ReadStatus::QUERY_CANCELLED.as_str(), "query_cancelled");
 		assert_eq!(std::mem::size_of::<QueryRequestMeta>(), 80);
 		assert_eq!(std::mem::offset_of!(QueryRequestMeta, min_hlc), 0);
 		assert_eq!(std::mem::offset_of!(QueryRequestMeta, expected_epoch), 16);

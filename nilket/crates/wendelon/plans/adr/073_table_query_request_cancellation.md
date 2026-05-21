@@ -1,6 +1,7 @@
 # Wendelon ADR 073: Table-Query Request Cancellation Producer Contract
 
-**Status:** Promoted (3-of-3 — Claude, Codex, Gemini)
+**Status:** Implemented 2026-05-21 (3-of-3 — Claude, Codex, Gemini);
+evidence in `plans/impl/073_table_query_request_cancellation_evidence.md`.
 **Seed:** the deferred half of **Toron ADR 059**'s honesty boundary — 059
 made Toron worker cancellation real but explicitly did **not** cancel
 already-issued Wendelon storage reads. This ADR is the Wendelon-side

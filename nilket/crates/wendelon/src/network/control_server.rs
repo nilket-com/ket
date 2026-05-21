@@ -3439,7 +3439,7 @@ fn membership_from_epoch_batch(
 	let mut overrides = HashMap::<u32, PeerOverrides>::new();
 	for (key, value) in optional_list_string(batch, "meta_keys")?
 		.into_iter()
-		.zip(optional_list_string(batch, "meta_values")?.into_iter())
+		.zip(optional_list_string(batch, "meta_values")?)
 	{
 		if let Some(node_id) = key
 			.strip_prefix("node.")
@@ -3483,10 +3483,10 @@ fn membership_from_epoch_batch(
 	}
 
 	let mut peers = HashMap::new();
-	for (id, address) in voter_ids.into_iter().zip(voter_addresses.into_iter()) {
+	for (id, address) in voter_ids.into_iter().zip(voter_addresses) {
 		insert_epoch_peer(&mut peers, current, &overrides, id, address)?;
 	}
-	for (id, address) in learner_ids.into_iter().zip(learner_addresses.into_iter()) {
+	for (id, address) in learner_ids.into_iter().zip(learner_addresses) {
 		insert_epoch_peer(&mut peers, current, &overrides, id, address)?;
 	}
 	if peers.is_empty() {
