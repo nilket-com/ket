@@ -4417,6 +4417,38 @@ along with the forward-sequence rewrite.
   Substrate → Toron home. Migration:
   `plans/impl/057_sql_connection_admission.md`. Parser/front-end throttling
   (deferred from 056) stays the named, evidence-gated follow-up.
+- **ADR 058 — Bounded SQL Request Ingress.**
+  Promoted. Closes an acute, in-hand frontend defect:
+  `sql_wire.rs::read_frame` does `vec![0u8; len]` from an untrusted `u32` length **before
+  decode**, and `handle_sql_connection` runs `SqlPlanner::plan` **before**
+  the statement timeout / admission. 058 adds two **default-on safety
+  floors** for server inbound SQL requests — `max_request_frame_bytes`
+  (checked on the length prefix *before allocation*) and `max_statement_bytes`
+  (checked *before* the planner) — with generous **equal 4 MiB defaults**,
+  64 MiB hard ceilings, and `statement ≤ frame`. **Default-on** because it's
+  a memory/CPU **safety floor**, not a fairness knob — the first non-opt-in
+  admission guard, deliberately distinct from the default-disabled 055/056/
+  057 governance knobs; `0` is a config error, not "disabled." Dual reject
+  surface keyed on decoded identity: **no `query_id` ⇒ transport close;
+  `query_id` ⇒ existing `ResourceExhausted`** (mirrors 057's Tier1/Tier2).
+  **Server-inbound only** — outbound result batches are never clamped. No
+  new SQL wire variant/protocol; ADR 043 postcard shape unchanged. Answers
+  the deferred parser-CPU worry the least-speculative way (bound bytes before
+  parser work; no parser-QPS scheduler without measured pressure). Final
+  D-set: **14 decisions, 16 architecture guards + 3 convention guards, 12
+  required fixtures**.
+  **Promoted 2-of-3 (Claude + Codex);** the Claude/Codex pair crossed over
+  three times as evidence resolved (ingress vs cancellation both proved real
+  defects) and converged on ingress-first by severity (acute instant-OOM
+  vector) + cadence (fully scoped, vs cancellation's larger contract).
+  Gemini proposed a different ADR (audit subsystem) throughout — carried
+  forward, not the evidence-pick. The **equal generous defaults** resolve a
+  council pressure-test: a default-on safety floor should avoid clipping
+  routine bulk `INSERT VALUES`; tight statement/parser limits stay
+  evidence-gated.
+  **Single-decision posture; Toron-ring only; node-local.** Placement:
+  Exterior Substrate → Toron home. Migration:
+  `plans/impl/058_bounded_sql_request_ingress.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4501,7 +4533,74 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 057 promoted; ADR 058 candidates
+### ADR 058 promoted; ADR 059 candidates
+
+ADR 058 selected and promoted **Bounded SQL Request Ingress** — an acute,
+in-hand frontend safety defect (`read_frame` allocates from an untrusted
+`u32` length before decode; `handle_sql_connection` plans before
+timeout/admission). Two **default-on safety floors**
+(`max_request_frame_bytes` before allocation; `max_statement_bytes` before the planner), generous
+equal 4 MiB defaults, 64 MiB hard ceilings, `statement ≤ frame`,
+`query_id`-keyed dual reject surface (close vs `ResourceExhausted`),
+server-inbound only. Final D-set: **14 decisions, 16 architecture guards + 3
+convention guards, 12 required fixtures**.
+
+**Pure Toron-ring substrate; node-local; SQL frontend; no new SQL wire
+variant/protocol; zero Wendelon change.**
+
+**Key decisions / invariants:**
+
+- **Promoted 2-of-3 (Claude + Codex)** on the *selection itself*: the pair
+  crossed over three times as evidence resolved — bounded ingress and
+  distributed cancellation both proved real verified code defects — and
+  converged on **ingress-first** by severity (acute instant-allocation OOM
+  vector, fully scoped) + cadence (cancellation is real but bounded wasted
+  compute, and a larger contract → its own round). Gemini proposed the
+  audit subsystem throughout; recorded as a carried-forward 045-D7
+  candidate, not the evidence-pick.
+- **First default-on admission guard** — a *safety floor*, not a fairness
+  knob, deliberately distinct from default-disabled 055/056/057. `0` is a
+  config error, not "disabled."
+- **Equal generous defaults** resolve the safety-floor-vs-behavior-change
+  pressure-test: the statement cap should avoid clipping routine bulk
+  `INSERT VALUES`; tight statement/parser-work limits stay evidence-gated.
+- **Dual reject surface by decoded identity** — pre-decode ⇒ transport
+  close (no `query_id`); post-decode ⇒ `ResourceExhausted` (mirrors 057).
+- **Answers the deferred parser-CPU worry the least-speculative way:** bound
+  bytes before parser work; no parser-QPS scheduler without measured
+  pressure.
+- `crates/nilket` runtime-free; `toron_fixture_worker.rs` unchanged;
+  brand-clean / no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in
+`plans/impl/058_bounded_sql_request_ingress.md`.
+
+**ADR 059 candidates:**
+
+- **Distributed Query Cancellation Completeness (LEAD, committed)** — the
+  verified gap from the 058 selection audit: SQL statement-timeout drops the
+  coordinator future with **no** `CancelTask` propagation; `cancel_query` is
+  coordinator-local; the worker awaits the task on `StartTask` and can't read
+  `CancelTask` on the same connection; there's **no worker active-task
+  registry**, so `CancelTask` is ack-only; SQL `Cancel` returns
+  `CancellationUnsupported`. In-flight remote work continues after
+  timeout/disconnect. Scope (start the focused round here): worker
+  active-task abort contract + out-of-band `CancelTask` delivery +
+  coordinator cancellation handle + statement-timeout & client-disconnect
+  triggers (`connection.closed()`) + bounded cancel waits; reuse existing
+  `CancelTask`/`Cancelled` wire. Makes the 049–057 governance arc *real*
+  (rejections/timeouts actually free distributed work).
+- **Audit subsystem** (045 D7) — shared `observability-audit` crate,
+  crypto-chained, fail-open, archive/syslog (no Kafka in Toron); its own
+  compliance/operability sequence.
+- **Parser/front-end rate throttle** (evidence-gated; 058 byte caps come
+  first), **pre-TLS/IP throttle** (deferred; 057 Tier 1 covers pre-handshake
+  concurrency), **descriptor-refresh hardening**, **OTLP traces export**,
+  **SQL surface widening** (`UPDATE WHERE`, `… RETURNING`, CTAS `IF NOT
+  EXISTS`), **JWT/OIDC/SPIFFE tenant claims**, gRPC / Arrow Flight / Postgres
+  frontends, prepared statements — all carried forward.
+
+### ADR 057 promoted; ADR 058 candidates (HISTORICAL)
 
 ADR 057 selected and promoted **Two-Tier SQL Connection Admission** — the
 first governance ADR at the **SQL listener edge**, moving beyond the
