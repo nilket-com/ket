@@ -4,14 +4,16 @@ use wendelon::schema::PhysicalDescriptorFingerprint;
 
 use crate::distributed::budget::{BudgetDimension, ByteCount};
 use crate::distributed::identity::{AttemptId, WorkerId};
+use crate::ir::TableId;
 use crate::wire::ProtocolVersion;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskFailureKind {
 	ProtocolMismatch,
 	DescriptorEvolved {
-		expected: PhysicalDescriptorFingerprint,
-		current: PhysicalDescriptorFingerprint,
+		table_id: TableId,
+		expected: Option<PhysicalDescriptorFingerprint>,
+		current: Option<PhysicalDescriptorFingerprint>,
 	},
 	WorkerLost {
 		worker_id: WorkerId,

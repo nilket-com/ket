@@ -16,7 +16,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use toron::catalog::DescriptorSyncMetrics;
+use toron::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use toron::config::{
 	CoordinatorConfig, LISTENER_BIND_COLLISION_DIAGNOSTIC,
 	OBSERVABILITY_HEALTH_LOOPBACK_DIAGNOSTIC, OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC,
@@ -31,7 +31,7 @@ use toron::distributed::budget::{
 	TenantBudgetPolicy, TenantConcurrencyAccountant, TenantMemoryAccountant,
 };
 use toron::distributed::identity::WorkerId;
-use toron::network::observability::{MetricsRegistry, ReadinessSnapshot};
+use toron::network::observability::{MetricsRegistry, MetricsRegistryConfig, ReadinessSnapshot};
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, canonical_client_dns_name, canonical_daemon_dns_name,
 	canonical_monitor_dns_name,
@@ -89,15 +89,16 @@ fn sample_resource_metrics_body() -> String {
 		.expect("reserve other concurrency");
 	admission_rejections.increment(TenantId(7), AdmissionResource::Memory);
 	admission_rejections.increment(TenantId(9), AdmissionResource::Concurrency);
-	let metrics = MetricsRegistry::new(
-		0,
-		0,
-		policy,
-		Arc::new(DescriptorSyncMetrics::default()),
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy,
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 		tenant_memory,
 		tenant_concurrency,
 		admission_rejections,
-	);
+	});
 
 	metrics.render_text(&ready_snapshot())
 }
@@ -435,6 +436,28 @@ fn catalog_descriptor_sync_metrics_are_aggregate_outcome_only() {
 		"catalog_descriptor_sync_requests_total{namespace",
 		"catalog_descriptor_sync_requests_total{table",
 		"catalog_descriptor_sync_requests_total{object",
+	] {
+		assert!(!body.contains(forbidden), "{forbidden} leaked into metrics");
+	}
+}
+
+#[test]
+fn catalog_descriptor_refresh_metrics_are_aggregate_outcome_only() {
+	let body = sample_resource_metrics_body();
+
+	for metric in [
+		"catalog_descriptor_refresh_requests_total{outcome=\"invalidated\"} 0\n",
+		"catalog_descriptor_refresh_requests_total{outcome=\"missing\"} 0\n",
+		"catalog_descriptor_refresh_requests_total{outcome=\"replacement\"} 0\n",
+	] {
+		assert!(body.contains(metric), "missing metric {metric} in {body}");
+	}
+	for forbidden in [
+		"catalog_descriptor_refresh_requests_total{tenant_id",
+		"catalog_descriptor_refresh_requests_total{namespace",
+		"catalog_descriptor_refresh_requests_total{table",
+		"catalog_descriptor_refresh_requests_total{object",
+		"catalog_descriptor_refresh_requests_total{fingerprint",
 	] {
 		assert!(!body.contains(forbidden), "{forbidden} leaked into metrics");
 	}

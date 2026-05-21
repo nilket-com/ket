@@ -35,8 +35,8 @@ use crate::error::{BindingError, CatalogError, FrontendError, QueryError};
 use crate::exec::ExecutionContext;
 use crate::ir::{LogicalPlan, SessionId};
 use crate::network::observability::{
-	ListenerName, MetricsRegistry, ObservabilityEndpoints, ObservabilityShutdownReceivers,
-	ReadinessState,
+	ListenerName, MetricsRegistry, MetricsRegistryConfig, ObservabilityEndpoints,
+	ObservabilityShutdownReceivers, ReadinessState,
 };
 use crate::network::tls::{ListenerPolicy, ListenerRole, TlsError, accepted_sql_tenant};
 use crate::quic::{QuicEndpoint, QuicStream};
@@ -255,15 +255,16 @@ impl ToronDaemon {
 		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
 		let mut shutdown_txs = Vec::new();
 		let mut listener_tasks = Vec::new();
-		let metrics = Arc::new(MetricsRegistry::new(
+		let metrics = Arc::new(MetricsRegistry::new(MetricsRegistryConfig {
 			descriptors_loaded,
-			config.coordinator.static_workers.len() as u64,
-			config.tenant_budgets.clone(),
-			catalog.descriptor_sync_metrics(),
-			coordinator.tenant_memory_accountant(),
-			coordinator.tenant_concurrency_accountant(),
-			coordinator.admission_rejection_counters(),
-		));
+			static_workers_configured: config.coordinator.static_workers.len() as u64,
+			tenant_budgets: config.tenant_budgets.clone(),
+			descriptor_sync_metrics: catalog.descriptor_sync_metrics(),
+			descriptor_refresh_metrics: catalog.descriptor_refresh_metrics(),
+			tenant_memory: coordinator.tenant_memory_accountant(),
+			tenant_concurrency: coordinator.tenant_concurrency_accountant(),
+			admission_rejections: coordinator.admission_rejection_counters(),
+		}));
 		let readiness = Arc::new(ReadinessState::new(
 			true,
 			true,

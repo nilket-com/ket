@@ -761,7 +761,12 @@ async fn in_memory_table_storage_seeds_appends_and_rejects_invalid_writes() {
 		.write(bad_identity)
 		.await
 		.expect_err("identity mismatch should reject");
-	assert!(matches!(bad_identity_err, StorageError::DescriptorEvolved));
+	assert!(matches!(
+		bad_identity_err,
+		StorageError::DescriptorEvolved {
+			table_id: TableId(1)
+		}
+	));
 }
 
 #[tokio::test]

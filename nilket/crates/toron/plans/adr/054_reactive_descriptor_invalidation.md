@@ -121,7 +121,9 @@ gone (D7); the guard (D12) protects statement identity.
 `catalog_descriptor_refresh_requests_total` with bounded `outcome`
 values `invalidated`, `missing`, and `replacement`; ADR 053's sync
 metrics remain the source for fetch outcomes. No tenant / table /
-object / fingerprint labels.
+object / fingerprint labels. Outcomes are independent event counters,
+not mutually exclusive per refresh attempt; a drop-recreate path may
+record both `invalidated` and `replacement`.
 
 **D16: Governance reuse, not extension.** Re-sync uses ADR 053's
 `max_concurrent_descriptor_syncs` admission, single-flight,

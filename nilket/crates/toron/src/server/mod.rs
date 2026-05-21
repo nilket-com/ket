@@ -19,7 +19,8 @@ use crate::distributed::task::{
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::error::{
-	PartitionMissingReason, QueryError, RuntimeError, StorageError, TaskFailureKind, WireError,
+	ExecutionError, PartitionMissingReason, QueryError, RuntimeError, StorageError,
+	TaskFailureKind, WireError,
 };
 use crate::exec::{ExecutionContext, Executor};
 use crate::ir::{ExecutionPlan, JoinStrategy, MorselId, TableId};
@@ -864,6 +865,24 @@ mod tests {
 	}
 
 	#[test]
+	fn descriptor_evolved_dispatch_failure_carries_stale_table_id() {
+		let kind = dispatch_failure_kind(QueryError::Execution(ExecutionError::Storage(
+			StorageError::DescriptorEvolved {
+				table_id: TableId(42),
+			},
+		)));
+
+		assert!(matches!(
+			kind,
+			TaskFailureKind::DescriptorEvolved {
+				table_id: TableId(42),
+				expected: None,
+				current: None
+			}
+		));
+	}
+
+	#[test]
 	fn broadcast_cap_validation_charges_replicated_build_bytes() {
 		let mut query_budget = QueryBudget::test_default();
 		query_budget.broadcast_build_bytes_per_task = ByteCount::new(64);
@@ -1436,6 +1455,16 @@ where
 			requested: *requested,
 			available: *available,
 		},
+		QueryError::Execution(ExecutionError::Storage(StorageError::DescriptorEvolved {
+			table_id,
+		}))
+		| QueryError::Storage(StorageError::DescriptorEvolved { table_id }) => {
+			TaskFailureKind::DescriptorEvolved {
+				table_id: *table_id,
+				expected: None,
+				current: None,
+			}
+		}
 		_ => TaskFailureKind::Internal {
 			reason: error.to_string(),
 		},
@@ -1497,6 +1526,16 @@ fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {
 			requested,
 			available,
 		},
+		QueryError::Execution(ExecutionError::Storage(StorageError::DescriptorEvolved {
+			table_id,
+		}))
+		| QueryError::Storage(StorageError::DescriptorEvolved { table_id }) => {
+			TaskFailureKind::DescriptorEvolved {
+				table_id,
+				expected: None,
+				current: None,
+			}
+		}
 		QueryError::Runtime(RuntimeError::ProtocolMismatch { .. }) => {
 			TaskFailureKind::ProtocolMismatch
 		}

@@ -7,7 +7,7 @@ mod delete;
 mod write;
 
 use crate::binder::{PlannerConfig, bind};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, InvalidatedDescriptor};
 use crate::distributed::budget::{
 	AdmissionResource, BudgetRejection, QueryBudget, TaskBudget, TenantAdmissionRejectionCounters,
 	TenantBudgetPolicy, TenantConcurrencyAccountant, TenantConcurrencyRejection,
@@ -18,9 +18,11 @@ use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_p
 use crate::distributed::identity::QueryId;
 use crate::distributed::scheduler::{DistributedScheduler, SchedulerError};
 use crate::distributed::worker_registry::WorkerRegistry;
-use crate::error::{CatalogError, ExecutionError, QueryError, StorageError};
+use crate::error::{
+	CatalogError, ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind,
+};
 use crate::exec::{ExecutionContext, Executor};
-use crate::ir::{ColumnOrdinal, ExecutionPlan, FilterDisposition, LogicalPlan, MorselId};
+use crate::ir::{ColumnOrdinal, ExecutionPlan, FilterDisposition, LogicalPlan, MorselId, TableId};
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
 use crate::storage::{
 	DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest, RowIdentityProjection,
@@ -296,21 +298,22 @@ where
 		query_budget: QueryBudget,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
-		let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 		if matches!(
-			bound,
-			ExecutionPlan::CreateTable { .. } | ExecutionPlan::DropTable { .. }
+			plan,
+			LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. }
 		) {
+			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			return execute_catalog_plan(catalog.as_ref(), self.admin.as_ref(), &context, &bound)
 				.await;
 		}
-		if matches!(bound, ExecutionPlan::Insert { .. }) {
+		if matches!(plan, LogicalPlan::Insert { .. }) {
+			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
 				query_budget,
 			};
-			return execute_write_plan_with_source(
+			let result = execute_write_plan_with_source(
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
@@ -320,19 +323,24 @@ where
 				&bound,
 			)
 			.await;
+			if let Err(error) = &result {
+				invalidate_descriptor_evolution_on_error(catalog.as_ref(), error).await?;
+			}
+			return result;
 		}
 		if matches!(
-			bound,
-			ExecutionPlan::InsertSelect { .. }
-				| ExecutionPlan::CreateTableAsSelect { .. }
-				| ExecutionPlan::Delete { .. }
+			plan,
+			LogicalPlan::InsertSelect { .. }
+				| LogicalPlan::CreateTableAsSelect { .. }
+				| LogicalPlan::Delete { .. }
 		) {
+			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
 				query_budget,
 			};
-			return execute_write_plan_with_source(
+			let result = execute_write_plan_with_source(
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
@@ -342,10 +350,41 @@ where
 				&bound,
 			)
 			.await;
+			if let Err(error) = &result {
+				invalidate_descriptor_evolution_on_error(catalog.as_ref(), error).await?;
+			}
+			return result;
 		}
 
-		self.execute_bound_distributed_with_context(bound, &context, query_budget)
-			.await
+		let mut retried_descriptor_evolution = false;
+		let mut invalidated = Vec::new();
+		loop {
+			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			if !invalidated.is_empty() {
+				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
+			}
+			match self
+				.execute_bound_distributed_with_context(bound, &context, query_budget)
+				.await
+			{
+				Ok(results) => return Ok(results),
+				Err(error)
+					if descriptor_evolved_table_id(&error).is_some()
+						&& !retried_descriptor_evolution =>
+				{
+					if let Some(stale) =
+						invalidate_descriptor_evolution(catalog.as_ref(), &error).await?
+					{
+						invalidated.push(stale);
+					}
+					retried_descriptor_evolution = true;
+				}
+				Err(error) if descriptor_evolved_table_id(&error).is_some() => {
+					return Err(QueryError::SchemaInstability);
+				}
+				Err(error) => return Err(error),
+			}
+		}
 	}
 
 	fn admit_query(&self, context: &ExecutionContext) -> Result<AdmittedQuery, QueryError> {
@@ -450,6 +489,69 @@ fn scheduler_error(error: SchedulerError) -> QueryError {
 		SchedulerError::PartitionManifestMismatch { message } => QueryError::Internal { message },
 		SchedulerError::Acceptance(message) => QueryError::Internal { message },
 	}
+}
+
+fn descriptor_evolved_table_id(error: &QueryError) -> Option<TableId> {
+	match error {
+		QueryError::Execution(ExecutionError::Storage(StorageError::DescriptorEvolved {
+			table_id,
+		}))
+		| QueryError::Storage(StorageError::DescriptorEvolved { table_id }) => Some(*table_id),
+		QueryError::Runtime(RuntimeError::TaskFailure {
+			kind: TaskFailureKind::DescriptorEvolved { table_id, .. },
+		}) => Some(*table_id),
+		_ => None,
+	}
+}
+
+async fn invalidate_descriptor_evolution(
+	catalog: &dyn Catalog,
+	error: &QueryError,
+) -> Result<Option<InvalidatedDescriptor>, QueryError> {
+	let Some(table_id) = descriptor_evolved_table_id(error) else {
+		return Ok(None);
+	};
+	catalog
+		.invalidate_table_descriptor(table_id)
+		.await
+		.map_err(QueryError::Catalog)
+}
+
+async fn invalidate_descriptor_evolution_on_error(
+	catalog: &dyn Catalog,
+	error: &QueryError,
+) -> Result<(), QueryError> {
+	if descriptor_evolved_table_id(error).is_some() {
+		invalidate_descriptor_evolution(catalog, error).await?;
+	}
+	Ok(())
+}
+
+async fn reject_replacement_object(
+	catalog: &dyn Catalog,
+	invalidated: &[InvalidatedDescriptor],
+) -> Result<(), QueryError> {
+	for stale in invalidated {
+		let mut same_object_seen = false;
+		let mut replacement_seen = false;
+		for table_ref in &stale.refs {
+			match catalog.resolve_table_local(table_ref).await {
+				Ok(current) if current.table == stale.table_object_id => {
+					same_object_seen = true;
+				}
+				Ok(_) => {
+					replacement_seen = true;
+				}
+				Err(CatalogError::TableNotFound { .. }) => {}
+				Err(error) => return Err(QueryError::Catalog(error)),
+			}
+		}
+		if !same_object_seen && replacement_seen {
+			catalog.descriptor_refresh_metrics().record_replacement();
+			return Err(QueryError::SchemaInstability);
+		}
+	}
+	Ok(())
 }
 
 async fn execute_catalog_plan(
@@ -877,16 +979,28 @@ impl QueryCoordinator {
 		}
 
 		let mut retried_descriptor_evolution = false;
+		let mut invalidated = Vec::new();
 		loop {
 			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			if !invalidated.is_empty() {
+				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
+			}
 			match self.executor.execute_bound(&bound, morsel).await {
 				Ok(results) => return Ok(results),
-				Err(ExecutionError::Storage(StorageError::DescriptorEvolved))
+				Err(ExecutionError::Storage(StorageError::DescriptorEvolved { table_id }))
 					if !retried_descriptor_evolution =>
 				{
+					let error = QueryError::Execution(ExecutionError::Storage(
+						StorageError::DescriptorEvolved { table_id },
+					));
+					if let Some(stale) =
+						invalidate_descriptor_evolution(catalog.as_ref(), &error).await?
+					{
+						invalidated.push(stale);
+					}
 					retried_descriptor_evolution = true;
 				}
-				Err(ExecutionError::Storage(StorageError::DescriptorEvolved)) => {
+				Err(ExecutionError::Storage(StorageError::DescriptorEvolved { .. })) => {
 					return Err(QueryError::SchemaInstability);
 				}
 				Err(error) => return Err(QueryError::Execution(error)),
@@ -902,7 +1016,7 @@ impl QueryCoordinator {
 		let source_executor = LocalMutationSourceExecutor {
 			executor: &self.executor,
 		};
-		execute_write_plan_with_source(
+		let result = execute_write_plan_with_source(
 			catalog,
 			self.writer.as_ref(),
 			self.deleter.as_ref(),
@@ -911,7 +1025,11 @@ impl QueryCoordinator {
 			&source_executor,
 			bound,
 		)
-		.await
+		.await;
+		if let Err(error) = &result {
+			invalidate_descriptor_evolution_on_error(catalog, error).await?;
+		}
+		result
 	}
 }
 
@@ -943,14 +1061,18 @@ impl StorageDeleteRows for UnsupportedStorageDeleteRows {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::catalog::{MockCatalog, TableRef};
+	use crate::catalog::{DescriptorRefreshMetrics, MockCatalog, TableBinding, TableRef};
 	use crate::distributed::budget::{BudgetDimension, ByteCount, TenantBudget};
 	use crate::distributed::worker_registry::StaticWorkerRegistry;
-	use crate::ir::{AggregateFunction, Expr, QueryId, SessionId, TableId};
+	use crate::error::BindingError;
+	use crate::ir::{AggregateFunction, Expr, InsertLiteral, QueryId, SessionId, TableId};
 	use crate::server::transport::TcpTransport;
-	use crate::storage::{HlcBound, ScanRequest, ScanStream, StorageScan, TenantId};
+	use crate::storage::{
+		HlcBound, ScanRequest, ScanStream, StorageScan, StorageWrite, TenantId, WriteOutcome,
+		WriteRequest,
+	};
 	use arrow::array::Int64Array;
-	use arrow::datatypes::{DataType, Field, Schema};
+	use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -966,7 +1088,7 @@ mod tests {
 		)
 		.expect("batch");
 		let coordinator = coordinator(batch, 1);
-		let plan = count_plan();
+		let plan = named_count_plan();
 
 		let results = coordinator
 			.execute_query(&plan, None)
@@ -993,7 +1115,7 @@ mod tests {
 		)
 		.expect("batch");
 		let coordinator = coordinator(batch, 2);
-		let plan = count_plan();
+		let plan = named_count_plan();
 
 		let err = coordinator
 			.execute_query(&plan, None)
@@ -1001,6 +1123,114 @@ mod tests {
 			.expect_err("second descriptor evolution fails");
 
 		assert!(matches!(err, QueryError::SchemaInstability));
+	}
+
+	#[tokio::test]
+	async fn coordinator_rejects_replacement_object_after_descriptor_evolved() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+		)
+		.expect("batch");
+		let coordinator = coordinator_with_refresh_object(batch, 1, TableObjectId::new([2; 16]));
+
+		let err = coordinator
+			.execute_query(&named_count_plan(), None)
+			.await
+			.expect_err("replacement object fails closed");
+
+		assert!(matches!(err, QueryError::SchemaInstability));
+	}
+
+	#[tokio::test]
+	async fn coordinator_returns_table_not_found_after_descriptor_evolved_drop() {
+		let coordinator = coordinator_with_refresh_outcome(batch(), 1, RefreshOutcome::Missing);
+
+		let err = coordinator
+			.execute_query(&named_count_plan(), None)
+			.await
+			.expect_err("missing replacement surfaces table-not-found");
+
+		assert!(matches!(
+			err,
+			QueryError::Binding(BindingError::Catalog(CatalogError::TableNotFound { .. }))
+		));
+	}
+
+	#[tokio::test]
+	async fn coordinator_returns_resource_exhausted_when_refresh_sync_is_over_budget() {
+		let coordinator =
+			coordinator_with_refresh_outcome(batch(), 1, RefreshOutcome::ResourceExhausted);
+
+		let err = coordinator
+			.execute_query(&named_count_plan(), None)
+			.await
+			.expect_err("descriptor refresh bind-miss budget exhausted");
+
+		assert!(matches!(
+			err,
+			QueryError::Binding(BindingError::Catalog(
+				CatalogError::ResourceExhausted { .. }
+			))
+		));
+	}
+
+	#[tokio::test]
+	async fn write_descriptor_evolved_invalidates_without_retrying() {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				descriptor_with_object(TableObjectId::new([1; 16]), 1),
+			)
+			.expect("register descriptor");
+		let catalog = Arc::new(catalog);
+		let writer = Arc::new(DescriptorEvolutionWriter {
+			calls: AtomicUsize::new(0),
+		});
+		let executor = Executor::with_context(
+			Arc::new(DescriptorEvolutionStorage {
+				table_data: batch(),
+				remaining_failures: AtomicUsize::new(0),
+			}),
+			ExecutionContext::new(
+				SessionId(1),
+				QueryId::from_u128(1),
+				TenantId(1),
+				HlcBound(1),
+			),
+		);
+		let coordinator = QueryCoordinator::with_writer(
+			catalog.clone(),
+			executor,
+			PlannerConfig::default(),
+			writer.clone(),
+		);
+		let plan = LogicalPlan::Insert {
+			table: TableRef::new("retry_table"),
+			columns: None,
+			rows: vec![vec![InsertLiteral::Int64(4)]],
+		};
+
+		let err = coordinator
+			.execute_query(&plan, None)
+			.await
+			.expect_err("write returns descriptor evolution");
+
+		assert!(matches!(
+			err,
+			QueryError::Storage(StorageError::DescriptorEvolved {
+				table_id: TableId(1)
+			})
+		));
+		assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
+		assert!(
+			catalog
+				.resolve_table(&TableRef::new("retry_table"))
+				.await
+				.is_err()
+		);
 	}
 
 	#[test]
@@ -1214,10 +1444,36 @@ mod tests {
 	}
 
 	fn coordinator(batch: RecordBatch, descriptor_failures: usize) -> QueryCoordinator {
-		let mut catalog = MockCatalog::new();
-		catalog
-			.register_descriptor(TableId(1), descriptor())
-			.expect("register descriptor");
+		coordinator_with_refresh_object(batch, descriptor_failures, TableObjectId::new([1; 16]))
+	}
+
+	fn batch() -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+			.expect("batch")
+	}
+
+	fn coordinator_with_refresh_object(
+		batch: RecordBatch,
+		descriptor_failures: usize,
+		refresh_object: TableObjectId,
+	) -> QueryCoordinator {
+		coordinator_with_refresh_outcome(
+			batch,
+			descriptor_failures,
+			RefreshOutcome::Binding(descriptor_with_identity(TableId(2), refresh_object, 2)),
+		)
+	}
+
+	fn coordinator_with_refresh_outcome(
+		batch: RecordBatch,
+		descriptor_failures: usize,
+		refresh: RefreshOutcome,
+	) -> QueryCoordinator {
+		let catalog = RefreshingCatalog::new(
+			descriptor_with_identity(TableId(1), TableObjectId::new([1; 16]), 1),
+			refresh,
+		);
 		let executor = Executor::with_context(
 			Arc::new(DescriptorEvolutionStorage {
 				table_data: batch,
@@ -1231,6 +1487,12 @@ mod tests {
 			),
 		);
 		QueryCoordinator::new(Arc::new(catalog), executor, PlannerConfig::default())
+	}
+
+	enum RefreshOutcome {
+		Binding(TableBinding),
+		Missing,
+		ResourceExhausted,
 	}
 
 	fn distributed_coordinator_with_policy(
@@ -1274,6 +1536,154 @@ mod tests {
 		}
 	}
 
+	fn named_count_plan() -> LogicalPlan {
+		LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("retry_table"),
+				projection: None,
+			}),
+			group_expr: vec![],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("id")])],
+		}
+	}
+
+	struct RefreshingCatalog {
+		inner: std::sync::Mutex<RefreshingCatalogState>,
+		metrics: Arc<DescriptorRefreshMetrics>,
+	}
+
+	struct RefreshingCatalogState {
+		current: Option<TableBinding>,
+		refresh: Option<RefreshOutcome>,
+		refs: Vec<TableRef>,
+	}
+
+	impl RefreshingCatalog {
+		fn new(stale: TableBinding, refresh: RefreshOutcome) -> Self {
+			Self {
+				inner: std::sync::Mutex::new(RefreshingCatalogState {
+					current: Some(stale),
+					refresh: Some(refresh),
+					refs: vec![
+						TableRef::new("retry_table"),
+						TableRef::with_schema("default", "retry_table"),
+					],
+				}),
+				metrics: Arc::new(DescriptorRefreshMetrics::default()),
+			}
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl Catalog for RefreshingCatalog {
+		fn scoped(self: Arc<Self>, _tenant_id: TenantId) -> Arc<dyn Catalog> {
+			self
+		}
+
+		fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics> {
+			Arc::clone(&self.metrics)
+		}
+
+		async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+			let mut state = self.inner.lock().expect("RefreshingCatalog lock poisoned");
+			if !state.refs.contains(table) {
+				return Err(CatalogError::TableNotFound {
+					table: table.table.clone(),
+				});
+			}
+			if state.current.is_none() {
+				match state.refresh.take() {
+					Some(RefreshOutcome::Binding(binding)) => state.current = Some(binding),
+					Some(RefreshOutcome::Missing) | None => {}
+					Some(RefreshOutcome::ResourceExhausted) => {
+						return Err(CatalogError::ResourceExhausted {
+							message: "tenant descriptor sync limit exhausted".to_string(),
+						});
+					}
+				}
+			}
+			state
+				.current
+				.clone()
+				.ok_or_else(|| CatalogError::TableNotFound {
+					table: table.table.clone(),
+				})
+		}
+
+		async fn resolve_table_local(
+			&self,
+			table: &TableRef,
+		) -> Result<TableBinding, CatalogError> {
+			let state = self.inner.lock().expect("RefreshingCatalog lock poisoned");
+			if !state.refs.contains(table) {
+				return Err(CatalogError::TableNotFound {
+					table: table.table.clone(),
+				});
+			}
+			state
+				.current
+				.clone()
+				.ok_or_else(|| CatalogError::TableNotFound {
+					table: table.table.clone(),
+				})
+		}
+
+		async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError> {
+			let state = self.inner.lock().expect("RefreshingCatalog lock poisoned");
+			state
+				.current
+				.as_ref()
+				.filter(|binding| binding.legacy_table_id == table)
+				.cloned()
+				.ok_or_else(|| CatalogError::TableNotFound {
+					table: format!("{table:?}"),
+				})
+		}
+
+		async fn invalidate_table_descriptor(
+			&self,
+			table: TableId,
+		) -> Result<Option<InvalidatedDescriptor>, CatalogError> {
+			let mut state = self.inner.lock().expect("RefreshingCatalog lock poisoned");
+			let Some(binding) = state
+				.current
+				.take()
+				.filter(|binding| binding.legacy_table_id == table)
+			else {
+				self.metrics.record_missing();
+				return Ok(None);
+			};
+			self.metrics.record_invalidated();
+			Ok(Some(InvalidatedDescriptor {
+				table_id: table,
+				table_object_id: binding.table,
+				fingerprint: binding.fingerprint,
+				refs: state.refs.clone(),
+			}))
+		}
+
+		async fn create_table(
+			&self,
+			_name: &TableRef,
+			_schema: SchemaRef,
+			_if_not_exists: bool,
+		) -> Result<TableBinding, CatalogError> {
+			Err(CatalogError::AdminFailed {
+				message: "RefreshingCatalog does not create tables".to_string(),
+			})
+		}
+
+		async fn drop_table(
+			&self,
+			_name: &TableRef,
+			_if_exists: bool,
+		) -> Result<Option<TableBinding>, CatalogError> {
+			Err(CatalogError::AdminFailed {
+				message: "RefreshingCatalog does not drop tables".to_string(),
+			})
+		}
+	}
+
 	struct DescriptorEvolutionStorage {
 		table_data: RecordBatch,
 		remaining_failures: AtomicUsize,
@@ -1293,7 +1703,9 @@ mod tests {
 				})
 				.is_ok()
 			{
-				return Err(StorageError::DescriptorEvolved);
+				return Err(StorageError::DescriptorEvolved {
+					table_id: request.table_id,
+				});
 			}
 			Ok(ScanStream::from_batches(
 				self.table_data.schema(),
@@ -1304,11 +1716,40 @@ mod tests {
 		}
 	}
 
-	fn descriptor() -> TableSchemaDescriptor {
+	struct DescriptorEvolutionWriter {
+		calls: AtomicUsize,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageWrite for DescriptorEvolutionWriter {
+		async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError> {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			})
+		}
+	}
+
+	fn descriptor_with_identity(
+		table_id: TableId,
+		table_object_id: TableObjectId,
+		schema_generation: u64,
+	) -> TableBinding {
+		TableBinding::from_descriptor(
+			table_id,
+			&descriptor_with_object(table_object_id, schema_generation),
+		)
+		.expect("table binding")
+	}
+
+	fn descriptor_with_object(
+		table_object_id: TableObjectId,
+		schema_generation: u64,
+	) -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
 		TableSchemaDescriptor::new(
-			TableObjectId::new([1; 16]),
-			1,
+			table_object_id,
+			schema_generation,
 			"default",
 			"retry_table",
 			&schema,

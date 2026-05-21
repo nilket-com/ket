@@ -2800,7 +2800,7 @@ fn adr029_coordinators_intercept_create_table() {
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
 	let distributed_branch = distributed_impl
-		.find("ExecutionPlan::CreateTable")
+		.find("LogicalPlan::CreateTable")
 		.expect("distributed DDL branch");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
@@ -3059,7 +3059,7 @@ fn adr030_distributed_coordinator_routes_insert_before_fragment_plan() {
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
 	let insert_route = distributed_impl
-		.find("ExecutionPlan::Insert")
+		.find("LogicalPlan::Insert")
 		.expect("distributed INSERT route");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
@@ -3326,7 +3326,7 @@ fn adr032_distributed_coordinator_routes_before_fragment() {
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
 	let insert_select_route = distributed_impl
-		.find("ExecutionPlan::InsertSelect")
+		.find("LogicalPlan::InsertSelect")
 		.expect("distributed INSERT SELECT route");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
@@ -3785,7 +3785,7 @@ fn adr033_distributed_coordinator_routes_before_fragment() {
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
 	let ctas_route = distributed_impl
-		.find("ExecutionPlan::CreateTableAsSelect")
+		.find("LogicalPlan::CreateTableAsSelect")
 		.expect("distributed CTAS route");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
@@ -4183,7 +4183,7 @@ fn adr034_coordinators_intercept_drop_table() {
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
 	let distributed_drop = distributed_impl
-		.find("ExecutionPlan::DropTable")
+		.find("LogicalPlan::DropTable")
 		.expect("distributed DROP branch");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
@@ -4746,7 +4746,7 @@ fn adr036_distributed_delete_routes_before_fragment() {
 		.nth(1)
 		.expect("DistributedQueryCoordinator impl");
 	let delete_route = distributed_impl
-		.find("ExecutionPlan::Delete")
+		.find("LogicalPlan::Delete")
 		.expect("distributed DELETE route");
 	let fragment_call = distributed_impl
 		.find("fragment_plan(")
@@ -4997,10 +4997,10 @@ fn adr037_distributed_dml_routes_to_shared_driver() {
 			.1;
 
 	for variant in [
-		"ExecutionPlan::Insert",
-		"ExecutionPlan::InsertSelect",
-		"ExecutionPlan::CreateTableAsSelect",
-		"ExecutionPlan::Delete",
+		"LogicalPlan::Insert",
+		"LogicalPlan::InsertSelect",
+		"LogicalPlan::CreateTableAsSelect",
+		"LogicalPlan::Delete",
 	] {
 		assert!(execute_query.contains(variant), "missing {variant}");
 	}
@@ -9313,17 +9313,30 @@ fn adr053_resolve_table_id_and_storage_do_not_trigger_descriptor_sync() {
 }
 
 #[test]
-fn adr053_descriptor_evolved_path_stays_unchanged() {
+fn adr053_descriptor_evolved_does_not_add_direct_sync_path() {
 	let storage =
 		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator");
+	let select_loop = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
+		.into_iter()
+		.last()
+		.expect("QueryCoordinator::execute_query")
+		.1;
+	let write_helper = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan(")
+		.into_iter()
+		.next()
+		.expect("execute_write_plan")
+		.1;
 
 	assert!(storage.contains("StorageError::DescriptorEvolved"));
-	assert!(storage.contains("physical_descriptor_fingerprint"));
-	assert!(coordinator.contains("StorageError::DescriptorEvolved"));
+	assert!(select_loop.contains("invalidate_descriptor_evolution(catalog.as_ref(), &error)"));
+	assert!(select_loop.contains("bind(plan, catalog.as_ref(), &self.config).await?"));
+	assert!(write_helper.contains("invalidate_descriptor_evolution_on_error"));
+	assert!(!write_helper.contains("loop"));
 	assert!(!coordinator.contains("get_table_schema_descriptor"));
 	assert!(!storage.contains("sync_descriptor_for_tenant"));
+	assert!(!storage.contains("resolve_table_after_local_miss"));
 }
 
 #[test]
@@ -9365,6 +9378,332 @@ fn adr053_retry_is_internal_to_resolve_table_not_coordinator() {
 	assert!(resolve_table.contains("resolve_table_after_local_miss"));
 	assert!(!coordinator.contains("resolve_table_after_local_miss"));
 	assert!(!coordinator.contains("get_table_schema_descriptor"));
+}
+
+#[test]
+fn adr054_descriptor_evolved_carries_local_table_id() {
+	let error = std::fs::read_to_string(manifest_dir().join("src/error.rs")).expect("read error");
+	let distributed = std::fs::read_to_string(manifest_dir().join("src/error/distributed.rs"))
+		.expect("read distributed error");
+
+	assert!(error.contains("DescriptorEvolved { table_id: TableId }"));
+	assert!(distributed.contains("DescriptorEvolved {\n\t\ttable_id: TableId,"));
+	assert!(distributed.contains("expected: Option<PhysicalDescriptorFingerprint>"));
+	assert!(distributed.contains("current: Option<PhysicalDescriptorFingerprint>"));
+}
+
+#[test]
+fn adr054_wendelon_evolved_error_mapped_with_request_context() {
+	let error = std::fs::read_to_string(manifest_dir().join("src/error.rs")).expect("read error");
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+
+	assert!(
+		!error.contains("ClientError::TableDescriptorEvolved { .. } => Self::DescriptorEvolved")
+	);
+	assert!(storage.contains("fn map_wendelon_client_error_to_storage("));
+	assert!(storage.contains("StorageError::DescriptorEvolved { table_id }"));
+	assert!(storage.contains("map_wendelon_client_error_to_storage(request.table_id, error)"));
+}
+
+#[test]
+fn adr054_trigger_is_descriptor_evolved_only() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let helper = brace_blocks_after_marker(&coordinator, "fn descriptor_evolved_table_id")
+		.into_iter()
+		.next()
+		.expect("descriptor_evolved_table_id")
+		.1;
+
+	assert!(helper.contains("StorageError::DescriptorEvolved"));
+	assert!(helper.contains("TaskFailureKind::DescriptorEvolved"));
+	for forbidden in ["TableNotFound", "AdminFailed", "ResourceExhausted"] {
+		assert!(
+			!helper.contains(forbidden),
+			"ADR 054 trigger helper widened to {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr054_invalidation_removes_by_id_payload_and_all_refs() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let invalidation =
+		brace_blocks_after_marker(&catalog, "pub fn invalidate_descriptor_for_tenant")
+			.into_iter()
+			.next()
+			.expect("invalidate_descriptor_for_tenant")
+			.1;
+
+	assert!(catalog.contains("pub struct InvalidatedDescriptor"));
+	assert!(invalidation.contains("state.by_id.remove(&(tenant_id, table))"));
+	assert!(invalidation.contains("state.descriptors.remove(&(tenant_id, table))"));
+	assert!(invalidation.contains("state.by_ref.retain"));
+	assert!(invalidation.contains("*entry_tenant == tenant_id && *table_id == table"));
+	assert!(invalidation.contains("refs.push(table_ref.clone())"));
+}
+
+#[test]
+fn adr054_invalidation_is_tenant_scoped_and_idempotent() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+	let invalidation =
+		brace_blocks_after_marker(&catalog, "pub fn invalidate_descriptor_for_tenant")
+			.into_iter()
+			.next()
+			.expect("invalidate_descriptor_for_tenant")
+			.1;
+
+	assert!(invalidation.contains("tenant_id: TenantId"));
+	assert!(invalidation.contains("table: TableId"));
+	assert!(invalidation.contains("let binding = state.by_id.remove(&(tenant_id, table))?;"));
+	assert!(!invalidation.contains("allocate_wendelon_table_id_locked"));
+	assert!(!invalidation.contains("sync_descriptor_for_tenant"));
+	assert!(!invalidation.contains("from_tenant_descriptors"));
+	assert!(catalog.contains("registry_invalidate_descriptor_for_tenant_is_tenant_scoped"));
+}
+
+#[test]
+fn adr054_select_retry_reuses_adr053_bind_miss_sync() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+
+	assert!(coordinator.contains("invalidate_descriptor_evolution(catalog.as_ref(), &error)"));
+	assert!(coordinator.contains("let bound = bind(plan, catalog.as_ref(), &self.config).await?;"));
+	assert!(catalog.contains("resolve_table_after_local_miss"));
+	assert!(catalog.contains("DescriptorSyncParticipant::Owner"));
+	assert!(
+		coordinator
+			.contains("coordinator_returns_resource_exhausted_when_refresh_sync_is_over_budget")
+	);
+	assert!(!coordinator.contains("get_table_schema_descriptor"));
+}
+
+#[test]
+fn adr054_no_force_refresh_resolve_table_flag() {
+	let catalog =
+		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
+
+	assert!(!catalog.contains("force_refresh"));
+	assert!(!catalog.contains("force_descriptor_refresh"));
+	assert!(!catalog.contains("refresh_descriptor_for_tenant"));
+}
+
+#[test]
+fn adr054_invalidation_is_path_agnostic_select_write_delete() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(coordinator.contains("fn invalidate_descriptor_evolution_on_error"));
+	assert!(coordinator.contains("execute_write_plan_with_source("));
+	assert!(coordinator.contains("invalidate_descriptor_evolution_on_error(catalog"));
+	assert!(coordinator.contains("LogicalPlan::Delete"));
+	assert!(coordinator.contains("LogicalPlan::CreateTableAsSelect"));
+}
+
+#[test]
+fn adr054_writes_invalidate_but_do_not_retry() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let write_helper = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan(")
+		.into_iter()
+		.next()
+		.expect("execute_write_plan")
+		.1;
+
+	assert!(write_helper.contains("invalidate_descriptor_evolution_on_error"));
+	assert!(!write_helper.contains("loop"));
+	assert!(coordinator.contains("write_descriptor_evolved_invalidates_without_retrying"));
+}
+
+#[test]
+fn adr054_replacement_object_returns_schema_instability() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let guard = brace_blocks_after_marker(&coordinator, "async fn reject_replacement_object")
+		.into_iter()
+		.next()
+		.expect("reject_replacement_object")
+		.1;
+
+	assert!(guard.contains("current.table == stale.table_object_id"));
+	assert!(guard.contains("record_replacement"));
+	assert!(guard.contains("QueryError::SchemaInstability"));
+	assert!(
+		coordinator.contains("coordinator_rejects_replacement_object_after_descriptor_evolved")
+	);
+	assert!(
+		coordinator.contains("coordinator_returns_table_not_found_after_descriptor_evolved_drop")
+	);
+}
+
+#[test]
+fn adr054_second_evolution_returns_schema_instability() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(coordinator.contains("retried_descriptor_evolution"));
+	assert!(coordinator.contains("Err(QueryError::SchemaInstability)"));
+	assert!(
+		coordinator
+			.contains("coordinator_fails_schema_instability_after_second_descriptor_evolved")
+	);
+}
+
+#[test]
+fn adr054_no_ttl_reaper_watch_inventory_or_push() {
+	let source = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"descriptor_ttl",
+		"DescriptorTtl",
+		"descriptor_reaper",
+		"DescriptorReaper",
+		"watch_descriptor",
+		"push_invalidation",
+		"DescriptorInventory",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 054 added forbidden refresh machinery: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr054_no_new_budget_or_governance_knob() {
+	let source = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"max_queries_per_second",
+		"TenantRateLimiter",
+		"fairness_weight",
+		"weighted_fair",
+		"borrow",
+		"queue_depth",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 054 added governance knob {forbidden}"
+		);
+	}
+	assert!(source.contains("max_concurrent_descriptor_syncs"));
+}
+
+#[test]
+fn adr054_no_wendelon_server_or_sql_wire_change() {
+	let toron_wire =
+		std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read toron wire");
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(!toron_wire.contains("DescriptorRefresh"));
+	assert!(!wendelon_source.contains("DescriptorRefresh"));
+	assert!(!wendelon_source.contains("catalog_descriptor_refresh"));
+}
+
+#[test]
+fn adr054_refresh_metrics_are_aggregate_only() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+
+	assert!(observability.contains("catalog_descriptor_refresh_requests_total"));
+	for outcome in ["invalidated", "missing", "replacement"] {
+		assert!(observability.contains(outcome), "missing outcome {outcome}");
+	}
+	for forbidden in [
+		"tenant_id",
+		"namespace",
+		"table_name",
+		"table_object_id",
+		"fingerprint",
+	] {
+		let offenders = observability
+			.lines()
+			.filter(|line| {
+				line.contains("catalog_descriptor_refresh_requests_total")
+					&& line.contains(forbidden)
+			})
+			.collect::<Vec<_>>();
+		assert!(
+			offenders.is_empty(),
+			"descriptor refresh metric gained forbidden label {forbidden}: {offenders:?}"
+		);
+	}
+	assert!(
+		observability_test
+			.contains("catalog_descriptor_refresh_metrics_are_aggregate_outcome_only")
+	);
+}
+
+#[test]
+fn adr054_prior_adr049_050_051_052_053_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in ["adr049_", "adr050_", "adr051_", "adr052_", "adr053_"] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr054_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr054_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	assert!(!worker.contains("DescriptorEvolved"));
+	assert!(!worker.contains("catalog_descriptor_refresh"));
+	assert!(!worker.contains("force_refresh"));
+}
+
+#[test]
+fn adr054_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	let source = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(source.contains("InvalidatedDescriptor"));
+	assert!(source.contains("DescriptorRefreshMetrics"));
+	assert!(!source.contains("InvalidatedDescriptorV1"));
+	assert!(!source.contains("DescriptorRefreshMetricsV1"));
+	assert!(!source.contains("DescriptorInvalidationV1"));
 }
 
 #[test]
@@ -10081,7 +10420,7 @@ fn adr038_no_separate_catalog_cache_after_admin() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
 		.expect("read catalog source");
 
-	for forbidden in ["invalidate_table", "refresh_catalog", "evict_descriptor"] {
+	for forbidden in ["refresh_catalog", "evict_descriptor"] {
 		assert!(
 			!catalog.contains(forbidden),
 			"unexpected helper {forbidden}"

@@ -10,8 +10,8 @@ use thiserror::Error;
 pub enum StorageError {
 	#[error("table not found: {table:?}")]
 	TableNotFound { table: TableId },
-	#[error("descriptor evolved during query planning/execution")]
-	DescriptorEvolved,
+	#[error("descriptor evolved for {table_id:?} during query planning/execution")]
+	DescriptorEvolved { table_id: TableId },
 	#[error("read bound unavailable")]
 	ReadBoundUnavailable {
 		#[source]
@@ -51,7 +51,9 @@ impl From<wendelon_client::ClientError> for StorageError {
 
 		match source {
 			source @ ClientError::AuthorizationFailed => Self::PermissionDenied { source },
-			ClientError::TableDescriptorEvolved { .. } => Self::DescriptorEvolved,
+			ClientError::TableDescriptorEvolved { .. } => Self::Internal {
+				message: "descriptor evolved without table context".to_string(),
+			},
 			source @ ClientError::QuotaExceeded { .. }
 			| source @ ClientError::TenantSuspended { .. }
 			| source @ ClientError::TenantUnavailable { .. }
@@ -312,7 +314,7 @@ mod tests {
 			expected: descriptor_fingerprint(),
 			observed: Some(descriptor_fingerprint()),
 		});
-		assert!(matches!(err, StorageError::DescriptorEvolved));
+		assert!(matches!(err, StorageError::Internal { .. }));
 	}
 
 	fn descriptor_fingerprint() -> wendelon::schema::PhysicalDescriptorFingerprint {

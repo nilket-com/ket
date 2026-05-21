@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
-use crate::catalog::DescriptorSyncMetrics;
+use crate::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use crate::config::ObservabilityListeners;
 use crate::distributed::budget::{
 	AdmissionResource, ByteCount, TenantAdmissionRejectionCounters, TenantBudgetPolicy,
@@ -160,32 +160,37 @@ pub struct MetricsRegistry {
 	descriptors_loaded: AtomicU64,
 	static_workers_configured: AtomicU64,
 	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
+	descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
 	resource_metrics: ResourceMetrics,
 }
 
+pub struct MetricsRegistryConfig {
+	pub descriptors_loaded: u64,
+	pub static_workers_configured: u64,
+	pub tenant_budgets: TenantBudgetPolicy,
+	pub descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
+	pub descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
+	pub tenant_memory: TenantMemoryAccountant,
+	pub tenant_concurrency: TenantConcurrencyAccountant,
+	pub admission_rejections: TenantAdmissionRejectionCounters,
+}
+
 impl MetricsRegistry {
-	pub fn new(
-		descriptors_loaded: u64,
-		static_workers_configured: u64,
-		tenant_budgets: TenantBudgetPolicy,
-		descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
-		tenant_memory: TenantMemoryAccountant,
-		tenant_concurrency: TenantConcurrencyAccountant,
-		admission_rejections: TenantAdmissionRejectionCounters,
-	) -> Self {
+	pub fn new(config: MetricsRegistryConfig) -> Self {
 		Self {
 			started_at: Instant::now(),
 			listener_accepts: ListenerCounters::default(),
 			listener_rejects: ListenerRejectCounters::default(),
 			metrics_scrapes_total: AtomicU64::new(0),
-			descriptors_loaded: AtomicU64::new(descriptors_loaded),
-			static_workers_configured: AtomicU64::new(static_workers_configured),
-			descriptor_sync_metrics,
+			descriptors_loaded: AtomicU64::new(config.descriptors_loaded),
+			static_workers_configured: AtomicU64::new(config.static_workers_configured),
+			descriptor_sync_metrics: config.descriptor_sync_metrics,
+			descriptor_refresh_metrics: config.descriptor_refresh_metrics,
 			resource_metrics: ResourceMetrics {
-				tenant_budgets,
-				tenant_memory,
-				tenant_concurrency,
-				admission_rejections,
+				tenant_budgets: config.tenant_budgets,
+				tenant_memory: config.tenant_memory,
+				tenant_concurrency: config.tenant_concurrency,
+				admission_rejections: config.admission_rejections,
 			},
 		}
 	}
@@ -248,6 +253,7 @@ impl MetricsRegistry {
 			self.static_workers_configured.load(Ordering::Relaxed)
 		));
 		self.render_descriptor_sync_metrics(&mut out);
+		self.render_descriptor_refresh_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
 		out
 	}
@@ -263,6 +269,20 @@ impl MetricsRegistry {
 		] {
 			out.push_str(&format!(
 				"catalog_descriptor_sync_requests_total{{outcome=\"{outcome}\"}} {count}\n"
+			));
+		}
+	}
+
+	fn render_descriptor_refresh_metrics(&self, out: &mut String) {
+		let snapshot = self.descriptor_refresh_metrics.snapshot();
+		out.push_str("# TYPE catalog_descriptor_refresh_requests_total counter\n");
+		for (outcome, count) in [
+			("invalidated", snapshot.invalidated),
+			("missing", snapshot.missing),
+			("replacement", snapshot.replacement),
+		] {
+			out.push_str(&format!(
+				"catalog_descriptor_refresh_requests_total{{outcome=\"{outcome}\"}} {count}\n"
 			));
 		}
 	}

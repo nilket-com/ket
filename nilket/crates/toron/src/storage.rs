@@ -263,7 +263,9 @@ impl StorageWrite for InMemoryTableStorage {
 					|| data.physical_descriptor_fingerprint
 						!= request.physical_descriptor_fingerprint
 				{
-					return Err(StorageError::DescriptorEvolved);
+					return Err(StorageError::DescriptorEvolved {
+						table_id: request.table_id,
+					});
 				}
 				if data.batch.schema() != request.payload.schema() {
 					return Err(StorageError::Internal {
@@ -297,10 +299,14 @@ impl StorageScan for InMemoryTableStorage {
 					table: request.table_id,
 				})?;
 			if data.table_object_id != request.table_object_id {
-				return Err(StorageError::DescriptorEvolved);
+				return Err(StorageError::DescriptorEvolved {
+					table_id: request.table_id,
+				});
 			}
 			if data.physical_descriptor_fingerprint != request.physical_descriptor_fingerprint {
-				return Err(StorageError::DescriptorEvolved);
+				return Err(StorageError::DescriptorEvolved {
+					table_id: request.table_id,
+				});
 			}
 			(
 				data.batch.clone(),
@@ -330,10 +336,14 @@ impl StorageDeleteRows for InMemoryTableStorage {
 				table: request.table_id,
 			})?;
 		if data.table_object_id != request.table_object_id {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 		if data.physical_descriptor_fingerprint != request.physical_descriptor_fingerprint {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 
 		let live_row_key_ids = data.row_key_ids.iter().copied().collect::<HashSet<_>>();
@@ -376,10 +386,14 @@ impl StorageAdmin for InMemoryTableStorage {
 				table: request.table_id,
 			})?;
 		if data.table_object_id != request.table_object_id {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 		if data.physical_descriptor_fingerprint != request.physical_descriptor_fingerprint {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 		tables.remove(&request.table_id);
 		Ok(DropTableStorageOutcome::new(1))
@@ -443,6 +457,21 @@ fn map_wendelon_admin_error_to_storage(
 			wendelon_client::WendelonAdminError::TableMissing { .. }
 			| wendelon_client::WendelonAdminError::TableAlreadyDropped { .. },
 		) => StorageError::TableNotFound { table: table_id },
+		wendelon_client::ClientError::TableDescriptorEvolved { .. } => {
+			StorageError::DescriptorEvolved { table_id }
+		}
+		other => StorageError::from(other),
+	}
+}
+
+fn map_wendelon_client_error_to_storage(
+	table_id: TableId,
+	error: wendelon_client::ClientError,
+) -> StorageError {
+	match error {
+		wendelon_client::ClientError::TableDescriptorEvolved { .. } => {
+			StorageError::DescriptorEvolved { table_id }
+		}
 		other => StorageError::from(other),
 	}
 }
@@ -716,10 +745,14 @@ impl StorageScan for WendelonStorageScan {
 			.descriptor_registry
 			.descriptor(request.tenant_id, request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 		if request.physical_descriptor_fingerprint != descriptor.physical_descriptor_fingerprint {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 
 		let mut pbc = request.pbc_predicate.unwrap_or_default();
@@ -752,7 +785,8 @@ impl StorageScan for WendelonStorageScan {
 				request.runtime_filter.clone(),
 				options,
 			)
-			.await?;
+			.await
+			.map_err(|error| map_wendelon_client_error_to_storage(request.table_id, error))?;
 		let schema = if let Some(batch) = query_result.batches.first() {
 			batch.schema()
 		} else {
@@ -809,10 +843,14 @@ impl StorageWrite for WendelonStorageWrite {
 			.descriptor_registry
 			.descriptor(request.tenant_id, request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 		if request.physical_descriptor_fingerprint != descriptor.physical_descriptor_fingerprint {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 
 		let descriptor_schema =
@@ -840,7 +878,7 @@ impl StorageWrite for WendelonStorageWrite {
 				},
 			)
 			.await
-			.map_err(StorageError::from)?;
+			.map_err(|error| map_wendelon_client_error_to_storage(request.table_id, error))?;
 
 		Ok(WriteOutcome { rows: receipt.rows })
 	}
@@ -885,10 +923,14 @@ impl StorageDeleteRows for WendelonStorageDeleteRows {
 			.descriptor_registry
 			.descriptor(request.tenant_id, request.table_id)?;
 		if request.table_object_id != descriptor.table_object_id {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 		if request.physical_descriptor_fingerprint != descriptor.physical_descriptor_fingerprint {
-			return Err(StorageError::DescriptorEvolved);
+			return Err(StorageError::DescriptorEvolved {
+				table_id: request.table_id,
+			});
 		}
 
 		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
@@ -904,7 +946,7 @@ impl StorageDeleteRows for WendelonStorageDeleteRows {
 				},
 			)
 			.await
-			.map_err(StorageError::from)?;
+			.map_err(|error| map_wendelon_client_error_to_storage(request.table_id, error))?;
 
 		Ok(DeleteRowsOutcome {
 			requested: receipt.requested,

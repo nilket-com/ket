@@ -128,9 +128,19 @@ impl TableBinding {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct InvalidatedDescriptor {
+	pub table_id: TableId,
+	pub table_object_id: TableObjectId,
+	pub fingerprint: PhysicalDescriptorFingerprint,
+	pub refs: Vec<TableRef>,
+}
+
 #[async_trait::async_trait]
 pub trait Catalog: Send + Sync {
 	fn scoped(self: Arc<Self>, tenant_id: TenantId) -> Arc<dyn Catalog>;
+
+	fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics>;
 
 	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError>;
 
@@ -139,6 +149,11 @@ pub trait Catalog: Send + Sync {
 	}
 
 	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError>;
+
+	async fn invalidate_table_descriptor(
+		&self,
+		table: TableId,
+	) -> Result<Option<InvalidatedDescriptor>, CatalogError>;
 
 	async fn create_table(
 		&self,
@@ -219,9 +234,46 @@ impl DescriptorSyncMetrics {
 	}
 }
 
+#[derive(Default)]
+pub struct DescriptorRefreshMetrics {
+	invalidated: AtomicU64,
+	missing: AtomicU64,
+	replacement: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorRefreshMetricSnapshot {
+	pub invalidated: u64,
+	pub missing: u64,
+	pub replacement: u64,
+}
+
+impl DescriptorRefreshMetrics {
+	pub fn snapshot(&self) -> DescriptorRefreshMetricSnapshot {
+		DescriptorRefreshMetricSnapshot {
+			invalidated: self.invalidated.load(Ordering::Relaxed),
+			missing: self.missing.load(Ordering::Relaxed),
+			replacement: self.replacement.load(Ordering::Relaxed),
+		}
+	}
+
+	pub fn record_invalidated(&self) {
+		self.invalidated.fetch_add(1, Ordering::Relaxed);
+	}
+
+	pub fn record_missing(&self) {
+		self.missing.fetch_add(1, Ordering::Relaxed);
+	}
+
+	pub fn record_replacement(&self) {
+		self.replacement.fetch_add(1, Ordering::Relaxed);
+	}
+}
+
 pub struct MockCatalog {
 	tenant_id: TenantId,
 	inner: Arc<RwLock<MockCatalogInner>>,
+	descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
 }
 
 struct MockCatalogInner {
@@ -235,6 +287,7 @@ impl Default for MockCatalog {
 		Self {
 			tenant_id: TenantId(1),
 			inner: Arc::new(RwLock::new(MockCatalogInner::default())),
+			descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 		}
 	}
 }
@@ -312,7 +365,12 @@ impl Catalog for MockCatalog {
 		Arc::new(Self {
 			tenant_id,
 			inner: Arc::clone(&self.inner),
+			descriptor_refresh_metrics: Arc::clone(&self.descriptor_refresh_metrics),
 		})
+	}
+
+	fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics> {
+		Arc::clone(&self.descriptor_refresh_metrics)
 	}
 
 	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
@@ -342,6 +400,32 @@ impl Catalog for MockCatalog {
 			.ok_or_else(|| CatalogError::TableNotFound {
 				table: format!("{table:?}"),
 			})
+	}
+
+	async fn invalidate_table_descriptor(
+		&self,
+		table: TableId,
+	) -> Result<Option<InvalidatedDescriptor>, CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		let Some(binding) = inner.by_id.remove(&(self.tenant_id, table)) else {
+			self.descriptor_refresh_metrics.record_missing();
+			return Ok(None);
+		};
+		let mut refs = Vec::new();
+		inner.by_ref.retain(|(tenant_id, table_ref), table_id| {
+			let remove = *tenant_id == self.tenant_id && *table_id == table;
+			if remove {
+				refs.push(table_ref.clone());
+			}
+			!remove
+		});
+		self.descriptor_refresh_metrics.record_invalidated();
+		Ok(Some(InvalidatedDescriptor {
+			table_id: table,
+			table_object_id: binding.table,
+			fingerprint: binding.fingerprint,
+			refs,
+		}))
 	}
 
 	async fn create_table(
@@ -597,6 +681,7 @@ pub struct WendelonCatalog {
 	descriptor_sync_client: Option<Arc<dyn DescriptorSyncClient>>,
 	descriptor_sync_flights: Option<Arc<DescriptorSyncFlights>>,
 	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
+	descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
 	tenant_id: TenantId,
 	registry: Arc<WendelonDescriptorRegistry>,
 }
@@ -608,6 +693,7 @@ impl Default for WendelonCatalog {
 			descriptor_sync_client: None,
 			descriptor_sync_flights: None,
 			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+			descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 			tenant_id: TenantId(1),
 			registry: Arc::new(WendelonDescriptorRegistry::default()),
 		}
@@ -995,6 +1081,34 @@ impl WendelonDescriptorRegistry {
 		state.finalized_drops.remove(&(tenant_id, table));
 		Ok(binding)
 	}
+
+	pub fn invalidate_descriptor_for_tenant(
+		&self,
+		tenant_id: TenantId,
+		table: TableId,
+	) -> Option<InvalidatedDescriptor> {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let binding = state.by_id.remove(&(tenant_id, table))?;
+		state.descriptors.remove(&(tenant_id, table));
+		state.finalized_drops.remove(&(tenant_id, table));
+		let mut refs = Vec::new();
+		state.by_ref.retain(|(entry_tenant, table_ref), table_id| {
+			let remove = *entry_tenant == tenant_id && *table_id == table;
+			if remove {
+				refs.push(table_ref.clone());
+			}
+			!remove
+		});
+		Some(InvalidatedDescriptor {
+			table_id: table,
+			table_object_id: binding.table,
+			fingerprint: binding.fingerprint,
+			refs,
+		})
+	}
 }
 
 fn insert_wendelon_descriptor_locked(
@@ -1083,6 +1197,7 @@ impl WendelonCatalog {
 			descriptor_sync_client: Some(descriptor_sync_client),
 			descriptor_sync_flights: Some(default_descriptor_sync_flights()),
 			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+			descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 			tenant_id,
 			registry: Arc::new(WendelonDescriptorRegistry::from_descriptors_for_tenant(
 				tenant_id,
@@ -1120,6 +1235,7 @@ impl WendelonCatalog {
 				descriptor_sync_accountant,
 			))),
 			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+			descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 			tenant_id,
 			registry,
 		}
@@ -1131,6 +1247,10 @@ impl WendelonCatalog {
 
 	pub fn descriptor_sync_metrics(&self) -> Arc<DescriptorSyncMetrics> {
 		Arc::clone(&self.descriptor_sync_metrics)
+	}
+
+	pub fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics> {
+		Arc::clone(&self.descriptor_refresh_metrics)
 	}
 
 	async fn resolve_table_after_local_miss(
@@ -1242,9 +1362,14 @@ impl Catalog for WendelonCatalog {
 			descriptor_sync_client: self.descriptor_sync_client.clone(),
 			descriptor_sync_flights: self.descriptor_sync_flights.clone(),
 			descriptor_sync_metrics: Arc::clone(&self.descriptor_sync_metrics),
+			descriptor_refresh_metrics: Arc::clone(&self.descriptor_refresh_metrics),
 			tenant_id,
 			registry: Arc::clone(&self.registry),
 		})
+	}
+
+	fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics> {
+		Arc::clone(&self.descriptor_refresh_metrics)
 	}
 
 	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
@@ -1263,6 +1388,21 @@ impl Catalog for WendelonCatalog {
 
 	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError> {
 		self.registry.resolve_table_id(self.tenant_id, table)
+	}
+
+	async fn invalidate_table_descriptor(
+		&self,
+		table: TableId,
+	) -> Result<Option<InvalidatedDescriptor>, CatalogError> {
+		let invalidated = self
+			.registry
+			.invalidate_descriptor_for_tenant(self.tenant_id, table);
+		if invalidated.is_some() {
+			self.descriptor_refresh_metrics.record_invalidated();
+		} else {
+			self.descriptor_refresh_metrics.record_missing();
+		}
+		Ok(invalidated)
 	}
 
 	async fn create_table(
@@ -1659,6 +1799,7 @@ mod tests {
 			descriptor_sync_client: Some(client),
 			descriptor_sync_flights: Some(Arc::new(DescriptorSyncFlights::new(accountant))),
 			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+			descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 			tenant_id,
 			registry,
 		}
@@ -2344,6 +2485,74 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn registry_invalidate_descriptor_for_tenant_removes_all_aliases_and_payload() {
+		let descriptor = descriptor();
+		let registry = WendelonDescriptorRegistry::from_descriptors_for_tenant(
+			TenantId(7),
+			[(TableId(9), descriptor.clone())],
+		)
+		.expect("registry");
+
+		let invalidated = registry
+			.invalidate_descriptor_for_tenant(TenantId(7), TableId(9))
+			.expect("invalidated descriptor");
+
+		assert_eq!(invalidated.table_id, TableId(9));
+		assert_eq!(invalidated.table_object_id, descriptor.table_object_id);
+		assert_eq!(
+			invalidated.fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+		assert!(invalidated.refs.contains(&TableRef::new("orders")));
+		assert!(
+			invalidated
+				.refs
+				.contains(&TableRef::with_schema("bench", "orders"))
+		);
+		assert!(
+			registry
+				.resolve_table(TenantId(7), &TableRef::new("orders"))
+				.is_err()
+		);
+		assert!(registry.resolve_table_id(TenantId(7), TableId(9)).is_err());
+		assert!(registry.descriptor(TenantId(7), TableId(9)).is_err());
+		assert!(
+			registry
+				.invalidate_descriptor_for_tenant(TenantId(7), TableId(9))
+				.is_none()
+		);
+	}
+
+	#[tokio::test]
+	async fn registry_invalidate_descriptor_for_tenant_is_tenant_scoped() {
+		let tenant_7_descriptor = descriptor_with_identity(0xA7, 7);
+		let tenant_8_descriptor = descriptor_with_identity(0xA8, 8);
+		let registry = WendelonDescriptorRegistry::default();
+		registry
+			.register_descriptor_for_tenant(TenantId(7), TableId(1), tenant_7_descriptor)
+			.expect("tenant 7 descriptor");
+		registry
+			.register_descriptor_for_tenant(TenantId(8), TableId(1), tenant_8_descriptor.clone())
+			.expect("tenant 8 descriptor");
+
+		let invalidated = registry.invalidate_descriptor_for_tenant(TenantId(7), TableId(1));
+
+		assert!(invalidated.is_some());
+		assert!(
+			registry
+				.resolve_table(TenantId(7), &TableRef::new("orders"))
+				.is_err()
+		);
+		assert_eq!(
+			registry
+				.resolve_table(TenantId(8), &TableRef::new("orders"))
+				.expect("tenant 8 still present")
+				.table,
+			tenant_8_descriptor.table_object_id
+		);
+	}
+
+	#[tokio::test]
 	async fn descriptor_sync_is_tenant_scoped_across_same_table_name() {
 		let tenant_7_descriptor = default_descriptor_with_identity(0xE7, 1);
 		let tenant_8_descriptor = default_descriptor_with_identity(0xE8, 1);
@@ -2397,6 +2606,7 @@ mod tests {
 			descriptor_sync_client: None,
 			descriptor_sync_flights: None,
 			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+			descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
 			tenant_id: TenantId(1),
 			registry,
 		});

@@ -4314,7 +4314,10 @@ along with the forward-sequence rewrite.
   authoritative; Toron is a reactive-pull-on-stale cache, never a
   managed mirror. Placement: Exterior Substrate → Toron home. The
   migration is materialized in
-  `plans/impl/054_reactive_descriptor_invalidation.md`.
+  `plans/impl/054_reactive_descriptor_invalidation.md`; implementation
+  evidence is recorded in
+  `plans/impl/054_reactive_descriptor_invalidation_evidence.md`, including
+  a passing full `cargo test -p toron -- --test-threads=6` run.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
