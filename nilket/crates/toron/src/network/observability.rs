@@ -16,6 +16,7 @@ use crate::distributed::budget::{
 	AdmissionResource, ByteCount, TenantAdmissionController, TenantAdmissionRejectionCounters,
 	TenantBudgetPolicy,
 };
+use crate::network::connection::SqlConnectionLimiter;
 use crate::network::observability_http::{READ_REQUEST_TIMEOUT, read_request, write_response};
 use crate::storage::TenantId;
 
@@ -161,6 +162,7 @@ pub struct MetricsRegistry {
 	static_workers_configured: AtomicU64,
 	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
+	sql_connection_limiter: Option<SqlConnectionLimiter>,
 	resource_metrics: ResourceMetrics,
 }
 
@@ -170,6 +172,7 @@ pub struct MetricsRegistryConfig {
 	pub tenant_budgets: TenantBudgetPolicy,
 	pub descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	pub descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
+	pub sql_connection_limiter: Option<SqlConnectionLimiter>,
 	pub tenant_admission: TenantAdmissionController,
 	pub admission_rejections: TenantAdmissionRejectionCounters,
 }
@@ -185,6 +188,7 @@ impl MetricsRegistry {
 			static_workers_configured: AtomicU64::new(config.static_workers_configured),
 			descriptor_sync_metrics: config.descriptor_sync_metrics,
 			descriptor_refresh_metrics: config.descriptor_refresh_metrics,
+			sql_connection_limiter: config.sql_connection_limiter,
 			resource_metrics: ResourceMetrics {
 				tenant_budgets: config.tenant_budgets,
 				tenant_admission: config.tenant_admission,
@@ -252,6 +256,7 @@ impl MetricsRegistry {
 		));
 		self.render_descriptor_sync_metrics(&mut out);
 		self.render_descriptor_refresh_metrics(&mut out);
+		self.render_sql_connection_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
 		out
 	}
@@ -281,6 +286,33 @@ impl MetricsRegistry {
 		] {
 			out.push_str(&format!(
 				"catalog_descriptor_refresh_requests_total{{outcome=\"{outcome}\"}} {count}\n"
+			));
+		}
+	}
+
+	fn render_sql_connection_metrics(&self, out: &mut String) {
+		let Some(limiter) = &self.sql_connection_limiter else {
+			return;
+		};
+		let global = limiter.global_metrics();
+		out.push_str("# TYPE sql_connections_active gauge\n");
+		out.push_str("# TYPE sql_connection_rejections_total counter\n");
+		out.push_str(&format!("sql_connections_active {}\n", global.active));
+		out.push_str(&format!(
+			"sql_connection_rejections_total {}\n",
+			global.rejections
+		));
+		out.push_str("# TYPE tenant_sql_connections_active gauge\n");
+		out.push_str("# TYPE tenant_sql_connection_rejections_total counter\n");
+		for slot in limiter.tenant_metric_slots() {
+			let label = slot.label;
+			out.push_str(&format!(
+				"tenant_sql_connections_active{{tenant_id=\"{label}\"}} {}\n",
+				slot.active
+			));
+			out.push_str(&format!(
+				"tenant_sql_connection_rejections_total{{tenant_id=\"{label}\"}} {}\n",
+				slot.rejections
 			));
 		}
 	}
@@ -492,6 +524,7 @@ struct RejectCounters {
 	san_role_rejected: AtomicU64,
 	bind_unavailable: AtomicU64,
 	request_timeout: AtomicU64,
+	connection_limit: AtomicU64,
 }
 
 impl RejectCounters {
@@ -511,6 +544,7 @@ impl RejectCounters {
 			RejectReason::SanRoleRejected => &self.san_role_rejected,
 			RejectReason::BindUnavailable => &self.bind_unavailable,
 			RejectReason::RequestTimeout => &self.request_timeout,
+			RejectReason::ConnectionLimit => &self.connection_limit,
 		}
 	}
 }
@@ -552,16 +586,18 @@ pub enum RejectReason {
 	SanRoleRejected,
 	BindUnavailable,
 	RequestTimeout,
+	ConnectionLimit,
 }
 
 impl RejectReason {
-	const ALL: [Self; 6] = [
+	const ALL: [Self; 7] = [
 		Self::MtlsHandshakeFailure,
 		Self::PeerUnknownCa,
 		Self::SanShapeRejected,
 		Self::SanRoleRejected,
 		Self::BindUnavailable,
 		Self::RequestTimeout,
+		Self::ConnectionLimit,
 	];
 
 	fn as_str(self) -> &'static str {
@@ -572,6 +608,7 @@ impl RejectReason {
 			Self::SanRoleRejected => "san_role_rejected",
 			Self::BindUnavailable => "bind_unavailable",
 			Self::RequestTimeout => "request_timeout",
+			Self::ConnectionLimit => "connection_limit",
 		}
 	}
 }

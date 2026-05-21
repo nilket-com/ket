@@ -79,6 +79,7 @@ fn config_with_sql() -> ToronBootstrapConfig {
 		transport: SqlTransport::Quic,
 		listener_bind: "127.0.0.1:0".parse().expect("sql bind"),
 		statement_timeout: Duration::from_secs(1),
+		max_concurrent_connections: None,
 	});
 	config
 }

@@ -83,6 +83,21 @@ impl QuicEndpoint {
 			.map_err(|error| Error::new(ErrorKind::ConnectionAborted, error))
 	}
 
+	pub async fn accept_sql_incoming(&self) -> std::io::Result<quinn::Incoming> {
+		self.inner
+			.accept()
+			.await
+			.ok_or_else(|| Error::new(ErrorKind::ConnectionAborted, "QUIC endpoint closed"))
+	}
+
+	pub async fn accept_incoming_connection(
+		incoming: quinn::Incoming,
+	) -> std::io::Result<quinn::Connection> {
+		incoming
+			.await
+			.map_err(|error| Error::new(ErrorKind::ConnectionAborted, error))
+	}
+
 	pub async fn accept_stream_on(connection: &quinn::Connection) -> std::io::Result<QuicStream> {
 		let (send, recv) = connection
 			.accept_bi()

@@ -4545,6 +4545,8 @@ Wendelon server change, zero SQL wire change.**
 
 The migration is materialized in
 `plans/impl/057_sql_connection_admission.md`.
+Implementation evidence is recorded in
+`plans/impl/057_sql_connection_admission_evidence.md`.
 
 **ADR 058 candidates:**
 

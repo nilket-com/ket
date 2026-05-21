@@ -32,6 +32,7 @@ use toron::distributed::budget::{
 	TenantAdmissionRejectionCounters, TenantBudget, TenantBudgetPolicy,
 };
 use toron::distributed::identity::WorkerId;
+use toron::network::connection::SqlConnectionLimiter;
 use toron::network::observability::{MetricsRegistry, MetricsRegistryConfig, ReadinessSnapshot};
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, canonical_client_dns_name, canonical_daemon_dns_name,
@@ -92,6 +93,7 @@ fn sample_resource_metrics_body() -> String {
 		tenant_budgets: policy,
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections,
 	});
@@ -401,6 +403,48 @@ fn rate_rejection_metric_uses_configured_plus_other_and_resource_rate() {
 	assert_rate_rejection_metric_uses_configured_plus_other_and_resource_rate();
 }
 
+#[test]
+fn sql_connection_metrics_are_configured_plus_other() {
+	let mut per_tenant = HashMap::new();
+	let mut configured_budget = TenantBudget::new(ByteCount::new(8), ByteCount::new(16));
+	configured_budget.max_concurrent_connections = NonZeroU32::new(1);
+	let mut default_budget = TenantBudget::new(ByteCount::new(8), ByteCount::new(32));
+	default_budget.max_concurrent_connections = NonZeroU32::new(1);
+	per_tenant.insert(TenantId(7), configured_budget);
+	let policy = TenantBudgetPolicy::new(default_budget, per_tenant);
+	let limiter = SqlConnectionLimiter::new(NonZeroU32::new(1), policy.clone());
+	let _global = limiter.try_acquire_tier1().expect("global permit");
+	assert!(limiter.try_acquire_tier1().is_err());
+	let _configured = limiter.try_acquire_tier2(TenantId(7)).expect("tenant 7");
+	assert!(limiter.try_acquire_tier2(TenantId(7)).is_err());
+	let _other = limiter.try_acquire_tier2(TenantId(9)).expect("other");
+	assert!(limiter.try_acquire_tier2(TenantId(10)).is_err());
+	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy.clone(),
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		sql_connection_limiter: Some(limiter),
+		tenant_admission,
+		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
+	});
+	let body = metrics.render_text(&ready_snapshot());
+
+	for metric in [
+		"sql_connections_active 1\n",
+		"sql_connection_rejections_total 1\n",
+		"tenant_sql_connections_active{tenant_id=\"7\"} 1\n",
+		"tenant_sql_connection_rejections_total{tenant_id=\"7\"} 1\n",
+		"tenant_sql_connections_active{tenant_id=\"other\"} 1\n",
+		"tenant_sql_connection_rejections_total{tenant_id=\"other\"} 1\n",
+	] {
+		assert!(body.contains(metric), "missing metric {metric} in {body}");
+	}
+	assert!(!body.contains("tenant_sql_connections_active{tenant_id=\"9\"}"));
+}
+
 fn assert_rate_rejection_metric_uses_configured_plus_other_and_resource_rate() {
 	let body = sample_resource_metrics_body();
 
@@ -427,6 +471,7 @@ fn queue_and_borrow_metrics_are_configured_plus_other_no_table_labels() {
 			ByteCount::new(8),
 			NonZeroU32::new(1).expect("nonzero"),
 			NonZeroU32::new(1).expect("nonzero"),
+			None,
 			NonZeroU32::new(1).expect("nonzero"),
 			1,
 			ByteCount::new(8),
@@ -470,6 +515,7 @@ fn queue_and_borrow_metrics_are_configured_plus_other_no_table_labels() {
 		tenant_budgets: policy,
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		sql_connection_limiter: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&TenantBudgetPolicy::new(
 			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
@@ -761,6 +807,7 @@ fn observability_config(worker_id: WorkerId, pki: &TestPki) -> ToronBootstrapCon
 			transport: SqlTransport::Quic,
 			listener_bind: "127.0.0.1:0".parse().expect("sql bind"),
 			statement_timeout: Duration::from_secs(1),
+			max_concurrent_connections: None,
 		}),
 		coordinator: CoordinatorConfig {
 			include_self_worker: true,

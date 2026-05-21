@@ -9858,18 +9858,375 @@ fn adr055_admission_lock_not_held_across_await() {
 
 #[test]
 fn adr055_no_connection_cap_surface() {
-	let source = source_lines(&manifest_dir().join("src"))
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let server = source_files(&manifest_dir().join("src/server"))
 		.into_iter()
-		.map(|(_, _, line)| line)
+		.map(|path| std::fs::read_to_string(path).expect("read server source"))
 		.collect::<Vec<_>>()
 		.join("\n");
 
-	for forbidden in ["max_concurrent_connections", "connection_cap"] {
+	for (name, source) in [
+		("coordinator", coordinator.as_str()),
+		("tenant admission controller", budget.as_str()),
+		("worker/server transport", server.as_str()),
+	] {
+		for forbidden in [
+			"SqlConnectionLimiter",
+			"try_acquire_tier1",
+			"try_acquire_tier2",
+			"tenant sql connection limit exhausted",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"ADR 055/056 keep connection caps out of {name}: {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr057_sql_handshake_failures_do_not_stop_accept_loop() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let sql_loop = brace_blocks_after_marker(&daemon, "async fn run_sql_accept_loop")
+		.into_iter()
+		.next()
+		.expect("run_sql_accept_loop")
+		.1;
+
+	assert!(sql_loop.contains("endpoint.accept_sql_incoming()"));
+	assert!(sql_loop.contains("QuicEndpoint::accept_incoming_connection(incoming)"));
+	assert!(sql_loop.contains("\"sql listener handshake failed\""));
+	let handshake_failure = sql_loop
+		.find("\"sql listener handshake failed\"")
+		.expect("handshake-failure log");
+	let after = &sql_loop[handshake_failure..];
+	assert!(after.contains("continue;"));
+}
+
+#[test]
+fn adr057_sql_connection_limiter_lives_at_sql_accept_edge() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let connection = std::fs::read_to_string(manifest_dir().join("src/network/connection.rs"))
+		.expect("read connection limiter");
+	let server = source_files(&manifest_dir().join("src/server"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read server source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(connection.contains("pub struct SqlConnectionLimiter"));
+	assert!(daemon.contains("SqlConnectionLimiter::new("));
+	assert!(daemon.contains("try_acquire_tier1()"));
+	assert!(daemon.contains("try_acquire_tier2(tenant_id)"));
+	assert!(!server.contains("SqlConnectionLimiter"));
+}
+
+#[test]
+fn adr057_global_cap_uses_quic_incoming_before_handshake() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let quic = std::fs::read_to_string(manifest_dir().join("src/quic.rs")).expect("read quic");
+	let sql_loop = brace_blocks_after_marker(&daemon, "async fn run_sql_accept_loop")
+		.into_iter()
+		.next()
+		.expect("run_sql_accept_loop")
+		.1;
+
+	assert!(quic.contains("pub async fn accept_sql_incoming"));
+	assert!(quic.contains("pub async fn accept_incoming_connection"));
+	let tier1 = sql_loop.find("try_acquire_tier1()").expect("tier1 admit");
+	let handshake = sql_loop
+		.find("QuicEndpoint::accept_incoming_connection(incoming)")
+		.expect("handshake");
+	assert!(tier1 < handshake);
+}
+
+#[test]
+fn adr057_per_tenant_cap_checks_after_sql_tenant_resolution() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let sql_loop = brace_blocks_after_marker(&daemon, "async fn run_sql_accept_loop")
+		.into_iter()
+		.next()
+		.expect("run_sql_accept_loop")
+		.1;
+
+	let tenant = sql_loop
+		.find("options.tenant_source.resolve(&connection)")
+		.expect("tenant resolution");
+	let tier2 = sql_loop
+		.find("try_acquire_tier2(tenant_id)")
+		.expect("tier2 admit");
+	assert!(tenant < tier2);
+}
+
+#[test]
+fn adr057_loopback_sql_connection_cap_uses_config_tenant() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let sql_tests = std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
+		.expect("read sql listener tests");
+
+	assert!(daemon.contains("SqlTenantSource::LoopbackConfig(config.node.tenant_id)"));
+	assert!(sql_tests.contains("loopback_sql_tenant_connection_cap_uses_config_tenant"));
+}
+
+#[test]
+fn adr057_connection_limiter_is_not_query_coordinator_or_admission_controller() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(!coordinator.contains("SqlConnectionLimiter"));
+	assert!(!coordinator.contains("ConnectionLimitExceeded"));
+	assert!(!budget.contains("SqlConnectionLimiter"));
+	assert!(!budget.contains("ConnectionLimitExceeded"));
+}
+
+#[test]
+fn adr057_connection_state_uses_one_lock_not_per_bucket_atomics() {
+	let connection = std::fs::read_to_string(manifest_dir().join("src/network/connection.rs"))
+		.expect("read connection limiter");
+
+	assert!(connection.contains("state: Mutex<SqlConnectionState>"));
+	assert_eq!(connection.matches("Mutex<SqlConnectionState>").count(), 1);
+	assert!(!connection.contains("AtomicUsize"));
+	assert!(!connection.contains("DashMap"));
+}
+
+#[test]
+fn adr057_tenant_connection_keys_are_configured_plus_other() {
+	let connection = std::fs::read_to_string(manifest_dir().join("src/network/connection.rs"))
+		.expect("read connection limiter");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	assert!(connection.contains("enum TenantConnectionKey"));
+	assert!(connection.contains("Configured(TenantId)"));
+	assert!(connection.contains("Other"));
+	assert!(connection.contains("configured_tenant_ids()"));
+	assert!(observability.contains("tenant_sql_connections_active{{tenant_id=\\\"{label}\\\"}}"));
+}
+
+#[test]
+fn adr057_connection_permits_release_by_raii_no_reaper() {
+	let connection = std::fs::read_to_string(manifest_dir().join("src/network/connection.rs"))
+		.expect("read connection limiter");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	assert!(connection.contains("impl Drop for Tier1Permit"));
+	assert!(connection.contains("impl Drop for Tier2Permit"));
+	assert!(daemon.contains("let _connection_permits = (tier1_permit, tier2_permit);"));
+	assert!(!connection.contains("tokio::spawn"));
+	assert!(!connection.contains("reaper"));
+}
+
+#[test]
+fn adr057_tier1_refuses_incoming_without_sql_wire_error() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let sql_loop = brace_blocks_after_marker(&daemon, "async fn run_sql_accept_loop")
+		.into_iter()
+		.next()
+		.expect("run_sql_accept_loop")
+		.1;
+	let sql_tests = std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
+		.expect("read sql listener tests");
+
+	assert!(sql_loop.contains("incoming.refuse();"));
+	assert!(sql_tests.contains("assert_transport_rejects_without_sql_frame"));
+	assert!(!sql_loop.contains("SqlErrorCode::ResourceExhausted"));
+}
+
+#[test]
+fn adr057_tier2_closes_connection_without_sql_wire_error() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let sql_loop = brace_blocks_after_marker(&daemon, "async fn run_sql_accept_loop")
+		.into_iter()
+		.next()
+		.expect("run_sql_accept_loop")
+		.1;
+	let sql_tests = std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
+		.expect("read sql listener tests");
+
+	assert!(sql_loop.contains("tenant sql connection limit exhausted"));
+	assert!(sql_tests.contains("assert_authenticated_transport_rejects_without_sql_frame"));
+	assert!(!sql_loop.contains("SqlErrorCode::ResourceExhausted"));
+}
+
+#[test]
+fn adr057_metrics_split_global_aggregate_and_tenant_bounded() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+
+	for metric in [
+		"sql_connections_active",
+		"sql_connection_rejections_total",
+		"tenant_sql_connections_active",
+		"tenant_sql_connection_rejections_total",
+	] {
+		assert!(observability.contains(metric), "missing metric {metric}");
+	}
+	assert!(observability.contains("tenant_metric_slots()"));
+	assert!(observability_test.contains("sql_connection_metrics_are_configured_plus_other"));
+}
+
+#[test]
+fn adr057_general_listener_metrics_remain_tenant_label_free() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	for line in observability.lines().filter(|line| {
+		line.contains("listener_accepts_total") || line.contains("listener_rejects_total")
+	}) {
 		assert!(
-			!source.contains(forbidden),
-			"ADR 055/056 still reserve connection caps for ADR 057: {forbidden}"
+			!line.contains("tenant_id"),
+			"listener metric gained tenant label: {line}"
 		);
 	}
+	assert!(observability.contains("ConnectionLimit"));
+}
+
+#[test]
+fn adr057_default_disabled_caps_preserve_current_behavior() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let connection = std::fs::read_to_string(manifest_dir().join("src/network/connection.rs"))
+		.expect("read connection limiter");
+
+	assert!(config.contains("max_concurrent_connections: Option<NonZeroU32>"));
+	assert!(config.contains("max_concurrent_connections.and_then(NonZeroU32::new)"));
+	assert!(
+		connection
+			.contains("default_disabled_connection_caps_preserve_current_connection_behavior")
+	);
+}
+
+#[test]
+fn adr057_no_worker_transport_or_observability_connection_cap() {
+	let worker_loop =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let server_source = source_files(&manifest_dir().join("src/server"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read server source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(worker_loop.contains("run_quic_worker_accept_loop"));
+	assert!(worker_loop.contains("accepted = endpoint.accept_connection()"));
+	assert!(!server_source.contains("SqlConnectionLimiter"));
+}
+
+#[test]
+fn adr057_no_parser_query_rate_queue_borrow_or_cluster_connection_coordination() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+
+	for source in [coordinator.as_str(), budget.as_str(), planner.as_str()] {
+		assert!(!source.contains("SqlConnectionLimiter"));
+		assert!(!source.contains("ConnectionLimitExceeded"));
+	}
+}
+
+#[test]
+fn adr057_sql_quic_idle_timeout_not_disabled() {
+	let quic = std::fs::read_to_string(manifest_dir().join("src/quic.rs")).expect("read quic");
+
+	assert!(!quic.contains("max_idle_timeout(None)"));
+	assert!(!quic.contains("keep_alive_interval(None)"));
+}
+
+#[test]
+fn adr057_no_wendelon_sql_wire_nilket_or_fixture_worker_change() {
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for source in [
+		sql_wire.as_str(),
+		fixture.as_str(),
+		nilket_manifest.as_str(),
+		wendelon_source.as_str(),
+	] {
+		assert!(!source.contains("SqlConnectionLimiter"));
+		assert!(!source.contains("max_concurrent_connections"));
+		assert!(!source.contains("ConnectionLimitExceeded"));
+	}
+}
+
+#[test]
+fn adr057_prior_adr049_050_051_052_053_054_055_056_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr049_", "adr050_", "adr051_", "adr052_", "adr053_", "adr054_", "adr055_", "adr056_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr057_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr057_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	assert!(!worker.contains("SqlConnectionLimiter"));
+	assert!(!worker.contains("max_concurrent_connections"));
+	assert!(!worker.contains("ConnectionLimitExceeded"));
+}
+
+#[test]
+fn adr057_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"SqlConnectionLimiterV1",
+		"SqlConnectionAdmissionV1",
+		"TenantConnectionKeyV1",
+		"ConnectionLimitExceededV1",
+	]);
 }
 
 #[test]

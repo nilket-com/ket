@@ -65,6 +65,7 @@ memory_budget_bytes = 67108864
 # max_borrowed_concurrent_queries = 0
 # max_queries_per_second = 0
 # query_burst_capacity = 0
+# max_concurrent_connections = 0
 
 # [[tenant_budgets.tenants]]
 # tenant_id = 7
@@ -78,6 +79,7 @@ memory_budget_bytes = 67108864
 # max_borrowed_concurrent_queries = 0
 # max_queries_per_second = 0
 # query_burst_capacity = 0
+# max_concurrent_connections = 0
 
 # [admission]
 # max_queued_queries = 0
@@ -104,6 +106,7 @@ pool_max_cap_bytes = 8388608
 transport = "quic"
 listener_bind = "127.0.0.1:7742"
 statement_timeout_seconds = 60
+max_concurrent_connections = 0
 
 [coordinator]
 include_self_worker = true
@@ -208,6 +211,7 @@ pub struct SqlConfig {
 	pub transport: SqlTransport,
 	pub listener_bind: SocketAddr,
 	pub statement_timeout: Duration,
+	pub max_concurrent_connections: Option<NonZeroU32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +338,7 @@ struct RawTenantBudget {
 	max_borrowed_concurrent_queries: Option<u32>,
 	max_queries_per_second: Option<u32>,
 	query_burst_capacity: Option<u32>,
+	max_concurrent_connections: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +354,7 @@ struct RawTenantBudgetEntry {
 	max_borrowed_concurrent_queries: Option<u32>,
 	max_queries_per_second: Option<u32>,
 	query_burst_capacity: Option<u32>,
+	max_concurrent_connections: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -404,6 +410,7 @@ struct RawSqlConfig {
 	listener_bind: String,
 	#[serde(default = "default_sql_statement_timeout_seconds")]
 	statement_timeout_seconds: u64,
+	max_concurrent_connections: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,6 +686,7 @@ fn normalize_tenant_budget_policy(
 		default.max_borrowed_concurrent_queries,
 		default.max_queries_per_second,
 		default.query_burst_capacity,
+		default.max_concurrent_connections,
 	)?;
 	let mut per_tenant = HashMap::new();
 	for tenant in raw.tenants {
@@ -697,6 +705,7 @@ fn normalize_tenant_budget_policy(
 			tenant.max_borrowed_concurrent_queries,
 			tenant.max_queries_per_second,
 			tenant.query_burst_capacity,
+			tenant.max_concurrent_connections,
 		)?;
 		if per_tenant.insert(tenant_id, budget).is_some() {
 			return Err(invalid(format!(
@@ -720,6 +729,7 @@ fn normalize_tenant_budget(
 	max_borrowed_concurrent_queries: Option<u32>,
 	max_queries_per_second: Option<u32>,
 	query_burst_capacity: Option<u32>,
+	max_concurrent_connections: Option<u32>,
 ) -> Result<TenantBudget, ToronConfigError> {
 	if memory_per_task_bytes == 0 {
 		return Err(invalid(
@@ -756,6 +766,7 @@ fn normalize_tenant_budget(
 		Some(value) => NonZeroU32::new(value).expect("zero rejected"),
 		None => derive_max_concurrent_descriptor_syncs(max_concurrent_queries),
 	};
+	let max_concurrent_connections = max_concurrent_connections.and_then(NonZeroU32::new);
 	let admission_weight = match admission_weight {
 		Some(0) => {
 			return Err(invalid(
@@ -770,6 +781,7 @@ fn normalize_tenant_budget(
 		aggregate_memory,
 		max_concurrent_queries,
 		max_concurrent_descriptor_syncs,
+		max_concurrent_connections,
 		admission_weight,
 		max_queued_queries.unwrap_or(0),
 		ByteCount::new(max_borrowed_memory_bytes.unwrap_or(0)),
@@ -900,6 +912,7 @@ fn normalize_sql_config(
 		transport,
 		listener_bind,
 		statement_timeout: Duration::from_secs(raw.statement_timeout_seconds),
+		max_concurrent_connections: raw.max_concurrent_connections.and_then(NonZeroU32::new),
 	})
 }
 

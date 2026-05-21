@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -287,6 +288,87 @@ async fn loopback_sql_uses_config_tenant_for_bootstrapped_descriptor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_sql_connection_cap_refuses_excess_incoming_before_handshake() {
+	let mut config = toron_config_with_descriptor(descriptor(), true);
+	config
+		.sql
+		.as_mut()
+		.expect("sql config")
+		.max_concurrent_connections = NonZeroU32::new(1);
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = QuicEndpoint::client().expect("first sql client");
+	let _held_stream = client
+		.connect_stream(endpoint)
+		.await
+		.expect("first SQL connection");
+
+	assert_transport_rejects_without_sql_frame(endpoint).await;
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_sql_tenant_connection_cap_uses_config_tenant() {
+	let mut config = toron_config_with_descriptor(descriptor(), true);
+	config.node.tenant_id = ToronTenantId(7);
+	config.tenant_budgets = TenantBudgetPolicy::new(
+		TenantBudget::new(ByteCount::new(8), ByteCount::new(32)),
+		HashMap::from([(ToronTenantId(7), tenant_connection_budget(1))]),
+	);
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = QuicEndpoint::client().expect("first sql client");
+	let _held_stream = client
+		.connect_stream(endpoint)
+		.await
+		.expect("first loopback tenant SQL connection");
+
+	assert_transport_rejects_without_sql_frame(endpoint).await;
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_sql_tenant_connection_cap_closes_excess_after_san_resolution() {
+	let worker_id = WorkerId::from_u128(57);
+	let pki = TestPki::generate(worker_id, "7");
+	let mut config = toron_config_with_descriptor_tls_for_tenant(
+		descriptor(),
+		ToronTenantId(7),
+		worker_id,
+		&pki,
+	);
+	config.tenant_budgets = TenantBudgetPolicy::new(
+		TenantBudget::new(ByteCount::new(8), ByteCount::new(32)),
+		HashMap::from([(ToronTenantId(7), tenant_connection_budget(1))]),
+	);
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = connectable_loopback_addr(daemon.handle().sql_endpoint.expect("sql endpoint"));
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+	let first_client_config =
+		client_config_from_paths(&pki.client_cert, &pki.client_key, &pki.ca_cert)
+			.expect("first client TLS config");
+	let first_client =
+		QuicEndpoint::client_authenticated(first_client_config).expect("first sql client");
+	let _held_stream = first_client
+		.connect_stream_with_server_name(endpoint, &server_name)
+		.await
+		.expect("first remote tenant SQL connection");
+
+	assert_authenticated_transport_rejects_without_sql_frame(
+		endpoint,
+		&server_name,
+		&pki.client_cert,
+		&pki.client_key,
+		&pki.ca_cert,
+	)
+	.await;
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_over_per_task_budget_returns_resource_exhausted() {
 	let fixture = LiveWendelonFixture::start(48).await;
 	let descriptor = descriptor();
@@ -481,6 +563,64 @@ async fn execute_sql_authenticated(
 	}
 }
 
+async fn assert_transport_rejects_without_sql_frame(endpoint: SocketAddr) {
+	let client = QuicEndpoint::client().expect("over-cap sql client");
+	let stream = client.connect_stream(endpoint).await;
+	if let Ok(mut stream) = stream {
+		let query_id = QueryId::new();
+		let write = write_sql_frame(
+			&mut stream,
+			&SqlFrame::execute(query_id, "SELECT 1".to_string(), None),
+		)
+		.await;
+		if write.is_ok() {
+			let _ = stream.finish().await;
+			let read = read_sql_frame(&mut stream).await;
+			assert!(
+				read.is_err(),
+				"connection-cap rejection must close transport without SQL frame"
+			);
+		}
+	}
+}
+
+async fn assert_authenticated_transport_rejects_without_sql_frame(
+	endpoint: SocketAddr,
+	server_name: &str,
+	cert: &Path,
+	key: &Path,
+	ca: &Path,
+) {
+	let client_config =
+		client_config_from_paths(cert, key, ca).expect("over-cap client TLS config");
+	let client = QuicEndpoint::client_authenticated(client_config).expect("over-cap sql client");
+	let stream = client
+		.connect_stream_with_server_name(endpoint, server_name)
+		.await;
+	if let Ok(mut stream) = stream {
+		let query_id = QueryId::new();
+		let write = write_sql_frame(
+			&mut stream,
+			&SqlFrame::execute(query_id, "SELECT 1".to_string(), None),
+		)
+		.await;
+		if write.is_ok() {
+			let _ = stream.finish().await;
+			let read = read_sql_frame(&mut stream).await;
+			assert!(
+				read.is_err(),
+				"connection-cap rejection must close transport without SQL frame"
+			);
+		}
+	}
+}
+
+fn tenant_connection_budget(max_connections: u32) -> TenantBudget {
+	let mut budget = TenantBudget::new(ByteCount::new(8), ByteCount::new(32));
+	budget.max_concurrent_connections = NonZeroU32::new(max_connections);
+	budget
+}
+
 fn projected_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<i32>, Option<String>)> {
 	let mut rows = Vec::new();
 	for batch in batches {
@@ -618,6 +758,7 @@ fn toron_config_with_descriptor_for_tenant(
 			transport: SqlTransport::Quic,
 			listener_bind: "127.0.0.1:0".parse().expect("sql bind"),
 			statement_timeout: Duration::from_secs(3),
+			max_concurrent_connections: None,
 		}),
 		coordinator: CoordinatorConfig {
 			include_self_worker,

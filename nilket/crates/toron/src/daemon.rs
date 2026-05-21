@@ -34,9 +34,10 @@ use crate::distributed::worker_registry::{
 use crate::error::{BindingError, CatalogError, FrontendError, QueryError};
 use crate::exec::ExecutionContext;
 use crate::ir::{LogicalPlan, SessionId};
+use crate::network::connection::SqlConnectionLimiter;
 use crate::network::observability::{
 	ListenerName, MetricsRegistry, MetricsRegistryConfig, ObservabilityEndpoints,
-	ObservabilityShutdownReceivers, ReadinessState,
+	ObservabilityShutdownReceivers, ReadinessState, RejectReason,
 };
 use crate::network::tls::{ListenerPolicy, ListenerRole, TlsError, accepted_sql_tenant};
 use crate::quic::{QuicEndpoint, QuicStream};
@@ -256,12 +257,19 @@ impl ToronDaemon {
 		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
 		let mut shutdown_txs = Vec::new();
 		let mut listener_tasks = Vec::new();
+		let sql_connection_limiter = config.sql.as_ref().map(|sql| {
+			SqlConnectionLimiter::new(
+				sql.max_concurrent_connections,
+				config.tenant_budgets.clone(),
+			)
+		});
 		let metrics = Arc::new(MetricsRegistry::new(MetricsRegistryConfig {
 			descriptors_loaded,
 			static_workers_configured: config.coordinator.static_workers.len() as u64,
 			tenant_budgets: config.tenant_budgets.clone(),
 			descriptor_sync_metrics: catalog.descriptor_sync_metrics(),
 			descriptor_refresh_metrics: catalog.descriptor_refresh_metrics(),
+			sql_connection_limiter: sql_connection_limiter.clone(),
 			tenant_admission: coordinator.tenant_admission_controller(),
 			admission_rejections: coordinator.admission_rejection_counters(),
 		}));
@@ -321,8 +329,13 @@ impl ToronDaemon {
 				sql_shutdown_rx,
 				Arc::clone(&connection_tasks),
 				Arc::clone(&metrics),
-				sql_tenant_source,
-				sql_config.statement_timeout,
+				SqlAcceptOptions {
+					tenant_source: sql_tenant_source,
+					connection_limiter: sql_connection_limiter
+						.clone()
+						.expect("SQL limiter exists when SQL config exists"),
+					statement_timeout: sql_config.statement_timeout,
+				},
 			)));
 			Some(sql_endpoint)
 		} else {
@@ -580,14 +593,19 @@ impl SqlTenantSource {
 	}
 }
 
+struct SqlAcceptOptions {
+	tenant_source: SqlTenantSource,
+	connection_limiter: SqlConnectionLimiter,
+	statement_timeout: std::time::Duration,
+}
+
 async fn run_sql_accept_loop(
 	coordinator: Arc<DistributedQueryCoordinator<StaticWorkerRegistry, QuicTransport>>,
 	endpoint: QuicEndpoint,
 	mut shutdown_rx: oneshot::Receiver<()>,
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
 	metrics: Arc<MetricsRegistry>,
-	tenant_source: SqlTenantSource,
-	statement_timeout: std::time::Duration,
+	options: SqlAcceptOptions,
 ) {
 	loop {
 		tokio::select! {
@@ -595,23 +613,54 @@ async fn run_sql_accept_loop(
 				endpoint.close();
 				break;
 			}
-			accepted = endpoint.accept_connection() => match accepted {
-				Ok(connection) => {
+			accepted = endpoint.accept_sql_incoming() => match accepted {
+				Ok(incoming) => {
+					let tier1_permit = match options.connection_limiter.try_acquire_tier1() {
+						Ok(permit) => permit,
+						Err(_) => {
+							metrics.increment_reject(ListenerName::Sql, RejectReason::ConnectionLimit);
+							incoming.refuse();
+							continue;
+						}
+					};
+					let connection = tokio::select! {
+						_ = &mut shutdown_rx => {
+							endpoint.close();
+							break;
+						}
+						accepted = QuicEndpoint::accept_incoming_connection(incoming) => match accepted {
+							Ok(connection) => connection,
+							Err(error) => {
+								tracing::warn!(error = %error, "sql listener handshake failed");
+								continue;
+							}
+						},
+					};
 					metrics.increment_accept(ListenerName::Sql);
-					let tenant_id = match tenant_source.resolve(&connection) {
+					let tenant_id = match options.tenant_source.resolve(&connection) {
 						Ok(tenant_id) => tenant_id,
 						Err(error) => {
 							metrics.increment_reject(
 								ListenerName::Sql,
-								crate::network::observability::RejectReason::SanShapeRejected,
+								RejectReason::SanShapeRejected,
 							);
 							tracing::warn!(error = %error, "sql peer tenant extraction failed");
 							connection.close(0_u32.into(), b"sql tenant rejected");
 							continue;
 						}
 					};
+					let tier2_permit = match options.connection_limiter.try_acquire_tier2(tenant_id) {
+						Ok(permit) => permit,
+						Err(_) => {
+							metrics.increment_reject(ListenerName::Sql, RejectReason::ConnectionLimit);
+							connection.close(0_u32.into(), b"tenant sql connection limit exhausted");
+							continue;
+						}
+					};
 					let coordinator = Arc::clone(&coordinator);
+					let statement_timeout = options.statement_timeout;
 					connection_tasks.lock().await.spawn(async move {
+						let _connection_permits = (tier1_permit, tier2_permit);
 						match QuicEndpoint::accept_stream_on(&connection).await {
 							Ok(stream) => {
 								if let Err(error) = handle_sql_connection(

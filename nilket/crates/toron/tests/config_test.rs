@@ -1,4 +1,6 @@
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -15,13 +17,16 @@ use wendelon::schema::{
 	TableObjectId, TableSchemaDescriptor,
 };
 
+static FRESH_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn fresh_dir(tag: &str) -> PathBuf {
 	let nanos = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.expect("system time after epoch")
 		.as_nanos();
+	let counter = FRESH_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
 	let dir = std::env::temp_dir().join(format!(
-		"toron-config-{tag}-{}-{}",
+		"toron-config-{tag}-{}-{}-{counter}",
 		std::process::id(),
 		nanos
 	));
@@ -83,14 +88,9 @@ fn toron_example_config_loads() {
 	assert!(config.worker.task_listener_bind.ip().is_loopback());
 	assert_eq!(config.storage.wendelon.bootstrap_peers.len(), 1);
 	assert!(config.catalog.descriptor_bootstrap_path.is_none());
-	assert!(
-		config
-			.sql
-			.expect("example sql config")
-			.listener_bind
-			.ip()
-			.is_loopback()
-	);
+	let sql = config.sql.as_ref().expect("example sql config");
+	assert!(sql.listener_bind.ip().is_loopback());
+	assert_eq!(sql.max_concurrent_connections, None);
 	assert!(config.coordinator.include_self_worker);
 	assert!(config.tls.is_none());
 	assert_eq!(
@@ -128,6 +128,10 @@ fn toron_example_config_loads() {
 	);
 	assert_eq!(config.tenant_budgets.default.max_queries_per_second, 0);
 	assert_eq!(config.tenant_budgets.default.query_burst_capacity, 0);
+	assert_eq!(
+		config.tenant_budgets.default.max_concurrent_connections,
+		None
+	);
 	assert!(config.admission.is_none());
 }
 
@@ -251,6 +255,45 @@ fn tenant_query_rate_policy_config_round_trips() {
 	assert_eq!(tenant.max_queries_per_second, 10);
 	assert_eq!(tenant.query_burst_capacity, 0);
 	assert_eq!(tenant.effective_burst(), 10);
+}
+
+#[test]
+fn sql_connection_cap_config_round_trips_and_zero_disables() {
+	let dir = fresh_dir("sql-connection-cap-round-trip");
+	let path = dir.join("toron.toml");
+	let config = render_example_config().replace(
+		"statement_timeout_seconds = 60\nmax_concurrent_connections = 0",
+		"statement_timeout_seconds = 60\nmax_concurrent_connections = 2",
+	);
+	let config = format!(
+		"{config}\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_connections = 3\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nmax_concurrent_connections = 0\n"
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load connection cap config");
+
+	assert_eq!(
+		config.sql.expect("sql config").max_concurrent_connections,
+		NonZeroU32::new(2)
+	);
+	assert_eq!(
+		config.tenant_budgets.default.max_concurrent_connections,
+		NonZeroU32::new(3)
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.budget_for(TenantId(7))
+			.max_concurrent_connections,
+		None
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.budget_for(TenantId(9))
+			.max_concurrent_connections,
+		NonZeroU32::new(3)
+	);
 }
 
 #[test]

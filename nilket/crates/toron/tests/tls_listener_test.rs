@@ -245,6 +245,20 @@ async fn remote_sql_listener_rejects_malformed_client_sans_and_unknown_ca() {
 		}
 	}
 
+	let response = execute_sql_with_tls(
+		endpoint,
+		&server_name,
+		&pki.client_cert,
+		&pki.client_key,
+		&pki.ca_cert,
+	)
+	.await
+	.expect("SQL listener still accepts after rejected handshakes");
+	match response {
+		SqlMessage::Error(error) => assert_eq!(error.code, SqlErrorCode::SyntaxError),
+		other => panic!("unexpected SQL response after rejected handshakes: {other:?}"),
+	}
+
 	daemon.shutdown().await.expect("shutdown daemon");
 }
 
@@ -513,6 +527,7 @@ fn tls_config(
 			transport: SqlTransport::Quic,
 			listener_bind,
 			statement_timeout: Duration::from_secs(1),
+			max_concurrent_connections: None,
 		}),
 		coordinator: CoordinatorConfig {
 			include_self_worker: true,
