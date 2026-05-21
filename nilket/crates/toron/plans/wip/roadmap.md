@@ -4559,6 +4559,38 @@ along with the forward-sequence rewrite.
   `plans/impl/061_ctas_if_not_exists.md`; implementation evidence is recorded
   in `plans/impl/061_ctas_if_not_exists_evidence.md`, including passing full
   `cargo test -p toron -- --test-threads=6`.
+- **ADR 062 — Primary-Key DDL for Toron-Created Tables.**
+  Promoted. The table-identity-policy Phase 0 that ADR 061 carried before
+  `UPDATE`: schema-only `CREATE TABLE` can declare a **single-column,
+  explicit-`NOT NULL` primary key**, creating a `RowIdentityPolicy::PrimaryKey`
+  descriptor (vs the append-only default) — so the tables users create carry
+  the logical row-identity the future `UPDATE` (063) needs. **Exposes
+  Wendelon's already-existing PK substrate** (`PrimaryKeyDescriptorV1`,
+  `RowIdentityPolicy::PrimaryKey`, PK admission/supersession, LSM elision)
+  through DDL — *not* a new storage model. The SQL IR carries a **Toron-local
+  `CreateTableRowIdentity` enum** (Wendelon descriptor types stay at the
+  catalog boundary — ring discipline); PK validation is **planner-owned**
+  (binder preserves); the supported PK type set is the **narrow intersection**
+  `Int32`/`Int64`/`Utf8` (Toron DDL ∩ Wendelon V1 — no DDL type-surface
+  widening); `IF NOT EXISTS` compatibility (ADR 061) extends to `(schema,
+  row_identity)`. CTAS stays append-only (PK-in-CTAS rejected); an end-to-end
+  fixture proves a SQL-created PK table drives Wendelon PK supersession (not
+  inert). Final D-set: **12 decisions, 18 architecture + 3 convention + meta
+  guards, 16 required fixtures.** Council: **3-of-3 on PK DDL** (a productive
+  iter-0 divergence — Claude UPDATE/append-only, Codex/Gemini PK-DDL, Gemini
+  audit→withdrawn — resolved once the **no-atomic-composite-mutation** boundary
+  was grounded: separate `StorageWrite`/`StorageDeleteRows`, so append-only
+  UPDATE would be non-atomic or a cross-ring storage ADR; Claude conceded
+  append-only UPDATE, then planner-owned-not-binder + intersection-only types).
+  The **PK type set** is 2-of-3 narrow (Codex+Claude); Gemini's broader
+  canonical set (unsigned/binary/timestamp) is recorded as **minority** — not
+  adopted, as it would widen the DDL type surface. **Prior-guard
+  reconciliation:** ADR 038's append-only-create guard is **retargeted**
+  (no-PK→AppendOnly; PK→PrimaryKey; CTAS→AppendOnly); CREATE-TABLE-PK-reject
+  tests retargeted; meta-guard scoped `…_except_retarget`. **Toron SQL/catalog
+  only; no Wendelon wire/storage/worker change; no UPDATE/RETURNING.**
+  Placement: Exterior Substrate → Toron home. Migration:
+  `plans/impl/062_primary_key_ddl.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4643,7 +4675,70 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 061 implemented; ADR 062 candidates
+### ADR 062 promoted; ADR 063 candidates
+
+ADR 062 selected and promoted **Primary-Key DDL for Toron-Created Tables** —
+the table-identity-policy Phase 0 that ADR 061 carried before `UPDATE`.
+Schema-only `CREATE TABLE` can declare a **single-column, explicit-`NOT NULL`
+primary key**, creating a `RowIdentityPolicy::PrimaryKey` descriptor instead
+of the append-only default — giving the tables users create the logical
+row-identity that the next ADR's `UPDATE` needs. It **exposes Wendelon's
+already-existing PK substrate** through DDL (not a new storage model); the SQL
+IR carries a **Toron-local `CreateTableRowIdentity` enum**; PK validation is
+**planner-owned**; the PK type set is the **narrow intersection**
+`Int32`/`Int64`/`Utf8`; `IF NOT EXISTS` compatibility extends to `(schema,
+row_identity)`. Final D-set: **12 decisions, 18 architecture + 3 convention +
+meta guards, 16 required fixtures**.
+
+**Toron SQL/catalog only; exposes the existing Wendelon PK substrate; zero new
+storage primitive / Wendelon wire / worker protocol; no DDL type-surface
+widening; no UPDATE/RETURNING.**
+
+**Key decisions / invariants:**
+
+- **Promoted 3-of-3 on PK DDL** out of a productive iter-0 divergence (Claude
+  UPDATE/append-only, Codex/Gemini PK-DDL, Gemini audit→withdrawn). The
+  decisive grounding: **no atomic composite tombstone+insert** exists
+  (separate `StorageWrite`/`StorageDeleteRows`), so append-only UPDATE would be
+  non-atomic or a cross-ring storage ADR — making PK DDL the honest substrate.
+  Claude conceded append-only UPDATE (hidden-`__row_key_id__`-as-mutation-
+  contract, no upsert, non-atomic), then conceded planner-owned-not-binder +
+  intersection-only types.
+- **PK type set = narrow intersection (2-of-3, Codex+Claude):** `Int32`/
+  `Int64`/`Utf8` — Toron DDL ∩ Wendelon V1. Gemini's broader canonical set
+  (unsigned/binary/timestamp) recorded as **minority** — not adopted (would
+  widen the DDL type surface, separate scope).
+- **Ring-boundary discipline:** Toron-local identity enum in the SQL IR;
+  Wendelon `RowIdentityPolicy`/descriptor types stay at the catalog boundary
+  (the inverse of 060's "no Toron identity on the Wendelon wire").
+- **ADR 061 composition:** `IF NOT EXISTS` compatibility predicate becomes
+  `(arrow_schema, row_identity)` — same schema + different identity →
+  `SchemaMismatch`; fail-closed for content-hash/unknown identity.
+- **Explicit `NOT NULL`** required (reject missing + `NULL`+PK conflict) — an
+  intentional, documented standard-SQL divergence to revisit.
+- **Prior-guard reconciliation:** ADR 038's append-only-create guard
+  retargeted (no-PK→AppendOnly; PK→PrimaryKey; CTAS→AppendOnly); CREATE-TABLE-
+  PK-reject tests retargeted; meta-guard scoped `…_except_retarget`.
+- `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
+  no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in `plans/impl/062_primary_key_ddl.md`.
+
+**ADR 063 candidates:**
+
+- **`UPDATE … WHERE` over PK tables** (the lead — now small and atomic):
+  coordinator-owned full-row rewrite → `table-write` of the new row with the
+  **same PK** (Wendelon supersession handles visibility — atomic per row,
+  single op); `SET` cannot modify the PK column (first cut); append-only/no-PK
+  UPDATE rejected until a composite tombstone+insert primitive exists; no
+  `RETURNING`/`FROM`/subquery-RHS/transaction/worker-local-write-back.
+- **Mutation `RETURNING`** (cross-cutting INSERT/UPDATE/DELETE/CTAS result
+  shape); **audit subsystem** (045 D7, parallel compliance track); **typed
+  `QUERY_CANCELLED` mapping** (060 follow-up); composite-PK / DDL-type-surface
+  widening / `ALTER TABLE` / standalone `UNIQUE`; parser throttle, OTLP
+  traces, auth claims, frontend protocols — all carried.
+
+### ADR 061 implemented; ADR 062 candidates (HISTORICAL)
 
 ADR 061 selected, promoted, and implemented **CTAS `IF NOT EXISTS` with
 Race-Safe Catalog Create Outcome** — the SQL-surface-widening pivot after the
