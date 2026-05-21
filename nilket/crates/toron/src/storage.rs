@@ -117,6 +117,17 @@ pub struct DeleteRowsOutcome {
 	pub not_found: usize,
 }
 
+impl DeleteRowsOutcome {
+	pub fn new(requested: usize, deleted: usize, already_deleted: usize, not_found: usize) -> Self {
+		Self {
+			requested,
+			deleted,
+			already_deleted,
+			not_found,
+		}
+	}
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropTableStorageOutcome {

@@ -147,6 +147,12 @@ pub struct ExecutionSortKey {
 	pub nulls_first: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoundReturningProjection {
+	pub exprs: BoundExprProgram,
+	pub output_schema: SchemaRef,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionPlan {
 	Scan {
@@ -223,6 +229,7 @@ pub enum ExecutionPlan {
 		predicate: Option<BoundExprProgram>,
 		pbc_program: Option<PbcProgram>,
 		profile_hint: QueryProfileHint,
+		returning: Option<BoundReturningProjection>,
 	},
 	Update {
 		legacy_table_id: TableId,
@@ -231,6 +238,7 @@ pub enum ExecutionPlan {
 		schema: SchemaRef,
 		source: Box<ExecutionPlan>,
 		profile_hint: QueryProfileHint,
+		returning: Option<BoundReturningProjection>,
 	},
 	Insert {
 		legacy_table_id: TableId,
@@ -238,6 +246,7 @@ pub enum ExecutionPlan {
 		fingerprint: PhysicalDescriptorFingerprint,
 		schema: SchemaRef,
 		rows: Vec<Vec<ScalarValue>>,
+		returning: Option<BoundReturningProjection>,
 	},
 	InsertSelect {
 		legacy_table_id: TableId,
@@ -246,6 +255,7 @@ pub enum ExecutionPlan {
 		schema: SchemaRef,
 		target_columns: Vec<ColumnOrdinal>,
 		source: Box<ExecutionPlan>,
+		returning: Option<BoundReturningProjection>,
 	},
 }
 
@@ -266,10 +276,26 @@ impl ExecutionPlan {
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
 			Self::CreateTableAsSelect { .. } => Arc::new(Schema::empty()),
 			Self::DropTable { .. } => Arc::new(Schema::empty()),
+			Self::Delete {
+				returning: Some(returning),
+				..
+			}
+			| Self::Update {
+				returning: Some(returning),
+				..
+			}
+			| Self::Insert {
+				returning: Some(returning),
+				..
+			}
+			| Self::InsertSelect {
+				returning: Some(returning),
+				..
+			} => returning.output_schema.clone(),
 			Self::Delete { .. } => result_count_schema_int64("deleted"),
-			Self::Update { .. } => Arc::new(Schema::empty()),
-			Self::Insert { .. } => Arc::new(Schema::empty()),
-			Self::InsertSelect { .. } => Arc::new(Schema::empty()),
+			Self::Update { .. } | Self::Insert { .. } | Self::InsertSelect { .. } => {
+				Arc::new(Schema::empty())
+			}
 		}
 	}
 }

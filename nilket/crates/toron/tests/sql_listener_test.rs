@@ -133,6 +133,37 @@ async fn sql_listener_update_complete_frame_carries_row_count() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_listener_dml_returning_sends_result_batches_then_complete() {
+	let fixture = LiveWendelonFixture::start(54).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let config = toron_config_with_descriptor(descriptor.clone(), true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	let response = execute_sql(
+		endpoint,
+		"UPDATE storage_execution SET amount = 175 WHERE id = 2 RETURNING id, amount, region",
+	)
+	.await
+	.expect("SQL update returning response");
+
+	assert_eq!(response.complete.row_count, 1);
+	assert_eq!(
+		projected_rows(&response.batches),
+		vec![(2, Some(175), Some("east".to_string()))]
+	);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn toron_sql_select_executes_over_authenticated_remote_listener() {
 	let fixture = LiveWendelonFixture::start(45).await;
 	let descriptor = descriptor();

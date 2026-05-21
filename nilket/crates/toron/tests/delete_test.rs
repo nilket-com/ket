@@ -11,13 +11,16 @@ use toron::distributed::budget::{QueryBudget, TaskBudget};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::QueryId;
 use toron::distributed::worker_registry::StaticWorkerRegistry;
-use toron::error::QueryError;
+use toron::error::{QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{ExecutionPlan, LogicalPlan, QueryProfileHint};
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
-use toron::storage::{InMemoryStorageScan, InMemoryTableStorage};
+use toron::storage::{
+	DeleteRowsOutcome, DeleteRowsRequest, InMemoryStorageScan, InMemoryTableStorage,
+	StorageDeleteRows,
+};
 
 #[test]
 fn planner_lowers_delete_where() {
@@ -25,7 +28,10 @@ fn planner_lowers_delete_where() {
 		.plan("DELETE FROM app.sales WHERE id = 7")
 		.expect("plan delete");
 
-	let LogicalPlan::Delete { table, predicate } = plan else {
+	let LogicalPlan::Delete {
+		table, predicate, ..
+	} = plan
+	else {
 		panic!("expected delete plan");
 	};
 	assert_eq!(table, TableRef::with_schema("app", "sales"));
@@ -38,7 +44,10 @@ fn planner_lowers_delete_without_where() {
 		.plan("DELETE FROM sales")
 		.expect("plan delete");
 
-	let LogicalPlan::Delete { table, predicate } = plan else {
+	let LogicalPlan::Delete {
+		table, predicate, ..
+	} = plan
+	else {
 		panic!("expected delete plan");
 	};
 	assert_eq!(table, TableRef::new("sales"));
@@ -46,11 +55,22 @@ fn planner_lowers_delete_without_where() {
 }
 
 #[test]
+fn planner_accepts_delete_returning_columns() {
+	let plan = SqlPlanner::new()
+		.plan("DELETE FROM sales WHERE id = 7 RETURNING id, name")
+		.expect("plan delete returning");
+
+	let LogicalPlan::Delete { returning, .. } = plan else {
+		panic!("expected delete plan");
+	};
+	assert!(returning.is_some());
+}
+
+#[test]
 fn planner_rejects_unsupported_delete_shapes() {
 	for (sql, diagnostic) in [
 		("DELETE sales WHERE id = 1", "requires FROM keyword"),
 		("DELETE FROM sales AS s WHERE id = 1", "table alias"),
-		("DELETE FROM sales RETURNING id", "RETURNING"),
 		("DELETE FROM sales ORDER BY id", "ORDER BY"),
 		("DELETE FROM sales LIMIT 1", "LIMIT"),
 		("DELETE FROM app.public.sales", "one- or two-part"),
@@ -77,6 +97,7 @@ async fn binder_resolves_delete_shape_a_identity() {
 		predicate,
 		pbc_program,
 		profile_hint,
+		..
 	} = bound
 	else {
 		panic!("expected delete execution plan");
@@ -139,6 +160,48 @@ async fn coordinator_deletes_rows_with_pbc_predicate() {
 }
 
 #[tokio::test]
+async fn delete_returning_emits_pre_delete_values_on_append_only_table() {
+	let (_catalog, _storage, coordinator, planner) = coordinator();
+	setup_sales(&coordinator, &planner).await;
+
+	let results = execute(
+		&coordinator,
+		&planner,
+		"DELETE FROM sales WHERE id = 2 RETURNING id, name",
+	)
+	.await;
+	assert_eq!(results.len(), 1);
+	let batch = &results[0];
+	assert_eq!(batch.schema().field(0).name(), "id");
+	assert_eq!(batch.schema().field(1).name(), "name");
+	assert_eq!(int32_column(batch, 0).values(), &[2]);
+	assert_eq!(string_column(batch, 1).value(0), "b");
+
+	let remaining = concat_query(&coordinator, &planner, "SELECT id FROM sales ORDER BY id").await;
+	assert_eq!(int32_column(&remaining, 0).values(), &[1, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn delete_returning_star_hides_appended_row_identity() {
+	let (_catalog, _storage, coordinator, planner) = coordinator();
+	setup_sales(&coordinator, &planner).await;
+
+	let results = execute(
+		&coordinator,
+		&planner,
+		"DELETE FROM sales WHERE id = 1 RETURNING *",
+	)
+	.await;
+	assert_eq!(results.len(), 1);
+	let batch = &results[0];
+	assert_eq!(batch.schema().fields().len(), 3);
+	assert_eq!(batch.schema().field(0).name(), "id");
+	assert_eq!(batch.schema().field(1).name(), "amount");
+	assert_eq!(batch.schema().field(2).name(), "name");
+	assert_eq!(int32_column(batch, 0).values(), &[1]);
+}
+
+#[tokio::test]
 async fn coordinator_deletes_rows_with_residual_predicate() {
 	let (_catalog, _storage, coordinator, planner) = coordinator();
 	setup_sales(&coordinator, &planner).await;
@@ -177,6 +240,52 @@ async fn coordinator_delete_zero_matches_returns_zero_count() {
 
 	let remaining = concat_query(&coordinator, &planner, "SELECT id FROM sales ORDER BY id").await;
 	assert_eq!(int32_column(&remaining, 0).values(), &[1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn zero_row_delete_returning_completes_row_count_zero_without_batch() {
+	let (_catalog, _storage, coordinator, planner) = coordinator();
+	setup_sales(&coordinator, &planner).await;
+
+	let results = execute(
+		&coordinator,
+		&planner,
+		"DELETE FROM sales WHERE id = 100 RETURNING *",
+	)
+	.await;
+	assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn delete_returning_fails_closed_on_partial_receipt() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let deleter = Arc::new(PartialDeleteStorage);
+	let coordinator = QueryCoordinator::with_writer_and_deleter(
+		catalog,
+		executor,
+		PlannerConfig::default(),
+		storage.clone(),
+		deleter,
+	);
+	let planner = SqlPlanner::new();
+	setup_sales(&coordinator, &planner).await;
+
+	let err = coordinator
+		.execute_query(
+			&planner
+				.plan("DELETE FROM sales WHERE id = 1 RETURNING id")
+				.expect("plan delete returning"),
+			None,
+		)
+		.await
+		.expect_err("partial delete receipt must fail closed");
+	assert!(
+		err.to_string()
+			.contains("DELETE RETURNING receipt mismatch"),
+		"unexpected error: {err}"
+	);
 }
 
 #[tokio::test]
@@ -252,6 +361,7 @@ async fn fragmenter_rejects_delete_defensively() {
 		predicate: None,
 		pbc_program: None,
 		profile_hint: QueryProfileHint::Scan,
+		returning: None,
 	};
 
 	let err = fragment_plan(
@@ -280,6 +390,7 @@ async fn executor_rejects_direct_delete_execution() {
 		predicate: None,
 		pbc_program: None,
 		profile_hint: QueryProfileHint::Scan,
+		returning: None,
 	};
 	let executor = Executor::with_context(empty_storage(), ExecutionContext::local_test());
 
@@ -405,6 +516,23 @@ fn string_column(batch: &RecordBatch, index: usize) -> &StringArray {
 		.as_any()
 		.downcast_ref::<StringArray>()
 		.expect("Utf8 column")
+}
+
+struct PartialDeleteStorage;
+
+#[async_trait]
+impl StorageDeleteRows for PartialDeleteStorage {
+	async fn delete_rows(
+		&self,
+		request: DeleteRowsRequest,
+	) -> Result<DeleteRowsOutcome, StorageError> {
+		Ok(DeleteRowsOutcome::new(
+			request.row_key_ids.len(),
+			request.row_key_ids.len().saturating_sub(1),
+			1,
+			0,
+		))
+	}
 }
 
 struct FailingTransport;

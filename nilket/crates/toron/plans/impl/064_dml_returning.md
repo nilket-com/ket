@@ -1,6 +1,7 @@
 # Impl Plan 064: DML `RETURNING` Rows
 
-**Status:** Promoted, paired with `plans/adr/064_dml_returning.md`.
+**Status:** Implemented, paired with `plans/adr/064_dml_returning.md`.
+Evidence: `plans/impl/064_dml_returning_evidence.md`.
 **Posture:** Toron SQL/planner/binder/coordinator/listener. Reuses each
 mutation's existing row materialization + the SELECT result path; **no new SQL
 wire message, storage primitive, Wendelon/worker change, parser upgrade, or
@@ -117,16 +118,16 @@ delete → verify receipt → emit only on success**:
 
 ## Acceptance checklist
 
-- [ ] Phase 1: flip the 3 rejects → `ReturningProjection::{Star,Exprs}`;
+- [x] Phase 1: flip the 3 rejects → `ReturningProjection::{Star,Exprs}`;
       preserve unrelated rejects; CTAS no-RETURNING.
-- [ ] Phase 2: logical + bound returning IR; `schema()` returns returning
+- [x] Phase 2: logical + bound returning IR; `schema()` returns returning
       output schema; binder target-user-schema, `Star` expansion (hides
       synthetic), reject aggregate/window/subquery.
-- [ ] Phase 3: per-verb materialize → project-before-write → write/delete →
+- [x] Phase 3: per-verb materialize → project-before-write → write/delete →
       receipt-verify (DELETE exact all-deleted) → emit-after-success; zero-row
       → Complete{0}; 054 invalidate-no-retry.
-- [ ] Phase 4: `sql_plan_returns_rows` true for returning DML; reuse
+- [x] Phase 4: `sql_plan_returns_rows` true for returning DML; reuse
       ResultBatch+Complete; row_count = emitted.
-- [ ] Phase 5: 24+3+meta guards (incl. no-knob); largest retarget set self-
+- [x] Phase 5: 24+3+meta guards (incl. no-knob); largest retarget set self-
       enforcing; 24 fixtures; evidence + roadmap; no CTAS / Wendelon / worker /
       wire / parser / new-PK-gate / new-knob drift.

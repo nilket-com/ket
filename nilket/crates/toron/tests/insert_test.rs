@@ -24,7 +24,7 @@ use toron::storage::{
 	HlcBound, InMemoryStorageScan, InMemoryTableStorage, RowIdentityProjection, ScanRequest,
 	StorageScan, StorageWrite, TenantId, WriteRequest,
 };
-use wendelon::schema::TableObjectId;
+use wendelon::schema::{STORAGE_ROW_KEY_ID_COLUMN, TableObjectId};
 
 #[test]
 fn planner_accepts_literal_insert_surface() {
@@ -36,6 +36,7 @@ fn planner_accepts_literal_insert_surface() {
 		table,
 		columns,
 		rows,
+		..
 	} = plan
 	else {
 		panic!("expected insert plan");
@@ -68,6 +69,7 @@ fn planner_accepts_insert_select_surface() {
 		table,
 		columns,
 		source,
+		..
 	} = plan
 	else {
 		panic!("expected insert select plan");
@@ -76,6 +78,26 @@ fn planner_accepts_insert_select_surface() {
 	assert_eq!(table, TableRef::new("dst"));
 	assert_eq!(columns, Some(vec!["b".to_string(), "a".to_string()]));
 	assert!(matches!(*source, LogicalPlan::Project { .. }));
+}
+
+#[test]
+fn planner_accepts_insert_returning_surface() {
+	let plan = SqlPlanner::new()
+		.plan("INSERT INTO people (id, name) VALUES (1, 'Alice') RETURNING name, id + 1 AS next_id")
+		.expect("plan insert returning");
+
+	let LogicalPlan::Insert { returning, .. } = plan else {
+		panic!("expected insert plan");
+	};
+	assert!(returning.is_some());
+
+	let plan = SqlPlanner::new()
+		.plan("INSERT INTO dst (b, a) SELECT x, y FROM src RETURNING *")
+		.expect("plan insert select returning");
+	let LogicalPlan::InsertSelect { returning, .. } = plan else {
+		panic!("expected insert select plan");
+	};
+	assert!(returning.is_some());
 }
 
 #[test]
@@ -88,6 +110,7 @@ fn planner_accepts_full_column_null_and_negative_literals() {
 		table,
 		columns,
 		rows,
+		..
 	} = plan
 	else {
 		panic!("expected insert plan");
@@ -106,7 +129,6 @@ fn planner_rejects_unsupported_insert_shapes() {
 	for (sql, diagnostic) in [
 		("INSERT t (a) VALUES (1)", "missing INTO"),
 		("INSERT INTO TABLE t (a) VALUES (1)", "TABLE keyword"),
-		("INSERT INTO t (a) VALUES (1) RETURNING a", "RETURNING"),
 		(
 			"INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING",
 			"ON CONFLICT",
@@ -125,6 +147,30 @@ fn planner_rejects_unsupported_insert_shapes() {
 		),
 		("INSERT INTO t (a) VALUES (1 + 2)", "must be literals"),
 		("INSERT INTO t (a) VALUES (now())", "must be literals"),
+	] {
+		assert_frontend_error(sql, diagnostic);
+	}
+}
+
+#[test]
+fn planner_rejects_returning_aggregate_window_subquery_and_qualified_wildcard() {
+	for (sql, diagnostic) in [
+		(
+			"INSERT INTO t (a) VALUES (1) RETURNING count(a)",
+			"aggregate",
+		),
+		(
+			"INSERT INTO t (a) VALUES (1) RETURNING row_number() OVER ()",
+			"window",
+		),
+		(
+			"INSERT INTO t (a) VALUES (1) RETURNING (SELECT a FROM t)",
+			"subqueries",
+		),
+		(
+			"INSERT INTO t (a) VALUES (1) RETURNING t.*",
+			"qualified wildcard",
+		),
 	] {
 		assert_frontend_error(sql, diagnostic);
 	}
@@ -317,6 +363,32 @@ async fn binder_rejects_invalid_insert_bindings() {
 }
 
 #[tokio::test]
+async fn binder_returning_rejects_unknown_and_storage_synthetic_columns() {
+	let catalog = people_catalog().await;
+	for (sql, diagnostic) in [
+		(
+			"INSERT INTO people (id, name) VALUES (1, 'Alice') RETURNING missing".to_string(),
+			"unknown column",
+		),
+		(
+			format!(
+				"INSERT INTO people (id, name) VALUES (1, 'Alice') RETURNING {STORAGE_ROW_KEY_ID_COLUMN}"
+			),
+			"storage metadata",
+		),
+	] {
+		let plan = SqlPlanner::new().plan(&sql).expect("plan insert returning");
+		let err = bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.expect_err("RETURNING binding should reject");
+		assert!(
+			err.to_string().contains(diagnostic),
+			"expected diagnostic {diagnostic:?}, got {err}"
+		);
+	}
+}
+
+#[tokio::test]
 async fn binder_rejects_insert_row_cap() {
 	let catalog = people_catalog().await;
 	let rows = vec![vec![InsertLiteral::Int64(1)]; TABLE_WRITE_MAX_ROWS + 1];
@@ -324,6 +396,7 @@ async fn binder_rejects_insert_row_cap() {
 		table: TableRef::new("people"),
 		columns: Some(vec!["id".to_string()]),
 		rows,
+		returning: None,
 	};
 
 	let err = bind(&plan, &catalog, &PlannerConfig::default())
@@ -341,6 +414,7 @@ async fn binder_rejects_empty_insert_rows() {
 		table: TableRef::new("people"),
 		columns: Some(vec!["id".to_string()]),
 		rows: Vec::new(),
+		returning: None,
 	};
 
 	let err = bind(&plan, &catalog, &PlannerConfig::default())
@@ -406,6 +480,68 @@ async fn query_coordinator_executes_insert_and_select_round_trip() {
 	assert_eq!(ids.value(1), 2);
 	assert_eq!(names.value(0), "Alice");
 	assert_eq!(names.value(1), "Bob");
+}
+
+#[tokio::test]
+async fn insert_values_returning_emits_inserted_rows() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), storage.clone());
+	let planner = SqlPlanner::new();
+
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE people (id INT NOT NULL, name TEXT)")
+				.expect("plan create"),
+			None,
+		)
+		.await
+		.expect("create table");
+	let results = coordinator
+		.execute_query(
+			&planner
+				.plan("INSERT INTO people (name, id) VALUES ('Alice', 1), ('Bob', 2) RETURNING name, id + 1 AS next_id")
+				.expect("plan insert returning"),
+			None,
+		)
+		.await
+		.expect("insert returning");
+	assert_eq!(results.len(), 1);
+	let batch = &results[0];
+	assert_eq!(batch.schema().field(0).name(), "name");
+	assert_eq!(batch.schema().field(1).name(), "next_id");
+	let names = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("name column");
+	let next_ids = batch
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("next_id column");
+	assert_eq!(names.value(0), "Alice");
+	assert_eq!(names.value(1), "Bob");
+	assert_eq!(next_ids.values(), &[2, 3]);
+
+	let stored = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT id, name FROM people ORDER BY id",
+	)
+	.await;
+	assert_eq!(
+		stored
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("id column")
+			.values(),
+		&[1, 2]
+	);
 }
 
 #[tokio::test]
@@ -527,6 +663,61 @@ async fn query_coordinator_insert_select_reorders_and_fills_nullable_targets() {
 	assert_eq!(labels.value(0), "seven");
 	assert_eq!(values.value(0), 7);
 	assert!(omitted.is_null(0));
+}
+
+#[tokio::test]
+async fn insert_select_returning_preserves_target_reorder_and_coercion() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), storage.clone());
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE src (x INT NOT NULL, y TEXT)",
+		"CREATE TABLE dst (a TEXT, b INT NOT NULL, c BIGINT)",
+		"INSERT INTO src VALUES (7, 'seven')",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let results = coordinator
+		.execute_query(
+			&planner
+				.plan("INSERT INTO dst (b, a) SELECT x, y FROM src RETURNING *")
+				.expect("plan insert select returning"),
+			None,
+		)
+		.await
+		.expect("insert select returning");
+	assert_eq!(results.len(), 1);
+	let batch = &results[0];
+	assert_eq!(batch.schema().field(0).name(), "a");
+	assert_eq!(batch.schema().field(1).name(), "b");
+	assert_eq!(batch.schema().field(2).name(), "c");
+	assert_eq!(
+		batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("a column")
+			.value(0),
+		"seven"
+	);
+	assert_eq!(
+		batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("b column")
+			.value(0),
+		7
+	);
+	assert!(batch.column(2).is_null(0));
 }
 
 #[tokio::test]
@@ -873,6 +1064,7 @@ async fn executor_rejects_direct_insert_execution() {
 			ScalarValue::Int32(Some(1)),
 			ScalarValue::Utf8(Some("Alice".to_string())),
 		]],
+		returning: None,
 	};
 
 	let err = executor
@@ -939,6 +1131,7 @@ async fn fragmenter_rejects_direct_insert_fragmentation() {
 			ScalarValue::Int32(Some(1)),
 			ScalarValue::Utf8(Some("Alice".to_string())),
 		]],
+		returning: None,
 	};
 
 	let err = fragment_plan(
@@ -1109,6 +1302,7 @@ fn insert_select_plan(binding: &TableBinding, source: ExecutionPlan) -> Executio
 		schema: binding.schema.clone(),
 		target_columns: vec![ColumnOrdinal(0), ColumnOrdinal(1)],
 		source: Box::new(source),
+		returning: None,
 	}
 }
 

@@ -7,7 +7,7 @@ use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, CreateTableRowIdentity, Expr, InsertLiteral, JoinKind, JoinStrategy,
-	LogicalPlan, ScalarValue, SortExpr,
+	LogicalPlan, ReturningProjection, ScalarValue, SortExpr,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
@@ -727,9 +727,6 @@ impl SqlPlanner {
 		if from.is_some() {
 			return Err(unsupported("unsupported UPDATE clause: FROM"));
 		}
-		if returning.is_some() {
-			return Err(unsupported("unsupported UPDATE clause: RETURNING"));
-		}
 		if or.is_some() {
 			return Err(unsupported(
 				"unsupported UPDATE clause: OR (ROLLBACK/ABORT/REPLACE/...)",
@@ -742,10 +739,12 @@ impl SqlPlanner {
 				.as_ref()
 				.ok_or_else(|| unsupported("UPDATE requires a WHERE clause"))
 				.and_then(|expr| self.lower_expr(expr))?;
+			let returning = self.lower_returning_projection(returning.as_deref())?;
 			Ok(LogicalPlan::Update {
 				table: target,
 				assignments,
 				predicate,
+				returning,
 			})
 		} else {
 			Err(unsupported(
@@ -770,9 +769,6 @@ impl SqlPlanner {
 		}
 		if using.is_some() {
 			return Err(unsupported("unsupported DELETE clause: USING"));
-		}
-		if returning.is_some() {
-			return Err(unsupported("unsupported DELETE clause: RETURNING"));
 		}
 		if !order_by.is_empty() {
 			return Err(unsupported("unsupported DELETE clause: ORDER BY"));
@@ -842,7 +838,12 @@ impl SqlPlanner {
 			.as_ref()
 			.map(|expr| self.lower_expr(expr))
 			.transpose()?;
-		Ok(LogicalPlan::Delete { table, predicate })
+		let returning = self.lower_returning_projection(returning.as_deref())?;
+		Ok(LogicalPlan::Delete {
+			table,
+			predicate,
+			returning,
+		})
 	}
 
 	fn lower_insert(&self, insert: &Insert) -> Result<LogicalPlan, FrontendError> {
@@ -904,9 +905,6 @@ impl SqlPlanner {
 				"unsupported INSERT clause: ON CONFLICT / ON DUPLICATE KEY",
 			));
 		}
-		if returning.is_some() {
-			return Err(unsupported("unsupported INSERT clause: RETURNING"));
-		}
 		if *replace_into {
 			return Err(unsupported("unsupported INSERT clause: REPLACE INTO"));
 		}
@@ -925,18 +923,81 @@ impl SqlPlanner {
 
 		let table = lower_insert_target_name(table)?;
 		let columns = lower_insert_column_list(columns);
+		let returning = self.lower_returning_projection(returning.as_deref())?;
 		match lower_insert_source(self, source.as_deref())? {
 			LoweredInsertSource::Values(rows) => Ok(LogicalPlan::Insert {
 				table,
 				columns,
 				rows,
+				returning,
 			}),
 			LoweredInsertSource::Select(source) => Ok(LogicalPlan::InsertSelect {
 				table,
 				columns,
 				source: Box::new(source),
+				returning,
 			}),
 		}
+	}
+
+	fn lower_returning_projection(
+		&self,
+		projection: Option<&[SelectItem]>,
+	) -> Result<Option<ReturningProjection>, FrontendError> {
+		let Some(projection) = projection else {
+			return Ok(None);
+		};
+		if projection.is_empty() {
+			return Err(unsupported(
+				"RETURNING requires at least one projection item",
+			));
+		}
+		if matches!(projection, [SelectItem::Wildcard(_)]) {
+			return Ok(Some(ReturningProjection::Star));
+		}
+
+		let mut exprs = Vec::with_capacity(projection.len());
+		let mut output_names = Vec::with_capacity(projection.len());
+		for item in projection {
+			let (sql_expr, alias) = match item {
+				SelectItem::UnnamedExpr(expr) => (expr, None),
+				SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+				SelectItem::Wildcard(_) => {
+					return Err(unsupported(
+						"mixed wildcard RETURNING projections are not supported",
+					));
+				}
+				SelectItem::QualifiedWildcard(_, _) => {
+					return Err(unsupported(
+						"qualified wildcard RETURNING projections are not supported",
+					));
+				}
+			};
+			if expr_contains_aggregate_call(sql_expr) {
+				return Err(unsupported(
+					"aggregate functions are not supported in RETURNING",
+				));
+			}
+			if expr_contains_window_function(sql_expr) {
+				return Err(unsupported(
+					"window functions are not supported in RETURNING",
+				));
+			}
+			if expr_contains_subquery(sql_expr) {
+				return Err(unsupported("subqueries are not supported in RETURNING"));
+			}
+			let expr = self.lower_expr(sql_expr)?;
+			if expr_contains_qualified_column(&expr) {
+				return Err(unsupported("qualified RETURNING columns are not supported"));
+			}
+			exprs.push(expr);
+			output_names.push(alias.map(|alias| alias.value.clone()));
+		}
+
+		Ok(Some(ReturningProjection::Exprs {
+			exprs,
+			output_names,
+		}))
 	}
 
 	fn lower_create_table(&self, create_table: &CreateTable) -> Result<LogicalPlan, FrontendError> {
@@ -3338,6 +3399,33 @@ fn logical_expr_output_name(expr: &Expr, idx: usize) -> String {
 	match expr {
 		Expr::Column(column) => column.name.0.clone(),
 		_ => format!("col_{idx}"),
+	}
+}
+
+fn expr_contains_qualified_column(expr: &Expr) -> bool {
+	match expr {
+		Expr::Column(column) => column.qualifier.is_some(),
+		Expr::Literal(_) => false,
+		Expr::Cast(inner, _)
+		| Expr::TryCast(inner, _)
+		| Expr::Not(inner)
+		| Expr::IsNull(inner)
+		| Expr::IsNotNull(inner)
+		| Expr::TimeBucket(_, inner) => expr_contains_qualified_column(inner),
+		Expr::Add(left, right)
+		| Expr::Sub(left, right)
+		| Expr::Mul(left, right)
+		| Expr::Div(left, right)
+		| Expr::Eq(left, right)
+		| Expr::Neq(left, right)
+		| Expr::Lt(left, right)
+		| Expr::Lte(left, right)
+		| Expr::Gt(left, right)
+		| Expr::Gte(left, right)
+		| Expr::And(left, right)
+		| Expr::Or(left, right) => {
+			expr_contains_qualified_column(left) || expr_contains_qualified_column(right)
+		}
 	}
 }
 

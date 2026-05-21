@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use wendelon::schema::{Identity, STORAGE_ROW_KEY_ID_COLUMN};
 
@@ -84,6 +84,47 @@ pub(crate) fn extract_delete_row_key_ids(
 		}
 	}
 	Ok(row_key_ids)
+}
+
+pub(crate) fn delete_candidate_user_batches(
+	batches: &[RecordBatch],
+	user_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>, StorageError> {
+	let mut user_batches = Vec::with_capacity(batches.len());
+	for batch in batches {
+		if batch.num_columns() == 0 {
+			return Err(StorageError::Internal {
+				message: "delete candidate batch missing row identity column".to_string(),
+			});
+		}
+		let expected_columns = user_schema.fields().len() + 1;
+		if batch.num_columns() != expected_columns {
+			return Err(StorageError::Internal {
+				message: format!(
+					"delete candidate batch has {} columns; expected {expected_columns}",
+					batch.num_columns()
+				),
+			});
+		}
+		let identity_index = batch.num_columns() - 1;
+		let field = batch.schema().field(identity_index).clone();
+		if field.name() != STORAGE_ROW_KEY_ID_COLUMN {
+			return Err(StorageError::Internal {
+				message: format!(
+					"delete candidate row identity column must be named {STORAGE_ROW_KEY_ID_COLUMN}"
+				),
+			});
+		}
+		if field.data_type() != &DataType::FixedSizeBinary(32) {
+			return Err(StorageError::Internal {
+				message: "delete candidate row identity column must be FixedSizeBinary(32)"
+					.to_string(),
+			});
+		}
+		let columns = batch.columns()[..identity_index].to_vec();
+		user_batches.push(RecordBatch::try_new(user_schema.clone(), columns)?);
+	}
+	Ok(user_batches)
 }
 
 pub(crate) async fn execute_delete_with_candidates(

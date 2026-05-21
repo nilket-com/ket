@@ -4627,7 +4627,7 @@ along with the forward-sequence rewrite.
   evidence is recorded in `plans/impl/063_pk_table_update_evidence.md`,
   including passing full `cargo test -p toron -- --test-threads=6`.
 - **ADR 064 — DML `RETURNING` Rows.**
-  Promoted. The smallest user-visible completion of the mutation suite 063
+  Implemented. The smallest user-visible completion of the mutation suite 063
   unlocked: `RETURNING` for `INSERT VALUES` / `INSERT SELECT` / `UPDATE` /
   `DELETE` (CTAS out — no sqlparser 0.54 `returning` field). A returning
   mutation emits the existing Arrow `ResultBatch` frames then `Complete {
@@ -4657,7 +4657,9 @@ along with the forward-sequence rewrite.
   (support-present + stale-reject-gone); meta scoped `…_except_retarget`.
   **Toron SQL only; no Wendelon/worker/wire/parser/storage-primitive change;
   CTAS unchanged.** Placement: Exterior Composition → Toron home. Migration:
-  `plans/impl/064_dml_returning.md`.
+  `plans/impl/064_dml_returning.md`; implementation evidence is recorded in
+  `plans/impl/064_dml_returning_evidence.md`, including passing full
+  `cargo test -p toron -- --test-threads=6`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4742,9 +4744,9 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 064 promoted; ADR 065 candidates
+### ADR 064 implemented; ADR 065 candidates
 
-ADR 064 selected and promoted **DML `RETURNING` Rows** — the smallest
+ADR 064 selected and implemented **DML `RETURNING` Rows** — the smallest
 user-visible completion of the mutation suite 063 unlocked, **completing the
 "First Query with Integrity" DML result surface**. `RETURNING` for `INSERT
 VALUES` / `INSERT SELECT` / `UPDATE` / `DELETE` (CTAS out); a returning
@@ -4783,7 +4785,9 @@ change / worker write-back / parser upgrade / memory knob.**
 - `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
   no-`*V1`. Placement: Exterior Composition → Toron home.
 
-The migration is materialized in `plans/impl/064_dml_returning.md`.
+The migration is materialized in `plans/impl/064_dml_returning.md`; evidence
+is recorded in `plans/impl/064_dml_returning_evidence.md`, including passing
+full `cargo test -p toron -- --test-threads=6`.
 
 **The "First Query with Integrity" DML story is now complete:**
 SELECT / INSERT / DELETE / UPDATE / CTAS + IF-NOT-EXISTS + PK-DDL + RETURNING.

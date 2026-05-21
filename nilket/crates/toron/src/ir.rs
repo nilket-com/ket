@@ -181,6 +181,15 @@ pub enum InsertLiteral {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReturningProjection {
+	Star,
+	Exprs {
+		exprs: Vec<Expr>,
+		output_names: Vec<Option<String>>,
+	},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
 	Scan {
 		table: TableId,
@@ -246,21 +255,25 @@ pub enum LogicalPlan {
 	Delete {
 		table: TableRef,
 		predicate: Option<Expr>,
+		returning: Option<ReturningProjection>,
 	},
 	Update {
 		table: TableRef,
 		assignments: Vec<(String, Expr)>,
 		predicate: Expr,
+		returning: Option<ReturningProjection>,
 	},
 	Insert {
 		table: TableRef,
 		columns: Option<Vec<String>>,
 		rows: Vec<Vec<InsertLiteral>>,
+		returning: Option<ReturningProjection>,
 	},
 	InsertSelect {
 		table: TableRef,
 		columns: Option<Vec<String>>,
 		source: Box<LogicalPlan>,
+		returning: Option<ReturningProjection>,
 	},
 }
 

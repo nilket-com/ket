@@ -990,6 +990,19 @@ fn sql_plan_returns_rows(plan: &LogicalPlan) -> bool {
 			| LogicalPlan::Exchange { .. }
 			| LogicalPlan::Sort { .. }
 			| LogicalPlan::Join { .. }
+			| LogicalPlan::Delete {
+				returning: Some(_),
+				..
+			} | LogicalPlan::Update {
+			returning: Some(_),
+			..
+		} | LogicalPlan::Insert {
+			returning: Some(_),
+			..
+		} | LogicalPlan::InsertSelect {
+			returning: Some(_),
+			..
+		}
 	)
 }
 

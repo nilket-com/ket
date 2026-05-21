@@ -12,10 +12,10 @@ use crate::catalog::{Catalog, TableBinding, TableRef, TableRowIdentity};
 use crate::error::BindingError;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
-	BoundExprProgram, BoundExprProgramBuilder, BoundUnaryOp, ColumnName, ColumnOrdinal,
-	ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind,
-	JoinStrategy, LogicalPlan, PbcProgram, QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr,
-	arithmetic_output_type, schema_for_exprs,
+	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
+	ColumnOrdinal, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral,
+	JoinKind, JoinStrategy, LogicalPlan, PbcProgram, QueryProfileHint, ResolvedColumn,
+	ReturningProjection, ScalarValue, SortExpr, arithmetic_output_type, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -231,25 +231,39 @@ impl<'a> Binder<'a> {
 					name: name.clone(),
 					if_exists: *if_exists,
 				}),
-				LogicalPlan::Delete { table, predicate } => {
-					self.bind_delete(table, predicate.as_ref()).await
+				LogicalPlan::Delete {
+					table,
+					predicate,
+					returning,
+				} => {
+					self.bind_delete(table, predicate.as_ref(), returning.as_ref())
+						.await
 				}
 				LogicalPlan::Update {
 					table,
 					assignments,
 					predicate,
-				} => self.bind_update(table, assignments, predicate).await,
+					returning,
+				} => {
+					self.bind_update(table, assignments, predicate, returning.as_ref())
+						.await
+				}
 				LogicalPlan::Insert {
 					table,
 					columns,
 					rows,
-				} => self.bind_insert(table, columns.as_deref(), rows).await,
+					returning,
+				} => {
+					self.bind_insert(table, columns.as_deref(), rows, returning.as_ref())
+						.await
+				}
 				LogicalPlan::InsertSelect {
 					table,
 					columns,
 					source,
+					returning,
 				} => {
-					self.bind_insert_select(table, columns.as_deref(), source)
+					self.bind_insert_select(table, columns.as_deref(), source, returning.as_ref())
 						.await
 				}
 			}
@@ -280,8 +294,10 @@ impl<'a> Binder<'a> {
 		&self,
 		table: &TableRef,
 		predicate: Option<&Expr>,
+		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
 		let binding = self.catalog.resolve_table(table).await?;
+		let returning = bind_returning_projection(returning, &binding.schema, self.config)?;
 		let bound_predicate = match predicate {
 			Some(expr) => {
 				let program =
@@ -308,6 +324,7 @@ impl<'a> Binder<'a> {
 			predicate: bound_predicate,
 			pbc_program,
 			profile_hint,
+			returning,
 		})
 	}
 
@@ -316,6 +333,7 @@ impl<'a> Binder<'a> {
 		table: &TableRef,
 		columns: Option<&[String]>,
 		rows: &[Vec<InsertLiteral>],
+		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
 		let binding = self.catalog.resolve_table(table).await?;
 		if rows.is_empty() {
@@ -333,6 +351,7 @@ impl<'a> Binder<'a> {
 		}
 
 		let schema = binding.schema.clone();
+		let returning = bind_returning_projection(returning, &schema, self.config)?;
 		let schema_fields = schema.fields();
 		let target_columns = resolve_insert_target_columns(&schema, columns)?;
 		let target_indices = target_columns
@@ -394,6 +413,7 @@ impl<'a> Binder<'a> {
 			fingerprint: binding.fingerprint,
 			schema,
 			rows: bound_rows,
+			returning,
 		})
 	}
 
@@ -402,9 +422,11 @@ impl<'a> Binder<'a> {
 		table: &TableRef,
 		columns: Option<&[String]>,
 		source: &LogicalPlan,
+		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
 		let binding = self.catalog.resolve_table(table).await?;
 		let schema = binding.schema.clone();
+		let returning = bind_returning_projection(returning, &schema, self.config)?;
 		let target_columns = resolve_insert_target_columns(&schema, columns)?;
 		validate_omitted_insert_target_columns(&schema, &target_columns)?;
 		let source = self.bind_plan(source).await?;
@@ -442,6 +464,7 @@ impl<'a> Binder<'a> {
 			schema,
 			target_columns,
 			source: Box::new(source),
+			returning,
 		})
 	}
 
@@ -450,6 +473,7 @@ impl<'a> Binder<'a> {
 		table: &TableRef,
 		assignments: &[(String, Expr)],
 		predicate: &Expr,
+		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
 		let binding = self.catalog.resolve_table(table).await?;
 		let TableRowIdentity::PrimaryKey {
@@ -468,6 +492,7 @@ impl<'a> Binder<'a> {
 		}
 
 		let schema = binding.schema.clone();
+		let returning = bind_returning_projection(returning, &schema, self.config)?;
 		let mut seen = HashSet::new();
 		let mut assigned = HashMap::new();
 		for (column, expr) in assignments {
@@ -544,6 +569,7 @@ impl<'a> Binder<'a> {
 				output_schema,
 			}),
 			profile_hint,
+			returning,
 		})
 	}
 
@@ -588,6 +614,88 @@ impl<'a> Binder<'a> {
 			strategy,
 			output_schema: join_schema(kind, &left_scope.schema, &right_scope.schema),
 		})
+	}
+}
+
+fn bind_returning_projection(
+	returning: Option<&ReturningProjection>,
+	schema: &SchemaRef,
+	config: &PlannerConfig,
+) -> Result<Option<BoundReturningProjection>, BindingError> {
+	let Some(returning) = returning else {
+		return Ok(None);
+	};
+	let (exprs, output_names) = match returning {
+		ReturningProjection::Star => {
+			let exprs = schema
+				.fields()
+				.iter()
+				.map(|field| Expr::column(field.name().clone()))
+				.collect::<Vec<_>>();
+			let output_names = schema
+				.fields()
+				.iter()
+				.map(|field| Some(field.name().clone()))
+				.collect::<Vec<_>>();
+			(exprs, output_names)
+		}
+		ReturningProjection::Exprs {
+			exprs,
+			output_names,
+		} => {
+			if exprs.len() != output_names.len() {
+				return Err(BindingError::UnsupportedExpression {
+					message: "RETURNING expression/name length mismatch".to_string(),
+				});
+			}
+			for expr in exprs {
+				reject_storage_synthetic_returning_reference(expr)?;
+			}
+			(exprs.clone(), output_names.clone())
+		}
+	};
+	let exprs = bind_expr_program(&exprs, schema, config)?;
+	let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
+	Ok(Some(BoundReturningProjection {
+		exprs,
+		output_schema,
+	}))
+}
+
+fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), BindingError> {
+	match expr {
+		Expr::Column(column)
+			if STORAGE_SYNTHETIC_COLUMN_NAMES.contains(&column.name.0.as_str()) =>
+		{
+			Err(BindingError::UnsupportedExpression {
+				message: format!(
+					"RETURNING column is reserved for storage metadata: {}",
+					column.name.0
+				),
+			})
+		}
+		Expr::Column(_) | Expr::Literal(_) => Ok(()),
+		Expr::Cast(inner, _)
+		| Expr::TryCast(inner, _)
+		| Expr::Not(inner)
+		| Expr::IsNull(inner)
+		| Expr::IsNotNull(inner)
+		| Expr::TimeBucket(_, inner) => reject_storage_synthetic_returning_reference(inner),
+		Expr::Add(left, right)
+		| Expr::Sub(left, right)
+		| Expr::Mul(left, right)
+		| Expr::Div(left, right)
+		| Expr::Eq(left, right)
+		| Expr::Neq(left, right)
+		| Expr::Lt(left, right)
+		| Expr::Lte(left, right)
+		| Expr::Gt(left, right)
+		| Expr::Gte(left, right)
+		| Expr::And(left, right)
+		| Expr::Or(left, right) => {
+			reject_storage_synthetic_returning_reference(left)?;
+			reject_storage_synthetic_returning_reference(right)
+		}
 	}
 }
 
@@ -1510,6 +1618,7 @@ fn optimize_for_required(
 			predicate,
 			pbc_program,
 			profile_hint,
+			returning,
 		} => Ok((
 			ExecutionPlan::Delete {
 				legacy_table_id,
@@ -1519,6 +1628,7 @@ fn optimize_for_required(
 				predicate,
 				pbc_program,
 				profile_hint,
+				returning,
 			},
 			OrdinalRemap::new(),
 		)),
@@ -1529,6 +1639,7 @@ fn optimize_for_required(
 			schema,
 			source,
 			profile_hint,
+			returning,
 		} => {
 			let (source, _) = optimize_for_required(*source, None)?;
 			Ok((
@@ -1539,6 +1650,7 @@ fn optimize_for_required(
 					schema,
 					source: Box::new(source),
 					profile_hint,
+					returning,
 				},
 				OrdinalRemap::new(),
 			))
@@ -1549,6 +1661,7 @@ fn optimize_for_required(
 			fingerprint,
 			schema,
 			rows,
+			returning,
 		} => Ok((
 			ExecutionPlan::Insert {
 				legacy_table_id,
@@ -1556,6 +1669,7 @@ fn optimize_for_required(
 				fingerprint,
 				schema,
 				rows,
+				returning,
 			},
 			OrdinalRemap::new(),
 		)),
@@ -1566,6 +1680,7 @@ fn optimize_for_required(
 			schema,
 			target_columns,
 			source,
+			returning,
 		} => {
 			let (source, _) = optimize_for_required(*source, None)?;
 			Ok((
@@ -1576,6 +1691,7 @@ fn optimize_for_required(
 					schema,
 					target_columns,
 					source: Box::new(source),
+					returning,
 				},
 				OrdinalRemap::new(),
 			))

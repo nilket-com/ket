@@ -974,6 +974,13 @@ impl Executor {
 		program: &BoundExprProgram,
 		batch: &RecordBatch,
 	) -> Result<Vec<ArrayRef>, ExecutionError> {
+		Self::evaluate_bound_program_without_storage(program, batch)
+	}
+
+	pub fn evaluate_bound_program_without_storage(
+		program: &BoundExprProgram,
+		batch: &RecordBatch,
+	) -> Result<Vec<ArrayRef>, ExecutionError> {
 		program
 			.validate()
 			.map_err(|error| ExecutionError::InvalidExpression {

@@ -38,6 +38,7 @@ fn planner_accepts_update_where() {
 		table,
 		assignments,
 		predicate,
+		..
 	} = plan
 	else {
 		panic!("expected update plan");
@@ -51,6 +52,18 @@ fn planner_accepts_update_where() {
 }
 
 #[test]
+fn planner_accepts_update_returning_star() {
+	let plan = SqlPlanner::new()
+		.plan("UPDATE people SET note = 'new' WHERE id = 7 RETURNING *")
+		.expect("plan update returning");
+
+	let LogicalPlan::Update { returning, .. } = plan else {
+		panic!("expected update plan");
+	};
+	assert!(returning.is_some());
+}
+
+#[test]
 fn planner_rejects_update_without_where() {
 	assert_frontend_error("UPDATE people SET note = 'new'", "WHERE");
 }
@@ -61,10 +74,6 @@ fn planner_rejects_update_from_returning_conflict_and_parser_rejects_output_orde
 		(
 			"UPDATE people SET note = 'new' FROM src WHERE id = 1",
 			"FROM",
-		),
-		(
-			"UPDATE people SET note = 'new' WHERE id = 1 RETURNING note",
-			"RETURNING",
 		),
 		(
 			"UPDATE OR REPLACE people SET note = 'new' WHERE id = 1",
@@ -127,6 +136,20 @@ async fn binder_rejects_update_on_append_only_table() {
 	let err = bind(&plan, &catalog, &PlannerConfig::default())
 		.await
 		.expect_err("append-only table should reject update");
+
+	assert_binding_error(err, "UPDATE requires a PRIMARY KEY table");
+}
+
+#[tokio::test]
+async fn update_returning_still_rejects_append_only_table() {
+	let catalog = append_only_catalog().await;
+	let plan = SqlPlanner::new()
+		.plan("UPDATE people SET note = 'new' WHERE id = 1 RETURNING *")
+		.expect("plan update returning");
+
+	let err = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("append-only table should reject update returning");
 
 	assert_binding_error(err, "UPDATE requires a PRIMARY KEY table");
 }
@@ -223,6 +246,32 @@ async fn update_zero_matches_returns_row_count_zero_without_write() {
 }
 
 #[tokio::test]
+async fn zero_row_update_returning_completes_row_count_zero_without_batch_or_write() {
+	let fixture = UpdateFixture::new(people_schema(true)).await;
+	fixture
+		.seed(people_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, Some("old"))],
+		))
+		.await;
+
+	let results = fixture
+		.coordinator
+		.execute_query(
+			&fixture
+				.planner
+				.plan("UPDATE people SET note = 'new' WHERE id = 99 RETURNING *")
+				.expect("plan update returning"),
+			None,
+		)
+		.await
+		.expect("zero-match update returning");
+
+	assert!(results.is_empty());
+	assert_eq!(fixture.writer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn update_writes_full_replacement_row() {
 	let fixture = UpdateFixture::new(people_schema(true)).await;
 	fixture
@@ -242,6 +291,40 @@ async fn update_writes_full_replacement_row() {
 	assert_eq!(payload.schema().as_ref(), fixture.binding.schema.as_ref());
 	assert_eq!(int32_values(&payload, 0), vec![1]);
 	assert_eq!(int64_values(&payload, 1), vec![10]);
+	assert_eq!(string_values(&payload, 2), vec![Some("new".to_string())]);
+}
+
+#[tokio::test]
+async fn update_returning_emits_post_update_values() {
+	let fixture = UpdateFixture::new(people_schema(true)).await;
+	fixture
+		.seed(people_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, Some("old"))],
+		))
+		.await;
+
+	let results = fixture
+		.coordinator
+		.execute_query(
+			&fixture
+				.planner
+				.plan(
+					"UPDATE people SET amount = amount + 5, note = 'new' WHERE id = 1 RETURNING id, amount, note",
+				)
+				.expect("plan update returning"),
+			None,
+		)
+		.await
+		.expect("update returning");
+
+	assert_eq!(results.len(), 1);
+	let batch = &results[0];
+	assert_eq!(int32_values(batch, 0), vec![1]);
+	assert_eq!(int64_values(batch, 1), vec![15]);
+	assert_eq!(string_values(batch, 2), vec![Some("new".to_string())]);
+	let payload = fixture.writer.single_payload();
+	assert_eq!(int64_values(&payload, 1), vec![15]);
 	assert_eq!(string_values(&payload, 2), vec![Some("new".to_string())]);
 }
 

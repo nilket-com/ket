@@ -29,8 +29,8 @@ use crate::error::{
 };
 use crate::exec::{ExecutionContext, Executor};
 use crate::ir::{
-	ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan, FilterDisposition, LogicalPlan, MorselId,
-	TableId,
+	BoundReturningProjection, ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan,
+	FilterDisposition, LogicalPlan, MorselId, TableId,
 };
 use crate::server::{
 	NetworkTaskDispatcher, ToronCoordinator, memory::MemoryManager, transport::ToronTransport,
@@ -975,8 +975,15 @@ async fn execute_write_plan_with_source(
 			fingerprint,
 			schema,
 			rows,
+			returning,
 		} => {
 			let payload = write::materialize_insert_batch(schema, rows)?;
+			let returning_batches =
+				project_returning_batches(returning.as_ref(), std::slice::from_ref(&payload))?;
+			let returning_row_count = returning_batches
+				.as_ref()
+				.map(|batches| batch_row_count(batches))
+				.unwrap_or(0);
 			let outcome = writer
 				.write(WriteRequest {
 					session_id: context.session_id,
@@ -990,7 +997,12 @@ async fn execute_write_plan_with_source(
 					trace_context: context.trace_context,
 				})
 				.await?;
-			Ok(vec![write::affected_count_batch(outcome.rows)?])
+			if let Some(batches) = returning_batches {
+				verify_write_returning_receipt("INSERT", outcome.rows, returning_row_count)?;
+				Ok(batches)
+			} else {
+				Ok(vec![write::affected_count_batch(outcome.rows)?])
+			}
 		}
 		ExecutionPlan::InsertSelect {
 			legacy_table_id,
@@ -999,13 +1011,24 @@ async fn execute_write_plan_with_source(
 			schema,
 			target_columns,
 			source,
+			returning,
 		} => {
 			let source_batches = source_executor.execute_read_plan(source).await?;
 			let Some(payload) =
 				write::materialize_insert_select_batch(schema, target_columns, &source_batches)?
 			else {
-				return Ok(vec![write::affected_count_batch(0)?]);
+				return if returning.is_some() {
+					Ok(Vec::new())
+				} else {
+					Ok(vec![write::affected_count_batch(0)?])
+				};
 			};
+			let returning_batches =
+				project_returning_batches(returning.as_ref(), std::slice::from_ref(&payload))?;
+			let returning_row_count = returning_batches
+				.as_ref()
+				.map(|batches| batch_row_count(batches))
+				.unwrap_or(0);
 			let outcome = writer
 				.write(WriteRequest {
 					session_id: context.session_id,
@@ -1019,7 +1042,12 @@ async fn execute_write_plan_with_source(
 					trace_context: context.trace_context,
 				})
 				.await?;
-			Ok(vec![write::affected_count_batch(outcome.rows)?])
+			if let Some(batches) = returning_batches {
+				verify_write_returning_receipt("INSERT SELECT", outcome.rows, returning_row_count)?;
+				Ok(batches)
+			} else {
+				Ok(vec![write::affected_count_batch(outcome.rows)?])
+			}
 		}
 		ExecutionPlan::Update {
 			legacy_table_id,
@@ -1028,12 +1056,23 @@ async fn execute_write_plan_with_source(
 			schema,
 			source,
 			profile_hint,
+			returning,
 		} => {
 			let source_batches = source_executor.execute_read_plan(source).await?;
 			let Some(payload) = write::materialize_update_select_batch(schema, &source_batches)?
 			else {
-				return Ok(vec![write::affected_count_batch(0)?]);
+				return if returning.is_some() {
+					Ok(Vec::new())
+				} else {
+					Ok(vec![write::affected_count_batch(0)?])
+				};
 			};
+			let returning_batches =
+				project_returning_batches(returning.as_ref(), std::slice::from_ref(&payload))?;
+			let returning_row_count = returning_batches
+				.as_ref()
+				.map(|batches| batch_row_count(batches))
+				.unwrap_or(0);
 			let outcome = writer
 				.write(WriteRequest {
 					session_id: context.session_id,
@@ -1047,7 +1086,12 @@ async fn execute_write_plan_with_source(
 					trace_context: context.trace_context,
 				})
 				.await?;
-			Ok(vec![write::affected_count_batch(outcome.rows)?])
+			if let Some(batches) = returning_batches {
+				verify_write_returning_receipt("UPDATE", outcome.rows, returning_row_count)?;
+				Ok(batches)
+			} else {
+				Ok(vec![write::affected_count_batch(outcome.rows)?])
+			}
 		}
 		ExecutionPlan::CreateTableAsSelect {
 			table,
@@ -1118,7 +1162,9 @@ async fn execute_write_plan_with_source(
 			legacy_table_id,
 			table,
 			fingerprint,
+			schema,
 			profile_hint,
+			returning,
 			..
 		} => {
 			let candidate_plan = derive_delete_candidate_plan(bound)?;
@@ -1126,6 +1172,18 @@ async fn execute_write_plan_with_source(
 				.execute_delete_candidate_plan(&candidate_plan)
 				.await?;
 			let row_key_ids = delete::extract_delete_row_key_ids(&candidate_batches)?;
+			let candidate_count = row_key_ids.len();
+			let returning_batches = if let Some(returning) = returning.as_ref() {
+				let user_batches =
+					delete::delete_candidate_user_batches(&candidate_batches, schema)?;
+				project_returning_batches(Some(returning), &user_batches)?
+			} else {
+				None
+			};
+			let returning_row_count = returning_batches
+				.as_ref()
+				.map(|batches| batch_row_count(batches))
+				.unwrap_or(0);
 			let outcome = delete::execute_delete_with_candidates(
 				deleter,
 				DeleteRowsRequest {
@@ -1141,12 +1199,85 @@ async fn execute_write_plan_with_source(
 				},
 			)
 			.await?;
-			Ok(vec![delete::delete_count_batch(outcome.deleted)?])
+			if let Some(batches) = returning_batches {
+				verify_delete_returning_receipt(&outcome, candidate_count, returning_row_count)?;
+				Ok(batches)
+			} else {
+				Ok(vec![delete::delete_count_batch(outcome.deleted)?])
+			}
 		}
 		other => Err(QueryError::Internal {
 			message: format!("execute_write_plan called with non-DML plan: {other:?}"),
 		}),
 	}
+}
+
+fn project_returning_batches(
+	returning: Option<&BoundReturningProjection>,
+	input_batches: &[RecordBatch],
+) -> Result<Option<Vec<RecordBatch>>, QueryError> {
+	let Some(returning) = returning else {
+		return Ok(None);
+	};
+	let mut output = Vec::new();
+	for batch in input_batches {
+		if batch.num_rows() == 0 {
+			continue;
+		}
+		let columns = Executor::evaluate_bound_program_without_storage(&returning.exprs, batch)?;
+		let projected = RecordBatch::try_new(returning.output_schema.clone(), columns)?;
+		if projected.num_rows() != batch.num_rows() {
+			return Err(QueryError::Internal {
+				message: format!(
+					"RETURNING projection produced {} rows from {} input rows",
+					projected.num_rows(),
+					batch.num_rows()
+				),
+			});
+		}
+		output.push(projected);
+	}
+	Ok(Some(output))
+}
+
+fn batch_row_count(batches: &[RecordBatch]) -> usize {
+	batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn verify_write_returning_receipt(
+	verb: &'static str,
+	storage_rows: usize,
+	returned_rows: usize,
+) -> Result<(), QueryError> {
+	if storage_rows == returned_rows {
+		return Ok(());
+	}
+	Err(QueryError::Internal {
+		message: format!(
+			"{verb} RETURNING row count {returned_rows} does not match storage receipt {storage_rows}"
+		),
+	})
+}
+
+fn verify_delete_returning_receipt(
+	outcome: &DeleteRowsOutcome,
+	candidate_count: usize,
+	returned_rows: usize,
+) -> Result<(), QueryError> {
+	if outcome.requested == candidate_count
+		&& outcome.deleted == candidate_count
+		&& outcome.already_deleted == 0
+		&& outcome.not_found == 0
+		&& returned_rows == candidate_count
+	{
+		return Ok(());
+	}
+	Err(QueryError::Internal {
+		message: format!(
+			"DELETE RETURNING receipt mismatch: candidates={candidate_count} returned={returned_rows} requested={} deleted={} already_deleted={} not_found={}",
+			outcome.requested, outcome.deleted, outcome.already_deleted, outcome.not_found
+		),
+	})
 }
 
 fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, QueryError> {
@@ -1158,6 +1289,7 @@ fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, 
 		predicate,
 		pbc_program,
 		profile_hint,
+		returning: _,
 	} = bound
 	else {
 		return Err(QueryError::Internal {
@@ -1909,6 +2041,7 @@ mod tests {
 			table: TableRef::new("retry_table"),
 			columns: None,
 			rows: vec![vec![InsertLiteral::Int64(4)]],
+			returning: None,
 		};
 
 		let err = coordinator
