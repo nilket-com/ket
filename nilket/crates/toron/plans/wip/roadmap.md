@@ -4626,6 +4626,38 @@ along with the forward-sequence rewrite.
   Toron home. Migration: `plans/impl/063_pk_table_update.md`; implementation
   evidence is recorded in `plans/impl/063_pk_table_update_evidence.md`,
   including passing full `cargo test -p toron -- --test-threads=6`.
+- **ADR 064 — DML `RETURNING` Rows.**
+  Promoted. The smallest user-visible completion of the mutation suite 063
+  unlocked: `RETURNING` for `INSERT VALUES` / `INSERT SELECT` / `UPDATE` /
+  `DELETE` (CTAS out — no sqlparser 0.54 `returning` field). A returning
+  mutation emits the existing Arrow `ResultBatch` frames then `Complete {
+  row_count }`; non-returning DML stays Complete-only. **Proven-small** — the
+  result protocol is already bimodal (`sql_plan_returns_rows` → `ResultBatch`/
+  `Complete`) and each mutation already materializes the affected rows.
+  Standard visibility (POST-mutation for INSERT/UPDATE, PRE-delete for DELETE);
+  the coordinator **materializes + validates the RETURNING projection before
+  the storage call** and **emits only after storage success + receipt
+  validation** (no streaming-before-commit; projection errors skip the write).
+  **Not PK-gated** — RETURNING follows each statement's existing table support
+  (INSERT/DELETE on append-only + PK, per `adr036`; UPDATE PK-only because 063
+  made UPDATE PK-only). **DELETE fails closed** on a non-exact receipt
+  (`DeleteRowsOutcome` is count-only; emit only on `requested ==
+  candidate_count && deleted == candidate_count && already_deleted == 0 &&
+  not_found == 0`); precise per-row DELETE RETURNING under contention is a
+  future ADR. `RETURNING *` hides
+  storage-synthetic/identity columns; reject aggregate/window/subquery;
+  Toron-local returning IR (no sqlparser AST in plans); reuse the SELECT result
+  path (no new wire frame) + the existing tenant memory budget (no new knob);
+  `Complete.row_count` == receipt == emitted (must not lie). Final D-set: **18
+  decisions, 24 architecture + 3 convention + meta guards, 24 required
+  fixtures**. Council: **3-of-3 (Claude, Codex, Gemini)**. **Prior-guard
+  reconciliation — the run's largest retarget set:** RETURNING was rejected in
+  three places (INSERT/UPDATE/DELETE), all flipped, plus the 062/063
+  returning-absence/Complete-only guards narrowed — self-enforcing
+  (support-present + stale-reject-gone); meta scoped `…_except_retarget`.
+  **Toron SQL only; no Wendelon/worker/wire/parser/storage-primitive change;
+  CTAS unchanged.** Placement: Exterior Composition → Toron home. Migration:
+  `plans/impl/064_dml_returning.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4710,7 +4742,67 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 063 implemented; ADR 064 candidates
+### ADR 064 promoted; ADR 065 candidates
+
+ADR 064 selected and promoted **DML `RETURNING` Rows** — the smallest
+user-visible completion of the mutation suite 063 unlocked, **completing the
+"First Query with Integrity" DML result surface**. `RETURNING` for `INSERT
+VALUES` / `INSERT SELECT` / `UPDATE` / `DELETE` (CTAS out); a returning
+mutation emits the existing Arrow `ResultBatch` frames then `Complete {
+row_count }`; non-returning DML stays Complete-only. Final D-set: **18
+decisions, 24 architecture + 3 convention + meta guards, 24 required
+fixtures**.
+
+**Toron SQL only; reuses the SELECT result path + each mutation's existing row
+materialization; zero new SQL wire frame / storage primitive / Wendelon
+change / worker write-back / parser upgrade / memory knob.**
+
+**Key decisions / invariants:**
+
+- **Promoted 3-of-3 (Claude, Codex, Gemini).** Proven-small: the result
+  protocol is already bimodal (`sql_plan_returns_rows` → `ResultBatch`/
+  `Complete`) and each mutation already materializes the affected rows.
+- **Standard visibility** (POST-mutation for INSERT/UPDATE, PRE-delete for
+  DELETE); **precompute + validate the projection before the storage call,
+  emit only after storage success + receipt validation** (no streaming-before-
+  commit; projection errors skip the write).
+- **Not PK-gated** — RETURNING follows each statement's existing table support
+  (INSERT/DELETE on append-only + PK per `adr036`; UPDATE PK-only because 063
+  made UPDATE PK-only).
+- **DELETE fails closed** on a non-exact receipt (`DeleteRowsOutcome` is
+  count-only — emit only on `requested == candidate_count && deleted ==
+  candidate_count && already_deleted == 0 && not_found == 0`); precise per-row
+  DELETE RETURNING under contention is a future ADR.
+- `RETURNING *` hides storage-synthetic/identity; reject aggregate/window/
+  subquery; Toron-local returning IR (no sqlparser AST in plans); row_count
+  must not lie (== receipt == emitted).
+- **Prior-guard reconciliation — the run's largest retarget set:** RETURNING
+  was rejected in three places (INSERT/UPDATE/DELETE), all flipped, plus the
+  062/063 returning-absence/Complete-only guards narrowed — self-enforcing
+  (support-present + stale-reject-gone); meta scoped `…_except_retarget`.
+- `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
+  no-`*V1`. Placement: Exterior Composition → Toron home.
+
+The migration is materialized in `plans/impl/064_dml_returning.md`.
+
+**The "First Query with Integrity" DML story is now complete:**
+SELECT / INSERT / DELETE / UPDATE / CTAS + IF-NOT-EXISTS + PK-DDL + RETURNING.
+
+**ADR 065 candidates:**
+
+- **Audit subsystem** (045 D7) — now the clear lead and the most-deferred
+  substantive item (~16 ADRs): shared `observability-audit` crate, crypto-
+  chained, fail-open, archive/syslog sinks; its own compliance sequence. With
+  the DML surface complete, this is the natural next major track.
+- **No-WHERE UPDATE** (restore DELETE symmetry — small 063 follow-up);
+  **composite-PK / DDL type-surface widening / `ALTER TABLE` / standalone
+  `UNIQUE`**; **sqlparser-0.62 migration** (its own ADR; 063/064 pinned 0.54);
+  **typed `QUERY_CANCELLED` mapping** (060 follow-up); **precise per-row DELETE
+  RETURNING** (needs a delete receipt carrying identities); **CTAS row-count
+  cleanup**; parser throttle, OTLP traces, JWT/OIDC/SPIFFE, gRPC/Arrow Flight/
+  Postgres frontends — all carried.
+
+### ADR 063 implemented; ADR 064 candidates (HISTORICAL)
 
 ADR 063 selected and implemented **PK-Table `UPDATE … WHERE` via Full-Row
 Upsert** — the direct consumer ADR 062 was built to unlock, **completing the
