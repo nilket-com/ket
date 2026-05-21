@@ -4275,6 +4275,47 @@ along with the forward-sequence rewrite.
   evidence:
   `plans/impl/053_governed_bind_miss_descriptor_sync_consumer_evidence.md`.
 
+- **ADR 054 — Reactive Descriptor Invalidation.**
+  Promoted. The symmetric completion of descriptor liveness: ADR 053
+  heals a *missing* table (bind-miss → sync); ADR 054 heals a *stale*
+  one. When execution proves a cached descriptor stale
+  (`DescriptorEvolved`), Toron **invalidates** the stale local registry
+  entry and the existing coordinator retry re-binds through ADR 053's
+  governed bind-miss sync — **refresh = invalidate + reuse-053**, no new
+  fetch path, no new budget, no TTL/reaper/watch/push. Closes the hole
+  053 left open: today the SELECT retry re-binds to the *same stale
+  cache entry forever* (coordinator.rs:879-894) → `SchemaInstability`
+  until restart, so a discovered table becomes *worse off* once it
+  evolves. Four+ council iterations (dual adr+impl from iter-2): iter-0
+  split (Claude+Gemini Governance Phase 3; Codex refresh); iter-1 Claude
+  withdrew the governance lead after verifying the permanent-failure
+  loop and **contested bundling governance into 054**; iter-2 converged
+  the mechanism; iter-3/4 reached 3-of-3 on the split (Gemini conceded
+  governance → ADR 055). Final D-set: **17 decisions, 14 architecture
+  guards + 3 convention guards, 13 required fixtures + 1 optional**.
+  **D3/D4/D9 critical decision:** `StorageError::DescriptorEvolved`
+  **and** the distributed `TaskFailureKind::DescriptorEvolved` carry the
+  stale local `TableId` (fingerprints stay diagnostic); invalidation is
+  **path-agnostic** (SELECT/write/delete/CTAS all invalidate) while
+  **auto-retry is SELECT-only** (writes don't replay — side-effect
+  safety).
+  **D12 critical decision:** a drop-and-recreate (different
+  `TableObjectId` on re-bind) is **not** a transparent re-bind — the
+  current statement fails closed with `SchemaInstability`; a later
+  statement binds the new object cleanly.
+  **D16/D17 critical decision:** reuses ADR 053's
+  `max_concurrent_descriptor_syncs` admission — **no** new QPS/WFQ/
+  queue/borrow knob. Governance Phase 3 is **split out to ADR 055**,
+  explicitly framed as the ADR 050 D7 / ADR 052 D3-D14 hard-reject
+  reversal (Claude's iter-1 contest, adopted 3-of-3).
+  **Single-plan posture; Toron-ring only.** Reuses 053/072; no Wendelon
+  server change; no SQL wire/DDL change; no TTL / background refresh /
+  push invalidation (future ADRs if measured). Wendelon stays
+  authoritative; Toron is a reactive-pull-on-stale cache, never a
+  managed mirror. Placement: Exterior Substrate → Toron home. The
+  migration is materialized in
+  `plans/impl/054_reactive_descriptor_invalidation.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -4358,7 +4399,70 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 053 implemented; ADR 054 candidates
+### ADR 054 promoted; ADR 055 candidates
+
+ADR 054 selected and promoted **Reactive Descriptor Invalidation** —
+the symmetric completion of descriptor liveness. ADR 053 healed a
+*missing* table (bind-miss → sync); ADR 054 heals a *stale* one. On
+execution-time `DescriptorEvolved`, Toron invalidates the stale local
+registry entry and the existing coordinator retry re-binds through ADR
+053's governed sync — **refresh = invalidate + reuse-053**, no new fetch
+path, no new budget, no TTL/reaper/watch/push. Closes the hole 053 left
+open: the SELECT retry currently re-binds to the same stale entry
+forever (coordinator.rs:879-894) → `SchemaInstability` until restart.
+Final D-set: **17 decisions, 14 architecture guards + 3 convention
+guards, 13 required fixtures + 1 optional**.
+
+**Pure Toron-ring substrate; node-local; reuses 053/072; zero Wendelon
+server change, zero SQL wire change.**
+
+**Key decisions / invariants:**
+
+- **The split (3-of-3):** governance is *not* in 054. Claude's iter-1
+  contested bundling — WFQ/queueing/borrowing reverses the ADR 050 D7 /
+  ADR 052 D3-D14 hard-reject exclusions, an architecture turn that earns
+  its own ADR. Gemini conceded; → **ADR 055**.
+- **Identity (D3/D4/D5):** `StorageError::DescriptorEvolved` and the
+  distributed `TaskFailureKind::DescriptorEvolved` carry the stale local
+  `TableId` (fingerprints diagnostic); the context-free
+  `From<ClientError>` is replaced by request-aware mapping.
+- **Path-agnostic invalidation, SELECT-only retry (D9/D11):**
+  SELECT/write/delete/CTAS all invalidate; only SELECT auto-retries
+  (writes don't replay — side-effect safety).
+- **Replacement guard (D12):** drop-and-recreate (different
+  `TableObjectId`) fails the current statement closed with
+  `SchemaInstability`; a later statement binds the new object cleanly.
+- **Reuse-not-extend (D16):** 053's `max_concurrent_descriptor_syncs`
+  admission; no new QPS/WFQ/queue/borrow knob. Aggregate-only sibling
+  metric. Wendelon stays authoritative; Toron is a reactive-pull-on-
+  stale cache, never a managed mirror.
+- `crates/nilket` runtime-free; `toron_fixture_worker.rs` unchanged;
+  brand-clean / no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in
+`plans/impl/054_reactive_descriptor_invalidation.md`.
+
+**ADR 055 candidates:**
+
+- **Per-tenant Governance Phase 3 (LEAD)** — fair-share / weighted
+  admission (WFQ), rate limits (QPS / token bucket), connection caps,
+  borrowing, queueing. **Headline:** this is the explicit reversal of
+  the ADR 050 D7 / ADR 052 D3-D14 hard-reject posture and must be
+  framed and guarded as such (not a bundled appendix). QPS (a clean
+  hard-reject extension) and WFQ (the reversal) may even split across
+  055/056.
+- **Descriptor refresh hardening** — proactive TTL / external-DROP
+  push invalidation, *if* measured staleness without a
+  `DescriptorEvolved` signal appears (054 is reactive-only by design).
+- **OTLP traces export**, **audit subsystem** (deferred since ADR 045
+  D7).
+- **SQL surface widening** — CTAS `IF NOT EXISTS`, `UPDATE WHERE`,
+  `INSERT/CTAS/DELETE … RETURNING`.
+- **Live cert rotation / CRL / OCSP**; **token-based tenant claims
+  (JWT/OIDC/SPIFFE)**; gRPC / Arrow Flight / Postgres frontends; strong
+  cross-worker cancellation; prepared statements (carried forward).
+
+### ADR 053 implemented; ADR 054 candidates (HISTORICAL)
 
 ADR 053 selected, promoted, and implemented **Governed Bind-Miss
 Descriptor Sync Consumer** — the Toron consumer of the Wendelon ADR 072
