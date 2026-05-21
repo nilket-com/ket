@@ -33,7 +33,9 @@ use toron::distributed::budget::{
 };
 use toron::distributed::identity::WorkerId;
 use toron::network::connection::SqlConnectionLimiter;
-use toron::network::observability::{MetricsRegistry, MetricsRegistryConfig, ReadinessSnapshot};
+use toron::network::observability::{
+	ListenerName, MetricsRegistry, MetricsRegistryConfig, ReadinessSnapshot, RejectReason,
+};
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, canonical_client_dns_name, canonical_daemon_dns_name,
 	canonical_monitor_dns_name,
@@ -99,6 +101,41 @@ fn sample_resource_metrics_body() -> String {
 	});
 
 	metrics.render_text(&ready_snapshot())
+}
+
+#[test]
+fn request_ingress_metrics_use_bounded_reasons_and_omit_sql_text() {
+	let policy = TenantBudgetPolicy::omitted_config(ByteCount::new(1024));
+	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy.clone(),
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		sql_connection_limiter: None,
+		tenant_admission,
+		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
+	});
+	metrics.increment_reject(ListenerName::Sql, RejectReason::RequestFrameTooLarge);
+	metrics.increment_reject(ListenerName::Sql, RejectReason::StatementTooLarge);
+
+	let body = metrics.render_text(&ready_snapshot());
+
+	assert!(body.contains(
+		"listener_rejects_total{listener=\"sql\",reason=\"request_frame_too_large\"} 1\n"
+	));
+	assert!(
+		body.contains(
+			"listener_rejects_total{listener=\"sql\",reason=\"statement_too_large\"} 1\n"
+		)
+	);
+	for forbidden in ["query_id", "SELECT", "tenant_id=\"1\"", "table_name"] {
+		assert!(
+			!body.contains(forbidden),
+			"request ingress reject metrics leaked forbidden token {forbidden}"
+		);
+	}
 }
 
 #[test]
@@ -808,6 +845,12 @@ fn observability_config(worker_id: WorkerId, pki: &TestPki) -> ToronBootstrapCon
 			listener_bind: "127.0.0.1:0".parse().expect("sql bind"),
 			statement_timeout: Duration::from_secs(1),
 			max_concurrent_connections: None,
+			max_request_frame_bytes: NonZeroU32::new(
+				toron::sql_wire::DEFAULT_SQL_REQUEST_FRAME_BYTES,
+			)
+			.expect("default SQL request cap"),
+			max_statement_bytes: NonZeroU32::new(toron::sql_wire::DEFAULT_SQL_STATEMENT_BYTES)
+				.expect("default SQL statement cap"),
 		}),
 		coordinator: CoordinatorConfig {
 			include_self_worker: true,

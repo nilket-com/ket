@@ -1,5 +1,6 @@
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -528,6 +529,12 @@ fn tls_config(
 			listener_bind,
 			statement_timeout: Duration::from_secs(1),
 			max_concurrent_connections: None,
+			max_request_frame_bytes: NonZeroU32::new(
+				toron::sql_wire::DEFAULT_SQL_REQUEST_FRAME_BYTES,
+			)
+			.expect("default SQL request cap"),
+			max_statement_bytes: NonZeroU32::new(toron::sql_wire::DEFAULT_SQL_STATEMENT_BYTES)
+				.expect("default SQL statement cap"),
 		}),
 		coordinator: CoordinatorConfig {
 			include_self_worker: true,

@@ -11,6 +11,10 @@ use toron::config::{
 };
 use toron::distributed::budget::{ByteCount, QueryBudget};
 use toron::ir::TableId;
+use toron::sql_wire::{
+	DEFAULT_SQL_REQUEST_FRAME_BYTES, DEFAULT_SQL_STATEMENT_BYTES,
+	SQL_REQUEST_FRAME_BYTES_HARD_CEILING, SQL_STATEMENT_BYTES_HARD_CEILING,
+};
 use toron::storage::TenantId;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -91,6 +95,11 @@ fn toron_example_config_loads() {
 	let sql = config.sql.as_ref().expect("example sql config");
 	assert!(sql.listener_bind.ip().is_loopback());
 	assert_eq!(sql.max_concurrent_connections, None);
+	assert_eq!(
+		sql.max_request_frame_bytes.get(),
+		DEFAULT_SQL_REQUEST_FRAME_BYTES
+	);
+	assert_eq!(sql.max_statement_bytes.get(), DEFAULT_SQL_STATEMENT_BYTES);
 	assert!(config.coordinator.include_self_worker);
 	assert!(config.tls.is_none());
 	assert_eq!(
@@ -133,6 +142,101 @@ fn toron_example_config_loads() {
 		None
 	);
 	assert!(config.admission.is_none());
+}
+
+#[test]
+fn sql_request_caps_default_to_nonzero_equal_safety_floor() {
+	let dir = fresh_dir("sql-request-cap-defaults");
+	let path = dir.join("toron.toml");
+	let config = render_example_config().replace(
+		"max_request_frame_bytes = 4194304\nmax_statement_bytes = 4194304\n",
+		"",
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load config with omitted caps");
+	let sql = config.sql.expect("sql config");
+
+	assert_eq!(
+		sql.max_request_frame_bytes.get(),
+		DEFAULT_SQL_REQUEST_FRAME_BYTES
+	);
+	assert_eq!(sql.max_statement_bytes.get(), DEFAULT_SQL_STATEMENT_BYTES);
+	assert_eq!(sql.max_statement_bytes, sql.max_request_frame_bytes);
+}
+
+#[test]
+fn sql_request_caps_reject_zero() {
+	for field in ["max_request_frame_bytes", "max_statement_bytes"] {
+		let dir = fresh_dir(field);
+		let path = dir.join("toron.toml");
+		let config =
+			render_example_config().replace(&format!("{field} = 4194304"), &format!("{field} = 0"));
+		std::fs::write(&path, config).expect("write config");
+
+		let error = load_toron_bootstrap_config(&path).expect_err("zero cap rejected");
+
+		assert!(
+			error
+				.to_string()
+				.contains(&format!("sql.{field} must be greater than 0")),
+			"{error}"
+		);
+	}
+}
+
+#[test]
+fn sql_request_caps_reject_values_over_hard_ceiling() {
+	for (field, ceiling) in [
+		(
+			"max_request_frame_bytes",
+			SQL_REQUEST_FRAME_BYTES_HARD_CEILING,
+		),
+		("max_statement_bytes", SQL_STATEMENT_BYTES_HARD_CEILING),
+	] {
+		let dir = fresh_dir(field);
+		let path = dir.join("toron.toml");
+		let too_large = ceiling + 1;
+		let config = render_example_config().replace(
+			&format!("{field} = 4194304"),
+			&format!("{field} = {too_large}"),
+		);
+		std::fs::write(&path, config).expect("write config");
+
+		let error = load_toron_bootstrap_config(&path).expect_err("over-ceiling cap rejected");
+
+		assert!(
+			error
+				.to_string()
+				.contains(&format!("sql.{field} must be at most 67108864")),
+			"{error}"
+		);
+	}
+}
+
+#[test]
+fn sql_statement_cap_cannot_exceed_request_frame_cap() {
+	let dir = fresh_dir("sql-statement-cap-order");
+	let path = dir.join("toron.toml");
+	let config = render_example_config()
+		.replace(
+			"max_request_frame_bytes = 4194304",
+			"max_request_frame_bytes = 1024",
+		)
+		.replace(
+			"max_statement_bytes = 4194304",
+			"max_statement_bytes = 2048",
+		);
+	std::fs::write(&path, config).expect("write config");
+
+	let error = load_toron_bootstrap_config(&path).expect_err("statement cap > frame cap rejected");
+
+	assert!(
+		error.to_string().contains(
+			"sql.max_statement_bytes must be less than or equal to sql.max_request_frame_bytes"
+		),
+		"{error}"
+	);
 }
 
 #[test]

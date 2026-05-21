@@ -1,4 +1,5 @@
 use std::io::{Error, ErrorKind};
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -6,6 +7,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::distributed::identity::QueryId;
 use crate::wire::{decode_payload, encode_payload};
+
+pub const SQL_REQUEST_FRAME_BYTES_HARD_CEILING: u32 = 64 * 1024 * 1024;
+pub const SQL_STATEMENT_BYTES_HARD_CEILING: u32 = 64 * 1024 * 1024;
+pub const DEFAULT_SQL_REQUEST_FRAME_BYTES: u32 = 4 * 1024 * 1024;
+pub const DEFAULT_SQL_STATEMENT_BYTES: u32 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqlFrame {
@@ -93,6 +99,12 @@ pub enum SqlErrorCode {
 	Internal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestFrameTooLarge {
+	pub declared_len: u32,
+	pub max_len: NonZeroU32,
+}
+
 pub async fn write_frame<W>(writer: &mut W, frame: &SqlFrame) -> std::io::Result<()>
 where
 	W: AsyncWrite + Unpin,
@@ -115,4 +127,28 @@ where
 	let mut payload = vec![0u8; len];
 	reader.read_exact(&mut payload).await?;
 	decode_payload(&payload).map_err(|error| Error::new(ErrorKind::InvalidData, error))
+}
+
+pub async fn read_request_frame_bounded<R>(
+	reader: &mut R,
+	max_request_frame_bytes: NonZeroU32,
+) -> std::io::Result<Result<SqlFrame, RequestFrameTooLarge>>
+where
+	R: AsyncRead + Unpin,
+{
+	let mut len_buf = [0u8; 4];
+	reader.read_exact(&mut len_buf).await?;
+	let declared_len = u32::from_le_bytes(len_buf);
+	if declared_len > max_request_frame_bytes.get() {
+		return Ok(Err(RequestFrameTooLarge {
+			declared_len,
+			max_len: max_request_frame_bytes,
+		}));
+	}
+	let len = usize::try_from(declared_len).expect("u32 fits usize");
+	let mut payload = vec![0u8; len];
+	reader.read_exact(&mut payload).await?;
+	decode_payload(&payload)
+		.map(Ok)
+		.map_err(|error| Error::new(ErrorKind::InvalidData, error))
 }

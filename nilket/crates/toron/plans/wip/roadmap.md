@@ -4418,7 +4418,7 @@ along with the forward-sequence rewrite.
   `plans/impl/057_sql_connection_admission.md`. Parser/front-end throttling
   (deferred from 056) stays the named, evidence-gated follow-up.
 - **ADR 058 — Bounded SQL Request Ingress.**
-  Promoted. Closes an acute, in-hand frontend defect:
+  Promoted + implemented. Closes an acute, in-hand frontend defect:
   `sql_wire.rs::read_frame` does `vec![0u8; len]` from an untrusted `u32` length **before
   decode**, and `handle_sql_connection` runs `SqlPlanner::plan` **before**
   the statement timeout / admission. 058 adds two **default-on safety
@@ -4448,7 +4448,10 @@ along with the forward-sequence rewrite.
   evidence-gated.
   **Single-decision posture; Toron-ring only; node-local.** Placement:
   Exterior Substrate → Toron home. Migration:
-  `plans/impl/058_bounded_sql_request_ingress.md`.
+  `plans/impl/058_bounded_sql_request_ingress.md`; implementation evidence
+  is recorded in
+  `plans/impl/058_bounded_sql_request_ingress_evidence.md`, including a
+  passing full `cargo test -p toron -- --test-threads=6` run.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical

@@ -13,6 +13,7 @@ use rcgen::{
 	BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
 	KeyUsagePurpose,
 };
+use tokio::io::AsyncWriteExt;
 use toron::config::{
 	CoordinatorConfig, DescriptorBootstrap, DescriptorBootstrapEntry, ObservabilityConfig,
 	SqlConfig, SqlTransport, TlsConfig, ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig,
@@ -28,8 +29,8 @@ use toron::network::tls::{
 };
 use toron::quic::QuicEndpoint;
 use toron::sql_wire::{
-	Complete, SqlError, SqlErrorCode, SqlFrame, SqlMessage, read_frame as read_sql_frame,
-	write_frame as write_sql_frame,
+	CancelRequest, Complete, SqlError, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion,
+	read_frame as read_sql_frame, write_frame as write_sql_frame,
 };
 use toron::storage::TenantId as ToronTenantId;
 use wendelon::client::{ClusterPeerWire, ClusterStatusWire, StaticTopologySource};
@@ -366,6 +367,163 @@ async fn remote_sql_tenant_connection_cap_closes_excess_after_san_resolution() {
 	.await;
 
 	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_declared_request_length_rejected_before_allocation_or_decode() {
+	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let sql = config.sql.as_mut().expect("sql config");
+	sql.max_request_frame_bytes = NonZeroU32::new(8).expect("request cap");
+	sql.max_statement_bytes = NonZeroU32::new(8).expect("statement cap");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = QuicEndpoint::client().expect("oversized sql client");
+	let mut stream = client.connect_stream(endpoint).await.expect("connect sql");
+
+	stream
+		.write_all(&9_u32.to_le_bytes())
+		.await
+		.expect("write oversized declared length");
+	stream.finish().await.expect("finish oversized request");
+	let read = tokio::time::timeout(Duration::from_secs(1), read_sql_frame(&mut stream))
+		.await
+		.expect("transport should close without waiting for payload");
+
+	assert!(
+		read.is_err(),
+		"oversized request-frame rejection must not emit a SQL error frame"
+	);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_decoded_execute_statement_returns_resource_exhausted_without_planning() {
+	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let sql = config.sql.as_mut().expect("sql config");
+	sql.max_request_frame_bytes = NonZeroU32::new(4096).expect("request cap");
+	sql.max_statement_bytes = NonZeroU32::new(8).expect("statement cap");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	let error = execute_sql(endpoint, "not valid sql and over the cap")
+		.await
+		.expect_err("oversized statement rejected");
+
+	assert_eq!(error.code, SqlErrorCode::ResourceExhausted);
+	assert!(error.message.contains("configured byte limit"), "{error:?}");
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_below_request_frame_cap_is_not_statement_capped() {
+	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let sql = config.sql.as_mut().expect("sql config");
+	sql.max_request_frame_bytes = NonZeroU32::new(4096).expect("request cap");
+	sql.max_statement_bytes = NonZeroU32::new(1).expect("statement cap");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = QuicEndpoint::client().expect("cancel sql client");
+	let mut stream = client.connect_stream(endpoint).await.expect("connect sql");
+	let query_id = QueryId::new();
+	write_sql_frame(
+		&mut stream,
+		&SqlFrame {
+			protocol_version: SqlProtocolVersion::Current,
+			query_id,
+			message: SqlMessage::Cancel(CancelRequest { query_id }),
+		},
+	)
+	.await
+	.expect("write cancel");
+	stream.finish().await.expect("finish cancel request");
+
+	let frame = read_sql_frame(&mut stream)
+		.await
+		.expect("read cancel response");
+	match frame.message {
+		SqlMessage::Error(error) => {
+			assert_eq!(error.code, SqlErrorCode::CancellationUnsupported);
+		}
+		other => panic!("unexpected cancel response: {other:?}"),
+	}
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_result_batches_not_constrained_by_inbound_request_cap() {
+	let fixture = LiveWendelonFixture::start(51).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	let rows = (0..64)
+		.map(|index| {
+			(
+				i64::from(index),
+				Some(index),
+				Some("region"),
+				BASE_TS + i64::from(index) * 60 * 1000,
+			)
+		})
+		.collect::<Vec<_>>();
+	write_rows(
+		&fixture.client,
+		LIVE_TENANT,
+		&descriptor,
+		batch_from_rows(&rows),
+	)
+	.await;
+
+	let mut config = toron_config_with_descriptor(descriptor, true);
+	let sql = config.sql.as_mut().expect("sql config");
+	sql.max_request_frame_bytes = NonZeroU32::new(512).expect("request cap");
+	sql.max_statement_bytes = NonZeroU32::new(512).expect("statement cap");
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = QuicEndpoint::client().expect("sql client");
+	let mut stream = client.connect_stream(endpoint).await.expect("connect sql");
+	let query_id = QueryId::new();
+	write_sql_frame(
+		&mut stream,
+		&SqlFrame::execute(
+			query_id,
+			"SELECT id, amount, region, ts FROM storage_execution".to_string(),
+			None,
+		),
+	)
+	.await
+	.expect("write sql request");
+	stream.finish().await.expect("finish sql request");
+
+	let mut saw_result_batch_larger_than_cap = false;
+	loop {
+		let frame = read_sql_frame(&mut stream)
+			.await
+			.expect("read sql response");
+		match frame.message {
+			SqlMessage::ResultBatch(batch) => {
+				saw_result_batch_larger_than_cap |= batch.arrow_ipc_bytes.len() > 512;
+			}
+			SqlMessage::Complete(complete) => {
+				assert_eq!(complete.row_count, 64);
+				break;
+			}
+			SqlMessage::Error(error) => panic!("unexpected SQL error: {error:?}"),
+			other => panic!("unexpected SQL response frame: {other:?}"),
+		}
+	}
+
+	assert!(
+		saw_result_batch_larger_than_cap,
+		"outbound result batches must not be constrained by inbound request cap"
+	);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -759,6 +917,12 @@ fn toron_config_with_descriptor_for_tenant(
 			listener_bind: "127.0.0.1:0".parse().expect("sql bind"),
 			statement_timeout: Duration::from_secs(3),
 			max_concurrent_connections: None,
+			max_request_frame_bytes: NonZeroU32::new(
+				toron::sql_wire::DEFAULT_SQL_REQUEST_FRAME_BYTES,
+			)
+			.expect("default SQL request cap"),
+			max_statement_bytes: NonZeroU32::new(toron::sql_wire::DEFAULT_SQL_STATEMENT_BYTES)
+				.expect("default SQL statement cap"),
 		}),
 		coordinator: CoordinatorConfig {
 			include_self_worker,

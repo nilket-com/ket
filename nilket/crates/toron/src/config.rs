@@ -20,6 +20,10 @@ use crate::ir::TableId;
 use crate::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, reject_env_interpolation, validate_cluster_domain,
 };
+use crate::sql_wire::{
+	DEFAULT_SQL_REQUEST_FRAME_BYTES, DEFAULT_SQL_STATEMENT_BYTES,
+	SQL_REQUEST_FRAME_BYTES_HARD_CEILING, SQL_STATEMENT_BYTES_HARD_CEILING,
+};
 use crate::storage::TenantId;
 
 pub const NON_LOOPBACK_BIND_DIAGNOSTIC: &str =
@@ -107,6 +111,8 @@ transport = "quic"
 listener_bind = "127.0.0.1:7742"
 statement_timeout_seconds = 60
 max_concurrent_connections = 0
+max_request_frame_bytes = 4194304
+max_statement_bytes = 4194304
 
 [coordinator]
 include_self_worker = true
@@ -212,6 +218,8 @@ pub struct SqlConfig {
 	pub listener_bind: SocketAddr,
 	pub statement_timeout: Duration,
 	pub max_concurrent_connections: Option<NonZeroU32>,
+	pub max_request_frame_bytes: NonZeroU32,
+	pub max_statement_bytes: NonZeroU32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +419,8 @@ struct RawSqlConfig {
 	#[serde(default = "default_sql_statement_timeout_seconds")]
 	statement_timeout_seconds: u64,
 	max_concurrent_connections: Option<u32>,
+	max_request_frame_bytes: Option<u32>,
+	max_statement_bytes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -908,12 +918,47 @@ fn normalize_sql_config(
 			"sql.statement_timeout_seconds must be greater than 0",
 		));
 	}
+	let max_request_frame_bytes = normalize_sql_nonzero_u32(
+		raw.max_request_frame_bytes,
+		DEFAULT_SQL_REQUEST_FRAME_BYTES,
+		SQL_REQUEST_FRAME_BYTES_HARD_CEILING,
+		"sql.max_request_frame_bytes",
+	)?;
+	let max_statement_bytes = normalize_sql_nonzero_u32(
+		raw.max_statement_bytes,
+		DEFAULT_SQL_STATEMENT_BYTES,
+		SQL_STATEMENT_BYTES_HARD_CEILING,
+		"sql.max_statement_bytes",
+	)?;
+	if max_statement_bytes.get() > max_request_frame_bytes.get() {
+		return Err(invalid(
+			"sql.max_statement_bytes must be less than or equal to sql.max_request_frame_bytes",
+		));
+	}
 	Ok(SqlConfig {
 		transport,
 		listener_bind,
 		statement_timeout: Duration::from_secs(raw.statement_timeout_seconds),
 		max_concurrent_connections: raw.max_concurrent_connections.and_then(NonZeroU32::new),
+		max_request_frame_bytes,
+		max_statement_bytes,
 	})
+}
+
+fn normalize_sql_nonzero_u32(
+	raw: Option<u32>,
+	default: u32,
+	hard_ceiling: u32,
+	name: &'static str,
+) -> Result<NonZeroU32, ToronConfigError> {
+	let value = raw.unwrap_or(default);
+	if value == 0 {
+		return Err(invalid(format!("{name} must be greater than 0")));
+	}
+	if value > hard_ceiling {
+		return Err(invalid(format!("{name} must be at most {hard_ceiling}")));
+	}
+	Ok(NonZeroU32::new(value).expect("validated nonzero SQL byte cap"))
 }
 
 fn normalize_wendelon_client_bind(raw: &str) -> Result<SocketAddr, ToronConfigError> {

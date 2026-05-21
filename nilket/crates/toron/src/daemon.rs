@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -46,7 +47,7 @@ use crate::server::{ToronWorker, memory::MemoryManager};
 use crate::sql_planner::SqlPlanner;
 use crate::sql_wire::{
 	Complete, ResultBatch, SqlError, SqlErrorCode, SqlFrame, SqlMessage,
-	read_frame as read_sql_frame, write_frame as write_sql_frame,
+	read_request_frame_bounded, write_frame as write_sql_frame,
 };
 use crate::storage::{
 	HlcBound, StorageScan, TenantId, WendelonStorageAdmin, WendelonStorageDeleteRows,
@@ -335,6 +336,8 @@ impl ToronDaemon {
 						.clone()
 						.expect("SQL limiter exists when SQL config exists"),
 					statement_timeout: sql_config.statement_timeout,
+					max_request_frame_bytes: sql_config.max_request_frame_bytes,
+					max_statement_bytes: sql_config.max_statement_bytes,
 				},
 			)));
 			Some(sql_endpoint)
@@ -597,6 +600,8 @@ struct SqlAcceptOptions {
 	tenant_source: SqlTenantSource,
 	connection_limiter: SqlConnectionLimiter,
 	statement_timeout: std::time::Duration,
+	max_request_frame_bytes: NonZeroU32,
+	max_statement_bytes: NonZeroU32,
 }
 
 async fn run_sql_accept_loop(
@@ -659,6 +664,9 @@ async fn run_sql_accept_loop(
 					};
 					let coordinator = Arc::clone(&coordinator);
 					let statement_timeout = options.statement_timeout;
+					let max_request_frame_bytes = options.max_request_frame_bytes;
+					let max_statement_bytes = options.max_statement_bytes;
+					let metrics = Arc::clone(&metrics);
 					connection_tasks.lock().await.spawn(async move {
 						let _connection_permits = (tier1_permit, tier2_permit);
 						match QuicEndpoint::accept_stream_on(&connection).await {
@@ -668,6 +676,9 @@ async fn run_sql_accept_loop(
 									stream,
 									tenant_id,
 									statement_timeout,
+									max_request_frame_bytes,
+									max_statement_bytes,
+									metrics,
 								).await {
 									tracing::warn!(error = %error, "sql connection error");
 								}
@@ -693,8 +704,23 @@ async fn handle_sql_connection(
 	mut stream: QuicStream,
 	tenant_id: TenantId,
 	statement_timeout: std::time::Duration,
+	max_request_frame_bytes: NonZeroU32,
+	max_statement_bytes: NonZeroU32,
+	metrics: Arc<MetricsRegistry>,
 ) -> Result<(), QueryError> {
-	let frame = read_sql_frame(&mut stream).await?;
+	let frame = match read_request_frame_bounded(&mut stream, max_request_frame_bytes).await? {
+		Ok(frame) => frame,
+		Err(error) => {
+			metrics.increment_reject(ListenerName::Sql, RejectReason::RequestFrameTooLarge);
+			tracing::warn!(
+				declared_len = error.declared_len,
+				max_len = error.max_len.get(),
+				"sql request frame too large"
+			);
+			let _ = stream.finish().await;
+			return Ok(());
+		}
+	};
 	if frame.protocol_version != crate::sql_wire::SqlProtocolVersion::Current {
 		return write_sql_error(
 			&mut stream,
@@ -707,6 +733,18 @@ async fn handle_sql_connection(
 
 	match frame.message {
 		SqlMessage::Execute(request) => {
+			if request.statement.len()
+				> usize::try_from(max_statement_bytes.get()).expect("u32 fits usize")
+			{
+				metrics.increment_reject(ListenerName::Sql, RejectReason::StatementTooLarge);
+				return write_sql_error(
+					&mut stream,
+					frame.query_id,
+					SqlErrorCode::ResourceExhausted,
+					"SQL statement exceeds configured byte limit",
+				)
+				.await;
+			}
 			let timeout_duration = request
 				.statement_timeout_seconds
 				.map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))

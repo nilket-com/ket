@@ -525,6 +525,8 @@ struct RejectCounters {
 	bind_unavailable: AtomicU64,
 	request_timeout: AtomicU64,
 	connection_limit: AtomicU64,
+	request_frame_too_large: AtomicU64,
+	statement_too_large: AtomicU64,
 }
 
 impl RejectCounters {
@@ -545,6 +547,8 @@ impl RejectCounters {
 			RejectReason::BindUnavailable => &self.bind_unavailable,
 			RejectReason::RequestTimeout => &self.request_timeout,
 			RejectReason::ConnectionLimit => &self.connection_limit,
+			RejectReason::RequestFrameTooLarge => &self.request_frame_too_large,
+			RejectReason::StatementTooLarge => &self.statement_too_large,
 		}
 	}
 }
@@ -587,10 +591,12 @@ pub enum RejectReason {
 	BindUnavailable,
 	RequestTimeout,
 	ConnectionLimit,
+	RequestFrameTooLarge,
+	StatementTooLarge,
 }
 
 impl RejectReason {
-	const ALL: [Self; 7] = [
+	const ALL: [Self; 9] = [
 		Self::MtlsHandshakeFailure,
 		Self::PeerUnknownCa,
 		Self::SanShapeRejected,
@@ -598,6 +604,8 @@ impl RejectReason {
 		Self::BindUnavailable,
 		Self::RequestTimeout,
 		Self::ConnectionLimit,
+		Self::RequestFrameTooLarge,
+		Self::StatementTooLarge,
 	];
 
 	fn as_str(self) -> &'static str {
@@ -609,6 +617,8 @@ impl RejectReason {
 			Self::BindUnavailable => "bind_unavailable",
 			Self::RequestTimeout => "request_timeout",
 			Self::ConnectionLimit => "connection_limit",
+			Self::RequestFrameTooLarge => "request_frame_too_large",
+			Self::StatementTooLarge => "statement_too_large",
 		}
 	}
 }

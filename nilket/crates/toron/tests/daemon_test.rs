@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -80,6 +81,10 @@ fn config_with_sql() -> ToronBootstrapConfig {
 		listener_bind: "127.0.0.1:0".parse().expect("sql bind"),
 		statement_timeout: Duration::from_secs(1),
 		max_concurrent_connections: None,
+		max_request_frame_bytes: NonZeroU32::new(toron::sql_wire::DEFAULT_SQL_REQUEST_FRAME_BYTES)
+			.expect("default SQL request cap"),
+		max_statement_bytes: NonZeroU32::new(toron::sql_wire::DEFAULT_SQL_STATEMENT_BYTES)
+			.expect("default SQL statement cap"),
 	});
 	config
 }
