@@ -4318,6 +4318,34 @@ along with the forward-sequence rewrite.
   evidence is recorded in
   `plans/impl/054_reactive_descriptor_invalidation_evidence.md`, including
   a passing full `cargo test -p toron -- --test-threads=6` run.
+- **ADR 055 — Bounded Fair Admission Queue.**
+  Promoted. The ADR 050 D7 / ADR 052 D3 hard-reject **reversal** (054 D17's
+  named handoff). When a tenant's owned memory/concurrency is full, a query
+  may wait in a **bounded per-tenant FIFO** and be granted later from owned
+  capacity or an **explicit node-local shared borrow pool**, in
+  **deterministic integer-weighted-deficit** order, FIFO within a tenant,
+  **non-preemptive**. **Inert by default:** with no `[admission]` config it
+  is byte-for-byte ADR 050/052 hard reject — the reversal is opt-in. One
+  synchronous `TenantAdmissionController` lock (never held across an await),
+  inline grant pump (no background actor). Reuses `ResourceExhausted`; no
+  SQL wire / Wendelon change; ADR 053/054 descriptor behavior untouched
+  (a 054 evolved-retry stays inside one admission reservation). Final
+  D-set: **18 decisions, 16 architecture guards + 3 convention guards, 16
+  required fixtures + 1 optional**.
+
+  **Mechanism adjudication (iter-3):** borrow-first atomics + per-tenant
+  semaphores **starve** queued waiters (fresh arrivals grab freed capacity;
+  nothing wakes the oldest waiter), the instantaneous fairness ratio is a
+  TOCTOU race, and independent atomics cannot make an atomic multi-resource
+  grant — resolved to a queue-first inline pump under one controller lock.
+  Scheduler core converged **3-of-3** (Gemini conceded the unified
+  node-local scheduler, node-local slack, and integer fairness in iter-5).
+  **The split:** rate admission → **ADR 056**, connection caps → **ADR
+  057** (2-of-3 split; cadence rule over Gemini's in-ADR connection-cap
+  minority).
+  **Single-plan posture; Toron-ring only; node-local.** Placement:
+  Exterior Substrate → Toron home. Migration:
+  `plans/impl/055_bounded_fair_admission_queue.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4402,7 +4430,70 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 054 promoted; ADR 055 candidates
+### ADR 055 promoted; ADR 056/057 candidates
+
+ADR 055 selected and promoted **Bounded Fair Admission Queue** — the ADR
+050 D7 / ADR 052 D3 hard-reject *reversal*, as ADR 054 D17 named it. When a
+tenant's owned memory/concurrency is full, a query may wait in a bounded
+per-tenant FIFO and be granted later from owned capacity or an explicit
+node-local shared borrow pool, in deterministic integer-weighted-deficit
+order, FIFO within a tenant, non-preemptive. **Inert by default:** with no
+`[admission]` config it is byte-for-byte ADR 050/052 hard reject. Final
+D-set: **18 decisions, 16 architecture guards + 3 convention guards, 16
+required fixtures + 1 optional**.
+
+**Pure Toron-ring substrate; node-local single daemon; reuses 050/052/053/
+054; zero Wendelon server change, zero SQL wire change.**
+
+**Key decisions / invariants:**
+
+- **The split (3-of-3 on the core):** the scheduler core converged 3-of-3
+  in iter-5 — Gemini conceded a unified node-local scheduler over isolated
+  per-tenant semaphores, node-local slack (not cluster), and integer
+  fairness. The two adjacent governance turns are split off and named:
+  rate → ADR 056, connection caps → ADR 057.
+- **Correctness adjudication (iter-3):** borrow-first atomics + per-tenant
+  semaphores *starve* queued waiters (fresh arrivals grab freed capacity
+  via `fetch_sub`; nothing wakes the oldest waiter); the instantaneous
+  fairness ratio is a TOCTOU race; independent atomics can't make an atomic
+  multi-resource grant. Resolution: queue-first inline pump under one
+  synchronous controller lock, never held across an await.
+- **Explicit pool, no steal (D9):** borrowing draws only from a configured
+  node-local shared pool bounded by per-tenant caps; never another tenant's
+  owned budget — keeps 050/052 budgets a real guarantee.
+- **Default-disabled (D5):** the reversal is opt-in; this is what lets it
+  ship without fleet-calibrated weights (the resolved iter-0 evidence-first
+  concern — calibration revisited once ADR 056 rate telemetry lands).
+- `crates/nilket` runtime-free; `toron_fixture_worker.rs` unchanged;
+  brand-clean / no-`*V1`. Placement: Exterior Substrate → Toron home.
+
+The migration is materialized in
+`plans/impl/055_bounded_fair_admission_queue.md`.
+
+**Next committed candidates:**
+
+- **Per-Tenant Query-Rate Admission (token bucket) (LEAD, committed)** — the
+  orthogonal hard-reject dimension 050/052 are blind to: a flood of cheap,
+  fast queries saturates the coordinator without tripping memory/concurrency
+  caps. Node-local token bucket at `admit_query`, `AdmissionResource::Rate`
+  on the existing bounded rejection family, reuse `ResourceExhausted`. Its
+  per-tenant rate telemetry also informs ADR 055 weight/borrow tuning
+  (054-style evidence handoff). Committed in the 055 split.
+- **Per-Tenant Connection Caps (client listener edge) (committed → ADR
+  057)** — client-edge (QUIC / SQL TLS) concurrent-connection cap; owns the
+  pre-auth tenant-identity question (052 D12: pre-auth / failed-auth
+  connections lack a stable tenant). Strictly client-facing — never the
+  worker `ToronTransport` (shuffle-deadlock risk).
+- **Descriptor refresh hardening** (proactive TTL / external-DROP push, *if*
+  measured staleness without a `DescriptorEvolved` signal appears),
+  **OTLP traces export**, **audit subsystem** (deferred since ADR 045 D7),
+  **SQL surface widening** (CTAS `IF NOT EXISTS`, `UPDATE WHERE`,
+  `INSERT/CTAS/DELETE … RETURNING`), **live cert rotation / CRL / OCSP**,
+  **token-based tenant claims (JWT/OIDC/SPIFFE)**, gRPC / Arrow Flight /
+  Postgres frontends, strong cross-worker cancellation, prepared statements
+  — all carried forward.
+
+### ADR 054 promoted; ADR 055 candidates (HISTORICAL)
 
 ADR 054 selected and promoted **Reactive Descriptor Invalidation** —
 the symmetric completion of descriptor liveness. ADR 053 healed a
