@@ -4593,6 +4593,37 @@ along with the forward-sequence rewrite.
   `plans/impl/062_primary_key_ddl.md`; implementation evidence is recorded in
   `plans/impl/062_primary_key_ddl_evidence.md`, including passing full
   `cargo test -p toron -- --test-threads=6`.
+- **ADR 063 — PK-Table `UPDATE … WHERE` via Full-Row Upsert.**
+  Promoted. The direct consumer ADR 062 was built to unlock — completing the
+  core DML suite. `UPDATE <table> SET <col> = <expr>[, …] WHERE <pred>` on
+  **PK tables**: the binder rewrites it as a **full-row projection over the
+  matched rows** (assigned columns ← `SET` exprs; unassigned + the **PK** pass
+  through), the coordinator writes those rows via the existing `StorageWrite`,
+  and Wendelon's **per-row PK supersession** provides replacement visibility.
+  Reuses the INSERT-SELECT write-with-source path + Filter/Projection/scalar-
+  exprs — **no new storage substrate** (the payoff of PK-first). **PK-tables
+  only** (via `binding.row_identity`; append-only/no-PK rejected — "UPDATE
+  requires a PRIMARY KEY table"); **SET can't modify the PK** (guarantees
+  same-PK supersession, no collision, no two-op); **simultaneous assignment**
+  (all RHS read the original matched row — `SET a=b,b=a` swaps); **per-row
+  atomic, not transaction**; INSERT-SELECT coercion reuse (null-into-non-null
+  fails); point-read reuse for PK-equality; ADR 054 descriptor-evolved
+  invalidate-no-retry; coordinator-owned `StorageWrite` (non-fragmentable,
+  worker-rejected); `Complete { row_count }` only, no `RETURNING`. Final
+  D-set: **17 decisions, 23 architecture + 3 convention + meta guards, 18
+  required fixtures**. Council: **3-of-3 (Claude, Codex, Gemini)** — the only
+  fork (no-WHERE) resolved to **WHERE-required, documented as deliberately
+  stricter than the existing no-WHERE DELETE** (a Claude finding; `lower_delete`
+  allows no-WHERE). **Prior-guard reconciliation:**
+  `adr062_update_surface_remains_absent` is **retargeted** (it goes false once
+  063 adds `Statement::Update`/`LogicalPlan::Update`/`ExecutionPlan::Update`),
+  preserving the narrow intent (still no RETURNING/no-WHERE/PK-mutation/append-
+  only/Wendelon-change/worker-write-back); meta scoped `…_except_retarget`.
+  **Parser pinned to sqlparser 0.54.0** — a 0.62 upgrade was tested and breaks
+  the build (broad AST drift), so it's a separate migration ADR, guarded.
+  **Toron SQL only; no Wendelon wire/storage/descriptor/worker change; no new
+  storage primitive; no transaction model.** Placement: Exterior Composition →
+  Toron home. Migration: `plans/impl/063_pk_table_update.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4677,7 +4708,65 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 062 implemented; ADR 063 candidates
+### ADR 063 promoted; ADR 064 candidates
+
+ADR 063 selected and promoted **PK-Table `UPDATE … WHERE` via Full-Row
+Upsert** — the direct consumer ADR 062 was built to unlock, **completing the
+core DML suite** (SELECT / INSERT / DELETE / UPDATE / CTAS) for primary-key
+tables. UPDATE on a PK table is a coordinator-owned full-row rewrite: the
+binder rewrites it as a **full-row projection over the WHERE-matched rows**
+(assigned columns ← `SET` exprs; unassigned + PK pass through), and the
+coordinator writes those rows via the existing `StorageWrite` → Wendelon
+per-row PK supersession. Reuses the INSERT-SELECT write-with-source path; **no
+new storage substrate**. Final D-set: **17 decisions, 23 architecture + 3
+convention + meta guards, 18 required fixtures**.
+
+**Toron SQL only; reuses 062's PK substrate + the INSERT-SELECT write path;
+zero new storage primitive / Wendelon change / worker write-back / transaction
+model; no sqlparser upgrade.**
+
+**Key decisions / invariants:**
+
+- **Promoted 3-of-3 (Claude, Codex, Gemini).** The only fork — no-WHERE
+  UPDATE — resolved to **WHERE-required**, documented as **deliberately
+  stricter than the existing no-WHERE DELETE** (a Claude finding: `lower_delete`
+  allows no-WHERE; UPDATE doesn't, yet — a symmetry-restoration follow-up).
+- **PK-tables only** (via `binding.row_identity`; append-only/no-PK rejected);
+  **SET can't modify the PK** (guarantees same-PK supersession — no collision,
+  no two-op delete+insert, the atomicity boundary 062 set up).
+- **Simultaneous assignment** (all RHS read the original matched row —
+  `SET a=b,b=a` swaps; free from the single SET-as-projection) and **per-row
+  atomic, not transaction** (no overclaim).
+- **Reuse, not reinvention:** INSERT-SELECT coercion lattice (null-into-non-
+  null fails), point-read reuse for PK-equality, ADR 054 descriptor-evolved
+  invalidate-no-retry, coordinator-owned `StorageWrite` (non-fragmentable,
+  worker-rejected), `Complete { row_count }` only.
+- **Prior-guard reconciliation:** `adr062_update_surface_remains_absent` is
+  **retargeted** (goes false once 063 adds the UPDATE surface), narrow intent
+  preserved; meta scoped `…_except_retarget`. (Codex caught this retarget
+  after the first dual pass had treated it as unnecessary.)
+- **Parser pinned to sqlparser 0.54.0** — a 0.62 upgrade was tested and breaks
+  the build (broad AST drift); a separate migration ADR, guarded.
+- `crates/nilket` runtime-free; fixture worker unchanged; brand-clean /
+  no-`*V1`. Placement: Exterior Composition → Toron home.
+
+The migration is materialized in `plans/impl/063_pk_table_update.md`.
+
+**ADR 064 candidates:**
+
+- **Mutation `RETURNING`** (the lead — now the core DML suite is complete):
+  cross-cutting INSERT/UPDATE/DELETE/CTAS result-shape contract (move the SQL
+  surface from `Complete { row_count }` to returning affected rows). Its own
+  ADR.
+- **Audit subsystem** (045 D7) — parallel compliance track (shared
+  `observability-audit` crate). The most-deferred substantive item.
+- **No-WHERE UPDATE** (restore DELETE symmetry — small follow-up to 063);
+  **composite-PK / DDL type-surface widening / `ALTER TABLE` / standalone
+  `UNIQUE`**; **sqlparser-0.62 migration** (its own ADR, 063 found it breaks
+  the build); **typed `QUERY_CANCELLED` mapping** (060 follow-up); parser
+  throttle, OTLP traces, auth claims, frontend protocols — all carried.
+
+### ADR 062 implemented; ADR 063 candidates (HISTORICAL)
 
 ADR 062 implemented **Primary-Key DDL for Toron-Created Tables** —
 the table-identity-policy Phase 0 that ADR 061 carried before `UPDATE`.
