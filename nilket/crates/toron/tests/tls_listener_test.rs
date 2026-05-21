@@ -492,6 +492,7 @@ fn tls_config(
 			memory_budget_bytes: 1024 * 1024,
 		},
 		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(1024 * 1024)),
+		admission: None,
 		storage: ToronStorageConfig {
 			wendelon: ToronWendelonStorageConfig {
 				bootstrap_peers: vec![ToronWendelonBootstrapPeer {

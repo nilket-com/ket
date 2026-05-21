@@ -34,11 +34,12 @@ bounded per-tenant FIFO** and be granted later from its **owned capacity
 or an explicit, node-local, configured shared borrow pool**, in
 **deterministic weighted-deficit order** across tenants. Borrowing is
 **non-preemptive** (in-flight work is never killed) and **never consumes
-another tenant's owned budget**. With no `[admission]` config and zero
-per-tenant queue/borrow fields, behavior is **byte-for-byte ADR 050/052
-hard reject** — the reversal is inert until an operator turns it on.
-Query-rate token buckets (ADR 056) and listener connection caps (ADR 057)
-are **out of scope**, named follow-ups.
+another tenant's owned budget**. With no `[admission]` config, behavior
+is **byte-for-byte ADR 050/052 hard reject**. Per-tenant queue/borrow
+fields default to zero, so an explicit `[admission]` section still needs a
+tenant-level opt-in before a tenant can queue or borrow. Query-rate token
+buckets (ADR 056) and listener connection caps (ADR 057) are **out of
+scope**, named follow-ups.
 
 ## Motivation
 
@@ -78,9 +79,10 @@ deadline, grant waiter) — **no** SQL string, logical/bound plan,
 descriptor, storage handle, memory reservation, or concurrency
 reservation.
 
-**D5: Default = hard reject.** Omitted `[admission]` config and zero
-per-tenant queue/borrow fields preserve ADR 050/052 behavior exactly.
-Queueing and borrowing are opt-in.
+**D5: Default = hard reject.** Omitted `[admission]` config preserves ADR
+050/052 behavior exactly. Per-tenant queue/borrow fields default to zero,
+so even an explicit `[admission]` section requires tenant-level opt-in
+before a tenant can queue or borrow; queueing and borrowing are opt-in.
 
 **D6: One admission controller.** `TenantAdmissionController` owns a
 **single synchronous state lock** over owned usage, borrowed usage, the
@@ -100,8 +102,8 @@ requests.
 **D8: Contended path.** If owned capacity can't grant now but the request
 *could* fit later (owned + borrow caps), enqueue in the tenant FIFO.
 Reject immediately with `ResourceExhausted` if queueing is disabled, the
-queue is full, the deadline is already unsatisfiable, or the request can
-**never** fit within owned + max-borrow.
+queue is full, the queue wait budget is zero, or the request can **never**
+fit within owned + max-borrow.
 
 **D9: Explicit shared pool.** Borrowing draws **only** from configured
 node-local `shared_memory_bytes` / `shared_concurrent_queries`, bounded by
@@ -121,13 +123,14 @@ cleanup. "Queue-first" is **not** "wait-first": a contended request that
 can be served now is granted in the same call that enqueues it. No
 scheduler task, poll loop, or refill thread.
 
-**D12: Timeout / cancellation.** Queue wait is bounded by global +
-per-tenant queue depth and by `max_queue_wait_ms`. Timeout and
-cancellation remove the waiter, **leak no grant or reservation**, and
-**pump** (a freed slot may admit others). Waiters have a stable
-controller-local identity so cleanup removes exactly the queued entry that
-timed out or was canceled; the queued wait handle owns that cleanup so task
-cancellation cannot strand a waiter.
+**D12: Timeout / cancellation.** Backlog is bounded by the global
+`[admission].max_queued_queries` and the tenant budget's
+`max_queued_queries`; individual waits are bounded by
+`max_queue_wait_ms`. Timeout and cancellation remove the waiter, **leak no
+grant or reservation**, and **pump** (a freed slot may admit others).
+Waiters have a stable controller-local identity so cleanup removes exactly
+the queued entry that timed out or was canceled; the queued wait handle
+owns that cleanup so task cancellation cannot strand a waiter.
 
 **D13: No preemption.** In-flight work — including borrowed work — is never
 killed or revoked to restore fairness. Fairness affects **future grants

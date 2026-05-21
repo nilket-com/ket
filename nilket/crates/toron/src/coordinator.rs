@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
@@ -9,9 +10,9 @@ mod write;
 use crate::binder::{PlannerConfig, bind};
 use crate::catalog::{Catalog, InvalidatedDescriptor};
 use crate::distributed::budget::{
-	AdmissionResource, BudgetRejection, QueryBudget, TaskBudget, TenantAdmissionRejectionCounters,
-	TenantBudgetPolicy, TenantConcurrencyAccountant, TenantConcurrencyRejection,
-	TenantConcurrencyReservation, TenantMemoryAccountant, TenantMemoryReservation,
+	AdmissionAttempt, AdmissionPolicy, AdmissionReservation, AdmissionResource, BudgetRejection,
+	QueryBudget, TaskBudget, TenantAdmissionController, TenantAdmissionRejection,
+	TenantAdmissionRejectionCounters, TenantBudgetPolicy, TenantConcurrencyRejection,
 };
 use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
@@ -48,8 +49,8 @@ where
 	config: PlannerConfig,
 	query_budget: QueryBudget,
 	tenant_budgets: TenantBudgetPolicy,
-	tenant_memory: TenantMemoryAccountant,
-	tenant_concurrency: TenantConcurrencyAccountant,
+	admission_policy: Option<AdmissionPolicy>,
+	tenant_admission: TenantAdmissionController,
 	admission_rejections: TenantAdmissionRejectionCounters,
 	context: ExecutionContext,
 	writer: Arc<dyn StorageWrite>,
@@ -233,8 +234,8 @@ where
 			transport,
 			config,
 			query_budget,
-			tenant_memory: TenantMemoryAccountant::new(tenant_budgets.clone()),
-			tenant_concurrency: TenantConcurrencyAccountant::new(tenant_budgets.clone()),
+			admission_policy: None,
+			tenant_admission: TenantAdmissionController::new(tenant_budgets.clone(), None),
 			admission_rejections: TenantAdmissionRejectionCounters::new(&tenant_budgets),
 			tenant_budgets,
 			context,
@@ -245,27 +246,30 @@ where
 	}
 
 	pub fn with_tenant_budget_policy(mut self, tenant_budgets: TenantBudgetPolicy) -> Self {
-		self.tenant_memory = TenantMemoryAccountant::new(tenant_budgets.clone());
-		self.tenant_concurrency = TenantConcurrencyAccountant::new(tenant_budgets.clone());
+		self.tenant_admission =
+			TenantAdmissionController::new(tenant_budgets.clone(), self.admission_policy);
 		self.admission_rejections = TenantAdmissionRejectionCounters::new(&tenant_budgets);
 		self.tenant_budgets = tenant_budgets;
 		self
 	}
 
+	pub fn with_admission_policy(mut self, admission: Option<AdmissionPolicy>) -> Self {
+		self.admission_policy = admission;
+		self.tenant_admission =
+			TenantAdmissionController::new(self.tenant_budgets.clone(), admission);
+		self
+	}
+
 	pub fn tenant_memory_used(&self, tenant_id: TenantId) -> crate::distributed::budget::ByteCount {
-		self.tenant_memory.used(tenant_id)
+		self.tenant_admission.used_memory(tenant_id)
 	}
 
 	pub fn tenant_concurrency_active(&self, tenant_id: TenantId) -> u32 {
-		self.tenant_concurrency.active(tenant_id)
+		self.tenant_admission.active_concurrency(tenant_id)
 	}
 
-	pub fn tenant_memory_accountant(&self) -> TenantMemoryAccountant {
-		self.tenant_memory.clone()
-	}
-
-	pub fn tenant_concurrency_accountant(&self) -> TenantConcurrencyAccountant {
-		self.tenant_concurrency.clone()
+	pub fn tenant_admission_controller(&self) -> TenantAdmissionController {
+		self.tenant_admission.clone()
 	}
 
 	pub fn admission_rejection_counters(&self) -> TenantAdmissionRejectionCounters {
@@ -282,7 +286,7 @@ where
 		plan: &LogicalPlan,
 		context: ExecutionContext,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let admitted = self.admit_query(&context)?;
+		let admitted = self.admit_query(&context).await?;
 		let query_budget = admitted.query_budget;
 		let result = self
 			.execute_query_with_admission(plan, context, query_budget)
@@ -387,31 +391,85 @@ where
 		}
 	}
 
-	fn admit_query(&self, context: &ExecutionContext) -> Result<AdmittedQuery, QueryError> {
+	async fn admit_query(&self, context: &ExecutionContext) -> Result<AdmittedQuery, QueryError> {
 		let query_budget = self
 			.tenant_budgets
 			.query_budget_for_base(context.tenant_id, self.query_budget);
-		let concurrency_reservation = self
-			.tenant_concurrency
-			.try_reserve(context.tenant_id)
-			.map_err(|rejection| {
-				self.admission_rejections
-					.increment(context.tenant_id, AdmissionResource::Concurrency);
-				concurrency_rejection_query_error(rejection)
-			})?;
-		let reservation = self
-			.tenant_memory
-			.try_reserve(context.tenant_id, query_budget.memory_per_task)
-			.map_err(|rejection| {
-				self.admission_rejections
-					.increment(context.tenant_id, AdmissionResource::Memory);
-				budget_rejection_query_error(rejection)
-			})?;
+		let reservation = match self
+			.tenant_admission
+			.try_admit(context.tenant_id, query_budget.memory_per_task)
+		{
+			AdmissionAttempt::Granted(reservation) => reservation,
+			AdmissionAttempt::Queued(mut queued) => {
+				let wait = self
+					.admission_policy
+					.map(|policy| Duration::from_millis(u64::from(policy.max_queue_wait_ms.get())))
+					.unwrap_or(Duration::ZERO);
+				match tokio::time::timeout(wait, queued.recv()).await {
+					Ok(Ok(reservation)) => reservation,
+					Ok(Err(rejection)) => {
+						return Err(self.admission_rejection_query_error(rejection));
+					}
+					Err(_) => {
+						queued.cancel_due_to_timeout();
+						return Err(self.admission_rejection_query_error(
+							TenantAdmissionRejection::QueueTimeout {
+								tenant_id: context.tenant_id,
+							},
+						));
+					}
+				}
+			}
+			AdmissionAttempt::Rejected(rejection) => {
+				return Err(self.admission_rejection_query_error(rejection));
+			}
+		};
 		Ok(AdmittedQuery {
 			query_budget,
-			_concurrency_reservation: concurrency_reservation,
 			_reservation: reservation,
 		})
+	}
+
+	fn admission_rejection_query_error(&self, rejection: TenantAdmissionRejection) -> QueryError {
+		match rejection {
+			TenantAdmissionRejection::Memory {
+				tenant_id,
+				rejection,
+			} => {
+				self.admission_rejections
+					.increment(tenant_id, AdmissionResource::Memory);
+				budget_rejection_query_error(rejection)
+			}
+			TenantAdmissionRejection::Concurrency(rejection) => {
+				self.admission_rejections
+					.increment(rejection.tenant_id, AdmissionResource::Concurrency);
+				concurrency_rejection_query_error(rejection)
+			}
+			TenantAdmissionRejection::QueueDisabled { tenant_id } => {
+				resource_exhausted_query_error(format!(
+					"tenant admission queue disabled for tenant {}",
+					tenant_id.0
+				))
+			}
+			TenantAdmissionRejection::QueueFull { tenant_id } => resource_exhausted_query_error(
+				format!("tenant admission queue full for tenant {}", tenant_id.0),
+			),
+			TenantAdmissionRejection::QueueTimeout { tenant_id } => resource_exhausted_query_error(
+				format!("tenant admission queue timeout for tenant {}", tenant_id.0),
+			),
+			TenantAdmissionRejection::RequestTooLarge { tenant_id } => {
+				resource_exhausted_query_error(format!(
+					"tenant admission request cannot fit owned plus borrowed capacity for tenant {}",
+					tenant_id.0
+				))
+			}
+			TenantAdmissionRejection::GrantCanceled { tenant_id } => {
+				resource_exhausted_query_error(format!(
+					"tenant admission grant canceled for tenant {}",
+					tenant_id.0
+				))
+			}
+		}
 	}
 
 	async fn execute_bound_distributed_with_context(
@@ -447,8 +505,7 @@ where
 
 struct AdmittedQuery {
 	query_budget: QueryBudget,
-	_concurrency_reservation: TenantConcurrencyReservation,
-	_reservation: TenantMemoryReservation,
+	_reservation: AdmissionReservation,
 }
 
 fn budget_rejection_query_error(rejection: BudgetRejection) -> QueryError {
@@ -465,6 +522,10 @@ fn concurrency_rejection_query_error(rejection: TenantConcurrencyRejection) -> Q
 		requested: rejection.requested,
 		available: rejection.available,
 	})
+}
+
+fn resource_exhausted_query_error(message: String) -> QueryError {
+	QueryError::Catalog(CatalogError::ResourceExhausted { message })
 }
 
 fn fragment_error(error: FragmentError) -> QueryError {
@@ -1062,18 +1123,32 @@ impl StorageDeleteRows for UnsupportedStorageDeleteRows {
 mod tests {
 	use super::*;
 	use crate::catalog::{DescriptorRefreshMetrics, MockCatalog, TableBinding, TableRef};
-	use crate::distributed::budget::{BudgetDimension, ByteCount, TenantBudget};
+	use crate::distributed::budget::{BudgetDimension, ByteCount, DurationMillis, TenantBudget};
+	use crate::distributed::identity::{LeaseEpoch, StreamSeq, WorkerId};
+	use crate::distributed::task::TaskCompletionOutput;
 	use crate::distributed::worker_registry::StaticWorkerRegistry;
+	use crate::distributed::worker_registry::{
+		ActiveTaskCount, SimdLaneCount, UnixMillis, WorkerCapabilities, WorkerEndpoint,
+		WorkerEntry, WorkerLease, WorkerResourceState, WorkerStatus,
+	};
 	use crate::error::BindingError;
 	use crate::ir::{AggregateFunction, Expr, InsertLiteral, QueryId, SessionId, TableId};
-	use crate::server::transport::TcpTransport;
+	use crate::server::transport::{TcpTransport, ToronStream, ToronTransport};
 	use crate::storage::{
 		HlcBound, ScanRequest, ScanStream, StorageScan, StorageWrite, TenantId, WriteOutcome,
 		WriteRequest,
 	};
+	use crate::wire::{
+		ArrowIpcBytes, EnvelopeIdentity, MessageKind, StartTaskPayload, TaskBatchPayload,
+		TaskCompletePayload, TaskFailedPayload, TaskStartedPayload, WireEnvelope, decode_payload,
+		encode_payload,
+	};
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+	use arrow::ipc::writer::StreamWriter;
+	use std::num::NonZeroU32;
 	use std::sync::atomic::{AtomicUsize, Ordering};
+	use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex as test_duplex};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
@@ -1177,6 +1252,84 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn bind_miss_after_grant_still_resource_exhausted_and_releases_admission() {
+		let coordinator = DistributedQueryCoordinator::new(
+			Arc::new(RefreshingCatalog::missing(
+				RefreshOutcome::ResourceExhausted,
+			)),
+			Arc::new(StaticWorkerRegistry::new(Vec::new())),
+			Arc::new(MemoryManager::new(1, 1024)),
+			Arc::new(TcpTransport::new()),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_tenant_budget_policy(tenant_policy())
+		.with_admission_policy(Some(coordinator_admission_policy()));
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+
+		let err = coordinator
+			.execute_query_with_context(&named_scan_plan(), context)
+			.await
+			.expect_err("descriptor sync exhaustion surfaces after admission grant");
+
+		assert!(matches!(
+			err,
+			QueryError::Binding(BindingError::Catalog(
+				CatalogError::ResourceExhausted { .. }
+			))
+		));
+		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+	}
+
+	#[tokio::test]
+	async fn adr054_evolved_retry_stays_inside_one_admission_reservation() {
+		let attempts = Arc::new(AtomicUsize::new(0));
+		let coordinator = DistributedQueryCoordinator::new(
+			Arc::new(RefreshingCatalog::new(
+				descriptor_with_identity(TableId(1), TableObjectId::new([1; 16]), 1),
+				RefreshOutcome::Binding(descriptor_with_identity(
+					TableId(2),
+					TableObjectId::new([1; 16]),
+					2,
+				)),
+			)),
+			Arc::new(StaticWorkerRegistry::new([scripted_worker()])),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			Arc::new(ScriptedDescriptorTransport {
+				attempts: Arc::clone(&attempts),
+				success_batch: batch(),
+			}),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_tenant_budget_policy(tenant_policy())
+		.with_admission_policy(Some(coordinator_admission_policy()));
+		let context = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
+
+		let results = coordinator
+			.execute_query_with_context(&named_scan_plan(), context)
+			.await
+			.expect("descriptor evolved retry succeeds under one admission reservation");
+
+		assert_eq!(attempts.load(Ordering::SeqCst), 2);
+		assert_eq!(results.len(), 1);
+		assert_eq!(results[0].num_rows(), 3);
+		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+	}
+
+	#[tokio::test]
 	async fn write_descriptor_evolved_invalidates_without_retrying() {
 		let mut catalog = MockCatalog::new();
 		catalog
@@ -1233,8 +1386,8 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn distributed_coordinator_selects_query_budget_by_tenant() {
+	#[tokio::test]
+	async fn distributed_coordinator_selects_query_budget_by_tenant() {
 		let coordinator = distributed_coordinator_with_policy(tenant_policy());
 
 		let tenant_7 = ExecutionContext::new(
@@ -1252,9 +1405,11 @@ mod tests {
 
 		let admitted_7 = coordinator
 			.admit_query(&tenant_7)
+			.await
 			.expect("tenant 7 admitted");
 		let admitted_8 = coordinator
 			.admit_query(&tenant_8)
+			.await
 			.expect("tenant 8 admitted");
 
 		assert_eq!(admitted_7.query_budget.memory_per_task, ByteCount::new(8));
@@ -1263,7 +1418,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn aggregate_admission_rejects_before_bind_or_execution() {
-		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let coordinator = distributed_coordinator_with_policy(memory_only_rejection_policy());
 		let context = ExecutionContext::new(
 			SessionId(1),
 			QueryId::from_u128(7),
@@ -1271,8 +1426,8 @@ mod tests {
 			HlcBound(1),
 		);
 		let _held = coordinator
-			.tenant_memory
-			.try_reserve(TenantId(7), ByteCount::new(8))
+			.admit_query(&context)
+			.await
 			.expect("saturate tenant 7");
 
 		let err = coordinator
@@ -1288,6 +1443,7 @@ mod tests {
 				available: ByteCount(0),
 			})
 		));
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 1);
 	}
 
 	#[tokio::test]
@@ -1299,9 +1455,9 @@ mod tests {
 			TenantId(7),
 			HlcBound(1),
 		);
-		let _held = coordinator
-			.tenant_concurrency
-			.try_reserve(TenantId(7))
+		let held = coordinator
+			.admit_query(&context)
+			.await
 			.expect("saturate tenant 7 concurrency");
 
 		let err = coordinator
@@ -1317,21 +1473,26 @@ mod tests {
 				available: 0,
 			})
 		));
+		assert_eq!(
+			coordinator.tenant_memory_used(TenantId(7)),
+			ByteCount::new(8)
+		);
+		drop(held);
 		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
 	}
 
 	#[tokio::test]
 	async fn memory_rejection_releases_concurrency_reservation() {
-		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let coordinator = distributed_coordinator_with_policy(memory_only_rejection_policy());
 		let context = ExecutionContext::new(
 			SessionId(1),
 			QueryId::from_u128(7),
 			TenantId(7),
 			HlcBound(1),
 		);
-		let _held_memory = coordinator
-			.tenant_memory
-			.try_reserve(TenantId(7), ByteCount::new(8))
+		let held_memory = coordinator
+			.admit_query(&context)
+			.await
 			.expect("saturate tenant 7 memory");
 
 		let err = coordinator
@@ -1347,6 +1508,8 @@ mod tests {
 				available: ByteCount(0),
 			})
 		));
+		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 1);
+		drop(held_memory);
 		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
 	}
 
@@ -1396,12 +1559,18 @@ mod tests {
 		assert_eq!(coordinator.tenant_concurrency_active(TenantId(8)), 0);
 	}
 
-	#[test]
-	fn one_tenant_saturated_does_not_block_another() {
+	#[tokio::test]
+	async fn one_tenant_saturated_does_not_block_another() {
 		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let tenant_7 = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
 		let _tenant_7 = coordinator
-			.tenant_memory
-			.try_reserve(TenantId(7), ByteCount::new(8))
+			.admit_query(&tenant_7)
+			.await
 			.expect("saturate tenant 7");
 		let tenant_8 = ExecutionContext::new(
 			SessionId(1),
@@ -1412,6 +1581,7 @@ mod tests {
 
 		let admitted_8 = coordinator
 			.admit_query(&tenant_8)
+			.await
 			.expect("tenant 8 admitted");
 
 		assert_eq!(admitted_8.query_budget.memory_per_task, ByteCount::new(16));
@@ -1421,12 +1591,18 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn one_tenant_concurrency_saturation_does_not_block_another() {
+	#[tokio::test]
+	async fn one_tenant_concurrency_saturation_does_not_block_another() {
 		let coordinator = distributed_coordinator_with_policy(tenant_policy());
+		let tenant_7 = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(7),
+			TenantId(7),
+			HlcBound(1),
+		);
 		let _tenant_7 = coordinator
-			.tenant_concurrency
-			.try_reserve(TenantId(7))
+			.admit_query(&tenant_7)
+			.await
 			.expect("saturate tenant 7 concurrency");
 		let tenant_8 = ExecutionContext::new(
 			SessionId(1),
@@ -1437,6 +1613,7 @@ mod tests {
 
 		let admitted_8 = coordinator
 			.admit_query(&tenant_8)
+			.await
 			.expect("tenant 8 admitted");
 
 		assert_eq!(admitted_8.query_budget.memory_per_task, ByteCount::new(16));
@@ -1525,6 +1702,22 @@ mod tests {
 		)
 	}
 
+	fn memory_only_rejection_policy() -> TenantBudgetPolicy {
+		let mut per_tenant = std::collections::HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			TenantBudget::with_max_concurrent_queries(
+				ByteCount::new(8),
+				ByteCount::new(8),
+				NonZeroU32::new(2).expect("nonzero"),
+			),
+		);
+		TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(64), ByteCount::new(64)),
+			per_tenant,
+		)
+	}
+
 	fn count_plan() -> LogicalPlan {
 		LogicalPlan::Aggregate {
 			input: Box::new(LogicalPlan::Scan {
@@ -1547,6 +1740,178 @@ mod tests {
 		}
 	}
 
+	fn named_scan_plan() -> LogicalPlan {
+		LogicalPlan::ScanNamed {
+			table: TableRef::new("retry_table"),
+			projection: None,
+		}
+	}
+
+	fn coordinator_admission_policy() -> AdmissionPolicy {
+		AdmissionPolicy {
+			max_queued_queries: 1,
+			max_queue_wait_ms: DurationMillis::new(50),
+			shared_memory: ByteCount::ZERO,
+			shared_concurrent_queries: 0,
+		}
+	}
+
+	fn scripted_worker() -> WorkerEntry {
+		WorkerEntry {
+			worker_id: WorkerId::from_u128(7),
+			endpoint: WorkerEndpoint::new("scripted://descriptor-worker"),
+			lease: WorkerLease {
+				last_heartbeat: UnixMillis::new(0),
+				epoch: LeaseEpoch::new(1),
+			},
+			capabilities: WorkerCapabilities {
+				advertised_memory: ByteCount::new(1024 * 1024),
+				simd_width: SimdLaneCount::new(1),
+				spill_capacity_reserved: ByteCount::ZERO,
+			},
+			resources: WorkerResourceState {
+				in_flight: ByteCount::ZERO,
+				active_tasks: ActiveTaskCount::new(0),
+			},
+			status: WorkerStatus::Live,
+		}
+	}
+
+	struct ScriptedDescriptorTransport {
+		attempts: Arc<AtomicUsize>,
+		success_batch: RecordBatch,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for ScriptedDescriptorTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+			let success_batch = self.success_batch.clone();
+			let (client, server) = test_duplex(1024 * 1024);
+			tokio::spawn(async move {
+				if let Err(error) =
+					run_scripted_descriptor_worker(server, attempt, success_batch).await
+				{
+					panic!("scripted descriptor worker failed: {error:?}");
+				}
+			});
+			Ok(Box::new(client))
+		}
+	}
+
+	async fn run_scripted_descriptor_worker(
+		mut stream: DuplexStream,
+		attempt: usize,
+		success_batch: RecordBatch,
+	) -> Result<(), QueryError> {
+		let start = read_test_envelope(&mut stream).await?;
+		if start.kind != MessageKind::StartTask {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "StartTask",
+			});
+		}
+		let payload: StartTaskPayload = decode_payload(&start.payload)?;
+		let identity = payload.spec.identity;
+		send_test_payload(
+			&mut stream,
+			MessageKind::TaskStarted,
+			EnvelopeIdentity::task(identity),
+			None,
+			&TaskStartedPayload { identity },
+		)
+		.await?;
+
+		if attempt == 0 {
+			send_test_payload(
+				&mut stream,
+				MessageKind::TaskFailed,
+				EnvelopeIdentity::task(identity),
+				None,
+				&TaskFailedPayload {
+					identity,
+					kind: TaskFailureKind::DescriptorEvolved {
+						table_id: TableId(1),
+						expected: None,
+						current: None,
+					},
+				},
+			)
+			.await?;
+			return Ok(());
+		}
+
+		let stream_seq = StreamSeq::new(0);
+		send_test_payload(
+			&mut stream,
+			MessageKind::TaskBatch,
+			EnvelopeIdentity::task(identity),
+			Some(stream_seq),
+			&TaskBatchPayload {
+				identity,
+				stream_seq,
+				payload: ArrowIpcBytes::new(encode_record_batch_for_test(&success_batch)?),
+			},
+		)
+		.await?;
+		send_test_payload(
+			&mut stream,
+			MessageKind::TaskComplete,
+			EnvelopeIdentity::task(identity),
+			None,
+			&TaskCompletePayload {
+				identity,
+				output: TaskCompletionOutput::FinalResult {
+					output_digest: None,
+				},
+				telemetry: None,
+			},
+		)
+		.await
+	}
+
+	async fn read_test_envelope(stream: &mut DuplexStream) -> Result<WireEnvelope, QueryError> {
+		let mut len_buf = [0_u8; 4];
+		stream.read_exact(&mut len_buf).await?;
+		let len = usize::try_from(u32::from_le_bytes(len_buf)).expect("u32 fits usize");
+		let mut payload = vec![0_u8; len];
+		stream.read_exact(&mut payload).await?;
+		Ok(WireEnvelope::decode(&payload)?)
+	}
+
+	async fn send_test_payload<Payload>(
+		stream: &mut DuplexStream,
+		kind: MessageKind,
+		identity: EnvelopeIdentity,
+		stream_seq: Option<StreamSeq>,
+		payload: &Payload,
+	) -> Result<(), QueryError>
+	where
+		Payload: serde::Serialize,
+	{
+		let envelope =
+			WireEnvelope::try_new(kind, identity, stream_seq, None, encode_payload(payload))?;
+		let encoded = envelope.encode();
+		let len = u32::try_from(encoded.len())
+			.map_err(|_| QueryError::Internal {
+				message: "test envelope too large".to_string(),
+			})?
+			.to_le_bytes();
+		stream.write_all(&len).await?;
+		stream.write_all(&encoded).await?;
+		Ok(())
+	}
+
+	fn encode_record_batch_for_test(batch: &RecordBatch) -> Result<Vec<u8>, QueryError> {
+		let mut buffer = Vec::new();
+		{
+			let mut writer =
+				StreamWriter::try_new(&mut buffer, &batch.schema()).map_err(StorageError::from)?;
+			writer.write(batch).map_err(StorageError::from)?;
+			writer.finish().map_err(StorageError::from)?;
+		}
+		Ok(buffer)
+	}
+
 	struct RefreshingCatalog {
 		inner: std::sync::Mutex<RefreshingCatalogState>,
 		metrics: Arc<DescriptorRefreshMetrics>,
@@ -1563,6 +1928,20 @@ mod tests {
 			Self {
 				inner: std::sync::Mutex::new(RefreshingCatalogState {
 					current: Some(stale),
+					refresh: Some(refresh),
+					refs: vec![
+						TableRef::new("retry_table"),
+						TableRef::with_schema("default", "retry_table"),
+					],
+				}),
+				metrics: Arc::new(DescriptorRefreshMetrics::default()),
+			}
+		}
+
+		fn missing(refresh: RefreshOutcome) -> Self {
+			Self {
+				inner: std::sync::Mutex::new(RefreshingCatalogState {
+					current: None,
 					refresh: Some(refresh),
 					refs: vec![
 						TableRef::new("retry_table"),

@@ -113,6 +113,20 @@ fn toron_example_config_loads() {
 			.get(),
 		1
 	);
+	assert_eq!(config.tenant_budgets.default.admission_weight.get(), 1);
+	assert_eq!(config.tenant_budgets.default.max_queued_queries, 0);
+	assert_eq!(
+		config.tenant_budgets.default.max_borrowed_memory,
+		ByteCount::ZERO
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.default
+			.max_borrowed_concurrent_queries,
+		0
+	);
+	assert!(config.admission.is_none());
 }
 
 #[test]
@@ -177,6 +191,43 @@ fn tenant_concurrency_policy_config_round_trips() {
 			.get(),
 		1
 	);
+}
+
+#[test]
+fn tenant_admission_policy_config_round_trips() {
+	let dir = fresh_dir("tenant-admission-round-trip");
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[admission]\nmax_queued_queries = 8\nmax_queue_wait_ms = 25\nshared_memory_bytes = 4096\nshared_concurrent_queries = 2\n\n[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nadmission_weight = 3\nmax_queued_queries = 4\nmax_borrowed_memory_bytes = 512\nmax_borrowed_concurrent_queries = 1\n\n[[tenant_budgets.tenants]]\ntenant_id = 7\nmemory_per_task_bytes = 512\naggregate_memory_bytes = 2048\nadmission_weight = 2\nmax_queued_queries = 5\nmax_borrowed_memory_bytes = 256\nmax_borrowed_concurrent_queries = 1\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load tenant admission config");
+	let admission = config.admission.expect("admission policy");
+
+	assert_eq!(admission.max_queued_queries, 8);
+	assert_eq!(admission.max_queue_wait_ms.get(), 25);
+	assert_eq!(admission.shared_memory, ByteCount::new(4096));
+	assert_eq!(admission.shared_concurrent_queries, 2);
+	assert_eq!(config.tenant_budgets.default.admission_weight.get(), 3);
+	assert_eq!(config.tenant_budgets.default.max_queued_queries, 4);
+	assert_eq!(
+		config.tenant_budgets.default.max_borrowed_memory,
+		ByteCount::new(512)
+	);
+	assert_eq!(
+		config
+			.tenant_budgets
+			.default
+			.max_borrowed_concurrent_queries,
+		1
+	);
+	let tenant = config.tenant_budgets.budget_for(TenantId(7));
+	assert_eq!(tenant.admission_weight.get(), 2);
+	assert_eq!(tenant.max_queued_queries, 5);
+	assert_eq!(tenant.max_borrowed_memory, ByteCount::new(256));
+	assert_eq!(tenant.max_borrowed_concurrent_queries, 1);
 }
 
 #[test]
@@ -326,6 +377,11 @@ fn tenant_budget_config_rejects_zero_duplicate_and_per_task_over_aggregate() {
 			"zero-descriptor-sync",
 			"[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nmax_concurrent_descriptor_syncs = 0\n",
 			"tenant_budgets max_concurrent_descriptor_syncs must be greater than 0",
+		),
+		(
+			"zero-admission-weight",
+			"[tenant_budgets.default]\nmemory_per_task_bytes = 1024\naggregate_memory_bytes = 4096\nadmission_weight = 0\n",
+			"tenant_budgets admission_weight must be greater than 0",
 		),
 	] {
 		let dir = fresh_dir(tag);

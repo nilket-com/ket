@@ -13,8 +13,8 @@ use tokio_rustls::TlsAcceptor;
 use crate::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use crate::config::ObservabilityListeners;
 use crate::distributed::budget::{
-	AdmissionResource, ByteCount, TenantAdmissionRejectionCounters, TenantBudgetPolicy,
-	TenantConcurrencyAccountant, TenantMemoryAccountant,
+	AdmissionResource, ByteCount, TenantAdmissionController, TenantAdmissionRejectionCounters,
+	TenantBudgetPolicy,
 };
 use crate::network::observability_http::{READ_REQUEST_TIMEOUT, read_request, write_response};
 use crate::storage::TenantId;
@@ -170,8 +170,7 @@ pub struct MetricsRegistryConfig {
 	pub tenant_budgets: TenantBudgetPolicy,
 	pub descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
 	pub descriptor_refresh_metrics: Arc<DescriptorRefreshMetrics>,
-	pub tenant_memory: TenantMemoryAccountant,
-	pub tenant_concurrency: TenantConcurrencyAccountant,
+	pub tenant_admission: TenantAdmissionController,
 	pub admission_rejections: TenantAdmissionRejectionCounters,
 }
 
@@ -188,8 +187,7 @@ impl MetricsRegistry {
 			descriptor_refresh_metrics: config.descriptor_refresh_metrics,
 			resource_metrics: ResourceMetrics {
 				tenant_budgets: config.tenant_budgets,
-				tenant_memory: config.tenant_memory,
-				tenant_concurrency: config.tenant_concurrency,
+				tenant_admission: config.tenant_admission,
 				admission_rejections: config.admission_rejections,
 			},
 		}
@@ -290,8 +288,7 @@ impl MetricsRegistry {
 
 struct ResourceMetrics {
 	tenant_budgets: TenantBudgetPolicy,
-	tenant_memory: TenantMemoryAccountant,
-	tenant_concurrency: TenantConcurrencyAccountant,
+	tenant_admission: TenantAdmissionController,
 	admission_rejections: TenantAdmissionRejectionCounters,
 }
 
@@ -302,6 +299,11 @@ impl ResourceMetrics {
 		out.push_str("# TYPE tenant_concurrency_active gauge\n");
 		out.push_str("# TYPE tenant_concurrency_limit gauge\n");
 		out.push_str("# TYPE tenant_admission_rejections_total counter\n");
+		out.push_str("# TYPE tenant_admission_queue_depth gauge\n");
+		out.push_str("# TYPE tenant_admission_borrowed_memory_bytes gauge\n");
+		out.push_str("# TYPE tenant_admission_borrowed_concurrency gauge\n");
+		out.push_str("# TYPE tenant_admission_queue_timeouts_total counter\n");
+		out.push_str("# TYPE tenant_admission_queue_full_rejections_total counter\n");
 
 		let slots = self.resource_slots();
 		for slot in &slots {
@@ -344,11 +346,34 @@ impl ResourceMetrics {
 				));
 			}
 		}
+		for slot in self.tenant_admission.metric_slots() {
+			let label = &slot.label;
+			out.push_str(&format!(
+				"tenant_admission_queue_depth{{tenant_id=\"{label}\"}} {}\n",
+				slot.queue_depth
+			));
+			out.push_str(&format!(
+				"tenant_admission_borrowed_memory_bytes{{tenant_id=\"{label}\"}} {}\n",
+				slot.borrowed_memory.get()
+			));
+			out.push_str(&format!(
+				"tenant_admission_borrowed_concurrency{{tenant_id=\"{label}\"}} {}\n",
+				slot.borrowed_concurrency
+			));
+			out.push_str(&format!(
+				"tenant_admission_queue_timeouts_total{{tenant_id=\"{label}\"}} {}\n",
+				slot.queue_timeouts
+			));
+			out.push_str(&format!(
+				"tenant_admission_queue_full_rejections_total{{tenant_id=\"{label}\"}} {}\n",
+				slot.queue_full_rejections
+			));
+		}
 	}
 
 	fn resource_slots(&self) -> Vec<TenantResourceSlot> {
-		let memory_used = self.tenant_memory.snapshot();
-		let concurrency_active = self.tenant_concurrency.snapshot();
+		let memory_used = self.tenant_admission.memory_snapshot();
+		let concurrency_active = self.tenant_admission.concurrency_snapshot();
 		let mut slots = Vec::new();
 		for tenant_id in self.tenant_budgets.configured_tenant_ids() {
 			let budget = self.tenant_budgets.budget_for(tenant_id);

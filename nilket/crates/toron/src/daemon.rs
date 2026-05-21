@@ -249,7 +249,8 @@ impl ToronDaemon {
 				coordinator_deleter,
 				coordinator_admin,
 			)
-			.with_tenant_budget_policy(config.tenant_budgets.clone()),
+			.with_tenant_budget_policy(config.tenant_budgets.clone())
+			.with_admission_policy(config.admission),
 		);
 
 		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
@@ -261,8 +262,7 @@ impl ToronDaemon {
 			tenant_budgets: config.tenant_budgets.clone(),
 			descriptor_sync_metrics: catalog.descriptor_sync_metrics(),
 			descriptor_refresh_metrics: catalog.descriptor_refresh_metrics(),
-			tenant_memory: coordinator.tenant_memory_accountant(),
-			tenant_concurrency: coordinator.tenant_concurrency_accountant(),
+			tenant_admission: coordinator.tenant_admission_controller(),
 			admission_rejections: coordinator.admission_rejection_counters(),
 		}));
 		let readiness = Arc::new(ReadinessState::new(

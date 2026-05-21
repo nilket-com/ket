@@ -11,8 +11,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::distributed::budget::{
-	ByteCount, TenantBudget, TenantBudgetPolicy, derive_max_concurrent_descriptor_syncs,
-	derive_max_concurrent_queries,
+	AdmissionPolicy, ByteCount, DurationMillis, TenantBudget, TenantBudgetPolicy,
+	derive_max_concurrent_descriptor_syncs, derive_max_concurrent_queries,
 };
 use crate::distributed::identity::WorkerId;
 use crate::distributed::worker_registry::WorkerEndpoint;
@@ -59,6 +59,10 @@ memory_budget_bytes = 67108864
 # aggregate_memory_bytes = 268435456
 # max_concurrent_queries = 4
 # max_concurrent_descriptor_syncs = 2
+# admission_weight = 1
+# max_queued_queries = 0
+# max_borrowed_memory_bytes = 0
+# max_borrowed_concurrent_queries = 0
 
 # [[tenant_budgets.tenants]]
 # tenant_id = 7
@@ -66,6 +70,16 @@ memory_budget_bytes = 67108864
 # aggregate_memory_bytes = 67108864
 # max_concurrent_queries = 4
 # max_concurrent_descriptor_syncs = 2
+# admission_weight = 1
+# max_queued_queries = 0
+# max_borrowed_memory_bytes = 0
+# max_borrowed_concurrent_queries = 0
+
+# [admission]
+# max_queued_queries = 0
+# max_queue_wait_ms = 0
+# shared_memory_bytes = 0
+# shared_concurrent_queries = 0
 
 [storage.wendelon]
 bootstrap_peers = [
@@ -129,6 +143,7 @@ pub struct ToronBootstrapConfig {
 	pub node: ToronNodeConfig,
 	pub worker: ToronWorkerConfig,
 	pub tenant_budgets: TenantBudgetPolicy,
+	pub admission: Option<AdmissionPolicy>,
 	pub storage: ToronStorageConfig,
 	pub catalog: ToronCatalogConfig,
 	pub sql: Option<SqlConfig>,
@@ -266,6 +281,7 @@ struct RawToronBootstrapConfig {
 	#[serde(default)]
 	worker: RawToronWorkerConfig,
 	tenant_budgets: Option<RawTenantBudgetPolicy>,
+	admission: Option<RawAdmissionPolicy>,
 	storage: RawToronStorageConfig,
 	#[serde(default)]
 	catalog: RawToronCatalogConfig,
@@ -308,6 +324,10 @@ struct RawTenantBudget {
 	aggregate_memory_bytes: u64,
 	max_concurrent_queries: Option<u32>,
 	max_concurrent_descriptor_syncs: Option<u32>,
+	admission_weight: Option<u32>,
+	max_queued_queries: Option<u32>,
+	max_borrowed_memory_bytes: Option<u64>,
+	max_borrowed_concurrent_queries: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,6 +337,22 @@ struct RawTenantBudgetEntry {
 	aggregate_memory_bytes: u64,
 	max_concurrent_queries: Option<u32>,
 	max_concurrent_descriptor_syncs: Option<u32>,
+	admission_weight: Option<u32>,
+	max_queued_queries: Option<u32>,
+	max_borrowed_memory_bytes: Option<u64>,
+	max_borrowed_concurrent_queries: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAdmissionPolicy {
+	#[serde(default)]
+	max_queued_queries: u32,
+	#[serde(default)]
+	max_queue_wait_ms: u32,
+	#[serde(default)]
+	shared_memory_bytes: u64,
+	#[serde(default)]
+	shared_concurrent_queries: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,6 +554,7 @@ fn normalize_config(
 		raw.tenant_budgets,
 		ByteCount::new(raw.worker.memory_budget_bytes),
 	)?;
+	let admission = raw.admission.map(normalize_admission_policy);
 	if raw.storage.wendelon.bootstrap_peers.is_empty() {
 		return Err(invalid(
 			"storage.wendelon.bootstrap_peers must contain at least one peer",
@@ -580,6 +617,7 @@ fn normalize_config(
 			memory_budget_bytes: raw.worker.memory_budget_bytes,
 		},
 		tenant_budgets,
+		admission,
 		storage: ToronStorageConfig {
 			wendelon: ToronWendelonStorageConfig {
 				bootstrap_peers: raw
@@ -627,6 +665,10 @@ fn normalize_tenant_budget_policy(
 		default.aggregate_memory_bytes,
 		default.max_concurrent_queries,
 		default.max_concurrent_descriptor_syncs,
+		default.admission_weight,
+		default.max_queued_queries,
+		default.max_borrowed_memory_bytes,
+		default.max_borrowed_concurrent_queries,
 	)?;
 	let mut per_tenant = HashMap::new();
 	for tenant in raw.tenants {
@@ -639,6 +681,10 @@ fn normalize_tenant_budget_policy(
 			tenant.aggregate_memory_bytes,
 			tenant.max_concurrent_queries,
 			tenant.max_concurrent_descriptor_syncs,
+			tenant.admission_weight,
+			tenant.max_queued_queries,
+			tenant.max_borrowed_memory_bytes,
+			tenant.max_borrowed_concurrent_queries,
 		)?;
 		if per_tenant.insert(tenant_id, budget).is_some() {
 			return Err(invalid(format!(
@@ -650,11 +696,16 @@ fn normalize_tenant_budget_policy(
 	Ok(TenantBudgetPolicy::new(default, per_tenant))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_tenant_budget(
 	memory_per_task_bytes: u64,
 	aggregate_memory_bytes: u64,
 	max_concurrent_queries: Option<u32>,
 	max_concurrent_descriptor_syncs: Option<u32>,
+	admission_weight: Option<u32>,
+	max_queued_queries: Option<u32>,
+	max_borrowed_memory_bytes: Option<u64>,
+	max_borrowed_concurrent_queries: Option<u32>,
 ) -> Result<TenantBudget, ToronConfigError> {
 	if memory_per_task_bytes == 0 {
 		return Err(invalid(
@@ -691,12 +742,34 @@ fn normalize_tenant_budget(
 		Some(value) => NonZeroU32::new(value).expect("zero rejected"),
 		None => derive_max_concurrent_descriptor_syncs(max_concurrent_queries),
 	};
-	Ok(TenantBudget::with_query_and_descriptor_sync_limits(
+	let admission_weight = match admission_weight {
+		Some(0) => {
+			return Err(invalid(
+				"tenant_budgets admission_weight must be greater than 0",
+			));
+		}
+		Some(value) => NonZeroU32::new(value).expect("zero rejected"),
+		None => NonZeroU32::new(1).expect("one is nonzero"),
+	};
+	Ok(TenantBudget::with_admission_limits(
 		memory_per_task,
 		aggregate_memory,
 		max_concurrent_queries,
 		max_concurrent_descriptor_syncs,
+		admission_weight,
+		max_queued_queries.unwrap_or(0),
+		ByteCount::new(max_borrowed_memory_bytes.unwrap_or(0)),
+		max_borrowed_concurrent_queries.unwrap_or(0),
 	))
+}
+
+fn normalize_admission_policy(raw: RawAdmissionPolicy) -> AdmissionPolicy {
+	AdmissionPolicy {
+		max_queued_queries: raw.max_queued_queries,
+		max_queue_wait_ms: DurationMillis::new(raw.max_queue_wait_ms),
+		shared_memory: ByteCount::new(raw.shared_memory_bytes),
+		shared_concurrent_queries: raw.shared_concurrent_queries,
+	}
 }
 
 fn listener_bind_addresses(

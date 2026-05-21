@@ -6,7 +6,9 @@
 no new error code, no SQL wire / Wendelon change, no ADR 053/054
 descriptor behavior change. Ten phases, dependency-ordered. **Default-
 disabled: with no `[admission]` config, every phase is behavior-neutral vs
-050/052.**
+050/052.** When `[admission]` is present, per-tenant queue/borrow fields
+still default to zero, so tenants must opt in before they can queue or
+borrow.
 
 ## Invariants carried in
 
@@ -79,9 +81,9 @@ struct Waiter {
     id: WaiterId,
     tenant,
     mem,
-    conc: 1,
+    // requested concurrency is implicit and fixed at 1
     seq,
-    deadline,
+    queue_wait_ms,
     grant: oneshot::Sender<Grant>,
 }
 struct QueuedAdmission {
@@ -97,11 +99,13 @@ struct QueuedAdmission {
 - `QueuedAdmission` is an RAII wait handle: it carries the stable
   controller-local `WaiterId`, removes exactly that queued waiter and pumps
   on drop before grant, and disarms cleanup once grant ownership transfers.
-- **Fast path (D7):** disabled, or (no waiters for tenant ∧ owned reserve
-  succeeds) → `Granted`; if the tenant has waiters → fall through to
-  enqueue (no bypass — anti-starvation).
+- **Fast path (D7):** omitted `[admission]` config uses the ADR 050/052
+  legacy owned grant/reject path; with admission configured, a tenant with
+  no waiters and an immediately successful owned reserve gets `Granted`.
+  If the tenant has waiters → fall through to enqueue (no bypass —
+  anti-starvation).
 - **Reject (D8):** disabled / queue full / never-fits(owned+borrow caps) /
-  deadline already past → `Rejected` (`ResourceExhausted`).
+  zero queue wait budget → `Rejected` (`ResourceExhausted`).
 - **Enqueue + pump:** push `Waiter` (FIFO), then `pump()` synchronously.
 - **`pump()` (D10):** loop — pick the eligible tenant by integer weighted
   deficit RR, take its FIFO head, attempt **one atomic grant** over {owned
@@ -134,12 +138,12 @@ struct QueuedAdmission {
 
 ## Phase 6 — Metrics (budget.rs, network/observability.rs) (D16)
 
-- `AdmissionMetrics`: `queue_depth` / `borrowed_memory_bytes` /
-  `borrowed_concurrency` gauges + `queue_timeouts_total` /
-  `queue_full_rejections_total` counters, all keyed configured + `"other"`
-  (052 model). Render alongside `ResourceMetrics`; thread through
-  `MetricsRegistryConfig`. No table/query/object/descriptor/fingerprint
-  labels.
+- The admission controller exposes metric slots for `queue_depth` /
+  `borrowed_memory_bytes` / `borrowed_concurrency` gauges plus
+  `queue_timeouts_total` / `queue_full_rejections_total` counters, all
+  keyed configured + `"other"` (052 model). Render alongside
+  `ResourceMetrics`; thread the controller through `MetricsRegistryConfig`.
+  No table/query/object/descriptor/fingerprint labels.
 
 ## Phase 7 — Guards + prior-guard retarget (tests/architecture_test.rs)
 
@@ -179,19 +183,21 @@ admission, 054-retry-stays-in-one-reservation, bounded metrics.
    that forgets to pump deadlocks waiters.
 5. **Reservation drop during the 054 retry must not release+re-admit** —
    one reservation spans the retry loop (D15).
-6. **Default-zero == 050/052 byte-for-byte** — the headline guard (#3) and
-   fixture #1; the whole reversal is inert until opt-in.
+6. **Omitted `[admission]` == 050/052 byte-for-byte** — the headline guard
+   (#3) and fixture #1; zero per-tenant queue/borrow fields keep tenants
+   queue/borrow-disabled after an explicit `[admission]` section appears.
+   The whole reversal is inert until opt-in.
 
 ## Acceptance checklist
 
-- [ ] Phase 1: `[admission]` + per-tenant fields parse; disabled defaults;
+- [x] Phase 1: `[admission]` + per-tenant fields parse; disabled defaults;
       back-compat with existing `[tenant_budgets]`.
-- [ ] Phase 2-3: controller with one sync lock; explicit shared pool;
+- [x] Phase 2-3: controller with one sync lock; explicit shared pool;
       integer weighted-deficit pump; atomic grant; RAII release pumps.
-- [ ] Phase 4: `admit_query` queues before bind; await outside lock;
+- [x] Phase 4: `admit_query` queues before bind; await outside lock;
       timeout/cancel clean + pump.
-- [ ] Phase 5: 053/054 unchanged; bind-miss releases; 054 retry no
+- [x] Phase 5: 053/054 unchanged; bind-miss releases; 054 retry no
       re-enqueue.
-- [ ] Phase 6: bounded configured+other metrics, no table/query labels.
-- [ ] Phase 7-9: 16+3 guards, 050/052 retarget, 16 fixtures, prior guards
+- [x] Phase 6: bounded configured+other metrics, no table/query labels.
+- [x] Phase 7-9: 16+3 guards, 050/052 retarget, 16 fixtures, prior guards
       pass, evidence + 3-ADR roadmap rewrite; no rate/connection-cap drift.

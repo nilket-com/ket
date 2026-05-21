@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,8 +28,8 @@ use toron::config::{
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::budget::{
-	AdmissionResource, ByteCount, TenantAdmissionRejectionCounters, TenantBudget,
-	TenantBudgetPolicy, TenantConcurrencyAccountant, TenantMemoryAccountant,
+	AdmissionAttempt, AdmissionResource, ByteCount, TenantAdmissionController,
+	TenantAdmissionRejectionCounters, TenantBudget, TenantBudgetPolicy,
 };
 use toron::distributed::identity::WorkerId;
 use toron::network::observability::{MetricsRegistry, MetricsRegistryConfig, ReadinessSnapshot};
@@ -72,21 +73,16 @@ fn sample_resource_metrics_body() -> String {
 		TenantBudget::new(ByteCount::new(8), ByteCount::new(32)),
 		per_tenant,
 	);
-	let tenant_memory = TenantMemoryAccountant::new(policy.clone());
-	let tenant_concurrency = TenantConcurrencyAccountant::new(policy.clone());
+	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
 	let admission_rejections = TenantAdmissionRejectionCounters::new(&policy);
-	let _configured_memory = tenant_memory
-		.try_reserve(TenantId(7), ByteCount::new(8))
-		.expect("reserve configured memory");
-	let _other_memory = tenant_memory
-		.try_reserve(TenantId(9), ByteCount::new(8))
-		.expect("reserve other memory");
-	let _configured_concurrency = tenant_concurrency
-		.try_reserve(TenantId(7))
-		.expect("reserve configured concurrency");
-	let _other_concurrency = tenant_concurrency
-		.try_reserve(TenantId(9))
-		.expect("reserve other concurrency");
+	let _configured = match tenant_admission.try_admit(TenantId(7), ByteCount::new(8)) {
+		AdmissionAttempt::Granted(reservation) => reservation,
+		other => panic!("expected configured admission grant, got {other:?}"),
+	};
+	let _other = match tenant_admission.try_admit(TenantId(9), ByteCount::new(8)) {
+		AdmissionAttempt::Granted(reservation) => reservation,
+		other => panic!("expected other admission grant, got {other:?}"),
+	};
 	admission_rejections.increment(TenantId(7), AdmissionResource::Memory);
 	admission_rejections.increment(TenantId(9), AdmissionResource::Concurrency);
 	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
@@ -95,8 +91,7 @@ fn sample_resource_metrics_body() -> String {
 		tenant_budgets: policy,
 		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
 		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
-		tenant_memory,
-		tenant_concurrency,
+		tenant_admission,
 		admission_rejections,
 	});
 
@@ -407,6 +402,92 @@ fn resource_admission_rejections_are_labeled_by_resource() {
 }
 
 #[test]
+fn queue_and_borrow_metrics_are_configured_plus_other_no_table_labels() {
+	let mut per_tenant = HashMap::new();
+	per_tenant.insert(
+		TenantId(7),
+		TenantBudget::with_admission_limits(
+			ByteCount::new(8),
+			ByteCount::new(8),
+			NonZeroU32::new(1).expect("nonzero"),
+			NonZeroU32::new(1).expect("nonzero"),
+			NonZeroU32::new(1).expect("nonzero"),
+			1,
+			ByteCount::new(8),
+			1,
+		),
+	);
+	let policy = TenantBudgetPolicy::new(
+		TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+		per_tenant,
+	);
+	let tenant_admission = TenantAdmissionController::new(
+		policy.clone(),
+		Some(toron::distributed::budget::AdmissionPolicy {
+			max_queued_queries: 1,
+			max_queue_wait_ms: toron::distributed::budget::DurationMillis::new(100),
+			shared_memory: ByteCount::new(8),
+			shared_concurrent_queries: 1,
+		}),
+	);
+	let _owned = match tenant_admission.try_admit(TenantId(7), ByteCount::new(8)) {
+		AdmissionAttempt::Granted(reservation) => reservation,
+		other => panic!("expected owned grant, got {other:?}"),
+	};
+	let _borrowed = match tenant_admission.try_admit(TenantId(7), ByteCount::new(8)) {
+		AdmissionAttempt::Granted(reservation) => reservation,
+		other => panic!("expected borrowed grant, got {other:?}"),
+	};
+	let _queued = match tenant_admission.try_admit(TenantId(7), ByteCount::new(8)) {
+		AdmissionAttempt::Queued(queued) => queued,
+		other => panic!("expected queued admission, got {other:?}"),
+	};
+	assert!(matches!(
+		tenant_admission.try_admit(TenantId(7), ByteCount::new(8)),
+		AdmissionAttempt::Rejected(_)
+	));
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy,
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		tenant_admission,
+		admission_rejections: TenantAdmissionRejectionCounters::new(&TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+			HashMap::new(),
+		)),
+	});
+	let body = metrics.render_text(&ready_snapshot());
+
+	for metric in [
+		"tenant_admission_queue_depth{tenant_id=\"7\"} 1\n",
+		"tenant_admission_borrowed_memory_bytes{tenant_id=\"7\"} 8\n",
+		"tenant_admission_borrowed_concurrency{tenant_id=\"7\"} 1\n",
+		"tenant_admission_queue_full_rejections_total{tenant_id=\"7\"} 1\n",
+		"tenant_admission_queue_depth{tenant_id=\"other\"} 0\n",
+	] {
+		assert!(body.contains(metric), "missing metric {metric} in {body}");
+	}
+	for forbidden in [
+		"table_id",
+		"query_id",
+		"object_id",
+		"descriptor",
+		"fingerprint",
+	] {
+		let offenders = body
+			.lines()
+			.filter(|line| line.contains("tenant_admission_") && line.contains(forbidden))
+			.collect::<Vec<_>>();
+		assert!(
+			offenders.is_empty(),
+			"{forbidden} leaked into admission metrics: {offenders:?}"
+		);
+	}
+}
+
+#[test]
 fn general_daemon_metrics_do_not_gain_tenant_labels() {
 	let body = sample_resource_metrics_body();
 
@@ -641,6 +722,7 @@ fn observability_config(worker_id: WorkerId, pki: &TestPki) -> ToronBootstrapCon
 			memory_budget_bytes: 1024 * 1024,
 		},
 		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(1024 * 1024)),
+		admission: None,
 		storage: ToronStorageConfig {
 			wendelon: ToronWendelonStorageConfig {
 				bootstrap_peers: vec![ToronWendelonBootstrapPeer {

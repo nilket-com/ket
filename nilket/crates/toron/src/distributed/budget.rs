@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 use crate::distributed::identity::FrameByteLen;
 use crate::storage::TenantId;
@@ -110,6 +111,10 @@ pub struct TenantBudget {
 	pub aggregate_memory: ByteCount,
 	pub max_concurrent_queries: NonZeroU32,
 	pub max_concurrent_descriptor_syncs: NonZeroU32,
+	pub admission_weight: NonZeroU32,
+	pub max_queued_queries: u32,
+	pub max_borrowed_memory: ByteCount,
+	pub max_borrowed_concurrent_queries: u32,
 }
 
 impl TenantBudget {
@@ -140,11 +145,41 @@ impl TenantBudget {
 		max_concurrent_queries: NonZeroU32,
 		max_concurrent_descriptor_syncs: NonZeroU32,
 	) -> Self {
+		Self::with_admission_limits(
+			memory_per_task,
+			aggregate_memory,
+			max_concurrent_queries,
+			max_concurrent_descriptor_syncs,
+			match NonZeroU32::new(1) {
+				Some(value) => value,
+				None => unreachable!(),
+			},
+			0,
+			ByteCount::ZERO,
+			0,
+		)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub const fn with_admission_limits(
+		memory_per_task: ByteCount,
+		aggregate_memory: ByteCount,
+		max_concurrent_queries: NonZeroU32,
+		max_concurrent_descriptor_syncs: NonZeroU32,
+		admission_weight: NonZeroU32,
+		max_queued_queries: u32,
+		max_borrowed_memory: ByteCount,
+		max_borrowed_concurrent_queries: u32,
+	) -> Self {
 		Self {
 			memory_per_task,
 			aggregate_memory,
 			max_concurrent_queries,
 			max_concurrent_descriptor_syncs,
+			admission_weight,
+			max_queued_queries,
+			max_borrowed_memory,
+			max_borrowed_concurrent_queries,
 		}
 	}
 }
@@ -352,6 +387,848 @@ impl TenantResourceRejectionCounters {
 		match resource {
 			AdmissionResource::Memory => &self.memory,
 			AdmissionResource::Concurrency => &self.concurrency,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionPolicy {
+	pub max_queued_queries: u32,
+	pub max_queue_wait_ms: DurationMillis,
+	pub shared_memory: ByteCount,
+	pub shared_concurrent_queries: u32,
+}
+
+impl AdmissionPolicy {
+	pub const fn disabled() -> Self {
+		Self {
+			max_queued_queries: 0,
+			max_queue_wait_ms: DurationMillis::new(0),
+			shared_memory: ByteCount::ZERO,
+			shared_concurrent_queries: 0,
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct TenantAdmissionController {
+	inner: Arc<TenantAdmissionControllerInner>,
+}
+
+#[derive(Debug)]
+struct TenantAdmissionControllerInner {
+	policy: TenantBudgetPolicy,
+	admission: Option<AdmissionPolicy>,
+	state: Mutex<AdmissionState>,
+}
+
+#[derive(Debug, Default)]
+struct AdmissionState {
+	tenant_memory: HashMap<TenantId, ByteCount>,
+	tenant_concurrency: HashMap<TenantId, u32>,
+	borrowed_memory: HashMap<TenantId, ByteCount>,
+	borrowed_concurrency: HashMap<TenantId, u32>,
+	queues: HashMap<TenantId, VecDeque<Waiter>>,
+	deficits: HashMap<TenantId, i64>,
+	next_waiter_id: u64,
+	next_sequence: u64,
+	shared_memory_used: ByteCount,
+	shared_concurrency_used: u32,
+	queue_full_rejections: HashMap<TenantMetricKey, u64>,
+	queue_timeouts: HashMap<TenantMetricKey, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TenantMetricKey {
+	Configured(TenantId),
+	Other,
+}
+
+#[derive(Debug)]
+struct Waiter {
+	id: WaiterId,
+	tenant_id: TenantId,
+	memory: ByteCount,
+	sequence: u64,
+	deadline_ms: u32,
+	grant: oneshot::Sender<AdmissionReservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WaiterId(u64);
+
+#[derive(Debug)]
+pub enum AdmissionAttempt {
+	Granted(AdmissionReservation),
+	Queued(QueuedAdmission),
+	Rejected(TenantAdmissionRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantAdmissionRejection {
+	Memory {
+		tenant_id: TenantId,
+		rejection: BudgetRejection,
+	},
+	Concurrency(TenantConcurrencyRejection),
+	QueueDisabled {
+		tenant_id: TenantId,
+	},
+	QueueFull {
+		tenant_id: TenantId,
+	},
+	QueueTimeout {
+		tenant_id: TenantId,
+	},
+	RequestTooLarge {
+		tenant_id: TenantId,
+	},
+	GrantCanceled {
+		tenant_id: TenantId,
+	},
+}
+
+#[derive(Debug)]
+pub struct QueuedAdmission {
+	inner: Arc<TenantAdmissionControllerInner>,
+	tenant_id: TenantId,
+	id: WaiterId,
+	grant: Option<oneshot::Receiver<AdmissionReservation>>,
+	cleanup: bool,
+}
+
+#[derive(Debug)]
+pub struct AdmissionReservation {
+	inner: Arc<TenantAdmissionControllerInner>,
+	tenant_id: TenantId,
+	memory: ByteCount,
+	owned_concurrency: u32,
+	borrowed_memory: ByteCount,
+	borrowed_concurrency: u32,
+	released: bool,
+}
+
+#[derive(Debug)]
+struct GrantDelivery {
+	id: WaiterId,
+	grant: oneshot::Sender<AdmissionReservation>,
+	reservation: AdmissionReservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAdmissionMetricSlot {
+	pub tenant_id: Option<TenantId>,
+	pub label: String,
+	pub queue_depth: u64,
+	pub borrowed_memory: ByteCount,
+	pub borrowed_concurrency: u64,
+	pub queue_timeouts: u64,
+	pub queue_full_rejections: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GrantResources {
+	owned_memory: ByteCount,
+	borrowed_memory: ByteCount,
+	owned_concurrency: u32,
+	borrowed_concurrency: u32,
+}
+
+impl TenantAdmissionController {
+	pub fn new(policy: TenantBudgetPolicy, admission: Option<AdmissionPolicy>) -> Self {
+		Self {
+			inner: Arc::new(TenantAdmissionControllerInner {
+				policy,
+				admission,
+				state: Mutex::new(AdmissionState::default()),
+			}),
+		}
+	}
+
+	pub fn try_admit(&self, tenant_id: TenantId, memory: ByteCount) -> AdmissionAttempt {
+		self.inner.try_admit(tenant_id, memory)
+	}
+
+	pub fn used_memory(&self, tenant_id: TenantId) -> ByteCount {
+		self.inner
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned")
+			.tenant_memory
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(ByteCount::ZERO)
+	}
+
+	pub fn active_concurrency(&self, tenant_id: TenantId) -> u32 {
+		self.inner
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned")
+			.tenant_concurrency
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(0)
+	}
+
+	pub fn memory_snapshot(&self) -> HashMap<TenantId, ByteCount> {
+		self.inner
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned")
+			.tenant_memory
+			.clone()
+	}
+
+	pub fn concurrency_snapshot(&self) -> HashMap<TenantId, u32> {
+		self.inner
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned")
+			.tenant_concurrency
+			.clone()
+	}
+
+	pub fn metric_slots(&self) -> Vec<TenantAdmissionMetricSlot> {
+		let state = self
+			.inner
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned");
+		let mut slots = Vec::new();
+		for tenant_id in self.inner.policy.configured_tenant_ids() {
+			let key = TenantMetricKey::Configured(tenant_id);
+			slots.push(TenantAdmissionMetricSlot {
+				tenant_id: Some(tenant_id),
+				label: tenant_id.0.to_string(),
+				queue_depth: state
+					.queues
+					.get(&tenant_id)
+					.map(|queue| u64::try_from(queue.len()).unwrap_or(u64::MAX))
+					.unwrap_or(0),
+				borrowed_memory: state
+					.borrowed_memory
+					.get(&tenant_id)
+					.copied()
+					.unwrap_or(ByteCount::ZERO),
+				borrowed_concurrency: u64::from(
+					state
+						.borrowed_concurrency
+						.get(&tenant_id)
+						.copied()
+						.unwrap_or(0),
+				),
+				queue_timeouts: state.queue_timeouts.get(&key).copied().unwrap_or(0),
+				queue_full_rejections: state.queue_full_rejections.get(&key).copied().unwrap_or(0),
+			});
+		}
+
+		let other_depth = state
+			.queues
+			.iter()
+			.filter(|(tenant_id, _)| !self.inner.policy.is_configured_tenant(**tenant_id))
+			.fold(0_u64, |total, (_, queue)| {
+				total.saturating_add(u64::try_from(queue.len()).unwrap_or(u64::MAX))
+			});
+		let other_borrowed_memory = state
+			.borrowed_memory
+			.iter()
+			.filter(|(tenant_id, _)| !self.inner.policy.is_configured_tenant(**tenant_id))
+			.fold(ByteCount::ZERO, |total, (_, used)| {
+				total.saturating_add(*used)
+			});
+		let other_borrowed_concurrency = state
+			.borrowed_concurrency
+			.iter()
+			.filter(|(tenant_id, _)| !self.inner.policy.is_configured_tenant(**tenant_id))
+			.fold(0_u64, |total, (_, active)| {
+				total.saturating_add(u64::from(*active))
+			});
+		slots.push(TenantAdmissionMetricSlot {
+			tenant_id: None,
+			label: "other".to_string(),
+			queue_depth: other_depth,
+			borrowed_memory: other_borrowed_memory,
+			borrowed_concurrency: other_borrowed_concurrency,
+			queue_timeouts: state
+				.queue_timeouts
+				.get(&TenantMetricKey::Other)
+				.copied()
+				.unwrap_or(0),
+			queue_full_rejections: state
+				.queue_full_rejections
+				.get(&TenantMetricKey::Other)
+				.copied()
+				.unwrap_or(0),
+		});
+		slots
+	}
+}
+
+impl TenantAdmissionControllerInner {
+	fn try_admit(self: &Arc<Self>, tenant_id: TenantId, memory: ByteCount) -> AdmissionAttempt {
+		let budget = self.policy.budget_for(tenant_id);
+		let Some(admission) = self.admission else {
+			let mut state = self
+				.state
+				.lock()
+				.expect("tenant admission controller poisoned");
+			return match self.try_grant_owned_legacy_order(&mut state, tenant_id, memory, budget) {
+				Ok(reservation) => AdmissionAttempt::Granted(reservation),
+				Err(rejection) => AdmissionAttempt::Rejected(rejection),
+			};
+		};
+
+		let mut state = self
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned");
+		if !state.has_waiters(tenant_id)
+			&& let Ok(reservation) =
+				self.try_grant_owned_legacy_order(&mut state, tenant_id, memory, budget)
+		{
+			return AdmissionAttempt::Granted(reservation);
+		}
+		if budget.max_queued_queries == 0 || admission.max_queued_queries == 0 {
+			return AdmissionAttempt::Rejected(TenantAdmissionRejection::QueueDisabled {
+				tenant_id,
+			});
+		}
+		if !request_can_ever_fit(memory, budget) {
+			return AdmissionAttempt::Rejected(TenantAdmissionRejection::RequestTooLarge {
+				tenant_id,
+			});
+		}
+		if admission.max_queue_wait_ms.get() == 0 {
+			return AdmissionAttempt::Rejected(TenantAdmissionRejection::QueueTimeout {
+				tenant_id,
+			});
+		}
+		if state.total_queue_depth() >= admission.max_queued_queries
+			|| state.tenant_queue_depth(tenant_id) >= budget.max_queued_queries
+		{
+			state.increment_queue_full(self.metric_key(tenant_id));
+			return AdmissionAttempt::Rejected(TenantAdmissionRejection::QueueFull { tenant_id });
+		}
+
+		let (grant_tx, grant_rx) = oneshot::channel();
+		let id = state.next_waiter_id();
+		let waiter = Waiter {
+			id,
+			tenant_id,
+			memory,
+			sequence: state.next_sequence(),
+			deadline_ms: admission.max_queue_wait_ms.get(),
+			grant: grant_tx,
+		};
+		state.queues.entry(tenant_id).or_default().push_back(waiter);
+		let mut deliveries = self.pump_locked(&mut state);
+		let own_delivery = deliveries
+			.iter()
+			.position(|delivery| delivery.id == id)
+			.map(|index| deliveries.remove(index));
+		drop(state);
+		send_grants(deliveries);
+		if let Some(delivery) = own_delivery {
+			AdmissionAttempt::Granted(delivery.reservation)
+		} else {
+			AdmissionAttempt::Queued(QueuedAdmission {
+				inner: Arc::clone(self),
+				tenant_id,
+				id,
+				grant: Some(grant_rx),
+				cleanup: true,
+			})
+		}
+	}
+
+	fn try_grant_owned_legacy_order(
+		self: &Arc<Self>,
+		state: &mut AdmissionState,
+		tenant_id: TenantId,
+		memory: ByteCount,
+		budget: TenantBudget,
+	) -> Result<AdmissionReservation, TenantAdmissionRejection> {
+		let active = state
+			.tenant_concurrency
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(0);
+		let concurrency_limit = budget.max_concurrent_queries.get();
+		if active >= concurrency_limit {
+			return Err(TenantAdmissionRejection::Concurrency(
+				TenantConcurrencyRejection {
+					tenant_id,
+					requested: 1,
+					available: concurrency_limit.saturating_sub(active),
+				},
+			));
+		}
+		let current_memory = state
+			.tenant_memory
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(ByteCount::ZERO);
+		let available_memory = budget.aggregate_memory.saturating_sub(current_memory);
+		if memory > available_memory {
+			return Err(TenantAdmissionRejection::Memory {
+				tenant_id,
+				rejection: BudgetRejection {
+					dimension: BudgetDimension::Memory,
+					requested: memory,
+					available: available_memory,
+				},
+			});
+		}
+		apply_grant(
+			state,
+			tenant_id,
+			GrantResources {
+				owned_memory: memory,
+				borrowed_memory: ByteCount::ZERO,
+				owned_concurrency: 1,
+				borrowed_concurrency: 0,
+			},
+		);
+		Ok(AdmissionReservation {
+			inner: Arc::clone(self),
+			tenant_id,
+			memory,
+			owned_concurrency: 1,
+			borrowed_memory: ByteCount::ZERO,
+			borrowed_concurrency: 0,
+			released: false,
+		})
+	}
+
+	fn pump_locked(self: &Arc<Self>, state: &mut AdmissionState) -> Vec<GrantDelivery> {
+		let mut deliveries = Vec::new();
+		loop {
+			let Some((tenant_id, resources)) = self.pick_grantable_waiter(state) else {
+				break;
+			};
+			let Some(waiter) = state
+				.queues
+				.get_mut(&tenant_id)
+				.and_then(VecDeque::pop_front)
+			else {
+				break;
+			};
+			debug_assert_eq!(waiter.tenant_id, tenant_id);
+			let _deadline_ms = waiter.deadline_ms;
+			state.remove_queue_if_empty(tenant_id);
+			apply_grant(state, tenant_id, resources);
+			let reservation = AdmissionReservation {
+				inner: Arc::clone(self),
+				tenant_id,
+				memory: resources.owned_memory,
+				owned_concurrency: resources.owned_concurrency,
+				borrowed_memory: resources.borrowed_memory,
+				borrowed_concurrency: resources.borrowed_concurrency,
+				released: false,
+			};
+			deliveries.push(GrantDelivery {
+				id: waiter.id,
+				grant: waiter.grant,
+				reservation,
+			});
+		}
+		deliveries
+	}
+
+	fn pick_grantable_waiter(
+		&self,
+		state: &mut AdmissionState,
+	) -> Option<(TenantId, GrantResources)> {
+		let mut tenants = state.queued_tenants();
+		if tenants.is_empty() {
+			return None;
+		}
+		let total_weight = tenants
+			.iter()
+			.map(|tenant_id| i64::from(self.policy.budget_for(*tenant_id).admission_weight.get()))
+			.sum::<i64>()
+			.max(1);
+		for tenant_id in &tenants {
+			let weight = i64::from(self.policy.budget_for(*tenant_id).admission_weight.get());
+			*state.deficits.entry(*tenant_id).or_default() += weight;
+		}
+		tenants.sort_by_key(|tenant_id| tenant_id.0);
+		let mut best: Option<(TenantId, GrantResources, i64, u64)> = None;
+		for tenant_id in tenants {
+			let Some(waiter) = state.queues.get(&tenant_id).and_then(|queue| queue.front()) else {
+				continue;
+			};
+			let budget = self.policy.budget_for(tenant_id);
+			let Some(resources) =
+				compute_grant(state, self.admission, tenant_id, waiter.memory, budget)
+			else {
+				continue;
+			};
+			let deficit = state.deficits.get(&tenant_id).copied().unwrap_or(0);
+			let sequence = waiter.sequence;
+			let replace = best
+				.as_ref()
+				.is_none_or(|(_, _, best_deficit, best_sequence)| {
+					deficit > *best_deficit
+						|| (deficit == *best_deficit && sequence < *best_sequence)
+				});
+			if replace {
+				best = Some((tenant_id, resources, deficit, sequence));
+			}
+		}
+		let (tenant_id, resources, _, _) = best?;
+		*state.deficits.entry(tenant_id).or_default() -= total_weight;
+		Some((tenant_id, resources))
+	}
+
+	fn cancel_waiter(
+		self: &Arc<Self>,
+		tenant_id: TenantId,
+		id: WaiterId,
+		reason: WaiterCancelReason,
+	) -> bool {
+		let mut state = self
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned");
+		let removed = state.remove_waiter(tenant_id, id);
+		if removed && reason == WaiterCancelReason::Timeout {
+			state.increment_queue_timeout(self.metric_key(tenant_id));
+		}
+		let deliveries = self.pump_locked(&mut state);
+		drop(state);
+		send_grants(deliveries);
+		removed
+	}
+
+	fn release_reservation(
+		self: &Arc<Self>,
+		tenant_id: TenantId,
+		memory: ByteCount,
+		owned_concurrency: u32,
+		borrowed_memory: ByteCount,
+		borrowed_concurrency: u32,
+	) {
+		let mut state = self
+			.state
+			.lock()
+			.expect("tenant admission controller poisoned");
+		sub_memory(&mut state.tenant_memory, tenant_id, memory);
+		sub_u32(&mut state.tenant_concurrency, tenant_id, owned_concurrency);
+		sub_memory(&mut state.borrowed_memory, tenant_id, borrowed_memory);
+		sub_u32(
+			&mut state.borrowed_concurrency,
+			tenant_id,
+			borrowed_concurrency,
+		);
+		state.shared_memory_used = state.shared_memory_used.saturating_sub(borrowed_memory);
+		state.shared_concurrency_used = state
+			.shared_concurrency_used
+			.saturating_sub(borrowed_concurrency);
+		let deliveries = self.pump_locked(&mut state);
+		drop(state);
+		send_grants(deliveries);
+	}
+
+	fn metric_key(&self, tenant_id: TenantId) -> TenantMetricKey {
+		if self.policy.is_configured_tenant(tenant_id) {
+			TenantMetricKey::Configured(tenant_id)
+		} else {
+			TenantMetricKey::Other
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaiterCancelReason {
+	Cancelled,
+	Timeout,
+}
+
+impl QueuedAdmission {
+	pub async fn recv(&mut self) -> Result<AdmissionReservation, TenantAdmissionRejection> {
+		let grant = self
+			.grant
+			.as_mut()
+			.expect("queued admission grant receiver missing");
+		match grant.await {
+			Ok(reservation) => {
+				self.cleanup = false;
+				self.grant = None;
+				Ok(reservation)
+			}
+			Err(_) => {
+				self.cleanup = false;
+				self.grant = None;
+				Err(TenantAdmissionRejection::GrantCanceled {
+					tenant_id: self.tenant_id,
+				})
+			}
+		}
+	}
+
+	pub fn cancel_due_to_timeout(&mut self) {
+		if self.cleanup {
+			self.inner
+				.cancel_waiter(self.tenant_id, self.id, WaiterCancelReason::Timeout);
+			self.cleanup = false;
+			self.grant = None;
+		}
+	}
+}
+
+impl Drop for QueuedAdmission {
+	fn drop(&mut self) {
+		if self.cleanup {
+			self.inner
+				.cancel_waiter(self.tenant_id, self.id, WaiterCancelReason::Cancelled);
+			self.cleanup = false;
+		}
+	}
+}
+
+impl AdmissionReservation {
+	pub fn release(mut self) {
+		self.release_once();
+	}
+
+	fn release_once(&mut self) {
+		if self.released {
+			return;
+		}
+		self.inner.release_reservation(
+			self.tenant_id,
+			self.memory,
+			self.owned_concurrency,
+			self.borrowed_memory,
+			self.borrowed_concurrency,
+		);
+		self.released = true;
+	}
+}
+
+impl Drop for AdmissionReservation {
+	fn drop(&mut self) {
+		self.release_once();
+	}
+}
+
+impl AdmissionState {
+	fn has_waiters(&self, tenant_id: TenantId) -> bool {
+		self.queues
+			.get(&tenant_id)
+			.is_some_and(|queue| !queue.is_empty())
+	}
+
+	fn tenant_queue_depth(&self, tenant_id: TenantId) -> u32 {
+		self.queues
+			.get(&tenant_id)
+			.map(|queue| u32::try_from(queue.len()).unwrap_or(u32::MAX))
+			.unwrap_or(0)
+	}
+
+	fn total_queue_depth(&self) -> u32 {
+		self.queues.values().fold(0_u32, |total, queue| {
+			total.saturating_add(u32::try_from(queue.len()).unwrap_or(u32::MAX))
+		})
+	}
+
+	fn next_waiter_id(&mut self) -> WaiterId {
+		let id = WaiterId(self.next_waiter_id);
+		self.next_waiter_id = self.next_waiter_id.saturating_add(1);
+		id
+	}
+
+	fn next_sequence(&mut self) -> u64 {
+		let sequence = self.next_sequence;
+		self.next_sequence = self.next_sequence.saturating_add(1);
+		sequence
+	}
+
+	fn queued_tenants(&self) -> Vec<TenantId> {
+		self.queues
+			.iter()
+			.filter(|(_, queue)| !queue.is_empty())
+			.map(|(tenant_id, _)| *tenant_id)
+			.collect()
+	}
+
+	fn remove_queue_if_empty(&mut self, tenant_id: TenantId) {
+		if self.queues.get(&tenant_id).is_some_and(VecDeque::is_empty) {
+			self.queues.remove(&tenant_id);
+			self.deficits.remove(&tenant_id);
+		}
+	}
+
+	fn remove_waiter(&mut self, tenant_id: TenantId, id: WaiterId) -> bool {
+		let Some(queue) = self.queues.get_mut(&tenant_id) else {
+			return false;
+		};
+		let Some(index) = queue.iter().position(|waiter| waiter.id == id) else {
+			return false;
+		};
+		queue.remove(index);
+		self.remove_queue_if_empty(tenant_id);
+		true
+	}
+
+	fn increment_queue_full(&mut self, key: TenantMetricKey) {
+		*self.queue_full_rejections.entry(key).or_default() += 1;
+	}
+
+	fn increment_queue_timeout(&mut self, key: TenantMetricKey) {
+		*self.queue_timeouts.entry(key).or_default() += 1;
+	}
+}
+
+fn request_can_ever_fit(memory: ByteCount, budget: TenantBudget) -> bool {
+	memory
+		<= budget
+			.aggregate_memory
+			.saturating_add(budget.max_borrowed_memory)
+		&& budget
+			.max_concurrent_queries
+			.get()
+			.saturating_add(budget.max_borrowed_concurrent_queries)
+			>= 1
+}
+
+fn compute_grant(
+	state: &AdmissionState,
+	admission: Option<AdmissionPolicy>,
+	tenant_id: TenantId,
+	memory: ByteCount,
+	budget: TenantBudget,
+) -> Option<GrantResources> {
+	let admission = admission.unwrap_or_else(AdmissionPolicy::disabled);
+	let current_memory = state
+		.tenant_memory
+		.get(&tenant_id)
+		.copied()
+		.unwrap_or(ByteCount::ZERO);
+	let owned_memory_available = budget.aggregate_memory.saturating_sub(current_memory);
+	let owned_memory = memory.min(owned_memory_available);
+	let borrowed_memory = memory.saturating_sub(owned_memory);
+	let tenant_borrowed_memory = state
+		.borrowed_memory
+		.get(&tenant_id)
+		.copied()
+		.unwrap_or(ByteCount::ZERO);
+	let tenant_borrowed_memory_available = budget
+		.max_borrowed_memory
+		.saturating_sub(tenant_borrowed_memory);
+	let shared_memory_available = admission
+		.shared_memory
+		.saturating_sub(state.shared_memory_used);
+	if borrowed_memory > tenant_borrowed_memory_available
+		|| borrowed_memory > shared_memory_available
+	{
+		return None;
+	}
+
+	let active = state
+		.tenant_concurrency
+		.get(&tenant_id)
+		.copied()
+		.unwrap_or(0);
+	let owned_concurrency_limit = budget.max_concurrent_queries.get();
+	let (owned_concurrency, borrowed_concurrency) = if active < owned_concurrency_limit {
+		(1, 0)
+	} else {
+		let tenant_borrowed = state
+			.borrowed_concurrency
+			.get(&tenant_id)
+			.copied()
+			.unwrap_or(0);
+		if tenant_borrowed >= budget.max_borrowed_concurrent_queries {
+			return None;
+		}
+		if state.shared_concurrency_used >= admission.shared_concurrent_queries {
+			return None;
+		}
+		(0, 1)
+	};
+
+	Some(GrantResources {
+		owned_memory,
+		borrowed_memory,
+		owned_concurrency,
+		borrowed_concurrency,
+	})
+}
+
+fn apply_grant(state: &mut AdmissionState, tenant_id: TenantId, resources: GrantResources) {
+	add_memory(&mut state.tenant_memory, tenant_id, resources.owned_memory);
+	add_u32(
+		&mut state.tenant_concurrency,
+		tenant_id,
+		resources.owned_concurrency,
+	);
+	add_memory(
+		&mut state.borrowed_memory,
+		tenant_id,
+		resources.borrowed_memory,
+	);
+	add_u32(
+		&mut state.borrowed_concurrency,
+		tenant_id,
+		resources.borrowed_concurrency,
+	);
+	state.shared_memory_used = state
+		.shared_memory_used
+		.saturating_add(resources.borrowed_memory);
+	state.shared_concurrency_used = state
+		.shared_concurrency_used
+		.saturating_add(resources.borrowed_concurrency);
+}
+
+fn add_memory(map: &mut HashMap<TenantId, ByteCount>, tenant_id: TenantId, amount: ByteCount) {
+	if amount == ByteCount::ZERO {
+		return;
+	}
+	let current = map.get(&tenant_id).copied().unwrap_or(ByteCount::ZERO);
+	map.insert(tenant_id, current.saturating_add(amount));
+}
+
+fn sub_memory(map: &mut HashMap<TenantId, ByteCount>, tenant_id: TenantId, amount: ByteCount) {
+	if amount == ByteCount::ZERO {
+		return;
+	}
+	let current = map.get(&tenant_id).copied().unwrap_or(ByteCount::ZERO);
+	let updated = current.saturating_sub(amount);
+	if updated == ByteCount::ZERO {
+		map.remove(&tenant_id);
+	} else {
+		map.insert(tenant_id, updated);
+	}
+}
+
+fn add_u32(map: &mut HashMap<TenantId, u32>, tenant_id: TenantId, amount: u32) {
+	if amount == 0 {
+		return;
+	}
+	let current = map.get(&tenant_id).copied().unwrap_or(0);
+	map.insert(tenant_id, current.saturating_add(amount));
+}
+
+fn sub_u32(map: &mut HashMap<TenantId, u32>, tenant_id: TenantId, amount: u32) {
+	if amount == 0 {
+		return;
+	}
+	let current = map.get(&tenant_id).copied().unwrap_or(0);
+	let updated = current.saturating_sub(amount);
+	if updated == 0 {
+		map.remove(&tenant_id);
+	} else {
+		map.insert(tenant_id, updated);
+	}
+}
+
+fn send_grants(deliveries: Vec<GrantDelivery>) {
+	for delivery in deliveries {
+		if let Err(reservation) = delivery.grant.send(delivery.reservation) {
+			drop(reservation);
 		}
 	}
 }
@@ -1055,5 +1932,415 @@ mod tests {
 		assert!(accountant.try_reserve(TenantId(8)).is_err());
 		assert_eq!(accountant.active(TenantId(7)), 1);
 		assert_eq!(accountant.active(TenantId(8)), 2);
+	}
+
+	#[test]
+	fn omitted_admission_config_preserves_memory_and_concurrency_hard_reject() {
+		let controller = TenantAdmissionController::new(single_tenant_policy(), None);
+		let _held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::Concurrency(
+				TenantConcurrencyRejection {
+					tenant_id: TenantId(7),
+					requested: 1,
+					available: 0,
+				}
+			))
+		));
+	}
+
+	#[test]
+	fn queue_disabled_for_tenant_rejects_immediately() {
+		let controller =
+			TenantAdmissionController::new(single_tenant_policy(), Some(admission_policy()));
+		let _held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::QueueDisabled {
+				tenant_id: TenantId(7),
+			})
+		));
+	}
+
+	#[test]
+	fn queue_full_rejects_immediately() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(1, ByteCount::ZERO, 0, 1),
+			Some(admission_policy()),
+		);
+		let _held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _queued = expect_queued(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::QueueFull {
+				tenant_id: TenantId(7),
+			})
+		));
+		let slot = metric_slot(&controller, TenantId(7));
+		assert_eq!(slot.queue_full_rejections, 1);
+	}
+
+	#[test]
+	fn request_that_can_never_fit_owned_plus_borrow_rejects_immediately() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(1, ByteCount::new(4), 1, 1),
+			Some(admission_policy()),
+		);
+		let _held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(13)),
+			AdmissionAttempt::Rejected(TenantAdmissionRejection::RequestTooLarge {
+				tenant_id: TenantId(7),
+			})
+		));
+	}
+
+	#[test]
+	fn queue_timeout_removes_waiter_and_returns_resource_exhausted() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(2, ByteCount::ZERO, 0, 1),
+			Some(AdmissionPolicy {
+				max_queue_wait_ms: DurationMillis::new(1),
+				..admission_policy()
+			}),
+		);
+		let _held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let mut queued = expect_queued(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		queued.cancel_due_to_timeout();
+
+		let slot = metric_slot(&controller, TenantId(7));
+		assert_eq!(slot.queue_depth, 0);
+		assert_eq!(slot.queue_timeouts, 1);
+	}
+
+	#[test]
+	fn cancelled_queued_request_cannot_receive_a_stale_grant() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(2, ByteCount::ZERO, 0, 1),
+			Some(admission_policy()),
+		);
+		let held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let queued = expect_queued(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		drop(queued);
+		drop(held);
+
+		let slot = metric_slot(&controller, TenantId(7));
+		assert_eq!(slot.queue_depth, 0);
+		assert_eq!(controller.active_concurrency(TenantId(7)), 0);
+		assert_eq!(controller.used_memory(TenantId(7)), ByteCount::ZERO);
+	}
+
+	#[tokio::test]
+	async fn release_grants_next_waiter_without_leaking_owned_or_borrowed() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(2, ByteCount::ZERO, 0, 1),
+			Some(admission_policy()),
+		);
+		let held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let mut queued = expect_queued(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		drop(held);
+		let granted = queued.recv().await.expect("queued grant");
+
+		assert_eq!(controller.active_concurrency(TenantId(7)), 1);
+		assert_eq!(controller.used_memory(TenantId(7)), ByteCount::new(8));
+		drop(granted);
+		assert_eq!(controller.active_concurrency(TenantId(7)), 0);
+		assert_eq!(controller.used_memory(TenantId(7)), ByteCount::ZERO);
+	}
+
+	#[tokio::test]
+	async fn same_tenant_fifo_holds_new_request_cannot_bypass_existing_waiter() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(3, ByteCount::ZERO, 0, 1),
+			Some(admission_policy()),
+		);
+		let held = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let mut first = expect_queued(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let mut second = expect_queued(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		drop(held);
+		let first_grant = first.recv().await.expect("first waiter granted");
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(5), second.recv())
+				.await
+				.is_err(),
+			"second waiter must not bypass first"
+		);
+		drop(first_grant);
+		let second_grant = second.recv().await.expect("second waiter granted");
+		drop(second_grant);
+	}
+
+	#[tokio::test]
+	async fn weighted_tenants_receive_deterministic_integer_deficit_grant_order() {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(TenantId(7), admission_budget(8, 8, 1, 8, 1, 2));
+		per_tenant.insert(TenantId(8), admission_budget(8, 8, 1, 8, 1, 1));
+		let controller = TenantAdmissionController::new(
+			TenantBudgetPolicy::new(
+				TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+				per_tenant,
+			),
+			Some(admission_policy()),
+		);
+		let _tenant_7_owned = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let borrowed = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _tenant_8_owned = expect_granted(controller.try_admit(TenantId(8), ByteCount::new(8)));
+		let mut tenant_7_waiter =
+			expect_queued(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let mut tenant_8_waiter =
+			expect_queued(controller.try_admit(TenantId(8), ByteCount::new(8)));
+
+		drop(borrowed);
+		let first = tenant_7_waiter.recv().await.expect("weighted first grant");
+		assert_eq!(controller.active_concurrency(TenantId(7)), 1);
+		drop(first);
+		let second = tenant_8_waiter.recv().await.expect("weighted second grant");
+		drop(second);
+	}
+
+	#[test]
+	fn borrowed_memory_and_concurrency_never_exceed_shared_pool_caps() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(1, ByteCount::new(8), 1, 1),
+			Some(admission_policy()),
+		);
+		let _owned = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _borrowed = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let queued = controller.try_admit(TenantId(7), ByteCount::new(8));
+
+		assert!(matches!(queued, AdmissionAttempt::Queued(_)));
+		let slot = metric_slot(&controller, TenantId(7));
+		assert_eq!(slot.borrowed_memory, ByteCount::new(8));
+		assert_eq!(slot.borrowed_concurrency, 1);
+	}
+
+	#[test]
+	fn dropping_borrowed_memory_reservation_preserves_owned_memory_accounting() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(1, ByteCount::new(8), 1, 1),
+			Some(admission_policy()),
+		);
+		let owned = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let borrowed = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert_eq!(controller.used_memory(TenantId(7)), ByteCount::new(8));
+		let slot = metric_slot(&controller, TenantId(7));
+		assert_eq!(slot.borrowed_memory, ByteCount::new(8));
+		assert_eq!(slot.borrowed_concurrency, 1);
+
+		drop(borrowed);
+
+		assert_eq!(controller.used_memory(TenantId(7)), ByteCount::new(8));
+		let slot = metric_slot(&controller, TenantId(7));
+		assert_eq!(slot.borrowed_memory, ByteCount::ZERO);
+		assert_eq!(slot.borrowed_concurrency, 0);
+
+		drop(owned);
+
+		assert_eq!(controller.used_memory(TenantId(7)), ByteCount::ZERO);
+	}
+
+	#[test]
+	fn drained_unconfigured_queue_prunes_scheduler_deficit() {
+		let controller = TenantAdmissionController::new(
+			TenantBudgetPolicy::new(admission_budget(8, 8, 1, 0, 0, 1), HashMap::new()),
+			Some(admission_policy()),
+		);
+		let blocked = expect_granted(controller.try_admit(TenantId(8), ByteCount::new(8)));
+		let queued = expect_queued(controller.try_admit(TenantId(8), ByteCount::new(8)));
+		let unrelated = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		drop(unrelated);
+		{
+			let state = controller
+				.inner
+				.state
+				.lock()
+				.expect("tenant admission controller poisoned");
+			assert!(state.queues.contains_key(&TenantId(8)));
+			assert!(state.deficits.contains_key(&TenantId(8)));
+		}
+
+		drop(queued);
+		{
+			let state = controller
+				.inner
+				.state
+				.lock()
+				.expect("tenant admission controller poisoned");
+			assert!(!state.queues.contains_key(&TenantId(8)));
+			assert!(!state.deficits.contains_key(&TenantId(8)));
+		}
+
+		drop(blocked);
+	}
+
+	#[test]
+	fn per_tenant_borrow_never_exceeds_tenant_borrow_caps() {
+		let controller = TenantAdmissionController::new(
+			queued_policy(2, ByteCount::new(8), 1, 1),
+			Some(AdmissionPolicy {
+				shared_memory: ByteCount::new(64),
+				shared_concurrent_queries: 4,
+				..admission_policy()
+			}),
+		);
+		let _owned = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _borrowed = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Queued(_)
+		));
+		let slot = metric_slot(&controller, TenantId(7));
+		assert_eq!(slot.borrowed_memory, ByteCount::new(8));
+		assert_eq!(slot.borrowed_concurrency, 1);
+	}
+
+	#[test]
+	fn tenant_a_cannot_consume_tenant_b_owned_budget() {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(TenantId(7), admission_budget(8, 8, 1, 0, 0, 1));
+		per_tenant.insert(TenantId(8), admission_budget(8, 8, 1, 0, 0, 1));
+		let controller = TenantAdmissionController::new(
+			TenantBudgetPolicy::new(
+				TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+				per_tenant,
+			),
+			Some(admission_policy()),
+		);
+		let _tenant_7 = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(7), ByteCount::new(8)),
+			AdmissionAttempt::Queued(_)
+		));
+		assert_eq!(controller.used_memory(TenantId(8)), ByteCount::ZERO);
+	}
+
+	#[test]
+	fn borrowed_in_flight_query_not_preempted_when_other_tenant_arrives() {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(TenantId(7), admission_budget(8, 8, 1, 8, 1, 1));
+		per_tenant.insert(TenantId(8), admission_budget(8, 8, 1, 8, 1, 1));
+		let controller = TenantAdmissionController::new(
+			TenantBudgetPolicy::new(
+				TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+				per_tenant,
+			),
+			Some(admission_policy()),
+		);
+		let _tenant_7_owned = expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _tenant_7_borrowed =
+			expect_granted(controller.try_admit(TenantId(7), ByteCount::new(8)));
+		let _tenant_8_owned = expect_granted(controller.try_admit(TenantId(8), ByteCount::new(8)));
+
+		assert!(matches!(
+			controller.try_admit(TenantId(8), ByteCount::new(8)),
+			AdmissionAttempt::Queued(_)
+		));
+		let slot = metric_slot(&controller, TenantId(7));
+		assert_eq!(slot.borrowed_memory, ByteCount::new(8));
+		assert_eq!(slot.borrowed_concurrency, 1);
+		assert_eq!(controller.active_concurrency(TenantId(7)), 1);
+	}
+
+	fn admission_policy() -> AdmissionPolicy {
+		AdmissionPolicy {
+			max_queued_queries: 8,
+			max_queue_wait_ms: DurationMillis::new(100),
+			shared_memory: ByteCount::new(8),
+			shared_concurrent_queries: 1,
+		}
+	}
+
+	fn single_tenant_policy() -> TenantBudgetPolicy {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+		);
+		TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+			per_tenant,
+		)
+	}
+
+	fn queued_policy(
+		max_queued_queries: u32,
+		max_borrowed_memory: ByteCount,
+		max_borrowed_concurrent_queries: u32,
+		admission_weight: u32,
+	) -> TenantBudgetPolicy {
+		let mut per_tenant = HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			admission_budget(
+				8,
+				8,
+				max_queued_queries,
+				max_borrowed_memory.get(),
+				max_borrowed_concurrent_queries,
+				admission_weight,
+			),
+		);
+		TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
+			per_tenant,
+		)
+	}
+
+	fn admission_budget(
+		memory_per_task: u64,
+		aggregate_memory: u64,
+		max_queued_queries: u32,
+		max_borrowed_memory: u64,
+		max_borrowed_concurrent_queries: u32,
+		admission_weight: u32,
+	) -> TenantBudget {
+		TenantBudget::with_admission_limits(
+			ByteCount::new(memory_per_task),
+			ByteCount::new(aggregate_memory),
+			NonZeroU32::new(1).expect("nonzero"),
+			NonZeroU32::new(1).expect("nonzero"),
+			NonZeroU32::new(admission_weight).expect("nonzero"),
+			max_queued_queries,
+			ByteCount::new(max_borrowed_memory),
+			max_borrowed_concurrent_queries,
+		)
+	}
+
+	fn expect_granted(attempt: AdmissionAttempt) -> AdmissionReservation {
+		match attempt {
+			AdmissionAttempt::Granted(reservation) => reservation,
+			other => panic!("expected admission grant, got {other:?}"),
+		}
+	}
+
+	fn expect_queued(attempt: AdmissionAttempt) -> QueuedAdmission {
+		match attempt {
+			AdmissionAttempt::Queued(queued) => queued,
+			other => panic!("expected queued admission, got {other:?}"),
+		}
+	}
+
+	fn metric_slot(
+		controller: &TenantAdmissionController,
+		tenant_id: TenantId,
+	) -> TenantAdmissionMetricSlot {
+		controller
+			.metric_slots()
+			.into_iter()
+			.find(|slot| slot.tenant_id == Some(tenant_id))
+			.expect("metric slot")
 	}
 }

@@ -8260,6 +8260,8 @@ fn adr050_aggregate_admission_reserves_and_releases_by_tenant() {
 		"pub fn try_reserve(",
 		"pub struct TenantMemoryReservation",
 		"impl Drop for TenantMemoryReservation",
+		"pub struct TenantAdmissionController",
+		"pub struct AdmissionReservation",
 		"self.release_once();",
 	] {
 		assert!(
@@ -8267,7 +8269,9 @@ fn adr050_aggregate_admission_reserves_and_releases_by_tenant() {
 			"missing tenant memory accountant token {required}"
 		);
 	}
-	assert!(coordinator.contains(".try_reserve(context.tenant_id, query_budget.memory_per_task)"));
+	assert!(coordinator.contains("tenant_admission"));
+	assert!(coordinator.contains("try_admit(context.tenant_id, query_budget.memory_per_task)"));
+	assert!(coordinator.contains("_reservation: AdmissionReservation"));
 }
 
 #[test]
@@ -8286,7 +8290,7 @@ fn adr050_aggregate_admission_rejects_before_bind_or_execution() {
 		.expect("execute_query_with_admission")
 		.1;
 
-	assert!(execute_query.contains("let admitted = self.admit_query(&context)?;"));
+	assert!(execute_query.contains("let admitted = self.admit_query(&context).await?;"));
 	assert!(execute_query.contains(".execute_query_with_admission(plan, context, query_budget)"));
 	assert!(helper.contains("bind(plan, catalog.as_ref(), &self.config).await?"));
 }
@@ -8819,20 +8823,15 @@ fn adr052_concurrency_accountant_is_tenant_keyed_and_raii() {
 fn adr052_concurrency_admission_rejects_before_bind_or_execution() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
-	let admit = brace_blocks_after_marker(&coordinator, "fn admit_query")
+	let admit = brace_blocks_after_marker(&coordinator, "async fn admit_query")
 		.into_iter()
 		.next()
 		.expect("admit_query")
 		.1;
 
-	let concurrency_pos = admit
-		.find("tenant_concurrency")
-		.expect("concurrency reserve");
-	let memory_pos = admit.find("tenant_memory").expect("memory reserve");
-	assert!(
-		concurrency_pos < memory_pos,
-		"concurrency must be reserved before memory"
-	);
+	assert!(admit.contains("tenant_admission"));
+	assert!(admit.contains("try_admit"));
+	assert!(admit.contains("AdmissionAttempt::Rejected"));
 	assert!(coordinator.contains("tenant_concurrency_limit_rejects_before_bind"));
 	assert!(coordinator.contains("execute_query_with_context(&count_plan(), context)"));
 }
@@ -8842,8 +8841,8 @@ fn adr052_admitted_query_holds_memory_and_concurrency_reservations() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator source");
 
-	assert!(coordinator.contains("_concurrency_reservation: TenantConcurrencyReservation"));
-	assert!(coordinator.contains("_reservation: TenantMemoryReservation"));
+	assert!(coordinator.contains("_reservation: AdmissionReservation"));
+	assert!(coordinator.contains("TenantAdmissionController"));
 	assert!(coordinator.contains("memory_rejection_releases_concurrency_reservation"));
 	assert!(coordinator.contains("tenant_concurrency_reservation_releases_on_error"));
 	assert!(coordinator.contains("tenant_concurrency_reservation_releases_on_success"));
@@ -9591,8 +9590,6 @@ fn adr054_no_new_budget_or_governance_knob() {
 		"TenantRateLimiter",
 		"fairness_weight",
 		"weighted_fair",
-		"borrow",
-		"queue_depth",
 	] {
 		assert!(
 			!source.contains(forbidden),
@@ -9704,6 +9701,327 @@ fn adr054_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 	assert!(!source.contains("InvalidatedDescriptorV1"));
 	assert!(!source.contains("DescriptorRefreshMetricsV1"));
 	assert!(!source.contains("DescriptorInvalidationV1"));
+}
+
+#[test]
+fn adr055_queue_lives_at_admit_query_before_bind() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let execute =
+		brace_blocks_after_marker(&coordinator, "pub async fn execute_query_with_context")
+			.into_iter()
+			.next()
+			.expect("execute_query_with_context")
+			.1;
+	let admit_pos = execute
+		.find("admit_query(&context).await?")
+		.expect("admission before execution");
+	let execute_pos = execute
+		.find("execute_query_with_admission")
+		.expect("execute with admission");
+	assert!(admit_pos < execute_pos);
+	assert!(coordinator.contains("let bound = bind(plan, catalog.as_ref(), &self.config).await?"));
+}
+
+#[test]
+fn adr055_queue_entries_hold_no_plan_descriptor_or_reservation() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let waiter = budget
+		.split("struct Waiter")
+		.nth(1)
+		.expect("waiter")
+		.split("struct WaiterId")
+		.next()
+		.expect("waiter body");
+
+	for required in ["tenant_id", "memory", "sequence", "grant"] {
+		assert!(waiter.contains(required), "Waiter missing {required}");
+	}
+	for forbidden in [
+		"LogicalPlan",
+		"ExecutionPlan",
+		"TableBinding",
+		"Descriptor",
+		"Storage",
+	] {
+		assert!(
+			!waiter.contains(forbidden),
+			"Waiter must not retain {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr055_omitted_config_preserves_hard_reject() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(budget.contains("let Some(admission) = self.admission else"));
+	assert!(budget.contains("try_grant_owned_legacy_order"));
+	assert!(
+		budget.contains("omitted_admission_config_preserves_memory_and_concurrency_hard_reject")
+	);
+	assert!(config.contains("admission: Option<RawAdmissionPolicy>"));
+	assert!(config.contains("pub admission: Option<AdmissionPolicy>"));
+}
+
+#[test]
+fn adr055_no_queue_bypass_when_tenant_has_waiters() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(budget.contains("state.has_waiters(tenant_id)"));
+	assert!(budget.contains("same_tenant_fifo_holds_new_request_cannot_bypass_existing_waiter"));
+	assert!(budget.contains("push_back(waiter)"));
+}
+
+#[test]
+fn adr055_borrowing_uses_explicit_shared_pool_only() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	for required in [
+		"shared_memory",
+		"shared_concurrent_queries",
+		"shared_memory_used",
+		"shared_concurrency_used",
+		"borrowed_memory_and_concurrency_never_exceed_shared_pool_caps",
+	] {
+		assert!(
+			budget.contains(required),
+			"missing shared-pool token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr055_no_borrow_from_other_tenant_owned_budget() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(budget.contains("tenant_a_cannot_consume_tenant_b_owned_budget"));
+	assert!(budget.contains("budget.max_borrowed_memory"));
+	assert!(budget.contains("budget.max_borrowed_concurrent_queries"));
+	assert!(!budget.contains("idle_owned"));
+}
+
+#[test]
+fn adr055_grants_decide_memory_concurrency_and_borrow_atomically() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(budget.contains("struct GrantResources"));
+	assert!(budget.contains("compute_grant("));
+	assert!(budget.contains("apply_grant(state, tenant_id, resources)"));
+	assert!(
+		budget.contains("dropping_borrowed_memory_reservation_preserves_owned_memory_accounting")
+	);
+	assert!(!budget.contains("fetch_sub"));
+}
+
+#[test]
+fn adr055_weighted_scheduler_uses_integer_deficit_rr() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(budget.contains("deficits: HashMap<TenantId, i64>"));
+	assert!(budget.contains("admission_weight"));
+	assert!(budget.contains("weighted_tenants_receive_deterministic_integer_deficit_grant_order"));
+	assert!(budget.contains("remove_queue_if_empty"));
+	assert!(budget.contains("drained_unconfigured_queue_prunes_scheduler_deficit"));
+}
+
+#[test]
+fn adr055_no_preemption_or_mid_query_revocation() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(budget.contains("borrowed_in_flight_query_not_preempted_when_other_tenant_arrives"));
+	assert!(!coordinator.contains("revocation"));
+}
+
+#[test]
+fn adr055_no_background_scheduler_actor() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(budget.contains("pump_locked"));
+	assert!(budget.contains("Drop for AdmissionReservation"));
+	assert!(!budget.contains("tokio::spawn"));
+	assert!(!budget.contains("JoinHandle"));
+}
+
+#[test]
+fn adr055_admission_lock_not_held_across_await() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+
+	assert!(coordinator.contains("tokio::time::timeout(wait, queued.recv()).await"));
+	assert!(budget.contains("state: Mutex<AdmissionState>"));
+	assert!(budget.contains("drop(state);"));
+}
+
+#[test]
+fn adr055_no_rate_limit_or_connection_cap_surface() {
+	let source = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|(_, _, line)| line)
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"max_queries_per_second",
+		"token_bucket",
+		"RateLimitExceeded",
+		"max_concurrent_connections",
+		"connection_cap",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 055 must not add rate/connection surface {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr055_no_descriptor_registry_refresh_or_sync_change() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(!budget.contains("DescriptorRefresh"));
+	assert!(coordinator.contains("let admitted = self.admit_query(&context).await?;"));
+	assert!(coordinator.contains("execute_query_with_admission(plan, context, query_budget)"));
+	assert!(coordinator.contains("descriptor_evolved_table_id"));
+	assert!(
+		coordinator
+			.contains("bind_miss_after_grant_still_resource_exhausted_and_releases_admission")
+	);
+	assert!(coordinator.contains("adr054_evolved_retry_stays_inside_one_admission_reservation"));
+}
+
+#[test]
+fn adr055_no_wendelon_server_or_sql_wire_change() {
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(!sql_wire.contains("Admission"));
+	assert!(!sql_wire.contains("Queue"));
+	assert!(!wendelon_source.contains("TenantAdmissionController"));
+	assert!(!wendelon_source.contains("tenant_admission_queue"));
+}
+
+#[test]
+fn adr055_resource_exhausted_reused_no_new_sql_code() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+
+	assert!(daemon.contains("CatalogError::ResourceExhausted"));
+	assert!(daemon.contains("SqlErrorCode::ResourceExhausted"));
+	assert!(!wire.contains("AdmissionQueue"));
+	assert!(!wire.contains("QueueTimeout"));
+}
+
+#[test]
+fn adr055_metrics_bounded_configured_plus_other() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+
+	for metric in [
+		"tenant_admission_queue_depth",
+		"tenant_admission_borrowed_memory_bytes",
+		"tenant_admission_borrowed_concurrency",
+		"tenant_admission_queue_timeouts_total",
+		"tenant_admission_queue_full_rejections_total",
+	] {
+		assert!(observability.contains(metric), "missing metric {metric}");
+	}
+	assert!(observability.contains("metric_slots()"));
+	assert!(observability.contains("tenant_id=\\\"{label}\\\""));
+	assert!(observability.contains("\"other\""));
+	assert!(
+		observability_test
+			.contains("queue_and_borrow_metrics_are_configured_plus_other_no_table_labels")
+	);
+	for forbidden in ["query_id", "sql_text", "table_id", "fingerprint"] {
+		let offenders = observability
+			.lines()
+			.filter(|line| line.contains("tenant_admission_") && line.contains(forbidden))
+			.collect::<Vec<_>>();
+		assert!(
+			offenders.is_empty(),
+			"admission metric gained forbidden label {forbidden}: {offenders:?}"
+		);
+	}
+}
+
+#[test]
+fn adr055_prior_adr049_050_051_052_053_054_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in [
+		"adr049_", "adr050_", "adr051_", "adr052_", "adr053_", "adr054_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+}
+
+#[test]
+fn adr055_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr055_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	assert!(!worker.contains("TenantAdmissionController"));
+	assert!(!worker.contains("AdmissionPolicy"));
+	assert!(!worker.contains("tenant_admission_queue"));
+}
+
+#[test]
+fn adr055_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"ToronTenantAdmissionController",
+		"BoundedFairAdmissionQueue",
+		"AdmissionPolicyV1",
+		"TenantAdmissionControllerV1",
+		"QueuedAdmissionV1",
+		"AdmissionReservationV1",
+	]);
 }
 
 #[test]

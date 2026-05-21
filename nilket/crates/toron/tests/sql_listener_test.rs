@@ -597,6 +597,7 @@ fn toron_config_with_descriptor_for_tenant(
 			memory_budget_bytes: 64 * 1024 * 1024,
 		},
 		tenant_budgets: TenantBudgetPolicy::omitted_config(ByteCount::new(64 * 1024 * 1024)),
+		admission: None,
 		storage: ToronStorageConfig {
 			wendelon: ToronWendelonStorageConfig {
 				bootstrap_peers: vec![ToronWendelonBootstrapPeer {

@@ -4325,7 +4325,8 @@ along with the forward-sequence rewrite.
   capacity or an **explicit node-local shared borrow pool**, in
   **deterministic integer-weighted-deficit** order, FIFO within a tenant,
   **non-preemptive**. **Inert by default:** with no `[admission]` config it
-  is byte-for-byte ADR 050/052 hard reject — the reversal is opt-in. One
+  is byte-for-byte ADR 050/052 hard reject; per-tenant queue/borrow fields
+  default to zero, so the reversal is opt-in. One
   synchronous `TenantAdmissionController` lock (never held across an await),
   inline grant pump (no background actor). Reuses `ResourceExhausted`; no
   SQL wire / Wendelon change; ADR 053/054 descriptor behavior untouched
@@ -4345,7 +4346,10 @@ along with the forward-sequence rewrite.
   minority).
   **Single-plan posture; Toron-ring only; node-local.** Placement:
   Exterior Substrate → Toron home. Migration:
-  `plans/impl/055_bounded_fair_admission_queue.md`.
+  `plans/impl/055_bounded_fair_admission_queue.md`; implementation
+  evidence is recorded in
+  `plans/impl/055_bounded_fair_admission_queue_evidence.md`, including a
+  passing full `cargo test -p toron -- --test-threads=6` run.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4438,9 +4442,11 @@ tenant's owned memory/concurrency is full, a query may wait in a bounded
 per-tenant FIFO and be granted later from owned capacity or an explicit
 node-local shared borrow pool, in deterministic integer-weighted-deficit
 order, FIFO within a tenant, non-preemptive. **Inert by default:** with no
-`[admission]` config it is byte-for-byte ADR 050/052 hard reject. Final
-D-set: **18 decisions, 16 architecture guards + 3 convention guards, 16
-required fixtures + 1 optional**.
+`[admission]` config it is byte-for-byte ADR 050/052 hard reject;
+per-tenant queue/borrow fields default to zero, so an explicit
+`[admission]` section still needs tenant-level opt-in before a tenant can
+queue or borrow. Final D-set: **18 decisions, 16 architecture guards + 3
+convention guards, 16 required fixtures + 1 optional**.
 
 **Pure Toron-ring substrate; node-local single daemon; reuses 050/052/053/
 054; zero Wendelon server change, zero SQL wire change.**
@@ -4468,7 +4474,9 @@ required fixtures + 1 optional**.
   brand-clean / no-`*V1`. Placement: Exterior Substrate → Toron home.
 
 The migration is materialized in
-`plans/impl/055_bounded_fair_admission_queue.md`.
+`plans/impl/055_bounded_fair_admission_queue.md`; implementation evidence
+is recorded in
+`plans/impl/055_bounded_fair_admission_queue_evidence.md`.
 
 **Next committed candidates:**
 
