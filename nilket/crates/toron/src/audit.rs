@@ -12,7 +12,11 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::AuditConfig;
-use crate::distributed::identity::QueryId;
+use crate::distributed::identity::{AttemptId, QueryId, StageId, TaskId, WorkerId};
+use crate::error::{
+	BindingError, CatalogError, ExecutionError, FrontendError, QueryError, RuntimeError,
+	SpillError, StorageError, TaskFailureKind, WireError,
+};
 use crate::ir::{LogicalPlan, SessionId};
 use crate::network::observability::ReadinessState;
 use crate::sql_wire::SqlErrorCode;
@@ -105,6 +109,12 @@ pub enum ToronAuditOperation {
 	QueryCancelled,
 	QueryTimedOut,
 	QueryDisconnectAborted,
+	WorkerTaskStarted,
+	WorkerTaskCompleted,
+	WorkerTaskFailed,
+	WorkerTaskCancelled,
+	ObservabilityReadyAccess,
+	ObservabilityMetricsAccess,
 }
 
 impl ToronAuditOperation {
@@ -125,6 +135,12 @@ impl ToronAuditOperation {
 			Self::QueryCancelled => "toron.sql.query.cancelled",
 			Self::QueryTimedOut => "toron.sql.query.timed_out",
 			Self::QueryDisconnectAborted => "toron.sql.query.disconnect_aborted",
+			Self::WorkerTaskStarted => "toron.worker.task.started",
+			Self::WorkerTaskCompleted => "toron.worker.task.completed",
+			Self::WorkerTaskFailed => "toron.worker.task.failed",
+			Self::WorkerTaskCancelled => "toron.worker.task.cancelled",
+			Self::ObservabilityReadyAccess => "toron.observability.ready.access",
+			Self::ObservabilityMetricsAccess => "toron.observability.metrics.access",
 		}
 	}
 }
@@ -134,6 +150,8 @@ pub enum ToronAuditEventClass {
 	Lifecycle,
 	EdgeDenial,
 	QueryOutcome,
+	TaskLifecycle,
+	ObservabilityAccess,
 	Audit,
 }
 
@@ -142,15 +160,19 @@ impl ToronAuditEventClass {
 		Self::Lifecycle,
 		Self::EdgeDenial,
 		Self::QueryOutcome,
+		Self::TaskLifecycle,
+		Self::ObservabilityAccess,
 		Self::Audit,
 	];
-	pub const COUNT: usize = 4;
+	pub const COUNT: usize = 6;
 
 	pub fn as_str(self) -> &'static str {
 		match self {
 			Self::Lifecycle => "lifecycle",
 			Self::EdgeDenial => "edge_denial",
 			Self::QueryOutcome => "query_outcome",
+			Self::TaskLifecycle => "task_lifecycle",
+			Self::ObservabilityAccess => "observability_access",
 			Self::Audit => "audit",
 		}
 	}
@@ -160,7 +182,9 @@ impl ToronAuditEventClass {
 			Self::Lifecycle => 0,
 			Self::EdgeDenial => 1,
 			Self::QueryOutcome => 2,
-			Self::Audit => 3,
+			Self::TaskLifecycle => 3,
+			Self::ObservabilityAccess => 4,
+			Self::Audit => 5,
 		}
 	}
 }
@@ -422,6 +446,30 @@ impl From<SqlErrorCode> for SqlErrorCodeClass {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkerTaskAuditFields {
+	pub(crate) tenant_id: TenantId,
+	pub(crate) query_id: QueryId,
+	pub(crate) stage_id: StageId,
+	pub(crate) task_id: TaskId,
+	pub(crate) attempt_id: AttemptId,
+	pub(crate) worker_id: WorkerId,
+	pub(crate) stage_role: &'static str,
+	pub(crate) operator_kind: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservabilityAccessAuditFields {
+	pub(crate) operation: ToronAuditOperation,
+	pub(crate) outcome: AuditOutcome,
+	pub(crate) endpoint: &'static str,
+	pub(crate) method_class: &'static str,
+	pub(crate) status_class: &'static str,
+	pub(crate) auth_class: &'static str,
+	pub(crate) outcome_class: &'static str,
+	pub(crate) actor_key_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ToronAuditEvent {
 	operation: ToronAuditOperation,
 	event_class: ToronAuditEventClass,
@@ -434,6 +482,20 @@ pub struct ToronAuditEvent {
 	sql_error_code_class: Option<SqlErrorCodeClass>,
 	duration_bucket: Option<DurationBucket>,
 	row_count_bucket: Option<RowCountBucket>,
+	stage_id: Option<StageId>,
+	task_id: Option<TaskId>,
+	attempt_id: Option<AttemptId>,
+	worker_id: Option<WorkerId>,
+	stage_role: Option<&'static str>,
+	operator_kind: Option<&'static str>,
+	outcome_class: Option<&'static str>,
+	error_class: Option<&'static str>,
+	endpoint: Option<&'static str>,
+	method_class: Option<&'static str>,
+	status_class: Option<&'static str>,
+	auth_class: Option<&'static str>,
+	actor_role: Option<&'static str>,
+	actor_key_id: Option<String>,
 	message: &'static str,
 }
 
@@ -502,6 +564,90 @@ impl ToronAuditEvent {
 		.with_security_relevant()
 	}
 
+	pub fn worker_task_started(fields: WorkerTaskAuditFields) -> Self {
+		Self::worker_task(
+			ToronAuditOperation::WorkerTaskStarted,
+			fields,
+			AuditOutcome::Allowed,
+			"started",
+			None,
+			"worker task started",
+		)
+	}
+
+	pub fn worker_task_completed(fields: WorkerTaskAuditFields) -> Self {
+		Self::worker_task(
+			ToronAuditOperation::WorkerTaskCompleted,
+			fields,
+			AuditOutcome::Allowed,
+			"completed",
+			None,
+			"worker task completed",
+		)
+	}
+
+	pub fn worker_task_failed(fields: WorkerTaskAuditFields, error_class: &'static str) -> Self {
+		Self::worker_task(
+			ToronAuditOperation::WorkerTaskFailed,
+			fields,
+			AuditOutcome::Error,
+			"failed",
+			Some(error_class),
+			"worker task failed",
+		)
+	}
+
+	pub fn worker_task_cancelled(fields: WorkerTaskAuditFields) -> Self {
+		Self::worker_task(
+			ToronAuditOperation::WorkerTaskCancelled,
+			fields,
+			AuditOutcome::Denied,
+			"cancelled",
+			Some("cancelled"),
+			"worker task cancelled",
+		)
+	}
+
+	pub fn observability_access(fields: ObservabilityAccessAuditFields) -> Self {
+		Self::new(
+			fields.operation,
+			ToronAuditEventClass::ObservabilityAccess,
+			fields.outcome,
+			"observability access",
+		)
+		.with_security_relevant()
+		.with_endpoint(fields.endpoint)
+		.with_method_class(fields.method_class)
+		.with_status_class(fields.status_class)
+		.with_auth_class(fields.auth_class)
+		.with_outcome_class(fields.outcome_class)
+		.with_actor("observability_probe", fields.actor_key_id)
+	}
+
+	fn worker_task(
+		operation: ToronAuditOperation,
+		fields: WorkerTaskAuditFields,
+		outcome: AuditOutcome,
+		outcome_class: &'static str,
+		error_class: Option<&'static str>,
+		message: &'static str,
+	) -> Self {
+		let actor_key_id = format!("worker:{}", fields.worker_id.get());
+		Self::new(
+			operation,
+			ToronAuditEventClass::TaskLifecycle,
+			outcome,
+			message,
+		)
+		.with_security_relevant()
+		.with_tenant_option(Some(fields.tenant_id))
+		.with_query_id(fields.query_id)
+		.with_worker_task_identity(&fields)
+		.with_outcome_class(outcome_class)
+		.with_error_class_option(error_class)
+		.with_actor("internal_compute", Some(actor_key_id))
+	}
+
 	fn new(
 		operation: ToronAuditOperation,
 		event_class: ToronAuditEventClass,
@@ -520,6 +666,20 @@ impl ToronAuditEvent {
 			sql_error_code_class: None,
 			duration_bucket: None,
 			row_count_bucket: None,
+			stage_id: None,
+			task_id: None,
+			attempt_id: None,
+			worker_id: None,
+			stage_role: None,
+			operator_kind: None,
+			outcome_class: None,
+			error_class: None,
+			endpoint: None,
+			method_class: None,
+			status_class: None,
+			auth_class: None,
+			actor_role: None,
+			actor_key_id: None,
 			message,
 		}
 	}
@@ -564,8 +724,63 @@ impl ToronAuditEvent {
 		self
 	}
 
+	fn with_worker_task_identity(mut self, fields: &WorkerTaskAuditFields) -> Self {
+		self.stage_id = Some(fields.stage_id);
+		self.task_id = Some(fields.task_id);
+		self.attempt_id = Some(fields.attempt_id);
+		self.worker_id = Some(fields.worker_id);
+		self.stage_role = Some(fields.stage_role);
+		self.operator_kind = Some(fields.operator_kind);
+		self
+	}
+
+	fn with_outcome_class(mut self, outcome_class: &'static str) -> Self {
+		self.outcome_class = Some(outcome_class);
+		self
+	}
+
+	fn with_error_class_option(mut self, error_class: Option<&'static str>) -> Self {
+		self.error_class = error_class;
+		self
+	}
+
+	fn with_endpoint(mut self, endpoint: &'static str) -> Self {
+		self.endpoint = Some(endpoint);
+		self
+	}
+
+	fn with_method_class(mut self, method_class: &'static str) -> Self {
+		self.method_class = Some(method_class);
+		self
+	}
+
+	fn with_status_class(mut self, status_class: &'static str) -> Self {
+		self.status_class = Some(status_class);
+		self
+	}
+
+	fn with_auth_class(mut self, auth_class: &'static str) -> Self {
+		self.auth_class = Some(auth_class);
+		self
+	}
+
+	fn with_actor(mut self, actor_role: &'static str, actor_key_id: Option<String>) -> Self {
+		self.actor_role = Some(actor_role);
+		self.actor_key_id = actor_key_id;
+		self
+	}
+
+	pub fn operation(&self) -> ToronAuditOperation {
+		self.operation
+	}
+
 	pub fn event_class(&self) -> ToronAuditEventClass {
 		self.event_class
+	}
+
+	#[cfg(test)]
+	pub(crate) fn error_class_for_test(&self) -> Option<&'static str> {
+		self.error_class
 	}
 
 	pub fn security_relevant(&self) -> bool {
@@ -606,7 +821,194 @@ impl ToronAuditEvent {
 		if let Some(row_count_bucket) = self.row_count_bucket {
 			event = event.with_parameter("row_count_bucket", row_count_bucket.as_str());
 		}
+		if let Some(stage_id) = self.stage_id {
+			event = event.with_parameter("stage_id", stage_id.get().to_string());
+		}
+		if let Some(task_id) = self.task_id {
+			event = event.with_parameter("task_id", task_id.get().to_string());
+		}
+		if let Some(attempt_id) = self.attempt_id {
+			event = event.with_parameter("attempt_id", attempt_id.get().to_string());
+		}
+		if let Some(worker_id) = self.worker_id {
+			event = event.with_parameter("worker_id", worker_id.get().to_string());
+		}
+		if let Some(stage_role) = self.stage_role {
+			event = event.with_parameter("stage_role", stage_role);
+		}
+		if let Some(operator_kind) = self.operator_kind {
+			event = event.with_parameter("operator_kind", operator_kind);
+		}
+		if let Some(outcome_class) = self.outcome_class {
+			event = event.with_parameter("outcome_class", outcome_class);
+		}
+		if let Some(error_class) = self.error_class {
+			event = event.with_parameter("error_class", error_class);
+		}
+		if let Some(endpoint) = self.endpoint {
+			event = event.with_parameter("endpoint", endpoint);
+		}
+		if let Some(method_class) = self.method_class {
+			event = event.with_parameter("method_class", method_class);
+		}
+		if let Some(status_class) = self.status_class {
+			event = event.with_parameter("status_class", status_class);
+		}
+		if let Some(auth_class) = self.auth_class {
+			event = event.with_parameter("auth_class", auth_class);
+		}
+		if let Some(actor_role) = self.actor_role {
+			event = event.with_parameter("actor_role", actor_role);
+			if let Some(actor_key_id) = &self.actor_key_id {
+				event = event
+					.with_parameter("actor_key_id", actor_key_id.clone())
+					.with_actor(shared_audit::AuditActor {
+						cert_subject: None,
+						role: actor_role.to_string(),
+						trust_domain: "toron".to_string(),
+						key_id: actor_key_id.clone(),
+						actor_tenant_id: self.tenant_id.map(|tenant_id| tenant_id.0.to_string()),
+						node_id: None,
+						break_glass: false,
+						scopes: Vec::new(),
+					});
+			}
+		}
 		Ok(event)
+	}
+}
+
+pub fn worker_task_error_class(error: &QueryError) -> &'static str {
+	match error {
+		QueryError::Execution(error) => execution_error_class(error),
+		QueryError::Storage(error) => storage_error_class(error),
+		QueryError::Binding(error) => binding_error_class(error),
+		QueryError::Catalog(error) => catalog_error_class(error),
+		QueryError::Frontend(error) => frontend_error_class(error),
+		QueryError::Wire(error) => wire_error_class(error),
+		QueryError::Spill(error) => spill_error_class(error),
+		QueryError::Runtime(error) => runtime_error_class(error),
+		QueryError::Io(_) => "io",
+		QueryError::Arrow(_) => "arrow",
+		QueryError::Remote { .. } => "remote_worker",
+		QueryError::UnexpectedMessage { .. } => "unexpected_message",
+		QueryError::SchemaInstability => "schema_instability",
+		QueryError::Internal { .. } => "internal",
+	}
+}
+
+fn runtime_error_class(error: &RuntimeError) -> &'static str {
+	match error {
+		RuntimeError::ProtocolMismatch { .. } => "protocol_mismatch",
+		RuntimeError::PartitionStoreMismatch { .. } => "partition_store_mismatch",
+		RuntimeError::TaskFailure { kind } => task_failure_error_class(kind),
+	}
+}
+
+pub fn task_failure_error_class(kind: &TaskFailureKind) -> &'static str {
+	match kind {
+		TaskFailureKind::ProtocolMismatch => "protocol_mismatch",
+		TaskFailureKind::DescriptorEvolved { .. } => "descriptor_evolved",
+		TaskFailureKind::WorkerLost { .. } => "worker_lost",
+		TaskFailureKind::TaskFailed { .. } => "task_failed",
+		TaskFailureKind::BudgetExhausted { .. } => "budget_exhausted",
+		TaskFailureKind::Cancelled => "cancelled",
+		TaskFailureKind::Internal { .. } => "internal",
+	}
+}
+
+fn execution_error_class(error: &ExecutionError) -> &'static str {
+	match error {
+		ExecutionError::Storage(error) => storage_error_class(error),
+		ExecutionError::Compute(_) => "compute",
+		ExecutionError::Binding(error) => binding_error_class(error),
+		ExecutionError::NotImplemented { .. } => "not_implemented",
+		ExecutionError::ColumnNotFound { .. } => "column_not_found",
+		ExecutionError::InvalidExpression { .. } => "invalid_expression",
+		ExecutionError::Kernel { .. } => "kernel",
+		ExecutionError::BudgetExhausted { .. } => "budget_exhausted",
+		ExecutionError::ConcurrencyExhausted { .. } => "concurrency_exhausted",
+	}
+}
+
+fn storage_error_class(error: &StorageError) -> &'static str {
+	match error {
+		StorageError::TableNotFound { .. } => "table_not_found",
+		StorageError::DescriptorEvolved { .. } => "descriptor_evolved",
+		StorageError::Cancelled => "cancelled",
+		StorageError::ReadBoundUnavailable { .. } => "read_bound_unavailable",
+		StorageError::InvalidPbcForDescriptor { .. } => "invalid_pbc_for_descriptor",
+		StorageError::InvalidPbcProgram { .. } => "invalid_pbc_program",
+		StorageError::PermissionDenied { .. } => "permission_denied",
+		StorageError::Unavailable { .. } => "storage_unavailable",
+		StorageError::Client { .. } => "storage_client",
+		StorageError::Arrow(_) => "arrow",
+		StorageError::Internal { .. } => "internal",
+	}
+}
+
+fn binding_error_class(error: &BindingError) -> &'static str {
+	match error {
+		BindingError::Catalog(error) => catalog_error_class(error),
+		BindingError::UnknownColumn { .. } => "unknown_column",
+		BindingError::AmbiguousColumn { .. } | BindingError::AmbiguousColumnRef { .. } => {
+			"ambiguous_column"
+		}
+		BindingError::UnknownTableRef { .. } => "unknown_table_ref",
+		BindingError::JoinPredicateNotEqui => "join_predicate_not_equi",
+		BindingError::JoinKeyTypeMismatch { .. } => "join_key_type_mismatch",
+		BindingError::JoinKeyTypeUnsupported { .. } => "join_key_type_unsupported",
+		BindingError::JoinComputedKeyUnsupported => "join_computed_key_unsupported",
+		BindingError::JoinPartitionCountMismatch { .. } => "join_partition_count_mismatch",
+		BindingError::JoinKeyExchangeMismatch => "join_key_exchange_mismatch",
+		BindingError::BroadcastBuildSidePlacement => "broadcast_build_side_placement",
+		BindingError::BroadcastCapExceededAtBind { .. } => "broadcast_cap_exceeded",
+		BindingError::TypeMismatch { .. } => "type_mismatch",
+		BindingError::ExperimentalKernel { .. } => "experimental_kernel",
+		BindingError::UnresolvedTable { .. } => "unresolved_table",
+		BindingError::UnsupportedExpression { .. } => "unsupported_expression",
+	}
+}
+
+fn catalog_error_class(error: &CatalogError) -> &'static str {
+	match error {
+		CatalogError::TableNotFound { .. } => "table_not_found",
+		CatalogError::SchemaNotFound { .. } => "schema_not_found",
+		CatalogError::TableAlreadyExists { .. } => "table_already_exists",
+		CatalogError::SchemaMismatch { .. } => "schema_mismatch",
+		CatalogError::AdminUnavailable { .. } => "admin_unavailable",
+		CatalogError::AdminFailed { .. } => "admin_failed",
+		CatalogError::ResourceExhausted { .. } => "resource_exhausted",
+		CatalogError::FingerprintResolution { .. } => "fingerprint_resolution",
+		CatalogError::Storage(error) => storage_error_class(error),
+	}
+}
+
+fn frontend_error_class(error: &FrontendError) -> &'static str {
+	match error {
+		FrontendError::SqlParse { .. } => "sql_parse",
+		FrontendError::RuneCompile { .. } => "rune_compile",
+		FrontendError::RuneRuntime { .. } => "rune_runtime",
+		FrontendError::RuneSandbox { .. } => "rune_sandbox",
+		FrontendError::Unsupported { .. } => "unsupported_frontend",
+	}
+}
+
+fn wire_error_class(error: &WireError) -> &'static str {
+	match error {
+		WireError::Decode(_) => "wire_decode",
+		WireError::FrameTooLarge { .. } => "wire_frame_too_large",
+	}
+}
+
+fn spill_error_class(error: &SpillError) -> &'static str {
+	match error {
+		SpillError::Random { .. } => "spill_random",
+		SpillError::Crypto { .. } => "spill_crypto",
+		SpillError::MissingSpill { .. } => "missing_spill",
+		SpillError::EmptySpill { .. } => "empty_spill",
+		SpillError::Io(_) => "spill_io",
+		SpillError::Arrow(_) => "spill_arrow",
 	}
 }
 
@@ -853,6 +1255,14 @@ mod tests {
 	}
 
 	#[test]
+	fn worker_audit_node_id_validation() {
+		assert!(ToronAuditNodeId::new("toron-n-7", 7).is_ok());
+		assert!(ToronAuditNodeId::new("toron-n-7", 8).is_err());
+		assert!(ToronAuditNodeId::new("worker-7", 7).is_err());
+		assert!(ToronAuditNodeId::new("toron-n-00000000-0000-0000-0000-000000000007", 7).is_err());
+	}
+
+	#[test]
 	fn statement_class_maps_mutation_and_select_plans() {
 		let select = LogicalPlan::Scan {
 			table: crate::ir::TableId(1),
@@ -891,5 +1301,83 @@ mod tests {
 				.security_unrecorded_count(ToronAuditSecurityEventUnrecordedReason::EmitterClosed,),
 			1
 		);
+	}
+
+	#[test]
+	fn worker_task_audit_event_serializes_bounded_identity_and_classes() {
+		let node_id = ToronAuditNodeId::new("toron-n-1", 1).expect("node id");
+		let fields = WorkerTaskAuditFields {
+			tenant_id: TenantId(7),
+			query_id: QueryId::from_u128(9),
+			stage_id: StageId::new(2),
+			task_id: TaskId::new(3),
+			attempt_id: AttemptId::first(),
+			worker_id: WorkerId::from_u128(4),
+			stage_role: "scan",
+			operator_kind: "scan",
+		};
+
+		let event = ToronAuditEvent::worker_task_failed(fields, "storage_unavailable")
+			.with_duration(Duration::from_millis(25));
+		let shared = event.to_shared(&node_id).expect("shared event");
+
+		assert_eq!(shared.operation, "toron.worker.task.failed");
+		assert_eq!(
+			shared.parameters.get("event_class"),
+			Some(&json!("task_lifecycle"))
+		);
+		assert_eq!(shared.parameters.get("stage_id"), Some(&json!("2")));
+		assert_eq!(shared.parameters.get("task_id"), Some(&json!("3")));
+		assert_eq!(
+			shared.parameters.get("error_class"),
+			Some(&json!("storage_unavailable"))
+		);
+		assert_eq!(
+			shared.parameters.get("actor_role"),
+			Some(&json!("internal_compute"))
+		);
+		assert!(shared.parameters.contains_key("actor_key_id"));
+		assert!(!shared.parameters.contains_key("sql"));
+		assert!(!shared.parameters.contains_key("raw_error"));
+	}
+
+	#[test]
+	fn observability_access_audit_event_serializes_bounded_monitor_actor() {
+		let node_id = ToronAuditNodeId::new("toron-n-1", 1).expect("node id");
+		let event = ToronAuditEvent::observability_access(ObservabilityAccessAuditFields {
+			operation: ToronAuditOperation::ObservabilityReadyAccess,
+			outcome: AuditOutcome::Allowed,
+			endpoint: "ready",
+			method_class: "get",
+			status_class: "2xx",
+			auth_class: "mtls_monitor",
+			outcome_class: "allowed",
+			actor_key_id: Some("monitor:prometheus".to_string()),
+		});
+
+		let shared = event.to_shared(&node_id).expect("shared event");
+
+		assert_eq!(shared.operation, "toron.observability.ready.access");
+		assert_eq!(
+			shared.parameters.get("event_class"),
+			Some(&json!("observability_access"))
+		);
+		assert_eq!(shared.parameters.get("endpoint"), Some(&json!("ready")));
+		assert_eq!(shared.parameters.get("method_class"), Some(&json!("get")));
+		assert_eq!(shared.parameters.get("status_class"), Some(&json!("2xx")));
+		assert_eq!(
+			shared.parameters.get("auth_class"),
+			Some(&json!("mtls_monitor"))
+		);
+		assert_eq!(
+			shared.parameters.get("actor_key_id"),
+			Some(&json!("monitor:prometheus"))
+		);
+		assert_eq!(
+			shared.actor.as_ref().map(|actor| actor.role.as_str()),
+			Some("observability_probe")
+		);
+		assert!(!shared.parameters.contains_key("san"));
+		assert!(!shared.parameters.contains_key("cert"));
 	}
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,12 +18,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use toron::audit::{
-	ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOutputKind,
-	ToronAuditSecurityEventUnrecordedReason,
+	AuditSinksConfig, ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics,
+	ToronAuditOutputKind, ToronAuditSecurityEventUnrecordedReason,
 };
 use toron::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use toron::config::{
-	AuditConfig, CoordinatorConfig, LISTENER_BIND_COLLISION_DIAGNOSTIC,
+	AuditConfig, AuditEnabledConfig, CoordinatorConfig, LISTENER_BIND_COLLISION_DIAGNOSTIC,
 	OBSERVABILITY_HEALTH_LOOPBACK_DIAGNOSTIC, OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC,
 	ObservabilityConfig, ObservabilityListeners, SqlConfig, SqlTransport, TlsConfig,
 	ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig, ToronStorageConfig,
@@ -561,6 +561,321 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 	daemon.shutdown().await.expect("shutdown daemon");
 }
 
+#[tokio::test]
+async fn observability_ready_allowed_emits_access_audit() {
+	let worker_id = WorkerId::from_u128(71);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let mut config = observability_config(worker_id, &pki);
+	let audit_path = enable_observability_audit(&mut config, "ready-access-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints")
+		.ready;
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = mtls_http_request(
+		endpoint,
+		&server_name,
+		&pki.monitor_cert,
+		&pki.monitor_key,
+		&pki.ca_cert,
+		"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await
+	.expect("ready response");
+	assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&[
+			"toron.observability.ready.access",
+			"observability_access",
+			"monitor:prometheus",
+			"observability_probe",
+			"mtls_monitor",
+			"2xx",
+		],
+	)
+	.await;
+	assert!(!audit.contains(&canonical_monitor_dns_name(
+		"prometheus",
+		DEFAULT_CLUSTER_DOMAIN
+	)));
+	assert!(!audit.contains("127.0.0.1"));
+	assert!(!audit.contains("BEGIN CERTIFICATE"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn observability_ready_tls_failure_emits_denied_access_audit() {
+	let worker_id = WorkerId::from_u128(72);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let mut config = observability_config(worker_id, &pki);
+	let audit_path = enable_observability_audit(&mut config, "ready-denied-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints")
+		.ready;
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	assert_mtls_request_rejected(
+		endpoint,
+		&server_name,
+		&pki.client_cert,
+		&pki.client_key,
+		&pki.ca_cert,
+		"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await;
+
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&[
+			"toron.observability.ready.access",
+			"observability_access",
+			"mtls_handshake_failure",
+			"denied",
+		],
+	)
+	.await;
+	assert!(!audit.contains(&canonical_client_dns_name(
+		"analytics",
+		DEFAULT_CLUSTER_DOMAIN
+	)));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn observability_metrics_allowed_emits_access_audit() {
+	let worker_id = WorkerId::from_u128(75);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let mut config = observability_config(worker_id, &pki);
+	let audit_path = enable_observability_audit(&mut config, "metrics-access-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints")
+		.metrics;
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = mtls_http_request(
+		endpoint,
+		&server_name,
+		&pki.monitor_cert,
+		&pki.monitor_key,
+		&pki.ca_cert,
+		"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await
+	.expect("metrics response");
+	assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&[
+			"toron.observability.metrics.access",
+			"observability_access",
+			"monitor:prometheus",
+			"observability_probe",
+			"mtls_monitor",
+			"get",
+			"2xx",
+			"allowed",
+		],
+	)
+	.await;
+	assert!(!audit.contains(&canonical_monitor_dns_name(
+		"prometheus",
+		DEFAULT_CLUSTER_DOMAIN
+	)));
+	assert!(!audit.contains("127.0.0.1"));
+	assert!(!audit.contains("BEGIN CERTIFICATE"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn observability_metrics_method_not_allowed_emits_denied_access_audit() {
+	let worker_id = WorkerId::from_u128(73);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let mut config = observability_config(worker_id, &pki);
+	let audit_path = enable_observability_audit(&mut config, "metrics-denied-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints")
+		.metrics;
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = mtls_http_request(
+		endpoint,
+		&server_name,
+		&pki.monitor_cert,
+		&pki.monitor_key,
+		&pki.ca_cert,
+		"POST /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await
+	.expect("metrics response");
+	assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&[
+			"toron.observability.metrics.access",
+			"observability_access",
+			"method_class",
+			"post",
+			"4xx",
+			"denied",
+		],
+	)
+	.await;
+	assert!(audit.contains("monitor:prometheus"));
+	assert!(!audit.contains("BEGIN CERTIFICATE"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn observability_access_records_admitted_monitor_principal_only() {
+	let worker_id = WorkerId::from_u128(76);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let mut config = observability_config(worker_id, &pki);
+	let audit_path = enable_observability_audit(&mut config, "access-principal-only-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints")
+		.ready;
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = mtls_http_request(
+		endpoint,
+		&server_name,
+		&pki.monitor_cert,
+		&pki.monitor_key,
+		&pki.ca_cert,
+		"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await
+	.expect("ready response");
+	assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&[
+			"toron.observability.ready.access",
+			"actor_key_id",
+			"monitor:prometheus",
+			"actor_role",
+			"observability_probe",
+		],
+	)
+	.await;
+	assert!(!audit.contains(&canonical_monitor_dns_name(
+		"prometheus",
+		DEFAULT_CLUSTER_DOMAIN
+	)));
+	assert!(!audit.contains(&canonical_client_dns_name(
+		"analytics",
+		DEFAULT_CLUSTER_DOMAIN
+	)));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn observability_access_audit_omits_raw_san_dn_ip_and_certificate_material() {
+	let worker_id = WorkerId::from_u128(77);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let mut config = observability_config(worker_id, &pki);
+	let audit_path = enable_observability_audit(&mut config, "access-redaction-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints")
+		.metrics;
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = mtls_http_request(
+		endpoint,
+		&server_name,
+		&pki.monitor_cert,
+		&pki.monitor_key,
+		&pki.ca_cert,
+		"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await
+	.expect("metrics response");
+	assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&[
+			"toron.observability.metrics.access",
+			"monitor:prometheus",
+			"mtls_monitor",
+		],
+	)
+	.await;
+	for forbidden in [
+		canonical_monitor_dns_name("prometheus", DEFAULT_CLUSTER_DOMAIN),
+		canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN),
+		"127.0.0.1".to_string(),
+		"BEGIN CERTIFICATE".to_string(),
+		"CERTIFICATE".to_string(),
+		"CN=".to_string(),
+		"DNS:".to_string(),
+		"serial".to_string(),
+		"san".to_string(),
+	] {
+		assert!(!audit.contains(&forbidden), "{forbidden} leaked into audit");
+	}
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
+async fn observability_health_does_not_emit_audit() {
+	let worker_id = WorkerId::from_u128(74);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let mut config = observability_config(worker_id, &pki);
+	let audit_path = enable_observability_audit(&mut config, "health-no-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints")
+		.health;
+
+	let response = plain_http_request(endpoint, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+		.await
+		.expect("health response");
+	assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+	let audit = wait_for_audit_records(&audit_path, &["toron.lifecycle.startup"]).await;
+	tokio::time::sleep(Duration::from_millis(50)).await;
+	let audit = format!(
+		"{audit}\n{}",
+		std::fs::read_to_string(&audit_path).unwrap_or_default()
+	);
+	assert!(!audit.contains("toron.observability.health"));
+	assert!(!audit.contains("toron.observability.ready.access"));
+	assert!(!audit.contains("toron.observability.metrics.access"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
 #[test]
 fn resource_metrics_label_configured_tenant() {
 	let body = sample_resource_metrics_body();
@@ -1056,6 +1371,36 @@ fn observability_config(worker_id: WorkerId, pki: &TestPki) -> ToronBootstrapCon
 			telemetry: None,
 		},
 		audit: AuditConfig::Disabled,
+	}
+}
+
+fn enable_observability_audit(config: &mut ToronBootstrapConfig, tag: &str) -> PathBuf {
+	let dir = fresh_dir(tag);
+	let audit_path = dir.join("toron-audit.ndjson");
+	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
+		node_id: "toron-n-1".to_string(),
+		node_numeric_id: 1,
+		local_path: audit_path.clone(),
+		queue_capacity: NonZeroUsize::new(64).expect("nonzero queue capacity"),
+		sinks: AuditSinksConfig::default(),
+	}));
+	audit_path
+}
+
+async fn wait_for_audit_records(path: &Path, required: &[&str]) -> String {
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+	loop {
+		let body = std::fs::read_to_string(path).unwrap_or_default();
+		if required.iter().all(|needle| body.contains(needle)) {
+			return body;
+		}
+		if tokio::time::Instant::now() >= deadline {
+			panic!(
+				"audit file {} missing {required:?}; body:\n{body}",
+				path.display()
+			);
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
 }
 

@@ -198,6 +198,25 @@ pub fn accepted_sql_tenant(
 	tenant_id.ok_or(TlsError::SanShapeRejected)
 }
 
+pub fn accepted_observability_monitor_principal(
+	certs: &[CertificateDer<'static>],
+	cluster_domain: &str,
+) -> Result<String, TlsError> {
+	let leaf = certs.first().ok_or(TlsError::SanShapeRejected)?;
+	let dns_sans = extract_dns_sans(leaf).map_err(TlsError::from)?;
+	let mut principal = None;
+	for san in dns_sans {
+		if let Ok(PeerKind::Monitor {
+			principal: admitted,
+		}) = admit_san(&san, ListenerRole::Observability, cluster_domain)
+			&& principal.replace(admitted).is_some()
+		{
+			return Err(TlsError::SanShapeRejected);
+		}
+	}
+	principal.ok_or(TlsError::SanShapeRejected)
+}
+
 pub struct ListenerPolicy {
 	cluster_domain: String,
 	server_config_worker_task: quinn::ServerConfig,

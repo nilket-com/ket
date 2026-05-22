@@ -4,6 +4,9 @@ pub mod transport;
 
 use self::memory::MemoryManager;
 use self::transport::ToronTransport;
+use crate::audit::{
+	ToronAuditEmitter, ToronAuditEvent, WorkerTaskAuditFields, worker_task_error_class,
+};
 use crate::binder::PlannerConfig;
 use crate::catalog::Catalog;
 use crate::distributed::budget::{BudgetDimension, ByteCount};
@@ -53,11 +56,19 @@ pub struct ToronWorker {
 	active_tasks: ActiveTaskRegistry,
 	worker_id: WorkerId,
 	endpoint: WorkerEndpoint,
+	audit: ToronAuditEmitter,
 }
 
 struct TaskExecutionReport {
 	results: Vec<RecordBatch>,
 	telemetry: TaskTelemetry,
+}
+
+struct WorkerTaskAuditRecorder<'a> {
+	audit: &'a ToronAuditEmitter,
+	fields: WorkerTaskAuditFields,
+	task_started: Instant,
+	terminal_recorded: bool,
 }
 
 #[derive(Default)]
@@ -113,6 +124,7 @@ impl ToronWorker {
 			active_tasks: ActiveTaskRegistry::new(),
 			worker_id,
 			endpoint,
+			audit: ToronAuditEmitter::disabled(),
 		}
 	}
 
@@ -121,6 +133,11 @@ impl ToronWorker {
 		metrics: Arc<DownstreamCancellationMetrics>,
 	) -> Self {
 		self.active_tasks = ActiveTaskRegistry::with_downstream_cancellation_metrics(Some(metrics));
+		self
+	}
+
+	pub fn with_audit_emitter(mut self, audit: ToronAuditEmitter) -> Self {
+		self.audit = audit;
 		self
 	}
 
@@ -368,20 +385,29 @@ impl ToronWorker {
 						});
 					}
 					let active_task = self.active_tasks.register(identity);
+					let audit_fields = self.worker_task_audit_fields(&payload.spec);
+					let mut audit_recorder =
+						WorkerTaskAuditRecorder::new(&self.audit, audit_fields, task_started);
 					if active_task.cancelled_before_start {
 						self.partition_store.cancel_query(identity.query_id);
+						audit_recorder.record_cancelled();
 						send_task_failed(&mut stream, identity, cancelled_task_error()).await?;
 						continue;
 					}
 
-					send_payload(
+					audit_recorder.record_started();
+					if let Err(error) = send_payload(
 						&mut stream,
 						MessageKind::TaskStarted,
 						EnvelopeIdentity::task(identity),
 						None,
 						&TaskStartedPayload { identity },
 					)
-					.await?;
+					.await
+					{
+						audit_recorder.record_failed(&error);
+						return Err(error);
+					}
 					let task_setup_micros = duration_micros(task_started);
 
 					let execution = self.execute_task_local_with_telemetry(
@@ -399,6 +425,7 @@ impl ToronWorker {
 							for (idx, batch) in report.results.iter().enumerate() {
 								if active_task.signal.is_cancelled() {
 									self.partition_store.cancel_query(identity.query_id);
+									audit_recorder.record_cancelled();
 									send_task_failed(&mut stream, identity, cancelled_task_error())
 										.await?;
 									break;
@@ -407,14 +434,20 @@ impl ToronWorker {
 									u64::try_from(idx).expect("record batch index fits u64"),
 								);
 								let batch_encode_started = Instant::now();
-								let encoded_batch = encode_record_batch(batch)?;
+								let encoded_batch = match encode_record_batch(batch) {
+									Ok(encoded_batch) => encoded_batch,
+									Err(error) => {
+										audit_recorder.record_failed(&error);
+										return Err(error);
+									}
+								};
 								report.telemetry.phases.batch_encode_micros = report
 									.telemetry
 									.phases
 									.batch_encode_micros
 									.saturating_add(duration_micros(batch_encode_started));
 								let batch_send_started = Instant::now();
-								send_payload(
+								if let Err(error) = send_payload(
 									&mut stream,
 									MessageKind::TaskBatch,
 									EnvelopeIdentity::task(identity),
@@ -425,7 +458,11 @@ impl ToronWorker {
 										payload: ArrowIpcBytes::new(encoded_batch),
 									},
 								)
-								.await?;
+								.await
+								{
+									audit_recorder.record_failed(&error);
+									return Err(error);
+								}
 								report.telemetry.phases.batch_send_micros = report
 									.telemetry
 									.phases
@@ -439,6 +476,7 @@ impl ToronWorker {
 							let publish_started = Instant::now();
 							if active_task.signal.is_cancelled() {
 								self.partition_store.cancel_query(identity.query_id);
+								audit_recorder.record_cancelled();
 								send_task_failed(&mut stream, identity, cancelled_task_error())
 									.await?;
 								continue;
@@ -448,6 +486,7 @@ impl ToronWorker {
 								Ok(output) => {
 									if active_task.signal.is_cancelled() {
 										self.partition_store.cancel_query(identity.query_id);
+										audit_recorder.record_cancelled();
 										send_task_failed(
 											&mut stream,
 											identity,
@@ -464,7 +503,8 @@ impl ToronWorker {
 									report.telemetry.phases.task_wall_micros =
 										duration_micros(task_started);
 									recompute_framework_overhead(&mut report.telemetry);
-									send_payload(
+									let emitted_rows = report.telemetry.counters.emitted_rows;
+									if let Err(error) = send_payload(
 										&mut stream,
 										MessageKind::TaskComplete,
 										EnvelopeIdentity::task(identity),
@@ -475,9 +515,15 @@ impl ToronWorker {
 											telemetry: Some(report.telemetry),
 										},
 									)
-									.await?;
+									.await
+									{
+										audit_recorder.record_failed(&error);
+										return Err(error);
+									}
+									audit_recorder.record_completed(emitted_rows);
 								}
 								Err(error) => {
+									audit_recorder.record_failed(&error);
 									send_task_failed(&mut stream, identity, error).await?;
 								}
 							}
@@ -490,6 +536,16 @@ impl ToronWorker {
 								})
 							) {
 								self.partition_store.cancel_query(identity.query_id);
+							}
+							if matches!(
+								error,
+								QueryError::Runtime(RuntimeError::TaskFailure {
+									kind: TaskFailureKind::Cancelled
+								})
+							) {
+								audit_recorder.record_cancelled();
+							} else {
+								audit_recorder.record_failed(&error);
 							}
 							send_task_failed(&mut stream, identity, error).await?;
 						}
@@ -565,6 +621,76 @@ impl ToronWorker {
 		}
 
 		Ok(())
+	}
+
+	fn worker_task_audit_fields(&self, spec: &TaskSpec) -> WorkerTaskAuditFields {
+		WorkerTaskAuditFields {
+			tenant_id: spec.context.tenant_id,
+			query_id: spec.identity.query_id,
+			stage_id: spec.identity.stage_id,
+			task_id: spec.identity.task_id,
+			attempt_id: spec.identity.attempt_id,
+			worker_id: self.worker_id,
+			stage_role: stage_role_label(spec),
+			operator_kind: operator_kind_label(&spec.plan),
+		}
+	}
+}
+
+impl<'a> WorkerTaskAuditRecorder<'a> {
+	fn new(
+		audit: &'a ToronAuditEmitter,
+		fields: WorkerTaskAuditFields,
+		task_started: Instant,
+	) -> Self {
+		Self {
+			audit,
+			fields,
+			task_started,
+			terminal_recorded: false,
+		}
+	}
+
+	fn record_started(&self) {
+		self.audit
+			.record(ToronAuditEvent::worker_task_started(self.fields.clone()));
+	}
+
+	fn record_completed(&mut self, row_count: u64) {
+		if self.terminal_recorded {
+			return;
+		}
+		self.terminal_recorded = true;
+		self.audit.record(
+			ToronAuditEvent::worker_task_completed(self.fields.clone())
+				.with_duration(self.task_started.elapsed())
+				.with_row_count(row_count),
+		);
+	}
+
+	fn record_failed(&mut self, error: &QueryError) {
+		if self.terminal_recorded {
+			return;
+		}
+		self.terminal_recorded = true;
+		self.audit.record(
+			ToronAuditEvent::worker_task_failed(
+				self.fields.clone(),
+				worker_task_error_class(error),
+			)
+			.with_duration(self.task_started.elapsed()),
+		);
+	}
+
+	fn record_cancelled(&mut self) {
+		if self.terminal_recorded {
+			return;
+		}
+		self.terminal_recorded = true;
+		self.audit.record(
+			ToronAuditEvent::worker_task_cancelled(self.fields.clone())
+				.with_duration(self.task_started.elapsed()),
+		);
 	}
 }
 
@@ -882,6 +1008,9 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::audit::{
+		ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOperation,
+	};
 	use crate::distributed::budget::{QueryBudget, TaskBudget};
 	use crate::distributed::identity::{AttemptId, ExchangeId, QueryId, StageId, TaskId};
 	use crate::distributed::task::{
@@ -892,7 +1021,10 @@ mod tests {
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::time::Duration;
 	use tokio::io::duplex as test_duplex;
+	use tokio::sync::{Notify, mpsc};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterBloom,
 		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicyV1,
@@ -1124,11 +1256,225 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn cancel_task_before_registration_tombstones_and_prevents_execution() {
+	async fn worker_task_success_emits_started_and_completed_audit() {
 		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 		let batch =
 			RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))])
 				.expect("batch");
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let (tx, mut rx) = mpsc::channel(8);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let worker = Arc::new(
+			ToronWorker::with_partition_store_and_endpoint(
+				Arc::new(InMemoryStorageScan { table_data: batch }),
+				memory.clone(),
+				Arc::new(InMemoryPartitionStore::new()),
+				WorkerId::from_u128(7),
+				WorkerEndpoint::new("127.0.0.1:0"),
+			)
+			.with_audit_emitter(ToronAuditEmitter::Enabled { tx, metrics }),
+		);
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(78),
+			StageId::new(1),
+			TaskId::new(2),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		let (rows, output) = ToronCoordinator::new(memory)
+			.execute_task_on_worker_with_completion(client, spec)
+			.await
+			.expect("task succeeds");
+
+		assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+		assert!(matches!(output, TaskCompletionOutput::FinalResult { .. }));
+		let started = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+			.await
+			.expect("started audit timeout")
+			.expect("started audit");
+		let completed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+			.await
+			.expect("completed audit timeout")
+			.expect("completed audit");
+		assert_eq!(started.operation(), ToronAuditOperation::WorkerTaskStarted);
+		assert_eq!(started.event_class(), ToronAuditEventClass::TaskLifecycle);
+		assert_eq!(
+			completed.operation(),
+			ToronAuditOperation::WorkerTaskCompleted
+		);
+		assert_eq!(completed.event_class(), ToronAuditEventClass::TaskLifecycle);
+
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
+	#[tokio::test]
+	async fn worker_task_failure_emits_failed_with_bounded_error_class() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+		)
+		.expect("batch");
+		let mut budget = QueryBudget::test_default();
+		budget.shuffle_bytes_published_per_task = ByteCount::new(1);
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let (tx, mut rx) = mpsc::channel(8);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let worker = Arc::new(
+			ToronWorker::with_partition_store_and_endpoint(
+				Arc::new(InMemoryStorageScan { table_data: batch }),
+				memory.clone(),
+				Arc::new(InMemoryPartitionStore::with_budget(budget)),
+				WorkerId::from_u128(7),
+				WorkerEndpoint::new("127.0.0.1:0"),
+			)
+			.with_audit_emitter(ToronAuditEmitter::Enabled { tx, metrics }),
+		);
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(80),
+			StageId::new(1),
+			TaskId::new(2),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::ShuffleProducer {
+				exchange_id: ExchangeId::new(1),
+				partition_count: PartitionCount::new(1),
+				partition_key: BoundExprProgram::empty(),
+			},
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		let err = ToronCoordinator::new(memory)
+			.execute_task_on_worker_with_completion(client, spec)
+			.await
+			.expect_err("publish budget exhaustion must fail task");
+
+		assert!(matches!(
+			err,
+			QueryError::Runtime(RuntimeError::TaskFailure {
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::ShuffleBytes,
+					..
+				}
+			})
+		));
+		let started = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+			.await
+			.expect("started audit timeout")
+			.expect("started audit");
+		let failed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+			.await
+			.expect("failed audit timeout")
+			.expect("failed audit");
+		assert_eq!(started.operation(), ToronAuditOperation::WorkerTaskStarted);
+		assert_eq!(failed.operation(), ToronAuditOperation::WorkerTaskFailed);
+		assert_eq!(failed.error_class_for_test(), Some("budget_exhausted"));
+		assert!(rx.try_recv().is_err());
+
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
+	#[tokio::test]
+	async fn worker_audit_queue_full_records_drop_without_failing_task() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))])
+			.expect("batch");
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let (tx, _rx) = mpsc::channel(1);
+		tx.try_send(ToronAuditEvent::lifecycle_startup())
+			.expect("fill audit queue");
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let worker = Arc::new(
+			ToronWorker::with_partition_store_and_endpoint(
+				Arc::new(InMemoryStorageScan { table_data: batch }),
+				memory.clone(),
+				Arc::new(InMemoryPartitionStore::new()),
+				WorkerId::from_u128(7),
+				WorkerEndpoint::new("127.0.0.1:0"),
+			)
+			.with_audit_emitter(ToronAuditEmitter::Enabled {
+				tx,
+				metrics: Arc::clone(&metrics),
+			}),
+		);
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(79),
+			StageId::new(1),
+			TaskId::new(2),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		let (rows, _output) = ToronCoordinator::new(memory)
+			.execute_task_on_worker_with_completion(client, spec)
+			.await
+			.expect("audit queue full must not fail task");
+
+		assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+		assert!(
+			metrics.dropped_count(
+				ToronAuditEventClass::TaskLifecycle,
+				ToronAuditDropReason::QueueFull
+			) >= 1
+		);
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
+	#[tokio::test]
+	async fn worker_audit_disabled_is_noop() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))])
+			.expect("batch");
 		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
 		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
 			Arc::new(InMemoryStorageScan { table_data: batch }),
@@ -1137,6 +1483,69 @@ mod tests {
 			WorkerId::from_u128(7),
 			WorkerEndpoint::new("127.0.0.1:0"),
 		));
+		assert!(matches!(&worker.audit, ToronAuditEmitter::Disabled));
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(81),
+			StageId::new(1),
+			TaskId::new(2),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		let (rows, _output) = ToronCoordinator::new(memory)
+			.execute_task_on_worker_with_completion(client, spec)
+			.await
+			.expect("disabled audit is a no-op");
+
+		assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
+	#[tokio::test]
+	async fn cancel_task_before_registration_tombstones_and_prevents_execution() {
+		assert_cancel_before_start_emits_cancelled_without_started().await;
+	}
+
+	#[tokio::test]
+	async fn worker_task_cancelled_before_start_emits_cancelled_without_started() {
+		assert_cancel_before_start_emits_cancelled_without_started().await;
+	}
+
+	async fn assert_cancel_before_start_emits_cancelled_without_started() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch =
+			RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))])
+				.expect("batch");
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let (tx, mut rx) = mpsc::channel(8);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let worker = Arc::new(
+			ToronWorker::with_partition_store_and_endpoint(
+				Arc::new(InMemoryStorageScan { table_data: batch }),
+				memory.clone(),
+				Arc::new(InMemoryPartitionStore::new()),
+				WorkerId::from_u128(7),
+				WorkerEndpoint::new("127.0.0.1:0"),
+			)
+			.with_audit_emitter(ToronAuditEmitter::Enabled { tx, metrics }),
+		);
 		let identity = TaskIdentity::new(
 			QueryId::from_u128(77),
 			StageId::new(0),
@@ -1189,12 +1598,148 @@ mod tests {
 		let payload: TaskFailedPayload =
 			decode_payload(&failed.payload).expect("decode task failed");
 		assert!(matches!(payload.kind, TaskFailureKind::Cancelled));
+		let cancelled_audit = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+			.await
+			.expect("cancelled audit timeout")
+			.expect("cancelled audit");
+		assert_eq!(
+			cancelled_audit.operation(),
+			ToronAuditOperation::WorkerTaskCancelled
+		);
+		assert!(rx.try_recv().is_err());
 
 		drop(client);
 		worker_handle
 			.await
 			.expect("worker task")
 			.expect("worker ok");
+	}
+
+	#[tokio::test]
+	async fn worker_task_cancelled_during_execution_emits_single_cancelled_terminal_event() {
+		let scan_started = Arc::new(AtomicBool::new(false));
+		let scan_notify = Arc::new(Notify::new());
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let (tx, mut rx) = mpsc::channel(8);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let worker = Arc::new(
+			ToronWorker::with_partition_store_and_endpoint(
+				Arc::new(BlockingStorageScan {
+					started: Arc::clone(&scan_started),
+					notify: Arc::clone(&scan_notify),
+				}),
+				memory.clone(),
+				Arc::new(InMemoryPartitionStore::new()),
+				WorkerId::from_u128(7),
+				WorkerEndpoint::new("127.0.0.1:0"),
+			)
+			.with_audit_emitter(ToronAuditEmitter::Enabled { tx, metrics }),
+		);
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(82),
+			StageId::new(1),
+			TaskId::new(2),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (mut task_client, task_server) = test_duplex(1024 * 1024);
+		let (cancel_client, cancel_server) = test_duplex(1024 * 1024);
+		let task_worker = Arc::clone(&worker);
+		let task_handle =
+			tokio::spawn(async move { task_worker.handle_connection(task_server).await });
+		let cancel_worker = Arc::clone(&worker);
+		let cancel_handle =
+			tokio::spawn(async move { cancel_worker.handle_connection(cancel_server).await });
+
+		send_payload(
+			&mut task_client,
+			MessageKind::StartTask,
+			EnvelopeIdentity::task(identity),
+			None,
+			&StartTaskPayload { spec },
+		)
+		.await
+		.expect("send start task");
+		let started = read_envelope(&mut task_client, memory.as_ref())
+			.await
+			.expect("read task started");
+		assert_eq!(started.kind, MessageKind::TaskStarted);
+		tokio::time::timeout(Duration::from_secs(1), async {
+			loop {
+				if scan_started.load(Ordering::SeqCst) {
+					break;
+				}
+				scan_notify.notified().await;
+			}
+		})
+		.await
+		.expect("storage scan started");
+
+		ToronCoordinator::new(memory.clone())
+			.cancel_task_on_worker(cancel_client, identity)
+			.await
+			.expect("cancel task");
+		let failed = read_envelope(&mut task_client, memory.as_ref())
+			.await
+			.expect("read cancelled task failure");
+		assert_eq!(failed.kind, MessageKind::TaskFailed);
+		let payload: TaskFailedPayload =
+			decode_payload(&failed.payload).expect("decode task failed");
+		assert!(matches!(payload.kind, TaskFailureKind::Cancelled));
+
+		let started_audit = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+			.await
+			.expect("started audit timeout")
+			.expect("started audit");
+		let cancelled_audit = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+			.await
+			.expect("cancelled audit timeout")
+			.expect("cancelled audit");
+		assert_eq!(
+			started_audit.operation(),
+			ToronAuditOperation::WorkerTaskStarted
+		);
+		assert_eq!(
+			cancelled_audit.operation(),
+			ToronAuditOperation::WorkerTaskCancelled
+		);
+		assert!(rx.try_recv().is_err());
+
+		drop(task_client);
+		task_handle
+			.await
+			.expect("task worker")
+			.expect("task worker ok");
+		cancel_handle
+			.await
+			.expect("cancel worker")
+			.expect("cancel worker ok");
+	}
+
+	struct BlockingStorageScan {
+		started: Arc<AtomicBool>,
+		notify: Arc<Notify>,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageScan for BlockingStorageScan {
+		async fn scan(&self, _request: ScanRequest) -> Result<ScanStream, StorageError> {
+			self.started.store(true, Ordering::SeqCst);
+			self.notify.notify_waiters();
+			std::future::pending::<Result<ScanStream, StorageError>>().await
+		}
 	}
 
 	fn scan(table_id: TableId, object_byte: u8) -> ExecutionPlan {

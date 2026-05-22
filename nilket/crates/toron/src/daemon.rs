@@ -230,16 +230,14 @@ impl ToronDaemon {
 		let memory = Arc::new(MemoryManager::new(32, memory_budget_bytes));
 		let worker_storage: Arc<dyn StorageScan> = scanner.clone();
 		let downstream_cancellation_metrics = Arc::new(DownstreamCancellationMetrics::default());
-		let worker = Arc::new(
-			ToronWorker::with_partition_store_and_endpoint(
-				worker_storage,
-				Arc::clone(&memory),
-				Arc::new(InMemoryPartitionStore::new()),
-				config.node.worker_id,
-				advertised_endpoint.clone(),
-			)
-			.with_downstream_cancellation_metrics(Arc::clone(&downstream_cancellation_metrics)),
-		);
+		let worker = ToronWorker::with_partition_store_and_endpoint(
+			worker_storage,
+			Arc::clone(&memory),
+			Arc::new(InMemoryPartitionStore::new()),
+			config.node.worker_id,
+			advertised_endpoint.clone(),
+		)
+		.with_downstream_cancellation_metrics(Arc::clone(&downstream_cancellation_metrics));
 
 		let registry_workers = coordinator_workers(
 			&config,
@@ -322,6 +320,7 @@ impl ToronDaemon {
 			ToronAuditEmitter::from_config(&config.audit, audit_metrics, Arc::clone(&readiness))
 				.await;
 		audit.record(ToronAuditEvent::lifecycle_startup());
+		let worker = Arc::new(worker.with_audit_emitter(audit.clone()));
 
 		if let Some(listener) = listener {
 			let (tcp_shutdown_tx, tcp_shutdown_rx) = oneshot::channel();
@@ -401,6 +400,8 @@ impl ToronDaemon {
 					TlsAcceptor::from(policy.rustls_server_config_for(ListenerRole::Observability)),
 					Arc::clone(&readiness),
 					Arc::clone(&metrics),
+					audit.clone(),
+					policy.cluster_domain().to_string(),
 					ObservabilityShutdownReceivers {
 						health: health_rx,
 						ready: ready_rx,

@@ -8485,6 +8485,8 @@ fn adr066_audit_payload_privacy_has_only_bounded_fields() {
 			assert!(audit.contains("with_parameter(\"row_count_bucket\""));
 		} else if forbidden == "with_parameter(\"sql" {
 			assert!(audit.contains("with_parameter(\"sql_error_code_class\""));
+		} else if forbidden == "with_parameter(\"error" {
+			assert!(audit.contains("with_parameter(\"error_class\""));
 		} else {
 			assert!(
 				!audit.contains(forbidden),
@@ -15417,6 +15419,408 @@ fn adr070_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 		"BulkUpdateV1",
 		"FullTable",
 	]);
+}
+
+#[test]
+fn adr071_toron_audit_event_classes_include_task_lifecycle_and_observability_access() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+
+	for required in [
+		"TaskLifecycle",
+		"ObservabilityAccess",
+		"task_lifecycle",
+		"observability_access",
+		"pub const COUNT: usize = 6",
+	] {
+		assert!(audit.contains(required), "missing {required}");
+	}
+}
+
+#[test]
+fn adr071_toron_audit_operations_include_worker_task_and_observability_access() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+
+	for operation in [
+		"toron.worker.task.started",
+		"toron.worker.task.completed",
+		"toron.worker.task.failed",
+		"toron.worker.task.cancelled",
+		"toron.observability.ready.access",
+		"toron.observability.metrics.access",
+	] {
+		assert!(audit.contains(operation), "missing operation {operation}");
+	}
+}
+
+#[test]
+fn adr071_worker_task_audit_uses_toron_audit_emitter() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(server.contains("audit: ToronAuditEmitter"));
+	assert!(server.contains("WorkerTaskAuditRecorder"));
+	assert!(server.contains("ToronAuditEvent::worker_task_started"));
+	assert!(server.contains("ToronAuditEvent::worker_task_completed"));
+	assert!(server.contains("ToronAuditEvent::worker_task_failed"));
+	assert!(server.contains("ToronAuditEvent::worker_task_cancelled"));
+}
+
+#[test]
+fn adr071_worker_task_started_after_decode_route_register_and_accept() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let start_task = server
+		.split("MessageKind::StartTask =>")
+		.nth(1)
+		.and_then(|rest| rest.split("MessageKind::CancelTask =>").next())
+		.expect("StartTask arm");
+
+	let decode = start_task
+		.find("decode_payload(&envelope.payload)")
+		.expect("decode");
+	let route = start_task
+		.find("if envelope.identity")
+		.expect("route validate");
+	let register = start_task
+		.find("self.active_tasks.register(identity)")
+		.expect("register");
+	let cancelled = start_task
+		.find("if active_task.cancelled_before_start")
+		.expect("pre-start cancel check");
+	let started = start_task
+		.find("audit_recorder.record_started()")
+		.expect("started audit");
+	assert!(decode < route && route < register && register < cancelled && cancelled < started);
+}
+
+#[test]
+fn adr071_worker_task_audit_emits_exactly_one_terminal_event() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let recorder = brace_blocks_after_marker(&server, "impl<'a> WorkerTaskAuditRecorder")
+		.into_iter()
+		.next()
+		.expect("worker audit recorder")
+		.1;
+
+	assert!(recorder.contains("terminal_recorded"));
+	assert_eq!(recorder.matches("self.terminal_recorded = true").count(), 3);
+	for method in ["record_completed", "record_failed", "record_cancelled"] {
+		let body = brace_blocks_after_marker(&recorder, &format!("fn {method}"))
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{method} body"))
+			.1;
+		assert!(body.contains("if self.terminal_recorded"));
+		assert!(body.contains("self.terminal_recorded = true"));
+	}
+}
+
+#[test]
+fn adr071_worker_task_audit_fields_are_bounded() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+
+	for allowed in [
+		"with_parameter(\"query_id\"",
+		"with_parameter(\"stage_id\"",
+		"with_parameter(\"task_id\"",
+		"with_parameter(\"attempt_id\"",
+		"with_parameter(\"worker_id\"",
+		"with_parameter(\"stage_role\"",
+		"with_parameter(\"operator_kind\"",
+		"with_parameter(\"outcome_class\"",
+		"with_parameter(\"error_class\"",
+		"with_parameter(\"duration_bucket\"",
+		"with_parameter(\"row_count_bucket\"",
+	] {
+		assert!(audit.contains(allowed), "missing bounded field {allowed}");
+	}
+}
+
+#[test]
+fn adr071_worker_task_audit_has_no_sql_plan_table_descriptor_value_payload_or_raw_error() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+
+	for forbidden in [
+		"with_parameter(\"sql",
+		"with_parameter(\"plan",
+		"with_parameter(\"table",
+		"with_parameter(\"column",
+		"with_parameter(\"descriptor",
+		"with_parameter(\"runtime_filter",
+		"with_parameter(\"literal",
+		"with_parameter(\"arrow",
+		"with_parameter(\"payload",
+		"with_parameter(\"peer",
+		"with_parameter(\"raw_error",
+	] {
+		if forbidden == "with_parameter(\"sql" {
+			assert!(audit.contains("with_parameter(\"sql_error_code_class\""));
+		} else {
+			assert!(
+				!audit.contains(forbidden),
+				"worker audit leaked {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr071_worker_task_audit_does_not_change_task_wire_protocol() {
+	let wire = std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
+
+	for forbidden in [
+		"WorkerTaskStarted",
+		"WorkerTaskCompleted",
+		"WorkerTaskFailedAudit",
+		"AuditEvent",
+		"audit",
+	] {
+		assert!(!wire.contains(forbidden), "wire gained {forbidden}");
+	}
+}
+
+#[test]
+fn adr071_worker_audit_is_disabled_by_default_handle() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+
+	assert!(server.contains("audit: ToronAuditEmitter::disabled()"));
+	assert!(server.contains("pub fn with_audit_emitter"));
+	assert!(daemon.contains("worker.with_audit_emitter(audit.clone())"));
+}
+
+#[test]
+fn adr071_observability_ready_metrics_audit_is_in_toron_network_layer() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	assert!(observability.contains("ToronAuditEmitter"));
+	assert!(observability.contains("ObservabilityReadyAccess"));
+	assert!(observability.contains("ObservabilityMetricsAccess"));
+	assert!(observability.contains("handle_ready_connection"));
+	assert!(observability.contains("handle_metrics_connection"));
+	adr071_shared_observability_crates_remain_policy_free();
+}
+
+#[test]
+fn adr071_observability_health_listener_remains_unaudited() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let health = brace_blocks_after_marker(&observability, "async fn handle_health_connection")
+		.into_iter()
+		.next()
+		.expect("health handler")
+		.1;
+
+	assert!(!health.contains("ToronAuditEmitter"));
+	assert!(!health.contains("ToronAuditEvent"));
+	assert!(!health.contains("record_observability_access"));
+}
+
+#[test]
+fn adr071_observability_access_records_admitted_monitor_principal_only() {
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let tls = std::fs::read_to_string(manifest_dir().join("src/network/tls.rs")).expect("read tls");
+
+	assert!(tls.contains("accepted_observability_monitor_principal"));
+	assert!(tls.contains("ListenerRole::Observability"));
+	assert!(tls.contains("PeerKind::Monitor"));
+	assert!(observability.contains("accepted_observability_monitor_principal"));
+	assert!(observability.contains("format!(\"monitor:{principal}\")"));
+	assert!(audit.contains("with_parameter(\"actor_key_id\""));
+	assert!(audit.contains("with_parameter(\"actor_role\""));
+}
+
+#[test]
+fn adr071_observability_access_has_no_raw_san_dn_ip_or_certificate_material() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+	let source = format!("{audit}\n{observability}");
+
+	for forbidden in [
+		"with_parameter(\"san",
+		"with_parameter(\"dn",
+		"with_parameter(\"distinguished",
+		"with_parameter(\"peer_ip",
+		"with_parameter(\"peer_addr",
+		"with_parameter(\"cert",
+		"with_parameter(\"certificate",
+		"with_parameter(\"serial",
+		"with_parameter(\"header",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"access audit leaked {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_shared_observability_crates_remain_policy_free() {
+	let shared = format!(
+		"{}\n{}",
+		observability_http_source_text(),
+		observability_audit_source_text()
+	);
+
+	for forbidden in [
+		"ToronAudit",
+		"toron.worker.task",
+		"toron.observability",
+		"TaskLifecycle",
+		"ObservabilityAccess",
+		"try_send",
+		"tokio::sync::mpsc",
+	] {
+		assert!(
+			!shared.contains(forbidden),
+			"shared observability gained Toron policy {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_audit_emission_preserves_try_send_fail_open_no_request_failure() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	assert!(audit.contains("tx.try_send(event)"));
+	assert!(audit.contains("TrySendError::Full"));
+	assert!(audit.contains("TrySendError::Closed"));
+	assert!(!audit.contains(".send(event).await"));
+	assert!(!server.contains("record(") || !server.contains("?; // audit"));
+	assert!(
+		!observability.contains("record_observability_access(")
+			|| !observability.contains("?; // audit")
+	);
+}
+
+#[test]
+fn adr071_no_audit_fail_closed_request_failure_path() {
+	let toron_source = source_files(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Toron source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"audit.fail_closed",
+		"AuditConfig::FailClosed",
+		"audit_failure_closes_task_execution",
+		"audit enqueue failed",
+		"audit write failed request",
+	] {
+		assert!(
+			!toron_source.contains(forbidden),
+			"found fail-closed path {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_runtime_worker_audit_allowed_fixture_worker_stays_audit_free() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let fixture = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	assert!(server.contains("audit: ToronAuditEmitter"));
+	assert!(server.contains("worker_task_started"));
+	assert!(!fixture.contains("audit"));
+	assert!(!fixture.contains("ToronAudit"));
+}
+
+#[test]
+fn adr071_worker_node_id_matches_toron_n_u32() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+
+	assert!(audit.contains("const TORON_NODE_ID_PREFIX: &str = \"toron-n-\""));
+	assert!(audit.contains("parse_toron_audit_node_numeric"));
+	assert!(audit.contains("audit.node_id must use toron-n-<u32>"));
+}
+
+#[test]
+fn adr071_no_wendelon_nilket_sql_wire_storage_or_worker_wire_change() {
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let worker_wire =
+		std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for source in [sql_wire.as_str(), worker_wire.as_str(), storage.as_str()] {
+		assert!(!source.contains("ToronAudit"));
+		assert!(!source.contains("AuditEvent"));
+	}
+	assert!(!wendelon_source.contains("toron.worker.task"));
+	assert!(!nilket_manifest.contains("observability"));
+}
+
+#[test]
+fn adr071_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in [
+		"tokio",
+		"quinn",
+		"rustls",
+		"observability",
+		"tls-pki",
+		"serde_json",
+	] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr071_prior_adr065_066_audit_guards_continue_to_pass_except_worker_retarget() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in ["adr065_", "adr066_"] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior audit guard prefix {prefix}");
+	}
+	assert!(
+		architecture_test
+			.contains("adr071_runtime_worker_audit_allowed_fixture_worker_stays_audit_free")
+	);
 }
 
 #[test]

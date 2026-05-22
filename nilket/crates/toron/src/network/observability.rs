@@ -11,8 +11,9 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
 use crate::audit::{
-	ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOutputKind,
-	ToronAuditSecurityEventUnrecordedReason,
+	AuditOutcome, ObservabilityAccessAuditFields, ToronAuditDropReason, ToronAuditEmitter,
+	ToronAuditEvent, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOperation,
+	ToronAuditOutputKind, ToronAuditSecurityEventUnrecordedReason,
 };
 use crate::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use crate::config::ObservabilityListeners;
@@ -26,6 +27,7 @@ use crate::distributed::cancellation::{
 };
 use crate::network::connection::SqlConnectionLimiter;
 use crate::network::observability_http::{READ_REQUEST_TIMEOUT, read_request, write_response};
+use crate::network::tls::accepted_observability_monitor_principal;
 use crate::storage::TenantId;
 
 pub const HEALTH_PATH: &str = "/health";
@@ -738,6 +740,8 @@ pub async fn spawn(
 	acceptor: TlsAcceptor,
 	readiness: Arc<ReadinessState>,
 	metrics: Arc<MetricsRegistry>,
+	audit: ToronAuditEmitter,
+	cluster_domain: String,
 	shutdown: ObservabilityShutdownReceivers,
 ) -> std::io::Result<ObservabilityHandles> {
 	let health_listener = TcpListener::bind(addresses.health).await?;
@@ -749,6 +753,8 @@ pub async fn spawn(
 		acceptor.clone(),
 		Arc::clone(&readiness),
 		Arc::clone(&metrics),
+		audit.clone(),
+		cluster_domain.clone(),
 		shutdown.ready,
 	)
 	.await?;
@@ -757,6 +763,8 @@ pub async fn spawn(
 		acceptor,
 		readiness,
 		metrics,
+		audit,
+		cluster_domain,
 		shutdown.metrics,
 	)
 	.await?;
@@ -801,6 +809,8 @@ async fn spawn_ready(
 	acceptor: TlsAcceptor,
 	readiness: Arc<ReadinessState>,
 	metrics: Arc<MetricsRegistry>,
+	audit: ToronAuditEmitter,
+	cluster_domain: String,
 	mut shutdown: oneshot::Receiver<()>,
 ) -> std::io::Result<ListenerHandle> {
 	let local_addr = listener.local_addr()?;
@@ -814,8 +824,18 @@ async fn spawn_ready(
 						let acceptor = acceptor.clone();
 						let readiness = Arc::clone(&readiness);
 						let metrics = Arc::clone(&metrics);
+						let audit = audit.clone();
+						let cluster_domain = cluster_domain.clone();
 						tokio::spawn(async move {
-							let _ = handle_ready_connection(stream, acceptor, readiness, metrics).await;
+							let _ = handle_ready_connection(
+								stream,
+								acceptor,
+								readiness,
+								metrics,
+								audit,
+								cluster_domain,
+							)
+							.await;
 						});
 					}
 					Err(error) => {
@@ -834,6 +854,8 @@ async fn spawn_metrics(
 	acceptor: TlsAcceptor,
 	readiness: Arc<ReadinessState>,
 	metrics: Arc<MetricsRegistry>,
+	audit: ToronAuditEmitter,
+	cluster_domain: String,
 	mut shutdown: oneshot::Receiver<()>,
 ) -> std::io::Result<ListenerHandle> {
 	let local_addr = listener.local_addr()?;
@@ -847,8 +869,18 @@ async fn spawn_metrics(
 						let acceptor = acceptor.clone();
 						let readiness = Arc::clone(&readiness);
 						let metrics = Arc::clone(&metrics);
+						let audit = audit.clone();
+						let cluster_domain = cluster_domain.clone();
 						tokio::spawn(async move {
-							let _ = handle_metrics_connection(stream, acceptor, readiness, metrics).await;
+							let _ = handle_metrics_connection(
+								stream,
+								acceptor,
+								readiness,
+								metrics,
+								audit,
+								cluster_domain,
+							)
+							.await;
 						});
 					}
 					Err(error) => {
@@ -877,51 +909,91 @@ async fn handle_ready_connection(
 	acceptor: TlsAcceptor,
 	readiness: Arc<ReadinessState>,
 	metrics: Arc<MetricsRegistry>,
+	audit: ToronAuditEmitter,
+	cluster_domain: String,
 ) -> std::io::Result<()> {
 	let mut stream = match acceptor.accept(stream).await {
 		Ok(stream) => stream,
 		Err(error) => {
 			metrics.increment_reject(ListenerName::Ready, RejectReason::MtlsHandshakeFailure);
+			record_observability_access(
+				&audit,
+				observability_access_fields(
+					ToronAuditOperation::ObservabilityReadyAccess,
+					AuditOutcome::Denied,
+					"ready",
+					"unknown",
+					"none",
+					"mtls_handshake_failure",
+					None,
+				),
+			);
 			return Err(std::io::Error::new(
 				std::io::ErrorKind::PermissionDenied,
 				error,
 			));
 		}
 	};
+	let actor_key_id = observability_actor_key_id(&stream, &cluster_domain);
 	let Some(req) = request_or_close(&mut stream, ListenerName::Ready, &metrics).await? else {
 		return Ok(());
 	};
-	let line = crate::network::observability_http::parse_request_line(&req)?;
-	match (line.method, line.path) {
+	let line = match crate::network::observability_http::parse_request_line(&req) {
+		Ok(line) => line,
+		Err(error) => {
+			record_observability_access(
+				&audit,
+				observability_access_fields(
+					ToronAuditOperation::ObservabilityReadyAccess,
+					AuditOutcome::Error,
+					"ready",
+					"unknown",
+					"none",
+					auth_class(&actor_key_id),
+					actor_key_id,
+				),
+			);
+			return Err(error);
+		}
+	};
+	let method_class = method_class(line.method);
+	let (status, content_type, body, outcome) = match (line.method, line.path) {
 		("GET", READY_PATH) => {
 			let snapshot = readiness.snapshot().await;
-			write_response(
-				&mut stream,
+			let status = snapshot.http_status();
+			(
 				snapshot.http_status(),
 				JSON_CONTENT_TYPE,
-				&snapshot.to_json(),
+				snapshot.to_json(),
+				http_outcome(status),
 			)
-			.await
 		}
-		(method, READY_PATH) if method != "GET" => {
-			write_response(
-				&mut stream,
-				"405 Method Not Allowed",
-				TEXT_CONTENT_TYPE,
-				"method not allowed\n",
-			)
-			.await
-		}
-		_ => {
-			write_response(
-				&mut stream,
-				"404 Not Found",
-				TEXT_CONTENT_TYPE,
-				"not found\n",
-			)
-			.await
-		}
-	}
+		(method, READY_PATH) if method != "GET" => (
+			"405 Method Not Allowed",
+			TEXT_CONTENT_TYPE,
+			"method not allowed\n".to_string(),
+			AuditOutcome::Denied,
+		),
+		_ => (
+			"404 Not Found",
+			TEXT_CONTENT_TYPE,
+			"not found\n".to_string(),
+			AuditOutcome::Denied,
+		),
+	};
+	record_observability_access(
+		&audit,
+		observability_access_fields(
+			ToronAuditOperation::ObservabilityReadyAccess,
+			outcome,
+			"ready",
+			method_class,
+			status_class(status),
+			auth_class(&actor_key_id),
+			actor_key_id,
+		),
+	);
+	write_response(&mut stream, status, content_type, &body).await
 }
 
 async fn handle_metrics_connection(
@@ -929,46 +1001,160 @@ async fn handle_metrics_connection(
 	acceptor: TlsAcceptor,
 	readiness: Arc<ReadinessState>,
 	metrics: Arc<MetricsRegistry>,
+	audit: ToronAuditEmitter,
+	cluster_domain: String,
 ) -> std::io::Result<()> {
 	let mut stream = match acceptor.accept(stream).await {
 		Ok(stream) => stream,
 		Err(error) => {
 			metrics.increment_reject(ListenerName::Metrics, RejectReason::MtlsHandshakeFailure);
+			record_observability_access(
+				&audit,
+				observability_access_fields(
+					ToronAuditOperation::ObservabilityMetricsAccess,
+					AuditOutcome::Denied,
+					"metrics",
+					"unknown",
+					"none",
+					"mtls_handshake_failure",
+					None,
+				),
+			);
 			return Err(std::io::Error::new(
 				std::io::ErrorKind::PermissionDenied,
 				error,
 			));
 		}
 	};
+	let actor_key_id = observability_actor_key_id(&stream, &cluster_domain);
 	let Some(req) = request_or_close(&mut stream, ListenerName::Metrics, &metrics).await? else {
 		return Ok(());
 	};
-	let line = crate::network::observability_http::parse_request_line(&req)?;
-	match (line.method, line.path) {
+	let line = match crate::network::observability_http::parse_request_line(&req) {
+		Ok(line) => line,
+		Err(error) => {
+			record_observability_access(
+				&audit,
+				observability_access_fields(
+					ToronAuditOperation::ObservabilityMetricsAccess,
+					AuditOutcome::Error,
+					"metrics",
+					"unknown",
+					"none",
+					auth_class(&actor_key_id),
+					actor_key_id,
+				),
+			);
+			return Err(error);
+		}
+	};
+	let method_class = method_class(line.method);
+	let (status, content_type, body, outcome) = match (line.method, line.path) {
 		("GET", METRICS_PATH) => {
 			let snapshot = readiness.snapshot().await;
 			metrics.increment_metrics_scrapes();
 			let body = metrics.render_text(&snapshot);
-			write_response(&mut stream, "200 OK", METRICS_CONTENT_TYPE, &body).await
+			("200 OK", METRICS_CONTENT_TYPE, body, AuditOutcome::Allowed)
 		}
-		(method, METRICS_PATH) if method != "GET" => {
-			write_response(
-				&mut stream,
-				"405 Method Not Allowed",
-				TEXT_CONTENT_TYPE,
-				"method not allowed\n",
-			)
-			.await
-		}
-		_ => {
-			write_response(
-				&mut stream,
-				"404 Not Found",
-				TEXT_CONTENT_TYPE,
-				"not found\n",
-			)
-			.await
-		}
+		(method, METRICS_PATH) if method != "GET" => (
+			"405 Method Not Allowed",
+			TEXT_CONTENT_TYPE,
+			"method not allowed\n".to_string(),
+			AuditOutcome::Denied,
+		),
+		_ => (
+			"404 Not Found",
+			TEXT_CONTENT_TYPE,
+			"not found\n".to_string(),
+			AuditOutcome::Denied,
+		),
+	};
+	record_observability_access(
+		&audit,
+		observability_access_fields(
+			ToronAuditOperation::ObservabilityMetricsAccess,
+			outcome,
+			"metrics",
+			method_class,
+			status_class(status),
+			auth_class(&actor_key_id),
+			actor_key_id,
+		),
+	);
+	write_response(&mut stream, status, content_type, &body).await
+}
+
+fn observability_actor_key_id<S>(
+	stream: &tokio_rustls::server::TlsStream<S>,
+	cluster_domain: &str,
+) -> Option<String> {
+	let certs = stream.get_ref().1.peer_certificates()?;
+	accepted_observability_monitor_principal(certs, cluster_domain)
+		.ok()
+		.map(|principal| format!("monitor:{principal}"))
+}
+
+fn record_observability_access(audit: &ToronAuditEmitter, fields: ObservabilityAccessAuditFields) {
+	audit.record(ToronAuditEvent::observability_access(fields));
+}
+
+fn observability_access_fields(
+	operation: ToronAuditOperation,
+	outcome: AuditOutcome,
+	endpoint: &'static str,
+	method_class: &'static str,
+	status_class: &'static str,
+	auth_class: &'static str,
+	actor_key_id: Option<String>,
+) -> ObservabilityAccessAuditFields {
+	ObservabilityAccessAuditFields {
+		operation,
+		outcome,
+		endpoint,
+		method_class,
+		status_class,
+		auth_class,
+		outcome_class: outcome.as_str(),
+		actor_key_id,
+	}
+}
+
+fn method_class(method: &str) -> &'static str {
+	match method {
+		"GET" => "get",
+		"POST" => "post",
+		"PUT" => "put",
+		"DELETE" => "delete",
+		"HEAD" => "head",
+		"OPTIONS" => "options",
+		_ => "other",
+	}
+}
+
+fn status_class(status: &str) -> &'static str {
+	match status.as_bytes().first().copied() {
+		Some(b'2') => "2xx",
+		Some(b'3') => "3xx",
+		Some(b'4') => "4xx",
+		Some(b'5') => "5xx",
+		_ => "none",
+	}
+}
+
+fn http_outcome(status: &str) -> AuditOutcome {
+	match status.as_bytes().first().copied() {
+		Some(b'2') | Some(b'3') => AuditOutcome::Allowed,
+		Some(b'4') => AuditOutcome::Denied,
+		Some(b'5') => AuditOutcome::Error,
+		_ => AuditOutcome::Error,
+	}
+}
+
+fn auth_class(actor_key_id: &Option<String>) -> &'static str {
+	if actor_key_id.is_some() {
+		"mtls_monitor"
+	} else {
+		"mtls_monitor_principal_unavailable"
 	}
 }
 
