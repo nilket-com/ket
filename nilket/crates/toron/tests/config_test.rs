@@ -220,12 +220,67 @@ fn audit_config_enabled_accepts_toron_node_id_and_resolves_paths() {
 	assert_eq!(audit.node_id, "toron-n-7");
 	assert_eq!(audit.node_numeric_id, 7);
 	assert_eq!(audit.queue_capacity.get(), 8);
+	assert!(!audit.fail_closed);
+	assert_eq!(
+		audit.fail_closed_ack_timeout,
+		std::time::Duration::from_millis(500)
+	);
 	assert_eq!(audit.local_path, dir.join("audit/toron.ndjson"));
 	assert_eq!(
 		audit.sinks.archive.expect("archive").directory,
 		dir.join("audit/archive")
 	);
 	assert!(audit.sinks.kafka.is_none());
+}
+
+#[test]
+fn audit_fail_closed_config_accepts_enabled_and_rejects_disabled_or_zero_timeout() {
+	let dir = fresh_dir("audit-fail-closed");
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[audit]\nenabled = true\nnode_id = \"toron-n-7\"\nnode_numeric_id = 7\nlocal_path = \"audit.ndjson\"\nqueue_capacity = 8\nfail_closed = true\nfail_closed_ack_timeout_ms = 250\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load fail-closed audit config");
+	let AuditConfig::Enabled(audit) = config.audit else {
+		panic!("audit enabled");
+	};
+	assert!(audit.fail_closed);
+	assert_eq!(
+		audit.fail_closed_ack_timeout,
+		std::time::Duration::from_millis(250)
+	);
+
+	let disabled_path = dir.join("toron-disabled.toml");
+	let disabled = format!(
+		"{}\n[audit]\nenabled = false\nfail_closed = true\n",
+		render_example_config()
+	);
+	std::fs::write(&disabled_path, disabled).expect("write disabled config");
+	let error =
+		load_toron_bootstrap_config(&disabled_path).expect_err("disabled fail-closed rejected");
+	assert!(
+		error
+			.to_string()
+			.contains("audit.fail_closed requires audit.enabled = true"),
+		"{error}"
+	);
+
+	let zero_path = dir.join("toron-zero-timeout.toml");
+	let zero = format!(
+		"{}\n[audit]\nenabled = true\nnode_id = \"toron-n-7\"\nnode_numeric_id = 7\nlocal_path = \"audit.ndjson\"\nqueue_capacity = 8\nfail_closed_ack_timeout_ms = 0\n",
+		render_example_config()
+	);
+	std::fs::write(&zero_path, zero).expect("write zero-timeout config");
+	let error = load_toron_bootstrap_config(&zero_path).expect_err("zero timeout rejected");
+	assert!(
+		error
+			.to_string()
+			.contains("audit.fail_closed_ack_timeout_ms must be greater than 0"),
+		"{error}"
+	);
 }
 
 #[test]

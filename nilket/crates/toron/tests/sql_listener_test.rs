@@ -107,6 +107,38 @@ async fn toron_sql_select_from_bootstrapped_descriptor_executes_over_wire() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_closed_sql_success_audit_failure_returns_internal_before_result_batches() {
+	let fixture = LiveWendelonFixture::start(84).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let mut config = toron_config_with_descriptor(descriptor.clone(), true);
+	enable_fail_closed_unavailable_audit(&mut config, "sql-fail-closed-success-audit");
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	let (batches, error) = execute_sql_until_error(
+		endpoint,
+		"SELECT id, amount, region FROM storage_execution WHERE amount > 100",
+	)
+	.await;
+
+	assert!(
+		batches.is_empty(),
+		"result batches were streamed before required terminal audit"
+	);
+	assert_eq!(error.code, SqlErrorCode::Internal);
+	assert_eq!(error.message, "audit unavailable");
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sql_listener_update_complete_frame_carries_row_count() {
 	let fixture = LiveWendelonFixture::start(53).await;
 	let descriptor = descriptor();
@@ -785,9 +817,24 @@ fn enable_audit(config: &mut ToronBootstrapConfig, tag: &str) -> PathBuf {
 		node_numeric_id: 1,
 		local_path: audit_path.clone(),
 		queue_capacity: NonZeroUsize::new(64).expect("nonzero queue capacity"),
+		fail_closed: false,
+		fail_closed_ack_timeout: Duration::from_millis(500),
 		sinks: AuditSinksConfig::default(),
 	}));
 	audit_path
+}
+
+fn enable_fail_closed_unavailable_audit(config: &mut ToronBootstrapConfig, tag: &str) {
+	let audit_path_that_is_a_directory = fresh_dir(tag);
+	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
+		node_id: "toron-n-1".to_string(),
+		node_numeric_id: 1,
+		local_path: audit_path_that_is_a_directory,
+		queue_capacity: NonZeroUsize::new(64).expect("nonzero queue capacity"),
+		fail_closed: true,
+		fail_closed_ack_timeout: Duration::from_millis(50),
+		sinks: AuditSinksConfig::default(),
+	}));
 }
 
 async fn wait_for_audit_records(path: &Path, required: &[&str]) -> String {
@@ -804,6 +851,43 @@ async fn wait_for_audit_records(path: &Path, required: &[&str]) -> String {
 			);
 		}
 		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+}
+
+async fn execute_sql_until_error(
+	endpoint: std::net::SocketAddr,
+	statement: &str,
+) -> (Vec<RecordBatch>, SqlError) {
+	let client = toron::quic::QuicEndpoint::client().expect("sql client");
+	let mut stream = client.connect_stream(endpoint).await.expect("connect sql");
+	let query_id = QueryId::new();
+	write_sql_frame(
+		&mut stream,
+		&SqlFrame::execute(query_id, statement.to_string(), None),
+	)
+	.await
+	.expect("write sql request");
+	stream.finish().await.expect("finish sql request");
+
+	let mut batches = Vec::new();
+	loop {
+		let frame = read_sql_frame(&mut stream)
+			.await
+			.expect("read sql response");
+		match frame.message {
+			SqlMessage::ResultBatch(batch) => {
+				let reader = StreamReader::try_new(batch.arrow_ipc_bytes.as_slice(), None)
+					.expect("open Arrow IPC stream");
+				for batch in reader {
+					batches.push(batch.expect("read Arrow IPC batch"));
+				}
+			}
+			SqlMessage::Complete(complete) => {
+				panic!("expected SQL error, got complete {complete:?} after {batches:?}")
+			}
+			SqlMessage::Error(error) => return (batches, error),
+			other => panic!("unexpected SQL response frame: {other:?}"),
+		}
 	}
 }
 

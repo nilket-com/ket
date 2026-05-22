@@ -702,6 +702,39 @@ async fn observability_metrics_allowed_emits_access_audit() {
 }
 
 #[tokio::test]
+async fn observability_metrics_audit_failure_returns_503_without_sink_detail() {
+	let worker_id = WorkerId::from_u128(76);
+	let pki = TestPki::generate(worker_id, "prometheus");
+	let mut config = observability_config(worker_id, &pki);
+	enable_observability_fail_closed_unavailable_audit(&mut config, "metrics-fail-closed-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon
+		.handle()
+		.observability_endpoints
+		.expect("observability endpoints")
+		.metrics;
+	let server_name = canonical_daemon_dns_name(&worker_id, DEFAULT_CLUSTER_DOMAIN);
+
+	let response = mtls_http_request(
+		endpoint,
+		&server_name,
+		&pki.monitor_cert,
+		&pki.monitor_key,
+		&pki.ca_cert,
+		"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+	)
+	.await
+	.expect("metrics response");
+
+	assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+	assert_eq!(response_body(&response), "audit unavailable\n");
+	assert!(!response.contains("audit_local_chain"));
+	assert!(!response.contains("sink"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test]
 async fn observability_metrics_method_not_allowed_emits_denied_access_audit() {
 	let worker_id = WorkerId::from_u128(73);
 	let pki = TestPki::generate(worker_id, "prometheus");
@@ -1382,9 +1415,27 @@ fn enable_observability_audit(config: &mut ToronBootstrapConfig, tag: &str) -> P
 		node_numeric_id: 1,
 		local_path: audit_path.clone(),
 		queue_capacity: NonZeroUsize::new(64).expect("nonzero queue capacity"),
+		fail_closed: false,
+		fail_closed_ack_timeout: Duration::from_millis(500),
 		sinks: AuditSinksConfig::default(),
 	}));
 	audit_path
+}
+
+fn enable_observability_fail_closed_unavailable_audit(
+	config: &mut ToronBootstrapConfig,
+	tag: &str,
+) {
+	let audit_path_that_is_a_directory = fresh_dir(tag);
+	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
+		node_id: "toron-n-1".to_string(),
+		node_numeric_id: 1,
+		local_path: audit_path_that_is_a_directory,
+		queue_capacity: NonZeroUsize::new(64).expect("nonzero queue capacity"),
+		fail_closed: true,
+		fail_closed_ack_timeout: Duration::from_millis(50),
+		sinks: AuditSinksConfig::default(),
+	}));
 }
 
 async fn wait_for_audit_records(path: &Path, required: &[&str]) -> String {

@@ -797,11 +797,15 @@ async fn handle_sql_connection(
 			Ok(frame) => frame,
 			Err(error) => {
 				metrics.increment_reject(ListenerName::Sql, RejectReason::RequestFrameTooLarge);
-				audit.record(ToronAuditEvent::edge_denial(
-					ToronAuditOperation::SqlRequestFrameTooLarge,
-					Some(tenant_id),
-					"sql request frame too large",
-				));
+				record_sql_audit_required_without_response(
+					&audit,
+					ToronAuditEvent::edge_denial(
+						ToronAuditOperation::SqlRequestFrameTooLarge,
+						Some(tenant_id),
+						"sql request frame too large",
+					),
+				)
+				.await;
 				tracing::warn!(
 					declared_len = error.declared_len,
 					max_len = error.max_len.get(),
@@ -812,11 +816,20 @@ async fn handle_sql_connection(
 			}
 		};
 	if frame.protocol_version != crate::sql_wire::SqlProtocolVersion::Current {
-		audit.record(ToronAuditEvent::edge_denial(
-			ToronAuditOperation::SqlProtocolMismatch,
-			Some(tenant_id),
-			"sql protocol mismatch",
-		));
+		if !record_sql_audit_required_or_error(
+			&audit,
+			ToronAuditEvent::edge_denial(
+				ToronAuditOperation::SqlProtocolMismatch,
+				Some(tenant_id),
+				"sql protocol mismatch",
+			),
+			&mut stream,
+			frame.query_id,
+		)
+		.await?
+		{
+			return Ok(());
+		}
 		return write_sql_error(
 			&mut stream,
 			frame.query_id,
@@ -841,11 +854,20 @@ async fn handle_sql_connection(
 					StatementClass::Unknown,
 				);
 				crate::telemetry::record_query_outcome(&query_span, "rejected");
-				audit.record(ToronAuditEvent::edge_denial(
-					ToronAuditOperation::SqlStatementTooLarge,
-					Some(tenant_id),
-					"sql statement too large",
-				));
+				if !record_sql_audit_required_or_error(
+					&audit,
+					ToronAuditEvent::edge_denial(
+						ToronAuditOperation::SqlStatementTooLarge,
+						Some(tenant_id),
+						"sql statement too large",
+					),
+					&mut stream,
+					frame.query_id,
+				)
+				.await?
+				{
+					return Ok(());
+				}
 				return write_sql_error(
 					&mut stream,
 					frame.query_id,
@@ -884,18 +906,26 @@ async fn handle_sql_connection(
 							);
 						});
 					}
-					audit.record(
-						ToronAuditEvent::query_outcome(
-							ToronAuditOperation::QueryPlannedError,
-							tenant_id,
-							session_id,
-							frame.query_id,
-							StatementClass::Unknown,
-							AuditOutcome::Denied,
-						)
-						.with_sql_error_code(code)
-						.with_duration(query_started.elapsed()),
-					);
+					let audit_event = ToronAuditEvent::query_outcome(
+						ToronAuditOperation::QueryPlannedError,
+						tenant_id,
+						session_id,
+						frame.query_id,
+						StatementClass::Unknown,
+						AuditOutcome::Denied,
+					)
+					.with_sql_error_code(code)
+					.with_duration(query_started.elapsed());
+					if !record_sql_audit_required_or_error(
+						&audit,
+						audit_event,
+						&mut stream,
+						frame.query_id,
+					)
+					.await?
+					{
+						return Ok(());
+					}
 					return write_sql_error(&mut stream, frame.query_id, code, error.to_string())
 						.await;
 				}
@@ -932,8 +962,7 @@ async fn handle_sql_connection(
 						CancellationTrigger::StatementTimeout,
 						cancellation_request_outcome(&cancellation),
 					);
-					audit.record(
-						ToronAuditEvent::query_outcome(
+					let audit_event = ToronAuditEvent::query_outcome(
 							ToronAuditOperation::QueryTimedOut,
 							tenant_id,
 							session_id,
@@ -942,8 +971,17 @@ async fn handle_sql_connection(
 							AuditOutcome::Denied,
 						)
 						.with_sql_error_code(SqlErrorCode::StatementTimeout)
-						.with_duration(query_started.elapsed()),
-					);
+						.with_duration(query_started.elapsed());
+					if !record_sql_audit_required_or_error(
+						&audit,
+						audit_event,
+						&mut stream,
+						frame.query_id,
+					)
+					.await?
+					{
+						return Ok(());
+					}
 					return write_sql_error(
 						&mut stream,
 						frame.query_id,
@@ -972,7 +1010,8 @@ async fn handle_sql_connection(
 						CancellationTrigger::ClientDisconnect,
 						cancellation_request_outcome(&cancellation),
 					);
-					audit.record(
+					record_sql_audit_required_without_response(
+						&audit,
 						ToronAuditEvent::query_outcome(
 							ToronAuditOperation::QueryDisconnectAborted,
 							tenant_id,
@@ -982,7 +1021,8 @@ async fn handle_sql_connection(
 							AuditOutcome::Error,
 						)
 						.with_duration(query_started.elapsed()),
-					);
+					)
+					.await;
 					return Ok(());
 				}
 			};
@@ -1021,56 +1061,140 @@ async fn handle_sql_connection(
 					} else {
 						AuditOutcome::Error
 					};
-					audit.record(
-						ToronAuditEvent::query_outcome(
-							operation,
-							tenant_id,
-							session_id,
-							frame.query_id,
-							statement_class,
-							outcome,
-						)
-						.with_sql_error_code(code)
-						.with_duration(query_started.elapsed()),
-					);
+					let audit_event = ToronAuditEvent::query_outcome(
+						operation,
+						tenant_id,
+						session_id,
+						frame.query_id,
+						statement_class,
+						outcome,
+					)
+					.with_sql_error_code(code)
+					.with_duration(query_started.elapsed());
+					if !record_sql_audit_required_or_error(
+						&audit,
+						audit_event,
+						&mut stream,
+						frame.query_id,
+					)
+					.await?
+					{
+						return Ok(());
+					}
 					return write_sql_error(&mut stream, frame.query_id, code, message).await;
 				}
 				None => unreachable!("SQL execution select always returns or exits"),
 			};
-			if returns_rows {
-				for (batch_index, batch) in batches.iter().enumerate() {
-					let ipc = encode_sql_batch(batch)?;
-					let response = SqlFrame::response(
-						frame.query_id,
-						SqlMessage::ResultBatch(ResultBatch {
-							batch_index: u32::try_from(batch_index).map_err(|_| {
-								QueryError::Internal {
-									message: "too many SQL result batches".to_string(),
-								}
-							})?,
-							arrow_ipc_bytes: ByteBuf::from(ipc),
-						}),
-					);
-					write_sql_frame(&mut stream, &response).await?;
-				}
-			}
 			let row_count = if returns_rows {
 				batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64
 			} else {
 				sql_affected_row_count(&batches)
 			};
-			audit.record(
-				ToronAuditEvent::query_outcome(
-					ToronAuditOperation::QueryCompleted,
-					tenant_id,
-					session_id,
+			let encoded_result_batches = if returns_rows && audit.fail_closed_enabled() {
+				let mut encoded = Vec::with_capacity(batches.len());
+				for (batch_index, batch) in batches.iter().enumerate() {
+					let ipc = match encode_sql_batch(batch) {
+						Ok(ipc) => ipc,
+						Err(error) => {
+							let (code, message) = map_sql_query_error(error);
+							crate::telemetry::record_query_outcome(&query_span, "error");
+							query_span.record("toron.error_class", "internal");
+							let audit_event = ToronAuditEvent::query_outcome(
+								ToronAuditOperation::QueryExecutionError,
+								tenant_id,
+								session_id,
+								frame.query_id,
+								statement_class,
+								AuditOutcome::Error,
+							)
+							.with_sql_error_code(code)
+							.with_duration(query_started.elapsed());
+							if !record_sql_audit_required_or_error(
+								&audit,
+								audit_event,
+								&mut stream,
+								frame.query_id,
+							)
+							.await?
+							{
+								return Ok(());
+							}
+							return write_sql_error(&mut stream, frame.query_id, code, message)
+								.await;
+						}
+					};
+					let batch_index =
+						u32::try_from(batch_index).map_err(|_| QueryError::Internal {
+							message: "too many SQL result batches".to_string(),
+						})?;
+					encoded.push((batch_index, ipc));
+				}
+				Some(encoded)
+			} else {
+				None
+			};
+			let audit_event = ToronAuditEvent::query_outcome(
+				ToronAuditOperation::QueryCompleted,
+				tenant_id,
+				session_id,
+				frame.query_id,
+				statement_class,
+				AuditOutcome::Allowed,
+			)
+			.with_duration(query_started.elapsed())
+			.with_row_count(row_count);
+			if audit.fail_closed_enabled()
+				&& !record_sql_audit_required_or_error(
+					&audit,
+					audit_event.clone(),
+					&mut stream,
 					frame.query_id,
-					statement_class,
-					AuditOutcome::Allowed,
 				)
-				.with_duration(query_started.elapsed())
-				.with_row_count(row_count),
-			);
+				.await?
+			{
+				return Ok(());
+			}
+			if returns_rows {
+				if let Some(encoded) = encoded_result_batches {
+					for (batch_index, ipc) in encoded {
+						let response = SqlFrame::response(
+							frame.query_id,
+							SqlMessage::ResultBatch(ResultBatch {
+								batch_index,
+								arrow_ipc_bytes: ByteBuf::from(ipc),
+							}),
+						);
+						write_sql_frame(&mut stream, &response).await?;
+					}
+				} else {
+					for (batch_index, batch) in batches.iter().enumerate() {
+						let ipc = encode_sql_batch(batch)?;
+						let response = SqlFrame::response(
+							frame.query_id,
+							SqlMessage::ResultBatch(ResultBatch {
+								batch_index: u32::try_from(batch_index).map_err(|_| {
+									QueryError::Internal {
+										message: "too many SQL result batches".to_string(),
+									}
+								})?,
+								arrow_ipc_bytes: ByteBuf::from(ipc),
+							}),
+						);
+						write_sql_frame(&mut stream, &response).await?;
+					}
+				}
+			}
+			if !audit.fail_closed_enabled()
+				&& !record_sql_audit_required_or_error(
+					&audit,
+					audit_event,
+					&mut stream,
+					frame.query_id,
+				)
+				.await?
+			{
+				return Ok(());
+			}
 			crate::telemetry::record_query_outcome(&query_span, "ok");
 			let response =
 				SqlFrame::response(frame.query_id, SqlMessage::Complete(Complete { row_count }));
@@ -1087,17 +1211,20 @@ async fn handle_sql_connection(
 				CancellationTrigger::SqlCancel,
 				cancellation_request_outcome(&cancellation),
 			);
-			audit.record(
-				ToronAuditEvent::query_outcome(
-					ToronAuditOperation::QueryCancelled,
-					tenant_id,
-					new_sql_session_id(),
-					request.query_id,
-					StatementClass::Cancel,
-					AuditOutcome::Denied,
-				)
-				.with_sql_error_code(SqlErrorCode::Cancelled),
-			);
+			let audit_event = ToronAuditEvent::query_outcome(
+				ToronAuditOperation::QueryCancelled,
+				tenant_id,
+				new_sql_session_id(),
+				request.query_id,
+				StatementClass::Cancel,
+				AuditOutcome::Denied,
+			)
+			.with_sql_error_code(SqlErrorCode::Cancelled);
+			if !record_sql_audit_required_or_error(&audit, audit_event, &mut stream, frame.query_id)
+				.await?
+			{
+				return Ok(());
+			}
 			write_sql_error(
 				&mut stream,
 				frame.query_id,
@@ -1107,11 +1234,20 @@ async fn handle_sql_connection(
 			.await?;
 		}
 		SqlMessage::ResultBatch(_) | SqlMessage::Complete(_) | SqlMessage::Error(_) => {
-			audit.record(ToronAuditEvent::edge_denial(
-				ToronAuditOperation::SqlUnexpectedClientFrame,
-				Some(tenant_id),
-				"unexpected client sql response frame",
-			));
+			if !record_sql_audit_required_or_error(
+				&audit,
+				ToronAuditEvent::edge_denial(
+					ToronAuditOperation::SqlUnexpectedClientFrame,
+					Some(tenant_id),
+					"unexpected client sql response frame",
+				),
+				&mut stream,
+				frame.query_id,
+			)
+			.await?
+			{
+				return Ok(());
+			}
 			write_sql_error(
 				&mut stream,
 				frame.query_id,
@@ -1153,6 +1289,39 @@ async fn write_sql_error(
 	write_sql_frame(stream, &response).await?;
 	stream.finish().await?;
 	Ok(())
+}
+
+const AUDIT_UNAVAILABLE_SQL_MESSAGE: &str = "audit unavailable";
+
+async fn record_sql_audit_required_or_error(
+	audit: &ToronAuditEmitter,
+	event: ToronAuditEvent,
+	stream: &mut QuicStream,
+	query_id: QueryId,
+) -> Result<bool, QueryError> {
+	match audit.record_required(event).await {
+		Ok(()) => Ok(true),
+		Err(error) => {
+			tracing::warn!(error = %error, "required SQL audit unavailable");
+			write_sql_error(
+				stream,
+				query_id,
+				SqlErrorCode::Internal,
+				AUDIT_UNAVAILABLE_SQL_MESSAGE,
+			)
+			.await?;
+			Ok(false)
+		}
+	}
+}
+
+async fn record_sql_audit_required_without_response(
+	audit: &ToronAuditEmitter,
+	event: ToronAuditEvent,
+) {
+	if let Err(error) = audit.record_required(event).await {
+		tracing::warn!(error = %error, "required SQL audit unavailable before close");
+	}
 }
 
 fn map_sql_query_error(error: QueryError) -> (SqlErrorCode, String) {

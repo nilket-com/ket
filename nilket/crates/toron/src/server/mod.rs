@@ -363,7 +363,7 @@ impl ToronWorker {
 	where
 		S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	{
-		loop {
+		'connection: loop {
 			let envelope = match read_envelope(&mut stream, self.memory.as_ref()).await {
 				Ok(envelope) => envelope,
 				Err(QueryError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -390,12 +390,23 @@ impl ToronWorker {
 						WorkerTaskAuditRecorder::new(&self.audit, audit_fields, task_started);
 					if active_task.cancelled_before_start {
 						self.partition_store.cancel_query(identity.query_id);
-						audit_recorder.record_cancelled();
-						send_task_failed(&mut stream, identity, cancelled_task_error()).await?;
-						continue;
+						let error = match audit_recorder.record_cancelled().await {
+							Ok(()) => cancelled_task_error(),
+							Err(error) => {
+								tracing::warn!(error = %error, "required worker cancellation audit unavailable");
+								audit_unavailable_task_error()
+							}
+						};
+						send_task_failed(&mut stream, identity, error).await?;
+						continue 'connection;
 					}
 
-					audit_recorder.record_started();
+					if let Err(error) = audit_recorder.record_started().await {
+						tracing::warn!(error = %error, "required worker start audit unavailable");
+						send_task_failed(&mut stream, identity, audit_unavailable_task_error())
+							.await?;
+						continue 'connection;
+					}
 					if let Err(error) = send_payload(
 						&mut stream,
 						MessageKind::TaskStarted,
@@ -405,7 +416,7 @@ impl ToronWorker {
 					)
 					.await
 					{
-						audit_recorder.record_failed(&error);
+						let _ = audit_recorder.record_failed(&error).await;
 						return Err(error);
 					}
 					let task_setup_micros = duration_micros(task_started);
@@ -425,10 +436,15 @@ impl ToronWorker {
 							for (idx, batch) in report.results.iter().enumerate() {
 								if active_task.signal.is_cancelled() {
 									self.partition_store.cancel_query(identity.query_id);
-									audit_recorder.record_cancelled();
-									send_task_failed(&mut stream, identity, cancelled_task_error())
-										.await?;
-									break;
+									let error = match audit_recorder.record_cancelled().await {
+										Ok(()) => cancelled_task_error(),
+										Err(error) => {
+											tracing::warn!(error = %error, "required worker cancellation audit unavailable");
+											audit_unavailable_task_error()
+										}
+									};
+									send_task_failed(&mut stream, identity, error).await?;
+									continue 'connection;
 								}
 								let stream_seq = StreamSeq::new(
 									u64::try_from(idx).expect("record batch index fits u64"),
@@ -437,8 +453,16 @@ impl ToronWorker {
 								let encoded_batch = match encode_record_batch(batch) {
 									Ok(encoded_batch) => encoded_batch,
 									Err(error) => {
-										audit_recorder.record_failed(&error);
-										return Err(error);
+										let error = match audit_recorder.record_failed(&error).await
+										{
+											Ok(()) => error,
+											Err(audit_error) => {
+												tracing::warn!(error = %audit_error, "required worker failure audit unavailable");
+												audit_unavailable_task_error()
+											}
+										};
+										send_task_failed(&mut stream, identity, error).await?;
+										continue 'connection;
 									}
 								};
 								report.telemetry.phases.batch_encode_micros = report
@@ -460,7 +484,7 @@ impl ToronWorker {
 								)
 								.await
 								{
-									audit_recorder.record_failed(&error);
+									let _ = audit_recorder.record_failed(&error).await;
 									return Err(error);
 								}
 								report.telemetry.phases.batch_send_micros = report
@@ -470,30 +494,36 @@ impl ToronWorker {
 									.saturating_add(duration_micros(batch_send_started));
 							}
 							if active_task.signal.is_cancelled() {
-								continue;
+								continue 'connection;
 							}
 
 							let publish_started = Instant::now();
 							if active_task.signal.is_cancelled() {
 								self.partition_store.cancel_query(identity.query_id);
-								audit_recorder.record_cancelled();
-								send_task_failed(&mut stream, identity, cancelled_task_error())
-									.await?;
-								continue;
+								let error = match audit_recorder.record_cancelled().await {
+									Ok(()) => cancelled_task_error(),
+									Err(error) => {
+										tracing::warn!(error = %error, "required worker cancellation audit unavailable");
+										audit_unavailable_task_error()
+									}
+								};
+								send_task_failed(&mut stream, identity, error).await?;
+								continue 'connection;
 							}
 							match self.publish_task_output(identity, &payload.spec, &report.results)
 							{
 								Ok(output) => {
 									if active_task.signal.is_cancelled() {
 										self.partition_store.cancel_query(identity.query_id);
-										audit_recorder.record_cancelled();
-										send_task_failed(
-											&mut stream,
-											identity,
-											cancelled_task_error(),
-										)
-										.await?;
-										continue;
+										let error = match audit_recorder.record_cancelled().await {
+											Ok(()) => cancelled_task_error(),
+											Err(error) => {
+												tracing::warn!(error = %error, "required worker cancellation audit unavailable");
+												audit_unavailable_task_error()
+											}
+										};
+										send_task_failed(&mut stream, identity, error).await?;
+										continue 'connection;
 									}
 									report.telemetry.phases.output_publish_micros =
 										duration_micros(publish_started);
@@ -504,6 +534,18 @@ impl ToronWorker {
 										duration_micros(task_started);
 									recompute_framework_overhead(&mut report.telemetry);
 									let emitted_rows = report.telemetry.counters.emitted_rows;
+									if let Err(error) =
+										audit_recorder.record_completed(emitted_rows).await
+									{
+										tracing::warn!(error = %error, "required worker completion audit unavailable");
+										send_task_failed(
+											&mut stream,
+											identity,
+											audit_unavailable_task_error(),
+										)
+										.await?;
+										continue 'connection;
+									}
 									if let Err(error) = send_payload(
 										&mut stream,
 										MessageKind::TaskComplete,
@@ -517,13 +559,18 @@ impl ToronWorker {
 									)
 									.await
 									{
-										audit_recorder.record_failed(&error);
+										let _ = audit_recorder.record_failed(&error).await;
 										return Err(error);
 									}
-									audit_recorder.record_completed(emitted_rows);
 								}
 								Err(error) => {
-									audit_recorder.record_failed(&error);
+									let error = match audit_recorder.record_failed(&error).await {
+										Ok(()) => error,
+										Err(audit_error) => {
+											tracing::warn!(error = %audit_error, "required worker failure audit unavailable");
+											audit_unavailable_task_error()
+										}
+									};
 									send_task_failed(&mut stream, identity, error).await?;
 								}
 							}
@@ -543,11 +590,26 @@ impl ToronWorker {
 									kind: TaskFailureKind::Cancelled
 								})
 							) {
-								audit_recorder.record_cancelled();
+								let error = match audit_recorder.record_cancelled().await {
+									Ok(()) => error,
+									Err(audit_error) => {
+										tracing::warn!(error = %audit_error, "required worker cancellation audit unavailable");
+										audit_unavailable_task_error()
+									}
+								};
+								send_task_failed(&mut stream, identity, error).await?;
+								continue 'connection;
 							} else {
-								audit_recorder.record_failed(&error);
+								let error = match audit_recorder.record_failed(&error).await {
+									Ok(()) => error,
+									Err(audit_error) => {
+										tracing::warn!(error = %audit_error, "required worker failure audit unavailable");
+										audit_unavailable_task_error()
+									}
+								};
+								send_task_failed(&mut stream, identity, error).await?;
+								continue 'connection;
 							}
-							send_task_failed(&mut stream, identity, error).await?;
 						}
 					}
 					drop(active_task.guard);
@@ -651,46 +713,59 @@ impl<'a> WorkerTaskAuditRecorder<'a> {
 		}
 	}
 
-	fn record_started(&self) {
+	async fn record_started(&self) -> Result<(), crate::audit::AuditUnavailable> {
 		self.audit
-			.record(ToronAuditEvent::worker_task_started(self.fields.clone()));
+			.record_required(ToronAuditEvent::worker_task_started(self.fields.clone()))
+			.await
 	}
 
-	fn record_completed(&mut self, row_count: u64) {
+	async fn record_completed(
+		&mut self,
+		row_count: u64,
+	) -> Result<(), crate::audit::AuditUnavailable> {
 		if self.terminal_recorded {
-			return;
+			return Ok(());
 		}
 		self.terminal_recorded = true;
-		self.audit.record(
-			ToronAuditEvent::worker_task_completed(self.fields.clone())
-				.with_duration(self.task_started.elapsed())
-				.with_row_count(row_count),
-		);
-	}
-
-	fn record_failed(&mut self, error: &QueryError) {
-		if self.terminal_recorded {
-			return;
-		}
-		self.terminal_recorded = true;
-		self.audit.record(
-			ToronAuditEvent::worker_task_failed(
-				self.fields.clone(),
-				worker_task_error_class(error),
+		self.audit
+			.record_required(
+				ToronAuditEvent::worker_task_completed(self.fields.clone())
+					.with_duration(self.task_started.elapsed())
+					.with_row_count(row_count),
 			)
-			.with_duration(self.task_started.elapsed()),
-		);
+			.await
 	}
 
-	fn record_cancelled(&mut self) {
+	async fn record_failed(
+		&mut self,
+		error: &QueryError,
+	) -> Result<(), crate::audit::AuditUnavailable> {
 		if self.terminal_recorded {
-			return;
+			return Ok(());
 		}
 		self.terminal_recorded = true;
-		self.audit.record(
-			ToronAuditEvent::worker_task_cancelled(self.fields.clone())
+		self.audit
+			.record_required(
+				ToronAuditEvent::worker_task_failed(
+					self.fields.clone(),
+					worker_task_error_class(error),
+				)
 				.with_duration(self.task_started.elapsed()),
-		);
+			)
+			.await
+	}
+
+	async fn record_cancelled(&mut self) -> Result<(), crate::audit::AuditUnavailable> {
+		if self.terminal_recorded {
+			return Ok(());
+		}
+		self.terminal_recorded = true;
+		self.audit
+			.record_required(
+				ToronAuditEvent::worker_task_cancelled(self.fields.clone())
+					.with_duration(self.task_started.elapsed()),
+			)
+			.await
 	}
 }
 
@@ -1272,7 +1347,12 @@ mod tests {
 				WorkerId::from_u128(7),
 				WorkerEndpoint::new("127.0.0.1:0"),
 			)
-			.with_audit_emitter(ToronAuditEmitter::Enabled { tx, metrics }),
+			.with_audit_emitter(ToronAuditEmitter::Enabled {
+				tx,
+				metrics,
+				fail_closed: false,
+				ack_timeout: Duration::from_millis(500),
+			}),
 		);
 		let identity = TaskIdentity::new(
 			QueryId::from_u128(78),
@@ -1346,7 +1426,12 @@ mod tests {
 				WorkerId::from_u128(7),
 				WorkerEndpoint::new("127.0.0.1:0"),
 			)
-			.with_audit_emitter(ToronAuditEmitter::Enabled { tx, metrics }),
+			.with_audit_emitter(ToronAuditEmitter::Enabled {
+				tx,
+				metrics,
+				fail_closed: false,
+				ack_timeout: Duration::from_millis(500),
+			}),
 		);
 		let identity = TaskIdentity::new(
 			QueryId::from_u128(80),
@@ -1414,8 +1499,10 @@ mod tests {
 			.expect("batch");
 		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
 		let (tx, _rx) = mpsc::channel(1);
-		tx.try_send(ToronAuditEvent::lifecycle_startup())
-			.expect("fill audit queue");
+		tx.try_send(crate::audit::ToronAuditCommand::fire_and_forget(
+			ToronAuditEvent::lifecycle_startup(),
+		))
+		.expect("fill audit queue");
 		let metrics = Arc::new(ToronAuditMetrics::default());
 		let worker = Arc::new(
 			ToronWorker::with_partition_store_and_endpoint(
@@ -1428,6 +1515,8 @@ mod tests {
 			.with_audit_emitter(ToronAuditEmitter::Enabled {
 				tx,
 				metrics: Arc::clone(&metrics),
+				fail_closed: false,
+				ack_timeout: Duration::from_millis(500),
 			}),
 		);
 		let identity = TaskIdentity::new(
@@ -1464,6 +1553,89 @@ mod tests {
 				ToronAuditDropReason::QueueFull
 			) >= 1
 		);
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
+	#[tokio::test]
+	async fn worker_started_audit_failure_prevents_task_execution() {
+		let scan_started = Arc::new(AtomicBool::new(false));
+		let scan_notify = Arc::new(Notify::new());
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let (tx, _rx) = mpsc::channel(1);
+		tx.try_send(crate::audit::ToronAuditCommand::fire_and_forget(
+			ToronAuditEvent::lifecycle_startup(),
+		))
+		.expect("fill audit queue");
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let worker = Arc::new(
+			ToronWorker::with_partition_store_and_endpoint(
+				Arc::new(BlockingStorageScan {
+					started: Arc::clone(&scan_started),
+					notify: Arc::clone(&scan_notify),
+				}),
+				memory.clone(),
+				Arc::new(InMemoryPartitionStore::new()),
+				WorkerId::from_u128(7),
+				WorkerEndpoint::new("127.0.0.1:0"),
+			)
+			.with_audit_emitter(ToronAuditEmitter::Enabled {
+				tx,
+				metrics,
+				fail_closed: true,
+				ack_timeout: Duration::from_millis(50),
+			}),
+		);
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(83),
+			StageId::new(1),
+			TaskId::new(2),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (mut client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		send_payload(
+			&mut client,
+			MessageKind::StartTask,
+			EnvelopeIdentity::task(identity),
+			None,
+			&StartTaskPayload { spec },
+		)
+		.await
+		.expect("send start task");
+		let failed = read_envelope(&mut client, memory.as_ref())
+			.await
+			.expect("read audit unavailable failure");
+		assert_eq!(failed.kind, MessageKind::TaskFailed);
+		let payload: TaskFailedPayload =
+			decode_payload(&failed.payload).expect("decode task failed");
+		assert!(matches!(
+			payload.kind,
+			TaskFailureKind::TaskFailed { ref reason, retryable }
+				if reason == "audit_unavailable" && retryable
+		));
+		assert!(
+			!scan_started.load(Ordering::SeqCst),
+			"task executed despite missing required started audit"
+		);
+
+		drop(client);
 		worker_handle
 			.await
 			.expect("worker task")
@@ -1544,7 +1716,12 @@ mod tests {
 				WorkerId::from_u128(7),
 				WorkerEndpoint::new("127.0.0.1:0"),
 			)
-			.with_audit_emitter(ToronAuditEmitter::Enabled { tx, metrics }),
+			.with_audit_emitter(ToronAuditEmitter::Enabled {
+				tx,
+				metrics,
+				fail_closed: false,
+				ack_timeout: Duration::from_millis(500),
+			}),
 		);
 		let identity = TaskIdentity::new(
 			QueryId::from_u128(77),
@@ -1633,7 +1810,12 @@ mod tests {
 				WorkerId::from_u128(7),
 				WorkerEndpoint::new("127.0.0.1:0"),
 			)
-			.with_audit_emitter(ToronAuditEmitter::Enabled { tx, metrics }),
+			.with_audit_emitter(ToronAuditEmitter::Enabled {
+				tx,
+				metrics,
+				fail_closed: false,
+				ack_timeout: Duration::from_millis(500),
+			}),
 		);
 		let identity = TaskIdentity::new(
 			QueryId::from_u128(82),
@@ -2220,6 +2402,15 @@ where
 fn cancelled_task_error() -> QueryError {
 	QueryError::Runtime(RuntimeError::TaskFailure {
 		kind: TaskFailureKind::Cancelled,
+	})
+}
+
+fn audit_unavailable_task_error() -> QueryError {
+	QueryError::Runtime(RuntimeError::TaskFailure {
+		kind: TaskFailureKind::TaskFailed {
+			reason: "audit_unavailable".to_string(),
+			retryable: true,
+		},
 	})
 }
 

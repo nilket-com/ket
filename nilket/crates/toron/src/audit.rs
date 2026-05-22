@@ -9,7 +9,7 @@ pub use observability::audit::{
 	DEFAULT_AUDIT_ARCHIVE_MAX_SEGMENT_BYTES, SyslogAuditConfig,
 };
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::AuditConfig;
 use crate::distributed::identity::{AttemptId, QueryId, StageId, TaskId, WorkerId};
@@ -1109,12 +1109,100 @@ impl shared_audit::AuditObserver for ToronAuditObserver {
 pub enum ToronAuditEmitter {
 	Disabled,
 	Enabled {
-		tx: mpsc::Sender<ToronAuditEvent>,
+		tx: mpsc::Sender<ToronAuditCommand>,
 		metrics: Arc<ToronAuditMetrics>,
+		fail_closed: bool,
+		ack_timeout: Duration,
 	},
 	Unavailable {
 		metrics: Arc<ToronAuditMetrics>,
+		fail_closed: bool,
 	},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditUnavailableReason {
+	QueueFull,
+	EmitterClosed,
+	SerializationFailed,
+	SinkFailed,
+	Timeout,
+}
+
+impl AuditUnavailableReason {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::QueueFull => "queue_full",
+			Self::EmitterClosed => "emitter_closed",
+			Self::SerializationFailed => "serialization_failed",
+			Self::SinkFailed => "sink_failed",
+			Self::Timeout => "timeout",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditUnavailable {
+	reason: AuditUnavailableReason,
+}
+
+impl AuditUnavailable {
+	fn new(reason: AuditUnavailableReason) -> Self {
+		Self { reason }
+	}
+
+	pub fn reason(&self) -> AuditUnavailableReason {
+		self.reason
+	}
+}
+
+impl std::fmt::Display for AuditUnavailable {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "audit unavailable: {}", self.reason.as_str())
+	}
+}
+
+impl std::error::Error for AuditUnavailable {}
+
+pub struct ToronAuditCommand {
+	event: ToronAuditEvent,
+	required_ack: Option<oneshot::Sender<Result<(), AuditUnavailable>>>,
+}
+
+impl ToronAuditCommand {
+	pub fn fire_and_forget(event: ToronAuditEvent) -> Self {
+		Self {
+			event,
+			required_ack: None,
+		}
+	}
+
+	fn required(
+		event: ToronAuditEvent,
+		required_ack: oneshot::Sender<Result<(), AuditUnavailable>>,
+	) -> Self {
+		Self {
+			event,
+			required_ack: Some(required_ack),
+		}
+	}
+
+	pub fn event(&self) -> &ToronAuditEvent {
+		&self.event
+	}
+
+	pub fn operation(&self) -> ToronAuditOperation {
+		self.event.operation()
+	}
+
+	pub fn event_class(&self) -> ToronAuditEventClass {
+		self.event.event_class()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn error_class_for_test(&self) -> Option<&'static str> {
+		self.event.error_class_for_test()
+	}
 }
 
 impl ToronAuditEmitter {
@@ -1134,7 +1222,10 @@ impl ToronAuditEmitter {
 				readiness
 					.set_degraded_reason(Some("audit_local_chain_unavailable".to_string()))
 					.await;
-				return Self::Unavailable { metrics };
+				return Self::Unavailable {
+					metrics,
+					fail_closed: config.fail_closed,
+				};
 			}
 		};
 		let observer = Arc::new(ToronAuditObserver {
@@ -1153,7 +1244,10 @@ impl ToronAuditEmitter {
 				readiness
 					.set_degraded_reason(Some("audit_local_chain_unavailable".to_string()))
 					.await;
-				return Self::Unavailable { metrics };
+				return Self::Unavailable {
+					metrics,
+					fail_closed: config.fail_closed,
+				};
 			}
 		};
 		let (tx, rx) = mpsc::channel(config.queue_capacity.get());
@@ -1164,24 +1258,97 @@ impl ToronAuditEmitter {
 			Arc::clone(&metrics),
 			readiness,
 		));
-		Self::Enabled { tx, metrics }
+		Self::Enabled {
+			tx,
+			metrics,
+			fail_closed: config.fail_closed,
+			ack_timeout: config.fail_closed_ack_timeout,
+		}
 	}
 
 	pub fn record(&self, event: ToronAuditEvent) {
 		match self {
 			Self::Disabled => {}
-			Self::Unavailable { metrics } => {
+			Self::Unavailable { metrics, .. } => {
 				record_drop(metrics, &event, ToronAuditDropReason::EmitterClosed);
 			}
-			Self::Enabled { tx, metrics } => match tx.try_send(event) {
-				Ok(()) => {}
-				Err(mpsc::error::TrySendError::Full(event)) => {
-					record_drop(metrics, &event, ToronAuditDropReason::QueueFull);
+			Self::Enabled { tx, metrics, .. } => {
+				let event = ToronAuditCommand::fire_and_forget(event);
+				match tx.try_send(event) {
+					Ok(()) => {}
+					Err(mpsc::error::TrySendError::Full(event)) => {
+						record_drop(metrics, event.event(), ToronAuditDropReason::QueueFull);
+					}
+					Err(mpsc::error::TrySendError::Closed(event)) => {
+						record_drop(metrics, event.event(), ToronAuditDropReason::EmitterClosed);
+					}
 				}
-				Err(mpsc::error::TrySendError::Closed(event)) => {
-					record_drop(metrics, &event, ToronAuditDropReason::EmitterClosed);
+			}
+		}
+	}
+
+	pub async fn record_required(&self, event: ToronAuditEvent) -> Result<(), AuditUnavailable> {
+		if !event.security_relevant() || event.operation() == ToronAuditOperation::AuditSinkFailure
+		{
+			self.record(event);
+			return Ok(());
+		}
+		match self {
+			Self::Disabled => Ok(()),
+			Self::Unavailable {
+				metrics,
+				fail_closed,
+			} => {
+				record_drop(metrics, &event, ToronAuditDropReason::EmitterClosed);
+				if *fail_closed {
+					Err(AuditUnavailable::new(AuditUnavailableReason::EmitterClosed))
+				} else {
+					Ok(())
 				}
-			},
+			}
+			Self::Enabled {
+				tx,
+				metrics,
+				fail_closed,
+				ack_timeout,
+			} => {
+				if !*fail_closed {
+					self.record(event);
+					return Ok(());
+				}
+				let (ack_tx, ack_rx) = oneshot::channel();
+				match tx.try_send(ToronAuditCommand::required(event, ack_tx)) {
+					Ok(()) => {}
+					Err(mpsc::error::TrySendError::Full(command)) => {
+						record_drop(metrics, command.event(), ToronAuditDropReason::QueueFull);
+						return Err(AuditUnavailable::new(AuditUnavailableReason::QueueFull));
+					}
+					Err(mpsc::error::TrySendError::Closed(command)) => {
+						record_drop(
+							metrics,
+							command.event(),
+							ToronAuditDropReason::EmitterClosed,
+						);
+						return Err(AuditUnavailable::new(AuditUnavailableReason::EmitterClosed));
+					}
+				}
+				match tokio::time::timeout(*ack_timeout, ack_rx).await {
+					Ok(Ok(result)) => result,
+					Ok(Err(_closed)) => {
+						Err(AuditUnavailable::new(AuditUnavailableReason::EmitterClosed))
+					}
+					Err(_elapsed) => Err(AuditUnavailable::new(AuditUnavailableReason::Timeout)),
+				}
+			}
+		}
+	}
+
+	pub fn fail_closed_enabled(&self) -> bool {
+		match self {
+			Self::Disabled => false,
+			Self::Enabled { fail_closed, .. } | Self::Unavailable { fail_closed, .. } => {
+				*fail_closed
+			}
 		}
 	}
 
@@ -1204,13 +1371,15 @@ fn record_drop(metrics: &ToronAuditMetrics, event: &ToronAuditEvent, reason: Tor
 }
 
 async fn run_audit_worker(
-	mut rx: mpsc::Receiver<ToronAuditEvent>,
+	mut rx: mpsc::Receiver<ToronAuditCommand>,
 	sink: Arc<dyn shared_audit::AuditSink>,
 	node_id: ToronAuditNodeId,
 	metrics: Arc<ToronAuditMetrics>,
 	readiness: Arc<ReadinessState>,
 ) {
-	while let Some(event) = rx.recv().await {
+	while let Some(command) = rx.recv().await {
+		let event = command.event;
+		let required_ack = command.required_ack;
 		let event_class = event.event_class();
 		let security_relevant = event.security_relevant();
 		let shared_event = match event.to_shared(&node_id) {
@@ -1223,11 +1392,21 @@ async fn run_audit_worker(
 					);
 				}
 				tracing::warn!(error = %error, "audit event serialization failed");
+				if let Some(ack) = required_ack {
+					let _ = ack.send(Err(AuditUnavailable::new(
+						AuditUnavailableReason::SerializationFailed,
+					)));
+				}
 				continue;
 			}
 		};
 		match sink.emit(shared_event) {
-			Ok(()) => metrics.record_event(event_class),
+			Ok(()) => {
+				metrics.record_event(event_class);
+				if let Some(ack) = required_ack {
+					let _ = ack.send(Ok(()));
+				}
+			}
 			Err(error) => {
 				if security_relevant {
 					metrics.record_security_unrecorded(
@@ -1238,6 +1417,11 @@ async fn run_audit_worker(
 				readiness
 					.set_degraded_reason(Some("audit_local_chain_write_failed".to_string()))
 					.await;
+				if let Some(ack) = required_ack {
+					let _ = ack.send(Err(AuditUnavailable::new(
+						AuditUnavailableReason::SinkFailed,
+					)));
+				}
 			}
 		}
 	}
@@ -1246,6 +1430,43 @@ async fn run_audit_worker(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::sync::atomic::{AtomicU64, Ordering};
+
+	struct RecordingAuditSink {
+		emits: AtomicU64,
+		fail: bool,
+	}
+
+	impl RecordingAuditSink {
+		fn succeeding() -> Self {
+			Self {
+				emits: AtomicU64::new(0),
+				fail: false,
+			}
+		}
+
+		fn failing() -> Self {
+			Self {
+				emits: AtomicU64::new(0),
+				fail: true,
+			}
+		}
+
+		fn emits(&self) -> u64 {
+			self.emits.load(Ordering::Relaxed)
+		}
+	}
+
+	impl shared_audit::AuditSink for RecordingAuditSink {
+		fn emit(&self, _event: shared_audit::AuditEvent) -> std::io::Result<()> {
+			self.emits.fetch_add(1, Ordering::Relaxed);
+			if self.fail {
+				Err(std::io::Error::other("injected audit sink failure"))
+			} else {
+				Ok(())
+			}
+		}
+	}
 
 	#[test]
 	fn toron_audit_node_id_requires_toron_prefix() {
@@ -1281,6 +1502,7 @@ mod tests {
 		let metrics = Arc::new(ToronAuditMetrics::default());
 		let emitter = ToronAuditEmitter::Unavailable {
 			metrics: Arc::clone(&metrics),
+			fail_closed: false,
 		};
 
 		emitter.record(ToronAuditEvent::edge_denial(
@@ -1300,6 +1522,215 @@ mod tests {
 			metrics
 				.security_unrecorded_count(ToronAuditSecurityEventUnrecordedReason::EmitterClosed,),
 			1
+		);
+	}
+
+	#[tokio::test]
+	async fn record_required_delegates_fail_open_when_fail_closed_false() {
+		let (tx, mut rx) = mpsc::channel(1);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let emitter = ToronAuditEmitter::Enabled {
+			tx,
+			metrics,
+			fail_closed: false,
+			ack_timeout: Duration::from_millis(50),
+		};
+
+		emitter
+			.record_required(ToronAuditEvent::edge_denial(
+				ToronAuditOperation::SqlConnectionLimitDenied,
+				Some(TenantId(7)),
+				"sql connection limit denied",
+			))
+			.await
+			.expect("fail-open required audit succeeds");
+
+		let command = rx.recv().await.expect("audit command");
+		assert_eq!(
+			command.operation(),
+			ToronAuditOperation::SqlConnectionLimitDenied
+		);
+	}
+
+	#[tokio::test]
+	async fn required_audit_queue_full_returns_bounded_audit_unavailable() {
+		let (tx, _rx) = mpsc::channel(1);
+		tx.try_send(ToronAuditCommand::fire_and_forget(
+			ToronAuditEvent::lifecycle_startup(),
+		))
+		.expect("fill queue");
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let emitter = ToronAuditEmitter::Enabled {
+			tx,
+			metrics: Arc::clone(&metrics),
+			fail_closed: true,
+			ack_timeout: Duration::from_millis(50),
+		};
+
+		let error = emitter
+			.record_required(ToronAuditEvent::edge_denial(
+				ToronAuditOperation::SqlConnectionLimitDenied,
+				Some(TenantId(7)),
+				"sql connection limit denied",
+			))
+			.await
+			.expect_err("queue full rejects required audit");
+
+		assert_eq!(error.reason(), AuditUnavailableReason::QueueFull);
+		assert_eq!(
+			metrics.dropped_count(
+				ToronAuditEventClass::EdgeDenial,
+				ToronAuditDropReason::QueueFull,
+			),
+			1
+		);
+	}
+
+	#[tokio::test]
+	async fn required_audit_ack_timeout_returns_bounded_audit_unavailable() {
+		let (tx, _rx) = mpsc::channel(1);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let emitter = ToronAuditEmitter::Enabled {
+			tx,
+			metrics,
+			fail_closed: true,
+			ack_timeout: Duration::from_millis(1),
+		};
+
+		let error = emitter
+			.record_required(ToronAuditEvent::edge_denial(
+				ToronAuditOperation::SqlConnectionLimitDenied,
+				Some(TenantId(7)),
+				"sql connection limit denied",
+			))
+			.await
+			.expect_err("missing required ack rejects audit");
+
+		assert_eq!(error.reason(), AuditUnavailableReason::Timeout);
+	}
+
+	#[tokio::test]
+	async fn required_audit_closed_emitter_returns_bounded_audit_unavailable() {
+		let (tx, rx) = mpsc::channel(1);
+		drop(rx);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let emitter = ToronAuditEmitter::Enabled {
+			tx,
+			metrics,
+			fail_closed: true,
+			ack_timeout: Duration::from_millis(50),
+		};
+
+		let error = emitter
+			.record_required(ToronAuditEvent::edge_denial(
+				ToronAuditOperation::SqlConnectionLimitDenied,
+				Some(TenantId(7)),
+				"sql connection limit denied",
+			))
+			.await
+			.expect_err("closed emitter rejects required audit");
+
+		assert_eq!(error.reason(), AuditUnavailableReason::EmitterClosed);
+	}
+
+	#[tokio::test]
+	async fn sink_failure_diagnostic_does_not_recursively_require_audit() {
+		let (tx, _rx) = mpsc::channel(1);
+		tx.try_send(ToronAuditCommand::fire_and_forget(
+			ToronAuditEvent::lifecycle_startup(),
+		))
+		.expect("fill queue");
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let emitter = ToronAuditEmitter::Enabled {
+			tx,
+			metrics: Arc::clone(&metrics),
+			fail_closed: true,
+			ack_timeout: Duration::from_millis(50),
+		};
+
+		emitter
+			.record_required(ToronAuditEvent::sink_failure())
+			.await
+			.expect("sink failure diagnostic is best-effort");
+
+		assert_eq!(
+			metrics.dropped_count(ToronAuditEventClass::Audit, ToronAuditDropReason::QueueFull),
+			1
+		);
+	}
+
+	#[tokio::test]
+	async fn required_audit_ack_follows_local_sink_emit_success() {
+		let sink = Arc::new(RecordingAuditSink::succeeding());
+		let worker_sink: Arc<dyn shared_audit::AuditSink> = sink.clone();
+		let (tx, rx) = mpsc::channel(4);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let readiness = Arc::new(ReadinessState::new(true, true, true, 0, 0));
+		tokio::spawn(run_audit_worker(
+			rx,
+			worker_sink,
+			ToronAuditNodeId::new("toron-n-1", 1).expect("node id"),
+			Arc::clone(&metrics),
+			readiness,
+		));
+		let emitter = ToronAuditEmitter::Enabled {
+			tx,
+			metrics: Arc::clone(&metrics),
+			fail_closed: true,
+			ack_timeout: Duration::from_secs(1),
+		};
+
+		emitter
+			.record_required(ToronAuditEvent::edge_denial(
+				ToronAuditOperation::SqlConnectionLimitDenied,
+				Some(TenantId(7)),
+				"sql connection limit denied",
+			))
+			.await
+			.expect("required audit ack");
+
+		assert_eq!(sink.emits(), 1);
+		assert_eq!(metrics.event_count(ToronAuditEventClass::EdgeDenial), 1);
+	}
+
+	#[tokio::test]
+	async fn required_audit_sink_error_rejects_and_degrades_readiness() {
+		let sink = Arc::new(RecordingAuditSink::failing());
+		let worker_sink: Arc<dyn shared_audit::AuditSink> = sink.clone();
+		let (tx, rx) = mpsc::channel(4);
+		let metrics = Arc::new(ToronAuditMetrics::default());
+		let readiness = Arc::new(ReadinessState::new(true, true, true, 0, 0));
+		tokio::spawn(run_audit_worker(
+			rx,
+			worker_sink,
+			ToronAuditNodeId::new("toron-n-1", 1).expect("node id"),
+			Arc::clone(&metrics),
+			Arc::clone(&readiness),
+		));
+		let emitter = ToronAuditEmitter::Enabled {
+			tx,
+			metrics: Arc::clone(&metrics),
+			fail_closed: true,
+			ack_timeout: Duration::from_secs(1),
+		};
+
+		let error = emitter
+			.record_required(ToronAuditEvent::edge_denial(
+				ToronAuditOperation::SqlConnectionLimitDenied,
+				Some(TenantId(7)),
+				"sql connection limit denied",
+			))
+			.await
+			.expect_err("sink failure rejects required audit");
+
+		assert_eq!(error.reason(), AuditUnavailableReason::SinkFailed);
+		assert_eq!(
+			metrics.security_unrecorded_count(ToronAuditSecurityEventUnrecordedReason::SinkError),
+			1
+		);
+		assert_eq!(
+			readiness.snapshot().await.degraded_reason.as_deref(),
+			Some("audit_local_chain_write_failed")
 		);
 	}
 

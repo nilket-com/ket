@@ -981,7 +981,7 @@ async fn handle_ready_connection(
 			AuditOutcome::Denied,
 		),
 	};
-	record_observability_access(
+	if !record_observability_access_required(
 		&audit,
 		observability_access_fields(
 			ToronAuditOperation::ObservabilityReadyAccess,
@@ -992,7 +992,17 @@ async fn handle_ready_connection(
 			auth_class(&actor_key_id),
 			actor_key_id,
 		),
-	);
+	)
+	.await
+	{
+		return write_response(
+			&mut stream,
+			"503 Service Unavailable",
+			TEXT_CONTENT_TYPE,
+			"audit unavailable\n",
+		)
+		.await;
+	}
 	write_response(&mut stream, status, content_type, &body).await
 }
 
@@ -1069,7 +1079,7 @@ async fn handle_metrics_connection(
 			AuditOutcome::Denied,
 		),
 	};
-	record_observability_access(
+	if !record_observability_access_required(
 		&audit,
 		observability_access_fields(
 			ToronAuditOperation::ObservabilityMetricsAccess,
@@ -1080,7 +1090,17 @@ async fn handle_metrics_connection(
 			auth_class(&actor_key_id),
 			actor_key_id,
 		),
-	);
+	)
+	.await
+	{
+		return write_response(
+			&mut stream,
+			"503 Service Unavailable",
+			TEXT_CONTENT_TYPE,
+			"audit unavailable\n",
+		)
+		.await;
+	}
 	write_response(&mut stream, status, content_type, &body).await
 }
 
@@ -1096,6 +1116,22 @@ fn observability_actor_key_id<S>(
 
 fn record_observability_access(audit: &ToronAuditEmitter, fields: ObservabilityAccessAuditFields) {
 	audit.record(ToronAuditEvent::observability_access(fields));
+}
+
+async fn record_observability_access_required(
+	audit: &ToronAuditEmitter,
+	fields: ObservabilityAccessAuditFields,
+) -> bool {
+	match audit
+		.record_required(ToronAuditEvent::observability_access(fields))
+		.await
+	{
+		Ok(()) => true,
+		Err(error) => {
+			tracing::warn!(error = %error, "required observability access audit unavailable");
+			false
+		}
+	}
 }
 
 fn observability_access_fields(

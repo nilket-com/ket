@@ -53,6 +53,7 @@ const DEFAULT_SQL_LISTENER_BIND: &str = "127.0.0.1:7742";
 const DEFAULT_SQL_STATEMENT_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_TELEMETRY_MAX_QUEUE_SIZE: usize = 1024;
 const DEFAULT_TELEMETRY_EXPORT_TIMEOUT_SECONDS: u64 = 10;
+const DEFAULT_AUDIT_FAIL_CLOSED_ACK_TIMEOUT_MS: u64 = 500;
 
 const EXAMPLE_CONFIG: &str = r#"[node]
 worker_id = "00000000-0000-0000-0000-000000000042"
@@ -160,6 +161,8 @@ format = "pretty"
 # node_numeric_id = 1
 # local_path = "audit/toron.ndjson"
 # queue_capacity = 1024
+# fail_closed = false
+# fail_closed_ack_timeout_ms = 500
 #
 # [audit.archive]
 # directory = "audit/archive"
@@ -323,6 +326,8 @@ pub struct AuditEnabledConfig {
 	pub node_numeric_id: u32,
 	pub local_path: PathBuf,
 	pub queue_capacity: NonZeroUsize,
+	pub fail_closed: bool,
+	pub fail_closed_ack_timeout: Duration,
 	pub sinks: AuditSinksConfig,
 }
 
@@ -570,6 +575,9 @@ struct RawAuditConfig {
 	node_numeric_id: Option<u32>,
 	local_path: Option<PathBuf>,
 	queue_capacity: Option<usize>,
+	#[serde(default)]
+	fail_closed: bool,
+	fail_closed_ack_timeout_ms: Option<u64>,
 	archive: Option<RawAuditArchiveConfig>,
 	syslog: Option<RawAuditSyslogConfig>,
 }
@@ -1131,7 +1139,23 @@ fn normalize_audit_config(
 	base_dir: &Path,
 ) -> Result<AuditConfig, ToronConfigError> {
 	if !raw.enabled {
+		if raw.fail_closed {
+			return Err(invalid("audit.fail_closed requires audit.enabled = true"));
+		}
+		if raw.fail_closed_ack_timeout_ms == Some(0) {
+			return Err(invalid(
+				"audit.fail_closed_ack_timeout_ms must be greater than 0",
+			));
+		}
 		return Ok(AuditConfig::Disabled);
+	}
+	let fail_closed_ack_timeout_ms = raw
+		.fail_closed_ack_timeout_ms
+		.unwrap_or(DEFAULT_AUDIT_FAIL_CLOSED_ACK_TIMEOUT_MS);
+	if fail_closed_ack_timeout_ms == 0 {
+		return Err(invalid(
+			"audit.fail_closed_ack_timeout_ms must be greater than 0",
+		));
 	}
 	let node_id = raw
 		.node_id
@@ -1190,6 +1214,8 @@ fn normalize_audit_config(
 		node_numeric_id,
 		local_path,
 		queue_capacity,
+		fail_closed: raw.fail_closed,
+		fail_closed_ack_timeout: Duration::from_millis(fail_closed_ack_timeout_ms),
 		sinks: AuditSinksConfig {
 			archive,
 			syslog,

@@ -8345,13 +8345,14 @@ fn adr066_emitter_is_bounded_try_send_fail_open() {
 	let audit =
 		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
 
-	assert!(audit.contains("tokio::sync::mpsc"));
+	assert!(audit.contains("tokio::sync::{mpsc, oneshot}"));
 	assert!(audit.contains("mpsc::channel(config.queue_capacity.get())"));
 	assert!(audit.contains("tx.try_send(event)"));
 	assert!(audit.contains("TrySendError::Full"));
 	assert!(audit.contains("TrySendError::Closed"));
 	assert!(!audit.contains(".send(event).await"));
-	assert!(audit.contains("record_drop(metrics, &event, ToronAuditDropReason::QueueFull)"));
+	assert!(audit.contains("ToronAuditCommand::fire_and_forget(event)"));
+	assert!(audit.contains("record_drop(metrics, event.event(), ToronAuditDropReason::QueueFull)"));
 }
 
 #[test]
@@ -12803,7 +12804,9 @@ fn adr059_cancel_before_start_task_tombstones_and_aborts_on_registration() {
 	assert!(cancellation.contains("insert_pending(identity)"));
 	assert!(cancellation.contains("cancelled_before_start"));
 	assert!(server.contains("if active_task.cancelled_before_start"));
-	assert!(server.contains("send_task_failed(&mut stream, identity, cancelled_task_error())"));
+	assert!(server.contains("record_cancelled().await"));
+	assert!(server.contains("cancelled_task_error()"));
+	assert!(server.contains("send_task_failed(&mut stream, identity, error).await?"));
 	assert!(server.contains("cancel_task_before_registration_tombstones_and_prevents_execution"));
 }
 
@@ -15717,25 +15720,28 @@ fn adr071_audit_emission_preserves_try_send_fail_open_no_request_failure() {
 }
 
 #[test]
-fn adr071_no_audit_fail_closed_request_failure_path() {
-	let toron_source = source_files(&manifest_dir().join("src"))
+fn adr071_fail_open_default_preserves_no_audit_request_failure_path_after_adr072() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let record = brace_blocks_after_marker(&audit, "pub fn record(&self")
 		.into_iter()
-		.map(|path| std::fs::read_to_string(path).expect("read Toron source"))
-		.collect::<Vec<_>>()
-		.join("\n");
+		.next()
+		.expect("record body")
+		.1;
+	let required = brace_blocks_after_marker(&audit, "pub async fn record_required")
+		.into_iter()
+		.next()
+		.expect("record_required body")
+		.1;
 
-	for forbidden in [
-		"audit.fail_closed",
-		"AuditConfig::FailClosed",
-		"audit_failure_closes_task_execution",
-		"audit enqueue failed",
-		"audit write failed request",
-	] {
-		assert!(
-			!toron_source.contains(forbidden),
-			"found fail-closed path {forbidden}"
-		);
-	}
+	assert!(config.contains("# fail_closed = false"));
+	assert!(record.contains("tx.try_send(event)"));
+	assert!(!record.contains("AuditUnavailable"));
+	assert!(required.contains("if !*fail_closed"));
+	assert!(required.contains("self.record(event);"));
+	assert!(required.contains("return Ok(());"));
 }
 
 #[test]
@@ -15821,6 +15827,419 @@ fn adr071_prior_adr065_066_audit_guards_continue_to_pass_except_worker_retarget(
 		architecture_test
 			.contains("adr071_runtime_worker_audit_allowed_fixture_worker_stays_audit_free")
 	);
+}
+
+#[test]
+fn adr072_audit_fail_closed_is_opt_in_default_false() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+
+	assert!(config.contains("# fail_closed = false"));
+	assert!(config.contains("pub fail_closed: bool"));
+	assert!(config.contains("fail_closed: bool"));
+	assert!(config.contains("fail_closed: raw.fail_closed"));
+	assert!(config.contains("DEFAULT_AUDIT_FAIL_CLOSED_ACK_TIMEOUT_MS"));
+}
+
+#[test]
+fn adr072_fail_closed_false_is_behavior_equivalent_to_071() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let sql_test = std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
+		.expect("read SQL listener tests");
+	let observability_test =
+		std::fs::read_to_string(manifest_dir().join("tests/observability_listener_test.rs"))
+			.expect("read observability tests");
+	let required = brace_blocks_after_marker(&audit, "pub async fn record_required")
+		.into_iter()
+		.next()
+		.expect("record_required body")
+		.1;
+
+	assert!(required.contains("if !*fail_closed"));
+	assert!(required.contains("self.record(event);"));
+	assert!(required.contains("return Ok(());"));
+	assert!(sql_test.contains("fail_closed: false"));
+	assert!(observability_test.contains("fail_closed: false"));
+	assert!(audit.contains("record_required_delegates_fail_open_when_fail_closed_false"));
+}
+
+#[test]
+fn adr072_fail_closed_true_requires_audit_enabled() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config tests");
+
+	assert!(config.contains("if !raw.enabled"));
+	assert!(config.contains("if raw.fail_closed"));
+	assert!(config.contains("audit.fail_closed requires audit.enabled = true"));
+	assert!(config_test.contains("audit_fail_closed_config_accepts_enabled_and_rejects_disabled"));
+}
+
+#[test]
+fn adr072_fail_closed_ack_timeout_is_bounded_and_nonzero() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let config_test = std::fs::read_to_string(manifest_dir().join("tests/config_test.rs"))
+		.expect("read config tests");
+
+	assert!(config.contains("DEFAULT_AUDIT_FAIL_CLOSED_ACK_TIMEOUT_MS: u64 = 500"));
+	assert!(config.contains("fail_closed_ack_timeout_ms: Option<u64>"));
+	assert!(config.contains("fail_closed_ack_timeout: Duration"));
+	assert!(config.contains("audit.fail_closed_ack_timeout_ms must be greater than 0"));
+	assert!(config_test.contains("fail_closed_ack_timeout"));
+}
+
+#[test]
+fn adr072_record_remains_try_send_fail_open() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let record = brace_blocks_after_marker(&audit, "pub fn record(&self")
+		.into_iter()
+		.next()
+		.expect("record body")
+		.1;
+
+	assert!(record.contains("ToronAuditCommand::fire_and_forget(event)"));
+	assert!(record.contains("tx.try_send(event)"));
+	assert!(record.contains("TrySendError::Full"));
+	assert!(record.contains("TrySendError::Closed"));
+	assert!(record.contains("record_drop(metrics"));
+	assert!(!record.contains("AuditUnavailable"));
+	assert!(!record.contains(".send("));
+	assert!(!record.contains(".await"));
+}
+
+#[test]
+fn adr072_record_required_is_mode_aware() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let required = brace_blocks_after_marker(&audit, "pub async fn record_required")
+		.into_iter()
+		.next()
+		.expect("record_required body")
+		.1;
+
+	assert!(required.contains("Result<(), AuditUnavailable>"));
+	assert!(required.contains("Self::Disabled => Ok(())"));
+	assert!(required.contains("if !*fail_closed"));
+	assert!(required.contains("self.record(event);"));
+	assert!(required.contains("ToronAuditCommand::required(event, ack_tx)"));
+	assert!(required.contains("tokio::time::timeout(*ack_timeout, ack_rx).await"));
+}
+
+#[test]
+fn adr072_required_audit_uses_worker_ack() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+
+	assert!(audit.contains("required_ack: Option<oneshot::Sender<Result<(), AuditUnavailable>>>"));
+	assert!(audit.contains("let (ack_tx, ack_rx) = oneshot::channel();"));
+	assert!(audit.contains("ToronAuditCommand::required(event, ack_tx)"));
+	assert!(audit.contains("let required_ack = command.required_ack;"));
+}
+
+#[test]
+fn adr072_required_ack_means_local_chain_written_and_fsynced() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let shared_audit = observability_audit_source_text();
+	let worker = brace_blocks_after_marker(&audit, "async fn run_audit_worker")
+		.into_iter()
+		.next()
+		.expect("audit worker")
+		.1;
+
+	assert!(shared_audit.contains("file.sync_data()"));
+	assert!(worker.contains("sink.emit(shared_event)"));
+	assert!(worker.contains("ack.send(Ok(()))"));
+}
+
+#[test]
+fn adr072_required_ack_uses_oneshot_after_sink_emit_returns() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let worker = brace_blocks_after_marker(&audit, "async fn run_audit_worker")
+		.into_iter()
+		.next()
+		.expect("audit worker")
+		.1;
+	let emit = worker.find("sink.emit(shared_event)").expect("sink emit");
+	let ack = worker.find("ack.send(Ok(()))").expect("success ack");
+
+	assert!(emit < ack);
+}
+
+#[test]
+fn adr072_security_relevant_is_eligibility_not_global_control_flow() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let required = brace_blocks_after_marker(&audit, "pub async fn record_required")
+		.into_iter()
+		.next()
+		.expect("record_required body")
+		.1;
+
+	assert!(audit.contains("pub fn security_relevant(&self) -> bool"));
+	assert!(required.contains("!event.security_relevant()"));
+	assert!(required.contains("event.operation() == ToronAuditOperation::AuditSinkFailure"));
+	assert!(required.contains("self.record(event);"));
+	assert!(required.contains("return Ok(());"));
+}
+
+#[test]
+fn adr072_required_call_sites_match_surface_table() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	for operation in [
+		"SqlRequestFrameTooLarge",
+		"SqlStatementTooLarge",
+		"SqlProtocolMismatch",
+		"SqlUnexpectedClientFrame",
+		"QueryCompleted",
+		"QueryPlannedError",
+		"QueryExecutionError",
+		"QueryCancelled",
+		"QueryTimedOut",
+		"QueryDisconnectAborted",
+	] {
+		assert!(
+			daemon.contains(operation),
+			"missing SQL surface {operation}"
+		);
+	}
+	assert!(daemon.contains("record_sql_audit_required_or_error"));
+	assert!(daemon.contains("record_sql_audit_required_without_response"));
+	assert!(server.contains("record_started().await"));
+	assert!(server.contains("record_completed(emitted_rows).await"));
+	assert!(server.contains("record_failed(&error).await"));
+	assert!(server.contains("record_cancelled().await"));
+	assert!(observability.contains("record_observability_access_required"));
+}
+
+#[test]
+fn adr072_audit_sink_failure_is_never_required() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let required = brace_blocks_after_marker(&audit, "pub async fn record_required")
+		.into_iter()
+		.next()
+		.expect("record_required body")
+		.1;
+
+	assert!(required.contains("ToronAuditOperation::AuditSinkFailure"));
+	assert!(required.contains("self.record(event);"));
+	assert!(audit.contains("sink_failure_diagnostic_does_not_recursively_require_audit"));
+}
+
+#[test]
+fn adr072_query_results_are_not_streamed_before_required_terminal_audit() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let sql_test = std::fs::read_to_string(manifest_dir().join("tests/sql_listener_test.rs"))
+		.expect("read SQL listener tests");
+	let fail_closed = daemon
+		.split("let encoded_result_batches")
+		.nth(1)
+		.expect("SQL success pre-encode block");
+	let preencode = fail_closed
+		.find("encode_sql_batch")
+		.expect("pre-encode batch");
+	let required = fail_closed
+		.find("record_sql_audit_required_or_error")
+		.expect("required terminal audit");
+	let send_batch = fail_closed
+		.find("SqlMessage::ResultBatch")
+		.expect("send batch");
+
+	assert!(preencode < required && required < send_batch);
+	assert!(
+		sql_test.contains(
+			"fail_closed_sql_success_audit_failure_returns_internal_before_result_batches"
+		)
+	);
+}
+
+#[test]
+fn adr072_worker_started_required_before_task_execution() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let start_task = server
+		.split("MessageKind::StartTask =>")
+		.nth(1)
+		.and_then(|rest| rest.split("MessageKind::CancelTask =>").next())
+		.expect("StartTask arm");
+	let started = start_task
+		.find("audit_recorder.record_started().await")
+		.expect("started audit");
+	let task_started = start_task
+		.find("MessageKind::TaskStarted")
+		.expect("TaskStarted response");
+	let execute = start_task
+		.find("self.execute_task_local_with_telemetry")
+		.expect("task execution");
+
+	assert!(started < task_started && started < execute);
+	assert!(server.contains("worker_started_audit_failure_prevents_task_execution"));
+}
+
+#[test]
+fn adr072_required_queue_full_closed_sink_error_or_timeout_rejects() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+
+	for required in [
+		"AuditUnavailableReason::QueueFull",
+		"AuditUnavailableReason::EmitterClosed",
+		"AuditUnavailableReason::SinkFailed",
+		"AuditUnavailableReason::Timeout",
+		"required_audit_queue_full_returns_bounded_audit_unavailable",
+		"required_audit_closed_emitter_returns_bounded_audit_unavailable",
+		"required_audit_sink_error_rejects_and_degrades_readiness",
+		"required_audit_ack_timeout_returns_bounded_audit_unavailable",
+	] {
+		assert!(
+			audit.contains(required),
+			"missing required failure {required}"
+		);
+	}
+}
+
+#[test]
+fn adr072_audit_unavailable_errors_are_bounded_oracle_safe() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let observability =
+		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+			.expect("read observability");
+
+	for label in [
+		"queue_full",
+		"emitter_closed",
+		"serialization_failed",
+		"sink_failed",
+		"timeout",
+	] {
+		assert!(audit.contains(label), "missing bounded reason {label}");
+	}
+	assert!(daemon.contains("const AUDIT_UNAVAILABLE_SQL_MESSAGE: &str = \"audit unavailable\""));
+	assert!(server.contains("reason: \"audit_unavailable\".to_string()"));
+	assert!(observability.contains("\"audit unavailable\\n\""));
+	assert!(!daemon.contains("write_sql_error(stream, query_id, SqlErrorCode::Internal, error"));
+}
+
+#[test]
+fn adr072_no_new_sql_error_or_task_failure_enum_variant() {
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let task_errors = std::fs::read_to_string(manifest_dir().join("src/error/distributed.rs"))
+		.expect("read task errors");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(!sql_wire.contains("AuditUnavailable"));
+	assert!(!task_errors.contains("AuditUnavailable"));
+	assert!(server.contains("TaskFailureKind::TaskFailed"));
+	assert!(server.contains("audit_unavailable"));
+}
+
+#[test]
+fn adr072_response_gating_not_side_effect_gating_documented() {
+	let adr = std::fs::read_to_string(manifest_dir().join("plans/adr/072_audit_fail_closed.md"))
+		.expect("read ADR 072");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+
+	assert!(adr.contains("response-gating"));
+	assert!(adr.contains("not side-effect rollback"));
+	assert!(daemon.contains("let encoded_result_batches"));
+	assert!(server.contains("record_completed(emitted_rows).await"));
+}
+
+#[test]
+fn adr072_fail_closed_degrades_readiness_for_security_relevant_surfaces() {
+	let audit =
+		std::fs::read_to_string(manifest_dir().join("src/audit.rs")).expect("read Toron audit");
+
+	assert!(audit.contains("audit_local_chain_unavailable"));
+	assert!(audit.contains("audit_local_chain_write_failed"));
+	assert!(audit.contains("record_security_unrecorded"));
+	assert!(audit.contains("required_audit_sink_error_rejects_and_degrades_readiness"));
+}
+
+#[test]
+fn adr072_no_wendelon_storage_sql_wire_worker_wire_or_shared_substrate_change() {
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let worker_wire =
+		std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read worker wire");
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage");
+	let shared = observability_audit_source_text();
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for source in [
+		sql_wire.as_str(),
+		worker_wire.as_str(),
+		storage.as_str(),
+		shared.as_str(),
+	] {
+		assert!(!source.contains("audit.fail_closed"));
+		assert!(!source.contains("ToronAuditEmitter"));
+	}
+	assert!(!wendelon_source.contains("audit.fail_closed"));
+	assert!(!wendelon_source.contains("record_required"));
+}
+
+#[test]
+fn adr072_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in [
+		"tokio",
+		"quinn",
+		"rustls",
+		"observability",
+		"tls-pki",
+		"serde_json",
+	] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr072_prior_adr065_066_071_audit_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for prefix in ["adr065_", "adr066_", "adr071_"] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior audit guard prefix {prefix}");
+	}
+	assert!(architecture_test.contains("fn adr072_record_required_is_mode_aware"));
 }
 
 #[test]
