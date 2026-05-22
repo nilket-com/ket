@@ -1,5 +1,6 @@
 mod aggregate_kernel;
 
+pub mod audit;
 pub mod binder;
 pub mod catalog;
 pub mod cli;

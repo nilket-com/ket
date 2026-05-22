@@ -17,6 +17,10 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::EnvFilter;
 
+use crate::audit::{
+	AuditOutcome, StatementClass, ToronAuditEmitter, ToronAuditEvent, ToronAuditMetrics,
+	ToronAuditOperation,
+};
 use crate::catalog::{WendelonCatalog, WendelonDescriptorRegistry};
 use crate::config::{
 	OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC, ToronBootstrapConfig, ToronConfigError,
@@ -108,6 +112,7 @@ pub struct ToronDaemon {
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
 	drain_timeout: std::time::Duration,
 	readiness: Arc<ReadinessState>,
+	audit: ToronAuditEmitter,
 }
 
 impl ToronDaemon {
@@ -275,6 +280,10 @@ impl ToronDaemon {
 				config.tenant_budgets.clone(),
 			)
 		});
+		let audit_metrics = config
+			.audit
+			.is_enabled()
+			.then(|| Arc::new(ToronAuditMetrics::default()));
 		let metrics = Arc::new(MetricsRegistry::new(MetricsRegistryConfig {
 			descriptors_loaded,
 			static_workers_configured: config.coordinator.static_workers.len() as u64,
@@ -284,6 +293,7 @@ impl ToronDaemon {
 			cancellation_metrics,
 			downstream_cancellation_metrics,
 			sql_connection_limiter: sql_connection_limiter.clone(),
+			audit_metrics: audit_metrics.clone(),
 			tenant_admission: coordinator.tenant_admission_controller(),
 			admission_rejections: coordinator.admission_rejection_counters(),
 		}));
@@ -294,6 +304,10 @@ impl ToronDaemon {
 			descriptors_loaded,
 			config.coordinator.static_workers.len() as u64,
 		));
+		let audit =
+			ToronAuditEmitter::from_config(&config.audit, audit_metrics, Arc::clone(&readiness))
+				.await;
+		audit.record(ToronAuditEvent::lifecycle_startup());
 
 		if let Some(listener) = listener {
 			let (tcp_shutdown_tx, tcp_shutdown_rx) = oneshot::channel();
@@ -343,6 +357,7 @@ impl ToronDaemon {
 				sql_shutdown_rx,
 				Arc::clone(&connection_tasks),
 				Arc::clone(&metrics),
+				audit.clone(),
 				SqlAcceptOptions {
 					tenant_source: sql_tenant_source,
 					connection_limiter: sql_connection_limiter
@@ -414,6 +429,7 @@ impl ToronDaemon {
 			connection_tasks,
 			drain_timeout: config.node.drain_timeout,
 			readiness,
+			audit,
 		})
 	}
 
@@ -422,6 +438,7 @@ impl ToronDaemon {
 	}
 
 	pub async fn shutdown(mut self) -> Result<(), ToronDaemonError> {
+		self.audit.record(ToronAuditEvent::lifecycle_shutdown());
 		self.readiness
 			.set_degraded_reason(Some("draining".to_string()))
 			.await;
@@ -631,6 +648,7 @@ async fn run_sql_accept_loop(
 	mut shutdown_rx: oneshot::Receiver<()>,
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
 	metrics: Arc<MetricsRegistry>,
+	audit: ToronAuditEmitter,
 	options: SqlAcceptOptions,
 ) {
 	loop {
@@ -645,6 +663,11 @@ async fn run_sql_accept_loop(
 						Ok(permit) => permit,
 						Err(_) => {
 							metrics.increment_reject(ListenerName::Sql, RejectReason::ConnectionLimit);
+							audit.record(ToronAuditEvent::edge_denial(
+								ToronAuditOperation::SqlConnectionLimitDenied,
+								None,
+								"sql connection limit denied",
+							));
 							incoming.refuse();
 							continue;
 						}
@@ -670,6 +693,11 @@ async fn run_sql_accept_loop(
 								ListenerName::Sql,
 								RejectReason::SanShapeRejected,
 							);
+							audit.record(ToronAuditEvent::edge_denial(
+								ToronAuditOperation::SqlTenantIdentityDenied,
+								None,
+								"sql tenant identity denied",
+							));
 							tracing::warn!(error = %error, "sql peer tenant extraction failed");
 							connection.close(0_u32.into(), b"sql tenant rejected");
 							continue;
@@ -679,6 +707,11 @@ async fn run_sql_accept_loop(
 						Ok(permit) => permit,
 						Err(_) => {
 							metrics.increment_reject(ListenerName::Sql, RejectReason::ConnectionLimit);
+							audit.record(ToronAuditEvent::edge_denial(
+								ToronAuditOperation::SqlConnectionLimitDenied,
+								Some(tenant_id),
+								"sql connection limit denied",
+							));
 							connection.close(0_u32.into(), b"tenant sql connection limit exhausted");
 							continue;
 						}
@@ -691,6 +724,7 @@ async fn run_sql_accept_loop(
 						max_statement_bytes: options.max_statement_bytes,
 					};
 					let metrics = Arc::clone(&metrics);
+					let audit = audit.clone();
 					connection_tasks.lock().await.spawn(async move {
 						let _connection_permits = (tier1_permit, tier2_permit);
 						match QuicEndpoint::accept_stream_on(&connection).await {
@@ -701,6 +735,7 @@ async fn run_sql_accept_loop(
 									connection.clone(),
 									connection_options,
 									metrics,
+									audit,
 								).await {
 									tracing::warn!(error = %error, "sql connection error");
 								}
@@ -727,6 +762,7 @@ async fn handle_sql_connection(
 	connection: quinn::Connection,
 	options: SqlConnectionOptions,
 	metrics: Arc<MetricsRegistry>,
+	audit: ToronAuditEmitter,
 ) -> Result<(), QueryError> {
 	let tenant_id = options.tenant_id;
 	let frame =
@@ -734,6 +770,11 @@ async fn handle_sql_connection(
 			Ok(frame) => frame,
 			Err(error) => {
 				metrics.increment_reject(ListenerName::Sql, RejectReason::RequestFrameTooLarge);
+				audit.record(ToronAuditEvent::edge_denial(
+					ToronAuditOperation::SqlRequestFrameTooLarge,
+					Some(tenant_id),
+					"sql request frame too large",
+				));
 				tracing::warn!(
 					declared_len = error.declared_len,
 					max_len = error.max_len.get(),
@@ -744,6 +785,11 @@ async fn handle_sql_connection(
 			}
 		};
 	if frame.protocol_version != crate::sql_wire::SqlProtocolVersion::Current {
+		audit.record(ToronAuditEvent::edge_denial(
+			ToronAuditOperation::SqlProtocolMismatch,
+			Some(tenant_id),
+			"sql protocol mismatch",
+		));
 		return write_sql_error(
 			&mut stream,
 			frame.query_id,
@@ -755,10 +801,17 @@ async fn handle_sql_connection(
 
 	match frame.message {
 		SqlMessage::Execute(request) => {
+			let query_started = std::time::Instant::now();
+			let session_id = new_sql_session_id();
 			if request.statement.len()
 				> usize::try_from(options.max_statement_bytes.get()).expect("u32 fits usize")
 			{
 				metrics.increment_reject(ListenerName::Sql, RejectReason::StatementTooLarge);
+				audit.record(ToronAuditEvent::edge_denial(
+					ToronAuditOperation::SqlStatementTooLarge,
+					Some(tenant_id),
+					"sql statement too large",
+				));
 				return write_sql_error(
 					&mut stream,
 					frame.query_id,
@@ -782,11 +835,24 @@ async fn handle_sql_connection(
 						| FrontendError::RuneRuntime { .. }
 						| FrontendError::RuneSandbox { .. } => SqlErrorCode::PlanningError,
 					};
+					audit.record(
+						ToronAuditEvent::query_outcome(
+							ToronAuditOperation::QueryPlannedError,
+							tenant_id,
+							session_id,
+							frame.query_id,
+							StatementClass::Unknown,
+							AuditOutcome::Denied,
+						)
+						.with_sql_error_code(code)
+						.with_duration(query_started.elapsed()),
+					);
 					return write_sql_error(&mut stream, frame.query_id, code, error.to_string())
 						.await;
 				}
 			};
-			let context = sql_execution_context(tenant_id, frame.query_id);
+			let statement_class = StatementClass::from_plan(&plan);
+			let context = sql_execution_context(tenant_id, frame.query_id, session_id);
 			let returns_rows = sql_plan_returns_rows(&plan);
 			let execution = coordinator.execute_query_with_context(&plan, context);
 			tokio::pin!(execution);
@@ -806,6 +872,18 @@ async fn handle_sql_connection(
 						CancellationTrigger::StatementTimeout,
 						cancellation_request_outcome(&cancellation),
 					);
+					audit.record(
+						ToronAuditEvent::query_outcome(
+							ToronAuditOperation::QueryTimedOut,
+							tenant_id,
+							session_id,
+							frame.query_id,
+							statement_class,
+							AuditOutcome::Denied,
+						)
+						.with_sql_error_code(SqlErrorCode::StatementTimeout)
+						.with_duration(query_started.elapsed()),
+					);
 					return write_sql_error(
 						&mut stream,
 						frame.query_id,
@@ -824,6 +902,17 @@ async fn handle_sql_connection(
 						CancellationTrigger::ClientDisconnect,
 						cancellation_request_outcome(&cancellation),
 					);
+					audit.record(
+						ToronAuditEvent::query_outcome(
+							ToronAuditOperation::QueryDisconnectAborted,
+							tenant_id,
+							session_id,
+							frame.query_id,
+							statement_class,
+							AuditOutcome::Error,
+						)
+						.with_duration(query_started.elapsed()),
+					);
 					return Ok(());
 				}
 			};
@@ -831,6 +920,28 @@ async fn handle_sql_connection(
 				Some(Ok(batches)) => batches,
 				Some(Err(error)) => {
 					let (code, message) = map_sql_query_error(error);
+					let operation = if code == SqlErrorCode::Cancelled {
+						ToronAuditOperation::QueryCancelled
+					} else {
+						ToronAuditOperation::QueryExecutionError
+					};
+					let outcome = if code == SqlErrorCode::Cancelled {
+						AuditOutcome::Denied
+					} else {
+						AuditOutcome::Error
+					};
+					audit.record(
+						ToronAuditEvent::query_outcome(
+							operation,
+							tenant_id,
+							session_id,
+							frame.query_id,
+							statement_class,
+							outcome,
+						)
+						.with_sql_error_code(code)
+						.with_duration(query_started.elapsed()),
+					);
 					return write_sql_error(&mut stream, frame.query_id, code, message).await;
 				}
 				None => unreachable!("SQL execution select always returns or exits"),
@@ -857,6 +968,18 @@ async fn handle_sql_connection(
 			} else {
 				sql_affected_row_count(&batches)
 			};
+			audit.record(
+				ToronAuditEvent::query_outcome(
+					ToronAuditOperation::QueryCompleted,
+					tenant_id,
+					session_id,
+					frame.query_id,
+					statement_class,
+					AuditOutcome::Allowed,
+				)
+				.with_duration(query_started.elapsed())
+				.with_row_count(row_count),
+			);
 			let response =
 				SqlFrame::response(frame.query_id, SqlMessage::Complete(Complete { row_count }));
 			write_sql_frame(&mut stream, &response).await?;
@@ -872,6 +995,17 @@ async fn handle_sql_connection(
 				CancellationTrigger::SqlCancel,
 				cancellation_request_outcome(&cancellation),
 			);
+			audit.record(
+				ToronAuditEvent::query_outcome(
+					ToronAuditOperation::QueryCancelled,
+					tenant_id,
+					new_sql_session_id(),
+					request.query_id,
+					StatementClass::Cancel,
+					AuditOutcome::Denied,
+				)
+				.with_sql_error_code(SqlErrorCode::Cancelled),
+			);
 			write_sql_error(
 				&mut stream,
 				frame.query_id,
@@ -881,6 +1015,11 @@ async fn handle_sql_connection(
 			.await?;
 		}
 		SqlMessage::ResultBatch(_) | SqlMessage::Complete(_) | SqlMessage::Error(_) => {
+			audit.record(ToronAuditEvent::edge_denial(
+				ToronAuditOperation::SqlUnexpectedClientFrame,
+				Some(tenant_id),
+				"unexpected client sql response frame",
+			));
 			write_sql_error(
 				&mut stream,
 				frame.query_id,
@@ -894,8 +1033,15 @@ async fn handle_sql_connection(
 	Ok(())
 }
 
-fn sql_execution_context(tenant_id: TenantId, query_id: QueryId) -> ExecutionContext {
-	let session_id = SessionId(QueryId::new().get().as_u128());
+fn new_sql_session_id() -> SessionId {
+	SessionId(QueryId::new().get().as_u128())
+}
+
+fn sql_execution_context(
+	tenant_id: TenantId,
+	query_id: QueryId,
+	session_id: SessionId,
+) -> ExecutionContext {
 	ExecutionContext::new(session_id, query_id, tenant_id, HlcBound(0))
 }
 

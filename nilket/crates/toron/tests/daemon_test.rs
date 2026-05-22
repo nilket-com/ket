@@ -4,9 +4,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use toron::config::{
-	CoordinatorConfig, ObservabilityConfig, SqlConfig, SqlTransport, ToronBootstrapConfig,
-	ToronCatalogConfig, ToronNodeConfig, ToronStorageConfig, ToronWendelonBootstrapPeer,
-	ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
+	AuditConfig, CoordinatorConfig, ObservabilityConfig, SqlConfig, SqlTransport,
+	ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig, ToronStorageConfig,
+	ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::budget::{ByteCount, TenantBudgetPolicy};
@@ -62,6 +62,7 @@ fn config() -> ToronBootstrapConfig {
 			format: TracingFormat::Pretty,
 			listeners: None,
 		},
+		audit: AuditConfig::Disabled,
 	}
 }
 

@@ -10,6 +10,10 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
+use crate::audit::{
+	ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOutputKind,
+	ToronAuditSecurityEventUnrecordedReason,
+};
 use crate::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use crate::config::ObservabilityListeners;
 use crate::distributed::budget::{
@@ -169,6 +173,7 @@ pub struct MetricsRegistry {
 	cancellation_metrics: Arc<CancellationMetrics>,
 	downstream_cancellation_metrics: Arc<DownstreamCancellationMetrics>,
 	sql_connection_limiter: Option<SqlConnectionLimiter>,
+	audit_metrics: Option<Arc<ToronAuditMetrics>>,
 	resource_metrics: ResourceMetrics,
 }
 
@@ -181,6 +186,7 @@ pub struct MetricsRegistryConfig {
 	pub cancellation_metrics: Arc<CancellationMetrics>,
 	pub downstream_cancellation_metrics: Arc<DownstreamCancellationMetrics>,
 	pub sql_connection_limiter: Option<SqlConnectionLimiter>,
+	pub audit_metrics: Option<Arc<ToronAuditMetrics>>,
 	pub tenant_admission: TenantAdmissionController,
 	pub admission_rejections: TenantAdmissionRejectionCounters,
 }
@@ -199,6 +205,7 @@ impl MetricsRegistry {
 			cancellation_metrics: config.cancellation_metrics,
 			downstream_cancellation_metrics: config.downstream_cancellation_metrics,
 			sql_connection_limiter: config.sql_connection_limiter,
+			audit_metrics: config.audit_metrics,
 			resource_metrics: ResourceMetrics {
 				tenant_budgets: config.tenant_budgets,
 				tenant_admission: config.tenant_admission,
@@ -273,6 +280,7 @@ impl MetricsRegistry {
 		self.render_cancellation_metrics(&mut out);
 		self.render_downstream_cancellation_metrics(&mut out);
 		self.render_sql_connection_metrics(&mut out);
+		self.render_audit_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
 		out
 	}
@@ -357,6 +365,47 @@ impl MetricsRegistry {
 			out.push_str(&format!(
 				"tenant_sql_connection_rejections_total{{tenant_id=\"{label}\"}} {}\n",
 				slot.rejections
+			));
+		}
+	}
+
+	fn render_audit_metrics(&self, out: &mut String) {
+		let Some(metrics) = &self.audit_metrics else {
+			return;
+		};
+		out.push_str("# TYPE toron_audit_events_total counter\n");
+		for event_class in ToronAuditEventClass::ALL {
+			out.push_str(&format!(
+				"toron_audit_events_total{{event_class=\"{}\"}} {}\n",
+				event_class.as_str(),
+				metrics.event_count(event_class)
+			));
+		}
+		out.push_str("# TYPE toron_audit_dropped_total counter\n");
+		for event_class in ToronAuditEventClass::ALL {
+			for reason in ToronAuditDropReason::ALL {
+				out.push_str(&format!(
+					"toron_audit_dropped_total{{event_class=\"{}\",reason=\"{}\"}} {}\n",
+					event_class.as_str(),
+					reason.as_str(),
+					metrics.dropped_count(event_class, reason)
+				));
+			}
+		}
+		out.push_str("# TYPE toron_audit_sink_errors_total counter\n");
+		for sink in ToronAuditOutputKind::ALL {
+			out.push_str(&format!(
+				"toron_audit_sink_errors_total{{sink=\"{}\"}} {}\n",
+				sink.as_str(),
+				metrics.sink_error_count(sink)
+			));
+		}
+		out.push_str("# TYPE toron_audit_security_event_unrecorded_total counter\n");
+		for reason in ToronAuditSecurityEventUnrecordedReason::ALL {
+			out.push_str(&format!(
+				"toron_audit_security_event_unrecorded_total{{reason=\"{}\"}} {}\n",
+				reason.as_str(),
+				metrics.security_unrecorded_count(reason)
 			));
 		}
 	}

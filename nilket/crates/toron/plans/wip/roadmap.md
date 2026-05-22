@@ -4723,11 +4723,13 @@ along with the forward-sequence rewrite.
   `node_numeric_id`; bare-numeric/UUID rejected) anchors the chain signature.
   Narrow readiness (degrade only on local-chain open / persistent write
   failure); aggregate-only metrics; no SQL-wire / Wendelon / telemetry drift;
-  Kafka not a Toron default. Final D-set: **17 decisions, 22 architecture + 3
+  Kafka not a Toron default. Final D-set: **17 decisions, 21 architecture + 3
   convention + meta guards, 18 fixtures**. Council: **3-of-3 (Claude, Codex,
   Gemini)**. **Two retargets:** the 065 audit-feature retarget (http-only →
   audit allowed) and the **roadmap fail-closed-text retarget** (the prior
-  ADR-066 candidate text flips to fail-open + deferred `audit.fail_closed`).
+  ADR-066 candidate text flips to fail-open + deferred `audit.fail_closed`,
+  recorded as planning-document reconciliation rather than an architecture
+  guard).
   Placement: Toron compute-ring consumer. Migration:
   `plans/impl/066_toron_audit_emission_consumer.md`.
 
@@ -4821,8 +4823,10 @@ consumer (the 065→066 producer/consumer split), making Toron the second
 `observability::audit` consumer and **completing the production-readiness arc
 opened by 065**. Default-disabled, privacy-preserving, **fail-open** audit
 emission (lifecycle + edge-denial + query-outcome) over a Toron-owned chain
-distinct from Wendelon's. Final D-set: **17 decisions, 22 architecture + 3
-convention + meta guards, 18 fixtures**. Council: **3-of-3**.
+distinct from Wendelon's. Final D-set: **17 decisions, 21 architecture + 3
+convention + meta guards, 18 fixtures**. Council: **3-of-3**. The roadmap
+fail-closed-text retarget is planning-document reconciliation, not an
+architecture guard.
 
 **Toron compute-ring consumer; reuses the 065 substrate unchanged (async lives
 in Toron); zero SQL-wire / Wendelon / telemetry drift; disabled = exact no-op.**

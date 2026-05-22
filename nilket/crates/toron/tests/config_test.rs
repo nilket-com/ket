@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow::datatypes::{DataType, Field, Schema};
 use toron::catalog::{TableRef, WendelonDescriptorRegistry};
 use toron::config::{
-	DescriptorBootstrap, DescriptorBootstrapEntry, load_descriptor_bootstrap,
+	AuditConfig, DescriptorBootstrap, DescriptorBootstrapEntry, load_descriptor_bootstrap,
 	load_toron_bootstrap_config, render_example_config,
 };
 use toron::distributed::budget::{ByteCount, QueryBudget};
@@ -142,6 +142,77 @@ fn toron_example_config_loads() {
 		None
 	);
 	assert!(config.admission.is_none());
+	assert!(matches!(config.audit, AuditConfig::Disabled));
+}
+
+#[test]
+fn audit_config_enabled_accepts_toron_node_id_and_resolves_paths() {
+	let dir = fresh_dir("audit-enabled");
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[audit]\nenabled = true\nnode_id = \"toron-n-7\"\nnode_numeric_id = 7\nlocal_path = \"audit/toron.ndjson\"\nqueue_capacity = 8\n\n[audit.archive]\ndirectory = \"audit/archive\"\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load audit config");
+	let AuditConfig::Enabled(audit) = config.audit else {
+		panic!("audit enabled");
+	};
+
+	assert_eq!(audit.node_id, "toron-n-7");
+	assert_eq!(audit.node_numeric_id, 7);
+	assert_eq!(audit.queue_capacity.get(), 8);
+	assert_eq!(audit.local_path, dir.join("audit/toron.ndjson"));
+	assert_eq!(
+		audit.sinks.archive.expect("archive").directory,
+		dir.join("audit/archive")
+	);
+	assert!(audit.sinks.kafka.is_none());
+}
+
+#[test]
+fn audit_config_rejects_bare_numeric_and_uuid_node_ids() {
+	for node_id in ["7", "00000000-0000-0000-0000-000000000007"] {
+		let dir = fresh_dir("audit-node-id");
+		let path = dir.join("toron.toml");
+		let config = format!(
+			"{}\n[audit]\nenabled = true\nnode_id = \"{node_id}\"\nnode_numeric_id = 7\nlocal_path = \"audit.ndjson\"\nqueue_capacity = 8\n",
+			render_example_config()
+		);
+		std::fs::write(&path, config).expect("write config");
+
+		let error = load_toron_bootstrap_config(&path).expect_err("node id rejected");
+
+		assert!(error.to_string().contains("audit.node_id"), "{error}");
+	}
+}
+
+#[test]
+fn audit_config_rejects_numeric_mismatch_and_zero_queue() {
+	let cases = [
+		(
+			"node_numeric_id = 8\nlocal_path = \"audit.ndjson\"\nqueue_capacity = 8\n",
+			"audit.node_id and audit.node_numeric_id",
+		),
+		(
+			"node_numeric_id = 7\nlocal_path = \"audit.ndjson\"\nqueue_capacity = 0\n",
+			"audit.queue_capacity must be greater than 0",
+		),
+	];
+	for (tail, expected) in cases {
+		let dir = fresh_dir("audit-invalid");
+		let path = dir.join("toron.toml");
+		let config = format!(
+			"{}\n[audit]\nenabled = true\nnode_id = \"toron-n-7\"\n{tail}",
+			render_example_config()
+		);
+		std::fs::write(&path, config).expect("write config");
+
+		let error = load_toron_bootstrap_config(&path).expect_err("audit config rejected");
+
+		assert!(error.to_string().contains(expected), "{error}");
+	}
 }
 
 #[test]

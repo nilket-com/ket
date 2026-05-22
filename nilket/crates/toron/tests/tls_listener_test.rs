@@ -10,7 +10,7 @@ use rcgen::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use toron::config::{
-	CoordinatorConfig, ObservabilityConfig, SqlConfig, SqlTransport, TlsConfig,
+	AuditConfig, CoordinatorConfig, ObservabilityConfig, SqlConfig, SqlTransport, TlsConfig,
 	ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig, ToronStorageConfig,
 	ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
@@ -551,6 +551,7 @@ fn tls_config(
 			format: TracingFormat::Pretty,
 			listeners: None,
 		},
+		audit: AuditConfig::Disabled,
 	}
 }
 

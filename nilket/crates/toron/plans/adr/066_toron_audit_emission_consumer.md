@@ -98,7 +98,7 @@ consumer while preserving "no shared-substrate mutation". The **roadmap's
 ADR-066-candidate fail-closed text is retargeted to fail-open + deferred
 `audit.fail_closed`**.
 
-## Architecture Guards (22 + 3 convention + meta)
+## Architecture Guards (21 + 3 convention + meta)
 
 `adr066_toron_enables_observability_audit_without_kafka_default`,
 `adr066_audit_config_is_default_disabled`,
@@ -120,8 +120,7 @@ ADR-066-candidate fail-closed text is retargeted to fail-open + deferred
 `adr066_audit_readiness_degrades_only_on_local_chain_failure`,
 `adr066_no_sql_wire_protocol_or_error_code_change`,
 `adr066_no_wendelon_runtime_or_protocol_change`,
-`adr066_observability_telemetry_remains_reserved_only`,
-`adr066_roadmap_fail_closed_candidate_text_is_retargeted_to_fail_open`.
+`adr066_observability_telemetry_remains_reserved_only`.
 **Convention:** `adr066_nilket_root_stays_runtime_free`,
 `adr066_fixture_worker_source_unchanged`,
 `adr066_new_surface_is_brand_clean_and_has_no_v1_suffix`.
@@ -129,12 +128,14 @@ ADR-066-candidate fail-closed text is retargeted to fail-open + deferred
 
 ## Prior-Guard / Roadmap Reconciliation
 
-Two retargets, both self-enforcing: (1) the **065 audit-feature retarget** —
+Two retargets, one code-guarded: (1) the **065 audit-feature retarget** —
 065's "Toron consumes `observability` with `http` only / audit-not-enabled"
 guards flip to "audit feature allowed" (audit-present + stale-http-only-claim
 gone); (2) the **roadmap fail-closed-text retarget** — the 065-era ADR-066
 candidate text (authored describing fail-closed-for-security) flips to
-fail-open + deferred `audit.fail_closed`. Meta scoped
+fail-open + deferred `audit.fail_closed`. The roadmap text retarget is recorded
+as planning-document reconciliation rather than architecture-guarded, because
+roadmap prose is not a code invariant. Meta scoped
 `…_except_audit_feature_retarget`.
 
 ## Integration Fixtures (18)
@@ -171,10 +172,11 @@ fail-closed-text retarget; Gemini aligned. 3-of-3.
 
 ## Promotion criteria met
 
-D-set 17, 3-of-3; 22 + 3 convention + meta guards; two self-enforcing retargets
-(065 audit-feature + roadmap fail-closed-text); behavior-preserving when
-disabled (exact no-op); reuses the 065 substrate unchanged (async lives in
-Toron); no SQL-wire / Wendelon / telemetry drift. Migration:
+D-set 17, 3-of-3; 21 + 3 convention + meta guards; 065 audit-feature retarget
+self-enforcing, roadmap fail-closed-text retarget recorded as planning-document
+reconciliation; behavior-preserving when disabled (exact no-op); reuses the 065
+substrate unchanged (async lives in Toron); no SQL-wire / Wendelon / telemetry
+drift. Migration:
 `plans/impl/066_toron_audit_emission_consumer.md`.
 
 ## Conclusion

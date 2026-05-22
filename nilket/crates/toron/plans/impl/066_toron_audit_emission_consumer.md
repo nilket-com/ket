@@ -81,7 +81,7 @@ change.** Six phases.
 
 ## Phase 6 — Guards + retargets + fixtures + evidence + roadmap
 
-- 22 + 3 convention + meta guards (ADR list), incl.
+- 21 + 3 convention + meta guards (ADR list), incl.
   `adr066_audit_node_wire_string_rejects_bare_numeric_and_uuid_inputs`,
   `adr066_all_first_cut_audit_emission_is_try_send_fail_open`,
   `adr066_security_event_drops_have_dedicated_aggregate_metric`,
@@ -89,8 +89,9 @@ change.** Six phases.
   `adr066_observability_telemetry_remains_reserved_only`.
 - **Two retargets:** (a) 065 `toron audit-not-enabled / http-only` →
   audit-feature allowed; meta `…_except_audit_feature_retarget`; (b) **roadmap
-  fail-closed candidate text → fail-open + deferred `audit.fail_closed`**
-  (guard `adr066_roadmap_fail_closed_candidate_text_is_retargeted_to_fail_open`).
+  fail-closed candidate text → fail-open + deferred `audit.fail_closed`**,
+  recorded as planning-document reconciliation rather than architecture-guarded
+  because roadmap prose is not a code invariant.
 - 18 fixtures (ADR list). Evidence
   (`plans/impl/066_toron_audit_emission_consumer_evidence.md`):
   `architecture_test adr066`, full `architecture_test`, `cargo test -p toron -p
@@ -108,7 +109,8 @@ change.** Six phases.
 3. **No PII / SQL text / plan-fingerprint** — class + bucket fields only.
 4. **Disabled = exact no-op**; async in Toron (substrate stays sync).
 5. **No SQL wire / Wendelon / telemetry change**; Kafka not a Toron default.
-6. **Two retargets** — 065 audit-feature + roadmap fail-closed-text.
+6. **Two retargets** — 065 audit-feature code guard + roadmap
+   fail-closed-text planning reconciliation.
 
 ## Acceptance checklist
 
@@ -121,5 +123,5 @@ change.** Six phases.
 - [ ] Phase 4: lifecycle + edge-denials (no SQL frame) + query-outcome after
       :791 (class/bucket, no SQL text).
 - [ ] Phase 5: aggregate-only counters; narrow readiness.
-- [ ] Phase 6: 22+3+meta guards; two retargets; 18 fixtures; evidence;
+- [ ] Phase 6: 21+3+meta guards; two retargets; 18 fixtures; evidence;
       roadmap.

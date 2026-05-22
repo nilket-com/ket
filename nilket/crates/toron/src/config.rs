@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::audit::{
+	ArchiveAuditConfig, AuditArchiveLockMode, AuditSinksConfig,
+	DEFAULT_AUDIT_ARCHIVE_MAX_SEGMENT_BYTES, SyslogAuditConfig, parse_toron_audit_node_numeric,
+};
 use crate::distributed::budget::{
 	AdmissionPolicy, ByteCount, DurationMillis, TenantBudget, TenantBudgetPolicy,
 	derive_max_concurrent_descriptor_syncs, derive_max_concurrent_queries,
@@ -137,6 +141,21 @@ format = "pretty"
 # health = "127.0.0.1:7780"
 # ready = "127.0.0.1:7781"
 # metrics = "127.0.0.1:7782"
+
+# [audit]
+# enabled = false
+# node_id = "toron-n-1"
+# node_numeric_id = 1
+# local_path = "audit/toron.ndjson"
+# queue_capacity = 1024
+#
+# [audit.archive]
+# directory = "audit/archive"
+# max_segment_bytes = 8388608
+# lock_mode = "none"
+#
+# [audit.syslog]
+# socket_path = "/dev/log"
 "#;
 
 #[derive(Debug, Error)]
@@ -163,6 +182,7 @@ pub struct ToronBootstrapConfig {
 	pub coordinator: CoordinatorConfig,
 	pub tls: Option<TlsConfig>,
 	pub observability: ObservabilityConfig,
+	pub audit: AuditConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +274,27 @@ pub struct ObservabilityConfig {
 	pub listeners: Option<ObservabilityListeners>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditConfig {
+	Disabled,
+	Enabled(Box<AuditEnabledConfig>),
+}
+
+impl AuditConfig {
+	pub fn is_enabled(&self) -> bool {
+		matches!(self, Self::Enabled(_))
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEnabledConfig {
+	pub node_id: String,
+	pub node_numeric_id: u32,
+	pub local_path: PathBuf,
+	pub queue_capacity: NonZeroUsize,
+	pub sinks: AuditSinksConfig,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TracingFormat {
 	Pretty,
@@ -307,6 +348,8 @@ struct RawToronBootstrapConfig {
 	tls: Option<RawTlsConfig>,
 	#[serde(default)]
 	observability: RawObservabilityConfig,
+	#[serde(default)]
+	audit: RawAuditConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,6 +503,32 @@ struct RawObservabilityListeners {
 	health: Option<String>,
 	ready: Option<String>,
 	metrics: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAuditConfig {
+	#[serde(default)]
+	enabled: bool,
+	node_id: Option<String>,
+	node_numeric_id: Option<u32>,
+	local_path: Option<PathBuf>,
+	queue_capacity: Option<usize>,
+	archive: Option<RawAuditArchiveConfig>,
+	syslog: Option<RawAuditSyslogConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAuditArchiveConfig {
+	directory: PathBuf,
+	max_segment_bytes: Option<u64>,
+	#[serde(default)]
+	lock_mode: AuditArchiveLockMode,
+	retain_days: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAuditSyslogConfig {
+	socket_path: PathBuf,
 }
 
 impl Default for RawToronNodeConfig {
@@ -623,6 +692,7 @@ fn normalize_config(
 		base_dir,
 	)?;
 	let observability = normalize_observability_config(raw.observability, tls.is_some())?;
+	let audit = normalize_audit_config(raw.audit, base_dir)?;
 	let listener_addresses = listener_bind_addresses(
 		task_listener_bind,
 		sql.as_ref(),
@@ -672,6 +742,7 @@ fn normalize_config(
 		},
 		tls,
 		observability,
+		audit,
 	})
 }
 
@@ -896,6 +967,78 @@ fn normalize_observability_listeners(
 		ready,
 		metrics,
 	})
+}
+
+fn normalize_audit_config(
+	raw: RawAuditConfig,
+	base_dir: &Path,
+) -> Result<AuditConfig, ToronConfigError> {
+	if !raw.enabled {
+		return Ok(AuditConfig::Disabled);
+	}
+	let node_id = raw
+		.node_id
+		.ok_or_else(|| invalid("audit.node_id is required when audit is enabled"))?;
+	let node_numeric_id = raw
+		.node_numeric_id
+		.ok_or_else(|| invalid("audit.node_numeric_id is required when audit is enabled"))?;
+	let parsed_node_numeric = parse_toron_audit_node_numeric(&node_id)
+		.map_err(|error| invalid(format!("invalid audit.node_id: {error}")))?;
+	if parsed_node_numeric != node_numeric_id {
+		return Err(invalid(
+			"audit.node_id and audit.node_numeric_id must refer to the same node",
+		));
+	}
+	let local_path = raw
+		.local_path
+		.ok_or_else(|| invalid("audit.local_path is required when audit is enabled"))
+		.map(|path| resolve_config_path(path, base_dir))?;
+	let queue_capacity = match raw.queue_capacity {
+		Some(0) => {
+			return Err(invalid(
+				"audit.queue_capacity must be greater than 0 when audit is enabled",
+			));
+		}
+		Some(value) => NonZeroUsize::new(value).expect("zero rejected"),
+		None => {
+			return Err(invalid(
+				"audit.queue_capacity is required when audit is enabled",
+			));
+		}
+	};
+	let archive = raw
+		.archive
+		.map(|archive| {
+			let max_segment_bytes = archive
+				.max_segment_bytes
+				.unwrap_or(DEFAULT_AUDIT_ARCHIVE_MAX_SEGMENT_BYTES);
+			if max_segment_bytes == 0 {
+				return Err(invalid(
+					"audit.archive.max_segment_bytes must be greater than 0",
+				));
+			}
+			Ok(ArchiveAuditConfig {
+				directory: resolve_config_path(archive.directory, base_dir),
+				max_segment_bytes,
+				lock_mode: archive.lock_mode,
+				retain_days: archive.retain_days,
+			})
+		})
+		.transpose()?;
+	let syslog = raw.syslog.map(|syslog| SyslogAuditConfig {
+		socket_path: resolve_config_path(syslog.socket_path, base_dir),
+	});
+	Ok(AuditConfig::Enabled(Box::new(AuditEnabledConfig {
+		node_id,
+		node_numeric_id,
+		local_path,
+		queue_capacity,
+		sinks: AuditSinksConfig {
+			archive,
+			syslog,
+			kafka: None,
+		},
+	})))
 }
 
 fn normalize_sql_config(

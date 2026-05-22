@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,11 +14,12 @@ use rcgen::{
 	KeyUsagePurpose,
 };
 use tokio::io::AsyncWriteExt;
+use toron::audit::AuditSinksConfig;
 use toron::config::{
-	CoordinatorConfig, DescriptorBootstrap, DescriptorBootstrapEntry, ObservabilityConfig,
-	SqlConfig, SqlTransport, TlsConfig, ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig,
-	ToronStorageConfig, ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig,
-	TracingFormat,
+	AuditConfig, AuditEnabledConfig, CoordinatorConfig, DescriptorBootstrap,
+	DescriptorBootstrapEntry, ObservabilityConfig, SqlConfig, SqlTransport, TlsConfig,
+	ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig, ToronStorageConfig,
+	ToronWendelonBootstrapPeer, ToronWendelonStorageConfig, ToronWorkerConfig, TracingFormat,
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::budget::{ByteCount, TenantBudget, TenantBudgetPolicy};
@@ -63,7 +64,8 @@ async fn toron_sql_select_from_bootstrapped_descriptor_executes_over_wire() {
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
 
-	let config = toron_config_with_descriptor(descriptor.clone(), true);
+	let mut config = toron_config_with_descriptor(descriptor.clone(), true);
+	let audit_path = enable_audit(&mut config, "sql-success-audit");
 	let daemon =
 		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
 			.await
@@ -87,6 +89,18 @@ async fn toron_sql_select_from_bootstrapped_descriptor_executes_over_wire() {
 			(4, Some(200), Some("west".to_string())),
 		]
 	);
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&[
+			"toron.lifecycle.startup",
+			"toron.sql.query.completed",
+			"query_outcome",
+			"row_count_bucket",
+		],
+	)
+	.await;
+	assert!(!audit.contains("SELECT id, amount"));
+	assert!(!audit.contains("storage_execution"));
 
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();
@@ -446,6 +460,7 @@ async fn oversized_declared_request_length_rejected_before_allocation_or_decode(
 	let sql = config.sql.as_mut().expect("sql config");
 	sql.max_request_frame_bytes = NonZeroU32::new(8).expect("request cap");
 	sql.max_statement_bytes = NonZeroU32::new(8).expect("statement cap");
+	let audit_path = enable_audit(&mut config, "request-frame-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
 	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
 	let client = QuicEndpoint::client().expect("oversized sql client");
@@ -464,6 +479,12 @@ async fn oversized_declared_request_length_rejected_before_allocation_or_decode(
 		read.is_err(),
 		"oversized request-frame rejection must not emit a SQL error frame"
 	);
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&["toron.sql.edge.request_frame_too_large", "edge_denial"],
+	)
+	.await;
+	assert!(!audit.contains("declared_len"));
 
 	daemon.shutdown().await.expect("shutdown daemon");
 }
@@ -474,6 +495,7 @@ async fn oversized_decoded_execute_statement_returns_resource_exhausted_without_
 	let sql = config.sql.as_mut().expect("sql config");
 	sql.max_request_frame_bytes = NonZeroU32::new(4096).expect("request cap");
 	sql.max_statement_bytes = NonZeroU32::new(8).expect("statement cap");
+	let audit_path = enable_audit(&mut config, "statement-cap-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
 	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
 
@@ -483,6 +505,40 @@ async fn oversized_decoded_execute_statement_returns_resource_exhausted_without_
 
 	assert_eq!(error.code, SqlErrorCode::ResourceExhausted);
 	assert!(error.message.contains("configured byte limit"), "{error:?}");
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&["toron.sql.edge.statement_too_large", "edge_denial"],
+	)
+	.await;
+	assert!(!audit.contains("not valid sql"));
+
+	daemon.shutdown().await.expect("shutdown daemon");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_records_planned_error_without_raw_sql() {
+	let mut config = toron_config_with_descriptor(descriptor(), true);
+	let audit_path = enable_audit(&mut config, "planned-error-audit");
+	let daemon = ToronDaemon::start(config).await.expect("start daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+
+	let error = execute_sql(endpoint, "not valid sql")
+		.await
+		.expect_err("parse error");
+
+	assert_eq!(error.code, SqlErrorCode::SyntaxError);
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&[
+			"toron.sql.query.planned_error",
+			"sql_error_code_class",
+			"syntax_error",
+			"statement_class",
+			"unknown",
+		],
+	)
+	.await;
+	assert!(!audit.contains("not valid sql"));
 
 	daemon.shutdown().await.expect("shutdown daemon");
 }
@@ -493,6 +549,7 @@ async fn cancel_below_request_frame_cap_is_not_statement_capped() {
 	let sql = config.sql.as_mut().expect("sql config");
 	sql.max_request_frame_bytes = NonZeroU32::new(4096).expect("request cap");
 	sql.max_statement_bytes = NonZeroU32::new(1).expect("statement cap");
+	let audit_path = enable_audit(&mut config, "cancel-audit");
 	let daemon = ToronDaemon::start(config).await.expect("start daemon");
 	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
 	let client = QuicEndpoint::client().expect("cancel sql client");
@@ -519,6 +576,12 @@ async fn cancel_below_request_frame_cap_is_not_statement_capped() {
 		}
 		other => panic!("unexpected cancel response: {other:?}"),
 	}
+	let audit = wait_for_audit_records(
+		&audit_path,
+		&["toron.sql.query.cancelled", "statement_class", "cancel"],
+	)
+	.await;
+	assert!(!audit.contains("query cancellation accepted"));
 
 	daemon.shutdown().await.expect("shutdown daemon");
 }
@@ -712,6 +775,36 @@ async fn toron_daemon_without_sql_section_preserves_worker_only_start() {
 struct SqlResponse {
 	batches: Vec<RecordBatch>,
 	complete: Complete,
+}
+
+fn enable_audit(config: &mut ToronBootstrapConfig, tag: &str) -> PathBuf {
+	let dir = fresh_dir(tag);
+	let audit_path = dir.join("toron-audit.ndjson");
+	config.audit = AuditConfig::Enabled(Box::new(AuditEnabledConfig {
+		node_id: "toron-n-1".to_string(),
+		node_numeric_id: 1,
+		local_path: audit_path.clone(),
+		queue_capacity: NonZeroUsize::new(64).expect("nonzero queue capacity"),
+		sinks: AuditSinksConfig::default(),
+	}));
+	audit_path
+}
+
+async fn wait_for_audit_records(path: &Path, required: &[&str]) -> String {
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+	loop {
+		let body = std::fs::read_to_string(path).unwrap_or_default();
+		if required.iter().all(|needle| body.contains(needle)) {
+			return body;
+		}
+		if tokio::time::Instant::now() >= deadline {
+			panic!(
+				"audit file {} missing {required:?}; body:\n{body}",
+				path.display()
+			);
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
 }
 
 async fn execute_sql(
@@ -1005,6 +1098,7 @@ fn toron_config_with_descriptor_for_tenant(
 			format: TracingFormat::Pretty,
 			listeners: None,
 		},
+		audit: AuditConfig::Disabled,
 	}
 }
 

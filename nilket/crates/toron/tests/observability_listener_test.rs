@@ -17,9 +17,13 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use toron::audit::{
+	ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOutputKind,
+	ToronAuditSecurityEventUnrecordedReason,
+};
 use toron::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use toron::config::{
-	CoordinatorConfig, LISTENER_BIND_COLLISION_DIAGNOSTIC,
+	AuditConfig, CoordinatorConfig, LISTENER_BIND_COLLISION_DIAGNOSTIC,
 	OBSERVABILITY_HEALTH_LOOPBACK_DIAGNOSTIC, OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC,
 	ObservabilityConfig, ObservabilityListeners, SqlConfig, SqlTransport, TlsConfig,
 	ToronBootstrapConfig, ToronCatalogConfig, ToronNodeConfig, ToronStorageConfig,
@@ -102,6 +106,7 @@ fn sample_resource_metrics_body() -> String {
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
+		audit_metrics: None,
 		tenant_admission,
 		admission_rejections,
 	});
@@ -122,6 +127,7 @@ fn request_ingress_metrics_use_bounded_reasons_and_omit_sql_text() {
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
+		audit_metrics: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -147,6 +153,62 @@ fn request_ingress_metrics_use_bounded_reasons_and_omit_sql_text() {
 }
 
 #[test]
+fn audit_metrics_are_disabled_until_audit_config_is_enabled() {
+	let body = sample_resource_metrics_body();
+
+	assert!(!body.contains("toron_audit_"));
+}
+
+#[test]
+fn audit_metrics_are_aggregate_only() {
+	let policy = TenantBudgetPolicy::omitted_config(ByteCount::new(1024));
+	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
+	let audit_metrics = Arc::new(ToronAuditMetrics::default());
+	audit_metrics.record_event(ToronAuditEventClass::QueryOutcome);
+	audit_metrics.record_drop(
+		ToronAuditEventClass::EdgeDenial,
+		ToronAuditDropReason::QueueFull,
+	);
+	audit_metrics.record_sink_error(ToronAuditOutputKind::Local);
+	audit_metrics.record_security_unrecorded(ToronAuditSecurityEventUnrecordedReason::QueueFull);
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy.clone(),
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
+		sql_connection_limiter: None,
+		audit_metrics: Some(audit_metrics),
+		tenant_admission,
+		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
+	});
+
+	let body = metrics.render_text(&ready_snapshot());
+
+	for expected in [
+		"toron_audit_events_total{event_class=\"query_outcome\"} 1\n",
+		"toron_audit_dropped_total{event_class=\"edge_denial\",reason=\"queue_full\"} 1\n",
+		"toron_audit_sink_errors_total{sink=\"local\"} 1\n",
+		"toron_audit_security_event_unrecorded_total{reason=\"queue_full\"} 1\n",
+	] {
+		assert!(body.contains(expected), "missing {expected} in {body}");
+	}
+	for forbidden in [
+		"toron_audit_events_total{tenant_id",
+		"toron_audit_events_total{query_id",
+		"toron_audit_events_total{session_id",
+		"toron_audit_events_total{table",
+		"SELECT",
+		"127.0.0.1",
+		"certificate",
+	] {
+		assert!(!body.contains(forbidden), "{forbidden} leaked into metrics");
+	}
+}
+
+#[test]
 fn cancellation_metrics_are_aggregate_trigger_outcome_only() {
 	let policy = TenantBudgetPolicy::omitted_config(ByteCount::new(1024));
 	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
@@ -159,6 +221,7 @@ fn cancellation_metrics_are_aggregate_trigger_outcome_only() {
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
+		audit_metrics: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -216,6 +279,7 @@ fn downstream_cancellation_metrics_are_aggregate_trigger_outcome_only() {
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		downstream_cancellation_metrics: downstream_metrics,
 		sql_connection_limiter: None,
+		audit_metrics: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -575,6 +639,7 @@ fn sql_connection_metrics_are_configured_plus_other() {
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: Some(limiter),
+		audit_metrics: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -666,6 +731,7 @@ fn queue_and_borrow_metrics_are_configured_plus_other_no_table_labels() {
 		cancellation_metrics: Arc::new(CancellationMetrics::default()),
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
+		audit_metrics: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&TenantBudgetPolicy::new(
 			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),
@@ -984,6 +1050,7 @@ fn observability_config(worker_id: WorkerId, pki: &TestPki) -> ToronBootstrapCon
 				metrics: "127.0.0.1:0".parse().expect("metrics bind"),
 			}),
 		},
+		audit: AuditConfig::Disabled,
 	}
 }
 
