@@ -4894,6 +4894,32 @@ along with the forward-sequence rewrite.
   emitter and the separately-deferred `audit.fail_closed`. Placement: Toron
   compute-ring audit consumer. Migration:
   `plans/impl/071_worker_observability_audit_expansion.md`.
+- **ADR 072 — `audit.fail_closed` (High-Assurance Audit Enforcement).**
+  Promoted (plan). The ADR 066 deferral, now unblocked by 071's complete
+  coverage: an **opt-in** `[audit] fail_closed` (default `false` ⇒
+  behavior-equivalent to 071) that makes **security-relevant** operations
+  **durable-or-reject**. `record(event)` stays fail-open; a new mode-aware
+  `record_required(event).await -> Result<(), AuditUnavailable>` **delegates to
+  `record` when off** and, when on, awaits a worker ack that fires only after the
+  event reaches the local chain through a successful local sink emit (today:
+  written + `sync_data()` through `LocalAuditSink::emit`). Gated via a **Required
+  Surface Table** (worker-task **start** =
+  pre-execution/side-effect-preventing; SQL denial / query-terminal / worker-
+  terminal / observability access = **response-gating**); `/health`, lifecycle,
+  and **audit-sink-failure diagnostics** are ungated (the latter is the
+  **non-recursion catch** — never require a durable ack from the failing sink).
+  Bounded **nonzero** ack-timeout (~500 ms; never hangs); **config honesty**
+  (`fail_closed=true`+`enabled=false` ⇒ startup-invalid); oracle-safe rejects over
+  **existing** wire shapes — **no new `SqlErrorCode`/`TaskFailureKind` variant**
+  (reuse `Internal`/existing kind + bounded reason). **Honest guarantee:**
+  response-gating, *not* side-effect rollback — a SQL write may commit before its
+  terminal audit; true no-unaudited-write needs a **pre-op intent audit** (carried).
+  Final D-set: **15 decisions, 20 + convention/meta guards, 15 fixtures**.
+  Council: **3-of-3 on the core**; **2-of-3 (Codex, Claude) on
+  no-new-wire-enum-variant** — Gemini iter-5 added `AuditUnavailable` wire variants
+  for client clarity, resolved against by the cycle-long no-wire-drift invariant
+  (keep 072 a surgical audit-emitter change). Placement: Toron compute-ring audit.
+  Migration: `plans/impl/072_audit_fail_closed.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4978,7 +5004,56 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 071 promoted; ADR 072 candidates
+### ADR 072 promoted; ADR 073 candidates
+
+ADR 072 selected and promoted **`audit.fail_closed` (High-Assurance Audit
+Enforcement)** — the ADR 066 deferral, now unblocked by 071's complete coverage:
+an opt-in mode that makes security-relevant operations durable-or-reject over the
+066/071 audit surface, completing the compute-ring audit arc (065/066/071/072).
+Final D-set: **15 decisions, 20 + convention/meta guards, 15 fixtures**. Council:
+**3-of-3 on the core; 2-of-3 (Codex, Claude) on no-new-wire-enum-variant**.
+
+**Key decisions / invariants:**
+
+- **Opt-in, default unchanged** — `[audit] fail_closed=false` ⇒ behavior-
+  equivalent to 071. `record(event)` stays fail-open; new mode-aware
+  `record_required().await -> Result<(), AuditUnavailable>` delegates to `record`
+  when off, awaits a worker ack after successful local sink emit when on (today:
+  **written + `sync_data()`** through `LocalAuditSink::emit`; batch/watermark
+  durability is a future substrate optimization).
+- **Required Surface Table** — worker-task **start** = pre-execution
+  (side-effect-preventing); SQL denial/query-terminal/worker-terminal/observability
+  access = **response-gating**; `/health`, lifecycle, audit-sink-failure diagnostics
+  **ungated**. **Non-recursion catch:** never require a durable ack from the failing
+  sink.
+- **Honest guarantee** — response-gating, *not* rollback (a SQL write may commit
+  before its terminal audit); true no-unaudited-write needs a **pre-op intent
+  audit** (carried).
+- **Config honesty** (`fail_closed=true`+`enabled=false` ⇒ startup-invalid);
+  bounded **nonzero** ack-timeout (~500 ms, never hangs); oracle-safe rejects over
+  **existing** wire shapes (no new `SqlErrorCode`/`TaskFailureKind` variant);
+  readiness-shed under a degraded chain; Toron-home, no substrate/Wendelon/wire
+  drift.
+
+The migration is materialized in `plans/impl/072_audit_fail_closed.md`.
+
+**ADR 073 candidates:**
+
+- **Typed table-mutation trace continuation** — the sharpest open observability
+  defect (Toron `WriteRequest`/`DeleteRowsRequest.trace_context` flow but are
+  discarded at the wendelon-client metas). **Wendelon-home producer** (≈075, the
+  074 pattern) + a later Toron consumer; carry the iter-2 refinements (DELETE is
+  1:1 with its request; bulk writes share one `toron.storage.write` parent). The
+  council has agreed it's Wendelon-home three cycles running — strong candidate to
+  finally take up on the Wendelon track.
+- **Pre-operation intent audit** — the stronger no-unaudited-side-effect contract
+  072 explicitly carried (audit the mutation intent durably *before* `StorageWrite`).
+- Carried: composite-PK (cross-ring schema-V2 — Wendelon `validate_primary_key` is
+  exact-one-column); fragmentable bulk DML (distributed write-back); DDL widening /
+  `ALTER` / `UNIQUE`; sqlparser-0.62; JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres
+  frontends.
+
+### ADR 071 promoted; ADR 072 candidates (HISTORICAL)
 
 ADR 071 selected and promoted **Worker + Observability-Access Audit Expansion** —
 the two ADR 066 deferrals (worker task-lifecycle audit + observability
