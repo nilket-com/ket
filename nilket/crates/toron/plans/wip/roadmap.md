@@ -4920,6 +4920,30 @@ along with the forward-sequence rewrite.
   for client clarity, resolved against by the cycle-long no-wire-drift invariant
   (keep 072 a surgical audit-emitter change). Placement: Toron compute-ring audit.
   Migration: `plans/impl/072_audit_fail_closed.md`.
+- **ADR 073 — sqlparser 0.54 → 0.62 (Parser-Foundation Refresh).**
+  Promoted (plan). A **single-file, behavior-neutral** parser upgrade at the
+  sqlparser→IR **anti-corruption boundary** — retiring the 063/064 guards that
+  pin 0.54 / reject 0.62, de-risking later SQL widening. **Grounded by a real
+  probe** (bump → `cargo check` → **62 errors, 100% in `sql_planner.rs`** →
+  revert): the boundary held, so it's a single-file migration over **11 mechanical
+  breakage categories** (`ObjectName`→`Vec<ObjectNamePart>`, `Value` reshape,
+  `Query.{limit,offset,limit_by}`→`limit_clause`, `OrderBy.exprs`→`kind`,
+  `Expr::Array`, `SelectItem::ExprWithAliases`, `CreateTable` field churn,
+  struct↔tuple variant flips, new statement token fields, `connect_by`
+  Option→Vec, `ColumnDef.collation` removed). Same SQL → same Toron IR; **new 0.62
+  syntax rejected** (no widening/`UNIQUE`/`ALTER`/`RETURNING` bundled).
+  **Exhaustive external-AST accounting** (the ADR-010 discipline — every changed
+  field lowered/rejected/parser-metadata; no rest patterns on changed lowered
+  external structs). The **highest-risk drift** is the
+  limit/order + INSERT-source contract (ordered LIMIT/OFFSET lower; unordered +
+  LIMIT BY/FETCH/locks/settings/FORMAT reject; INSERT VALUES-only) — preserved
+  exactly. **Promotion bar = the existing SQL corpus stays green + reject-surface
+  parity + the containment guard**, not "it compiles." Final D-set: **8 decisions,
+  9 + meta guards**. Council: **3-of-3 (Codex, Gemini, Claude)**, promoted at
+  iter-0 (Codex sharpened rest-pattern-free external struct accounting + the
+  precise limit contract; Claude grounded the probe).
+  Placement: Toron compute-ring parser. Migration:
+  `plans/impl/073_sqlparser_062_migration.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5004,7 +5028,53 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 072 promoted; ADR 073 candidates
+### ADR 073 promoted; ADR 074 candidates
+
+ADR 073 selected and promoted **sqlparser 0.54 → 0.62 (Parser-Foundation
+Refresh)** — a single-file, behavior-neutral parser upgrade at the sqlparser→IR
+anti-corruption boundary, retiring the 063/064 0.54-pins and de-risking later SQL
+widening. Grounded by a real probe (62 errors, 100% in `sql_planner.rs`; 11
+mechanical breakage categories). Final D-set: **8 decisions, 9 + meta guards**.
+Council: **3-of-3, promoted at iter-0**.
+
+**Key decisions / invariants:**
+
+- **Behavior-neutral** — same SQL → same Toron IR; new 0.62 syntax **rejected**
+  (no widening/`UNIQUE`/`ALTER`/`RETURNING` bundled). **Single version**, no compat
+  layer.
+- **Anti-corruption containment** — sqlparser stays quarantined to `sql_planner.rs`
+  (verified: 62 errors all there); no AST leak into IR/wire/storage/audit.
+- **Exhaustive external-AST accounting** (ADR-010 discipline) — every changed
+  field bucketed lowered/rejected/parser-metadata; no rest patterns on changed
+  lowered external structs; wildcard enum arms may remain only when they reject
+  or mark unsupported syntax; the existing
+  `adr028/029/030/034/036_..._destructure_is_exhaustive` guards stay green on 0.62.
+- **Limit/order + INSERT-source contract preserved exactly** (highest-risk drift):
+  ordered LIMIT/OFFSET lower; unordered + LIMIT BY/FETCH/locks/settings/FORMAT +
+  ORDER BY ALL reject; INSERT source VALUES-only.
+- **Guard reconciliation:** retarget `adr063_..._054_update_fields` → 0.62; invert/
+  remove `adr063_sqlparser_062_upgrade_is_not_part_of_update_surface` +
+  `adr064_sqlparser_stays_054` (both assert `!"0.62"`).
+- **Promotion bar = existing SQL corpus green + reject-surface parity + containment
+  guard**, not "it compiles."
+
+The migration is materialized in `plans/impl/073_sqlparser_062_migration.md`.
+
+**ADR 074 candidates:**
+
+- **Expression-surface widening** — `CASE` / `IN (list)` / `BETWEEN` / `LIKE`
+  (absent from `Expr` today). Toron-bounded (binder + executor + the per-`Expr`
+  `is_pbc_pushdown_eligible` classification); the now-current 0.62 `Expr`/`Function`
+  AST should ease the lowering. Highest-value bounded next on "First Query with
+  Integrity"; unlocks `CHECK` later.
+- **Typed table-mutation trace continuation** — Wendelon-home producer (≈075, the
+  074 pattern) + later Toron consumer; agreed Wendelon-home four cycles running.
+- Carried: `CHECK`/`DEFAULT` constraints (Toron-bounded, needs expressions first);
+  composite-PK / `UNIQUE` / `ALTER` (cross-ring schema-V2); pre-op intent audit
+  (072 carry); fragmentable bulk DML; JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres
+  frontends.
+
+### ADR 072 promoted; ADR 073 candidates (HISTORICAL)
 
 ADR 072 selected and promoted **`audit.fail_closed` (High-Assurance Audit
 Enforcement)** — the ADR 066 deferral, now unblocked by 071's complete coverage:
