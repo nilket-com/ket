@@ -4799,6 +4799,40 @@ along with the forward-sequence rewrite.
   `…_except_external_context_seam`); 067 behavior fixtures unchanged.
   Placement: Toron compute-ring consumer. Migration:
   `plans/impl/068_toron_telemetry_consumer.md`.
+- **ADR 069 — Toron Table-Query Trace Consumer.**
+  Promoted (plan). The consumer half of Wendelon ADR 074 (the
+  072→053 / 073→060 producer/consumer pattern), specifying the final consumer in
+  the **ADR 068 → Wendelon 074 → 069** trace chain: it will populate
+  `wendelon_client::TableQueryOptions.trace_context` in `WendelonStorageScan`
+  so a sampled Toron query can produce the linked `wendelon.table.query` child
+  span under `toron.storage.scan`. **Three-state mapping, `!enabled()`-first**
+  (testable `_with_enabled(req, bool)` seam): disabled ⇒ `Absent` (**even over a
+  `Some` context** — a disabled node emits no `toron.storage.scan`, so a child
+  under a never-exported parent would be a broken tree, and `Absent` is
+  byte-identical to today's default); enabled+`None` ⇒ `Unsampled` (068
+  no-resample rule at the boundary); enabled+`Some` ⇒ `Sampled`. **The
+  load-bearing correction:** `parent_span_id` is the storage-scan span id derived
+  through `storage_scan_trace_context(request)`, **never** the incoming task span
+  — the easy-wrong `request.trace_context.map(Sampled)` parents under
+  `toron.task`. Helper split:
+  `telemetry::storage_scan_trace_context -> Option<TraceContext>` reuses the
+  **private** `storage_scan_span_id` (no duplicate hash; the enum mapping lives
+  in `storage.rs`). Carrier set **once** on the shared `options` (`storage.rs:785`)
+  before the ADR-060 cancellation branch ⇒ hook/no-hook parity by construction.
+  Toron sends only `trace_id`+`parent_span_id` (Wendelon 074 owns child-id
+  derivation); no new span attributes; privacy/behavior unchanged. **Consumer-
+  only — no Wendelon production change**; table-query read path only (other
+  request-struct `trace_context` fields are carry-forward). **Prior-guard
+  reconciliation:** 069 retargets the two 074-era "Toron-doesn't-populate-yet"
+  guards — the Wendelon `adr074_no_toron_production_change` source-scan
+  (test-only Wendelon edit) and the Toron `!storage.contains(...)` assertion —
+  both of which flip the moment `storage.rs` references the carrier. Final
+  D-set: **13 decisions, 16 + convention/meta guards, seam-level fixtures**.
+  Council: **3-of-3 (Codex, Gemini, Claude)** on the design; the lone residual
+  was a minor API nit (private `storage_scan_span_id` + semantic helper —
+  Codex+Claude — vs Gemini's also-`pub(crate)`), promoted on the narrower
+  surface. Placement: Toron compute-ring consumer. Migration:
+  `plans/impl/069_toron_table_query_trace_consumer.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4883,7 +4917,64 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 068 promoted; ADR 069 candidates
+### ADR 069 promoted; ADR 070 candidates
+
+ADR 069 selected and promoted **Toron Table-Query Trace Consumer** — the Toron
+consumer half of Wendelon ADR 074 (the 072→053 / 073→060 producer/consumer
+pattern), specifying the final consumer in the **ADR 068 → Wendelon 074 → 069
+cross-ring trace chain**. The implementation will populate
+`wendelon_client::TableQueryOptions.trace_context` from the `ScanRequest` in
+`WendelonStorageScan`, so a sampled Toron query links Wendelon's
+`wendelon.table.query` span under `toron.storage.scan`. Final D-set: **13
+decisions, 16 + convention/meta guards**. Council: **3-of-3 (Codex, Gemini,
+Claude)** on the design (lone residual: a minor private-vs-`pub(crate)` helper
+nit, promoted on the narrower surface).
+
+**Key decisions / invariants:**
+
+- **`!enabled()`-first three-state mapping** (testable `_with_enabled` seam):
+  disabled ⇒ `Absent` (byte-identical to default; **wins even over a `Some`
+  context** — a disabled node emits no `toron.storage.scan`); enabled+`None` ⇒
+  `Unsampled` (068 no-resample rule at the boundary); enabled+`Some` ⇒ `Sampled`.
+- **Parent = the storage-scan continuation id, never the task span** — the
+  load-bearing correction (the easy-wrong `request.trace_context.map(Sampled)`
+  parents under `toron.task` and skips `toron.storage.scan`).
+- **Helper split:** `telemetry::storage_scan_trace_context -> Option<TraceContext>`
+  reuses the **private** `storage_scan_span_id` (no duplicate hash; enum mapping
+  in `storage.rs`); carrier set **once** on the shared `options` ⇒ hook/no-hook
+  parity by construction (ADR-060 cancellation untouched).
+- **Consumer-only — no Wendelon production change;** Toron sends only
+  `trace_id`+`parent_span_id` (Wendelon 074 owns child-id derivation); no new span
+  attributes; table-query read path only.
+- **Prior-guard reconciliation:** 069 retargets the two 074-era "Toron-doesn't-
+  populate-yet" guards (the Wendelon `adr074_no_toron_production_change`
+  source-scan — test-only Wendelon edit — and the Toron `!storage.contains(...)`
+  assertion), which flip the moment `storage.rs` references the carrier. Lesson:
+  a "consumer-doesn't-exist-yet" check should be a one-time/provenance guard, not
+  a standing source-scan forbidding the planned consumer's token.
+
+The migration is materialized in
+`plans/impl/069_toron_table_query_trace_consumer.md`.
+
+**The cross-ring observability arc is specified end-to-end:** ADR 067
+(`observability::telemetry` substrate) → 068 (Toron consumer + traces) →
+Wendelon 074 (table-query carrier producer) → 069 (Toron carrier consumer) ⇒
+`toron.query → dispatch → task → storage.scan → wendelon.table.query` in one
+trace once the ADR 069 implementation lands.
+
+**ADR 070 candidates:**
+
+- **`UPDATE`-without-`WHERE`** (Gemini's deferred topic — a Toron compute-ring DML
+  symmetry with `DELETE`, promotion-ready from the parallel 069 brainstorm).
+- **Write/delete trace carriers** — extend the cross-ring trace beyond the
+  table-query read path (each needs the Wendelon producer-side carrier first,
+  then a Toron consumer — the 074/069 pattern repeated per message family).
+- Carried: `audit.fail_closed`; worker/observability-listener audit coverage;
+  composite-PK / DDL / `ALTER` / `UNIQUE`; sqlparser-0.62; typed
+  `QUERY_CANCELLED`; per-row DELETE RETURNING; JWT/OIDC/SPIFFE; gRPC/Arrow
+  Flight/Postgres frontends.
+
+### ADR 068 promoted; ADR 069 candidates (HISTORICAL)
 
 ADR 068 selected and promoted **Toron Telemetry Consumer (OTLP trace
 integration)** — the 067 consumer, applying the 065→066 audit arc to telemetry.
