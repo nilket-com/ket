@@ -1,6 +1,6 @@
 use tokio::io::AsyncWriteExt;
 
-use observability_http::{
+use observability::http::{
 	HttpResponse, parse_request_line, read_request, read_response, write_request, write_response,
 };
 

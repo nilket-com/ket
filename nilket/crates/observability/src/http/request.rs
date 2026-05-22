@@ -2,7 +2,7 @@ use std::io::{Error, ErrorKind};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::MAX_REQUEST_HEADER_BYTES;
+use super::MAX_REQUEST_HEADER_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestLine<'a> {

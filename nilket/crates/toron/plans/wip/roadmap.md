@@ -4661,9 +4661,10 @@ along with the forward-sequence rewrite.
   `plans/impl/064_dml_returning_evidence.md`, including passing full
   `cargo test -p toron -- --test-threads=6`.
 - **ADR 065 — `crates/observability` Namespace and Audit Substrate.**
-  Promoted (plan). The oldest substantive deferral (ADR 045 D7), unblocked now
-  that the DML surface is complete — and the start of the **production-
-  readiness / compliance** track. Establishes a shared **`crates/observability`**
+  Promoted + implemented. The oldest substantive deferral (ADR 045 D7),
+  unblocked now that the DML surface is complete — and the start of the
+  **production-readiness / compliance** track. Establishes a shared
+  **`crates/observability`**
   namespace crate (interior shared substrate, the 047 `tls-pki` / 048
   `observability-http` precedent) with non-default feature-gated modules
   **`observability::{http, audit}`** (and a reserved future
@@ -4677,9 +4678,12 @@ along with the forward-sequence rewrite.
   shared envelope. **Behavior-preserving / byte-equivalent** — Wendelon's
   `AUDIT_SCHEMA_VERSION=4`, hash tags (`blake3-256`/`sha256`), chain-root tag
   (`wendelon-audit-chain-root-v1`), `ed25519` root-sig, JSON field order, and
-  verifier codes are unchanged (no schema bump); the genesis tag becomes a
-  consumer-provided parameter. **Precise feature invariant** (Cargo features
-  unify per-package, so: `default=[]`, per-feature `cargo check` builds,
+  verifier codes are unchanged (no schema bump); Wendelon-specific format
+  literals (genesis tag, schema version, chain-root/signature tags, canonical
+  operation labels, syslog identifiers, and node-id codec) are consumer-provided
+  rather than hard-coded in the shared crate. **Precise feature invariant**
+  (Cargo features unify per-package, so: `default=[]`, per-feature `cargo
+  check` builds,
   `audit ⊀ http`, no cross-module source references). **No Toron audit
   emission** (Toron gets the HTTP retarget only) and **no async/fail-open
   policy in the substrate** — both deferred to the ADR 066 consumer. Final
@@ -4691,7 +4695,10 @@ along with the forward-sequence rewrite.
   `observability-http` crate/path guards are **retargeted** to
   `observability::http`; meta scoped `…_except_adr048_retarget`; self-enforcing.
   Placement: Interior Substrate → Toron-aggregator home. Migration:
-  `plans/impl/065_observability_namespace_audit_substrate.md`.
+  `plans/impl/065_observability_namespace_audit_substrate.md`;
+  implementation evidence is recorded in
+  `plans/impl/065_observability_namespace_audit_substrate_evidence.md`,
+  including passing full `cargo test -p toron -- --test-threads=6`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4807,8 +4814,8 @@ the substrate, zero Wendelon-type leakage into the shared crate.**
 - **Byte-equivalence is the whole risk surface** — `AUDIT_SCHEMA_VERSION=4`,
   `blake3-256`/`sha256` hash tags, `wendelon-audit-chain-root-v1`, `ed25519`
   root-sig, JSON field order, verifier codes all preserved (no schema bump);
-  Wendelon payload serialization moves *verbatim*; genesis tag becomes a
-  consumer-provided parameter.
+  Wendelon payload serialization moves *verbatim*; Wendelon-specific format
+  literals are passed through a consumer-owned audit format/profile.
 - **Precise feature invariant** (Codex's correction): Cargo features unify
   per-package, so the invariant is `default=[]` + per-feature `cargo check`
   builds + `audit ⊀ http` + no cross-module source references — *not* "each

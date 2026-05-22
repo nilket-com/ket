@@ -2,7 +2,7 @@ use std::io::{Error, ErrorKind};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::{MAX_RESPONSE_BODY_BYTES, MAX_RESPONSE_HEADER_BYTES};
+use super::{MAX_RESPONSE_BODY_BYTES, MAX_RESPONSE_HEADER_BYTES};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {

@@ -22,6 +22,7 @@ use crate::metrics::observability::{self, ObservabilityHandles};
 use crate::metrics::telemetry;
 use crate::network::{ActorTrustRoots, TlsMaterial, rustls_server_config_with_peer_roots};
 use crate::node::{NodeBootstrapConfig, WendelonNode};
+use ::observability::http as observability_http;
 
 const DEFAULT_INSPECT_ENDPOINT: &str = "127.0.0.1:7432";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

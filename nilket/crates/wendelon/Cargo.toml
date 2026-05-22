@@ -6,9 +6,9 @@ publish = false
 
 [features]
 default = ["non-fips"]
-non-fips = ["aws-lc-rs/non-fips"]
-fips = ["aws-lc-rs/fips"]
-audit-kafka = ["dep:rdkafka"]
+non-fips = ["aws-lc-rs/non-fips", "observability/non-fips"]
+fips = ["aws-lc-rs/fips", "observability/fips"]
+audit-kafka = ["observability/kafka"]
 otlp-http = []
 otlp-grpc = ["dep:h2", "dep:http"]
 
@@ -33,13 +33,12 @@ http = { version = "1", optional = true }
 io-uring = "0.7.11"
 libc = "0.2"
 lz4_flex = "0.13"
-observability-http = { path = "../observability-http" }
+observability = { path = "../observability", default-features = false, features = ["http", "audit"] }
 opendal = { version = "0.55", features = ["services-b2", "services-gcs", "services-s3"] }
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 postcard = { workspace = true }
 quinn = "0.11"
 rand = "0.10.1"
-rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "ssl"], optional = true }
 redb = "4.0.0"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2", "blocking", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

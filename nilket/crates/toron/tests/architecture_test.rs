@@ -7522,38 +7522,30 @@ fn adr047_new_tls_pki_types_are_brand_clean_and_no_v1_suffix() {
 }
 
 #[test]
-fn adr048_observability_http_crate_exists_under_workspace_glob() {
+fn adr048_observability_http_substrate_is_retargeted_to_observability_namespace() {
 	let root_manifest =
 		std::fs::read_to_string(workspace_root_dir().join("Cargo.toml")).expect("read workspace");
 	assert!(root_manifest.contains("\"crates/*\""));
 	assert!(
 		workspace_root_dir()
-			.join("crates/observability-http/Cargo.toml")
+			.join("crates/observability/Cargo.toml")
 			.exists()
+	);
+	assert!(
+		!workspace_root_dir()
+			.join("crates/observability-http/Cargo.toml")
+			.exists(),
+		"ADR 065 retarget removes the flat observability-http crate"
 	);
 }
 
 #[test]
 fn adr048_observability_http_depends_only_on_tokio_io() {
 	let manifest =
-		std::fs::read_to_string(workspace_root_dir().join("crates/observability-http/Cargo.toml"))
-			.expect("read observability-http manifest");
-	let dependencies = manifest
-		.split("[dependencies]")
-		.nth(1)
-		.expect("dependencies section")
-		.split("[dev-dependencies]")
-		.next()
-		.expect("dependencies before dev-dependencies");
-	let dependency_lines = dependencies
-		.lines()
-		.map(str::trim)
-		.filter(|line| !line.is_empty())
-		.collect::<Vec<_>>();
-	assert_eq!(
-		dependency_lines,
-		vec![r#"tokio = { version = "1.37", default-features = false, features = ["io-util"] }"#]
-	);
+		std::fs::read_to_string(workspace_root_dir().join("crates/observability/Cargo.toml"))
+			.expect("read observability manifest");
+	assert!(manifest.contains(r#"default = []"#));
+	assert!(manifest.contains(r#"http = ["dep:tokio"]"#));
 	assert!(manifest.contains(
 		r#"tokio = { version = "1.37", default-features = false, features = ["io-util", "macros", "rt"] }"#
 	));
@@ -7566,7 +7558,6 @@ fn adr048_observability_http_depends_only_on_tokio_io() {
 		"reqwest",
 		"ureq",
 		"h2",
-		"http =",
 		"httparse",
 		"bytes",
 		"tokio-util",
@@ -7586,8 +7577,8 @@ fn adr048_observability_http_depends_only_on_tokio_io() {
 #[test]
 fn adr048_observability_http_has_bounded_header_and_body_limits() {
 	let lib =
-		std::fs::read_to_string(workspace_root_dir().join("crates/observability-http/src/lib.rs"))
-			.expect("read observability-http lib");
+		std::fs::read_to_string(workspace_root_dir().join("crates/observability/src/http/mod.rs"))
+			.expect("read observability::http module");
 
 	for required in [
 		"pub const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;",
@@ -7665,7 +7656,7 @@ fn adr048_toron_observability_http_module_is_shim_only() {
 		.expect("read observability HTTP shim");
 
 	assert!(http.contains("pub const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);"));
-	assert!(http.contains("pub use observability_http::"));
+	assert!(http.contains("pub use observability::http::"));
 	for required in [
 		"HttpResponse",
 		"MAX_REQUEST_HEADER_BYTES",
@@ -7855,6 +7846,374 @@ fn adr048_new_observability_http_types_are_brand_clean_and_no_v1_suffix() {
 			"observability-http contains forbidden branded/V1 token {forbidden}"
 		);
 	}
+}
+
+#[test]
+fn adr065_observability_crate_exists_under_workspace_glob() {
+	assert!(
+		workspace_root_dir()
+			.join("crates/observability/Cargo.toml")
+			.exists()
+	);
+	assert!(
+		std::fs::read_to_string(workspace_root_dir().join("Cargo.toml"))
+			.expect("read workspace manifest")
+			.contains("\"crates/*\"")
+	);
+}
+
+#[test]
+fn adr065_observability_default_features_are_empty() {
+	assert!(observability_manifest().contains("default = []"));
+}
+
+#[test]
+fn adr065_observability_exposes_http_and_audit_modules() {
+	let lib = std::fs::read_to_string(workspace_root_dir().join("crates/observability/src/lib.rs"))
+		.expect("read observability lib");
+	assert!(lib.contains("#[cfg(feature = \"http\")]"));
+	assert!(lib.contains("pub mod http;"));
+	assert!(lib.contains("#[cfg(feature = \"audit\")]"));
+	assert!(lib.contains("pub mod audit;"));
+}
+
+#[test]
+fn adr065_observability_builds_with_only_http_feature() {
+	let manifest = observability_manifest();
+	assert!(manifest.contains(r#"http = ["dep:tokio"]"#));
+	assert!(manifest.contains("tokio = {"));
+	assert!(manifest.contains("optional = true"));
+}
+
+#[test]
+fn adr065_observability_builds_with_only_audit_feature() {
+	let manifest = observability_manifest();
+	assert!(manifest.contains("audit = ["));
+	for required in [
+		"dep:serde",
+		"dep:serde_json",
+		"dep:ed25519-dalek",
+		"dep:rand",
+	] {
+		assert!(
+			manifest.contains(required),
+			"audit feature missing {required}"
+		);
+	}
+}
+
+#[test]
+fn adr065_observability_http_does_not_reference_audit() {
+	let source = observability_http_source_text();
+	for forbidden in [
+		"observability::audit",
+		"crate::audit",
+		"super::audit",
+		"AuditSink",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"observability::http must not reference audit token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr065_observability_audit_does_not_reference_http() {
+	let source = observability_audit_source_text();
+	assert!(!source.contains("pub mod http"));
+	assert!(!source.contains("observability::http"));
+	assert!(!source.contains("HttpResponse"));
+	assert!(!source.contains("RequestLine"));
+}
+
+#[test]
+fn adr065_observability_http_retargets_adr048_substrate() {
+	let toron_manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Toron manifest");
+	let wendelon_manifest = std::fs::read_to_string(wendelon_manifest_dir().join("Cargo.toml"))
+		.expect("read Wendelon manifest");
+	assert!(toron_manifest.contains("observability = { path = \"../observability\""));
+	assert!(toron_manifest.contains("features = [\"http\"]"));
+	assert!(wendelon_manifest.contains("observability = { path = \"../observability\""));
+	assert!(wendelon_manifest.contains("\"http\""));
+	assert!(
+		workspace_root_dir()
+			.join("crates/observability/src/http/mod.rs")
+			.exists()
+	);
+}
+
+#[test]
+fn adr065_observability_http_preserves_limits_and_timeout_boundary() {
+	adr048_observability_http_has_bounded_header_and_body_limits();
+	adr048_observability_http_does_not_own_timeouts();
+	adr045_observability_http_has_per_request_read_timeout();
+}
+
+#[test]
+fn adr065_observability_http_preserves_small_public_surface() {
+	adr048_observability_http_public_surface_is_small();
+}
+
+#[test]
+fn adr065_flat_observability_http_runtime_crate_removed() {
+	assert!(
+		!workspace_root_dir()
+			.join("crates/observability-http")
+			.exists()
+	);
+	assert!(!observability_manifest().contains("name = \"observability-http\""));
+}
+
+#[test]
+fn adr065_observability_has_no_toron_or_wendelon_dependency() {
+	let manifest = observability_manifest();
+	for forbidden in ["toron", "wendelon", "../toron", "../wendelon"] {
+		assert!(
+			!manifest.contains(forbidden),
+			"observability manifest must not depend on {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr065_observability_has_no_quinn_raft_sql_wire_tls_or_router_dependency() {
+	let manifest = observability_manifest();
+	let source = format!(
+		"{}\n{}",
+		observability_http_source_text(),
+		observability_audit_source_text()
+	);
+	for forbidden in [
+		"quinn",
+		"openraft",
+		"sql_wire",
+		"SqlMessage",
+		"tls-pki",
+		"tls_pki",
+		"rustls",
+		"router",
+		"Router",
+	] {
+		assert!(
+			!manifest.contains(forbidden),
+			"manifest contains {forbidden}"
+		);
+		assert!(!source.contains(forbidden), "source contains {forbidden}");
+	}
+}
+
+#[test]
+fn adr065_wendelon_consumes_observability_audit() {
+	let manifest = std::fs::read_to_string(wendelon_manifest_dir().join("Cargo.toml"))
+		.expect("read Wendelon manifest");
+	let audit = std::fs::read_to_string(wendelon_manifest_dir().join("src/audit.rs"))
+		.expect("read Wendelon audit");
+	assert!(manifest.contains("\"audit\""));
+	assert!(audit.contains("use observability::audit as shared_audit;"));
+	assert!(audit.contains("shared_audit::build_audit_sink"));
+	assert!(audit.contains("shared_audit::LocalAuditSink::open_with_archive"));
+}
+
+#[test]
+fn adr065_wendelon_payload_remains_ring_owned_and_typed() {
+	let audit = std::fs::read_to_string(wendelon_manifest_dir().join("src/audit.rs"))
+		.expect("read Wendelon audit");
+	for required in [
+		"pub enum AuditOperation",
+		"pub enum AuditSchema",
+		"pub struct AdministrativeControlSchema",
+		"pub struct LocalSecuritySchema",
+		"pub struct DataAccessSchema",
+		"pub fn from_actor_identity",
+	] {
+		assert!(
+			audit.contains(required),
+			"Wendelon audit missing {required}"
+		);
+	}
+	for forbidden in ["pub enum ToronPayload", "pub struct ToronPayload"] {
+		assert!(!audit.contains(forbidden));
+	}
+}
+
+#[test]
+fn adr065_wendelon_audit_serialization_is_preserved() {
+	let audit = std::fs::read_to_string(wendelon_manifest_dir().join("src/audit.rs"))
+		.expect("read Wendelon audit");
+	assert!(audit.contains("serialize_struct(\"AuditEvent\", 13)"));
+	assert!(audit.contains("event.serialize_field(\"authority_model\", &self.authority_model())"));
+	assert!(audit.contains("event.serialize_field(\"operation\", &self.operation)"));
+	assert!(audit.contains("serde_json::to_value(schema)"));
+	assert!(audit.contains("identity.as_bytes()"));
+}
+
+#[test]
+fn adr065_wendelon_audit_verify_cli_uses_shared_verifier() {
+	let cli = std::fs::read_to_string(wendelon_manifest_dir().join("src/cli.rs"))
+		.expect("read Wendelon CLI");
+	let audit = std::fs::read_to_string(wendelon_manifest_dir().join("src/audit.rs"))
+		.expect("read Wendelon audit");
+	assert!(cli.contains("use crate::audit::verify_local_audit_evidence"));
+	assert!(audit.contains("shared_audit::verify_local_audit_evidence"));
+}
+
+#[test]
+fn adr065_local_ndjson_chain_sink_is_in_observability_audit() {
+	let source = observability_audit_source_text();
+	assert!(source.contains("pub struct LocalAuditSink"));
+	assert!(source.contains("OpenOptions::new().create(true).append(true).open"));
+	assert!(source.contains("serde_json::to_string(&persisted)"));
+	assert!(source.contains("sync_data()"));
+}
+
+#[test]
+fn adr065_audit_sink_trait_is_in_observability_audit() {
+	let source = observability_audit_source_text();
+	assert!(source.contains("pub trait AuditSink: Send + Sync"));
+	assert!(source.contains("fn emit(&self, event: AuditEvent)"));
+	assert!(source.contains("fn chain_head(&self)"));
+}
+
+#[test]
+fn adr065_audit_format_literals_are_consumer_provided() {
+	let shared = observability_audit_source_text();
+	let wendelon = std::fs::read_to_string(wendelon_manifest_dir().join("src/audit.rs"))
+		.expect("read Wendelon audit");
+	assert!(shared.contains("pub struct AuditFormat"));
+	for literal in [
+		"wendelon-audit-genesis-v1",
+		"wendelon-audit-chain-root-v1",
+		"wendelon@47450",
+	] {
+		assert!(
+			!shared.contains(literal),
+			"shared audit must not hard-code Wendelon literal {literal}"
+		);
+		assert!(
+			wendelon.contains(literal),
+			"Wendelon adapter must provide literal {literal}"
+		);
+	}
+}
+
+#[test]
+fn adr065_kafka_sink_remains_feature_gated() {
+	let manifest = observability_manifest();
+	let source = observability_audit_source_text();
+	assert!(manifest.contains(r#"kafka = ["audit", "dep:rdkafka"]"#));
+	assert!(source.contains("#[cfg(feature = \"kafka\")]"));
+	assert!(source.contains("pub trait KafkaProducer"));
+}
+
+#[test]
+fn adr065_no_toron_audit_config_or_emission_yet() {
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Toron manifest");
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read Toron config");
+	let toron_source = source_files(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Toron source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	assert!(manifest.contains("features = [\"http\"]"));
+	assert!(!manifest.contains("\"audit\""));
+	assert!(!config.contains("[audit]"));
+	assert!(!toron_source.contains("AuditEvent::new"));
+	assert!(!toron_source.contains("observability::audit"));
+}
+
+#[test]
+fn adr065_no_async_try_send_policy_in_observability_audit() {
+	let source = observability_audit_source_text();
+	for forbidden in ["tokio::sync::mpsc", "try_send", "spawn(", "async fn"] {
+		assert!(
+			!source.contains(forbidden),
+			"shared audit contains async policy {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr065_audit_schema_version_is_preserved() {
+	let wendelon = std::fs::read_to_string(wendelon_manifest_dir().join("src/audit.rs"))
+		.expect("read Wendelon audit");
+	assert!(wendelon.contains("const AUDIT_SCHEMA_VERSION: u16 = 4;"));
+	assert!(wendelon.contains("schema_version: AUDIT_SCHEMA_VERSION"));
+}
+
+#[test]
+fn adr065_observability_namespace_reserves_future_telemetry_facet() {
+	let adr = std::fs::read_to_string(
+		manifest_dir().join("plans/adr/065_observability_namespace_audit_substrate.md"),
+	)
+	.expect("read ADR 065");
+	let lib = std::fs::read_to_string(workspace_root_dir().join("crates/observability/src/lib.rs"))
+		.expect("read observability lib");
+	assert!(adr.contains("observability::telemetry"));
+	assert!(!lib.contains("pub mod telemetry"));
+}
+
+#[test]
+fn adr065_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+	for forbidden in ["tokio", "rustls", "observability", "tls-pki", "serde_json"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr065_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+	assert!(!worker.contains("observability"));
+	assert!(!worker.contains("audit"));
+}
+
+#[test]
+fn adr065_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	let source = format!(
+		"{}\n{}",
+		observability_http_source_text(),
+		observability_audit_source_text()
+	);
+	for forbidden in [
+		"ToronAudit",
+		"WendelonAudit",
+		"NilketAudit",
+		"AuditEventV1",
+		"AuditSinkV1",
+		"ObservabilityV1",
+		"TelemetryV1",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"observability surface contains forbidden branded/V1 token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr065_prior_adr045_to_064_guards_continue_to_pass_except_adr048_retarget() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+	for prefix in [
+		"adr045_", "adr046_", "adr047_", "adr048_", "adr049_", "adr050_", "adr051_", "adr052_",
+		"adr053_", "adr054_", "adr055_", "adr056_", "adr057_", "adr058_", "adr059_", "adr060_",
+		"adr061_", "adr062_", "adr063_", "adr064_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	assert!(architecture_test.contains("adr065_flat_observability_http_runtime_crate_removed"));
 }
 
 #[test]
@@ -14713,12 +15072,26 @@ fn tls_pki_source_text() -> String {
 }
 
 fn observability_http_source_text() -> String {
-	let src_dir = workspace_root_dir().join("crates/observability-http/src");
+	let src_dir = workspace_root_dir().join("crates/observability/src/http");
 	source_files(&src_dir)
 		.into_iter()
-		.map(|path| std::fs::read_to_string(path).expect("read observability-http source"))
+		.map(|path| std::fs::read_to_string(path).expect("read observability::http source"))
 		.collect::<Vec<_>>()
 		.join("\n")
+}
+
+fn observability_audit_source_text() -> String {
+	let src_dir = workspace_root_dir().join("crates/observability/src/audit");
+	source_files(&src_dir)
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read observability::audit source"))
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+fn observability_manifest() -> String {
+	std::fs::read_to_string(workspace_root_dir().join("crates/observability/Cargo.toml"))
+		.expect("read observability manifest")
 }
 
 fn workspace_cargo_tomls() -> Vec<PathBuf> {

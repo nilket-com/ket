@@ -2241,9 +2241,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "observability-http"
+name = "observability"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
+ "blake3",
+ "ed25519-dalek",
+ "rand 0.10.1",
+ "rdkafka",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -3936,7 +3943,7 @@ dependencies = [
  "aws-lc-rs",
  "bytemuck",
  "futures",
- "observability-http",
+ "observability",
  "postcard",
  "quinn",
  "rand 0.10.1",
@@ -4416,14 +4423,13 @@ dependencies = [
  "io-uring",
  "libc",
  "lz4_flex",
- "observability-http",
+ "observability",
  "opendal",
  "openraft",
  "postcard",
  "proc-macro2",
  "quinn",
  "rand 0.10.1",
- "rdkafka",
  "redb",
  "reqwest",
  "rustls",

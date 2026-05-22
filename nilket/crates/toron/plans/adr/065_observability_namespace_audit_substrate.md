@@ -81,9 +81,13 @@ clock-drift subscriber traits.**
 `ToronPayload` in 065. The shared envelope is generic over a typed per-ring
 payload; Toron's is introduced by ADR 066.
 
-**D8 Consumer-provided genesis tag.** The shared chain code accepts a genesis
-tag parameter; Wendelon passes `b"wendelon-audit-genesis-v1"`; Toron may pass
-its own later.
+**D8 Consumer-provided audit format.** The shared chain code accepts a
+consumer-owned audit format/profile rather than hard-coding Wendelon literals.
+For Wendelon, that profile carries `AUDIT_SCHEMA_VERSION = 4`, genesis tag
+`b"wendelon-audit-genesis-v1"`, chain-root tag
+`wendelon-audit-chain-root-v1`, root-signature tag `ed25519`, canonical
+operation labels, syslog identifiers, and the ring's node-id codec. Toron may
+pass its own profile later.
 
 **D9 Byte-equivalence.** No change to Wendelon's `AUDIT_SCHEMA_VERSION = 4`,
 hash algorithm tags (`blake3-256` / `sha256`), chain-root tag
@@ -133,7 +137,7 @@ fail-open/authority split, aggregate-only metrics.
 `adr065_wendelon_audit_verify_cli_uses_shared_verifier`,
 `adr065_local_ndjson_chain_sink_is_in_observability_audit`,
 `adr065_audit_sink_trait_is_in_observability_audit`,
-`adr065_genesis_tag_is_consumer_provided_parameter`,
+`adr065_audit_format_literals_are_consumer_provided`,
 `adr065_kafka_sink_remains_feature_gated`,
 `adr065_no_toron_audit_config_or_emission_yet`,
 `adr065_no_async_try_send_policy_in_observability_audit`,

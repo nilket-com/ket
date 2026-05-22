@@ -6217,7 +6217,7 @@ fn adr071_nilket_root_stays_runtime_free() {
 		"tokio",
 		"tokio-rustls",
 		"rustls",
-		"observability-http",
+		"observability",
 		"tls-pki",
 		"serde_json",
 	] {

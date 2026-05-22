@@ -1,7 +1,8 @@
 # Impl Plan 065: `crates/observability` namespace + audit substrate
 
-**Status:** Promoted, paired with
+**Status:** Implemented, paired with
 `plans/adr/065_observability_namespace_audit_substrate.md`.
+Evidence: `plans/impl/065_observability_namespace_audit_substrate_evidence.md`.
 **Posture:** Establish `crates/observability` (interior shared substrate);
 migrate ADR 048 HTTP → `observability::http` (remove the flat crate); extract
 Wendelon's audit **mechanics** → `observability::audit` **byte-equivalently**.
@@ -28,10 +29,11 @@ equivalence fixtures. Seven phases.
 - **The cut.** *Shared mechanics → `observability::audit`:* `AuditSinksConfig`/
   `ArchiveAuditConfig`/`SyslogAuditConfig`/`KafkaAuditConfig`, `AuditAuthority`,
   `AuditOutcome`, `AuditProjectionSinkKind`, `AuditEvidenceDisposition`,
-  generic `AuditEvent` envelope + generic `AuditActor`, `AuditSink` trait,
-  chaining (prev-hash, genesis-as-param), NDJSON sink, archive/syslog/kafka
-  sinks, replay + verify + signed chain-root helpers, composite-sink failure
-  tracking. *Wendelon-owned (stays; typed payload through the envelope):*
+  consumer-provided `AuditFormat`, generic `AuditEvent` envelope + generic
+  `AuditActor`, `AuditSink` trait, chaining (prev-hash, format-provided
+  constants), NDJSON sink, archive/syslog/kafka sinks, replay + verify +
+  signed chain-root helpers, composite-sink failure tracking.
+  *Wendelon-owned (stays; typed payload through the envelope):*
   `AuditOperation`, `AdministrativeControlSchema`/`LocalSecuritySchema`/
   `DataAccessSchema`/`AuditSchema`, `AuditActor::from_actor_identity`
   (`ActorIdentity`).
@@ -42,8 +44,10 @@ equivalence fixtures. Seven phases.
 
 ## Phase 1 — Create `crates/observability`
 
-- New crate; `default = []`; features `http`, `audit` (+ sink features
-  `archive`/`syslog`/`kafka`, kafka off-default). `lib.rs`:
+- New crate; `default = []`; features `http`, `audit`, and optional
+  `kafka` (off-default). Archive/syslog stay under `audit` because they are
+  existing Wendelon audit behavior, not new user-visible Cargo feature gates.
+  `lib.rs`:
   `#[cfg(feature="http")] pub mod http;` / `#[cfg(feature="audit")] pub mod
   audit;`. **`audit` must not require `http`.** Auto-included by `crates/*`.
 
@@ -57,21 +61,31 @@ equivalence fixtures. Seven phases.
 
 ## Phase 3 — Extract audit mechanics → `observability::audit`
 
-- Move the shared-mechanics set (Phase 0). The chaining takes the **genesis
-  tag as a parameter** (no `wendelon-…` constant in the shared crate). The
-  `AuditEvent` envelope is generic over `P: AuditPayload`. **The shared crate
-  imports none of:** Wendelon `NodeId`/`TenantId`/`Identity`/`ActorIdentity`,
-  metrics, clock-drift subscriber traits (D6).
+- Move the shared-mechanics set (Phase 0). Chaining, signed-root emission,
+  syslog formatting, verification, and replay take an **`AuditFormat` /
+  consumer-profile parameter** (no `wendelon-…` constants in the shared
+  crate). For Wendelon this profile carries schema version 4, the genesis tag,
+  chain-root tag, signature tag, canonical operation labels, syslog
+  identifiers, and the ring's node-id codec. The `AuditEvent` envelope is
+  generic over `P: AuditPayload`; operation/schema data stay typed at the
+  consumer boundary, with no free-form operation-string escape hatch in the
+  Wendelon adapter. **The shared crate imports none of:** Wendelon
+  `NodeId`/`TenantId`/`Identity`/`ActorIdentity`, metrics, clock-drift
+  subscriber traits (D6).
 
 ## Phase 4 — Wendelon first consumer (byte-equivalent)
 
 - Wendelon keeps `AuditOperation`/`*Schema`/`AuditActor::from_actor_identity`
   as a **`WendelonPayload: AuditPayload`** — payload serialization moves
-  **verbatim** (relocated, not rewritten). Wendelon passes
-  `b"wendelon-audit-genesis-v1"` + `AUDIT_SCHEMA_VERSION=4`. Update wendelon
+  **verbatim** (relocated, not rewritten). Wendelon provides the `AuditFormat`
+  carrying `b"wendelon-audit-genesis-v1"`, `AUDIT_SCHEMA_VERSION=4`,
+  `wendelon-audit-chain-root-v1`, `ed25519`, the existing operation labels,
+  syslog identifiers, and node-id conversion. Update wendelon
   `crate::audit::…` imports → `observability::audit::…` (mechanics) + local
-  `WendelonPayload` (schema); preserve the metrics adapter. **Serialized
-  envelope+payload bytes identical** pre/post; the D9 constants unchanged.
+  `WendelonPayload` (schema); preserve the metrics adapter and keep the
+  existing Wendelon `audit-kafka` Cargo feature name as the consumer-facing
+  feature that enables `observability/kafka`. **Serialized envelope+payload
+  bytes identical** pre/post; the D9 constants unchanged.
 
 ## Phase 5 — Toron (HTTP retarget only)
 
@@ -83,7 +97,8 @@ equivalence fixtures. Seven phases.
 - The ADR guard set, incl. **per-feature `cargo check`** (`--no-default-
   features --features http` / `… audit`), **no-cross-module-reference**
   (audit↛http, http↛audit), **ADR 048 small-public-surface preserved**,
-  **flat-crate-removed**, **genesis-tag-param**, **Wendelon-payload-ring-owned**,
+  **flat-crate-removed**, **consumer-audit-format-param**,
+  **Wendelon-payload-ring-owned**,
   byte-equivalence, mechanics-only, no-Toron-emission, no-async-substrate,
   no-Wendelon-type-leak, schema-preserved, `::telemetry`-reserved.
 - **Retarget the adr048 (+071) `observability-http` crate/path guards** →
@@ -110,7 +125,9 @@ equivalence fixtures. Seven phases.
    (schema-v4, `blake3-256`/`sha256`, `chain-root-v1`, `ed25519`, JSON field
    order, verifier codes); payload serialization moves **verbatim**; pin with
    existing Wendelon audit tests + a pre-extraction golden. **No schema bump.**
-2. **Genesis tag = consumer param** (not a shared constant).
+2. **Audit format = consumer param** (not shared Wendelon constants): genesis
+   tag, schema version, chain-root/signature tags, canonical operation labels,
+   syslog identifiers, and node-id codec.
 3. **No Wendelon-type leakage** into the shared crate (NodeId/TenantId/Identity/
    ActorIdentity/metrics/clock-drift) — D6 guarded.
 4. **Precise feature invariant** — per-feature `cargo check` + no cross-module
@@ -124,16 +141,17 @@ equivalence fixtures. Seven phases.
 
 ## Acceptance checklist
 
-- [ ] Phase 1: `crates/observability`, `default=[]`, feature-gated http/audit
+- [x] Phase 1: `crates/observability`, `default=[]`, feature-gated http/audit
       (audit ⊀ http).
-- [ ] Phase 2: 048 → `observability::http`; consumers migrated; flat crate
+- [x] Phase 2: 048 → `observability::http`; consumers migrated; flat crate
       removed; semantics preserved.
-- [ ] Phase 3: audit mechanics → `observability::audit`; genesis-tag param;
-      generic `AuditPayload` envelope; no Wendelon-type imports.
-- [ ] Phase 4: Wendelon `WendelonPayload` (verbatim) first consumer;
+- [x] Phase 3: audit mechanics → `observability::audit`; consumer
+      `AuditFormat` param; generic `AuditPayload` envelope; no Wendelon-type
+      imports.
+- [x] Phase 4: Wendelon `WendelonPayload` (verbatim) first consumer;
       **byte-equivalent** (D9 constants; metrics adapter; no bump).
-- [ ] Phase 5: Toron `http` only; no audit feature/config/emission.
-- [ ] Phase 6: guard set incl. per-feature cargo-check, no-cross-reference,
-      flat-crate-removed, genesis-param, no-Wendelon-type-leak; adr048 retarget;
-      byte-equivalence fixtures; evidence.
-- [ ] Phase 7: roadmap; 066 carry.
+- [x] Phase 5: Toron `http` only; no audit feature/config/emission.
+- [x] Phase 6: guard set incl. per-feature cargo-check, no-cross-reference,
+      flat-crate-removed, audit-format-param, no-Wendelon-type-leak; adr048
+      retarget; byte-equivalence fixtures; evidence.
+- [x] Phase 7: roadmap; 066 carry.
