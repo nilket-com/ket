@@ -4732,6 +4732,39 @@ along with the forward-sequence rewrite.
   guard).
   Placement: Toron compute-ring consumer. Migration:
   `plans/impl/066_toron_audit_emission_consumer.md`.
+- **ADR 067 — `observability::telemetry` Substrate (Wendelon OTLP extraction).**
+  Promoted (plan). The **third and final pillar** of the shared observability
+  namespace — `observability::{http, audit, telemetry}`. The audit arc's exact
+  pattern, applied again: Wendelon has the mature implementation (a
+  **hand-rolled** OTLP trace exporter in `metrics/telemetry.rs` over
+  reqwest/h2/http/rustls, + a W3C `ComputeTraceContextV1`), so 067 **extracts
+  it into `observability::telemetry`, behavior-equivalent**, with Wendelon the
+  first consumer and **Toron telemetry deferred to ADR 068**. The shared module
+  owns the trace layer / bounded export queue / shutdown / batching / W3C
+  trace-context validation / OTLP protobuf + HTTP/protobuf + gRPC export;
+  ring policy (resource attrs, scope `wendelon.traces`, `WENDELON_LOG`,
+  `wendelon_otlp_spans_dropped_total`, sampling, node-id, span taxonomy) stays
+  ring-owned via a consumer `TelemetryProfile` seam. **Strict extraction — not
+  an SDK migration:** no `opentelemetry-otlp`/`tonic`/SDK introduced (the
+  hand-rolled stack is preserved); the **Prometheus `/metrics` exporter
+  (`metrics/exporter.rs`) is explicitly NOT moved** (it isn't OTLP). Privacy
+  line held from 066: the substrate exposes W3C trace-context but **does not
+  map `QueryId`/tenant/session into external trace IDs or default span
+  attributes** — that correlation is the ADR 068 consumer's call.
+  `ComputeTraceContextV1` is **kept as a compatibility surface** (delegates to
+  the brand-clean shared type; retiring the `V1` name is a later contract ADR,
+  not an incidental edit). This is the continuous-refactoring disposition:
+  clean the new shared surface now, preserve the existing Wendelon compute
+  contract until a separate contract cleanup owns the rename. Final D-set:
+  **19 decisions, 20 architecture + 4
+  convention + meta guards, 15 fixtures**. Council: **3-of-3 (Claude, Codex,
+  Gemini)**. **Prior-guard reconciliation:** the OTLP-feature retarget
+  (Wendelon `otlp-http`/`otlp-grpc` delegate to `observability`; meta scoped
+  `…_except_otlp_feature_retarget`); self-enforcing. Behavior-equivalence is
+  the whole risk surface — pinned by leaving Wendelon's `otlp_http_export`/
+  `otlp_grpc_export` fixtures **unchanged** (the 065 regression-net lesson).
+  Placement: Interior Substrate → Toron-aggregator home. Migration:
+  `plans/impl/067_observability_telemetry_substrate.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4816,7 +4849,78 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 066 promoted; ADR 067 candidates
+### ADR 067 promoted; ADR 068 candidates
+
+ADR 067 selected and promoted **`observability::telemetry` Substrate (Wendelon
+OTLP extraction)** — the **third and final pillar** of the shared observability
+namespace, `observability::{http, audit, telemetry}`. It repeats the audit
+arc's exact pattern: Wendelon owns the mature implementation (a **hand-rolled**
+OTLP trace exporter + a W3C trace-context), so 067 **extracts it into
+`observability::telemetry`, behavior-equivalent**, Wendelon first consumer,
+**Toron telemetry deferred to ADR 068**. Final D-set: **19 decisions, 20
+architecture + 4 convention + meta guards, 15 fixtures**. Council: **3-of-3**.
+
+**Interior shared substrate (065/066 precedent); strict extraction (no SDK
+migration); behavior-equivalent for Wendelon; ring-agnostic; zero Toron
+emission / SQL-wire / worker / storage / Prometheus-exporter / audit drift.**
+
+**Key decisions / invariants:**
+
+- **Extract, don't invent** (the 065/066 lesson, decisively): the shared shape
+  is *discovered by extracting* Wendelon's working exporter, not invented from
+  Toron. (iter-0/1 had a 3-way split — Claude/Gemini telemetry vs Codex
+  fail-closed, and Claude/Codex extract-first vs Gemini Toron-first; both
+  resolved 3-of-3 to telemetry-extraction.)
+- **Strict extraction — not an SDK migration:** the exporter is hand-rolled
+  (reqwest/h2/http/rustls); **no `opentelemetry-otlp`/`tonic`/SDK** introduced.
+  The Prometheus `/metrics` exporter (`metrics/exporter.rs`) is **not moved**
+  (it isn't OTLP). *(Codex caught both points; the second corrected a Claude
+  iter-3 draft error that listed `exporter.rs` in the extraction surface.)*
+- **Privacy line held from 066** — the substrate validates/carries W3C
+  trace-context but **does not map `QueryId`/tenant/session into external trace
+  IDs or default span attributes**; that correlation is the ADR 068 consumer's
+  call.
+- **Ring policy stays ring-owned** via a consumer `TelemetryProfile` seam
+  (resource attrs, scope `wendelon.traces`, `WENDELON_LOG`, dropped-span metric,
+  sampling, node-id, span taxonomy); shared owns the transport mechanics +
+  bounded fail-open queue + shutdown + W3C validation + HTTP/gRPC export.
+- **`ComputeTraceContextV1` kept as a compatibility surface** (delegates to the
+  brand-clean shared type; retiring the `V1` name is a later contract ADR, not
+  an incidental extraction edit). This is the continuous-refactoring cut:
+  clean the new shared surface now, preserve the existing Wendelon compute
+  contract until a separate contract cleanup owns the rename.
+- **Prior-guard reconciliation:** the OTLP-feature retarget (Wendelon
+  `otlp-http`/`otlp-grpc` delegate to `observability`; meta scoped
+  `…_except_otlp_feature_retarget`); self-enforcing. Behavior-equivalence
+  pinned by leaving the `otlp_http_export`/`otlp_grpc_export` fixtures
+  **unchanged**.
+- `crates/nilket` runtime-free; fixture worker unchanged; new shared surface
+  brand-clean / no-`*V1`. Placement: Interior Substrate → Toron-aggregator home.
+
+The migration is materialized in
+`plans/impl/067_observability_telemetry_substrate.md`.
+
+**The observability namespace is now complete:** `observability::{http (048),
+audit (065/066), telemetry (067/068)}`.
+
+**ADR 068 candidates:**
+
+- **Toron telemetry consumer** (the lead — the 067 consumer): Toron's
+  `TaskTelemetry` → OTLP spans over `observability::telemetry`; the
+  `QueryId ↔ W3C trace-root` mapping + cross-ring `traceparent` propagation
+  (coordinator → workers → Wendelon over the existing wire `trace_id` seam);
+  head-based sampling; default-disabled `[observability.telemetry]` config;
+  span taxonomy (planning / dispatch / worker-execution); the 066 privacy line
+  (coarse class/bucket span attributes, no SQL/PII). Gemini's instrumentation +
+  sampling design is the input here.
+- **`audit.fail_closed` / wait-for-evidence** (the 066 deferral — high-assurance
+  opt-in, evidence-gated); **worker/observability-listener audit coverage** (the
+  066 taxonomy's deferred breadth); **no-WHERE UPDATE** (063 symmetry);
+  composite-PK / DDL widening / `ALTER` / `UNIQUE`; sqlparser-0.62 migration;
+  typed `QUERY_CANCELLED`; precise per-row DELETE RETURNING; CTAS row-count
+  cleanup; JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends — all carried.
+
+### ADR 066 promoted; ADR 067 candidates (HISTORICAL)
 
 ADR 066 selected and promoted **Toron Audit Emission Consumer** — the 065
 consumer (the 065→066 producer/consumer split), making Toron the second
