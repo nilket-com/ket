@@ -752,6 +752,28 @@ impl WendelonStorageScan {
 	}
 }
 
+fn wendelon_table_query_trace_context(
+	request: &ScanRequest,
+) -> wendelon_client::TableQueryTraceContext {
+	wendelon_table_query_trace_context_with_enabled(request, crate::telemetry::enabled())
+}
+
+fn wendelon_table_query_trace_context_with_enabled(
+	request: &ScanRequest,
+	telemetry_enabled: bool,
+) -> wendelon_client::TableQueryTraceContext {
+	if !telemetry_enabled {
+		return wendelon_client::TableQueryTraceContext::Absent;
+	}
+	match crate::telemetry::storage_scan_trace_context(request) {
+		Some(context) => wendelon_client::TableQueryTraceContext::Sampled {
+			trace_id: context.trace_id,
+			parent_span_id: context.span_id,
+		},
+		None => wendelon_client::TableQueryTraceContext::Unsampled,
+	}
+}
+
 #[async_trait::async_trait]
 impl StorageScan for WendelonStorageScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
@@ -777,12 +799,16 @@ impl StorageScan for WendelonStorageScan {
 			});
 		}
 
+		let mut options = wendelon_client::TableQueryOptions {
+			trace_context: wendelon_table_query_trace_context(&request),
+			..wendelon_client::TableQueryOptions::default()
+		};
+
 		let mut pbc = request.pbc_predicate.unwrap_or_default();
 		if let Some(projected_columns) = &request.projected_columns {
 			append_projection(&mut pbc, projected_columns)?;
 		}
 
-		let mut options = wendelon_client::TableQueryOptions::default();
 		if request.read_bound.0 > 0 {
 			options.as_of_hlc = Some(wendelon::schema::HybridTimestamp {
 				physical_ms: request.read_bound.0,
@@ -1050,6 +1076,55 @@ mod tests {
 		RuntimeFilterKeyType, RuntimeFilterKind, encode_runtime_filter_key,
 		insert_runtime_filter_encoded_key,
 	};
+
+	#[test]
+	fn adr069_disabled_local_telemetry_sends_absent_even_with_context() {
+		let request = adr069_scan_request(Some(TraceContext {
+			trace_id: [0x11; 16],
+			span_id: [0; 8],
+		}));
+
+		assert_eq!(
+			wendelon_table_query_trace_context_with_enabled(&request, false),
+			wendelon_client::TableQueryTraceContext::Absent
+		);
+	}
+
+	#[test]
+	fn adr069_enabled_unsampled_sends_unsampled_carrier() {
+		let request = adr069_scan_request(None);
+
+		assert_eq!(
+			wendelon_table_query_trace_context_with_enabled(&request, true),
+			wendelon_client::TableQueryTraceContext::Unsampled
+		);
+	}
+
+	#[test]
+	fn adr069_enabled_sampled_sends_sampled_carrier() {
+		let incoming = TraceContext {
+			trace_id: [0x11; 16],
+			span_id: [0; 8],
+		};
+		let request = adr069_scan_request(Some(incoming));
+		let expected_parent = crate::telemetry::storage_scan_trace_context(&request)
+			.expect("storage scan trace context");
+
+		let actual = wendelon_table_query_trace_context_with_enabled(&request, true);
+
+		assert_eq!(
+			actual,
+			wendelon_client::TableQueryTraceContext::Sampled {
+				trace_id: incoming.trace_id,
+				parent_span_id: expected_parent.span_id,
+			}
+		);
+		if let wendelon_client::TableQueryTraceContext::Sampled { parent_span_id, .. } = actual {
+			assert_ne!(parent_span_id, incoming.span_id);
+		} else {
+			panic!("expected sampled table query trace context");
+		}
+	}
 
 	#[tokio::test]
 	async fn in_memory_runtime_filter_applies_after_morsel_and_before_projection() {
@@ -1402,6 +1477,12 @@ mod tests {
 			morsel: Some((MorselId(1), 2)),
 			downstream_cancellation: None,
 		}
+	}
+
+	fn adr069_scan_request(trace_context: Option<TraceContext>) -> ScanRequest {
+		let mut request = test_request(None);
+		request.trace_context = trace_context;
+		request
 	}
 
 	fn runtime_filter_for_int32_values(values: &[i32]) -> RuntimeFilterDescriptor {

@@ -7190,24 +7190,73 @@ fn adr074_absent_context_preserves_wendelon_otlp_behavior_fixtures() {
 
 #[test]
 fn adr074_no_toron_production_change() {
+	let toron_storage = read_workspace("crates/toron/src/storage.rs");
+	let toron_telemetry = read_workspace("crates/toron/src/telemetry.rs");
+	assert!(
+		toron_storage.contains("fn wendelon_table_query_trace_context("),
+		"ADR 069 owns Toron's table-query trace carrier population"
+	);
+	assert!(
+		toron_storage.contains("wendelon_client::TableQueryTraceContext"),
+		"Toron must consume Wendelon's ADR 074 carrier type directly"
+	);
+	assert!(
+		toron_telemetry.contains("pub(crate) fn storage_scan_trace_context("),
+		"Toron must derive the storage-scan parent through its local telemetry seam"
+	);
+
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	assert!(client.contains("pub enum TableQueryTraceContext"));
+	assert!(data_server.contains("fn decode_table_query_trace_carrier"));
+
+	let mut violations = Vec::new();
+	for dir in [
+		workspace_root().join("crates/wendelon/src"),
+		workspace_root().join("crates/wendelon/crates/wendelon-client/src"),
+	] {
+		walk_dir(&dir, &mut |path| {
+			if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+				return;
+			}
+			let content = fs::read_to_string(path).unwrap();
+			for forbidden in [
+				"wendelon_table_query_trace_context",
+				"storage_scan_trace_context",
+				"toron.storage.scan",
+			] {
+				if content.contains(forbidden) {
+					violations.push(format!("{} contains {forbidden}", path.display()));
+				}
+			}
+		});
+	}
+	assert!(
+		violations.is_empty(),
+		"Toron consumer hooks must not be added to Wendelon production:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn adr074_toron_consumer_population_is_owned_by_adr069() {
 	let mut violations = Vec::new();
 	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
 		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
 			return;
 		}
 		let content = fs::read_to_string(path).unwrap();
-		for forbidden in [
-			"TableQueryTraceContext",
-			"trace_parent_span_id",
-			"TABLE_QUERY_TRACE_FLAG",
-			"wendelon.table.query",
-		] {
+		for forbidden in ["TABLE_QUERY_TRACE_FLAG", "wendelon.table.query"] {
 			if content.contains(forbidden) {
 				violations.push(format!("{} contains {forbidden}", path.display()));
 			}
 		}
 	});
-	assert!(violations.is_empty(), "{}", violations.join("\n"));
+	assert!(
+		violations.is_empty(),
+		"Toron should consume the carrier, not duplicate Wendelon's producer internals:\n{}",
+		violations.join("\n")
+	);
 }
 
 #[test]

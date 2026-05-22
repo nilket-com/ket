@@ -9381,8 +9381,6 @@ fn adr068_wendelon_table_query_trace_carrier_is_owned_by_wendelon_adr074() {
 			.expect("read Wendelon client");
 	let table_schema = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
 		.expect("read Wendelon table schema");
-	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
-		.expect("read storage source");
 	let options = client
 		.split("pub struct TableQueryOptions")
 		.nth(1)
@@ -9396,10 +9394,383 @@ fn adr068_wendelon_table_query_trace_carrier_is_owned_by_wendelon_adr074() {
 	assert!(options.contains("trace_context: TableQueryTraceContext"));
 	assert!(meta.contains("trace_id: [u8; 16]"));
 	assert!(meta.contains("trace_parent_span_id: [u8; 8]"));
+}
+
+#[test]
+fn adr069_wendelon_trace_consumer_is_toron_only() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(storage.contains("fn wendelon_table_query_trace_context("));
+	assert!(storage.contains("wendelon_client::TableQueryTraceContext"));
+	assert!(telemetry.contains("pub(crate) fn storage_scan_trace_context("));
+
+	let mut offenders = Vec::new();
+	for path in source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.chain(source_files(
+			&wendelon_manifest_dir().join("crates/wendelon-client/src"),
+		)) {
+		let content = std::fs::read_to_string(&path).expect("read Wendelon source");
+		for forbidden in [
+			"wendelon_table_query_trace_context",
+			"storage_scan_trace_context",
+			"toron.storage.scan",
+		] {
+			if content.contains(forbidden) {
+				offenders.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	}
 	assert!(
-		!storage.contains("TableQueryTraceContext"),
-		"Toron production population belongs to the consumer ADR, not ADR 074"
+		offenders.is_empty(),
+		"ADR 069 consumer hooks must stay out of Wendelon production:\n{}",
+		offenders.join("\n")
 	);
+}
+
+#[test]
+fn adr069_only_storage_scan_populates_table_query_trace_context() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let production = storage.split("#[cfg(test)]").next().unwrap_or(&storage);
+	assert_eq!(
+		production
+			.matches("fn wendelon_table_query_trace_context(")
+			.count(),
+		1
+	);
+	assert_eq!(
+		production
+			.matches("TableQueryTraceContext::Sampled")
+			.count(),
+		1
+	);
+	assert_eq!(
+		production
+			.matches("trace_context: wendelon_table_query_trace_context(&request),")
+			.count(),
+		1
+	);
+}
+
+#[test]
+fn adr069_trace_context_set_once_on_shared_options() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, scan_block) =
+		brace_blocks_after_marker(&storage, "impl StorageScan for WendelonStorageScan")
+			.into_iter()
+			.next()
+			.expect("WendelonStorageScan impl block");
+	let options_pos = scan_block
+		.find("let mut options = wendelon_client::TableQueryOptions {")
+		.expect("options initialization");
+	let carrier = "trace_context: wendelon_table_query_trace_context(&request),";
+	let carrier_pos = scan_block.find(carrier).expect("trace context carrier");
+	let default_pos = scan_block
+		.find("..wendelon_client::TableQueryOptions::default()")
+		.expect("default options update");
+	let branch_pos = scan_block
+		.find("let query_result = if let Some(downstream_cancellation)")
+		.expect("cancellation branch");
+	assert_eq!(scan_block.matches(carrier).count(), 1);
+	assert!(options_pos < carrier_pos);
+	assert!(carrier_pos < default_pos);
+	assert!(default_pos < branch_pos);
+}
+
+#[test]
+fn adr069_disabled_local_telemetry_sends_absent_even_with_context() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, helper) = brace_blocks_after_marker(
+		&storage,
+		"fn wendelon_table_query_trace_context_with_enabled",
+	)
+	.into_iter()
+	.next()
+	.expect("trace context helper block");
+	assert!(helper.contains("if !telemetry_enabled"));
+	assert!(helper.contains("return wendelon_client::TableQueryTraceContext::Absent;"));
+}
+
+#[test]
+fn adr069_enabled_unsampled_sends_unsampled_carrier() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, helper) = brace_blocks_after_marker(
+		&storage,
+		"fn wendelon_table_query_trace_context_with_enabled",
+	)
+	.into_iter()
+	.next()
+	.expect("trace context helper block");
+	assert!(helper.contains("None => wendelon_client::TableQueryTraceContext::Unsampled"));
+}
+
+#[test]
+fn adr069_enabled_sampled_sends_sampled_carrier() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, helper) = brace_blocks_after_marker(
+		&storage,
+		"fn wendelon_table_query_trace_context_with_enabled",
+	)
+	.into_iter()
+	.next()
+	.expect("trace context helper block");
+	assert!(helper.contains("Some(context) => wendelon_client::TableQueryTraceContext::Sampled"));
+	assert!(helper.contains("trace_id: context.trace_id"));
+	assert!(helper.contains("parent_span_id: context.span_id"));
+}
+
+#[test]
+fn adr069_parent_span_id_equals_storage_scan_trace_context_span_id() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, helper) = brace_blocks_after_marker(
+		&storage,
+		"fn wendelon_table_query_trace_context_with_enabled",
+	)
+	.into_iter()
+	.next()
+	.expect("trace context helper block");
+	assert!(helper.contains("match crate::telemetry::storage_scan_trace_context(request)"));
+	assert!(helper.contains("parent_span_id: context.span_id"));
+}
+
+#[test]
+fn adr069_parent_span_id_is_not_request_trace_context_span_id() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, helper) = brace_blocks_after_marker(
+		&storage,
+		"fn wendelon_table_query_trace_context_with_enabled",
+	)
+	.into_iter()
+	.next()
+	.expect("trace context helper block");
+	assert!(!helper.contains("request.trace_context"));
+	assert!(!helper.contains("parent_span_id: parent.span_id"));
+	assert!(!helper.contains("parent_span_id: request"));
+}
+
+#[test]
+fn adr069_storage_scan_span_id_remains_private_to_telemetry() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(telemetry.contains("\nfn storage_scan_span_id(request: &ScanRequest) -> [u8; 8]"));
+	assert!(!telemetry.contains("pub(crate) fn storage_scan_span_id"));
+	assert!(!telemetry.contains("pub fn storage_scan_span_id"));
+	assert!(telemetry.contains("pub(crate) fn storage_scan_trace_context(request: &ScanRequest)"));
+}
+
+#[test]
+fn adr069_storage_rs_does_not_duplicate_storage_scan_hash_recipe() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let production = storage.split("#[cfg(test)]").next().unwrap_or(&storage);
+	for forbidden in [
+		"STORAGE_SCAN_SPAN_DOMAIN",
+		"blake3::Hasher",
+		"hasher.update(request.query_id",
+	] {
+		assert!(
+			!production.contains(forbidden),
+			"storage.rs must delegate storage-scan span id derivation, found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr069_cancellation_attempt_hook_shape_is_preserved() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, scan_block) =
+		brace_blocks_after_marker(&storage, "impl StorageScan for WendelonStorageScan")
+			.into_iter()
+			.next()
+			.expect("WendelonStorageScan impl block");
+	assert!(scan_block.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(scan_block.contains("register_wendelon_table_query_attempt"));
+	assert!(scan_block.contains("WendelonTableQueryAttempt"));
+	assert!(scan_block.contains("target: attempt.target"));
+	assert!(scan_block.contains("tenant_id: attempt.tenant_id"));
+	assert!(scan_block.contains("request_id: attempt.request_id"));
+}
+
+#[test]
+fn adr069_no_toron_derived_wendelon_table_query_span_id() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, helper) = brace_blocks_after_marker(
+		&storage,
+		"fn wendelon_table_query_trace_context_with_enabled",
+	)
+	.into_iter()
+	.next()
+	.expect("trace context helper block");
+	for forbidden in [
+		"wendelon.table.query",
+		"TABLE_QUERY_TRACE",
+		"request_id",
+		"blake3",
+	] {
+		assert!(
+			!helper.contains(forbidden),
+			"Toron must pass the parent for Wendelon's table-query span, not derive it; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr069_no_traceparent_compute_trace_context_v1_or_taskspec_trace() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let production = storage.split("#[cfg(test)]").next().unwrap_or(&storage);
+	for forbidden in ["traceparent", "ComputeTraceContextV1", "TaskSpec.trace"] {
+		assert!(
+			!production.contains(forbidden),
+			"ADR 069 must use the Wendelon table-query carrier directly; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr069_no_sql_tenant_table_descriptor_peer_queryid_attrs() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let (_, helper) = brace_blocks_after_marker(
+		&storage,
+		"fn wendelon_table_query_trace_context_with_enabled",
+	)
+	.into_iter()
+	.next()
+	.expect("trace context helper block");
+	for forbidden in [
+		"sql",
+		"tenant_id",
+		"table_id",
+		"descriptor",
+		"peer",
+		"query_id",
+	] {
+		assert!(
+			!helper.contains(forbidden),
+			"trace carrier mapping must not add unbounded attributes; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr069_no_wendelon_production_change() {
+	let mut offenders = Vec::new();
+	for path in source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.chain(source_files(
+			&wendelon_manifest_dir().join("crates/wendelon-client/src"),
+		)) {
+		let content = std::fs::read_to_string(&path).expect("read Wendelon source");
+		for forbidden in [
+			"wendelon_table_query_trace_context",
+			"storage_scan_trace_context",
+			"toron.storage.scan",
+		] {
+			if content.contains(forbidden) {
+				offenders.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR 069 must not add Toron consumer hooks to Wendelon production:\n{}",
+		offenders.join("\n")
+	);
+}
+
+#[test]
+fn adr069_only_table_query_read_path_carrier_populated() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let production = storage.split("#[cfg(test)]").next().unwrap_or(&storage);
+	assert_eq!(
+		production
+			.matches("trace_context: wendelon_table_query_trace_context")
+			.count(),
+		1
+	);
+	assert!(!production.contains("table_insert_with_trace_context"));
+	assert!(!production.contains("delete_rows_with_trace_context"));
+	assert!(!production.contains("drop_table_with_trace_context"));
+}
+
+#[test]
+fn adr069_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+	for forbidden in [
+		"tokio",
+		"quinn",
+		"rustls",
+		"observability",
+		"tls-pki",
+		"reqwest",
+		"h2",
+		"wendelon-client",
+	] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr069_reconciles_074_producer_only_toron_population_guards() {
+	let toron_arch = std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+		.expect("read Toron architecture tests");
+	let (_, adr068_block) = brace_blocks_after_marker(
+		&toron_arch,
+		"fn adr068_wendelon_table_query_trace_carrier_is_owned_by_wendelon_adr074",
+	)
+	.into_iter()
+	.next()
+	.expect("ADR 068 reconciliation guard block");
+	assert!(!adr068_block.contains("!storage.contains(\"TableQueryTraceContext\")"));
+	assert!(!adr068_block.contains("consumer ADR, not ADR 074"));
+
+	let wendelon_arch =
+		std::fs::read_to_string(wendelon_manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read Wendelon architecture tests");
+	let (_, adr074_block) =
+		brace_blocks_after_marker(&wendelon_arch, "fn adr074_no_toron_production_change")
+			.into_iter()
+			.next()
+			.expect("ADR 074 reconciliation guard block");
+	assert!(adr074_block.contains("ADR 069 owns Toron's table-query trace carrier population"));
+	assert!(!adr074_block.contains("\"TableQueryTraceContext\","));
+	assert!(!adr074_block.contains("\"trace_parent_span_id\""));
+}
+
+#[test]
+fn adr069_adr068_and_adr074_guards_remain_green() {
+	let toron_arch = std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+		.expect("read Toron architecture tests");
+	let wendelon_arch =
+		std::fs::read_to_string(wendelon_manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read Wendelon architecture tests");
+	for required in [
+		"fn adr068_wendelon_table_query_trace_carrier_is_owned_by_wendelon_adr074",
+		"fn adr069_wendelon_trace_consumer_is_toron_only",
+		"fn adr069_reconciles_074_producer_only_toron_population_guards",
+	] {
+		assert!(toron_arch.contains(required), "missing {required}");
+	}
+	assert!(wendelon_arch.contains("fn adr074_no_toron_production_change"));
+	assert!(wendelon_arch.contains("fn adr074_toron_consumer_population_is_owned_by_adr069"));
 }
 
 #[test]

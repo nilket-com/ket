@@ -462,6 +462,13 @@ pub fn storage_scan_span(request: &ScanRequest) -> Span {
 	)
 }
 
+pub(crate) fn storage_scan_trace_context(request: &ScanRequest) -> Option<TraceContext> {
+	request.trace_context.map(|parent| TraceContext {
+		trace_id: parent.trace_id,
+		span_id: storage_scan_span_id(request),
+	})
+}
+
 fn child_span(
 	name: &'static str,
 	trace_id: [u8; 16],
