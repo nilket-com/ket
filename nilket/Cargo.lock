@@ -2246,12 +2246,21 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "bytes",
  "ed25519-dalek",
+ "h2",
+ "http",
  "rand 0.10.1",
  "rdkafka",
+ "reqwest",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "tls-pki",
  "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

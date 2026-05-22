@@ -9,13 +9,14 @@ use crate::network::cert_issuance_policy::{
 };
 use crate::network::tls::{ACTOR_CLAIMS_OID_DOTTED, ActorIdentity, ActorRole};
 use crate::schema::{IndexObjectId, ReadStatus, TableObjectId, TenantId, WriteStatus};
+use observability::telemetry as shared_telemetry;
 use serde::{Deserialize, Serialize};
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
 
 pub const COMPUTE_STORAGE_CONTRACT_VERSION: u16 = 1;
 pub const SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
-pub const TRACEPARENT_LEN: usize = 55;
+pub const TRACEPARENT_LEN: usize = shared_telemetry::TRACEPARENT_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputeQuerySessionIssueRequest {
@@ -443,62 +444,16 @@ pub struct ComputeTraceContextV1 {
 
 impl ComputeTraceContextV1 {
 	pub fn validate(&self) -> std::io::Result<()> {
-		validate_traceparent(self.traceparent.as_str())?;
-		if let Some(tracestate) = &self.tracestate {
-			if tracestate.len() > 512 || tracestate.chars().any(char::is_control) {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					"tracestate is out of bounds",
-				));
-			}
+		shared_telemetry::TraceContext {
+			traceparent: self.traceparent.clone(),
+			tracestate: self.tracestate.clone(),
 		}
-		Ok(())
+		.validate()
 	}
 }
 
 pub fn validate_traceparent(traceparent: &str) -> std::io::Result<()> {
-	let bytes = traceparent.as_bytes();
-	if bytes.len() != TRACEPARENT_LEN {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			"traceparent must be exactly 55 bytes",
-		));
-	}
-	if bytes[2] != b'-' || bytes[35] != b'-' || bytes[52] != b'-' {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			"traceparent separators are invalid",
-		));
-	}
-	let version = &traceparent[0..2];
-	let trace_id = &traceparent[3..35];
-	let span_id = &traceparent[36..52];
-	let flags = &traceparent[53..55];
-	if version != "00" {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			"only W3C traceparent version 00 is supported",
-		));
-	}
-	if !is_lower_hex(trace_id) || trace_id.bytes().all(|byte| byte == b'0') {
-		return Err(Error::new(ErrorKind::InvalidData, "trace id is invalid"));
-	}
-	if !is_lower_hex(span_id) || span_id.bytes().all(|byte| byte == b'0') {
-		return Err(Error::new(ErrorKind::InvalidData, "span id is invalid"));
-	}
-	if !is_lower_hex(flags) {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			"trace flags are invalid",
-		));
-	}
-	Ok(())
-}
-
-fn is_lower_hex(value: &str) -> bool {
-	value
-		.bytes()
-		.all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+	shared_telemetry::validate_traceparent(traceparent)
 }
 
 pub fn validate_query_session_audit_attribution(

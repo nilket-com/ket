@@ -9,8 +9,8 @@ default = ["non-fips"]
 non-fips = ["aws-lc-rs/non-fips", "observability/non-fips"]
 fips = ["aws-lc-rs/fips", "observability/fips"]
 audit-kafka = ["observability/kafka"]
-otlp-http = []
-otlp-grpc = ["dep:h2", "dep:http"]
+otlp-http = ["observability/otlp-http"]
+otlp-grpc = ["observability/otlp-grpc"]
 
 [dependencies]
 arrow = { version = "58.1.0", features = ["ipc_compression"] }
@@ -28,12 +28,10 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 # compacting/materializing body buffers; Arrow's public Schema APIs do not
 # expose that metadata rewrite path.
 flatbuffers = "25.12.19"
-h2 = { version = "0.4", optional = true }
-http = { version = "1", optional = true }
 io-uring = "0.7.11"
 libc = "0.2"
 lz4_flex = "0.13"
-observability = { path = "../observability", default-features = false, features = ["http", "audit"] }
+observability = { path = "../observability", default-features = false, features = ["http", "audit", "telemetry"] }
 opendal = { version = "0.55", features = ["services-b2", "services-gcs", "services-s3"] }
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 postcard = { workspace = true }
@@ -61,6 +59,8 @@ uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
+h2 = "0.4"
+http = "1"
 proc-macro2 = "1"
 syn = { version = "2", features = ["full"] }
 wendelon-client = { path = "crates/wendelon-client", default-features = false }

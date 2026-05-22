@@ -1,3 +1,5 @@
+#![cfg(feature = "audit")]
+
 use observability::audit::{
 	ArchiveAuditConfig, AuditArchiveLockMode, AuditAuthority, AuditEvent, AuditFormat, AuditNodeId,
 	AuditOutcome, AuditRootSigner, AuditSink, LocalAuditSink, NoopAuditObserver,

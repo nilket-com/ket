@@ -1,3 +1,5 @@
+#![cfg(feature = "http")]
+
 use tokio::io::AsyncWriteExt;
 
 use observability::http::{

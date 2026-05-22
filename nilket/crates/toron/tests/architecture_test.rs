@@ -7555,6 +7555,7 @@ fn adr048_observability_http_depends_only_on_tokio_io() {
 	let manifest =
 		std::fs::read_to_string(workspace_root_dir().join("crates/observability/Cargo.toml"))
 			.expect("read observability manifest");
+	let http_source = observability_http_source_text();
 	assert!(manifest.contains(r#"default = []"#));
 	assert!(manifest.contains(r#"http = ["dep:tokio"]"#));
 	assert!(manifest.contains(
@@ -7570,7 +7571,7 @@ fn adr048_observability_http_depends_only_on_tokio_io() {
 		"ureq",
 		"h2",
 		"httparse",
-		"bytes",
+		"bytes::",
 		"tokio-util",
 		"rustls",
 		"tokio-rustls",
@@ -7579,8 +7580,8 @@ fn adr048_observability_http_depends_only_on_tokio_io() {
 		"tracing",
 	] {
 		assert!(
-			!manifest.contains(forbidden),
-			"observability-http manifest must not contain dependency token {forbidden}"
+			!http_source.contains(forbidden),
+			"observability-http source must not contain dependency token {forbidden}"
 		);
 	}
 }
@@ -8002,16 +8003,25 @@ fn adr065_observability_has_no_quinn_raft_sql_wire_tls_or_router_dependency() {
 		"openraft",
 		"sql_wire",
 		"SqlMessage",
+		"router",
+		"Router",
+	] {
+		assert!(
+			!manifest.contains(forbidden),
+			"manifest contains ring dependency {forbidden}"
+		);
+	}
+	for forbidden in [
+		"quinn",
+		"openraft",
+		"sql_wire",
+		"SqlMessage",
 		"tls-pki",
 		"tls_pki",
 		"rustls",
 		"router",
 		"Router",
 	] {
-		assert!(
-			!manifest.contains(forbidden),
-			"manifest contains {forbidden}"
-		);
 		assert!(!source.contains(forbidden), "source contains {forbidden}");
 	}
 }
@@ -8171,7 +8181,8 @@ fn adr065_observability_namespace_reserves_future_telemetry_facet() {
 	let lib = std::fs::read_to_string(workspace_root_dir().join("crates/observability/src/lib.rs"))
 		.expect("read observability lib");
 	assert!(adr.contains("observability::telemetry"));
-	assert!(!lib.contains("pub mod telemetry"));
+	assert!(lib.contains("#[cfg(feature = \"telemetry\")]"));
+	assert!(lib.contains("pub mod telemetry"));
 }
 
 #[test]
@@ -8700,6 +8711,416 @@ fn adr066_prior_adr045_to_065_guards_continue_to_pass_except_audit_feature_retar
 		let count = architecture_test.matches(&format!("fn {prefix}")).count();
 		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
 	}
+}
+
+#[test]
+fn adr067_observability_telemetry_module_exists_and_is_feature_gated() {
+	let lib = std::fs::read_to_string(workspace_root_dir().join("crates/observability/src/lib.rs"))
+		.expect("read observability lib");
+	assert!(lib.contains("#[cfg(feature = \"telemetry\")]"));
+	assert!(lib.contains("pub mod telemetry;"));
+	assert!(
+		workspace_root_dir()
+			.join("crates/observability/src/telemetry/mod.rs")
+			.exists()
+	);
+}
+
+#[test]
+fn adr067_telemetry_feature_is_independent_of_http_and_audit() {
+	let manifest = observability_manifest();
+	let source = observability_telemetry_source_text();
+	assert!(manifest.contains("telemetry = []"));
+	assert!(manifest.contains(r#"http = ["dep:tokio"]"#));
+	assert!(!manifest.contains(r#"telemetry = ["http""#));
+	assert!(!manifest.contains(r#"telemetry = ["audit""#));
+	for forbidden in [
+		"observability::http",
+		"observability::audit",
+		"crate::http",
+		"crate::audit",
+		"super::http",
+		"super::audit",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"telemetry references {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr067_otlp_http_and_grpc_features_are_non_default() {
+	let manifest = observability_manifest();
+	assert!(manifest.contains("default = []"));
+	assert!(manifest.contains("otlp-http = ["));
+	assert!(manifest.contains("otlp-grpc = ["));
+	for required in [
+		"dep:reqwest",
+		"dep:h2",
+		"dep:http",
+		"dep:tokio-rustls",
+		"dep:tls-pki",
+	] {
+		assert!(
+			manifest.contains(required),
+			"missing OTLP feature dep {required}"
+		);
+	}
+}
+
+#[test]
+fn adr067_wendelon_otlp_features_delegate_to_observability() {
+	let manifest = std::fs::read_to_string(wendelon_manifest_dir().join("Cargo.toml"))
+		.expect("read Wendelon manifest");
+	assert!(manifest.contains(r#"otlp-http = ["observability/otlp-http"]"#));
+	assert!(manifest.contains(r#"otlp-grpc = ["observability/otlp-grpc"]"#));
+	assert!(manifest.contains(r#"features = ["http", "audit", "telemetry"]"#));
+	assert!(!manifest.contains(r#"otlp-http = []"#));
+	assert!(!manifest.contains(r#""dep:h2""#));
+	assert!(!manifest.contains(r#""dep:http""#));
+}
+
+#[test]
+fn adr067_wendelon_build_dispatch_uses_observability_telemetry() {
+	let telemetry =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/metrics/telemetry.rs"))
+			.expect("read Wendelon telemetry");
+	assert!(telemetry.contains("use observability::telemetry as shared_telemetry;"));
+	assert!(telemetry.contains("shared_telemetry::OtlpTraceLayer::new"));
+	assert!(telemetry.contains("fn build_dispatch("));
+	assert!(!telemetry.contains("mod otlp"));
+	assert!(!telemetry.contains("fn encode_export_trace_service_request"));
+}
+
+#[test]
+fn adr067_wendelon_otlp_behavior_fixtures_remain_present() {
+	for fixture in [
+		"tests/otlp_http_export.rs",
+		"tests/otlp_grpc_export.rs",
+		"tests/config_loader.rs",
+	] {
+		assert!(
+			wendelon_manifest_dir().join(fixture).exists(),
+			"missing Wendelon fixture {fixture}"
+		);
+	}
+	let http = std::fs::read_to_string(wendelon_manifest_dir().join("tests/otlp_http_export.rs"))
+		.expect("read OTLP HTTP test");
+	let grpc = std::fs::read_to_string(wendelon_manifest_dir().join("tests/otlp_grpc_export.rs"))
+		.expect("read OTLP gRPC test");
+	assert!(http.contains("telemetry::build_dispatch(Some(&trace_cfg), 7)"));
+	assert!(grpc.contains("telemetry::build_dispatch(Some(&trace_cfg), 8)"));
+	assert!(grpc.contains("telemetry::build_dispatch(Some(&trace_cfg), 9)"));
+}
+
+#[test]
+fn adr067_shared_telemetry_has_no_wendelon_or_toron_imports() {
+	let source = observability_telemetry_source_text();
+	for forbidden in [
+		"wendelon",
+		"Wendelon",
+		"toron",
+		"Toron",
+		"crate::metrics",
+		"crate::network",
+		"crate::storage",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"shared telemetry contains ring token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr067_wendelon_policy_literals_remain_ring_owned() {
+	let shared = observability_telemetry_source_text();
+	let telemetry =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/metrics/telemetry.rs"))
+			.expect("read Wendelon telemetry");
+	for literal in [
+		"WENDELON_LOG",
+		"wendelon.traces",
+		"service.name",
+		"service.version",
+		"wendelon.node_id",
+	] {
+		assert!(
+			telemetry.contains(literal),
+			"Wendelon missing policy literal {literal}"
+		);
+		assert!(
+			!shared.contains(literal),
+			"shared telemetry owns Wendelon policy literal {literal}"
+		);
+	}
+	assert!(telemetry.contains("TelemetryProfile::new"));
+}
+
+#[test]
+fn adr067_wendelon_dropped_span_metric_name_remains_ring_owned() {
+	let shared = observability_telemetry_source_text();
+	let telemetry =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/metrics/telemetry.rs"))
+			.expect("read Wendelon telemetry");
+	assert!(telemetry.contains("otlp_spans_dropped_total"));
+	assert!(!shared.contains("otlp_spans_dropped_total"));
+	assert!(telemetry.contains("WendelonDroppedSpanObserver"));
+}
+
+#[test]
+fn adr067_w3c_trace_context_validation_is_shared() {
+	let shared = observability_telemetry_source_text();
+	let compute =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
+			.expect("read Wendelon compute integration");
+	assert!(shared.contains("pub struct TraceContext"));
+	assert!(shared.contains("pub fn validate_traceparent"));
+	assert!(shared.contains("pub fn validate_tracestate"));
+	assert!(compute.contains("use observability::telemetry as shared_telemetry;"));
+	assert!(compute.contains("shared_telemetry::TraceContext"));
+	assert!(compute.contains("shared_telemetry::validate_traceparent(traceparent)"));
+}
+
+#[test]
+fn adr067_compute_trace_context_v1_is_preserved_as_compatibility_surface() {
+	let compute =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
+			.expect("read Wendelon compute integration");
+	assert!(compute.contains("pub struct ComputeTraceContextV1"));
+	assert!(compute.contains("impl ComputeTraceContextV1"));
+	assert!(compute.contains("shared_telemetry::TraceContext"));
+	assert!(
+		compute.contains("pub const TRACEPARENT_LEN: usize = shared_telemetry::TRACEPARENT_LEN;")
+	);
+}
+
+#[test]
+fn adr067_queryid_to_traceid_mapping_is_absent() {
+	let shared = observability_telemetry_source_text();
+	for forbidden in [
+		"QueryId",
+		"query_id",
+		"tenant_id",
+		"session_id",
+		"trace_id_from_query",
+		"TraceId::from",
+	] {
+		assert!(
+			!shared.contains(forbidden),
+			"shared telemetry gained identity mapping token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr067_otlp_queue_remains_bounded_try_send_fail_open() {
+	let shared = observability_telemetry_source_text();
+	for required in [
+		"mpsc::channel(cfg.max_queue_size)",
+		"tx.try_send(ExportCommand::Span(completed))",
+		"TrySendError::Full",
+		"TrySendError::Closed",
+		"record_dropped_span",
+	] {
+		assert!(
+			shared.contains(required),
+			"missing bounded queue token {required}"
+		);
+	}
+	assert!(!shared.contains(".send(ExportCommand::Span"));
+}
+
+#[test]
+fn adr067_otlp_shutdown_handle_remains_explicit() {
+	let shared = observability_telemetry_source_text();
+	let telemetry =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/metrics/telemetry.rs"))
+			.expect("read Wendelon telemetry");
+	assert!(shared.contains("pub struct OtlpShutdownHandle"));
+	assert!(shared.contains("pub async fn shutdown(self)"));
+	assert!(telemetry.contains("pub struct TelemetryHandle"));
+	assert!(telemetry.contains("shutdown: Option<shared_telemetry::OtlpShutdownHandle>"));
+}
+
+#[test]
+fn adr067_http_and_grpc_export_paths_remain_feature_gated() {
+	let shared = observability_telemetry_source_text();
+	for required in [
+		"#[cfg(feature = \"otlp-http\")]",
+		"#[cfg(feature = \"otlp-grpc\")]",
+		"const OTLP_HTTP_TRACES_PATH: &str = \"/v1/traces\";",
+		"/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+		"application/x-protobuf",
+		"application/grpc",
+		"te\", \"trailers",
+	] {
+		assert!(
+			shared.contains(required),
+			"missing OTLP protocol token {required}"
+		);
+	}
+}
+
+#[test]
+fn adr067_no_new_opentelemetry_sdk_or_tonic_dependency() {
+	let manifests = workspace_cargo_tomls()
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read manifest"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	for forbidden in [
+		"opentelemetry-otlp",
+		"opentelemetry_sdk",
+		"opentelemetry =",
+		"tonic",
+		"prost =",
+	] {
+		assert!(
+			!manifests.contains(forbidden),
+			"manifest gained {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr067_metrics_http_exporter_is_not_moved_as_otlp() {
+	let exporter = std::fs::read_to_string(wendelon_manifest_dir().join("src/metrics/exporter.rs"))
+		.expect("read Wendelon metrics exporter");
+	let shared = observability_telemetry_source_text();
+	assert!(exporter.contains("METRICS_PATH"));
+	assert!(exporter.contains("\"/metrics\""));
+	assert!(exporter.contains("MetricsExporterHandle"));
+	assert!(!shared.contains("METRICS_PATH"));
+	assert!(!shared.contains("MetricsExporterHandle"));
+}
+
+#[test]
+fn adr067_no_toron_telemetry_config_or_exporter_yet() {
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Toron manifest");
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read Toron config");
+	let source = source_files(&manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Toron source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	assert!(source.contains("pub struct TaskTelemetry"));
+	assert!(!manifest.contains("\"telemetry\""));
+	assert!(!config.contains("[observability.telemetry]"));
+	assert!(!config.contains("TelemetryConfig"));
+	assert!(!source.contains("OtlpTraceLayer"));
+	assert!(!source.contains("TraceExportConfig"));
+}
+
+#[test]
+fn adr067_no_audit_http_sql_wire_worker_or_storage_behavior_change() {
+	let sql_wire =
+		std::fs::read_to_string(manifest_dir().join("src/sql_wire.rs")).expect("read SQL wire");
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+	let storage =
+		std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read Toron storage");
+	assert!(!sql_wire.contains("Otlp"));
+	assert!(!sql_wire.contains("TraceExport"));
+	assert!(!worker.contains("Otlp"));
+	assert!(!worker.contains("TraceExport"));
+	assert!(!storage.contains("Otlp"));
+	assert!(!storage.contains("TraceExport"));
+	adr065_observability_http_does_not_reference_audit();
+	adr065_observability_audit_does_not_reference_http();
+}
+
+#[test]
+fn adr067_prior_adr065_066_observability_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+	for prefix in ["adr065_", "adr066_"] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(
+			count > 0,
+			"missing prior observability guard prefix {prefix}"
+		);
+	}
+}
+
+#[test]
+fn adr067_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+	for forbidden in [
+		"tokio",
+		"quinn",
+		"rustls",
+		"observability",
+		"tls-pki",
+		"reqwest",
+		"h2",
+	] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr067_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+	assert!(!worker.contains("observability"));
+	assert!(!worker.contains("Otlp"));
+	assert!(!worker.contains("TraceExport"));
+	assert!(!worker.contains("traceparent"));
+}
+
+#[test]
+fn adr067_new_shared_surface_is_brand_clean_and_has_no_v1_suffix() {
+	let shared = observability_telemetry_source_text();
+	for forbidden in [
+		"Wendelon",
+		"Toron",
+		"Nilket",
+		"TraceContextV1",
+		"TelemetryProfileV1",
+		"OtlpTraceLayerV1",
+	] {
+		assert!(
+			!shared.contains(forbidden),
+			"shared telemetry surface contains forbidden brand/V1 token {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr067_wendelon_v1_trace_context_suffix_is_compatibility_scoped() {
+	let shared = observability_telemetry_source_text();
+	let compute =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
+			.expect("read Wendelon compute integration");
+	assert!(!shared.contains("V1"));
+	assert!(compute.contains("pub struct ComputeTraceContextV1"));
+	assert!(compute.contains("shared_telemetry::TraceContext"));
+}
+
+#[test]
+fn adr067_prior_adr045_to_066_guards_continue_to_pass_except_otlp_feature_retarget() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+	for prefix in [
+		"adr045_", "adr046_", "adr047_", "adr048_", "adr049_", "adr050_", "adr051_", "adr052_",
+		"adr053_", "adr054_", "adr055_", "adr056_", "adr057_", "adr058_", "adr059_", "adr060_",
+		"adr061_", "adr062_", "adr063_", "adr064_", "adr065_", "adr066_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	assert!(architecture_test.contains("adr067_wendelon_otlp_features_delegate_to_observability"));
 }
 
 #[test]
@@ -15571,6 +15992,15 @@ fn observability_audit_source_text() -> String {
 	source_files(&src_dir)
 		.into_iter()
 		.map(|path| std::fs::read_to_string(path).expect("read observability::audit source"))
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+fn observability_telemetry_source_text() -> String {
+	let src_dir = workspace_root_dir().join("crates/observability/src/telemetry");
+	source_files(&src_dir)
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read observability::telemetry source"))
 		.collect::<Vec<_>>()
 		.join("\n")
 }
