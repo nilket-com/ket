@@ -4765,6 +4765,40 @@ along with the forward-sequence rewrite.
   `otlp_grpc_export` fixtures **unchanged** (the 065 regression-net lesson).
   Placement: Interior Substrate → Toron-aggregator home. Migration:
   `plans/impl/067_observability_telemetry_substrate.md`.
+- **ADR 068 — Toron Telemetry Consumer (OTLP trace integration).**
+  Promoted (plan). The 067 consumer (the 065→066 audit arc applied to
+  telemetry): Toron becomes the **second `observability::telemetry` consumer**,
+  turning its rich-but-unexported `TaskTelemetry` + a previously-unpopulated
+  execution trace context into real distributed OTLP traces. Default-disabled
+  `[observability.telemetry]`
+  (Toron-owned `RawTelemetryConfig` → shared `TraceExportConfig`); **absent ⇒
+  exact no-op**. **Derived trace root** — `blake3("toron.trace.v1" ‖
+  query_id)[0..16]`, *not* the literal UUIDv7 `QueryId` (which would leak v7
+  submission-time ordering into the backend); `query_id` is never a span
+  attribute. **Head sampling at the query root only**, propagated as context
+  **presence** (`Some` iff sampled) over the live
+  `TaskExecutionContext.trace_context` carrier — the dead `TaskSpec.trace` is
+  left dormant. The one shared change is an **additive, ring-neutral
+  explicit-context seam** (`otel.{trace_id,span_id,parent_span_id,sampled}`
+  reserved fields, authoritative + stripped) so the worker adopts the remote
+  parent and translates `None`→`otel.sampled=false`, closing the resampling gap
+  (the 067 layer root-samples absent an in-process parent). Five-span `toron.*`
+  taxonomy (query/planning/dispatch/task/storage.scan) with **raw** perf
+  magnitudes + bounded categorical labels behind the 066 privacy line; bounded
+  `ErrorClass` + error status on failure; `toron_otlp_spans_dropped_total`
+  (aggregate); explicit `TelemetryHandle` shutdown. **Stops at the Toron
+  `storage.scan` span** — `wendelon-client::TableQueryOptions` has no trace
+  field, so Wendelon transmission + Wendelon-side continuation are **deferred to
+  ADR 069** (not smuggled in). Final D-set: **20 decisions, 26 architecture + 3
+  convention + meta guards, 16 fixtures**. Council: **grounded 2-of-3 (Codex,
+  Claude)** — the harder details (derived id, live carrier, `otel.sampled`
+  authority, Wendelon defer) were settled by source-grounding; the alternate
+  literal-mapping / wire-envelope / `TableQueryOptions`-transmit line is
+  recorded in the ADR history. **Prior-guard reconciliation:** only the additive
+  ring-neutral seam (meta scoped
+  `…_except_external_context_seam`); 067 behavior fixtures unchanged.
+  Placement: Toron compute-ring consumer. Migration:
+  `plans/impl/068_toron_telemetry_consumer.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4849,7 +4883,69 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 067 promoted; ADR 068 candidates
+### ADR 068 promoted; ADR 069 candidates
+
+ADR 068 selected and promoted **Toron Telemetry Consumer (OTLP trace
+integration)** — the 067 consumer, applying the 065→066 audit arc to telemetry.
+Toron becomes the **second `observability::telemetry` consumer**: its
+rich-but-unexported `TaskTelemetry` and previously-unpopulated execution trace
+context become real distributed OTLP traces. Final D-set: **20 decisions, 26
+architecture + 3 convention + meta guards, 16 fixtures**. Council: **grounded
+2-of-3 (Codex, Claude)**.
+
+**Toron consumer (065/066/067 precedent); default-disabled ⇒ exact no-op;
+derived non-reversible trace root; consumer-only (one additive ring-neutral
+substrate seam); zero Wendelon-wire / SQL-wire / audit / Prometheus-metrics /
+storage drift.**
+
+**Key decisions / invariants:**
+
+- **Derive, don't export the literal `QueryId`** (the privacy cut, decisively):
+  `trace_id = blake3("toron.trace.v1" ‖ query_id)[0..16]`. `QueryId =
+  Uuid::now_v7()`, so a literal trace-id leaks the v7 submission-time prefix +
+  ordering into the backend; the digest stays deterministic + operator-
+  recomputable with no key lifecycle. `query_id` is never a span attribute.
+  *(Claude raised the v7 leak; Codex refined keyed→unkeyed domain-separated to
+  avoid secret lifecycle in a consumer ADR.)*
+- **Live carrier, dead carrier** (grounded): propagation rides the live
+  `TaskExecutionContext.trace_context` (W3C-shaped, already carries a span-id);
+  `TaskSpec.trace` has no live reader and is left dormant.
+- **Head sampling at the query root only, propagated as presence.** One
+  root-sampling site; `Some` context iff sampled, `None` otherwise. The worker
+  translates `None`→`otel.sampled=false` so it **never re-samples** — closing a
+  real gap (the 067 layer root-samples when it has no in-process parent).
+  *(Claude red-teamed this in iter-3; Codex independently locked the same fix.)*
+- **One additive, ring-neutral substrate seam** — reserved
+  `otel.{trace_id,span_id,parent_span_id,sampled}` fields, authoritative + W3C-
+  validated + stripped from exported attributes. No ring imports; spans without
+  reserved fields stay byte-equivalent ⇒ 067 behavior fixtures unchanged.
+- **Privacy/cardinality line (066 symmetry):** raw numeric counters/phases
+  (perf magnitude, not content), bounded categorical labels, bounded
+  `ErrorClass` + error status; **forbid** SQL/literals/table/tenant/session/
+  descriptor/peer/`query_id`.
+- **Stops at the Toron `storage.scan` span.** `wendelon-client::TableQueryOptions`
+  has no trace field, so Wendelon transmission **cannot** be incidental — the
+  table-query carrier + Wendelon-side span continuation are **deferred to ADR
+  069**, not smuggled in.
+- `crates/nilket` runtime-free; fixture worker unchanged; `toron::telemetry`
+  brand-clean / no-`*V1`. Placement: Toron compute-ring consumer.
+
+The migration is materialized in
+`plans/impl/068_toron_telemetry_consumer.md`.
+
+**ADR 069 candidates:**
+
+- **Wendelon table-query trace continuation** (the lead — the 068 deferral): a
+  Wendelon-owned trace carrier on `wendelon-client::TableQueryOptions` /
+  `TableQueryRequestMeta`, plus Wendelon emitting child spans *parented on* the
+  received `ComputeTraceContextV1` — completing end-to-end Toron→Wendelon traces.
+- **`audit.fail_closed` / wait-for-evidence** (the 066 deferral); worker/
+  observability-listener audit coverage; no-WHERE UPDATE (063 symmetry);
+  composite-PK / DDL widening / `ALTER` / `UNIQUE`; sqlparser-0.62 migration;
+  typed `QUERY_CANCELLED`; precise per-row DELETE RETURNING; CTAS row-count
+  cleanup; JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends — all carried.
+
+### ADR 067 promoted; ADR 068 candidates (HISTORICAL)
 
 ADR 067 selected and promoted **`observability::telemetry` Substrate (Wendelon
 OTLP extraction)** — the **third and final pillar** of the shared observability
