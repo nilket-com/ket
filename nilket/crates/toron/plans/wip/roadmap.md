@@ -4944,6 +4944,32 @@ along with the forward-sequence rewrite.
   precise limit contract; Claude grounded the probe).
   Placement: Toron compute-ring parser. Migration:
   `plans/impl/073_sqlparser_062_migration.md`.
+- **ADR 074 — Predicate Widening: `IN` (native `OP_IN_LIST`) + `BETWEEN`.**
+  Promoted (plan). The first predicate-surface widening 073 de-risked, on the V1
+  "First Query with Integrity" target. **First-class `IN`** (`Expr::InList` +
+  `BoundExprNode::InList`) compiling to Wendelon's **existing** `OP_IN_LIST`
+  opcode (`NOT IN` = `IN_LIST` + `OP_NOT`) — **no Wendelon change** (the opcode +
+  execution pre-exist); residual eval folds existing equality + Kleene-`or`
+  kernels for exact parity to `x=a OR x=b` (Arrow `in_list` only as a proven fast
+  path). **`BETWEEN` desugars** to `And(Gte,Lte)` / `Or(Lt,Gt)` (no new IR/opcode/
+  exec arm). `MAX_IN_LIST_ITEMS=32`, deliberately below Wendelon's 64-slot PBC
+  stack limit because `OP_IN_LIST` needs target + members live; reject empty/
+  over-limit/subquery/`UNNEST`/row-value/NULL members; NULL literals stay rejected.
+  **The decisive grounding:** the binder's PBC pushdown is **all-or-nothing**
+  (`binder.rs:105-116` — `compile_pbc` on the whole predicate, no partial push),
+  which both (a) justifies first-class `IN` over desugar (a large OR-tree could
+  exceed PBC limits → poison the whole filter; `OP_IN_LIST` is compact) and (b) is
+  why **`LIKE`/`ILIKE` are deferred to ADR 075** — a residual `LIKE` would
+  silently regress pushdown of eligible siblings; doing it right needs a
+  **partial-pushdown residual-split** (ADR 075's prerequisite). **ADR-014
+  reconciliation:** retarget `adr014_does_not_add_sql_in_lowering_to_toron_planner`
+  (074 now owns list-`IN`; subquery-`IN` stays unsupported). Final D-set: **13
+  decisions, 12 + meta guards, 13 fixtures**. Council: **2-of-3 (Claude, Codex)**
+  — Codex withdrew its pure-desugar position to adopt first-class `IN` (the
+  all-or-nothing finding); **Gemini iter-4 held `LIKE`+`ILIKE`** and claimed 3-of-3,
+  resolved against by the pushdown-regression that defers them. Placement: Toron
+  compute-ring SQL predicate surface. Migration:
+  `plans/impl/074_predicate_widening_in_between.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5028,7 +5054,45 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 073 promoted; ADR 074 candidates
+### ADR 074 promoted; ADR 075 candidates
+
+ADR 074 selected and promoted **Predicate Widening — `IN` (native `OP_IN_LIST`) +
+`BETWEEN`** — the first predicate-surface widening unblocked by 073's parser
+refresh. First-class `IN` compiling to Wendelon's existing `OP_IN_LIST` (no
+Wendelon change); `BETWEEN` desugars; `LIKE`/`ILIKE` deferred. Final D-set: **13
+decisions, 12 + meta guards, 13 fixtures**. Council: **2-of-3 (Claude, Codex)**;
+Gemini held `LIKE`+`ILIKE`, resolved against by the all-or-nothing pushdown.
+
+**Key decisions / invariants:**
+
+- **First-class `IN`** → native `OP_IN_LIST` (`NOT IN` = `IN_LIST` + `OP_NOT`),
+  **no Wendelon change** (opcode + execution pre-exist); residual eval folds
+  equality + Kleene-`or` at exact parity to `x=a OR x=b`. `MAX_IN_LIST_ITEMS=32`
+  to stay stack-safe under Wendelon's 64-slot PBC stack limit; reject empty/
+  over-limit/subquery/`UNNEST`/row-value/NULL members.
+- **`BETWEEN` desugars** to `And(Gte,Lte)` / `Or(Lt,Gt)` — no new IR/opcode/exec arm.
+- **The driver:** the binder's PBC pushdown is **all-or-nothing**
+  (`binder.rs:105-116`), so (a) first-class `IN` beats a desugared OR-tree (which
+  could exceed PBC limits → poison the whole filter), and (b) **`LIKE`/`ILIKE`
+  defer** (a residual `LIKE` would regress pushdown of eligible siblings).
+- **ADR-014 retarget** (`adr014_does_not_add_sql_in_lowering_to_toron_planner` —
+  074 now owns list-`IN`); NULL literals stay rejected; sqlparser stays quarantined.
+
+The migration is materialized in `plans/impl/074_predicate_widening_in_between.md`.
+
+**ADR 075 candidates:**
+
+- **`LIKE`/`ILIKE` + partial PBC residual-splitting** — the natural next, and the
+  residual-split (push eligible conjuncts, residual the non-PBC predicate) is the
+  load-bearing prerequisite that unlocks *all* future non-PBC predicates (string
+  ops, future functions), not just `LIKE`. Highest-value follow-on.
+- **Typed table-mutation trace continuation** — Wendelon-home producer (≈075, the
+  074-trace pattern); agreed Wendelon-home five cycles running.
+- Carried: `CASE`/value-conditionals; subquery/`UNNEST`/row-value `IN`; `CHECK`/
+  `DEFAULT`; `ALTER`/composite-PK/`UNIQUE` (cross-ring schema-V2); pre-op intent
+  audit; fragmentable bulk DML; JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 073 promoted; ADR 074 candidates (HISTORICAL)
 
 ADR 073 selected and promoted **sqlparser 0.54 → 0.62 (Parser-Foundation
 Refresh)** — a single-file, behavior-neutral parser upgrade at the sqlparser→IR
