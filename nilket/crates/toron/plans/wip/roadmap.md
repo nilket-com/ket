@@ -4699,6 +4699,37 @@ along with the forward-sequence rewrite.
   implementation evidence is recorded in
   `plans/impl/065_observability_namespace_audit_substrate_evidence.md`,
   including passing full `cargo test -p toron -- --test-threads=6`.
+- **ADR 066 — Toron Audit Emission Consumer.**
+  Promoted (plan). The 065 consumer (the 065→066 producer/consumer split):
+  Toron becomes the second `observability::audit` consumer, emitting durable,
+  hash-chained, privacy-preserving audit evidence for sensitive node activity —
+  **default-disabled**, reusing the 065 substrate unchanged. Toron-owned
+  `AuditFormat` + typed `ToronAuditEvent` with its **own genesis** ⇒ a Toron
+  chain cryptographically **distinct from Wendelon's** even on the same host.
+  Narrow taxonomy: lifecycle (started/shutdown/sink_failure) + SQL edge-denials
+  (connection-limit / tenant-identity / frame-cap / statement-cap / protocol /
+  unexpected-frame) + query-outcome (completed/planned-error/exec-error/
+  cancelled/timed-out/disconnect). **Strict privacy boundary** — no raw SQL /
+  params / rows / table / descriptor / cert / SAN / error-string / **plan
+  fingerprint**; only bounded statement-**class**, outcome-**class**, error-
+  code-**class**, duration-**bucket**, row-count-**bucket**. **The authority
+  fork resolved to fail-open** (the run's most-contested decision): all
+  emission is non-blocking `try_send` (async lives in Toron; the substrate
+  stays sync), and missed *security* evidence is made **loud, not blocking**,
+  via a dedicated `toron_audit_security_event_unrecorded_total` — because
+  **audit is evidence, not the authorization gate** (a denial already rejects;
+  blocking admissions on audit IO is a deliberate availability tradeoff). A
+  **self-consistent node identity** (`node_id="toron-n-<u32>"` parses to
+  `node_numeric_id`; bare-numeric/UUID rejected) anchors the chain signature.
+  Narrow readiness (degrade only on local-chain open / persistent write
+  failure); aggregate-only metrics; no SQL-wire / Wendelon / telemetry drift;
+  Kafka not a Toron default. Final D-set: **17 decisions, 22 architecture + 3
+  convention + meta guards, 18 fixtures**. Council: **3-of-3 (Claude, Codex,
+  Gemini)**. **Two retargets:** the 065 audit-feature retarget (http-only →
+  audit allowed) and the **roadmap fail-closed-text retarget** (the prior
+  ADR-066 candidate text flips to fail-open + deferred `audit.fail_closed`).
+  Placement: Toron compute-ring consumer. Migration:
+  `plans/impl/066_toron_audit_emission_consumer.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4783,7 +4814,62 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 065 promoted; ADR 066 candidates
+### ADR 066 promoted; ADR 067 candidates
+
+ADR 066 selected and promoted **Toron Audit Emission Consumer** — the 065
+consumer (the 065→066 producer/consumer split), making Toron the second
+`observability::audit` consumer and **completing the production-readiness arc
+opened by 065**. Default-disabled, privacy-preserving, **fail-open** audit
+emission (lifecycle + edge-denial + query-outcome) over a Toron-owned chain
+distinct from Wendelon's. Final D-set: **17 decisions, 22 architecture + 3
+convention + meta guards, 18 fixtures**. Council: **3-of-3**.
+
+**Toron compute-ring consumer; reuses the 065 substrate unchanged (async lives
+in Toron); zero SQL-wire / Wendelon / telemetry drift; disabled = exact no-op.**
+
+**Key decisions / invariants:**
+
+- **The authority fork resolved to fail-open + loud metric** — the run's
+  most-contested decision. **Audit is evidence, not the authorization gate:** a
+  denial already rejects (fail-closed is moot for it); blocking a successful
+  admission on audit IO is a deliberate availability tradeoff. So all emission
+  is `try_send`, and missed *security* evidence is made loud
+  (`toron_audit_security_event_unrecorded_total`), not blocking. **Recorded
+  deferral:** durable-capture / wait-for-evidence becomes an explicit
+  **`audit.fail_closed`** mode (own ADR, threat model, timeout budget, and a
+  fixture proving the accept loop can't be held hostage by audit IO).
+- **Self-consistent node identity** — `node_id="toron-n-<u32>"` must parse to
+  `node_numeric_id`; bare-numeric/UUID rejected; own genesis ⇒ Toron chain
+  distinct from Wendelon's.
+- **Strict privacy / boundedness** — no raw SQL / PII / descriptor / **plan
+  fingerprint** (deferred as its own stability contract); statement-class +
+  row-count-bucket + duration-bucket + error-code-class only.
+- **Narrow taxonomy** (SQL listener first; worker/observability-listener audit
+  follows); **narrow readiness** (degrade only on local-chain failure);
+  **aggregate-only metrics**; **Kafka not a Toron default**; **async lives in
+  Toron** (substrate stays sync).
+- **Two retargets:** the 065 audit-feature retarget (http-only → audit allowed,
+  `…_except_audit_feature_retarget`) and the **roadmap fail-closed-text
+  retarget** (this section's prior fail-closed candidate text → fail-open +
+  deferred `audit.fail_closed`) — both self-enforcing.
+- `crates/nilket` runtime-free; fixture worker unchanged; brand-clean / no-`*V1`.
+
+The migration is materialized in
+`plans/impl/066_toron_audit_emission_consumer.md`.
+
+**ADR 067 candidates:**
+
+- **`audit.fail_closed` / wait-for-evidence** (the 066 deferral — a high-
+  assurance opt-in: durable-capture for authoritative admissions, with a
+  bounded accept-loop-safe gate); **worker/observability-listener audit
+  coverage** (the 066 taxonomy's deferred breadth).
+- **`observability::telemetry` / OTLP export** (the reserved facet);
+  **no-WHERE UPDATE** (063 symmetry); composite-PK / DDL widening / `ALTER` /
+  standalone `UNIQUE`; sqlparser-0.62 migration; typed `QUERY_CANCELLED`
+  mapping; precise per-row DELETE RETURNING; CTAS row-count cleanup;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends — all carried.
+
+### ADR 065 promoted; ADR 066 candidates (HISTORICAL)
 
 ADR 065 selected and promoted **`crates/observability` Namespace and Audit
 Substrate** — the oldest substantive deferral (045 D7), unblocked now that the
@@ -4835,11 +4921,12 @@ The migration is materialized in
 
 - **Toron Audit Emission Consumer** (the lead — the 065 consumer): Toron
   `[audit]` config (default-disabled), `ToronPayload`, the event taxonomy
-  (lifecycle + edge-denial + query-outcome, no raw SQL/PII), the **async
-  `try_send` fail-open** posture for non-authoritative events + **fail-closed
-  for authoritative local security denials** (the deferred authority-split
-  fork), aggregate-only metrics. This is where Gemini's hot-path non-blocking
-  design + the fail-open/closed split land.
+  (lifecycle + edge-denial + query-outcome, no raw SQL/PII), the audit
+  emission posture, aggregate-only metrics. *(Authority-split note retargeted
+  by ADR 066: the fork **resolved to fail-open + loud security-evidence
+  metric** — audit is evidence, not the authorization gate; durable-capture is
+  the deferred `audit.fail_closed` mode. The original fail-closed phrasing here
+  is superseded.)*
 - **`observability::telemetry` / OTLP export** (the reserved facet);
   **no-WHERE UPDATE** (063 symmetry); composite-PK / DDL widening / `ALTER` /
   standalone `UNIQUE`; sqlparser-0.62 migration; typed `QUERY_CANCELLED`
