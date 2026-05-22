@@ -7,6 +7,10 @@ use std::time::Duration;
 
 pub const TRACE_SAMPLING_RATE_DENOMINATOR: u32 = 1_000_000;
 pub const TRACEPARENT_LEN: usize = 55;
+pub const OTEL_TRACE_ID_FIELD: &str = "otel.trace_id";
+pub const OTEL_SPAN_ID_FIELD: &str = "otel.span_id";
+pub const OTEL_PARENT_SPAN_ID_FIELD: &str = "otel.parent_span_id";
+pub const OTEL_SAMPLED_FIELD: &str = "otel.sampled";
 
 #[cfg(any(feature = "otlp-http", feature = "otlp-grpc"))]
 pub use otlp::{OtlpShutdownHandle, OtlpTraceLayer};
@@ -226,6 +230,7 @@ mod tests {
 #[cfg(any(feature = "otlp-http", feature = "otlp-grpc"))]
 mod otlp {
 	use super::{
+		OTEL_PARENT_SPAN_ID_FIELD, OTEL_SAMPLED_FIELD, OTEL_SPAN_ID_FIELD, OTEL_TRACE_ID_FIELD,
 		TRACE_SAMPLING_RATE_DENOMINATOR, TelemetryAttribute as KeyValue, TelemetryProfile,
 		TelemetryValue as Value, TelemetryWarning, TraceExportConfig, TraceExportProtocol,
 	};
@@ -467,6 +472,9 @@ mod otlp {
 	{
 		fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
 			let metadata = attrs.metadata();
+			let mut visitor = AttributeVisitor::default();
+			attrs.record(&mut visitor);
+			let (mut attributes, explicit_context) = visitor.finish();
 			let parent = attrs
 				.parent()
 				.and_then(|parent| trace_context_for_span(ctx.span(parent)))
@@ -477,19 +485,47 @@ mod otlp {
 						None
 					}
 				});
-			let sampled = parent
-				.as_ref()
-				.map(|parent| parent.sampled)
-				.unwrap_or_else(|| self.should_sample_root_span());
-			let trace_id = parent
-				.as_ref()
-				.map(|parent| parent.trace_id)
-				.unwrap_or_else(|| self.next_trace_id());
-			let parent_span_id = parent.as_ref().map(|parent| parent.span_id);
-			let span_id = self.next_span_id();
-			let mut visitor = AttributeVisitor::default();
-			attrs.record(&mut visitor);
-			let mut attributes = visitor.finish_attributes();
+			let default_trace_id = || {
+				parent
+					.as_ref()
+					.map(|parent| parent.trace_id)
+					.unwrap_or_else(|| self.next_trace_id())
+			};
+			let default_parent_span_id = || parent.as_ref().map(|parent| parent.span_id);
+			let default_span_id = || self.next_span_id();
+			let (sampled, trace_id, parent_span_id, span_id) =
+				match explicit_context.to_authoritative_context() {
+					ExplicitSamplingContext::Absent => {
+						let sampled = parent
+							.as_ref()
+							.map(|parent| parent.sampled)
+							.unwrap_or_else(|| self.should_sample_root_span());
+						(
+							sampled,
+							default_trace_id(),
+							default_parent_span_id(),
+							default_span_id(),
+						)
+					}
+					ExplicitSamplingContext::Unsampled => (
+						false,
+						default_trace_id(),
+						default_parent_span_id(),
+						default_span_id(),
+					),
+					ExplicitSamplingContext::Sampled(context) => (
+						true,
+						context.trace_id,
+						context.parent_span_id,
+						context.span_id,
+					),
+					ExplicitSamplingContext::Malformed => (
+						false,
+						default_trace_id(),
+						default_parent_span_id(),
+						default_span_id(),
+					),
+				};
 			attributes.push(KeyValue::string("tracing.level", metadata.level().as_str()));
 			attributes.push(KeyValue::string("tracing.target", metadata.target()));
 			let state = SpanState {
@@ -521,7 +557,8 @@ mod otlp {
 			}
 			let mut visitor = AttributeVisitor::default();
 			values.record(&mut visitor);
-			state.attributes.extend(visitor.finish_attributes());
+			let (attributes, _) = visitor.finish();
+			state.attributes.extend(attributes);
 		}
 
 		fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
@@ -542,7 +579,7 @@ mod otlp {
 				.message
 				.clone()
 				.unwrap_or_else(|| metadata.name().to_string());
-			let mut attributes = visitor.finish_attributes();
+			let (mut attributes, _) = visitor.finish();
 			attributes.push(KeyValue::string("tracing.level", metadata.level().as_str()));
 			attributes.push(KeyValue::string("tracing.target", metadata.target()));
 			if metadata.level() == &tracing::Level::ERROR {
@@ -1078,10 +1115,14 @@ mod otlp {
 	struct AttributeVisitor {
 		attributes: HashMap<String, Value>,
 		message: Option<String>,
+		explicit_context: ExplicitSpanContextFields,
 	}
 
 	impl AttributeVisitor {
 		fn record_value(&mut self, field: &Field, value: Value) {
+			if self.explicit_context.record(field.name(), &value) {
+				return;
+			}
 			if field.name() == "message" {
 				if let Value::String(message) = &value {
 					self.message = Some(message.clone());
@@ -1090,11 +1131,150 @@ mod otlp {
 			self.attributes.insert(field.name().to_string(), value);
 		}
 
-		fn finish_attributes(self) -> Vec<KeyValue> {
-			self.attributes
+		fn finish(self) -> (Vec<KeyValue>, ExplicitSpanContextFields) {
+			let attributes = self
+				.attributes
 				.into_iter()
 				.map(|(key, value)| KeyValue { key, value })
-				.collect()
+				.collect();
+			(attributes, self.explicit_context)
+		}
+	}
+
+	#[derive(Clone, Copy, Default)]
+	struct ExplicitSpanContextFields {
+		trace_id: Option<[u8; 16]>,
+		span_id: Option<[u8; 8]>,
+		parent_span_id: Option<[u8; 8]>,
+		sampled: Option<bool>,
+		malformed: bool,
+	}
+
+	impl ExplicitSpanContextFields {
+		fn record(&mut self, field_name: &str, value: &Value) -> bool {
+			match field_name {
+				OTEL_TRACE_ID_FIELD => {
+					self.record_trace_id(value);
+					true
+				}
+				OTEL_SPAN_ID_FIELD => {
+					self.record_span_id(value);
+					true
+				}
+				OTEL_PARENT_SPAN_ID_FIELD => {
+					self.record_parent_span_id(value);
+					true
+				}
+				OTEL_SAMPLED_FIELD => {
+					self.record_sampled(value);
+					true
+				}
+				_ => false,
+			}
+		}
+
+		fn record_trace_id(&mut self, value: &Value) {
+			match parse_trace_id(value) {
+				Ok(trace_id) => self.trace_id = Some(trace_id),
+				Err(()) => self.malformed = true,
+			}
+		}
+
+		fn record_span_id(&mut self, value: &Value) {
+			match parse_span_id(value) {
+				Ok(span_id) => self.span_id = Some(span_id),
+				Err(()) => self.malformed = true,
+			}
+		}
+
+		fn record_parent_span_id(&mut self, value: &Value) {
+			match parse_span_id(value) {
+				Ok(span_id) => self.parent_span_id = Some(span_id),
+				Err(()) => self.malformed = true,
+			}
+		}
+
+		fn record_sampled(&mut self, value: &Value) {
+			match value {
+				Value::Bool(sampled) => self.sampled = Some(*sampled),
+				_ => self.malformed = true,
+			}
+		}
+
+		fn to_authoritative_context(self) -> ExplicitSamplingContext {
+			let Some(sampled) = self.sampled else {
+				return if self.malformed {
+					ExplicitSamplingContext::Malformed
+				} else {
+					ExplicitSamplingContext::Absent
+				};
+			};
+			if !sampled {
+				return ExplicitSamplingContext::Unsampled;
+			}
+			if self.malformed {
+				return ExplicitSamplingContext::Malformed;
+			}
+			let (Some(trace_id), Some(span_id)) = (self.trace_id, self.span_id) else {
+				return ExplicitSamplingContext::Malformed;
+			};
+			ExplicitSamplingContext::Sampled(ExplicitSpanContext {
+				trace_id,
+				span_id,
+				parent_span_id: self.parent_span_id,
+			})
+		}
+	}
+
+	enum ExplicitSamplingContext {
+		Absent,
+		Unsampled,
+		Sampled(ExplicitSpanContext),
+		Malformed,
+	}
+
+	struct ExplicitSpanContext {
+		trace_id: [u8; 16],
+		span_id: [u8; 8],
+		parent_span_id: Option<[u8; 8]>,
+	}
+
+	fn parse_trace_id(value: &Value) -> Result<[u8; 16], ()> {
+		let Value::String(value) = value else {
+			return Err(());
+		};
+		parse_lower_hex_array::<16>(value)
+	}
+
+	fn parse_span_id(value: &Value) -> Result<[u8; 8], ()> {
+		let Value::String(value) = value else {
+			return Err(());
+		};
+		parse_lower_hex_array::<8>(value)
+	}
+
+	fn parse_lower_hex_array<const N: usize>(value: &str) -> Result<[u8; N], ()> {
+		let bytes = value.as_bytes();
+		if bytes.len() != N * 2 {
+			return Err(());
+		}
+		let mut out = [0u8; N];
+		for i in 0..N {
+			let high = lower_hex_nibble(bytes[i * 2])?;
+			let low = lower_hex_nibble(bytes[i * 2 + 1])?;
+			out[i] = (high << 4) | low;
+		}
+		if out.iter().all(|byte| *byte == 0) {
+			return Err(());
+		}
+		Ok(out)
+	}
+
+	fn lower_hex_nibble(byte: u8) -> Result<u8, ()> {
+		match byte {
+			b'0'..=b'9' => Ok(byte - b'0'),
+			b'a'..=b'f' => Ok(byte - b'a' + 10),
+			_ => Err(()),
 		}
 	}
 
@@ -1274,6 +1454,58 @@ mod otlp {
 				&last_warn,
 				60_000_000_000 + 1_000,
 				Duration::from_secs(60),
+			));
+		}
+
+		#[test]
+		fn explicit_sampled_context_requires_lower_hex_nonzero_ids() {
+			let mut explicit = ExplicitSpanContextFields::default();
+			assert!(explicit.record(
+				OTEL_TRACE_ID_FIELD,
+				&Value::String("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+			));
+			assert!(explicit.record(
+				OTEL_SPAN_ID_FIELD,
+				&Value::String("00f067aa0ba902b7".to_string())
+			));
+			assert!(explicit.record(OTEL_SAMPLED_FIELD, &Value::Bool(true)));
+
+			let ExplicitSamplingContext::Sampled(context) = explicit.to_authoritative_context()
+			else {
+				panic!("valid explicit context must sample");
+			};
+			assert_eq!(
+				context.trace_id,
+				[
+					0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e,
+					0x0e, 0x47, 0x36
+				]
+			);
+			assert_eq!(
+				context.span_id,
+				[0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]
+			);
+		}
+
+		#[test]
+		fn malformed_explicit_context_is_unsampled() {
+			let mut explicit = ExplicitSpanContextFields::default();
+			assert!(explicit.record(
+				OTEL_TRACE_ID_FIELD,
+				&Value::String("4BF92F3577B34DA6A3CE929D0E0E4736".to_string())
+			));
+			assert!(explicit.record(OTEL_SAMPLED_FIELD, &Value::Bool(true)));
+
+			assert!(matches!(
+				explicit.to_authoritative_context(),
+				ExplicitSamplingContext::Malformed
+			));
+
+			let mut unsampled = ExplicitSpanContextFields::default();
+			assert!(unsampled.record(OTEL_SAMPLED_FIELD, &Value::Bool(false)));
+			assert!(matches!(
+				unsampled.to_authoritative_context(),
+				ExplicitSamplingContext::Unsampled
 			));
 		}
 	}

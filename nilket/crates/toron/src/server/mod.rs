@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::Instrument;
 use wendelon::schema::RuntimeFilterDescriptor;
 
 pub struct ToronWorker {
@@ -137,54 +138,70 @@ impl ToronWorker {
 		spec: &TaskSpec,
 		downstream_cancellation: Option<DownstreamCancellationContext>,
 	) -> Result<TaskExecutionReport, QueryError> {
-		let task_started = Instant::now();
-		let telemetry = Arc::new(Mutex::new(task_telemetry_for_spec(spec)));
-		validate_broadcast_caps(spec)?;
-		let morsel = scan_share_morsel(spec);
-		let shuffle_started = Instant::now();
-		let (overrides, shuffle_telemetry) = self.shuffle_input_overrides(spec).await?;
-		record_worker_telemetry(&telemetry, |task| {
-			task.phases.shuffle_pull_decode_micros = duration_micros(shuffle_started);
-			task.counters.pulled_shuffle_bytes = shuffle_telemetry.pulled_shuffle_bytes;
-			task.counters.left_shuffle_bytes = shuffle_telemetry.left_shuffle_bytes;
-			task.counters.right_shuffle_bytes = shuffle_telemetry.right_shuffle_bytes;
-		});
-		let mut task_context = ExecutionContext::new(
-			spec.context.session_id,
-			spec.identity.query_id,
-			spec.context.tenant_id,
-			spec.context.read_bound,
-		)
-		.with_task_budget(spec.budget)
-		.with_task_telemetry(telemetry.clone())
-		.with_runtime_filter(scan_runtime_filter(spec))
-		.with_downstream_cancellation(downstream_cancellation);
-		task_context.trace_context = spec.context.trace_context;
-		let results = if overrides.is_empty() {
-			let executor = Executor::with_context(self.storage.clone(), task_context);
-			executor.execute_bound(&spec.plan, morsel).await?
-		} else {
-			let executor = Executor::with_context(
-				Arc::new(TaskInputStorageScan {
-					base: self.storage.clone(),
-					legacy_single_override: legacy_single_shuffle_override(&spec.plan, &overrides),
-					overrides,
-				}),
-				task_context,
-			);
-			executor.execute_bound(&spec.plan, morsel).await?
-		};
-		record_worker_telemetry(&telemetry, |task| {
-			task.counters.emitted_rows =
-				results.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
-			task.counters.emitted_batches = results.len() as u64;
-			task.phases.task_wall_micros = duration_micros(task_started);
-			recompute_framework_overhead(task);
-		});
-		Ok(TaskExecutionReport {
-			results,
-			telemetry: snapshot_worker_telemetry(&telemetry),
-		})
+		let task_span = crate::telemetry::task_span(spec);
+		let report = async {
+			let task_started = Instant::now();
+			let telemetry = Arc::new(Mutex::new(task_telemetry_for_spec(spec)));
+			validate_broadcast_caps(spec)?;
+			let morsel = scan_share_morsel(spec);
+			let shuffle_started = Instant::now();
+			let (overrides, shuffle_telemetry) = self.shuffle_input_overrides(spec).await?;
+			record_worker_telemetry(&telemetry, |task| {
+				task.phases.shuffle_pull_decode_micros = duration_micros(shuffle_started);
+				task.counters.pulled_shuffle_bytes = shuffle_telemetry.pulled_shuffle_bytes;
+				task.counters.left_shuffle_bytes = shuffle_telemetry.left_shuffle_bytes;
+				task.counters.right_shuffle_bytes = shuffle_telemetry.right_shuffle_bytes;
+			});
+			let mut task_context = ExecutionContext::new(
+				spec.context.session_id,
+				spec.identity.query_id,
+				spec.context.tenant_id,
+				spec.context.read_bound,
+			)
+			.with_task_budget(spec.budget)
+			.with_task_telemetry(telemetry.clone())
+			.with_runtime_filter(scan_runtime_filter(spec))
+			.with_downstream_cancellation(downstream_cancellation);
+			task_context.trace_context = if crate::telemetry::enabled() {
+				crate::telemetry::task_trace_context(spec)
+			} else {
+				spec.context.trace_context
+			};
+			let results = if overrides.is_empty() {
+				let executor = Executor::with_context(self.storage.clone(), task_context);
+				executor.execute_bound(&spec.plan, morsel).await?
+			} else {
+				let executor = Executor::with_context(
+					Arc::new(TaskInputStorageScan {
+						base: self.storage.clone(),
+						legacy_single_override: legacy_single_shuffle_override(
+							&spec.plan, &overrides,
+						),
+						overrides,
+					}),
+					task_context,
+				);
+				executor.execute_bound(&spec.plan, morsel).await?
+			};
+			record_worker_telemetry(&telemetry, |task| {
+				task.counters.emitted_rows =
+					results.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
+				task.counters.emitted_batches = results.len() as u64;
+				task.phases.task_wall_micros = duration_micros(task_started);
+				recompute_framework_overhead(task);
+			});
+			Ok(TaskExecutionReport {
+				results,
+				telemetry: snapshot_worker_telemetry(&telemetry),
+			})
+		}
+		.instrument(task_span.clone())
+		.await;
+		match &report {
+			Ok(report) => crate::telemetry::record_task_telemetry(&task_span, &report.telemetry),
+			Err(error) => crate::telemetry::record_query_error(&task_span, error),
+		}
+		report
 	}
 
 	async fn pull_shuffle_inputs(

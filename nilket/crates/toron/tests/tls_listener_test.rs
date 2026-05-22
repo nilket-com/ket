@@ -550,6 +550,7 @@ fn tls_config(
 			level: "info".to_string(),
 			format: TracingFormat::Pretty,
 			listeners: None,
+			telemetry: None,
 		},
 		audit: AuditConfig::Disabled,
 	}

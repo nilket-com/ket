@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tracing::Instrument;
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
@@ -275,7 +276,8 @@ impl Executor {
 						morsel,
 						downstream_cancellation: self.context.downstream_cancellation.clone(),
 					};
-					let stream = self.storage.scan(req).await?;
+					let span = crate::telemetry::storage_scan_span(&req);
+					let stream = self.storage.scan(req).instrument(span).await?;
 					Ok(materialize_scan_stream(stream).await?)
 				}
 				LogicalPlan::ScanNamed { .. } => Err(ExecutionError::NotImplemented {
@@ -666,7 +668,8 @@ impl Executor {
 						morsel,
 						downstream_cancellation: self.context.downstream_cancellation.clone(),
 					};
-					let stream = self.storage.scan(req).await?;
+					let span = crate::telemetry::storage_scan_span(&req);
+					let stream = self.storage.scan(req).instrument(span).await?;
 					Ok(materialize_scan_stream(stream).await?)
 				}
 				ExecutionPlan::Filter {

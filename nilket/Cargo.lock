@@ -3950,6 +3950,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "aws-lc-rs",
+ "blake3",
  "bytemuck",
  "futures",
  "observability",

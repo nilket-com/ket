@@ -1097,6 +1097,7 @@ fn toron_config_with_descriptor_for_tenant(
 			level: "info".to_string(),
 			format: TracingFormat::Pretty,
 			listeners: None,
+			telemetry: None,
 		},
 		audit: AuditConfig::Disabled,
 	}

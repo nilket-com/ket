@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
+use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 use crate::audit::{
@@ -113,11 +114,14 @@ pub struct ToronDaemon {
 	drain_timeout: std::time::Duration,
 	readiness: Arc<ReadinessState>,
 	audit: ToronAuditEmitter,
+	telemetry: Option<crate::telemetry::TelemetryHandle>,
 }
 
 impl ToronDaemon {
 	pub async fn start(config: ToronBootstrapConfig) -> Result<Self, ToronDaemonError> {
-		install_tracing(&config);
+		if config.observability.telemetry.is_none() {
+			install_tracing(&config);
+		}
 		let client = Arc::new(
 			build_wendelon_client(
 				&config.storage.wendelon,
@@ -133,7 +137,9 @@ impl ToronDaemon {
 		config: ToronBootstrapConfig,
 		client: Arc<wendelon_client::Client>,
 	) -> Result<Self, ToronDaemonError> {
-		install_tracing(&config);
+		if config.observability.telemetry.is_none() {
+			install_tracing(&config);
+		}
 		Self::start_with_client(config, client).await
 	}
 
@@ -297,6 +303,14 @@ impl ToronDaemon {
 			tenant_admission: coordinator.tenant_admission_controller(),
 			admission_rejections: coordinator.admission_rejection_counters(),
 		}));
+		let telemetry = if config.observability.telemetry.is_some() {
+			Some(crate::telemetry::install_global(
+				&config,
+				Arc::clone(&metrics),
+			)?)
+		} else {
+			None
+		};
 		let readiness = Arc::new(ReadinessState::new(
 			true,
 			true,
@@ -430,6 +444,7 @@ impl ToronDaemon {
 			drain_timeout: config.node.drain_timeout,
 			readiness,
 			audit,
+			telemetry,
 		})
 	}
 
@@ -457,7 +472,7 @@ impl ToronDaemon {
 			Ok(())
 		};
 
-		match timeout(self.drain_timeout, drain).await {
+		let drain_result = match timeout(self.drain_timeout, drain).await {
 			Ok(result) => result,
 			Err(_) => {
 				let mut tasks = self.connection_tasks.lock().await;
@@ -467,7 +482,18 @@ impl ToronDaemon {
 				}
 				Err(ToronDaemonError::DrainTimeoutExceeded)
 			}
+		};
+		if drain_result.is_ok()
+			&& let Some(telemetry) = self.telemetry.take()
+		{
+			let export_timeout = telemetry.export_timeout();
+			match timeout(export_timeout, telemetry.shutdown()).await {
+				Ok(Ok(())) => {}
+				Ok(Err(error)) => eprintln!("toron: telemetry shutdown failed: {error}"),
+				Err(_) => eprintln!("toron: telemetry shutdown timed out"),
+			}
 		}
+		drain_result
 	}
 }
 
@@ -803,10 +829,17 @@ async fn handle_sql_connection(
 		SqlMessage::Execute(request) => {
 			let query_started = std::time::Instant::now();
 			let session_id = new_sql_session_id();
+			let query_trace = crate::telemetry::query_trace_context(frame.query_id);
+			let query_span = crate::telemetry::query_span(query_trace);
 			if request.statement.len()
 				> usize::try_from(options.max_statement_bytes.get()).expect("u32 fits usize")
 			{
 				metrics.increment_reject(ListenerName::Sql, RejectReason::StatementTooLarge);
+				crate::telemetry::record_query_statement_class(
+					&query_span,
+					StatementClass::Unknown,
+				);
+				crate::telemetry::record_query_outcome(&query_span, "rejected");
 				audit.record(ToronAuditEvent::edge_denial(
 					ToronAuditOperation::SqlStatementTooLarge,
 					Some(tenant_id),
@@ -825,7 +858,8 @@ async fn handle_sql_connection(
 				.map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
 				.unwrap_or(options.statement_timeout);
 			let planner = SqlPlanner::new();
-			let plan = match planner.plan(&request.statement) {
+			let planning_span = crate::telemetry::planning_span(query_trace);
+			let plan = match planning_span.in_scope(|| planner.plan(&request.statement)) {
 				Ok(plan) => plan,
 				Err(error) => {
 					let code = match error {
@@ -835,6 +869,20 @@ async fn handle_sql_connection(
 						| FrontendError::RuneRuntime { .. }
 						| FrontendError::RuneSandbox { .. } => SqlErrorCode::PlanningError,
 					};
+					crate::telemetry::record_query_statement_class(
+						&query_span,
+						StatementClass::Unknown,
+					);
+					crate::telemetry::record_query_outcome(&query_span, "error");
+					query_span.record("toron.error_class", "frontend");
+					if crate::telemetry::enabled() {
+						query_span.in_scope(|| {
+							tracing::error!(
+								error_class = "frontend",
+								"toron query planning failed"
+							);
+						});
+					}
 					audit.record(
 						ToronAuditEvent::query_outcome(
 							ToronAuditOperation::QueryPlannedError,
@@ -852,9 +900,13 @@ async fn handle_sql_connection(
 				}
 			};
 			let statement_class = StatementClass::from_plan(&plan);
-			let context = sql_execution_context(tenant_id, frame.query_id, session_id);
+			crate::telemetry::record_query_statement_class(&query_span, statement_class);
+			let mut context = sql_execution_context(tenant_id, frame.query_id, session_id);
+			context.trace_context = query_trace.trace_context();
 			let returns_rows = sql_plan_returns_rows(&plan);
-			let execution = coordinator.execute_query_with_context(&plan, context);
+			let execution = coordinator
+				.execute_query_with_context(&plan, context)
+				.instrument(query_span.clone());
 			tokio::pin!(execution);
 			let timeout_sleep = tokio::time::sleep(timeout_duration);
 			tokio::pin!(timeout_sleep);
@@ -863,6 +915,13 @@ async fn handle_sql_connection(
 			let execution = tokio::select! {
 				result = &mut execution => Some(result),
 				_ = &mut timeout_sleep => {
+					crate::telemetry::record_query_outcome(&query_span, "timeout");
+					query_span.record("toron.error_class", "timeout");
+					if crate::telemetry::enabled() {
+						query_span.in_scope(|| {
+							tracing::error!(error_class = "timeout", "toron query timed out");
+						});
+					}
 					let cancellation = coordinator.cancel_query_for_tenant(
 						tenant_id,
 						frame.query_id,
@@ -893,6 +952,16 @@ async fn handle_sql_connection(
 					.await;
 				}
 				_ = &mut connection_closed => {
+					crate::telemetry::record_query_outcome(&query_span, "client_disconnect");
+					query_span.record("toron.error_class", "client_disconnect");
+					if crate::telemetry::enabled() {
+						query_span.in_scope(|| {
+							tracing::error!(
+								error_class = "client_disconnect",
+								"toron query client disconnected"
+							);
+						});
+					}
 					let cancellation = coordinator.cancel_query_for_tenant(
 						tenant_id,
 						frame.query_id,
@@ -920,6 +989,27 @@ async fn handle_sql_connection(
 				Some(Ok(batches)) => batches,
 				Some(Err(error)) => {
 					let (code, message) = map_sql_query_error(error);
+					crate::telemetry::record_query_outcome(&query_span, "error");
+					let error_class = match code {
+						SqlErrorCode::SyntaxError => "syntax",
+						SqlErrorCode::PlanningError => "planning",
+						SqlErrorCode::CatalogError => "catalog",
+						SqlErrorCode::BindingError => "binding",
+						SqlErrorCode::StorageError => "storage",
+						SqlErrorCode::ResourceExhausted => "resource_exhausted",
+						SqlErrorCode::StatementTimeout => "timeout",
+						SqlErrorCode::Cancelled => "cancelled",
+						SqlErrorCode::TenantMismatch => "tenant_mismatch",
+						SqlErrorCode::CancellationUnsupported => "cancellation_unsupported",
+						SqlErrorCode::NoLiveWorker => "no_live_worker",
+						SqlErrorCode::Internal => "internal",
+					};
+					query_span.record("toron.error_class", error_class);
+					if crate::telemetry::enabled() {
+						query_span.in_scope(|| {
+							tracing::error!(error_class, "toron query execution failed");
+						});
+					}
 					let operation = if code == SqlErrorCode::Cancelled {
 						ToronAuditOperation::QueryCancelled
 					} else {
@@ -980,6 +1070,7 @@ async fn handle_sql_connection(
 				.with_duration(query_started.elapsed())
 				.with_row_count(row_count),
 			);
+			crate::telemetry::record_query_outcome(&query_span, "ok");
 			let response =
 				SqlFrame::response(frame.query_id, SqlMessage::Complete(Complete { row_count }));
 			write_sql_frame(&mut stream, &response).await?;

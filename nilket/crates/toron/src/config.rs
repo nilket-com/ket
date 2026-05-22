@@ -51,6 +51,8 @@ const DEFAULT_POOL_MAX_RETAINED: usize = 64;
 const DEFAULT_POOL_MAX_CAP_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_SQL_LISTENER_BIND: &str = "127.0.0.1:7742";
 const DEFAULT_SQL_STATEMENT_TIMEOUT_SECONDS: u64 = 60;
+const DEFAULT_TELEMETRY_MAX_QUEUE_SIZE: usize = 1024;
+const DEFAULT_TELEMETRY_EXPORT_TIMEOUT_SECONDS: u64 = 10;
 
 const EXAMPLE_CONFIG: &str = r#"[node]
 worker_id = "00000000-0000-0000-0000-000000000042"
@@ -141,6 +143,16 @@ format = "pretty"
 # health = "127.0.0.1:7780"
 # ready = "127.0.0.1:7781"
 # metrics = "127.0.0.1:7782"
+
+# [observability.telemetry]
+# endpoint = "https://collector.example.com"
+# protocol = "http/protobuf"
+# sampling_rate_per_million = 100000
+# client_cert_path = "certs/otlp-client.crt"
+# client_key_path = "certs/otlp-client.key"
+# ca_bundle_path = "certs/otlp-ca.crt"
+# max_queue_size = 1024
+# export_timeout_seconds = 10
 
 # [audit]
 # enabled = false
@@ -272,6 +284,25 @@ pub struct ObservabilityConfig {
 	pub level: String,
 	pub format: TracingFormat,
 	pub listeners: Option<ObservabilityListeners>,
+	pub telemetry: Option<TelemetryConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryConfig {
+	pub endpoint: String,
+	pub protocol: TelemetryProtocol,
+	pub sampling_rate_per_million: u32,
+	pub client_cert_path: PathBuf,
+	pub client_key_path: PathBuf,
+	pub ca_bundle_path: PathBuf,
+	pub max_queue_size: usize,
+	pub export_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryProtocol {
+	HttpProtobuf,
+	Grpc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,6 +527,7 @@ struct RawObservabilityConfig {
 	#[serde(default = "default_observability_format")]
 	format: String,
 	listeners: Option<RawObservabilityListeners>,
+	telemetry: Option<RawTelemetryConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -503,6 +535,31 @@ struct RawObservabilityListeners {
 	health: Option<String>,
 	ready: Option<String>,
 	metrics: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTelemetryConfig {
+	endpoint: String,
+	#[serde(default)]
+	protocol: RawTelemetryProtocol,
+	#[serde(default)]
+	sampling_rate_per_million: u32,
+	client_cert_path: PathBuf,
+	client_key_path: PathBuf,
+	ca_bundle_path: PathBuf,
+	#[serde(default = "default_telemetry_max_queue_size")]
+	max_queue_size: usize,
+	#[serde(default = "default_telemetry_export_timeout_seconds")]
+	export_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+enum RawTelemetryProtocol {
+	#[default]
+	#[serde(rename = "http/protobuf")]
+	HttpProtobuf,
+	#[serde(rename = "grpc")]
+	Grpc,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -557,6 +614,7 @@ impl Default for RawObservabilityConfig {
 			level: default_observability_level(),
 			format: default_observability_format(),
 			listeners: None,
+			telemetry: None,
 		}
 	}
 }
@@ -691,7 +749,7 @@ fn normalize_config(
 		raw.storage.wendelon.tls_ca_path,
 		base_dir,
 	)?;
-	let observability = normalize_observability_config(raw.observability, tls.is_some())?;
+	let observability = normalize_observability_config(raw.observability, tls.is_some(), base_dir)?;
 	let audit = normalize_audit_config(raw.audit, base_dir)?;
 	let listener_addresses = listener_bind_addresses(
 		task_listener_bind,
@@ -916,6 +974,7 @@ fn validate_pairwise_distinct_listeners(addresses: &[SocketAddr]) -> Result<(), 
 fn normalize_observability_config(
 	raw: RawObservabilityConfig,
 	tls_present: bool,
+	base_dir: &Path,
 ) -> Result<ObservabilityConfig, ToronConfigError> {
 	let format = match raw.format.as_str() {
 		"pretty" => TracingFormat::Pretty,
@@ -929,11 +988,109 @@ fn normalize_observability_config(
 		.listeners
 		.map(|listeners| normalize_observability_listeners(listeners, tls_present))
 		.transpose()?;
+	let telemetry = raw
+		.telemetry
+		.map(|telemetry| normalize_telemetry_config(telemetry, base_dir))
+		.transpose()?;
 	Ok(ObservabilityConfig {
 		level: raw.level,
 		format,
 		listeners,
+		telemetry,
 	})
+}
+
+fn normalize_telemetry_config(
+	raw: RawTelemetryConfig,
+	base_dir: &Path,
+) -> Result<TelemetryConfig, ToronConfigError> {
+	if raw.endpoint.trim().is_empty() {
+		return Err(invalid(
+			"observability.telemetry.endpoint must not be empty",
+		));
+	}
+	if raw.sampling_rate_per_million > 1_000_000 {
+		return Err(invalid(
+			"observability.telemetry.sampling_rate_per_million must be at most 1000000",
+		));
+	}
+	if raw.max_queue_size == 0 {
+		return Err(invalid(
+			"observability.telemetry.max_queue_size must be greater than zero",
+		));
+	}
+	if raw.export_timeout_seconds == 0 {
+		return Err(invalid(
+			"observability.telemetry.export_timeout_seconds must be greater than zero",
+		));
+	}
+	let protocol = normalize_telemetry_protocol(raw.protocol)?;
+	for path in [
+		&raw.client_cert_path,
+		&raw.client_key_path,
+		&raw.ca_bundle_path,
+	] {
+		reject_env_interpolation(path).map_err(|error| invalid(error.to_string()))?;
+	}
+	let client_cert_path = resolve_config_path(raw.client_cert_path, base_dir);
+	let client_key_path = resolve_config_path(raw.client_key_path, base_dir);
+	let ca_bundle_path = resolve_config_path(raw.ca_bundle_path, base_dir);
+	for (field, path) in [
+		(
+			"observability.telemetry.client_cert_path",
+			&client_cert_path,
+		),
+		("observability.telemetry.client_key_path", &client_key_path),
+		("observability.telemetry.ca_bundle_path", &ca_bundle_path),
+	] {
+		if std::fs::File::open(path).is_err() {
+			return Err(invalid(format!(
+				"{field} is not an existing file: {}",
+				path.display()
+			)));
+		}
+	}
+	Ok(TelemetryConfig {
+		endpoint: raw.endpoint,
+		protocol,
+		sampling_rate_per_million: raw.sampling_rate_per_million,
+		client_cert_path,
+		client_key_path,
+		ca_bundle_path,
+		max_queue_size: raw.max_queue_size,
+		export_timeout: Duration::from_secs(raw.export_timeout_seconds),
+	})
+}
+
+fn normalize_telemetry_protocol(
+	raw: RawTelemetryProtocol,
+) -> Result<TelemetryProtocol, ToronConfigError> {
+	match raw {
+		RawTelemetryProtocol::HttpProtobuf => {
+			#[cfg(not(feature = "otlp-http"))]
+			{
+				Err(invalid(
+					"observability.telemetry.protocol=http/protobuf requires the toron otlp-http cargo feature",
+				))
+			}
+			#[cfg(feature = "otlp-http")]
+			{
+				Ok(TelemetryProtocol::HttpProtobuf)
+			}
+		}
+		RawTelemetryProtocol::Grpc => {
+			#[cfg(not(feature = "otlp-grpc"))]
+			{
+				Err(invalid(
+					"observability.telemetry.protocol=grpc requires the toron otlp-grpc cargo feature",
+				))
+			}
+			#[cfg(feature = "otlp-grpc")]
+			{
+				Ok(TelemetryProtocol::Grpc)
+			}
+		}
+	}
 }
 
 fn normalize_observability_listeners(
@@ -1235,4 +1392,12 @@ fn default_observability_level() -> String {
 
 fn default_observability_format() -> String {
 	"pretty".to_string()
+}
+
+fn default_telemetry_max_queue_size() -> usize {
+	DEFAULT_TELEMETRY_MAX_QUEUE_SIZE
+}
+
+fn default_telemetry_export_timeout_seconds() -> u64 {
+	DEFAULT_TELEMETRY_EXPORT_TIMEOUT_SECONDS
 }

@@ -542,9 +542,13 @@ async fn toron_metrics_endpoint_emits_prometheus_text_format_with_brand_clean_na
 		assert!(body.contains(metric), "missing metric {metric} in {body}");
 	}
 	assert!(body.contains("toron_downstream_storage_cancellations_total"));
+	assert!(body.contains("toron_otlp_spans_dropped_total"));
 	let legacy_brand_body = body
 		.lines()
-		.filter(|line| !line.contains("toron_downstream_storage_cancellations_total"))
+		.filter(|line| {
+			!line.contains("toron_downstream_storage_cancellations_total")
+				&& !line.contains("toron_otlp_spans_dropped_total")
+		})
 		.collect::<Vec<_>>()
 		.join("\n");
 	for forbidden in ["toron_", "query_id", "task_id", "sql_text", "_bucket"] {
@@ -1049,6 +1053,7 @@ fn observability_config(worker_id: WorkerId, pki: &TestPki) -> ToronBootstrapCon
 				ready: "127.0.0.1:0".parse().expect("ready bind"),
 				metrics: "127.0.0.1:0".parse().expect("metrics bind"),
 			}),
+			telemetry: None,
 		},
 		audit: AuditConfig::Disabled,
 	}

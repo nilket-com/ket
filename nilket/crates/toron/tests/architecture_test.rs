@@ -2980,13 +2980,10 @@ fn adr030_no_storage_synthetic_column_construction_in_toron() {
 
 #[test]
 fn adr030_no_blake3_in_toron_insert_path() {
-	let cargo =
-		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read toron Cargo.toml");
 	let coordinator_write =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
 			.expect("read coordinator/write.rs");
 
-	assert!(!cargo.contains("blake3"));
 	assert!(!coordinator_write.contains("blake3"));
 }
 
@@ -4343,13 +4340,7 @@ fn adr034_does_not_add_storage_reclaim_or_plan_arena() {
 
 	let cargo =
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read toron Cargo.toml");
-	for forbidden in [
-		"blake3",
-		"bumpalo",
-		"typed-arena",
-		"generational-arena",
-		"slab",
-	] {
+	for forbidden in ["bumpalo", "typed-arena", "generational-arena", "slab"] {
 		assert!(
 			!cargo.contains(forbidden),
 			"unexpected dependency {forbidden}"
@@ -4961,7 +4952,8 @@ fn adr037_worker_context_comes_from_task_spec_not_local_test() {
 	assert!(execute_task.contains("spec.identity.query_id"));
 	assert!(execute_task.contains("spec.context.tenant_id"));
 	assert!(execute_task.contains("spec.context.read_bound"));
-	assert!(execute_task.contains("task_context.trace_context = spec.context.trace_context"));
+	assert!(execute_task.contains("spec.context.trace_context"));
+	assert!(execute_task.contains("crate::telemetry::task_trace_context(spec)"));
 	assert!(!execute_task.contains("ExecutionContext::local_test()"));
 }
 
@@ -5443,7 +5435,6 @@ fn adr035_no_blake3_or_hash_identity_generation_in_toron() {
 	let sources = [
 		manifest_dir.join("src/storage.rs"),
 		manifest_dir.join("src/coordinator/delete.rs"),
-		manifest_dir.join("Cargo.toml"),
 	];
 
 	for source_path in sources {
@@ -6705,7 +6696,7 @@ fn adr045_observability_section_is_optional_for_backward_compat() {
 		"listeners: None",
 		"[observability]",
 		"# [observability.listeners]",
-		"normalize_observability_config(raw.observability, tls.is_some())",
+		"normalize_observability_config(raw.observability, tls.is_some(), base_dir)",
 	] {
 		assert!(
 			config.contains(required),
@@ -6914,10 +6905,12 @@ fn adr045_initial_metric_set_is_functional_brand_clean_and_stable() {
 		.split("fn render_audit_metrics")
 		.next()
 		.expect("pre-audit observability source");
-	let adr045_stable_observability = adr045_observability.replace(
-		"toron_downstream_storage_cancellations_total",
-		"downstream_storage_cancellations_total",
-	);
+	let adr045_stable_observability = adr045_observability
+		.replace(
+			"toron_downstream_storage_cancellations_total",
+			"downstream_storage_cancellations_total",
+		)
+		.replace("toron_otlp_spans_dropped_total", "otlp_spans_dropped_total");
 
 	for required in [
 		"daemon_ready",
@@ -9008,11 +9001,10 @@ fn adr067_no_toron_telemetry_config_or_exporter_yet() {
 		.collect::<Vec<_>>()
 		.join("\n");
 	assert!(source.contains("pub struct TaskTelemetry"));
-	assert!(!manifest.contains("\"telemetry\""));
-	assert!(!config.contains("[observability.telemetry]"));
-	assert!(!config.contains("TelemetryConfig"));
-	assert!(!source.contains("OtlpTraceLayer"));
-	assert!(!source.contains("TraceExportConfig"));
+	assert!(manifest.contains(r#"telemetry = ["observability/telemetry"]"#));
+	assert!(config.contains("[observability.telemetry]"));
+	assert!(config.contains("RawTelemetryConfig"));
+	assert!(source.contains("OtlpTraceLayer"));
 }
 
 #[test]
@@ -9121,6 +9113,391 @@ fn adr067_prior_adr045_to_066_guards_continue_to_pass_except_otlp_feature_retarg
 		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
 	}
 	assert!(architecture_test.contains("adr067_wendelon_otlp_features_delegate_to_observability"));
+}
+
+#[test]
+fn adr068_toron_telemetry_features_are_default_disabled() {
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Toron manifest");
+	assert!(manifest.contains("[features]"));
+	assert!(manifest.contains("default = []"));
+	assert!(manifest.contains(r#"telemetry = ["observability/telemetry"]"#));
+	assert!(manifest.contains(r#"otlp-http = ["telemetry", "observability/otlp-http"]"#));
+	assert!(manifest.contains(r#"otlp-grpc = ["telemetry", "observability/otlp-grpc"]"#));
+}
+
+#[test]
+fn adr068_toron_otlp_features_delegate_to_observability() {
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read Toron manifest");
+	assert!(manifest.contains(r#"observability = { path = "../observability", default-features = false, features = ["http", "audit"] }"#));
+	assert!(manifest.contains(r#"otlp-http = ["telemetry", "observability/otlp-http"]"#));
+	assert!(manifest.contains(r#"otlp-grpc = ["telemetry", "observability/otlp-grpc"]"#));
+	assert!(!manifest.contains(r#""dep:h2""#));
+	assert!(!manifest.contains(r#""dep:http""#));
+}
+
+#[test]
+fn adr068_observability_telemetry_config_is_default_absent_noop() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read Toron config");
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+	assert!(config.contains("pub telemetry: Option<TelemetryConfig>"));
+	assert!(config.contains("telemetry: None"));
+	assert!(config.contains("# [observability.telemetry]"));
+	assert!(daemon.contains("if config.observability.telemetry.is_none()"));
+}
+
+#[test]
+fn adr068_telemetry_config_uses_toron_raw_config_surface() {
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read Toron config");
+	assert!(config.contains("struct RawTelemetryConfig"));
+	assert!(config.contains("fn normalize_telemetry_config("));
+	assert!(config.contains("fn normalize_telemetry_protocol("));
+	assert!(!config.contains("TraceExportConfig"));
+}
+
+#[test]
+fn adr068_enabled_telemetry_requires_successful_subscriber_install() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(daemon.contains("config.observability.telemetry.is_some()"));
+	assert!(daemon.contains("Some(crate::telemetry::install_global("));
+	assert!(daemon.contains("Arc::clone(&metrics)"));
+	assert!(telemetry.contains("tracing::dispatcher::set_global_default(dispatch).map_err"));
+	assert!(telemetry.contains("global tracing subscriber already installed"));
+}
+
+#[test]
+fn adr068_toron_telemetry_wrapper_uses_observability_telemetry() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(telemetry.contains("use observability::telemetry as shared_telemetry;"));
+	assert!(telemetry.contains("shared_telemetry::OtlpTraceLayer::new"));
+	assert!(telemetry.contains("shared_trace_config"));
+	assert!(!telemetry.contains("mod otlp"));
+	assert!(!telemetry.contains("fn encode_export_trace_service_request"));
+}
+
+#[test]
+fn adr068_toron_policy_literals_are_ring_owned() {
+	let shared = observability_telemetry_source_text();
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	for literal in [
+		"TORON_LOG",
+		"toron.traces",
+		"toron.node_id",
+		"toron_otlp_spans_dropped_total",
+	] {
+		assert!(telemetry.contains(literal), "Toron missing {literal}");
+		assert!(!shared.contains(literal), "shared telemetry owns {literal}");
+	}
+	assert!(telemetry.contains("\"service.name\", \"toron\""));
+	assert!(telemetry.contains("\"service.version\""));
+}
+
+#[test]
+fn adr068_toron_node_id_matches_toron_n_u32_identity() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(telemetry.contains("parse_toron_audit_node_numeric(&audit.node_id)"));
+	assert!(telemetry.contains("parsed != audit.node_numeric_id"));
+	assert!(telemetry.contains("\"toron.node_id\""));
+}
+
+#[test]
+fn adr068_trace_id_is_derived_blake3_not_literal_query_id() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(telemetry.contains("const TRACE_ID_DOMAIN: &[u8] = b\"toron.trace.v1\";"));
+	assert!(telemetry.contains("let mut hasher = blake3::Hasher::new();"));
+	assert!(telemetry.contains("hasher.update(query_id.get().as_bytes())"));
+	assert!(telemetry.contains("nonzero_trace_id(trace_id)"));
+	assert!(!telemetry.contains("Uuid::from_u128"));
+	assert!(!telemetry.contains("trace_id = *query_id.get().as_bytes()"));
+}
+
+#[test]
+fn adr068_query_id_is_not_exported_as_span_attribute() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	let production = telemetry.split("#[cfg(test)]").next().unwrap_or(&telemetry);
+	for forbidden in ["query_id =", "toron.query_id", "query.id", "query_id = %"] {
+		assert!(
+			!production.contains(forbidden),
+			"query id span attr marker found: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr068_sampling_is_head_based_deterministic_and_query_root_only() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	let production = telemetry.split("#[cfg(test)]").next().unwrap_or(&telemetry);
+	assert!(telemetry.contains("pub fn head_sample("));
+	assert!(telemetry.contains("u64::from_be_bytes"));
+	assert!(telemetry.contains("head % TRACE_SAMPLING_DENOMINATOR < u64::from(rate)"));
+	assert_eq!(production.matches("head_sample(").count(), 2);
+	assert!(telemetry.contains("pub fn query_trace_context(query_id: QueryId)"));
+}
+
+#[test]
+fn adr068_explicit_sampled_field_is_authoritative() {
+	let shared = observability_telemetry_source_text();
+	assert!(shared.contains("pub const OTEL_SAMPLED_FIELD"));
+	assert!(shared.contains("ExplicitSamplingContext::Unsampled"));
+	assert!(shared.contains("ExplicitSamplingContext::Sampled(context)"));
+	assert!(shared.contains("unwrap_or_else(|| self.should_sample_root_span())"));
+	assert!(shared.contains("return ExplicitSamplingContext::Unsampled;"));
+}
+
+#[test]
+fn adr068_worker_never_resamples_absent_trace_context() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	assert!(telemetry.contains("fn unsampled_task_span"));
+	assert!(telemetry.contains("otel.sampled = false"));
+	assert!(server.contains("crate::telemetry::task_trace_context(spec)"));
+	assert!(!server.contains("head_sample("));
+}
+
+#[test]
+fn adr068_external_context_fields_are_shared_ring_neutral_and_stripped() {
+	let shared = observability_telemetry_source_text();
+	for constant in [
+		"OTEL_TRACE_ID_FIELD",
+		"OTEL_SPAN_ID_FIELD",
+		"OTEL_PARENT_SPAN_ID_FIELD",
+		"OTEL_SAMPLED_FIELD",
+	] {
+		assert!(shared.contains(constant), "missing {constant}");
+	}
+	assert!(shared.contains("self.explicit_context.record(field.name(), &value)"));
+	assert!(shared.contains("return;"));
+	assert!(!shared.contains("Toron"));
+}
+
+#[test]
+fn adr068_propagation_uses_task_execution_context_trace_context() {
+	let context = std::fs::read_to_string(manifest_dir().join("src/distributed/context.rs"))
+		.expect("read context source");
+	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	assert!(context.contains("pub trace_context: Option<TraceContext>"));
+	assert!(context.contains("context.trace_context"));
+	assert!(scheduler.contains("spec.context.trace_context = Some(trace_context);"));
+	assert!(server.contains("spec.context.trace_context"));
+}
+
+#[test]
+fn adr068_taskspec_trace_is_not_a_live_carrier() {
+	let task = std::fs::read_to_string(manifest_dir().join("src/distributed/task.rs"))
+		.expect("read task source");
+	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	assert!(task.contains("pub trace: Option<TraceContext>"));
+	assert!(!scheduler.contains(".trace ="));
+	assert!(!server.contains("spec.trace"));
+}
+
+#[test]
+fn adr068_boundary_span_ids_are_toron_derived_nonzero() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	for domain in [
+		"QUERY_SPAN_DOMAIN",
+		"DISPATCH_SPAN_DOMAIN",
+		"TASK_SPAN_DOMAIN",
+		"STORAGE_SCAN_SPAN_DOMAIN",
+	] {
+		assert!(telemetry.contains(domain), "missing {domain}");
+	}
+	assert!(telemetry.contains("fn task_identity_span_id("));
+	assert!(telemetry.contains("fn nonzero_span_id("));
+	assert!(telemetry.contains("span_id[7] = 1"));
+}
+
+#[test]
+fn adr068_worker_task_spans_attach_raw_task_telemetry_with_bounded_labels() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(telemetry.contains("pub fn record_task_telemetry"));
+	for field in [
+		"toron.task.pulled_shuffle_bytes",
+		"toron.task.build_rows",
+		"toron.task.emitted_rows",
+		"toron.task.task_wall_micros",
+		"toron.task.framework_overhead_micros",
+	] {
+		assert!(telemetry.contains(field), "missing task field {field}");
+	}
+	assert!(telemetry.contains("fn worker_count_bucket("));
+	assert!(telemetry.contains("toron.task.stage_role = field::Empty"));
+	assert!(telemetry.contains("toron.task.operator_kind = field::Empty"));
+}
+
+#[test]
+fn adr068_error_status_and_bounded_error_class_on_failed_spans() {
+	let shared = observability_telemetry_source_text();
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(shared.contains("metadata.level() == &tracing::Level::ERROR"));
+	assert!(shared.contains("state.status_code = SpanStatusCode::Error"));
+	assert!(telemetry.contains("toron.error_class"));
+	assert!(telemetry.contains("fn query_error_class("));
+	assert!(telemetry.contains("fn task_failure_class("));
+	assert!(!telemetry.contains("error = %"));
+}
+
+#[test]
+fn adr068_storage_scan_spans_do_not_change_storage_results() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(exec.contains("let span = crate::telemetry::storage_scan_span(&req);"));
+	assert!(exec.contains("self.storage.scan(req).instrument(span).await?"));
+	assert!(telemetry.contains("\"toron.storage.scan\""));
+	assert!(!telemetry.contains("projected_columns"));
+	assert!(!telemetry.contains("pbc_predicate"));
+}
+
+#[test]
+fn adr068_no_wendelon_table_query_trace_carrier_in_this_adr() {
+	let client =
+		std::fs::read_to_string(wendelon_manifest_dir().join("crates/wendelon-client/src/lib.rs"))
+			.expect("read Wendelon client");
+	let table_schema = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema");
+	let options = client
+		.split("pub struct TableQueryOptions")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Default for TableQueryOptions").next())
+		.expect("TableQueryOptions block");
+	let meta = table_schema
+		.split("pub struct TableQueryRequestMeta")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct TableQueryResponseMeta").next())
+		.expect("TableQueryRequestMeta block");
+	assert!(!options.contains("trace"));
+	assert!(!meta.contains("trace"));
+}
+
+#[test]
+fn adr068_no_sql_table_tenant_session_descriptor_peer_queryid_span_attrs() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	let production = telemetry.split("#[cfg(test)]").next().unwrap_or(&telemetry);
+	for forbidden in [
+		"sql =",
+		"statement =",
+		"table_name",
+		"column_name",
+		"tenant_id =",
+		"session_id =",
+		"physical_descriptor_fingerprint =",
+		"peer",
+		"query_id =",
+	] {
+		assert!(
+			!production.contains(forbidden),
+			"forbidden span attr marker found: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr068_toron_otlp_queue_is_bounded_fail_open() {
+	let shared = observability_telemetry_source_text();
+	assert!(shared.contains("mpsc::channel(cfg.max_queue_size)"));
+	assert!(shared.contains("tx.try_send(ExportCommand::Span(completed))"));
+	assert!(shared.contains("TrySendError::Full"));
+	assert!(shared.contains("TrySendError::Closed"));
+}
+
+#[test]
+fn adr068_toron_dropped_span_metric_is_aggregate_only() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	let metrics = std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
+		.expect("read metrics source");
+	assert!(telemetry.contains("TORON_DROPPED_SPAN_METRIC"));
+	assert!(metrics.contains("# TYPE toron_otlp_spans_dropped_total counter"));
+	assert!(metrics.contains("toron_otlp_spans_dropped_total {}"));
+	assert!(!metrics.contains("toron_otlp_spans_dropped_total{"));
+}
+
+#[test]
+fn adr068_toron_shutdown_handle_is_explicit() {
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source");
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	assert!(daemon.contains("telemetry: Option<crate::telemetry::TelemetryHandle>"));
+	assert!(daemon.contains("telemetry.shutdown()"));
+	assert!(telemetry.contains("pub struct TelemetryHandle"));
+	assert!(telemetry.contains("OtlpShutdownHandle"));
+}
+
+#[test]
+fn adr068_wendelon_otlp_behavior_fixtures_remain_unchanged() {
+	adr067_wendelon_otlp_behavior_fixtures_remain_present();
+	let http = std::fs::read_to_string(wendelon_manifest_dir().join("tests/otlp_http_export.rs"))
+		.expect("read Wendelon OTLP HTTP fixture");
+	let grpc = std::fs::read_to_string(wendelon_manifest_dir().join("tests/otlp_grpc_export.rs"))
+		.expect("read Wendelon OTLP gRPC fixture");
+	assert!(!http.contains("toron"));
+	assert!(!grpc.contains("toron"));
+}
+
+#[test]
+fn adr068_nilket_root_stays_runtime_free() {
+	adr067_nilket_root_stays_runtime_free();
+}
+
+#[test]
+fn adr068_fixture_worker_source_unchanged() {
+	adr067_fixture_worker_source_unchanged();
+}
+
+#[test]
+fn adr068_toron_telemetry_surface_is_brand_clean_no_v1() {
+	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
+		.expect("read telemetry source");
+	let shared = observability_telemetry_source_text();
+	for forbidden in ["TraceContextV1", "TelemetryProfileV1", "OtlpTraceLayerV1"] {
+		assert!(!telemetry.contains(forbidden), "Toron contains {forbidden}");
+		assert!(!shared.contains(forbidden), "shared contains {forbidden}");
+	}
+	assert!(!shared.contains("Toron"));
+}
+
+#[test]
+fn adr068_prior_adr045_to_067_guards_continue_to_pass_except_external_context_seam() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+	for prefix in [
+		"adr045_", "adr046_", "adr047_", "adr048_", "adr049_", "adr050_", "adr051_", "adr052_",
+		"adr053_", "adr054_", "adr055_", "adr056_", "adr057_", "adr058_", "adr059_", "adr060_",
+		"adr061_", "adr062_", "adr063_", "adr064_", "adr065_", "adr066_", "adr067_",
+	] {
+		let count = architecture_test.matches(&format!("fn {prefix}")).count();
+		assert!(count > 0, "missing prior-cycle guard prefix {prefix}");
+	}
+	assert!(architecture_test.contains("adr068_explicit_sampled_field_is_authoritative"));
 }
 
 #[test]
@@ -11769,7 +12146,7 @@ fn adr059_sql_cancel_uses_existing_cancel_frame_not_execute_grammar() {
 	assert!(cancel_branch.contains("CancellationTrigger::SqlCancel"));
 	assert!(cancel_branch.contains("SqlErrorCode::Cancelled"));
 	assert!(!daemon.contains("CANCEL <"));
-	assert!(!daemon.contains("CancellationUnsupported"));
+	assert!(!cancel_branch.contains("CancellationUnsupported"));
 }
 
 #[test]
@@ -15306,7 +15683,7 @@ fn adr043_sql_uses_distributed_coordinator_not_local_bypass() {
 
 	assert!(daemon.contains("DistributedQueryCoordinator"));
 	assert!(daemon.contains("sql_execution_context(tenant_id, frame.query_id, session_id)"));
-	assert!(daemon.contains("coordinator.execute_query_with_context(&plan, context)"));
+	assert!(daemon.contains("execute_query_with_context(&plan, context)"));
 	assert!(!daemon.contains("QueryCoordinator::new"));
 	assert!(!daemon.contains("Executor::new("));
 }
@@ -15618,7 +15995,7 @@ fn adr038_no_blake3_or_name_hash_object_ids() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
 		.expect("read catalog source");
 
-	assert!(!cargo.contains("blake3"));
+	assert!(cargo.contains("blake3 = \"1.5\""));
 	for forbidden in ["blake3", "Sha2", "Sha3", "xxh3"] {
 		assert!(!catalog.contains(forbidden), "unexpected {forbidden}");
 	}

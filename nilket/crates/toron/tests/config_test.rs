@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Field, Schema};
 use toron::catalog::{TableRef, WendelonDescriptorRegistry};
+#[cfg(feature = "otlp-http")]
+use toron::config::TelemetryProtocol;
 use toron::config::{
 	AuditConfig, DescriptorBootstrap, DescriptorBootstrapEntry, load_descriptor_bootstrap,
 	load_toron_bootstrap_config, render_example_config,
@@ -41,6 +43,12 @@ fn fresh_dir(tag: &str) -> PathBuf {
 fn write_toron_tls_placeholders(dir: &Path) {
 	for name in ["listener.pem", "listener.key", "peer-ca.pem"] {
 		std::fs::write(dir.join(name), "placeholder").expect("write TLS placeholder");
+	}
+}
+
+fn write_toron_telemetry_placeholders(dir: &Path) {
+	for name in ["otlp-client.crt", "otlp-client.key", "otlp-ca.crt"] {
+		std::fs::write(dir.join(name), "placeholder").expect("write telemetry placeholder");
 	}
 }
 
@@ -142,7 +150,56 @@ fn toron_example_config_loads() {
 		None
 	);
 	assert!(config.admission.is_none());
+	assert!(config.observability.telemetry.is_none());
 	assert!(matches!(config.audit, AuditConfig::Disabled));
+}
+
+#[cfg(feature = "otlp-http")]
+#[test]
+fn telemetry_config_accepts_toron_owned_surface_with_otlp_feature() {
+	let dir = fresh_dir("telemetry-enabled");
+	write_toron_telemetry_placeholders(&dir);
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[observability.telemetry]\nendpoint = \"https://collector.example.com\"\nprotocol = \"http/protobuf\"\nsampling_rate_per_million = 250000\nclient_cert_path = \"otlp-client.crt\"\nclient_key_path = \"otlp-client.key\"\nca_bundle_path = \"otlp-ca.crt\"\nmax_queue_size = 64\nexport_timeout_seconds = 3\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let config = load_toron_bootstrap_config(&path).expect("load telemetry config");
+	let telemetry = config
+		.observability
+		.telemetry
+		.as_ref()
+		.expect("telemetry config");
+
+	assert_eq!(telemetry.protocol, TelemetryProtocol::HttpProtobuf);
+	assert_eq!(telemetry.sampling_rate_per_million, 250_000);
+	assert_eq!(telemetry.client_cert_path, dir.join("otlp-client.crt"));
+	assert_eq!(telemetry.max_queue_size, 64);
+	assert_eq!(telemetry.export_timeout, std::time::Duration::from_secs(3));
+}
+
+#[cfg(not(feature = "otlp-http"))]
+#[test]
+fn telemetry_config_rejects_unsupported_protocol_without_otlp_feature() {
+	let dir = fresh_dir("telemetry-unsupported");
+	write_toron_telemetry_placeholders(&dir);
+	let path = dir.join("toron.toml");
+	let config = format!(
+		"{}\n[observability.telemetry]\nendpoint = \"https://collector.example.com\"\nprotocol = \"http/protobuf\"\nsampling_rate_per_million = 250000\nclient_cert_path = \"otlp-client.crt\"\nclient_key_path = \"otlp-client.key\"\nca_bundle_path = \"otlp-ca.crt\"\n",
+		render_example_config()
+	);
+	std::fs::write(&path, config).expect("write config");
+
+	let error = load_toron_bootstrap_config(&path).expect_err("unsupported protocol rejected");
+
+	assert!(
+		error
+			.to_string()
+			.contains("observability.telemetry.protocol=http/protobuf"),
+		"{error}"
+	);
 }
 
 #[test]

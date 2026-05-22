@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use tracing::Instrument;
 
 use crate::distributed::budget::DurationMillis;
 use crate::distributed::identity::{AttemptId, QueryId, StageId, TaskIdentity, WorkerId};
@@ -266,7 +267,15 @@ where
 						dispatched.push(spec.identity);
 
 						let dispatch_started = Instant::now();
-						let outcome = dispatcher.dispatch(&worker, &spec).await;
+						let dispatch_span = crate::telemetry::dispatch_span(&spec);
+						if let Some(trace_context) = crate::telemetry::dispatch_trace_context(&spec)
+						{
+							spec.context.trace_context = Some(trace_context);
+						}
+						let outcome = dispatcher
+							.dispatch(&worker, &spec)
+							.instrument(dispatch_span.clone())
+							.await;
 						let dispatch_wait_micros = duration_micros(dispatch_started);
 
 						match outcome {
@@ -325,6 +334,7 @@ where
 								break;
 							}
 							DispatchOutcome::Failed(kind) => {
+								crate::telemetry::record_task_failure(&dispatch_span, &kind);
 								self.record_dispatch_failure(&kind);
 								let retryable = failure_retryable(&kind);
 								if retryable
@@ -351,6 +361,7 @@ where
 								kind,
 								mut telemetry,
 							} => {
+								crate::telemetry::record_task_failure(&dispatch_span, &kind);
 								telemetry.phases.dispatch_wait_micros = telemetry
 									.phases
 									.dispatch_wait_micros

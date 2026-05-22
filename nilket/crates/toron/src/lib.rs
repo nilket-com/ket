@@ -20,6 +20,7 @@ pub mod server;
 pub mod sql_planner;
 pub mod sql_wire;
 pub mod storage;
+pub mod telemetry;
 pub mod wire;
 
 #[cfg(test)]

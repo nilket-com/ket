@@ -166,6 +166,7 @@ pub struct MetricsRegistry {
 	listener_accepts: ListenerCounters,
 	listener_rejects: ListenerRejectCounters,
 	metrics_scrapes_total: AtomicU64,
+	otlp_spans_dropped_total: AtomicU64,
 	descriptors_loaded: AtomicU64,
 	static_workers_configured: AtomicU64,
 	descriptor_sync_metrics: Arc<DescriptorSyncMetrics>,
@@ -198,6 +199,7 @@ impl MetricsRegistry {
 			listener_accepts: ListenerCounters::default(),
 			listener_rejects: ListenerRejectCounters::default(),
 			metrics_scrapes_total: AtomicU64::new(0),
+			otlp_spans_dropped_total: AtomicU64::new(0),
 			descriptors_loaded: AtomicU64::new(config.descriptors_loaded),
 			static_workers_configured: AtomicU64::new(config.static_workers_configured),
 			descriptor_sync_metrics: config.descriptor_sync_metrics,
@@ -228,6 +230,12 @@ impl MetricsRegistry {
 
 	pub fn record_cancellation(&self, trigger: CancellationTrigger, outcome: CancellationOutcome) {
 		self.cancellation_metrics.record(trigger, outcome);
+	}
+
+	pub fn record_dropped_otlp_span(&self) -> u64 {
+		self.otlp_spans_dropped_total
+			.fetch_add(1, Ordering::Relaxed)
+			.saturating_add(1)
 	}
 
 	pub fn render_text(&self, snapshot: &ReadinessSnapshot) -> String {
@@ -279,6 +287,7 @@ impl MetricsRegistry {
 		self.render_descriptor_refresh_metrics(&mut out);
 		self.render_cancellation_metrics(&mut out);
 		self.render_downstream_cancellation_metrics(&mut out);
+		self.render_telemetry_metrics(&mut out);
 		self.render_sql_connection_metrics(&mut out);
 		self.render_audit_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
@@ -340,6 +349,14 @@ impl MetricsRegistry {
 				));
 			}
 		}
+	}
+
+	fn render_telemetry_metrics(&self, out: &mut String) {
+		out.push_str("# TYPE toron_otlp_spans_dropped_total counter\n");
+		out.push_str(&format!(
+			"toron_otlp_spans_dropped_total {}\n",
+			self.otlp_spans_dropped_total.load(Ordering::Relaxed)
+		));
 	}
 
 	fn render_sql_connection_metrics(&self, out: &mut String) {
