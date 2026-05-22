@@ -9375,12 +9375,14 @@ fn adr068_storage_scan_spans_do_not_change_storage_results() {
 }
 
 #[test]
-fn adr068_no_wendelon_table_query_trace_carrier_in_this_adr() {
+fn adr068_wendelon_table_query_trace_carrier_is_owned_by_wendelon_adr074() {
 	let client =
 		std::fs::read_to_string(wendelon_manifest_dir().join("crates/wendelon-client/src/lib.rs"))
 			.expect("read Wendelon client");
 	let table_schema = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
 		.expect("read Wendelon table schema");
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
 	let options = client
 		.split("pub struct TableQueryOptions")
 		.nth(1)
@@ -9391,8 +9393,13 @@ fn adr068_no_wendelon_table_query_trace_carrier_in_this_adr() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub struct TableQueryResponseMeta").next())
 		.expect("TableQueryRequestMeta block");
-	assert!(!options.contains("trace"));
-	assert!(!meta.contains("trace"));
+	assert!(options.contains("trace_context: TableQueryTraceContext"));
+	assert!(meta.contains("trace_id: [u8; 16]"));
+	assert!(meta.contains("trace_parent_span_id: [u8; 8]"));
+	assert!(
+		!storage.contains("TableQueryTraceContext"),
+		"Toron production population belongs to the consumer ADR, not ADR 074"
+	);
 }
 
 #[test]

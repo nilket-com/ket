@@ -91,7 +91,8 @@ use crate::schema::{
 	RecordRowIndex, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
 	RowCount, RowIdentityPolicy, RuntimeFilterDescriptor, RuntimeFilterDropReason,
 	STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog, SecondaryIndexDescriptor,
-	SecondaryIndexState, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
+	SecondaryIndexState, SlabId, StreamFinalizationRequestMeta, TABLE_QUERY_TRACE_FLAG_KNOWN_MASK,
+	TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED, TABLE_WRITE_MAX_ROWS,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId,
 	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryCancelStatus,
 	TableQueryRequestId, TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptor,
@@ -167,7 +168,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedMutexGuard, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
+use tracing::{Instrument, Span, field};
 
 use crate::network::core::HrftFrame;
 use crate::network::traits::DataRing;
@@ -3877,6 +3878,10 @@ impl WendelonDataServer {
 		metrics().data_ring_query_requests_total.inc();
 		let (meta, bytecode, runtime_filter) = self.decode_table_query_request_frame(&frame)?;
 		let audit_meta = table_query_as_range_query(&meta);
+		let trace_carrier = decode_table_query_trace_carrier(&meta);
+		let trace_started_at = Instant::now();
+		let linked_span = linked_table_query_span(&meta, trace_carrier);
+		let runtime_filter_state = table_query_runtime_filter_state(&runtime_filter);
 		let active_query = match self
 			.table_query_cancellation
 			.register(meta.tenant_id, meta.request_id)
@@ -3887,6 +3892,16 @@ impl WendelonDataServer {
 					query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
 				metrics().observe_table_query_cancellation("cancelled_response");
 				self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+				record_linked_table_query_span_response(
+					&linked_span,
+					&response,
+					runtime_filter_state,
+					"not_planned",
+					"cancelled_before_start",
+					0,
+					0,
+					trace_started_at,
+				);
 				return Ok(self.build_query_response_frame_with_type(
 					MsgType::TABLE_QUERY_RESP,
 					frame.header.stream_id,
@@ -3897,16 +3912,7 @@ impl WendelonDataServer {
 			}
 		};
 		let cancellation_token = active_query.token();
-		let span = tracing::info_span!(
-			"data_ring.table_query.request",
-			stream_id = frame.header.stream_id,
-			tenant_id = meta.tenant_id.get(),
-			request_id = %format!("{:032x}", meta.request_id.get()),
-			table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
-			schema_generation = meta.schema_generation,
-			expected_epoch = meta.expected_epoch,
-			consistency = meta.consistency.0,
-		);
+		let span = local_table_query_span(&meta, frame.header.stream_id, trace_carrier);
 		let plan = match self
 			.prepare_table_query_execution_plan_with_migration_with_cancellation(
 				&meta,
@@ -3931,6 +3937,11 @@ impl WendelonDataServer {
 					&err,
 					"table_query",
 				)?;
+				record_linked_table_query_span_error(
+					&linked_span,
+					runtime_filter_state,
+					trace_started_at,
+				);
 				return Err(err);
 			}
 		};
@@ -3949,6 +3960,16 @@ impl WendelonDataServer {
 				&audit_meta,
 				&plan.encoding_materialize_audit,
 			)?;
+			record_linked_table_query_span_response(
+				&linked_span,
+				&plan.response,
+				runtime_filter_state,
+				table_query_planner_path(&plan),
+				table_query_cancellation_outcome(plan.response.status),
+				0,
+				plan.batches.len(),
+				trace_started_at,
+			);
 			return Ok(self.build_query_response_frame_with_type(
 				MsgType::TABLE_QUERY_RESP,
 				frame.header.stream_id,
@@ -3963,6 +3984,16 @@ impl WendelonDataServer {
 				query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
 			metrics().observe_table_query_cancellation("cancelled_response");
 			self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+			record_linked_table_query_span_response(
+				&linked_span,
+				&response,
+				runtime_filter_state,
+				table_query_planner_path(&plan),
+				"cancelled",
+				0,
+				plan.batches.len(),
+				trace_started_at,
+			);
 			return Ok(self.build_query_response_frame_with_type(
 				MsgType::TABLE_QUERY_RESP,
 				frame.header.stream_id,
@@ -3972,13 +4003,35 @@ impl WendelonDataServer {
 			));
 		}
 		let schema = plan.batches[0].schema();
-		let concatenated = concat_batches(&schema, &plan.batches)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("table query concat: {e}")))?;
+		let concatenated = match concat_batches(&schema, &plan.batches) {
+			Ok(concatenated) => concatenated,
+			Err(err) => {
+				record_linked_table_query_span_error(
+					&linked_span,
+					runtime_filter_state,
+					trace_started_at,
+				);
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!("table query concat: {err}"),
+				));
+			}
+		};
 		if cancellation_token.is_cancelled() {
 			let response =
 				query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
 			metrics().observe_table_query_cancellation("cancelled_response");
 			self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+			record_linked_table_query_span_response(
+				&linked_span,
+				&response,
+				runtime_filter_state,
+				table_query_planner_path(&plan),
+				"cancelled",
+				0,
+				plan.batches.len(),
+				trace_started_at,
+			);
 			return Ok(self.build_query_response_frame_with_type(
 				MsgType::TABLE_QUERY_RESP,
 				frame.header.stream_id,
@@ -3987,13 +4040,35 @@ impl WendelonDataServer {
 				FRAME_FLAG_STREAM_END,
 			));
 		}
-		let arrow_bytes =
-			wire_encode_batch_for_path(&concatenated, NetworkCompressionPath::QueryResponse)?;
+		let arrow_bytes = match wire_encode_batch_for_path(
+			&concatenated,
+			NetworkCompressionPath::QueryResponse,
+		) {
+			Ok(arrow_bytes) => arrow_bytes,
+			Err(err) => {
+				record_linked_table_query_span_error(
+					&linked_span,
+					runtime_filter_state,
+					trace_started_at,
+				);
+				return Err(err);
+			}
+		};
 		if cancellation_token.is_cancelled() {
 			let response =
 				query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
 			metrics().observe_table_query_cancellation("cancelled_response");
 			self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+			record_linked_table_query_span_response(
+				&linked_span,
+				&response,
+				runtime_filter_state,
+				table_query_planner_path(&plan),
+				"cancelled",
+				arrow_bytes.len(),
+				plan.batches.len(),
+				trace_started_at,
+			);
 			return Ok(self.build_query_response_frame_with_type(
 				MsgType::TABLE_QUERY_RESP,
 				frame.header.stream_id,
@@ -4013,6 +4088,16 @@ impl WendelonDataServer {
 			&audit_meta,
 			&plan.encoding_materialize_audit,
 		)?;
+		record_linked_table_query_span_response(
+			&linked_span,
+			&response,
+			runtime_filter_state,
+			table_query_planner_path(&plan),
+			"none",
+			arrow_bytes.len(),
+			plan.batches.len(),
+			trace_started_at,
+		);
 		Ok(self.build_query_response_frame_with_type(
 			MsgType::TABLE_QUERY_RESP,
 			frame.header.stream_id,
@@ -10865,6 +10950,286 @@ enum DecodedRuntimeFilter {
 	DroppedBeforePlanning(RuntimeFilterDropReason),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableQueryTraceCarrier {
+	Absent,
+	Unsampled,
+	Sampled {
+		trace_id: [u8; 16],
+		parent_span_id: [u8; 8],
+	},
+}
+
+const TABLE_QUERY_LINKED_SPAN_DOMAIN: &[u8] = b"wendelon.table_query.span.v1";
+
+fn decode_table_query_trace_carrier(meta: &TableQueryRequestMeta) -> TableQueryTraceCarrier {
+	let flags = meta.trace_flags;
+	let has_trace_id = !all_zero(&meta.trace_id);
+	let has_parent_span_id = !all_zero(&meta.trace_parent_span_id);
+	if flags == 0 {
+		return if has_trace_id || has_parent_span_id {
+			TableQueryTraceCarrier::Unsampled
+		} else {
+			TableQueryTraceCarrier::Absent
+		};
+	}
+	if flags & !TABLE_QUERY_TRACE_FLAG_KNOWN_MASK != 0 {
+		return TableQueryTraceCarrier::Unsampled;
+	}
+	if flags & TABLE_QUERY_TRACE_FLAG_PRESENT == 0 {
+		return TableQueryTraceCarrier::Unsampled;
+	}
+	if flags & TABLE_QUERY_TRACE_FLAG_SAMPLED == 0 {
+		return TableQueryTraceCarrier::Unsampled;
+	}
+	if !has_trace_id || !has_parent_span_id {
+		return TableQueryTraceCarrier::Unsampled;
+	}
+	TableQueryTraceCarrier::Sampled {
+		trace_id: meta.trace_id,
+		parent_span_id: meta.trace_parent_span_id,
+	}
+}
+
+fn linked_table_query_span(
+	meta: &TableQueryRequestMeta,
+	carrier: TableQueryTraceCarrier,
+) -> Option<Span> {
+	let TableQueryTraceCarrier::Sampled {
+		trace_id,
+		parent_span_id,
+	} = carrier
+	else {
+		return None;
+	};
+	let span_id = table_query_linked_span_id(meta, trace_id, parent_span_id);
+	let trace_id = hex_trace_id(&trace_id);
+	let parent_span_id = hex_span_id(&parent_span_id);
+	let span_id = hex_span_id(&span_id);
+	Some(tracing::info_span!(
+		"wendelon.table.query",
+		otel.trace_id = %trace_id,
+		otel.parent_span_id = %parent_span_id,
+		otel.span_id = %span_id,
+		otel.sampled = true,
+		wendelon.table_query.consistency = meta.consistency.0 as i64,
+		wendelon.table_query.row_identity_projection =
+			table_query_row_identity_projection_label(meta.row_identity_projection),
+		wendelon.table_query.stats_pruning_enabled = table_query_stats_pruning_enabled(meta),
+		wendelon.table_query.runtime_filter = field::Empty,
+		wendelon.table_query.planner_path = field::Empty,
+		wendelon.table_query.outcome = field::Empty,
+		wendelon.table_query.cancellation_outcome = field::Empty,
+		wendelon.table_query.rows = field::Empty,
+		wendelon.table_query.arrow_bytes = field::Empty,
+		wendelon.table_query.batch_count = field::Empty,
+		wendelon.table_query.wall_micros = field::Empty,
+		wendelon.error_class = field::Empty,
+	))
+}
+
+fn local_table_query_span(
+	meta: &TableQueryRequestMeta,
+	stream_id: u32,
+	carrier: TableQueryTraceCarrier,
+) -> Span {
+	match carrier {
+		TableQueryTraceCarrier::Unsampled => tracing::info_span!(
+			"data_ring.table_query.request",
+			otel.sampled = false,
+			stream_id = stream_id,
+			tenant_id = meta.tenant_id.get(),
+			request_id = %format!("{:032x}", meta.request_id.get()),
+			table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+			schema_generation = meta.schema_generation,
+			expected_epoch = meta.expected_epoch,
+			consistency = meta.consistency.0,
+		),
+		TableQueryTraceCarrier::Absent | TableQueryTraceCarrier::Sampled { .. } => {
+			tracing::info_span!(
+				"data_ring.table_query.request",
+				stream_id = stream_id,
+				tenant_id = meta.tenant_id.get(),
+				request_id = %format!("{:032x}", meta.request_id.get()),
+				table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+				schema_generation = meta.schema_generation,
+				expected_epoch = meta.expected_epoch,
+				consistency = meta.consistency.0,
+			)
+		}
+	}
+}
+
+fn record_linked_table_query_span_response(
+	span: &Option<Span>,
+	response: &QueryResponseMeta,
+	runtime_filter: &'static str,
+	planner_path: &'static str,
+	cancellation_outcome: &'static str,
+	arrow_bytes: usize,
+	batch_count: usize,
+	started_at: Instant,
+) {
+	let Some(span) = span else {
+		return;
+	};
+	span.record("wendelon.table_query.runtime_filter", runtime_filter);
+	span.record("wendelon.table_query.planner_path", planner_path);
+	span.record("wendelon.table_query.outcome", response.status.as_str());
+	span.record(
+		"wendelon.table_query.cancellation_outcome",
+		cancellation_outcome,
+	);
+	span.record("wendelon.table_query.rows", saturated_i64(response.rows));
+	span.record(
+		"wendelon.table_query.arrow_bytes",
+		saturated_i64(arrow_bytes),
+	);
+	span.record(
+		"wendelon.table_query.batch_count",
+		saturated_i64(batch_count),
+	);
+	span.record(
+		"wendelon.table_query.wall_micros",
+		saturated_i64(started_at.elapsed().as_micros()),
+	);
+	if response.status != ReadStatus::OK {
+		span.record(
+			"wendelon.error_class",
+			table_query_error_class(response.status),
+		);
+	}
+}
+
+fn record_linked_table_query_span_error(
+	span: &Option<Span>,
+	runtime_filter: &'static str,
+	started_at: Instant,
+) {
+	let Some(span) = span else {
+		return;
+	};
+	span.record("wendelon.table_query.runtime_filter", runtime_filter);
+	span.record("wendelon.table_query.planner_path", "error");
+	span.record("wendelon.table_query.outcome", "internal_error");
+	span.record("wendelon.table_query.cancellation_outcome", "none");
+	span.record("wendelon.table_query.rows", 0_i64);
+	span.record("wendelon.table_query.arrow_bytes", 0_i64);
+	span.record("wendelon.table_query.batch_count", 0_i64);
+	span.record(
+		"wendelon.table_query.wall_micros",
+		saturated_i64(started_at.elapsed().as_micros()),
+	);
+	span.record("wendelon.error_class", "internal");
+}
+
+fn table_query_linked_span_id(
+	meta: &TableQueryRequestMeta,
+	trace_id: [u8; 16],
+	parent_span_id: [u8; 8],
+) -> [u8; 8] {
+	let mut hasher = blake3::Hasher::new();
+	hasher.update(TABLE_QUERY_LINKED_SPAN_DOMAIN);
+	hasher.update(&trace_id);
+	hasher.update(&parent_span_id);
+	hasher.update(meta.request_id.as_bytes());
+	let mut span_id = [0u8; 8];
+	span_id.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+	nonzero_span_id(span_id)
+}
+
+fn table_query_runtime_filter_state(runtime_filter: &DecodedRuntimeFilter) -> &'static str {
+	match runtime_filter {
+		DecodedRuntimeFilter::Absent => "absent",
+		DecodedRuntimeFilter::Decoded(_) => "decoded",
+		DecodedRuntimeFilter::DroppedBeforePlanning(reason) => reason.as_str(),
+	}
+}
+
+fn table_query_planner_path(plan: &QueryExecutionPlan) -> &'static str {
+	if plan.secondary_index_access_plan.is_some() {
+		"secondary_index"
+	} else {
+		"table_scan"
+	}
+}
+
+fn table_query_cancellation_outcome(status: ReadStatus) -> &'static str {
+	if status == ReadStatus::QUERY_CANCELLED {
+		"cancelled"
+	} else {
+		"none"
+	}
+}
+
+fn table_query_error_class(status: ReadStatus) -> &'static str {
+	match status {
+		ReadStatus::OK => "none",
+		ReadStatus::QUERY_INVALID_PROGRAM => "invalid_program",
+		ReadStatus::QUERY_BUDGET_EXCEEDED => "budget_exceeded",
+		ReadStatus::QUERY_CANCELLED => "cancelled",
+		ReadStatus::TABLE_DESCRIPTOR_EVOLVED => "descriptor_evolved",
+		ReadStatus::AUTHORIZATION_FAILED => "authorization_failed",
+		ReadStatus::BACKPRESSURED => "backpressured",
+		ReadStatus::RETENTION_EXPIRED => "retention_expired",
+		ReadStatus::MIGRATION_INCOMPLETE => "migration_incomplete",
+		ReadStatus::NOT_LEADER | ReadStatus::EPOCH_STALE => "retryable_topology",
+		_ => "read_status",
+	}
+}
+
+fn table_query_row_identity_projection_label(value: u8) -> &'static str {
+	match RowIdentityProjection::from_u8(value) {
+		Some(RowIdentityProjection::None) => "none",
+		Some(RowIdentityProjection::Append) => "append",
+		None => "unknown",
+	}
+}
+
+fn table_query_stats_pruning_enabled(meta: &TableQueryRequestMeta) -> bool {
+	meta._pad[0] & crate::schema::QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING == 0
+}
+
+fn saturated_i64(value: impl TryInto<i64>) -> i64 {
+	value.try_into().unwrap_or(i64::MAX)
+}
+
+fn all_zero(bytes: &[u8]) -> bool {
+	bytes.iter().all(|byte| *byte == 0)
+}
+
+fn nonzero_span_id(mut span_id: [u8; 8]) -> [u8; 8] {
+	if span_id.iter().all(|byte| *byte == 0) {
+		span_id[7] = 1;
+	}
+	span_id
+}
+
+fn hex_trace_id(trace_id: &[u8; 16]) -> String {
+	hex_bytes(trace_id)
+}
+
+fn hex_span_id(span_id: &[u8; 8]) -> String {
+	hex_bytes(span_id)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+	let mut out = String::with_capacity(bytes.len() * 2);
+	for byte in bytes {
+		out.push(hex_digit(byte >> 4));
+		out.push(hex_digit(byte & 0x0f));
+	}
+	out
+}
+
+fn hex_digit(nibble: u8) -> char {
+	match nibble {
+		0..=9 => char::from(b'0' + nibble),
+		10..=15 => char::from(b'a' + nibble - 10),
+		_ => unreachable!("nibble is masked to 4 bits"),
+	}
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeFilterApplication {
 	descriptor: RuntimeFilterDescriptor,
@@ -15670,6 +16035,12 @@ mod tests {
 	use std::io::{Read, Seek, SeekFrom};
 	use std::panic::AssertUnwindSafe;
 	use std::sync::atomic::{AtomicU64, Ordering};
+	use tracing::field::{Field as TracingField, Visit};
+	use tracing::span::{Attributes, Id};
+	use tracing_subscriber::layer::Context;
+	use tracing_subscriber::prelude::*;
+	use tracing_subscriber::registry::LookupSpan;
+	use tracing_subscriber::{Layer, Registry};
 
 	fn n(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
@@ -15705,6 +16076,107 @@ mod tests {
 		fn now_ms(&self) -> u64 {
 			self.now_ms.load(Ordering::SeqCst)
 		}
+	}
+
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	struct CapturedSpan {
+		name: String,
+		parent: Option<String>,
+		fields: Vec<(String, String)>,
+	}
+
+	#[derive(Clone)]
+	struct CapturingSpanLayer {
+		spans: Arc<StdMutex<Vec<CapturedSpan>>>,
+	}
+
+	impl<S> Layer<S> for CapturingSpanLayer
+	where
+		S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+	{
+		fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+			let _ = id;
+			let mut visitor = CapturedFieldVisitor::default();
+			attrs.record(&mut visitor);
+			let parent = attrs
+				.parent()
+				.and_then(|parent| ctx.span(parent))
+				.map(|span| span.metadata().name().to_string())
+				.or_else(|| {
+					if attrs.is_contextual() {
+						ctx.lookup_current()
+							.map(|span| span.metadata().name().to_string())
+					} else {
+						None
+					}
+				});
+			self.spans
+				.lock()
+				.expect("captured span mutex")
+				.push(CapturedSpan {
+					name: attrs.metadata().name().to_string(),
+					parent,
+					fields: visitor.fields,
+				});
+		}
+	}
+
+	#[derive(Default)]
+	struct CapturedFieldVisitor {
+		fields: Vec<(String, String)>,
+	}
+
+	impl CapturedFieldVisitor {
+		fn push(&mut self, field: &TracingField, value: String) {
+			self.fields.push((field.name().to_string(), value));
+		}
+	}
+
+	impl Visit for CapturedFieldVisitor {
+		fn record_bool(&mut self, field: &TracingField, value: bool) {
+			self.push(field, value.to_string());
+		}
+
+		fn record_i64(&mut self, field: &TracingField, value: i64) {
+			self.push(field, value.to_string());
+		}
+
+		fn record_u64(&mut self, field: &TracingField, value: u64) {
+			self.push(field, value.to_string());
+		}
+
+		fn record_str(&mut self, field: &TracingField, value: &str) {
+			self.push(field, value.to_string());
+		}
+
+		fn record_debug(&mut self, field: &TracingField, value: &dyn std::fmt::Debug) {
+			self.push(field, format!("{value:?}"));
+		}
+	}
+
+	fn capture_new_spans(run: impl FnOnce()) -> Vec<CapturedSpan> {
+		let spans = Arc::new(StdMutex::new(Vec::new()));
+		let subscriber = Registry::default().with(CapturingSpanLayer {
+			spans: spans.clone(),
+		});
+		tracing::subscriber::with_default(subscriber, run);
+		Arc::try_unwrap(spans)
+			.expect("subscriber dropped")
+			.into_inner()
+			.expect("captured span mutex")
+	}
+
+	fn captured_span<'a>(spans: &'a [CapturedSpan], name: &str) -> &'a CapturedSpan {
+		spans
+			.iter()
+			.find(|span| span.name == name)
+			.unwrap_or_else(|| panic!("missing captured span {name} in {spans:?}"))
+	}
+
+	fn captured_field<'a>(span: &'a CapturedSpan, name: &str) -> Option<&'a str> {
+		span.fields
+			.iter()
+			.find_map(|(field, value)| (field == name).then_some(value.as_str()))
 	}
 
 	fn typed_table_schema() -> Schema {
@@ -16040,6 +16512,10 @@ mod tests {
 			runtime_filter_len: 0,
 			as_of_hlc,
 			request_id: TableQueryRequestId::from_u128(1),
+			trace_id: [0; 16],
+			trace_parent_span_id: [0; 8],
+			trace_flags: 0,
+			_trace_pad: [0; 7],
 		}
 	}
 
@@ -16362,6 +16838,166 @@ mod tests {
 			DecodedRuntimeFilter::DroppedBeforePlanning(RuntimeFilterDropReason::DecodeFailed) => {}
 			other => panic!("expected decode_failed advisory drop, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn table_query_trace_carrier_absent_unsampled_and_sampled_decode() {
+		let descriptor = typed_table_descriptor();
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), 0);
+		assert_eq!(
+			decode_table_query_trace_carrier(&meta),
+			TableQueryTraceCarrier::Absent
+		);
+
+		meta.trace_flags = TABLE_QUERY_TRACE_FLAG_PRESENT;
+		assert_eq!(
+			decode_table_query_trace_carrier(&meta),
+			TableQueryTraceCarrier::Unsampled
+		);
+
+		let trace_id = [0x11; 16];
+		let parent_span_id = [0x22; 8];
+		meta.trace_id = trace_id;
+		meta.trace_parent_span_id = parent_span_id;
+		meta.trace_flags = TABLE_QUERY_TRACE_FLAG_PRESENT | TABLE_QUERY_TRACE_FLAG_SAMPLED;
+		assert_eq!(
+			decode_table_query_trace_carrier(&meta),
+			TableQueryTraceCarrier::Sampled {
+				trace_id,
+				parent_span_id
+			}
+		);
+	}
+
+	#[test]
+	fn table_query_trace_carrier_malformed_fails_open_unsampled() {
+		let descriptor = typed_table_descriptor();
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), 0);
+		meta.trace_flags = TABLE_QUERY_TRACE_FLAG_PRESENT | TABLE_QUERY_TRACE_FLAG_SAMPLED;
+		meta.trace_parent_span_id = [0x22; 8];
+		assert_eq!(
+			decode_table_query_trace_carrier(&meta),
+			TableQueryTraceCarrier::Unsampled
+		);
+
+		meta.trace_id = [0x11; 16];
+		meta.trace_parent_span_id = [0; 8];
+		assert_eq!(
+			decode_table_query_trace_carrier(&meta),
+			TableQueryTraceCarrier::Unsampled
+		);
+
+		meta.trace_parent_span_id = [0x22; 8];
+		meta.trace_flags = TABLE_QUERY_TRACE_FLAG_PRESENT | TABLE_QUERY_TRACE_FLAG_SAMPLED | 0x80;
+		assert_eq!(
+			decode_table_query_trace_carrier(&meta),
+			TableQueryTraceCarrier::Unsampled
+		);
+
+		meta.trace_flags = TABLE_QUERY_TRACE_FLAG_SAMPLED;
+		assert_eq!(
+			decode_table_query_trace_carrier(&meta),
+			TableQueryTraceCarrier::Unsampled
+		);
+	}
+
+	#[test]
+	fn table_query_linked_span_id_is_derived_nonzero_per_attempt() {
+		let descriptor = typed_table_descriptor();
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), 0);
+		let trace_id = [0x11; 16];
+		let parent_span_id = [0x22; 8];
+		let first = table_query_linked_span_id(&meta, trace_id, parent_span_id);
+		assert!(first.iter().any(|byte| *byte != 0));
+		assert_eq!(
+			first,
+			table_query_linked_span_id(&meta, trace_id, parent_span_id)
+		);
+		meta.request_id = TableQueryRequestId::from_u128(2);
+		assert_ne!(
+			first,
+			table_query_linked_span_id(&meta, trace_id, parent_span_id)
+		);
+		assert_ne!(first, parent_span_id);
+	}
+
+	#[test]
+	fn sampled_trace_carrier_emits_sanitized_linked_span_and_sibling_raw_span() {
+		let descriptor = typed_table_descriptor();
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), 0);
+		meta.trace_id = [0x11; 16];
+		meta.trace_parent_span_id = [0x22; 8];
+		meta.trace_flags = TABLE_QUERY_TRACE_FLAG_PRESENT | TABLE_QUERY_TRACE_FLAG_SAMPLED;
+		let carrier = decode_table_query_trace_carrier(&meta);
+
+		let spans = capture_new_spans(|| {
+			let linked = linked_table_query_span(&meta, carrier).expect("sampled linked span");
+			let raw = local_table_query_span(&meta, 99, carrier);
+			drop(raw);
+			drop(linked);
+		});
+
+		let linked = captured_span(&spans, "wendelon.table.query");
+		assert_eq!(linked.parent, None);
+		for required in [
+			"otel.trace_id",
+			"otel.parent_span_id",
+			"otel.span_id",
+			"otel.sampled",
+			"wendelon.table_query.consistency",
+			"wendelon.table_query.row_identity_projection",
+			"wendelon.table_query.stats_pruning_enabled",
+		] {
+			assert!(
+				captured_field(linked, required).is_some(),
+				"missing linked field {required}: {linked:?}"
+			);
+		}
+		assert_eq!(captured_field(linked, "otel.sampled"), Some("true"));
+		for forbidden in [
+			"tenant_id",
+			"table_object_id",
+			"request_id",
+			"physical_descriptor_fingerprint",
+			"query_id",
+			"peer",
+			"sql",
+		] {
+			assert_eq!(
+				captured_field(linked, forbidden),
+				None,
+				"linked span leaked {forbidden}: {linked:?}"
+			);
+		}
+
+		let raw = captured_span(&spans, "data_ring.table_query.request");
+		assert_eq!(raw.parent, None);
+		assert!(captured_field(raw, "tenant_id").is_some());
+		assert!(captured_field(raw, "request_id").is_some());
+		assert!(captured_field(raw, "table_object_id").is_some());
+		assert_eq!(captured_field(raw, "otel.sampled"), None);
+	}
+
+	#[test]
+	fn unsampled_trace_carrier_suppresses_linked_and_raw_root_export() {
+		let descriptor = typed_table_descriptor();
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), 0);
+		meta.trace_flags = TABLE_QUERY_TRACE_FLAG_PRESENT;
+		let carrier = decode_table_query_trace_carrier(&meta);
+		assert!(linked_table_query_span(&meta, carrier).is_none());
+
+		let spans = capture_new_spans(|| {
+			let raw = local_table_query_span(&meta, 100, carrier);
+			drop(raw);
+		});
+
+		assert!(
+			spans.iter().all(|span| span.name != "wendelon.table.query"),
+			"unsampled carrier must not create linked span: {spans:?}"
+		);
+		let raw = captured_span(&spans, "data_ring.table_query.request");
+		assert_eq!(raw.parent, None);
+		assert_eq!(captured_field(raw, "otel.sampled"), Some("false"));
 	}
 
 	#[test]
@@ -21483,6 +22119,10 @@ mod tests {
 			runtime_filter_len: 0,
 			as_of_hlc: hlc(0, 0, 0),
 			request_id: TableQueryRequestId::from_u128(2),
+			trace_id: [0; 16],
+			trace_parent_span_id: [0; 8],
+			trace_flags: 0,
+			_trace_pad: [0; 7],
 		};
 		let mut bad_query_meta = query_meta;
 		bad_query_meta.physical_descriptor_fingerprint = [0xFF; 32];

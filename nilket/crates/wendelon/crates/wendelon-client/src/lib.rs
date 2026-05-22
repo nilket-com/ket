@@ -35,8 +35,9 @@ use wendelon::network::wire;
 use wendelon::schema::{
 	ClientWriteId, FinalizationMarker, FrameHeader, HybridTimestamp, Identity, MsgType, NodeId,
 	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus,
-	TableDeleteRowsRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
-	TableQueryRequestMeta, TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
+	TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED, TableDeleteRowsRequestMeta,
+	TableQueryCancelResponseMeta, TableQueryRequestId, TableQueryRequestMeta,
+	TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
 	encode_table_schema_descriptor_v1, encode_table_write_row_count, read_key_schema,
 	write_payload_schema,
 };
@@ -161,6 +162,18 @@ pub struct TableQueryOptions {
 	pub stats_pruning_enabled: bool,
 	pub physical_descriptor_fingerprint: Option<PhysicalDescriptorFingerprint>,
 	pub row_identity: RowIdentityProjection,
+	pub trace_context: TableQueryTraceContext,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableQueryTraceContext {
+	#[default]
+	Absent,
+	Unsampled,
+	Sampled {
+		trace_id: [u8; 16],
+		parent_span_id: [u8; 8],
+	},
 }
 
 impl Default for TableQueryOptions {
@@ -172,6 +185,7 @@ impl Default for TableQueryOptions {
 			stats_pruning_enabled: true,
 			physical_descriptor_fingerprint: None,
 			row_identity: RowIdentityProjection::None,
+			trace_context: TableQueryTraceContext::Absent,
 		}
 	}
 }
@@ -969,6 +983,7 @@ impl Client {
 		if !options.stats_pruning_enabled {
 			pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
 		}
+		let trace_tail = table_query_trace_tail(options.trace_context);
 		let request = TableQueryRequest {
 			meta: TableQueryRequestMeta {
 				min_hlc: options.min_hlc.unwrap_or_else(zero_hlc),
@@ -985,6 +1000,10 @@ impl Client {
 				runtime_filter_len,
 				as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
 				request_id: TableQueryRequestId::ZERO,
+				trace_id: trace_tail.trace_id,
+				trace_parent_span_id: trace_tail.parent_span_id,
+				trace_flags: trace_tail.flags,
+				_trace_pad: [0; 7],
 			},
 			descriptor: descriptor.clone(),
 			pbc,
@@ -1206,6 +1225,7 @@ fn table_query_request(
 	if !options.stats_pruning_enabled {
 		pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
 	}
+	let trace_tail = table_query_trace_tail(options.trace_context);
 	Ok(TableQueryRequest {
 		meta: TableQueryRequestMeta {
 			min_hlc: options.min_hlc.unwrap_or_else(zero_hlc),
@@ -1221,12 +1241,46 @@ fn table_query_request(
 			runtime_filter_len,
 			as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
 			request_id: TableQueryRequestId::ZERO,
+			trace_id: trace_tail.trace_id,
+			trace_parent_span_id: trace_tail.parent_span_id,
+			trace_flags: trace_tail.flags,
+			_trace_pad: [0; 7],
 		},
 		descriptor: descriptor.clone(),
 		pbc,
 		runtime_filter,
 		row_identity: options.row_identity,
 	})
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableQueryTraceTail {
+	trace_id: [u8; 16],
+	parent_span_id: [u8; 8],
+	flags: u8,
+}
+
+fn table_query_trace_tail(context: TableQueryTraceContext) -> TableQueryTraceTail {
+	match context {
+		TableQueryTraceContext::Absent => TableQueryTraceTail {
+			trace_id: [0; 16],
+			parent_span_id: [0; 8],
+			flags: 0,
+		},
+		TableQueryTraceContext::Unsampled => TableQueryTraceTail {
+			trace_id: [0; 16],
+			parent_span_id: [0; 8],
+			flags: TABLE_QUERY_TRACE_FLAG_PRESENT,
+		},
+		TableQueryTraceContext::Sampled {
+			trace_id,
+			parent_span_id,
+		} => TableQueryTraceTail {
+			trace_id,
+			parent_span_id,
+			flags: TABLE_QUERY_TRACE_FLAG_PRESENT | TABLE_QUERY_TRACE_FLAG_SAMPLED,
+		},
+	}
 }
 
 fn bootstrap_snapshot(bootstrap: &[BootstrapPeer]) -> ClusterStatusWire {
@@ -1400,5 +1454,39 @@ mod tests {
 		);
 
 		assert!(is_table_descriptor_evolved_error(&err));
+	}
+
+	#[test]
+	fn table_query_options_default_trace_context_absent() {
+		assert_eq!(
+			TableQueryOptions::default().trace_context,
+			TableQueryTraceContext::Absent
+		);
+	}
+
+	#[test]
+	fn table_query_trace_tail_encodes_absent_unsampled_and_sampled() {
+		let absent = table_query_trace_tail(TableQueryTraceContext::Absent);
+		assert_eq!(absent.trace_id, [0; 16]);
+		assert_eq!(absent.parent_span_id, [0; 8]);
+		assert_eq!(absent.flags, 0);
+
+		let unsampled = table_query_trace_tail(TableQueryTraceContext::Unsampled);
+		assert_eq!(unsampled.trace_id, [0; 16]);
+		assert_eq!(unsampled.parent_span_id, [0; 8]);
+		assert_eq!(unsampled.flags, TABLE_QUERY_TRACE_FLAG_PRESENT);
+
+		let trace_id = [0x11; 16];
+		let parent_span_id = [0x22; 8];
+		let sampled = table_query_trace_tail(TableQueryTraceContext::Sampled {
+			trace_id,
+			parent_span_id,
+		});
+		assert_eq!(sampled.trace_id, trace_id);
+		assert_eq!(sampled.parent_span_id, parent_span_id);
+		assert_eq!(
+			sampled.flags,
+			TABLE_QUERY_TRACE_FLAG_PRESENT | TABLE_QUERY_TRACE_FLAG_SAMPLED
+		);
 	}
 }

@@ -1,8 +1,10 @@
 # Wendelon ADR 074: Table-Query Trace Continuation (Producer)
 
-**Status:** Promoted (plan) — **2-of-3 (Codex, Claude)** on the producer/consumer
-split and local-span preservation; Gemini's parallel iter-4 held the
-fold-Toron / sanitized-only-replacement line (recorded in Council History).
+**Status:** Implemented 2026-05-22 — evidence in
+`plans/impl/074_table_query_trace_continuation_evidence.md`. Promotion was
+**2-of-3 (Codex, Claude)** on the producer/consumer split and local-span
+preservation; Gemini's parallel iter-4 held the fold-Toron /
+sanitized-only-replacement line (recorded in Council History).
 **Seed:** Toron ADR 068 §D18 — Toron OTLP tracing stopped at `toron.storage.scan`
 because `wendelon-client::TableQueryOptions` and `TableQueryRequestMeta` had no
 trace carrier. 074 is the Wendelon-owned producer that closes the cross-ring gap.

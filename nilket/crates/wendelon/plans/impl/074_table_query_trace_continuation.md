@@ -1,6 +1,7 @@
 # Impl Plan 074: Table-Query Trace Continuation (Producer)
 
-**Status:** Promoted, paired with
+**Status:** Implemented 2026-05-22; evidence recorded in
+`plans/impl/074_table_query_trace_continuation_evidence.md`. Paired with
 `plans/adr/074_table_query_trace_continuation.md`.
 **Posture:** Producer-only Wendelon ADR — carry Toron's trace context through
 `TABLE_QUERY_REQ` via a fixed-binary tail on `TableQueryRequestMeta`, and have

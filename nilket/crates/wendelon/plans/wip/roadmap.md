@@ -195,7 +195,7 @@ ran in. Only workspace-shared Interior substrate (`tls-pki`,
 
 ## Forward sequence
 
-**Promoted (plan) — ADR 074 Table-Query Trace Continuation
+**Implemented — ADR 074 Table-Query Trace Continuation
 (cross-ring trace-continuation producer).** The Wendelon-owned half of
 Toron ADR 068: 068 instrumented Toron OTLP traces but **stopped at
 `toron.storage.scan`** because `wendelon-client::TableQueryOptions` /
@@ -230,7 +230,8 @@ parallel iter-4 held fold-the-Toron-change / sanitized-only replacement,
 resolved against by precedent and the Wendelon-local-observability
 regression. **14 decisions, 16 architecture + 3 convention/meta guards,
 16 fixtures.** Plans: `plans/adr/074_table_query_trace_continuation.md` +
-`plans/impl/074_table_query_trace_continuation.md`. **Next consumer:**
+`plans/impl/074_table_query_trace_continuation.md`; evidence:
+`plans/impl/074_table_query_trace_continuation_evidence.md`. **Next consumer:**
 the Toron telemetry consumer ADR (Toron sequence) — populate
 `TableQueryOptions.trace_context` from `ScanRequest` with
 `toron.storage.scan` as parent (cross-referenced, not owned here).

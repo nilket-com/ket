@@ -193,6 +193,11 @@ impl From<TableQueryRequestId> for [u8; 16] {
 	}
 }
 
+pub const TABLE_QUERY_TRACE_FLAG_PRESENT: u8 = 0x01;
+pub const TABLE_QUERY_TRACE_FLAG_SAMPLED: u8 = 0x02;
+pub const TABLE_QUERY_TRACE_FLAG_KNOWN_MASK: u8 =
+	TABLE_QUERY_TRACE_FLAG_PRESENT | TABLE_QUERY_TRACE_FLAG_SAMPLED;
+
 // ============================================================
 //  TABLE WRITE WIRE METADATA AND ADMISSION
 // ============================================================
@@ -315,9 +320,16 @@ pub struct TableQueryRequestMeta {
 	pub as_of_hlc: HybridTimestamp, // 16 bytes
 	/// Client-generated attempt identity for TABLE_QUERY_CANCEL_REQ.
 	pub request_id: TableQueryRequestId, // 16 bytes
+	/// Binary trace id propagated by Wendelon ADR 074. All zeros when absent.
+	pub trace_id: [u8; 16], // 16 bytes
+	/// Binary parent span id propagated by Wendelon ADR 074. All zeros when absent.
+	pub trace_parent_span_id: [u8; 8], //  8 bytes
+	/// Bit 0 = carrier present, bit 1 = sampled.
+	pub trace_flags: u8, //  1 byte
+	pub _trace_pad: [u8; 7],            //  7 bytes alignment
 }
 
-const _: () = assert!(std::mem::size_of::<TableQueryRequestMeta>() == 136);
+const _: () = assert!(std::mem::size_of::<TableQueryRequestMeta>() == 168);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
@@ -4119,7 +4131,7 @@ mod tests {
 		assert_eq!(TableQueryRequestId::from_u128(42).get(), 42);
 		assert!(TableQueryRequestId::ZERO.is_zero());
 
-		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 136);
+		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 168);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, min_hlc), 0);
 		assert_eq!(
 			std::mem::offset_of!(TableQueryRequestMeta, expected_epoch),
@@ -4154,6 +4166,16 @@ mod tests {
 		);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, as_of_hlc), 104);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, request_id), 120);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, trace_id), 136);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, trace_parent_span_id),
+			152
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, trace_flags),
+			160
+		);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _trace_pad), 161);
 		assert_eq!(std::mem::size_of::<TableQueryCancelRequestMeta>(), 24);
 		assert_eq!(
 			std::mem::offset_of!(TableQueryCancelRequestMeta, tenant_id),

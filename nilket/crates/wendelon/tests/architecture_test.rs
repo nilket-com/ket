@@ -6639,7 +6639,7 @@ fn adr073_table_query_request_id_is_required_fixed_meta() {
 		"pub struct TableQueryCancelStatus",
 	);
 	assert!(meta.contains("pub request_id: TableQueryRequestId"));
-	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 136"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 168"));
 	assert!(schema.contains("offset_of!(TableQueryRequestMeta, request_id), 120"));
 	assert!(client.contains("TABLE_QUERY_REQ request_id must be non-zero"));
 	assert!(data_server.contains("TABLE_QUERY_REQ request_id must be non-zero"));
@@ -6966,6 +6966,305 @@ fn adr073_prior_wendelon_protocol_and_architecture_guards_continue_to_pass() {
 		"fn test_adr068_fsst_row_safe_estimator_guards",
 		"fn test_adr067_row_safe_fsst_guards",
 		"fn test_adr066_fsst_evaluator_guards",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior Wendelon guard {required}"
+		);
+	}
+}
+
+fn adr074_trace_handler_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"async fn handle_table_query",
+		"async fn handle_table_query_cancel",
+	)
+}
+
+fn adr074_linked_span_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"fn linked_table_query_span",
+		"fn local_table_query_span",
+	)
+}
+
+fn adr074_trace_carrier_region(data_server: &str) -> &str {
+	source_region(
+		data_server,
+		"enum TableQueryTraceCarrier",
+		"#[derive(Clone, Debug)]\nstruct RuntimeFilterApplication",
+	)
+}
+
+#[test]
+fn adr074_table_query_options_trace_context_is_absent_by_default() {
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	assert!(client.contains("pub trace_context: TableQueryTraceContext"));
+	assert!(client.contains("trace_context: TableQueryTraceContext::Absent"));
+	assert!(client.contains("pub enum TableQueryTraceContext"));
+	assert!(client.contains("#[default]"));
+}
+
+#[test]
+fn adr074_table_query_trace_context_has_absent_unsampled_sampled_states() {
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	let enum_region = source_region(
+		&client,
+		"pub enum TableQueryTraceContext",
+		"impl Default for TableQueryOptions",
+	);
+	for required in [
+		"Absent",
+		"Unsampled",
+		"Sampled",
+		"trace_id: [u8; 16]",
+		"parent_span_id: [u8; 8]",
+	] {
+		assert!(enum_region.contains(required), "missing {required}");
+	}
+}
+
+#[test]
+fn adr074_table_query_trace_carrier_is_fixed_binary_not_traceparent() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let meta = source_region(
+		&schema,
+		"pub struct TableQueryRequestMeta",
+		"pub struct TableQueryCancelStatus",
+	);
+	assert!(meta.contains("pub trace_id: [u8; 16]"));
+	assert!(meta.contains("pub trace_parent_span_id: [u8; 8]"));
+	assert!(meta.contains("pub trace_flags: u8"));
+	assert!(!meta.contains("traceparent"));
+	assert!(!meta.contains("tracestate"));
+}
+
+#[test]
+fn adr074_table_query_meta_widens_tail_without_extension_or_v1_sidecar() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 168"));
+	for forbidden in [
+		"TableQueryRequestMetaV1",
+		"TableQueryRequestMetaExtension",
+		"ComputeTraceContextV1",
+	] {
+		assert!(
+			!schema.contains(forbidden),
+			"forbidden trace carrier {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr074_trace_meta_offsets_are_pinned() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	for required in [
+		"offset_of!(TableQueryRequestMeta, trace_id), 136",
+		"offset_of!(TableQueryRequestMeta, trace_parent_span_id)",
+		"152",
+		"offset_of!(TableQueryRequestMeta, trace_flags)",
+		"160",
+		"offset_of!(TableQueryRequestMeta, _trace_pad), 161",
+		"161",
+	] {
+		assert!(schema.contains(required), "missing offset pin {required}");
+	}
+}
+
+#[test]
+fn adr074_wendelon_span_id_is_derived_nonzero_from_request_attempt() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let region = adr074_trace_carrier_region(&data_server);
+	assert!(region.contains("TABLE_QUERY_LINKED_SPAN_DOMAIN"));
+	assert!(region.contains("b\"wendelon.table_query.span.v1\""));
+	assert!(region.contains("hasher.update(&trace_id)"));
+	assert!(region.contains("hasher.update(&parent_span_id)"));
+	assert!(region.contains("hasher.update(meta.request_id.as_bytes())"));
+	assert!(region.contains("fn nonzero_span_id"));
+	assert!(region.contains("span_id[7] = 1"));
+}
+
+#[test]
+fn adr074_linked_span_uses_explicit_otel_context_fields() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let linked = adr074_linked_span_region(&data_server);
+	for required in [
+		"\"wendelon.table.query\"",
+		"otel.trace_id",
+		"otel.parent_span_id",
+		"otel.span_id",
+		"otel.sampled = true",
+	] {
+		assert!(
+			linked.contains(required),
+			"missing linked span field {required}"
+		);
+	}
+}
+
+#[test]
+fn adr074_unsampled_carrier_bypasses_root_sampling() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let region = adr074_trace_carrier_region(&data_server);
+	assert!(region.contains("TableQueryTraceCarrier::Unsampled"));
+	assert!(region.contains("otel.sampled = false"));
+	assert!(!region.contains("should_sample_root_span"));
+}
+
+#[test]
+fn adr074_sampled_emits_sanitized_linked_span_local_raw_span_preserved() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let handler = adr074_trace_handler_region(&data_server);
+	assert!(handler.contains("let linked_span = linked_table_query_span(&meta, trace_carrier);"));
+	assert!(data_server.contains("\"wendelon.table.query\""));
+	assert!(data_server.contains("\"data_ring.table_query.request\""));
+}
+
+#[test]
+fn adr074_local_raw_span_is_never_nested_under_linked_span() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let handler = adr074_trace_handler_region(&data_server);
+	assert!(handler.contains("let linked_span = linked_table_query_span(&meta, trace_carrier);"));
+	assert!(handler.contains(
+		"let span = local_table_query_span(&meta, frame.header.stream_id, trace_carrier);"
+	));
+	assert!(handler.contains(".instrument(span)"));
+	assert!(!handler.contains(".instrument(linked_span"));
+	assert!(!handler.contains("linked_span.enter()"));
+}
+
+#[test]
+fn adr074_linked_span_has_no_tenant_table_request_descriptor_query_attrs() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let linked = adr074_linked_span_region(&data_server);
+	for forbidden in [
+		"tenant_id",
+		"table_object_id",
+		"request_id",
+		"physical_descriptor_fingerprint",
+		"descriptor",
+		"query_id",
+		"peer",
+		"sql",
+	] {
+		assert!(
+			!linked.contains(forbidden),
+			"linked span leaks forbidden raw identity marker {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr074_malformed_trace_carrier_is_fail_open_unsampled() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let region = adr074_trace_carrier_region(&data_server);
+	assert!(region.contains("flags & !TABLE_QUERY_TRACE_FLAG_KNOWN_MASK"));
+	assert!(region.contains("flags & TABLE_QUERY_TRACE_FLAG_PRESENT == 0"));
+	assert!(region.contains("!has_trace_id || !has_parent_span_id"));
+	assert!(
+		region
+			.matches("return TableQueryTraceCarrier::Unsampled")
+			.count() >= 4
+	);
+}
+
+#[test]
+fn adr074_no_new_shared_observability_telemetry_seam() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	assert!(!data_server.contains("observability::telemetry::"));
+	assert!(!client.contains("observability::telemetry::"));
+	assert!(!data_server.contains("TraceContextV1"));
+}
+
+#[test]
+fn adr074_absent_context_preserves_wendelon_otlp_behavior_fixtures() {
+	let fixtures = read_workspace("crates/wendelon/tests/table_query_telemetry.rs");
+	assert!(fixtures.contains("table_query_options_default_trace_context_absent"));
+	assert!(fixtures.contains("table_query_meta_absent_roundtrips_zero_flags"));
+	assert!(read_workspace("crates/wendelon/tests/otlp_http_export.rs").contains("otlp.test.span"));
+	assert!(read_workspace("crates/wendelon/tests/otlp_grpc_export.rs").contains("grpc.test.span"));
+}
+
+#[test]
+fn adr074_no_toron_production_change() {
+	let mut violations = Vec::new();
+	walk_dir(&workspace_root().join("crates/toron/src"), &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let content = fs::read_to_string(path).unwrap();
+		for forbidden in [
+			"TableQueryTraceContext",
+			"trace_parent_span_id",
+			"TABLE_QUERY_TRACE_FLAG",
+			"wendelon.table.query",
+		] {
+			if content.contains(forbidden) {
+				violations.push(format!("{} contains {forbidden}", path.display()));
+			}
+		}
+	});
+	assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn adr074_no_control_ring_sql_wire_audit_cancellation_or_non_table_query_drift() {
+	let core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	assert!(!core.contains("TRACE_REQ"));
+	assert!(!control.contains("TableQueryTrace"));
+	assert!(!data_server.contains("SQL_TRACE"));
+	assert!(!data_server.contains("CDC_TRACE"));
+	assert!(data_server.contains("fn decode_table_query_trace_carrier"));
+}
+
+#[test]
+fn adr074_new_trace_surface_is_brand_clean_no_v1_suffix() {
+	let combined = format!(
+		"{}\n{}\n{}",
+		read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs"),
+		read_workspace("crates/wendelon/src/schema/table.rs"),
+		read_workspace("crates/wendelon/src/network/data_server.rs")
+	);
+	let identifiers = rust_identifiers_from_source("adr074 combined surface", &combined);
+	assert!(has_rust_identifier(&identifiers, "TableQueryTraceContext"));
+	for forbidden in [
+		"TableQueryTraceContextV1",
+		"WendelonTableQueryTraceContext",
+		"TableQueryRequestMetaV1",
+	] {
+		assert!(
+			!has_rust_identifier(&identifiers, forbidden),
+			"new trace surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr074_carrier_does_not_transmit_compute_trace_context_v1() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	let options_region = source_region(
+		&client,
+		"pub struct TableQueryOptions",
+		"pub struct WriteReceipt",
+	);
+	assert!(!schema.contains("ComputeTraceContextV1"));
+	assert!(!options_region.contains("ComputeTraceContextV1"));
+}
+
+#[test]
+fn adr074_prior_wendelon_telemetry_and_table_query_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr073_table_query_request_id_is_required_fixed_meta",
+		"fn adr073_prior_wendelon_protocol_and_architecture_guards_continue_to_pass",
+		"fn adr072_prior_adr_guards_continue_to_pass",
+		"fn adr071_wendelon_inspect_branch_exists",
 	] {
 		assert!(
 			architecture.contains(required),
