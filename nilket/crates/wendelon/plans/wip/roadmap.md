@@ -195,6 +195,47 @@ ran in. Only workspace-shared Interior substrate (`tls-pki`,
 
 ## Forward sequence
 
+**Promoted (plan) — ADR 074 Table-Query Trace Continuation
+(cross-ring trace-continuation producer).** The Wendelon-owned half of
+Toron ADR 068: 068 instrumented Toron OTLP traces but **stopped at
+`toron.storage.scan`** because `wendelon-client::TableQueryOptions` /
+`TableQueryRequestMeta` had no trace carrier. 074 carries Toron's trace
+context through `TABLE_QUERY_REQ` via a **fixed binary tail** widening
+`TableQueryRequestMeta` (136 → 168 B, prefix offsets pinned; flags
+`0x01` present / `0x02` sampled — the 073 no-extension/no-`*V1` posture;
+no traceparent string, no `ComputeTraceContextV1` on the wire). A
+**three-state** `TableQueryTraceContext` (`Absent` / `Unsampled` /
+`Sampled{trace_id, parent_span_id}`) carries the ADR 068 worker
+no-resample rule to the ring boundary: `Unsampled` is authoritative
+(Wendelon must not root-sample), `Absent` keeps direct-client behavior.
+Wendelon **derives** its child span id
+(`blake3("wendelon.table_query.span.v1" ‖ trace_id ‖ parent_span_id ‖
+request_id)[0..8]`, nonzero) and **consumes the ADR 068 explicit-context
+seam** (`otel.{trace_id,parent_span_id,span_id,sampled}`, adopted +
+stripped) — **no new `observability::telemetry` seam**. Privacy: a
+**sanitized** `wendelon.table.query` linked span (bounded classes + raw
+magnitudes, no SQL/tenant/table/request-id), while the existing raw
+`data_ring.table_query.request` span is **preserved as a Wendelon-local,
+unlinked** span (siblings in different traces, never nested — so raw ids
+never enter Toron's trace). Malformed carriers **fail open** to
+unsampled (never reject `TABLE_QUERY_REQ`); `Absent` is
+behavior-equivalent (the unchanged Wendelon OTLP HTTP/gRPC fixtures are
+the regression net). **Producer-only — no Toron production change.**
+Drafted in the Toron cross-ring council (working "ADR 069"), relocated +
+renumbered to the Wendelon sequence at promotion per
+`ring-product-placement.md` + the ADR 071/072/073 precedent. Council:
+**2-of-3 (Codex, Claude)** — on the producer/consumer split (072/073
+precedent) and local-span preservation (the iter-3 red-team); Gemini's
+parallel iter-4 held fold-the-Toron-change / sanitized-only replacement,
+resolved against by precedent and the Wendelon-local-observability
+regression. **14 decisions, 16 architecture + 3 convention/meta guards,
+16 fixtures.** Plans: `plans/adr/074_table_query_trace_continuation.md` +
+`plans/impl/074_table_query_trace_continuation.md`. **Next consumer:**
+the Toron telemetry consumer ADR (Toron sequence) — populate
+`TableQueryOptions.trace_context` from `ScanRequest` with
+`toron.storage.scan` as parent (cross-referenced, not owned here).
+Gemini's `UPDATE`-without-`WHERE` is the parallel **Toron ADR 069**.
+
 **Implemented — ADR 073 Table-Query Request Cancellation
 Producer Contract (cross-ring cancellation producer).** The
 deferred half of Toron ADR 059's honesty boundary: 059 made Toron
