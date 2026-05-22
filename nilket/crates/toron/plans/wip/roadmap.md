@@ -4866,6 +4866,34 @@ along with the forward-sequence rewrite.
   `FullTable` profile hint, resolved to the existing `QueryProfileHint::Scan`).
   Placement: Toron compute-ring DML. Migration:
   `plans/impl/070_update_without_where.md`.
+- **ADR 071 — Worker + Observability-Access Audit Expansion.**
+  Promoted (plan). The two ADR 066 deferrals: **worker task-lifecycle audit**
+  (`toron.worker.task.{started,completed,failed,cancelled}`, started-after-accept,
+  exactly-one terminal, bounded identity + `error_class`) and **observability
+  `ready`/`metrics` access audit** (bounded endpoint/auth/status/method/outcome
+  classes), over the existing `observability::audit` substrate. **Strictly
+  fail-open** (the decisive call): routes new events through the 066 `try_send`
+  emitter (`audit.rs:774`) — a worker task / `ready`-`metrics` response /
+  TLS-accept **never** fails on audit enqueue/sink failure (drops counted, sink
+  failure → degraded readiness). **`audit.fail_closed` stays a separate
+  evidence-gated ADR** (it changes emission semantics) — not smuggled in here.
+  Disabled-by-default `ToronWorker` emitter handle (**no task-wire change**;
+  fixture workers stay audit-free); `/health` **unaudited**; observability audit
+  lives in the Toron network layer (shared `observability::{http,audit}` stay
+  **policy-free**); records only the **admitted monitor principal**
+  (`actor_key_id=monitor:<principal>` via the `ListenerRole::Observability` SAN
+  admission) — **no raw SAN/DN/IP/cert material**; process-local chains
+  (`toron-n-<u32>`, 066 config/format/metrics). **Prior-guard reconciliation:**
+  retarget the 066 worker-no-audit guard (runtime worker audit now required) while
+  keeping the fixture-worker / SQL-wire / Wendelon / nilket /
+  shared-observability-policy-free guards. Final D-set: **14 decisions, 19 +
+  convention/meta guards,
+  14 fixtures**. Council: **grounded 2-of-3 (Codex, Claude) on fail-open** —
+  Gemini iter-5 held a fail-closed posture ("audit emission a prerequisite for
+  task/request completion"), resolved against by the implemented 066 `try_send`
+  emitter and the separately-deferred `audit.fail_closed`. Placement: Toron
+  compute-ring audit consumer. Migration:
+  `plans/impl/071_worker_observability_audit_expansion.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4950,7 +4978,56 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 070 promoted; ADR 071 candidates
+### ADR 071 promoted; ADR 072 candidates
+
+ADR 071 selected and promoted **Worker + Observability-Access Audit Expansion** —
+the two ADR 066 deferrals (worker task-lifecycle audit + observability
+`ready`/`metrics` access audit), over the existing `observability::audit`
+substrate, completing the Toron compute-ring audit arc. Final D-set: **14
+decisions, 19 + convention/meta guards, 14 fixtures**. Council: **grounded 2-of-3
+(Codex, Claude) on fail-open**.
+
+**Key decisions / invariants:**
+
+- **Strictly fail-open** (the decisive call) — new worker/access events route
+  through the 066 `try_send` emitter; a worker task / `ready`-`metrics` response /
+  TLS-accept never fails on audit enqueue/sink failure. **`audit.fail_closed`
+  (gating completion on audit success) stays a separate evidence-gated ADR** — it
+  changes emission semantics and was *not* smuggled into this coverage ADR.
+  Gemini iter-5 held the fail-closed posture; resolved against by the implemented
+  066 emitter (`audit.rs:774 try_send`) + the deferral framing.
+- **Worker audit** = disabled-by-default `ToronWorker` emitter handle (no
+  task-wire change; fixture workers stay audit-free); started-after-accept,
+  exactly-one terminal (one-shot recorder), bounded identity + `error_class`
+  (from `QueryError`/`TaskFailureKind`), no SQL/plan/table/descriptor/value/payload.
+- **Observability access** in the Toron network layer (shared
+  `observability::{http,audit}` stay policy-free); `/health` unaudited; records
+  only the **admitted monitor principal** (`actor_key_id=monitor:<principal>`),
+  **no raw SAN/DN/IP/cert material**.
+- Process-local chains (`toron-n-<u32>`, 066 config/format/metrics); **retarget
+  the 066 worker-no-audit guard** (runtime worker audit now required) keeping the
+  fixture-worker / SQL-wire / Wendelon / nilket / shared-observability-policy-free
+  guards.
+
+The migration is materialized in
+`plans/impl/071_worker_observability_audit_expansion.md`.
+
+**ADR 072 candidates:**
+
+- **Typed table-mutation trace continuation** — the sharpest open observability
+  defect (Toron `WriteRequest`/`DeleteRowsRequest.trace_context` flow but are
+  discarded at the wendelon-client metas). **Wendelon-home producer** (≈075, the
+  074 pattern) + a later Toron consumer; carry the iter-2 refinements (DELETE is
+  1:1 with its request; bulk writes share one `toron.storage.write` parent).
+- **`audit.fail_closed`** — the deferred high-assurance emission-mode ADR
+  (evidence-gated; gates request/task completion on audit success), now that 071
+  has the full fail-open coverage in place.
+- Carried: composite-PK (cross-ring schema-V2 storage/identity — Wendelon
+  `validate_primary_key` is exact-one-column); fragmentable bulk DML (distributed
+  write-back — the DML source already distributes); DDL widening / `ALTER` /
+  `UNIQUE`; sqlparser-0.62; JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 070 promoted; ADR 071 candidates (HISTORICAL)
 
 ADR 070 selected and promoted **Toron `UPDATE` without `WHERE` (PK-table symmetry
 restoration)** — the SQL/DML return after the cross-ring observability arc. It
