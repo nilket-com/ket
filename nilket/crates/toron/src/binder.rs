@@ -245,7 +245,7 @@ impl<'a> Binder<'a> {
 					predicate,
 					returning,
 				} => {
-					self.bind_update(table, assignments, predicate, returning.as_ref())
+					self.bind_update(table, assignments, predicate.as_ref(), returning.as_ref())
 						.await
 				}
 				LogicalPlan::Insert {
@@ -472,7 +472,7 @@ impl<'a> Binder<'a> {
 		&self,
 		table: &TableRef,
 		assignments: &[(String, Expr)],
-		predicate: &Expr,
+		predicate: Option<&Expr>,
 		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
 		let binding = self.catalog.resolve_table(table).await?;
@@ -531,31 +531,14 @@ impl<'a> Binder<'a> {
 			output_names.push(Some(field.name().clone()));
 		}
 
-		let bound_predicate =
-			bind_expr_program(std::slice::from_ref(predicate), &schema, self.config)?;
-		require_single_boolean_root(&bound_predicate, "UPDATE WHERE")?;
-		let mut scan = scan_plan(binding.clone(), None);
-		let profile_hint =
-			scan_profile_hint(&bound_predicate, &scan).unwrap_or(QueryProfileHint::Scan);
-		apply_scan_profile_hint(&mut scan, Some(profile_hint));
-		let (filter_input, disposition) = match compile_pbc(&bound_predicate) {
-			Some(program) => {
-				let (input, attached) = attach_pbc_program(scan, program);
-				let disposition = if attached {
-					FilterDisposition::FullyPushed
-				} else {
-					FilterDisposition::EvaluateInToron
-				};
-				(input, disposition)
+		let scan = scan_plan(binding.clone(), None);
+		let (project_input, profile_hint) = match predicate {
+			Some(predicate) => {
+				bind_update_source_for_predicate(scan, predicate, &schema, self.config)?
 			}
-			None => (scan, FilterDisposition::EvaluateInToron),
+			None => bind_update_source_for_all_rows(scan),
 		};
-		let filtered = ExecutionPlan::Filter {
-			input: Box::new(filter_input),
-			predicate: bound_predicate,
-			disposition,
-		};
-		let exprs = bind_expr_program(&source_exprs, &filtered.schema(), self.config)?;
+		let exprs = bind_expr_program(&source_exprs, &project_input.schema(), self.config)?;
 		let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
 
 		Ok(ExecutionPlan::Update {
@@ -564,7 +547,7 @@ impl<'a> Binder<'a> {
 			fingerprint: binding.fingerprint,
 			schema,
 			source: Box::new(ExecutionPlan::Project {
-				input: Box::new(filtered),
+				input: Box::new(project_input),
 				exprs,
 				output_schema,
 			}),
@@ -615,6 +598,42 @@ impl<'a> Binder<'a> {
 			output_schema: join_schema(kind, &left_scope.schema, &right_scope.schema),
 		})
 	}
+}
+
+fn bind_update_source_for_predicate(
+	mut scan: ExecutionPlan,
+	predicate: &Expr,
+	schema: &SchemaRef,
+	config: &PlannerConfig,
+) -> Result<(ExecutionPlan, QueryProfileHint), BindingError> {
+	let bound_predicate = bind_expr_program(std::slice::from_ref(predicate), schema, config)?;
+	require_single_boolean_root(&bound_predicate, "UPDATE WHERE")?;
+	let profile_hint = scan_profile_hint(&bound_predicate, &scan).unwrap_or(QueryProfileHint::Scan);
+	apply_scan_profile_hint(&mut scan, Some(profile_hint));
+	let (filter_input, disposition) = match compile_pbc(&bound_predicate) {
+		Some(program) => {
+			let (input, attached) = attach_pbc_program(scan, program);
+			let disposition = if attached {
+				FilterDisposition::FullyPushed
+			} else {
+				FilterDisposition::EvaluateInToron
+			};
+			(input, disposition)
+		}
+		None => (scan, FilterDisposition::EvaluateInToron),
+	};
+	Ok((
+		ExecutionPlan::Filter {
+			input: Box::new(filter_input),
+			predicate: bound_predicate,
+			disposition,
+		},
+		profile_hint,
+	))
+}
+
+fn bind_update_source_for_all_rows(scan: ExecutionPlan) -> (ExecutionPlan, QueryProfileHint) {
+	(scan, QueryProfileHint::Scan)
 }
 
 fn bind_returning_projection(

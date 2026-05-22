@@ -48,7 +48,7 @@ fn planner_accepts_update_where() {
 	assert_eq!(assignments.len(), 2);
 	assert_eq!(assignments[0].0, "note");
 	assert_eq!(assignments[1].0, "amount");
-	assert!(matches!(predicate, Expr::Eq(_, _)));
+	assert!(matches!(predicate, Some(Expr::Eq(_, _))));
 }
 
 #[test]
@@ -64,8 +64,43 @@ fn planner_accepts_update_returning_star() {
 }
 
 #[test]
-fn planner_rejects_update_without_where() {
-	assert_frontend_error("UPDATE people SET note = 'new'", "WHERE");
+fn planner_accepts_update_without_where() {
+	let plan = SqlPlanner::new()
+		.plan("UPDATE people SET note = 'new'")
+		.expect("plan update without WHERE");
+
+	let LogicalPlan::Update {
+		table,
+		assignments,
+		predicate,
+		..
+	} = plan
+	else {
+		panic!("expected update plan");
+	};
+
+	assert_eq!(table, TableRef::new("people"));
+	assert_eq!(assignments.len(), 1);
+	assert_eq!(assignments[0].0, "note");
+	assert!(predicate.is_none());
+}
+
+#[test]
+fn planner_accepts_update_without_where_returning() {
+	let plan = SqlPlanner::new()
+		.plan("UPDATE people SET note = 'new' RETURNING *")
+		.expect("plan update without WHERE returning");
+
+	let LogicalPlan::Update {
+		predicate,
+		returning,
+		..
+	} = plan
+	else {
+		panic!("expected update plan");
+	};
+	assert!(predicate.is_none());
+	assert!(returning.is_some());
 }
 
 #[test]
@@ -155,6 +190,20 @@ async fn update_returning_still_rejects_append_only_table() {
 }
 
 #[tokio::test]
+async fn binder_rejects_update_without_where_on_append_only_table() {
+	let catalog = append_only_catalog().await;
+	let plan = SqlPlanner::new()
+		.plan("UPDATE people SET note = 'new'")
+		.expect("plan update");
+
+	let err = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("append-only table should reject update");
+
+	assert_binding_error(err, "UPDATE requires a PRIMARY KEY table");
+}
+
+#[tokio::test]
 async fn binder_rejects_update_on_unsupported_identity_table() {
 	let mut catalog = MockCatalog::new();
 	let schema = people_schema(true);
@@ -195,11 +244,25 @@ async fn binder_rejects_primary_key_assignment() {
 }
 
 #[tokio::test]
+async fn binder_rejects_update_without_where_primary_key_assignment() {
+	let (catalog, _) = pk_catalog(people_schema(true)).await;
+	let plan = SqlPlanner::new()
+		.plan("UPDATE people SET id = 2")
+		.expect("plan update");
+
+	let err = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("primary key update should reject");
+
+	assert_binding_error(err, "PRIMARY KEY");
+}
+
+#[tokio::test]
 async fn binder_update_pk_equality_uses_point_read_profile() {
 	let (catalog, _) = pk_catalog(people_schema(true)).await;
 	let bound = bind_update(&catalog, "UPDATE people SET note = 'new' WHERE id = 1").await;
 
-	let scan = update_source_scan(&bound);
+	let scan = update_where_source_scan(&bound);
 	let ExecutionPlan::Scan {
 		row_identity,
 		profile_hint,
@@ -219,11 +282,31 @@ async fn binder_update_non_pk_predicate_uses_scan_profile() {
 	let (catalog, _) = pk_catalog(people_schema(true)).await;
 	let bound = bind_update(&catalog, "UPDATE people SET note = 'new' WHERE amount > 10").await;
 
-	let scan = update_source_scan(&bound);
+	let scan = update_where_source_scan(&bound);
 	let ExecutionPlan::Scan { profile_hint, .. } = scan else {
 		panic!("expected update source scan, got {scan:?}");
 	};
 	assert_eq!(*profile_hint, QueryProfileHint::Scan);
+}
+
+#[tokio::test]
+async fn binder_update_without_where_uses_full_scan_profile_no_filter() {
+	let (catalog, _) = pk_catalog(people_schema(true)).await;
+	let bound = bind_update(&catalog, "UPDATE people SET note = 'new'").await;
+
+	let scan = update_all_rows_source_scan(&bound);
+	let ExecutionPlan::Scan {
+		row_identity,
+		profile_hint,
+		primary_key_columns,
+		..
+	} = scan
+	else {
+		panic!("expected update source scan, got {scan:?}");
+	};
+	assert_eq!(*row_identity, RowIdentityProjection::None);
+	assert_eq!(*profile_hint, QueryProfileHint::Scan);
+	assert_eq!(primary_key_columns.as_slice(), &[ColumnOrdinal(0)]);
 }
 
 #[tokio::test]
@@ -295,6 +378,48 @@ async fn update_writes_full_replacement_row() {
 }
 
 #[tokio::test]
+async fn update_all_rows_writes_full_table_replacement() {
+	let fixture = UpdateFixture::new(people_schema(true)).await;
+	fixture
+		.seed(people_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, Some("old")), (2, 20, Some("older"))],
+		))
+		.await;
+
+	let affected = fixture
+		.execute("UPDATE people SET amount = amount + 5, note = 'new'")
+		.await
+		.expect("update all rows");
+
+	assert_eq!(affected, 2);
+	let payload = fixture.writer.single_payload();
+	assert_eq!(payload.schema().as_ref(), fixture.binding.schema.as_ref());
+	assert_eq!(int32_values(&payload, 0), vec![1, 2]);
+	assert_eq!(int64_values(&payload, 1), vec![15, 25]);
+	assert_eq!(
+		string_values(&payload, 2),
+		vec![Some("new".to_string()), Some("new".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn update_all_rows_zero_rows_table_is_no_op() {
+	let fixture = UpdateFixture::new(people_schema(true)).await;
+	fixture
+		.seed(people_batch(fixture.binding.schema.clone(), &[]))
+		.await;
+
+	let affected = fixture
+		.execute("UPDATE people SET note = 'new'")
+		.await
+		.expect("update empty table");
+
+	assert_eq!(affected, 0);
+	assert_eq!(fixture.writer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn update_returning_emits_post_update_values() {
 	let fixture = UpdateFixture::new(people_schema(true)).await;
 	fixture
@@ -329,6 +454,46 @@ async fn update_returning_emits_post_update_values() {
 }
 
 #[tokio::test]
+async fn update_all_rows_returning_emits_post_update_rows() {
+	let fixture = UpdateFixture::new(people_schema(true)).await;
+	fixture
+		.seed(people_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, Some("old")), (2, 20, Some("older"))],
+		))
+		.await;
+
+	let results = fixture
+		.coordinator
+		.execute_query(
+			&fixture
+				.planner
+				.plan(
+					"UPDATE people SET amount = amount + 5, note = 'new' RETURNING id, amount, note",
+				)
+				.expect("plan update returning"),
+			None,
+		)
+		.await
+		.expect("update returning");
+
+	assert_eq!(results.len(), 1);
+	let batch = &results[0];
+	assert_eq!(int32_values(batch, 0), vec![1, 2]);
+	assert_eq!(int64_values(batch, 1), vec![15, 25]);
+	assert_eq!(
+		string_values(batch, 2),
+		vec![Some("new".to_string()), Some("new".to_string())]
+	);
+	let payload = fixture.writer.single_payload();
+	assert_eq!(int64_values(&payload, 1), vec![15, 25]);
+	assert_eq!(
+		string_values(&payload, 2),
+		vec![Some("new".to_string()), Some("new".to_string())]
+	);
+}
+
+#[tokio::test]
 async fn update_assignments_read_original_row_values() {
 	let fixture = UpdateFixture::new(swap_schema()).await;
 	fixture
@@ -347,6 +512,27 @@ async fn update_assignments_read_original_row_values() {
 }
 
 #[tokio::test]
+async fn update_all_rows_respects_simultaneous_assignment() {
+	let fixture = UpdateFixture::new(swap_schema()).await;
+	fixture
+		.seed(swap_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, 20), (2, 30, 40)],
+		))
+		.await;
+
+	let affected = fixture
+		.execute("UPDATE people SET a = b, b = a")
+		.await
+		.expect("swap update all rows");
+
+	assert_eq!(affected, 2);
+	let payload = fixture.writer.single_payload();
+	assert_eq!(int32_values(&payload, 1), vec![20, 40]);
+	assert_eq!(int32_values(&payload, 2), vec![10, 30]);
+}
+
+#[tokio::test]
 async fn update_null_for_non_nullable_column_fails_before_write() {
 	let fixture = UpdateFixture::new(people_schema(false)).await;
 	fixture
@@ -358,6 +544,29 @@ async fn update_null_for_non_nullable_column_fails_before_write() {
 
 	let err = fixture
 		.execute("UPDATE people SET note = NULL WHERE id = 1")
+		.await
+		.expect_err("non-null target should fail before write");
+
+	assert!(
+		err.to_string()
+			.contains("UPDATE produced NULL for non-nullable column: note"),
+		"unexpected error: {err}"
+	);
+	assert_eq!(fixture.writer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn update_all_rows_null_for_non_nullable_column_fails_before_write() {
+	let fixture = UpdateFixture::new(people_schema(false)).await;
+	fixture
+		.seed(people_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, Some("old"))],
+		))
+		.await;
+
+	let err = fixture
+		.execute("UPDATE people SET note = NULL")
 		.await
 		.expect_err("non-null target should fail before write");
 
@@ -388,6 +597,27 @@ async fn update_type_coercion_matches_insert_select_policy() {
 	let payload = fixture.writer.single_payload();
 	assert_eq!(payload.schema().field(1).data_type(), &DataType::Int64);
 	assert_eq!(int64_values(&payload, 1), vec![7]);
+}
+
+#[tokio::test]
+async fn update_all_rows_type_coercion_matches_insert_select_policy() {
+	let fixture = UpdateFixture::new(people_schema(true)).await;
+	fixture
+		.seed(people_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, Some("old")), (2, 20, Some("older"))],
+		))
+		.await;
+
+	let affected = fixture
+		.execute("UPDATE people SET amount = 7")
+		.await
+		.expect("update all rows with numeric coercion");
+
+	assert_eq!(affected, 2);
+	let payload = fixture.writer.single_payload();
+	assert_eq!(payload.schema().field(1).data_type(), &DataType::Int64);
+	assert_eq!(int64_values(&payload, 1), vec![7, 7]);
 }
 
 #[tokio::test]
@@ -439,6 +669,24 @@ async fn update_descriptor_evolved_invalidates_without_retry() {
 async fn fragmenter_rejects_direct_update_fragmentation() {
 	let (catalog, binding) = pk_catalog(people_schema(true)).await;
 	let bound = bind_update(&catalog, "UPDATE people SET note = 'new' WHERE id = 1").await;
+
+	let err = fragment_plan(
+		bound,
+		FragmentPlanConfig::new(
+			QueryId::from_u128(1),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect_err("update should not fragment");
+
+	assert_eq!(binding.primary_key_columns.len(), 1);
+	assert_eq!(err, FragmentError::UpdateNotFragmentable);
+}
+
+#[tokio::test]
+async fn fragmenter_rejects_direct_update_without_where_fragmentation() {
+	let (catalog, binding) = pk_catalog(people_schema(true)).await;
+	let bound = bind_update(&catalog, "UPDATE people SET note = 'new'").await;
 
 	let err = fragment_plan(
 		bound,
@@ -575,24 +823,33 @@ async fn append_only_catalog() -> MockCatalog {
 	catalog
 }
 
-fn update_source_scan(plan: &ExecutionPlan) -> &ExecutionPlan {
+fn update_where_source_scan(plan: &ExecutionPlan) -> &ExecutionPlan {
 	let ExecutionPlan::Update { source, .. } = plan else {
 		panic!("expected update plan, got {plan:?}");
 	};
-	first_scan(source)
+	let ExecutionPlan::Project { input, .. } = source.as_ref() else {
+		panic!("expected update source project, got {source:?}");
+	};
+	let ExecutionPlan::Filter { input, .. } = input.as_ref() else {
+		panic!("expected update WHERE source filter, got {input:?}");
+	};
+	let ExecutionPlan::Scan { .. } = input.as_ref() else {
+		panic!("expected update WHERE source scan, got {input:?}");
+	};
+	input.as_ref()
 }
 
-fn first_scan(plan: &ExecutionPlan) -> &ExecutionPlan {
-	match plan {
-		ExecutionPlan::Scan { .. } => plan,
-		ExecutionPlan::Filter { input, .. }
-		| ExecutionPlan::Project { input, .. }
-		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. } => first_scan(input),
-		ExecutionPlan::Join { left, .. } => first_scan(left),
-		other => panic!("expected scan-bearing plan, got {other:?}"),
-	}
+fn update_all_rows_source_scan(plan: &ExecutionPlan) -> &ExecutionPlan {
+	let ExecutionPlan::Update { source, .. } = plan else {
+		panic!("expected update plan, got {plan:?}");
+	};
+	let ExecutionPlan::Project { input, .. } = source.as_ref() else {
+		panic!("expected update source project, got {source:?}");
+	};
+	let ExecutionPlan::Scan { .. } = input.as_ref() else {
+		panic!("expected no-WHERE update source scan, got {input:?}");
+	};
+	input.as_ref()
 }
 
 fn affected_count(results: &[RecordBatch]) -> i64 {

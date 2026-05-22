@@ -737,8 +737,8 @@ impl SqlPlanner {
 			let assignments = lower_update_assignments(self, assignments)?;
 			let predicate = selection
 				.as_ref()
-				.ok_or_else(|| unsupported("UPDATE requires a WHERE clause"))
-				.and_then(|expr| self.lower_expr(expr))?;
+				.map(|expr| self.lower_expr(expr))
+				.transpose()?;
 			let returning = self.lower_returning_projection(returning.as_deref())?;
 			Ok(LogicalPlan::Update {
 				table: target,

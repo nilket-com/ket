@@ -13929,7 +13929,6 @@ fn adr062_update_surface_is_present_under_pk_update_contract_after_adr063() {
 	assert!(planner.contains("Statement::Update { .. } => self.lower_update(&ast[0])"));
 	assert!(logical.contains("Update {"));
 	assert!(execution.contains("Update {"));
-	assert!(planner.contains("UPDATE requires a WHERE clause"));
 	assert!(planner.contains("lower_returning_projection(returning.as_deref())"));
 	assert!(binder.contains("UPDATE requires a PRIMARY KEY table"));
 	assert!(binder.contains("UPDATE cannot modify the PRIMARY KEY column"));
@@ -14095,7 +14094,7 @@ fn adr063_unsupported_statement_text_lists_update() {
 }
 
 #[test]
-fn adr063_update_requires_where_and_delete_semantics_unchanged() {
+fn adr063_update_where_requirement_is_retargeted_after_adr070() {
 	let planner =
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
 	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
@@ -14109,8 +14108,10 @@ fn adr063_update_requires_where_and_delete_semantics_unchanged() {
 		.expect("lower_delete")
 		.1;
 
-	assert!(lower_update.contains("UPDATE requires a WHERE clause"));
 	assert!(lower_update.contains("selection"));
+	assert!(lower_update.contains(".map(|expr| self.lower_expr(expr))"));
+	assert!(lower_update.contains(".transpose()?"));
+	assert!(!lower_update.contains("UPDATE requires a WHERE clause"));
 	assert!(lower_delete.contains("let predicate = selection"));
 	assert!(lower_delete.contains(".map(|expr| self.lower_expr(expr))"));
 	assert!(!lower_delete.contains("DELETE requires a WHERE clause"));
@@ -14205,7 +14206,7 @@ fn adr063_logical_update_shape_is_name_based() {
 
 	assert!(update.contains("table: TableRef"));
 	assert!(update.contains("assignments: Vec<(String, Expr)>"));
-	assert!(update.contains("predicate: Expr"));
+	assert!(update.contains("predicate: Option<Expr>"));
 }
 
 #[test]
@@ -14319,15 +14320,16 @@ fn adr063_update_source_scan_does_not_request_append_identity() {
 fn adr063_update_reuses_existing_point_read_profile() {
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
-	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
-		.into_iter()
-		.next()
-		.expect("bind_update")
-		.1;
+	let predicate_helper =
+		brace_blocks_after_marker(&binder, "fn bind_update_source_for_predicate")
+			.into_iter()
+			.next()
+			.expect("bind_update_source_for_predicate")
+			.1;
 
-	assert!(bind_update.contains("scan_profile_hint(&bound_predicate, &scan)"));
-	assert!(bind_update.contains("apply_scan_profile_hint(&mut scan, Some(profile_hint))"));
-	assert!(!bind_update.contains("update_profile_hint"));
+	assert!(predicate_helper.contains("scan_profile_hint(&bound_predicate, &scan)"));
+	assert!(predicate_helper.contains("apply_scan_profile_hint(&mut scan, Some(profile_hint))"));
+	assert!(!predicate_helper.contains("update_profile_hint"));
 }
 
 #[test]
@@ -14435,18 +14437,11 @@ fn adr063_no_wendelon_wire_storage_or_descriptor_change() {
 }
 
 #[test]
-fn adr063_no_transaction_lock_compare_swap_or_no_where_surface() {
-	let planner =
-		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+fn adr063_no_transaction_lock_compare_swap_surface_after_adr070() {
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
-	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
-		.into_iter()
-		.next()
-		.expect("lower_update")
-		.1;
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -14461,7 +14456,6 @@ fn adr063_no_transaction_lock_compare_swap_or_no_where_surface() {
 			.expect("coordinator update arm end");
 	let update_arm = &coordinator[update_start..update_end];
 
-	assert!(lower_update.contains("UPDATE requires a WHERE clause"));
 	for forbidden in [
 		"CompareSwap",
 		"compare_swap",
@@ -15017,6 +15011,412 @@ fn adr064_prior_adr030_to_063_guards_continue_to_pass_except_retarget() {
 		architecture_test
 			.contains("adr063_sql_response_is_complete_only_for_non_returning_dml_after_adr064")
 	);
+}
+
+#[test]
+fn adr070_update_logical_predicate_is_optional() {
+	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+	let update = brace_blocks_after_marker(&logical, "Update {")
+		.into_iter()
+		.next()
+		.expect("logical update")
+		.1;
+
+	assert!(update.contains("predicate: Option<Expr>"));
+	assert!(!update.contains("predicate: Expr,"));
+}
+
+#[test]
+fn adr070_planner_accepts_update_without_where() {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("UPDATE people SET note = 'new'")
+		.expect("no-WHERE UPDATE should plan");
+
+	let LogicalPlan::Update { predicate, .. } = plan else {
+		panic!("expected update plan");
+	};
+	assert!(predicate.is_none());
+}
+
+#[test]
+fn adr070_planner_lowers_missing_update_selection_to_none() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
+		.into_iter()
+		.next()
+		.expect("lower_update")
+		.1;
+
+	assert!(lower_update.contains("let predicate = selection"));
+	assert!(lower_update.contains(".map(|expr| self.lower_expr(expr))"));
+	assert!(lower_update.contains(".transpose()?"));
+	assert!(!lower_update.contains("UPDATE requires a WHERE clause"));
+}
+
+#[test]
+fn adr070_update_without_where_is_not_lowered_as_true_literal() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let all_rows = brace_blocks_after_marker(&binder, "fn bind_update_source_for_all_rows")
+		.into_iter()
+		.next()
+		.expect("bind_update_source_for_all_rows")
+		.1;
+
+	for forbidden in [
+		"Expr::Literal",
+		"ScalarValue::Boolean",
+		"compile_pbc",
+		"attach_pbc_program",
+		"ExecutionPlan::Filter",
+		"FilterDisposition",
+	] {
+		assert!(
+			!all_rows.contains(forbidden),
+			"no-WHERE UPDATE helper gained {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr070_update_without_where_builds_project_over_scan_without_filter() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+	let all_rows = brace_blocks_after_marker(&binder, "fn bind_update_source_for_all_rows")
+		.into_iter()
+		.next()
+		.expect("bind_update_source_for_all_rows")
+		.1;
+	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
+		.expect("read update tests");
+
+	assert!(bind_update.contains("bind_update_source_for_all_rows(scan)"));
+	assert!(bind_update.contains("ExecutionPlan::Project"));
+	assert!(bind_update.contains("input: Box::new(project_input)"));
+	assert!(!all_rows.contains("ExecutionPlan::Filter"));
+	assert!(update_test.contains("binder_update_without_where_uses_full_scan_profile_no_filter"));
+	assert!(update_test.contains("update_all_rows_source_scan"));
+}
+
+#[test]
+fn adr070_update_without_where_scan_uses_no_append_identity() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+	let scan_plan = brace_blocks_after_marker(&binder, "fn scan_plan")
+		.into_iter()
+		.next()
+		.expect("scan_plan")
+		.1;
+
+	assert!(bind_update.contains("scan_plan(binding.clone(), None)"));
+	assert!(scan_plan.contains("RowIdentityProjection::None"));
+	assert!(!bind_update.contains("RowIdentityProjection::Append"));
+}
+
+#[test]
+fn adr070_update_without_where_profile_hint_is_scan() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let all_rows = brace_blocks_after_marker(&binder, "fn bind_update_source_for_all_rows")
+		.into_iter()
+		.next()
+		.expect("bind_update_source_for_all_rows")
+		.1;
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
+
+	assert!(all_rows.contains("QueryProfileHint::Scan"));
+	assert!(!ir.contains("FullTable"));
+}
+
+#[test]
+fn adr070_update_where_pk_equality_point_read_profile_still_works() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let predicate_helper =
+		brace_blocks_after_marker(&binder, "fn bind_update_source_for_predicate")
+			.into_iter()
+			.next()
+			.expect("bind_update_source_for_predicate")
+			.1;
+	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
+		.expect("read update tests");
+
+	assert!(predicate_helper.contains("scan_profile_hint(&bound_predicate, &scan)"));
+	assert!(predicate_helper.contains("apply_scan_profile_hint(&mut scan, Some(profile_hint))"));
+	assert!(update_test.contains("binder_update_pk_equality_uses_point_read_profile"));
+}
+
+#[test]
+fn adr070_update_without_where_still_requires_pk_table() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
+		.expect("read update tests");
+
+	assert!(bind_update.contains("TableRowIdentity::PrimaryKey"));
+	assert!(bind_update.contains("primary_key_columns.contains(primary_key_ordinal)"));
+	assert!(bind_update.contains("UPDATE requires a PRIMARY KEY table"));
+	assert!(update_test.contains("binder_rejects_update_without_where_on_append_only_table"));
+}
+
+#[test]
+fn adr070_update_without_where_preserves_pk_immutability() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
+		.expect("read update tests");
+
+	assert!(bind_update.contains("UPDATE cannot modify the PRIMARY KEY column"));
+	assert!(update_test.contains("binder_rejects_update_without_where_primary_key_assignment"));
+}
+
+#[test]
+fn adr070_update_returning_composes_with_no_where() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
+		.expect("read update tests");
+
+	assert!(
+		coordinator.contains("write::materialize_update_select_batch(schema, &source_batches)")
+	);
+	assert!(coordinator.contains("project_returning_batches(returning.as_ref()"));
+	assert!(coordinator.contains("verify_write_returning_receipt(\"UPDATE\""));
+	assert!(update_test.contains("planner_accepts_update_without_where_returning"));
+	assert!(update_test.contains("update_all_rows_returning_emits_post_update_rows"));
+}
+
+#[test]
+fn adr070_update_remains_coordinator_owned_source_bearing_write() {
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let update = brace_blocks_after_marker(&execution, "Update {")
+		.into_iter()
+		.next()
+		.expect("execution update")
+		.1;
+	let update_start = coordinator
+		.find("ExecutionPlan::Update {\n\t\t\tlegacy")
+		.expect("coordinator update arm start");
+	let update_end = update_start
+		+ coordinator[update_start..]
+			.find("ExecutionPlan::CreateTableAsSelect")
+			.expect("coordinator update arm end");
+	let update_arm = &coordinator[update_start..update_end];
+
+	assert!(update.contains("source: Box<ExecutionPlan>"));
+	assert!(update_arm.contains("source_executor.execute_read_plan(source).await?"));
+	assert!(update_arm.contains("write(WriteRequest"));
+	assert!(!update_arm.contains("delete_rows"));
+	assert!(!update_arm.contains("StorageDeleteRows"));
+}
+
+#[test]
+fn adr070_update_remains_non_fragmentable_and_worker_rejected() {
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
+		.expect("read update tests");
+
+	assert!(fragmenter.contains("UpdateNotFragmentable"));
+	assert!(fragmenter.contains("matches!(plan, ExecutionPlan::Update { .. })"));
+	assert!(server.contains("ExecutionPlan::Update { .. } => \"update\""));
+	assert!(exec.contains("UPDATE execution is coordinator-only"));
+	assert!(exec.contains("unbound UPDATE execution"));
+	assert!(update_test.contains("fragmenter_rejects_direct_update_without_where_fragmentation"));
+}
+
+#[test]
+fn adr070_delete_no_where_semantics_unchanged() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_delete = brace_blocks_after_marker(&planner, "fn lower_delete")
+		.into_iter()
+		.next()
+		.expect("lower_delete")
+		.1;
+	let delete_test = std::fs::read_to_string(manifest_dir().join("tests/delete_test.rs"))
+		.expect("read delete tests");
+
+	assert!(lower_delete.contains("let predicate = selection"));
+	assert!(lower_delete.contains(".map(|expr| self.lower_expr(expr))"));
+	assert!(lower_delete.contains(".transpose()?"));
+	assert!(!lower_delete.contains("DELETE requires a WHERE clause"));
+	assert!(delete_test.contains("planner_lowers_delete_without_where"));
+}
+
+#[test]
+fn adr070_no_transaction_lock_cas_retry_or_safety_knob() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
+	let config =
+		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget");
+	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
+		.into_iter()
+		.next()
+		.expect("bind_update")
+		.1;
+	let update_start = coordinator
+		.find("ExecutionPlan::Update {\n\t\t\tlegacy")
+		.expect("coordinator update arm start");
+	let update_end = update_start
+		+ coordinator[update_start..]
+			.find("ExecutionPlan::CreateTableAsSelect")
+			.expect("coordinator update arm end");
+	let update_arm = &coordinator[update_start..update_end];
+
+	for forbidden in [
+		"CompareSwap",
+		"compare_swap",
+		"lost_update",
+		"transaction",
+		"rollback",
+		"StorageDeleteRows",
+		"delete_rows",
+	] {
+		assert!(
+			!bind_update.contains(forbidden),
+			"bind UPDATE gained {forbidden}"
+		);
+		assert!(
+			!update_arm.contains(forbidden),
+			"coordinator UPDATE gained {forbidden}"
+		);
+	}
+	for forbidden in [
+		"update_without_where",
+		"full_table_update",
+		"FullTable",
+		"confirm_update",
+	] {
+		assert!(
+			!config.contains(forbidden),
+			"config gained no-WHERE UPDATE knob {forbidden}"
+		);
+		assert!(
+			!budget.contains(forbidden),
+			"budget gained no-WHERE UPDATE knob {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr070_no_wendelon_wire_storage_or_descriptor_change() {
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for forbidden in [
+		"LogicalPlan::Update",
+		"ExecutionPlan::Update",
+		"Statement::Update",
+		"UpdateNotFragmentable",
+		"StorageUpdate",
+		"TableUpdateRequest",
+		"TableUpdateResponse",
+	] {
+		assert!(
+			!wendelon_source.contains(forbidden),
+			"ADR 070 leaked UPDATE surface into Wendelon: {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr070_prior_adr062_to_064_guards_continue_to_pass_except_no_where_retarget() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	assert!(
+		architecture_test
+			.contains("adr062_update_surface_is_present_under_pk_update_contract_after_adr063")
+	);
+	assert!(
+		architecture_test.contains("adr063_update_where_requirement_is_retargeted_after_adr070")
+	);
+	assert!(architecture_test.contains("adr063_logical_update_shape_is_name_based"));
+	assert!(
+		architecture_test.contains("adr063_no_transaction_lock_compare_swap_surface_after_adr070")
+	);
+	assert!(architecture_test.contains("adr064_update_returning_inherits_pk_update_contract"));
+	let stale_update_reject = ["planner_rejects_update", "_without_where"].concat();
+	assert!(!architecture_test.contains(&stale_update_reject));
+}
+
+#[test]
+fn adr070_nilket_root_stays_runtime_free() {
+	let nilket_manifest =
+		std::fs::read_to_string(workspace_root_dir().join("crates/nilket/Cargo.toml"))
+			.expect("read nilket manifest");
+
+	for forbidden in ["tokio", "quinn", "rustls", "clap", "tracing", "arrow"] {
+		assert!(
+			!nilket_manifest.contains(forbidden),
+			"nilket manifest gained direct runtime dependency {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr070_fixture_worker_source_unchanged() {
+	let worker = std::fs::read_to_string(manifest_dir().join("src/bin/toron_fixture_worker.rs"))
+		.expect("read fixture worker");
+
+	for forbidden in [
+		"LogicalPlan::Update",
+		"ExecutionPlan::Update",
+		"UPDATE",
+		"UpdateNotFragmentable",
+	] {
+		assert!(
+			!worker.contains(forbidden),
+			"fixture worker gained UPDATE surface {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr070_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	assert_toron_sources_do_not_contain(&[
+		"UpdateWithoutWhereV1",
+		"UpdateAllRowsV1",
+		"FullTableUpdateV1",
+		"BulkUpdateV1",
+		"FullTable",
+	]);
 }
 
 #[test]

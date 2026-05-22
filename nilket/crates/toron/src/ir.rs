@@ -260,7 +260,7 @@ pub enum LogicalPlan {
 	Update {
 		table: TableRef,
 		assignments: Vec<(String, Expr)>,
-		predicate: Expr,
+		predicate: Option<Expr>,
 		returning: Option<ReturningProjection>,
 	},
 	Insert {
