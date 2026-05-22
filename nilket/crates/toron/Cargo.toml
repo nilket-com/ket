@@ -26,7 +26,7 @@ futures = "0.3"
 observability = { path = "../observability", default-features = false, features = ["http", "audit"] }
 blake3 = "1.5"
 rune = "0.14"
-sqlparser = "0.54"
+sqlparser = "0.62"
 rand = "0.10"
 thiserror = "2"
 tracing = "0.1"

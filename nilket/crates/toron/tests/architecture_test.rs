@@ -2590,9 +2590,21 @@ fn adr029_create_table_destructure_is_exhaustive() {
 		"query",
 		"like",
 		"clone",
+		"dynamic",
+		"iceberg",
+		"snapshot",
+		"table_options",
+		"version",
 		"primary_key",
 		"partition_by",
+		"with_storage_lifecycle_policy",
 		"with_tags",
+		"catalog_sync",
+		"storage_serialization_policy",
+		"target_lag",
+		"warehouse",
+		"refresh_mode",
+		"backup",
 	] {
 		assert!(body.contains(marker), "lower_create_table missing {marker}");
 	}
@@ -2669,11 +2681,15 @@ fn adr029_create_table_column_options_are_narrow() {
 		"ColumnOption::Null => true",
 		"ColumnOption::NotNull => false",
 		"ColumnOption::Default",
+		"ColumnOption::PrimaryKey",
+		"PrimaryKeyConstraint",
+		"characteristics",
 		"ColumnOption::Unique",
-		"is_primary",
 		"ColumnOption::Check",
 		"ColumnOption::ForeignKey",
 		"ColumnOption::Generated",
+		"ColumnOption::Srid",
+		"ColumnOption::Invisible",
 		"named constraint",
 	] {
 		assert!(
@@ -2876,6 +2892,8 @@ fn adr030_insert_destructure_is_exhaustive() {
 		.1;
 
 	for marker in [
+		"insert_token",
+		"optimizer_hints",
 		"or",
 		"ignore",
 		"into",
@@ -2890,11 +2908,16 @@ fn adr030_insert_destructure_is_exhaustive() {
 		"has_table_keyword",
 		"on",
 		"returning",
+		"output",
 		"replace_into",
 		"priority",
 		"insert_alias",
 		"settings",
 		"format_clause",
+		"multi_table_insert_type",
+		"multi_table_into_clauses",
+		"multi_table_when_clauses",
+		"multi_table_else_clause",
 	] {
 		assert!(body.contains(marker), "lower_insert missing {marker}");
 	}
@@ -4394,11 +4417,14 @@ fn adr036_delete_destructure_is_exhaustive() {
 		.1;
 
 	for field in [
+		"delete_token",
+		"optimizer_hints",
 		"tables",
 		"from",
 		"using",
 		"selection",
 		"returning",
+		"output",
 		"order_by",
 		"limit",
 	] {
@@ -4425,6 +4451,7 @@ fn adr036_delete_target_table_destructure_is_exhaustive() {
 		"alias",
 		"args",
 		"with_hints",
+		"index_hints",
 		"version",
 		"with_ordinality",
 		"partitions",
@@ -13931,7 +13958,7 @@ fn adr062_update_surface_is_present_under_pk_update_contract_after_adr063() {
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
 
-	assert!(planner.contains("Statement::Update { .. } => self.lower_update(&ast[0])"));
+	assert!(planner.contains("Statement::Update(update) => self.lower_update(update)"));
 	assert!(logical.contains("Update {"));
 	assert!(execution.contains("Update {"));
 	assert!(planner.contains("lower_returning_projection(returning.as_deref())"));
@@ -14047,11 +14074,11 @@ fn adr063_sql_planner_accepts_statement_update() {
 		.expect("plan body")
 		.1;
 
-	assert!(plan_body.contains("Statement::Update { .. } => self.lower_update(&ast[0])"));
+	assert!(plan_body.contains("Statement::Update(update) => self.lower_update(update)"));
 }
 
 #[test]
-fn adr063_sql_planner_destructures_sqlparser_054_update_fields() {
+fn adr063_sql_planner_destructures_sqlparser_062_update_fields_after_adr073() {
 	let planner =
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
 	let lower_update = brace_blocks_after_marker(&planner, "fn lower_update(&self")
@@ -14060,29 +14087,46 @@ fn adr063_sql_planner_destructures_sqlparser_054_update_fields() {
 		.expect("lower_update")
 		.1;
 
-	assert!(lower_update.contains("let Statement::Update {"));
+	assert!(lower_update.contains("let sqlparser::ast::Update {"));
 	for field in [
+		"update_token",
+		"optimizer_hints",
 		"table",
 		"assignments",
 		"from",
 		"selection",
 		"returning",
+		"output",
 		"or",
+		"order_by",
+		"limit",
 	] {
 		assert!(
 			lower_update.contains(field),
-			"UPDATE destructure lost sqlparser 0.54 field {field}"
+			"UPDATE destructure lost sqlparser 0.62 field {field}"
 		);
 	}
+	assert!(!lower_update.contains("{ .."));
+	assert!(!lower_update.contains("..,"));
 }
 
 #[test]
-fn adr063_sqlparser_062_upgrade_is_not_part_of_update_surface() {
+fn adr063_sqlparser_upgrade_is_now_owned_by_adr073() {
 	let manifest =
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
 
-	assert!(manifest.contains("sqlparser = \"0.54\""));
-	assert!(!manifest.contains("sqlparser = \"0.62\""));
+	assert!(manifest.contains("sqlparser = \"0.62\""));
+	assert!(architecture_test.contains("fn adr073_sqlparser_is_pinned_to_062"));
+	let stale_guard = [
+		"fn ",
+		"adr063_sqlparser_062_upgrade",
+		"_is_not_part_of_update_surface",
+	]
+	.concat();
+	assert!(!architecture_test.contains(&stale_guard));
 }
 
 #[test]
@@ -14589,12 +14633,17 @@ fn adr064_ctas_returning_remains_out_of_scope() {
 }
 
 #[test]
-fn adr064_sqlparser_stays_054() {
+fn adr064_sqlparser_upgrade_is_now_owned_by_adr073() {
 	let manifest =
 		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
 
-	assert!(manifest.contains("sqlparser = \"0.54\""));
-	assert!(!manifest.contains("sqlparser = \"0.62\""));
+	assert!(manifest.contains("sqlparser = \"0.62\""));
+	assert!(architecture_test.contains("fn adr073_sqlparser_is_pinned_to_062"));
+	let stale_guard = ["fn ", "adr064_sqlparser", "_stays_054"].concat();
+	assert!(!architecture_test.contains(&stale_guard));
 }
 
 #[test]
@@ -17746,6 +17795,321 @@ fn adr029_select_retry_loop_is_preserved() {
 		.expect("descriptor-evolution retry loop body");
 
 	assert!(loop_body.contains("let bound = bind(plan, catalog.as_ref(), &self.config).await?"));
+}
+
+#[test]
+fn adr073_sqlparser_is_pinned_to_062() {
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
+	let cargo_lock =
+		std::fs::read_to_string(workspace_root_dir().join("Cargo.lock")).expect("read lockfile");
+	let lock_entry = cargo_lock
+		.split("[[package]]")
+		.find(|entry| entry.contains("name = \"sqlparser\""))
+		.expect("sqlparser lockfile entry");
+
+	assert!(manifest.contains("sqlparser = \"0.62\""));
+	assert!(lock_entry.contains("version = \"0.62.0\""));
+	assert!(!manifest.contains("sqlparser = \"0.54\""));
+	assert!(!lock_entry.contains("version = \"0.54.0\""));
+}
+
+#[test]
+fn adr073_sqlparser_ast_is_quarantined_to_sql_planner() {
+	let toron_manifest = manifest_dir();
+	let mut offenders = source_lines(&toron_manifest.join("src"))
+		.into_iter()
+		.filter(|(path, _, _)| {
+			path.file_name().and_then(|name| name.to_str()) != Some("sql_planner.rs")
+		})
+		.filter(|(_, _, line)| line.contains("sqlparser"))
+		.collect::<Vec<_>>();
+
+	for root in [
+		wendelon_manifest_dir().join("src"),
+		wendelon_manifest_dir().join("crates/wendelon-client/src"),
+	] {
+		offenders.extend(
+			source_lines(&root)
+				.into_iter()
+				.filter(|(_, _, line)| line.contains("sqlparser")),
+		);
+	}
+
+	assert!(
+		offenders.is_empty(),
+		"sqlparser leaked outside Toron SQL planner:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+fn adr073_no_wendelon_wire_storage_or_ir_leakage() {
+	for path in [
+		manifest_dir().join("src/ir.rs"),
+		manifest_dir().join("src/ir/execution.rs"),
+		manifest_dir().join("src/sql_wire.rs"),
+		manifest_dir().join("src/storage.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read source");
+		assert!(
+			!source.contains("sqlparser"),
+			"{} leaked sqlparser",
+			path.display()
+		);
+	}
+}
+
+#[test]
+fn adr073_lowered_external_ast_structs_do_not_use_rest_patterns() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+
+	for marker in [
+		"fn lower_update(&self",
+		"fn lower_delete",
+		"fn lower_insert(",
+		"fn lower_create_table(",
+		"fn lower_create_table_as_select",
+		"fn lower_drop_table",
+		"fn lower_query",
+		"fn lower_select",
+		"fn lower_table_factor",
+		"fn lower_update_target_table",
+	] {
+		let body = brace_blocks_after_marker(&planner, marker)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{marker} body"))
+			.1;
+		assert!(!body.contains("{ .."), "{marker} uses a rest pattern");
+		assert!(!body.contains("..,"), "{marker} uses a rest pattern");
+	}
+}
+
+#[test]
+fn adr073_semantic_wildcard_arms_only_reject() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_limit = brace_blocks_after_marker(&planner, "fn lower_limit_clause")
+		.into_iter()
+		.next()
+		.expect("lower_limit_clause")
+		.1;
+	let lower_order_by = brace_blocks_after_marker(&planner, "fn lower_order_by")
+		.into_iter()
+		.next()
+		.expect("lower_order_by")
+		.1;
+	let lower_select = brace_blocks_after_marker(&planner, "fn lower_select")
+		.into_iter()
+		.next()
+		.expect("lower_select")
+		.1;
+
+	assert!(lower_limit.contains("LimitClause::OffsetCommaLimit { .. }"));
+	assert!(lower_limit.contains("LIMIT offset, count syntax is not supported"));
+	assert!(lower_order_by.contains("OrderByKind::All(_)"));
+	assert!(lower_order_by.contains("ORDER BY ALL is not supported"));
+	assert!(lower_select.contains("SelectItem::ExprWithAliases"));
+	assert!(lower_select.contains("multi-alias projections are not supported"));
+	assert!(!lower_select.contains("_ => Ok("));
+}
+
+#[test]
+fn adr073_query_limit_clause_preserves_ordered_limit_offset_else_rejects() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_limit = brace_blocks_after_marker(&planner, "fn lower_limit_clause")
+		.into_iter()
+		.next()
+		.expect("lower_limit_clause")
+		.1;
+	let lower_query = brace_blocks_after_marker(&planner, "fn lower_query")
+		.into_iter()
+		.next()
+		.expect("lower_query")
+		.1;
+	let lower_order_by = brace_blocks_after_marker(&planner, "fn lower_order_by")
+		.into_iter()
+		.next()
+		.expect("lower_order_by")
+		.1;
+
+	for marker in [
+		"LimitClause::LimitOffset",
+		"limit_by",
+		"LIMIT BY is not supported",
+		"LimitClause::OffsetCommaLimit",
+		"LIMIT offset, count syntax is not supported",
+	] {
+		assert!(
+			lower_limit.contains(marker),
+			"limit lowering missing {marker}"
+		);
+	}
+	assert!(lower_query.contains("LIMIT/OFFSET without ORDER BY is not supported"));
+	assert!(lower_query.contains("let limit = limit_offset"));
+	assert!(lower_query.contains("let offset = limit_offset"));
+	assert!(lower_order_by.contains("OrderByKind::Expressions"));
+	assert!(lower_order_by.contains("OrderByKind::All(_)"));
+	assert!(lower_order_by.contains("ORDER BY ALL is not supported"));
+}
+
+#[test]
+fn adr073_insert_values_source_rejects_query_decorations() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let lower_insert = brace_blocks_after_marker(&planner, "fn lower_insert(")
+		.into_iter()
+		.next()
+		.expect("lower_insert")
+		.1;
+	let lower_source = brace_blocks_after_marker(&planner, "fn lower_insert_source")
+		.into_iter()
+		.next()
+		.expect("lower_insert_source")
+		.1;
+
+	assert!(lower_insert.contains("lower_insert_column_list(columns)?"));
+	assert!(planner.contains("TableObject::TableQuery"));
+	for marker in [
+		"SetExpr::Values",
+		"query.order_by.is_some()",
+		"query.limit_clause.is_some()",
+		"query.fetch.is_some()",
+		"!query.locks.is_empty()",
+		"query.settings.is_some()",
+		"query.format_clause.is_some()",
+		"!query.pipe_operators.is_empty()",
+		"unsupported INSERT source: must be VALUES only",
+	] {
+		assert!(
+			lower_source.contains(marker),
+			"INSERT source guard missing {marker}"
+		);
+	}
+}
+
+#[test]
+fn adr073_new_062_select_item_and_expr_variants_are_explicitly_rejected() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+
+	for marker in [
+		"ObjectNamePart",
+		"object_name_part_ident",
+		"ExprWithAliases",
+		"multi-alias projections are not supported",
+		"qualified wildcard projections are not supported",
+		"ColumnOption::Srid",
+		"ColumnOption::Invisible",
+		"CAST AS ARRAY is not supported",
+		"SELECT EXCLUDE is not supported",
+		"FROM-first SELECT is not supported",
+		"unsupported INSERT clause: multi-table INSERT",
+		"TableObject::TableQuery",
+	] {
+		assert!(
+			planner.contains(marker),
+			"missing explicit 0.62 guard {marker}"
+		);
+	}
+}
+
+#[test]
+fn adr073_no_new_sql_capability_surface() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let plan_body = brace_blocks_after_marker(&planner, "pub fn plan")
+		.into_iter()
+		.next()
+		.expect("plan body")
+		.1;
+
+	for accepted in [
+		"Statement::Query(query)",
+		"Statement::CreateTable(create_table)",
+		"Statement::Insert(insert)",
+		"Statement::Delete(delete)",
+		"Statement::Update(update)",
+		"Statement::Drop { .. }",
+	] {
+		assert!(
+			plan_body.contains(accepted),
+			"missing existing surface {accepted}"
+		);
+	}
+	for forbidden in [
+		"Statement::AlterTable",
+		"Statement::CreateIndex",
+		"Statement::CreateView",
+		"Statement::Copy",
+		"Statement::Merge",
+	] {
+		assert!(
+			!plan_body.contains(forbidden),
+			"planner gained new SQL surface {forbidden}"
+		);
+	}
+	assert!(plan_body.contains(
+		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported"
+	));
+}
+
+#[test]
+fn adr073_retargets_adr063_064_sqlparser_054_pins() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	assert!(
+		architecture_test
+			.contains("adr063_sql_planner_destructures_sqlparser_062_update_fields_after_adr073")
+	);
+	assert!(architecture_test.contains("adr063_sqlparser_upgrade_is_now_owned_by_adr073"));
+	assert!(architecture_test.contains("adr064_sqlparser_upgrade_is_now_owned_by_adr073"));
+
+	for stale_guard in [
+		[
+			"fn ",
+			"adr063_sql_planner_destructures_sqlparser_054",
+			"_update_fields",
+		]
+		.concat(),
+		[
+			"fn ",
+			"adr063_sqlparser_062_upgrade",
+			"_is_not_part_of_update_surface",
+		]
+		.concat(),
+		["fn ", "adr064_sqlparser", "_stays_054"].concat(),
+	] {
+		assert!(!architecture_test.contains(&stale_guard));
+	}
+}
+
+#[test]
+fn adr073_prior_028_029_030_034_036_exhaustive_destructure_guards_pass_on_062() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
+
+	for guard in [
+		"adr028_aggregate_signature_visitors_are_exhaustive",
+		"adr029_create_table_destructure_is_exhaustive",
+		"adr030_insert_destructure_is_exhaustive",
+		"adr034_drop_table_destructure_is_exhaustive",
+		"adr036_delete_destructure_is_exhaustive",
+	] {
+		assert!(
+			architecture_test.contains(guard),
+			"missing prior guard {guard}"
+		);
+	}
+	assert!(manifest.contains("sqlparser = \"0.62\""));
 }
 
 struct RecordingStorageScan {

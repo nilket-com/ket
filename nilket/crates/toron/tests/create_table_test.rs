@@ -91,6 +91,19 @@ fn planner_accepts_if_not_exists_qualified_name_and_nullability() {
 }
 
 #[test]
+fn planner_preserves_quoted_object_name_parts_after_sqlparser_062() {
+	let plan = SqlPlanner::new()
+		.plan(r#"CREATE TABLE "App"."Sales" ("Id" INT NOT NULL)"#)
+		.expect("plan quoted create table");
+
+	let LogicalPlan::CreateTable { name, schema, .. } = plan else {
+		panic!("expected create table");
+	};
+	assert_eq!(name, TableRef::with_schema("App", "Sales"));
+	assert_field(&schema, 0, "Id", &DataType::Int32, false);
+}
+
+#[test]
 fn planner_accepts_create_or_replace_table_surface() {
 	let plan = SqlPlanner::new()
 		.plan("CREATE OR REPLACE TABLE sales (id INT NOT NULL)")
@@ -227,6 +240,14 @@ fn planner_rejects_unsupported_create_table_shapes() {
 		(
 			"CREATE TABLE t (a INT NULL NOT NULL)",
 			"nullability is specified more than once",
+		),
+		(
+			"CREATE TABLE t (a INT INVISIBLE)",
+			"unsupported CREATE TABLE column option",
+		),
+		(
+			"CREATE TABLE t (a INT) WITH (foo = 'bar')",
+			"unsupported CREATE TABLE clause: WITH options",
 		),
 	] {
 		assert_frontend_error(sql, diagnostic);

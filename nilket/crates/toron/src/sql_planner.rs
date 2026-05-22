@@ -12,11 +12,12 @@ use crate::ir::{
 use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
 	Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnDef, ColumnOption,
-	ColumnOptionDef, CreateTable, DataType as SqlDataType, Delete, ExactNumberInfo,
-	Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-	FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident, Insert, JoinConstraint,
-	JoinOperator, ObjectName, ObjectType, OrderBy, Query, Select, SelectItem, SetExpr, Statement,
-	TableAlias, TableConstraint, TableFactor, TableObject, UnaryOperator, Value,
+	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, Delete,
+	ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
+	FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident, Insert,
+	JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderBy,
+	OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableConstraint,
+	TableFactor, TableObject, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -44,6 +45,39 @@ const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
 	STORAGE_ROW_TOMBSTONE_COLUMN,
 ];
+
+fn object_name_part_ident<'a>(
+	part: &'a ObjectNamePart,
+	context: &'static str,
+) -> Result<&'a Ident, FrontendError> {
+	part.as_ident().ok_or_else(|| {
+		unsupported(format!(
+			"{context} does not support function-derived object name parts"
+		))
+	})
+}
+
+fn object_name_part_value(
+	part: &ObjectNamePart,
+	context: &'static str,
+) -> Result<String, FrontendError> {
+	Ok(object_name_part_ident(part, context)?.value.clone())
+}
+
+fn sql_value(expr: &SqlExpr) -> Option<&Value> {
+	match expr {
+		SqlExpr::Value(value) => Some(&value.value),
+		_ => None,
+	}
+}
+
+fn stripped_sql_value(expr: &SqlExpr) -> Option<&Value> {
+	sql_value(strip_nested_sql_expr(expr))
+}
+
+fn expr_is_null_literal(expr: &SqlExpr) -> bool {
+	matches!(stripped_sql_value(expr), Some(Value::Null))
+}
 
 fn validate_simple_aggregate_arg(arg: &FunctionArg) -> Result<(), FrontendError> {
 	match arg {
@@ -117,10 +151,13 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 
 fn lower_ddl_table_name(name: &ObjectName) -> Result<TableRef, FrontendError> {
 	match name.0.as_slice() {
-		[table] => Ok(TableRef::new(table.value.clone())),
+		[table] => Ok(TableRef::new(object_name_part_value(
+			table,
+			"DDL table name",
+		)?)),
 		[schema, table] => Ok(TableRef::with_schema(
-			schema.value.clone(),
-			table.value.clone(),
+			object_name_part_value(schema, "DDL table name")?,
+			object_name_part_value(table, "DDL table name")?,
 		)),
 		_ => Err(unsupported(
 			"DDL table names support only one- or two-part table names",
@@ -133,10 +170,10 @@ fn lower_table_ref_object_name(
 	context: &'static str,
 ) -> Result<TableRef, FrontendError> {
 	match name.0.as_slice() {
-		[table] => Ok(TableRef::new(table.value.clone())),
+		[table] => Ok(TableRef::new(object_name_part_value(table, context)?)),
 		[schema, table] => Ok(TableRef::with_schema(
-			schema.value.clone(),
-			table.value.clone(),
+			object_name_part_value(schema, context)?,
+			object_name_part_value(table, context)?,
 		)),
 		_ => Err(unsupported(format!(
 			"{context} supports only one- or two-part table names"
@@ -147,10 +184,10 @@ fn lower_table_ref_object_name(
 fn lower_insert_target_name(target: &TableObject) -> Result<TableRef, FrontendError> {
 	match target {
 		TableObject::TableName(name) => match name.0.as_slice() {
-			[table] => Ok(TableRef::new(table.value.clone())),
+			[table] => Ok(TableRef::new(object_name_part_value(table, "INSERT")?)),
 			[schema, table] => Ok(TableRef::with_schema(
-				schema.value.clone(),
-				table.value.clone(),
+				object_name_part_value(schema, "INSERT")?,
+				object_name_part_value(table, "INSERT")?,
 			)),
 			_ => Err(unsupported(
 				"INSERT supports only one- or two-part table names",
@@ -159,14 +196,26 @@ fn lower_insert_target_name(target: &TableObject) -> Result<TableRef, FrontendEr
 		TableObject::TableFunction(_) => Err(unsupported(
 			"INSERT target must be a table name; table functions are not supported",
 		)),
+		TableObject::TableQuery(_) => Err(unsupported(
+			"INSERT target must be a table name; table queries are not supported",
+		)),
 	}
 }
 
-fn lower_insert_column_list(columns: &[Ident]) -> Option<Vec<String>> {
+fn lower_insert_column_list(columns: &[ObjectName]) -> Result<Option<Vec<String>>, FrontendError> {
 	if columns.is_empty() {
-		None
+		Ok(None)
 	} else {
-		Some(columns.iter().map(|ident| ident.value.clone()).collect())
+		columns
+			.iter()
+			.map(|name| match name.0.as_slice() {
+				[column] => object_name_part_value(column, "INSERT column list"),
+				_ => Err(unsupported(
+					"unsupported INSERT column list: qualified column",
+				)),
+			})
+			.collect::<Result<Vec<_>, _>>()
+			.map(Some)
 	}
 }
 
@@ -178,6 +227,7 @@ fn lower_update_target_table(
 		alias,
 		args,
 		with_hints,
+		index_hints,
 		version,
 		with_ordinality,
 		partitions,
@@ -196,6 +246,9 @@ fn lower_update_target_table(
 	}
 	if !with_hints.is_empty() {
 		return Err(unsupported("unsupported UPDATE target: table hints"));
+	}
+	if !index_hints.is_empty() {
+		return Err(unsupported("unsupported UPDATE target: index hints"));
 	}
 	if version.is_some() {
 		return Err(unsupported("unsupported UPDATE target: table version"));
@@ -242,7 +295,7 @@ fn lower_update_assignments(
 fn lower_update_assignment_target(target: &AssignmentTarget) -> Result<String, FrontendError> {
 	match target {
 		AssignmentTarget::ColumnName(name) => match name.0.as_slice() {
-			[column] => Ok(column.value.clone()),
+			[column] => object_name_part_value(column, "UPDATE assignment target"),
 			_ => Err(unsupported(
 				"unsupported UPDATE assignment target: qualified column",
 			)),
@@ -257,7 +310,7 @@ fn lower_update_assignment_expr(
 	planner: &SqlPlanner,
 	expr: &SqlExpr,
 ) -> Result<Expr, FrontendError> {
-	if matches!(strip_nested_sql_expr(expr), SqlExpr::Value(Value::Null)) {
+	if expr_is_null_literal(expr) {
 		return Ok(update_null_placeholder());
 	}
 	if expr_contains_aggregate_call(expr) {
@@ -287,6 +340,53 @@ enum LoweredInsertSource {
 	Select(LogicalPlan),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LoweredLimitOffset<'a> {
+	limit: Option<&'a SqlExpr>,
+	offset: Option<&'a SqlExpr>,
+}
+
+fn lower_limit_clause(
+	limit_clause: Option<&LimitClause>,
+) -> Result<LoweredLimitOffset<'_>, FrontendError> {
+	let Some(limit_clause) = limit_clause else {
+		return Ok(LoweredLimitOffset {
+			limit: None,
+			offset: None,
+		});
+	};
+	match limit_clause {
+		LimitClause::LimitOffset {
+			limit,
+			offset,
+			limit_by,
+		} => {
+			if !limit_by.is_empty() {
+				return Err(unsupported("LIMIT BY is not supported"));
+			}
+			Ok(LoweredLimitOffset {
+				limit: limit.as_ref(),
+				offset: offset.as_ref().map(|offset| &offset.value),
+			})
+		}
+		LimitClause::OffsetCommaLimit { .. } => {
+			Err(unsupported("LIMIT offset, count syntax is not supported"))
+		}
+	}
+}
+
+fn query_has_limit_or_offset(limit_clause: Option<&LimitClause>) -> bool {
+	match limit_clause {
+		Some(LimitClause::LimitOffset {
+			limit,
+			offset,
+			limit_by,
+		}) => limit.is_some() || offset.is_some() || !limit_by.is_empty(),
+		Some(LimitClause::OffsetCommaLimit { .. }) => true,
+		None => false,
+	}
+}
+
 fn lower_insert_source(
 	planner: &SqlPlanner,
 	source: Option<&Query>,
@@ -297,14 +397,13 @@ fn lower_insert_source(
 		SetExpr::Values(values) => {
 			if query.with.is_some()
 				|| query.order_by.is_some()
-				|| query.limit.is_some()
-				|| !query.limit_by.is_empty()
-				|| query.offset.is_some()
+				|| query.limit_clause.is_some()
 				|| query.fetch.is_some()
 				|| !query.locks.is_empty()
 				|| query.for_clause.is_some()
 				|| query.settings.is_some()
 				|| query.format_clause.is_some()
+				|| !query.pipe_operators.is_empty()
 			{
 				return Err(unsupported(
 					"unsupported INSERT source: must be VALUES only",
@@ -342,15 +441,25 @@ fn lower_insert_source(
 
 fn lower_insert_literal(expr: &SqlExpr) -> Result<InsertLiteral, FrontendError> {
 	match expr {
-		SqlExpr::Value(Value::Null) => Ok(InsertLiteral::Null),
-		SqlExpr::Value(Value::Boolean(value)) => Ok(InsertLiteral::Boolean(*value)),
-		SqlExpr::Value(Value::Number(text, _)) => parse_insert_number(text, false),
-		SqlExpr::Value(Value::SingleQuotedString(value)) => Ok(InsertLiteral::Utf8(value.clone())),
+		SqlExpr::Value(value) => match &value.value {
+			Value::Null => Ok(InsertLiteral::Null),
+			Value::Boolean(value) => Ok(InsertLiteral::Boolean(*value)),
+			Value::Number(text, _) => parse_insert_number(text, false),
+			Value::SingleQuotedString(value) => Ok(InsertLiteral::Utf8(value.clone())),
+			_ => Err(unsupported(
+				"INSERT VALUES must be literals; complex expressions not supported",
+			)),
+		},
 		SqlExpr::UnaryOp {
 			op: UnaryOperator::Minus,
 			expr,
 		} => match expr.as_ref() {
-			SqlExpr::Value(Value::Number(text, _)) => parse_insert_number(text, true),
+			SqlExpr::Value(value) => match &value.value {
+				Value::Number(text, _) => parse_insert_number(text, true),
+				_ => Err(unsupported(
+					"INSERT VALUES must be literals; complex expressions not supported",
+				)),
+			},
 			_ => Err(unsupported(
 				"INSERT VALUES must be literals; complex expressions not supported",
 			)),
@@ -411,11 +520,6 @@ fn lower_create_table_column(
 			"CREATE TABLE column name is reserved for storage metadata: {column_name}"
 		)));
 	}
-	if column.collation.is_some() {
-		return Err(unsupported(
-			"unsupported CREATE TABLE column option: COLLATE",
-		));
-	}
 
 	let data_type = lower_create_table_data_type(&column.data_type)?;
 	let (nullable, primary_key) = lower_create_table_column_options(&column.options)?;
@@ -445,16 +549,22 @@ fn lower_create_table_column_options(
 					"unsupported CREATE TABLE column option: DEFAULT",
 				));
 			}
-			ColumnOption::Unique {
-				is_primary,
-				characteristics,
-			} => {
-				if !is_primary {
-					return Err(unsupported(
-						"unsupported CREATE TABLE column option: UNIQUE",
-					));
-				}
-				if characteristics.is_some() {
+			ColumnOption::PrimaryKey(primary_key_constraint) => {
+				let sqlparser::ast::PrimaryKeyConstraint {
+					name,
+					index_name,
+					index_type,
+					columns,
+					index_options,
+					characteristics,
+				} = primary_key_constraint;
+				if name.is_some()
+					|| index_name.is_some()
+					|| index_type.is_some()
+					|| !columns.is_empty()
+					|| !index_options.is_empty()
+					|| characteristics.is_some()
+				{
 					return Err(unsupported(
 						"unsupported CREATE TABLE column option: PRIMARY KEY characteristics",
 					));
@@ -467,7 +577,12 @@ fn lower_create_table_column_options(
 				primary_key = true;
 				continue;
 			}
-			ColumnOption::ForeignKey { .. } => {
+			ColumnOption::Unique(_) => {
+				return Err(unsupported(
+					"unsupported CREATE TABLE column option: UNIQUE",
+				));
+			}
+			ColumnOption::ForeignKey(_) => {
 				return Err(unsupported(
 					"unsupported CREATE TABLE column option: REFERENCES",
 				));
@@ -475,7 +590,13 @@ fn lower_create_table_column_options(
 			ColumnOption::Check(_) => {
 				return Err(unsupported("unsupported CREATE TABLE column option: CHECK"));
 			}
-			ColumnOption::Generated { .. } => {
+			ColumnOption::Generated {
+				generated_as: _,
+				sequence_options: _,
+				generation_expr: _,
+				generation_expr_mode: _,
+				generated_keyword: _,
+			} => {
 				return Err(unsupported(
 					"unsupported CREATE TABLE column option: GENERATED",
 				));
@@ -485,13 +606,16 @@ fn lower_create_table_column_options(
 			| ColumnOption::Alias(_)
 			| ColumnOption::DialectSpecific(_)
 			| ColumnOption::CharacterSet(_)
+			| ColumnOption::Collation(_)
 			| ColumnOption::Comment(_)
 			| ColumnOption::OnUpdate(_)
 			| ColumnOption::Options(_)
 			| ColumnOption::Identity(_)
 			| ColumnOption::OnConflict(_)
 			| ColumnOption::Policy(_)
-			| ColumnOption::Tags(_) => {
+			| ColumnOption::Tags(_)
+			| ColumnOption::Srid(_)
+			| ColumnOption::Invisible => {
 				return Err(unsupported("unsupported CREATE TABLE column option"));
 			}
 		};
@@ -565,14 +689,15 @@ fn lower_create_table_schema_and_identity(
 
 	for constraint in constraints {
 		match constraint {
-			TableConstraint::PrimaryKey {
-				name,
-				index_name,
-				index_type,
-				columns,
-				index_options,
-				characteristics,
-			} => {
+			TableConstraint::PrimaryKey(primary_key_constraint) => {
+				let sqlparser::ast::PrimaryKeyConstraint {
+					name,
+					index_name,
+					index_type,
+					columns,
+					index_options,
+					characteristics,
+				} = primary_key_constraint;
 				if name.is_some() {
 					return Err(unsupported(
 						"unsupported CREATE TABLE clause: named PRIMARY KEY constraint",
@@ -592,9 +717,9 @@ fn lower_create_table_schema_and_identity(
 						"CREATE TABLE PRIMARY KEY must reference exactly one column",
 					));
 				};
-				primary_key_declarations.push(column.value.clone());
+				primary_key_declarations.push(lower_primary_key_index_column(column)?);
 			}
-			TableConstraint::Unique { .. } => {
+			TableConstraint::Unique(_) => {
 				return Err(unsupported(
 					"unsupported CREATE TABLE clause: table-level UNIQUE",
 				));
@@ -643,6 +768,51 @@ fn lower_create_table_schema_and_identity(
 	};
 
 	Ok((schema, row_identity))
+}
+
+fn lower_primary_key_index_column(
+	column: &sqlparser::ast::IndexColumn,
+) -> Result<String, FrontendError> {
+	if column.operator_class.is_some() {
+		return Err(unsupported(
+			"unsupported CREATE TABLE clause: PRIMARY KEY operator class",
+		));
+	}
+	if column.column.with_fill.is_some()
+		|| column.column.options.asc.is_some()
+		|| column.column.options.nulls_first.is_some()
+	{
+		return Err(unsupported(
+			"unsupported CREATE TABLE clause: PRIMARY KEY options",
+		));
+	}
+	match &column.column.expr {
+		SqlExpr::Identifier(ident) => Ok(ident.value.clone()),
+		SqlExpr::CompoundIdentifier(_) => Err(unsupported(
+			"CREATE TABLE PRIMARY KEY column must be unqualified",
+		)),
+		_ => Err(unsupported(
+			"unsupported CREATE TABLE clause: PRIMARY KEY expression",
+		)),
+	}
+}
+
+fn reject_create_table_options(options: &CreateTableOptions) -> Result<(), FrontendError> {
+	match options {
+		CreateTableOptions::None => Ok(()),
+		CreateTableOptions::With(_) => {
+			Err(unsupported("unsupported CREATE TABLE clause: WITH options"))
+		}
+		CreateTableOptions::Options(_) => {
+			Err(unsupported("unsupported CREATE TABLE clause: OPTIONS"))
+		}
+		CreateTableOptions::Plain(_) => {
+			Err(unsupported("unsupported CREATE TABLE clause: options"))
+		}
+		CreateTableOptions::TableProperties(_) => Err(unsupported(
+			"unsupported CREATE TABLE clause: TBLPROPERTIES",
+		)),
+	}
 }
 
 fn lower_create_table_primary_key_expr(expr: &SqlExpr) -> Result<String, FrontendError> {
@@ -701,7 +871,7 @@ impl SqlPlanner {
 			Statement::CreateTable(create_table) => self.lower_create_table(create_table),
 			Statement::Insert(insert) => self.lower_insert(insert),
 			Statement::Delete(delete) => self.lower_delete(delete),
-			Statement::Update { .. } => self.lower_update(&ast[0]),
+			Statement::Update(update) => self.lower_update(update),
 			Statement::Drop { .. } => self.lower_drop_table(&ast[0]),
 			_ => Err(unsupported(
 				"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported",
@@ -709,28 +879,41 @@ impl SqlPlanner {
 		}
 	}
 
-	fn lower_update(&self, statement: &Statement) -> Result<LogicalPlan, FrontendError> {
-		let Statement::Update {
+	fn lower_update(&self, update: &sqlparser::ast::Update) -> Result<LogicalPlan, FrontendError> {
+		let sqlparser::ast::Update {
+			update_token,
+			optimizer_hints,
 			table,
 			assignments,
 			from,
 			selection,
 			returning,
+			output,
 			or,
-		} = statement
-		else {
-			return Err(unsupported(
-				"internal planner error: expected UPDATE statement",
-			));
-		};
+			order_by,
+			limit,
+		} = update;
+		let _parser_metadata_only = update_token;
 
+		if !optimizer_hints.is_empty() {
+			return Err(unsupported("unsupported UPDATE clause: optimizer hints"));
+		}
 		if from.is_some() {
 			return Err(unsupported("unsupported UPDATE clause: FROM"));
+		}
+		if output.is_some() {
+			return Err(unsupported("unsupported UPDATE clause: OUTPUT"));
 		}
 		if or.is_some() {
 			return Err(unsupported(
 				"unsupported UPDATE clause: OR (ROLLBACK/ABORT/REPLACE/...)",
 			));
+		}
+		if !order_by.is_empty() {
+			return Err(unsupported("unsupported UPDATE clause: ORDER BY"));
+		}
+		if limit.is_some() {
+			return Err(unsupported("unsupported UPDATE clause: LIMIT"));
 		}
 		if table.joins.is_empty() {
 			let target = lower_update_target_table(table)?;
@@ -755,20 +938,30 @@ impl SqlPlanner {
 
 	fn lower_delete(&self, delete: &Delete) -> Result<LogicalPlan, FrontendError> {
 		let Delete {
+			delete_token,
+			optimizer_hints,
 			tables,
 			from,
 			using,
 			selection,
 			returning,
+			output,
 			order_by,
 			limit,
 		} = delete;
+		let _parser_metadata_only = delete_token;
 
+		if !optimizer_hints.is_empty() {
+			return Err(unsupported("unsupported DELETE clause: optimizer hints"));
+		}
 		if !tables.is_empty() {
 			return Err(unsupported("DELETE supports exactly one target table"));
 		}
 		if using.is_some() {
 			return Err(unsupported("unsupported DELETE clause: USING"));
+		}
+		if output.is_some() {
+			return Err(unsupported("unsupported DELETE clause: OUTPUT"));
 		}
 		if !order_by.is_empty() {
 			return Err(unsupported("unsupported DELETE clause: ORDER BY"));
@@ -798,6 +991,7 @@ impl SqlPlanner {
 			alias,
 			args,
 			with_hints,
+			index_hints,
 			version,
 			with_ordinality,
 			partitions,
@@ -816,6 +1010,9 @@ impl SqlPlanner {
 		}
 		if !with_hints.is_empty() {
 			return Err(unsupported("unsupported DELETE target: table hints"));
+		}
+		if !index_hints.is_empty() {
+			return Err(unsupported("unsupported DELETE target: index hints"));
 		}
 		if version.is_some() {
 			return Err(unsupported("unsupported DELETE target: table version"));
@@ -848,6 +1045,8 @@ impl SqlPlanner {
 
 	fn lower_insert(&self, insert: &Insert) -> Result<LogicalPlan, FrontendError> {
 		let Insert {
+			insert_token,
+			optimizer_hints,
 			or,
 			ignore,
 			into,
@@ -862,13 +1061,22 @@ impl SqlPlanner {
 			has_table_keyword,
 			on,
 			returning,
+			output,
 			replace_into,
 			priority,
 			insert_alias,
 			settings,
 			format_clause,
+			multi_table_insert_type,
+			multi_table_into_clauses,
+			multi_table_when_clauses,
+			multi_table_else_clause,
 		} = insert;
+		let _parser_metadata_only = insert_token;
 
+		if !optimizer_hints.is_empty() {
+			return Err(unsupported("unsupported INSERT clause: optimizer hints"));
+		}
 		if or.is_some() {
 			return Err(unsupported(
 				"unsupported INSERT clause: OR (REPLACE/IGNORE/...)",
@@ -905,6 +1113,9 @@ impl SqlPlanner {
 				"unsupported INSERT clause: ON CONFLICT / ON DUPLICATE KEY",
 			));
 		}
+		if output.is_some() {
+			return Err(unsupported("unsupported INSERT clause: OUTPUT"));
+		}
 		if *replace_into {
 			return Err(unsupported("unsupported INSERT clause: REPLACE INTO"));
 		}
@@ -920,9 +1131,16 @@ impl SqlPlanner {
 		if format_clause.is_some() {
 			return Err(unsupported("unsupported INSERT clause: FORMAT"));
 		}
+		if multi_table_insert_type.is_some()
+			|| !multi_table_into_clauses.is_empty()
+			|| !multi_table_when_clauses.is_empty()
+			|| multi_table_else_clause.is_some()
+		{
+			return Err(unsupported("unsupported INSERT clause: multi-table INSERT"));
+		}
 
 		let table = lower_insert_target_name(table)?;
-		let columns = lower_insert_column_list(columns);
+		let columns = lower_insert_column_list(columns)?;
 		let returning = self.lower_returning_projection(returning.as_deref())?;
 		match lower_insert_source(self, source.as_deref())? {
 			LoweredInsertSource::Values(rows) => Ok(LogicalPlan::Insert {
@@ -962,6 +1180,14 @@ impl SqlPlanner {
 			let (sql_expr, alias) = match item {
 				SelectItem::UnnamedExpr(expr) => (expr, None),
 				SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+				SelectItem::ExprWithAliases {
+					expr: _,
+					aliases: _,
+				} => {
+					return Err(unsupported(
+						"multi-alias RETURNING projections are not supported",
+					));
+				}
 				SelectItem::Wildcard(_) => {
 					return Err(unsupported(
 						"mixed wildcard RETURNING projections are not supported",
@@ -1005,28 +1231,27 @@ impl SqlPlanner {
 			or_replace,
 			temporary,
 			external,
+			dynamic,
 			global,
 			if_not_exists,
 			transient,
 			volatile,
+			iceberg,
+			snapshot,
 			name,
 			columns,
 			constraints,
 			hive_distribution,
 			hive_formats,
-			table_properties,
-			with_options,
+			table_options,
 			file_format,
 			location,
 			query,
 			without_rowid,
 			like,
 			clone,
-			engine,
+			version,
 			comment,
-			auto_increment_offset,
-			default_charset,
-			collation,
 			on_commit,
 			on_cluster,
 			primary_key,
@@ -1034,7 +1259,9 @@ impl SqlPlanner {
 			partition_by,
 			cluster_by,
 			clustered_by,
-			options,
+			inherits,
+			partition_of,
+			for_values,
 			strict,
 			copy_grants,
 			enable_schema_evolution,
@@ -1044,7 +1271,22 @@ impl SqlPlanner {
 			default_ddl_collation,
 			with_aggregation_policy,
 			with_row_access_policy,
+			with_storage_lifecycle_policy,
 			with_tags,
+			external_volume,
+			base_location,
+			catalog,
+			catalog_sync,
+			storage_serialization_policy,
+			target_lag,
+			warehouse,
+			refresh_mode,
+			initialize,
+			require_user,
+			diststyle,
+			distkey,
+			sortkey,
+			backup,
 		} = create_table;
 
 		if *or_replace && *if_not_exists {
@@ -1067,6 +1309,15 @@ impl SqlPlanner {
 		if *volatile {
 			return Err(unsupported("unsupported CREATE TABLE clause: VOLATILE"));
 		}
+		if *dynamic {
+			return Err(unsupported("unsupported CREATE TABLE clause: DYNAMIC"));
+		}
+		if *iceberg {
+			return Err(unsupported("unsupported CREATE TABLE clause: ICEBERG"));
+		}
+		if *snapshot {
+			return Err(unsupported("unsupported CREATE TABLE clause: SNAPSHOT"));
+		}
 		if hive_formats.as_ref().is_some_and(|formats| {
 			formats.row_format.is_some()
 				|| formats
@@ -1078,14 +1329,7 @@ impl SqlPlanner {
 		}) {
 			return Err(unsupported("unsupported CREATE TABLE clause: HIVE FORMATS"));
 		}
-		if !table_properties.is_empty() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: TBLPROPERTIES",
-			));
-		}
-		if !with_options.is_empty() {
-			return Err(unsupported("unsupported CREATE TABLE clause: WITH options"));
-		}
+		reject_create_table_options(table_options)?;
 		if file_format.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: STORED AS"));
 		}
@@ -1106,24 +1350,11 @@ impl SqlPlanner {
 		if clone.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: CLONE"));
 		}
-		if engine.is_some() {
-			return Err(unsupported("unsupported CREATE TABLE clause: ENGINE"));
+		if version.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: VERSION"));
 		}
 		if comment.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: COMMENT"));
-		}
-		if auto_increment_offset.is_some() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: AUTO_INCREMENT",
-			));
-		}
-		if default_charset.is_some() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: DEFAULT CHARSET",
-			));
-		}
-		if collation.is_some() {
-			return Err(unsupported("unsupported CREATE TABLE clause: COLLATE"));
 		}
 		if on_commit.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: ON COMMIT"));
@@ -1143,8 +1374,14 @@ impl SqlPlanner {
 		if clustered_by.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: CLUSTERED BY"));
 		}
-		if options.as_ref().is_some_and(|options| !options.is_empty()) {
-			return Err(unsupported("unsupported CREATE TABLE clause: OPTIONS"));
+		if inherits.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: INHERITS"));
+		}
+		if partition_of.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: PARTITION OF"));
+		}
+		if for_values.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: FOR VALUES"));
 		}
 		if *strict {
 			return Err(unsupported("unsupported CREATE TABLE clause: STRICT"));
@@ -1187,8 +1424,61 @@ impl SqlPlanner {
 				"unsupported CREATE TABLE clause: ROW ACCESS POLICY",
 			));
 		}
+		if with_storage_lifecycle_policy.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: STORAGE LIFECYCLE POLICY",
+			));
+		}
 		if with_tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
 			return Err(unsupported("unsupported CREATE TABLE clause: WITH TAGS"));
+		}
+		if external_volume.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: EXTERNAL_VOLUME",
+			));
+		}
+		if base_location.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: BASE_LOCATION",
+			));
+		}
+		if catalog.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CATALOG"));
+		}
+		if catalog_sync.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CATALOG_SYNC"));
+		}
+		if storage_serialization_policy.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: STORAGE_SERIALIZATION_POLICY",
+			));
+		}
+		if target_lag.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: TARGET_LAG"));
+		}
+		if warehouse.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: WAREHOUSE"));
+		}
+		if refresh_mode.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: REFRESH_MODE"));
+		}
+		if initialize.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: INITIALIZE"));
+		}
+		if *require_user {
+			return Err(unsupported("unsupported CREATE TABLE clause: REQUIRE USER"));
+		}
+		if diststyle.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: DISTSTYLE"));
+		}
+		if distkey.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: DISTKEY"));
+		}
+		if sortkey.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: SORTKEY"));
+		}
+		if backup.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: BACKUP"));
 		}
 		if !matches!(hive_distribution, HiveDistributionStyle::NONE) {
 			return Err(unsupported(
@@ -1220,28 +1510,27 @@ impl SqlPlanner {
 			or_replace,
 			temporary,
 			external,
+			dynamic,
 			global,
 			if_not_exists,
 			transient,
 			volatile,
+			iceberg,
+			snapshot,
 			name,
 			columns,
 			constraints,
 			hive_distribution,
 			hive_formats,
-			table_properties,
-			with_options,
+			table_options,
 			file_format,
 			location,
 			query,
 			without_rowid,
 			like,
 			clone,
-			engine,
+			version,
 			comment,
-			auto_increment_offset,
-			default_charset,
-			collation,
 			on_commit,
 			on_cluster,
 			primary_key,
@@ -1249,7 +1538,9 @@ impl SqlPlanner {
 			partition_by,
 			cluster_by,
 			clustered_by,
-			options,
+			inherits,
+			partition_of,
+			for_values,
 			strict,
 			copy_grants,
 			enable_schema_evolution,
@@ -1259,7 +1550,22 @@ impl SqlPlanner {
 			default_ddl_collation,
 			with_aggregation_policy,
 			with_row_access_policy,
+			with_storage_lifecycle_policy,
 			with_tags,
+			external_volume,
+			base_location,
+			catalog,
+			catalog_sync,
+			storage_serialization_policy,
+			target_lag,
+			warehouse,
+			refresh_mode,
+			initialize,
+			require_user,
+			diststyle,
+			distkey,
+			sortkey,
+			backup,
 		} = create_table;
 
 		if *or_replace && *if_not_exists {
@@ -1287,6 +1593,15 @@ impl SqlPlanner {
 		if *volatile {
 			return Err(unsupported("unsupported CREATE TABLE clause: VOLATILE"));
 		}
+		if *dynamic {
+			return Err(unsupported("unsupported CREATE TABLE clause: DYNAMIC"));
+		}
+		if *iceberg {
+			return Err(unsupported("unsupported CREATE TABLE clause: ICEBERG"));
+		}
+		if *snapshot {
+			return Err(unsupported("unsupported CREATE TABLE clause: SNAPSHOT"));
+		}
 		if !constraints.is_empty() {
 			return Err(unsupported(
 				"unsupported CREATE TABLE clause: table-level constraints",
@@ -1303,14 +1618,7 @@ impl SqlPlanner {
 		}) {
 			return Err(unsupported("unsupported CREATE TABLE clause: HIVE FORMATS"));
 		}
-		if !table_properties.is_empty() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: TBLPROPERTIES",
-			));
-		}
-		if !with_options.is_empty() {
-			return Err(unsupported("unsupported CREATE TABLE clause: WITH options"));
-		}
+		reject_create_table_options(table_options)?;
 		if file_format.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: STORED AS"));
 		}
@@ -1328,24 +1636,11 @@ impl SqlPlanner {
 		if clone.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: CLONE"));
 		}
-		if engine.is_some() {
-			return Err(unsupported("unsupported CREATE TABLE clause: ENGINE"));
+		if version.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: VERSION"));
 		}
 		if comment.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: COMMENT"));
-		}
-		if auto_increment_offset.is_some() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: AUTO_INCREMENT",
-			));
-		}
-		if default_charset.is_some() {
-			return Err(unsupported(
-				"unsupported CREATE TABLE clause: DEFAULT CHARSET",
-			));
-		}
-		if collation.is_some() {
-			return Err(unsupported("unsupported CREATE TABLE clause: COLLATE"));
 		}
 		if on_commit.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: ON COMMIT"));
@@ -1370,8 +1665,14 @@ impl SqlPlanner {
 		if clustered_by.is_some() {
 			return Err(unsupported("unsupported CREATE TABLE clause: CLUSTERED BY"));
 		}
-		if options.as_ref().is_some_and(|options| !options.is_empty()) {
-			return Err(unsupported("unsupported CREATE TABLE clause: OPTIONS"));
+		if inherits.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: INHERITS"));
+		}
+		if partition_of.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: PARTITION OF"));
+		}
+		if for_values.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: FOR VALUES"));
 		}
 		if *strict {
 			return Err(unsupported("unsupported CREATE TABLE clause: STRICT"));
@@ -1414,8 +1715,61 @@ impl SqlPlanner {
 				"unsupported CREATE TABLE clause: ROW ACCESS POLICY",
 			));
 		}
+		if with_storage_lifecycle_policy.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: STORAGE LIFECYCLE POLICY",
+			));
+		}
 		if with_tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
 			return Err(unsupported("unsupported CREATE TABLE clause: WITH TAGS"));
+		}
+		if external_volume.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: EXTERNAL_VOLUME",
+			));
+		}
+		if base_location.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: BASE_LOCATION",
+			));
+		}
+		if catalog.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CATALOG"));
+		}
+		if catalog_sync.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: CATALOG_SYNC"));
+		}
+		if storage_serialization_policy.is_some() {
+			return Err(unsupported(
+				"unsupported CREATE TABLE clause: STORAGE_SERIALIZATION_POLICY",
+			));
+		}
+		if target_lag.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: TARGET_LAG"));
+		}
+		if warehouse.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: WAREHOUSE"));
+		}
+		if refresh_mode.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: REFRESH_MODE"));
+		}
+		if initialize.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: INITIALIZE"));
+		}
+		if *require_user {
+			return Err(unsupported("unsupported CREATE TABLE clause: REQUIRE USER"));
+		}
+		if diststyle.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: DISTSTYLE"));
+		}
+		if distkey.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: DISTKEY"));
+		}
+		if sortkey.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: SORTKEY"));
+		}
+		if backup.is_some() {
+			return Err(unsupported("unsupported CREATE TABLE clause: BACKUP"));
 		}
 		if !matches!(hive_distribution, HiveDistributionStyle::NONE) {
 			return Err(unsupported(
@@ -1445,6 +1799,7 @@ impl SqlPlanner {
 			restrict,
 			purge,
 			temporary,
+			table,
 		} = statement
 		else {
 			return Err(unsupported(
@@ -1472,6 +1827,9 @@ impl SqlPlanner {
 		if *temporary {
 			return Err(unsupported("unsupported DROP TABLE clause: TEMPORARY"));
 		}
+		if table.is_some() {
+			return Err(unsupported("unsupported DROP TABLE clause: ON"));
+		}
 
 		let name = lower_ddl_table_name(&names[0])?;
 		Ok(LogicalPlan::DropTable {
@@ -1485,21 +1843,17 @@ impl SqlPlanner {
 			with,
 			body,
 			order_by,
-			limit,
-			limit_by,
-			offset,
+			limit_clause,
 			fetch,
 			locks,
 			for_clause,
 			settings,
 			format_clause,
+			pipe_operators,
 		} = query;
 
 		if with.is_some() {
 			return Err(unsupported("WITH is not supported"));
-		}
-		if !limit_by.is_empty() {
-			return Err(unsupported("LIMIT BY is not supported"));
 		}
 		if fetch.is_some() {
 			return Err(unsupported("FETCH is not supported"));
@@ -1516,7 +1870,11 @@ impl SqlPlanner {
 		if format_clause.is_some() {
 			return Err(unsupported("FORMAT clause is not supported"));
 		}
-		if order_by.is_none() && (limit.is_some() || offset.is_some()) {
+		if !pipe_operators.is_empty() {
+			return Err(unsupported("pipe operators are not supported"));
+		}
+		let limit_offset = lower_limit_clause(limit_clause.as_ref())?;
+		if order_by.is_none() && (limit_offset.limit.is_some() || limit_offset.offset.is_some()) {
 			return Err(unsupported(
 				"LIMIT/OFFSET without ORDER BY is not supported",
 			));
@@ -1538,13 +1896,13 @@ impl SqlPlanner {
 				} else {
 					(plan, order_by, None)
 				};
-			let limit = limit
-				.as_ref()
+			let limit = limit_offset
+				.limit
 				.map(parse_non_negative_usize_literal)
 				.transpose()?;
-			let offset = offset
-				.as_ref()
-				.map(|offset| parse_non_negative_usize_literal(&offset.value))
+			let offset = limit_offset
+				.offset
+				.map(parse_non_negative_usize_literal)
 				.transpose()?
 				.unwrap_or(0);
 			let sorted = LogicalPlan::Sort {
@@ -1574,14 +1932,18 @@ impl SqlPlanner {
 	fn lower_select(&self, select: &Select) -> Result<LoweredSelect, FrontendError> {
 		let Select {
 			select_token,
+			optimizer_hints,
 			distinct,
+			select_modifiers,
 			top,
 			top_before_distinct,
 			projection,
+			exclude,
 			into,
 			from,
 			lateral_views,
 			prewhere,
+			connect_by,
 			selection,
 			group_by,
 			cluster_by,
@@ -1592,15 +1954,24 @@ impl SqlPlanner {
 			qualify,
 			window_before_qualify,
 			value_table_mode,
-			connect_by,
+			flavor,
 		} = select;
 		let _parser_metadata_only = (select_token, top_before_distinct, window_before_qualify);
 
+		if !optimizer_hints.is_empty() {
+			return Err(unsupported("optimizer hints are not supported"));
+		}
 		if distinct.is_some() {
 			return Err(unsupported("DISTINCT is not supported"));
 		}
+		if select_modifiers.is_some() {
+			return Err(unsupported("SELECT modifiers are not supported"));
+		}
 		if top.is_some() {
 			return Err(unsupported("TOP is not supported"));
+		}
+		if exclude.is_some() {
+			return Err(unsupported("SELECT EXCLUDE is not supported"));
 		}
 		if into.is_some() {
 			return Err(unsupported("SELECT INTO is not supported"));
@@ -1629,8 +2000,11 @@ impl SqlPlanner {
 		if value_table_mode.is_some() {
 			return Err(unsupported("SELECT AS VALUE/STRUCT is not supported"));
 		}
-		if connect_by.is_some() {
+		if !connect_by.is_empty() {
 			return Err(unsupported("CONNECT BY is not supported"));
+		}
+		if !matches!(flavor, sqlparser::ast::SelectFlavor::Standard) {
+			return Err(unsupported("FROM-first SELECT is not supported"));
 		}
 		let group_keys = if group_by_is_empty(group_by) {
 			None
@@ -1805,10 +2179,18 @@ impl SqlPlanner {
 					exprs.push(self.lower_expr(expr)?);
 					output_names.push(Some(alias.value.clone()));
 				}
+				SelectItem::ExprWithAliases {
+					expr: _,
+					aliases: _,
+				} => return Err(unsupported("multi-alias projections are not supported")),
 				SelectItem::Wildcard(_) => {
 					return Err(unsupported("mixed wildcard projections are not supported"));
 				}
-				_ => return Err(unsupported("unsupported select item")),
+				SelectItem::QualifiedWildcard(_, _) => {
+					return Err(unsupported(
+						"qualified wildcard projections are not supported",
+					));
+				}
 			}
 		}
 
@@ -1830,12 +2212,15 @@ impl SqlPlanner {
 		if order_by.interpolate.is_some() {
 			return Err(unsupported("ORDER BY INTERPOLATE is not supported"));
 		}
-		if order_by.exprs.is_empty() {
+		let exprs = match &order_by.kind {
+			OrderByKind::Expressions(exprs) => exprs,
+			OrderByKind::All(_) => return Err(unsupported("ORDER BY ALL is not supported")),
+		};
+		if exprs.is_empty() {
 			return Err(unsupported("ORDER BY requires at least one expression"));
 		}
 
-		order_by
-			.exprs
+		exprs
 			.iter()
 			.map(|expr| {
 				if expr.with_fill.is_some() {
@@ -1848,8 +2233,8 @@ impl SqlPlanner {
 				};
 				Ok(SortExpr {
 					expr: self.lower_expr(&sql_expr)?,
-					descending: expr.asc == Some(false),
-					nulls_first: expr.nulls_first.unwrap_or(false),
+					descending: expr.options.asc == Some(false),
+					nulls_first: expr.options.nulls_first.unwrap_or(false),
 				})
 			})
 			.collect()
@@ -1963,13 +2348,20 @@ impl SqlPlanner {
 				kind,
 				expr,
 				data_type,
+				array,
 				format,
-			} => Ok(SqlExpr::Cast {
-				kind: kind.clone(),
-				expr: Box::new(self.rewrite_grouped_aggregate_calls(expr, scope, clause)?),
-				data_type: data_type.clone(),
-				format: format.clone(),
-			}),
+			} => {
+				if *array {
+					return Err(unsupported("CAST AS ARRAY is not supported"));
+				}
+				Ok(SqlExpr::Cast {
+					kind: kind.clone(),
+					expr: Box::new(self.rewrite_grouped_aggregate_calls(expr, scope, clause)?),
+					data_type: data_type.clone(),
+					array: *array,
+					format: format.clone(),
+				})
+			}
 			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
 				self.rewrite_grouped_aggregate_calls(inner, scope, clause)?,
 			))),
@@ -2166,13 +2558,22 @@ impl SqlPlanner {
 				kind,
 				expr,
 				data_type,
+				array,
 				format,
-			} => Ok(SqlExpr::Cast {
-				kind: kind.clone(),
-				expr: Box::new(self.rewrite_aggregate_calls_for_projection(expr, mode, catalog)?),
-				data_type: data_type.clone(),
-				format: format.clone(),
-			}),
+			} => {
+				if *array {
+					return Err(unsupported("CAST AS ARRAY is not supported"));
+				}
+				Ok(SqlExpr::Cast {
+					kind: kind.clone(),
+					expr: Box::new(
+						self.rewrite_aggregate_calls_for_projection(expr, mode, catalog)?,
+					),
+					data_type: data_type.clone(),
+					array: *array,
+					format: format.clone(),
+				})
+			}
 			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
 				self.rewrite_aggregate_calls_for_projection(inner, mode, catalog)?,
 			))),
@@ -2306,9 +2707,16 @@ impl SqlPlanner {
 		}
 		let val = self.lower_arg(&args[0])?;
 		let q = match &args[1] {
-			FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(Value::Number(n, _)))) => {
-				n.parse::<f64>().map_err(|e| unsupported(e.to_string()))?
-			}
+			FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => match sql_value(expr) {
+				Some(Value::Number(n, _)) => {
+					n.parse::<f64>().map_err(|e| unsupported(e.to_string()))?
+				}
+				_ => {
+					return Err(unsupported(
+						"APPROX_QUANTILE expects a numeric literal for quantile",
+					));
+				}
+			},
 			_ => {
 				return Err(unsupported(
 					"APPROX_QUANTILE expects a numeric literal for quantile",
@@ -2320,8 +2728,43 @@ impl SqlPlanner {
 
 	fn lower_table_factor(&self, factor: &TableFactor) -> Result<LogicalPlan, FrontendError> {
 		match factor {
-			TableFactor::Table { name, alias, .. } => {
-				let table = table_ref_from_object_name(name);
+			TableFactor::Table {
+				name,
+				alias,
+				args,
+				with_hints,
+				index_hints,
+				version,
+				with_ordinality,
+				partitions,
+				json_path,
+				sample,
+			} => {
+				if args.is_some() {
+					return Err(unsupported("unsupported table factor: table arguments"));
+				}
+				if !with_hints.is_empty() {
+					return Err(unsupported("unsupported table factor: table hints"));
+				}
+				if !index_hints.is_empty() {
+					return Err(unsupported("unsupported table factor: index hints"));
+				}
+				if version.is_some() {
+					return Err(unsupported("unsupported table factor: table version"));
+				}
+				if *with_ordinality {
+					return Err(unsupported("unsupported table factor: WITH ORDINALITY"));
+				}
+				if !partitions.is_empty() {
+					return Err(unsupported("unsupported table factor: partitions"));
+				}
+				if json_path.is_some() {
+					return Err(unsupported("unsupported table factor: json path"));
+				}
+				if sample.is_some() {
+					return Err(unsupported("unsupported table factor: sample"));
+				}
+				let table = lower_table_ref_object_name(name, "SELECT")?;
 				let plan = LogicalPlan::ScanNamed {
 					table,
 					projection: None,
@@ -2483,7 +2926,7 @@ impl SqlPlanner {
 				TableRef::new(idents[0].value.clone()),
 				idents[1].value.clone(),
 			)),
-			SqlExpr::Value(val) => match val {
+			SqlExpr::Value(val) => match &val.value {
 				Value::Number(n, _) => {
 					if let Ok(i) = n.parse::<i32>() {
 						Ok(Expr::Literal(ScalarValue::Int32(Some(i))))
@@ -2523,8 +2966,12 @@ impl SqlPlanner {
 				kind,
 				expr,
 				data_type,
+				array,
 				format,
 			} => {
+				if *array {
+					return Err(unsupported("CAST AS ARRAY is not supported"));
+				}
 				if format.is_some() {
 					return Err(unsupported("CAST FORMAT clause is not supported"));
 				}
@@ -2555,18 +3002,25 @@ impl SqlPlanner {
 				}
 				let ts = self.lower_arg(&args[0])?;
 				let interval = match &args[1] {
-					FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-						SqlExpr::Value(Value::SingleQuotedString(s)),
-					)) => match s.as_str() {
-						"1m" => std::time::Duration::from_secs(60),
-						"1h" => std::time::Duration::from_secs(3600),
-						"1d" => std::time::Duration::from_secs(86400),
-						_ => {
-							return Err(unsupported(format!(
-								"unsupported time_bucket interval: {s}"
-							)));
+					FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+						match sql_value(expr) {
+							Some(Value::SingleQuotedString(s)) => match s.as_str() {
+								"1m" => std::time::Duration::from_secs(60),
+								"1h" => std::time::Duration::from_secs(3600),
+								"1d" => std::time::Duration::from_secs(86400),
+								_ => {
+									return Err(unsupported(format!(
+										"unsupported time_bucket interval: {s}"
+									)));
+								}
+							},
+							_ => {
+								return Err(unsupported(
+									"time_bucket expects a string literal interval",
+								));
+							}
 						}
-					},
+					}
 					_ => return Err(unsupported("time_bucket expects a string literal interval")),
 				};
 				Ok(Expr::TimeBucket(interval, Box::new(ts)))
@@ -3244,7 +3698,7 @@ enum AggregateSqlMode {
 }
 
 fn lower_group_by_keys(group_by: &GroupByExpr) -> Result<Vec<GroupKey>, FrontendError> {
-	// P0.1: sqlparser 0.54 stores plain keys in Expressions and ClickHouse-style modifiers
+	// P0.1: sqlparser stores plain keys in Expressions and ClickHouse-style modifiers
 	// beside them; GROUP BY ALL and every modifier are outside ADR 011.
 	match group_by {
 		GroupByExpr::Expressions(exprs, modifiers) => {
@@ -3380,6 +3834,9 @@ fn select_item_expr_and_alias(
 	match item {
 		SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
 		SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias))),
+		SelectItem::ExprWithAliases { .. } => {
+			Err(unsupported("multi-alias projections are not supported"))
+		}
 		SelectItem::Wildcard(_) => Err(unsupported("mixed wildcard projections are not supported")),
 		SelectItem::QualifiedWildcard(_, _) => Err(unsupported(
 			"qualified wildcard projections are not supported",
@@ -3437,6 +3894,7 @@ fn select_item_contains_aggregate_call(item: &SelectItem) -> bool {
 	match item {
 		SelectItem::UnnamedExpr(expr) => expr_contains_aggregate_call(expr),
 		SelectItem::ExprWithAlias { expr, alias: _ } => expr_contains_aggregate_call(expr),
+		SelectItem::ExprWithAliases { .. } => false,
 		SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => false,
 	}
 }
@@ -3637,9 +4095,10 @@ fn aggregate_projection_matches_natural(
 }
 
 fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
-	let [ident] = name.0.as_slice() else {
+	let [part] = name.0.as_slice() else {
 		return None;
 	};
+	let ident = part.as_ident()?;
 	let upper = ident.value.to_ascii_uppercase();
 	if aggregate_kernel::is_stable_aggregate_sql_name(&upper) {
 		return aggregate_kernel::stable_aggregate_sql_name(&upper);
@@ -3816,14 +4275,13 @@ fn combine_and_exprs(exprs: Vec<Expr>) -> Option<Expr> {
 fn validate_exists_query_shape(query: &Query) -> Result<(), FrontendError> {
 	if query.with.is_some()
 		|| query.order_by.is_some()
-		|| query.limit.is_some()
-		|| !query.limit_by.is_empty()
-		|| query.offset.is_some()
+		|| query_has_limit_or_offset(query.limit_clause.as_ref())
 		|| query.fetch.is_some()
 		|| !query.locks.is_empty()
 		|| query.for_clause.is_some()
 		|| query.settings.is_some()
 		|| query.format_clause.is_some()
+		|| !query.pipe_operators.is_empty()
 	{
 		return Err(unsupported("unsupported EXISTS subquery shape"));
 	}
@@ -3846,7 +4304,11 @@ fn validate_exists_select_shape(select: &Select) -> Result<(), FrontendError> {
 		|| !select.named_window.is_empty()
 		|| select.qualify.is_some()
 		|| select.value_table_mode.is_some()
-		|| select.connect_by.is_some()
+		|| !select.connect_by.is_empty()
+		|| !select.optimizer_hints.is_empty()
+		|| select.select_modifiers.is_some()
+		|| select.exclude.is_some()
+		|| !matches!(select.flavor, sqlparser::ast::SelectFlavor::Standard)
 	{
 		return Err(unsupported("unsupported EXISTS subquery shape"));
 	}
@@ -3865,14 +4327,14 @@ fn validate_exists_projection(projection: &[SelectItem]) -> Result<(), FrontendE
 }
 
 fn exists_projection_expr_supported(expr: &SqlExpr) -> bool {
-	matches!(
-		strip_nested_sql_expr(expr),
-		SqlExpr::Identifier(_)
-			| SqlExpr::CompoundIdentifier(_)
-			| SqlExpr::Value(Value::Number(_, _))
-			| SqlExpr::Value(Value::SingleQuotedString(_))
-			| SqlExpr::Value(Value::Boolean(_))
-	)
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => true,
+		SqlExpr::Value(value) => matches!(
+			&value.value,
+			Value::Number(_, _) | Value::SingleQuotedString(_) | Value::Boolean(_)
+		),
+		_ => false,
+	}
 }
 
 fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
@@ -3883,8 +4345,8 @@ fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
 }
 
 fn parse_non_negative_usize_literal(expr: &SqlExpr) -> Result<usize, FrontendError> {
-	match strip_nested_sql_expr(expr) {
-		SqlExpr::Value(Value::Number(number, _)) => {
+	match stripped_sql_value(expr) {
+		Some(Value::Number(number, _)) => {
 			if number.starts_with('-')
 				|| number.contains('.')
 				|| number.contains('e')
@@ -4062,22 +4524,6 @@ fn expr_side(expr: &Expr, left: &[TableRef], right: &[TableRef]) -> Option<JoinS
 	} else {
 		None
 	}
-}
-
-fn table_ref_from_object_name(name: &ObjectName) -> TableRef {
-	let parts = object_name_parts(name);
-	match parts.as_slice() {
-		[schema, table] => TableRef::with_schema(schema.clone(), table.clone()),
-		[table] => TableRef::new(table.clone()),
-		_ => TableRef::new(name.to_string()),
-	}
-}
-
-fn object_name_parts(name: &ObjectName) -> Vec<String> {
-	name.to_string()
-		.split('.')
-		.map(|part| part.trim_matches('"').to_string())
-		.collect()
 }
 
 #[cfg(test)]

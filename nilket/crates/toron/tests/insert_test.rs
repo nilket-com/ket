@@ -140,6 +140,15 @@ fn planner_rejects_unsupported_insert_shapes() {
 			"INSERT INTO catalog.public.t (a) VALUES (1)",
 			"only one- or two-part",
 		),
+		("INSERT INTO t (catalog.a) VALUES (1)", "qualified column"),
+		(
+			"INSERT INTO t (a) VALUES (1) ORDER BY a",
+			"must be VALUES only",
+		),
+		(
+			"INSERT INTO t (a) VALUES (1) LIMIT 1",
+			"must be VALUES only",
+		),
 		("INSERT OVERWRITE TABLE t (a) VALUES (1)", "OVERWRITE"),
 		(
 			"INSERT INTO t (a) VALUES (DATE '2024-01-01')",

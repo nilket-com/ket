@@ -49,6 +49,14 @@ fn limit_and_offset_without_order_by_are_unsupported() {
 }
 
 #[test]
+fn sqlparser_062_comma_limit_variant_remains_unsupported() {
+	assert_unsupported_message(
+		"SELECT id FROM t ORDER BY id LIMIT 1, 2",
+		"LIMIT offset, count",
+	);
+}
+
+#[test]
 fn unsupported_query_level_clauses_are_loud() {
 	for sql in [
 		"WITH cte AS (SELECT id FROM t) SELECT id FROM cte",
@@ -82,5 +90,19 @@ fn assert_unsupported(sql: &str) {
 	assert!(
 		matches!(err, FrontendError::Unsupported { .. }),
 		"{sql}: expected unsupported, got {err}"
+	);
+}
+
+fn assert_unsupported_message(sql: &str, diagnostic: &str) {
+	let err = SqlPlanner::new()
+		.plan(sql)
+		.expect_err("query should be unsupported");
+	assert!(
+		matches!(err, FrontendError::Unsupported { .. }),
+		"{sql}: expected unsupported, got {err}"
+	);
+	assert!(
+		err.to_string().contains(diagnostic),
+		"{sql}: expected diagnostic {diagnostic:?}, got {err}"
 	);
 }
