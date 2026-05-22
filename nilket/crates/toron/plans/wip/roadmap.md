@@ -4833,6 +4833,39 @@ along with the forward-sequence rewrite.
   Codex+Claude — vs Gemini's also-`pub(crate)`), promoted on the narrower
   surface. Placement: Toron compute-ring consumer. Migration:
   `plans/impl/069_toron_table_query_trace_consumer.md`.
+- **ADR 070 — Toron `UPDATE` without `WHERE` (PK-table symmetry restoration).**
+  Promoted (plan). Restores the one DML asymmetry ADR 063 deliberately left:
+  `UPDATE t SET … [RETURNING …]` (no `WHERE`) is accepted on **PK tables**,
+  updating every visible row — matching `DELETE` (ADR 036), which already lowers
+  a missing predicate as `None`. An **ADR-015 cycle move** (remove one reject +
+  mirror the existing path): drop the `sql_planner.rs:740` `"UPDATE requires a
+  WHERE clause"` reject, make `LogicalPlan::Update.predicate` `Expr → Option<Expr>`
+  (mirroring `Delete`), and bind `None` to `Project → Scan`
+  (`RowIdentityProjection::None`, `QueryProfileHint::Scan`) **with no `Filter`, no
+  PBC, no literal-`true`, no appended row identity** through the existing
+  `execute_write_plan_with_source` path. **Absent IS absence** (the load-bearing
+  line — a synthetic `WHERE true` would drift PBC/profile accounting). The `WHERE`
+  form remains behaviorally unchanged (incl. PK-equality `PointRead`); binder
+  gates (PK-table, PK-immutability) bind **before** the predicate branch. Every
+  063 invariant preserved (PK-table-only, PK immutable, **per-row supersession
+  atomicity — not statement-level**, coordinator-owned, **non-fragmentable** — worker arms stay
+  `NotImplemented`); 064 RETURNING composes; INSERT-SELECT coercion + NULL→
+  non-nullable-fails-before-write unchanged; whole-table source uses the
+  existing query/task budgeted source-execution paths. **No safety knob** (the
+  063 PK gate is the boundary); **no Wendelon/storage/wire/descriptor change**.
+  **Prior-guard reconciliation:** five
+  verified sites referencing the no-`WHERE`/`predicate: Expr` surface (the reject
+  string appears 3×) are **retargeted, not deleted** — `update_test.rs:67`, and
+  arch guards `adr062_…present` (`:13916`), `adr063_update_requires_where…`
+  (`:14098`, → the 070 symmetry guard), `adr063_logical_update_shape_is_name_based`
+  (`:14198`, → `Option<Expr>`), `adr063_no_transaction_lock…no_where_surface`
+  (`:14438`, drops only the no-`WHERE`-surface assertion). Final D-set: **15
+  decisions, 17 + 3 convention/meta guards, 13 fixtures**. Council: **3-of-3
+  (Codex, Gemini, Claude)** — the cleanest convergence of the cycle, no
+  substantive fork at any iteration (the lone residual, `Scan` vs a new
+  `FullTable` profile hint, resolved to the existing `QueryProfileHint::Scan`).
+  Placement: Toron compute-ring DML. Migration:
+  `plans/impl/070_update_without_where.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -4917,7 +4950,56 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 069 promoted; ADR 070 candidates
+### ADR 070 promoted; ADR 071 candidates
+
+ADR 070 selected and promoted **Toron `UPDATE` without `WHERE` (PK-table symmetry
+restoration)** — the SQL/DML return after the cross-ring observability arc. It
+restores the one asymmetry ADR 063 deliberately deferred: `UPDATE t SET …` (no
+`WHERE`) on PK tables updates every visible row, matching `DELETE` (ADR 036). An
+**ADR-015 cycle move** (remove one reject + mirror the existing path), pure
+composition over 063/064/036. Final D-set: **15 decisions, 17 + 3 convention/meta
+guards, 13 fixtures**. Council: **3-of-3 (Codex, Gemini, Claude)** — the cleanest
+convergence of the cycle, no substantive fork at any iteration.
+
+**Key decisions / invariants:**
+
+- **`Option<Expr>`, not synthetic `true`** — `LogicalPlan::Update.predicate: Expr
+  → Option<Expr>` (mirroring `Delete`); drop the `sql_planner.rs:740` reject;
+  lower with the DELETE-shaped `.map(lower_expr).transpose()?`. **Absent IS
+  absence**: the `None` branch binds no literal, compiles no PBC, installs no
+  `Filter`, infers no point-read.
+- **No-`WHERE` binder branch** — `None` ⇒ `Project → Scan`
+  (`RowIdentityProjection::None`, `QueryProfileHint::Scan` — the existing hint,
+  not a new `FullTable`), gates (PK-table, PK-immutability) bound **before** the
+  branch; the `WHERE` form (incl. PK-equality `PointRead`) remains
+  behaviorally unchanged.
+- **Every 063 invariant preserved** — PK-table-only, PK immutable, simultaneity,
+  **per-row supersession atomicity (not statement-level)**, coordinator-owned,
+  **non-fragmentable** (worker arms stay `NotImplemented`); 064 RETURNING
+  composes; whole-table source uses the existing query/task budgeted
+  source-execution paths.
+- **No new surface** — no safety knob, no Wendelon/storage/wire/descriptor
+  change, only the one IR field change.
+- **Five-site guard reconciliation** (the reject string appears 3×) — retarget,
+  don't delete: `update_test.rs:67` + the 062/063 guards at `:13916/:14098/:14198/
+  :14438`.
+
+The migration is materialized in `plans/impl/070_update_without_where.md`.
+
+**ADR 071 candidates:**
+
+- **Write/delete cross-ring trace carriers** — extend the now-complete
+  table-query trace arc (074/069) to the write/delete paths (each: a Wendelon
+  producer carrier + a Toron consumer, the 074/069 pattern repeated per message
+  family).
+- **Fragmentable bulk DML** — the deferred distribution story for whole-table
+  UPDATE/DELETE (070/063 are coordinator-owned/non-fragmentable).
+- Carried: `audit.fail_closed`; worker/observability-listener audit coverage;
+  composite-PK / DDL widening / `ALTER` / `UNIQUE`; sqlparser-0.62; typed
+  `QUERY_CANCELLED`; per-row DELETE RETURNING; JWT/OIDC/SPIFFE; gRPC/Arrow
+  Flight/Postgres frontends.
+
+### ADR 069 promoted; ADR 070 candidates (HISTORICAL)
 
 ADR 069 selected and promoted **Toron Table-Query Trace Consumer** — the Toron
 consumer half of Wendelon ADR 074 (the 072→053 / 073→060 producer/consumer
