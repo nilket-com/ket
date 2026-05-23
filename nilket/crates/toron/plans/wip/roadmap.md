@@ -5147,6 +5147,18 @@ along with the forward-sequence rewrite.
   3VL filter executes to ids `[1,2,3]` (incl. `NULL OR TRUE`) and the same predicate
   binds `FullyPushed` with scan PBC. Genuine 3-of-3. Migration:
   `plans/impl/083_rune_predicate_operator_surface.md`.
+- **ADR 084 — Rune Arithmetic Expressions.** Promoted. Adds `.add`/`.sub`/`.mul`/
+  `.div` `RuneExpr` methods → existing `Expr::Add/Sub/Mul/Div` (ADR 024 substrate),
+  closing the basic Rune numeric-expression gap (literals + predicates + arithmetic).
+  No IR/binder/executor change; `rune_engine.rs`-localized. **Texture change:**
+  arithmetic is PBC-ineligible, so the proof is computed projection + **residual**
+  filter (`EvaluateInToron`, not pushed) — the inverse of 083's gate. Inherits
+  ADR-024 semantics: overflow → `Kernel` error, int div-by-zero → NULL, truncating
+  int division, Int+Float→Float64. Reconciles the scope guard (discipline #4:
+  `add/sub/mul/div` → required). Cast/TryCast deferred (ADR 085+). 5 gates: computed
+  projection, residual predicate (ids `[2,4]`), aggregate-arg sum `71`, div-by-zero
+  NULL, overflow `Kernel`. Genuine 3-of-3 (Gemini's iter-0 overflow-→-NULL slip
+  corrected + pinned). Migration: `plans/impl/084_rune_arithmetic_expressions.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5231,7 +5243,37 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 083 promoted; ADR 084 candidates
+### ADR 084 promoted; ADR 085 candidates
+
+ADR 084 selected and promoted **Rune Arithmetic Expressions** — `.add`/`.sub`/`.mul`/
+`.div` lowering to existing `Expr`, closing the basic Rune numeric-expression gap
+(literals + predicates + arithmetic). First Rune-expr cut proven on the
+**residual/computed** path (arithmetic is PBC-ineligible), not fully-pushed.
+`rune_engine.rs`-localized. Genuine 3-of-3.
+
+**ADR 085 candidates:**
+
+- **Rune `Cast`/`TryCast`** (the 084 follow-on) — explicit type control
+  (`.cast(type)` / `.try_cast(type)` → `Expr::Cast/TryCast`); needs a target-type
+  authoring surface + strict-vs-null-on-failure policy. Deferred from 084.
+- **Rune `Like`/`InList`** — pattern/list predicates over existing `Expr::Like/InList`;
+  needs pattern/case/negation + list/empty-list/typed-coercion policy (note `Like` is
+  PBC-residual, `InList` pushes).
+- **Residual minimization for factored shapes** (078 follow-on; strongest non-Rune
+  lead) — minimal `(R1 ∨ R2)` residual in `split_boolean_tree`, gated by 078's 3VL
+  fixture.
+- **Rune joins** — needs relation-alias + qualified-column ergonomics first.
+- **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex in-tree; CPU-cost contract); **`CASE`/
+  value-conditionals**; **Rune sort/limit**; dot-field sugar; **Wendelon typed
+  table-mutation trace continuation**.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+The migration is materialized in
+`plans/impl/084_rune_arithmetic_expressions.md`.
+
+### ADR 083 promoted; ADR 084 candidates (HISTORICAL)
 
 ADR 083 selected and promoted **Rune Predicate Operator Surface** — comparison
 parity, boolean combinators (`.and`/`.or`/`.logical_not`), and null predicates as 9
