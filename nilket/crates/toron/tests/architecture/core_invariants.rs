@@ -315,3 +315,160 @@ pub(crate) fn adr076_no_production_runtime_or_dependency_change() {
 		);
 	}
 }
+
+#[test]
+pub(crate) fn adr077_no_architecture_module_exceeds_line_ceiling() {
+	let manifest_dir = manifest_dir();
+	let architecture_dir = manifest_dir.join("tests/architecture");
+	let offenders = source_files(&architecture_dir)
+		.into_iter()
+		.filter(|path| path.file_name().and_then(|name| name.to_str()) != Some("support.rs"))
+		.filter_map(|path| {
+			let line_count = std::fs::read_to_string(&path)
+				.expect("read architecture module")
+				.lines()
+				.count();
+			(line_count > 2500).then_some((path, line_count))
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"architecture modules exceed 2500-line ceiling:\n{}",
+		offenders
+			.iter()
+			.map(|(path, line_count)| format!(
+				"{}: {line_count}",
+				path.strip_prefix(&manifest_dir).unwrap_or(path).display()
+			))
+			.collect::<Vec<_>>()
+			.join("\n")
+	);
+}
+
+#[test]
+pub(crate) fn adr077_second_level_modules_are_semantic_not_adr_numbered() {
+	let architecture_dir = manifest_dir().join("tests/architecture");
+	for flat_jumbo in ["distributed_execution.rs", "storage_wendelon_boundary.rs"] {
+		assert!(
+			!architecture_dir.join(flat_jumbo).exists(),
+			"ADR077 jumbos must be directory modules, not flat files: {flat_jumbo}"
+		);
+	}
+	for expected in [
+		"distributed_execution/mod.rs",
+		"distributed_execution/tenant_admission.rs",
+		"distributed_execution/descriptor_sync.rs",
+		"distributed_execution/cancellation.rs",
+		"distributed_execution/sql_ingress.rs",
+		"distributed_execution/worker_lifecycle.rs",
+		"distributed_execution/scheduler_dispatch.rs",
+		"distributed_execution/resource_governance.rs",
+		"storage_wendelon_boundary/mod.rs",
+		"storage_wendelon_boundary/ddl_admin.rs",
+		"storage_wendelon_boundary/row_identity.rs",
+		"storage_wendelon_boundary/dml_delete_update.rs",
+		"storage_wendelon_boundary/returning.rs",
+		"storage_wendelon_boundary/descriptor_invalidation.rs",
+		"storage_wendelon_boundary/wendelon_catalog.rs",
+	] {
+		assert!(
+			architecture_dir.join(expected).exists(),
+			"missing ADR077 semantic sub-bucket {expected}"
+		);
+	}
+
+	let offenders = source_files(&architecture_dir)
+		.into_iter()
+		.filter_map(|path| {
+			let relative = path.strip_prefix(&architecture_dir).ok()?;
+			if relative.components().count() < 2 {
+				return None;
+			}
+			path.file_name()
+				.and_then(|name| name.to_str())
+				.map(str::to_owned)
+		})
+		.filter(|name| {
+			name.starts_with("adr_")
+				|| name
+					.strip_prefix("adr")
+					.and_then(|rest| rest.chars().next())
+					.is_some_and(|ch| ch.is_ascii_digit())
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"second-level architecture modules must be semantic, not ADR-numbered: {offenders:?}"
+	);
+}
+
+#[test]
+pub(crate) fn adr077_architecture_corpus_source_recurses_subdirectories() {
+	let architecture_dir = manifest_dir().join("tests/architecture");
+	let files = source_files(&architecture_dir);
+	for expected in [
+		"distributed_execution/tenant_admission.rs",
+		"distributed_execution/scheduler_dispatch.rs",
+		"storage_wendelon_boundary/ddl_admin.rs",
+		"storage_wendelon_boundary/returning.rs",
+	] {
+		assert!(
+			files.iter().any(|path| path.ends_with(expected)),
+			"architecture source_files must include recursive sub-bucket {expected}"
+		);
+	}
+
+	let corpus = architecture_corpus_source();
+	for guard in [
+		"fn adr049_sql_tenant_source_is_authenticated_peer_identity",
+		"fn scheduler_dispatch_loop_uses_acceptance_barrier",
+		"fn adr029_sql_planner_accepts_only_select_and_create_table",
+		"fn adr064_returning_supports_four_dml_variants",
+	] {
+		assert!(
+			corpus.contains(guard),
+			"architecture corpus must include sub-bucket guard {guard}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr077_architecture_command_remains_stable() {
+	let manifest_dir = manifest_dir();
+	let manifest =
+		std::fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Toron manifest");
+	let harness = std::fs::read_to_string(manifest_dir.join("tests/architecture_test.rs"))
+		.expect("read architecture harness");
+	let architecture_mod = std::fs::read_to_string(manifest_dir.join("tests/architecture/mod.rs"))
+		.expect("read architecture module declaration");
+
+	assert!(harness.contains("mod architecture;"));
+	assert!(architecture_mod.contains("pub(crate) mod distributed_execution;"));
+	assert!(architecture_mod.contains("pub(crate) mod storage_wendelon_boundary;"));
+	assert!(!manifest.contains("[[test]]"));
+	assert!(!manifest.contains("architecture_guard"));
+}
+
+#[test]
+pub(crate) fn adr077_leaf_names_conserved_after_subbucketing() {
+	let architecture = architecture_corpus_source();
+	for guard in [
+		"fn distributed_identity_keeps_morsel_id_worker_local",
+		"fn adr049_sql_tenant_source_is_authenticated_peer_identity",
+		"fn adr053_descriptor_sync_lives_in_toron_consumer",
+		"fn adr059_reuses_existing_cancel_wire_and_rejects_control_protocol_drift",
+		"fn adr029_sql_planner_accepts_only_select_and_create_table",
+		"fn adr035_scan_request_uses_row_identity_enum",
+		"fn adr063_sql_planner_accepts_statement_update",
+		"fn adr064_returning_supports_four_dml_variants",
+	] {
+		assert!(
+			architecture.contains(guard),
+			"missing preserved ADR077 sub-bucket leaf {guard}"
+		);
+	}
+	let adr077_marker = ["fn", "adr077_"].join(" ");
+	assert_eq!(architecture.matches(&adr077_marker).count(), 5);
+}
