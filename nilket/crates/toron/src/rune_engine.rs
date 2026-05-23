@@ -170,6 +170,12 @@ pub struct RuneExpr {
 	pub(crate) expr: Expr,
 }
 
+#[derive(Any, Debug, Clone)]
+pub struct RuneNamedExpr {
+	pub(crate) expr: Expr,
+	pub(crate) name: String,
+}
+
 impl RuneDataFrame {
 	pub fn new(table: String) -> Self {
 		Self {
@@ -196,6 +202,22 @@ impl RuneDataFrame {
 				input: Box::new(self.plan),
 				output_names: vec![None; exprs.len()],
 				exprs,
+			},
+		}
+	}
+
+	pub fn select(self, exprs: Vec<RuneNamedExpr>) -> Self {
+		let mut plan_exprs = Vec::with_capacity(exprs.len());
+		let mut output_names = Vec::with_capacity(exprs.len());
+		for named in exprs {
+			plan_exprs.push(named.expr);
+			output_names.push(Some(named.name));
+		}
+		Self {
+			plan: LogicalPlan::Project {
+				input: Box::new(self.plan),
+				exprs: plan_exprs,
+				output_names,
 			},
 		}
 	}
@@ -281,9 +303,44 @@ pub fn approx_quantile(val: RuneExpr, q: f64) -> RuneAggr {
 	}
 }
 
+pub fn count_all() -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::CountAll,
+		args: vec![Expr::column("count")],
+	}
+}
+
+pub fn count(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::Count,
+		args: vec![expr.expr],
+	}
+}
+
 pub fn sum(expr: RuneExpr) -> RuneAggr {
 	RuneAggr {
 		func: AggregateFunction::Sum,
+		args: vec![expr.expr],
+	}
+}
+
+pub fn avg(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::Avg,
+		args: vec![expr.expr],
+	}
+}
+
+pub fn min(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::Min,
+		args: vec![expr.expr],
+	}
+}
+
+pub fn max(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::Max,
 		args: vec![expr.expr],
 	}
 }
@@ -295,6 +352,13 @@ pub async fn sandbox_sleep_ms(ms: i64) {
 }
 
 impl RuneExpr {
+	pub fn named(self, name: String) -> RuneNamedExpr {
+		RuneNamedExpr {
+			expr: self.expr,
+			name,
+		}
+	}
+
 	pub fn gt(self, other: RuneExpr) -> RuneExpr {
 		RuneExpr {
 			expr: Expr::Gt(Box::new(self.expr), Box::new(other.expr)),
@@ -312,6 +376,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	let mut m = Module::new();
 	m.ty::<RuneDataFrame>()?;
 	m.ty::<RuneExpr>()?;
+	m.ty::<RuneNamedExpr>()?;
 	m.ty::<RuneAggr>()?;
 	m.ty::<ToronContext>()?;
 
@@ -320,7 +385,12 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["time_bucket"], time_bucket).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
+	m.function(["count_all"], count_all).build()?;
+	m.function(["count"], count).build()?;
 	m.function(["sum"], sum).build()?;
+	m.function(["avg"], avg).build()?;
+	m.function(["min"], min).build()?;
+	m.function(["max"], max).build()?;
 	#[cfg(test)]
 	m.function(["sandbox_sleep_ms"], sandbox_sleep_ms).build()?;
 
@@ -328,10 +398,13 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("sql", ToronContext::sql)?;
 	m.associated_function("filter", RuneDataFrame::filter)?;
 	m.associated_function("project", RuneDataFrame::project)?;
+	m.associated_function("select", RuneDataFrame::select)?;
+	m.associated_function("select_named", RuneDataFrame::select)?;
 	m.associated_function("aggregate", RuneDataFrame::aggregate)?;
 	m.associated_function("count", RuneDataFrame::count)?;
 
 	// Expression methods
+	m.associated_function("named", RuneExpr::named)?;
 	m.associated_function("gt", RuneExpr::gt)?;
 	m.associated_function("eq", RuneExpr::eq)?;
 
@@ -461,6 +534,8 @@ fn compile_script(
 	config: &RuneSandboxConfig,
 ) -> Result<Unit, FrontendError> {
 	limit::with(usize_budget(config.memory_budget), || {
+		let normalized_script = normalize_rune_named_select_surface(script);
+		let script = normalized_script.as_deref().unwrap_or(script);
 		let mut sources = Sources::new();
 		sources
 			.insert(
@@ -505,6 +580,102 @@ fn compile_script(
 		})
 	})
 	.call()
+}
+
+fn normalize_rune_named_select_surface(script: &str) -> Option<String> {
+	const FROM: &str = ".select";
+	const TO: &str = ".select_named";
+
+	// Rune reserves `select`, so preserve the ADR 080 `.select(...)` authoring
+	// surface by dispatching to a non-keyword host method before compilation.
+	let bytes = script.as_bytes();
+	let mut rewritten = None::<String>;
+	let mut index = 0;
+
+	while index < bytes.len() {
+		let start = index;
+		if bytes[index] == b'"' || bytes[index] == b'`' {
+			index = skip_rune_quoted(bytes, index, bytes[index]);
+			if let Some(output) = &mut rewritten {
+				output.push_str(&script[start..index]);
+			}
+			continue;
+		}
+		if bytes[index] == b'/' && index + 1 < bytes.len() {
+			if bytes[index + 1] == b'/' {
+				index = skip_rune_line_comment(bytes, index);
+				if let Some(output) = &mut rewritten {
+					output.push_str(&script[start..index]);
+				}
+				continue;
+			}
+			if bytes[index + 1] == b'*' {
+				index = skip_rune_block_comment(bytes, index);
+				if let Some(output) = &mut rewritten {
+					output.push_str(&script[start..index]);
+				}
+				continue;
+			}
+		}
+		if script[index..].starts_with(FROM)
+			&& !is_ascii_ident_continue(bytes.get(index + FROM.len()).copied())
+		{
+			let output = rewritten.get_or_insert_with(|| {
+				let mut output = String::with_capacity(script.len() + TO.len() - FROM.len());
+				output.push_str(&script[..index]);
+				output
+			});
+			output.push_str(TO);
+			index += FROM.len();
+			continue;
+		}
+
+		let ch = script[index..]
+			.chars()
+			.next()
+			.expect("index is inside script");
+		index += ch.len_utf8();
+		if let Some(output) = &mut rewritten {
+			output.push(ch);
+		}
+	}
+
+	rewritten
+}
+
+fn skip_rune_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+	let mut index = start + 1;
+	while index < bytes.len() {
+		match bytes[index] {
+			b'\\' => index = (index + 2).min(bytes.len()),
+			byte if byte == quote => return index + 1,
+			_ => index += 1,
+		}
+	}
+	bytes.len()
+}
+
+fn skip_rune_line_comment(bytes: &[u8], start: usize) -> usize {
+	let mut index = start + 2;
+	while index < bytes.len() && bytes[index] != b'\n' {
+		index += 1;
+	}
+	index
+}
+
+fn skip_rune_block_comment(bytes: &[u8], start: usize) -> usize {
+	let mut index = start + 2;
+	while index + 1 < bytes.len() {
+		if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+			return index + 2;
+		}
+		index += 1;
+	}
+	bytes.len()
+}
+
+fn is_ascii_ident_continue(byte: Option<u8>) -> bool {
+	matches!(byte, Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'))
 }
 
 fn usize_budget(value: u64) -> usize {
@@ -641,5 +812,23 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[test]
+	fn named_select_surface_normalizes_keyword_method_only_in_code() {
+		let script = r#"
+            pub fn main(ctx) {
+                let text = ".select([col(\"x\")])";
+                // .select([col("comment")])
+                ctx.table("sales").select([col("region").named("bucket")])
+            }
+        "#;
+
+		let normalized =
+			normalize_rune_named_select_surface(script).expect("select method normalized");
+
+		assert!(normalized.contains(".select_named([col(\"region\").named(\"bucket\")])"));
+		assert!(normalized.contains("\".select([col(\\\"x\\\")])\""));
+		assert!(normalized.contains("// .select([col(\"comment\")])"));
 	}
 }

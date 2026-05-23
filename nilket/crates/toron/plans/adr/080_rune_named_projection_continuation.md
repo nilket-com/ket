@@ -27,6 +27,16 @@ projection carrier (`RuneNamedExpr`), a `.select(...)` dataframe method lowering
 pack (`count_all`, `count`, `avg`, `min`, `max`). No IR variant, no binder seam, no
 engine change.
 
+**Implementation refinement:** Rune 0.14 reserves `select` as a language keyword,
+so `df.select(...)` is rejected by the Rune parser before host method dispatch.
+ADR 080 keeps the authored `.select(...)` surface by normalizing that exact method
+token to an internal non-keyword `select_named` host registration before Rune
+compilation. The semantic lowering remains `RuneDataFrame::select(...) ->
+LogicalPlan::Project.output_names`; this is a frontend keyword-compatibility shim,
+not a SQL, binder, IR, executor, or worker change. ADR 081 will revisit whether the
+long-term authored surface should stay shimmed as `.select(...)` or be renamed to
+drop the pre-compile normalizer.
+
 The promotion gate is one composed Rune program that **binds and executes**:
 
 ```rune
@@ -78,6 +88,11 @@ remains the shared substrate; SQL remains a relation-producing frontend under Ru
 - **`lit` is i32-only** — the gate stays within it (SQL
   supplies `status='open'`; Rune compares with integer lits). String/float Rune
   literals are deferred.
+- **Rune keyword rider** — `select` is a Rune 0.14 keyword, so the implemented
+  `.select(...)` surface is preserved through a bounded pre-compile normalization
+  to the internal `select_named` host method. The guard
+  `adr080_named_select_lowers_to_existing_project_output_names` pins the normalizer
+  and the `compile_script` call; the implementation evidence records the reason.
 
 **Hand-verified gate output** against the `sales` fixture
 (region=[east,west,east,east,west,NULL], amount=[10,20,NULL,30,NULL,7],
@@ -94,6 +109,11 @@ canonical `col("amount").named("net")`. Global `named(expr, name)` fallback allo
 only if Rune method registration fails and the reason is recorded.
 **D3 Named dataframe select.** `RuneDataFrame::select(Vec<RuneNamedExpr>) ->
 RuneDataFrame` → `Project { exprs, output_names: all Some(name) }`.
+**D3a Keyword-compatible select dispatch.** Because `select` is reserved by Rune,
+the ADR 080 implementation preserves authored `.select(...)` with a pre-compile
+normalization to an internal `select_named` host registration. This is accepted as
+an implementation-discovered compatibility rider for ADR 080; the council should
+make an explicit shim-vs-rename decision in ADR 081.
 **D4 Anonymous project remains.** `.project(Vec<RuneExpr>)` stays the anonymous
 surface (all `None`); not renamed/removed.
 **D5 No alias state on `RuneExpr`.** Expression carrier only — aliases never flow

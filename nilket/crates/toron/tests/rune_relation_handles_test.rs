@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
-use toron::error::{FrontendError, StorageError};
+use toron::error::{BindingError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{ExecutionPlan, FilterDisposition, LogicalPlan, TableId};
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
@@ -168,6 +168,232 @@ async fn rune_sql_parse_error_maps_to_frontend_error_without_capability_escape()
 	assert!(message.contains("SQL parse failed"), "{message}");
 	assert!(!message.contains("Rune sandbox violation"), "{message}");
 	assert!(!message.contains("/home/"), "{message}");
+}
+
+#[tokio::test]
+async fn rune_named_sql_multi_hop_continuation_binds_and_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT region, amount FROM sales WHERE status = 'open'")
+               .filter(col("amount").gt(lit(10)))
+               .select([
+                   col("region").named("bucket"),
+                   col("amount").named("net"),
+               ])
+               .aggregate([col("bucket")], [sum(col("net")), count_all()])
+               .select([
+                   col("bucket").named("bucket"),
+                   col("sum").named("gross"),
+                   col("count").named("n"),
+               ])
+               .filter(col("gross").gt(lit(20)))
+        }
+    "#,
+	)
+	.await
+	.expect("multi-hop named continuation");
+
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind multi-hop named continuation");
+	assert_schema_names(bound.schema().as_ref(), &["bucket", "gross", "n"]);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![Some("east".to_string())]
+	);
+	assert_eq!(int64_column_rows(&batches, 1), vec![Some(30)]);
+	assert_eq!(int64_column_rows(&batches, 2), vec![Some(1)]);
+}
+
+#[tokio::test]
+async fn rune_named_select_sets_project_output_names() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .select([
+                   col("region").named("bucket"),
+                   col("amount").named("net"),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("named select plan");
+
+	let LogicalPlan::Project { output_names, .. } = logical else {
+		panic!("expected named Project, got {logical:?}");
+	};
+	assert_eq!(
+		output_names,
+		vec![Some("bucket".to_string()), Some("net".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn rune_named_select_binds_visible_schema() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .select([
+                   col("region").named("bucket"),
+                   col("amount").named("net"),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("named select plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind named select");
+
+	assert_schema_names(bound.schema().as_ref(), &["bucket", "net"]);
+}
+
+#[tokio::test]
+async fn rune_aggregate_helper_pack_binds_stable_outputs() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [
+                   count_all(),
+                   count(col("amount")),
+                   sum(col("amount")),
+                   avg(col("amount")),
+                   min(col("amount")),
+                   max(col("amount")),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("aggregate helper pack plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind stable aggregate helpers");
+
+	assert_schema_names(
+		bound.schema().as_ref(),
+		&["count", "count", "sum", "avg", "min", "max"],
+	);
+}
+
+#[tokio::test]
+async fn rune_named_post_aggregate_select_renames_outputs() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [sum(col("amount"))])
+               .select([col("sum").named("gross")])
+        }
+    "#,
+	)
+	.await
+	.expect("post aggregate named select plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind post aggregate rename");
+
+	assert_schema_names(bound.schema().as_ref(), &["gross"]);
+}
+
+#[tokio::test]
+async fn rune_duplicate_aggregate_output_name_is_ambiguous() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [sum(col("amount")), sum(col("id"))])
+               .select([col("sum").named("gross")])
+        }
+    "#,
+	)
+	.await
+	.expect("duplicate aggregate output plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("duplicate aggregate output name should be ambiguous");
+
+	assert!(matches!(
+		error,
+		BindingError::AmbiguousColumn { column } if column == "sum"
+	));
+}
+
+#[tokio::test]
+async fn rune_named_select_rejects_misused_named_expression() {
+	let error = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [sum(col("amount").named("net"))])
+        }
+    "#,
+	)
+	.await
+	.expect_err("RuneNamedExpr must not be accepted as RuneExpr");
+
+	let message = frontend_message(error);
+	assert!(!message.contains("Rune capability denied"), "{message}");
+	assert!(!message.contains("/home/"), "{message}");
+}
+
+#[tokio::test]
+async fn rune_named_projection_preserves_adr079_sql_relation_guards() {
+	let multi_statement = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT id FROM sales; DROP TABLE sales")
+        }
+    "#,
+	)
+	.await
+	.expect_err("multi statement SQL must remain rejected");
+	assert_frontend_message_contains(multi_statement, "exactly one SQL statement");
+
+	let ddl = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("DROP TABLE sales")
+        }
+    "#,
+	)
+	.await
+	.expect_err("terminal SQL must remain rejected");
+	assert_frontend_message_contains(ddl, "ctx.sql accepts single query relations only");
+
+	let alias_bound = bind(
+		&sql_group_by_alias_outer_sum_plan().await,
+		&catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("ADR079 SQL alias continuation still binds");
+	assert_schema_names(alias_bound.schema().as_ref(), &["sum"]);
+
+	let pushdown = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM sales")
+               .filter(col("amount").gt(lit(10)))
+        }
+    "#,
+	)
+	.await
+	.expect("compose SQL scan with Rune filter");
+	let bound = bind(&pushdown, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind composed Rune SQL filter");
+	let (_, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::FullyPushed);
+	assert!(scan_pbc(scan).is_some());
 }
 
 async fn sql_group_by_alias_outer_sum_plan() -> LogicalPlan {
@@ -379,6 +605,31 @@ fn int64_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<i64>>
 				.collect::<Vec<_>>()
 		})
 		.collect()
+}
+
+fn string_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<String>> {
+	batches
+		.iter()
+		.flat_map(|batch| {
+			batch
+				.column(column)
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.expect("Utf8 column")
+				.iter()
+				.map(|value| value.map(str::to_string))
+				.collect::<Vec<_>>()
+		})
+		.collect()
+}
+
+fn assert_schema_names(schema: &Schema, expected: &[&str]) {
+	let actual = schema
+		.fields()
+		.iter()
+		.map(|field| field.name().as_str())
+		.collect::<Vec<_>>();
+	assert_eq!(actual, expected);
 }
 
 fn frontend_message(error: FrontendError) -> String {
