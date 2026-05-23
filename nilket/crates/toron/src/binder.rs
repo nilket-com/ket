@@ -2133,20 +2133,18 @@ fn optimize_for_required(
 		} => {
 			let requested_outputs =
 				required_output.unwrap_or_else(|| output_columns(exprs.root_count()));
+			let requested_outputs_vec = requested_outputs.iter().copied().collect::<Vec<_>>();
+			let exprs = project_program_roots(&exprs, &requested_outputs_vec)?;
 			let mut child_required = BTreeSet::new();
-			for ordinal in &requested_outputs {
-				let root = exprs.roots.get(ordinal.0 as usize).ok_or_else(|| {
-					BindingError::UnsupportedExpression {
-						message: format!("project output ordinal {:?} out of bounds", ordinal),
-					}
-				})?;
-				collect_program_node_columns(&exprs, *root, &mut child_required);
-			}
+			collect_program_columns(&exprs, &mut child_required);
 			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
 			let exprs = rewrite_program_ordinals(exprs, &remap)?;
-			let output_schema = schema_for_exprs_with_existing_names(&exprs, &output_schema);
-			let output_remap =
-				ordinal_remap(&requested_outputs.iter().copied().collect::<Vec<_>>());
+			let output_schema = schema_for_projected_exprs_with_existing_names(
+				&exprs,
+				&output_schema,
+				&requested_outputs_vec,
+			);
+			let output_remap = ordinal_remap(&requested_outputs_vec);
 
 			Ok((
 				ExecutionPlan::Project {
@@ -2182,8 +2180,7 @@ fn optimize_for_required(
 				.collect::<Result<Vec<_>, BindingError>>()?;
 			let output_schema = aggregate_schema(&group_expr, &aggr_expr);
 			let output_remap = ordinal_remap(
-				&required_output
-					.unwrap_or_else(|| output_columns(output_schema.fields().len()))
+				&output_columns(output_schema.fields().len())
 					.iter()
 					.copied()
 					.collect::<Vec<_>>(),
@@ -2412,6 +2409,35 @@ fn output_columns(len: usize) -> BTreeSet<ColumnOrdinal> {
 	(0..len)
 		.map(|idx| ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow")))
 		.collect()
+}
+
+fn project_program_roots(
+	source: &BoundExprProgram,
+	requested_outputs: &[ColumnOrdinal],
+) -> Result<BoundExprProgram, BindingError> {
+	let mut builder = BoundExprProgramBuilder::new();
+	let mut remap = HashMap::new();
+	for ordinal in requested_outputs {
+		let root = *source.roots.get(ordinal.0 as usize).ok_or_else(|| {
+			BindingError::UnsupportedExpression {
+				message: format!("project output ordinal {:?} out of bounds", ordinal),
+			}
+		})?;
+		let cloned =
+			clone_bound_subgraph(source, root, &mut builder, &mut remap).ok_or_else(|| {
+				BindingError::UnsupportedExpression {
+					message: format!("project output ordinal {:?} is malformed", ordinal),
+				}
+			})?;
+		builder.push_root(cloned);
+	}
+	let program = builder.build();
+	program
+		.validate()
+		.map_err(|error| BindingError::UnsupportedExpression {
+			message: format!("project output program is malformed: {error:?}"),
+		})?;
+	Ok(program)
 }
 
 fn ordinal_remap(requested: &[ColumnOrdinal]) -> OrdinalRemap {
@@ -3339,18 +3365,19 @@ fn schema_for_exprs_with_output_names(
 	Arc::new(Schema::new(fields))
 }
 
-fn schema_for_exprs_with_existing_names(
+fn schema_for_projected_exprs_with_existing_names(
 	exprs: &BoundExprProgram,
 	existing_schema: &SchemaRef,
+	requested_outputs: &[ColumnOrdinal],
 ) -> SchemaRef {
 	let fields = exprs
 		.roots
 		.iter()
 		.enumerate()
 		.map(|(idx, _)| {
-			let name = existing_schema
-				.fields()
+			let name = requested_outputs
 				.get(idx)
+				.and_then(|ordinal| existing_schema.fields().get(ordinal.0 as usize))
 				.map(|field| field.name().clone())
 				.unwrap_or_else(|| {
 					exprs

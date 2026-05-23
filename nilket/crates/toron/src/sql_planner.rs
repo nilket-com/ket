@@ -848,6 +848,19 @@ fn primary_key_type_is_supported(data_type: &DataType) -> bool {
 	)
 }
 
+fn relation_plan_is_terminal(plan: &LogicalPlan) -> bool {
+	matches!(
+		plan,
+		LogicalPlan::CreateTable { .. }
+			| LogicalPlan::CreateTableAsSelect { .. }
+			| LogicalPlan::DropTable { .. }
+			| LogicalPlan::Delete { .. }
+			| LogicalPlan::Update { .. }
+			| LogicalPlan::Insert { .. }
+			| LogicalPlan::InsertSelect { .. }
+	)
+}
+
 pub struct SqlPlanner;
 
 impl Default for SqlPlanner {
@@ -871,13 +884,44 @@ impl SqlPlanner {
 			return Err(unsupported("empty SQL statement"));
 		}
 
-		match &ast[0] {
+		self.lower_statement(&ast[0])
+	}
+
+	pub fn plan_relation(&self, sql: &str) -> Result<LogicalPlan, FrontendError> {
+		let statement = self.parse_one_statement(sql)?;
+		let plan = self.lower_statement(&statement)?;
+		if relation_plan_is_terminal(&plan) {
+			return Err(unsupported("ctx.sql accepts single query relations only"));
+		}
+		Ok(plan)
+	}
+
+	fn parse_one_statement(&self, sql: &str) -> Result<Statement, FrontendError> {
+		let dialect = GenericDialect {};
+		let mut ast = Parser::parse_sql(&dialect, sql).map_err(|e| FrontendError::SqlParse {
+			message: e.to_string(),
+		})?;
+
+		if ast.is_empty() {
+			return Err(unsupported("ctx.sql accepts single query relations only"));
+		}
+		if ast.len() != 1 {
+			return Err(unsupported(
+				"ctx.sql accepts single query relations only; exactly one SQL statement is required",
+			));
+		}
+
+		Ok(ast.remove(0))
+	}
+
+	fn lower_statement(&self, statement: &Statement) -> Result<LogicalPlan, FrontendError> {
+		match statement {
 			Statement::Query(query) => self.lower_query(query),
 			Statement::CreateTable(create_table) => self.lower_create_table(create_table),
 			Statement::Insert(insert) => self.lower_insert(insert),
 			Statement::Delete(delete) => self.lower_delete(delete),
 			Statement::Update(update) => self.lower_update(update),
-			Statement::Drop { .. } => self.lower_drop_table(&ast[0]),
+			Statement::Drop { .. } => self.lower_drop_table(statement),
 			_ => Err(unsupported(
 				"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported",
 			)),

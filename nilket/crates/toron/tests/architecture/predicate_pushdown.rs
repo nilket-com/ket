@@ -967,9 +967,15 @@ pub(crate) fn adr074_alter_table_remains_unsupported() {
 		.next()
 		.expect("plan body")
 		.1;
+	let lower_statement = brace_blocks_after_marker(&planner, "fn lower_statement")
+		.into_iter()
+		.next()
+		.expect("lower_statement body")
+		.1;
+	let dispatch_body = format!("{plan_body}\n{lower_statement}");
 
-	assert!(!plan_body.contains("Statement::AlterTable"));
-	assert!(plan_body.contains("unsupported SQL statement; only SELECT"));
+	assert!(!dispatch_body.contains("Statement::AlterTable"));
+	assert!(dispatch_body.contains("unsupported SQL statement; only SELECT"));
 }
 
 #[test]

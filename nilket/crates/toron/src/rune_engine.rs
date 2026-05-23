@@ -1,8 +1,9 @@
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{AggregateFunction, Expr, LogicalPlan, ScalarValue};
+use crate::sql_planner::SqlPlanner;
 use rune::alloc::limit;
-use rune::runtime::budget;
+use rune::runtime::{VmResult, budget};
 use rune::{Any, Context, Diagnostics, Module, Source, Sources, Unit, Vm};
 use std::sync::Arc;
 use std::time::Duration;
@@ -233,6 +234,13 @@ impl ToronContext {
 	pub fn table(&self, name: String) -> RuneDataFrame {
 		RuneDataFrame::new(name)
 	}
+
+	pub fn sql(&self, query: String) -> VmResult<RuneDataFrame> {
+		match SqlPlanner::new().plan_relation(&query) {
+			Ok(plan) => VmResult::Ok(RuneDataFrame { plan }),
+			Err(error) => VmResult::panic(error.to_string()),
+		}
+	}
 }
 
 pub fn col(name: String) -> RuneExpr {
@@ -273,6 +281,13 @@ pub fn approx_quantile(val: RuneExpr, q: f64) -> RuneAggr {
 	}
 }
 
+pub fn sum(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::Sum,
+		args: vec![expr.expr],
+	}
+}
+
 #[cfg(test)]
 pub async fn sandbox_sleep_ms(ms: i64) {
 	let ms = u64::try_from(ms).unwrap_or(0);
@@ -305,10 +320,12 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["time_bucket"], time_bucket).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
+	m.function(["sum"], sum).build()?;
 	#[cfg(test)]
 	m.function(["sandbox_sleep_ms"], sandbox_sleep_ms).build()?;
 
 	m.associated_function("table", ToronContext::table)?;
+	m.associated_function("sql", ToronContext::sql)?;
 	m.associated_function("filter", RuneDataFrame::filter)?;
 	m.associated_function("project", RuneDataFrame::project)?;
 	m.associated_function("aggregate", RuneDataFrame::aggregate)?;

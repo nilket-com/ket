@@ -3,7 +3,7 @@
 use super::support::*;
 use super::{
 	core_invariants::*, distributed_execution::*, network_tls::*, observability_audit::*,
-	observability_telemetry::*, predicate_pushdown::*, ring_placement::*,
+	observability_telemetry::*, predicate_pushdown::*, ring_placement::*, rune_frontend::*,
 	storage_wendelon_boundary::*,
 };
 
@@ -2092,6 +2092,12 @@ pub(crate) fn adr073_no_new_sql_capability_surface() {
 		.next()
 		.expect("plan body")
 		.1;
+	let lower_statement = brace_blocks_after_marker(&planner, "fn lower_statement")
+		.into_iter()
+		.next()
+		.expect("lower_statement body")
+		.1;
+	let dispatch_body = format!("{plan_body}\n{lower_statement}");
 
 	for accepted in [
 		"Statement::Query(query)",
@@ -2102,7 +2108,7 @@ pub(crate) fn adr073_no_new_sql_capability_surface() {
 		"Statement::Drop { .. }",
 	] {
 		assert!(
-			plan_body.contains(accepted),
+			dispatch_body.contains(accepted),
 			"missing existing surface {accepted}"
 		);
 	}
@@ -2114,11 +2120,11 @@ pub(crate) fn adr073_no_new_sql_capability_surface() {
 		"Statement::Merge",
 	] {
 		assert!(
-			!plan_body.contains(forbidden),
+			!dispatch_body.contains(forbidden),
 			"planner gained new SQL surface {forbidden}"
 		);
 	}
-	assert!(plan_body.contains(
+	assert!(dispatch_body.contains(
 		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported"
 	));
 }

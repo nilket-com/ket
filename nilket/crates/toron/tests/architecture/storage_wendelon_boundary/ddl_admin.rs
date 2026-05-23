@@ -19,17 +19,23 @@ pub(crate) fn adr029_sql_planner_accepts_only_select_and_create_table() {
 		.next()
 		.expect("SqlPlanner::plan body")
 		.1;
+	let lower_statement = brace_blocks_after_marker(&planner, "fn lower_statement")
+		.into_iter()
+		.next()
+		.expect("SqlPlanner::lower_statement body")
+		.1;
+	let dispatch_body = format!("{plan_body}\n{lower_statement}");
 
-	assert!(plan_body.contains("Statement::Query(query)"));
-	assert!(plan_body.contains("Statement::CreateTable(create_table)"));
-	assert!(plan_body.contains("Statement::Insert(insert)"));
-	assert!(plan_body.contains("Statement::Delete(delete)"));
-	assert!(plan_body.contains("Statement::Drop { .. }"));
-	assert!(plan_body.contains(
+	assert!(dispatch_body.contains("Statement::Query(query)"));
+	assert!(dispatch_body.contains("Statement::CreateTable(create_table)"));
+	assert!(dispatch_body.contains("Statement::Insert(insert)"));
+	assert!(dispatch_body.contains("Statement::Delete(delete)"));
+	assert!(dispatch_body.contains("Statement::Drop { .. }"));
+	assert!(dispatch_body.contains(
 		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported"
 	));
-	assert!(!plan_body.contains("only SELECT and CREATE TABLE are supported"));
-	assert!(!plan_body.contains("only SELECT is supported"));
+	assert!(!dispatch_body.contains("only SELECT and CREATE TABLE are supported"));
+	assert!(!dispatch_body.contains("only SELECT is supported"));
 }
 
 #[test]
@@ -724,10 +730,16 @@ pub(crate) fn adr034_sql_planner_accepts_drop_table() {
 		.next()
 		.expect("SqlPlanner::plan body")
 		.1;
+	let lower_statement = brace_blocks_after_marker(&planner, "fn lower_statement")
+		.into_iter()
+		.next()
+		.expect("SqlPlanner::lower_statement body")
+		.1;
+	let dispatch_body = format!("{plan_body}\n{lower_statement}");
 
-	assert!(plan_body.contains("Statement::Drop { .. }"));
-	assert!(plan_body.contains("self.lower_drop_table(&ast[0])"));
-	assert!(plan_body.contains("DROP TABLE"));
+	assert!(dispatch_body.contains("Statement::Drop { .. }"));
+	assert!(dispatch_body.contains("self.lower_drop_table(statement)"));
+	assert!(dispatch_body.contains("DROP TABLE"));
 }
 
 #[test]

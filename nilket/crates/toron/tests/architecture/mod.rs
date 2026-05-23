@@ -5,6 +5,7 @@ pub(crate) mod observability_audit;
 pub(crate) mod observability_telemetry;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod ring_placement;
+pub(crate) mod rune_frontend;
 pub(crate) mod sql_planner_surface;
 pub(crate) mod storage_wendelon_boundary;
 pub(crate) mod support;

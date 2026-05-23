@@ -1266,8 +1266,14 @@ pub(crate) fn adr063_sql_planner_accepts_statement_update() {
 		.next()
 		.expect("plan body")
 		.1;
+	let lower_statement = brace_blocks_after_marker(&planner, "fn lower_statement")
+		.into_iter()
+		.next()
+		.expect("lower_statement body")
+		.1;
+	let dispatch_body = format!("{plan_body}\n{lower_statement}");
 
-	assert!(plan_body.contains("Statement::Update(update) => self.lower_update(update)"));
+	assert!(dispatch_body.contains("Statement::Update(update) => self.lower_update(update)"));
 }
 
 #[test]
@@ -1329,8 +1335,14 @@ pub(crate) fn adr063_unsupported_statement_text_lists_update() {
 		.next()
 		.expect("plan body")
 		.1;
+	let lower_statement = brace_blocks_after_marker(&planner, "fn lower_statement")
+		.into_iter()
+		.next()
+		.expect("lower_statement body")
+		.1;
+	let dispatch_body = format!("{plan_body}\n{lower_statement}");
 
-	assert!(plan_body.contains("SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE"));
+	assert!(dispatch_body.contains("SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE"));
 }
 
 #[test]

@@ -31,6 +31,13 @@ binder, resolving outer `col("cnt")` against the SQL-derived output schema. The
 assertion is **schema continuation across the SQL/Rune boundary**, not a brittle
 adjacent-node shape.
 
+Implementation refinement: that binding gate also surfaced and fixed a latent
+SQL correctness bug in aggregate-only grouped projections such as
+`SELECT COUNT(*) FROM sales GROUP BY region`, where the group key is required for
+aggregation but dropped from the visible output. The fix travels with ADR 079
+because it is the same schema-continuation path the Rune relation handle relies
+on.
+
 ## Doctrine
 
 **SQL is a relation-producing frontend. Rune is the composition frontend. Toron IR
@@ -149,10 +156,11 @@ guard + binding-proof). Genuine 3-of-3, no fork.
 
 ## Promotion criteria met
 
-D-set 13; 14 guards; 8 fixtures; behavior-additive (existing SQL + Rune unchanged);
-Toron-only; no new dependency/wire/storage/PBC-opcode/worker-Rune/execution-action/
-SQL-subquery/`syn`. The promotion gate is the **bound** SQL-alias continuation
-fixture + multi-statement rejection. Migration:
+D-set 13; 14 guards; 8 fixtures; behavior-additive for Rune plus one
+schema-continuation correctness fix for existing aggregate-only grouped SQL
+projections; Toron-only; no new dependency/wire/storage/PBC-opcode/worker-Rune/
+execution-action/SQL-subquery/`syn`. The promotion gate is the **bound**
+SQL-alias continuation fixture + multi-statement rejection. Migration:
 `plans/impl/079_rune_relation_handles.md`.
 
 ## Conclusion

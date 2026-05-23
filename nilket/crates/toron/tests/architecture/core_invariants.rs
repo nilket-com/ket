@@ -3,7 +3,8 @@
 use super::support::*;
 use super::{
 	distributed_execution::*, network_tls::*, observability_audit::*, observability_telemetry::*,
-	predicate_pushdown::*, ring_placement::*, sql_planner_surface::*, storage_wendelon_boundary::*,
+	predicate_pushdown::*, ring_placement::*, rune_frontend::*, sql_planner_surface::*,
+	storage_wendelon_boundary::*,
 };
 
 #[test]

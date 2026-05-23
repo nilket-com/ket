@@ -1233,6 +1233,28 @@ async fn grouped_aggregate_order_by_duplicate_generated_name_is_ambiguous() {
 }
 
 #[tokio::test]
+async fn grouped_aggregate_can_project_only_aggregates_and_drop_group_keys() {
+	let (catalog, _) = fixture();
+	let one_key_logical = plan_sql("SELECT COUNT(*) FROM sales GROUP BY region");
+	let one_key_bound = bind(&one_key_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind aggregate-only projection over one group key");
+	assert_eq!(one_key_bound.schema().fields().len(), 1);
+	assert_eq!(one_key_bound.schema().field(0).name(), "count");
+	let one_key = run_logical(&one_key_logical).await;
+	assert_eq!(sorted_int64_column_rows(&one_key, 0), vec![1, 2, 3]);
+
+	let two_key_logical = plan_sql("SELECT COUNT(*) FROM sales GROUP BY region, status");
+	let two_key_bound = bind(&two_key_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind aggregate-only projection over two group keys");
+	assert_eq!(two_key_bound.schema().fields().len(), 1);
+	assert_eq!(two_key_bound.schema().field(0).name(), "count");
+	let two_key = run_logical(&two_key_logical).await;
+	assert_eq!(sorted_int64_column_rows(&two_key, 0), vec![1, 1, 2, 2]);
+}
+
+#[tokio::test]
 async fn grouped_aggregate_having_binds_against_aggregate_output() {
 	let (catalog, _) = fixture();
 	let logical =
@@ -3258,6 +3280,15 @@ fn scalar_int64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<O
 			});
 		}
 	}
+	rows
+}
+
+fn sorted_int64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<i64> {
+	let mut rows = scalar_int64_column_rows(results, column_idx)
+		.into_iter()
+		.map(|value| value.expect("non-null Int64 row"))
+		.collect::<Vec<_>>();
+	rows.sort_unstable();
 	rows
 }
 

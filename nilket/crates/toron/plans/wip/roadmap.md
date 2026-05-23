@@ -5074,8 +5074,10 @@ along with the forward-sequence rewrite.
   through the normal Toron binder/pushdown/placement/execution (no Rune-local
   optimizer/executor). **Doctrine:** SQL = relation-producing frontend, Rune =
   composition frontend, Toron IR = shared substrate (future SQL work improves the
-  substrate, not SQL-as-top-authoring-model). Only new code: `ctx.sql` (+
-  `plan_sql_relation`) and a `sum` helper. **Two grounded guardrails:** (1)
+  substrate, not SQL-as-top-authoring-model). Primary new surface: `ctx.sql` (+
+  `plan_relation`) and a `sum` helper; implementation also repaired the existing
+  aggregate-only grouped SQL projection shape (`SELECT COUNT(*) ... GROUP BY key`)
+  that the binding gate exposed. **Two grounded guardrails:** (1)
   **explicit multi-statement rejection** (`SqlPlanner::plan` parses all statements
   but lowers only `ast[0]`, so `ctx.sql` enforces `ast.len()==1` — else a
   `SELECT…; DROP…` silently drops the DROP); (2) **DDL/DML rejected** (no side
@@ -5187,9 +5189,11 @@ substrate. Final D-set: **13 decisions, 14 guards, 8 fixtures**. Council: **genu
 
 **Key decisions / invariants:**
 
-- **Lazy handle** (`RuneDataFrame { plan: LogicalPlan }`); only new code is
+- **Lazy handle** (`RuneDataFrame { plan: LogicalPlan }`); primary new surface is
   `ctx.sql` + a `sum` helper (the `.filter`/`.aggregate` composition already
-  exists).
+  exists). Implementation also fixed the existing aggregate-only grouped SQL
+  projection path where hidden group keys must remain available for execution but
+  be dropped from the visible output.
 - **Multi-statement rejection** (grounded: `SqlPlanner::plan` lowers only
   `ast[0]`, so `ctx.sql` enforces `ast.len()==1`); **DDL/DML rejected** (no side
   effects in lazy graphs).
