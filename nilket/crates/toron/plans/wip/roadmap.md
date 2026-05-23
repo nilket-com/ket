@@ -4995,6 +4995,30 @@ along with the forward-sequence rewrite.
   classification, omitted DELETE/UPDATE), recorded as rejected for ADR 075.
   Placement: Toron compute-ring predicate surface + PBC policy. Migration:
   `plans/impl/075_partial_pushdown_residual_split_like.md`.
+- **ADR 076 — Architecture Guard Corpus Modularization.**
+  Promoted (plan). A **behavior-zero, test-only** refactor: split the ~18.7k-line
+  `tests/architecture_test.rs` monolith (903 `adrNNN_*` guards; **938 tests**)
+  into **semantic modules** under `tests/architecture/` (`predicate_pushdown`,
+  `sql_planner_surface`, `observability_{audit,telemetry}`, `network_tls`,
+  `distributed_execution`, `storage_wendelon_boundary`, `ring_placement`,
+  `core_invariants`), keeping `architecture_test.rs` as a tiny `mod architecture;`
+  harness — **one stable Cargo target**, `adrNNN_`-prefixed guard names preserved
+  for provenance (semantic files, not `adr_NNN.rs`). Shared helpers → test-local
+  `support.rs` + a new `architecture_corpus_source()`. **Behavior-zero proof =
+  duplicate-preserving leaf-name conservation** (the module prefix changes the
+  full test path, so compare sorted *leaf* names; every pre-move leaf occurrence
+  still present + passing; additions only `adr076_*`). **Load-bearing migration
+  step:** retarget the ≥5 self-inspecting
+  guards that read `architecture_test.rs` + assert `.contains("adrNNN_…")` to read
+  the *corpus* (else they hit the empty harness and fail). Preserve `#[cfg]`/
+  `#[tokio::test]` attrs (21 sites). **No new dependency, including no `syn`.**
+  Final D-set: **8 decisions, 7 guards**. Council: **genuine 3-of-3 (Codex,
+  Gemini, Claude)** — the cleanest convergence of the recent run, no substantive
+  fork (topic pre-set; Claude added the conservation gate + self-inspecting-guard
+  hazard, Codex refined to duplicate-preserving leaf-name conservation, Gemini
+  added the deferred `syn`/AST direction). Placement: Toron test architecture /
+  council substrate. Migration:
+  `plans/impl/076_architecture_guard_corpus_modularization.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5079,7 +5103,54 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 075 promoted; ADR 076 candidates
+### ADR 076 promoted; ADR 077 candidates
+
+ADR 076 selected and promoted **Architecture Guard Corpus Modularization** — a
+behavior-zero, test-only split of the ~18.7k-line `architecture_test.rs` monolith
+(938 tests) into semantic modules under `tests/architecture/`, behind a stable
+`mod architecture;` harness and the unchanged `cargo test -p toron --test
+architecture_test` command. Final D-set: **8 decisions, 7 guards**. Council:
+**genuine 3-of-3** — the cleanest convergence of the recent run, no substantive
+fork.
+
+**Key decisions / invariants:**
+
+- **Semantic module files** (`predicate_pushdown`, `observability_audit`, …), not
+  `adr_NNN.rs`; `adrNNN_`-prefixed guard names preserved for provenance. Shared
+  helpers → test-local `support.rs` + `architecture_corpus_source()`.
+- **Behavior-zero = duplicate-preserving leaf-name conservation** — the module
+  prefix changes the full test path, so compare sorted *leaf* names; every
+  pre-move leaf occurrence present + passing; additions only `adr076_*`
+  (post-count = 938 + N).
+- **Retarget self-inspecting guards** — guards that read `architecture_test.rs` +
+  assert `.contains("adrNNN_…")` must read the corpus, not the now-empty harness
+  (the move most likely to falsify behavior-zero). Harness-regrowth guard is the
+  only legitimate harness read.
+- Preserve `#[cfg]`/`#[tokio::test]` attrs (21 sites); one Cargo target; **no new
+  dependency, including no `syn`**.
+
+The migration is materialized in
+`plans/impl/076_architecture_guard_corpus_modularization.md`.
+
+**ADR 077 candidates:**
+
+- **`syn`/AST semantic guard rewrite** (the direction Gemini raised, deferred from
+  076) — convert the brittle string-search guards to `syn`-AST queries, **per
+  bucket** (076's semantic modules are the unit of work). Big, but 076 made it
+  incremental + auditable. Likely ≈080+ unless prioritized sooner.
+- **`OR` / `NOT` predicate-distribution pushdown** — generalize 075's top-level-
+  `AND` split (factor pushable terms out of `OR`, push De Morgan'd `NOT`); the next
+  pushdown-completeness step.
+- **`SIMILAR TO` / `RLIKE` / `REGEXP`** (`arrow_string::regexp` kernels, regex
+  already in-tree; needs a CPU-cost/ReDoS contract); or `ESCAPE` + dynamic `LIKE`
+  patterns (widen 075's literal-only bound).
+- **`CASE` / value-conditionals**; **Wendelon typed table-mutation trace
+  continuation** (Wendelon-home producer).
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/
+  composite-PK/`UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable
+  bulk DML; JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 075 promoted; ADR 076 candidates (HISTORICAL)
 
 ADR 075 selected and promoted **Partial-Pushdown Residual Split + Literal
 `LIKE`/`ILIKE`** - the binder now splits top-level `AND`, pushes PBC-eligible
