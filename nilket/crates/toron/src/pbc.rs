@@ -5,8 +5,8 @@ use crate::ir::{
 
 // Import OP codes from Wendelon.
 use wendelon::schema::pbc::{
-	OP_AND, OP_EQ, OP_GT, OP_GTE, OP_IS_NOT_NULL, OP_IS_NULL, OP_LT, OP_LTE, OP_NEQ, OP_NOT, OP_OR,
-	OP_PROJECT, OP_PUSH_BOOL, OP_PUSH_COL, OP_PUSH_FLOAT, OP_PUSH_INT, OP_PUSH_STR,
+	OP_AND, OP_EQ, OP_GT, OP_GTE, OP_IN_LIST, OP_IS_NOT_NULL, OP_IS_NULL, OP_LT, OP_LTE, OP_NEQ,
+	OP_NOT, OP_OR, OP_PROJECT, OP_PUSH_BOOL, OP_PUSH_COL, OP_PUSH_FLOAT, OP_PUSH_INT, OP_PUSH_STR,
 };
 
 #[allow(dead_code)]
@@ -103,6 +103,23 @@ impl PbcCompiler {
 					stack.push((id, true));
 					stack.push((*input, false));
 				}
+				BoundExprNode::InList { expr, list, .. } => {
+					if list.is_empty() {
+						return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+							"IN list must not be empty".to_string(),
+						));
+					}
+					u16::try_from(list.len()).map_err(|_| {
+						PushdownDeclineReason::ExpressionShapeUnsupported(
+							"IN list item count exceeds u16::MAX".to_string(),
+						)
+					})?;
+					stack.push((id, true));
+					for item in list.iter().rev() {
+						stack.push((*item, false));
+					}
+					stack.push((*expr, false));
+				}
 				BoundExprNode::Cast { .. } | BoundExprNode::TryCast { .. } => {
 					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 						"arithmetic, Cast, and TryCast are not PBC-eligible".to_string(),
@@ -142,6 +159,18 @@ impl PbcCompiler {
 			}
 			BoundExprNode::Binary { op, .. } => bytecode.push(binary_opcode(op)?),
 			BoundExprNode::Unary { op, .. } => bytecode.push(unary_opcode(op)),
+			BoundExprNode::InList { list, negated, .. } => {
+				let count = u16::try_from(list.len()).map_err(|_| {
+					PushdownDeclineReason::ExpressionShapeUnsupported(
+						"IN list item count exceeds u16::MAX".to_string(),
+					)
+				})?;
+				bytecode.push(OP_IN_LIST);
+				bytecode.extend_from_slice(&count.to_le_bytes());
+				if *negated {
+					bytecode.push(OP_NOT);
+				}
+			}
 			BoundExprNode::Cast { .. }
 			| BoundExprNode::TryCast { .. }
 			| BoundExprNode::TimeBucket { .. } => {
@@ -264,6 +293,68 @@ mod tests {
 		expected.push(OP_AND);
 
 		assert_eq!(bytecode, expected);
+	}
+
+	#[test]
+	fn in_list_lowers_to_native_opcode_with_target_then_members() {
+		let compiler = PbcCompiler::new();
+		let expr = program(|builder| {
+			let status = column(builder, "status", 2, DataType::Utf8, true);
+			let active = builder.append_literal(ScalarValue::Utf8(Some("active".to_string())));
+			let pending = builder.append_literal(ScalarValue::Utf8(Some("pending".to_string())));
+			builder.append_in_list(status, vec![active, pending], false)
+		});
+
+		let bytecode = compiler.compile(Some(&expr), None).unwrap();
+
+		let mut expected = Vec::new();
+		expected.push(OP_PUSH_COL);
+		expected.extend_from_slice(&2u32.to_le_bytes());
+		expected.push(OP_PUSH_STR);
+		expected.extend_from_slice(&6u16.to_le_bytes());
+		expected.extend_from_slice(b"active");
+		expected.push(OP_PUSH_STR);
+		expected.extend_from_slice(&7u16.to_le_bytes());
+		expected.extend_from_slice(b"pending");
+		expected.push(OP_IN_LIST);
+		expected.extend_from_slice(&2u16.to_le_bytes());
+
+		assert_eq!(bytecode, expected);
+		assert!(wendelon::schema::pbc::Program::compile(&bytecode).is_ok());
+	}
+
+	#[test]
+	fn not_in_list_lowers_to_native_opcode_plus_not() {
+		let compiler = PbcCompiler::new();
+		let expr = program(|builder| {
+			let status = column(builder, "status", 2, DataType::Utf8, true);
+			let active = builder.append_literal(ScalarValue::Utf8(Some("active".to_string())));
+			builder.append_in_list(status, vec![active], true)
+		});
+
+		let bytecode = compiler.compile(Some(&expr), None).unwrap();
+
+		assert_eq!(*bytecode.last().expect("not opcode"), OP_NOT);
+		assert!(bytecode.contains(&OP_IN_LIST));
+		assert!(wendelon::schema::pbc::Program::compile(&bytecode).is_ok());
+	}
+
+	#[test]
+	fn in_list_at_adr074_bound_stays_within_wendelon_pbc_limits() {
+		let compiler = PbcCompiler::new();
+		let expr = program(|builder| {
+			let amount = column(builder, "amount", 1, DataType::Int32, true);
+			let items = (0..32)
+				.map(|value| builder.append_literal(ScalarValue::Int32(Some(value))))
+				.collect::<Vec<_>>();
+			builder.append_in_list(amount, items, false)
+		});
+
+		let bytecode = compiler.compile(Some(&expr), None).unwrap();
+
+		assert!(bytecode.contains(&OP_IN_LIST));
+		wendelon::schema::pbc::Program::compile(&bytecode)
+			.expect("32-item IN_LIST must be stack-safe for Wendelon PBC");
 	}
 
 	#[test]

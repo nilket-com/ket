@@ -467,16 +467,14 @@ fn adr014_runtime_filter_contract_has_no_version_suffixed_types() {
 }
 
 #[test]
-fn adr014_does_not_add_sql_in_lowering_to_toron_planner() {
+fn adr014_sql_in_absence_guard_is_retargeted_after_adr074() {
 	let source = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
 
-	for forbidden in ["InList", "InSubquery", "Expr::InList", "Expr::InSubquery"] {
-		assert!(
-			!source.contains(forbidden),
-			"ADR 014 must not add SQL IN lowering marker {forbidden}"
-		);
-	}
+	assert!(source.contains("SqlExpr::InList"));
+	assert!(source.contains("Expr::InList"));
+	assert!(source.contains("SqlExpr::InSubquery { .. }"));
+	assert!(source.contains("IN subquery is not supported"));
 }
 
 #[test]
@@ -651,7 +649,7 @@ fn adr031_bound_expr_node_has_no_boxes() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("BoundExprNode enum");
-	assert_eq!(enum_variant_count(node), 7);
+	assert_eq!(enum_variant_count(node), 8);
 	for variant in [
 		"Column",
 		"Literal",
@@ -659,6 +657,7 @@ fn adr031_bound_expr_node_has_no_boxes() {
 		"TryCast",
 		"Binary",
 		"Unary",
+		"InList",
 		"TimeBucket",
 	] {
 		assert!(node.contains(variant), "missing BoundExprNode::{variant}");
@@ -18110,6 +18109,234 @@ fn adr073_prior_028_029_030_034_036_exhaustive_destructure_guards_pass_on_062() 
 		);
 	}
 	assert!(manifest.contains("sqlparser = \"0.62\""));
+}
+
+#[test]
+fn adr074_in_list_is_first_class_expr_and_bound_node() {
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read ir");
+	let execution_ir =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec ir");
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+
+	assert!(ir.contains("InList {"));
+	assert!(ir.contains("Self::InList { expr, list, .. }"));
+	assert!(execution_ir.contains("BoundExprNode::InList"));
+	assert!(execution_ir.contains("pub fn append_in_list"));
+	assert!(binder.contains("Expr::InList"));
+	assert!(binder.contains("fn bind_in_list"));
+}
+
+#[test]
+fn adr074_in_list_compiles_to_existing_op_in_list_opcode() {
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
+
+	assert!(pbc.contains("OP_IN_LIST"));
+	assert!(pbc.contains("bytecode.push(OP_IN_LIST)"));
+	assert!(pbc.contains("bytecode.extend_from_slice(&count.to_le_bytes())"));
+	assert!(!pbc.contains("Op::InList"));
+	assert!(!pbc.contains("OP_IN_LIST_V"));
+}
+
+#[test]
+fn adr074_in_list_adds_no_new_wendelon_pbc_opcode() {
+	let wendelon_pbc = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/pbc.rs"))
+		.expect("read Wendelon pbc");
+
+	assert!(wendelon_pbc.contains("pub const OP_IN_LIST: u8 = 0x30;"));
+	assert_eq!(wendelon_pbc.matches("pub const OP_IN_LIST").count(), 1);
+	assert!(!wendelon_pbc.contains("OP_IN_LIST_V"));
+}
+
+#[test]
+fn adr074_in_list_negation_uses_existing_not_opcode() {
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
+
+	assert!(pbc.contains("OP_NOT"));
+	assert!(pbc.contains("if *negated"));
+	assert!(pbc.contains("bytecode.push(OP_NOT)"));
+	assert!(!pbc.contains("OP_NOT_IN"));
+}
+
+#[test]
+fn adr074_in_list_residual_eval_is_implemented_without_new_wendelon_surface() {
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
+
+	assert!(exec.contains("fn evaluate_in_list"));
+	assert!(exec.contains("let mask = eq(expr_arr, item_arr)?"));
+	assert!(exec.contains("or(&current, &mask)?"));
+	assert!(!exec.contains("in_list_utf8"));
+	assert!(!manifest.contains("arrow-ord"));
+}
+
+#[test]
+fn adr074_in_list_pushdown_eligible_iff_members_eligible() {
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read ir");
+
+	assert!(ir.contains("Self::InList { expr, list, .. }"));
+	assert!(ir.contains("expr.is_pbc_pushdown_eligible()"));
+	assert!(ir.contains("list.iter().all(Self::is_pbc_pushdown_eligible)"));
+}
+
+#[test]
+fn adr074_in_list_has_static_item_limit() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+
+	assert!(planner.contains("const MAX_IN_LIST_ITEMS: usize = 32;"));
+	assert!(planner.contains("list.len() > MAX_IN_LIST_ITEMS"));
+	assert!(planner.contains("IN list exceeds {MAX_IN_LIST_ITEMS} items"));
+}
+
+#[test]
+fn adr074_between_desugars_with_no_new_ir_or_opcode() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read ir");
+	let execution_ir =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec ir");
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
+
+	assert!(planner.contains("SqlExpr::Between"));
+	assert!(planner.contains("fn lower_between"));
+	assert!(planner.contains("Expr::And"));
+	assert!(planner.contains("Expr::Gte"));
+	assert!(!ir.contains("Expr::Between"));
+	assert!(!ir.contains("Between {"));
+	assert!(!execution_ir.contains("BoundExprNode::Between"));
+	assert!(!pbc.contains("OP_BETWEEN"));
+}
+
+#[test]
+fn adr074_like_ilike_similar_rlike_case_subquery_in_remain_unsupported() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+
+	for marker in [
+		"SqlExpr::Like { .. }",
+		"SqlExpr::ILike { .. }",
+		"SqlExpr::SimilarTo { .. }",
+		"SqlExpr::RLike { .. }",
+		"SqlExpr::Case { .. }",
+		"SqlExpr::InSubquery { .. }",
+		"SqlExpr::InUnnest { .. }",
+		"BinaryOperator::PGLikeMatch",
+		"BinaryOperator::PGILikeMatch",
+	] {
+		assert!(planner.contains(marker), "missing reject marker {marker}");
+	}
+}
+
+#[test]
+fn adr074_alter_table_remains_unsupported() {
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let plan_body = brace_blocks_after_marker(&planner, "pub fn plan")
+		.into_iter()
+		.next()
+		.expect("plan body")
+		.1;
+
+	assert!(!plan_body.contains("Statement::AlterTable"));
+	assert!(plan_body.contains("unsupported SQL statement; only SELECT"));
+}
+
+#[test]
+fn adr074_retargets_adr014_sql_in_absence_guard() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	assert!(architecture_test.contains("adr014_sql_in_absence_guard_is_retargeted_after_adr074"));
+	let stale_guard = [
+		"fn ",
+		"adr014_does_not_add_sql_in",
+		"_lowering_to_toron_planner",
+	]
+	.concat();
+	assert!(!architecture_test.contains(&stale_guard));
+}
+
+#[test]
+fn adr074_no_wendelon_storage_wire_worker_audit_or_telemetry_change() {
+	let forbidden = [
+		"Expr::InList",
+		"BoundExprNode::InList",
+		"OP_IN_LIST",
+		"MAX_IN_LIST_ITEMS",
+	];
+	for relative in [
+		"src/storage.rs",
+		"src/sql_wire.rs",
+		"src/audit.rs",
+		"src/telemetry.rs",
+		"src/distributed/scheduler.rs",
+		"src/distributed/task.rs",
+	] {
+		let path = manifest_dir().join(relative);
+		if !path.exists() {
+			continue;
+		}
+		let source = std::fs::read_to_string(&path).expect("read source");
+		for marker in forbidden {
+			assert!(
+				!source.contains(marker),
+				"{relative} leaked ADR074 marker {marker}"
+			);
+		}
+	}
+}
+
+#[test]
+fn adr074_sqlparser_ast_remains_quarantined_to_sql_planner() {
+	adr073_sqlparser_ast_is_quarantined_to_sql_planner();
+}
+
+#[test]
+fn adr074_nilket_root_stays_runtime_free() {
+	adr070_nilket_root_stays_runtime_free();
+}
+
+#[test]
+fn adr074_new_surface_is_brand_clean_and_has_no_v1_suffix() {
+	let sources = [
+		manifest_dir().join("src/ir.rs"),
+		manifest_dir().join("src/ir/execution.rs"),
+		manifest_dir().join("src/sql_planner.rs"),
+		manifest_dir().join("src/pbc.rs"),
+	];
+	for path in sources {
+		let source = std::fs::read_to_string(&path).expect("read source");
+		assert!(
+			!source.contains("InListV1"),
+			"{} has V1 suffix",
+			path.display()
+		);
+		assert!(
+			!source.contains("NilDB"),
+			"{} has stale brand",
+			path.display()
+		);
+	}
+}
+
+#[test]
+fn adr074_prior_010_023_024_025_026_029_030_034_036_064_073_guards_continue_to_pass() {
+	let architecture_test =
+		std::fs::read_to_string(manifest_dir().join("tests/architecture_test.rs"))
+			.expect("read architecture test");
+
+	for guard in [
+		"adr010", "adr023", "adr024", "adr025", "adr026", "adr029", "adr030", "adr034", "adr036",
+		"adr064", "adr073",
+	] {
+		assert!(
+			architecture_test.contains(guard),
+			"missing prior guard family {guard}"
+		);
+	}
 }
 
 struct RecordingStorageScan {

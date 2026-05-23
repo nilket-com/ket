@@ -35,6 +35,7 @@ fn unsupported(message: impl Into<String>) -> FrontendError {
 const DEFAULT_JOIN_PARTITION_COUNT: u32 = 4;
 // P0.3: grouped SQL reuses the join shuffle fanout until aggregate fanout has separate evidence.
 const DEFAULT_AGGREGATE_PARTITION_COUNT: u32 = DEFAULT_JOIN_PARTITION_COUNT;
+const MAX_IN_LIST_ITEMS: usize = 32;
 const AGGREGATE_ARGUMENT_SHAPE_MESSAGE: &str = "unsupported aggregate argument";
 const NESTED_AGGREGATE_ARGUMENT_MESSAGE: &str =
 	"aggregate arguments must not contain aggregate calls";
@@ -77,6 +78,10 @@ fn stripped_sql_value(expr: &SqlExpr) -> Option<&Value> {
 
 fn expr_is_null_literal(expr: &SqlExpr) -> bool {
 	matches!(stripped_sql_value(expr), Some(Value::Null))
+}
+
+fn is_row_value_expr(expr: &SqlExpr) -> bool {
+	matches!(strip_nested_sql_expr(expr), SqlExpr::Tuple(_))
 }
 
 fn validate_simple_aggregate_arg(arg: &FunctionArg) -> Result<(), FrontendError> {
@@ -2245,9 +2250,15 @@ impl SqlPlanner {
 		operator: &JoinOperator,
 	) -> Result<(JoinKind, Vec<(Expr, Expr)>), FrontendError> {
 		let (kind, constraint) = match operator {
-			JoinOperator::Inner(constraint) => (JoinKind::Inner, constraint),
-			JoinOperator::LeftOuter(constraint) => (JoinKind::LeftOuter, constraint),
-			JoinOperator::RightOuter(constraint) => (JoinKind::RightOuter, constraint),
+			JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+				(JoinKind::Inner, constraint)
+			}
+			JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+				(JoinKind::LeftOuter, constraint)
+			}
+			JoinOperator::Right(constraint) | JoinOperator::RightOuter(constraint) => {
+				(JoinKind::RightOuter, constraint)
+			}
 			JoinOperator::FullOuter(constraint) => (JoinKind::FullOuter, constraint),
 			JoinOperator::Semi(constraint) | JoinOperator::LeftSemi(constraint) => {
 				(JoinKind::LeftSemi, constraint)
@@ -2257,7 +2268,14 @@ impl SqlPlanner {
 				(JoinKind::LeftAnti, constraint)
 			}
 			JoinOperator::RightAnti(constraint) => (JoinKind::RightAnti, constraint),
-			_ => {
+			JoinOperator::CrossJoin(_)
+			| JoinOperator::CrossApply
+			| JoinOperator::OuterApply
+			| JoinOperator::AsOf { .. }
+			| JoinOperator::StraightJoin(_)
+			| JoinOperator::ArrayJoin
+			| JoinOperator::LeftArrayJoin
+			| JoinOperator::InnerArrayJoin => {
 				return Err(unsupported(
 					"only INNER/OUTER/SEMI/ANTI JOIN ... ON is supported",
 				));
@@ -2959,9 +2977,33 @@ impl SqlPlanner {
 					BinaryOperator::Minus => Ok(Expr::Sub(l, r)),
 					BinaryOperator::Multiply => Ok(Expr::Mul(l, r)),
 					BinaryOperator::Divide => Ok(Expr::Div(l, r)),
+					BinaryOperator::PGLikeMatch
+					| BinaryOperator::PGILikeMatch
+					| BinaryOperator::PGNotLikeMatch
+					| BinaryOperator::PGNotILikeMatch => Err(unsupported(
+						"PostgreSQL LIKE operator spellings are not supported",
+					)),
 					_ => Err(unsupported(format!("unsupported operator: {op:?}"))),
 				}
 			}
+			SqlExpr::InList {
+				expr,
+				list,
+				negated,
+			} => self.lower_in_list(expr, list, *negated),
+			SqlExpr::Between {
+				expr,
+				negated,
+				low,
+				high,
+			} => self.lower_between(expr, low, high, *negated),
+			SqlExpr::InSubquery { .. } => Err(unsupported("IN subquery is not supported")),
+			SqlExpr::InUnnest { .. } => Err(unsupported("IN UNNEST is not supported")),
+			SqlExpr::Like { .. } => Err(unsupported("LIKE is not supported")),
+			SqlExpr::ILike { .. } => Err(unsupported("ILIKE is not supported")),
+			SqlExpr::SimilarTo { .. } => Err(unsupported("SIMILAR TO is not supported")),
+			SqlExpr::RLike { .. } => Err(unsupported("RLIKE is not supported")),
+			SqlExpr::Case { .. } => Err(unsupported("CASE is not supported")),
 			SqlExpr::Cast {
 				kind,
 				expr,
@@ -3026,6 +3068,59 @@ impl SqlPlanner {
 				Ok(Expr::TimeBucket(interval, Box::new(ts)))
 			}
 			_ => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
+		}
+	}
+
+	fn lower_in_list(
+		&self,
+		expr: &SqlExpr,
+		list: &[SqlExpr],
+		negated: bool,
+	) -> Result<Expr, FrontendError> {
+		if list.is_empty() {
+			return Err(unsupported("IN list must not be empty"));
+		}
+		if list.len() > MAX_IN_LIST_ITEMS {
+			return Err(unsupported(format!(
+				"IN list exceeds {MAX_IN_LIST_ITEMS} items"
+			)));
+		}
+		if is_row_value_expr(expr) || list.iter().any(is_row_value_expr) {
+			return Err(unsupported("row-value IN is not supported"));
+		}
+		if list.iter().any(expr_is_null_literal) {
+			return Err(unsupported("NULL members in IN lists are not supported"));
+		}
+		Ok(Expr::InList {
+			expr: Box::new(self.lower_expr(expr)?),
+			list: list
+				.iter()
+				.map(|item| self.lower_expr(item))
+				.collect::<Result<Vec<_>, _>>()?,
+			negated,
+		})
+	}
+
+	fn lower_between(
+		&self,
+		expr: &SqlExpr,
+		low: &SqlExpr,
+		high: &SqlExpr,
+		negated: bool,
+	) -> Result<Expr, FrontendError> {
+		let expr = self.lower_expr(expr)?;
+		let low = self.lower_expr(low)?;
+		let high = self.lower_expr(high)?;
+		if negated {
+			Ok(Expr::Or(
+				Box::new(Expr::Lt(Box::new(expr.clone()), Box::new(low))),
+				Box::new(Expr::Gt(Box::new(expr), Box::new(high))),
+			))
+		} else {
+			Ok(Expr::And(
+				Box::new(Expr::Gte(Box::new(expr.clone()), Box::new(low))),
+				Box::new(Expr::Lte(Box::new(expr), Box::new(high))),
+			))
 		}
 	}
 
@@ -3115,6 +3210,13 @@ fn validate_hidden_sort_key_refs(
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::TimeBucket(_, inner) => validate_hidden_sort_key_refs(inner, visible_names),
+		Expr::InList { expr, list, .. } => {
+			validate_hidden_sort_key_refs(expr, visible_names)?;
+			for item in list {
+				validate_hidden_sort_key_refs(item, visible_names)?;
+			}
+			Ok(())
+		}
 	}
 }
 
@@ -3580,6 +3682,19 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			interval.hash(state);
 			hash_expr_structural(inner, state);
 		}
+		Expr::InList {
+			expr,
+			list,
+			negated,
+		} => {
+			20u8.hash(state);
+			negated.hash(state);
+			hash_expr_structural(expr, state);
+			list.len().hash(state);
+			for item in list {
+				hash_expr_structural(item, state);
+			}
+		}
 	}
 }
 
@@ -3611,6 +3726,26 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 		| (Expr::IsNotNull(left), Expr::IsNotNull(right)) => expr_structural_eq(left, right),
 		(Expr::TimeBucket(left_interval, left), Expr::TimeBucket(right_interval, right)) => {
 			left_interval == right_interval && expr_structural_eq(left, right)
+		}
+		(
+			Expr::InList {
+				expr: left_expr,
+				list: left_list,
+				negated: left_negated,
+			},
+			Expr::InList {
+				expr: right_expr,
+				list: right_list,
+				negated: right_negated,
+			},
+		) => {
+			left_negated == right_negated
+				&& expr_structural_eq(left_expr, right_expr)
+				&& left_list.len() == right_list.len()
+				&& left_list
+					.iter()
+					.zip(right_list.iter())
+					.all(|(left, right)| expr_structural_eq(left, right))
 		}
 		_ => false,
 	}
@@ -3869,6 +4004,9 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::TimeBucket(_, inner) => expr_contains_qualified_column(inner),
+		Expr::InList { expr, list, .. } => {
+			expr_contains_qualified_column(expr) || list.iter().any(expr_contains_qualified_column)
+		}
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)

@@ -700,6 +700,13 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::TimeBucket(_, inner) => reject_storage_synthetic_returning_reference(inner),
+		Expr::InList { expr, list, .. } => {
+			reject_storage_synthetic_returning_reference(expr)?;
+			for item in list {
+				reject_storage_synthetic_returning_reference(item)?;
+			}
+			Ok(())
+		}
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -1786,6 +1793,12 @@ fn collect_program_node_columns(
 			collect_program_node_columns(program, *left, columns);
 			collect_program_node_columns(program, *right, columns);
 		}
+		Some(BoundExprNode::InList { expr, list, .. }) => {
+			collect_program_node_columns(program, *expr, columns);
+			for item in list {
+				collect_program_node_columns(program, *item, columns);
+			}
+		}
 	}
 }
 
@@ -1950,6 +1963,15 @@ fn offset_bound_node(node: BoundExprNode, node_offset: u32, literal_offset: u32)
 			op,
 			input: offset_id(input),
 		},
+		BoundExprNode::InList {
+			expr,
+			list,
+			negated,
+		} => BoundExprNode::InList {
+			expr: offset_id(expr),
+			list: list.into_iter().map(offset_id).collect(),
+			negated,
+		},
 		BoundExprNode::TimeBucket { interval, input } => BoundExprNode::TimeBucket {
 			interval,
 			input: offset_id(input),
@@ -2113,6 +2135,11 @@ fn bind_expr_into_program(
 			require_boolean(builder, "NOT", inner)?;
 			Ok(builder.append_unary(BoundUnaryOp::Not, inner, DataType::Boolean))
 		}
+		Expr::InList {
+			expr,
+			list,
+			negated,
+		} => bind_in_list(builder, input_schema, config, expr, list, *negated),
 		Expr::IsNull(inner) => {
 			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNull, inner, DataType::Boolean))
@@ -2397,6 +2424,45 @@ fn bind_comparison(
 		});
 	}
 	Ok(builder.append_binary(op, left, right, DataType::Boolean))
+}
+
+fn bind_in_list(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	config: &PlannerConfig,
+	expr: &Expr,
+	list: &[Expr],
+	negated: bool,
+) -> Result<BoundExprId, BindingError> {
+	if list.is_empty() {
+		return Err(BindingError::UnsupportedExpression {
+			message: "IN list must not be empty".to_string(),
+		});
+	}
+	let expr = bind_expr_into_program(builder, expr, input_schema, config)?;
+	let mut bound_items = Vec::with_capacity(list.len());
+	for item in list {
+		let item = bind_expr_into_program(builder, item, input_schema, config)?;
+		coerce_comparison_literals(builder, expr, item);
+		let expr_type = builder
+			.node_type(expr)
+			.cloned()
+			.expect("builder returns typed IN target");
+		let item_type = builder
+			.node_type(item)
+			.cloned()
+			.expect("builder returns typed IN member");
+		if expr_type != item_type {
+			return Err(BindingError::TypeMismatch {
+				message: format!(
+					"IN operands have different types: {:?} and {:?}",
+					expr_type, item_type
+				),
+			});
+		}
+		bound_items.push(item);
+	}
+	Ok(builder.append_in_list(expr, bound_items, negated))
 }
 
 fn coerce_comparison_literals(

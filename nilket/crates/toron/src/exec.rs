@@ -944,6 +944,18 @@ impl Executor {
 				let res = not(bool_arr)?;
 				Ok(Arc::new(res))
 			}
+			Expr::InList {
+				expr,
+				list,
+				negated,
+			} => {
+				let expr_arr = self.evaluate_expr(expr, batch)?;
+				let item_arrs = list
+					.iter()
+					.map(|item| self.evaluate_expr(item, batch))
+					.collect::<Result<Vec<_>, _>>()?;
+				evaluate_in_list(&expr_arr, &item_arrs, *negated, batch.num_rows())
+			}
 			Expr::IsNull(inner) => {
 				let arr = self.evaluate_expr(inner, batch)?;
 				let res = is_null(&arr)?;
@@ -1024,6 +1036,18 @@ impl Executor {
 				BoundExprNode::Unary { op, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
 					evaluate_bound_unary(op, &arr)?
+				}
+				BoundExprNode::InList {
+					expr,
+					list,
+					negated,
+				} => {
+					let expr_arr = evaluated_child(&outputs, *expr)?;
+					let item_arrs = list
+						.iter()
+						.map(|item| evaluated_child(&outputs, *item))
+						.collect::<Result<Vec<_>, _>>()?;
+					evaluate_in_list(&expr_arr, &item_arrs, *negated, batch.num_rows())?
 				}
 				BoundExprNode::TimeBucket { interval, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -1620,6 +1644,28 @@ fn evaluate_bound_unary(op: &BoundUnaryOp, arr: &ArrayRef) -> Result<ArrayRef, E
 		}
 		BoundUnaryOp::IsNull => Ok(Arc::new(is_null(arr)?)),
 		BoundUnaryOp::IsNotNull => Ok(Arc::new(is_not_null(arr)?)),
+	}
+}
+
+fn evaluate_in_list(
+	expr_arr: &ArrayRef,
+	item_arrs: &[ArrayRef],
+	negated: bool,
+	num_rows: usize,
+) -> Result<ArrayRef, ExecutionError> {
+	let mut combined: Option<BooleanArray> = None;
+	for item_arr in item_arrs {
+		let mask = eq(expr_arr, item_arr)?;
+		combined = Some(match combined {
+			Some(current) => or(&current, &mask)?,
+			None => mask,
+		});
+	}
+	let mask = combined.unwrap_or_else(|| BooleanArray::from(vec![Some(false); num_rows]));
+	if negated {
+		Ok(Arc::new(not(&mask)?))
+	} else {
+		Ok(Arc::new(mask))
 	}
 }
 

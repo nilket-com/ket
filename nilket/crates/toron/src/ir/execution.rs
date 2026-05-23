@@ -78,6 +78,11 @@ pub enum BoundExprNode {
 		op: BoundUnaryOp,
 		input: BoundExprId,
 	},
+	InList {
+		expr: BoundExprId,
+		list: Vec<BoundExprId>,
+		negated: bool,
+	},
 	TimeBucket {
 		interval: std::time::Duration,
 		input: BoundExprId,
@@ -382,6 +387,26 @@ impl BoundExprProgramBuilder {
 		self.append_node(BoundExprNode::Unary { op, input }, output_type)
 	}
 
+	pub fn append_in_list(
+		&mut self,
+		expr: BoundExprId,
+		list: Vec<BoundExprId>,
+		negated: bool,
+	) -> BoundExprId {
+		self.assert_existing_child(expr);
+		for item in &list {
+			self.assert_existing_child(*item);
+		}
+		self.append_node(
+			BoundExprNode::InList {
+				expr,
+				list,
+				negated,
+			},
+			DataType::Boolean,
+		)
+	}
+
 	pub fn append_time_bucket(
 		&mut self,
 		interval: std::time::Duration,
@@ -526,6 +551,16 @@ impl BoundExprProgram {
 				BoundUnaryOp::IsNull | BoundUnaryOp::IsNotNull => Some(false),
 				BoundUnaryOp::Not => self.node_nullable(*input),
 			},
+			BoundExprNode::InList { expr, list, .. } => {
+				let expr_nullable = self.node_nullable(*expr)?;
+				let list_nullable = list
+					.iter()
+					.map(|item| self.node_nullable(*item))
+					.collect::<Option<Vec<_>>>()?
+					.into_iter()
+					.any(|nullable| nullable);
+				Some(expr_nullable || list_nullable)
+			}
 			BoundExprNode::TimeBucket { input, .. } => self.node_nullable(*input),
 		}
 	}
@@ -625,6 +660,19 @@ impl BoundExprProgram {
 			BoundExprNode::Unary { op, input } => {
 				format!("{op:?}({})", self.pretty_node(*input))
 			}
+			BoundExprNode::InList {
+				expr,
+				list,
+				negated,
+			} => {
+				let members = list
+					.iter()
+					.map(|item| self.pretty_node(*item))
+					.collect::<Vec<_>>()
+					.join(", ");
+				let op = if *negated { "NOT IN" } else { "IN" };
+				format!("{} {op} ({members})", self.pretty_node(*expr))
+			}
 			BoundExprNode::TimeBucket { interval, input } => {
 				format!("TIME_BUCKET({interval:?}, {})", self.pretty_node(*input))
 			}
@@ -640,6 +688,12 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::TimeBucket { input, .. } => vec![*input],
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
+		BoundExprNode::InList { expr, list, .. } => {
+			let mut children = Vec::with_capacity(list.len() + 1);
+			children.push(*expr);
+			children.extend(list.iter().copied());
+			children
+		}
 	}
 }
 

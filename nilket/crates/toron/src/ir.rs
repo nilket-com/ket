@@ -90,6 +90,11 @@ pub enum Expr {
 	And(Box<Expr>, Box<Expr>),
 	Or(Box<Expr>, Box<Expr>),
 	Not(Box<Expr>),
+	InList {
+		expr: Box<Expr>,
+		list: Vec<Expr>,
+		negated: bool,
+	},
 	IsNull(Box<Expr>),
 	IsNotNull(Box<Expr>),
 	TimeBucket(std::time::Duration, Box<Expr>),
@@ -128,6 +133,9 @@ impl Expr {
 			| Self::Or(left, right) => left.is_pbc_pushdown_eligible() && right.is_pbc_pushdown_eligible(),
 			Self::Not(inner) | Self::IsNull(inner) | Self::IsNotNull(inner) => {
 				inner.is_pbc_pushdown_eligible()
+			}
+			Self::InList { expr, list, .. } => {
+				expr.is_pbc_pushdown_eligible() && list.iter().all(Self::is_pbc_pushdown_eligible)
 			}
 		}
 	}
