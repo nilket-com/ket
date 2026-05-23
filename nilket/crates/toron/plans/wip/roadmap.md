@@ -5135,6 +5135,18 @@ along with the forward-sequence rewrite.
   fixtures (ids `[1,2,4,5,6]`/`[2,4]`/`[1,3,4,6]`/`[4]`) + a wide-int (`3000000000`)
   plan fixture; 5 `adr082_*` guards. Genuine 3-of-3. Migration:
   `plans/impl/082_rune_typed_literals.md`.
+- **ADR 083 — Rune Predicate Operator Surface.** Promoted. Completes the Rune filter
+  authoring surface: 9 `RuneExpr` methods — comparison parity (`.lt`/`.lte`/`.gte`/
+  `.ne`), boolean combinators (`.and`/`.or`/**`.logical_not`**), null predicates
+  (`.is_null`/`.is_not_null`) — each lowering to an existing `Expr` variant. No
+  IR/binder/executor change; `rune_engine.rs`-localized. `.logical_not` (not `.not`)
+  because `not` is a Rune keyword (ADR 081 doctrine). `is_pbc_pushdown_eligible` is
+  true for the whole predicate set, so Rune predicates keep the fully-pushed scan
+  path; arithmetic is **deferred to ADR 084** (pushdown-ineligible, residual/computed
+  proof). Reconciles the 082 operator-scope guard (discipline #4). Gate: a compound
+  3VL filter executes to ids `[1,2,3]` (incl. `NULL OR TRUE`) and the same predicate
+  binds `FullyPushed` with scan PBC. Genuine 3-of-3. Migration:
+  `plans/impl/083_rune_predicate_operator_surface.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5219,7 +5231,37 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 082 promoted; ADR 083 candidates
+### ADR 083 promoted; ADR 084 candidates
+
+ADR 083 selected and promoted **Rune Predicate Operator Surface** — comparison
+parity, boolean combinators (`.and`/`.or`/`.logical_not`), and null predicates as 9
+thin `RuneExpr` methods lowering to existing `Expr`. Completes Rune filters; preserves
+the PBC pushed path with the same compound gate predicate; `rune_engine.rs`-localized.
+Genuine 3-of-3.
+
+**ADR 084 candidates:**
+
+- **Rune arithmetic expressions** (the 083 follow-on; the lead) — `.add`/`.sub`/`.mul`/
+  `.div` → `Expr::Add/Sub/Mul/Div`. Distinct proof from predicates:
+  `is_pbc_pushdown_eligible` is **false** for arithmetic, so the gate is
+  computed-projection / residual execution + ADR-024 edge cases (checked overflow,
+  int-div-by-zero → NULL, the Int/Float promotion lattice). Exercises 081's
+  name-only-via-`.named` for computed columns.
+- **Residual minimization for factored shapes** (078 follow-on; strongest non-Rune
+  lead) — minimal `(R1 ∨ R2)` residual in `split_boolean_tree`, gated by 078's 3VL
+  fixture.
+- **Rune joins** — needs relation-alias + qualified-column ergonomics first.
+- **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex verified in-tree; CPU-cost contract) or
+  `ESCAPE`/dynamic `LIKE`; **`CASE`/value-conditionals**; Rune `Like`/`InList`/`Cast`
+  surface; dot-field sugar; **Wendelon typed table-mutation trace continuation**.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+The migration is materialized in
+`plans/impl/083_rune_predicate_operator_surface.md`.
+
+### ADR 082 promoted; ADR 083 candidates (HISTORICAL)
 
 ADR 082 selected and promoted **Rune Typed Literals** — `lit_str`/`lit_f64`/
 `lit_bool`/`lit_i64` free functions lowering to existing `ScalarValue`, unblocking
