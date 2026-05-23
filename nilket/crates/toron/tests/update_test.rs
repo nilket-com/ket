@@ -16,7 +16,7 @@ use toron::error::{BindingError, QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
 	BoundExprNode, ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan, Expr, FilterDisposition,
-	LogicalPlan, QueryProfileHint, SessionId, TableId,
+	LogicalPlan, QueryProfileHint, ScalarValue, SessionId, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
@@ -335,6 +335,69 @@ async fn binder_update_splits_pbc_conjunct_from_like_residual() {
 	};
 	assert!(pbc_program.is_some());
 	assert_eq!(*profile_hint, QueryProfileHint::PointRead);
+}
+
+#[tokio::test]
+async fn update_not_or_extraction_uses_pushed_source_scan_plus_original_residual() {
+	let (catalog, _) = pk_catalog(people_schema(true)).await;
+	let plan = LogicalPlan::Update {
+		table: TableRef::new("people"),
+		assignments: vec![(
+			"note".to_string(),
+			Expr::Literal(ScalarValue::Utf8(Some("new".to_string()))),
+		)],
+		predicate: Some(Expr::Not(Box::new(Expr::Or(
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("id")),
+				Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
+			)),
+			Box::new(Expr::Like {
+				expr: Box::new(Expr::column("note")),
+				pattern: "a%".to_string(),
+				negated: false,
+				case_insensitive: false,
+			}),
+		)))),
+		returning: None,
+	};
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind update");
+
+	let ExecutionPlan::Update { source, .. } = &bound else {
+		panic!("expected update plan, got {bound:?}");
+	};
+	let ExecutionPlan::Project { input, .. } = source.as_ref() else {
+		panic!("expected update source project, got {source:?}");
+	};
+	let ExecutionPlan::Filter {
+		input,
+		predicate,
+		disposition,
+	} = input.as_ref()
+	else {
+		panic!("expected update WHERE source filter, got {input:?}");
+	};
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Unary {
+			op: toron::ir::BoundUnaryOp::Not,
+			..
+		})
+	));
+	let ExecutionPlan::Scan {
+		pbc_program,
+		profile_hint,
+		..
+	} = input.as_ref()
+	else {
+		panic!("expected update WHERE source scan, got {input:?}");
+	};
+	assert!(pbc_program.is_some());
+	assert_eq!(*profile_hint, QueryProfileHint::Scan);
 }
 
 #[tokio::test]

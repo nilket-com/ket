@@ -554,15 +554,29 @@ pub(crate) fn adr075_partial_pushdown_splits_bound_top_level_and_only() {
 		.next()
 		.expect("partition_bound_predicate body")
 		.1;
+	let boolean_splitter = brace_blocks_after_marker(&binder, "fn split_boolean_tree")
+		.into_iter()
+		.next()
+		.expect("split_boolean_tree body")
+		.1;
+	let legacy_splitter = brace_blocks_after_marker(&binder, "fn legacy_top_level_and_partition")
+		.into_iter()
+		.next()
+		.expect("legacy_top_level_and_partition body")
+		.1;
 	let collector = brace_blocks_after_marker(&binder, "fn collect_top_level_bound_and")
 		.into_iter()
 		.next()
 		.expect("collect_top_level_bound_and body")
 		.1;
 
-	assert!(splitter.contains("compile_pbc(&isolated).is_some()"));
-	assert!(splitter.contains("combine_bound_conjuncts(predicate, &pushed)"));
-	assert!(splitter.contains("combine_bound_conjuncts(predicate, &residual)"));
+	assert!(splitter.contains("split_boolean_tree(predicate, root)"));
+	assert!(splitter.contains("legacy_top_level_and_partition(predicate)"));
+	assert!(boolean_splitter.contains("op: BoundBinaryOp::And"));
+	assert!(boolean_splitter.contains("combine_bound_programs_as_and"));
+	assert!(legacy_splitter.contains("compile_pbc(&isolated).is_some()"));
+	assert!(legacy_splitter.contains("combine_bound_conjuncts(predicate, &pushed)"));
+	assert!(legacy_splitter.contains("combine_bound_conjuncts(predicate, &residual)"));
 	assert!(collector.contains("op: BoundBinaryOp::And"));
 	assert!(!collector.contains("BoundBinaryOp::Or"));
 	assert!(!collector.contains("BoundUnaryOp::Not"));
@@ -592,6 +606,356 @@ pub(crate) fn adr075_partial_pushdown_covers_select_update_delete_scan_sites() {
 	assert!(predicate_test.contains("where_like_residual_splits_from_pbc_conjunct"));
 	assert!(update_test.contains("binder_update_splits_pbc_conjunct_from_like_residual"));
 	assert!(delete_test.contains("binder_delete_splits_pbc_conjunct_from_like_residual"));
+}
+
+#[test]
+pub(crate) fn adr078_recursive_splitter_hosts_or_not_extraction_rules() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let partitioner = brace_blocks_after_marker(&binder, "fn partition_bound_predicate")
+		.into_iter()
+		.next()
+		.expect("partition_bound_predicate body")
+		.1;
+	let splitter = brace_blocks_after_marker(&binder, "fn split_boolean_tree")
+		.into_iter()
+		.next()
+		.expect("split_boolean_tree body")
+		.1;
+
+	assert!(partitioner.contains("split_boolean_tree(predicate, root)"));
+	assert!(partitioner.contains("legacy_top_level_and_partition(predicate)"));
+	assert!(splitter.contains("try_extract_common_or_factors(source, root)"));
+	assert!(splitter.contains("try_extract_not_or_branch_negations(source, *input)"));
+}
+
+#[test]
+pub(crate) fn adr078_pushed_predicate_is_necessary_for_original() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
+		.into_iter()
+		.next()
+		.expect("try_extract_common_or_factors body")
+		.1;
+	let not_or = brace_blocks_after_marker(&binder, "fn try_extract_not_or_branch_negations")
+		.into_iter()
+		.next()
+		.expect("try_extract_not_or_branch_negations body")
+		.1;
+
+	assert!(common.contains("necessary_candidates"));
+	assert!(common.contains("present_in_every_branch"));
+	assert!(common.contains("compile_pbc(&isolated).is_some()"));
+	assert!(not_or.contains("necessary_candidates"));
+	assert!(not_or.contains("build_negated_subgraph"));
+	assert!(not_or.contains("compile_pbc(&candidate).is_some()"));
+}
+
+#[test]
+pub(crate) fn adr078_factoring_preserves_3vl_where_true_set() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(binder.contains("predicate_pushdown_emitted_splits_preserve_kleene_3vl"));
+	assert!(binder.contains("partition_bound_predicate(&program)"));
+	assert!(binder.contains("split must preserve exact K3 value"));
+	assert!(predicate_test.contains("predicate_pushdown_3vl_property_random_rows_including_nulls"));
+	assert!(predicate_test.contains("enum K3"));
+	assert!(predicate_test.contains("fn k3_and"));
+	assert!(predicate_test.contains("fn k3_or"));
+	assert!(predicate_test.contains("fn k3_not"));
+	assert!(predicate_test.contains("k3_and(pushed, residual)"));
+}
+
+#[test]
+pub(crate) fn adr078_fully_pushable_or_and_not_still_push_as_whole_subtrees() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+	let splitter = brace_blocks_after_marker(&binder, "fn split_boolean_tree")
+		.into_iter()
+		.next()
+		.expect("split_boolean_tree body")
+		.1;
+
+	assert!(splitter.contains("let whole = isolate_bound_subgraph(source, root)?"));
+	assert!(splitter.contains("compile_pbc(&whole).is_some()"));
+	assert!(predicate_test.contains("where_fully_pushable_or_pushes_whole_or"));
+	assert!(predicate_test.contains("where_fully_pushable_not_pushes_whole_not"));
+}
+
+#[test]
+pub(crate) fn adr078_top_level_and_split_remains_minimal() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let splitter = brace_blocks_after_marker(&binder, "fn split_boolean_tree")
+		.into_iter()
+		.next()
+		.expect("split_boolean_tree body")
+		.1;
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(splitter.contains("op: BoundBinaryOp::And"));
+	assert!(splitter.contains("[left.pushed, right.pushed]"));
+	assert!(splitter.contains("[left.residual, right.residual]"));
+	assert!(predicate_test.contains("where_like_residual_splits_from_pbc_conjunct"));
+}
+
+#[test]
+pub(crate) fn adr078_mixed_or_does_not_push_one_branch_only() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
+		.into_iter()
+		.next()
+		.expect("try_extract_common_or_factors body")
+		.1;
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(common.contains("present_in_every_branch"));
+	assert!(predicate_test.contains("where_mixed_or_branch_does_not_push_partial_branch"));
+	assert!(predicate_test.contains("assert!(scan_pbc(scan).is_none())"));
+}
+
+#[test]
+pub(crate) fn adr078_common_or_factor_requires_presence_in_every_branch() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
+		.into_iter()
+		.next()
+		.expect("try_extract_common_or_factors body")
+		.1;
+
+	assert!(common.contains("collect_bound_or_branches"));
+	assert!(common.contains("collect_top_level_bound_and"));
+	assert!(common.contains("branch_terms.iter().skip(1).all"));
+	assert!(common.contains("present_in_every_branch"));
+}
+
+#[test]
+pub(crate) fn adr078_common_factor_matching_is_structural_not_algebraic() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let structural =
+		brace_blocks_after_marker(&binder, "fn bound_subgraphs_structurally_equal_inner")
+			.into_iter()
+			.next()
+			.expect("bound_subgraphs_structurally_equal_inner body")
+			.1;
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	for marker in [
+		"source.node_type(left) != source.node_type(right)",
+		"BoundExprNode::Column",
+		"BoundExprNode::Literal",
+		"BoundExprNode::Binary",
+		"BoundExprNode::Like",
+		"left_op == right_op",
+	] {
+		assert!(
+			structural.contains(marker),
+			"missing structural marker {marker}"
+		);
+	}
+	assert!(!structural.contains("pretty"));
+	assert!(!structural.contains("Debug"));
+	assert!(!structural.contains("format!"));
+	assert!(predicate_test.contains("where_structurally_different_equivalent_terms_do_not_factor"));
+}
+
+#[test]
+pub(crate) fn adr078_not_or_extracts_only_compilable_branch_negations() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let not_or = brace_blocks_after_marker(&binder, "fn try_extract_not_or_branch_negations")
+		.into_iter()
+		.next()
+		.expect("try_extract_not_or_branch_negations body")
+		.1;
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(not_or.contains("build_negated_subgraph"));
+	assert!(not_or.contains("compile_pbc(&candidate).is_some()"));
+	assert!(not_or.contains("combine_bound_programs_as_and(necessary_candidates)"));
+	assert!(predicate_test.contains("where_not_or_mixed_extracts_negated_pushable_branch"));
+}
+
+#[test]
+pub(crate) fn adr078_not_and_does_not_push_individual_negated_terms() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let not_or = brace_blocks_after_marker(&binder, "fn try_extract_not_or_branch_negations")
+		.into_iter()
+		.next()
+		.expect("try_extract_not_or_branch_negations body")
+		.1;
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(not_or.contains("op: BoundBinaryOp::Or"));
+	assert!(!not_or.contains("BoundBinaryOp::And"));
+	assert!(predicate_test.contains("where_not_and_mixed_does_not_push_negated_single_side"));
+}
+
+#[test]
+pub(crate) fn adr078_boolean_factoring_has_bounded_extraction_budget() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	for marker in [
+		"BOOLEAN_FACTOR_MAX_NODES",
+		"BOOLEAN_FACTOR_MAX_OR_BRANCHES",
+		"BOOLEAN_FACTOR_MAX_AND_TERMS_PER_BRANCH",
+		"BOOLEAN_FACTOR_MAX_CANDIDATES",
+		"BooleanSplitError::OverBudget",
+		"legacy_top_level_and_partition(predicate)",
+	] {
+		assert!(binder.contains(marker), "missing budget marker {marker}");
+	}
+	assert!(
+		predicate_test.contains("boolean_factoring_over_budget_falls_back_without_wrong_results")
+	);
+}
+
+#[test]
+pub(crate) fn adr078_pushdown_classification_still_uses_compile_pbc_attempts() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+
+	for marker in [
+		"compile_pbc(&whole).is_some()",
+		"compile_pbc(&isolated).is_some()",
+		"compile_pbc(&candidate).is_some()",
+		"let Some(pbc_program) = compile_pbc(&pushed_predicate)",
+	] {
+		assert!(
+			binder.contains(marker),
+			"missing compile-attempt marker {marker}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr078_factored_pushdown_drives_scan_profile() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(binder.contains("let profile_hint = scan_profile_hint(&pushed_predicate, input)"));
+	assert!(predicate_test.contains("where_common_pk_conjunct_across_or_uses_point_read_profile"));
+}
+
+#[test]
+pub(crate) fn adr078_select_update_delete_share_boolean_factoring_path() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+	let update_test =
+		std::fs::read_to_string(manifest_dir().join("tests/update_test.rs")).expect("read update");
+	let delete_test =
+		std::fs::read_to_string(manifest_dir().join("tests/delete_test.rs")).expect("read delete");
+
+	assert!(binder.contains("plan_filter_with_predicate_pushdown(input, bound_predicate)"));
+	assert!(binder.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)"));
+	assert!(binder.contains("predicate_pushdown_plan(program, &scan)"));
+	assert!(predicate_test.contains("where_common_pushable_conjunct_factors_out_of_or"));
+	assert!(
+		update_test
+			.contains("update_not_or_extraction_uses_pushed_source_scan_plus_original_residual")
+	);
+	assert!(
+		delete_test
+			.contains("delete_common_or_factor_uses_pushed_candidate_plus_original_residual")
+	);
+}
+
+#[test]
+pub(crate) fn adr078_no_new_sql_surface_pbc_opcode_wendelon_wire_storage_or_dependency_change() {
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
+	let wendelon_pbc = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/pbc.rs"))
+		.expect("read Wendelon pbc");
+
+	assert!(!manifest.lines().any(|line| {
+		let line = line.trim_start();
+		line.starts_with("syn =") || line.starts_with("syn ")
+	}));
+	for marker in ["OP_BOOLEAN_FACTOR", "OP_DE_MORGAN", "OP_FACTOR_OR"] {
+		assert!(!pbc.contains(marker), "Toron PBC leaked opcode {marker}");
+		assert!(
+			!wendelon_pbc.contains(marker),
+			"Wendelon PBC leaked opcode {marker}"
+		);
+	}
+	for relative in [
+		"src/storage.rs",
+		"src/sql_wire.rs",
+		"src/audit.rs",
+		"src/telemetry.rs",
+		"src/distributed/scheduler.rs",
+		"src/distributed/task.rs",
+	] {
+		let path = manifest_dir().join(relative);
+		if !path.exists() {
+			continue;
+		}
+		let source = std::fs::read_to_string(&path).expect("read source");
+		assert!(
+			!source.contains("split_boolean_tree"),
+			"{relative} leaked ADR078 binder helper"
+		);
+		assert!(
+			!source.contains("BOOLEAN_FACTOR"),
+			"{relative} leaked ADR078 budget marker"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr078_sqlparser_ast_remains_quarantined_to_sql_planner() {
+	adr074_sqlparser_ast_remains_quarantined_to_sql_planner();
+}
+
+#[test]
+pub(crate) fn adr078_prior_074_075_predicate_guards_continue_to_pass() {
+	let architecture_test = architecture_corpus_source();
+
+	for guard in [
+		"adr074_in_list_is_first_class_expr_and_bound_node",
+		"adr074_between_desugars_with_no_new_ir_or_opcode",
+		"adr075_like_ilike_are_first_class_residual_only_predicates",
+		"adr075_partial_pushdown_splits_bound_top_level_and_only",
+		"adr075_partial_pushdown_covers_select_update_delete_scan_sites",
+	] {
+		assert!(
+			architecture_test.contains(guard),
+			"missing prior guard {guard}"
+		);
+	}
 }
 
 #[test]

@@ -146,6 +146,40 @@ async fn binder_delete_splits_pbc_conjunct_from_like_residual() {
 }
 
 #[tokio::test]
+async fn delete_common_or_factor_uses_pushed_candidate_plus_original_residual() {
+	let catalog = people_catalog().await;
+	let plan = SqlPlanner::new()
+		.plan(
+			"DELETE FROM people \
+			 WHERE (id = 1 AND name LIKE 'a%') OR (id = 1 AND name LIKE 'z%')",
+		)
+		.expect("plan delete");
+
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind delete");
+	let ExecutionPlan::Delete {
+		predicate,
+		pbc_program,
+		..
+	} = bound
+	else {
+		panic!("expected delete execution plan");
+	};
+	let predicate = predicate.expect("original OR residual predicate");
+	assert!(pbc_program.is_some());
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Binary {
+			op: toron::ir::BoundBinaryOp::Or,
+			..
+		})
+	));
+}
+
+#[tokio::test]
 async fn binder_rejects_unknown_delete_column() {
 	let catalog = people_catalog().await;
 	let plan = SqlPlanner::new()

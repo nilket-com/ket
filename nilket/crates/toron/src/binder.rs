@@ -902,6 +902,11 @@ fn compile_pbc(predicate: &BoundExprProgram) -> Option<PbcProgram> {
 		.map(PbcProgram)
 }
 
+const BOOLEAN_FACTOR_MAX_NODES: usize = 256;
+const BOOLEAN_FACTOR_MAX_OR_BRANCHES: usize = 16;
+const BOOLEAN_FACTOR_MAX_AND_TERMS_PER_BRANCH: usize = 16;
+const BOOLEAN_FACTOR_MAX_CANDIDATES: usize = 8;
+
 fn attach_pbc_program(mut plan: ExecutionPlan, program: PbcProgram) -> (ExecutionPlan, bool) {
 	match &mut plan {
 		ExecutionPlan::Scan { pbc_program, .. } => {
@@ -1024,6 +1029,107 @@ fn partition_bound_predicate(
 	predicate: &BoundExprProgram,
 ) -> Option<(Option<BoundExprProgram>, Option<BoundExprProgram>)> {
 	let root = predicate.single_root()?;
+	match split_boolean_tree(predicate, root) {
+		Ok(split) => Some((split.pushed, split.residual)),
+		Err(BooleanSplitError::OverBudget) => legacy_top_level_and_partition(predicate),
+		Err(BooleanSplitError::Malformed) => None,
+	}
+}
+
+#[derive(Debug, Clone)]
+struct BooleanPredicateSplit {
+	pushed: Option<BoundExprProgram>,
+	residual: Option<BoundExprProgram>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BooleanSplitError {
+	Malformed,
+	OverBudget,
+}
+
+fn split_boolean_tree(
+	source: &BoundExprProgram,
+	root: BoundExprId,
+) -> Result<BooleanPredicateSplit, BooleanSplitError> {
+	let node_count = count_bound_subgraph_nodes(source, root)?;
+	if node_count > BOOLEAN_FACTOR_MAX_NODES {
+		return Err(BooleanSplitError::OverBudget);
+	}
+
+	let whole = isolate_bound_subgraph(source, root)?;
+	if compile_pbc(&whole).is_some() {
+		return Ok(BooleanPredicateSplit {
+			pushed: Some(whole),
+			residual: None,
+		});
+	}
+
+	match source.node(root).ok_or(BooleanSplitError::Malformed)? {
+		BoundExprNode::Binary {
+			op: BoundBinaryOp::And,
+			left,
+			right,
+		} => {
+			let left = split_boolean_tree(source, *left)?;
+			let right = split_boolean_tree(source, *right)?;
+			Ok(BooleanPredicateSplit {
+				pushed: combine_bound_programs_as_and(
+					[left.pushed, right.pushed]
+						.into_iter()
+						.flatten()
+						.collect::<Vec<_>>(),
+				)?,
+				residual: combine_bound_programs_as_and(
+					[left.residual, right.residual]
+						.into_iter()
+						.flatten()
+						.collect::<Vec<_>>(),
+				)?,
+			})
+		}
+		BoundExprNode::Binary {
+			op: BoundBinaryOp::Or,
+			..
+		} => {
+			if let Some(necessary_candidates) = try_extract_common_or_factors(source, root)? {
+				return Ok(BooleanPredicateSplit {
+					pushed: Some(necessary_candidates),
+					residual: Some(isolate_bound_subgraph(source, root)?),
+				});
+			}
+			Ok(BooleanPredicateSplit {
+				pushed: None,
+				residual: Some(isolate_bound_subgraph(source, root)?),
+			})
+		}
+		BoundExprNode::Unary {
+			op: BoundUnaryOp::Not,
+			input,
+		} => {
+			if let Some(necessary_candidates) = try_extract_not_or_branch_negations(source, *input)?
+			{
+				return Ok(BooleanPredicateSplit {
+					pushed: Some(necessary_candidates),
+					residual: Some(isolate_bound_subgraph(source, root)?),
+				});
+			}
+			Ok(BooleanPredicateSplit {
+				pushed: None,
+				residual: Some(isolate_bound_subgraph(source, root)?),
+			})
+		}
+		_ => Ok(BooleanPredicateSplit {
+			pushed: None,
+			residual: Some(isolate_bound_subgraph(source, root)?),
+		}),
+	}
+}
+
+fn legacy_top_level_and_partition(
+	predicate: &BoundExprProgram,
+) -> Option<(Option<BoundExprProgram>, Option<BoundExprProgram>)> {
+	let root = predicate.single_root()?;
 	let mut conjuncts = Vec::new();
 	collect_top_level_bound_and(predicate, root, &mut conjuncts);
 
@@ -1044,6 +1150,127 @@ fn partition_bound_predicate(
 	))
 }
 
+fn try_extract_common_or_factors(
+	source: &BoundExprProgram,
+	root: BoundExprId,
+) -> Result<Option<BoundExprProgram>, BooleanSplitError> {
+	let mut branches = Vec::new();
+	collect_bound_or_branches(source, root, &mut branches)?;
+	if branches.len() < 2 {
+		return Ok(None);
+	}
+
+	let mut branch_terms = Vec::with_capacity(branches.len());
+	for branch in branches {
+		let mut terms = Vec::new();
+		collect_top_level_bound_and(source, branch, &mut terms);
+		if terms.len() > BOOLEAN_FACTOR_MAX_AND_TERMS_PER_BRANCH {
+			return Err(BooleanSplitError::OverBudget);
+		}
+		branch_terms.push(terms);
+	}
+
+	let Some(first_branch) = branch_terms.first() else {
+		return Ok(None);
+	};
+	let mut necessary_candidates = Vec::new();
+	for term in first_branch {
+		if necessary_candidates
+			.iter()
+			.any(|candidate| bound_subgraphs_structurally_equal(source, *candidate, *term))
+		{
+			continue;
+		}
+		let present_in_every_branch = branch_terms.iter().skip(1).all(|branch| {
+			branch
+				.iter()
+				.any(|candidate| bound_subgraphs_structurally_equal(source, *term, *candidate))
+		});
+		if !present_in_every_branch {
+			continue;
+		}
+
+		let isolated = isolate_bound_subgraph(source, *term)?;
+		if compile_pbc(&isolated).is_some() {
+			necessary_candidates.push(*term);
+			if necessary_candidates.len() > BOOLEAN_FACTOR_MAX_CANDIDATES {
+				return Err(BooleanSplitError::OverBudget);
+			}
+		}
+	}
+
+	if necessary_candidates.is_empty() {
+		return Ok(None);
+	}
+
+	let pushed = necessary_candidates
+		.into_iter()
+		.map(|candidate| isolate_bound_subgraph(source, candidate))
+		.collect::<Result<Vec<_>, _>>()?;
+	combine_bound_programs_as_and(pushed)
+}
+
+fn try_extract_not_or_branch_negations(
+	source: &BoundExprProgram,
+	or_root: BoundExprId,
+) -> Result<Option<BoundExprProgram>, BooleanSplitError> {
+	if !matches!(
+		source.node(or_root),
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::Or,
+			..
+		})
+	) {
+		return Ok(None);
+	}
+
+	let mut branches = Vec::new();
+	collect_bound_or_branches(source, or_root, &mut branches)?;
+
+	let mut necessary_candidates = Vec::new();
+	for branch in branches {
+		let candidate = build_negated_subgraph(source, branch)?;
+		if compile_pbc(&candidate).is_some() {
+			necessary_candidates.push(candidate);
+			if necessary_candidates.len() > BOOLEAN_FACTOR_MAX_CANDIDATES {
+				return Err(BooleanSplitError::OverBudget);
+			}
+		}
+	}
+
+	if necessary_candidates.is_empty() {
+		return Ok(None);
+	}
+	combine_bound_programs_as_and(necessary_candidates)
+}
+
+fn collect_bound_or_branches(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	branches: &mut Vec<BoundExprId>,
+) -> Result<(), BooleanSplitError> {
+	if branches.len() > BOOLEAN_FACTOR_MAX_OR_BRANCHES {
+		return Err(BooleanSplitError::OverBudget);
+	}
+	match program.node(id).ok_or(BooleanSplitError::Malformed)? {
+		BoundExprNode::Binary {
+			op: BoundBinaryOp::Or,
+			left,
+			right,
+		} => {
+			collect_bound_or_branches(program, *left, branches)?;
+			collect_bound_or_branches(program, *right, branches)?;
+		}
+		_ => {
+			branches.push(id);
+			if branches.len() > BOOLEAN_FACTOR_MAX_OR_BRANCHES {
+				return Err(BooleanSplitError::OverBudget);
+			}
+		}
+	}
+	Ok(())
+}
+
 fn collect_top_level_bound_and(
 	program: &BoundExprProgram,
 	id: BoundExprId,
@@ -1060,6 +1287,13 @@ fn collect_top_level_bound_and(
 		}
 		_ => conjuncts.push(id),
 	}
+}
+
+fn isolate_bound_subgraph(
+	source: &BoundExprProgram,
+	root: BoundExprId,
+) -> Result<BoundExprProgram, BooleanSplitError> {
+	combine_bound_conjuncts(source, &[root]).ok_or(BooleanSplitError::Malformed)
 }
 
 fn combine_bound_conjuncts(
@@ -1081,6 +1315,55 @@ fn combine_bound_conjuncts(
 	let program = builder.build();
 	program.validate().ok()?;
 	Some(program)
+}
+
+fn combine_bound_programs_as_and(
+	programs: Vec<BoundExprProgram>,
+) -> Result<Option<BoundExprProgram>, BooleanSplitError> {
+	let mut programs = programs.into_iter();
+	let Some(first_program) = programs.next() else {
+		return Ok(None);
+	};
+	let mut builder = BoundExprProgramBuilder::new();
+	let mut combined = clone_single_root_into_builder(&first_program, &mut builder)?;
+
+	for program in programs {
+		let next = clone_single_root_into_builder(&program, &mut builder)?;
+		combined = builder.append_binary(BoundBinaryOp::And, combined, next, DataType::Boolean);
+	}
+
+	builder.push_root(combined);
+	let program = builder.build();
+	program
+		.validate()
+		.map_err(|_| BooleanSplitError::Malformed)?;
+	Ok(Some(program))
+}
+
+fn clone_single_root_into_builder(
+	source: &BoundExprProgram,
+	builder: &mut BoundExprProgramBuilder,
+) -> Result<BoundExprId, BooleanSplitError> {
+	let root = source.single_root().ok_or(BooleanSplitError::Malformed)?;
+	let mut remap = HashMap::new();
+	clone_bound_subgraph(source, root, builder, &mut remap).ok_or(BooleanSplitError::Malformed)
+}
+
+fn build_negated_subgraph(
+	source: &BoundExprProgram,
+	root: BoundExprId,
+) -> Result<BoundExprProgram, BooleanSplitError> {
+	let mut builder = BoundExprProgramBuilder::new();
+	let mut remap = HashMap::new();
+	let input = clone_bound_subgraph(source, root, &mut builder, &mut remap)
+		.ok_or(BooleanSplitError::Malformed)?;
+	let negated = builder.append_unary(BoundUnaryOp::Not, input, DataType::Boolean);
+	builder.push_root(negated);
+	let program = builder.build();
+	program
+		.validate()
+		.map_err(|_| BooleanSplitError::Malformed)?;
+	Ok(program)
 }
 
 fn clone_bound_subgraph(
@@ -1144,6 +1427,196 @@ fn clone_bound_subgraph(
 	};
 	remap.insert(id, cloned);
 	Some(cloned)
+}
+
+fn bound_subgraphs_structurally_equal(
+	source: &BoundExprProgram,
+	left: BoundExprId,
+	right: BoundExprId,
+) -> bool {
+	let mut seen = HashSet::new();
+	bound_subgraphs_structurally_equal_inner(source, left, right, &mut seen)
+}
+
+fn bound_subgraphs_structurally_equal_inner(
+	source: &BoundExprProgram,
+	left: BoundExprId,
+	right: BoundExprId,
+	seen: &mut HashSet<(BoundExprId, BoundExprId)>,
+) -> bool {
+	if left == right {
+		return true;
+	}
+	if !seen.insert((left, right)) {
+		return true;
+	}
+	if source.node_type(left) != source.node_type(right) {
+		return false;
+	}
+
+	match (source.node(left), source.node(right)) {
+		(Some(BoundExprNode::Column(left)), Some(BoundExprNode::Column(right))) => left == right,
+		(Some(BoundExprNode::Literal(left)), Some(BoundExprNode::Literal(right))) => {
+			source.literals.get(*left as usize) == source.literals.get(*right as usize)
+		}
+		(
+			Some(BoundExprNode::Cast {
+				input: left_input,
+				target: left_target,
+			}),
+			Some(BoundExprNode::Cast {
+				input: right_input,
+				target: right_target,
+			}),
+		)
+		| (
+			Some(BoundExprNode::TryCast {
+				input: left_input,
+				target: left_target,
+			}),
+			Some(BoundExprNode::TryCast {
+				input: right_input,
+				target: right_target,
+			}),
+		) => {
+			left_target == right_target
+				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
+		}
+		(
+			Some(BoundExprNode::Binary {
+				op: left_op,
+				left: left_left,
+				right: left_right,
+			}),
+			Some(BoundExprNode::Binary {
+				op: right_op,
+				left: right_left,
+				right: right_right,
+			}),
+		) => {
+			left_op == right_op
+				&& bound_subgraphs_structurally_equal_inner(source, *left_left, *right_left, seen)
+				&& bound_subgraphs_structurally_equal_inner(source, *left_right, *right_right, seen)
+		}
+		(
+			Some(BoundExprNode::Unary {
+				op: left_op,
+				input: left_input,
+			}),
+			Some(BoundExprNode::Unary {
+				op: right_op,
+				input: right_input,
+			}),
+		) => {
+			left_op == right_op
+				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
+		}
+		(
+			Some(BoundExprNode::InList {
+				expr: left_expr,
+				list: left_list,
+				negated: left_negated,
+			}),
+			Some(BoundExprNode::InList {
+				expr: right_expr,
+				list: right_list,
+				negated: right_negated,
+			}),
+		) => {
+			left_negated == right_negated
+				&& left_list.len() == right_list.len()
+				&& bound_subgraphs_structurally_equal_inner(source, *left_expr, *right_expr, seen)
+				&& left_list
+					.iter()
+					.zip(right_list)
+					.all(|(left_item, right_item)| {
+						bound_subgraphs_structurally_equal_inner(
+							source,
+							*left_item,
+							*right_item,
+							seen,
+						)
+					})
+		}
+		(
+			Some(BoundExprNode::Like {
+				expr: left_expr,
+				pattern: left_pattern,
+				negated: left_negated,
+				case_insensitive: left_case_insensitive,
+			}),
+			Some(BoundExprNode::Like {
+				expr: right_expr,
+				pattern: right_pattern,
+				negated: right_negated,
+				case_insensitive: right_case_insensitive,
+			}),
+		) => {
+			left_pattern == right_pattern
+				&& left_negated == right_negated
+				&& left_case_insensitive == right_case_insensitive
+				&& bound_subgraphs_structurally_equal_inner(source, *left_expr, *right_expr, seen)
+		}
+		(
+			Some(BoundExprNode::TimeBucket {
+				interval: left_interval,
+				input: left_input,
+			}),
+			Some(BoundExprNode::TimeBucket {
+				interval: right_interval,
+				input: right_input,
+			}),
+		) => {
+			left_interval == right_interval
+				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
+		}
+		_ => false,
+	}
+}
+
+fn count_bound_subgraph_nodes(
+	source: &BoundExprProgram,
+	root: BoundExprId,
+) -> Result<usize, BooleanSplitError> {
+	let mut seen = HashSet::new();
+	count_bound_subgraph_nodes_inner(source, root, &mut seen)
+}
+
+fn count_bound_subgraph_nodes_inner(
+	source: &BoundExprProgram,
+	id: BoundExprId,
+	seen: &mut HashSet<BoundExprId>,
+) -> Result<usize, BooleanSplitError> {
+	if !seen.insert(id) {
+		return Ok(0);
+	}
+	let node = source.node(id).ok_or(BooleanSplitError::Malformed)?;
+	let mut count = 1;
+	for child in bound_node_children(node) {
+		count += count_bound_subgraph_nodes_inner(source, child, seen)?;
+		if count > BOOLEAN_FACTOR_MAX_NODES {
+			return Ok(count);
+		}
+	}
+	Ok(count)
+}
+
+fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
+	match node {
+		BoundExprNode::Column(_) | BoundExprNode::Literal(_) => Vec::new(),
+		BoundExprNode::Cast { input, .. }
+		| BoundExprNode::TryCast { input, .. }
+		| BoundExprNode::Unary { input, .. }
+		| BoundExprNode::Like { expr: input, .. }
+		| BoundExprNode::TimeBucket { input, .. } => vec![*input],
+		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
+		BoundExprNode::InList { expr, list, .. } => {
+			let mut children = Vec::with_capacity(list.len() + 1);
+			children.push(*expr);
+			children.extend(list.iter().copied());
+			children
+		}
+	}
 }
 
 fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> ExecutionPlan {
@@ -2933,6 +3406,41 @@ mod tests {
 		TableObjectId, TableSchemaDescriptor,
 	};
 
+	#[test]
+	fn predicate_pushdown_emitted_splits_preserve_kleene_3vl() {
+		for program in [
+			property_common_or_factor_program(),
+			property_not_or_program(),
+			property_top_level_and_program(),
+		] {
+			let (pushed, residual) = partition_bound_predicate(&program).expect("predicate split");
+			assert!(
+				pushed.is_some(),
+				"property fixture must emit a pushed predicate"
+			);
+
+			for p in TestK3::VALUES {
+				for r1 in TestK3::VALUES {
+					for r2 in TestK3::VALUES {
+						let row = [p, r1, r2];
+						let original = eval_test_program(&program, &row);
+						let split = k3_and(
+							pushed
+								.as_ref()
+								.map(|program| eval_test_program(program, &row))
+								.unwrap_or(TestK3::True),
+							residual
+								.as_ref()
+								.map(|program| eval_test_program(program, &row))
+								.unwrap_or(TestK3::True),
+						);
+						assert_eq!(split, original, "split must preserve exact K3 value");
+					}
+				}
+			}
+		}
+	}
+
 	#[tokio::test]
 	async fn binder_resolves_columns_to_ordinals() {
 		let catalog = catalog();
@@ -3661,6 +4169,114 @@ mod tests {
 			}),
 			partition_count,
 			key: vec![Expr::qualified_column(TableRef::new(table), key)],
+		}
+	}
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+	enum TestK3 {
+		True,
+		False,
+		Null,
+	}
+
+	impl TestK3 {
+		const VALUES: [Self; 3] = [Self::True, Self::False, Self::Null];
+	}
+
+	fn property_common_or_factor_program() -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let p_left = builder.append_column(test_bool_column("p", 0, true));
+		let r1 = builder.append_column(test_bool_column("r1", 1, false));
+		let left = builder.append_binary(BoundBinaryOp::And, p_left, r1, DataType::Boolean);
+		let p_right = builder.append_column(test_bool_column("p", 0, true));
+		let r2 = builder.append_column(test_bool_column("r2", 2, false));
+		let right = builder.append_binary(BoundBinaryOp::And, p_right, r2, DataType::Boolean);
+		let root = builder.append_binary(BoundBinaryOp::Or, left, right, DataType::Boolean);
+		builder.push_root(root);
+		builder.build()
+	}
+
+	fn property_not_or_program() -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let p = builder.append_column(test_bool_column("p", 0, true));
+		let r1 = builder.append_column(test_bool_column("r1", 1, false));
+		let disjunction = builder.append_binary(BoundBinaryOp::Or, p, r1, DataType::Boolean);
+		let root = builder.append_unary(BoundUnaryOp::Not, disjunction, DataType::Boolean);
+		builder.push_root(root);
+		builder.build()
+	}
+
+	fn property_top_level_and_program() -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let p = builder.append_column(test_bool_column("p", 0, true));
+		let r1 = builder.append_column(test_bool_column("r1", 1, false));
+		let root = builder.append_binary(BoundBinaryOp::And, p, r1, DataType::Boolean);
+		builder.push_root(root);
+		builder.build()
+	}
+
+	fn test_bool_column(name: &str, ordinal: u32, pbc_eligible: bool) -> ResolvedColumn {
+		ResolvedColumn {
+			name: ColumnName(name.to_string()),
+			ordinal: ColumnOrdinal(ordinal),
+			data_type: DataType::Boolean,
+			nullable: true,
+			pbc_eligible,
+		}
+	}
+
+	fn eval_test_program(program: &BoundExprProgram, row: &[TestK3; 3]) -> TestK3 {
+		let root = program.single_root().expect("single root");
+		eval_test_node(program, root, row)
+	}
+
+	fn eval_test_node(program: &BoundExprProgram, id: BoundExprId, row: &[TestK3; 3]) -> TestK3 {
+		match program.node(id).expect("node") {
+			BoundExprNode::Column(column) => row[column.ordinal.0 as usize],
+			BoundExprNode::Literal(literal) => match program.literals[*literal as usize] {
+				ScalarValue::Boolean(Some(true)) => TestK3::True,
+				ScalarValue::Boolean(Some(false)) => TestK3::False,
+				ScalarValue::Boolean(None) => TestK3::Null,
+				_ => panic!("property evaluator only supports Boolean literals"),
+			},
+			BoundExprNode::Binary { op, left, right } => {
+				let left = eval_test_node(program, *left, row);
+				let right = eval_test_node(program, *right, row);
+				match op {
+					BoundBinaryOp::And => k3_and(left, right),
+					BoundBinaryOp::Or => k3_or(left, right),
+					_ => panic!("property evaluator only supports Boolean binary ops"),
+				}
+			}
+			BoundExprNode::Unary { op, input } => match op {
+				BoundUnaryOp::Not => k3_not(eval_test_node(program, *input, row)),
+				_ => panic!("property evaluator only supports NOT"),
+			},
+			_ => panic!("property evaluator only supports Boolean test nodes"),
+		}
+	}
+
+	fn k3_not(value: TestK3) -> TestK3 {
+		match value {
+			TestK3::True => TestK3::False,
+			TestK3::False => TestK3::True,
+			TestK3::Null => TestK3::Null,
+		}
+	}
+
+	fn k3_and(left: TestK3, right: TestK3) -> TestK3 {
+		match (left, right) {
+			(TestK3::False, _) | (_, TestK3::False) => TestK3::False,
+			(TestK3::True, TestK3::True) => TestK3::True,
+			_ => TestK3::Null,
+		}
+	}
+
+	fn k3_or(left: TestK3, right: TestK3) -> TestK3 {
+		match (left, right) {
+			(TestK3::True, _) | (_, TestK3::True) => TestK3::True,
+			(TestK3::False, TestK3::False) => TestK3::False,
+			_ => TestK3::Null,
 		}
 	}
 

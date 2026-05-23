@@ -8,14 +8,15 @@ use toron::catalog::MockCatalog;
 use toron::error::{BindingError, FrontendError};
 use toron::exec::Executor;
 use toron::ir::{
-	BoundExprNode, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, TableId,
+	BoundExprNode, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue,
+	TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::InMemoryStorageScan;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
-	pbc::{OP_IN_LIST, OP_NOT},
+	pbc::{OP_IN_LIST, OP_NOT, OP_OR},
 };
 
 #[test]
@@ -165,6 +166,163 @@ async fn where_like_residual_splits_from_pbc_conjunct_and_prunes_pushed_column()
 }
 
 #[tokio::test]
+async fn where_fully_pushable_or_pushes_whole_or() {
+	let sql = "SELECT id FROM sales WHERE id = 1 OR id = 3";
+	let bound = bind_sql(sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::FullyPushed);
+	let pbc = scan_pbc(scan).expect("PBC predicate");
+	assert!(pbc.contains(&OP_OR));
+	assert_ids(sql, &[1, 3]).await;
+}
+
+#[tokio::test]
+async fn where_fully_pushable_not_pushes_whole_not() {
+	let plan = sales_filter(Expr::Not(Box::new(id_eq(1))));
+	let bound = bind_logical(&plan).await;
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::FullyPushed);
+	let pbc = scan_pbc(scan).expect("PBC predicate");
+	assert_eq!(*pbc.last().expect("last opcode"), OP_NOT);
+	assert_ids_for_plan(&plan, &[2, 3, 4, 5, 6]).await;
+}
+
+#[tokio::test]
+async fn where_mixed_or_branch_does_not_push_partial_branch() {
+	let sql = "SELECT id FROM sales WHERE id = 3 OR status LIKE 'o%'";
+	let bound = bind_sql(sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+	assert_ids(sql, &[1, 2, 3, 4]).await;
+}
+
+#[tokio::test]
+async fn where_common_pushable_conjunct_factors_out_of_or_and_preserves_rows() {
+	let sql = "SELECT id FROM sales \
+		WHERE (id = 3 AND status LIKE 'c%') OR (id = 3 AND status LIKE 'x%')";
+	let bound = bind_sql(sql).await;
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Binary {
+			op: toron::ir::BoundBinaryOp::Or,
+			..
+		})
+	));
+	assert!(scan_pbc(scan).is_some());
+	assert_ids(sql, &[3]).await;
+}
+
+#[tokio::test]
+async fn where_common_pk_conjunct_across_or_uses_point_read_profile() {
+	let sql = "SELECT id FROM sales \
+		WHERE (id = 3 AND status LIKE 'c%') OR (id = 3 AND status LIKE 'x%')";
+	let bound = bind_sql(sql).await;
+	let (_, _, scan) = find_filter(&bound);
+	let ExecutionPlan::Scan { profile_hint, .. } = scan else {
+		panic!("expected scan input, got {scan:?}");
+	};
+
+	assert_eq!(*profile_hint, toron::ir::QueryProfileHint::PointRead);
+}
+
+#[tokio::test]
+async fn where_structurally_different_equivalent_terms_do_not_factor() {
+	let sql = "SELECT id FROM sales \
+		WHERE (id = 3 AND status LIKE 'c%') OR (3 = id AND status LIKE 'x%')";
+	let bound = bind_sql(sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+	assert_ids(sql, &[3]).await;
+}
+
+#[tokio::test]
+async fn where_not_or_mixed_extracts_negated_pushable_branch_and_preserves_rows() {
+	let plan = sales_filter(Expr::Not(Box::new(Expr::Or(
+		Box::new(id_eq(3)),
+		Box::new(status_like("o%")),
+	))));
+	let bound = bind_logical(&plan).await;
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Unary {
+			op: toron::ir::BoundUnaryOp::Not,
+			..
+		})
+	));
+	let pbc = scan_pbc(scan).expect("PBC predicate");
+	assert_eq!(*pbc.last().expect("last opcode"), OP_NOT);
+	assert_ids_for_plan(&plan, &[6]).await;
+}
+
+#[tokio::test]
+async fn where_not_and_mixed_does_not_push_negated_single_side() {
+	let plan = sales_filter(Expr::Not(Box::new(Expr::And(
+		Box::new(id_eq(3)),
+		Box::new(id_plus_one_gt_zero()),
+	))));
+	let bound = bind_logical(&plan).await;
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+	assert_ids_for_plan(&plan, &[1, 2, 4, 5, 6]).await;
+}
+
+#[tokio::test]
+async fn boolean_factoring_over_budget_falls_back_without_wrong_results() {
+	let branches = (0..17)
+		.map(|_| "(id = 3 AND status LIKE 'c%')")
+		.collect::<Vec<_>>()
+		.join(" OR ");
+	let sql = format!("SELECT id FROM sales WHERE {branches}");
+	let bound = bind_sql(&sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+	assert_ids(&sql, &[3]).await;
+}
+
+#[test]
+fn predicate_pushdown_3vl_property_random_rows_including_nulls() {
+	let values = [K3::True, K3::False, K3::Null];
+	for p in values {
+		for r1 in values {
+			for r2 in values {
+				let original = k3_or(k3_and(p, r1), k3_and(p, r2));
+				assert_k3_split_identity("common OR factor", original, p, original);
+
+				let original = k3_not(k3_or(p, r1));
+				assert_k3_split_identity("NOT(OR) single branch", original, k3_not(p), original);
+
+				let original = k3_not(k3_or(k3_or(p, r1), r2));
+				let pushed = k3_and(k3_not(p), k3_not(r1));
+				assert_k3_split_identity("NOT(OR) branch negations", original, pushed, original);
+
+				let original = k3_and(p, r1);
+				assert_k3_split_identity("top-level AND residual split", original, p, r1);
+			}
+		}
+	}
+}
+
+#[tokio::test]
 async fn where_in_list_filters_rows() {
 	assert_ids(
 		"SELECT id FROM sales WHERE status IN ('closed', 'pending')",
@@ -294,10 +452,14 @@ fn plan_sql(sql: &str) -> LogicalPlan {
 }
 
 async fn bind_sql(sql: &str) -> ExecutionPlan {
+	bind_logical(&plan_sql(sql)).await
+}
+
+async fn bind_logical(plan: &LogicalPlan) -> ExecutionPlan {
 	let catalog = catalog();
-	bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
+	bind(plan, &catalog, &PlannerConfig::default())
 		.await
-		.expect("bind SQL")
+		.expect("bind logical plan")
 }
 
 async fn pbc_for(sql: &str) -> Vec<u8> {
@@ -308,10 +470,14 @@ async fn pbc_for(sql: &str) -> Vec<u8> {
 }
 
 async fn assert_ids(sql: &str, expected: &[i32]) {
+	assert_ids_for_plan(&plan_sql(sql), expected).await;
+}
+
+async fn assert_ids_for_plan(plan: &LogicalPlan, expected: &[i32]) {
 	let catalog = catalog();
-	let bound = bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
+	let bound = bind(plan, &catalog, &PlannerConfig::default())
 		.await
-		.expect("bind SQL");
+		.expect("bind plan");
 	let batches = Executor::new(Arc::new(InMemoryStorageScan {
 		table_data: sales_batch(schema()),
 	}))
@@ -319,6 +485,42 @@ async fn assert_ids(sql: &str, expected: &[i32]) {
 	.await
 	.expect("execute SQL");
 	assert_eq!(ids(&batches), expected);
+}
+
+fn sales_filter(predicate: Expr) -> LogicalPlan {
+	LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Scan {
+			table: TableId(1),
+			projection: None,
+		}),
+		predicate,
+	}
+}
+
+fn id_eq(value: i32) -> Expr {
+	Expr::Eq(
+		Box::new(Expr::column("id")),
+		Box::new(Expr::Literal(ScalarValue::Int32(Some(value)))),
+	)
+}
+
+fn status_like(pattern: &str) -> Expr {
+	Expr::Like {
+		expr: Box::new(Expr::column("status")),
+		pattern: pattern.to_string(),
+		negated: false,
+		case_insensitive: false,
+	}
+}
+
+fn id_plus_one_gt_zero() -> Expr {
+	Expr::Gt(
+		Box::new(Expr::Add(
+			Box::new(Expr::column("id")),
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
+		)),
+		Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+	)
 }
 
 async fn assert_statuses(sql: &str, expected: &[&str]) {
@@ -406,6 +608,45 @@ fn statuses(batches: &[RecordBatch]) -> Vec<String> {
 				.collect::<Vec<_>>()
 		})
 		.collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K3 {
+	True,
+	False,
+	Null,
+}
+
+fn k3_not(value: K3) -> K3 {
+	match value {
+		K3::True => K3::False,
+		K3::False => K3::True,
+		K3::Null => K3::Null,
+	}
+}
+
+fn k3_and(left: K3, right: K3) -> K3 {
+	match (left, right) {
+		(K3::False, _) | (_, K3::False) => K3::False,
+		(K3::True, K3::True) => K3::True,
+		_ => K3::Null,
+	}
+}
+
+fn k3_or(left: K3, right: K3) -> K3 {
+	match (left, right) {
+		(K3::True, _) | (_, K3::True) => K3::True,
+		(K3::False, K3::False) => K3::False,
+		_ => K3::Null,
+	}
+}
+
+fn assert_k3_split_identity(label: &str, original: K3, pushed: K3, residual: K3) {
+	assert_eq!(
+		k3_and(pushed, residual),
+		original,
+		"{label}: pushed AND residual must equal original"
+	);
 }
 
 fn catalog() -> MockCatalog {
