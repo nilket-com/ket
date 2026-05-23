@@ -490,6 +490,82 @@ async fn rune_lit_i64_preserves_wide_integer_in_logical_plan() {
 	));
 }
 
+#[tokio::test]
+async fn rune_predicate_operator_compound_filter_executes() {
+	let logical = predicate_operator_compound_filter_plan().await;
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int64_column_rows(&batches, 0),
+		vec![Some(1), Some(2), Some(3)]
+	);
+}
+
+#[tokio::test]
+async fn rune_predicate_operators_preserve_pushdown_path() {
+	let logical = predicate_operator_compound_filter_plan().await;
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind compound Rune predicate filter");
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::FullyPushed);
+	assert!(
+		scan_pbc(scan).is_some(),
+		"compound predicate must reach scan PBC"
+	);
+}
+
+#[tokio::test]
+async fn rune_logical_not_executes_against_boolean_column() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("active").logical_not())
+        }
+    "#,
+	)
+	.await
+	.expect("logical_not filter plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(2), Some(5)]);
+}
+
+#[tokio::test]
+async fn rune_null_predicate_executes_against_nullable_column() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("price").is_null())
+        }
+    "#,
+	)
+	.await
+	.expect("is_null filter plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3)]);
+}
+
+async fn predicate_operator_compound_filter_plan() -> LogicalPlan {
+	rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").lt(lit_i64(4))
+                    .and(col("amount").gte(lit(10)))
+                    .and(col("amount").lte(lit(20)))
+                    .or(col("status").ne(lit_str("open")).and(col("price").is_null()))
+                    .and(col("region").is_not_null())
+            )
+        }
+    "#,
+	)
+	.await
+	.expect("compound predicate operator filter plan")
+}
+
 async fn sql_group_by_alias_outer_sum_plan() -> LogicalPlan {
 	rune_plan(
 		r#"

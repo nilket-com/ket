@@ -25,6 +25,10 @@ fn exec_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source")
 }
 
+fn pbc_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read PBC source")
+}
+
 fn rune_relation_handles_test_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("tests/rune_relation_handles_test.rs"))
 		.expect("read Rune relation handles tests")
@@ -667,13 +671,9 @@ pub(crate) fn adr082_typed_literal_cut_does_not_expand_operator_surface() {
 	let module = source_block(&rune, "pub fn create_toron_module");
 	let names = registered_rune_function_names(&module);
 
-	for retained in ["eq", "gt"] {
-		assert!(
-			names.iter().any(|name| name == retained),
-			"existing Rune expression method `{retained}` missing: {names:?}"
-		);
-	}
-	for deferred in [
+	for retained in [
+		"eq",
+		"gt",
 		"lt",
 		"lte",
 		"gte",
@@ -681,17 +681,20 @@ pub(crate) fn adr082_typed_literal_cut_does_not_expand_operator_surface() {
 		"and",
 		"or",
 		"logical_not",
-		"not",
 		"is_null",
 		"is_not_null",
-		"add",
-		"sub",
-		"mul",
-		"div",
+	] {
+		assert!(
+			names.iter().any(|name| name == retained),
+			"post-ADR083 Rune expression method `{retained}` missing: {names:?}"
+		);
+	}
+	for deferred in [
+		"not", "add", "sub", "mul", "div", "like", "ilike", "in_list", "cast", "try_cast",
 	] {
 		assert!(
 			!names.iter().any(|name| name == deferred),
-			"ADR082 must not register deferred Rune operator `{deferred}`: {names:?}"
+			"post-ADR083 Rune surface must keep deferred operator `{deferred}` out: {names:?}"
 		);
 	}
 }
@@ -725,4 +728,149 @@ pub(crate) fn adr082_typed_literals_do_not_change_ir_binder_executor_or_sandbox(
 	assert!(exec.contains("ScalarValue::Boolean(v)"));
 	assert!(exec.contains("ScalarValue::Float64(v)"));
 	assert!(exec.contains("ScalarValue::Int64(v)"));
+}
+
+#[test]
+pub(crate) fn adr083_rune_predicate_operators_lower_to_existing_expr_variants() {
+	let rune = rune_engine_source();
+
+	for (function, variant) in [
+		("pub fn lt", "Expr::Lt"),
+		("pub fn lte", "Expr::Lte"),
+		("pub fn gte", "Expr::Gte"),
+		("pub fn ne(self", "Expr::Neq"),
+		("pub fn and", "Expr::And"),
+		("pub fn or", "Expr::Or"),
+		("pub fn logical_not", "Expr::Not"),
+		("pub fn is_null", "Expr::IsNull"),
+		("pub fn is_not_null", "Expr::IsNotNull"),
+	] {
+		let body = source_block(&rune, function);
+		assert!(body.contains(variant), "{function} missing {variant}");
+		assert!(
+			!body.contains("Expr::Add")
+				&& !body.contains("Expr::Sub")
+				&& !body.contains("Expr::Mul")
+				&& !body.contains("Expr::Div"),
+			"{function} must not introduce arithmetic"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr083_rune_predicate_operators_are_registered() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+
+	for registration in [
+		"m.associated_function(\"lt\", RuneExpr::lt)?;",
+		"m.associated_function(\"lte\", RuneExpr::lte)?;",
+		"m.associated_function(\"gte\", RuneExpr::gte)?;",
+		"m.associated_function(\"ne\", RuneExpr::ne)?;",
+		"m.associated_function(\"and\", RuneExpr::and)?;",
+		"m.associated_function(\"or\", RuneExpr::or)?;",
+		"m.associated_function(\"logical_not\", RuneExpr::logical_not)?;",
+		"m.associated_function(\"is_null\", RuneExpr::is_null)?;",
+		"m.associated_function(\"is_not_null\", RuneExpr::is_not_null)?;",
+	] {
+		assert!(module.contains(registration), "missing {registration}");
+	}
+	assert!(!module.contains("m.associated_function(\"not\","));
+}
+
+#[test]
+pub(crate) fn adr083_logical_not_avoids_keyword_collision_with_not() {
+	adr081_authored_rune_methods_avoid_reserved_keywords();
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	assert!(
+		names.iter().any(|name| name == "logical_not"),
+		"Rune negation method must be logical_not: {names:?}"
+	);
+	for keyword in ["not", "is", "select", "as"] {
+		assert!(
+			!names.iter().any(|name| name == keyword),
+			"Rune authoring surface registered keyword `{keyword}`: {names:?}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr083_predicate_operator_cut_does_not_change_engine_substrate() {
+	let rune = rune_engine_source();
+	let ir = ir_source();
+	let binder = binder_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+
+	for forbidden in [
+		"BindingError",
+		"BoundExpr",
+		"ExecutionPlan",
+		"PlannerConfig",
+		"normalize_",
+		"evaluate_expr",
+	] {
+		assert!(
+			!rune.contains(forbidden),
+			"Rune predicate operator surface gained substrate marker {forbidden}"
+		);
+	}
+	for variant in [
+		"Neq(Box<Expr>, Box<Expr>)",
+		"Lt(Box<Expr>, Box<Expr>)",
+		"Lte(Box<Expr>, Box<Expr>)",
+		"Gte(Box<Expr>, Box<Expr>)",
+		"And(Box<Expr>, Box<Expr>)",
+		"Or(Box<Expr>, Box<Expr>)",
+		"Not(Box<Expr>)",
+		"IsNull(Box<Expr>)",
+		"IsNotNull(Box<Expr>)",
+	] {
+		assert!(ir.contains(variant), "IR missing existing {variant}");
+	}
+	for binder_arm in [
+		"Expr::Neq(left, right) => bind_comparison",
+		"Expr::Lt(left, right) => bind_comparison",
+		"Expr::Lte(left, right) => bind_comparison",
+		"Expr::Gte(left, right) => bind_comparison",
+		"Expr::And(left, right) => bind_boolean",
+		"Expr::Or(left, right) => bind_boolean",
+		"Expr::Not(inner) =>",
+		"Expr::IsNull(inner) =>",
+		"Expr::IsNotNull(inner) =>",
+	] {
+		assert!(binder.contains(binder_arm), "binder missing {binder_arm}");
+	}
+	for exec_arm in [
+		"Expr::Neq(left, right)",
+		"Expr::Lt(left, right)",
+		"Expr::Lte(left, right)",
+		"Expr::Gte(left, right)",
+		"Expr::And(left, right)",
+		"Expr::Or(left, right)",
+		"Expr::Not(inner)",
+		"Expr::IsNull(inner)",
+		"Expr::IsNotNull(inner)",
+	] {
+		assert!(exec.contains(exec_arm), "executor missing {exec_arm}");
+	}
+	for pbc_mapping in [
+		"BoundBinaryOp::Neq => Ok(OP_NEQ)",
+		"BoundBinaryOp::Lt => Ok(OP_LT)",
+		"BoundBinaryOp::Lte => Ok(OP_LTE)",
+		"BoundBinaryOp::Gte => Ok(OP_GTE)",
+		"BoundBinaryOp::And => Ok(OP_AND)",
+		"BoundBinaryOp::Or => Ok(OP_OR)",
+		"BoundUnaryOp::Not => OP_NOT",
+		"BoundUnaryOp::IsNull => OP_IS_NULL",
+		"BoundUnaryOp::IsNotNull => OP_IS_NOT_NULL",
+	] {
+		assert!(
+			pbc.contains(pbc_mapping),
+			"PBC compiler missing {pbc_mapping}"
+		);
+	}
 }

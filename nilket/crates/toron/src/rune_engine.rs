@@ -394,6 +394,60 @@ impl RuneExpr {
 			expr: Expr::Eq(Box::new(self.expr), Box::new(other.expr)),
 		}
 	}
+
+	pub fn lt(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Lt(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	pub fn lte(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Lte(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	pub fn gte(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Gte(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	pub fn ne(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Neq(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	pub fn and(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::And(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	pub fn or(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Or(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	pub fn logical_not(self) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Not(Box::new(self.expr)),
+		}
+	}
+
+	pub fn is_null(self) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::IsNull(Box::new(self.expr)),
+		}
+	}
+
+	pub fn is_not_null(self) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::IsNotNull(Box::new(self.expr)),
+		}
+	}
 }
 
 pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
@@ -434,6 +488,15 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("named", RuneExpr::named)?;
 	m.associated_function("gt", RuneExpr::gt)?;
 	m.associated_function("eq", RuneExpr::eq)?;
+	m.associated_function("lt", RuneExpr::lt)?;
+	m.associated_function("lte", RuneExpr::lte)?;
+	m.associated_function("gte", RuneExpr::gte)?;
+	m.associated_function("ne", RuneExpr::ne)?;
+	m.associated_function("and", RuneExpr::and)?;
+	m.associated_function("or", RuneExpr::or)?;
+	m.associated_function("logical_not", RuneExpr::logical_not)?;
+	m.associated_function("is_null", RuneExpr::is_null)?;
+	m.associated_function("is_not_null", RuneExpr::is_not_null)?;
 
 	Ok(m)
 }
