@@ -5019,6 +5019,30 @@ along with the forward-sequence rewrite.
   added the deferred `syn`/AST direction). Placement: Toron test architecture /
   council substrate. Migration:
   `plans/impl/076_architecture_guard_corpus_modularization.md`.
+- **ADR 077 — Architecture Guard Sub-Bucketing.**
+  Promoted (plan). A **behavior-zero, test-only** follow-on to 076, one level
+  deeper: convert the two remaining >4000-line modules —
+  `distributed_execution.rs` (4635) and `storage_wendelon_boundary.rs` (5364) —
+  into semantic **directory-modules** (for example, `tenant_admission.rs`,
+  `descriptor_sync.rs`, and `resource_governance.rs` under
+  `distributed_execution/`), behind the unchanged `mod architecture;`
+  harness and `cargo test -p toron --test architecture_test` command.
+  `sql_planner_surface.rs` (2175) left intact (under ceiling). **No reader change**
+  (grounded: the 076 `architecture_corpus_source()` → `collect_rs_files()` already
+  recurses into subdirs, `support.rs:192`, so conservation + self-inspecting guards
+  work natively). **Leaf-name conservation** gate (post = 945 + `adr077_*`).
+  **Generous line-ceiling guard** (`line_count <= 2500` for non-support modules)
+  as the durable teeth — set generously so it bites only real jumbos, not a
+  feature ADR mid-work. Sub-file support imports use the deeper
+  `super::super::support` path, with sibling guard imports/reexports kept
+  test-local as needed; `#[cfg]`/`#[tokio::test]` attrs preserved; **no facade, no
+  `syn`, no new dependency.** Final D-set:
+  **6 decisions, 5 guards.** Council: **genuine 3-of-3** — fully converged by
+  iter-1, no fork (Codex seeded; Claude+Gemini tightened to a bounded one-off +
+  the return-to-features sequencing; Claude grounded the no-reader-change). **A
+  bounded one-off: feature work resumes next.** Placement: Toron test architecture
+  / council substrate. Migration:
+  `plans/impl/077_architecture_guard_subbucketing.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5103,7 +5127,47 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 076 promoted; ADR 077 candidates
+### ADR 077 promoted; ADR 078 candidates
+
+ADR 077 selected and promoted **Architecture Guard Sub-Bucketing** — a
+behavior-zero, test-only follow-on to 076: the two remaining >4000-line modules
+(`distributed_execution`, `storage_wendelon_boundary`) become semantic
+directory-modules behind the unchanged harness/command. Final D-set: **6
+decisions, 5 guards**. Council: **genuine 3-of-3, fully converged by iter-1**.
+
+**Key decisions / invariants:**
+
+- **Scope = the two jumbos only**; `sql_planner_surface.rs` (2175) left intact.
+  Directory-modules with semantic sub-files (`mod X;` → `X/mod.rs`); not
+  ADR-numbered.
+- **No reader change** — the 076 `architecture_corpus_source()` already recurses
+  (`support.rs:192`), so conservation + self-inspecting guards work natively.
+- **Leaf-name conservation** (post = 945 + `adr077_*`); `super::super::support`
+  import depth, with sibling guard imports/reexports kept test-local as needed;
+  `#[cfg]`/`#[tokio::test]` attrs preserved; single Cargo target.
+- **Generous line-ceiling guard** (`line_count <= 2500` for non-support modules)
+  — durable teeth, set generously to avoid mid-feature churn. No facade, no
+  `syn`, no new dependency.
+
+The migration is materialized in `plans/impl/077_architecture_guard_subbucketing.md`.
+
+**ADR 078 candidates — feature work resumes (the test-infra streak ends with 077):**
+
+- **`OR` / `NOT` predicate-distribution pushdown** (the lead) — generalize 075's
+  top-level-`AND` split: factor pushable terms out of `OR`, push De Morgan'd `NOT`.
+  The next pushdown-completeness step on the V1 "First Query with Integrity" target.
+- **`SIMILAR TO` / `RLIKE` / `REGEXP`** (`arrow_string::regexp` kernels, regex
+  already in-tree; needs a CPU-cost/ReDoS contract); or `ESCAPE` + dynamic `LIKE`
+  patterns (widen 075's literal-only bound).
+- **`CASE` / value-conditionals**; **Wendelon typed table-mutation trace
+  continuation** (Wendelon-home producer).
+- On-demand test-infra (deferred, not committed): source-guard support **facade**;
+  **`syn`/AST pilot** on one bucket (077 made either per-bucket and small).
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 076 promoted; ADR 077 candidates (HISTORICAL)
 
 ADR 076 selected and promoted **Architecture Guard Corpus Modularization** — a
 behavior-zero, test-only split of the ~18.7k-line `architecture_test.rs` monolith
