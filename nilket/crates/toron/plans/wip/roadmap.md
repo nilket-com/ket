@@ -5066,6 +5066,31 @@ along with the forward-sequence rewrite.
   framing:** completeness, not a perf swing — sound full-boolean-structure pushdown
   as a foundation. Placement: Toron compute-ring predicate pushdown. Migration:
   `plans/impl/078_predicate_pushdown_boolean_distribution.md`.
+- **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
+  Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
+  to Rune composition**: `ctx.sql("<query>")` parses one SQL query, lowers it to a
+  lazy `LogicalPlan`, wraps it as a `RuneDataFrame`, and lets the **existing**
+  `.filter`/`.aggregate` Rune methods add more IR above it — one composed plan
+  through the normal Toron binder/pushdown/placement/execution (no Rune-local
+  optimizer/executor). **Doctrine:** SQL = relation-producing frontend, Rune =
+  composition frontend, Toron IR = shared substrate (future SQL work improves the
+  substrate, not SQL-as-top-authoring-model). Only new code: `ctx.sql` (+
+  `plan_sql_relation`) and a `sum` helper. **Two grounded guardrails:** (1)
+  **explicit multi-statement rejection** (`SqlPlanner::plan` parses all statements
+  but lowers only `ast[0]`, so `ctx.sql` enforces `ast.len()==1` — else a
+  `SELECT…; DROP…` silently drops the DROP); (2) **DDL/DML rejected** (no side
+  effects in lazy graphs). **Proof = binding, not construction:** the gate fixture
+  binds `aggregate([],[sum(col("cnt"))])` over a SQL `… COUNT(1) AS cnt … GROUP BY`
+  — resolving `col("cnt")` via **schema continuation** across the boundary (the SQL
+  `Project` output names; a well-exercised path). ADR-007 sandbox intact; no
+  execution action (`execute_script` still returns a plan; evidence may execute via
+  an existing harness); no worker-side Rune; no `FROM`-subquery / `syn` / new dep.
+  Final D-set: **13 decisions, 14 guards, 8 fixtures.** Council: **genuine 3-of-3**,
+  no fork (Claude identified the binding-proof hinge; Codex grounded the
+  multi-statement catch; Claude softened the nested-shape risk to schema-
+  continuation; Gemini converged the same 13-decision shape). Placement: Toron
+  frontend composition / Rune authoring. Migration:
+  `plans/impl/079_rune_relation_handles.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5150,7 +5175,51 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 078 promoted; ADR 079 candidates
+### ADR 079 promoted; ADR 080 candidates
+
+ADR 079 selected and promoted **Rune Relation Handles (SQL as a Composable
+DataFrame Source)** — a small frontend-composition seam: `ctx.sql("<query>")`
+returns a lazy `RuneDataFrame` that the existing Rune `.filter`/`.aggregate`
+methods compose over, one plan through the normal Toron pipeline. Establishes the
+doctrine: SQL = relation frontend, Rune = composition frontend, Toron IR = shared
+substrate. Final D-set: **13 decisions, 14 guards, 8 fixtures**. Council: **genuine
+3-of-3, fully converged by iter-2**.
+
+**Key decisions / invariants:**
+
+- **Lazy handle** (`RuneDataFrame { plan: LogicalPlan }`); only new code is
+  `ctx.sql` + a `sum` helper (the `.filter`/`.aggregate` composition already
+  exists).
+- **Multi-statement rejection** (grounded: `SqlPlanner::plan` lowers only
+  `ast[0]`, so `ctx.sql` enforces `ast.len()==1`); **DDL/DML rejected** (no side
+  effects in lazy graphs).
+- **Proof = binding, not construction**: bind `aggregate([],[sum(col("cnt"))])`
+  over a SQL group-by alias via **schema continuation** (SQL `Project` output
+  names) through the normal binder. No Rune-local optimizer/executor; no execution
+  action (`execute_script` returns a plan; evidence may execute via existing
+  harness).
+- ADR-007 sandbox intact; no worker-side Rune; no `FROM`-subquery/`syn`/new dep;
+  Toron-only.
+
+The migration is materialized in `plans/impl/079_rune_relation_handles.md`.
+
+**ADR 080 candidates:**
+
+- **Residual minimization for factored shapes** (the 078 follow-on) — reconstruct
+  the *minimal* residual `(R1 ∨ R2)` for common-factor `OR` / `NOT(OR)` instead of
+  re-checking the whole original, now that necessary-extraction is sound.
+- **Rune dataframe ergonomics** (079 follow-on) — more continuation helpers
+  (`count`/`avg`/projection/`join`), dot-field sugar (`.cnt.sum()` lowering to the
+  named-column model), once `ctx.sql` composition has landed.
+- **`SIMILAR TO` / `RLIKE` / `REGEXP`** (`arrow_string::regexp`, regex in-tree;
+  needs a CPU-cost/ReDoS contract); or `ESCAPE` + dynamic `LIKE` patterns; **`CASE`
+  / value-conditionals**; **Wendelon typed table-mutation trace continuation**.
+- On-demand test-infra (deferred): source-guard **facade**; **`syn`/AST pilot**.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 078 promoted; ADR 079 candidates (HISTORICAL)
 
 ADR 078 selected and promoted **Predicate Pushdown Boolean Distribution (Safe
 Boolean Factoring, OR/NOT)** — feature work resumed on the V1 pushdown axis. A
