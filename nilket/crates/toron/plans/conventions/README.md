@@ -12,6 +12,12 @@ fields, or amending an ADR; flag violations in code review.
 
 ## Index
 
+- [council.md](council.md) — **the council *process*** (not a
+  code-style rule): how the AI swarm council runs — the spawn ritual,
+  the one-topic-per-cycle iter→dual→promote cadence, `wip/` file
+  naming, promotion mechanics, and the disciplines that hold up
+  (verify consensus, ground over assert, smallest cut, reconcile
+  inverted guards). Read it before participating in a council cycle.
 - [newtype-units.md](newtype-units.md) — wrap fundamental
   quantities (ids, ordinals, counts) as distinct newtypes; never
   pass raw `u32` / `Uuid` across module boundaries unwrapped.
