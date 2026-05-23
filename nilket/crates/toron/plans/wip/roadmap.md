@@ -5043,6 +5043,29 @@ along with the forward-sequence rewrite.
   bounded one-off: feature work resumes next.** Placement: Toron test architecture
   / council substrate. Migration:
   `plans/impl/077_architecture_guard_subbucketing.md`.
+- **ADR 078 — Predicate Pushdown Boolean Distribution (Safe Boolean Factoring,
+  OR/NOT).** Promoted (plan). Feature work resumed (075 follow-on) on the V1
+  pushdown axis. **Behavior-additive** binder-side change: a recursive
+  `split_boolean_tree` partitioner that extracts only **necessary** PBC predicates
+  from *mixed* boolean shapes — **common-`OR` factors** (`(P∧R1)∨(P∧R2)`→push `P`)
+  and **`NOT(OR)` branch negations** (`NOT(P∨R)`→push `NOT P`) — pushes them, and
+  keeps the **original** predicate as the Toron residual (075-minimal residual for
+  top-level `AND`). **Soundness invariant:** a pushed `N` must be necessary
+  (`P TRUE ⇒ N TRUE`), 3VL-sound under Kleene logic; **a mixed `OR` never pushes a
+  single branch** (fundamentally non-pushable). Structural-identity matching only
+  (no algebraic equivalence); **bounded extraction, no CNF/DNF** (over-budget →
+  075 fallback); compile-attempt classification; pushed candidate drives scan-
+  profile + pruning; one shared SELECT/UPDATE/DELETE path. **Gate:** a 3VL property
+  fixture (random predicate + NULL-bearing rows ⇒ exact Kleene equality for
+  `pushed(N)∧residual(P) ≡ P`; the `WHERE TRUE` set is the minimum safety bar).
+  Toron-local; no SQL/PBC-opcode/Wendelon/wire/dependency change, no `syn`. Final
+  D-set: **14 decisions, 15 + meta guards, 13 fixtures**. Council: **2-of-3 (Codex,
+  Claude)** on the full design — Gemini held a minimal recursive-split variant (no
+  De Morgan, no factoring), rejected as safe-but-near-no-op against 075 (its
+  recursive-split *skeleton* was adopted as the implementation spine). **Honest
+  framing:** completeness, not a perf swing — sound full-boolean-structure pushdown
+  as a foundation. Placement: Toron compute-ring predicate pushdown. Migration:
+  `plans/impl/078_predicate_pushdown_boolean_distribution.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5127,7 +5150,51 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 077 promoted; ADR 078 candidates
+### ADR 078 promoted; ADR 079 candidates
+
+ADR 078 selected and promoted **Predicate Pushdown Boolean Distribution (Safe
+Boolean Factoring, OR/NOT)** — feature work resumed on the V1 pushdown axis. A
+behavior-additive binder-side partitioner that extracts only *necessary* PBC
+predicates from mixed boolean shapes (common-`OR` factors + `NOT(OR)` branch
+negations), keeping the original predicate as residual. Final D-set: **14
+decisions, 15 + meta guards, 13 fixtures**. Council: **2-of-3 (Codex, Claude)** on
+the full design; Gemini's minimal recursive split (no De Morgan/factoring) rejected
+as near-no-op vs 075 (its skeleton adopted as the spine).
+
+**Key decisions / invariants:**
+
+- **Necessary-filter soundness** (`P TRUE ⇒ pushed TRUE`), 3VL-sound (Kleene);
+  **mixed `OR` never pushes a single branch** (fundamentally non-pushable).
+- **Common-`OR` factoring** (structural identity, present-in-every-branch) +
+  **De Morgan `NOT(OR)`-only** (`NOT(AND)` yields no necessary term). Residual =
+  original for the new mixed shapes; 075-minimal for top-level `AND`.
+- **Bounded extraction, no CNF/DNF** (over-budget → 075 fallback); compile-attempt
+  classification; pushed drives scan-profile + pruning; shared SELECT/UPDATE/DELETE
+  path. Toron-local; no opcode/dep/`syn`.
+- **Gate:** a 3VL property fixture (random predicate + NULL-bearing rows ⇒ exact
+  Kleene equality for `pushed(N) ∧ residual(P) ≡ P`; the `WHERE TRUE` set is the
+  minimum safety bar).
+
+The migration is materialized in
+`plans/impl/078_predicate_pushdown_boolean_distribution.md`.
+
+**ADR 079 candidates (continue the query-surface / pushdown axis):**
+
+- **Residual minimization for factored shapes** — the 078 follow-on: reconstruct
+  the *minimal* residual for common-factor `OR` / `NOT(OR)` (push `P`, residual
+  `(R1 ∨ R2)` not the whole original), recovering more compute savings now that the
+  necessary-extraction is sound.
+- **`SIMILAR TO` / `RLIKE` / `REGEXP`** (`arrow_string::regexp` kernels, regex
+  in-tree; needs a CPU-cost/ReDoS contract); or `ESCAPE` + dynamic `LIKE` patterns.
+- **`CASE` / value-conditionals**; **Wendelon typed table-mutation trace
+  continuation** (Wendelon-home producer).
+- On-demand test-infra (deferred, not committed): source-guard **facade**;
+  **`syn`/AST pilot** on one bucket.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 077 promoted; ADR 078 candidates (HISTORICAL)
 
 ADR 077 selected and promoted **Architecture Guard Sub-Bucketing** — a
 behavior-zero, test-only follow-on to 076: the two remaining >4000-line modules
