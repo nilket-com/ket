@@ -13,7 +13,7 @@ use toron::distributed::identity::QueryId;
 use toron::distributed::worker_registry::StaticWorkerRegistry;
 use toron::error::{QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
-use toron::ir::{ExecutionPlan, LogicalPlan, QueryProfileHint};
+use toron::ir::{BoundExprNode, ExecutionPlan, LogicalPlan, QueryProfileHint};
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
@@ -110,9 +110,39 @@ async fn binder_resolves_delete_shape_a_identity() {
 	assert_eq!(table, binding.table);
 	assert_eq!(fingerprint, binding.fingerprint);
 	assert_eq!(schema.field(0).name(), "id");
-	assert!(predicate.is_some());
+	assert!(predicate.is_none());
 	assert!(pbc_program.is_some());
 	assert_eq!(profile_hint, QueryProfileHint::Scan);
+}
+
+#[tokio::test]
+async fn binder_delete_splits_pbc_conjunct_from_like_residual() {
+	let catalog = people_catalog().await;
+	let plan = SqlPlanner::new()
+		.plan("DELETE FROM people WHERE id = 1 AND name LIKE 'a%'")
+		.expect("plan delete");
+
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind delete");
+	let ExecutionPlan::Delete {
+		predicate,
+		pbc_program,
+		profile_hint,
+		..
+	} = bound
+	else {
+		panic!("expected delete execution plan");
+	};
+	let predicate = predicate.expect("LIKE residual predicate");
+	assert!(pbc_program.is_some());
+	assert_eq!(profile_hint, QueryProfileHint::Scan);
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Like { .. })
+	));
 }
 
 #[tokio::test]

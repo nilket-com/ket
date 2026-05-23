@@ -15,8 +15,8 @@ use toron::distributed::identity::QueryId;
 use toron::error::{BindingError, QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan, Expr, LogicalPlan, QueryProfileHint,
-	SessionId, TableId,
+	BoundExprNode, ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan, Expr, FilterDisposition,
+	LogicalPlan, QueryProfileHint, SessionId, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
@@ -287,6 +287,54 @@ async fn binder_update_non_pk_predicate_uses_scan_profile() {
 		panic!("expected update source scan, got {scan:?}");
 	};
 	assert_eq!(*profile_hint, QueryProfileHint::Scan);
+}
+
+#[tokio::test]
+async fn binder_update_splits_pbc_conjunct_from_like_residual() {
+	let (catalog, _) = pk_catalog(people_schema(true)).await;
+	let bound = bind_update(
+		&catalog,
+		"UPDATE people SET note = 'new' WHERE id = 1 AND note LIKE 'a%'",
+	)
+	.await;
+
+	let ExecutionPlan::Update {
+		source,
+		profile_hint,
+		..
+	} = &bound
+	else {
+		panic!("expected update plan, got {bound:?}");
+	};
+	assert_eq!(*profile_hint, QueryProfileHint::PointRead);
+	let ExecutionPlan::Project { input, .. } = source.as_ref() else {
+		panic!("expected update source project, got {source:?}");
+	};
+	let ExecutionPlan::Filter {
+		input,
+		predicate,
+		disposition,
+	} = input.as_ref()
+	else {
+		panic!("expected update WHERE source filter, got {input:?}");
+	};
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Like { .. })
+	));
+	let ExecutionPlan::Scan {
+		pbc_program,
+		profile_hint,
+		..
+	} = input.as_ref()
+	else {
+		panic!("expected update WHERE source scan, got {input:?}");
+	};
+	assert!(pbc_program.is_some());
+	assert_eq!(*profile_hint, QueryProfileHint::PointRead);
 }
 
 #[tokio::test]

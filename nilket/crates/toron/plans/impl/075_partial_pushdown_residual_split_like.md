@@ -117,12 +117,12 @@ new dependency**. Six phases.
 
 ## Acceptance checklist
 
-- [ ] Phase 1: `Expr::Like` (one variant); `is_pbc_pushdown_eligible(Like)=false`.
-- [ ] Phase 2: lower Like/ILike (literal pattern; reject escape/dynamic/any/PG/
+- [x] Phase 1: `Expr::Like` (one variant); `is_pbc_pushdown_eligible(Like)=false`.
+- [x] Phase 2: lower Like/ILike (literal pattern; reject escape/dynamic/any/PG/
       SimilarTo/RLike/Case).
-- [ ] Phase 3: binder top-level-AND split + per-conjunct `compile_pbc` + fallback;
+- [x] Phase 3: binder top-level-AND split + per-conjunct `compile_pbc` + fallback;
       scan-profile-from-pushed; both Filter sites; `bind_like` UTF-8.
-- [ ] Phase 4: UPDATE source + DELETE candidate scans apply the split.
-- [ ] Phase 5: `BoundExprNode::Like` + Arrow `comparison` exec; `pbc.rs` declines Like.
-- [ ] Phase 6: 16 guards + 17 fixtures (incl. arithmetic-partial-push + DELETE/UPDATE
+- [x] Phase 4: UPDATE source + DELETE candidate scans apply the split.
+- [x] Phase 5: `BoundExprNode::Like` + Arrow `comparison` exec; `pbc.rs` declines Like.
+- [x] Phase 6: 16 guards + 17 fixtures (incl. arithmetic-partial-push + DELETE/UPDATE
       + bytecode shape) + evidence; prior 074/PBC corpus green; no Wendelon/dep change.

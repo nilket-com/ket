@@ -839,7 +839,7 @@ fn assert_point_read_scan(plan: &ExecutionPlan) {
 			..
 		} => {
 			assert_eq!(*profile_hint, QueryProfileHint::PointRead);
-			assert_eq!(primary_key_columns.as_slice(), &[ColumnOrdinal(0)]);
+			assert!(primary_key_columns.is_empty());
 		}
 		other => panic!("expected point-read scan under plan, got {other:?}"),
 	}

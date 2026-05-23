@@ -83,6 +83,12 @@ pub enum BoundExprNode {
 		list: Vec<BoundExprId>,
 		negated: bool,
 	},
+	Like {
+		expr: BoundExprId,
+		pattern: String,
+		negated: bool,
+		case_insensitive: bool,
+	},
 	TimeBucket {
 		interval: std::time::Duration,
 		input: BoundExprId,
@@ -407,6 +413,25 @@ impl BoundExprProgramBuilder {
 		)
 	}
 
+	pub fn append_like(
+		&mut self,
+		expr: BoundExprId,
+		pattern: String,
+		negated: bool,
+		case_insensitive: bool,
+	) -> BoundExprId {
+		self.assert_existing_child(expr);
+		self.append_node(
+			BoundExprNode::Like {
+				expr,
+				pattern,
+				negated,
+				case_insensitive,
+			},
+			DataType::Boolean,
+		)
+	}
+
 	pub fn append_time_bucket(
 		&mut self,
 		interval: std::time::Duration,
@@ -561,6 +586,7 @@ impl BoundExprProgram {
 					.any(|nullable| nullable);
 				Some(expr_nullable || list_nullable)
 			}
+			BoundExprNode::Like { expr, .. } => self.node_nullable(*expr),
 			BoundExprNode::TimeBucket { input, .. } => self.node_nullable(*input),
 		}
 	}
@@ -673,6 +699,20 @@ impl BoundExprProgram {
 				let op = if *negated { "NOT IN" } else { "IN" };
 				format!("{} {op} ({members})", self.pretty_node(*expr))
 			}
+			BoundExprNode::Like {
+				expr,
+				pattern,
+				negated,
+				case_insensitive,
+			} => {
+				let op = match (*negated, *case_insensitive) {
+					(false, false) => "LIKE",
+					(true, false) => "NOT LIKE",
+					(false, true) => "ILIKE",
+					(true, true) => "NOT ILIKE",
+				};
+				format!("{} {op} {pattern:?}", self.pretty_node(*expr))
+			}
 			BoundExprNode::TimeBucket { interval, input } => {
 				format!("TIME_BUCKET({interval:?}, {})", self.pretty_node(*input))
 			}
@@ -686,6 +726,7 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		BoundExprNode::Cast { input, .. }
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
+		| BoundExprNode::Like { expr: input, .. }
 		| BoundExprNode::TimeBucket { input, .. } => vec![*input],
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {

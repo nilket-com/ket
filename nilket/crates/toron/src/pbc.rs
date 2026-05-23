@@ -125,6 +125,11 @@ impl PbcCompiler {
 						"arithmetic, Cast, and TryCast are not PBC-eligible".to_string(),
 					));
 				}
+				BoundExprNode::Like { .. } => {
+					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+						"LIKE is not PBC-eligible".to_string(),
+					));
+				}
 				BoundExprNode::TimeBucket { .. } => {
 					return Err(PushdownDeclineReason::ExperimentalKernelInPredicate);
 				}
@@ -173,6 +178,7 @@ impl PbcCompiler {
 			}
 			BoundExprNode::Cast { .. }
 			| BoundExprNode::TryCast { .. }
+			| BoundExprNode::Like { .. }
 			| BoundExprNode::TimeBucket { .. } => {
 				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 					"unsupported node reached PBC emitter".to_string(),

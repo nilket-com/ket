@@ -2991,6 +2991,20 @@ impl SqlPlanner {
 				list,
 				negated,
 			} => self.lower_in_list(expr, list, *negated),
+			SqlExpr::Like {
+				negated,
+				any,
+				expr,
+				pattern,
+				escape_char,
+			} => self.lower_like(expr, pattern, *negated, false, *any, escape_char.as_ref()),
+			SqlExpr::ILike {
+				negated,
+				any,
+				expr,
+				pattern,
+				escape_char,
+			} => self.lower_like(expr, pattern, *negated, true, *any, escape_char.as_ref()),
 			SqlExpr::Between {
 				expr,
 				negated,
@@ -2999,8 +3013,6 @@ impl SqlPlanner {
 			} => self.lower_between(expr, low, high, *negated),
 			SqlExpr::InSubquery { .. } => Err(unsupported("IN subquery is not supported")),
 			SqlExpr::InUnnest { .. } => Err(unsupported("IN UNNEST is not supported")),
-			SqlExpr::Like { .. } => Err(unsupported("LIKE is not supported")),
-			SqlExpr::ILike { .. } => Err(unsupported("ILIKE is not supported")),
 			SqlExpr::SimilarTo { .. } => Err(unsupported("SIMILAR TO is not supported")),
 			SqlExpr::RLike { .. } => Err(unsupported("RLIKE is not supported")),
 			SqlExpr::Case { .. } => Err(unsupported("CASE is not supported")),
@@ -3069,6 +3081,35 @@ impl SqlPlanner {
 			}
 			_ => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
 		}
+	}
+
+	fn lower_like(
+		&self,
+		expr: &SqlExpr,
+		pattern: &SqlExpr,
+		negated: bool,
+		case_insensitive: bool,
+		any: bool,
+		escape_char: Option<&sqlparser::ast::ValueWithSpan>,
+	) -> Result<Expr, FrontendError> {
+		if any {
+			return Err(unsupported("LIKE ANY is not supported"));
+		}
+		if escape_char.is_some() {
+			return Err(unsupported("LIKE ESCAPE is not supported"));
+		}
+		if expr_is_null_literal(pattern) {
+			return Err(unsupported("NULL LIKE patterns are not supported"));
+		}
+		let Some(Value::SingleQuotedString(pattern)) = stripped_sql_value(pattern) else {
+			return Err(unsupported("LIKE pattern must be a string literal"));
+		};
+		Ok(Expr::Like {
+			expr: Box::new(self.lower_expr(expr)?),
+			pattern: pattern.clone(),
+			negated,
+			case_insensitive,
+		})
 	}
 
 	fn lower_in_list(
@@ -3209,6 +3250,7 @@ fn validate_hidden_sort_key_refs(
 		Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
+		| Expr::Like { expr: inner, .. }
 		| Expr::TimeBucket(_, inner) => validate_hidden_sort_key_refs(inner, visible_names),
 		Expr::InList { expr, list, .. } => {
 			validate_hidden_sort_key_refs(expr, visible_names)?;
@@ -3695,6 +3737,18 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 				hash_expr_structural(item, state);
 			}
 		}
+		Expr::Like {
+			expr,
+			pattern,
+			negated,
+			case_insensitive,
+		} => {
+			21u8.hash(state);
+			hash_expr_structural(expr, state);
+			pattern.hash(state);
+			negated.hash(state);
+			case_insensitive.hash(state);
+		}
 	}
 }
 
@@ -3726,6 +3780,25 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 		| (Expr::IsNotNull(left), Expr::IsNotNull(right)) => expr_structural_eq(left, right),
 		(Expr::TimeBucket(left_interval, left), Expr::TimeBucket(right_interval, right)) => {
 			left_interval == right_interval && expr_structural_eq(left, right)
+		}
+		(
+			Expr::Like {
+				expr: left_expr,
+				pattern: left_pattern,
+				negated: left_negated,
+				case_insensitive: left_case_insensitive,
+			},
+			Expr::Like {
+				expr: right_expr,
+				pattern: right_pattern,
+				negated: right_negated,
+				case_insensitive: right_case_insensitive,
+			},
+		) => {
+			left_pattern == right_pattern
+				&& left_negated == right_negated
+				&& left_case_insensitive == right_case_insensitive
+				&& expr_structural_eq(left_expr, right_expr)
 		}
 		(
 			Expr::InList {
@@ -4003,6 +4076,7 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
+		| Expr::Like { expr: inner, .. }
 		| Expr::TimeBucket(_, inner) => expr_contains_qualified_column(inner),
 		Expr::InList { expr, list, .. } => {
 			expr_contains_qualified_column(expr) || list.iter().any(expr_contains_qualified_column)

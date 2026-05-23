@@ -23,6 +23,9 @@ use arrow::array::{
 };
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
+use arrow::compute::kernels::comparison::{
+	ilike as arrow_ilike, like as arrow_like, nilike as arrow_nilike, nlike as arrow_nlike,
+};
 use arrow::compute::{
 	SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
@@ -956,6 +959,15 @@ impl Executor {
 					.collect::<Result<Vec<_>, _>>()?;
 				evaluate_in_list(&expr_arr, &item_arrs, *negated, batch.num_rows())
 			}
+			Expr::Like {
+				expr,
+				pattern,
+				negated,
+				case_insensitive,
+			} => {
+				let expr_arr = self.evaluate_expr(expr, batch)?;
+				evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)
+			}
 			Expr::IsNull(inner) => {
 				let arr = self.evaluate_expr(inner, batch)?;
 				let res = is_null(&arr)?;
@@ -1048,6 +1060,15 @@ impl Executor {
 						.map(|item| evaluated_child(&outputs, *item))
 						.collect::<Result<Vec<_>, _>>()?;
 					evaluate_in_list(&expr_arr, &item_arrs, *negated, batch.num_rows())?
+				}
+				BoundExprNode::Like {
+					expr,
+					pattern,
+					negated,
+					case_insensitive,
+				} => {
+					let expr_arr = evaluated_child(&outputs, *expr)?;
+					evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)?
 				}
 				BoundExprNode::TimeBucket { interval, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -1667,6 +1688,27 @@ fn evaluate_in_list(
 	} else {
 		Ok(Arc::new(mask))
 	}
+}
+
+fn evaluate_like(
+	expr_arr: &ArrayRef,
+	pattern: &str,
+	negated: bool,
+	case_insensitive: bool,
+) -> Result<ArrayRef, ExecutionError> {
+	if expr_arr.data_type() != &DataType::Utf8 {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!("LIKE expects Utf8 input, got {:?}", expr_arr.data_type()),
+		});
+	}
+	let pattern = StringArray::new_scalar(pattern);
+	let result = match (negated, case_insensitive) {
+		(false, false) => arrow_like(expr_arr, &pattern)?,
+		(true, false) => arrow_nlike(expr_arr, &pattern)?,
+		(false, true) => arrow_ilike(expr_arr, &pattern)?,
+		(true, true) => arrow_nilike(expr_arr, &pattern)?,
+	};
+	Ok(Arc::new(result) as ArrayRef)
 }
 
 fn evaluate_time_bucket(
@@ -4982,10 +5024,7 @@ mod tests {
 
 		assert_eq!(ids.values(), &[2, 4]);
 		let observed = requests.lock().unwrap();
-		assert_eq!(
-			observed[0].projected_columns,
-			Some(vec![ColumnOrdinal(0), ColumnOrdinal(1)])
-		);
+		assert_eq!(observed[0].projected_columns, Some(vec![ColumnOrdinal(0)]));
 		assert!(observed[0].pbc_predicate.is_some());
 	}
 

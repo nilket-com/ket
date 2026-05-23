@@ -649,7 +649,7 @@ fn adr031_bound_expr_node_has_no_boxes() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("BoundExprNode enum");
-	assert_eq!(enum_variant_count(node), 8);
+	assert_eq!(enum_variant_count(node), 9);
 	for variant in [
 		"Column",
 		"Literal",
@@ -658,6 +658,7 @@ fn adr031_bound_expr_node_has_no_boxes() {
 		"Binary",
 		"Unary",
 		"InList",
+		"Like",
 		"TimeBucket",
 	] {
 		assert!(node.contains(variant), "missing BoundExprNode::{variant}");
@@ -4634,7 +4635,9 @@ fn adr036_binder_delete_allows_residual_predicates() {
 		.expect("bind_delete body")
 		.1;
 
-	assert!(bind_delete.contains("bound_predicate.as_ref().and_then(compile_pbc)"));
+	assert!(bind_delete.contains("predicate_pushdown_plan(program, &scan)"));
+	assert!(bind_delete.contains("pushdown.residual_predicate"));
+	assert!(bind_delete.contains("pushdown.pbc_program"));
 	for forbidden in [
 		"PBC pushdown required",
 		"pushdown-only DELETE",
@@ -5224,7 +5227,7 @@ fn adr037_delete_candidate_plan_wraps_residual_filter() {
 		.expect("delete candidate builder")
 		.1;
 
-	assert!(derive.contains("if let (Some(predicate), None)"));
+	assert!(derive.contains("if let Some(predicate) = predicate"));
 	assert!(derive.contains("ExecutionPlan::Filter"));
 	assert!(derive.contains("FilterDisposition::EvaluateInToron"));
 }
@@ -14375,8 +14378,11 @@ fn adr063_update_reuses_existing_point_read_profile() {
 			.expect("bind_update_source_for_predicate")
 			.1;
 
-	assert!(predicate_helper.contains("scan_profile_hint(&bound_predicate, &scan)"));
-	assert!(predicate_helper.contains("apply_scan_profile_hint(&mut scan, Some(profile_hint))"));
+	assert!(
+		predicate_helper.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)")
+	);
+	assert!(binder.contains("scan_profile_hint(&predicate, input)"));
+	assert!(binder.contains("apply_scan_profile_hint(&mut input, Some(profile_hint))"));
 	assert!(!predicate_helper.contains("update_profile_hint"));
 }
 
@@ -15205,8 +15211,11 @@ fn adr070_update_where_pk_equality_point_read_profile_still_works() {
 	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
 		.expect("read update tests");
 
-	assert!(predicate_helper.contains("scan_profile_hint(&bound_predicate, &scan)"));
-	assert!(predicate_helper.contains("apply_scan_profile_hint(&mut scan, Some(profile_hint))"));
+	assert!(
+		predicate_helper.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)")
+	);
+	assert!(binder.contains("scan_profile_hint(&pushed_predicate, input)"));
+	assert!(binder.contains("apply_scan_profile_hint(&mut input, Some(profile_hint))"));
 	assert!(update_test.contains("binder_update_pk_equality_uses_point_read_profile"));
 }
 
@@ -18210,13 +18219,11 @@ fn adr074_between_desugars_with_no_new_ir_or_opcode() {
 }
 
 #[test]
-fn adr074_like_ilike_similar_rlike_case_subquery_in_remain_unsupported() {
+fn adr074_similar_rlike_case_subquery_in_remain_unsupported() {
 	let planner =
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
 
 	for marker in [
-		"SqlExpr::Like { .. }",
-		"SqlExpr::ILike { .. }",
 		"SqlExpr::SimilarTo { .. }",
 		"SqlExpr::RLike { .. }",
 		"SqlExpr::Case { .. }",
@@ -18227,6 +18234,87 @@ fn adr074_like_ilike_similar_rlike_case_subquery_in_remain_unsupported() {
 	] {
 		assert!(planner.contains(marker), "missing reject marker {marker}");
 	}
+}
+
+#[test]
+fn adr075_like_ilike_are_first_class_residual_only_predicates() {
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read ir");
+	let execution_ir =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec ir");
+	let planner =
+		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+
+	assert!(ir.contains("Like {"));
+	assert!(ir.contains("| Self::Like { .. }"));
+	assert!(ir.contains("=> false"));
+	assert!(execution_ir.contains("BoundExprNode::Like"));
+	assert!(execution_ir.contains("pub fn append_like"));
+	assert!(planner.contains("SqlExpr::Like {"));
+	assert!(planner.contains("SqlExpr::ILike {"));
+	assert!(planner.contains("fn lower_like"));
+	assert!(planner.contains("LIKE pattern must be a string literal"));
+	assert!(binder.contains("Expr::Like"));
+	assert!(binder.contains("fn bind_like"));
+	assert!(binder.contains("LIKE expects Utf8 input"));
+	assert!(pbc.contains("BoundExprNode::Like { .. }"));
+	assert!(pbc.contains("LIKE is not PBC-eligible"));
+	assert!(exec.contains("fn evaluate_like"));
+	assert!(exec.contains("arrow_like"));
+	assert!(exec.contains("arrow_ilike"));
+	assert!(!pbc.contains("OP_LIKE"));
+}
+
+#[test]
+fn adr075_partial_pushdown_splits_bound_top_level_and_only() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let splitter = brace_blocks_after_marker(&binder, "fn partition_bound_predicate")
+		.into_iter()
+		.next()
+		.expect("partition_bound_predicate body")
+		.1;
+	let collector = brace_blocks_after_marker(&binder, "fn collect_top_level_bound_and")
+		.into_iter()
+		.next()
+		.expect("collect_top_level_bound_and body")
+		.1;
+
+	assert!(splitter.contains("compile_pbc(&isolated).is_some()"));
+	assert!(splitter.contains("combine_bound_conjuncts(predicate, &pushed)"));
+	assert!(splitter.contains("combine_bound_conjuncts(predicate, &residual)"));
+	assert!(collector.contains("op: BoundBinaryOp::And"));
+	assert!(!collector.contains("BoundBinaryOp::Or"));
+	assert!(!collector.contains("BoundUnaryOp::Not"));
+	assert!(binder.contains("let Some(pbc_program) = compile_pbc(&pushed_predicate)"));
+	assert!(binder.contains("pushdown.residual_predicate"));
+	assert!(binder.contains("FilterDisposition::EvaluateInToron"));
+}
+
+#[test]
+fn adr075_partial_pushdown_covers_select_update_delete_scan_sites() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+	let update_test =
+		std::fs::read_to_string(manifest_dir().join("tests/update_test.rs")).expect("read update");
+	let delete_test =
+		std::fs::read_to_string(manifest_dir().join("tests/delete_test.rs")).expect("read delete");
+
+	assert!(binder.contains("plan_filter_with_predicate_pushdown(input, bound_predicate)"));
+	assert!(binder.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)"));
+	assert!(binder.contains("predicate_pushdown_plan(program, &scan)"));
+	assert!(coordinator.contains("if let Some(predicate) = predicate"));
+	assert!(predicate_test.contains("where_like_residual_splits_from_pbc_conjunct"));
+	assert!(update_test.contains("binder_update_splits_pbc_conjunct_from_like_residual"));
+	assert!(delete_test.contains("binder_delete_splits_pbc_conjunct_from_like_residual"));
 }
 
 #[test]

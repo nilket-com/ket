@@ -7,7 +7,9 @@ use toron::binder::{PlannerConfig, bind};
 use toron::catalog::MockCatalog;
 use toron::error::{BindingError, FrontendError};
 use toron::exec::Executor;
-use toron::ir::{BoundExprNode, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, TableId};
+use toron::ir::{
+	BoundExprNode, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, TableId,
+};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::InMemoryStorageScan;
 use wendelon::schema::{
@@ -95,6 +97,71 @@ async fn where_in_list_residual_evals_when_not_pushdown_eligible() {
 	assert!(scan_pbc(scan).is_none());
 
 	assert_ids(sql, &[1, 2]).await;
+}
+
+#[tokio::test]
+async fn where_like_and_ilike_filter_rows_without_pbc_opcode() {
+	let like_sql = "SELECT id FROM sales WHERE status LIKE 'o%'";
+	let bound = bind_sql(like_sql).await;
+	let (predicate, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Like {
+			negated: false,
+			case_insensitive: false,
+			..
+		})
+	));
+	assert_ids(like_sql, &[1, 2, 4]).await;
+
+	let ilike_sql = "SELECT id FROM sales WHERE status ILIKE 'PEN%'";
+	let bound = bind_sql(ilike_sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+	assert_ids(ilike_sql, &[6]).await;
+}
+
+#[tokio::test]
+async fn where_not_like_filters_rows() {
+	assert_ids("SELECT id FROM sales WHERE status NOT LIKE 'o%'", &[3, 6]).await;
+	assert_ids(
+		"SELECT id FROM sales WHERE status NOT ILIKE 'PEN%'",
+		&[1, 2, 3, 4],
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn where_like_residual_splits_from_pbc_conjunct_and_prunes_pushed_column() {
+	let sql = "SELECT status FROM sales WHERE id = 3 AND status LIKE 'c%'";
+	let bound = bind_sql(sql).await;
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Like { .. })
+	));
+	let ExecutionPlan::Scan {
+		projection,
+		pbc_program,
+		schema,
+		..
+	} = scan
+	else {
+		panic!("expected scan input, got {scan:?}");
+	};
+	assert!(pbc_program.is_some());
+	assert_eq!(projection.as_deref(), Some(&[ColumnOrdinal(2)][..]));
+	assert_eq!(schema.field(0).name(), "status");
+	assert_statuses(sql, &["closed"]).await;
 }
 
 #[tokio::test]
@@ -201,12 +268,15 @@ async fn between_pbc_matches_equivalent_and_chain() {
 }
 
 #[test]
-fn like_ilike_case_subquery_in_remain_unsupported() {
+fn unsupported_pattern_predicates_and_case_subquery_in_remain_unsupported() {
 	for sql in [
-		"SELECT id FROM sales WHERE status LIKE 'o%'",
-		"SELECT id FROM sales WHERE status ILIKE 'o%'",
+		"SELECT id FROM sales WHERE status LIKE ANY ('o%')",
+		"SELECT id FROM sales WHERE status LIKE status",
+		"SELECT id FROM sales WHERE status LIKE 'o%' ESCAPE '\\'",
 		"SELECT id FROM sales WHERE status SIMILAR TO 'o%'",
 		"SELECT id FROM sales WHERE status RLIKE 'o.*'",
+		"SELECT id FROM sales WHERE status ~~ 'o%'",
+		"SELECT id FROM sales WHERE status ~~* 'o%'",
 		"SELECT id FROM sales WHERE CASE WHEN id = 1 THEN true ELSE false END",
 		"SELECT id FROM sales WHERE id IN (SELECT id FROM sales)",
 	] {
@@ -249,6 +319,20 @@ async fn assert_ids(sql: &str, expected: &[i32]) {
 	.await
 	.expect("execute SQL");
 	assert_eq!(ids(&batches), expected);
+}
+
+async fn assert_statuses(sql: &str, expected: &[&str]) {
+	let catalog = catalog();
+	let bound = bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL");
+	let batches = Executor::new(Arc::new(InMemoryStorageScan {
+		table_data: sales_batch(schema()),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute SQL");
+	assert_eq!(statuses(&batches), expected);
 }
 
 fn assert_plan_rejected(sql: &str) {
@@ -303,6 +387,22 @@ fn ids(batches: &[RecordBatch]) -> Vec<i32> {
 				.expect("id column")
 				.iter()
 				.map(|value| value.expect("id value"))
+				.collect::<Vec<_>>()
+		})
+		.collect()
+}
+
+fn statuses(batches: &[RecordBatch]) -> Vec<String> {
+	batches
+		.iter()
+		.flat_map(|batch| {
+			batch
+				.column(0)
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.expect("status column")
+				.iter()
+				.map(|value| value.expect("status value").to_string())
 				.collect::<Vec<_>>()
 		})
 		.collect()

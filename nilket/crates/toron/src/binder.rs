@@ -94,32 +94,14 @@ impl<'a> Binder<'a> {
 				}
 				LogicalPlan::Alias { input, .. } => self.bind_plan(input).await,
 				LogicalPlan::Filter { input, predicate } => {
-					let mut input = self.bind_plan(input).await?;
+					let input = self.bind_plan(input).await?;
 					let bound_predicate = bind_expr_program(
 						std::slice::from_ref(predicate),
 						&input.schema(),
 						self.config,
 					)?;
-					let profile_hint = scan_profile_hint(&bound_predicate, &input);
-					apply_scan_profile_hint(&mut input, profile_hint);
-					let (input, disposition) = match compile_pbc(&bound_predicate) {
-						Some(program) => {
-							let (input, attached) = attach_pbc_program(input, program);
-							let disposition = if attached {
-								FilterDisposition::FullyPushed
-							} else {
-								FilterDisposition::EvaluateInToron
-							};
-							(input, disposition)
-						}
-						None => (input, FilterDisposition::EvaluateInToron),
-					};
-
-					Ok(ExecutionPlan::Filter {
-						input: Box::new(input),
-						predicate: bound_predicate,
-						disposition,
-					})
+					let (plan, _) = plan_filter_with_predicate_pushdown(input, bound_predicate);
+					Ok(plan)
 				}
 				LogicalPlan::Project {
 					input,
@@ -307,13 +289,17 @@ impl<'a> Binder<'a> {
 			}
 			None => None,
 		};
-		let pbc_program = bound_predicate.as_ref().and_then(compile_pbc);
-		let profile_hint = match bound_predicate.as_ref() {
+		let (bound_predicate, pbc_program, profile_hint) = match bound_predicate {
 			Some(program) => {
 				let scan = scan_plan(binding.clone(), None);
-				scan_profile_hint(program, &scan).unwrap_or(QueryProfileHint::Scan)
+				let pushdown = predicate_pushdown_plan(program, &scan);
+				(
+					pushdown.residual_predicate,
+					pushdown.pbc_program,
+					pushdown.profile_hint.unwrap_or(QueryProfileHint::Scan),
+				)
 			}
-			None => QueryProfileHint::Scan,
+			None => (None, None, QueryProfileHint::Scan),
 		};
 
 		Ok(ExecutionPlan::Delete {
@@ -601,35 +587,14 @@ impl<'a> Binder<'a> {
 }
 
 fn bind_update_source_for_predicate(
-	mut scan: ExecutionPlan,
+	scan: ExecutionPlan,
 	predicate: &Expr,
 	schema: &SchemaRef,
 	config: &PlannerConfig,
 ) -> Result<(ExecutionPlan, QueryProfileHint), BindingError> {
 	let bound_predicate = bind_expr_program(std::slice::from_ref(predicate), schema, config)?;
 	require_single_boolean_root(&bound_predicate, "UPDATE WHERE")?;
-	let profile_hint = scan_profile_hint(&bound_predicate, &scan).unwrap_or(QueryProfileHint::Scan);
-	apply_scan_profile_hint(&mut scan, Some(profile_hint));
-	let (filter_input, disposition) = match compile_pbc(&bound_predicate) {
-		Some(program) => {
-			let (input, attached) = attach_pbc_program(scan, program);
-			let disposition = if attached {
-				FilterDisposition::FullyPushed
-			} else {
-				FilterDisposition::EvaluateInToron
-			};
-			(input, disposition)
-		}
-		None => (scan, FilterDisposition::EvaluateInToron),
-	};
-	Ok((
-		ExecutionPlan::Filter {
-			input: Box::new(filter_input),
-			predicate: bound_predicate,
-			disposition,
-		},
-		profile_hint,
-	))
+	Ok(plan_filter_with_predicate_pushdown(scan, bound_predicate))
 }
 
 fn bind_update_source_for_all_rows(scan: ExecutionPlan) -> (ExecutionPlan, QueryProfileHint) {
@@ -699,6 +664,7 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
+		| Expr::Like { expr: inner, .. }
 		| Expr::TimeBucket(_, inner) => reject_storage_synthetic_returning_reference(inner),
 		Expr::InList { expr, list, .. } => {
 			reject_storage_synthetic_returning_reference(expr)?;
@@ -944,6 +910,240 @@ fn attach_pbc_program(mut plan: ExecutionPlan, program: PbcProgram) -> (Executio
 		}
 		_ => (plan, false),
 	}
+}
+
+struct PredicatePushdownPlan {
+	pushed_predicate: Option<BoundExprProgram>,
+	residual_predicate: Option<BoundExprProgram>,
+	pbc_program: Option<PbcProgram>,
+	profile_hint: Option<QueryProfileHint>,
+}
+
+fn plan_filter_with_predicate_pushdown(
+	mut input: ExecutionPlan,
+	predicate: BoundExprProgram,
+) -> (ExecutionPlan, QueryProfileHint) {
+	let original_predicate = predicate.clone();
+	let fallback_profile = scan_profile_hint(&original_predicate, &input);
+	let pushdown = predicate_pushdown_plan(predicate, &input);
+	let profile_hint = pushdown
+		.profile_hint
+		.or(fallback_profile)
+		.unwrap_or(QueryProfileHint::Scan);
+	apply_scan_profile_hint(&mut input, Some(profile_hint));
+
+	if let Some(pbc_program) = pushdown.pbc_program {
+		let (filter_input, attached) = attach_pbc_program(input, pbc_program);
+		if attached {
+			let (predicate, disposition) = match pushdown.residual_predicate {
+				Some(residual_predicate) => {
+					(residual_predicate, FilterDisposition::EvaluateInToron)
+				}
+				None => (
+					pushdown
+						.pushed_predicate
+						.expect("PBC program requires pushed predicate"),
+					FilterDisposition::FullyPushed,
+				),
+			};
+			return (
+				ExecutionPlan::Filter {
+					input: Box::new(filter_input),
+					predicate,
+					disposition,
+				},
+				profile_hint,
+			);
+		}
+
+		let mut filter_input = filter_input;
+		let fallback_profile = fallback_profile.unwrap_or(QueryProfileHint::Scan);
+		apply_scan_profile_hint(&mut filter_input, Some(fallback_profile));
+		return (
+			ExecutionPlan::Filter {
+				input: Box::new(filter_input),
+				predicate: original_predicate,
+				disposition: FilterDisposition::EvaluateInToron,
+			},
+			fallback_profile,
+		);
+	}
+
+	(
+		ExecutionPlan::Filter {
+			input: Box::new(input),
+			predicate: pushdown.residual_predicate.unwrap_or(original_predicate),
+			disposition: FilterDisposition::EvaluateInToron,
+		},
+		profile_hint,
+	)
+}
+
+fn predicate_pushdown_plan(
+	predicate: BoundExprProgram,
+	input: &ExecutionPlan,
+) -> PredicatePushdownPlan {
+	let fallback_profile = scan_profile_hint(&predicate, input);
+	let Some((pushed_predicate, residual_predicate)) = partition_bound_predicate(&predicate) else {
+		return PredicatePushdownPlan {
+			pushed_predicate: None,
+			residual_predicate: Some(predicate),
+			pbc_program: None,
+			profile_hint: fallback_profile,
+		};
+	};
+
+	let Some(pushed_predicate) = pushed_predicate else {
+		return PredicatePushdownPlan {
+			pushed_predicate: None,
+			residual_predicate: residual_predicate.or(Some(predicate)),
+			pbc_program: None,
+			profile_hint: fallback_profile,
+		};
+	};
+
+	let Some(pbc_program) = compile_pbc(&pushed_predicate) else {
+		return PredicatePushdownPlan {
+			pushed_predicate: None,
+			residual_predicate: Some(predicate),
+			pbc_program: None,
+			profile_hint: fallback_profile,
+		};
+	};
+	let profile_hint = scan_profile_hint(&pushed_predicate, input);
+
+	PredicatePushdownPlan {
+		pushed_predicate: Some(pushed_predicate),
+		residual_predicate,
+		pbc_program: Some(pbc_program),
+		profile_hint,
+	}
+}
+
+fn partition_bound_predicate(
+	predicate: &BoundExprProgram,
+) -> Option<(Option<BoundExprProgram>, Option<BoundExprProgram>)> {
+	let root = predicate.single_root()?;
+	let mut conjuncts = Vec::new();
+	collect_top_level_bound_and(predicate, root, &mut conjuncts);
+
+	let mut pushed = Vec::new();
+	let mut residual = Vec::new();
+	for conjunct in conjuncts {
+		let isolated = combine_bound_conjuncts(predicate, &[conjunct])?;
+		if compile_pbc(&isolated).is_some() {
+			pushed.push(conjunct);
+		} else {
+			residual.push(conjunct);
+		}
+	}
+
+	Some((
+		combine_bound_conjuncts(predicate, &pushed),
+		combine_bound_conjuncts(predicate, &residual),
+	))
+}
+
+fn collect_top_level_bound_and(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	conjuncts: &mut Vec<BoundExprId>,
+) {
+	match program.node(id) {
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::And,
+			left,
+			right,
+		}) => {
+			collect_top_level_bound_and(program, *left, conjuncts);
+			collect_top_level_bound_and(program, *right, conjuncts);
+		}
+		_ => conjuncts.push(id),
+	}
+}
+
+fn combine_bound_conjuncts(
+	source: &BoundExprProgram,
+	roots: &[BoundExprId],
+) -> Option<BoundExprProgram> {
+	let mut roots = roots.iter().copied();
+	let first_root = roots.next()?;
+	let mut builder = BoundExprProgramBuilder::new();
+	let mut remap = HashMap::new();
+	let mut combined = clone_bound_subgraph(source, first_root, &mut builder, &mut remap)?;
+
+	for root in roots {
+		let next = clone_bound_subgraph(source, root, &mut builder, &mut remap)?;
+		combined = builder.append_binary(BoundBinaryOp::And, combined, next, DataType::Boolean);
+	}
+
+	builder.push_root(combined);
+	let program = builder.build();
+	program.validate().ok()?;
+	Some(program)
+}
+
+fn clone_bound_subgraph(
+	source: &BoundExprProgram,
+	id: BoundExprId,
+	builder: &mut BoundExprProgramBuilder,
+	remap: &mut HashMap<BoundExprId, BoundExprId>,
+) -> Option<BoundExprId> {
+	if let Some(cloned) = remap.get(&id) {
+		return Some(*cloned);
+	}
+
+	let output_type = source.node_type(id)?.clone();
+	let cloned = match source.node(id)? {
+		BoundExprNode::Column(column) => builder.append_column(column.clone()),
+		BoundExprNode::Literal(literal) => {
+			builder.append_literal(source.literals.get(*literal as usize)?.clone())
+		}
+		BoundExprNode::Cast { input, target } => {
+			let input = clone_bound_subgraph(source, *input, builder, remap)?;
+			builder.append_cast(input, target.clone(), output_type)
+		}
+		BoundExprNode::TryCast { input, target } => {
+			let input = clone_bound_subgraph(source, *input, builder, remap)?;
+			builder.append_try_cast(input, target.clone(), output_type)
+		}
+		BoundExprNode::Binary { op, left, right } => {
+			let left = clone_bound_subgraph(source, *left, builder, remap)?;
+			let right = clone_bound_subgraph(source, *right, builder, remap)?;
+			builder.append_binary(op.clone(), left, right, output_type)
+		}
+		BoundExprNode::Unary { op, input } => {
+			let input = clone_bound_subgraph(source, *input, builder, remap)?;
+			builder.append_unary(op.clone(), input, output_type)
+		}
+		BoundExprNode::InList {
+			expr,
+			list,
+			negated,
+		} => {
+			let expr = clone_bound_subgraph(source, *expr, builder, remap)?;
+			let list = list
+				.iter()
+				.map(|item| clone_bound_subgraph(source, *item, builder, remap))
+				.collect::<Option<Vec<_>>>()?;
+			builder.append_in_list(expr, list, *negated)
+		}
+		BoundExprNode::Like {
+			expr,
+			pattern,
+			negated,
+			case_insensitive,
+		} => {
+			let expr = clone_bound_subgraph(source, *expr, builder, remap)?;
+			builder.append_like(expr, pattern.clone(), *negated, *case_insensitive)
+		}
+		BoundExprNode::TimeBucket { interval, input } => {
+			let input = clone_bound_subgraph(source, *input, builder, remap)?;
+			builder.append_time_bucket(*interval, input, output_type)
+		}
+	};
+	remap.insert(id, cloned);
+	Some(cloned)
 }
 
 fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> ExecutionPlan {
@@ -1434,9 +1634,15 @@ fn optimize_for_required(
 		} => {
 			let output_required = required_output.unwrap_or_else(|| all_columns(&input.schema()));
 			let mut child_required = output_required.clone();
-			collect_program_columns(&predicate, &mut child_required);
+			if disposition == FilterDisposition::EvaluateInToron {
+				collect_program_columns(&predicate, &mut child_required);
+			}
 			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
-			let predicate = rewrite_program_ordinals(predicate, &remap)?;
+			let predicate = if disposition == FilterDisposition::EvaluateInToron {
+				rewrite_program_ordinals(predicate, &remap)?
+			} else {
+				predicate
+			};
 
 			Ok((
 				ExecutionPlan::Filter {
@@ -1786,6 +1992,7 @@ fn collect_program_node_columns(
 		Some(BoundExprNode::Cast { input, .. })
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
+		| Some(BoundExprNode::Like { expr: input, .. })
 		| Some(BoundExprNode::TimeBucket { input, .. }) => {
 			collect_program_node_columns(program, *input, columns);
 		}
@@ -1972,6 +2179,17 @@ fn offset_bound_node(node: BoundExprNode, node_offset: u32, literal_offset: u32)
 			list: list.into_iter().map(offset_id).collect(),
 			negated,
 		},
+		BoundExprNode::Like {
+			expr,
+			pattern,
+			negated,
+			case_insensitive,
+		} => BoundExprNode::Like {
+			expr: offset_id(expr),
+			pattern,
+			negated,
+			case_insensitive,
+		},
 		BoundExprNode::TimeBucket { interval, input } => BoundExprNode::TimeBucket {
 			interval,
 			input: offset_id(input),
@@ -2140,6 +2358,20 @@ fn bind_expr_into_program(
 			list,
 			negated,
 		} => bind_in_list(builder, input_schema, config, expr, list, *negated),
+		Expr::Like {
+			expr,
+			pattern,
+			negated,
+			case_insensitive,
+		} => bind_like(
+			builder,
+			input_schema,
+			config,
+			expr,
+			pattern,
+			*negated,
+			*case_insensitive,
+		),
 		Expr::IsNull(inner) => {
 			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNull, inner, DataType::Boolean))
@@ -2465,6 +2697,28 @@ fn bind_in_list(
 	Ok(builder.append_in_list(expr, bound_items, negated))
 }
 
+fn bind_like(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	config: &PlannerConfig,
+	expr: &Expr,
+	pattern: &str,
+	negated: bool,
+	case_insensitive: bool,
+) -> Result<BoundExprId, BindingError> {
+	let expr = bind_expr_into_program(builder, expr, input_schema, config)?;
+	let expr_type = builder
+		.node_type(expr)
+		.cloned()
+		.expect("builder returns typed LIKE input");
+	if expr_type != DataType::Utf8 {
+		return Err(BindingError::TypeMismatch {
+			message: format!("LIKE expects Utf8 input, got {expr_type:?}"),
+		});
+	}
+	Ok(builder.append_like(expr, pattern.to_string(), negated, case_insensitive))
+}
+
 fn coerce_comparison_literals(
 	builder: &mut BoundExprProgramBuilder,
 	left: BoundExprId,
@@ -2742,8 +2996,11 @@ mod tests {
 				assert_eq!(column.ordinal, ColumnOrdinal(0));
 				match *input {
 					ExecutionPlan::Filter {
-						input, predicate, ..
+						input,
+						predicate,
+						disposition,
 					} => {
+						assert_eq!(disposition, FilterDisposition::FullyPushed);
 						let root = predicate.single_root().expect("predicate root");
 						match predicate.node(root).expect("predicate node") {
 							BoundExprNode::Binary {
@@ -2762,13 +3019,9 @@ mod tests {
 							ExecutionPlan::Scan {
 								projection, schema, ..
 							} => {
-								assert_eq!(
-									projection,
-									Some(vec![ColumnOrdinal(0), ColumnOrdinal(1)])
-								);
-								assert_eq!(schema.fields().len(), 2);
+								assert_eq!(projection, Some(vec![ColumnOrdinal(0)]));
+								assert_eq!(schema.fields().len(), 1);
 								assert_eq!(schema.field(0).name(), "id");
-								assert_eq!(schema.field(1).name(), "amount");
 							}
 							other => panic!("expected scan input, got {other:?}"),
 						}

@@ -95,6 +95,12 @@ pub enum Expr {
 		list: Vec<Expr>,
 		negated: bool,
 	},
+	Like {
+		expr: Box<Expr>,
+		pattern: String,
+		negated: bool,
+		case_insensitive: bool,
+	},
 	IsNull(Box<Expr>),
 	IsNotNull(Box<Expr>),
 	TimeBucket(std::time::Duration, Box<Expr>),
@@ -122,6 +128,7 @@ impl Expr {
 			| Self::Sub(_, _)
 			| Self::Mul(_, _)
 			| Self::Div(_, _)
+			| Self::Like { .. }
 			| Self::TimeBucket(_, _) => false,
 			Self::Eq(left, right)
 			| Self::Neq(left, right)

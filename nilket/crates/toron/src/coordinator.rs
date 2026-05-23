@@ -1309,7 +1309,7 @@ fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, 
 		primary_key_columns: Vec::new(),
 	};
 
-	if let (Some(predicate), None) = (predicate, pbc_program) {
+	if let Some(predicate) = predicate {
 		Ok(ExecutionPlan::Filter {
 			input: Box::new(scan),
 			predicate: predicate.clone(),
