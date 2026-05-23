@@ -30,6 +30,23 @@ fn source_block(source: &str, marker: &str) -> String {
 		.1
 }
 
+fn registered_rune_function_names(module: &str) -> Vec<String> {
+	let mut names = Vec::new();
+	for line in module.lines() {
+		if let Some(rest) = line.split("m.associated_function(\"").nth(1) {
+			if let Some(name) = rest.split('"').next() {
+				names.push(name.to_string());
+			}
+		}
+		if let Some(rest) = line.split("m.function([\"").nth(1) {
+			if let Some(name) = rest.split('"').next() {
+				names.push(name.to_string());
+			}
+		}
+	}
+	names
+}
+
 #[test]
 pub(crate) fn adr079_rune_dataframe_remains_lazy_logical_plan_handle() {
 	let source = rune_engine_source();
@@ -325,21 +342,17 @@ pub(crate) fn adr080_rune_expr_does_not_carry_alias_state() {
 }
 
 #[test]
-pub(crate) fn adr080_named_select_lowers_to_existing_project_output_names() {
+pub(crate) fn adr080_named_projection_lowers_to_existing_project_output_names() {
 	let rune = rune_engine_source();
-	let select = source_block(&rune, "pub fn select");
-	let normalize = source_block(&rune, "fn normalize_rune_named_select_surface");
-	let compile_script = source_block(&rune, "fn compile_script");
+	let project_named = source_block(&rune, "pub fn project_named");
 
-	assert!(select.contains("exprs: Vec<RuneNamedExpr>"));
-	assert!(select.contains("LogicalPlan::Project"));
-	assert!(select.contains("output_names.push(Some(named.name))"));
-	assert!(select.contains("plan_exprs.push(named.expr)"));
-	assert!(!select.contains("LogicalPlan::Join"));
-	assert!(!select.contains("Aggregate"));
-	assert!(normalize.contains("const FROM: &str = \".select\";"));
-	assert!(normalize.contains("const TO: &str = \".select_named\";"));
-	assert!(compile_script.contains("normalize_rune_named_select_surface(script)"));
+	assert!(project_named.contains("exprs: Vec<RuneNamedExpr>"));
+	assert!(project_named.contains("LogicalPlan::Project"));
+	assert!(project_named.contains("output_names.push(Some(named.name))"));
+	assert!(project_named.contains("plan_exprs.push(named.expr)"));
+	assert!(!project_named.contains("LogicalPlan::Join"));
+	assert!(!project_named.contains("Aggregate"));
+	assert!(!project_named.contains("normalize_"));
 }
 
 #[test]
@@ -444,7 +457,7 @@ pub(crate) fn adr080_named_continuation_binds_through_normal_binder() {
 	let rune = rune_engine_source();
 	let tests = rune_relation_handles_test_source();
 
-	assert!(tests.contains("rune_named_sql_multi_hop_continuation_binds_and_executes"));
+	assert!(tests.contains("rune_project_named_sql_multi_hop_continuation_binds_and_executes"));
 	assert!(tests.contains("bind(&logical, &catalog(), &PlannerConfig::default())"));
 	assert!(
 		tests.contains(
@@ -512,10 +525,62 @@ pub(crate) fn adr080_rune_sandbox_allow_list_remains_toron_authoring_only() {
 	let module = source_block(&rune, "pub fn create_toron_module");
 
 	assert!(module.contains("m.ty::<RuneNamedExpr>()?;"));
-	assert!(module.contains("m.associated_function(\"select\", RuneDataFrame::select)?;"));
-	assert!(module.contains("m.associated_function(\"select_named\", RuneDataFrame::select)?;"));
+	assert!(
+		module.contains("m.associated_function(\"project_named\", RuneDataFrame::project_named)?;")
+	);
+	assert!(!module.contains("m.associated_function(\"select\","));
+	assert!(!module.contains("m.associated_function(\"select_named\","));
 	assert!(module.contains("m.associated_function(\"named\", RuneExpr::named)?;"));
 	assert!(module.contains("m.function([\"count_all\"], count_all).build()?;"));
 	assert!(!rune.contains("Context::with_default_modules"));
 	assert!(rune.contains("install_minimal_primitives"));
+}
+
+#[test]
+pub(crate) fn adr081_rune_frontend_does_not_rewrite_user_source() {
+	let rune = rune_engine_source();
+	let compile_script = source_block(&rune, "fn compile_script");
+
+	assert!(!rune.contains("fn normalize_rune_named_select_surface"));
+	assert!(!rune.contains("fn skip_rune_quoted"));
+	assert!(!rune.contains("fn skip_rune_line_comment"));
+	assert!(!rune.contains("fn skip_rune_block_comment"));
+	assert!(!rune.contains("fn is_ascii_ident_continue"));
+	assert!(!compile_script.contains("normalize_"));
+	assert!(compile_script.contains("Source::new(\"script\", script)"));
+}
+
+#[test]
+pub(crate) fn adr081_authored_rune_methods_avoid_reserved_keywords() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	for keyword in ["select", "as"] {
+		assert!(
+			!names.iter().any(|name| name == keyword),
+			"Rune authoring surface registered keyword `{keyword}`: {names:?}"
+		);
+	}
+	assert!(
+		!names.iter().any(|name| name == "select_named"),
+		"Rune authoring surface kept compatibility shim: {names:?}"
+	);
+	for expected in [
+		"table",
+		"sql",
+		"filter",
+		"project",
+		"project_named",
+		"aggregate",
+		"count",
+		"named",
+		"gt",
+		"eq",
+	] {
+		assert!(
+			names.iter().any(|name| name == expected),
+			"Rune authoring surface missing `{expected}`: {names:?}"
+		);
+	}
 }

@@ -171,18 +171,18 @@ async fn rune_sql_parse_error_maps_to_frontend_error_without_capability_escape()
 }
 
 #[tokio::test]
-async fn rune_named_sql_multi_hop_continuation_binds_and_executes() {
+async fn rune_project_named_sql_multi_hop_continuation_binds_and_executes() {
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
             ctx.sql("SELECT region, amount FROM sales WHERE status = 'open'")
                .filter(col("amount").gt(lit(10)))
-               .select([
+               .project_named([
                    col("region").named("bucket"),
                    col("amount").named("net"),
                ])
                .aggregate([col("bucket")], [sum(col("net")), count_all()])
-               .select([
+               .project_named([
                    col("bucket").named("bucket"),
                    col("sum").named("gross"),
                    col("count").named("n"),
@@ -209,12 +209,12 @@ async fn rune_named_sql_multi_hop_continuation_binds_and_executes() {
 }
 
 #[tokio::test]
-async fn rune_named_select_sets_project_output_names() {
+async fn rune_project_named_sets_project_output_names() {
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
             ctx.table("sales")
-               .select([
+               .project_named([
                    col("region").named("bucket"),
                    col("amount").named("net"),
                ])
@@ -222,7 +222,7 @@ async fn rune_named_select_sets_project_output_names() {
     "#,
 	)
 	.await
-	.expect("named select plan");
+	.expect("named project plan");
 
 	let LogicalPlan::Project { output_names, .. } = logical else {
 		panic!("expected named Project, got {logical:?}");
@@ -234,12 +234,12 @@ async fn rune_named_select_sets_project_output_names() {
 }
 
 #[tokio::test]
-async fn rune_named_select_binds_visible_schema() {
+async fn rune_project_named_binds_visible_schema() {
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
             ctx.table("sales")
-               .select([
+               .project_named([
                    col("region").named("bucket"),
                    col("amount").named("net"),
                ])
@@ -247,10 +247,10 @@ async fn rune_named_select_binds_visible_schema() {
     "#,
 	)
 	.await
-	.expect("named select plan");
+	.expect("named project plan");
 	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
 		.await
-		.expect("bind named select");
+		.expect("bind named project");
 
 	assert_schema_names(bound.schema().as_ref(), &["bucket", "net"]);
 }
@@ -285,18 +285,18 @@ async fn rune_aggregate_helper_pack_binds_stable_outputs() {
 }
 
 #[tokio::test]
-async fn rune_named_post_aggregate_select_renames_outputs() {
+async fn rune_project_named_post_aggregate_renames_outputs() {
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
             ctx.table("sales")
                .aggregate([], [sum(col("amount"))])
-               .select([col("sum").named("gross")])
+               .project_named([col("sum").named("gross")])
         }
     "#,
 	)
 	.await
-	.expect("post aggregate named select plan");
+	.expect("post aggregate named project plan");
 	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
 		.await
 		.expect("bind post aggregate rename");
@@ -311,7 +311,7 @@ async fn rune_duplicate_aggregate_output_name_is_ambiguous() {
         pub fn main(ctx) {
             ctx.table("sales")
                .aggregate([], [sum(col("amount")), sum(col("id"))])
-               .select([col("sum").named("gross")])
+               .project_named([col("sum").named("gross")])
         }
     "#,
 	)
@@ -328,7 +328,7 @@ async fn rune_duplicate_aggregate_output_name_is_ambiguous() {
 }
 
 #[tokio::test]
-async fn rune_named_select_rejects_misused_named_expression() {
+async fn rune_named_expr_rejects_misused_named_expression() {
 	let error = rune_plan(
 		r#"
         pub fn main(ctx) {
