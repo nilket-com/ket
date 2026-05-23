@@ -5123,6 +5123,18 @@ along with the forward-sequence rewrite.
   Genuine **3-of-3** (minor fixture-naming + guard-granularity divergences resolved
   2-of-3, Codex+Claude). Originating from the ADR 080 review Finding #2. Migration:
   `plans/impl/081_rune_surface_naming.md`.
+- **ADR 082 — Rune Typed Literals.** Promoted. Adds typed literal constructors
+  `lit_str`/`lit_f64`/`lit_bool`/`lit_i64` (free functions lowering to existing
+  `Expr::Literal(ScalarValue::{Utf8,Float64,Boolean,Int64})`); keeps `lit(i32)`. No
+  operator expansion (deferred to ADR 083), no IR/binder/executor change — production
+  localized to `rune_engine.rs`. Unblocks same-type Rune filters
+  (`col("status").eq(lit_str("open"))`). **Grounded:** `coerce_literal_value` has no
+  `Float64->Int32` arm, so all `lit_f64`/`lit_bool` fixtures are same-type (test-only
+  `price: Float64` + `active: Boolean` columns); `lit_i64` included because
+  `sales.id` is `Int64` and `lit(i32)` truncates wide integers. 4 same-type behavior
+  fixtures (ids `[1,2,4,5,6]`/`[2,4]`/`[1,3,4,6]`/`[4]`) + a wide-int (`3000000000`)
+  plan fixture; 5 `adr082_*` guards. Genuine 3-of-3. Migration:
+  `plans/impl/082_rune_typed_literals.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5207,7 +5219,36 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 081 promoted; ADR 082 candidates
+### ADR 082 promoted; ADR 083 candidates
+
+ADR 082 selected and promoted **Rune Typed Literals** — `lit_str`/`lit_f64`/
+`lit_bool`/`lit_i64` free functions lowering to existing `ScalarValue`, unblocking
+same-type Rune filters. Behavior-additive, `rune_engine.rs`-localized, no operator
+expansion. Genuine 3-of-3.
+
+**ADR 083 candidates:**
+
+- **Rune operator surface** (the 082 follow-on; the lead) — comparison parity
+  (`.lt`/`.lte`/`.gte`/`.ne` to pair with `.gt`/`.eq`), boolean combinators
+  (`.and`/`.or`/`.logical_not` — needed for OR/NOT, unreachable via chained
+  `.filter`; no keyword-colliding `.not` alias), null predicates
+  (`.is_null`/`.is_not_null`), and arithmetic (`.add`/`.sub`/`.mul`/`.div`, exercising
+  081's name-only-via-`.named`). All lower to existing `Expr` variants.
+- **Residual minimization for factored shapes** (078 follow-on; strongest non-Rune
+  lead) — minimal `(R1 ∨ R2)` residual in `split_boolean_tree`, gated by 078's 3VL
+  fixture.
+- **Rune joins** — needs relation-alias + qualified-column ergonomics first.
+- **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex verified in-tree; CPU-cost contract) or
+  `ESCAPE`/dynamic `LIKE`; **`CASE`/value-conditionals**; `Like`/`InList`/`Cast` Rune
+  surface; dot-field sugar; **Wendelon typed table-mutation trace continuation**.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+The migration is materialized in
+`plans/impl/082_rune_typed_literals.md`.
+
+### ADR 081 promoted; ADR 082 candidates (HISTORICAL)
 
 ADR 081 selected and promoted **Rune Surface Naming Cleanup** — a behavior-zero
 follow-on to ADR 080: renames the authored named-projection surface `.select` →
