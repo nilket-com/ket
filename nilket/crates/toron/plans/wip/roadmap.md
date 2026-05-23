@@ -5108,6 +5108,21 @@ along with the forward-sequence rewrite.
   Production change localized to `rune_engine.rs`; **no IR variant**, no
   dependency/wire/worker-Rune/SQL-expansion/`syn`. **15 decisions, 15 guards, 8
   fixtures.** Migration: `plans/impl/080_rune_named_projection_continuation.md`.
+- **ADR 081 — Rune Surface Naming Cleanup.** Promoted. Behavior-zero follow-on to
+  ADR 080: renames the authored named-projection surface `.select(...)` →
+  **`.project_named(...)`** and **deletes** the ADR 080 keyword shim (the
+  `normalize_rune_named_select_surface` source rewriter + scanner helpers + unit test
+  + dual registration) — `select` is a Rune 0.14 keyword. Supersedes ADR 080's
+  `.select` spelling (no compatibility alias). **Doctrine:** Rune authoring method
+  names must not collide with Rune keywords, and the frontend never rewrites user
+  source. Two 080 guards reconciled (discipline #4) + two durable guards
+  (`adr081_rune_frontend_does_not_rewrite_user_source`,
+  `adr081_authored_rune_methods_avoid_reserved_keywords`). Gate respelled, identical
+  result (`bucket="east", gross=30, n=1`). ~95 lines deleted, no production
+  machinery added.
+  Genuine **3-of-3** (minor fixture-naming + guard-granularity divergences resolved
+  2-of-3, Codex+Claude). Originating from the ADR 080 review Finding #2. Migration:
+  `plans/impl/081_rune_surface_naming.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5192,7 +5207,40 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 080 promoted; ADR 081 candidates
+### ADR 081 promoted; ADR 082 candidates
+
+ADR 081 selected and promoted **Rune Surface Naming Cleanup** — a behavior-zero
+follow-on to ADR 080: renames the authored named-projection surface `.select` →
+**`.project_named`** and deletes the ADR 080 keyword shim (Rune 0.14 reserves
+`select`). Doctrine: no keyword-colliding authored method names; the Rune frontend
+never rewrites user source. Two 080 guards reconciled (discipline #4) + two durable
+`adr081_*` guards. Gate respelled, identical result (`east,30,1`). ~95 lines deleted,
+no production machinery added. Genuine 3-of-3 (minor fixture-naming / guard-granularity
+divergences resolved 2-of-3).
+
+**ADR 082 candidates:**
+
+- **Residual minimization for factored shapes** (078 follow-on; strongest non-Rune
+  lead) — reconstruct the *minimal* residual `(R1 ∨ R2)` instead of the whole
+  original OR in `split_boolean_tree` (`binder.rs`), gated by 078's 3VL property
+  fixture.
+- **Rune literal widening** (`lit_str`/`lit_f64`/`lit_bool`) — the usability gap 080
+  named (`lit` is i32-only); unlocks string/float Rune filters. Smallest Rune
+  follow-on now that the surface is clean.
+- **Rune joins** — needs relation-alias + qualified-column ergonomics first (the
+  reason join was deferred from 080).
+- **`SIMILAR TO` / `RLIKE` / `REGEXP`** (`arrow_string::regexp`, regex verified
+  in-tree; needs a CPU-cost contract) or `ESCAPE` + dynamic `LIKE`; **`CASE` /
+  value-conditionals**; dot-field sugar; **Wendelon typed table-mutation trace
+  continuation**.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+The migration is materialized in
+`plans/impl/081_rune_surface_naming.md`.
+
+### ADR 080 promoted; ADR 081 candidates (HISTORICAL)
 
 ADR 080 selected and promoted **Rune Named Projection Continuation** — named
 projection (`RuneDataFrame::select` over a `RuneNamedExpr` carrier) plus the stable
