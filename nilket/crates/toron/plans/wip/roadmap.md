@@ -4970,6 +4970,31 @@ along with the forward-sequence rewrite.
   resolved against by the pushdown-regression that defers them. Placement: Toron
   compute-ring SQL predicate surface. Migration:
   `plans/impl/074_predicate_widening_in_between.md`.
+- **ADR 075 — Partial-Pushdown Residual Split + Literal `LIKE`/`ILIKE`.**
+  Promoted (plan). The load-bearing piece is **top-level-`AND` residual
+  splitting**: the binder splits the conjunction, pushes the PBC-eligible
+  conjuncts to Wendelon, and keeps the rest as a Toron residual `Filter`, fixing
+  074's all-or-nothing pushdown so a non-PBC predicate no longer poisons its
+  eligible siblings. Literal **`LIKE`/`ILIKE`** is the first new consumer (one
+  `Expr::Like { ..., case_insensitive }` variant, residual-only, executed via
+  **Arrow `comparison::{like,ilike,nlike,nilike}` kernels with no new dependency**
+  - `regex`/`arrow-string` are already in toron's tree). **Classify by attempting
+  `compile_pbc` per conjunct** (not `is_pbc_pushdown_eligible` alone; preserves
+  type/column/bytecode/stack checks), with a **conservative fallback** to
+  all-residual; `FilterDisposition` stays binary but `EvaluateInToron` is
+  retargeted ("residual work remains," not "no PBC below"); scan-profile from the
+  **pushed** predicate (PointRead preserved for `id=7 AND name LIKE`). Applies to
+  **SELECT + UPDATE source + DELETE candidate** scan predicates. **Immediate win
+  beyond LIKE:** existing `Add/Cast/TimeBucket` conjuncts now partial-push (`x+1>5
+  AND y>10` pushes `y>10`) - behavior-additive (same results, more pushdown).
+  Literal-pattern only; reject `ESCAPE`/dynamic/`ANY`/`SIMILAR TO`/`RLIKE`/PG
+  spellings/`CASE`; no PBC opcode, no Wendelon change. Final D-set: **15 decisions,
+  16 + meta guards, 17 fixtures**. Council: **3-of-3 on the topic + Arrow kernels;
+  2-of-3 (Codex, Claude) on the narrower design specifics**. Gemini iter-3 kept
+  broader alternatives (separate `Expr::ILike`, `ESCAPE`, eligibility-not-compile
+  classification, omitted DELETE/UPDATE), recorded as rejected for ADR 075.
+  Placement: Toron compute-ring predicate surface + PBC policy. Migration:
+  `plans/impl/075_partial_pushdown_residual_split_like.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5054,7 +5079,55 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 074 promoted; ADR 075 candidates
+### ADR 075 promoted; ADR 076 candidates
+
+ADR 075 selected and promoted **Partial-Pushdown Residual Split + Literal
+`LIKE`/`ILIKE`** - the binder now splits top-level `AND`, pushes PBC-eligible
+conjuncts and residuals the rest, fixing 074's all-or-nothing pushdown; literal
+`LIKE`/`ILIKE` is the first consumer (Arrow `comparison` kernels, residual-only,
+no new dependency). Final D-set: **15 decisions, 16 + meta guards, 17 fixtures**.
+Council: **3-of-3 topic + Arrow kernels; 2-of-3 (Codex, Claude) on the narrower
+design specifics**. Gemini held broader alternatives (`Expr::ILike` + `ESCAPE`)
+that are recorded as rejected for ADR 075.
+
+**Key decisions / invariants:**
+
+- **Residual split** - split top-level `AND` only (no `OR`/`NOT` distribution);
+  classify by **`compile_pbc` attempt** per conjunct (not `is_pbc_pushdown_eligible`
+  alone); push the eligible partition, residual the rest; **conservative fallback**
+  to all-residual. `FilterDisposition` binary but `EvaluateInToron` retargeted
+  ("residual work," not "no PBC below"); scan-profile from the **pushed** predicate
+  (PointRead preserved). Applies to **SELECT + UPDATE source + DELETE candidate**
+  scans.
+- **Immediate win beyond LIKE** - existing `Add/Cast/TimeBucket` conjuncts now
+  partial-push (`x+1>5 AND y>10` pushes `y>10`); behavior-additive (same results,
+  more pushdown).
+- **`LIKE`/`ILIKE`** - one `Expr::Like { ..., case_insensitive }` variant; Arrow
+  `comparison::{like,ilike,nlike,nilike}` (no new dep; `regex`/`arrow-string`
+  already in toron's tree); residual-only (no PBC opcode); literal-pattern only
+  (reject `ESCAPE`/dynamic/`ANY`/`SIMILAR TO`/`RLIKE`/PG-spellings/`CASE`); UTF-8.
+- Toron-local; no Wendelon/wire/storage/audit/dependency change; sqlparser
+  quarantined; the 074 `IN`/`BETWEEN` + PBC fixtures stay green.
+
+The migration is materialized in
+`plans/impl/075_partial_pushdown_residual_split_like.md`.
+
+**ADR 076 candidates:**
+
+- **`OR` / `NOT` predicate-distribution pushdown** - generalize 075's top-level-
+  `AND` split (e.g., factor pushable terms out of `OR`, push De Morgan'd `NOT`),
+  the natural next pushdown-completeness step now that the residual-split exists.
+- **`SIMILAR TO` / `RLIKE` / `REGEXP`** - the `arrow_string::regexp` kernels are
+  available (regex already in-tree); needs a CPU-cost/ReDoS contract. Or `ESCAPE`
+  + dynamic `LIKE` patterns (widen 075's literal-only bound).
+- **`CASE` / value-conditionals** - projection-side conditional (its own IR shape).
+- **Typed table-mutation trace continuation** - Wendelon-home producer (about 075/076,
+  the 074-trace pattern); agreed Wendelon-home six cycles running.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 074 promoted; ADR 075 candidates (HISTORICAL)
 
 ADR 074 selected and promoted **Predicate Widening — `IN` (native `OP_IN_LIST`) +
 `BETWEEN`** — the first predicate-surface widening unblocked by 073's parser
