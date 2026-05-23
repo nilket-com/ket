@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::error::{BindingError, FrontendError, StorageError};
 use toron::exec::Executor;
-use toron::ir::{ExecutionPlan, FilterDisposition, LogicalPlan, TableId};
+use toron::ir::{ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue, TableId};
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -396,6 +396,100 @@ async fn rune_named_projection_preserves_adr079_sql_relation_guards() {
 	assert!(scan_pbc(scan).is_some());
 }
 
+#[tokio::test]
+async fn rune_lit_str_filters_utf8_column_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("status").eq(lit_str("open")))
+        }
+    "#,
+	)
+	.await
+	.expect("lit_str filter plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int64_column_rows(&batches, 0),
+		vec![Some(1), Some(2), Some(4), Some(5), Some(6)]
+	);
+}
+
+#[tokio::test]
+async fn rune_lit_f64_filters_float64_column_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("price").gt(lit_f64(15.5)))
+        }
+    "#,
+	)
+	.await
+	.expect("lit_f64 filter plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(2), Some(4)]);
+}
+
+#[tokio::test]
+async fn rune_lit_bool_filters_boolean_column_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("active").eq(lit_bool(true)))
+        }
+    "#,
+	)
+	.await
+	.expect("lit_bool filter plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int64_column_rows(&batches, 0),
+		vec![Some(1), Some(3), Some(4), Some(6)]
+	);
+}
+
+#[tokio::test]
+async fn rune_lit_i64_filters_int64_column_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("id").eq(lit_i64(4)))
+        }
+    "#,
+	)
+	.await
+	.expect("lit_i64 filter plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(4)]);
+}
+
+#[tokio::test]
+async fn rune_lit_i64_preserves_wide_integer_in_logical_plan() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("id").eq(lit_i64(3000000000)))
+        }
+    "#,
+	)
+	.await
+	.expect("wide lit_i64 filter plan");
+
+	let LogicalPlan::Filter { predicate, .. } = logical else {
+		panic!("expected filter plan");
+	};
+	let Expr::Eq(_, right) = predicate else {
+		panic!("expected equality predicate, got {predicate:?}");
+	};
+	assert!(matches!(
+		right.as_ref(),
+		Expr::Literal(ScalarValue::Int64(Some(3_000_000_000)))
+	));
+}
+
 async fn sql_group_by_alias_outer_sum_plan() -> LogicalPlan {
 	rune_plan(
 		r#"
@@ -438,6 +532,8 @@ fn sales_schema() -> SchemaRef {
 		Field::new("region", DataType::Utf8, true),
 		Field::new("amount", DataType::Int32, true),
 		Field::new("status", DataType::Utf8, true),
+		Field::new("price", DataType::Float64, true),
+		Field::new("active", DataType::Boolean, true),
 	]))
 }
 
@@ -469,6 +565,22 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 				Some("open"),
 				Some("open"),
 				Some("open"),
+			])),
+			Arc::new(Float64Array::from(vec![
+				Some(10.5),
+				Some(20.25),
+				None,
+				Some(30.75),
+				Some(5.5),
+				Some(7.25),
+			])),
+			Arc::new(BooleanArray::from(vec![
+				Some(true),
+				Some(false),
+				Some(true),
+				Some(true),
+				Some(false),
+				Some(true),
 			])),
 		],
 	)
@@ -506,6 +618,13 @@ impl StorageScan for FixtureScan {
 			.get(&request.table_id)
 			.expect("fixture table")
 			.clone();
+		if let Some(pbc) = request.pbc_predicate {
+			batch = wendelon::schema::pbc::execute(&pbc, &batch).map_err(|error| {
+				StorageError::InvalidPbcProgram {
+					message: format!("{error:?}"),
+				}
+			})?;
+		}
 		if let Some(projected_columns) = request.projected_columns.as_ref() {
 			let schema = batch.schema();
 			let fields = projected_columns

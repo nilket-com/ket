@@ -277,6 +277,30 @@ pub fn lit(val: i32) -> RuneExpr {
 	}
 }
 
+pub fn lit_str(value: String) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::Literal(ScalarValue::Utf8(Some(value))),
+	}
+}
+
+pub fn lit_f64(value: f64) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::Literal(ScalarValue::Float64(Some(value))),
+	}
+}
+
+pub fn lit_bool(value: bool) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::Literal(ScalarValue::Boolean(Some(value))),
+	}
+}
+
+pub fn lit_i64(value: i64) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::Literal(ScalarValue::Int64(Some(value))),
+	}
+}
+
 pub fn time_bucket(interval_str: String, ts: RuneExpr) -> RuneExpr {
 	let interval = match interval_str.as_str() {
 		"1m" => std::time::Duration::from_secs(60),
@@ -382,6 +406,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 
 	m.function(["col"], col).build()?;
 	m.function(["lit"], lit).build()?;
+	m.function(["lit_str"], lit_str).build()?;
+	m.function(["lit_f64"], lit_f64).build()?;
+	m.function(["lit_bool"], lit_bool).build()?;
+	m.function(["lit_i64"], lit_i64).build()?;
 	m.function(["time_bucket"], time_bucket).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;

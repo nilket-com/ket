@@ -17,6 +17,14 @@ fn ir_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source")
 }
 
+fn binder_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
+}
+
+fn exec_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source")
+}
+
 fn rune_relation_handles_test_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("tests/rune_relation_handles_test.rs"))
 		.expect("read Rune relation handles tests")
@@ -583,4 +591,138 @@ pub(crate) fn adr081_authored_rune_methods_avoid_reserved_keywords() {
 			"Rune authoring surface missing `{expected}`: {names:?}"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr082_rune_typed_literal_helpers_lower_to_existing_scalar_values() {
+	let rune = rune_engine_source();
+
+	for (function, scalar) in [
+		("pub fn lit(val: i32)", "ScalarValue::Int32(Some(val))"),
+		(
+			"pub fn lit_str(value: String)",
+			"ScalarValue::Utf8(Some(value))",
+		),
+		(
+			"pub fn lit_f64(value: f64)",
+			"ScalarValue::Float64(Some(value))",
+		),
+		(
+			"pub fn lit_bool(value: bool)",
+			"ScalarValue::Boolean(Some(value))",
+		),
+		(
+			"pub fn lit_i64(value: i64)",
+			"ScalarValue::Int64(Some(value))",
+		),
+	] {
+		let body = source_block(&rune, function);
+		assert!(
+			body.contains("Expr::Literal"),
+			"{function} must build Expr::Literal"
+		);
+		assert!(body.contains(scalar), "{function} missing {scalar}");
+	}
+}
+
+#[test]
+pub(crate) fn adr082_rune_typed_literal_helpers_are_registered_in_toron_module() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+
+	for registration in [
+		"m.function([\"lit\"], lit).build()?;",
+		"m.function([\"lit_str\"], lit_str).build()?;",
+		"m.function([\"lit_f64\"], lit_f64).build()?;",
+		"m.function([\"lit_bool\"], lit_bool).build()?;",
+		"m.function([\"lit_i64\"], lit_i64).build()?;",
+	] {
+		assert!(module.contains(registration), "missing {registration}");
+	}
+}
+
+#[test]
+pub(crate) fn adr082_typed_literal_names_avoid_rune_keywords() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	for literal_name in ["lit_str", "lit_f64", "lit_bool", "lit_i64"] {
+		assert!(
+			names.iter().any(|name| name == literal_name),
+			"Rune typed literal surface missing `{literal_name}`: {names:?}"
+		);
+	}
+	for keyword in ["as", "is", "not", "select"] {
+		assert!(
+			!names.iter().any(|name| name == keyword),
+			"Rune authoring surface registered keyword `{keyword}`: {names:?}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr082_typed_literal_cut_does_not_expand_operator_surface() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	for retained in ["eq", "gt"] {
+		assert!(
+			names.iter().any(|name| name == retained),
+			"existing Rune expression method `{retained}` missing: {names:?}"
+		);
+	}
+	for deferred in [
+		"lt",
+		"lte",
+		"gte",
+		"ne",
+		"and",
+		"or",
+		"logical_not",
+		"not",
+		"is_null",
+		"is_not_null",
+		"add",
+		"sub",
+		"mul",
+		"div",
+	] {
+		assert!(
+			!names.iter().any(|name| name == deferred),
+			"ADR082 must not register deferred Rune operator `{deferred}`: {names:?}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr082_typed_literals_do_not_change_ir_binder_executor_or_sandbox() {
+	adr081_rune_frontend_does_not_rewrite_user_source();
+	let rune = rune_engine_source();
+	let ir = ir_source();
+	let binder = binder_source();
+	let exec = exec_source();
+
+	for forbidden in [
+		"BindingError",
+		"BoundExpr",
+		"ExecutionPlan",
+		"PlannerConfig",
+	] {
+		assert!(
+			!rune.contains(forbidden),
+			"Rune typed literal surface gained planner/binder marker {forbidden}"
+		);
+	}
+	assert!(!rune.contains("normalize_"));
+	assert!(!rune.contains("evaluate_expr"));
+	assert!(ir.contains("Utf8(Option<String>)"));
+	assert!(ir.contains("Float64(Option<f64>)"));
+	assert!(ir.contains("Boolean(Option<bool>)"));
+	assert!(ir.contains("Int64(Option<i64>)"));
+	assert!(binder.contains("Expr::Literal(value) => Ok(builder.append_literal(value.clone()))"));
+	assert!(exec.contains("ScalarValue::Boolean(v)"));
+	assert!(exec.contains("ScalarValue::Float64(v)"));
+	assert!(exec.contains("ScalarValue::Int64(v)"));
 }
