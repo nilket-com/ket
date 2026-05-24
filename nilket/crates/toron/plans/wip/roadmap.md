@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–091, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–092, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -377,6 +377,28 @@ run, 079+).
   plan-shape + create-rebind catch + bind-time; Gemini converged). Migration:
   `plans/impl/091_sql_logical_type_ddl_columns.md`.
 
+- **ADR 092 — SQL `CAST(x AS LogicalType)` (coercing ascription).** Promoted. **Completes the
+  SQL authoring surface** (define → DDL column → CAST). Toron-only. The receipt doctrine at
+  expression position: `CAST(x AS CustomerId)` resolves **durable-only** (091's resolver, seed
+  excluded) and is a **reconciling coerce-ascription, not a silent relabel** — binds iff `T`
+  durably defined ∧ physical convertible by existing semantics ∧ `reconcile(x.identity, T)`
+  doesn't conflict. `CAST(product_id AS CustomerId)` rejects; `CAST(CAST(product_id AS BIGINT)
+  AS CustomerId)` is the explicit override. **Reconcile before physical coercion is the whole
+  feature.** Shape (converged after a load-bearing correction): transient `Expr::SqlLogicalCast
+  { expr, logical_name, try_cast }` (planner-emitted, binder-consumed — never in
+  `BoundExprProgram`/exec); an **async pre-resolution pass** resolves names → a `HashMap<String,
+  LogicalTypeSpec>` (durable-only, refresh-on-miss; unknown → `LogicalTypeNotFound`); the **sync
+  binder** reads the resolved **spec** (the seed-only-spec catch: `validate_logical_ascription_physical`
+  is seed-only, so a durable id can't validate id-only — the *spec*, not the id, must reach the
+  binder), reconciles against the operand identity before coercing physical via the existing
+  lattice (no new kernels; same-physical incl Utf8/Boolean ascribes with no kernel).
+  **`LogicalAscription` is unchanged (no coerce flag)** — Rune + 087's cast-erase escape stay
+  byte-identical (Claude conceded the iter-1 coerce-flag; Codex grounded the correction). Typed
+  CTAS is free via 089; **TRY_CAST deferred** (Gemini conceded; now 3-of-3 — nullability +
+  non-numeric physicals are a separate call, 093). No Wendelon/executor/PBC; no new nominal gate. Reconcile
+  091's `no_cast_or_typed_ctas_authoring_yet` + the cast-shape guards in-change (full suite green).
+  11 decisions, 9 guards. Genuine 3-of-3. Migration: `plans/impl/092_sql_logical_cast.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -460,31 +482,29 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 091 promoted; ADR 092 candidates
+### ADR 092 promoted; ADR 093 candidates
 
-ADR 091 selected and promoted **SQL Logical Type Use-Sites (DDL column position)** — the first
-honest SQL use over the 090 substrate: `CREATE TABLE orders (customer_id CustomerId)` resolves a
-durably-defined type at bind (registry-only, **seed excluded** — the seed-first trap), builds the
-field via the 089 writer, write-side fail-closed, create-path self-rebind resolver-aware.
-Back to Toron-only. `CAST` + typed CTAS deferred to 092. Genuine 3-of-3.
+ADR 092 selected and promoted **SQL `CAST(x AS LogicalType)`** — the expression-side use that
+**completes the SQL authoring surface** (define → DDL column → CAST). A reconciling
+coerce-ascription resolved durable-only: `CAST(product_id AS CustomerId)` rejects, the explicit
+primitive erase is the override; reconcile-before-coerce; transient `SqlLogicalCast` + async spec
+pre-resolution + the resolved *spec* to the sync binder; `LogicalAscription` unchanged; typed
+CTAS free via 089; TRY_CAST deferred. Genuine 3-of-3.
 
-**ADR 092 candidates:**
+**ADR 093 candidates:**
 
-*Identity follow-ons (from ADR 091 §"What to do next" — the natural successors):*
+*Identity follow-ons (from ADR 092 §"What to do next" — the natural successors):*
 
-- **`CAST(x AS CustomerId)` + typed CTAS projection** (the direct successor; strongest lead) —
-  the *coercing-ascription*: a `coerce` flag on `Expr::LogicalAscription`, reconcile against the
-  operand identity, **reconcile-before-erase** (binds iff `T` known [via 091's durable-only
-  resolver] ∧ physical cast supported ∧ no conflict; `CAST(product_id AS CustomerId)` rejects;
-  `CAST(CAST(product_id AS BIGINT) AS CustomerId)` is the explicit override — no silent relabel),
-  physical coercion via the existing numeric lattice; then CTAS materialization composes it
-  with 089. This is the expression-side use the whole receipt arc set up.
+- **Refinement contracts** (the next *integrity level*; strongest lead) — value predicates on a
+  durable `LogicalTypeId` (`PersonId(Int64, value > 0)`) → static plan elision (`WHERE id = -5` →
+  `EmptyRelation`, zero I/O). The brainstorm-007 horizon, now real: 090 gave the durable receipt
+  substrate, 091/092 the full authoring surface, so predicates have a stable handle to hang on.
+- **`TRY_CAST(x AS LogicalType)`** — the deferred 092 sibling: nullable conversion (reconcile
+  compile-time + physical `TryCast`); a clean small ADR.
 - **PK/FK-derived identity** — "magic that follows constraints, not names": derive identity
   from `PRIMARY KEY`, inherit via `REFERENCES`, durable on 090's id substrate (needs FK
   support, currently rejected, + a canonical `schema.table.column` identity name).
-- **Refinement contracts** — value predicates on a `LogicalTypeId` (`PersonId(Int64, value >
-  0)`) → static plan elision (`WHERE id = -5` → `EmptyRelation`); brainstorm-007 horizon.
-  Plus `DROP`/`ALTER LOGICAL TYPE`, a read-only `information_schema.logical_types` view,
+- **`DROP`/`ALTER LOGICAL TYPE`**, a read-only `information_schema.logical_types` view,
   aggregate-output identity semantics, the optional Wendelon-validate-at-authority (090 knob),
   **`.as_naked()`** Rune helper.
 
@@ -506,7 +526,7 @@ Back to Toron-only. `CAST` + typed CTAS deferred to 092. Genuine 3-of-3.
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/091_sql_logical_type_ddl_columns.md`.
+`plans/impl/092_sql_logical_cast.md`.
 
 ### Advanced kernel graduations *(one ADR per kernel)*
 
