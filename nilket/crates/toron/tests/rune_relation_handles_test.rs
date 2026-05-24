@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+	Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
@@ -710,6 +712,164 @@ async fn rune_arithmetic_integer_overflow_is_kernel_error() {
 	}
 }
 
+#[tokio::test]
+async fn rune_cast_projection_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("amount").cast(type_i64()).named("amount_i64"),
+                   col("id").cast(type_i32()).named("id_i32"),
+                   col("price").cast(type_f32()).named("price_f32"),
+                   col("amount").cast(type_f64()).named("amount_f64"),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("cast projection plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind cast projection");
+	assert_schema_names(
+		bound.schema().as_ref(),
+		&["amount_i64", "id_i32", "price_f32", "amount_f64"],
+	);
+	assert_schema_types(
+		bound.schema().as_ref(),
+		&[
+			DataType::Int64,
+			DataType::Int32,
+			DataType::Float32,
+			DataType::Float64,
+		],
+	);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int64_column_rows(&batches, 0),
+		vec![Some(10), Some(20), None, Some(30), None, Some(7)]
+	);
+	assert_eq!(
+		int32_column_rows(&batches, 1),
+		vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+	);
+	assert_eq!(
+		float32_column_rows(&batches, 2),
+		vec![
+			Some(10.5),
+			Some(20.25),
+			None,
+			Some(30.75),
+			Some(5.5),
+			Some(7.25)
+		]
+	);
+	assert_eq!(
+		float64_column_rows(&batches, 3),
+		vec![Some(10.0), Some(20.0), None, Some(30.0), None, Some(7.0)]
+	);
+}
+
+#[tokio::test]
+async fn rune_try_cast_nulls_data_domain_failures() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("id").add(lit_i64(3000000000)).try_cast(type_i32()).named("id_i32"),
+                   col("price").mul(lit_f64(1e40)).try_cast(type_f32()).named("price_f32"),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("try_cast overflow projection plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![None, None, None, None, None, None]
+	);
+	assert_eq!(
+		float32_column_rows(&batches, 1),
+		vec![None, None, None, None, None, None]
+	);
+}
+
+#[tokio::test]
+async fn rune_strict_cast_domain_failure_is_kernel_error() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("id").add(lit_i64(3000000000)).cast(type_i32()).named("id_i32"),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("strict cast overflow projection plan");
+
+	let error = execute_logical(&logical)
+		.await
+		.expect_err("strict cast overflow should fail");
+	match error {
+		ExecutionError::Kernel { message } => assert!(
+			message.contains("cast failed"),
+			"unexpected cast failure message: {message}"
+		),
+		other => panic!("expected kernel cast error, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn rune_cast_predicate_is_residual() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .filter(col("amount").cast(type_i64()).gt(lit_i64(10)))
+        }
+    "#,
+	)
+	.await
+	.expect("cast residual filter plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind cast residual filter");
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(
+		scan_pbc(scan).is_none(),
+		"cast predicate must not reach scan PBC"
+	);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(2), Some(4)]);
+}
+
+#[tokio::test]
+async fn rune_cast_feeds_aggregate_argument() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [sum(col("amount").try_cast(type_i64()))])
+        }
+    "#,
+	)
+	.await
+	.expect("cast aggregate argument plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(67)]);
+}
+
 async fn predicate_operator_compound_filter_plan() -> LogicalPlan {
 	rune_plan(
 		r#"
@@ -990,6 +1150,21 @@ fn int32_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<i32>>
 		.collect()
 }
 
+fn float32_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<f32>> {
+	batches
+		.iter()
+		.flat_map(|batch| {
+			batch
+				.column(column)
+				.as_any()
+				.downcast_ref::<Float32Array>()
+				.expect("Float32 column")
+				.iter()
+				.collect::<Vec<_>>()
+		})
+		.collect()
+}
+
 fn float64_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<f64>> {
 	batches
 		.iter()
@@ -1026,6 +1201,15 @@ fn assert_schema_names(schema: &Schema, expected: &[&str]) {
 		.fields()
 		.iter()
 		.map(|field| field.name().as_str())
+		.collect::<Vec<_>>();
+	assert_eq!(actual, expected);
+}
+
+fn assert_schema_types(schema: &Schema, expected: &[DataType]) {
+	let actual = schema
+		.fields()
+		.iter()
+		.map(|field| field.data_type().clone())
 		.collect::<Vec<_>>();
 	assert_eq!(actual, expected);
 }

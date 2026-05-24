@@ -687,16 +687,18 @@ pub(crate) fn adr082_typed_literal_cut_does_not_expand_operator_surface() {
 		"sub",
 		"mul",
 		"div",
+		"cast",
+		"try_cast",
 	] {
 		assert!(
 			names.iter().any(|name| name == retained),
-			"post-ADR084 Rune expression method `{retained}` missing: {names:?}"
+			"post-ADR085 Rune expression method `{retained}` missing: {names:?}"
 		);
 	}
-	for deferred in ["not", "like", "ilike", "in_list", "cast", "try_cast"] {
+	for deferred in ["not", "like", "ilike", "in_list", "safe_cast"] {
 		assert!(
 			!names.iter().any(|name| name == deferred),
-			"post-ADR084 Rune surface must keep deferred operator `{deferred}` out: {names:?}"
+			"post-ADR085 Rune surface must keep deferred operator `{deferred}` out: {names:?}"
 		);
 	}
 }
@@ -798,8 +800,6 @@ pub(crate) fn adr084_rune_arithmetic_methods_are_registered() {
 		assert!(module.contains(registration), "missing {registration}");
 	}
 	for forbidden in [
-		"m.associated_function(\"cast\"",
-		"m.associated_function(\"try_cast\"",
 		"m.associated_function(\"mod\"",
 		"m.associated_function(\"neg\"",
 	] {
@@ -808,6 +808,162 @@ pub(crate) fn adr084_rune_arithmetic_methods_are_registered() {
 			"ADR084 registered deferred arithmetic-adjacent surface {forbidden}"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr085_rune_datatype_is_host_surface_only() {
+	let manifest_dir = manifest_dir();
+	let rune = rune_engine_source();
+	assert!(rune.contains("pub struct RuneDataType"));
+	assert!(rune.contains("data_type: DataType"));
+
+	let offenders = source_files(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|path| path.file_name().and_then(|name| name.to_str()) != Some("rune_engine.rs"))
+		.filter_map(|path| {
+			let source = std::fs::read_to_string(&path).expect("read production source");
+			source.contains("RuneDataType").then(|| {
+				path.strip_prefix(&manifest_dir)
+					.unwrap_or(&path)
+					.display()
+					.to_string()
+			})
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"RuneDataType leaked outside rune_engine.rs: {offenders:?}"
+	);
+}
+
+#[test]
+pub(crate) fn adr085_rune_cast_target_helpers_are_numeric_only() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	for (helper, data_type) in [
+		("type_i32", "DataType::Int32"),
+		("type_i64", "DataType::Int64"),
+		("type_f32", "DataType::Float32"),
+		("type_f64", "DataType::Float64"),
+	] {
+		assert!(
+			names.iter().any(|name| name == helper),
+			"Rune cast target helper `{helper}` missing: {names:?}"
+		);
+		let body = source_block(&rune, &format!("pub fn {helper}"));
+		assert!(body.contains(data_type), "{helper} missing {data_type}");
+	}
+	for forbidden in [
+		"type_utf8",
+		"type_bool",
+		"type_decimal",
+		"type_date",
+		"safe_cast",
+		"rune_parse_data_type",
+		"FromStr",
+		"type_str",
+	] {
+		assert!(
+			!rune.contains(forbidden),
+			"Rune cast target surface gained forbidden marker {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr085_rune_cast_methods_lower_to_existing_expr_variants() {
+	let rune = rune_engine_source();
+	let cast = source_block(&rune, "pub fn cast");
+	let try_cast = source_block(&rune, "pub fn try_cast");
+
+	assert!(cast.contains("target: RuneDataType"));
+	assert!(cast.contains("Expr::Cast(Box::new(self.expr), target.data_type)"));
+	assert!(try_cast.contains("target: RuneDataType"));
+	assert!(try_cast.contains("Expr::TryCast(Box::new(self.expr), target.data_type)"));
+	for forbidden in [
+		"BindingError",
+		"BoundExpr",
+		"ExecutionPlan",
+		"PlannerConfig",
+		"safe_cast",
+		"rune_parse_data_type",
+	] {
+		assert!(
+			!cast.contains(forbidden) && !try_cast.contains(forbidden),
+			"Rune cast methods gained forbidden marker {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr085_rune_cast_methods_are_registered() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+
+	for registration in [
+		"m.ty::<RuneDataType>()?;",
+		"m.function([\"type_i32\"], type_i32).build()?;",
+		"m.function([\"type_i64\"], type_i64).build()?;",
+		"m.function([\"type_f32\"], type_f32).build()?;",
+		"m.function([\"type_f64\"], type_f64).build()?;",
+		"m.associated_function(\"cast\", RuneExpr::cast)?;",
+		"m.associated_function(\"try_cast\", RuneExpr::try_cast)?;",
+	] {
+		assert!(module.contains(registration), "missing {registration}");
+	}
+	assert!(!module.contains("safe_cast"));
+}
+
+#[test]
+pub(crate) fn adr085_rune_cast_reuses_existing_substrate() {
+	let rune = rune_engine_source();
+	let ir = ir_source();
+	let binder = binder_source();
+	let exec = exec_source();
+
+	for forbidden in [
+		"BindingError",
+		"BoundExpr",
+		"ExecutionPlan",
+		"PlannerConfig",
+		"normalize_",
+		"evaluate_expr",
+	] {
+		assert!(
+			!rune.contains(forbidden),
+			"Rune cast surface gained substrate marker {forbidden}"
+		);
+	}
+	for variant in ["Cast(Box<Expr>, DataType)", "TryCast(Box<Expr>, DataType)"] {
+		assert!(ir.contains(variant), "IR missing existing {variant}");
+	}
+	assert!(binder.contains("Expr::Cast(inner, target) =>"));
+	assert!(binder.contains("bind_explicit_cast"));
+	assert!(binder.contains("Expr::TryCast(inner, target) =>"));
+	assert!(binder.contains("bind_try_cast"));
+	assert!(exec.contains("Expr::Cast(inner, target)"));
+	assert!(exec.contains("Expr::TryCast(inner, target)"));
+}
+
+#[test]
+pub(crate) fn adr085_rune_cast_remains_pbc_ineligible() {
+	let ir = ir_source();
+	let pbc = pbc_source();
+	let eligible_body = source_block(&ir, "pub fn is_pbc_pushdown_eligible");
+
+	for cast_variant in ["Self::Cast(_, _)", "Self::TryCast(_, _)"] {
+		assert!(
+			eligible_body.contains(cast_variant),
+			"is_pbc_pushdown_eligible missing cast decline {cast_variant}"
+		);
+	}
+	assert!(eligible_body.contains("=> false"));
+	assert!(pbc.contains("BoundExprNode::Cast { .. }"));
+	assert!(pbc.contains("BoundExprNode::TryCast { .. }"));
+	assert!(pbc.contains("arithmetic, Cast, and TryCast are not PBC-eligible"));
 }
 
 #[test]

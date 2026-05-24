@@ -2,6 +2,7 @@ use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{AggregateFunction, Expr, LogicalPlan, ScalarValue};
 use crate::sql_planner::SqlPlanner;
+use arrow::datatypes::DataType;
 use rune::alloc::limit;
 use rune::runtime::{VmResult, budget};
 use rune::{Any, Context, Diagnostics, Module, Source, Sources, Unit, Vm};
@@ -176,6 +177,11 @@ pub struct RuneNamedExpr {
 	pub(crate) name: String,
 }
 
+#[derive(Any, Debug, Clone)]
+pub struct RuneDataType {
+	pub(crate) data_type: DataType,
+}
+
 impl RuneDataFrame {
 	pub fn new(table: String) -> Self {
 		Self {
@@ -298,6 +304,30 @@ pub fn lit_bool(value: bool) -> RuneExpr {
 pub fn lit_i64(value: i64) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::Literal(ScalarValue::Int64(Some(value))),
+	}
+}
+
+pub fn type_i32() -> RuneDataType {
+	RuneDataType {
+		data_type: DataType::Int32,
+	}
+}
+
+pub fn type_i64() -> RuneDataType {
+	RuneDataType {
+		data_type: DataType::Int64,
+	}
+}
+
+pub fn type_f32() -> RuneDataType {
+	RuneDataType {
+		data_type: DataType::Float32,
+	}
+}
+
+pub fn type_f64() -> RuneDataType {
+	RuneDataType {
+		data_type: DataType::Float64,
 	}
 }
 
@@ -476,6 +506,18 @@ impl RuneExpr {
 			expr: Expr::Div(Box::new(self.expr), Box::new(other.expr)),
 		}
 	}
+
+	pub fn cast(self, target: RuneDataType) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Cast(Box::new(self.expr), target.data_type),
+		}
+	}
+
+	pub fn try_cast(self, target: RuneDataType) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::TryCast(Box::new(self.expr), target.data_type),
+		}
+	}
 }
 
 pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
@@ -483,6 +525,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.ty::<RuneDataFrame>()?;
 	m.ty::<RuneExpr>()?;
 	m.ty::<RuneNamedExpr>()?;
+	m.ty::<RuneDataType>()?;
 	m.ty::<RuneAggr>()?;
 	m.ty::<ToronContext>()?;
 
@@ -492,6 +535,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lit_f64"], lit_f64).build()?;
 	m.function(["lit_bool"], lit_bool).build()?;
 	m.function(["lit_i64"], lit_i64).build()?;
+	m.function(["type_i32"], type_i32).build()?;
+	m.function(["type_i64"], type_i64).build()?;
+	m.function(["type_f32"], type_f32).build()?;
+	m.function(["type_f64"], type_f64).build()?;
 	m.function(["time_bucket"], time_bucket).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
@@ -529,6 +576,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("sub", RuneExpr::sub)?;
 	m.associated_function("mul", RuneExpr::mul)?;
 	m.associated_function("div", RuneExpr::div)?;
+	m.associated_function("cast", RuneExpr::cast)?;
+	m.associated_function("try_cast", RuneExpr::try_cast)?;
 
 	Ok(m)
 }
