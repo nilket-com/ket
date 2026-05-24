@@ -15,8 +15,8 @@ use toron::distributed::worker_registry::StaticWorkerRegistry;
 use toron::error::{CatalogError, ExecutionError, QueryError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan, LogicalPlan, QueryProfileHint, SessionId,
-	TableId,
+	ColumnOrdinal, CreateTableColumnType, CreateTableRowIdentity, CreateTableSchema, ExecutionPlan,
+	LogicalPlan, QueryProfileHint, SessionId, TableId,
 };
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
@@ -57,12 +57,12 @@ fn planner_accepts_create_table_surface() {
 	assert!(!if_not_exists);
 	assert!(!or_replace);
 	assert_eq!(row_identity, CreateTableRowIdentity::AppendOnly);
-	assert_field(&schema, 0, "id", &DataType::Int32, true);
-	assert_field(&schema, 1, "amount", &DataType::Int64, true);
-	assert_field(&schema, 2, "price", &DataType::Float64, true);
-	assert_field(&schema, 3, "score", &DataType::Float32, true);
-	assert_field(&schema, 4, "name", &DataType::Utf8, true);
-	assert_field(&schema, 5, "active", &DataType::Boolean, true);
+	assert_create_column(&schema, 0, "id", &DataType::Int32, true);
+	assert_create_column(&schema, 1, "amount", &DataType::Int64, true);
+	assert_create_column(&schema, 2, "price", &DataType::Float64, true);
+	assert_create_column(&schema, 3, "score", &DataType::Float32, true);
+	assert_create_column(&schema, 4, "name", &DataType::Utf8, true);
+	assert_create_column(&schema, 5, "active", &DataType::Boolean, true);
 }
 
 #[test]
@@ -86,8 +86,8 @@ fn planner_accepts_if_not_exists_qualified_name_and_nullability() {
 	assert!(if_not_exists);
 	assert!(!or_replace);
 	assert_eq!(row_identity, CreateTableRowIdentity::AppendOnly);
-	assert_field(&schema, 0, "id", &DataType::Int32, false);
-	assert_field(&schema, 1, "note", &DataType::Utf8, true);
+	assert_create_column(&schema, 0, "id", &DataType::Int32, false);
+	assert_create_column(&schema, 1, "note", &DataType::Utf8, true);
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn planner_preserves_quoted_object_name_parts_after_sqlparser_062() {
 		panic!("expected create table");
 	};
 	assert_eq!(name, TableRef::with_schema("App", "Sales"));
-	assert_field(&schema, 0, "Id", &DataType::Int32, false);
+	assert_create_column(&schema, 0, "Id", &DataType::Int32, false);
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn planner_accepts_create_or_replace_table_surface() {
 	assert!(!if_not_exists);
 	assert!(or_replace);
 	assert_eq!(row_identity, CreateTableRowIdentity::AppendOnly);
-	assert_field(&schema, 0, "id", &DataType::Int32, false);
+	assert_create_column(&schema, 0, "id", &DataType::Int32, false);
 }
 
 #[test]
@@ -153,8 +153,8 @@ fn planner_accepts_column_primary_key() {
 			column: "id".to_string()
 		}
 	);
-	assert_field(&schema, 0, "id", &DataType::Int32, false);
-	assert_field(&schema, 1, "note", &DataType::Utf8, true);
+	assert_create_column(&schema, 0, "id", &DataType::Int32, false);
+	assert_create_column(&schema, 1, "note", &DataType::Utf8, true);
 }
 
 #[test]
@@ -183,8 +183,8 @@ fn planner_accepts_table_primary_key() {
 			column: "id".to_string()
 		}
 	);
-	assert_field(&schema, 0, "id", &DataType::Int64, false);
-	assert_field(&schema, 1, "note", &DataType::Utf8, true);
+	assert_create_column(&schema, 0, "id", &DataType::Int64, false);
+	assert_create_column(&schema, 1, "note", &DataType::Utf8, true);
 }
 
 #[test]
@@ -826,6 +826,22 @@ fn assert_field(schema: &SchemaRef, idx: usize, name: &str, data_type: &DataType
 	assert_eq!(field.name(), name);
 	assert_eq!(field.data_type(), data_type);
 	assert_eq!(field.is_nullable(), nullable);
+}
+
+fn assert_create_column(
+	schema: &CreateTableSchema,
+	idx: usize,
+	name: &str,
+	data_type: &DataType,
+	nullable: bool,
+) {
+	let column = &schema.columns[idx];
+	assert_eq!(column.name, name);
+	assert_eq!(column.nullable, nullable);
+	assert_eq!(
+		column.column_type,
+		CreateTableColumnType::Physical(data_type.clone())
+	);
 }
 
 fn assert_point_read_scan(plan: &ExecutionPlan) {

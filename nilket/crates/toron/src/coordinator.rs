@@ -1544,7 +1544,9 @@ mod tests {
 		WorkerEntry, WorkerLease, WorkerResourceState, WorkerStatus,
 	};
 	use crate::error::BindingError;
-	use crate::ir::{AggregateFunction, Expr, InsertLiteral, QueryId, SessionId, TableId};
+	use crate::ir::{
+		AggregateFunction, CreateTableSchema, Expr, InsertLiteral, QueryId, SessionId, TableId,
+	};
 	use crate::server::transport::{TcpTransport, ToronStream, ToronTransport};
 	use crate::storage::{
 		HlcBound, ScanRequest, ScanStream, StorageScan, StorageWrite, TenantId, WriteOutcome,
@@ -2009,7 +2011,7 @@ mod tests {
 		);
 		let create = LogicalPlan::CreateTable {
 			name: TableRef::new("rate_write"),
-			schema: Arc::new(Schema::empty()),
+			schema: empty_create_table_schema(),
 			row_identity: CreateTableRowIdentity::AppendOnly,
 			if_not_exists: false,
 			or_replace: false,
@@ -2243,7 +2245,7 @@ mod tests {
 		);
 		let plan = LogicalPlan::CreateTable {
 			name: TableRef::new("budget_success"),
-			schema: Arc::new(Schema::empty()),
+			schema: empty_create_table_schema(),
 			row_identity: CreateTableRowIdentity::AppendOnly,
 			if_not_exists: false,
 			or_replace: false,
@@ -2496,6 +2498,12 @@ mod tests {
 		LogicalPlan::ScanNamed {
 			table: TableRef::new("retry_table"),
 			projection: None,
+		}
+	}
+
+	fn empty_create_table_schema() -> CreateTableSchema {
+		CreateTableSchema {
+			columns: Vec::new(),
 		}
 	}
 
@@ -2893,6 +2901,15 @@ mod tests {
 				.ok_or_else(|| CatalogError::TableNotFound {
 					table: format!("{table:?}"),
 				})
+		}
+
+		async fn resolve_durable_logical_type_by_name(
+			&self,
+			name: &str,
+		) -> Result<crate::ir::LogicalTypeSpec, CatalogError> {
+			Err(CatalogError::LogicalTypeNotFound {
+				name: name.to_string(),
+			})
 		}
 
 		async fn invalidate_table_descriptor(

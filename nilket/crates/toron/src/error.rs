@@ -140,6 +140,8 @@ pub enum CatalogError {
 	SchemaNotFound { schema: String },
 	#[error("table already exists: {table}")]
 	TableAlreadyExists { table: String },
+	#[error("logical type not found: {name}")]
+	LogicalTypeNotFound { name: String },
 	#[error("existing table schema does not match CREATE TABLE IF NOT EXISTS: {table}")]
 	SchemaMismatch { table: String },
 	#[error("catalog admin operation unavailable: {message}")]

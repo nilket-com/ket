@@ -13,11 +13,11 @@ use crate::error::BindingError;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
-	ColumnOrdinal, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral,
-	JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId, PbcProgram, QueryProfileHint,
-	ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, arithmetic_output_type,
-	decode_column_logical_type, field_with_logical_type_metadata, logical_type_name,
-	logical_type_spec, schema_for_exprs,
+	ColumnOrdinal, CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
+	FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId,
+	PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr,
+	arithmetic_output_type, decode_column_logical_type, field_with_logical_type_metadata,
+	logical_type_name, logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -195,13 +195,10 @@ impl<'a> Binder<'a> {
 					row_identity,
 					if_not_exists,
 					or_replace,
-				} => Ok(ExecutionPlan::CreateTable {
-					name: name.clone(),
-					schema: schema.clone(),
-					row_identity: row_identity.clone(),
-					if_not_exists: *if_not_exists,
-					or_replace: *or_replace,
-				}),
+				} => {
+					self.bind_create_table(name, schema, row_identity, *if_not_exists, *or_replace)
+						.await
+				}
 				LogicalPlan::CreateLogicalType { name, physical } => {
 					Ok(ExecutionPlan::CreateLogicalType {
 						name: name.clone(),
@@ -257,6 +254,45 @@ impl<'a> Binder<'a> {
 						.await
 				}
 			}
+		})
+	}
+
+	async fn bind_create_table(
+		&self,
+		name: &TableRef,
+		schema: &CreateTableSchema,
+		row_identity: &crate::ir::CreateTableRowIdentity,
+		if_not_exists: bool,
+		or_replace: bool,
+	) -> Result<ExecutionPlan, BindingError> {
+		let mut fields = Vec::with_capacity(schema.columns.len());
+		for column in &schema.columns {
+			let field = match &column.column_type {
+				CreateTableColumnType::Physical(data_type) => {
+					Field::new(column.name.clone(), data_type.clone(), column.nullable)
+				}
+				CreateTableColumnType::LogicalName(name) => {
+					let spec = self
+						.catalog
+						.resolve_durable_logical_type_by_name(name)
+						.await?;
+					field_with_logical_type_metadata(
+						column.name.clone(),
+						spec.physical,
+						column.nullable,
+						spec.id,
+					)
+				}
+			};
+			fields.push(field);
+		}
+
+		Ok(ExecutionPlan::CreateTable {
+			name: name.clone(),
+			schema: Arc::new(Schema::new(fields)),
+			row_identity: row_identity.clone(),
+			if_not_exists,
+			or_replace,
 		})
 	}
 

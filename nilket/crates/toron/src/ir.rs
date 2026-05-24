@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::catalog::TableRef;
 pub use crate::distributed::identity::{QueryId, StageId};
-use arrow::datatypes::{DataType, Field, SchemaRef};
+use arrow::datatypes::{DataType, Field};
 use serde::{Deserialize, Serialize};
 use wendelon_client::{
 	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinitionV1, LogicalTypePhysicalV1,
@@ -183,25 +183,47 @@ impl std::error::Error for LogicalTypeRegistryError {}
 #[derive(Debug, Clone, Copy)]
 pub struct LogicalTypeResolver<'a> {
 	registry: Option<&'a LogicalTypeRegistry>,
+	include_seed: bool,
 }
 
 impl<'a> LogicalTypeResolver<'a> {
 	pub fn seed_only() -> Self {
-		Self { registry: None }
+		Self {
+			registry: None,
+			include_seed: true,
+		}
 	}
 
 	pub fn with_registry(registry: &'a LogicalTypeRegistry) -> Self {
 		Self {
 			registry: Some(registry),
+			include_seed: true,
+		}
+	}
+
+	pub fn durable_only(registry: &'a LogicalTypeRegistry) -> Self {
+		Self {
+			registry: Some(registry),
+			include_seed: false,
 		}
 	}
 
 	pub fn spec(self, id: LogicalTypeId) -> Option<LogicalTypeSpec> {
-		seed_logical_type_spec(id).or_else(|| self.registry.and_then(|registry| registry.spec(id)))
+		if self.include_seed {
+			seed_logical_type_spec(id)
+		} else {
+			None
+		}
+		.or_else(|| self.registry.and_then(|registry| registry.spec(id)))
 	}
 
 	pub fn spec_by_name(self, name: &str) -> Option<LogicalTypeSpec> {
-		seed_logical_type_spec_by_name(name).or_else(|| {
+		if self.include_seed {
+			seed_logical_type_spec_by_name(name)
+		} else {
+			None
+		}
+		.or_else(|| {
 			self.registry
 				.and_then(|registry| registry.spec_by_name(name))
 		})
@@ -281,7 +303,36 @@ impl std::error::Error for LogicalTypeMetadataError {}
 pub fn decode_column_logical_type(
 	field: &Field,
 ) -> Result<LogicalTypeId, LogicalTypeMetadataError> {
-	decode_column_logical_type_with_resolver(field, LogicalTypeResolver::seed_only())
+	let Some(raw) = field.metadata().get(LOGICAL_TYPE_ID_METADATA_KEY) else {
+		return Ok(LogicalTypeId::NAKED);
+	};
+	let id = raw.parse::<u32>().map(LogicalTypeId).map_err(|_| {
+		LogicalTypeMetadataError::InvalidDecimal {
+			field: field.name().clone(),
+			value_preview: metadata_value_preview(raw),
+		}
+	})?;
+	if id.is_naked() {
+		return Ok(id);
+	}
+	if let Some(spec) = seed_logical_type_spec(id) {
+		if spec.physical != *field.data_type() {
+			return Err(LogicalTypeMetadataError::PhysicalMismatch {
+				field: field.name().clone(),
+				logical_type: spec.name,
+				expected: spec.physical,
+				actual: field.data_type().clone(),
+			});
+		}
+		return Ok(id);
+	}
+	if id.0 < DURABLE_LOGICAL_TYPE_MIN_ID {
+		return Err(LogicalTypeMetadataError::UnknownId {
+			field: field.name().clone(),
+			id: id.0,
+		});
+	}
+	Ok(id)
 }
 
 pub fn decode_column_logical_type_with_resolver(
@@ -359,6 +410,24 @@ pub enum QueryProfileHint {
 pub enum CreateTableRowIdentity {
 	AppendOnly,
 	PrimaryKey { column: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTableSchema {
+	pub columns: Vec<CreateTableColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTableColumn {
+	pub name: String,
+	pub nullable: bool,
+	pub column_type: CreateTableColumnType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CreateTableColumnType {
+	Physical(DataType),
+	LogicalName(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -592,7 +661,7 @@ pub enum LogicalPlan {
 	},
 	CreateTable {
 		name: TableRef,
-		schema: SchemaRef,
+		schema: CreateTableSchema,
 		row_identity: CreateTableRowIdentity,
 		if_not_exists: bool,
 		or_replace: bool,

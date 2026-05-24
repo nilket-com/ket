@@ -1067,6 +1067,13 @@ impl Catalog for RacingCatalog {
 		self.inner.resolve_table_id(table).await
 	}
 
+	async fn resolve_durable_logical_type_by_name(
+		&self,
+		name: &str,
+	) -> Result<toron::ir::LogicalTypeSpec, CatalogError> {
+		self.inner.resolve_durable_logical_type_by_name(name).await
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: toron::ir::TableId,

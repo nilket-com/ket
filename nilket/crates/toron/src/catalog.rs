@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::distributed::budget::{QueryBudget, TenantBudgetPolicy, TenantDescriptorSyncAccountant};
 use crate::error::{CatalogError, StorageError};
 use crate::ir::{
-	ColumnOrdinal, CreateTableRowIdentity, LogicalTypeRegistry, LogicalTypeResolver, TableId,
-	decode_column_logical_type_with_resolver,
+	ColumnOrdinal, CreateTableRowIdentity, LogicalTypeRegistry, LogicalTypeResolver,
+	LogicalTypeSpec, TableId, decode_column_logical_type_with_resolver,
 };
 use crate::storage::TenantId;
 use wendelon::integration::compute::SchemaIntentId;
@@ -226,6 +226,11 @@ pub trait Catalog: Send + Sync {
 	}
 
 	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError>;
+
+	async fn resolve_durable_logical_type_by_name(
+		&self,
+		name: &str,
+	) -> Result<LogicalTypeSpec, CatalogError>;
 
 	async fn invalidate_table_descriptor(
 		&self,
@@ -554,6 +559,23 @@ impl Catalog for MockCatalog {
 			})
 	}
 
+	async fn resolve_durable_logical_type_by_name(
+		&self,
+		name: &str,
+	) -> Result<LogicalTypeSpec, CatalogError> {
+		let inner = self.inner.read().expect("MockCatalog lock poisoned");
+		let Some(registry) = inner.logical_types.get(&self.tenant_id) else {
+			return Err(CatalogError::LogicalTypeNotFound {
+				name: name.to_string(),
+			});
+		};
+		LogicalTypeResolver::durable_only(registry)
+			.spec_by_name(name)
+			.ok_or_else(|| CatalogError::LogicalTypeNotFound {
+				name: name.to_string(),
+			})
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: TableId,
@@ -633,7 +655,16 @@ impl Catalog for MockCatalog {
 			mock_table_identity(name, schema.as_ref(), &row_identity, legacy_table_id)?;
 		let descriptor =
 			create_table_descriptor(name, schema.as_ref(), &row_identity, table_object_id)?;
-		let mut binding = TableBinding::from_descriptor(legacy_table_id, &descriptor)?;
+		let logical_types = inner
+			.logical_types
+			.get(&self.tenant_id)
+			.cloned()
+			.unwrap_or_default();
+		let mut binding = TableBinding::from_descriptor_with_logical_types(
+			legacy_table_id,
+			&descriptor,
+			LogicalTypeResolver::with_registry(&logical_types),
+		)?;
 		binding.fingerprint = fingerprint;
 
 		inner
@@ -1124,6 +1155,19 @@ impl WendelonDescriptorRegistry {
 			.expect("WendelonDescriptorRegistry lock poisoned");
 		let registry = state.logical_types.get(&tenant_id)?;
 		LogicalTypeResolver::with_registry(registry).spec_by_name(name)
+	}
+
+	pub fn resolve_durable_logical_type_by_name(
+		&self,
+		tenant_id: TenantId,
+		name: &str,
+	) -> Option<LogicalTypeSpec> {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let registry = state.logical_types.get(&tenant_id)?;
+		LogicalTypeResolver::durable_only(registry).spec_by_name(name)
 	}
 
 	pub fn resolve_table(
@@ -1642,6 +1686,37 @@ impl Catalog for WendelonCatalog {
 		self.registry.resolve_table_id(self.tenant_id, table)
 	}
 
+	async fn resolve_durable_logical_type_by_name(
+		&self,
+		name: &str,
+	) -> Result<LogicalTypeSpec, CatalogError> {
+		if let Some(spec) = self
+			.registry
+			.resolve_durable_logical_type_by_name(self.tenant_id, name)
+		{
+			return Ok(spec);
+		}
+
+		let Some(client) = self.descriptor_sync_client.as_ref() else {
+			return Err(CatalogError::LogicalTypeNotFound {
+				name: name.to_string(),
+			});
+		};
+		let definitions = client
+			.list_logical_type_definitions(wendelon_tenant_id(self.tenant_id))
+			.await
+			.map_err(|error| CatalogError::AdminFailed {
+				message: error.to_string(),
+			})?;
+		self.registry
+			.register_logical_types_for_tenant(self.tenant_id, definitions)?;
+		self.registry
+			.resolve_durable_logical_type_by_name(self.tenant_id, name)
+			.ok_or_else(|| CatalogError::LogicalTypeNotFound {
+				name: name.to_string(),
+			})
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: TableId,
@@ -1737,7 +1812,12 @@ impl Catalog for WendelonCatalog {
 			return Err(original_error);
 		}
 
-		let binding = TableBinding::from_descriptor(legacy_table_id, &descriptor)?;
+		let logical_types = self.registry.logical_type_registry(self.tenant_id);
+		let binding = TableBinding::from_descriptor_with_logical_types(
+			legacy_table_id,
+			&descriptor,
+			LogicalTypeResolver::with_registry(&logical_types),
+		)?;
 		self.registry.insert_descriptor(
 			self.tenant_id,
 			name.clone(),
@@ -2032,7 +2112,7 @@ mod tests {
 		DURABLE_LOGICAL_TYPE_MIN_ID, LOGICAL_TYPE_ID_METADATA_KEY, field_with_logical_type_metadata,
 	};
 	use crate::sql_planner::SqlPlanner;
-	use arrow::datatypes::{Field, Schema};
+	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::VecDeque;
 	use std::num::NonZeroU32;
 	use std::sync::atomic::Ordering;
@@ -2353,6 +2433,39 @@ mod tests {
 				.id
 				.0,
 			definition.logical_type_id
+		);
+	}
+
+	#[tokio::test]
+	async fn durable_logical_type_name_lookup_refreshes_list_before_not_found() {
+		let definition = LogicalTypeDefinitionV1 {
+			logical_type_id: DURABLE_LOGICAL_TYPE_MIN_ID,
+			name: "PersonId".to_string(),
+			physical: LogicalTypePhysicalV1::Int64,
+		};
+		let client =
+			Arc::new(FakeDescriptorSyncClient::new([]).with_logical_types([definition.clone()]));
+		let registry = Arc::new(WendelonDescriptorRegistry::default());
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::clone(&registry),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let spec = catalog
+			.resolve_durable_logical_type_by_name("PersonId")
+			.await
+			.expect("refresh logical type list before unknown");
+
+		assert_eq!(spec.id.0, definition.logical_type_id);
+		assert_eq!(spec.name, "PersonId");
+		assert_eq!(spec.physical, DataType::Int64);
+		assert!(
+			registry
+				.logical_type_registry(TenantId(7))
+				.spec_by_name("PersonId")
+				.is_some()
 		);
 	}
 

@@ -560,3 +560,155 @@ pub(crate) fn adr090_no_refinement_dropalter_or_pkfk_derivation() {
 	assert!(!planner.contains("PRIMARY KEY") || !planner.contains("LogicalTypePhysicalV1"));
 	assert!(!compute.contains("refinement"));
 }
+
+#[test]
+pub(crate) fn adr091_create_table_carries_unresolved_logical_type_names_to_bind() {
+	let ir = ir_source();
+	let logical_plan = ir
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("pub fn project_plan").next())
+		.expect("LogicalPlan enum");
+	let create_table = source_block(logical_plan, "CreateTable {");
+
+	assert!(ir.contains("pub struct CreateTableSchema"));
+	assert!(ir.contains("pub struct CreateTableColumn"));
+	assert!(ir.contains("pub enum CreateTableColumnType"));
+	assert!(ir.contains("LogicalName(String)"));
+	assert!(create_table.contains("schema: CreateTableSchema,"));
+	assert!(!create_table.contains("schema: SchemaRef,"));
+}
+
+#[test]
+pub(crate) fn adr091_execution_create_table_stays_resolved_schema() {
+	let execution = execution_source();
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+	let create_table = source_block(execution_plan, "CreateTable {");
+
+	assert!(create_table.contains("schema: SchemaRef,"));
+	assert!(!create_table.contains("CreateTableSchema"));
+	assert!(!execution.contains("CreateTableColumnType"));
+}
+
+#[test]
+pub(crate) fn adr091_sql_planner_records_custom_type_names_without_catalog_resolution() {
+	let planner = sql_planner_source();
+	let lower_type = source_block(&planner, "fn lower_create_table_data_type");
+	let lower_logical = source_block(&planner, "fn lower_create_table_logical_type_name");
+
+	assert!(lower_type.contains("SqlDataType::Custom(name, modifiers)"));
+	assert!(lower_type.contains("CreateTableColumnType::LogicalName"));
+	assert!(lower_logical.contains("ident.quote_style.is_some()"));
+	assert!(lower_logical.contains("eq_ignore_ascii_case(\"naked\")"));
+	assert!(lower_logical.contains("ident.value.clone()"));
+	assert!(!lower_type.contains("resolve_durable_logical_type_by_name"));
+	assert!(!lower_type.contains("resolve_logical_type_by_name"));
+}
+
+#[test]
+pub(crate) fn adr091_ddl_logical_type_resolution_is_registry_only_not_seed_first() {
+	let ir = ir_source();
+	let catalog = catalog_source();
+	let binder = binder_source();
+	let bind_create = source_block(&binder, "async fn bind_create_table");
+
+	assert!(ir.contains("pub fn durable_only(registry: &'a LogicalTypeRegistry) -> Self"));
+	assert!(ir.contains("include_seed: false"));
+	assert!(catalog.contains("resolve_durable_logical_type_by_name"));
+	assert!(catalog.contains("LogicalTypeResolver::durable_only(registry).spec_by_name(name)"));
+	assert!(bind_create.contains("resolve_durable_logical_type_by_name(name)"));
+	assert!(!bind_create.contains("resolve_logical_type_by_name"));
+	assert!(!bind_create.contains("logical_type_spec_by_name"));
+}
+
+#[test]
+pub(crate) fn adr091_wendelon_lookup_refreshes_logical_type_list_before_unknown() {
+	let catalog = catalog_source();
+	let impl_body = catalog
+		.split("impl Catalog for WendelonCatalog")
+		.nth(1)
+		.expect("WendelonCatalog Catalog impl");
+	let lookup = source_block(impl_body, "async fn resolve_durable_logical_type_by_name");
+	let local = lookup
+		.find("resolve_durable_logical_type_by_name(self.tenant_id, name)")
+		.expect("local durable lookup");
+	let list = lookup
+		.find("list_logical_type_definitions")
+		.expect("logical type list refresh");
+	let not_found = lookup
+		.rfind("CatalogError::LogicalTypeNotFound")
+		.expect("not found after refresh");
+
+	assert!(local < list);
+	assert!(list < not_found);
+	assert!(lookup.contains("register_logical_types_for_tenant"));
+}
+
+#[test]
+pub(crate) fn adr091_ddl_logical_column_uses_089_metadata_writer() {
+	let binder = binder_source();
+	let bind_create = source_block(&binder, "async fn bind_create_table");
+
+	assert!(bind_create.contains("CreateTableColumnType::Physical"));
+	assert!(bind_create.contains("Field::new"));
+	assert!(bind_create.contains("CreateTableColumnType::LogicalName"));
+	assert!(bind_create.contains("field_with_logical_type_metadata"));
+	assert!(!bind_create.contains(".with_metadata"));
+}
+
+#[test]
+pub(crate) fn adr091_catalog_create_rebinds_logical_descriptors_with_resolver() {
+	let catalog = catalog_source();
+	let mock_impl = catalog
+		.split("impl Catalog for MockCatalog")
+		.nth(1)
+		.and_then(|rest| rest.split("impl WendelonDescriptorRegistry").next())
+		.expect("MockCatalog impl");
+	let mock_create = source_block(mock_impl, "async fn create_table_with_outcome");
+	let wendelon_impl = catalog
+		.split("impl Catalog for WendelonCatalog")
+		.nth(1)
+		.expect("WendelonCatalog impl");
+	let wendelon_create = source_block(wendelon_impl, "async fn create_table_with_outcome");
+
+	assert!(mock_create.contains("inner\n\t\t\t.logical_types"));
+	assert!(wendelon_create.contains("logical_type_registry"));
+	for body in [mock_create, wendelon_create] {
+		assert!(body.contains("TableBinding::from_descriptor_with_logical_types"));
+		assert!(body.contains("LogicalTypeResolver::with_registry"));
+		assert!(!body.contains("TableBinding::from_descriptor(legacy_table_id, &descriptor)"));
+	}
+}
+
+#[test]
+pub(crate) fn adr091_undefined_logical_type_fails_before_descriptor_submit() {
+	let binder = binder_source();
+	let bind_create = source_block(&binder, "async fn bind_create_table");
+	let resolve = bind_create
+		.find("resolve_durable_logical_type_by_name(name)")
+		.expect("logical name resolution");
+	let execution = bind_create
+		.find("ExecutionPlan::CreateTable")
+		.expect("resolved execution plan");
+	let catalog = catalog_source();
+
+	assert!(resolve < execution);
+	assert!(error_source().contains("LogicalTypeNotFound"));
+	assert!(catalog.contains("CatalogError::LogicalTypeNotFound"));
+}
+
+#[test]
+pub(crate) fn adr091_no_cast_or_typed_ctas_authoring_yet() {
+	let planner = sql_planner_source();
+	let cast = source_block(&planner, "fn lower_cast_target_type");
+	let ctas = source_block(&planner, "fn lower_create_table_as_select");
+
+	assert!(!cast.contains("SqlDataType::Custom"));
+	assert!(ctas.contains("CTAS does not support explicit column lists"));
+	assert!(!ctas.contains("CreateTableSchema"));
+	assert!(!ctas.contains("LogicalName"));
+}

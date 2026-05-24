@@ -1,15 +1,12 @@
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-
 use crate::aggregate_kernel;
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, CreateTableRowIdentity, Expr, InsertLiteral, JoinKind, JoinStrategy,
-	LogicalPlan, ReturningProjection, ScalarValue, SortExpr, data_type_to_logical_type_physical,
+	AggregateFunction, CreateTableColumn, CreateTableColumnType, CreateTableRowIdentity,
+	CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan,
+	ReturningProjection, ScalarValue, SortExpr, data_type_to_logical_type_physical,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::DataType;
 use sqlparser::ast::{
 	Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnDef, ColumnOption,
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, Delete,
@@ -21,6 +18,8 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use wendelon::schema::{
 	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
@@ -567,7 +566,7 @@ fn parse_insert_number(text: &str, negate: bool) -> Result<InsertLiteral, Fronte
 }
 
 struct LoweredCreateTableColumn {
-	field: Field,
+	column: CreateTableColumn,
 	primary_key: bool,
 }
 
@@ -585,11 +584,15 @@ fn lower_create_table_column(
 		)));
 	}
 
-	let data_type = lower_create_table_data_type(&column.data_type)?;
+	let column_type = lower_create_table_data_type(&column.data_type)?;
 	let (nullable, primary_key) = lower_create_table_column_options(&column.options)?;
 
 	Ok(LoweredCreateTableColumn {
-		field: Field::new(column_name.clone(), data_type, nullable),
+		column: CreateTableColumn {
+			name: column_name.clone(),
+			nullable,
+			column_type,
+		},
 		primary_key,
 	})
 }
@@ -693,26 +696,37 @@ fn lower_create_table_column_options(
 	Ok((nullable.unwrap_or(true), primary_key))
 }
 
-fn lower_create_table_data_type(data_type: &SqlDataType) -> Result<DataType, FrontendError> {
+fn lower_create_table_data_type(
+	data_type: &SqlDataType,
+) -> Result<CreateTableColumnType, FrontendError> {
 	match data_type {
 		SqlDataType::Int(_)
 		| SqlDataType::Integer(_)
 		| SqlDataType::Int4(_)
-		| SqlDataType::Int32 => Ok(DataType::Int32),
-		SqlDataType::BigInt(_) | SqlDataType::Int8(_) | SqlDataType::Int64 => Ok(DataType::Int64),
-		SqlDataType::Real | SqlDataType::Float4 | SqlDataType::Float32 => Ok(DataType::Float32),
+		| SqlDataType::Int32 => Ok(CreateTableColumnType::Physical(DataType::Int32)),
+		SqlDataType::BigInt(_) | SqlDataType::Int8(_) | SqlDataType::Int64 => {
+			Ok(CreateTableColumnType::Physical(DataType::Int64))
+		}
+		SqlDataType::Real | SqlDataType::Float4 | SqlDataType::Float32 => {
+			Ok(CreateTableColumnType::Physical(DataType::Float32))
+		}
 		SqlDataType::Double(_)
 		| SqlDataType::DoublePrecision
 		| SqlDataType::Float8
-		| SqlDataType::Float64 => Ok(DataType::Float64),
+		| SqlDataType::Float64 => Ok(CreateTableColumnType::Physical(DataType::Float64)),
 		SqlDataType::Text
 		| SqlDataType::String(_)
 		| SqlDataType::Varchar(_)
 		| SqlDataType::Char(_)
 		| SqlDataType::Character(_)
 		| SqlDataType::CharVarying(_)
-		| SqlDataType::CharacterVarying(_) => Ok(DataType::Utf8),
-		SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Boolean),
+		| SqlDataType::CharacterVarying(_) => Ok(CreateTableColumnType::Physical(DataType::Utf8)),
+		SqlDataType::Boolean | SqlDataType::Bool => {
+			Ok(CreateTableColumnType::Physical(DataType::Boolean))
+		}
+		SqlDataType::Custom(name, modifiers) => Ok(CreateTableColumnType::LogicalName(
+			lower_create_table_logical_type_name(name, modifiers)?,
+		)),
 		SqlDataType::Decimal(_) | SqlDataType::Numeric(_) => {
 			Err(unsupported("unsupported CREATE TABLE column type: DECIMAL"))
 		}
@@ -725,10 +739,47 @@ fn lower_create_table_data_type(data_type: &SqlDataType) -> Result<DataType, Fro
 	}
 }
 
-fn check_unique_column_names(fields: &[Field]) -> Result<(), FrontendError> {
+fn lower_create_table_logical_type_name(
+	name: &ObjectName,
+	modifiers: &[String],
+) -> Result<String, FrontendError> {
+	if !modifiers.is_empty() {
+		return Err(unsupported(
+			"CREATE TABLE logical type names do not support modifiers",
+		));
+	}
+	let [part] = name.0.as_slice() else {
+		return Err(unsupported(
+			"CREATE TABLE logical type names support one-part names only",
+		));
+	};
+	let ident = object_name_part_ident(part, "CREATE TABLE logical type name")?;
+	if ident.quote_style.is_some() {
+		return Err(unsupported(
+			"CREATE TABLE logical type names must be unquoted ASCII identifiers",
+		));
+	}
+	if ident.value.eq_ignore_ascii_case("naked") {
+		return Err(unsupported(
+			"CREATE TABLE logical type name cannot be the naked sentinel",
+		));
+	}
+	if ident
+		.value
+		.bytes()
+		.any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+	{
+		return Err(unsupported(
+			"CREATE TABLE logical type names must be unquoted ASCII identifiers",
+		));
+	}
+	Ok(ident.value.clone())
+}
+
+fn check_unique_column_names(columns: &[CreateTableColumn]) -> Result<(), FrontendError> {
 	let mut seen = HashSet::new();
-	for field in fields {
-		if !seen.insert(field.name().as_str()) {
+	for column in columns {
+		if !seen.insert(column.name.as_str()) {
 			return Err(unsupported("CREATE TABLE column names must be unique"));
 		}
 	}
@@ -739,8 +790,8 @@ fn lower_create_table_schema_and_identity(
 	columns: &[ColumnDef],
 	constraints: &[TableConstraint],
 	primary_key: Option<&SqlExpr>,
-) -> Result<(Arc<Schema>, CreateTableRowIdentity), FrontendError> {
-	let mut fields = Vec::with_capacity(columns.len());
+) -> Result<(CreateTableSchema, CreateTableRowIdentity), FrontendError> {
+	let mut lowered_columns = Vec::with_capacity(columns.len());
 	let mut primary_key_declarations = Vec::new();
 
 	for column in columns {
@@ -748,7 +799,7 @@ fn lower_create_table_schema_and_identity(
 		if lowered.primary_key {
 			primary_key_declarations.push(column.name.value.clone());
 		}
-		fields.push(lowered.field);
+		lowered_columns.push(lowered.column);
 	}
 
 	for constraint in constraints {
@@ -800,22 +851,30 @@ fn lower_create_table_schema_and_identity(
 		primary_key_declarations.push(lower_create_table_primary_key_expr(primary_key)?);
 	}
 
-	check_unique_column_names(&fields)?;
-	let schema = Arc::new(Schema::new(fields));
+	check_unique_column_names(&lowered_columns)?;
+	let schema = CreateTableSchema {
+		columns: lowered_columns,
+	};
 
 	let row_identity = match primary_key_declarations.as_slice() {
 		[] => CreateTableRowIdentity::AppendOnly,
 		[column] => {
-			let ordinal = schema.index_of(column).map_err(|_| {
-				unsupported(format!(
-					"CREATE TABLE PRIMARY KEY column does not exist: {column}"
-				))
-			})?;
-			let field = schema.field(ordinal);
-			if field.is_nullable() {
+			let (_, primary_key_column) = schema
+				.columns
+				.iter()
+				.enumerate()
+				.find(|(_, candidate)| candidate.name == *column)
+				.ok_or_else(|| {
+					unsupported(format!(
+						"CREATE TABLE PRIMARY KEY column does not exist: {column}"
+					))
+				})?;
+			if primary_key_column.nullable {
 				return Err(unsupported("PRIMARY KEY column must be declared NOT NULL"));
 			}
-			if !primary_key_type_is_supported(field.data_type()) {
+			if let CreateTableColumnType::Physical(data_type) = &primary_key_column.column_type
+				&& !primary_key_type_is_supported(data_type)
+			{
 				return Err(unsupported(
 					"unsupported CREATE TABLE PRIMARY KEY column type",
 				));

@@ -976,6 +976,7 @@ fn catalog_error_class(error: &CatalogError) -> &'static str {
 		CatalogError::TableNotFound { .. } => "table_not_found",
 		CatalogError::SchemaNotFound { .. } => "schema_not_found",
 		CatalogError::TableAlreadyExists { .. } => "table_already_exists",
+		CatalogError::LogicalTypeNotFound { .. } => "logical_type_not_found",
 		CatalogError::SchemaMismatch { .. } => "schema_mismatch",
 		CatalogError::AdminUnavailable { .. } => "admin_unavailable",
 		CatalogError::AdminFailed { .. } => "admin_failed",

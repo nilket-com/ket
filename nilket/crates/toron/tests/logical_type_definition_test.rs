@@ -214,11 +214,7 @@ fn static_seed_still_resolves_for_rune_and_tests() {
 }
 
 #[test]
-fn sql_column_and_cast_use_sites_still_reject() {
-	assert_frontend_error(
-		"CREATE TABLE orders (customer_id CustomerId NOT NULL)",
-		"unsupported CREATE TABLE column type",
-	);
+fn sql_cast_use_site_still_rejects() {
 	assert_frontend_error(
 		"SELECT CAST(customer_id AS CustomerId) FROM orders",
 		"unsupported CAST target type",

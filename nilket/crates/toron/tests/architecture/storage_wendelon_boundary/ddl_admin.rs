@@ -80,10 +80,11 @@ pub(crate) fn adr029_create_table_ir_surface_is_narrow() {
 	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
 
-	assert!(logical.contains("CreateTable {\n\t\tname: TableRef,\n\t\tschema: SchemaRef,"));
+	assert!(logical.contains("pub struct CreateTableSchema"));
+	assert!(logical.contains("pub enum CreateTableColumnType"));
+	assert!(logical.contains("CreateTable {\n\t\tname: TableRef,\n\t\tschema: CreateTableSchema,"));
 	assert!(execution.contains("CreateTable {\n\t\tname: TableRef,\n\t\tschema: SchemaRef,"));
 	assert!(!logical.contains("ColumnSpec"));
-	assert!(!logical.contains("CreateTableColumn"));
 	assert!(!execution.contains("ColumnSpec"));
 	assert!(!execution.contains("CreateTableColumn"));
 }
@@ -115,12 +116,14 @@ pub(crate) fn adr029_create_table_type_lattice_is_ddl_specific() {
 		.1;
 
 	for marker in [
-		"Ok(DataType::Int32)",
-		"Ok(DataType::Int64)",
-		"Ok(DataType::Float32)",
-		"Ok(DataType::Float64)",
-		"Ok(DataType::Utf8)",
-		"Ok(DataType::Boolean)",
+		"CreateTableColumnType::Physical(DataType::Int32)",
+		"CreateTableColumnType::Physical(DataType::Int64)",
+		"CreateTableColumnType::Physical(DataType::Float32)",
+		"CreateTableColumnType::Physical(DataType::Float64)",
+		"CreateTableColumnType::Physical(DataType::Utf8)",
+		"CreateTableColumnType::Physical(DataType::Boolean)",
+		"SqlDataType::Custom(name, modifiers)",
+		"CreateTableColumnType::LogicalName",
 		"SqlDataType::Float(_)",
 		"SqlDataType::Decimal(_)",
 	] {
@@ -1210,7 +1213,7 @@ pub(crate) fn adr061_ctas_ir_carries_if_not_exists() {
 		assert!(ctas.contains("if_not_exists: bool,"));
 	}
 	assert!(planner.contains("if_not_exists: *if_not_exists"));
-	assert!(binder.contains("if_not_exists: *if_not_exists"));
+	assert!(binder.contains("*if_not_exists"));
 	assert!(binder.contains("if_not_exists,"));
 }
 
