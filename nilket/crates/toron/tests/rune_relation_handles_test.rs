@@ -1042,6 +1042,181 @@ async fn rune_in_list_mismatch_is_binding_error() {
 	}
 }
 
+#[tokio::test]
+async fn rune_nominal_turbofish_binds_vs_literal() {
+	bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("id").as_logical_type::<CustomerId>().eq(lit_i64(1)))
+        }
+    "#,
+	)
+	.await
+	.expect("logical column vs naked literal should bind");
+}
+
+#[tokio::test]
+async fn rune_nominal_same_identity_binds() {
+	bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").as_logical_type::<CustomerId>()
+                    .eq(col("id").as_logical_type::<CustomerId>())
+            )
+        }
+    "#,
+	)
+	.await
+	.expect("same nominal identity should bind");
+}
+
+#[tokio::test]
+async fn rune_nominal_different_identity_rejects() {
+	let error = bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").as_logical_type::<CustomerId>()
+                    .eq(col("id").as_logical_type::<ProductId>())
+            )
+        }
+    "#,
+	)
+	.await
+	.expect_err("different nominal identities must reject");
+
+	assert_nominal_mismatch(error, "CustomerId", "ProductId", "Int64");
+}
+
+#[tokio::test]
+async fn rune_nominal_one_side_oops_rejects() {
+	let error = bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").as_logical_type::<CustomerId>().eq(col("id"))
+            )
+        }
+    "#,
+	)
+	.await
+	.expect_err("logical vs naked non-literal must reject");
+
+	assert_nominal_mismatch(error, "CustomerId", "naked", "Int64");
+}
+
+#[tokio::test]
+async fn rune_nominal_ascription_physical_mismatch_rejects() {
+	let error = bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("amount").as_logical_type::<CustomerId>().eq(lit_i64(1))
+            )
+        }
+    "#,
+	)
+	.await
+	.expect_err("logical ascription must match the physical type");
+
+	match error {
+		BindingError::TypeMismatch { message } => {
+			assert!(message.contains("CustomerId expects Int64"), "{message}");
+			assert!(message.contains("got Int32"), "{message}");
+		}
+		other => panic!("expected logical ascription physical mismatch, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn rune_nominal_both_side_cast_binds() {
+	bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").as_logical_type::<CustomerId>().cast(type_i64())
+                    .eq(col("id").as_logical_type::<ProductId>().cast(type_i64()))
+            )
+        }
+    "#,
+	)
+	.await
+	.expect("explicit casts on both sides erase nominal identity");
+}
+
+#[tokio::test]
+async fn rune_nominal_one_side_cast_still_rejects() {
+	let error = bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").as_logical_type::<CustomerId>().cast(type_i64())
+                    .eq(col("id").as_logical_type::<ProductId>())
+            )
+        }
+    "#,
+	)
+	.await
+	.expect_err("one-side cast must not bypass nominal mismatch");
+
+	assert_nominal_mismatch(error, "naked", "ProductId", "Int64");
+}
+
+#[tokio::test]
+async fn rune_nominal_in_list_same_identity_binds() {
+	bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").as_logical_type::<CustomerId>().in_list([
+                    lit_i64(1).as_logical_type::<CustomerId>(),
+                    lit_i64(2).as_logical_type::<CustomerId>(),
+                ])
+            )
+        }
+    "#,
+	)
+	.await
+	.expect("same nominal identity IN list should bind");
+}
+
+#[tokio::test]
+async fn rune_nominal_in_list_different_identity_rejects() {
+	let error = bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").as_logical_type::<CustomerId>().in_list([
+                    lit_i64(1).as_logical_type::<ProductId>(),
+                ])
+            )
+        }
+    "#,
+	)
+	.await
+	.expect_err("different nominal identity in IN list must reject");
+
+	assert_nominal_mismatch(error, "CustomerId", "ProductId", "Int64");
+}
+
+#[tokio::test]
+async fn rune_nominal_ascribed_literal_identity_is_preserved() {
+	let error = bind_rune_nominal_filter(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                lit_i64(1).as_logical_type::<CustomerId>().eq(col("price"))
+            )
+        }
+    "#,
+	)
+	.await
+	.expect_err("implicit literal coercion must preserve explicit logical identity");
+
+	assert_nominal_mismatch(error, "CustomerId", "naked", "Float64");
+}
+
 async fn predicate_operator_compound_filter_plan() -> LogicalPlan {
 	rune_plan(
 		r#"
@@ -1071,6 +1246,31 @@ async fn sql_group_by_alias_outer_sum_plan() -> LogicalPlan {
 	)
 	.await
 	.expect("Rune aggregate over SQL group-by alias")
+}
+
+async fn bind_rune_nominal_filter(script: &str) -> Result<ExecutionPlan, BindingError> {
+	let logical = rune_plan(script).await.expect("Rune nominal plan");
+	bind(&logical, &catalog(), &PlannerConfig::default()).await
+}
+
+fn assert_nominal_mismatch(
+	error: BindingError,
+	expected_left: &str,
+	expected_right: &str,
+	expected_physical: &str,
+) {
+	match error {
+		BindingError::NominalTypeMismatch {
+			left,
+			right,
+			physical,
+		} => {
+			assert_eq!(left, expected_left);
+			assert_eq!(right, expected_right);
+			assert_eq!(physical, expected_physical);
+		}
+		other => panic!("expected nominal type mismatch, got {other:?}"),
+	}
 }
 
 async fn run_logical(logical: &LogicalPlan) -> Vec<RecordBatch> {

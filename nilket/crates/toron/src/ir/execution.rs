@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::TableRef;
 pub use crate::distributed::identity::QueryId;
-use crate::ir::{AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, ScalarValue};
+use crate::ir::{
+	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId, ScalarValue,
+};
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
 use wendelon::schema::{PhysicalDescriptorFingerprint, STORAGE_ROW_KEY_ID_COLUMN, TableObjectId};
@@ -99,6 +101,7 @@ pub enum BoundExprNode {
 pub struct BoundExprProgram {
 	pub nodes: Vec<BoundExprNode>,
 	pub node_types: Vec<DataType>,
+	pub node_logical_types: Vec<LogicalTypeId>,
 	pub literals: Vec<ScalarValue>,
 	pub roots: Vec<BoundExprId>,
 }
@@ -114,6 +117,10 @@ pub enum BoundExprProgramError {
 	NodeTypeArityMismatch {
 		nodes: usize,
 		node_types: usize,
+	},
+	NodeLogicalTypeArityMismatch {
+		nodes: usize,
+		node_logical_types: usize,
 	},
 	ChildOutOfBounds {
 		parent: BoundExprId,
@@ -141,6 +148,7 @@ pub enum BoundExprProgramError {
 pub struct BoundExprProgramBuilder {
 	nodes: Vec<BoundExprNode>,
 	node_types: Vec<DataType>,
+	node_logical_types: Vec<LogicalTypeId>,
 	literals: Vec<ScalarValue>,
 	roots: Vec<BoundExprId>,
 }
@@ -451,6 +459,18 @@ impl BoundExprProgramBuilder {
 		self.node_types.get(id.0 as usize)
 	}
 
+	pub fn node_logical_type(&self, id: BoundExprId) -> Option<LogicalTypeId> {
+		self.node_logical_types.get(id.0 as usize).copied()
+	}
+
+	pub fn set_node_logical_type(&mut self, id: BoundExprId, logical_type: LogicalTypeId) -> bool {
+		let Some(slot) = self.node_logical_types.get_mut(id.0 as usize) else {
+			return false;
+		};
+		*slot = logical_type;
+		true
+	}
+
 	pub fn literal(&self, id: BoundExprId) -> Option<&ScalarValue> {
 		let BoundExprNode::Literal(literal) = self.nodes.get(id.0 as usize)? else {
 			return None;
@@ -479,6 +499,7 @@ impl BoundExprProgramBuilder {
 		BoundExprProgram {
 			nodes: self.nodes,
 			node_types: self.node_types,
+			node_logical_types: self.node_logical_types,
 			literals: self.literals,
 			roots: self.roots,
 		}
@@ -488,6 +509,7 @@ impl BoundExprProgramBuilder {
 		let id = BoundExprId(u32::try_from(self.nodes.len()).expect("bound expression overflow"));
 		self.nodes.push(node);
 		self.node_types.push(output_type);
+		self.node_logical_types.push(LogicalTypeId::NAKED);
 		id
 	}
 
@@ -542,6 +564,10 @@ impl BoundExprProgram {
 
 	pub fn node_type(&self, id: BoundExprId) -> Option<&DataType> {
 		self.node_types.get(id.0 as usize)
+	}
+
+	pub fn node_logical_type(&self, id: BoundExprId) -> Option<LogicalTypeId> {
+		self.node_logical_types.get(id.0 as usize).copied()
 	}
 
 	pub fn root_nullable(&self, root_index: usize) -> Option<bool> {
@@ -601,6 +627,12 @@ impl BoundExprProgram {
 			return Err(BoundExprProgramError::NodeTypeArityMismatch {
 				nodes: self.nodes.len(),
 				node_types: self.node_types.len(),
+			});
+		}
+		if self.nodes.len() != self.node_logical_types.len() {
+			return Err(BoundExprProgramError::NodeLogicalTypeArityMismatch {
+				nodes: self.nodes.len(),
+				node_logical_types: self.node_logical_types.len(),
 			});
 		}
 		for (idx, node) in self.nodes.iter().enumerate() {
@@ -808,6 +840,7 @@ mod tests {
 				input: BoundExprId(0),
 			}],
 			node_types: vec![DataType::Boolean],
+			node_logical_types: vec![LogicalTypeId::NAKED],
 			literals: Vec::new(),
 			roots: vec![BoundExprId(0)],
 		};

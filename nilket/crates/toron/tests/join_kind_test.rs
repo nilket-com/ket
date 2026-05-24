@@ -4,7 +4,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use toron::binder::{PlannerConfig, bind, join_schema};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::error::BindingError;
-use toron::ir::{Expr, JoinKind, JoinStrategy, LogicalPlan, TableId};
+use toron::ir::{
+	CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId,
+	PRODUCT_ID_LOGICAL_TYPE, TableId,
+};
 use toron::sql_planner::SqlPlanner;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -117,6 +120,34 @@ async fn bind_join_promotes_outer_and_semi_anti_schemas() {
 	}
 }
 
+#[tokio::test]
+async fn pure_join_gate_rejects_nominal_mismatch() {
+	let err = bind(
+		&nominal_join_plan(CUSTOMER_ID_LOGICAL_TYPE, PRODUCT_ID_LOGICAL_TYPE),
+		&catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("mismatched logical join keys must reject");
+
+	assert!(matches!(
+		err,
+		BindingError::NominalTypeMismatch { left, right, physical }
+			if left == "CustomerId" && right == "ProductId" && physical == "Int64"
+	));
+}
+
+#[tokio::test]
+async fn pure_join_gate_accepts_nominal_match() {
+	bind(
+		&nominal_join_plan(CUSTOMER_ID_LOGICAL_TYPE, CUSTOMER_ID_LOGICAL_TYPE),
+		&catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("matching logical join keys should bind");
+}
+
 #[test]
 fn sql_outer_semi_anti_joins_lower_to_join_kind() {
 	for (sql, expected) in [
@@ -174,6 +205,38 @@ fn planned_join_kind(sql: &str) -> JoinKind {
 	match SqlPlanner::new().plan(sql).expect("plan sql") {
 		LogicalPlan::Join { kind, .. } => kind,
 		other => panic!("expected join plan, got {other:?}"),
+	}
+}
+
+fn nominal_join_plan(left_logical: LogicalTypeId, right_logical: LogicalTypeId) -> LogicalPlan {
+	let logical_key = |table: &str, logical_type| Expr::LogicalAscription {
+		expr: Box::new(Expr::qualified_column(TableRef::new(table), "id")),
+		logical_type,
+	};
+
+	LogicalPlan::Join {
+		left: Box::new(LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("left_t"),
+				projection: None,
+			}),
+			partition_count: 2,
+			key: vec![Expr::qualified_column(TableRef::new("left_t"), "id")],
+		}),
+		right: Box::new(LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("right_t"),
+				projection: None,
+			}),
+			partition_count: 2,
+			key: vec![Expr::qualified_column(TableRef::new("right_t"), "id")],
+		}),
+		kind: JoinKind::Inner,
+		on: vec![(
+			logical_key("left_t", left_logical),
+			logical_key("right_t", right_logical),
+		)],
+		strategy: JoinStrategy::HashPartitioned,
 	}
 }
 

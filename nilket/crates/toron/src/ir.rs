@@ -9,6 +9,54 @@ pub mod execution;
 pub use execution::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LogicalTypeId(pub u32);
+
+impl LogicalTypeId {
+	pub const NAKED: Self = Self(0);
+
+	pub fn is_naked(self) -> bool {
+		self == Self::NAKED
+	}
+}
+
+pub const CUSTOMER_ID_LOGICAL_TYPE: LogicalTypeId = LogicalTypeId(1);
+pub const PRODUCT_ID_LOGICAL_TYPE: LogicalTypeId = LogicalTypeId(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalTypeSpec {
+	pub id: LogicalTypeId,
+	pub name: &'static str,
+	pub physical: DataType,
+}
+
+pub fn logical_type_spec(id: LogicalTypeId) -> Option<LogicalTypeSpec> {
+	match id {
+		LogicalTypeId::NAKED => Some(LogicalTypeSpec {
+			id,
+			name: "naked",
+			physical: DataType::Null,
+		}),
+		CUSTOMER_ID_LOGICAL_TYPE => Some(LogicalTypeSpec {
+			id,
+			name: "CustomerId",
+			physical: DataType::Int64,
+		}),
+		PRODUCT_ID_LOGICAL_TYPE => Some(LogicalTypeSpec {
+			id,
+			name: "ProductId",
+			physical: DataType::Int64,
+		}),
+		_ => None,
+	}
+}
+
+pub fn logical_type_name(id: LogicalTypeId) -> String {
+	logical_type_spec(id)
+		.map(|spec| spec.name.to_string())
+		.unwrap_or_else(|| format!("LogicalTypeId({})", id.0))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -75,6 +123,10 @@ impl ColumnRef {
 pub enum Expr {
 	Column(ColumnRef),
 	Literal(ScalarValue),
+	LogicalAscription {
+		expr: Box<Expr>,
+		logical_type: LogicalTypeId,
+	},
 	Cast(Box<Expr>, DataType),
 	TryCast(Box<Expr>, DataType),
 	Add(Box<Expr>, Box<Expr>),
@@ -122,6 +174,7 @@ impl Expr {
 	pub fn is_pbc_pushdown_eligible(&self) -> bool {
 		match self {
 			Self::Column(_) | Self::Literal(_) => true,
+			Self::LogicalAscription { expr, .. } => expr.is_pbc_pushdown_eligible(),
 			Self::Cast(_, _)
 			| Self::TryCast(_, _)
 			| Self::Add(_, _)

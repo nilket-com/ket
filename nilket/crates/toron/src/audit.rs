@@ -964,6 +964,7 @@ fn binding_error_class(error: &BindingError) -> &'static str {
 		BindingError::BroadcastBuildSidePlacement => "broadcast_build_side_placement",
 		BindingError::BroadcastCapExceededAtBind { .. } => "broadcast_cap_exceeded",
 		BindingError::TypeMismatch { .. } => "type_mismatch",
+		BindingError::NominalTypeMismatch { .. } => "nominal_type_mismatch",
 		BindingError::ExperimentalKernel { .. } => "experimental_kernel",
 		BindingError::UnresolvedTable { .. } => "unresolved_table",
 		BindingError::UnsupportedExpression { .. } => "unsupported_expression",

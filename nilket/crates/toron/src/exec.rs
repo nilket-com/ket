@@ -845,6 +845,7 @@ impl Executor {
 				let arr = self.evaluate_expr(inner, batch)?;
 				evaluate_try_cast(&arr, target)
 			}
+			Expr::LogicalAscription { expr, .. } => self.evaluate_expr(expr, batch),
 			Expr::Add(left, right) => {
 				let left_arr = self.evaluate_expr(left, batch)?;
 				let right_arr = self.evaluate_expr(right, batch)?;

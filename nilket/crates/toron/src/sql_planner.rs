@@ -3257,6 +3257,11 @@ fn sort_needs_hidden_projection(order_by: &[SortExpr]) -> bool {
 
 fn sort_key_is_direct_output_reference(expr: &Expr) -> bool {
 	matches!(expr, Expr::Column(_) | Expr::Literal(_))
+		|| matches!(
+			expr,
+			Expr::LogicalAscription { expr, .. }
+				if sort_key_is_direct_output_reference(expr)
+		)
 }
 
 fn validate_hidden_sort_key_refs(
@@ -3273,6 +3278,9 @@ fn validate_hidden_sort_key_refs(
 			Ok(())
 		}
 		Expr::Literal(_) => Ok(()),
+		Expr::LogicalAscription { expr: inner, .. } => {
+			validate_hidden_sort_key_refs(inner, visible_names)
+		}
 		Expr::Cast(inner, _) | Expr::TryCast(inner, _) => {
 			validate_hidden_sort_key_refs(inner, visible_names)
 		}
@@ -3793,6 +3801,11 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			negated.hash(state);
 			case_insensitive.hash(state);
 		}
+		Expr::LogicalAscription { expr, logical_type } => {
+			22u8.hash(state);
+			logical_type.hash(state);
+			hash_expr_structural(expr, state);
+		}
 	}
 }
 
@@ -3805,6 +3818,16 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 			expr_structural_eq(left_inner, right_inner)
 				&& data_type_structural_eq(left_type, right_type)
 		}
+		(
+			Expr::LogicalAscription {
+				expr: left_inner,
+				logical_type: left_logical_type,
+			},
+			Expr::LogicalAscription {
+				expr: right_inner,
+				logical_type: right_logical_type,
+			},
+		) => left_logical_type == right_logical_type && expr_structural_eq(left_inner, right_inner),
 		(Expr::Add(left_left, left_right), Expr::Add(right_left, right_right))
 		| (Expr::Sub(left_left, left_right), Expr::Sub(right_left, right_right))
 		| (Expr::Mul(left_left, left_right), Expr::Mul(right_left, right_right))
@@ -4107,6 +4130,7 @@ fn select_expr_is_computed(expr: &SqlExpr) -> bool {
 fn logical_expr_output_name(expr: &Expr, idx: usize) -> String {
 	match expr {
 		Expr::Column(column) => column.name.0.clone(),
+		Expr::LogicalAscription { expr, .. } => logical_expr_output_name(expr, idx),
 		_ => format!("col_{idx}"),
 	}
 }
@@ -4115,7 +4139,8 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 	match expr {
 		Expr::Column(column) => column.qualifier.is_some(),
 		Expr::Literal(_) => false,
-		Expr::Cast(inner, _)
+		Expr::LogicalAscription { expr: inner, .. }
+		| Expr::Cast(inner, _)
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)

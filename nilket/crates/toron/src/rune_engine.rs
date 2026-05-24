@@ -1,10 +1,13 @@
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
-use crate::ir::{AggregateFunction, Expr, LogicalPlan, ScalarValue};
+use crate::ir::{
+	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, LogicalPlan, LogicalTypeId,
+	PRODUCT_ID_LOGICAL_TYPE, ScalarValue,
+};
 use crate::sql_planner::SqlPlanner;
 use arrow::datatypes::DataType;
 use rune::alloc::limit;
-use rune::runtime::{VmResult, budget};
+use rune::runtime::{TypeHash, VmResult, budget};
 use rune::{Any, Context, Diagnostics, Module, Source, Sources, Unit, Vm};
 use std::sync::Arc;
 use std::time::Duration;
@@ -183,6 +186,12 @@ pub struct RuneNamedExpr {
 pub struct RuneDataType {
 	pub(crate) data_type: DataType,
 }
+
+#[derive(Any, Debug, Clone, Copy)]
+pub enum CustomerId {}
+
+#[derive(Any, Debug, Clone, Copy)]
+pub enum ProductId {}
 
 impl RuneDataFrame {
 	pub fn new(table: String) -> Self {
@@ -521,6 +530,23 @@ impl RuneExpr {
 		}
 	}
 
+	fn logical_ascription(self, logical_type: LogicalTypeId) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::LogicalAscription {
+				expr: Box::new(self.expr),
+				logical_type,
+			},
+		}
+	}
+
+	pub fn as_customer_id(self) -> RuneExpr {
+		self.logical_ascription(CUSTOMER_ID_LOGICAL_TYPE)
+	}
+
+	pub fn as_product_id(self) -> RuneExpr {
+		self.logical_ascription(PRODUCT_ID_LOGICAL_TYPE)
+	}
+
 	pub fn in_list(self, list: Vec<RuneExpr>) -> VmResult<RuneExpr> {
 		build_in_list(self.expr, list, false)
 	}
@@ -552,6 +578,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.ty::<RuneExpr>()?;
 	m.ty::<RuneNamedExpr>()?;
 	m.ty::<RuneDataType>()?;
+	m.ty::<CustomerId>()?;
+	m.ty::<ProductId>()?;
 	m.ty::<RuneAggr>()?;
 	m.ty::<ToronContext>()?;
 
@@ -604,6 +632,14 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("div", RuneExpr::div)?;
 	m.associated_function("cast", RuneExpr::cast)?;
 	m.associated_function("try_cast", RuneExpr::try_cast)?;
+	m.associated_function(
+		rune::Params::new("as_logical_type", [CustomerId::HASH]),
+		RuneExpr::as_customer_id,
+	)?;
+	m.associated_function(
+		rune::Params::new("as_logical_type", [ProductId::HASH]),
+		RuneExpr::as_product_id,
+	)?;
 	m.associated_function("in_list", RuneExpr::in_list)?;
 	m.associated_function("not_in_list", RuneExpr::not_in_list)?;
 

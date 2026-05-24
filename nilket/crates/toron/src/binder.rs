@@ -14,8 +14,9 @@ use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
 	ColumnOrdinal, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral,
-	JoinKind, JoinStrategy, LogicalPlan, PbcProgram, QueryProfileHint, ResolvedColumn,
-	ReturningProjection, ScalarValue, SortExpr, arithmetic_output_type, schema_for_exprs,
+	JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId, PbcProgram, QueryProfileHint,
+	ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, arithmetic_output_type,
+	logical_type_name, logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -561,8 +562,8 @@ impl<'a> Binder<'a> {
 			let (left_key, right_key) =
 				bind_join_key_pair(left_expr, right_expr, &left_scope, &right_scope)?;
 			validate_join_key_types(&left_key, &right_key)?;
-			left_keys.push(left_key.ordinal);
-			right_keys.push(right_key.ordinal);
+			left_keys.push(left_key.column.ordinal);
+			right_keys.push(right_key.column.ordinal);
 		}
 
 		validate_strategy_shape(
@@ -659,7 +660,8 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 			})
 		}
 		Expr::Column(_) | Expr::Literal(_) => Ok(()),
-		Expr::Cast(inner, _)
+		Expr::LogicalAscription { expr: inner, .. }
+		| Expr::Cast(inner, _)
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
@@ -1425,6 +1427,9 @@ fn clone_bound_subgraph(
 			builder.append_time_bucket(*interval, input, output_type)
 		}
 	};
+	if let Some(logical_type) = source.node_logical_type(id) {
+		builder.set_node_logical_type(cloned, logical_type);
+	}
 	remap.insert(id, cloned);
 	Some(cloned)
 }
@@ -1846,26 +1851,66 @@ fn bind_join_key_pair(
 	right_expr: &Expr,
 	left_scope: &Scope,
 	right_scope: &Scope,
-) -> Result<(ResolvedColumn, ResolvedColumn), BindingError> {
-	let (left_ref, right_ref) = match (left_expr, right_expr) {
-		(Expr::Column(left_ref), Expr::Column(right_ref)) => (left_ref, right_ref),
+) -> Result<(ResolvedJoinKey, ResolvedJoinKey), BindingError> {
+	let (left_ref, left_logical_type) = join_key_column_ref(left_expr)?;
+	let (right_ref, right_logical_type) = join_key_column_ref(right_expr)?;
+
+	match (left_expr, right_expr) {
 		(Expr::Eq(_, _), _) | (_, Expr::Eq(_, _)) => {
 			return Err(BindingError::JoinPredicateNotEqui);
 		}
-		_ => return Err(BindingError::JoinComputedKeyUnsupported),
-	};
+		_ => {}
+	}
 
 	match (
 		resolve_join_column_across(left_ref, left_scope, right_scope)?,
 		resolve_join_column_across(right_ref, left_scope, right_scope)?,
 	) {
-		(JoinColumnResolution::Left(left), JoinColumnResolution::Right(right)) => Ok((left, right)),
-		(JoinColumnResolution::Right(right), JoinColumnResolution::Left(left)) => Ok((left, right)),
+		(JoinColumnResolution::Left(left), JoinColumnResolution::Right(right)) => Ok((
+			resolved_join_key(left, left_logical_type)?,
+			resolved_join_key(right, right_logical_type)?,
+		)),
+		(JoinColumnResolution::Right(right), JoinColumnResolution::Left(left)) => Ok((
+			resolved_join_key(left, right_logical_type)?,
+			resolved_join_key(right, left_logical_type)?,
+		)),
 		(JoinColumnResolution::Left(_), JoinColumnResolution::Left(_))
 		| (JoinColumnResolution::Right(_), JoinColumnResolution::Right(_)) => {
 			Err(BindingError::JoinComputedKeyUnsupported)
 		}
 	}
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedJoinKey {
+	column: ResolvedColumn,
+	logical_type: LogicalTypeId,
+}
+
+fn join_key_column_ref(
+	expr: &Expr,
+) -> Result<(&crate::ir::ColumnRef, LogicalTypeId), BindingError> {
+	match expr {
+		Expr::Column(column_ref) => Ok((column_ref, LogicalTypeId::NAKED)),
+		Expr::LogicalAscription { expr, logical_type } => match expr.as_ref() {
+			Expr::Column(column_ref) => Ok((column_ref, *logical_type)),
+			Expr::Eq(_, _) => Err(BindingError::JoinPredicateNotEqui),
+			_ => Err(BindingError::JoinComputedKeyUnsupported),
+		},
+		Expr::Eq(_, _) => Err(BindingError::JoinPredicateNotEqui),
+		_ => Err(BindingError::JoinComputedKeyUnsupported),
+	}
+}
+
+fn resolved_join_key(
+	column: ResolvedColumn,
+	logical_type: LogicalTypeId,
+) -> Result<ResolvedJoinKey, BindingError> {
+	validate_logical_ascription_physical(&column.data_type, logical_type)?;
+	Ok(ResolvedJoinKey {
+		column,
+		logical_type,
+	})
 }
 
 enum JoinColumnResolution {
@@ -1902,23 +1947,31 @@ fn resolve_join_column_across(
 }
 
 fn validate_join_key_types(
-	left: &ResolvedColumn,
-	right: &ResolvedColumn,
+	left: &ResolvedJoinKey,
+	right: &ResolvedJoinKey,
 ) -> Result<(), BindingError> {
-	if left.data_type != right.data_type {
+	if left.column.data_type != right.column.data_type {
 		return Err(BindingError::JoinKeyTypeMismatch {
-			left_type: format!("{:?}", left.data_type),
-			right_type: format!("{:?}", right.data_type),
+			left_type: format!("{:?}", left.column.data_type),
+			right_type: format!("{:?}", right.column.data_type),
 		});
 	}
 	if matches!(
-		left.data_type,
+		left.column.data_type,
 		DataType::Float16 | DataType::Float32 | DataType::Float64
 	) {
 		return Err(BindingError::JoinKeyTypeUnsupported {
-			type_name: format!("{:?}", left.data_type),
+			type_name: format!("{:?}", left.column.data_type),
 		});
 	}
+	nominal_compatible(
+		&left.column.data_type,
+		&right.column.data_type,
+		left.logical_type,
+		right.logical_type,
+		false,
+		false,
+	)?;
 	Ok(())
 }
 
@@ -2621,6 +2674,7 @@ fn merge_aggregate_args(programs: Vec<BoundExprProgram>) -> BoundExprProgram {
 	let mut merged = BoundExprProgram {
 		nodes: Vec::new(),
 		node_types: Vec::new(),
+		node_logical_types: Vec::new(),
 		literals: Vec::new(),
 		roots: Vec::new(),
 	};
@@ -2631,6 +2685,7 @@ fn merge_aggregate_args(programs: Vec<BoundExprProgram>) -> BoundExprProgram {
 			u32::try_from(merged.literals.len()).expect("bound expression literal offset overflow");
 		merged.literals.extend(program.literals);
 		merged.node_types.extend(program.node_types);
+		merged.node_logical_types.extend(program.node_logical_types);
 		merged.nodes.extend(
 			program
 				.nodes
@@ -2747,6 +2802,9 @@ fn bind_expr_into_program(
 			Ok(builder.append_column(resolve_column(&column_ref.name.0, input_schema)?))
 		}
 		Expr::Literal(value) => Ok(builder.append_literal(value.clone())),
+		Expr::LogicalAscription { expr, logical_type } => {
+			bind_logical_ascription(builder, input_schema, config, expr, *logical_type)
+		}
 		Expr::Cast(inner, target) => {
 			bind_explicit_cast(builder, input_schema, config, inner, target)
 		}
@@ -2894,6 +2952,50 @@ fn bind_expr_into_program(
 			Ok(builder.append_time_bucket(*interval, inner, DataType::Int64))
 		}
 	}
+}
+
+fn bind_logical_ascription(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	config: &PlannerConfig,
+	inner: &Expr,
+	logical_type: LogicalTypeId,
+) -> Result<BoundExprId, BindingError> {
+	let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+	let physical = builder
+		.node_type(inner)
+		.cloned()
+		.expect("builder returns typed logical ascription input");
+	validate_logical_ascription_physical(&physical, logical_type)?;
+	if !builder.set_node_logical_type(inner, logical_type) {
+		return Err(BindingError::UnsupportedExpression {
+			message: "logical ascription target is malformed".to_string(),
+		});
+	}
+	Ok(inner)
+}
+
+fn validate_logical_ascription_physical(
+	physical: &DataType,
+	logical_type: LogicalTypeId,
+) -> Result<(), BindingError> {
+	if logical_type.is_naked() {
+		return Ok(());
+	}
+	let Some(spec) = logical_type_spec(logical_type) else {
+		return Err(BindingError::UnsupportedExpression {
+			message: format!("unknown logical type {}", logical_type_name(logical_type)),
+		});
+	};
+	if spec.physical != *physical {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"logical type {} expects {:?}, got {physical:?}",
+				spec.name, spec.physical
+			),
+		});
+	}
+	Ok(())
 }
 
 fn bind_arithmetic(
@@ -3154,6 +3256,18 @@ fn bind_comparison(
 			),
 		});
 	}
+	nominal_compatible(
+		&left_type,
+		&right_type,
+		builder
+			.node_logical_type(left)
+			.expect("builder returns logical type for comparison left"),
+		builder
+			.node_logical_type(right)
+			.expect("builder returns logical type for comparison right"),
+		builder.literal(left).is_some(),
+		builder.literal(right).is_some(),
+	)?;
 	Ok(builder.append_binary(op, left, right, DataType::Boolean))
 }
 
@@ -3191,9 +3305,49 @@ fn bind_in_list(
 				),
 			});
 		}
+		nominal_compatible(
+			&expr_type,
+			&item_type,
+			builder
+				.node_logical_type(expr)
+				.expect("builder returns logical type for IN target"),
+			builder
+				.node_logical_type(item)
+				.expect("builder returns logical type for IN member"),
+			builder.literal(expr).is_some(),
+			builder.literal(item).is_some(),
+		)?;
 		bound_items.push(item);
 	}
 	Ok(builder.append_in_list(expr, bound_items, negated))
+}
+
+fn nominal_compatible(
+	left_physical: &DataType,
+	right_physical: &DataType,
+	left_logical: LogicalTypeId,
+	right_logical: LogicalTypeId,
+	left_is_literal: bool,
+	right_is_literal: bool,
+) -> Result<(), BindingError> {
+	debug_assert_eq!(left_physical, right_physical);
+	if left_logical == right_logical {
+		return Ok(());
+	}
+	if left_logical.is_naked() && right_logical.is_naked() {
+		return Ok(());
+	}
+	if left_logical.is_naked() && left_is_literal {
+		return Ok(());
+	}
+	if right_logical.is_naked() && right_is_literal {
+		return Ok(());
+	}
+	Err(BindingError::NominalTypeMismatch {
+		left: logical_type_name(left_logical),
+		right: logical_type_name(right_logical),
+		physical: format!("{left_physical:?}"),
+	})
 }
 
 fn bind_like(

@@ -118,6 +118,12 @@ pub enum BindingError {
 	},
 	#[error("type mismatch: {message}")]
 	TypeMismatch { message: String },
+	#[error("nominal type mismatch: {left}({physical}) vs {right}({physical})")]
+	NominalTypeMismatch {
+		left: String,
+		right: String,
+		physical: String,
+	},
 	#[error("experimental kernel is not enabled: {kernel}")]
 	ExperimentalKernel { kernel: &'static str },
 	#[error("unresolved table: {table}")]
