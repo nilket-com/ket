@@ -17,6 +17,7 @@ use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
+	pbc::{OP_IN_LIST, OP_NOT},
 };
 
 fn sandbox_config() -> RuneSandboxConfig {
@@ -868,6 +869,177 @@ async fn rune_cast_feeds_aggregate_argument() {
 
 	let batches = run_logical(&logical).await;
 	assert_eq!(int64_column_rows(&batches, 0), vec![Some(67)]);
+}
+
+#[tokio::test]
+async fn rune_in_list_pushes_to_scan_pbc() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("id").in_list([lit_i64(1), lit_i64(2)]))
+        }
+    "#,
+	)
+	.await
+	.expect("in_list filter plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind in_list filter");
+	let (_, disposition, scan) = find_filter(&bound);
+	let pbc = scan_pbc(scan).expect("in_list must reach scan PBC");
+
+	assert_eq!(*disposition, FilterDisposition::FullyPushed);
+	assert!(pbc.contains(&OP_IN_LIST));
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(1), Some(2)]);
+}
+
+#[tokio::test]
+async fn rune_not_in_list_pushes_to_scan_pbc() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("status").not_in_list([lit_str("open")]))
+        }
+    "#,
+	)
+	.await
+	.expect("not_in_list filter plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind not_in_list filter");
+	let (_, disposition, scan) = find_filter(&bound);
+	let pbc = scan_pbc(scan).expect("not_in_list must reach scan PBC");
+
+	assert_eq!(*disposition, FilterDisposition::FullyPushed);
+	assert!(pbc.contains(&OP_IN_LIST));
+	assert!(pbc.contains(&OP_NOT));
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3)]);
+}
+
+#[tokio::test]
+async fn rune_not_in_list_excludes_null_target() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("region").not_in_list([lit_str("east")]))
+        }
+    "#,
+	)
+	.await
+	.expect("not_in_list nullable target plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(2), Some(5)]);
+}
+
+#[tokio::test]
+async fn rune_in_list_literal_coercion_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("id").in_list([lit(1), lit_i64(2)]))
+        }
+    "#,
+	)
+	.await
+	.expect("in_list coercion filter plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(1), Some(2)]);
+}
+
+#[tokio::test]
+async fn rune_in_list_computed_member_is_residual() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(
+                col("id").in_list([
+                    col("amount").sub(lit_i64(9)),
+                    col("amount").sub(lit_i64(18)),
+                ])
+            )
+        }
+    "#,
+	)
+	.await
+	.expect("in_list computed member filter plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind computed in_list filter");
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(
+		scan_pbc(scan).is_none(),
+		"computed IN list member must not reach scan PBC"
+	);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(1), Some(2)]);
+}
+
+#[tokio::test]
+async fn rune_in_list_empty_list_panics() {
+	let error = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("id").in_list([]))
+        }
+    "#,
+	)
+	.await
+	.expect_err("empty IN list must fail in Rune frontend");
+
+	assert_frontend_message_contains(error, "IN list must not be empty");
+}
+
+#[tokio::test]
+async fn rune_in_list_over_limit_panics() {
+	let members = (0..33)
+		.map(|value| format!("lit_i64({value})"))
+		.collect::<Vec<_>>()
+		.join(", ");
+	let script = format!(
+		r#"
+        pub fn main(ctx) {{
+            ctx.table("sales").filter(col("id").in_list([{members}]))
+        }}
+    "#
+	);
+	let error = rune_plan(&script)
+		.await
+		.expect_err("over-limit IN list must fail in Rune frontend");
+
+	assert_frontend_message_contains(error, "IN list exceeds 32 items");
+}
+
+#[tokio::test]
+async fn rune_in_list_mismatch_is_binding_error() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("status").in_list([lit(1)]))
+        }
+    "#,
+	)
+	.await
+	.expect("in_list type mismatch plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("IN list mismatch must fail in binder");
+
+	match error {
+		BindingError::TypeMismatch { message } => assert!(
+			message.contains("IN operands"),
+			"unexpected IN list mismatch message: {message}"
+		),
+		other => panic!("expected IN list type mismatch, got {other:?}"),
+	}
 }
 
 async fn predicate_operator_compound_filter_plan() -> LogicalPlan {

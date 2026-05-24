@@ -9,6 +9,8 @@ use rune::{Any, Context, Diagnostics, Module, Source, Sources, Unit, Vm};
 use std::sync::Arc;
 use std::time::Duration;
 
+const RUNE_MAX_IN_LIST_ITEMS: usize = 32;
+
 fn rune_compile_error(error: impl std::fmt::Display) -> FrontendError {
 	FrontendError::RuneCompile {
 		message: error.to_string(),
@@ -518,6 +520,30 @@ impl RuneExpr {
 			expr: Expr::TryCast(Box::new(self.expr), target.data_type),
 		}
 	}
+
+	pub fn in_list(self, list: Vec<RuneExpr>) -> VmResult<RuneExpr> {
+		build_in_list(self.expr, list, false)
+	}
+
+	pub fn not_in_list(self, list: Vec<RuneExpr>) -> VmResult<RuneExpr> {
+		build_in_list(self.expr, list, true)
+	}
+}
+
+fn build_in_list(expr: Expr, list: Vec<RuneExpr>, negated: bool) -> VmResult<RuneExpr> {
+	if list.is_empty() {
+		return VmResult::panic("IN list must not be empty");
+	}
+	if list.len() > RUNE_MAX_IN_LIST_ITEMS {
+		return VmResult::panic(format!("IN list exceeds {RUNE_MAX_IN_LIST_ITEMS} items"));
+	}
+	VmResult::Ok(RuneExpr {
+		expr: Expr::InList {
+			expr: Box::new(expr),
+			list: list.into_iter().map(|item| item.expr).collect(),
+			negated,
+		},
+	})
 }
 
 pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
@@ -578,6 +604,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("div", RuneExpr::div)?;
 	m.associated_function("cast", RuneExpr::cast)?;
 	m.associated_function("try_cast", RuneExpr::try_cast)?;
+	m.associated_function("in_list", RuneExpr::in_list)?;
+	m.associated_function("not_in_list", RuneExpr::not_in_list)?;
 
 	Ok(m)
 }

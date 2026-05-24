@@ -689,16 +689,18 @@ pub(crate) fn adr082_typed_literal_cut_does_not_expand_operator_surface() {
 		"div",
 		"cast",
 		"try_cast",
+		"in_list",
+		"not_in_list",
 	] {
 		assert!(
 			names.iter().any(|name| name == retained),
-			"post-ADR085 Rune expression method `{retained}` missing: {names:?}"
+			"post-ADR086 Rune expression method `{retained}` missing: {names:?}"
 		);
 	}
-	for deferred in ["not", "like", "ilike", "in_list", "safe_cast"] {
+	for deferred in ["not", "like", "ilike", "safe_cast"] {
 		assert!(
 			!names.iter().any(|name| name == deferred),
-			"post-ADR085 Rune surface must keep deferred operator `{deferred}` out: {names:?}"
+			"post-ADR086 Rune surface must keep deferred operator `{deferred}` out: {names:?}"
 		);
 	}
 }
@@ -964,6 +966,144 @@ pub(crate) fn adr085_rune_cast_remains_pbc_ineligible() {
 	assert!(pbc.contains("BoundExprNode::Cast { .. }"));
 	assert!(pbc.contains("BoundExprNode::TryCast { .. }"));
 	assert!(pbc.contains("arithmetic, Cast, and TryCast are not PBC-eligible"));
+}
+
+#[test]
+pub(crate) fn adr086_rune_in_list_methods_lower_to_existing_expr_variant() {
+	let rune = rune_engine_source();
+	let in_list = source_block(&rune, "pub fn in_list");
+	let not_in_list = source_block(&rune, "pub fn not_in_list");
+	let build = source_block(&rune, "fn build_in_list");
+
+	assert!(in_list.contains("list: Vec<RuneExpr>"));
+	assert!(in_list.contains("VmResult<RuneExpr>"));
+	assert!(in_list.contains("build_in_list(self.expr, list, false)"));
+	assert!(not_in_list.contains("list: Vec<RuneExpr>"));
+	assert!(not_in_list.contains("VmResult<RuneExpr>"));
+	assert!(not_in_list.contains("build_in_list(self.expr, list, true)"));
+	assert!(build.contains("Expr::InList"));
+	assert!(build.contains("expr: Box::new(expr)"));
+	assert!(build.contains("list.into_iter().map(|item| item.expr).collect()"));
+	assert!(build.contains("negated"));
+	for forbidden in [
+		"BindingError",
+		"BoundExpr",
+		"ExecutionPlan",
+		"PlannerConfig",
+	] {
+		assert!(
+			!in_list.contains(forbidden)
+				&& !not_in_list.contains(forbidden)
+				&& !build.contains(forbidden),
+			"Rune InList methods gained forbidden marker {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr086_rune_in_list_methods_validate_frontend_bounds() {
+	let rune = rune_engine_source();
+	let build = source_block(&rune, "fn build_in_list");
+
+	assert!(rune.contains("const RUNE_MAX_IN_LIST_ITEMS: usize = 32;"));
+	assert!(build.contains("if list.is_empty()"));
+	assert!(build.contains("VmResult::panic(\"IN list must not be empty\")"));
+	assert!(build.contains("if list.len() > RUNE_MAX_IN_LIST_ITEMS"));
+	assert!(build.contains("VmResult::panic(format!"));
+	assert!(build.contains("IN list exceeds {RUNE_MAX_IN_LIST_ITEMS} items"));
+}
+
+#[test]
+pub(crate) fn adr086_rune_in_list_authoring_bounds_match_sql_planner() {
+	fn const_usize(source: &str, name: &str) -> usize {
+		let marker = format!("const {name}: usize = ");
+		let rest = source
+			.split(&marker)
+			.nth(1)
+			.unwrap_or_else(|| panic!("missing {name}"));
+		rest.split(';')
+			.next()
+			.expect("constant terminator")
+			.trim()
+			.parse()
+			.unwrap_or_else(|error| panic!("parse {name}: {error}"))
+	}
+
+	let rune = rune_engine_source();
+	let sql_planner = sql_planner_source();
+	let rune_max = const_usize(&rune, "RUNE_MAX_IN_LIST_ITEMS");
+	let sql_max = const_usize(&sql_planner, "MAX_IN_LIST_ITEMS");
+
+	assert_eq!(rune_max, 32);
+	assert_eq!(rune_max, sql_max);
+}
+
+#[test]
+pub(crate) fn adr086_rune_in_list_methods_are_registered() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	for registration in [
+		"m.associated_function(\"in_list\", RuneExpr::in_list)?;",
+		"m.associated_function(\"not_in_list\", RuneExpr::not_in_list)?;",
+	] {
+		assert!(module.contains(registration), "missing {registration}");
+	}
+	for forbidden in ["in", "not", "like", "ilike", "safe_cast"] {
+		assert!(
+			!names.iter().any(|name| name == forbidden),
+			"Rune InList surface registered forbidden name `{forbidden}`: {names:?}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr086_rune_in_list_pushes_when_pbc_eligible() {
+	let tests = rune_relation_handles_test_source();
+
+	assert!(tests.contains("rune_in_list_pushes_to_scan_pbc"));
+	assert!(tests.contains("rune_not_in_list_pushes_to_scan_pbc"));
+	assert!(tests.contains("FilterDisposition::FullyPushed"));
+	assert!(tests.contains("scan_pbc(scan).expect(\"in_list must reach scan PBC\")"));
+	assert!(tests.contains("scan_pbc(scan).expect(\"not_in_list must reach scan PBC\")"));
+	assert!(tests.contains("OP_IN_LIST"));
+	assert!(tests.contains("OP_NOT"));
+}
+
+#[test]
+pub(crate) fn adr086_rune_in_list_reuses_existing_substrate() {
+	let rune = rune_engine_source();
+	let ir = ir_source();
+	let binder = binder_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+
+	for forbidden in [
+		"BindingError",
+		"BoundExpr",
+		"ExecutionPlan",
+		"PlannerConfig",
+		"normalize_",
+		"evaluate_expr",
+		"OP_IN_LIST",
+		"OP_NOT",
+	] {
+		assert!(
+			!rune.contains(forbidden),
+			"Rune InList surface gained substrate marker {forbidden}"
+		);
+	}
+	assert!(ir.contains("InList {\n\t\texpr: Box<Expr>,"));
+	assert!(ir.contains("list: Vec<Expr>"));
+	assert!(ir.contains("negated: bool"));
+	assert!(binder.contains("Expr::InList { expr, list, .. }"));
+	assert!(binder.contains("fn bind_in_list"));
+	assert!(exec.contains("Expr::InList"));
+	assert!(exec.contains("fn evaluate_in_list"));
+	assert!(pbc.contains("BoundExprNode::InList"));
+	assert!(pbc.contains("bytecode.push(OP_IN_LIST)"));
+	assert!(pbc.contains("bytecode.push(OP_NOT)"));
 }
 
 #[test]
