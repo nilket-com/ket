@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–089, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–090, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -316,6 +316,42 @@ run, 079+).
   adopted the doctrine). Migration:
   `plans/impl/089_projection_ctas_logical_identity_propagation.md`.
 
+- **ADR 090 — Persisted Logical Type Definition Substrate.** Promoted. **The arc's first
+  cross-ring ADR** — a deliberate, bounded exception for one foundational concern: *durable
+  type receipts*. **Doctrine: definition before use; magic enforces only with a receipt.** A
+  `CAST(x AS CustomerId)` / `customer_id CustomerId` is a *use-site* presupposing a
+  *definition* — and 088 persists a bare `LogicalTypeId` into descriptor metadata, so the
+  definition must be exactly as durable as the descriptor. **Invariant: a descriptor may
+  reference only a logical type id whose definition is durably stored in the same metadata
+  authority.** Grounded: Toron holds no durable state (the catalog is a synced view of
+  Wendelon descriptors), so the registry must live in Wendelon — the cross-ring exception,
+  but **bounded** (a new `SchemaObjectKind::LogicalType` riding the existing schema-intent /
+  `Create` / `SchemaGeneration` / sync machinery, `TenantId`-scoped). **Authority vs
+  representation** (Codex's split): authority = Wendelon schema metadata (allocates the id,
+  persists `{id, name, physical}`, exposes via admin/sync — never the query path);
+  representation = flexible, Wendelon-**internal** (a catalog table is fine); rejected = a
+  Toron-managed *ordinary* table read at bind. **Awareness (where-to-enforce, not capability):**
+  090 enforces the reference invariant Toron-side (write refuses undefined ids in 091, read =
+  decode fail-closed) because that's where the type-checker lives + zero new Wendelon
+  descriptor-parsing — not because Wendelon is "dumb" (it already runs KLL/ApproxQuantile
+  compute); the honest axis is data-plane compute vs interpreting the Toron `logical_type_id`
+  metadata key (088 stores it opaquely). Codex's validate-at-authority (Wendelon enforces
+  referential integrity) is a legitimate open 091 enhancement, not required by 090. Toron surface: `CREATE LOGICAL
+  TYPE <Name> AS <primitive>` (a SQL extension — sqlparser lacks `CREATE DOMAIN`; `CreateType`
+  is the wrong shape) → `StorageAdmin::create_logical_type` RPC; `WendelonCatalog` syncs a
+  per-tenant `LogicalTypeRegistry`; **the bulk = rewiring `logical_type_spec`/088-decode to
+  resolve seed ∪ synced-registry through explicit resolver context — no process-global dynamic
+  registry**. Static pilot (`CustomerId=1`/`ProductId=2`) stays a
+  reserved-range Rune/test bridge, disjoint from Wendelon-allocated durable ids. **SQL
+  use-sites deferred to 091** (DDL column type, `CAST` + reconcile-before-erase, CTAS
+  materialization); pinned by `..._still_rejects` fixtures. No executor/PBC/Rune change. 10
+  decisions, 9 guards, 12 fixtures (incl. the survives-resync durability proof + the invariant
+  fail-closed guard). Genuine 3-of-3 (operator design call: definition-first / Cut B /
+  Wendelon-native authority / `CREATE LOGICAL TYPE`; Claude grounded the cross-ring-but-bounded
+  `SchemaObjectKind` path; Codex split authority-vs-representation; Claude held minimal Wendelon
+  awareness vs validate-at-authority). Migration:
+  `plans/impl/090_persisted_logical_type_definition_substrate.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -399,32 +435,35 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 089 promoted; ADR 090 candidates
+### ADR 090 promoted; ADR 091 candidates
 
-ADR 089 selected and promoted **Projection / CTAS Logical Identity Propagation** — closes
-the 088 loop so nominal protection survives multi-hop pipelines. 088 and 089 are inverse
-halves of one isomorphism: a single central writer emits the 087 root sidecar back into
-the reserved Arrow field-metadata key at projection and CTAS rebuild sites, with aggregate
-group keys flowing through `schema_for_exprs`, so a `SELECT customer_id AS cid` keeps
-`CustomerId` downstream. Computed stays naked; CTAS
-`IF NOT EXISTS` keeps exact logical-schema equality. Genuine 3-of-3.
+ADR 090 selected and promoted **Persisted Logical Type Definition Substrate** — the arc's
+first cross-ring ADR (bounded exception for durable type receipts). A use is not a
+definition: `CAST(x AS CustomerId)` presupposes a definition receipt, and 088 persists a
+bare id into descriptor metadata, so the definition must be as durable as the descriptor.
+Invariant: *a descriptor may reference only a logical type id whose definition is durably
+stored in the same metadata authority.* A new Wendelon `SchemaObjectKind::LogicalType`
+(authority); `CREATE LOGICAL TYPE <Name> AS <primitive>` + synced per-tenant registry +
+seed∪registry decode rewire (Toron). SQL use-sites deferred to 091. Genuine 3-of-3.
 
-**ADR 090 candidates:**
+**ADR 091 candidates:**
 
-*Identity follow-ons (from ADR 089 §"What to do next" — the natural successors):*
+*Identity follow-ons (from ADR 090 §"What to do next" — the natural successors):*
 
-- **SQL / domain authoring + dynamic registry** (the direct successor; strongest lead) —
-  declare logical identity through SQL (`CAST(id AS CustomerId)` / domain-style DDL)
-  instead of test-built Arrow metadata, backed by a dynamic/tenant marker registry (087–089
-  use the static 2-entry registry). Makes catalog identity *authorable* in production — the
-  last gap before identity is a first-class, user-declared contract.
-- **Refinement contracts** — with a durable, *propagating* handle (088 minted it, 089 makes
-  it flow), attach value predicates to a `LogicalTypeId` (`PersonId(Int64, value > 0)`),
-  enabling static plan elision (`WHERE id = -5` → `EmptyRelation`) — the brainstorm-007
-  long horizon. **`.as_naked()`** explicit Rune helper.
-- **Aggregate-output identity semantics** — should `MIN`/`MAX(customer_id)` carry
-  `CustomerId` (a set representative) while `SUM`/`COUNT` stay naked? 089 keeps all aggregate
-  outputs naked; the natural follow-on once propagation is proven.
+- **SQL use-sites over the substrate** (the direct successor; strongest lead) — on the proven
+  registry: `CREATE TABLE … customer_id CustomerId` (DDL column via the 089 writer),
+  `CAST(x AS CustomerId)` with **reconcile-before-erase** (binds iff `T` known ∧ physical cast
+  supported ∧ `reconcile(x.identity, T)` doesn't conflict; explicit primitive erase is the
+  override — no silent relabel), CTAS materialization. The payoff: receipts become authorable
+  in production SQL. *(Optionally: Codex's validate-at-authority — Wendelon enforces descriptor
+  reference integrity — as a paired enhancement.)*
+- **PK/FK-derived identity** — "magic that follows constraints, not names": derive identity
+  from `PRIMARY KEY`, inherit via `REFERENCES`, durable on 090's id substrate (needs FK
+  support, currently rejected, + a canonical `schema.table.column` identity name).
+- **Refinement contracts** — value predicates on a `LogicalTypeId` (`PersonId(Int64, value >
+  0)`) → static plan elision (`WHERE id = -5` → `EmptyRelation`); brainstorm-007 horizon.
+  Plus `DROP`/`ALTER LOGICAL TYPE`, a read-only `information_schema.logical_types` view,
+  aggregate-output identity semantics, **`.as_naked()`** Rune helper.
 
 *Carried Rune leads (the nominal-typing spine was prioritized over these — still live):*
 
@@ -444,7 +483,7 @@ group keys flowing through `schema_for_exprs`, so a `SELECT customer_id AS cid` 
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/089_projection_ctas_logical_identity_propagation.md`.
+`plans/impl/090_persisted_logical_type_definition_substrate.md`.
 
 ### Advanced kernel graduations *(one ADR per kernel)*
 
