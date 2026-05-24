@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–090, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–091, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -352,6 +352,31 @@ run, 079+).
   awareness vs validate-at-authority). Migration:
   `plans/impl/090_persisted_logical_type_definition_substrate.md`.
 
+- **ADR 091 — SQL Logical Type Use-Sites (DDL column position).** Promoted. The first honest
+  SQL use-site over the 090 substrate: `CREATE TABLE orders (customer_id CustomerId)` — Int64
+  field carrying the durable id via the 089 writer, protected by the 087/088 gate, **no
+  hand-built Arrow metadata**. **Back to Toron-only** (consumes 090; no Wendelon change).
+  **Cut: DDL column position only** — `CAST(x AS CustomerId)` + typed CTAS are 092 (coercing-
+  ascription, different machinery). **Resolution-timing shift:** `SqlPlanner::plan` is sync +
+  catalog-less, so `LogicalPlan::CreateTable` carries an unresolved `CreateTableSchema`
+  (`CreateTableColumnType::{Physical(DataType), LogicalName(String)}`); the binder resolves
+  names at **bind** (async catalog) and emits a resolved `ExecutionPlan::CreateTable`.
+  **The seed-first trap (Claude's load-bearing finding, unanimous):** `LogicalTypeResolver::
+  spec_by_name` is seed-first (correct for decode), so SQL DDL must use an **async registry-only**
+  lookup that bypasses the seed — else `CREATE TABLE (id CustomerId)` would resolve the static
+  pilot with no `CREATE LOGICAL TYPE`, making the seed "SQL truth." Two paths: decode =
+  seed∪registry; DDL name = registry-only. **Write-side fail-closed:** undefined name →
+  `CatalogError::LogicalTypeNotFound` before any descriptor submits (the write-half of 090's
+  co-authority invariant). **Refresh-before-unknown** via 090's `list_logical_type_definitions`
+  (fresh-process usable). **Create-path self-rebind goes resolver-aware** (`create_table_with_
+  outcome` rebound via seed-only `from_descriptor` at `catalog.rs:636` → `with_registry`, else a
+  valid create rejects its own durable-id output). `naked`/modifiers/quoted/multi-part reject;
+  no executor/PBC/Rune change; no new nominal gate. Reconcile the variant/shape guards in the
+  same change (the explicit 090-review lesson — don't ship a red suite). 10 decisions, 9 guards.
+  Genuine 3-of-3 (Claude seeded the DDL-only cut + grounded the seed-first trap; Codex named the
+  plan-shape + create-rebind catch + bind-time; Gemini converged). Migration:
+  `plans/impl/091_sql_logical_type_ddl_columns.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -435,35 +460,33 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 090 promoted; ADR 091 candidates
+### ADR 091 promoted; ADR 092 candidates
 
-ADR 090 selected and promoted **Persisted Logical Type Definition Substrate** — the arc's
-first cross-ring ADR (bounded exception for durable type receipts). A use is not a
-definition: `CAST(x AS CustomerId)` presupposes a definition receipt, and 088 persists a
-bare id into descriptor metadata, so the definition must be as durable as the descriptor.
-Invariant: *a descriptor may reference only a logical type id whose definition is durably
-stored in the same metadata authority.* A new Wendelon `SchemaObjectKind::LogicalType`
-(authority); `CREATE LOGICAL TYPE <Name> AS <primitive>` + synced per-tenant registry +
-seed∪registry decode rewire (Toron). SQL use-sites deferred to 091. Genuine 3-of-3.
+ADR 091 selected and promoted **SQL Logical Type Use-Sites (DDL column position)** — the first
+honest SQL use over the 090 substrate: `CREATE TABLE orders (customer_id CustomerId)` resolves a
+durably-defined type at bind (registry-only, **seed excluded** — the seed-first trap), builds the
+field via the 089 writer, write-side fail-closed, create-path self-rebind resolver-aware.
+Back to Toron-only. `CAST` + typed CTAS deferred to 092. Genuine 3-of-3.
 
-**ADR 091 candidates:**
+**ADR 092 candidates:**
 
-*Identity follow-ons (from ADR 090 §"What to do next" — the natural successors):*
+*Identity follow-ons (from ADR 091 §"What to do next" — the natural successors):*
 
-- **SQL use-sites over the substrate** (the direct successor; strongest lead) — on the proven
-  registry: `CREATE TABLE … customer_id CustomerId` (DDL column via the 089 writer),
-  `CAST(x AS CustomerId)` with **reconcile-before-erase** (binds iff `T` known ∧ physical cast
-  supported ∧ `reconcile(x.identity, T)` doesn't conflict; explicit primitive erase is the
-  override — no silent relabel), CTAS materialization. The payoff: receipts become authorable
-  in production SQL. *(Optionally: Codex's validate-at-authority — Wendelon enforces descriptor
-  reference integrity — as a paired enhancement.)*
+- **`CAST(x AS CustomerId)` + typed CTAS projection** (the direct successor; strongest lead) —
+  the *coercing-ascription*: a `coerce` flag on `Expr::LogicalAscription`, reconcile against the
+  operand identity, **reconcile-before-erase** (binds iff `T` known [via 091's durable-only
+  resolver] ∧ physical cast supported ∧ no conflict; `CAST(product_id AS CustomerId)` rejects;
+  `CAST(CAST(product_id AS BIGINT) AS CustomerId)` is the explicit override — no silent relabel),
+  physical coercion via the existing numeric lattice; then CTAS materialization composes it
+  with 089. This is the expression-side use the whole receipt arc set up.
 - **PK/FK-derived identity** — "magic that follows constraints, not names": derive identity
   from `PRIMARY KEY`, inherit via `REFERENCES`, durable on 090's id substrate (needs FK
   support, currently rejected, + a canonical `schema.table.column` identity name).
 - **Refinement contracts** — value predicates on a `LogicalTypeId` (`PersonId(Int64, value >
   0)`) → static plan elision (`WHERE id = -5` → `EmptyRelation`); brainstorm-007 horizon.
   Plus `DROP`/`ALTER LOGICAL TYPE`, a read-only `information_schema.logical_types` view,
-  aggregate-output identity semantics, **`.as_naked()`** Rune helper.
+  aggregate-output identity semantics, the optional Wendelon-validate-at-authority (090 knob),
+  **`.as_naked()`** Rune helper.
 
 *Carried Rune leads (the nominal-typing spine was prioritized over these — still live):*
 
@@ -483,7 +506,7 @@ seed∪registry decode rewire (Toron). SQL use-sites deferred to 091. Genuine 3-
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/090_persisted_logical_type_definition_substrate.md`.
+`plans/impl/091_sql_logical_type_ddl_columns.md`.
 
 ### Advanced kernel graduations *(one ADR per kernel)*
 
