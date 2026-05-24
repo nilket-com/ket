@@ -11,6 +11,7 @@ use crate::network::tls::{ACTOR_CLAIMS_OID_DOTTED, ActorIdentity, ActorRole};
 use crate::schema::{IndexObjectId, ReadStatus, TableObjectId, TenantId, WriteStatus};
 use observability::telemetry as shared_telemetry;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
 
@@ -78,6 +79,7 @@ pub enum SchemaObjectKind {
 	Table,
 	Index,
 	View,
+	LogicalType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +308,282 @@ pub fn decode_schema_update_envelope_v1(bytes: &[u8]) -> std::io::Result<SchemaU
 	})?;
 	envelope.validate()?;
 	Ok(envelope)
+}
+
+pub const LOGICAL_TYPE_INTERNAL_NAMESPACE: &str = "_toron_logical_types";
+pub const LOGICAL_TYPE_RESERVED_STATIC_MAX_ID: u32 = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalTypePhysicalV1 {
+	Int64,
+	Int32,
+	Float64,
+	Float32,
+	Utf8,
+	Boolean,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalTypeDefinitionCreateV1 {
+	pub name: String,
+	pub physical: LogicalTypePhysicalV1,
+}
+
+impl LogicalTypeDefinitionCreateV1 {
+	pub fn validate(&self) -> std::io::Result<()> {
+		validate_logical_type_name(self.name.as_str())?;
+		Ok(())
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalTypeDefinitionV1 {
+	pub logical_type_id: u32,
+	pub name: String,
+	pub physical: LogicalTypePhysicalV1,
+}
+
+impl LogicalTypeDefinitionV1 {
+	pub fn validate(&self) -> std::io::Result<()> {
+		if self.logical_type_id <= LOGICAL_TYPE_RESERVED_STATIC_MAX_ID {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"logical_type_id is in the reserved static seed range",
+			));
+		}
+		validate_logical_type_name(self.name.as_str())?;
+		Ok(())
+	}
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalTypeCatalogV1 {
+	#[serde(default)]
+	by_id: BTreeMap<LogicalTypeIdCatalogKey, LogicalTypeDefinitionV1>,
+	#[serde(default)]
+	by_name: BTreeMap<LogicalTypeNameCatalogKey, u32>,
+}
+
+impl LogicalTypeCatalogV1 {
+	pub fn create(
+		&mut self,
+		tenant_id: TenantId,
+		create: LogicalTypeDefinitionCreateV1,
+	) -> std::io::Result<LogicalTypeDefinitionV1> {
+		create.validate()?;
+		let name_key = LogicalTypeNameCatalogKey {
+			tenant_id,
+			name: create.name.clone(),
+		};
+		if let Some(existing_id) = self.by_name.get(&name_key).copied() {
+			let existing = self
+				.by_id
+				.get(&LogicalTypeIdCatalogKey {
+					tenant_id,
+					logical_type_id: existing_id,
+				})
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						"logical type catalog name index references a missing id",
+					)
+				})?;
+			if existing.physical == create.physical {
+				return Ok(existing.clone());
+			}
+			return Err(Error::new(
+				ErrorKind::AlreadyExists,
+				"logical type name already exists with a different physical type",
+			));
+		}
+		let definition = LogicalTypeDefinitionV1 {
+			logical_type_id: self.next_id_for_tenant(tenant_id)?,
+			name: create.name,
+			physical: create.physical,
+		};
+		definition.validate()?;
+		let id_key = LogicalTypeIdCatalogKey {
+			tenant_id,
+			logical_type_id: definition.logical_type_id,
+		};
+		if self.by_id.contains_key(&id_key) {
+			return Err(Error::new(
+				ErrorKind::AlreadyExists,
+				"logical type id already exists",
+			));
+		}
+		self.by_name.insert(
+			LogicalTypeNameCatalogKey {
+				tenant_id,
+				name: definition.name.clone(),
+			},
+			definition.logical_type_id,
+		);
+		self.by_id.insert(id_key, definition.clone());
+		Ok(definition)
+	}
+
+	pub fn get_by_name(&self, tenant_id: TenantId, name: &str) -> Option<&LogicalTypeDefinitionV1> {
+		let logical_type_id = self.by_name.get(&LogicalTypeNameCatalogKey {
+			tenant_id,
+			name: name.to_owned(),
+		})?;
+		self.by_id.get(&LogicalTypeIdCatalogKey {
+			tenant_id,
+			logical_type_id: *logical_type_id,
+		})
+	}
+
+	pub fn get_by_id(
+		&self,
+		tenant_id: TenantId,
+		logical_type_id: u32,
+	) -> Option<&LogicalTypeDefinitionV1> {
+		self.by_id.get(&LogicalTypeIdCatalogKey {
+			tenant_id,
+			logical_type_id,
+		})
+	}
+
+	pub fn definitions_for_tenant(&self, tenant_id: TenantId) -> Vec<LogicalTypeDefinitionV1> {
+		let start = LogicalTypeIdCatalogKey {
+			tenant_id,
+			logical_type_id: LOGICAL_TYPE_RESERVED_STATIC_MAX_ID + 1,
+		};
+		let end = LogicalTypeIdCatalogKey {
+			tenant_id,
+			logical_type_id: u32::MAX,
+		};
+		self.by_id
+			.range(start..=end)
+			.map(|(_, definition)| definition.clone())
+			.collect()
+	}
+
+	fn next_id_for_tenant(&self, tenant_id: TenantId) -> std::io::Result<u32> {
+		let start = LogicalTypeIdCatalogKey {
+			tenant_id,
+			logical_type_id: LOGICAL_TYPE_RESERVED_STATIC_MAX_ID + 1,
+		};
+		let end = LogicalTypeIdCatalogKey {
+			tenant_id,
+			logical_type_id: u32::MAX,
+		};
+		let next = self
+			.by_id
+			.range(start..=end)
+			.next_back()
+			.map(|(key, _)| key.logical_type_id.saturating_add(1))
+			.unwrap_or(LOGICAL_TYPE_RESERVED_STATIC_MAX_ID + 1);
+		if next <= LOGICAL_TYPE_RESERVED_STATIC_MAX_ID {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"logical type id allocator overflowed",
+			));
+		}
+		Ok(next)
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct LogicalTypeIdCatalogKey {
+	tenant_id: TenantId,
+	logical_type_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct LogicalTypeNameCatalogKey {
+	tenant_id: TenantId,
+	name: String,
+}
+
+pub fn encode_logical_type_definition_create_v1(
+	create: &LogicalTypeDefinitionCreateV1,
+) -> std::io::Result<Vec<u8>> {
+	create.validate()?;
+	postcard::to_allocvec(create).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("failed to encode logical type create: {err}"),
+		)
+	})
+}
+
+pub fn decode_logical_type_definition_create_v1(
+	bytes: &[u8],
+) -> std::io::Result<LogicalTypeDefinitionCreateV1> {
+	let create: LogicalTypeDefinitionCreateV1 = postcard::from_bytes(bytes).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("failed to decode logical type create: {err}"),
+		)
+	})?;
+	create.validate()?;
+	Ok(create)
+}
+
+pub fn encode_logical_type_definition_v1(
+	definition: &LogicalTypeDefinitionV1,
+) -> std::io::Result<Vec<u8>> {
+	definition.validate()?;
+	postcard::to_allocvec(definition).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("failed to encode logical type definition: {err}"),
+		)
+	})
+}
+
+pub fn decode_logical_type_definition_v1(bytes: &[u8]) -> std::io::Result<LogicalTypeDefinitionV1> {
+	let definition: LogicalTypeDefinitionV1 = postcard::from_bytes(bytes).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("failed to decode logical type definition: {err}"),
+		)
+	})?;
+	definition.validate()?;
+	Ok(definition)
+}
+
+pub fn encode_logical_type_definitions_v1(
+	definitions: &[LogicalTypeDefinitionV1],
+) -> std::io::Result<Vec<u8>> {
+	for definition in definitions {
+		definition.validate()?;
+	}
+	postcard::to_allocvec(definitions).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("failed to encode logical type definitions: {err}"),
+		)
+	})
+}
+
+pub fn decode_logical_type_definitions_v1(
+	bytes: &[u8],
+) -> std::io::Result<Vec<LogicalTypeDefinitionV1>> {
+	let definitions: Vec<LogicalTypeDefinitionV1> = postcard::from_bytes(bytes).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("failed to decode logical type definitions: {err}"),
+		)
+	})?;
+	for definition in &definitions {
+		definition.validate()?;
+	}
+	Ok(definitions)
+}
+
+fn validate_logical_type_name(value: &str) -> std::io::Result<()> {
+	validate_contract_name("logical type name", value)?;
+	if value.eq_ignore_ascii_case("naked") {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"naked is a reserved logical type sentinel",
+		));
+	}
+	Ok(())
 }
 
 fn validate_contract_name(label: &str, value: &str) -> std::io::Result<()> {

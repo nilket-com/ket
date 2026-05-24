@@ -451,6 +451,41 @@ pub struct TableDescriptorGetResponseMeta {
 	pub _pad2: [u8; 4],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct LogicalTypeGetRequestMeta {
+	pub tenant_id: TenantId,
+	pub name: [u8; 128],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct LogicalTypeGetResponseMeta {
+	pub accepted: u8,
+	pub reason_code: u8,
+	pub _pad1: [u8; 6],
+	pub leader_hint: NodeId,
+	pub definition_len: u32,
+	pub _pad2: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct LogicalTypeListRequestMeta {
+	pub tenant_id: TenantId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct LogicalTypeListResponseMeta {
+	pub accepted: u8,
+	pub reason_code: u8,
+	pub _pad1: [u8; 6],
+	pub leader_hint: NodeId,
+	pub definitions_len: u32,
+	pub _pad2: [u8; 4],
+}
+
 // ============================================================
 //  ROLLING-UPGRADE VERSION WINDOW
 // ============================================================
@@ -635,6 +670,10 @@ impl MsgType {
 	pub const TABLE_DESCRIPTOR_GET_RESP: Self = Self(0x3D);
 	pub const TABLE_QUERY_CANCEL_REQ: Self = Self(0x3E);
 	pub const TABLE_QUERY_CANCEL_RESP: Self = Self(0x3F);
+	pub const LOGICAL_TYPE_GET_REQ: Self = Self(0x40);
+	pub const LOGICAL_TYPE_GET_RESP: Self = Self(0x41);
+	pub const LOGICAL_TYPE_LIST_REQ: Self = Self(0x42);
+	pub const LOGICAL_TYPE_LIST_RESP: Self = Self(0x43);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -1543,8 +1582,9 @@ const _: () = assert!(std::mem::size_of::<SnapshotHeader>() == 80);
 #[cfg(test)]
 mod tests {
 	use super::{
-		MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadStatus,
-		TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
+		LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta, LogicalTypeListRequestMeta,
+		LogicalTypeListResponseMeta, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta,
+		ReadStatus, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
 	};
 
 	#[test]
@@ -1636,6 +1676,63 @@ mod tests {
 		);
 		assert_eq!(
 			std::mem::offset_of!(TableDescriptorGetResponseMeta, descriptor_len),
+			16
+		);
+	}
+
+	#[test]
+	fn logical_type_get_wire_contract_is_fixed_pod_and_exact_opcode() {
+		assert_eq!(MsgType::LOGICAL_TYPE_GET_REQ.0, 0x40);
+		assert_eq!(MsgType::LOGICAL_TYPE_GET_RESP.0, 0x41);
+		assert_eq!(MsgType::LOGICAL_TYPE_LIST_REQ.0, 0x42);
+		assert_eq!(MsgType::LOGICAL_TYPE_LIST_RESP.0, 0x43);
+
+		assert_eq!(std::mem::size_of::<LogicalTypeGetRequestMeta>(), 136);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeGetRequestMeta, tenant_id),
+			0
+		);
+		assert_eq!(std::mem::offset_of!(LogicalTypeGetRequestMeta, name), 8);
+
+		assert_eq!(std::mem::size_of::<LogicalTypeGetResponseMeta>(), 24);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeGetResponseMeta, accepted),
+			0
+		);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeGetResponseMeta, reason_code),
+			1
+		);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeGetResponseMeta, leader_hint),
+			8
+		);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeGetResponseMeta, definition_len),
+			16
+		);
+
+		assert_eq!(std::mem::size_of::<LogicalTypeListRequestMeta>(), 8);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeListRequestMeta, tenant_id),
+			0
+		);
+
+		assert_eq!(std::mem::size_of::<LogicalTypeListResponseMeta>(), 24);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeListResponseMeta, accepted),
+			0
+		);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeListResponseMeta, reason_code),
+			1
+		);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeListResponseMeta, leader_hint),
+			8
+		);
+		assert_eq!(
+			std::mem::offset_of!(LogicalTypeListResponseMeta, definitions_len),
 			16
 		);
 	}

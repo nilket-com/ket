@@ -202,6 +202,12 @@ impl<'a> Binder<'a> {
 					if_not_exists: *if_not_exists,
 					or_replace: *or_replace,
 				}),
+				LogicalPlan::CreateLogicalType { name, physical } => {
+					Ok(ExecutionPlan::CreateLogicalType {
+						name: name.clone(),
+						physical: physical.clone(),
+					})
+				}
 				LogicalPlan::CreateTableAsSelect {
 					table,
 					if_not_exists,
@@ -1844,6 +1850,7 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 			}
 		},
 		LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Delete { .. }
@@ -2056,6 +2063,7 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
@@ -2359,6 +2367,10 @@ fn optimize_for_required(
 				if_not_exists,
 				or_replace,
 			},
+			OrdinalRemap::new(),
+		)),
+		ExecutionPlan::CreateLogicalType { name, physical } => Ok((
+			ExecutionPlan::CreateLogicalType { name, physical },
 			OrdinalRemap::new(),
 		)),
 		ExecutionPlan::CreateTableAsSelect {

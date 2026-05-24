@@ -40,6 +40,9 @@
 //! without forcing callers to hand-roll redirect logic.
 
 use crate::client::topology::{ClusterStatusWire, TopologySource};
+use crate::integration::compute::{
+	decode_logical_type_definition_v1, decode_logical_type_definitions_v1,
+};
 use crate::metrics::NetworkCompressionPath;
 use crate::network::control_server::{
 	CONTROL_REASON_AUTHORIZATION_FAILED, CONTROL_REASON_GRANTED, CONTROL_REASON_INVALID_CONFIG,
@@ -57,14 +60,15 @@ use crate::schema::table::encode_descriptor_wire_name;
 use crate::schema::{
 	CdcCheckpointMeta, CdcCursor, CdcDecodeError, CdcFrameMeta, CdcRejectMeta, CdcSubscribeBound,
 	CdcSubscribeRequestMeta, Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader,
-	HybridTimestamp, Identity, Locality, LogicalSchemaFingerprint, MsgType, NodeId, PbcRejectCode,
-	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN, StateDigest,
-	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta,
-	TableDescriptorGetResponseMeta, TableObjectId, TableQueryCancelRequestMeta,
-	TableQueryCancelResponseMeta, TableQueryRequestId, TableQueryRequestMeta,
-	TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
-	WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
+	HybridTimestamp, Identity, Locality, LogicalSchemaFingerprint, LogicalTypeGetRequestMeta,
+	LogicalTypeGetResponseMeta, LogicalTypeListRequestMeta, LogicalTypeListResponseMeta, MsgType,
+	NodeId, PbcRejectCode, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta,
+	QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor,
+	STORAGE_ROW_KEY_ID_COLUMN, StateDigest, TableDeleteRowsRequestMeta,
+	TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
+	TableObjectId, TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
+	TableQueryRequestMeta, TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta,
+	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
 	column_projection_prefix_ranges, decode_table_schema_descriptor_v1, read_key_schema,
 	read_value_schema, table_spread_prefix_ranges, validate_table_write_request_batch,
 	write_payload_schema,
@@ -330,6 +334,18 @@ pub struct TableDeleteRowsResult {
 pub struct TableDescriptorGetResult {
 	pub response: TableDescriptorGetResponseMeta,
 	pub descriptor: Option<TableSchemaDescriptor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LogicalTypeGetResult {
+	pub response: LogicalTypeGetResponseMeta,
+	pub definition: Option<crate::integration::compute::LogicalTypeDefinitionV1>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LogicalTypeListResult {
+	pub response: LogicalTypeListResponseMeta,
+	pub definitions: Vec<crate::integration::compute::LogicalTypeDefinitionV1>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -815,6 +831,139 @@ impl WendelonClient {
 		unreachable!("bounded retry loop must return within budget")
 	}
 
+	/// Fetch a tenant logical type definition by exact name from the
+	/// Control Ring leader.
+	pub async fn get_logical_type_definition(
+		&self,
+		tenant_id: TenantId,
+		name: &str,
+	) -> std::io::Result<Option<crate::integration::compute::LogicalTypeDefinitionV1>> {
+		let request = LogicalTypeGetRequestMeta {
+			tenant_id,
+			name: encode_descriptor_wire_name("logical type name", name)?,
+		};
+		let mut preferred_target = self.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = match preferred_target.or_else(|| self.leader()) {
+				Some(target) => target,
+				None => {
+					self.refresh_topology().await?;
+					self.leader().ok_or_else(|| {
+						Error::new(
+							ErrorKind::NotConnected,
+							"logical type get requires a known Control Ring leader",
+						)
+					})?
+				}
+			};
+			let result = self.logical_type_get_once(target, &request).await?;
+			if result.response.leader_hint.id != 0 {
+				*self.leader.write().unwrap() = Some(result.response.leader_hint);
+			}
+			match result.response.reason_code {
+				code if result.response.accepted == 1 && code == CONTROL_REASON_GRANTED => {
+					return Ok(result.definition);
+				}
+				CONTROL_REASON_NOT_FOUND => return Ok(None),
+				CONTROL_REASON_NOT_LEADER => {
+					if attempt + 1 == DATA_RETRY_BUDGET {
+						return Err(Error::new(
+							ErrorKind::NotConnected,
+							"Wendelon logical type get retry budget exhausted",
+						));
+					}
+					let retry =
+						RetryDirective::redirect(nonzero_node_id(result.response.leader_hint));
+					self.prepare_retry(None, retry).await?;
+					preferred_target = retry.preferred_target.or_else(|| self.leader());
+				}
+				CONTROL_REASON_AUTHORIZATION_FAILED => {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"Wendelon logical type get authorization failed",
+					));
+				}
+				CONTROL_REASON_INVALID_CONFIG => {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"Wendelon logical type get request was invalid",
+					));
+				}
+				other => {
+					return Err(Error::new(
+						ErrorKind::Other,
+						format!("Wendelon logical type get failed: reason_code={other}"),
+					));
+				}
+			}
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	/// Fetch all tenant logical type definitions from the Control Ring
+	/// leader for catalog sync.
+	pub async fn list_logical_type_definitions(
+		&self,
+		tenant_id: TenantId,
+	) -> std::io::Result<Vec<crate::integration::compute::LogicalTypeDefinitionV1>> {
+		let request = LogicalTypeListRequestMeta { tenant_id };
+		let mut preferred_target = self.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = match preferred_target.or_else(|| self.leader()) {
+				Some(target) => target,
+				None => {
+					self.refresh_topology().await?;
+					self.leader().ok_or_else(|| {
+						Error::new(
+							ErrorKind::NotConnected,
+							"logical type list requires a known Control Ring leader",
+						)
+					})?
+				}
+			};
+			let result = self.logical_type_list_once(target, &request).await?;
+			if result.response.leader_hint.id != 0 {
+				*self.leader.write().unwrap() = Some(result.response.leader_hint);
+			}
+			match result.response.reason_code {
+				code if result.response.accepted == 1 && code == CONTROL_REASON_GRANTED => {
+					return Ok(result.definitions);
+				}
+				CONTROL_REASON_NOT_LEADER => {
+					if attempt + 1 == DATA_RETRY_BUDGET {
+						return Err(Error::new(
+							ErrorKind::NotConnected,
+							"Wendelon logical type list retry budget exhausted",
+						));
+					}
+					let retry =
+						RetryDirective::redirect(nonzero_node_id(result.response.leader_hint));
+					self.prepare_retry(None, retry).await?;
+					preferred_target = retry.preferred_target.or_else(|| self.leader());
+				}
+				CONTROL_REASON_AUTHORIZATION_FAILED => {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"Wendelon logical type list authorization failed",
+					));
+				}
+				CONTROL_REASON_INVALID_CONFIG => {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"Wendelon logical type list request was invalid",
+					));
+				}
+				other => {
+					return Err(Error::new(
+						ErrorKind::Other,
+						format!("Wendelon logical type list failed: reason_code={other}"),
+					));
+				}
+			}
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
 	/// Issue one `READ_REQ` over HRFT and surface the exact
 	/// `ReadStatus` the server returned. Successful reads carry the
 	/// Arrow value batch in `ReadResult.value`.
@@ -1081,6 +1230,72 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 		let frame = read_frame(&mut *stream, &self.pool).await?;
 		decode_table_descriptor_get_response_frame(frame)
+	}
+
+	async fn logical_type_get_once(
+		&self,
+		target: NodeId,
+		request: &LogicalTypeGetRequestMeta,
+	) -> std::io::Result<LogicalTypeGetResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::LOGICAL_TYPE_GET_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<LogicalTypeGetRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(request),
+			None,
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_logical_type_get_response_frame(frame)
+	}
+
+	async fn logical_type_list_once(
+		&self,
+		target: NodeId,
+		request: &LogicalTypeListRequestMeta,
+	) -> std::io::Result<LogicalTypeListResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::LOGICAL_TYPE_LIST_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<LogicalTypeListRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(request),
+			None,
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_logical_type_list_response_frame(frame)
 	}
 
 	async fn table_query_once(
@@ -2225,6 +2440,154 @@ fn decode_table_descriptor_get_response_frame(
 	Ok(TableDescriptorGetResult {
 		response,
 		descriptor,
+	})
+}
+
+fn decode_logical_type_get_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<LogicalTypeGetResult> {
+	if frame.header.msg_type != MsgType::LOGICAL_TYPE_GET_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected LOGICAL_TYPE_GET_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() != std::mem::size_of::<LogicalTypeGetResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"LOGICAL_TYPE_GET_RESP meta size mismatch",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"LOGICAL_TYPE_GET_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: LogicalTypeGetResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<LogicalTypeGetResponseMeta>()]);
+	let definition = if response.accepted == 1 {
+		if response.reason_code != CONTROL_REASON_GRANTED {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"LOGICAL_TYPE_GET_RESP accepted response must use granted reason",
+			));
+		}
+		let trailing = frame.trailing.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"LOGICAL_TYPE_GET_RESP accepted response missing definition payload",
+			)
+		})?;
+		if response.definition_len as usize != trailing.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"LOGICAL_TYPE_GET_RESP definition_len mismatch: meta={} actual={}",
+					response.definition_len,
+					trailing.len()
+				),
+			));
+		}
+		Some(decode_logical_type_definition_v1(&trailing[..])?)
+	} else {
+		if response.accepted != 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"LOGICAL_TYPE_GET_RESP invalid accepted value {}",
+					response.accepted
+				),
+			));
+		}
+		if response.definition_len != 0 || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"LOGICAL_TYPE_GET_RESP rejected response must not carry definition payload",
+			));
+		}
+		None
+	};
+	Ok(LogicalTypeGetResult {
+		response,
+		definition,
+	})
+}
+
+fn decode_logical_type_list_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<LogicalTypeListResult> {
+	if frame.header.msg_type != MsgType::LOGICAL_TYPE_LIST_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected LOGICAL_TYPE_LIST_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() != std::mem::size_of::<LogicalTypeListResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"LOGICAL_TYPE_LIST_RESP meta size mismatch",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"LOGICAL_TYPE_LIST_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: LogicalTypeListResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<LogicalTypeListResponseMeta>()]);
+	let definitions = if response.accepted == 1 {
+		if response.reason_code != CONTROL_REASON_GRANTED {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"LOGICAL_TYPE_LIST_RESP accepted response must use granted reason",
+			));
+		}
+		let trailing = frame.trailing.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"LOGICAL_TYPE_LIST_RESP accepted response missing definitions payload",
+			)
+		})?;
+		if response.definitions_len as usize != trailing.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"LOGICAL_TYPE_LIST_RESP definitions_len mismatch: meta={} actual={}",
+					response.definitions_len,
+					trailing.len()
+				),
+			));
+		}
+		decode_logical_type_definitions_v1(&trailing[..])?
+	} else {
+		if response.accepted != 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"LOGICAL_TYPE_LIST_RESP invalid accepted value {}",
+					response.accepted
+				),
+			));
+		}
+		if response.definitions_len != 0 || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"LOGICAL_TYPE_LIST_RESP rejected response must not carry definitions payload",
+			));
+		}
+		Vec::new()
+	};
+	Ok(LogicalTypeListResult {
+		response,
+		definitions,
 	})
 }
 

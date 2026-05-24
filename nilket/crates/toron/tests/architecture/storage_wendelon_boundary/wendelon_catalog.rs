@@ -319,8 +319,9 @@ pub(crate) fn adr038_storage_admin_trait_has_one_method() {
 		.and_then(|rest| rest.split("pub struct InMemoryStorageScan").next())
 		.expect("StorageAdmin trait block");
 
-	assert_eq!(trait_body.matches("async fn").count(), 1);
+	assert_eq!(trait_body.matches("async fn").count(), 2);
 	assert!(trait_body.contains("async fn drop_table_storage("));
+	assert!(trait_body.contains("async fn create_logical_type("));
 }
 
 #[test]

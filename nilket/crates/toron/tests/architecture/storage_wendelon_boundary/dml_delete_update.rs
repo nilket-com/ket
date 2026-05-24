@@ -417,8 +417,9 @@ pub(crate) fn adr032_logical_plan_retains_insert_select_variant() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 16);
+	assert_eq!(enum_variant_count(logical_plan), 17);
 	assert!(logical_plan.contains("InsertSelect {"));
+	assert!(logical_plan.contains("CreateLogicalType {"));
 	assert!(logical_plan.contains("DropTable {"));
 	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("table: TableRef,"));
@@ -435,8 +436,9 @@ pub(crate) fn adr032_execution_plan_retains_insert_select_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 14);
+	assert_eq!(enum_variant_count(execution_plan), 15);
 	assert!(execution_plan.contains("InsertSelect {"));
+	assert!(execution_plan.contains("CreateLogicalType {"));
 	assert!(execution_plan.contains("DropTable {"));
 	assert!(execution_plan.contains("Update {"));
 }
@@ -904,8 +906,9 @@ pub(crate) fn adr036_logical_variant_count_is_15() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 16);
+	assert_eq!(enum_variant_count(logical_plan), 17);
 	assert!(logical_plan.contains("Delete {"));
+	assert!(logical_plan.contains("CreateLogicalType {"));
 	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("table: TableRef,"));
 	assert!(logical_plan.contains("predicate: Option<Expr>,"));
@@ -921,8 +924,9 @@ pub(crate) fn adr036_execution_variant_count_is_13() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 14);
+	assert_eq!(enum_variant_count(execution_plan), 15);
 	assert!(execution_plan.contains("Delete {"));
+	assert!(execution_plan.contains("CreateLogicalType {"));
 	assert!(execution_plan.contains("Update {"));
 }
 

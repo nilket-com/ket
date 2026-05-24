@@ -7,7 +7,7 @@ use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, CreateTableRowIdentity, Expr, InsertLiteral, JoinKind, JoinStrategy,
-	LogicalPlan, ReturningProjection, ScalarValue, SortExpr,
+	LogicalPlan, ReturningProjection, ScalarValue, SortExpr, data_type_to_logical_type_physical,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
@@ -152,6 +152,65 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 			"unsupported CAST target type: {other}"
 		))),
 	}
+}
+
+fn try_lower_create_logical_type(sql: &str) -> Result<Option<LogicalPlan>, FrontendError> {
+	let trimmed = sql.trim();
+	let statement = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+	let tokens = statement.split_whitespace().collect::<Vec<_>>();
+	if tokens.len() < 3
+		|| !tokens[0].eq_ignore_ascii_case("CREATE")
+		|| !tokens[1].eq_ignore_ascii_case("LOGICAL")
+		|| !tokens[2].eq_ignore_ascii_case("TYPE")
+	{
+		return Ok(None);
+	}
+	if tokens.len() != 6 || !tokens[4].eq_ignore_ascii_case("AS") {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE syntax is CREATE LOGICAL TYPE <Name> AS <primitive>",
+		));
+	}
+	let name = tokens[3];
+	if name.contains('.') {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE supports one-part tenant-global names only",
+		));
+	}
+	if name.eq_ignore_ascii_case("naked") {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE cannot define the naked sentinel",
+		));
+	}
+	if name
+		.bytes()
+		.any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+	{
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE names must be unquoted ASCII identifiers",
+		));
+	}
+	let physical = match tokens[5].to_ascii_uppercase().as_str() {
+		"BIGINT" | "INT64" => DataType::Int64,
+		"INT" | "INTEGER" | "INT32" => DataType::Int32,
+		"DOUBLE" | "DOUBLEPRECISION" | "FLOAT64" => DataType::Float64,
+		"REAL" | "FLOAT32" => DataType::Float32,
+		"TEXT" | "STRING" | "UTF8" => DataType::Utf8,
+		"BOOLEAN" | "BOOL" => DataType::Boolean,
+		other => {
+			return Err(unsupported(format!(
+				"unsupported CREATE LOGICAL TYPE physical type: {other}"
+			)));
+		}
+	};
+	if data_type_to_logical_type_physical(&physical).is_none() {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE physical type must be a primitive logical-type carrier",
+		));
+	}
+	Ok(Some(LogicalPlan::CreateLogicalType {
+		name: name.to_string(),
+		physical,
+	}))
 }
 
 fn lower_ddl_table_name(name: &ObjectName) -> Result<TableRef, FrontendError> {
@@ -852,6 +911,7 @@ fn relation_plan_is_terminal(plan: &LogicalPlan) -> bool {
 	matches!(
 		plan,
 		LogicalPlan::CreateTable { .. }
+			| LogicalPlan::CreateLogicalType { .. }
 			| LogicalPlan::CreateTableAsSelect { .. }
 			| LogicalPlan::DropTable { .. }
 			| LogicalPlan::Delete { .. }
@@ -875,6 +935,9 @@ impl SqlPlanner {
 	}
 
 	pub fn plan(&self, sql: &str) -> Result<LogicalPlan, FrontendError> {
+		if let Some(plan) = try_lower_create_logical_type(sql)? {
+			return Ok(plan);
+		}
 		let dialect = GenericDialect {};
 		let ast = Parser::parse_sql(&dialect, sql).map_err(|e| FrontendError::SqlParse {
 			message: e.to_string(),
@@ -4500,6 +4563,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			strategy: _,
 		} => true,
 		LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Delete { .. }
@@ -4784,6 +4848,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		},
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
 		| LogicalPlan::Delete { .. }

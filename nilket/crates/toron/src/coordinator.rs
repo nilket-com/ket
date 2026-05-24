@@ -30,15 +30,15 @@ use crate::error::{
 use crate::exec::{ExecutionContext, Executor};
 use crate::ir::{
 	BoundReturningProjection, ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan,
-	FilterDisposition, LogicalPlan, MorselId, TableId,
+	FilterDisposition, LogicalPlan, MorselId, TableId, data_type_to_logical_type_physical,
 };
 use crate::server::{
 	NetworkTaskDispatcher, ToronCoordinator, memory::MemoryManager, transport::ToronTransport,
 };
 use crate::storage::{
-	DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest, RowIdentityProjection,
-	ScanStream, StorageAdmin, StorageDeleteRows, StorageWrite, TenantId, UnsupportedStorageAdmin,
-	WriteOutcome, WriteRequest,
+	CreateLogicalTypeRequest, DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest,
+	RowIdentityProjection, ScanStream, StorageAdmin, StorageDeleteRows, StorageWrite, TenantId,
+	UnsupportedStorageAdmin, WriteOutcome, WriteRequest,
 };
 use tokio::sync::Semaphore;
 
@@ -373,7 +373,9 @@ where
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
 		if matches!(
 			plan,
-			LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. }
+			LogicalPlan::CreateTable { .. }
+				| LogicalPlan::CreateLogicalType { .. }
+				| LogicalPlan::DropTable { .. }
 		) {
 			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			return execute_catalog_plan(catalog.as_ref(), self.admin.as_ref(), &context, &bound)
@@ -821,6 +823,23 @@ async fn execute_catalog_plan(
 					row_identity.clone(),
 					*if_not_exists,
 				)
+				.await?;
+			Ok(Vec::new())
+		}
+		ExecutionPlan::CreateLogicalType { name, physical } => {
+			let physical = data_type_to_logical_type_physical(physical).ok_or_else(|| {
+				QueryError::Internal {
+					message: format!(
+						"unsupported CREATE LOGICAL TYPE physical carrier: {physical:?}"
+					),
+				}
+			})?;
+			admin
+				.create_logical_type(CreateLogicalTypeRequest {
+					tenant_id: context.tenant_id,
+					name: name.clone(),
+					physical,
+				})
 				.await?;
 			Ok(Vec::new())
 		}
@@ -1405,7 +1424,9 @@ impl QueryCoordinator {
 		let catalog = Arc::clone(&self.catalog).scoped(self.executor.context().tenant_id);
 		if matches!(
 			plan,
-			LogicalPlan::CreateTable { .. } | LogicalPlan::DropTable { .. }
+			LogicalPlan::CreateTable { .. }
+				| LogicalPlan::CreateLogicalType { .. }
+				| LogicalPlan::DropTable { .. }
 		) {
 			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
 			return execute_catalog_plan(

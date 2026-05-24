@@ -1,12 +1,15 @@
 use std::time::Duration;
 use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
-	ComputeTraceContextV1, SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES, SchemaGeneration,
-	SchemaIntentId, SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1,
-	SchemaUpdateEnvelopeV1, StorageQuotaMetadataV1, StorageStatusKind,
-	decode_schema_update_envelope_v1, encode_schema_update_envelope_v1,
-	map_read_status_for_compute, map_write_status_for_compute, prepare_query_session_handoff,
-	validate_query_session_audit_attribution,
+	ComputeTraceContextV1, LOGICAL_TYPE_INTERNAL_NAMESPACE, LOGICAL_TYPE_RESERVED_STATIC_MAX_ID,
+	LogicalTypeCatalogV1, LogicalTypeDefinitionCreateV1, LogicalTypePhysicalV1,
+	SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES, SchemaGeneration, SchemaIntentId,
+	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+	StorageQuotaMetadataV1, StorageStatusKind, decode_logical_type_definition_create_v1,
+	decode_logical_type_definitions_v1, decode_schema_update_envelope_v1,
+	encode_logical_type_definition_create_v1, encode_logical_type_definitions_v1,
+	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
+	prepare_query_session_handoff, validate_query_session_audit_attribution,
 };
 use wendelon::network::cert_issuance_policy::{
 	CertAuthorityKind, CertIssuancePolicy, QUERY_SESSION_CERT_MAX_TTL,
@@ -111,6 +114,89 @@ fn schema_intent_id_type_enforces_sixteen_byte_shape() {
 	let id = SchemaIntentId::new([0x7A; 16]);
 	assert_eq!(id.as_bytes().len(), 16);
 	assert_eq!(id.into_bytes(), [0x7A; 16]);
+}
+
+#[test]
+fn logical_type_definition_payload_roundtrips_and_uses_schema_object_kind() {
+	let create = LogicalTypeDefinitionCreateV1 {
+		name: "CustomerId".to_string(),
+		physical: LogicalTypePhysicalV1::Int64,
+	};
+	let payload = encode_logical_type_definition_create_v1(&create).unwrap();
+	let envelope = SchemaUpdateEnvelopeV1::compute_client_intent(
+		TenantId::new(42),
+		SchemaObjectRefV1 {
+			kind: SchemaObjectKind::LogicalType,
+			namespace: LOGICAL_TYPE_INTERNAL_NAMESPACE.to_string(),
+			name: "CustomerId".to_string(),
+		},
+		SchemaGeneration::ZERO,
+		SchemaGeneration::new(1),
+		SchemaIntentId::new([0x90; 16]),
+		SchemaMutationKindV1::Create,
+		payload.clone(),
+	);
+
+	let encoded = encode_schema_update_envelope_v1(&envelope).unwrap();
+	let decoded = decode_schema_update_envelope_v1(&encoded).unwrap();
+
+	assert_eq!(decoded.object.kind, SchemaObjectKind::LogicalType);
+	assert_eq!(decoded.object.namespace, LOGICAL_TYPE_INTERNAL_NAMESPACE);
+	assert_eq!(
+		decode_logical_type_definition_create_v1(&payload).unwrap(),
+		create
+	);
+}
+
+#[test]
+fn logical_type_catalog_allocates_durable_ids_and_is_idempotent() {
+	let mut catalog = LogicalTypeCatalogV1::default();
+	let tenant = TenantId::new(7);
+	let first = catalog
+		.create(
+			tenant,
+			LogicalTypeDefinitionCreateV1 {
+				name: "PersonId".to_string(),
+				physical: LogicalTypePhysicalV1::Int64,
+			},
+		)
+		.unwrap();
+	let duplicate = catalog
+		.create(
+			tenant,
+			LogicalTypeDefinitionCreateV1 {
+				name: "PersonId".to_string(),
+				physical: LogicalTypePhysicalV1::Int64,
+			},
+		)
+		.unwrap();
+
+	assert_eq!(
+		first.logical_type_id,
+		LOGICAL_TYPE_RESERVED_STATIC_MAX_ID + 1
+	);
+	assert_eq!(duplicate, first);
+	assert_eq!(catalog.get_by_name(tenant, "PersonId"), Some(&first));
+	let listed = catalog.definitions_for_tenant(tenant);
+	assert_eq!(listed, vec![first.clone()]);
+	let listed_payload = encode_logical_type_definitions_v1(&listed).unwrap();
+	assert_eq!(
+		decode_logical_type_definitions_v1(&listed_payload).unwrap(),
+		listed
+	);
+	assert_eq!(
+		catalog
+			.create(
+				tenant,
+				LogicalTypeDefinitionCreateV1 {
+					name: "PersonId".to_string(),
+					physical: LogicalTypePhysicalV1::Int32,
+				},
+			)
+			.unwrap_err()
+			.kind(),
+		std::io::ErrorKind::AlreadyExists
+	);
 }
 
 #[test]

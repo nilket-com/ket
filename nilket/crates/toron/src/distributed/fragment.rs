@@ -88,7 +88,10 @@ pub fn fragment_plan(
 	plan: ExecutionPlan,
 	config: FragmentPlanConfig,
 ) -> Result<Vec<StagePlan>, FragmentError> {
-	if matches!(plan, ExecutionPlan::CreateTable { .. }) {
+	if matches!(
+		plan,
+		ExecutionPlan::CreateTable { .. } | ExecutionPlan::CreateLogicalType { .. }
+	) {
 		return Err(FragmentError::CreateTableNotFragmentable);
 	}
 	if matches!(plan, ExecutionPlan::DropTable { .. }) {
@@ -902,6 +905,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Sort { input, .. } => first_join(input),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
@@ -946,6 +950,7 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		}
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
@@ -965,6 +970,7 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
@@ -997,6 +1003,7 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
 		ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
@@ -1088,6 +1095,7 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 		},
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }
@@ -1153,6 +1161,7 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 		},
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
 		| ExecutionPlan::Delete { .. }

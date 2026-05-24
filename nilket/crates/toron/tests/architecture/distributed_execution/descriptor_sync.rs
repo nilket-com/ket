@@ -186,7 +186,10 @@ pub(crate) fn adr051_descriptor_identity_fields_are_preserved() {
 		.expect("read config test");
 
 	assert!(config.contains("table.descriptor"));
-	assert!(catalog.contains("TableBinding::from_descriptor(table_id, &descriptor)?"));
+	assert!(catalog.contains(
+		"TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?"
+	));
+	assert!(catalog.contains("LogicalTypeResolver::with_registry"));
 	assert!(config_test.contains("descriptor_bootstrap_preserves_physical_fingerprint"));
 	assert!(!config.contains("table_object_id ="));
 }

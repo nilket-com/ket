@@ -48,10 +48,14 @@ pub use wendelon::client::{
 };
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
-	ComputeTraceContextV1, DropOperationId, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
+	ComputeTraceContextV1, DropOperationId, LOGICAL_TYPE_INTERNAL_NAMESPACE,
+	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinitionCreateV1, LogicalTypeDefinitionV1,
+	LogicalTypePhysicalV1, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
 	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
 	StorageQuotaMetadataV1, StorageStatusKind, TableSchemaDropFields, TableSchemaDropRequest,
-	WendelonAdminError, decode_schema_update_envelope_v1, encode_schema_update_envelope_v1,
+	WendelonAdminError, decode_logical_type_definition_v1, decode_logical_type_definitions_v1,
+	decode_schema_update_envelope_v1, encode_logical_type_definition_create_v1,
+	encode_logical_type_definitions_v1, encode_schema_update_envelope_v1,
 	map_read_status_for_compute, map_write_status_for_compute, prepare_query_session_handoff,
 	validate_query_session_audit_attribution, validate_traceparent,
 };
@@ -301,6 +305,54 @@ impl TableSchemaUpdateRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalTypeDefinitionCreateRequest {
+	pub tenant_id: TenantId,
+	pub name: String,
+	pub physical: LogicalTypePhysicalV1,
+	pub intent_id: SchemaIntentId,
+}
+
+impl LogicalTypeDefinitionCreateRequest {
+	pub fn create(
+		tenant_id: TenantId,
+		name: impl Into<String>,
+		physical: LogicalTypePhysicalV1,
+		intent_id: SchemaIntentId,
+	) -> Self {
+		Self {
+			tenant_id,
+			name: name.into(),
+			physical,
+			intent_id,
+		}
+	}
+
+	pub fn envelope(&self) -> std::io::Result<SchemaUpdateEnvelopeV1> {
+		let payload = encode_logical_type_definition_create_v1(&LogicalTypeDefinitionCreateV1 {
+			name: self.name.clone(),
+			physical: self.physical,
+		})?;
+		Ok(SchemaUpdateEnvelopeV1::compute_client_intent(
+			self.tenant_id,
+			SchemaObjectRefV1 {
+				kind: SchemaObjectKind::LogicalType,
+				namespace: LOGICAL_TYPE_INTERNAL_NAMESPACE.to_string(),
+				name: self.name.clone(),
+			},
+			SchemaGeneration::ZERO,
+			SchemaGeneration::new(1),
+			self.intent_id,
+			SchemaMutationKindV1::Create,
+			payload,
+		))
+	}
+
+	pub fn encode(&self) -> std::io::Result<Vec<u8>> {
+		encode_schema_update_envelope_v1(&self.envelope()?)
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaUpdateReceipt {
 	pub leader_hint: Option<NodeId>,
 }
@@ -464,6 +516,27 @@ impl Client {
 			.map_err(ClientError::from)
 	}
 
+	pub async fn get_logical_type_definition(
+		&self,
+		tenant_id: TenantId,
+		name: &str,
+	) -> Result<Option<LogicalTypeDefinitionV1>, ClientError> {
+		self.inner
+			.get_logical_type_definition(tenant_id, name)
+			.await
+			.map_err(ClientError::from)
+	}
+
+	pub async fn list_logical_type_definitions(
+		&self,
+		tenant_id: TenantId,
+	) -> Result<Vec<LogicalTypeDefinitionV1>, ClientError> {
+		self.inner
+			.list_logical_type_definitions(tenant_id)
+			.await
+			.map_err(ClientError::from)
+	}
+
 	pub fn identity_for_key(tenant_id: TenantId, key: &[u8]) -> Identity {
 		Identity::blake3_tenant(tenant_id, key)
 	}
@@ -490,6 +563,21 @@ impl Client {
 		request: TableSchemaUpdateRequest,
 	) -> Result<SchemaUpdateReceipt, ClientError> {
 		let payload = request.encode()?;
+		self.submit_schema_update_payload(payload).await
+	}
+
+	pub async fn submit_logical_type_definition_create(
+		&self,
+		request: LogicalTypeDefinitionCreateRequest,
+	) -> Result<SchemaUpdateReceipt, ClientError> {
+		let payload = request.encode()?;
+		self.submit_schema_update_payload(payload).await
+	}
+
+	async fn submit_schema_update_payload(
+		&self,
+		payload: Vec<u8>,
+	) -> Result<SchemaUpdateReceipt, ClientError> {
 		let mut preferred_target = self.inner.leader();
 		for attempt in 0..DATA_RETRY_BUDGET {
 			let target = if let Some(target) = preferred_target {

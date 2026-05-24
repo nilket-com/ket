@@ -230,6 +230,10 @@ pub enum ExecutionPlan {
 		if_not_exists: bool,
 		or_replace: bool,
 	},
+	CreateLogicalType {
+		name: String,
+		physical: DataType,
+	},
 	CreateTableAsSelect {
 		table: TableRef,
 		schema: SchemaRef,
@@ -294,6 +298,7 @@ impl ExecutionPlan {
 			Self::Sort { output_schema, .. } => output_schema.clone(),
 			Self::Join { output_schema, .. } => output_schema.clone(),
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
+			Self::CreateLogicalType { .. } => Arc::new(Schema::empty()),
 			Self::CreateTableAsSelect { .. } => Arc::new(Schema::empty()),
 			Self::DropTable { .. } => Arc::new(Schema::empty()),
 			Self::Delete {

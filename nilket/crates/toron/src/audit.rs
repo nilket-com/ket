@@ -294,7 +294,7 @@ impl StatementClass {
 			LogicalPlan::InsertSelect { .. } => Self::InsertSelect,
 			LogicalPlan::Update { .. } => Self::Update,
 			LogicalPlan::Delete { .. } => Self::Delete,
-			LogicalPlan::CreateTable { .. } => Self::Create,
+			LogicalPlan::CreateTable { .. } | LogicalPlan::CreateLogicalType { .. } => Self::Create,
 			LogicalPlan::CreateTableAsSelect { .. } => Self::CreateTableAsSelect,
 			LogicalPlan::DropTable { .. } => Self::Drop,
 			LogicalPlan::Scan { .. }

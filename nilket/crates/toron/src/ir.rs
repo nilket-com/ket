@@ -4,6 +4,9 @@ use crate::catalog::TableRef;
 pub use crate::distributed::identity::{QueryId, StageId};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use serde::{Deserialize, Serialize};
+use wendelon_client::{
+	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinitionV1, LogicalTypePhysicalV1,
+};
 
 #[path = "ir/execution.rs"]
 pub mod execution;
@@ -23,40 +26,209 @@ impl LogicalTypeId {
 
 pub const CUSTOMER_ID_LOGICAL_TYPE: LogicalTypeId = LogicalTypeId(1);
 pub const PRODUCT_ID_LOGICAL_TYPE: LogicalTypeId = LogicalTypeId(2);
+pub const DURABLE_LOGICAL_TYPE_MIN_ID: u32 = LOGICAL_TYPE_RESERVED_STATIC_MAX_ID + 1;
 pub const LOGICAL_TYPE_ID_METADATA_KEY: &str = "nilket.toron.logical_type_id";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalTypeSpec {
 	pub id: LogicalTypeId,
-	pub name: &'static str,
+	pub name: String,
 	pub physical: DataType,
 }
 
-pub fn logical_type_spec(id: LogicalTypeId) -> Option<LogicalTypeSpec> {
+pub fn seed_logical_type_spec(id: LogicalTypeId) -> Option<LogicalTypeSpec> {
 	match id {
 		LogicalTypeId::NAKED => Some(LogicalTypeSpec {
 			id,
-			name: "naked",
+			name: "naked".to_string(),
 			physical: DataType::Null,
 		}),
 		CUSTOMER_ID_LOGICAL_TYPE => Some(LogicalTypeSpec {
 			id,
-			name: "CustomerId",
+			name: "CustomerId".to_string(),
 			physical: DataType::Int64,
 		}),
 		PRODUCT_ID_LOGICAL_TYPE => Some(LogicalTypeSpec {
 			id,
-			name: "ProductId",
+			name: "ProductId".to_string(),
 			physical: DataType::Int64,
 		}),
 		_ => None,
 	}
 }
 
+pub fn logical_type_spec(id: LogicalTypeId) -> Option<LogicalTypeSpec> {
+	LogicalTypeResolver::seed_only().spec(id)
+}
+
+pub fn logical_type_spec_by_name(name: &str) -> Option<LogicalTypeSpec> {
+	LogicalTypeResolver::seed_only().spec_by_name(name)
+}
+
+pub fn seed_logical_type_spec_by_name(name: &str) -> Option<LogicalTypeSpec> {
+	[CUSTOMER_ID_LOGICAL_TYPE, PRODUCT_ID_LOGICAL_TYPE]
+		.into_iter()
+		.find_map(|id| seed_logical_type_spec(id).filter(|spec| spec.name == name))
+}
+
 pub fn logical_type_name(id: LogicalTypeId) -> String {
 	logical_type_spec(id)
-		.map(|spec| spec.name.to_string())
+		.map(|spec| spec.name)
 		.unwrap_or_else(|| format!("LogicalTypeId({})", id.0))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogicalTypeRegistry {
+	by_id: HashMap<LogicalTypeId, LogicalTypeSpec>,
+	by_name: HashMap<String, LogicalTypeId>,
+}
+
+impl LogicalTypeRegistry {
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	pub fn from_definitions(
+		definitions: impl IntoIterator<Item = LogicalTypeDefinitionV1>,
+	) -> Result<Self, LogicalTypeRegistryError> {
+		let mut registry = Self::new();
+		for definition in definitions {
+			registry.register_definition(definition)?;
+		}
+		Ok(registry)
+	}
+
+	pub fn register_definition(
+		&mut self,
+		definition: LogicalTypeDefinitionV1,
+	) -> Result<LogicalTypeSpec, LogicalTypeRegistryError> {
+		if definition.logical_type_id < DURABLE_LOGICAL_TYPE_MIN_ID {
+			return Err(LogicalTypeRegistryError::ReservedId {
+				id: definition.logical_type_id,
+			});
+		}
+		if definition.name.eq_ignore_ascii_case("naked") {
+			return Err(LogicalTypeRegistryError::ReservedName {
+				name: definition.name,
+			});
+		}
+		let spec = LogicalTypeSpec {
+			id: LogicalTypeId(definition.logical_type_id),
+			name: definition.name,
+			physical: logical_type_physical_to_data_type(definition.physical),
+		};
+		if let Some(existing) = self.by_id.get(&spec.id) {
+			if existing == &spec {
+				return Ok(existing.clone());
+			}
+			return Err(LogicalTypeRegistryError::DuplicateId { id: spec.id.0 });
+		}
+		if let Some(existing_id) = self.by_name.get(&spec.name) {
+			if *existing_id == spec.id {
+				return Ok(spec);
+			}
+			return Err(LogicalTypeRegistryError::DuplicateName { name: spec.name });
+		}
+		self.by_name.insert(spec.name.clone(), spec.id);
+		self.by_id.insert(spec.id, spec.clone());
+		Ok(spec)
+	}
+
+	pub fn spec(&self, id: LogicalTypeId) -> Option<LogicalTypeSpec> {
+		self.by_id.get(&id).cloned()
+	}
+
+	pub fn spec_by_name(&self, name: &str) -> Option<LogicalTypeSpec> {
+		self.by_name
+			.get(name)
+			.and_then(|id| self.by_id.get(id))
+			.cloned()
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalTypeRegistryError {
+	ReservedId { id: u32 },
+	ReservedName { name: String },
+	DuplicateId { id: u32 },
+	DuplicateName { name: String },
+}
+
+impl std::fmt::Display for LogicalTypeRegistryError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::ReservedId { id } => write!(
+				formatter,
+				"logical type id {id} is in the reserved static seed range"
+			),
+			Self::ReservedName { name } => {
+				write!(formatter, "logical type name {name:?} is reserved")
+			}
+			Self::DuplicateId { id } => {
+				write!(
+					formatter,
+					"logical type id {id} already has a different definition"
+				)
+			}
+			Self::DuplicateName { name } => write!(
+				formatter,
+				"logical type name {name:?} already has a different definition"
+			),
+		}
+	}
+}
+
+impl std::error::Error for LogicalTypeRegistryError {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LogicalTypeResolver<'a> {
+	registry: Option<&'a LogicalTypeRegistry>,
+}
+
+impl<'a> LogicalTypeResolver<'a> {
+	pub fn seed_only() -> Self {
+		Self { registry: None }
+	}
+
+	pub fn with_registry(registry: &'a LogicalTypeRegistry) -> Self {
+		Self {
+			registry: Some(registry),
+		}
+	}
+
+	pub fn spec(self, id: LogicalTypeId) -> Option<LogicalTypeSpec> {
+		seed_logical_type_spec(id).or_else(|| self.registry.and_then(|registry| registry.spec(id)))
+	}
+
+	pub fn spec_by_name(self, name: &str) -> Option<LogicalTypeSpec> {
+		seed_logical_type_spec_by_name(name).or_else(|| {
+			self.registry
+				.and_then(|registry| registry.spec_by_name(name))
+		})
+	}
+}
+
+pub fn logical_type_physical_to_data_type(physical: LogicalTypePhysicalV1) -> DataType {
+	match physical {
+		LogicalTypePhysicalV1::Int64 => DataType::Int64,
+		LogicalTypePhysicalV1::Int32 => DataType::Int32,
+		LogicalTypePhysicalV1::Float64 => DataType::Float64,
+		LogicalTypePhysicalV1::Float32 => DataType::Float32,
+		LogicalTypePhysicalV1::Utf8 => DataType::Utf8,
+		LogicalTypePhysicalV1::Boolean => DataType::Boolean,
+	}
+}
+
+pub fn data_type_to_logical_type_physical(data_type: &DataType) -> Option<LogicalTypePhysicalV1> {
+	match data_type {
+		DataType::Int64 => Some(LogicalTypePhysicalV1::Int64),
+		DataType::Int32 => Some(LogicalTypePhysicalV1::Int32),
+		DataType::Float64 => Some(LogicalTypePhysicalV1::Float64),
+		DataType::Float32 => Some(LogicalTypePhysicalV1::Float32),
+		DataType::Utf8 => Some(LogicalTypePhysicalV1::Utf8),
+		DataType::Boolean => Some(LogicalTypePhysicalV1::Boolean),
+		_ => None,
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +243,7 @@ pub enum LogicalTypeMetadataError {
 	},
 	PhysicalMismatch {
 		field: String,
-		logical_type: &'static str,
+		logical_type: String,
 		expected: DataType,
 		actual: DataType,
 	},
@@ -109,6 +281,13 @@ impl std::error::Error for LogicalTypeMetadataError {}
 pub fn decode_column_logical_type(
 	field: &Field,
 ) -> Result<LogicalTypeId, LogicalTypeMetadataError> {
+	decode_column_logical_type_with_resolver(field, LogicalTypeResolver::seed_only())
+}
+
+pub fn decode_column_logical_type_with_resolver(
+	field: &Field,
+	resolver: LogicalTypeResolver<'_>,
+) -> Result<LogicalTypeId, LogicalTypeMetadataError> {
 	let Some(raw) = field.metadata().get(LOGICAL_TYPE_ID_METADATA_KEY) else {
 		return Ok(LogicalTypeId::NAKED);
 	};
@@ -121,7 +300,7 @@ pub fn decode_column_logical_type(
 	if id.is_naked() {
 		return Ok(id);
 	}
-	let Some(spec) = logical_type_spec(id) else {
+	let Some(spec) = resolver.spec(id) else {
 		return Err(LogicalTypeMetadataError::UnknownId {
 			field: field.name().clone(),
 			id: id.0,
@@ -417,6 +596,10 @@ pub enum LogicalPlan {
 		row_identity: CreateTableRowIdentity,
 		if_not_exists: bool,
 		or_replace: bool,
+	},
+	CreateLogicalType {
+		name: String,
+		physical: DataType,
 	},
 	CreateTableAsSelect {
 		table: TableRef,

@@ -60,7 +60,8 @@ use crate::consensus::{
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::integration::compute::{
-	SchemaMutationKindV1, SchemaObjectKind, SchemaUpdateEnvelopeV1,
+	LOGICAL_TYPE_INTERNAL_NAMESPACE, LogicalTypeCatalogV1, SchemaMutationKindV1, SchemaObjectKind,
+	SchemaUpdateEnvelopeV1, decode_logical_type_definition_create_v1,
 	decode_schema_update_envelope_v1,
 };
 use crate::metrics::global as metrics;
@@ -1533,6 +1534,11 @@ pub struct SmState {
 	/// the default descriptor without needing this map populated.
 	#[serde(default)]
 	pub table_schemas: TableSchemaCatalogV1,
+	/// ADR 090 tenant logical type definitions. The ids in table descriptor
+	/// field metadata are honest only if this durable registry travels with
+	/// the descriptors that reference them.
+	#[serde(default)]
+	pub logical_types: LogicalTypeCatalogV1,
 	/// ADR 052 secondary-index descriptors and lifecycle state. Index
 	/// metadata is separate from table descriptors, so index create /
 	/// drop does not mutate table schema generation.
@@ -4058,7 +4064,45 @@ fn apply_schema_update(state: &mut SmState, bytes: &[u8]) -> Result<(), String> 
 	match envelope.object.kind {
 		SchemaObjectKind::Table => apply_table_schema_update(state, envelope),
 		SchemaObjectKind::Index => apply_index_schema_update(state, envelope),
+		SchemaObjectKind::LogicalType => apply_logical_type_schema_update(state, envelope),
 		other => Err(format!("schema object kind {other:?} is not implemented")),
+	}
+}
+
+fn apply_logical_type_schema_update(
+	state: &mut SmState,
+	envelope: SchemaUpdateEnvelopeV1,
+) -> Result<(), String> {
+	match envelope.mutation {
+		SchemaMutationKindV1::Create => {
+			if envelope.object.namespace != LOGICAL_TYPE_INTERNAL_NAMESPACE {
+				return Err("logical type definitions must use the reserved namespace".to_owned());
+			}
+			if envelope.expected_generation != 0.into() || envelope.requested_generation != 1.into()
+			{
+				return Err(
+					"logical type definitions use fixed create generation 0 -> 1".to_owned(),
+				);
+			}
+			let create = decode_logical_type_definition_create_v1(&envelope.payload)
+				.map_err(|err| err.to_string())?;
+			if create.name != envelope.object.name {
+				return Err(
+					"logical type definition name does not match schema envelope".to_owned(),
+				);
+			}
+			state
+				.logical_types
+				.create(envelope.tenant_id, create)
+				.map(|_| ())
+				.map_err(|err| err.to_string())
+		}
+		SchemaMutationKindV1::Alter | SchemaMutationKindV1::Drop => {
+			Err("logical type ALTER/DROP is not supported".to_owned())
+		}
+		SchemaMutationKindV1::IndexBackfillComplete | SchemaMutationKindV1::IndexDropGcComplete => {
+			Err("logical types do not support secondary-index lifecycle mutations".to_owned())
+		}
 	}
 }
 

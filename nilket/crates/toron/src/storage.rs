@@ -102,6 +102,18 @@ pub struct DropTableStorageRequest {
 	pub trace_context: Option<TraceContext>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CreateLogicalTypeRequest {
+	pub tenant_id: TenantId,
+	pub name: String,
+	pub physical: wendelon_client::LogicalTypePhysicalV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateLogicalTypeOutcome {
+	pub definition: wendelon_client::LogicalTypeDefinitionV1,
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteOutcome {
@@ -205,6 +217,16 @@ pub trait StorageAdmin: Send + Sync {
 		&self,
 		request: DropTableStorageRequest,
 	) -> Result<DropTableStorageOutcome, StorageError>;
+
+	async fn create_logical_type(
+		&self,
+		_request: CreateLogicalTypeRequest,
+	) -> Result<CreateLogicalTypeOutcome, StorageError> {
+		Err(StorageError::Internal {
+			message: "CREATE LOGICAL TYPE requires a configured Wendelon catalog admin client"
+				.to_string(),
+		})
+	}
 }
 
 pub struct InMemoryStorageScan {
@@ -460,6 +482,40 @@ impl StorageAdmin for WendelonStorageAdmin {
 				message: error.to_string(),
 			})?;
 		Ok(DropTableStorageOutcome::new(1))
+	}
+
+	async fn create_logical_type(
+		&self,
+		request: CreateLogicalTypeRequest,
+	) -> Result<CreateLogicalTypeOutcome, StorageError> {
+		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
+		let create_request = wendelon_client::LogicalTypeDefinitionCreateRequest::create(
+			tenant_id,
+			request.name.clone(),
+			request.physical,
+			wendelon_client::SchemaIntentId::new(*uuid::Uuid::new_v4().as_bytes()),
+		);
+		self.client
+			.submit_logical_type_definition_create(create_request)
+			.await
+			.map_err(StorageError::from)?;
+		let definition = self
+			.client
+			.get_logical_type_definition(tenant_id, &request.name)
+			.await
+			.map_err(StorageError::from)?
+			.ok_or_else(|| StorageError::Internal {
+				message: format!(
+					"CREATE LOGICAL TYPE succeeded but definition {:?} was not readable",
+					request.name
+				),
+			})?;
+		self.registry
+			.register_logical_type_for_tenant(request.tenant_id, definition.clone())
+			.map_err(|error| StorageError::Internal {
+				message: error.to_string(),
+			})?;
+		Ok(CreateLogicalTypeOutcome { definition })
 	}
 }
 

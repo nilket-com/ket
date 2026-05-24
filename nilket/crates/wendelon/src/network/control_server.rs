@@ -19,7 +19,8 @@ use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
 use crate::integration::compute::{
 	SchemaMutationKindV1, TableSchemaDropRequest, WendelonAdminError,
-	decode_schema_update_envelope_v1,
+	decode_schema_update_envelope_v1, encode_logical_type_definition_v1,
+	encode_logical_type_definitions_v1,
 };
 use crate::metrics::{TableRetentionMetricPolicy, global as metrics};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
@@ -40,11 +41,12 @@ use crate::network::wire;
 use crate::schema::table::decode_descriptor_wire_name;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
-	LeaseDescriptor, LeaseStatus, MsgType, NodeId, PolicyGeneration, ProtocolVersionWindow,
-	ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TableDescriptorGetRequestMeta,
-	TableDescriptorGetResponseMeta, TableObjectId, TableRetentionPolicy, TableSchemaDescriptor,
-	TenantId, TenantKekId, TransferToken, decode_table_schema_descriptor_v1,
-	encode_table_schema_descriptor_v1, epoch_entry_var_schema,
+	LeaseDescriptor, LeaseStatus, LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta,
+	LogicalTypeListRequestMeta, LogicalTypeListResponseMeta, MsgType, NodeId, PolicyGeneration,
+	ProtocolVersionWindow, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta,
+	TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta, TableObjectId,
+	TableRetentionPolicy, TableSchemaDescriptor, TenantId, TenantKekId, TransferToken,
+	decode_table_schema_descriptor_v1, encode_table_schema_descriptor_v1, epoch_entry_var_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -91,6 +93,12 @@ struct TableDescriptorGetRequest {
 	tenant_id: TenantId,
 	namespace: String,
 	table_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogicalTypeGetRequest {
+	tenant_id: TenantId,
+	name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,6 +500,70 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn build_logical_type_get_frame(
+		&self,
+		stream_id: u32,
+		meta: LogicalTypeGetResponseMeta,
+		definition: Option<&[u8]>,
+	) -> std::io::Result<HrftFrame> {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let trailing = definition.map(|bytes| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec().extend_from_slice(bytes);
+			buf
+		});
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::LOGICAL_TYPE_GET_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0),
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing,
+		})
+	}
+
+	fn build_logical_type_list_frame(
+		&self,
+		stream_id: u32,
+		meta: LogicalTypeListResponseMeta,
+		definitions: Option<&[u8]>,
+	) -> std::io::Result<HrftFrame> {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let trailing = definitions.map(|bytes| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec().extend_from_slice(bytes);
+			buf
+		});
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::LOGICAL_TYPE_LIST_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0),
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing,
+		})
+	}
+
 	fn tenant_admin_rejection(
 		&self,
 		frame: &HrftFrame,
@@ -586,6 +658,52 @@ impl WendelonControlServer {
 					_reserved: 0,
 				}),
 				descriptor_len: 0,
+				_pad2: [0; 4],
+			},
+			None,
+		)
+	}
+
+	fn logical_type_get_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		self.build_logical_type_get_frame(
+			frame.header.stream_id,
+			LogicalTypeGetResponseMeta {
+				accepted: 0,
+				reason_code,
+				_pad1: [0; 6],
+				leader_hint: leader_hint.unwrap_or(NodeId {
+					id: 0,
+					_reserved: 0,
+				}),
+				definition_len: 0,
+				_pad2: [0; 4],
+			},
+			None,
+		)
+	}
+
+	fn logical_type_list_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		self.build_logical_type_list_frame(
+			frame.header.stream_id,
+			LogicalTypeListResponseMeta {
+				accepted: 0,
+				reason_code,
+				_pad1: [0; 6],
+				leader_hint: leader_hint.unwrap_or(NodeId {
+					id: 0,
+					_reserved: 0,
+				}),
+				definitions_len: 0,
 				_pad2: [0; 4],
 			},
 			None,
@@ -1189,6 +1307,15 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn decode_logical_type_get_request(
+		meta: LogicalTypeGetRequestMeta,
+	) -> std::io::Result<LogicalTypeGetRequest> {
+		Ok(LogicalTypeGetRequest {
+			tenant_id: meta.tenant_id,
+			name: decode_descriptor_wire_name("logical type name", &meta.name)?,
+		})
+	}
+
 	fn authorize_descriptor_get_actor(
 		actor: &ActorIdentity,
 		tenant_id: TenantId,
@@ -1290,6 +1417,136 @@ impl WendelonControlServer {
 				_pad2: [0; 4],
 			},
 			Some(&descriptor_bytes),
+		)
+	}
+
+	async fn handle_logical_type_get(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return self.logical_type_get_rejection(&frame, CONTROL_REASON_INVALID_CONFIG, None);
+		}
+
+		let raw_meta: LogicalTypeGetRequestMeta = if frame.meta.len()
+			== std::mem::size_of::<LogicalTypeGetRequestMeta>()
+		{
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<LogicalTypeGetRequestMeta>()])
+		} else {
+			return self.logical_type_get_rejection(&frame, CONTROL_REASON_INVALID_CONFIG, None);
+		};
+		if Self::authorize_descriptor_get_actor(&context.actor, raw_meta.tenant_id).is_err() {
+			return self.logical_type_get_rejection(
+				&frame,
+				CONTROL_REASON_AUTHORIZATION_FAILED,
+				None,
+			);
+		}
+
+		let request = match Self::decode_logical_type_get_request(raw_meta) {
+			Ok(request) => request,
+			Err(_) => {
+				return self.logical_type_get_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					None,
+				);
+			}
+		};
+		if !self.is_leader().await {
+			return self.logical_type_get_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+
+		let snapshot = self.state_machine.state_snapshot().await;
+		let Some(definition) = snapshot
+			.logical_types
+			.get_by_name(request.tenant_id, request.name.as_str())
+		else {
+			return self.logical_type_get_rejection(&frame, CONTROL_REASON_NOT_FOUND, None);
+		};
+		let definition_bytes = encode_logical_type_definition_v1(definition)?;
+		let definition_len = u32::try_from(definition_bytes.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"encoded logical type definition exceeds u32 wire length",
+			)
+		})?;
+		self.build_logical_type_get_frame(
+			frame.header.stream_id,
+			LogicalTypeGetResponseMeta {
+				accepted: 1,
+				reason_code: CONTROL_REASON_GRANTED,
+				_pad1: [0; 6],
+				leader_hint: self.local_node,
+				definition_len,
+				_pad2: [0; 4],
+			},
+			Some(&definition_bytes),
+		)
+	}
+
+	async fn handle_logical_type_list(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return self.logical_type_list_rejection(&frame, CONTROL_REASON_INVALID_CONFIG, None);
+		}
+
+		let raw_meta: LogicalTypeListRequestMeta = if frame.meta.len()
+			== std::mem::size_of::<LogicalTypeListRequestMeta>()
+		{
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<LogicalTypeListRequestMeta>()])
+		} else {
+			return self.logical_type_list_rejection(&frame, CONTROL_REASON_INVALID_CONFIG, None);
+		};
+		if Self::authorize_descriptor_get_actor(&context.actor, raw_meta.tenant_id).is_err() {
+			return self.logical_type_list_rejection(
+				&frame,
+				CONTROL_REASON_AUTHORIZATION_FAILED,
+				None,
+			);
+		}
+		if !self.is_leader().await {
+			return self.logical_type_list_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+
+		let snapshot = self.state_machine.state_snapshot().await;
+		let definitions = snapshot
+			.logical_types
+			.definitions_for_tenant(raw_meta.tenant_id);
+		let definitions_bytes = encode_logical_type_definitions_v1(&definitions)?;
+		let definitions_len = u32::try_from(definitions_bytes.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"encoded logical type definitions exceed u32 wire length",
+			)
+		})?;
+		self.build_logical_type_list_frame(
+			frame.header.stream_id,
+			LogicalTypeListResponseMeta {
+				accepted: 1,
+				reason_code: CONTROL_REASON_GRANTED,
+				_pad1: [0; 6],
+				leader_hint: self.local_node,
+				definitions_len,
+				_pad2: [0; 4],
+			},
+			Some(&definitions_bytes),
 		)
 	}
 
@@ -3188,6 +3445,10 @@ impl ControlRingServer for WendelonControlServer {
 			}
 			MsgType::TABLE_DESCRIPTOR_GET_REQ => {
 				self.handle_table_descriptor_get(&context, frame).await?
+			}
+			MsgType::LOGICAL_TYPE_GET_REQ => self.handle_logical_type_get(&context, frame).await?,
+			MsgType::LOGICAL_TYPE_LIST_REQ => {
+				self.handle_logical_type_list(&context, frame).await?
 			}
 			MsgType::TENANT_ADMIN_REQ => self.handle_tenant_admin(&context, frame).await?,
 			_ => {

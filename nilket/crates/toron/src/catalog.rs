@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 use crate::distributed::budget::{QueryBudget, TenantBudgetPolicy, TenantDescriptorSyncAccountant};
 use crate::error::{CatalogError, StorageError};
-use crate::ir::{ColumnOrdinal, CreateTableRowIdentity, TableId, decode_column_logical_type};
+use crate::ir::{
+	ColumnOrdinal, CreateTableRowIdentity, LogicalTypeRegistry, LogicalTypeResolver, TableId,
+	decode_column_logical_type_with_resolver,
+};
 use crate::storage::TenantId;
 use wendelon::integration::compute::SchemaIntentId;
 use wendelon::schema::{
@@ -18,8 +21,8 @@ use wendelon::schema::{
 	TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
 };
 use wendelon_client::{
-	Client, ClientError, DropOperationId, SchemaGeneration, SchemaUpdateReceipt,
-	TableSchemaUpdateRequest,
+	Client, ClientError, DropOperationId, LogicalTypeDefinitionV1, SchemaGeneration,
+	SchemaUpdateReceipt, TableSchemaUpdateRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -86,12 +89,24 @@ impl TableBinding {
 		legacy_table_id: TableId,
 		descriptor: &wendelon_client::TableSchemaDescriptor,
 	) -> Result<Self, CatalogError> {
+		Self::from_descriptor_with_logical_types(
+			legacy_table_id,
+			descriptor,
+			LogicalTypeResolver::seed_only(),
+		)
+	}
+
+	pub fn from_descriptor_with_logical_types(
+		legacy_table_id: TableId,
+		descriptor: &wendelon_client::TableSchemaDescriptor,
+		logical_types: LogicalTypeResolver<'_>,
+	) -> Result<Self, CatalogError> {
 		let schema = Arc::new(descriptor.arrow_schema().map_err(|error| {
 			CatalogError::FingerprintResolution {
 				message: error.to_string(),
 			}
 		})?);
-		validate_logical_column_metadata(schema.as_ref())?;
+		validate_logical_column_metadata(schema.as_ref(), logical_types)?;
 
 		let row_identity = table_row_identity(&schema, descriptor)?;
 		let primary_key_columns = primary_key_columns(&schema, descriptor)?;
@@ -268,6 +283,11 @@ impl SchemaUpdateClient for Client {
 
 #[async_trait::async_trait]
 trait DescriptorSyncClient: Send + Sync {
+	async fn list_logical_type_definitions(
+		&self,
+		tenant_id: WendelonTenantId,
+	) -> Result<Vec<LogicalTypeDefinitionV1>, ClientError>;
+
 	async fn get_table_schema_descriptor(
 		&self,
 		tenant_id: WendelonTenantId,
@@ -278,6 +298,13 @@ trait DescriptorSyncClient: Send + Sync {
 
 #[async_trait::async_trait]
 impl DescriptorSyncClient for Client {
+	async fn list_logical_type_definitions(
+		&self,
+		tenant_id: WendelonTenantId,
+	) -> Result<Vec<LogicalTypeDefinitionV1>, ClientError> {
+		Client::list_logical_type_definitions(self, tenant_id).await
+	}
+
 	async fn get_table_schema_descriptor(
 		&self,
 		tenant_id: WendelonTenantId,
@@ -376,6 +403,7 @@ pub struct MockCatalog {
 struct MockCatalogInner {
 	by_ref: HashMap<(TenantId, TableRef), TableId>,
 	by_id: HashMap<(TenantId, TableId), TableBinding>,
+	logical_types: HashMap<TenantId, LogicalTypeRegistry>,
 	next_table_id: u64,
 }
 
@@ -394,6 +422,7 @@ impl Default for MockCatalogInner {
 		Self {
 			by_ref: HashMap::new(),
 			by_id: HashMap::new(),
+			logical_types: HashMap::new(),
 			next_table_id: 1,
 		}
 	}
@@ -420,8 +449,17 @@ impl MockCatalog {
 	) -> Result<(), CatalogError> {
 		let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
 		let unqualified_ref = TableRef::new(&descriptor.table_name);
-		let binding = TableBinding::from_descriptor(legacy_table_id, &descriptor)?;
 		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		let resolver = inner
+			.logical_types
+			.get(&tenant_id)
+			.map(LogicalTypeResolver::with_registry)
+			.unwrap_or_else(LogicalTypeResolver::seed_only);
+		let binding = TableBinding::from_descriptor_with_logical_types(
+			legacy_table_id,
+			&descriptor,
+			resolver,
+		)?;
 
 		inner.by_ref.insert((tenant_id, table_ref), legacy_table_id);
 		inner
@@ -452,6 +490,23 @@ impl MockCatalog {
 		inner.by_ref.insert((tenant_id, table_ref), legacy_table_id);
 		inner.by_id.insert((tenant_id, legacy_table_id), binding);
 		bump_next_table_id(&mut inner, legacy_table_id);
+		Ok(())
+	}
+
+	pub fn register_logical_type_for_tenant(
+		&self,
+		tenant_id: TenantId,
+		definition: wendelon_client::LogicalTypeDefinitionV1,
+	) -> Result<(), CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		inner
+			.logical_types
+			.entry(tenant_id)
+			.or_default()
+			.register_definition(definition)
+			.map_err(|error| CatalogError::AdminFailed {
+				message: error.to_string(),
+			})?;
 		Ok(())
 	}
 }
@@ -813,6 +868,7 @@ struct WendelonDescriptorState {
 	by_ref: HashMap<(TenantId, TableRef), TableId>,
 	by_id: HashMap<(TenantId, TableId), TableBinding>,
 	descriptors: HashMap<(TenantId, TableId), wendelon_client::TableSchemaDescriptor>,
+	logical_types: HashMap<TenantId, LogicalTypeRegistry>,
 	finalized_drops: HashMap<(TenantId, TableId), DropOperationId>,
 	next_table_id: u64,
 }
@@ -823,6 +879,7 @@ impl Default for WendelonDescriptorState {
 			by_ref: HashMap::new(),
 			by_id: HashMap::new(),
 			descriptors: HashMap::new(),
+			logical_types: HashMap::new(),
 			finalized_drops: HashMap::new(),
 			next_table_id: 1,
 		}
@@ -866,7 +923,6 @@ impl WendelonDescriptorRegistry {
 			}
 			let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
 			let unqualified_ref = TableRef::new(&descriptor.table_name);
-			let binding = TableBinding::from_descriptor(table_id, &descriptor)?;
 			let mut state = registry
 				.inner
 				.write()
@@ -888,6 +944,13 @@ impl WendelonDescriptorRegistry {
 					),
 				});
 			}
+			let resolver = state
+				.logical_types
+				.get(&tenant_id)
+				.map(LogicalTypeResolver::with_registry)
+				.unwrap_or_else(LogicalTypeResolver::seed_only);
+			let binding =
+				TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?;
 			insert_wendelon_descriptor_locked(
 				&mut state,
 				tenant_id,
@@ -909,11 +972,17 @@ impl WendelonDescriptorRegistry {
 	) -> Result<(), CatalogError> {
 		let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
 		let unqualified_ref = TableRef::new(&descriptor.table_name);
-		let binding = TableBinding::from_descriptor(table_id, &descriptor)?;
 		let mut state = self
 			.inner
 			.write()
 			.expect("WendelonDescriptorRegistry lock poisoned");
+		let resolver = state
+			.logical_types
+			.get(&tenant_id)
+			.map(LogicalTypeResolver::with_registry)
+			.unwrap_or_else(LogicalTypeResolver::seed_only);
+		let binding =
+			TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?;
 		insert_wendelon_descriptor_locked(
 			&mut state,
 			tenant_id,
@@ -952,6 +1021,12 @@ impl WendelonDescriptorRegistry {
 			.inner
 			.write()
 			.expect("WendelonDescriptorRegistry lock poisoned");
+		let logical_types = state
+			.logical_types
+			.get(&tenant_id)
+			.cloned()
+			.unwrap_or_default();
+		let resolver = LogicalTypeResolver::with_registry(&logical_types);
 
 		if let Some(existing_table_id) = state.by_ref.get(&(tenant_id, table_ref.clone())).copied()
 		{
@@ -962,7 +1037,11 @@ impl WendelonDescriptorRegistry {
 				.ok_or_else(|| CatalogError::TableNotFound {
 					table: table_name(&table_ref),
 				})?;
-			let candidate = TableBinding::from_descriptor(existing_table_id, &descriptor)?;
+			let candidate = TableBinding::from_descriptor_with_logical_types(
+				existing_table_id,
+				&descriptor,
+				resolver,
+			)?;
 			if same_descriptor_identity(&existing, &candidate) {
 				return Ok(existing);
 			}
@@ -975,7 +1054,8 @@ impl WendelonDescriptorRegistry {
 		}
 
 		let table_id = allocate_wendelon_table_id_locked(&mut state);
-		let binding = TableBinding::from_descriptor(table_id, &descriptor)?;
+		let binding =
+			TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?;
 		insert_wendelon_descriptor_locked(
 			&mut state,
 			tenant_id,
@@ -986,6 +1066,64 @@ impl WendelonDescriptorRegistry {
 			descriptor,
 		)?;
 		Ok(binding)
+	}
+
+	pub fn register_logical_type_for_tenant(
+		&self,
+		tenant_id: TenantId,
+		definition: LogicalTypeDefinitionV1,
+	) -> Result<(), CatalogError> {
+		self.register_logical_types_for_tenant(tenant_id, [definition])
+	}
+
+	pub fn register_logical_types_for_tenant(
+		&self,
+		tenant_id: TenantId,
+		definitions: impl IntoIterator<Item = LogicalTypeDefinitionV1>,
+	) -> Result<(), CatalogError> {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let mut registry = state
+			.logical_types
+			.get(&tenant_id)
+			.cloned()
+			.unwrap_or_default();
+		for definition in definitions {
+			registry.register_definition(definition).map_err(|error| {
+				CatalogError::AdminFailed {
+					message: error.to_string(),
+				}
+			})?;
+		}
+		state.logical_types.insert(tenant_id, registry);
+		Ok(())
+	}
+
+	pub fn logical_type_registry(&self, tenant_id: TenantId) -> LogicalTypeRegistry {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		state
+			.logical_types
+			.get(&tenant_id)
+			.cloned()
+			.unwrap_or_default()
+	}
+
+	pub fn resolve_logical_type_by_name(
+		&self,
+		tenant_id: TenantId,
+		name: &str,
+	) -> Option<crate::ir::LogicalTypeSpec> {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let registry = state.logical_types.get(&tenant_id)?;
+		LogicalTypeResolver::with_registry(registry).spec_by_name(name)
 	}
 
 	pub fn resolve_table(
@@ -1411,13 +1549,21 @@ impl WendelonCatalog {
 			}
 		};
 
-		let descriptor_result = client
-			.get_table_schema_descriptor(
-				wendelon_tenant_id(self.tenant_id),
-				&key.namespace,
-				&key.table_name,
-			)
-			.await;
+		let wendelon_tenant = wendelon_tenant_id(self.tenant_id);
+		let logical_types_result = client.list_logical_type_definitions(wendelon_tenant).await;
+		let descriptor_result = match logical_types_result {
+			Ok(definitions) => match self
+				.registry
+				.register_logical_types_for_tenant(self.tenant_id, definitions)
+			{
+				Ok(()) => client
+					.get_table_schema_descriptor(wendelon_tenant, &key.namespace, &key.table_name)
+					.await
+					.map_err(|error| error.to_string()),
+				Err(error) => Err(error.to_string()),
+			},
+			Err(error) => Err(error.to_string()),
+		};
 
 		let result = match descriptor_result {
 			Ok(Some(descriptor)) => self
@@ -1823,10 +1969,15 @@ fn pbc_eligible_columns(schema: &Schema) -> HashSet<ColumnOrdinal> {
 		.collect()
 }
 
-fn validate_logical_column_metadata(schema: &Schema) -> Result<(), CatalogError> {
+fn validate_logical_column_metadata(
+	schema: &Schema,
+	logical_types: LogicalTypeResolver<'_>,
+) -> Result<(), CatalogError> {
 	for field in schema.fields() {
-		decode_column_logical_type(field).map_err(|error| CatalogError::FingerprintResolution {
-			message: error.to_string(),
+		decode_column_logical_type_with_resolver(field, logical_types).map_err(|error| {
+			CatalogError::FingerprintResolution {
+				message: error.to_string(),
+			}
 		})?;
 	}
 	Ok(())
@@ -1877,6 +2028,9 @@ mod tests {
 	use super::*;
 	use crate::binder::{PlannerConfig, bind};
 	use crate::distributed::budget::{ByteCount, TenantBudget};
+	use crate::ir::{
+		DURABLE_LOGICAL_TYPE_MIN_ID, LOGICAL_TYPE_ID_METADATA_KEY, field_with_logical_type_metadata,
+	};
 	use crate::sql_planner::SqlPlanner;
 	use arrow::datatypes::{Field, Schema};
 	use std::collections::VecDeque;
@@ -1888,10 +2042,12 @@ mod tests {
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
 	};
+	use wendelon_client::LogicalTypePhysicalV1;
 
 	struct FakeDescriptorSyncClient {
 		responses: tokio::sync::Mutex<VecDeque<Result<Option<TableSchemaDescriptor>, ClientError>>>,
 		requests: tokio::sync::Mutex<Vec<(WendelonTenantId, String, String)>>,
+		logical_type_definitions: Vec<LogicalTypeDefinitionV1>,
 		calls: AtomicU64,
 		active: AtomicU64,
 		max_active: AtomicU64,
@@ -1907,6 +2063,7 @@ mod tests {
 			Self {
 				responses: tokio::sync::Mutex::new(responses.into_iter().collect()),
 				requests: tokio::sync::Mutex::new(Vec::new()),
+				logical_type_definitions: Vec::new(),
 				calls: AtomicU64::new(0),
 				active: AtomicU64::new(0),
 				max_active: AtomicU64::new(0),
@@ -1914,6 +2071,14 @@ mod tests {
 				release: Notify::new(),
 				hold_until_released: false,
 			}
+		}
+
+		fn with_logical_types(
+			mut self,
+			definitions: impl IntoIterator<Item = LogicalTypeDefinitionV1>,
+		) -> Self {
+			self.logical_type_definitions = definitions.into_iter().collect();
+			self
 		}
 
 		fn held(
@@ -1954,6 +2119,13 @@ mod tests {
 
 	#[async_trait::async_trait]
 	impl DescriptorSyncClient for FakeDescriptorSyncClient {
+		async fn list_logical_type_definitions(
+			&self,
+			_tenant_id: WendelonTenantId,
+		) -> Result<Vec<LogicalTypeDefinitionV1>, ClientError> {
+			Ok(self.logical_type_definitions.clone())
+		}
+
 		async fn get_table_schema_descriptor(
 			&self,
 			tenant_id: WendelonTenantId,
@@ -2141,6 +2313,47 @@ mod tests {
 			descriptor.physical_descriptor_fingerprint
 		);
 		assert_eq!(catalog.descriptor_sync_metrics().snapshot().success, 1);
+	}
+
+	#[tokio::test]
+	async fn resolve_table_bind_miss_syncs_logical_types_before_descriptor_decode() {
+		let definition = LogicalTypeDefinitionV1 {
+			logical_type_id: DURABLE_LOGICAL_TYPE_MIN_ID,
+			name: "PersonId".to_string(),
+			physical: LogicalTypePhysicalV1::Int64,
+		};
+		let descriptor = logical_descriptor(definition.logical_type_id);
+		let client = Arc::new(
+			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
+				.with_logical_types([definition.clone()]),
+		);
+		let registry = Arc::new(WendelonDescriptorRegistry::default());
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::clone(&registry),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor with dynamic logical id");
+
+		assert_eq!(client.call_count(), 1);
+		assert_eq!(
+			resolved.schema.field(0).metadata()[LOGICAL_TYPE_ID_METADATA_KEY],
+			DURABLE_LOGICAL_TYPE_MIN_ID.to_string()
+		);
+		assert_eq!(
+			registry
+				.logical_type_registry(TenantId(7))
+				.spec_by_name("PersonId")
+				.expect("synced logical type")
+				.id
+				.0,
+			definition.logical_type_id
+		);
 	}
 
 	#[tokio::test]
@@ -2933,6 +3146,30 @@ mod tests {
 
 	fn descriptor() -> TableSchemaDescriptor {
 		descriptor_with_identity(0xCA, 3)
+	}
+
+	fn logical_descriptor(logical_type_id: u32) -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![
+			field_with_logical_type_metadata(
+				"id",
+				DataType::Int64,
+				false,
+				crate::ir::LogicalTypeId(logical_type_id),
+			),
+			Field::new("amount", DataType::Int32, true),
+		]);
+
+		TableSchemaDescriptor::new(
+			TableObjectId::new([0xCC; 16]),
+			3,
+			"bench",
+			"orders",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.expect("descriptor")
 	}
 
 	fn default_descriptor_with_identity(id_byte: u8, generation: u64) -> TableSchemaDescriptor {

@@ -38,6 +38,25 @@ fn wendelon_table_source() -> String {
 		.expect("read Wendelon table schema source")
 }
 
+fn wendelon_compute_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
+		.expect("read Wendelon compute integration source")
+}
+
+fn wendelon_raft_storage_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/consensus/raft_storage.rs"))
+		.expect("read Wendelon raft storage source")
+}
+
+fn storage_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage source")
+}
+
+fn sql_planner_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read sql planner source")
+}
+
 fn source_block(source: &str, marker: &str) -> String {
 	brace_blocks_after_marker(source, marker)
 		.into_iter()
@@ -200,12 +219,12 @@ pub(crate) fn adr088_resolved_column_stays_physical_only() {
 #[test]
 pub(crate) fn adr088_field_metadata_decoder_validates_parse_registry_and_physical_type() {
 	let ir = ir_source();
-	let decoder = source_block(&ir, "pub fn decode_column_logical_type");
+	let decoder = source_block(&ir, "pub fn decode_column_logical_type_with_resolver");
 
 	assert!(decoder.contains("field.metadata().get(LOGICAL_TYPE_ID_METADATA_KEY)"));
 	assert!(decoder.contains("parse::<u32>()"));
 	assert!(decoder.contains("LogicalTypeId::NAKED"));
-	assert!(decoder.contains("logical_type_spec(id)"));
+	assert!(decoder.contains("resolver.spec(id)"));
 	assert!(decoder.contains("spec.physical != *field.data_type()"));
 	assert!(ir.contains("LogicalTypeMetadataError::InvalidDecimal"));
 	assert!(ir.contains("LogicalTypeMetadataError::UnknownId"));
@@ -215,13 +234,13 @@ pub(crate) fn adr088_field_metadata_decoder_validates_parse_registry_and_physica
 #[test]
 pub(crate) fn adr088_descriptor_binding_validates_declared_logical_metadata() {
 	let catalog = catalog_source();
-	let from_descriptor = source_block(&catalog, "pub fn from_descriptor");
+	let from_descriptor = source_block(&catalog, "pub fn from_descriptor_with_logical_types");
 
 	let arrow_schema = from_descriptor
 		.find("descriptor.arrow_schema()")
 		.expect("descriptor schema decode");
 	let validate = from_descriptor
-		.find("validate_logical_column_metadata(schema.as_ref())?")
+		.find("validate_logical_column_metadata(schema.as_ref(), logical_types)?")
 		.expect("logical metadata validation");
 	let row_identity = from_descriptor
 		.find("table_row_identity")
@@ -230,7 +249,7 @@ pub(crate) fn adr088_descriptor_binding_validates_declared_logical_metadata() {
 	assert!(arrow_schema < validate);
 	assert!(validate < row_identity);
 	assert!(catalog.contains("fn validate_logical_column_metadata"));
-	assert!(catalog.contains("decode_column_logical_type(field)"));
+	assert!(catalog.contains("decode_column_logical_type_with_resolver(field, logical_types)"));
 }
 
 #[test]
@@ -453,4 +472,91 @@ pub(crate) fn adr089_no_lineage_or_name_heuristic_inference() {
 		assert!(!block.contains("column_node"));
 		assert!(!block.contains("resolve_table"));
 	}
+}
+
+#[test]
+pub(crate) fn adr090_logical_type_authority_is_wendelon_metadata_not_toron_query_path() {
+	let compute = wendelon_compute_source();
+	let raft = wendelon_raft_storage_source();
+	let storage = storage_source();
+
+	assert!(compute.contains("SchemaObjectKind"));
+	assert!(compute.contains("LogicalType"));
+	assert!(compute.contains("pub struct LogicalTypeDefinitionV1"));
+	assert!(raft.contains("pub logical_types: LogicalTypeCatalogV1"));
+	assert!(raft.contains("apply_logical_type_schema_update"));
+	assert!(storage.contains("submit_logical_type_definition_create"));
+	assert!(storage.contains("get_logical_type_definition"));
+	assert!(catalog_source().contains("list_logical_type_definitions"));
+	assert!(!storage.contains("SELECT * FROM"));
+	assert!(!storage.contains("information_schema.logical_types"));
+}
+
+#[test]
+pub(crate) fn adr090_logical_type_id_allocation_is_wendelon_owned_and_durable() {
+	let compute = wendelon_compute_source();
+
+	assert!(compute.contains("LOGICAL_TYPE_RESERVED_STATIC_MAX_ID"));
+	assert!(compute.contains("fn next_id_for_tenant"));
+	assert!(compute.contains("logical_type_id: self.next_id_for_tenant(tenant_id)?"));
+	assert!(compute.contains("definitions_for_tenant"));
+	assert!(compute.contains("Serialize, Deserialize"));
+}
+
+#[test]
+pub(crate) fn adr090_decode_resolves_against_synced_registry_not_static_hardcode() {
+	let ir = ir_source();
+	let catalog = catalog_source();
+
+	assert!(ir.contains("pub struct LogicalTypeRegistry"));
+	assert!(ir.contains("pub struct LogicalTypeResolver"));
+	assert!(ir.contains("decode_column_logical_type_with_resolver"));
+	assert!(catalog.contains("TableBinding::from_descriptor_with_logical_types"));
+	assert!(catalog.contains("register_logical_type_for_tenant"));
+	assert!(catalog.contains("register_logical_types_for_tenant"));
+	assert!(catalog.contains("LogicalTypeResolver::with_registry"));
+}
+
+#[test]
+pub(crate) fn adr090_no_process_global_dynamic_logical_type_registry() {
+	let ir = ir_source();
+	let catalog = catalog_source();
+
+	assert!(!ir.contains("static LOGICAL_TYPE_REGISTRY"));
+	assert!(!ir.contains("lazy_static!"));
+	assert!(!ir.contains("OnceLock<LogicalTypeRegistry"));
+	assert!(!ir.contains("Mutex<LogicalTypeRegistry"));
+	assert!(!catalog.contains("static LOGICAL_TYPE_REGISTRY"));
+}
+
+#[test]
+pub(crate) fn adr090_create_logical_type_keyword_not_create_domain() {
+	let planner = sql_planner_source();
+
+	assert!(planner.contains("CREATE LOGICAL TYPE"));
+	assert!(planner.contains("try_lower_create_logical_type"));
+	assert!(!planner.contains("CREATE DOMAIN"));
+}
+
+#[test]
+pub(crate) fn adr090_static_pilot_seed_is_reserved_range_rune_test_bridge_only() {
+	let ir = ir_source();
+	let rune = rune_engine_source();
+
+	assert!(ir.contains("pub const CUSTOMER_ID_LOGICAL_TYPE: LogicalTypeId = LogicalTypeId(1);"));
+	assert!(ir.contains("pub const PRODUCT_ID_LOGICAL_TYPE: LogicalTypeId = LogicalTypeId(2);"));
+	assert!(ir.contains("pub const DURABLE_LOGICAL_TYPE_MIN_ID"));
+	assert!(rune.contains("CUSTOMER_ID_LOGICAL_TYPE"));
+	assert!(rune.contains("PRODUCT_ID_LOGICAL_TYPE"));
+}
+
+#[test]
+pub(crate) fn adr090_no_refinement_dropalter_or_pkfk_derivation() {
+	let compute = wendelon_compute_source();
+	let raft = wendelon_raft_storage_source();
+	let planner = sql_planner_source();
+
+	assert!(raft.contains("logical type ALTER/DROP is not supported"));
+	assert!(!planner.contains("PRIMARY KEY") || !planner.contains("LogicalTypePhysicalV1"));
+	assert!(!compute.contains("refinement"));
 }
