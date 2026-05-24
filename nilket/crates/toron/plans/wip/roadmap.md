@@ -5159,6 +5159,18 @@ along with the forward-sequence rewrite.
   projection, residual predicate (ids `[2,4]`), aggregate-arg sum `71`, div-by-zero
   NULL, overflow `Kernel`. Genuine 3-of-3 (Gemini's iter-0 overflow-→-NULL slip
   corrected + pinned). Migration: `plans/impl/084_rune_arithmetic_expressions.md`.
+- **ADR 085 — Rune Cast / TryCast.** Promoted. Explicit type control: `.cast(type)` /
+  `.try_cast(type)` `RuneExpr` methods → existing `Expr::Cast/TryCast` (ADR 024
+  substrate). Target type is a **typed carrier** (`RuneDataType` + `type_i32/i64/f32/
+  f64()`), not a string — compile-time-safe, guardable, no parser (the ADR 080 carrier
+  doctrine; `time_bucket`'s silent-zero string API is the counter-example).
+  Numeric-only `{Int32,Int64,Float32,Float64}`; no `safe_cast`. Semantics inherited
+  from ADR 024: `cast` strict → `Kernel "cast failed"`, `try_cast` → NULL.
+  PBC-ineligible → residual (like 084). **Reconciles two stale guards (discipline
+  #4):** the 082 scope guard *and* the 084 registration guard, both of which forbade
+  `cast`/`try_cast`. `rune_engine.rs`-localized. Genuine 3-of-3 (Gemini conceded its
+  string proposal to the carrier; Codex caught the 2nd guard). Migration:
+  `plans/impl/085_rune_cast_try_cast.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5243,7 +5255,37 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 084 promoted; ADR 085 candidates
+### ADR 085 promoted; ADR 086 candidates
+
+ADR 085 selected and promoted **Rune Cast / TryCast** — `.cast`/`.try_cast` over a
+typed `RuneDataType` carrier (numeric-only), lowering to existing `Expr::Cast/TryCast`.
+Completes Rune explicit numeric type control. Residual (PBC-ineligible). Genuine
+3-of-3 (typed carrier over strings; two stale guards reconciled).
+`rune_engine.rs`-localized.
+
+**ADR 086 candidates:**
+
+- **Rune `InList`** (the lead) — list membership over existing `Expr::InList`;
+  **pushes** (PBC-eligible), a new pushed-texture proof. Needs list-construction
+  ergonomics (`Vec<RuneExpr>`), `.not_in_list` negation (keyword-safe), empty-list +
+  typed-coercion policy. Kept separate from Like (different texture).
+- **Rune `Like`/`ILike`** (087) — pattern predicates over existing `Expr::Like`;
+  **residual**; needs pattern/case-sensitivity + `.not_like` negation.
+- **Residual minimization for factored shapes** (078 follow-on; strongest non-Rune
+  lead) — minimal `(R1 ∨ R2)` residual in `split_boolean_tree`, gated by 078's 3VL
+  fixture.
+- **Rune joins** — needs relation-alias + qualified-column ergonomics first.
+- **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex in-tree; CPU-cost contract); **`CASE`/
+  value-conditionals**; **Rune sort/limit**; dot-field sugar; **Wendelon typed
+  table-mutation trace continuation**.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+The migration is materialized in
+`plans/impl/085_rune_cast_try_cast.md`.
+
+### ADR 084 promoted; ADR 085 candidates (HISTORICAL)
 
 ADR 084 selected and promoted **Rune Arithmetic Expressions** — `.add`/`.sub`/`.mul`/
 `.div` lowering to existing `Expr`, closing the basic Rune numeric-expression gap
