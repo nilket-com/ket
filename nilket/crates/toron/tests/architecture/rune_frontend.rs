@@ -683,18 +683,20 @@ pub(crate) fn adr082_typed_literal_cut_does_not_expand_operator_surface() {
 		"logical_not",
 		"is_null",
 		"is_not_null",
+		"add",
+		"sub",
+		"mul",
+		"div",
 	] {
 		assert!(
 			names.iter().any(|name| name == retained),
-			"post-ADR083 Rune expression method `{retained}` missing: {names:?}"
+			"post-ADR084 Rune expression method `{retained}` missing: {names:?}"
 		);
 	}
-	for deferred in [
-		"not", "add", "sub", "mul", "div", "like", "ilike", "in_list", "cast", "try_cast",
-	] {
+	for deferred in ["not", "like", "ilike", "in_list", "cast", "try_cast"] {
 		assert!(
 			!names.iter().any(|name| name == deferred),
-			"post-ADR083 Rune surface must keep deferred operator `{deferred}` out: {names:?}"
+			"post-ADR084 Rune surface must keep deferred operator `{deferred}` out: {names:?}"
 		);
 	}
 }
@@ -755,6 +757,134 @@ pub(crate) fn adr083_rune_predicate_operators_lower_to_existing_expr_variants() 
 			"{function} must not introduce arithmetic"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr084_rune_arithmetic_methods_lower_to_existing_expr_variants() {
+	let rune = rune_engine_source();
+
+	for (function, variant) in [
+		("pub fn add", "Expr::Add"),
+		("pub fn sub", "Expr::Sub"),
+		("pub fn mul", "Expr::Mul"),
+		("pub fn div", "Expr::Div"),
+	] {
+		let body = source_block(&rune, function);
+		assert!(body.contains(variant), "{function} missing {variant}");
+		assert!(
+			body.contains("Box::new(self.expr)") && body.contains("Box::new(other.expr)"),
+			"{function} must lower both operands into existing Expr variants"
+		);
+		for forbidden in ["Expr::Cast", "Expr::TryCast", "BindingError", "BoundExpr"] {
+			assert!(
+				!body.contains(forbidden),
+				"{function} must not introduce substrate marker {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+pub(crate) fn adr084_rune_arithmetic_methods_are_registered() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+
+	for registration in [
+		"m.associated_function(\"add\", RuneExpr::add)?;",
+		"m.associated_function(\"sub\", RuneExpr::sub)?;",
+		"m.associated_function(\"mul\", RuneExpr::mul)?;",
+		"m.associated_function(\"div\", RuneExpr::div)?;",
+	] {
+		assert!(module.contains(registration), "missing {registration}");
+	}
+	for forbidden in [
+		"m.associated_function(\"cast\"",
+		"m.associated_function(\"try_cast\"",
+		"m.associated_function(\"mod\"",
+		"m.associated_function(\"neg\"",
+	] {
+		assert!(
+			!module.contains(forbidden),
+			"ADR084 registered deferred arithmetic-adjacent surface {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr084_rune_arithmetic_reuses_adr024_substrate() {
+	let rune = rune_engine_source();
+	let ir = ir_source();
+	let binder = binder_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+
+	for forbidden in [
+		"BindingError",
+		"BoundExpr",
+		"ExecutionPlan",
+		"PlannerConfig",
+		"normalize_",
+		"evaluate_expr",
+	] {
+		assert!(
+			!rune.contains(forbidden),
+			"Rune arithmetic surface gained substrate marker {forbidden}"
+		);
+	}
+	for variant in [
+		"Add(Box<Expr>, Box<Expr>)",
+		"Sub(Box<Expr>, Box<Expr>)",
+		"Mul(Box<Expr>, Box<Expr>)",
+		"Div(Box<Expr>, Box<Expr>)",
+	] {
+		assert!(ir.contains(variant), "IR missing existing {variant}");
+	}
+	for binder_arm in [
+		"Expr::Add(left, right) => bind_arithmetic",
+		"Expr::Sub(left, right) => bind_arithmetic",
+		"Expr::Mul(left, right) => bind_arithmetic",
+		"Expr::Div(left, right) => bind_arithmetic",
+	] {
+		assert!(binder.contains(binder_arm), "binder missing {binder_arm}");
+	}
+	assert!(binder.contains("fn bind_arithmetic"));
+	assert!(binder.contains("arithmetic_output_type(&left_type, &right_type)"));
+	for exec_arm in [
+		"Expr::Add(left, right)",
+		"Expr::Sub(left, right)",
+		"Expr::Mul(left, right)",
+		"Expr::Div(left, right)",
+	] {
+		assert!(exec.contains(exec_arm), "executor missing {exec_arm}");
+	}
+	assert!(exec.contains("fn evaluate_unbound_arithmetic"));
+	assert!(exec.contains("arithmetic_output_type(left.data_type(), right.data_type())"));
+	assert!(pbc.contains("BoundBinaryOp::Add"));
+}
+
+#[test]
+pub(crate) fn adr084_rune_arithmetic_remains_pbc_ineligible() {
+	let ir = ir_source();
+	let pbc = pbc_source();
+	let eligible_body = source_block(&ir, "pub fn is_pbc_pushdown_eligible");
+
+	for arithmetic in [
+		"Self::Add(_, _)",
+		"Self::Sub(_, _)",
+		"Self::Mul(_, _)",
+		"Self::Div(_, _)",
+	] {
+		assert!(
+			eligible_body.contains(arithmetic),
+			"is_pbc_pushdown_eligible missing arithmetic decline {arithmetic}"
+		);
+	}
+	assert!(eligible_body.contains("=> false"));
+	assert!(pbc.contains("BoundBinaryOp::Add"));
+	assert!(pbc.contains("BoundBinaryOp::Sub"));
+	assert!(pbc.contains("BoundBinaryOp::Mul"));
+	assert!(pbc.contains("BoundBinaryOp::Div"));
+	assert!(pbc.contains("arithmetic, Cast, and TryCast are not PBC-eligible"));
 }
 
 #[test]

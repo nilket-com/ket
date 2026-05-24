@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
-use toron::error::{BindingError, FrontendError, StorageError};
+use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue, TableId};
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
@@ -548,6 +548,168 @@ async fn rune_null_predicate_executes_against_nullable_column() {
 	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3)]);
 }
 
+#[tokio::test]
+async fn rune_arithmetic_computed_projection_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("amount").add(lit(1)).named("amount_plus_one"),
+                   col("amount").div(lit(2)).named("amount_half"),
+                   col("price").mul(lit_f64(2.0)).named("price_x2"),
+                   col("id").sub(lit_i64(1)).named("zero_based_id"),
+                   col("amount").add(col("price")).named("amount_plus_price"),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("arithmetic projection plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind arithmetic projection");
+	assert_schema_names(
+		bound.schema().as_ref(),
+		&[
+			"amount_plus_one",
+			"amount_half",
+			"price_x2",
+			"zero_based_id",
+			"amount_plus_price",
+		],
+	);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![Some(11), Some(21), None, Some(31), None, Some(8)]
+	);
+	assert_eq!(
+		int32_column_rows(&batches, 1),
+		vec![Some(5), Some(10), None, Some(15), None, Some(3)]
+	);
+	assert_eq!(
+		float64_column_rows(&batches, 2),
+		vec![
+			Some(21.0),
+			Some(40.5),
+			None,
+			Some(61.5),
+			Some(11.0),
+			Some(14.5)
+		]
+	);
+	assert_eq!(
+		int64_column_rows(&batches, 3),
+		vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
+	);
+	assert_eq!(
+		float64_column_rows(&batches, 4),
+		vec![
+			Some(20.5),
+			Some(40.25),
+			None,
+			Some(60.75),
+			None,
+			Some(14.25)
+		]
+	);
+}
+
+#[tokio::test]
+async fn rune_arithmetic_residual_filter_disposition_is_evaluate_in_toron() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .filter(col("amount").add(lit(1)).gt(lit(20)))
+        }
+    "#,
+	)
+	.await
+	.expect("arithmetic residual filter plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind arithmetic residual filter");
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(
+		scan_pbc(scan).is_none(),
+		"arithmetic predicate must not reach scan PBC"
+	);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(2), Some(4)]);
+}
+
+#[tokio::test]
+async fn rune_arithmetic_aggregate_argument_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [sum(col("amount").add(lit(1)))])
+        }
+    "#,
+	)
+	.await
+	.expect("arithmetic aggregate argument plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(71)]);
+}
+
+#[tokio::test]
+async fn rune_arithmetic_integer_division_by_zero_is_null() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("amount").div(col("amount").sub(col("amount"))).named("q")
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("integer division by zero plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![None, None, None, None, None, None]
+	);
+}
+
+#[tokio::test]
+async fn rune_arithmetic_integer_overflow_is_kernel_error() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   lit_i64(9223372036854775807).add(lit_i64(1)).named("overflow")
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("overflowing arithmetic plan");
+
+	let error = execute_logical(&logical)
+		.await
+		.expect_err("overflow should fail");
+	match error {
+		ExecutionError::Kernel { message } => assert!(
+			message.contains("arithmetic overflow"),
+			"unexpected overflow message: {message}"
+		),
+		other => panic!("expected kernel overflow error, got {other:?}"),
+	}
+}
+
 async fn predicate_operator_compound_filter_plan() -> LogicalPlan {
 	rune_plan(
 		r#"
@@ -580,15 +742,16 @@ async fn sql_group_by_alias_outer_sum_plan() -> LogicalPlan {
 }
 
 async fn run_logical(logical: &LogicalPlan) -> Vec<RecordBatch> {
-	let bound = bind(logical, &catalog(), &PlannerConfig::default())
-		.await
-		.expect("bind");
+	execute_logical(logical).await.expect("execute")
+}
+
+async fn execute_logical(logical: &LogicalPlan) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let bound = bind(logical, &catalog(), &PlannerConfig::default()).await?;
 	Executor::new(Arc::new(FixtureScan {
 		batches: HashMap::from([(TableId(1), sales_batch(sales_schema()))]),
 	}))
 	.execute_bound(&bound, None)
 	.await
-	.expect("execute")
 }
 
 fn catalog() -> MockCatalog {
@@ -702,6 +865,7 @@ impl StorageScan for FixtureScan {
 			})?;
 		}
 		if let Some(projected_columns) = request.projected_columns.as_ref() {
+			let row_count = batch.num_rows();
 			let schema = batch.schema();
 			let fields = projected_columns
 				.iter()
@@ -711,8 +875,17 @@ impl StorageScan for FixtureScan {
 				.iter()
 				.map(|ordinal| batch.column(ordinal.0 as usize).clone())
 				.collect::<Vec<_>>();
-			batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-				.expect("project fixture batch");
+			let projected_schema = Arc::new(Schema::new(fields));
+			batch = if columns.is_empty() {
+				RecordBatch::try_new_with_options(
+					projected_schema,
+					columns,
+					&RecordBatchOptions::new().with_row_count(Some(row_count)),
+				)
+				.expect("project fixture batch")
+			} else {
+				RecordBatch::try_new(projected_schema, columns).expect("project fixture batch")
+			};
 		}
 		Ok(ScanStream::from_batches(
 			batch.schema(),
@@ -796,6 +969,36 @@ fn int64_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<i64>>
 				.as_any()
 				.downcast_ref::<Int64Array>()
 				.expect("Int64 column")
+				.iter()
+				.collect::<Vec<_>>()
+		})
+		.collect()
+}
+
+fn int32_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<i32>> {
+	batches
+		.iter()
+		.flat_map(|batch| {
+			batch
+				.column(column)
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.expect("Int32 column")
+				.iter()
+				.collect::<Vec<_>>()
+		})
+		.collect()
+}
+
+fn float64_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<f64>> {
+	batches
+		.iter()
+		.flat_map(|batch| {
+			batch
+				.column(column)
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.expect("Float64 column")
 				.iter()
 				.collect::<Vec<_>>()
 		})

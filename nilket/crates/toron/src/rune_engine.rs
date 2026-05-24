@@ -448,6 +448,34 @@ impl RuneExpr {
 			expr: Expr::IsNotNull(Box::new(self.expr)),
 		}
 	}
+
+	#[allow(clippy::should_implement_trait)]
+	pub fn add(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Add(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	#[allow(clippy::should_implement_trait)]
+	pub fn sub(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Sub(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	#[allow(clippy::should_implement_trait)]
+	pub fn mul(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Mul(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
+
+	#[allow(clippy::should_implement_trait)]
+	pub fn div(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::Div(Box::new(self.expr), Box::new(other.expr)),
+		}
+	}
 }
 
 pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
@@ -497,6 +525,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("logical_not", RuneExpr::logical_not)?;
 	m.associated_function("is_null", RuneExpr::is_null)?;
 	m.associated_function("is_not_null", RuneExpr::is_not_null)?;
+	m.associated_function("add", RuneExpr::add)?;
+	m.associated_function("sub", RuneExpr::sub)?;
+	m.associated_function("mul", RuneExpr::mul)?;
+	m.associated_function("div", RuneExpr::div)?;
 
 	Ok(m)
 }
