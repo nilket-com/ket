@@ -15,6 +15,10 @@ fn binder_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
 }
 
+fn catalog_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
+}
+
 fn error_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/error.rs")).expect("read error source")
 }
@@ -22,6 +26,11 @@ fn error_source() -> String {
 fn rune_engine_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/rune_engine.rs"))
 		.expect("read rune engine source")
+}
+
+fn wendelon_table_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema source")
 }
 
 fn source_block(source: &str, marker: &str) -> String {
@@ -150,4 +159,170 @@ pub(crate) fn adr087_cast_outputs_naked_identity() {
 	assert!(!explicit_cast.contains("set_node_logical_type"));
 	assert!(try_cast.contains("builder.append_try_cast"));
 	assert!(!try_cast.contains("set_node_logical_type"));
+}
+
+#[test]
+pub(crate) fn adr088_uses_arrow_field_metadata_not_wendelon_descriptor_field() {
+	let ir = ir_source();
+	let wendelon = wendelon_table_source();
+
+	assert!(ir.contains("pub const LOGICAL_TYPE_ID_METADATA_KEY"));
+	assert!(ir.contains("\"nilket.toron.logical_type_id\""));
+	assert!(ir.contains("field.metadata().get(LOGICAL_TYPE_ID_METADATA_KEY)"));
+	assert!(!wendelon.contains("nilket.toron.logical_type_id"));
+	assert!(!wendelon.contains("LogicalTypeId"));
+}
+
+#[test]
+pub(crate) fn adr088_no_table_binding_parallel_logical_vector() {
+	let catalog = catalog_source();
+	let binding = source_block(&catalog, "pub struct TableBinding");
+
+	assert!(!binding.contains("logical_column_types"));
+	assert!(!binding.contains("Vec<LogicalTypeId>"));
+	assert!(binding.contains("pub schema: SchemaRef"));
+}
+
+#[test]
+pub(crate) fn adr088_resolved_column_stays_physical_only() {
+	let execution = execution_source();
+	let resolved = source_block(&execution, "pub struct ResolvedColumn");
+
+	assert!(resolved.contains("pub data_type: DataType"));
+	assert!(!resolved.contains("logical_type"));
+}
+
+#[test]
+pub(crate) fn adr088_field_metadata_decoder_validates_parse_registry_and_physical_type() {
+	let ir = ir_source();
+	let decoder = source_block(&ir, "pub fn decode_column_logical_type");
+
+	assert!(decoder.contains("field.metadata().get(LOGICAL_TYPE_ID_METADATA_KEY)"));
+	assert!(decoder.contains("parse::<u32>()"));
+	assert!(decoder.contains("LogicalTypeId::NAKED"));
+	assert!(decoder.contains("logical_type_spec(id)"));
+	assert!(decoder.contains("spec.physical != *field.data_type()"));
+	assert!(ir.contains("LogicalTypeMetadataError::InvalidDecimal"));
+	assert!(ir.contains("LogicalTypeMetadataError::UnknownId"));
+	assert!(ir.contains("LogicalTypeMetadataError::PhysicalMismatch"));
+}
+
+#[test]
+pub(crate) fn adr088_descriptor_binding_validates_declared_logical_metadata() {
+	let catalog = catalog_source();
+	let from_descriptor = source_block(&catalog, "pub fn from_descriptor");
+
+	let arrow_schema = from_descriptor
+		.find("descriptor.arrow_schema()")
+		.expect("descriptor schema decode");
+	let validate = from_descriptor
+		.find("validate_logical_column_metadata(schema.as_ref())?")
+		.expect("logical metadata validation");
+	let row_identity = from_descriptor
+		.find("table_row_identity")
+		.expect("row identity decode");
+
+	assert!(arrow_schema < validate);
+	assert!(validate < row_identity);
+	assert!(catalog.contains("fn validate_logical_column_metadata"));
+	assert!(catalog.contains("decode_column_logical_type(field)"));
+}
+
+#[test]
+pub(crate) fn adr088_column_binding_stamps_bound_expr_logical_sidecar() {
+	let binder = binder_source();
+	let bind_expr = source_block(&binder, "fn bind_expr_into_program");
+
+	let resolve = bind_expr
+		.find("resolve_logical_column(&column_ref.name.0, input_schema)?")
+		.expect("logical column resolution");
+	let append = bind_expr
+		.find("builder.append_column(column.column)")
+		.expect("physical column append");
+	let stamp = bind_expr
+		.find("builder.set_node_logical_type(node, column.logical_type)")
+		.expect("logical sidecar stamp");
+
+	assert!(resolve < append);
+	assert!(append < stamp);
+}
+
+#[test]
+pub(crate) fn adr088_join_key_takes_identity_from_catalog_metadata() {
+	let binder = binder_source();
+	let scope = source_block(&binder, "fn resolve_join_column");
+	let resolve = source_block(&binder, "fn resolve_logical_column");
+	let join_key = source_block(&binder, "fn resolved_join_key");
+
+	assert!(scope.contains("resolve_logical_column"));
+	assert!(resolve.contains("decode_column_logical_type(field)"));
+	assert!(join_key.contains("column.logical_type"));
+	assert!(join_key.contains("declared_logical_type"));
+	assert!(join_key.contains("reconcile_identity("));
+}
+
+#[test]
+pub(crate) fn adr088_identity_reconciliation_is_single_shared_helper() {
+	let binder = binder_source();
+	let reconcile = source_block(&binder, "fn reconcile_identity");
+	let ascription = source_block(&binder, "fn bind_logical_ascription");
+	let join_key = source_block(&binder, "fn resolved_join_key");
+
+	assert_eq!(binder.matches("fn reconcile_identity").count(), 1);
+	assert!(reconcile.contains("existing == declared"));
+	assert!(reconcile.contains("declared.is_naked()"));
+	assert!(reconcile.contains("existing.is_naked()"));
+	assert!(reconcile.contains("NominalTypeMismatch"));
+	assert!(ascription.contains("reconcile_identity(existing, logical_type, &physical)"));
+	assert!(join_key.contains("reconcile_identity("));
+}
+
+#[test]
+pub(crate) fn adr088_explicit_ascription_cannot_contradict_existing_identity() {
+	let binder = binder_source();
+	let ascription = source_block(&binder, "fn bind_logical_ascription");
+	let reconcile = source_block(&binder, "fn reconcile_identity");
+	let read_existing = ascription
+		.find("node_logical_type(inner)")
+		.expect("existing node logical identity read");
+	let reconcile_call = ascription
+		.find("reconcile_identity(existing, logical_type, &physical)")
+		.expect("logical identity reconciliation");
+	let stamp = ascription
+		.find("set_node_logical_type(inner, logical_type)")
+		.expect("logical sidecar stamp");
+
+	assert!(read_existing < reconcile_call);
+	assert!(reconcile_call < stamp);
+	assert!(reconcile.contains("NominalTypeMismatch"));
+}
+
+#[test]
+pub(crate) fn adr088_no_column_name_heuristic_for_logical_identity() {
+	let ir = ir_source();
+	let binder = binder_source();
+	let decoder = source_block(&ir, "pub fn decode_column_logical_type");
+	let resolve = source_block(&binder, "fn resolve_logical_column");
+
+	assert!(!decoder.contains("customer_id"));
+	assert!(!decoder.contains("product_id"));
+	assert!(!decoder.contains("field.name() =="));
+	assert!(!resolve.contains("customer_id"));
+	assert!(!resolve.contains("product_id"));
+}
+
+#[test]
+pub(crate) fn adr088_no_new_projection_or_ctas_logical_metadata_writer() {
+	let binder = binder_source();
+	let execution = execution_source();
+	let schema_for_exprs = source_block(&execution, "pub fn schema_for_exprs");
+	let named_project = source_block(&binder, "fn schema_for_exprs_with_output_names");
+	let pruned_project = source_block(&binder, "fn schema_for_projected_exprs_with_existing_names");
+	let ctas = source_block(&binder, "fn infer_ctas_schema");
+
+	for block in [schema_for_exprs, named_project, pruned_project, ctas] {
+		assert!(block.contains("Field::new"));
+		assert!(!block.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
+		assert!(!block.contains("with_metadata"));
+	}
 }

@@ -1,6 +1,6 @@
 use crate::catalog::TableRef;
 pub use crate::distributed::identity::{QueryId, StageId};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 #[path = "ir/execution.rs"]
@@ -21,6 +21,7 @@ impl LogicalTypeId {
 
 pub const CUSTOMER_ID_LOGICAL_TYPE: LogicalTypeId = LogicalTypeId(1);
 pub const PRODUCT_ID_LOGICAL_TYPE: LogicalTypeId = LogicalTypeId(2);
+pub const LOGICAL_TYPE_ID_METADATA_KEY: &str = "nilket.toron.logical_type_id";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalTypeSpec {
@@ -54,6 +55,95 @@ pub fn logical_type_name(id: LogicalTypeId) -> String {
 	logical_type_spec(id)
 		.map(|spec| spec.name.to_string())
 		.unwrap_or_else(|| format!("LogicalTypeId({})", id.0))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalTypeMetadataError {
+	InvalidDecimal {
+		field: String,
+		value_preview: String,
+	},
+	UnknownId {
+		field: String,
+		id: u32,
+	},
+	PhysicalMismatch {
+		field: String,
+		logical_type: &'static str,
+		expected: DataType,
+		actual: DataType,
+	},
+}
+
+impl std::fmt::Display for LogicalTypeMetadataError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::InvalidDecimal {
+				field,
+				value_preview,
+			} => write!(
+				formatter,
+				"logical type metadata for column {field} must be a decimal u32, got {value_preview:?}"
+			),
+			Self::UnknownId { field, id } => write!(
+				formatter,
+				"logical type metadata for column {field} references unknown id {id}"
+			),
+			Self::PhysicalMismatch {
+				field,
+				logical_type,
+				expected,
+				actual,
+			} => write!(
+				formatter,
+				"logical type metadata for column {field} declares {logical_type}({expected:?}) on {actual:?}"
+			),
+		}
+	}
+}
+
+impl std::error::Error for LogicalTypeMetadataError {}
+
+pub fn decode_column_logical_type(
+	field: &Field,
+) -> Result<LogicalTypeId, LogicalTypeMetadataError> {
+	let Some(raw) = field.metadata().get(LOGICAL_TYPE_ID_METADATA_KEY) else {
+		return Ok(LogicalTypeId::NAKED);
+	};
+	let id = raw.parse::<u32>().map(LogicalTypeId).map_err(|_| {
+		LogicalTypeMetadataError::InvalidDecimal {
+			field: field.name().clone(),
+			value_preview: metadata_value_preview(raw),
+		}
+	})?;
+	if id.is_naked() {
+		return Ok(id);
+	}
+	let Some(spec) = logical_type_spec(id) else {
+		return Err(LogicalTypeMetadataError::UnknownId {
+			field: field.name().clone(),
+			id: id.0,
+		});
+	};
+	if spec.physical != *field.data_type() {
+		return Err(LogicalTypeMetadataError::PhysicalMismatch {
+			field: field.name().clone(),
+			logical_type: spec.name,
+			expected: spec.physical,
+			actual: field.data_type().clone(),
+		});
+	}
+	Ok(id)
+}
+
+fn metadata_value_preview(value: &str) -> String {
+	const MAX_PREVIEW_CHARS: usize = 64;
+	let mut chars = value.chars();
+	let mut preview = chars.by_ref().take(MAX_PREVIEW_CHARS).collect::<String>();
+	if chars.next().is_some() {
+		preview.push_str("...");
+	}
+	preview
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

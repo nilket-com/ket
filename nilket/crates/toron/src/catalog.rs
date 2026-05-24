@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::distributed::budget::{QueryBudget, TenantBudgetPolicy, TenantDescriptorSyncAccountant};
 use crate::error::{CatalogError, StorageError};
-use crate::ir::{ColumnOrdinal, CreateTableRowIdentity, TableId};
+use crate::ir::{ColumnOrdinal, CreateTableRowIdentity, TableId, decode_column_logical_type};
 use crate::storage::TenantId;
 use wendelon::integration::compute::SchemaIntentId;
 use wendelon::schema::{
@@ -91,6 +91,7 @@ impl TableBinding {
 				message: error.to_string(),
 			}
 		})?);
+		validate_logical_column_metadata(schema.as_ref())?;
 
 		let row_identity = table_row_identity(&schema, descriptor)?;
 		let primary_key_columns = primary_key_columns(&schema, descriptor)?;
@@ -1820,6 +1821,15 @@ fn pbc_eligible_columns(schema: &Schema) -> HashSet<ColumnOrdinal> {
 			))
 		})
 		.collect()
+}
+
+fn validate_logical_column_metadata(schema: &Schema) -> Result<(), CatalogError> {
+	for field in schema.fields() {
+		decode_column_logical_type(field).map_err(|error| CatalogError::FingerprintResolution {
+			message: error.to_string(),
+		})?;
+	}
+	Ok(())
 }
 
 fn primary_key_columns(

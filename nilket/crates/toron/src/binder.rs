@@ -16,7 +16,7 @@ use crate::ir::{
 	ColumnOrdinal, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral,
 	JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId, PbcProgram, QueryProfileHint,
 	ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, arithmetic_output_type,
-	logical_type_name, logical_type_spec, schema_for_exprs,
+	decode_column_logical_type, logical_type_name, logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -1786,7 +1786,7 @@ impl Scope {
 		&self,
 		column_ref: &crate::ir::ColumnRef,
 		side: &'static str,
-	) -> Result<Option<ResolvedColumn>, BindingError> {
+	) -> Result<Option<ResolvedLogicalColumn>, BindingError> {
 		if let Some(qualifier) = &column_ref.qualifier {
 			if !self
 				.qualifiers
@@ -1795,10 +1795,10 @@ impl Scope {
 			{
 				return Ok(None);
 			}
-			return resolve_column(&column_ref.name.0, &self.schema).map(Some);
+			return resolve_logical_column(&column_ref.name.0, &self.schema).map(Some);
 		}
 
-		match resolve_column(&column_ref.name.0, &self.schema) {
+		match resolve_logical_column(&column_ref.name.0, &self.schema) {
 			Ok(column) => Ok(Some(column)),
 			Err(BindingError::UnknownColumn { .. }) => Ok(None),
 			Err(error) => Err(error),
@@ -1887,6 +1887,12 @@ struct ResolvedJoinKey {
 	logical_type: LogicalTypeId,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedLogicalColumn {
+	column: ResolvedColumn,
+	logical_type: LogicalTypeId,
+}
+
 fn join_key_column_ref(
 	expr: &Expr,
 ) -> Result<(&crate::ir::ColumnRef, LogicalTypeId), BindingError> {
@@ -1903,19 +1909,25 @@ fn join_key_column_ref(
 }
 
 fn resolved_join_key(
-	column: ResolvedColumn,
-	logical_type: LogicalTypeId,
+	column: ResolvedLogicalColumn,
+	declared_logical_type: LogicalTypeId,
 ) -> Result<ResolvedJoinKey, BindingError> {
-	validate_logical_ascription_physical(&column.data_type, logical_type)?;
+	validate_logical_ascription_physical(&column.column.data_type, declared_logical_type)?;
+	let logical_type = reconcile_identity(
+		column.logical_type,
+		declared_logical_type,
+		&column.column.data_type,
+	)?;
+	validate_logical_ascription_physical(&column.column.data_type, logical_type)?;
 	Ok(ResolvedJoinKey {
-		column,
+		column: column.column,
 		logical_type,
 	})
 }
 
 enum JoinColumnResolution {
-	Left(ResolvedColumn),
-	Right(ResolvedColumn),
+	Left(ResolvedLogicalColumn),
+	Right(ResolvedLogicalColumn),
 }
 
 fn resolve_join_column_across(
@@ -2799,7 +2811,14 @@ fn bind_expr_into_program(
 ) -> Result<BoundExprId, BindingError> {
 	match expr {
 		Expr::Column(column_ref) => {
-			Ok(builder.append_column(resolve_column(&column_ref.name.0, input_schema)?))
+			let column = resolve_logical_column(&column_ref.name.0, input_schema)?;
+			let node = builder.append_column(column.column);
+			if !builder.set_node_logical_type(node, column.logical_type) {
+				return Err(BindingError::UnsupportedExpression {
+					message: "logical column target is malformed".to_string(),
+				});
+			}
+			Ok(node)
 		}
 		Expr::Literal(value) => Ok(builder.append_literal(value.clone())),
 		Expr::LogicalAscription { expr, logical_type } => {
@@ -2967,6 +2986,10 @@ fn bind_logical_ascription(
 		.cloned()
 		.expect("builder returns typed logical ascription input");
 	validate_logical_ascription_physical(&physical, logical_type)?;
+	let existing = builder
+		.node_logical_type(inner)
+		.expect("builder returns logical type for logical ascription input");
+	let logical_type = reconcile_identity(existing, logical_type, &physical)?;
 	if !builder.set_node_logical_type(inner, logical_type) {
 		return Err(BindingError::UnsupportedExpression {
 			message: "logical ascription target is malformed".to_string(),
@@ -3350,6 +3373,27 @@ fn nominal_compatible(
 	})
 }
 
+fn reconcile_identity(
+	existing: LogicalTypeId,
+	declared: LogicalTypeId,
+	physical: &DataType,
+) -> Result<LogicalTypeId, BindingError> {
+	if existing == declared {
+		return Ok(existing);
+	}
+	if declared.is_naked() {
+		return Ok(existing);
+	}
+	if existing.is_naked() {
+		return Ok(declared);
+	}
+	Err(BindingError::NominalTypeMismatch {
+		left: logical_type_name(existing),
+		right: logical_type_name(declared),
+		physical: format!("{physical:?}"),
+	})
+}
+
 fn bind_like(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
@@ -3478,6 +3522,22 @@ fn resolve_column(name: &str, input_schema: &SchemaRef) -> Result<ResolvedColumn
 		data_type: field.data_type().clone(),
 		nullable: field.is_nullable(),
 		pbc_eligible: is_pbc_eligible_type(field.data_type()),
+	})
+}
+
+fn resolve_logical_column(
+	name: &str,
+	input_schema: &SchemaRef,
+) -> Result<ResolvedLogicalColumn, BindingError> {
+	let column = resolve_column(name, input_schema)?;
+	let field = input_schema.field(column.ordinal.0 as usize);
+	let logical_type =
+		decode_column_logical_type(field).map_err(|error| BindingError::UnsupportedExpression {
+			message: error.to_string(),
+		})?;
+	Ok(ResolvedLogicalColumn {
+		column,
+		logical_type,
 	})
 }
 
