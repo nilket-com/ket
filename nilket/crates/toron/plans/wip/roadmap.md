@@ -5171,6 +5171,18 @@ along with the forward-sequence rewrite.
   `cast`/`try_cast`. `rune_engine.rs`-localized. Genuine 3-of-3 (Gemini conceded its
   string proposal to the carrier; Codex caught the 2nd guard). Migration:
   `plans/impl/085_rune_cast_try_cast.md`.
+- **ADR 086 — Rune InList Membership.** Promoted. `.in_list`/`.not_in_list`
+  (`VmResult`-returning `RuneExpr` methods over `Vec<RuneExpr>`) → existing
+  `Expr::InList`; native `negated: true`. **First post-cast cut that pushes** —
+  `FullyPushed` + `OP_IN_LIST` (negated → `+OP_NOT`) when target+members are
+  PBC-eligible; computed target or members → residual `EvaluateInToron`. Re-validates
+  the ADR 074 frontend bound **in Rune** (non-empty + <=32, SQL-parity messages) because the
+  planner's `lower_in_list` is bypassed; a guard pins `RUNE_MAX_IN_LIST_ITEMS ==
+  MAX_IN_LIST_ITEMS`. Inherits binder coercion + type-mismatch + 3VL (NULL under
+  `NOT IN` excluded). Reconciles the 082 scope guard (discipline #4).
+  `rune_engine.rs`-localized; no IR/binder/executor/PBC change. Genuine 3-of-3 (Codex
+  caught the planner-bypass; Claude conceded + adopted Codex's type-correct fixture +
+  Gemini's split parity guard). Migration: `plans/impl/086_rune_in_list.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -5255,7 +5267,34 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 085 promoted; ADR 086 candidates
+### ADR 086 promoted; ADR 087 candidates
+
+ADR 086 selected and promoted **Rune InList Membership** — `.in_list`/`.not_in_list`
+over existing `Expr::InList`, the first post-cast Rune cut that **pushes**
+(`FullyPushed` + `OP_IN_LIST`), with in-Rune ADR-074 bound parity.
+`rune_engine.rs`-localized. Genuine 3-of-3.
+
+**ADR 087 candidates:**
+
+- **Rune `Like`/`ILike`** (the lead; 086 sibling) — pattern predicates over existing
+  `Expr::Like { pattern, negated, case_insensitive }`; **residual** (PBC-ineligible);
+  needs pattern (literal `String`, per 075), case-sensitivity (`like` vs `ilike`), and
+  `.not_like` negation (keyword-safe). Completes the common filter idioms.
+- **Residual minimization for factored shapes** (078 follow-on; strongest non-Rune
+  lead) — minimal `(R1 ∨ R2)` residual in `split_boolean_tree`, gated by 078's 3VL
+  fixture.
+- **Rune joins** — needs relation-alias + qualified-column ergonomics first.
+- **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex in-tree; CPU-cost contract); **`CASE`/
+  value-conditionals**; **Rune sort/limit**; dot-field sugar; **Wendelon typed
+  table-mutation trace continuation**.
+- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+The migration is materialized in
+`plans/impl/086_rune_in_list.md`.
+
+### ADR 085 promoted; ADR 086 candidates (HISTORICAL)
 
 ADR 085 selected and promoted **Rune Cast / TryCast** — `.cast`/`.try_cast` over a
 typed `RuneDataType` carrier (numeric-only), lowering to existing `Expr::Cast/TryCast`.
