@@ -7,6 +7,7 @@ use crate::catalog::TableRef;
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{
 	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId, ScalarValue,
+	field_with_logical_type_metadata,
 };
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
@@ -574,6 +575,10 @@ impl BoundExprProgram {
 		self.node_nullable(*self.roots.get(root_index)?)
 	}
 
+	pub fn root_logical_type(&self, root_index: usize) -> Option<LogicalTypeId> {
+		self.node_logical_type(*self.roots.get(root_index)?)
+	}
+
 	pub fn node_nullable(&self, id: BoundExprId) -> Option<bool> {
 		let node = self.node(id)?;
 		match node {
@@ -801,7 +806,8 @@ pub fn schema_for_exprs(exprs: &BoundExprProgram) -> SchemaRef {
 				.unwrap_or_else(|| format!("col_{idx}"));
 			let data_type = exprs.root_type(idx).cloned().unwrap_or(DataType::Null);
 			let nullable = exprs.root_nullable(idx).unwrap_or(true);
-			Field::new(name, data_type, nullable)
+			let logical_type = exprs.root_logical_type(idx).unwrap_or(LogicalTypeId::NAKED);
+			field_with_logical_type_metadata(name, data_type, nullable, logical_type)
 		})
 		.collect::<Vec<_>>();
 	Arc::new(Schema::new(fields))

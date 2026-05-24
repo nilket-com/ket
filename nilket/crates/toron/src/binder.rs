@@ -16,7 +16,8 @@ use crate::ir::{
 	ColumnOrdinal, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral,
 	JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId, PbcProgram, QueryProfileHint,
 	ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, arithmetic_output_type,
-	decode_column_logical_type, logical_type_name, logical_type_spec, schema_for_exprs,
+	decode_column_logical_type, field_with_logical_type_metadata, logical_type_name,
+	logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -776,10 +777,16 @@ fn infer_ctas_schema(source_schema: &SchemaRef) -> Result<SchemaRef, BindingErro
 				),
 			});
 		}
-		fields.push(Field::new(
+		let logical_type = decode_column_logical_type(field).map_err(|error| {
+			BindingError::UnsupportedExpression {
+				message: error.to_string(),
+			}
+		})?;
+		fields.push(field_with_logical_type_metadata(
 			field.name().clone(),
 			field.data_type().clone(),
 			field.is_nullable(),
+			logical_type,
 		));
 	}
 	Ok(Arc::new(Schema::new(fields)))
@@ -3573,7 +3580,8 @@ fn schema_for_exprs_with_output_names(
 				.unwrap_or_else(|| derived.field(idx).name().clone());
 			let data_type = exprs.root_type(idx).cloned().unwrap_or(DataType::Null);
 			let nullable = exprs.root_nullable(idx).unwrap_or(true);
-			Field::new(name, data_type, nullable)
+			let logical_type = exprs.root_logical_type(idx).unwrap_or(LogicalTypeId::NAKED);
+			field_with_logical_type_metadata(name, data_type, nullable, logical_type)
 		})
 		.collect::<Vec<_>>();
 	Arc::new(Schema::new(fields))
@@ -3601,7 +3609,8 @@ fn schema_for_projected_exprs_with_existing_names(
 				});
 			let data_type = exprs.root_type(idx).cloned().unwrap_or(DataType::Null);
 			let nullable = exprs.root_nullable(idx).unwrap_or(true);
-			Field::new(name, data_type, nullable)
+			let logical_type = exprs.root_logical_type(idx).unwrap_or(LogicalTypeId::NAKED);
+			field_with_logical_type_metadata(name, data_type, nullable, logical_type)
 		})
 		.collect::<Vec<_>>();
 	Arc::new(Schema::new(fields))

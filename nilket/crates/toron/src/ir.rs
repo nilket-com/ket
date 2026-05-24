@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::catalog::TableRef;
 pub use crate::distributed::identity::{QueryId, StageId};
 use arrow::datatypes::{DataType, Field, SchemaRef};
@@ -134,6 +136,22 @@ pub fn decode_column_logical_type(
 		});
 	}
 	Ok(id)
+}
+
+pub fn field_with_logical_type_metadata(
+	name: impl Into<String>,
+	data_type: DataType,
+	nullable: bool,
+	logical_type: LogicalTypeId,
+) -> Field {
+	let field = Field::new(name, data_type, nullable);
+	if logical_type.is_naked() {
+		return field;
+	}
+	field.with_metadata(HashMap::from([(
+		LOGICAL_TYPE_ID_METADATA_KEY.to_string(),
+		logical_type.0.to_string(),
+	)]))
 }
 
 fn metadata_value_preview(value: &str) -> String {

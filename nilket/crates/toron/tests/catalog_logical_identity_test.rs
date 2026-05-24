@@ -5,14 +5,19 @@ use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::{MockCatalog, TableRef};
-use toron::error::{BindingError, CatalogError, StorageError};
+use toron::catalog::{Catalog, MockCatalog, TableRef};
+use toron::coordinator::QueryCoordinator;
+use toron::error::{BindingError, CatalogError, QueryError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, LOGICAL_TYPE_ID_METADATA_KEY,
-	LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, ScalarValue, TableId,
+	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, JoinKind, JoinStrategy,
+	LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, QueryId,
+	ScalarValue, SessionId, TableId, decode_column_logical_type,
 };
-use toron::storage::{ScanRequest, ScanStream, StorageScan};
+use toron::storage::{
+	InMemoryTableStorage, ScanRequest, ScanStream, StorageScan, StorageWrite, TenantId,
+	WriteRequest,
+};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
@@ -236,6 +241,297 @@ async fn catalog_logical_explicit_restate_contradict_and_cast_reascribe() {
 	.expect("explicit cast erases catalog identity before re-ascription");
 }
 
+#[tokio::test]
+async fn projection_alias_preserves_identity() {
+	let schema = bound_schema(project_sales(
+		vec![Expr::column("customer_id")],
+		vec![Some("cid")],
+	))
+	.await;
+
+	assert_eq!(schema.field(0).name(), "cid");
+	assert_field_logical_type(&schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+}
+
+#[tokio::test]
+async fn projection_alias_same_identity_binds() {
+	bind(
+		&LogicalPlan::Filter {
+			input: Box::new(project_sales(
+				vec![Expr::column("customer_id"), Expr::column("alt_customer_id")],
+				vec![Some("cid"), Some("aid")],
+			)),
+			predicate: Expr::Eq(Box::new(Expr::column("cid")), Box::new(Expr::column("aid"))),
+		},
+		&sales_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("same identity aliases bind");
+}
+
+#[tokio::test]
+async fn projection_alias_different_identity_rejects() {
+	let error = bind(
+		&LogicalPlan::Filter {
+			input: Box::new(project_sales(
+				vec![Expr::column("customer_id"), Expr::column("product_id")],
+				vec![Some("cid"), Some("pid")],
+			)),
+			predicate: Expr::Eq(Box::new(Expr::column("cid")), Box::new(Expr::column("pid"))),
+		},
+		&sales_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("different identity aliases reject");
+
+	assert_nominal_mismatch(error, "CustomerId", "ProductId", "Int64");
+}
+
+#[tokio::test]
+async fn computed_projection_stays_naked() {
+	bind(
+		&LogicalPlan::Filter {
+			input: Box::new(project_sales(
+				vec![
+					add_zero(Expr::column("customer_id")),
+					Expr::column("raw_id"),
+				],
+				vec![Some("cid_value"), None],
+			)),
+			predicate: Expr::Eq(
+				Box::new(Expr::column("cid_value")),
+				Box::new(Expr::column("raw_id")),
+			),
+		},
+		&sales_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("computed projection is naked and can compare to naked raw id");
+
+	let schema = bound_schema(project_sales(
+		vec![add_zero(Expr::column("customer_id"))],
+		vec![Some("cid_value")],
+	))
+	.await;
+	assert_field_logical_type(&schema, 0, LogicalTypeId::NAKED);
+}
+
+#[tokio::test]
+async fn explicit_ascribed_computed_projection_carries_identity() {
+	let schema = bound_schema(project_sales(
+		vec![ascribe(
+			add_zero(Expr::column("customer_id")),
+			CUSTOMER_ID_LOGICAL_TYPE,
+		)],
+		vec![Some("cid_value")],
+	))
+	.await;
+	assert_field_logical_type(&schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+
+	bind(
+		&LogicalPlan::Filter {
+			input: Box::new(project_sales(
+				vec![
+					ascribe(
+						add_zero(Expr::column("customer_id")),
+						CUSTOMER_ID_LOGICAL_TYPE,
+					),
+					Expr::column("alt_customer_id"),
+				],
+				vec![Some("cid_value"), Some("aid")],
+			)),
+			predicate: Expr::Eq(
+				Box::new(Expr::column("cid_value")),
+				Box::new(Expr::column("aid")),
+			),
+		},
+		&sales_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("explicitly ascribed computed identity binds against same identity");
+}
+
+#[tokio::test]
+async fn aggregate_group_key_preserves_identity() {
+	let schema = bound_schema(LogicalPlan::Aggregate {
+		input: Box::new(scan("sales")),
+		group_expr: vec![Expr::column("customer_id"), Expr::column("raw_id")],
+		aggr_expr: vec![(AggregateFunction::CountAll, vec![])],
+	})
+	.await;
+
+	assert_field_logical_type(&schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+	assert_field_logical_type(&schema, 1, LogicalTypeId::NAKED);
+
+	let error = bind(
+		&LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::Aggregate {
+				input: Box::new(scan("sales")),
+				group_expr: vec![Expr::column("customer_id"), Expr::column("raw_id")],
+				aggr_expr: vec![(AggregateFunction::CountAll, vec![])],
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::column("customer_id")),
+				Box::new(Expr::column("raw_id")),
+			),
+		},
+		&sales_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("group key identity survives into post-aggregate filter");
+
+	assert_nominal_mismatch(error, "CustomerId", "naked", "Int64");
+}
+
+#[tokio::test]
+async fn aggregate_output_stays_naked() {
+	let schema = bound_schema(LogicalPlan::Aggregate {
+		input: Box::new(scan("sales")),
+		group_expr: vec![],
+		aggr_expr: vec![(AggregateFunction::Sum, vec![Expr::column("customer_id")])],
+	})
+	.await;
+
+	assert_field_logical_type(&schema, 0, LogicalTypeId::NAKED);
+}
+
+#[tokio::test]
+async fn project_pruning_preserves_identity() {
+	let schema = bound_schema(LogicalPlan::Project {
+		input: Box::new(project_sales(
+			vec![Expr::column("customer_id"), Expr::column("product_id")],
+			vec![Some("cid"), Some("pid")],
+		)),
+		exprs: vec![Expr::column("cid")],
+		output_names: vec![None],
+	})
+	.await;
+
+	assert_eq!(schema.field(0).name(), "cid");
+	assert_field_logical_type(&schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+}
+
+#[tokio::test]
+async fn ctas_direct_projection_materializes_identity_in_descriptor() {
+	let schema = bound_ctas_schema(project_sales(
+		vec![Expr::column("customer_id")],
+		vec![Some("cid")],
+	))
+	.await;
+
+	assert_eq!(schema.field(0).name(), "cid");
+	assert_field_logical_type(&schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+}
+
+#[tokio::test]
+async fn ctas_computed_projection_stays_naked_in_descriptor() {
+	let schema = bound_ctas_schema(project_sales(
+		vec![add_zero(Expr::column("customer_id"))],
+		vec![Some("cid_value")],
+	))
+	.await;
+
+	assert_field_logical_type(&schema, 0, LogicalTypeId::NAKED);
+}
+
+#[tokio::test]
+async fn ctas_if_not_exists_over_naked_target_rejects_schema_mismatch() {
+	let catalog = Arc::new(sales_catalog());
+	catalog
+		.create_table(
+			&TableRef::new("copy"),
+			Arc::new(Schema::new(vec![Field::new("cid", DataType::Int64, false)])),
+			false,
+		)
+		.await
+		.expect("create naked target");
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let coordinator = logical_identity_coordinator(catalog, storage);
+
+	let error = coordinator
+		.execute_query(&ctas_project_customer_id_as_cid(true), None)
+		.await
+		.expect_err("naked target is incompatible with identity-bearing CTAS schema");
+
+	assert!(
+		matches!(
+			error,
+			QueryError::Catalog(CatalogError::SchemaMismatch { .. })
+		),
+		"unexpected error: {error}"
+	);
+}
+
+#[tokio::test]
+async fn ctas_if_not_exists_identity_target_is_idempotent_on_reissue() {
+	let (catalog, storage, coordinator) = seeded_logical_identity_coordinator().await;
+	coordinator
+		.execute_query(&ctas_project_customer_id_as_cid(true), None)
+		.await
+		.expect("first CTAS creates target");
+
+	let results = coordinator
+		.execute_query(&ctas_project_customer_id_as_cid(true), None)
+		.await
+		.expect("second identical CTAS is a no-op");
+
+	assert!(results.is_empty());
+	let binding = catalog
+		.resolve_table(&TableRef::new("copy"))
+		.await
+		.expect("resolve CTAS target");
+	assert_field_logical_type(&binding.schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+	assert_eq!(storage.table_count(), 2);
+}
+
+#[tokio::test]
+async fn ctas_created_logical_projection_rebinds_as_source_without_fail_closed() {
+	let (catalog, _storage, coordinator) = seeded_logical_identity_coordinator().await;
+	coordinator
+		.execute_query(&ctas_project_customer_id_as_cid(false), None)
+		.await
+		.expect("CTAS creates identity-bearing target");
+
+	bind(
+		&filter(
+			"copy",
+			Expr::Eq(
+				Box::new(Expr::column("cid")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(1)))),
+			),
+		),
+		catalog.as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("CTAS-created logical metadata rebinds cleanly");
+}
+
+#[tokio::test]
+async fn projection_alias_round_trips_without_fail_closed() {
+	bind(
+		&LogicalPlan::Filter {
+			input: Box::new(project_sales(
+				vec![Expr::column("customer_id")],
+				vec![Some("cid")],
+			)),
+			predicate: Expr::Eq(
+				Box::new(Expr::column("cid")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(1)))),
+			),
+		},
+		&sales_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("alias-preserved identity decodes and binds downstream");
+}
+
 fn filter(table: &str, predicate: Expr) -> LogicalPlan {
 	LogicalPlan::Filter {
 		input: Box::new(scan(table)),
@@ -255,6 +551,105 @@ fn ascribe(expr: Expr, logical_type: LogicalTypeId) -> Expr {
 		expr: Box::new(expr),
 		logical_type,
 	}
+}
+
+fn add_zero(expr: Expr) -> Expr {
+	Expr::Add(
+		Box::new(expr),
+		Box::new(Expr::Literal(ScalarValue::Int64(Some(0)))),
+	)
+}
+
+fn project_sales(exprs: Vec<Expr>, output_names: Vec<Option<&str>>) -> LogicalPlan {
+	LogicalPlan::Project {
+		input: Box::new(scan("sales")),
+		exprs,
+		output_names: output_names
+			.into_iter()
+			.map(|name| name.map(str::to_string))
+			.collect(),
+	}
+}
+
+fn ctas_project_customer_id_as_cid(if_not_exists: bool) -> LogicalPlan {
+	LogicalPlan::CreateTableAsSelect {
+		table: TableRef::new("copy"),
+		if_not_exists,
+		or_replace: false,
+		source: Box::new(project_sales(
+			vec![Expr::column("customer_id")],
+			vec![Some("cid")],
+		)),
+	}
+}
+
+async fn bound_schema(logical: LogicalPlan) -> SchemaRef {
+	bind(&logical, &sales_catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind")
+		.schema()
+}
+
+async fn bound_ctas_schema(source: LogicalPlan) -> SchemaRef {
+	let plan = LogicalPlan::CreateTableAsSelect {
+		table: TableRef::new("copy"),
+		if_not_exists: false,
+		or_replace: false,
+		source: Box::new(source),
+	};
+	let bound = bind(&plan, &sales_catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind CTAS");
+	let ExecutionPlan::CreateTableAsSelect { schema, .. } = bound else {
+		panic!("expected CTAS execution plan");
+	};
+	schema
+}
+
+async fn seeded_logical_identity_coordinator() -> (
+	Arc<MockCatalog>,
+	Arc<InMemoryTableStorage>,
+	QueryCoordinator,
+) {
+	let catalog = Arc::new(sales_catalog());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	seed_sales_storage(catalog.as_ref(), storage.as_ref()).await;
+	let coordinator = logical_identity_coordinator(catalog.clone(), storage.clone());
+	(catalog, storage, coordinator)
+}
+
+fn logical_identity_coordinator(
+	catalog: Arc<MockCatalog>,
+	storage: Arc<InMemoryTableStorage>,
+) -> QueryCoordinator {
+	QueryCoordinator::with_writer(
+		catalog,
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(storage)
+}
+
+async fn seed_sales_storage(catalog: &MockCatalog, storage: &InMemoryTableStorage) {
+	let binding = catalog
+		.resolve_table(&TableRef::new("sales"))
+		.await
+		.expect("resolve sales");
+	storage
+		.write(WriteRequest {
+			session_id: SessionId(1),
+			query_id: QueryId::from_u128(1),
+			tenant_id: TenantId(0),
+			table_id: binding.legacy_table_id,
+			table_object_id: binding.table,
+			physical_descriptor_fingerprint: binding.fingerprint,
+			payload: sales_batch(),
+			profile_hint: None,
+			trace_context: None,
+		})
+		.await
+		.expect("seed sales storage");
 }
 
 fn join_plan(left_key: Expr, right_key: Expr) -> LogicalPlan {
@@ -346,6 +741,11 @@ fn logical_field_with_raw(name: &str, data_type: DataType, raw: &str) -> Field {
 		LOGICAL_TYPE_ID_METADATA_KEY.to_string(),
 		raw.to_string(),
 	)]))
+}
+
+fn assert_field_logical_type(schema: &SchemaRef, index: usize, expected: LogicalTypeId) {
+	let actual = decode_column_logical_type(schema.field(index)).expect("decode logical metadata");
+	assert_eq!(actual, expected);
 }
 
 fn sales_batch() -> RecordBatch {

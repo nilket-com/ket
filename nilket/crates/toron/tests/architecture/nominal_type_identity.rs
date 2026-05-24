@@ -19,6 +19,11 @@ fn catalog_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
 }
 
+fn coordinator_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source")
+}
+
 fn error_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/error.rs")).expect("read error source")
 }
@@ -312,17 +317,140 @@ pub(crate) fn adr088_no_column_name_heuristic_for_logical_identity() {
 }
 
 #[test]
-pub(crate) fn adr088_no_new_projection_or_ctas_logical_metadata_writer() {
+pub(crate) fn adr089_logical_metadata_writer_is_centralized() {
+	let ir = ir_source();
 	let binder = binder_source();
 	let execution = execution_source();
-	let schema_for_exprs = source_block(&execution, "pub fn schema_for_exprs");
-	let named_project = source_block(&binder, "fn schema_for_exprs_with_output_names");
-	let pruned_project = source_block(&binder, "fn schema_for_projected_exprs_with_existing_names");
-	let ctas = source_block(&binder, "fn infer_ctas_schema");
+	let writer = source_block(&ir, "pub fn field_with_logical_type_metadata");
 
-	for block in [schema_for_exprs, named_project, pruned_project, ctas] {
-		assert!(block.contains("Field::new"));
-		assert!(!block.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
-		assert!(!block.contains("with_metadata"));
+	assert!(writer.contains("Field::new(name, data_type, nullable)"));
+	assert!(writer.contains("logical_type.is_naked()"));
+	assert!(writer.contains("field.with_metadata"));
+	assert!(writer.contains("LOGICAL_TYPE_ID_METADATA_KEY.to_string()"));
+
+	let production = [ir.as_str(), execution.as_str(), binder.as_str()];
+	let writer_defs = production
+		.iter()
+		.map(|source| {
+			source
+				.matches("pub fn field_with_logical_type_metadata")
+				.count()
+		})
+		.sum::<usize>();
+	assert_eq!(writer_defs, 1);
+
+	for block in [
+		source_block(&execution, "pub fn schema_for_exprs"),
+		source_block(&binder, "fn schema_for_exprs_with_output_names"),
+		source_block(&binder, "fn schema_for_projected_exprs_with_existing_names"),
+		source_block(&binder, "fn infer_ctas_schema"),
+	] {
+		assert!(block.contains("field_with_logical_type_metadata"));
+		assert!(!block.contains(".with_metadata"));
+	}
+}
+
+#[test]
+pub(crate) fn adr089_schema_for_exprs_writes_root_sidecar() {
+	let execution = execution_source();
+	let schema_for_exprs = source_block(&execution, "pub fn schema_for_exprs");
+
+	assert!(execution.contains("pub fn root_logical_type(&self, root_index: usize)"));
+	assert!(schema_for_exprs.contains("root_logical_type(idx)"));
+	assert!(schema_for_exprs.contains("unwrap_or(LogicalTypeId::NAKED)"));
+	assert!(schema_for_exprs.contains("field_with_logical_type_metadata"));
+	assert!(!schema_for_exprs.contains("decode_column_logical_type"));
+}
+
+#[test]
+pub(crate) fn adr089_named_projection_preserves_metadata_on_rename() {
+	let binder = binder_source();
+	let named_project = source_block(&binder, "fn schema_for_exprs_with_output_names");
+
+	assert!(named_project.contains("output_names[idx]"));
+	assert!(named_project.contains("root_logical_type(idx)"));
+	assert!(named_project.contains("field_with_logical_type_metadata"));
+	assert!(!named_project.contains("decode_column_logical_type"));
+	assert!(!named_project.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
+}
+
+#[test]
+pub(crate) fn adr089_project_pruning_preserves_root_identity() {
+	let binder = binder_source();
+	let pruned_project = source_block(&binder, "fn schema_for_projected_exprs_with_existing_names");
+
+	assert!(pruned_project.contains("requested_outputs"));
+	assert!(pruned_project.contains("root_logical_type(idx)"));
+	assert!(pruned_project.contains("field_with_logical_type_metadata"));
+	assert!(!pruned_project.contains("decode_column_logical_type"));
+	assert!(!pruned_project.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
+}
+
+#[test]
+pub(crate) fn adr089_group_keys_preserve_identity_aggregate_outputs_naked() {
+	let binder = binder_source();
+	let aggregate_schema = source_block(&binder, "fn aggregate_schema");
+	let aggregate_field = source_block(&binder, "fn aggregate_field");
+
+	assert!(aggregate_schema.contains("schema_for_exprs(group_expr)"));
+	assert!(aggregate_schema.contains("fields.push(aggregate_field(call))"));
+	assert!(!aggregate_schema.contains("field_with_logical_type_metadata"));
+	assert!(!aggregate_schema.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
+	assert!(!aggregate_field.contains("field_with_logical_type_metadata"));
+	assert!(!aggregate_field.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
+	assert!(aggregate_field.contains("Field::new"));
+}
+
+#[test]
+pub(crate) fn adr089_ctas_reemits_reserved_logical_metadata_only() {
+	let binder = binder_source();
+	let ctas = source_block(&binder, "fn infer_ctas_schema");
+	let decode = ctas
+		.find("decode_column_logical_type(field)")
+		.expect("CTAS decodes reserved logical metadata");
+	let writer = ctas
+		.find("field_with_logical_type_metadata")
+		.expect("CTAS re-emits via centralized writer");
+
+	assert!(decode < writer);
+	assert!(!ctas.contains(".with_metadata"));
+	assert!(!ctas.contains("metadata().clone"));
+	assert!(!ctas.contains("field.metadata().clone"));
+}
+
+#[test]
+pub(crate) fn adr089_ctas_if_not_exists_exact_equality_policy() {
+	let coordinator = coordinator_source();
+	let write = source_block(&coordinator, "async fn execute_write_plan_with_source");
+	let ctas_arm = write
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.expect("CTAS arm")
+		.split("ExecutionPlan::Delete")
+		.next()
+		.expect("CTAS arm before next match arm");
+
+	assert!(ctas_arm.contains("if *if_not_exists"));
+	assert!(ctas_arm.contains("existing.schema.as_ref() == schema.as_ref()"));
+	assert!(ctas_arm.contains("CatalogError::SchemaMismatch"));
+}
+
+#[test]
+pub(crate) fn adr089_no_lineage_or_name_heuristic_inference() {
+	let binder = binder_source();
+	let execution = execution_source();
+
+	for block in [
+		source_block(&execution, "pub fn schema_for_exprs"),
+		source_block(&binder, "fn schema_for_exprs_with_output_names"),
+		source_block(&binder, "fn schema_for_projected_exprs_with_existing_names"),
+		source_block(&binder, "fn infer_ctas_schema"),
+	] {
+		assert!(!block.contains("customer_id"));
+		assert!(!block.contains("product_id"));
+		assert!(!block.contains("logical_type_spec"));
+		assert!(!block.contains("root_columns"));
+		assert!(!block.contains("column_node"));
+		assert!(!block.contains("resolve_table"));
 	}
 }

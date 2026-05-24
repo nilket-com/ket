@@ -45,15 +45,15 @@ fn source_block(source: &str, marker: &str) -> String {
 fn registered_rune_function_names(module: &str) -> Vec<String> {
 	let mut names = Vec::new();
 	for line in module.lines() {
-		if let Some(rest) = line.split("m.associated_function(\"").nth(1) {
-			if let Some(name) = rest.split('"').next() {
-				names.push(name.to_string());
-			}
+		if let Some(rest) = line.split("m.associated_function(\"").nth(1)
+			&& let Some(name) = rest.split('"').next()
+		{
+			names.push(name.to_string());
 		}
-		if let Some(rest) = line.split("m.function([\"").nth(1) {
-			if let Some(name) = rest.split('"').next() {
-				names.push(name.to_string());
-			}
+		if let Some(rest) = line.split("m.function([\"").nth(1)
+			&& let Some(name) = rest.split('"').next()
+		{
+			names.push(name.to_string());
 		}
 	}
 	names
