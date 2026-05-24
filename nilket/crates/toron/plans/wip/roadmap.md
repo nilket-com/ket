@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–086 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–088 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + substrate leap (087, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–088, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -257,6 +257,34 @@ run, 079+).
   serialized-payload caveat; Codex added literal-preservation). Migration:
   `plans/impl/087_nominal_type_identity_spine.md`.
 
+- **ADR 088 — Catalog-Carried Logical Column Identity.** Promoted. Direct successor to
+  087: moves nominal identity from a query-authoring flourish to a **database contract**.
+  **Doctrine: the catalog is the source of truth** — a column declares its `LogicalTypeId`
+  in a reserved Arrow field-metadata key (`nilket.toron.logical_type_id`, decimal `u32`;
+  missing or `"0"` → NAKED), and the binder protects *unannotated* queries by default
+  (`orders.customer_id = products.id` rejects with no `.as_logical_type` in sight).
+  **Carrier (Claude's iter-0 catch): metadata-resident** — read at `resolve_column`, no
+  `TableBinding` parallel vector, no new arity invariant; grounded that field metadata
+  rides intact through scan-pruning (`scan_output_schema`/`project_schema`) and joins
+  (`join_schema`) to the binder, dropped only at `schema_for_exprs` (the `Field::new`
+  rebuild = the 089 seam). `ResolvedColumn` **stays physical-only** (Codex's catch — it
+  serializes inside `BoundExprNode::Column`; a logical field there would duplicate 087's
+  `node_logical_types`); a binder-local `ResolvedLogicalColumn` carries identity during
+  binding and the sidecar stays the sole carrier. **Decode fails closed** at
+  `from_descriptor` (unknown id / non-decimal / physical mismatch → bounded catalog
+  error). **One shared `reconcile_identity` helper** (Claude's iter-1 mechanism) enforces
+  *add / restate / not-contradict* across both the expr path (`bind_logical_ascription`
+  flips from set to reconcile-then-set, since the inner column now arrives stamped) and
+  the join path (dual-source: explicit peel + catalog decode); cast-erase
+  (`cast(type_i64())`) is the reinterpret escape. Reuses 087's `nominal_compatible`
+  unchanged; no name heuristics; no propagation writer (089). Toron-only (`ir.rs`,
+  `catalog.rs`, `binder.rs`); **no Wendelon, SQL DDL, executor/PBC, or Rune-surface
+  change**; behavior-additive (no-key descriptors all-naked). 13 decisions, 11 guards, 10
+  fixtures. Genuine 3-of-3 (Claude grounded the carrier + reconcile mechanism + scan-leaf
+  survival; Codex caught the `ResolvedColumn` serialization; Gemini framed the
+  catalog-as-source-of-truth doctrine). Migration:
+  `plans/impl/088_catalog_carried_logical_column_identity.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -340,29 +368,35 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 087 promoted; ADR 088 candidates
+### ADR 088 promoted; ADR 089 candidates
 
-ADR 087 selected and promoted **Nominal Type Identity Spine** — the first substrate
-leap since the Rune run: a `LogicalTypeId` sidecar (a database `PhantomData<T>`) makes
-the binder the nominal type checker, rejecting `CustomerId = ProductId` though both are
-physically `Int64`. Genuine 3-of-3.
+ADR 088 selected and promoted **Catalog-Carried Logical Column Identity** — moves
+nominal identity from a query-authoring flourish (087) to a database contract: columns
+declare a `LogicalTypeId` in Arrow field metadata, the binder stamps the 087 sidecar for
+source columns, join keys resolve catalog identity before the existing nominal gate, and
+a single `reconcile_identity` helper enforces add/restate/not-contradict.
+Metadata-resident carrier, `ResolvedColumn` physical-only,
+fail-closed decode. Genuine 3-of-3.
 
-**ADR 088 candidates:**
+**ADR 089 candidates:**
 
-*Identity follow-ons (from ADR 087 §"What to do next" — the natural successors):*
+*Identity follow-ons (from ADR 088 §"What to do next" — the natural successors):*
 
-- **Catalog-carried column identity** (strongest identity lead) — let table columns
-  declare a `LogicalTypeId` in their descriptor so identity flows from the source, not
-  just explicit ascription; makes the gate protect un-annotated queries.
-- **Projection / CTAS identity propagation** — carry the sidecar through outer plan
-  nodes + materialized outputs (needs a typed-schema or Arrow field-metadata decision).
-- **Refinement contracts** — `logical_id` as a registry key for value predicates
-  (`PersonId(Int64, value > 0)`), enabling static plan elision (`WHERE id = -5` →
-  `EmptyRelation`) — the brainstorm-007 long horizon.
-- **SQL nominal surface** (`CAST(id AS CustomerId)` / domain DDL); **`.as_naked()`**
-  explicit Rune helper; dynamic tenant/catalog marker registration.
+- **Projection / CTAS identity propagation** (the direct successor; strongest lead) —
+  carry identity through the one place 088 deliberately stops: `schema_for_exprs` /
+  `..._with_output_names` (the `Field::new` rebuild). `SELECT customer_id AS cid` should
+  preserve `CustomerId`; computed expressions stay naked. Needs a typed-schema or
+  field-metadata-emit decision — the gate that makes identity flow through multi-hop
+  pipelines.
+- **SQL / domain authoring** (`CAST(id AS CustomerId)` / domain DDL) so identity is
+  declarable through SQL, not just test-built Arrow metadata; pairs with a
+  dynamic/tenant marker registry (088 uses the static 087 registry).
+- **Refinement contracts** — now that identity has a durable catalog handle (the point of
+  088), attach value predicates to a `LogicalTypeId` (`PersonId(Int64, value > 0)`),
+  enabling static plan elision (`WHERE id = -5` → `EmptyRelation`) — the brainstorm-007
+  long horizon. **`.as_naked()`** explicit Rune helper.
 
-*Carried Rune leads (the 087 substrate leap was chosen over these — still live):*
+*Carried Rune leads (the nominal-typing spine was prioritized over these — still live):*
 
 - **Rune `Like`/`ILike`** — pattern predicates over existing `Expr::Like { pattern,
   negated, case_insensitive }`; **residual** (PBC-ineligible); needs pattern (literal
@@ -380,7 +414,7 @@ physically `Int64`. Genuine 3-of-3.
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/087_nominal_type_identity_spine.md`.
+`plans/impl/088_catalog_carried_logical_column_identity.md`.
 
 ### Advanced kernel graduations *(one ADR per kernel)*
 
