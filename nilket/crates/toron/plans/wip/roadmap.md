@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -528,6 +528,25 @@ run, 079+).
   unify-095+097 + the fence; Codex: independent fence + the atom/wrapper split + the guard retarget;
   Gemini ratified). Migration: `plans/impl/098_and_decomposition_static_elision.md`.
 
+- **ADR 099 — `information_schema.logical_types` (read-only introspection).** Promoted. **The pivot off
+  the 11-ADR identity/refinement arc** (087–098): makes the durable type system *inspectable* — a
+  `SELECT … FROM information_schema.logical_types` lists the tenant's durable logical types
+  (`logical_type_id BIGINT, name, physical` SQL-keyword, `refinement` `CHECK`-text-or-`NULL`). **The
+  first read-side synthetic relation.** Selection note: Claude **proved** the on-arc lead
+  (pass-through-projection) had *no SQL consumer* — `SELECT id FROM people WHERE id<0` already elides
+  (`lower_select` puts Project above Filter), so its gate only blocks non-SQL-reachable shapes; operator
+  locked the introspection pivot (pass-through → ADR 100). Shape (3-of-3, Codex's sharpenings): a new
+  `ExecutionPlan::SystemTable { kind, schema, rows }` leaf (the 095 `EmptyRelation` precedent +
+  ~15-site walker sweep), **bind-time interception** of `ScanNamed(information_schema.logical_types)`
+  before `catalog.resolve_table` (no `LogicalPlan` variant; catalog access stays in the binder),
+  **refresh-before-materialize** (`refreshed_logical_type_registry`, list-failure fails the query — a
+  synced view must refresh, per 091/092), rows baked at bind from `specs_sorted()`. Durable-only +
+  tenant-scoped (seed/`naked` excluded); **read-only namespace** (mutation/DDL *targeting*
+  `information_schema.*` rejects; CTAS-*from* valid); refinement rendered from the 096 AST; composes with
+  `WHERE`/projection/`ORDER BY` for free. Toron-only; **no Wendelon contract/PBC/wire/storage change**
+  (refreshes through the existing catalog-sync path, then executes coordinator-local). Genuine 3-of-3.
+  Migration: `plans/impl/099_information_schema_logical_types.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -611,29 +630,28 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 098 promoted; ADR 099 candidates
+### ADR 099 promoted; ADR 100 candidates
 
-ADR 098 selected and promoted **Top-Level-AND Decomposition for Static Elision** — widening the
-095/097 elision substrate to compound `WHERE` (the universal case): decompose the `AND`, run the
-unified 095+097 atom proofs per conjunct, elide iff a conjunct is never-TRUE **and** every sibling is
-provably error-free (the eager-error fence). Atom/wrapper split, reuses 094's decomposition + 095's
-`EmptyRelation`; Toron-only. Genuine 3-of-3.
+ADR 099 selected and promoted **`information_schema.logical_types`** — the introspection pivot off the
+087–098 identity/refinement arc; the first read-side synthetic relation (`ExecutionPlan::SystemTable`,
+bind-time interception, refresh-before-read, durable/tenant-scoped, read-only). Genuine 3-of-3.
 
-**ADR 099 candidates:**
+**ADR 100 candidates:**
 
-*Refinement-elision follow-ons (the remaining 097/098 deferrals):*
+*Operator-designated next (the 097/098 deferral):*
 
-- **Pass-through-projection provenance** — lift the 097/098 `Scan { projection: None }` restriction
-  once column lineage through a `Project` (or `Scan { projection: Some }`) is mechanically proven
-  (ordinal remap; no intervening cast/compute). Needs its own lineage contract — the strong follow-on.
-  Multi-column refinement facts follow.
-- **Utf8 collation range reasoning** — only after collation semantics are a deliberate decision (097/098
-  kept strings to equality/inequality singletons).
+- **Pass-through-projection provenance** *(operator: "doing it next cycle")* — lift 097/098's
+  `Scan { projection: None }` gate so refinement elision survives a transparent `Project`/projected
+  `Scan` (trace the predicate column's lineage to a stored scan; reject cast/compute/sidecar-only).
+  **Caveat (099 grounding):** it has **no SQL consumer today** — `Filter(Project(Scan))` isn't
+  SQL-reachable until subquery-`FROM`/views exist, so ADR 100 either builds the lineage contract
+  *ahead* of its consumer or **pairs with** a source-shaping feature that makes it reachable. The
+  council should name which at iter-0.
 
-*Pivot note: the refinement/identity arc has run 087–098 (minus 094). A pivot off the elision line is
-live — the strongest off-axis candidates are detailed in the subsections below
-(`information_schema.logical_types` introspection, `DROP`/`ALTER LOGICAL TYPE` lifecycle, Rune
-`Like`/`ILike`, and the operator's Wendelon `*V1` de-versioning sweep).*
+*Introspection follow-on (now that the substrate exists):*
+
+- **`information_schema.tables` / `.columns`** — a 2nd/3rd system relation; the point at which the 099
+  `SystemTableKind` enum earns generalizing into a small virtual-table framework.
 
 *Identity authoring follow-ons:*
 
@@ -663,7 +681,14 @@ live — the strongest off-axis candidates are detailed in the subsections below
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/098_and_decomposition_static_elision.md`.
+`plans/impl/099_information_schema_logical_types.md`.
+
+### ADR 098 promoted; ADR 099 candidates (HISTORICAL)
+
+ADR 098 promoted **Top-Level-AND Decomposition for Static Elision** (compound-`WHERE` elision, eager-
+error fence). 099 pivoted off the elision arc to `information_schema.logical_types` introspection
+(Claude proved pass-through-projection had no SQL consumer; operator locked the pivot, pass-through →
+100). Detail in `plans/adr/098_and_decomposition_static_elision.md` + the active-line entry above.
 
 ### ADR 097 promoted; ADR 098 candidates (HISTORICAL)
 
@@ -940,364 +965,9 @@ hold it.
 
 ## What Not To Do Next
 
-Enduring guardrails for upcoming work. Items tied to
-specific shipped ADRs live in those ADRs' §"What Not To Do"
-sections; this list is the cross-cutting set.
-
-- **Don't adapt DataFusion / Ballista.** ADR 001 rejected;
-  ADR 002 / 003 reinforced. The greenfield decision is
-  final unless a future ADR cites concrete evidence
-  reversing the surface-area-mismatch argument.
-- **Don't bundle scope across contract surfaces.**
-  Distributed joins, executor model upgrade, runtime
-  filter pushdown, outer joins, multi-tenant governance,
-  and Rune sandbox enforcement are each their own ADR.
-  ADR 003 was intentionally narrow; ADR 004 inherits the
-  discipline; ADR 005 stays narrow.
-- **Don't ungate experimental kernels by default.** ADR
-  002 requires `PlannerConfig::allow_experimental_kernels
-  = false`. Each kernel graduates under its own narrow
-  ADR.
-- **Don't put `Result<_, String>` in any public or module-
-  crossing signature.** ADR 002 G3 enforces; ADR 003 G9
-  enforces for distributed surface; ADR 004 inherits.
-- **Don't skip descriptor-fingerprint validation on PBC
-  pushdown.** Silently-wrong-results is the failure mode
-  ADR 002 paid complexity to prevent.
-- **Don't extract Wendelon types into a shared crate
-  before V1.x consumer pressure.** ADR 001 / 002 / 003
-  import allowlist holds.
-- **Don't bypass the Wendelon import allowlist.**
-  Production code consumes `wendelon::schema::{pbc, *types}`,
-  `wendelon_client::*`, `wendelon::network::pool::*`,
-  `wendelon::storage::file_ops::*`. Forbidden:
-  `wendelon::network::raft::*`, `wendelon::network::quic::*`,
-  `wendelon::storage::lsm::*`, ad-hoc page readers,
-  anything inside Wendelon's node / raft / transport
-  internals.
-- **Don't query Wendelon for ring placement.** ADR 003
-  V1 is location-agnostic; ADR 004 inherits. Locality
-  routing is V1.x.
-- **Don't initiate P2P-push from producer to consumer.**
-  ADR 003 G11 enforces. Consumers always pull via
-  `PullPartition`.
-- **Don't use `tokio::time::sleep` for backpressure** in
-  the production worker path. ADR 003 G10 enforces. The
-  per-query budget envelope is the contract.
-- **Don't dispatch `LogicalPlan` to workers.** ADR 003
-  G12 enforces. Coordinator binds; workers receive
-  `TaskSpec`.
-- **Don't let `MorselId` cross the wire.** ADR 003 G14
-  enforces. Worker-local scheduling detail only.
-- **Don't introduce a new IR level below `ExecutionPlan`.**
-  `TaskSpec` wraps; it doesn't transform.
-- **Don't conflate task-lifecycle failures with partition-
-  store wire errors.** `TaskFailureKind` is 7 variants;
-  `PartitionMissing` is a wire response carrying
-  `PartitionMissingReason`, not a `TaskFailed` variant.
-- **Don't start Stage N+1 tasks before Stage N manifests
-  are accepted.** ADR 003 G13 enforces strict barrier;
-  ADR 004 G18 generalizes for multi-upstream.
-- **Don't promise byte-identical Arrow output without
-  canonical normalization.** ADR 003 §13 normalization
-  (concat → full-row sort → reslice → digest) is the
-  contract; ADR 004 reuses unchanged.
-- **Don't require stable worker assignment for
-  determinism.** ADR 003 output parity is the contract.
-- **Don't promote a kernel without a bench-evidence
-  artifact.** Wendelon ADR 070 pattern — narrow ADR +
-  bench results + roadmap update, every time.
-- **Don't open the next ADR with a mega-scope.** One
-  contract surface per ADR; bundling defers real
-  decisions.
-- **Don't promote stabilization watch items into roadmap
-  items.** Observability metrics, architectural-test
-  guards, post-merge dashboards belong in runbooks and
-  impl plans. Decision-enabling measurement belongs
-  inside the owning ADR.
-- **Don't introduce non-pinned join algorithms.** ADR 004
-  G16 enforces. Sort-merge, nested-loop, non-equi joins,
-  cross join — each is its own future ADR. Outer / semi / anti
-  joins now pinned by ADR 008 (eight-variant `JoinKind`); the
-  underlying hash-build / probe-right algorithm is unchanged.
-- **Don't reject duplicate output column names at the
-  binder.** ADR 004 architectural division puts naming
-  in the SQL planner, ordinals in the bound IR.
-- **Don't synthesize `Exchange` in the fragmenter.** The
-  planner emits explicit `Exchange` above each join /
-  aggregate input; the fragmenter never adds operators.
-- **Don't allow broadcast to bypass caps.** ADR 004
-  pinned three caps; over-cap fails terminal; no silent
-  strategy switch.
-- **Don't reserve placeholder fields, message slots, or
-  PBC ops for deferred features.** Convention
-  `no-premature-backward-compat.md`. The future ADR adds
-  the surface when it pins the contract.
-- **Don't bundle ADR 003 telemetry residual into ADR 004
-  feature commits.** Separate `chore:` slice (ADR 004
-  council decision 19).
-- **Don't conflate join-build key hashing with
-  exchange-partition hashing.** ADR 003 §5 partition assignment
-  uses `xxh3_64(canonical_encoded_bytes)`; ADR 005's fast-path
-  key representation is operator-local. Helper names must make
-  the boundary explicit ("join build key" vs "exchange partition
-  hash"), never a generic "fast hash" that blurs them. ADR 005
-  hard gate 14 conditional architecture guard.
-- **Don't let an ADR 005 fast-path encoder lose the logical-type
-  tag.** `Int32(1)` and `Int64(1)` must remain distinct
-  build-side hash keys. ADR 005 hard gate 7 unit-test enforced.
-- **Don't promote ADR 005 on wall-clock alone.** `build_ms` is
-  the primary signal; digest equality and phase attribution are
-  load-bearing. ADR 005 hard gate 16.
-- **Don't soften an ADR 005 `build_ms` target miss** into a
-  vague "improved" narrative. The bench artifact records the
-  explicit gap; the council selects accept-narrower / scope-down
-  / shelve.
-- **Don't add new contract surface in ADR 005.** No new
-  `MessageKind`, IR variant, `BudgetDimension`, task telemetry
-  field, public API, Wendelon scan contract, or architecture
-  guard (default; conditional escape only). ADR 005 hard gates
-  3, 12-14.
-- **Don't parallelize hash-table build inside a worker in
-  ADR 005.** Sharded concurrent insertion is V1.x with its own
-  determinism + budget accounting work.
-- **Don't bundle runtime-plumbing investigation into ADR 005.**
-  Conditional ADR 006 governed by the three-band rerun rule.
-- **Don't generate ADR 006 runtime filters inside
-  `execute_inner_join`.** Too late in ADR 004's stage graph;
-  the probe-side shuffle has already happened. Filter
-  generation lives in the build-side exchange producer wave
-  (ADR 006 Decision §1).
-- **Don't let ADR 006's runtime-filter hash conflate with the
-  exchange-partition hash.** ADR 003 §5 partition assignment
-  uses `xxh3_64(canonical_encoded_bytes)`; ADR 006's
-  runtime-filter hashing is operator/cross-ring scoped.
-  Helper names are semantic ("runtime filter key" vs
-  "exchange partition hash"). Generalizes ADR 005's pattern.
-  ADR 006 hard gate 15.
-- **Don't let an ADR 006 runtime filter affect join
-  correctness.** Advisory always — false positives allowed,
-  false negatives forbidden. If Wendelon drops the filter for
-  any reason, output is byte-identical to filter-disabled.
-  ADR 006 hard gate 7 (false-positive tolerance) + hard
-  gate 10 (no false negatives).
-- **Don't count ADR 013 advisory-drop behavior as production
-  runtime-filter application evidence.** Advisory drop is the
-  safety fallback; promotion evidence needs an applied Wendelon
-  filter with fewer probe rows/bytes and digest equality.
-- **Don't add ADR 013 runtime-filter key columns to scan output.**
-  Wendelon may fetch probe keys through
-  `ColumnFetchRequirement::predicate_columns`, but PBC output is
-  still governed by `output_columns`.
-- **Don't put `RuntimeFilterDescriptor` into
-  `TableQueryOptions`.** ADR 013 keeps options `Copy`; the
-  descriptor is query payload carried by runtime-filter-specific
-  table-query entry points.
-- **Don't start probe-side dispatch before the ADR 006
-  build-side runtime-filter barrier opens** when filters are
-  enabled. ADR 006 hard gate 13 — the two-wave barrier is
-  contractually load-bearing.
-- **Don't deserialize ADR 006's runtime-filter descriptor as
-  a Toron-private type in Wendelon.** Shared cross-ring schema
-  surface only (default: extend an existing Wendelon-published
-  schema crate; alternative: `nilket-shared` common module).
-- **Don't multiply ADR 006 filter kinds in V1.** Bloom only.
-  Exact `InList` is V1.x once the cross-ring contract is
-  proven.
-- **Don't add ADR 006 planner cost-model opt-in in V1.** Always
-  two-wave when the filter is enabled; planner-stats opt-in
-  is V1.x once stats exist.
-- **Don't couple ADR 006 promotion to lockstep Wendelon-side
-  landing.** Advisory invariant makes split-shipment safe.
-  Toron-side shipped first; the Wendelon-enabled production row
-  arrived through ADR 013.
-- **Don't extend ADR 006 filter eligibility to outer / semi /
-  anti / sort-merge / non-equi / broadcast joins.** Each is
-  its own future ADR (V1.x). Inner + hash-partitioned only in
-  V1.
-- **Don't soften an ADR 006 selective-row reduction miss**
-  into a vague "improved" narrative. The bench artifact
-  records the explicit gap; the council selects
-  accept-narrower / scope-down (narrow filter eligibility) /
-  shelve.
-- **Don't promote a runtime-filter ADR without a
-  no-false-negative unit test.** The advisory invariant is
-  load-bearing; false negatives are contract violations.
-  ADR 006 hard gate 10.
-- **Don't skip the non-selective guard benchmark.** The
-  two-wave barrier cost is real; the guard proves it's
-  bounded against ADR 005's `build_ms` baseline. ADR 006
-  hard gate 19.
-- **Don't skip the Scale boundary section in new ADRs**
-  (convention adopted iter-5 of ADR 006). Even when the
-  boundary feels obvious, naming it explicitly makes
-  scope-creep into adjacent boundaries visible at review
-  time. Omit only when truly N/A and say so explicitly.
-- **Don't call `Context::with_default_modules()` in the Rune
-  engine** (ADR 007 hard gate 19). The V1 contract is
-  allow-list (`Context::new()` + explicit registration); a
-  future refactor reverting to default-allow opens the
-  sandbox. Source-level architecture grep guard at
-  `tests/architecture_test.rs` enforces this.
-- **Don't ship a fuel-only V1 Rune sandbox.** Memory
-  enforcement is V1 hard requirement (ADR 007 hard gate 8). A
-  memory bomb that fits within fuel can still OOM the host —
-  Rune-native cap or helper-process isolation, not "deferred."
-- **Don't add new `TaskFailureKind` variants for sandbox
-  failures.** ADR 003 7-variant wire contract is
-  architecture-guarded. Sandbox failures crossing the task wire
-  map to `TaskFailureKind::TaskFailed { retryable: false,
-  reason: "RuneSandbox::<label>" }`.
-- **Don't let Rune sandbox failures fall through to
-  `RuneRuntime`.** Use the `FrontendError::RuneSandbox`
-  variant carrying the typed `RuneSandboxViolation` enum.
-  `RuneRuntime` is for genuine script-logic errors only.
-- **Don't expose host paths, internal VM state, or Rune
-  source positions in coordinator-facing error messages**
-  (ADR 007 hard gate 20). `CapabilityCategory` enum abstracts
-  over raw module paths for stability and non-leakiness.
-- **Don't add native functions to the Rune allow-list without
-  threat-model review.** Each new function is a potential
-  sandbox-escape vector. Extension is a separate narrow ADR.
-- **Don't couple Rune sandbox enforcement to per-tenant
-  governance.** Tenant identity is L-3 (multi-tenant
-  governance) territory. ADR 007 ships per-*script* budgets;
-  per-tenant aggregation is a future ADR when workload evidence
-  justifies.
-- **Don't treat `wall_timeout` as primary CPU accounting.**
-  Fuel is primary; `tokio::time::timeout` around
-  `async_complete()` is a defense-in-depth belt that fires only
-  at .await yield points (Rune 0.13.4 drives the VM via a
-  synchronous `vm.run()` inside `async_resume()`). Real
-  preemption of a CPU-bound loop with broken fuel comes from the
-  Phase 4 helper-process parent-side SIGKILL deadline, not the
-  Tokio timeout. The infinite-loop hard gate (gate 7) must
-  assert `FuelExhausted`, not merely `Timeout`.
-- **Don't run row-level Rune UDFs in worker tasks under
-  ADR 007.** Rune is frontend-scoped in V1 (script →
-  `LogicalPlan` → distribution). Worker-side execution is a
-  substantial future ADR.
-- **Don't introduce a second `ExecutionPlan::Join` or
-  `LogicalPlan::Join` physical variant** (ADR 008 hard gates
-  22, 23). Per-kind physical variants duplicate the operator
-  shape and weaken ADR 004's single-variant architecture guard.
-  The semantic difference belongs in `JoinKind`.
-- **Don't use sentinel values for null fill in outer joins.**
-  Arrow's native `NullBuffer` is the canonical representation;
-  sentinels break the contract and couple to downstream readers.
-  ADR 008 hard gate 10.
-- **Don't loosen runtime-filter eligibility beyond `Inner`.**
-  ADR 006 invariant is load-bearing for outer / anti
-  correctness. A Bloom filter on the build side of a left-outer
-  join would drop the very rows the outer must preserve;
-  `RightAnti` depends on emitting unmatched probe rows. ADR 008
-  hard gate 17 enforces; a "filter + preserve" combined operator
-  is the separable future design (ADR 010 Candidate C).
-- **Don't allow `JoinStrategy::Broadcast` for non-Inner
-  `JoinKind`.** Broadcast replicates the build side; preserved-
-  side or existence variants would emit duplicate unmatched
-  rows in every probe partition. ADR 008 hard gate 16 (binder
-  rejection) + hard gate 18 (fragmenter defensive guard) form
-  the defense-in-depth pair.
-- **Don't rewrite `RightOuter` ↔ `LeftOuter` at planner time as
-  a workaround for broadcast.** Strategy-dependent semantics
-  blur the operator-level scale boundary. The cleaner contract
-  is reject-and-defer; a strategy-rewrite ADR can follow if
-  evidence supports it.
-- **Don't add `EXISTS` / `NOT EXISTS` decorrelation under ADR
-  008.** Subquery-planner contract; promoted as ADR 009. ADR 008
-  ships the `Semi` / `Anti` operators; ADR 009 layers the
-  correlated-`EXISTS` rewrite on top.
-- **Don't promise rolling coordinator/worker mixed-version
-  semantics for `JoinKind`.** Serde-tagged variants are additive
-  but older binaries reject unknown variants. ADR 008 ships at a
-  single workspace version bump; cluster upgrades are
-  full-fleet, not rolling. Matches the posture from prior ADRs.
-- **Don't drop `JoinKind` IR variants if `sqlparser` regresses
-  a spelling.** Keep the IR variants; gate SQL lowering to
-  whatever parses. Dropping IR variants breaks the serde wire
-  contract and ADR 008 hard gate 25 (variant-count architecture
-  guard).
-- **Don't add per-kind task-telemetry counters for the new join
-  kinds.** ADR 003 task-telemetry contract change worth carrying
-  only when bench evidence is insufficient. Existing
-  `build_rows` / `probe_rows` / `output_rows` counters are
-  sufficient for V1; kind-specific aggregates surface downstream
-  of the task wire if needed.
-- **Don't add a subquery node to Toron's IR for `EXISTS`
-  decorrelation.** ADR 009 is a targeted SQL-AST rewrite in
-  `SqlPlanner::lower_select`; the logical and physical join
-  contract is reused unchanged. A subquery IR node is a general
-  subquery-engine decision, not ADR 009's.
-- **Don't lower the whole subquery predicate through `lower_expr`
-  before classifying.** ADR 009's two-scope classifier operates
-  on the `sqlparser` AST so unsafe outer-reference shapes reject
-  precisely; a generic lowering pass first would route a mixed
-  predicate into a generic filter path. Classify, then lower only
-  the accepted `CorrelatedPair` columns and `InnerResidual`
-  predicates.
-- **Don't invent a new unqualified-name resolution rule for
-  subqueries.** ADR 009 rejects unqualified / ambiguous
-  correlation rather than guessing. If the existing qualifier
-  logic cannot pin one side to the outer scope and one to the
-  inner scope, the rewrite is unsupported — "too narrow and
-  correct" over matching a permissive engine.
-- **Don't decorrelate uncorrelated `EXISTS`, `IN`, or `NOT IN`
-  under ADR 009.** Uncorrelated `EXISTS` is a scalar cardinality
-  check, not a semi-join; `NOT IN` carries three-valued NULL
-  logic that must not be smuggled into anti-join semantics. Each
-  is a named, deferred extension with its own decision matrix.
-- **Don't widen the ADR 009 subquery body beyond one
-  `TableFactor::Table`.** Subquery joins, aggregates, `LIMIT`,
-  `DISTINCT`, set ops, and nested subqueries are unsupported and
-  reject through the existing path. The classifier's
-  `Unsupported` arm is the structural scope boundary.
-- **Don't duplicate binder semantic checks in the SQL planner
-  for ADR 009.** The planner classifies shape and builds the
-  logical rewrite; the binder stays the authority for type
-  compatibility, float-key rejection, computed-key rejection,
-  exchange shape, and non-Inner broadcast rejection.
-- **Don't let `lower_query` / `lower_select` destructure with a
-  `..` rest pattern.** ADR 010's exhaustive three-bucket
-  no-`..` destructure is the load-bearing clause-accounting
-  guard — a `sqlparser` bump that adds a field must be a compile
-  error, not a silent widening. A source-level architecture
-  guard enforces it; the parser-metadata allow-list
-  (`select_token`, `top_before_distinct`,
-  `window_before_qualify`) is explicit.
-- **Don't silently drop any top-level `Query` / `Select`
-  clause.** ADR 010's invariant: every parsed field is
-  lowered, rejected-when-present, or bound-and-ignored as parser
-  metadata. Silently-dropped `ORDER BY` was the V1 integrity
-  defect ADR 010 closed; do not reintroduce the class.
-- **Don't accept bare `LIMIT` / `OFFSET` / `FETCH`.** Without an
-  `ORDER BY` contract, distributed truncation is arbitrary.
-  ADR 010 rejects them; deterministic top-N is
-  `ORDER BY ... LIMIT n`.
-- **Don't place `Sort` below `Project` or support `ORDER BY` on
-  non-output / alias / computed keys.** ADR 010 keys resolve
-  against the output schema only (column names + 1-based
-  positive ordinals); `Sort` sits above `Project` so the
-  total-order tie-break surface is exactly the output columns.
-  Input-only keys are a named V1.x extension.
-- **Don't ship a partial-order `ORDER BY`.** ADR 010's contract
-  is a total order — user keys then every remaining output
-  column, ascending `NULLS LAST`, appended at bind time. Ties
-  resolved arbitrarily reopen silent nondeterminism.
-- **Don't let the fragmenter infer a hidden gather, and don't
-  prove the distributed gather-sort with output digest alone.**
-  The planner emits the terminal `Exchange { partition_count: 1 }`
-  explicitly; the post-join gather-sort is strategy-agnostic
-  (hash-partitioned and broadcast) and gated by stage-shape
-  inspection. ADR 010 Phase 4 is the named primary risk.
-- **Don't add a new `TaskFailureKind`, `BudgetDimension`, IR
-  level, or wire surface for ADR 010.** `LogicalPlan` /
-  `ExecutionPlan` each gain exactly one variant (`Sort`); sort
-  memory exhaustion reuses `BudgetDimension::Memory` →
-  `ExecutionError::BudgetExhausted` →
-  `TaskFailureKind::BudgetExhausted`. No sort spill, no
-  distributed range sort in V1 — both are named V1.x ADRs.
-- **Don't implement `DISTINCT` / `GROUP BY` / `HAVING` under
-  ADR 010.** They loud-reject; implementing them is
-  aggregate-path ADR work. ADR 010 closes their silent drop
-  only.
+Enduring guardrails are **enforced, not restated here.** The technical contracts live in the
+`adrNNN_*` architecture-guard tests (`crates/toron/tests/architecture/`) — the durable enforcement
+(council discipline #4) — and in each ADR's own §"What Not To Do". Cross-cutting process guardrails
+live in the **Prioritization philosophy** (above), `plans/conventions/`, and
+`plans/conventions/council.md`. The prior 81-item, per-ADR (001–016 era) list had drifted from its
+cross-cutting charter into a redundant duplicate of the guards; pruned (git history holds it).
