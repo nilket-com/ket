@@ -48,7 +48,7 @@ const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
 
 fn object_name_part_ident<'a>(
 	part: &'a ObjectNamePart,
-	context: &'static str,
+	context: &str,
 ) -> Result<&'a Ident, FrontendError> {
 	part.as_ident().ok_or_else(|| {
 		unsupported(format!(
@@ -57,10 +57,7 @@ fn object_name_part_ident<'a>(
 	})
 }
 
-fn object_name_part_value(
-	part: &ObjectNamePart,
-	context: &'static str,
-) -> Result<String, FrontendError> {
+fn object_name_part_value(part: &ObjectNamePart, context: &str) -> Result<String, FrontendError> {
 	Ok(object_name_part_ident(part, context)?.value.clone())
 }
 
@@ -129,6 +126,20 @@ fn reject_nested_aggregate(expr: &SqlExpr) -> Result<(), FrontendError> {
 			reject_nested_aggregate(inner)
 		}
 		_ => Ok(()),
+	}
+}
+
+enum LoweredCastTarget {
+	Physical(DataType),
+	LogicalName(String),
+}
+
+fn lower_cast_target(data_type: &SqlDataType) -> Result<LoweredCastTarget, FrontendError> {
+	match data_type {
+		SqlDataType::Custom(name, modifiers) => Ok(LoweredCastTarget::LogicalName(
+			lower_cast_logical_type_name(name, modifiers)?,
+		)),
+		other => Ok(LoweredCastTarget::Physical(lower_cast_target_type(other)?)),
 	}
 }
 
@@ -743,35 +754,50 @@ fn lower_create_table_logical_type_name(
 	name: &ObjectName,
 	modifiers: &[String],
 ) -> Result<String, FrontendError> {
+	lower_sql_logical_type_name("CREATE TABLE", name, modifiers)
+}
+
+fn lower_cast_logical_type_name(
+	name: &ObjectName,
+	modifiers: &[String],
+) -> Result<String, FrontendError> {
+	lower_sql_logical_type_name("CAST", name, modifiers)
+}
+
+fn lower_sql_logical_type_name(
+	context: &'static str,
+	name: &ObjectName,
+	modifiers: &[String],
+) -> Result<String, FrontendError> {
 	if !modifiers.is_empty() {
-		return Err(unsupported(
-			"CREATE TABLE logical type names do not support modifiers",
-		));
+		return Err(unsupported(format!(
+			"{context} logical type names do not support modifiers"
+		)));
 	}
 	let [part] = name.0.as_slice() else {
-		return Err(unsupported(
-			"CREATE TABLE logical type names support one-part names only",
-		));
+		return Err(unsupported(format!(
+			"{context} logical type names support one-part names only"
+		)));
 	};
-	let ident = object_name_part_ident(part, "CREATE TABLE logical type name")?;
+	let ident = object_name_part_ident(part, &format!("{context} logical type name"))?;
 	if ident.quote_style.is_some() {
-		return Err(unsupported(
-			"CREATE TABLE logical type names must be unquoted ASCII identifiers",
-		));
+		return Err(unsupported(format!(
+			"{context} logical type names must be unquoted ASCII identifiers"
+		)));
 	}
 	if ident.value.eq_ignore_ascii_case("naked") {
-		return Err(unsupported(
-			"CREATE TABLE logical type name cannot be the naked sentinel",
-		));
+		return Err(unsupported(format!(
+			"{context} logical type name cannot be the naked sentinel"
+		)));
 	}
 	if ident
 		.value
 		.bytes()
 		.any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
 	{
-		return Err(unsupported(
-			"CREATE TABLE logical type names must be unquoted ASCII identifiers",
-		));
+		return Err(unsupported(format!(
+			"{context} logical type names must be unquoted ASCII identifiers"
+		)));
 	}
 	Ok(ident.value.clone())
 }
@@ -3195,16 +3221,31 @@ impl SqlPlanner {
 				if format.is_some() {
 					return Err(unsupported("CAST FORMAT clause is not supported"));
 				}
-				match kind {
-					CastKind::Cast => Ok(Expr::Cast(
-						Box::new(self.lower_expr(expr)?),
-						lower_cast_target_type(data_type)?,
-					)),
-					CastKind::TryCast | CastKind::SafeCast => Ok(Expr::TryCast(
-						Box::new(self.lower_expr(expr)?),
-						lower_cast_target_type(data_type)?,
-					)),
-					CastKind::DoubleColon => Err(unsupported(
+				let target = lower_cast_target(data_type)?;
+				match (kind, target) {
+					(CastKind::Cast, LoweredCastTarget::Physical(data_type)) => {
+						Ok(Expr::Cast(Box::new(self.lower_expr(expr)?), data_type))
+					}
+					(
+						CastKind::TryCast | CastKind::SafeCast,
+						LoweredCastTarget::Physical(data_type),
+					) => Ok(Expr::TryCast(Box::new(self.lower_expr(expr)?), data_type)),
+					(CastKind::Cast, LoweredCastTarget::LogicalName(logical_name)) => {
+						Ok(Expr::SqlLogicalCast {
+							expr: Box::new(self.lower_expr(expr)?),
+							logical_name,
+							try_cast: false,
+						})
+					}
+					(
+						CastKind::TryCast | CastKind::SafeCast,
+						LoweredCastTarget::LogicalName(logical_name),
+					) => Ok(Expr::SqlLogicalCast {
+						expr: Box::new(self.lower_expr(expr)?),
+						logical_name,
+						try_cast: true,
+					}),
+					(CastKind::DoubleColon, _) => Err(unsupported(
 						"unsupported cast syntax: ::; only CAST(... AS ...) is supported",
 					)),
 				}
@@ -3382,6 +3423,7 @@ fn sort_key_is_direct_output_reference(expr: &Expr) -> bool {
 		|| matches!(
 			expr,
 			Expr::LogicalAscription { expr, .. }
+				| Expr::SqlLogicalCast { expr, .. }
 				if sort_key_is_direct_output_reference(expr)
 		)
 }
@@ -3403,9 +3445,9 @@ fn validate_hidden_sort_key_refs(
 		Expr::LogicalAscription { expr: inner, .. } => {
 			validate_hidden_sort_key_refs(inner, visible_names)
 		}
-		Expr::Cast(inner, _) | Expr::TryCast(inner, _) => {
-			validate_hidden_sort_key_refs(inner, visible_names)
-		}
+		Expr::SqlLogicalCast { expr: inner, .. }
+		| Expr::Cast(inner, _)
+		| Expr::TryCast(inner, _) => validate_hidden_sort_key_refs(inner, visible_names),
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -3928,6 +3970,16 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			logical_type.hash(state);
 			hash_expr_structural(expr, state);
 		}
+		Expr::SqlLogicalCast {
+			expr,
+			logical_name,
+			try_cast,
+		} => {
+			23u8.hash(state);
+			logical_name.hash(state);
+			try_cast.hash(state);
+			hash_expr_structural(expr, state);
+		}
 	}
 }
 
@@ -3950,6 +4002,22 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 				logical_type: right_logical_type,
 			},
 		) => left_logical_type == right_logical_type && expr_structural_eq(left_inner, right_inner),
+		(
+			Expr::SqlLogicalCast {
+				expr: left_inner,
+				logical_name: left_logical_name,
+				try_cast: left_try_cast,
+			},
+			Expr::SqlLogicalCast {
+				expr: right_inner,
+				logical_name: right_logical_name,
+				try_cast: right_try_cast,
+			},
+		) => {
+			left_logical_name == right_logical_name
+				&& left_try_cast == right_try_cast
+				&& expr_structural_eq(left_inner, right_inner)
+		}
 		(Expr::Add(left_left, left_right), Expr::Add(right_left, right_right))
 		| (Expr::Sub(left_left, left_right), Expr::Sub(right_left, right_right))
 		| (Expr::Mul(left_left, left_right), Expr::Mul(right_left, right_right))
@@ -4252,7 +4320,9 @@ fn select_expr_is_computed(expr: &SqlExpr) -> bool {
 fn logical_expr_output_name(expr: &Expr, idx: usize) -> String {
 	match expr {
 		Expr::Column(column) => column.name.0.clone(),
-		Expr::LogicalAscription { expr, .. } => logical_expr_output_name(expr, idx),
+		Expr::LogicalAscription { expr, .. } | Expr::SqlLogicalCast { expr, .. } => {
+			logical_expr_output_name(expr, idx)
+		}
 		_ => format!("col_{idx}"),
 	}
 }
@@ -4262,6 +4332,7 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		Expr::Column(column) => column.qualifier.is_some(),
 		Expr::Literal(_) => false,
 		Expr::LogicalAscription { expr: inner, .. }
+		| Expr::SqlLogicalCast { expr: inner, .. }
 		| Expr::Cast(inner, _)
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)

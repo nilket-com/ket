@@ -11,6 +11,14 @@ fn execution_source() -> String {
 		.expect("read execution IR source")
 }
 
+fn exec_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source")
+}
+
+fn pbc_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc source")
+}
+
 fn binder_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
 }
@@ -598,7 +606,7 @@ pub(crate) fn adr091_execution_create_table_stays_resolved_schema() {
 pub(crate) fn adr091_sql_planner_records_custom_type_names_without_catalog_resolution() {
 	let planner = sql_planner_source();
 	let lower_type = source_block(&planner, "fn lower_create_table_data_type");
-	let lower_logical = source_block(&planner, "fn lower_create_table_logical_type_name");
+	let lower_logical = source_block(&planner, "fn lower_sql_logical_type_name");
 
 	assert!(lower_type.contains("SqlDataType::Custom(name, modifiers)"));
 	assert!(lower_type.contains("CreateTableColumnType::LogicalName"));
@@ -702,13 +710,105 @@ pub(crate) fn adr091_undefined_logical_type_fails_before_descriptor_submit() {
 }
 
 #[test]
-pub(crate) fn adr091_no_cast_or_typed_ctas_authoring_yet() {
+pub(crate) fn adr091_typed_ctas_authoring_is_still_deferred_after_adr092() {
 	let planner = sql_planner_source();
-	let cast = source_block(&planner, "fn lower_cast_target_type");
 	let ctas = source_block(&planner, "fn lower_create_table_as_select");
 
-	assert!(!cast.contains("SqlDataType::Custom"));
 	assert!(ctas.contains("CTAS does not support explicit column lists"));
 	assert!(!ctas.contains("CreateTableSchema"));
 	assert!(!ctas.contains("LogicalName"));
+}
+
+#[test]
+pub(crate) fn adr092_sql_logical_cast_is_transient_logical_ir_only() {
+	let ir = ir_source();
+	let expr_enum = ir
+		.split("pub enum Expr")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Expr").next())
+		.expect("Expr enum");
+	let execution = execution_source();
+
+	assert!(expr_enum.contains("SqlLogicalCast {"));
+	assert!(expr_enum.contains("logical_name: String"));
+	assert!(expr_enum.contains("try_cast: bool"));
+	assert!(expr_enum.contains("LogicalAscription {"));
+	assert!(!expr_enum.contains("coerce"));
+	assert!(!execution.contains("SqlLogicalCast"));
+}
+
+#[test]
+pub(crate) fn adr092_planner_records_logical_cast_names_without_resolution() {
+	let planner = sql_planner_source();
+	let lower_cast = source_block(&planner, "fn lower_cast_target");
+	let lower_logical = source_block(&planner, "fn lower_cast_logical_type_name");
+	let lower_shared = source_block(&planner, "fn lower_sql_logical_type_name");
+	let lower_expr = source_block(&planner, "fn lower_expr");
+
+	assert!(lower_cast.contains("SqlDataType::Custom(name, modifiers)"));
+	assert!(lower_cast.contains("LoweredCastTarget::LogicalName"));
+	assert!(lower_logical.contains("lower_sql_logical_type_name(\"CAST\""));
+	assert!(lower_shared.contains("ident.quote_style.is_some()"));
+	assert!(lower_shared.contains("eq_ignore_ascii_case(\"naked\")"));
+	assert!(lower_expr.contains("Expr::SqlLogicalCast"));
+	assert!(lower_expr.contains("try_cast: true"));
+	for block in [lower_cast, lower_logical, lower_shared, lower_expr] {
+		assert!(!block.contains("resolve_durable_logical_type_by_name"));
+		assert!(!block.contains("logical_type_spec_by_name"));
+	}
+}
+
+#[test]
+pub(crate) fn adr092_binder_resolves_sql_logical_casts_registry_only_before_sync_bind() {
+	let binder = binder_source();
+	let resolve = source_block(&binder, "async fn resolve_logical_casts");
+	let collect = source_block(&binder, "fn collect_logical_cast_names");
+	let bind_program = source_block(&binder, "async fn bind_expr_program");
+
+	assert!(resolve.contains("collect_logical_cast_names(expr"));
+	assert!(resolve.contains("resolve_durable_logical_type_by_name(&name)"));
+	assert!(resolve.contains("HashMap<String, LogicalTypeSpec>"));
+	assert!(bind_program.contains("ExprBindContext"));
+	assert!(bind_program.contains("logical_casts: &logical_casts"));
+	assert!(collect.contains("TRY_CAST/SAFE_CAST to logical type is not supported"));
+	assert!(!resolve.contains("logical_type_spec_by_name"));
+	assert!(!resolve.contains("seed_logical_type_spec_by_name"));
+}
+
+#[test]
+pub(crate) fn adr092_logical_cast_reconciles_identity_before_physical_cast() {
+	let binder = binder_source();
+	let bind_cast = source_block(&binder, "fn bind_sql_logical_cast");
+	let reconcile = bind_cast
+		.find("reconcile_identity(existing, spec.id, &source)")
+		.expect("logical identity reconciliation");
+	let append_cast = bind_cast
+		.find("builder.append_cast")
+		.expect("physical cast append");
+	let stamp = bind_cast
+		.find("builder.set_node_logical_type(output, logical_type)")
+		.expect("logical type stamp");
+
+	assert!(reconcile < append_cast);
+	assert!(append_cast < stamp);
+	assert!(bind_cast.contains("source == spec.physical"));
+	assert!(bind_cast.contains("is_supported_explicit_numeric_cast(&source, &spec.physical)"));
+	assert!(bind_cast.contains("unsupported CAST: {source:?} to logical type"));
+	assert!(!bind_cast.contains("validate_logical_ascription_physical"));
+	assert!(!bind_cast.contains("logical_type_spec("));
+}
+
+#[test]
+pub(crate) fn adr092_sql_logical_cast_does_not_add_execution_kernel_or_pbc_opcode() {
+	let ir = ir_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+	let pbc_helper = source_block(&ir, "pub fn is_pbc_pushdown_eligible");
+
+	assert!(pbc_helper.contains("Self::SqlLogicalCast { .. }"));
+	assert!(pbc_helper.contains("=> false"));
+	assert!(exec.contains("unresolved SQL logical CAST reached execution"));
+	assert!(!exec.contains("fn evaluate_sql_logical_cast"));
+	assert!(!pbc.contains("SqlLogicalCast"));
+	assert!(!pbc.contains("OP_LOGICAL_CAST"));
 }

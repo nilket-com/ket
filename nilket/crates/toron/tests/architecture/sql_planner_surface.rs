@@ -223,11 +223,11 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 pub(crate) fn bind_expr_remains_aggregate_free() {
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
-	let bind_expr = binder
-		.split("fn bind_expr")
-		.nth(1)
-		.and_then(|rest| rest.split("fn bind_comparison").next())
-		.expect("bind_expr block");
+	let bind_expr = brace_blocks_after_marker(&binder, "fn bind_expr_into_program")
+		.into_iter()
+		.next()
+		.expect("bind_expr_into_program body")
+		.1;
 	assert!(!bind_expr.contains("AggregateCall"));
 	assert!(!bind_expr.contains("AggregateFunction"));
 }
@@ -252,11 +252,11 @@ pub(crate) fn adr017_order_by_aggregate_call_guards_are_narrow() {
 
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
-	let bind_expr = binder
-		.split("fn bind_expr")
-		.nth(1)
-		.and_then(|rest| rest.split("fn bind_comparison").next())
-		.expect("bind_expr block");
+	let bind_expr = brace_blocks_after_marker(&binder, "fn bind_expr_into_program")
+		.into_iter()
+		.next()
+		.expect("bind_expr_into_program body")
+		.1;
 	assert!(!bind_expr.contains("AggregateCall"));
 	assert!(!bind_expr.contains("AggregateFunction"));
 
@@ -291,11 +291,11 @@ pub(crate) fn adr018_scalar_aggregate_having_order_by_guards_are_narrow() {
 
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
-	let bind_expr = binder
-		.split("fn bind_expr")
-		.nth(1)
-		.and_then(|rest| rest.split("fn bind_comparison").next())
-		.expect("bind_expr block");
+	let bind_expr = brace_blocks_after_marker(&binder, "fn bind_expr_into_program")
+		.into_iter()
+		.next()
+		.expect("bind_expr_into_program body")
+		.1;
 	assert!(!bind_expr.contains("AggregateCall"));
 	assert!(!bind_expr.contains("AggregateFunction"));
 
@@ -456,8 +456,11 @@ pub(crate) fn adr025_sql_cast_lowers_via_planner() {
 		.1;
 
 	assert!(lower_expr.contains("SqlExpr::Cast {"));
-	assert!(lower_expr.contains("CastKind::Cast => Ok(Expr::Cast"));
-	assert!(lower_expr.contains("lower_cast_target_type(data_type)?"));
+	assert!(lower_expr.contains("lower_cast_target(data_type)?"));
+	assert!(lower_expr.contains("(CastKind::Cast, LoweredCastTarget::Physical(data_type))"));
+	assert!(lower_expr.contains("Ok(Expr::Cast"));
+	assert!(lower_expr.contains("(CastKind::Cast, LoweredCastTarget::LogicalName(logical_name))"));
+	assert!(lower_expr.contains("Ok(Expr::SqlLogicalCast"));
 	assert!(lower_expr.contains("if format.is_some()"));
 	assert!(lower_expr.contains("CAST FORMAT clause is not supported"));
 
@@ -530,7 +533,9 @@ pub(crate) fn adr025_order_by_cast_uses_hidden_sort_projection() {
 		.next()
 		.expect("validate_hidden_sort_key_refs body")
 		.1;
-	assert!(validator.contains("Expr::Cast(inner, _) | Expr::TryCast(inner, _)"));
+	assert!(validator.contains("Expr::SqlLogicalCast { expr: inner, .. }"));
+	assert!(validator.contains("| Expr::Cast(inner, _)"));
+	assert!(validator.contains("| Expr::TryCast(inner, _)"));
 	assert!(!planner.contains("fn expr_contains_cast_family"));
 
 	let hidden_projection = brace_blocks_after_marker(&planner, "fn add_hidden_sort_projection")
@@ -844,7 +849,8 @@ pub(crate) fn adr026_try_cast_lowers_via_planner() {
 		.1;
 	assert!(lower_expr.contains("CastKind::TryCast | CastKind::SafeCast"));
 	assert!(lower_expr.contains("Ok(Expr::TryCast"));
-	assert!(lower_expr.contains("lower_cast_target_type(data_type)?"));
+	assert!(lower_expr.contains("lower_cast_target(data_type)?"));
+	assert!(lower_expr.contains("LoweredCastTarget::LogicalName(logical_name)"));
 	assert!(lower_expr.contains("CastKind::DoubleColon"));
 	assert!(lower_expr.contains("CAST FORMAT clause is not supported"));
 }
@@ -1006,7 +1012,9 @@ pub(crate) fn adr026_try_cast_order_by_uses_hidden_sort_projection() {
 		.next()
 		.expect("validate_hidden_sort_key_refs body")
 		.1;
-	assert!(validator.contains("Expr::Cast(inner, _) | Expr::TryCast(inner, _)"));
+	assert!(validator.contains("Expr::SqlLogicalCast { expr: inner, .. }"));
+	assert!(validator.contains("| Expr::Cast(inner, _)"));
+	assert!(validator.contains("| Expr::TryCast(inner, _)"));
 }
 
 #[test]
@@ -1043,7 +1051,9 @@ pub(crate) fn adr027_hidden_sort_key_refs_are_visible_outputs() {
 		)
 	);
 	assert!(validator.contains("Expr::Literal(_) => Ok(())"));
-	assert!(validator.contains("Expr::Cast(inner, _) | Expr::TryCast(inner, _)"));
+	assert!(validator.contains("Expr::SqlLogicalCast { expr: inner, .. }"));
+	assert!(validator.contains("| Expr::Cast(inner, _)"));
+	assert!(validator.contains("| Expr::TryCast(inner, _)"));
 	for op in ["Add", "Sub", "Mul", "Div"] {
 		assert!(validator.contains(&format!("Expr::{op}(left, right)")));
 	}

@@ -15,9 +15,9 @@ use crate::ir::{
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
 	ColumnOrdinal, CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
 	FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId,
-	PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr,
-	arithmetic_output_type, decode_column_logical_type, field_with_logical_type_metadata,
-	logical_type_name, logical_type_spec, schema_for_exprs,
+	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
+	ScalarValue, SortExpr, arithmetic_output_type, decode_column_logical_type,
+	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -51,6 +51,11 @@ pub async fn bind(
 struct Binder<'a> {
 	catalog: &'a dyn Catalog,
 	config: &'a PlannerConfig,
+}
+
+struct ExprBindContext<'a> {
+	config: &'a PlannerConfig,
+	logical_casts: &'a HashMap<String, LogicalTypeSpec>,
 }
 
 impl<'a> Binder<'a> {
@@ -97,11 +102,9 @@ impl<'a> Binder<'a> {
 				LogicalPlan::Alias { input, .. } => self.bind_plan(input).await,
 				LogicalPlan::Filter { input, predicate } => {
 					let input = self.bind_plan(input).await?;
-					let bound_predicate = bind_expr_program(
-						std::slice::from_ref(predicate),
-						&input.schema(),
-						self.config,
-					)?;
+					let bound_predicate = self
+						.bind_expr_program(std::slice::from_ref(predicate), &input.schema())
+						.await?;
 					let (plan, _) = plan_filter_with_predicate_pushdown(input, bound_predicate);
 					Ok(plan)
 				}
@@ -117,7 +120,7 @@ impl<'a> Binder<'a> {
 						});
 					}
 					let input = self.bind_plan(input).await?;
-					let exprs = bind_expr_program(exprs, &input.schema(), self.config)?;
+					let exprs = self.bind_expr_program(exprs, &input.schema()).await?;
 					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
 
 					Ok(ExecutionPlan::Project {
@@ -133,19 +136,20 @@ impl<'a> Binder<'a> {
 				} => {
 					let input = self.bind_plan(input).await?;
 					let input_schema = input.schema();
-					let group_expr = bind_expr_program(group_expr, &input_schema, self.config)?;
-					let aggr_expr = aggr_expr
-						.iter()
-						.map(|(function, args)| {
-							bind_aggregate_call(function, args, &input_schema, self.config)
-						})
-						.collect::<Result<Vec<_>, _>>()?;
-					let output_schema = aggregate_schema(&group_expr, &aggr_expr);
+					let group_expr = self.bind_expr_program(group_expr, &input_schema).await?;
+					let mut bound_aggr_expr = Vec::with_capacity(aggr_expr.len());
+					for (function, args) in aggr_expr {
+						bound_aggr_expr.push(
+							self.bind_aggregate_call(function, args, &input_schema)
+								.await?,
+						);
+					}
+					let output_schema = aggregate_schema(&group_expr, &bound_aggr_expr);
 
 					Ok(ExecutionPlan::Aggregate {
 						input: Box::new(input),
 						group_expr,
-						aggr_expr,
+						aggr_expr: bound_aggr_expr,
 						output_schema,
 					})
 				}
@@ -156,7 +160,7 @@ impl<'a> Binder<'a> {
 				} => {
 					let input = self.bind_plan(input).await?;
 					let input_schema = input.schema();
-					let key = bind_expr_program(key, &input_schema, self.config)?;
+					let key = self.bind_expr_program(key, &input_schema).await?;
 
 					Ok(ExecutionPlan::Exchange {
 						input: Box::new(input),
@@ -296,6 +300,52 @@ impl<'a> Binder<'a> {
 		})
 	}
 
+	async fn bind_expr_program(
+		&self,
+		exprs: &[Expr],
+		input_schema: &SchemaRef,
+	) -> Result<BoundExprProgram, BindingError> {
+		let logical_casts = self.resolve_logical_casts(exprs).await?;
+		let ctx = ExprBindContext {
+			config: self.config,
+			logical_casts: &logical_casts,
+		};
+		bind_expr_program(exprs, input_schema, &ctx)
+	}
+
+	async fn bind_aggregate_call(
+		&self,
+		function: &AggregateFunction,
+		args: &[Expr],
+		input_schema: &SchemaRef,
+	) -> Result<BoundAggregateCall, BindingError> {
+		let logical_casts = self.resolve_logical_casts(args).await?;
+		let ctx = ExprBindContext {
+			config: self.config,
+			logical_casts: &logical_casts,
+		};
+		bind_aggregate_call(function, args, input_schema, &ctx)
+	}
+
+	async fn resolve_logical_casts(
+		&self,
+		exprs: &[Expr],
+	) -> Result<HashMap<String, LogicalTypeSpec>, BindingError> {
+		let mut names = HashSet::new();
+		for expr in exprs {
+			collect_logical_cast_names(expr, &mut names)?;
+		}
+		let mut resolved = HashMap::with_capacity(names.len());
+		for name in names {
+			let spec = self
+				.catalog
+				.resolve_durable_logical_type_by_name(&name)
+				.await?;
+			resolved.insert(name, spec);
+		}
+		Ok(resolved)
+	}
+
 	async fn bind_create_table_as_select(
 		&self,
 		table: &TableRef,
@@ -323,11 +373,14 @@ impl<'a> Binder<'a> {
 		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
 		let binding = self.catalog.resolve_table(table).await?;
-		let returning = bind_returning_projection(returning, &binding.schema, self.config)?;
+		let returning = self
+			.bind_returning_projection(returning, &binding.schema)
+			.await?;
 		let bound_predicate = match predicate {
 			Some(expr) => {
-				let program =
-					bind_expr_program(std::slice::from_ref(expr), &binding.schema, self.config)?;
+				let program = self
+					.bind_expr_program(std::slice::from_ref(expr), &binding.schema)
+					.await?;
 				require_single_boolean_root(&program, "DELETE WHERE")?;
 				Some(program)
 			}
@@ -381,7 +434,7 @@ impl<'a> Binder<'a> {
 		}
 
 		let schema = binding.schema.clone();
-		let returning = bind_returning_projection(returning, &schema, self.config)?;
+		let returning = self.bind_returning_projection(returning, &schema).await?;
 		let schema_fields = schema.fields();
 		let target_columns = resolve_insert_target_columns(&schema, columns)?;
 		let target_indices = target_columns
@@ -456,7 +509,7 @@ impl<'a> Binder<'a> {
 	) -> Result<ExecutionPlan, BindingError> {
 		let binding = self.catalog.resolve_table(table).await?;
 		let schema = binding.schema.clone();
-		let returning = bind_returning_projection(returning, &schema, self.config)?;
+		let returning = self.bind_returning_projection(returning, &schema).await?;
 		let target_columns = resolve_insert_target_columns(&schema, columns)?;
 		validate_omitted_insert_target_columns(&schema, &target_columns)?;
 		let source = self.bind_plan(source).await?;
@@ -522,7 +575,7 @@ impl<'a> Binder<'a> {
 		}
 
 		let schema = binding.schema.clone();
-		let returning = bind_returning_projection(returning, &schema, self.config)?;
+		let returning = self.bind_returning_projection(returning, &schema).await?;
 		let mut seen = HashSet::new();
 		let mut assigned = HashMap::new();
 		for (column, expr) in assignments {
@@ -564,11 +617,14 @@ impl<'a> Binder<'a> {
 		let scan = scan_plan(binding.clone(), None);
 		let (project_input, profile_hint) = match predicate {
 			Some(predicate) => {
-				bind_update_source_for_predicate(scan, predicate, &schema, self.config)?
+				self.bind_update_source_for_predicate(scan, predicate, &schema)
+					.await?
 			}
 			None => bind_update_source_for_all_rows(scan),
 		};
-		let exprs = bind_expr_program(&source_exprs, &project_input.schema(), self.config)?;
+		let exprs = self
+			.bind_expr_program(&source_exprs, &project_input.schema())
+			.await?;
 		let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
 
 		Ok(ExecutionPlan::Update {
@@ -628,66 +684,68 @@ impl<'a> Binder<'a> {
 			output_schema: join_schema(kind, &left_scope.schema, &right_scope.schema),
 		})
 	}
-}
 
-fn bind_update_source_for_predicate(
-	scan: ExecutionPlan,
-	predicate: &Expr,
-	schema: &SchemaRef,
-	config: &PlannerConfig,
-) -> Result<(ExecutionPlan, QueryProfileHint), BindingError> {
-	let bound_predicate = bind_expr_program(std::slice::from_ref(predicate), schema, config)?;
-	require_single_boolean_root(&bound_predicate, "UPDATE WHERE")?;
-	Ok(plan_filter_with_predicate_pushdown(scan, bound_predicate))
+	async fn bind_update_source_for_predicate(
+		&self,
+		scan: ExecutionPlan,
+		predicate: &Expr,
+		schema: &SchemaRef,
+	) -> Result<(ExecutionPlan, QueryProfileHint), BindingError> {
+		let bound_predicate = self
+			.bind_expr_program(std::slice::from_ref(predicate), schema)
+			.await?;
+		require_single_boolean_root(&bound_predicate, "UPDATE WHERE")?;
+		Ok(plan_filter_with_predicate_pushdown(scan, bound_predicate))
+	}
+
+	async fn bind_returning_projection(
+		&self,
+		returning: Option<&ReturningProjection>,
+		schema: &SchemaRef,
+	) -> Result<Option<BoundReturningProjection>, BindingError> {
+		let Some(returning) = returning else {
+			return Ok(None);
+		};
+		let (exprs, output_names) = match returning {
+			ReturningProjection::Star => {
+				let exprs = schema
+					.fields()
+					.iter()
+					.map(|field| Expr::column(field.name().clone()))
+					.collect::<Vec<_>>();
+				let output_names = schema
+					.fields()
+					.iter()
+					.map(|field| Some(field.name().clone()))
+					.collect::<Vec<_>>();
+				(exprs, output_names)
+			}
+			ReturningProjection::Exprs {
+				exprs,
+				output_names,
+			} => {
+				if exprs.len() != output_names.len() {
+					return Err(BindingError::UnsupportedExpression {
+						message: "RETURNING expression/name length mismatch".to_string(),
+					});
+				}
+				for expr in exprs {
+					reject_storage_synthetic_returning_reference(expr)?;
+				}
+				(exprs.clone(), output_names.clone())
+			}
+		};
+		let exprs = self.bind_expr_program(&exprs, schema).await?;
+		let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
+		Ok(Some(BoundReturningProjection {
+			exprs,
+			output_schema,
+		}))
+	}
 }
 
 fn bind_update_source_for_all_rows(scan: ExecutionPlan) -> (ExecutionPlan, QueryProfileHint) {
 	(scan, QueryProfileHint::Scan)
-}
-
-fn bind_returning_projection(
-	returning: Option<&ReturningProjection>,
-	schema: &SchemaRef,
-	config: &PlannerConfig,
-) -> Result<Option<BoundReturningProjection>, BindingError> {
-	let Some(returning) = returning else {
-		return Ok(None);
-	};
-	let (exprs, output_names) = match returning {
-		ReturningProjection::Star => {
-			let exprs = schema
-				.fields()
-				.iter()
-				.map(|field| Expr::column(field.name().clone()))
-				.collect::<Vec<_>>();
-			let output_names = schema
-				.fields()
-				.iter()
-				.map(|field| Some(field.name().clone()))
-				.collect::<Vec<_>>();
-			(exprs, output_names)
-		}
-		ReturningProjection::Exprs {
-			exprs,
-			output_names,
-		} => {
-			if exprs.len() != output_names.len() {
-				return Err(BindingError::UnsupportedExpression {
-					message: "RETURNING expression/name length mismatch".to_string(),
-				});
-			}
-			for expr in exprs {
-				reject_storage_synthetic_returning_reference(expr)?;
-			}
-			(exprs.clone(), output_names.clone())
-		}
-	};
-	let exprs = bind_expr_program(&exprs, schema, config)?;
-	let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
-	Ok(Some(BoundReturningProjection {
-		exprs,
-		output_schema,
-	}))
 }
 
 fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), BindingError> {
@@ -704,6 +762,7 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 		}
 		Expr::Column(_) | Expr::Literal(_) => Ok(()),
 		Expr::LogicalAscription { expr: inner, .. }
+		| Expr::SqlLogicalCast { expr: inner, .. }
 		| Expr::Cast(inner, _)
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)
@@ -732,6 +791,58 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 		| Expr::Or(left, right) => {
 			reject_storage_synthetic_returning_reference(left)?;
 			reject_storage_synthetic_returning_reference(right)
+		}
+	}
+}
+
+fn collect_logical_cast_names(
+	expr: &Expr,
+	names: &mut HashSet<String>,
+) -> Result<(), BindingError> {
+	match expr {
+		Expr::Column(_) | Expr::Literal(_) => Ok(()),
+		Expr::SqlLogicalCast {
+			expr,
+			logical_name,
+			try_cast,
+		} => {
+			if *try_cast {
+				return Err(BindingError::UnsupportedExpression {
+					message: "TRY_CAST/SAFE_CAST to logical type is not supported".to_string(),
+				});
+			}
+			names.insert(logical_name.clone());
+			collect_logical_cast_names(expr, names)
+		}
+		Expr::LogicalAscription { expr, .. }
+		| Expr::Cast(expr, _)
+		| Expr::TryCast(expr, _)
+		| Expr::Not(expr)
+		| Expr::IsNull(expr)
+		| Expr::IsNotNull(expr)
+		| Expr::Like { expr, .. }
+		| Expr::TimeBucket(_, expr) => collect_logical_cast_names(expr, names),
+		Expr::InList { expr, list, .. } => {
+			collect_logical_cast_names(expr, names)?;
+			for item in list {
+				collect_logical_cast_names(item, names)?;
+			}
+			Ok(())
+		}
+		Expr::Add(left, right)
+		| Expr::Sub(left, right)
+		| Expr::Mul(left, right)
+		| Expr::Div(left, right)
+		| Expr::Eq(left, right)
+		| Expr::Neq(left, right)
+		| Expr::Lt(left, right)
+		| Expr::Lte(left, right)
+		| Expr::Gt(left, right)
+		| Expr::Gte(left, right)
+		| Expr::And(left, right)
+		| Expr::Or(left, right) => {
+			collect_logical_cast_names(left, names)?;
+			collect_logical_cast_names(right, names)
 		}
 	}
 }
@@ -1953,6 +2064,7 @@ fn join_key_column_ref(
 			Expr::Eq(_, _) => Err(BindingError::JoinPredicateNotEqui),
 			_ => Err(BindingError::JoinComputedKeyUnsupported),
 		},
+		Expr::SqlLogicalCast { .. } => Err(BindingError::JoinComputedKeyUnsupported),
 		Expr::Eq(_, _) => Err(BindingError::JoinPredicateNotEqui),
 		_ => Err(BindingError::JoinComputedKeyUnsupported),
 	}
@@ -2649,7 +2761,7 @@ fn bind_aggregate_call(
 	function: &AggregateFunction,
 	args: &[Expr],
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 ) -> Result<BoundAggregateCall, BindingError> {
 	if matches!(function, AggregateFunction::CountAll) {
 		return Ok(BoundAggregateCall {
@@ -2658,18 +2770,18 @@ fn bind_aggregate_call(
 		});
 	}
 	if let Some(spec) = aggregate_kernel::stable_spec_for_function(function) {
-		return bind_stable_aggregate_call(function, args, input_schema, config, spec);
+		return bind_stable_aggregate_call(function, args, input_schema, ctx, spec);
 	}
 	match function {
 		AggregateFunction::LinearRegress => {
-			if !config.allow_experimental_kernels {
+			if !ctx.config.allow_experimental_kernels {
 				return Err(BindingError::ExperimentalKernel {
 					kernel: "LinearRegress",
 				});
 			}
 			let args = args
 				.iter()
-				.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, config))
+				.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, ctx))
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(BoundAggregateCall {
 				function: function.clone(),
@@ -2677,14 +2789,14 @@ fn bind_aggregate_call(
 			})
 		}
 		AggregateFunction::ApproxQuantile(_) => {
-			if !config.allow_experimental_kernels {
+			if !ctx.config.allow_experimental_kernels {
 				return Err(BindingError::ExperimentalKernel {
 					kernel: "ApproxQuantile",
 				});
 			}
 			let args = args
 				.iter()
-				.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, config))
+				.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, ctx))
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(BoundAggregateCall {
 				function: function.clone(),
@@ -2704,7 +2816,7 @@ fn bind_stable_aggregate_call(
 	function: &AggregateFunction,
 	args: &[Expr],
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	spec: &AggregateKernelSpec,
 ) -> Result<BoundAggregateCall, BindingError> {
 	if args.len() != aggregate_arity_len(spec.arity) {
@@ -2712,7 +2824,7 @@ fn bind_stable_aggregate_call(
 			message: format!("{} requires one argument", spec.sql_name),
 		});
 	}
-	let args = bind_expr_program(args, input_schema, config)?;
+	let args = bind_expr_program(args, input_schema, ctx)?;
 	if !matches!(spec.input_domain, AggregateInputDomain::Any) {
 		let Some(data_type) = args.root_type(0) else {
 			return Err(BindingError::UnsupportedExpression {
@@ -2848,11 +2960,11 @@ fn aggregate_type_mismatch_message(kernel: StableAggregateKernel, data_type: &Da
 fn bind_expr_program(
 	exprs: &[Expr],
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 ) -> Result<BoundExprProgram, BindingError> {
 	let mut builder = BoundExprProgramBuilder::new();
 	for expr in exprs {
-		let root = bind_expr_into_program(&mut builder, expr, input_schema, config)?;
+		let root = bind_expr_into_program(&mut builder, expr, input_schema, ctx)?;
 		builder.push_root(root);
 	}
 	Ok(builder.build())
@@ -2862,7 +2974,7 @@ fn bind_expr_into_program(
 	builder: &mut BoundExprProgramBuilder,
 	expr: &Expr,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 ) -> Result<BoundExprId, BindingError> {
 	match expr {
 		Expr::Column(column_ref) => {
@@ -2877,110 +2989,53 @@ fn bind_expr_into_program(
 		}
 		Expr::Literal(value) => Ok(builder.append_literal(value.clone())),
 		Expr::LogicalAscription { expr, logical_type } => {
-			bind_logical_ascription(builder, input_schema, config, expr, *logical_type)
+			bind_logical_ascription(builder, input_schema, ctx, expr, *logical_type)
 		}
-		Expr::Cast(inner, target) => {
-			bind_explicit_cast(builder, input_schema, config, inner, target)
+		Expr::SqlLogicalCast {
+			expr,
+			logical_name,
+			try_cast,
+		} => bind_sql_logical_cast(builder, input_schema, ctx, expr, logical_name, *try_cast),
+		Expr::Cast(inner, target) => bind_explicit_cast(builder, input_schema, ctx, inner, target),
+		Expr::TryCast(inner, target) => bind_try_cast(builder, input_schema, ctx, inner, target),
+		Expr::Add(left, right) => {
+			bind_arithmetic(builder, input_schema, ctx, left, right, BoundBinaryOp::Add)
 		}
-		Expr::TryCast(inner, target) => bind_try_cast(builder, input_schema, config, inner, target),
-		Expr::Add(left, right) => bind_arithmetic(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Add,
-		),
-		Expr::Sub(left, right) => bind_arithmetic(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Sub,
-		),
-		Expr::Mul(left, right) => bind_arithmetic(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Mul,
-		),
-		Expr::Div(left, right) => bind_arithmetic(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Div,
-		),
-		Expr::Eq(left, right) => bind_comparison(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Eq,
-		),
-		Expr::Neq(left, right) => bind_comparison(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Neq,
-		),
-		Expr::Lt(left, right) => bind_comparison(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Lt,
-		),
-		Expr::Lte(left, right) => bind_comparison(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Lte,
-		),
-		Expr::Gt(left, right) => bind_comparison(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Gt,
-		),
-		Expr::Gte(left, right) => bind_comparison(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Gte,
-		),
-		Expr::And(left, right) => bind_boolean(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::And,
-		),
-		Expr::Or(left, right) => bind_boolean(
-			builder,
-			input_schema,
-			config,
-			left,
-			right,
-			BoundBinaryOp::Or,
-		),
+		Expr::Sub(left, right) => {
+			bind_arithmetic(builder, input_schema, ctx, left, right, BoundBinaryOp::Sub)
+		}
+		Expr::Mul(left, right) => {
+			bind_arithmetic(builder, input_schema, ctx, left, right, BoundBinaryOp::Mul)
+		}
+		Expr::Div(left, right) => {
+			bind_arithmetic(builder, input_schema, ctx, left, right, BoundBinaryOp::Div)
+		}
+		Expr::Eq(left, right) => {
+			bind_comparison(builder, input_schema, ctx, left, right, BoundBinaryOp::Eq)
+		}
+		Expr::Neq(left, right) => {
+			bind_comparison(builder, input_schema, ctx, left, right, BoundBinaryOp::Neq)
+		}
+		Expr::Lt(left, right) => {
+			bind_comparison(builder, input_schema, ctx, left, right, BoundBinaryOp::Lt)
+		}
+		Expr::Lte(left, right) => {
+			bind_comparison(builder, input_schema, ctx, left, right, BoundBinaryOp::Lte)
+		}
+		Expr::Gt(left, right) => {
+			bind_comparison(builder, input_schema, ctx, left, right, BoundBinaryOp::Gt)
+		}
+		Expr::Gte(left, right) => {
+			bind_comparison(builder, input_schema, ctx, left, right, BoundBinaryOp::Gte)
+		}
+		Expr::And(left, right) => {
+			bind_boolean(builder, input_schema, ctx, left, right, BoundBinaryOp::And)
+		}
+		Expr::Or(left, right) => {
+			bind_boolean(builder, input_schema, ctx, left, right, BoundBinaryOp::Or)
+		}
 		Expr::Not(inner) => {
-			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 			require_boolean(builder, "NOT", inner)?;
 			Ok(builder.append_unary(BoundUnaryOp::Not, inner, DataType::Boolean))
 		}
@@ -2988,7 +3043,7 @@ fn bind_expr_into_program(
 			expr,
 			list,
 			negated,
-		} => bind_in_list(builder, input_schema, config, expr, list, *negated),
+		} => bind_in_list(builder, input_schema, ctx, expr, list, *negated),
 		Expr::Like {
 			expr,
 			pattern,
@@ -2997,27 +3052,27 @@ fn bind_expr_into_program(
 		} => bind_like(
 			builder,
 			input_schema,
-			config,
+			ctx,
 			expr,
 			pattern,
 			*negated,
 			*case_insensitive,
 		),
 		Expr::IsNull(inner) => {
-			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNull, inner, DataType::Boolean))
 		}
 		Expr::IsNotNull(inner) => {
-			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNotNull, inner, DataType::Boolean))
 		}
 		Expr::TimeBucket(interval, inner) => {
-			if !config.allow_experimental_kernels {
+			if !ctx.config.allow_experimental_kernels {
 				return Err(BindingError::ExperimentalKernel {
 					kernel: "TimeBucket",
 				});
 			}
-			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 			if builder.node_type(inner) != Some(&DataType::Int64) {
 				return Err(BindingError::TypeMismatch {
 					message: "TimeBucket expects Int64 (ms) input".to_string(),
@@ -3031,11 +3086,11 @@ fn bind_expr_into_program(
 fn bind_logical_ascription(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	inner: &Expr,
 	logical_type: LogicalTypeId,
 ) -> Result<BoundExprId, BindingError> {
-	let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 	let physical = builder
 		.node_type(inner)
 		.cloned()
@@ -3051,6 +3106,56 @@ fn bind_logical_ascription(
 		});
 	}
 	Ok(inner)
+}
+
+fn bind_sql_logical_cast(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	inner: &Expr,
+	logical_name: &str,
+	try_cast: bool,
+) -> Result<BoundExprId, BindingError> {
+	if try_cast {
+		return Err(BindingError::UnsupportedExpression {
+			message: "TRY_CAST/SAFE_CAST to logical type is not supported".to_string(),
+		});
+	}
+	let spec =
+		ctx.logical_casts
+			.get(logical_name)
+			.ok_or_else(|| BindingError::UnsupportedExpression {
+				message: format!(
+					"internal: SQL logical CAST target {logical_name} was not resolved"
+				),
+			})?;
+	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+	let source = builder
+		.node_type(inner)
+		.cloned()
+		.expect("builder returns typed SQL logical cast input");
+	let existing = builder
+		.node_logical_type(inner)
+		.expect("builder returns logical type for SQL logical cast input");
+	let logical_type = reconcile_identity(existing, spec.id, &source)?;
+	let output = if source == spec.physical {
+		inner
+	} else if is_supported_explicit_numeric_cast(&source, &spec.physical) {
+		builder.append_cast(inner, spec.physical.clone(), spec.physical.clone())
+	} else {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"unsupported CAST: {source:?} to logical type {}({:?}); only same-physical casts or Int32, Int64, Float32, and Float64 numeric conversions are supported",
+				spec.name, spec.physical
+			),
+		});
+	};
+	if !builder.set_node_logical_type(output, logical_type) {
+		return Err(BindingError::UnsupportedExpression {
+			message: "SQL logical cast target is malformed".to_string(),
+		});
+	}
+	Ok(output)
 }
 
 fn validate_logical_ascription_physical(
@@ -3079,13 +3184,13 @@ fn validate_logical_ascription_physical(
 fn bind_arithmetic(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	left: &Expr,
 	right: &Expr,
 	op: BoundBinaryOp,
 ) -> Result<BoundExprId, BindingError> {
-	let left = bind_expr_into_program(builder, left, input_schema, config)?;
-	let right = bind_expr_into_program(builder, right, input_schema, config)?;
+	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
+	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
 	let left_type = builder
 		.node_type(left)
 		.cloned()
@@ -3110,11 +3215,11 @@ fn bind_arithmetic(
 fn bind_explicit_cast(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	inner: &Expr,
 	target: &DataType,
 ) -> Result<BoundExprId, BindingError> {
-	let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 	let source = builder
 		.node_type(inner)
 		.cloned()
@@ -3132,11 +3237,11 @@ fn bind_explicit_cast(
 fn bind_try_cast(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	inner: &Expr,
 	target: &DataType,
 ) -> Result<BoundExprId, BindingError> {
-	let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 	let source = builder
 		.node_type(inner)
 		.cloned()
@@ -3310,13 +3415,13 @@ fn insert_overflow(column: &str, literal: &InsertLiteral, target: &DataType) -> 
 fn bind_comparison(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	left: &Expr,
 	right: &Expr,
 	op: BoundBinaryOp,
 ) -> Result<BoundExprId, BindingError> {
-	let left = bind_expr_into_program(builder, left, input_schema, config)?;
-	let right = bind_expr_into_program(builder, right, input_schema, config)?;
+	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
+	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
 	coerce_comparison_literals(builder, left, right);
 	let left_type = builder
 		.node_type(left)
@@ -3352,7 +3457,7 @@ fn bind_comparison(
 fn bind_in_list(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	expr: &Expr,
 	list: &[Expr],
 	negated: bool,
@@ -3362,10 +3467,10 @@ fn bind_in_list(
 			message: "IN list must not be empty".to_string(),
 		});
 	}
-	let expr = bind_expr_into_program(builder, expr, input_schema, config)?;
+	let expr = bind_expr_into_program(builder, expr, input_schema, ctx)?;
 	let mut bound_items = Vec::with_capacity(list.len());
 	for item in list {
-		let item = bind_expr_into_program(builder, item, input_schema, config)?;
+		let item = bind_expr_into_program(builder, item, input_schema, ctx)?;
 		coerce_comparison_literals(builder, expr, item);
 		let expr_type = builder
 			.node_type(expr)
@@ -3452,13 +3557,13 @@ fn reconcile_identity(
 fn bind_like(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	expr: &Expr,
 	pattern: &str,
 	negated: bool,
 	case_insensitive: bool,
 ) -> Result<BoundExprId, BindingError> {
-	let expr = bind_expr_into_program(builder, expr, input_schema, config)?;
+	let expr = bind_expr_into_program(builder, expr, input_schema, ctx)?;
 	let expr_type = builder
 		.node_type(expr)
 		.cloned()
@@ -3519,13 +3624,13 @@ fn coerce_literal_value(value: ScalarValue, target_type: &DataType) -> ScalarVal
 fn bind_boolean(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
-	config: &PlannerConfig,
+	ctx: &ExprBindContext<'_>,
 	left: &Expr,
 	right: &Expr,
 	op: BoundBinaryOp,
 ) -> Result<BoundExprId, BindingError> {
-	let left = bind_expr_into_program(builder, left, input_schema, config)?;
-	let right = bind_expr_into_program(builder, right, input_schema, config)?;
+	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
+	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
 	require_boolean(builder, "boolean operator left", left)?;
 	require_boolean(builder, "boolean operator right", right)?;
 	Ok(builder.append_binary(op, left, right, DataType::Boolean))

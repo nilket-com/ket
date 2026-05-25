@@ -214,10 +214,10 @@ fn static_seed_still_resolves_for_rune_and_tests() {
 }
 
 #[test]
-fn sql_cast_use_site_still_rejects() {
+fn sql_explicit_typed_ctas_column_list_still_rejects() {
 	assert_frontend_error(
-		"SELECT CAST(customer_id AS CustomerId) FROM orders",
-		"unsupported CAST target type",
+		"CREATE TABLE copied (customer_id CustomerId) AS SELECT customer_id FROM orders",
+		"explicit column lists",
 	);
 }
 

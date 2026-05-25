@@ -1135,13 +1135,14 @@ pub(crate) fn adr084_rune_arithmetic_reuses_adr024_substrate() {
 	] {
 		assert!(ir.contains(variant), "IR missing existing {variant}");
 	}
-	for binder_arm in [
-		"Expr::Add(left, right) => bind_arithmetic",
-		"Expr::Sub(left, right) => bind_arithmetic",
-		"Expr::Mul(left, right) => bind_arithmetic",
-		"Expr::Div(left, right) => bind_arithmetic",
+	for (variant, op) in [
+		("Expr::Add(left, right)", "BoundBinaryOp::Add"),
+		("Expr::Sub(left, right)", "BoundBinaryOp::Sub"),
+		("Expr::Mul(left, right)", "BoundBinaryOp::Mul"),
+		("Expr::Div(left, right)", "BoundBinaryOp::Div"),
 	] {
-		assert!(binder.contains(binder_arm), "binder missing {binder_arm}");
+		assert!(binder.contains(variant), "binder missing {variant}");
+		assert!(binder.contains(op), "binder missing {op}");
 	}
 	assert!(binder.contains("fn bind_arithmetic"));
 	assert!(binder.contains("arithmetic_output_type(&left_type, &right_type)"));
@@ -1257,13 +1258,18 @@ pub(crate) fn adr083_predicate_operator_cut_does_not_change_engine_substrate() {
 	] {
 		assert!(ir.contains(variant), "IR missing existing {variant}");
 	}
+	for (variant, op) in [
+		("Expr::Neq(left, right)", "BoundBinaryOp::Neq"),
+		("Expr::Lt(left, right)", "BoundBinaryOp::Lt"),
+		("Expr::Lte(left, right)", "BoundBinaryOp::Lte"),
+		("Expr::Gte(left, right)", "BoundBinaryOp::Gte"),
+		("Expr::And(left, right)", "BoundBinaryOp::And"),
+		("Expr::Or(left, right)", "BoundBinaryOp::Or"),
+	] {
+		assert!(binder.contains(variant), "binder missing {variant}");
+		assert!(binder.contains(op), "binder missing {op}");
+	}
 	for binder_arm in [
-		"Expr::Neq(left, right) => bind_comparison",
-		"Expr::Lt(left, right) => bind_comparison",
-		"Expr::Lte(left, right) => bind_comparison",
-		"Expr::Gte(left, right) => bind_comparison",
-		"Expr::And(left, right) => bind_boolean",
-		"Expr::Or(left, right) => bind_boolean",
 		"Expr::Not(inner) =>",
 		"Expr::IsNull(inner) =>",
 		"Expr::IsNotNull(inner) =>",

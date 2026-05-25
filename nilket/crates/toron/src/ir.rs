@@ -483,6 +483,11 @@ pub enum Expr {
 		expr: Box<Expr>,
 		logical_type: LogicalTypeId,
 	},
+	SqlLogicalCast {
+		expr: Box<Expr>,
+		logical_name: String,
+		try_cast: bool,
+	},
 	Cast(Box<Expr>, DataType),
 	TryCast(Box<Expr>, DataType),
 	Add(Box<Expr>, Box<Expr>),
@@ -531,7 +536,8 @@ impl Expr {
 		match self {
 			Self::Column(_) | Self::Literal(_) => true,
 			Self::LogicalAscription { expr, .. } => expr.is_pbc_pushdown_eligible(),
-			Self::Cast(_, _)
+			Self::SqlLogicalCast { .. }
+			| Self::Cast(_, _)
 			| Self::TryCast(_, _)
 			| Self::Add(_, _)
 			| Self::Sub(_, _)
