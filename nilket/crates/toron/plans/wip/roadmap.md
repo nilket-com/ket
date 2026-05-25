@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–089 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–100 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -547,6 +547,27 @@ run, 079+).
   (refreshes through the existing catalog-sync path, then executes coordinator-local). Genuine 3-of-3.
   Migration: `plans/impl/099_information_schema_logical_types.md`.
 
+- **ADR 100 — Derived-Source Transparent Projection Provenance.** Promoted. **Closes the 097/098
+  deferral 099 named:** standalone pass-through provenance had no SQL consumer (`SELECT id FROM people
+  WHERE id<0` already binds `Project(Filter(Scan))`), so 100 **pairs the consumer with the proof** —
+  a narrow derived `FROM` source makes `Filter(Project(Scan))` SQL-reachable, and the refinement atom
+  learns to trace through a transparent inner `Project` to the stored scan receipt. **Fork → B:** the
+  planner accepts narrow single-source plain-SELECT derived tables (transparent *or* computed); a
+  computed derived projection binds and runs but returns `Unknown` — transparency is an elision-proof
+  property decided in the binder atom, **not** a parser property. **Two-shape receipt** (Claude's iter-1
+  cut, 3-of-3): direct `Scan { projection: None }` or transparent-`Project` chain
+  (`exprs.roots[ordinal]` must be `Column`, remap output→child, recurse); the projected
+  `Scan { projection: Some }` receipt is **excluded as inert** — `push_down_scan_projection` runs
+  *after* filter classification (`bind()` = `bind_plan` then pushdown), so it has no consumer at proof
+  time. Reuses **089-propagated identity** (structural-only, no re-drive); leaves the **098 eager-error
+  fence** untouched; outer projection unconstrained. Behavior payoff visible as the **inverted** guard
+  (`refinement_on_non_scan_input_does_not_elide` → `refinement_through_transparent_project_elides`; its
+  transparent bare-column project now elides), with `cast_ascribed_projected_column_does_not_elide`
+  preserved as the non-transparent boundary. Toron-only; no IR/exec variant, PBC, executor, storage, or
+  Wendelon change. Genuine 3-of-3 (Claude grounded 089-identity-propagation, the projected-scan-inert
+  cut, and the confirmed retarget; Codex seeded the paired cut + the receipt resolver structure; Gemini
+  ratified). Migration: `plans/impl/100_derived_source_transparent_projection_provenance.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -630,25 +651,24 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 099 promoted; ADR 100 candidates
+### ADR 100 promoted; ADR 101 candidates
 
-ADR 099 selected and promoted **`information_schema.logical_types`** — the introspection pivot off the
-087–098 identity/refinement arc; the first read-side synthetic relation (`ExecutionPlan::SystemTable`,
-bind-time interception, refresh-before-read, durable/tenant-scoped, read-only). Genuine 3-of-3.
+ADR 100 selected and promoted **Derived-Source Transparent Projection Provenance** — paired the first
+narrow derived `FROM` source with the refinement proof that traces through a transparent inner `Project`
+to the stored scan receipt (Fork B: transparency in the binder atom, not the parser; two-shape receipt;
+projected-scan excluded as inert). Genuine 3-of-3. No operator-designated next named yet; the strongest
+leads, by theme:
 
-**ADR 100 candidates:**
+*Derived-source continuation (the natural next step from 100):*
 
-*Operator-designated next (the 097/098 deferral):*
+- **General derived tables / subqueries** — lift 100's single-source fence toward joins-around-derived,
+  derived aggregates/sort/limit, alias scoping, and eventually `IN`/scalar/correlated + decorrelation.
+  Large; sequence the sub-features.
+- **Projected-scan receipt** — only earns a cut if/when refinement elision is ever duplicated or moved
+  to run *after* `push_down_scan_projection` (then `Scan { projection: Some }` has a consumer). Low
+  priority; explicitly deferred by ADR 100 D5.
 
-- **Pass-through-projection provenance** *(operator: "doing it next cycle")* — lift 097/098's
-  `Scan { projection: None }` gate so refinement elision survives a transparent `Project`/projected
-  `Scan` (trace the predicate column's lineage to a stored scan; reject cast/compute/sidecar-only).
-  **Caveat (099 grounding):** it has **no SQL consumer today** — `Filter(Project(Scan))` isn't
-  SQL-reachable until subquery-`FROM`/views exist, so ADR 100 either builds the lineage contract
-  *ahead* of its consumer or **pairs with** a source-shaping feature that makes it reachable. The
-  council should name which at iter-0.
-
-*Introspection follow-on (now that the substrate exists):*
+*Introspection follow-on (substrate now exists, doubly motivated after 099 + the type system):*
 
 - **`information_schema.tables` / `.columns`** — a 2nd/3rd system relation; the point at which the 099
   `SystemTableKind` enum earns generalizing into a small virtual-table framework.
@@ -660,8 +680,7 @@ bind-time interception, refresh-before-read, durable/tenant-scoped, read-only). 
 - **PK/FK-derived identity** — "magic that follows constraints, not names": derive from `PRIMARY
   KEY`, inherit via `REFERENCES`; blocked on FK support (rejected at `sql_planner.rs:663`) + a
   canonical `schema.table.column` identity name.
-- read-only **`information_schema.logical_types`** (net-new virtual-table surface);
-  aggregate-output identity semantics; the optional Wendelon-validate-at-authority (090 knob);
+- aggregate-output identity semantics; the optional Wendelon-validate-at-authority (090 knob);
   **`.as_naked()`** Rune helper.
 
 *Carried Rune leads (still live):*
@@ -674,6 +693,12 @@ bind-time interception, refresh-before-read, durable/tenant-scoped, read-only). 
 - **`SIMILAR TO`/`RLIKE`/`REGEXP`**; **`CASE`/value-conditionals**; **Rune sort/limit**;
   dot-field sugar; **Wendelon typed table-mutation trace continuation**.
 
+*Cross-ring chore (operator-flagged):*
+
+- **Wendelon `*V1`/`*v1` de-version sweep** — strip the version suffixes in Wendelon unless one has a
+  strong reason (pre-release, no historical installs). A Wendelon-home chore (placement follows
+  code-locality), not a Toron ADR.
+
 *Carried:*
 
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
@@ -681,7 +706,15 @@ bind-time interception, refresh-before-read, durable/tenant-scoped, read-only). 
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/099_information_schema_logical_types.md`.
+`plans/impl/100_derived_source_transparent_projection_provenance.md`.
+
+### ADR 099 promoted; ADR 100 candidates (HISTORICAL)
+
+ADR 099 promoted **`information_schema.logical_types`** (the introspection pivot off the 087–098
+identity/refinement arc; first read-side synthetic relation). 100 closed the 097/098 deferral 099 named —
+pass-through provenance had no SQL consumer, so 100 paired a narrow derived `FROM` source with the
+transparent-projection proof. Detail in `plans/adr/099_information_schema_logical_types.md` + the
+active-line entry above.
 
 ### ADR 098 promoted; ADR 099 candidates (HISTORICAL)
 
