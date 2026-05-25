@@ -10,9 +10,10 @@ use toron::coordinator::QueryCoordinator;
 use toron::error::{BindingError, CatalogError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	BoundExprNode, BoundExprProgram, CreateTableColumnType, DURABLE_LOGICAL_TYPE_MIN_ID,
-	ExecutionPlan, LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan, LogicalTypeId,
-	decode_column_logical_type,
+	BoundExprNode, BoundExprProgram, CUSTOMER_ID_LOGICAL_TYPE, CreateTableColumnType,
+	DURABLE_LOGICAL_TYPE_MIN_ID, ExecutionPlan, Expr, LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan,
+	LogicalTypeId, ScalarValue, TableId, decode_column_logical_type,
+	field_with_logical_type_metadata,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
@@ -1097,6 +1098,293 @@ async fn refined_logical_type_write_boundary_covers_select_update_and_ctas() {
 	assert_eq!(int64_rows(&ctas_ok, 0), vec![Some(2)]);
 }
 
+#[tokio::test]
+async fn refined_positive_column_eq_negative_elides_to_empty_relation() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_logical(&catalog, people_filter(int64_eq("id", -5))).await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn refined_positive_column_range_disjoint_elides() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(&catalog, &planner, "SELECT id FROM people WHERE id < 0").await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn refined_positive_column_overlapping_range_does_not_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	for sql in [
+		"SELECT id FROM people WHERE id = 5",
+		"SELECT id FROM people WHERE id > 100",
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert!(find_empty_relation(&bound).is_none(), "{sql}");
+		assert!(contains_scan(&bound), "{sql}");
+	}
+}
+
+#[tokio::test]
+async fn refinement_exclusion_point_elides() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE NonZeroId AS BIGINT CHECK (VALUE != 0)",
+		"CREATE TABLE non_zero_people (id NonZeroId, note TEXT)",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT id FROM non_zero_people WHERE id = 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn cast_ascribed_projected_column_does_not_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0)",
+		"CREATE TABLE raw_people (raw_id BIGINT)",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+	let plan = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("raw_people"),
+				projection: None,
+			}),
+			exprs: vec![Expr::SqlLogicalCast {
+				expr: Box::new(Expr::column("raw_id")),
+				logical_name: "PersonId".to_string(),
+				try_cast: false,
+			}],
+			output_names: vec![Some("id".to_string())],
+		}),
+		predicate: Expr::Eq(
+			Box::new(Expr::column("id")),
+			Box::new(Expr::Literal(ScalarValue::Int64(Some(-5)))),
+		),
+	};
+	let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind cast-ascribed non-receipt plan");
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn refinement_on_non_scan_input_does_not_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	let plan = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("people"),
+				projection: None,
+			}),
+			exprs: vec![Expr::column("id")],
+			output_names: vec![Some("id".to_string())],
+		}),
+		predicate: Expr::Eq(
+			Box::new(Expr::column("id")),
+			Box::new(Expr::Literal(ScalarValue::Int64(Some(-5)))),
+		),
+	};
+	let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind projected refined non-scan plan");
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn nullable_refined_column_is_null_does_not_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(&catalog, &planner, "SELECT id FROM people WHERE id IS NULL").await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn naked_or_unrefined_column_does_not_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE CustomerId AS BIGINT",
+		"CREATE TABLE customers (id CustomerId, note TEXT)",
+		"CREATE TABLE raw_ids (id BIGINT, note TEXT)",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	for sql in [
+		"SELECT id FROM customers WHERE id < 0",
+		"SELECT id FROM raw_ids WHERE id < 0",
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert!(find_empty_relation(&bound).is_none(), "{sql}");
+		assert!(contains_scan(&bound), "{sql}");
+	}
+}
+
+#[tokio::test]
+async fn refinement_elision_uses_durable_registry_not_seed_lookup() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	let durable_bound = bind_logical(&catalog, people_filter(int64_eq("id", -5))).await;
+	assert!(find_empty_relation(&durable_bound).is_some());
+
+	let mut seed_catalog = MockCatalog::new();
+	let seed_schema = Arc::new(Schema::new(vec![field_with_logical_type_metadata(
+		"id",
+		DataType::Int64,
+		true,
+		CUSTOMER_ID_LOGICAL_TYPE,
+	)]));
+	seed_catalog
+		.register_descriptor(
+			TableId(77),
+			descriptor_from_schema("seed_people", seed_schema.as_ref()),
+		)
+		.expect("register seed typed table");
+	let seed_plan = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("seed_people"),
+			projection: None,
+		}),
+		predicate: int64_eq("id", -5),
+	};
+	let seed_bound = bind(&seed_plan, &seed_catalog, &PlannerConfig::default())
+		.await
+		.expect("bind seed logical type query");
+
+	assert!(find_empty_relation(&seed_bound).is_none());
+	assert!(contains_scan(&seed_bound));
+}
+
+#[tokio::test]
+async fn float_refinement_decodes_bits_for_ordering() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE Price AS DOUBLE CHECK (VALUE >= 0.0)",
+		"CREATE TABLE prices (price Price)",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	let bound = bind_logical(
+		&catalog,
+		LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("prices"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::column("price")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(-1.0)))),
+			),
+		},
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn boolean_and_utf8_refinement_singletons_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE EnabledFlag AS BOOLEAN CHECK (VALUE = TRUE)",
+		"CREATE TABLE feature_flags (enabled EnabledFlag)",
+		"CREATE LOGICAL TYPE SafeSku AS TEXT CHECK (VALUE != 'bad')",
+		"CREATE TABLE skus (sku SafeSku)",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	for sql in [
+		"SELECT enabled FROM feature_flags WHERE enabled = FALSE",
+		"SELECT sku FROM skus WHERE sku = 'bad'",
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert!(find_empty_relation(&bound).is_some(), "{sql}");
+		assert!(!contains_scan(&bound), "{sql}");
+	}
+}
+
+#[tokio::test]
+async fn count_star_over_refinement_elided_filter_returns_single_zero() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT COUNT(*) FROM people WHERE id < 0",
+	)
+	.await;
+	assert!(find_empty_relation(&bound).is_some());
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT COUNT(*) FROM people WHERE id < 0",
+	)
+	.await;
+
+	assert_eq!(int64_rows(&batch, 0), vec![Some(0)]);
+}
+
+#[tokio::test]
+async fn update_or_insert_select_source_filter_elides_through_shared_planner() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0)",
+		"CREATE TABLE update_people (pk BIGINT NOT NULL PRIMARY KEY, id PersonId, note TEXT)",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"UPDATE update_people SET note = 'miss' WHERE id < 0",
+	)
+	.await;
+	let ExecutionPlan::Update { source, .. } = &bound else {
+		panic!("expected update plan, got {bound:?}");
+	};
+	let ExecutionPlan::Project { input, .. } = source.as_ref() else {
+		panic!("expected update source project, got {source:?}");
+	};
+	assert!(
+		matches!(input.as_ref(), ExecutionPlan::EmptyRelation { .. }),
+		"expected refinement-elided update source, got {input:?}"
+	);
+}
+
 fn logical_type_coordinator() -> (Arc<MockCatalog>, QueryCoordinator, SqlPlanner) {
 	let catalog = Arc::new(MockCatalog::new());
 	let storage = empty_storage();
@@ -1129,6 +1417,48 @@ async fn execute(coordinator: &QueryCoordinator, planner: &SqlPlanner, sql: &str
 		.execute_query(&planner.plan(sql).expect("plan SQL"), None)
 		.await
 		.expect(sql);
+}
+
+async fn setup_person_id_people(coordinator: &QueryCoordinator, planner: &SqlPlanner) {
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0)",
+		"CREATE TABLE people (id PersonId, note TEXT)",
+	] {
+		execute(coordinator, planner, sql).await;
+	}
+}
+
+async fn bind_sql(catalog: &MockCatalog, planner: &SqlPlanner, sql: &str) -> ExecutionPlan {
+	bind(
+		&planner.plan(sql).expect("plan SQL"),
+		catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect(sql)
+}
+
+async fn bind_logical(catalog: &MockCatalog, plan: LogicalPlan) -> ExecutionPlan {
+	bind(&plan, catalog, &PlannerConfig::default())
+		.await
+		.expect("bind logical plan")
+}
+
+fn people_filter(predicate: Expr) -> LogicalPlan {
+	LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("people"),
+			projection: None,
+		}),
+		predicate,
+	}
+}
+
+fn int64_eq(column: &str, value: i64) -> Expr {
+	Expr::Eq(
+		Box::new(Expr::column(column)),
+		Box::new(Expr::Literal(ScalarValue::Int64(Some(value)))),
+	)
 }
 
 async fn expect_query_error_contains(
@@ -1217,6 +1547,40 @@ fn bool_rows(batch: &RecordBatch, column: usize) -> Vec<Option<bool>> {
 		.expect("Boolean column")
 		.iter()
 		.collect()
+}
+
+fn find_empty_relation(plan: &ExecutionPlan) -> Option<&Schema> {
+	match plan {
+		ExecutionPlan::EmptyRelation { schema } => Some(schema.as_ref()),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => find_empty_relation(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			find_empty_relation(left).or_else(|| find_empty_relation(right))
+		}
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::Update { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. } => find_empty_relation(source),
+		_ => None,
+	}
+}
+
+fn contains_scan(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Scan { .. } => true,
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => contains_scan(input),
+		ExecutionPlan::Join { left, right, .. } => contains_scan(left) || contains_scan(right),
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::Update { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. } => contains_scan(source),
+		_ => false,
+	}
 }
 
 fn descriptor_from_schema(table: &str, schema: &Schema) -> TableSchemaDescriptor {

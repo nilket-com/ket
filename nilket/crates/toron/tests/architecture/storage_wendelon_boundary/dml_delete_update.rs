@@ -1533,9 +1533,10 @@ pub(crate) fn adr063_update_reuses_existing_point_read_profile() {
 			.expect("bind_update_source_for_predicate")
 			.1;
 
-	assert!(
-		predicate_helper.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)")
-	);
+	assert!(predicate_helper.contains("plan_filter_with_predicate_pushdown("));
+	assert!(predicate_helper.contains("scan,"));
+	assert!(predicate_helper.contains("bound_predicate,"));
+	assert!(predicate_helper.contains("&logical_types"));
 	assert!(binder.contains("scan_profile_hint(&predicate, input)"));
 	assert!(binder.contains("apply_scan_profile_hint(&mut input, Some(profile_hint))"));
 	assert!(!predicate_helper.contains("update_profile_hint"));

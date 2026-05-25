@@ -599,8 +599,15 @@ pub(crate) fn adr075_partial_pushdown_covers_select_update_delete_scan_sites() {
 	let delete_test =
 		std::fs::read_to_string(manifest_dir().join("tests/delete_test.rs")).expect("read delete");
 
-	assert!(binder.contains("plan_filter_with_predicate_pushdown(input, bound_predicate)"));
-	assert!(binder.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)"));
+	assert!(
+		binder.contains(
+			"plan_filter_with_predicate_pushdown(input, bound_predicate, &logical_types)"
+		)
+	);
+	let update_helper = first_block(&binder, "async fn bind_update_source_for_predicate");
+	assert!(update_helper.contains("self.catalog.logical_type_registry()"));
+	assert!(update_helper.contains("plan_filter_with_predicate_pushdown("));
+	assert!(update_helper.contains("&logical_types"));
 	assert!(binder.contains("predicate_pushdown_plan(program, &scan)"));
 	assert!(coordinator.contains("if let Some(predicate) = predicate"));
 	assert!(predicate_test.contains("where_like_residual_splits_from_pbc_conjunct"));
@@ -885,8 +892,15 @@ pub(crate) fn adr078_select_update_delete_share_boolean_factoring_path() {
 	let delete_test =
 		std::fs::read_to_string(manifest_dir().join("tests/delete_test.rs")).expect("read delete");
 
-	assert!(binder.contains("plan_filter_with_predicate_pushdown(input, bound_predicate)"));
-	assert!(binder.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)"));
+	assert!(
+		binder.contains(
+			"plan_filter_with_predicate_pushdown(input, bound_predicate, &logical_types)"
+		)
+	);
+	let update_helper = first_block(&binder, "async fn bind_update_source_for_predicate");
+	assert!(update_helper.contains("self.catalog.logical_type_registry()"));
+	assert!(update_helper.contains("plan_filter_with_predicate_pushdown("));
+	assert!(update_helper.contains("&logical_types"));
 	assert!(binder.contains("predicate_pushdown_plan(program, &scan)"));
 	assert!(
 		predicate_test.contains("where_common_pushable_conjunct_factors_out_with_minimal_residual")
@@ -1227,7 +1241,7 @@ pub(crate) fn adr095_filter_elision_runs_before_pbc_pushdown() {
 	let binder = source("src/binder.rs");
 	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
 	let classifier = filter_helper
-		.find("static_filter_class(&original_predicate)")
+		.find("static_filter_class(&input, &original_predicate, logical_types)")
 		.expect("static classifier call");
 	let pushdown = filter_helper
 		.find("predicate_pushdown_plan(predicate, &input)")
@@ -1322,7 +1336,93 @@ pub(crate) fn adr095_no_sql_pbc_wendelon_storage_surface() {
 }
 
 #[test]
-pub(crate) fn adr096_refinement_persistence_is_durable_but_not_pbc_elision() {
+pub(crate) fn adr097_refinement_elision_uses_durable_registry_not_seed() {
+	let binder = source("src/binder.rs");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+	let refinement_helper = first_block(&binder, "fn refinement_static_filter_class");
+
+	assert!(filter_helper.contains("logical_types: &LogicalTypeRegistry"));
+	assert!(
+		filter_helper.contains("static_filter_class(&input, &original_predicate, logical_types)")
+	);
+	assert!(binder.contains("self.catalog.logical_type_registry()"));
+	assert!(scan_atom.contains("logical_types.spec(logical_type)"));
+	assert!(!scan_atom.contains("logical_type_spec"));
+	assert!(!refinement_helper.contains("logical_type_spec"));
+}
+
+#[test]
+pub(crate) fn adr097_refinement_elision_requires_stored_scan_column_provenance() {
+	let binder = source("src/binder.rs");
+	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+
+	assert!(scan_atom.contains("ExecutionPlan::Scan"));
+	assert!(scan_atom.contains("projection: None"));
+	assert!(scan_atom.contains("BoundExprNode::Column"));
+	assert!(scan_atom.contains("node_logical_type(column_node)"));
+	assert!(scan_atom.contains("refinement"));
+	assert!(logical_type_ddl.contains("cast_ascribed_projected_column_does_not_elide"));
+	assert!(logical_type_ddl.contains("refinement_on_non_scan_input_does_not_elide"));
+}
+
+#[test]
+pub(crate) fn adr097_refinement_elision_only_from_durable_stored_scan_receipts() {
+	let binder = source("src/binder.rs");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+
+	assert!(scan_atom.contains("projection: None"));
+	assert!(scan_atom.contains("logical_types.spec(logical_type)"));
+	assert!(logical_type_ddl.contains("refinement_elision_uses_durable_registry_not_seed_lookup"));
+	assert!(logical_type_ddl.contains("naked_or_unrefined_column_does_not_elide"));
+	assert!(logical_type_ddl.contains("nullable_refined_column_is_null_does_not_elide"));
+}
+
+#[test]
+pub(crate) fn adr097_refinement_elision_reuses_095_empty_relation() {
+	let binder = source("src/binder.rs");
+	let execution = source("src/ir/execution.rs");
+	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+
+	assert!(filter_helper.contains("ExecutionPlan::EmptyRelation"));
+	assert!(execution_plan.contains("CreateLogicalType"));
+	assert!(!execution_plan.contains("RefinementElision"));
+	assert!(!execution_plan.contains("StaticReject"));
+}
+
+#[test]
+pub(crate) fn adr097_static_filter_class_is_structural_3vl_and_error_conservative() {
+	let binder = source("src/binder.rs");
+	let classifier = first_block(&binder, "fn static_filter_class");
+	let refinement_helper = first_block(&binder, "fn refinement_static_filter_class");
+	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+
+	assert!(classifier.contains("structural_non_nullable_is_null(predicate)"));
+	assert!(classifier.contains("refinement_static_filter_class(input, predicate, logical_types)"));
+	assert!(!refinement_helper.contains("evaluate_bound_program_without_storage"));
+	assert!(!refinement_helper.contains("predicate_pushdown_plan"));
+	assert!(!refinement_helper.contains("compile_pbc"));
+	assert!(!scan_atom.contains("Executor::"));
+}
+
+#[test]
+pub(crate) fn adr097_cast_try_cast_remain_ephemeral_not_receipts() {
+	let binder = source("src/binder.rs");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+	let sql_logical_cast = first_block(&binder, "fn bind_sql_logical_cast");
+	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+
+	assert!(sql_logical_cast.contains("set_node_logical_type"));
+	assert!(!sql_logical_cast.contains("refinement"));
+	assert!(scan_atom.contains("ExecutionPlan::Scan"));
+	assert!(logical_type_ddl.contains("cast_ascribed_projected_column_does_not_elide"));
+}
+
+#[test]
+pub(crate) fn adr097_no_wendelon_096_contract_pbc_executor_storage_or_wire_change() {
 	let wendelon_compute =
 		std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
 			.expect("read Wendelon compute schema");
@@ -1337,9 +1437,15 @@ pub(crate) fn adr096_refinement_persistence_is_durable_but_not_pbc_elision() {
 	assert!(sql_planner.contains("parse_create_logical_type_refinement_clause"));
 
 	let binder = source("src/binder.rs");
-	let static_filter_class = first_block(&binder, "fn static_filter_class");
-	assert!(!static_filter_class.contains("refinement"));
-	assert!(!static_filter_class.contains("LogicalTypeRefinementPredicate"));
+	let pbc = source("src/pbc.rs");
+	let executor = source("src/exec.rs");
+	let storage = source("src/storage.rs");
+
+	assert!(binder.contains("fn refinement_static_filter_class"));
+	assert!(!pbc.contains("refinement_static_filter_class"));
+	assert!(!pbc.contains("CarrierDomain"));
+	assert!(!executor.contains("refinement_static_filter_class"));
+	assert!(!storage.contains("refinement_static_filter_class"));
 }
 
 fn source(relative: &str) -> String {

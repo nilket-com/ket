@@ -1605,9 +1605,10 @@ pub(crate) fn adr070_update_where_pk_equality_point_read_profile_still_works() {
 	let update_test = std::fs::read_to_string(manifest_dir().join("tests/update_test.rs"))
 		.expect("read update tests");
 
-	assert!(
-		predicate_helper.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)")
-	);
+	assert!(predicate_helper.contains("plan_filter_with_predicate_pushdown("));
+	assert!(predicate_helper.contains("scan,"));
+	assert!(predicate_helper.contains("bound_predicate,"));
+	assert!(predicate_helper.contains("&logical_types"));
 	assert!(binder.contains("scan_profile_hint(&pushed_predicate, input)"));
 	assert!(binder.contains("apply_scan_profile_hint(&mut input, Some(profile_hint))"));
 	assert!(update_test.contains("binder_update_pk_equality_uses_point_read_profile"));

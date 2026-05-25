@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -18,14 +19,17 @@ use crate::ir::{
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
 	ColumnOrdinal, CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
 	FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId,
-	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
-	ScalarValue, SortExpr, arithmetic_output_type, decode_column_logical_type,
+	LogicalTypeRegistry, LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn,
+	ReturningProjection, ScalarValue, SortExpr, arithmetic_output_type, decode_column_logical_type,
 	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
 	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
+};
+use wendelon_client::{
+	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -108,7 +112,9 @@ impl<'a> Binder<'a> {
 					let bound_predicate = self
 						.bind_expr_program(std::slice::from_ref(predicate), &input.schema())
 						.await?;
-					let (plan, _) = plan_filter_with_predicate_pushdown(input, bound_predicate);
+					let logical_types = self.catalog.logical_type_registry();
+					let (plan, _) =
+						plan_filter_with_predicate_pushdown(input, bound_predicate, &logical_types);
 					Ok(plan)
 				}
 				LogicalPlan::Project {
@@ -701,7 +707,12 @@ impl<'a> Binder<'a> {
 			.bind_expr_program(std::slice::from_ref(predicate), schema)
 			.await?;
 		require_single_boolean_root(&bound_predicate, "UPDATE WHERE")?;
-		Ok(plan_filter_with_predicate_pushdown(scan, bound_predicate))
+		let logical_types = self.catalog.logical_type_registry();
+		Ok(plan_filter_with_predicate_pushdown(
+			scan,
+			bound_predicate,
+			&logical_types,
+		))
 	}
 
 	async fn bind_returning_projection(
@@ -1097,11 +1108,12 @@ enum StaticFilterClass {
 fn plan_filter_with_predicate_pushdown(
 	mut input: ExecutionPlan,
 	predicate: BoundExprProgram,
+	logical_types: &LogicalTypeRegistry,
 ) -> (ExecutionPlan, QueryProfileHint) {
 	let original_predicate = predicate.clone();
 	let fallback_profile = scan_profile_hint(&original_predicate, &input);
 	if matches!(
-		static_filter_class(&original_predicate),
+		static_filter_class(&input, &original_predicate, logical_types),
 		StaticFilterClass::AlwaysReject
 	) {
 		return (
@@ -1166,8 +1178,18 @@ fn plan_filter_with_predicate_pushdown(
 	)
 }
 
-fn static_filter_class(predicate: &BoundExprProgram) -> StaticFilterClass {
+fn static_filter_class(
+	input: &ExecutionPlan,
+	predicate: &BoundExprProgram,
+	logical_types: &LogicalTypeRegistry,
+) -> StaticFilterClass {
 	if structural_non_nullable_is_null(predicate) {
+		return StaticFilterClass::AlwaysReject;
+	}
+	if matches!(
+		refinement_static_filter_class(input, predicate, logical_types),
+		StaticFilterClass::AlwaysReject
+	) {
 		return StaticFilterClass::AlwaysReject;
 	}
 	if predicate.single_root().is_some() && !program_has_column_references(predicate) {
@@ -1222,6 +1244,571 @@ fn closed_root_filter_class(predicate: &BoundExprProgram) -> StaticFilterClass {
 		StaticFilterClass::AlwaysReject
 	} else {
 		StaticFilterClass::AlwaysPass
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefinementCmpOp {
+	Eq,
+	Ne,
+	Lt,
+	Le,
+	Gt,
+	Ge,
+}
+
+impl RefinementCmpOp {
+	fn flip(self) -> Self {
+		match self {
+			Self::Eq => Self::Eq,
+			Self::Ne => Self::Ne,
+			Self::Lt => Self::Gt,
+			Self::Le => Self::Ge,
+			Self::Gt => Self::Lt,
+			Self::Ge => Self::Le,
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+struct StoredRefinementAtom {
+	op: RefinementCmpOp,
+	literal: CarrierLiteral,
+	refinement: LogicalTypeRefinementPredicate,
+}
+
+fn refinement_static_filter_class(
+	input: &ExecutionPlan,
+	predicate: &BoundExprProgram,
+	logical_types: &LogicalTypeRegistry,
+) -> StaticFilterClass {
+	let Some(atom) = stored_scan_refinement_atom(input, predicate, logical_types) else {
+		return StaticFilterClass::Unknown;
+	};
+	let Some(refinement_domain) = domain_from_refinement(&atom.refinement) else {
+		return StaticFilterClass::Unknown;
+	};
+	let Some(filter_domain) = domain_from_comparison(atom.op, atom.literal) else {
+		return StaticFilterClass::Unknown;
+	};
+	let Some(intersection) = refinement_domain.intersect(&filter_domain) else {
+		return StaticFilterClass::Unknown;
+	};
+	if intersection.is_empty() {
+		StaticFilterClass::AlwaysReject
+	} else {
+		StaticFilterClass::Unknown
+	}
+}
+
+fn stored_scan_refinement_atom(
+	input: &ExecutionPlan,
+	predicate: &BoundExprProgram,
+	logical_types: &LogicalTypeRegistry,
+) -> Option<StoredRefinementAtom> {
+	let ExecutionPlan::Scan {
+		projection: None,
+		schema,
+		..
+	} = input
+	else {
+		return None;
+	};
+	let root = predicate.single_root()?;
+	let BoundExprNode::Binary { op, left, right } = predicate.node(root)? else {
+		return None;
+	};
+	let op = filter_refinement_cmp_op(op)?;
+	let (column_node, literal_node, op) = match (predicate.node(*left)?, predicate.node(*right)?) {
+		(BoundExprNode::Column(_), BoundExprNode::Literal(_)) => (*left, *right, op),
+		(BoundExprNode::Literal(_), BoundExprNode::Column(_)) => (*right, *left, op.flip()),
+		_ => return None,
+	};
+	let BoundExprNode::Column(column) = predicate.node(column_node)? else {
+		return None;
+	};
+	let field = schema.fields().get(column.ordinal.0 as usize)?;
+	let logical_type = predicate.node_logical_type(column_node)?;
+	if logical_type.is_naked() {
+		return None;
+	}
+	let spec = logical_types.spec(logical_type)?;
+	if field.data_type() != &spec.physical || column.data_type != spec.physical {
+		return None;
+	}
+	let refinement = spec.refinement?;
+	let literal = predicate_carrier_literal(predicate, literal_node, field.data_type())?;
+	Some(StoredRefinementAtom {
+		op,
+		literal,
+		refinement,
+	})
+}
+
+fn filter_refinement_cmp_op(op: &BoundBinaryOp) -> Option<RefinementCmpOp> {
+	match op {
+		BoundBinaryOp::Eq => Some(RefinementCmpOp::Eq),
+		BoundBinaryOp::Neq => Some(RefinementCmpOp::Ne),
+		BoundBinaryOp::Lt => Some(RefinementCmpOp::Lt),
+		BoundBinaryOp::Lte => Some(RefinementCmpOp::Le),
+		BoundBinaryOp::Gt => Some(RefinementCmpOp::Gt),
+		BoundBinaryOp::Gte => Some(RefinementCmpOp::Ge),
+		_ => None,
+	}
+}
+
+fn predicate_carrier_literal(
+	predicate: &BoundExprProgram,
+	literal_node: BoundExprId,
+	carrier: &DataType,
+) -> Option<CarrierLiteral> {
+	let BoundExprNode::Literal(literal) = predicate.node(literal_node)? else {
+		return None;
+	};
+	let value = predicate.literals.get(*literal as usize)?;
+	carrier_literal_from_scalar(value, carrier)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CarrierLiteral {
+	Int32(i32),
+	Int64(i64),
+	Float32(FiniteF32),
+	Float64(FiniteF64),
+	Utf8(String),
+	Boolean(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+struct FiniteF32(f32);
+
+impl FiniteF32 {
+	fn new(value: f32) -> Option<Self> {
+		value.is_finite().then_some(Self(value))
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+struct FiniteF64(f64);
+
+impl FiniteF64 {
+	fn new(value: f64) -> Option<Self> {
+		value.is_finite().then_some(Self(value))
+	}
+}
+
+fn carrier_literal_from_scalar(value: &ScalarValue, carrier: &DataType) -> Option<CarrierLiteral> {
+	match (carrier, value) {
+		(DataType::Int32, ScalarValue::Int32(Some(value))) => Some(CarrierLiteral::Int32(*value)),
+		(DataType::Int64, ScalarValue::Int64(Some(value))) => Some(CarrierLiteral::Int64(*value)),
+		(DataType::Float32, ScalarValue::Float32(Some(value))) => {
+			FiniteF32::new(*value).map(CarrierLiteral::Float32)
+		}
+		(DataType::Float64, ScalarValue::Float64(Some(value))) => {
+			FiniteF64::new(*value).map(CarrierLiteral::Float64)
+		}
+		(DataType::Utf8, ScalarValue::Utf8(Some(value))) => {
+			Some(CarrierLiteral::Utf8(value.clone()))
+		}
+		(DataType::Boolean, ScalarValue::Boolean(Some(value))) => {
+			Some(CarrierLiteral::Boolean(*value))
+		}
+		_ => None,
+	}
+}
+
+fn carrier_literal_from_refinement_value(
+	value: &LogicalTypeRefinementValue,
+) -> Option<CarrierLiteral> {
+	match value {
+		LogicalTypeRefinementValue::Value => None,
+		LogicalTypeRefinementValue::Int64(value) => Some(CarrierLiteral::Int64(*value)),
+		LogicalTypeRefinementValue::Int32(value) => Some(CarrierLiteral::Int32(*value)),
+		LogicalTypeRefinementValue::Float64(bits) => {
+			FiniteF64::new(f64::from_bits(*bits)).map(CarrierLiteral::Float64)
+		}
+		LogicalTypeRefinementValue::Float32(bits) => {
+			FiniteF32::new(f32::from_bits(*bits)).map(CarrierLiteral::Float32)
+		}
+		LogicalTypeRefinementValue::Utf8(value) => Some(CarrierLiteral::Utf8(value.clone())),
+		LogicalTypeRefinementValue::Boolean(value) => Some(CarrierLiteral::Boolean(*value)),
+	}
+}
+
+#[derive(Debug, Clone)]
+struct DomainBound<T> {
+	value: T,
+	inclusive: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OrderedDomain<T> {
+	lower: Option<DomainBound<T>>,
+	upper: Option<DomainBound<T>>,
+	excluded: Vec<T>,
+}
+
+impl<T> OrderedDomain<T>
+where
+	T: Clone + PartialEq + PartialOrd,
+{
+	fn point(value: T) -> Self {
+		Self {
+			lower: Some(DomainBound {
+				value: value.clone(),
+				inclusive: true,
+			}),
+			upper: Some(DomainBound {
+				value,
+				inclusive: true,
+			}),
+			excluded: Vec::new(),
+		}
+	}
+
+	fn lower(value: T, inclusive: bool) -> Self {
+		Self {
+			lower: Some(DomainBound { value, inclusive }),
+			upper: None,
+			excluded: Vec::new(),
+		}
+	}
+
+	fn upper(value: T, inclusive: bool) -> Self {
+		Self {
+			lower: None,
+			upper: Some(DomainBound { value, inclusive }),
+			excluded: Vec::new(),
+		}
+	}
+
+	fn excluded(value: T) -> Self {
+		Self {
+			lower: None,
+			upper: None,
+			excluded: vec![value],
+		}
+	}
+
+	fn intersect(&self, other: &Self) -> Self {
+		let lower = intersect_lower_bound(&self.lower, &other.lower);
+		let upper = intersect_upper_bound(&self.upper, &other.upper);
+		let mut excluded = self.excluded.clone();
+		for value in &other.excluded {
+			if !excluded.iter().any(|existing| existing == value) {
+				excluded.push(value.clone());
+			}
+		}
+		Self {
+			lower,
+			upper,
+			excluded,
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		let (Some(lower), Some(upper)) = (&self.lower, &self.upper) else {
+			return false;
+		};
+		match lower.value.partial_cmp(&upper.value) {
+			Some(Ordering::Greater) | None => true,
+			Some(Ordering::Less) => false,
+			Some(Ordering::Equal) => {
+				!lower.inclusive
+					|| !upper.inclusive
+					|| self.excluded.iter().any(|value| value == &lower.value)
+			}
+		}
+	}
+}
+
+fn intersect_lower_bound<T>(
+	left: &Option<DomainBound<T>>,
+	right: &Option<DomainBound<T>>,
+) -> Option<DomainBound<T>>
+where
+	T: Clone + PartialEq + PartialOrd,
+{
+	match (left, right) {
+		(None, None) => None,
+		(Some(bound), None) | (None, Some(bound)) => Some(bound.clone()),
+		(Some(left), Some(right)) => match left.value.partial_cmp(&right.value) {
+			Some(Ordering::Greater) => Some(left.clone()),
+			Some(Ordering::Less) => Some(right.clone()),
+			Some(Ordering::Equal) => Some(DomainBound {
+				value: left.value.clone(),
+				inclusive: left.inclusive && right.inclusive,
+			}),
+			None => Some(DomainBound {
+				value: left.value.clone(),
+				inclusive: false,
+			}),
+		},
+	}
+}
+
+fn intersect_upper_bound<T>(
+	left: &Option<DomainBound<T>>,
+	right: &Option<DomainBound<T>>,
+) -> Option<DomainBound<T>>
+where
+	T: Clone + PartialEq + PartialOrd,
+{
+	match (left, right) {
+		(None, None) => None,
+		(Some(bound), None) | (None, Some(bound)) => Some(bound.clone()),
+		(Some(left), Some(right)) => match left.value.partial_cmp(&right.value) {
+			Some(Ordering::Greater) => Some(right.clone()),
+			Some(Ordering::Less) => Some(left.clone()),
+			Some(Ordering::Equal) => Some(DomainBound {
+				value: left.value.clone(),
+				inclusive: left.inclusive && right.inclusive,
+			}),
+			None => Some(DomainBound {
+				value: left.value.clone(),
+				inclusive: false,
+			}),
+		},
+	}
+}
+
+#[derive(Debug, Clone)]
+struct Utf8Domain {
+	only: Option<String>,
+	excluded: Vec<String>,
+}
+
+impl Utf8Domain {
+	fn only(value: String) -> Self {
+		Self {
+			only: Some(value),
+			excluded: Vec::new(),
+		}
+	}
+
+	fn excluding(value: String) -> Self {
+		Self {
+			only: None,
+			excluded: vec![value],
+		}
+	}
+
+	fn intersect(&self, other: &Self) -> Option<Self> {
+		let only = match (&self.only, &other.only) {
+			(Some(left), Some(right)) if left == right => Some(left.clone()),
+			(Some(_), Some(_)) => return None,
+			(Some(value), None) | (None, Some(value)) => Some(value.clone()),
+			(None, None) => None,
+		};
+		let mut excluded = self.excluded.clone();
+		for value in &other.excluded {
+			if !excluded.iter().any(|existing| existing == value) {
+				excluded.push(value.clone());
+			}
+		}
+		if let Some(value) = &only
+			&& excluded.iter().any(|excluded| excluded == value)
+		{
+			return None;
+		}
+		Some(Self { only, excluded })
+	}
+}
+
+#[derive(Debug, Clone)]
+struct BooleanDomain {
+	allow_false: bool,
+	allow_true: bool,
+}
+
+impl BooleanDomain {
+	fn only(value: bool) -> Self {
+		Self {
+			allow_false: !value,
+			allow_true: value,
+		}
+	}
+
+	fn excluding(value: bool) -> Self {
+		Self {
+			allow_false: value,
+			allow_true: !value,
+		}
+	}
+
+	fn intersect(&self, other: &Self) -> Self {
+		Self {
+			allow_false: self.allow_false && other.allow_false,
+			allow_true: self.allow_true && other.allow_true,
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		!self.allow_false && !self.allow_true
+	}
+}
+
+#[derive(Debug, Clone)]
+enum CarrierDomain {
+	Empty,
+	Int32(OrderedDomain<i32>),
+	Int64(OrderedDomain<i64>),
+	Float32(OrderedDomain<FiniteF32>),
+	Float64(OrderedDomain<FiniteF64>),
+	Utf8(Utf8Domain),
+	Boolean(BooleanDomain),
+}
+
+impl CarrierDomain {
+	fn intersect(&self, other: &Self) -> Option<Self> {
+		match (self, other) {
+			(Self::Empty, _) | (_, Self::Empty) => Some(Self::Empty),
+			(Self::Int32(left), Self::Int32(right)) => {
+				let domain = left.intersect(right);
+				if domain.is_empty() {
+					Some(Self::Empty)
+				} else {
+					Some(Self::Int32(domain))
+				}
+			}
+			(Self::Int64(left), Self::Int64(right)) => {
+				let domain = left.intersect(right);
+				if domain.is_empty() {
+					Some(Self::Empty)
+				} else {
+					Some(Self::Int64(domain))
+				}
+			}
+			(Self::Float32(left), Self::Float32(right)) => {
+				let domain = left.intersect(right);
+				if domain.is_empty() {
+					Some(Self::Empty)
+				} else {
+					Some(Self::Float32(domain))
+				}
+			}
+			(Self::Float64(left), Self::Float64(right)) => {
+				let domain = left.intersect(right);
+				if domain.is_empty() {
+					Some(Self::Empty)
+				} else {
+					Some(Self::Float64(domain))
+				}
+			}
+			(Self::Utf8(left), Self::Utf8(right)) => {
+				left.intersect(right).map(Self::Utf8).or(Some(Self::Empty))
+			}
+			(Self::Boolean(left), Self::Boolean(right)) => {
+				let domain = left.intersect(right);
+				if domain.is_empty() {
+					Some(Self::Empty)
+				} else {
+					Some(Self::Boolean(domain))
+				}
+			}
+			_ => None,
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		matches!(self, Self::Empty)
+	}
+}
+
+fn domain_from_refinement(predicate: &LogicalTypeRefinementPredicate) -> Option<CarrierDomain> {
+	match predicate {
+		LogicalTypeRefinementPredicate::Comparison { left, op, right } => {
+			let (op, literal) = refinement_comparison_literal(left, *op, right)?;
+			let literal = carrier_literal_from_refinement_value(literal)?;
+			domain_from_comparison(op, literal)
+		}
+		LogicalTypeRefinementPredicate::And(predicates) => {
+			let mut domain: Option<CarrierDomain> = None;
+			for predicate in predicates {
+				let child = domain_from_refinement(predicate)?;
+				domain = Some(match domain {
+					None => child,
+					Some(existing) => existing.intersect(&child)?,
+				});
+				if matches!(domain, Some(CarrierDomain::Empty)) {
+					break;
+				}
+			}
+			domain
+		}
+	}
+}
+
+fn refinement_comparison_literal<'a>(
+	left: &'a LogicalTypeRefinementValue,
+	op: LogicalTypeRefinementComparisonOp,
+	right: &'a LogicalTypeRefinementValue,
+) -> Option<(RefinementCmpOp, &'a LogicalTypeRefinementValue)> {
+	let op = refinement_cmp_op(op);
+	match (left, right) {
+		(LogicalTypeRefinementValue::Value, literal)
+			if !matches!(literal, LogicalTypeRefinementValue::Value) =>
+		{
+			Some((op, literal))
+		}
+		(literal, LogicalTypeRefinementValue::Value)
+			if !matches!(literal, LogicalTypeRefinementValue::Value) =>
+		{
+			Some((op.flip(), literal))
+		}
+		_ => None,
+	}
+}
+
+fn refinement_cmp_op(op: LogicalTypeRefinementComparisonOp) -> RefinementCmpOp {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq => RefinementCmpOp::Eq,
+		LogicalTypeRefinementComparisonOp::Ne => RefinementCmpOp::Ne,
+		LogicalTypeRefinementComparisonOp::Lt => RefinementCmpOp::Lt,
+		LogicalTypeRefinementComparisonOp::Le => RefinementCmpOp::Le,
+		LogicalTypeRefinementComparisonOp::Gt => RefinementCmpOp::Gt,
+		LogicalTypeRefinementComparisonOp::Ge => RefinementCmpOp::Ge,
+	}
+}
+
+fn domain_from_comparison(op: RefinementCmpOp, literal: CarrierLiteral) -> Option<CarrierDomain> {
+	match literal {
+		CarrierLiteral::Int32(value) => {
+			ordered_domain_from_comparison(op, value).map(CarrierDomain::Int32)
+		}
+		CarrierLiteral::Int64(value) => {
+			ordered_domain_from_comparison(op, value).map(CarrierDomain::Int64)
+		}
+		CarrierLiteral::Float32(value) => {
+			ordered_domain_from_comparison(op, value).map(CarrierDomain::Float32)
+		}
+		CarrierLiteral::Float64(value) => {
+			ordered_domain_from_comparison(op, value).map(CarrierDomain::Float64)
+		}
+		CarrierLiteral::Utf8(value) => match op {
+			RefinementCmpOp::Eq => Some(CarrierDomain::Utf8(Utf8Domain::only(value))),
+			RefinementCmpOp::Ne => Some(CarrierDomain::Utf8(Utf8Domain::excluding(value))),
+			_ => None,
+		},
+		CarrierLiteral::Boolean(value) => match op {
+			RefinementCmpOp::Eq => Some(CarrierDomain::Boolean(BooleanDomain::only(value))),
+			RefinementCmpOp::Ne => Some(CarrierDomain::Boolean(BooleanDomain::excluding(value))),
+			_ => None,
+		},
+	}
+}
+
+fn ordered_domain_from_comparison<T>(op: RefinementCmpOp, value: T) -> Option<OrderedDomain<T>>
+where
+	T: Clone + PartialEq + PartialOrd,
+{
+	match op {
+		RefinementCmpOp::Eq => Some(OrderedDomain::point(value)),
+		RefinementCmpOp::Ne => Some(OrderedDomain::excluded(value)),
+		RefinementCmpOp::Lt => Some(OrderedDomain::upper(value, false)),
+		RefinementCmpOp::Le => Some(OrderedDomain::upper(value, true)),
+		RefinementCmpOp::Gt => Some(OrderedDomain::lower(value, false)),
+		RefinementCmpOp::Ge => Some(OrderedDomain::lower(value, true)),
 	}
 }
 
