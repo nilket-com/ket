@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–092, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -399,6 +399,31 @@ run, 079+).
   091's `no_cast_or_typed_ctas_authoring_yet` + the cast-shape guards in-change (full suite green).
   11 decisions, 9 guards. Genuine 3-of-3. Migration: `plans/impl/092_sql_logical_cast.md`.
 
+- **ADR 093 — SQL `TRY_CAST(x AS LogicalType)` (nullable coercing ascription).** Promoted.
+  **Completes the CAST/TRY_CAST 2×2** (026 physical CAST+TRY_CAST; 092 logical CAST; 093 logical
+  TRY_CAST). Toron-only, `binder.rs`-localized — the production diff is two un-gates + one branch.
+  **Doctrine: try softens the *value domain*, not the *identity* contract** — physical failure →
+  NULL, but a logical mismatch is a compile-time error: `TRY_CAST(product_id AS CustomerId)` still
+  **rejects at bind** (`NominalTypeMismatch`, not NULL); the explicit primitive erase
+  (`TRY_CAST(CAST(product_id AS BIGINT) AS CustomerId)`) is the only override — not an
+  identity-laundering bypass. **Contract γ (converged 3-of-3): categorically nullable, binds
+  wherever strict CAST binds** — `reconcile_identity` runs first (088, unchanged), then on every
+  bound path append the existing `BoundExprNode::TryCast` (same-physical incl. `Utf8`/`Boolean`
+  served by the `evaluate_try_cast` same-type passthrough — **no new kernel, no shared-gate
+  widening, no routing through the identity-free physical `bind_try_cast`**); cross-physical
+  non-numeric rejects == CAST. Reuses transient `SqlLogicalCast { try_cast }` (already planner-
+  plumbed) + the 092 async durable spec pre-resolution — the **two** rejection sites (the
+  collection prepass + the bind gate) both un-gated; resolved **spec** to the sync binder (092
+  seed-only-spec trap holds). Typed CTAS materializes a **nullable** logical column free via 089's
+  writer (`root_nullable` threaded; `infer_ctas_schema` preserves `is_nullable`) + survives resync;
+  `SAFE_CAST` aliases. **No** Wendelon/executor/PBC/IR/Rune change; no new nominal gate; strict CAST
+  + physical `bind_try_cast` byte-identical. Invert the 092 deferral assertion (inside
+  `adr092_binder_resolves_sql_logical_casts_registry_only_before_sync_bind`) + flip the reject
+  fixture in-change. 11 decisions, 11-gate behavior net, 6 added guards. Genuine 3-of-3 (Claude
+  grounded contract γ + corrected its cost to binder-local; Codex independently reached γ + closed
+  the CTAS-nullability question; Gemini ratified). Migration:
+  `plans/impl/093_sql_logical_try_cast.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -482,30 +507,33 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 092 promoted; ADR 093 candidates
+### ADR 093 promoted; ADR 094 candidates
 
-ADR 092 selected and promoted **SQL `CAST(x AS LogicalType)`** — the expression-side use that
-**completes the SQL authoring surface** (define → DDL column → CAST). A reconciling
-coerce-ascription resolved durable-only: `CAST(product_id AS CustomerId)` rejects, the explicit
-primitive erase is the override; reconcile-before-coerce; transient `SqlLogicalCast` + async spec
-pre-resolution + the resolved *spec* to the sync binder; `LogicalAscription` unchanged; typed
-CTAS free via 089; TRY_CAST deferred. Genuine 3-of-3.
+ADR 093 selected and promoted **SQL `TRY_CAST(x AS LogicalType)`** — the deferred 092 sibling that
+**completes the CAST/TRY_CAST 2×2**. Nullable coercing ascription: try softens physical failure to
+NULL but **not** the identity contract (`TRY_CAST(product_id AS CustomerId)` still rejects at bind);
+contract γ — categorically nullable, binds wherever strict CAST binds; binder-local (two un-gates +
+one branch), no new kernel / shared-gate / Wendelon change; CTAS nullable-column free via 089.
+Genuine 3-of-3.
 
-**ADR 093 candidates:**
+**ADR 094 candidates:**
 
-*Identity follow-ons (from ADR 092 §"What to do next" — the natural successors):*
+*Identity follow-ons (from ADR 093 §"What to do next"):*
 
-- **Refinement contracts** (the next *integrity level*; strongest lead) — value predicates on a
-  durable `LogicalTypeId` (`PersonId(Int64, value > 0)`) → static plan elision (`WHERE id = -5` →
-  `EmptyRelation`, zero I/O). The brainstorm-007 horizon, now real: 090 gave the durable receipt
-  substrate, 091/092 the full authoring surface, so predicates have a stable handle to hang on.
-- **`TRY_CAST(x AS LogicalType)`** — the deferred 092 sibling: nullable conversion (reconcile
-  compile-time + physical `TryCast`); a clean small ADR.
-- **PK/FK-derived identity** — "magic that follows constraints, not names": derive identity
-  from `PRIMARY KEY`, inherit via `REFERENCES`, durable on 090's id substrate (needs FK
-  support, currently rejected, + a canonical `schema.table.column` identity name).
-- **`DROP`/`ALTER LOGICAL TYPE`**, a read-only `information_schema.logical_types` view,
-  aggregate-output identity semantics, the optional Wendelon-validate-at-authority (090 knob),
+- **Refinement contracts** (the next *integrity tier*; strongest lead, now fully scoped by the
+  define → DDL column → CAST → TRY_CAST authoring line) — value predicates on a durable `LogicalTypeId`
+  (`PersonId(Int64, value > 0)`) → static plan elision (`WHERE id = -5` → `EmptyRelation`, zero
+  I/O). **Grounded as a mega-scope that must split** (no `EmptyRelation` node, no constant-folding
+  pass anywhere, no predicate field on the 090 definition + cross-ring ripple). The only non-inert
+  first slice is **elision-first** (`EmptyRelation` + a contradiction simplifier, Toron-only); a
+  durable-predicate-persistence cross-ring ADR follows. An explicit council split call, not one ADR.
+- **`DROP`/`ALTER LOGICAL TYPE`** — net-new IR variants + parsing + cross-ring DROP with referential
+  integrity (can't drop a logical type a column still references).
+- **PK/FK-derived identity** — "magic that follows constraints, not names": derive from `PRIMARY
+  KEY`, inherit via `REFERENCES`; blocked on FK support (rejected at `sql_planner.rs:663`) + a
+  canonical `schema.table.column` identity name.
+- read-only **`information_schema.logical_types`** (net-new virtual-table surface);
+  aggregate-output identity semantics; the optional Wendelon-validate-at-authority (090 knob);
   **`.as_naked()`** Rune helper.
 
 *Carried Rune leads (the nominal-typing spine was prioritized over these — still live):*
@@ -526,7 +554,14 @@ CTAS free via 089; TRY_CAST deferred. Genuine 3-of-3.
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/092_sql_logical_cast.md`.
+`plans/impl/093_sql_logical_try_cast.md`.
+
+### ADR 092 promoted; ADR 093 candidates (HISTORICAL)
+
+ADR 092 promoted **SQL `CAST(x AS LogicalType)`** (reconciling coerce-ascription, durable-only,
+reconcile-before-coerce; TRY_CAST deferred → became ADR 093). Detail lives in
+`plans/adr/092_sql_logical_cast.md` + the active-line entry above; git holds the candidate
+archaeology.
 
 ### Advanced kernel graduations *(one ADR per kernel)*
 
