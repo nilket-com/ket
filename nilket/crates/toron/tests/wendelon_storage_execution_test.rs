@@ -732,6 +732,7 @@ fn assert_filter_declined_without_pbc(plan: &ExecutionPlan) {
 fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 	match plan {
 		ExecutionPlan::EmptyRelation { .. } => panic!("EmptyRelation has no scan"),
+		ExecutionPlan::SystemTable { .. } => panic!("SystemTable has no scan"),
 		ExecutionPlan::Scan { pbc_program, .. } => assert!(
 			pbc_program.is_none(),
 			"declined filter must not attach a PBC program"

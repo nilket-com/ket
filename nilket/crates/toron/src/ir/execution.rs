@@ -174,10 +174,20 @@ pub struct BoundReturningProjection {
 	pub output_schema: SchemaRef,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SystemTableKind {
+	InformationSchemaLogicalTypes,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionPlan {
 	EmptyRelation {
 		schema: SchemaRef,
+	},
+	SystemTable {
+		kind: SystemTableKind,
+		schema: SchemaRef,
+		rows: Vec<Vec<ScalarValue>>,
 	},
 	Scan {
 		legacy_table_id: TableId,
@@ -292,6 +302,7 @@ impl ExecutionPlan {
 	pub fn schema(&self) -> SchemaRef {
 		match self {
 			Self::EmptyRelation { schema } => schema.clone(),
+			Self::SystemTable { schema, .. } => schema.clone(),
 			Self::Scan {
 				schema,
 				row_identity,

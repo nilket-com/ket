@@ -904,6 +904,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. } => first_join(input),
 		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
@@ -950,6 +951,7 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 			find_exchange(left).or_else(|| find_exchange(right))
 		}
 		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
@@ -971,6 +973,7 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Sort { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
 		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
@@ -1006,6 +1009,7 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
 		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
@@ -1098,6 +1102,7 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			output_schema,
 		},
 		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
@@ -1165,6 +1170,7 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 			output_schema,
 		},
 		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }

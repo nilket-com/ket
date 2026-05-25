@@ -150,6 +150,17 @@ impl LogicalTypeRegistry {
 			.and_then(|id| self.by_id.get(id))
 			.cloned()
 	}
+
+	pub fn specs_sorted(&self) -> Vec<LogicalTypeSpec> {
+		let mut specs = self.by_id.values().cloned().collect::<Vec<_>>();
+		specs.sort_by(|left, right| {
+			left.id
+				.0
+				.cmp(&right.id.0)
+				.then_with(|| left.name.cmp(&right.name))
+		});
+		specs
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

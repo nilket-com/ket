@@ -236,6 +236,10 @@ pub trait Catalog: Send + Sync {
 		LogicalTypeRegistry::default()
 	}
 
+	async fn refreshed_logical_type_registry(&self) -> Result<LogicalTypeRegistry, CatalogError> {
+		Ok(self.logical_type_registry())
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: TableId,
@@ -1732,6 +1736,21 @@ impl Catalog for WendelonCatalog {
 
 	fn logical_type_registry(&self) -> LogicalTypeRegistry {
 		self.registry.logical_type_registry(self.tenant_id)
+	}
+
+	async fn refreshed_logical_type_registry(&self) -> Result<LogicalTypeRegistry, CatalogError> {
+		let Some(client) = self.descriptor_sync_client.as_ref() else {
+			return Ok(self.registry.logical_type_registry(self.tenant_id));
+		};
+		let definitions = client
+			.list_logical_type_definitions(wendelon_tenant_id(self.tenant_id))
+			.await
+			.map_err(|error| CatalogError::AdminFailed {
+				message: error.to_string(),
+			})?;
+		self.registry
+			.register_logical_types_for_tenant(self.tenant_id, definitions)?;
+		Ok(self.registry.logical_type_registry(self.tenant_id))
 	}
 
 	async fn invalidate_table_descriptor(

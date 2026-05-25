@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{BooleanArray, Int32Array, Int64Array, StringArray};
@@ -5,7 +6,10 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::{Catalog, MockCatalog, TableRef, WendelonDescriptorRegistry};
+use toron::catalog::{
+	Catalog, CreateTableOutcome, DescriptorRefreshMetrics, MockCatalog, TableBinding, TableRef,
+	WendelonDescriptorRegistry,
+};
 use toron::coordinator::QueryCoordinator;
 use toron::error::{BindingError, CatalogError, StorageError};
 use toron::exec::Executor;
@@ -18,7 +22,8 @@ use toron::ir::{
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
 	CreateLogicalTypeOutcome, CreateLogicalTypeRequest, DropTableStorageOutcome,
-	DropTableStorageRequest, InMemoryStorageScan, InMemoryTableStorage, StorageAdmin, TenantId,
+	DropTableStorageRequest, InMemoryStorageScan, InMemoryTableStorage, ScanRequest, ScanStream,
+	StorageAdmin, StorageScan, TenantId,
 };
 use wendelon::integration::compute::LogicalTypeCatalog;
 use wendelon::schema::{
@@ -1505,6 +1510,299 @@ async fn update_or_insert_select_source_filter_elides_through_shared_planner() {
 	);
 }
 
+#[tokio::test]
+async fn information_schema_logical_types_lists_current_tenant_durable_definitions() {
+	let (_catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0 AND VALUE <= 100)",
+		"CREATE LOGICAL TYPE Sku AS TEXT",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT logical_type_id, name, physical, refinement FROM information_schema.logical_types ORDER BY logical_type_id",
+	)
+	.await;
+
+	assert_eq!(
+		int64_rows(&batch, 0),
+		vec![
+			Some(i64::from(DURABLE_LOGICAL_TYPE_MIN_ID)),
+			Some(i64::from(DURABLE_LOGICAL_TYPE_MIN_ID + 1)),
+		]
+	);
+	assert_eq!(
+		string_rows(&batch, 1),
+		vec![Some("PersonId".to_string()), Some("Sku".to_string())]
+	);
+	assert_eq!(
+		string_rows(&batch, 2),
+		vec![Some("BIGINT".to_string()), Some("TEXT".to_string())]
+	);
+	assert_eq!(
+		string_rows(&batch, 3),
+		vec![Some("CHECK (VALUE > 0 AND VALUE <= 100)".to_string()), None,]
+	);
+}
+
+#[tokio::test]
+async fn information_schema_logical_types_renders_sql_literals_and_excludes_seed() {
+	let (_catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE EnabledFlag AS BOOLEAN CHECK (VALUE = TRUE)",
+		"CREATE LOGICAL TYPE SafeSku AS TEXT CHECK (VALUE != 'bad''sku')",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT name, physical, refinement FROM information_schema.logical_types ORDER BY name",
+	)
+	.await;
+
+	assert_eq!(
+		string_rows(&batch, 0),
+		vec![Some("EnabledFlag".to_string()), Some("SafeSku".to_string())]
+	);
+	assert_eq!(
+		string_rows(&batch, 1),
+		vec![Some("BOOLEAN".to_string()), Some("TEXT".to_string())]
+	);
+	assert_eq!(
+		string_rows(&batch, 2),
+		vec![
+			Some("CHECK (VALUE = TRUE)".to_string()),
+			Some("CHECK (VALUE != 'bad''sku')".to_string()),
+		]
+	);
+	assert!(
+		!string_rows(&batch, 0)
+			.into_iter()
+			.flatten()
+			.any(|name| name == "CustomerId" || name == "ProductId" || name == "naked")
+	);
+}
+
+#[tokio::test]
+async fn information_schema_logical_types_supports_query_ops_and_ctas_source() {
+	let (_catalog, coordinator, planner) = logical_type_writer_coordinator();
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0)",
+		"CREATE LOGICAL TYPE Sku AS TEXT",
+		"CREATE TABLE logical_type_names AS SELECT name FROM information_schema.logical_types WHERE physical = 'BIGINT'",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	let filtered = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT name FROM information_schema.logical_types WHERE physical = 'BIGINT' ORDER BY name",
+	)
+	.await;
+	assert_eq!(
+		string_rows(&filtered, 0),
+		vec![Some("PersonId".to_string())]
+	);
+
+	let count = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT COUNT(*) FROM information_schema.logical_types",
+	)
+	.await;
+	assert_eq!(int64_rows(&count, 0), vec![Some(2)]);
+
+	let copied = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT name FROM logical_type_names",
+	)
+	.await;
+	assert_eq!(string_rows(&copied, 0), vec![Some("PersonId".to_string())]);
+}
+
+#[tokio::test]
+async fn information_schema_logical_types_is_tenant_scoped() {
+	let catalog = Arc::new(MockCatalog::new());
+	catalog
+		.register_logical_type_for_tenant(
+			TenantId(1),
+			logical_type_definition(
+				DURABLE_LOGICAL_TYPE_MIN_ID,
+				"TenantOne",
+				LogicalTypePhysical::Int64,
+				None,
+			),
+		)
+		.expect("tenant one definition");
+	catalog
+		.register_logical_type_for_tenant(
+			TenantId(2),
+			logical_type_definition(
+				DURABLE_LOGICAL_TYPE_MIN_ID + 1,
+				"TenantTwo",
+				LogicalTypePhysical::Utf8,
+				None,
+			),
+		)
+		.expect("tenant two definition");
+	let planner = SqlPlanner::new();
+	let plan = planner
+		.plan("SELECT name FROM information_schema.logical_types")
+		.expect("plan introspection");
+
+	let tenant_one = Arc::clone(&catalog).scoped(TenantId(1));
+	let tenant_two = Arc::clone(&catalog).scoped(TenantId(2));
+	let batch_one = execute_bound_query(
+		bind(&plan, tenant_one.as_ref(), &PlannerConfig::default())
+			.await
+			.unwrap(),
+	)
+	.await;
+	let batch_two = execute_bound_query(
+		bind(&plan, tenant_two.as_ref(), &PlannerConfig::default())
+			.await
+			.unwrap(),
+	)
+	.await;
+
+	assert_eq!(
+		string_rows(&batch_one, 0),
+		vec![Some("TenantOne".to_string())]
+	);
+	assert_eq!(
+		string_rows(&batch_two, 0),
+		vec![Some("TenantTwo".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn information_schema_logical_types_refreshes_before_read() {
+	let inner = Arc::new(MockCatalog::new());
+	let refreshes = Arc::new(AtomicU64::new(0));
+	let catalog = Arc::new(RefreshingLogicalTypeCatalog {
+		inner,
+		tenant_id: TenantId(1),
+		definitions: vec![logical_type_definition(
+			DURABLE_LOGICAL_TYPE_MIN_ID + 10,
+			"RefreshedId",
+			LogicalTypePhysical::Int64,
+			None,
+		)],
+		refreshes: Arc::clone(&refreshes),
+	});
+	let planner = SqlPlanner::new();
+	let bound = bind(
+		&planner
+			.plan("SELECT name FROM information_schema.logical_types")
+			.expect("plan introspection"),
+		catalog.as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind refreshed information schema");
+	let batch = execute_bound_query(bound).await;
+
+	assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+	assert_eq!(
+		string_rows(&batch, 0),
+		vec![Some("RefreshedId".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn information_schema_namespace_is_read_only_and_scoped() {
+	let (catalog, _coordinator, planner) = logical_type_writer_coordinator();
+
+	let unqualified = bind(
+		&planner
+			.plan("SELECT * FROM logical_types")
+			.expect("plan unqualified logical_types"),
+		catalog.as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("unqualified logical_types remains a normal table lookup");
+	assert!(matches!(
+		unqualified,
+		BindingError::Catalog(CatalogError::TableNotFound { ref table }) if table == "logical_types"
+	));
+
+	let unknown = bind(
+		&planner
+			.plan("SELECT * FROM information_schema.tables")
+			.expect("plan unknown information schema table"),
+		catalog.as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("unknown information schema relation rejects");
+	assert!(
+		format!("{unknown:?}").contains("unknown information_schema relation"),
+		"unexpected unknown relation error: {unknown:?}"
+	);
+
+	for sql in [
+		"CREATE TABLE information_schema.logical_types (id BIGINT)",
+		"CREATE TABLE information_schema.copy AS SELECT name FROM information_schema.logical_types",
+		"DROP TABLE information_schema.logical_types",
+		"INSERT INTO information_schema.logical_types VALUES (1, 'X', 'BIGINT', NULL)",
+		"UPDATE information_schema.logical_types SET name = 'X'",
+		"DELETE FROM information_schema.logical_types",
+	] {
+		let result = bind(
+			&planner
+				.plan(sql)
+				.unwrap_or_else(|error| panic!("{sql}: {error}")),
+			catalog.as_ref(),
+			&PlannerConfig::default(),
+		)
+		.await;
+		let err = result.expect_err(sql);
+		assert!(
+			format!("{err:?}").contains("information_schema is read-only"),
+			"{sql} produced unexpected error: {err:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn system_table_executes_without_storage_scan() {
+	let catalog = Arc::new(MockCatalog::new());
+	catalog
+		.register_logical_type_for_tenant(
+			TenantId(1),
+			logical_type_definition(
+				DURABLE_LOGICAL_TYPE_MIN_ID,
+				"PersonId",
+				LogicalTypePhysical::Int64,
+				None,
+			),
+		)
+		.expect("register definition");
+	let coordinator = QueryCoordinator::new(
+		catalog,
+		Executor::new(Arc::new(FailingStorageScan)),
+		PlannerConfig::default(),
+	);
+	let planner = SqlPlanner::new();
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT name FROM information_schema.logical_types",
+	)
+	.await;
+
+	assert_eq!(string_rows(&batch, 0), vec![Some("PersonId".to_string())]);
+}
+
 fn logical_type_coordinator() -> (Arc<MockCatalog>, QueryCoordinator, SqlPlanner) {
 	let catalog = Arc::new(MockCatalog::new());
 	let storage = empty_storage();
@@ -1616,6 +1914,29 @@ async fn concat_query(
 		.expect(sql);
 	let schema = results[0].schema();
 	arrow::compute::concat_batches(&schema, results.iter()).expect("concat query results")
+}
+
+async fn execute_bound_query(bound: ExecutionPlan) -> RecordBatch {
+	let results = Executor::new(empty_storage())
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute bound plan");
+	let schema = results[0].schema();
+	arrow::compute::concat_batches(&schema, results.iter()).expect("concat bound query results")
+}
+
+fn logical_type_definition(
+	logical_type_id: u32,
+	name: &str,
+	physical: LogicalTypePhysical,
+	refinement: Option<LogicalTypeRefinementPredicate>,
+) -> LogicalTypeDefinition {
+	LogicalTypeDefinition {
+		logical_type_id,
+		name: name.to_string(),
+		physical,
+		refinement,
+	}
 }
 
 fn assert_try_cast_root(
@@ -1782,4 +2103,114 @@ fn empty_storage() -> Arc<InMemoryStorageScan> {
 	let schema = Arc::new(Schema::empty());
 	let batch = RecordBatch::new_empty(schema);
 	Arc::new(InMemoryStorageScan { table_data: batch })
+}
+
+struct FailingStorageScan;
+
+#[async_trait]
+impl StorageScan for FailingStorageScan {
+	async fn scan(&self, _request: ScanRequest) -> Result<ScanStream, StorageError> {
+		Err(StorageError::Internal {
+			message: "system table query should not scan storage".to_string(),
+		})
+	}
+}
+
+struct RefreshingLogicalTypeCatalog {
+	inner: Arc<MockCatalog>,
+	tenant_id: TenantId,
+	definitions: Vec<LogicalTypeDefinition>,
+	refreshes: Arc<AtomicU64>,
+}
+
+impl RefreshingLogicalTypeCatalog {
+	fn delegate(&self) -> Arc<dyn Catalog> {
+		Arc::clone(&self.inner).scoped(self.tenant_id)
+	}
+}
+
+#[async_trait]
+impl Catalog for RefreshingLogicalTypeCatalog {
+	fn scoped(self: Arc<Self>, tenant_id: TenantId) -> Arc<dyn Catalog> {
+		Arc::new(Self {
+			inner: Arc::clone(&self.inner),
+			tenant_id,
+			definitions: self.definitions.clone(),
+			refreshes: Arc::clone(&self.refreshes),
+		})
+	}
+
+	fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics> {
+		let delegate = self.delegate();
+		delegate.descriptor_refresh_metrics()
+	}
+
+	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		let delegate = self.delegate();
+		delegate.resolve_table(table).await
+	}
+
+	async fn resolve_table_local(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		let delegate = self.delegate();
+		delegate.resolve_table_local(table).await
+	}
+
+	async fn resolve_table_id(&self, table: TableId) -> Result<TableBinding, CatalogError> {
+		let delegate = self.delegate();
+		delegate.resolve_table_id(table).await
+	}
+
+	async fn resolve_durable_logical_type_by_name(
+		&self,
+		name: &str,
+	) -> Result<toron::ir::LogicalTypeSpec, CatalogError> {
+		let delegate = self.delegate();
+		delegate.resolve_durable_logical_type_by_name(name).await
+	}
+
+	fn logical_type_registry(&self) -> toron::ir::LogicalTypeRegistry {
+		let delegate = self.delegate();
+		delegate.logical_type_registry()
+	}
+
+	async fn refreshed_logical_type_registry(
+		&self,
+	) -> Result<toron::ir::LogicalTypeRegistry, CatalogError> {
+		self.refreshes.fetch_add(1, Ordering::SeqCst);
+		for definition in &self.definitions {
+			self.inner
+				.register_logical_type_for_tenant(self.tenant_id, definition.clone())?;
+		}
+		Ok(self.delegate().logical_type_registry())
+	}
+
+	async fn invalidate_table_descriptor(
+		&self,
+		table: TableId,
+	) -> Result<Option<toron::catalog::InvalidatedDescriptor>, CatalogError> {
+		let delegate = self.delegate();
+		delegate.invalidate_table_descriptor(table).await
+	}
+
+	async fn create_table_with_outcome(
+		&self,
+		name: &TableRef,
+		schema: Arc<Schema>,
+		row_identity: toron::ir::CreateTableRowIdentity,
+		if_not_exists: bool,
+	) -> Result<CreateTableOutcome, CatalogError> {
+		let delegate = self.delegate();
+		delegate
+			.create_table_with_outcome(name, schema, row_identity, if_not_exists)
+			.await
+	}
+
+	async fn drop_table(
+		&self,
+		name: &TableRef,
+		if_exists: bool,
+	) -> Result<Option<TableBinding>, CatalogError> {
+		let delegate = self.delegate();
+		delegate.drop_table(name, if_exists).await
+	}
 }

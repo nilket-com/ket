@@ -20,8 +20,9 @@ use crate::ir::{
 	ColumnOrdinal, CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
 	FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId,
 	LogicalTypeRegistry, LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn,
-	ReturningProjection, ScalarValue, SortExpr, arithmetic_output_type, decode_column_logical_type,
-	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
+	ReturningProjection, ScalarValue, SortExpr, SystemTableKind, arithmetic_output_type,
+	decode_column_logical_type, field_with_logical_type_metadata, logical_type_name,
+	logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -40,6 +41,9 @@ const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
 	STORAGE_ROW_TOMBSTONE_COLUMN,
 ];
+const INFORMATION_SCHEMA_NAMESPACE: &str = "information_schema";
+const INFORMATION_SCHEMA_LOGICAL_TYPES: &str = "information_schema.logical_types";
+const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlannerConfig {
@@ -90,6 +94,11 @@ impl<'a> Binder<'a> {
 					Ok(scan_plan(binding, projection))
 				}
 				LogicalPlan::ScanNamed { table, projection } => {
+					if is_information_schema_namespace(table) {
+						return self
+							.bind_information_schema_relation(table, projection.as_ref())
+							.await;
+					}
 					let binding = self.catalog.resolve_table(table).await?;
 					let projection = projection
 						.as_ref()
@@ -230,10 +239,13 @@ impl<'a> Binder<'a> {
 					self.bind_create_table_as_select(table, *if_not_exists, *or_replace, source)
 						.await
 				}
-				LogicalPlan::DropTable { name, if_exists } => Ok(ExecutionPlan::DropTable {
-					name: name.clone(),
-					if_exists: *if_exists,
-				}),
+				LogicalPlan::DropTable { name, if_exists } => {
+					reject_information_schema_target(name)?;
+					Ok(ExecutionPlan::DropTable {
+						name: name.clone(),
+						if_exists: *if_exists,
+					})
+				}
 				LogicalPlan::Delete {
 					table,
 					predicate,
@@ -281,6 +293,7 @@ impl<'a> Binder<'a> {
 		if_not_exists: bool,
 		or_replace: bool,
 	) -> Result<ExecutionPlan, BindingError> {
+		reject_information_schema_target(name)?;
 		let mut fields = Vec::with_capacity(schema.columns.len());
 		for column in &schema.columns {
 			let field = match &column.column_type {
@@ -365,6 +378,7 @@ impl<'a> Binder<'a> {
 		or_replace: bool,
 		source: &LogicalPlan,
 	) -> Result<ExecutionPlan, BindingError> {
+		reject_information_schema_target(table)?;
 		let source = self.bind_plan(source).await?;
 		let source_schema = source.schema();
 		let schema = infer_ctas_schema(&source_schema)?;
@@ -384,6 +398,7 @@ impl<'a> Binder<'a> {
 		predicate: Option<&Expr>,
 		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
+		reject_information_schema_target(table)?;
 		let binding = self.catalog.resolve_table(table).await?;
 		let returning = self
 			.bind_returning_projection(returning, &binding.schema)
@@ -430,6 +445,7 @@ impl<'a> Binder<'a> {
 		rows: &[Vec<InsertLiteral>],
 		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
+		reject_information_schema_target(table)?;
 		let binding = self.catalog.resolve_table(table).await?;
 		if rows.is_empty() {
 			return Err(BindingError::UnsupportedExpression {
@@ -519,6 +535,7 @@ impl<'a> Binder<'a> {
 		source: &LogicalPlan,
 		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
+		reject_information_schema_target(table)?;
 		let binding = self.catalog.resolve_table(table).await?;
 		let schema = binding.schema.clone();
 		let returning = self.bind_returning_projection(returning, &schema).await?;
@@ -570,6 +587,7 @@ impl<'a> Binder<'a> {
 		predicate: Option<&Expr>,
 		returning: Option<&ReturningProjection>,
 	) -> Result<ExecutionPlan, BindingError> {
+		reject_information_schema_target(table)?;
 		let binding = self.catalog.resolve_table(table).await?;
 		let TableRowIdentity::PrimaryKey {
 			ordinal: primary_key_ordinal,
@@ -651,6 +669,52 @@ impl<'a> Binder<'a> {
 			}),
 			profile_hint,
 			returning,
+		})
+	}
+
+	async fn bind_information_schema_relation(
+		&self,
+		table: &TableRef,
+		projection: Option<&Vec<String>>,
+	) -> Result<ExecutionPlan, BindingError> {
+		if !table
+			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE)
+		{
+			return Err(BindingError::UnsupportedExpression {
+				message: format!(
+					"unknown information_schema relation: {}; supported relation is {INFORMATION_SCHEMA_LOGICAL_TYPES}",
+					table_name(table)
+				),
+			});
+		}
+
+		let full_schema = information_schema_logical_types_schema();
+		let registry = self.catalog.refreshed_logical_type_registry().await?;
+		let rows = registry
+			.specs_sorted()
+			.into_iter()
+			.map(logical_type_spec_row)
+			.collect::<Result<Vec<_>, _>>()?;
+		let Some(projection) = projection else {
+			return Ok(ExecutionPlan::SystemTable {
+				kind: SystemTableKind::InformationSchemaLogicalTypes,
+				schema: full_schema,
+				rows,
+			});
+		};
+
+		let requested = projection
+			.iter()
+			.map(|column| resolve_column(column, &full_schema).map(|column| column.ordinal))
+			.collect::<Result<Vec<_>, _>>()?;
+		let schema = project_schema(&full_schema, &requested)?;
+		let rows = project_scalar_rows(&rows, &requested)?;
+
+		Ok(ExecutionPlan::SystemTable {
+			kind: SystemTableKind::InformationSchemaLogicalTypes,
+			schema,
+			rows,
 		})
 	}
 
@@ -3071,6 +3135,7 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. } => terminal_exchange(input),
 		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::CreateTable { .. }
@@ -3143,6 +3208,152 @@ fn table_name(table: &TableRef) -> String {
 	}
 }
 
+fn is_information_schema_namespace(table: &TableRef) -> bool {
+	table
+		.schema
+		.as_deref()
+		.is_some_and(|schema| schema.eq_ignore_ascii_case(INFORMATION_SCHEMA_NAMESPACE))
+}
+
+fn reject_information_schema_target(table: &TableRef) -> Result<(), BindingError> {
+	if is_information_schema_namespace(table) {
+		return Err(BindingError::UnsupportedExpression {
+			message: format!("information_schema is read-only: {}", table_name(table)),
+		});
+	}
+	Ok(())
+}
+
+fn information_schema_logical_types_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("logical_type_id", DataType::Int64, false),
+		Field::new("name", DataType::Utf8, false),
+		Field::new("physical", DataType::Utf8, false),
+		Field::new("refinement", DataType::Utf8, true),
+	]))
+}
+
+fn logical_type_spec_row(spec: LogicalTypeSpec) -> Result<Vec<ScalarValue>, BindingError> {
+	Ok(vec![
+		ScalarValue::Int64(Some(i64::from(spec.id.0))),
+		ScalarValue::Utf8(Some(spec.name)),
+		ScalarValue::Utf8(Some(physical_keyword(&spec.physical)?.to_string())),
+		ScalarValue::Utf8(
+			spec.refinement
+				.as_ref()
+				.map(render_refinement_check)
+				.transpose()?,
+		),
+	])
+}
+
+fn physical_keyword(data_type: &DataType) -> Result<&'static str, BindingError> {
+	match data_type {
+		DataType::Int32 => Ok("INT"),
+		DataType::Int64 => Ok("BIGINT"),
+		DataType::Float32 => Ok("REAL"),
+		DataType::Float64 => Ok("DOUBLE"),
+		DataType::Utf8 => Ok("TEXT"),
+		DataType::Boolean => Ok("BOOLEAN"),
+		other => Err(BindingError::UnsupportedExpression {
+			message: format!("unsupported logical type physical carrier: {other:?}"),
+		}),
+	}
+}
+
+fn render_refinement_check(
+	predicate: &LogicalTypeRefinementPredicate,
+) -> Result<String, BindingError> {
+	Ok(format!(
+		"CHECK ({})",
+		render_refinement_predicate(predicate)?
+	))
+}
+
+fn render_refinement_predicate(
+	predicate: &LogicalTypeRefinementPredicate,
+) -> Result<String, BindingError> {
+	match predicate {
+		LogicalTypeRefinementPredicate::Comparison { left, op, right } => Ok(format!(
+			"{} {} {}",
+			render_refinement_value(left)?,
+			refinement_op_sql(*op),
+			render_refinement_value(right)?
+		)),
+		LogicalTypeRefinementPredicate::And(predicates) => predicates
+			.iter()
+			.map(render_refinement_predicate)
+			.collect::<Result<Vec<_>, _>>()
+			.map(|parts| parts.join(" AND ")),
+	}
+}
+
+fn render_refinement_value(value: &LogicalTypeRefinementValue) -> Result<String, BindingError> {
+	match value {
+		LogicalTypeRefinementValue::Value => Ok("VALUE".to_string()),
+		LogicalTypeRefinementValue::Int64(value) => Ok(value.to_string()),
+		LogicalTypeRefinementValue::Int32(value) => Ok(value.to_string()),
+		LogicalTypeRefinementValue::Float64(bits) => {
+			let value = f64::from_bits(*bits);
+			if value.is_finite() {
+				Ok(value.to_string())
+			} else {
+				Err(BindingError::UnsupportedExpression {
+					message: "logical type FLOAT64 refinement literal is not finite".to_string(),
+				})
+			}
+		}
+		LogicalTypeRefinementValue::Float32(bits) => {
+			let value = f32::from_bits(*bits);
+			if value.is_finite() {
+				Ok(value.to_string())
+			} else {
+				Err(BindingError::UnsupportedExpression {
+					message: "logical type FLOAT32 refinement literal is not finite".to_string(),
+				})
+			}
+		}
+		LogicalTypeRefinementValue::Utf8(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
+		LogicalTypeRefinementValue::Boolean(value) => {
+			Ok(if *value { "TRUE" } else { "FALSE" }.to_string())
+		}
+	}
+}
+
+fn refinement_op_sql(op: LogicalTypeRefinementComparisonOp) -> &'static str {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq => "=",
+		LogicalTypeRefinementComparisonOp::Ne => "!=",
+		LogicalTypeRefinementComparisonOp::Lt => "<",
+		LogicalTypeRefinementComparisonOp::Le => "<=",
+		LogicalTypeRefinementComparisonOp::Gt => ">",
+		LogicalTypeRefinementComparisonOp::Ge => ">=",
+	}
+}
+
+fn project_scalar_rows(
+	rows: &[Vec<ScalarValue>],
+	requested: &[ColumnOrdinal],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	rows.iter()
+		.map(|row| {
+			requested
+				.iter()
+				.map(|column| {
+					row.get(column.0 as usize).cloned().ok_or_else(|| {
+						BindingError::UnsupportedExpression {
+							message: format!(
+								"internal: system table projection column {} out of range",
+								column.0
+							),
+						}
+					})
+				})
+				.collect::<Result<Vec<_>, _>>()
+		})
+		.collect()
+}
+
 type OrdinalRemap = HashMap<ColumnOrdinal, ColumnOrdinal>;
 
 fn push_down_scan_projection(plan: ExecutionPlan) -> Result<ExecutionPlan, BindingError> {
@@ -3162,6 +3373,15 @@ fn optimize_for_required(
 			let remap = ordinal_remap(&requested);
 			let schema = project_schema(&schema, &requested)?;
 			Ok((ExecutionPlan::EmptyRelation { schema }, remap))
+		}
+		ExecutionPlan::SystemTable { kind, schema, rows } => {
+			let all_columns = all_columns(&schema);
+			let required = required_output.unwrap_or(all_columns);
+			let requested = required.iter().copied().collect::<Vec<_>>();
+			let remap = ordinal_remap(&requested);
+			let schema = project_schema(&schema, &requested)?;
+			let rows = project_scalar_rows(&rows, &requested)?;
+			Ok((ExecutionPlan::SystemTable { kind, schema, rows }, remap))
 		}
 		ExecutionPlan::Scan {
 			legacy_table_id,

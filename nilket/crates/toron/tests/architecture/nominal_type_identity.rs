@@ -925,3 +925,131 @@ pub(crate) fn adr093_ctas_try_cast_nullability_flows_through_089_writer() {
 		assert!(block.contains("field_with_logical_type_metadata"));
 	}
 }
+
+#[test]
+pub(crate) fn adr099_information_schema_logical_types_intercepts_before_catalog_resolve_table() {
+	let binder = binder_source();
+	let scan_named = binder
+		.find("LogicalPlan::ScanNamed { table, projection } =>")
+		.expect("ScanNamed bind arm");
+	let scan_tail = &binder[scan_named..];
+	let info_schema = scan_tail
+		.find("is_information_schema_namespace(table)")
+		.expect("information_schema interception");
+	let resolve = scan_tail
+		.find("self.catalog.resolve_table(table)")
+		.expect("catalog resolve table");
+
+	assert!(info_schema < resolve);
+	assert!(scan_tail.contains("bind_information_schema_relation"));
+}
+
+#[test]
+pub(crate) fn adr099_system_table_is_coordinator_local_scalar_rows() {
+	let execution = execution_source();
+	let exec = exec_source();
+	let system_kind = source_block(&execution, "pub enum SystemTableKind");
+	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
+
+	assert!(system_kind.contains("InformationSchemaLogicalTypes"));
+	assert_eq!(enum_variant_count(&system_kind), 1);
+	assert!(execution_plan.contains("SystemTable {"));
+	assert!(execution_plan.contains("rows: Vec<Vec<ScalarValue>>"));
+	assert!(exec.contains("ExecutionPlan::SystemTable { schema, rows, .. }"));
+	assert!(exec.contains("materialize_scalar_rows(schema, rows)"));
+	assert!(!execution.contains("LogicalPlan::SystemTable"));
+}
+
+#[test]
+pub(crate) fn adr099_logical_types_rows_from_refreshed_durable_registry_not_seed() {
+	let binder = binder_source();
+	let catalog = catalog_source();
+	let ir = ir_source();
+	let bind_relation = source_block(&binder, "async fn bind_information_schema_relation");
+	let row_builder = source_block(&binder, "fn logical_type_spec_row");
+
+	assert!(bind_relation.contains("refreshed_logical_type_registry"));
+	assert!(bind_relation.contains("specs_sorted()"));
+	assert!(row_builder.contains("spec.refinement"));
+	assert!(!bind_relation.contains("logical_type_spec("));
+	assert!(catalog.contains("async fn refreshed_logical_type_registry"));
+	assert!(catalog.contains("list_logical_type_definitions"));
+	assert!(catalog.contains("register_logical_types_for_tenant"));
+	assert!(ir.contains("pub fn specs_sorted(&self) -> Vec<LogicalTypeSpec>"));
+}
+
+#[test]
+pub(crate) fn adr099_information_schema_namespace_is_reserved_read_only() {
+	let binder = binder_source();
+	let reject = source_block(&binder, "fn reject_information_schema_target");
+
+	assert!(reject.contains("is_information_schema_namespace(table)"));
+	assert!(reject.contains("information_schema is read-only"));
+	for method in [
+		"async fn bind_create_table",
+		"async fn bind_create_table_as_select",
+		"async fn bind_delete",
+		"async fn bind_insert",
+		"async fn bind_insert_select",
+		"async fn bind_update",
+	] {
+		let block = source_block(&binder, method);
+		assert!(block.contains("reject_information_schema_target"));
+	}
+	assert!(binder.contains(
+		"LogicalPlan::DropTable { name, if_exists } => {\n\t\t\t\t\treject_information_schema_target(name)?;"
+	));
+}
+
+#[test]
+pub(crate) fn adr099_system_table_walkers_handle_new_variant() {
+	let execution = execution_source();
+	let binder = binder_source();
+	let exec = exec_source();
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragment source");
+	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let server = std::fs::read_to_string(manifest_dir().join("src/server/mod.rs"))
+		.expect("read server source");
+
+	assert!(source_block(&execution, "pub fn schema").contains("Self::SystemTable { schema, .. }"));
+	assert!(source_block(&binder, "fn terminal_exchange").contains("ExecutionPlan::SystemTable"));
+	assert!(
+		source_block(&binder, "fn optimize_for_required").contains("ExecutionPlan::SystemTable")
+	);
+	assert!(exec.contains("ExecutionPlan::SystemTable { schema, rows, .. }"));
+	assert!(fragment.matches("ExecutionPlan::SystemTable").count() >= 6);
+	assert!(scheduler.contains("ExecutionPlan::SystemTable"));
+	assert!(server.contains("ExecutionPlan::SystemTable { .. } => \"system_table\""));
+}
+
+#[test]
+pub(crate) fn adr099_no_wendelon_pbc_wire_or_storage_surface() {
+	let binder = binder_source();
+	let storage = storage_source();
+	let pbc = pbc_source();
+	let wendelon_compute = wendelon_compute_source();
+	let wendelon_table = wendelon_table_source();
+
+	assert!(binder.contains("information_schema.logical_types"));
+	for source in [storage, pbc, wendelon_compute, wendelon_table] {
+		assert!(!source.contains("information_schema.logical_types"));
+		assert!(!source.contains("InformationSchemaLogicalTypes"));
+	}
+}
+
+#[test]
+pub(crate) fn adr099_scoped_to_logical_types_only() {
+	let execution = execution_source();
+	let binder = binder_source();
+	let system_kind = source_block(&execution, "pub enum SystemTableKind");
+	let bind_relation = source_block(&binder, "async fn bind_information_schema_relation");
+
+	assert_eq!(enum_variant_count(&system_kind), 1);
+	assert!(system_kind.contains("InformationSchemaLogicalTypes"));
+	assert!(bind_relation.contains("logical_types"));
+	assert!(bind_relation.contains("unknown information_schema relation"));
+	assert!(!system_kind.contains("Tables"));
+	assert!(!system_kind.contains("Columns"));
+}

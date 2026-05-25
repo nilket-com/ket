@@ -18,8 +18,9 @@ use crate::ir::{
 use crate::ir::{Expr, LogicalPlan};
 use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
 use arrow::array::{
-	Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-	Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float32Builder, Float64Array,
+	Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
+	StringArray, StringBuilder, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -29,8 +30,8 @@ use arrow::compute::kernels::comparison::{
 use arrow::compute::{
 	SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
-use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::{DataType, SchemaRef};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -649,6 +650,9 @@ impl Executor {
 			match plan {
 				ExecutionPlan::EmptyRelation { schema } => {
 					Ok(vec![RecordBatch::new_empty(schema.clone())])
+				}
+				ExecutionPlan::SystemTable { schema, rows, .. } => {
+					Ok(vec![materialize_scalar_rows(schema, rows)?])
 				}
 				ExecutionPlan::Scan {
 					legacy_table_id,
@@ -1624,6 +1628,146 @@ fn literal_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
 		ScalarValue::Utf8(value) => {
 			Arc::new(StringArray::from(vec![value.clone().as_deref(); num_rows]))
 		}
+	}
+}
+
+fn materialize_scalar_rows(
+	schema: &SchemaRef,
+	rows: &[Vec<ScalarValue>],
+) -> Result<RecordBatch, ExecutionError> {
+	for (row_index, row) in rows.iter().enumerate() {
+		if row.len() != schema.fields().len() {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"system table row {} has {} values; expected {}",
+					row_index + 1,
+					row.len(),
+					schema.fields().len()
+				),
+			});
+		}
+	}
+
+	let mut columns = Vec::with_capacity(schema.fields().len());
+	for (field_index, field) in schema.fields().iter().enumerate() {
+		columns.push(system_table_array(
+			field.data_type(),
+			rows,
+			field_index,
+			field.name(),
+		)?);
+	}
+	if columns.is_empty() {
+		let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+		Ok(RecordBatch::try_new_with_options(
+			schema.clone(),
+			columns,
+			&options,
+		)?)
+	} else {
+		Ok(RecordBatch::try_new(schema.clone(), columns)?)
+	}
+}
+
+fn system_table_array(
+	data_type: &DataType,
+	rows: &[Vec<ScalarValue>],
+	field_index: usize,
+	field_name: &str,
+) -> Result<ArrayRef, ExecutionError> {
+	match data_type {
+		DataType::Boolean => {
+			let mut builder = BooleanBuilder::with_capacity(rows.len());
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Boolean(Some(value)) => builder.append_value(*value),
+					ScalarValue::Boolean(None) => builder.append_null(),
+					other => return Err(system_table_type_mismatch(field_name, "Boolean", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Int32 => {
+			let mut builder = Int32Builder::with_capacity(rows.len());
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Int32(Some(value)) => builder.append_value(*value),
+					ScalarValue::Int32(None) => builder.append_null(),
+					other => return Err(system_table_type_mismatch(field_name, "Int32", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Int64 => {
+			let mut builder = Int64Builder::with_capacity(rows.len());
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Int64(Some(value)) => builder.append_value(*value),
+					ScalarValue::Int64(None) => builder.append_null(),
+					other => return Err(system_table_type_mismatch(field_name, "Int64", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Float32 => {
+			let mut builder = Float32Builder::with_capacity(rows.len());
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Float32(Some(value)) => builder.append_value(*value),
+					ScalarValue::Float32(None) => builder.append_null(),
+					other => return Err(system_table_type_mismatch(field_name, "Float32", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Float64 => {
+			let mut builder = Float64Builder::with_capacity(rows.len());
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Float64(Some(value)) => builder.append_value(*value),
+					ScalarValue::Float64(None) => builder.append_null(),
+					other => return Err(system_table_type_mismatch(field_name, "Float64", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Utf8 => {
+			let mut builder = StringBuilder::new();
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Utf8(Some(value)) => builder.append_value(value),
+					ScalarValue::Utf8(None) => builder.append_null(),
+					other => return Err(system_table_type_mismatch(field_name, "Utf8", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		other => Err(ExecutionError::InvalidExpression {
+			message: format!("unsupported system table column type: {other:?}"),
+		}),
+	}
+}
+
+fn system_scalar_at(
+	row: &[ScalarValue],
+	field_index: usize,
+) -> Result<&ScalarValue, ExecutionError> {
+	row.get(field_index)
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("system table row missing column {}", field_index + 1),
+		})
+}
+
+fn system_table_type_mismatch(
+	field_name: &str,
+	expected: &'static str,
+	actual: &ScalarValue,
+) -> ExecutionError {
+	ExecutionError::InvalidExpression {
+		message: format!(
+			"system table column {field_name} expected {expected}, got {:?}",
+			actual.data_type()
+		),
 	}
 }
 

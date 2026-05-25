@@ -777,6 +777,7 @@ fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFing
 			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
 		}
 		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
