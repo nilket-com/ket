@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–101 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–102 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -584,6 +584,27 @@ run, 079+).
   `sales`-fixture rows/guard retarget sites; Gemini ratified). Migration:
   `plans/impl/101_rune_like_ilike_pattern_predicates.md`.
 
+- **ADR 102 — `information_schema.tables` / `.columns` (authoritative).** Promoted. The 2nd/3rd read-side
+  system relations, generalizing 099's `SystemTableKind` (3 finite variants; **no** virtual-table
+  framework, **no** new `ExecutionPlan` variant → no walker sweep). **Fork B (operator-locked):**
+  authoritative refreshed tenant descriptor listing, **not** local-cache-only — Claude grounded that the
+  lazy `WendelonDescriptorRegistry` would make `information_schema.tables` mean "tables this coordinator
+  touched," violating 099's refresh-before-read (D6). **The point of the ADR is the cross-ring read
+  contract:** a new read-only Control-Ring RPC `list_table_schema_descriptors(tenant)` (first new
+  cross-ring read surface since 090), built on Wendelon's **`latest_by_name`** index (latest-only — raw
+  `descriptors_for_tenant` spans all generations → would duplicate rows). `Catalog::refreshed_table_schema_descriptors`
+  mirrors 099's refresh-before-read (logical-types-then-descriptors so durable names decode; list-failure
+  fails the query). `.columns` decode is reuse (`descriptor.arrow_schema()` + `decode_column_logical_type_with_resolver`
+  + the closed SQL carrier renderer). Schemas: `tables`(table_schema/table_name/`BASE TABLE`), `columns`(schema/table/
+  column/1-based ordinal/SQL-`data_type`/`YES`-`NO`/`logical_type_name` — the 087-098 tie-in, resolved via
+  the refreshed registry, not `logical_type_name(id)` fallback). Read-only namespace; coordinator-local
+  (listing at bind). **Retargets three 099 guards** — esp. `adr099_no_wendelon_pbc_wire_or_storage_surface`
+  narrows to "no *execution-time* storage/PBC/worker/RPC" (102 adds a *bind-time control-plane* read).
+  Toron binder/catalog + a narrow Wendelon listing RPC; no storage/executor/PBC change. Genuine 3-of-3
+  (Codex seeded the authoritative-vs-cache framing + the Wendelon wire shape + the guard-retarget catch;
+  Claude grounded latest-only-via-`latest_by_name` + the decode-reuse + no-walker-sweep; Gemini ratified).
+  Migration: `plans/impl/102_information_schema_tables_columns.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -667,21 +688,18 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 101 promoted; ADR 102 candidates
+### ADR 102 promoted; ADR 103 candidates
 
-ADR 101 selected and promoted **Rune `LIKE`/`ILIKE` Pattern Predicates** — a pure Rune authoring
-admission over the already-complete `Expr::Like` substrate (four infallible methods, residual-only,
-literal pattern, stale guard retargets). Genuine 3-of-3. Strongest leads, by theme:
+ADR 102 selected and promoted **authoritative `information_schema.tables` / `.columns`** — the 2nd/3rd
+system relations (Fork B: refreshed tenant descriptor listing, not local-cache; a new read-only Control-Ring
+listing RPC built on `latest_by_name`; 099-pattern reuse, no walker sweep). Genuine 3-of-3. No
+operator-designated next yet; strongest leads, by theme:
 
-*Introspection follow-on — ADR 102 lead candidate (needs a framing decision first):*
+*Catalog introspection continuation (the substrate now exists):*
 
-- **`information_schema.tables` / `.columns`** — the 2nd/3rd system relation, the point at which the 099
-  `SystemTableKind` enum earns generalizing into a small virtual-table framework. **Name the fork at
-  iter-0:** **(a)** local-cache-only introspection over descriptors Toron already holds (smaller,
-  Toron-local, not fully authoritative), vs **(b)** refreshed authoritative tenant descriptor listing
-  (099's refresh-before-read, but a *listing* RPC — Toron has per-table `get_table_schema_descriptor`,
-  Wendelon has `descriptors_for_tenant`, so (b) adds a cross-ring listing surface). (b) is the bigger,
-  truer cut; (a) is the smaller stopgap. This choice, not a 2nd variant, is the real ADR 102 question.
+- **`information_schema.schemata` / constraints / indexes / PK-FK / views** — further system relations off
+  the 102 descriptor-listing substrate; gated on constraint/namespace modeling (PK/FK identity and
+  referential integrity are the harder pieces). The next introspection cut once 102 settles.
 
 *Derived-source continuation (let ADR 100 keep baking; split, don't generalize):*
 
@@ -723,7 +741,14 @@ literal pattern, stale guard retargets). Genuine 3-of-3. Strongest leads, by the
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/101_rune_like_ilike_pattern_predicates.md`.
+`plans/impl/102_information_schema_tables_columns.md`.
+
+### ADR 101 promoted; ADR 102 candidates (HISTORICAL)
+
+ADR 101 promoted **Rune `LIKE`/`ILIKE`** (pure Rune authoring admission over the existing `Expr::Like`
+substrate). 102 took the pre-teed introspection follow-on, resolving the (a)/(b) fork to authoritative
+listing (the cross-ring read contract is the ADR). Detail in
+`plans/adr/101_rune_like_ilike_pattern_predicates.md` + the active-line entry above.
 
 ### ADR 100 promoted; ADR 101 candidates (HISTORICAL)
 
