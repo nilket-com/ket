@@ -60,8 +60,8 @@ use crate::consensus::{
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::integration::compute::{
-	LOGICAL_TYPE_INTERNAL_NAMESPACE, LogicalTypeCatalogV1, SchemaMutationKindV1, SchemaObjectKind,
-	SchemaUpdateEnvelopeV1, decode_logical_type_definition_create_v1,
+	LOGICAL_TYPE_INTERNAL_NAMESPACE, LogicalTypeCatalog, SchemaMutationKindV1, SchemaObjectKind,
+	SchemaUpdateEnvelopeV1, decode_logical_type_definition_create,
 	decode_schema_update_envelope_v1,
 };
 use crate::metrics::global as metrics;
@@ -1538,7 +1538,7 @@ pub struct SmState {
 	/// field metadata are honest only if this durable registry travels with
 	/// the descriptors that reference them.
 	#[serde(default)]
-	pub logical_types: LogicalTypeCatalogV1,
+	pub logical_types: LogicalTypeCatalog,
 	/// ADR 052 secondary-index descriptors and lifecycle state. Index
 	/// metadata is separate from table descriptors, so index create /
 	/// drop does not mutate table schema generation.
@@ -4084,7 +4084,7 @@ fn apply_logical_type_schema_update(
 					"logical type definitions use fixed create generation 0 -> 1".to_owned(),
 				);
 			}
-			let create = decode_logical_type_definition_create_v1(&envelope.payload)
+			let create = decode_logical_type_definition_create(&envelope.payload)
 				.map_err(|err| err.to_string())?;
 			if create.name != envelope.object.name {
 				return Err(

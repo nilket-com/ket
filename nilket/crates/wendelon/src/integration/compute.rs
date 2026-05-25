@@ -315,7 +315,7 @@ pub const LOGICAL_TYPE_RESERVED_STATIC_MAX_ID: u32 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LogicalTypePhysicalV1 {
+pub enum LogicalTypePhysical {
 	Int64,
 	Int32,
 	Float64,
@@ -324,27 +324,88 @@ pub enum LogicalTypePhysicalV1 {
 	Boolean,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogicalTypeDefinitionCreateV1 {
-	pub name: String,
-	pub physical: LogicalTypePhysicalV1,
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalTypeRefinementPredicate {
+	Comparison {
+		left: LogicalTypeRefinementValue,
+		op: LogicalTypeRefinementComparisonOp,
+		right: LogicalTypeRefinementValue,
+	},
+	And(Vec<LogicalTypeRefinementPredicate>),
 }
 
-impl LogicalTypeDefinitionCreateV1 {
+impl LogicalTypeRefinementPredicate {
+	pub fn validate_for_physical(&self, physical: LogicalTypePhysical) -> std::io::Result<()> {
+		match self {
+			LogicalTypeRefinementPredicate::Comparison { left, op, right } => {
+				validate_logical_type_refinement_comparison(physical, left, *op, right)
+			}
+			LogicalTypeRefinementPredicate::And(predicates) => {
+				if predicates.is_empty() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"logical type refinement AND must contain at least one predicate",
+					));
+				}
+				for predicate in predicates {
+					predicate.validate_for_physical(physical)?;
+				}
+				Ok(())
+			}
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalTypeRefinementValue {
+	Value,
+	Int64(i64),
+	Int32(i32),
+	Float64(u64),
+	Float32(u32),
+	Utf8(String),
+	Boolean(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalTypeRefinementComparisonOp {
+	Eq,
+	Ne,
+	Lt,
+	Le,
+	Gt,
+	Ge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalTypeDefinitionCreate {
+	pub name: String,
+	pub physical: LogicalTypePhysical,
+	pub refinement: Option<LogicalTypeRefinementPredicate>,
+}
+
+impl LogicalTypeDefinitionCreate {
 	pub fn validate(&self) -> std::io::Result<()> {
 		validate_logical_type_name(self.name.as_str())?;
+		if let Some(refinement) = &self.refinement {
+			refinement.validate_for_physical(self.physical)?;
+		}
 		Ok(())
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogicalTypeDefinitionV1 {
+pub struct LogicalTypeDefinition {
 	pub logical_type_id: u32,
 	pub name: String,
-	pub physical: LogicalTypePhysicalV1,
+	pub physical: LogicalTypePhysical,
+	pub refinement: Option<LogicalTypeRefinementPredicate>,
 }
 
-impl LogicalTypeDefinitionV1 {
+impl LogicalTypeDefinition {
 	pub fn validate(&self) -> std::io::Result<()> {
 		if self.logical_type_id <= LOGICAL_TYPE_RESERVED_STATIC_MAX_ID {
 			return Err(Error::new(
@@ -353,24 +414,27 @@ impl LogicalTypeDefinitionV1 {
 			));
 		}
 		validate_logical_type_name(self.name.as_str())?;
+		if let Some(refinement) = &self.refinement {
+			refinement.validate_for_physical(self.physical)?;
+		}
 		Ok(())
 	}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogicalTypeCatalogV1 {
+pub struct LogicalTypeCatalog {
 	#[serde(default)]
-	by_id: BTreeMap<LogicalTypeIdCatalogKey, LogicalTypeDefinitionV1>,
+	by_id: BTreeMap<LogicalTypeIdCatalogKey, LogicalTypeDefinition>,
 	#[serde(default)]
 	by_name: BTreeMap<LogicalTypeNameCatalogKey, u32>,
 }
 
-impl LogicalTypeCatalogV1 {
+impl LogicalTypeCatalog {
 	pub fn create(
 		&mut self,
 		tenant_id: TenantId,
-		create: LogicalTypeDefinitionCreateV1,
-	) -> std::io::Result<LogicalTypeDefinitionV1> {
+		create: LogicalTypeDefinitionCreate,
+	) -> std::io::Result<LogicalTypeDefinition> {
 		create.validate()?;
 		let name_key = LogicalTypeNameCatalogKey {
 			tenant_id,
@@ -389,18 +453,19 @@ impl LogicalTypeCatalogV1 {
 						"logical type catalog name index references a missing id",
 					)
 				})?;
-			if existing.physical == create.physical {
+			if existing.physical == create.physical && existing.refinement == create.refinement {
 				return Ok(existing.clone());
 			}
 			return Err(Error::new(
 				ErrorKind::AlreadyExists,
-				"logical type name already exists with a different physical type",
+				"logical type name already exists with a different physical type or refinement",
 			));
 		}
-		let definition = LogicalTypeDefinitionV1 {
+		let definition = LogicalTypeDefinition {
 			logical_type_id: self.next_id_for_tenant(tenant_id)?,
 			name: create.name,
 			physical: create.physical,
+			refinement: create.refinement,
 		};
 		definition.validate()?;
 		let id_key = LogicalTypeIdCatalogKey {
@@ -424,7 +489,7 @@ impl LogicalTypeCatalogV1 {
 		Ok(definition)
 	}
 
-	pub fn get_by_name(&self, tenant_id: TenantId, name: &str) -> Option<&LogicalTypeDefinitionV1> {
+	pub fn get_by_name(&self, tenant_id: TenantId, name: &str) -> Option<&LogicalTypeDefinition> {
 		let logical_type_id = self.by_name.get(&LogicalTypeNameCatalogKey {
 			tenant_id,
 			name: name.to_owned(),
@@ -439,14 +504,14 @@ impl LogicalTypeCatalogV1 {
 		&self,
 		tenant_id: TenantId,
 		logical_type_id: u32,
-	) -> Option<&LogicalTypeDefinitionV1> {
+	) -> Option<&LogicalTypeDefinition> {
 		self.by_id.get(&LogicalTypeIdCatalogKey {
 			tenant_id,
 			logical_type_id,
 		})
 	}
 
-	pub fn definitions_for_tenant(&self, tenant_id: TenantId) -> Vec<LogicalTypeDefinitionV1> {
+	pub fn definitions_for_tenant(&self, tenant_id: TenantId) -> Vec<LogicalTypeDefinition> {
 		let start = LogicalTypeIdCatalogKey {
 			tenant_id,
 			logical_type_id: LOGICAL_TYPE_RESERVED_STATIC_MAX_ID + 1,
@@ -498,8 +563,8 @@ struct LogicalTypeNameCatalogKey {
 	name: String,
 }
 
-pub fn encode_logical_type_definition_create_v1(
-	create: &LogicalTypeDefinitionCreateV1,
+pub fn encode_logical_type_definition_create(
+	create: &LogicalTypeDefinitionCreate,
 ) -> std::io::Result<Vec<u8>> {
 	create.validate()?;
 	postcard::to_allocvec(create).map_err(|err| {
@@ -510,10 +575,10 @@ pub fn encode_logical_type_definition_create_v1(
 	})
 }
 
-pub fn decode_logical_type_definition_create_v1(
+pub fn decode_logical_type_definition_create(
 	bytes: &[u8],
-) -> std::io::Result<LogicalTypeDefinitionCreateV1> {
-	let create: LogicalTypeDefinitionCreateV1 = postcard::from_bytes(bytes).map_err(|err| {
+) -> std::io::Result<LogicalTypeDefinitionCreate> {
+	let create: LogicalTypeDefinitionCreate = postcard::from_bytes(bytes).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
 			format!("failed to decode logical type create: {err}"),
@@ -523,8 +588,8 @@ pub fn decode_logical_type_definition_create_v1(
 	Ok(create)
 }
 
-pub fn encode_logical_type_definition_v1(
-	definition: &LogicalTypeDefinitionV1,
+pub fn encode_logical_type_definition(
+	definition: &LogicalTypeDefinition,
 ) -> std::io::Result<Vec<u8>> {
 	definition.validate()?;
 	postcard::to_allocvec(definition).map_err(|err| {
@@ -535,8 +600,8 @@ pub fn encode_logical_type_definition_v1(
 	})
 }
 
-pub fn decode_logical_type_definition_v1(bytes: &[u8]) -> std::io::Result<LogicalTypeDefinitionV1> {
-	let definition: LogicalTypeDefinitionV1 = postcard::from_bytes(bytes).map_err(|err| {
+pub fn decode_logical_type_definition(bytes: &[u8]) -> std::io::Result<LogicalTypeDefinition> {
+	let definition: LogicalTypeDefinition = postcard::from_bytes(bytes).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
 			format!("failed to decode logical type definition: {err}"),
@@ -546,8 +611,8 @@ pub fn decode_logical_type_definition_v1(bytes: &[u8]) -> std::io::Result<Logica
 	Ok(definition)
 }
 
-pub fn encode_logical_type_definitions_v1(
-	definitions: &[LogicalTypeDefinitionV1],
+pub fn encode_logical_type_definitions(
+	definitions: &[LogicalTypeDefinition],
 ) -> std::io::Result<Vec<u8>> {
 	for definition in definitions {
 		definition.validate()?;
@@ -560,10 +625,10 @@ pub fn encode_logical_type_definitions_v1(
 	})
 }
 
-pub fn decode_logical_type_definitions_v1(
+pub fn decode_logical_type_definitions(
 	bytes: &[u8],
-) -> std::io::Result<Vec<LogicalTypeDefinitionV1>> {
-	let definitions: Vec<LogicalTypeDefinitionV1> = postcard::from_bytes(bytes).map_err(|err| {
+) -> std::io::Result<Vec<LogicalTypeDefinition>> {
+	let definitions: Vec<LogicalTypeDefinition> = postcard::from_bytes(bytes).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
 			format!("failed to decode logical type definitions: {err}"),
@@ -573,6 +638,76 @@ pub fn decode_logical_type_definitions_v1(
 		definition.validate()?;
 	}
 	Ok(definitions)
+}
+
+fn validate_logical_type_refinement_comparison(
+	physical: LogicalTypePhysical,
+	left: &LogicalTypeRefinementValue,
+	op: LogicalTypeRefinementComparisonOp,
+	right: &LogicalTypeRefinementValue,
+) -> std::io::Result<()> {
+	let left_is_value = matches!(left, LogicalTypeRefinementValue::Value);
+	let right_is_value = matches!(right, LogicalTypeRefinementValue::Value);
+	if left_is_value == right_is_value {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"logical type refinement comparison must compare VALUE with a literal",
+		));
+	}
+	let literal = if left_is_value { right } else { left };
+	validate_logical_type_refinement_literal(physical, literal)?;
+	if !logical_type_refinement_op_allowed(physical, op) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ordered logical type refinement comparisons require a numeric physical type",
+		));
+	}
+	Ok(())
+}
+
+fn validate_logical_type_refinement_literal(
+	physical: LogicalTypePhysical,
+	literal: &LogicalTypeRefinementValue,
+) -> std::io::Result<()> {
+	let valid = match (physical, literal) {
+		(LogicalTypePhysical::Int64, LogicalTypeRefinementValue::Int64(_)) => true,
+		(LogicalTypePhysical::Int32, LogicalTypeRefinementValue::Int32(_)) => true,
+		(LogicalTypePhysical::Float64, LogicalTypeRefinementValue::Float64(bits)) => {
+			f64::from_bits(*bits).is_finite()
+		}
+		(LogicalTypePhysical::Float32, LogicalTypeRefinementValue::Float32(bits)) => {
+			f32::from_bits(*bits).is_finite()
+		}
+		(LogicalTypePhysical::Utf8, LogicalTypeRefinementValue::Utf8(_)) => true,
+		(LogicalTypePhysical::Boolean, LogicalTypeRefinementValue::Boolean(_)) => true,
+		_ => false,
+	};
+	if valid {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		"logical type refinement literal must match the physical carrier type",
+	))
+}
+
+fn logical_type_refinement_op_allowed(
+	physical: LogicalTypePhysical,
+	op: LogicalTypeRefinementComparisonOp,
+) -> bool {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq | LogicalTypeRefinementComparisonOp::Ne => true,
+		LogicalTypeRefinementComparisonOp::Lt
+		| LogicalTypeRefinementComparisonOp::Le
+		| LogicalTypeRefinementComparisonOp::Gt
+		| LogicalTypeRefinementComparisonOp::Ge => matches!(
+			physical,
+			LogicalTypePhysical::Int64
+				| LogicalTypePhysical::Int32
+				| LogicalTypePhysical::Float64
+				| LogicalTypePhysical::Float32
+		),
+	}
 }
 
 fn validate_logical_type_name(value: &str) -> std::io::Result<()> {

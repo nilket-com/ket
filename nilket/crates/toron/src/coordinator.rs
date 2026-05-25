@@ -826,7 +826,11 @@ async fn execute_catalog_plan(
 				.await?;
 			Ok(Vec::new())
 		}
-		ExecutionPlan::CreateLogicalType { name, physical } => {
+		ExecutionPlan::CreateLogicalType {
+			name,
+			physical,
+			refinement,
+		} => {
 			let physical = data_type_to_logical_type_physical(physical).ok_or_else(|| {
 				QueryError::Internal {
 					message: format!(
@@ -839,6 +843,7 @@ async fn execute_catalog_plan(
 					tenant_id: context.tenant_id,
 					name: name.clone(),
 					physical,
+					refinement: refinement.clone(),
 				})
 				.await?;
 			Ok(Vec::new())
@@ -987,6 +992,7 @@ async fn execute_write_plan_with_source(
 	source_executor: &dyn MutationSourceExecutor,
 	bound: &ExecutionPlan,
 ) -> Result<Vec<RecordBatch>, QueryError> {
+	let logical_types = catalog.logical_type_registry();
 	match bound {
 		ExecutionPlan::Insert {
 			legacy_table_id,
@@ -997,6 +1003,7 @@ async fn execute_write_plan_with_source(
 			returning,
 		} => {
 			let payload = write::materialize_insert_batch(schema, rows)?;
+			write::validate_refined_logical_columns("INSERT", &logical_types, &payload)?;
 			let returning_batches =
 				project_returning_batches(returning.as_ref(), std::slice::from_ref(&payload))?;
 			let returning_row_count = returning_batches
@@ -1042,6 +1049,7 @@ async fn execute_write_plan_with_source(
 					Ok(vec![write::affected_count_batch(0)?])
 				};
 			};
+			write::validate_refined_logical_columns("INSERT SELECT", &logical_types, &payload)?;
 			let returning_batches =
 				project_returning_batches(returning.as_ref(), std::slice::from_ref(&payload))?;
 			let returning_row_count = returning_batches
@@ -1086,6 +1094,7 @@ async fn execute_write_plan_with_source(
 					Ok(vec![write::affected_count_batch(0)?])
 				};
 			};
+			write::validate_refined_logical_columns("UPDATE", &logical_types, &payload)?;
 			let returning_batches =
 				project_returning_batches(returning.as_ref(), std::slice::from_ref(&payload))?;
 			let returning_row_count = returning_batches
@@ -1162,6 +1171,7 @@ async fn execute_write_plan_with_source(
 				Some(payload) => payload,
 				None => write::materialize_empty_record_batch(schema)?,
 			};
+			write::validate_refined_logical_columns("CTAS", &logical_types, &payload)?;
 			writer
 				.write(WriteRequest {
 					session_id: context.session_id,

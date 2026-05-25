@@ -19,8 +19,8 @@ use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
 use crate::integration::compute::{
 	SchemaMutationKindV1, TableSchemaDropRequest, WendelonAdminError,
-	decode_schema_update_envelope_v1, encode_logical_type_definition_v1,
-	encode_logical_type_definitions_v1,
+	decode_schema_update_envelope_v1, encode_logical_type_definition,
+	encode_logical_type_definitions,
 };
 use crate::metrics::{TableRetentionMetricPolicy, global as metrics};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
@@ -1471,7 +1471,7 @@ impl WendelonControlServer {
 		else {
 			return self.logical_type_get_rejection(&frame, CONTROL_REASON_NOT_FOUND, None);
 		};
-		let definition_bytes = encode_logical_type_definition_v1(definition)?;
+		let definition_bytes = encode_logical_type_definition(definition)?;
 		let definition_len = u32::try_from(definition_bytes.len()).map_err(|_| {
 			Error::new(
 				ErrorKind::InvalidData,
@@ -1529,7 +1529,7 @@ impl WendelonControlServer {
 		let definitions = snapshot
 			.logical_types
 			.definitions_for_tenant(raw_meta.tenant_id);
-		let definitions_bytes = encode_logical_type_definitions_v1(&definitions)?;
+		let definitions_bytes = encode_logical_type_definitions(&definitions)?;
 		let definitions_len = u32::try_from(definitions_bytes.len()).map_err(|_| {
 			Error::new(
 				ErrorKind::InvalidData,

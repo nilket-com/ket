@@ -5,7 +5,8 @@ pub use crate::distributed::identity::{QueryId, StageId};
 use arrow::datatypes::{DataType, Field};
 use serde::{Deserialize, Serialize};
 use wendelon_client::{
-	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinitionV1, LogicalTypePhysicalV1,
+	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinition, LogicalTypePhysical,
+	LogicalTypeRefinementPredicate,
 };
 
 #[path = "ir/execution.rs"]
@@ -34,6 +35,7 @@ pub struct LogicalTypeSpec {
 	pub id: LogicalTypeId,
 	pub name: String,
 	pub physical: DataType,
+	pub refinement: Option<LogicalTypeRefinementPredicate>,
 }
 
 pub fn seed_logical_type_spec(id: LogicalTypeId) -> Option<LogicalTypeSpec> {
@@ -42,16 +44,19 @@ pub fn seed_logical_type_spec(id: LogicalTypeId) -> Option<LogicalTypeSpec> {
 			id,
 			name: "naked".to_string(),
 			physical: DataType::Null,
+			refinement: None,
 		}),
 		CUSTOMER_ID_LOGICAL_TYPE => Some(LogicalTypeSpec {
 			id,
 			name: "CustomerId".to_string(),
 			physical: DataType::Int64,
+			refinement: None,
 		}),
 		PRODUCT_ID_LOGICAL_TYPE => Some(LogicalTypeSpec {
 			id,
 			name: "ProductId".to_string(),
 			physical: DataType::Int64,
+			refinement: None,
 		}),
 		_ => None,
 	}
@@ -89,7 +94,7 @@ impl LogicalTypeRegistry {
 	}
 
 	pub fn from_definitions(
-		definitions: impl IntoIterator<Item = LogicalTypeDefinitionV1>,
+		definitions: impl IntoIterator<Item = LogicalTypeDefinition>,
 	) -> Result<Self, LogicalTypeRegistryError> {
 		let mut registry = Self::new();
 		for definition in definitions {
@@ -100,7 +105,7 @@ impl LogicalTypeRegistry {
 
 	pub fn register_definition(
 		&mut self,
-		definition: LogicalTypeDefinitionV1,
+		definition: LogicalTypeDefinition,
 	) -> Result<LogicalTypeSpec, LogicalTypeRegistryError> {
 		if definition.logical_type_id < DURABLE_LOGICAL_TYPE_MIN_ID {
 			return Err(LogicalTypeRegistryError::ReservedId {
@@ -116,6 +121,7 @@ impl LogicalTypeRegistry {
 			id: LogicalTypeId(definition.logical_type_id),
 			name: definition.name,
 			physical: logical_type_physical_to_data_type(definition.physical),
+			refinement: definition.refinement,
 		};
 		if let Some(existing) = self.by_id.get(&spec.id) {
 			if existing == &spec {
@@ -230,25 +236,25 @@ impl<'a> LogicalTypeResolver<'a> {
 	}
 }
 
-pub fn logical_type_physical_to_data_type(physical: LogicalTypePhysicalV1) -> DataType {
+pub fn logical_type_physical_to_data_type(physical: LogicalTypePhysical) -> DataType {
 	match physical {
-		LogicalTypePhysicalV1::Int64 => DataType::Int64,
-		LogicalTypePhysicalV1::Int32 => DataType::Int32,
-		LogicalTypePhysicalV1::Float64 => DataType::Float64,
-		LogicalTypePhysicalV1::Float32 => DataType::Float32,
-		LogicalTypePhysicalV1::Utf8 => DataType::Utf8,
-		LogicalTypePhysicalV1::Boolean => DataType::Boolean,
+		LogicalTypePhysical::Int64 => DataType::Int64,
+		LogicalTypePhysical::Int32 => DataType::Int32,
+		LogicalTypePhysical::Float64 => DataType::Float64,
+		LogicalTypePhysical::Float32 => DataType::Float32,
+		LogicalTypePhysical::Utf8 => DataType::Utf8,
+		LogicalTypePhysical::Boolean => DataType::Boolean,
 	}
 }
 
-pub fn data_type_to_logical_type_physical(data_type: &DataType) -> Option<LogicalTypePhysicalV1> {
+pub fn data_type_to_logical_type_physical(data_type: &DataType) -> Option<LogicalTypePhysical> {
 	match data_type {
-		DataType::Int64 => Some(LogicalTypePhysicalV1::Int64),
-		DataType::Int32 => Some(LogicalTypePhysicalV1::Int32),
-		DataType::Float64 => Some(LogicalTypePhysicalV1::Float64),
-		DataType::Float32 => Some(LogicalTypePhysicalV1::Float32),
-		DataType::Utf8 => Some(LogicalTypePhysicalV1::Utf8),
-		DataType::Boolean => Some(LogicalTypePhysicalV1::Boolean),
+		DataType::Int64 => Some(LogicalTypePhysical::Int64),
+		DataType::Int32 => Some(LogicalTypePhysical::Int32),
+		DataType::Float64 => Some(LogicalTypePhysical::Float64),
+		DataType::Float32 => Some(LogicalTypePhysical::Float32),
+		DataType::Utf8 => Some(LogicalTypePhysical::Utf8),
+		DataType::Boolean => Some(LogicalTypePhysical::Boolean),
 		_ => None,
 	}
 }
@@ -675,6 +681,7 @@ pub enum LogicalPlan {
 	CreateLogicalType {
 		name: String,
 		physical: DataType,
+		refinement: Option<LogicalTypeRefinementPredicate>,
 	},
 	CreateTableAsSelect {
 		table: TableRef,

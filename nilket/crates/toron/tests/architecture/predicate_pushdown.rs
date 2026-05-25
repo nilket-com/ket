@@ -1322,24 +1322,24 @@ pub(crate) fn adr095_no_sql_pbc_wendelon_storage_surface() {
 }
 
 #[test]
-pub(crate) fn adr095_refinement_persistence_deferred_to_096() {
+pub(crate) fn adr096_refinement_persistence_is_durable_but_not_pbc_elision() {
 	let wendelon_compute =
 		std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
 			.expect("read Wendelon compute schema");
-	let definition = first_block(&wendelon_compute, "pub struct LogicalTypeDefinitionV1");
-	assert!(definition.contains("pub physical: LogicalTypePhysicalV1"));
-	assert!(!definition.contains("predicate"));
-	assert!(!definition.contains("check"));
+	let definition = first_block(&wendelon_compute, "pub struct LogicalTypeDefinition");
+	assert!(definition.contains("pub physical: LogicalTypePhysical"));
+	assert!(definition.contains("pub refinement: Option<LogicalTypeRefinementPredicate>"));
+	assert!(!wendelon_compute.contains("BoundExprProgram"));
+	assert!(!wendelon_compute.contains("ScalarValue"));
 
 	let sql_planner = source("src/sql_planner.rs");
-	assert!(!sql_planner.contains("CREATE LOGICAL TYPE CHECK"));
-	for line in sql_planner
-		.lines()
-		.filter(|line| line.contains("CREATE LOGICAL TYPE"))
-	{
-		assert!(!line.contains("CHECK"));
-		assert!(!line.contains("predicate"));
-	}
+	assert!(sql_planner.contains("CREATE LOGICAL TYPE CHECK"));
+	assert!(sql_planner.contains("parse_create_logical_type_refinement_clause"));
+
+	let binder = source("src/binder.rs");
+	let static_filter_class = first_block(&binder, "fn static_filter_class");
+	assert!(!static_filter_class.contains("refinement"));
+	assert!(!static_filter_class.contains("LogicalTypeRefinementPredicate"));
 }
 
 fn source(relative: &str) -> String {

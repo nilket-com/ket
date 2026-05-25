@@ -2,12 +2,13 @@ use std::time::Duration;
 use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
 	ComputeTraceContextV1, LOGICAL_TYPE_INTERNAL_NAMESPACE, LOGICAL_TYPE_RESERVED_STATIC_MAX_ID,
-	LogicalTypeCatalogV1, LogicalTypeDefinitionCreateV1, LogicalTypePhysicalV1,
+	LogicalTypeCatalog, LogicalTypeDefinitionCreate, LogicalTypePhysical,
+	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
 	SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES, SchemaGeneration, SchemaIntentId,
 	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
-	StorageQuotaMetadataV1, StorageStatusKind, decode_logical_type_definition_create_v1,
-	decode_logical_type_definitions_v1, decode_schema_update_envelope_v1,
-	encode_logical_type_definition_create_v1, encode_logical_type_definitions_v1,
+	StorageQuotaMetadataV1, StorageStatusKind, decode_logical_type_definition_create,
+	decode_logical_type_definitions, decode_schema_update_envelope_v1,
+	encode_logical_type_definition_create, encode_logical_type_definitions,
 	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
 	prepare_query_session_handoff, validate_query_session_audit_attribution,
 };
@@ -118,11 +119,12 @@ fn schema_intent_id_type_enforces_sixteen_byte_shape() {
 
 #[test]
 fn logical_type_definition_payload_roundtrips_and_uses_schema_object_kind() {
-	let create = LogicalTypeDefinitionCreateV1 {
+	let create = LogicalTypeDefinitionCreate {
 		name: "CustomerId".to_string(),
-		physical: LogicalTypePhysicalV1::Int64,
+		physical: LogicalTypePhysical::Int64,
+		refinement: None,
 	};
-	let payload = encode_logical_type_definition_create_v1(&create).unwrap();
+	let payload = encode_logical_type_definition_create(&create).unwrap();
 	let envelope = SchemaUpdateEnvelopeV1::compute_client_intent(
 		TenantId::new(42),
 		SchemaObjectRefV1 {
@@ -143,30 +145,73 @@ fn logical_type_definition_payload_roundtrips_and_uses_schema_object_kind() {
 	assert_eq!(decoded.object.kind, SchemaObjectKind::LogicalType);
 	assert_eq!(decoded.object.namespace, LOGICAL_TYPE_INTERNAL_NAMESPACE);
 	assert_eq!(
-		decode_logical_type_definition_create_v1(&payload).unwrap(),
+		decode_logical_type_definition_create(&payload).unwrap(),
 		create
 	);
 }
 
 #[test]
+fn logical_type_refinement_payload_roundtrips_and_participates_in_idempotence() {
+	let refinement = LogicalTypeRefinementPredicate::Comparison {
+		left: LogicalTypeRefinementValue::Value,
+		op: LogicalTypeRefinementComparisonOp::Gt,
+		right: LogicalTypeRefinementValue::Int64(0),
+	};
+	let create = LogicalTypeDefinitionCreate {
+		name: "PersonId".to_string(),
+		physical: LogicalTypePhysical::Int64,
+		refinement: Some(refinement.clone()),
+	};
+
+	let payload = encode_logical_type_definition_create(&create).unwrap();
+	assert_eq!(
+		decode_logical_type_definition_create(&payload).unwrap(),
+		create
+	);
+
+	let mut catalog = LogicalTypeCatalog::default();
+	let tenant = TenantId::new(7);
+	let first = catalog.create(tenant, create.clone()).unwrap();
+	let duplicate = catalog.create(tenant, create).unwrap();
+	assert_eq!(first, duplicate);
+	assert_eq!(first.refinement, Some(refinement));
+	assert_eq!(
+		catalog
+			.create(
+				tenant,
+				LogicalTypeDefinitionCreate {
+					name: "PersonId".to_string(),
+					physical: LogicalTypePhysical::Int64,
+					refinement: None,
+				},
+			)
+			.unwrap_err()
+			.kind(),
+		std::io::ErrorKind::AlreadyExists
+	);
+}
+
+#[test]
 fn logical_type_catalog_allocates_durable_ids_and_is_idempotent() {
-	let mut catalog = LogicalTypeCatalogV1::default();
+	let mut catalog = LogicalTypeCatalog::default();
 	let tenant = TenantId::new(7);
 	let first = catalog
 		.create(
 			tenant,
-			LogicalTypeDefinitionCreateV1 {
+			LogicalTypeDefinitionCreate {
 				name: "PersonId".to_string(),
-				physical: LogicalTypePhysicalV1::Int64,
+				physical: LogicalTypePhysical::Int64,
+				refinement: None,
 			},
 		)
 		.unwrap();
 	let duplicate = catalog
 		.create(
 			tenant,
-			LogicalTypeDefinitionCreateV1 {
+			LogicalTypeDefinitionCreate {
 				name: "PersonId".to_string(),
-				physical: LogicalTypePhysicalV1::Int64,
+				physical: LogicalTypePhysical::Int64,
+				refinement: None,
 			},
 		)
 		.unwrap();
@@ -179,18 +224,19 @@ fn logical_type_catalog_allocates_durable_ids_and_is_idempotent() {
 	assert_eq!(catalog.get_by_name(tenant, "PersonId"), Some(&first));
 	let listed = catalog.definitions_for_tenant(tenant);
 	assert_eq!(listed, vec![first.clone()]);
-	let listed_payload = encode_logical_type_definitions_v1(&listed).unwrap();
+	let listed_payload = encode_logical_type_definitions(&listed).unwrap();
 	assert_eq!(
-		decode_logical_type_definitions_v1(&listed_payload).unwrap(),
+		decode_logical_type_definitions(&listed_payload).unwrap(),
 		listed
 	);
 	assert_eq!(
 		catalog
 			.create(
 				tenant,
-				LogicalTypeDefinitionCreateV1 {
+				LogicalTypeDefinitionCreate {
 					name: "PersonId".to_string(),
-					physical: LogicalTypePhysicalV1::Int32,
+					physical: LogicalTypePhysical::Int32,
+					refinement: None,
 				},
 			)
 			.unwrap_err()

@@ -24,6 +24,10 @@ use wendelon::schema::{
 	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
 };
+use wendelon_client::{
+	LogicalTypePhysical, LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate,
+	LogicalTypeRefinementValue,
+};
 
 fn unsupported(message: impl Into<String>) -> FrontendError {
 	FrontendError::Unsupported {
@@ -164,23 +168,56 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 	}
 }
 
+fn take_sql_word(input: &str) -> Option<(&str, &str)> {
+	let trimmed = input.trim_start();
+	if trimmed.is_empty() {
+		return None;
+	}
+	let end = trimmed
+		.char_indices()
+		.find_map(|(index, character)| character.is_whitespace().then_some(index))
+		.unwrap_or(trimmed.len());
+	Some((&trimmed[..end], &trimmed[end..]))
+}
+
 fn try_lower_create_logical_type(sql: &str) -> Result<Option<LogicalPlan>, FrontendError> {
 	let trimmed = sql.trim();
 	let statement = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
-	let tokens = statement.split_whitespace().collect::<Vec<_>>();
-	if tokens.len() < 3
-		|| !tokens[0].eq_ignore_ascii_case("CREATE")
-		|| !tokens[1].eq_ignore_ascii_case("LOGICAL")
-		|| !tokens[2].eq_ignore_ascii_case("TYPE")
+	let Some((create_keyword, rest)) = take_sql_word(statement) else {
+		return Ok(None);
+	};
+	let Some((logical_keyword, rest)) = take_sql_word(rest) else {
+		return Ok(None);
+	};
+	let Some((type_keyword, rest)) = take_sql_word(rest) else {
+		return Ok(None);
+	};
+	if !create_keyword.eq_ignore_ascii_case("CREATE")
+		|| !logical_keyword.eq_ignore_ascii_case("LOGICAL")
+		|| !type_keyword.eq_ignore_ascii_case("TYPE")
 	{
 		return Ok(None);
 	}
-	if tokens.len() != 6 || !tokens[4].eq_ignore_ascii_case("AS") {
+	let Some((name, rest)) = take_sql_word(rest) else {
 		return Err(unsupported(
-			"CREATE LOGICAL TYPE syntax is CREATE LOGICAL TYPE <Name> AS <primitive>",
+			"CREATE LOGICAL TYPE syntax is CREATE LOGICAL TYPE <Name> AS <primitive> [CHECK (<predicate>)]",
+		));
+	};
+	let Some((as_keyword, rest)) = take_sql_word(rest) else {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE syntax is CREATE LOGICAL TYPE <Name> AS <primitive> [CHECK (<predicate>)]",
+		));
+	};
+	let Some((physical_token, rest)) = take_sql_word(rest) else {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE syntax is CREATE LOGICAL TYPE <Name> AS <primitive> [CHECK (<predicate>)]",
+		));
+	};
+	if !as_keyword.eq_ignore_ascii_case("AS") {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE syntax is CREATE LOGICAL TYPE <Name> AS <primitive> [CHECK (<predicate>)]",
 		));
 	}
-	let name = tokens[3];
 	if name.contains('.') {
 		return Err(unsupported(
 			"CREATE LOGICAL TYPE supports one-part tenant-global names only",
@@ -199,7 +236,7 @@ fn try_lower_create_logical_type(sql: &str) -> Result<Option<LogicalPlan>, Front
 			"CREATE LOGICAL TYPE names must be unquoted ASCII identifiers",
 		));
 	}
-	let physical = match tokens[5].to_ascii_uppercase().as_str() {
+	let physical = match physical_token.to_ascii_uppercase().as_str() {
 		"BIGINT" | "INT64" => DataType::Int64,
 		"INT" | "INTEGER" | "INT32" => DataType::Int32,
 		"DOUBLE" | "DOUBLEPRECISION" | "FLOAT64" => DataType::Float64,
@@ -212,15 +249,349 @@ fn try_lower_create_logical_type(sql: &str) -> Result<Option<LogicalPlan>, Front
 			)));
 		}
 	};
-	if data_type_to_logical_type_physical(&physical).is_none() {
-		return Err(unsupported(
-			"CREATE LOGICAL TYPE physical type must be a primitive logical-type carrier",
-		));
+	let physical_carrier = data_type_to_logical_type_physical(&physical).ok_or_else(|| {
+		unsupported("CREATE LOGICAL TYPE physical type must be a primitive logical-type carrier")
+	})?;
+	let refinement = parse_create_logical_type_refinement_clause(rest.trim(), physical_carrier)?;
+	if let Some(refinement) = &refinement {
+		refinement
+			.validate_for_physical(physical_carrier)
+			.map_err(|err| unsupported(format!("invalid CREATE LOGICAL TYPE CHECK: {err}")))?;
 	}
 	Ok(Some(LogicalPlan::CreateLogicalType {
 		name: name.to_string(),
 		physical,
+		refinement,
 	}))
+}
+
+fn parse_create_logical_type_refinement_clause(
+	clause: &str,
+	physical: LogicalTypePhysical,
+) -> Result<Option<LogicalTypeRefinementPredicate>, FrontendError> {
+	if clause.is_empty() {
+		return Ok(None);
+	}
+	let Some(after_check) = strip_sql_keyword_prefix(clause, "CHECK") else {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE supports only an optional CHECK (<predicate>) clause after the physical type",
+		));
+	};
+	let check = after_check.trim();
+	if !check.starts_with('(') || !check.ends_with(')') {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE CHECK must wrap the predicate in parentheses",
+		));
+	}
+	let inner = check[1..check.len() - 1].trim();
+	if inner.is_empty() {
+		return Err(unsupported("CREATE LOGICAL TYPE CHECK cannot be empty"));
+	}
+	parse_logical_type_refinement_predicate(inner, physical).map(Some)
+}
+
+fn strip_sql_keyword_prefix<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+	let trimmed = input.trim_start();
+	if !trimmed
+		.get(..keyword.len())
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+	{
+		return None;
+	}
+	let rest = &trimmed[keyword.len()..];
+	if rest
+		.chars()
+		.next()
+		.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+	{
+		return None;
+	}
+	Some(rest)
+}
+
+fn parse_logical_type_refinement_predicate(
+	input: &str,
+	physical: LogicalTypePhysical,
+) -> Result<LogicalTypeRefinementPredicate, FrontendError> {
+	if contains_sql_keyword_outside_string(input, "OR") {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE CHECK does not support OR predicates",
+		));
+	}
+	if contains_sql_keyword_outside_string(input, "NOT") {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE CHECK does not support NOT predicates",
+		));
+	}
+	let terms = split_sql_keyword_outside_string(input, "AND")?;
+	if terms.len() > 1 {
+		let mut predicates = Vec::with_capacity(terms.len());
+		for term in terms {
+			predicates.push(parse_logical_type_refinement_comparison(term, physical)?);
+		}
+		return Ok(LogicalTypeRefinementPredicate::And(predicates));
+	}
+	parse_logical_type_refinement_comparison(input, physical)
+}
+
+fn parse_logical_type_refinement_comparison(
+	input: &str,
+	physical: LogicalTypePhysical,
+) -> Result<LogicalTypeRefinementPredicate, FrontendError> {
+	let atom = strip_balanced_outer_parentheses(input.trim());
+	for (operator, op) in [
+		(">=", LogicalTypeRefinementComparisonOp::Ge),
+		("<=", LogicalTypeRefinementComparisonOp::Le),
+		("<>", LogicalTypeRefinementComparisonOp::Ne),
+		("!=", LogicalTypeRefinementComparisonOp::Ne),
+		("=", LogicalTypeRefinementComparisonOp::Eq),
+		(">", LogicalTypeRefinementComparisonOp::Gt),
+		("<", LogicalTypeRefinementComparisonOp::Lt),
+	] {
+		if let Some(index) = find_token_outside_string(atom, operator) {
+			let left = atom[..index].trim();
+			let right = atom[index + operator.len()..].trim();
+			if left.is_empty() || right.is_empty() {
+				break;
+			}
+			return Ok(LogicalTypeRefinementPredicate::Comparison {
+				left: parse_logical_type_refinement_value(left, physical)?,
+				op,
+				right: parse_logical_type_refinement_value(right, physical)?,
+			});
+		}
+	}
+	Err(unsupported(
+		"CREATE LOGICAL TYPE CHECK supports only VALUE comparisons joined by AND",
+	))
+}
+
+fn parse_logical_type_refinement_value(
+	input: &str,
+	physical: LogicalTypePhysical,
+) -> Result<LogicalTypeRefinementValue, FrontendError> {
+	let value = strip_balanced_outer_parentheses(input.trim());
+	if value.eq_ignore_ascii_case("VALUE") {
+		return Ok(LogicalTypeRefinementValue::Value);
+	}
+	match physical {
+		LogicalTypePhysical::Int64 => value
+			.parse::<i64>()
+			.map(LogicalTypeRefinementValue::Int64)
+			.map_err(|_| unsupported("CREATE LOGICAL TYPE CHECK requires an INT64 literal")),
+		LogicalTypePhysical::Int32 => value
+			.parse::<i32>()
+			.map(LogicalTypeRefinementValue::Int32)
+			.map_err(|_| unsupported("CREATE LOGICAL TYPE CHECK requires an INT32 literal")),
+		LogicalTypePhysical::Float64 => {
+			let parsed = value.parse::<f64>().map_err(|_| {
+				unsupported("CREATE LOGICAL TYPE CHECK requires a finite FLOAT64 literal")
+			})?;
+			if !parsed.is_finite() {
+				return Err(unsupported(
+					"CREATE LOGICAL TYPE CHECK requires a finite FLOAT64 literal",
+				));
+			}
+			Ok(LogicalTypeRefinementValue::Float64(parsed.to_bits()))
+		}
+		LogicalTypePhysical::Float32 => {
+			let parsed = value.parse::<f32>().map_err(|_| {
+				unsupported("CREATE LOGICAL TYPE CHECK requires a finite FLOAT32 literal")
+			})?;
+			if !parsed.is_finite() {
+				return Err(unsupported(
+					"CREATE LOGICAL TYPE CHECK requires a finite FLOAT32 literal",
+				));
+			}
+			Ok(LogicalTypeRefinementValue::Float32(parsed.to_bits()))
+		}
+		LogicalTypePhysical::Utf8 => parse_sql_string_literal(value)
+			.map(LogicalTypeRefinementValue::Utf8)
+			.ok_or_else(|| {
+				unsupported("CREATE LOGICAL TYPE CHECK requires a single-quoted UTF8 literal")
+			}),
+		LogicalTypePhysical::Boolean => match value.to_ascii_uppercase().as_str() {
+			"TRUE" => Ok(LogicalTypeRefinementValue::Boolean(true)),
+			"FALSE" => Ok(LogicalTypeRefinementValue::Boolean(false)),
+			_ => Err(unsupported(
+				"CREATE LOGICAL TYPE CHECK requires a BOOLEAN literal",
+			)),
+		},
+	}
+}
+
+fn parse_sql_string_literal(input: &str) -> Option<String> {
+	if !input.starts_with('\'') || !input.ends_with('\'') || input.len() < 2 {
+		return None;
+	}
+	let mut output = String::new();
+	let mut chars = input[1..input.len() - 1].chars().peekable();
+	while let Some(character) = chars.next() {
+		if character == '\'' {
+			if chars.peek() == Some(&'\'') {
+				chars.next();
+				output.push('\'');
+			} else {
+				return None;
+			}
+		} else {
+			output.push(character);
+		}
+	}
+	Some(output)
+}
+
+fn strip_balanced_outer_parentheses(mut input: &str) -> &str {
+	loop {
+		let trimmed = input.trim();
+		if trimmed.len() < 2 || !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+			return trimmed;
+		}
+		if !outer_parentheses_wrap(trimmed) {
+			return trimmed;
+		}
+		input = &trimmed[1..trimmed.len() - 1];
+	}
+}
+
+fn outer_parentheses_wrap(input: &str) -> bool {
+	let mut depth = 0i32;
+	let mut in_string = false;
+	let mut chars = input.char_indices().peekable();
+	while let Some((index, character)) = chars.next() {
+		if in_string {
+			if character == '\'' {
+				if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+					chars.next();
+				} else {
+					in_string = false;
+				}
+			}
+			continue;
+		}
+		match character {
+			'\'' => in_string = true,
+			'(' => depth += 1,
+			')' => {
+				depth -= 1;
+				if depth == 0 && index != input.len() - 1 {
+					return false;
+				}
+				if depth < 0 {
+					return false;
+				}
+			}
+			_ => {}
+		}
+	}
+	depth == 0 && !in_string
+}
+
+fn contains_sql_keyword_outside_string(input: &str, keyword: &str) -> bool {
+	find_sql_keyword_outside_string(input, keyword, 0).is_some()
+}
+
+fn split_sql_keyword_outside_string<'a>(
+	input: &'a str,
+	keyword: &str,
+) -> Result<Vec<&'a str>, FrontendError> {
+	let mut parts = Vec::new();
+	let mut start = 0usize;
+	let mut search_from = 0usize;
+	while let Some(index) = find_sql_keyword_outside_string(input, keyword, search_from) {
+		let part = input[start..index].trim();
+		if part.is_empty() {
+			return Err(unsupported(
+				"CREATE LOGICAL TYPE CHECK has an empty predicate around AND",
+			));
+		}
+		parts.push(part);
+		start = index + keyword.len();
+		search_from = start;
+	}
+	let tail = input[start..].trim();
+	if tail.is_empty() {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE CHECK has an empty predicate around AND",
+		));
+	}
+	parts.push(tail);
+	Ok(parts)
+}
+
+fn find_sql_keyword_outside_string(
+	input: &str,
+	keyword: &str,
+	search_from: usize,
+) -> Option<usize> {
+	let mut depth = 0i32;
+	let mut in_string = false;
+	let mut chars = input.char_indices().peekable();
+	while let Some((index, character)) = chars.next() {
+		if index < search_from {
+			continue;
+		}
+		if in_string {
+			if character == '\'' {
+				if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+					chars.next();
+				} else {
+					in_string = false;
+				}
+			}
+			continue;
+		}
+		match character {
+			'\'' => in_string = true,
+			'(' => depth += 1,
+			')' => depth -= 1,
+			_ if depth == 0 && sql_keyword_at(input, index, keyword) => return Some(index),
+			_ => {}
+		}
+	}
+	None
+}
+
+fn find_token_outside_string(input: &str, token: &str) -> Option<usize> {
+	let mut in_string = false;
+	let mut chars = input.char_indices().peekable();
+	while let Some((index, character)) = chars.next() {
+		if in_string {
+			if character == '\'' {
+				if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+					chars.next();
+				} else {
+					in_string = false;
+				}
+			}
+			continue;
+		}
+		if character == '\'' {
+			in_string = true;
+			continue;
+		}
+		if input[index..].starts_with(token) {
+			return Some(index);
+		}
+	}
+	None
+}
+
+fn sql_keyword_at(input: &str, index: usize, keyword: &str) -> bool {
+	if !input
+		.get(index..index + keyword.len())
+		.is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
+	{
+		return false;
+	}
+	let before = input[..index].chars().next_back();
+	let after = input[index + keyword.len()..].chars().next();
+	!before.is_some_and(is_sql_identifier_character)
+		&& !after.is_some_and(is_sql_identifier_character)
+}
+
+fn is_sql_identifier_character(character: char) -> bool {
+	character.is_ascii_alphanumeric() || character == '_'
 }
 
 fn lower_ddl_table_name(name: &ObjectName) -> Result<TableRef, FrontendError> {

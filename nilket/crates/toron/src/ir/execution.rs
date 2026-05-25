@@ -12,6 +12,7 @@ use crate::ir::{
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
 use wendelon::schema::{PhysicalDescriptorFingerprint, STORAGE_ROW_KEY_ID_COLUMN, TableObjectId};
+use wendelon_client::LogicalTypeRefinementPredicate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ColumnOrdinal(pub u32);
@@ -236,6 +237,7 @@ pub enum ExecutionPlan {
 	CreateLogicalType {
 		name: String,
 		physical: DataType,
+		refinement: Option<LogicalTypeRefinementPredicate>,
 	},
 	CreateTableAsSelect {
 		table: TableRef,

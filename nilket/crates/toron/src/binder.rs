@@ -206,12 +206,15 @@ impl<'a> Binder<'a> {
 					self.bind_create_table(name, schema, row_identity, *if_not_exists, *or_replace)
 						.await
 				}
-				LogicalPlan::CreateLogicalType { name, physical } => {
-					Ok(ExecutionPlan::CreateLogicalType {
-						name: name.clone(),
-						physical: physical.clone(),
-					})
-				}
+				LogicalPlan::CreateLogicalType {
+					name,
+					physical,
+					refinement,
+				} => Ok(ExecutionPlan::CreateLogicalType {
+					name: name.clone(),
+					physical: physical.clone(),
+					refinement: refinement.clone(),
+				}),
 				LogicalPlan::CreateTableAsSelect {
 					table,
 					if_not_exists,
@@ -2683,8 +2686,16 @@ fn optimize_for_required(
 			},
 			OrdinalRemap::new(),
 		)),
-		ExecutionPlan::CreateLogicalType { name, physical } => Ok((
-			ExecutionPlan::CreateLogicalType { name, physical },
+		ExecutionPlan::CreateLogicalType {
+			name,
+			physical,
+			refinement,
+		} => Ok((
+			ExecutionPlan::CreateLogicalType {
+				name,
+				physical,
+				refinement,
+			},
 			OrdinalRemap::new(),
 		)),
 		ExecutionPlan::CreateTableAsSelect {

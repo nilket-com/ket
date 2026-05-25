@@ -21,7 +21,7 @@ use wendelon::schema::{
 	TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
 };
 use wendelon_client::{
-	Client, ClientError, DropOperationId, LogicalTypeDefinitionV1, SchemaGeneration,
+	Client, ClientError, DropOperationId, LogicalTypeDefinition, SchemaGeneration,
 	SchemaUpdateReceipt, TableSchemaUpdateRequest,
 };
 
@@ -232,6 +232,10 @@ pub trait Catalog: Send + Sync {
 		name: &str,
 	) -> Result<LogicalTypeSpec, CatalogError>;
 
+	fn logical_type_registry(&self) -> LogicalTypeRegistry {
+		LogicalTypeRegistry::default()
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: TableId,
@@ -291,7 +295,7 @@ trait DescriptorSyncClient: Send + Sync {
 	async fn list_logical_type_definitions(
 		&self,
 		tenant_id: WendelonTenantId,
-	) -> Result<Vec<LogicalTypeDefinitionV1>, ClientError>;
+	) -> Result<Vec<LogicalTypeDefinition>, ClientError>;
 
 	async fn get_table_schema_descriptor(
 		&self,
@@ -306,7 +310,7 @@ impl DescriptorSyncClient for Client {
 	async fn list_logical_type_definitions(
 		&self,
 		tenant_id: WendelonTenantId,
-	) -> Result<Vec<LogicalTypeDefinitionV1>, ClientError> {
+	) -> Result<Vec<LogicalTypeDefinition>, ClientError> {
 		Client::list_logical_type_definitions(self, tenant_id).await
 	}
 
@@ -501,7 +505,7 @@ impl MockCatalog {
 	pub fn register_logical_type_for_tenant(
 		&self,
 		tenant_id: TenantId,
-		definition: wendelon_client::LogicalTypeDefinitionV1,
+		definition: wendelon_client::LogicalTypeDefinition,
 	) -> Result<(), CatalogError> {
 		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
 		inner
@@ -574,6 +578,15 @@ impl Catalog for MockCatalog {
 			.ok_or_else(|| CatalogError::LogicalTypeNotFound {
 				name: name.to_string(),
 			})
+	}
+
+	fn logical_type_registry(&self) -> LogicalTypeRegistry {
+		let inner = self.inner.read().expect("MockCatalog lock poisoned");
+		inner
+			.logical_types
+			.get(&self.tenant_id)
+			.cloned()
+			.unwrap_or_default()
 	}
 
 	async fn invalidate_table_descriptor(
@@ -1102,7 +1115,7 @@ impl WendelonDescriptorRegistry {
 	pub fn register_logical_type_for_tenant(
 		&self,
 		tenant_id: TenantId,
-		definition: LogicalTypeDefinitionV1,
+		definition: LogicalTypeDefinition,
 	) -> Result<(), CatalogError> {
 		self.register_logical_types_for_tenant(tenant_id, [definition])
 	}
@@ -1110,7 +1123,7 @@ impl WendelonDescriptorRegistry {
 	pub fn register_logical_types_for_tenant(
 		&self,
 		tenant_id: TenantId,
-		definitions: impl IntoIterator<Item = LogicalTypeDefinitionV1>,
+		definitions: impl IntoIterator<Item = LogicalTypeDefinition>,
 	) -> Result<(), CatalogError> {
 		let mut state = self
 			.inner
@@ -1717,6 +1730,10 @@ impl Catalog for WendelonCatalog {
 			})
 	}
 
+	fn logical_type_registry(&self) -> LogicalTypeRegistry {
+		self.registry.logical_type_registry(self.tenant_id)
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: TableId,
@@ -2122,12 +2139,12 @@ mod tests {
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
 	};
-	use wendelon_client::LogicalTypePhysicalV1;
+	use wendelon_client::LogicalTypePhysical;
 
 	struct FakeDescriptorSyncClient {
 		responses: tokio::sync::Mutex<VecDeque<Result<Option<TableSchemaDescriptor>, ClientError>>>,
 		requests: tokio::sync::Mutex<Vec<(WendelonTenantId, String, String)>>,
-		logical_type_definitions: Vec<LogicalTypeDefinitionV1>,
+		logical_type_definitions: Vec<LogicalTypeDefinition>,
 		calls: AtomicU64,
 		active: AtomicU64,
 		max_active: AtomicU64,
@@ -2155,7 +2172,7 @@ mod tests {
 
 		fn with_logical_types(
 			mut self,
-			definitions: impl IntoIterator<Item = LogicalTypeDefinitionV1>,
+			definitions: impl IntoIterator<Item = LogicalTypeDefinition>,
 		) -> Self {
 			self.logical_type_definitions = definitions.into_iter().collect();
 			self
@@ -2202,7 +2219,7 @@ mod tests {
 		async fn list_logical_type_definitions(
 			&self,
 			_tenant_id: WendelonTenantId,
-		) -> Result<Vec<LogicalTypeDefinitionV1>, ClientError> {
+		) -> Result<Vec<LogicalTypeDefinition>, ClientError> {
 			Ok(self.logical_type_definitions.clone())
 		}
 
@@ -2397,10 +2414,11 @@ mod tests {
 
 	#[tokio::test]
 	async fn resolve_table_bind_miss_syncs_logical_types_before_descriptor_decode() {
-		let definition = LogicalTypeDefinitionV1 {
+		let definition = LogicalTypeDefinition {
 			logical_type_id: DURABLE_LOGICAL_TYPE_MIN_ID,
 			name: "PersonId".to_string(),
-			physical: LogicalTypePhysicalV1::Int64,
+			physical: LogicalTypePhysical::Int64,
+			refinement: None,
 		};
 		let descriptor = logical_descriptor(definition.logical_type_id);
 		let client = Arc::new(
@@ -2438,10 +2456,11 @@ mod tests {
 
 	#[tokio::test]
 	async fn durable_logical_type_name_lookup_refreshes_list_before_not_found() {
-		let definition = LogicalTypeDefinitionV1 {
+		let definition = LogicalTypeDefinition {
 			logical_type_id: DURABLE_LOGICAL_TYPE_MIN_ID,
 			name: "PersonId".to_string(),
-			physical: LogicalTypePhysicalV1::Int64,
+			physical: LogicalTypePhysical::Int64,
+			refinement: None,
 		};
 		let client =
 			Arc::new(FakeDescriptorSyncClient::new([]).with_logical_types([definition.clone()]));

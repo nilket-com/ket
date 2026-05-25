@@ -41,7 +41,7 @@
 
 use crate::client::topology::{ClusterStatusWire, TopologySource};
 use crate::integration::compute::{
-	decode_logical_type_definition_v1, decode_logical_type_definitions_v1,
+	decode_logical_type_definition, decode_logical_type_definitions,
 };
 use crate::metrics::NetworkCompressionPath;
 use crate::network::control_server::{
@@ -339,13 +339,13 @@ pub struct TableDescriptorGetResult {
 #[derive(Clone, Debug)]
 pub struct LogicalTypeGetResult {
 	pub response: LogicalTypeGetResponseMeta,
-	pub definition: Option<crate::integration::compute::LogicalTypeDefinitionV1>,
+	pub definition: Option<crate::integration::compute::LogicalTypeDefinition>,
 }
 
 #[derive(Clone, Debug)]
 pub struct LogicalTypeListResult {
 	pub response: LogicalTypeListResponseMeta,
-	pub definitions: Vec<crate::integration::compute::LogicalTypeDefinitionV1>,
+	pub definitions: Vec<crate::integration::compute::LogicalTypeDefinition>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -837,7 +837,7 @@ impl WendelonClient {
 		&self,
 		tenant_id: TenantId,
 		name: &str,
-	) -> std::io::Result<Option<crate::integration::compute::LogicalTypeDefinitionV1>> {
+	) -> std::io::Result<Option<crate::integration::compute::LogicalTypeDefinition>> {
 		let request = LogicalTypeGetRequestMeta {
 			tenant_id,
 			name: encode_descriptor_wire_name("logical type name", name)?,
@@ -905,7 +905,7 @@ impl WendelonClient {
 	pub async fn list_logical_type_definitions(
 		&self,
 		tenant_id: TenantId,
-	) -> std::io::Result<Vec<crate::integration::compute::LogicalTypeDefinitionV1>> {
+	) -> std::io::Result<Vec<crate::integration::compute::LogicalTypeDefinition>> {
 		let request = LogicalTypeListRequestMeta { tenant_id };
 		let mut preferred_target = self.leader();
 		for attempt in 0..DATA_RETRY_BUDGET {
@@ -2492,7 +2492,7 @@ fn decode_logical_type_get_response_frame(
 				),
 			));
 		}
-		Some(decode_logical_type_definition_v1(&trailing[..])?)
+		Some(decode_logical_type_definition(&trailing[..])?)
 	} else {
 		if response.accepted != 0 {
 			return Err(Error::new(
@@ -2566,7 +2566,7 @@ fn decode_logical_type_list_response_frame(
 				),
 			));
 		}
-		decode_logical_type_definitions_v1(&trailing[..])?
+		decode_logical_type_definitions(&trailing[..])?
 	} else {
 		if response.accepted != 0 {
 			return Err(Error::new(

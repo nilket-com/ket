@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{
-	ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float32Builder, Float64Array,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float32Builder, Float64Array,
 	Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef};
@@ -10,7 +10,13 @@ use arrow::record_batch::RecordBatch;
 use crate::binder::TABLE_WRITE_MAX_ROWS;
 use crate::error::{ExecutionError, StorageError};
 use crate::exec::evaluate_cast;
-use crate::ir::{ColumnOrdinal, ScalarValue};
+use crate::ir::{
+	ColumnOrdinal, LogicalTypeRegistry, LogicalTypeResolver, ScalarValue,
+	decode_column_logical_type_with_resolver,
+};
+use wendelon_client::{
+	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
+};
 
 pub(super) fn affected_count_batch(count: usize) -> Result<RecordBatch, ExecutionError> {
 	let value = i64::try_from(count).map_err(|_| ExecutionError::Kernel {
@@ -221,6 +227,233 @@ fn validate_non_null_arrays(
 		}
 	}
 	Ok(())
+}
+
+pub(super) fn validate_refined_logical_columns(
+	operation: &'static str,
+	registry: &LogicalTypeRegistry,
+	batch: &RecordBatch,
+) -> Result<(), ExecutionError> {
+	let resolver = LogicalTypeResolver::with_registry(registry);
+	for (column_index, field) in batch.schema().fields().iter().enumerate() {
+		let logical_type =
+			decode_column_logical_type_with_resolver(field, resolver).map_err(|error| {
+				ExecutionError::InvalidExpression {
+					message: error.to_string(),
+				}
+			})?;
+		if logical_type.is_naked() {
+			continue;
+		}
+		let Some(spec) = resolver.spec(logical_type) else {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"{operation} target column {} references unknown logical type id {}",
+					field.name(),
+					logical_type.0
+				),
+			});
+		};
+		let Some(refinement) = spec.refinement.as_ref() else {
+			continue;
+		};
+		let array = batch.column(column_index);
+		for row in 0..batch.num_rows() {
+			if array.is_null(row) {
+				continue;
+			}
+			let value = logical_type_refinement_row_value(field.data_type(), array, row)?;
+			if !evaluate_logical_type_refinement_predicate(refinement, &value)? {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!(
+						"{operation} violates logical type refinement for column {} ({}) at row {}",
+						field.name(),
+						spec.name,
+						row
+					),
+				});
+			}
+		}
+	}
+	Ok(())
+}
+
+fn logical_type_refinement_row_value(
+	data_type: &DataType,
+	array: &ArrayRef,
+	row: usize,
+) -> Result<LogicalTypeRefinementValue, ExecutionError> {
+	match data_type {
+		DataType::Boolean => array
+			.as_any()
+			.downcast_ref::<BooleanArray>()
+			.map(|array| LogicalTypeRefinementValue::Boolean(array.value(row)))
+			.ok_or_else(|| refinement_array_type_mismatch(data_type)),
+		DataType::Int32 => array
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.map(|array| LogicalTypeRefinementValue::Int32(array.value(row)))
+			.ok_or_else(|| refinement_array_type_mismatch(data_type)),
+		DataType::Int64 => array
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.map(|array| LogicalTypeRefinementValue::Int64(array.value(row)))
+			.ok_or_else(|| refinement_array_type_mismatch(data_type)),
+		DataType::Float32 => array
+			.as_any()
+			.downcast_ref::<Float32Array>()
+			.map(|array| LogicalTypeRefinementValue::Float32(array.value(row).to_bits()))
+			.ok_or_else(|| refinement_array_type_mismatch(data_type)),
+		DataType::Float64 => array
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.map(|array| LogicalTypeRefinementValue::Float64(array.value(row).to_bits()))
+			.ok_or_else(|| refinement_array_type_mismatch(data_type)),
+		DataType::Utf8 => array
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.map(|array| LogicalTypeRefinementValue::Utf8(array.value(row).to_string()))
+			.ok_or_else(|| refinement_array_type_mismatch(data_type)),
+		other => Err(ExecutionError::InvalidExpression {
+			message: format!("unsupported logical type refinement carrier: {other:?}"),
+		}),
+	}
+}
+
+fn refinement_array_type_mismatch(data_type: &DataType) -> ExecutionError {
+	ExecutionError::InvalidExpression {
+		message: format!(
+			"logical type refinement array storage did not match carrier {data_type:?}"
+		),
+	}
+}
+
+fn evaluate_logical_type_refinement_predicate(
+	predicate: &LogicalTypeRefinementPredicate,
+	value: &LogicalTypeRefinementValue,
+) -> Result<bool, ExecutionError> {
+	match predicate {
+		LogicalTypeRefinementPredicate::Comparison { left, op, right } => {
+			let left = resolve_logical_type_refinement_operand(left, value);
+			let right = resolve_logical_type_refinement_operand(right, value);
+			compare_logical_type_refinement_values(left, *op, right)
+		}
+		LogicalTypeRefinementPredicate::And(predicates) => {
+			for predicate in predicates {
+				if !evaluate_logical_type_refinement_predicate(predicate, value)? {
+					return Ok(false);
+				}
+			}
+			Ok(true)
+		}
+	}
+}
+
+fn resolve_logical_type_refinement_operand<'a>(
+	operand: &'a LogicalTypeRefinementValue,
+	value: &'a LogicalTypeRefinementValue,
+) -> &'a LogicalTypeRefinementValue {
+	match operand {
+		LogicalTypeRefinementValue::Value => value,
+		literal => literal,
+	}
+}
+
+fn compare_logical_type_refinement_values(
+	left: &LogicalTypeRefinementValue,
+	op: LogicalTypeRefinementComparisonOp,
+	right: &LogicalTypeRefinementValue,
+) -> Result<bool, ExecutionError> {
+	match (left, right) {
+		(LogicalTypeRefinementValue::Int64(left), LogicalTypeRefinementValue::Int64(right)) => {
+			Ok(compare_i64(*left, op, *right))
+		}
+		(LogicalTypeRefinementValue::Int32(left), LogicalTypeRefinementValue::Int32(right)) => {
+			Ok(compare_i32(*left, op, *right))
+		}
+		(LogicalTypeRefinementValue::Float64(left), LogicalTypeRefinementValue::Float64(right)) => {
+			Ok(compare_f64(
+				f64::from_bits(*left),
+				op,
+				f64::from_bits(*right),
+			))
+		}
+		(LogicalTypeRefinementValue::Float32(left), LogicalTypeRefinementValue::Float32(right)) => {
+			Ok(compare_f32(
+				f32::from_bits(*left),
+				op,
+				f32::from_bits(*right),
+			))
+		}
+		(LogicalTypeRefinementValue::Utf8(left), LogicalTypeRefinementValue::Utf8(right)) => {
+			compare_eq_only(left, op, right)
+		}
+		(LogicalTypeRefinementValue::Boolean(left), LogicalTypeRefinementValue::Boolean(right)) => {
+			compare_eq_only(left, op, right)
+		}
+		_ => Err(ExecutionError::InvalidExpression {
+			message: "logical type refinement compared incompatible value types".to_string(),
+		}),
+	}
+}
+
+fn compare_i64(left: i64, op: LogicalTypeRefinementComparisonOp, right: i64) -> bool {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq => left == right,
+		LogicalTypeRefinementComparisonOp::Ne => left != right,
+		LogicalTypeRefinementComparisonOp::Lt => left < right,
+		LogicalTypeRefinementComparisonOp::Le => left <= right,
+		LogicalTypeRefinementComparisonOp::Gt => left > right,
+		LogicalTypeRefinementComparisonOp::Ge => left >= right,
+	}
+}
+
+fn compare_i32(left: i32, op: LogicalTypeRefinementComparisonOp, right: i32) -> bool {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq => left == right,
+		LogicalTypeRefinementComparisonOp::Ne => left != right,
+		LogicalTypeRefinementComparisonOp::Lt => left < right,
+		LogicalTypeRefinementComparisonOp::Le => left <= right,
+		LogicalTypeRefinementComparisonOp::Gt => left > right,
+		LogicalTypeRefinementComparisonOp::Ge => left >= right,
+	}
+}
+
+fn compare_f64(left: f64, op: LogicalTypeRefinementComparisonOp, right: f64) -> bool {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq => left == right,
+		LogicalTypeRefinementComparisonOp::Ne => left != right,
+		LogicalTypeRefinementComparisonOp::Lt => left < right,
+		LogicalTypeRefinementComparisonOp::Le => left <= right,
+		LogicalTypeRefinementComparisonOp::Gt => left > right,
+		LogicalTypeRefinementComparisonOp::Ge => left >= right,
+	}
+}
+
+fn compare_f32(left: f32, op: LogicalTypeRefinementComparisonOp, right: f32) -> bool {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq => left == right,
+		LogicalTypeRefinementComparisonOp::Ne => left != right,
+		LogicalTypeRefinementComparisonOp::Lt => left < right,
+		LogicalTypeRefinementComparisonOp::Le => left <= right,
+		LogicalTypeRefinementComparisonOp::Gt => left > right,
+		LogicalTypeRefinementComparisonOp::Ge => left >= right,
+	}
+}
+
+fn compare_eq_only<T: PartialEq>(
+	left: &T,
+	op: LogicalTypeRefinementComparisonOp,
+	right: &T,
+) -> Result<bool, ExecutionError> {
+	match op {
+		LogicalTypeRefinementComparisonOp::Eq => Ok(left == right),
+		LogicalTypeRefinementComparisonOp::Ne => Ok(left != right),
+		_ => Err(ExecutionError::InvalidExpression {
+			message: "logical type refinement ordered comparison requires a numeric carrier"
+				.to_string(),
+		}),
+	}
 }
 
 fn is_supported_insert_select_target(data_type: &DataType) -> bool {

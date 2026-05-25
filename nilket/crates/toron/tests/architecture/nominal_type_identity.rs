@@ -490,8 +490,8 @@ pub(crate) fn adr090_logical_type_authority_is_wendelon_metadata_not_toron_query
 
 	assert!(compute.contains("SchemaObjectKind"));
 	assert!(compute.contains("LogicalType"));
-	assert!(compute.contains("pub struct LogicalTypeDefinitionV1"));
-	assert!(raft.contains("pub logical_types: LogicalTypeCatalogV1"));
+	assert!(compute.contains("pub struct LogicalTypeDefinition"));
+	assert!(raft.contains("pub logical_types: LogicalTypeCatalog"));
 	assert!(raft.contains("apply_logical_type_schema_update"));
 	assert!(storage.contains("submit_logical_type_definition_create"));
 	assert!(storage.contains("get_logical_type_definition"));
@@ -559,14 +559,17 @@ pub(crate) fn adr090_static_pilot_seed_is_reserved_range_rune_test_bridge_only()
 }
 
 #[test]
-pub(crate) fn adr090_no_refinement_dropalter_or_pkfk_derivation() {
+pub(crate) fn adr090_no_dropalter_or_pkfk_derivation_after_refinement_persistence() {
 	let compute = wendelon_compute_source();
 	let raft = wendelon_raft_storage_source();
 	let planner = sql_planner_source();
 
 	assert!(raft.contains("logical type ALTER/DROP is not supported"));
-	assert!(!planner.contains("PRIMARY KEY") || !planner.contains("LogicalTypePhysicalV1"));
-	assert!(!compute.contains("refinement"));
+	assert!(!planner.contains("FOREIGN KEY") || !planner.contains("LogicalTypePhysical"));
+	assert!(compute.contains("LogicalTypeRefinementPredicate"));
+	assert!(compute.contains("pub refinement: Option<LogicalTypeRefinementPredicate>"));
+	assert!(!compute.contains("BoundExprProgram"));
+	assert!(!compute.contains("ScalarValue"));
 }
 
 #[test]

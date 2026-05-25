@@ -49,14 +49,15 @@ pub use wendelon::client::{
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
 	ComputeTraceContextV1, DropOperationId, LOGICAL_TYPE_INTERNAL_NAMESPACE,
-	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinitionCreateV1, LogicalTypeDefinitionV1,
-	LogicalTypePhysicalV1, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
+	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinition, LogicalTypeDefinitionCreate,
+	LogicalTypePhysical, LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate,
+	LogicalTypeRefinementValue, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
 	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
 	StorageQuotaMetadataV1, StorageStatusKind, TableSchemaDropFields, TableSchemaDropRequest,
-	WendelonAdminError, decode_logical_type_definition_v1, decode_logical_type_definitions_v1,
-	decode_schema_update_envelope_v1, encode_logical_type_definition_create_v1,
-	encode_logical_type_definitions_v1, encode_schema_update_envelope_v1,
-	map_read_status_for_compute, map_write_status_for_compute, prepare_query_session_handoff,
+	WendelonAdminError, decode_logical_type_definition, decode_logical_type_definitions,
+	decode_schema_update_envelope_v1, encode_logical_type_definition_create,
+	encode_logical_type_definitions, encode_schema_update_envelope_v1, map_read_status_for_compute,
+	map_write_status_for_compute, prepare_query_session_handoff,
 	validate_query_session_audit_attribution, validate_traceparent,
 };
 pub use wendelon::schema::{
@@ -308,7 +309,8 @@ impl TableSchemaUpdateRequest {
 pub struct LogicalTypeDefinitionCreateRequest {
 	pub tenant_id: TenantId,
 	pub name: String,
-	pub physical: LogicalTypePhysicalV1,
+	pub physical: LogicalTypePhysical,
+	pub refinement: Option<LogicalTypeRefinementPredicate>,
 	pub intent_id: SchemaIntentId,
 }
 
@@ -316,21 +318,39 @@ impl LogicalTypeDefinitionCreateRequest {
 	pub fn create(
 		tenant_id: TenantId,
 		name: impl Into<String>,
-		physical: LogicalTypePhysicalV1,
+		physical: LogicalTypePhysical,
 		intent_id: SchemaIntentId,
 	) -> Self {
 		Self {
 			tenant_id,
 			name: name.into(),
 			physical,
+			refinement: None,
+			intent_id,
+		}
+	}
+
+	pub fn create_with_refinement(
+		tenant_id: TenantId,
+		name: impl Into<String>,
+		physical: LogicalTypePhysical,
+		refinement: Option<LogicalTypeRefinementPredicate>,
+		intent_id: SchemaIntentId,
+	) -> Self {
+		Self {
+			tenant_id,
+			name: name.into(),
+			physical,
+			refinement,
 			intent_id,
 		}
 	}
 
 	pub fn envelope(&self) -> std::io::Result<SchemaUpdateEnvelopeV1> {
-		let payload = encode_logical_type_definition_create_v1(&LogicalTypeDefinitionCreateV1 {
+		let payload = encode_logical_type_definition_create(&LogicalTypeDefinitionCreate {
 			name: self.name.clone(),
 			physical: self.physical,
+			refinement: self.refinement.clone(),
 		})?;
 		Ok(SchemaUpdateEnvelopeV1::compute_client_intent(
 			self.tenant_id,
@@ -520,7 +540,7 @@ impl Client {
 		&self,
 		tenant_id: TenantId,
 		name: &str,
-	) -> Result<Option<LogicalTypeDefinitionV1>, ClientError> {
+	) -> Result<Option<LogicalTypeDefinition>, ClientError> {
 		self.inner
 			.get_logical_type_definition(tenant_id, name)
 			.await
@@ -530,7 +550,7 @@ impl Client {
 	pub async fn list_logical_type_definitions(
 		&self,
 		tenant_id: TenantId,
-	) -> Result<Vec<LogicalTypeDefinitionV1>, ClientError> {
+	) -> Result<Vec<LogicalTypeDefinition>, ClientError> {
 		self.inner
 			.list_logical_type_definitions(tenant_id)
 			.await

@@ -19,12 +19,15 @@ use toron::storage::{
 	CreateLogicalTypeOutcome, CreateLogicalTypeRequest, DropTableStorageOutcome,
 	DropTableStorageRequest, InMemoryStorageScan, InMemoryTableStorage, StorageAdmin, TenantId,
 };
-use wendelon::integration::compute::LogicalTypeCatalogV1;
+use wendelon::integration::compute::LogicalTypeCatalog;
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
 	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 };
-use wendelon_client::{LogicalTypeDefinitionV1, LogicalTypePhysicalV1};
+use wendelon_client::{
+	LogicalTypeDefinition, LogicalTypePhysical, LogicalTypeRefinementComparisonOp,
+	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
+};
 
 #[tokio::test]
 async fn ddl_define_then_use_creates_durable_typed_descriptor() {
@@ -66,6 +69,53 @@ async fn ddl_define_then_use_creates_durable_typed_descriptor() {
 			.metadata()
 			.contains_key(LOGICAL_TYPE_ID_METADATA_KEY)
 	);
+}
+
+#[test]
+fn ddl_create_logical_type_check_lowers_portable_refinement() {
+	let plan = SqlPlanner::new()
+		.plan("CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0 AND VALUE <= 100)")
+		.expect("plan refined logical type");
+
+	let LogicalPlan::CreateLogicalType {
+		name,
+		physical,
+		refinement: Some(refinement),
+	} = plan
+	else {
+		panic!("expected refined create logical type");
+	};
+
+	assert_eq!(name, "PersonId");
+	assert_eq!(physical, DataType::Int64);
+	assert_eq!(
+		refinement,
+		LogicalTypeRefinementPredicate::And(vec![
+			LogicalTypeRefinementPredicate::Comparison {
+				left: LogicalTypeRefinementValue::Value,
+				op: LogicalTypeRefinementComparisonOp::Gt,
+				right: LogicalTypeRefinementValue::Int64(0),
+			},
+			LogicalTypeRefinementPredicate::Comparison {
+				left: LogicalTypeRefinementValue::Value,
+				op: LogicalTypeRefinementComparisonOp::Le,
+				right: LogicalTypeRefinementValue::Int64(100),
+			},
+		])
+	);
+}
+
+#[test]
+fn ddl_create_logical_type_check_rejects_unbounded_boolean_shapes() {
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0 OR VALUE < -10)",
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (NOT VALUE > 0)",
+	] {
+		let err = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("unsupported refinement shape rejects");
+		assert!(format!("{err:?}").contains("does not support"));
+	}
 }
 
 #[tokio::test]
@@ -952,10 +1002,11 @@ async fn ctas_try_cast_materializes_nullable_logical_identity_and_survives_resyn
 	resynced
 		.register_logical_type_for_tenant(
 			TenantId(1),
-			LogicalTypeDefinitionV1 {
+			LogicalTypeDefinition {
 				logical_type_id: DURABLE_LOGICAL_TYPE_MIN_ID,
 				name: "CustomerId".to_string(),
-				physical: LogicalTypePhysicalV1::Int64,
+				physical: LogicalTypePhysical::Int64,
+				refinement: None,
 			},
 		)
 		.expect("sync logical type definition");
@@ -975,6 +1026,75 @@ async fn ctas_try_cast_materializes_nullable_logical_identity_and_survives_resyn
 		decode_column_logical_type(resynced_field).expect("decode resynced CTAS identity"),
 		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID)
 	);
+}
+
+#[tokio::test]
+async fn refined_logical_type_insert_values_allows_null_and_rejects_violation() {
+	let (_catalog, coordinator, planner) = logical_type_writer_coordinator();
+
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0)",
+		"CREATE TABLE people (id PersonId, note TEXT)",
+		"INSERT INTO people VALUES (1, 'ok')",
+		"INSERT INTO people VALUES (NULL, 'nullable')",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	expect_query_error_contains(
+		&coordinator,
+		&planner,
+		"INSERT INTO people VALUES (-1, 'bad')",
+		"violates logical type refinement",
+	)
+	.await;
+
+	let batch = concat_query(&coordinator, &planner, "SELECT id FROM people").await;
+	assert_eq!(int64_rows(&batch, 0), vec![Some(1), None]);
+}
+
+#[tokio::test]
+async fn refined_logical_type_write_boundary_covers_select_update_and_ctas() {
+	let (_catalog, coordinator, planner) = logical_type_writer_coordinator();
+
+	for sql in [
+		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0)",
+		"CREATE TABLE raw_ids (id BIGINT)",
+		"INSERT INTO raw_ids VALUES (2)",
+		"INSERT INTO raw_ids VALUES (-2)",
+		"CREATE TABLE people (pk BIGINT NOT NULL PRIMARY KEY, id PersonId)",
+		"INSERT INTO people (pk, id) SELECT id, id FROM raw_ids WHERE id > 0",
+		"CREATE TABLE ctas_ok AS SELECT CAST(id AS PersonId) AS id FROM raw_ids WHERE id > 0",
+	] {
+		execute(&coordinator, &planner, sql).await;
+	}
+
+	expect_query_error_contains(
+		&coordinator,
+		&planner,
+		"INSERT INTO people (pk, id) SELECT id, id FROM raw_ids WHERE id < 0",
+		"violates logical type refinement",
+	)
+	.await;
+	expect_query_error_contains(
+		&coordinator,
+		&planner,
+		"UPDATE people SET id = 0 WHERE pk = 2",
+		"violates logical type refinement",
+	)
+	.await;
+	expect_query_error_contains(
+		&coordinator,
+		&planner,
+		"CREATE TABLE ctas_bad AS SELECT CAST(id AS PersonId) AS id FROM raw_ids WHERE id < 0",
+		"violates logical type refinement",
+	)
+	.await;
+
+	let people = concat_query(&coordinator, &planner, "SELECT id FROM people").await;
+	assert_eq!(int64_rows(&people, 0), vec![Some(2)]);
+	let ctas_ok = concat_query(&coordinator, &planner, "SELECT id FROM ctas_ok").await;
+	assert_eq!(int64_rows(&ctas_ok, 0), vec![Some(2)]);
 }
 
 fn logical_type_coordinator() -> (Arc<MockCatalog>, QueryCoordinator, SqlPlanner) {
@@ -1009,6 +1129,23 @@ async fn execute(coordinator: &QueryCoordinator, planner: &SqlPlanner, sql: &str
 		.execute_query(&planner.plan(sql).expect("plan SQL"), None)
 		.await
 		.expect(sql);
+}
+
+async fn expect_query_error_contains(
+	coordinator: &QueryCoordinator,
+	planner: &SqlPlanner,
+	sql: &str,
+	needle: &str,
+) {
+	let err = coordinator
+		.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+		.await
+		.expect_err(sql);
+	let debug = format!("{err:?}");
+	assert!(
+		debug.contains(needle),
+		"expected error containing {needle:?}, got {debug}"
+	);
 }
 
 async fn concat_query(
@@ -1099,14 +1236,14 @@ fn descriptor_from_schema(table: &str, schema: &Schema) -> TableSchemaDescriptor
 
 struct RegisteringLogicalTypeAdmin {
 	catalog: Arc<MockCatalog>,
-	definitions: Mutex<LogicalTypeCatalogV1>,
+	definitions: Mutex<LogicalTypeCatalog>,
 }
 
 impl RegisteringLogicalTypeAdmin {
 	fn new(catalog: Arc<MockCatalog>) -> Self {
 		Self {
 			catalog,
-			definitions: Mutex::new(LogicalTypeCatalogV1::default()),
+			definitions: Mutex::new(LogicalTypeCatalog::default()),
 		}
 	}
 }
@@ -1132,9 +1269,10 @@ impl StorageAdmin for RegisteringLogicalTypeAdmin {
 			.expect("logical type catalog lock poisoned")
 			.create(
 				wendelon::schema::TenantId::new(request.tenant_id.0),
-				wendelon::integration::compute::LogicalTypeDefinitionCreateV1 {
+				wendelon::integration::compute::LogicalTypeDefinitionCreate {
 					name: request.name,
 					physical: request.physical,
+					refinement: request.refinement,
 				},
 			)
 			.map_err(|error| StorageError::Internal {

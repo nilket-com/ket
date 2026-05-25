@@ -17,12 +17,12 @@ use toron::storage::{
 	CreateLogicalTypeOutcome, CreateLogicalTypeRequest, DropTableStorageOutcome,
 	DropTableStorageRequest, InMemoryStorageScan, StorageAdmin, TenantId,
 };
-use wendelon::integration::compute::LogicalTypeCatalogV1;
+use wendelon::integration::compute::LogicalTypeCatalog;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
 };
-use wendelon_client::{LogicalTypeDefinitionV1, LogicalTypePhysicalV1};
+use wendelon_client::{LogicalTypeDefinition, LogicalTypePhysical};
 
 #[test]
 fn planner_accepts_create_logical_type_surface() {
@@ -30,11 +30,17 @@ fn planner_accepts_create_logical_type_surface() {
 		.plan("CREATE LOGICAL TYPE CustomerId AS BIGINT")
 		.expect("plan create logical type");
 
-	let LogicalPlan::CreateLogicalType { name, physical } = plan else {
+	let LogicalPlan::CreateLogicalType {
+		name,
+		physical,
+		refinement,
+	} = plan
+	else {
 		panic!("expected create logical type");
 	};
 	assert_eq!(name, "CustomerId");
 	assert_eq!(physical, DataType::Int64);
+	assert!(refinement.is_none());
 }
 
 #[test]
@@ -76,7 +82,7 @@ async fn create_logical_type_executes_through_storage_admin() {
 		.expect("definition");
 	assert_eq!(definition.logical_type_id, DURABLE_LOGICAL_TYPE_MIN_ID);
 	assert_eq!(definition.name, "PersonId");
-	assert_eq!(definition.physical, LogicalTypePhysicalV1::Int64);
+	assert_eq!(definition.physical, LogicalTypePhysical::Int64);
 }
 
 #[tokio::test]
@@ -148,14 +154,15 @@ async fn decode_resolves_durable_id_against_synced_registry() {
 
 #[test]
 fn logical_type_definition_survives_catalog_resync() {
-	let mut durable_catalog = LogicalTypeCatalogV1::default();
+	let mut durable_catalog = LogicalTypeCatalog::default();
 	let tenant = wendelon::schema::TenantId::new(7);
 	let definition = durable_catalog
 		.create(
 			tenant,
-			wendelon::integration::compute::LogicalTypeDefinitionCreateV1 {
+			wendelon::integration::compute::LogicalTypeDefinitionCreate {
 				name: "PersonId".to_string(),
-				physical: LogicalTypePhysicalV1::Int64,
+				physical: LogicalTypePhysical::Int64,
+				refinement: None,
 			},
 		)
 		.expect("create durable definition");
@@ -231,20 +238,26 @@ async fn binder_lowers_create_logical_type_without_engine_surface_changes() {
 		.await
 		.expect("bind create logical type");
 
-	let ExecutionPlan::CreateLogicalType { name, physical } = bound else {
+	let ExecutionPlan::CreateLogicalType {
+		name,
+		physical,
+		refinement,
+	} = bound
+	else {
 		panic!("expected create logical type execution plan");
 	};
 	assert_eq!(name, "PersonId");
 	assert_eq!(physical, DataType::Int64);
+	assert!(refinement.is_none());
 }
 
 #[derive(Default)]
 struct LogicalTypeAdmin {
-	catalog: Mutex<LogicalTypeCatalogV1>,
+	catalog: Mutex<LogicalTypeCatalog>,
 }
 
 impl LogicalTypeAdmin {
-	fn definition(&self, tenant_id: TenantId, name: &str) -> Option<LogicalTypeDefinitionV1> {
+	fn definition(&self, tenant_id: TenantId, name: &str) -> Option<LogicalTypeDefinition> {
 		self.catalog
 			.lock()
 			.expect("logical type admin lock poisoned")
@@ -274,9 +287,10 @@ impl StorageAdmin for LogicalTypeAdmin {
 			.expect("logical type admin lock poisoned")
 			.create(
 				wendelon::schema::TenantId::new(request.tenant_id.0),
-				wendelon::integration::compute::LogicalTypeDefinitionCreateV1 {
+				wendelon::integration::compute::LogicalTypeDefinitionCreate {
 					name: request.name,
 					physical: request.physical,
+					refinement: request.refinement,
 				},
 			)
 			.map_err(|error| StorageError::Internal {
@@ -286,11 +300,12 @@ impl StorageAdmin for LogicalTypeAdmin {
 	}
 }
 
-fn person_id_definition() -> LogicalTypeDefinitionV1 {
-	LogicalTypeDefinitionV1 {
+fn person_id_definition() -> LogicalTypeDefinition {
+	LogicalTypeDefinition {
 		logical_type_id: DURABLE_LOGICAL_TYPE_MIN_ID,
 		name: "PersonId".to_string(),
-		physical: LogicalTypePhysicalV1::Int64,
+		physical: LogicalTypePhysical::Int64,
+		refinement: None,
 	}
 }
 

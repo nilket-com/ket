@@ -106,12 +106,13 @@ pub struct DropTableStorageRequest {
 pub struct CreateLogicalTypeRequest {
 	pub tenant_id: TenantId,
 	pub name: String,
-	pub physical: wendelon_client::LogicalTypePhysicalV1,
+	pub physical: wendelon_client::LogicalTypePhysical,
+	pub refinement: Option<wendelon_client::LogicalTypeRefinementPredicate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateLogicalTypeOutcome {
-	pub definition: wendelon_client::LogicalTypeDefinitionV1,
+	pub definition: wendelon_client::LogicalTypeDefinition,
 }
 
 #[non_exhaustive]
@@ -489,12 +490,14 @@ impl StorageAdmin for WendelonStorageAdmin {
 		request: CreateLogicalTypeRequest,
 	) -> Result<CreateLogicalTypeOutcome, StorageError> {
 		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
-		let create_request = wendelon_client::LogicalTypeDefinitionCreateRequest::create(
-			tenant_id,
-			request.name.clone(),
-			request.physical,
-			wendelon_client::SchemaIntentId::new(*uuid::Uuid::new_v4().as_bytes()),
-		);
+		let create_request =
+			wendelon_client::LogicalTypeDefinitionCreateRequest::create_with_refinement(
+				tenant_id,
+				request.name.clone(),
+				request.physical,
+				request.refinement.clone(),
+				wendelon_client::SchemaIntentId::new(*uuid::Uuid::new_v4().as_bytes()),
+			);
 		self.client
 			.submit_logical_type_definition_create(create_request)
 			.await
