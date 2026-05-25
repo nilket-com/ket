@@ -115,7 +115,8 @@ pub(crate) fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 15);
+	assert_eq!(enum_variant_count(execution_plan), 16);
+	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("CreateTable {"));
 	assert!(execution_plan.contains("CreateTableAsSelect {"));

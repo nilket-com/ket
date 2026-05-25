@@ -647,6 +647,9 @@ impl Executor {
 	> {
 		Box::pin(async move {
 			match plan {
+				ExecutionPlan::EmptyRelation { schema } => {
+					Ok(vec![RecordBatch::new_empty(schema.clone())])
+				}
 				ExecutionPlan::Scan {
 					legacy_table_id,
 					table,

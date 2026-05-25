@@ -903,7 +903,8 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. } => first_join(input),
-		ExecutionPlan::Scan { .. }
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
@@ -948,7 +949,8 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		ExecutionPlan::Join { left, right, .. } => {
 			find_exchange(left).or_else(|| find_exchange(right))
 		}
-		ExecutionPlan::Scan { .. }
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
@@ -968,7 +970,8 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
-		ExecutionPlan::Scan { .. }
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
@@ -1002,7 +1005,8 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
-		ExecutionPlan::CreateTable { .. }
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
 		| ExecutionPlan::DropTable { .. }
@@ -1093,7 +1097,8 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			strategy,
 			output_schema,
 		},
-		ExecutionPlan::Scan { .. }
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
@@ -1159,7 +1164,8 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 			offset,
 			output_schema,
 		},
-		ExecutionPlan::Scan { .. }
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }

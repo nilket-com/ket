@@ -287,7 +287,8 @@ pub(crate) fn adr033_execution_variant_count_is_11() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 15);
+	assert_eq!(enum_variant_count(execution_plan), 16);
+	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("CreateTableAsSelect {"));
 	assert!(execution_plan.contains("CreateLogicalType {"));
 	assert!(execution_plan.contains("DropTable {"));
@@ -848,7 +849,8 @@ pub(crate) fn adr034_execution_variant_count_is_12() {
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
 
-	assert_eq!(enum_variant_count(execution_plan), 15);
+	assert_eq!(enum_variant_count(execution_plan), 16);
+	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("CreateLogicalType {"));
 	assert!(execution_plan.contains("DropTable {"));
 	assert!(execution_plan.contains("Update {"));

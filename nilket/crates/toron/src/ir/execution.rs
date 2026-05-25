@@ -175,6 +175,9 @@ pub struct BoundReturningProjection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionPlan {
+	EmptyRelation {
+		schema: SchemaRef,
+	},
 	Scan {
 		legacy_table_id: TableId,
 		table: TableObjectId,
@@ -286,6 +289,7 @@ pub enum ExecutionPlan {
 impl ExecutionPlan {
 	pub fn schema(&self) -> SchemaRef {
 		match self {
+			Self::EmptyRelation { schema } => schema.clone(),
 			Self::Scan {
 				schema,
 				row_identity,

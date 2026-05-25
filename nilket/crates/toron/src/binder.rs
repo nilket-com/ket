@@ -3,13 +3,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow::array::{Array, BooleanArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::aggregate_kernel::{
 	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
 };
 use crate::catalog::{Catalog, TableBinding, TableRef, TableRowIdentity};
 use crate::error::BindingError;
+use crate::exec::Executor;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
@@ -1081,12 +1084,31 @@ struct PredicatePushdownPlan {
 	profile_hint: Option<QueryProfileHint>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticFilterClass {
+	AlwaysPass,
+	AlwaysReject,
+	Unknown,
+}
+
 fn plan_filter_with_predicate_pushdown(
 	mut input: ExecutionPlan,
 	predicate: BoundExprProgram,
 ) -> (ExecutionPlan, QueryProfileHint) {
 	let original_predicate = predicate.clone();
 	let fallback_profile = scan_profile_hint(&original_predicate, &input);
+	if matches!(
+		static_filter_class(&original_predicate),
+		StaticFilterClass::AlwaysReject
+	) {
+		return (
+			ExecutionPlan::EmptyRelation {
+				schema: input.schema(),
+			},
+			fallback_profile.unwrap_or(QueryProfileHint::Scan),
+		);
+	}
+
 	let pushdown = predicate_pushdown_plan(predicate, &input);
 	let profile_hint = pushdown
 		.profile_hint
@@ -1139,6 +1161,65 @@ fn plan_filter_with_predicate_pushdown(
 		},
 		profile_hint,
 	)
+}
+
+fn static_filter_class(predicate: &BoundExprProgram) -> StaticFilterClass {
+	if structural_non_nullable_is_null(predicate) {
+		return StaticFilterClass::AlwaysReject;
+	}
+	if predicate.single_root().is_some() && !program_has_column_references(predicate) {
+		return closed_root_filter_class(predicate);
+	}
+	StaticFilterClass::Unknown
+}
+
+fn structural_non_nullable_is_null(predicate: &BoundExprProgram) -> bool {
+	let Some(root) = predicate.single_root() else {
+		return false;
+	};
+	let Some(BoundExprNode::Unary {
+		op: BoundUnaryOp::IsNull,
+		input,
+	}) = predicate.node(root)
+	else {
+		return false;
+	};
+	let Some(BoundExprNode::Column(column)) = predicate.node(*input) else {
+		return false;
+	};
+	!column.nullable
+}
+
+fn program_has_column_references(predicate: &BoundExprProgram) -> bool {
+	predicate
+		.nodes
+		.iter()
+		.any(|node| matches!(node, BoundExprNode::Column(_)))
+}
+
+fn closed_root_filter_class(predicate: &BoundExprProgram) -> StaticFilterClass {
+	let schema = Arc::new(Schema::empty());
+	let options = RecordBatchOptions::new().with_row_count(Some(1));
+	let Ok(batch) = RecordBatch::try_new_with_options(schema, Vec::new(), &options) else {
+		return StaticFilterClass::Unknown;
+	};
+	let Ok(outputs) = Executor::evaluate_bound_program_without_storage(predicate, &batch) else {
+		return StaticFilterClass::Unknown;
+	};
+	let [output] = outputs.as_slice() else {
+		return StaticFilterClass::Unknown;
+	};
+	let Some(mask) = output.as_any().downcast_ref::<BooleanArray>() else {
+		return StaticFilterClass::Unknown;
+	};
+	if mask.len() != 1 {
+		return StaticFilterClass::Unknown;
+	}
+	if mask.is_null(0) || !mask.value(0) {
+		StaticFilterClass::AlwaysReject
+	} else {
+		StaticFilterClass::AlwaysPass
+	}
 }
 
 fn predicate_pushdown_plan(
@@ -2284,7 +2365,8 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. } => terminal_exchange(input),
-		ExecutionPlan::Scan { .. }
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::Scan { .. }
 		| ExecutionPlan::Join { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
@@ -2368,6 +2450,14 @@ fn optimize_for_required(
 	required_output: Option<BTreeSet<ColumnOrdinal>>,
 ) -> Result<(ExecutionPlan, OrdinalRemap), BindingError> {
 	match plan {
+		ExecutionPlan::EmptyRelation { schema } => {
+			let all_columns = all_columns(&schema);
+			let required = required_output.unwrap_or(all_columns);
+			let requested = required.iter().copied().collect::<Vec<_>>();
+			let remap = ordinal_remap(&requested);
+			let schema = project_schema(&schema, &requested)?;
+			Ok((ExecutionPlan::EmptyRelation { schema }, remap))
+		}
 		ExecutionPlan::Scan {
 			legacy_table_id,
 			table,

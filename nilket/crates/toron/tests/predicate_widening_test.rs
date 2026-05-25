@@ -1,18 +1,20 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{Array, Int32Array, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::MockCatalog;
-use toron::error::{BindingError, FrontendError};
+use toron::error::{BindingError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
 	BoundBinaryOp, BoundExprNode, BoundExprProgram, BoundUnaryOp, ColumnOrdinal, ExecutionPlan,
 	Expr, FilterDisposition, LogicalPlan, ScalarValue, TableId,
 };
 use toron::sql_planner::SqlPlanner;
-use toron::storage::InMemoryStorageScan;
+use toron::storage::{InMemoryStorageScan, ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
@@ -336,6 +338,184 @@ async fn where_not_and_mixed_does_not_push_negated_single_side() {
 }
 
 #[tokio::test]
+async fn where_false_literal_elides_to_empty_relation() {
+	let plan = sales_filter(bool_lit(Some(false)));
+	let bound = bind_logical(&plan).await;
+
+	let schema = find_empty_relation(&bound).expect("empty relation");
+	assert_eq!(schema.fields().len(), 3);
+	assert!(scan_pbc(&bound).is_none());
+}
+
+#[tokio::test]
+async fn where_literal_comparison_false_elides_to_empty_relation() {
+	let plan = sales_filter(Expr::Eq(
+		Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
+		Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+	));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_some());
+}
+
+#[tokio::test]
+async fn where_closed_null_predicate_elides_to_empty_relation() {
+	let plan = sales_filter(bool_lit(None));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_some());
+}
+
+#[tokio::test]
+async fn where_non_nullable_column_is_null_elides_to_empty_relation() {
+	let plan = sales_filter(Expr::IsNull(Box::new(Expr::column("id"))));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_some());
+}
+
+#[tokio::test]
+async fn where_nullable_column_is_null_does_not_elide() {
+	let plan = sales_filter(Expr::IsNull(Box::new(Expr::column("amount"))));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert_ids_for_plan(&plan, &[3]).await;
+}
+
+#[tokio::test]
+async fn where_column_predicate_does_not_elide() {
+	let plan = sales_filter(id_eq(5));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert_ids_for_plan(&plan, &[5]).await;
+}
+
+#[tokio::test]
+async fn where_false_and_column_predicate_stays_out_of_scope() {
+	let plan = sales_filter(Expr::And(
+		Box::new(bool_lit(Some(false))),
+		Box::new(id_eq(5)),
+	));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	let (_, _, scan) = find_filter(&bound);
+	assert!(matches!(scan, ExecutionPlan::Scan { .. }));
+}
+
+#[tokio::test]
+async fn where_false_and_erroring_expression_does_not_elide() {
+	let plan = sales_filter(Expr::And(
+		Box::new(bool_lit(Some(false))),
+		Box::new(Expr::Eq(
+			Box::new(Expr::Cast(
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(2147483648.0)))),
+				DataType::Int32,
+			)),
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+		)),
+	));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_none());
+}
+
+#[tokio::test]
+async fn where_closed_erroring_expression_does_not_elide_and_still_errors() {
+	let plan = sales_filter(Expr::Eq(
+		Box::new(Expr::Cast(
+			Box::new(Expr::Literal(ScalarValue::Float64(Some(2147483648.0)))),
+			DataType::Int32,
+		)),
+		Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+	));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	let err = Executor::new(Arc::new(InMemoryStorageScan {
+		table_data: sales_batch(schema()),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect_err("strict cast should still execute and fail");
+	assert!(
+		format!("{err:?}").contains("cast failed"),
+		"unexpected error: {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn empty_relation_executor_returns_one_empty_batch() {
+	let empty_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+	let plan = ExecutionPlan::EmptyRelation {
+		schema: empty_schema.clone(),
+	};
+
+	let batches = Executor::new(Arc::new(InMemoryStorageScan {
+		table_data: sales_batch(schema()),
+	}))
+	.execute_bound(&plan, None)
+	.await
+	.expect("execute empty relation");
+
+	assert_eq!(batches.len(), 1);
+	assert_eq!(batches[0].num_rows(), 0);
+	assert_eq!(batches[0].schema(), empty_schema);
+}
+
+#[tokio::test]
+async fn where_static_false_does_not_scan_storage() {
+	let plan = sales_filter(bool_lit(Some(false)));
+	let bound = bind_logical(&plan).await;
+	let scan_count = Arc::new(AtomicUsize::new(0));
+
+	let batches = Executor::new(Arc::new(CountingStorageScan {
+		batch: sales_batch(schema()),
+		scan_count: scan_count.clone(),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute empty relation");
+
+	assert_eq!(scan_count.load(Ordering::SeqCst), 0);
+	assert_eq!(batches.len(), 1);
+	assert_eq!(batches[0].num_rows(), 0);
+}
+
+#[tokio::test]
+async fn count_star_over_static_false_filter_returns_single_zero() {
+	let batches = execute_sql("SELECT COUNT(*) FROM sales WHERE 1 = 0").await;
+
+	assert_eq!(int64_values(&batches), vec![0]);
+}
+
+#[tokio::test]
+async fn grouped_aggregate_over_static_false_filter_returns_zero_groups() {
+	let batches =
+		execute_sql("SELECT status, COUNT(*) FROM sales WHERE 1 = 0 GROUP BY status").await;
+
+	assert_eq!(total_rows(&batches), 0);
+}
+
+#[tokio::test]
+async fn project_over_static_false_filter_preserves_schema() {
+	let bound = bind_sql("SELECT status FROM sales WHERE 1 = 0").await;
+	let batches = Executor::new(Arc::new(InMemoryStorageScan {
+		table_data: sales_batch(schema()),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute project over empty relation");
+
+	assert_eq!(bound.schema().field(0).name(), "status");
+	assert_eq!(batches.len(), 1);
+	assert_eq!(batches[0].num_rows(), 0);
+	assert_eq!(batches[0].schema().field(0).name(), "status");
+}
+
+#[tokio::test]
 async fn boolean_factoring_over_budget_falls_back_without_wrong_results() {
 	let branches = (0..17)
 		.map(|_| "(id = 3 AND status LIKE 'c%')")
@@ -558,6 +738,10 @@ fn id_eq(value: i32) -> Expr {
 	)
 }
 
+fn bool_lit(value: Option<bool>) -> Expr {
+	Expr::Literal(ScalarValue::Boolean(value))
+}
+
 fn status_like(pattern: &str) -> Expr {
 	Expr::Like {
 		expr: Box::new(Expr::column("status")),
@@ -575,6 +759,16 @@ fn id_plus_one_gt_zero() -> Expr {
 		)),
 		Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
 	)
+}
+
+async fn execute_sql(sql: &str) -> Vec<RecordBatch> {
+	let bound = bind_sql(sql).await;
+	Executor::new(Arc::new(InMemoryStorageScan {
+		table_data: sales_batch(schema()),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute SQL")
 }
 
 async fn assert_statuses(sql: &str, expected: &[&str]) {
@@ -616,6 +810,21 @@ fn find_filter(
 			disposition,
 		} => (predicate, disposition, input),
 		other => panic!("expected filter plan, got {other:?}"),
+	}
+}
+
+fn find_empty_relation(plan: &ExecutionPlan) -> Option<&SchemaRef> {
+	match plan {
+		ExecutionPlan::EmptyRelation { schema } => Some(schema),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => find_empty_relation(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			find_empty_relation(left).or_else(|| find_empty_relation(right))
+		}
+		_ => None,
 	}
 }
 
@@ -669,6 +878,26 @@ fn statuses(batches: &[RecordBatch]) -> Vec<String> {
 				.collect::<Vec<_>>()
 		})
 		.collect()
+}
+
+fn int64_values(batches: &[RecordBatch]) -> Vec<i64> {
+	batches
+		.iter()
+		.flat_map(|batch| {
+			batch
+				.column(0)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.expect("int64 column")
+				.iter()
+				.map(|value| value.expect("int64 value"))
+				.collect::<Vec<_>>()
+		})
+		.collect()
+}
+
+fn total_rows(batches: &[RecordBatch]) -> usize {
+	batches.iter().map(RecordBatch::num_rows).sum()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -751,6 +980,24 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 		],
 	)
 	.expect("sales batch")
+}
+
+struct CountingStorageScan {
+	batch: RecordBatch,
+	scan_count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StorageScan for CountingStorageScan {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		self.scan_count.fetch_add(1, Ordering::SeqCst);
+		Ok(ScanStream::from_batches(
+			self.batch.schema(),
+			request.session_id,
+			request.query_id,
+			vec![self.batch.clone()],
+		))
+	}
 }
 
 fn descriptor(schema: &Schema) -> TableSchemaDescriptor {

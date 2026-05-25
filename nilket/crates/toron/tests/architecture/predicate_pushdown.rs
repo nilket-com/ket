@@ -1209,3 +1209,147 @@ pub(crate) fn adr074_prior_010_023_024_025_026_029_030_034_036_064_073_guards_co
 		);
 	}
 }
+
+#[test]
+pub(crate) fn adr095_empty_relation_is_execution_plan_only() {
+	let execution = source("src/ir/execution.rs");
+	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
+	assert!(execution_plan.contains("EmptyRelation"));
+	assert!(execution_plan.contains("schema: SchemaRef"));
+
+	let logical = source("src/ir.rs");
+	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
+	assert!(!logical_plan.contains("EmptyRelation"));
+}
+
+#[test]
+pub(crate) fn adr095_filter_elision_runs_before_pbc_pushdown() {
+	let binder = source("src/binder.rs");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+	let classifier = filter_helper
+		.find("static_filter_class(&original_predicate)")
+		.expect("static classifier call");
+	let pushdown = filter_helper
+		.find("predicate_pushdown_plan(predicate, &input)")
+		.expect("predicate pushdown call");
+
+	assert!(classifier < pushdown);
+	assert!(filter_helper.contains("ExecutionPlan::EmptyRelation"));
+	assert!(filter_helper.contains("fallback_profile.unwrap_or(QueryProfileHint::Scan)"));
+}
+
+#[test]
+pub(crate) fn adr095_static_filter_classifier_is_error_conservative() {
+	let binder = source("src/binder.rs");
+	let classifier = first_block(&binder, "fn static_filter_class");
+	let closed_root = first_block(&binder, "fn closed_root_filter_class");
+	let structural_null = first_block(&binder, "fn structural_non_nullable_is_null");
+
+	assert!(classifier.contains("program_has_column_references"));
+	assert!(!classifier.contains("BoundBinaryOp::And"));
+	assert!(!classifier.contains("BoundBinaryOp::Or"));
+	assert!(!classifier.contains("BoundUnaryOp::Not"));
+	assert!(closed_root.contains("evaluate_bound_program_without_storage"));
+	assert!(closed_root.matches("StaticFilterClass::Unknown").count() >= 4);
+	assert!(structural_null.contains("BoundUnaryOp::IsNull"));
+	assert!(structural_null.contains("BoundExprNode::Column(column)"));
+	assert!(structural_null.contains("!column.nullable"));
+}
+
+#[test]
+pub(crate) fn adr095_plan_walkers_handle_empty_relation_as_leaf() {
+	for (relative, marker) in [
+		("src/binder.rs", "fn terminal_exchange"),
+		("src/binder.rs", "fn optimize_for_required"),
+		("src/distributed/fragment.rs", "fn first_join"),
+		("src/distributed/fragment.rs", "fn find_exchange"),
+		("src/distributed/fragment.rs", "fn count_exchanges"),
+		("src/distributed/fragment.rs", "fn first_scan_metadata"),
+		(
+			"src/distributed/fragment.rs",
+			"fn replace_exchange_with_scan",
+		),
+		("src/distributed/fragment.rs", "fn replace_first_join"),
+		("src/distributed/scheduler.rs", "fn first_scan_fingerprint"),
+		("src/server/mod.rs", "fn join_strategy_label"),
+		("src/server/mod.rs", "fn contains_join"),
+		("src/server/mod.rs", "fn operator_kind_label"),
+		("src/server/mod.rs", "fn contains_broadcast_join"),
+		("src/server/mod.rs", "fn scan_schema_for_table_id"),
+	] {
+		let source = source(relative);
+		let block = first_block(&source, marker);
+		assert!(
+			block.contains("ExecutionPlan::EmptyRelation"),
+			"{relative} {marker} does not name EmptyRelation"
+		);
+	}
+
+	let server = source("src/server/mod.rs");
+	let operator_kind = first_block(&server, "fn operator_kind_label");
+	assert!(operator_kind.contains("\"empty_relation\""));
+}
+
+#[test]
+pub(crate) fn adr095_no_sql_pbc_wendelon_storage_surface() {
+	for relative in [
+		"src/ir.rs",
+		"src/sql_planner.rs",
+		"src/pbc.rs",
+		"src/storage.rs",
+	] {
+		let source = source(relative);
+		if relative == "src/ir.rs" {
+			let logical_plan = first_block(&source, "pub enum LogicalPlan");
+			assert!(!logical_plan.contains("EmptyRelation"));
+		} else {
+			assert!(
+				!source.contains("EmptyRelation"),
+				"{relative} gained public EmptyRelation surface"
+			);
+		}
+	}
+
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("EmptyRelation"))
+		.collect::<Vec<_>>();
+	assert!(
+		wendelon_offenders.is_empty(),
+		"EmptyRelation leaked to Wendelon:\n{}",
+		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr095_refinement_persistence_deferred_to_096() {
+	let wendelon_compute =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
+			.expect("read Wendelon compute schema");
+	let definition = first_block(&wendelon_compute, "pub struct LogicalTypeDefinitionV1");
+	assert!(definition.contains("pub physical: LogicalTypePhysicalV1"));
+	assert!(!definition.contains("predicate"));
+	assert!(!definition.contains("check"));
+
+	let sql_planner = source("src/sql_planner.rs");
+	assert!(!sql_planner.contains("CREATE LOGICAL TYPE CHECK"));
+	for line in sql_planner
+		.lines()
+		.filter(|line| line.contains("CREATE LOGICAL TYPE"))
+	{
+		assert!(!line.contains("CHECK"));
+		assert!(!line.contains("predicate"));
+	}
+}
+
+fn source(relative: &str) -> String {
+	std::fs::read_to_string(manifest_dir().join(relative)).expect("read Toron source")
+}
+
+fn first_block(source: &str, marker: &str) -> String {
+	brace_blocks_after_marker(source, marker)
+		.into_iter()
+		.next()
+		.unwrap_or_else(|| panic!("missing block for {marker}"))
+		.1
+}

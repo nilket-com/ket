@@ -445,6 +445,38 @@ async fn update_zero_matches_returns_row_count_zero_without_write() {
 }
 
 #[tokio::test]
+async fn update_where_static_false_uses_empty_source_and_writes_zero_rows() {
+	let (catalog, _) = pk_catalog(people_schema(true)).await;
+	let bound = bind_update(&catalog, "UPDATE people SET note = 'new' WHERE 1 = 0").await;
+	let ExecutionPlan::Update { source, .. } = &bound else {
+		panic!("expected update plan, got {bound:?}");
+	};
+	let ExecutionPlan::Project { input, .. } = source.as_ref() else {
+		panic!("expected update source project, got {source:?}");
+	};
+	assert!(
+		matches!(input.as_ref(), ExecutionPlan::EmptyRelation { .. }),
+		"expected static-false update source to use EmptyRelation, got {input:?}"
+	);
+
+	let fixture = UpdateFixture::new(people_schema(true)).await;
+	fixture
+		.seed(people_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, Some("old"))],
+		))
+		.await;
+
+	let affected = fixture
+		.execute("UPDATE people SET note = 'new' WHERE 1 = 0")
+		.await
+		.expect("static-false update");
+
+	assert_eq!(affected, 0);
+	assert_eq!(fixture.writer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn zero_row_update_returning_completes_row_count_zero_without_batch_or_write() {
 	let fixture = UpdateFixture::new(people_schema(true)).await;
 	fixture
