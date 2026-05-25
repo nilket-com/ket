@@ -8,8 +8,8 @@ use toron::catalog::MockCatalog;
 use toron::error::{BindingError, FrontendError};
 use toron::exec::Executor;
 use toron::ir::{
-	BoundExprNode, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue,
-	TableId,
+	BoundBinaryOp, BoundExprNode, BoundExprProgram, BoundUnaryOp, ColumnOrdinal, ExecutionPlan,
+	Expr, FilterDisposition, LogicalPlan, ScalarValue, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::InMemoryStorageScan;
@@ -201,7 +201,7 @@ async fn where_mixed_or_branch_does_not_push_partial_branch() {
 }
 
 #[tokio::test]
-async fn where_common_pushable_conjunct_factors_out_of_or_and_preserves_rows() {
+async fn where_common_pushable_conjunct_factors_out_with_minimal_residual() {
 	let sql = "SELECT id FROM sales \
 		WHERE (id = 3 AND status LIKE 'c%') OR (id = 3 AND status LIKE 'x%')";
 	let bound = bind_sql(sql).await;
@@ -213,16 +213,20 @@ async fn where_common_pushable_conjunct_factors_out_of_or_and_preserves_rows() {
 			.single_root()
 			.and_then(|root| predicate.node(root)),
 		Some(BoundExprNode::Binary {
-			op: toron::ir::BoundBinaryOp::Or,
+			op: BoundBinaryOp::Or,
 			..
 		})
 	));
+	assert!(
+		!program_contains_column_named(predicate, "id"),
+		"minimal residual must not repeat pushed id equality: {predicate:?}"
+	);
 	assert!(scan_pbc(scan).is_some());
 	assert_ids(sql, &[3]).await;
 }
 
 #[tokio::test]
-async fn where_common_pk_conjunct_across_or_uses_point_read_profile() {
+async fn where_common_pk_conjunct_minimal_residual_keeps_point_read_profile() {
 	let sql = "SELECT id FROM sales \
 		WHERE (id = 3 AND status LIKE 'c%') OR (id = 3 AND status LIKE 'x%')";
 	let bound = bind_sql(sql).await;
@@ -232,6 +236,53 @@ async fn where_common_pk_conjunct_across_or_uses_point_read_profile() {
 	};
 
 	assert_eq!(*profile_hint, toron::ir::QueryProfileHint::PointRead);
+}
+
+#[tokio::test]
+async fn where_multiple_common_factors_strip_from_each_or_branch() {
+	let sql = "SELECT id FROM sales \
+		WHERE (id = 6 AND amount = 7 AND status LIKE 'p%') \
+		   OR (id = 6 AND amount = 7 AND status LIKE 'z%')";
+	let bound = bind_sql(sql).await;
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::Or,
+			..
+		})
+	));
+	for column in ["id", "amount"] {
+		assert!(
+			!program_contains_column_named(predicate, column),
+			"minimal residual must not repeat pushed column {column:?}: {predicate:?}"
+		);
+	}
+	assert!(scan_pbc(scan).is_some());
+	assert_ids(sql, &[6]).await;
+}
+
+#[tokio::test]
+async fn where_common_factor_branch_strips_to_true_removes_residual_when_safe() {
+	let sql = "SELECT id FROM sales WHERE id = 3 OR (id = 3 AND status LIKE 'x%')";
+	let bound = bind_sql(sql).await;
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::FullyPushed);
+	assert!(
+		program_contains_column_named(predicate, "id"),
+		"fully pushed predicate should be the pushed id equality: {predicate:?}"
+	);
+	assert!(
+		!program_contains_column_named(predicate, "status"),
+		"branch stripped to TRUE should remove LIKE residual: {predicate:?}"
+	);
+	assert!(scan_pbc(scan).is_some());
+	assert_ids(sql, &[3]).await;
 }
 
 #[tokio::test]
@@ -247,7 +298,7 @@ async fn where_structurally_different_equivalent_terms_do_not_factor() {
 }
 
 #[tokio::test]
-async fn where_not_or_mixed_extracts_negated_pushable_branch_and_preserves_rows() {
+async fn where_not_or_minimal_residual_keeps_only_unpushed_branch_negations() {
 	let plan = sales_filter(Expr::Not(Box::new(Expr::Or(
 		Box::new(id_eq(3)),
 		Box::new(status_like("o%")),
@@ -258,12 +309,12 @@ async fn where_not_or_mixed_extracts_negated_pushable_branch_and_preserves_rows(
 	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
 	assert!(matches!(
 		predicate
-			.single_root()
-			.and_then(|root| predicate.node(root)),
-		Some(BoundExprNode::Unary {
-			op: toron::ir::BoundUnaryOp::Not,
-			..
-		})
+				.single_root()
+				.and_then(|root| predicate.node(root)),
+			Some(BoundExprNode::Unary {
+				op: BoundUnaryOp::Not,
+				input,
+			}) if matches!(predicate.node(*input), Some(BoundExprNode::Like { .. }))
 	));
 	let pbc = scan_pbc(scan).expect("PBC predicate");
 	assert_eq!(*pbc.last().expect("last opcode"), OP_NOT);
@@ -306,14 +357,17 @@ fn predicate_pushdown_3vl_property_random_rows_including_nulls() {
 		for r1 in values {
 			for r2 in values {
 				let original = k3_or(k3_and(p, r1), k3_and(p, r2));
-				assert_k3_split_identity("common OR factor", original, p, original);
+				assert_k3_split_identity("common OR factor", original, p, k3_or(r1, r2));
+
+				let original = k3_or(k3_and(p, r1), p);
+				assert_k3_split_identity("common OR branch strips to true", original, p, K3::True);
 
 				let original = k3_not(k3_or(p, r1));
-				assert_k3_split_identity("NOT(OR) single branch", original, k3_not(p), original);
+				assert_k3_split_identity("NOT(OR) single branch", original, k3_not(p), k3_not(r1));
 
 				let original = k3_not(k3_or(k3_or(p, r1), r2));
 				let pushed = k3_and(k3_not(p), k3_not(r1));
-				assert_k3_split_identity("NOT(OR) branch negations", original, pushed, original);
+				assert_k3_split_identity("NOT(OR) branch negations", original, pushed, k3_not(r2));
 
 				let original = k3_and(p, r1);
 				assert_k3_split_identity("top-level AND residual split", original, p, r1);
@@ -563,6 +617,13 @@ fn find_filter(
 		} => (predicate, disposition, input),
 		other => panic!("expected filter plan, got {other:?}"),
 	}
+}
+
+fn program_contains_column_named(program: &BoundExprProgram, name: &str) -> bool {
+	program
+		.nodes
+		.iter()
+		.any(|node| matches!(node, BoundExprNode::Column(column) if column.name.0 == name))
 }
 
 fn scan_pbc(plan: &ExecutionPlan) -> Option<&[u8]> {

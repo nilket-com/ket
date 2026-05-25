@@ -626,7 +626,7 @@ pub(crate) fn adr078_recursive_splitter_hosts_or_not_extraction_rules() {
 	assert!(partitioner.contains("split_boolean_tree(predicate, root)"));
 	assert!(partitioner.contains("legacy_top_level_and_partition(predicate)"));
 	assert!(splitter.contains("try_extract_common_or_factors(source, root)"));
-	assert!(splitter.contains("try_extract_not_or_branch_negations(source, *input)"));
+	assert!(splitter.contains("try_extract_not_or_branch_negations(source, root, *input)"));
 }
 
 #[test]
@@ -647,7 +647,7 @@ pub(crate) fn adr078_pushed_predicate_is_necessary_for_original() {
 	assert!(common.contains("necessary_candidates"));
 	assert!(common.contains("present_in_every_branch"));
 	assert!(common.contains("compile_pbc(&isolated).is_some()"));
-	assert!(not_or.contains("necessary_candidates"));
+	assert!(not_or.contains("pushed_negations"));
 	assert!(not_or.contains("build_negated_subgraph"));
 	assert!(not_or.contains("compile_pbc(&candidate).is_some()"));
 }
@@ -791,8 +791,12 @@ pub(crate) fn adr078_not_or_extracts_only_compilable_branch_negations() {
 
 	assert!(not_or.contains("build_negated_subgraph"));
 	assert!(not_or.contains("compile_pbc(&candidate).is_some()"));
-	assert!(not_or.contains("combine_bound_programs_as_and(necessary_candidates)"));
-	assert!(predicate_test.contains("where_not_or_mixed_extracts_negated_pushable_branch"));
+	assert!(not_or.contains("combine_bound_programs_as_and(pushed_negations)"));
+	assert!(not_or.contains("combine_bound_programs_as_and(residual_negations)"));
+	assert!(
+		predicate_test
+			.contains("where_not_or_minimal_residual_keeps_only_unpushed_branch_negations")
+	);
 }
 
 #[test]
@@ -863,7 +867,10 @@ pub(crate) fn adr078_factored_pushdown_drives_scan_profile() {
 			.expect("read predicate tests");
 
 	assert!(binder.contains("let profile_hint = scan_profile_hint(&pushed_predicate, input)"));
-	assert!(predicate_test.contains("where_common_pk_conjunct_across_or_uses_point_read_profile"));
+	assert!(
+		predicate_test
+			.contains("where_common_pk_conjunct_minimal_residual_keeps_point_read_profile")
+	);
 }
 
 #[test]
@@ -881,15 +888,148 @@ pub(crate) fn adr078_select_update_delete_share_boolean_factoring_path() {
 	assert!(binder.contains("plan_filter_with_predicate_pushdown(input, bound_predicate)"));
 	assert!(binder.contains("plan_filter_with_predicate_pushdown(scan, bound_predicate)"));
 	assert!(binder.contains("predicate_pushdown_plan(program, &scan)"));
-	assert!(predicate_test.contains("where_common_pushable_conjunct_factors_out_of_or"));
+	assert!(
+		predicate_test.contains("where_common_pushable_conjunct_factors_out_with_minimal_residual")
+	);
 	assert!(
 		update_test
-			.contains("update_not_or_extraction_uses_pushed_source_scan_plus_original_residual")
+			.contains("update_not_or_extraction_uses_pushed_source_scan_plus_minimal_residual")
 	);
 	assert!(
-		delete_test
-			.contains("delete_common_or_factor_uses_pushed_candidate_plus_original_residual")
+		delete_test.contains("delete_common_or_factor_uses_pushed_candidate_plus_minimal_residual")
 	);
+}
+
+#[test]
+pub(crate) fn adr094_common_or_factor_reconstructs_minimal_residual() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
+		.into_iter()
+		.next()
+		.expect("try_extract_common_or_factors body")
+		.1;
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(common.contains("branch_residuals"));
+	assert!(common.contains("let mut used = vec![false; terms.len()]"));
+	assert!(common.contains("combine_bound_conjuncts(source, &remaining)"));
+	assert!(common.contains("combine_bound_programs_as_or(branch_residuals)"));
+	assert!(common.contains("original_or_residual_factoring(source, root, pushed)"));
+	assert!(
+		predicate_test.contains("where_common_pushable_conjunct_factors_out_with_minimal_residual")
+	);
+	assert!(predicate_test.contains("where_multiple_common_factors_strip_from_each_or_branch"));
+}
+
+#[test]
+pub(crate) fn adr094_not_or_reconstructs_remaining_branch_negations() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let not_or = brace_blocks_after_marker(&binder, "fn try_extract_not_or_branch_negations")
+		.into_iter()
+		.next()
+		.expect("try_extract_not_or_branch_negations body")
+		.1;
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(not_or.contains("pushed_negations"));
+	assert!(not_or.contains("residual_negations"));
+	assert!(not_or.contains("compile_pbc(&candidate).is_some()"));
+	assert!(not_or.contains("combine_bound_programs_as_and(pushed_negations)"));
+	assert!(not_or.contains("combine_bound_programs_as_and(residual_negations)"));
+	assert!(not_or.contains("original_not_or_residual_factoring(source, not_root, pushed)"));
+	assert!(!not_or.contains("BoundBinaryOp::And"));
+	assert!(
+		predicate_test
+			.contains("where_not_or_minimal_residual_keeps_only_unpushed_branch_negations")
+	);
+}
+
+#[test]
+pub(crate) fn adr094_branch_strips_to_true_removes_common_or_residual() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
+		.into_iter()
+		.next()
+		.expect("try_extract_common_or_factors body")
+		.1;
+	let predicate_test =
+		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
+			.expect("read predicate tests");
+
+	assert!(common.contains("if remaining.is_empty()"));
+	assert!(common.contains("residual: None"));
+	assert!(
+		predicate_test
+			.contains("where_common_factor_branch_strips_to_true_removes_residual_when_safe")
+	);
+}
+
+#[test]
+pub(crate) fn adr094_minimal_residual_preserves_078_kleene_gate() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+
+	assert!(binder.contains("predicate_pushdown_emitted_splits_preserve_kleene_3vl"));
+	assert!(binder.contains("property_common_or_three_branch_program"));
+	assert!(binder.contains("property_or_branch_strips_to_true_program"));
+	assert!(binder.contains("property_not_or_partial_push_program"));
+	assert!(binder.contains("where_not_or_all_branch_negations_push_removes_residual"));
+}
+
+#[test]
+pub(crate) fn adr094_no_new_ir_sql_pbc_wendelon_surface() {
+	let manifest =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read manifest");
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read ir");
+	let execution_ir = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution ir");
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
+	let wendelon_pbc = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/pbc.rs"))
+		.expect("read Wendelon pbc");
+
+	for source in [&ir, &execution_ir] {
+		assert!(!source.contains("MinimalResidual"));
+		assert!(!source.contains("FactoredResidual"));
+		assert!(!source.contains("ResidualMinimization"));
+	}
+	assert!(!manifest.lines().any(|line| {
+		let line = line.trim_start();
+		line.starts_with("syn =") || line.starts_with("syn ")
+	}));
+	for marker in ["OP_BOOLEAN_FACTOR", "OP_DE_MORGAN", "OP_FACTOR_OR"] {
+		assert!(!pbc.contains(marker), "Toron PBC leaked opcode {marker}");
+		assert!(
+			!wendelon_pbc.contains(marker),
+			"Wendelon PBC leaked opcode {marker}"
+		);
+	}
+	for relative in [
+		"src/sql_planner.rs",
+		"src/sql_wire.rs",
+		"src/storage.rs",
+		"src/coordinator.rs",
+		"src/coordinator/delete.rs",
+		"src/coordinator/write.rs",
+		"src/exec.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir().join(relative)).expect("read source");
+		for marker in [
+			"ResidualMinimization",
+			"MinimalResidual",
+			"FactoredResidual",
+			"try_extract_common_or_factors",
+			"try_extract_not_or_branch_negations",
+		] {
+			assert!(!source.contains(marker), "{relative} leaked {marker}");
+		}
+	}
 }
 
 #[test]

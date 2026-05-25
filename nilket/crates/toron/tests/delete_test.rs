@@ -13,7 +13,9 @@ use toron::distributed::identity::QueryId;
 use toron::distributed::worker_registry::StaticWorkerRegistry;
 use toron::error::{QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
-use toron::ir::{BoundExprNode, ExecutionPlan, LogicalPlan, QueryProfileHint};
+use toron::ir::{
+	BoundExprNode, BoundExprProgram, ColumnOrdinal, ExecutionPlan, LogicalPlan, QueryProfileHint,
+};
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
@@ -146,7 +148,7 @@ async fn binder_delete_splits_pbc_conjunct_from_like_residual() {
 }
 
 #[tokio::test]
-async fn delete_common_or_factor_uses_pushed_candidate_plus_original_residual() {
+async fn delete_common_or_factor_uses_pushed_candidate_plus_minimal_residual() {
 	let catalog = people_catalog().await;
 	let plan = SqlPlanner::new()
 		.plan(
@@ -166,7 +168,7 @@ async fn delete_common_or_factor_uses_pushed_candidate_plus_original_residual() 
 	else {
 		panic!("expected delete execution plan");
 	};
-	let predicate = predicate.expect("original OR residual predicate");
+	let predicate = predicate.expect("minimal OR residual predicate");
 	assert!(pbc_program.is_some());
 	assert!(matches!(
 		predicate
@@ -177,6 +179,10 @@ async fn delete_common_or_factor_uses_pushed_candidate_plus_original_residual() 
 			..
 		})
 	));
+	assert!(
+		!program_contains_column(&predicate, ColumnOrdinal(0)),
+		"minimal residual must not repeat pushed id equality: {predicate:?}"
+	);
 }
 
 #[tokio::test]
@@ -571,6 +577,13 @@ fn int32_column(batch: &RecordBatch, index: usize) -> &Int32Array {
 		.as_any()
 		.downcast_ref::<Int32Array>()
 		.expect("Int32 column")
+}
+
+fn program_contains_column(program: &BoundExprProgram, ordinal: ColumnOrdinal) -> bool {
+	program
+		.nodes
+		.iter()
+		.any(|node| matches!(node, BoundExprNode::Column(column) if column.ordinal == ordinal))
 }
 
 #[allow(dead_code)]

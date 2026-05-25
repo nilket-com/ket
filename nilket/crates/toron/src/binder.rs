@@ -1249,11 +1249,8 @@ fn split_boolean_tree(
 			op: BoundBinaryOp::Or,
 			..
 		} => {
-			if let Some(necessary_candidates) = try_extract_common_or_factors(source, root)? {
-				return Ok(BooleanPredicateSplit {
-					pushed: Some(necessary_candidates),
-					residual: Some(isolate_bound_subgraph(source, root)?),
-				});
+			if let Some(split) = try_extract_common_or_factors(source, root)? {
+				return Ok(split);
 			}
 			Ok(BooleanPredicateSplit {
 				pushed: None,
@@ -1264,12 +1261,8 @@ fn split_boolean_tree(
 			op: BoundUnaryOp::Not,
 			input,
 		} => {
-			if let Some(necessary_candidates) = try_extract_not_or_branch_negations(source, *input)?
-			{
-				return Ok(BooleanPredicateSplit {
-					pushed: Some(necessary_candidates),
-					residual: Some(isolate_bound_subgraph(source, root)?),
-				});
+			if let Some(split) = try_extract_not_or_branch_negations(source, root, *input)? {
+				return Ok(split);
 			}
 			Ok(BooleanPredicateSplit {
 				pushed: None,
@@ -1310,7 +1303,7 @@ fn legacy_top_level_and_partition(
 fn try_extract_common_or_factors(
 	source: &BoundExprProgram,
 	root: BoundExprId,
-) -> Result<Option<BoundExprProgram>, BooleanSplitError> {
+) -> Result<Option<BooleanPredicateSplit>, BooleanSplitError> {
 	let mut branches = Vec::new();
 	collect_bound_or_branches(source, root, &mut branches)?;
 	if branches.len() < 2 {
@@ -1360,17 +1353,59 @@ fn try_extract_common_or_factors(
 		return Ok(None);
 	}
 
-	let pushed = necessary_candidates
-		.into_iter()
+	let pushed_programs = necessary_candidates
+		.iter()
+		.copied()
 		.map(|candidate| isolate_bound_subgraph(source, candidate))
 		.collect::<Result<Vec<_>, _>>()?;
-	combine_bound_programs_as_and(pushed)
+	let pushed =
+		combine_bound_programs_as_and(pushed_programs)?.ok_or(BooleanSplitError::Malformed)?;
+
+	let mut branch_residuals = Vec::with_capacity(branch_terms.len());
+	for terms in &branch_terms {
+		let mut used = vec![false; terms.len()];
+		for common in &necessary_candidates {
+			let Some(index) = terms.iter().enumerate().find_map(|(index, term)| {
+				(!used[index] && bound_subgraphs_structurally_equal(source, *common, *term))
+					.then_some(index)
+			}) else {
+				return original_or_residual_factoring(source, root, pushed);
+			};
+			used[index] = true;
+		}
+
+		let remaining = terms
+			.iter()
+			.enumerate()
+			.filter_map(|(index, term)| (!used[index]).then_some(*term))
+			.collect::<Vec<_>>();
+		if remaining.is_empty() {
+			return Ok(Some(BooleanPredicateSplit {
+				pushed: Some(pushed),
+				residual: None,
+			}));
+		}
+
+		let Some(branch) = combine_bound_conjuncts(source, &remaining) else {
+			return original_or_residual_factoring(source, root, pushed);
+		};
+		branch_residuals.push(branch);
+	}
+
+	let Ok(residual) = combine_bound_programs_as_or(branch_residuals) else {
+		return original_or_residual_factoring(source, root, pushed);
+	};
+	Ok(Some(BooleanPredicateSplit {
+		pushed: Some(pushed),
+		residual,
+	}))
 }
 
 fn try_extract_not_or_branch_negations(
 	source: &BoundExprProgram,
+	not_root: BoundExprId,
 	or_root: BoundExprId,
-) -> Result<Option<BoundExprProgram>, BooleanSplitError> {
+) -> Result<Option<BooleanPredicateSplit>, BooleanSplitError> {
 	if !matches!(
 		source.node(or_root),
 		Some(BoundExprNode::Binary {
@@ -1384,21 +1419,54 @@ fn try_extract_not_or_branch_negations(
 	let mut branches = Vec::new();
 	collect_bound_or_branches(source, or_root, &mut branches)?;
 
-	let mut necessary_candidates = Vec::new();
+	let mut pushed_negations = Vec::new();
+	let mut residual_negations = Vec::new();
 	for branch in branches {
 		let candidate = build_negated_subgraph(source, branch)?;
 		if compile_pbc(&candidate).is_some() {
-			necessary_candidates.push(candidate);
-			if necessary_candidates.len() > BOOLEAN_FACTOR_MAX_CANDIDATES {
+			pushed_negations.push(candidate);
+			if pushed_negations.len() > BOOLEAN_FACTOR_MAX_CANDIDATES {
 				return Err(BooleanSplitError::OverBudget);
 			}
+		} else {
+			residual_negations.push(candidate);
 		}
 	}
 
-	if necessary_candidates.is_empty() {
+	if pushed_negations.is_empty() {
 		return Ok(None);
 	}
-	combine_bound_programs_as_and(necessary_candidates)
+	let pushed =
+		combine_bound_programs_as_and(pushed_negations)?.ok_or(BooleanSplitError::Malformed)?;
+	let Ok(residual) = combine_bound_programs_as_and(residual_negations) else {
+		return original_not_or_residual_factoring(source, not_root, pushed);
+	};
+	Ok(Some(BooleanPredicateSplit {
+		pushed: Some(pushed),
+		residual,
+	}))
+}
+
+fn original_or_residual_factoring(
+	source: &BoundExprProgram,
+	root: BoundExprId,
+	pushed: BoundExprProgram,
+) -> Result<Option<BooleanPredicateSplit>, BooleanSplitError> {
+	Ok(Some(BooleanPredicateSplit {
+		pushed: Some(pushed),
+		residual: Some(isolate_bound_subgraph(source, root)?),
+	}))
+}
+
+fn original_not_or_residual_factoring(
+	source: &BoundExprProgram,
+	root: BoundExprId,
+	pushed: BoundExprProgram,
+) -> Result<Option<BooleanPredicateSplit>, BooleanSplitError> {
+	Ok(Some(BooleanPredicateSplit {
+		pushed: Some(pushed),
+		residual: Some(isolate_bound_subgraph(source, root)?),
+	}))
 }
 
 fn collect_bound_or_branches(
@@ -1477,6 +1545,19 @@ fn combine_bound_conjuncts(
 fn combine_bound_programs_as_and(
 	programs: Vec<BoundExprProgram>,
 ) -> Result<Option<BoundExprProgram>, BooleanSplitError> {
+	combine_bound_programs_as_binary(programs, BoundBinaryOp::And)
+}
+
+fn combine_bound_programs_as_or(
+	programs: Vec<BoundExprProgram>,
+) -> Result<Option<BoundExprProgram>, BooleanSplitError> {
+	combine_bound_programs_as_binary(programs, BoundBinaryOp::Or)
+}
+
+fn combine_bound_programs_as_binary(
+	programs: Vec<BoundExprProgram>,
+	op: BoundBinaryOp,
+) -> Result<Option<BoundExprProgram>, BooleanSplitError> {
 	let mut programs = programs.into_iter();
 	let Some(first_program) = programs.next() else {
 		return Ok(None);
@@ -1486,7 +1567,7 @@ fn combine_bound_programs_as_and(
 
 	for program in programs {
 		let next = clone_single_root_into_builder(&program, &mut builder)?;
-		combined = builder.append_binary(BoundBinaryOp::And, combined, next, DataType::Boolean);
+		combined = builder.append_binary(op.clone(), combined, next, DataType::Boolean);
 	}
 
 	builder.push_root(combined);
@@ -3814,7 +3895,10 @@ mod tests {
 	fn predicate_pushdown_emitted_splits_preserve_kleene_3vl() {
 		for program in [
 			property_common_or_factor_program(),
+			property_common_or_three_branch_program(),
+			property_or_branch_strips_to_true_program(),
 			property_not_or_program(),
+			property_not_or_partial_push_program(),
 			property_top_level_and_program(),
 		] {
 			let (pushed, residual) = partition_bound_predicate(&program).expect("predicate split");
@@ -3843,6 +3927,26 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn where_not_or_all_branch_negations_push_removes_residual() {
+		let mut builder = BoundExprProgramBuilder::new();
+		let p = builder.append_column(test_bool_column("p", 0, true));
+		let r1 = builder.append_column(test_bool_column("r1", 1, true));
+		let disjunction = builder.append_binary(BoundBinaryOp::Or, p, r1, DataType::Boolean);
+		let root = builder.append_unary(BoundUnaryOp::Not, disjunction, DataType::Boolean);
+		builder.push_root(root);
+		let program = builder.build();
+
+		let split = try_extract_not_or_branch_negations(&program, root, disjunction)
+			.expect("extract not-or")
+			.expect("all branch negations should push");
+		assert!(split.pushed.is_some());
+		assert!(
+			split.residual.is_none(),
+			"all pushed NOT(OR) branches must remove residual"
+		);
 	}
 
 	#[tokio::test]
@@ -4600,11 +4704,53 @@ mod tests {
 		builder.build()
 	}
 
+	fn property_common_or_three_branch_program() -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let p_left = builder.append_column(test_bool_column("p", 0, true));
+		let r1_left = builder.append_column(test_bool_column("r1", 1, false));
+		let left = builder.append_binary(BoundBinaryOp::And, p_left, r1_left, DataType::Boolean);
+		let p_middle = builder.append_column(test_bool_column("p", 0, true));
+		let r2 = builder.append_column(test_bool_column("r2", 2, false));
+		let middle = builder.append_binary(BoundBinaryOp::And, p_middle, r2, DataType::Boolean);
+		let p_right = builder.append_column(test_bool_column("p", 0, true));
+		let r1_right = builder.append_column(test_bool_column("r1", 1, false));
+		let right = builder.append_binary(BoundBinaryOp::And, p_right, r1_right, DataType::Boolean);
+		let left_or_middle =
+			builder.append_binary(BoundBinaryOp::Or, left, middle, DataType::Boolean);
+		let root =
+			builder.append_binary(BoundBinaryOp::Or, left_or_middle, right, DataType::Boolean);
+		builder.push_root(root);
+		builder.build()
+	}
+
+	fn property_or_branch_strips_to_true_program() -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let p_left = builder.append_column(test_bool_column("p", 0, true));
+		let r1 = builder.append_column(test_bool_column("r1", 1, false));
+		let left = builder.append_binary(BoundBinaryOp::And, p_left, r1, DataType::Boolean);
+		let right = builder.append_column(test_bool_column("p", 0, true));
+		let root = builder.append_binary(BoundBinaryOp::Or, left, right, DataType::Boolean);
+		builder.push_root(root);
+		builder.build()
+	}
+
 	fn property_not_or_program() -> BoundExprProgram {
 		let mut builder = BoundExprProgramBuilder::new();
 		let p = builder.append_column(test_bool_column("p", 0, true));
 		let r1 = builder.append_column(test_bool_column("r1", 1, false));
 		let disjunction = builder.append_binary(BoundBinaryOp::Or, p, r1, DataType::Boolean);
+		let root = builder.append_unary(BoundUnaryOp::Not, disjunction, DataType::Boolean);
+		builder.push_root(root);
+		builder.build()
+	}
+
+	fn property_not_or_partial_push_program() -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let p = builder.append_column(test_bool_column("p", 0, true));
+		let r1 = builder.append_column(test_bool_column("r1", 1, true));
+		let r2 = builder.append_column(test_bool_column("r2", 2, false));
+		let left = builder.append_binary(BoundBinaryOp::Or, p, r1, DataType::Boolean);
+		let disjunction = builder.append_binary(BoundBinaryOp::Or, left, r2, DataType::Boolean);
 		let root = builder.append_unary(BoundUnaryOp::Not, disjunction, DataType::Boolean);
 		builder.push_root(root);
 		builder.build()

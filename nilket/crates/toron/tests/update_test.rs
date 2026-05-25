@@ -15,8 +15,9 @@ use toron::distributed::identity::QueryId;
 use toron::error::{BindingError, QueryError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	BoundExprNode, ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan, Expr, FilterDisposition,
-	LogicalPlan, QueryProfileHint, ScalarValue, SessionId, TableId,
+	BoundExprNode, BoundExprProgram, BoundUnaryOp, ColumnOrdinal, CreateTableRowIdentity,
+	ExecutionPlan, Expr, FilterDisposition, LogicalPlan, QueryProfileHint, ScalarValue, SessionId,
+	TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
@@ -338,7 +339,7 @@ async fn binder_update_splits_pbc_conjunct_from_like_residual() {
 }
 
 #[tokio::test]
-async fn update_not_or_extraction_uses_pushed_source_scan_plus_original_residual() {
+async fn update_not_or_extraction_uses_pushed_source_scan_plus_minimal_residual() {
 	let (catalog, _) = pk_catalog(people_schema(true)).await;
 	let plan = LogicalPlan::Update {
 		table: TableRef::new("people"),
@@ -384,10 +385,14 @@ async fn update_not_or_extraction_uses_pushed_source_scan_plus_original_residual
 			.single_root()
 			.and_then(|root| predicate.node(root)),
 		Some(BoundExprNode::Unary {
-			op: toron::ir::BoundUnaryOp::Not,
-			..
-		})
+			op: BoundUnaryOp::Not,
+			input,
+		}) if matches!(predicate.node(*input), Some(BoundExprNode::Like { .. }))
 	));
+	assert!(
+		!program_contains_column(predicate, ColumnOrdinal(0)),
+		"minimal residual must not repeat pushed id equality: {predicate:?}"
+	);
 	let ExecutionPlan::Scan {
 		pbc_program,
 		profile_hint,
@@ -923,6 +928,13 @@ async fn pk_catalog(schema: SchemaRef) -> (MockCatalog, TableBinding) {
 		.expect("create primary-key table")
 		.binding;
 	(catalog, binding)
+}
+
+fn program_contains_column(program: &BoundExprProgram, ordinal: ColumnOrdinal) -> bool {
+	program
+		.nodes
+		.iter()
+		.any(|node| matches!(node, BoundExprNode::Column(column) if column.ordinal == ordinal))
 }
 
 async fn append_only_catalog() -> MockCatalog {
