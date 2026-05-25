@@ -71,8 +71,9 @@ fn conjunct_is_error_free(program: &BoundExprProgram, node: BoundExprId) -> bool
 `refinement_nested_and_safe_conjunct_elides`; `static_false_and_safe_sibling_elides` (`1 = 0 AND active`);
 `non_nullable_is_null_and_safe_sibling_elides`; `refinement_and_overlapping_conjunct_does_not_elide`;
 **`refinement_and_strict_cast_sibling_does_not_elide`** (assert **no** `EmptyRelation`, Filter kept);
-**`closed_false_and_strict_cast_sibling_does_not_elide_and_still_errors`** (assert runtime error
-preserved); `refinement_or_not_root_does_not_elide`; `and_with_unrefined_or_non_scan_conjunct_does_not_elide`;
+**`static_null_and_strict_cast_sibling_does_not_elide_and_still_errors`** (assert runtime error
+preserved where the existing non-elided path evaluates the sibling);
+`refinement_or_not_root_does_not_elide`; `and_with_unrefined_or_non_scan_conjunct_does_not_elide`;
 `count_star_over_and_elided_filter_returns_single_zero`.
 
 ## Phase 5 — Architecture guards
@@ -97,8 +98,9 @@ cargo test -p toron                                                             
 
 **Acceptance:** compound `AND` with a never-TRUE conjunct + error-free siblings elide to
 `EmptyRelation` (zero scan); strict-cast sibling / overlapping / `OR`/`NOT` / unrefined / non-scan do
-**not** elide (cast-sibling keeps the Filter + still errors where it did before); the wrapper feeds
-isolated conjuncts to one shared atom classifier (095 + 097); 095's no-recursive-`AND` guard
+**not** elide (cast-sibling keeps the Filter; error preservation is asserted where the existing
+non-elided path evaluates it); the wrapper feeds isolated conjuncts to one shared atom classifier
+(095 + 097); 095's no-recursive-`AND` guard
 retargeted (not red); 095 cardinality + error fences + 097 provenance hold; full suite green.
 
 ## Risks / notes
@@ -106,7 +108,8 @@ retargeted (not red); 095 cardinality + error fences + 097 provenance hold; full
 - **The eager-error fence is the soundness linchpin** — a never-TRUE conjunct must not erase a
   sibling's runtime error. Closed siblings are safe iff the closed-root classifier returns
   `AlwaysPass`/`AlwaysReject`; open siblings iff in the structural allowlist. Pin with the
-  strict-cast-sibling fixtures (plan-shape + error-preservation).
+  strict-cast-sibling fixtures (plan-shape + error-preservation on the `NULL AND strict_cast` path;
+  `FALSE AND strict_cast` may already be suppressed by the existing PBC false path after non-elision).
 - **Reuse, don't rewrite** — atom classifier internals unchanged (single-root); the wrapper isolates
   conjuncts via 094's helpers; 097's durable-registry + `Scan { projection: None }` provenance inherited
   per conjunct.

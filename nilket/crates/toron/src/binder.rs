@@ -1080,6 +1080,7 @@ const BOOLEAN_FACTOR_MAX_NODES: usize = 256;
 const BOOLEAN_FACTOR_MAX_OR_BRANCHES: usize = 16;
 const BOOLEAN_FACTOR_MAX_AND_TERMS_PER_BRANCH: usize = 16;
 const BOOLEAN_FACTOR_MAX_CANDIDATES: usize = 8;
+const STATIC_ELISION_MAX_AND_CONJUNCTS: usize = BOOLEAN_FACTOR_MAX_AND_TERMS_PER_BRANCH;
 
 fn attach_pbc_program(mut plan: ExecutionPlan, program: PbcProgram) -> (ExecutionPlan, bool) {
 	match &mut plan {
@@ -1183,6 +1184,17 @@ fn static_filter_class(
 	predicate: &BoundExprProgram,
 	logical_types: &LogicalTypeRegistry,
 ) -> StaticFilterClass {
+	if let Some(class) = static_filter_and_class(input, predicate, logical_types) {
+		return class;
+	}
+	static_filter_atom_class(input, predicate, logical_types)
+}
+
+fn static_filter_atom_class(
+	input: &ExecutionPlan,
+	predicate: &BoundExprProgram,
+	logical_types: &LogicalTypeRegistry,
+) -> StaticFilterClass {
 	if structural_non_nullable_is_null(predicate) {
 		return StaticFilterClass::AlwaysReject;
 	}
@@ -1196,6 +1208,109 @@ fn static_filter_class(
 		return closed_root_filter_class(predicate);
 	}
 	StaticFilterClass::Unknown
+}
+
+fn static_filter_and_class(
+	input: &ExecutionPlan,
+	predicate: &BoundExprProgram,
+	logical_types: &LogicalTypeRegistry,
+) -> Option<StaticFilterClass> {
+	let root = predicate.single_root()?;
+	if !matches!(
+		predicate.node(root),
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::And,
+			..
+		})
+	) {
+		return None;
+	}
+	let Ok(node_count) = count_bound_subgraph_nodes(predicate, root) else {
+		return Some(StaticFilterClass::Unknown);
+	};
+	if node_count > BOOLEAN_FACTOR_MAX_NODES {
+		return Some(StaticFilterClass::Unknown);
+	}
+
+	let mut conjuncts = Vec::new();
+	collect_top_level_bound_and(predicate, root, &mut conjuncts);
+	if conjuncts.len() > STATIC_ELISION_MAX_AND_CONJUNCTS {
+		return Some(StaticFilterClass::Unknown);
+	}
+
+	let mut found_reject = false;
+	for conjunct in conjuncts {
+		let Ok(isolated) = isolate_bound_subgraph(predicate, conjunct) else {
+			return Some(StaticFilterClass::Unknown);
+		};
+		match static_filter_atom_class(input, &isolated, logical_types) {
+			StaticFilterClass::AlwaysReject => found_reject = true,
+			StaticFilterClass::AlwaysPass | StaticFilterClass::Unknown => {
+				if !static_elision_error_free_conjunct(&isolated) {
+					return Some(StaticFilterClass::Unknown);
+				}
+			}
+		}
+	}
+
+	if found_reject {
+		Some(StaticFilterClass::AlwaysReject)
+	} else {
+		Some(StaticFilterClass::Unknown)
+	}
+}
+
+fn static_elision_error_free_conjunct(predicate: &BoundExprProgram) -> bool {
+	let Some(root) = predicate.single_root() else {
+		return false;
+	};
+	if !program_has_column_references(predicate) {
+		return !matches!(
+			closed_root_filter_class(predicate),
+			StaticFilterClass::Unknown
+		);
+	}
+	static_elision_error_free_node(predicate, root)
+}
+
+fn static_elision_error_free_node(predicate: &BoundExprProgram, id: BoundExprId) -> bool {
+	match predicate.node(id) {
+		Some(BoundExprNode::Column(_)) | Some(BoundExprNode::Literal(_)) => true,
+		Some(BoundExprNode::Binary {
+			op:
+				BoundBinaryOp::Eq
+				| BoundBinaryOp::Neq
+				| BoundBinaryOp::Lt
+				| BoundBinaryOp::Lte
+				| BoundBinaryOp::Gt
+				| BoundBinaryOp::Gte,
+			left,
+			right,
+		}) => {
+			static_elision_error_free_operand(predicate, *left)
+				&& static_elision_error_free_operand(predicate, *right)
+		}
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::And,
+			left,
+			right,
+		}) => {
+			static_elision_error_free_node(predicate, *left)
+				&& static_elision_error_free_node(predicate, *right)
+		}
+		Some(BoundExprNode::Unary {
+			op: BoundUnaryOp::IsNull | BoundUnaryOp::IsNotNull,
+			input,
+		}) => static_elision_error_free_operand(predicate, *input),
+		_ => false,
+	}
+}
+
+fn static_elision_error_free_operand(predicate: &BoundExprProgram, id: BoundExprId) -> bool {
+	matches!(
+		predicate.node(id),
+		Some(BoundExprNode::Column(_)) | Some(BoundExprNode::Literal(_))
+	)
 }
 
 fn structural_non_nullable_is_null(predicate: &BoundExprProgram) -> bool {

@@ -62,12 +62,14 @@ SQL grammar / logical-IR / execution-IR / executor / PBC / storage / Wendelon / 
 `non_nullable_is_null_and_safe_sibling_elides`;
 `refinement_and_overlapping_conjunct_does_not_elide` (`id = 5 AND active`);
 **`refinement_and_strict_cast_sibling_does_not_elide`** (`id = -5 AND CAST('x' AS INT) = 0` → assert
-**no** `EmptyRelation`); **`closed_false_and_strict_cast_sibling_does_not_elide_and_still_errors`** (the
-case whose non-elided plan errors today — assert the error is preserved); `refinement_or_not_root_does_not_elide`;
+**no** `EmptyRelation`); **`static_null_and_strict_cast_sibling_does_not_elide_and_still_errors`** (the
+case whose non-elided residual path errors today — assert the error is preserved);
+`refinement_or_not_root_does_not_elide`;
 `and_with_unrefined_or_non_scan_conjunct_does_not_elide` (097 provenance inherited per conjunct);
 `count_star_over_and_elided_filter_returns_single_zero` (095 cardinality fence). *(Testing nuance:
 assert plan-shape `no-EmptyRelation` as primary; assert runtime error only where the non-elided plan
-actually errors — the closed `FALSE AND strict_cast`.)*
+actually errors. `FALSE AND strict_cast` can be suppressed by the existing PBC false path, so the
+error-preservation fixture uses `NULL AND strict_cast`.)*
 
 ## Architecture guards
 
@@ -109,7 +111,8 @@ pinned `NOT` as unsafe. Migration:
 
 `id = -5 AND active` / `1 = 0 AND active` / nested-`AND` elide to `EmptyRelation` (zero scan);
 overlapping conjunct / `OR`/`NOT` root / unrefined or non-scan conjunct / **strict-cast sibling** do
-**not** elide (the cast-sibling stays a Filter and still errors where it did before); the wrapper feeds
-isolated conjuncts to one shared atom classifier (095 + 097); 095's no-recursive-`AND` guard
+**not** elide (the cast-sibling stays a Filter; error preservation is pinned where the existing
+non-elided path evaluates it); the wrapper feeds isolated conjuncts to one shared atom classifier
+(095 + 097); 095's no-recursive-`AND` guard
 retargeted in-change; 095 cardinality + error fences + 097 provenance hold; no surface change.
 Migration: `plans/impl/098_and_decomposition_static_elision.md`.

@@ -1255,16 +1255,24 @@ pub(crate) fn adr095_filter_elision_runs_before_pbc_pushdown() {
 #[test]
 pub(crate) fn adr095_static_filter_classifier_is_error_conservative() {
 	let binder = source("src/binder.rs");
-	let classifier = first_block(&binder, "fn static_filter_class");
+	let atom_classifier = first_block(&binder, "fn static_filter_atom_class");
+	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 	let closed_root = first_block(&binder, "fn closed_root_filter_class");
 	let structural_null = first_block(&binder, "fn structural_non_nullable_is_null");
 
-	assert!(classifier.contains("program_has_column_references"));
-	assert!(!classifier.contains("BoundBinaryOp::And"));
-	assert!(!classifier.contains("BoundBinaryOp::Or"));
-	assert!(!classifier.contains("BoundUnaryOp::Not"));
+	assert!(atom_classifier.contains("program_has_column_references"));
+	assert!(!atom_classifier.contains("BoundBinaryOp::And"));
+	assert!(!atom_classifier.contains("BoundBinaryOp::Or"));
+	assert!(!atom_classifier.contains("BoundUnaryOp::Not"));
+	assert!(and_classifier.contains("collect_top_level_bound_and"));
+	assert!(and_classifier.contains("op: BoundBinaryOp::And"));
+	assert!(!and_classifier.contains("BoundBinaryOp::Or"));
+	assert!(!and_classifier.contains("BoundUnaryOp::Not"));
 	assert!(closed_root.contains("evaluate_bound_program_without_storage"));
 	assert!(closed_root.matches("StaticFilterClass::Unknown").count() >= 4);
+	assert!(!closed_root.contains("BoundBinaryOp::And"));
+	assert!(!closed_root.contains("BoundBinaryOp::Or"));
+	assert!(!closed_root.contains("BoundUnaryOp::Not"));
 	assert!(structural_null.contains("BoundUnaryOp::IsNull"));
 	assert!(structural_null.contains("BoundExprNode::Column(column)"));
 	assert!(structural_null.contains("!column.nullable"));
@@ -1396,16 +1404,175 @@ pub(crate) fn adr097_refinement_elision_reuses_095_empty_relation() {
 #[test]
 pub(crate) fn adr097_static_filter_class_is_structural_3vl_and_error_conservative() {
 	let binder = source("src/binder.rs");
-	let classifier = first_block(&binder, "fn static_filter_class");
+	let atom_classifier = first_block(&binder, "fn static_filter_atom_class");
 	let refinement_helper = first_block(&binder, "fn refinement_static_filter_class");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
 
-	assert!(classifier.contains("structural_non_nullable_is_null(predicate)"));
-	assert!(classifier.contains("refinement_static_filter_class(input, predicate, logical_types)"));
+	assert!(atom_classifier.contains("structural_non_nullable_is_null(predicate)"));
+	assert!(
+		atom_classifier.contains("refinement_static_filter_class(input, predicate, logical_types)")
+	);
 	assert!(!refinement_helper.contains("evaluate_bound_program_without_storage"));
 	assert!(!refinement_helper.contains("predicate_pushdown_plan"));
 	assert!(!refinement_helper.contains("compile_pbc"));
 	assert!(!scan_atom.contains("Executor::"));
+}
+
+#[test]
+pub(crate) fn adr098_and_decomposition_runs_unified_atom_classifier() {
+	let binder = source("src/binder.rs");
+	let classifier = first_block(&binder, "fn static_filter_class");
+	let and_classifier = first_block(&binder, "fn static_filter_and_class");
+	let atom_classifier = first_block(&binder, "fn static_filter_atom_class");
+
+	assert!(classifier.contains("static_filter_and_class(input, predicate, logical_types)"));
+	assert!(classifier.contains("static_filter_atom_class(input, predicate, logical_types)"));
+	assert!(
+		and_classifier.contains("collect_top_level_bound_and(predicate, root, &mut conjuncts)")
+	);
+	assert!(and_classifier.contains("isolate_bound_subgraph(predicate, conjunct)"));
+	assert!(and_classifier.contains("static_filter_atom_class(input, &isolated, logical_types)"));
+	assert!(atom_classifier.contains("structural_non_nullable_is_null(predicate)"));
+	assert!(
+		atom_classifier.contains("refinement_static_filter_class(input, predicate, logical_types)")
+	);
+	assert!(atom_classifier.contains("closed_root_filter_class(predicate)"));
+}
+
+#[test]
+pub(crate) fn adr098_and_elision_requires_error_free_siblings() {
+	let binder = source("src/binder.rs");
+	let and_classifier = first_block(&binder, "fn static_filter_and_class");
+	let conjunct_checker = first_block(&binder, "fn static_elision_error_free_conjunct");
+	let node_checker = first_block(&binder, "fn static_elision_error_free_node");
+	let operand_checker = first_block(&binder, "fn static_elision_error_free_operand");
+
+	assert!(and_classifier.contains("count_bound_subgraph_nodes(predicate, root)"));
+	assert!(and_classifier.contains("BOOLEAN_FACTOR_MAX_NODES"));
+	assert!(and_classifier.contains("STATIC_ELISION_MAX_AND_CONJUNCTS"));
+	assert!(and_classifier.contains("static_elision_error_free_conjunct(&isolated)"));
+	assert!(conjunct_checker.contains("closed_root_filter_class(predicate)"));
+	assert!(conjunct_checker.contains("StaticFilterClass::Unknown"));
+	for marker in [
+		"BoundBinaryOp::Eq",
+		"BoundBinaryOp::Neq",
+		"BoundBinaryOp::Lt",
+		"BoundBinaryOp::Lte",
+		"BoundBinaryOp::Gt",
+		"BoundBinaryOp::Gte",
+		"op: BoundBinaryOp::And",
+		"BoundUnaryOp::IsNull | BoundUnaryOp::IsNotNull",
+		"_ => false",
+	] {
+		assert!(
+			node_checker.contains(marker),
+			"missing allowlist marker {marker}"
+		);
+	}
+	assert!(operand_checker.contains("BoundExprNode::Column(_)"));
+	assert!(operand_checker.contains("BoundExprNode::Literal(_)"));
+	for forbidden in [
+		"BoundBinaryOp::Or",
+		"BoundUnaryOp::Not",
+		"BoundBinaryOp::Add",
+		"BoundBinaryOp::Sub",
+		"BoundBinaryOp::Mul",
+		"BoundBinaryOp::Div",
+		"BoundExprNode::Cast",
+		"BoundExprNode::TryCast",
+		"BoundExprNode::InList",
+		"BoundExprNode::Like",
+	] {
+		assert!(
+			!node_checker.contains(forbidden),
+			"unsafe marker {forbidden} was allowlisted"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr098_and_decomposition_inherits_097_durable_registry_and_scan_provenance() {
+	let binder = source("src/binder.rs");
+	let and_classifier = first_block(&binder, "fn static_filter_and_class");
+	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+
+	assert!(and_classifier.contains("static_filter_atom_class(input, &isolated, logical_types)"));
+	assert!(scan_atom.contains("ExecutionPlan::Scan"));
+	assert!(scan_atom.contains("projection: None"));
+	assert!(scan_atom.contains("BoundExprNode::Column"));
+	assert!(scan_atom.contains("node_logical_type(column_node)"));
+	assert!(scan_atom.contains("logical_types.spec(logical_type)"));
+	assert!(!scan_atom.contains("logical_type_spec"));
+}
+
+#[test]
+pub(crate) fn adr098_and_elision_reuses_095_empty_relation_no_alwayspass() {
+	let binder = source("src/binder.rs");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+	let and_classifier = first_block(&binder, "fn static_filter_and_class");
+
+	assert!(filter_helper.contains("ExecutionPlan::EmptyRelation"));
+	assert!(filter_helper.contains("StaticFilterClass::AlwaysReject"));
+	assert!(!filter_helper.contains("StaticFilterClass::AlwaysPass"));
+	assert!(and_classifier.contains("StaticFilterClass::AlwaysPass | StaticFilterClass::Unknown"));
+	assert!(and_classifier.contains("Some(StaticFilterClass::Unknown)"));
+}
+
+#[test]
+pub(crate) fn adr098_no_boolean_algebra_beyond_and() {
+	let binder = source("src/binder.rs");
+	let and_classifier = first_block(&binder, "fn static_filter_and_class");
+	let node_checker = first_block(&binder, "fn static_elision_error_free_node");
+
+	assert!(and_classifier.contains("op: BoundBinaryOp::And"));
+	assert!(and_classifier.contains("collect_top_level_bound_and"));
+	assert!(node_checker.contains("op: BoundBinaryOp::And"));
+	for forbidden in [
+		"BoundBinaryOp::Or",
+		"BoundUnaryOp::Not",
+		"combine_bound_programs_as_or",
+		"try_extract_common_or_factors",
+		"try_extract_not_or_branch_negations",
+	] {
+		assert!(!and_classifier.contains(forbidden));
+		assert!(!node_checker.contains(forbidden));
+	}
+}
+
+#[test]
+pub(crate) fn adr098_no_wendelon_pbc_executor_storage_or_wire_change() {
+	let binder = source("src/binder.rs");
+	let pbc = source("src/pbc.rs");
+	let executor = source("src/exec.rs");
+	let storage = source("src/storage.rs");
+	let coordinator = source("src/coordinator.rs");
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("static_filter_and_class")
+				|| line.contains("static_filter_atom_class")
+				|| line.contains("static_elision_error_free")
+				|| line.contains("STATIC_ELISION_MAX_AND_CONJUNCTS")
+		})
+		.collect::<Vec<_>>();
+
+	for marker in [
+		"fn static_filter_and_class",
+		"fn static_filter_atom_class",
+		"fn static_elision_error_free_conjunct",
+		"STATIC_ELISION_MAX_AND_CONJUNCTS",
+	] {
+		assert!(binder.contains(marker));
+		assert!(!pbc.contains(marker));
+		assert!(!executor.contains(marker));
+		assert!(!storage.contains(marker));
+		assert!(!coordinator.contains(marker));
+	}
+	assert!(
+		wendelon_offenders.is_empty(),
+		"ADR098 helper leaked to Wendelon:\n{}",
+		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
+	);
 }
 
 #[test]

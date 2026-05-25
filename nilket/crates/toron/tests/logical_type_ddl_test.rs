@@ -1121,6 +1121,46 @@ async fn refined_positive_column_range_disjoint_elides() {
 }
 
 #[tokio::test]
+async fn refinement_and_safe_conjunct_elides_to_empty_relation() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT id FROM people WHERE id < 0 AND note = 'x'",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn refinement_nested_and_safe_conjunct_elides_to_empty_relation() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_logical(
+		&catalog,
+		people_filter(Expr::And(
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("note")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("x".to_string())))),
+			)),
+			Box::new(Expr::And(
+				Box::new(int64_lt("id", 0)),
+				Box::new(Expr::IsNull(Box::new(Expr::column("note")))),
+			)),
+		)),
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
 async fn refined_positive_column_overlapping_range_does_not_elide() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_person_id_people(&coordinator, &planner).await;
@@ -1128,11 +1168,91 @@ async fn refined_positive_column_overlapping_range_does_not_elide() {
 	for sql in [
 		"SELECT id FROM people WHERE id = 5",
 		"SELECT id FROM people WHERE id > 100",
+		"SELECT id FROM people WHERE id = 5 AND note = 'x'",
 	] {
 		let bound = bind_sql(&catalog, &planner, sql).await;
 		assert!(find_empty_relation(&bound).is_none(), "{sql}");
 		assert!(contains_scan(&bound), "{sql}");
 	}
+}
+
+#[tokio::test]
+async fn refinement_and_strict_cast_sibling_does_not_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_logical(
+		&catalog,
+		people_filter(Expr::And(
+			Box::new(int64_lt("id", 0)),
+			Box::new(Expr::Eq(
+				Box::new(Expr::Cast(
+					Box::new(Expr::Literal(ScalarValue::Float64(Some(2147483648.0)))),
+					DataType::Int32,
+				)),
+				Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+			)),
+		)),
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn refinement_or_not_root_still_do_not_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let or_bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT id FROM people WHERE id < 0 OR note = 'x'",
+	)
+	.await;
+	assert!(find_empty_relation(&or_bound).is_none());
+	assert!(contains_scan(&or_bound));
+
+	let not_bound = bind_logical(
+		&catalog,
+		people_filter(Expr::Not(Box::new(Expr::Gt(
+			Box::new(Expr::column("id")),
+			Box::new(Expr::Literal(ScalarValue::Int64(Some(0)))),
+		)))),
+	)
+	.await;
+	assert!(find_empty_relation(&not_bound).is_none());
+	assert!(contains_scan(&not_bound));
+}
+
+#[tokio::test]
+async fn refinement_and_non_receipt_shapes_do_not_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	let plan = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("people"),
+				projection: None,
+			}),
+			exprs: vec![Expr::column("id"), Expr::column("note")],
+			output_names: vec![Some("id".to_string()), Some("note".to_string())],
+		}),
+		predicate: Expr::And(
+			Box::new(int64_lt("id", 0)),
+			Box::new(Expr::Eq(
+				Box::new(Expr::column("note")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("x".to_string())))),
+			)),
+		),
+	};
+	let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind projected refined AND plan");
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
 }
 
 #[tokio::test]
@@ -1456,6 +1576,13 @@ fn people_filter(predicate: Expr) -> LogicalPlan {
 
 fn int64_eq(column: &str, value: i64) -> Expr {
 	Expr::Eq(
+		Box::new(Expr::column(column)),
+		Box::new(Expr::Literal(ScalarValue::Int64(Some(value)))),
+	)
+}
+
+fn int64_lt(column: &str, value: i64) -> Expr {
+	Expr::Lt(
 		Box::new(Expr::column(column)),
 		Box::new(Expr::Literal(ScalarValue::Int64(Some(value)))),
 	)

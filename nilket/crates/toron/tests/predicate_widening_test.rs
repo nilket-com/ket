@@ -393,20 +393,37 @@ async fn where_column_predicate_does_not_elide() {
 }
 
 #[tokio::test]
-async fn where_false_and_column_predicate_stays_out_of_scope() {
+async fn static_false_and_safe_column_elides_to_empty_relation() {
 	let plan = sales_filter(Expr::And(
 		Box::new(bool_lit(Some(false))),
 		Box::new(id_eq(5)),
 	));
 	let bound = bind_logical(&plan).await;
 
-	assert!(find_empty_relation(&bound).is_none());
-	let (_, _, scan) = find_filter(&bound);
-	assert!(matches!(scan, ExecutionPlan::Scan { .. }));
+	assert!(find_empty_relation(&bound).is_some());
 }
 
 #[tokio::test]
-async fn where_false_and_erroring_expression_does_not_elide() {
+async fn closed_null_and_safe_column_elides_to_empty_relation() {
+	let plan = sales_filter(Expr::And(Box::new(bool_lit(None)), Box::new(id_eq(5))));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_some());
+}
+
+#[tokio::test]
+async fn non_nullable_is_null_and_safe_column_elides_to_empty_relation() {
+	let plan = sales_filter(Expr::And(
+		Box::new(Expr::IsNull(Box::new(Expr::column("id")))),
+		Box::new(id_eq(5)),
+	));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_some());
+}
+
+#[tokio::test]
+async fn static_false_and_strict_cast_sibling_does_not_elide() {
 	let plan = sales_filter(Expr::And(
 		Box::new(bool_lit(Some(false))),
 		Box::new(Expr::Eq(
@@ -420,6 +437,33 @@ async fn where_false_and_erroring_expression_does_not_elide() {
 	let bound = bind_logical(&plan).await;
 
 	assert!(find_empty_relation(&bound).is_none());
+}
+
+#[tokio::test]
+async fn static_null_and_strict_cast_sibling_does_not_elide_and_still_errors() {
+	let plan = sales_filter(Expr::And(
+		Box::new(bool_lit(None)),
+		Box::new(Expr::Eq(
+			Box::new(Expr::Cast(
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(2147483648.0)))),
+				DataType::Int32,
+			)),
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
+		)),
+	));
+	let bound = bind_logical(&plan).await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	let err = Executor::new(Arc::new(InMemoryStorageScan {
+		table_data: sales_batch(schema()),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect_err("strict cast sibling should still execute and fail");
+	assert!(
+		format!("{err:?}").contains("cast failed"),
+		"unexpected error: {err:?}"
+	);
 }
 
 #[tokio::test]
@@ -487,6 +531,13 @@ async fn where_static_false_does_not_scan_storage() {
 #[tokio::test]
 async fn count_star_over_static_false_filter_returns_single_zero() {
 	let batches = execute_sql("SELECT COUNT(*) FROM sales WHERE 1 = 0").await;
+
+	assert_eq!(int64_values(&batches), vec![0]);
+}
+
+#[tokio::test]
+async fn count_star_over_and_elided_filter_returns_single_zero() {
+	let batches = execute_sql("SELECT COUNT(*) FROM sales WHERE 1 = 0 AND id = 5").await;
 
 	assert_eq!(int64_values(&batches), vec![0]);
 }
