@@ -56,6 +56,7 @@ use crate::network::transport::{
 	CapabilityResolver, EpochCapabilityResolver, MembershipEpoch, NodeCapability,
 	TransportProvider, TransportStream, TransportTier, TransportTierSet,
 };
+use crate::schema::table::decode_table_schema_descriptors;
 use crate::schema::table::encode_descriptor_wire_name;
 use crate::schema::{
 	CdcCheckpointMeta, CdcCursor, CdcDecodeError, CdcFrameMeta, CdcRejectMeta, CdcSubscribeBound,
@@ -66,7 +67,8 @@ use crate::schema::{
 	QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor,
 	STORAGE_ROW_KEY_ID_COLUMN, StateDigest, TableDeleteRowsRequestMeta,
 	TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
-	TableObjectId, TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
+	TableDescriptorListRequestMeta, TableDescriptorListResponseMeta, TableObjectId,
+	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
 	TableQueryRequestMeta, TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta,
 	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
 	column_projection_prefix_ranges, decode_table_schema_descriptor_v1, read_key_schema,
@@ -334,6 +336,12 @@ pub struct TableDeleteRowsResult {
 pub struct TableDescriptorGetResult {
 	pub response: TableDescriptorGetResponseMeta,
 	pub descriptor: Option<TableSchemaDescriptor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TableDescriptorListResult {
+	pub response: TableDescriptorListResponseMeta,
+	pub descriptors: Vec<TableSchemaDescriptor>,
 }
 
 #[derive(Clone, Debug)]
@@ -831,6 +839,70 @@ impl WendelonClient {
 		unreachable!("bounded retry loop must return within budget")
 	}
 
+	/// Fetch the latest authoritative table descriptors for a tenant
+	/// from the Control Ring leader.
+	pub async fn list_table_schema_descriptors(
+		&self,
+		tenant_id: TenantId,
+	) -> std::io::Result<Vec<TableSchemaDescriptor>> {
+		let request = TableDescriptorListRequestMeta { tenant_id };
+		let mut preferred_target = self.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = match preferred_target.or_else(|| self.leader()) {
+				Some(target) => target,
+				None => {
+					self.refresh_topology().await?;
+					self.leader().ok_or_else(|| {
+						Error::new(
+							ErrorKind::NotConnected,
+							"table descriptor list requires a known Control Ring leader",
+						)
+					})?
+				}
+			};
+			let result = self.table_descriptor_list_once(target, &request).await?;
+			if result.response.leader_hint.id != 0 {
+				*self.leader.write().unwrap() = Some(result.response.leader_hint);
+			}
+			match result.response.reason_code {
+				code if result.response.accepted == 1 && code == CONTROL_REASON_GRANTED => {
+					return Ok(result.descriptors);
+				}
+				CONTROL_REASON_NOT_LEADER => {
+					if attempt + 1 == DATA_RETRY_BUDGET {
+						return Err(Error::new(
+							ErrorKind::NotConnected,
+							"Wendelon table descriptor list retry budget exhausted",
+						));
+					}
+					let retry =
+						RetryDirective::redirect(nonzero_node_id(result.response.leader_hint));
+					self.prepare_retry(None, retry).await?;
+					preferred_target = retry.preferred_target.or_else(|| self.leader());
+				}
+				CONTROL_REASON_AUTHORIZATION_FAILED => {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"Wendelon table descriptor list authorization failed",
+					));
+				}
+				CONTROL_REASON_INVALID_CONFIG => {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"Wendelon table descriptor list request was invalid",
+					));
+				}
+				other => {
+					return Err(Error::new(
+						ErrorKind::Other,
+						format!("Wendelon table descriptor list failed: reason_code={other}"),
+					));
+				}
+			}
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
 	/// Fetch a tenant logical type definition by exact name from the
 	/// Control Ring leader.
 	pub async fn get_logical_type_definition(
@@ -1230,6 +1302,39 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 		let frame = read_frame(&mut *stream, &self.pool).await?;
 		decode_table_descriptor_get_response_frame(frame)
+	}
+
+	async fn table_descriptor_list_once(
+		&self,
+		target: NodeId,
+		request: &TableDescriptorListRequestMeta,
+	) -> std::io::Result<TableDescriptorListResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_DESCRIPTOR_LIST_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<TableDescriptorListRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(request),
+			None,
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_table_descriptor_list_response_frame(frame)
 	}
 
 	async fn logical_type_get_once(
@@ -2443,6 +2548,81 @@ fn decode_table_descriptor_get_response_frame(
 	})
 }
 
+fn decode_table_descriptor_list_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<TableDescriptorListResult> {
+	if frame.header.msg_type != MsgType::TABLE_DESCRIPTOR_LIST_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected TABLE_DESCRIPTOR_LIST_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() != std::mem::size_of::<TableDescriptorListResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_DESCRIPTOR_LIST_RESP meta size mismatch",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_DESCRIPTOR_LIST_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: TableDescriptorListResponseMeta = *bytemuck::from_bytes(
+		&frame.meta[..std::mem::size_of::<TableDescriptorListResponseMeta>()],
+	);
+	let descriptors = if response.accepted == 1 {
+		if response.reason_code != CONTROL_REASON_GRANTED {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_DESCRIPTOR_LIST_RESP accepted response must use granted reason",
+			));
+		}
+		let trailing = frame.trailing.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_DESCRIPTOR_LIST_RESP accepted response missing descriptors payload",
+			)
+		})?;
+		if response.descriptors_len as usize != trailing.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"TABLE_DESCRIPTOR_LIST_RESP descriptors_len mismatch: meta={} actual={}",
+					response.descriptors_len,
+					trailing.len()
+				),
+			));
+		}
+		decode_table_schema_descriptors(&trailing[..])?
+	} else {
+		if response.accepted != 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"TABLE_DESCRIPTOR_LIST_RESP invalid accepted value {}",
+					response.accepted
+				),
+			));
+		}
+		if response.descriptors_len != 0 || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_DESCRIPTOR_LIST_RESP rejected response must not carry descriptors payload",
+			));
+		}
+		Vec::new()
+	};
+	Ok(TableDescriptorListResult {
+		response,
+		descriptors,
+	})
+}
+
 fn decode_logical_type_get_response_frame(
 	frame: crate::network::core::HrftFrame,
 ) -> std::io::Result<LogicalTypeGetResult> {
@@ -2863,7 +3043,7 @@ mod tests {
 		ClientWriteId, ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicy,
 		PrimaryKeyDescriptorV1, ProjectionFunctionV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
-		encode_table_schema_descriptor_v1,
+		encode_table_schema_descriptor_v1, encode_table_schema_descriptors,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use async_trait::async_trait;
@@ -3257,6 +3437,92 @@ mod tests {
 		let err = decode_table_descriptor_get_response_frame(frame).unwrap_err();
 		assert_eq!(err.kind(), ErrorKind::InvalidData);
 		assert!(err.to_string().contains("descriptor_len mismatch"));
+	}
+
+	#[test]
+	fn client_list_table_schema_descriptors_decodes_descriptor_payload() {
+		let descriptor = table_query_descriptor(LocalityPolicy::default_table_spread());
+		let descriptors_bytes =
+			encode_table_schema_descriptors(std::slice::from_ref(&descriptor)).unwrap();
+		let pool = BufPool::new(2, 64 * 1024);
+		let mut meta_buf = pool.acquire();
+		let meta = TableDescriptorListResponseMeta {
+			accepted: 1,
+			reason_code: CONTROL_REASON_GRANTED,
+			_pad1: [0; 6],
+			leader_hint: NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			descriptors_len: descriptors_bytes.len() as u32,
+			_pad2: [0; 4],
+		};
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut trailing = pool.acquire();
+		trailing.as_mut_vec().extend_from_slice(&descriptors_bytes);
+		let frame = crate::network::core::HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_DESCRIPTOR_LIST_RESP.0,
+				flags: 0,
+				stream_id: 0,
+				meta_len: std::mem::size_of::<TableDescriptorListResponseMeta>() as u32,
+				arrow_len: 0,
+				trailing_len: descriptors_bytes.len() as u32,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: Some(trailing),
+		};
+
+		let result = decode_table_descriptor_list_response_frame(frame).unwrap();
+		assert_eq!(result.descriptors, vec![descriptor]);
+	}
+
+	#[test]
+	fn client_list_table_schema_descriptors_rejects_length_mismatch() {
+		let descriptor = table_query_descriptor(LocalityPolicy::default_table_spread());
+		let descriptors_bytes = encode_table_schema_descriptors(&[descriptor]).unwrap();
+		let pool = BufPool::new(2, 64 * 1024);
+		let mut meta_buf = pool.acquire();
+		let meta = TableDescriptorListResponseMeta {
+			accepted: 1,
+			reason_code: CONTROL_REASON_GRANTED,
+			_pad1: [0; 6],
+			leader_hint: NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			descriptors_len: descriptors_bytes.len() as u32 + 1,
+			_pad2: [0; 4],
+		};
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut trailing = pool.acquire();
+		trailing.as_mut_vec().extend_from_slice(&descriptors_bytes);
+		let frame = crate::network::core::HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_DESCRIPTOR_LIST_RESP.0,
+				flags: 0,
+				stream_id: 0,
+				meta_len: std::mem::size_of::<TableDescriptorListResponseMeta>() as u32,
+				arrow_len: 0,
+				trailing_len: descriptors_bytes.len() as u32,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: Some(trailing),
+		};
+
+		let err = decode_table_descriptor_list_response_frame(frame).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(err.to_string().contains("descriptors_len mismatch"));
 	}
 
 	#[tokio::test]

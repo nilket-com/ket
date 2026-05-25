@@ -6276,7 +6276,15 @@ fn adr072_control_descriptor_get_handler_region(control: &str) -> &str {
 	source_region(
 		control,
 		"async fn handle_table_descriptor_get",
-		"async fn run_table_schema_drop",
+		"async fn handle_table_descriptor_list",
+	)
+}
+
+fn adr102_control_descriptor_list_handler_region(control: &str) -> &str {
+	source_region(
+		control,
+		"async fn handle_table_descriptor_list",
+		"async fn handle_logical_type_get",
 	)
 }
 
@@ -6293,12 +6301,18 @@ fn adr072_descriptor_get_msg_types_are_unique() {
 	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
 	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_GET_REQ: Self = Self(0x3C);"));
 	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_GET_RESP: Self = Self(0x3D);"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_REQ: Self = Self(0x44);"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45);"));
 	assert_eq!(schema_core.matches("Self(0x3C)").count(), 1);
 	assert_eq!(schema_core.matches("Self(0x3D)").count(), 1);
+	assert_eq!(schema_core.matches("Self(0x44)").count(), 1);
+	assert_eq!(schema_core.matches("Self(0x45)").count(), 1);
 
 	let router = read_workspace("crates/wendelon/src/network/router.rs");
 	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_REQ.0"));
 	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_RESP.0"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_REQ.0"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_RESP.0"));
 }
 
 #[test]
@@ -6448,6 +6462,36 @@ fn adr072_no_data_ring_or_bulk_or_object_id_descriptor_lookup() {
 	assert!(!handler.contains("descriptors_for_tenant"));
 	assert!(!handler.contains("latest_by_id"));
 	assert!(!handler.contains("table_object_id"));
+}
+
+#[test]
+fn adr102_descriptor_list_surface_is_latest_only_metadata() {
+	let schema_core = read_workspace("crates/wendelon/src/schema/core.rs");
+	let table_schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
+	let client = read_workspace("crates/wendelon/src/client/core.rs");
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let handler = adr102_control_descriptor_list_handler_region(&control);
+
+	assert!(schema_core.contains("pub struct TableDescriptorListRequestMeta"));
+	assert!(schema_core.contains("pub struct TableDescriptorListResponseMeta"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_REQ: Self = Self(0x44);"));
+	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45);"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_REQ.0"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_RESP.0"));
+	assert!(client.contains("pub async fn list_table_schema_descriptors"));
+	assert!(client.contains("decode_table_schema_descriptors(&trailing[..])"));
+	assert!(table_schema.contains("pub fn latest_descriptors_for_tenant"));
+	assert!(handler.contains(".latest_descriptors_for_tenant("));
+	assert!(!handler.contains(".descriptors_for_tenant("));
+	assert!(handler.contains("self.state_machine.state_snapshot().await"));
+	assert!(handler.contains("authorize_descriptor_get_actor"));
+	assert!(handler.contains("CONTROL_REASON_NOT_LEADER"));
+	assert!(handler.contains("encode_table_schema_descriptors(&descriptors)"));
+	assert!(!data_server.contains("TABLE_DESCRIPTOR_LIST"));
+	assert!(!handler.contains("Pbc"));
+	assert!(!handler.contains("scan"));
 }
 
 #[test]

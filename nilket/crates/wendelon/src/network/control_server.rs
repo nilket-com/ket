@@ -38,15 +38,16 @@ use crate::network::transport::{
 	TransportTierSet,
 };
 use crate::network::wire;
-use crate::schema::table::decode_descriptor_wire_name;
+use crate::schema::table::{decode_descriptor_wire_name, encode_table_schema_descriptors};
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
 	LeaseDescriptor, LeaseStatus, LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta,
 	LogicalTypeListRequestMeta, LogicalTypeListResponseMeta, MsgType, NodeId, PolicyGeneration,
 	ProtocolVersionWindow, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta,
-	TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta, TableObjectId,
-	TableRetentionPolicy, TableSchemaDescriptor, TenantId, TenantKekId, TransferToken,
-	decode_table_schema_descriptor_v1, encode_table_schema_descriptor_v1, epoch_entry_var_schema,
+	TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta, TableDescriptorListRequestMeta,
+	TableDescriptorListResponseMeta, TableObjectId, TableRetentionPolicy, TableSchemaDescriptor,
+	TenantId, TenantKekId, TransferToken, decode_table_schema_descriptor_v1,
+	encode_table_schema_descriptor_v1, epoch_entry_var_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -500,6 +501,38 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn build_table_descriptor_list_frame(
+		&self,
+		stream_id: u32,
+		meta: TableDescriptorListResponseMeta,
+		descriptors: Option<&[u8]>,
+	) -> std::io::Result<HrftFrame> {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let trailing = descriptors.map(|bytes| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec().extend_from_slice(bytes);
+			buf
+		});
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_DESCRIPTOR_LIST_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0),
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing,
+		})
+	}
+
 	fn build_logical_type_get_frame(
 		&self,
 		stream_id: u32,
@@ -658,6 +691,29 @@ impl WendelonControlServer {
 					_reserved: 0,
 				}),
 				descriptor_len: 0,
+				_pad2: [0; 4],
+			},
+			None,
+		)
+	}
+
+	fn table_descriptor_list_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		self.build_table_descriptor_list_frame(
+			frame.header.stream_id,
+			TableDescriptorListResponseMeta {
+				accepted: 0,
+				reason_code,
+				_pad1: [0; 6],
+				leader_hint: leader_hint.unwrap_or(NodeId {
+					id: 0,
+					_reserved: 0,
+				}),
+				descriptors_len: 0,
 				_pad2: [0; 4],
 			},
 			None,
@@ -1417,6 +1473,73 @@ impl WendelonControlServer {
 				_pad2: [0; 4],
 			},
 			Some(&descriptor_bytes),
+		)
+	}
+
+	async fn handle_table_descriptor_list(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return self.table_descriptor_list_rejection(
+				&frame,
+				CONTROL_REASON_INVALID_CONFIG,
+				None,
+			);
+		}
+
+		let raw_meta: TableDescriptorListRequestMeta =
+			if frame.meta.len() == std::mem::size_of::<TableDescriptorListRequestMeta>() {
+				*bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<TableDescriptorListRequestMeta>()],
+				)
+			} else {
+				return self.table_descriptor_list_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					None,
+				);
+			};
+		if Self::authorize_descriptor_get_actor(&context.actor, raw_meta.tenant_id).is_err() {
+			return self.table_descriptor_list_rejection(
+				&frame,
+				CONTROL_REASON_AUTHORIZATION_FAILED,
+				None,
+			);
+		}
+		if !self.is_leader().await {
+			return self.table_descriptor_list_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+
+		let snapshot = self.state_machine.state_snapshot().await;
+		let descriptors = snapshot
+			.table_schemas
+			.latest_descriptors_for_tenant(raw_meta.tenant_id);
+		let descriptors_bytes = encode_table_schema_descriptors(&descriptors)?;
+		let descriptors_len = u32::try_from(descriptors_bytes.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"encoded table descriptors exceed u32 wire length",
+			)
+		})?;
+		self.build_table_descriptor_list_frame(
+			frame.header.stream_id,
+			TableDescriptorListResponseMeta {
+				accepted: 1,
+				reason_code: CONTROL_REASON_GRANTED,
+				_pad1: [0; 6],
+				leader_hint: self.local_node,
+				descriptors_len,
+				_pad2: [0; 4],
+			},
+			Some(&descriptors_bytes),
 		)
 	}
 
@@ -3445,6 +3568,9 @@ impl ControlRingServer for WendelonControlServer {
 			}
 			MsgType::TABLE_DESCRIPTOR_GET_REQ => {
 				self.handle_table_descriptor_get(&context, frame).await?
+			}
+			MsgType::TABLE_DESCRIPTOR_LIST_REQ => {
+				self.handle_table_descriptor_list(&context, frame).await?
 			}
 			MsgType::LOGICAL_TYPE_GET_REQ => self.handle_logical_type_get(&context, frame).await?,
 			MsgType::LOGICAL_TYPE_LIST_REQ => {

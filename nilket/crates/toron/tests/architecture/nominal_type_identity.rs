@@ -56,6 +56,16 @@ fn wendelon_raft_storage_source() -> String {
 		.expect("read Wendelon raft storage source")
 }
 
+fn wendelon_control_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/network/control_server.rs"))
+		.expect("read Wendelon control server source")
+}
+
+fn wendelon_client_core_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/client/core.rs"))
+		.expect("read Wendelon client core source")
+}
+
 fn storage_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage source")
 }
@@ -952,7 +962,6 @@ pub(crate) fn adr099_system_table_is_coordinator_local_scalar_rows() {
 	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
 
 	assert!(system_kind.contains("InformationSchemaLogicalTypes"));
-	assert_eq!(enum_variant_count(&system_kind), 1);
 	assert!(execution_plan.contains("SystemTable {"));
 	assert!(execution_plan.contains("rows: Vec<Vec<ScalarValue>>"));
 	assert!(exec.contains("ExecutionPlan::SystemTable { schema, rows, .. }"));
@@ -1029,27 +1038,101 @@ pub(crate) fn adr099_no_wendelon_pbc_wire_or_storage_surface() {
 	let binder = binder_source();
 	let storage = storage_source();
 	let pbc = pbc_source();
-	let wendelon_compute = wendelon_compute_source();
-	let wendelon_table = wendelon_table_source();
 
 	assert!(binder.contains("information_schema.logical_types"));
-	for source in [storage, pbc, wendelon_compute, wendelon_table] {
+	for source in [storage, pbc] {
 		assert!(!source.contains("information_schema.logical_types"));
 		assert!(!source.contains("InformationSchemaLogicalTypes"));
 	}
 }
 
 #[test]
-pub(crate) fn adr099_scoped_to_logical_types_only() {
+pub(crate) fn adr102_system_table_kind_has_finite_introspection_family() {
 	let execution = execution_source();
-	let binder = binder_source();
 	let system_kind = source_block(&execution, "pub enum SystemTableKind");
+
+	assert_eq!(enum_variant_count(&system_kind), 3);
+	assert!(system_kind.contains("InformationSchemaLogicalTypes"));
+	assert!(system_kind.contains("InformationSchemaTables"));
+	assert!(system_kind.contains("InformationSchemaColumns"));
+	assert!(!system_kind.contains("VirtualTable"));
+	assert!(!system_kind.contains("SystemTableRegistry"));
+}
+
+#[test]
+pub(crate) fn adr102_information_schema_dispatch_is_explicit() {
+	let binder = binder_source();
 	let bind_relation = source_block(&binder, "async fn bind_information_schema_relation");
 
-	assert_eq!(enum_variant_count(&system_kind), 1);
-	assert!(system_kind.contains("InformationSchemaLogicalTypes"));
-	assert!(bind_relation.contains("logical_types"));
+	assert!(
+		binder.contains("const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = \"logical_types\"")
+	);
+	assert!(binder.contains("const INFORMATION_SCHEMA_TABLES_TABLE: &str = \"tables\""));
+	assert!(binder.contains("const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = \"columns\""));
+	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE)"));
+	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_TABLES_TABLE)"));
+	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_COLUMNS_TABLE)"));
 	assert!(bind_relation.contains("unknown information_schema relation"));
-	assert!(!system_kind.contains("Tables"));
-	assert!(!system_kind.contains("Columns"));
+	assert!(!bind_relation.contains("HashMap"));
+	assert!(!bind_relation.contains("SystemTableRegistry"));
+}
+
+#[test]
+pub(crate) fn adr102_table_descriptor_refresh_is_authoritative() {
+	let catalog = catalog_source();
+	let client = wendelon_client_core_source();
+	let wendelon_table = wendelon_table_source();
+	let control = wendelon_control_source();
+	let wendelon_catalog = source_block(&catalog, "impl Catalog for WendelonCatalog");
+	let refresh = source_block(
+		&wendelon_catalog,
+		"async fn refreshed_table_schema_descriptors",
+	);
+
+	assert!(catalog.contains("async fn refreshed_table_schema_descriptors"));
+	assert!(catalog.contains("async fn list_table_schema_descriptors"));
+	assert!(catalog.contains("sync_latest_descriptor_for_tenant"));
+	assert!(refresh.contains("self.refreshed_logical_type_registry().await?"));
+	assert!(refresh.contains(".list_table_schema_descriptors"));
+	assert!(refresh.contains("CatalogError::AdminFailed"));
+	assert!(client.contains("pub async fn list_table_schema_descriptors"));
+	assert!(wendelon_table.contains("pub fn latest_descriptors_for_tenant"));
+	assert!(wendelon_table.contains("latest_by_name"));
+	assert!(control.contains(".latest_descriptors_for_tenant("));
+	assert!(!control.contains(".descriptors_for_tenant("));
+}
+
+#[test]
+pub(crate) fn adr102_columns_decode_logical_types_after_refresh() {
+	let binder = binder_source();
+	let bind_relation = source_block(&binder, "async fn bind_information_schema_relation");
+	let column_rows = source_block(&binder, "fn information_schema_column_rows");
+	let display = source_block(&binder, "fn logical_type_display_name");
+
+	assert!(bind_relation.contains("refreshed_table_schema_descriptors().await?"));
+	assert!(bind_relation.contains("let logical_types = self.catalog.logical_type_registry();"));
+	assert!(column_rows.contains(".arrow_schema()"));
+	assert!(column_rows.contains("logical_type_display_name(field, logical_types)?"));
+	assert!(display.contains("decode_column_logical_type_with_resolver"));
+	assert!(display.contains("LogicalTypeResolver::with_registry(logical_types)"));
+	assert!(!display.contains("CUSTOMER_ID_LOGICAL_TYPE"));
+}
+
+#[test]
+pub(crate) fn adr102_system_table_execution_stays_coordinator_local() {
+	let execution = execution_source();
+	let exec = exec_source();
+	let storage = storage_source();
+	let pbc = pbc_source();
+
+	assert!(execution.contains("InformationSchemaTables"));
+	assert!(execution.contains("InformationSchemaColumns"));
+	assert!(exec.contains("ExecutionPlan::SystemTable { schema, rows, .. }"));
+	assert!(exec.contains("materialize_scalar_rows(schema, rows)"));
+	for source in [exec, storage, pbc] {
+		assert!(!source.contains("list_table_schema_descriptors"));
+		assert!(!source.contains("latest_descriptors_for_tenant"));
+		assert!(!source.contains("InformationSchemaTables"));
+		assert!(!source.contains("InformationSchemaColumns"));
+	}
 }

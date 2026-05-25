@@ -1631,6 +1631,83 @@ pub fn decode_table_schema_descriptor_v1(bytes: &[u8]) -> std::io::Result<TableS
 	Ok(descriptor)
 }
 
+pub fn encode_table_schema_descriptors(
+	descriptors: &[TableSchemaDescriptor],
+) -> std::io::Result<Vec<u8>> {
+	let count = u32::try_from(descriptors.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"table descriptor list exceeds u32 count",
+		)
+	})?;
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(&count.to_le_bytes());
+	for descriptor in descriptors {
+		let descriptor_bytes = encode_table_schema_descriptor_v1(descriptor)?;
+		let descriptor_len = u32::try_from(descriptor_bytes.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"encoded table descriptor exceeds u32 list element length",
+			)
+		})?;
+		bytes.extend_from_slice(&descriptor_len.to_le_bytes());
+		bytes.extend_from_slice(&descriptor_bytes);
+	}
+	Ok(bytes)
+}
+
+pub fn decode_table_schema_descriptors(
+	bytes: &[u8],
+) -> std::io::Result<Vec<TableSchemaDescriptor>> {
+	let mut offset = 0usize;
+	let count = read_descriptor_list_u32(bytes, &mut offset, "descriptor count")?;
+	let mut descriptors = Vec::with_capacity(count as usize);
+	for _ in 0..count {
+		let descriptor_len = read_descriptor_list_u32(bytes, &mut offset, "descriptor length")?;
+		let descriptor_len = descriptor_len as usize;
+		let end = offset.checked_add(descriptor_len).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"table descriptor list element length overflow",
+			)
+		})?;
+		if end > bytes.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"table descriptor list element length exceeds payload",
+			));
+		}
+		descriptors.push(decode_table_schema_descriptor_v1(&bytes[offset..end])?);
+		offset = end;
+	}
+	if offset != bytes.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"table descriptor list has trailing bytes",
+		));
+	}
+	Ok(descriptors)
+}
+
+fn read_descriptor_list_u32(bytes: &[u8], offset: &mut usize, label: &str) -> std::io::Result<u32> {
+	let end = offset.checked_add(4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("table descriptor list {label} offset overflow"),
+		)
+	})?;
+	if end > bytes.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("table descriptor list missing {label}"),
+		));
+	}
+	let mut raw = [0u8; 4];
+	raw.copy_from_slice(&bytes[*offset..end]);
+	*offset = end;
+	Ok(u32::from_le_bytes(raw))
+}
+
 pub fn validate_table_schema_evolution(
 	previous: &TableSchemaDescriptor,
 	next: &TableSchemaDescriptor,
@@ -2240,6 +2317,15 @@ impl TableSchemaCatalogV1 {
 		self.by_id
 			.range(start..=end)
 			.map(|(_, descriptor)| descriptor.clone())
+			.collect()
+	}
+
+	pub fn latest_descriptors_for_tenant(&self, tenant_id: TenantId) -> Vec<TableSchemaDescriptor> {
+		self.latest_by_name
+			.iter()
+			.filter(|(name_key, _)| name_key.tenant_id == tenant_id)
+			.filter_map(|(_, schema_key)| self.by_id.get(schema_key))
+			.cloned()
 			.collect()
 	}
 
@@ -5147,6 +5233,72 @@ mod tests {
 			catalog.latest_by_name(tenant, "analytics", "events"),
 			Some(&newest)
 		);
+	}
+
+	#[test]
+	fn catalog_latest_descriptors_for_tenant_is_latest_name_bound() {
+		let tenant = TenantId::new(9);
+		let old = descriptor_for_generation(&table_schema(DataType::Int64, false), 1);
+		let latest = descriptor_for_generation(&table_schema(DataType::Int64, false), 2);
+		let other = TableSchemaDescriptor::new(
+			TableObjectId::new([8; 16]),
+			1,
+			"analytics",
+			"customers",
+			&table_schema(DataType::Int64, false),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let tenant_two = TableSchemaDescriptor::new(
+			TableObjectId::new([9; 16]),
+			1,
+			"analytics",
+			"events",
+			&table_schema(DataType::Int64, false),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant, old).unwrap();
+		catalog.upsert(tenant, latest.clone()).unwrap();
+		catalog.upsert(tenant, other.clone()).unwrap();
+		catalog.upsert(TenantId::new(10), tenant_two).unwrap();
+
+		let descriptors = catalog.latest_descriptors_for_tenant(tenant);
+		assert_eq!(descriptors.len(), 2);
+		assert_eq!(descriptors[0].table_name, "customers");
+		assert_eq!(descriptors[1].table_name, "events");
+		assert_eq!(descriptors[1].schema_generation, latest.schema_generation);
+		assert_eq!(descriptors[0], other);
+	}
+
+	#[test]
+	fn table_schema_descriptor_list_codec_round_trips_and_rejects_trailing_bytes() {
+		let first = descriptor_for_generation(&table_schema(DataType::Int64, false), 1);
+		let second = TableSchemaDescriptor::new(
+			TableObjectId::new([8; 16]),
+			1,
+			"analytics",
+			"customers",
+			&table_schema(DataType::Int64, false),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+
+		let encoded = encode_table_schema_descriptors(&[first.clone(), second.clone()]).unwrap();
+		let decoded = decode_table_schema_descriptors(&encoded).unwrap();
+		assert_eq!(decoded, vec![first, second]);
+
+		let mut trailing = encoded;
+		trailing.push(0);
+		let err = decode_table_schema_descriptors(&trailing).unwrap_err();
+		assert!(err.to_string().contains("trailing bytes"));
 	}
 
 	#[test]

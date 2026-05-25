@@ -240,6 +240,12 @@ pub trait Catalog: Send + Sync {
 		Ok(self.logical_type_registry())
 	}
 
+	async fn refreshed_table_schema_descriptors(
+		&self,
+	) -> Result<Vec<wendelon_client::TableSchemaDescriptor>, CatalogError> {
+		Ok(Vec::new())
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: TableId,
@@ -307,6 +313,11 @@ trait DescriptorSyncClient: Send + Sync {
 		namespace: &str,
 		table_name: &str,
 	) -> Result<Option<wendelon_client::TableSchemaDescriptor>, ClientError>;
+
+	async fn list_table_schema_descriptors(
+		&self,
+		tenant_id: WendelonTenantId,
+	) -> Result<Vec<wendelon_client::TableSchemaDescriptor>, ClientError>;
 }
 
 #[async_trait::async_trait]
@@ -325,6 +336,13 @@ impl DescriptorSyncClient for Client {
 		table_name: &str,
 	) -> Result<Option<wendelon_client::TableSchemaDescriptor>, ClientError> {
 		Client::get_table_schema_descriptor(self, tenant_id, namespace, table_name).await
+	}
+
+	async fn list_table_schema_descriptors(
+		&self,
+		tenant_id: WendelonTenantId,
+	) -> Result<Vec<wendelon_client::TableSchemaDescriptor>, ClientError> {
+		Client::list_table_schema_descriptors(self, tenant_id).await
 	}
 }
 
@@ -416,6 +434,7 @@ pub struct MockCatalog {
 struct MockCatalogInner {
 	by_ref: HashMap<(TenantId, TableRef), TableId>,
 	by_id: HashMap<(TenantId, TableId), TableBinding>,
+	descriptors: HashMap<(TenantId, TableId), wendelon_client::TableSchemaDescriptor>,
 	logical_types: HashMap<TenantId, LogicalTypeRegistry>,
 	next_table_id: u64,
 }
@@ -435,6 +454,7 @@ impl Default for MockCatalogInner {
 		Self {
 			by_ref: HashMap::new(),
 			by_id: HashMap::new(),
+			descriptors: HashMap::new(),
 			logical_types: HashMap::new(),
 			next_table_id: 1,
 		}
@@ -479,6 +499,9 @@ impl MockCatalog {
 			.by_ref
 			.insert((tenant_id, unqualified_ref), legacy_table_id);
 		inner.by_id.insert((tenant_id, legacy_table_id), binding);
+		inner
+			.descriptors
+			.insert((tenant_id, legacy_table_id), descriptor);
 		bump_next_table_id(&mut inner, legacy_table_id);
 		Ok(())
 	}
@@ -593,6 +616,20 @@ impl Catalog for MockCatalog {
 			.unwrap_or_default()
 	}
 
+	async fn refreshed_table_schema_descriptors(
+		&self,
+	) -> Result<Vec<wendelon_client::TableSchemaDescriptor>, CatalogError> {
+		let inner = self.inner.read().expect("MockCatalog lock poisoned");
+		Ok(sorted_descriptors_for_tenant(
+			inner
+				.descriptors
+				.iter()
+				.filter_map(|((tenant_id, _), descriptor)| {
+					(*tenant_id == self.tenant_id).then(|| descriptor.clone())
+				}),
+		))
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: TableId,
@@ -602,6 +639,7 @@ impl Catalog for MockCatalog {
 			self.descriptor_refresh_metrics.record_missing();
 			return Ok(None);
 		};
+		inner.descriptors.remove(&(self.tenant_id, table));
 		let mut refs = Vec::new();
 		inner.by_ref.retain(|(tenant_id, table_ref), table_id| {
 			let remove = *tenant_id == self.tenant_id && *table_id == table;
@@ -696,6 +734,9 @@ impl Catalog for MockCatalog {
 		inner
 			.by_id
 			.insert((self.tenant_id, legacy_table_id), binding.clone());
+		inner
+			.descriptors
+			.insert((self.tenant_id, legacy_table_id), descriptor);
 
 		Ok(CreateTableOutcome {
 			binding,
@@ -728,6 +769,7 @@ impl Catalog for MockCatalog {
 		inner
 			.by_ref
 			.retain(|(tenant_id, _), id| *tenant_id != self.tenant_id || *id != table_id);
+		inner.descriptors.remove(&(self.tenant_id, table_id));
 		Ok(Some(binding))
 	}
 }
@@ -1116,6 +1158,74 @@ impl WendelonDescriptorRegistry {
 		Ok(binding)
 	}
 
+	pub fn sync_latest_descriptor_for_tenant(
+		&self,
+		tenant_id: TenantId,
+		descriptor: wendelon_client::TableSchemaDescriptor,
+	) -> Result<TableBinding, CatalogError> {
+		let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
+		let unqualified_ref = TableRef::new(&descriptor.table_name);
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let logical_types = state
+			.logical_types
+			.get(&tenant_id)
+			.cloned()
+			.unwrap_or_default();
+		let resolver = LogicalTypeResolver::with_registry(&logical_types);
+
+		if let Some(existing_table_id) = state.by_ref.get(&(tenant_id, table_ref.clone())).copied()
+		{
+			let existing = state
+				.by_id
+				.get(&(tenant_id, existing_table_id))
+				.cloned()
+				.ok_or_else(|| CatalogError::TableNotFound {
+					table: table_name(&table_ref),
+				})?;
+			let binding = TableBinding::from_descriptor_with_logical_types(
+				existing_table_id,
+				&descriptor,
+				resolver,
+			)?;
+			if existing.table != binding.table {
+				return Err(CatalogError::AdminFailed {
+					message: format!(
+						"descriptor list sync failed: table {} already exists with a different table_object_id",
+						table_name(&table_ref)
+					),
+				});
+			}
+			state
+				.by_id
+				.insert((tenant_id, existing_table_id), binding.clone());
+			state
+				.descriptors
+				.insert((tenant_id, existing_table_id), descriptor);
+			state
+				.by_ref
+				.entry((tenant_id, unqualified_ref))
+				.or_insert(existing_table_id);
+			return Ok(binding);
+		}
+
+		let table_id = allocate_wendelon_table_id_locked(&mut state);
+		let binding =
+			TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?;
+		insert_wendelon_descriptor_locked(
+			&mut state,
+			tenant_id,
+			table_ref,
+			Some(unqualified_ref),
+			table_id,
+			binding.clone(),
+			descriptor,
+		)?;
+		Ok(binding)
+	}
+
 	pub fn register_logical_type_for_tenant(
 		&self,
 		tenant_id: TenantId,
@@ -1243,6 +1353,21 @@ impl WendelonDescriptorRegistry {
 			.get(&(tenant_id, table))
 			.cloned()
 			.ok_or(StorageError::TableNotFound { table })
+	}
+
+	pub fn descriptor_snapshot_for_tenant(
+		&self,
+		tenant_id: TenantId,
+	) -> Vec<wendelon_client::TableSchemaDescriptor> {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		sorted_descriptors_for_tenant(state.descriptors.iter().filter_map(
+			|((entry_tenant, _), descriptor)| {
+				(*entry_tenant == tenant_id).then(|| descriptor.clone())
+			},
+		))
 	}
 
 	fn try_resolve_table(&self, tenant_id: TenantId, table: &TableRef) -> Option<TableBinding> {
@@ -1753,6 +1878,27 @@ impl Catalog for WendelonCatalog {
 		Ok(self.registry.logical_type_registry(self.tenant_id))
 	}
 
+	async fn refreshed_table_schema_descriptors(
+		&self,
+	) -> Result<Vec<wendelon_client::TableSchemaDescriptor>, CatalogError> {
+		let Some(client) = self.descriptor_sync_client.as_ref() else {
+			return Ok(self.registry.descriptor_snapshot_for_tenant(self.tenant_id));
+		};
+		self.refreshed_logical_type_registry().await?;
+		let mut descriptors = client
+			.list_table_schema_descriptors(wendelon_tenant_id(self.tenant_id))
+			.await
+			.map_err(|error| CatalogError::AdminFailed {
+				message: error.to_string(),
+			})?;
+		descriptors = sorted_descriptors_for_tenant(descriptors);
+		for descriptor in descriptors.iter().cloned() {
+			self.registry
+				.sync_latest_descriptor_for_tenant(self.tenant_id, descriptor)?;
+		}
+		Ok(descriptors)
+	}
+
 	async fn invalidate_table_descriptor(
 		&self,
 		table: TableId,
@@ -1904,6 +2050,20 @@ impl From<WendelonTenantId> for TenantId {
 
 fn wendelon_tenant_id(tenant_id: TenantId) -> WendelonTenantId {
 	WendelonTenantId::new(tenant_id.0)
+}
+
+fn sorted_descriptors_for_tenant(
+	descriptors: impl IntoIterator<Item = wendelon_client::TableSchemaDescriptor>,
+) -> Vec<wendelon_client::TableSchemaDescriptor> {
+	let mut descriptors = descriptors.into_iter().collect::<Vec<_>>();
+	descriptors.sort_by(|left, right| {
+		left.namespace
+			.cmp(&right.namespace)
+			.then_with(|| left.table_name.cmp(&right.table_name))
+			.then_with(|| left.schema_generation.cmp(&right.schema_generation))
+			.then_with(|| left.table_object_id.cmp(&right.table_object_id))
+	});
+	descriptors
 }
 
 fn table_name(table: &TableRef) -> String {
@@ -2162,6 +2322,7 @@ mod tests {
 
 	struct FakeDescriptorSyncClient {
 		responses: tokio::sync::Mutex<VecDeque<Result<Option<TableSchemaDescriptor>, ClientError>>>,
+		list_responses: Mutex<VecDeque<Result<Vec<TableSchemaDescriptor>, ClientError>>>,
 		requests: tokio::sync::Mutex<Vec<(WendelonTenantId, String, String)>>,
 		logical_type_definitions: Vec<LogicalTypeDefinition>,
 		calls: AtomicU64,
@@ -2178,6 +2339,7 @@ mod tests {
 		) -> Self {
 			Self {
 				responses: tokio::sync::Mutex::new(responses.into_iter().collect()),
+				list_responses: Mutex::new(VecDeque::new()),
 				requests: tokio::sync::Mutex::new(Vec::new()),
 				logical_type_definitions: Vec::new(),
 				calls: AtomicU64::new(0),
@@ -2194,6 +2356,17 @@ mod tests {
 			definitions: impl IntoIterator<Item = LogicalTypeDefinition>,
 		) -> Self {
 			self.logical_type_definitions = definitions.into_iter().collect();
+			self
+		}
+
+		fn with_table_descriptor_lists(
+			self,
+			responses: impl IntoIterator<Item = Result<Vec<TableSchemaDescriptor>, ClientError>>,
+		) -> Self {
+			*self
+				.list_responses
+				.lock()
+				.expect("fake descriptor list response lock poisoned") = responses.into_iter().collect();
 			self
 		}
 
@@ -2274,6 +2447,17 @@ mod tests {
 				.await
 				.pop_front()
 				.expect("fake descriptor response")
+		}
+
+		async fn list_table_schema_descriptors(
+			&self,
+			_tenant_id: WendelonTenantId,
+		) -> Result<Vec<TableSchemaDescriptor>, ClientError> {
+			self.list_responses
+				.lock()
+				.expect("fake descriptor list response lock poisoned")
+				.pop_front()
+				.expect("fake descriptor list response")
 		}
 	}
 

@@ -177,6 +177,8 @@ pub struct BoundReturningProjection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SystemTableKind {
 	InformationSchemaLogicalTypes,
+	InformationSchemaTables,
+	InformationSchemaColumns,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

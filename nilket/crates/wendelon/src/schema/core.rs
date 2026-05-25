@@ -453,6 +453,23 @@ pub struct TableDescriptorGetResponseMeta {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
+pub struct TableDescriptorListRequestMeta {
+	pub tenant_id: TenantId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct TableDescriptorListResponseMeta {
+	pub accepted: u8,
+	pub reason_code: u8,
+	pub _pad1: [u8; 6],
+	pub leader_hint: NodeId,
+	pub descriptors_len: u32,
+	pub _pad2: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
 pub struct LogicalTypeGetRequestMeta {
 	pub tenant_id: TenantId,
 	pub name: [u8; 128],
@@ -674,6 +691,8 @@ impl MsgType {
 	pub const LOGICAL_TYPE_GET_RESP: Self = Self(0x41);
 	pub const LOGICAL_TYPE_LIST_REQ: Self = Self(0x42);
 	pub const LOGICAL_TYPE_LIST_RESP: Self = Self(0x43);
+	pub const TABLE_DESCRIPTOR_LIST_REQ: Self = Self(0x44);
+	pub const TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -1554,6 +1573,8 @@ const _: () = assert!(std::mem::size_of::<AcquireLeaseRequestMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseResponseMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<TableDescriptorGetRequestMeta>() == 264);
 const _: () = assert!(std::mem::size_of::<TableDescriptorGetResponseMeta>() == 24);
+const _: () = assert!(std::mem::size_of::<TableDescriptorListRequestMeta>() == 8);
+const _: () = assert!(std::mem::size_of::<TableDescriptorListResponseMeta>() == 24);
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 24);
 const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 120);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
@@ -1585,6 +1606,7 @@ mod tests {
 		LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta, LogicalTypeListRequestMeta,
 		LogicalTypeListResponseMeta, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta,
 		ReadStatus, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
+		TableDescriptorListRequestMeta, TableDescriptorListResponseMeta,
 	};
 
 	#[test]
@@ -1646,6 +1668,8 @@ mod tests {
 	fn descriptor_get_wire_contract_is_fixed_pod_and_exact_opcode() {
 		assert_eq!(MsgType::TABLE_DESCRIPTOR_GET_REQ.0, 0x3C);
 		assert_eq!(MsgType::TABLE_DESCRIPTOR_GET_RESP.0, 0x3D);
+		assert_eq!(MsgType::TABLE_DESCRIPTOR_LIST_REQ.0, 0x44);
+		assert_eq!(MsgType::TABLE_DESCRIPTOR_LIST_RESP.0, 0x45);
 
 		assert_eq!(std::mem::size_of::<TableDescriptorGetRequestMeta>(), 264);
 		assert_eq!(
@@ -1676,6 +1700,30 @@ mod tests {
 		);
 		assert_eq!(
 			std::mem::offset_of!(TableDescriptorGetResponseMeta, descriptor_len),
+			16
+		);
+
+		assert_eq!(std::mem::size_of::<TableDescriptorListRequestMeta>(), 8);
+		assert_eq!(
+			std::mem::offset_of!(TableDescriptorListRequestMeta, tenant_id),
+			0
+		);
+
+		assert_eq!(std::mem::size_of::<TableDescriptorListResponseMeta>(), 24);
+		assert_eq!(
+			std::mem::offset_of!(TableDescriptorListResponseMeta, accepted),
+			0
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableDescriptorListResponseMeta, reason_code),
+			1
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableDescriptorListResponseMeta, leader_hint),
+			8
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableDescriptorListResponseMeta, descriptors_len),
 			16
 		);
 	}

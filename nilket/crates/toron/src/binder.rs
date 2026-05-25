@@ -19,10 +19,10 @@ use crate::ir::{
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
 	ColumnOrdinal, CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
 	FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId,
-	LogicalTypeRegistry, LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn,
-	ReturningProjection, ScalarValue, SortExpr, SystemTableKind, arithmetic_output_type,
-	decode_column_logical_type, field_with_logical_type_metadata, logical_type_name,
-	logical_type_spec, schema_for_exprs,
+	LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram, QueryProfileHint,
+	ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
+	arithmetic_output_type, decode_column_logical_type, decode_column_logical_type_with_resolver,
+	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -31,6 +31,7 @@ use wendelon::schema::{
 };
 use wendelon_client::{
 	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
+	TableSchemaDescriptor,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -43,7 +44,11 @@ const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
 ];
 const INFORMATION_SCHEMA_NAMESPACE: &str = "information_schema";
 const INFORMATION_SCHEMA_LOGICAL_TYPES: &str = "information_schema.logical_types";
+const INFORMATION_SCHEMA_TABLES: &str = "information_schema.tables";
+const INFORMATION_SCHEMA_COLUMNS: &str = "information_schema.columns";
 const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
+const INFORMATION_SCHEMA_TABLES_TABLE: &str = "tables";
+const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = "columns";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlannerConfig {
@@ -677,44 +682,53 @@ impl<'a> Binder<'a> {
 		table: &TableRef,
 		projection: Option<&Vec<String>>,
 	) -> Result<ExecutionPlan, BindingError> {
-		if !table
+		if table
 			.table
 			.eq_ignore_ascii_case(INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE)
 		{
-			return Err(BindingError::UnsupportedExpression {
-				message: format!(
-					"unknown information_schema relation: {}; supported relation is {INFORMATION_SCHEMA_LOGICAL_TYPES}",
-					table_name(table)
-				),
-			});
-		}
-
-		let full_schema = information_schema_logical_types_schema();
-		let registry = self.catalog.refreshed_logical_type_registry().await?;
-		let rows = registry
-			.specs_sorted()
-			.into_iter()
-			.map(logical_type_spec_row)
-			.collect::<Result<Vec<_>, _>>()?;
-		let Some(projection) = projection else {
-			return Ok(ExecutionPlan::SystemTable {
-				kind: SystemTableKind::InformationSchemaLogicalTypes,
-				schema: full_schema,
+			let registry = self.catalog.refreshed_logical_type_registry().await?;
+			let rows = registry
+				.specs_sorted()
+				.into_iter()
+				.map(logical_type_spec_row)
+				.collect::<Result<Vec<_>, _>>()?;
+			return system_table_plan(
+				SystemTableKind::InformationSchemaLogicalTypes,
+				information_schema_logical_types_schema(),
 				rows,
-			});
-		};
-
-		let requested = projection
-			.iter()
-			.map(|column| resolve_column(column, &full_schema).map(|column| column.ordinal))
-			.collect::<Result<Vec<_>, _>>()?;
-		let schema = project_schema(&full_schema, &requested)?;
-		let rows = project_scalar_rows(&rows, &requested)?;
-
-		Ok(ExecutionPlan::SystemTable {
-			kind: SystemTableKind::InformationSchemaLogicalTypes,
-			schema,
-			rows,
+				projection,
+			);
+		}
+		if table
+			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_TABLES_TABLE)
+		{
+			let descriptors = self.catalog.refreshed_table_schema_descriptors().await?;
+			return system_table_plan(
+				SystemTableKind::InformationSchemaTables,
+				information_schema_tables_schema(),
+				information_schema_table_rows(&descriptors),
+				projection,
+			);
+		}
+		if table
+			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_COLUMNS_TABLE)
+		{
+			let descriptors = self.catalog.refreshed_table_schema_descriptors().await?;
+			let logical_types = self.catalog.logical_type_registry();
+			return system_table_plan(
+				SystemTableKind::InformationSchemaColumns,
+				information_schema_columns_schema(),
+				information_schema_column_rows(&descriptors, &logical_types)?,
+				projection,
+			);
+		}
+		Err(BindingError::UnsupportedExpression {
+			message: format!(
+				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}",
+				table_name(table)
+			),
 		})
 	}
 
@@ -3275,11 +3289,55 @@ fn information_schema_logical_types_schema() -> SchemaRef {
 	]))
 }
 
+fn information_schema_tables_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("table_schema", DataType::Utf8, false),
+		Field::new("table_name", DataType::Utf8, false),
+		Field::new("table_type", DataType::Utf8, false),
+	]))
+}
+
+fn information_schema_columns_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("table_schema", DataType::Utf8, false),
+		Field::new("table_name", DataType::Utf8, false),
+		Field::new("column_name", DataType::Utf8, false),
+		Field::new("ordinal_position", DataType::Int64, false),
+		Field::new("data_type", DataType::Utf8, false),
+		Field::new("is_nullable", DataType::Utf8, false),
+		Field::new("logical_type_name", DataType::Utf8, true),
+	]))
+}
+
+fn system_table_plan(
+	kind: SystemTableKind,
+	full_schema: SchemaRef,
+	rows: Vec<Vec<ScalarValue>>,
+	projection: Option<&Vec<String>>,
+) -> Result<ExecutionPlan, BindingError> {
+	let Some(projection) = projection else {
+		return Ok(ExecutionPlan::SystemTable {
+			kind,
+			schema: full_schema,
+			rows,
+		});
+	};
+
+	let requested = projection
+		.iter()
+		.map(|column| resolve_column(column, &full_schema).map(|column| column.ordinal))
+		.collect::<Result<Vec<_>, _>>()?;
+	let schema = project_schema(&full_schema, &requested)?;
+	let rows = project_scalar_rows(&rows, &requested)?;
+
+	Ok(ExecutionPlan::SystemTable { kind, schema, rows })
+}
+
 fn logical_type_spec_row(spec: LogicalTypeSpec) -> Result<Vec<ScalarValue>, BindingError> {
 	Ok(vec![
 		ScalarValue::Int64(Some(i64::from(spec.id.0))),
 		ScalarValue::Utf8(Some(spec.name)),
-		ScalarValue::Utf8(Some(physical_keyword(&spec.physical)?.to_string())),
+		ScalarValue::Utf8(Some(sql_carrier_keyword(&spec.physical)?.to_string())),
 		ScalarValue::Utf8(
 			spec.refinement
 				.as_ref()
@@ -3289,7 +3347,82 @@ fn logical_type_spec_row(spec: LogicalTypeSpec) -> Result<Vec<ScalarValue>, Bind
 	])
 }
 
-fn physical_keyword(data_type: &DataType) -> Result<&'static str, BindingError> {
+fn information_schema_table_rows(descriptors: &[TableSchemaDescriptor]) -> Vec<Vec<ScalarValue>> {
+	descriptors
+		.iter()
+		.map(|descriptor| {
+			vec![
+				ScalarValue::Utf8(Some(descriptor.namespace.clone())),
+				ScalarValue::Utf8(Some(descriptor.table_name.clone())),
+				ScalarValue::Utf8(Some("BASE TABLE".to_string())),
+			]
+		})
+		.collect()
+}
+
+fn information_schema_column_rows(
+	descriptors: &[TableSchemaDescriptor],
+	logical_types: &LogicalTypeRegistry,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rows = Vec::new();
+	for descriptor in descriptors {
+		let schema =
+			descriptor
+				.arrow_schema()
+				.map_err(|error| BindingError::UnsupportedExpression {
+					message: format!(
+						"failed to decode table descriptor schema for {}.{}: {error}",
+						descriptor.namespace, descriptor.table_name
+					),
+				})?;
+		for (index, field) in schema.fields().iter().enumerate() {
+			let ordinal =
+				i64::try_from(index + 1).map_err(|_| BindingError::UnsupportedExpression {
+					message: "information_schema.columns ordinal overflow".to_string(),
+				})?;
+			rows.push(vec![
+				ScalarValue::Utf8(Some(descriptor.namespace.clone())),
+				ScalarValue::Utf8(Some(descriptor.table_name.clone())),
+				ScalarValue::Utf8(Some(field.name().clone())),
+				ScalarValue::Int64(Some(ordinal)),
+				ScalarValue::Utf8(Some(sql_carrier_keyword(field.data_type())?.to_string())),
+				ScalarValue::Utf8(Some(
+					if field.is_nullable() { "YES" } else { "NO" }.to_string(),
+				)),
+				ScalarValue::Utf8(logical_type_display_name(field, logical_types)?),
+			]);
+		}
+	}
+	Ok(rows)
+}
+
+fn logical_type_display_name(
+	field: &Field,
+	logical_types: &LogicalTypeRegistry,
+) -> Result<Option<String>, BindingError> {
+	let logical_type = decode_column_logical_type_with_resolver(
+		field,
+		LogicalTypeResolver::with_registry(logical_types),
+	)
+	.map_err(|error| BindingError::UnsupportedExpression {
+		message: error.to_string(),
+	})?;
+	if logical_type.is_naked() {
+		return Ok(None);
+	}
+	LogicalTypeResolver::with_registry(logical_types)
+		.spec(logical_type)
+		.map(|spec| Some(spec.name))
+		.ok_or_else(|| BindingError::UnsupportedExpression {
+			message: format!(
+				"logical type metadata for column {} references unknown id {}",
+				field.name(),
+				logical_type.0
+			),
+		})
+}
+
+fn sql_carrier_keyword(data_type: &DataType) -> Result<&'static str, BindingError> {
 	match data_type {
 		DataType::Int32 => Ok("INT"),
 		DataType::Int64 => Ok("BIGINT"),
@@ -3298,7 +3431,7 @@ fn physical_keyword(data_type: &DataType) -> Result<&'static str, BindingError> 
 		DataType::Utf8 => Ok("TEXT"),
 		DataType::Boolean => Ok("BOOLEAN"),
 		other => Err(BindingError::UnsupportedExpression {
-			message: format!("unsupported logical type physical carrier: {other:?}"),
+			message: format!("unsupported SQL carrier for information_schema: {other:?}"),
 		}),
 	}
 }
