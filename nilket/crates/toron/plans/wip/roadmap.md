@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–103 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–104 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -623,6 +623,27 @@ run, 079+).
   transparency tie-in; Codex grounded the seam + the explicit-vs-wildcard scope correction + duplicate-alias
   inheritance; Gemini ratified). Migration: `plans/impl/103_derived_table_alias_column_lists.md`.
 
+- **ADR 104 — Unified Table Alias Column Lists at Bind.** Promoted. **Supersedes 103's planner rewrite**:
+  makes the alias column list a single `LogicalPlan::Alias { columns }` concept renamed **once at bind**,
+  covering base-table, explicit-derived, and wildcard-derived aliases through one mechanism. **The decisive
+  grounding** (which moved the council A→B after the operator flagged a small-cut/structure-ossification
+  bias): **base-table alias columns are silently dropped today** — `TableFactor::Table` never checks
+  `alias.columns` and `alias_plan` drops them, so `FROM people AS p(pid)` ignores the rename — and
+  base-table + wildcard both lack a plan-time `Project`, so the binder rename is **mandatory** regardless.
+  Fork A (wildcard-only binder path + keep 103's planner rewrite) was two mechanisms that *still* left
+  base-table broken; **B unifies all three and fixes the bug**. Shape: extend
+  `LogicalPlan::Alias.columns` (mini-sweep); planner carries names for every alias + rejects type
+  annotations; delete `apply_derived_alias_column_list`; arity fully unified at bind; rename = **ordinal**
+  identity `Project` (not `Expr::column(name)` — robust to duplicate source names) reusing the 089
+  metadata path so logical identity + the 100 receipt trace (explicit + wildcard elision both hold);
+  duplicates inherit `AmbiguousColumn`. Explicit-derived gains a redundant identity `Project` (Toron has no
+  project-folding) — accepted; a future general collapse pass is the right fix (out of scope). Retargets
+  three 103 guards (incl. the inverted "Alias is now extended"). Toron-only IR+planner+binder; no
+  exec/PBC/storage/Wendelon/`information_schema` surface. Genuine 3-of-3 (all three flipped A→B on the
+  base-table grounding; Codex surfaced base-table + the ordinal-project sharpening; Claude confirmed the
+  silent-ignore + no-project-folding and held fully-unified arity; Gemini conceded the planner arity
+  check). Migration: `plans/impl/104_unified_alias_column_lists.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -706,11 +727,19 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 103 promoted; ADR 104 candidates
+### ADR 104 promoted; ADR 105 candidates
 
-ADR 103 selected and promoted **derived-table alias column lists** (explicit-projection positional rename
-of `Project.output_names`; wildcard fence; transparency preserved through bare-column renames). Genuine
-3-of-3. No operator-designated next yet; strongest leads, by theme:
+ADR 104 selected and promoted **unified table alias column lists at bind** — one `LogicalPlan::Alias { columns }`
+mechanism for base-table, explicit-derived, and wildcard-derived aliases (superseding 103's planner
+rewrite, fixing the base-table silent-ignore). Genuine 3-of-3. No operator-designated next yet; strongest
+leads, by theme:
+
+*Optimizer cleanup the 104 work surfaced:*
+
+- **General adjacent-identity-`Project` collapse pass** — Toron has no project-folding, so 104's unified
+  rename leaves a redundant identity `Project` on explicit-derived aliases (and the pattern recurs
+  elsewhere). A small general optimizer pass removes it without reintroducing an alias special-case. The
+  natural 104 follow-on.
 
 *Catalog introspection continuation (the substrate now exists):*
 
@@ -720,8 +749,6 @@ of `Project.output_names`; wildcard fence; transparency preserved through bare-c
 
 *Derived-source continuation (split, don't generalize):*
 
-- **Binder-carried wildcard alias-columns** — the deferred ADR 103 half: carry the alias list to bind time
-  and rename after `SELECT *` scan resolution (needs a binder-aware representation). The named 103 follow-on.
 - **General derived tables / subqueries** — joins-around-derived, derived aggregates/sort/limit, alias
   scoping, eventually `IN`/scalar/correlated + decorrelation. Large; sequence the sub-features.
 - **Projected-scan receipt** — only earns a cut if/when refinement elision is ever moved to run *after*
@@ -758,7 +785,15 @@ of `Project.output_names`; wildcard fence; transparency preserved through bare-c
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/103_derived_table_alias_column_lists.md`.
+`plans/impl/104_unified_alias_column_lists.md`.
+
+### ADR 103 promoted; ADR 104 candidates (HISTORICAL)
+
+ADR 103 promoted explicit-projection derived-table alias column lists (planner `Project.output_names`
+rewrite; wildcard fenced). 104 took the deferred wildcard half — but the base-table silent-ignore grounding
+(+ the operator's small-cut-bias steer) widened it to a **unified** bind-time rename across base/explicit/
+wildcard, superseding 103's planner path. Detail in `plans/adr/103_derived_table_alias_column_lists.md` +
+the active-line entry above.
 
 ### ADR 102 promoted; ADR 103 candidates (HISTORICAL)
 
