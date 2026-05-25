@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + elision substrate (095) + refinement contracts (096, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + elision substrate (095) + refinement contracts (096) + refinement elision (097, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -488,6 +488,26 @@ run, 079+).
   neutral-AST + complete enforcement). Migration:
   `plans/impl/096_durable_refinement_persistence_enforcement.md`.
 
+- **ADR 097 — Refinement-Driven Read-Time Elision.** Promoted. **Slice 3 of the refinement tier — the
+  payoff**, closing the arc (095 substrate → 096 receipt → 097 spend). Feeds 096's *enforced* durable
+  refinement into 095's `static_filter_class` (`binder.rs:1169`) as a third `AlwaysReject` proof: a
+  whole-root filter atom that contradicts a stored column's refinement → 095's `EmptyRelation` (zero
+  scan, zero PBC) before pushdown. **Two soundness invariants:** (1) **durable registry, not seed** —
+  thread `Catalog::logical_type_registry()` (096-synced), never the seed-only `logical_type_spec` (the
+  091/092 trap); (2) **stored-scan provenance, not the sidecar** — elide only when `input` is
+  `Scan { projection: None }` and the atom is a direct scan-output `Column op literal` with a durable
+  refinement. A `CAST(raw AS PersonId)` column carries the sidecar (089) but is *not* a 096 receipt
+  (092/093/096 D8 left casts ephemeral) → must not elide. Reasoning = a bounded **1D carrier-domain
+  intersection** (interval bounds + excluded points, so `CHECK (VALUE != 0)` + `id = 0` elides; floats
+  decode from 096 bits, NaN→Unknown; Bool/Utf8 equality singletons) — not an SMT solver. Whole-root
+  single comparison; AND-decomposition/multi-column/pass-through-projection deferred. 3VL +
+  error-conservative (structural proof; `IS NULL` stays 095's rule). **Inverts 096's
+  `no_refinement_elision_yet` guard** → "elision only from durable stored-scan receipts" (discipline
+  #4). Toron-only; reuses 095 `EmptyRelation`; **no** Wendelon/096-contract/PBC/executor/wire change.
+  Genuine 3-of-3 (Claude grounded the durable-not-seed + provenance-not-sidecar catches; Codex
+  independently grounded both + the `Scan{projection:None}` precision + the `!=` excluded-point case +
+  the guard inversion; Gemini ratified). Migration: `plans/impl/097_refinement_driven_elision.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -571,25 +591,27 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 096 promoted; ADR 097 candidates
+### ADR 097 promoted; ADR 098 candidates
 
-ADR 096 selected and promoted **Durable Refinement Predicate Persistence + Write Enforcement** — slice
-2 of the refinement tier (the integrity *receipt*). `CREATE LOGICAL TYPE … CHECK (VALUE > 0)` persists
-a portable Wendelon-owned refinement AST + enforces it across all write paths (INSERT VALUES/SELECT,
-UPDATE, CTAS); CAST unchanged (092/093); the touched Wendelon contract de-versioned in place (no
-numeric suffixes/compat, pre-release). No elision (097 boundary). Genuine 3-of-3 after the soundness reordering.
+ADR 097 selected and promoted **Refinement-Driven Read-Time Elision** — slice 3 of the refinement
+tier, the payoff that closes the arc (095 substrate → 096 receipt → 097 spend). A third
+`static_filter_class` proof elides a stored-column filter that contradicts the column's *enforced*
+durable refinement (`WHERE id = -5` on `PersonId CHECK (VALUE > 0)` → `EmptyRelation`, zero I/O), on
+two soundness invariants — durable-registry-not-seed + stored-scan-provenance-not-sidecar — via a
+bounded 1D carrier-domain intersection. Inverts 096's no-elision guard. Genuine 3-of-3.
 
-**ADR 097 candidates:**
+**ADR 098 candidates:**
 
-*The integrity tier, slice 3 (the direct successor — the payoff 096's receipt unlocks):*
+*Refinement-elision follow-ons (from ADR 097 §"What to do next" — broaden the just-landed payoff):*
 
-- **Refinement-driven read-time elision** (Toron-only) — feed the *enforced* durable refinement into
-  095's `static_filter_class` (`binder.rs:1166`) so `WHERE id = -5` on a `PersonId CHECK (VALUE > 0)`
-  column elides to `EmptyRelation` (zero I/O). **Sound only on 096's receipt** (stored refined-column
-  data passed Toron enforcement). Needs a real single-column interval/literal-contradiction model
-  (normalize comparisons against literals; prove `VALUE > 0` ∧ `id = -5` unsat) — *not* just appending
-  the refinement to the bound predicate. Scoped to stored-column receipts (not arbitrary expression
-  logical types, per 096 D8). 3VL- + error-conservative (inherit 095).
+- **Top-level-`AND` decomposition** — `WHERE id = -5 AND active` elides if any conjunct contradicts a
+  refinement (reuse 097's single-atom `CarrierDomain` reasoner over decomposed conjuncts; the 094
+  residual machinery is the decomposition precedent). Smallest, purely-Toron broadening.
+- **Pass-through-projection provenance** — lift 097's `Scan { projection: None }` restriction once
+  column lineage through a `Project` is mechanically proven (ordinal remap + no intervening
+  cast/compute). Multi-column refinement facts follow.
+- **Utf8 collation range reasoning** — only after collation semantics are a deliberate decision (097
+  kept strings to equality/inequality singletons).
 
 *Identity authoring follow-ons:*
 
@@ -619,7 +641,14 @@ numeric suffixes/compat, pre-release). No elision (097 boundary). Genuine 3-of-3
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/096_durable_refinement_persistence_enforcement.md`.
+`plans/impl/097_refinement_driven_elision.md`.
+
+### ADR 096 promoted; ADR 097 candidates (HISTORICAL)
+
+ADR 096 promoted **Durable Refinement Persistence + Write Enforcement** (the integrity receipt;
+portable Wendelon AST, complete write enforcement, contract de-versioned in place). 097 spent the
+receipt: refinement-driven read-time elision (the payoff), closing the 095→096→097 arc. Detail in
+`plans/adr/096_durable_refinement_persistence_enforcement.md` + the active-line entry above.
 
 ### ADR 095 promoted; ADR 096 candidates (HISTORICAL)
 
