@@ -120,7 +120,10 @@ impl<'a> Binder<'a> {
 
 					Ok(scan_plan(binding, projection))
 				}
-				LogicalPlan::Alias { input, .. } => self.bind_plan(input).await,
+				LogicalPlan::Alias { input, columns, .. } => {
+					let input = self.bind_plan(input).await?;
+					bind_alias_column_rename(input, columns)
+				}
 				LogicalPlan::Filter { input, predicate } => {
 					let input = self.bind_plan(input).await?;
 					let bound_predicate = self
@@ -837,6 +840,56 @@ impl<'a> Binder<'a> {
 			output_schema,
 		}))
 	}
+}
+
+fn bind_alias_column_rename(
+	input: ExecutionPlan,
+	columns: &[String],
+) -> Result<ExecutionPlan, BindingError> {
+	if columns.is_empty() {
+		return Ok(input);
+	}
+	let schema = input.schema();
+	if columns.len() != schema.fields().len() {
+		return Err(BindingError::UnsupportedExpression {
+			message: format!(
+				"alias column list arity mismatch: expected {}, got {}",
+				schema.fields().len(),
+				columns.len()
+			),
+		});
+	}
+
+	let mut builder = BoundExprProgramBuilder::new();
+	for (idx, field) in schema.fields().iter().enumerate() {
+		let logical_type = decode_column_logical_type(field).map_err(|error| {
+			BindingError::UnsupportedExpression {
+				message: error.to_string(),
+			}
+		})?;
+		let ordinal = ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow"));
+		let node = builder.append_column(ResolvedColumn {
+			name: ColumnName(field.name().clone()),
+			ordinal,
+			data_type: field.data_type().clone(),
+			nullable: field.is_nullable(),
+			pbc_eligible: is_pbc_eligible_type(field.data_type()),
+		});
+		if !builder.set_node_logical_type(node, logical_type) {
+			return Err(BindingError::UnsupportedExpression {
+				message: "alias column rename target is malformed".to_string(),
+			});
+		}
+		builder.push_root(node);
+	}
+	let exprs = builder.build();
+	let output_names = columns.iter().cloned().map(Some).collect::<Vec<_>>();
+	let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
+	Ok(ExecutionPlan::Project {
+		input: Box::new(input),
+		exprs,
+		output_schema,
+	})
 }
 
 fn bind_update_source_for_all_rows(scan: ExecutionPlan) -> (ExecutionPlan, QueryProfileHint) {
@@ -2959,7 +3012,7 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 	match plan {
 		LogicalPlan::Scan { .. } => {}
 		LogicalPlan::ScanNamed { table, .. } => qualifiers.push(table.clone()),
-		LogicalPlan::Alias { input, alias } => {
+		LogicalPlan::Alias { input, alias, .. } => {
 			collect_qualifiers(input, qualifiers);
 			qualifiers.push(alias.clone());
 		}

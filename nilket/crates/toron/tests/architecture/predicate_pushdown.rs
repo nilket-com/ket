@@ -1764,88 +1764,66 @@ pub(crate) fn adr100_no_ir_exec_pbc_storage_or_wendelon_change() {
 }
 
 #[test]
-pub(crate) fn adr103_derived_alias_columns_are_project_output_name_rewrites() {
-	let planner = source("src/sql_planner.rs");
-	let helper = first_block(&planner, "fn apply_derived_alias_column_list");
-	let lower_derived = first_block(&planner, "fn lower_derived_table");
-	let table_factor = first_block(&planner, "fn lower_table_factor");
-
-	assert!(helper.contains("alias_columns.is_empty()"));
-	assert!(helper.contains("column.data_type.is_some()"));
-	assert!(helper.contains("LogicalPlan::Project"));
-	assert!(helper.contains("alias_columns.len() != output_names.len()"));
-	assert!(helper.contains("column.name.value.clone()"));
-	assert!(helper.contains("alias column lists over SELECT * derived tables are not supported"));
-	assert!(!helper.contains("LogicalPlan::Alias"));
-	assert!(lower_derived.contains("apply_derived_alias_column_list(plan, &alias.columns)"));
-	assert!(!table_factor.contains("derived table alias column lists are not supported"));
-}
-
-#[test]
-pub(crate) fn adr103_alias_columns_do_not_extend_alias_or_ir() {
+pub(crate) fn adr104_alias_column_lists_are_single_bind_time_mechanism() {
 	let planner = source("src/sql_planner.rs");
 	let alias_plan = first_block(&planner, "fn alias_plan");
-	let binder = source("src/binder.rs");
-	let bind_plan = first_block(&binder, "fn bind_plan");
+	let lower_derived = first_block(&planner, "fn lower_derived_table");
+	let table_factor = first_block(&planner, "fn lower_table_factor");
 	let logical = source("src/ir.rs");
 	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
-	let execution = source("src/ir/execution.rs");
-	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
 
+	assert!(!planner.contains("fn apply_derived_alias_column_list"));
+	assert!(!planner.contains("derived table alias column list arity mismatch"));
+	assert!(planner.contains("fn alias_column_names"));
 	assert!(alias_plan.contains("LogicalPlan::Alias"));
 	assert!(alias_plan.contains("TableRef::new(alias.name.value.clone())"));
-	assert!(!alias_plan.contains("columns"));
-	assert!(bind_plan.contains("LogicalPlan::Alias { input, .. } => self.bind_plan(input).await"));
-	for marker in ["AliasColumn", "TableAliasColumnDef", "DerivedAlias"] {
-		assert!(
-			!logical_plan.contains(marker),
-			"{marker} leaked to LogicalPlan"
-		);
-		assert!(
-			!execution_plan.contains(marker),
-			"{marker} leaked to ExecutionPlan"
-		);
-	}
+	assert!(alias_plan.contains("columns: alias_column_names(alias)?"));
+	assert!(logical_plan.contains("columns: Vec<String>"));
+	assert!(lower_derived.contains("alias_plan(plan, Some(alias))"));
+	assert!(table_factor.contains("alias_plan(plan, alias.as_ref())"));
 }
 
 #[test]
-pub(crate) fn adr103_alias_column_renames_reuse_transparent_project_receipt() {
+pub(crate) fn adr104_binder_alias_columns_build_ordinal_identity_project() {
+	let binder = source("src/binder.rs");
+	let bind_plan = first_block(&binder, "fn bind_plan");
+	let helper = first_block(&binder, "fn bind_alias_column_rename");
+
+	assert!(bind_plan.contains("LogicalPlan::Alias { input, columns, .. }"));
+	assert!(bind_plan.contains("bind_alias_column_rename(input, columns)"));
+	assert!(helper.contains("columns.len() != schema.fields().len()"));
+	assert!(helper.contains("BoundExprProgramBuilder::new()"));
+	assert!(helper.contains("decode_column_logical_type(field)"));
+	assert!(helper.contains("ColumnOrdinal(u32::try_from(idx)"));
+	assert!(helper.contains("builder.append_column(ResolvedColumn"));
+	assert!(helper.contains("builder.set_node_logical_type(node, logical_type)"));
+	assert!(helper.contains("schema_for_exprs_with_output_names"));
+	assert!(helper.contains("ExecutionPlan::Project"));
+	assert!(!helper.contains("Expr::column"));
+}
+
+#[test]
+pub(crate) fn adr104_alias_column_renames_reuse_transparent_project_receipt() {
 	let binder = source("src/binder.rs");
 	let child_ordinal = first_block(&binder, "fn transparent_project_child_ordinal");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
-	let planner = source("src/sql_planner.rs");
-	let helper = first_block(&planner, "fn apply_derived_alias_column_list");
+	let helper = first_block(&binder, "fn bind_alias_column_rename");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
 
-	assert!(logical_type_ddl.contains("derived_table_alias_columns_preserve_refinement_elision"));
+	assert!(
+		logical_type_ddl
+			.contains("alias_columns_preserve_refinement_elision_base_explicit_and_wildcard")
+	);
 	assert!(receipt.contains("transparent_project_child_ordinal(exprs, ordinal)"));
+	assert!(receipt.contains("decode_column_logical_type(child_field)"));
 	assert!(child_ordinal.contains("BoundExprNode::Column(column)"));
-	for marker in [
-		"LogicalTypeId",
-		"decode_column_logical_type",
-		"field.name",
-		"transparent_project_child_ordinal",
-		"BoundExprNode",
-	] {
-		assert!(
-			!helper.contains(marker),
-			"{marker} leaked to alias-column rename helper"
-		);
-	}
+	assert!(helper.contains("builder.append_column(ResolvedColumn"));
+	assert!(helper.contains("decode_column_logical_type(field)"));
+	assert!(helper.contains("set_node_logical_type(node, logical_type)"));
 }
 
 #[test]
-pub(crate) fn adr103_wildcard_alias_columns_remain_deferred() {
-	let planner = source("src/sql_planner.rs");
-	let helper = first_block(&planner, "fn apply_derived_alias_column_list");
-	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
-
-	assert!(helper.contains("alias column lists over SELECT * derived tables are not supported"));
-	assert!(logical_type_ddl.contains("derived_table_alias_columns_wildcard_remains_deferred"));
-}
-
-#[test]
-pub(crate) fn adr103_no_runtime_cross_ring_or_information_schema_surface() {
+pub(crate) fn adr104_no_execution_pbc_storage_wendelon_information_schema_surface() {
 	let logical = source("src/ir.rs");
 	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
 	let execution = source("src/ir/execution.rs");
@@ -1857,10 +1835,9 @@ pub(crate) fn adr103_no_runtime_cross_ring_or_information_schema_surface() {
 	let storage = source("src/storage.rs");
 	let coordinator = source("src/coordinator.rs");
 	let runtime_markers = [
-		"apply_derived_alias_column_list",
-		"derived table alias column",
-		"alias column lists over SELECT *",
-		"TableAliasColumnDef",
+		"alias_column_names",
+		"bind_alias_column_rename",
+		"AliasColumn",
 		"DerivedAlias",
 	];
 	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
@@ -1868,11 +1845,10 @@ pub(crate) fn adr103_no_runtime_cross_ring_or_information_schema_surface() {
 		.filter(|(_, _, line)| runtime_markers.iter().any(|marker| line.contains(marker)))
 		.collect::<Vec<_>>();
 
+	assert!(logical_plan.contains("Alias"));
+	assert!(logical_plan.contains("columns: Vec<String>"));
+	assert!(!execution_plan.contains("Alias"));
 	for marker in runtime_markers {
-		assert!(
-			!logical_plan.contains(marker),
-			"{marker} leaked to LogicalPlan"
-		);
 		assert!(
 			!execution_plan.contains(marker),
 			"{marker} leaked to ExecutionPlan"
@@ -1891,9 +1867,43 @@ pub(crate) fn adr103_no_runtime_cross_ring_or_information_schema_surface() {
 	}
 	assert!(
 		wendelon_offenders.is_empty(),
-		"ADR103 helper leaked to Wendelon:\n{}",
+		"ADR104 alias-column helper leaked to Wendelon:\n{}",
 		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
 	);
+}
+
+#[test]
+pub(crate) fn adr104_alias_match_sweep_is_complete() {
+	for relative in [
+		"src/binder.rs",
+		"src/sql_planner.rs",
+		"src/exec.rs",
+		"src/audit.rs",
+		"src/daemon.rs",
+		"tests/rune_relation_handles_test.rs",
+	] {
+		let source = source(relative);
+		for stale in [
+			"LogicalPlan::Alias { input, alias }",
+			"LogicalPlan::Alias { input, alias: _ }",
+		] {
+			assert!(
+				!source.contains(stale),
+				"{relative} contains stale Alias match {stale}"
+			);
+		}
+	}
+}
+
+#[test]
+pub(crate) fn adr103_alias_column_guards_retarget_to_104_unified_path() {
+	let planner = source("src/sql_planner.rs");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+
+	assert!(!planner.contains("fn apply_derived_alias_column_list"));
+	assert!(logical_type_ddl.contains("alias_columns_explicit_derived_rename_output"));
+	assert!(logical_type_ddl.contains("alias_columns_wildcard_derived_rename_output"));
+	assert!(logical_type_ddl.contains("alias_columns_arity_mismatch_rejects_at_bind"));
 }
 
 #[test]

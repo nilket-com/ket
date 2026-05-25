@@ -649,6 +649,7 @@ pub enum LogicalPlan {
 	Alias {
 		input: Box<LogicalPlan>,
 		alias: TableRef,
+		columns: Vec<String>,
 	},
 	Filter {
 		input: Box<LogicalPlan>,
