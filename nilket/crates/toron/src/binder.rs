@@ -1456,6 +1456,13 @@ struct StoredRefinementAtom {
 	refinement: LogicalTypeRefinementPredicate,
 }
 
+const STORED_REFINEMENT_RECEIPT_MAX_DEPTH: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct StoredRefinementReceipt<'a> {
+	field: &'a Field,
+}
+
 fn refinement_static_filter_class(
 	input: &ExecutionPlan,
 	predicate: &BoundExprProgram,
@@ -1485,14 +1492,6 @@ fn stored_scan_refinement_atom(
 	predicate: &BoundExprProgram,
 	logical_types: &LogicalTypeRegistry,
 ) -> Option<StoredRefinementAtom> {
-	let ExecutionPlan::Scan {
-		projection: None,
-		schema,
-		..
-	} = input
-	else {
-		return None;
-	};
 	let root = predicate.single_root()?;
 	let BoundExprNode::Binary { op, left, right } = predicate.node(root)? else {
 		return None;
@@ -1506,7 +1505,8 @@ fn stored_scan_refinement_atom(
 	let BoundExprNode::Column(column) = predicate.node(column_node)? else {
 		return None;
 	};
-	let field = schema.fields().get(column.ordinal.0 as usize)?;
+	let receipt = stored_refinement_receipt(input, column.ordinal, 0)?;
+	let field = receipt.field;
 	let logical_type = predicate.node_logical_type(column_node)?;
 	if logical_type.is_naked() {
 		return None;
@@ -1522,6 +1522,48 @@ fn stored_scan_refinement_atom(
 		literal,
 		refinement,
 	})
+}
+
+fn transparent_project_child_ordinal(
+	exprs: &BoundExprProgram,
+	ordinal: ColumnOrdinal,
+) -> Option<ColumnOrdinal> {
+	let root = *exprs.roots.get(ordinal.0 as usize)?;
+	match exprs.node(root)? {
+		BoundExprNode::Column(column) => Some(column.ordinal),
+		_ => None,
+	}
+}
+
+fn stored_refinement_receipt<'a>(
+	input: &'a ExecutionPlan,
+	ordinal: ColumnOrdinal,
+	depth: usize,
+) -> Option<StoredRefinementReceipt<'a>> {
+	if depth > STORED_REFINEMENT_RECEIPT_MAX_DEPTH {
+		return None;
+	}
+	match input {
+		ExecutionPlan::Scan {
+			projection: None,
+			schema,
+			..
+		} => {
+			let field = schema.fields().get(ordinal.0 as usize)?.as_ref();
+			Some(StoredRefinementReceipt { field })
+		}
+		ExecutionPlan::Project { input, exprs, .. } => {
+			let child = transparent_project_child_ordinal(exprs, ordinal)?;
+			let input_schema = input.schema();
+			let child_field = input_schema.fields().get(child.0 as usize)?;
+			let child_logical_type = decode_column_logical_type(child_field).ok()?;
+			if exprs.root_logical_type(ordinal.0 as usize)? != child_logical_type {
+				return None;
+			}
+			stored_refinement_receipt(input, child, depth + 1)
+		}
+		_ => None,
+	}
 }
 
 fn filter_refinement_cmp_op(op: &BoundBinaryOp) -> Option<RefinementCmpOp> {

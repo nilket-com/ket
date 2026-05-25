@@ -1364,15 +1364,17 @@ pub(crate) fn adr097_refinement_elision_uses_durable_registry_not_seed() {
 pub(crate) fn adr097_refinement_elision_requires_stored_scan_column_provenance() {
 	let binder = source("src/binder.rs");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
 
-	assert!(scan_atom.contains("ExecutionPlan::Scan"));
-	assert!(scan_atom.contains("projection: None"));
+	assert!(receipt.contains("ExecutionPlan::Scan"));
+	assert!(receipt.contains("projection: None"));
 	assert!(scan_atom.contains("BoundExprNode::Column"));
 	assert!(scan_atom.contains("node_logical_type(column_node)"));
 	assert!(scan_atom.contains("refinement"));
 	assert!(logical_type_ddl.contains("cast_ascribed_projected_column_does_not_elide"));
-	assert!(logical_type_ddl.contains("refinement_on_non_scan_input_does_not_elide"));
+	assert!(logical_type_ddl.contains("refinement_through_transparent_project_elides"));
+	assert!(!logical_type_ddl.contains("refinement_on_non_scan_input_does_not_elide"));
 }
 
 #[test]
@@ -1380,8 +1382,9 @@ pub(crate) fn adr097_refinement_elision_only_from_durable_stored_scan_receipts()
 	let binder = source("src/binder.rs");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 
-	assert!(scan_atom.contains("projection: None"));
+	assert!(receipt.contains("projection: None"));
 	assert!(scan_atom.contains("logical_types.spec(logical_type)"));
 	assert!(logical_type_ddl.contains("refinement_elision_uses_durable_registry_not_seed_lookup"));
 	assert!(logical_type_ddl.contains("naked_or_unrefined_column_does_not_elide"));
@@ -1495,10 +1498,11 @@ pub(crate) fn adr098_and_decomposition_inherits_097_durable_registry_and_scan_pr
 	let binder = source("src/binder.rs");
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 
 	assert!(and_classifier.contains("static_filter_atom_class(input, &isolated, logical_types)"));
-	assert!(scan_atom.contains("ExecutionPlan::Scan"));
-	assert!(scan_atom.contains("projection: None"));
+	assert!(receipt.contains("ExecutionPlan::Scan"));
+	assert!(receipt.contains("projection: None"));
 	assert!(scan_atom.contains("BoundExprNode::Column"));
 	assert!(scan_atom.contains("node_logical_type(column_node)"));
 	assert!(scan_atom.contains("logical_types.spec(logical_type)"));
@@ -1576,15 +1580,199 @@ pub(crate) fn adr098_no_wendelon_pbc_executor_storage_or_wire_change() {
 }
 
 #[test]
+pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support() {
+	let planner = source("src/sql_planner.rs");
+	let lower_select = first_block(&planner, "fn lower_select");
+	let table_factor = first_block(&planner, "fn lower_table_factor");
+	let query_shape = first_block(&planner, "fn validate_derived_query_shape");
+	let select_shape = first_block(&planner, "fn validate_derived_select_shape");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+
+	assert!(table_factor.contains("TableFactor::Derived"));
+	for marker in [
+		"lateral",
+		"sample",
+		"derived tables require an alias",
+		"derived table alias column lists are not supported",
+		"lower_derived_table",
+	] {
+		assert!(
+			table_factor.contains(marker),
+			"missing derived arm marker {marker}"
+		);
+	}
+	for marker in [
+		"query.with.is_some()",
+		"query.order_by.is_some()",
+		"query_has_limit_or_offset",
+		"query.fetch.is_some()",
+		"SetExpr::Select",
+		"unsupported derived table query body",
+	] {
+		assert!(
+			query_shape.contains(marker),
+			"missing query-shape marker {marker}"
+		);
+	}
+	for marker in [
+		"projection_contains_aggregate_call",
+		"projection_contains_window_function",
+		"group_by_is_empty",
+		"select.from.len() != 1",
+		"!source.joins.is_empty()",
+		"TableFactor::Derived",
+		"unsupported derived table source",
+	] {
+		assert!(
+			select_shape.contains(marker),
+			"missing select-shape marker {marker}"
+		);
+	}
+	assert!(lower_select.contains("table_factor_is_derived"));
+	assert!(lower_select.contains("joins around derived tables are not supported"));
+	assert!(
+		logical_type_ddl.contains("derived_table_source_scope_rejects_general_subquery_features")
+	);
+}
+
+#[test]
+pub(crate) fn adr100_refinement_provenance_crosses_only_transparent_project() {
+	let binder = source("src/binder.rs");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
+	let child_ordinal = first_block(&binder, "fn transparent_project_child_ordinal");
+
+	assert!(receipt.contains("ExecutionPlan::Project"));
+	assert!(receipt.contains("transparent_project_child_ordinal(exprs, ordinal)"));
+	assert!(receipt.contains("stored_refinement_receipt(input, child, depth + 1)"));
+	assert!(receipt.contains("ExecutionPlan::Scan"));
+	assert!(receipt.contains("projection: None"));
+	assert!(receipt.contains("decode_column_logical_type(child_field)"));
+	assert!(receipt.contains("exprs.root_logical_type(ordinal.0 as usize)"));
+	assert!(child_ordinal.contains("exprs.roots.get(ordinal.0 as usize)"));
+	assert!(child_ordinal.contains("BoundExprNode::Column(column)"));
+	assert!(child_ordinal.contains("_ => None"));
+}
+
+#[test]
+pub(crate) fn adr100_refinement_receipt_root_is_scan_or_transparent_project_chain() {
+	let binder = source("src/binder.rs");
+	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+
+	assert!(scan_atom.contains("stored_refinement_receipt(input, column.ordinal, 0)"));
+	assert!(!scan_atom.contains("let ExecutionPlan::Scan"));
+	assert!(receipt.contains("ExecutionPlan::Scan"));
+	assert!(receipt.contains("ExecutionPlan::Project"));
+	assert!(receipt.contains("_ => None"));
+	assert!(logical_type_ddl.contains("refinement_through_transparent_project_elides"));
+	assert!(logical_type_ddl.contains("cast_ascribed_projected_column_does_not_elide"));
+	assert!(!logical_type_ddl.contains("refinement_on_non_scan_input_does_not_elide"));
+}
+
+#[test]
+pub(crate) fn adr100_refinement_receipt_reuses_089_identity_no_redrive() {
+	let binder = source("src/binder.rs");
+	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
+
+	assert!(scan_atom.contains("predicate.node_logical_type(column_node)"));
+	assert!(scan_atom.contains("logical_type.is_naked()"));
+	assert!(scan_atom.contains("logical_types.spec(logical_type)"));
+	assert!(scan_atom.contains("receipt.field"));
+	assert!(!scan_atom.contains("logical_type_spec"));
+	assert!(!scan_atom.contains("logical_type_name"));
+	assert!(!scan_atom.contains("CUSTOMER_ID_LOGICAL_TYPE"));
+	assert!(!scan_atom.contains("field.name"));
+	assert!(!receipt.contains("logical_types.spec"));
+	assert!(!receipt.contains("logical_type_spec"));
+}
+
+#[test]
+pub(crate) fn adr100_eager_error_fence_policy_unchanged() {
+	let binder = source("src/binder.rs");
+	let classifier = first_block(&binder, "fn static_filter_class");
+	let and_classifier = first_block(&binder, "fn static_filter_and_class");
+	let conjunct_checker = first_block(&binder, "fn static_elision_error_free_conjunct");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+
+	assert!(classifier.contains("static_filter_and_class(input, predicate, logical_types)"));
+	assert!(classifier.contains("static_filter_atom_class(input, predicate, logical_types)"));
+	assert!(and_classifier.contains("static_elision_error_free_conjunct(&isolated)"));
+	assert!(and_classifier.contains("StaticFilterClass::AlwaysPass | StaticFilterClass::Unknown"));
+	assert!(conjunct_checker.contains("StaticFilterClass::Unknown"));
+	assert!(logical_type_ddl.contains("derived_table_outer_filter_keeps_098_eager_error_fence"));
+}
+
+#[test]
+pub(crate) fn adr100_no_projected_scan_receipt_until_elision_has_a_consumer() {
+	let binder = source("src/binder.rs");
+	let bind_entry = first_block(&binder, "pub async fn bind");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
+
+	assert!(bind_entry.contains("bind_plan(plan).await?"));
+	assert!(bind_entry.contains("push_down_scan_projection(plan)"));
+	assert!(receipt.contains("projection: None"));
+	assert!(!receipt.contains("projection: Some"));
+}
+
+#[test]
+pub(crate) fn adr100_no_ir_exec_pbc_storage_or_wendelon_change() {
+	let logical = source("src/ir.rs");
+	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
+	let execution = source("src/ir/execution.rs");
+	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
+	let planner = source("src/sql_planner.rs");
+	let binder = source("src/binder.rs");
+	let pbc = source("src/pbc.rs");
+	let executor = source("src/exec.rs");
+	let storage = source("src/storage.rs");
+	let coordinator = source("src/coordinator.rs");
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("stored_refinement_receipt")
+				|| line.contains("transparent_project_child_ordinal")
+				|| line.contains("validate_derived_query_shape")
+				|| line.contains("TableFactor::Derived")
+		})
+		.collect::<Vec<_>>();
+
+	assert!(!logical_plan.contains("Derived"));
+	assert!(!execution_plan.contains("Derived"));
+	assert!(planner.contains("TableFactor::Derived"));
+	assert!(binder.contains("stored_refinement_receipt"));
+	for marker in [
+		"stored_refinement_receipt",
+		"transparent_project_child_ordinal",
+		"validate_derived_query_shape",
+		"TableFactor::Derived",
+	] {
+		assert!(!pbc.contains(marker), "{marker} leaked to PBC");
+		assert!(!executor.contains(marker), "{marker} leaked to executor");
+		assert!(!storage.contains(marker), "{marker} leaked to storage");
+		assert!(
+			!coordinator.contains(marker),
+			"{marker} leaked to coordinator"
+		);
+	}
+	assert!(
+		wendelon_offenders.is_empty(),
+		"ADR100 helper leaked to Wendelon:\n{}",
+		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
+	);
+}
+
+#[test]
 pub(crate) fn adr097_cast_try_cast_remain_ephemeral_not_receipts() {
 	let binder = source("src/binder.rs");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
 	let sql_logical_cast = first_block(&binder, "fn bind_sql_logical_cast");
-	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 
 	assert!(sql_logical_cast.contains("set_node_logical_type"));
 	assert!(!sql_logical_cast.contains("refinement"));
-	assert!(scan_atom.contains("ExecutionPlan::Scan"));
+	assert!(receipt.contains("ExecutionPlan::Scan"));
 	assert!(logical_type_ddl.contains("cast_ascribed_projected_column_does_not_elide"));
 }
 

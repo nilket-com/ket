@@ -1126,6 +1126,108 @@ async fn refined_positive_column_range_disjoint_elides() {
 }
 
 #[tokio::test]
+async fn derived_table_transparent_projection_refinement_elides_to_empty_relation() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT person_id FROM (SELECT id AS person_id FROM people) AS p WHERE person_id < 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn derived_table_projection_subset_reorder_and_rename_preserve_refinement_elision() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT renamed_id FROM (SELECT note, id AS renamed_id FROM people) AS p WHERE renamed_id < 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn derived_table_computed_projection_binds_but_does_not_refinement_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT id FROM (SELECT id + 0 AS id FROM people) AS p WHERE id < 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn derived_table_outer_projection_is_unconstrained() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT person_id + 1 FROM (SELECT id AS person_id FROM people) AS p WHERE person_id < 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn derived_table_outer_filter_keeps_098_eager_error_fence() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT person_id FROM (SELECT id AS person_id FROM people) AS p WHERE person_id < 0 AND CAST(2147483648.0 AS INT) = 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn derived_table_source_scope_rejects_general_subquery_features() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	for sql in [
+		"SELECT id FROM (SELECT id FROM people) WHERE id < 0",
+		"SELECT id FROM (SELECT id FROM people) AS p(id) WHERE id < 0",
+		"SELECT id FROM LATERAL (SELECT id FROM people) AS p WHERE id < 0",
+		"SELECT id FROM (SELECT id FROM (SELECT id FROM people) AS q) AS p WHERE id < 0",
+		"SELECT id FROM (SELECT people.id FROM people JOIN people AS other ON people.id = other.id) AS p WHERE id < 0",
+		"SELECT id FROM (SELECT id FROM people) AS p JOIN people AS other ON p.id = other.id",
+		"SELECT id FROM (SELECT COUNT(*) AS id FROM people) AS p WHERE id < 0",
+		"SELECT id FROM (SELECT id, COUNT(*) AS n FROM people GROUP BY id) AS p WHERE id < 0",
+		"SELECT id FROM (SELECT id FROM people ORDER BY id LIMIT 1) AS p WHERE id < 0",
+		"SELECT id FROM (WITH q AS (SELECT id FROM people) SELECT id FROM q) AS p WHERE id < 0",
+		"SELECT id FROM (SELECT id FROM people UNION SELECT id FROM people) AS p WHERE id < 0",
+	] {
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "derived").await;
+	}
+}
+
+#[tokio::test]
 async fn refinement_and_safe_conjunct_elides_to_empty_relation() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_person_id_people(&coordinator, &planner).await;
@@ -1241,7 +1343,10 @@ async fn refinement_and_non_receipt_shapes_do_not_elide() {
 				table: TableRef::new("people"),
 				projection: None,
 			}),
-			exprs: vec![Expr::column("id"), Expr::column("note")],
+			exprs: vec![
+				Expr::Cast(Box::new(Expr::column("id")), DataType::Int64),
+				Expr::column("note"),
+			],
 			output_names: vec![Some("id".to_string()), Some("note".to_string())],
 		}),
 		predicate: Expr::And(
@@ -1317,7 +1422,7 @@ async fn cast_ascribed_projected_column_does_not_elide() {
 }
 
 #[tokio::test]
-async fn refinement_on_non_scan_input_does_not_elide() {
+async fn refinement_through_transparent_project_elides() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_person_id_people(&coordinator, &planner).await;
 	let plan = LogicalPlan::Filter {
@@ -1336,10 +1441,10 @@ async fn refinement_on_non_scan_input_does_not_elide() {
 	};
 	let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
 		.await
-		.expect("bind projected refined non-scan plan");
+		.expect("bind projected refined transparent plan");
 
-	assert!(find_empty_relation(&bound).is_none());
-	assert!(contains_scan(&bound));
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
 }
 
 #[tokio::test]
@@ -1854,6 +1959,33 @@ async fn bind_sql(catalog: &MockCatalog, planner: &SqlPlanner, sql: &str) -> Exe
 	)
 	.await
 	.expect(sql)
+}
+
+async fn expect_plan_or_bind_error_contains(
+	catalog: &MockCatalog,
+	planner: &SqlPlanner,
+	sql: &str,
+	needle: &str,
+) {
+	let plan = match planner.plan(sql) {
+		Ok(plan) => plan,
+		Err(err) => {
+			let message = format!("{err:?}");
+			assert!(
+				message.contains(needle),
+				"expected planning error for {sql:?} to contain {needle:?}, got {message}"
+			);
+			return;
+		}
+	};
+	let err = bind(&plan, catalog, &PlannerConfig::default())
+		.await
+		.expect_err(sql);
+	let message = format!("{err:?}");
+	assert!(
+		message.contains(needle),
+		"expected binding error for {sql:?} to contain {needle:?}, got {message}"
+	);
 }
 
 async fn bind_logical(catalog: &MockCatalog, plan: LogicalPlan) -> ExecutionPlan {

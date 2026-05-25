@@ -2601,8 +2601,15 @@ impl SqlPlanner {
 		if group_keys.is_some() && !table_with_joins.joins.is_empty() {
 			return Err(unsupported("GROUP BY over joins is not supported"));
 		}
+		if table_factor_is_derived(&table_with_joins.relation) && !table_with_joins.joins.is_empty()
+		{
+			return Err(unsupported("joins around derived tables are not supported"));
+		}
 		let mut plan = self.lower_table_factor(&table_with_joins.relation)?;
 		for join in &table_with_joins.joins {
+			if table_factor_is_derived(&join.relation) {
+				return Err(unsupported("joins around derived tables are not supported"));
+			}
 			let right = self.lower_table_factor(&join.relation)?;
 			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
 			let (left_keys, right_keys) = self.join_exchange_keys(&on, &plan, &right)?;
@@ -3307,6 +3314,23 @@ impl SqlPlanner {
 		Ok((AggregateFunction::ApproxQuantile(q), vec![val]))
 	}
 
+	fn lower_derived_table(
+		&self,
+		subquery: &Query,
+		alias: &TableAlias,
+	) -> Result<LogicalPlan, FrontendError> {
+		let select = validate_derived_query_shape(subquery)?;
+		validate_derived_select_shape(select)?;
+		let LoweredSelect {
+			plan,
+			aggregate_output_catalog,
+		} = self.lower_select(select)?;
+		if aggregate_output_catalog.is_some() {
+			return Err(unsupported("aggregate derived tables are not supported"));
+		}
+		Ok(alias_plan(plan, Some(alias)))
+	}
+
 	fn lower_table_factor(&self, factor: &TableFactor) -> Result<LogicalPlan, FrontendError> {
 		match factor {
 			TableFactor::Table {
@@ -3351,6 +3375,31 @@ impl SqlPlanner {
 					projection: None,
 				};
 				Ok(alias_plan(plan, alias.as_ref()))
+			}
+			TableFactor::Derived {
+				lateral,
+				subquery,
+				alias,
+				sample,
+			} => {
+				if *lateral {
+					return Err(unsupported("lateral derived tables are not supported"));
+				}
+				if sample.is_some() {
+					return Err(unsupported("sampled derived tables are not supported"));
+				}
+				let alias = alias
+					.as_ref()
+					.ok_or_else(|| unsupported("derived tables require an alias"))?;
+				if !alias.columns.is_empty() {
+					return Err(unsupported(
+						"derived table alias column lists are not supported",
+					));
+				}
+				if alias.at.is_some() {
+					return Err(unsupported("derived table alias AT is not supported"));
+				}
+				self.lower_derived_table(subquery, alias)
 			}
 			_ => Err(unsupported("unsupported table factor")),
 		}
@@ -4735,10 +4784,23 @@ fn projection_contains_aggregate_call(projection: &[SelectItem]) -> bool {
 	projection.iter().any(select_item_contains_aggregate_call)
 }
 
+fn projection_contains_window_function(projection: &[SelectItem]) -> bool {
+	projection.iter().any(select_item_contains_window_function)
+}
+
 fn select_item_contains_aggregate_call(item: &SelectItem) -> bool {
 	match item {
 		SelectItem::UnnamedExpr(expr) => expr_contains_aggregate_call(expr),
 		SelectItem::ExprWithAlias { expr, alias: _ } => expr_contains_aggregate_call(expr),
+		SelectItem::ExprWithAliases { .. } => false,
+		SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => false,
+	}
+}
+
+fn select_item_contains_window_function(item: &SelectItem) -> bool {
+	match item {
+		SelectItem::UnnamedExpr(expr) => expr_contains_window_function(expr),
+		SelectItem::ExprWithAlias { expr, alias: _ } => expr_contains_window_function(expr),
 		SelectItem::ExprWithAliases { .. } => false,
 		SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => false,
 	}
@@ -5074,6 +5136,10 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 	}
 }
 
+fn table_factor_is_derived(factor: &TableFactor) -> bool {
+	matches!(factor, TableFactor::Derived { .. })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinSide {
 	Left,
@@ -5132,6 +5198,69 @@ fn validate_exists_query_shape(query: &Query) -> Result<(), FrontendError> {
 		return Err(unsupported("unsupported EXISTS subquery shape"));
 	}
 	Ok(())
+}
+
+fn validate_derived_query_shape(query: &Query) -> Result<&Select, FrontendError> {
+	if query.with.is_some()
+		|| query.order_by.is_some()
+		|| query_has_limit_or_offset(query.limit_clause.as_ref())
+		|| query.fetch.is_some()
+		|| !query.locks.is_empty()
+		|| query.for_clause.is_some()
+		|| query.settings.is_some()
+		|| query.format_clause.is_some()
+		|| !query.pipe_operators.is_empty()
+	{
+		return Err(unsupported("unsupported derived table query shape"));
+	}
+
+	match query.body.as_ref() {
+		SetExpr::Select(select) => Ok(select.as_ref()),
+		_ => Err(unsupported("unsupported derived table query body")),
+	}
+}
+
+fn validate_derived_select_shape(select: &Select) -> Result<(), FrontendError> {
+	if select.distinct.is_some()
+		|| select.top.is_some()
+		|| select.into.is_some()
+		|| !select.lateral_views.is_empty()
+		|| select.prewhere.is_some()
+		|| !group_by_is_empty(&select.group_by)
+		|| !select.cluster_by.is_empty()
+		|| !select.distribute_by.is_empty()
+		|| !select.sort_by.is_empty()
+		|| select.having.is_some()
+		|| !select.named_window.is_empty()
+		|| select.qualify.is_some()
+		|| select.value_table_mode.is_some()
+		|| !select.connect_by.is_empty()
+		|| !select.optimizer_hints.is_empty()
+		|| select.select_modifiers.is_some()
+		|| select.exclude.is_some()
+		|| !matches!(select.flavor, sqlparser::ast::SelectFlavor::Standard)
+	{
+		return Err(unsupported("unsupported derived table select shape"));
+	}
+	if projection_contains_aggregate_call(&select.projection)
+		|| projection_contains_window_function(&select.projection)
+	{
+		return Err(unsupported("unsupported derived table projection"));
+	}
+	if select.from.len() != 1 {
+		return Err(unsupported(
+			"derived table subquery must have exactly one FROM source",
+		));
+	}
+	let source = &select.from[0];
+	if !source.joins.is_empty() {
+		return Err(unsupported("joins inside derived tables are not supported"));
+	}
+	match &source.relation {
+		TableFactor::Table { .. } => Ok(()),
+		TableFactor::Derived { .. } => Err(unsupported("nested derived tables are not supported")),
+		_ => Err(unsupported("unsupported derived table source")),
+	}
 }
 
 fn validate_exists_select_shape(select: &Select) -> Result<(), FrontendError> {
