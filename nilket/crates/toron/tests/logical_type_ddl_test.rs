@@ -1207,13 +1207,159 @@ async fn derived_table_outer_filter_keeps_098_eager_error_fence() {
 }
 
 #[tokio::test]
+async fn derived_table_alias_columns_rename_output() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT pid FROM (SELECT id FROM people) AS p(pid)",
+	)
+	.await;
+
+	assert_eq!(bound.schema().field(0).name(), "pid");
+}
+
+#[tokio::test]
+async fn derived_table_alias_columns_hide_original_names() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	let plan = planner
+		.plan("SELECT id FROM (SELECT id FROM people) AS p(pid)")
+		.expect("plan derived alias column query");
+
+	let err = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect_err("old derived output name should not bind");
+
+	assert!(matches!(
+		err,
+		BindingError::UnknownColumn { column } if column == "id"
+	));
+}
+
+#[test]
+fn derived_table_alias_columns_arity_mismatch_rejects() {
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"SELECT a FROM (SELECT id FROM people) AS p(a, b)",
+		"SELECT a FROM (SELECT id, note FROM people) AS p(a)",
+	] {
+		let err = planner
+			.plan(sql)
+			.expect_err("derived alias column arity should fail during planning");
+		let message = format!("{err:?}");
+		for needle in ["arity mismatch", "expected", "got"] {
+			assert!(
+				message.contains(needle),
+				"expected planning error for {sql:?} to contain {needle:?}, got {message}"
+			);
+		}
+	}
+}
+
+#[tokio::test]
+async fn derived_table_alias_columns_preserve_refinement_elision() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT pid FROM (SELECT id FROM people) AS p(pid) WHERE pid < 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_some());
+	assert!(!contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn derived_table_alias_columns_computed_projection_renames_but_is_not_transparent() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT computed FROM (SELECT id + 0 FROM people) AS p(computed) WHERE computed < 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+}
+
+#[tokio::test]
+async fn derived_table_alias_columns_wildcard_remains_deferred() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT pid FROM (SELECT * FROM people) AS p(pid)",
+		"alias column lists over SELECT * derived tables are not supported",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn derived_table_alias_columns_reject_type_annotations() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT pid FROM (SELECT id FROM people) AS p(pid BIGINT)",
+		"derived table alias column type annotations are not supported",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn derived_table_alias_columns_duplicate_names_inherit_ambiguity() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	let plan = planner
+		.plan("SELECT dup FROM (SELECT id, note FROM people) AS p(dup, dup)")
+		.expect("plan duplicate derived alias columns");
+
+	let err = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect_err("duplicate derived alias output should be ambiguous");
+
+	assert!(matches!(
+		err,
+		BindingError::AmbiguousColumn { column } if column == "dup"
+	));
+}
+
+#[tokio::test]
+async fn derived_table_alias_columns_compose() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT label FROM (SELECT id, note FROM people) AS p(pid, label) WHERE pid > 0 ORDER BY label",
+	)
+	.await;
+
+	assert_eq!(bound.schema().field(0).name(), "label");
+}
+
+#[tokio::test]
 async fn derived_table_source_scope_rejects_general_subquery_features() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_person_id_people(&coordinator, &planner).await;
 
 	for sql in [
 		"SELECT id FROM (SELECT id FROM people) WHERE id < 0",
-		"SELECT id FROM (SELECT id FROM people) AS p(id) WHERE id < 0",
 		"SELECT id FROM LATERAL (SELECT id FROM people) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT id FROM (SELECT id FROM people) AS q) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT people.id FROM people JOIN people AS other ON people.id = other.id) AS p WHERE id < 0",

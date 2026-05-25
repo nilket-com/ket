@@ -1593,7 +1593,7 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 		"lateral",
 		"sample",
 		"derived tables require an alias",
-		"derived table alias column lists are not supported",
+		"derived table alias AT is not supported",
 		"lower_derived_table",
 	] {
 		assert!(
@@ -1759,6 +1759,139 @@ pub(crate) fn adr100_no_ir_exec_pbc_storage_or_wendelon_change() {
 	assert!(
 		wendelon_offenders.is_empty(),
 		"ADR100 helper leaked to Wendelon:\n{}",
+		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr103_derived_alias_columns_are_project_output_name_rewrites() {
+	let planner = source("src/sql_planner.rs");
+	let helper = first_block(&planner, "fn apply_derived_alias_column_list");
+	let lower_derived = first_block(&planner, "fn lower_derived_table");
+	let table_factor = first_block(&planner, "fn lower_table_factor");
+
+	assert!(helper.contains("alias_columns.is_empty()"));
+	assert!(helper.contains("column.data_type.is_some()"));
+	assert!(helper.contains("LogicalPlan::Project"));
+	assert!(helper.contains("alias_columns.len() != output_names.len()"));
+	assert!(helper.contains("column.name.value.clone()"));
+	assert!(helper.contains("alias column lists over SELECT * derived tables are not supported"));
+	assert!(!helper.contains("LogicalPlan::Alias"));
+	assert!(lower_derived.contains("apply_derived_alias_column_list(plan, &alias.columns)"));
+	assert!(!table_factor.contains("derived table alias column lists are not supported"));
+}
+
+#[test]
+pub(crate) fn adr103_alias_columns_do_not_extend_alias_or_ir() {
+	let planner = source("src/sql_planner.rs");
+	let alias_plan = first_block(&planner, "fn alias_plan");
+	let binder = source("src/binder.rs");
+	let bind_plan = first_block(&binder, "fn bind_plan");
+	let logical = source("src/ir.rs");
+	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
+	let execution = source("src/ir/execution.rs");
+	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
+
+	assert!(alias_plan.contains("LogicalPlan::Alias"));
+	assert!(alias_plan.contains("TableRef::new(alias.name.value.clone())"));
+	assert!(!alias_plan.contains("columns"));
+	assert!(bind_plan.contains("LogicalPlan::Alias { input, .. } => self.bind_plan(input).await"));
+	for marker in ["AliasColumn", "TableAliasColumnDef", "DerivedAlias"] {
+		assert!(
+			!logical_plan.contains(marker),
+			"{marker} leaked to LogicalPlan"
+		);
+		assert!(
+			!execution_plan.contains(marker),
+			"{marker} leaked to ExecutionPlan"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr103_alias_column_renames_reuse_transparent_project_receipt() {
+	let binder = source("src/binder.rs");
+	let child_ordinal = first_block(&binder, "fn transparent_project_child_ordinal");
+	let receipt = first_block(&binder, "fn stored_refinement_receipt");
+	let planner = source("src/sql_planner.rs");
+	let helper = first_block(&planner, "fn apply_derived_alias_column_list");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+
+	assert!(logical_type_ddl.contains("derived_table_alias_columns_preserve_refinement_elision"));
+	assert!(receipt.contains("transparent_project_child_ordinal(exprs, ordinal)"));
+	assert!(child_ordinal.contains("BoundExprNode::Column(column)"));
+	for marker in [
+		"LogicalTypeId",
+		"decode_column_logical_type",
+		"field.name",
+		"transparent_project_child_ordinal",
+		"BoundExprNode",
+	] {
+		assert!(
+			!helper.contains(marker),
+			"{marker} leaked to alias-column rename helper"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr103_wildcard_alias_columns_remain_deferred() {
+	let planner = source("src/sql_planner.rs");
+	let helper = first_block(&planner, "fn apply_derived_alias_column_list");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+
+	assert!(helper.contains("alias column lists over SELECT * derived tables are not supported"));
+	assert!(logical_type_ddl.contains("derived_table_alias_columns_wildcard_remains_deferred"));
+}
+
+#[test]
+pub(crate) fn adr103_no_runtime_cross_ring_or_information_schema_surface() {
+	let logical = source("src/ir.rs");
+	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
+	let execution = source("src/ir/execution.rs");
+	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
+	let binder = source("src/binder.rs");
+	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
+	let pbc = source("src/pbc.rs");
+	let executor = source("src/exec.rs");
+	let storage = source("src/storage.rs");
+	let coordinator = source("src/coordinator.rs");
+	let runtime_markers = [
+		"apply_derived_alias_column_list",
+		"derived table alias column",
+		"alias column lists over SELECT *",
+		"TableAliasColumnDef",
+		"DerivedAlias",
+	];
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| runtime_markers.iter().any(|marker| line.contains(marker)))
+		.collect::<Vec<_>>();
+
+	for marker in runtime_markers {
+		assert!(
+			!logical_plan.contains(marker),
+			"{marker} leaked to LogicalPlan"
+		);
+		assert!(
+			!execution_plan.contains(marker),
+			"{marker} leaked to ExecutionPlan"
+		);
+		assert!(
+			!information_schema.contains(marker),
+			"{marker} leaked to information_schema"
+		);
+		assert!(!pbc.contains(marker), "{marker} leaked to PBC");
+		assert!(!executor.contains(marker), "{marker} leaked to executor");
+		assert!(!storage.contains(marker), "{marker} leaked to storage");
+		assert!(
+			!coordinator.contains(marker),
+			"{marker} leaked to coordinator"
+		);
+	}
+	assert!(
+		wendelon_offenders.is_empty(),
+		"ADR103 helper leaked to Wendelon:\n{}",
 		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
 	);
 }

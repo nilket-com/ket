@@ -13,8 +13,8 @@ use sqlparser::ast::{
 	ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
 	FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident, Insert,
 	JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderBy,
-	OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableConstraint,
-	TableFactor, TableObject, UnaryOperator, Value,
+	OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableAliasColumnDef,
+	TableConstraint, TableFactor, TableObject, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -3328,6 +3328,7 @@ impl SqlPlanner {
 		if aggregate_output_catalog.is_some() {
 			return Err(unsupported("aggregate derived tables are not supported"));
 		}
+		let plan = apply_derived_alias_column_list(plan, &alias.columns)?;
 		Ok(alias_plan(plan, Some(alias)))
 	}
 
@@ -3391,11 +3392,6 @@ impl SqlPlanner {
 				let alias = alias
 					.as_ref()
 					.ok_or_else(|| unsupported("derived tables require an alias"))?;
-				if !alias.columns.is_empty() {
-					return Err(unsupported(
-						"derived table alias column lists are not supported",
-					));
-				}
 				if alias.at.is_some() {
 					return Err(unsupported("derived table alias AT is not supported"));
 				}
@@ -5444,6 +5440,50 @@ fn collect_scope_refs(
 		_ => {}
 	}
 	Ok(())
+}
+
+fn apply_derived_alias_column_list(
+	plan: LogicalPlan,
+	alias_columns: &[TableAliasColumnDef],
+) -> Result<LogicalPlan, FrontendError> {
+	if alias_columns.is_empty() {
+		return Ok(plan);
+	}
+	if alias_columns
+		.iter()
+		.any(|column| column.data_type.is_some())
+	{
+		return Err(unsupported(
+			"derived table alias column type annotations are not supported",
+		));
+	}
+	match plan {
+		LogicalPlan::Project {
+			input,
+			exprs,
+			output_names,
+		} => {
+			if alias_columns.len() != output_names.len() {
+				return Err(unsupported(format!(
+					"derived table alias column list arity mismatch: expected {}, got {}",
+					output_names.len(),
+					alias_columns.len()
+				)));
+			}
+			let output_names = alias_columns
+				.iter()
+				.map(|column| Some(column.name.value.clone()))
+				.collect();
+			Ok(LogicalPlan::Project {
+				input,
+				exprs,
+				output_names,
+			})
+		}
+		_ => Err(unsupported(
+			"alias column lists over SELECT * derived tables are not supported",
+		)),
+	}
 }
 
 fn alias_plan(plan: LogicalPlan, alias: Option<&TableAlias>) -> LogicalPlan {

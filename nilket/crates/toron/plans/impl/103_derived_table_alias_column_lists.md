@@ -81,7 +81,7 @@ Notes:
 - `derived_table_alias_columns_rename_output` — `SELECT pid FROM (SELECT id FROM people) AS p(pid)`; output
   field is `pid`.
 - `derived_table_alias_columns_hide_original_names` — `SELECT id FROM (SELECT id FROM people) AS p(pid)` →
-  `BindingError::UnknownColumn { column: "id" }`.
+  `BindingError::UnknownColumn { column: "id" }` / `unknown column: id`.
 - `derived_table_alias_columns_arity_mismatch_rejects` — `AS p(a, b)` over 1 col **and** `AS p(a)` over 2
   cols; assert the error contains `arity mismatch`, `expected`, `got`.
 - `derived_table_alias_columns_preserve_refinement_elision` — `setup_person_id_people`; `SELECT pid FROM
@@ -91,8 +91,9 @@ Notes:
   (SELECT id + 0 FROM people) AS p(computed) WHERE computed < 0` → `find_empty_relation` none, scan present.
 - `derived_table_alias_columns_wildcard_remains_deferred` — `SELECT pid FROM (SELECT * FROM people) AS
   p(pid)` → error contains `alias column lists over SELECT * derived tables are not supported`.
-- `derived_table_alias_columns_reject_type_annotations` — an alias-column type annotation (if parsed for a
-  derived-table alias) rejects with the type-annotation fence; it is not a cast or logical ascription.
+- `derived_table_alias_columns_reject_type_annotations` — `SELECT pid FROM (SELECT id FROM people) AS
+  p(pid BIGINT)` reaches the derived-alias helper and rejects with the type-annotation fence; it is not a
+  cast or logical ascription.
 - `derived_table_alias_columns_duplicate_names_inherit_ambiguity` — `SELECT dup FROM (SELECT id, note FROM
   people) AS p(dup, dup)` → existing `AmbiguousColumn` error for `dup`.
 - `derived_table_alias_columns_compose` — `SELECT label FROM (SELECT id, note FROM people) AS p(pid, label)
@@ -117,15 +118,16 @@ Notes:
   / name heuristic.
 - `adr103_wildcard_alias_columns_remain_deferred` — the helper contains the `SELECT *` fence string; the
   behavior-test name exists.
-- `adr103_no_pbc_storage_wendelon_or_information_schema_surface` — no ADR 103 helper/string in `pbc.rs` /
-  storage / Wendelon / `information_schema` branches; no new `ExecutionPlan` variant.
+- `adr103_no_runtime_cross_ring_or_information_schema_surface` — no ADR 103 helper/string in `pbc.rs` /
+  executor / storage / coordinator / Wendelon / `information_schema` branches; no new `ExecutionPlan`
+  variant.
 
 ## Phase 5 — Verification
 
 ```sh
 cargo test -p toron --test logical_type_ddl_test derived_table_alias_columns   # the 9 gates
-cargo test -p toron --test architecture_test adr103                            # new + retargeted guard
-cargo test -p toron --test architecture_test adr100                            # 100 fences still green
+cargo test -p toron --test architecture_test adr103                            # new 103 guards
+cargo test -p toron --test architecture_test adr100                            # retargeted 100 fences still green
 cargo test -p toron                                                            # full suite, no regression
 ```
 

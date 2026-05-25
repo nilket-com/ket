@@ -82,7 +82,8 @@ names.)
 - `derived_table_alias_columns_rename_output` — `SELECT pid FROM (SELECT id FROM people) AS p(pid)` binds,
   exposes `pid`.
 - `derived_table_alias_columns_hide_original_names` — `SELECT id FROM (SELECT id FROM people) AS p(pid)`
-  rejects with `UnknownColumn("id")` (the old name is gone at the boundary).
+  rejects with `BindingError::UnknownColumn { column: "id" }` / `unknown column: id` (the old name is
+  gone at the boundary).
 - `derived_table_alias_columns_arity_mismatch_rejects` — too-many and too-few reject with the arity message
   (expected + got).
 - `derived_table_alias_columns_preserve_refinement_elision` — `SELECT pid FROM (SELECT id FROM people) AS
@@ -91,8 +92,9 @@ names.)
   (SELECT id + 0 FROM people) AS p(computed) WHERE computed < 0` binds but does not elide.
 - `derived_table_alias_columns_wildcard_remains_deferred` — `SELECT pid FROM (SELECT * FROM people) AS
   p(pid)` rejects with the named `SELECT *` fence.
-- `derived_table_alias_columns_reject_type_annotations` — a parsed alias-column type annotation rejects
-  rather than acting like a cast/ascription.
+- `derived_table_alias_columns_reject_type_annotations` — `SELECT pid FROM (SELECT id FROM people) AS
+  p(pid BIGINT)` reaches the derived-alias helper and rejects with the type-annotation fence rather than
+  acting like a cast/ascription.
 - `derived_table_alias_columns_duplicate_names_inherit_ambiguity` — `AS p(dup, dup)` is accepted at rename
   time; referencing `dup` is ambiguous under existing binder rules.
 - `derived_table_alias_columns_compose` — projection / `WHERE` / unqualified `ORDER BY` over renamed
@@ -110,8 +112,8 @@ names.)
 - `adr103_alias_column_renames_reuse_transparent_project_receipt` — pins the elision gate + continued
   `transparent_project_child_ordinal` / `BoundExprNode::Column` use (no name heuristic).
 - `adr103_wildcard_alias_columns_remain_deferred` — the `SELECT *` fence message.
-- `adr103_no_pbc_storage_wendelon_or_information_schema_surface` — no runtime/cross-ring/introspection
-  expansion.
+- `adr103_no_runtime_cross_ring_or_information_schema_surface` — no PBC/executor/storage/coordinator/
+  Wendelon/`information_schema` expansion.
 
 ## Scale boundary & seam check
 
