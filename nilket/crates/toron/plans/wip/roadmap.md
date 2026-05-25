@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual follow-on (094, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + elision substrate (095, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -442,6 +442,30 @@ run, 079+).
   (Claude grounded 078's own-deferral provenance; Codex re-grounded + accepted the lock; Gemini's
   dual aligned). Migration: `plans/impl/094_predicate_residual_minimization.md`.
 
+- **ADR 095 — EmptyRelation + Static Contradiction Elision.** Promoted. **Slice 1 of the refinement
+  tier** the council forked over in the 094 cycle — the Toron-only elision substrate; durable
+  refinement predicates are slice 2 (ADR 096). Adds `ExecutionPlan::EmptyRelation { schema }`
+  (execution-IR only; **internal `TaskSpec` payload, not "no wire"** — Codex's catch) + a conservative
+  binder classifier `StaticFilterClass { AlwaysPass, AlwaysReject, Unknown }` (only `AlwaysReject`
+  elides). **Doctrine: a plan-shape optimization, never a truth source** — replace a `Filter` only
+  when statically *always-rejecting* under `WHERE` 3VL (`{FALSE} ∪ {NULL}`, since Arrow
+  `filter_record_batch` keeps `Some(true)` only). Classifier: closed (column-free) root → eval via
+  `evaluate_bound_program_without_storage` on a 1-row zero-column dummy → `AlwaysReject` on
+  `false`/`null`; structural `non_nullable_col IS NULL` → reject; **everything else (column ref) →
+  Unknown**. **No recursive boolean short-circuit** — which by construction also **preserves eager
+  errors** (a closed strict-cast that errors classifies as `Unknown`, so the query still raises it;
+  Codex's catch). Closed-`NULL` **elides** (resolved 3-of-3 — column-free constant-NULL is statically
+  never-TRUE, vs data-dependent Unknown). Elision is filter-local (in
+  `plan_filter_with_predicate_pushdown`, before pushdown, replacing *only* the Filter), so the
+  **scalar-aggregate cardinality fence** is structural — `SELECT COUNT(*) … WHERE 1=0` still emits one
+  `0` row (`bound_global_aggregate`, `exec.rs:1117`). The implementation bulk is a **~15-site
+  exhaustive `ExecutionPlan` walker sweep** (~4 real, ~11 trivial leaf arms; no `_` wildcard, guarded).
+  SELECT + UPDATE-source covered; DELETE deferred. Logical identity survives via the carried
+  `SchemaRef` (087–093, 089 path structural). **No** SQL/logical-IR/PBC/Wendelon/storage/public-wire
+  change. Genuine 3-of-3 (Claude: the 15-site ripple + cardinality fence + closed-NULL-vs-data-dependent
+  distinction; Codex: the `TaskSpec`-wire reality + eager-error fence + 1-row dummy-batch; Gemini
+  synthesized). Migration: `plans/impl/095_empty_relation_static_contradiction_elision.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -525,29 +549,27 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 094 promoted; ADR 095 candidates
+### ADR 095 promoted; ADR 096 candidates
 
-ADR 094 selected and promoted **Predicate Pushdown Residual Minimization (factored OR / NOT)** — ADR
-078's explicitly-deferred follow-on, on Toron's primary pushdown axis. 078 kept the whole original
-predicate as the Toron residual after pushing a factored common term; 094 makes it minimal
-(`(P∧R1)∨(P∧R2)` → `pushed=P, residual=R1∨R2`; `NOT(P∨R)` → `residual=¬R`). Pure efficiency, zero
-result change; binder-local; structural-identity only; the existing 3VL gate auto-validates. Genuine
-3-of-3 after an operator-broken cross-over.
+ADR 095 selected and promoted **EmptyRelation + Static Contradiction Elision** — slice 1 of the
+refinement tier (the Toron-only elision substrate). `ExecutionPlan::EmptyRelation` + a conservative
+`StaticFilterClass` classifier that elides statically always-rejecting filters (`WHERE 1=0`, closed
+`NULL`, `non_nullable_col IS NULL`) before pushdown, replacing only the Filter (cardinality fence
+structural); error-preserving, no recursive short-circuit, durable predicates deferred. Genuine 3-of-3.
 
-**ADR 095 candidates:**
+**ADR 096 candidates:**
 
-*The integrity tier (the council forked over this in the 094 cycle — strongest lead, now teed up):*
+*The integrity tier, slice 2 (the direct successor — 095 built the execution target it plugs into):*
 
-- **EmptyRelation + durable refinement contracts** — the deepen-on-identity tier. **Build in slices,
-  per the 094 grounding:** (1) `ExecutionPlan::EmptyRelation { schema }` (execution-plan-only, no
-  `LogicalPlan` variant) + a conservative binder contradiction classifier (literal `false`/typed
-  `NULL`, `non_nullable_col IS NULL`; **Unknown stays Unknown**), Toron-only — incl. the closed-literal
-  dummy-batch caveat (reuse the existing evaluator, no partial evaluator) and the **scalar-aggregate
-  cardinality fence** (`SELECT COUNT(*) … WHERE false` must emit one zero row, so elision targets the
-  Filter, never the operators above it — grounded at `exec.rs:1117`); (2) durable refinement-predicate
-  persistence on the 090 substrate (cross-ring: `LogicalTypeDefinitionV1` gains a predicate field) +
-  write-time enforcement (also net-new — `CHECK` rejected at `sql_planner.rs:668`, INSERT validation
-  type-only). An explicit council split call: elision-substrate-first, durable-predicate second.
+- **Durable refinement-predicate persistence + write-time enforcement** (cross-ring) — value
+  predicates on a durable `LogicalTypeId` (`PersonId(Int64, value > 0)`). Two net-new halves: (a)
+  **persistence** — `LogicalTypeDefinitionV1` (`wendelon/.../compute.rs`, currently `{id, name,
+  physical}`) gains a predicate field, rippling the 090 create/sync/registry path (cross-ring, the
+  bounded 090 exception re-opened); (b) **use** — a durable `value > 0` fact becomes a
+  `static_filter_class` input so `WHERE id = -5` elides to `EmptyRelation` (095's substrate, zero
+  I/O), and/or **write-time enforcement** at INSERT (also net-new — `CHECK` rejected at
+  `sql_planner.rs:668`, INSERT validation is type-only today). **Likely itself a split** (persist
+  → elide-use → enforce); the council should scope which half is 096 vs 097 at iter-0.
 
 *Identity authoring follow-ons:*
 
@@ -577,7 +599,14 @@ result change; binder-local; structural-identity only; the existing 3VL gate aut
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/094_predicate_residual_minimization.md`.
+`plans/impl/095_empty_relation_static_contradiction_elision.md`.
+
+### ADR 094 promoted; ADR 095 candidates (HISTORICAL)
+
+ADR 094 promoted **Predicate Pushdown Residual Minimization (factored OR / NOT)** (078's deferred
+follow-on; minimal Toron residual, pure efficiency). 095 selected slice 1 of the refinement tier
+(EmptyRelation elision substrate) over the deeper durable-predicate cut (→ 096). Detail in
+`plans/adr/094_predicate_residual_minimization.md` + the active-line entry above.
 
 ### ADR 093 promoted; ADR 094 candidates (HISTORICAL)
 
