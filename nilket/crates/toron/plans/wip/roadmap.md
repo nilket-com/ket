@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + elision substrate (095, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + elision substrate (095) + refinement contracts (096, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -466,6 +466,28 @@ run, 079+).
   distinction; Codex: the `TaskSpec`-wire reality + eager-error fence + 1-row dummy-batch; Gemini
   synthesized). Migration: `plans/impl/095_empty_relation_static_contradiction_elision.md`.
 
+- **ADR 096 — Durable Refinement Predicate Persistence + Write Enforcement.** Promoted. **Slice 2 of
+  the refinement tier** — the integrity *receipt* (097 spends it on elision). **Doctrine: the receipt
+  before the magic** — a `CHECK (VALUE > 0)` refinement is a valid elision basis only if stored data
+  is guaranteed to satisfy it, so 096 *persists + enforces*; eliding on an unenforced declaration is a
+  silent-wrong-results bug (the load-bearing **soundness reordering** Claude caught: enforce before
+  elide; Gemini's persist+elide conceded). `CREATE LOGICAL TYPE <Name> AS <primitive> CHECK (VALUE >
+  0)` persists a **portable, Wendelon-owned refinement AST** (`LogicalTypeRefinementPredicate` —
+  comparisons over `VALUE` + `AND`; **not** `BoundExprProgram`/`ScalarValue`; float literals as
+  canonical bits to keep `Eq`/`Hash`). **Complete write enforcement** across INSERT VALUES / INSERT
+  SELECT / UPDATE / CTAS (a shared runtime validator reusing 095's `evaluate_bound_program_without_storage`;
+  literal-only would not be a receipt). `CAST`/`TRY_CAST` stay pure physical-ascription (092/093
+  byte-identical) — the storage boundary is the only enforcement point; 097's elision is scoped to
+  stored-column receipts. Null orthogonal (refinement on non-null). Receipt scope = complete Toron
+  write path (Toron sole writer, refinement-before-column); Wendelon authority-side
+  validation carried. **No numeric suffixes/compat** — the touched Wendelon logical-type contract is **de-versioned
+  in place** (`LogicalTypeDefinition`/`…Create`/`LogicalTypePhysical`/`LogicalTypeCatalog`), per the
+  operator's pre-release directive (no historical installations). Cross-ring (bounded 090 re-open),
+  Toron-sequence. Genuine 3-of-3 (Claude: soundness reordering + storage-only/CAST/receipt resolutions;
+  Codex: portable AST + float-bits + idempotency + the de-version directive; Gemini: corrected to
+  neutral-AST + complete enforcement). Migration:
+  `plans/impl/096_durable_refinement_persistence_enforcement.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -549,27 +571,25 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 095 promoted; ADR 096 candidates
+### ADR 096 promoted; ADR 097 candidates
 
-ADR 095 selected and promoted **EmptyRelation + Static Contradiction Elision** — slice 1 of the
-refinement tier (the Toron-only elision substrate). `ExecutionPlan::EmptyRelation` + a conservative
-`StaticFilterClass` classifier that elides statically always-rejecting filters (`WHERE 1=0`, closed
-`NULL`, `non_nullable_col IS NULL`) before pushdown, replacing only the Filter (cardinality fence
-structural); error-preserving, no recursive short-circuit, durable predicates deferred. Genuine 3-of-3.
+ADR 096 selected and promoted **Durable Refinement Predicate Persistence + Write Enforcement** — slice
+2 of the refinement tier (the integrity *receipt*). `CREATE LOGICAL TYPE … CHECK (VALUE > 0)` persists
+a portable Wendelon-owned refinement AST + enforces it across all write paths (INSERT VALUES/SELECT,
+UPDATE, CTAS); CAST unchanged (092/093); the touched Wendelon contract de-versioned in place (no
+numeric suffixes/compat, pre-release). No elision (097 boundary). Genuine 3-of-3 after the soundness reordering.
 
-**ADR 096 candidates:**
+**ADR 097 candidates:**
 
-*The integrity tier, slice 2 (the direct successor — 095 built the execution target it plugs into):*
+*The integrity tier, slice 3 (the direct successor — the payoff 096's receipt unlocks):*
 
-- **Durable refinement-predicate persistence + write-time enforcement** (cross-ring) — value
-  predicates on a durable `LogicalTypeId` (`PersonId(Int64, value > 0)`). Two net-new halves: (a)
-  **persistence** — `LogicalTypeDefinitionV1` (`wendelon/.../compute.rs`, currently `{id, name,
-  physical}`) gains a predicate field, rippling the 090 create/sync/registry path (cross-ring, the
-  bounded 090 exception re-opened); (b) **use** — a durable `value > 0` fact becomes a
-  `static_filter_class` input so `WHERE id = -5` elides to `EmptyRelation` (095's substrate, zero
-  I/O), and/or **write-time enforcement** at INSERT (also net-new — `CHECK` rejected at
-  `sql_planner.rs:668`, INSERT validation is type-only today). **Likely itself a split** (persist
-  → elide-use → enforce); the council should scope which half is 096 vs 097 at iter-0.
+- **Refinement-driven read-time elision** (Toron-only) — feed the *enforced* durable refinement into
+  095's `static_filter_class` (`binder.rs:1166`) so `WHERE id = -5` on a `PersonId CHECK (VALUE > 0)`
+  column elides to `EmptyRelation` (zero I/O). **Sound only on 096's receipt** (stored refined-column
+  data passed Toron enforcement). Needs a real single-column interval/literal-contradiction model
+  (normalize comparisons against literals; prove `VALUE > 0` ∧ `id = -5` unsat) — *not* just appending
+  the refinement to the bound predicate. Scoped to stored-column receipts (not arbitrary expression
+  logical types, per 096 D8). 3VL- + error-conservative (inherit 095).
 
 *Identity authoring follow-ons:*
 
@@ -595,11 +615,18 @@ structural); error-preserving, no recursive short-circuit, durable predicates de
 *Carried:*
 
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
-  `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
+  `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/095_empty_relation_static_contradiction_elision.md`.
+`plans/impl/096_durable_refinement_persistence_enforcement.md`.
+
+### ADR 095 promoted; ADR 096 candidates (HISTORICAL)
+
+ADR 095 promoted **EmptyRelation + Static Contradiction Elision** (the Toron-only elision substrate).
+096 selected slice 2 (durable refinement persistence + enforcement — the receipt), reordered before
+elision (097) on the soundness catch. Detail in
+`plans/adr/095_empty_relation_static_contradiction_elision.md` + the active-line entry above.
 
 ### ADR 094 promoted; ADR 095 candidates (HISTORICAL)
 
@@ -834,6 +861,16 @@ Small improvements that don't fit a single ADR.
   `plans/impl/001-003` filenames (ADR 004's filename
   already follows the cleaner pattern). Mechanical sed +
   cross-reference update.
+- **Wendelon numeric-suffix de-versioning sweep** (operator
+  directive) — at pre-release with no historical
+  installations, there is only "the new way": drop the
+  numeric suffixes from Wendelon type/function names
+  **unless a suffix has a very good reason** (e.g. genuine
+  multi-version wire negotiation that actually exists).
+  Behavior-neutral mechanical rename; do it as a dedicated
+  chore (not bundled into a feature ADR), or let each ADR
+  de-version the surface it touches (ADR 096 did the
+  logical-type contract). Retarget any suffix-naming guards.
 
 ## Backlog (parked, may not return)
 
