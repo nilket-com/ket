@@ -770,7 +770,8 @@ pub(crate) fn adr092_binder_resolves_sql_logical_casts_registry_only_before_sync
 	assert!(resolve.contains("HashMap<String, LogicalTypeSpec>"));
 	assert!(bind_program.contains("ExprBindContext"));
 	assert!(bind_program.contains("logical_casts: &logical_casts"));
-	assert!(collect.contains("TRY_CAST/SAFE_CAST to logical type is not supported"));
+	assert!(collect.contains("Expr::SqlLogicalCast"));
+	assert!(collect.contains("names.insert(logical_name.clone())"));
 	assert!(!resolve.contains("logical_type_spec_by_name"));
 	assert!(!resolve.contains("seed_logical_type_spec_by_name"));
 }
@@ -811,4 +812,113 @@ pub(crate) fn adr092_sql_logical_cast_does_not_add_execution_kernel_or_pbc_opcod
 	assert!(!exec.contains("fn evaluate_sql_logical_cast"));
 	assert!(!pbc.contains("SqlLogicalCast"));
 	assert!(!pbc.contains("OP_LOGICAL_CAST"));
+}
+
+#[test]
+pub(crate) fn adr093_binder_collects_both_cast_and_try_cast_logical_names() {
+	let binder = binder_source();
+	let collect = source_block(&binder, "fn collect_logical_cast_names");
+
+	assert!(collect.contains("Expr::SqlLogicalCast"));
+	assert!(collect.contains("try_cast: _"));
+	assert!(collect.contains("names.insert(logical_name.clone())"));
+	assert!(collect.contains("collect_logical_cast_names(expr, names)"));
+	assert!(!collect.contains("TRY_CAST/SAFE_CAST to logical type is not supported"));
+}
+
+#[test]
+pub(crate) fn adr093_logical_try_cast_reconciles_identity_before_try_cast() {
+	let binder = binder_source();
+	let bind_cast = source_block(&binder, "fn bind_sql_logical_cast");
+	let reconcile = bind_cast
+		.find("reconcile_identity(existing, spec.id, &source)")
+		.expect("logical identity reconciliation");
+	let try_branch = bind_cast
+		.find("let output = if try_cast")
+		.expect("logical TRY_CAST branch");
+	let append_try = bind_cast
+		.find("builder.append_try_cast")
+		.expect("TRY_CAST append");
+	let stamp = bind_cast
+		.find("builder.set_node_logical_type(output, logical_type)")
+		.expect("logical type stamp");
+
+	assert!(reconcile < try_branch);
+	assert!(try_branch < append_try);
+	assert!(append_try < stamp);
+}
+
+#[test]
+pub(crate) fn adr093_logical_try_cast_categorically_nullable_no_same_physical_elide() {
+	let binder = binder_source();
+	let execution = execution_source();
+	let bind_cast = source_block(&binder, "fn bind_sql_logical_cast");
+	let node_nullable = source_block(&execution, "pub fn node_nullable");
+	let try_branch = bind_cast
+		.find("let output = if try_cast")
+		.expect("logical TRY_CAST branch");
+	let append_try = bind_cast
+		.find("builder.append_try_cast")
+		.expect("TRY_CAST append");
+	let strict_same = bind_cast
+		.find("} else if source == spec.physical")
+		.expect("strict same-physical elision branch");
+
+	assert!(try_branch < append_try);
+	assert!(append_try < strict_same);
+	assert!(bind_cast.contains(
+		"source == spec.physical || is_supported_explicit_numeric_cast(&source, &spec.physical)"
+	));
+	assert!(
+		bind_cast.contains(
+			"builder.append_try_cast(inner, spec.physical.clone(), spec.physical.clone())"
+		)
+	);
+	assert!(node_nullable.contains("BoundExprNode::TryCast { .. } => Some(true)"));
+}
+
+#[test]
+pub(crate) fn adr093_logical_try_cast_uses_existing_try_cast_node_no_executor_or_pbc() {
+	let binder = binder_source();
+	let execution = execution_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+	let bind_cast = source_block(&binder, "fn bind_sql_logical_cast");
+
+	assert!(bind_cast.contains("builder.append_try_cast"));
+	assert!(execution.contains("BoundExprNode::TryCast"));
+	assert!(exec.contains("BoundExprNode::TryCast"));
+	assert!(!execution.contains("SqlLogicalTryCast"));
+	assert!(!exec.contains("fn evaluate_sql_logical_try_cast"));
+	assert!(!exec.contains("fn evaluate_logical_try_cast"));
+	assert!(!pbc.contains("SqlLogicalTryCast"));
+	assert!(!pbc.contains("OP_LOGICAL_TRY_CAST"));
+}
+
+#[test]
+pub(crate) fn adr093_physical_bind_try_cast_remains_identity_free() {
+	let binder = binder_source();
+	let try_cast = source_block(&binder, "fn bind_try_cast");
+
+	assert!(try_cast.contains("is_supported_explicit_numeric_cast(&source, target)"));
+	assert!(try_cast.contains("builder.append_try_cast"));
+	assert!(!try_cast.contains("reconcile_identity"));
+	assert!(!try_cast.contains("set_node_logical_type"));
+	assert!(!try_cast.contains("logical_casts"));
+}
+
+#[test]
+pub(crate) fn adr093_ctas_try_cast_nullability_flows_through_089_writer() {
+	let binder = binder_source();
+	let execution = execution_source();
+	let schema_for_exprs = source_block(&execution, "pub fn schema_for_exprs");
+	let named_project = source_block(&binder, "fn schema_for_exprs_with_output_names");
+	let ctas = source_block(&binder, "fn infer_ctas_schema");
+
+	assert!(schema_for_exprs.contains("root_nullable(idx)"));
+	assert!(named_project.contains("root_nullable(idx)"));
+	assert!(ctas.contains("field.is_nullable()"));
+	for block in [schema_for_exprs, named_project, ctas] {
+		assert!(block.contains("field_with_logical_type_metadata"));
+	}
 }

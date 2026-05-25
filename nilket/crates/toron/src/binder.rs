@@ -804,13 +804,8 @@ fn collect_logical_cast_names(
 		Expr::SqlLogicalCast {
 			expr,
 			logical_name,
-			try_cast,
+			try_cast: _,
 		} => {
-			if *try_cast {
-				return Err(BindingError::UnsupportedExpression {
-					message: "TRY_CAST/SAFE_CAST to logical type is not supported".to_string(),
-				});
-			}
 			names.insert(logical_name.clone());
 			collect_logical_cast_names(expr, names)
 		}
@@ -3116,11 +3111,6 @@ fn bind_sql_logical_cast(
 	logical_name: &str,
 	try_cast: bool,
 ) -> Result<BoundExprId, BindingError> {
-	if try_cast {
-		return Err(BindingError::UnsupportedExpression {
-			message: "TRY_CAST/SAFE_CAST to logical type is not supported".to_string(),
-		});
-	}
 	let spec =
 		ctx.logical_casts
 			.get(logical_name)
@@ -3138,7 +3128,18 @@ fn bind_sql_logical_cast(
 		.node_logical_type(inner)
 		.expect("builder returns logical type for SQL logical cast input");
 	let logical_type = reconcile_identity(existing, spec.id, &source)?;
-	let output = if source == spec.physical {
+	let output = if try_cast {
+		if source == spec.physical || is_supported_explicit_numeric_cast(&source, &spec.physical) {
+			builder.append_try_cast(inner, spec.physical.clone(), spec.physical.clone())
+		} else {
+			return Err(BindingError::TypeMismatch {
+				message: format!(
+					"unsupported TRY_CAST: {source:?} to logical type {}({:?}); only same-physical casts or Int32, Int64, Float32, and Float64 numeric conversions are supported",
+					spec.name, spec.physical
+				),
+			});
+		}
+	} else if source == spec.physical {
 		inner
 	} else if is_supported_explicit_numeric_cast(&source, &spec.physical) {
 		builder.append_cast(inner, spec.physical.clone(), spec.physical.clone())
