@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual follow-on (094, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -424,6 +424,24 @@ run, 079+).
   the CTAS-nullability question; Gemini ratified). Migration:
   `plans/impl/093_sql_logical_try_cast.md`.
 
+- **ADR 094 — Predicate Pushdown Residual Minimization (factored OR / NOT).** Promoted. ADR 078's
+  **explicitly-deferred** follow-on (`078:58` "no residual reconstruction/minimization this ADR"),
+  on Toron's **primary axis** (pushdown). 078 kept the *whole original* predicate as the Toron
+  residual after pushing a factored common term; 094 makes it minimal: `(P∧R1)∨(P∧R2)` → `pushed=P,
+  residual=R1∨R2`; `NOT(P∨R)` → `pushed=¬P, residual=¬R` (= `AND of ¬unpushed-branch`). **Pure
+  efficiency, zero result change** — `P ∧ minimal ≡ P ∧ original` on survivors. Binder-local
+  (`split_boolean_tree` + its extractors return pushed + reconstructed residual; one new
+  `combine_bound_programs_as_or`); structural-identity only (no commutation/folding/CNF);
+  branch-strips-to-TRUE & extractor all-pushed → residual `None`; `NOT(AND)` out; reconstruction
+  failures after a safe pushed split fall back to ADR 078's original residual; **AND-path untouched**
+  (075 owns its minimal residual — clean seam). The existing
+  3VL property gate (`binder.rs:3814`) auto-validates the new residual over all 27 {T,F,N}³ rows
+  (extended with the D2/D3 edge shapes). Invert 078's `..._original_residual` DML guards/fixtures
+  (`delete_test.rs:149`, `update_test.rs:341`) → `...plus_minimal_residual` in-change. No
+  IR/SQL/PBC/Wendelon/wire/executor change. Genuine 3-of-3 after an operator-broken cross-over
+  (Claude grounded 078's own-deferral provenance; Codex re-grounded + accepted the lock; Gemini's
+  dual aligned). Migration: `plans/impl/094_predicate_residual_minimization.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -507,26 +525,32 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 093 promoted; ADR 094 candidates
+### ADR 094 promoted; ADR 095 candidates
 
-ADR 093 selected and promoted **SQL `TRY_CAST(x AS LogicalType)`** — the deferred 092 sibling that
-**completes the CAST/TRY_CAST 2×2**. Nullable coercing ascription: try softens physical failure to
-NULL but **not** the identity contract (`TRY_CAST(product_id AS CustomerId)` still rejects at bind);
-contract γ — categorically nullable, binds wherever strict CAST binds; binder-local (two un-gates +
-one branch), no new kernel / shared-gate / Wendelon change; CTAS nullable-column free via 089.
-Genuine 3-of-3.
+ADR 094 selected and promoted **Predicate Pushdown Residual Minimization (factored OR / NOT)** — ADR
+078's explicitly-deferred follow-on, on Toron's primary pushdown axis. 078 kept the whole original
+predicate as the Toron residual after pushing a factored common term; 094 makes it minimal
+(`(P∧R1)∨(P∧R2)` → `pushed=P, residual=R1∨R2`; `NOT(P∨R)` → `residual=¬R`). Pure efficiency, zero
+result change; binder-local; structural-identity only; the existing 3VL gate auto-validates. Genuine
+3-of-3 after an operator-broken cross-over.
 
-**ADR 094 candidates:**
+**ADR 095 candidates:**
 
-*Identity follow-ons (from ADR 093 §"What to do next"):*
+*The integrity tier (the council forked over this in the 094 cycle — strongest lead, now teed up):*
 
-- **Refinement contracts** (the next *integrity tier*; strongest lead, now fully scoped by the
-  define → DDL column → CAST → TRY_CAST authoring line) — value predicates on a durable `LogicalTypeId`
-  (`PersonId(Int64, value > 0)`) → static plan elision (`WHERE id = -5` → `EmptyRelation`, zero
-  I/O). **Grounded as a mega-scope that must split** (no `EmptyRelation` node, no constant-folding
-  pass anywhere, no predicate field on the 090 definition + cross-ring ripple). The only non-inert
-  first slice is **elision-first** (`EmptyRelation` + a contradiction simplifier, Toron-only); a
-  durable-predicate-persistence cross-ring ADR follows. An explicit council split call, not one ADR.
+- **EmptyRelation + durable refinement contracts** — the deepen-on-identity tier. **Build in slices,
+  per the 094 grounding:** (1) `ExecutionPlan::EmptyRelation { schema }` (execution-plan-only, no
+  `LogicalPlan` variant) + a conservative binder contradiction classifier (literal `false`/typed
+  `NULL`, `non_nullable_col IS NULL`; **Unknown stays Unknown**), Toron-only — incl. the closed-literal
+  dummy-batch caveat (reuse the existing evaluator, no partial evaluator) and the **scalar-aggregate
+  cardinality fence** (`SELECT COUNT(*) … WHERE false` must emit one zero row, so elision targets the
+  Filter, never the operators above it — grounded at `exec.rs:1117`); (2) durable refinement-predicate
+  persistence on the 090 substrate (cross-ring: `LogicalTypeDefinitionV1` gains a predicate field) +
+  write-time enforcement (also net-new — `CHECK` rejected at `sql_planner.rs:668`, INSERT validation
+  type-only). An explicit council split call: elision-substrate-first, durable-predicate second.
+
+*Identity authoring follow-ons:*
+
 - **`DROP`/`ALTER LOGICAL TYPE`** — net-new IR variants + parsing + cross-ring DROP with referential
   integrity (can't drop a logical type a column still references).
 - **PK/FK-derived identity** — "magic that follows constraints, not names": derive from `PRIMARY
@@ -536,25 +560,31 @@ Genuine 3-of-3.
   aggregate-output identity semantics; the optional Wendelon-validate-at-authority (090 knob);
   **`.as_naked()`** Rune helper.
 
-*Carried Rune leads (the nominal-typing spine was prioritized over these — still live):*
+*Carried Rune leads (still live):*
 
 - **Rune `Like`/`ILike`** — pattern predicates over existing `Expr::Like { pattern,
-  negated, case_insensitive }`; **residual** (PBC-ineligible); needs pattern (literal
-  `String`, per 075), case-sensitivity (`like` vs `ilike`), `.not_like` (keyword-safe).
+  negated, case_insensitive }`; **residual** (PBC-ineligible); `like` is not a Rune keyword (so
+  `.like`/`.ilike`/`.not_like` are safe); pattern is a literal `String` (per 075). The smallest
+  carried cut.
 - **Rune joins** — needs relation-alias + qualified-column ergonomics first.
 - **`SIMILAR TO`/`RLIKE`/`REGEXP`**; **`CASE`/value-conditionals**; **Rune sort/limit**;
   dot-field sugar; **Wendelon typed table-mutation trace continuation**.
 
-*Non-Rune lead:*
+*Carried:*
 
-- **Residual minimization for factored shapes** (078 follow-on) — minimal `(R1 ∨ R2)`
-  residual in `split_boolean_tree`, gated by 078's 3VL fixture.
-- Carried: subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
+- subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema-V2); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/093_sql_logical_try_cast.md`.
+`plans/impl/094_predicate_residual_minimization.md`.
+
+### ADR 093 promoted; ADR 094 candidates (HISTORICAL)
+
+ADR 093 promoted **SQL `TRY_CAST(x AS LogicalType)`** (nullable coercing ascription, contract γ;
+completed the CAST/TRY_CAST 2×2). 094 selected the 078 residual-minimization follow-on over the
+elision tier (carried → 095). Detail in `plans/adr/093_sql_logical_try_cast.md` + the active-line
+entry above; git holds the candidate archaeology.
 
 ### ADR 092 promoted; ADR 093 candidates (HISTORICAL)
 
