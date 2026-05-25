@@ -691,13 +691,17 @@ pub(crate) fn adr082_typed_literal_cut_does_not_expand_operator_surface() {
 		"try_cast",
 		"in_list",
 		"not_in_list",
+		"like",
+		"not_like",
+		"ilike",
+		"not_ilike",
 	] {
 		assert!(
 			names.iter().any(|name| name == retained),
 			"post-ADR086 Rune expression method `{retained}` missing: {names:?}"
 		);
 	}
-	for deferred in ["not", "like", "ilike", "safe_cast"] {
+	for deferred in ["not", "safe_cast"] {
 		assert!(
 			!names.iter().any(|name| name == deferred),
 			"post-ADR086 Rune surface must keep deferred operator `{deferred}` out: {names:?}"
@@ -1050,7 +1054,7 @@ pub(crate) fn adr086_rune_in_list_methods_are_registered() {
 	] {
 		assert!(module.contains(registration), "missing {registration}");
 	}
-	for forbidden in ["in", "not", "like", "ilike", "safe_cast"] {
+	for forbidden in ["in", "not", "safe_cast"] {
 		assert!(
 			!names.iter().any(|name| name == forbidden),
 			"Rune InList surface registered forbidden name `{forbidden}`: {names:?}"
@@ -1104,6 +1108,178 @@ pub(crate) fn adr086_rune_in_list_reuses_existing_substrate() {
 	assert!(pbc.contains("BoundExprNode::InList"));
 	assert!(pbc.contains("bytecode.push(OP_IN_LIST)"));
 	assert!(pbc.contains("bytecode.push(OP_NOT)"));
+}
+
+#[test]
+pub(crate) fn adr101_rune_like_ilike_methods_are_registered() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+	let build = source_block(&rune, "fn build_like");
+
+	for (function, negated, case_insensitive) in [
+		("pub fn like", "false", "false"),
+		("pub fn not_like", "true", "false"),
+		("pub fn ilike", "false", "true"),
+		("pub fn not_ilike", "true", "true"),
+	] {
+		let body = source_block(&rune, function);
+		assert!(body.contains("pattern: String"));
+		assert!(body.contains("-> RuneExpr"));
+		assert!(
+			body.contains(&format!(
+				"build_like(self.expr, pattern, {negated}, {case_insensitive})"
+			)),
+			"{function} must delegate to build_like with the expected flags"
+		);
+	}
+	assert!(build.contains("Expr::Like"));
+	assert!(build.contains("expr: Box::new(expr)"));
+	assert!(build.contains("pattern"));
+	assert!(build.contains("negated"));
+	assert!(build.contains("case_insensitive"));
+
+	for registration in [
+		"m.associated_function(\"like\", RuneExpr::like)?;",
+		"m.associated_function(\"not_like\", RuneExpr::not_like)?;",
+		"m.associated_function(\"ilike\", RuneExpr::ilike)?;",
+		"m.associated_function(\"not_ilike\", RuneExpr::not_ilike)?;",
+	] {
+		assert!(module.contains(registration), "missing {registration}");
+	}
+	for method in ["like", "not_like", "ilike", "not_ilike"] {
+		assert!(
+			names.iter().any(|name| name == method),
+			"ADR101 Rune method `{method}` missing: {names:?}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr101_rune_like_methods_are_infallible() {
+	let rune = rune_engine_source();
+	let build_like = source_block(&rune, "fn build_like");
+
+	for function in [
+		"pub fn like",
+		"pub fn not_like",
+		"pub fn ilike",
+		"pub fn not_ilike",
+	] {
+		let body = source_block(&rune, function);
+		assert!(!body.contains("VmResult"));
+		assert!(!body.contains("panic"));
+		assert!(!body.contains("is_empty"));
+	}
+	assert!(!build_like.contains("VmResult"));
+	assert!(!build_like.contains("panic"));
+	assert!(!build_like.contains("is_empty"));
+	assert!(source_block(&rune, "fn build_in_list").contains("VmResult::panic"));
+}
+
+#[test]
+pub(crate) fn adr101_stale_surface_guards_are_retargeted() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	for admitted in ["like", "not_like", "ilike", "not_ilike"] {
+		assert!(
+			names.iter().any(|name| name == admitted),
+			"ADR101 admitted method `{admitted}` missing: {names:?}"
+		);
+	}
+	for deferred in ["not", "safe_cast"] {
+		assert!(
+			!names.iter().any(|name| name == deferred),
+			"ADR101 must keep deferred method `{deferred}` out: {names:?}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr101_reuses_075_like_policy() {
+	let rune = rune_engine_source();
+	let planner = sql_planner_source();
+	let binder = binder_source();
+	let exec = exec_source();
+
+	assert!(planner.contains("fn lower_like"));
+	assert!(planner.contains("LIKE ANY"));
+	assert!(planner.contains("LIKE ESCAPE is not supported"));
+	assert!(binder.contains("fn bind_like"));
+	assert!(binder.contains("LIKE expects Utf8 input, got {expr_type:?}"));
+	assert!(exec.contains("fn evaluate_like"));
+	for forbidden in [
+		"LIKE ANY",
+		"ESCAPE",
+		"SIMILAR TO",
+		"RLIKE",
+		"REGEXP",
+		"regex",
+	] {
+		assert!(
+			!rune.contains(forbidden),
+			"Rune LIKE surface introduced forbidden policy marker {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr101_like_remains_residual_only() {
+	let pbc = pbc_source();
+
+	assert!(pbc.contains("BoundExprNode::Like { .. }"));
+	assert!(pbc.contains("ExpressionShapeUnsupported"));
+	assert!(!pbc.contains("OP_LIKE"));
+	assert!(!pbc.contains("OP_ILIKE"));
+	assert!(!pbc.contains("bytecode.push(OP_LIKE)"));
+}
+
+#[test]
+pub(crate) fn adr101_no_cross_ring_surface() {
+	let manifest_dir = manifest_dir();
+	let rune = rune_engine_source();
+
+	for forbidden in ["wendelon", "Storage", "ScanStream", "Pbc", "PBC"] {
+		assert!(
+			!rune.contains(forbidden),
+			"ADR101 Rune LIKE surface touched cross-ring/storage marker: {forbidden}"
+		);
+	}
+	for source_file in ["src/storage.rs", "src/wire.rs", "src/sql_wire.rs"] {
+		let source = std::fs::read_to_string(manifest_dir.join(source_file))
+			.unwrap_or_else(|_| panic!("read {source_file}"));
+		for marker in ["not_like", "not_ilike", "RuneExpr"] {
+			assert!(
+				!source.contains(marker),
+				"ADR101 marker {marker} leaked to {source_file}"
+			);
+		}
+	}
+	let wendelon_src = manifest_dir
+		.parent()
+		.expect("workspace crates dir")
+		.join("wendelon/src");
+	let offenders = source_files(&wendelon_src)
+		.into_iter()
+		.filter_map(|path| {
+			let source = std::fs::read_to_string(&path).expect("read Wendelon source");
+			(source.contains("not_like")
+				|| source.contains("not_ilike")
+				|| source.contains("RuneExpr"))
+			.then(|| {
+				path.strip_prefix(manifest_dir.parent().expect("workspace crates dir"))
+					.unwrap_or(&path)
+					.display()
+					.to_string()
+			})
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR101 Rune LIKE surface leaked to Wendelon: {offenders:?}"
+	);
 }
 
 #[test]

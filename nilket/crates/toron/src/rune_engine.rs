@@ -554,6 +554,22 @@ impl RuneExpr {
 	pub fn not_in_list(self, list: Vec<RuneExpr>) -> VmResult<RuneExpr> {
 		build_in_list(self.expr, list, true)
 	}
+
+	pub fn like(self, pattern: String) -> RuneExpr {
+		build_like(self.expr, pattern, false, false)
+	}
+
+	pub fn not_like(self, pattern: String) -> RuneExpr {
+		build_like(self.expr, pattern, true, false)
+	}
+
+	pub fn ilike(self, pattern: String) -> RuneExpr {
+		build_like(self.expr, pattern, false, true)
+	}
+
+	pub fn not_ilike(self, pattern: String) -> RuneExpr {
+		build_like(self.expr, pattern, true, true)
+	}
 }
 
 fn build_in_list(expr: Expr, list: Vec<RuneExpr>, negated: bool) -> VmResult<RuneExpr> {
@@ -570,6 +586,17 @@ fn build_in_list(expr: Expr, list: Vec<RuneExpr>, negated: bool) -> VmResult<Run
 			negated,
 		},
 	})
+}
+
+fn build_like(expr: Expr, pattern: String, negated: bool, case_insensitive: bool) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::Like {
+			expr: Box::new(expr),
+			pattern,
+			negated,
+			case_insensitive,
+		},
+	}
 }
 
 pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
@@ -642,6 +669,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	)?;
 	m.associated_function("in_list", RuneExpr::in_list)?;
 	m.associated_function("not_in_list", RuneExpr::not_in_list)?;
+	m.associated_function("like", RuneExpr::like)?;
+	m.associated_function("not_like", RuneExpr::not_like)?;
+	m.associated_function("ilike", RuneExpr::ilike)?;
+	m.associated_function("not_ilike", RuneExpr::not_ilike)?;
 
 	Ok(m)
 }

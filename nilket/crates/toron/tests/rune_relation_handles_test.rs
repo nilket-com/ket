@@ -11,7 +11,9 @@ use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
-use toron::ir::{ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue, TableId};
+use toron::ir::{
+	BoundExprNode, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue, TableId,
+};
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
@@ -1043,6 +1045,159 @@ async fn rune_in_list_mismatch_is_binding_error() {
 }
 
 #[tokio::test]
+async fn rune_like_filters_utf8_column_residual() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("status").like("o%"))
+        }
+    "#,
+	)
+	.await
+	.expect("LIKE filter plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind LIKE filter");
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(
+		scan_pbc(scan).is_none(),
+		"LIKE predicate must stay out of scan PBC"
+	);
+	assert_single_like(predicate, "o%", false, false);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int64_column_rows(&batches, 0),
+		vec![Some(1), Some(2), Some(4), Some(5), Some(6)]
+	);
+}
+
+#[tokio::test]
+async fn rune_ilike_filters_utf8_column_residual() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("status").ilike("CLO%"))
+        }
+    "#,
+	)
+	.await
+	.expect("ILIKE filter plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind ILIKE filter");
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(
+		scan_pbc(scan).is_none(),
+		"ILIKE predicate must stay out of scan PBC"
+	);
+	assert_single_like(predicate, "CLO%", false, true);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3)]);
+}
+
+#[tokio::test]
+async fn rune_not_like_and_not_ilike_filter_rows() {
+	let not_like = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("status").not_like("o%"))
+        }
+    "#,
+	)
+	.await
+	.expect("NOT LIKE filter plan");
+	let bound = bind(&not_like, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind NOT LIKE filter");
+	let (predicate, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+	assert_single_like(predicate, "o%", true, false);
+	let batches = run_logical(&not_like).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3)]);
+
+	let not_ilike = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("status").not_ilike("CLO%"))
+        }
+    "#,
+	)
+	.await
+	.expect("NOT ILIKE filter plan");
+	let bound = bind(&not_ilike, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind NOT ILIKE filter");
+	let (predicate, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+	assert_single_like(predicate, "CLO%", true, true);
+	let batches = run_logical(&not_ilike).await;
+	assert_eq!(
+		int64_column_rows(&batches, 0),
+		vec![Some(1), Some(2), Some(4), Some(5), Some(6)]
+	);
+}
+
+#[tokio::test]
+async fn rune_like_residual_splits_from_pushable_conjunct() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .filter(col("id").eq(lit_i64(3)).and(col("status").like("c%")))
+        }
+    "#,
+	)
+	.await
+	.expect("LIKE residual split plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind LIKE residual split");
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert_single_like(predicate, "c%", false, false);
+	assert!(
+		scan_pbc(scan).is_some(),
+		"pushable id equality must still reach scan PBC"
+	);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3)]);
+}
+
+#[tokio::test]
+async fn rune_like_reuses_binder_utf8_type_error() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("amount").like("1%"))
+        }
+    "#,
+	)
+	.await
+	.expect("LIKE type error plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("LIKE on non-Utf8 column must fail in binder");
+
+	match error {
+		BindingError::TypeMismatch { message } => assert!(
+			message.contains("LIKE expects Utf8 input, got Int32"),
+			"unexpected LIKE type mismatch message: {message}"
+		),
+		other => panic!("expected LIKE type mismatch, got {other:?}"),
+	}
+}
+
+#[tokio::test]
 async fn rune_nominal_turbofish_binds_vs_literal() {
 	bind_rune_nominal_filter(
 		r#"
@@ -1489,6 +1644,30 @@ fn scan_pbc(plan: &ExecutionPlan) -> Option<&[u8]> {
 		| ExecutionPlan::Sort { input, .. } => scan_pbc(input),
 		ExecutionPlan::Join { left, right, .. } => scan_pbc(left).or_else(|| scan_pbc(right)),
 		_ => None,
+	}
+}
+
+fn assert_single_like(
+	predicate: &toron::ir::BoundExprProgram,
+	expected_pattern: &str,
+	expected_negated: bool,
+	expected_case_insensitive: bool,
+) {
+	match predicate
+		.single_root()
+		.and_then(|root| predicate.node(root))
+	{
+		Some(BoundExprNode::Like {
+			pattern,
+			negated,
+			case_insensitive,
+			..
+		}) => {
+			assert_eq!(pattern, expected_pattern);
+			assert_eq!(*negated, expected_negated);
+			assert_eq!(*case_insensitive, expected_case_insensitive);
+		}
+		other => panic!("expected single LIKE predicate, got {other:?}"),
 	}
 }
 
