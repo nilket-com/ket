@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–102 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–103 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -605,6 +605,24 @@ run, 079+).
   Claude grounded latest-only-via-`latest_by_name` + the decode-reuse + no-walker-sweep; Gemini ratified).
   Migration: `plans/impl/102_information_schema_tables_columns.md`.
 
+- **ADR 103 — Derived-Table Alias Column Lists (explicit-projection).** Promoted. Closes the ADR 100
+  alias-column deferral: `FROM (SELECT id, note FROM people) AS p(pid, label)` **positionally renames** the
+  derived subquery's outputs. **Pure `sql_planner`** — it rewrites the existing lowered
+  `Project.output_names` (the rejection at `sql_planner.rs:3394` moves into `lower_derived_table`, where the
+  `select` + lowered plan coexist; a new `apply_derived_alias_column_list` helper arity-checks and
+  overwrites `output_names`). **Explicit-only scope (Codex's correction, operator-locked):** an explicit
+  projection lowers to `Project` (plan-time arity); a wildcard (`SELECT *`) lowers to a bare plan (no
+  `Project`, arity binder-known), so wildcard alias-lists **reject** with a named fence — binder-carried
+  wildcard aliasing is a deferred ADR. **Exact arity** (mismatch rejects before binding). The rename is
+  **transparent** for bare-column items (089 preserves identity, ADR 100's `transparent_project_child_ordinal`
+  still traces the receipt → `WHERE pid < 0` over `PersonId CHECK (VALUE > 0)` still elides); a computed
+  rename binds but doesn't elide. Duplicate aliases (`AS p(x, x)`) inherit existing `AmbiguousColumn`
+  behavior (no new uniqueness rule). Retargets only the categorical alias-rejection assertion in
+  `adr100_derived_table_source_is_narrow_not_general_subquery_support`; all other 100 fences hold. No new
+  IR/exec/PBC/storage/Wendelon/`information_schema` surface. Genuine 3-of-3 (Claude seeded + the 089/100
+  transparency tie-in; Codex grounded the seam + the explicit-vs-wildcard scope correction + duplicate-alias
+  inheritance; Gemini ratified). Migration: `plans/impl/103_derived_table_alias_column_lists.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -688,12 +706,11 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 102 promoted; ADR 103 candidates
+### ADR 103 promoted; ADR 104 candidates
 
-ADR 102 selected and promoted **authoritative `information_schema.tables` / `.columns`** — the 2nd/3rd
-system relations (Fork B: refreshed tenant descriptor listing, not local-cache; a new read-only Control-Ring
-listing RPC built on `latest_by_name`; 099-pattern reuse, no walker sweep). Genuine 3-of-3. No
-operator-designated next yet; strongest leads, by theme:
+ADR 103 selected and promoted **derived-table alias column lists** (explicit-projection positional rename
+of `Project.output_names`; wildcard fence; transparency preserved through bare-column renames). Genuine
+3-of-3. No operator-designated next yet; strongest leads, by theme:
 
 *Catalog introspection continuation (the substrate now exists):*
 
@@ -701,10 +718,10 @@ operator-designated next yet; strongest leads, by theme:
   the 102 descriptor-listing substrate; gated on constraint/namespace modeling (PK/FK identity and
   referential integrity are the harder pieces). The next introspection cut once 102 settles.
 
-*Derived-source continuation (let ADR 100 keep baking; split, don't generalize):*
+*Derived-source continuation (split, don't generalize):*
 
-- **Derived-table alias column lists** (`... AS p(pid)`) — small SQL-surface completion (a renaming
-  projection above the subquery); the narrowest 100 follow-on.
+- **Binder-carried wildcard alias-columns** — the deferred ADR 103 half: carry the alias list to bind time
+  and rename after `SELECT *` scan resolution (needs a binder-aware representation). The named 103 follow-on.
 - **General derived tables / subqueries** — joins-around-derived, derived aggregates/sort/limit, alias
   scoping, eventually `IN`/scalar/correlated + decorrelation. Large; sequence the sub-features.
 - **Projected-scan receipt** — only earns a cut if/when refinement elision is ever moved to run *after*
@@ -741,7 +758,14 @@ operator-designated next yet; strongest leads, by theme:
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/102_information_schema_tables_columns.md`.
+`plans/impl/103_derived_table_alias_column_lists.md`.
+
+### ADR 102 promoted; ADR 103 candidates (HISTORICAL)
+
+ADR 102 promoted authoritative `information_schema.tables`/`.columns` (Fork B: refreshed tenant descriptor
+listing via a read-only Control-Ring RPC on `latest_by_name`; 099-pattern reuse, no walker sweep). 103 took
+the narrowest 100 follow-on — derived-table alias column lists (explicit-projection, wildcard fenced).
+Detail in `plans/adr/102_information_schema_tables_columns.md` + the active-line entry above.
 
 ### ADR 101 promoted; ADR 102 candidates (HISTORICAL)
 
