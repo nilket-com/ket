@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–100 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–101 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -568,6 +568,22 @@ run, 079+).
   cut, and the confirmed retarget; Codex seeded the paired cut + the receipt resolver structure; Gemini
   ratified). Migration: `plans/impl/100_derived_source_transparent_projection_provenance.md`.
 
+- **ADR 101 — Rune `LIKE`/`ILIKE` Pattern Predicates.** Promoted. A **pure Rune authoring admission**:
+  the whole `LIKE`/`ILIKE` path already exists end-to-end for SQL (`Expr::Like` `ir.rs:528` →
+  `BoundExprNode::Like` → `lower_like`/`bind_like` → Arrow `like`/`nlike`/`ilike`/`nilike` → PBC declines
+  it as residual `pbc.rs:128`); Rune was the only missing authoring consumer. Adds four infallible
+  `RuneExpr` methods (`like`/`not_like`/`ilike`/`not_ilike`) that build the existing `Expr::Like` via a
+  `build_like` helper, registered in `create_toron_module`. **Literal-only pattern** (host `String`, per
+  075); **residual-only** (no PBC); **binder owns type policy** (the existing `LIKE expects Utf8 input`
+  error). Infallible `-> RuneExpr` (mirrors `logical_not`/`eq`, not `in_list`'s `VmResult` — that's the
+  exception, for empty/oversized-list validation). Retargets stale surface guards: the deferred list
+  (`rune_frontend.rs:700`) becomes `["not","safe_cast"]`, and the ADR 086 in-list forbidden-name guard no
+  longer rejects admitted `like`/`ilike` names. Toron-only, ring-local Rune frontend; **no** SQL
+  grammar/IR/binder-semantics/executor/PBC/storage/Wendelon change. Genuine 3-of-3 (Codex seeded +
+  sharpened the infallible return; Claude grounded the substrate + the exact binder error + the
+  `sales`-fixture rows/guard retarget sites; Gemini ratified). Migration:
+  `plans/impl/101_rune_like_ilike_pattern_predicates.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -651,27 +667,30 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 100 promoted; ADR 101 candidates
+### ADR 101 promoted; ADR 102 candidates
 
-ADR 100 selected and promoted **Derived-Source Transparent Projection Provenance** — paired the first
-narrow derived `FROM` source with the refinement proof that traces through a transparent inner `Project`
-to the stored scan receipt (Fork B: transparency in the binder atom, not the parser; two-shape receipt;
-projected-scan excluded as inert). Genuine 3-of-3. No operator-designated next named yet; the strongest
-leads, by theme:
+ADR 101 selected and promoted **Rune `LIKE`/`ILIKE` Pattern Predicates** — a pure Rune authoring
+admission over the already-complete `Expr::Like` substrate (four infallible methods, residual-only,
+literal pattern, stale guard retargets). Genuine 3-of-3. Strongest leads, by theme:
 
-*Derived-source continuation (the natural next step from 100):*
+*Introspection follow-on — ADR 102 lead candidate (needs a framing decision first):*
 
-- **General derived tables / subqueries** — lift 100's single-source fence toward joins-around-derived,
-  derived aggregates/sort/limit, alias scoping, and eventually `IN`/scalar/correlated + decorrelation.
-  Large; sequence the sub-features.
-- **Projected-scan receipt** — only earns a cut if/when refinement elision is ever duplicated or moved
-  to run *after* `push_down_scan_projection` (then `Scan { projection: Some }` has a consumer). Low
-  priority; explicitly deferred by ADR 100 D5.
+- **`information_schema.tables` / `.columns`** — the 2nd/3rd system relation, the point at which the 099
+  `SystemTableKind` enum earns generalizing into a small virtual-table framework. **Name the fork at
+  iter-0:** **(a)** local-cache-only introspection over descriptors Toron already holds (smaller,
+  Toron-local, not fully authoritative), vs **(b)** refreshed authoritative tenant descriptor listing
+  (099's refresh-before-read, but a *listing* RPC — Toron has per-table `get_table_schema_descriptor`,
+  Wendelon has `descriptors_for_tenant`, so (b) adds a cross-ring listing surface). (b) is the bigger,
+  truer cut; (a) is the smaller stopgap. This choice, not a 2nd variant, is the real ADR 102 question.
 
-*Introspection follow-on (substrate now exists, doubly motivated after 099 + the type system):*
+*Derived-source continuation (let ADR 100 keep baking; split, don't generalize):*
 
-- **`information_schema.tables` / `.columns`** — a 2nd/3rd system relation; the point at which the 099
-  `SystemTableKind` enum earns generalizing into a small virtual-table framework.
+- **Derived-table alias column lists** (`... AS p(pid)`) — small SQL-surface completion (a renaming
+  projection above the subquery); the narrowest 100 follow-on.
+- **General derived tables / subqueries** — joins-around-derived, derived aggregates/sort/limit, alias
+  scoping, eventually `IN`/scalar/correlated + decorrelation. Large; sequence the sub-features.
+- **Projected-scan receipt** — only earns a cut if/when refinement elision is ever moved to run *after*
+  `push_down_scan_projection` (then `Scan { projection: Some }` has a consumer). Deferred by ADR 100 D5.
 
 *Identity authoring follow-ons:*
 
@@ -685,19 +704,17 @@ leads, by theme:
 
 *Carried Rune leads (still live):*
 
-- **Rune `Like`/`ILike`** — pattern predicates over existing `Expr::Like { pattern,
-  negated, case_insensitive }`; **residual** (PBC-ineligible); `like` is not a Rune keyword (so
-  `.like`/`.ilike`/`.not_like` are safe); pattern is a literal `String` (per 075). The smallest
-  carried cut.
 - **Rune joins** — needs relation-alias + qualified-column ergonomics first.
-- **`SIMILAR TO`/`RLIKE`/`REGEXP`**; **`CASE`/value-conditionals**; **Rune sort/limit**;
-  dot-field sugar; **Wendelon typed table-mutation trace continuation**.
+- **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex pattern families, beyond 101's literal `LIKE`);
+  **`CASE`/value-conditionals**; **Rune sort/limit**; dot-field sugar; **Wendelon typed table-mutation
+  trace continuation**.
 
 *Cross-ring chore (operator-flagged):*
 
 - **Wendelon `*V1`/`*v1` de-version sweep** — strip the version suffixes in Wendelon unless one has a
   strong reason (pre-release, no historical installs). A Wendelon-home chore (placement follows
-  code-locality), not a Toron ADR.
+  code-locality), needs an audit taxonomy (cosmetic suffix vs durable format label like `WDV1` vs
+  compat-test fixture); not a Toron ADR.
 
 *Carried:*
 
@@ -706,7 +723,15 @@ leads, by theme:
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
 The migration is materialized in
-`plans/impl/100_derived_source_transparent_projection_provenance.md`.
+`plans/impl/101_rune_like_ilike_pattern_predicates.md`.
+
+### ADR 100 promoted; ADR 101 candidates (HISTORICAL)
+
+ADR 100 promoted **Derived-Source Transparent Projection Provenance** (narrow derived `FROM` paired with
+the transparent-project refinement receipt; Fork B; two-shape receipt; projected-scan excluded as inert).
+101 took the smallest carried Rune cut (`LIKE`/`ILIKE`) as a palate cleanser over a fully-proven
+substrate. Detail in `plans/adr/100_derived_source_transparent_projection_provenance.md` + the
+active-line entry above.
 
 ### ADR 099 promoted; ADR 100 candidates (HISTORICAL)
 
