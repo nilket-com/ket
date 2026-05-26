@@ -3694,11 +3694,7 @@ fn optimize_for_required(
 			let output_remap = ordinal_remap(&requested_outputs_vec);
 
 			Ok((
-				ExecutionPlan::Project {
-					input: Box::new(input),
-					exprs,
-					output_schema,
-				},
+				collapse_adjacent_identity_project(input, exprs, output_schema),
 				output_remap,
 			))
 		}
@@ -3958,6 +3954,71 @@ fn optimize_for_required(
 			))
 		}
 	}
+}
+
+fn collapse_adjacent_identity_project(
+	input: ExecutionPlan,
+	parent_exprs: BoundExprProgram,
+	parent_output_schema: SchemaRef,
+) -> ExecutionPlan {
+	let collapsible = matches!(
+		&input,
+		ExecutionPlan::Project { output_schema, .. }
+			if is_metadata_transparent_identity_project(&parent_exprs, output_schema)
+	);
+	if collapsible {
+		let ExecutionPlan::Project {
+			input: child_input,
+			exprs: child_exprs,
+			..
+		} = input
+		else {
+			unreachable!("collapsible implies the child is a Project");
+		};
+		return ExecutionPlan::Project {
+			input: child_input,
+			exprs: child_exprs,
+			output_schema: parent_output_schema,
+		};
+	}
+	ExecutionPlan::Project {
+		input: Box::new(input),
+		exprs: parent_exprs,
+		output_schema: parent_output_schema,
+	}
+}
+
+fn is_metadata_transparent_identity_project(
+	parent_exprs: &BoundExprProgram,
+	child_output_schema: &SchemaRef,
+) -> bool {
+	let fields = child_output_schema.fields();
+	if parent_exprs.root_count() != fields.len() {
+		return false;
+	}
+	for (idx, field) in fields.iter().enumerate() {
+		let field = field.as_ref();
+		let Some(root_id) = parent_exprs.roots.get(idx).copied() else {
+			return false;
+		};
+		let Some(BoundExprNode::Column(column)) = parent_exprs.node(root_id) else {
+			return false;
+		};
+		let ordinal = ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow"));
+		if column.ordinal != ordinal {
+			return false;
+		}
+		if column.data_type != *field.data_type() || column.nullable != field.is_nullable() {
+			return false;
+		}
+		let Ok(child_logical_type) = decode_column_logical_type(field) else {
+			return false;
+		};
+		if parent_exprs.root_logical_type(idx) != Some(child_logical_type) {
+			return false;
+		}
+	}
+	true
 }
 
 fn all_columns(schema: &SchemaRef) -> BTreeSet<ColumnOrdinal> {

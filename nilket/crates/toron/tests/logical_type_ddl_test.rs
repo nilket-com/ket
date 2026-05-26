@@ -1252,6 +1252,84 @@ async fn alias_columns_wildcard_derived_rename_output() {
 }
 
 #[tokio::test]
+async fn explicit_derived_alias_columns_collapse_adjacent_identity_project() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT * FROM (SELECT id, note FROM people) AS p(pid, label)",
+	)
+	.await;
+
+	assert_eq!(bound.schema().field(0).name(), "pid");
+	assert_eq!(bound.schema().field(1).name(), "label");
+	assert_eq!(project_count(&bound), 1);
+}
+
+#[tokio::test]
+async fn explicit_derived_alias_columns_collapse_after_outer_projection() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT pid FROM (SELECT id, note FROM people) AS p(pid, label)",
+	)
+	.await;
+
+	assert_eq!(bound.schema().field(0).name(), "pid");
+	assert_eq!(project_count(&bound), 1);
+}
+
+#[tokio::test]
+async fn plain_derived_outer_projection_collapses_adjacent_projects() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT id FROM (SELECT id, note FROM people) AS p",
+	)
+	.await;
+
+	assert_eq!(bound.schema().field(0).name(), "id");
+	assert_eq!(project_count(&bound), 1);
+}
+
+#[tokio::test]
+async fn base_table_alias_columns_keep_project_boundary() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(&catalog, &planner, "SELECT * FROM people AS p(pid, label)").await;
+
+	assert_eq!(bound.schema().field(0).name(), "pid");
+	assert_eq!(bound.schema().field(1).name(), "label");
+	assert_eq!(project_count(&bound), 1);
+}
+
+#[tokio::test]
+async fn wildcard_derived_alias_columns_keep_project_boundary() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT * FROM (SELECT * FROM people) AS p(pid, label)",
+	)
+	.await;
+
+	assert_eq!(bound.schema().field(0).name(), "pid");
+	assert_eq!(bound.schema().field(1).name(), "label");
+	assert_eq!(project_count(&bound), 1);
+}
+
+#[tokio::test]
 async fn alias_columns_hide_original_names() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_person_id_people(&coordinator, &planner).await;
@@ -2787,6 +2865,21 @@ fn contains_scan(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Update { source, .. }
 		| ExecutionPlan::InsertSelect { source, .. } => contains_scan(source),
 		_ => false,
+	}
+}
+
+fn project_count(plan: &ExecutionPlan) -> usize {
+	match plan {
+		ExecutionPlan::Project { input, .. } => 1 + project_count(input),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => project_count(input),
+		ExecutionPlan::Join { left, right, .. } => project_count(left) + project_count(right),
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::Update { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. } => project_count(source),
+		_ => 0,
 	}
 }
 

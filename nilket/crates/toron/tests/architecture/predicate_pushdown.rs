@@ -1907,6 +1907,117 @@ pub(crate) fn adr103_alias_column_guards_retarget_to_104_unified_path() {
 }
 
 #[test]
+pub(crate) fn adr105_project_coalescing_lives_in_existing_post_bind_optimizer() {
+	let binder = source("src/binder.rs");
+	let bind_entry = first_block(&binder, "pub async fn bind");
+	let optimizer = first_block(&binder, "fn optimize_for_required");
+
+	assert!(bind_entry.contains("push_down_scan_projection(plan)"));
+	assert!(optimizer.contains("collapse_adjacent_identity_project(input, exprs, output_schema)"));
+}
+
+#[test]
+pub(crate) fn adr105_coalescing_is_adjacent_project_only() {
+	let binder = source("src/binder.rs");
+	let helper = first_block(&binder, "fn collapse_adjacent_identity_project");
+
+	assert!(helper.contains("ExecutionPlan::Project { output_schema, .. }"));
+	for marker in [
+		"ExecutionPlan::Scan",
+		"ExecutionPlan::SystemTable",
+		"ExecutionPlan::EmptyRelation",
+		"ExecutionPlan::Filter",
+		"ExecutionPlan::Aggregate",
+		"ExecutionPlan::Exchange",
+		"ExecutionPlan::Sort",
+		"ExecutionPlan::Join",
+		"ExecutionPlan::Update",
+		"ExecutionPlan::InsertSelect",
+	] {
+		assert!(
+			!helper.contains(marker),
+			"ADR105 coalescer should not directly remove {marker}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr105_identity_requires_ordinal_and_metadata_match() {
+	let binder = source("src/binder.rs");
+	let helper = first_block(&binder, "fn is_metadata_transparent_identity_project");
+
+	assert!(helper.contains("BoundExprNode::Column(column)"));
+	assert!(helper.contains("ColumnOrdinal(u32::try_from(idx)"));
+	assert!(helper.contains("column.ordinal"));
+	assert!(helper.contains("field.data_type()"));
+	assert!(helper.contains("field.is_nullable()"));
+	assert!(helper.contains("parent_exprs.root_logical_type(idx)"));
+	assert!(helper.contains("decode_column_logical_type(field)"));
+}
+
+#[test]
+pub(crate) fn adr105_identity_check_ignores_names_parent_schema_wins() {
+	let binder = source("src/binder.rs");
+	let helper = first_block(&binder, "fn is_metadata_transparent_identity_project");
+	let coalescer = first_block(&binder, "fn collapse_adjacent_identity_project");
+
+	assert!(!helper.contains("field.name"));
+	assert!(coalescer.contains("exprs: child_exprs"));
+	assert!(coalescer.contains("output_schema: parent_output_schema"));
+}
+
+#[test]
+pub(crate) fn adr105_no_sql_ir_exec_pbc_storage_wendelon_information_schema_surface() {
+	let planner = source("src/sql_planner.rs");
+	let logical = source("src/ir.rs");
+	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
+	let execution = source("src/ir/execution.rs");
+	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
+	let binder = source("src/binder.rs");
+	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
+	let pbc = source("src/pbc.rs");
+	let executor = source("src/exec.rs");
+	let storage = source("src/storage.rs");
+	let coordinator = source("src/coordinator.rs");
+	let markers = [
+		"collapse_adjacent_identity_project",
+		"is_metadata_transparent_identity_project",
+	];
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker)))
+		.collect::<Vec<_>>();
+
+	for marker in markers {
+		assert!(!planner.contains(marker), "{marker} leaked to SQL planner");
+		assert!(
+			!logical_plan.contains(marker),
+			"{marker} leaked to LogicalPlan"
+		);
+		assert!(
+			!execution_plan.contains(marker),
+			"{marker} leaked to ExecutionPlan"
+		);
+		assert!(
+			!information_schema.contains(marker),
+			"{marker} leaked to information_schema"
+		);
+		assert!(!pbc.contains(marker), "{marker} leaked to PBC");
+		assert!(!executor.contains(marker), "{marker} leaked to executor");
+		assert!(!storage.contains(marker), "{marker} leaked to storage");
+		assert!(
+			!coordinator.contains(marker),
+			"{marker} leaked to coordinator"
+		);
+	}
+	assert!(
+		wendelon_offenders.is_empty(),
+		"ADR105 project coalescing helper leaked to Wendelon:\n{}",
+		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
+	);
+}
+
+#[test]
 pub(crate) fn adr097_cast_try_cast_remain_ephemeral_not_receipts() {
 	let binder = source("src/binder.rs");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");

@@ -261,6 +261,32 @@ async fn rune_project_named_binds_visible_schema() {
 }
 
 #[tokio::test]
+async fn rune_project_named_chains_collapse_adjacent_projects() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT id, amount FROM sales")
+               .project_named([
+                   col("id").named("sale_id"),
+                   col("amount").named("net"),
+               ])
+               .project_named([
+                   col("sale_id").named("id2"),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("project_named chain");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind project_named chain");
+
+	assert_schema_names(bound.schema().as_ref(), &["id2"]);
+	assert_eq!(execution_project_count(&bound), 1);
+}
+
+#[tokio::test]
 async fn rune_aggregate_helper_pack_binds_stable_outputs() {
 	let logical = rune_plan(
 		r#"
@@ -1644,6 +1670,23 @@ fn scan_pbc(plan: &ExecutionPlan) -> Option<&[u8]> {
 		| ExecutionPlan::Sort { input, .. } => scan_pbc(input),
 		ExecutionPlan::Join { left, right, .. } => scan_pbc(left).or_else(|| scan_pbc(right)),
 		_ => None,
+	}
+}
+
+fn execution_project_count(plan: &ExecutionPlan) -> usize {
+	match plan {
+		ExecutionPlan::Project { input, .. } => 1 + execution_project_count(input),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => execution_project_count(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			execution_project_count(left) + execution_project_count(right)
+		}
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::Update { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. } => execution_project_count(source),
+		_ => 0,
 	}
 }
 
