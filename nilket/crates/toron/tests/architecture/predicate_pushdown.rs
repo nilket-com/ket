@@ -1615,9 +1615,7 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 		);
 	}
 	for marker in [
-		"projection_contains_aggregate_call",
 		"projection_contains_window_function",
-		"group_by_is_empty",
 		"select.from.len() != 1",
 		"!source.joins.is_empty()",
 		"TableFactor::Derived",
@@ -2013,6 +2011,167 @@ pub(crate) fn adr105_no_sql_ir_exec_pbc_storage_wendelon_information_schema_surf
 	assert!(
 		wendelon_offenders.is_empty(),
 		"ADR105 project coalescing helper leaked to Wendelon:\n{}",
+		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr106_derived_aggregates_reuse_existing_aggregate_ir() {
+	let logical = source("src/ir.rs");
+	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
+	let execution = source("src/ir/execution.rs");
+	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
+	let planner = source("src/sql_planner.rs");
+	let lower_derived = first_block(&planner, "fn lower_derived_table");
+
+	assert!(logical_plan.contains("Aggregate"));
+	assert!(execution_plan.contains("Aggregate"));
+	assert!(planner.contains("LogicalPlan::Aggregate"));
+	assert!(!logical_plan.contains("DerivedAggregate"));
+	assert!(!execution_plan.contains("DerivedAggregate"));
+	assert!(!lower_derived.contains("DerivedAggregate"));
+}
+
+#[test]
+pub(crate) fn adr106_lower_derived_table_lifts_only_aggregate_fence() {
+	let planner = source("src/sql_planner.rs");
+	let lower_derived = first_block(&planner, "fn lower_derived_table");
+
+	for marker in [
+		"validate_derived_query_shape(subquery)",
+		"validate_derived_select_shape(select)",
+		"self.lower_select(select)?",
+		"alias_plan(plan, Some(alias))",
+	] {
+		assert!(
+			lower_derived.contains(marker),
+			"lower_derived_table missing {marker}"
+		);
+	}
+	assert!(!lower_derived.contains("lower_query("));
+	assert!(!lower_derived.contains("aggregate_output_catalog.is_some()"));
+	assert!(!lower_derived.contains("aggregate derived tables are not supported"));
+}
+
+#[test]
+pub(crate) fn adr106_general_derived_source_fences_remain() {
+	let planner = source("src/sql_planner.rs");
+	let query_shape = first_block(&planner, "fn validate_derived_query_shape");
+	let select_shape = first_block(&planner, "fn validate_derived_select_shape");
+
+	for marker in [
+		"query.with.is_some()",
+		"query.order_by.is_some()",
+		"query_has_limit_or_offset",
+		"SetExpr::Select",
+		"unsupported derived table query body",
+	] {
+		assert!(
+			query_shape.contains(marker),
+			"missing query-shape fence {marker}"
+		);
+	}
+	for marker in [
+		"projection_contains_window_function",
+		"select.from.len() != 1",
+		"!source.joins.is_empty()",
+		"TableFactor::Derived",
+		"unsupported derived table source",
+	] {
+		assert!(
+			select_shape.contains(marker),
+			"missing derived select fence {marker}"
+		);
+	}
+	for removed in [
+		"projection_contains_aggregate_call",
+		"!group_by_is_empty(&select.group_by)",
+		"select.having.is_some()",
+	] {
+		assert!(
+			!select_shape.contains(removed),
+			"aggregate fence should be lifted from derived select shape: {removed}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr106_alias_column_rename_remains_generic_bound_project() {
+	let planner = source("src/sql_planner.rs");
+	let lower_derived = first_block(&planner, "fn lower_derived_table");
+	let binder = source("src/binder.rs");
+	let bind_plan = first_block(&binder, "fn bind_plan");
+	let helper = first_block(&binder, "fn bind_alias_column_rename");
+	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
+
+	assert!(lower_derived.contains("alias_plan(plan, Some(alias))"));
+	assert!(bind_plan.contains("LogicalPlan::Alias { input, columns, .. }"));
+	assert!(bind_plan.contains("bind_alias_column_rename(input, columns)"));
+	assert!(helper.contains("ExecutionPlan::Project"));
+	assert!(logical_type_ddl.contains("aggregate_derived_alias_columns_rename_outputs"));
+	for marker in [
+		"aggregate_alias",
+		"bind_aggregate_alias",
+		"rename_aggregate",
+		"apply_aggregate_alias",
+	] {
+		assert!(
+			!planner.contains(marker) && !binder.contains(marker),
+			"aggregate-local alias helper leaked in via {marker}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr106_no_ir_exec_pbc_storage_wendelon_information_schema_surface() {
+	let logical = source("src/ir.rs");
+	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
+	let execution = source("src/ir/execution.rs");
+	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
+	let binder = source("src/binder.rs");
+	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
+	let pbc = source("src/pbc.rs");
+	let executor = source("src/exec.rs");
+	let storage = source("src/storage.rs");
+	let coordinator = source("src/coordinator.rs");
+	let rune = source("src/rune_engine.rs");
+	let markers = [
+		"DerivedAggregate",
+		"aggregate_derived",
+		"bind_aggregate_derived",
+		"lower_aggregate_derived",
+		"aggregate derived tables",
+	];
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker)))
+		.collect::<Vec<_>>();
+
+	for marker in markers {
+		assert!(
+			!logical_plan.contains(marker),
+			"{marker} leaked to LogicalPlan"
+		);
+		assert!(
+			!execution_plan.contains(marker),
+			"{marker} leaked to ExecutionPlan"
+		);
+		assert!(
+			!information_schema.contains(marker),
+			"{marker} leaked to information_schema"
+		);
+		assert!(!pbc.contains(marker), "{marker} leaked to PBC");
+		assert!(!executor.contains(marker), "{marker} leaked to executor");
+		assert!(!storage.contains(marker), "{marker} leaked to storage");
+		assert!(
+			!coordinator.contains(marker),
+			"{marker} leaked to coordinator"
+		);
+		assert!(!rune.contains(marker), "{marker} leaked to Rune");
+	}
+	assert!(
+		wendelon_offenders.is_empty(),
+		"ADR106 derived aggregate helper leaked to Wendelon:\n{}",
 		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
 	);
 }

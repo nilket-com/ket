@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::distributed::budget::{QueryBudget, TaskBudget};
@@ -1432,6 +1432,48 @@ async fn grouped_aggregate_having_executes_after_aggregation() {
 	.await;
 	assert_eq!(
 		region_count_rows(&count_results),
+		vec![(Some("east".to_string()), 3)]
+	);
+}
+
+#[tokio::test]
+async fn aggregate_derived_table_binds_and_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT bucket, total \
+		 FROM (SELECT region AS bucket, SUM(amount) AS total FROM sales GROUP BY region) AS p \
+		 WHERE total > 10 ORDER BY bucket",
+	))
+	.await;
+
+	assert_eq!(
+		ordered_region_sum_rows(&results),
+		vec![
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+		]
+	);
+}
+
+#[tokio::test]
+async fn global_aggregate_derived_table_binds_and_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT n FROM (SELECT COUNT(*) AS n FROM sales) AS p",
+	))
+	.await;
+
+	assert_eq!(scalar_sum_rows(&results), vec![Some(6)]);
+}
+
+#[tokio::test]
+async fn aggregate_derived_having_binds_and_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT bucket, n \
+		 FROM (SELECT region AS bucket, COUNT(*) AS n FROM sales GROUP BY region HAVING COUNT(*) > 2) AS p",
+	))
+	.await;
+
+	assert_eq!(
+		region_count_rows(&results),
 		vec![(Some("east".to_string()), 3)]
 	);
 }
@@ -4036,15 +4078,24 @@ impl StorageScan for FixtureScan {
 			.clone();
 		if let Some(projected_columns) = request.projected_columns.as_ref() {
 			let schema = batch.schema();
-			let fields = projected_columns
-				.iter()
-				.map(|ordinal| schema.field(ordinal.0 as usize).as_ref().clone())
-				.collect::<Vec<_>>();
-			let columns = projected_columns
-				.iter()
-				.map(|ordinal| batch.column(ordinal.0 as usize).clone())
-				.collect::<Vec<_>>();
-			batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+			if projected_columns.is_empty() {
+				let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+				batch = RecordBatch::try_new_with_options(
+					Arc::new(Schema::empty()),
+					Vec::new(),
+					&options,
+				)?;
+			} else {
+				let fields = projected_columns
+					.iter()
+					.map(|ordinal| schema.field(ordinal.0 as usize).as_ref().clone())
+					.collect::<Vec<_>>();
+				let columns = projected_columns
+					.iter()
+					.map(|ordinal| batch.column(ordinal.0 as usize).clone())
+					.collect::<Vec<_>>();
+				batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+			}
 		}
 		Ok(ScanStream::from_batches(
 			batch.schema(),

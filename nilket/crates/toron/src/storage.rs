@@ -6,7 +6,7 @@ use crate::error::StorageError;
 use crate::ir::{ColumnOrdinal, MorselId, QueryId, QueryProfileHint, SessionId, TableId};
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryBuilder, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
@@ -679,7 +679,7 @@ fn scan_in_memory_batch(
 			.into_iter()
 			.map(|column| column.0 as usize)
 			.collect::<Vec<_>>();
-		batch = batch.project(&indices)?;
+		batch = project_record_batch(&batch, &indices)?;
 	}
 
 	if request.row_identity == RowIdentityProjection::Append {
@@ -695,6 +695,21 @@ fn scan_in_memory_batch(
 		request.query_id,
 		vec![batch],
 	))
+}
+
+fn project_record_batch(
+	batch: &RecordBatch,
+	indices: &[usize],
+) -> Result<RecordBatch, StorageError> {
+	if indices.is_empty() {
+		let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+		return Ok(RecordBatch::try_new_with_options(
+			Arc::new(Schema::empty()),
+			Vec::new(),
+			&options,
+		)?);
+	}
+	Ok(batch.project(indices)?)
 }
 
 fn in_memory_row_identities(

@@ -3321,13 +3321,7 @@ impl SqlPlanner {
 	) -> Result<LogicalPlan, FrontendError> {
 		let select = validate_derived_query_shape(subquery)?;
 		validate_derived_select_shape(select)?;
-		let LoweredSelect {
-			plan,
-			aggregate_output_catalog,
-		} = self.lower_select(select)?;
-		if aggregate_output_catalog.is_some() {
-			return Err(unsupported("aggregate derived tables are not supported"));
-		}
+		let LoweredSelect { plan, .. } = self.lower_select(select)?;
 		alias_plan(plan, Some(alias))
 	}
 
@@ -5221,11 +5215,9 @@ fn validate_derived_select_shape(select: &Select) -> Result<(), FrontendError> {
 		|| select.into.is_some()
 		|| !select.lateral_views.is_empty()
 		|| select.prewhere.is_some()
-		|| !group_by_is_empty(&select.group_by)
 		|| !select.cluster_by.is_empty()
 		|| !select.distribute_by.is_empty()
 		|| !select.sort_by.is_empty()
-		|| select.having.is_some()
 		|| !select.named_window.is_empty()
 		|| select.qualify.is_some()
 		|| select.value_table_mode.is_some()
@@ -5237,9 +5229,7 @@ fn validate_derived_select_shape(select: &Select) -> Result<(), FrontendError> {
 	{
 		return Err(unsupported("unsupported derived table select shape"));
 	}
-	if projection_contains_aggregate_call(&select.projection)
-		|| projection_contains_window_function(&select.projection)
-	{
+	if projection_contains_window_function(&select.projection) {
 		return Err(unsupported("unsupported derived table projection"));
 	}
 	if select.from.len() != 1 {

@@ -1,10 +1,12 @@
 # Impl Plan — ADR 106: Derived Aggregate Tables
 
 **Migration for** `plans/adr/106_derived_aggregate_tables.md`. **Scope:** Toron `sql_planner.rs` (relax two
-fences) + behavior tests + guard reconciliation. **Non-scope:** no `LogicalPlan`/`ExecutionPlan` variant, no
-binder semantics, no executor/aggregate-kernel feature, no PBC/storage/coordinator/Wendelon/`information_schema`
-surface, no `lower_query` delegation, no derived ORDER BY/LIMIT, no joins-around/inside or nested derived. A
-planner fence-lift over the existing aggregate substrate.
+fences) + a small `storage.rs` empty-projection row-count fix (Phase 2b) + behavior tests + guard
+reconciliation. **Non-scope:** no `LogicalPlan`/`ExecutionPlan` variant, no binder semantics, no
+executor/aggregate-kernel feature, no PBC/coordinator/Wendelon/`information_schema` surface, no storage
+*contract* change (the Phase 2b fix is an adjacent in-memory-scan correctness fix, not a storage contract),
+no `lower_query` delegation, no derived ORDER BY/LIMIT, no joins-around/inside or nested derived. A planner
+fence-lift over the existing aggregate substrate.
 
 ## Pre-flight anchors (grounded)
 
@@ -59,7 +61,29 @@ nested-derived (`:5256`); non-table source (`:5257`).
 ```
 
 The `validate_derived_query_shape` / `validate_derived_select_shape` calls stay (D4). No `lower_query`
-delegation. That is the entire production change.
+delegation.
+
+## Phase 2b — Empty-projection row-count fix in `scan_in_memory_batch` (`storage.rs`)
+
+Surfaced by the global-aggregate-derived case: `SELECT n FROM (SELECT COUNT(*) AS n FROM t) AS p` pushes an
+**empty** column projection to the scan, and `batch.project(&[])` drops the row count → `COUNT(*)` returns
+`0` instead of the true count. Add a generic helper and route the scan through it:
+
+```rust
+fn project_record_batch(batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch, StorageError> {
+    if indices.is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        return Ok(RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options)?);
+    }
+    Ok(batch.project(indices)?)
+}
+```
+
+Replace the `batch = batch.project(&indices)?` call in `scan_in_memory_batch` with
+`batch = project_record_batch(&batch, &indices)?`. Behavior-correcting, generic (any zero-column scan
+projection), no new storage contract (§ADR Adjacent fix). Mirror the same empty-projection branch in the
+test `FixtureScan` (`tests/group_by_test.rs`) so `global_aggregate_derived_table_binds_and_executes`
+(`n = 6`) passes.
 
 ## Phase 3 — Behavior tests
 

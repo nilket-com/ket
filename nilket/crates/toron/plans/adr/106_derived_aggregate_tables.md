@@ -3,8 +3,10 @@
 **Status:** Promoted (plan). **Genuine 3-of-3 (Claude, Codex, Gemini)** — converged on the **narrow
 fence-lift** (admit grouped + global aggregate SELECTs as derived sources by relaxing the aggregate
 conditions of the existing derived-select validator; keep `lower_select`, do not delegate to `lower_query`).
-**Toron-only** (SQL frontend); no IR/binder/executor/PBC/storage/Wendelon/coordinator/Rune/`information_schema`
-surface — the planner still emits `LogicalPlan::Aggregate`. **Predecessors:** 100/103/104 (derived-source +
+**Toron-only** (SQL frontend); no IR/binder/executor/PBC/Wendelon/coordinator/Rune/`information_schema`
+surface and no storage *contract* change — the planner still emits `LogicalPlan::Aggregate`. One adjacent
+in-memory-scan correctness fix (empty-projection row-count) the global-aggregate case surfaces travels with
+it (§Adjacent fix). **Predecessors:** 100/103/104 (derived-source +
 alias rename), 105 (adjacent-`Project` coalescing), the aggregate substrate (011/015/016/023). **Migration:**
 `plans/impl/106_derived_aggregate_tables.md`.
 
@@ -15,7 +17,8 @@ substrate. `lower_select` already lowers grouped *and* global aggregates to `Log
 (Exchange-wrapped for grouped) → optional `Filter` for `HAVING` → optional final `Project`; the binder binds
 `Aggregate`; the executor runs it; `LogicalPlan::Alias` + `bind_alias_column_rename` (104) rename *any* bound
 input's columns. The only thing rejecting aggregate-derived tables is an artificial frontend fence. 106 lifts
-that fence and adds nothing.
+that fence; the sole added code is one adjacent in-memory-scan correctness fix the global-aggregate case
+surfaces (§Adjacent fix).
 
 ## Scale boundary
 
@@ -55,6 +58,21 @@ ordering over the derived output. **Out of scope (stay fenced, named follow-ons)
   at `Aggregate` (not a `Scan { projection: None }`), so `WHERE p.n > 1` over a derived aggregate does not
   elide. No new rule.
 
+## Adjacent fix — empty-projection row-count (travels with 106, discipline #6)
+
+The global-aggregate-derived case (`SELECT n FROM (SELECT COUNT(*) AS n FROM t) AS p`) is the first SQL path
+that pushes an **empty column projection** to the scan: `COUNT(*)` references no column, so
+`optimize_for_required` narrows the inner scan's projection to zero columns. Arrow's `batch.project(&[])`
+builds a zero-column batch that **loses the row count**, so `COUNT(*)` would return `0` instead of the true
+row count. The fix is a generic `project_record_batch` helper in `storage.rs` `scan_in_memory_batch`: for an
+empty projection, build the zero-column batch via `RecordBatch::try_new_with_options` with
+`RecordBatchOptions::with_row_count(num_rows)`; otherwise unchanged. It is **behavior-correcting and generic**
+(any zero-column scan projection), surfaced *by* this feature, so it travels with the ADR (discipline #6) —
+not a new storage contract/API. The `adr106_no_..._storage_..._surface` guard polices ADR106 feature-marker
+leakage (not raw diffs), so it stays green: the helper carries no feature marker. Mirrored in the test
+`FixtureScan` (`group_by_test.rs`), which the `global_aggregate_derived_table_binds_and_executes` gate
+(`n = 6`) exercises.
+
 ## Decisions (promotion-locked, 3-of-3)
 
 **D1 — Admit aggregate-rooted derived tables** (grouped + global).
@@ -72,8 +90,9 @@ joins-inside, nested-derived, non-table source).
 `validate_derived_query_shape` → `validate_derived_select_shape` → `lower_select` → `alias_plan`.
 
 **D5 — Reuse the existing aggregate substrate.** No new `LogicalPlan`/`ExecutionPlan` variant, binder
-semantics, executor feature, aggregate kernel, or PBC/storage/Wendelon/coordinator/`information_schema`
-surface. The planner still emits `LogicalPlan::Aggregate`.
+semantics, executor feature, aggregate kernel, or PBC/Wendelon/coordinator/`information_schema` surface, and
+no storage *contract* change (the empty-projection row-count fix is an adjacent in-memory-scan correctness
+fix, §Adjacent fix — not a storage-contract/feature change). The planner still emits `LogicalPlan::Aggregate`.
 
 **D6 — HAVING stays an inner aggregate concern.** Inner `HAVING` is lowered against the inner aggregate
 catalog inside `lower_select` (the existing "HAVING requires GROUP BY or aggregate projection" rule `:2582`

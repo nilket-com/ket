@@ -1462,6 +1462,40 @@ async fn alias_columns_compose() {
 }
 
 #[tokio::test]
+async fn aggregate_derived_alias_columns_rename_outputs() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT pid, total FROM (SELECT id, COUNT(*) AS n FROM people GROUP BY id) AS p(pid, total)",
+	)
+	.await;
+
+	assert_eq!(bound.schema().field(0).name(), "pid");
+	assert_eq!(bound.schema().field(1).name(), "total");
+	assert!(contains_aggregate(&bound));
+}
+
+#[tokio::test]
+async fn aggregate_derived_outputs_are_not_refinement_transparent() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT pid FROM (SELECT id AS pid, COUNT(*) AS n FROM people GROUP BY id) AS p WHERE pid < 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+	assert!(contains_aggregate(&bound));
+}
+
+#[tokio::test]
 async fn derived_table_source_scope_rejects_general_subquery_features() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_person_id_people(&coordinator, &planner).await;
@@ -1472,8 +1506,6 @@ async fn derived_table_source_scope_rejects_general_subquery_features() {
 		"SELECT id FROM (SELECT id FROM (SELECT id FROM people) AS q) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT people.id FROM people JOIN people AS other ON people.id = other.id) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT id FROM people) AS p JOIN people AS other ON p.id = other.id",
-		"SELECT id FROM (SELECT COUNT(*) AS id FROM people) AS p WHERE id < 0",
-		"SELECT id FROM (SELECT id, COUNT(*) AS n FROM people GROUP BY id) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT id FROM people ORDER BY id LIMIT 1) AS p WHERE id < 0",
 		"SELECT id FROM (WITH q AS (SELECT id FROM people) SELECT id FROM q) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT id FROM people UNION SELECT id FROM people) AS p WHERE id < 0",
@@ -2864,6 +2896,23 @@ fn contains_scan(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::CreateTableAsSelect { source, .. }
 		| ExecutionPlan::Update { source, .. }
 		| ExecutionPlan::InsertSelect { source, .. } => contains_scan(source),
+		_ => false,
+	}
+}
+
+fn contains_aggregate(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Aggregate { .. } => true,
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => contains_aggregate(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			contains_aggregate(left) || contains_aggregate(right)
+		}
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::Update { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. } => contains_aggregate(source),
 		_ => false,
 	}
 }
