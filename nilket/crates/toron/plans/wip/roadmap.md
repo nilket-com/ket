@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–107 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–108 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -703,6 +703,27 @@ run, 079+).
   refresh-failure gate the others missed; Claude retracted his iter-0 inert claim). Migration:
   `plans/impl/107_information_schema_schemata.md`.
 
+- **ADR 108 — SQL `CASE` (value conditionals).** Promoted. The **first conditional-expression substrate** in
+  Toron (and first IR+executor leap since the 087 nominal spine). One canonical searched-form
+  `Expr::Case { when_then, else_expr }`; **simple CASE desugars to searched** in the planner (one path).
+  Branches unify via the existing `arithmetic_output_type` lattice (identical + numeric widening; else reject
+  at bind); missing `ELSE` → synthesized typed-NULL; result `LogicalTypeId::NAKED` (uniform-branch identity
+  propagation deferred). **Residual** (PBC declines; no opcode), evaluated **eager-vectorized** via Arrow
+  `zip` folded in reverse (first-WHEN-true wins). **The implementation bulk is a two-sided expression-walker
+  ripple** — the logical `SqlExpr`/`Expr` planner visitors (nested-aggregate/subquery/window/qualified-column/
+  hidden-sort-key/structural-hash) **and** the bound `BoundExprNode` arena walkers across `ir/execution.rs` /
+  `binder.rs` / `pbc.rs` / `exec.rs` (the 10th arena variant; mirror `Like`). **Documented eager/lazy
+  tradeoff** (the headline semantic the operator wanted legible): SQL CASE is nominally lazy, but vectorized
+  CASE computes every branch then masks — *branchless evaluation at array granularity*, where only **total**
+  ops are safe to speculate. ADR 084's div0→NULL makes the common `1/x` guard safe; **hard-erroring** kernels
+  (overflow, strict `CAST`) in a masked branch still fail the query — pinned by `case_divide_guard_is_safe_via_null`
+  + `case_branches_eval_eagerly_masked_hard_error_fails`, and a required `evaluate_case` doc-comment. **The
+  `IF` fork resolved to ADR 109** (the whole sugar family), keeping 108 the clean substrate. Retargets the 074
+  + pattern-predicates + 031 guards; adds `adr108_case_is_residual_bound_expression`. No
+  plan/exec-variant/Wendelon/storage/PBC-opcode surface. Genuine 3-of-3 (Gemini led the capability swing;
+  Claude added the eager-vectorized/branchless semantic; Codex grounded the two-sided walker surface +
+  `arithmetic_output_type` + `else_input` synthesis). Migration: `plans/impl/108_sql_case.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -786,12 +807,23 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 107 promoted; ADR 108 candidates
+### ADR 108 promoted; ADR 109 candidates
 
-ADR 107 selected and promoted **`information_schema.schemata`** — the 4th finite read-only system relation
-(distinct descriptor namespaces, descriptor-derived, `schema_name`-only), pure 102 reuse with no new
-`ExecutionPlan` variant / walker / Wendelon / storage / PBC surface. Genuine 3-of-3. No operator-designated
-next yet; strongest leads, by theme:
+ADR 108 selected and promoted **SQL `CASE`** — the first conditional-expression substrate (searched-form
+`Expr::Case` + simple-CASE desugar, `arithmetic_output_type` branch lattice, typed-NULL else, residual
+eager-vectorized `zip` execution, naked identity, two-sided walker coverage). Genuine 3-of-3; the
+`IF`-in-108 fork resolved to the 109 sugar family. **Operator-blessed obvious next: ADR 109.** Strongest
+leads, by theme:
+
+*Conditional-sugar family (108's blessed follow-on — the payoff):*
+
+- **ADR 109 — `COALESCE` / `NULLIF` / `IF` / `IIF`** — pure `SqlExpr::Function`-arm desugars onto 108's
+  `Expr::Case`, **zero new substrate**: `COALESCE(a,b,…)`→nested `IS NOT NULL` CASE, `NULLIF(a,b)`→`CASE WHEN
+  a=b THEN NULL ELSE a`, `IF`/`IIF(c,t,e)`→2-branch CASE. Standard (`COALESCE`/`NULLIF`) + dialect
+  (`IF`/`IIF`) as one cheap ADR — "the substrate makes the whole family nearly free." Other 108 descendants:
+  **Rune `.case`** authoring (101 pattern); **uniform-branch logical-identity propagation** (lifts 108's
+  NAKED result into the 087–098 system + elision); masked/lazy CASE eval (only if eager hard-error exposure
+  bites); far-horizon `OP_CASE` pushdown.
 
 *Optimizer tier (105's own named follow-on):*
 
@@ -830,8 +862,8 @@ next yet; strongest leads, by theme:
 
 - **Rune joins** — needs relation-alias + qualified-column ergonomics first.
 - **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex pattern families, beyond 101's literal `LIKE`);
-  **`CASE`/value-conditionals**; **Rune sort/limit**; dot-field sugar; **Wendelon typed table-mutation
-  trace continuation**.
+  **Rune sort/limit**; dot-field sugar; **Wendelon typed table-mutation trace continuation**. (SQL
+  `CASE`/value-conditionals landed as ADR 108; Rune `.case` authoring is teed in the 108 arc above.)
 
 *Cross-ring chore (operator-flagged):*
 
@@ -845,6 +877,14 @@ next yet; strongest leads, by theme:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 107 promoted; ADR 108 candidates (HISTORICAL)
+
+ADR 107 promoted `information_schema.schemata` (the 4th finite system relation), exhausting the clean
+introspection small-cuts. 108 took the standing capability swing the council had teed for three cycles —
+SQL `CASE`, the first conditional-expression substrate — after the introspection well ran dry. The `IF`
+scope fork resolved to a 109 sugar family. Detail in `plans/adr/107_information_schema_schemata.md` + the
+active-line entry above.
 
 ### ADR 106 promoted; ADR 107 candidates (HISTORICAL)
 
