@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–109 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–110 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -742,6 +742,26 @@ run, 079+).
   explicit-NULL value/result sugar enhancement; operator steered `IFNULL`/`NVL` in — "small + fits → include"; Gemini
   aligned). Migration: `plans/impl/109_conditional_sugar_family.md`.
 
+- **ADR 110 — Conditional Logical-Identity Preservation.** Promoted. Closes the identity-erasure hole 108/109
+  opened: every CASE result was `NAKED`, so `CASE WHEN c THEN customer_id ELSE customer_id END` silently
+  dropped `CustomerId` — exactly as conditionals became broadly authored. **One binder-local rule** in
+  `bind_case`: compute the CASE output logical identity over the **pre-cast** branches via the literal-aware
+  `nominal_compatible` (not the too-permissive `reconcile_identity`) and `set_node_logical_type` on the node
+  — which propagates to the projection schema **for free** via the existing 089 path (`schema_for_exprs`
+  reads `root_logical_type`). Rules (reusing 087): uniform non-naked identity with neutral nakeds (literals /
+  109 placeholders / missing-ELSE) → **preserve**; mixed non-naked, or non-naked + naked-non-literal →
+  **reject** (today's silent `NAKED` becomes a `NominalTypeMismatch`, the same judgment `=`/`IN` make);
+  **implicit physical widening of an identity branch → reject** (escape hatch = explicit `CAST`, per 087);
+  all-naked → naked. **Identity flow, not elision** (CASE is computed, not a stored-scan receipt — 108 D7
+  holds). All six 109 sugars inherit by construction. Retargets `case_result_is_naked` (→ all-naked stays
+  naked) + adds `adr110_case_preserves_compatible_logical_identity`. No new IR/executor/PBC/Rune/Wendelon
+  surface. Genuine 3-of-3 core; the **widening sub-decision was a grounded 2-of-3 reject** (Claude + Codex)
+  — Gemini's erase-to-naked resolved against because `bind_comparison` rejects non-literal physical mismatch
+  and coerces literals *toward* the column, so there's no erase precedent, and 087's implicit-erasure-reject
+  doctrine governs (Claude conceded Rune `.case` → Codex's identity-repair, then conceded its own iter-2
+  erase → reject on this grounding; Codex grounded shared-binder-first + the reject; Gemini converged on the
+  core). Migration: `plans/impl/110_conditional_logical_identity_preservation.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -825,22 +845,24 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 109 promoted; ADR 110 candidates
+### ADR 110 promoted; ADR 111 candidates
 
-ADR 109 selected and promoted the **SQL conditional-sugar family** (`COALESCE`/`NULLIF`/`IF`/`IIF`/`IFNULL`/
-`NVL`) — pure `SqlExpr::Function`-arm desugars onto 108's `Expr::Case` + one shared `bind_case` typed-NULL
-placeholder hook; zero new substrate. Genuine 3-of-3. No operator-designated next yet; strongest leads, by
+ADR 110 selected and promoted **conditional logical-identity preservation** — a binder-local `bind_case`
+rule so CASE (and all six 109 sugars) carries a uniform branch identity through the 087–098 nominal spine
+instead of erasing to NAKED; reuses `nominal_compatible` + the 089 schema path, zero new substrate. Genuine
+3-of-3 (widening sub-decision a grounded 2-of-3 reject). No operator-designated next yet; strongest leads, by
 theme:
 
-*Conditionals-arc continuation (108/109 descendants):*
+*Conditionals-arc continuation (108/109/110 descendants):*
 
+- **Rune `.case(...)`** authoring — the 101 admission pattern over the 108 node, **now over already-correct
+  (110) CASE identity semantics**; the symmetric Rune-frontend completion of the conditionals arc. The
+  natural next conditionals cut.
 - **General explicit-`NULL` literal support** — lifts the `Value::Null` rejection (would retire/formalize the
-  109 `Utf8(None)` placeholder convention for a real typeless NULL); the natural next NULL cut, and unblocks
-  `NVL2(a,b,c)` (3-arg, its own shape).
-- **Rune `.case(...)`** authoring (the 101 admission pattern over the 108 node); **uniform-branch
-  logical-identity propagation** (lifts 108's NAKED CASE result into the 087–098 system + refinement
-  elision); masked/lazy CASE eval (only if 108's eager hard-error exposure bites); far-horizon `OP_CASE`
-  pushdown.
+  109 `Utf8(None)` placeholder for a real typeless NULL); bigger (context-typing across SELECT/comparison/
+  arithmetic/INSERT/UPDATE/CASE); unblocks `NVL2(a,b,c)`.
+- **Aggregate-output identity** (same nominal-flow theme as 110, for aggregate results); masked/lazy CASE
+  eval (only if 108's eager hard-error exposure bites); far-horizon `OP_CASE` pushdown.
 
 *Optimizer tier (105's own named follow-on):*
 
@@ -894,6 +916,15 @@ theme:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 109 promoted; ADR 110 candidates (HISTORICAL)
+
+ADR 109 promoted the SQL conditional-sugar family (six functions desugaring onto 108's `Expr::Case`). 110
+closed the identity-erasure hole the conditionals arc created — `bind_case` now preserves a uniform branch
+logical identity through the 087–098 spine (reusing `nominal_compatible` + the 089 schema path), rejecting
+mixed/naked-non-literal/widening cases. The widening sub-decision was a grounded 2-of-3 reject (Gemini's
+erase-to-naked resolved against). Detail in `plans/adr/109_conditional_sugar_family.md` + the active-line
+entry above.
 
 ### ADR 108 promoted; ADR 109 candidates (HISTORICAL)
 
