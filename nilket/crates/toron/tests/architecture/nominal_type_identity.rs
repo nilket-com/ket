@@ -1051,10 +1051,11 @@ pub(crate) fn adr102_system_table_kind_has_finite_introspection_family() {
 	let execution = execution_source();
 	let system_kind = source_block(&execution, "pub enum SystemTableKind");
 
-	assert_eq!(enum_variant_count(&system_kind), 3);
+	assert_eq!(enum_variant_count(&system_kind), 4);
 	assert!(system_kind.contains("InformationSchemaLogicalTypes"));
 	assert!(system_kind.contains("InformationSchemaTables"));
 	assert!(system_kind.contains("InformationSchemaColumns"));
+	assert!(system_kind.contains("InformationSchemaSchemata"));
 	assert!(!system_kind.contains("VirtualTable"));
 	assert!(!system_kind.contains("SystemTableRegistry"));
 }
@@ -1069,9 +1070,11 @@ pub(crate) fn adr102_information_schema_dispatch_is_explicit() {
 	);
 	assert!(binder.contains("const INFORMATION_SCHEMA_TABLES_TABLE: &str = \"tables\""));
 	assert!(binder.contains("const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = \"columns\""));
+	assert!(binder.contains("const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = \"schemata\""));
 	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE)"));
 	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_TABLES_TABLE)"));
 	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_COLUMNS_TABLE)"));
+	assert!(bind_relation.contains("eq_ignore_ascii_case(INFORMATION_SCHEMA_SCHEMATA_TABLE)"));
 	assert!(bind_relation.contains("unknown information_schema relation"));
 	assert!(!bind_relation.contains("HashMap"));
 	assert!(!bind_relation.contains("SystemTableRegistry"));
@@ -1127,6 +1130,7 @@ pub(crate) fn adr102_system_table_execution_stays_coordinator_local() {
 
 	assert!(execution.contains("InformationSchemaTables"));
 	assert!(execution.contains("InformationSchemaColumns"));
+	assert!(execution.contains("InformationSchemaSchemata"));
 	assert!(exec.contains("ExecutionPlan::SystemTable { schema, rows, .. }"));
 	assert!(exec.contains("materialize_scalar_rows(schema, rows)"));
 	for source in [exec, storage, pbc] {
@@ -1134,5 +1138,32 @@ pub(crate) fn adr102_system_table_execution_stays_coordinator_local() {
 		assert!(!source.contains("latest_descriptors_for_tenant"));
 		assert!(!source.contains("InformationSchemaTables"));
 		assert!(!source.contains("InformationSchemaColumns"));
+		assert!(!source.contains("InformationSchemaSchemata"));
 	}
+}
+
+#[test]
+pub(crate) fn adr107_schemata_is_descriptor_derived_not_a_registry() {
+	let binder = binder_source();
+	let bind_relation = source_block(&binder, "async fn bind_information_schema_relation");
+	let schema = source_block(&binder, "fn information_schema_schemata_schema");
+	let rows = source_block(&binder, "fn information_schema_schemata_rows");
+
+	assert!(
+		binder
+			.contains("const INFORMATION_SCHEMA_SCHEMATA: &str = \"information_schema.schemata\"")
+	);
+	assert!(bind_relation.contains("INFORMATION_SCHEMA_SCHEMATA_TABLE"));
+	assert!(bind_relation.contains("SystemTableKind::InformationSchemaSchemata"));
+	assert!(bind_relation.contains("refreshed_table_schema_descriptors().await?"));
+	assert!(schema.contains("Field::new(\n\t\t\"schema_name\",\n\t\tDataType::Utf8,\n\t\tfalse,"));
+	assert!(!schema.contains("catalog_name"));
+	assert!(!schema.contains("schema_owner"));
+	assert!(rows.contains("descriptor.namespace"));
+	assert!(rows.contains("BTreeSet"));
+	assert!(!rows.contains(".arrow_schema()"));
+	assert!(!rows.contains("logical_type_display_name"));
+	assert!(!rows.contains("LogicalTypeResolver"));
+	assert!(!binder.contains("CREATE SCHEMA"));
+	assert!(!binder.contains("SystemTableRegistry"));
 }

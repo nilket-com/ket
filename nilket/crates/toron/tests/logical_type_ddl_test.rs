@@ -2255,6 +2255,346 @@ async fn information_schema_columns_renders_logical_type_names_after_refresh() {
 }
 
 #[tokio::test]
+async fn information_schema_schemata_lists_descriptor_namespaces_distinct_sorted() {
+	let descriptors = vec![
+		descriptor_from_schema_with_identity(
+			14,
+			1,
+			"analytics",
+			"events",
+			&Schema::new(vec![arrow::datatypes::Field::new(
+				"event_id",
+				DataType::Int64,
+				false,
+			)]),
+		),
+		descriptor_from_schema_with_identity(
+			15,
+			1,
+			"analytics",
+			"clicks",
+			&Schema::new(vec![arrow::datatypes::Field::new(
+				"click_id",
+				DataType::Int64,
+				false,
+			)]),
+		),
+		descriptor_from_schema_with_identity(
+			16,
+			1,
+			"default",
+			"people",
+			&Schema::new(vec![arrow::datatypes::Field::new(
+				"person_id",
+				DataType::Int64,
+				false,
+			)]),
+		),
+	];
+	let refreshes = Arc::new(AtomicU64::new(0));
+	let catalog: Arc<dyn Catalog> = Arc::new(RefreshingTableDescriptorCatalog {
+		inner: Arc::new(MockCatalog::new()),
+		tenant_id: TenantId(1),
+		descriptors,
+		definitions: Vec::new(),
+		refreshes: Arc::clone(&refreshes),
+		fail_message: None,
+	});
+	let coordinator = QueryCoordinator::new(
+		catalog,
+		Executor::new(empty_storage()),
+		PlannerConfig::default(),
+	);
+	let planner = SqlPlanner::new();
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+	)
+	.await;
+
+	assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+	assert_eq!(
+		string_rows(&batch, 0),
+		vec![Some("analytics".to_string()), Some("default".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn information_schema_schemata_is_tenant_scoped() {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor_for_tenant(
+			TenantId(1),
+			TableId(151),
+			descriptor_from_schema_with_identity(
+				17,
+				1,
+				"tenant_one",
+				"events",
+				&Schema::new(vec![arrow::datatypes::Field::new(
+					"tenant_one_id",
+					DataType::Int64,
+					false,
+				)]),
+			),
+		)
+		.expect("register tenant one descriptor");
+	catalog
+		.register_descriptor_for_tenant(
+			TenantId(2),
+			TableId(152),
+			descriptor_from_schema_with_identity(
+				18,
+				1,
+				"tenant_two",
+				"events",
+				&Schema::new(vec![arrow::datatypes::Field::new(
+					"tenant_two_id",
+					DataType::Int64,
+					false,
+				)]),
+			),
+		)
+		.expect("register tenant two descriptor");
+	let catalog = Arc::new(catalog);
+	let planner = SqlPlanner::new();
+	let schemata_plan = planner
+		.plan("SELECT schema_name FROM information_schema.schemata")
+		.expect("plan schemata");
+	let tenant_one = Arc::clone(&catalog).scoped(TenantId(1));
+	let tenant_two = Arc::clone(&catalog).scoped(TenantId(2));
+
+	let tenant_one_schemata = execute_bound_query(
+		bind(
+			&schemata_plan,
+			tenant_one.as_ref(),
+			&PlannerConfig::default(),
+		)
+		.await
+		.unwrap(),
+	)
+	.await;
+	let tenant_two_schemata = execute_bound_query(
+		bind(
+			&schemata_plan,
+			tenant_two.as_ref(),
+			&PlannerConfig::default(),
+		)
+		.await
+		.unwrap(),
+	)
+	.await;
+
+	assert_eq!(
+		string_rows(&tenant_one_schemata, 0),
+		vec![Some("tenant_one".to_string())]
+	);
+	assert_eq!(
+		string_rows(&tenant_two_schemata, 0),
+		vec![Some("tenant_two".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn information_schema_schemata_is_latest_only() {
+	let mut source = TableSchemaCatalogV1::default();
+	let tenant = WendelonTenantId::new(1);
+	source
+		.upsert(
+			tenant,
+			descriptor_from_schema_with_identity(
+				19,
+				1,
+				"analytics",
+				"events",
+				&Schema::new(vec![arrow::datatypes::Field::new(
+					"old_event_id",
+					DataType::Int64,
+					false,
+				)]),
+			),
+		)
+		.expect("upsert old descriptor");
+	source
+		.upsert(
+			tenant,
+			descriptor_from_schema_with_identity(
+				19,
+				2,
+				"analytics",
+				"events",
+				&Schema::new(vec![arrow::datatypes::Field::new(
+					"event_id",
+					DataType::Int64,
+					false,
+				)]),
+			),
+		)
+		.expect("upsert latest descriptor");
+	let descriptors = source.latest_descriptors_for_tenant(tenant);
+	assert_eq!(descriptors.len(), 1);
+	let catalog: Arc<dyn Catalog> = Arc::new(RefreshingTableDescriptorCatalog {
+		inner: Arc::new(MockCatalog::new()),
+		tenant_id: TenantId(1),
+		descriptors,
+		definitions: Vec::new(),
+		refreshes: Arc::new(AtomicU64::new(0)),
+		fail_message: None,
+	});
+	let coordinator = QueryCoordinator::new(
+		catalog,
+		Executor::new(empty_storage()),
+		PlannerConfig::default(),
+	);
+	let planner = SqlPlanner::new();
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT schema_name FROM information_schema.schemata",
+	)
+	.await;
+
+	assert_eq!(string_rows(&batch, 0), vec![Some("analytics".to_string())]);
+}
+
+#[tokio::test]
+async fn information_schema_schemata_empty_catalog_has_no_rows() {
+	let catalog: Arc<dyn Catalog> = Arc::new(RefreshingTableDescriptorCatalog {
+		inner: Arc::new(MockCatalog::new()),
+		tenant_id: TenantId(1),
+		descriptors: Vec::new(),
+		definitions: Vec::new(),
+		refreshes: Arc::new(AtomicU64::new(0)),
+		fail_message: None,
+	});
+	let coordinator = QueryCoordinator::new(
+		catalog,
+		Executor::new(empty_storage()),
+		PlannerConfig::default(),
+	);
+	let planner = SqlPlanner::new();
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT schema_name FROM information_schema.schemata",
+	)
+	.await;
+
+	assert_eq!(batch.num_rows(), 0);
+}
+
+#[tokio::test]
+async fn information_schema_schemata_listing_failure_fails_query_without_stale_fallback() {
+	let mut inner = MockCatalog::new();
+	inner
+		.register_descriptor_for_tenant(
+			TenantId(1),
+			TableId(153),
+			descriptor_from_schema_with_identity(
+				20,
+				1,
+				"stale",
+				"stale_events",
+				&Schema::new(vec![arrow::datatypes::Field::new(
+					"id",
+					DataType::Int64,
+					false,
+				)]),
+			),
+		)
+		.expect("register stale descriptor");
+	let catalog = RefreshingTableDescriptorCatalog {
+		inner: Arc::new(inner),
+		tenant_id: TenantId(1),
+		descriptors: Vec::new(),
+		definitions: Vec::new(),
+		refreshes: Arc::new(AtomicU64::new(0)),
+		fail_message: Some("descriptor list unavailable".to_string()),
+	};
+	let planner = SqlPlanner::new();
+
+	let err = bind(
+		&planner
+			.plan("SELECT schema_name FROM information_schema.schemata")
+			.expect("plan schemata"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("descriptor list failure must fail binding");
+
+	assert!(
+		format!("{err:?}").contains("descriptor list unavailable"),
+		"unexpected stale fallback error: {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn information_schema_schemata_composes_with_query_ops() {
+	let descriptors = vec![
+		descriptor_from_schema_with_identity(
+			23,
+			1,
+			"analytics",
+			"events",
+			&Schema::new(vec![arrow::datatypes::Field::new(
+				"event_id",
+				DataType::Int64,
+				false,
+			)]),
+		),
+		descriptor_from_schema_with_identity(
+			24,
+			1,
+			"default",
+			"people",
+			&Schema::new(vec![arrow::datatypes::Field::new(
+				"person_id",
+				DataType::Int64,
+				false,
+			)]),
+		),
+	];
+	let catalog: Arc<dyn Catalog> = Arc::new(RefreshingTableDescriptorCatalog {
+		inner: Arc::new(MockCatalog::new()),
+		tenant_id: TenantId(1),
+		descriptors,
+		definitions: Vec::new(),
+		refreshes: Arc::new(AtomicU64::new(0)),
+		fail_message: None,
+	});
+	let coordinator = QueryCoordinator::new(
+		catalog,
+		Executor::new(empty_storage()),
+		PlannerConfig::default(),
+	);
+	let planner = SqlPlanner::new();
+
+	let filtered = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT schema_name FROM information_schema.schemata WHERE schema_name <> 'default' ORDER BY schema_name",
+	)
+	.await;
+	let counted = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT COUNT(*) FROM information_schema.schemata",
+	)
+	.await;
+
+	assert_eq!(
+		string_rows(&filtered, 0),
+		vec![Some("analytics".to_string())]
+	);
+	assert_eq!(int64_rows(&counted, 0), vec![Some(2)]);
+}
+
+#[tokio::test]
 async fn information_schema_tables_and_columns_are_tenant_scoped() {
 	let mut catalog = MockCatalog::new();
 	catalog
@@ -2522,7 +2862,7 @@ async fn information_schema_tables_and_columns_compose_with_query_ops() {
 async fn information_schema_namespace_is_read_only_and_scoped() {
 	let (catalog, _coordinator, planner) = logical_type_writer_coordinator();
 
-	for table in ["logical_types", "tables", "columns"] {
+	for table in ["logical_types", "tables", "columns", "schemata"] {
 		let sql = format!("SELECT * FROM {table}");
 		let unqualified = bind(
 			&planner.plan(&sql).expect("plan unqualified name"),
@@ -2539,7 +2879,7 @@ async fn information_schema_namespace_is_read_only_and_scoped() {
 
 	let unknown = bind(
 		&planner
-			.plan("SELECT * FROM information_schema.schemata")
+			.plan("SELECT * FROM information_schema.views")
 			.expect("plan unknown information schema table"),
 		catalog.as_ref(),
 		&PlannerConfig::default(),
@@ -2554,15 +2894,20 @@ async fn information_schema_namespace_is_read_only_and_scoped() {
 	for sql in [
 		"CREATE TABLE information_schema.logical_types (id BIGINT)",
 		"CREATE TABLE information_schema.tables (id BIGINT)",
+		"CREATE TABLE information_schema.schemata (schema_name TEXT)",
 		"CREATE TABLE information_schema.copy AS SELECT name FROM information_schema.logical_types",
 		"DROP TABLE information_schema.logical_types",
 		"DROP TABLE information_schema.columns",
+		"DROP TABLE information_schema.schemata",
 		"INSERT INTO information_schema.logical_types VALUES (1, 'X', 'BIGINT', NULL)",
 		"INSERT INTO information_schema.tables VALUES ('public', 't', 'BASE TABLE')",
+		"INSERT INTO information_schema.schemata VALUES ('analytics')",
 		"UPDATE information_schema.logical_types SET name = 'X'",
 		"UPDATE information_schema.columns SET column_name = 'X'",
+		"UPDATE information_schema.schemata SET schema_name = 'X'",
 		"DELETE FROM information_schema.logical_types",
 		"DELETE FROM information_schema.tables",
+		"DELETE FROM information_schema.schemata",
 	] {
 		let result = bind(
 			&planner
@@ -2636,6 +2981,12 @@ async fn system_table_executes_without_storage_scan() {
 		"SELECT column_name FROM information_schema.columns",
 	)
 	.await;
+	let schemata = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT schema_name FROM information_schema.schemata",
+	)
+	.await;
 
 	assert_eq!(
 		string_rows(&logical_types, 0),
@@ -2643,6 +2994,10 @@ async fn system_table_executes_without_storage_scan() {
 	);
 	assert_eq!(string_rows(&tables, 0), vec![Some("events".to_string())]);
 	assert_eq!(string_rows(&columns, 0), vec![Some("event_id".to_string())]);
+	assert_eq!(
+		string_rows(&schemata, 0),
+		vec![Some("analytics".to_string())]
+	);
 }
 
 fn logical_type_coordinator() -> (Arc<MockCatalog>, QueryCoordinator, SqlPlanner) {

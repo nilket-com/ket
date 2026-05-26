@@ -46,9 +46,11 @@ const INFORMATION_SCHEMA_NAMESPACE: &str = "information_schema";
 const INFORMATION_SCHEMA_LOGICAL_TYPES: &str = "information_schema.logical_types";
 const INFORMATION_SCHEMA_TABLES: &str = "information_schema.tables";
 const INFORMATION_SCHEMA_COLUMNS: &str = "information_schema.columns";
+const INFORMATION_SCHEMA_SCHEMATA: &str = "information_schema.schemata";
 const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
 const INFORMATION_SCHEMA_TABLES_TABLE: &str = "tables";
 const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = "columns";
+const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlannerConfig {
@@ -727,9 +729,21 @@ impl<'a> Binder<'a> {
 				projection,
 			);
 		}
+		if table
+			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_SCHEMATA_TABLE)
+		{
+			let descriptors = self.catalog.refreshed_table_schema_descriptors().await?;
+			return system_table_plan(
+				SystemTableKind::InformationSchemaSchemata,
+				information_schema_schemata_schema(),
+				information_schema_schemata_rows(&descriptors),
+				projection,
+			);
+		}
 		Err(BindingError::UnsupportedExpression {
 			message: format!(
-				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}",
+				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}",
 				table_name(table)
 			),
 		})
@@ -3362,6 +3376,14 @@ fn information_schema_columns_schema() -> SchemaRef {
 	]))
 }
 
+fn information_schema_schemata_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![Field::new(
+		"schema_name",
+		DataType::Utf8,
+		false,
+	)]))
+}
+
 fn system_table_plan(
 	kind: SystemTableKind,
 	full_schema: SchemaRef,
@@ -3410,6 +3432,18 @@ fn information_schema_table_rows(descriptors: &[TableSchemaDescriptor]) -> Vec<V
 				ScalarValue::Utf8(Some("BASE TABLE".to_string())),
 			]
 		})
+		.collect()
+}
+
+fn information_schema_schemata_rows(
+	descriptors: &[TableSchemaDescriptor],
+) -> Vec<Vec<ScalarValue>> {
+	descriptors
+		.iter()
+		.map(|descriptor| descriptor.namespace.clone())
+		.collect::<BTreeSet<_>>()
+		.into_iter()
+		.map(|schema_name| vec![ScalarValue::Utf8(Some(schema_name))])
 		.collect()
 }
 

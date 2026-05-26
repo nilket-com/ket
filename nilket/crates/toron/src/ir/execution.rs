@@ -179,6 +179,7 @@ pub enum SystemTableKind {
 	InformationSchemaLogicalTypes,
 	InformationSchemaTables,
 	InformationSchemaColumns,
+	InformationSchemaSchemata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
