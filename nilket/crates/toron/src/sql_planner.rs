@@ -2945,6 +2945,15 @@ impl SqlPlanner {
 					self.resolve_grouped_aggregate_reference(function, scope, clause)?;
 				Ok(SqlExpr::Identifier(Ident::new(output_name)))
 			}
+			SqlExpr::Function(function)
+				if conditional_sugar_function_name(&function.name).is_some() =>
+			{
+				let mut rewritten = function.clone();
+				rewritten.args = rewrite_function_argument_exprs(&function.args, |expr| {
+					self.rewrite_grouped_aggregate_calls(expr, scope, clause)
+				})?;
+				Ok(SqlExpr::Function(rewritten))
+			}
 			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
 				left: Box::new(self.rewrite_grouped_aggregate_calls(left, scope, clause)?),
 				op: op.clone(),
@@ -3209,6 +3218,15 @@ impl SqlPlanner {
 					}
 					ResolveOutcome::Ambiguous => Err(unsupported("ambiguous aggregate projection")),
 				}
+			}
+			SqlExpr::Function(function)
+				if conditional_sugar_function_name(&function.name).is_some() =>
+			{
+				let mut rewritten = function.clone();
+				rewritten.args = rewrite_function_argument_exprs(&function.args, |expr| {
+					self.rewrite_aggregate_calls_for_projection(expr, mode, catalog)
+				})?;
+				Ok(SqlExpr::Function(rewritten))
 			}
 			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
 				left: Box::new(self.rewrite_aggregate_calls_for_projection(left, mode, catalog)?),
@@ -3777,41 +3795,138 @@ impl SqlPlanner {
 			SqlExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.lower_expr(expr)?))),
 			SqlExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.lower_expr(expr)?))),
 			SqlExpr::Nested(expr) => self.lower_expr(expr),
-			SqlExpr::Function(f) if f.name.to_string().to_uppercase() == "TIME_BUCKET" => {
-				let args = match &f.args {
-					sqlparser::ast::FunctionArguments::List(l) => &l.args,
-					_ => return Err(unsupported("TIME_BUCKET expects arguments")),
-				};
-				if args.len() != 2 {
-					return Err(unsupported("TIME_BUCKET expects exactly two arguments"));
+			SqlExpr::Function(f) => match conditional_sugar_function_name(&f.name) {
+				Some(ConditionalSugarFunction::Coalesce) => self.lower_coalesce(f),
+				Some(ConditionalSugarFunction::If) | Some(ConditionalSugarFunction::Iif) => {
+					self.lower_if(f)
 				}
-				let ts = self.lower_arg(&args[0])?;
-				let interval = match &args[1] {
-					FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
-						match sql_value(expr) {
-							Some(Value::SingleQuotedString(s)) => match s.as_str() {
-								"1m" => std::time::Duration::from_secs(60),
-								"1h" => std::time::Duration::from_secs(3600),
-								"1d" => std::time::Duration::from_secs(86400),
+				Some(ConditionalSugarFunction::Nullif) => self.lower_nullif(f),
+				Some(ConditionalSugarFunction::Ifnull) | Some(ConditionalSugarFunction::Nvl) => {
+					self.lower_ifnull_nvl(f)
+				}
+				None if f.name.to_string().to_uppercase() == "TIME_BUCKET" => {
+					let args = match &f.args {
+						sqlparser::ast::FunctionArguments::List(l) => &l.args,
+						_ => return Err(unsupported("TIME_BUCKET expects arguments")),
+					};
+					if args.len() != 2 {
+						return Err(unsupported("TIME_BUCKET expects exactly two arguments"));
+					}
+					let ts = self.lower_arg(&args[0])?;
+					let interval = match &args[1] {
+						FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+							match sql_value(expr) {
+								Some(Value::SingleQuotedString(s)) => match s.as_str() {
+									"1m" => std::time::Duration::from_secs(60),
+									"1h" => std::time::Duration::from_secs(3600),
+									"1d" => std::time::Duration::from_secs(86400),
+									_ => {
+										return Err(unsupported(format!(
+											"unsupported time_bucket interval: {s}"
+										)));
+									}
+								},
 								_ => {
-									return Err(unsupported(format!(
-										"unsupported time_bucket interval: {s}"
-									)));
+									return Err(unsupported(
+										"time_bucket expects a string literal interval",
+									));
 								}
-							},
-							_ => {
-								return Err(unsupported(
-									"time_bucket expects a string literal interval",
-								));
 							}
 						}
-					}
-					_ => return Err(unsupported("time_bucket expects a string literal interval")),
-				};
-				Ok(Expr::TimeBucket(interval, Box::new(ts)))
-			}
+						_ => {
+							return Err(unsupported(
+								"time_bucket expects a string literal interval",
+							));
+						}
+					};
+					Ok(Expr::TimeBucket(interval, Box::new(ts)))
+				}
+				None => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
+			},
 			_ => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
 		}
+	}
+
+	fn lower_conditional_value_arg(&self, expr: &SqlExpr) -> Result<Expr, FrontendError> {
+		if expr_is_null_literal(expr) {
+			return Ok(Expr::Literal(conditional_null_placeholder()));
+		}
+		self.lower_expr(expr)
+	}
+
+	fn lower_if(&self, function: &Function) -> Result<Expr, FrontendError> {
+		let args = function_positional_args(function, "IF/IIF")?;
+		let [condition, truthy, falsy] = args.as_slice() else {
+			return Err(unsupported("IF/IIF requires exactly three arguments"));
+		};
+		Ok(Expr::Case {
+			when_then: vec![(
+				Box::new(self.lower_expr(condition)?),
+				Box::new(self.lower_conditional_value_arg(truthy)?),
+			)],
+			else_expr: Some(Box::new(self.lower_conditional_value_arg(falsy)?)),
+		})
+	}
+
+	fn lower_coalesce(&self, function: &Function) -> Result<Expr, FrontendError> {
+		let args = function_positional_args(function, "COALESCE")?;
+		let (last, init) = args
+			.split_last()
+			.ok_or_else(|| unsupported("COALESCE requires at least one argument"))?;
+		if init.is_empty() {
+			if expr_is_null_literal(last) {
+				return Err(unsupported("COALESCE requires at least one typed argument"));
+			}
+			return self.lower_expr(last);
+		}
+
+		let when_then = init
+			.iter()
+			.map(|arg| {
+				let lowered = self.lower_conditional_value_arg(arg)?;
+				Ok((
+					Box::new(Expr::IsNotNull(Box::new(lowered.clone()))),
+					Box::new(lowered),
+				))
+			})
+			.collect::<Result<Vec<_>, FrontendError>>()?;
+		Ok(Expr::Case {
+			when_then,
+			else_expr: Some(Box::new(self.lower_conditional_value_arg(last)?)),
+		})
+	}
+
+	fn lower_ifnull_nvl(&self, function: &Function) -> Result<Expr, FrontendError> {
+		let args = function_positional_args(function, "IFNULL/NVL")?;
+		let [first, fallback] = args.as_slice() else {
+			return Err(unsupported("IFNULL/NVL requires exactly two arguments"));
+		};
+		let first = self.lower_conditional_value_arg(first)?;
+		Ok(Expr::Case {
+			when_then: vec![(
+				Box::new(Expr::IsNotNull(Box::new(first.clone()))),
+				Box::new(first),
+			)],
+			else_expr: Some(Box::new(self.lower_conditional_value_arg(fallback)?)),
+		})
+	}
+
+	fn lower_nullif(&self, function: &Function) -> Result<Expr, FrontendError> {
+		let args = function_positional_args(function, "NULLIF")?;
+		let [first, second] = args.as_slice() else {
+			return Err(unsupported("NULLIF requires exactly two arguments"));
+		};
+		let first = self.lower_expr(first)?;
+		Ok(Expr::Case {
+			when_then: vec![(
+				Box::new(Expr::Eq(
+					Box::new(first.clone()),
+					Box::new(self.lower_expr(second)?),
+				)),
+				Box::new(Expr::Literal(conditional_null_placeholder())),
+			)],
+			else_expr: Some(Box::new(first)),
+		})
 	}
 
 	fn lower_case(
@@ -5321,6 +5436,122 @@ fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
 		return aggregate_kernel::stable_aggregate_sql_name(&upper);
 	}
 	aggregate_kernel::experimental_aggregate_sql_name(&upper)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalSugarFunction {
+	Coalesce,
+	Nullif,
+	If,
+	Iif,
+	Ifnull,
+	Nvl,
+}
+
+fn conditional_sugar_function_name(name: &ObjectName) -> Option<ConditionalSugarFunction> {
+	let [part] = name.0.as_slice() else {
+		return None;
+	};
+	let ident = part.as_ident()?;
+	match ident.value.to_ascii_uppercase().as_str() {
+		"COALESCE" => Some(ConditionalSugarFunction::Coalesce),
+		"NULLIF" => Some(ConditionalSugarFunction::Nullif),
+		"IF" => Some(ConditionalSugarFunction::If),
+		"IIF" => Some(ConditionalSugarFunction::Iif),
+		"IFNULL" => Some(ConditionalSugarFunction::Ifnull),
+		"NVL" => Some(ConditionalSugarFunction::Nvl),
+		_ => None,
+	}
+}
+
+fn conditional_null_placeholder() -> ScalarValue {
+	ScalarValue::Utf8(None)
+}
+
+fn function_positional_args<'a>(
+	function: &'a Function,
+	name: &str,
+) -> Result<Vec<&'a SqlExpr>, FrontendError> {
+	if function.uses_odbc_syntax
+		|| !matches!(function.parameters, FunctionArguments::None)
+		|| function.filter.is_some()
+		|| function.null_treatment.is_some()
+		|| function.over.is_some()
+		|| !function.within_group.is_empty()
+	{
+		return Err(unsupported(format!(
+			"{name} does not support function modifiers"
+		)));
+	}
+
+	let FunctionArguments::List(FunctionArgumentList {
+		duplicate_treatment,
+		args,
+		clauses,
+	}) = &function.args
+	else {
+		return Err(unsupported(format!("{name} requires positional arguments")));
+	};
+	if duplicate_treatment.is_some() || !clauses.is_empty() {
+		return Err(unsupported(format!(
+			"{name} does not support argument clauses"
+		)));
+	}
+	args.iter()
+		.map(|arg| match arg {
+			FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Ok(expr),
+			_ => Err(unsupported(format!(
+				"{name} supports only plain positional arguments"
+			))),
+		})
+		.collect()
+}
+
+fn rewrite_function_argument_exprs<F>(
+	args: &FunctionArguments,
+	mut rewrite: F,
+) -> Result<FunctionArguments, FrontendError>
+where
+	F: FnMut(&SqlExpr) -> Result<SqlExpr, FrontendError>,
+{
+	match args {
+		FunctionArguments::List(list) => {
+			let args = list
+				.args
+				.iter()
+				.map(|arg| match arg {
+					FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+						Ok(FunctionArg::Unnamed(FunctionArgExpr::Expr(rewrite(expr)?)))
+					}
+					FunctionArg::Named {
+						name,
+						arg: FunctionArgExpr::Expr(expr),
+						operator,
+					} => Ok(FunctionArg::Named {
+						name: name.clone(),
+						arg: FunctionArgExpr::Expr(rewrite(expr)?),
+						operator: operator.clone(),
+					}),
+					FunctionArg::ExprNamed {
+						name,
+						arg: FunctionArgExpr::Expr(expr),
+						operator,
+					} => Ok(FunctionArg::ExprNamed {
+						name: rewrite(name)?,
+						arg: FunctionArgExpr::Expr(rewrite(expr)?),
+						operator: operator.clone(),
+					}),
+					_ => Ok(arg.clone()),
+				})
+				.collect::<Result<Vec<_>, FrontendError>>()?;
+			Ok(FunctionArguments::List(FunctionArgumentList {
+				duplicate_treatment: list.duplicate_treatment.clone(),
+				args,
+				clauses: list.clauses.clone(),
+			}))
+		}
+		_ => Ok(args.clone()),
+	}
 }
 
 fn aggregate_output_name(function: &AggregateFunction) -> &'static str {

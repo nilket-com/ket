@@ -600,6 +600,144 @@ pub(crate) fn adr108_case_is_residual_bound_expression() {
 }
 
 #[test]
+pub(crate) fn adr109_conditional_sugar_desugars_to_case() {
+	let manifest_dir = manifest_dir();
+	let ir = std::fs::read_to_string(manifest_dir.join("src/ir.rs")).expect("read ir");
+	let execution_ir =
+		std::fs::read_to_string(manifest_dir.join("src/ir/execution.rs")).expect("read exec ir");
+	let planner =
+		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read planner");
+	let binder = std::fs::read_to_string(manifest_dir.join("src/binder.rs")).expect("read binder");
+	let pbc = std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read pbc");
+	let exec = std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read exec");
+
+	let lower_expr = brace_blocks_after_marker(&planner, "fn lower_expr")
+		.into_iter()
+		.next()
+		.expect("lower_expr body")
+		.1;
+	let classifier = brace_blocks_after_marker(&planner, "fn conditional_sugar_function_name")
+		.into_iter()
+		.next()
+		.expect("conditional sugar classifier")
+		.1;
+	let lower_coalesce = brace_blocks_after_marker(&planner, "fn lower_coalesce")
+		.into_iter()
+		.next()
+		.expect("lower_coalesce body")
+		.1;
+	let lower_if = brace_blocks_after_marker(&planner, "fn lower_if")
+		.into_iter()
+		.next()
+		.expect("lower_if body")
+		.1;
+	let lower_nullif = brace_blocks_after_marker(&planner, "fn lower_nullif")
+		.into_iter()
+		.next()
+		.expect("lower_nullif body")
+		.1;
+	let lower_ifnull_nvl = brace_blocks_after_marker(&planner, "fn lower_ifnull_nvl")
+		.into_iter()
+		.next()
+		.expect("lower_ifnull_nvl body")
+		.1;
+	let lower_statement = brace_blocks_after_marker(&planner, "fn lower_statement")
+		.into_iter()
+		.next()
+		.expect("lower_statement body")
+		.1;
+
+	assert!(planner.contains("enum ConditionalSugarFunction"));
+	for name in ["COALESCE", "NULLIF", "IF", "IIF", "IFNULL", "NVL"] {
+		assert!(classifier.contains(name), "classifier missing {name}");
+	}
+	assert!(!classifier.contains("NVL2"));
+	assert!(lower_expr.contains("SqlExpr::Function(f) => match conditional_sugar_function_name"));
+	for variant in [
+		"ConditionalSugarFunction::Coalesce",
+		"ConditionalSugarFunction::If",
+		"ConditionalSugarFunction::Iif",
+		"ConditionalSugarFunction::Nullif",
+		"ConditionalSugarFunction::Ifnull",
+		"ConditionalSugarFunction::Nvl",
+	] {
+		assert!(lower_expr.contains(variant), "lower_expr missing {variant}");
+	}
+	assert!(planner.contains("fn lower_conditional_value_arg"));
+	assert!(planner.contains("fn function_positional_args"));
+	assert!(lower_coalesce.contains("Expr::Case"));
+	assert!(lower_coalesce.contains("Expr::IsNotNull"));
+	assert!(lower_coalesce.contains("COALESCE requires at least one typed argument"));
+	assert!(lower_if.contains("Expr::Case"));
+	assert!(lower_if.contains("self.lower_expr(condition)?"));
+	assert!(lower_if.contains("self.lower_conditional_value_arg(truthy)?"));
+	assert!(lower_nullif.contains("Expr::Case"));
+	assert!(lower_nullif.contains("Expr::Eq"));
+	assert!(lower_nullif.contains("conditional_null_placeholder()"));
+	assert!(lower_ifnull_nvl.contains("Expr::Case"));
+	assert!(lower_ifnull_nvl.contains("Expr::IsNotNull"));
+	assert!(lower_ifnull_nvl.contains("IFNULL/NVL requires exactly two arguments"));
+	assert!(planner.contains("rewrite_function_argument_exprs"));
+	assert!(!lower_statement.contains("Statement::If"));
+	for forbidden in ["Coalesce", "NullIf", "Nullif"] {
+		assert!(
+			!ir.contains(&format!("{forbidden} {{")),
+			"Expr must not grow {forbidden} variant"
+		);
+		assert!(
+			!execution_ir.contains(&format!("{forbidden} {{")),
+			"BoundExprNode must not grow {forbidden} variant"
+		);
+	}
+	assert!(!pbc.contains("OP_COALESCE"));
+	assert!(!pbc.contains("OP_NULLIF"));
+	assert!(!exec.contains("evaluate_coalesce"));
+	assert!(!exec.contains("evaluate_nullif"));
+	assert!(binder.contains("Expr::Case"));
+}
+
+#[test]
+pub(crate) fn adr109_case_binder_types_untyped_null_sentinel() {
+	let manifest_dir = manifest_dir();
+	let planner =
+		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read planner");
+	let binder = std::fs::read_to_string(manifest_dir.join("src/binder.rs")).expect("read binder");
+	let bind_case = brace_blocks_after_marker(&binder, "fn bind_case")
+		.into_iter()
+		.next()
+		.expect("bind_case body")
+		.1;
+	let type_case_result = brace_blocks_after_marker(&binder, "fn type_case_result")
+		.into_iter()
+		.next()
+		.expect("type_case_result body")
+		.1;
+	let update_null = brace_blocks_after_marker(&binder, "fn typed_update_null_for_target")
+		.into_iter()
+		.next()
+		.expect("typed_update_null_for_target body")
+		.1;
+
+	assert!(planner.contains("fn conditional_null_placeholder"));
+	assert!(planner.contains("ScalarValue::Utf8(None)"));
+	assert!(binder.contains("fn is_case_null_placeholder"));
+	assert!(binder.contains("matches!(builder.literal(id), Some(ScalarValue::Utf8(None)))"));
+	assert!(bind_case.contains("filter(|id| !is_case_null_placeholder(builder, **id))"));
+	assert!(bind_case.contains("conditional has no typed (non-NULL) result branch"));
+	assert!(bind_case.contains("type_case_result(builder, *result, &output_type)?"));
+	assert!(bind_case.contains("type_case_result(builder, bound_else, &output_type)?"));
+	assert!(bind_case.contains("builder.append_literal(typed_null_for_case(&output_type)?)"));
+	assert!(type_case_result.contains("is_case_null_placeholder(builder, id)"));
+	assert!(type_case_result.contains("typed_null_for_case(output_type)?"));
+	assert!(type_case_result.contains("cast_if_needed(builder, id, output_type)"));
+	assert!(
+		type_case_result.contains("normal SQL expression lowering still rejects explicit NULL")
+	);
+	assert!(update_null.contains("Expr::Literal(ScalarValue::Utf8(None))"));
+	assert!(update_null.contains("ScalarValue::Utf8(None)"));
+}
+
+#[test]
 pub(crate) fn adr075_partial_pushdown_splits_bound_top_level_and_only() {
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");

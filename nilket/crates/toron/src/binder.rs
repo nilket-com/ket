@@ -4779,6 +4779,7 @@ fn bind_case(
 
 	let result_types = result_ids
 		.iter()
+		.filter(|id| !is_case_null_placeholder(builder, **id))
 		.map(|id| {
 			builder
 				.node_type(*id)
@@ -4786,18 +4787,41 @@ fn bind_case(
 				.expect("builder returns typed CASE result")
 		})
 		.collect::<Vec<_>>();
+	if result_types.is_empty() {
+		return Err(BindingError::TypeMismatch {
+			message: "conditional has no typed (non-NULL) result branch".to_string(),
+		});
+	}
 	let output_type = case_common_type(&result_types)?;
 
 	for (_, result) in &mut bound_when_then {
-		*result = cast_if_needed(builder, *result, &output_type)?;
+		*result = type_case_result(builder, *result, &output_type)?;
 	}
 	let else_input = if let Some(bound_else) = bound_else {
-		cast_if_needed(builder, bound_else, &output_type)?
+		type_case_result(builder, bound_else, &output_type)?
 	} else {
 		builder.append_literal(typed_null_for_case(&output_type)?)
 	};
 
 	Ok(builder.append_case(bound_when_then, else_input, output_type))
+}
+
+fn is_case_null_placeholder(builder: &BoundExprProgramBuilder, id: BoundExprId) -> bool {
+	matches!(builder.literal(id), Some(ScalarValue::Utf8(None)))
+}
+
+fn type_case_result(
+	builder: &mut BoundExprProgramBuilder,
+	id: BoundExprId,
+	output_type: &DataType,
+) -> Result<BoundExprId, BindingError> {
+	// Literal Utf8(None) is the planner's untyped-NULL sentinel for CASE result
+	// branches while normal SQL expression lowering still rejects explicit NULL
+	// literals. Revisit this if general explicit NULL literals become supported.
+	if is_case_null_placeholder(builder, id) {
+		return Ok(builder.append_literal(typed_null_for_case(output_type)?));
+	}
+	cast_if_needed(builder, id, output_type)
 }
 
 fn case_common_type(types: &[DataType]) -> Result<DataType, BindingError> {

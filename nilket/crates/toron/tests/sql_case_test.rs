@@ -191,9 +191,10 @@ fn case_nested_aggregate_in_aggregate_argument_rejects() {
 	let err = SqlPlanner::new()
 		.plan("SELECT SUM(CASE WHEN amount > 0 THEN COUNT(*) ELSE 0 END) FROM sales")
 		.expect_err("nested aggregate inside CASE should reject");
-	assert!(err
-		.to_string()
-		.contains("aggregate arguments must not contain aggregate calls"));
+	assert!(
+		err.to_string()
+			.contains("aggregate arguments must not contain aggregate calls")
+	);
 }
 
 #[tokio::test]
@@ -234,6 +235,329 @@ async fn case_branches_eval_eagerly_masked_hard_error_fails() {
 			assert!(message.starts_with("arithmetic overflow: Add(Int32)"));
 		}
 		other => panic!("unexpected error: {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn coalesce_returns_first_non_null() {
+	let batches = run_sql("SELECT COALESCE(amount, id) FROM sales").await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![Some(10), Some(0), Some(3), Some(30), Some(40), Some(7)]
+	);
+}
+
+#[tokio::test]
+async fn coalesce_single_arg_is_identity() {
+	let plan = plan_sql("SELECT COALESCE(amount) FROM sales");
+	let LogicalPlan::Project { exprs, .. } = &plan else {
+		panic!("expected project");
+	};
+	assert!(matches!(exprs[0], Expr::Column(_)));
+
+	let batches = run_logical(&plan).await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![Some(10), Some(0), None, Some(30), Some(40), Some(7)]
+	);
+}
+
+#[tokio::test]
+async fn coalesce_explicit_null_argument_uses_typed_fallback() {
+	let batches = run_sql("SELECT COALESCE(NULL, amount) FROM sales").await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![Some(10), Some(0), None, Some(30), Some(40), Some(7)]
+	);
+}
+
+#[tokio::test]
+async fn coalesce_numeric_branches_widen() {
+	let batches = run_sql("SELECT COALESCE(amount, 1.5) FROM sales").await;
+	assert_eq!(
+		float64_column_rows(&batches, 0),
+		vec![
+			Some(10.0),
+			Some(0.0),
+			Some(1.5),
+			Some(30.0),
+			Some(40.0),
+			Some(7.0)
+		]
+	);
+}
+
+#[tokio::test]
+async fn coalesce_all_null_arguments_reject() {
+	let err = bind_sql_result("SELECT COALESCE(NULL, NULL) FROM sales")
+		.await
+		.expect_err("all-NULL COALESCE should reject");
+	match err {
+		BindingError::TypeMismatch { message } => {
+			assert!(message.contains("no typed (non-NULL) result branch"));
+		}
+		other => panic!("unexpected error: {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn nullif_returns_null_when_equal_and_first_arg_when_unequal() {
+	let batches = run_sql("SELECT NULLIF(status, 'open') FROM sales").await;
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![
+			None,
+			None,
+			Some("closed".to_string()),
+			None,
+			None,
+			Some("pending".to_string()),
+		]
+	);
+}
+
+#[tokio::test]
+async fn nullif_result_type_is_first_argument_type() {
+	let bound = bind_sql("SELECT NULLIF(amount, 0) FROM sales").await;
+	let ExecutionPlan::Project { exprs, .. } = &bound else {
+		panic!("expected project");
+	};
+	assert_eq!(exprs.root_type(0), Some(&DataType::Int32));
+
+	let batches = execute_bound(&bound).await.expect("execute NULLIF");
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![Some(10), None, None, Some(30), Some(40), Some(7)]
+	);
+}
+
+#[tokio::test]
+async fn if_function_executes_and_iif_is_alias() {
+	let if_rows = run_sql("SELECT IF(flag, 'yes', 'no') FROM sales").await;
+	let iif_rows = run_sql("SELECT IIF(flag, 'yes', 'no') FROM sales").await;
+	let expected = vec![
+		Some("yes".to_string()),
+		Some("no".to_string()),
+		Some("no".to_string()),
+		Some("yes".to_string()),
+		Some("no".to_string()),
+		Some("no".to_string()),
+	];
+	assert_eq!(string_column_rows(&if_rows, 0), expected);
+	assert_eq!(string_column_rows(&iif_rows, 0), expected);
+}
+
+#[tokio::test]
+async fn if_null_result_branch_uses_typed_case_null() {
+	let batches = run_sql("SELECT IF(flag, NULL, amount) FROM sales").await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![None, Some(0), None, None, Some(40), Some(7)]
+	);
+}
+
+#[tokio::test]
+async fn if_condition_must_be_boolean() {
+	let err = bind_sql_result("SELECT IF(amount, 1, 0) FROM sales")
+		.await
+		.expect_err("IF condition should require Boolean");
+	match err {
+		BindingError::TypeMismatch { message } => {
+			assert!(message.contains("CASE WHEN expected Boolean"));
+		}
+		other => panic!("unexpected error: {other:?}"),
+	}
+}
+
+#[test]
+fn if_explicit_null_condition_remains_unsupported() {
+	let err = SqlPlanner::new()
+		.plan("SELECT IF(NULL, 1, 0) FROM sales")
+		.expect_err("IF NULL condition should reject during lowering");
+	assert!(
+		err.to_string()
+			.contains("explicit NULL literal not supported")
+	);
+}
+
+#[test]
+fn if_arity_not_three_rejects() {
+	let err = SqlPlanner::new()
+		.plan("SELECT IF(flag, 1) FROM sales")
+		.expect_err("IF arity should reject");
+	assert!(
+		err.to_string()
+			.contains("IF/IIF requires exactly three arguments")
+	);
+}
+
+#[test]
+fn nullif_explicit_null_operand_remains_unsupported() {
+	let err = SqlPlanner::new()
+		.plan("SELECT NULLIF(NULL, amount) FROM sales")
+		.expect_err("NULLIF explicit NULL operand should reject");
+	assert!(
+		err.to_string()
+			.contains("explicit NULL literal not supported")
+	);
+}
+
+#[tokio::test]
+async fn ifnull_and_nvl_match_two_arg_coalesce() {
+	let batches = run_sql("SELECT IFNULL(NULL, status), NVL(amount, id) FROM sales").await;
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![
+			Some("open".to_string()),
+			Some("open".to_string()),
+			Some("closed".to_string()),
+			Some("open".to_string()),
+			None,
+			Some("pending".to_string()),
+		]
+	);
+	assert_eq!(
+		int32_column_rows(&batches, 1),
+		vec![Some(10), Some(0), Some(3), Some(30), Some(40), Some(7)]
+	);
+}
+
+#[test]
+fn ifnull_nvl_arity_not_two_rejects() {
+	for sql in [
+		"SELECT IFNULL(amount) FROM sales",
+		"SELECT NVL(amount, id, 0) FROM sales",
+	] {
+		let err = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("arity should reject");
+		assert!(
+			err.to_string()
+				.contains("IFNULL/NVL requires exactly two arguments")
+		);
+	}
+}
+
+#[test]
+fn nvl2_remains_unsupported() {
+	let err = SqlPlanner::new()
+		.plan("SELECT NVL2(amount, 1, 0) FROM sales")
+		.expect_err("NVL2 should remain unsupported");
+	assert!(err.to_string().contains("unsupported expression"));
+}
+
+#[tokio::test]
+async fn conditional_sugar_in_where_order_by_having_and_aggregate_arg() {
+	let where_bound = bind_sql("SELECT id FROM sales WHERE IF(amount > 20, true, false)").await;
+	let (predicate, disposition) = find_filter(&where_bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate
+			.single_root()
+			.and_then(|root| predicate.node(root)),
+		Some(BoundExprNode::Case { .. })
+	));
+	let where_rows = execute_bound(&where_bound).await.expect("execute IF WHERE");
+	assert_eq!(ids(&where_rows), vec![4, 5]);
+
+	let order_rows =
+		run_sql("SELECT SUM(amount) FROM sales ORDER BY IF(SUM(amount) > 0, 0, 1)").await;
+	assert_eq!(int64_column_rows(&order_rows, 0), vec![Some(87)]);
+
+	let aggregate_rows = run_sql("SELECT SUM(IF(status = 'open', amount, 0)) FROM sales").await;
+	assert_eq!(int64_column_rows(&aggregate_rows, 0), vec![Some(40)]);
+
+	let having_rows =
+		run_sql("SELECT SUM(amount) FROM sales HAVING IF(SUM(amount) > 0, true, false)").await;
+	assert_eq!(int64_column_rows(&having_rows, 0), vec![Some(87)]);
+}
+
+#[tokio::test]
+async fn conditional_sugar_in_derived_table_executes() {
+	let batches = run_sql(
+		"SELECT x FROM (SELECT COALESCE(amount, id) AS x FROM sales) AS d WHERE IF(x > 20, true, false)",
+	)
+	.await;
+	assert_eq!(int32_column_rows(&batches, 0), vec![Some(30), Some(40)]);
+}
+
+#[test]
+fn conditional_sugar_in_update_scalar_exprs_plans() {
+	let plan = SqlPlanner::new()
+		.plan(
+			"UPDATE sales SET amount = COALESCE(NULL, amount) \
+			 WHERE IF(flag, true, false) \
+			 RETURNING NULLIF(amount, 0)",
+		)
+		.expect("plan UPDATE with conditional sugar");
+	let LogicalPlan::Update {
+		assignments,
+		predicate,
+		returning,
+		..
+	} = &plan
+	else {
+		panic!("expected update plan");
+	};
+	assert!(matches!(assignments[0].1, Expr::Case { .. }));
+	assert!(matches!(predicate, Some(Expr::Case { .. })));
+	let Some(toron::ir::ReturningProjection::Exprs { exprs, .. }) = returning else {
+		panic!("expected expression returning");
+	};
+	assert!(matches!(exprs[0], Expr::Case { .. }));
+}
+
+#[tokio::test]
+async fn conditional_sugar_inherits_case_eager_hard_error() {
+	let err = run_sql_result("SELECT IF(true, 0, 2147483647 + 1) FROM sales")
+		.await
+		.expect_err("masked IF overflow branch should still fail");
+	match err {
+		ExecutionError::Kernel { message } => {
+			assert!(message.starts_with("arithmetic overflow: Add(Int32)"));
+		}
+		other => panic!("unexpected error: {other:?}"),
+	}
+}
+
+#[test]
+fn bare_select_null_remains_unsupported() {
+	let err = SqlPlanner::new()
+		.plan("SELECT NULL FROM sales")
+		.expect_err("bare NULL should remain unsupported");
+	assert!(
+		err.to_string()
+			.contains("explicit NULL literal not supported")
+	);
+}
+
+#[test]
+fn procedural_if_statement_remains_unsupported() {
+	let err = SqlPlanner::new()
+		.plan("IF true THEN SELECT 1; END IF")
+		.expect_err("procedural IF should remain unsupported");
+	assert!(
+		err.to_string().contains("unsupported SQL statement")
+			|| err.to_string().contains("sql parser error")
+	);
+}
+
+#[test]
+fn conditional_sugar_rejects_non_plain_args_and_modifiers() {
+	for sql in [
+		"SELECT COALESCE(*) FROM sales",
+		"SELECT COALESCE(DISTINCT amount, 0) FROM sales",
+	] {
+		let err = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("non-plain conditional sugar call should reject");
+		assert!(
+			err.to_string()
+				.contains("supports only plain positional arguments")
+				|| err
+					.to_string()
+					.contains("does not support argument clauses")
+		);
 	}
 }
 
