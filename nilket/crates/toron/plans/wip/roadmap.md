@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–104 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–105 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -644,6 +644,26 @@ run, 079+).
   silent-ignore + no-project-folding and held fully-unified arity; Gemini conceded the planner arity
   check). Migration: `plans/impl/104_unified_alias_column_lists.md`.
 
+- **ADR 105 — Adjacent Identity `Project` Coalescing.** Promoted. Closes 104's named follow-on: 104's
+  unified bind-time rename leaves a redundant identity `Project` on explicit-derived aliases (Toron has no
+  project-folding), and the pattern recurs in plain derived pass-through (`SELECT id FROM (SELECT id, note
+  FROM people)`) + Rune `.project_named` chains. **The decisive grounding** (Codex, dissolving Claude's
+  iter-0 Fork A/B): the post-bind optimizer `optimize_for_required` already runs on every plan and its
+  `Project` arm already reconstructs the node — so the coalescer is **one helper call in an existing arm**,
+  not a new walker or an alias special-case. Shape: in the `Project` arm, `collapse_adjacent_identity_project`
+  folds an adjacent `Project`-over-`Project` when the parent is a **dense `0..N` positional identity** with
+  **metadata-transparent** roots (physical type + nullability + durable `LogicalTypeId` match the child
+  output; **names ignored** — parent schema wins); the collapsed node reuses child input + child exprs,
+  keeps the parent `output_schema`; `output_remap` unchanged; bottom-up recursion collapses N-deep chains
+  pairwise. Base-table + wildcard renames sit over `Scan` (sole carrier) and are **not** folded (D6).
+  Conservative on bad metadata (predicate returns `false`, not error). **Efficiency only** — elision runs
+  before this pass and traces chains regardless; the win is removing one per-morsel evaluator frame. No
+  SQL/Rune/IR/exec-variant/PBC/storage/Wendelon/`information_schema` surface; removes a node, adds none.
+  Genuine 3-of-3 (same helper shape across the latest duals; Codex dissolved the placement
+  fork + added the derived-source scope regression gate; Claude corrected the rename-is-not-a-no-op
+  characterization + grounded the recurrence + the correctness backbone (`output_remap` invariance, chain
+  composition); Gemini converged). Migration: `plans/impl/105_adjacent_identity_project_coalescing.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -727,19 +747,20 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 104 promoted; ADR 105 candidates
+### ADR 105 promoted; ADR 106 candidates
 
-ADR 104 selected and promoted **unified table alias column lists at bind** — one `LogicalPlan::Alias { columns }`
-mechanism for base-table, explicit-derived, and wildcard-derived aliases (superseding 103's planner
-rewrite, fixing the base-table silent-ignore). Genuine 3-of-3. No operator-designated next yet; strongest
-leads, by theme:
+ADR 105 selected and promoted **adjacent-identity-`Project` coalescing** — a bounded
+`Project`-over-`Project` fold inside the existing `optimize_for_required` pass, closing 104's redundant
+identity-`Project` debt (and the same shape from plain derived pass-through + Rune `.project_named` chains).
+Genuine 3-of-3. No operator-designated next yet; strongest leads, by theme:
 
-*Optimizer cleanup the 104 work surfaced:*
+*Optimizer tier (105's own named follow-on):*
 
-- **General adjacent-identity-`Project` collapse pass** — Toron has no project-folding, so 104's unified
-  rename leaves a redundant identity `Project` on explicit-derived aliases (and the pattern recurs
-  elsewhere). A small general optimizer pass removes it without reintroducing an alias special-case. The
-  natural 104 follow-on.
+- **General project-fusion** — expression substitution / reorder folding / `Project(Filter(Project))`
+  collapse, beyond 105's adjacent-identity case. Evidence-gated: earns a cut only if project chains persist
+  after 105, and carries its own metadata / ordinal / eager-error proofs. 105's named deferrals also live
+  here: **project-into-`Scan`** (base/wildcard scan-output rename folding) and standalone no-op
+  identity-`Project` removal over non-`Project` children.
 
 *Catalog introspection continuation (the substrate now exists):*
 
@@ -784,8 +805,13 @@ leads, by theme:
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
 
-The migration is materialized in
-`plans/impl/104_unified_alias_column_lists.md`.
+### ADR 104 promoted; ADR 105 candidates (HISTORICAL)
+
+ADR 104 promoted unified table alias column lists at bind (one `LogicalPlan::Alias { columns }` mechanism
+across base/explicit/wildcard, superseding 103's planner rewrite, fixing the base-table silent-ignore).
+105 took the optimizer-cleanup follow-on it named — adjacent-identity-`Project` coalescing — after Codex
+dissolved Claude's placement fork via the existing `optimize_for_required` arm. Detail in
+`plans/adr/104_unified_alias_column_lists.md` + the active-line entry above.
 
 ### ADR 103 promoted; ADR 104 candidates (HISTORICAL)
 
