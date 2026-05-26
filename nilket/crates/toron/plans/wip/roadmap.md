@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–105 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–106 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -664,6 +664,28 @@ run, 079+).
   characterization + grounded the recurrence + the correctness backbone (`output_remap` invariance, chain
   composition); Gemini converged). Migration: `plans/impl/105_adjacent_identity_project_coalescing.md`.
 
+- **ADR 106 — Derived Aggregate Tables.** Promoted. The narrow derived-source slice: admit grouped + global
+  aggregate SELECTs as derived sources (`FROM (SELECT k, COUNT(*) AS n FROM t GROUP BY k) AS p`) over the
+  **existing** `Aggregate` substrate. **Pure SQL-frontend fence-lift** — `lower_select` already builds
+  `Aggregate`→`Filter`(HAVING)→`Project`; the only blockers are two artificial fences. The cut: relax the
+  `group_by`/`having`/aggregate-projection rejections in `validate_derived_select_shape` (keep window +
+  every structural fence) and drop the `aggregate_output_catalog.is_some()` rejection in
+  `lower_derived_table` (catalog feeds only `lower_query`'s ORDER BY, which stays fenced; HAVING already in
+  the plan). **Decisive scope grounding (Codex): keep `lower_select`, do NOT delegate to `lower_query`** —
+  the structural fences (nested-derived, joins-inside, EXISTS-decorrelation) live in
+  `validate_derived_select_shape` *before* `lower_select`, so delegating would bypass them. Alias columns
+  rename aggregate outputs via the 104 path (105 coalesces redundant adjacent `Project`s where a final
+  projection already exists); aggregate outputs stay non-transparent for elision (the receipt walk stops at
+  `Aggregate` — inherited). No
+  IR/binder/executor/PBC/storage/Wendelon/`information_schema` surface. **Reconciled two inverted guards
+  (discipline #4, Codex's D9 catch the others missed):** the ADR 100 narrow-derived guard drops its
+  `projection_contains_aggregate_call` + `group_by_is_empty` markers (keeps the structural ones), and the
+  `derived_table_source_scope_rejects_general_subquery_features` behavior test drops its two aggregate
+  reject-cases. Sort/limit-in-derived (a distributed barrier+ordering cut) and joins-around-derived held as
+  follow-ons. Genuine 3-of-3 (Claude leaned narrow + conceded his iter-0 schemata-inert error; Codex
+  withdrew schemata, grounded the no-`lower_query` correction + the ADR 100 guard retarget; Gemini
+  converged from the broad delegation). Migration: `plans/impl/106_derived_aggregate_tables.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -747,11 +769,11 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 105 promoted; ADR 106 candidates
+### ADR 106 promoted; ADR 107 candidates
 
-ADR 105 selected and promoted **adjacent-identity-`Project` coalescing** — a bounded
-`Project`-over-`Project` fold inside the existing `optimize_for_required` pass, closing 104's redundant
-identity-`Project` debt (and the same shape from plain derived pass-through + Rune `.project_named` chains).
+ADR 106 selected and promoted **derived aggregate tables** — a narrow SQL-frontend fence-lift admitting
+grouped + global aggregate SELECTs as derived sources over the existing `Aggregate` substrate (keep
+`lower_select`, no `lower_query` delegation; reconcile the ADR 100 guard + the source-scope behavior test).
 Genuine 3-of-3. No operator-designated next yet; strongest leads, by theme:
 
 *Optimizer tier (105's own named follow-on):*
@@ -764,14 +786,17 @@ Genuine 3-of-3. No operator-designated next yet; strongest leads, by theme:
 
 *Catalog introspection continuation (the substrate now exists):*
 
-- **`information_schema.schemata` / constraints / indexes / PK-FK / views** — further system relations off
-  the 102 descriptor-listing substrate; gated on constraint/namespace modeling (PK/FK identity and
-  referential integrity are the harder pieces). The next introspection cut once 102 settles.
+- **`information_schema.schemata`** — distinct descriptor namespaces off the 102 substrate; **confirmed
+  non-inert** (namespaces are user-creatable via two-part `CREATE TABLE schema.t` → `TableRef::with_schema`,
+  `sql_planner.rs:597`), a clean small 102 continuation (finite family 3→4, no walker sweep). Further system
+  relations (constraints / indexes / PK-FK / views) stay gated on constraint/namespace modeling.
 
 *Derived-source continuation (split, don't generalize):*
 
-- **General derived tables / subqueries** — joins-around-derived, derived aggregates/sort/limit, alias
-  scoping, eventually `IN`/scalar/correlated + decorrelation. Large; sequence the sub-features.
+- **Derived-source continuation** — 106 took derived *aggregates*; the next slices are
+  **sort/limit-in-derived** (a distributed barrier + ordering cut, pairs with Rune sort/limit) and
+  **joins-around-derived** (needs qualifier + join-planning proof), then alias scoping / `IN` / scalar /
+  correlated + decorrelation. Sequence the sub-features.
 - **Projected-scan receipt** — only earns a cut if/when refinement elision is ever moved to run *after*
   `push_down_scan_projection` (then `Scan { projection: Some }` has a consumer). Deferred by ADR 100 D5.
 
@@ -804,6 +829,14 @@ Genuine 3-of-3. No operator-designated next yet; strongest leads, by theme:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 105 promoted; ADR 106 candidates (HISTORICAL)
+
+ADR 105 promoted adjacent-identity-`Project` coalescing (a bounded `Project`-over-`Project` fold in the
+existing `optimize_for_required` pass). 106 took the narrow derived-source slice it carried — derived
+aggregate tables — a pure frontend fence-lift over the existing `Aggregate` substrate, after Codex grounded
+that delegating to `lower_query` would bypass the structural derived fences. Detail in
+`plans/adr/105_adjacent_identity_project_coalescing.md` + the active-line entry above.
 
 ### ADR 104 promoted; ADR 105 candidates (HISTORICAL)
 
