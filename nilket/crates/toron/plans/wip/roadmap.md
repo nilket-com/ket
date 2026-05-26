@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–106 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–107 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -686,6 +686,23 @@ run, 079+).
   withdrew schemata, grounded the no-`lower_query` correction + the ADR 100 guard retarget; Gemini
   converged from the broad delegation). Migration: `plans/impl/106_derived_aggregate_tables.md`.
 
+- **ADR 107 — `information_schema.schemata`.** Promoted. The 4th finite read-only system relation,
+  rounding out the 099/102 ready introspection surface (logical_types + tables + columns + schemata). Lists the
+  tenant's **distinct namespaces from the latest table descriptors** (`schema_name TEXT NOT NULL`),
+  descriptor-derived (a `BTreeSet` over `descriptor.namespace`) — **not a schema registry** (no
+  `CREATE SCHEMA`, owner, catalog, or synthetic/empty schema). **Pure 102 reuse:** a 4th `SystemTableKind`
+  variant + one explicit `bind_information_schema_relation` arm over the existing
+  `refreshed_table_schema_descriptors` snapshot; coordinator-local `SystemTable` execution; **no walker
+  sweep** (`SystemTableKind` has no exhaustive match outside the binder), no new `ExecutionPlan` variant, no
+  Wendelon RPC/storage/PBC/executor surface. Empty → zero rows; refresh-failure fails binding; read-only
+  namespace (mutation rejects). Confirmed non-inert: non-default namespaces are user-creatable via two-part
+  DDL (`CREATE TABLE schema.t` → `TableRef::with_schema`). **Reconciled three ADR 102 guards** (finite-family
+  3→4, explicit-dispatch +schemata, coordinator-local +variant) **+ two behavior sentinels** (read-only
+  test's unknown sentinel `schemata`→`views`; `system_table_executes_without_storage_scan` +schemata).
+  Genuine 3-of-3 (Gemini led; Codex's iter-2 added the 3rd guard retarget + the storage-scan retarget +
+  refresh-failure gate the others missed; Claude retracted his iter-0 inert claim). Migration:
+  `plans/impl/107_information_schema_schemata.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -769,12 +786,12 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 106 promoted; ADR 107 candidates
+### ADR 107 promoted; ADR 108 candidates
 
-ADR 106 selected and promoted **derived aggregate tables** — a narrow SQL-frontend fence-lift admitting
-grouped + global aggregate SELECTs as derived sources over the existing `Aggregate` substrate (keep
-`lower_select`, no `lower_query` delegation; reconcile the ADR 100 guard + the source-scope behavior test).
-Genuine 3-of-3. No operator-designated next yet; strongest leads, by theme:
+ADR 107 selected and promoted **`information_schema.schemata`** — the 4th finite read-only system relation
+(distinct descriptor namespaces, descriptor-derived, `schema_name`-only), pure 102 reuse with no new
+`ExecutionPlan` variant / walker / Wendelon / storage / PBC surface. Genuine 3-of-3. No operator-designated
+next yet; strongest leads, by theme:
 
 *Optimizer tier (105's own named follow-on):*
 
@@ -784,12 +801,11 @@ Genuine 3-of-3. No operator-designated next yet; strongest leads, by theme:
   here: **project-into-`Scan`** (base/wildcard scan-output rename folding) and standalone no-op
   identity-`Project` removal over non-`Project` children.
 
-*Catalog introspection continuation (the substrate now exists):*
+*Catalog introspection continuation:*
 
-- **`information_schema.schemata`** — distinct descriptor namespaces off the 102 substrate; **confirmed
-  non-inert** (namespaces are user-creatable via two-part `CREATE TABLE schema.t` → `TableRef::with_schema`,
-  `sql_planner.rs:597`), a clean small 102 continuation (finite family 3→4, no walker sweep). Further system
-  relations (constraints / indexes / PK-FK / views) stay gated on constraint/namespace modeling.
+- **Further `information_schema` relations** — 107 landed `schemata` (the namespace view), closing the
+  finite-family small cuts. Next are **constraints / indexes / PK-FK / views** — each gated on
+  constraint/view/namespace modeling (the harder pieces), not a clean small cut like schemata was.
 
 *Derived-source continuation (split, don't generalize):*
 
@@ -829,6 +845,13 @@ Genuine 3-of-3. No operator-designated next yet; strongest leads, by theme:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 106 promoted; ADR 107 candidates (HISTORICAL)
+
+ADR 106 promoted derived aggregate tables (a narrow SQL-frontend fence-lift over the existing `Aggregate`
+substrate). 107 took the ready introspection cut it carried — `information_schema.schemata`, the 4th finite
+system relation — a pure 102 reuse (distinct descriptor namespaces, no new `ExecutionPlan` variant/walker/
+Wendelon surface). Detail in `plans/adr/106_derived_aggregate_tables.md` + the active-line entry above.
 
 ### ADR 105 promoted; ADR 106 candidates (HISTORICAL)
 
