@@ -503,7 +503,6 @@ pub(crate) fn adr074_similar_rlike_case_subquery_in_remain_unsupported() {
 	for marker in [
 		"SqlExpr::SimilarTo { .. }",
 		"SqlExpr::RLike { .. }",
-		"SqlExpr::Case { .. }",
 		"SqlExpr::InSubquery { .. }",
 		"SqlExpr::InUnnest { .. }",
 		"BinaryOperator::PGLikeMatch",
@@ -543,6 +542,61 @@ pub(crate) fn adr075_like_ilike_are_first_class_residual_only_predicates() {
 	assert!(exec.contains("arrow_like"));
 	assert!(exec.contains("arrow_ilike"));
 	assert!(!pbc.contains("OP_LIKE"));
+}
+
+#[test]
+pub(crate) fn adr108_case_is_residual_bound_expression() {
+	let manifest_dir = manifest_dir();
+	let ir = std::fs::read_to_string(manifest_dir.join("src/ir.rs")).expect("read ir");
+	let execution_ir =
+		std::fs::read_to_string(manifest_dir.join("src/ir/execution.rs")).expect("read exec ir");
+	let planner =
+		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read planner");
+	let binder = std::fs::read_to_string(manifest_dir.join("src/binder.rs")).expect("read binder");
+	let pbc = std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read pbc");
+	let exec = std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read exec");
+	let storage =
+		std::fs::read_to_string(manifest_dir.join("src/storage.rs")).expect("read storage");
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("OP_CASE")
+				|| line.contains("BoundExprNode::Case")
+				|| line.contains("Expr::Case")
+		})
+		.collect::<Vec<_>>();
+
+	assert!(ir.contains("Case {"));
+	assert!(ir.contains("| Self::Case { .. }"));
+	assert!(execution_ir.contains("Case {"));
+	assert!(execution_ir.contains("else_input: BoundExprId"));
+	assert!(execution_ir.contains("pub fn append_case"));
+	assert!(execution_ir.contains("BoundExprNode::Case"));
+	assert!(execution_ir.contains("node_nullable"));
+	assert!(planner.contains("SqlExpr::Case"));
+	assert!(planner.contains("fn lower_case"));
+	assert!(!planner.contains("CASE is not supported"));
+	assert!(binder.contains("Expr::Case"));
+	assert!(binder.contains("fn bind_case"));
+	assert!(binder.contains("require_boolean(builder, \"CASE WHEN\", condition)"));
+	assert!(binder.contains("fn case_common_type"));
+	assert!(binder.contains("arithmetic_output_type(&common, data_type)"));
+	assert!(binder.contains("fn typed_null_for_case"));
+	assert!(pbc.contains("BoundExprNode::Case { .. }"));
+	assert!(pbc.contains("CASE is not PBC-eligible"));
+	assert!(!pbc.contains("OP_CASE"));
+	assert!(exec.contains("fn evaluate_case"));
+	assert!(exec.contains("kernels::zip::zip"));
+	assert!(exec.contains("treat CASE as a lazy error fence"));
+	assert!(!ir.contains("LogicalPlan::Case"));
+	assert!(!execution_ir.contains("ExecutionPlan::Case"));
+	assert!(!storage.contains("BoundExprNode::Case"));
+	assert!(!storage.contains("Expr::Case"));
+	assert!(
+		wendelon_offenders.is_empty(),
+		"Wendelon must not grow CASE surface:\n{}",
+		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
+	);
 }
 
 #[test]

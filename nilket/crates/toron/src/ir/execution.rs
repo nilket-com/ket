@@ -93,6 +93,10 @@ pub enum BoundExprNode {
 		negated: bool,
 		case_insensitive: bool,
 	},
+	Case {
+		when_then: Vec<(BoundExprId, BoundExprId)>,
+		else_input: BoundExprId,
+	},
 	TimeBucket {
 		interval: std::time::Duration,
 		input: BoundExprId,
@@ -466,6 +470,26 @@ impl BoundExprProgramBuilder {
 		)
 	}
 
+	pub fn append_case(
+		&mut self,
+		when_then: Vec<(BoundExprId, BoundExprId)>,
+		else_input: BoundExprId,
+		output_type: DataType,
+	) -> BoundExprId {
+		for (condition, result) in &when_then {
+			self.assert_existing_child(*condition);
+			self.assert_existing_child(*result);
+		}
+		self.assert_existing_child(else_input);
+		self.append_node(
+			BoundExprNode::Case {
+				when_then,
+				else_input,
+			},
+			output_type,
+		)
+	}
+
 	pub fn append_time_bucket(
 		&mut self,
 		interval: std::time::Duration,
@@ -643,6 +667,16 @@ impl BoundExprProgram {
 				Some(expr_nullable || list_nullable)
 			}
 			BoundExprNode::Like { expr, .. } => self.node_nullable(*expr),
+			BoundExprNode::Case {
+				when_then,
+				else_input,
+			} => {
+				let mut nullable = self.node_nullable(*else_input)?;
+				for (_, result) in when_then {
+					nullable |= self.node_nullable(*result)?;
+				}
+				Some(nullable)
+			}
 			BoundExprNode::TimeBucket { input, .. } => self.node_nullable(*input),
 		}
 	}
@@ -775,6 +809,23 @@ impl BoundExprProgram {
 				};
 				format!("{} {op} {pattern:?}", self.pretty_node(*expr))
 			}
+			BoundExprNode::Case {
+				when_then,
+				else_input,
+			} => {
+				let mut parts = Vec::with_capacity(when_then.len() + 2);
+				parts.push("CASE".to_string());
+				for (condition, result) in when_then {
+					parts.push(format!(
+						"WHEN {} THEN {}",
+						self.pretty_node(*condition),
+						self.pretty_node(*result)
+					));
+				}
+				parts.push(format!("ELSE {}", self.pretty_node(*else_input)));
+				parts.push("END".to_string());
+				parts.join(" ")
+			}
 			BoundExprNode::TimeBucket { interval, input } => {
 				format!("TIME_BUCKET({interval:?}, {})", self.pretty_node(*input))
 			}
@@ -795,6 +846,18 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 			let mut children = Vec::with_capacity(list.len() + 1);
 			children.push(*expr);
 			children.extend(list.iter().copied());
+			children
+		}
+		BoundExprNode::Case {
+			when_then,
+			else_input,
+		} => {
+			let mut children = Vec::with_capacity(when_then.len() * 2 + 1);
+			for (condition, result) in when_then {
+				children.push(*condition);
+				children.push(*result);
+			}
+			children.push(*else_input);
 			children
 		}
 	}

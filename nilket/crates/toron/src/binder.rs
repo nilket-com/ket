@@ -939,6 +939,19 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 			}
 			Ok(())
 		}
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			for (condition, result) in when_then {
+				reject_storage_synthetic_returning_reference(condition)?;
+				reject_storage_synthetic_returning_reference(result)?;
+			}
+			if let Some(else_expr) = else_expr {
+				reject_storage_synthetic_returning_reference(else_expr)?;
+			}
+			Ok(())
+		}
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -983,6 +996,19 @@ fn collect_logical_cast_names(
 			collect_logical_cast_names(expr, names)?;
 			for item in list {
 				collect_logical_cast_names(item, names)?;
+			}
+			Ok(())
+		}
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			for (condition, result) in when_then {
+				collect_logical_cast_names(condition, names)?;
+				collect_logical_cast_names(result, names)?;
+			}
+			if let Some(else_expr) = else_expr {
+				collect_logical_cast_names(else_expr, names)?;
 			}
 			Ok(())
 		}
@@ -2631,6 +2657,22 @@ fn clone_bound_subgraph(
 			let expr = clone_bound_subgraph(source, *expr, builder, remap)?;
 			builder.append_like(expr, pattern.clone(), *negated, *case_insensitive)
 		}
+		BoundExprNode::Case {
+			when_then,
+			else_input,
+		} => {
+			let when_then = when_then
+				.iter()
+				.map(|(condition, result)| {
+					Some((
+						clone_bound_subgraph(source, *condition, builder, remap)?,
+						clone_bound_subgraph(source, *result, builder, remap)?,
+					))
+				})
+				.collect::<Option<Vec<_>>>()?;
+			let else_input = clone_bound_subgraph(source, *else_input, builder, remap)?;
+			builder.append_case(when_then, else_input, output_type)
+		}
 		BoundExprNode::TimeBucket { interval, input } => {
 			let input = clone_bound_subgraph(source, *input, builder, remap)?;
 			builder.append_time_bucket(*interval, input, output_type)
@@ -2772,6 +2814,33 @@ fn bound_subgraphs_structurally_equal_inner(
 				&& bound_subgraphs_structurally_equal_inner(source, *left_expr, *right_expr, seen)
 		}
 		(
+			Some(BoundExprNode::Case {
+				when_then: left_when_then,
+				else_input: left_else,
+			}),
+			Some(BoundExprNode::Case {
+				when_then: right_when_then,
+				else_input: right_else,
+			}),
+		) => {
+			left_when_then.len() == right_when_then.len()
+				&& left_when_then.iter().zip(right_when_then.iter()).all(
+					|((left_condition, left_result), (right_condition, right_result))| {
+						bound_subgraphs_structurally_equal_inner(
+							source,
+							*left_condition,
+							*right_condition,
+							seen,
+						) && bound_subgraphs_structurally_equal_inner(
+							source,
+							*left_result,
+							*right_result,
+							seen,
+						)
+					},
+				) && bound_subgraphs_structurally_equal_inner(source, *left_else, *right_else, seen)
+		}
+		(
 			Some(BoundExprNode::TimeBucket {
 				interval: left_interval,
 				input: left_input,
@@ -2828,6 +2897,18 @@ fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 			let mut children = Vec::with_capacity(list.len() + 1);
 			children.push(*expr);
 			children.extend(list.iter().copied());
+			children
+		}
+		BoundExprNode::Case {
+			when_then,
+			else_input,
+		} => {
+			let mut children = Vec::with_capacity(when_then.len() * 2 + 1);
+			for (condition, result) in when_then {
+				children.push(*condition);
+				children.push(*result);
+			}
+			children.push(*else_input);
 			children
 		}
 	}
@@ -4159,6 +4240,16 @@ fn collect_program_node_columns(
 				collect_program_node_columns(program, *item, columns);
 			}
 		}
+		Some(BoundExprNode::Case {
+			when_then,
+			else_input,
+		}) => {
+			for (condition, result) in when_then {
+				collect_program_node_columns(program, *condition, columns);
+				collect_program_node_columns(program, *result, columns);
+			}
+			collect_program_node_columns(program, *else_input, columns);
+		}
 	}
 }
 
@@ -4345,6 +4436,16 @@ fn offset_bound_node(node: BoundExprNode, node_offset: u32, literal_offset: u32)
 			negated,
 			case_insensitive,
 		},
+		BoundExprNode::Case {
+			when_then,
+			else_input,
+		} => BoundExprNode::Case {
+			when_then: when_then
+				.into_iter()
+				.map(|(condition, result)| (offset_id(condition), offset_id(result)))
+				.collect(),
+			else_input: offset_id(else_input),
+		},
 		BoundExprNode::TimeBucket { interval, input } => BoundExprNode::TimeBucket {
 			interval,
 			input: offset_id(input),
@@ -4480,6 +4581,10 @@ fn bind_expr_into_program(
 			*negated,
 			*case_insensitive,
 		),
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => bind_case(builder, input_schema, ctx, when_then, else_expr.as_deref()),
 		Expr::IsNull(inner) => {
 			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNull, inner, DataType::Boolean))
@@ -4638,6 +4743,98 @@ fn bind_arithmetic(
 	let left = cast_if_needed(builder, left, &output_type)?;
 	let right = cast_if_needed(builder, right, &output_type)?;
 	Ok(builder.append_binary(op, left, right, output_type))
+}
+
+fn bind_case(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	when_then: &[(Box<Expr>, Box<Expr>)],
+	else_expr: Option<&Expr>,
+) -> Result<BoundExprId, BindingError> {
+	if when_then.is_empty() {
+		return Err(BindingError::UnsupportedExpression {
+			message: "CASE must have at least one WHEN branch".to_string(),
+		});
+	}
+
+	let mut bound_when_then = Vec::with_capacity(when_then.len());
+	let mut result_ids =
+		Vec::with_capacity(when_then.len() + if else_expr.is_some() { 1 } else { 0 });
+	for (condition, result) in when_then {
+		let condition = bind_expr_into_program(builder, condition, input_schema, ctx)?;
+		require_boolean(builder, "CASE WHEN", condition)?;
+		let result = bind_expr_into_program(builder, result, input_schema, ctx)?;
+		result_ids.push(result);
+		bound_when_then.push((condition, result));
+	}
+
+	let bound_else = if let Some(else_expr) = else_expr {
+		let else_input = bind_expr_into_program(builder, else_expr, input_schema, ctx)?;
+		result_ids.push(else_input);
+		Some(else_input)
+	} else {
+		None
+	};
+
+	let result_types = result_ids
+		.iter()
+		.map(|id| {
+			builder
+				.node_type(*id)
+				.cloned()
+				.expect("builder returns typed CASE result")
+		})
+		.collect::<Vec<_>>();
+	let output_type = case_common_type(&result_types)?;
+
+	for (_, result) in &mut bound_when_then {
+		*result = cast_if_needed(builder, *result, &output_type)?;
+	}
+	let else_input = if let Some(bound_else) = bound_else {
+		cast_if_needed(builder, bound_else, &output_type)?
+	} else {
+		builder.append_literal(typed_null_for_case(&output_type)?)
+	};
+
+	Ok(builder.append_case(bound_when_then, else_input, output_type))
+}
+
+fn case_common_type(types: &[DataType]) -> Result<DataType, BindingError> {
+	let mut iter = types.iter();
+	let mut common = iter
+		.next()
+		.cloned()
+		.ok_or_else(|| BindingError::TypeMismatch {
+			message: "CASE requires at least one result branch".to_string(),
+		})?;
+	for data_type in iter {
+		if common == *data_type {
+			continue;
+		}
+		common = arithmetic_output_type(&common, data_type).ok_or_else(|| {
+			BindingError::TypeMismatch {
+				message: format!(
+					"CASE result branches cannot be unified: {common:?} and {data_type:?}"
+				),
+			}
+		})?;
+	}
+	Ok(common)
+}
+
+fn typed_null_for_case(data_type: &DataType) -> Result<ScalarValue, BindingError> {
+	match data_type {
+		DataType::Boolean => Ok(ScalarValue::Boolean(None)),
+		DataType::Int32 => Ok(ScalarValue::Int32(None)),
+		DataType::Int64 => Ok(ScalarValue::Int64(None)),
+		DataType::Float32 => Ok(ScalarValue::Float32(None)),
+		DataType::Float64 => Ok(ScalarValue::Float64(None)),
+		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
+		other => Err(BindingError::TypeMismatch {
+			message: format!("unsupported CASE result type: {other:?}"),
+		}),
+	}
 }
 
 fn bind_explicit_cast(

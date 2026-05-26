@@ -130,6 +130,11 @@ impl PbcCompiler {
 						"LIKE is not PBC-eligible".to_string(),
 					));
 				}
+				BoundExprNode::Case { .. } => {
+					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+						"CASE is not PBC-eligible".to_string(),
+					));
+				}
 				BoundExprNode::TimeBucket { .. } => {
 					return Err(PushdownDeclineReason::ExperimentalKernelInPredicate);
 				}
@@ -179,6 +184,7 @@ impl PbcCompiler {
 			BoundExprNode::Cast { .. }
 			| BoundExprNode::TryCast { .. }
 			| BoundExprNode::Like { .. }
+			| BoundExprNode::Case { .. }
 			| BoundExprNode::TimeBucket { .. } => {
 				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 					"unsupported node reached PBC emitter".to_string(),

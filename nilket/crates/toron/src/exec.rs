@@ -985,6 +985,37 @@ impl Executor {
 				let expr_arr = self.evaluate_expr(expr, batch)?;
 				evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)
 			}
+			Expr::Case {
+				when_then,
+				else_expr,
+			} => {
+				if when_then.is_empty() {
+					return Err(ExecutionError::InvalidExpression {
+						message: "CASE must have at least one WHEN branch".to_string(),
+					});
+				}
+				let when_then = when_then
+					.iter()
+					.map(|(condition, result)| {
+						Ok((
+							self.evaluate_expr(condition, batch)?,
+							self.evaluate_expr(result, batch)?,
+						))
+					})
+					.collect::<Result<Vec<_>, ExecutionError>>()?;
+				let else_array = if let Some(else_expr) = else_expr {
+					self.evaluate_expr(else_expr, batch)?
+				} else {
+					let data_type = when_then
+						.first()
+						.map(|(_, result)| result.data_type().clone())
+						.ok_or_else(|| ExecutionError::InvalidExpression {
+							message: "CASE must have at least one result branch".to_string(),
+						})?;
+					arrow::array::new_null_array(&data_type, batch.num_rows())
+				};
+				evaluate_case(&when_then, else_array)
+			}
 			Expr::IsNull(inner) => {
 				let arr = self.evaluate_expr(inner, batch)?;
 				let res = is_null(&arr)?;
@@ -1086,6 +1117,22 @@ impl Executor {
 				} => {
 					let expr_arr = evaluated_child(&outputs, *expr)?;
 					evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)?
+				}
+				BoundExprNode::Case {
+					when_then,
+					else_input,
+				} => {
+					let when_then = when_then
+						.iter()
+						.map(|(condition, result)| {
+							Ok((
+								evaluated_child(&outputs, *condition)?,
+								evaluated_child(&outputs, *result)?,
+							))
+						})
+						.collect::<Result<Vec<_>, ExecutionError>>()?;
+					let else_array = evaluated_child(&outputs, *else_input)?;
+					evaluate_case(&when_then, else_array)?
 				}
 				BoundExprNode::TimeBucket { interval, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -1845,6 +1892,23 @@ fn evaluate_in_list(
 	} else {
 		Ok(Arc::new(mask))
 	}
+}
+
+/// SQL CASE reads like a lazy conditional, but this vectorized evaluator computes every branch
+/// array eagerly and then zips by each WHEN mask. A hard-erroring kernel in a branch fails the
+/// query even for rows where that branch is not selected. Integer div-by-zero is safe because
+/// ADR 084 makes it yield NULL. Per-branch masked execution is a deferred follow-on; do not
+/// treat CASE as a lazy error fence.
+fn evaluate_case(
+	when_then: &[(ArrayRef, ArrayRef)],
+	else_array: ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let mut acc = else_array;
+	for (condition, result) in when_then.iter().rev() {
+		let mask = as_boolean(condition, "CASE WHEN condition")?;
+		acc = arrow::compute::kernels::zip::zip(mask, &result.as_ref(), &acc.as_ref())?;
+	}
+	Ok(acc)
 }
 
 fn evaluate_like(

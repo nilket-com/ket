@@ -531,6 +531,10 @@ pub enum Expr {
 		negated: bool,
 		case_insensitive: bool,
 	},
+	Case {
+		when_then: Vec<(Box<Expr>, Box<Expr>)>,
+		else_expr: Option<Box<Expr>>,
+	},
 	IsNull(Box<Expr>),
 	IsNotNull(Box<Expr>),
 	TimeBucket(std::time::Duration, Box<Expr>),
@@ -561,6 +565,7 @@ impl Expr {
 			| Self::Mul(_, _)
 			| Self::Div(_, _)
 			| Self::Like { .. }
+			| Self::Case { .. }
 			| Self::TimeBucket(_, _) => false,
 			Self::Eq(left, right)
 			| Self::Neq(left, right)

@@ -8,7 +8,7 @@ use crate::ir::{
 };
 use arrow::datatypes::DataType;
 use sqlparser::ast::{
-	Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnDef, ColumnOption,
+	Assignment, AssignmentTarget, BinaryOperator, CaseWhen, CastKind, ColumnDef, ColumnOption,
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, Delete,
 	ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
 	FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident, Insert,
@@ -124,6 +124,24 @@ fn reject_nested_aggregate(expr: &SqlExpr) -> Result<(), FrontendError> {
 		SqlExpr::BinaryOp { left, right, .. } => {
 			reject_nested_aggregate(left)?;
 			reject_nested_aggregate(right)
+		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			if let Some(operand) = operand {
+				reject_nested_aggregate(operand)?;
+			}
+			for case_when in conditions {
+				reject_nested_aggregate(&case_when.condition)?;
+				reject_nested_aggregate(&case_when.result)?;
+			}
+			if let Some(else_result) = else_result {
+				reject_nested_aggregate(else_result)?;
+			}
+			Ok(())
 		}
 		SqlExpr::Cast { expr, .. } | SqlExpr::UnaryOp { expr, .. } => reject_nested_aggregate(expr),
 		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) | SqlExpr::Nested(inner) => {
@@ -2932,6 +2950,43 @@ impl SqlPlanner {
 				op: op.clone(),
 				right: Box::new(self.rewrite_grouped_aggregate_calls(right, scope, clause)?),
 			}),
+			SqlExpr::Case {
+				case_token,
+				end_token,
+				operand,
+				conditions,
+				else_result,
+			} => Ok(SqlExpr::Case {
+				case_token: case_token.clone(),
+				end_token: end_token.clone(),
+				operand: operand
+					.as_ref()
+					.map(|expr| self.rewrite_grouped_aggregate_calls(expr, scope, clause))
+					.transpose()?
+					.map(Box::new),
+				conditions: conditions
+					.iter()
+					.map(|case_when| {
+						Ok(CaseWhen {
+							condition: self.rewrite_grouped_aggregate_calls(
+								&case_when.condition,
+								scope,
+								clause,
+							)?,
+							result: self.rewrite_grouped_aggregate_calls(
+								&case_when.result,
+								scope,
+								clause,
+							)?,
+						})
+					})
+					.collect::<Result<Vec<_>, FrontendError>>()?,
+				else_result: else_result
+					.as_ref()
+					.map(|expr| self.rewrite_grouped_aggregate_calls(expr, scope, clause))
+					.transpose()?
+					.map(Box::new),
+			}),
 			SqlExpr::Cast {
 				kind,
 				expr,
@@ -3048,6 +3103,24 @@ impl SqlPlanner {
 				self.discover_aggregate_calls(left, mode, source, catalog)?;
 				self.discover_aggregate_calls(right, mode, source, catalog)
 			}
+			SqlExpr::Case {
+				operand,
+				conditions,
+				else_result,
+				..
+			} => {
+				if let Some(operand) = operand {
+					self.discover_aggregate_calls(operand, mode, source, catalog)?;
+				}
+				for case_when in conditions {
+					self.discover_aggregate_calls(&case_when.condition, mode, source, catalog)?;
+					self.discover_aggregate_calls(&case_when.result, mode, source, catalog)?;
+				}
+				if let Some(else_result) = else_result {
+					self.discover_aggregate_calls(else_result, mode, source, catalog)?;
+				}
+				Ok(())
+			}
 			SqlExpr::Cast { expr, .. } => {
 				self.discover_aggregate_calls(expr, mode, source, catalog)
 			}
@@ -3141,6 +3214,43 @@ impl SqlPlanner {
 				left: Box::new(self.rewrite_aggregate_calls_for_projection(left, mode, catalog)?),
 				op: op.clone(),
 				right: Box::new(self.rewrite_aggregate_calls_for_projection(right, mode, catalog)?),
+			}),
+			SqlExpr::Case {
+				case_token,
+				end_token,
+				operand,
+				conditions,
+				else_result,
+			} => Ok(SqlExpr::Case {
+				case_token: case_token.clone(),
+				end_token: end_token.clone(),
+				operand: operand
+					.as_ref()
+					.map(|expr| self.rewrite_aggregate_calls_for_projection(expr, mode, catalog))
+					.transpose()?
+					.map(Box::new),
+				conditions: conditions
+					.iter()
+					.map(|case_when| {
+						Ok(CaseWhen {
+							condition: self.rewrite_aggregate_calls_for_projection(
+								&case_when.condition,
+								mode,
+								catalog,
+							)?,
+							result: self.rewrite_aggregate_calls_for_projection(
+								&case_when.result,
+								mode,
+								catalog,
+							)?,
+						})
+					})
+					.collect::<Result<Vec<_>, FrontendError>>()?,
+				else_result: else_result
+					.as_ref()
+					.map(|expr| self.rewrite_aggregate_calls_for_projection(expr, mode, catalog))
+					.transpose()?
+					.map(Box::new),
 			}),
 			SqlExpr::Cast {
 				kind,
@@ -3612,11 +3722,16 @@ impl SqlPlanner {
 				low,
 				high,
 			} => self.lower_between(expr, low, high, *negated),
+			SqlExpr::Case {
+				operand,
+				conditions,
+				else_result,
+				..
+			} => self.lower_case(operand.as_deref(), conditions, else_result.as_deref()),
 			SqlExpr::InSubquery { .. } => Err(unsupported("IN subquery is not supported")),
 			SqlExpr::InUnnest { .. } => Err(unsupported("IN UNNEST is not supported")),
 			SqlExpr::SimilarTo { .. } => Err(unsupported("SIMILAR TO is not supported")),
 			SqlExpr::RLike { .. } => Err(unsupported("RLIKE is not supported")),
-			SqlExpr::Case { .. } => Err(unsupported("CASE is not supported")),
 			SqlExpr::Cast {
 				kind,
 				expr,
@@ -3697,6 +3812,40 @@ impl SqlPlanner {
 			}
 			_ => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
 		}
+	}
+
+	fn lower_case(
+		&self,
+		operand: Option<&SqlExpr>,
+		conditions: &[CaseWhen],
+		else_result: Option<&SqlExpr>,
+	) -> Result<Expr, FrontendError> {
+		if conditions.is_empty() {
+			return Err(unsupported("CASE must have at least one WHEN branch"));
+		}
+		let operand = operand.map(|expr| self.lower_expr(expr)).transpose()?;
+		let mut when_then = Vec::with_capacity(conditions.len());
+		for case_when in conditions {
+			let condition = if let Some(operand) = &operand {
+				Expr::Eq(
+					Box::new(operand.clone()),
+					Box::new(self.lower_expr(&case_when.condition)?),
+				)
+			} else {
+				self.lower_expr(&case_when.condition)?
+			};
+			when_then.push((
+				Box::new(condition),
+				Box::new(self.lower_expr(&case_when.result)?),
+			));
+		}
+		let else_expr = else_result
+			.map(|expr| self.lower_expr(expr).map(Box::new))
+			.transpose()?;
+		Ok(Expr::Case {
+			when_then,
+			else_expr,
+		})
 	}
 
 	fn lower_like(
@@ -3881,6 +4030,19 @@ fn validate_hidden_sort_key_refs(
 			validate_hidden_sort_key_refs(expr, visible_names)?;
 			for item in list {
 				validate_hidden_sort_key_refs(item, visible_names)?;
+			}
+			Ok(())
+		}
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			for (condition, result) in when_then {
+				validate_hidden_sort_key_refs(condition, visible_names)?;
+				validate_hidden_sort_key_refs(result, visible_names)?;
+			}
+			if let Some(else_expr) = else_expr {
+				validate_hidden_sort_key_refs(else_expr, visible_names)?;
 			}
 			Ok(())
 		}
@@ -4389,6 +4551,21 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			try_cast.hash(state);
 			hash_expr_structural(expr, state);
 		}
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			24u8.hash(state);
+			when_then.len().hash(state);
+			for (condition, result) in when_then {
+				hash_expr_structural(condition, state);
+				hash_expr_structural(result, state);
+			}
+			else_expr.is_some().hash(state);
+			if let Some(else_expr) = else_expr {
+				hash_expr_structural(else_expr, state);
+			}
+		}
 	}
 }
 
@@ -4485,6 +4662,28 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 					.iter()
 					.zip(right_list.iter())
 					.all(|(left, right)| expr_structural_eq(left, right))
+		}
+		(
+			Expr::Case {
+				when_then: left_when_then,
+				else_expr: left_else,
+			},
+			Expr::Case {
+				when_then: right_when_then,
+				else_expr: right_else,
+			},
+		) => {
+			left_when_then.len() == right_when_then.len()
+				&& left_when_then.iter().zip(right_when_then.iter()).all(
+					|((left_condition, left_result), (right_condition, right_result))| {
+						expr_structural_eq(left_condition, right_condition)
+							&& expr_structural_eq(left_result, right_result)
+					},
+				) && match (left_else, right_else) {
+				(Some(left_else), Some(right_else)) => expr_structural_eq(left_else, right_else),
+				(None, None) => true,
+				_ => false,
+			}
 		}
 		_ => false,
 	}
@@ -4612,6 +4811,24 @@ fn reject_qualified_having_column_references(expr: &SqlExpr) -> Result<(), Front
 			reject_qualified_having_column_references(left)?;
 			reject_qualified_having_column_references(right)
 		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			if let Some(operand) = operand {
+				reject_qualified_having_column_references(operand)?;
+			}
+			for case_when in conditions {
+				reject_qualified_having_column_references(&case_when.condition)?;
+				reject_qualified_having_column_references(&case_when.result)?;
+			}
+			if let Some(else_result) = else_result {
+				reject_qualified_having_column_references(else_result)?;
+			}
+			Ok(())
+		}
 		SqlExpr::Cast { expr, .. } => reject_qualified_having_column_references(expr),
 		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) | SqlExpr::Nested(inner) => {
 			reject_qualified_having_column_references(inner)
@@ -4643,6 +4860,24 @@ fn reject_having_alias_references(
 			reject_having_alias_references(left, select_aliases)?;
 			reject_having_alias_references(right, select_aliases)
 		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			if let Some(operand) = operand {
+				reject_having_alias_references(operand, select_aliases)?;
+			}
+			for case_when in conditions {
+				reject_having_alias_references(&case_when.condition, select_aliases)?;
+				reject_having_alias_references(&case_when.result, select_aliases)?;
+			}
+			if let Some(else_result) = else_result {
+				reject_having_alias_references(else_result, select_aliases)?;
+			}
+			Ok(())
+		}
 		SqlExpr::Cast { expr, .. } => reject_having_alias_references(expr, select_aliases),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
@@ -4670,6 +4905,24 @@ fn reject_qualified_aggregate_projection_references(expr: &SqlExpr) -> Result<()
 		SqlExpr::BinaryOp { left, right, .. } => {
 			reject_qualified_aggregate_projection_references(left)?;
 			reject_qualified_aggregate_projection_references(right)
+		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			if let Some(operand) = operand {
+				reject_qualified_aggregate_projection_references(operand)?;
+			}
+			for case_when in conditions {
+				reject_qualified_aggregate_projection_references(&case_when.condition)?;
+				reject_qualified_aggregate_projection_references(&case_when.result)?;
+			}
+			if let Some(else_result) = else_result {
+				reject_qualified_aggregate_projection_references(else_result)?;
+			}
+			Ok(())
 		}
 		SqlExpr::Cast { expr, .. } => reject_qualified_aggregate_projection_references(expr),
 		SqlExpr::UnaryOp { expr, .. }
@@ -4752,6 +5005,16 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		Expr::InList { expr, list, .. } => {
 			expr_contains_qualified_column(expr) || list.iter().any(expr_contains_qualified_column)
 		}
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			when_then.iter().any(|(condition, result)| {
+				expr_contains_qualified_column(condition) || expr_contains_qualified_column(result)
+			}) || else_expr
+				.as_deref()
+				.is_some_and(expr_contains_qualified_column)
+		}
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -4801,6 +5064,20 @@ fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 		SqlExpr::BinaryOp { left, right, .. } => {
 			expr_contains_aggregate_call(left) || expr_contains_aggregate_call(right)
 		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			operand.as_deref().is_some_and(expr_contains_aggregate_call)
+				|| conditions.iter().any(|case_when| {
+					expr_contains_aggregate_call(&case_when.condition)
+						|| expr_contains_aggregate_call(&case_when.result)
+				}) || else_result
+				.as_deref()
+				.is_some_and(expr_contains_aggregate_call)
+		}
 		SqlExpr::Cast { expr, .. } => expr_contains_aggregate_call(expr),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
@@ -4815,6 +5092,18 @@ fn expr_contains_subquery(expr: &SqlExpr) -> bool {
 		SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => true,
 		SqlExpr::BinaryOp { left, right, .. } => {
 			expr_contains_subquery(left) || expr_contains_subquery(right)
+		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			operand.as_deref().is_some_and(expr_contains_subquery)
+				|| conditions.iter().any(|case_when| {
+					expr_contains_subquery(&case_when.condition)
+						|| expr_contains_subquery(&case_when.result)
+				}) || else_result.as_deref().is_some_and(expr_contains_subquery)
 		}
 		SqlExpr::Cast { expr, .. } => expr_contains_subquery(expr),
 		SqlExpr::UnaryOp { expr, .. }
@@ -4838,6 +5127,22 @@ fn expr_contains_window_function(expr: &SqlExpr) -> bool {
 		}
 		SqlExpr::BinaryOp { left, right, .. } => {
 			expr_contains_window_function(left) || expr_contains_window_function(right)
+		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			operand
+				.as_deref()
+				.is_some_and(expr_contains_window_function)
+				|| conditions.iter().any(|case_when| {
+					expr_contains_window_function(&case_when.condition)
+						|| expr_contains_window_function(&case_when.result)
+				}) || else_result
+				.as_deref()
+				.is_some_and(expr_contains_window_function)
 		}
 		SqlExpr::Cast { expr, .. } => expr_contains_window_function(expr),
 		SqlExpr::UnaryOp { expr, .. }
@@ -4907,6 +5212,22 @@ fn expr_contains_nonaggregate_column_reference(expr: &SqlExpr) -> bool {
 		SqlExpr::BinaryOp { left, right, .. } => {
 			expr_contains_nonaggregate_column_reference(left)
 				|| expr_contains_nonaggregate_column_reference(right)
+		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			operand
+				.as_deref()
+				.is_some_and(expr_contains_nonaggregate_column_reference)
+				|| conditions.iter().any(|case_when| {
+					expr_contains_nonaggregate_column_reference(&case_when.condition)
+						|| expr_contains_nonaggregate_column_reference(&case_when.result)
+				}) || else_result
+				.as_deref()
+				.is_some_and(expr_contains_nonaggregate_column_reference)
 		}
 		SqlExpr::Cast { expr, .. } => expr_contains_nonaggregate_column_reference(expr),
 		SqlExpr::UnaryOp { expr, .. }
@@ -5395,6 +5716,28 @@ fn collect_scope_refs(
 		SqlExpr::BinaryOp { left, right, .. } => {
 			collect_scope_refs(left, outer_qualifiers, inner_qualifiers, refs)?;
 			collect_scope_refs(right, outer_qualifiers, inner_qualifiers, refs)?;
+		}
+		SqlExpr::Case {
+			operand,
+			conditions,
+			else_result,
+			..
+		} => {
+			if let Some(operand) = operand {
+				collect_scope_refs(operand, outer_qualifiers, inner_qualifiers, refs)?;
+			}
+			for case_when in conditions {
+				collect_scope_refs(
+					&case_when.condition,
+					outer_qualifiers,
+					inner_qualifiers,
+					refs,
+				)?;
+				collect_scope_refs(&case_when.result, outer_qualifiers, inner_qualifiers, refs)?;
+			}
+			if let Some(else_result) = else_result {
+				collect_scope_refs(else_result, outer_qualifiers, inner_qualifiers, refs)?;
+			}
 		}
 		SqlExpr::Cast { expr, .. } => {
 			collect_scope_refs(expr, outer_qualifiers, inner_qualifiers, refs)?;

@@ -720,7 +720,6 @@ fn unsupported_pattern_predicates_and_case_subquery_in_remain_unsupported() {
 		"SELECT id FROM sales WHERE status RLIKE 'o.*'",
 		"SELECT id FROM sales WHERE status ~~ 'o%'",
 		"SELECT id FROM sales WHERE status ~~* 'o%'",
-		"SELECT id FROM sales WHERE CASE WHEN id = 1 THEN true ELSE false END",
 		"SELECT id FROM sales WHERE id IN (SELECT id FROM sales)",
 	] {
 		assert_plan_rejected(sql);
