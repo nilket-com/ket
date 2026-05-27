@@ -8,7 +8,7 @@ use toron::binder::{PlannerConfig, bind};
 use toron::catalog::MockCatalog;
 use toron::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
-use toron::distributed::fragment::{FragmentPlanConfig, fragment_plan};
+use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::{ExchangeId, QueryId, StageId};
 use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBinding};
 use toron::error::{BindingError, ExecutionError, StorageError};
@@ -109,6 +109,65 @@ async fn order_by_limit_offset_executes_in_deterministic_order() {
 			.await;
 
 	assert_i64_values(&batch, 0, &[3, 1, 5]);
+}
+
+#[tokio::test]
+async fn sql_derived_top_k_executes() {
+	let batch =
+		run_sql("SELECT id FROM (SELECT id FROM t ORDER BY id DESC LIMIT 2) AS p WHERE id > 0")
+			.await;
+
+	assert_i64_values(&batch, 0, &[9, 5]);
+}
+
+#[tokio::test]
+async fn sql_derived_offset_executes() {
+	let batch =
+		run_sql("SELECT id FROM (SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 2) AS p").await;
+
+	assert_i64_values(&batch, 0, &[3, 4]);
+}
+
+#[tokio::test]
+async fn sql_derived_sort_alias_columns_apply_after_sort() {
+	let batch =
+		run_sql("SELECT renamed FROM (SELECT id FROM t ORDER BY id DESC LIMIT 1) AS p(renamed)")
+			.await;
+
+	assert_i64_values(&batch, 0, &[9]);
+}
+
+#[test]
+fn limit_without_order_by_rejects_top_level_and_derived() {
+	for sql in [
+		"SELECT id FROM t LIMIT 1",
+		"SELECT id FROM (SELECT id FROM t LIMIT 1) AS p",
+	] {
+		let err = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("LIMIT should reject");
+		assert!(
+			err.to_string()
+				.contains("LIMIT/OFFSET without ORDER BY is not supported"),
+			"{sql}: {err}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn multiple_global_sorts_reject_loudly() {
+	let (catalog, _) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT id FROM (SELECT id FROM t ORDER BY id DESC LIMIT 2) AS p ORDER BY id")
+		.expect("plan nested ordered top-k");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind nested ordered top-k");
+
+	assert_eq!(
+		fragment_plan(bound, fragment_config()).expect_err("multiple barriers should reject"),
+		FragmentError::MultipleGlobalSortBarriers
+	);
 }
 
 #[tokio::test]

@@ -512,14 +512,14 @@ pub(crate) fn adr025_sql_cast_lowers_via_planner() {
 pub(crate) fn adr025_order_by_cast_uses_hidden_sort_projection() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
-	let lower_query = brace_blocks_after_marker(&planner, "fn lower_query")
+	let tail = brace_blocks_after_marker(&planner, "fn apply_order_by_limit_tail")
 		.into_iter()
 		.next()
-		.expect("lower_query body")
+		.expect("apply_order_by_limit_tail body")
 		.1;
-	assert!(lower_query.contains("sort_needs_hidden_projection(&order_by)"));
-	assert!(lower_query.contains("add_hidden_sort_projection"));
-	assert!(lower_query.contains("final_projection"));
+	assert!(tail.contains("sort_needs_hidden_projection(&order_by)"));
+	assert!(tail.contains("add_hidden_sort_projection"));
+	assert!(tail.contains("final_projection"));
 
 	let hidden_gate = brace_blocks_after_marker(&planner, "fn sort_needs_hidden_projection")
 		.into_iter()
@@ -2007,6 +2007,11 @@ pub(crate) fn adr073_query_limit_clause_preserves_ordered_limit_offset_else_reje
 		.next()
 		.expect("lower_query")
 		.1;
+	let tail = brace_blocks_after_marker(&planner, "fn apply_order_by_limit_tail")
+		.into_iter()
+		.next()
+		.expect("apply_order_by_limit_tail")
+		.1;
 	let lower_order_by = brace_blocks_after_marker(&planner, "fn lower_order_by")
 		.into_iter()
 		.next()
@@ -2025,9 +2030,10 @@ pub(crate) fn adr073_query_limit_clause_preserves_ordered_limit_offset_else_reje
 			"limit lowering missing {marker}"
 		);
 	}
-	assert!(lower_query.contains("LIMIT/OFFSET without ORDER BY is not supported"));
-	assert!(lower_query.contains("let limit = limit_offset"));
-	assert!(lower_query.contains("let offset = limit_offset"));
+	assert!(lower_query.contains("self.apply_order_by_limit_tail("));
+	assert!(tail.contains("LIMIT/OFFSET without ORDER BY is not supported"));
+	assert!(tail.contains("let limit = limit_offset"));
+	assert!(tail.contains("let offset = limit_offset"));
 	assert!(lower_order_by.contains("OrderByKind::Expressions"));
 	assert!(lower_order_by.contains("OrderByKind::All(_)"));
 	assert!(lower_order_by.contains("ORDER BY ALL is not supported"));
@@ -2189,4 +2195,166 @@ pub(crate) fn adr073_prior_028_029_030_034_036_exhaustive_destructure_guards_pas
 		);
 	}
 	assert!(manifest.contains("sqlparser = \"0.62\""));
+}
+
+#[test]
+pub(crate) fn adr115_derived_query_tail_fence_lifted_only() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let derived = adr115_source_block(&planner, "fn validate_derived_query_shape");
+	let exists = adr115_source_block(&planner, "fn validate_exists_query_shape");
+	let derived_select = adr115_source_block(&planner, "fn validate_derived_select_shape");
+
+	assert!(!derived.contains("query.order_by.is_some()"));
+	assert!(!derived.contains("query_has_limit_or_offset"));
+	for retained in [
+		"query.with.is_some()",
+		"query.fetch.is_some()",
+		"!query.locks.is_empty()",
+		"query.for_clause.is_some()",
+		"query.settings.is_some()",
+		"query.format_clause.is_some()",
+		"!query.pipe_operators.is_empty()",
+		"unsupported derived table query body",
+	] {
+		assert!(
+			derived.contains(retained),
+			"derived query gate lost {retained}"
+		);
+	}
+	assert!(exists.contains("query.order_by.is_some()"));
+	assert!(exists.contains("query_has_limit_or_offset"));
+	assert!(derived_select.contains("select.distinct.is_some()"));
+	assert!(derived_select.contains("!select.sort_by.is_empty()"));
+}
+
+#[test]
+pub(crate) fn adr115_derived_lowering_does_not_delegate_to_lower_query() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let derived = adr115_source_block(&planner, "fn lower_derived_table");
+
+	for required in [
+		"validate_derived_query_shape(subquery)?",
+		"validate_derived_select_shape(select)?",
+		"self.lower_select(select)?",
+		"self.apply_order_by_limit_tail(",
+		"alias_plan(plan, Some(alias))",
+	] {
+		assert!(
+			derived.contains(required),
+			"derived lowering lost {required}"
+		);
+	}
+	assert!(!derived.contains("lower_query("));
+}
+
+#[test]
+pub(crate) fn adr115_sort_reuses_existing_ir_and_executor() {
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
+	let execution_ir = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+
+	assert!(ir.contains("Sort {\n\t\tinput: Box<LogicalPlan>"));
+	assert!(execution_ir.contains("Sort {\n\t\tinput: Box<ExecutionPlan>"));
+	assert!(!ir.contains("Limit {\n"));
+	assert!(!execution_ir.contains("Limit {\n"));
+	assert!(exec.contains("fn execute_sort"));
+	assert!(!exec.contains("fn execute_limit"));
+	assert!(planner.contains("LogicalPlan::Sort"));
+}
+
+#[test]
+pub(crate) fn adr115_sort_builders_use_single_partition_exchange() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let rune = std::fs::read_to_string(manifest_dir().join("src/rune_engine.rs"))
+		.expect("read Rune source");
+	let tail = adr115_source_block(&planner, "fn apply_order_by_limit_tail");
+	let rune_sort = adr115_source_block(&rune, "pub fn sort");
+
+	for block in [tail, rune_sort] {
+		assert!(block.contains("LogicalPlan::Sort"));
+		assert!(block.contains("LogicalPlan::Exchange"));
+		assert!(block.contains("partition_count: 1"));
+		assert!(block.contains("key: Vec::new()"));
+	}
+}
+
+#[test]
+pub(crate) fn adr115_global_sort_barrier_is_a_named_primitive() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let fragment_plan = adr115_source_block(&fragment, "pub fn fragment_plan");
+	let aggregate_sort =
+		adr115_source_block(&fragment, "fn is_terminal_sort_over_grouped_aggregate");
+
+	assert!(fragment.contains("fn global_sort_barrier("));
+	assert!(fragment.contains("fn global_sort_barrier_count("));
+	assert!(fragment_plan.contains("global_sort_barrier_count(&plan) > 1"));
+	assert!(fragment_plan.contains("FragmentError::MultipleGlobalSortBarriers"));
+	assert!(aggregate_sort.contains("let barrier = global_sort_barrier(plan)?;"));
+	assert!(fragment.contains("fn terminal_sort_stage("));
+	assert!(fragment.contains("tail: Vec<UnaryPlanTail>"));
+}
+
+#[test]
+pub(crate) fn adr115_multiple_global_sorts_reject_with_pin() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let sort_tests = std::fs::read_to_string(manifest_dir().join("tests/sort_ordering_test.rs"))
+		.expect("read sort tests");
+	let rune_tests =
+		std::fs::read_to_string(manifest_dir().join("tests/rune_relation_handles_test.rs"))
+			.expect("read Rune tests");
+
+	assert!(fragment.contains("multiple global sort barriers are not supported in V1"));
+	assert!(sort_tests.contains("multiple_global_sorts_reject_loudly"));
+	assert!(rune_tests.contains("rune_multiple_global_sorts_reject_loudly"));
+	assert!(sort_tests.contains("FragmentError::MultipleGlobalSortBarriers"));
+	assert!(rune_tests.contains("FragmentError::MultipleGlobalSortBarriers"));
+}
+
+#[test]
+pub(crate) fn adr115_no_merge_sort_or_topk_pushdown() {
+	for path in [
+		"src/distributed/fragment.rs",
+		"src/exec.rs",
+		"src/pbc.rs",
+		"src/storage.rs",
+	] {
+		let source =
+			std::fs::read_to_string(manifest_dir().join(path)).unwrap_or_else(|_| panic!("{path}"));
+		assert!(!source.contains("merge_sort"), "{path} added merge sort");
+		assert!(!source.contains("topk"), "{path} added top-k pushdown");
+		assert!(!source.contains("top_k"), "{path} added top-k pushdown");
+	}
+}
+
+#[test]
+pub(crate) fn adr115_unordered_limit_is_future_take_not_sort() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let rune = std::fs::read_to_string(manifest_dir().join("src/rune_engine.rs"))
+		.expect("read Rune source");
+	let tests = std::fs::read_to_string(manifest_dir().join("tests/sort_ordering_test.rs"))
+		.expect("read sort tests");
+
+	assert!(planner.contains("LIMIT/OFFSET without ORDER BY is not supported"));
+	assert!(rune.contains("LIMIT/OFFSET without ORDER BY is not supported"));
+	assert!(tests.contains("limit_without_order_by_rejects_top_level_and_derived"));
+	assert!(!planner.contains("LogicalPlan::Take"));
+	assert!(!rune.contains("pub fn take"));
+}
+
+fn adr115_source_block(source: &str, marker: &str) -> String {
+	brace_blocks_after_marker(source, marker)
+		.into_iter()
+		.next()
+		.unwrap_or_else(|| panic!("missing source block for {marker}"))
+		.1
 }

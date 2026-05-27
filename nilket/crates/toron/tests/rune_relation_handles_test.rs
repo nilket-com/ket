@@ -9,6 +9,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
+use toron::distributed::budget::{QueryBudget, TaskBudget};
+use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
+use toron::distributed::identity::QueryId;
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
@@ -28,6 +31,13 @@ fn sandbox_config() -> RuneSandboxConfig {
 		wall_timeout: Duration::from_secs(2),
 		..RuneSandboxConfig::v1_default()
 	}
+}
+
+fn fragment_config() -> FragmentPlanConfig {
+	FragmentPlanConfig::new(
+		QueryId::new(),
+		TaskBudget::from_query_budget(QueryBudget::test_default()),
+	)
 }
 
 async fn rune_plan(script: &str) -> Result<LogicalPlan, FrontendError> {
@@ -155,6 +165,112 @@ async fn rune_sql_composition_preserves_existing_pushdown_path() {
 	assert!(
 		scan_pbc(scan).is_some(),
 		"composed filter must reach scan PBC"
+	);
+}
+
+#[tokio::test]
+async fn rune_dataframe_top_k_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .sort([col("amount").desc().nulls_last(), col("id").asc()])
+               .limit(2)
+               .project([col("id"), col("amount")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune dataframe top-k");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(4), Some(2)]);
+	assert_eq!(int32_column_rows(&batches, 1), vec![Some(30), Some(20)]);
+}
+
+#[tokio::test]
+async fn rune_sql_relation_top_k_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT id, amount FROM sales")
+               .sort([desc(col("id"))])
+               .limit(3)
+        }
+    "#,
+	)
+	.await
+	.expect("Rune SQL relation top-k");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int64_column_rows(&batches, 0),
+		vec![Some(6), Some(5), Some(4)]
+	);
+}
+
+#[tokio::test]
+async fn rune_null_ordering_top_k_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .sort([asc(col("amount")).nulls_first()])
+               .limit(2)
+               .project([col("id")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune null ordering top-k");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3), Some(5)]);
+}
+
+#[tokio::test]
+async fn rune_limit_without_sort_rejects() {
+	for script in [
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").limit(1)
+        }
+    "#,
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").offset(1)
+        }
+    "#,
+	] {
+		let error = rune_plan(script)
+			.await
+			.expect_err("Rune limit/offset without sort should reject");
+		assert_frontend_message_contains(error, "LIMIT/OFFSET without ORDER BY is not supported");
+	}
+}
+
+#[tokio::test]
+async fn rune_multiple_global_sorts_reject_loudly() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .sort([col("id").desc()])
+               .limit(3)
+               .sort([col("amount").asc()])
+               .limit(1)
+        }
+    "#,
+	)
+	.await
+	.expect("Rune stacked top-k plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind Rune stacked top-k plan");
+
+	assert_eq!(
+		fragment_plan(bound, fragment_config()).expect_err("multiple barriers should reject"),
+		FragmentError::MultipleGlobalSortBarriers
 	);
 }
 

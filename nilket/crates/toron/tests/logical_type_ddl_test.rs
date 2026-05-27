@@ -1703,7 +1703,6 @@ async fn derived_table_source_scope_rejects_general_subquery_features() {
 		"SELECT id FROM (SELECT id FROM (SELECT id FROM people) AS q) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT people.id FROM people JOIN people AS other ON people.id = other.id) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT id FROM people) AS p JOIN people AS other ON p.id = other.id",
-		"SELECT id FROM (SELECT id FROM people ORDER BY id LIMIT 1) AS p WHERE id < 0",
 		"SELECT id FROM (WITH q AS (SELECT id FROM people) SELECT id FROM q) AS p WHERE id < 0",
 		"SELECT id FROM (SELECT id FROM people UNION SELECT id FROM people) AS p WHERE id < 0",
 	] {

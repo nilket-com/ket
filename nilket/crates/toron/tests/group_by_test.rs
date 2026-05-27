@@ -1479,6 +1479,25 @@ async fn aggregate_derived_having_binds_and_executes() {
 }
 
 #[tokio::test]
+async fn sql_aggregate_derived_top_k_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT bucket, total \
+		 FROM (SELECT region AS bucket, SUM(amount) AS total FROM sales GROUP BY region \
+		       ORDER BY SUM(amount) + 1 DESC LIMIT 2) AS p \
+		 WHERE total > 0",
+	))
+	.await;
+
+	assert_eq!(
+		ordered_region_sum_rows(&results),
+		vec![
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+		]
+	);
+}
+
+#[tokio::test]
 async fn grouped_aggregate_having_order_by_limit_offset_executes() {
 	let results = run_logical(&plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region \
@@ -2704,6 +2723,30 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 }
 
 #[tokio::test]
+async fn derived_grouped_aggregate_top_k_with_outer_filter_fragments_to_terminal_sort_tail() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql(
+		"SELECT bucket, total \
+		 FROM (SELECT region AS bucket, SUM(amount) AS total FROM sales GROUP BY region \
+		       ORDER BY SUM(amount) DESC LIMIT 2) AS p \
+		 WHERE total > 0",
+	);
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind derived ordered aggregate");
+	let stages =
+		fragment_plan(bound, fragment_config()).expect("fragment derived ordered aggregate");
+
+	assert_eq!(stages.len(), 3);
+	let terminal = &stages[2].tasks[0].spec.plan;
+	assert!(
+		!matches!(terminal, ExecutionPlan::Sort { .. }),
+		"outer derived consumers should stay above the terminal sort"
+	);
+	assert!(contains_execution_sort(terminal));
+}
+
+#[tokio::test]
 async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage() {
 	let (catalog, _) = fixture();
 	let logical = plan_sql(
@@ -3323,6 +3366,30 @@ fn scalar_int64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<O
 		}
 	}
 	rows
+}
+
+fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Sort { .. } => true,
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. } => contains_execution_sort(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			contains_execution_sort(left) || contains_execution_sort(right)
+		}
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => false,
+	}
 }
 
 fn sorted_int64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<i64> {

@@ -2,7 +2,7 @@ use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, LogicalPlan, LogicalTypeId,
-	PRODUCT_ID_LOGICAL_TYPE, ScalarValue,
+	PRODUCT_ID_LOGICAL_TYPE, ScalarValue, SortExpr,
 };
 use crate::sql_planner::SqlPlanner;
 use arrow::datatypes::DataType;
@@ -183,6 +183,13 @@ pub struct RuneNamedExpr {
 }
 
 #[derive(Any, Debug, Clone)]
+pub struct RuneSortKey {
+	pub(crate) expr: Expr,
+	pub(crate) descending: bool,
+	pub(crate) nulls_first: bool,
+}
+
+#[derive(Any, Debug, Clone)]
 pub struct RuneWhenThen {
 	pub(crate) condition: Expr,
 	pub(crate) result: Expr,
@@ -255,6 +262,76 @@ impl RuneDataFrame {
 		}
 	}
 
+	pub fn sort(self, order_by: Vec<RuneSortKey>) -> VmResult<Self> {
+		if order_by.is_empty() {
+			return VmResult::panic("ORDER BY requires at least one expression");
+		}
+		let order_by = order_by
+			.into_iter()
+			.map(|key| SortExpr {
+				expr: key.expr,
+				descending: key.descending,
+				nulls_first: key.nulls_first,
+			})
+			.collect();
+		VmResult::Ok(Self {
+			plan: LogicalPlan::Sort {
+				input: Box::new(LogicalPlan::Exchange {
+					input: Box::new(self.plan),
+					partition_count: 1,
+					key: Vec::new(),
+				}),
+				order_by,
+				limit: None,
+				offset: 0,
+			},
+		})
+	}
+
+	pub fn limit(self, limit: i64) -> VmResult<Self> {
+		let Some(limit) = non_negative_usize_arg(limit) else {
+			return VmResult::panic("LIMIT/OFFSET expects a non-negative integer");
+		};
+		match self.plan {
+			LogicalPlan::Sort {
+				input,
+				order_by,
+				offset,
+				..
+			} => VmResult::Ok(Self {
+				plan: LogicalPlan::Sort {
+					input,
+					order_by,
+					limit: Some(limit),
+					offset,
+				},
+			}),
+			_ => VmResult::panic("LIMIT/OFFSET without ORDER BY is not supported"),
+		}
+	}
+
+	pub fn offset(self, offset: i64) -> VmResult<Self> {
+		let Some(offset) = non_negative_usize_arg(offset) else {
+			return VmResult::panic("LIMIT/OFFSET expects a non-negative integer");
+		};
+		match self.plan {
+			LogicalPlan::Sort {
+				input,
+				order_by,
+				limit,
+				..
+			} => VmResult::Ok(Self {
+				plan: LogicalPlan::Sort {
+					input,
+					order_by,
+					limit,
+					offset,
+				},
+			}),
+			_ => VmResult::panic("LIMIT/OFFSET without ORDER BY is not supported"),
+		}
+	}
+
 	pub fn count(self) -> Self {
 		Self {
 			plan: LogicalPlan::Aggregate {
@@ -264,6 +341,10 @@ impl RuneDataFrame {
 			},
 		}
 	}
+}
+
+fn non_negative_usize_arg(value: i64) -> Option<usize> {
+	usize::try_from(value).ok()
 }
 
 #[derive(Any, Debug, Clone)]
@@ -328,6 +409,14 @@ pub fn lit_i64(value: i64) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::Literal(ScalarValue::Int64(Some(value))),
 	}
+}
+
+pub fn asc(expr: RuneExpr) -> RuneSortKey {
+	expr.asc()
+}
+
+pub fn desc(expr: RuneExpr) -> RuneSortKey {
+	expr.desc()
 }
 
 pub fn when(condition: RuneExpr, result: RuneExpr) -> RuneWhenThen {
@@ -451,6 +540,22 @@ pub async fn sandbox_sleep_ms(ms: i64) {
 }
 
 impl RuneExpr {
+	pub fn asc(self) -> RuneSortKey {
+		RuneSortKey {
+			expr: self.expr,
+			descending: false,
+			nulls_first: false,
+		}
+	}
+
+	pub fn desc(self) -> RuneSortKey {
+		RuneSortKey {
+			expr: self.expr,
+			descending: true,
+			nulls_first: false,
+		}
+	}
+
 	pub fn named(self, name: String) -> RuneNamedExpr {
 		RuneNamedExpr {
 			expr: self.expr,
@@ -606,6 +711,18 @@ impl RuneExpr {
 	}
 }
 
+impl RuneSortKey {
+	pub fn nulls_first(mut self) -> Self {
+		self.nulls_first = true;
+		self
+	}
+
+	pub fn nulls_last(mut self) -> Self {
+		self.nulls_first = false;
+		self
+	}
+}
+
 fn build_in_list(expr: Expr, list: Vec<RuneExpr>, negated: bool) -> VmResult<RuneExpr> {
 	if list.is_empty() {
 		return VmResult::panic("IN list must not be empty");
@@ -638,6 +755,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.ty::<RuneDataFrame>()?;
 	m.ty::<RuneExpr>()?;
 	m.ty::<RuneNamedExpr>()?;
+	m.ty::<RuneSortKey>()?;
 	m.ty::<RuneWhenThen>()?;
 	m.ty::<RuneDataType>()?;
 	m.ty::<CustomerId>()?;
@@ -652,6 +770,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lit_f64"], lit_f64).build()?;
 	m.function(["lit_bool"], lit_bool).build()?;
 	m.function(["lit_i64"], lit_i64).build()?;
+	m.function(["asc"], asc).build()?;
+	m.function(["desc"], desc).build()?;
 	m.function(["when"], when).build()?;
 	m.function(["case"], case).build()?;
 	m.function(["type_i32"], type_i32).build()?;
@@ -676,9 +796,14 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("project", RuneDataFrame::project)?;
 	m.associated_function("project_named", RuneDataFrame::project_named)?;
 	m.associated_function("aggregate", RuneDataFrame::aggregate)?;
+	m.associated_function("sort", RuneDataFrame::sort)?;
+	m.associated_function("limit", RuneDataFrame::limit)?;
+	m.associated_function("offset", RuneDataFrame::offset)?;
 	m.associated_function("count", RuneDataFrame::count)?;
 
 	// Expression methods
+	m.associated_function("asc", RuneExpr::asc)?;
+	m.associated_function("desc", RuneExpr::desc)?;
 	m.associated_function("named", RuneExpr::named)?;
 	m.associated_function("gt", RuneExpr::gt)?;
 	m.associated_function("eq", RuneExpr::eq)?;
@@ -711,6 +836,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("not_like", RuneExpr::not_like)?;
 	m.associated_function("ilike", RuneExpr::ilike)?;
 	m.associated_function("not_ilike", RuneExpr::not_ilike)?;
+	m.associated_function("nulls_first", RuneSortKey::nulls_first)?;
+	m.associated_function("nulls_last", RuneSortKey::nulls_last)?;
 
 	Ok(m)
 }

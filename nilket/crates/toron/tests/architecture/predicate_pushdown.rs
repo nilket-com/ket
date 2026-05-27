@@ -1659,8 +1659,6 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 	}
 	for marker in [
 		"query.with.is_some()",
-		"query.order_by.is_some()",
-		"query_has_limit_or_offset",
 		"query.fetch.is_some()",
 		"SetExpr::Select",
 		"unsupported derived table query body",
@@ -1670,6 +1668,8 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 			"missing query-shape marker {marker}"
 		);
 	}
+	assert!(!query_shape.contains("query.order_by.is_some()"));
+	assert!(!query_shape.contains("query_has_limit_or_offset"));
 	for marker in [
 		"projection_contains_window_function",
 		"select.from.len() != 1",
@@ -2117,8 +2117,6 @@ pub(crate) fn adr106_general_derived_source_fences_remain() {
 
 	for marker in [
 		"query.with.is_some()",
-		"query.order_by.is_some()",
-		"query_has_limit_or_offset",
 		"SetExpr::Select",
 		"unsupported derived table query body",
 	] {
@@ -2127,6 +2125,8 @@ pub(crate) fn adr106_general_derived_source_fences_remain() {
 			"missing query-shape fence {marker}"
 		);
 	}
+	assert!(!query_shape.contains("query.order_by.is_some()"));
+	assert!(!query_shape.contains("query_has_limit_or_offset"));
 	for marker in [
 		"projection_contains_window_function",
 		"select.from.len() != 1",

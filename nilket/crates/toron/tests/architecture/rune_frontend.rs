@@ -712,6 +712,52 @@ pub(crate) fn adr082_typed_literal_cut_does_not_expand_operator_surface() {
 }
 
 #[test]
+pub(crate) fn adr115_rune_ordered_topk_surface_registered() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	assert!(rune.contains("pub struct RuneSortKey"));
+	assert!(rune.contains("pub fn sort(self, order_by: Vec<RuneSortKey>)"));
+	assert!(rune.contains("pub fn limit(self, limit: i64)"));
+	assert!(rune.contains("pub fn offset(self, offset: i64)"));
+	assert!(module.contains("m.ty::<RuneSortKey>()?;"));
+	for registered in [
+		"sort",
+		"limit",
+		"offset",
+		"asc",
+		"desc",
+		"nulls_first",
+		"nulls_last",
+	] {
+		assert!(
+			names.iter().any(|name| name == registered),
+			"Rune ordered top-k surface missing `{registered}`: {names:?}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr115_rune_boundaries_are_authorial_not_sql_sugar() {
+	let adr =
+		std::fs::read_to_string(manifest_dir().join("plans/adr/115_composable_ordered_top_k.md"))
+			.expect("read ADR 115");
+	let tests = rune_relation_handles_test_source();
+
+	for doctrine in [
+		"Rune dataframe chains are lazy, but authored operator order is meaningful",
+		"implementation cap, not Rune doctrine",
+		"preserve authored Rune `.sort().limit()` boundaries",
+	] {
+		assert!(adr.contains(doctrine), "ADR 115 lost doctrine: {doctrine}");
+	}
+	assert!(tests.contains("rune_multiple_global_sorts_reject_loudly"));
+	assert!(tests.contains(".sort([col(\"id\").desc()])"));
+	assert!(tests.contains(".sort([col(\"amount\").asc()])"));
+}
+
+#[test]
 pub(crate) fn adr082_typed_literals_do_not_change_ir_binder_executor_or_sandbox() {
 	adr081_rune_frontend_does_not_rewrite_user_source();
 	let rune = rune_engine_source();

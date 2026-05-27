@@ -2452,13 +2452,6 @@ impl SqlPlanner {
 		if !pipe_operators.is_empty() {
 			return Err(unsupported("pipe operators are not supported"));
 		}
-		let limit_offset = lower_limit_clause(limit_clause.as_ref())?;
-		if order_by.is_none() && (limit_offset.limit.is_some() || limit_offset.offset.is_some()) {
-			return Err(unsupported(
-				"LIMIT/OFFSET without ORDER BY is not supported",
-			));
-		}
-
 		let LoweredSelect {
 			plan,
 			aggregate_output_catalog,
@@ -2467,11 +2460,33 @@ impl SqlPlanner {
 			_ => return Err(unsupported("unsupported query body")),
 		};
 
+		self.apply_order_by_limit_tail(
+			plan,
+			aggregate_output_catalog.as_ref(),
+			order_by.as_ref(),
+			limit_clause.as_ref(),
+		)
+	}
+
+	fn apply_order_by_limit_tail(
+		&self,
+		plan: LogicalPlan,
+		aggregate_output_catalog: Option<&AggregateOutputCatalog>,
+		order_by: Option<&OrderBy>,
+		limit_clause: Option<&LimitClause>,
+	) -> Result<LogicalPlan, FrontendError> {
+		let limit_offset = lower_limit_clause(limit_clause)?;
+		if order_by.is_none() && (limit_offset.limit.is_some() || limit_offset.offset.is_some()) {
+			return Err(unsupported(
+				"LIMIT/OFFSET without ORDER BY is not supported",
+			));
+		}
+
 		if let Some(order_by) = order_by {
-			let order_by = self.lower_order_by(order_by, aggregate_output_catalog.as_ref())?;
+			let order_by = self.lower_order_by(order_by, aggregate_output_catalog)?;
 			let (sort_input, order_by, final_projection) =
 				if aggregate_output_catalog.is_some() && sort_needs_hidden_projection(&order_by) {
-					add_hidden_sort_projection(plan, order_by, aggregate_output_catalog.as_ref())?
+					add_hidden_sort_projection(plan, order_by, aggregate_output_catalog)?
 				} else {
 					(plan, order_by, None)
 				};
@@ -3442,7 +3457,16 @@ impl SqlPlanner {
 	) -> Result<LogicalPlan, FrontendError> {
 		let select = validate_derived_query_shape(subquery)?;
 		validate_derived_select_shape(select)?;
-		let LoweredSelect { plan, .. } = self.lower_select(select)?;
+		let LoweredSelect {
+			plan,
+			aggregate_output_catalog,
+		} = self.lower_select(select)?;
+		let plan = self.apply_order_by_limit_tail(
+			plan,
+			aggregate_output_catalog.as_ref(),
+			subquery.order_by.as_ref(),
+			subquery.limit_clause.as_ref(),
+		)?;
 		alias_plan(plan, Some(alias))
 	}
 
@@ -5741,8 +5765,6 @@ fn validate_exists_query_shape(query: &Query) -> Result<(), FrontendError> {
 
 fn validate_derived_query_shape(query: &Query) -> Result<&Select, FrontendError> {
 	if query.with.is_some()
-		|| query.order_by.is_some()
-		|| query_has_limit_or_offset(query.limit_clause.as_ref())
 		|| query.fetch.is_some()
 		|| !query.locks.is_empty()
 		|| query.for_clause.is_some()

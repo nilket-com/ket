@@ -60,6 +60,8 @@ pub enum FragmentError {
 	ZeroPartitionCount,
 	#[error("only one exchange boundary is supported in the seed fragmenter; observed {count}")]
 	MultipleExchangeBoundaries { count: usize },
+	#[error("multiple global sort barriers are not supported in V1")]
+	MultipleGlobalSortBarriers,
 	#[error("exchange input has no scan metadata to anchor a shuffle-input scan")]
 	MissingScanMetadata,
 	#[error("join input must terminate in an explicit exchange")]
@@ -113,6 +115,10 @@ pub fn fragment_plan(
 		return Err(FragmentError::CreateTableAsSelectNotFragmentable);
 	}
 
+	if global_sort_barrier_count(&plan) > 1 {
+		return Err(FragmentError::MultipleGlobalSortBarriers);
+	}
+
 	if contains_join(&plan) {
 		return fragment_join_plan(plan, config);
 	}
@@ -121,8 +127,8 @@ pub fn fragment_plan(
 	if exchange_count == 0 {
 		return Ok(vec![single_task_stage(plan, config)]);
 	}
-	// ADR 015: this exact Sort-over-Aggregate composition has two exchanges;
-	// every other non-join multi-exchange shape still rejects below.
+	// ADR 015/115: grouped aggregate followed by one global sort has two
+	// exchanges; every other non-join multi-exchange shape still rejects below.
 	if let Some(detected) = is_terminal_sort_over_grouped_aggregate(&plan) {
 		return fragment_terminal_sort_over_grouped_aggregate(config, detected);
 	}
@@ -566,6 +572,7 @@ struct TerminalSortGather {
 	limit: Option<usize>,
 	offset: usize,
 	output_schema: SchemaRef,
+	tail: Vec<UnaryPlanTail>,
 }
 
 #[derive(Debug, Clone)]
@@ -581,64 +588,73 @@ struct TerminalSortOverAggregate {
 	terminal_gather: TerminalSortGather,
 }
 
+#[derive(Debug, Clone)]
+struct GlobalSortBarrier {
+	input: ExecutionPlan,
+	order_by: Vec<ExecutionSortKey>,
+	limit: Option<usize>,
+	offset: usize,
+	output_schema: SchemaRef,
+	tail: Vec<UnaryPlanTail>,
+}
+
+#[derive(Debug, Clone)]
+enum UnaryPlanTail {
+	Filter {
+		predicate: BoundExprProgram,
+		disposition: FilterDisposition,
+	},
+	Project {
+		exprs: BoundExprProgram,
+		output_schema: SchemaRef,
+	},
+}
+
+impl UnaryPlanTail {
+	fn apply(self, input: ExecutionPlan) -> ExecutionPlan {
+		match self {
+			Self::Filter {
+				predicate,
+				disposition,
+			} => ExecutionPlan::Filter {
+				input: Box::new(input),
+				predicate,
+				disposition,
+			},
+			Self::Project {
+				exprs,
+				output_schema,
+			} => ExecutionPlan::Project {
+				input: Box::new(input),
+				exprs,
+				output_schema,
+			},
+		}
+	}
+}
+
 fn terminal_sort_gather(plan: &ExecutionPlan) -> Option<TerminalSortGather> {
-	let ExecutionPlan::Sort {
-		input,
-		order_by,
-		limit,
-		offset,
-		output_schema,
-	} = plan
-	else {
-		return None;
-	};
-	let ExecutionPlan::Exchange {
-		input,
-		partition_count,
-		key,
-	} = input.as_ref()
-	else {
-		return None;
-	};
-	if *partition_count != 1 || !key.is_empty_roots() || !contains_join(input) {
+	let barrier = global_sort_barrier(plan)?;
+	if !contains_join(&barrier.input) {
 		return None;
 	}
 
 	Some(TerminalSortGather {
-		input: input.as_ref().clone(),
-		order_by: order_by.clone(),
-		limit: *limit,
-		offset: *offset,
-		output_schema: output_schema.clone(),
+		input: barrier.input,
+		order_by: barrier.order_by,
+		limit: barrier.limit,
+		offset: barrier.offset,
+		output_schema: barrier.output_schema,
+		tail: barrier.tail,
 	})
 }
 
 fn is_terminal_sort_over_grouped_aggregate(
 	plan: &ExecutionPlan,
 ) -> Option<TerminalSortOverAggregate> {
-	let ExecutionPlan::Sort {
-		input,
-		order_by,
-		limit,
-		offset,
-		output_schema,
-	} = plan
-	else {
-		return None;
-	};
-	let ExecutionPlan::Exchange {
-		input,
-		partition_count,
-		key,
-	} = input.as_ref()
-	else {
-		return None;
-	};
-	if *partition_count != 1 || !key.is_empty_roots() {
-		return None;
-	}
-	let gathered_input = input.as_ref().clone();
-	let mut aggregate = input.as_ref();
+	let barrier = global_sort_barrier(plan)?;
+	let gathered_input = barrier.input.clone();
+	let mut aggregate = &barrier.input;
 	let mut projection = None;
 	if let ExecutionPlan::Project {
 		input,
@@ -688,12 +704,72 @@ fn is_terminal_sort_over_grouped_aggregate(
 		projection,
 		terminal_gather: TerminalSortGather {
 			input: gathered_input,
-			order_by: order_by.clone(),
-			limit: *limit,
-			offset: *offset,
-			output_schema: output_schema.clone(),
+			order_by: barrier.order_by,
+			limit: barrier.limit,
+			offset: barrier.offset,
+			output_schema: barrier.output_schema,
+			tail: barrier.tail,
 		},
 	})
+}
+
+fn global_sort_barrier(plan: &ExecutionPlan) -> Option<GlobalSortBarrier> {
+	let mut cursor = plan;
+	let mut tail = Vec::new();
+	loop {
+		match cursor {
+			ExecutionPlan::Filter {
+				input,
+				predicate,
+				disposition,
+			} => {
+				tail.push(UnaryPlanTail::Filter {
+					predicate: predicate.clone(),
+					disposition: *disposition,
+				});
+				cursor = input.as_ref();
+			}
+			ExecutionPlan::Project {
+				input,
+				exprs,
+				output_schema,
+			} => {
+				tail.push(UnaryPlanTail::Project {
+					exprs: exprs.clone(),
+					output_schema: output_schema.clone(),
+				});
+				cursor = input.as_ref();
+			}
+			ExecutionPlan::Sort {
+				input,
+				order_by,
+				limit,
+				offset,
+				output_schema,
+			} => {
+				let ExecutionPlan::Exchange {
+					input,
+					partition_count,
+					key,
+				} = input.as_ref()
+				else {
+					return None;
+				};
+				if *partition_count != 1 || !key.is_empty_roots() {
+					return None;
+				}
+				return Some(GlobalSortBarrier {
+					input: input.as_ref().clone(),
+					order_by: order_by.clone(),
+					limit: *limit,
+					offset: *offset,
+					output_schema: output_schema.clone(),
+					tail,
+				});
+			}
+			_ => return None,
+		}
+	}
 }
 
 fn fragment_terminal_sort_over_grouped_aggregate(
@@ -827,6 +903,11 @@ fn terminal_sort_stage(
 		offset: gather.offset,
 		output_schema: gather.output_schema,
 	};
+	let plan = gather
+		.tail
+		.into_iter()
+		.rev()
+		.fold(sort_plan, |input, tail| tail.apply(input));
 
 	Ok(StagePlan {
 		stage_id,
@@ -840,7 +921,7 @@ fn terminal_sort_stage(
 			),
 			partition: Some(PartitionId::new(0)),
 			context: config.task_context,
-			plan: sort_plan,
+			plan,
 			inputs: vec![TaskInputBinding::ShuffleConsumer {
 				exchange_id,
 				producer_stage_id,
@@ -972,6 +1053,40 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => 0,
+	}
+}
+
+fn global_sort_barrier_count(plan: &ExecutionPlan) -> usize {
+	match plan {
+		ExecutionPlan::Sort { input, .. } => {
+			let here = match input.as_ref() {
+				ExecutionPlan::Exchange {
+					partition_count,
+					key,
+					..
+				} if *partition_count == 1 && key.is_empty_roots() => 1,
+				_ => 0,
+			};
+			here + global_sort_barrier_count(input)
+		}
+		ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. } => global_sort_barrier_count(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			global_sort_barrier_count(left) + global_sort_barrier_count(right)
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
