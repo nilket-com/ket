@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–112 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–113 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -816,6 +816,34 @@ run, 079+).
   pin + the `NOT IN (NULL)` trap gate; operator resolved `CAST(NULL AS LogicalType)` → include, Codex owning the
   impl). Migration: `plans/impl/112_explicit_null_literal.md`.
 
+- **ADR 113 — Aggregate-Output Logical-Identity Preservation.** Promoted. Closes the **last big identity-flow
+  leak** after 087–110 + 112: `aggregate_field` (`binder.rs:5688`) emitted every aggregate output NAKED, so
+  `MIN(customer_id)` dropped `CustomerId`. **Doctrine: selection preserves identity, computation erases it** —
+  `MIN`/`MAX` return an actual element of the input domain → carry its identity; `SUM`/`AVG`/`COUNT`/`COUNT(*)`/
+  `LinearRegress`/`ApproxQuantile` compute a new value (closure isn't a declared logical-type property) → NAKED.
+  Total partition over all 8 `AggregateFunction` variants. **Mechanism:** one binder helper
+  `aggregate_output_logical_type(call, output_type)` reads `call.args.root_logical_type(0)`/`root_type(0)` and
+  preserves under `Min`/`Max` **iff** the output physical exactly equals the input root physical (a defensive
+  mirror of 110's implicit-widening reject; guaranteed by MIN/MAX's `SameAsInput` rule, `aggregate_kernel.rs:82`/
+  `:92`); `aggregate_field` stamps via the existing 089 `field_with_logical_type_metadata` writer (no new
+  emitter). Output physical = input physical ⇒ identity rides with no widening and the **089 round-trip invariant
+  holds** by construction. Computed/cast-erased/naked inputs stay naked automatically (arg root identity is
+  NAKED); `MIN(CAST(customer_id + 0 AS CustomerId))` is the explicit ascription escape. Identity flows downstream
+  (projection / alias / CTAS persist-resync / join-key nominal checks) via the 088/089 decode-reemit loop; group
+  keys already preserved (089 D6). **`SUM` stays naked** — physical sameness ≠ nominal identity, summing IDs is
+  nonsense, and `SumNumeric` widening shows a physical-preservation rule would be partial even before the
+  semantic issue (a declared-additive/"unit" logical-type property is the deferred follow-on for
+  `SUM(Money) → Money`). Retargets
+  `adr089_group_keys_preserve_identity_aggregate_outputs_naked` (→ group keys **and** selector aggregates
+  preserve; computed/cardinality/statistical aggregates stay naked) + the `aggregate_output_stays_naked`
+  behavior test; adds `adr113_min_max_preserve_aggregate_identity` +
+  `adr113_aggregate_kernel_stays_physical_only`. Behavior-additive, Toron-only; **no**
+  IR/executor/PBC/Wendelon/storage/kernel change. Genuine 3-of-3 on the partition; the `SUM`-naked sub-decision
+  was a grounded 2-of-3 (Claude + Codex) that Gemini conceded at iter-2 → unanimous (Codex deferred the topic at
+  iter-0 leaning contextless-NULL, then converged once Claude's selection-vs-computation partition answered the
+  `SUM(CustomerId)` worry; the physical-equality guard + named helper came from the Codex/Gemini iter-2
+  convergence). Migration: `plans/impl/113_aggregate_output_logical_identity.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -899,28 +927,27 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 112 promoted; ADR 113 candidates
+### ADR 113 promoted; ADR 114 candidates
 
-ADR 112 selected and promoted **explicit `NULL` literal** — a transient `Expr::UntypedNull` typed late by the
-binder (designated slots + typed siblings) or rejected, retiring the 109 `Utf8(None)` sentinel; **no
-execution-substrate/PBC/Wendelon change, except `evaluate_in_list` adopting Kleene OR for residual IN-with-NULL
-3VL correctness**. Genuine 3-of-3 on the carrier + context-typed scope (Gemini conceded `ScalarValue::Null`→carrier; Claude conceded
-its comparison/arithmetic deferral on grounding; operator folded `CAST(NULL AS LogicalType)` in — the complete
-explicit-NULL cut, not a granular slice). **Scope each candidate as a complete cut, not a ~100-line granular
-slice** (operator steer — fold adjacent surface in rather than spawning a follow-on ADR per small thing). No
-operator-designated next yet; strongest leads, by theme:
+ADR 113 selected and promoted **aggregate-output logical identity** — `MIN`/`MAX` carry the input column's
+logical identity (selection preserves; computation erases), closing the last big identity-flow leak after the
+087–112 arc; one binder helper + the 089 writer, zero substrate change. Genuine 3-of-3 (the `SUM`-naked
+sub-decision a grounded 2-of-3 Gemini conceded). **Scope each candidate as a complete cut, not a ~100-line
+granular slice** (operator steer — fold adjacent surface in rather than spawning a follow-on ADR per small
+thing). No operator-designated next yet; strongest leads, by theme:
 
-*Conditionals / NULL-arc continuation (108–112 descendants):*
+*Identity / NULL-arc continuation (108–113 descendants):*
 
-- **Contextless `SELECT NULL`** — the one genuine NULL boundary 112 left: a typeless NULL that must survive to
-  execution needs a `DataType::Null` + Arrow `NullArray` projection contract (executor + schema work), not the
-  112 bind-time resolution. A real execution-substrate cut.
-- **`NVL2(a,b,c)`** — the last 109-family conditional sugar straggler (`CASE WHEN a IS NOT NULL THEN b ELSE c`);
-  trivial planner desugar. Small enough to ride along with a larger conditional/NULL cut rather than alone.
+- **Contextless `SELECT NULL` projection substrate** — the strongest remaining semantic cut + the one genuine
+  NULL boundary 112 left: a typeless NULL surviving to execution needs a `DataType::Null` + Arrow `NullArray`
+  projection contract (executor + schema work), not the 112 bind-time resolution. `NVL2(a,b,c)` (the last
+  109-family sugar straggler) can ride along if it stays a pure CASE desugar.
+- **Declared-additive logical types** — the deferred half of 113: a "unit/additive" property so `SUM(Money) →
+  Money` (and `SUM`/`AVG` over closed domains) preserves identity. Needs a logical-type property plus an
+  extension to the `CREATE LOGICAL TYPE` surface; a focused identity follow-on.
 - **Rune `if_else` / simple-CASE shortcuts** — the authoring conveniences 111 D9 deferred (sugar over the
   landed `case`/`when`, no substrate); evidence-gated on real Rune-authoring ergonomics.
-- **Aggregate-output identity** (same nominal-flow theme as 110, for aggregate results); masked/lazy CASE
-  eval (only if 108's eager hard-error exposure bites); far-horizon `OP_CASE` pushdown.
+- masked/lazy CASE eval (only if 108's eager hard-error exposure bites); far-horizon `OP_CASE` pushdown.
 
 *Optimizer tier (105's own named follow-on):*
 
@@ -952,8 +979,7 @@ operator-designated next yet; strongest leads, by theme:
 - **PK/FK-derived identity** — "magic that follows constraints, not names": derive from `PRIMARY
   KEY`, inherit via `REFERENCES`; blocked on FK support (rejected at `sql_planner.rs:663`) + a
   canonical `schema.table.column` identity name.
-- aggregate-output identity semantics; the optional Wendelon-validate-at-authority (090 knob);
-  **`.as_naked()`** Rune helper.
+- optional Wendelon-validate-at-authority (090 knob); **`.as_naked()`** Rune helper.
 
 *Carried Rune leads (still live):*
 
@@ -975,6 +1001,14 @@ operator-designated next yet; strongest leads, by theme:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 112 promoted; ADR 113 candidates (HISTORICAL)
+
+ADR 112 retired the `Utf8(None)` NULL sentinel (transient `Expr::UntypedNull`, typed late). 113 closed the last
+identity-flow leak: `MIN`/`MAX` aggregate outputs now carry the input column's logical identity (selection
+preserves, computation erases — `SUM`/`COUNT`/`AVG`/derived stay naked), via one binder helper + the 089 writer,
+zero substrate change. The `SUM`-naked sub-decision was a grounded 2-of-3 (Gemini conceded its preserve-when-not-
+widened lean). Detail in `plans/adr/113_aggregate_output_logical_identity.md` + the active-line entry above.
 
 ### ADR 111 promoted; ADR 112 candidates (HISTORICAL)
 
