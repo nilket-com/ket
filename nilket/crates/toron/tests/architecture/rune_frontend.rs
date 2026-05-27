@@ -767,9 +767,9 @@ pub(crate) fn adr115_rune_boundaries_are_authorial_not_sql_sugar() {
 	] {
 		assert!(adr.contains(doctrine), "ADR 115 lost doctrine: {doctrine}");
 	}
-	assert!(tests.contains("rune_multiple_global_sorts_reject_loudly"));
+	assert!(tests.contains("rune_top_k_of_top_k_fragments_and_executes"));
 	assert!(tests.contains(".sort([col(\"id\").desc()])"));
-	assert!(tests.contains(".sort([col(\"amount\").asc()])"));
+	assert!(tests.contains(".sort([col(\"id\").asc()])"));
 }
 
 #[test]

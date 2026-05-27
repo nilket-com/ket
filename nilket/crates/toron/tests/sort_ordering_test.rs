@@ -227,20 +227,56 @@ async fn bind_bare_limit_does_not_push_scan_row_limit_below_residual_filter() {
 	assert_eq!(*row_limit, None);
 }
 
-#[tokio::test]
-async fn multiple_global_sorts_reject_loudly() {
-	let (catalog, _) = fixture();
-	let logical = SqlPlanner::new()
-		.plan("SELECT id FROM (SELECT id FROM t ORDER BY id DESC LIMIT 2) AS p ORDER BY id")
-		.expect("plan nested ordered top-k");
-	let bound = bind(&logical, &catalog, &PlannerConfig::default())
-		.await
-		.expect("bind nested ordered top-k");
-
-	assert_eq!(
-		fragment_plan(bound, fragment_config()).expect_err("multiple barriers should reject"),
-		FragmentError::MultipleGlobalSortBarriers
+#[test]
+fn three_global_sort_barriers_allocate_unique_stage_and_exchange_ids() {
+	let bound = ordered_top_k_plan(
+		ordered_top_k_plan(
+			ordered_top_k_plan(scan_plan(TableId(1), 1), true, Some(5)),
+			false,
+			Some(3),
+		),
+		true,
+		Some(2),
 	);
+
+	let stages = fragment_plan(bound, fragment_config()).expect("fragment recursive barriers");
+
+	assert_eq!(stage_ids(&stages), vec![0, 1, 2, 3]);
+	assert!(stages[0].upstream_stages.is_empty());
+	assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
+	assert_eq!(stages[2].upstream_stages, vec![StageId::new(1)]);
+	assert_eq!(stages[3].upstream_stages, vec![StageId::new(2)]);
+	assert_eq!(final_result_task_count(&stages), 1);
+	assert!(matches!(
+		stages[3].tasks[0].spec.output,
+		TaskOutputBinding::FinalResult
+	));
+
+	let mut exchange_ids = stages
+		.iter()
+		.flat_map(|stage| &stage.tasks)
+		.filter_map(|task| match &task.spec.output {
+			TaskOutputBinding::ShuffleProducer {
+				exchange_id,
+				partition_count,
+				partition_key,
+			} => {
+				assert_eq!(*partition_count, PartitionCount::new(1));
+				assert!(partition_key.is_empty_roots());
+				Some(exchange_id.get())
+			}
+			TaskOutputBinding::FinalResult => None,
+		})
+		.collect::<Vec<_>>();
+	exchange_ids.sort_unstable();
+	assert_eq!(exchange_ids, vec![0, 1, 2]);
+
+	for stage_index in 1..stages.len() {
+		assert_single_shuffle_input(
+			&stages[stage_index].tasks[0].spec,
+			stages[stage_index - 1].stage_id,
+		);
+	}
 }
 
 #[tokio::test]
@@ -397,13 +433,13 @@ fn hash_join_ordered_plan_fragments_to_terminal_gather_sort() {
 			exchange_id,
 			partition_count,
 			partition_key,
-		} if *exchange_id == ExchangeId::new(2)
+		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
 	));
 	assert_terminal_sort_task(
 		&stages[3].tasks[0].spec,
-		ExchangeId::new(2),
+		ExchangeId::new(0),
 		StageId::new(2),
 	);
 }
@@ -429,14 +465,33 @@ fn broadcast_join_ordered_plan_fragments_to_terminal_gather_sort() {
 			exchange_id,
 			partition_count,
 			partition_key,
-		} if *exchange_id == ExchangeId::new(1)
+		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
 	));
 	assert_terminal_sort_task(
 		&stages[2].tasks[0].spec,
-		ExchangeId::new(1),
+		ExchangeId::new(0),
 		StageId::new(1),
+	);
+}
+
+#[test]
+fn barrier_inside_hash_join_input_rejects_with_pin() {
+	let left = ExecutionPlan::Exchange {
+		input: Box::new(ordered_top_k_plan(scan_plan(TableId(1), 1), true, Some(1))),
+		partition_count: 2,
+		key: resolved_key_program("key", ColumnOrdinal(0)),
+	};
+	let plan = join_plan(
+		left,
+		exchanged_scan(TableId(2), 2),
+		JoinStrategy::HashPartitioned,
+	);
+
+	assert_eq!(
+		fragment_plan(plan, fragment_config()).expect_err("sort barrier inside join input"),
+		FragmentError::SortBarrierInsideJoinInput
 	);
 }
 
@@ -663,6 +718,29 @@ fn terminal_sort_plan(input: ExecutionPlan) -> ExecutionPlan {
 	}
 }
 
+fn ordered_top_k_plan(
+	input: ExecutionPlan,
+	descending: bool,
+	limit: Option<usize>,
+) -> ExecutionPlan {
+	let schema = input.schema();
+	ExecutionPlan::Sort {
+		input: Box::new(ExecutionPlan::Exchange {
+			input: Box::new(input),
+			partition_count: 1,
+			key: BoundExprProgram::empty(),
+		}),
+		order_by: vec![ExecutionSortKey {
+			ordinal: ColumnOrdinal(0),
+			descending,
+			nulls_first: false,
+		}],
+		limit,
+		offset: 0,
+		output_schema: schema,
+	}
+}
+
 fn project_join_output(input: ExecutionPlan) -> ExecutionPlan {
 	let output_schema = join_output_schema();
 	ExecutionPlan::Project {
@@ -759,6 +837,33 @@ fn append_resolved_key_expr(
 		nullable: false,
 		pbc_eligible: true,
 	})
+}
+
+fn stage_ids(stages: &[toron::distributed::scheduler::StagePlan]) -> Vec<u32> {
+	stages.iter().map(|stage| stage.stage_id.get()).collect()
+}
+
+fn final_result_task_count(stages: &[toron::distributed::scheduler::StagePlan]) -> usize {
+	stages
+		.iter()
+		.flat_map(|stage| &stage.tasks)
+		.filter(|task| matches!(task.spec.output, TaskOutputBinding::FinalResult))
+		.count()
+}
+
+fn assert_single_shuffle_input(
+	spec: &toron::distributed::task::TaskSpec,
+	producer_stage_id: StageId,
+) {
+	assert_eq!(spec.inputs.len(), 1);
+	assert!(matches!(
+		&spec.inputs[0],
+		TaskInputBinding::ShuffleConsumer {
+			producer_stage_id: observed_stage,
+			partition_id,
+			..
+		} if *observed_stage == producer_stage_id && *partition_id == toron::distributed::identity::PartitionId::new(0)
+	));
 }
 
 fn assert_terminal_sort_task(

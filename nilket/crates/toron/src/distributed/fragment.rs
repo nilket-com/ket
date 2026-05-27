@@ -14,8 +14,8 @@ use crate::distributed::task::{
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
-	BoundAggregateCall, BoundExprProgram, ColumnOrdinal, ExecutionPlan, ExecutionSortKey,
-	FilterDisposition, JoinKind, JoinStrategy, QueryProfileHint,
+	BoundExprProgram, ColumnOrdinal, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
+	JoinStrategy, QueryProfileHint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,12 +60,12 @@ pub enum FragmentError {
 	ZeroPartitionCount,
 	#[error("only one exchange boundary is supported in the seed fragmenter; observed {count}")]
 	MultipleExchangeBoundaries { count: usize },
-	#[error("multiple global sort barriers are not supported in V1")]
-	MultipleGlobalSortBarriers,
 	#[error("exchange input has no scan metadata to anchor a shuffle-input scan")]
 	MissingScanMetadata,
 	#[error("join input must terminate in an explicit exchange")]
 	JoinInputNotExchanged,
+	#[error("global sort barriers inside join inputs are not supported")]
+	SortBarrierInsideJoinInput,
 	#[error("broadcast strategy is only supported for INNER joins; observed {kind:?}")]
 	BroadcastNonInner { kind: JoinKind },
 	#[error("broadcast build input must terminate in a single-partition exchange")]
@@ -84,6 +84,81 @@ pub enum FragmentError {
 	InsertSelectNotFragmentable,
 	#[error("CREATE TABLE AS SELECT is a coordinator-only data-plane operation")]
 	CreateTableAsSelectNotFragmentable,
+}
+
+#[derive(Debug, Default)]
+struct FragmentIdAllocator {
+	next_stage: u32,
+	next_exchange: u32,
+}
+
+impl FragmentIdAllocator {
+	fn alloc_stage(&mut self) -> StageId {
+		let id = StageId::new(self.next_stage);
+		self.next_stage = self.next_stage.saturating_add(1);
+		id
+	}
+
+	fn alloc_exchange(&mut self) -> ExchangeId {
+		let id = ExchangeId::new(self.next_exchange);
+		self.next_exchange = self.next_exchange.saturating_add(1);
+		id
+	}
+}
+
+#[derive(Debug, Clone)]
+enum FragmentTerminalOutput {
+	FinalResult,
+	ShuffleProducer {
+		exchange_id: ExchangeId,
+		partition_count: u32,
+		partition_key: BoundExprProgram,
+	},
+}
+
+impl FragmentTerminalOutput {
+	fn task_output(&self) -> TaskOutputBinding {
+		match self {
+			Self::FinalResult => TaskOutputBinding::FinalResult,
+			Self::ShuffleProducer {
+				exchange_id,
+				partition_count,
+				partition_key,
+			} => TaskOutputBinding::ShuffleProducer {
+				exchange_id: *exchange_id,
+				partition_count: PartitionCount::new(*partition_count),
+				partition_key: partition_key.clone(),
+			},
+		}
+	}
+
+	fn wrap_plan(&self, plan: ExecutionPlan) -> ExecutionPlan {
+		match self {
+			Self::FinalResult => plan,
+			Self::ShuffleProducer {
+				partition_count,
+				partition_key,
+				..
+			} => {
+				if matches!(
+					&plan,
+					ExecutionPlan::Exchange {
+						partition_count: existing_partition_count,
+						key,
+						..
+					} if existing_partition_count == partition_count && key == partition_key
+				) {
+					plan
+				} else {
+					ExecutionPlan::Exchange {
+						input: Box::new(plan),
+						partition_count: *partition_count,
+						key: partition_key.clone(),
+					}
+				}
+			}
+		}
+	}
 }
 
 pub fn fragment_plan(
@@ -115,22 +190,66 @@ pub fn fragment_plan(
 		return Err(FragmentError::CreateTableAsSelectNotFragmentable);
 	}
 
-	if global_sort_barrier_count(&plan) > 1 {
-		return Err(FragmentError::MultipleGlobalSortBarriers);
+	let mut allocator = FragmentIdAllocator::default();
+	let (stages, _) = fragment_execution_plan(
+		plan,
+		FragmentTerminalOutput::FinalResult,
+		&mut allocator,
+		config,
+	)?;
+	Ok(stages)
+}
+
+fn fragment_execution_plan(
+	plan: ExecutionPlan,
+	terminal_output: FragmentTerminalOutput,
+	allocator: &mut FragmentIdAllocator,
+	config: FragmentPlanConfig,
+) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
+	if let Some(barrier) = global_sort_barrier(&plan) {
+		let exchange_id = allocator.alloc_exchange();
+		let (mut stages, input_terminal_stage) = fragment_execution_plan(
+			barrier.input.clone(),
+			FragmentTerminalOutput::ShuffleProducer {
+				exchange_id,
+				partition_count: 1,
+				partition_key: BoundExprProgram::empty(),
+			},
+			allocator,
+			config,
+		)?;
+		let sort_stage_id = allocator.alloc_stage();
+		stages.push(global_sort_barrier_stage(
+			config,
+			sort_stage_id,
+			input_terminal_stage,
+			exchange_id,
+			barrier,
+			terminal_output,
+		)?);
+		return Ok((stages, sort_stage_id));
 	}
 
+	fragment_base_plan(plan, terminal_output, allocator, config)
+}
+
+fn fragment_base_plan(
+	plan: ExecutionPlan,
+	terminal_output: FragmentTerminalOutput,
+	allocator: &mut FragmentIdAllocator,
+	config: FragmentPlanConfig,
+) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
 	if contains_join(&plan) {
-		return fragment_join_plan(plan, config);
+		return fragment_join_plan(plan, terminal_output, allocator, config);
 	}
 
 	let exchange_count = count_exchanges(&plan);
 	if exchange_count == 0 {
-		return Ok(vec![single_task_stage(plan, config)]);
-	}
-	// ADR 015/115: grouped aggregate followed by one global sort has two
-	// exchanges; every other non-join multi-exchange shape still rejects below.
-	if let Some(detected) = is_terminal_sort_over_grouped_aggregate(&plan) {
-		return fragment_terminal_sort_over_grouped_aggregate(config, detected);
+		let stage_id = allocator.alloc_stage();
+		return Ok((
+			vec![single_task_stage(plan, terminal_output, stage_id, config)],
+			stage_id,
+		));
 	}
 	if exchange_count > 1 {
 		return Err(FragmentError::MultipleExchangeBoundaries {
@@ -143,13 +262,13 @@ pub fn fragment_plan(
 		return Err(FragmentError::ZeroPartitionCount);
 	}
 
-	let exchange_id = ExchangeId::new(0);
-	let producer_stage_id = StageId::new(0);
-	let consumer_stage_id = StageId::new(1);
+	let exchange_id = allocator.alloc_exchange();
+	let producer_stage_id = allocator.alloc_stage();
+	let consumer_stage_id = allocator.alloc_stage();
 	let scan_metadata =
 		first_scan_metadata(&boundary.input).ok_or(FragmentError::MissingScanMetadata)?;
 	let consumer_scan = shuffle_input_scan(scan_metadata, boundary.input.schema(), exchange_id);
-	let consumer_plan = replace_exchange_with_scan(plan, &consumer_scan);
+	let consumer_plan = terminal_output.wrap_plan(replace_exchange_with_scan(plan, &consumer_scan));
 	let producer_task = TaskPlan::new(TaskSpec {
 		identity: TaskIdentity::new(
 			config.query_id,
@@ -196,14 +315,14 @@ pub fn fragment_plan(
 					partition_id,
 					producer_partitions: Vec::new(),
 				}],
-				output: TaskOutputBinding::FinalResult,
+				output: terminal_output.task_output(),
 				budget: config.task_budget,
 				trace: None,
 			})
 		})
 		.collect();
 
-	Ok(vec![
+	let stages = vec![
 		StagePlan {
 			stage_id: producer_stage_id,
 			upstream_stages: vec![],
@@ -214,27 +333,37 @@ pub fn fragment_plan(
 			upstream_stages: vec![producer_stage_id],
 			tasks: consumer_tasks,
 		},
-	])
+	];
+	Ok((stages, consumer_stage_id))
 }
 
 fn fragment_join_plan(
 	plan: ExecutionPlan,
+	terminal_output: FragmentTerminalOutput,
+	allocator: &mut FragmentIdAllocator,
 	config: FragmentPlanConfig,
-) -> Result<Vec<StagePlan>, FragmentError> {
+) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
 	let join = first_join(&plan).expect("join presence checked");
 	match join.strategy {
-		JoinStrategy::HashPartitioned => fragment_hash_join_plan(plan, join, config),
-		JoinStrategy::Broadcast => fragment_broadcast_join_plan(plan, join, config),
+		JoinStrategy::HashPartitioned => {
+			fragment_hash_join_plan(plan, join, terminal_output, allocator, config)
+		}
+		JoinStrategy::Broadcast => {
+			fragment_broadcast_join_plan(plan, join, terminal_output, allocator, config)
+		}
 	}
 }
 
 fn fragment_hash_join_plan(
 	plan: ExecutionPlan,
 	join: JoinBoundary,
+	terminal_output: FragmentTerminalOutput,
+	allocator: &mut FragmentIdAllocator,
 	config: FragmentPlanConfig,
-) -> Result<Vec<StagePlan>, FragmentError> {
+) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
 	let runtime_filter_enabled =
 		config.runtime_filters_enabled && runtime_filter_join_eligible(&join);
+	reject_sort_barrier_inside_join_inputs(&join)?;
 	let left_boundary = extract_exchange(*join.left)?;
 	let right_boundary = extract_exchange(*join.right)?;
 	if left_boundary.partition_count == 0 || right_boundary.partition_count == 0 {
@@ -244,11 +373,11 @@ fn fragment_hash_join_plan(
 		return Err(FragmentError::JoinInputNotExchanged);
 	}
 
-	let left_exchange_id = ExchangeId::new(0);
-	let right_exchange_id = ExchangeId::new(1);
-	let left_stage_id = StageId::new(0);
-	let right_stage_id = StageId::new(1);
-	let join_stage_id = StageId::new(2);
+	let left_exchange_id = allocator.alloc_exchange();
+	let right_exchange_id = allocator.alloc_exchange();
+	let left_stage_id = allocator.alloc_stage();
+	let right_stage_id = allocator.alloc_stage();
+	let join_stage_id = allocator.alloc_stage();
 	let left_scan_metadata =
 		first_scan_metadata(&left_boundary.input).ok_or(FragmentError::MissingScanMetadata)?;
 	let right_scan_metadata =
@@ -270,33 +399,8 @@ fn fragment_hash_join_plan(
 		strategy: join.strategy,
 		output_schema: join.output_schema,
 	};
-	let terminal_gather = terminal_sort_gather(&plan);
-	let terminal_exchange_id = ExchangeId::new(2);
-	let (consumer_plan, consumer_output, terminal_stage) = if let Some(gather) = terminal_gather {
-		let consumer_plan = replace_first_join(gather.input.clone(), join_replacement);
-		let terminal_stage = terminal_sort_stage(
-			config,
-			StageId::new(3),
-			join_stage_id,
-			terminal_exchange_id,
-			gather,
-		)?;
-		(
-			consumer_plan,
-			TaskOutputBinding::ShuffleProducer {
-				exchange_id: terminal_exchange_id,
-				partition_count: PartitionCount::new(1),
-				partition_key: BoundExprProgram::empty(),
-			},
-			Some(terminal_stage),
-		)
-	} else {
-		(
-			replace_first_join(plan, join_replacement),
-			TaskOutputBinding::FinalResult,
-			None,
-		)
-	};
+	let consumer_plan = terminal_output.wrap_plan(replace_first_join(plan, join_replacement));
+	let consumer_output = terminal_output.task_output();
 	let partition_count = left_boundary.partition_count;
 	let consumer_tasks = (0..partition_count)
 		.map(|partition| {
@@ -332,7 +436,7 @@ fn fragment_hash_join_plan(
 		})
 		.collect();
 
-	let mut stages = vec![
+	let stages = vec![
 		StagePlan {
 			stage_id: left_stage_id,
 			upstream_stages: vec![],
@@ -363,20 +467,20 @@ fn fragment_hash_join_plan(
 			tasks: consumer_tasks,
 		},
 	];
-	if let Some(stage) = terminal_stage {
-		stages.push(stage);
-	}
-	Ok(stages)
+	Ok((stages, join_stage_id))
 }
 
 fn fragment_broadcast_join_plan(
 	plan: ExecutionPlan,
 	join: JoinBoundary,
+	terminal_output: FragmentTerminalOutput,
+	allocator: &mut FragmentIdAllocator,
 	config: FragmentPlanConfig,
-) -> Result<Vec<StagePlan>, FragmentError> {
+) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
 	if join.kind != JoinKind::Inner {
 		return Err(FragmentError::BroadcastNonInner { kind: join.kind });
 	}
+	reject_sort_barrier_inside_join_inputs(&join)?;
 	let build_boundary = extract_exchange(*join.left)?;
 	if build_boundary.partition_count != 1 {
 		return Err(FragmentError::BroadcastBuildNotPublished);
@@ -385,9 +489,9 @@ fn fragment_broadcast_join_plan(
 		return Err(FragmentError::BroadcastBuildNotPublished);
 	}
 
-	let build_exchange_id = ExchangeId::new(0);
-	let build_stage_id = StageId::new(0);
-	let join_stage_id = StageId::new(1);
+	let build_exchange_id = allocator.alloc_exchange();
+	let build_stage_id = allocator.alloc_stage();
+	let join_stage_id = allocator.alloc_stage();
 	let worker_count = config.worker_count.max(1);
 	let build_scan_metadata =
 		first_scan_metadata(&build_boundary.input).ok_or(FragmentError::MissingScanMetadata)?;
@@ -404,33 +508,8 @@ fn fragment_broadcast_join_plan(
 		strategy: join.strategy,
 		output_schema: join.output_schema,
 	};
-	let terminal_gather = terminal_sort_gather(&plan);
-	let terminal_exchange_id = ExchangeId::new(1);
-	let (consumer_plan, consumer_output, terminal_stage) = if let Some(gather) = terminal_gather {
-		let consumer_plan = replace_first_join(gather.input.clone(), join_replacement);
-		let terminal_stage = terminal_sort_stage(
-			config,
-			StageId::new(2),
-			join_stage_id,
-			terminal_exchange_id,
-			gather,
-		)?;
-		(
-			consumer_plan,
-			TaskOutputBinding::ShuffleProducer {
-				exchange_id: terminal_exchange_id,
-				partition_count: PartitionCount::new(1),
-				partition_key: BoundExprProgram::empty(),
-			},
-			Some(terminal_stage),
-		)
-	} else {
-		(
-			replace_first_join(plan, join_replacement),
-			TaskOutputBinding::FinalResult,
-			None,
-		)
-	};
+	let consumer_plan = terminal_output.wrap_plan(replace_first_join(plan, join_replacement));
+	let consumer_output = terminal_output.task_output();
 	let consumer_tasks = (0..worker_count)
 		.map(|worker_index| {
 			TaskPlan::new(TaskSpec {
@@ -465,7 +544,7 @@ fn fragment_broadcast_join_plan(
 		})
 		.collect();
 
-	let mut stages = vec![
+	let stages = vec![
 		StagePlan {
 			stage_id: build_stage_id,
 			upstream_stages: vec![],
@@ -482,10 +561,7 @@ fn fragment_broadcast_join_plan(
 			tasks: consumer_tasks,
 		},
 	];
-	if let Some(stage) = terminal_stage {
-		stages.push(stage);
-	}
-	Ok(stages)
+	Ok((stages, join_stage_id))
 }
 
 fn producer_task(
@@ -522,14 +598,20 @@ fn producer_task(
 	})
 }
 
-fn single_task_stage(plan: ExecutionPlan, config: FragmentPlanConfig) -> StagePlan {
+fn single_task_stage(
+	plan: ExecutionPlan,
+	terminal_output: FragmentTerminalOutput,
+	stage_id: StageId,
+	config: FragmentPlanConfig,
+) -> StagePlan {
+	let plan = terminal_output.wrap_plan(plan);
 	StagePlan {
-		stage_id: StageId::new(0),
+		stage_id,
 		upstream_stages: vec![],
 		tasks: vec![TaskPlan::new(TaskSpec {
 			identity: TaskIdentity::new(
 				config.query_id,
-				StageId::new(0),
+				stage_id,
 				TaskId::new(0),
 				AttemptId::first(),
 			),
@@ -540,7 +622,7 @@ fn single_task_stage(plan: ExecutionPlan, config: FragmentPlanConfig) -> StagePl
 				share: None,
 				runtime_filter: None,
 			}],
-			output: TaskOutputBinding::FinalResult,
+			output: terminal_output.task_output(),
 			budget: config.task_budget,
 			trace: None,
 		})],
@@ -563,29 +645,6 @@ struct JoinBoundary {
 	right_keys: Vec<ColumnOrdinal>,
 	strategy: JoinStrategy,
 	output_schema: SchemaRef,
-}
-
-#[derive(Debug, Clone)]
-struct TerminalSortGather {
-	input: ExecutionPlan,
-	order_by: Vec<ExecutionSortKey>,
-	limit: Option<usize>,
-	offset: usize,
-	output_schema: SchemaRef,
-	tail: Vec<UnaryPlanTail>,
-}
-
-#[derive(Debug, Clone)]
-struct TerminalSortOverAggregate {
-	inner_input: ExecutionPlan,
-	group_partition_count: u32,
-	group_key: BoundExprProgram,
-	group_expr: BoundExprProgram,
-	aggr_expr: Vec<BoundAggregateCall>,
-	aggregate_output_schema: SchemaRef,
-	having: Option<(BoundExprProgram, FilterDisposition)>,
-	projection: Option<(BoundExprProgram, SchemaRef)>,
-	terminal_gather: TerminalSortGather,
 }
 
 #[derive(Debug, Clone)]
@@ -631,86 +690,6 @@ impl UnaryPlanTail {
 			},
 		}
 	}
-}
-
-fn terminal_sort_gather(plan: &ExecutionPlan) -> Option<TerminalSortGather> {
-	let barrier = global_sort_barrier(plan)?;
-	if !contains_join(&barrier.input) {
-		return None;
-	}
-
-	Some(TerminalSortGather {
-		input: barrier.input,
-		order_by: barrier.order_by,
-		limit: barrier.limit,
-		offset: barrier.offset,
-		output_schema: barrier.output_schema,
-		tail: barrier.tail,
-	})
-}
-
-fn is_terminal_sort_over_grouped_aggregate(
-	plan: &ExecutionPlan,
-) -> Option<TerminalSortOverAggregate> {
-	let barrier = global_sort_barrier(plan)?;
-	let gathered_input = barrier.input.clone();
-	let mut aggregate = &barrier.input;
-	let mut projection = None;
-	if let ExecutionPlan::Project {
-		input,
-		exprs,
-		output_schema,
-	} = aggregate
-	{
-		projection = Some((exprs.clone(), output_schema.clone()));
-		aggregate = input.as_ref();
-	}
-	let mut having = None;
-	if let ExecutionPlan::Filter {
-		input,
-		predicate,
-		disposition,
-	} = aggregate
-	{
-		having = Some((predicate.clone(), *disposition));
-		aggregate = input.as_ref();
-	}
-	let ExecutionPlan::Aggregate {
-		input,
-		group_expr,
-		aggr_expr,
-		output_schema: aggregate_output_schema,
-	} = aggregate
-	else {
-		return None;
-	};
-	let ExecutionPlan::Exchange {
-		input,
-		partition_count: group_partition_count,
-		key: group_key,
-	} = input.as_ref()
-	else {
-		return None;
-	};
-
-	Some(TerminalSortOverAggregate {
-		inner_input: input.as_ref().clone(),
-		group_partition_count: *group_partition_count,
-		group_key: group_key.clone(),
-		group_expr: group_expr.clone(),
-		aggr_expr: aggr_expr.clone(),
-		aggregate_output_schema: aggregate_output_schema.clone(),
-		having,
-		projection,
-		terminal_gather: TerminalSortGather {
-			input: gathered_input,
-			order_by: barrier.order_by,
-			limit: barrier.limit,
-			offset: barrier.offset,
-			output_schema: barrier.output_schema,
-			tail: barrier.tail,
-		},
-	})
 }
 
 fn global_sort_barrier(plan: &ExecutionPlan) -> Option<GlobalSortBarrier> {
@@ -772,142 +751,30 @@ fn global_sort_barrier(plan: &ExecutionPlan) -> Option<GlobalSortBarrier> {
 	}
 }
 
-fn fragment_terminal_sort_over_grouped_aggregate(
-	config: FragmentPlanConfig,
-	detected: TerminalSortOverAggregate,
-) -> Result<Vec<StagePlan>, FragmentError> {
-	let TerminalSortOverAggregate {
-		inner_input,
-		group_partition_count,
-		group_key,
-		group_expr,
-		aggr_expr,
-		aggregate_output_schema,
-		having,
-		projection,
-		terminal_gather,
-	} = detected;
-	if group_partition_count == 0 {
-		return Err(FragmentError::ZeroPartitionCount);
-	}
-
-	let producer_stage_id = StageId::new(0);
-	let aggregate_stage_id = StageId::new(1);
-	let sort_stage_id = StageId::new(2);
-	let group_exchange_id = ExchangeId::new(0);
-	let terminal_exchange_id = ExchangeId::new(1);
-	let scan_metadata =
-		first_scan_metadata(&inner_input).ok_or(FragmentError::MissingScanMetadata)?;
-	let input_schema = inner_input.schema();
-	let aggregate_input = shuffle_input_scan(scan_metadata, input_schema, group_exchange_id);
-	let aggregate_plan = ExecutionPlan::Aggregate {
-		input: Box::new(aggregate_input),
-		group_expr,
-		aggr_expr,
-		output_schema: aggregate_output_schema,
-	};
-	let aggregate_plan = if let Some((predicate, disposition)) = having {
-		ExecutionPlan::Filter {
-			input: Box::new(aggregate_plan),
-			predicate,
-			disposition,
-		}
-	} else {
-		aggregate_plan
-	};
-	let aggregate_plan = if let Some((exprs, output_schema)) = projection {
-		ExecutionPlan::Project {
-			input: Box::new(aggregate_plan),
-			exprs,
-			output_schema,
-		}
-	} else {
-		aggregate_plan
-	};
-	let producer_task = producer_task(
-		config,
-		producer_stage_id,
-		group_exchange_id,
-		ExchangeBoundary {
-			input: inner_input,
-			partition_count: group_partition_count,
-			key: group_key,
-		},
-	);
-	let aggregate_tasks = (0..group_partition_count)
-		.map(|partition| {
-			let partition_id = PartitionId::new(partition);
-			TaskPlan::new(TaskSpec {
-				identity: TaskIdentity::new(
-					config.query_id,
-					aggregate_stage_id,
-					TaskId::new(partition),
-					AttemptId::first(),
-				),
-				partition: Some(partition_id),
-				context: config.task_context,
-				plan: aggregate_plan.clone(),
-				inputs: vec![TaskInputBinding::ShuffleConsumer {
-					exchange_id: group_exchange_id,
-					producer_stage_id,
-					partition_id,
-					producer_partitions: Vec::new(),
-				}],
-				output: TaskOutputBinding::ShuffleProducer {
-					exchange_id: terminal_exchange_id,
-					partition_count: PartitionCount::new(1),
-					partition_key: BoundExprProgram::empty(),
-				},
-				budget: config.task_budget,
-				trace: None,
-			})
-		})
-		.collect();
-	let sort_stage = terminal_sort_stage(
-		config,
-		sort_stage_id,
-		aggregate_stage_id,
-		terminal_exchange_id,
-		terminal_gather,
-	)?;
-
-	Ok(vec![
-		StagePlan {
-			stage_id: producer_stage_id,
-			upstream_stages: vec![],
-			tasks: vec![producer_task],
-		},
-		StagePlan {
-			stage_id: aggregate_stage_id,
-			upstream_stages: vec![producer_stage_id],
-			tasks: aggregate_tasks,
-		},
-		sort_stage,
-	])
-}
-
-fn terminal_sort_stage(
+fn global_sort_barrier_stage(
 	config: FragmentPlanConfig,
 	stage_id: StageId,
 	producer_stage_id: StageId,
 	exchange_id: ExchangeId,
-	gather: TerminalSortGather,
+	barrier: GlobalSortBarrier,
+	terminal_output: FragmentTerminalOutput,
 ) -> Result<StagePlan, FragmentError> {
 	let scan_metadata =
-		first_scan_metadata(&gather.input).ok_or(FragmentError::MissingScanMetadata)?;
-	let input_schema = gather.input.schema();
+		first_scan_metadata(&barrier.input).ok_or(FragmentError::MissingScanMetadata)?;
+	let input_schema = barrier.input.schema();
 	let sort_plan = ExecutionPlan::Sort {
 		input: Box::new(shuffle_input_scan(scan_metadata, input_schema, exchange_id)),
-		order_by: gather.order_by,
-		limit: gather.limit,
-		offset: gather.offset,
-		output_schema: gather.output_schema,
+		order_by: barrier.order_by,
+		limit: barrier.limit,
+		offset: barrier.offset,
+		output_schema: barrier.output_schema,
 	};
-	let plan = gather
+	let plan = barrier
 		.tail
 		.into_iter()
 		.rev()
 		.fold(sort_plan, |input, tail| tail.apply(input));
+	let plan = terminal_output.wrap_plan(plan);
 
 	Ok(StagePlan {
 		stage_id,
@@ -928,11 +795,20 @@ fn terminal_sort_stage(
 				partition_id: PartitionId::new(0),
 				producer_partitions: Vec::new(),
 			}],
-			output: TaskOutputBinding::FinalResult,
+			output: terminal_output.task_output(),
 			budget: config.task_budget,
 			trace: None,
 		})],
 	})
+}
+
+fn reject_sort_barrier_inside_join_inputs(join: &JoinBoundary) -> Result<(), FragmentError> {
+	if global_sort_barrier_count(join.left.as_ref()) > 0
+		|| global_sort_barrier_count(join.right.as_ref()) > 0
+	{
+		return Err(FragmentError::SortBarrierInsideJoinInput);
+	}
+	Ok(())
 }
 
 fn runtime_filter_join_eligible(join: &JoinBoundary) -> bool {

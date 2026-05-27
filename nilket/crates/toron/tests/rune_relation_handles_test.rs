@@ -10,7 +10,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::distributed::budget::{QueryBudget, TaskBudget};
-use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
+use toron::distributed::fragment::{FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::QueryId;
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
@@ -285,15 +285,15 @@ async fn rune_take_is_unordered_and_chainable() {
 }
 
 #[tokio::test]
-async fn rune_multiple_global_sorts_reject_loudly() {
+async fn rune_top_k_of_top_k_fragments_and_executes() {
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
             ctx.table("sales")
                .sort([col("id").desc()])
-               .limit(3)
-               .sort([col("amount").asc()])
-               .limit(1)
+               .limit(4)
+               .sort([col("id").asc()])
+               .limit(2)
         }
     "#,
 	)
@@ -303,9 +303,32 @@ async fn rune_multiple_global_sorts_reject_loudly() {
 		.await
 		.expect("bind Rune stacked top-k plan");
 
+	let stages = fragment_plan(bound, fragment_config()).expect("fragment stacked top-k plan");
+	assert_eq!(stages.len(), 3);
+	assert!(matches!(
+		stages[0].tasks[0].spec.output,
+		toron::distributed::task::TaskOutputBinding::ShuffleProducer { .. }
+	));
+	assert!(matches!(
+		stages[1].tasks[0].spec.output,
+		toron::distributed::task::TaskOutputBinding::ShuffleProducer { .. }
+	));
+	assert!(matches!(
+		stages[2].tasks[0].spec.output,
+		toron::distributed::task::TaskOutputBinding::FinalResult
+	));
+
+	let batches = execute_logical(&logical)
+		.await
+		.expect("execute Rune stacked top-k plan");
+	let ids = batches[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("id column");
 	assert_eq!(
-		fragment_plan(bound, fragment_config()).expect_err("multiple barriers should reject"),
-		FragmentError::MultipleGlobalSortBarriers
+		(0..ids.len()).map(|row| ids.value(row)).collect::<Vec<_>>(),
+		vec![3, 4]
 	);
 }
 

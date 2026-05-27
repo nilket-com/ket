@@ -253,7 +253,7 @@ pub(crate) fn adr029_executor_and_fragmenter_reject_create_table() {
 	assert!(fragment_plan.contains("ExecutionPlan::CreateTable"));
 	assert!(
 		fragment_plan.find("ExecutionPlan::CreateTable").unwrap()
-			< fragment_plan.find("count_exchanges").unwrap()
+			< fragment_plan.find("fragment_execution_plan").unwrap()
 	);
 }
 
@@ -614,12 +614,12 @@ pub(crate) fn adr033_fragmenter_rejects_before_join_or_exchange() {
 	assert!(
 		fragment_plan
 			.find("ExecutionPlan::CreateTableAsSelect")
-			.unwrap() < fragment_plan.find("contains_join").unwrap()
+			.unwrap() < fragment_plan.find("fragment_execution_plan").unwrap()
 	);
 	assert!(
 		fragment_plan
 			.find("ExecutionPlan::CreateTableAsSelect")
-			.unwrap() < fragment_plan.find("count_exchanges").unwrap()
+			.unwrap() < fragment_plan.find("fragment_execution_plan").unwrap()
 	);
 }
 
@@ -974,11 +974,11 @@ pub(crate) fn adr034_executor_and_fragmenter_reject_drop_table() {
 	assert!(fragment_plan.contains("ExecutionPlan::DropTable"));
 	assert!(
 		fragment_plan.find("ExecutionPlan::DropTable").unwrap()
-			< fragment_plan.find("contains_join").unwrap()
+			< fragment_plan.find("fragment_execution_plan").unwrap()
 	);
 	assert!(
 		fragment_plan.find("ExecutionPlan::DropTable").unwrap()
-			< fragment_plan.find("count_exchanges").unwrap()
+			< fragment_plan.find("fragment_execution_plan").unwrap()
 	);
 }
 

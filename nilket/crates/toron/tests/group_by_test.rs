@@ -8,7 +8,7 @@ use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::distributed::budget::{QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
-use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
+use toron::distributed::fragment::{FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::{ExchangeId, QueryId, StageId};
 use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBinding};
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
@@ -2667,33 +2667,38 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 			exchange_id,
 			partition_count,
 			partition_key,
-		} if *exchange_id == ExchangeId::new(0)
+		} if *exchange_id == ExchangeId::new(1)
 			&& *partition_count == PartitionCount::new(4)
 			&& partition_key.root_count() == 1
 	));
 	assert_eq!(stages[1].tasks.len(), 4);
 	for (partition, task) in stages[1].tasks.iter().enumerate() {
-		assert!(matches!(task.spec.plan, ExecutionPlan::Aggregate { .. }));
 		assert!(matches!(
-			&task.spec.inputs[0],
-			TaskInputBinding::ShuffleConsumer {
-				exchange_id,
-				producer_stage_id,
-				partition_id,
-				..
-			} if *exchange_id == ExchangeId::new(0)
-				&& *producer_stage_id == StageId::new(0)
-				&& partition_id.0 == u32::try_from(partition).unwrap()
+			task.spec.plan,
+			ExecutionPlan::Exchange { ref input, partition_count: 1, ref key }
+				if key.is_empty_roots()
+					&& matches!(input.as_ref(), ExecutionPlan::Aggregate { .. })
 		));
 		assert!(matches!(
-			&task.spec.output,
-			TaskOutputBinding::ShuffleProducer {
-				exchange_id,
-				partition_count,
-				partition_key,
-			} if *exchange_id == ExchangeId::new(1)
-				&& *partition_count == PartitionCount::new(1)
-				&& partition_key.is_empty_roots()
+				&task.spec.inputs[0],
+				TaskInputBinding::ShuffleConsumer {
+					exchange_id,
+					producer_stage_id,
+					partition_id,
+					..
+				} if *exchange_id == ExchangeId::new(1)
+					&& *producer_stage_id == StageId::new(0)
+					&& partition_id.0 == u32::try_from(partition).unwrap()
+		));
+		assert!(matches!(
+				&task.spec.output,
+				TaskOutputBinding::ShuffleProducer {
+					exchange_id,
+					partition_count,
+					partition_key,
+				} if *exchange_id == ExchangeId::new(0)
+					&& *partition_count == PartitionCount::new(1)
+					&& partition_key.is_empty_roots()
 		));
 	}
 
@@ -2707,7 +2712,7 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 			producer_stage_id,
 			partition_id,
 			..
-		} if *exchange_id == ExchangeId::new(1)
+		} if *exchange_id == ExchangeId::new(0)
 			&& *producer_stage_id == StageId::new(1)
 			&& partition_id.0 == 0
 	));
@@ -2768,18 +2773,23 @@ async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage
 	for task in &stages[1].tasks {
 		assert!(matches!(
 			task.spec.plan,
-			ExecutionPlan::Filter { ref input, .. }
-				if matches!(input.as_ref(), ExecutionPlan::Aggregate { .. })
+			ExecutionPlan::Exchange { ref input, partition_count: 1, ref key }
+				if key.is_empty_roots()
+					&& matches!(
+						input.as_ref(),
+						ExecutionPlan::Filter { input, .. }
+							if matches!(input.as_ref(), ExecutionPlan::Aggregate { .. })
+					)
 		));
 		assert!(matches!(
-			&task.spec.output,
-			TaskOutputBinding::ShuffleProducer {
-				exchange_id,
-				partition_count,
-				partition_key,
-			} if *exchange_id == ExchangeId::new(1)
-				&& *partition_count == PartitionCount::new(1)
-				&& partition_key.is_empty_roots()
+				&task.spec.output,
+				TaskOutputBinding::ShuffleProducer {
+					exchange_id,
+					partition_count,
+					partition_key,
+				} if *exchange_id == ExchangeId::new(0)
+					&& *partition_count == PartitionCount::new(1)
+					&& partition_key.is_empty_roots()
 		));
 	}
 	assert!(matches!(
@@ -2883,7 +2893,7 @@ async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
 }
 
 #[tokio::test]
-async fn non_aggregate_two_exchange_terminal_sort_still_rejects() {
+async fn non_aggregate_two_exchange_terminal_sort_fragments_recursively() {
 	let (catalog, _) = fixture();
 	let bound = bind(
 		&project_between_exchanges_sort_plan(),
@@ -2893,14 +2903,13 @@ async fn non_aggregate_two_exchange_terminal_sort_still_rejects() {
 	.await
 	.expect("bind non-aggregate two-exchange sort");
 
-	assert_eq!(
-		fragment_plan(bound, fragment_config()).expect_err("two exchanges should reject"),
-		FragmentError::MultipleExchangeBoundaries { count: 2 }
-	);
+	let stages = fragment_plan(bound, fragment_config()).expect("fragment recursive sort");
+
+	assert_two_exchange_terminal_sort_fragments(&stages);
 }
 
 #[tokio::test]
-async fn filter_without_aggregate_between_terminal_exchanges_still_rejects() {
+async fn filter_without_aggregate_between_terminal_exchanges_fragments_recursively() {
 	let (catalog, _) = fixture();
 	let bound = bind(
 		&filter_without_aggregate_between_exchanges_sort_plan(),
@@ -2910,10 +2919,45 @@ async fn filter_without_aggregate_between_terminal_exchanges_still_rejects() {
 	.await
 	.expect("bind non-aggregate filtered two-exchange sort");
 
-	assert_eq!(
-		fragment_plan(bound, fragment_config()).expect_err("two exchanges should reject"),
-		FragmentError::MultipleExchangeBoundaries { count: 2 }
-	);
+	let stages = fragment_plan(bound, fragment_config()).expect("fragment recursive sort");
+
+	assert_two_exchange_terminal_sort_fragments(&stages);
+}
+
+fn assert_two_exchange_terminal_sort_fragments(
+	stages: &[toron::distributed::scheduler::StagePlan],
+) {
+	assert_eq!(stages.len(), 3);
+	assert!(stages[0].upstream_stages.is_empty());
+	assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
+	assert_eq!(stages[2].upstream_stages, vec![StageId::new(1)]);
+	assert!(matches!(
+		&stages[0].tasks[0].spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count,
+			..
+		} if *exchange_id == ExchangeId::new(1)
+			&& *partition_count == PartitionCount::new(4)
+	));
+	assert!(matches!(
+		&stages[1].tasks[0].spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count,
+			partition_key,
+		} if *exchange_id == ExchangeId::new(0)
+			&& *partition_count == PartitionCount::new(1)
+			&& partition_key.is_empty_roots()
+	));
+	assert!(matches!(
+		&stages[2].tasks[0].spec.output,
+		TaskOutputBinding::FinalResult
+	));
+	assert!(matches!(
+		&stages[2].tasks[0].spec.plan,
+		ExecutionPlan::Sort { .. }
+	));
 }
 
 async fn run_logical(logical: &LogicalPlan) -> Vec<RecordBatch> {

@@ -80,30 +80,22 @@ pub(crate) fn adr015_grouped_aggregate_ordering_guards_are_narrow() {
 
 	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter source");
-	let detector_index = fragmenter
-		.find("is_terminal_sort_over_grouped_aggregate(&plan)")
-		.expect("ADR 015 detector call");
+	let recursive_split_index = fragmenter
+		.find("if let Some(barrier) = global_sort_barrier(&plan)")
+		.expect("ADR 117 recursive sort barrier split");
 	let reject_index = fragmenter
 		.find("FragmentError::MultipleExchangeBoundaries")
 		.expect("multi-exchange reject");
 	assert!(
-		detector_index < reject_index,
-		"ADR 015 detector must stay before the generic multi-exchange reject"
+		recursive_split_index < reject_index,
+		"global sort barriers must split recursively before the generic multi-exchange reject"
 	);
 
-	let detector = fragmenter
-		.split("fn is_terminal_sort_over_grouped_aggregate")
-		.nth(1)
-		.and_then(|rest| {
-			rest.split("fn fragment_terminal_sort_over_grouped_aggregate")
-				.next()
-		})
-		.expect("ADR 015 detector block");
-	assert!(detector.contains("ExecutionPlan::Sort"));
-	assert!(detector.contains("ExecutionPlan::Exchange"));
-	assert!(detector.contains("ExecutionPlan::Aggregate"));
-	assert!(detector.contains("*partition_count != 1 || !key.is_empty_roots()"));
-	assert!(detector.contains("partition_count: group_partition_count"));
+	let recursive_split = adr115_source_block(&fragmenter, "fn fragment_execution_plan");
+	assert!(recursive_split.contains("global_sort_barrier(&plan)"));
+	assert!(recursive_split.contains("FragmentTerminalOutput::ShuffleProducer"));
+	assert!(recursive_split.contains("partition_count: 1"));
+	assert!(recursive_split.contains("BoundExprProgram::empty()"));
 	assert!(fragmenter.contains("if exchange_count > 1"));
 }
 
@@ -194,17 +186,11 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 
 	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter source");
-	let detector = fragmenter
-		.split("fn is_terminal_sort_over_grouped_aggregate")
-		.nth(1)
-		.and_then(|rest| {
-			rest.split("fn fragment_terminal_sort_over_grouped_aggregate")
-				.next()
-		})
-		.expect("ADR 016 detector block");
-	assert!(detector.contains("ExecutionPlan::Filter"));
-	assert!(detector.contains("ExecutionPlan::Aggregate"));
-	assert!(detector.contains("having = Some"));
+	let global_barrier = adr115_source_block(&fragmenter, "fn global_sort_barrier");
+	let base_fragment = adr115_source_block(&fragmenter, "fn fragment_base_plan");
+	assert!(global_barrier.contains("UnaryPlanTail::Filter"));
+	assert!(base_fragment.contains("terminal_output.wrap_plan"));
+	assert!(base_fragment.contains("replace_exchange_with_scan"));
 
 	let exec =
 		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
@@ -336,23 +322,13 @@ pub(crate) fn adr023_post_aggregate_projection_guards_are_narrow() {
 
 	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter source");
-	let detector = fragmenter
-		.split("fn is_terminal_sort_over_grouped_aggregate")
-		.nth(1)
-		.and_then(|rest| {
-			rest.split("fn fragment_terminal_sort_over_grouped_aggregate")
-				.next()
-		})
-		.expect("ADR 023 detector block");
-	let project_index = detector
-		.find("ExecutionPlan::Project")
-		.expect("detector peels Project");
-	let filter_index = detector
-		.find("ExecutionPlan::Filter")
-		.expect("detector peels Filter");
+	let barrier = adr115_source_block(&fragmenter, "fn global_sort_barrier");
+	let barrier_stage = adr115_source_block(&fragmenter, "fn global_sort_barrier_stage");
+	assert!(barrier.contains("UnaryPlanTail::Project"));
+	assert!(barrier.contains("UnaryPlanTail::Filter"));
 	assert!(
-		project_index < filter_index,
-		"terminal sort detector must peel Project before Filter"
+		barrier_stage.contains(".rev()"),
+		"terminal sort tail must be reapplied in original order"
 	);
 }
 
@@ -2289,21 +2265,20 @@ pub(crate) fn adr115_sort_builders_use_single_partition_exchange() {
 pub(crate) fn adr115_global_sort_barrier_is_a_named_primitive() {
 	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter source");
-	let fragment_plan = adr115_source_block(&fragment, "pub fn fragment_plan");
-	let aggregate_sort =
-		adr115_source_block(&fragment, "fn is_terminal_sort_over_grouped_aggregate");
+	let recursive_split = adr115_source_block(&fragment, "fn fragment_execution_plan");
+	let barrier_stage = adr115_source_block(&fragment, "fn global_sort_barrier_stage");
 
 	assert!(fragment.contains("fn global_sort_barrier("));
 	assert!(fragment.contains("fn global_sort_barrier_count("));
-	assert!(fragment_plan.contains("global_sort_barrier_count(&plan) > 1"));
-	assert!(fragment_plan.contains("FragmentError::MultipleGlobalSortBarriers"));
-	assert!(aggregate_sort.contains("let barrier = global_sort_barrier(plan)?;"));
-	assert!(fragment.contains("fn terminal_sort_stage("));
+	assert!(recursive_split.contains("if let Some(barrier) = global_sort_barrier(&plan)"));
+	assert!(recursive_split.contains("fragment_execution_plan("));
+	assert!(recursive_split.contains("global_sort_barrier_stage("));
+	assert!(barrier_stage.contains(".tail"));
 	assert!(fragment.contains("tail: Vec<UnaryPlanTail>"));
 }
 
 #[test]
-pub(crate) fn adr115_multiple_global_sorts_reject_with_pin() {
+pub(crate) fn adr117_multiple_global_sorts_split_recursively() {
 	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter source");
 	let sort_tests = std::fs::read_to_string(manifest_dir().join("tests/sort_ordering_test.rs"))
@@ -2311,12 +2286,86 @@ pub(crate) fn adr115_multiple_global_sorts_reject_with_pin() {
 	let rune_tests =
 		std::fs::read_to_string(manifest_dir().join("tests/rune_relation_handles_test.rs"))
 			.expect("read Rune tests");
+	let distributed_tests =
+		std::fs::read_to_string(manifest_dir().join("tests/distributed_process_test.rs"))
+			.expect("read distributed process tests");
+	let recursive_split = adr115_source_block(&fragment, "fn fragment_execution_plan");
 
-	assert!(fragment.contains("multiple global sort barriers are not supported in V1"));
-	assert!(sort_tests.contains("multiple_global_sorts_reject_loudly"));
-	assert!(rune_tests.contains("rune_multiple_global_sorts_reject_loudly"));
-	assert!(sort_tests.contains("FragmentError::MultipleGlobalSortBarriers"));
-	assert!(rune_tests.contains("FragmentError::MultipleGlobalSortBarriers"));
+	assert!(!fragment.contains("multiple global sort barriers are not supported in V1"));
+	assert!(!fragment.contains("FragmentError::MultipleGlobalSortBarriers"));
+	assert!(recursive_split.contains("if let Some(barrier) = global_sort_barrier(&plan)"));
+	assert!(recursive_split.contains("FragmentTerminalOutput::ShuffleProducer"));
+	assert!(
+		sort_tests.contains("three_global_sort_barriers_allocate_unique_stage_and_exchange_ids")
+	);
+	assert!(rune_tests.contains("rune_top_k_of_top_k_fragments_and_executes"));
+	assert!(
+		distributed_tests.contains("multiple_ordered_top_k_process_query_preserves_inner_barrier")
+	);
+	assert!(!sort_tests.contains("MultipleGlobalSortBarriers"));
+	assert!(!rune_tests.contains("MultipleGlobalSortBarriers"));
+}
+
+#[test]
+pub(crate) fn adr117_terminal_output_is_explicit() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let terminal_output = adr115_source_block(&fragment, "enum FragmentTerminalOutput");
+	let wrap_plan = adr115_source_block(&fragment, "fn wrap_plan");
+	let barrier_stage = adr115_source_block(&fragment, "fn global_sort_barrier_stage");
+
+	assert!(terminal_output.contains("FinalResult"));
+	assert!(terminal_output.contains("ShuffleProducer"));
+	assert!(terminal_output.contains("exchange_id: ExchangeId"));
+	assert!(terminal_output.contains("partition_key: BoundExprProgram"));
+	assert!(wrap_plan.contains("ExecutionPlan::Exchange"));
+	assert!(barrier_stage.contains("terminal_output.wrap_plan"));
+	assert!(barrier_stage.contains("terminal_output.task_output"));
+}
+
+#[test]
+pub(crate) fn adr117_fragment_ids_are_allocated_not_fixed() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let production = fragment
+		.split("#[cfg(test)]")
+		.next()
+		.expect("fragment production source");
+
+	assert!(production.contains("struct FragmentIdAllocator"));
+	assert!(production.contains("fn alloc_stage"));
+	assert!(production.contains("fn alloc_exchange"));
+	assert!(production.contains("allocator.alloc_stage()"));
+	assert!(production.contains("allocator.alloc_exchange()"));
+	assert!(!production.contains("StageId::new(0)"));
+	assert!(!production.contains("ExchangeId::new(0)"));
+}
+
+#[test]
+pub(crate) fn adr117_no_barrier_inside_join_inputs() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let join_fragment = adr115_source_block(&fragment, "fn fragment_hash_join_plan");
+
+	assert!(fragment.contains("SortBarrierInsideJoinInput"));
+	assert!(fragment.contains("fn reject_sort_barrier_inside_join_inputs"));
+	assert!(join_fragment.contains("reject_sort_barrier_inside_join_inputs(&join)?"));
+	assert!(join_fragment.contains("extract_exchange(*join.left)?"));
+	assert!(join_fragment.contains("extract_exchange(*join.right)?"));
+	assert!(!join_fragment.contains("global_sort_barrier"));
+}
+
+#[test]
+pub(crate) fn adr117_take_is_not_a_sort_barrier() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let barrier = adr115_source_block(&fragment, "fn global_sort_barrier");
+	let count = adr115_source_block(&fragment, "fn global_sort_barrier_count");
+
+	assert!(!barrier.contains("ExecutionPlan::Take"));
+	assert!(
+		count.contains("ExecutionPlan::Take { input, .. } => global_sort_barrier_count(input)")
+	);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use arrow::array::Int64Array;
+use arrow::array::{Int32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::collections::{HashMap, HashSet};
@@ -22,7 +22,7 @@ use toron::distributed::worker_registry::{
 	WorkerEntry, WorkerLease, WorkerRegistry, WorkerResourceState, WorkerStatus,
 };
 use toron::ir::{
-	AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, LogicalPlan, TableId,
+	AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, LogicalPlan, SortExpr, TableId,
 };
 use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
@@ -333,6 +333,49 @@ async fn grouped_aggregate_sql_matches_hand_built_aggregate_over_processes() {
 	assert_eq!(grouped_sql.total_count, 16);
 	assert_eq!(grouped_sql.total_count, hand_built.total_count);
 	assert_eq!(grouped_sql.digest, hand_built.digest);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_ordered_top_k_process_query_preserves_inner_barrier() {
+	let mut workers = [
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(1_410)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(1_411)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(workers.iter().map(worker_entry), 0));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry,
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = logical_ordered_top_k(
+		logical_ordered_top_k(fixture_scan_plan(), true, Some(10)),
+		false,
+		Some(3),
+	);
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("nested ordered top-k query");
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	assert_eq!(results.len(), 1);
+	let values = results[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("val column");
+	assert_eq!(
+		(0..values.len())
+			.map(|row| values.value(row))
+			.collect::<Vec<_>>(),
+		vec![6, 7, 8]
+	);
 }
 
 #[tokio::test]
@@ -1533,6 +1576,34 @@ fn group_count_after_exchange_plan() -> LogicalPlan {
 				projection: None,
 			}),
 		}),
+	}
+}
+
+fn fixture_scan_plan() -> LogicalPlan {
+	LogicalPlan::Scan {
+		table: TableId(1),
+		projection: None,
+	}
+}
+
+fn logical_ordered_top_k(
+	input: LogicalPlan,
+	descending: bool,
+	limit: Option<usize>,
+) -> LogicalPlan {
+	LogicalPlan::Sort {
+		input: Box::new(LogicalPlan::Exchange {
+			partition_count: 1,
+			key: Vec::new(),
+			input: Box::new(input),
+		}),
+		order_by: vec![SortExpr {
+			expr: Expr::column("val"),
+			descending,
+			nulls_first: false,
+		}],
+		limit,
+		offset: 0,
 	}
 }
 

@@ -405,7 +405,7 @@ pub(crate) fn adr030_executor_and_fragmenter_reject_insert() {
 	assert!(fragment_plan.contains("ExecutionPlan::Insert"));
 	assert!(
 		fragment_plan.find("ExecutionPlan::Insert").unwrap()
-			< fragment_plan.find("count_exchanges").unwrap()
+			< fragment_plan.find("fragment_execution_plan").unwrap()
 	);
 }
 
@@ -680,7 +680,7 @@ pub(crate) fn adr032_fragmenter_rejects_before_join_or_exchange() {
 	assert!(fragment_plan.contains("ExecutionPlan::InsertSelect"));
 	assert!(
 		fragment_plan.find("ExecutionPlan::InsertSelect").unwrap()
-			< fragment_plan.find("count_exchanges").unwrap()
+			< fragment_plan.find("fragment_execution_plan").unwrap()
 	);
 }
 
@@ -1218,8 +1218,7 @@ pub(crate) fn adr036_fragmenter_delete_defensive_reject() {
 		.expect("fragmenter DELETE reject");
 
 	assert!(fragmenter.contains("DeleteNotFragmentable"));
-	assert!(delete_reject < fragment_plan.find("contains_join").unwrap());
-	assert!(delete_reject < fragment_plan.find("count_exchanges").unwrap());
+	assert!(delete_reject < fragment_plan.find("fragment_execution_plan").unwrap());
 }
 
 #[test]
