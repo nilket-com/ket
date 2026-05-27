@@ -157,6 +157,36 @@ pub(crate) fn adr087_nominal_in_list_gate_reuses_shared_helper() {
 }
 
 #[test]
+pub(crate) fn adr110_case_preserves_compatible_logical_identity() {
+	let binder = binder_source();
+	let bind_case = source_block(&binder, "fn bind_case");
+	let case_output = source_block(&binder, "fn case_output_logical_type");
+
+	assert!(bind_case.contains("case_output_logical_type(builder, &result_ids, &output_type)?"));
+	let append_case = bind_case
+		.find("builder.append_case")
+		.expect("CASE node append");
+	let stamp = bind_case
+		.find("set_node_logical_type(case_id, output_logical_type)")
+		.expect("CASE logical identity stamp");
+	assert!(append_case < stamp);
+
+	assert_eq!(binder.matches("fn nominal_compatible").count(), 1);
+	for marker in [
+		"node_type",
+		"node_logical_type",
+		"builder.literal",
+		"is_case_null_placeholder",
+		"nominal_compatible(",
+		"branch_type != *output_type",
+		"cast explicitly to erase identity before widening",
+	] {
+		assert!(case_output.contains(marker), "missing CASE marker {marker}");
+	}
+	assert!(!case_output.contains("reconcile_identity"));
+}
+
+#[test]
 pub(crate) fn adr087_nominal_join_key_gate_extends_existing_type_gate() {
 	let binder = binder_source();
 	let validate = source_block(&binder, "fn validate_join_key_types");

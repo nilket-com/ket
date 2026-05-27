@@ -209,6 +209,171 @@ async fn ddl_literal_policy_allows_naked_literal_against_logical_column() {
 }
 
 #[tokio::test]
+async fn case_uniform_logical_identity_propagates_to_projection_schema() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT CASE WHEN flag THEN customer_id ELSE customer_id END AS id FROM orders",
+	)
+	.await;
+
+	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+}
+
+#[tokio::test]
+async fn case_missing_else_preserves_uniform_logical_identity() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT CASE WHEN flag THEN customer_id END AS id FROM orders",
+	)
+	.await;
+
+	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+}
+
+#[tokio::test]
+async fn coalesce_logical_identity_preserves_through_null_fallback() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT COALESCE(NULL, customer_id) AS id FROM orders",
+	)
+	.await;
+
+	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+}
+
+#[tokio::test]
+async fn if_logical_identity_preserves_through_null_branch() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT IF(flag, customer_id, NULL) AS id FROM orders",
+	)
+	.await;
+
+	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+}
+
+#[tokio::test]
+async fn case_literal_fallback_can_infer_logical_identity() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT CASE WHEN flag THEN customer_id ELSE 0 END AS id FROM orders",
+	)
+	.await;
+
+	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+}
+
+#[tokio::test]
+async fn case_mixed_logical_identities_reject() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let err = bind_sql_error(
+		&catalog,
+		&planner,
+		"SELECT CASE WHEN flag THEN customer_id ELSE product_id END FROM orders",
+	)
+	.await;
+
+	assert!(matches!(
+		err,
+		BindingError::NominalTypeMismatch { physical, .. } if physical == "Int64"
+	));
+}
+
+#[tokio::test]
+async fn case_logical_identity_plus_naked_nonliteral_rejects() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let err = bind_sql_error(
+		&catalog,
+		&planner,
+		"SELECT CASE WHEN flag THEN customer_id ELSE raw_bigint END FROM orders",
+	)
+	.await;
+
+	assert!(matches!(
+		err,
+		BindingError::NominalTypeMismatch { physical, .. } if physical == "Int64"
+	));
+}
+
+#[tokio::test]
+async fn case_identity_branch_rejects_physical_widening() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let err = bind_sql_error(
+		&catalog,
+		&planner,
+		"SELECT CASE WHEN flag THEN customer_id ELSE 1.5 END FROM orders",
+	)
+	.await;
+
+	assert!(matches!(
+		err,
+		BindingError::TypeMismatch { ref message }
+			if message.contains("CASE logical result")
+				&& message.contains("cast explicitly to erase identity before widening")
+	));
+}
+
+#[tokio::test]
+async fn case_produced_identity_is_nominally_checked_downstream() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let err = bind_sql_error(
+		&catalog,
+		&planner,
+		"SELECT CASE WHEN flag THEN customer_id ELSE customer_id END = product_id FROM orders",
+	)
+	.await;
+
+	assert!(matches!(
+		err,
+		BindingError::NominalTypeMismatch { physical, .. } if physical == "Int64"
+	));
+}
+
+#[tokio::test]
+async fn case_computed_identity_does_not_refinement_elide() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT id FROM (SELECT CASE WHEN note IS NOT NULL THEN id ELSE id END AS id FROM people) AS p WHERE id < 0",
+	)
+	.await;
+
+	assert!(find_empty_relation(&bound).is_none());
+	assert!(contains_scan(&bound));
+}
+
+#[tokio::test]
 async fn ddl_primitive_column_stays_naked() {
 	let (catalog, coordinator, planner) = logical_type_coordinator();
 	execute(
@@ -3043,6 +3208,16 @@ async fn setup_person_id_people(coordinator: &QueryCoordinator, planner: &SqlPla
 	}
 }
 
+async fn setup_case_identity_orders(coordinator: &QueryCoordinator, planner: &SqlPlanner) {
+	for sql in [
+		"CREATE LOGICAL TYPE CustomerId AS BIGINT",
+		"CREATE LOGICAL TYPE ProductId AS BIGINT",
+		"CREATE TABLE orders (customer_id CustomerId, product_id ProductId, raw_bigint BIGINT, flag BOOLEAN)",
+	] {
+		execute(coordinator, planner, sql).await;
+	}
+}
+
 async fn bind_sql(catalog: &MockCatalog, planner: &SqlPlanner, sql: &str) -> ExecutionPlan {
 	bind(
 		&planner.plan(sql).expect("plan SQL"),
@@ -3051,6 +3226,33 @@ async fn bind_sql(catalog: &MockCatalog, planner: &SqlPlanner, sql: &str) -> Exe
 	)
 	.await
 	.expect(sql)
+}
+
+async fn bind_sql_error(catalog: &MockCatalog, planner: &SqlPlanner, sql: &str) -> BindingError {
+	bind(
+		&planner.plan(sql).expect("plan SQL"),
+		catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err(sql)
+}
+
+fn assert_project_identity(bound: ExecutionPlan, expected: LogicalTypeId) {
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = bound
+	else {
+		panic!("expected project");
+	};
+	assert_eq!(exprs.root_logical_type(0), Some(expected));
+	assert_eq!(
+		decode_column_logical_type(output_schema.field(0))
+			.expect("decode projection logical identity"),
+		expected
+	);
 }
 
 async fn expect_plan_or_bind_error_contains(

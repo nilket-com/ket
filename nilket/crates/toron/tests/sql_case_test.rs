@@ -207,11 +207,21 @@ async fn case_in_having_executes() {
 }
 
 #[tokio::test]
-async fn case_result_is_naked() {
+async fn case_all_naked_result_stays_naked() {
 	let bound = bind_sql("SELECT CASE WHEN id = 1 THEN amount ELSE 0 END FROM sales").await;
 	let ExecutionPlan::Project { exprs, .. } = bound else {
 		panic!("expected project");
 	};
+	assert_eq!(exprs.root_logical_type(0), Some(LogicalTypeId::NAKED));
+}
+
+#[tokio::test]
+async fn case_numeric_widening_all_naked_still_works() {
+	let bound = bind_sql("SELECT CASE WHEN id = 1 THEN amount ELSE 1.5 END FROM sales").await;
+	let ExecutionPlan::Project { exprs, .. } = bound else {
+		panic!("expected project");
+	};
+	assert_eq!(exprs.root_type(0), Some(&DataType::Float64));
 	assert_eq!(exprs.root_logical_type(0), Some(LogicalTypeId::NAKED));
 }
 

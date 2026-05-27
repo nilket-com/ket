@@ -4793,6 +4793,7 @@ fn bind_case(
 		});
 	}
 	let output_type = case_common_type(&result_types)?;
+	let output_logical_type = case_output_logical_type(builder, &result_ids, &output_type)?;
 
 	for (_, result) in &mut bound_when_then {
 		*result = type_case_result(builder, *result, &output_type)?;
@@ -4803,11 +4804,65 @@ fn bind_case(
 		builder.append_literal(typed_null_for_case(&output_type)?)
 	};
 
-	Ok(builder.append_case(bound_when_then, else_input, output_type))
+	let case_id = builder.append_case(bound_when_then, else_input, output_type);
+	if !output_logical_type.is_naked()
+		&& !builder.set_node_logical_type(case_id, output_logical_type)
+	{
+		return Err(BindingError::UnsupportedExpression {
+			message: "CASE logical identity target is malformed".to_string(),
+		});
+	}
+	Ok(case_id)
 }
 
 fn is_case_null_placeholder(builder: &BoundExprProgramBuilder, id: BoundExprId) -> bool {
 	matches!(builder.literal(id), Some(ScalarValue::Utf8(None)))
+}
+
+fn case_output_logical_type(
+	builder: &BoundExprProgramBuilder,
+	result_ids: &[BoundExprId],
+	output_type: &DataType,
+) -> Result<LogicalTypeId, BindingError> {
+	let mut acc_logical = LogicalTypeId::NAKED;
+	let mut acc_is_literal = true;
+	for &id in result_ids {
+		if is_case_null_placeholder(builder, id) {
+			continue;
+		}
+		let branch_type = builder
+			.node_type(id)
+			.cloned()
+			.expect("builder returns typed CASE result");
+		let branch_logical = builder
+			.node_logical_type(id)
+			.expect("builder returns logical type for CASE result");
+		if !branch_logical.is_naked() && branch_type != *output_type {
+			return Err(BindingError::TypeMismatch {
+				message: format!(
+					"CASE logical result {} has physical {branch_type:?}, but common CASE output is {output_type:?}; cast explicitly to erase identity before widening",
+					logical_type_name(branch_logical)
+				),
+			});
+		}
+
+		let is_literal = builder.literal(id).is_some();
+		nominal_compatible(
+			output_type,
+			output_type,
+			acc_logical,
+			branch_logical,
+			acc_is_literal,
+			is_literal,
+		)?;
+		if !branch_logical.is_naked() {
+			acc_logical = branch_logical;
+			acc_is_literal = false;
+		} else if !is_literal {
+			acc_is_literal = false;
+		}
+	}
+	Ok(acc_logical)
 }
 
 fn type_case_result(
