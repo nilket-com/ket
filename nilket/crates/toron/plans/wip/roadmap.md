@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–113 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–114 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -844,6 +844,32 @@ run, 079+).
   `SUM(CustomerId)` worry; the physical-equality guard + named helper came from the Codex/Gemini iter-2
   convergence). Migration: `plans/impl/113_aggregate_output_logical_identity.md`.
 
+- **ADR 114 — Contextless `NULL` Projection Substrate.** Promoted. Finishes the NULL arc 112 named: a contextless
+  *result* NULL (`SELECT NULL`, all-null `CASE`/`COALESCE`) binds to Arrow `DataType::Null` and executes as a
+  `NullArray` of batch length, instead of rejecting. **Doctrine: untyped NULL stays non-executable
+  (`Expr::UntypedNull`, 112); `DataType::Null` is a result type of last resort — never a coercion participant.**
+  **Representation: `BoundExprNode::NullLiteral`** — a result-only bound-arena leaf (`append_null()`, type
+  `DataType::Null`/nullable/NAKED), **not** `ScalarValue::Null` (operator-steered: a `ScalarValue` arm would put a
+  result-only artifact on the public scalar surface — `Expr::Literal`/system rows/insert/PBC/tests — degrading
+  containment to defensive rejects; the bound node makes containment **structural**, only the binder constructs it,
+  and `ScalarValue` stays typed-only so 112's `!scalar_enum.contains("Null")` guard holds). **Scoping hinge:**
+  materialization is opt-in at **result-projection roots only** (a `NullRootPolicy::MaterializeResultNull` path at
+  SELECT `Project` including derived SELECT outputs / `RETURNING` — and **Rune `.project` inherits free** via
+  `LogicalPlan::Project`); the generic `bind_expr_into_program` reject is unchanged, so `WHERE NULL`/`GROUP BY NULL`/
+  `SUM(NULL)`/operand NULL keep 112's behavior (Gemini's iter-1 blanket materialization was rejected for mistyping
+  exactly these). All-null `CASE` (incl. missing-ELSE) resolves to `DataType::Null` via a `materialize_null_for_output_type`
+  helper that leaves `typed_null_for_data_type` (the 6 physical) narrow; the whole 109 sugar family inherits
+  (`COALESCE(NULL[,NULL])`, `IFNULL`/`NVL(NULL,NULL)`, `NVL2(a,NULL,NULL)`, `NULLIF(NULL, amount)` → Null while
+  `NULLIF(NULL,NULL)` still rejects). `DataType::Null` is not a coercion participant — `COALESCE(NULL,NULL) + 1`
+  rejects. **CTAS boundary:** persisted columns require a declared type — `CREATE TABLE AS SELECT NULL` rejects;
+  `… SELECT CAST(NULL AS BIGINT)` persists nullable `Int64` (the explicit escape). `NVL2(a,b,c)` folded in as the
+  last 109 sugar straggler (pure `CASE WHEN a IS NOT NULL THEN b ELSE c` desugar; no `OP_NVL2`/bound node/Rune
+  surface). Executor reuses `new_null_array`; **no** `ScalarValue::Null`/PBC opcode/Wendelon/storage carrier.
+  Genuine 3-of-3 on doctrine + scope; representation operator-resolved to B (Codex + Claude leaned B for
+  containment, Gemini's `ScalarValue::Null` superseded); the small-wins sweep (sugar family, `RETURNING NULL`, Rune
+  `lit_null()`) inherits through the all-null-CASE + result-projection chokepoints. Migration:
+  `plans/impl/114_contextless_null_projection.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -927,27 +953,34 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 113 promoted; ADR 114 candidates
+### ADR 114 promoted; ADR 115 candidates
 
-ADR 113 selected and promoted **aggregate-output logical identity** — `MIN`/`MAX` carry the input column's
-logical identity (selection preserves; computation erases), closing the last big identity-flow leak after the
-087–112 arc; one binder helper + the 089 writer, zero substrate change. Genuine 3-of-3 (the `SUM`-naked
-sub-decision a grounded 2-of-3 Gemini conceded). **Scope each candidate as a complete cut, not a ~100-line
-granular slice** (operator steer — fold adjacent surface in rather than spawning a follow-on ADR per small
-thing). No operator-designated next yet; strongest leads, by theme:
+ADR 114 selected and promoted **contextless `NULL` projection substrate** — a result-only
+`BoundExprNode::NullLiteral` materializing `DataType::Null`/`NullArray` at result-projection roots (SELECT /
+`RETURNING` / Rune `.project`) + all-null conditionals, closing the NULL arc 112 named; `NVL2` folded in as the
+last 109 sugar straggler. Genuine 3-of-3 on doctrine + scope; representation operator-resolved to B (structural
+containment over `ScalarValue::Null`). With the conditionals/NULL/identity arc (108–114) now **complete**, 115 is
+a likely pivot off the expression-substrate spine. **Scope each candidate as a complete cut, not a ~100-line
+granular slice** (operator steer). No operator-designated next yet; strongest leads, by theme:
 
-*Identity / NULL-arc continuation (108–113 descendants):*
+*Relational-completion (pivot off the spine — V1 distributed-execution axis):*
 
-- **Contextless `SELECT NULL` projection substrate** — the strongest remaining semantic cut + the one genuine
-  NULL boundary 112 left: a typeless NULL surviving to execution needs a `DataType::Null` + Arrow `NullArray`
-  projection contract (executor + schema work), not the 112 bind-time resolution. `NVL2(a,b,c)` (the last
-  109-family sugar straggler) can ride along if it stays a pure CASE desugar.
+- **Composable `ORDER BY` / `LIMIT`** — SQL sort/limit-in-derived (106 follow-on, fenced) + Rune `.sort`/`.limit`
+  (Rune has neither; SQL uses `LogicalPlan::Sort`) in one cut. The distributed barrier/ordering placement is the
+  topic, not granular friction. The most anti-granular option (two carried leads → one cut).
+
+*Identity-tier continuation (087–114 descendants):*
+
+- **Logical-type lifecycle — `DROP`/`ALTER LOGICAL TYPE`** — only `CREATE` exists; completes the logical-type
+  story. Net-new IR + cross-ring DROP (bounded 090 re-open) + referential-integrity guard (can't drop a
+  referenced type).
 - **Declared-additive logical types** — the deferred half of 113: a "unit/additive" property so `SUM(Money) →
-  Money` (and `SUM`/`AVG` over closed domains) preserves identity. Needs a logical-type property plus an
-  extension to the `CREATE LOGICAL TYPE` surface; a focused identity follow-on.
-- **Rune `if_else` / simple-CASE shortcuts** — the authoring conveniences 111 D9 deferred (sugar over the
-  landed `case`/`when`, no substrate); evidence-gated on real Rune-authoring ergonomics.
-- masked/lazy CASE eval (only if 108's eager hard-error exposure bites); far-horizon `OP_CASE` pushdown.
+  Money` preserves identity. Needs a logical-type property + a `CREATE LOGICAL TYPE` extension; narrower.
+
+*Conditionals leftovers (small, ride-along only):*
+
+- **Rune `if_else` / simple-CASE shortcuts** (111 D9, sugar over landed `case`/`when`); masked/lazy CASE eval
+  (only if 108's eager hard-error exposure bites); far-horizon `OP_CASE` pushdown. None is a standalone cut.
 
 *Optimizer tier (105's own named follow-on):*
 
@@ -1001,6 +1034,15 @@ thing). No operator-designated next yet; strongest leads, by theme:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 113 promoted; ADR 114 candidates (HISTORICAL)
+
+ADR 113 closed the identity-flow leak (`MIN`/`MAX` carry identity). 114 finished the NULL arc 112 named:
+contextless result NULL (`SELECT NULL`, all-null `CASE`/`COALESCE`) materializes `DataType::Null`/`NullArray` at
+result-projection roots via a result-only `BoundExprNode::NullLiteral` (operator-steered over `ScalarValue::Null`
+for structural containment), scoped so non-result positions keep 112's reject; `NVL2` folded in; CTAS requires a
+declared type (`CAST(NULL AS T)` escape). Detail in `plans/adr/114_contextless_null_projection.md` + the
+active-line entry above.
 
 ### ADR 112 promoted; ADR 113 candidates (HISTORICAL)
 
