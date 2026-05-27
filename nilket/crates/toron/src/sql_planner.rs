@@ -773,9 +773,6 @@ fn lower_update_assignment_expr(
 	planner: &SqlPlanner,
 	expr: &SqlExpr,
 ) -> Result<Expr, FrontendError> {
-	if expr_is_null_literal(expr) {
-		return Ok(update_null_placeholder());
-	}
 	if expr_contains_aggregate_call(expr) {
 		return Err(unsupported(
 			"unsupported UPDATE assignment expression: aggregate functions",
@@ -792,10 +789,6 @@ fn lower_update_assignment_expr(
 		));
 	}
 	planner.lower_expr(expr)
-}
-
-fn update_null_placeholder() -> Expr {
-	Expr::Literal(ScalarValue::Utf8(None))
 }
 
 enum LoweredInsertSource {
@@ -3687,7 +3680,7 @@ impl SqlPlanner {
 					Ok(Expr::Literal(ScalarValue::Utf8(Some(s.clone()))))
 				}
 				Value::Boolean(b) => Ok(Expr::Literal(ScalarValue::Boolean(Some(*b)))),
-				Value::Null => Err(unsupported("explicit NULL literal not supported")),
+				Value::Null => Ok(Expr::UntypedNull),
 				_ => Err(unsupported(format!("unsupported value: {val:?}"))),
 			},
 			SqlExpr::BinaryOp { left, op, right } => {
@@ -3847,13 +3840,6 @@ impl SqlPlanner {
 		}
 	}
 
-	fn lower_conditional_value_arg(&self, expr: &SqlExpr) -> Result<Expr, FrontendError> {
-		if expr_is_null_literal(expr) {
-			return Ok(Expr::Literal(conditional_null_placeholder()));
-		}
-		self.lower_expr(expr)
-	}
-
 	fn lower_if(&self, function: &Function) -> Result<Expr, FrontendError> {
 		let args = function_positional_args(function, "IF/IIF")?;
 		let [condition, truthy, falsy] = args.as_slice() else {
@@ -3862,9 +3848,9 @@ impl SqlPlanner {
 		Ok(Expr::Case {
 			when_then: vec![(
 				Box::new(self.lower_expr(condition)?),
-				Box::new(self.lower_conditional_value_arg(truthy)?),
+				Box::new(self.lower_expr(truthy)?),
 			)],
-			else_expr: Some(Box::new(self.lower_conditional_value_arg(falsy)?)),
+			else_expr: Some(Box::new(self.lower_expr(falsy)?)),
 		})
 	}
 
@@ -3883,7 +3869,7 @@ impl SqlPlanner {
 		let when_then = init
 			.iter()
 			.map(|arg| {
-				let lowered = self.lower_conditional_value_arg(arg)?;
+				let lowered = self.lower_expr(arg)?;
 				Ok((
 					Box::new(Expr::IsNotNull(Box::new(lowered.clone()))),
 					Box::new(lowered),
@@ -3892,7 +3878,7 @@ impl SqlPlanner {
 			.collect::<Result<Vec<_>, FrontendError>>()?;
 		Ok(Expr::Case {
 			when_then,
-			else_expr: Some(Box::new(self.lower_conditional_value_arg(last)?)),
+			else_expr: Some(Box::new(self.lower_expr(last)?)),
 		})
 	}
 
@@ -3901,13 +3887,13 @@ impl SqlPlanner {
 		let [first, fallback] = args.as_slice() else {
 			return Err(unsupported("IFNULL/NVL requires exactly two arguments"));
 		};
-		let first = self.lower_conditional_value_arg(first)?;
+		let first = self.lower_expr(first)?;
 		Ok(Expr::Case {
 			when_then: vec![(
 				Box::new(Expr::IsNotNull(Box::new(first.clone()))),
 				Box::new(first),
 			)],
-			else_expr: Some(Box::new(self.lower_conditional_value_arg(fallback)?)),
+			else_expr: Some(Box::new(self.lower_expr(fallback)?)),
 		})
 	}
 
@@ -3923,7 +3909,7 @@ impl SqlPlanner {
 					Box::new(first.clone()),
 					Box::new(self.lower_expr(second)?),
 				)),
-				Box::new(Expr::Literal(conditional_null_placeholder())),
+				Box::new(Expr::UntypedNull),
 			)],
 			else_expr: Some(Box::new(first)),
 		})
@@ -4009,9 +3995,6 @@ impl SqlPlanner {
 		if is_row_value_expr(expr) || list.iter().any(is_row_value_expr) {
 			return Err(unsupported("row-value IN is not supported"));
 		}
-		if list.iter().any(expr_is_null_literal) {
-			return Err(unsupported("NULL members in IN lists are not supported"));
-		}
 		Ok(Expr::InList {
 			expr: Box::new(self.lower_expr(expr)?),
 			list: list
@@ -4092,7 +4075,7 @@ fn sort_needs_hidden_projection(order_by: &[SortExpr]) -> bool {
 }
 
 fn sort_key_is_direct_output_reference(expr: &Expr) -> bool {
-	matches!(expr, Expr::Column(_) | Expr::Literal(_))
+	matches!(expr, Expr::Column(_) | Expr::Literal(_) | Expr::UntypedNull)
 		|| matches!(
 			expr,
 			Expr::LogicalAscription { expr, .. }
@@ -4114,7 +4097,7 @@ fn validate_hidden_sort_key_refs(
 			}
 			Ok(())
 		}
-		Expr::Literal(_) => Ok(()),
+		Expr::Literal(_) | Expr::UntypedNull => Ok(()),
 		Expr::LogicalAscription { expr: inner, .. } => {
 			validate_hidden_sort_key_refs(inner, visible_names)
 		}
@@ -4539,6 +4522,9 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			1u8.hash(state);
 			hash_scalar_structural(value, state);
 		}
+		Expr::UntypedNull => {
+			25u8.hash(state);
+		}
 		Expr::Cast(inner, data_type) => {
 			2u8.hash(state);
 			hash_expr_structural(inner, state);
@@ -4688,6 +4674,7 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 	match (left, right) {
 		(Expr::Column(left), Expr::Column(right)) => left == right,
 		(Expr::Literal(left), Expr::Literal(right)) => scalar_structural_eq(left, right),
+		(Expr::UntypedNull, Expr::UntypedNull) => true,
 		(Expr::Cast(left_inner, left_type), Expr::Cast(right_inner, right_type))
 		| (Expr::TryCast(left_inner, left_type), Expr::TryCast(right_inner, right_type)) => {
 			expr_structural_eq(left_inner, right_inner)
@@ -5107,7 +5094,7 @@ fn logical_expr_output_name(expr: &Expr, idx: usize) -> String {
 fn expr_contains_qualified_column(expr: &Expr) -> bool {
 	match expr {
 		Expr::Column(column) => column.qualifier.is_some(),
-		Expr::Literal(_) => false,
+		Expr::Literal(_) | Expr::UntypedNull => false,
 		Expr::LogicalAscription { expr: inner, .. }
 		| Expr::SqlLogicalCast { expr: inner, .. }
 		| Expr::Cast(inner, _)
@@ -5462,10 +5449,6 @@ fn conditional_sugar_function_name(name: &ObjectName) -> Option<ConditionalSugar
 		"NVL" => Some(ConditionalSugarFunction::Nvl),
 		_ => None,
 	}
-}
-
-fn conditional_null_placeholder() -> ScalarValue {
-	ScalarValue::Utf8(None)
 }
 
 fn function_positional_args<'a>(

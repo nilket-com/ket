@@ -654,7 +654,7 @@ async fn in_list_type_mismatch_fails_at_binding() {
 }
 
 #[test]
-fn in_list_rejects_empty_over_limit_subquery_unnest_rowvalue_or_null() {
+fn in_list_rejects_empty_over_limit_subquery_unnest_or_rowvalue() {
 	let over_limit = format!(
 		"SELECT id FROM sales WHERE id IN ({})",
 		(0..33)
@@ -668,10 +668,63 @@ fn in_list_rejects_empty_over_limit_subquery_unnest_rowvalue_or_null() {
 		"SELECT id FROM sales WHERE id IN (SELECT id FROM sales)",
 		"SELECT id FROM sales WHERE id IN UNNEST([1, 2])",
 		"SELECT id FROM sales WHERE (id, amount) IN ((1, 10))",
-		"SELECT id FROM sales WHERE id IN (1, NULL)",
 	] {
 		assert_plan_rejected(sql);
 	}
+}
+
+#[tokio::test]
+async fn null_comparison_is_residual_and_filters_all_rows() {
+	let sql = "SELECT id FROM sales WHERE amount = NULL";
+	let bound = bind_sql(sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+
+	assert_ids(sql, &[]).await;
+}
+
+#[tokio::test]
+async fn in_list_null_member_is_residual_and_uses_sql_three_valued_logic() {
+	let sql = "SELECT id FROM sales WHERE status IN (NULL, 'closed')";
+	let bound = bind_sql(sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+
+	assert_ids(sql, &[3]).await;
+
+	let not_sql = "SELECT id FROM sales WHERE status NOT IN (NULL, 'closed')";
+	let bound = bind_sql(not_sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+
+	assert_ids(not_sql, &[]).await;
+}
+
+#[tokio::test]
+async fn null_in_list_target_infers_type_from_member() {
+	let sql = "SELECT id FROM sales WHERE NULL IN (id)";
+	let bound = bind_sql(sql).await;
+	let (_, disposition, scan) = find_filter(&bound);
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+
+	assert_ids(sql, &[]).await;
+}
+
+#[tokio::test]
+async fn all_null_in_list_rejects_without_typed_member() {
+	let plan = plan_sql("SELECT id FROM sales WHERE NULL IN (NULL)");
+	let err = bind(&plan, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("all-NULL IN list should reject");
+
+	assert!(matches!(
+		err,
+		BindingError::TypeMismatch { message } if message.contains("requires a typed member")
+	));
 }
 
 #[tokio::test]

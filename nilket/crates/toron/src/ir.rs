@@ -496,6 +496,7 @@ impl ColumnRef {
 pub enum Expr {
 	Column(ColumnRef),
 	Literal(ScalarValue),
+	UntypedNull,
 	LogicalAscription {
 		expr: Box<Expr>,
 		logical_type: LogicalTypeId,
@@ -556,6 +557,7 @@ impl Expr {
 	pub fn is_pbc_pushdown_eligible(&self) -> bool {
 		match self {
 			Self::Column(_) | Self::Literal(_) => true,
+			Self::UntypedNull => false,
 			Self::LogicalAscription { expr, .. } => expr.is_pbc_pushdown_eligible(),
 			Self::SqlLogicalCast { .. }
 			| Self::Cast(_, _)

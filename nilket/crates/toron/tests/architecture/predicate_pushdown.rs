@@ -452,7 +452,7 @@ pub(crate) fn adr074_in_list_residual_eval_is_implemented_without_new_wendelon_s
 
 	assert!(exec.contains("fn evaluate_in_list"));
 	assert!(exec.contains("let mask = eq(expr_arr, item_arr)?"));
-	assert!(exec.contains("or(&current, &mask)?"));
+	assert!(exec.contains("or_kleene(&current, &mask)?"));
 	assert!(!exec.contains("in_list_utf8"));
 	assert!(!manifest.contains("arrow-ord"));
 }
@@ -578,10 +578,12 @@ pub(crate) fn adr108_case_is_residual_bound_expression() {
 	assert!(!planner.contains("CASE is not supported"));
 	assert!(binder.contains("Expr::Case"));
 	assert!(binder.contains("fn bind_case"));
-	assert!(binder.contains("require_boolean(builder, \"CASE WHEN\", condition)"));
+	assert!(binder.contains(
+		"bind_boolean_context_expr(builder, input_schema, ctx, \"CASE WHEN\", condition)?"
+	));
 	assert!(binder.contains("fn case_common_type"));
 	assert!(binder.contains("arithmetic_output_type(&common, data_type)"));
-	assert!(binder.contains("fn typed_null_for_case"));
+	assert!(binder.contains("fn typed_null_for_data_type"));
 	assert!(pbc.contains("BoundExprNode::Case { .. }"));
 	assert!(pbc.contains("CASE is not PBC-eligible"));
 	assert!(!pbc.contains("OP_CASE"));
@@ -663,17 +665,18 @@ pub(crate) fn adr109_conditional_sugar_desugars_to_case() {
 	] {
 		assert!(lower_expr.contains(variant), "lower_expr missing {variant}");
 	}
-	assert!(planner.contains("fn lower_conditional_value_arg"));
 	assert!(planner.contains("fn function_positional_args"));
+	assert!(!planner.contains("fn lower_conditional_value_arg"));
+	assert!(!planner.contains("fn conditional_null_placeholder"));
 	assert!(lower_coalesce.contains("Expr::Case"));
 	assert!(lower_coalesce.contains("Expr::IsNotNull"));
 	assert!(lower_coalesce.contains("COALESCE requires at least one typed argument"));
 	assert!(lower_if.contains("Expr::Case"));
 	assert!(lower_if.contains("self.lower_expr(condition)?"));
-	assert!(lower_if.contains("self.lower_conditional_value_arg(truthy)?"));
+	assert!(lower_if.contains("self.lower_expr(truthy)?"));
 	assert!(lower_nullif.contains("Expr::Case"));
 	assert!(lower_nullif.contains("Expr::Eq"));
-	assert!(lower_nullif.contains("conditional_null_placeholder()"));
+	assert!(lower_nullif.contains("Expr::UntypedNull"));
 	assert!(lower_ifnull_nvl.contains("Expr::Case"));
 	assert!(lower_ifnull_nvl.contains("Expr::IsNotNull"));
 	assert!(lower_ifnull_nvl.contains("IFNULL/NVL requires exactly two arguments"));
@@ -697,15 +700,18 @@ pub(crate) fn adr109_conditional_sugar_desugars_to_case() {
 }
 
 #[test]
-pub(crate) fn adr109_case_binder_types_untyped_null_sentinel() {
-	let manifest_dir = manifest_dir();
-	let planner =
-		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read planner");
-	let binder = std::fs::read_to_string(manifest_dir.join("src/binder.rs")).expect("read binder");
+pub(crate) fn adr112_null_sentinel_retired() {
+	let planner = source("src/sql_planner.rs");
+	let binder = source("src/binder.rs");
 	let bind_case = brace_blocks_after_marker(&binder, "fn bind_case")
 		.into_iter()
 		.next()
 		.expect("bind_case body")
+		.1;
+	let bind_case_result_input = brace_blocks_after_marker(&binder, "fn bind_case_result_input")
+		.into_iter()
+		.next()
+		.expect("bind_case_result_input body")
 		.1;
 	let type_case_result = brace_blocks_after_marker(&binder, "fn type_case_result")
 		.into_iter()
@@ -718,23 +724,92 @@ pub(crate) fn adr109_case_binder_types_untyped_null_sentinel() {
 		.expect("typed_update_null_for_target body")
 		.1;
 
-	assert!(planner.contains("fn conditional_null_placeholder"));
-	assert!(planner.contains("ScalarValue::Utf8(None)"));
-	assert!(binder.contains("fn is_case_null_placeholder"));
-	assert!(binder.contains("matches!(builder.literal(id), Some(ScalarValue::Utf8(None)))"));
-	assert!(bind_case.contains("filter(|id| !is_case_null_placeholder(builder, **id))"));
-	assert!(bind_case.contains("conditional has no typed (non-NULL) result branch"));
-	assert!(bind_case.contains("type_case_result(builder, *result, &output_type)?"));
-	assert!(bind_case.contains("type_case_result(builder, bound_else, &output_type)?"));
-	assert!(bind_case.contains("builder.append_literal(typed_null_for_case(&output_type)?)"));
-	assert!(type_case_result.contains("is_case_null_placeholder(builder, id)"));
-	assert!(type_case_result.contains("typed_null_for_case(output_type)?"));
-	assert!(type_case_result.contains("cast_if_needed(builder, id, output_type)"));
+	assert!(!planner.contains("fn conditional_null_placeholder"));
+	assert!(!planner.contains("fn update_null_placeholder"));
+	assert!(!binder.contains("fn is_case_null_placeholder"));
+	assert!(!binder.contains("fn typed_null_for_case"));
+	assert!(binder.contains("fn typed_null_for_data_type"));
+	assert!(binder.contains("fn resolve_untyped_null"));
+	assert!(bind_case_result_input.contains("is_untyped_null(expr)"));
+	assert!(bind_case.contains("CaseResultInput::Bound(result_id)"));
 	assert!(
-		type_case_result.contains("normal SQL expression lowering still rejects explicit NULL")
+		bind_case.contains("case_output_logical_type(builder, &typed_result_ids, &output_type)?")
 	);
-	assert!(update_null.contains("Expr::Literal(ScalarValue::Utf8(None))"));
-	assert!(update_null.contains("ScalarValue::Utf8(None)"));
+	assert!(bind_case.contains("conditional has no typed (non-NULL) result branch"));
+	assert!(bind_case.contains("resolve_untyped_null(builder, &output_type)?"));
+	assert!(type_case_result.contains("CaseResultInput::Bound(id)"));
+	assert!(type_case_result.contains("CaseResultInput::UntypedNull"));
+	assert!(type_case_result.contains("resolve_untyped_null(builder, output_type)"));
+	assert!(update_null.contains("is_untyped_null(expr)"));
+	assert!(update_null.contains("typed_null_for_data_type(field.data_type())?"));
+}
+
+#[test]
+pub(crate) fn adr112_explicit_null_is_transient_binder_consumed() {
+	let ir = source("src/ir.rs");
+	let execution_ir = source("src/ir/execution.rs");
+	let exec = source("src/exec.rs");
+	let planner = source("src/sql_planner.rs");
+	let binder = source("src/binder.rs");
+	let pbc = source("src/pbc.rs");
+	let expr_enum = ir
+		.split("pub enum Expr")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Expr").next())
+		.expect("Expr enum");
+	let scalar_enum = ir
+		.split("pub enum ScalarValue")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ScalarValue").next())
+		.expect("ScalarValue enum");
+	let bound_node = execution_ir
+		.split("pub enum BoundExprNode")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive").next())
+		.expect("BoundExprNode enum");
+	let lower_expr = brace_blocks_after_marker(&planner, "fn lower_expr")
+		.into_iter()
+		.next()
+		.expect("lower_expr body")
+		.1;
+	let bind_expr = brace_blocks_after_marker(&binder, "fn bind_expr_into_program")
+		.into_iter()
+		.next()
+		.expect("bind_expr_into_program body")
+		.1;
+
+	assert!(expr_enum.contains("UntypedNull"));
+	assert!(!scalar_enum.contains("Null"));
+	assert!(!bound_node.contains("UntypedNull"));
+	assert!(!pbc.contains("UntypedNull"));
+	assert!(!exec.contains("BoundExprNode::UntypedNull"));
+	assert!(lower_expr.contains("Value::Null => Ok(Expr::UntypedNull)"));
+	assert!(bind_expr.contains("Expr::UntypedNull => Err"));
+	assert!(bind_expr.contains("NULL literal has no type in this position"));
+	assert!(bind_expr.contains("CAST(NULL AS <type>)"));
+}
+
+#[test]
+pub(crate) fn adr112_null_predicates_stay_residual() {
+	let binder = source("src/binder.rs");
+	let pbc = source("src/pbc.rs");
+	let comparison = brace_blocks_after_marker(&binder, "fn bind_comparison")
+		.into_iter()
+		.next()
+		.expect("bind_comparison body")
+		.1;
+	let in_list = brace_blocks_after_marker(&binder, "fn bind_in_list")
+		.into_iter()
+		.next()
+		.expect("bind_in_list body")
+		.1;
+
+	assert!(comparison.contains("resolve_untyped_null(builder, &right_type)?"));
+	assert!(comparison.contains("resolve_untyped_null(builder, &left_type)?"));
+	assert!(in_list.contains("resolve_untyped_null(builder, &expr_type)?"));
+	assert!(pbc.contains("NullLiteralUnrepresentable"));
+	assert!(pbc.contains("ScalarValue::Int32(None)"));
+	assert!(pbc.contains("PBC doesn't have OP_PUSH_NULL"));
 }
 
 #[test]

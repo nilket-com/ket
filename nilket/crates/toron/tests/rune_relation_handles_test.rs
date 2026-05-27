@@ -1013,6 +1013,52 @@ async fn rune_in_list_computed_member_is_residual() {
 }
 
 #[tokio::test]
+async fn rune_lit_null_comparison_is_residual() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("amount").eq(lit_null()))
+        }
+    "#,
+	)
+	.await
+	.expect("lit_null comparison filter plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind lit_null comparison filter");
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), Vec::<Option<i64>>::new());
+}
+
+#[tokio::test]
+async fn rune_lit_null_in_list_member_is_residual() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("status").in_list([lit_null(), lit_str("closed")]))
+        }
+    "#,
+	)
+	.await
+	.expect("lit_null IN list plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind lit_null IN list filter");
+	let (_, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert!(scan_pbc(scan).is_none());
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3)]);
+}
+
+#[tokio::test]
 async fn rune_in_list_empty_list_panics() {
 	let error = rune_plan(
 		r#"
@@ -1425,6 +1471,51 @@ async fn rune_case_carries_logical_identity() {
 		decode_column_logical_type(output_schema.field(0)).expect("decode projection identity"),
 		CUSTOMER_ID_LOGICAL_TYPE
 	);
+}
+
+#[tokio::test]
+async fn rune_lit_null_case_result_types_from_sibling_branch() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                case([when(col("active"), lit_null())], col("amount"))
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune lit_null CASE plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![None, Some(20), None, None, None, None]
+	);
+}
+
+#[tokio::test]
+async fn rune_lit_null_projection_rejects_without_type_context() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([lit_null()])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune lit_null projection plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("contextless lit_null must fail in binder");
+
+	match error {
+		BindingError::UnsupportedExpression { message } => {
+			assert!(message.contains("NULL literal has no type in this position"));
+			assert!(message.contains("CAST(NULL AS <type>)"));
+		}
+		other => panic!("expected contextless NULL unsupported expression, got {other:?}"),
+	}
 }
 
 #[tokio::test]

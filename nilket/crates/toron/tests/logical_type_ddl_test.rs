@@ -269,6 +269,38 @@ async fn if_logical_identity_preserves_through_null_branch() {
 }
 
 #[tokio::test]
+async fn logical_cast_null_projects_typed_logical_null() {
+	let (catalog, coordinator, planner) = logical_type_coordinator();
+	setup_case_identity_orders(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT CAST(NULL AS CustomerId), TRY_CAST(NULL AS CustomerId) FROM orders",
+	)
+	.await;
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = bound
+	else {
+		panic!("expected project");
+	};
+	let customer_id = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID);
+	for idx in 0..2 {
+		assert_eq!(exprs.root_type(idx), Some(&DataType::Int64));
+		assert_eq!(exprs.root_nullable(idx), Some(true));
+		assert_eq!(exprs.root_logical_type(idx), Some(customer_id));
+		assert_eq!(
+			decode_column_logical_type(output_schema.field(idx))
+				.expect("decode logical NULL projection identity"),
+			customer_id
+		);
+	}
+}
+
+#[tokio::test]
 async fn case_literal_fallback_can_infer_logical_identity() {
 	let (catalog, coordinator, planner) = logical_type_coordinator();
 	setup_case_identity_orders(&coordinator, &planner).await;

@@ -3,10 +3,11 @@
 **Migration for** `plans/adr/112_explicit_null_literal.md`. **Scope:** `ir.rs` (`Expr::UntypedNull` transient
 leaf) + `sql_planner.rs` (lift `:3690`; retire both placeholders; lift IN-member reject; leaf walker arms) +
 `binder.rs` (reject backstop; one `typed_null_for_data_type`; resolve `UntypedNull` at CAST physical+logical /
-CASE / UPDATE / Boolean/null-test / comparison / arithmetic / IN; delete the bound sentinel) + `rune_engine.rs` (`lit_null`)
-+ tests + guards. **Non-scope:** no `BoundExprNode`/executor/PBC/Wendelon/storage change; no contextless `SELECT
-NULL` (needs `DataType::Null`/`NullArray`); no `NVL2`. `UntypedNull` is binder-consumed (the `SqlLogicalCast`
-precedent) → the bound arena is untouched.
+CASE / UPDATE / Boolean/null-test / comparison / arithmetic / IN; delete the bound sentinel) + `rune_engine.rs`
+(`lit_null`) + tests + guards. **Non-scope:** no `BoundExprNode`/executor-kernel/PBC/Wendelon/storage substrate
+change, except residual `evaluate_in_list` adopting Kleene OR for IN-with-NULL 3VL correctness; no contextless
+`SELECT NULL` (needs `DataType::Null`/`NullArray`); no `NVL2`. `UntypedNull` is binder-consumed (the
+`SqlLogicalCast` precedent) → the bound arena is untouched.
 
 ## Pre-flight anchors
 
@@ -74,7 +75,9 @@ unary node; this keeps `COALESCE(NULL, amount)` green after the sentinel is dele
 `is_untyped_null`, `resolve_untyped_null(peer_type)` before the `:5138` mismatch / `cast_if_needed`; both null →
 reject. `bind_in_list`: resolve `UntypedNull` members to the target type; if the target is `UntypedNull`, infer one
 compatible type from the non-null members and materialize the target from that type; all-null target/list rejects.
-Negated keeps native 3VL (`NOT IN (NULL,…)` → empty).
+Negated keeps native 3VL (`NOT IN (NULL,…)` → empty). In the executor, switch residual `evaluate_in_list` from
+strict `or` to `or_kleene`; otherwise `x IN (NULL, v)` can incorrectly return `UNKNOWN` even when `x = v` is TRUE.
+This is a residual evaluator correctness fix, not a new executor kernel or NULL carrier.
 
 **(g) UPDATE (D4).** `typed_update_null_for_target` matches `Expr::UntypedNull` → `Expr::Literal(
 typed_null_for_data_type(field.data_type())?)`.
@@ -112,4 +115,5 @@ assignment / CASE / Boolean/null-test / comparison / arithmetic / IN); contextle
 T)`; the `Utf8(None)` sentinel is gone (one marker + one `typed_null_for_data_type`); sugars + `SET col = NULL`
 regress; `NOT IN (NULL) → empty` + 3VL comparisons pinned residual; 110 identity + all-NULL reject hold; `CAST(NULL
 AS CustomerId)` carries identity; Rune `lit_null()` binds by the same rules; `adr112_*` guards green; **no**
-bound-arena/executor/PBC/Wendelon/storage change; Toron suite green.
+bound-arena/executor-kernel/PBC/Wendelon/storage substrate change, except `evaluate_in_list` using Kleene OR for
+3VL IN-with-NULL; Toron suite green.

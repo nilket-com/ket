@@ -1050,7 +1050,7 @@ pub(crate) fn adr027_hidden_sort_key_refs_are_visible_outputs() {
 			"ORDER BY computed aggregate expression must reference visible output columns"
 		)
 	);
-	assert!(validator.contains("Expr::Literal(_) => Ok(())"));
+	assert!(validator.contains("Expr::Literal(_) | Expr::UntypedNull => Ok(())"));
 	assert!(validator.contains("Expr::SqlLogicalCast { expr: inner, .. }"));
 	assert!(validator.contains("| Expr::Cast(inner, _)"));
 	assert!(validator.contains("| Expr::TryCast(inner, _)"));

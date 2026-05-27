@@ -922,7 +922,7 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 				),
 			})
 		}
-		Expr::Column(_) | Expr::Literal(_) => Ok(()),
+		Expr::Column(_) | Expr::Literal(_) | Expr::UntypedNull => Ok(()),
 		Expr::LogicalAscription { expr: inner, .. }
 		| Expr::SqlLogicalCast { expr: inner, .. }
 		| Expr::Cast(inner, _)
@@ -975,7 +975,7 @@ fn collect_logical_cast_names(
 	names: &mut HashSet<String>,
 ) -> Result<(), BindingError> {
 	match expr {
-		Expr::Column(_) | Expr::Literal(_) => Ok(()),
+		Expr::Column(_) | Expr::Literal(_) | Expr::UntypedNull => Ok(()),
 		Expr::SqlLogicalCast {
 			expr,
 			logical_name,
@@ -1072,26 +1072,36 @@ fn validate_omitted_insert_target_columns(
 }
 
 fn typed_update_null_for_target(expr: &Expr, field: &Field) -> Result<Expr, BindingError> {
-	if !matches!(expr, Expr::Literal(ScalarValue::Utf8(None))) {
+	if !is_untyped_null(expr) {
 		return Ok(expr.clone());
 	}
-	let value = match field.data_type() {
-		DataType::Boolean => ScalarValue::Boolean(None),
-		DataType::Int32 => ScalarValue::Int32(None),
-		DataType::Int64 => ScalarValue::Int64(None),
-		DataType::Float32 => ScalarValue::Float32(None),
-		DataType::Float64 => ScalarValue::Float64(None),
-		DataType::Utf8 => ScalarValue::Utf8(None),
-		other => {
-			return Err(BindingError::TypeMismatch {
-				message: format!(
-					"unsupported UPDATE target type for column {}: {other:?}",
-					field.name()
-				),
-			});
-		}
-	};
+	let value = typed_null_for_data_type(field.data_type())?;
 	Ok(Expr::Literal(value))
+}
+
+fn is_untyped_null(expr: &Expr) -> bool {
+	matches!(expr, Expr::UntypedNull)
+}
+
+fn typed_null_for_data_type(data_type: &DataType) -> Result<ScalarValue, BindingError> {
+	match data_type {
+		DataType::Boolean => Ok(ScalarValue::Boolean(None)),
+		DataType::Int32 => Ok(ScalarValue::Int32(None)),
+		DataType::Int64 => Ok(ScalarValue::Int64(None)),
+		DataType::Float32 => Ok(ScalarValue::Float32(None)),
+		DataType::Float64 => Ok(ScalarValue::Float64(None)),
+		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
+		other => Err(BindingError::TypeMismatch {
+			message: format!("unsupported NULL target type: {other:?}"),
+		}),
+	}
+}
+
+fn resolve_untyped_null(
+	builder: &mut BoundExprProgramBuilder,
+	data_type: &DataType,
+) -> Result<BoundExprId, BindingError> {
+	Ok(builder.append_literal(typed_null_for_data_type(data_type)?))
 }
 
 fn infer_ctas_schema(source_schema: &SchemaRef) -> Result<SchemaRef, BindingError> {
@@ -4511,6 +4521,10 @@ fn bind_expr_into_program(
 			Ok(node)
 		}
 		Expr::Literal(value) => Ok(builder.append_literal(value.clone())),
+		Expr::UntypedNull => Err(BindingError::UnsupportedExpression {
+			message: "NULL literal has no type in this position; wrap it in CAST(NULL AS <type>)"
+				.to_string(),
+		}),
 		Expr::LogicalAscription { expr, logical_type } => {
 			bind_logical_ascription(builder, input_schema, ctx, expr, *logical_type)
 		}
@@ -4558,8 +4572,7 @@ fn bind_expr_into_program(
 			bind_boolean(builder, input_schema, ctx, left, right, BoundBinaryOp::Or)
 		}
 		Expr::Not(inner) => {
-			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
-			require_boolean(builder, "NOT", inner)?;
+			let inner = bind_boolean_context_expr(builder, input_schema, ctx, "NOT", inner)?;
 			Ok(builder.append_unary(BoundUnaryOp::Not, inner, DataType::Boolean))
 		}
 		Expr::InList {
@@ -4586,11 +4599,11 @@ fn bind_expr_into_program(
 			else_expr,
 		} => bind_case(builder, input_schema, ctx, when_then, else_expr.as_deref()),
 		Expr::IsNull(inner) => {
-			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+			let inner = bind_null_test_input(builder, input_schema, ctx, inner)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNull, inner, DataType::Boolean))
 		}
 		Expr::IsNotNull(inner) => {
-			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+			let inner = bind_null_test_input(builder, input_schema, ctx, inner)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNotNull, inner, DataType::Boolean))
 		}
 		Expr::TimeBucket(interval, inner) => {
@@ -4651,6 +4664,19 @@ fn bind_sql_logical_cast(
 					"internal: SQL logical CAST target {logical_name} was not resolved"
 				),
 			})?;
+	if is_untyped_null(inner) {
+		let output = resolve_untyped_null(builder, &spec.physical)?;
+		let existing = builder
+			.node_logical_type(output)
+			.expect("builder returns logical type for SQL logical NULL cast input");
+		let logical_type = reconcile_identity(existing, spec.id, &spec.physical)?;
+		if !builder.set_node_logical_type(output, logical_type) {
+			return Err(BindingError::UnsupportedExpression {
+				message: "SQL logical cast target is malformed".to_string(),
+			});
+		}
+		return Ok(output);
+	}
 	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 	let source = builder
 		.node_type(inner)
@@ -4722,6 +4748,49 @@ fn bind_arithmetic(
 	right: &Expr,
 	op: BoundBinaryOp,
 ) -> Result<BoundExprId, BindingError> {
+	match (is_untyped_null(left), is_untyped_null(right)) {
+		(true, true) => {
+			return Err(BindingError::TypeMismatch {
+				message: "arithmetic with NULL requires a typed operand".to_string(),
+			});
+		}
+		(true, false) => {
+			let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
+			let right_type = builder
+				.node_type(right)
+				.cloned()
+				.expect("builder returns typed right node");
+			let output_type =
+				arithmetic_output_type(&right_type, &right_type).ok_or_else(|| {
+					BindingError::TypeMismatch {
+						message: format!(
+							"arithmetic operands must be Int32, Int64, Float32, or Float64, got NULL and {right_type:?}"
+						),
+					}
+				})?;
+			let left = resolve_untyped_null(builder, &output_type)?;
+			let right = cast_if_needed(builder, right, &output_type)?;
+			return Ok(builder.append_binary(op, left, right, output_type));
+		}
+		(false, true) => {
+			let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
+			let left_type = builder
+				.node_type(left)
+				.cloned()
+				.expect("builder returns typed left node");
+			let output_type = arithmetic_output_type(&left_type, &left_type).ok_or_else(|| {
+				BindingError::TypeMismatch {
+					message: format!(
+						"arithmetic operands must be Int32, Int64, Float32, or Float64, got {left_type:?} and NULL"
+					),
+				}
+			})?;
+			let left = cast_if_needed(builder, left, &output_type)?;
+			let right = resolve_untyped_null(builder, &output_type)?;
+			return Ok(builder.append_binary(op, left, right, output_type));
+		}
+		(false, false) => {}
+	}
 	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
 	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
 	let left_type = builder
@@ -4758,28 +4827,31 @@ fn bind_case(
 		});
 	}
 
-	let mut bound_when_then = Vec::with_capacity(when_then.len());
-	let mut result_ids =
+	let mut bound_when_then_inputs = Vec::with_capacity(when_then.len());
+	let mut typed_result_ids =
 		Vec::with_capacity(when_then.len() + if else_expr.is_some() { 1 } else { 0 });
 	for (condition, result) in when_then {
-		let condition = bind_expr_into_program(builder, condition, input_schema, ctx)?;
-		require_boolean(builder, "CASE WHEN", condition)?;
-		let result = bind_expr_into_program(builder, result, input_schema, ctx)?;
-		result_ids.push(result);
-		bound_when_then.push((condition, result));
+		let condition =
+			bind_boolean_context_expr(builder, input_schema, ctx, "CASE WHEN", condition)?;
+		let result = bind_case_result_input(builder, input_schema, ctx, result)?;
+		if let CaseResultInput::Bound(result_id) = result {
+			typed_result_ids.push(result_id);
+		}
+		bound_when_then_inputs.push((condition, result));
 	}
 
 	let bound_else = if let Some(else_expr) = else_expr {
-		let else_input = bind_expr_into_program(builder, else_expr, input_schema, ctx)?;
-		result_ids.push(else_input);
+		let else_input = bind_case_result_input(builder, input_schema, ctx, else_expr)?;
+		if let CaseResultInput::Bound(else_id) = else_input {
+			typed_result_ids.push(else_id);
+		}
 		Some(else_input)
 	} else {
 		None
 	};
 
-	let result_types = result_ids
+	let result_types = typed_result_ids
 		.iter()
-		.filter(|id| !is_case_null_placeholder(builder, **id))
 		.map(|id| {
 			builder
 				.node_type(*id)
@@ -4793,15 +4865,16 @@ fn bind_case(
 		});
 	}
 	let output_type = case_common_type(&result_types)?;
-	let output_logical_type = case_output_logical_type(builder, &result_ids, &output_type)?;
+	let output_logical_type = case_output_logical_type(builder, &typed_result_ids, &output_type)?;
 
-	for (_, result) in &mut bound_when_then {
-		*result = type_case_result(builder, *result, &output_type)?;
+	let mut bound_when_then = Vec::with_capacity(bound_when_then_inputs.len());
+	for (condition, result) in bound_when_then_inputs {
+		bound_when_then.push((condition, type_case_result(builder, result, &output_type)?));
 	}
 	let else_input = if let Some(bound_else) = bound_else {
 		type_case_result(builder, bound_else, &output_type)?
 	} else {
-		builder.append_literal(typed_null_for_case(&output_type)?)
+		resolve_untyped_null(builder, &output_type)?
 	};
 
 	let case_id = builder.append_case(bound_when_then, else_input, output_type);
@@ -4815,8 +4888,27 @@ fn bind_case(
 	Ok(case_id)
 }
 
-fn is_case_null_placeholder(builder: &BoundExprProgramBuilder, id: BoundExprId) -> bool {
-	matches!(builder.literal(id), Some(ScalarValue::Utf8(None)))
+#[derive(Debug, Clone, Copy)]
+enum CaseResultInput {
+	Bound(BoundExprId),
+	UntypedNull,
+}
+
+fn bind_case_result_input(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	expr: &Expr,
+) -> Result<CaseResultInput, BindingError> {
+	if is_untyped_null(expr) {
+		return Ok(CaseResultInput::UntypedNull);
+	}
+	Ok(CaseResultInput::Bound(bind_expr_into_program(
+		builder,
+		expr,
+		input_schema,
+		ctx,
+	)?))
 }
 
 fn case_output_logical_type(
@@ -4827,9 +4919,6 @@ fn case_output_logical_type(
 	let mut acc_logical = LogicalTypeId::NAKED;
 	let mut acc_is_literal = true;
 	for &id in result_ids {
-		if is_case_null_placeholder(builder, id) {
-			continue;
-		}
 		let branch_type = builder
 			.node_type(id)
 			.cloned()
@@ -4867,16 +4956,13 @@ fn case_output_logical_type(
 
 fn type_case_result(
 	builder: &mut BoundExprProgramBuilder,
-	id: BoundExprId,
+	input: CaseResultInput,
 	output_type: &DataType,
 ) -> Result<BoundExprId, BindingError> {
-	// Literal Utf8(None) is the planner's untyped-NULL sentinel for CASE result
-	// branches while normal SQL expression lowering still rejects explicit NULL
-	// literals. Revisit this if general explicit NULL literals become supported.
-	if is_case_null_placeholder(builder, id) {
-		return Ok(builder.append_literal(typed_null_for_case(output_type)?));
+	match input {
+		CaseResultInput::Bound(id) => cast_if_needed(builder, id, output_type),
+		CaseResultInput::UntypedNull => resolve_untyped_null(builder, output_type),
 	}
-	cast_if_needed(builder, id, output_type)
 }
 
 fn case_common_type(types: &[DataType]) -> Result<DataType, BindingError> {
@@ -4902,20 +4988,6 @@ fn case_common_type(types: &[DataType]) -> Result<DataType, BindingError> {
 	Ok(common)
 }
 
-fn typed_null_for_case(data_type: &DataType) -> Result<ScalarValue, BindingError> {
-	match data_type {
-		DataType::Boolean => Ok(ScalarValue::Boolean(None)),
-		DataType::Int32 => Ok(ScalarValue::Int32(None)),
-		DataType::Int64 => Ok(ScalarValue::Int64(None)),
-		DataType::Float32 => Ok(ScalarValue::Float32(None)),
-		DataType::Float64 => Ok(ScalarValue::Float64(None)),
-		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
-		other => Err(BindingError::TypeMismatch {
-			message: format!("unsupported CASE result type: {other:?}"),
-		}),
-	}
-}
-
 fn bind_explicit_cast(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
@@ -4923,6 +4995,9 @@ fn bind_explicit_cast(
 	inner: &Expr,
 	target: &DataType,
 ) -> Result<BoundExprId, BindingError> {
+	if is_untyped_null(inner) {
+		return resolve_untyped_null(builder, target);
+	}
 	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 	let source = builder
 		.node_type(inner)
@@ -4945,6 +5020,9 @@ fn bind_try_cast(
 	inner: &Expr,
 	target: &DataType,
 ) -> Result<BoundExprId, BindingError> {
+	if is_untyped_null(inner) {
+		return resolve_untyped_null(builder, target);
+	}
 	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 	let source = builder
 		.node_type(inner)
@@ -5086,20 +5164,7 @@ fn coerce_insert_literal(
 }
 
 fn typed_null_for_insert(field: &Field) -> Result<ScalarValue, BindingError> {
-	match field.data_type() {
-		DataType::Boolean => Ok(ScalarValue::Boolean(None)),
-		DataType::Int32 => Ok(ScalarValue::Int32(None)),
-		DataType::Int64 => Ok(ScalarValue::Int64(None)),
-		DataType::Float32 => Ok(ScalarValue::Float32(None)),
-		DataType::Float64 => Ok(ScalarValue::Float64(None)),
-		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
-		target => Err(BindingError::TypeMismatch {
-			message: format!(
-				"unsupported INSERT target type for column {}: {target:?}",
-				field.name()
-			),
-		}),
-	}
+	typed_null_for_data_type(field.data_type())
 }
 
 fn insert_type_mismatch(column: &str, literal: &InsertLiteral, target: &DataType) -> BindingError {
@@ -5124,6 +5189,56 @@ fn bind_comparison(
 	right: &Expr,
 	op: BoundBinaryOp,
 ) -> Result<BoundExprId, BindingError> {
+	match (is_untyped_null(left), is_untyped_null(right)) {
+		(true, true) => {
+			return Err(BindingError::TypeMismatch {
+				message: "NULL comparison requires a typed operand".to_string(),
+			});
+		}
+		(true, false) => {
+			let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
+			let right_type = builder
+				.node_type(right)
+				.cloned()
+				.expect("builder returns typed comparison right");
+			let left = resolve_untyped_null(builder, &right_type)?;
+			nominal_compatible(
+				&right_type,
+				&right_type,
+				builder
+					.node_logical_type(left)
+					.expect("builder returns logical type for comparison left"),
+				builder
+					.node_logical_type(right)
+					.expect("builder returns logical type for comparison right"),
+				true,
+				builder.literal(right).is_some(),
+			)?;
+			return Ok(builder.append_binary(op, left, right, DataType::Boolean));
+		}
+		(false, true) => {
+			let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
+			let left_type = builder
+				.node_type(left)
+				.cloned()
+				.expect("builder returns typed comparison left");
+			let right = resolve_untyped_null(builder, &left_type)?;
+			nominal_compatible(
+				&left_type,
+				&left_type,
+				builder
+					.node_logical_type(left)
+					.expect("builder returns logical type for comparison left"),
+				builder
+					.node_logical_type(right)
+					.expect("builder returns logical type for comparison right"),
+				builder.literal(left).is_some(),
+				true,
+			)?;
+			return Ok(builder.append_binary(op, left, right, DataType::Boolean));
+		}
+		(false, false) => {}
+	}
 	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
 	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
 	coerce_comparison_literals(builder, left, right);
@@ -5171,12 +5286,23 @@ fn bind_in_list(
 			message: "IN list must not be empty".to_string(),
 		});
 	}
+	if is_untyped_null(expr) {
+		return bind_in_list_with_untyped_target(builder, input_schema, ctx, list, negated);
+	}
 	let expr = bind_expr_into_program(builder, expr, input_schema, ctx)?;
 	let mut bound_items = Vec::with_capacity(list.len());
 	for item in list {
-		let item = bind_expr_into_program(builder, item, input_schema, ctx)?;
-		coerce_comparison_literals(builder, expr, item);
 		let expr_type = builder
+			.node_type(expr)
+			.cloned()
+			.expect("builder returns typed IN target");
+		let item = if is_untyped_null(item) {
+			resolve_untyped_null(builder, &expr_type)?
+		} else {
+			bind_expr_into_program(builder, item, input_schema, ctx)?
+		};
+		coerce_comparison_literals(builder, expr, item);
+		let current_expr_type = builder
 			.node_type(expr)
 			.cloned()
 			.expect("builder returns typed IN target");
@@ -5184,16 +5310,16 @@ fn bind_in_list(
 			.node_type(item)
 			.cloned()
 			.expect("builder returns typed IN member");
-		if expr_type != item_type {
+		if current_expr_type != item_type {
 			return Err(BindingError::TypeMismatch {
 				message: format!(
 					"IN operands have different types: {:?} and {:?}",
-					expr_type, item_type
+					current_expr_type, item_type
 				),
 			});
 		}
 		nominal_compatible(
-			&expr_type,
+			&current_expr_type,
 			&item_type,
 			builder
 				.node_logical_type(expr)
@@ -5204,6 +5330,65 @@ fn bind_in_list(
 			builder.literal(expr).is_some(),
 			builder.literal(item).is_some(),
 		)?;
+		bound_items.push(item);
+	}
+	Ok(builder.append_in_list(expr, bound_items, negated))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InListInput {
+	Bound(BoundExprId),
+	UntypedNull,
+}
+
+fn bind_in_list_with_untyped_target(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	list: &[Expr],
+	negated: bool,
+) -> Result<BoundExprId, BindingError> {
+	let mut inputs = Vec::with_capacity(list.len());
+	let mut types = Vec::new();
+	for item in list {
+		if is_untyped_null(item) {
+			inputs.push(InListInput::UntypedNull);
+		} else {
+			let item = bind_expr_into_program(builder, item, input_schema, ctx)?;
+			types.push(
+				builder
+					.node_type(item)
+					.cloned()
+					.expect("builder returns typed IN member"),
+			);
+			inputs.push(InListInput::Bound(item));
+		}
+	}
+	if types.is_empty() {
+		return Err(BindingError::TypeMismatch {
+			message: "NULL IN list requires a typed member".to_string(),
+		});
+	}
+	let target_type = case_common_type(&types)?;
+	let expr = resolve_untyped_null(builder, &target_type)?;
+	let mut bound_items = Vec::with_capacity(inputs.len());
+	for input in inputs {
+		let item = match input {
+			InListInput::Bound(item) => cast_if_needed(builder, item, &target_type)?,
+			InListInput::UntypedNull => resolve_untyped_null(builder, &target_type)?,
+		};
+		let item_type = builder
+			.node_type(item)
+			.cloned()
+			.expect("builder returns typed IN member");
+		if item_type != target_type {
+			return Err(BindingError::TypeMismatch {
+				message: format!(
+					"IN operands have different types: {:?} and {:?}",
+					target_type, item_type
+				),
+			});
+		}
 		bound_items.push(item);
 	}
 	Ok(builder.append_in_list(expr, bound_items, negated))
@@ -5333,11 +5518,38 @@ fn bind_boolean(
 	right: &Expr,
 	op: BoundBinaryOp,
 ) -> Result<BoundExprId, BindingError> {
-	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
-	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
-	require_boolean(builder, "boolean operator left", left)?;
-	require_boolean(builder, "boolean operator right", right)?;
+	let left =
+		bind_boolean_context_expr(builder, input_schema, ctx, "boolean operator left", left)?;
+	let right =
+		bind_boolean_context_expr(builder, input_schema, ctx, "boolean operator right", right)?;
 	Ok(builder.append_binary(op, left, right, DataType::Boolean))
+}
+
+fn bind_boolean_context_expr(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	context: &'static str,
+	expr: &Expr,
+) -> Result<BoundExprId, BindingError> {
+	if is_untyped_null(expr) {
+		return resolve_untyped_null(builder, &DataType::Boolean);
+	}
+	let expr = bind_expr_into_program(builder, expr, input_schema, ctx)?;
+	require_boolean(builder, context, expr)?;
+	Ok(expr)
+}
+
+fn bind_null_test_input(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	expr: &Expr,
+) -> Result<BoundExprId, BindingError> {
+	if is_untyped_null(expr) {
+		return resolve_untyped_null(builder, &DataType::Boolean);
+	}
+	bind_expr_into_program(builder, expr, input_schema, ctx)
 }
 
 fn require_boolean(

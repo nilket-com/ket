@@ -300,6 +300,12 @@ pub fn lit(val: i32) -> RuneExpr {
 	}
 }
 
+pub fn lit_null() -> RuneExpr {
+	RuneExpr {
+		expr: Expr::UntypedNull,
+	}
+}
+
 pub fn lit_str(value: String) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::Literal(ScalarValue::Utf8(Some(value))),
@@ -641,6 +647,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 
 	m.function(["col"], col).build()?;
 	m.function(["lit"], lit).build()?;
+	m.function(["lit_null"], lit_null).build()?;
 	m.function(["lit_str"], lit_str).build()?;
 	m.function(["lit_f64"], lit_f64).build()?;
 	m.function(["lit_bool"], lit_bool).build()?;

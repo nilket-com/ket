@@ -1365,7 +1365,9 @@ pub(crate) fn adr111_rune_case_lowers_to_existing_expr_case() {
 
 	assert!(ir.contains("Case {\n\t\twhen_then: Vec<(Box<Expr>, Box<Expr>)>"));
 	assert!(binder.contains("fn bind_case"));
-	assert!(binder.contains("require_boolean(builder, \"CASE WHEN\", condition)"));
+	assert!(binder.contains(
+		"bind_boolean_context_expr(builder, input_schema, ctx, \"CASE WHEN\", condition)?"
+	));
 	assert!(exec.contains("fn evaluate_case"));
 	assert!(pbc.contains("BoundExprNode::Case"));
 	assert!(!pbc.contains("OP_CASE"));
@@ -1384,6 +1386,33 @@ pub(crate) fn adr111_rune_case_lowers_to_existing_expr_case() {
 	] {
 		assert!(tests.contains(behavior), "missing behavior gate {behavior}");
 	}
+}
+
+#[test]
+pub(crate) fn adr112_rune_lit_null_is_thin_authoring_alias() {
+	let rune = rune_engine_source();
+	let ir = ir_source();
+	let binder = binder_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+	let lit_null = source_block(&rune, "pub fn lit_null");
+
+	assert!(ir.contains("UntypedNull"));
+	assert!(lit_null.contains("-> RuneExpr"));
+	assert!(lit_null.contains("Expr::UntypedNull"));
+	assert!(module.contains("m.function([\"lit_null\"], lit_null).build()?;"));
+	assert!(
+		names.iter().any(|name| name == "lit_null"),
+		"ADR112 Rune lit_null function missing: {names:?}"
+	);
+	for forbidden in ["BindingError", "BoundExpr", "ExecutionPlan", "PBC"] {
+		assert!(
+			!lit_null.contains(forbidden),
+			"Rune lit_null authoring surface gained substrate marker {forbidden}"
+		);
+	}
+	assert!(binder.contains("Expr::UntypedNull => Err"));
+	assert!(binder.contains("fn resolve_untyped_null"));
 }
 
 #[test]

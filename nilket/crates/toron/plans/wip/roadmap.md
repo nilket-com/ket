@@ -790,7 +790,8 @@ run, 079+).
   `binder.rs:4873` to-do: *"Revisit … if general explicit NULL literals become supported"*) and admits explicit
   `NULL` across the SQL expression surface. **Doctrine: NULL is typed *late* by context, never by pretending to
   be Utf8.** A new **transient `Expr::UntypedNull`** (the `SqlLogicalCast`/`LogicalAscription` precedent —
-  binder-consumed, **never in `BoundExprNode`**, so zero executor/PBC/`NullArray`/Wendelon change) lowers from
+  binder-consumed, **never in `BoundExprNode`**, so no executor-kernel/PBC/`NullArray`/Wendelon substrate change;
+  one executor evaluator nuance is `evaluate_in_list` switching to Kleene OR for residual IN-with-NULL 3VL) lowers from
   `Value::Null` (lifting the `:3690` reject); the binder materializes it to a typed `ScalarValue::T(None)`
   wherever a **local context supplies a physical type** — designated slots (`CAST(NULL AS T)` physical **and**
   logical, `SET col = NULL`, CASE result + missing-ELSE, Boolean/null-test positions) **and** typed sibling operands
@@ -807,7 +808,8 @@ run, 079+).
   NULL` (needs a `DataType::Null`/`NullArray` *execution* substrate) and `NVL2` (a 109-family sugar, off-topic).
   Guards `adr112_explicit_null_is_transient_binder_consumed` / `adr112_null_sentinel_retired` /
   `adr112_untyped_null_rejects_without_context` / `adr112_null_predicates_stay_residual`; reconcile the 109/110 +
-  Rune surface-name guards. No bound-arena/executor/PBC/Wendelon/storage change. Genuine 3-of-3 on the carrier +
+  Rune surface-name guards. No bound-arena/executor-kernel/PBC/Wendelon/storage substrate change beyond the
+  `or_kleene` residual IN-list correction. Genuine 3-of-3 on the carrier +
   context-typed scope (Gemini conceded `ScalarValue::Null` → transient
   carrier + default-Utf8 → reject; Claude conceded its comparison/arithmetic *deferral* on the verified binary-op-
   contract + PBC-residual grounding — the small-cut-ossification self-check — and added the PBC-residual-mechanism
@@ -900,8 +902,9 @@ touch no seams, but the question is asked.
 ### ADR 112 promoted; ADR 113 candidates
 
 ADR 112 selected and promoted **explicit `NULL` literal** — a transient `Expr::UntypedNull` typed late by the
-binder (designated slots + typed siblings) or rejected, retiring the 109 `Utf8(None)` sentinel; **zero
-execution/PBC/Wendelon change**. Genuine 3-of-3 on the carrier + context-typed scope (Gemini conceded `ScalarValue::Null`→carrier; Claude conceded
+binder (designated slots + typed siblings) or rejected, retiring the 109 `Utf8(None)` sentinel; **no
+execution-substrate/PBC/Wendelon change, except `evaluate_in_list` adopting Kleene OR for residual IN-with-NULL
+3VL correctness**. Genuine 3-of-3 on the carrier + context-typed scope (Gemini conceded `ScalarValue::Null`→carrier; Claude conceded
 its comparison/arithmetic deferral on grounding; operator folded `CAST(NULL AS LogicalType)` in — the complete
 explicit-NULL cut, not a granular slice). **Scope each candidate as a complete cut, not a ~100-line granular
 slice** (operator steer — fold adjacent surface in rather than spawning a follow-on ADR per small thing). No

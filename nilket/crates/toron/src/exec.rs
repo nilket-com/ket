@@ -22,7 +22,7 @@ use arrow::array::{
 	Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
 	StringArray, StringBuilder, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or};
+use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or, or_kleene};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::compute::kernels::comparison::{
 	ilike as arrow_ilike, like as arrow_like, nilike as arrow_nilike, nlike as arrow_nlike,
@@ -850,6 +850,9 @@ impl Executor {
 					]))),
 				}
 			}
+			Expr::UntypedNull => Err(ExecutionError::Kernel {
+				message: "internal: unresolved NULL literal reached execution".to_string(),
+			}),
 			Expr::Cast(inner, target) => {
 				let arr = self.evaluate_expr(inner, batch)?;
 				evaluate_cast(&arr, target)
@@ -1882,7 +1885,7 @@ fn evaluate_in_list(
 	for item_arr in item_arrs {
 		let mask = eq(expr_arr, item_arr)?;
 		combined = Some(match combined {
-			Some(current) => or(&current, &mask)?,
+			Some(current) => or_kleene(&current, &mask)?,
 			None => mask,
 		});
 	}

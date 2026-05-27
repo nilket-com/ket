@@ -1,9 +1,10 @@
 # ADR 112: Explicit `NULL` Literal
 
 **Status:** Promoted (plan). **Genuine 3-of-3 on carrier + context-typed scope; operator-resolved D11 include.**
-**Toron-only, transient-IR + binder substrate; zero execution/PBC/Wendelon change.** **Predecessors:** 024
-(literals), 087/092/093 (transient binder-consumed `Expr` + logical-cast reconcile path), 108/109/110/111 (CASE
-substrate + the `Utf8(None)` sentinel this ADR retires). **Migration:** `plans/impl/112_explicit_null_literal.md`.
+**Toron-only, transient-IR + binder substrate; no bound/executor-kernel/PBC/Wendelon substrate change, with one
+executor evaluator correction for residual IN-list 3VL.** **Predecessors:** 024 (literals), 087/092/093
+(transient binder-consumed `Expr` + logical-cast reconcile path), 108/109/110/111 (CASE substrate + the
+`Utf8(None)` sentinel this ADR retires). **Migration:** `plans/impl/112_explicit_null_literal.md`.
 
 ## Doctrine — NULL is typed late by context, never by pretending to be Utf8
 
@@ -24,7 +25,9 @@ literals become supported"* (`binder.rs:4873`). This is that ADR.
 
 Reject is the *default* arm, so any position not taught to type a NULL is sound by construction. This is the
 `SqlLogicalCast`/`LogicalAscription` pattern (a transient `Expr` the binder resolves away): `UntypedNull` **never
-reaches `BoundExprNode`**, so there is no executor, PBC opcode, Arrow `NullArray`, storage, or Wendelon change.
+reaches `BoundExprNode`**, so there is no executor kernel, PBC opcode, Arrow `NullArray`, storage, or Wendelon
+change. The one executor nuance is not a NULL representation: residual IN-list evaluation must combine member
+equality masks with Kleene OR so the newly legal `x IN (NULL, v)` obeys 3VL (`TRUE` wins over `UNKNOWN`).
 
 ## Scale boundary — the *complete* explicit-NULL cut (not a granular slice)
 
@@ -35,6 +38,8 @@ comparison, arithmetic, IN-list; retire the sentinel + unify the typer; Rune `li
 granularity:** contextless `SELECT NULL` / `COALESCE(NULL, NULL)` (needs a `DataType::Null` + Arrow `NullArray`
 *execution* substrate — a real separate cut, not friction); `NVL2` (a 109-family conditional sugar, a different
 topic — it never produces a NULL literal); INSERT row-value rewrite (its `InsertLiteral::Null` path already works).
+One executor evaluator correction rides with D7: `evaluate_in_list` uses `or_kleene` for residual IN-list masks so
+NULL members do not poison later TRUE matches. This is not a new execution substrate, kernel, or typed-NULL carrier.
 
 ## Grounding (verified)
 
@@ -105,9 +110,12 @@ CustomerId)` → a null Int64 carrying `CustomerId`; `TRY_CAST` nullable parity.
 impl and judged it a natural extension of the same helper; folded in rather than deferred to avoid a granular
 follow-on ADR.)*
 
-**D12 — No bound-arena / executor / PBC / Wendelon / storage change.** `UntypedNull` is a transient leaf; the
-logical-`Expr` walkers 108 touched gain a trivial leaf arm. INSERT `InsertLiteral::Null` (`:908`) stays (may share
-the typer).
+**D12 — No bound-arena / executor kernel / PBC / Wendelon / storage substrate change.** `UntypedNull` is a
+transient leaf; the logical-`Expr` walkers 108 touched gain a trivial leaf arm. The executor has one load-bearing
+evaluator correction: residual `evaluate_in_list` uses Kleene OR for `x IN (NULL, v)` / `NOT IN (NULL, v)` 3VL
+correctness. The defensive raw-`Expr` `UntypedNull` arm is an internal backstop; no `BoundExprNode::UntypedNull`,
+PBC opcode, `NullArray`, storage, or Wendelon carrier exists. INSERT `InsertLiteral::Null` (`:908`) stays (may
+share the typer).
 
 ## Behavior gates
 
@@ -127,8 +135,9 @@ the typer).
 
 ## Architecture guards
 
-- `adr112_explicit_null_is_transient_binder_consumed` — `Expr::UntypedNull` exists; **no** `BoundExprNode` /
-  executor / PBC arm (pins transient-ness, the `SqlLogicalCast` precedent).
+- `adr112_explicit_null_is_transient_binder_consumed` — `Expr::UntypedNull` exists; **no** `BoundExprNode` / PBC
+  arm (pins transient-ness, the `SqlLogicalCast` precedent); the executor's raw-`Expr` arm is only a defensive
+  unresolved-marker backstop.
 - `adr112_null_sentinel_retired` — no `Utf8(None)` sentinel; `update_null_placeholder` /
   `conditional_null_placeholder` / `is_case_null_placeholder` absent; one `typed_null_for_data_type`.
 - `adr112_untyped_null_rejects_without_context` — the reject backstop.
@@ -163,5 +172,6 @@ guidance; the `Utf8(None)` sentinel is gone (one marker, one `typed_null_for_dat
 col = NULL` regress green; the `NOT IN (NULL) → empty` trap + 3VL comparisons are pinned residual; 110 identity +
 all-NULL reject hold; `CAST(NULL AS CustomerId)` carries identity; Rune `lit_null()` binds by the same rules; the
 `adr112_*` guards pin transient-ness + sentinel-retirement + reject backstop + PBC-residual; **no** bound-arena /
-executor / PBC / Wendelon / storage change; targeted + Toron suite green. Migration:
+executor-kernel / PBC / Wendelon / storage substrate change, except residual `evaluate_in_list` adopting Kleene OR
+for 3VL with NULL members; targeted + Toron suite green. Migration:
 `plans/impl/112_explicit_null_literal.md`.

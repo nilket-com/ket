@@ -136,14 +136,14 @@ pub(crate) fn adr087_nominal_comparison_gate_after_physical_coercion() {
 	let coerce = comparison
 		.find("coerce_comparison_literals")
 		.expect("comparison literal coercion");
-	let physical_check = comparison
+	let non_null_branch = &comparison[coerce..];
+	let physical_check = non_null_branch
 		.find("if left_type != right_type")
 		.expect("physical comparison type gate");
-	let nominal = comparison
+	let nominal = non_null_branch
 		.find("nominal_compatible")
 		.expect("nominal comparison gate");
 
-	assert!(coerce < physical_check);
 	assert!(physical_check < nominal);
 }
 
@@ -162,7 +162,9 @@ pub(crate) fn adr110_case_preserves_compatible_logical_identity() {
 	let bind_case = source_block(&binder, "fn bind_case");
 	let case_output = source_block(&binder, "fn case_output_logical_type");
 
-	assert!(bind_case.contains("case_output_logical_type(builder, &result_ids, &output_type)?"));
+	assert!(
+		bind_case.contains("case_output_logical_type(builder, &typed_result_ids, &output_type)?")
+	);
 	let append_case = bind_case
 		.find("builder.append_case")
 		.expect("CASE node append");
@@ -176,13 +178,13 @@ pub(crate) fn adr110_case_preserves_compatible_logical_identity() {
 		"node_type",
 		"node_logical_type",
 		"builder.literal",
-		"is_case_null_placeholder",
 		"nominal_compatible(",
 		"branch_type != *output_type",
 		"cast explicitly to erase identity before widening",
 	] {
 		assert!(case_output.contains(marker), "missing CASE marker {marker}");
 	}
+	assert!(!case_output.contains("is_case_null_placeholder"));
 	assert!(!case_output.contains("reconcile_identity"));
 }
 
@@ -826,14 +828,14 @@ pub(crate) fn adr092_logical_cast_reconciles_identity_before_physical_cast() {
 	let reconcile = bind_cast
 		.find("reconcile_identity(existing, spec.id, &source)")
 		.expect("logical identity reconciliation");
-	let append_cast = bind_cast
+	let non_null_branch = &bind_cast[reconcile..];
+	let append_cast = non_null_branch
 		.find("builder.append_cast")
 		.expect("physical cast append");
-	let stamp = bind_cast
+	let stamp = non_null_branch
 		.find("builder.set_node_logical_type(output, logical_type)")
 		.expect("logical type stamp");
 
-	assert!(reconcile < append_cast);
 	assert!(append_cast < stamp);
 	assert!(bind_cast.contains("source == spec.physical"));
 	assert!(bind_cast.contains("is_supported_explicit_numeric_cast(&source, &spec.physical)"));
@@ -879,15 +881,15 @@ pub(crate) fn adr093_logical_try_cast_reconciles_identity_before_try_cast() {
 	let try_branch = bind_cast
 		.find("let output = if try_cast")
 		.expect("logical TRY_CAST branch");
-	let append_try = bind_cast
+	let try_branch_body = &bind_cast[try_branch..];
+	let append_try = try_branch_body
 		.find("builder.append_try_cast")
 		.expect("TRY_CAST append");
-	let stamp = bind_cast
+	let stamp = try_branch_body
 		.find("builder.set_node_logical_type(output, logical_type)")
 		.expect("logical type stamp");
 
 	assert!(reconcile < try_branch);
-	assert!(try_branch < append_try);
 	assert!(append_try < stamp);
 }
 

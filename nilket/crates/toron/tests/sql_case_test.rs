@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
@@ -379,14 +379,12 @@ async fn if_condition_must_be_boolean() {
 	}
 }
 
-#[test]
-fn if_explicit_null_condition_remains_unsupported() {
-	let err = SqlPlanner::new()
-		.plan("SELECT IF(NULL, 1, 0) FROM sales")
-		.expect_err("IF NULL condition should reject during lowering");
-	assert!(
-		err.to_string()
-			.contains("explicit NULL literal not supported")
+#[tokio::test]
+async fn if_explicit_null_condition_is_no_match() {
+	let batches = run_sql("SELECT IF(NULL, 1, 0) FROM sales").await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]
 	);
 }
 
@@ -401,14 +399,25 @@ fn if_arity_not_three_rejects() {
 	);
 }
 
-#[test]
-fn nullif_explicit_null_operand_remains_unsupported() {
-	let err = SqlPlanner::new()
-		.plan("SELECT NULLIF(NULL, amount) FROM sales")
-		.expect_err("NULLIF explicit NULL operand should reject");
-	assert!(
-		err.to_string()
-			.contains("explicit NULL literal not supported")
+#[tokio::test]
+async fn nullif_first_explicit_null_operand_rejects_without_result_type() {
+	let err = bind_sql_result("SELECT NULLIF(NULL, amount) FROM sales")
+		.await
+		.expect_err("NULLIF first explicit NULL operand should reject");
+	match err {
+		BindingError::TypeMismatch { message } => {
+			assert!(message.contains("no typed (non-NULL) result branch"));
+		}
+		other => panic!("unexpected error: {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn nullif_second_explicit_null_operand_returns_first_arg() {
+	let batches = run_sql("SELECT NULLIF(amount, NULL) FROM sales").await;
+	assert_eq!(
+		int32_column_rows(&batches, 0),
+		vec![Some(10), Some(0), None, Some(30), Some(40), Some(7)]
 	);
 }
 
@@ -530,15 +539,66 @@ async fn conditional_sugar_inherits_case_eager_hard_error() {
 	}
 }
 
-#[test]
-fn bare_select_null_remains_unsupported() {
-	let err = SqlPlanner::new()
-		.plan("SELECT NULL FROM sales")
+#[tokio::test]
+async fn bare_select_null_rejects_without_type_context() {
+	let err = bind_sql_result("SELECT NULL FROM sales")
+		.await
 		.expect_err("bare NULL should remain unsupported");
-	assert!(
-		err.to_string()
-			.contains("explicit NULL literal not supported")
+	match err {
+		BindingError::UnsupportedExpression { message } => {
+			assert!(message.contains("NULL literal has no type in this position"));
+			assert!(message.contains("CAST(NULL AS <type>)"));
+		}
+		other => panic!("unexpected error: {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn cast_null_as_type_projects_typed_null() {
+	let bound = bind_sql("SELECT CAST(NULL AS BIGINT), TRY_CAST(NULL AS BIGINT) FROM sales").await;
+	let ExecutionPlan::Project { exprs, .. } = &bound else {
+		panic!("expected project");
+	};
+	assert_eq!(exprs.root_type(0), Some(&DataType::Int64));
+	assert_eq!(exprs.root_type(1), Some(&DataType::Int64));
+
+	let batches = execute_bound(&bound).await.expect("execute NULL casts");
+	let expected = vec![None, None, None, None, None, None];
+	assert_eq!(int64_column_rows(&batches, 0), expected);
+	assert_eq!(int64_column_rows(&batches, 1), expected);
+}
+
+#[tokio::test]
+async fn null_is_null_and_is_not_null_bind_without_sentinel() {
+	let batches = run_sql("SELECT NULL IS NULL, NULL IS NOT NULL FROM sales").await;
+	assert_eq!(
+		bool_column_rows(&batches, 0),
+		vec![
+			Some(true),
+			Some(true),
+			Some(true),
+			Some(true),
+			Some(true),
+			Some(true)
+		]
 	);
+	assert_eq!(
+		bool_column_rows(&batches, 1),
+		vec![
+			Some(false),
+			Some(false),
+			Some(false),
+			Some(false),
+			Some(false),
+			Some(false)
+		]
+	);
+}
+
+#[tokio::test]
+async fn arithmetic_with_null_operand_executes() {
+	let batches = run_sql("SELECT amount + NULL FROM sales").await;
+	assert_eq!(int32_column_rows(&batches, 0), vec![None; 6]);
 }
 
 #[test]
@@ -663,6 +723,21 @@ fn int64_column_rows(batches: &[RecordBatch], column_idx: usize) -> Vec<Option<i
 				.as_any()
 				.downcast_ref::<Int64Array>()
 				.expect("Int64 column")
+				.iter()
+				.collect::<Vec<_>>()
+		})
+		.collect()
+}
+
+fn bool_column_rows(batches: &[RecordBatch], column_idx: usize) -> Vec<Option<bool>> {
+	batches
+		.iter()
+		.flat_map(|batch| {
+			batch
+				.column(column_idx)
+				.as_any()
+				.downcast_ref::<BooleanArray>()
+				.expect("Boolean column")
 				.iter()
 				.collect::<Vec<_>>()
 		})
