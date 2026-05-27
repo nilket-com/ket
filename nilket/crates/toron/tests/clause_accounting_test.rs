@@ -38,9 +38,19 @@ fn top_level_order_by_limit_offset_is_supported() {
 }
 
 #[test]
-fn limit_and_offset_without_order_by_are_unsupported() {
+fn bare_limit_without_order_by_lowers_to_take() {
+	// ADR 116: bare LIMIT (no ORDER BY) is unordered bounded take, not a rejection.
+	let plan = plan_sql("SELECT id FROM t LIMIT 1");
+	assert!(
+		matches!(plan, LogicalPlan::Take { limit: 1, .. }),
+		"expected unordered Take, got {plan:?}"
+	);
+}
+
+#[test]
+fn offset_without_order_by_is_unsupported() {
+	// ADR 116 admits bare LIMIT but keeps unordered OFFSET (and LIMIT ... OFFSET) rejected.
 	for sql in [
-		"SELECT id FROM t LIMIT 1",
 		"SELECT id FROM t OFFSET 1",
 		"SELECT id FROM t LIMIT 1 OFFSET 1",
 	] {

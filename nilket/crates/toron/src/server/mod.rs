@@ -868,7 +868,8 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. } => join_strategy_label(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => join_strategy_label(input),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -890,7 +891,8 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. } => contains_join(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => contains_join(input),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -915,6 +917,7 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::Project { .. } => "project",
 			ExecutionPlan::Aggregate { .. } => "aggregate",
 			ExecutionPlan::Sort { .. } => "sort",
+			ExecutionPlan::Take { .. } => "take",
 			ExecutionPlan::EmptyRelation { .. } => "empty_relation",
 			ExecutionPlan::SystemTable { .. } => "system_table",
 			ExecutionPlan::Scan { .. } => "scan",
@@ -1077,7 +1080,8 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. } => contains_broadcast_join(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => contains_broadcast_join(input),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1957,6 +1961,7 @@ mod tests {
 			projection: None,
 			pbc_program: None,
 			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		}
@@ -2026,7 +2031,8 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. } => scan_schema_for_table_id(input, table_id),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => scan_schema_for_table_id(input, table_id),
 		ExecutionPlan::Join { left, right, .. } => scan_schema_for_table_id(left, table_id)
 			.or_else(|| scan_schema_for_table_id(right, table_id)),
 		ExecutionPlan::EmptyRelation { .. }

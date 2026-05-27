@@ -15,8 +15,8 @@ use toron::error::{BindingError, ExecutionError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
 	BoundExprProgram, BoundExprProgramBuilder, ColumnName, ColumnOrdinal, ExecutionPlan,
-	ExecutionSortKey, Expr, JoinKind, JoinStrategy, LogicalPlan, QueryProfileHint, ResolvedColumn,
-	ScalarValue, SortExpr, TableId,
+	ExecutionSortKey, Expr, FilterDisposition, JoinKind, JoinStrategy, LogicalPlan,
+	QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -138,20 +138,93 @@ async fn sql_derived_sort_alias_columns_apply_after_sort() {
 }
 
 #[test]
-fn limit_without_order_by_rejects_top_level_and_derived() {
-	for sql in [
-		"SELECT id FROM t LIMIT 1",
-		"SELECT id FROM (SELECT id FROM t LIMIT 1) AS p",
-	] {
-		let err = SqlPlanner::new()
-			.plan(sql)
-			.expect_err("LIMIT should reject");
-		assert!(
-			err.to_string()
-				.contains("LIMIT/OFFSET without ORDER BY is not supported"),
-			"{sql}: {err}"
-		);
-	}
+fn limit_without_order_by_lowers_to_unordered_take() {
+	let plan = SqlPlanner::new()
+		.plan("SELECT id FROM t LIMIT 2")
+		.expect("plan bare limit");
+
+	let LogicalPlan::Take { input, limit } = plan else {
+		panic!("expected unordered take");
+	};
+	assert_eq!(limit, 2);
+	assert!(matches!(input.as_ref(), LogicalPlan::Project { .. }));
+}
+
+#[test]
+fn offset_without_order_by_still_rejects() {
+	let err = SqlPlanner::new()
+		.plan("SELECT id FROM t LIMIT 1 OFFSET 1")
+		.expect_err("unordered offset should reject");
+	assert!(
+		err.to_string()
+			.contains("LIMIT/OFFSET without ORDER BY is not supported"),
+		"{err}"
+	);
+}
+
+#[tokio::test]
+async fn sql_bare_limit_executes_as_unordered_take() {
+	let batch = run_sql("SELECT id FROM t LIMIT 2").await;
+	assert_i64_values_in(&batch, 0, 2, &[1, 2, 3, 4, 5, 9]);
+
+	let derived = run_sql("SELECT id FROM (SELECT id FROM t LIMIT 3) AS p LIMIT 2").await;
+	assert_i64_values_in(&derived, 0, 2, &[1, 2, 3, 4, 5, 9]);
+
+	let empty = run_sql("SELECT id FROM t LIMIT 0").await;
+	assert_eq!(empty.num_rows(), 0);
+}
+
+#[tokio::test]
+async fn bind_bare_limit_pushes_scan_row_limit_into_fully_pushed_scan() {
+	let (catalog, _) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM t WHERE id > 2 LIMIT 2")
+		.expect("plan filtered bare limit");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind filtered bare limit");
+
+	let ExecutionPlan::Take { input, limit, .. } = bound else {
+		panic!("expected take");
+	};
+	assert_eq!(limit, 2);
+	let ExecutionPlan::Scan {
+		row_limit,
+		pbc_program,
+		..
+	} = scan_under(input.as_ref())
+	else {
+		panic!("expected scan under take");
+	};
+	assert_eq!(*row_limit, Some(2));
+	assert!(pbc_program.is_some());
+}
+
+#[tokio::test]
+async fn bind_bare_limit_does_not_push_scan_row_limit_below_residual_filter() {
+	let (catalog, _) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM t WHERE label LIKE 'a%' LIMIT 2")
+		.expect("plan residual filtered bare limit");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind residual filtered bare limit");
+
+	let ExecutionPlan::Take { input, limit, .. } = bound else {
+		panic!("expected take");
+	};
+	assert_eq!(limit, 2);
+	let ExecutionPlan::Filter {
+		input, disposition, ..
+	} = input.as_ref()
+	else {
+		panic!("expected residual filter under take");
+	};
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	let ExecutionPlan::Scan { row_limit, .. } = input.as_ref() else {
+		panic!("expected scan under residual filter");
+	};
+	assert_eq!(*row_limit, None);
 }
 
 #[tokio::test]
@@ -393,6 +466,35 @@ fn assert_i64_values(batch: &RecordBatch, column: usize, expected: &[i64]) {
 	assert_eq!(actual, expected);
 }
 
+fn assert_i64_values_in(batch: &RecordBatch, column: usize, expected_len: usize, allowed: &[i64]) {
+	let values = batch
+		.column(column)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("i64 column");
+	assert_eq!(values.len(), expected_len);
+	for row in 0..values.len() {
+		let value = values.value(row);
+		assert!(
+			allowed.contains(&value),
+			"unexpected unordered take row {value}"
+		);
+	}
+}
+
+fn scan_under(plan: &ExecutionPlan) -> &ExecutionPlan {
+	match plan {
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => scan_under(input),
+		ExecutionPlan::Join { .. } => panic!("join has multiple scans"),
+		other => other,
+	}
+}
+
 fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 	let schema = sort_schema();
 	let mut catalog = MockCatalog::new();
@@ -604,6 +706,7 @@ fn scan_with_schema(table_id: TableId, schema: SchemaRef, object_byte: u8) -> Ex
 		projection: None,
 		pbc_program: None,
 		row_identity: toron::storage::RowIdentityProjection::None,
+		row_limit: None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![ColumnOrdinal(0)],
 	}

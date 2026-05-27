@@ -264,6 +264,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			fingerprint,
 			schema,
 			projection,
+			row_limit,
 			profile_hint,
 			primary_key_columns,
 			..
@@ -274,6 +275,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			schema,
 			projection,
 			pbc_program: None,
+			row_limit,
 			profile_hint,
 			primary_key_columns,
 			row_identity: RowIdentityProjection::None,

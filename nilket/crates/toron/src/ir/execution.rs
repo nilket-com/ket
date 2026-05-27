@@ -204,6 +204,7 @@ pub enum ExecutionPlan {
 		schema: SchemaRef,
 		projection: Option<Vec<ColumnOrdinal>>,
 		pbc_program: Option<PbcProgram>,
+		row_limit: Option<usize>,
 		row_identity: RowIdentityProjection,
 		profile_hint: QueryProfileHint,
 		primary_key_columns: Vec<ColumnOrdinal>,
@@ -234,6 +235,11 @@ pub enum ExecutionPlan {
 		order_by: Vec<ExecutionSortKey>,
 		limit: Option<usize>,
 		offset: usize,
+		output_schema: SchemaRef,
+	},
+	Take {
+		input: Box<ExecutionPlan>,
+		limit: usize,
 		output_schema: SchemaRef,
 	},
 	Join {
@@ -321,6 +327,7 @@ impl ExecutionPlan {
 			Self::Aggregate { output_schema, .. } => output_schema.clone(),
 			Self::Exchange { input, .. } => input.schema(),
 			Self::Sort { output_schema, .. } => output_schema.clone(),
+			Self::Take { output_schema, .. } => output_schema.clone(),
 			Self::Join { output_schema, .. } => output_schema.clone(),
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
 			Self::CreateLogicalType { .. } => Arc::new(Schema::empty()),

@@ -217,6 +217,15 @@ impl<'a> Binder<'a> {
 						output_schema,
 					})
 				}
+				LogicalPlan::Take { input, limit } => {
+					let input = self.bind_plan(input).await?;
+					let output_schema = input.schema();
+					Ok(ExecutionPlan::Take {
+						input: Box::new(input),
+						limit: *limit,
+						output_schema,
+					})
+				}
 				LogicalPlan::Join {
 					left,
 					right,
@@ -2967,6 +2976,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		schema: binding.schema,
 		projection,
 		pbc_program: None,
+		row_limit: None,
 		row_identity: crate::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: sorted_columns(&binding.primary_key_columns),
@@ -3160,7 +3170,8 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
-		| LogicalPlan::Sort { input, .. } => collect_qualifiers(input, qualifiers),
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. } => collect_qualifiers(input, qualifiers),
 		LogicalPlan::Join {
 			left, right, kind, ..
 		} => match kind {
@@ -3382,7 +3393,8 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Sort { input, .. } => terminal_exchange(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => terminal_exchange(input),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -3749,6 +3761,30 @@ fn push_down_scan_projection(plan: ExecutionPlan) -> Result<ExecutionPlan, Bindi
 	Ok(plan)
 }
 
+fn apply_safe_row_limit_to_scan(plan: &mut ExecutionPlan, limit: usize) -> bool {
+	match plan {
+		ExecutionPlan::Scan {
+			row_identity,
+			row_limit,
+			..
+		} if *row_identity == crate::storage::RowIdentityProjection::None => {
+			*row_limit = Some(row_limit.map_or(limit, |existing| existing.min(limit)));
+			true
+		}
+		ExecutionPlan::Filter {
+			input,
+			disposition: FilterDisposition::FullyPushed,
+			..
+		} => apply_safe_row_limit_to_scan(input, limit),
+		ExecutionPlan::Take {
+			input,
+			limit: inner_limit,
+			..
+		} => apply_safe_row_limit_to_scan(input, limit.min(*inner_limit)),
+		_ => false,
+	}
+}
+
 fn optimize_for_required(
 	plan: ExecutionPlan,
 	required_output: Option<BTreeSet<ColumnOrdinal>>,
@@ -3778,6 +3814,7 @@ fn optimize_for_required(
 			schema,
 			projection: _,
 			pbc_program,
+			row_limit,
 			row_identity,
 			profile_hint,
 			primary_key_columns,
@@ -3800,6 +3837,7 @@ fn optimize_for_required(
 					schema,
 					projection: Some(requested),
 					pbc_program,
+					row_limit,
 					row_identity,
 					profile_hint,
 					primary_key_columns,
@@ -3940,6 +3978,29 @@ fn optimize_for_required(
 					order_by,
 					limit,
 					offset,
+					output_schema,
+				},
+				output_remap,
+			))
+		}
+		ExecutionPlan::Take {
+			input,
+			limit,
+			output_schema,
+		} => {
+			let output_len = output_schema.fields().len();
+			let (mut input, _) = optimize_for_required(*input, None)?;
+			apply_safe_row_limit_to_scan(&mut input, limit);
+			let output_remap = ordinal_remap(
+				&output_columns(output_len)
+					.iter()
+					.copied()
+					.collect::<Vec<_>>(),
+			);
+			Ok((
+				ExecutionPlan::Take {
+					input: Box::new(input),
+					limit,
 					output_schema,
 				},
 				output_remap,

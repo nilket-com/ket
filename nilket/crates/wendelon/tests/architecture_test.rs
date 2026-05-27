@@ -6683,8 +6683,8 @@ fn adr073_table_query_request_id_is_required_fixed_meta() {
 		"pub struct TableQueryCancelStatus",
 	);
 	assert!(meta.contains("pub request_id: TableQueryRequestId"));
-	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 168"));
-	assert!(schema.contains("offset_of!(TableQueryRequestMeta, request_id), 120"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
+	assert!(schema.contains("offset_of!(TableQueryRequestMeta, request_id), 128"));
 	assert!(client.contains("TABLE_QUERY_REQ request_id must be non-zero"));
 	assert!(data_server.contains("TABLE_QUERY_REQ request_id must be non-zero"));
 }
@@ -7088,7 +7088,7 @@ fn adr074_table_query_trace_carrier_is_fixed_binary_not_traceparent() {
 #[test]
 fn adr074_table_query_meta_widens_tail_without_extension_or_v1_sidecar() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
-	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 168"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
 	for forbidden in [
 		"TableQueryRequestMetaV1",
 		"TableQueryRequestMetaExtension",
@@ -7105,13 +7105,13 @@ fn adr074_table_query_meta_widens_tail_without_extension_or_v1_sidecar() {
 fn adr074_trace_meta_offsets_are_pinned() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
 	for required in [
-		"offset_of!(TableQueryRequestMeta, trace_id), 136",
+		"offset_of!(TableQueryRequestMeta, trace_id), 144",
 		"offset_of!(TableQueryRequestMeta, trace_parent_span_id)",
-		"152",
-		"offset_of!(TableQueryRequestMeta, trace_flags)",
 		"160",
-		"offset_of!(TableQueryRequestMeta, _trace_pad), 161",
-		"161",
+		"offset_of!(TableQueryRequestMeta, trace_flags)",
+		"168",
+		"offset_of!(TableQueryRequestMeta, _trace_pad), 169",
+		"169",
 	] {
 		assert!(schema.contains(required), "missing offset pin {required}");
 	}
@@ -7348,6 +7348,36 @@ fn adr074_carrier_does_not_transmit_compute_trace_context_v1() {
 	);
 	assert!(!schema.contains("ComputeTraceContextV1"));
 	assert!(!options_region.contains("ComputeTraceContextV1"));
+}
+
+#[test]
+fn adr116_table_query_row_limit_is_fixed_meta_not_sidecar_budget() {
+	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let options_region = source_region(
+		&client,
+		"pub struct TableQueryOptions",
+		"pub struct WriteReceipt",
+	);
+	let meta_region = source_region(
+		&schema,
+		"pub struct TableQueryRequestMeta",
+		"pub struct TableQueryCancelStatus",
+	);
+
+	assert!(options_region.contains("pub row_limit: Option<NonZeroU64>"));
+	assert!(client.contains("row_limit_rows: options.row_limit.map(NonZeroU64::get).unwrap_or(0)"));
+	assert!(meta_region.contains("pub row_limit_rows: u64"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
+	assert!(schema.contains("offset_of!(TableQueryRequestMeta, row_limit_rows)"));
+	assert!(schema.contains("120"));
+	assert!(data_server.contains("fn table_query_row_limit"));
+	assert!(data_server.contains("fn take_output_batch"));
+	assert!(data_server.contains("table_query_row_limit(meta)"));
+	assert!(data_server.contains("QueryExecutionBudget::default()"));
+	assert!(!schema.contains("TableQueryRequestMetaExtension"));
+	assert!(!schema.contains("TableQueryRequestMetaV1"));
 }
 
 #[test]

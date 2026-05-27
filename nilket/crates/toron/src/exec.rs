@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::aggregate_kernel;
-use crate::coordinator::materialize_scan_stream;
+use crate::coordinator::{materialize_scan_stream, materialize_scan_stream_bounded};
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use crate::distributed::cancellation::DownstreamCancellationContext;
 use crate::distributed::task::TaskTelemetry;
@@ -278,6 +278,7 @@ impl Executor {
 						profile_hint: self.context.profile_hint,
 						trace_context: self.context.trace_context,
 						morsel,
+						row_limit: None,
 						downstream_cancellation: self.context.downstream_cancellation.clone(),
 					};
 					let span = crate::telemetry::storage_scan_span(&req);
@@ -608,6 +609,18 @@ impl Executor {
 				LogicalPlan::Sort { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical sort execution",
 				}),
+				LogicalPlan::Take { input, limit } => {
+					if *limit == 0 {
+						let input_batches = self.execute(input, morsel).await?;
+						let schema = input_batches
+							.first()
+							.map(RecordBatch::schema)
+							.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
+						return Ok(vec![RecordBatch::new_empty(schema)]);
+					}
+					let input_batches = self.execute(input, morsel).await?;
+					Ok(take_batches(input_batches, *limit))
+				}
 				LogicalPlan::Join { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical join execution",
 				}),
@@ -660,6 +673,7 @@ impl Executor {
 					fingerprint,
 					projection,
 					pbc_program,
+					row_limit,
 					row_identity,
 					profile_hint,
 					..
@@ -679,11 +693,15 @@ impl Executor {
 						profile_hint: Some(*profile_hint),
 						trace_context: self.context.trace_context,
 						morsel,
+						row_limit: *row_limit,
 						downstream_cancellation: self.context.downstream_cancellation.clone(),
 					};
 					let span = crate::telemetry::storage_scan_span(&req);
 					let stream = self.storage.scan(req).instrument(span).await?;
-					Ok(materialize_scan_stream(stream).await?)
+					Ok(match row_limit {
+						Some(limit) => materialize_scan_stream_bounded(stream, *limit).await?,
+						None => materialize_scan_stream(stream).await?,
+					})
 				}
 				ExecutionPlan::Filter {
 					input,
@@ -757,6 +775,17 @@ impl Executor {
 						output_schema,
 						self.context.task_budget,
 					)
+				}
+				ExecutionPlan::Take {
+					input,
+					limit,
+					output_schema,
+				} => {
+					if *limit == 0 {
+						return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
+					}
+					let input_batches = self.execute_bound(input, morsel).await?;
+					Ok(take_batches(input_batches, *limit))
 				}
 				ExecutionPlan::Join {
 					left,
@@ -1656,6 +1685,28 @@ impl Executor {
 			})
 			.collect()
 	}
+}
+
+fn take_batches(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch> {
+	let mut rows = 0usize;
+	let mut output = Vec::new();
+	for batch in batches {
+		if rows >= limit {
+			break;
+		}
+		if batch.num_rows() == 0 {
+			continue;
+		}
+		let remaining = limit - rows;
+		if batch.num_rows() <= remaining {
+			rows += batch.num_rows();
+			output.push(batch);
+		} else {
+			output.push(batch.slice(0, remaining));
+			break;
+		}
+	}
+	output
 }
 
 fn evaluated_child(
@@ -5162,6 +5213,7 @@ mod tests {
 			projection: None,
 			pbc_program: None,
 			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		};
@@ -6143,6 +6195,7 @@ mod tests {
 			projection: None,
 			pbc_program: None,
 			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		}

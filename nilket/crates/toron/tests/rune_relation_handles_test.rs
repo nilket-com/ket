@@ -250,6 +250,41 @@ async fn rune_limit_without_sort_rejects() {
 }
 
 #[tokio::test]
+async fn rune_take_is_unordered_and_chainable() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .take(4)
+               .take(2)
+               .project([col("id")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune unordered take");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind Rune unordered take");
+
+	let ExecutionPlan::Project { input, .. } = bound else {
+		panic!("expected project over take");
+	};
+	let ExecutionPlan::Take { input, limit, .. } = input.as_ref() else {
+		panic!("expected outer take");
+	};
+	assert_eq!(*limit, 2);
+	let ExecutionPlan::Take { input, limit, .. } = input.as_ref() else {
+		panic!("expected inner take");
+	};
+	assert_eq!(*limit, 4);
+	let ExecutionPlan::Scan { row_limit, .. } = input.as_ref() else {
+		panic!("expected scan under take chain");
+	};
+	assert_eq!(*row_limit, Some(2));
+}
+
+#[tokio::test]
 async fn rune_multiple_global_sorts_reject_loudly() {
 	let logical = rune_plan(
 		r#"
@@ -2102,6 +2137,7 @@ fn contains_scan_named(plan: &LogicalPlan, table: &str) -> bool {
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. }
 		| LogicalPlan::CreateTableAsSelect { source: input, .. }
 		| LogicalPlan::InsertSelect { source: input, .. } => contains_scan_named(input, table),
 		LogicalPlan::Join { left, right, .. } => {

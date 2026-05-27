@@ -191,6 +191,7 @@ mod tests {
 				profile_hint: None,
 				trace_context: None,
 				morsel: None,
+				row_limit: None,
 				downstream_cancellation: None,
 			},
 		)

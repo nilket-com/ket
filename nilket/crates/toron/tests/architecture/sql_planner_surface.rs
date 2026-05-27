@@ -2336,19 +2336,54 @@ pub(crate) fn adr115_no_merge_sort_or_topk_pushdown() {
 }
 
 #[test]
-pub(crate) fn adr115_unordered_limit_is_future_take_not_sort() {
+pub(crate) fn adr116_unordered_limit_is_take_not_sort() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
 	let rune = std::fs::read_to_string(manifest_dir().join("src/rune_engine.rs"))
 		.expect("read Rune source");
 	let tests = std::fs::read_to_string(manifest_dir().join("tests/sort_ordering_test.rs"))
 		.expect("read sort tests");
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
+	let execution_ir = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
 
 	assert!(planner.contains("LIMIT/OFFSET without ORDER BY is not supported"));
 	assert!(rune.contains("LIMIT/OFFSET without ORDER BY is not supported"));
-	assert!(tests.contains("limit_without_order_by_rejects_top_level_and_derived"));
-	assert!(!planner.contains("LogicalPlan::Take"));
-	assert!(!rune.contains("pub fn take"));
+	assert!(tests.contains("limit_without_order_by_lowers_to_unordered_take"));
+	assert!(tests.contains("offset_without_order_by_still_rejects"));
+	assert!(ir.contains("Take {\n\t\tinput: Box<LogicalPlan>"));
+	assert!(execution_ir.contains("Take {\n\t\tinput: Box<ExecutionPlan>"));
+	assert!(planner.contains("LogicalPlan::Take"));
+	assert!(binder.contains("ExecutionPlan::Take"));
+	assert!(binder.contains("apply_safe_row_limit_to_scan"));
+	assert!(rune.contains("pub fn take"));
+}
+
+#[test]
+pub(crate) fn adr116_row_limit_pushes_through_scan_request_to_wendelon_meta() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read Toron storage source");
+	let client =
+		std::fs::read_to_string(wendelon_manifest_dir().join("crates/wendelon-client/src/lib.rs"))
+			.expect("read Wendelon client source");
+	let schema = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema");
+	let data_server =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/network/data_server.rs"))
+			.expect("read Wendelon data server");
+
+	assert!(storage.contains("pub row_limit: Option<usize>"));
+	assert!(storage.contains("options.row_limit = request"));
+	assert!(storage.contains("std::num::NonZeroU64::new(limit as u64)"));
+	assert!(client.contains("pub row_limit: Option<NonZeroU64>"));
+	assert!(client.contains("row_limit_rows: options.row_limit.map(NonZeroU64::get).unwrap_or(0)"));
+	assert!(schema.contains("pub row_limit_rows: u64"));
+	assert!(schema.contains("offset_of!(TableQueryRequestMeta, row_limit_rows)"));
+	assert!(schema.contains("120"));
+	assert!(data_server.contains("fn table_query_row_limit"));
+	assert!(data_server.contains("fn take_output_batch"));
 }
 
 fn adr115_source_block(source: &str, marker: &str) -> String {

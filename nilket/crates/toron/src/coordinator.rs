@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 mod delete;
 mod write;
@@ -50,6 +50,33 @@ pub(crate) async fn materialize_scan_stream(
 	stream: ScanStream,
 ) -> Result<Vec<RecordBatch>, StorageError> {
 	stream.into_batches().try_collect().await
+}
+
+pub(crate) async fn materialize_scan_stream_bounded(
+	stream: ScanStream,
+	limit: usize,
+) -> Result<Vec<RecordBatch>, StorageError> {
+	let mut stream = stream.into_batches();
+	let mut rows = 0usize;
+	let mut batches = Vec::new();
+	while rows < limit {
+		let Some(batch) = stream.next().await else {
+			break;
+		};
+		let batch = batch?;
+		if batch.num_rows() == 0 {
+			continue;
+		}
+		let remaining = limit - rows;
+		if batch.num_rows() <= remaining {
+			rows += batch.num_rows();
+			batches.push(batch);
+		} else {
+			batches.push(batch.slice(0, remaining));
+			break;
+		}
+	}
+	Ok(batches)
 }
 
 pub struct DistributedQueryCoordinator<Registry, Transport>
@@ -1334,6 +1361,7 @@ fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, 
 		projection: None,
 		pbc_program: pbc_program.clone(),
 		row_identity: RowIdentityProjection::Append,
+		row_limit: None,
 		profile_hint: *profile_hint,
 		primary_key_columns: Vec::new(),
 	};

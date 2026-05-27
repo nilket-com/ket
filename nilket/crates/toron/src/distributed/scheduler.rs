@@ -772,7 +772,8 @@ fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFing
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. } => first_scan_fingerprint(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => first_scan_fingerprint(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
 		}
@@ -889,6 +890,7 @@ mod tests {
 				projection: None,
 				pbc_program: None,
 				row_identity: crate::storage::RowIdentityProjection::None,
+				row_limit: None,
 				profile_hint: crate::ir::QueryProfileHint::Scan,
 				primary_key_columns: Vec::new(),
 			},

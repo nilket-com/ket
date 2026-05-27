@@ -310,6 +310,18 @@ impl RuneDataFrame {
 		}
 	}
 
+	pub fn take(self, limit: i64) -> VmResult<Self> {
+		let Some(limit) = non_negative_usize_arg(limit) else {
+			return VmResult::panic("LIMIT/OFFSET expects a non-negative integer");
+		};
+		VmResult::Ok(Self {
+			plan: LogicalPlan::Take {
+				input: Box::new(self.plan),
+				limit,
+			},
+		})
+	}
+
 	pub fn offset(self, offset: i64) -> VmResult<Self> {
 		let Some(offset) = non_negative_usize_arg(offset) else {
 			return VmResult::panic("LIMIT/OFFSET expects a non-negative integer");
@@ -798,6 +810,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("aggregate", RuneDataFrame::aggregate)?;
 	m.associated_function("sort", RuneDataFrame::sort)?;
 	m.associated_function("limit", RuneDataFrame::limit)?;
+	m.associated_function("take", RuneDataFrame::take)?;
 	m.associated_function("offset", RuneDataFrame::offset)?;
 	m.associated_function("count", RuneDataFrame::count)?;
 

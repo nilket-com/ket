@@ -683,6 +683,10 @@ pub enum LogicalPlan {
 		limit: Option<usize>,
 		offset: usize,
 	},
+	Take {
+		input: Box<LogicalPlan>,
+		limit: usize,
+	},
 	Join {
 		left: Box<LogicalPlan>,
 		right: Box<LogicalPlan>,

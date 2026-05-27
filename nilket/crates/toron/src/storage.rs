@@ -60,6 +60,7 @@ pub struct ScanRequest {
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
 	pub morsel: Option<(MorselId, u32)>,
+	pub row_limit: Option<usize>,
 	pub downstream_cancellation: Option<DownstreamCancellationContext>,
 }
 
@@ -689,6 +690,10 @@ fn scan_in_memory_batch(
 		batch = append_row_identity_column(batch, &context.row_key_ids)?;
 	}
 
+	if let Some(limit) = request.row_limit {
+		batch = batch.slice(0, batch.num_rows().min(limit));
+	}
+
 	Ok(ScanStream::from_batches(
 		batch.schema(),
 		request.session_id,
@@ -895,6 +900,9 @@ impl StorageScan for WendelonStorageScan {
 			RowIdentityProjection::None => wendelon_client::RowIdentityProjection::None,
 			RowIdentityProjection::Append => wendelon_client::RowIdentityProjection::Append,
 		};
+		options.row_limit = request
+			.row_limit
+			.and_then(|limit| std::num::NonZeroU64::new(limit as u64));
 
 		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
 		if request
@@ -1509,6 +1517,7 @@ mod tests {
 			profile_hint: None,
 			trace_context: None,
 			morsel: None,
+			row_limit: None,
 			downstream_cancellation: None,
 		}
 	}
@@ -1549,6 +1558,7 @@ mod tests {
 			profile_hint: None,
 			trace_context: None,
 			morsel: Some((MorselId(1), 2)),
+			row_limit: None,
 			downstream_cancellation: None,
 		}
 	}

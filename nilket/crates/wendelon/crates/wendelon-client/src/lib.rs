@@ -5,6 +5,7 @@ use arrow::array::{Array, LargeBinaryArray, LargeBinaryBuilder};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -168,6 +169,7 @@ pub struct TableQueryOptions {
 	pub physical_descriptor_fingerprint: Option<PhysicalDescriptorFingerprint>,
 	pub row_identity: RowIdentityProjection,
 	pub trace_context: TableQueryTraceContext,
+	pub row_limit: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -191,6 +193,7 @@ impl Default for TableQueryOptions {
 			physical_descriptor_fingerprint: None,
 			row_identity: RowIdentityProjection::None,
 			trace_context: TableQueryTraceContext::Absent,
+			row_limit: None,
 		}
 	}
 }
@@ -1107,6 +1110,7 @@ impl Client {
 				bytecode_len,
 				runtime_filter_len,
 				as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
+				row_limit_rows: options.row_limit.map(NonZeroU64::get).unwrap_or(0),
 				request_id: TableQueryRequestId::ZERO,
 				trace_id: trace_tail.trace_id,
 				trace_parent_span_id: trace_tail.parent_span_id,
@@ -1348,6 +1352,7 @@ fn table_query_request(
 			bytecode_len,
 			runtime_filter_len,
 			as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
+			row_limit_rows: options.row_limit.map(NonZeroU64::get).unwrap_or(0),
 			request_id: TableQueryRequestId::ZERO,
 			trace_id: trace_tail.trace_id,
 			trace_parent_span_id: trace_tail.parent_span_id,

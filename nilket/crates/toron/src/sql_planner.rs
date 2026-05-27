@@ -2476,7 +2476,7 @@ impl SqlPlanner {
 		limit_clause: Option<&LimitClause>,
 	) -> Result<LogicalPlan, FrontendError> {
 		let limit_offset = lower_limit_clause(limit_clause)?;
-		if order_by.is_none() && (limit_offset.limit.is_some() || limit_offset.offset.is_some()) {
+		if order_by.is_none() && limit_offset.offset.is_some() {
 			return Err(unsupported(
 				"LIMIT/OFFSET without ORDER BY is not supported",
 			));
@@ -2518,6 +2518,11 @@ impl SqlPlanner {
 			} else {
 				Ok(sorted)
 			}
+		} else if let Some(limit) = limit_offset.limit {
+			Ok(LogicalPlan::Take {
+				input: Box::new(plan),
+				limit: parse_non_negative_usize_literal(limit)?,
+			})
 		} else {
 			Ok(plan)
 		}
@@ -5680,7 +5685,8 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			order_by: _,
 			limit: _,
 			offset: _,
-		} => plan_contains_join(input),
+		}
+		| LogicalPlan::Take { input, .. } => plan_contains_join(input),
 		LogicalPlan::Join {
 			left: _,
 			right: _,
@@ -6061,7 +6067,8 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. }
-		| LogicalPlan::Sort { input, .. } => plan_qualifiers(input),
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. } => plan_qualifiers(input),
 		LogicalPlan::Join {
 			left, right, kind, ..
 		} => match kind {

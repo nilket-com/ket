@@ -6230,6 +6230,10 @@ impl WendelonDataServer {
 		cancellation_token: &CancellationToken,
 	) -> std::io::Result<QueryExecutionPlan> {
 		let range_meta = table_query_as_range_query(meta);
+		let row_limit = match table_query_row_limit(meta) {
+			Ok(row_limit) => row_limit,
+			Err(status) => return Ok(query_plan_error(&range_meta, status, self.local_node)),
+		};
 		if cancellation_token.is_cancelled() {
 			return Ok(query_plan_error(
 				&range_meta,
@@ -6449,6 +6453,7 @@ impl WendelonDataServer {
 					&program,
 					&ranges,
 					QueryExecutionBudget::default(),
+					row_limit,
 					&descriptor,
 					&projected_execution,
 					effective_retention.floor,
@@ -6492,6 +6497,7 @@ impl WendelonDataServer {
 			&program,
 			&ranges,
 			QueryExecutionBudget::default(),
+			row_limit,
 			Some(&descriptor),
 			projected_execution,
 			row_identity_projection,
@@ -6625,6 +6631,7 @@ impl WendelonDataServer {
 			&prepared.program,
 			&prepared.ranges,
 			aggregate_query_budget(&request.budgets),
+			None,
 			Some(&prepared.descriptor),
 			projected_execution,
 			RowIdentityProjection::None,
@@ -11190,6 +11197,15 @@ fn table_query_stats_pruning_enabled(meta: &TableQueryRequestMeta) -> bool {
 	meta._pad[0] & crate::schema::QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING == 0
 }
 
+fn table_query_row_limit(meta: &TableQueryRequestMeta) -> Result<Option<usize>, ReadStatus> {
+	if meta.row_limit_rows == 0 {
+		return Ok(None);
+	}
+	usize::try_from(meta.row_limit_rows)
+		.map(Some)
+		.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)
+}
+
 fn saturated_i64(value: impl TryInto<i64>) -> i64 {
 	value.try_into().unwrap_or(i64::MAX)
 }
@@ -11727,6 +11743,33 @@ impl Default for QueryExecutionBudget {
 			max_wall_time: Duration::from_millis(250),
 			stats_pruning_enabled: true,
 		}
+	}
+}
+
+fn row_limit_satisfied(rows: u64, row_limit: Option<usize>) -> bool {
+	row_limit.is_some_and(|limit| rows >= limit as u64)
+}
+
+fn take_output_batch(
+	batch: RecordBatch,
+	rows: &mut u64,
+	row_limit: Option<usize>,
+) -> Option<RecordBatch> {
+	let Some(limit) = row_limit else {
+		*rows = rows.saturating_add(batch.num_rows() as u64);
+		return Some(batch);
+	};
+	let limit = limit as u64;
+	if *rows >= limit {
+		return None;
+	}
+	let remaining = usize::try_from(limit - *rows).unwrap_or(usize::MAX);
+	let emit = batch.num_rows().min(remaining);
+	*rows = rows.saturating_add(emit as u64);
+	if emit == batch.num_rows() {
+		Some(batch)
+	} else {
+		Some(batch.slice(0, emit))
 	}
 }
 
@@ -12583,6 +12626,7 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 		&ranges,
 		budget,
 		None,
+		None,
 		QueryProjectedExecution::Disabled,
 		RowIdentityProjection::None,
 		None,
@@ -12597,6 +12641,7 @@ async fn plan_table_query_execution_by_secondary_index(
 	program: &pbc::Program,
 	ranges: &[QueryScanRange],
 	budget: QueryExecutionBudget,
+	row_limit: Option<usize>,
 	table_descriptor: &TableSchemaDescriptor,
 	projected_execution: &QueryProjectedExecution,
 	logical_retention_floor: Option<HybridTimestamp>,
@@ -12707,6 +12752,9 @@ async fn plan_table_query_execution_by_secondary_index(
 		if result.num_rows() == 0 {
 			continue;
 		}
+		let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
+			break;
+		};
 		if result.num_rows() > max_rows_per_location {
 			return Ok(query_plan_error(
 				meta,
@@ -12714,7 +12762,6 @@ async fn plan_table_query_execution_by_secondary_index(
 				local_node,
 			));
 		}
-		rows = rows.saturating_add(result.num_rows() as u64);
 		if row.row_hlc > max_hlc {
 			max_hlc = row.row_hlc;
 		}
@@ -12726,12 +12773,18 @@ async fn plan_table_query_execution_by_secondary_index(
 			));
 		}
 		batches.push(result);
+		if row_limit_satisfied(rows, row_limit) {
+			break;
+		}
 	}
 
 	let tail_source_slabs = slab
 		.secondary_index_tail_source_slabs(meta.tenant_id, &access_plan.descriptor)
 		.await;
-	for range in ranges {
+	'ranges: for range in ranges {
+		if row_limit_satisfied(rows, row_limit) {
+			break;
+		}
 		if let Some(cancel) = cancellation_token {
 			if cancel.is_cancelled() {
 				return Ok(query_plan_error(
@@ -12748,6 +12801,9 @@ async fn plan_table_query_execution_by_secondary_index(
 			meta.as_of_hlc,
 		);
 		for (key_identity, locality, location) in scanned {
+			if row_limit_satisfied(rows, row_limit) {
+				break 'ranges;
+			}
 			if let Some(cancel) = cancellation_token {
 				if cancel.is_cancelled() {
 					return Ok(query_plan_error(
@@ -12815,6 +12871,9 @@ async fn plan_table_query_execution_by_secondary_index(
 			if result.num_rows() == 0 {
 				continue;
 			}
+			let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
+				break 'ranges;
+			};
 			if result.num_rows() > max_rows_per_location {
 				return Ok(query_plan_error(
 					meta,
@@ -12822,7 +12881,6 @@ async fn plan_table_query_execution_by_secondary_index(
 					local_node,
 				));
 			}
-			rows = rows.saturating_add(result.num_rows() as u64);
 			if location.hlc > max_hlc {
 				max_hlc = location.hlc;
 			}
@@ -12834,6 +12892,9 @@ async fn plan_table_query_execution_by_secondary_index(
 				));
 			}
 			batches.push(result);
+			if row_limit_satisfied(rows, row_limit) {
+				break 'ranges;
+			}
 		}
 	}
 
@@ -13289,6 +13350,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	program: &pbc::Program,
 	ranges: &[QueryScanRange],
 	budget: QueryExecutionBudget,
+	row_limit: Option<usize>,
 	table_descriptor: Option<&TableSchemaDescriptor>,
 	projected_execution: QueryProjectedExecution,
 	row_identity_projection: RowIdentityProjection,
@@ -13301,6 +13363,7 @@ async fn plan_query_execution_for_ranges_with_program(
 		program,
 		ranges,
 		budget,
+		row_limit,
 		table_descriptor,
 		projected_execution,
 		row_identity_projection,
@@ -13317,6 +13380,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	program: &pbc::Program,
 	ranges: &[QueryScanRange],
 	budget: QueryExecutionBudget,
+	row_limit: Option<usize>,
 	table_descriptor: Option<&TableSchemaDescriptor>,
 	projected_execution: QueryProjectedExecution,
 	row_identity_projection: RowIdentityProjection,
@@ -13354,7 +13418,10 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			));
 		}
 	}
-	for range in ranges {
+	'ranges: for range in ranges {
+		if row_limit_satisfied(rows, row_limit) {
+			break;
+		}
 		if let Some(cancel) = cancellation_token {
 			if cancel.is_cancelled() {
 				return Ok(query_plan_error(
@@ -13371,6 +13438,9 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			meta.as_of_hlc,
 		);
 		for (key_identity, locality, location) in scanned {
+			if row_limit_satisfied(rows, row_limit) {
+				break 'ranges;
+			}
 			if let Some(cancel) = cancellation_token {
 				if cancel.is_cancelled() {
 					return Ok(query_plan_error(
@@ -13441,8 +13511,10 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 								if result.num_rows() == 0 {
 									continue;
 								}
-								let result_rows = result.num_rows() as u64;
-								rows = rows.saturating_add(result_rows);
+								let Some(result) = take_output_batch(result, &mut rows, row_limit)
+								else {
+									break 'ranges;
+								};
 								if location.hlc > max_hlc {
 									max_hlc = location.hlc;
 								}
@@ -13456,6 +13528,9 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 									));
 								}
 								batches.push(result);
+								if row_limit_satisfied(rows, row_limit) {
+									break 'ranges;
+								}
 							}
 							AggregateQueryLocationRead::Encoded {
 								response,
@@ -13506,8 +13581,9 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					if result.num_rows() == 0 {
 						continue;
 					}
-					let result_rows = result.num_rows() as u64;
-					rows = rows.saturating_add(result_rows);
+					let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
+						break 'ranges;
+					};
 					if location.hlc > max_hlc {
 						max_hlc = location.hlc;
 					}
@@ -13519,6 +13595,9 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 						));
 					}
 					batches.push(result);
+					if row_limit_satisfied(rows, row_limit) {
+						break 'ranges;
+					}
 					continue;
 				}
 			}
@@ -13610,6 +13689,9 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 		}
 	}
 	for group in rebatch_groups {
+		if row_limit_satisfied(rows, row_limit) {
+			break;
+		}
 		if let Some(cancel) = cancellation_token {
 			if cancel.is_cancelled() {
 				return Ok(query_plan_error(
@@ -13663,7 +13745,9 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 		if group.max_hlc > max_hlc {
 			max_hlc = group.max_hlc;
 		}
-		rows = rows.saturating_add(result.num_rows() as u64);
+		let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
+			break;
+		};
 		if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
 			return Ok(query_plan_error(
 				meta,
@@ -16511,6 +16595,7 @@ mod tests {
 			bytecode_len: bytecode_len as u32,
 			runtime_filter_len: 0,
 			as_of_hlc,
+			row_limit_rows: 0,
 			request_id: TableQueryRequestId::from_u128(1),
 			trace_id: [0; 16],
 			trace_parent_span_id: [0; 8],
@@ -18323,6 +18408,7 @@ mod tests {
 			}],
 			QueryExecutionBudget::default(),
 			None,
+			None,
 			QueryProjectedExecution::Disabled,
 			RowIdentityProjection::None,
 			Some(hlc(80, 0, 1)),
@@ -18332,6 +18418,44 @@ mod tests {
 
 		assert_eq!(plan.response.status, ReadStatus::OK);
 		assert_eq!(plan.response.rows, 1);
+	}
+
+	#[tokio::test]
+	async fn table_query_row_limit_bounds_successful_output() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(70, 0, 1), b"a", b"a-value").await;
+		seed_record(&mgr, 2, hlc(80, 0, 1), b"b", b"b-value").await;
+		seed_record(&mgr, 3, hlc(90, 0, 1), b"c", b"c-value").await;
+
+		let program = pbc::Program::compile(&[]).unwrap();
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&base_meta(),
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			Some(2),
+			None,
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 2);
+		assert_eq!(
+			plan.batches
+				.iter()
+				.map(RecordBatch::num_rows)
+				.sum::<usize>(),
+			2
+		);
 	}
 
 	#[tokio::test]
@@ -19266,6 +19390,7 @@ mod tests {
 			&program,
 			&ranges,
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
 			RowIdentityProjection::None,
@@ -19320,6 +19445,7 @@ mod tests {
 			&program,
 			&ranges,
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
 			RowIdentityProjection::None,
@@ -19380,6 +19506,7 @@ mod tests {
 				end: Locality::MAX,
 			}],
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
 			RowIdentityProjection::None,
@@ -19445,6 +19572,7 @@ mod tests {
 				end: Locality::MAX,
 			}],
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Pbc {
 				requirement,
@@ -19575,6 +19703,7 @@ mod tests {
 				max_wall_time: Duration::from_secs(600),
 				stats_pruning_enabled: true,
 			},
+			None,
 			Some(&descriptor),
 			projected_execution,
 			RowIdentityProjection::None,
@@ -19756,6 +19885,7 @@ mod tests {
 				max_wall_time: Duration::from_secs(600),
 				stats_pruning_enabled: true,
 			},
+			None,
 			Some(&descriptor),
 			projected_execution,
 			RowIdentityProjection::None,
@@ -19811,6 +19941,7 @@ mod tests {
 				end: Locality::MAX,
 			}],
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
 			RowIdentityProjection::None,
@@ -19836,6 +19967,7 @@ mod tests {
 				end: Locality::MAX,
 			}],
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
 			RowIdentityProjection::None,
@@ -19873,6 +20005,7 @@ mod tests {
 				end: Locality::MAX,
 			}],
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Pbc {
 				requirement,
@@ -19970,6 +20103,7 @@ mod tests {
 			&prepared.program,
 			&prepared.ranges,
 			aggregate_query_budget(&request.budgets),
+			None,
 			Some(&descriptor),
 			projected_execution,
 			RowIdentityProjection::None,
@@ -20021,6 +20155,7 @@ mod tests {
 				end: Locality::MAX,
 			}],
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
 			RowIdentityProjection::None,
@@ -20082,6 +20217,7 @@ mod tests {
 				end: Locality::MAX,
 			}],
 			QueryExecutionBudget::default(),
+			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
 			RowIdentityProjection::None,
@@ -22118,6 +22254,7 @@ mod tests {
 			bytecode_len: bytecode.len() as u32,
 			runtime_filter_len: 0,
 			as_of_hlc: hlc(0, 0, 0),
+			row_limit_rows: 0,
 			request_id: TableQueryRequestId::from_u128(2),
 			trace_id: [0; 16],
 			trace_parent_span_id: [0; 8],

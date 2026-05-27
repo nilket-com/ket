@@ -1285,6 +1285,7 @@ fn scan_request(binding: &TableBinding) -> ScanRequest {
 		profile_hint: None,
 		trace_context: None,
 		morsel: None,
+		row_limit: None,
 		downstream_cancellation: None,
 	}
 }
@@ -1297,6 +1298,7 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 		schema: binding.schema.clone(),
 		projection: None,
 		pbc_program: None,
+		row_limit: None,
 		row_identity: toron::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![],

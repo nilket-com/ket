@@ -1396,6 +1396,7 @@ fn sql_plan_returns_rows(plan: &LogicalPlan) -> bool {
 			| LogicalPlan::Aggregate { .. }
 			| LogicalPlan::Exchange { .. }
 			| LogicalPlan::Sort { .. }
+			| LogicalPlan::Take { .. }
 			| LogicalPlan::Join { .. }
 			| LogicalPlan::Delete {
 				returning: Some(_),

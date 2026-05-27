@@ -3374,7 +3374,8 @@ fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. } => contains_execution_sort(input),
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Take { input, .. } => contains_execution_sort(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			contains_execution_sort(left) || contains_execution_sort(right)
 		}

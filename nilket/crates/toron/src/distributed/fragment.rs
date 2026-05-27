@@ -983,7 +983,8 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. } => first_join(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => first_join(input),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1027,7 +1028,8 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Sort { input, .. } => find_exchange(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => find_exchange(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			find_exchange(left).or_else(|| find_exchange(right))
 		}
@@ -1051,7 +1053,8 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Sort { input, .. } => count_exchanges(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
@@ -1083,7 +1086,8 @@ fn global_sort_barrier_count(plan: &ExecutionPlan) -> usize {
 		ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
-		| ExecutionPlan::Aggregate { input, .. } => global_sort_barrier_count(input),
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Take { input, .. } => global_sort_barrier_count(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			global_sort_barrier_count(left) + global_sort_barrier_count(right)
 		}
@@ -1119,7 +1123,8 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. } => first_scan_metadata(input),
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => first_scan_metadata(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
@@ -1149,6 +1154,7 @@ fn shuffle_input_scan(
 		projection: None,
 		pbc_program: None,
 		row_identity: crate::storage::RowIdentityProjection::None,
+		row_limit: None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: Vec::new(),
 	}
@@ -1197,6 +1203,15 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			order_by,
 			limit,
 			offset,
+			output_schema,
+		},
+		ExecutionPlan::Take {
+			input,
+			limit,
+			output_schema,
+		} => ExecutionPlan::Take {
+			input: Box::new(replace_exchange_with_scan(*input, scan)),
+			limit,
 			output_schema,
 		},
 		ExecutionPlan::Join {
@@ -1282,6 +1297,15 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 			order_by,
 			limit,
 			offset,
+			output_schema,
+		},
+		ExecutionPlan::Take {
+			input,
+			limit,
+			output_schema,
+		} => ExecutionPlan::Take {
+			input: Box::new(replace_first_join(*input, replacement)),
+			limit,
 			output_schema,
 		},
 		ExecutionPlan::EmptyRelation { .. }
@@ -1671,6 +1695,7 @@ mod tests {
 			projection: None,
 			pbc_program: None,
 			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		}
@@ -1711,6 +1736,7 @@ mod tests {
 			projection: None,
 			pbc_program: None,
 			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 		}

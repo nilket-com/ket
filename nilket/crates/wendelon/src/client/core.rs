@@ -3680,6 +3680,7 @@ mod tests {
 				bytecode_len: 2,
 				runtime_filter_len: 0,
 				as_of_hlc: bytemuck::Zeroable::zeroed(),
+				row_limit_rows: 0,
 				request_id: TableQueryRequestId::from_u128(1),
 				trace_id: [0; 16],
 				trace_parent_span_id: [0; 8],

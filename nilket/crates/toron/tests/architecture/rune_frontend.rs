@@ -739,6 +739,21 @@ pub(crate) fn adr115_rune_ordered_topk_surface_registered() {
 }
 
 #[test]
+pub(crate) fn adr116_rune_unordered_take_surface_registered() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	assert!(rune.contains("pub fn take(self, limit: i64)"));
+	assert!(rune.contains("LogicalPlan::Take"));
+	assert!(module.contains("m.associated_function(\"take\", RuneDataFrame::take)?;"));
+	assert!(
+		names.iter().any(|name| name == "take"),
+		"Rune unordered take surface missing `take`: {names:?}"
+	);
+}
+
+#[test]
 pub(crate) fn adr115_rune_boundaries_are_authorial_not_sql_sugar() {
 	let adr =
 		std::fs::read_to_string(manifest_dir().join("plans/adr/115_composable_ordered_top_k.md"))

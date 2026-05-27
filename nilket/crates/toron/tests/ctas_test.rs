@@ -1031,6 +1031,7 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 		projection: None,
 		pbc_program: None,
 		row_identity: toron::storage::RowIdentityProjection::None,
+		row_limit: None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![],
 	}
