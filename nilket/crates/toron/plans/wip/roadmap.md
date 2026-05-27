@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–111 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–112 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -786,6 +786,34 @@ run, 079+).
   conceded its iter-0 infallible lean to `VmResult` on the `in_list` non-empty precedent). Migration:
   `plans/impl/111_rune_case_authoring.md`.
 
+- **ADR 112 — Explicit `NULL` Literal.** Promoted. Retires the `Utf8(None)` sentinel hack (109's own
+  `binder.rs:4873` to-do: *"Revisit … if general explicit NULL literals become supported"*) and admits explicit
+  `NULL` across the SQL expression surface. **Doctrine: NULL is typed *late* by context, never by pretending to
+  be Utf8.** A new **transient `Expr::UntypedNull`** (the `SqlLogicalCast`/`LogicalAscription` precedent —
+  binder-consumed, **never in `BoundExprNode`**, so zero executor/PBC/`NullArray`/Wendelon change) lowers from
+  `Value::Null` (lifting the `:3690` reject); the binder materializes it to a typed `ScalarValue::T(None)`
+  wherever a **local context supplies a physical type** — designated slots (`CAST(NULL AS T)` physical **and**
+  logical, `SET col = NULL`, CASE result + missing-ELSE, Boolean/null-test positions) **and** typed sibling operands
+  (comparison, arithmetic, IN) — and **rejects** where no type is available, pointing at `CAST(NULL AS <type>)`
+  (reject is the default arm → sound by construction; one `typed_null_for_data_type` materializer replaces the
+  expression sentinel typers). **Residual-safe for free:** PBC already declines typed NULL (`emit_literal` catch-all
+  → `NullLiteralUnrepresentable` `pbc.rs:231`), so `WHERE x = NULL` is 3VL residual `EvaluateInToron` with no
+  Wendelon opcode; the **`NOT IN (NULL) → zero rows`** trap (`x <> NULL` is NULL ⇒ conjunction never TRUE) is a
+  pinned gate. `CAST(NULL AS CustomerId)` carries identity via the existing 092/093 `reconcile(naked, T) = add`
+  path; the six 109 sugars desugar through normal `lower_expr` (no placeholder); 110 identity + the all-NULL
+  reject preserved (NULL branch identity-neutral by source shape). Rune `lit_null()` admits the same marker —
+  `case([when(c,t)], lit_null())` delivers the 111 D5 missing-ELSE unblock. **The complete explicit-NULL cut in
+  one ADR** (operator anti-granularity steer): the only deferrals are genuine boundaries — contextless `SELECT
+  NULL` (needs a `DataType::Null`/`NullArray` *execution* substrate) and `NVL2` (a 109-family sugar, off-topic).
+  Guards `adr112_explicit_null_is_transient_binder_consumed` / `adr112_null_sentinel_retired` /
+  `adr112_untyped_null_rejects_without_context` / `adr112_null_predicates_stay_residual`; reconcile the 109/110 +
+  Rune surface-name guards. No bound-arena/executor/PBC/Wendelon/storage change. Genuine 3-of-3 on the carrier +
+  context-typed scope (Gemini conceded `ScalarValue::Null` → transient
+  carrier + default-Utf8 → reject; Claude conceded its comparison/arithmetic *deferral* on the verified binary-op-
+  contract + PBC-residual grounding — the small-cut-ossification self-check — and added the PBC-residual-mechanism
+  pin + the `NOT IN (NULL)` trap gate; operator resolved `CAST(NULL AS LogicalType)` → include, Codex owning the
+  impl). Migration: `plans/impl/112_explicit_null_literal.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -869,23 +897,25 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 111 promoted; ADR 112 candidates
+### ADR 112 promoted; ADR 113 candidates
 
-ADR 111 selected and promoted **Rune CASE authoring** — a pure 080/086/101-pattern authoring admission
-(`RuneWhenThen` carrier + top-level `when`/`case` constructors building 108's `Expr::Case`, `VmResult`-reject
-empty, required else, binder-owned schema policy), **zero engine change**, completing the conditionals arc
-across both frontends now that the shared binder is correct (108 substrate, 109 sugars, 110 identity). Genuine
-3-of-3 (Gemini's iter-1 optional-else/`if_else` fork converged in iter-2). With the conditionals arc closed at
-the surface, no operator-designated next yet; strongest leads, by theme:
+ADR 112 selected and promoted **explicit `NULL` literal** — a transient `Expr::UntypedNull` typed late by the
+binder (designated slots + typed siblings) or rejected, retiring the 109 `Utf8(None)` sentinel; **zero
+execution/PBC/Wendelon change**. Genuine 3-of-3 on the carrier + context-typed scope (Gemini conceded `ScalarValue::Null`→carrier; Claude conceded
+its comparison/arithmetic deferral on grounding; operator folded `CAST(NULL AS LogicalType)` in — the complete
+explicit-NULL cut, not a granular slice). **Scope each candidate as a complete cut, not a ~100-line granular
+slice** (operator steer — fold adjacent surface in rather than spawning a follow-on ADR per small thing). No
+operator-designated next yet; strongest leads, by theme:
 
-*Conditionals-arc continuation (108/109/110/111 descendants):*
+*Conditionals / NULL-arc continuation (108–112 descendants):*
 
-- **General explicit-`NULL` literal support** — lifts the `Value::Null` rejection (would retire/formalize the
-  109 `Utf8(None)` placeholder for a real typeless NULL); bigger (context-typing across SELECT/comparison/
-  arithmetic/INSERT/UPDATE/CASE); **unblocks missing-ELSE Rune CASE (111 D5)** *and* `NVL2(a,b,c)`. The
-  natural next conditionals cut.
+- **Contextless `SELECT NULL`** — the one genuine NULL boundary 112 left: a typeless NULL that must survive to
+  execution needs a `DataType::Null` + Arrow `NullArray` projection contract (executor + schema work), not the
+  112 bind-time resolution. A real execution-substrate cut.
+- **`NVL2(a,b,c)`** — the last 109-family conditional sugar straggler (`CASE WHEN a IS NOT NULL THEN b ELSE c`);
+  trivial planner desugar. Small enough to ride along with a larger conditional/NULL cut rather than alone.
 - **Rune `if_else` / simple-CASE shortcuts** — the authoring conveniences 111 D9 deferred (sugar over the
-  landed `case`/`when`, no substrate); small, evidence-gated on real Rune-authoring ergonomics.
+  landed `case`/`when`, no substrate); evidence-gated on real Rune-authoring ergonomics.
 - **Aggregate-output identity** (same nominal-flow theme as 110, for aggregate results); masked/lazy CASE
   eval (only if 108's eager hard-error exposure bites); far-horizon `OP_CASE` pushdown.
 
@@ -942,6 +972,16 @@ the surface, no operator-designated next yet; strongest leads, by theme:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 111 promoted; ADR 112 candidates (HISTORICAL)
+
+ADR 111 completed the conditionals arc at the surface (Rune CASE authoring). 112 selected **explicit NULL
+literal** — the conditionals/NULL-arc continuation that retired the 109 `Utf8(None)` sentinel: a transient
+`Expr::UntypedNull` typed late by the binder (CAST physical+logical / assignment / CASE / Boolean/null-test /
+comparison / arithmetic / IN) or rejected, with Rune `lit_null()` delivering the 111 D5 missing-ELSE unblock. The operator
+steered the cut to span the *complete* explicit-NULL surface (anti-granularity), deferring only contextless
+`SELECT NULL` (a `NullArray` execution substrate) and `NVL2`. Detail in `plans/adr/112_explicit_null_literal.md`
++ the active-line entry above.
 
 ### ADR 110 promoted; ADR 111 candidates (HISTORICAL)
 
