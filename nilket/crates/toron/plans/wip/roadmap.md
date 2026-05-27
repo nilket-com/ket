@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–116 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–117 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -922,6 +922,28 @@ run, 079+).
   iter-2 sharpened the `LIMIT 0`/wire trap, success-bound-not-budget, secondary-index, row-identity carve-out, and
   the fragmenter single-source-first/fanout-fallback ladder). Migration: `plans/impl/116_unordered_bounded_take.md`.
 
+- **ADR 117 — Multiple Ordered Top-K Barriers.** Promoted. Relaxes 115's single-barrier cap by **recursing the
+  `global_sort_barrier` named primitive** — `fragment_plan` goes from a flat single-boundary dispatcher to a
+  **recursive stage-splitter**. **Fragmenter-only** (the scheduler already runs multi-stage DAGs); reuses `Sort`/
+  `execute_sort` + the empty-key single-partition gather `Exchange`; **no IR/executor/Wendelon/merge-sort/top-k-
+  pushdown.** **Rune is the reason (115 D9):** `df.sort([desc(revenue)]).limit(100).sort([asc(created_at)]).limit(10)`
+  = "the 10 oldest among the top 100 by revenue" — each authored `.sort().limit()` is a preserved gather+sort
+  stage (no flatten/reorder/advisory-demotion); SQL gets it free if its IR is valid (no SQL rewrites). **Two
+  load-bearing seams:** (1) **a threaded `FragmentIdAllocator`** — every path hard-coded `StageId::new(0)/(1)`/
+  `ExchangeId::new(0)` (`fragment.rs:146`), so monotonic allocation is required for N barriers → N+ uniquely-id'd
+  stages (Claude); (2) **an explicit terminal-output parameter** `FragmentTerminalOutput::{FinalResult,
+  ShuffleProducer{..}}` (Codex's hinge) — because `TaskOutputBinding::ShuffleProducer` isn't just metadata (the
+  worker publishes its batches *as partitions*), a subplan feeding a parent barrier is fragmented with a requested
+  `ShuffleProducer` terminal and its terminal stage **wrapped in a matching `Exchange`**, not built-as-`FinalResult`-
+  then-mutated; only the final stage emits `FinalResult`. Base fragmenters (scan/`==1`/aggregate/join) become
+  allocator- + terminal-output-aware; **barriers compose *above* a fragmented join base but not *inside* join
+  inputs** (pinned reject — the resolved fork). 115/116 (single barrier, ordered `OFFSET` per-barrier, unordered
+  `Take` transparent) unchanged. Genuine 3-of-3 — Claude conceded the streaming lead (grounded: `handle_table_query`
+  pre-materializes `plan.batches`, so transport streaming doesn't bound remote cost — that's a separate 2-ADR arc),
+  Codex contributed the terminal-output hinge, Claude grounded the id-allocator; join fork resolved to
+  compose-above. Retargets `adr115_multiple_global_sorts_reject_with_pin` → positive recursive split + strengthens
+  the named-primitive guard. Migration: `plans/impl/117_multiple_ordered_topk_barriers.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -1005,27 +1027,27 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 116 promoted; ADR 117 candidates
+### ADR 117 promoted; ADR 118 candidates
 
-ADR 116 selected and promoted **unordered bounded take (cheap bare `LIMIT`)** — the BigQuery-cost goal: bare
-`LIMIT n` lowers to a distinct `Take` operator (not `Sort`); Wendelon honors a `row_limit` (post-PBC early-return
-via a widened fixed table-query meta) so one source can answer directly when it produces `n` rows; executor
-early-stop is the correctness floor. Genuine 3-of-3 (cross-ring resolved → B after the
-`collect_all`-materialization grounding correction). Distributed frontiers seeded by 115/116 now lead the top of
-the menu; identity-tier continuation remains queued below:
+ADR 117 selected and promoted **multiple ordered top-k barriers** — `fragment_plan` became a recursive
+stage-splitter over the 115 `global_sort_barrier` primitive (threaded id allocator + explicit
+`FragmentTerminalOutput` parameter), so authored Rune `.sort().limit()` chains ("top-k of a top-k") fragment into
+correct multi-stage DAGs; fragmenter-only, reuse-only. Genuine 3-of-3. The fragmenter is now the recursive DAG
+shape pipelining will need. Distributed frontiers still lead; the streaming arc is the named V1 boundary:
 **Scope each candidate as a complete cut, not a ~100-line granular slice** (operator steer).
 
-*Top-k / distributed continuation (115/116 descendants):*
+*Distributed / storage-cost continuation (115/116/117 descendants):*
 
-- **Multiple ordered top-k barriers (Rune-driven)** — relax 115's D8 single-barrier cap by making the fragmenter
-  splitter recursive (`flat single-barrier dispatch → recursive stage-splitter`; the scheduler already runs
-  multi-stage DAGs). Must preserve authored Rune `.sort().limit()` chain boundaries (115 D9). The contained
-  fragmenter-only rework 115 deferred; 2 and 3 barriers cost the same once recursive.
-- **True Wendelon→Toron streaming scan** — 116 grounded that `WendelonStorageScan::scan` `collect_all()`s before
-  Toron streams. A genuinely streaming scan would let executor cancellation bound *remote* cost (not just trim),
-  relax 116's collect-all barrier, and underpin pipelined execution. A substantial cross-ring substrate cut.
+- **Stream-shaped storage boundary — A: transport de-collect** — a streaming `TABLE_QUERY_RESP` (analogous to
+  `handle_query_stream`) + adapt `StreamingQueryResult::next_batch` into a lazy Toron `ScanStream`, dropping the
+  `collect_all()` + one-frame concat. Reduces coordinator memory; **honestly does NOT bound remote cost** (the
+  server still pre-materializes `plan.batches`) — name it as plumbing, not the V1 stream-shaped payoff.
+- **Stream-shaped storage boundary — B: execution-pipelined table query** — the table-query planner
+  scans/encodes/observes-cancellation **before** full materialization → the V1 "stream-shaped storage boundary"
+  (roadmap:928) + the real "cancellation bounds remote cost." Must settle the all-or-nothing response-status
+  semantics. The substantial cut; sequence after A.
 - **Joins frontier** — Rune joins / joins-around-derived (V1 two-input operator); needs relation-alias +
-  qualified-column ergonomics first.
+  qualified-column ergonomics first (and would exercise 117's deferred barrier-inside-join-input).
 
 *Identity-tier continuation (087–114 descendants):*
 
@@ -1092,6 +1114,15 @@ the menu; identity-tier continuation remains queued below:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 116 promoted; ADR 117 candidates (HISTORICAL)
+
+ADR 116 made unordered bounded take (`Take`) cheap (Wendelon `row_limit`). 117 lifted 115's single-barrier cap:
+`fragment_plan` became a recursive stage-splitter over the `global_sort_barrier` primitive (threaded id allocator
++ explicit `FragmentTerminalOutput`), so authored Rune `.sort().limit()` chains fragment into correct multi-stage
+DAGs (barriers compose above join bases, not inside join inputs). Claude conceded the streaming lead (grounded:
+`handle_table_query` pre-materializes before responding, so streaming is a separate 2-ADR arc). Detail in
+`plans/adr/117_multiple_ordered_topk_barriers.md` + the active-line entry above.
 
 ### ADR 115 promoted; ADR 116 candidates (HISTORICAL)
 
