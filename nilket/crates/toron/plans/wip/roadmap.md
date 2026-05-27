@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–114 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–115 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -870,6 +870,33 @@ run, 079+).
   `lit_null()`) inherits through the all-null-CASE + result-projection chokepoints. Migration:
   `plans/impl/114_contextless_null_projection.md`.
 
+- **ADR 115 — Composable Ordered Top-K.** Promoted. **Pivots off the 108–114 expression-substrate spine onto the
+  distributed-execution axis:** makes `ORDER BY` + `LIMIT`/`OFFSET` a composable operator inside derived sources
+  and in Rune (`.sort`/`.limit`/`.offset`), reusing the existing `LogicalPlan::Sort`/`execute_sort` +
+  coordinator-final single-partition gather (`Exchange{partition_count:1}`) — **no new IR/executor kernel/PBC/
+  storage**. **Doctrine:** `ORDER BY` orders rows at-a-point (not durable metadata); `ORDER BY`+`LIMIT` is *ordered
+  top-k* (selects rows before later operators). **Fork A (3-of-3): one global sort barrier, a capped reusable
+  primitive.** **Fragmenter grounding (Claude):** `fragment_plan` is a flat single-exchange-boundary splitter
+  (`==0`→1 stage, `==1`→producer+consumer, `>1`→`MultipleExchangeBoundaries`); a global sort barrier contributes
+  one empty-key gather exchange, so simple sort-over-scan rides the existing `==1` split, while aggregate+sort
+  reuses/generalizes the existing sort-over-aggregate exception. The V1 cap is **barrier-specific**
+  (`global_sort_barrier_count > 1` → `multiple global sort barriers are not supported in V1`), not raw
+  `count_exchanges > 1` and not a new bespoke shape; A→B is a contained recursive barrier-splitter rework
+  (scheduler already multi-stage), so the frontend/IR/executor work is the shared non-throwaway foundation.
+  **SQL/Rune asymmetry (operator-steered, D9):** the cap is
+  an *implementation* cap, not Rune doctrine — SQL stays declarative (multi-barrier rejection fine indefinitely),
+  but Rune `.sort().limit()` boundaries are *authorial* (meaningful, lazy) and **repeated barriers are a valid
+  future Rune workflow** — Rune is the reason to expect the cap lifted, and future multi-barrier work must preserve
+  authored chain boundaries (no flatten without proven equivalence); this hardens the named-primitive requirement.
+  Lifts only the derived **query-tail** fence (`validate_derived_query_shape`), keeps `validate_derived_select_shape`
+  + the ADR-106 no-`lower_query`-delegation correction (shared `apply_order_by_limit_tail` helper); `LIMIT` requires
+  `ORDER BY` (bare-`LIMIT` cheap *take* is a deferred separate operator, **not** a `Sort` special case); Rune typed
+  `RuneSortKey` + `asc`/`desc`; one barrier may feed unary consumers + coexist with a grouped-aggregate shuffle.
+  Genuine 3-of-3 (Codex surfaced the B tradeoff iter-1, Claude+Gemini converged A, Codex iter-3 ratified; Claude
+  grounded the barrier-count vs raw-exchange-count fragmenter reality; operator added the SQL/Rune asymmetry).
+  Migration:
+  `plans/impl/115_composable_ordered_top_k.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -953,21 +980,28 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 114 promoted; ADR 115 candidates
+### ADR 115 promoted; ADR 116 candidates
 
-ADR 114 selected and promoted **contextless `NULL` projection substrate** — a result-only
-`BoundExprNode::NullLiteral` materializing `DataType::Null`/`NullArray` at result-projection roots (SELECT /
-`RETURNING` / Rune `.project`) + all-null conditionals, closing the NULL arc 112 named; `NVL2` folded in as the
-last 109 sugar straggler. Genuine 3-of-3 on doctrine + scope; representation operator-resolved to B (structural
-containment over `ScalarValue::Null`). With the conditionals/NULL/identity arc (108–114) now **complete**, 115 is
-a likely pivot off the expression-substrate spine. **Scope each candidate as a complete cut, not a ~100-line
-granular slice** (operator steer). No operator-designated next yet; strongest leads, by theme:
+ADR 115 selected and promoted **composable ordered top-k** — `ORDER BY`+`LIMIT`/`OFFSET` made composable in
+derived sources + Rune (`.sort`/`.limit`/`.offset`) over the existing `Sort`/coordinator-final-gather substrate,
+Fork A (one global sort barrier as a capped reusable primitive; cap counts global sort barriers, not raw
+exchanges). Genuine 3-of-3; the V1 cap is an implementation
+cap (D9: SQL declarative; Rune `.sort().limit()` boundaries authorial → Rune drives lifting it later). The
+expression-substrate spine (108–114) is closed and the first relational-completion/distributed cut has landed.
+**Scope each candidate as a complete cut, not a ~100-line granular slice** (operator steer). Two named follow-ons
+now lead, both seeded by 115:
 
-*Relational-completion (pivot off the spine — V1 distributed-execution axis):*
+*Top-k / distributed continuation (115 descendants):*
 
-- **Composable `ORDER BY` / `LIMIT`** — SQL sort/limit-in-derived (106 follow-on, fenced) + Rune `.sort`/`.limit`
-  (Rune has neither; SQL uses `LogicalPlan::Sort`) in one cut. The distributed barrier/ordering placement is the
-  topic, not granular friction. The most anti-granular option (two carried leads → one cut).
+- **Unordered bounded `take` (cheap bare `LIMIT`)** — the operator's BigQuery-cost goal: `SELECT * FROM huge LIMIT
+  3` with no `ORDER BY` = "any 3 rows, no ordering/stability/fairness/randomness guarantee — one Wendelon node
+  returns up to 3 and stops." Early-stop streaming scan + 059/060 cancellation + a storage row-limit pushdown; a
+  deliberate opt-out of deterministic ordering. **Not** a `Sort` special case — a distinct operator. Lands on
+  existing streaming-scan + cancellation substrate (tractable, not a rewrite).
+- **Multiple ordered top-k barriers (Rune-driven)** — relax 115's D8 V1 cap by making the fragmenter splitter
+  recursive (`flat count_exchanges dispatch → recursive stage-splitter`; the scheduler already runs multi-stage
+  DAGs). Must preserve authored Rune `.sort().limit()` chain boundaries (D9). The contained fragmenter-only rework
+  115 deliberately deferred; 2 and 3 barriers cost the same once recursive.
 
 *Identity-tier continuation (087–114 descendants):*
 
@@ -1034,6 +1068,16 @@ granular slice** (operator steer). No operator-designated next yet; strongest le
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 114 promoted; ADR 115 candidates (HISTORICAL)
+
+ADR 114 closed the NULL arc (contextless `DataType::Null` projection). 115 pivoted off the expression-substrate
+spine to the distributed axis: **composable ordered top-k** — `ORDER BY`+`LIMIT` in derived sources + Rune
+`.sort`/`.limit` over the existing `Sort`/gather substrate, Fork A (one global sort barrier as a capped reusable
+primitive; simple shapes reuse the existing `==1` split, aggregate+sort reuses the aggregate-sort path, and the V1
+cap counts global sort barriers rather than raw exchanges). The operator set the SQL/Rune asymmetry doctrine (cap
+is implementation-only; Rune authored barriers drive lifting it). Detail in
+`plans/adr/115_composable_ordered_top_k.md` + the active-line entry above.
 
 ### ADR 113 promoted; ADR 114 candidates (HISTORICAL)
 
