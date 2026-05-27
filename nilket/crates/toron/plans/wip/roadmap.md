@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–110 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–111 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -762,6 +762,30 @@ run, 079+).
   erase → reject on this grounding; Codex grounded shared-binder-first + the reject; Gemini converged on the
   core). Migration: `plans/impl/110_conditional_logical_identity_preservation.md`.
 
+- **ADR 111 — Rune CASE Authoring.** Promoted. **Completes the conditionals arc across both frontends** — SQL
+  authors CASE directly (108), via sugar (109), with identity preserved (110); 111 lets Rune *construct the
+  same node*. A **pure authoring admission** in the 080/086/101 pattern over 108's `Expr::Case`, **zero engine
+  change**, `rune_engine.rs`-localized. Shape: a `RuneWhenThen { condition: Expr, result: Expr }` host carrier +
+  free `when(condition, result) -> RuneWhenThen` + free `case(branches: Vec<RuneWhenThen>, else_expr) ->
+  VmResult<RuneExpr>` building `Expr::Case { when_then, else_expr: Some(...) }` with **authored order preserved**,
+  registered in `create_toron_module`. Searched form only (`case([when(c, t), ...], else)`); top-level
+  constructor, **not** a receiver method (searched CASE has no natural receiver). **The only Rune-side check is
+  the schema-free non-empty precondition** (`VmResult::panic` — the `in_list` precedent, vs infallible `LIKE`);
+  everything substantive is **inherited** — Boolean-condition/type-unify/eager-vectorized eval + residual-only
+  PBC from 108, and **110 logical-identity preservation** (uniform identity carries; mixed/naked-non-literal/
+  identity-widening reject) by construction through `bind_case`. **Required `else_expr` in V1** (missing-ELSE
+  would expose the 109 `Utf8(None)` typed-NULL placeholder before the explicit-NULL ADR); **no shortcuts**
+  (simple-CASE/`if_else`/fluent builder/method alias deferred — authoring conveniences, not substrate). The arc
+  landed in the right order — shared binder (110) fixed *before* the surface — so Rune CASE binds over
+  already-correct semantics. Adds `adr111_rune_case_lowers_to_existing_expr_case` (pins the desugar-only nature
+  + the absence of local binder/executor/PBC policy markers in the Rune engine); retargets the Rune
+  surface-name discipline (admit `case`/`when`; `select`/`match`/`if`/`else`/`as`/`is`/`in`/`not`/`safe_cast`
+  stay out); 108/110 CASE-policy guards reused, not restated. No SQL/IR/binder/executor/PBC/storage/Wendelon
+  change. Genuine 3-of-3 (Claude + Codex held required-else/no-shortcuts/binder-owned-schema-policy; Gemini's
+  iter-1 fork — optional-else/`if_else`/Rune-side Boolean check — converged to that shape in iter-2; Claude
+  conceded its iter-0 infallible lean to `VmResult` on the `in_list` non-empty precedent). Migration:
+  `plans/impl/111_rune_case_authoring.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -845,22 +869,23 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 110 promoted; ADR 111 candidates
+### ADR 111 promoted; ADR 112 candidates
 
-ADR 110 selected and promoted **conditional logical-identity preservation** — a binder-local `bind_case`
-rule so CASE (and all six 109 sugars) carries a uniform branch identity through the 087–098 nominal spine
-instead of erasing to NAKED; reuses `nominal_compatible` + the 089 schema path, zero new substrate. Genuine
-3-of-3 (widening sub-decision a grounded 2-of-3 reject). No operator-designated next yet; strongest leads, by
-theme:
+ADR 111 selected and promoted **Rune CASE authoring** — a pure 080/086/101-pattern authoring admission
+(`RuneWhenThen` carrier + top-level `when`/`case` constructors building 108's `Expr::Case`, `VmResult`-reject
+empty, required else, binder-owned schema policy), **zero engine change**, completing the conditionals arc
+across both frontends now that the shared binder is correct (108 substrate, 109 sugars, 110 identity). Genuine
+3-of-3 (Gemini's iter-1 optional-else/`if_else` fork converged in iter-2). With the conditionals arc closed at
+the surface, no operator-designated next yet; strongest leads, by theme:
 
-*Conditionals-arc continuation (108/109/110 descendants):*
+*Conditionals-arc continuation (108/109/110/111 descendants):*
 
-- **Rune `.case(...)`** authoring — the 101 admission pattern over the 108 node, **now over already-correct
-  (110) CASE identity semantics**; the symmetric Rune-frontend completion of the conditionals arc. The
-  natural next conditionals cut.
 - **General explicit-`NULL` literal support** — lifts the `Value::Null` rejection (would retire/formalize the
   109 `Utf8(None)` placeholder for a real typeless NULL); bigger (context-typing across SELECT/comparison/
-  arithmetic/INSERT/UPDATE/CASE); unblocks `NVL2(a,b,c)`.
+  arithmetic/INSERT/UPDATE/CASE); **unblocks missing-ELSE Rune CASE (111 D5)** *and* `NVL2(a,b,c)`. The
+  natural next conditionals cut.
+- **Rune `if_else` / simple-CASE shortcuts** — the authoring conveniences 111 D9 deferred (sugar over the
+  landed `case`/`when`, no substrate); small, evidence-gated on real Rune-authoring ergonomics.
 - **Aggregate-output identity** (same nominal-flow theme as 110, for aggregate results); masked/lazy CASE
   eval (only if 108's eager hard-error exposure bites); far-horizon `OP_CASE` pushdown.
 
@@ -902,7 +927,8 @@ theme:
 - **Rune joins** — needs relation-alias + qualified-column ergonomics first.
 - **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex pattern families, beyond 101's literal `LIKE`);
   **Rune sort/limit**; dot-field sugar; **Wendelon typed table-mutation trace continuation**. (SQL
-  `CASE`/value-conditionals landed as ADR 108; Rune `.case` authoring is teed in the 108 arc above.)
+  `CASE`/value-conditionals landed as ADR 108; Rune CASE authoring landed as ADR 111 — the conditionals arc
+  is now complete across both frontends.)
 
 *Cross-ring chore (operator-flagged):*
 
@@ -916,6 +942,15 @@ theme:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 110 promoted; ADR 111 candidates (HISTORICAL)
+
+ADR 110 closed the conditional identity-erasure hole (`bind_case` preserves uniform branch identity through
+the 087–098 spine). 111 completed the conditionals arc at the surface — Rune CASE authoring as a pure
+080/086/101-pattern admission over 108's `Expr::Case` (`RuneWhenThen` carrier + `when`/`case` constructors,
+`VmResult`-reject empty, required else), inheriting 108 eval + 110 identity by construction, zero engine
+change. The Rune `.case` lead was the operator-locked topic; explicit-NULL / `if_else` shortcuts deferred.
+Detail in `plans/adr/111_rune_case_authoring.md` + the active-line entry above.
 
 ### ADR 109 promoted; ADR 110 candidates (HISTORICAL)
 
