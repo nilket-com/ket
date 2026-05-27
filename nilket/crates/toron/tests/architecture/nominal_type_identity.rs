@@ -19,6 +19,11 @@ fn pbc_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc source")
 }
 
+fn aggregate_kernel_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
+		.expect("read aggregate kernel source")
+}
+
 fn binder_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
 }
@@ -456,7 +461,7 @@ pub(crate) fn adr089_project_pruning_preserves_root_identity() {
 }
 
 #[test]
-pub(crate) fn adr089_group_keys_preserve_identity_aggregate_outputs_naked() {
+pub(crate) fn adr089_group_keys_preserve_identity_aggregate_outputs_are_adr113_owned() {
 	let binder = binder_source();
 	let aggregate_schema = source_block(&binder, "fn aggregate_schema");
 	let aggregate_field = source_block(&binder, "fn aggregate_field");
@@ -465,9 +470,59 @@ pub(crate) fn adr089_group_keys_preserve_identity_aggregate_outputs_naked() {
 	assert!(aggregate_schema.contains("fields.push(aggregate_field(call))"));
 	assert!(!aggregate_schema.contains("field_with_logical_type_metadata"));
 	assert!(!aggregate_schema.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
-	assert!(!aggregate_field.contains("field_with_logical_type_metadata"));
 	assert!(!aggregate_field.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
-	assert!(aggregate_field.contains("Field::new"));
+	assert!(aggregate_field.contains("aggregate_output_logical_type(call, field.data_type())"));
+}
+
+#[test]
+pub(crate) fn adr113_min_max_preserve_aggregate_identity() {
+	let binder = binder_source();
+	let aggregate_field = source_block(&binder, "fn aggregate_field");
+	let output_identity = source_block(&binder, "fn aggregate_output_logical_type");
+
+	assert!(aggregate_field.contains("aggregate_kernel::stable_output_field(call)"));
+	assert!(aggregate_field.contains("aggregate_output_logical_type(call, field.data_type())"));
+	assert!(aggregate_field.contains("field_with_logical_type_metadata"));
+
+	assert!(output_identity.contains("call.args.root_logical_type(0)"));
+	assert!(output_identity.contains("call.args.root_type(0)"));
+	assert!(output_identity.contains("AggregateFunction::Min | AggregateFunction::Max"));
+	assert!(output_identity.contains("input_type != output_type"));
+	for naked in [
+		"AggregateFunction::CountAll",
+		"AggregateFunction::Count",
+		"AggregateFunction::Sum",
+		"AggregateFunction::Avg",
+		"AggregateFunction::LinearRegress",
+		"AggregateFunction::ApproxQuantile(_)",
+	] {
+		assert!(
+			output_identity.contains(naked),
+			"missing naked arm for {naked}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr113_aggregate_kernel_stays_physical_only() {
+	let aggregate_kernel = aggregate_kernel_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+
+	for (name, source) in [
+		("aggregate_kernel.rs", aggregate_kernel.as_str()),
+		("exec.rs", exec.as_str()),
+		("pbc.rs", pbc.as_str()),
+	] {
+		assert!(
+			!source.contains("field_with_logical_type_metadata"),
+			"{name} must not write logical field metadata"
+		);
+		assert!(
+			!source.contains("LOGICAL_TYPE_ID_METADATA_KEY"),
+			"{name} must not write logical metadata keys"
+		);
+	}
 }
 
 #[test]

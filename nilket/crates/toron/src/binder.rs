@@ -5686,18 +5686,54 @@ fn schema_for_projected_exprs_with_existing_names(
 }
 
 fn aggregate_field(call: &BoundAggregateCall) -> Field {
-	if let Some(field) = aggregate_kernel::stable_output_field(call) {
-		return field;
+	let field =
+		aggregate_kernel::stable_output_field(call).unwrap_or_else(|| match call.function {
+			AggregateFunction::LinearRegress => Field::new("linreg", DataType::Float64, true),
+			AggregateFunction::ApproxQuantile(_) => Field::new("quantile", DataType::Float64, true),
+			AggregateFunction::CountAll
+			| AggregateFunction::Count
+			| AggregateFunction::Sum
+			| AggregateFunction::Min
+			| AggregateFunction::Max
+			| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
+		});
+	let logical_type = aggregate_output_logical_type(call, field.data_type());
+	if logical_type.is_naked() {
+		field
+	} else {
+		field_with_logical_type_metadata(
+			field.name().clone(),
+			field.data_type().clone(),
+			field.is_nullable(),
+			logical_type,
+		)
 	}
+}
+
+fn aggregate_output_logical_type(
+	call: &BoundAggregateCall,
+	output_type: &DataType,
+) -> LogicalTypeId {
 	match call.function {
-		AggregateFunction::LinearRegress => Field::new("linreg", DataType::Float64, true),
-		AggregateFunction::ApproxQuantile(_) => Field::new("quantile", DataType::Float64, true),
+		AggregateFunction::Min | AggregateFunction::Max => {
+			let Some(logical_type) = call.args.root_logical_type(0) else {
+				return LogicalTypeId::NAKED;
+			};
+			let Some(input_type) = call.args.root_type(0) else {
+				return LogicalTypeId::NAKED;
+			};
+			if logical_type.is_naked() || input_type != output_type {
+				LogicalTypeId::NAKED
+			} else {
+				logical_type
+			}
+		}
 		AggregateFunction::CountAll
 		| AggregateFunction::Count
 		| AggregateFunction::Sum
-		| AggregateFunction::Min
-		| AggregateFunction::Max
-		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
+		| AggregateFunction::Avg
+		| AggregateFunction::LinearRegress
+		| AggregateFunction::ApproxQuantile(_) => LogicalTypeId::NAKED,
 	}
 }
 

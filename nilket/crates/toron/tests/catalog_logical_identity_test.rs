@@ -14,6 +14,7 @@ use toron::ir::{
 	LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, QueryId,
 	ScalarValue, SessionId, TableId, decode_column_logical_type,
 };
+use toron::sql_planner::SqlPlanner;
 use toron::storage::{
 	InMemoryTableStorage, ScanRequest, ScanStream, StorageScan, StorageWrite, TenantId,
 	WriteRequest,
@@ -389,15 +390,182 @@ async fn aggregate_group_key_preserves_identity() {
 }
 
 #[tokio::test]
-async fn aggregate_output_stays_naked() {
+async fn aggregate_min_max_preserve_logical_identity() {
 	let schema = bound_schema(LogicalPlan::Aggregate {
 		input: Box::new(scan("sales")),
 		group_expr: vec![],
-		aggr_expr: vec![(AggregateFunction::Sum, vec![Expr::column("customer_id")])],
+		aggr_expr: vec![
+			(AggregateFunction::Min, vec![Expr::column("customer_id")]),
+			(AggregateFunction::Max, vec![Expr::column("customer_id")]),
+			(AggregateFunction::Min, vec![Expr::column("product_id")]),
+		],
+	})
+	.await;
+
+	assert_field_logical_type(&schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+	assert_field_logical_type(&schema, 1, CUSTOMER_ID_LOGICAL_TYPE);
+	assert_field_logical_type(&schema, 2, PRODUCT_ID_LOGICAL_TYPE);
+}
+
+#[tokio::test]
+async fn aggregate_grouped_min_max_preserve_logical_identity() {
+	let schema = bound_schema(LogicalPlan::Aggregate {
+		input: Box::new(scan("sales")),
+		group_expr: vec![Expr::column("raw_id")],
+		aggr_expr: vec![
+			(AggregateFunction::Min, vec![Expr::column("customer_id")]),
+			(
+				AggregateFunction::Max,
+				vec![Expr::column("alt_customer_id")],
+			),
+		],
 	})
 	.await;
 
 	assert_field_logical_type(&schema, 0, LogicalTypeId::NAKED);
+	assert_field_logical_type(&schema, 1, CUSTOMER_ID_LOGICAL_TYPE);
+	assert_field_logical_type(&schema, 2, CUSTOMER_ID_LOGICAL_TYPE);
+}
+
+#[tokio::test]
+async fn aggregate_sum_count_avg_stay_naked() {
+	let schema = bound_schema(LogicalPlan::Aggregate {
+		input: Box::new(scan("sales")),
+		group_expr: vec![],
+		aggr_expr: vec![
+			(AggregateFunction::Sum, vec![Expr::column("customer_id")]),
+			(AggregateFunction::Count, vec![Expr::column("customer_id")]),
+			(AggregateFunction::CountAll, vec![]),
+			(AggregateFunction::Avg, vec![Expr::column("customer_id")]),
+		],
+	})
+	.await;
+
+	for idx in 0..4 {
+		assert_field_logical_type(&schema, idx, LogicalTypeId::NAKED);
+	}
+}
+
+#[tokio::test]
+async fn aggregate_min_of_computed_or_cast_or_naked_input_stays_naked() {
+	let schema = bound_schema(LogicalPlan::Aggregate {
+		input: Box::new(scan("sales")),
+		group_expr: vec![],
+		aggr_expr: vec![
+			(AggregateFunction::Min, vec![Expr::column("raw_id")]),
+			(
+				AggregateFunction::Min,
+				vec![add_zero(Expr::column("customer_id"))],
+			),
+			(
+				AggregateFunction::Min,
+				vec![Expr::Cast(
+					Box::new(Expr::column("customer_id")),
+					DataType::Int64,
+				)],
+			),
+		],
+	})
+	.await;
+
+	for idx in 0..3 {
+		assert_field_logical_type(&schema, idx, LogicalTypeId::NAKED);
+	}
+}
+
+#[tokio::test]
+async fn aggregate_min_of_ascribed_computed_preserves_logical_identity() {
+	let schema = bound_schema(LogicalPlan::Aggregate {
+		input: Box::new(scan("sales")),
+		group_expr: vec![],
+		aggr_expr: vec![(
+			AggregateFunction::Min,
+			vec![ascribe(
+				add_zero(Expr::column("customer_id")),
+				CUSTOMER_ID_LOGICAL_TYPE,
+			)],
+		)],
+	})
+	.await;
+
+	assert_field_logical_type(&schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+}
+
+#[tokio::test]
+async fn aggregate_min_max_identity_flows_through_ctas_and_alias_columns() {
+	let (catalog, _storage, coordinator) = seeded_logical_identity_coordinator().await;
+	let planner = SqlPlanner::new();
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE hi AS SELECT MAX(customer_id) AS m FROM sales")
+				.expect("plan aggregate CTAS"),
+			None,
+		)
+		.await
+		.expect("execute aggregate CTAS");
+	let binding = catalog
+		.resolve_table(&TableRef::new("hi"))
+		.await
+		.expect("resolve aggregate CTAS target");
+	assert_field_logical_type(&binding.schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+
+	let alias_plan = planner
+		.plan("SELECT cid_max FROM (SELECT MAX(customer_id) FROM sales) AS p(cid_max)")
+		.expect("plan derived aggregate alias");
+	let alias_schema = bind(&alias_plan, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind derived aggregate alias")
+		.schema();
+	assert_eq!(alias_schema.field(0).name(), "cid_max");
+	assert_field_logical_type(&alias_schema, 0, CUSTOMER_ID_LOGICAL_TYPE);
+}
+
+#[tokio::test]
+async fn aggregate_min_customer_id_vs_max_alt_customer_id_binds() {
+	bind(
+		&LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::Aggregate {
+				input: Box::new(scan("sales")),
+				group_expr: vec![],
+				aggr_expr: vec![
+					(AggregateFunction::Min, vec![Expr::column("customer_id")]),
+					(
+						AggregateFunction::Max,
+						vec![Expr::column("alt_customer_id")],
+					),
+				],
+			}),
+			predicate: Expr::Eq(Box::new(Expr::column("min")), Box::new(Expr::column("max"))),
+		},
+		&sales_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("same identity selector aggregate comparison binds");
+}
+
+#[tokio::test]
+async fn aggregate_min_customer_id_vs_max_product_id_rejects() {
+	let error = bind(
+		&LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::Aggregate {
+				input: Box::new(scan("sales")),
+				group_expr: vec![],
+				aggr_expr: vec![
+					(AggregateFunction::Min, vec![Expr::column("customer_id")]),
+					(AggregateFunction::Max, vec![Expr::column("product_id")]),
+				],
+			}),
+			predicate: Expr::Eq(Box::new(Expr::column("min")), Box::new(Expr::column("max"))),
+		},
+		&sales_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("different selector aggregate identities reject");
+
+	assert_nominal_mismatch(error, "CustomerId", "ProductId", "Int64");
 }
 
 #[tokio::test]
