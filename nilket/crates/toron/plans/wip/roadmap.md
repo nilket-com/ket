@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–115 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–116 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -897,6 +897,31 @@ run, 079+).
   Migration:
   `plans/impl/115_composable_ordered_top_k.md`.
 
+- **ADR 116 — Unordered Bounded Take (cheap bare `LIMIT`).** Promoted. The operator's BigQuery-cost goal +
+  Toron's reason for existence: `SELECT * FROM huge_table LIMIT 3` with **no `ORDER BY`** returns any 3 qualifying
+  rows by the **cheapest** path — one bounded Wendelon request answers directly and stops when that source can
+  produce `n` rows; if it underfills, the engine continues or falls back to preserve SQL cardinality.
+  **A distinct operator, not a weaker sort** (`LogicalPlan::Take`/`ExecutionPlan::Take`, schema-preserving, not a
+  global sort barrier, doesn't route through 115's `Sort`); a **deliberate opt-out of the 010/015
+  deterministic-ordering doctrine** (no order/stability/fairness/repeatability/randomness/identity), keeping only
+  the SQL **cardinality contract `min(limit, cardinality)`** (not best-effort — continue to more sources if one
+  underfills). **Three layers:** (A) the `Take` operator; (B) executor early-stop = the *correctness floor*
+  (coordinator-local, slice final batch, cancel upstream, `LIMIT 0` free); (C) storage pushdown `ScanRequest.row_limit`
+  = the *cheap path*. **Cross-ring B is required (grounded):** `WendelonStorageScan::scan` `collect_all()`s the
+  table query *before* `ScanStream::from_batches` (`storage.rs:853`), so the scan is already done by the time
+  Toron streams — executor `Take` only trims; **Wendelon must honor the bound.** Narrow chain: `ScanRequest.row_limit`
+  → `TableQueryOptions.row_limit` → an **explicit** field in the fixed `TableQueryRequestMeta` (`0`=absent, **not**
+  `_pad`) → server decode → `handle_table_query` **post-PBC early-return** (a *success bound, not a budget* —
+  count post-PBC rows, return `OK` not `QUERY_BUDGET_EXCEEDED`, don't lower `max_rows`; secondary-index honors or
+  falls back). **Pushdown safety:** set `row_limit` only when post-PBC = post-storage (`Take(Scan)`/`Take(Project(Scan))`/
+  `Take(Filter(fully-pushed-PBC,Scan))`); never below a residual filter or row-identity-append (→ executor `Take`).
+  **`LIMIT 0`/wire-`0` trap:** short-circuit `LIMIT 0` before issuing a Wendelon request (`0` means absent). Rune
+  `.take(n)` is the honest unordered surface; `.limit` stays 115 sort-attached; unordered `OFFSET` rejected.
+  Genuine 3-of-3 (Codex iter-0 full design; Gemini re-drafted off a stale 114 mis-file; **operator resolved
+  cross-ring → B, correcting Claude's Fork-A grounding miss — the `collect_all` materialization barrier**; Codex
+  iter-2 sharpened the `LIMIT 0`/wire trap, success-bound-not-budget, secondary-index, row-identity carve-out, and
+  the fragmenter single-source-first/fanout-fallback ladder). Migration: `plans/impl/116_unordered_bounded_take.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -980,28 +1005,27 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 115 promoted; ADR 116 candidates
+### ADR 116 promoted; ADR 117 candidates
 
-ADR 115 selected and promoted **composable ordered top-k** — `ORDER BY`+`LIMIT`/`OFFSET` made composable in
-derived sources + Rune (`.sort`/`.limit`/`.offset`) over the existing `Sort`/coordinator-final-gather substrate,
-Fork A (one global sort barrier as a capped reusable primitive; cap counts global sort barriers, not raw
-exchanges). Genuine 3-of-3; the V1 cap is an implementation
-cap (D9: SQL declarative; Rune `.sort().limit()` boundaries authorial → Rune drives lifting it later). The
-expression-substrate spine (108–114) is closed and the first relational-completion/distributed cut has landed.
-**Scope each candidate as a complete cut, not a ~100-line granular slice** (operator steer). Two named follow-ons
-now lead, both seeded by 115:
+ADR 116 selected and promoted **unordered bounded take (cheap bare `LIMIT`)** — the BigQuery-cost goal: bare
+`LIMIT n` lowers to a distinct `Take` operator (not `Sort`); Wendelon honors a `row_limit` (post-PBC early-return
+via a widened fixed table-query meta) so one source can answer directly when it produces `n` rows; executor
+early-stop is the correctness floor. Genuine 3-of-3 (cross-ring resolved → B after the
+`collect_all`-materialization grounding correction). Distributed frontiers seeded by 115/116 now lead the top of
+the menu; identity-tier continuation remains queued below:
+**Scope each candidate as a complete cut, not a ~100-line granular slice** (operator steer).
 
-*Top-k / distributed continuation (115 descendants):*
+*Top-k / distributed continuation (115/116 descendants):*
 
-- **Unordered bounded `take` (cheap bare `LIMIT`)** — the operator's BigQuery-cost goal: `SELECT * FROM huge LIMIT
-  3` with no `ORDER BY` = "any 3 rows, no ordering/stability/fairness/randomness guarantee — one Wendelon node
-  returns up to 3 and stops." Early-stop streaming scan + 059/060 cancellation + a storage row-limit pushdown; a
-  deliberate opt-out of deterministic ordering. **Not** a `Sort` special case — a distinct operator. Lands on
-  existing streaming-scan + cancellation substrate (tractable, not a rewrite).
-- **Multiple ordered top-k barriers (Rune-driven)** — relax 115's D8 V1 cap by making the fragmenter splitter
-  recursive (`flat count_exchanges dispatch → recursive stage-splitter`; the scheduler already runs multi-stage
-  DAGs). Must preserve authored Rune `.sort().limit()` chain boundaries (D9). The contained fragmenter-only rework
-  115 deliberately deferred; 2 and 3 barriers cost the same once recursive.
+- **Multiple ordered top-k barriers (Rune-driven)** — relax 115's D8 single-barrier cap by making the fragmenter
+  splitter recursive (`flat single-barrier dispatch → recursive stage-splitter`; the scheduler already runs
+  multi-stage DAGs). Must preserve authored Rune `.sort().limit()` chain boundaries (115 D9). The contained
+  fragmenter-only rework 115 deferred; 2 and 3 barriers cost the same once recursive.
+- **True Wendelon→Toron streaming scan** — 116 grounded that `WendelonStorageScan::scan` `collect_all()`s before
+  Toron streams. A genuinely streaming scan would let executor cancellation bound *remote* cost (not just trim),
+  relax 116's collect-all barrier, and underpin pipelined execution. A substantial cross-ring substrate cut.
+- **Joins frontier** — Rune joins / joins-around-derived (V1 two-input operator); needs relation-alias +
+  qualified-column ergonomics first.
 
 *Identity-tier continuation (087–114 descendants):*
 
@@ -1068,6 +1092,15 @@ now lead, both seeded by 115:
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 115 promoted; ADR 116 candidates (HISTORICAL)
+
+ADR 115 made *ordered* top-k composable (one global sort barrier). 116 took the opposite branch — **unordered
+bounded take**: bare `LIMIT n` (no `ORDER BY`) → a distinct `Take` operator returning `min(n, cardinality)` rows
+by the cheapest path, with Wendelon honoring a `row_limit` (post-PBC early-return via a widened fixed table-query
+meta) so one source answers directly when it can produce `n` rows. Cross-ring resolved → B after grounding that
+`WendelonStorageScan::scan` `collect_all()`s before Toron streams (executor early-stop alone only trims). Detail in
+`plans/adr/116_unordered_bounded_take.md` + the active-line entry above.
 
 ### ADR 114 promoted; ADR 115 candidates (HISTORICAL)
 
