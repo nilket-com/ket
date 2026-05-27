@@ -568,7 +568,7 @@ pub(crate) fn adr081_authored_rune_methods_avoid_reserved_keywords() {
 	let module = source_block(&rune, "pub fn create_toron_module");
 	let names = registered_rune_function_names(&module);
 
-	for keyword in ["select", "as"] {
+	for keyword in ["select", "match", "if", "else", "as", "is", "in", "not"] {
 		assert!(
 			!names.iter().any(|name| name == keyword),
 			"Rune authoring surface registered keyword `{keyword}`: {names:?}"
@@ -589,6 +589,8 @@ pub(crate) fn adr081_authored_rune_methods_avoid_reserved_keywords() {
 		"named",
 		"gt",
 		"eq",
+		"when",
+		"case",
 	] {
 		assert!(
 			names.iter().any(|name| name == expected),
@@ -657,7 +659,7 @@ pub(crate) fn adr082_typed_literal_names_avoid_rune_keywords() {
 			"Rune typed literal surface missing `{literal_name}`: {names:?}"
 		);
 	}
-	for keyword in ["as", "is", "not", "select"] {
+	for keyword in ["as", "is", "not", "select", "match", "if", "else", "in"] {
 		assert!(
 			!names.iter().any(|name| name == keyword),
 			"Rune authoring surface registered keyword `{keyword}`: {names:?}"
@@ -1183,13 +1185,13 @@ pub(crate) fn adr101_stale_surface_guards_are_retargeted() {
 	let module = source_block(&rune, "pub fn create_toron_module");
 	let names = registered_rune_function_names(&module);
 
-	for admitted in ["like", "not_like", "ilike", "not_ilike"] {
+	for admitted in ["like", "not_like", "ilike", "not_ilike", "when", "case"] {
 		assert!(
 			names.iter().any(|name| name == admitted),
 			"ADR101 admitted method `{admitted}` missing: {names:?}"
 		);
 	}
-	for deferred in ["not", "safe_cast"] {
+	for deferred in ["not", "safe_cast", "match", "if", "else", "as", "is", "in"] {
 		assert!(
 			!names.iter().any(|name| name == deferred),
 			"ADR101 must keep deferred method `{deferred}` out: {names:?}"
@@ -1280,6 +1282,108 @@ pub(crate) fn adr101_no_cross_ring_surface() {
 		offenders.is_empty(),
 		"ADR101 Rune LIKE surface leaked to Wendelon: {offenders:?}"
 	);
+}
+
+#[test]
+pub(crate) fn adr111_rune_case_lowers_to_existing_expr_case() {
+	let rune = rune_engine_source();
+	let ir = ir_source();
+	let binder = binder_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+	let tests = rune_relation_handles_test_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+	let carrier = source_block(&rune, "pub struct RuneWhenThen");
+	let when = source_block(&rune, "pub fn when");
+	let case = source_block(&rune, "pub fn case");
+	let case_surface = format!("{carrier}\n{when}\n{case}");
+
+	assert!(rune.contains("#[derive(Any, Debug, Clone)]\npub struct RuneWhenThen"));
+	assert!(carrier.contains("condition: Expr"));
+	assert!(carrier.contains("result: Expr"));
+
+	assert!(when.contains("condition: RuneExpr"));
+	assert!(when.contains("result: RuneExpr"));
+	assert!(when.contains("-> RuneWhenThen"));
+	assert!(when.contains("condition: condition.expr"));
+	assert!(when.contains("result: result.expr"));
+
+	assert!(case.contains("branches: Vec<RuneWhenThen>"));
+	assert!(case.contains("else_expr: RuneExpr"));
+	assert!(case.contains("-> VmResult<RuneExpr>"));
+	assert!(case.contains("branches.is_empty()"));
+	assert!(case.contains("VmResult::panic(\"CASE requires at least one WHEN branch\")"));
+	assert!(case.contains("Expr::Case"));
+	assert!(case.contains("when_then"));
+	assert!(case.contains("else_expr: Some(Box::new(else_expr.expr))"));
+
+	for registration in [
+		"m.ty::<RuneWhenThen>()?;",
+		"m.function([\"when\"], when).build()?;",
+		"m.function([\"case\"], case).build()?;",
+	] {
+		assert!(module.contains(registration), "missing {registration}");
+	}
+	for admitted in ["when", "case"] {
+		assert!(
+			names.iter().any(|name| name == admitted),
+			"ADR111 Rune function `{admitted}` missing: {names:?}"
+		);
+	}
+	for forbidden in [
+		"select",
+		"match",
+		"if",
+		"else",
+		"as",
+		"is",
+		"in",
+		"not",
+		"safe_cast",
+	] {
+		assert!(
+			!names.iter().any(|name| name == forbidden),
+			"ADR111 Rune CASE surface registered forbidden name `{forbidden}`: {names:?}"
+		);
+	}
+
+	for forbidden in [
+		"BindingError",
+		"BoundExpr",
+		"ExecutionPlan",
+		"PushdownDeclineReason",
+		"OP_CASE",
+		"PBC",
+		"CASE is not PBC-eligible",
+	] {
+		assert!(
+			!case_surface.contains(forbidden),
+			"Rune CASE authoring surface gained substrate marker {forbidden}"
+		);
+	}
+
+	assert!(ir.contains("Case {\n\t\twhen_then: Vec<(Box<Expr>, Box<Expr>)>"));
+	assert!(binder.contains("fn bind_case"));
+	assert!(binder.contains("require_boolean(builder, \"CASE WHEN\", condition)"));
+	assert!(exec.contains("fn evaluate_case"));
+	assert!(pbc.contains("BoundExprNode::Case"));
+	assert!(!pbc.contains("OP_CASE"));
+	assert!(pbc.contains("CASE is not PBC-eligible"));
+
+	for behavior in [
+		"rune_case_projection_executes",
+		"rune_case_numeric_widening_stays_naked",
+		"rune_case_empty_branches_reject",
+		"rune_case_type_errors_inherited",
+		"rune_case_filter_is_residual_and_keeps_pushable_conjunct",
+		"rune_case_eager_eval_masked_error_fails",
+		"rune_case_carries_logical_identity",
+		"rune_case_mixed_identities_reject",
+		"rune_case_identity_widening_rejects",
+	] {
+		assert!(tests.contains(behavior), "missing behavior gate {behavior}");
+	}
 }
 
 #[test]

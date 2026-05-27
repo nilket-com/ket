@@ -183,6 +183,12 @@ pub struct RuneNamedExpr {
 }
 
 #[derive(Any, Debug, Clone)]
+pub struct RuneWhenThen {
+	pub(crate) condition: Expr,
+	pub(crate) result: Expr,
+}
+
+#[derive(Any, Debug, Clone)]
 pub struct RuneDataType {
 	pub(crate) data_type: DataType,
 }
@@ -316,6 +322,28 @@ pub fn lit_i64(value: i64) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::Literal(ScalarValue::Int64(Some(value))),
 	}
+}
+
+pub fn when(condition: RuneExpr, result: RuneExpr) -> RuneWhenThen {
+	RuneWhenThen {
+		condition: condition.expr,
+		result: result.expr,
+	}
+}
+
+pub fn case(branches: Vec<RuneWhenThen>, else_expr: RuneExpr) -> VmResult<RuneExpr> {
+	if branches.is_empty() {
+		return VmResult::panic("CASE requires at least one WHEN branch");
+	}
+	VmResult::Ok(RuneExpr {
+		expr: Expr::Case {
+			when_then: branches
+				.into_iter()
+				.map(|branch| (Box::new(branch.condition), Box::new(branch.result)))
+				.collect(),
+			else_expr: Some(Box::new(else_expr.expr)),
+		},
+	})
 }
 
 pub fn type_i32() -> RuneDataType {
@@ -604,6 +632,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.ty::<RuneDataFrame>()?;
 	m.ty::<RuneExpr>()?;
 	m.ty::<RuneNamedExpr>()?;
+	m.ty::<RuneWhenThen>()?;
 	m.ty::<RuneDataType>()?;
 	m.ty::<CustomerId>()?;
 	m.ty::<ProductId>()?;
@@ -616,6 +645,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lit_f64"], lit_f64).build()?;
 	m.function(["lit_bool"], lit_bool).build()?;
 	m.function(["lit_i64"], lit_i64).build()?;
+	m.function(["when"], when).build()?;
+	m.function(["case"], case).build()?;
 	m.function(["type_i32"], type_i32).build()?;
 	m.function(["type_i64"], type_i64).build()?;
 	m.function(["type_f32"], type_f32).build()?;

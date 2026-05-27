@@ -12,7 +12,8 @@ use toron::catalog::{MockCatalog, TableRef};
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	BoundExprNode, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue, TableId,
+	BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, FilterDisposition, LogicalPlan,
+	LogicalTypeId, ScalarValue, TableId, decode_column_logical_type,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -1224,6 +1225,261 @@ async fn rune_like_reuses_binder_utf8_type_error() {
 }
 
 #[tokio::test]
+async fn rune_case_projection_executes() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                case([
+                    when(col("amount").gt(lit(20)), lit_str("big")),
+                    when(col("status").eq(lit_str("closed")), lit_str("closed")),
+                ], lit_str("small")),
+                case([
+                    when(col("status").eq(lit_str("closed")), lit_i64(0)),
+                    when(col("amount").gt(lit(20)), lit_i64(2)),
+                ], lit_i64(1)),
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE projection plan");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![
+			Some("small".to_string()),
+			Some("small".to_string()),
+			Some("closed".to_string()),
+			Some("big".to_string()),
+			Some("small".to_string()),
+			Some("small".to_string()),
+		]
+	);
+	assert_eq!(
+		int64_column_rows(&batches, 1),
+		vec![Some(1), Some(1), Some(0), Some(2), Some(1), Some(1)]
+	);
+}
+
+#[tokio::test]
+async fn rune_case_numeric_widening_stays_naked() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                case([when(col("id").eq(lit_i64(1)), col("amount"))], lit_f64(1.5))
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE numeric widening plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind Rune CASE numeric widening");
+	let ExecutionPlan::Project { exprs, .. } = bound else {
+		panic!("expected project");
+	};
+
+	assert_eq!(exprs.root_type(0), Some(&DataType::Float64));
+	assert_eq!(exprs.root_logical_type(0), Some(LogicalTypeId::NAKED));
+}
+
+#[tokio::test]
+async fn rune_case_empty_branches_reject() {
+	let error = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([case([], lit(0))])
+        }
+    "#,
+	)
+	.await
+	.expect_err("empty CASE branches must fail in Rune frontend");
+
+	assert_frontend_message_contains(error, "CASE requires at least one WHEN branch");
+}
+
+#[tokio::test]
+async fn rune_case_type_errors_inherited() {
+	let non_boolean = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([case([when(col("id"), lit(1))], lit(0))])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE non-Boolean condition plan");
+	let error = bind(&non_boolean, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("non-Boolean CASE condition must fail in binder");
+	assert_binding_type_mismatch_contains(error, "CASE WHEN expected Boolean");
+
+	let incompatible_results = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                case([when(col("id").eq(lit_i64(1)), col("amount"))], col("status"))
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE incompatible result plan");
+	let error = bind(&incompatible_results, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("incompatible CASE results must fail in binder");
+	assert_binding_type_mismatch_contains(error, "CASE result branches cannot be unified");
+}
+
+#[tokio::test]
+async fn rune_case_filter_is_residual_and_keeps_pushable_conjunct() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .filter(
+                   col("id").eq(lit_i64(3)).and(
+                       case([when(col("status").eq(lit_str("closed")), lit_bool(true))], lit_bool(false))
+                   )
+               )
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE residual split plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind Rune CASE residual split");
+	let (predicate, disposition, scan) = find_filter(&bound);
+
+	assert_eq!(*disposition, FilterDisposition::EvaluateInToron);
+	assert_single_case(predicate);
+	assert!(
+		scan_pbc(scan).is_some(),
+		"pushable id equality must still reach scan PBC"
+	);
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(3)]);
+}
+
+#[tokio::test]
+async fn rune_case_eager_eval_masked_error_fails() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                case([when(col("id").lt(lit_i64(0)), lit(2147483647).add(lit(1)))], lit(0))
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE masked overflow plan");
+
+	let error = execute_logical(&logical)
+		.await
+		.expect_err("masked overflow branch should still fail");
+	match error {
+		ExecutionError::Kernel { message } => {
+			assert!(message.starts_with("arithmetic overflow: Add(Int32)"));
+		}
+		other => panic!("expected kernel overflow, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn rune_case_carries_logical_identity() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                case([
+                    when(col("id").eq(lit_i64(1)), col("id").as_logical_type::<CustomerId>())
+                ], lit_i64(0))
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE logical identity plan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind Rune CASE logical identity");
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = bound
+	else {
+		panic!("expected project");
+	};
+
+	assert_eq!(exprs.root_type(0), Some(&DataType::Int64));
+	assert_eq!(exprs.root_logical_type(0), Some(CUSTOMER_ID_LOGICAL_TYPE));
+	assert_eq!(
+		decode_column_logical_type(output_schema.field(0)).expect("decode projection identity"),
+		CUSTOMER_ID_LOGICAL_TYPE
+	);
+}
+
+#[tokio::test]
+async fn rune_case_mixed_identities_reject() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                case([
+                    when(col("id").eq(lit_i64(1)), col("id").as_logical_type::<CustomerId>())
+                ], col("id").as_logical_type::<ProductId>())
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE mixed identity plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("mixed CASE identities must fail in binder");
+
+	assert_nominal_mismatch(error, "CustomerId", "ProductId", "Int64");
+}
+
+#[tokio::test]
+async fn rune_case_identity_widening_rejects() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                case([
+                    when(col("id").eq(lit_i64(1)), col("id").as_logical_type::<CustomerId>())
+                ], lit_f64(1.5))
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CASE identity widening plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("CASE identity widening must fail in binder");
+	match error {
+		BindingError::TypeMismatch { message } => {
+			assert!(message.contains("CASE logical result"), "{message}");
+			assert!(
+				message.contains("cast explicitly to erase identity before widening"),
+				"{message}"
+			);
+		}
+		other => panic!("expected CASE identity widening type mismatch, got {other:?}"),
+	}
+}
+
+#[tokio::test]
 async fn rune_nominal_turbofish_binds_vs_literal() {
 	bind_rune_nominal_filter(
 		r#"
@@ -1451,6 +1707,16 @@ fn assert_nominal_mismatch(
 			assert_eq!(physical, expected_physical);
 		}
 		other => panic!("expected nominal type mismatch, got {other:?}"),
+	}
+}
+
+fn assert_binding_type_mismatch_contains(error: BindingError, expected: &str) {
+	match error {
+		BindingError::TypeMismatch { message } => assert!(
+			message.contains(expected),
+			"expected binding type mismatch containing {expected:?}, got {message:?}"
+		),
+		other => panic!("expected binding type mismatch, got {other:?}"),
 	}
 }
 
@@ -1711,6 +1977,22 @@ fn assert_single_like(
 			assert_eq!(*case_insensitive, expected_case_insensitive);
 		}
 		other => panic!("expected single LIKE predicate, got {other:?}"),
+	}
+}
+
+fn assert_single_case(predicate: &toron::ir::BoundExprProgram) {
+	match predicate
+		.single_root()
+		.and_then(|root| predicate.node(root))
+	{
+		Some(BoundExprNode::Case {
+			when_then,
+			else_input,
+		}) => {
+			assert_eq!(when_then.len(), 1);
+			assert!(predicate.node(*else_input).is_some());
+		}
+		other => panic!("expected single CASE predicate, got {other:?}"),
 	}
 }
 
