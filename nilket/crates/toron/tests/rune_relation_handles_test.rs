@@ -1495,27 +1495,38 @@ async fn rune_lit_null_case_result_types_from_sibling_branch() {
 }
 
 #[tokio::test]
-async fn rune_lit_null_projection_rejects_without_type_context() {
+async fn rune_lit_null_projection_materializes_null_column() {
 	let logical = rune_plan(
 		r#"
-        pub fn main(ctx) {
-            ctx.table("sales").project([lit_null()])
+	    pub fn main(ctx) {
+	        ctx.table("sales").project([lit_null()])
         }
     "#,
 	)
 	.await
 	.expect("Rune lit_null projection plan");
-	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
 		.await
-		.expect_err("contextless lit_null must fail in binder");
+		.expect("bind contextless lit_null projection");
 
-	match error {
-		BindingError::UnsupportedExpression { message } => {
-			assert!(message.contains("NULL literal has no type in this position"));
-			assert!(message.contains("CAST(NULL AS <type>)"));
-		}
-		other => panic!("expected contextless NULL unsupported expression, got {other:?}"),
-	}
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = &bound
+	else {
+		panic!("expected project");
+	};
+	assert_eq!(exprs.root_type(0), Some(&DataType::Null));
+	assert_eq!(output_schema.field(0).data_type(), &DataType::Null);
+
+	let batches = Executor::new(Arc::new(FixtureScan {
+		batches: HashMap::from([(TableId(1), sales_batch(sales_schema()))]),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute lit_null projection");
+	assert_null_column(&batches, 0, 6);
 }
 
 #[tokio::test]
@@ -2161,6 +2172,16 @@ fn string_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<Stri
 				.collect::<Vec<_>>()
 		})
 		.collect()
+}
+
+fn assert_null_column(batches: &[RecordBatch], column: usize, expected_len: usize) {
+	let mut len = 0;
+	for batch in batches {
+		let array = batch.column(column);
+		assert_eq!(array.data_type(), &DataType::Null);
+		len += array.len();
+	}
+	assert_eq!(len, expected_len);
 }
 
 fn assert_schema_names(schema: &Schema, expected: &[&str]) {

@@ -602,6 +602,36 @@ async fn update_returning_emits_post_update_values() {
 }
 
 #[tokio::test]
+async fn update_returning_contextless_null_projects_null_column() {
+	let fixture = UpdateFixture::new(people_schema(true)).await;
+	fixture
+		.seed(people_batch(
+			fixture.binding.schema.clone(),
+			&[(1, 10, Some("old"))],
+		))
+		.await;
+
+	let results = fixture
+		.coordinator
+		.execute_query(
+			&fixture
+				.planner
+				.plan("UPDATE people SET note = 'new' WHERE id = 1 RETURNING NULL")
+				.expect("plan update returning NULL"),
+			None,
+		)
+		.await
+		.expect("update returning NULL");
+
+	assert_eq!(results.len(), 1);
+	let batch = &results[0];
+	assert_eq!(batch.column(0).data_type(), &DataType::Null);
+	assert_eq!(batch.column(0).len(), 1);
+	let payload = fixture.writer.single_payload();
+	assert_eq!(string_values(&payload, 2), vec![Some("new".to_string())]);
+}
+
+#[tokio::test]
 async fn update_all_rows_returning_emits_post_update_rows() {
 	let fixture = UpdateFixture::new(people_schema(true)).await;
 	fixture

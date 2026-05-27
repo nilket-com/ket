@@ -131,6 +131,7 @@ impl<'a> Binder<'a> {
 					let bound_predicate = self
 						.bind_expr_program(std::slice::from_ref(predicate), &input.schema())
 						.await?;
+					require_single_boolean_root(&bound_predicate, "WHERE")?;
 					let logical_types = self.catalog.logical_type_registry();
 					let (plan, _) =
 						plan_filter_with_predicate_pushdown(input, bound_predicate, &logical_types);
@@ -148,7 +149,9 @@ impl<'a> Binder<'a> {
 						});
 					}
 					let input = self.bind_plan(input).await?;
-					let exprs = self.bind_expr_program(exprs, &input.schema()).await?;
+					let exprs = self
+						.bind_projection_expr_program(exprs, &input.schema())
+						.await?;
 					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
 
 					Ok(ExecutionPlan::Project {
@@ -346,6 +349,24 @@ impl<'a> Binder<'a> {
 			logical_casts: &logical_casts,
 		};
 		bind_expr_program(exprs, input_schema, &ctx)
+	}
+
+	async fn bind_projection_expr_program(
+		&self,
+		exprs: &[Expr],
+		input_schema: &SchemaRef,
+	) -> Result<BoundExprProgram, BindingError> {
+		let logical_casts = self.resolve_logical_casts(exprs).await?;
+		let ctx = ExprBindContext {
+			config: self.config,
+			logical_casts: &logical_casts,
+		};
+		bind_expr_program_with_null_policy(
+			exprs,
+			input_schema,
+			&ctx,
+			NullRootPolicy::MaterializeResultNull,
+		)
 	}
 
 	async fn bind_aggregate_call(
@@ -847,7 +868,7 @@ impl<'a> Binder<'a> {
 				(exprs.clone(), output_names.clone())
 			}
 		};
-		let exprs = self.bind_expr_program(&exprs, schema).await?;
+		let exprs = self.bind_projection_expr_program(&exprs, schema).await?;
 		let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
 		Ok(Some(BoundReturningProjection {
 			exprs,
@@ -1102,6 +1123,17 @@ fn resolve_untyped_null(
 	data_type: &DataType,
 ) -> Result<BoundExprId, BindingError> {
 	Ok(builder.append_literal(typed_null_for_data_type(data_type)?))
+}
+
+fn materialize_null_for_output_type(
+	builder: &mut BoundExprProgramBuilder,
+	output_type: &DataType,
+) -> Result<BoundExprId, BindingError> {
+	if output_type == &DataType::Null {
+		Ok(builder.append_null())
+	} else {
+		resolve_untyped_null(builder, output_type)
+	}
 }
 
 fn infer_ctas_schema(source_schema: &SchemaRef) -> Result<SchemaRef, BindingError> {
@@ -2629,6 +2661,7 @@ fn clone_bound_subgraph(
 		BoundExprNode::Literal(literal) => {
 			builder.append_literal(source.literals.get(*literal as usize)?.clone())
 		}
+		BoundExprNode::NullLiteral => builder.append_null(),
 		BoundExprNode::Cast { input, target } => {
 			let input = clone_bound_subgraph(source, *input, builder, remap)?;
 			builder.append_cast(input, target.clone(), output_type)
@@ -2896,7 +2929,9 @@ fn count_bound_subgraph_nodes_inner(
 
 fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 	match node {
-		BoundExprNode::Column(_) | BoundExprNode::Literal(_) => Vec::new(),
+		BoundExprNode::Column(_) | BoundExprNode::Literal(_) | BoundExprNode::NullLiteral => {
+			Vec::new()
+		}
 		BoundExprNode::Cast { input, .. }
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
@@ -4232,7 +4267,7 @@ fn collect_program_node_columns(
 		Some(BoundExprNode::Column(column)) => {
 			columns.insert(column.ordinal);
 		}
-		Some(BoundExprNode::Literal(_)) | None => {}
+		Some(BoundExprNode::Literal(_)) | Some(BoundExprNode::NullLiteral) | None => {}
 		Some(BoundExprNode::Cast { input, .. })
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
@@ -4409,6 +4444,7 @@ fn offset_bound_node(node: BoundExprNode, node_offset: u32, literal_offset: u32)
 	match node {
 		BoundExprNode::Column(column) => BoundExprNode::Column(column),
 		BoundExprNode::Literal(literal) => BoundExprNode::Literal(literal + literal_offset),
+		BoundExprNode::NullLiteral => BoundExprNode::NullLiteral,
 		BoundExprNode::Cast { input, target } => BoundExprNode::Cast {
 			input: offset_id(input),
 			target,
@@ -4495,9 +4531,30 @@ fn bind_expr_program(
 	input_schema: &SchemaRef,
 	ctx: &ExprBindContext<'_>,
 ) -> Result<BoundExprProgram, BindingError> {
+	bind_expr_program_with_null_policy(exprs, input_schema, ctx, NullRootPolicy::Reject)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NullRootPolicy {
+	Reject,
+	MaterializeResultNull,
+}
+
+fn bind_expr_program_with_null_policy(
+	exprs: &[Expr],
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	null_policy: NullRootPolicy,
+) -> Result<BoundExprProgram, BindingError> {
 	let mut builder = BoundExprProgramBuilder::new();
 	for expr in exprs {
-		let root = bind_expr_into_program(&mut builder, expr, input_schema, ctx)?;
+		let root = if matches!(null_policy, NullRootPolicy::MaterializeResultNull)
+			&& is_untyped_null(expr)
+		{
+			builder.append_null()
+		} else {
+			bind_expr_into_program(&mut builder, expr, input_schema, ctx)?
+		};
 		builder.push_root(root);
 	}
 	Ok(builder.build())
@@ -4859,13 +4916,14 @@ fn bind_case(
 				.expect("builder returns typed CASE result")
 		})
 		.collect::<Vec<_>>();
-	if result_types.is_empty() {
-		return Err(BindingError::TypeMismatch {
-			message: "conditional has no typed (non-NULL) result branch".to_string(),
-		});
-	}
-	let output_type = case_common_type(&result_types)?;
-	let output_logical_type = case_output_logical_type(builder, &typed_result_ids, &output_type)?;
+	let (output_type, output_logical_type) = if result_types.is_empty() {
+		(DataType::Null, LogicalTypeId::NAKED)
+	} else {
+		let output_type = case_common_type(&result_types)?;
+		let output_logical_type =
+			case_output_logical_type(builder, &typed_result_ids, &output_type)?;
+		(output_type, output_logical_type)
+	};
 
 	let mut bound_when_then = Vec::with_capacity(bound_when_then_inputs.len());
 	for (condition, result) in bound_when_then_inputs {
@@ -4874,7 +4932,7 @@ fn bind_case(
 	let else_input = if let Some(bound_else) = bound_else {
 		type_case_result(builder, bound_else, &output_type)?
 	} else {
-		resolve_untyped_null(builder, &output_type)?
+		materialize_null_for_output_type(builder, &output_type)?
 	};
 
 	let case_id = builder.append_case(bound_when_then, else_input, output_type);
@@ -4961,7 +5019,7 @@ fn type_case_result(
 ) -> Result<BoundExprId, BindingError> {
 	match input {
 		CaseResultInput::Bound(id) => cast_if_needed(builder, id, output_type),
-		CaseResultInput::UntypedNull => resolve_untyped_null(builder, output_type),
+		CaseResultInput::UntypedNull => materialize_null_for_output_type(builder, output_type),
 	}
 }
 

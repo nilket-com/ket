@@ -131,7 +131,7 @@ pub(crate) fn adr064_returning_binds_against_target_user_schema() {
 		.1;
 
 	assert!(helper.contains(".fields()"));
-	assert!(helper.contains("self.bind_expr_program(&exprs, schema).await?"));
+	assert!(helper.contains("self.bind_projection_expr_program(&exprs, schema).await?"));
 	assert!(helper.contains("schema_for_exprs_with_output_names"));
 	assert!(binder.contains("RETURNING column is reserved for storage metadata"));
 }

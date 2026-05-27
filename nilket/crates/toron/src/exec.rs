@@ -1083,6 +1083,9 @@ impl Executor {
 					})?;
 					literal_array(value, batch.num_rows())
 				}
+				BoundExprNode::NullLiteral => {
+					arrow::array::new_null_array(&DataType::Null, batch.num_rows())
+				}
 				BoundExprNode::Cast { input, target } => {
 					let arr = evaluated_child(&outputs, *input)?;
 					evaluate_cast(&arr, target)?

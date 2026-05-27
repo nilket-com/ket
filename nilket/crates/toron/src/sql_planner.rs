@@ -3797,6 +3797,7 @@ impl SqlPlanner {
 				Some(ConditionalSugarFunction::Ifnull) | Some(ConditionalSugarFunction::Nvl) => {
 					self.lower_ifnull_nvl(f)
 				}
+				Some(ConditionalSugarFunction::Nvl2) => self.lower_nvl2(f),
 				None if f.name.to_string().to_uppercase() == "TIME_BUCKET" => {
 					let args = match &f.args {
 						sqlparser::ast::FunctionArguments::List(l) => &l.args,
@@ -3860,9 +3861,6 @@ impl SqlPlanner {
 			.split_last()
 			.ok_or_else(|| unsupported("COALESCE requires at least one argument"))?;
 		if init.is_empty() {
-			if expr_is_null_literal(last) {
-				return Err(unsupported("COALESCE requires at least one typed argument"));
-			}
 			return self.lower_expr(last);
 		}
 
@@ -3912,6 +3910,21 @@ impl SqlPlanner {
 				Box::new(Expr::UntypedNull),
 			)],
 			else_expr: Some(Box::new(first)),
+		})
+	}
+
+	fn lower_nvl2(&self, function: &Function) -> Result<Expr, FrontendError> {
+		let args = function_positional_args(function, "NVL2")?;
+		let [probe, when_not_null, when_null] = args.as_slice() else {
+			return Err(unsupported("NVL2 requires exactly three arguments"));
+		};
+		let probe = self.lower_expr(probe)?;
+		Ok(Expr::Case {
+			when_then: vec![(
+				Box::new(Expr::IsNotNull(Box::new(probe.clone()))),
+				Box::new(self.lower_expr(when_not_null)?),
+			)],
+			else_expr: Some(Box::new(self.lower_expr(when_null)?)),
 		})
 	}
 
@@ -5433,6 +5446,7 @@ enum ConditionalSugarFunction {
 	Iif,
 	Ifnull,
 	Nvl,
+	Nvl2,
 }
 
 fn conditional_sugar_function_name(name: &ObjectName) -> Option<ConditionalSugarFunction> {
@@ -5447,6 +5461,7 @@ fn conditional_sugar_function_name(name: &ObjectName) -> Option<ConditionalSugar
 		"IIF" => Some(ConditionalSugarFunction::Iif),
 		"IFNULL" => Some(ConditionalSugarFunction::Ifnull),
 		"NVL" => Some(ConditionalSugarFunction::Nvl),
+		"NVL2" => Some(ConditionalSugarFunction::Nvl2),
 		_ => None,
 	}
 }

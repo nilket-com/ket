@@ -2,6 +2,7 @@ pub(crate) mod core_invariants;
 pub(crate) mod distributed_execution;
 pub(crate) mod network_tls;
 pub(crate) mod nominal_type_identity;
+pub(crate) mod null_semantics;
 pub(crate) mod observability_audit;
 pub(crate) mod observability_telemetry;
 pub(crate) mod predicate_pushdown;

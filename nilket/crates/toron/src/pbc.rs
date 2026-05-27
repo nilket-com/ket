@@ -84,6 +84,11 @@ impl PbcCompiler {
 			}
 			match node {
 				BoundExprNode::Column(_) | BoundExprNode::Literal(_) => stack.push((id, true)),
+				BoundExprNode::NullLiteral => {
+					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+						"NULL literal is not PBC-eligible".to_string(),
+					));
+				}
 				BoundExprNode::Binary { op, left, right } => {
 					if matches!(
 						op,
@@ -166,6 +171,11 @@ impl PbcCompiler {
 					))
 				})?;
 				emit_literal(val, bytecode)?;
+			}
+			BoundExprNode::NullLiteral => {
+				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+					"NULL literal reached PBC emitter".to_string(),
+				));
 			}
 			BoundExprNode::Binary { op, .. } => bytecode.push(binary_opcode(op)?),
 			BoundExprNode::Unary { op, .. } => bytecode.push(unary_opcode(op)),

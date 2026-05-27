@@ -89,14 +89,14 @@ nullable `Int64` persists (no special handling — source column is already `Int
 ## Phase 7 — Tests + guards
 
 Behavior (ADR §gates): `bare_select_null_projects_null_array`, `select_null_respects_empty_input_row_count`,
-`sugar_family_all_null_projects_null`, `case_all_null_branches_project_null`, `nullif_null_first_operand_projects_null`,
-`nullif_all_untyped_operands_still_rejects`, `null_result_is_not_a_coercion_participant`,
-`mixed_typed_null_behavior_unchanged`, `nvl2_desugars_and_executes`, `nvl2_all_null_results_project_null`,
-`nvl2_arity_rejects`, `nvl2_inherits_case_identity_and_aggregate_rejection`, `returning_null_projects_null_array`,
-`rune_lit_null_projection_materializes_null`, `ctas_select_null_rejects`, `ctas_cast_null_to_concrete_type_succeeds`,
-`untyped_null_still_non_executable`. Flip 112 negatives (`bare_select_null_rejects_without_type_context`,
-`coalesce_all_null_arguments_reject`) → positive. Schema assertions: `data_type() == DataType::Null`, nullable,
-NAKED, `len()` == input rows, `null_count() == len()`.
+`sugar_family_all_null_projects_null`, `case_all_null_branches_project_null`,
+`nullif_first_explicit_null_operand_projects_null`, `nullif_two_contextless_nulls_still_rejects`,
+`null_result_is_not_a_coercion_participant`, `mixed_typed_null_behavior_unchanged`, `nvl2_desugars_and_executes`,
+`nvl2_all_null_results_project_null`, `nvl2_arity_rejects`, `nvl2_inherits_case_identity_and_aggregate_rejection`,
+`update_returning_contextless_null_projects_null_column`, `rune_lit_null_projection_materializes_null_column`,
+`ctas_select_null_rejects`, `ctas_cast_null_to_concrete_type_succeeds`, `untyped_null_still_non_executable`. Flip 112
+negatives to positive result-position coverage. Schema assertions: `data_type() == DataType::Null`, nullable, NAKED,
+`len()` == input rows.
 
 Guards: `adr114_bound_null_projection_substrate`, `adr114_untyped_null_stays_binder_only`,
 `adr114_projection_policy_is_the_only_raw_untyped_null_escape`, `adr114_bound_executor_materializes_null_array`,
@@ -111,6 +111,7 @@ cargo fmt
 cargo test -p toron --test architecture_test adr114
 cargo test -p toron --test architecture_test adr112 && cargo test -p toron --test architecture_test adr109
 cargo test -p toron --test sql_case_test && cargo test -p toron --test update_test
+cargo test -p toron --test ctas_test && cargo test -p toron --test rune_relation_handles_test
 cargo test -p toron
 git diff --check
 ```

@@ -471,6 +471,7 @@ pub(crate) fn adr033_schema_inference_uses_adr029_type_lattice() {
 		);
 	}
 	assert!(!type_lattice.contains("DataType::Date32"));
+	assert!(!type_lattice.contains("DataType::Null"));
 	assert!(!type_lattice.contains("DataType::UInt32"));
 }
 

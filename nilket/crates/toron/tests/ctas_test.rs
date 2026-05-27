@@ -405,6 +405,10 @@ async fn binder_rejects_invalid_ctas_inferred_schema() {
 			"CREATE TABLE reserved AS SELECT id AS __row_hlc__ FROM people",
 			"reserved for storage metadata",
 		),
+		(
+			"CREATE TABLE erased AS SELECT NULL AS erased FROM people",
+			"unsupported CTAS output column type",
+		),
 	] {
 		let catalog = people_catalog().await;
 		let plan = SqlPlanner::new().plan(sql).expect("plan CTAS");
@@ -472,6 +476,36 @@ async fn query_coordinator_executes_projection_ctas() {
 	assert_eq!(ids.values(), &[1, 2]);
 	assert_eq!(names.value(0), "Alice");
 	assert_eq!(names.value(1), "Bob");
+}
+
+#[tokio::test]
+async fn query_coordinator_executes_cast_null_ctas_with_typed_schema() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+
+	for sql in [
+		"CREATE TABLE people (id INT NOT NULL, name TEXT)",
+		"INSERT INTO people VALUES (1, 'Alice'), (2, 'Bob')",
+		"CREATE TABLE nulls AS SELECT CAST(NULL AS BIGINT) AS maybe_id FROM people",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let binding = catalog
+		.resolve_table(&TableRef::new("nulls"))
+		.await
+		.expect("resolve CTAS table");
+	assert_field(&binding.schema, 0, "maybe_id", &DataType::Int64, true);
+
+	let batch = concat_query(&coordinator, &planner, "SELECT maybe_id FROM nulls").await;
+	assert_eq!(batch.column(0).data_type(), &DataType::Int64);
+	assert_eq!(batch.column(0).null_count(), 2);
+	assert_eq!(
+		int64_column(&batch, 0).iter().collect::<Vec<_>>(),
+		vec![None, None]
+	);
 }
 
 #[tokio::test]

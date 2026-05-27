@@ -65,6 +65,7 @@ pub enum BoundUnaryOp {
 pub enum BoundExprNode {
 	Column(ResolvedColumn),
 	Literal(u32),
+	NullLiteral,
 	Cast {
 		input: BoundExprId,
 		target: DataType,
@@ -389,6 +390,10 @@ impl BoundExprProgramBuilder {
 		self.append_node(BoundExprNode::Literal(literal), output_type)
 	}
 
+	pub fn append_null(&mut self) -> BoundExprId {
+		self.append_node(BoundExprNode::NullLiteral, DataType::Null)
+	}
+
 	pub fn append_cast(
 		&mut self,
 		input: BoundExprId,
@@ -632,6 +637,7 @@ impl BoundExprProgram {
 		let node = self.node(id)?;
 		match node {
 			BoundExprNode::Column(column) => Some(column.nullable),
+			BoundExprNode::NullLiteral => Some(true),
 			BoundExprNode::Literal(literal) => self.literals.get(*literal as usize).map(|value| {
 				matches!(
 					value,
@@ -761,6 +767,7 @@ impl BoundExprProgram {
 		};
 		match node {
 			BoundExprNode::Column(column) => format!("{}#{}", column.name.0, column.ordinal.0),
+			BoundExprNode::NullLiteral => "NULL".to_string(),
 			BoundExprNode::Literal(literal) => self
 				.literals
 				.get(*literal as usize)
@@ -835,7 +842,9 @@ impl BoundExprProgram {
 
 fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 	match node {
-		BoundExprNode::Column(_) | BoundExprNode::Literal(_) => Vec::new(),
+		BoundExprNode::Column(_) | BoundExprNode::Literal(_) | BoundExprNode::NullLiteral => {
+			Vec::new()
+		}
 		BoundExprNode::Cast { input, .. }
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }

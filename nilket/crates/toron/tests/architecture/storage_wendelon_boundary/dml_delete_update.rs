@@ -57,10 +57,11 @@ pub(crate) fn adr031_bound_expr_node_has_no_boxes() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("BoundExprNode enum");
-	assert_eq!(enum_variant_count(node), 10);
+	assert_eq!(enum_variant_count(node), 11);
 	for variant in [
 		"Column",
 		"Literal",
+		"NullLiteral",
 		"Cast",
 		"TryCast",
 		"Binary",

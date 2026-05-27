@@ -47,8 +47,8 @@ NULL`/join-key null; no lazy CASE; no Rune `nvl2` surface.
   pool, so a null-only result can't be represented without either broadening `ScalarValue` (rejected) or a new
   bound node (chosen).
 - `bind_expr_into_program` rejects `Expr::UntypedNull` (112) — kept as the default; result positions opt in around it.
-- `bind_case` rejects when `result_types.is_empty()` ("conditional has no typed (non-NULL) result branch",
-  `binder.rs:4862`) — 114 changes *that* partition to `DataType::Null`.
+- Pre-114, `bind_case` errored when `result_types.is_empty()`; 114 changes *that* partition to
+  `DataType::Null`.
 - The shared result-projection path is `bind_expr_program` + `schema_for_exprs_with_output_names`: SELECT `Project`
   (`binder.rs:151`, covering top-level and derived SELECT outputs), `RETURNING` (`:850`); Rune
   `.project`/`.project_named` build `LogicalPlan::Project` (`rune_engine.rs:224`/`:240`) → same path. The
@@ -107,19 +107,20 @@ eval, residual execution. No `OP_NVL2`, no bound node, no executor branch, no Ru
 ## Behavior gates
 
 - `bare_select_null_projects_null_array` — `SELECT NULL FROM sales`: one `DataType::Null` column, nullable, NAKED,
-  `len == row count`, `null_count == len`; `select_null_respects_empty_input_row_count` (zero rows → zero-length).
+  `len == row count`; `select_null_respects_empty_input_row_count` (zero rows → zero-length).
 - `sugar_family_all_null_projects_null` — `COALESCE(NULL)`, `COALESCE(NULL,NULL)`, `IFNULL(NULL,NULL)`,
   `NVL(NULL,NULL)`, `NVL2(a,NULL,NULL)` → `DataType::Null`.
 - `case_all_null_branches_project_null` — explicit `ELSE NULL` + missing-ELSE both → `DataType::Null`.
-- `nullif_null_first_operand_projects_null` (`NULLIF(NULL, amount)`) + `nullif_all_untyped_operands_still_rejects`
-  (`NULLIF(NULL, NULL)`).
+- `nullif_first_explicit_null_operand_projects_null` (`NULLIF(NULL, amount)`) +
+  `nullif_two_contextless_nulls_still_rejects` (`NULLIF(NULL, NULL)`).
 - `null_result_is_not_a_coercion_participant` — `COALESCE(NULL,NULL) + 1` rejects (no silent widening).
 - `mixed_typed_null_behavior_unchanged` — `COALESCE(NULL, amount)`, `CASE WHEN flag THEN NULL ELSE amount END`,
   110 identity, all 112 typed-null contexts unchanged.
 - `nvl2_desugars_and_executes`, `nvl2_all_null_results_project_null`, `nvl2_arity_rejects`,
   `nvl2_inherits_case_identity_and_aggregate_rejection`.
-- `returning_null_projects_null_array` — `… RETURNING NULL` uses the same substrate (ephemeral, not persisted).
-- `rune_lit_null_projection_materializes_null` — Rune `.project([lit_null()])` → `DataType::Null` for free.
+- `update_returning_contextless_null_projects_null_column` — `… RETURNING NULL` uses the same substrate
+  (ephemeral, not persisted).
+- `rune_lit_null_projection_materializes_null_column` — Rune `.project([lit_null()])` → `DataType::Null` for free.
 - `ctas_select_null_rejects` + `ctas_cast_null_to_concrete_type_succeeds` (persists `Int64`).
 - `untyped_null_still_non_executable` — operand-position null-only still 112; `Expr::UntypedNull` never executes.
 
@@ -135,9 +136,9 @@ eval, residual execution. No `OP_NVL2`, no bound node, no executor branch, no Ru
   batch.num_rows())`.
 - `adr114_all_null_case_resolves_to_null_type` — the all-null CASE branch sets `DataType::Null`/NAKED; mixed CASE
   still skips untyped nulls for identity.
-- Retarget the 109 sugar guard (+`NVL2`/`lower_nvl2`, no `OP_NVL2`) and the 112 contextless-null negative guards
-  (`bare_select_null_rejects…`, `coalesce_all_null_arguments_reject` → positive), keeping 112's generic-reject +
-  PBC-residual + transient-marker assertions. `pbc.rs` has no null opcode; any `NullLiteral` arm is a decline.
+- Retarget the 109 sugar guard (+`NVL2`/`lower_nvl2`, no `OP_NVL2`) and the old 112 contextless-null negative gates
+  to positive result-position coverage, keeping 112's generic-reject + PBC-residual + transient-marker assertions.
+  `pbc.rs` has no null opcode; any `NullLiteral` arm is a decline.
 
 ## Council history
 

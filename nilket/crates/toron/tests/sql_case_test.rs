@@ -298,15 +298,34 @@ async fn coalesce_numeric_branches_widen() {
 }
 
 #[tokio::test]
-async fn coalesce_all_null_arguments_reject() {
-	let err = bind_sql_result("SELECT COALESCE(NULL, NULL) FROM sales")
-		.await
-		.expect_err("all-NULL COALESCE should reject");
-	match err {
-		BindingError::TypeMismatch { message } => {
-			assert!(message.contains("no typed (non-NULL) result branch"));
-		}
-		other => panic!("unexpected error: {other:?}"),
+async fn sugar_family_all_null_projects_null() {
+	let bound = bind_sql(
+		"SELECT \
+		 COALESCE(NULL, NULL), \
+		 IF(true, NULL, NULL), \
+		 IFNULL(NULL, NULL), \
+		 NVL(NULL, NULL), \
+		 NVL2(amount, NULL, NULL) \
+		 FROM sales",
+	)
+	.await;
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = &bound
+	else {
+		panic!("expected project");
+	};
+	for idx in 0..5 {
+		assert_eq!(exprs.root_type(idx), Some(&DataType::Null));
+		assert_eq!(output_schema.field(idx).data_type(), &DataType::Null);
+		assert!(output_schema.field(idx).is_nullable());
+	}
+
+	let batches = execute_bound(&bound).await.expect("execute all-NULL sugar");
+	for idx in 0..5 {
+		assert_null_column(&batches, idx, 6);
 	}
 }
 
@@ -400,13 +419,34 @@ fn if_arity_not_three_rejects() {
 }
 
 #[tokio::test]
-async fn nullif_first_explicit_null_operand_rejects_without_result_type() {
-	let err = bind_sql_result("SELECT NULLIF(NULL, amount) FROM sales")
+async fn nullif_first_explicit_null_operand_projects_null() {
+	let bound = bind_sql("SELECT NULLIF(NULL, amount) FROM sales").await;
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = &bound
+	else {
+		panic!("expected project");
+	};
+	assert_eq!(exprs.root_type(0), Some(&DataType::Null));
+	assert_eq!(output_schema.field(0).data_type(), &DataType::Null);
+
+	let batches = execute_bound(&bound).await.expect("execute NULLIF");
+	assert_null_column(&batches, 0, 6);
+}
+
+#[tokio::test]
+async fn nullif_two_contextless_nulls_still_rejects() {
+	let err = bind_sql_result("SELECT NULLIF(NULL, NULL) FROM sales")
 		.await
-		.expect_err("NULLIF first explicit NULL operand should reject");
+		.expect_err("NULLIF comparison with two contextless NULL operands should reject");
 	match err {
+		BindingError::UnsupportedExpression { message } => {
+			assert!(message.contains("NULL literal has no type in this position"));
+		}
 		BindingError::TypeMismatch { message } => {
-			assert!(message.contains("no typed (non-NULL) result branch"));
+			assert!(message.contains("NULL"));
 		}
 		other => panic!("unexpected error: {other:?}"),
 	}
@@ -457,12 +497,45 @@ fn ifnull_nvl_arity_not_two_rejects() {
 	}
 }
 
+#[tokio::test]
+async fn nvl2_desugars_and_executes() {
+	let plan = plan_sql("SELECT NVL2(amount, 'has', 'missing') FROM sales");
+	let LogicalPlan::Project { exprs, .. } = &plan else {
+		panic!("expected project");
+	};
+	let Expr::Case { when_then, .. } = &exprs[0] else {
+		panic!("expected NVL2 to lower to CASE");
+	};
+	assert!(matches!(when_then[0].0.as_ref(), Expr::IsNotNull(_)));
+
+	let batches = run_logical(&plan).await;
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![
+			Some("has".to_string()),
+			Some("has".to_string()),
+			Some("missing".to_string()),
+			Some("has".to_string()),
+			Some("has".to_string()),
+			Some("has".to_string()),
+		]
+	);
+}
+
 #[test]
-fn nvl2_remains_unsupported() {
-	let err = SqlPlanner::new()
-		.plan("SELECT NVL2(amount, 1, 0) FROM sales")
-		.expect_err("NVL2 should remain unsupported");
-	assert!(err.to_string().contains("unsupported expression"));
+fn nvl2_arity_not_three_rejects() {
+	for sql in [
+		"SELECT NVL2(amount, 1) FROM sales",
+		"SELECT NVL2(amount, 1, 0, 2) FROM sales",
+	] {
+		let err = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("NVL2 arity should reject");
+		assert!(
+			err.to_string()
+				.contains("NVL2 requires exactly three arguments")
+		);
+	}
 }
 
 #[tokio::test]
@@ -540,14 +613,43 @@ async fn conditional_sugar_inherits_case_eager_hard_error() {
 }
 
 #[tokio::test]
-async fn bare_select_null_rejects_without_type_context() {
-	let err = bind_sql_result("SELECT NULL FROM sales")
+async fn bare_select_null_projects_null_array() {
+	let bound = bind_sql("SELECT NULL FROM sales").await;
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = &bound
+	else {
+		panic!("expected project");
+	};
+	assert_eq!(exprs.root_type(0), Some(&DataType::Null));
+	assert_eq!(output_schema.field(0).data_type(), &DataType::Null);
+	assert!(output_schema.field(0).is_nullable());
+
+	let batches = execute_bound(&bound).await.expect("execute bare NULL");
+	assert_null_column(&batches, 0, 6);
+}
+
+#[tokio::test]
+async fn select_null_respects_empty_input_row_count() {
+	let bound = bind_sql("SELECT NULL FROM sales WHERE id < 0").await;
+	assert_eq!(bound.schema().field(0).data_type(), &DataType::Null);
+
+	let batches = execute_bound(&bound)
 		.await
-		.expect_err("bare NULL should remain unsupported");
+		.expect("execute empty NULL projection");
+	assert_null_column(&batches, 0, 0);
+}
+
+#[tokio::test]
+async fn null_result_is_not_a_coercion_participant() {
+	let err = bind_sql_result("SELECT COALESCE(NULL, NULL) + 1 FROM sales")
+		.await
+		.expect_err("DataType::Null should not widen into arithmetic");
 	match err {
-		BindingError::UnsupportedExpression { message } => {
-			assert!(message.contains("NULL literal has no type in this position"));
-			assert!(message.contains("CAST(NULL AS <type>)"));
+		BindingError::TypeMismatch { message } => {
+			assert!(message.contains("Add") || message.contains("arithmetic"));
 		}
 		other => panic!("unexpected error: {other:?}"),
 	}
@@ -773,6 +875,16 @@ fn string_column_rows(batches: &[RecordBatch], column_idx: usize) -> Vec<Option<
 				.collect::<Vec<_>>()
 		})
 		.collect()
+}
+
+fn assert_null_column(batches: &[RecordBatch], column_idx: usize, expected_len: usize) {
+	let mut len = 0;
+	for batch in batches {
+		let column = batch.column(column_idx);
+		assert_eq!(column.data_type(), &DataType::Null);
+		len += column.len();
+	}
+	assert_eq!(len, expected_len);
 }
 
 fn catalog() -> MockCatalog {
