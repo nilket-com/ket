@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–117 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–118 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -944,6 +944,29 @@ run, 079+).
   compose-above. Retargets `adr115_multiple_global_sorts_reject_with_pin` → positive recursive split + strengthens
   the named-primitive guard. Migration: `plans/impl/117_multiple_ordered_topk_barriers.md`.
 
+- **ADR 118 — Stream-Shaped Storage Boundary (Execution-Pipelined Table Query).** Promoted. The named V1
+  "stream-shaped storage boundary": makes the Wendelon table-query scan **streaming end-to-end** so a
+  cancelled/dropped Toron consumer **stops Wendelon before it scans all qualifying row groups** — turning 116's
+  early-stop/059-060 cancellation into a *remote*-cost bound (not just a local trim), and laying the foundation for
+  pipelined cross-stage execution (117's recursive fragmenter + this = the executor-model-upgrade substrate).
+  **Cross-ring** (Wendelon server/protocol + `wendelon-client` + Toron bridge); **no Toron IR/SQL/Rune/PBC.**
+  **The obstacle was the *metadata* path, not failure** (Toron already fails a stream cleanly): the first frame's
+  `QueryResponseMeta` carries final `status`/`value_hlc`/`rows` (`encode_query_stream_batches_with_deadline`
+  pre-materializes because "continuations have no status surface", `data_server.rs:13793`). **Resolution: the
+  terminal-trailer status contract** — first `TABLE_QUERY_RESP` frame provisional (`status=OK` "stream opened"),
+  continuation frames Arrow-only (reusing `FrameHeader.arrow_len`), **terminal frame = authoritative final meta +
+  `STREAM_END`**; **`QueryResponseMeta` is NOT widened** — provisional-vs-terminal is distinguished by frame
+  position + an **opt-in cursor mode** (the generic stream still rejects continuation metadata). `handle_table_query`
+  refactors from "materialize `plan.batches` then respond" into an **incremental producer** that checks
+  cancellation + 116 `row_limit` **between yields** (full-scan **and** secondary-index, for access-path-independent
+  cost); **partial-output-then-terminal-error** is the defined contract (Toron maps a non-OK terminal → `ScanStream`
+  error → query fail, no partial success; collecting wrappers discard partial → error). Toron `WendelonStorageScan`
+  consumes lazily via `table_query_stream*` (no `collect_all`). Genuine 3-of-3 — **Codex retracted his iter-0
+  A-only lean** (transport-de-collect alone under-delivers the cost goal); Gemini grounded the failure path, Codex
+  the metadata path, Claude collapsed them into the trailer contract; the trailer shape (reuse meta, no widening)
+  + secondary-index parity + opt-in cursor mode all converged. Implementation *size* (the producer refactor) is
+  the named risk, not direction. Migration: `plans/impl/118_stream_shaped_storage_boundary.md`.
+
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
 results against a Wendelon-native cluster with pushdown
@@ -1027,25 +1050,23 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 117 promoted; ADR 118 candidates
+### ADR 118 promoted; ADR 119 candidates
 
-ADR 117 selected and promoted **multiple ordered top-k barriers** — `fragment_plan` became a recursive
-stage-splitter over the 115 `global_sort_barrier` primitive (threaded id allocator + explicit
-`FragmentTerminalOutput` parameter), so authored Rune `.sort().limit()` chains ("top-k of a top-k") fragment into
-correct multi-stage DAGs; fragmenter-only, reuse-only. Genuine 3-of-3. The fragmenter is now the recursive DAG
-shape pipelining will need. Distributed frontiers still lead; the streaming arc is the named V1 boundary:
+ADR 118 selected and promoted **the stream-shaped storage boundary** (execution-pipelined table query): a
+multi-frame `TABLE_QUERY_RESP` with a terminal-trailer status contract (no `QueryResponseMeta` widening) +
+Wendelon incremental production that stops on cancellation/row-limit before scanning all row groups + Toron lazy
+`ScanStream` — so a dropped consumer bounds *remote* cost. Genuine 3-of-3 (Codex retracted his A-only lean). With
+115/116/117/118, the distributed-execution + storage-cost substrate is largely in place; the next frontiers:
 **Scope each candidate as a complete cut, not a ~100-line granular slice** (operator steer).
 
-*Distributed / storage-cost continuation (115/116/117 descendants):*
+*Distributed / execution continuation (115–118 descendants):*
 
-- **Stream-shaped storage boundary — A: transport de-collect** — a streaming `TABLE_QUERY_RESP` (analogous to
-  `handle_query_stream`) + adapt `StreamingQueryResult::next_batch` into a lazy Toron `ScanStream`, dropping the
-  `collect_all()` + one-frame concat. Reduces coordinator memory; **honestly does NOT bound remote cost** (the
-  server still pre-materializes `plan.batches`) — name it as plumbing, not the V1 stream-shaped payoff.
-- **Stream-shaped storage boundary — B: execution-pipelined table query** — the table-query planner
-  scans/encodes/observes-cancellation **before** full materialization → the V1 "stream-shaped storage boundary"
-  (roadmap:928) + the real "cancellation bounds remote cost." Must settle the all-or-nothing response-status
-  semantics. The substantial cut; sequence after A.
+- **Pipelined cross-stage execution / executor-model upgrade** — now **unblocked** by 117 (recursive-DAG
+  fragmenter) + 118 (stream-shaped boundary), the two prerequisites the V1 target names (roadmap:934/1433).
+  Stages consume upstream output as it streams rather than stage-barrier-materializing. The capstone distributed
+  cut; substantial.
+- **Row-group-lazy-from-disk scan** — if 118 yields per-batch/row-group not per disk page, push the laziness
+  deeper into Wendelon storage so very large row groups don't materialize. A storage-internal follow-on to 118.
 - **Joins frontier** — Rune joins / joins-around-derived (V1 two-input operator); needs relation-alias +
   qualified-column ergonomics first (and would exercise 117's deferred barrier-inside-join-input).
 
@@ -1114,6 +1135,16 @@ shape pipelining will need. Distributed frontiers still lead; the streaming arc 
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 117 promoted; ADR 118 candidates (HISTORICAL)
+
+ADR 117 made the fragmenter a recursive stage-splitter (multiple ordered top-k barriers). 118 took the named V1
+"stream-shaped storage boundary": multi-frame `TABLE_QUERY_RESP` + terminal-trailer status (no `QueryResponseMeta`
+widening) + Wendelon incremental production that stops on cancel/row-limit before scanning all row groups + Toron
+lazy `ScanStream` — so a dropped consumer bounds *remote* cost (the general case 116's cancellation couldn't reach).
+Codex retracted his A-only lean (transport de-collect under-delivers); the metadata path (not failure) was the
+obstacle, resolved by the trailer contract. Detail in `plans/adr/118_stream_shaped_storage_boundary.md` + the
+active-line entry above.
 
 ### ADR 116 promoted; ADR 117 candidates (HISTORICAL)
 
