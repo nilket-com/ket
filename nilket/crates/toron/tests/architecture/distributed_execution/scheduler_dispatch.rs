@@ -225,7 +225,11 @@ pub(crate) fn adr119_live_exchange_path_does_not_call_bound_exchange() {
 		.expect("live producer block");
 
 	assert!(live_producer.contains("open_live"));
-	assert!(live_producer.contains("append_live"));
+	assert!(
+		live_producer.contains("append_live")
+			|| (live_producer.contains("LiveAppendStreamableBatchSink")
+				&& source.contains(".append_live(payload)"))
+	);
 	assert!(live_producer.contains("drive_streamable_plan"));
 	assert!(!live_producer.contains("bound_exchange"));
 	assert!(!live_producer.contains("execute_bound"));
@@ -386,13 +390,192 @@ pub(crate) fn adr123_executor_pbc_wendelon_ir_fragmenter_unchanged() {
 		let source = std::fs::read_to_string(manifest_dir().join(path)).expect("read source");
 		assert!(!source.contains("ADR 123"), "{path}");
 		assert!(!source.contains("adr123"), "{path}");
+		assert!(!source.contains("ADR 124"), "{path}");
+		assert!(!source.contains("adr124"), "{path}");
 	}
 	for path in ["src/lib.rs", "src/storage/mod.rs"] {
 		let source =
 			std::fs::read_to_string(wendelon_manifest_dir().join(path)).expect("read wendelon");
 		assert!(!source.contains("ADR 123"), "{path}");
 		assert!(!source.contains("adr123"), "{path}");
+		assert!(!source.contains("ADR 124"), "{path}");
+		assert!(!source.contains("adr124"), "{path}");
 	}
+}
+
+#[test]
+pub(crate) fn adr124_live_partition_has_pacing_semaphore_and_farthest_released_index() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let live_partition = source
+		.split("struct LivePartition {")
+		.nth(1)
+		.and_then(|rest| rest.split("impl LivePartition").next())
+		.expect("LivePartition block");
+
+	assert!(live_partition.contains("pacing_semaphore: Arc<Semaphore>"));
+	assert!(live_partition.contains("farthest_released_index: usize"));
+}
+
+#[test]
+pub(crate) fn adr124_live_backlog_depth_is_named_constant() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+
+	assert!(source.contains("const LIVE_BACKLOG_DEPTH: usize = 4;"));
+	assert!(source.contains("Semaphore::new(LIVE_BACKLOG_DEPTH)"));
+}
+
+#[test]
+pub(crate) fn adr124_partition_store_append_live_is_async() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+
+	assert!(source.contains("#[async_trait::async_trait]\npub trait PartitionStore"));
+	assert!(source.contains("async fn append_live(&self, payload: PartitionPayload)"));
+	for impl_name in [
+		"InMemoryPartitionStore",
+		"EncryptedSpillPartitionStore",
+		"HybridPartitionStore",
+	] {
+		let marker = format!("#[async_trait::async_trait]\nimpl PartitionStore for {impl_name}");
+		assert!(
+			source.contains(&marker),
+			"missing async_trait impl for {impl_name}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr124_append_live_acquires_owned_permit_forget_on_success() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let in_memory_impl = source
+		.split("impl PartitionStore for InMemoryPartitionStore")
+		.nth(1)
+		.expect("in-memory partition store impl");
+	let append_live = in_memory_impl
+		.split("async fn append_live")
+		.nth(1)
+		.and_then(|rest| rest.split("fn seal_live").next())
+		.expect("in-memory append_live body");
+	let acquire = append_live
+		.find("acquire_owned()")
+		.expect("append_live acquire");
+	let reserve = append_live
+		.find("reserve(BudgetDimension::ShuffleBytes")
+		.expect("append_live reserve");
+	let push = append_live
+		.find("live.chunks.push(payload)")
+		.expect("append_live push");
+	let forget = append_live
+		.find("permit.forget()")
+		.expect("append_live permit forget");
+
+	assert!(acquire < reserve);
+	assert!(reserve < push);
+	assert!(push < forget);
+}
+
+#[test]
+pub(crate) fn adr124_pull_live_releases_only_at_farthest_released_index() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let guard = "if index == live.farthest_released_index";
+	let release = source
+		.split(guard)
+		.nth(1)
+		.and_then(|rest| rest.split("return Some((Ok(chunk)").next())
+		.expect("farthest release block");
+
+	assert!(release.contains("live.farthest_released_index += 1"));
+	assert!(release.contains("live.pacing_semaphore.add_permits(1)"));
+}
+
+#[test]
+pub(crate) fn adr124_seal_live_materializes_from_chunks() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let in_memory_impl = source
+		.split("impl PartitionStore for InMemoryPartitionStore")
+		.nth(1)
+		.expect("in-memory partition store impl");
+	let seal_live = in_memory_impl
+		.split("fn seal_live")
+		.nth(1)
+		.and_then(|rest| rest.split("fn cancel_live").next())
+		.expect("seal_live body");
+
+	assert!(seal_live.contains("for chunk in &live.chunks"));
+	assert!(seal_live.contains("bytes.extend_from_slice(&chunk.bytes)"));
+	assert!(seal_live.contains("inner.partitions.insert(address, payload)"));
+}
+
+#[test]
+pub(crate) fn adr124_pull_live_unfolds_by_index_for_replay() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let in_memory_impl = source
+		.split("impl PartitionStore for InMemoryPartitionStore")
+		.nth(1)
+		.expect("in-memory partition store impl");
+	let pull_live = in_memory_impl
+		.split("fn pull_live")
+		.nth(1)
+		.and_then(|rest| rest.split("fn remove_query").next())
+		.expect("pull_live body");
+
+	assert!(pull_live.contains("stream::unfold"));
+	assert!(pull_live.contains("(inner.clone(), address, 0usize)"));
+	assert!(pull_live.contains("live.chunks.get(index)"));
+}
+
+#[test]
+pub(crate) fn adr124_cancel_live_closes_pacing_semaphore() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let in_memory_impl = source
+		.split("impl PartitionStore for InMemoryPartitionStore")
+		.nth(1)
+		.expect("in-memory partition store impl");
+	let cancel_live = in_memory_impl
+		.split("fn cancel_live")
+		.nth(1)
+		.and_then(|rest| rest.split("fn pull_live").next())
+		.expect("cancel_live body");
+
+	assert!(cancel_live.contains("live.pacing_semaphore.close()"));
+}
+
+#[test]
+pub(crate) fn adr124_live_shuffle_producer_uses_async_append_sink() {
+	let source =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let live_producer = source
+		.split("async fn execute_live_shuffle_producer")
+		.nth(1)
+		.and_then(|rest| rest.split("async fn execute_live_shuffle_consumer").next())
+		.expect("live producer block");
+	let live_append_sink = source
+		.split("impl StreamableBatchSink for LiveAppendStreamableBatchSink")
+		.nth(1)
+		.and_then(|rest| rest.split("struct SyncStreamableBatchSink").next())
+		.expect("live append sink impl");
+
+	assert!(live_producer.contains("LiveAppendStreamableBatchSink"));
+	assert!(!live_producer.contains("SyncStreamableBatchSink::new"));
+	assert!(live_append_sink.contains(".append_live(payload)"));
+	assert!(live_append_sink.contains(".await"));
+}
+
+#[test]
+pub(crate) fn adr124_no_exec_fragmenter_pbc_wendelon_change() {
+	adr123_executor_pbc_wendelon_ir_fragmenter_unchanged();
+}
+
+#[test]
+pub(crate) fn adr124_streamable_unary_plan_still_rejects_join() {
+	adr123_streamable_unary_plan_still_excludes_join();
 }
 
 #[test]

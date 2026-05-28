@@ -2359,17 +2359,6 @@ mod tests {
 			self
 		}
 
-		fn with_table_descriptor_lists(
-			self,
-			responses: impl IntoIterator<Item = Result<Vec<TableSchemaDescriptor>, ClientError>>,
-		) -> Self {
-			*self
-				.list_responses
-				.lock()
-				.expect("fake descriptor list response lock poisoned") = responses.into_iter().collect();
-			self
-		}
-
 		fn held(
 			responses: impl IntoIterator<Item = Result<Option<TableSchemaDescriptor>, ClientError>>,
 		) -> Self {

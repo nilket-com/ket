@@ -20,7 +20,7 @@ use crate::distributed::partition_store::{
 };
 use crate::distributed::scheduler::{DispatchOutcome, TaskDispatcher};
 use crate::distributed::task::{
-	ArrowIpcDigest, LiveProducerPartitionRef, PartitionAddress, PartitionBackend,
+	ArrowIpcDigest, LiveProducerPartitionRef, PartitionAddress, PartitionBackend, PartitionCount,
 	PartitionManifest, RowCount, ShufflePartitionRef, TaskCompletionOutput, TaskInputBinding,
 	TaskOutputBinding, TaskSpec, TaskTelemetry, TaskTelemetryLabels,
 	is_streamable_exchange_producer, is_streamable_final_result, is_streamable_shuffle_consumer,
@@ -469,33 +469,14 @@ impl ToronWorker {
 		let partition_store = self.partition_store.clone();
 		let mut partition_batches: Vec<Vec<RecordBatch>> =
 			(0..partition_count_usize).map(|_| Vec::new()).collect();
-		let mut append_batch = |batch: RecordBatch| -> Result<bool, QueryError> {
-			for (partition, partition_batch) in
-				partition_record_batch(&executor, &batch, partition_count.get(), partition_key)?
-					.into_iter()
-					.enumerate()
-			{
-				let Some(partition_batch) = partition_batch else {
-					continue;
-				};
-				let bytes = encode_record_batch(&partition_batch)?;
-				let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
-				let payload = PartitionPayload::new(
-					addresses[partition],
-					bytes,
-					RowCount::new(
-						u64::try_from(partition_batch.num_rows()).expect("row count fits u64"),
-					),
-					digest,
-				);
-				partition_store
-					.append_live(payload)
-					.map_err(partition_store_publish_error)?;
-				partition_batches[partition].push(partition_batch);
-			}
-			Ok(true)
+		let mut append_sink = LiveAppendStreamableBatchSink {
+			executor: &executor,
+			partition_store,
+			addresses: &addresses,
+			partition_count: *partition_count,
+			partition_key,
+			partition_batches: &mut partition_batches,
 		};
-		let mut append_sink = SyncStreamableBatchSink::new(&mut append_batch);
 		drive_streamable_plan(input, &executor, morsel, &mut append_sink).await?;
 
 		let results = partition_batches
@@ -1393,7 +1374,7 @@ mod tests {
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Arc;
-	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 	use std::time::Duration;
 	use tokio::io::duplex as test_duplex;
 	use tokio::sync::{Notify, mpsc};
@@ -2259,6 +2240,36 @@ mod tests {
 		}
 	}
 
+	struct CountingBatchStorageScan {
+		schema: SchemaRef,
+		batches: Vec<RecordBatch>,
+		yielded_batches: Arc<AtomicUsize>,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageScan for CountingBatchStorageScan {
+		async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+			let batches = self.batches.clone();
+			let yielded_batches = self.yielded_batches.clone();
+			let stream = futures::stream::unfold(0_usize, move |index| {
+				let batches = batches.clone();
+				let yielded_batches = yielded_batches.clone();
+				async move {
+					let batch = batches.get(index)?.clone();
+					yielded_batches.fetch_add(1, Ordering::SeqCst);
+					Some((Ok(batch), index + 1))
+				}
+			})
+			.boxed();
+			Ok(ScanStream::new(
+				self.schema.clone(),
+				request.session_id,
+				request.query_id,
+				stream,
+			))
+		}
+	}
+
 	#[tokio::test]
 	async fn worker_streamable_final_result_sends_taskbatch_before_taskcomplete() {
 		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -2591,6 +2602,120 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn scan_pull_pauses_when_live_append_awaits() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let backlog_depth = crate::distributed::partition_store::LIVE_BACKLOG_DEPTH;
+		let batches = (0..(backlog_depth + 2))
+			.map(|value| {
+				RecordBatch::try_new(
+					schema.clone(),
+					vec![Arc::new(Int64Array::from(vec![value as i64]))],
+				)
+				.expect("scan batch")
+			})
+			.collect::<Vec<_>>();
+		let yielded_batches = Arc::new(AtomicUsize::new(0));
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(CountingBatchStorageScan {
+				schema: schema.clone(),
+				batches,
+				yielded_batches: yielded_batches.clone(),
+			}),
+			Arc::new(MemoryManager::new(8, 1024 * 1024)),
+			store.clone(),
+			WorkerId::from_u128(124),
+			WorkerEndpoint::new("local"),
+		));
+		let exchange_id = ExchangeId::new(124);
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(124),
+			StageId::new(0),
+			TaskId::new(0),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: ExecutionPlan::Exchange {
+				input: Box::new(scan(TableId(1), 1)),
+				partition_count: 1,
+				key: BoundExprProgram::empty(),
+			},
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::ShuffleProducer {
+				exchange_id,
+				partition_count: PartitionCount::new(1),
+				partition_key: BoundExprProgram::empty(),
+			},
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let address = PartitionAddress {
+			query_id: identity.query_id,
+			exchange_id,
+			producer_stage_id: identity.stage_id,
+			producer_task_id: identity.task_id,
+			attempt_id: identity.attempt_id,
+			partition_id: PartitionId::new(0),
+		};
+		let mut live = store
+			.pull_live(address, AttemptId::first())
+			.expect("live pull");
+		let producer =
+			tokio::spawn(
+				async move { worker.execute_task_local_with_telemetry(&spec, None).await },
+			);
+
+		let blocked_at = backlog_depth + 1;
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while yielded_batches.load(Ordering::SeqCst) < blocked_at {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("producer should pull until the first over-depth append blocks");
+		assert_eq!(yielded_batches.load(Ordering::SeqCst), blocked_at);
+		assert!(
+			tokio::time::timeout(Duration::from_millis(50), async {
+				while yielded_batches.load(Ordering::SeqCst) == blocked_at {
+					tokio::task::yield_now().await;
+				}
+			})
+			.await
+			.is_err(),
+			"upstream scan must stop pulling while append_live awaits capacity"
+		);
+
+		let first = live
+			.next()
+			.await
+			.expect("first live chunk")
+			.expect("first live chunk ok");
+		assert_eq!(
+			decode_record_batches(&first.bytes).unwrap()[0].num_rows(),
+			1
+		);
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while yielded_batches.load(Ordering::SeqCst) <= blocked_at {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("producer should resume scanning after the consumer drains one chunk");
+
+		store.cancel_live(address, PartitionMissingReason::WorkerLost);
+		let _ = tokio::time::timeout(Duration::from_secs(1), producer)
+			.await
+			.expect("producer should wake after live cancellation")
+			.expect("producer task join");
+	}
+
+	#[tokio::test]
 	async fn live_consumer_does_not_materialize_all_shuffle_input_before_execution() {
 		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2]))])
@@ -2614,6 +2739,7 @@ mod tests {
 				RowCount::new(2),
 				ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes)),
 			))
+			.await
 			.expect("append live");
 		let worker = ToronWorker::with_partition_store_and_endpoint(
 			Arc::new(InMemoryStorageScan {
@@ -2768,14 +2894,16 @@ mod tests {
 			&left_batch,
 			worker_id,
 			endpoint.clone(),
-		);
+		)
+		.await;
 		seed_live_partition(
 			store.as_ref(),
 			right_address,
 			&right_batch,
 			worker_id,
 			endpoint.clone(),
-		);
+		)
+		.await;
 		let worker = ToronWorker::with_partition_store_and_endpoint(
 			Arc::new(InMemoryStorageScan {
 				table_data: RecordBatch::new_empty(schema.clone()),
@@ -2847,7 +2975,7 @@ mod tests {
 		report.results.iter().map(RecordBatch::num_rows).sum()
 	}
 
-	fn seed_live_partition(
+	async fn seed_live_partition(
 		store: &InMemoryPartitionStore,
 		address: PartitionAddress,
 		batch: &RecordBatch,
@@ -2862,7 +2990,10 @@ mod tests {
 			RowCount::new(u64::try_from(batch.num_rows()).expect("row count fits u64")),
 			ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes)),
 		);
-		store.append_live(payload.clone()).expect("append live");
+		store
+			.append_live(payload.clone())
+			.await
+			.expect("append live");
 		store
 			.seal_live(PartitionManifest {
 				query_id: address.query_id,
@@ -3084,6 +3215,51 @@ trait StreamableBatchSink: Send {
 
 	fn batch_send_micros(&self) -> u64 {
 		0
+	}
+}
+
+struct LiveAppendStreamableBatchSink<'a> {
+	executor: &'a Executor,
+	partition_store: Arc<dyn PartitionStore>,
+	addresses: &'a [PartitionAddress],
+	partition_count: PartitionCount,
+	partition_key: &'a BoundExprProgram,
+	partition_batches: &'a mut Vec<Vec<RecordBatch>>,
+}
+
+impl StreamableBatchSink for LiveAppendStreamableBatchSink<'_> {
+	fn emit<'a>(&'a mut self, batch: RecordBatch) -> StreamableBatchFuture<'a> {
+		Box::pin(async move {
+			for (partition, partition_batch) in partition_record_batch(
+				self.executor,
+				&batch,
+				self.partition_count.get(),
+				self.partition_key,
+			)?
+			.into_iter()
+			.enumerate()
+			{
+				let Some(partition_batch) = partition_batch else {
+					continue;
+				};
+				let bytes = encode_record_batch(&partition_batch)?;
+				let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
+				let payload = PartitionPayload::new(
+					self.addresses[partition],
+					bytes,
+					RowCount::new(
+						u64::try_from(partition_batch.num_rows()).expect("row count fits u64"),
+					),
+					digest,
+				);
+				self.partition_store
+					.append_live(payload)
+					.await
+					.map_err(partition_store_publish_error)?;
+				self.partition_batches[partition].push(partition_batch);
+			}
+			Ok(true)
+		})
 	}
 }
 
