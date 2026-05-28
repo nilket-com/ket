@@ -283,9 +283,66 @@ pub(crate) fn wendelon_storage_scan_forwards_runtime_filter_to_table_query() {
 		.and_then(|rest| rest.split("fn append_projection").next())
 		.expect("WendelonStorageScan StorageScan impl block");
 
-	assert!(impl_block.contains(".table_query_with_runtime_filter("));
+	assert!(impl_block.contains(".table_query_stream_with_runtime_filter("));
 	assert!(impl_block.contains("request.runtime_filter.clone()"));
 	assert!(!impl_block.contains(".table_query("));
+}
+
+#[test]
+pub(crate) fn adr118_toron_storage_uses_table_query_stream_api() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let impl_block = source
+		.split("impl StorageScan for WendelonStorageScan")
+		.nth(1)
+		.and_then(|rest| rest.split("fn append_projection").next())
+		.expect("WendelonStorageScan StorageScan impl block");
+
+	assert!(impl_block.contains(".table_query_stream_with_runtime_filter("));
+	assert!(impl_block.contains(".table_query_stream_with_runtime_filter_and_attempt_hook("));
+	assert!(impl_block.contains(".next_batch()"));
+	assert!(impl_block.contains("stream::unfold(Some(query_stream)"));
+	assert!(impl_block.contains("ScanStream::new("));
+	assert!(!impl_block.contains("query_result.batches"));
+}
+
+#[test]
+pub(crate) fn adr118_attempt_hook_survives_stream_path() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let impl_block = source
+		.split("impl StorageScan for WendelonStorageScan")
+		.nth(1)
+		.and_then(|rest| rest.split("fn append_projection").next())
+		.expect("WendelonStorageScan StorageScan impl block");
+
+	// ADR 060 downstream cancellation must stay wired into the streaming
+	// scan: when a downstream cancellation context is present the scan
+	// uses the attempt-hook variant of the stream API, so dropping a
+	// bounded consumer still cancels/stops the Wendelon producer.
+	assert!(impl_block.contains("request.downstream_cancellation"));
+	assert!(impl_block.contains(".table_query_stream_with_runtime_filter_and_attempt_hook("));
+}
+
+#[test]
+pub(crate) fn adr118_no_ir_sql_rune_pbc_change() {
+	// ADR 118 is a storage-boundary change only. The streaming
+	// table-query API must not leak into the IR / SQL planner / Rune /
+	// PBC surfaces.
+	for relative in [
+		"src/ir.rs",
+		"src/binder.rs",
+		"src/sql_planner.rs",
+		"src/rune_engine.rs",
+		"src/pbc.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir().join(relative))
+			.unwrap_or_else(|err| panic!("read {relative}: {err}"));
+		assert!(
+			!source.contains("table_query_stream"),
+			"{relative} must not reference the streaming storage API (ADR 118 is storage-only)"
+		);
+	}
 }
 
 #[test]

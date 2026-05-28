@@ -220,6 +220,7 @@ impl HrftService for MsgRouter {
 		if header.msg_type == MsgType::BULK_WRITE_REQ.0
 			|| header.msg_type == MsgType::STREAM_FIN_REQ.0
 			|| header.msg_type == MsgType::QUERY_REQ.0
+			|| header.msg_type == MsgType::TABLE_QUERY_REQ.0
 		{
 			return match &self.data {
 				Some(h) => h.handle_data_stream(context, header, stream, pool).await,

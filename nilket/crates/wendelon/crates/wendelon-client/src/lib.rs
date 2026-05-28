@@ -1025,15 +1025,12 @@ impl Client {
 		pbc: Vec<u8>,
 		options: QueryOptions,
 	) -> Result<QueryResult, ClientError> {
-		let stream = self.query_stream(tenant_id, pbc, options).await?;
-		let epoch = stream.epoch;
-		let value_hlc = stream.value_hlc;
-		let rows = stream.rows;
-		let batches = stream.collect_all().await?;
+		let mut stream = self.query_stream(tenant_id, pbc, options).await?;
+		let batches = stream.drain_all().await?;
 		Ok(QueryResult {
-			epoch,
-			value_hlc,
-			rows,
+			epoch: stream.epoch,
+			value_hlc: stream.value_hlc,
+			rows: stream.rows,
 			batches,
 		})
 	}
@@ -1188,17 +1185,14 @@ impl Client {
 		pbc: Vec<u8>,
 		options: TableQueryOptions,
 	) -> Result<QueryResult, ClientError> {
-		let stream = self
+		let mut stream = self
 			.table_query_stream(tenant_id, descriptor, pbc, options)
 			.await?;
-		let epoch = stream.epoch;
-		let value_hlc = stream.value_hlc;
-		let rows = stream.rows;
-		let batches = stream.collect_all().await?;
+		let batches = stream.drain_all().await?;
 		Ok(QueryResult {
-			epoch,
-			value_hlc,
-			rows,
+			epoch: stream.epoch,
+			value_hlc: stream.value_hlc,
+			rows: stream.rows,
 			batches,
 		})
 	}
@@ -1211,7 +1205,7 @@ impl Client {
 		runtime_filter: Option<RuntimeFilterDescriptor>,
 		options: TableQueryOptions,
 	) -> Result<QueryResult, ClientError> {
-		let stream = self
+		let mut stream = self
 			.table_query_stream_with_runtime_filter(
 				tenant_id,
 				descriptor,
@@ -1220,14 +1214,11 @@ impl Client {
 				options,
 			)
 			.await?;
-		let epoch = stream.epoch;
-		let value_hlc = stream.value_hlc;
-		let rows = stream.rows;
-		let batches = stream.collect_all().await?;
+		let batches = stream.drain_all().await?;
 		Ok(QueryResult {
-			epoch,
-			value_hlc,
-			rows,
+			epoch: stream.epoch,
+			value_hlc: stream.value_hlc,
+			rows: stream.rows,
 			batches,
 		})
 	}
@@ -1244,7 +1235,7 @@ impl Client {
 	where
 		F: FnMut(WendelonTableQueryAttempt) -> std::io::Result<TableQueryAttemptGuard> + Send,
 	{
-		let stream = self
+		let mut stream = self
 			.table_query_stream_with_runtime_filter_and_attempt_hook(
 				tenant_id,
 				descriptor,
@@ -1254,14 +1245,11 @@ impl Client {
 				attempt_hook,
 			)
 			.await?;
-		let epoch = stream.epoch;
-		let value_hlc = stream.value_hlc;
-		let rows = stream.rows;
-		let batches = stream.collect_all().await?;
+		let batches = stream.drain_all().await?;
 		Ok(QueryResult {
-			epoch,
-			value_hlc,
-			rows,
+			epoch: stream.epoch,
+			value_hlc: stream.value_hlc,
+			rows: stream.rows,
 			batches,
 		})
 	}

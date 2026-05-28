@@ -6918,7 +6918,7 @@ fn adr073_toron_storage_scan_consumer_claim_is_retargeted_by_adr060() {
 	assert!(adr060.contains("Toron consumer of Wendelon 073"));
 	assert!(adr060.contains("best-effort"));
 	assert!(adr060.contains("checkpoint-bounded"));
-	assert!(storage.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(storage.contains("table_query_stream_with_runtime_filter_and_attempt_hook"));
 	assert!(storage.contains("register_wendelon_table_query_attempt"));
 	assert!(cancellation.contains("DownstreamAttemptRegistry"));
 
@@ -7378,6 +7378,200 @@ fn adr116_table_query_row_limit_is_fixed_meta_not_sidecar_budget() {
 	assert!(data_server.contains("QueryExecutionBudget::default()"));
 	assert!(!schema.contains("TableQueryRequestMetaExtension"));
 	assert!(!schema.contains("TableQueryRequestMetaV1"));
+}
+
+#[test]
+fn adr118_table_query_resp_has_terminal_metadata_contract() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+
+	assert!(schema.contains("size_of::<QueryResponseMeta>() == 56"));
+	assert!(!schema.contains("terminal_status"));
+	assert!(!schema.contains("provisional"));
+	assert!(router.contains("MsgType::TABLE_QUERY_REQ.0"));
+	assert!(data_server.contains("async fn handle_table_query_stream"));
+	assert!(data_server.contains("struct TableQueryResponseStreamWriter"));
+	assert!(data_server.contains("fn query_ok_provisional_meta"));
+	assert!(data_server.contains("async fn emit_terminal"));
+	assert!(data_server.contains("MsgType::TABLE_QUERY_RESP.0"));
+	assert!(data_server.contains("FRAME_FLAG_STREAM_END"));
+	assert!(data_server.contains("writer.emit_terminal(response).await"));
+}
+
+#[test]
+fn adr118_streaming_query_result_terminal_mode_is_opt_in() {
+	let client_core = read_workspace("crates/wendelon/src/client/core.rs");
+	let strict_query = source_region(
+		&client_core,
+		"async fn query_once",
+		"#[derive(Debug)]\nenum QueryOutcome",
+	);
+	let table_query = source_region(
+		&client_core,
+		"async fn table_query_once",
+		"async fn bulk_write_group",
+	);
+
+	assert!(client_core.contains("enum StreamingQueryMetaMode"));
+	assert!(client_core.contains("StrictContinuations"));
+	assert!(client_core.contains("TerminalMetadata"));
+	assert!(strict_query.contains("StreamingQueryMetaMode::StrictContinuations"));
+	assert!(table_query.contains("StreamingQueryMetaMode::TerminalMetadata"));
+	assert!(client_core.contains("QUERY_RESP continuation must not carry response meta"));
+	assert!(client_core.contains("query terminal response meta too small"));
+}
+
+#[test]
+fn adr118_table_query_production_streams_batches_without_boundary_concat() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let stream_handler = source_region(
+		&data_server,
+		"async fn handle_table_query_stream",
+		"async fn handle_table_query_cancel",
+	);
+
+	assert!(stream_handler.contains(
+		"prepare_table_query_execution_plan_with_migration_with_cancellation_and_stream"
+	));
+	assert!(!stream_handler.contains("concat_batches"));
+	assert!(stream_handler.contains("writer.total_arrow_bytes()"));
+	assert!(stream_handler.contains("writer.emit_terminal(response).await"));
+	assert!(data_server.contains("stream_writer.as_deref_mut()"));
+	assert!(data_server.contains("writer.emit_batch(&result).await?"));
+	assert!(data_server.contains("if rows == 0 && batches.is_empty()"));
+}
+
+#[test]
+fn adr118_wendelon_table_query_checks_cancellation_during_production() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let producer = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"fn encode_query_stream_batches_with_deadline",
+	);
+	// The cost bound depends on the cancellation check living *inside*
+	// the per-location scan loop (alongside the per-location emit), not
+	// only before planning — so a cancelled/dropped consumer stops
+	// Wendelon before it reads the remaining row groups. Pin the check
+	// to the region between the scan loop and the post-scan rebatch loop.
+	let scan_loop = source_region(
+		producer,
+		"for (key_identity, locality, location) in scanned",
+		"for group in rebatch_groups",
+	);
+	assert!(
+		scan_loop.contains("cancel.is_cancelled()"),
+		"cancellation must be checked inside the per-location scan loop"
+	);
+	assert!(
+		scan_loop.contains("writer.emit_batch(&result).await?"),
+		"the projected path emits per location inside the scan loop"
+	);
+	assert!(
+		scan_loop.contains("ReadStatus::QUERY_CANCELLED"),
+		"an in-loop cancellation yields QUERY_CANCELLED"
+	);
+}
+
+#[test]
+fn adr118_table_query_req_uses_stream_handler() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	assert!(
+		data_server.contains("self.handle_table_query_stream("),
+		"a TABLE_QUERY_REQ dispatch arm must call the streaming handler"
+	);
+	// The streaming handler must run the streaming producer, not a
+	// materialize-then-respond path.
+	let handler = source_region(
+		&data_server,
+		"async fn handle_table_query_stream",
+		"async fn handle_table_query_cancel",
+	);
+	assert!(handler.contains(
+		"prepare_table_query_execution_plan_with_migration_with_cancellation_and_stream"
+	));
+}
+
+#[test]
+fn adr118_query_response_meta_not_widened() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let meta = source_region(&schema, "pub struct QueryResponseMeta", "}");
+	// D3: provisional-vs-terminal is distinguished by frame position +
+	// FRAME_FLAG_STREAM_END + the opt-in cursor mode — never by widening
+	// the fixed-size meta. The struct must carry no terminal/cursor fields.
+	for forbidden in [
+		"is_terminal",
+		"terminal_status",
+		"provisional",
+		"cursor",
+		"stream_end",
+		"continuation",
+	] {
+		assert!(
+			!meta.contains(forbidden),
+			"QueryResponseMeta must not be widened with `{forbidden}` (ADR 118 D3)"
+		);
+	}
+	assert!(schema.contains("size_of::<QueryResponseMeta>() == 56"));
+}
+
+#[test]
+fn adr118_secondary_index_table_query_streams() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	// D7: the secondary-index table-query path uses the same streaming
+	// producer contract as the full scan — it threads the stream writer
+	// so the cost bound is access-path-independent.
+	assert!(
+		data_server.contains("plan_table_query_execution_by_secondary_index"),
+		"secondary-index producer exists"
+	);
+	let by_index = source_region(
+		&data_server,
+		"match plan_table_query_execution_by_secondary_index(",
+		"Ok(plan) =>",
+	);
+	assert!(
+		by_index.contains("stream_writer.as_deref_mut()"),
+		"the secondary-index path threads the stream writer (D7 parity)"
+	);
+}
+
+#[test]
+fn adr118_cost_bound_scope_is_projected_path() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let producer = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"fn encode_query_stream_batches_with_deadline",
+	);
+	let scan_loop = source_region(
+		producer,
+		"for (key_identity, locality, location) in scanned",
+		"for group in rebatch_groups",
+	);
+	// ADR 118's storage-cost streaming guarantee scopes to the
+	// projected table-query path (Toron production scans always
+	// project). Both halves of the dual-emit reality must remain
+	// structurally visible so future readers don't silently widen the
+	// claim to the whole-record path:
+	//   1) projected = bounded — emit lives inside the per-location
+	//      scan loop, so a cancel between locations stops slab reads.
+	//   2) whole-record = wire-streaming follow-on — emit lives in the
+	//      post-scan rebatch loop, so it is stream-shaped on the wire
+	//      but does not bound slab reads (a deliberately-named follow-on).
+	assert!(
+		scan_loop.contains("writer.emit_batch(&result).await?"),
+		"projected path must emit per location inside the scan loop"
+	);
+	assert!(
+		producer.contains("for group in rebatch_groups"),
+		"whole-record path still rebatches post-scan (the named follow-on)"
+	);
+	assert!(
+		producer.contains("// ADR 118 cost-bound scope:"),
+		"the in-source scope comment must remain at the rebatch loop boundary so future readers see the dual-emit shape"
+	);
 }
 
 #[test]

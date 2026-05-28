@@ -4107,6 +4107,131 @@ impl WendelonDataServer {
 		))
 	}
 
+	async fn handle_table_query_stream(
+		&self,
+		actor: &ActorIdentity,
+		frame: HrftFrame,
+		mut stream: Box<dyn TransportStream>,
+	) -> std::io::Result<()> {
+		metrics().data_ring_query_requests_total.inc();
+		let (meta, bytecode, runtime_filter) = self.decode_table_query_request_frame(&frame)?;
+		let audit_meta = table_query_as_range_query(&meta);
+		let trace_carrier = decode_table_query_trace_carrier(&meta);
+		let trace_started_at = Instant::now();
+		let linked_span = linked_table_query_span(&meta, trace_carrier);
+		let runtime_filter_state = table_query_runtime_filter_state(&runtime_filter);
+		let provisional_response = query_ok_provisional_meta(&audit_meta, self.local_node);
+		let active_query = match self
+			.table_query_cancellation
+			.register(meta.tenant_id, meta.request_id)
+		{
+			ActiveTableQueryRegistration::Active(guard) => guard,
+			ActiveTableQueryRegistration::CancelledBeforeStart => {
+				let response =
+					query_error_meta(&audit_meta, ReadStatus::QUERY_CANCELLED, self.local_node);
+				metrics().observe_table_query_cancellation("cancelled_response");
+				self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+				record_linked_table_query_span_response(
+					&linked_span,
+					&response,
+					runtime_filter_state,
+					"not_planned",
+					"cancelled_before_start",
+					0,
+					0,
+					trace_started_at,
+				);
+				let mut writer = TableQueryResponseStreamWriter::new(
+					&mut *stream,
+					frame.header.stream_id,
+					provisional_response,
+				);
+				writer.emit_terminal(response).await?;
+				stream.finish().await?;
+				return Ok(());
+			}
+		};
+		let cancellation_token = active_query.token();
+		let span = local_table_query_span(&meta, frame.header.stream_id, trace_carrier);
+		let mut writer = TableQueryResponseStreamWriter::new(
+			&mut *stream,
+			frame.header.stream_id,
+			provisional_response,
+		);
+		let plan = match self
+			.prepare_table_query_execution_plan_with_migration_with_cancellation_and_stream(
+				&meta,
+				&bytecode,
+				runtime_filter,
+				&cancellation_token,
+				Some(&mut writer),
+			)
+			.instrument(span)
+			.await
+		{
+			Ok(plan) => plan,
+			Err(err) => {
+				self.emit_row_group_invariant_audit_for_error(
+					actor,
+					meta.tenant_id,
+					&err,
+					"table_query",
+				)?;
+				self.emit_encoding_invariant_audit_for_error(
+					actor,
+					meta.tenant_id,
+					&err,
+					"table_query",
+				)?;
+				record_linked_table_query_span_error(
+					&linked_span,
+					runtime_filter_state,
+					trace_started_at,
+				);
+				if writer.has_started() {
+					metrics().observe_table_query_cancellation("stream_dropped");
+				}
+				return Err(err);
+			}
+		};
+		let mut response = plan.response;
+		if response.status == ReadStatus::KEY_NOT_FOUND {
+			response.status = ReadStatus::OK;
+		}
+		if response.status == ReadStatus::QUERY_CANCELLED {
+			metrics().observe_table_query_cancellation("cancelled_response");
+		}
+		self.emit_row_group_fetch_sampled_audit(actor, &audit_meta, &plan.row_group_fetch_audit)?;
+		self.emit_encoding_materialize_sampled_audit(
+			actor,
+			&audit_meta,
+			&plan.encoding_materialize_audit,
+		)?;
+
+		let arrow_bytes = writer.total_arrow_bytes();
+		let batch_count = writer.batch_count();
+		self.emit_query_completion_audit(actor, &audit_meta, &response, arrow_bytes as u64)?;
+		record_linked_table_query_span_response(
+			&linked_span,
+			&response,
+			runtime_filter_state,
+			table_query_planner_path(&plan),
+			table_query_cancellation_outcome(response.status),
+			arrow_bytes,
+			batch_count,
+			trace_started_at,
+		);
+		if let Err(err) = writer.emit_terminal(response).await {
+			metrics().observe_table_query_cancellation("stream_dropped");
+			return Err(err);
+		}
+		if let Err(err) = stream.finish().await {
+			metrics().observe_table_query_cancellation("stream_dropped");
+			return Err(err);
+		}
+		Ok(())
+	}
+
 	async fn handle_table_query_cancel(
 		&self,
 		actor: &ActorIdentity,
@@ -6229,6 +6354,24 @@ impl WendelonDataServer {
 		runtime_filter: DecodedRuntimeFilter,
 		cancellation_token: &CancellationToken,
 	) -> std::io::Result<QueryExecutionPlan> {
+		self.prepare_table_query_execution_plan_with_migration_with_cancellation_and_stream(
+			meta,
+			bytecode,
+			runtime_filter,
+			cancellation_token,
+			None,
+		)
+		.await
+	}
+
+	async fn prepare_table_query_execution_plan_with_migration_with_cancellation_and_stream(
+		&self,
+		meta: &TableQueryRequestMeta,
+		bytecode: &[u8],
+		runtime_filter: DecodedRuntimeFilter,
+		cancellation_token: &CancellationToken,
+		mut stream_writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
+	) -> std::io::Result<QueryExecutionPlan> {
 		let range_meta = table_query_as_range_query(meta);
 		let row_limit = match table_query_row_limit(meta) {
 			Ok(row_limit) => row_limit,
@@ -6459,6 +6602,7 @@ impl WendelonDataServer {
 					effective_retention.floor,
 					access_plan,
 					Some(cancellation_token),
+					stream_writer.as_deref_mut(),
 				)
 				.await
 				{
@@ -6472,6 +6616,12 @@ impl WendelonDataServer {
 						return Ok(plan);
 					}
 					Err(err) => {
+						if stream_writer
+							.as_ref()
+							.is_some_and(|writer| writer.has_started())
+						{
+							return Err(err);
+						}
 						metrics().observe_storage_secondary_index_query_plan(
 							meta.tenant_id,
 							access_plan.descriptor.table_object_id,
@@ -6503,6 +6653,7 @@ impl WendelonDataServer {
 			row_identity_projection,
 			effective_retention.floor,
 			Some(cancellation_token),
+			stream_writer.as_deref_mut(),
 		)
 		.await?;
 		plan.secondary_index_access_plan = secondary_index_access_plan;
@@ -7920,6 +8071,67 @@ impl DataRingServer for WendelonDataServer {
 					}
 				};
 				self.handle_query_stream(&context.actor, frame, stream)
+					.await
+			}
+			MsgType::TABLE_QUERY_REQ => {
+				if frame.meta.len() < std::mem::size_of::<TableQueryRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"TABLE_QUERY_REQ meta too small",
+					));
+				}
+				let meta: TableQueryRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<TableQueryRequestMeta>()],
+				);
+				let audit_meta = table_query_as_range_query(&meta);
+				if let Err(err) = self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Query,
+				) {
+					self.emit_query_denied_audit(
+						&context.actor,
+						&audit_meta,
+						ReadStatus::AUTHORIZATION_FAILED,
+						err.to_string(),
+					)?;
+					let response = self.table_query_error_frame(
+						frame.header.stream_id,
+						&meta,
+						ReadStatus::AUTHORIZATION_FAILED,
+					);
+					write_frame(&mut *stream, &response.header, &response.meta, None, None).await?;
+					stream.finish().await?;
+					return Ok(());
+				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Query,
+				)? {
+					Ok(admission) => admission,
+					Err(scope) => {
+						self.emit_query_denied_audit(
+							&context.actor,
+							&audit_meta,
+							ReadStatus::BACKPRESSURED,
+							format!(
+								"post-auth request admission saturated at {}",
+								backpressure_scope_name(scope)
+							),
+						)?;
+						let response = self.table_query_error_frame(
+							frame.header.stream_id,
+							&meta,
+							ReadStatus::BACKPRESSURED,
+						);
+						write_frame(&mut *stream, &response.header, &response.meta, None, None)
+							.await?;
+						stream.finish().await?;
+						return Ok(());
+					}
+				};
+				self.handle_table_query_stream(&context.actor, frame, stream)
 					.await
 			}
 			MsgType::CDC_SUBSCRIBE_REQ => {
@@ -11263,6 +11475,104 @@ struct QueryExecutionPlan {
 	encoding_materialize_audit: Vec<EncodingMaterializeAuditSample>,
 }
 
+struct TableQueryResponseStreamWriter<'a> {
+	stream: &'a mut dyn TransportStream,
+	stream_id: u32,
+	provisional_response: QueryResponseMeta,
+	first_frame_sent: bool,
+	batch_count: usize,
+	total_arrow_bytes: usize,
+}
+
+impl<'a> TableQueryResponseStreamWriter<'a> {
+	fn new(
+		stream: &'a mut dyn TransportStream,
+		stream_id: u32,
+		provisional_response: QueryResponseMeta,
+	) -> Self {
+		Self {
+			stream,
+			stream_id,
+			provisional_response,
+			first_frame_sent: false,
+			batch_count: 0,
+			total_arrow_bytes: 0,
+		}
+	}
+
+	fn batch_count(&self) -> usize {
+		self.batch_count
+	}
+
+	fn total_arrow_bytes(&self) -> usize {
+		self.total_arrow_bytes
+	}
+
+	fn has_started(&self) -> bool {
+		self.first_frame_sent
+	}
+
+	async fn emit_batch(&mut self, batch: &RecordBatch) -> std::io::Result<()> {
+		let arrow = wire_encode_batch_for_path(batch, NetworkCompressionPath::QueryResponse)?;
+		let header = if self.first_frame_sent {
+			FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_RESP.0,
+				flags: 0,
+				stream_id: self.stream_id,
+				meta_len: 0,
+				arrow_len: arrow.len() as u32,
+				trailing_len: 0,
+			}
+		} else {
+			let response = QueryResponseMeta {
+				arrow_len: arrow.len() as u32,
+				..self.provisional_response
+			};
+			let meta_bytes = bytemuck::bytes_of(&response);
+			let header = FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_RESP.0,
+				flags: 0,
+				stream_id: self.stream_id,
+				meta_len: meta_bytes.len() as u32,
+				arrow_len: arrow.len() as u32,
+				trailing_len: 0,
+			};
+			write_frame(self.stream, &header, meta_bytes, Some(&arrow), None).await?;
+			self.first_frame_sent = true;
+			self.batch_count = self.batch_count.saturating_add(1);
+			self.total_arrow_bytes = self.total_arrow_bytes.saturating_add(arrow.len());
+			return Ok(());
+		};
+		write_frame(self.stream, &header, &[], Some(&arrow), None).await?;
+		self.batch_count = self.batch_count.saturating_add(1);
+		self.total_arrow_bytes = self.total_arrow_bytes.saturating_add(arrow.len());
+		Ok(())
+	}
+
+	async fn emit_terminal(&mut self, response: QueryResponseMeta) -> std::io::Result<()> {
+		let response = QueryResponseMeta {
+			arrow_len: 0,
+			..response
+		};
+		let meta_bytes = bytemuck::bytes_of(&response);
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_QUERY_RESP.0,
+			flags: FRAME_FLAG_STREAM_END,
+			stream_id: self.stream_id,
+			meta_len: meta_bytes.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(self.stream, &header, meta_bytes, None, None).await
+	}
+}
+
 #[derive(Clone, Debug)]
 struct ProjectedQueryLocationRead {
 	batch: RecordBatch,
@@ -12647,6 +12957,7 @@ async fn plan_table_query_execution_by_secondary_index(
 	logical_retention_floor: Option<HybridTimestamp>,
 	access_plan: &SecondaryIndexAccessPlan,
 	cancellation_token: Option<&CancellationToken>,
+	mut stream_writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
 ) -> std::io::Result<QueryExecutionPlan> {
 	let budget = QueryExecutionBudget {
 		stats_pruning_enabled: budget.stats_pruning_enabled
@@ -12772,7 +13083,11 @@ async fn plan_table_query_execution_by_secondary_index(
 				local_node,
 			));
 		}
-		batches.push(result);
+		if let Some(writer) = stream_writer.as_deref_mut() {
+			writer.emit_batch(&result).await?;
+		} else {
+			batches.push(result);
+		}
 		if row_limit_satisfied(rows, row_limit) {
 			break;
 		}
@@ -12891,14 +13206,18 @@ async fn plan_table_query_execution_by_secondary_index(
 					local_node,
 				));
 			}
-			batches.push(result);
+			if let Some(writer) = stream_writer.as_deref_mut() {
+				writer.emit_batch(&result).await?;
+			} else {
+				batches.push(result);
+			}
 			if row_limit_satisfied(rows, row_limit) {
 				break 'ranges;
 			}
 		}
 	}
 
-	if batches.is_empty() {
+	if rows == 0 && batches.is_empty() {
 		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
 		plan.stats_explain = stats_prune_cache.explain;
 		plan.secondary_index_access_plan = Some(access_plan.clone());
@@ -13369,6 +13688,7 @@ async fn plan_query_execution_for_ranges_with_program(
 		row_identity_projection,
 		logical_retention_floor,
 		None,
+		None,
 	)
 	.await
 }
@@ -13386,6 +13706,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	row_identity_projection: RowIdentityProjection,
 	logical_retention_floor: Option<HybridTimestamp>,
 	cancellation_token: Option<&CancellationToken>,
+	mut stream_writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
 ) -> std::io::Result<QueryExecutionPlan> {
 	let budget = QueryExecutionBudget {
 		stats_pruning_enabled: budget.stats_pruning_enabled
@@ -13527,7 +13848,11 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 										local_node,
 									));
 								}
-								batches.push(result);
+								if let Some(writer) = stream_writer.as_deref_mut() {
+									writer.emit_batch(&result).await?;
+								} else {
+									batches.push(result);
+								}
 								if row_limit_satisfied(rows, row_limit) {
 									break 'ranges;
 								}
@@ -13594,7 +13919,11 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 							local_node,
 						));
 					}
-					batches.push(result);
+					if let Some(writer) = stream_writer.as_deref_mut() {
+						writer.emit_batch(&result).await?;
+					} else {
+						batches.push(result);
+					}
 					if row_limit_satisfied(rows, row_limit) {
 						break 'ranges;
 					}
@@ -13688,6 +14017,12 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			}
 		}
 	}
+	// ADR 118 cost-bound scope: this rebatch loop emits *after* the
+	// full scan, so the storage-cost streaming guarantee (cancel/drop
+	// stops slab reads) covers only the projected path above (which
+	// emits per location inside the scan loop). The whole-record path
+	// remains stream-shaped at the wire boundary but is not
+	// storage-cost-streaming internally — a deliberately-named follow-on.
 	for group in rebatch_groups {
 		if row_limit_satisfied(rows, row_limit) {
 			break;
@@ -13755,13 +14090,17 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 				local_node,
 			));
 		}
-		batches.push(result);
+		if let Some(writer) = stream_writer.as_deref_mut() {
+			writer.emit_batch(&result).await?;
+		} else {
+			batches.push(result);
+		}
 	}
 
 	// 4. Empty result is a legitimate answer. Clients map
 	// KEY_NOT_FOUND to an empty batch on the receive side, so we
 	// avoid the cost of encoding a zero-row stream.
-	if batches.is_empty() && aggregate_responses.is_empty() {
+	if rows == 0 && batches.is_empty() && aggregate_responses.is_empty() {
 		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
 		plan.stats_explain = stats_prune_cache.explain;
 		plan.row_group_fetch_audit = row_group_fetch_audit;
@@ -14254,6 +14593,23 @@ fn query_error_meta(
 ) -> QueryResponseMeta {
 	QueryResponseMeta {
 		status,
+		_pad1: [0; 7],
+		value_hlc: HybridTimestamp {
+			physical_ms: 0,
+			logical: 0,
+			node_id: 0,
+		},
+		epoch: meta.expected_epoch,
+		leader_hint,
+		rows: 0,
+		arrow_len: 0,
+		_pad2: [0; 4],
+	}
+}
+
+fn query_ok_provisional_meta(meta: &QueryRequestMeta, leader_hint: NodeId) -> QueryResponseMeta {
+	QueryResponseMeta {
+		status: ReadStatus::OK,
 		_pad1: [0; 7],
 		value_hlc: HybridTimestamp {
 			physical_ms: 0,
@@ -18455,6 +18811,466 @@ mod tests {
 				.map(RecordBatch::num_rows)
 				.sum::<usize>(),
 			2
+		);
+	}
+
+	#[tokio::test]
+	async fn table_query_resp_streams_with_terminal_metadata() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(70, 0, 1), b"a", b"a-value").await;
+		let typed_bytes = encode_batch(&typed_table_batch(vec![20])).unwrap();
+		mgr.append(tenant(), id(2), hlc(80, 0, 1), &typed_bytes)
+			.await
+			.unwrap();
+
+		let program = pbc::Program::compile(&[]).unwrap();
+		let meta = base_meta();
+		let (mut client_side, server_side) = tokio::io::duplex(64 * 1024);
+		let mut server_stream = DuplexTransportStream { inner: server_side };
+		let provisional = query_ok_provisional_meta(&meta, n(1));
+		let mut writer = TableQueryResponseStreamWriter::new(&mut server_stream, 118, provisional);
+
+		let plan = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			None,
+			None,
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+			None,
+			Some(&mut writer),
+		)
+		.await
+		.unwrap();
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 2);
+		assert!(
+			plan.batches.is_empty(),
+			"streaming path must not collect emitted batches"
+		);
+		assert_eq!(writer.batch_count(), 2);
+		writer.emit_terminal(plan.response).await.unwrap();
+		drop(writer);
+		server_stream.finish().await.unwrap();
+		let pool = crate::network::pool::BufPool::new(8, 64 * 1024);
+
+		let first = read_frame(&mut client_side, &pool).await.unwrap();
+		assert_eq!(first.header.msg_type, MsgType::TABLE_QUERY_RESP.0);
+		assert_eq!(first.header.flags & FRAME_FLAG_STREAM_END, 0);
+		assert!(first.arrow_payload.is_some());
+		let first_meta: QueryResponseMeta =
+			*bytemuck::from_bytes(&first.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+		assert_eq!(first_meta.status, ReadStatus::OK);
+		assert_eq!(first_meta.rows, 0, "first-frame rows are provisional");
+
+		let continuation = read_frame(&mut client_side, &pool).await.unwrap();
+		assert_eq!(continuation.header.msg_type, MsgType::TABLE_QUERY_RESP.0);
+		assert_eq!(continuation.header.flags & FRAME_FLAG_STREAM_END, 0);
+		assert!(continuation.meta.is_empty());
+		assert!(continuation.arrow_payload.is_some());
+
+		let terminal = read_frame(&mut client_side, &pool).await.unwrap();
+		assert_ne!(terminal.header.flags & FRAME_FLAG_STREAM_END, 0);
+		assert!(terminal.arrow_payload.is_none());
+		let terminal_meta: QueryResponseMeta =
+			*bytemuck::from_bytes(&terminal.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+		assert_eq!(terminal_meta.status, ReadStatus::OK);
+		assert_eq!(terminal_meta.rows, 2);
+		assert_eq!(terminal_meta.value_hlc, hlc(80, 0, 1));
+	}
+
+	#[tokio::test]
+	async fn empty_successful_table_query_can_emit_terminal_metadata_only() {
+		let meta = base_meta();
+		let (mut client_side, server_side) = tokio::io::duplex(4096);
+		let mut server_stream = DuplexTransportStream { inner: server_side };
+		let provisional = query_ok_provisional_meta(&meta, n(1));
+		let mut writer = TableQueryResponseStreamWriter::new(&mut server_stream, 118, provisional);
+
+		writer
+			.emit_terminal(query_ok_provisional_meta(&meta, n(1)))
+			.await
+			.unwrap();
+		drop(writer);
+		server_stream.finish().await.unwrap();
+		let pool = crate::network::pool::BufPool::new(8, 4096);
+
+		let terminal = read_frame(&mut client_side, &pool).await.unwrap();
+		assert_eq!(terminal.header.msg_type, MsgType::TABLE_QUERY_RESP.0);
+		assert_ne!(terminal.header.flags & FRAME_FLAG_STREAM_END, 0);
+		assert!(terminal.arrow_payload.is_none());
+		let meta: QueryResponseMeta =
+			*bytemuck::from_bytes(&terminal.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+		assert_eq!(meta.status, ReadStatus::OK);
+		assert_eq!(meta.rows, 0);
+	}
+
+	/// Test transport that cancels a held token the first time a frame
+	/// is written to it. The frame write itself still succeeds — only
+	/// the producer's *between-location* cancel check observes the flip
+	/// — so a downstream cancellation fires deterministically after the
+	/// first batch is on the wire, exercising the ADR 118 cost bound
+	/// without timing races.
+	struct CancelOnFirstWriteTransport {
+		inner: DuplexStream,
+		token: CancellationToken,
+		armed: bool,
+	}
+
+	impl AsyncRead for CancelOnFirstWriteTransport {
+		fn poll_read(
+			mut self: Pin<&mut Self>,
+			cx: &mut TaskContext<'_>,
+			buf: &mut ReadBuf<'_>,
+		) -> Poll<std::io::Result<()>> {
+			Pin::new(&mut self.inner).poll_read(cx, buf)
+		}
+	}
+
+	impl AsyncWrite for CancelOnFirstWriteTransport {
+		fn poll_write(
+			mut self: Pin<&mut Self>,
+			cx: &mut TaskContext<'_>,
+			buf: &[u8],
+		) -> Poll<std::io::Result<usize>> {
+			if self.armed {
+				self.armed = false;
+				self.token.cancel();
+			}
+			Pin::new(&mut self.inner).poll_write(cx, buf)
+		}
+		fn poll_flush(
+			mut self: Pin<&mut Self>,
+			cx: &mut TaskContext<'_>,
+		) -> Poll<std::io::Result<()>> {
+			Pin::new(&mut self.inner).poll_flush(cx)
+		}
+		fn poll_shutdown(
+			mut self: Pin<&mut Self>,
+			cx: &mut TaskContext<'_>,
+		) -> Poll<std::io::Result<()>> {
+			Pin::new(&mut self.inner).poll_shutdown(cx)
+		}
+	}
+
+	#[async_trait]
+	impl TransportStream for CancelOnFirstWriteTransport {
+		fn stream_id(&self) -> u64 {
+			0
+		}
+		async fn finish(&mut self) -> std::io::Result<()> {
+			use tokio::io::AsyncWriteExt;
+			self.inner.shutdown().await
+		}
+	}
+
+	/// Build the projected (row-group / L2) fixture for the cost-bound
+	/// tests: six rows tiered to a mock object store, a keep-everything
+	/// PBC predicate, and the projected requirement. On this path the
+	/// producer reads and emits one frame *per location inside the scan
+	/// loop*, so a cancellation that arrives after the first frame halts
+	/// the scan before the remaining row groups are read — the Toron
+	/// production path, unlike the whole-record rebatch path which
+	/// materializes every location before emitting.
+	async fn projected_cost_bound_fixture(
+		tier_name: &str,
+	) -> (Arc<SlabManager>, TableSchemaDescriptor, pbc::Program, usize) {
+		let l2 = Arc::new(MockObjectStore::default());
+		let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+		let descriptor = append_only_table_descriptor();
+		append_append_only_rows_for_query(&mgr, &descriptor, vec![1, 2, 3, 4, 5, 6], hlc(10, 0, 1))
+			.await;
+		let _ = tier_active_slab_with_stats_for_query(&mgr, l2, &descriptor, tier_name).await;
+
+		// `col0 >= 0` keeps every row, so a full scan reads and emits
+		// every location.
+		let mut predicate = Vec::new();
+		predicate.push(OP_PUSH_COL);
+		predicate.extend_from_slice(&0_u32.to_le_bytes());
+		predicate.push(OP_PUSH_INT);
+		predicate.extend_from_slice(&0_i64.to_le_bytes());
+		predicate.push(OP_GTE);
+		let program = pbc::Program::compile(&predicate).unwrap();
+		let user_column_count = descriptor.arrow_schema().unwrap().fields().len();
+		(mgr, descriptor, program, user_column_count)
+	}
+
+	#[tokio::test]
+	async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
+		// ADR 118 headline cost bound: a consumer that cancels mid-stream
+		// makes Wendelon stop scanning before it reaches the remaining
+		// row groups.
+		let (mgr, descriptor, program, user_column_count) =
+			projected_cost_bound_fixture("adr118-cost-bound.wnd").await;
+		let mut meta = base_meta();
+		meta.as_of_hlc = hlc(99, 0, 1);
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+
+		// Control: an uncancelled projected scan emits one frame per location.
+		let (_full_client, full_server) = tokio::io::duplex(256 * 1024);
+		let mut full_stream = DuplexTransportStream { inner: full_server };
+		let mut full_writer = TableQueryResponseStreamWriter::new(
+			&mut full_stream,
+			118,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let full = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Pbc {
+				requirement: analyze_pbc_column_requirement(&program, user_column_count).unwrap(),
+				user_column_count,
+				runtime_filter: None,
+			},
+			RowIdentityProjection::None,
+			None,
+			None,
+			Some(&mut full_writer),
+		)
+		.await
+		.unwrap();
+		assert_eq!(full.response.status, ReadStatus::OK);
+		assert!(
+			full_writer.batch_count() >= 2,
+			"projected scan emits one frame per location (got {})",
+			full_writer.batch_count()
+		);
+
+		// Cancelled mid-stream: cancellation fires as the first frame is
+		// written, so the producer halts at the next location's cancel
+		// check — before reading the remaining row groups.
+		let token = CancellationToken::new();
+		let (_cancel_client, cancel_server) = tokio::io::duplex(256 * 1024);
+		let mut cancel_stream = CancelOnFirstWriteTransport {
+			inner: cancel_server,
+			token: token.clone(),
+			armed: true,
+		};
+		let mut cancel_writer = TableQueryResponseStreamWriter::new(
+			&mut cancel_stream,
+			118,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let cancelled = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Pbc {
+				requirement: analyze_pbc_column_requirement(&program, user_column_count).unwrap(),
+				user_column_count,
+				runtime_filter: None,
+			},
+			RowIdentityProjection::None,
+			None,
+			Some(&token),
+			Some(&mut cancel_writer),
+		)
+		.await
+		.unwrap();
+		assert_eq!(cancelled.response.status, ReadStatus::QUERY_CANCELLED);
+		assert_eq!(
+			cancel_writer.batch_count(),
+			1,
+			"exactly one location is emitted before the cancel check halts the scan"
+		);
+		assert!(
+			cancel_writer.batch_count() < full_writer.batch_count(),
+			"cancellation bounds the scan strictly below a full materialization"
+		);
+	}
+
+	#[tokio::test]
+	async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
+		// Row_limit pushdown DISABLED (row_limit = None). A bare `.take(n)`
+		// that does not push its bound down still bounds remote work: the
+		// executor drops/cancels the scan once it has enough rows and
+		// Wendelon stops before reading the remaining row groups. The
+		// bound comes from the drop, not from pushdown.
+		let (mgr, descriptor, program, user_column_count) =
+			projected_cost_bound_fixture("adr118-bare-limit.wnd").await;
+		let mut meta = base_meta();
+		meta.as_of_hlc = hlc(99, 0, 1);
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+
+		// Without pushdown AND without an early drop, every location is scanned.
+		let (_full_client, full_server) = tokio::io::duplex(256 * 1024);
+		let mut full_stream = DuplexTransportStream { inner: full_server };
+		let mut full_writer = TableQueryResponseStreamWriter::new(
+			&mut full_stream,
+			118,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let full = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None, // row_limit pushdown disabled
+			Some(&descriptor),
+			QueryProjectedExecution::Pbc {
+				requirement: analyze_pbc_column_requirement(&program, user_column_count).unwrap(),
+				user_column_count,
+				runtime_filter: None,
+			},
+			RowIdentityProjection::None,
+			None,
+			None,
+			Some(&mut full_writer),
+		)
+		.await
+		.unwrap();
+		assert_eq!(full.response.status, ReadStatus::OK);
+		assert!(
+			full_writer.batch_count() >= 2,
+			"no pushdown + no drop scans every location (got {})",
+			full_writer.batch_count()
+		);
+
+		// The bounded consumer drops after the first batch → cancellation
+		// fires → remote scan is bounded even though row_limit is None.
+		let token = CancellationToken::new();
+		let (_drop_client, dropped_server) = tokio::io::duplex(256 * 1024);
+		let mut dropped_stream = CancelOnFirstWriteTransport {
+			inner: dropped_server,
+			token: token.clone(),
+			armed: true,
+		};
+		let mut dropped_writer = TableQueryResponseStreamWriter::new(
+			&mut dropped_stream,
+			118,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let bounded = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None, // still no row_limit pushdown
+			Some(&descriptor),
+			QueryProjectedExecution::Pbc {
+				requirement: analyze_pbc_column_requirement(&program, user_column_count).unwrap(),
+				user_column_count,
+				runtime_filter: None,
+			},
+			RowIdentityProjection::None,
+			None,
+			Some(&token),
+			Some(&mut dropped_writer),
+		)
+		.await
+		.unwrap();
+		assert_eq!(bounded.response.status, ReadStatus::QUERY_CANCELLED);
+		assert!(
+			dropped_writer.batch_count() < full_writer.batch_count(),
+			"consumer drop bounds remote scan below full materialization without row_limit pushdown"
+		);
+	}
+
+	#[tokio::test]
+	async fn terminal_metadata_totals_match_legacy_materialized_response() {
+		// The streaming producer's authoritative terminal totals
+		// (rows / value_hlc) must equal the legacy materialized
+		// single-response totals for the same fixture.
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(70, 0, 1), b"a", b"a-value").await;
+		seed_record(&mgr, 2, hlc(95, 0, 1), b"b", b"b-value").await;
+		seed_record(&mgr, 3, hlc(88, 0, 1), b"c", b"c-value").await;
+		let program = pbc::Program::compile(&[]).unwrap();
+		let meta = base_meta();
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+
+		// Legacy materialized response: batches are collected, not streamed.
+		let legacy = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			None,
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+
+		// Streaming producer with terminal metadata.
+		let (_client, server) = tokio::io::duplex(256 * 1024);
+		let mut stream = DuplexTransportStream { inner: server };
+		let mut writer = TableQueryResponseStreamWriter::new(
+			&mut stream,
+			118,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let streamed = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			None,
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+			None,
+			Some(&mut writer),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(streamed.response.status, ReadStatus::OK);
+		assert_eq!(
+			streamed.response.rows, legacy.response.rows,
+			"streamed terminal rows equal legacy materialized rows"
+		);
+		assert_eq!(
+			streamed.response.value_hlc, legacy.response.value_hlc,
+			"streamed terminal value_hlc equals legacy materialized value_hlc"
+		);
+		assert_eq!(
+			writer.batch_count(),
+			legacy.batches.len(),
+			"streamed frame count equals legacy batch count"
+		);
+		assert!(
+			streamed.batches.is_empty(),
+			"streaming path must not also collect batches"
 		);
 	}
 

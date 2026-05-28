@@ -1461,6 +1461,7 @@ impl WendelonClient {
 			stream,
 			self.pool.clone(),
 			MsgType::TABLE_QUERY_RESP,
+			StreamingQueryMetaMode::TerminalMetadata,
 			attempt_guard,
 		)
 	}
@@ -1623,7 +1624,14 @@ pub struct StreamingQueryResult {
 	stream: Option<Box<dyn TransportStream>>,
 	pool: Arc<BufPool>,
 	expected_msg_type: MsgType,
+	meta_mode: StreamingQueryMetaMode,
 	_table_query_attempt_guard: Option<TableQueryAttemptGuard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamingQueryMetaMode {
+	StrictContinuations,
+	TerminalMetadata,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1750,6 +1758,7 @@ impl std::fmt::Debug for StreamingQueryResult {
 			.field("has_pending_batch", &self.pending_batch.is_some())
 			.field("stream_open", &self.stream.is_some())
 			.field("expected_msg_type", &self.expected_msg_type.0)
+			.field("meta_mode", &self.meta_mode)
 			.finish()
 	}
 }
@@ -1773,11 +1782,50 @@ impl StreamingQueryResult {
 				),
 			));
 		}
+		let is_end = (frame.header.flags & FRAME_FLAG_STREAM_END) != 0;
 		if !frame.meta.is_empty() {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				"QUERY_RESP continuation must not carry response meta",
-			));
+			if self.meta_mode != StreamingQueryMetaMode::TerminalMetadata || !is_end {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"QUERY_RESP continuation must not carry response meta",
+				));
+			}
+			if frame.meta.len() < std::mem::size_of::<QueryResponseMeta>() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"query terminal response meta too small",
+				));
+			}
+			if frame.trailing.is_some() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"QUERY_RESP continuation must not carry trailing bytes",
+				));
+			}
+			let ack: &QueryResponseMeta =
+				bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+			if frame.header.arrow_len != ack.arrow_len {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"query terminal response arrow_len mismatch: meta={} header={}",
+						ack.arrow_len, frame.header.arrow_len
+					),
+				));
+			}
+			self.value_hlc = ack.value_hlc;
+			self.epoch = ack.epoch;
+			self.rows = ack.rows;
+			self.stream = None;
+			return match ack.status {
+				s if s == ReadStatus::OK || s == ReadStatus::KEY_NOT_FOUND => {
+					match frame.arrow_payload.as_ref() {
+						Some(arrow) => Ok(Some(decode_batch(&arrow[..])?)),
+						None => Ok(None),
+					}
+				}
+				other => Err(query_failure_error(other)),
+			};
 		}
 		if frame.trailing.is_some() {
 			return Err(Error::new(
@@ -1785,8 +1833,6 @@ impl StreamingQueryResult {
 				"QUERY_RESP continuation must not carry trailing bytes",
 			));
 		}
-
-		let is_end = (frame.header.flags & FRAME_FLAG_STREAM_END) != 0;
 		let batch = match frame.arrow_payload.as_ref() {
 			Some(arrow) => Some(decode_batch(&arrow[..])?),
 			None if is_end => None,
@@ -1804,12 +1850,16 @@ impl StreamingQueryResult {
 		Ok(batch)
 	}
 
-	pub async fn collect_all(mut self) -> std::io::Result<Vec<RecordBatch>> {
+	pub async fn drain_all(&mut self) -> std::io::Result<Vec<RecordBatch>> {
 		let mut batches = Vec::new();
 		while let Some(batch) = self.next_batch().await? {
 			batches.push(batch);
 		}
 		Ok(batches)
+	}
+
+	pub async fn collect_all(mut self) -> std::io::Result<Vec<RecordBatch>> {
+		self.drain_all().await
 	}
 }
 
@@ -1957,7 +2007,14 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 
 		let resp = read_frame(&mut *stream, &self.pool).await?;
-		decode_initial_query_response(resp, stream, self.pool.clone(), MsgType::QUERY_RESP, None)
+		decode_initial_query_response(
+			resp,
+			stream,
+			self.pool.clone(),
+			MsgType::QUERY_RESP,
+			StreamingQueryMetaMode::StrictContinuations,
+			None,
+		)
 	}
 }
 
@@ -2045,6 +2102,7 @@ fn decode_initial_query_response(
 	stream: Box<dyn TransportStream>,
 	pool: Arc<BufPool>,
 	expected_msg_type: MsgType,
+	meta_mode: StreamingQueryMetaMode,
 	attempt_guard: Option<TableQueryAttemptGuard>,
 ) -> std::io::Result<QueryOutcome> {
 	if resp.header.msg_type != expected_msg_type.0 {
@@ -2084,21 +2142,25 @@ fn decode_initial_query_response(
 					),
 				));
 			}
-			let arrow = resp.arrow_payload.as_ref().ok_or_else(|| {
-				Error::new(
-					ErrorKind::InvalidData,
-					"query response OK missing Arrow payload",
-				)
-			})?;
-			let batch = decode_batch(&arrow[..])?;
+			let batch = match resp.arrow_payload.as_ref() {
+				Some(arrow) => Some(decode_batch(&arrow[..])?),
+				None if is_end && meta_mode == StreamingQueryMetaMode::TerminalMetadata => None,
+				None => {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"query response OK missing Arrow payload",
+					));
+				}
+			};
 			Ok(QueryOutcome::Ok(StreamingQueryResult {
 				value_hlc: ack.value_hlc,
 				epoch: ack.epoch,
 				rows: ack.rows,
-				pending_batch: Some(batch),
+				pending_batch: batch,
 				stream: if is_end { None } else { Some(stream) },
 				pool,
 				expected_msg_type,
+				meta_mode,
 				_table_query_attempt_guard: attempt_guard,
 			}))
 		}
@@ -2111,6 +2173,7 @@ fn decode_initial_query_response(
 			stream: None,
 			pool,
 			expected_msg_type,
+			meta_mode,
 			_table_query_attempt_guard: attempt_guard,
 		})),
 		other => Err(query_failure_error(other)),
@@ -3875,6 +3938,67 @@ mod tests {
 				ReadStatus::TENANT_UNAVAILABLE.0
 			)
 		);
+	}
+
+	#[tokio::test]
+	async fn table_query_terminal_error_after_data_fails_cursor() {
+		let (client_side, mut server_side) = tokio::io::duplex(4096);
+		let terminal = QueryResponseMeta {
+			status: ReadStatus::QUERY_BUDGET_EXCEEDED,
+			_pad1: [0; 7],
+			value_hlc: HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			},
+			epoch: 7,
+			leader_hint: NodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			rows: 0,
+			arrow_len: 0,
+			_pad2: [0; 4],
+		};
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_QUERY_RESP.0,
+			flags: FRAME_FLAG_STREAM_END,
+			stream_id: 9,
+			meta_len: std::mem::size_of::<QueryResponseMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut server_side,
+			&header,
+			bytemuck::bytes_of(&terminal),
+			None,
+			None,
+		)
+		.await
+		.unwrap();
+		tokio::io::AsyncWriteExt::shutdown(&mut server_side)
+			.await
+			.unwrap();
+
+		let mut result = StreamingQueryResult {
+			value_hlc: terminal.value_hlc,
+			epoch: terminal.epoch,
+			rows: 1,
+			pending_batch: Some(RecordBatch::new_empty(Arc::new(Schema::empty()))),
+			stream: Some(Box::new(DuplexTransportStream { inner: client_side })),
+			pool: BufPool::new(4, 4096),
+			expected_msg_type: MsgType::TABLE_QUERY_RESP,
+			meta_mode: StreamingQueryMetaMode::TerminalMetadata,
+			_table_query_attempt_guard: None,
+		};
+
+		assert!(result.next_batch().await.unwrap().is_some());
+		let err = result.next_batch().await.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::Other);
+		assert!(err.to_string().contains("QUERY_BUDGET_EXCEEDED"));
 	}
 
 	#[tokio::test]

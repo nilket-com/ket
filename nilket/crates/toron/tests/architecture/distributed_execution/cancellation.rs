@@ -557,7 +557,7 @@ pub(crate) fn adr060_client_hook_exposes_attempt_without_retry_duplication() {
 		std::fs::read_to_string(workspace_root_dir().join("crates/wendelon/src/client/core.rs"))
 			.expect("read wendelon client core");
 
-	assert!(facade.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(facade.contains("table_query_stream_with_runtime_filter_and_attempt_hook"));
 	assert!(core.contains("pub struct TableQueryAttempt"));
 	assert!(core.contains("attempt_request.meta.request_id = TableQueryRequestId::random();"));
 	assert!(core.contains("hook(TableQueryAttempt"));
@@ -779,7 +779,7 @@ pub(crate) fn adr060_already_cancelled_before_scan_sends_no_table_query_req() {
 		.1;
 	let cancelled_pos = scan.find("is_cancelled").expect("cancelled check");
 	let query_pos = scan
-		.find("table_query_with_runtime_filter_and_attempt_hook")
+		.find("table_query_stream_with_runtime_filter_and_attempt_hook")
 		.expect("table query call");
 
 	assert!(cancelled_pos < query_pos);
@@ -825,7 +825,7 @@ pub(crate) fn adr060_stream_drop_is_fallback_not_primary() {
 		std::fs::read_to_string(workspace_root_dir().join("crates/wendelon/src/network/router.rs"))
 			.expect("read wendelon router");
 
-	assert!(storage.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(storage.contains("table_query_stream_with_runtime_filter_and_attempt_hook"));
 	assert!(storage.contains("register_wendelon_table_query_attempt"));
 	assert!(wendelon_router.contains("stream_dropped"));
 	assert!(!storage.contains("stream_dropped"));
@@ -868,12 +868,14 @@ pub(crate) fn adr060_no_writes_cdc_admin_agg_or_legacy_query_scope() {
 			.expect("read wendelon core");
 
 	assert!(storage.contains("impl StorageScan for WendelonStorageScan"));
-	assert!(storage.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(storage.contains("table_query_stream_with_runtime_filter_and_attempt_hook"));
 	assert!(!storage.contains("aggregate_with_attempt_hook"));
 	assert!(!storage.contains("write_with_attempt_hook"));
 	assert!(!storage.contains("delete_with_attempt_hook"));
 	assert!(!storage.contains("cdc_subscribe_with_attempt_hook"));
-	assert!(wendelon_core.contains("MsgType::QUERY_RESP, None"));
+	assert!(wendelon_core.contains(
+		"MsgType::QUERY_RESP,\n\t\t\tStreamingQueryMetaMode::StrictContinuations,\n\t\t\tNone,"
+	));
 }
 
 #[test]

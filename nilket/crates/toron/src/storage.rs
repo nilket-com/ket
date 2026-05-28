@@ -913,13 +913,13 @@ impl StorageScan for WendelonStorageScan {
 			return Err(StorageError::Cancelled);
 		}
 
-		let query_result = if let Some(downstream_cancellation) =
+		let mut query_stream = if let Some(downstream_cancellation) =
 			request.downstream_cancellation.clone()
 		{
 			let client = Arc::clone(&self.client);
 			let cancel_sender: Arc<dyn WendelonTableQueryCancelSender> = client;
 			self.client
-				.table_query_with_runtime_filter_and_attempt_hook(
+				.table_query_stream_with_runtime_filter_and_attempt_hook(
 					tenant_id,
 					&descriptor,
 					pbc,
@@ -947,7 +947,7 @@ impl StorageScan for WendelonStorageScan {
 				.await
 		} else {
 			self.client
-				.table_query_with_runtime_filter(
+				.table_query_stream_with_runtime_filter(
 					tenant_id,
 					&descriptor,
 					pbc,
@@ -957,23 +957,50 @@ impl StorageScan for WendelonStorageScan {
 				.await
 		}
 		.map_err(|error| map_wendelon_client_error_to_storage(request.table_id, error))?;
-		let schema = if let Some(batch) = query_result.batches.first() {
-			batch.schema()
-		} else {
-			Arc::new(
-				descriptor
-					.arrow_schema()
-					.map_err(|error| StorageError::Internal {
-						message: error.to_string(),
-					})?,
+		let first_batch = query_stream.next_batch().await.map_err(|error| {
+			map_wendelon_client_error_to_storage(
+				request.table_id,
+				wendelon_client::ClientError::Io(error),
 			)
+		})?;
+		let schema = match first_batch.as_ref() {
+			Some(batch) => batch.schema(),
+			None => {
+				Arc::new(
+					descriptor
+						.arrow_schema()
+						.map_err(|error| StorageError::Internal {
+							message: error.to_string(),
+						})?,
+				)
+			}
 		};
+		let table_id = request.table_id;
+		let remainder = stream::unfold(Some(query_stream), move |state| async move {
+			let Some(mut query_stream) = state else {
+				return None;
+			};
+			match query_stream.next_batch().await {
+				Ok(Some(batch)) => Some((Ok(batch), Some(query_stream))),
+				Ok(None) => None,
+				Err(error) => Some((
+					Err(map_wendelon_client_error_to_storage(
+						table_id,
+						wendelon_client::ClientError::Io(error),
+					)),
+					None,
+				)),
+			}
+		});
+		let batches = stream::iter(first_batch.into_iter().map(Ok))
+			.chain(remainder)
+			.boxed();
 
-		Ok(ScanStream::from_batches(
+		Ok(ScanStream::new(
 			schema,
 			request.session_id,
 			request.query_id,
-			query_result.batches,
+			batches,
 		))
 	}
 }
@@ -1265,6 +1292,33 @@ mod tests {
 		);
 
 		assert!(matches!(error, StorageError::Cancelled));
+	}
+
+	#[tokio::test]
+	async fn terminal_error_after_data_fails_toron_query() {
+		// ADR 118 D8 (Toron side): once Wendelon has put a batch on the
+		// wire and then reports a non-OK terminal status, Toron surfaces
+		// it as a ScanStream error. The already-emitted batch is NOT a
+		// successful partial result — draining the stream yields the error.
+		let batch = test_batch();
+		let schema = batch.schema();
+		let stream = ScanStream::new(
+			schema,
+			SessionId(1),
+			QueryId::from_u128(2),
+			stream::iter(vec![Ok(batch), Err(StorageError::Cancelled)]).boxed(),
+		);
+		let mut items = stream.into_batches();
+		let first = items.next().await.expect("first item present");
+		assert!(
+			first.is_ok(),
+			"the provisional batch arrives before the terminal error"
+		);
+		let second = items.next().await.expect("terminal item present");
+		assert!(
+			matches!(second, Err(StorageError::Cancelled)),
+			"a non-OK terminal after data surfaces as a ScanStream error, not a successful result"
+		);
 	}
 
 	#[tokio::test]

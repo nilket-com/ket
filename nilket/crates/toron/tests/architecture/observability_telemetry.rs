@@ -769,7 +769,7 @@ pub(crate) fn adr069_trace_context_set_once_on_shared_options() {
 		.find("..wendelon_client::TableQueryOptions::default()")
 		.expect("default options update");
 	let branch_pos = scan_block
-		.find("let query_result = if let Some(downstream_cancellation)")
+		.find("let mut query_stream = if let Some(downstream_cancellation)")
 		.expect("cancellation branch");
 	assert_eq!(scan_block.matches(carrier).count(), 1);
 	assert!(options_pos < carrier_pos);
@@ -889,7 +889,7 @@ pub(crate) fn adr069_cancellation_attempt_hook_shape_is_preserved() {
 			.into_iter()
 			.next()
 			.expect("WendelonStorageScan impl block");
-	assert!(scan_block.contains("table_query_with_runtime_filter_and_attempt_hook"));
+	assert!(scan_block.contains("table_query_stream_with_runtime_filter_and_attempt_hook"));
 	assert!(scan_block.contains("register_wendelon_table_query_attempt"));
 	assert!(scan_block.contains("WendelonTableQueryAttempt"));
 	assert!(scan_block.contains("target: attempt.target"));
