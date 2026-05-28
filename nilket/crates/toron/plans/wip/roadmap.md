@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–120 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–121 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118) + pipelined cross-stage execution (119) + end-to-end bounded first rows (120, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118) + pipelined cross-stage execution (119) + end-to-end bounded first rows (120) + general qualified relation-scope binding (121, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -1050,27 +1050,50 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 120 promoted; ADR 121 candidates
+### ADR 121 promoted; ADR 122 candidates
 
-ADR 120 selected and promoted **end-to-end bounded first rows** — the in-process coordinator cursor
-capstone of the 115→119 substrate arc, reconciling Claude's client-streaming candidate with Gemini's whole-record
-cost-streaming candidate into a behavior-led topic (see
-[[feedback_behavior_led_topic_reconciles_layer_led_splits]]). Three hops now stream end-to-end:
-storage (Wendelon descriptor-backed whole-record per-location emit; 118's descriptor-backed
-`rebatch_groups` post-scan loop deleted), worker
-(`drive_streamable_plan` sink for streamable FinalResult sends `TaskBatch` frames before
-`TaskComplete`), and coordinator (`execute_query_stream` cursor surface over a spawn-driver lifetime,
-with `execute_query` preserved as a collecting compatibility wrapper). **Genuine 3-of-3 — Claude
-conceded iter-1 to grounding**: Codex flagged that a scheduler→cursor channel over task-complete events
-is the same syntactic-relocation trap as 119 iter-1 (worker hop was Vec-buffered); the bifurcated gates
-(`collect_select_star_limit_3_*` + `stream_select_star_consume_three_then_drop_*`) pin both halves
-distinctly. Descriptor-backed `SELECT * FROM huge_table LIMIT 3` now stops Wendelon mid-scan through the coordinator
-surface regardless of whether the projected fast path or the whole-record fallback engages; external SQL
-wire result streaming remains a follow-on because `daemon.rs` still has its own response/audit ordering.
-With 115/116/117/118/119/120 the substrate
-arc is complete through the in-process coordinator surface; subsequent frontiers extend coverage (multi-upstream, non-
-streamable shapes, V2 frame-overhead reduction) or pivot to compute (joins) / types (lifecycle).
-**Scope each candidate as a complete cut, not a ~100-line granular slice** (standing operator steer).
+ADR 121 selected and promoted **general qualified relation-scope binding** — scalar qualifier resolution
+generalized across SELECT/WHERE/HAVING/GROUP BY/aggregate args/ORDER BY (and the existing JOIN-key
+context), using the existing `ColumnRef { qualifier: Option<TableRef> }` IR (no new variants); a
+binder-internal `RelationScope` sidecar carries `(qualifier, visible_column_name) → (output_ordinal,
+physical_type, nullability, logical_identity)` with explicit scope propagation per plan node and
+alias-hides-base-qualifier semantics, including alias-column-list renamed names under the alias
+qualifier; named/actionable qualifier errors cover unknown relation, ambiguous relation, and unknown
+column within relation, replacing four generic "not supported" strings plus one visible-name
+qualifier gate; Rune gains `RuneDataFrame::alias` + free `qcol`. **Genuine 3-of-3 — Claude
+conceded twice to Codex's grounding**: iter-0 (joins/aliases/qualifier infrastructure all landed —
+[[feedback_ground_the_premise_before_sketching_scope]]) and iter-1 (wildcard expansion has no catalog
+access at the SQL-planner expansion site; same lesson recursively at sub-features). The 9-site reject
+surface partitions cleanly: 5 scalar sites converted (pinned by G1 — four strings gone, visible-name
+qualifier shape relaxed); 4 wildcard/RETURNING sites stay rejected verbatim (pinned by G2 — the
+deferred non-scope is explicit and can't be silently relaxed, including qualified RETURNING's
+`expr_contains_qualified_column` helper). With 115/116/117/118/119/120/121 the execution substrate
+is complete through the coordinator surface AND qualified column authoring is general at the SQL/Rune
+frontends.
+The next frontier is either the joins-customer side (Rune `.join(...)` direct authoring, multi-upstream
+live pipelining) or the 121 named follow-ons (qualified wildcards, qualified DML RETURNING). **Scope
+each candidate as a complete cut, not a ~100-line granular slice** (standing operator steer).
+
+*121 named follow-ons (deferred non-scope, pinned by G2):*
+
+- **Qualified wildcards (`t.*` + mixed wildcard)** — requires planner↔binder restructuring (move
+  wildcard expansion into the binder where catalog access lives) or a `Wildcard` IR variant.
+  Substantial; either approach is a distinct cut from "convert a reject string."
+- **Qualified DML RETURNING (`INSERT … RETURNING t.id` + RETURNING wildcard)** — same machinery as
+  wildcards + DML target alias semantics.
+- **DML target aliases / qualified DML assignment targets** — `UPDATE t AS x SET x.col = ...` and
+  similar; requires DML target alias surface that doesn't exist today.
+
+*Compute customer frontier (now-unblocked by 121):*
+
+- **Rune `.join(...)` direct authoring** — over the existing `LogicalPlan::Join`. 121 made qualified
+  authoring general, which is the prerequisite Rune-side joins needed. Smaller cut than the V1 join
+  customer itself (which 121 also unblocks).
+- **Multi-upstream live pipelining** — relax 117's multi-upstream acceptance-layer barrier for the
+  streamable subset, letting joins / multi-input compositions pipeline across both upstreams. **Now
+  genuinely customer-ready** once Rune `.join(...)` lands (joins authorable → multi-upstream
+  pipelining has live customers to exercise it; previously the [[feedback_cut_must_deliver_the_name]]
+  trap of "barrier relaxation without customer evidence").
 
 *120 V2 follow-ons (named at promotion):*
 
@@ -1086,18 +1109,15 @@ streamable shapes, V2 frame-overhead reduction) or pivot to compute (joins) / ty
 - **External SQL wire result streaming** — stream `ResultBatch` frames from the daemon as cursor batches
   arrive, including the audit-fail-closed pre-encode ordering question.
 
-*Distributed / execution continuation (115–120 descendants):*
+*Distributed / execution continuation (115–121 descendants):*
 
-- **Multi-upstream live pipelining** — relax 117's multi-upstream acceptance-layer barrier for the
-  streamable subset, letting joins / multi-input compositions pipeline across both upstreams. Touches
-  117's landed correctness; substantial; gated on joins as the customer.
 - **Streamable-plan coverage extension** — bounded-memory streaming shapes for `Aggregate`/`Sort` (top-k
   bounded buffers; partial+merge for aggregates) that promote them from non-streamable to live-eligible
   producers, widening 119/120's streamable subset.
 - **Row-group-lazy-from-disk scan** — push the laziness deeper into Wendelon storage (per disk page rather
   than per row group) so very large row groups don't materialize. A storage-internal follow-on to 118.
-- **Joins frontier** — Rune joins / joins-around-derived (V1 two-input operator); needs relation-alias +
-  qualified-column ergonomics first (and would exercise 117's deferred barrier-inside-join-input).
+- **Joins-around-derived / GROUP BY over joins** — explicitly named non-scope of 121; substantive
+  next-cut on the joins surface once Rune `.join(...)` lands.
 
 *Identity-tier continuation (087–114 descendants):*
 
@@ -1164,6 +1184,21 @@ streamable shapes, V2 frame-overhead reduction) or pivot to compute (joins) / ty
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 120 promoted; ADR 121 candidates (HISTORICAL)
+
+ADR 120 took the user-visible capstone of the 115→119 substrate arc: three hops streaming end-to-end
+(Wendelon descriptor-backed whole-record per-location emit; Toron worker `drive_streamable_plan` sink
+for streamable FinalResult sending `TaskBatch` frames before `TaskComplete`; coordinator
+`execute_query_stream` cursor surface with spawn-driver lifetime and RAII drop-cancellation). The
+bifurcated headline gates pin both halves (collecting `LIMIT 3` cheapness + caller-drop streaming
+cancellation). ADR 121 followed up as the **authoring capstone**: scalar qualifier resolution
+generalized across scalar `Expr::Column` positions, with Rune `alias`/`qcol` exposed,
+alias-column-list names feeding relation scope, and named/actionable qualifier errors; the 9-site
+reject surface partitions into 5 converted (G1: four strings gone plus visible-name qualifier gate
+relaxed) and 4 stays-rejected-as-explicit-non-scope (G2). Detail in
+`plans/adr/120_end_to_end_bounded_first_rows.md` +
+`plans/adr/121_general_qualified_relation_scope_binding.md` + the active-line entry above.
 
 ### ADR 119 promoted; ADR 120 candidates (HISTORICAL)
 
