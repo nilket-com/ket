@@ -11830,12 +11830,11 @@ where
 	false
 }
 
-struct RebatchGroup {
+struct DescriptorlessRebatchGroup {
 	schema: Arc<Schema>,
 	batches: Vec<RecordBatch>,
 	row_key_ids: Vec<Identity>,
 	max_hlc: HybridTimestamp,
-	input_rows: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -13039,57 +13038,62 @@ async fn plan_table_query_execution_by_secondary_index(
 		}
 		indexed_rows.push(row.clone());
 	}
-	for (row, result) in read_secondary_index_query_locations(
-		slab,
-		&indexed_rows,
-		table_descriptor,
-		program,
-		projected_execution,
-	)
-	.await?
-	{
-		if let Some(cancel) = cancellation_token {
-			if cancel.is_cancelled() {
+	'indexed_rows: for indexed_chunk in indexed_rows.chunks(4) {
+		if row_limit_satisfied(rows, row_limit) {
+			break;
+		}
+		for (row, result) in read_secondary_index_query_locations(
+			slab,
+			indexed_chunk,
+			table_descriptor,
+			program,
+			projected_execution,
+		)
+		.await?
+		{
+			if let Some(cancel) = cancellation_token {
+				if cancel.is_cancelled() {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_CANCELLED,
+						local_node,
+					));
+				}
+			}
+			row_group_fetch_audit.merge(result.row_group_fetch_audit);
+			encoding_materialize_audit.extend(result.encoding_materialize_audit);
+			let result = result.batch;
+			if result.num_rows() == 0 {
+				continue;
+			}
+			let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
+				break 'indexed_rows;
+			};
+			if result.num_rows() > max_rows_per_location {
 				return Ok(query_plan_error(
 					meta,
-					ReadStatus::QUERY_CANCELLED,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
 					local_node,
 				));
 			}
-		}
-		row_group_fetch_audit.merge(result.row_group_fetch_audit);
-		encoding_materialize_audit.extend(result.encoding_materialize_audit);
-		let result = result.batch;
-		if result.num_rows() == 0 {
-			continue;
-		}
-		let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
-			break;
-		};
-		if result.num_rows() > max_rows_per_location {
-			return Ok(query_plan_error(
-				meta,
-				ReadStatus::QUERY_BUDGET_EXCEEDED,
-				local_node,
-			));
-		}
-		if row.row_hlc > max_hlc {
-			max_hlc = row.row_hlc;
-		}
-		if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
-			return Ok(query_plan_error(
-				meta,
-				ReadStatus::QUERY_BUDGET_EXCEEDED,
-				local_node,
-			));
-		}
-		if let Some(writer) = stream_writer.as_deref_mut() {
-			writer.emit_batch(&result).await?;
-		} else {
-			batches.push(result);
-		}
-		if row_limit_satisfied(rows, row_limit) {
-			break;
+			if row.row_hlc > max_hlc {
+				max_hlc = row.row_hlc;
+			}
+			if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+			if let Some(writer) = stream_writer.as_deref_mut() {
+				writer.emit_batch(&result).await?;
+			} else {
+				batches.push(result);
+			}
+			if row_limit_satisfied(rows, row_limit) {
+				break 'indexed_rows;
+			}
 		}
 	}
 
@@ -13728,7 +13732,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	let mut row_group_fetch_audit = RowGroupFetchAuditCounters::default();
 	let mut encoding_materialize_audit = Vec::new();
 	let mut stats_prune_cache = QueryStatsPruneCache::default();
-	let mut rebatch_groups: Vec<RebatchGroup> = Vec::new();
+	let mut descriptorless_rebatch_groups: Vec<DescriptorlessRebatchGroup> = Vec::new();
 	let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
 	if let Some(cancel) = cancellation_token {
 		if cancel.is_cancelled() {
@@ -13995,35 +13999,100 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					continue;
 				}
 			}
-			let input_rows = batch.num_rows() as u64;
-			if let Some(group) = rebatch_groups
-				.iter_mut()
-				.find(|group| group.schema.as_ref() == batch.schema().as_ref())
-			{
-				if location.hlc > group.max_hlc {
-					group.max_hlc = location.hlc;
+			if table_descriptor.is_none() {
+				// ADR 120 D2(c): descriptor-backed typed-table queries
+				// take the per-location path below. Descriptorless legacy
+				// queries keep the pre-ADR-120 schema-grouping behavior
+				// because there is no table descriptor to assert against.
+				if let Some(group) = descriptorless_rebatch_groups
+					.iter_mut()
+					.find(|group| group.schema.as_ref() == batch.schema().as_ref())
+				{
+					if location.hlc > group.max_hlc {
+						group.max_hlc = location.hlc;
+					}
+					group.batches.push(batch);
+					group.row_key_ids.extend(batch_row_key_ids);
+				} else {
+					descriptorless_rebatch_groups.push(DescriptorlessRebatchGroup {
+						schema: batch.schema(),
+						batches: vec![batch],
+						row_key_ids: batch_row_key_ids,
+						max_hlc: location.hlc,
+					});
 				}
-				group.input_rows = group.input_rows.saturating_add(input_rows);
-				group.batches.push(batch);
-				group.row_key_ids.extend(batch_row_key_ids);
+				continue;
+			}
+
+			// ADR 120 descriptor-backed whole-record path: after
+			// `table_record_matches_descriptor` has asserted the table
+			// descriptor schema, execute and emit each location before
+			// the next storage read so bounded consumers bound storage
+			// work.
+			let mut row_key_ids = Vec::new();
+			if row_identity_projection == RowIdentityProjection::Append {
+				let mask = match pbc::survival_mask(program, &batch) {
+					Ok(mask) => mask,
+					Err(_) => {
+						return Ok(query_plan_error(
+							meta,
+							ReadStatus::QUERY_INVALID_PROGRAM,
+							local_node,
+						));
+					}
+				};
+				row_key_ids = filter_row_key_ids_by_mask(&batch_row_key_ids, &mask);
+			}
+			let mut result = match pbc::execute_program(program, &batch) {
+				Ok(result) => result,
+				Err(_) => {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_INVALID_PROGRAM,
+						local_node,
+					));
+				}
+			};
+			if row_identity_projection == RowIdentityProjection::Append {
+				result = append_query_row_identity_column(result, &row_key_ids)?;
+			}
+			if let Some(cancel) = cancellation_token {
+				if cancel.is_cancelled() {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_CANCELLED,
+						local_node,
+					));
+				}
+			}
+			if result.num_rows() == 0 {
+				continue;
+			}
+			if location.hlc > max_hlc {
+				max_hlc = location.hlc;
+			}
+			let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
+				break 'ranges;
+			};
+			if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+			if let Some(writer) = stream_writer.as_deref_mut() {
+				writer.emit_batch(&result).await?;
 			} else {
-				rebatch_groups.push(RebatchGroup {
-					schema: batch.schema(),
-					batches: vec![batch],
-					row_key_ids: batch_row_key_ids,
-					max_hlc: location.hlc,
-					input_rows,
-				});
+				batches.push(result);
+			}
+			if row_limit_satisfied(rows, row_limit) {
+				break 'ranges;
 			}
 		}
 	}
-	// ADR 118 cost-bound scope: this rebatch loop emits *after* the
-	// full scan, so the storage-cost streaming guarantee (cancel/drop
-	// stops slab reads) covers only the projected path above (which
-	// emits per location inside the scan loop). The whole-record path
-	// remains stream-shaped at the wire boundary but is not
-	// storage-cost-streaming internally — a deliberately-named follow-on.
-	for group in rebatch_groups {
+
+	for group in descriptorless_rebatch_groups {
 		if row_limit_satisfied(rows, row_limit) {
 			break;
 		}
@@ -18913,19 +18982,74 @@ mod tests {
 		assert_eq!(meta.rows, 0);
 	}
 
-	/// Test transport that cancels a held token the first time a frame
-	/// is written to it. The frame write itself still succeeds — only
-	/// the producer's *between-location* cancel check observes the flip
-	/// — so a downstream cancellation fires deterministically after the
-	/// first batch is on the wire, exercising the ADR 118 cost bound
-	/// without timing races.
-	struct CancelOnFirstWriteTransport {
+	/// Test transport that cancels a held token after a configured
+	/// number of complete HRFT frames. The triggering frame write itself still
+	/// succeeds — only the producer's *between-location* cancel check
+	/// observes the flip — so downstream cancellation fires
+	/// deterministically after N batches are on the wire.
+	struct CancelAfterFrameTransport {
 		inner: DuplexStream,
 		token: CancellationToken,
-		armed: bool,
+		cancel_after_frames: usize,
+		frames_seen: usize,
+		header_buf: Vec<u8>,
+		payload_remaining: Option<usize>,
 	}
 
-	impl AsyncRead for CancelOnFirstWriteTransport {
+	impl CancelAfterFrameTransport {
+		fn new(inner: DuplexStream, token: CancellationToken, cancel_after_frames: usize) -> Self {
+			Self {
+				inner,
+				token,
+				cancel_after_frames,
+				frames_seen: 0,
+				header_buf: Vec::with_capacity(std::mem::size_of::<FrameHeader>()),
+				payload_remaining: None,
+			}
+		}
+
+		fn observe_written_bytes(&mut self, mut bytes: &[u8]) {
+			while !bytes.is_empty() {
+				if let Some(remaining) = self.payload_remaining.as_mut() {
+					let consumed = (*remaining).min(bytes.len());
+					*remaining -= consumed;
+					bytes = &bytes[consumed..];
+					if *remaining == 0 {
+						self.payload_remaining = None;
+						self.note_frame_complete();
+					}
+					continue;
+				}
+
+				let header_size = std::mem::size_of::<FrameHeader>();
+				let needed = header_size - self.header_buf.len();
+				let consumed = needed.min(bytes.len());
+				self.header_buf.extend_from_slice(&bytes[..consumed]);
+				bytes = &bytes[consumed..];
+				if self.header_buf.len() == header_size {
+					let header: FrameHeader = *bytemuck::from_bytes(&self.header_buf);
+					self.header_buf.clear();
+					let payload_len = header.meta_len as usize
+						+ header.arrow_len as usize
+						+ header.trailing_len as usize;
+					if payload_len == 0 {
+						self.note_frame_complete();
+					} else {
+						self.payload_remaining = Some(payload_len);
+					}
+				}
+			}
+		}
+
+		fn note_frame_complete(&mut self) {
+			self.frames_seen += 1;
+			if self.frames_seen == self.cancel_after_frames {
+				self.token.cancel();
+			}
+		}
+	}
+
+	impl AsyncRead for CancelAfterFrameTransport {
 		fn poll_read(
 			mut self: Pin<&mut Self>,
 			cx: &mut TaskContext<'_>,
@@ -18935,17 +19059,19 @@ mod tests {
 		}
 	}
 
-	impl AsyncWrite for CancelOnFirstWriteTransport {
+	impl AsyncWrite for CancelAfterFrameTransport {
 		fn poll_write(
 			mut self: Pin<&mut Self>,
 			cx: &mut TaskContext<'_>,
 			buf: &[u8],
 		) -> Poll<std::io::Result<usize>> {
-			if self.armed {
-				self.armed = false;
-				self.token.cancel();
+			match Pin::new(&mut self.inner).poll_write(cx, buf) {
+				Poll::Ready(Ok(written)) => {
+					self.observe_written_bytes(&buf[..written]);
+					Poll::Ready(Ok(written))
+				}
+				other => other,
 			}
-			Pin::new(&mut self.inner).poll_write(cx, buf)
 		}
 		fn poll_flush(
 			mut self: Pin<&mut Self>,
@@ -18962,7 +19088,7 @@ mod tests {
 	}
 
 	#[async_trait]
-	impl TransportStream for CancelOnFirstWriteTransport {
+	impl TransportStream for CancelAfterFrameTransport {
 		fn stream_id(&self) -> u64 {
 			0
 		}
@@ -19001,6 +19127,27 @@ mod tests {
 		let program = pbc::Program::compile(&predicate).unwrap();
 		let user_column_count = descriptor.arrow_schema().unwrap().fields().len();
 		(mgr, descriptor, program, user_column_count)
+	}
+
+	async fn descriptor_backed_whole_record_cost_bound_fixture() -> (
+		Arc<SlabManager>,
+		TableSchemaDescriptor,
+		pbc::Program,
+		QueryRequestMeta,
+		[QueryScanRange; 1],
+	) {
+		let mgr = make_manager().await;
+		let descriptor = append_only_table_descriptor();
+		append_append_only_rows_for_query(&mgr, &descriptor, vec![1, 2, 3, 4, 5, 6], hlc(10, 0, 1))
+			.await;
+		let program = pbc::Program::compile(&[]).unwrap();
+		let mut meta = base_meta();
+		meta.as_of_hlc = hlc(99, 0, 1);
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+		(mgr, descriptor, program, meta, ranges)
 	}
 
 	#[tokio::test]
@@ -19058,11 +19205,7 @@ mod tests {
 		// check — before reading the remaining row groups.
 		let token = CancellationToken::new();
 		let (_cancel_client, cancel_server) = tokio::io::duplex(256 * 1024);
-		let mut cancel_stream = CancelOnFirstWriteTransport {
-			inner: cancel_server,
-			token: token.clone(),
-			armed: true,
-		};
+		let mut cancel_stream = CancelAfterFrameTransport::new(cancel_server, token.clone(), 1);
 		let mut cancel_writer = TableQueryResponseStreamWriter::new(
 			&mut cancel_stream,
 			118,
@@ -19099,6 +19242,259 @@ mod tests {
 			cancel_writer.batch_count() < full_writer.batch_count(),
 			"cancellation bounds the scan strictly below a full materialization"
 		);
+	}
+
+	#[tokio::test]
+	async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
+		let (mgr, descriptor, program, meta, ranges) =
+			descriptor_backed_whole_record_cost_bound_fixture().await;
+
+		let (_full_client, full_server) = tokio::io::duplex(256 * 1024);
+		let mut full_stream = DuplexTransportStream { inner: full_server };
+		let mut full_writer = TableQueryResponseStreamWriter::new(
+			&mut full_stream,
+			118,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let full = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+			None,
+			Some(&mut full_writer),
+		)
+		.await
+		.unwrap();
+		assert_eq!(full.response.status, ReadStatus::OK);
+		assert!(
+			full_writer.batch_count() >= 2,
+			"whole-record scan should emit multiple per-location batches"
+		);
+
+		let token = CancellationToken::new();
+		let (_cancel_client, cancel_server) = tokio::io::duplex(256 * 1024);
+		let mut cancel_stream = CancelAfterFrameTransport::new(cancel_server, token.clone(), 1);
+		let mut cancel_writer = TableQueryResponseStreamWriter::new(
+			&mut cancel_stream,
+			118,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let cancelled = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+			Some(&token),
+			Some(&mut cancel_writer),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(cancelled.response.status, ReadStatus::QUERY_CANCELLED);
+		assert_eq!(cancel_writer.batch_count(), 1);
+		assert!(cancel_writer.batch_count() < full_writer.batch_count());
+	}
+
+	#[tokio::test]
+	async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() {
+		let (mgr, descriptor, program, meta, ranges) =
+			descriptor_backed_whole_record_cost_bound_fixture().await;
+		let full = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+		assert_eq!(full.response.status, ReadStatus::OK);
+		assert!(
+			full.batches.len() > 3,
+			"control scan must visit more locations than LIMIT 3"
+		);
+
+		let limited = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			Some(3),
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+		assert_eq!(limited.response.status, ReadStatus::OK);
+		assert_eq!(limited.response.rows, 3);
+		assert_eq!(limited.batches.len(), 3);
+		assert!(
+			limited.batches.len() < full.batches.len(),
+			"LIMIT 3 must stop before the full whole-record scan completes"
+		);
+		assert_eq!(
+			limited
+				.batches
+				.iter()
+				.map(RecordBatch::num_rows)
+				.sum::<usize>(),
+			3
+		);
+	}
+
+	#[tokio::test]
+	async fn stream_select_star_consume_three_then_drop_stops_whole_record_scan() {
+		let (mgr, descriptor, program, meta, ranges) =
+			descriptor_backed_whole_record_cost_bound_fixture().await;
+
+		let (_full_client, full_server) = tokio::io::duplex(256 * 1024);
+		let mut full_stream = DuplexTransportStream { inner: full_server };
+		let mut full_writer = TableQueryResponseStreamWriter::new(
+			&mut full_stream,
+			120,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let full = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+			None,
+			Some(&mut full_writer),
+		)
+		.await
+		.unwrap();
+		assert_eq!(full.response.status, ReadStatus::OK);
+		assert!(
+			full_writer.batch_count() > 3,
+			"control stream must emit more locations than the consuming cursor"
+		);
+
+		let token = CancellationToken::new();
+		let (_drop_client, dropped_server) = tokio::io::duplex(256 * 1024);
+		let mut dropped_stream = CancelAfterFrameTransport::new(dropped_server, token.clone(), 3);
+		let mut dropped_writer = TableQueryResponseStreamWriter::new(
+			&mut dropped_stream,
+			120,
+			query_ok_provisional_meta(&meta, n(1)),
+		);
+		let bounded = plan_query_execution_for_ranges_with_program_maybe_cancelled(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+			Some(&token),
+			Some(&mut dropped_writer),
+		)
+		.await
+		.unwrap();
+		assert_eq!(bounded.response.status, ReadStatus::QUERY_CANCELLED);
+		assert_eq!(dropped_writer.batch_count(), 3);
+		assert!(
+			dropped_writer.batch_count() < full_writer.batch_count(),
+			"dropping after three streamed rows bounds the whole-record scan"
+		);
+	}
+
+	#[tokio::test]
+	async fn whole_record_emitted_batch_matches_descriptor_schema() {
+		let (mgr, descriptor, program, meta, ranges) =
+			descriptor_backed_whole_record_cost_bound_fixture().await;
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			Some(3),
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+		let schema = descriptor.arrow_schema().unwrap();
+		assert!(!plan.batches.is_empty());
+		for batch in &plan.batches {
+			assert_eq!(batch.schema().as_ref(), &schema);
+		}
+	}
+
+	#[tokio::test]
+	async fn whole_record_descriptorless_path_remains_behavior_compatible() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(70, 0, 1), b"a", b"a-value").await;
+		seed_record(&mgr, 2, hlc(80, 0, 1), b"b", b"b-value").await;
+		seed_record(&mgr, 3, hlc(90, 0, 1), b"c", b"c-value").await;
+		let program = pbc::Program::compile(&[]).unwrap();
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&base_meta(),
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			None,
+			None,
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 3);
+		assert_eq!(
+			plan.batches.len(),
+			1,
+			"descriptorless whole-record queries retain legacy schema-grouped output"
+		);
+		assert_eq!(plan.batches[0].num_rows(), 3);
 	}
 
 	#[tokio::test]
@@ -19157,11 +19553,7 @@ mod tests {
 		// fires → remote scan is bounded even though row_limit is None.
 		let token = CancellationToken::new();
 		let (_drop_client, dropped_server) = tokio::io::duplex(256 * 1024);
-		let mut dropped_stream = CancelOnFirstWriteTransport {
-			inner: dropped_server,
-			token: token.clone(),
-			armed: true,
-		};
+		let mut dropped_stream = CancelAfterFrameTransport::new(dropped_server, token.clone(), 1);
 		let mut dropped_writer = TableQueryResponseStreamWriter::new(
 			&mut dropped_stream,
 			118,

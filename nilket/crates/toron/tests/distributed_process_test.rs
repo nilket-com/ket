@@ -1,6 +1,7 @@
 use arrow::array::{Int32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -376,6 +377,62 @@ async fn multiple_ordered_top_k_process_query_preserves_inner_barrier() {
 			.collect::<Vec<_>>(),
 		vec![6, 7, 8]
 	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execute_query_stream_yields_bare_limit_first_rows() {
+	let mut worker = FixtureWorkerProcess::spawn(WorkerId::from_u128(1_420)).await;
+	let registry = Arc::new(RoundRobinRegistry::new([worker_entry(&worker)], 0));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry,
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan("SELECT val FROM fixture LIMIT 3")
+		.expect("plan bare limit");
+
+	let mut stream = coordinator
+		.execute_query_stream(&logical)
+		.await
+		.expect("open result stream");
+	let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+		.await
+		.expect("first result batch")
+		.expect("stream item")
+		.expect("first batch ok");
+	drop(stream);
+	worker.shutdown().await;
+
+	assert_eq!(first.num_rows(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collecting_execute_query_remains_behavior_compatible_for_bare_limit() {
+	let mut worker = FixtureWorkerProcess::spawn(WorkerId::from_u128(1_421)).await;
+	let registry = Arc::new(RoundRobinRegistry::new([worker_entry(&worker)], 0));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry,
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan("SELECT val FROM fixture LIMIT 3")
+		.expect("plan bare limit");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("collecting query");
+	worker.shutdown().await;
+
+	assert_eq!(results.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
 }
 
 #[tokio::test]

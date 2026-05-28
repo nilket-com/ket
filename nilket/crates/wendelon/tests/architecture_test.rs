@@ -6820,12 +6820,12 @@ fn adr073_table_query_checks_cancel_at_execution_boundaries() {
 		"// 4. Empty result is a legitimate answer.",
 	);
 	assert!(plan.matches("cancellation_token.is_cancelled()").count() >= 5);
-	assert!(ranged.matches("cancel.is_cancelled()").count() >= 7);
+	assert!(ranged.matches("cancel.is_cancelled()").count() >= 6);
 	assert!(plan.contains("pull_migration_range"));
 	assert!(plan.contains("plan_table_query_execution_by_secondary_index"));
 	assert!(ranged.contains("for range in ranges"));
 	assert!(ranged.contains("for (key_identity, locality, location) in scanned"));
-	assert!(ranged.contains("for group in rebatch_groups"));
+	assert!(ranged.contains("writer.emit_batch(&result).await?"));
 }
 
 #[test]
@@ -7454,11 +7454,12 @@ fn adr118_wendelon_table_query_checks_cancellation_during_production() {
 	// the per-location scan loop (alongside the per-location emit), not
 	// only before planning — so a cancelled/dropped consumer stops
 	// Wendelon before it reads the remaining row groups. Pin the check
-	// to the region between the scan loop and the post-scan rebatch loop.
+	// to the scan-loop region so both projected and whole-record
+	// production stay cancellation-bounded.
 	let scan_loop = source_region(
 		producer,
 		"for (key_identity, locality, location) in scanned",
-		"for group in rebatch_groups",
+		"// 4. Empty result is a legitimate answer.",
 	);
 	assert!(
 		scan_loop.contains("cancel.is_cancelled()"),
@@ -7466,7 +7467,7 @@ fn adr118_wendelon_table_query_checks_cancellation_during_production() {
 	);
 	assert!(
 		scan_loop.contains("writer.emit_batch(&result).await?"),
-		"the projected path emits per location inside the scan loop"
+		"the table-query producer emits per location inside the scan loop"
 	);
 	assert!(
 		scan_loop.contains("ReadStatus::QUERY_CANCELLED"),
@@ -7538,40 +7539,136 @@ fn adr118_secondary_index_table_query_streams() {
 }
 
 #[test]
-fn adr118_cost_bound_scope_is_projected_path() {
+fn adr120_whole_record_table_query_emits_per_location() {
 	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
 	let producer = source_region(
 		&data_server,
 		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
 		"fn encode_query_stream_batches_with_deadline",
 	);
-	let scan_loop = source_region(
+	let descriptor_backed = source_region(
 		producer,
-		"for (key_identity, locality, location) in scanned",
-		"for group in rebatch_groups",
+		"// ADR 120 descriptor-backed whole-record path:",
+		"for group in descriptorless_rebatch_groups",
 	);
-	// ADR 118's storage-cost streaming guarantee scopes to the
-	// projected table-query path (Toron production scans always
-	// project). Both halves of the dual-emit reality must remain
-	// structurally visible so future readers don't silently widen the
-	// claim to the whole-record path:
-	//   1) projected = bounded — emit lives inside the per-location
-	//      scan loop, so a cancel between locations stops slab reads.
-	//   2) whole-record = wire-streaming follow-on — emit lives in the
-	//      post-scan rebatch loop, so it is stream-shaped on the wire
-	//      but does not bound slab reads (a deliberately-named follow-on).
+	// ADR 120 retires the ADR 118 projected-only scope carve-out: the
+	// whole-record fallback must execute PBC and emit from inside the
+	// per-location scan loop, with no post-scan rebatch buffer.
 	assert!(
-		scan_loop.contains("writer.emit_batch(&result).await?"),
-		"projected path must emit per location inside the scan loop"
+		descriptor_backed.contains("writer.emit_batch(&result).await?"),
+		"table-query results must emit per location inside the scan loop"
 	);
 	assert!(
-		producer.contains("for group in rebatch_groups"),
-		"whole-record path still rebatches post-scan (the named follow-on)"
+		descriptor_backed.contains("pbc::execute_program(program, &batch)"),
+		"whole-record fallback must execute PBC per location"
 	);
 	assert!(
-		producer.contains("// ADR 118 cost-bound scope:"),
-		"the in-source scope comment must remain at the rebatch loop boundary so future readers see the dual-emit shape"
+		descriptor_backed.contains("take_output_batch(result, &mut rows, row_limit)"),
+		"whole-record fallback must apply row_limit before any later scan location can be read"
 	);
+	assert!(!descriptor_backed.contains("concat_batches"));
+	assert!(data_server.contains("struct DescriptorlessRebatchGroup"));
+	assert!(producer.contains("for group in descriptorless_rebatch_groups"));
+}
+
+#[test]
+fn adr120_rebatch_groups_post_scan_emit_is_gone_for_descriptor_backed_queries() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let producer = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"fn encode_query_stream_batches_with_deadline",
+	);
+	let descriptorless_compat = source_region(
+		producer,
+		"if table_descriptor.is_none()",
+		"// ADR 120 descriptor-backed whole-record path:",
+	);
+	let descriptor_backed = source_region(
+		producer,
+		"// ADR 120 descriptor-backed whole-record path:",
+		"for group in descriptorless_rebatch_groups",
+	);
+
+	assert!(data_server.contains("struct DescriptorlessRebatchGroup"));
+	assert!(descriptorless_compat.contains("descriptorless_rebatch_groups"));
+	assert!(descriptorless_compat.contains("continue;"));
+	assert!(producer.contains("for group in descriptorless_rebatch_groups"));
+	assert!(!descriptor_backed.contains("descriptorless_rebatch_groups"));
+	assert!(!descriptor_backed.contains("concat_batches"));
+	assert!(!descriptor_backed.contains("Vec<DescriptorlessRebatchGroup>"));
+}
+
+#[test]
+fn adr120_cost_bound_is_access_path_independent_for_descriptor_backed_queries() {
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let full_scan = source_region(
+		&data_server,
+		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
+		"fn encode_query_stream_batches_with_deadline",
+	);
+	let descriptor_backed = source_region(
+		full_scan,
+		"// ADR 120 descriptor-backed whole-record path:",
+		"for group in descriptorless_rebatch_groups",
+	);
+	let secondary_index = source_region(
+		&data_server,
+		"async fn plan_table_query_execution_by_secondary_index",
+		"async fn plan_query_execution_for_ranges",
+	);
+
+	for (name, region) in [
+		(
+			"full scan descriptor-backed whole-record",
+			descriptor_backed,
+		),
+		("secondary-index descriptor-backed", secondary_index),
+	] {
+		assert!(
+			region.contains("take_output_batch(result, &mut rows, row_limit)"),
+			"{name}: row_limit must be applied before the next storage read"
+		);
+		assert!(
+			region.contains("writer.emit_batch(&result).await?"),
+			"{name}: batch must be emitted from the producer path"
+		);
+		assert!(
+			region.contains("row_limit_satisfied(rows, row_limit)"),
+			"{name}: producer must break once the bound is satisfied"
+		);
+	}
+	assert!(
+		secondary_index.contains("for indexed_chunk in indexed_rows.chunks(4)"),
+		"secondary-index reads must be chunked so LIMIT does not materialize all index hits"
+	);
+	assert!(
+		secondary_index.contains("break 'indexed_rows;"),
+		"secondary-index producer must stop reading indexed chunks once LIMIT is satisfied"
+	);
+}
+
+#[test]
+fn adr120_no_wendelon_protocol_widening() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let meta = source_region(&schema, "pub struct QueryResponseMeta", "}");
+
+	assert!(schema.contains("size_of::<QueryResponseMeta>() == 56"));
+	for forbidden in [
+		"cursor",
+		"stream_id",
+		"terminal_status",
+		"result_stream",
+		"TaskBatch",
+	] {
+		assert!(
+			!meta.contains(forbidden),
+			"QueryResponseMeta must not grow ADR 120 field `{forbidden}`"
+		);
+	}
+	assert!(data_server.contains("TableQueryResponseStreamWriter"));
+	assert!(!data_server.contains("MsgType::TABLE_QUERY_CURSOR"));
 }
 
 #[test]

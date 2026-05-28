@@ -282,14 +282,182 @@ pub(crate) fn adr119_non_streamable_fallback_is_explicit() {
 	let source =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
 	let execution = source
-		.split("let (results, output) = if is_streamable_exchange_producer(spec)")
+		.split("let (results, output) = if is_streamable_final_result(spec)")
 		.nth(1)
 		.and_then(|rest| rest.split("record_worker_telemetry").next())
 		.expect("worker execution branch");
 
+	assert!(execution.contains("drive_streamable_plan"));
 	assert!(execution.contains("execute_live_shuffle_producer"));
 	assert!(execution.contains("execute_live_shuffle_consumer"));
 	assert!(execution.contains("executor.execute_bound"));
+}
+
+#[test]
+pub(crate) fn adr120_coordinator_has_streaming_cursor_surface() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert!(coordinator.contains("pub struct DistributedResultStream"));
+	assert!(coordinator.contains("pub async fn execute_query_stream"));
+	assert!(coordinator.contains("impl futures::Stream for DistributedResultStream"));
+	assert!(coordinator.contains("mpsc::Receiver<Result<RecordBatch, QueryError>>"));
+}
+
+#[test]
+pub(crate) fn adr120_collecting_execute_is_compatibility_wrapper() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let execute = coordinator
+		.split("pub async fn execute_query_with_context")
+		.nth(1)
+		.and_then(|rest| rest.split("fn cancel_query_for_tenant").next())
+		.expect("execute_query_with_context block");
+
+	assert!(execute.contains("execute_query_stream_with_context(plan, context)"));
+	assert!(execute.contains(".await?"));
+	assert!(execute.contains("while let Some(batch) = stream.next().await"));
+	assert!(execute.contains("batches.push(batch?)"));
+}
+
+#[test]
+pub(crate) fn adr120_execute_query_stream_uses_background_driver() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let stream_entry = coordinator
+		.split("pub async fn execute_query_stream_with_context")
+		.nth(1)
+		.and_then(|rest| rest.split("pub async fn execute_query_with_context").next())
+		.expect("execute_query_stream_with_context block");
+	let driver = coordinator
+		.split("async fn run_streaming_read_driver")
+		.nth(1)
+		.and_then(|rest| rest.split("fn spawn_remote_cancel_fanout_task").next())
+		.expect("streaming driver block");
+
+	assert!(stream_entry.contains("mpsc::channel(DISTRIBUTED_RESULT_STREAM_DEPTH)"));
+	assert!(stream_entry.contains("tokio::spawn(async move"));
+	assert!(!stream_entry.contains("dispatch_loop(&stages"));
+	assert!(driver.contains("dispatch_loop(&stages, &dispatcher).await"));
+}
+
+#[test]
+pub(crate) fn adr120_worker_streams_final_result_taskbatch_frames() {
+	let task = std::fs::read_to_string(manifest_dir().join("src/distributed/task.rs"))
+		.expect("read task source");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let worker_sink = server
+		.split("struct WorkerTaskBatchSink")
+		.nth(1)
+		.and_then(|rest| rest.split("fn drive_streamable_plan").next())
+		.expect("worker task batch sink block");
+
+	assert!(task.contains("pub fn is_streamable_final_result"));
+	assert!(server.contains("is_streamable_final_result(&payload.spec)"));
+	assert!(server.contains("final_result_sink.is_some()"));
+	assert!(worker_sink.contains("MessageKind::TaskBatch"));
+	assert!(worker_sink.contains("send_payload("));
+	assert!(server.contains("Vec::new(),"));
+}
+
+#[test]
+pub(crate) fn adr120_network_dispatcher_forwards_final_taskbatch_immediately() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let client = server
+		.split("pub async fn execute_task_on_worker_with_telemetry_and_batch_sender")
+		.nth(1)
+		.and_then(|rest| {
+			rest.split("pub async fn execute_task_on_worker_with_completion")
+				.next()
+		})
+		.expect("remote task client block");
+
+	assert!(server.contains("with_final_result_sender"));
+	assert!(client.contains("forward_final_batches"));
+	assert!(client.contains("MessageKind::TaskBatch"));
+	assert!(client.contains("sender.send(Ok(batch)).await"));
+	assert!(client.contains("results.push(batch)"));
+}
+
+#[test]
+pub(crate) fn adr120_cursor_drop_cancels_active_query_synchronously() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let drop_impl = coordinator
+		.split("impl Drop for DistributedResultStream")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct DistributedQueryCoordinator").next())
+		.expect("DistributedResultStream Drop block");
+
+	assert!(drop_impl.contains("active_query"));
+	assert!(drop_impl.contains(".cancel(CancellationTrigger::ClientDisconnect)"));
+	assert!(drop_impl.contains("CancellationTrigger::ClientDisconnect"));
+	assert!(drop_impl.contains("self.cancel_remote"));
+}
+
+#[test]
+pub(crate) fn adr120_non_streamable_final_result_uses_completion_buffer() {
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let execution = server
+		.split("let (results, output) = if is_streamable_final_result(spec)")
+		.nth(1)
+		.and_then(|rest| rest.split("record_worker_telemetry").next())
+		.expect("worker execution branch");
+
+	assert!(execution.contains("final_result_sink.is_some()"));
+	assert!(execution.contains("executor.execute_bound"));
+	assert!(server.contains(".map(RecordBatch::num_rows)"));
+	assert!(server.contains("sum::<usize>() as u64"));
+}
+
+#[test]
+pub(crate) fn adr120_119_multi_upstream_barrier_untouched() {
+	adr119_multi_upstream_barrier_untouched();
+}
+
+#[test]
+pub(crate) fn adr120_no_sql_rune_ir_change() {
+	let manifest_dir = manifest_dir();
+	let forbidden = [
+		"DistributedResultStream",
+		"execute_query_stream",
+		"WorkerTaskBatchSink",
+		"final_result_sender",
+	];
+	for path in [
+		"src/ir.rs",
+		"src/ir/execution.rs",
+		"src/pbc.rs",
+		"src/planner.rs",
+		"src/rune_engine.rs",
+		"src/sql_planner.rs",
+		"src/sql_wire.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir.join(path)).expect("read source");
+		for marker in forbidden {
+			assert!(
+				!source.contains(marker),
+				"{path} must not contain ADR 120 streaming marker {marker}"
+			);
+		}
+	}
+}
+
+#[test]
+pub(crate) fn adr120_no_toron_worker_protocol_widening() {
+	let wire = std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire");
+	let message_kind = wire
+		.split("pub enum MessageKind")
+		.nth(1)
+		.and_then(|rest| rest.split("impl MessageKind").next())
+		.expect("MessageKind block");
+
+	assert_eq!(toron::wire::MessageKind::COUNT, 12);
+	assert!(!message_kind.contains("ResultStream"));
+	assert!(!message_kind.contains("Cursor"));
 }
 
 #[test]

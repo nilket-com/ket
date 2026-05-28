@@ -12,7 +12,7 @@ use crate::catalog::Catalog;
 use crate::distributed::budget::{BudgetDimension, ByteCount};
 use crate::distributed::cancellation::{
 	ActiveQueryHandle, ActiveTaskRegistry, DownstreamCancellationContext,
-	DownstreamCancellationMetrics,
+	DownstreamCancellationMetrics, TaskCancellationSignal,
 };
 use crate::distributed::identity::{FrameByteLen, PartitionId, StreamSeq, TaskIdentity, WorkerId};
 use crate::distributed::partition_store::{
@@ -23,7 +23,8 @@ use crate::distributed::task::{
 	ArrowIpcDigest, LiveProducerPartitionRef, PartitionAddress, PartitionBackend,
 	PartitionManifest, RowCount, ShufflePartitionRef, TaskCompletionOutput, TaskInputBinding,
 	TaskOutputBinding, TaskSpec, TaskTelemetry, TaskTelemetryLabels,
-	is_streamable_exchange_producer, is_streamable_shuffle_consumer, shuffle_input_table_id,
+	is_streamable_exchange_producer, is_streamable_final_result, is_streamable_shuffle_consumer,
+	shuffle_input_table_id,
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::error::{
@@ -48,9 +49,11 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::Instrument;
 use wendelon::schema::RuntimeFilterDescriptor;
 
@@ -161,6 +164,16 @@ impl ToronWorker {
 		spec: &TaskSpec,
 		downstream_cancellation: Option<DownstreamCancellationContext>,
 	) -> Result<TaskExecutionReport, QueryError> {
+		self.execute_task_local_with_telemetry_and_stream_sink(spec, downstream_cancellation, None)
+			.await
+	}
+
+	async fn execute_task_local_with_telemetry_and_stream_sink(
+		&self,
+		spec: &TaskSpec,
+		downstream_cancellation: Option<DownstreamCancellationContext>,
+		mut final_result_sink: Option<&mut dyn StreamableBatchSink>,
+	) -> Result<TaskExecutionReport, QueryError> {
 		let task_span = crate::telemetry::task_span(spec);
 		let report = async {
 			let task_started = Instant::now();
@@ -190,7 +203,51 @@ impl ToronWorker {
 			} else {
 				spec.context.trace_context
 			};
-			let (results, output) = if is_streamable_exchange_producer(spec) {
+			let mut streamed_rows = 0u64;
+			let mut streamed_batches = 0u64;
+			let mut streamed_batch_encode_micros = 0u64;
+			let mut streamed_batch_send_micros = 0u64;
+			let (results, output) = if is_streamable_final_result(spec)
+				&& final_result_sink.is_some()
+			{
+				let sink = final_result_sink
+					.as_deref_mut()
+					.expect("checked streamable final-result sink");
+				if self.has_live_shuffle_input(spec) && is_streamable_shuffle_consumer(spec) {
+					let storage = Arc::new(LiveInputStorageScan {
+						base: self.storage.clone(),
+						partition_store: self.partition_store.clone(),
+						live_overrides: live_scan_overrides(spec),
+					});
+					let executor = Executor::with_context(storage, task_context);
+					drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
+				} else if overrides.is_empty() {
+					let executor = Executor::with_context(self.storage.clone(), task_context);
+					drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
+				} else {
+					let executor = Executor::with_context(
+						Arc::new(TaskInputStorageScan {
+							base: self.storage.clone(),
+							legacy_single_override: legacy_single_shuffle_override(
+								&spec.plan, &overrides,
+							),
+							overrides,
+						}),
+						task_context,
+					);
+					drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
+				}
+				streamed_rows = sink.emitted_rows();
+				streamed_batches = sink.emitted_batches();
+				streamed_batch_encode_micros = sink.batch_encode_micros();
+				streamed_batch_send_micros = sink.batch_send_micros();
+				(
+					Vec::new(),
+					Some(TaskCompletionOutput::FinalResult {
+						output_digest: None,
+					}),
+				)
+			} else if is_streamable_exchange_producer(spec) {
 				self.execute_live_shuffle_producer(spec, task_context, morsel)
 					.await?
 			} else if self.has_live_shuffle_input(spec) && is_streamable_shuffle_consumer(spec) {
@@ -214,8 +271,16 @@ impl ToronWorker {
 			};
 			record_worker_telemetry(&telemetry, |task| {
 				task.counters.emitted_rows =
-					results.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
-				task.counters.emitted_batches = results.len() as u64;
+					results.iter().map(RecordBatch::num_rows).sum::<usize>() as u64 + streamed_rows;
+				task.counters.emitted_batches = results.len() as u64 + streamed_batches;
+				task.phases.batch_encode_micros = task
+					.phases
+					.batch_encode_micros
+					.saturating_add(streamed_batch_encode_micros);
+				task.phases.batch_send_micros = task
+					.phases
+					.batch_send_micros
+					.saturating_add(streamed_batch_send_micros);
 				task.phases.task_wall_micros = duration_micros(task_started);
 				recompute_framework_overhead(task);
 			});
@@ -399,7 +464,8 @@ impl ToronWorker {
 			}
 			Ok(true)
 		};
-		drive_streamable_plan(input, &executor, morsel, &mut append_batch).await?;
+		let mut append_sink = SyncStreamableBatchSink::new(&mut append_batch);
+		drive_streamable_plan(input, &executor, morsel, &mut append_sink).await?;
 
 		let results = partition_batches
 			.into_iter()
@@ -437,7 +503,8 @@ impl ToronWorker {
 			results.push(batch);
 			Ok(true)
 		};
-		drive_streamable_plan(&spec.plan, &executor, morsel, &mut collect).await?;
+		let mut collect_sink = SyncStreamableBatchSink::new(&mut collect);
+		drive_streamable_plan(&spec.plan, &executor, morsel, &mut collect_sink).await?;
 		Ok((results, None))
 	}
 
@@ -515,7 +582,7 @@ impl ToronWorker {
 
 	pub async fn handle_connection<S>(&self, mut stream: S) -> Result<(), QueryError>
 	where
-		S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+		S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 	{
 		'connection: loop {
 			let envelope = match read_envelope(&mut stream, self.memory.as_ref()).await {
@@ -575,14 +642,32 @@ impl ToronWorker {
 					}
 					let task_setup_micros = duration_micros(task_started);
 
-					let execution = self.execute_task_local_with_telemetry(
-						&payload.spec,
-						Some(active_task.downstream.context()),
-					);
-					tokio::pin!(execution);
-					let execution_result = tokio::select! {
-						result = &mut execution => result,
-						_ = active_task.signal.cancelled() => Err(cancelled_task_error()),
+					let execution_result = if is_streamable_final_result(&payload.spec) {
+						let mut streaming_sink = WorkerTaskBatchSink::new(
+							&mut stream,
+							identity,
+							active_task.signal.clone(),
+						);
+						let execution = self.execute_task_local_with_telemetry_and_stream_sink(
+							&payload.spec,
+							Some(active_task.downstream.context()),
+							Some(&mut streaming_sink),
+						);
+						tokio::pin!(execution);
+						tokio::select! {
+							result = &mut execution => result,
+							_ = active_task.signal.cancelled() => Err(cancelled_task_error()),
+						}
+					} else {
+						let execution = self.execute_task_local_with_telemetry(
+							&payload.spec,
+							Some(active_task.downstream.context()),
+						);
+						tokio::pin!(execution);
+						tokio::select! {
+							result = &mut execution => result,
+							_ = active_task.signal.cancelled() => Err(cancelled_task_error()),
+						}
 					};
 
 					match execution_result {
@@ -2143,6 +2228,201 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn worker_streamable_final_result_sends_taskbatch_before_taskcomplete() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let first = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1_i64]))],
+		)
+		.expect("first batch");
+		let second = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![2_i64]))],
+		)
+		.expect("second batch");
+		let release_tail = Arc::new(Notify::new());
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(TwoBatchBlockingStorageScan {
+				schema,
+				first,
+				second,
+				release_tail: release_tail.clone(),
+			}),
+			memory.clone(),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(120),
+			WorkerEndpoint::new("local"),
+		));
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(120),
+			StageId::new(0),
+			TaskId::new(0),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (mut client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		send_payload(
+			&mut client,
+			MessageKind::StartTask,
+			EnvelopeIdentity::task(identity),
+			None,
+			&StartTaskPayload { spec },
+		)
+		.await
+		.expect("send start task");
+		let started = read_envelope(&mut client, memory.as_ref())
+			.await
+			.expect("read task started");
+		assert_eq!(started.kind, MessageKind::TaskStarted);
+		let first_batch = tokio::time::timeout(
+			Duration::from_millis(250),
+			read_envelope(&mut client, memory.as_ref()),
+		)
+		.await
+		.expect("streamable final result must emit first TaskBatch before tail release")
+		.expect("read first task batch");
+		assert_eq!(first_batch.kind, MessageKind::TaskBatch);
+		let no_complete = tokio::time::timeout(
+			Duration::from_millis(50),
+			read_envelope(&mut client, memory.as_ref()),
+		)
+		.await;
+		assert!(
+			no_complete.is_err(),
+			"TaskComplete must not arrive while the scan tail is still blocked"
+		);
+
+		release_tail.notify_waiters();
+		let second_batch = read_envelope(&mut client, memory.as_ref())
+			.await
+			.expect("read second task batch");
+		assert_eq!(second_batch.kind, MessageKind::TaskBatch);
+		let complete = read_envelope(&mut client, memory.as_ref())
+			.await
+			.expect("read task complete");
+		assert_eq!(complete.kind, MessageKind::TaskComplete);
+
+		drop(client);
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
+	#[tokio::test]
+	async fn network_dispatcher_forwards_final_taskbatch_to_cursor_without_buffering() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let first = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1_i64]))],
+		)
+		.expect("first batch");
+		let second = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![2_i64]))],
+		)
+		.expect("second batch");
+		let release_tail = Arc::new(Notify::new());
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(TwoBatchBlockingStorageScan {
+				schema,
+				first,
+				second,
+				release_tail: release_tail.clone(),
+			}),
+			memory.clone(),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(121),
+			WorkerEndpoint::new("local"),
+		));
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(121),
+			StageId::new(0),
+			TaskId::new(0),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+		let (tx, mut rx) = mpsc::channel(16);
+		let completion = {
+			let memory = memory.clone();
+			tokio::spawn(async move {
+				ToronCoordinator::new(memory)
+					.execute_task_on_worker_with_telemetry_and_batch_sender(
+						client,
+						spec,
+						Some(tx),
+						None,
+					)
+					.await
+			})
+		};
+
+		let first_forwarded = tokio::time::timeout(Duration::from_millis(250), rx.recv())
+			.await
+			.expect("first final-result batch must reach cursor before task completion")
+			.expect("cursor batch")
+			.expect("cursor batch ok");
+		assert_eq!(first_forwarded.num_rows(), 1);
+		assert!(
+			tokio::time::timeout(Duration::from_millis(50), rx.recv())
+				.await
+				.is_err(),
+			"second batch must wait behind the blocked scan tail"
+		);
+
+		release_tail.notify_waiters();
+		let second_forwarded = rx
+			.recv()
+			.await
+			.expect("second cursor batch")
+			.expect("second cursor batch ok");
+		assert_eq!(second_forwarded.num_rows(), 1);
+		let completion = completion
+			.await
+			.expect("client task")
+			.expect("task completion");
+		assert!(
+			completion.batches.is_empty(),
+			"forwarded final-result batches must not also be buffered locally"
+		);
+
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
 	struct CancellationAwareTwoBatchStorageScan {
 		schema: SchemaRef,
 		first: RecordBatch,
@@ -2533,11 +2813,204 @@ mod tests {
 type StreamableBatchFuture<'a> =
 	std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, QueryError>> + Send + 'a>>;
 
+trait StreamableBatchSink: Send {
+	fn emit<'a>(&'a mut self, batch: RecordBatch) -> StreamableBatchFuture<'a>;
+
+	fn emitted_rows(&self) -> u64 {
+		0
+	}
+
+	fn emitted_batches(&self) -> u64 {
+		0
+	}
+
+	fn batch_encode_micros(&self) -> u64 {
+		0
+	}
+
+	fn batch_send_micros(&self) -> u64 {
+		0
+	}
+}
+
+struct SyncStreamableBatchSink<F> {
+	on_batch: F,
+}
+
+impl<F> SyncStreamableBatchSink<F> {
+	fn new(on_batch: F) -> Self {
+		Self { on_batch }
+	}
+}
+
+impl<F> StreamableBatchSink for SyncStreamableBatchSink<F>
+where
+	F: FnMut(RecordBatch) -> Result<bool, QueryError> + Send,
+{
+	fn emit<'a>(&'a mut self, batch: RecordBatch) -> StreamableBatchFuture<'a> {
+		let result = (self.on_batch)(batch);
+		Box::pin(async move { result })
+	}
+}
+
+struct FilterStreamableBatchSink<'a, 'b> {
+	executor: &'a Executor,
+	predicate: &'a BoundExprProgram,
+	disposition: &'a FilterDisposition,
+	downstream: &'b mut dyn StreamableBatchSink,
+}
+
+impl StreamableBatchSink for FilterStreamableBatchSink<'_, '_> {
+	fn emit<'a>(&'a mut self, batch: RecordBatch) -> StreamableBatchFuture<'a> {
+		Box::pin(async move {
+			if *self.disposition == FilterDisposition::FullyPushed {
+				return self.downstream.emit(batch).await;
+			}
+			for filtered in self.executor.filter_batches_with_bound_predicate(
+				self.predicate,
+				vec![batch],
+				"filter predicate",
+			)? {
+				if filtered.num_rows() > 0 && !self.downstream.emit(filtered).await? {
+					return Ok(false);
+				}
+			}
+			Ok(true)
+		})
+	}
+}
+
+struct ProjectStreamableBatchSink<'a, 'b> {
+	executor: &'a Executor,
+	exprs: &'a BoundExprProgram,
+	output_schema: &'a SchemaRef,
+	downstream: &'b mut dyn StreamableBatchSink,
+}
+
+impl StreamableBatchSink for ProjectStreamableBatchSink<'_, '_> {
+	fn emit<'a>(&'a mut self, batch: RecordBatch) -> StreamableBatchFuture<'a> {
+		Box::pin(async move {
+			let cols = self.executor.evaluate_bound_program(self.exprs, &batch)?;
+			self.downstream
+				.emit(RecordBatch::try_new(self.output_schema.clone(), cols)?)
+				.await
+		})
+	}
+}
+
+struct TakeStreamableBatchSink<'a> {
+	remaining: usize,
+	downstream: &'a mut dyn StreamableBatchSink,
+}
+
+impl StreamableBatchSink for TakeStreamableBatchSink<'_> {
+	fn emit<'a>(&'a mut self, batch: RecordBatch) -> StreamableBatchFuture<'a> {
+		Box::pin(async move {
+			if self.remaining == 0 {
+				return Ok(false);
+			}
+			let batch = if batch.num_rows() > self.remaining {
+				batch.slice(0, self.remaining)
+			} else {
+				batch
+			};
+			self.remaining = self.remaining.saturating_sub(batch.num_rows());
+			if batch.num_rows() > 0 && !self.downstream.emit(batch).await? {
+				return Ok(false);
+			}
+			Ok(self.remaining > 0)
+		})
+	}
+}
+
+struct WorkerTaskBatchSink<'a, S> {
+	stream: &'a mut S,
+	identity: TaskIdentity,
+	signal: TaskCancellationSignal,
+	next_seq: u64,
+	emitted_rows: u64,
+	emitted_batches: u64,
+	batch_encode_micros: u64,
+	batch_send_micros: u64,
+}
+
+impl<'a, S> WorkerTaskBatchSink<'a, S> {
+	fn new(stream: &'a mut S, identity: TaskIdentity, signal: TaskCancellationSignal) -> Self {
+		Self {
+			stream,
+			identity,
+			signal,
+			next_seq: 0,
+			emitted_rows: 0,
+			emitted_batches: 0,
+			batch_encode_micros: 0,
+			batch_send_micros: 0,
+		}
+	}
+}
+
+impl<S> StreamableBatchSink for WorkerTaskBatchSink<'_, S>
+where
+	S: tokio::io::AsyncWrite + Unpin + Send,
+{
+	fn emit<'a>(&'a mut self, batch: RecordBatch) -> StreamableBatchFuture<'a> {
+		Box::pin(async move {
+			if self.signal.is_cancelled() {
+				return Err(cancelled_task_error());
+			}
+			let stream_seq = StreamSeq::new(self.next_seq);
+			self.next_seq = self.next_seq.saturating_add(1);
+			let batch_encode_started = Instant::now();
+			let encoded_batch = encode_record_batch(&batch)?;
+			self.batch_encode_micros = self
+				.batch_encode_micros
+				.saturating_add(duration_micros(batch_encode_started));
+			let batch_send_started = Instant::now();
+			send_payload(
+				self.stream,
+				MessageKind::TaskBatch,
+				EnvelopeIdentity::task(self.identity),
+				Some(stream_seq),
+				&TaskBatchPayload {
+					identity: self.identity,
+					stream_seq,
+					payload: ArrowIpcBytes::new(encoded_batch),
+				},
+			)
+			.await?;
+			self.batch_send_micros = self
+				.batch_send_micros
+				.saturating_add(duration_micros(batch_send_started));
+			self.emitted_rows = self.emitted_rows.saturating_add(
+				u64::try_from(batch.num_rows()).expect("record batch row count fits u64"),
+			);
+			self.emitted_batches = self.emitted_batches.saturating_add(1);
+			Ok(true)
+		})
+	}
+
+	fn emitted_rows(&self) -> u64 {
+		self.emitted_rows
+	}
+
+	fn emitted_batches(&self) -> u64 {
+		self.emitted_batches
+	}
+
+	fn batch_encode_micros(&self) -> u64 {
+		self.batch_encode_micros
+	}
+
+	fn batch_send_micros(&self) -> u64 {
+		self.batch_send_micros
+	}
+}
+
 fn drive_streamable_plan<'a>(
 	plan: &'a ExecutionPlan,
 	executor: &'a Executor,
 	morsel: Option<(MorselId, u32)>,
-	on_batch: &'a mut (dyn FnMut(RecordBatch) -> Result<bool, QueryError> + Send + 'a),
+	on_batch: &'a mut dyn StreamableBatchSink,
 ) -> StreamableBatchFuture<'a> {
 	Box::pin(async move {
 		match plan {
@@ -2591,7 +3064,7 @@ fn drive_streamable_plan<'a>(
 					if batch.num_rows() == 0 {
 						continue;
 					}
-					if !on_batch(batch)? {
+					if !on_batch.emit(batch).await? {
 						return Ok(false);
 					}
 				}
@@ -2602,20 +3075,11 @@ fn drive_streamable_plan<'a>(
 				predicate,
 				disposition,
 			} => {
-				let mut filter_batch = |batch: RecordBatch| -> Result<bool, QueryError> {
-					if *disposition == FilterDisposition::FullyPushed {
-						return on_batch(batch);
-					}
-					for filtered in executor.filter_batches_with_bound_predicate(
-						predicate,
-						vec![batch],
-						"filter predicate",
-					)? {
-						if filtered.num_rows() > 0 && !on_batch(filtered)? {
-							return Ok(false);
-						}
-					}
-					Ok(true)
+				let mut filter_batch = FilterStreamableBatchSink {
+					executor,
+					predicate,
+					disposition,
+					downstream: on_batch,
 				};
 				drive_streamable_plan(input, executor, morsel, &mut filter_batch).await
 			}
@@ -2624,9 +3088,11 @@ fn drive_streamable_plan<'a>(
 				exprs,
 				output_schema,
 			} => {
-				let mut project_batch = |batch: RecordBatch| -> Result<bool, QueryError> {
-					let cols = executor.evaluate_bound_program(exprs, &batch)?;
-					on_batch(RecordBatch::try_new(output_schema.clone(), cols)?)
+				let mut project_batch = ProjectStreamableBatchSink {
+					executor,
+					exprs,
+					output_schema,
+					downstream: on_batch,
 				};
 				drive_streamable_plan(input, executor, morsel, &mut project_batch).await
 			}
@@ -2637,24 +3103,12 @@ fn drive_streamable_plan<'a>(
 			} => {
 				if *limit == 0 {
 					let empty = RecordBatch::new_empty(output_schema.clone());
-					let _ = on_batch(empty)?;
+					let _ = on_batch.emit(empty).await?;
 					return Ok(false);
 				}
-				let mut remaining = *limit;
-				let mut take_batch = |batch: RecordBatch| -> Result<bool, QueryError> {
-					if remaining == 0 {
-						return Ok(false);
-					}
-					let batch = if batch.num_rows() > remaining {
-						batch.slice(0, remaining)
-					} else {
-						batch
-					};
-					remaining = remaining.saturating_sub(batch.num_rows());
-					if batch.num_rows() > 0 && !on_batch(batch)? {
-						return Ok(false);
-					}
-					Ok(remaining > 0)
+				let mut take_batch = TakeStreamableBatchSink {
+					remaining: *limit,
+					downstream: on_batch,
 				};
 				drive_streamable_plan(input, executor, morsel, &mut take_batch).await
 			}
@@ -2919,6 +3373,8 @@ pub struct NetworkTaskDispatcher<Transport> {
 	coordinator: ToronCoordinator,
 	transport: Transport,
 	active_query: Option<ActiveQueryHandle>,
+	final_result_sender: Option<mpsc::Sender<Result<RecordBatch, QueryError>>>,
+	final_result_batch_sent: Option<Arc<AtomicBool>>,
 }
 
 impl<Transport> NetworkTaskDispatcher<Transport> {
@@ -2927,11 +3383,23 @@ impl<Transport> NetworkTaskDispatcher<Transport> {
 			coordinator: ToronCoordinator::new(memory),
 			transport,
 			active_query: None,
+			final_result_sender: None,
+			final_result_batch_sent: None,
 		}
 	}
 
 	pub fn with_active_query(mut self, active_query: Option<ActiveQueryHandle>) -> Self {
 		self.active_query = active_query;
+		self
+	}
+
+	pub fn with_final_result_sender(
+		mut self,
+		sender: Option<mpsc::Sender<Result<RecordBatch, QueryError>>>,
+		batch_sent: Option<Arc<AtomicBool>>,
+	) -> Self {
+		self.final_result_sender = sender;
+		self.final_result_batch_sent = batch_sent;
 		self
 	}
 }
@@ -2966,7 +3434,12 @@ where
 
 		match self
 			.coordinator
-			.execute_task_on_worker_with_telemetry(stream, spec.clone())
+			.execute_task_on_worker_with_telemetry_and_batch_sender(
+				stream,
+				spec.clone(),
+				self.final_result_sender.clone(),
+				self.final_result_batch_sent.clone(),
+			)
 			.await
 		{
 			Ok(completion) => DispatchOutcome::CompletedWithTelemetry {
@@ -2999,13 +3472,29 @@ impl ToronCoordinator {
 
 	pub async fn execute_task_on_worker_with_telemetry<Stream>(
 		&self,
-		mut stream: Stream,
+		stream: Stream,
 		spec: TaskSpec,
 	) -> Result<RemoteTaskCompletion, QueryError>
 	where
 		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	{
+		self.execute_task_on_worker_with_telemetry_and_batch_sender(stream, spec, None, None)
+			.await
+	}
+
+	pub async fn execute_task_on_worker_with_telemetry_and_batch_sender<Stream>(
+		&self,
+		mut stream: Stream,
+		spec: TaskSpec,
+		final_result_sender: Option<mpsc::Sender<Result<RecordBatch, QueryError>>>,
+		final_result_batch_sent: Option<Arc<AtomicBool>>,
+	) -> Result<RemoteTaskCompletion, QueryError>
+	where
+		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
 		let identity = spec.identity;
+		let forward_final_batches =
+			matches!(spec.output, TaskOutputBinding::FinalResult) && final_result_sender.is_some();
 		send_payload(
 			&mut stream,
 			MessageKind::StartTask,
@@ -3040,7 +3529,19 @@ impl ToronCoordinator {
 					let batch_decode_started = Instant::now();
 					let mut reader = StreamReader::try_new(payload.payload.as_slice(), None)?;
 					while let Some(batch) = reader.next().transpose()? {
-						results.push(batch);
+						if forward_final_batches {
+							if let Some(batch_sent) = &final_result_batch_sent {
+								batch_sent.store(true, Ordering::SeqCst);
+							}
+							let sender = final_result_sender
+								.as_ref()
+								.expect("checked final result sender");
+							if sender.send(Ok(batch)).await.is_err() {
+								return Err(cancelled_task_error());
+							}
+						} else {
+							results.push(batch);
+						}
 					}
 					batch_decode_micros =
 						batch_decode_micros.saturating_add(duration_micros(batch_decode_started));

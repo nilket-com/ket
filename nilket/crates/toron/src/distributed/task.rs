@@ -216,6 +216,10 @@ pub fn is_streamable_shuffle_consumer(spec: &TaskSpec) -> bool {
 		&& streamable_unary_plan(&spec.plan)
 }
 
+pub fn is_streamable_final_result(spec: &TaskSpec) -> bool {
+	matches!(spec.output, TaskOutputBinding::FinalResult) && streamable_unary_plan(&spec.plan)
+}
+
 fn streamable_unary_plan(plan: &ExecutionPlan) -> bool {
 	match plan {
 		ExecutionPlan::Scan { .. } => true,

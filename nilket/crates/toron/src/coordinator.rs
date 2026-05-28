@@ -1,4 +1,7 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
@@ -41,10 +44,15 @@ use crate::storage::{
 	UnsupportedStorageAdmin, WriteOutcome, WriteRequest,
 };
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 
 const REMOTE_CANCEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 const REMOTE_CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_REMOTE_CANCEL_FANOUTS: usize = 64;
+const DISTRIBUTED_RESULT_STREAM_DEPTH: usize = 16;
+
+type RemoteCancelSpawner =
+	Arc<dyn Fn(CancellationTrigger, Vec<RemoteTaskCancellation>) + Send + Sync>;
 
 pub(crate) async fn materialize_scan_stream(
 	stream: ScanStream,
@@ -77,6 +85,60 @@ pub(crate) async fn materialize_scan_stream_bounded(
 		}
 	}
 	Ok(batches)
+}
+
+pub struct DistributedResultStream {
+	receiver: mpsc::Receiver<Result<RecordBatch, QueryError>>,
+	active_query: ActiveQueryHandle,
+	cancel_remote: RemoteCancelSpawner,
+	finished: bool,
+}
+
+impl DistributedResultStream {
+	fn new(
+		receiver: mpsc::Receiver<Result<RecordBatch, QueryError>>,
+		active_query: ActiveQueryHandle,
+		cancel_remote: RemoteCancelSpawner,
+	) -> Self {
+		Self {
+			receiver,
+			active_query,
+			cancel_remote,
+			finished: false,
+		}
+	}
+}
+
+impl futures::Stream for DistributedResultStream {
+	type Item = Result<RecordBatch, QueryError>;
+
+	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		match self.receiver.poll_recv(cx) {
+			Poll::Ready(Some(Err(error))) => {
+				self.finished = true;
+				Poll::Ready(Some(Err(error)))
+			}
+			Poll::Ready(None) => {
+				self.finished = true;
+				Poll::Ready(None)
+			}
+			other => other,
+		}
+	}
+}
+
+impl Drop for DistributedResultStream {
+	fn drop(&mut self) {
+		if self.finished {
+			return;
+		}
+		let (first_request, remote_tasks) = self
+			.active_query
+			.cancel(CancellationTrigger::ClientDisconnect);
+		if first_request && !remote_tasks.is_empty() {
+			(self.cancel_remote)(CancellationTrigger::ClientDisconnect, remote_tasks);
+		}
+	}
 }
 
 pub struct DistributedQueryCoordinator<Registry, Transport>
@@ -341,16 +403,122 @@ where
 		self.admission_rejections.clone()
 	}
 
-	pub async fn execute_query(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, QueryError> {
+	pub async fn execute_query(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, QueryError>
+	where
+		Registry: 'static,
+		Transport: 'static,
+	{
 		self.execute_query_with_context(plan, self.context.clone())
 			.await
+	}
+
+	pub async fn execute_query_stream(
+		&self,
+		plan: &LogicalPlan,
+	) -> Result<DistributedResultStream, QueryError>
+	where
+		Registry: 'static,
+		Transport: 'static,
+	{
+		self.execute_query_stream_with_context(plan, self.context.clone())
+			.await
+	}
+
+	pub async fn execute_query_stream_with_context(
+		&self,
+		plan: &LogicalPlan,
+		context: ExecutionContext,
+	) -> Result<DistributedResultStream, QueryError>
+	where
+		Registry: 'static,
+		Transport: 'static,
+	{
+		if !logical_plan_is_distributed_read(plan) {
+			return Err(QueryError::Internal {
+				message: "execute_query_stream supports read queries only in ADR 120 V1"
+					.to_string(),
+			});
+		}
+		let admitted = self.admit_query(&context).await?;
+		let query_budget = admitted.query_budget;
+		let downstream = DownstreamAttemptRegistry::new(
+			self.downstream_cancel_fanout_permits.clone(),
+			self.downstream_cancellation_metrics.clone(),
+		);
+		let active_query = self.active_queries.register_with_downstream(
+			context.tenant_id,
+			context.query_id,
+			downstream,
+		);
+		let active_query_handle = active_query.handle();
+		let context = context.with_downstream_cancellation(Some(
+			active_query_handle.downstream_cancellation_context(),
+		));
+		let (sender, receiver) = mpsc::channel(DISTRIBUTED_RESULT_STREAM_DEPTH);
+		let batch_sent = Arc::new(AtomicBool::new(false));
+		let cancel_remote = self.remote_cancel_spawner();
+		let driver_cancel_remote = cancel_remote.clone();
+		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
+		let registry = Arc::clone(&self.registry);
+		let memory = Arc::clone(&self.memory);
+		let transport = Arc::clone(&self.transport);
+		let config = self.config.clone();
+		let plan = plan.clone();
+		let stream_active_query = active_query_handle.clone();
+		tokio::spawn(async move {
+			let _admitted = admitted;
+			let _active_query = active_query;
+			let result = run_streaming_read_driver(
+				plan.clone(),
+				catalog,
+				registry,
+				memory,
+				transport,
+				config,
+				context,
+				query_budget,
+				active_query_handle.clone(),
+				sender.clone(),
+				batch_sent,
+			)
+			.await;
+			if let Err(error) = result {
+				let _ = sender.send(Err(error)).await;
+			}
+			if active_query_handle.is_cancelled() {
+				let (first_request, remote_tasks) =
+					active_query_handle.cancel(CancellationTrigger::ClientDisconnect);
+				if first_request && !remote_tasks.is_empty() {
+					driver_cancel_remote(CancellationTrigger::ClientDisconnect, remote_tasks);
+				}
+			}
+		});
+		Ok(DistributedResultStream::new(
+			receiver,
+			stream_active_query,
+			cancel_remote,
+		))
 	}
 
 	pub async fn execute_query_with_context(
 		&self,
 		plan: &LogicalPlan,
 		context: ExecutionContext,
-	) -> Result<Vec<RecordBatch>, QueryError> {
+	) -> Result<Vec<RecordBatch>, QueryError>
+	where
+		Registry: 'static,
+		Transport: 'static,
+	{
+		if logical_plan_is_distributed_read(plan) {
+			let mut stream = self
+				.execute_query_stream_with_context(plan, context)
+				.await?;
+			let mut batches = Vec::new();
+			while let Some(batch) = stream.next().await {
+				batches.push(batch?);
+			}
+			return Ok(batches);
+		}
 		let admitted = self.admit_query(&context).await?;
 		let query_budget = admitted.query_budget;
 		let downstream = DownstreamAttemptRegistry::new(
@@ -388,6 +556,26 @@ where
 			self.spawn_remote_cancel_fanout(trigger, cancellation.remote_tasks.clone());
 		}
 		cancellation
+	}
+
+	fn remote_cancel_spawner(&self) -> RemoteCancelSpawner
+	where
+		Transport: 'static,
+	{
+		let transport = Arc::clone(&self.transport);
+		let memory = Arc::clone(&self.memory);
+		let metrics = self.cancellation_metrics.clone();
+		let permits = Arc::clone(&self.cancel_fanout_permits);
+		Arc::new(move |trigger, remote_tasks| {
+			spawn_remote_cancel_fanout_task(
+				Arc::clone(&transport),
+				Arc::clone(&memory),
+				metrics.clone(),
+				Arc::clone(&permits),
+				trigger,
+				remote_tasks,
+			);
+		})
 	}
 
 	async fn execute_query_with_admission(
@@ -622,84 +810,14 @@ where
 	) where
 		Transport: 'static,
 	{
-		let Ok(permit) = self.cancel_fanout_permits.clone().try_acquire_owned() else {
-			if let Some(metrics) = &self.cancellation_metrics {
-				for _ in &remote_tasks {
-					metrics.record(trigger, CancellationOutcome::RemoteError);
-				}
-			}
-			tracing::warn!("remote cancel fan-out limit exhausted");
-			return;
-		};
-		let transport = Arc::clone(&self.transport);
-		let memory = Arc::clone(&self.memory);
-		let metrics = self.cancellation_metrics.clone();
-		tokio::spawn(async move {
-			let _permit = permit;
-			let coordinator = ToronCoordinator::new(memory);
-			for task in remote_tasks {
-				let stream = match tokio::time::timeout(
-					REMOTE_CANCEL_CONNECT_TIMEOUT,
-					transport.connect_worker(&task.worker),
-				)
-				.await
-				{
-					Ok(Ok(stream)) => stream,
-					Ok(Err(error)) => {
-						if let Some(metrics) = &metrics {
-							metrics.record(trigger, CancellationOutcome::RemoteError);
-						}
-						tracing::warn!(
-							error = %error,
-							identity = ?task.identity,
-							"remote cancel connect failed"
-						);
-						continue;
-					}
-					Err(_) => {
-						if let Some(metrics) = &metrics {
-							metrics.record(trigger, CancellationOutcome::RemoteTimeout);
-						}
-						tracing::warn!(
-							identity = ?task.identity,
-							"remote cancel connect timed out"
-						);
-						continue;
-					}
-				};
-				match tokio::time::timeout(
-					REMOTE_CANCEL_ACK_TIMEOUT,
-					coordinator.cancel_task_on_worker(stream, task.identity),
-				)
-				.await
-				{
-					Ok(Ok(())) => {
-						if let Some(metrics) = &metrics {
-							metrics.record(trigger, CancellationOutcome::RemoteAck);
-						}
-					}
-					Ok(Err(error)) => {
-						if let Some(metrics) = &metrics {
-							metrics.record(trigger, CancellationOutcome::RemoteError);
-						}
-						tracing::warn!(
-							error = %error,
-							identity = ?task.identity,
-							"remote cancel acknowledgement failed"
-						);
-					}
-					Err(_) => {
-						if let Some(metrics) = &metrics {
-							metrics.record(trigger, CancellationOutcome::RemoteTimeout);
-						}
-						tracing::warn!(
-							identity = ?task.identity,
-							"remote cancel acknowledgement timed out"
-						);
-					}
-				}
-			}
-		});
+		spawn_remote_cancel_fanout_task(
+			Arc::clone(&self.transport),
+			Arc::clone(&self.memory),
+			self.cancellation_metrics.clone(),
+			Arc::clone(&self.cancel_fanout_permits),
+			trigger,
+			remote_tasks,
+		);
 	}
 
 	fn fragment_config(
@@ -713,6 +831,175 @@ where
 		)
 		.with_task_context(TaskExecutionContext::from_execution_context(context))
 	}
+}
+
+async fn run_streaming_read_driver<Registry, Transport>(
+	plan: LogicalPlan,
+	catalog: Arc<dyn Catalog>,
+	registry: Arc<Registry>,
+	memory: Arc<MemoryManager>,
+	transport: Arc<Transport>,
+	config: PlannerConfig,
+	context: ExecutionContext,
+	query_budget: QueryBudget,
+	active_query: ActiveQueryHandle,
+	sender: mpsc::Sender<Result<RecordBatch, QueryError>>,
+	batch_sent: Arc<AtomicBool>,
+) -> Result<(), QueryError>
+where
+	Registry: WorkerRegistry + ?Sized + 'static,
+	Transport: ToronTransport + ?Sized + 'static,
+{
+	let mut retried_descriptor_evolution = false;
+	let mut invalidated = Vec::new();
+	loop {
+		let bound = bind(&plan, catalog.as_ref(), &config)
+			.await
+			.map_err(QueryError::Binding)?;
+		if !invalidated.is_empty() {
+			reject_replacement_object(catalog.as_ref(), &invalidated).await?;
+		}
+		let stages = fragment_plan(
+			bound,
+			FragmentPlanConfig::new(
+				context.query_id,
+				TaskBudget::from_query_budget(query_budget),
+			)
+			.with_task_context(TaskExecutionContext::from_execution_context(&context)),
+		)
+		.map_err(fragment_error)?;
+		let mut scheduler = DistributedScheduler::new(registry.clone())
+			.with_max_in_flight_tasks(query_budget.max_in_flight_tasks);
+		let dispatcher = NetworkTaskDispatcher::new(memory.clone(), transport.clone())
+			.with_active_query(Some(active_query.clone()))
+			.with_final_result_sender(Some(sender.clone()), Some(batch_sent.clone()));
+		match scheduler.dispatch_loop(&stages, &dispatcher).await {
+			Ok(_) => return Ok(()),
+			Err(error) => {
+				if active_query.is_cancelled() {
+					scheduler.cancel_query(context.query_id);
+				}
+				let error = scheduler_error(error);
+				if descriptor_evolved_table_id(&error).is_some()
+					&& !retried_descriptor_evolution
+					&& !batch_sent.load(Ordering::SeqCst)
+				{
+					if let Some(stale) =
+						invalidate_descriptor_evolution(catalog.as_ref(), &error).await?
+					{
+						invalidated.push(stale);
+					}
+					retried_descriptor_evolution = true;
+					continue;
+				}
+				if descriptor_evolved_table_id(&error).is_some() {
+					return Err(QueryError::SchemaInstability);
+				}
+				return Err(error);
+			}
+		}
+	}
+}
+
+fn spawn_remote_cancel_fanout_task<Transport>(
+	transport: Arc<Transport>,
+	memory: Arc<MemoryManager>,
+	metrics: Option<Arc<CancellationMetrics>>,
+	permits: Arc<Semaphore>,
+	trigger: CancellationTrigger,
+	remote_tasks: Vec<RemoteTaskCancellation>,
+) where
+	Transport: ToronTransport + ?Sized + 'static,
+{
+	let Ok(permit) = permits.try_acquire_owned() else {
+		if let Some(metrics) = &metrics {
+			for _ in &remote_tasks {
+				metrics.record(trigger, CancellationOutcome::RemoteError);
+			}
+		}
+		tracing::warn!("remote cancel fan-out limit exhausted");
+		return;
+	};
+	tokio::spawn(async move {
+		let _permit = permit;
+		let coordinator = ToronCoordinator::new(memory);
+		for task in remote_tasks {
+			let stream = match tokio::time::timeout(
+				REMOTE_CANCEL_CONNECT_TIMEOUT,
+				transport.connect_worker(&task.worker),
+			)
+			.await
+			{
+				Ok(Ok(stream)) => stream,
+				Ok(Err(error)) => {
+					if let Some(metrics) = &metrics {
+						metrics.record(trigger, CancellationOutcome::RemoteError);
+					}
+					tracing::warn!(
+						error = %error,
+						identity = ?task.identity,
+						"remote cancel connect failed"
+					);
+					continue;
+				}
+				Err(_) => {
+					if let Some(metrics) = &metrics {
+						metrics.record(trigger, CancellationOutcome::RemoteTimeout);
+					}
+					tracing::warn!(
+						identity = ?task.identity,
+						"remote cancel connect timed out"
+					);
+					continue;
+				}
+			};
+			match tokio::time::timeout(
+				REMOTE_CANCEL_ACK_TIMEOUT,
+				coordinator.cancel_task_on_worker(stream, task.identity),
+			)
+			.await
+			{
+				Ok(Ok(())) => {
+					if let Some(metrics) = &metrics {
+						metrics.record(trigger, CancellationOutcome::RemoteAck);
+					}
+				}
+				Ok(Err(error)) => {
+					if let Some(metrics) = &metrics {
+						metrics.record(trigger, CancellationOutcome::RemoteError);
+					}
+					tracing::warn!(
+						error = %error,
+						identity = ?task.identity,
+						"remote cancel acknowledgement failed"
+					);
+				}
+				Err(_) => {
+					if let Some(metrics) = &metrics {
+						metrics.record(trigger, CancellationOutcome::RemoteTimeout);
+					}
+					tracing::warn!(
+						identity = ?task.identity,
+						"remote cancel acknowledgement timed out"
+					);
+				}
+			}
+		}
+	});
+}
+
+fn logical_plan_is_distributed_read(plan: &LogicalPlan) -> bool {
+	!matches!(
+		plan,
+		LogicalPlan::CreateTable { .. }
+			| LogicalPlan::CreateLogicalType { .. }
+			| LogicalPlan::DropTable { .. }
+			| LogicalPlan::Insert { .. }
+			| LogicalPlan::InsertSelect { .. }
+			| LogicalPlan::CreateTableAsSelect { .. }
+			| LogicalPlan::Delete { .. }
+			| LogicalPlan::Update { .. }
+	)
 }
 
 struct AdmittedQuery {

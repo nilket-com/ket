@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::num::NonZeroU64;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray};
@@ -453,8 +454,7 @@ async fn wendelon_table_query_appends_row_identity_for_filter_candidates() {
 		.await
 		.expect("row identity table query");
 
-	assert_eq!(first.batches.len(), 1);
-	let batch = &first.batches[0];
+	let batch = concat_batches_for_assertion(&first.batches);
 	assert_eq!(
 		batch.num_columns(),
 		descriptor.arrow_schema().unwrap().fields().len() + 1
@@ -464,10 +464,126 @@ async fn wendelon_table_query_appends_row_identity_for_filter_candidates() {
 	assert_eq!(identity_field.name(), STORAGE_ROW_KEY_ID_COLUMN);
 	assert_eq!(identity_field.data_type(), &DataType::FixedSizeBinary(32));
 	assert_eq!(ids_from_single_column(&first.batches), vec![2, 4]);
-	let first_ids = row_key_id_bytes(batch);
-	let second_ids = row_key_id_bytes(&second.batches[0]);
+	let first_ids = row_key_id_bytes(&batch);
+	let second_batch = concat_batches_for_assertion(&second.batches);
+	let second_ids = row_key_id_bytes(&second_batch);
 	assert_eq!(first_ids, second_ids);
 	assert_eq!(first_ids.len(), 2);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() {
+	let fixture = LiveWendelonFixture::start(120).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(
+		&fixture.client,
+		LIVE_TENANT,
+		&descriptor,
+		selective_batch(12),
+	)
+	.await;
+
+	let full = fixture
+		.client
+		.table_query(
+			LIVE_TENANT,
+			&descriptor,
+			Vec::new(),
+			whole_record_select_star_options(&descriptor, None),
+		)
+		.await
+		.expect("full whole-record select star");
+	let limited = fixture
+		.client
+		.table_query(
+			LIVE_TENANT,
+			&descriptor,
+			Vec::new(),
+			whole_record_select_star_options(&descriptor, NonZeroU64::new(3)),
+		)
+		.await
+		.expect("limited whole-record select star");
+
+	assert!(row_count(&full.batches) > 3);
+	assert_eq!(row_count(&limited.batches), 3);
+	assert_eq!(
+		limited.batches.len(),
+		3,
+		"LIMIT 3 must return three per-location whole-record batches, not one post-scan rebatch"
+	);
+	assert!(
+		limited.batches.len() < full.batches.len(),
+		"LIMIT 3 must stop before the full whole-record scan"
+	);
+	for batch in &limited.batches {
+		assert_select_star_prefix_schema(&descriptor, batch);
+	}
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn stream_select_star_consume_three_then_drop_stops_whole_record_scan() {
+	let fixture = LiveWendelonFixture::start(121).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(
+		&fixture.client,
+		LIVE_TENANT,
+		&descriptor,
+		selective_batch(12),
+	)
+	.await;
+
+	let full = fixture
+		.client
+		.table_query(
+			LIVE_TENANT,
+			&descriptor,
+			Vec::new(),
+			whole_record_select_star_options(&descriptor, None),
+		)
+		.await
+		.expect("full whole-record select star");
+	assert!(full.batches.len() > 3);
+
+	let mut stream = fixture
+		.client
+		.table_query_stream(
+			LIVE_TENANT,
+			&descriptor,
+			Vec::new(),
+			whole_record_select_star_options(&descriptor, None),
+		)
+		.await
+		.expect("streaming whole-record select star");
+	let mut consumed = Vec::new();
+	for _ in 0..3 {
+		let batch = stream
+			.next_batch()
+			.await
+			.expect("stream batch")
+			.expect("expected another streamed batch");
+		assert_eq!(
+			batch.num_rows(),
+			1,
+			"whole-record stream should emit per location before cursor drop"
+		);
+		assert_select_star_prefix_schema(&descriptor, &batch);
+		consumed.push(batch);
+	}
+	drop(stream);
+
+	assert_eq!(row_count(&consumed), 3);
+	assert!(
+		consumed.len() < full.batches.len(),
+		"consuming three batches then dropping must stop before full whole-record materialization"
+	);
 
 	fixture.node.handles.abort();
 	let _ = std::fs::remove_dir_all(fixture.data_dir);
@@ -618,8 +734,8 @@ async fn query_ids_gt(
 		.await
 		.expect("execute live Wendelon-backed query");
 
-	assert_eq!(results.len(), 1);
-	let ids = results[0]
+	let batch = concat_batches_for_assertion(&results);
+	let ids = batch
 		.column(0)
 		.as_any()
 		.downcast_ref::<Int64Array>()
@@ -761,12 +877,19 @@ fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 }
 
 fn assert_batches_equal(expected: &[RecordBatch], actual: &[RecordBatch]) {
-	assert_eq!(actual.len(), expected.len(), "batch count");
+	assert_eq!(row_count(actual), row_count(expected), "row count");
+	let expected = concat_batches_for_assertion(expected);
+	let actual = concat_batches_for_assertion(actual);
 	assert_eq!(
-		encode_batches(expected),
-		encode_batches(actual),
+		encode_batches(&[expected]),
+		encode_batches(&[actual]),
 		"record batch IPC payloads"
 	);
+}
+
+fn concat_batches_for_assertion(batches: &[RecordBatch]) -> RecordBatch {
+	let schema = batches.first().expect("at least one batch").schema();
+	arrow::compute::concat_batches(&schema, batches.iter()).expect("concat batches")
 }
 
 fn encode_batches(batches: &[RecordBatch]) -> Vec<u8> {
@@ -783,8 +906,8 @@ fn encode_batches(batches: &[RecordBatch]) -> Vec<u8> {
 }
 
 fn ids_from_single_column(batches: &[RecordBatch]) -> Vec<i64> {
-	assert_eq!(batches.len(), 1);
-	let ids = batches[0]
+	let batch = concat_batches_for_assertion(batches);
+	let ids = batch
 		.column(0)
 		.as_any()
 		.downcast_ref::<Int64Array>()
@@ -804,10 +927,40 @@ fn row_key_id_bytes(batch: &RecordBatch) -> Vec<[u8; 32]> {
 		.collect()
 }
 
+fn whole_record_select_star_options(
+	descriptor: &TableSchemaDescriptor,
+	row_limit: Option<NonZeroU64>,
+) -> TableQueryOptions {
+	TableQueryOptions {
+		physical_descriptor_fingerprint: Some(descriptor.physical_descriptor_fingerprint),
+		row_identity: RowIdentityProjection::Append,
+		row_limit,
+		..TableQueryOptions::default()
+	}
+}
+
+fn assert_select_star_prefix_schema(descriptor: &TableSchemaDescriptor, batch: &RecordBatch) {
+	let descriptor_schema = descriptor.arrow_schema().expect("descriptor schema");
+	assert!(batch.num_columns() > descriptor_schema.fields().len());
+	for (actual, expected) in batch
+		.schema()
+		.fields()
+		.iter()
+		.take(descriptor_schema.fields().len())
+		.zip(descriptor_schema.fields().iter())
+	{
+		assert_eq!(actual.as_ref(), expected.as_ref());
+	}
+	assert_eq!(
+		batch.schema().field(batch.num_columns() - 1).name(),
+		STORAGE_ROW_KEY_ID_COLUMN
+	);
+}
+
 fn amounts_from_single_column(batches: &[RecordBatch]) -> Vec<i32> {
-	assert_eq!(batches.len(), 1);
-	assert_eq!(batches[0].num_columns(), 1);
-	let amounts = batches[0]
+	let batch = concat_batches_for_assertion(batches);
+	assert_eq!(batch.num_columns(), 1);
+	let amounts = batch
 		.column(0)
 		.as_any()
 		.downcast_ref::<Int32Array>()
@@ -923,10 +1076,16 @@ struct LiveWendelonFixture {
 	node: WendelonNode,
 	client: Arc<Client>,
 	data_dir: std::path::PathBuf,
+	_serial_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl LiveWendelonFixture {
 	async fn start(node_id: u32) -> Self {
+		let serial_permit = live_wendelon_fixture_semaphore()
+			.clone()
+			.acquire_owned()
+			.await
+			.expect("live Wendelon fixture semaphore open");
 		let data_dir = std::env::temp_dir().join(format!(
 			"toron-wendelon-live-{node_id}-{}",
 			rand::random::<u64>()
@@ -978,8 +1137,14 @@ impl LiveWendelonFixture {
 			node,
 			client,
 			data_dir,
+			_serial_permit: serial_permit,
 		}
 	}
+}
+
+fn live_wendelon_fixture_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+	static LIVE_WENDELON_FIXTURE_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+	LIVE_WENDELON_FIXTURE_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
 }
 
 async fn create_live_tenant(node: &WendelonNode, tenant: WendelonTenantId) {

@@ -112,13 +112,22 @@ pub(crate) fn adr037_fragmenter_stamps_every_task_spec_with_context() {
 #[test]
 pub(crate) fn adr037_worker_context_comes_from_task_spec_not_local_test() {
 	let server = std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("server");
-	let execute_task =
+	let execute_task_wrapper =
 		brace_blocks_after_marker(&server, "async fn execute_task_local_with_telemetry")
 			.into_iter()
 			.next()
 			.expect("execute_task_local_with_telemetry body")
 			.1;
+	let execute_task = brace_blocks_after_marker(
+		&server,
+		"async fn execute_task_local_with_telemetry_and_stream_sink",
+	)
+	.into_iter()
+	.next()
+	.expect("execute_task_local_with_telemetry_and_stream_sink body")
+	.1;
 
+	assert!(execute_task_wrapper.contains("execute_task_local_with_telemetry_and_stream_sink"));
 	assert!(execute_task.contains("ExecutionContext::new("));
 	assert!(execute_task.contains("spec.context.session_id"));
 	assert!(execute_task.contains("spec.identity.query_id"));
