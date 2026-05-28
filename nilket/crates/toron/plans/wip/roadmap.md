@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–121 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–122 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118) + pipelined cross-stage execution (119) + end-to-end bounded first rows (120) + general qualified relation-scope binding (121, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118) + pipelined cross-stage execution (119) + end-to-end bounded first rows (120) + general qualified relation-scope binding (121) + Rune `.join(...)` (122, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -1050,50 +1050,50 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 121 promoted; ADR 122 candidates
+### ADR 122 promoted; ADR 123 candidates
 
-ADR 121 selected and promoted **general qualified relation-scope binding** — scalar qualifier resolution
-generalized across SELECT/WHERE/HAVING/GROUP BY/aggregate args/ORDER BY (and the existing JOIN-key
-context), using the existing `ColumnRef { qualifier: Option<TableRef> }` IR (no new variants); a
-binder-internal `RelationScope` sidecar carries `(qualifier, visible_column_name) → (output_ordinal,
-physical_type, nullability, logical_identity)` with explicit scope propagation per plan node and
-alias-hides-base-qualifier semantics, including alias-column-list renamed names under the alias
-qualifier; named/actionable qualifier errors cover unknown relation, ambiguous relation, and unknown
-column within relation, replacing four generic "not supported" strings plus one visible-name
-qualifier gate; Rune gains `RuneDataFrame::alias` + free `qcol`. **Genuine 3-of-3 — Claude
-conceded twice to Codex's grounding**: iter-0 (joins/aliases/qualifier infrastructure all landed —
-[[feedback_ground_the_premise_before_sketching_scope]]) and iter-1 (wildcard expansion has no catalog
-access at the SQL-planner expansion site; same lesson recursively at sub-features). The 9-site reject
-surface partitions cleanly: 5 scalar sites converted (pinned by G1 — four strings gone, visible-name
-qualifier shape relaxed); 4 wildcard/RETURNING sites stay rejected verbatim (pinned by G2 — the
-deferred non-scope is explicit and can't be silently relaxed, including qualified RETURNING's
-`expr_contains_qualified_column` helper). With 115/116/117/118/119/120/121 the execution substrate
-is complete through the coordinator surface AND qualified column authoring is general at the SQL/Rune
-frontends.
-The next frontier is either the joins-customer side (Rune `.join(...)` direct authoring, multi-upstream
-live pipelining) or the 121 named follow-ons (qualified wildcards, qualified DML RETURNING). **Scope
-each candidate as a complete cut, not a ~100-line granular slice** (standing operator steer).
+ADR 122 selected and promoted **Rune `.join(...)` direct authoring** — `.join(other, on)` defaulting
+to Inner + 8 named methods (`inner_join`/`left_join`/`right_join`/`full_join`/`left_semi_join`/
+`right_semi_join`/`left_anti_join`/`right_anti_join`) over the existing `LogicalPlan::Join`. The cut
+extracts a shared pair-shaped `build_hash_join_plan(left, right, kind, on)` helper that SQL and Rune
+both call (single `LogicalPlan::Join` literal site, pinned by G2); a small Rune-only
+`expr_to_join_keys` bridge walks `Eq`/`And` predicates into `Vec<(Expr, Expr)>` key pairs (D3);
+`derive_join_exchange_keys` extracts as a true free function (no `&self`). Predicate at the Rune
+surface (`qcol("l", "k").eq(qcol("r", "k"))` + `.and(...)`-composition) — the DataFrame-conventional
+shape — key-pair shape at the IR (unchanged); the conversion is one small walker. **Grounded
+promotion over a live peer-draft divergence:** iter-1 corrected the IR flow (key-pairs, not
+predicate, verified at `sql_planner.rs:4067`); the final promotion also resolved two stale
+peer-draft details — there are eight join kinds, not nine, and SQL's `"joins around derived tables
+are not supported"` reject is syntactic, not structural. `plan_qualifiers` recursion +
+`RelationScope::project` direct-column provenance already make
+`ctx.sql("SELECT id, region FROM sales").alias("s")` a valid Rune join input. Same lesson recursively
+at sub-feature depth: [[feedback_ground_the_premise_before_sketching_scope]] applies to ANY decision
+in an ADR (cut shape, sub-feature inclusion, helper extraction, rejection import), not just iter-0
+cut-framing. The customer the [[feedback_cut_must_deliver_the_name]] barrier-relaxation trap was
+waiting for has finally landed — multi-upstream live pipelining is now genuinely customer-ready.
+**Scope each candidate as a complete cut, not a ~100-line granular slice** (standing operator steer).
 
-*121 named follow-ons (deferred non-scope, pinned by G2):*
+*Compute customer frontier (now-customer-ready by 122):*
+
+- **Multi-upstream live pipelining** — relax 117's multi-upstream acceptance-layer barrier for the
+  streamable subset, letting joins / multi-input compositions pipeline across both upstreams.
+  **Finally customer-ready** — 122 lands the authored joins that exercise the multi-upstream path;
+  the [[feedback_cut_must_deliver_the_name]] barrier-relaxation-needs-customer trap is finally
+  resolvable. Substantial — touches 117/119's freshly-landed correctness.
+- **Broadcast joins / strategy selection** — `JoinStrategy::Broadcast` exists in the IR but has no
+  constructor today; needs cost-based selection or syntactic hint. Pairs with 122's authored joins.
+
+*121/122 named follow-ons (deferred non-scope):*
 
 - **Qualified wildcards (`t.*` + mixed wildcard)** — requires planner↔binder restructuring (move
   wildcard expansion into the binder where catalog access lives) or a `Wildcard` IR variant.
   Substantial; either approach is a distinct cut from "convert a reject string."
 - **Qualified DML RETURNING (`INSERT … RETURNING t.id` + RETURNING wildcard)** — same machinery as
   wildcards + DML target alias semantics.
-- **DML target aliases / qualified DML assignment targets** — `UPDATE t AS x SET x.col = ...` and
-  similar; requires DML target alias surface that doesn't exist today.
-
-*Compute customer frontier (now-unblocked by 121):*
-
-- **Rune `.join(...)` direct authoring** — over the existing `LogicalPlan::Join`. 121 made qualified
-  authoring general, which is the prerequisite Rune-side joins needed. Smaller cut than the V1 join
-  customer itself (which 121 also unblocks).
-- **Multi-upstream live pipelining** — relax 117's multi-upstream acceptance-layer barrier for the
-  streamable subset, letting joins / multi-input compositions pipeline across both upstreams. **Now
-  genuinely customer-ready** once Rune `.join(...)` lands (joins authorable → multi-upstream
-  pipelining has live customers to exercise it; previously the [[feedback_cut_must_deliver_the_name]]
-  trap of "barrier relaxation without customer evidence").
+- **DML target aliases / qualified DML assignment targets** — `UPDATE t AS x SET x.col = ...`;
+  requires DML target alias surface that doesn't exist today.
+- **SQL joins around derived tables / `GROUP BY` over joins** — corresponding SQL syntactic
+  rejections that 122 deliberately left in place (D6); separate from Rune's permissive shape.
 
 *120 V2 follow-ons (named at promotion):*
 
@@ -1109,15 +1109,13 @@ each candidate as a complete cut, not a ~100-line granular slice** (standing ope
 - **External SQL wire result streaming** — stream `ResultBatch` frames from the daemon as cursor batches
   arrive, including the audit-fail-closed pre-encode ordering question.
 
-*Distributed / execution continuation (115–121 descendants):*
+*Distributed / execution continuation (115–122 descendants):*
 
 - **Streamable-plan coverage extension** — bounded-memory streaming shapes for `Aggregate`/`Sort` (top-k
   bounded buffers; partial+merge for aggregates) that promote them from non-streamable to live-eligible
   producers, widening 119/120's streamable subset.
 - **Row-group-lazy-from-disk scan** — push the laziness deeper into Wendelon storage (per disk page rather
   than per row group) so very large row groups don't materialize. A storage-internal follow-on to 118.
-- **Joins-around-derived / GROUP BY over joins** — explicitly named non-scope of 121; substantive
-  next-cut on the joins surface once Rune `.join(...)` lands.
 
 *Identity-tier continuation (087–114 descendants):*
 
@@ -1166,7 +1164,6 @@ each candidate as a complete cut, not a ~100-line granular slice** (standing ope
 
 *Carried Rune leads (still live):*
 
-- **Rune joins** — needs relation-alias + qualified-column ergonomics first.
 - **`SIMILAR TO`/`RLIKE`/`REGEXP`** (regex pattern families, beyond 101's literal `LIKE`);
   **Rune sort/limit**; dot-field sugar; **Wendelon typed table-mutation trace continuation**. (SQL
   `CASE`/value-conditionals landed as ADR 108; Rune CASE authoring landed as ADR 111 — the conditionals arc
@@ -1184,6 +1181,21 @@ each candidate as a complete cut, not a ~100-line granular slice** (standing ope
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 121 promoted; ADR 122 candidates (HISTORICAL)
+
+ADR 121 took the authoring capstone of the 115→120 substrate arc: scalar qualifier resolution
+generalized across all `Expr::Column` positions via a binder-internal `RelationScope` sidecar and a
+shared `resolve_qualified_column` core (the JOIN-key resolver extracted); Rune gained `alias` +
+`qcol`; named `QualifierResolution::{UnknownRelation, AmbiguousRelation, UnknownColumnInRelation}`
+errors replaced the converted reject strings; the 9-site reject surface partitioned into 5 converted
+(pinned by G1) and 4 wildcard/RETURNING stays-rejected-verbatim (pinned by G2). ADR 122 followed up
+as the **compute-customer authoring surface**: Rune `.join(...)` + 8 named methods over the existing
+`LogicalPlan::Join`, with a shared pair-shaped `build_hash_join_plan` helper and a small
+predicate-to-key-pair bridge; the cut deliberately *did not* import SQL's derived-table grammar
+rejection into Rune (grounded in `plan_qualifiers` + `RelationScope::project`). Detail in
+`plans/adr/121_general_qualified_relation_scope_binding.md` + `plans/adr/122_rune_join.md` + the
+active-line entry above.
 
 ### ADR 120 promoted; ADR 121 candidates (HISTORICAL)
 
