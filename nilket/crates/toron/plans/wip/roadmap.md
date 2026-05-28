@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–119 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–120 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118) + pipelined cross-stage execution (119, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118) + pipelined cross-stage execution (119) + end-to-end bounded first rows (120, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -1050,40 +1050,50 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 119 promoted; ADR 120 candidates
+### ADR 120 promoted; ADR 121 candidates
 
-ADR 119 selected and promoted **pipelined cross-stage execution (V1, single-exchange)** — the consumer-side
-capstone of the 115→118 substrate arc: in-flight scheduler frontier + complete expected-dependency
-readiness (not the post-manifest `task_dependencies` helper alone) + explicit
-`ShufflePartitionRef::{Sealed,Live}` + partition store open/append/seal/cancel lifecycle + worker
-streamable producer and consumer paths (`Scan`/`Filter`/`Project`/`Take`) that bypass the existing
-`Vec<RecordBatch>` barriers, with non-streamable producers/consumers (Sort/Aggregate/Join) and full-fan-in
-hash shuffles **explicitly** falling back to sealed manifests. Multi-upstream stages keep 117's
-acceptance-layer barrier exact. The ADR 118 cost-bound chain now lands end-to-end: a downstream `take`
-cancels live upstream work, which
-(through 118's projected path) stops Wendelon's scan before all qualifying row groups are read. **Genuine
-3-of-3 — Claude conceded iter-1 to grounding** (barrier relaxation without the lifecycle change ≠
-pipelining; see [[feedback_cut_must_deliver_the_name]]). With 115/116/117/118/119, the distributed-execution
-+ storage-cost substrate is complete end-to-end on the streamable subset; the next frontiers extend
-coverage outward (multi-upstream, client streaming, non-streamable shapes) or pivot to compute (joins) /
-types (lifecycle). **Scope each candidate as a complete cut, not a ~100-line granular slice** (standing
-operator steer).
+ADR 120 selected and promoted **end-to-end bounded first rows** — the in-process coordinator cursor
+capstone of the 115→119 substrate arc, reconciling Claude's client-streaming candidate with Gemini's whole-record
+cost-streaming candidate into a behavior-led topic (see
+[[feedback_behavior_led_topic_reconciles_layer_led_splits]]). Three hops now stream end-to-end:
+storage (Wendelon descriptor-backed whole-record per-location emit; 118's descriptor-backed
+`rebatch_groups` post-scan loop deleted), worker
+(`drive_streamable_plan` sink for streamable FinalResult sends `TaskBatch` frames before
+`TaskComplete`), and coordinator (`execute_query_stream` cursor surface over a spawn-driver lifetime,
+with `execute_query` preserved as a collecting compatibility wrapper). **Genuine 3-of-3 — Claude
+conceded iter-1 to grounding**: Codex flagged that a scheduler→cursor channel over task-complete events
+is the same syntactic-relocation trap as 119 iter-1 (worker hop was Vec-buffered); the bifurcated gates
+(`collect_select_star_limit_3_*` + `stream_select_star_consume_three_then_drop_*`) pin both halves
+distinctly. Descriptor-backed `SELECT * FROM huge_table LIMIT 3` now stops Wendelon mid-scan through the coordinator
+surface regardless of whether the projected fast path or the whole-record fallback engages; external SQL
+wire result streaming remains a follow-on because `daemon.rs` still has its own response/audit ordering.
+With 115/116/117/118/119/120 the substrate
+arc is complete through the in-process coordinator surface; subsequent frontiers extend coverage (multi-upstream, non-
+streamable shapes, V2 frame-overhead reduction) or pivot to compute (joins) / types (lifecycle).
+**Scope each candidate as a complete cut, not a ~100-line granular slice** (standing operator steer).
 
-*Distributed / execution continuation (115–119 descendants):*
+*120 V2 follow-ons (named at promotion):*
+
+- **Bounded-buffer whole-record emit** — frame-overhead reduction for the 120 per-location emit via a
+  size-bounded accumulator with periodic flush. Recovers the rebatch grouping's efficiency without
+  reintroducing the post-scan barrier. Honesty boundary: any buffer makes the cost-bound's failure mode
+  timing-dependent; carries its own "buffer bounded ≤ N rows AND emits within K millis" gate.
+- **Configurable cursor depth** — D8's fixed `mpsc::channel(16)` becomes `QueryBudget::result_cursor_depth`.
+  Probably premature until cursor backpressure shows observable cost in practice.
+- **Cursor surface extended to DDL/DML returning paths** — 120 V1 was read-query-only (D6 boundary);
+  RETURNING clauses + mutation-source-returning paths still take the collecting path. Extending is a
+  follow-on, gated on a real consumer.
+- **External SQL wire result streaming** — stream `ResultBatch` frames from the daemon as cursor batches
+  arrive, including the audit-fail-closed pre-encode ordering question.
+
+*Distributed / execution continuation (115–120 descendants):*
 
 - **Multi-upstream live pipelining** — relax 117's multi-upstream acceptance-layer barrier for the
   streamable subset, letting joins / multi-input compositions pipeline across both upstreams. Touches
-  117's freshly-landed correctness; substantial; the natural sequel to 119.
-- **Client-facing `FinalResult` streaming** — coordinator forwards terminal-stage `FinalResult` batches to
-  the SQL/Rune caller as they arrive (currently collected into a `Vec` at task completion). Closes the
-  pipeline end-to-end from Wendelon scan → live exchange → client cursor.
-- **Streamable-plan coverage extension** — bounded-memory streaming shapes for `Aggregate`/`Sort` (e.g.
-  spilling, top-k bounded buffers) that promote them from non-streamable to live-eligible producers,
-  widening 119's streamable subset.
-- **Whole-record table-query cost-streaming** — 118's named follow-on
-  ([[adr_118_cost_bound_scope_projected_path]]): refactor `data_server.rs`'s `rebatch_groups` post-scan
-  emit into per-location incremental emit on the whole-record path, so cancel/drop also bounds slab reads
-  there.
+  117's landed correctness; substantial; gated on joins as the customer.
+- **Streamable-plan coverage extension** — bounded-memory streaming shapes for `Aggregate`/`Sort` (top-k
+  bounded buffers; partial+merge for aggregates) that promote them from non-streamable to live-eligible
+  producers, widening 119/120's streamable subset.
 - **Row-group-lazy-from-disk scan** — push the laziness deeper into Wendelon storage (per disk page rather
   than per row group) so very large row groups don't materialize. A storage-internal follow-on to 118.
 - **Joins frontier** — Rune joins / joins-around-derived (V1 two-input operator); needs relation-alias +
@@ -1154,6 +1164,19 @@ operator steer).
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 119 promoted; ADR 120 candidates (HISTORICAL)
+
+ADR 119 took the consumer-side capstone of the 115→118 substrate arc: in-flight scheduler frontier +
+expected-dependency readiness + explicit `ShufflePartitionRef::{Sealed,Live}` + partition store
+open/append/seal/cancel lifecycle + worker streamable producer/consumer paths bypassing the existing
+`Vec<RecordBatch>` barriers, with non-streamable shapes (Sort/Aggregate/Join) + full-fan-in hash shuffles
+falling back to sealed manifests explicitly. Multi-upstream stages kept 117's acceptance-layer barrier
+exact. ADR 120 followed up as the **user-visible capstone**: cursor surface + worker→coordinator TaskBatch
+streaming + Wendelon whole-record per-location emit, closing the cost-bound chain `SELECT * FROM
+huge_table LIMIT 3` → caller drop → Wendelon stops mid-scan regardless of access path. Detail in
+`plans/adr/119_pipelined_cross_stage_execution.md` + `plans/adr/120_end_to_end_bounded_first_rows.md`
++ the active-line entry above.
 
 ### ADR 118 promoted; ADR 119 candidates (HISTORICAL)
 
