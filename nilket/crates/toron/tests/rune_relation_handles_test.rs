@@ -15,8 +15,8 @@ use toron::distributed::identity::QueryId;
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, FilterDisposition, LogicalPlan,
-	LogicalTypeId, ScalarValue, TableId, decode_column_logical_type,
+	BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, FilterDisposition, JoinKind,
+	JoinStrategy, LogicalPlan, LogicalTypeId, ScalarValue, TableId, decode_column_logical_type,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -282,6 +282,349 @@ async fn rune_take_is_unordered_and_chainable() {
 		panic!("expected scan under take chain");
 	};
 	assert_eq!(*row_limit, Some(2));
+}
+
+#[tokio::test]
+async fn rune_inner_join_executes_equivalently_to_sql_inner_join() {
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+               .project_named([qcol("s", "id").named("id")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune join plan");
+	let sql_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT sales.id FROM sales JOIN regions ON sales.region = regions.region")
+        }
+    "#,
+	)
+	.await
+	.expect("SQL join plan");
+
+	assert_eq!(
+		sorted_int64_column_rows(&run_logical(&rune_logical).await, 0),
+		sorted_int64_column_rows(&run_logical(&sql_logical).await, 0)
+	);
+}
+
+#[tokio::test]
+async fn rune_join_wraps_both_inputs_in_hash_exchanges() {
+	let logical = rune_region_join_plan().await;
+	let LogicalPlan::Join {
+		left,
+		right,
+		kind,
+		on,
+		strategy,
+	} = logical
+	else {
+		panic!("expected Rune join, got {logical:?}");
+	};
+
+	assert_eq!(kind, JoinKind::Inner);
+	assert_eq!(strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(on.len(), 1);
+	let LogicalPlan::Exchange {
+		partition_count: left_partitions,
+		key: left_key,
+		..
+	} = left.as_ref()
+	else {
+		panic!("expected left exchange, got {left:?}");
+	};
+	let LogicalPlan::Exchange {
+		partition_count: right_partitions,
+		key: right_key,
+		..
+	} = right.as_ref()
+	else {
+		panic!("expected right exchange, got {right:?}");
+	};
+	assert_eq!(*left_partitions, 4);
+	assert_eq!(*right_partitions, 4);
+	assert_eq!(left_key.len(), 1);
+	assert_eq!(right_key.len(), 1);
+	assert_qualified_column(&left_key[0], "s", "region");
+	assert_qualified_column(&right_key[0], "r", "region");
+}
+
+#[tokio::test]
+async fn rune_join_multi_column_predicate_decomposes_to_key_pairs() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("l")
+               .join(
+                   ctx.table("sales").alias("r"),
+                   qcol("l", "region").eq(qcol("r", "region"))
+                       .and(qcol("l", "id").eq(qcol("r", "id")))
+               )
+        }
+    "#,
+	)
+	.await
+	.expect("Rune multi-key join plan");
+	let LogicalPlan::Join {
+		left, right, on, ..
+	} = logical
+	else {
+		panic!("expected Rune join, got {logical:?}");
+	};
+
+	assert_eq!(on.len(), 2);
+	let LogicalPlan::Exchange { key: left_key, .. } = left.as_ref() else {
+		panic!("expected left exchange");
+	};
+	let LogicalPlan::Exchange { key: right_key, .. } = right.as_ref() else {
+		panic!("expected right exchange");
+	};
+	assert_eq!(left_key.len(), 2);
+	assert_eq!(right_key.len(), 2);
+	assert_qualified_column(&left_key[0], "l", "region");
+	assert_qualified_column(&right_key[0], "r", "region");
+	assert_qualified_column(&left_key[1], "l", "id");
+	assert_qualified_column(&right_key[1], "r", "id");
+}
+
+#[tokio::test]
+async fn rune_join_named_methods_lower_to_existing_join_kinds() {
+	for (method, expected) in [
+		("join", JoinKind::Inner),
+		("inner_join", JoinKind::Inner),
+		("left_join", JoinKind::LeftOuter),
+		("right_join", JoinKind::RightOuter),
+		("full_join", JoinKind::FullOuter),
+		("left_semi_join", JoinKind::LeftSemi),
+		("right_semi_join", JoinKind::RightSemi),
+		("left_anti_join", JoinKind::LeftAnti),
+		("right_anti_join", JoinKind::RightAnti),
+	] {
+		let script = format!(
+			r#"
+        pub fn main(ctx) {{
+            ctx.table("sales").alias("s")
+               .{method}(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+        }}
+    "#
+		);
+		let logical = rune_plan(&script).await.expect("Rune named join method");
+		let LogicalPlan::Join { kind, .. } = logical else {
+			panic!("expected Rune join for {method}");
+		};
+		assert_eq!(kind, expected, "{method}");
+	}
+}
+
+#[tokio::test]
+async fn rune_join_project_named_qualified_outputs_execute() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+               .project_named([
+                   qcol("s", "id").named("sale_id"),
+                   qcol("r", "label").named("region_label"),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune qualified join projection");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind Rune qualified join projection");
+	assert_schema_names(bound.schema().as_ref(), &["sale_id", "region_label"]);
+
+	let batches = execute_logical(&logical)
+		.await
+		.expect("execute Rune qualified join projection");
+	let mut rows = int64_column_rows(&batches, 0)
+		.into_iter()
+		.zip(string_column_rows(&batches, 1))
+		.collect::<Vec<_>>();
+	rows.sort_by_key(|(id, _)| *id);
+	assert_eq!(
+		rows,
+		vec![
+			(Some(1), Some("East".to_string())),
+			(Some(2), Some("West".to_string())),
+			(Some(3), Some("East".to_string())),
+			(Some(4), Some("East".to_string())),
+			(Some(5), Some("West".to_string())),
+		]
+	);
+}
+
+#[tokio::test]
+async fn rune_join_then_take_remains_chainable() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+               .take(3)
+               .project_named([qcol("s", "id").named("id")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune join then take");
+
+	let batches = run_logical(&logical).await;
+	assert_eq!(total_rows(&batches), 3);
+}
+
+#[tokio::test]
+async fn rune_join_accepts_filtered_dataframe_inputs() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .filter(qcol("s", "status").eq(lit_str("open")))
+               .join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+               .project_named([qcol("s", "id").named("id")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune join with filtered input");
+
+	assert_eq!(
+		sorted_int64_column_rows(&run_logical(&logical).await, 0),
+		vec![Some(1), Some(2), Some(4), Some(5)]
+	);
+}
+
+#[tokio::test]
+async fn rune_join_accepts_sql_relation_input_when_keys_resolve() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT id, region FROM sales")
+               .alias("s")
+               .join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+               .project_named([qcol("s", "id").named("id")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune join with ctx.sql input");
+
+	assert_eq!(
+		sorted_int64_column_rows(&run_logical(&logical).await, 0),
+		vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
+	);
+}
+
+#[tokio::test]
+async fn rune_join_unqualified_ambiguous_key_rejects() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .join(ctx.table("sales").alias("r"), col("id").eq(col("id")))
+        }
+    "#,
+	)
+	.await
+	.expect("Rune ambiguous join plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("ambiguous unqualified join key must reject");
+
+	assert!(matches!(
+		error,
+		BindingError::AmbiguousColumnRef { name, .. } if name == "id"
+	));
+}
+
+#[tokio::test]
+async fn rune_join_computed_key_rejects() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "id").add(lit_i64(1)).eq(qcol("r", "region"))
+               )
+        }
+    "#,
+	)
+	.await
+	.expect("Rune computed join key plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("computed join key must reject");
+
+	assert!(matches!(error, BindingError::JoinComputedKeyUnsupported));
+}
+
+#[tokio::test]
+async fn rune_join_predicate_without_equi_key_rejects() {
+	let error = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "id").gt(qcol("r", "region"))
+               )
+        }
+    "#,
+	)
+	.await
+	.expect_err("non-equi Rune join predicate must reject");
+
+	assert_frontend_message_contains(error, "JOIN predicate requires equality key predicates");
+}
+
+#[tokio::test]
+async fn rune_join_logical_identity_mismatch_rejects() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .join(
+                   ctx.table("sales").alias("r"),
+                   qcol("s", "id").as_logical_type::<CustomerId>()
+                       .eq(qcol("r", "id").as_logical_type::<ProductId>())
+               )
+        }
+    "#,
+	)
+	.await
+	.expect("Rune nominal join plan");
+	let error = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("nominal mismatch join key must reject");
+
+	assert_nominal_mismatch(error, "CustomerId", "ProductId", "Int64");
 }
 
 #[tokio::test]
@@ -1961,6 +2304,22 @@ async fn sql_group_by_alias_outer_sum_plan() -> LogicalPlan {
 	.expect("Rune aggregate over SQL group-by alias")
 }
 
+async fn rune_region_join_plan() -> LogicalPlan {
+	rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+        }
+    "#,
+	)
+	.await
+	.expect("Rune region join plan")
+}
+
 async fn bind_rune_nominal_filter(script: &str) -> Result<ExecutionPlan, BindingError> {
 	let logical = rune_plan(script).await.expect("Rune nominal plan");
 	bind(&logical, &catalog(), &PlannerConfig::default()).await
@@ -2003,7 +2362,10 @@ async fn run_logical(logical: &LogicalPlan) -> Vec<RecordBatch> {
 async fn execute_logical(logical: &LogicalPlan) -> Result<Vec<RecordBatch>, ExecutionError> {
 	let bound = bind(logical, &catalog(), &PlannerConfig::default()).await?;
 	Executor::new(Arc::new(FixtureScan {
-		batches: HashMap::from([(TableId(1), sales_batch(sales_schema()))]),
+		batches: HashMap::from([
+			(TableId(1), sales_batch(sales_schema())),
+			(TableId(2), regions_batch(regions_schema())),
+		]),
 	}))
 	.execute_bound(&bound, None)
 	.await
@@ -2017,6 +2379,12 @@ fn catalog() -> MockCatalog {
 			descriptor(1, "sales", sales_schema().as_ref(), "id"),
 		)
 		.expect("register sales");
+	catalog
+		.register_descriptor(
+			TableId(2),
+			descriptor(2, "regions", regions_schema().as_ref(), "region"),
+		)
+		.expect("register regions");
 	catalog
 }
 
@@ -2079,6 +2447,24 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 		],
 	)
 	.expect("sales batch")
+}
+
+fn regions_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("region", DataType::Utf8, false),
+		Field::new("label", DataType::Utf8, false),
+	]))
+}
+
+fn regions_batch(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(StringArray::from(vec!["east", "west"])),
+			Arc::new(StringArray::from(vec!["East", "West"])),
+		],
+	)
+	.expect("regions batch")
 }
 
 fn descriptor(
@@ -2286,6 +2672,30 @@ fn int64_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<i64>>
 				.collect::<Vec<_>>()
 		})
 		.collect()
+}
+
+fn sorted_int64_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<i64>> {
+	let mut rows = int64_column_rows(batches, column);
+	rows.sort();
+	rows
+}
+
+fn total_rows(batches: &[RecordBatch]) -> usize {
+	batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn assert_qualified_column(expr: &Expr, qualifier: &str, name: &str) {
+	let Expr::Column(column) = expr else {
+		panic!("expected column expression, got {expr:?}");
+	};
+	assert_eq!(
+		column
+			.qualifier
+			.as_ref()
+			.map(|qualifier| qualifier.table.as_str()),
+		Some(qualifier)
+	);
+	assert_eq!(column.name.0.as_str(), name);
 }
 
 fn int32_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<i32>> {

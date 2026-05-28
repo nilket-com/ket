@@ -2643,22 +2643,7 @@ impl SqlPlanner {
 			}
 			let right = self.lower_table_factor(&join.relation)?;
 			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
-			let (left_keys, right_keys) = self.join_exchange_keys(&on, &plan, &right)?;
-			plan = LogicalPlan::Join {
-				left: Box::new(LogicalPlan::Exchange {
-					input: Box::new(plan),
-					partition_count: DEFAULT_JOIN_PARTITION_COUNT,
-					key: left_keys,
-				}),
-				right: Box::new(LogicalPlan::Exchange {
-					input: Box::new(right),
-					partition_count: DEFAULT_JOIN_PARTITION_COUNT,
-					key: right_keys,
-				}),
-				kind,
-				on,
-				strategy: JoinStrategy::HashPartitioned,
-			};
+			plan = build_hash_join_plan(plan, right, kind, on)?;
 		}
 
 		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation)
@@ -3610,27 +3595,16 @@ impl SqlPlanner {
 			};
 		}
 
-		let left_key = on.iter().map(|(outer, _)| outer.clone()).collect();
-		let right_key = on.iter().map(|(_, inner)| inner.clone()).collect();
-		Ok(LogicalPlan::Join {
-			left: Box::new(LogicalPlan::Exchange {
-				input: Box::new(outer_plan),
-				partition_count: DEFAULT_JOIN_PARTITION_COUNT,
-				key: left_key,
-			}),
-			right: Box::new(LogicalPlan::Exchange {
-				input: Box::new(inner_plan),
-				partition_count: DEFAULT_JOIN_PARTITION_COUNT,
-				key: right_key,
-			}),
-			kind: if negated {
+		build_hash_join_plan(
+			outer_plan,
+			inner_plan,
+			if negated {
 				JoinKind::LeftAnti
 			} else {
 				JoinKind::LeftSemi
 			},
 			on,
-			strategy: JoinStrategy::HashPartitioned,
-		})
+		)
 	}
 
 	fn classify_exists_conjunct(
@@ -4063,45 +4037,82 @@ impl SqlPlanner {
 			))
 		}
 	}
+}
 
-	fn join_exchange_keys(
-		&self,
-		on: &[(Expr, Expr)],
-		left: &LogicalPlan,
-		right: &LogicalPlan,
-	) -> Result<(Vec<Expr>, Vec<Expr>), FrontendError> {
-		let left_qualifiers = plan_qualifiers(left);
-		let right_qualifiers = plan_qualifiers(right);
-		let mut left_keys = Vec::with_capacity(on.len());
-		let mut right_keys = Vec::with_capacity(on.len());
+pub(crate) fn build_hash_join_plan(
+	left: LogicalPlan,
+	right: LogicalPlan,
+	kind: JoinKind,
+	on: Vec<(Expr, Expr)>,
+) -> Result<LogicalPlan, FrontendError> {
+	let (left_keys, right_keys) = derive_join_exchange_keys(&on, &left, &right)?;
+	Ok(LogicalPlan::Join {
+		left: Box::new(LogicalPlan::Exchange {
+			input: Box::new(left),
+			partition_count: DEFAULT_JOIN_PARTITION_COUNT,
+			key: left_keys,
+		}),
+		right: Box::new(LogicalPlan::Exchange {
+			input: Box::new(right),
+			partition_count: DEFAULT_JOIN_PARTITION_COUNT,
+			key: right_keys,
+		}),
+		kind,
+		on,
+		strategy: JoinStrategy::HashPartitioned,
+	})
+}
 
-		for (first, second) in on {
-			let first_side = expr_side(first, &left_qualifiers, &right_qualifiers);
-			let second_side = expr_side(second, &left_qualifiers, &right_qualifiers);
-			match (first_side, second_side) {
-				(Some(JoinSide::Left), Some(JoinSide::Right))
-				| (Some(JoinSide::Left), None)
-				| (None, Some(JoinSide::Right))
-				| (None, None) => {
-					left_keys.push(first.clone());
-					right_keys.push(second.clone());
-				}
-				(Some(JoinSide::Right), Some(JoinSide::Left))
-				| (Some(JoinSide::Right), None)
-				| (None, Some(JoinSide::Left)) => {
-					left_keys.push(second.clone());
-					right_keys.push(first.clone());
-				}
-				_ => {
-					return Err(unsupported(
-						"join ON equality must reference one column from each side",
-					));
-				}
+pub(crate) fn expr_to_join_keys(expr: &Expr) -> Result<Vec<(Expr, Expr)>, FrontendError> {
+	match expr {
+		Expr::And(left, right) => {
+			let mut keys = expr_to_join_keys(left)?;
+			keys.extend(expr_to_join_keys(right)?);
+			Ok(keys)
+		}
+		Expr::Eq(left, right) => Ok(vec![((*left.as_ref()).clone(), (*right.as_ref()).clone())]),
+		_ => Err(unsupported(
+			"JOIN predicate requires equality key predicates",
+		)),
+	}
+}
+
+fn derive_join_exchange_keys(
+	on: &[(Expr, Expr)],
+	left: &LogicalPlan,
+	right: &LogicalPlan,
+) -> Result<(Vec<Expr>, Vec<Expr>), FrontendError> {
+	let left_qualifiers = plan_qualifiers(left);
+	let right_qualifiers = plan_qualifiers(right);
+	let mut left_keys = Vec::with_capacity(on.len());
+	let mut right_keys = Vec::with_capacity(on.len());
+
+	for (first, second) in on {
+		let first_side = expr_side(first, &left_qualifiers, &right_qualifiers);
+		let second_side = expr_side(second, &left_qualifiers, &right_qualifiers);
+		match (first_side, second_side) {
+			(Some(JoinSide::Left), Some(JoinSide::Right))
+			| (Some(JoinSide::Left), None)
+			| (None, Some(JoinSide::Right))
+			| (None, None) => {
+				left_keys.push(first.clone());
+				right_keys.push(second.clone());
+			}
+			(Some(JoinSide::Right), Some(JoinSide::Left))
+			| (Some(JoinSide::Right), None)
+			| (None, Some(JoinSide::Left)) => {
+				left_keys.push(second.clone());
+				right_keys.push(first.clone());
+			}
+			_ => {
+				return Err(unsupported(
+					"join ON equality must reference one column from each side",
+				));
 			}
 		}
-
-		Ok((left_keys, right_keys))
 	}
+
+	Ok((left_keys, right_keys))
 }
 
 fn sort_needs_hidden_projection(order_by: &[SortExpr]) -> bool {

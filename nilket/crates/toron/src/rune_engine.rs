@@ -1,10 +1,10 @@
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, LogicalPlan, LogicalTypeId,
+	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, LogicalPlan, LogicalTypeId,
 	PRODUCT_ID_LOGICAL_TYPE, ScalarValue, SortExpr,
 };
-use crate::sql_planner::SqlPlanner;
+use crate::sql_planner::{SqlPlanner, build_hash_join_plan, expr_to_join_keys};
 use arrow::datatypes::DataType;
 use rune::alloc::limit;
 use rune::runtime::{TypeHash, VmResult, budget};
@@ -226,6 +226,42 @@ impl RuneDataFrame {
 		}
 	}
 
+	pub fn join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::Inner, on)
+	}
+
+	pub fn inner_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::Inner, on)
+	}
+
+	pub fn left_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::LeftOuter, on)
+	}
+
+	pub fn right_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::RightOuter, on)
+	}
+
+	pub fn full_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::FullOuter, on)
+	}
+
+	pub fn left_semi_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::LeftSemi, on)
+	}
+
+	pub fn right_semi_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::RightSemi, on)
+	}
+
+	pub fn left_anti_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::LeftAnti, on)
+	}
+
+	pub fn right_anti_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_kind(self.plan, right.plan, JoinKind::RightAnti, on)
+	}
+
 	pub fn filter(self, predicate: RuneExpr) -> Self {
 		Self {
 			plan: LogicalPlan::Filter {
@@ -362,6 +398,22 @@ impl RuneDataFrame {
 				aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("count")])],
 			},
 		}
+	}
+}
+
+fn join_with_kind(
+	left: LogicalPlan,
+	right: LogicalPlan,
+	kind: JoinKind,
+	on: RuneExpr,
+) -> VmResult<RuneDataFrame> {
+	let pairs = match expr_to_join_keys(&on.expr) {
+		Ok(pairs) => pairs,
+		Err(error) => return VmResult::panic(error.to_string()),
+	};
+	match build_hash_join_plan(left, right, kind, pairs) {
+		Ok(plan) => VmResult::Ok(RuneDataFrame { plan }),
+		Err(error) => VmResult::panic(error.to_string()),
 	}
 }
 
@@ -822,6 +874,15 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("table", ToronContext::table)?;
 	m.associated_function("sql", ToronContext::sql)?;
 	m.associated_function("alias", RuneDataFrame::alias)?;
+	m.associated_function("join", RuneDataFrame::join)?;
+	m.associated_function("inner_join", RuneDataFrame::inner_join)?;
+	m.associated_function("left_join", RuneDataFrame::left_join)?;
+	m.associated_function("right_join", RuneDataFrame::right_join)?;
+	m.associated_function("full_join", RuneDataFrame::full_join)?;
+	m.associated_function("left_semi_join", RuneDataFrame::left_semi_join)?;
+	m.associated_function("right_semi_join", RuneDataFrame::right_semi_join)?;
+	m.associated_function("left_anti_join", RuneDataFrame::left_anti_join)?;
+	m.associated_function("right_anti_join", RuneDataFrame::right_anti_join)?;
 	m.associated_function("filter", RuneDataFrame::filter)?;
 	m.associated_function("project", RuneDataFrame::project)?;
 	m.associated_function("project_named", RuneDataFrame::project_named)?;

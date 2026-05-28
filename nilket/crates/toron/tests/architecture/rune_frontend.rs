@@ -498,11 +498,12 @@ pub(crate) fn adr080_no_rune_local_schema_binder_optimizer_or_executor() {
 #[test]
 pub(crate) fn adr080_no_join_surface_in_named_projection_cut() {
 	let rune = rune_engine_source();
+	let project_named = source_block(&rune, "pub fn project_named");
 
-	assert!(!rune.contains("LogicalPlan::Join"));
-	assert!(!rune.contains("JoinKind"));
-	assert!(!rune.contains("JoinStrategy"));
-	assert!(!rune.contains("pub fn join"));
+	assert!(!project_named.contains("LogicalPlan::Join"));
+	assert!(!project_named.contains("JoinKind"));
+	assert!(!project_named.contains("JoinStrategy"));
+	assert!(!project_named.contains("pub fn join"));
 }
 
 #[test]
@@ -1675,4 +1676,169 @@ pub(crate) fn adr083_predicate_operator_cut_does_not_change_engine_substrate() {
 			"PBC compiler missing {pbc_mapping}"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr122_rune_join_surface_exposed_without_join_kind_type() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	for method in [
+		"join",
+		"inner_join",
+		"left_join",
+		"right_join",
+		"full_join",
+		"left_semi_join",
+		"right_semi_join",
+		"left_anti_join",
+		"right_anti_join",
+	] {
+		assert!(
+			names.iter().any(|name| name == method),
+			"Rune join method `{method}` is not registered: {names:?}"
+		);
+		assert!(
+			rune.contains(&format!(
+				"pub fn {method}(self, right: RuneDataFrame, on: RuneExpr)"
+			)),
+			"RuneDataFrame missing `{method}` surface"
+		);
+	}
+	assert!(!module.contains("m.ty::<JoinKind>()"));
+}
+
+#[test]
+pub(crate) fn adr122_join_builder_is_pair_shaped_and_shared() {
+	let planner = sql_planner_source();
+	let rune = rune_engine_source();
+	let builder = source_block(&planner, "pub(crate) fn build_hash_join_plan");
+	let lower_exists = source_block(&planner, "fn lower_exists_join");
+
+	assert!(builder.contains("on: Vec<(Expr, Expr)>"));
+	assert!(builder.contains("derive_join_exchange_keys(&on, &left, &right)?"));
+	assert!(builder.contains("LogicalPlan::Join"));
+	assert!(builder.contains("JoinStrategy::HashPartitioned"));
+	assert!(planner.contains("plan = build_hash_join_plan(plan, right, kind, on)?;"));
+	assert!(lower_exists.contains("build_hash_join_plan("));
+	assert!(rune.contains("build_hash_join_plan(left, right, kind, pairs)"));
+}
+
+#[test]
+pub(crate) fn adr122_rune_predicate_bridge_is_narrow_and_sql_does_not_call_it() {
+	let planner = sql_planner_source();
+	let bridge = source_block(&planner, "pub(crate) fn expr_to_join_keys");
+	let lower_join_on = source_block(&planner, "fn lower_join_on");
+	let lower_join_operator = source_block(&planner, "fn lower_join_operator");
+
+	assert!(bridge.contains("Expr::And(left, right)"));
+	assert!(bridge.contains("Expr::Eq(left, right)"));
+	assert!(bridge.contains("JOIN predicate requires equality key predicates"));
+	for forbidden in ["Expr::Or", "Expr::Gt", "Expr::Lt", "Expr::Neq", "JoinKind"] {
+		assert!(
+			!bridge.contains(forbidden),
+			"Rune join predicate bridge widened to {forbidden}"
+		);
+	}
+	assert!(!lower_join_on.contains("expr_to_join_keys"));
+	assert!(!lower_join_operator.contains("expr_to_join_keys"));
+}
+
+#[test]
+pub(crate) fn adr122_join_builder_inserts_terminal_hash_exchanges() {
+	let planner = sql_planner_source();
+	let builder = source_block(&planner, "pub(crate) fn build_hash_join_plan");
+
+	assert_eq!(builder.matches("LogicalPlan::Exchange").count(), 2);
+	assert_eq!(builder.matches("DEFAULT_JOIN_PARTITION_COUNT").count(), 2);
+	assert!(builder.contains("key: left_keys"));
+	assert!(builder.contains("key: right_keys"));
+}
+
+#[test]
+pub(crate) fn adr122_join_ir_and_strategy_surface_unchanged() {
+	let ir = ir_source();
+	let join_kind = source_block(&ir, "pub enum JoinKind");
+	let join_strategy = source_block(&ir, "pub enum JoinStrategy");
+
+	for variant in [
+		"Inner",
+		"LeftOuter",
+		"RightOuter",
+		"FullOuter",
+		"LeftSemi",
+		"RightSemi",
+		"LeftAnti",
+		"RightAnti",
+	] {
+		assert!(join_kind.contains(variant), "JoinKind missing {variant}");
+	}
+	assert_eq!(enum_variant_count(&join_kind), 8);
+	assert!(join_strategy.contains("HashPartitioned"));
+	assert!(join_strategy.contains("Broadcast"));
+	assert_eq!(enum_variant_count(&join_strategy), 2);
+}
+
+#[test]
+pub(crate) fn adr122_sql_derived_reject_not_imported_into_rune_join() {
+	let rune = rune_engine_source();
+	let tests = rune_relation_handles_test_source();
+
+	assert!(!rune.contains("joins around derived tables are not supported"));
+	assert!(tests.contains("rune_join_accepts_sql_relation_input_when_keys_resolve"));
+	assert!(tests.contains("ctx.sql(\"SELECT id, region FROM sales\")"));
+}
+
+#[test]
+pub(crate) fn adr122_behavior_gates_cover_rune_join() {
+	let tests = rune_relation_handles_test_source();
+
+	for gate in [
+		"rune_inner_join_executes_equivalently_to_sql_inner_join",
+		"rune_join_wraps_both_inputs_in_hash_exchanges",
+		"rune_join_multi_column_predicate_decomposes_to_key_pairs",
+		"rune_join_named_methods_lower_to_existing_join_kinds",
+		"rune_join_project_named_qualified_outputs_execute",
+		"rune_join_then_take_remains_chainable",
+		"rune_join_accepts_filtered_dataframe_inputs",
+		"rune_join_accepts_sql_relation_input_when_keys_resolve",
+		"rune_join_unqualified_ambiguous_key_rejects",
+		"rune_join_computed_key_rejects",
+		"rune_join_predicate_without_equi_key_rejects",
+		"rune_join_logical_identity_mismatch_rejects",
+	] {
+		assert!(tests.contains(gate), "missing behavior gate {gate}");
+	}
+}
+
+#[test]
+pub(crate) fn adr122_no_executor_pbc_wendelon_or_scheduler_change() {
+	let manifest_dir = manifest_dir();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/pbc.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read Toron source");
+		assert!(
+			!source.contains("ADR 122") && !source.contains("adr122"),
+			"ADR 122 marker leaked into {}",
+			path.display()
+		);
+	}
+
+	let mut offenders = source_lines(&manifest_dir.join("src/distributed"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("ADR 122") || line.contains("adr122"))
+		.collect::<Vec<_>>();
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| line.contains("ADR 122") || line.contains("adr122")),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR 122 marker leaked into executor-adjacent code:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
 }
