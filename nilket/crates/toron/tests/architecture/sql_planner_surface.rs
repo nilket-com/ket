@@ -106,7 +106,6 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 	assert!(!planner.contains("HAVING is not supported"));
 	assert!(planner.contains("HAVING aggregate-call must appear in SELECT list"));
 	assert!(planner.contains("ambiguous HAVING aggregate-call"));
-	assert!(planner.contains("qualified HAVING column references are not supported"));
 	assert!(planner.contains("unsupported aggregate function"));
 
 	let lib = std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source");
@@ -228,7 +227,6 @@ pub(crate) fn adr017_order_by_aggregate_call_guards_are_narrow() {
 		)
 	);
 	assert!(planner.contains("ambiguous ORDER BY aggregate-call"));
-	assert!(planner.contains("qualified HAVING column references are not supported"));
 	assert!(planner.contains("struct LoweredSelect"));
 	assert!(planner.contains("aggregate_output_catalog: Option<AggregateOutputCatalog>"));
 	assert!(planner.contains("fn rewrite_grouped_aggregate_calls"));
@@ -262,7 +260,6 @@ pub(crate) fn adr018_scalar_aggregate_having_order_by_guards_are_narrow() {
 		.expect("read SQL planner source");
 	assert!(planner.contains("HAVING requires GROUP BY or an aggregate projection"));
 	assert!(!planner.contains("HAVING without GROUP BY is not supported"));
-	assert!(planner.contains("qualified HAVING column references are not supported"));
 	assert!(planner.contains("HAVING aggregate-call must appear in SELECT list"));
 	assert!(
 		planner.contains("HAVING does not resolve SELECT aliases; spell the aggregate explicitly")
@@ -451,16 +448,8 @@ pub(crate) fn adr025_sql_cast_lowers_via_planner() {
 
 	for (marker, guard) in [
 		(
-			"fn reject_qualified_having_column_references",
-			"reject_qualified_having_column_references",
-		),
-		(
 			"fn reject_having_alias_references(\n\texpr",
 			"reject_having_alias_references",
-		),
-		(
-			"fn reject_qualified_aggregate_projection_references",
-			"reject_qualified_aggregate_projection_references",
 		),
 		(
 			"fn expr_contains_aggregate_call",
@@ -1019,7 +1008,6 @@ pub(crate) fn adr027_hidden_sort_key_refs_are_visible_outputs() {
 		.expect("validate_hidden_sort_key_refs body")
 		.1;
 
-	assert!(validator.contains("column.qualifier.is_some()"));
 	assert!(validator.contains("visible_names.contains(&column.name.0)"));
 	assert!(
 		validator.contains(

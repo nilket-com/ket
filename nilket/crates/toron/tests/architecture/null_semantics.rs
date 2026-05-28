@@ -233,10 +233,10 @@ pub(crate) fn adr114_contextless_null_projection_is_result_position_only() {
 		.and_then(|rest| rest.split("pub struct BoundExprProgram").next())
 		.expect("BoundExprNode enum");
 	let projection_bind =
-		brace_blocks_after_marker(&binder, "async fn bind_projection_expr_program")
+		brace_blocks_after_marker(&binder, "async fn bind_projection_expr_program_with_scope")
 			.into_iter()
 			.next()
-			.expect("bind_projection_expr_program body")
+			.expect("bind_projection_expr_program_with_scope body")
 			.1;
 	let returning_bind = brace_blocks_after_marker(&binder, "async fn bind_returning_projection")
 		.into_iter()
@@ -293,7 +293,7 @@ pub(crate) fn adr114_contextless_null_projection_is_result_position_only() {
 	assert!(materialize_null.contains("output_type == &DataType::Null"));
 	assert!(materialize_null.contains("builder.append_null()"));
 	assert!(update_bind.contains("typed_update_null_for_target(expr, field)?"));
-	assert!(update_bind.contains("bind_expr_program(&source_exprs"));
+	assert!(update_bind.contains("bind_expr_program_scoped(&source_exprs"));
 	assert!(!update_bind.contains("bind_projection_expr_program(&source_exprs"));
 	assert!(pbc.contains("NULL literal is not PBC-eligible"));
 	assert!(pbc.contains("NULL literal reached PBC emitter"));

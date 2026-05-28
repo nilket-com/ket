@@ -216,6 +216,16 @@ impl RuneDataFrame {
 		}
 	}
 
+	pub fn alias(self, name: String) -> Self {
+		Self {
+			plan: LogicalPlan::Alias {
+				input: Box::new(self.plan),
+				alias: TableRef::new(name),
+				columns: Vec::new(),
+			},
+		}
+	}
+
 	pub fn filter(self, predicate: RuneExpr) -> Self {
 		Self {
 			plan: LogicalPlan::Filter {
@@ -384,6 +394,12 @@ impl ToronContext {
 pub fn col(name: String) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::column(name),
+	}
+}
+
+pub fn qcol(rel: String, col: String) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::qualified_column(TableRef::new(rel), col),
 	}
 }
 
@@ -776,6 +792,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.ty::<ToronContext>()?;
 
 	m.function(["col"], col).build()?;
+	m.function(["qcol"], qcol).build()?;
 	m.function(["lit"], lit).build()?;
 	m.function(["lit_null"], lit_null).build()?;
 	m.function(["lit_str"], lit_str).build()?;
@@ -804,6 +821,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 
 	m.associated_function("table", ToronContext::table)?;
 	m.associated_function("sql", ToronContext::sql)?;
+	m.associated_function("alias", RuneDataFrame::alias)?;
 	m.associated_function("filter", RuneDataFrame::filter)?;
 	m.associated_function("project", RuneDataFrame::project)?;
 	m.associated_function("project_named", RuneDataFrame::project_named)?;

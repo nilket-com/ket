@@ -956,6 +956,8 @@ fn binding_error_class(error: &BindingError) -> &'static str {
 			"ambiguous_column"
 		}
 		BindingError::UnknownTableRef { .. } => "unknown_table_ref",
+		BindingError::AmbiguousTableRef { .. } => "ambiguous_table_ref",
+		BindingError::UnknownColumnInRelation { .. } => "unknown_column_in_relation",
 		BindingError::JoinPredicateNotEqui => "join_predicate_not_equi",
 		BindingError::JoinKeyTypeMismatch { .. } => "join_key_type_mismatch",
 		BindingError::JoinKeyTypeUnsupported { .. } => "join_key_type_unsupported",

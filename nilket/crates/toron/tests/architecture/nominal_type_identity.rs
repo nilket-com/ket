@@ -313,7 +313,7 @@ pub(crate) fn adr088_column_binding_stamps_bound_expr_logical_sidecar() {
 	let bind_expr = source_block(&binder, "fn bind_expr_into_program");
 
 	let resolve = bind_expr
-		.find("resolve_logical_column(&column_ref.name.0, input_schema)?")
+		.find("resolve_expr_column(column_ref, input_schema, ctx.relation_scope)?")
 		.expect("logical column resolution");
 	let append = bind_expr
 		.find("builder.append_column(column.column)")
@@ -330,9 +330,10 @@ pub(crate) fn adr088_column_binding_stamps_bound_expr_logical_sidecar() {
 pub(crate) fn adr088_join_key_takes_identity_from_catalog_metadata() {
 	let binder = binder_source();
 	let scope = source_block(&binder, "fn resolve_join_column");
-	let resolve = source_block(&binder, "fn resolve_logical_column");
+	let resolve = source_block(&binder, "fn resolved_logical_column_at_ordinal");
 	let join_key = source_block(&binder, "fn resolved_join_key");
 
+	assert!(scope.contains("resolve_qualified_column"));
 	assert!(scope.contains("resolve_logical_column"));
 	assert!(resolve.contains("decode_column_logical_type(field)"));
 	assert!(join_key.contains("column.logical_type"));
@@ -863,7 +864,7 @@ pub(crate) fn adr092_binder_resolves_sql_logical_casts_registry_only_before_sync
 	let binder = binder_source();
 	let resolve = source_block(&binder, "async fn resolve_logical_casts");
 	let collect = source_block(&binder, "fn collect_logical_cast_names");
-	let bind_program = source_block(&binder, "async fn bind_expr_program");
+	let bind_program = source_block(&binder, "async fn bind_expr_program_with_scope");
 
 	assert!(resolve.contains("collect_logical_cast_names(expr"));
 	assert!(resolve.contains("resolve_durable_logical_type_by_name(&name)"));

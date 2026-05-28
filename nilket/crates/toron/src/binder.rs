@@ -17,10 +17,10 @@ use crate::exec::Executor;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
-	ColumnOrdinal, CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
-	FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId,
-	LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram, QueryProfileHint,
-	ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
+	ColumnOrdinal, ColumnRef, CreateTableColumnType, CreateTableSchema, ExecutionPlan,
+	ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan,
+	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
+	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
 	arithmetic_output_type, decode_column_logical_type, decode_column_logical_type_with_resolver,
 	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
 };
@@ -63,7 +63,7 @@ pub async fn bind(
 	config: &PlannerConfig,
 ) -> Result<ExecutionPlan, BindingError> {
 	let plan = Binder { catalog, config }.bind_plan(plan).await?;
-	push_down_scan_projection(plan)
+	push_down_scan_projection(plan.plan)
 }
 
 struct Binder<'a> {
@@ -71,16 +71,37 @@ struct Binder<'a> {
 	config: &'a PlannerConfig,
 }
 
+struct ScopedExecutionPlan {
+	plan: ExecutionPlan,
+	scope: RelationScope,
+}
+
+impl ScopedExecutionPlan {
+	fn new(plan: ExecutionPlan, scope: RelationScope) -> Self {
+		Self { plan, scope }
+	}
+
+	fn empty_scope(plan: ExecutionPlan) -> Self {
+		let scope = RelationScope::empty(plan.schema());
+		Self { plan, scope }
+	}
+
+	fn schema(&self) -> SchemaRef {
+		self.plan.schema()
+	}
+}
+
 struct ExprBindContext<'a> {
 	config: &'a PlannerConfig,
 	logical_casts: &'a HashMap<String, LogicalTypeSpec>,
+	relation_scope: Option<&'a RelationScope>,
 }
 
 impl<'a> Binder<'a> {
 	fn bind_plan<'b>(
 		&'b self,
 		plan: &'b LogicalPlan,
-	) -> Pin<Box<dyn Future<Output = Result<ExecutionPlan, BindingError>> + Send + 'b>> {
+	) -> Pin<Box<dyn Future<Output = Result<ScopedExecutionPlan, BindingError>> + Send + 'b>> {
 		Box::pin(async move {
 			match plan {
 				LogicalPlan::Scan { table, projection } => {
@@ -98,13 +119,16 @@ impl<'a> Binder<'a> {
 						})
 						.transpose()?;
 
-					Ok(scan_plan(binding, projection))
+					let plan = scan_plan(binding, projection);
+					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
 				LogicalPlan::ScanNamed { table, projection } => {
 					if is_information_schema_namespace(table) {
-						return self
+						let plan = self
 							.bind_information_schema_relation(table, projection.as_ref())
-							.await;
+							.await?;
+						let scope = RelationScope::scan(table.clone(), &plan.schema());
+						return Ok(ScopedExecutionPlan::new(plan, scope));
 					}
 					let binding = self.catalog.resolve_table(table).await?;
 					let projection = projection
@@ -120,22 +144,39 @@ impl<'a> Binder<'a> {
 						})
 						.transpose()?;
 
-					Ok(scan_plan(binding, projection))
+					let plan = scan_plan(binding, projection);
+					let scope = RelationScope::scan(table.clone(), &plan.schema());
+					Ok(ScopedExecutionPlan::new(plan, scope))
 				}
-				LogicalPlan::Alias { input, columns, .. } => {
+				LogicalPlan::Alias {
+					input,
+					alias,
+					columns,
+				} => {
 					let input = self.bind_plan(input).await?;
-					bind_alias_column_rename(input, columns)
+					let plan = bind_alias_column_rename(input.plan, columns)?;
+					let scope = RelationScope::alias(alias.clone(), &plan.schema());
+					Ok(ScopedExecutionPlan::new(plan, scope))
 				}
 				LogicalPlan::Filter { input, predicate } => {
 					let input = self.bind_plan(input).await?;
 					let bound_predicate = self
-						.bind_expr_program(std::slice::from_ref(predicate), &input.schema())
+						.bind_expr_program_scoped(
+							std::slice::from_ref(predicate),
+							&input.schema(),
+							&input.scope,
+						)
 						.await?;
 					require_single_boolean_root(&bound_predicate, "WHERE")?;
 					let logical_types = self.catalog.logical_type_registry();
-					let (plan, _) =
-						plan_filter_with_predicate_pushdown(input, bound_predicate, &logical_types);
-					Ok(plan)
+					let input_scope = input.scope.clone();
+					let (plan, _) = plan_filter_with_predicate_pushdown(
+						input.plan,
+						bound_predicate,
+						&logical_types,
+					);
+					let scope = input_scope.with_schema(plan.schema());
+					Ok(ScopedExecutionPlan::new(plan, scope))
 				}
 				LogicalPlan::Project {
 					input,
@@ -150,15 +191,19 @@ impl<'a> Binder<'a> {
 					}
 					let input = self.bind_plan(input).await?;
 					let exprs = self
-						.bind_projection_expr_program(exprs, &input.schema())
+						.bind_projection_expr_program_scoped(exprs, &input.schema(), &input.scope)
 						.await?;
 					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
+					let scope = input.scope.project(&exprs, &output_schema);
 
-					Ok(ExecutionPlan::Project {
-						input: Box::new(input),
-						exprs,
-						output_schema,
-					})
+					Ok(ScopedExecutionPlan::new(
+						ExecutionPlan::Project {
+							input: Box::new(input.plan),
+							exprs,
+							output_schema,
+						},
+						scope,
+					))
 				}
 				LogicalPlan::Aggregate {
 					input,
@@ -167,22 +212,33 @@ impl<'a> Binder<'a> {
 				} => {
 					let input = self.bind_plan(input).await?;
 					let input_schema = input.schema();
-					let group_expr = self.bind_expr_program(group_expr, &input_schema).await?;
+					let group_expr = self
+						.bind_expr_program_scoped(group_expr, &input_schema, &input.scope)
+						.await?;
 					let mut bound_aggr_expr = Vec::with_capacity(aggr_expr.len());
 					for (function, args) in aggr_expr {
 						bound_aggr_expr.push(
-							self.bind_aggregate_call(function, args, &input_schema)
-								.await?,
+							self.bind_aggregate_call_scoped(
+								function,
+								args,
+								&input_schema,
+								&input.scope,
+							)
+							.await?,
 						);
 					}
 					let output_schema = aggregate_schema(&group_expr, &bound_aggr_expr);
+					let scope = input.scope.aggregate(&group_expr, &output_schema);
 
-					Ok(ExecutionPlan::Aggregate {
-						input: Box::new(input),
-						group_expr,
-						aggr_expr: bound_aggr_expr,
-						output_schema,
-					})
+					Ok(ScopedExecutionPlan::new(
+						ExecutionPlan::Aggregate {
+							input: Box::new(input.plan),
+							group_expr,
+							aggr_expr: bound_aggr_expr,
+							output_schema,
+						},
+						scope,
+					))
 				}
 				LogicalPlan::Exchange {
 					input,
@@ -191,13 +247,19 @@ impl<'a> Binder<'a> {
 				} => {
 					let input = self.bind_plan(input).await?;
 					let input_schema = input.schema();
-					let key = self.bind_expr_program(key, &input_schema).await?;
+					let key = self
+						.bind_expr_program_scoped(key, &input_schema, &input.scope)
+						.await?;
+					let scope = input.scope.with_schema(input_schema);
 
-					Ok(ExecutionPlan::Exchange {
-						input: Box::new(input),
-						partition_count: *partition_count,
-						key,
-					})
+					Ok(ScopedExecutionPlan::new(
+						ExecutionPlan::Exchange {
+							input: Box::new(input.plan),
+							partition_count: *partition_count,
+							key,
+						},
+						scope,
+					))
 				}
 				LogicalPlan::Sort {
 					input,
@@ -207,24 +269,32 @@ impl<'a> Binder<'a> {
 				} => {
 					let input = self.bind_plan(input).await?;
 					let output_schema = input.schema();
-					let order_by = bind_sort_keys(order_by, &output_schema)?;
+					let order_by = bind_sort_keys(order_by, &output_schema, &input.scope)?;
+					let scope = input.scope.with_schema(output_schema.clone());
 
-					Ok(ExecutionPlan::Sort {
-						input: Box::new(input),
-						order_by,
-						limit: *limit,
-						offset: *offset,
-						output_schema,
-					})
+					Ok(ScopedExecutionPlan::new(
+						ExecutionPlan::Sort {
+							input: Box::new(input.plan),
+							order_by,
+							limit: *limit,
+							offset: *offset,
+							output_schema,
+						},
+						scope,
+					))
 				}
 				LogicalPlan::Take { input, limit } => {
 					let input = self.bind_plan(input).await?;
 					let output_schema = input.schema();
-					Ok(ExecutionPlan::Take {
-						input: Box::new(input),
-						limit: *limit,
-						output_schema,
-					})
+					let scope = input.scope.with_schema(output_schema.clone());
+					Ok(ScopedExecutionPlan::new(
+						ExecutionPlan::Take {
+							input: Box::new(input.plan),
+							limit: *limit,
+							output_schema,
+						},
+						scope,
+					))
 				}
 				LogicalPlan::Join {
 					left,
@@ -240,41 +310,49 @@ impl<'a> Binder<'a> {
 					if_not_exists,
 					or_replace,
 				} => {
-					self.bind_create_table(name, schema, row_identity, *if_not_exists, *or_replace)
-						.await
+					let plan = self
+						.bind_create_table(name, schema, row_identity, *if_not_exists, *or_replace)
+						.await?;
+					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
 				LogicalPlan::CreateLogicalType {
 					name,
 					physical,
 					refinement,
-				} => Ok(ExecutionPlan::CreateLogicalType {
-					name: name.clone(),
-					physical: physical.clone(),
-					refinement: refinement.clone(),
-				}),
+				} => Ok(ScopedExecutionPlan::empty_scope(
+					ExecutionPlan::CreateLogicalType {
+						name: name.clone(),
+						physical: physical.clone(),
+						refinement: refinement.clone(),
+					},
+				)),
 				LogicalPlan::CreateTableAsSelect {
 					table,
 					if_not_exists,
 					or_replace,
 					source,
 				} => {
-					self.bind_create_table_as_select(table, *if_not_exists, *or_replace, source)
-						.await
+					let plan = self
+						.bind_create_table_as_select(table, *if_not_exists, *or_replace, source)
+						.await?;
+					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
 				LogicalPlan::DropTable { name, if_exists } => {
 					reject_information_schema_target(name)?;
-					Ok(ExecutionPlan::DropTable {
+					Ok(ScopedExecutionPlan::empty_scope(ExecutionPlan::DropTable {
 						name: name.clone(),
 						if_exists: *if_exists,
-					})
+					}))
 				}
 				LogicalPlan::Delete {
 					table,
 					predicate,
 					returning,
 				} => {
-					self.bind_delete(table, predicate.as_ref(), returning.as_ref())
-						.await
+					let plan = self
+						.bind_delete(table, predicate.as_ref(), returning.as_ref())
+						.await?;
+					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
 				LogicalPlan::Update {
 					table,
@@ -282,8 +360,10 @@ impl<'a> Binder<'a> {
 					predicate,
 					returning,
 				} => {
-					self.bind_update(table, assignments, predicate.as_ref(), returning.as_ref())
-						.await
+					let plan = self
+						.bind_update(table, assignments, predicate.as_ref(), returning.as_ref())
+						.await?;
+					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
 				LogicalPlan::Insert {
 					table,
@@ -291,8 +371,10 @@ impl<'a> Binder<'a> {
 					rows,
 					returning,
 				} => {
-					self.bind_insert(table, columns.as_deref(), rows, returning.as_ref())
-						.await
+					let plan = self
+						.bind_insert(table, columns.as_deref(), rows, returning.as_ref())
+						.await?;
+					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
 				LogicalPlan::InsertSelect {
 					table,
@@ -300,8 +382,10 @@ impl<'a> Binder<'a> {
 					source,
 					returning,
 				} => {
-					self.bind_insert_select(table, columns.as_deref(), source, returning.as_ref())
-						.await
+					let plan = self
+						.bind_insert_select(table, columns.as_deref(), source, returning.as_ref())
+						.await?;
+					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
 			}
 		})
@@ -347,15 +431,27 @@ impl<'a> Binder<'a> {
 		})
 	}
 
-	async fn bind_expr_program(
+	async fn bind_expr_program_scoped(
 		&self,
 		exprs: &[Expr],
 		input_schema: &SchemaRef,
+		scope: &RelationScope,
+	) -> Result<BoundExprProgram, BindingError> {
+		self.bind_expr_program_with_scope(exprs, input_schema, Some(scope))
+			.await
+	}
+
+	async fn bind_expr_program_with_scope(
+		&self,
+		exprs: &[Expr],
+		input_schema: &SchemaRef,
+		relation_scope: Option<&RelationScope>,
 	) -> Result<BoundExprProgram, BindingError> {
 		let logical_casts = self.resolve_logical_casts(exprs).await?;
 		let ctx = ExprBindContext {
 			config: self.config,
 			logical_casts: &logical_casts,
+			relation_scope,
 		};
 		bind_expr_program(exprs, input_schema, &ctx)
 	}
@@ -365,10 +461,31 @@ impl<'a> Binder<'a> {
 		exprs: &[Expr],
 		input_schema: &SchemaRef,
 	) -> Result<BoundExprProgram, BindingError> {
+		self.bind_projection_expr_program_with_scope(exprs, input_schema, None)
+			.await
+	}
+
+	async fn bind_projection_expr_program_scoped(
+		&self,
+		exprs: &[Expr],
+		input_schema: &SchemaRef,
+		scope: &RelationScope,
+	) -> Result<BoundExprProgram, BindingError> {
+		self.bind_projection_expr_program_with_scope(exprs, input_schema, Some(scope))
+			.await
+	}
+
+	async fn bind_projection_expr_program_with_scope(
+		&self,
+		exprs: &[Expr],
+		input_schema: &SchemaRef,
+		relation_scope: Option<&RelationScope>,
+	) -> Result<BoundExprProgram, BindingError> {
 		let logical_casts = self.resolve_logical_casts(exprs).await?;
 		let ctx = ExprBindContext {
 			config: self.config,
 			logical_casts: &logical_casts,
+			relation_scope,
 		};
 		bind_expr_program_with_null_policy(
 			exprs,
@@ -378,16 +495,29 @@ impl<'a> Binder<'a> {
 		)
 	}
 
-	async fn bind_aggregate_call(
+	async fn bind_aggregate_call_scoped(
 		&self,
 		function: &AggregateFunction,
 		args: &[Expr],
 		input_schema: &SchemaRef,
+		scope: &RelationScope,
+	) -> Result<BoundAggregateCall, BindingError> {
+		self.bind_aggregate_call_with_scope(function, args, input_schema, Some(scope))
+			.await
+	}
+
+	async fn bind_aggregate_call_with_scope(
+		&self,
+		function: &AggregateFunction,
+		args: &[Expr],
+		input_schema: &SchemaRef,
+		relation_scope: Option<&RelationScope>,
 	) -> Result<BoundAggregateCall, BindingError> {
 		let logical_casts = self.resolve_logical_casts(args).await?;
 		let ctx = ExprBindContext {
 			config: self.config,
 			logical_casts: &logical_casts,
+			relation_scope,
 		};
 		bind_aggregate_call(function, args, input_schema, &ctx)
 	}
@@ -420,6 +550,7 @@ impl<'a> Binder<'a> {
 	) -> Result<ExecutionPlan, BindingError> {
 		reject_information_schema_target(table)?;
 		let source = self.bind_plan(source).await?;
+		let source = source.plan;
 		let source_schema = source.schema();
 		let schema = infer_ctas_schema(&source_schema)?;
 
@@ -443,10 +574,15 @@ impl<'a> Binder<'a> {
 		let returning = self
 			.bind_returning_projection(returning, &binding.schema)
 			.await?;
+		let table_scope = RelationScope::scan(table.clone(), &binding.schema);
 		let bound_predicate = match predicate {
 			Some(expr) => {
 				let program = self
-					.bind_expr_program(std::slice::from_ref(expr), &binding.schema)
+					.bind_expr_program_scoped(
+						std::slice::from_ref(expr),
+						&binding.schema,
+						&table_scope,
+					)
 					.await?;
 				require_single_boolean_root(&program, "DELETE WHERE")?;
 				Some(program)
@@ -582,6 +718,7 @@ impl<'a> Binder<'a> {
 		let target_columns = resolve_insert_target_columns(&schema, columns)?;
 		validate_omitted_insert_target_columns(&schema, &target_columns)?;
 		let source = self.bind_plan(source).await?;
+		let source = source.plan;
 		let source_schema = source.schema();
 		if source_schema.fields().len() != target_columns.len() {
 			return Err(BindingError::TypeMismatch {
@@ -645,6 +782,7 @@ impl<'a> Binder<'a> {
 		}
 
 		let schema = binding.schema.clone();
+		let table_scope = RelationScope::scan(table.clone(), &schema);
 		let returning = self.bind_returning_projection(returning, &schema).await?;
 		let mut seen = HashSet::new();
 		let mut assigned = HashMap::new();
@@ -687,13 +825,13 @@ impl<'a> Binder<'a> {
 		let scan = scan_plan(binding.clone(), None);
 		let (project_input, profile_hint) = match predicate {
 			Some(predicate) => {
-				self.bind_update_source_for_predicate(scan, predicate, &schema)
+				self.bind_update_source_for_predicate(scan, predicate, &schema, &table_scope)
 					.await?
 			}
 			None => bind_update_source_for_all_rows(scan),
 		};
 		let exprs = self
-			.bind_expr_program(&source_exprs, &project_input.schema())
+			.bind_expr_program_scoped(&source_exprs, &project_input.schema(), &table_scope)
 			.await?;
 		let output_schema = schema_for_exprs_with_output_names(&exprs, &output_names);
 
@@ -786,17 +924,15 @@ impl<'a> Binder<'a> {
 		kind: JoinKind,
 		on: &[(Expr, Expr)],
 		strategy: JoinStrategy,
-	) -> Result<ExecutionPlan, BindingError> {
+	) -> Result<ScopedExecutionPlan, BindingError> {
 		let left_plan = self.bind_plan(left).await?;
 		let right_plan = self.bind_plan(right).await?;
-		let left_scope = Scope::from_plan(left, &left_plan.schema());
-		let right_scope = Scope::from_plan(right, &right_plan.schema());
 		let mut left_keys = Vec::new();
 		let mut right_keys = Vec::new();
 
 		for (left_expr, right_expr) in on {
 			let (left_key, right_key) =
-				bind_join_key_pair(left_expr, right_expr, &left_scope, &right_scope)?;
+				bind_join_key_pair(left_expr, right_expr, &left_plan.scope, &right_plan.scope)?;
 			validate_join_key_types(&left_key, &right_key)?;
 			left_keys.push(left_key.column.ordinal);
 			right_keys.push(right_key.column.ordinal);
@@ -805,21 +941,26 @@ impl<'a> Binder<'a> {
 		validate_strategy_shape(
 			kind,
 			strategy,
-			&left_plan,
-			&right_plan,
+			&left_plan.plan,
+			&right_plan.plan,
 			&left_keys,
 			&right_keys,
 		)?;
+		let output_schema = join_schema(kind, &left_plan.schema(), &right_plan.schema());
+		let scope = RelationScope::join(kind, &left_plan.scope, &right_plan.scope, &output_schema);
 
-		Ok(ExecutionPlan::Join {
-			left: Box::new(left_plan),
-			right: Box::new(right_plan),
-			kind,
-			left_keys,
-			right_keys,
-			strategy,
-			output_schema: join_schema(kind, &left_scope.schema, &right_scope.schema),
-		})
+		Ok(ScopedExecutionPlan::new(
+			ExecutionPlan::Join {
+				left: Box::new(left_plan.plan),
+				right: Box::new(right_plan.plan),
+				kind,
+				left_keys,
+				right_keys,
+				strategy,
+				output_schema,
+			},
+			scope,
+		))
 	}
 
 	async fn bind_update_source_for_predicate(
@@ -827,9 +968,10 @@ impl<'a> Binder<'a> {
 		scan: ExecutionPlan,
 		predicate: &Expr,
 		schema: &SchemaRef,
+		scope: &RelationScope,
 	) -> Result<(ExecutionPlan, QueryProfileHint), BindingError> {
 		let bound_predicate = self
-			.bind_expr_program(std::slice::from_ref(predicate), schema)
+			.bind_expr_program_scoped(std::slice::from_ref(predicate), schema, scope)
 			.await?;
 		require_single_boolean_root(&bound_predicate, "UPDATE WHERE")?;
 		let logical_types = self.catalog.logical_type_registry();
@@ -1208,6 +1350,7 @@ fn is_supported_ctas_column_type(data_type: &DataType) -> bool {
 fn bind_sort_keys(
 	order_by: &[SortExpr],
 	output_schema: &SchemaRef,
+	scope: &RelationScope,
 ) -> Result<Vec<ExecutionSortKey>, BindingError> {
 	if order_by.is_empty() {
 		return Err(BindingError::UnsupportedExpression {
@@ -1218,7 +1361,7 @@ fn bind_sort_keys(
 	let mut keys = Vec::with_capacity(order_by.len() + output_schema.fields().len());
 	let mut user_ordinals = BTreeSet::new();
 	for key in order_by {
-		let ordinal = bind_sort_key_ordinal(&key.expr, output_schema)?;
+		let ordinal = bind_sort_key_ordinal(&key.expr, output_schema, scope)?;
 		user_ordinals.insert(ordinal);
 		keys.push(ExecutionSortKey {
 			ordinal,
@@ -1243,13 +1386,12 @@ fn bind_sort_keys(
 fn bind_sort_key_ordinal(
 	expr: &Expr,
 	output_schema: &SchemaRef,
+	scope: &RelationScope,
 ) -> Result<ColumnOrdinal, BindingError> {
 	match expr {
 		Expr::Column(column_ref) => {
 			if column_ref.qualifier.is_some() {
-				return Err(BindingError::UnsupportedExpression {
-					message: "ORDER BY only supports unqualified output column names".to_string(),
-				});
+				return Ok(resolve_qualified_column(column_ref, scope)?.column.ordinal);
 			}
 			Ok(resolve_column(&column_ref.name.0, output_schema)?.ordinal)
 		}
@@ -3112,35 +3254,159 @@ fn literal_is_non_null(value: &ScalarValue) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct Scope {
+struct RelationScope {
 	schema: SchemaRef,
-	qualifiers: Vec<TableRef>,
+	entries: Vec<RelationScopeEntry>,
+	next_source_id: usize,
 }
 
-impl Scope {
-	fn from_plan(plan: &LogicalPlan, schema: &SchemaRef) -> Self {
-		let mut qualifiers = Vec::new();
-		collect_qualifiers(plan, &mut qualifiers);
+#[derive(Debug, Clone)]
+struct RelationScopeEntry {
+	qualifier: TableRef,
+	column: String,
+	ordinal: ColumnOrdinal,
+	source_id: usize,
+}
+
+impl RelationScope {
+	fn empty(schema: SchemaRef) -> Self {
+		Self {
+			schema,
+			entries: Vec::new(),
+			next_source_id: 0,
+		}
+	}
+
+	fn scan(qualifier: TableRef, schema: &SchemaRef) -> Self {
+		Self::single_source(qualifier, schema)
+	}
+
+	fn alias(qualifier: TableRef, schema: &SchemaRef) -> Self {
+		Self::single_source(qualifier, schema)
+	}
+
+	fn single_source(qualifier: TableRef, schema: &SchemaRef) -> Self {
+		let entries = schema
+			.fields()
+			.iter()
+			.enumerate()
+			.map(|(idx, field)| RelationScopeEntry {
+				qualifier: qualifier.clone(),
+				column: field.name().clone(),
+				ordinal: ColumnOrdinal(u32::try_from(idx).expect("column ordinal overflow")),
+				source_id: 0,
+			})
+			.collect();
 		Self {
 			schema: schema.clone(),
-			qualifiers,
+			entries,
+			next_source_id: 1,
+		}
+	}
+
+	fn with_schema(&self, schema: SchemaRef) -> Self {
+		let mut scope = self.clone();
+		scope.schema = schema;
+		scope
+	}
+
+	fn project(&self, exprs: &BoundExprProgram, output_schema: &SchemaRef) -> Self {
+		let mut entries = Vec::new();
+		for (output_idx, root) in exprs.roots.iter().enumerate() {
+			let Some(BoundExprNode::Column(column)) = exprs.node(*root) else {
+				continue;
+			};
+			let output_field = output_schema.field(output_idx);
+			let output_ordinal =
+				ColumnOrdinal(u32::try_from(output_idx).expect("column ordinal overflow"));
+			for entry in self
+				.entries
+				.iter()
+				.filter(|entry| entry.ordinal == column.ordinal)
+			{
+				entries.push(RelationScopeEntry {
+					qualifier: entry.qualifier.clone(),
+					column: output_field.name().clone(),
+					ordinal: output_ordinal,
+					source_id: entry.source_id,
+				});
+			}
+		}
+		Self {
+			schema: output_schema.clone(),
+			entries,
+			next_source_id: self.next_source_id,
+		}
+	}
+
+	fn aggregate(&self, group_expr: &BoundExprProgram, output_schema: &SchemaRef) -> Self {
+		let mut entries = Vec::new();
+		for (output_idx, root) in group_expr.roots.iter().enumerate() {
+			let Some(BoundExprNode::Column(column)) = group_expr.node(*root) else {
+				continue;
+			};
+			let output_field = output_schema.field(output_idx);
+			let output_ordinal =
+				ColumnOrdinal(u32::try_from(output_idx).expect("column ordinal overflow"));
+			for entry in self
+				.entries
+				.iter()
+				.filter(|entry| entry.ordinal == column.ordinal)
+			{
+				entries.push(RelationScopeEntry {
+					qualifier: entry.qualifier.clone(),
+					column: output_field.name().clone(),
+					ordinal: output_ordinal,
+					source_id: entry.source_id,
+				});
+			}
+		}
+		Self {
+			schema: output_schema.clone(),
+			entries,
+			next_source_id: self.next_source_id,
+		}
+	}
+
+	fn join(
+		kind: JoinKind,
+		left: &RelationScope,
+		right: &RelationScope,
+		output_schema: &SchemaRef,
+	) -> Self {
+		match kind {
+			JoinKind::LeftSemi | JoinKind::LeftAnti => left.with_schema(output_schema.clone()),
+			JoinKind::RightSemi | JoinKind::RightAnti => right.with_schema(output_schema.clone()),
+			JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+				let mut entries = left.entries.clone();
+				let right_offset = ColumnOrdinal(
+					u32::try_from(left.schema.fields().len()).expect("column ordinal overflow"),
+				);
+				entries.extend(right.entries.iter().map(|entry| RelationScopeEntry {
+					qualifier: entry.qualifier.clone(),
+					column: entry.column.clone(),
+					ordinal: ColumnOrdinal(entry.ordinal.0 + right_offset.0),
+					source_id: entry.source_id + left.next_source_id,
+				}));
+				Self {
+					schema: output_schema.clone(),
+					entries,
+					next_source_id: left.next_source_id + right.next_source_id,
+				}
+			}
 		}
 	}
 
 	fn resolve_join_column(
 		&self,
-		column_ref: &crate::ir::ColumnRef,
+		column_ref: &ColumnRef,
 		side: &'static str,
 	) -> Result<Option<ResolvedLogicalColumn>, BindingError> {
-		if let Some(qualifier) = &column_ref.qualifier {
-			if !self
-				.qualifiers
-				.iter()
-				.any(|candidate| candidate == qualifier)
-			{
+		if column_ref.qualifier.is_some() {
+			if !self.contains_qualifier(column_ref.qualifier.as_ref().expect("checked")) {
 				return Ok(None);
 			}
-			return resolve_logical_column(&column_ref.name.0, &self.schema).map(Some);
+			return resolve_qualified_column(column_ref, self).map(Some);
 		}
 
 		match resolve_logical_column(&column_ref.name.0, &self.schema) {
@@ -3156,48 +3422,82 @@ impl Scope {
 			other => other,
 		})
 	}
+
+	fn contains_qualifier(&self, qualifier: &TableRef) -> bool {
+		self.entries
+			.iter()
+			.any(|entry| &entry.qualifier == qualifier)
+	}
 }
 
-fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
-	match plan {
-		LogicalPlan::Scan { .. } => {}
-		LogicalPlan::ScanNamed { table, .. } => qualifiers.push(table.clone()),
-		LogicalPlan::Alias { input, alias, .. } => {
-			collect_qualifiers(input, qualifiers);
-			qualifiers.push(alias.clone());
-		}
-		LogicalPlan::Filter { input, .. }
-		| LogicalPlan::Project { input, .. }
-		| LogicalPlan::Aggregate { input, .. }
-		| LogicalPlan::Exchange { input, .. }
-		| LogicalPlan::Sort { input, .. }
-		| LogicalPlan::Take { input, .. } => collect_qualifiers(input, qualifiers),
-		LogicalPlan::Join {
-			left, right, kind, ..
-		} => match kind {
-			JoinKind::LeftSemi | JoinKind::LeftAnti => collect_qualifiers(left, qualifiers),
-			JoinKind::RightSemi | JoinKind::RightAnti => collect_qualifiers(right, qualifiers),
-			JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
-				collect_qualifiers(left, qualifiers);
-				collect_qualifiers(right, qualifiers);
-			}
-		},
-		LogicalPlan::CreateTable { .. }
-		| LogicalPlan::CreateLogicalType { .. }
-		| LogicalPlan::CreateTableAsSelect { .. }
-		| LogicalPlan::DropTable { .. }
-		| LogicalPlan::Delete { .. }
-		| LogicalPlan::Update { .. }
-		| LogicalPlan::Insert { .. }
-		| LogicalPlan::InsertSelect { .. } => {}
+fn resolve_qualified_column(
+	column_ref: &ColumnRef,
+	scope: &RelationScope,
+) -> Result<ResolvedLogicalColumn, BindingError> {
+	let Some(qualifier) = &column_ref.qualifier else {
+		return resolve_logical_column(&column_ref.name.0, &scope.schema);
+	};
+	let qualifier_entries = scope
+		.entries
+		.iter()
+		.filter(|entry| &entry.qualifier == qualifier)
+		.collect::<Vec<_>>();
+	if qualifier_entries.is_empty() {
+		return Err(BindingError::UnknownTableRef {
+			qualifier: table_name(qualifier),
+		});
 	}
+	let source_count = qualifier_entries
+		.iter()
+		.map(|entry| entry.source_id)
+		.collect::<BTreeSet<_>>()
+		.len();
+	if source_count > 1 {
+		return Err(BindingError::AmbiguousTableRef {
+			qualifier: table_name(qualifier),
+			found_in: qualifier_entries
+				.iter()
+				.map(|entry| entry.source_id.to_string())
+				.collect::<BTreeSet<_>>()
+				.into_iter()
+				.collect(),
+		});
+	}
+	let column_entries = qualifier_entries
+		.iter()
+		.filter(|entry| entry.column == column_ref.name.0)
+		.collect::<Vec<_>>();
+	let [entry] = column_entries.as_slice() else {
+		if column_entries.is_empty() {
+			return Err(BindingError::UnknownColumnInRelation {
+				qualifier: table_name(qualifier),
+				column: column_ref.name.0.clone(),
+				available: qualifier_entries
+					.iter()
+					.map(|entry| entry.column.clone())
+					.collect::<BTreeSet<_>>()
+					.into_iter()
+					.collect(),
+			});
+		}
+		return Err(BindingError::AmbiguousColumnRef {
+			name: format!("{}.{}", table_name(qualifier), column_ref.name.0),
+			found_in: column_entries
+				.iter()
+				.map(|entry| entry.source_id.to_string())
+				.collect::<BTreeSet<_>>()
+				.into_iter()
+				.collect(),
+		});
+	};
+	resolved_logical_column_at_ordinal(&scope.schema, entry.ordinal)
 }
 
 fn bind_join_key_pair(
 	left_expr: &Expr,
 	right_expr: &Expr,
-	left_scope: &Scope,
-	right_scope: &Scope,
+	left_scope: &RelationScope,
+	right_scope: &RelationScope,
 ) -> Result<(ResolvedJoinKey, ResolvedJoinKey), BindingError> {
 	let (left_ref, left_logical_type) = join_key_column_ref(left_expr)?;
 	let (right_ref, right_logical_type) = join_key_column_ref(right_expr)?;
@@ -3240,9 +3540,7 @@ struct ResolvedLogicalColumn {
 	logical_type: LogicalTypeId,
 }
 
-fn join_key_column_ref(
-	expr: &Expr,
-) -> Result<(&crate::ir::ColumnRef, LogicalTypeId), BindingError> {
+fn join_key_column_ref(expr: &Expr) -> Result<(&ColumnRef, LogicalTypeId), BindingError> {
 	match expr {
 		Expr::Column(column_ref) => Ok((column_ref, LogicalTypeId::NAKED)),
 		Expr::LogicalAscription { expr, logical_type } => match expr.as_ref() {
@@ -3279,9 +3577,9 @@ enum JoinColumnResolution {
 }
 
 fn resolve_join_column_across(
-	column_ref: &crate::ir::ColumnRef,
-	left_scope: &Scope,
-	right_scope: &Scope,
+	column_ref: &ColumnRef,
+	left_scope: &RelationScope,
+	right_scope: &RelationScope,
 ) -> Result<JoinColumnResolution, BindingError> {
 	let left = left_scope.resolve_join_column(column_ref, "left")?;
 	let right = right_scope.resolve_join_column(column_ref, "right")?;
@@ -4629,7 +4927,7 @@ fn bind_expr_into_program(
 ) -> Result<BoundExprId, BindingError> {
 	match expr {
 		Expr::Column(column_ref) => {
-			let column = resolve_logical_column(&column_ref.name.0, input_schema)?;
+			let column = resolve_expr_column(column_ref, input_schema, ctx.relation_scope)?;
 			let node = builder.append_column(column.column);
 			if !builder.set_node_logical_type(node, column.logical_type) {
 				return Err(BindingError::UnsupportedExpression {
@@ -5720,18 +6018,47 @@ fn resolve_column(name: &str, input_schema: &SchemaRef) -> Result<ResolvedColumn
 	})
 }
 
+fn resolve_expr_column(
+	column_ref: &ColumnRef,
+	input_schema: &SchemaRef,
+	relation_scope: Option<&RelationScope>,
+) -> Result<ResolvedLogicalColumn, BindingError> {
+	if column_ref.qualifier.is_none() {
+		return resolve_logical_column(&column_ref.name.0, input_schema);
+	}
+	let Some(scope) = relation_scope else {
+		return Err(BindingError::UnknownTableRef {
+			qualifier: table_name(column_ref.qualifier.as_ref().expect("checked")),
+		});
+	};
+	resolve_qualified_column(column_ref, scope)
+}
+
 fn resolve_logical_column(
 	name: &str,
 	input_schema: &SchemaRef,
 ) -> Result<ResolvedLogicalColumn, BindingError> {
 	let column = resolve_column(name, input_schema)?;
-	let field = input_schema.field(column.ordinal.0 as usize);
+	resolved_logical_column_at_ordinal(input_schema, column.ordinal)
+}
+
+fn resolved_logical_column_at_ordinal(
+	input_schema: &SchemaRef,
+	ordinal: ColumnOrdinal,
+) -> Result<ResolvedLogicalColumn, BindingError> {
+	let field = input_schema.field(ordinal.0 as usize);
 	let logical_type =
 		decode_column_logical_type(field).map_err(|error| BindingError::UnsupportedExpression {
 			message: error.to_string(),
 		})?;
 	Ok(ResolvedLogicalColumn {
-		column,
+		column: ResolvedColumn {
+			name: ColumnName(field.name().clone()),
+			ordinal,
+			data_type: field.data_type().clone(),
+			nullable: field.is_nullable(),
+			pbc_eligible: is_pbc_eligible_type(field.data_type()),
+		},
 		logical_type,
 	})
 }

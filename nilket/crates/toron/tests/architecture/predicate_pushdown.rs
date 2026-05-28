@@ -712,11 +712,15 @@ pub(crate) fn adr075_partial_pushdown_covers_select_update_delete_scan_sites() {
 	let delete_test =
 		std::fs::read_to_string(manifest_dir().join("tests/delete_test.rs")).expect("read delete");
 
-	assert!(
-		binder.contains(
-			"plan_filter_with_predicate_pushdown(input, bound_predicate, &logical_types)"
-		)
-	);
+	let filter_arm = binder
+		.split("LogicalPlan::Filter { input, predicate } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Project").next())
+		.expect("Filter bind arm");
+	assert!(filter_arm.contains("plan_filter_with_predicate_pushdown("));
+	assert!(filter_arm.contains("input.plan"));
+	assert!(filter_arm.contains("bound_predicate"));
+	assert!(filter_arm.contains("&logical_types"));
 	let update_helper = first_block(&binder, "async fn bind_update_source_for_predicate");
 	assert!(update_helper.contains("self.catalog.logical_type_registry()"));
 	assert!(update_helper.contains("plan_filter_with_predicate_pushdown("));
@@ -1005,11 +1009,15 @@ pub(crate) fn adr078_select_update_delete_share_boolean_factoring_path() {
 	let delete_test =
 		std::fs::read_to_string(manifest_dir().join("tests/delete_test.rs")).expect("read delete");
 
-	assert!(
-		binder.contains(
-			"plan_filter_with_predicate_pushdown(input, bound_predicate, &logical_types)"
-		)
-	);
+	let filter_arm = binder
+		.split("LogicalPlan::Filter { input, predicate } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Project").next())
+		.expect("Filter bind arm");
+	assert!(filter_arm.contains("plan_filter_with_predicate_pushdown("));
+	assert!(filter_arm.contains("input.plan"));
+	assert!(filter_arm.contains("bound_predicate"));
+	assert!(filter_arm.contains("&logical_types"));
 	let update_helper = first_block(&binder, "async fn bind_update_source_for_predicate");
 	assert!(update_helper.contains("self.catalog.logical_type_registry()"));
 	assert!(update_helper.contains("plan_filter_with_predicate_pushdown("));
@@ -1822,7 +1830,7 @@ pub(crate) fn adr100_no_projected_scan_receipt_until_elision_has_a_consumer() {
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 
 	assert!(bind_entry.contains("bind_plan(plan).await?"));
-	assert!(bind_entry.contains("push_down_scan_projection(plan)"));
+	assert!(bind_entry.contains("push_down_scan_projection(plan.plan)"));
 	assert!(receipt.contains("projection: None"));
 	assert!(!receipt.contains("projection: Some"));
 }
@@ -1900,8 +1908,8 @@ pub(crate) fn adr104_binder_alias_columns_build_ordinal_identity_project() {
 	let bind_plan = first_block(&binder, "fn bind_plan");
 	let helper = first_block(&binder, "fn bind_alias_column_rename");
 
-	assert!(bind_plan.contains("LogicalPlan::Alias { input, columns, .. }"));
-	assert!(bind_plan.contains("bind_alias_column_rename(input, columns)"));
+	assert!(bind_plan.contains("LogicalPlan::Alias {"));
+	assert!(bind_plan.contains("bind_alias_column_rename(input.plan, columns)"));
 	assert!(helper.contains("columns.len() != schema.fields().len()"));
 	assert!(helper.contains("BoundExprProgramBuilder::new()"));
 	assert!(helper.contains("decode_column_logical_type(field)"));
@@ -2023,7 +2031,7 @@ pub(crate) fn adr105_project_coalescing_lives_in_existing_post_bind_optimizer() 
 	let bind_entry = first_block(&binder, "pub async fn bind");
 	let optimizer = first_block(&binder, "fn optimize_for_required");
 
-	assert!(bind_entry.contains("push_down_scan_projection(plan)"));
+	assert!(bind_entry.contains("push_down_scan_projection(plan.plan)"));
 	assert!(optimizer.contains("collapse_adjacent_identity_project(input, exprs, output_schema)"));
 }
 
@@ -2218,8 +2226,8 @@ pub(crate) fn adr106_alias_column_rename_remains_generic_bound_project() {
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
 
 	assert!(lower_derived.contains("alias_plan(plan, Some(alias))"));
-	assert!(bind_plan.contains("LogicalPlan::Alias { input, columns, .. }"));
-	assert!(bind_plan.contains("bind_alias_column_rename(input, columns)"));
+	assert!(bind_plan.contains("LogicalPlan::Alias {"));
+	assert!(bind_plan.contains("bind_alias_column_rename(input.plan, columns)"));
 	assert!(helper.contains("ExecutionPlan::Project"));
 	assert!(logical_type_ddl.contains("aggregate_derived_alias_columns_rename_outputs"));
 	for marker in [

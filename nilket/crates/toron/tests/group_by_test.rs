@@ -398,15 +398,19 @@ fn group_by_accepts_only_stable_aggregate_set() {
 }
 
 #[test]
-fn group_by_keys_must_be_simple_unqualified_input_columns() {
+fn group_by_keys_must_be_simple_input_columns() {
 	for sql in [
-		"SELECT region, COUNT(*) FROM sales GROUP BY sales.region",
 		"SELECT region, COUNT(*) FROM sales GROUP BY 1",
 		"SELECT region, COUNT(*) FROM sales GROUP BY region + 1",
-		"SELECT sales.region, COUNT(*) FROM sales GROUP BY region",
 	] {
 		assert_unsupported(sql);
 	}
+}
+
+#[test]
+fn qualified_group_by_keys_and_projections_lower() {
+	plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY sales.region");
+	plan_sql("SELECT sales.region, COUNT(*) FROM sales GROUP BY region");
 }
 
 #[test]
@@ -660,10 +664,18 @@ fn having_aggregate_call_argument_not_in_select_is_hidden_when_names_do_not_coll
 	let plan =
 		plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING SUM(amount) > 1000");
 	assert_project_over_aggregate(&plan);
-	assert_unsupported_message(
+	let qualified = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(sales.amount) > 10",
-		"qualified HAVING column references are not supported",
 	);
+	let LogicalPlan::Filter { input, predicate } = qualified else {
+		panic!("expected qualified HAVING aggregate to rewrite to filter");
+	};
+	assert!(matches!(input.as_ref(), LogicalPlan::Aggregate { .. }));
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+	));
 }
 
 #[test]
@@ -798,12 +810,17 @@ fn scalar_aggregate_having_not_in_select_is_computed_and_dropped() {
 	assert_project_over_aggregate(&plan);
 }
 
-#[test]
-fn scalar_aggregate_having_qualified_reference_rejects() {
-	assert_unsupported_message(
-		"SELECT SUM(amount) FROM sales HAVING t.amount > 0",
-		"qualified HAVING column references are not supported",
-	);
+#[tokio::test]
+async fn scalar_aggregate_having_unknown_qualified_reference_rejects_at_bind() {
+	let logical = plan_sql("SELECT SUM(amount) FROM sales HAVING t.amount > 0");
+	let (catalog, _) = fixture();
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("unknown HAVING qualifier should reject at bind");
+	assert!(matches!(
+		err,
+		BindingError::UnknownTableRef { qualifier } if qualifier == "t"
+	));
 }
 
 #[test]
@@ -910,12 +927,18 @@ fn order_by_aggregate_call_ambiguity_is_rejected() {
 	}
 }
 
-#[test]
-fn having_qualified_column_reference_is_rejected() {
-	assert_unsupported_message(
-		"SELECT region, COUNT(*) FROM sales GROUP BY region HAVING t.region = 'EMEA'",
-		"qualified HAVING column references are not supported",
-	);
+#[tokio::test]
+async fn having_unknown_qualified_column_reference_rejects_at_bind() {
+	let logical =
+		plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING t.region = 'EMEA'");
+	let (catalog, _) = fixture();
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("unknown HAVING qualifier should reject at bind");
+	assert!(matches!(
+		err,
+		BindingError::UnknownTableRef { qualifier } if qualifier == "t"
+	));
 }
 
 #[test]
@@ -1884,7 +1907,7 @@ async fn order_by_alias_and_literal_only_computed_keys_execute() {
 fn order_by_computed_aggregate_refs_must_be_visible_outputs() {
 	for sql in [
 		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY amount + 1",
-		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY sales.region + 1",
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY sales.amount + 1",
 	] {
 		assert_unsupported_message(
 			sql,

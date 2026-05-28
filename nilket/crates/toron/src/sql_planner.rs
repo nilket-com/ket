@@ -2911,7 +2911,6 @@ impl SqlPlanner {
 			self.discover_select_aggregates(item, mode, &mut catalog)?;
 		}
 		if let Some(having) = having {
-			reject_qualified_having_column_references(having)?;
 			self.discover_aggregate_calls(having, mode, AggregateSource::Having, &mut catalog)?;
 		}
 		catalog.reject_having_alias_references(having)?;
@@ -2941,7 +2940,6 @@ impl SqlPlanner {
 		having: &SqlExpr,
 		scope: &AggregateOutputCatalog,
 	) -> Result<Expr, FrontendError> {
-		reject_qualified_having_column_references(having)?;
 		let rewritten = self.rewrite_grouped_aggregate_calls(having, scope, "HAVING")?;
 		self.lower_expr(&rewritten)
 	}
@@ -3160,10 +3158,6 @@ impl SqlPlanner {
 		mode: AggregateSqlMode,
 		catalog: &AggregateOutputCatalog,
 	) -> Result<LoweredAggregateProjection, FrontendError> {
-		for item in projection {
-			let (expr, _) = select_item_expr_and_alias(item)?;
-			reject_qualified_aggregate_projection_references(expr)?;
-		}
 		let has_alias = projection
 			.iter()
 			.map(select_item_expr_and_alias)
@@ -4132,7 +4126,7 @@ fn validate_hidden_sort_key_refs(
 ) -> Result<(), FrontendError> {
 	match expr {
 		Expr::Column(column) => {
-			if column.qualifier.is_some() || !visible_names.contains(&column.name.0) {
+			if !visible_names.contains(&column.name.0) {
 				return Err(unsupported(
 					"ORDER BY computed aggregate expression must reference visible output columns",
 				));
@@ -4940,54 +4934,17 @@ fn lower_group_by_key(expr: &SqlExpr) -> Result<GroupKey, FrontendError> {
 				expr: Expr::column(name),
 			})
 		}
+		SqlExpr::CompoundIdentifier(idents) if idents.len() == 2 => {
+			let qualifier = TableRef::new(idents[0].value.clone());
+			let name = idents[1].value.clone();
+			Ok(GroupKey {
+				name: name.clone(),
+				expr: Expr::qualified_column(qualifier, name),
+			})
+		}
 		_ => Err(unsupported(
-			"GROUP BY keys must be simple unqualified columns",
+			"GROUP BY keys must be simple column references",
 		)),
-	}
-}
-
-fn reject_qualified_having_column_references(expr: &SqlExpr) -> Result<(), FrontendError> {
-	match strip_nested_sql_expr(expr) {
-		SqlExpr::CompoundIdentifier(_) => Err(unsupported(
-			"qualified HAVING column references are not supported",
-		)),
-		SqlExpr::BinaryOp { left, right, .. } => {
-			reject_qualified_having_column_references(left)?;
-			reject_qualified_having_column_references(right)
-		}
-		SqlExpr::Case {
-			operand,
-			conditions,
-			else_result,
-			..
-		} => {
-			if let Some(operand) = operand {
-				reject_qualified_having_column_references(operand)?;
-			}
-			for case_when in conditions {
-				reject_qualified_having_column_references(&case_when.condition)?;
-				reject_qualified_having_column_references(&case_when.result)?;
-			}
-			if let Some(else_result) = else_result {
-				reject_qualified_having_column_references(else_result)?;
-			}
-			Ok(())
-		}
-		SqlExpr::Cast { expr, .. } => reject_qualified_having_column_references(expr),
-		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) | SqlExpr::Nested(inner) => {
-			reject_qualified_having_column_references(inner)
-		}
-		SqlExpr::Function(function) => {
-			if let FunctionArguments::List(list) = &function.args {
-				for arg in &list.args {
-					if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
-						reject_qualified_having_column_references(expr)?;
-					}
-				}
-			}
-			Ok(())
-		}
-		_ => Ok(()),
 	}
 }
 
@@ -5027,52 +4984,6 @@ fn reject_having_alias_references(
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
 		| SqlExpr::Nested(expr) => reject_having_alias_references(expr, select_aliases),
-		_ => Ok(()),
-	}
-}
-
-fn reject_qualified_aggregate_projection_references(expr: &SqlExpr) -> Result<(), FrontendError> {
-	match strip_nested_sql_expr(expr) {
-		SqlExpr::CompoundIdentifier(_) => Err(unsupported(
-			"qualified aggregate projection references are not supported",
-		)),
-		SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
-			if let FunctionArguments::List(list) = &function.args {
-				for arg in &list.args {
-					if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
-						reject_qualified_aggregate_projection_references(expr)?;
-					}
-				}
-			}
-			Ok(())
-		}
-		SqlExpr::BinaryOp { left, right, .. } => {
-			reject_qualified_aggregate_projection_references(left)?;
-			reject_qualified_aggregate_projection_references(right)
-		}
-		SqlExpr::Case {
-			operand,
-			conditions,
-			else_result,
-			..
-		} => {
-			if let Some(operand) = operand {
-				reject_qualified_aggregate_projection_references(operand)?;
-			}
-			for case_when in conditions {
-				reject_qualified_aggregate_projection_references(&case_when.condition)?;
-				reject_qualified_aggregate_projection_references(&case_when.result)?;
-			}
-			if let Some(else_result) = else_result {
-				reject_qualified_aggregate_projection_references(else_result)?;
-			}
-			Ok(())
-		}
-		SqlExpr::Cast { expr, .. } => reject_qualified_aggregate_projection_references(expr),
-		SqlExpr::UnaryOp { expr, .. }
-		| SqlExpr::IsNull(expr)
-		| SqlExpr::IsNotNull(expr)
-		| SqlExpr::Nested(expr) => reject_qualified_aggregate_projection_references(expr),
 		_ => Ok(()),
 	}
 }
@@ -5420,10 +5331,18 @@ fn aggregate_projection_matches_natural(
 		let SelectItem::UnnamedExpr(expr) = item else {
 			return Ok(false);
 		};
-		let SqlExpr::Identifier(ident) = strip_nested_sql_expr(expr) else {
+		let expr = strip_nested_sql_expr(expr);
+		if !matches!(
+			expr,
+			SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)
+		) {
 			return Ok(false);
-		};
-		if ident.value != key.name {
+		}
+		let projected = planner.lower_expr(expr)?;
+		if !expr_structural_eq(
+			&canonical_aggregate_signature_expr(&projected),
+			&canonical_aggregate_signature_expr(&key.expr),
+		) {
 			return Ok(false);
 		}
 	}
@@ -5614,11 +5533,111 @@ fn grouped_aggregate_signature(
 		aggregate_kernel::AggregateArity::One if args.len() == 1 => {
 			Some(GroupedAggregateSignature {
 				kernel,
-				args: vec![args[0].clone()],
+				args: vec![canonical_aggregate_signature_expr(&args[0])],
 			})
 		}
 		_ => None,
 	}
+}
+
+fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
+	match expr {
+		Expr::Column(column) => Expr::column(column.name.0.clone()),
+		Expr::Literal(_) | Expr::UntypedNull => expr.clone(),
+		Expr::LogicalAscription { expr, logical_type } => Expr::LogicalAscription {
+			expr: Box::new(canonical_aggregate_signature_expr(expr)),
+			logical_type: *logical_type,
+		},
+		Expr::SqlLogicalCast {
+			expr,
+			logical_name,
+			try_cast,
+		} => Expr::SqlLogicalCast {
+			expr: Box::new(canonical_aggregate_signature_expr(expr)),
+			logical_name: logical_name.clone(),
+			try_cast: *try_cast,
+		},
+		Expr::Cast(inner, data_type) => Expr::Cast(
+			Box::new(canonical_aggregate_signature_expr(inner)),
+			data_type.clone(),
+		),
+		Expr::TryCast(inner, data_type) => Expr::TryCast(
+			Box::new(canonical_aggregate_signature_expr(inner)),
+			data_type.clone(),
+		),
+		Expr::Add(left, right) => canonical_binary_signature_expr(Expr::Add, left, right),
+		Expr::Sub(left, right) => canonical_binary_signature_expr(Expr::Sub, left, right),
+		Expr::Mul(left, right) => canonical_binary_signature_expr(Expr::Mul, left, right),
+		Expr::Div(left, right) => canonical_binary_signature_expr(Expr::Div, left, right),
+		Expr::Eq(left, right) => canonical_binary_signature_expr(Expr::Eq, left, right),
+		Expr::Neq(left, right) => canonical_binary_signature_expr(Expr::Neq, left, right),
+		Expr::Lt(left, right) => canonical_binary_signature_expr(Expr::Lt, left, right),
+		Expr::Lte(left, right) => canonical_binary_signature_expr(Expr::Lte, left, right),
+		Expr::Gt(left, right) => canonical_binary_signature_expr(Expr::Gt, left, right),
+		Expr::Gte(left, right) => canonical_binary_signature_expr(Expr::Gte, left, right),
+		Expr::And(left, right) => canonical_binary_signature_expr(Expr::And, left, right),
+		Expr::Or(left, right) => canonical_binary_signature_expr(Expr::Or, left, right),
+		Expr::Not(inner) => Expr::Not(Box::new(canonical_aggregate_signature_expr(inner))),
+		Expr::InList {
+			expr,
+			list,
+			negated,
+		} => Expr::InList {
+			expr: Box::new(canonical_aggregate_signature_expr(expr)),
+			list: list
+				.iter()
+				.map(canonical_aggregate_signature_expr)
+				.collect(),
+			negated: *negated,
+		},
+		Expr::Like {
+			expr,
+			pattern,
+			negated,
+			case_insensitive,
+		} => Expr::Like {
+			expr: Box::new(canonical_aggregate_signature_expr(expr)),
+			pattern: pattern.clone(),
+			negated: *negated,
+			case_insensitive: *case_insensitive,
+		},
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => Expr::Case {
+			when_then: when_then
+				.iter()
+				.map(|(condition, result)| {
+					(
+						Box::new(canonical_aggregate_signature_expr(condition)),
+						Box::new(canonical_aggregate_signature_expr(result)),
+					)
+				})
+				.collect(),
+			else_expr: else_expr
+				.as_ref()
+				.map(|expr| Box::new(canonical_aggregate_signature_expr(expr))),
+		},
+		Expr::IsNull(inner) => Expr::IsNull(Box::new(canonical_aggregate_signature_expr(inner))),
+		Expr::IsNotNull(inner) => {
+			Expr::IsNotNull(Box::new(canonical_aggregate_signature_expr(inner)))
+		}
+		Expr::TimeBucket(interval, inner) => Expr::TimeBucket(
+			*interval,
+			Box::new(canonical_aggregate_signature_expr(inner)),
+		),
+	}
+}
+
+fn canonical_binary_signature_expr(
+	constructor: fn(Box<Expr>, Box<Expr>) -> Expr,
+	left: &Expr,
+	right: &Expr,
+) -> Expr {
+	constructor(
+		Box::new(canonical_aggregate_signature_expr(left)),
+		Box::new(canonical_aggregate_signature_expr(right)),
+	)
 }
 
 fn aggregate_function_args(function: &Function) -> Result<&[FunctionArg], FrontendError> {

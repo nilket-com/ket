@@ -93,6 +93,17 @@ pub enum BindingError {
 	AmbiguousColumnRef { name: String, found_in: Vec<String> },
 	#[error("unknown table reference: {qualifier}")]
 	UnknownTableRef { qualifier: String },
+	#[error("ambiguous table reference: {qualifier}")]
+	AmbiguousTableRef {
+		qualifier: String,
+		found_in: Vec<String>,
+	},
+	#[error("unknown column {column} in table reference {qualifier}")]
+	UnknownColumnInRelation {
+		qualifier: String,
+		column: String,
+		available: Vec<String>,
+	},
 	#[error("join predicate is not an equality predicate")]
 	JoinPredicateNotEqui,
 	#[error("join key type mismatch: left {left_type}, right {right_type}")]

@@ -900,7 +900,8 @@ pub(crate) fn adr034_binder_drop_table_is_pass_through() {
 		.and_then(|rest| rest.split("LogicalPlan::Insert").next())
 		.expect("DropTable bind arm");
 
-	assert!(drop_arm.contains("Ok(ExecutionPlan::DropTable"));
+	assert!(drop_arm.contains("ScopedExecutionPlan::empty_scope"));
+	assert!(drop_arm.contains("ExecutionPlan::DropTable"));
 	assert!(drop_arm.contains("name: name.clone()"));
 	assert!(drop_arm.contains("if_exists: *if_exists"));
 	assert!(!drop_arm.contains(".resolve_table("));
