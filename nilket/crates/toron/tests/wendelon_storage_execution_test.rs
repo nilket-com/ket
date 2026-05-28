@@ -399,7 +399,7 @@ async fn wendelon_table_query_runtime_filter_reduces_boundary_rows() {
 		&fixture.client,
 		LIVE_TENANT,
 		&descriptor,
-		selective_batch(1024),
+		selective_batch(RUNTIME_FILTER_BOUNDARY_ROWS),
 	)
 	.await;
 
@@ -598,7 +598,7 @@ async fn wendelon_table_query_exact_set_runtime_filter_matches_bloom_and_reduces
 		&fixture.client,
 		LIVE_TENANT,
 		&descriptor,
-		selective_batch(1024),
+		selective_batch(RUNTIME_FILTER_BOUNDARY_ROWS),
 	)
 	.await;
 
@@ -1361,6 +1361,10 @@ fn affected_count_from_batches(batches: &[RecordBatch]) -> i64 {
 	assert_eq!(affected.len(), 1);
 	affected.value(0)
 }
+
+// Keep the live Wendelon scan comfortably under the fixed table-query wall-clock
+// budget; these gates assert runtime-filter boundary reduction, not scan scale.
+const RUNTIME_FILTER_BOUNDARY_ROWS: i64 = 128;
 
 fn selective_batch(rows: i64) -> RecordBatch {
 	let schema = Arc::new(schema());
