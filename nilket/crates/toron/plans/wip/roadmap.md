@@ -24,7 +24,7 @@ forward view + the active line, not the archaeology.
 
 ## Status
 
-ADRs 001–122 are promoted (implemented unless a `feat` is still pending — check
+ADRs 001–123 are promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR decisions, fixtures, and follow-ons live in
 `plans/adr/NNN_*.md` + each ADR's §"What to do next"; this section is a **one-line
 ledger**, not a recap. Prose is kept only for the active line (the Rune authoring
@@ -111,7 +111,7 @@ run, 079+).
 - **077** Architecture Guard Sub-Bucketing
 - **078** Predicate Pushdown Boolean Distribution (safe `OR`/`NOT` factoring)
 
-### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118) + pipelined cross-stage execution (119) + end-to-end bounded first rows (120) + general qualified relation-scope binding (121) + Rune `.join(...)` (122, detail retained)
+### Active line — Rune authoring run (079–086) + nominal-typing spine (087–093) + pushdown residual (094) + integrity & elision tier (095–098) + introspection (099) + derived-source provenance (100) + Rune LIKE/ILIKE (101) + table/column introspection (102) + derived alias columns (103) + unified alias-column rename (104) + adjacent-identity-Project coalescing (105) + derived aggregate tables (106) + information_schema.schemata (107) + SQL CASE (108) + conditional-sugar family (109) + conditional logical-identity preservation (110) + Rune CASE authoring (111) + explicit NULL literal (112) + aggregate-output logical identity (113) + contextless NULL projection (114) + composable ordered top-k (115) + unordered bounded take (116) + multiple ordered top-k barriers (117) + stream-shaped storage boundary (118) + pipelined cross-stage execution (119) + end-to-end bounded first rows (120) + general qualified relation-scope binding (121) + Rune `.join(...)` (122) + multi-upstream live-input dispatch (123, detail retained)
 
 - **ADR 079 — Rune Relation Handles (SQL as a Composable DataFrame Source).**
   Promoted (plan). A small frontend-composition seam that makes **SQL subordinate
@@ -1050,38 +1050,50 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 122 promoted; ADR 123 candidates
+### ADR 123 promoted; ADR 124 candidates
 
-ADR 122 selected and promoted **Rune `.join(...)` direct authoring** — `.join(other, on)` defaulting
-to Inner + 8 named methods (`inner_join`/`left_join`/`right_join`/`full_join`/`left_semi_join`/
-`right_semi_join`/`left_anti_join`/`right_anti_join`) over the existing `LogicalPlan::Join`. The cut
-extracts a shared pair-shaped `build_hash_join_plan(left, right, kind, on)` helper that SQL and Rune
-both call (single `LogicalPlan::Join` literal site, pinned by G2); a small Rune-only
-`expr_to_join_keys` bridge walks `Eq`/`And` predicates into `Vec<(Expr, Expr)>` key pairs (D3);
-`derive_join_exchange_keys` extracts as a true free function (no `&self`). Predicate at the Rune
-surface (`qcol("l", "k").eq(qcol("r", "k"))` + `.and(...)`-composition) — the DataFrame-conventional
-shape — key-pair shape at the IR (unchanged); the conversion is one small walker. **Grounded
-promotion over a live peer-draft divergence:** iter-1 corrected the IR flow (key-pairs, not
-predicate, verified at `sql_planner.rs:4067`); the final promotion also resolved two stale
-peer-draft details — there are eight join kinds, not nine, and SQL's `"joins around derived tables
-are not supported"` reject is syntactic, not structural. `plan_qualifiers` recursion +
-`RelationScope::project` direct-column provenance already make
-`ctx.sql("SELECT id, region FROM sales").alias("s")` a valid Rune join input. Same lesson recursively
-at sub-feature depth: [[feedback_ground_the_premise_before_sketching_scope]] applies to ANY decision
-in an ADR (cut shape, sub-feature inclusion, helper extraction, rejection import), not just iter-0
-cut-framing. The customer the [[feedback_cut_must_deliver_the_name]] barrier-relaxation trap was
-waiting for has finally landed — multi-upstream live pipelining is now genuinely customer-ready.
+ADR 123 selected and promoted **multi-upstream live-input dispatch for streamable-both consumers**
+— the distributed-execution payoff of 122's compute-customer arc. Two-layer change: **scheduler**
+relaxes `task_ready_for_dispatch` to allow live refs when `is_streamable_producer_stage` holds for
+every upstream (regardless of consumer plan); **worker** adds one inserted dispatch arm so a
+non-streamable consumer (Join) with live refs uses `LiveInputStorageScan` for inputs +
+`execute_bound` for the plan. V1 covers all 8 HashPartitioned join kinds. **Three grounding-
+corrections in this cycle alone**: iter-1 added the worker bridge (Codex grounded that
+`LiveInputStorageScan` is double-gated by `is_streamable_shuffle_consumer`, blocking Join
+consumers); iter-2 expanded from Inner-only to all 8 kinds (Codex grounded `execute_bound` runs all
+variants via the same path); iter-3 **dropped the "probe-side Wendelon scan pauses during build"
+gate** (Codex grounded that `exec.rs:790` collects left-then-right to EOF and `append_live` is
+Vec-buffered behind shuffle budget — not bounded-channel backpressure). V1's honest deliverables
+are exactly four: scheduler timestamp-ordering, worker `LiveInputStorageScan` consumption,
+consumer-starts-before-sealed-manifests, and all-8-kinds correctness. **Ninth grounding-correction
+in the 119→123 arc**; the discipline [[feedback_ground_the_premise_before_sketching_scope]]
+applies recursively at every layer, including elegant peer-claim framings — the mechanical check
+is "grep the relevant code path after every 'for free / the existing system handles this' claim."
+With 115/116/117/118/119/120/121/122/123 the distributed-execution arc is end-to-end with live-
+input dispatch for join consumers; subsequent frontiers either extend the live path's coverage
+(asymmetric build-then-probe + bounded-channel partition store; output-side streamable joins;
+A2 mixed cases; multi-producer fan-in) or shift tier (logical-type lifecycle; SQL frontend follow-ons).
 **Scope each candidate as a complete cut, not a ~100-line granular slice** (standing operator steer).
 
-*Compute customer frontier (now-customer-ready by 122):*
+*123 named follow-ons (deferred V1 capabilities):*
 
-- **Multi-upstream live pipelining** — relax 117's multi-upstream acceptance-layer barrier for the
-  streamable subset, letting joins / multi-input compositions pipeline across both upstreams.
-  **Finally customer-ready** — 122 lands the authored joins that exercise the multi-upstream path;
-  the [[feedback_cut_must_deliver_the_name]] barrier-relaxation-needs-customer trap is finally
-  resolvable. Substantial — touches 117/119's freshly-landed correctness.
+- **Executor reorder for asymmetric build-then-probe** — build = smaller side first, probe =
+  stream second. Would enable probe-side scan pause via storage cancellation + 120 cursor drop —
+  the "natural backpressure" claim iter-3 honestly dropped. Substantial executor cut.
+- **Bounded-channel partition store** — replace `append_live`'s Vec-buffered shuffle-budget shape
+  with a bounded channel that backpressures the producer when the consumer isn't pulling. Pairs
+  with executor reorder for end-to-end natural backpressure.
+- **Output-side joins-as-streamable-producers** — widen `streamable_unary_plan` to accept `Join`
+  AND restructure the join executor to stream output as it emerges.
+- **Mixed streamable+sealed multi-upstream (A2)** — the deferred permissive case from 123 D2.
+- **Multi-producer fan-in live dispatch** — the deferred fan-in case from 123 D2; V1 is exactly
+  one streamable producer task per upstream stage.
+
+*Compute customer frontier (still-deferred):*
+
 - **Broadcast joins / strategy selection** — `JoinStrategy::Broadcast` exists in the IR but has no
-  constructor today; needs cost-based selection or syntactic hint. Pairs with 122's authored joins.
+  constructor today; needs cost-based selection or syntactic hint. Pairs with 122's authored joins
+  and 123's live-input dispatch.
 
 *121/122 named follow-ons (deferred non-scope):*
 
@@ -1181,6 +1193,18 @@ waiting for has finally landed — multi-upstream live pipelining is now genuine
 - subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`; `ALTER`/composite-PK/
   `UNIQUE` (cross-ring schema evolution); pre-op intent audit; fragmentable bulk DML;
   JWT/OIDC/SPIFFE; gRPC/Arrow Flight/Postgres frontends.
+
+### ADR 122 promoted; ADR 123 candidates (HISTORICAL)
+
+ADR 122 took the compute-customer authoring surface: Rune `.join(other, on)` + 8 named methods
+over the existing `LogicalPlan::Join` via the shared pair-shaped `build_hash_join_plan` helper
+that SQL and Rune both call (single `LogicalPlan::Join` literal site); a small Rune-only
+`expr_to_join_keys` bridge walks `Eq`/`And` predicates into key pairs; predicate at the Rune
+surface, key-pair shape at the IR. The 9-Rune-method surface maps to the 8 existing `JoinKind`
+variants. ADR 123 followed up as the **distributed-execution payoff**: multi-upstream live-input
+dispatch for streamable-both consumers (scheduler relaxation + worker dispatch arm) covering all 8
+HashPartitioned kinds. Detail in `plans/adr/122_rune_join.md` +
+`plans/adr/123_multi_upstream_live_input_dispatch.md` + the active-line entry above.
 
 ### ADR 121 promoted; ADR 122 candidates (HISTORICAL)
 
