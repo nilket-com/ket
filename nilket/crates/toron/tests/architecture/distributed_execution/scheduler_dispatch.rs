@@ -263,26 +263,11 @@ pub(crate) fn adr119_live_consumer_path_does_not_call_execute_bound_on_live_scan
 }
 
 #[test]
-pub(crate) fn adr119_multi_upstream_barrier_untouched() {
-	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
-		.expect("read scheduler source");
-	let barrier = source
-		.split("fn stage_barrier_open")
-		.nth(1)
-		.and_then(|rest| rest.split("fn materialize_task_spec").next())
-		.expect("stage barrier block");
-
-	assert!(source.contains("stage_requires_stage_barrier"));
-	assert!(barrier.contains("upstream_stages.iter().all"));
-	assert!(barrier.contains("AcceptanceState::LiveAccepted"));
-}
-
-#[test]
 pub(crate) fn adr119_non_streamable_fallback_is_explicit() {
 	let source =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
 	let execution = source
-		.split("let (results, output) = if is_streamable_final_result(spec)")
+		.split("if is_streamable_final_result(spec)")
 		.nth(1)
 		.and_then(|rest| rest.split("record_worker_telemetry").next())
 		.expect("worker execution branch");
@@ -291,6 +276,170 @@ pub(crate) fn adr119_non_streamable_fallback_is_explicit() {
 	assert!(execution.contains("execute_live_shuffle_producer"));
 	assert!(execution.contains("execute_live_shuffle_consumer"));
 	assert!(execution.contains("executor.execute_bound"));
+}
+
+#[test]
+pub(crate) fn adr123_task_ready_for_dispatch_relaxes_for_streamable_both() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let readiness = source
+		.split("fn task_ready_for_dispatch")
+		.nth(1)
+		.and_then(|rest| rest.split("fn shuffle_inputs_fully_sealed").next())
+		.expect("task_ready_for_dispatch block");
+	let materialize = source
+		.split("fn materialize_task_spec")
+		.nth(1)
+		.and_then(|rest| rest.split("fn sealed_ref_for_producer").next())
+		.expect("materialize_task_spec block");
+
+	assert!(readiness.contains("is_streamable_producer_stage"));
+	assert!(readiness.contains("let live_eligible"));
+	assert!(readiness.contains("stage.upstream_stages.len() == 1"));
+	assert!(readiness.contains("is_streamable_shuffle_consumer(&task.spec)"));
+	assert!(readiness.contains("|| streamable_both"));
+	assert!(readiness.contains("live_input_worker_for_all_shuffle_inputs"));
+	assert!(readiness.contains("self.shuffle_inputs_fully_sealed"));
+	assert!(materialize.contains("spec_all_shuffle_inputs_from_streamable_producer_stages"));
+	assert!(materialize.contains("consumer_streamable || consumer_streamable_both"));
+}
+
+#[test]
+pub(crate) fn adr123_streamable_unary_plan_still_excludes_join() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/task.rs"))
+		.expect("read task source");
+	let streamable = source
+		.split("fn streamable_unary_plan")
+		.nth(1)
+		.expect("streamable_unary_plan block");
+
+	assert!(streamable.contains("ExecutionPlan::Join { .. }"));
+}
+
+#[test]
+pub(crate) fn adr123_drive_streamable_plan_still_errors_on_join() {
+	let source =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let drive = source
+		.split("fn drive_streamable_plan")
+		.nth(1)
+		.and_then(|rest| rest.split("fn partition_record_batch").next())
+		.expect("drive_streamable_plan block");
+
+	assert!(drive.contains("ExecutionPlan::Join { .. }"));
+	assert!(drive.contains("internal: non-streamable plan reached live stream path"));
+}
+
+#[test]
+pub(crate) fn adr123_multi_upstream_barrier_holds_for_non_streamable_both() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let requires = source
+		.split("fn stage_requires_stage_barrier")
+		.nth(1)
+		.and_then(|rest| rest.split("fn task_ready_for_dispatch").next())
+		.expect("stage_requires_stage_barrier block");
+	let barrier = source
+		.split("fn stage_barrier_open")
+		.nth(1)
+		.and_then(|rest| rest.split("fn materialize_task_spec").next())
+		.expect("stage barrier block");
+
+	assert!(source.contains("self.stage_requires_stage_barrier(stage, stages)"));
+	assert!(requires.contains("is_streamable_producer_stage"));
+	assert!(requires.contains("let streamable_both"));
+	assert!(requires.contains("&& !streamable_both"));
+	assert!(barrier.contains("upstream_stages.iter().all"));
+	assert!(barrier.contains("AcceptanceState::LiveAccepted"));
+}
+
+#[test]
+pub(crate) fn adr123_worker_bridges_live_refs_to_non_streamable_consumer() {
+	let source =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let execution = source
+		.split("if is_streamable_final_result(spec)")
+		.nth(1)
+		.and_then(|rest| rest.split("record_worker_telemetry").next())
+		.expect("worker execution branch");
+	let live_branch = execution
+		.split("} else if self.has_live_shuffle_input(spec) {")
+		.nth(1)
+		.and_then(|rest| rest.split("} else if overrides.is_empty()").next())
+		.expect("live input branch");
+
+	assert!(live_branch.contains("if is_streamable_shuffle_consumer(spec)"));
+	assert!(live_branch.contains("self.execute_live_shuffle_consumer"));
+	assert!(live_branch.contains("LiveInputStorageScan"));
+	assert!(live_branch.contains("live_scan_overrides(spec)"));
+	assert!(live_branch.contains("executor.execute_bound(&spec.plan, morsel)"));
+}
+
+#[test]
+pub(crate) fn adr123_executor_pbc_wendelon_ir_fragmenter_unchanged() {
+	for path in [
+		"src/exec.rs",
+		"src/ir.rs",
+		"src/pbc.rs",
+		"src/distributed/fragment.rs",
+	] {
+		let source = std::fs::read_to_string(manifest_dir().join(path)).expect("read source");
+		assert!(!source.contains("ADR 123"), "{path}");
+		assert!(!source.contains("adr123"), "{path}");
+	}
+	for path in ["src/lib.rs", "src/storage/mod.rs"] {
+		let source =
+			std::fs::read_to_string(wendelon_manifest_dir().join(path)).expect("read wendelon");
+		assert!(!source.contains("ADR 123"), "{path}");
+		assert!(!source.contains("adr123"), "{path}");
+	}
+}
+
+#[test]
+pub(crate) fn adr123_streamable_producer_stage_predicate_is_single_task() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let predicate = source
+		.split("fn is_streamable_producer_stage")
+		.nth(1)
+		.and_then(|rest| {
+			rest.split("fn spec_all_shuffle_inputs_from_streamable_producer_stages")
+				.next()
+		})
+		.expect("is_streamable_producer_stage block");
+
+	assert!(predicate.contains("stage.tasks.len() == 1"));
+	assert!(predicate.contains("is_streamable_exchange_producer(&stage.tasks[0].spec)"));
+}
+
+#[test]
+pub(crate) fn adr123_v1_covers_all_eight_hashpartitioned_join_kinds() {
+	let source =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let gate = source
+		.split(
+			"async fn multi_upstream_streamable_both_all_hashpartitioned_kinds_execute_correctly",
+		)
+		.nth(1)
+		.and_then(|rest| {
+			rest.split("async fn execution_plan_join_still_rejected_by_drive_streamable_plan")
+				.next()
+		})
+		.expect("all-kinds behavior gate");
+
+	for variant in [
+		"JoinKind::Inner",
+		"JoinKind::LeftOuter",
+		"JoinKind::RightOuter",
+		"JoinKind::FullOuter",
+		"JoinKind::LeftSemi",
+		"JoinKind::RightSemi",
+		"JoinKind::LeftAnti",
+		"JoinKind::RightAnti",
+	] {
+		assert!(gate.contains(variant), "missing {variant}");
+	}
+	assert!(source.contains("strategy: JoinStrategy::HashPartitioned"));
 }
 
 #[test]
@@ -402,7 +551,7 @@ pub(crate) fn adr120_non_streamable_final_result_uses_completion_buffer() {
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
 	let execution = server
-		.split("let (results, output) = if is_streamable_final_result(spec)")
+		.split("if is_streamable_final_result(spec)")
 		.nth(1)
 		.and_then(|rest| rest.split("record_worker_telemetry").next())
 		.expect("worker execution branch");
@@ -414,8 +563,8 @@ pub(crate) fn adr120_non_streamable_final_result_uses_completion_buffer() {
 }
 
 #[test]
-pub(crate) fn adr120_119_multi_upstream_barrier_untouched() {
-	adr119_multi_upstream_barrier_untouched();
+pub(crate) fn adr120_multi_upstream_barrier_boundary_still_holds() {
+	adr123_multi_upstream_barrier_holds_for_non_streamable_both();
 }
 
 #[test]

@@ -207,23 +207,86 @@ impl ToronWorker {
 			let mut streamed_batches = 0u64;
 			let mut streamed_batch_encode_micros = 0u64;
 			let mut streamed_batch_send_micros = 0u64;
-			let (results, output) = if is_streamable_final_result(spec)
-				&& final_result_sink.is_some()
-			{
-				let sink = final_result_sink
-					.as_deref_mut()
-					.expect("checked streamable final-result sink");
-				if self.has_live_shuffle_input(spec) && is_streamable_shuffle_consumer(spec) {
-					let storage = Arc::new(LiveInputStorageScan {
-						base: self.storage.clone(),
-						partition_store: self.partition_store.clone(),
-						live_overrides: live_scan_overrides(spec),
-					});
-					let executor = Executor::with_context(storage, task_context);
-					drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
+			let (results, output) =
+				if is_streamable_final_result(spec) && final_result_sink.is_some() {
+					let sink = final_result_sink
+						.as_deref_mut()
+						.expect("checked streamable final-result sink");
+					if self.has_live_shuffle_input(spec) && is_streamable_shuffle_consumer(spec) {
+						let base: Arc<dyn StorageScan> = if overrides.is_empty() {
+							self.storage.clone()
+						} else {
+							Arc::new(TaskInputStorageScan {
+								base: self.storage.clone(),
+								legacy_single_override: legacy_single_shuffle_override(
+									&spec.plan, &overrides,
+								),
+								overrides,
+							})
+						};
+						let storage = Arc::new(LiveInputStorageScan {
+							base,
+							partition_store: self.partition_store.clone(),
+							live_overrides: live_scan_overrides(spec),
+						});
+						let executor = Executor::with_context(storage, task_context);
+						drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
+					} else if overrides.is_empty() {
+						let executor = Executor::with_context(self.storage.clone(), task_context);
+						drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
+					} else {
+						let executor = Executor::with_context(
+							Arc::new(TaskInputStorageScan {
+								base: self.storage.clone(),
+								legacy_single_override: legacy_single_shuffle_override(
+									&spec.plan, &overrides,
+								),
+								overrides,
+							}),
+							task_context,
+						);
+						drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
+					}
+					streamed_rows = sink.emitted_rows();
+					streamed_batches = sink.emitted_batches();
+					streamed_batch_encode_micros = sink.batch_encode_micros();
+					streamed_batch_send_micros = sink.batch_send_micros();
+					(
+						Vec::new(),
+						Some(TaskCompletionOutput::FinalResult {
+							output_digest: None,
+						}),
+					)
+				} else if is_streamable_exchange_producer(spec) {
+					self.execute_live_shuffle_producer(spec, task_context, morsel)
+						.await?
+				} else if self.has_live_shuffle_input(spec) {
+					if is_streamable_shuffle_consumer(spec) {
+						self.execute_live_shuffle_consumer(spec, task_context, morsel)
+							.await?
+					} else {
+						let base: Arc<dyn StorageScan> = if overrides.is_empty() {
+							self.storage.clone()
+						} else {
+							Arc::new(TaskInputStorageScan {
+								base: self.storage.clone(),
+								legacy_single_override: legacy_single_shuffle_override(
+									&spec.plan, &overrides,
+								),
+								overrides,
+							})
+						};
+						let storage = Arc::new(LiveInputStorageScan {
+							base,
+							partition_store: self.partition_store.clone(),
+							live_overrides: live_scan_overrides(spec),
+						});
+						let executor = Executor::with_context(storage, task_context);
+						(executor.execute_bound(&spec.plan, morsel).await?, None)
+					}
 				} else if overrides.is_empty() {
 					let executor = Executor::with_context(self.storage.clone(), task_context);
-					drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
+					(executor.execute_bound(&spec.plan, morsel).await?, None)
 				} else {
 					let executor = Executor::with_context(
 						Arc::new(TaskInputStorageScan {
@@ -235,40 +298,8 @@ impl ToronWorker {
 						}),
 						task_context,
 					);
-					drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
-				}
-				streamed_rows = sink.emitted_rows();
-				streamed_batches = sink.emitted_batches();
-				streamed_batch_encode_micros = sink.batch_encode_micros();
-				streamed_batch_send_micros = sink.batch_send_micros();
-				(
-					Vec::new(),
-					Some(TaskCompletionOutput::FinalResult {
-						output_digest: None,
-					}),
-				)
-			} else if is_streamable_exchange_producer(spec) {
-				self.execute_live_shuffle_producer(spec, task_context, morsel)
-					.await?
-			} else if self.has_live_shuffle_input(spec) && is_streamable_shuffle_consumer(spec) {
-				self.execute_live_shuffle_consumer(spec, task_context, morsel)
-					.await?
-			} else if overrides.is_empty() {
-				let executor = Executor::with_context(self.storage.clone(), task_context);
-				(executor.execute_bound(&spec.plan, morsel).await?, None)
-			} else {
-				let executor = Executor::with_context(
-					Arc::new(TaskInputStorageScan {
-						base: self.storage.clone(),
-						legacy_single_override: legacy_single_shuffle_override(
-							&spec.plan, &overrides,
-						),
-						overrides,
-					}),
-					task_context,
-				);
-				(executor.execute_bound(&spec.plan, morsel).await?, None)
-			};
+					(executor.execute_bound(&spec.plan, morsel).await?, None)
+				};
 			record_worker_telemetry(&telemetry, |task| {
 				task.counters.emitted_rows =
 					results.iter().map(RecordBatch::num_rows).sum::<usize>() as u64 + streamed_rows;
@@ -2636,6 +2667,229 @@ mod tests {
 
 		assert_eq!(report.results.len(), 1);
 		assert_eq!(report.results[0].num_rows(), 1);
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_streamable_both_worker_uses_live_input_storage_scan() {
+		let rows = execute_live_hash_join_kind(JoinKind::Inner).await;
+
+		assert_eq!(rows, 1);
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_streamable_both_all_hashpartitioned_kinds_execute_correctly() {
+		for kind in [
+			JoinKind::Inner,
+			JoinKind::LeftOuter,
+			JoinKind::RightOuter,
+			JoinKind::FullOuter,
+			JoinKind::LeftSemi,
+			JoinKind::RightSemi,
+			JoinKind::LeftAnti,
+			JoinKind::RightAnti,
+		] {
+			let rows = execute_live_hash_join_kind(kind).await;
+
+			assert_eq!(rows, expected_live_hash_join_rows(kind), "{kind:?}");
+		}
+	}
+
+	#[tokio::test]
+	async fn execution_plan_join_still_rejected_by_drive_streamable_plan() {
+		let left = scan(TableId(1), 41);
+		let right = scan(TableId(2), 42);
+		let plan = ExecutionPlan::Join {
+			left: Box::new(left.clone()),
+			right: Box::new(right.clone()),
+			kind: JoinKind::Inner,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: crate::binder::join_schema(
+				JoinKind::Inner,
+				&left.schema(),
+				&right.schema(),
+			),
+		};
+		let storage = Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(left.schema()),
+		});
+		let executor = Executor::with_context(storage, ExecutionContext::local_test());
+		let mut collect = |_batch: RecordBatch| -> Result<bool, QueryError> { Ok(true) };
+		let mut sink = SyncStreamableBatchSink::new(&mut collect);
+
+		let err = drive_streamable_plan(&plan, &executor, None, &mut sink)
+			.await
+			.expect_err("join must stay rejected by streamable output path");
+
+		assert!(matches!(
+			err,
+			QueryError::Internal { message } if message == "internal: non-streamable plan reached live stream path"
+		));
+	}
+
+	async fn execute_live_hash_join_kind(kind: JoinKind) -> usize {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let left_batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+		)
+		.expect("left batch");
+		let right_batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![2_i64, 3]))],
+		)
+		.expect("right batch");
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let query_id = QueryId::from_u128(123_000 + kind as u128);
+		let left_exchange_id = ExchangeId::new(1239);
+		let right_exchange_id = ExchangeId::new(1240);
+		let left_address = PartitionAddress {
+			query_id,
+			exchange_id: left_exchange_id,
+			producer_stage_id: StageId::new(0),
+			producer_task_id: TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(0),
+		};
+		let right_address = PartitionAddress {
+			query_id,
+			exchange_id: right_exchange_id,
+			producer_stage_id: StageId::new(1),
+			producer_task_id: TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(0),
+		};
+		let endpoint = WorkerEndpoint::new("local");
+		let worker_id = WorkerId::from_u128(23);
+		seed_live_partition(
+			store.as_ref(),
+			left_address,
+			&left_batch,
+			worker_id,
+			endpoint.clone(),
+		);
+		seed_live_partition(
+			store.as_ref(),
+			right_address,
+			&right_batch,
+			worker_id,
+			endpoint.clone(),
+		);
+		let worker = ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan {
+				table_data: RecordBatch::new_empty(schema.clone()),
+			}),
+			Arc::new(MemoryManager::new(8, 1024 * 1024)),
+			store,
+			worker_id,
+			endpoint.clone(),
+		);
+		let left = scan(shuffle_input_table_id(left_exchange_id), 43);
+		let right = scan(shuffle_input_table_id(right_exchange_id), 44);
+		let spec = TaskSpec {
+			identity: TaskIdentity::new(
+				query_id,
+				StageId::new(2),
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: Some(PartitionId::new(0)),
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: ExecutionPlan::Join {
+				left: Box::new(left.clone()),
+				right: Box::new(right.clone()),
+				kind,
+				left_keys: vec![ColumnOrdinal(0)],
+				right_keys: vec![ColumnOrdinal(0)],
+				strategy: JoinStrategy::HashPartitioned,
+				output_schema: crate::binder::join_schema(kind, &left.schema(), &right.schema()),
+			},
+			inputs: vec![
+				TaskInputBinding::ShuffleConsumer {
+					exchange_id: left_exchange_id,
+					producer_stage_id: StageId::new(0),
+					partition_id: PartitionId::new(0),
+					producer_partitions: vec![ShufflePartitionRef::Live(
+						LiveProducerPartitionRef {
+							address: left_address,
+							worker_id,
+							endpoint: endpoint.clone(),
+						},
+					)],
+				},
+				TaskInputBinding::ShuffleConsumer {
+					exchange_id: right_exchange_id,
+					producer_stage_id: StageId::new(1),
+					partition_id: PartitionId::new(0),
+					producer_partitions: vec![ShufflePartitionRef::Live(
+						LiveProducerPartitionRef {
+							address: right_address,
+							worker_id,
+							endpoint,
+						},
+					)],
+				},
+			],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+
+		let report = tokio::time::timeout(
+			Duration::from_secs(1),
+			worker.execute_task_local_with_telemetry(&spec, None),
+		)
+		.await
+		.expect("live hash join should finish from sealed live chunks")
+		.expect("live hash join");
+
+		report.results.iter().map(RecordBatch::num_rows).sum()
+	}
+
+	fn seed_live_partition(
+		store: &InMemoryPartitionStore,
+		address: PartitionAddress,
+		batch: &RecordBatch,
+		worker_id: WorkerId,
+		endpoint: WorkerEndpoint,
+	) {
+		store.open_live(address).expect("open live");
+		let bytes = encode_record_batch(batch).expect("encode live batch");
+		let payload = PartitionPayload::new(
+			address,
+			bytes.clone(),
+			RowCount::new(u64::try_from(batch.num_rows()).expect("row count fits u64")),
+			ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes)),
+		);
+		store.append_live(payload.clone()).expect("append live");
+		store
+			.seal_live(PartitionManifest {
+				query_id: address.query_id,
+				stage_id: address.producer_stage_id,
+				task_id: address.producer_task_id,
+				attempt_id: address.attempt_id,
+				exchange_id: address.exchange_id,
+				producer_worker_id: worker_id,
+				producer_endpoint: endpoint,
+				partitions: vec![payload.entry()],
+				runtime_filter_fragment: None,
+				backend: PartitionBackend::InMemory,
+			})
+			.expect("seal live");
+	}
+
+	fn expected_live_hash_join_rows(kind: JoinKind) -> usize {
+		match kind {
+			JoinKind::Inner => 1,
+			JoinKind::LeftOuter => 2,
+			JoinKind::RightOuter => 2,
+			JoinKind::FullOuter => 3,
+			JoinKind::LeftSemi => 1,
+			JoinKind::RightSemi => 1,
+			JoinKind::LeftAnti => 1,
+			JoinKind::RightAnti => 1,
+		}
 	}
 
 	#[tokio::test]

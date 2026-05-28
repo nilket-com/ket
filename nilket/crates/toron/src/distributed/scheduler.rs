@@ -241,7 +241,7 @@ where
 				if !self.in_flight_capacity_available(in_flight.len()) {
 					break;
 				}
-				if self.stage_requires_stage_barrier(stage)
+				if self.stage_requires_stage_barrier(stage, stages)
 					&& !self.stage_barrier_open(&stage.upstream_stages, stages)
 				{
 					blocked_stages.insert(stage.stage_id);
@@ -382,6 +382,9 @@ where
 		task: &TaskPlan,
 		stages: &[StagePlan],
 	) -> Option<WorkerId> {
+		if let Some(worker_id) = self.live_input_worker_for_all_shuffle_inputs(&task.spec, stages) {
+			return Some(worker_id);
+		}
 		if stage.upstream_stages.len() != 1 || !is_streamable_shuffle_consumer(&task.spec) {
 			return None;
 		}
@@ -623,8 +626,13 @@ where
 		consumers
 	}
 
-	fn stage_requires_stage_barrier(&self, stage: &StagePlan) -> bool {
-		stage.upstream_stages.len() != 1
+	fn stage_requires_stage_barrier(&self, stage: &StagePlan, stages: &[StagePlan]) -> bool {
+		let upstreams_all_streamable_producers = stage
+			.upstream_stages
+			.iter()
+			.all(|upstream| is_streamable_producer_stage(*upstream, stages));
+		let streamable_both = stage.upstream_stages.len() > 1 && upstreams_all_streamable_producers;
+		(stage.upstream_stages.len() != 1 && !streamable_both)
 			|| stage.tasks.iter().any(|task| {
 				!task
 					.spec
@@ -643,8 +651,21 @@ where
 		if stage.upstream_stages.is_empty() {
 			return true;
 		}
-		if stage.upstream_stages.len() > 1 || !is_streamable_shuffle_consumer(&task.spec) {
+		let upstreams_all_streamable_producers = stage
+			.upstream_stages
+			.iter()
+			.all(|upstream| is_streamable_producer_stage(*upstream, stages));
+		let streamable_both = stage.upstream_stages.len() > 1 && upstreams_all_streamable_producers;
+		let live_eligible = (stage.upstream_stages.len() == 1
+			&& is_streamable_shuffle_consumer(&task.spec))
+			|| streamable_both;
+		if !live_eligible {
 			return self.shuffle_inputs_fully_sealed(&task.spec, stages);
+		}
+		if streamable_both {
+			return self
+				.live_input_worker_for_all_shuffle_inputs(&task.spec, stages)
+				.is_some() || self.shuffle_inputs_fully_sealed(&task.spec, stages);
 		}
 
 		task.spec.inputs.iter().all(|input| {
@@ -702,6 +723,43 @@ where
 		})
 	}
 
+	fn live_input_worker_for_all_shuffle_inputs(
+		&self,
+		spec: &TaskSpec,
+		stages: &[StagePlan],
+	) -> Option<WorkerId> {
+		let mut common_worker_id = None;
+		let mut saw_shuffle_input = false;
+		for input in &spec.inputs {
+			let TaskInputBinding::ShuffleConsumer {
+				exchange_id,
+				producer_stage_id,
+				partition_id,
+				..
+			} = input
+			else {
+				continue;
+			};
+			saw_shuffle_input = true;
+			let producers = expected_producer_tasks(stages, *producer_stage_id)?;
+			if producers.len() != 1 {
+				return None;
+			}
+			let live =
+				self.live_ref_for_producer(&producers[0].spec, *exchange_id, *partition_id)?;
+			match common_worker_id {
+				Some(worker_id) if worker_id != live.worker_id => return None,
+				Some(_) => {}
+				None => common_worker_id = Some(live.worker_id),
+			}
+		}
+		if saw_shuffle_input {
+			common_worker_id
+		} else {
+			None
+		}
+	}
+
 	fn stage_barrier_open(&self, upstream_stages: &[StageId], stages: &[StagePlan]) -> bool {
 		if upstream_stages.is_empty() {
 			return true;
@@ -731,6 +789,8 @@ where
 	) -> Result<TaskSpec, SchedulerError> {
 		let runtime_filter = self.runtime_filter_descriptor_for_probe(&spec, stages);
 		let consumer_streamable = is_streamable_shuffle_consumer(&spec);
+		let consumer_streamable_both =
+			spec_all_shuffle_inputs_from_streamable_producer_stages(&spec, stages);
 		for input in &mut spec.inputs {
 			if let TaskInputBinding::Scan {
 				runtime_filter: input_runtime_filter,
@@ -772,7 +832,7 @@ where
 					continue;
 				}
 				if producers.len() == 1
-					&& consumer_streamable
+					&& (consumer_streamable || consumer_streamable_both)
 					&& let Some(live) =
 						self.live_ref_for_producer(&producer.spec, *exchange_id, *partition_id)
 				{
@@ -1017,6 +1077,35 @@ fn expected_producer_tasks(
 		.map(|stage| stage.tasks.as_slice())
 }
 
+fn is_streamable_producer_stage(stage_id: StageId, stages: &[StagePlan]) -> bool {
+	stages
+		.iter()
+		.find(|stage| stage.stage_id == stage_id)
+		.is_some_and(|stage| {
+			stage.tasks.len() == 1 && is_streamable_exchange_producer(&stage.tasks[0].spec)
+		})
+}
+
+fn spec_all_shuffle_inputs_from_streamable_producer_stages(
+	spec: &TaskSpec,
+	stages: &[StagePlan],
+) -> bool {
+	let producer_stage_ids = spec
+		.inputs
+		.iter()
+		.filter_map(|input| match input {
+			TaskInputBinding::ShuffleConsumer {
+				producer_stage_id, ..
+			} => Some(*producer_stage_id),
+			TaskInputBinding::Scan { .. } => None,
+		})
+		.collect::<BTreeSet<_>>();
+	producer_stage_ids.len() > 1
+		&& producer_stage_ids
+			.iter()
+			.all(|stage_id| is_streamable_producer_stage(*stage_id, stages))
+}
+
 fn runtime_filter_build_stage(spec: &TaskSpec, stages: &[StagePlan]) -> bool {
 	matches!(spec.output, TaskOutputBinding::ShuffleProducer { .. })
 		&& stages.iter().any(|stage| {
@@ -1088,11 +1177,11 @@ mod tests {
 	};
 	use crate::ir::{
 		BoundExprProgram, BoundExprProgramBuilder, ColumnName, ColumnOrdinal, ExecutionPlan,
-		ResolvedColumn,
+		JoinKind, JoinStrategy, ResolvedColumn,
 	};
 	use arrow::array::{ArrayRef, Int64Array};
 	use arrow::datatypes::{DataType, Field, Schema};
-	use std::collections::VecDeque;
+	use std::collections::{HashSet, VecDeque};
 	use std::sync::Arc;
 	use std::sync::Mutex;
 	use std::sync::atomic::{AtomicBool, Ordering};
@@ -1285,6 +1374,74 @@ mod tests {
 		exchange_id: ExchangeId,
 	}
 
+	struct BlockingTaskSetDispatcher {
+		seen: Mutex<Vec<TaskSpec>>,
+		seen_notify: Notify,
+		release: Notify,
+		blocked_tasks: HashSet<TaskKey>,
+		released: AtomicBool,
+	}
+
+	impl BlockingTaskSetDispatcher {
+		fn new(blocked_tasks: impl IntoIterator<Item = TaskKey>) -> Self {
+			Self {
+				seen: Mutex::new(Vec::new()),
+				seen_notify: Notify::new(),
+				release: Notify::new(),
+				blocked_tasks: blocked_tasks.into_iter().collect(),
+				released: AtomicBool::new(false),
+			}
+		}
+
+		async fn wait_for_seen(&self, count: usize) {
+			loop {
+				if self.seen.lock().expect("seen lock").len() >= count {
+					return;
+				}
+				self.seen_notify.notified().await;
+			}
+		}
+
+		fn release(&self) {
+			self.released.store(true, Ordering::SeqCst);
+			self.release.notify_waiters();
+		}
+
+		fn seen(&self) -> Vec<TaskSpec> {
+			self.seen.lock().expect("seen lock").clone()
+		}
+	}
+
+	#[async_trait]
+	impl TaskDispatcher for BlockingTaskSetDispatcher {
+		async fn dispatch(&self, _worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome {
+			self.seen.lock().expect("seen lock").push(spec.clone());
+			self.seen_notify.notify_waiters();
+			if self
+				.blocked_tasks
+				.contains(&TaskKey::from_identity(spec.identity))
+			{
+				loop {
+					let notified = self.release.notified();
+					tokio::pin!(notified);
+					notified.as_mut().enable();
+					if self.released.load(Ordering::SeqCst) {
+						break;
+					}
+					notified.await;
+				}
+			}
+			match spec.output {
+				TaskOutputBinding::ShuffleProducer { exchange_id, .. } => {
+					DispatchOutcome::Completed(TaskCompletionOutput::ShuffleProducer {
+						manifest: manifest_for_spec(spec, exchange_id),
+					})
+				}
+				TaskOutputBinding::FinalResult => completed(),
+			}
+		}
+	}
+
 	impl BlockingProducerDispatcher {
 		fn new(blocked_task: TaskKey, exchange_id: ExchangeId) -> Self {
 			Self {
@@ -1447,6 +1604,209 @@ mod tests {
 			producer_partitions: Vec::new(),
 		}];
 		consumer
+	}
+
+	fn shuffle_input_scan(exchange_id: ExchangeId, object_byte: u8) -> ExecutionPlan {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		ExecutionPlan::Scan {
+			legacy_table_id: crate::distributed::task::shuffle_input_table_id(exchange_id),
+			table: TableObjectId::new([object_byte; 16]),
+			fingerprint: physical_fingerprint(),
+			schema,
+			projection: None,
+			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
+			profile_hint: crate::ir::QueryProfileHint::Scan,
+			primary_key_columns: vec![ColumnOrdinal(0)],
+		}
+	}
+
+	fn hash_join_consumer(
+		stage_id: StageId,
+		left_exchange_id: ExchangeId,
+		left_producer_stage_id: StageId,
+		right_exchange_id: ExchangeId,
+		right_producer_stage_id: StageId,
+		kind: JoinKind,
+	) -> TaskPlan {
+		let mut consumer = task(stage_id, TaskId::new(0));
+		let left = shuffle_input_scan(left_exchange_id, 7);
+		let right = shuffle_input_scan(right_exchange_id, 8);
+		let left_schema = left.schema();
+		let right_schema = right.schema();
+		consumer.spec.plan = ExecutionPlan::Join {
+			left: Box::new(left),
+			right: Box::new(right),
+			kind,
+			left_keys: vec![ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0)],
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: crate::binder::join_schema(kind, &left_schema, &right_schema),
+		};
+		consumer.spec.inputs = vec![
+			TaskInputBinding::ShuffleConsumer {
+				exchange_id: left_exchange_id,
+				producer_stage_id: left_producer_stage_id,
+				partition_id: PartitionId::new(0),
+				producer_partitions: Vec::new(),
+			},
+			TaskInputBinding::ShuffleConsumer {
+				exchange_id: right_exchange_id,
+				producer_stage_id: right_producer_stage_id,
+				partition_id: PartitionId::new(0),
+				producer_partitions: Vec::new(),
+			},
+		];
+		consumer
+	}
+
+	async fn assert_multi_upstream_streamable_join_dispatches_before_acceptance(
+		assert_manifest_absent: bool,
+	) {
+		let left_exchange_id = ExchangeId::new(1231);
+		let right_exchange_id = ExchangeId::new(1232);
+		let left = streamable_shuffle_producer(StageId::new(0), TaskId::new(0), left_exchange_id);
+		let right = streamable_shuffle_producer(StageId::new(1), TaskId::new(0), right_exchange_id);
+		let left_key = TaskKey::from_identity(left.spec.identity);
+		let right_key = TaskKey::from_identity(right.spec.identity);
+		let consumer = hash_join_consumer(
+			StageId::new(2),
+			left_exchange_id,
+			StageId::new(0),
+			right_exchange_id,
+			StageId::new(1),
+			JoinKind::Inner,
+		);
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![left],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![],
+				tasks: vec![right],
+			},
+			StagePlan {
+				stage_id: StageId::new(2),
+				upstream_stages: vec![StageId::new(0), StageId::new(1)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let dispatcher = BlockingTaskSetDispatcher::new([left_key, right_key]);
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(3),
+			) => {
+				seen.expect("consumer should dispatch while both upstreams are still running");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before live multi-upstream consumer was observed: {result:?}");
+			}
+		}
+		if assert_manifest_absent {
+			assert!(
+				!dispatcher.released.load(Ordering::SeqCst),
+				"blocked producers cannot have returned manifests before release"
+			);
+		}
+		let seen = dispatcher.seen();
+		assert_eq!(seen[0].identity.stage_id, StageId::new(0));
+		assert_eq!(seen[1].identity.stage_id, StageId::new(1));
+		assert_eq!(seen[2].identity.stage_id, StageId::new(2));
+		for input in &seen[2].inputs {
+			let TaskInputBinding::ShuffleConsumer {
+				producer_partitions,
+				..
+			} = input
+			else {
+				panic!("consumer shuffle input");
+			};
+			assert!(matches!(
+				producer_partitions.as_slice(),
+				[ShufflePartitionRef::Live(_)]
+			));
+		}
+
+		dispatcher.release();
+		dispatch.await.expect("dispatch");
+	}
+
+	async fn assert_multi_upstream_join_keeps_barrier(
+		left_tasks: Vec<TaskPlan>,
+		right_tasks: Vec<TaskPlan>,
+		left_exchange_id: ExchangeId,
+		right_exchange_id: ExchangeId,
+		message: &str,
+	) {
+		let blocked_tasks = left_tasks
+			.iter()
+			.chain(right_tasks.iter())
+			.map(|task| TaskKey::from_identity(task.spec.identity))
+			.collect::<Vec<_>>();
+		let consumer = hash_join_consumer(
+			StageId::new(2),
+			left_exchange_id,
+			StageId::new(0),
+			right_exchange_id,
+			StageId::new(1),
+			JoinKind::Inner,
+		);
+		let expected_producer_count = left_tasks.len() + right_tasks.len();
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: left_tasks,
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![],
+				tasks: right_tasks,
+			},
+			StagePlan {
+				stage_id: StageId::new(2),
+				upstream_stages: vec![StageId::new(0), StageId::new(1)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let dispatcher = BlockingTaskSetDispatcher::new(blocked_tasks);
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(expected_producer_count),
+			) => {
+				seen.expect("all producers should dispatch");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before blocked producers were observed: {result:?}");
+			}
+		}
+		tokio::select! {
+			no_consumer = tokio::time::timeout(
+				std::time::Duration::from_millis(50),
+				dispatcher.wait_for_seen(expected_producer_count + 1),
+			) => {
+				no_consumer.expect_err(message);
+			}
+			result = &mut dispatch => {
+				panic!("multi-upstream consumer dispatched before barrier opened: {result:?}");
+			}
+		}
+
+		dispatcher.release();
+		dispatch.await.expect("dispatch");
 	}
 
 	#[tokio::test]
@@ -1612,6 +1972,165 @@ mod tests {
 
 	#[tokio::test]
 	async fn barrier_only_revert_would_break_the_pipelining_gate() {
+		assert_single_exchange_consumer_pipelines_before_producer_completion().await;
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_streamable_both_consumer_dispatches_before_either_upstream_accepts() {
+		assert_multi_upstream_streamable_join_dispatches_before_acceptance(false).await;
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_streamable_both_consumer_starts_before_sealed_manifests() {
+		assert_multi_upstream_streamable_join_dispatches_before_acceptance(true).await;
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_non_streamable_one_side_keeps_barrier() {
+		let left_exchange_id = ExchangeId::new(1233);
+		let right_exchange_id = ExchangeId::new(1234);
+		assert_multi_upstream_join_keeps_barrier(
+			vec![streamable_shuffle_producer(
+				StageId::new(0),
+				TaskId::new(0),
+				left_exchange_id,
+			)],
+			vec![non_streamable_shuffle_producer(
+				StageId::new(1),
+				TaskId::new(0),
+				right_exchange_id,
+			)],
+			left_exchange_id,
+			right_exchange_id,
+			"one non-streamable upstream must keep the multi-upstream barrier",
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_non_streamable_both_sides_keeps_barrier() {
+		let left_exchange_id = ExchangeId::new(1235);
+		let right_exchange_id = ExchangeId::new(1236);
+		assert_multi_upstream_join_keeps_barrier(
+			vec![non_streamable_shuffle_producer(
+				StageId::new(0),
+				TaskId::new(0),
+				left_exchange_id,
+			)],
+			vec![non_streamable_shuffle_producer(
+				StageId::new(1),
+				TaskId::new(0),
+				right_exchange_id,
+			)],
+			left_exchange_id,
+			right_exchange_id,
+			"two non-streamable upstreams must keep the multi-upstream barrier",
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_multi_producer_fan_in_keeps_barrier() {
+		let left_exchange_id = ExchangeId::new(1237);
+		let right_exchange_id = ExchangeId::new(1238);
+		assert_multi_upstream_join_keeps_barrier(
+			vec![
+				streamable_shuffle_producer(StageId::new(0), TaskId::new(0), left_exchange_id),
+				streamable_shuffle_producer(StageId::new(0), TaskId::new(1), left_exchange_id),
+			],
+			vec![streamable_shuffle_producer(
+				StageId::new(1),
+				TaskId::new(0),
+				right_exchange_id,
+			)],
+			left_exchange_id,
+			right_exchange_id,
+			"multi-producer fan-in must keep the multi-upstream barrier",
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_streamable_both_mixed_live_and_sealed_keeps_barrier() {
+		let left_exchange_id = ExchangeId::new(1239);
+		let right_exchange_id = ExchangeId::new(1240);
+		let left = streamable_shuffle_producer(StageId::new(0), TaskId::new(0), left_exchange_id);
+		let right = streamable_shuffle_producer(StageId::new(1), TaskId::new(0), right_exchange_id);
+		let right_key = TaskKey::from_identity(right.spec.identity);
+		let consumer = hash_join_consumer(
+			StageId::new(2),
+			left_exchange_id,
+			StageId::new(0),
+			right_exchange_id,
+			StageId::new(1),
+			JoinKind::Inner,
+		);
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![left],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![StageId::new(0)],
+				tasks: vec![right],
+			},
+			StagePlan {
+				stage_id: StageId::new(2),
+				upstream_stages: vec![StageId::new(0), StageId::new(1)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let dispatcher = BlockingTaskSetDispatcher::new([right_key]);
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(2),
+			) => {
+				seen.expect("left should seal before right producer starts");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before blocked right producer was observed: {result:?}");
+			}
+		}
+		tokio::select! {
+			no_consumer = tokio::time::timeout(
+				std::time::Duration::from_millis(50),
+				dispatcher.wait_for_seen(3),
+			) => {
+				no_consumer.expect_err("mixed sealed/live multi-upstream input is deferred");
+			}
+			result = &mut dispatch => {
+				panic!("mixed sealed/live consumer dispatched before all inputs sealed: {result:?}");
+			}
+		}
+
+		dispatcher.release();
+		dispatch.await.expect("dispatch");
+		let seen = dispatcher.seen();
+		for input in &seen[2].inputs {
+			let TaskInputBinding::ShuffleConsumer {
+				producer_partitions,
+				..
+			} = input
+			else {
+				panic!("consumer shuffle input");
+			};
+			assert!(
+				producer_partitions
+					.iter()
+					.all(|partition| matches!(partition, ShufflePartitionRef::Sealed(_)))
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn single_upstream_streamable_path_unchanged() {
 		assert_single_exchange_consumer_pipelines_before_producer_completion().await;
 	}
 
