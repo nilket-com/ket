@@ -3369,7 +3369,7 @@ fn budget_exhausted(dimension: BudgetDimension, requested: u64, available: u64) 
 	}
 }
 
-fn partition_bucket(
+pub(crate) fn partition_bucket(
 	key_arrays: &[ArrayRef],
 	row: usize,
 	partition_count: u32,

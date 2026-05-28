@@ -571,6 +571,7 @@ fn query_budget() -> QueryBudget {
 		broadcast_replicated_bytes_per_query: ByteCount::new(64 * 1024 * 1024),
 		max_arrow_ipc_frame: FrameByteLen::from_u32(u32::MAX),
 		cancellation_grace: toron::distributed::budget::DurationMillis::new(1_000),
+		max_in_flight_tasks: None,
 	}
 }
 

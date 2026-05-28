@@ -148,7 +148,7 @@ pub enum TaskInputBinding {
 		exchange_id: ExchangeId,
 		producer_stage_id: StageId,
 		partition_id: PartitionId,
-		producer_partitions: Vec<ProducerPartitionRef>,
+		producer_partitions: Vec<ShufflePartitionRef>,
 	},
 }
 
@@ -163,6 +163,80 @@ pub struct ProducerPartitionRef {
 	pub endpoint: WorkerEndpoint,
 	pub size_bytes: ByteCount,
 	pub digest: ArrowIpcDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShufflePartitionRef {
+	Sealed(ProducerPartitionRef),
+	Live(LiveProducerPartitionRef),
+}
+
+impl ShufflePartitionRef {
+	pub const fn address(&self) -> PartitionAddress {
+		match self {
+			Self::Sealed(partition) => partition.address,
+			Self::Live(partition) => partition.address,
+		}
+	}
+
+	pub fn endpoint(&self) -> &WorkerEndpoint {
+		match self {
+			Self::Sealed(partition) => &partition.endpoint,
+			Self::Live(partition) => &partition.endpoint,
+		}
+	}
+
+	pub const fn as_sealed(&self) -> Option<&ProducerPartitionRef> {
+		match self {
+			Self::Sealed(partition) => Some(partition),
+			Self::Live(_) => None,
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveProducerPartitionRef {
+	pub address: PartitionAddress,
+	pub worker_id: WorkerId,
+	pub endpoint: WorkerEndpoint,
+}
+
+pub fn is_streamable_exchange_producer(spec: &TaskSpec) -> bool {
+	matches!(spec.output, TaskOutputBinding::ShuffleProducer { .. })
+		&& matches!(
+			&spec.plan,
+			ExecutionPlan::Exchange { input, .. } if streamable_unary_plan(input)
+		)
+}
+
+pub fn is_streamable_shuffle_consumer(spec: &TaskSpec) -> bool {
+	spec.inputs
+		.iter()
+		.any(|input| matches!(input, TaskInputBinding::ShuffleConsumer { .. }))
+		&& streamable_unary_plan(&spec.plan)
+}
+
+fn streamable_unary_plan(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Scan { .. } => true,
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Take { input, .. } => streamable_unary_plan(input),
+		ExecutionPlan::Exchange { .. }
+		| ExecutionPlan::Sort { .. }
+		| ExecutionPlan::Aggregate { .. }
+		| ExecutionPlan::Join { .. }
+		| ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => false,
+	}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

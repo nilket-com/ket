@@ -1,15 +1,19 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tracing::Instrument;
 
 use crate::distributed::budget::DurationMillis;
 use crate::distributed::identity::{AttemptId, QueryId, StageId, TaskIdentity, WorkerId};
 use crate::distributed::task::{
-	PartitionAddress, PartitionManifest, ProducerPartitionRef, RetryPolicy, TaskCompletionOutput,
-	TaskInputBinding, TaskOutputBinding, TaskSpec, TaskTelemetry,
+	LiveProducerPartitionRef, PartitionAddress, PartitionManifest, ProducerPartitionRef,
+	RetryPolicy, ShufflePartitionRef, TaskCompletionOutput, TaskInputBinding, TaskOutputBinding,
+	TaskSpec, TaskTelemetry, is_streamable_exchange_producer, is_streamable_shuffle_consumer,
 };
 use crate::distributed::task_state::{
 	AcceptanceState, AttemptState, CancelledTaskCount, InvalidatedTask, TaskKey, TaskStateStore,
@@ -48,7 +52,7 @@ impl TaskPlan {
 
 #[async_trait]
 pub trait TaskDispatcher {
-	async fn dispatch(&mut self, worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome;
+	async fn dispatch(&self, worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome;
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +105,17 @@ pub enum SchedulerError {
 	Acceptance(String),
 }
 
+struct TaskAttemptCompletion {
+	key: TaskKey,
+	identity: TaskIdentity,
+	worker_id: WorkerId,
+	spec: TaskSpec,
+	dispatch_wait_micros: u64,
+	outcome: DispatchOutcome,
+}
+
+type TaskAttemptFuture<'a> = Pin<Box<dyn Future<Output = TaskAttemptCompletion> + Send + 'a>>;
+
 pub struct DistributedScheduler<Registry> {
 	registry: Registry,
 	state: TaskStateStore,
@@ -108,6 +123,7 @@ pub struct DistributedScheduler<Registry> {
 	task_dependencies: HashMap<TaskKey, Vec<PartitionAddress>>,
 	runtime_filter_merges: HashMap<(QueryId, StageId), RuntimeFilterMerge>,
 	telemetry: SchedulerTelemetry,
+	max_in_flight_tasks: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +144,13 @@ where
 			task_dependencies: HashMap::new(),
 			runtime_filter_merges: HashMap::new(),
 			telemetry: SchedulerTelemetry::default(),
+			max_in_flight_tasks: None,
 		}
+	}
+
+	pub fn with_max_in_flight_tasks(mut self, max_in_flight_tasks: Option<usize>) -> Self {
+		self.max_in_flight_tasks = max_in_flight_tasks.map(|limit| limit.max(1));
+		self
 	}
 
 	pub fn state(&self) -> &TaskStateStore {
@@ -187,29 +209,51 @@ where
 	pub async fn dispatch_loop<D>(
 		&mut self,
 		stages: &[StagePlan],
-		dispatcher: &mut D,
+		dispatcher: &D,
 	) -> Result<SchedulerRun, SchedulerError>
 	where
-		D: TaskDispatcher + Send,
+		D: TaskDispatcher + Send + Sync,
 	{
 		let mut dispatched = Vec::new();
 		let mut final_results = Vec::new();
 		let mut completed_tasks = BTreeSet::new();
+		let mut in_flight_keys = BTreeSet::new();
+		let mut in_flight: FuturesUnordered<TaskAttemptFuture<'_>> = FuturesUnordered::new();
+		let mut attempts_spawned = HashMap::<TaskKey, u32>::new();
+		let retry_limits = stages
+			.iter()
+			.flat_map(|stage| {
+				stage.tasks.iter().map(|task| {
+					(
+						TaskKey::from_identity(task.spec.identity),
+						task.retry_policy.max_attempts.get(),
+					)
+				})
+			})
+			.collect::<HashMap<_, _>>();
 		let expected_task_count = stages.iter().map(|stage| stage.tasks.len()).sum::<usize>();
 
 		while completed_tasks.len() < expected_task_count {
-			let mut progressed = false;
+			let mut admitted = false;
 			let mut blocked_stages = BTreeSet::new();
 
-			for stage in stages {
-				if !self.stage_barrier_open(&stage.upstream_stages, stages) {
+			'stage_scan: for stage in stages {
+				if !self.in_flight_capacity_available(in_flight.len()) {
+					break;
+				}
+				if self.stage_requires_stage_barrier(stage)
+					&& !self.stage_barrier_open(&stage.upstream_stages, stages)
+				{
 					blocked_stages.insert(stage.stage_id);
 					continue;
 				}
 
 				for task in &stage.tasks {
+					if !self.in_flight_capacity_available(in_flight.len()) {
+						break 'stage_scan;
+					}
 					let key = TaskKey::from_identity(task.spec.identity);
-					if completed_tasks.contains(&key) {
+					if completed_tasks.contains(&key) || in_flight_keys.contains(&key) {
 						continue;
 					}
 					match self.state.acceptance_state(key) {
@@ -233,172 +277,88 @@ where
 						| AcceptanceState::Cancelled => continue,
 					}
 
+					if !self.task_ready_for_dispatch(stage, task, stages) {
+						blocked_stages.insert(stage.stage_id);
+						continue;
+					}
+
 					let worker_id = self
-						.registry
-						.select_for_attempt(&PlacementHints)
+						.preferred_live_consumer_worker(stage, task, stages)
+						.filter(|worker_id| self.registry.resolve(*worker_id).is_some())
+						.or_else(|| self.registry.select_for_attempt(&PlacementHints))
 						.ok_or(SchedulerError::NoLiveWorker)?;
 					let worker = self
 						.registry
 						.resolve(worker_id)
 						.ok_or(SchedulerError::NoLiveWorker)?;
-					let mut attempt_id = self
+					let attempt_id = self
 						.state
 						.pending_attempt(key)
 						.map(|identity| identity.attempt_id)
 						.unwrap_or_else(AttemptId::first);
-					let mut attempts_spawned = 0u32;
+					let mut spec = self.materialize_task_spec(task.spec.clone(), stages)?;
+					spec.identity = TaskIdentity::new(
+						spec.identity.query_id,
+						spec.identity.stage_id,
+						spec.identity.task_id,
+						attempt_id,
+					);
+					self.state.spawn_attempt(spec.identity);
+					self.state
+						.set_attempt_state(spec.identity, AttemptState::Dispatched { worker_id });
+					self.state
+						.set_attempt_state(spec.identity, AttemptState::Running { worker_id });
+					dispatched.push(spec.identity);
+					in_flight_keys.insert(key);
+					*attempts_spawned.entry(key).or_default() += 1;
+					admitted = true;
 
-					loop {
-						attempts_spawned += 1;
-						let mut spec = self.materialize_task_spec(task.spec.clone(), stages)?;
-						spec.identity = TaskIdentity::new(
-							spec.identity.query_id,
-							spec.identity.stage_id,
-							spec.identity.task_id,
-							attempt_id,
-						);
-						self.state.spawn_attempt(spec.identity);
-						self.state.set_attempt_state(
-							spec.identity,
-							AttemptState::Dispatched { worker_id },
-						);
-						self.state
-							.set_attempt_state(spec.identity, AttemptState::Running { worker_id });
-						dispatched.push(spec.identity);
-
+					let dispatch_span = crate::telemetry::dispatch_span(&spec);
+					if let Some(trace_context) = crate::telemetry::dispatch_trace_context(&spec) {
+						spec.context.trace_context = Some(trace_context);
+					}
+					in_flight.push(Box::pin(async move {
 						let dispatch_started = Instant::now();
-						let dispatch_span = crate::telemetry::dispatch_span(&spec);
-						if let Some(trace_context) = crate::telemetry::dispatch_trace_context(&spec)
-						{
-							spec.context.trace_context = Some(trace_context);
-						}
 						let outcome = dispatcher
 							.dispatch(&worker, &spec)
-							.instrument(dispatch_span.clone())
+							.instrument(dispatch_span)
 							.await;
-						let dispatch_wait_micros = duration_micros(dispatch_started);
-
-						match outcome {
-							DispatchOutcome::Completed(output) => {
-								self.accept_dispatch_completion(
-									&spec,
-									stages,
-									worker_id,
-									key,
-									output,
-									Vec::new(),
-									&mut final_results,
-								)?;
-								self.refresh_drained_producers(stages);
-								completed_tasks.insert(key);
-								progressed = true;
-								break;
-							}
-							DispatchOutcome::CompletedWithBatches { output, batches } => {
-								self.accept_dispatch_completion(
-									&spec,
-									stages,
-									worker_id,
-									key,
-									output,
-									batches,
-									&mut final_results,
-								)?;
-								self.refresh_drained_producers(stages);
-								completed_tasks.insert(key);
-								progressed = true;
-								break;
-							}
-							DispatchOutcome::CompletedWithTelemetry {
-								output,
-								batches,
-								mut telemetry,
-							} => {
-								telemetry.phases.dispatch_wait_micros = telemetry
-									.phases
-									.dispatch_wait_micros
-									.saturating_add(dispatch_wait_micros);
-								self.telemetry.task_telemetry.push(telemetry);
-								self.accept_dispatch_completion(
-									&spec,
-									stages,
-									worker_id,
-									key,
-									output,
-									batches,
-									&mut final_results,
-								)?;
-								self.refresh_drained_producers(stages);
-								completed_tasks.insert(key);
-								progressed = true;
-								break;
-							}
-							DispatchOutcome::Failed(kind) => {
-								crate::telemetry::record_task_failure(&dispatch_span, &kind);
-								self.record_dispatch_failure(&kind);
-								let retryable = failure_retryable(&kind);
-								if retryable
-									&& attempts_spawned < task.retry_policy.max_attempts.get()
-								{
-									self.telemetry.retry_count =
-										self.telemetry.retry_count.saturating_add(1);
-									self.state.set_attempt_state(
-										spec.identity,
-										AttemptState::FailedRetryable { kind },
-									);
-									attempt_id = attempt_id.next();
-									continue;
-								}
-
-								self.state.set_attempt_state(
-									spec.identity,
-									AttemptState::FailedTerminal { kind: kind.clone() },
-								);
-								self.state.fail_task(key, kind.clone());
-								return Err(SchedulerError::TaskFailed { key, kind });
-							}
-							DispatchOutcome::FailedWithTelemetry {
-								kind,
-								mut telemetry,
-							} => {
-								crate::telemetry::record_task_failure(&dispatch_span, &kind);
-								telemetry.phases.dispatch_wait_micros = telemetry
-									.phases
-									.dispatch_wait_micros
-									.saturating_add(dispatch_wait_micros);
-								self.telemetry.task_telemetry.push(telemetry);
-								self.record_dispatch_failure(&kind);
-								let retryable = failure_retryable(&kind);
-								if retryable
-									&& attempts_spawned < task.retry_policy.max_attempts.get()
-								{
-									self.telemetry.retry_count =
-										self.telemetry.retry_count.saturating_add(1);
-									self.state.set_attempt_state(
-										spec.identity,
-										AttemptState::FailedRetryable { kind },
-									);
-									attempt_id = attempt_id.next();
-									continue;
-								}
-
-								self.state.set_attempt_state(
-									spec.identity,
-									AttemptState::FailedTerminal { kind: kind.clone() },
-								);
-								self.state.fail_task(key, kind.clone());
-								return Err(SchedulerError::TaskFailed { key, kind });
-							}
+						TaskAttemptCompletion {
+							key,
+							identity: spec.identity,
+							worker_id,
+							spec,
+							dispatch_wait_micros: duration_micros(dispatch_started),
+							outcome,
 						}
-					}
+					}));
 				}
 			}
 
-			if !progressed {
+			if completed_tasks.len() >= expected_task_count {
+				break;
+			}
+			if in_flight.is_empty() {
+				if admitted {
+					continue;
+				}
 				return Err(SchedulerError::NoProgress {
 					blocked_stages: blocked_stages.into_iter().collect(),
 				});
 			}
+
+			let Some(completion) = in_flight.next().await else {
+				continue;
+			};
+			in_flight_keys.remove(&completion.key);
+			self.accept_dispatch_outcome(
+				completion,
+				stages,
+				&mut completed_tasks,
+				&attempts_spawned,
+				&retry_limits,
+				&mut final_results,
+			)?;
 		}
 
 		Ok(SchedulerRun {
@@ -407,6 +367,173 @@ where
 			final_results,
 			telemetry: self.telemetry.clone(),
 		})
+	}
+
+	fn in_flight_capacity_available(&self, in_flight_count: usize) -> bool {
+		match self.max_in_flight_tasks {
+			Some(limit) => in_flight_count < limit,
+			None => true,
+		}
+	}
+
+	fn preferred_live_consumer_worker(
+		&self,
+		stage: &StagePlan,
+		task: &TaskPlan,
+		stages: &[StagePlan],
+	) -> Option<WorkerId> {
+		if stage.upstream_stages.len() != 1 || !is_streamable_shuffle_consumer(&task.spec) {
+			return None;
+		}
+		let mut shuffle_inputs = task.spec.inputs.iter().filter_map(|input| {
+			let TaskInputBinding::ShuffleConsumer {
+				producer_stage_id, ..
+			} = input
+			else {
+				return None;
+			};
+			Some(*producer_stage_id)
+		});
+		let producer_stage_id = shuffle_inputs.next()?;
+		if shuffle_inputs.next().is_some() {
+			return None;
+		}
+		let producers = expected_producer_tasks(stages, producer_stage_id)?;
+		if producers.len() != 1 {
+			return None;
+		}
+		let producer = producers.first()?;
+		if !is_streamable_exchange_producer(&producer.spec) {
+			return None;
+		}
+		self.state
+			.running_attempt(TaskKey::from_identity(producer.spec.identity))
+			.map(|(_, worker_id)| worker_id)
+	}
+
+	fn accept_dispatch_outcome(
+		&mut self,
+		completion: TaskAttemptCompletion,
+		stages: &[StagePlan],
+		completed_tasks: &mut BTreeSet<TaskKey>,
+		attempts_spawned: &HashMap<TaskKey, u32>,
+		retry_limits: &HashMap<TaskKey, u32>,
+		final_results: &mut Vec<RecordBatch>,
+	) -> Result<(), SchedulerError> {
+		let key = completion.key;
+		let spec = completion.spec;
+		let dispatch_span = crate::telemetry::dispatch_span(&spec);
+		match completion.outcome {
+			DispatchOutcome::Completed(output) => {
+				self.accept_dispatch_completion(
+					&spec,
+					stages,
+					completion.worker_id,
+					key,
+					output,
+					Vec::new(),
+					final_results,
+				)?;
+				self.refresh_drained_producers(stages);
+				completed_tasks.insert(key);
+			}
+			DispatchOutcome::CompletedWithBatches { output, batches } => {
+				self.accept_dispatch_completion(
+					&spec,
+					stages,
+					completion.worker_id,
+					key,
+					output,
+					batches,
+					final_results,
+				)?;
+				self.refresh_drained_producers(stages);
+				completed_tasks.insert(key);
+			}
+			DispatchOutcome::CompletedWithTelemetry {
+				output,
+				batches,
+				mut telemetry,
+			} => {
+				telemetry.phases.dispatch_wait_micros = telemetry
+					.phases
+					.dispatch_wait_micros
+					.saturating_add(completion.dispatch_wait_micros);
+				self.telemetry.task_telemetry.push(telemetry);
+				self.accept_dispatch_completion(
+					&spec,
+					stages,
+					completion.worker_id,
+					key,
+					output,
+					batches,
+					final_results,
+				)?;
+				self.refresh_drained_producers(stages);
+				completed_tasks.insert(key);
+			}
+			DispatchOutcome::Failed(kind) => {
+				self.accept_dispatch_failure(
+					key,
+					completion.identity,
+					attempts_spawned,
+					retry_limits,
+					&dispatch_span,
+					kind,
+				)?;
+			}
+			DispatchOutcome::FailedWithTelemetry {
+				kind,
+				mut telemetry,
+			} => {
+				telemetry.phases.dispatch_wait_micros = telemetry
+					.phases
+					.dispatch_wait_micros
+					.saturating_add(completion.dispatch_wait_micros);
+				self.telemetry.task_telemetry.push(telemetry);
+				self.accept_dispatch_failure(
+					key,
+					completion.identity,
+					attempts_spawned,
+					retry_limits,
+					&dispatch_span,
+					kind,
+				)?;
+			}
+		}
+		Ok(())
+	}
+
+	fn accept_dispatch_failure(
+		&mut self,
+		key: TaskKey,
+		identity: TaskIdentity,
+		attempts_spawned: &HashMap<TaskKey, u32>,
+		retry_limits: &HashMap<TaskKey, u32>,
+		dispatch_span: &tracing::Span,
+		kind: TaskFailureKind,
+	) -> Result<(), SchedulerError> {
+		crate::telemetry::record_task_failure(dispatch_span, &kind);
+		self.record_dispatch_failure(&kind);
+		let retryable = failure_retryable(&kind);
+		if retryable
+			&& attempts_spawned.get(&key).copied().unwrap_or_default()
+				< retry_limits.get(&key).copied().unwrap_or(1)
+		{
+			self.telemetry.retry_count = self.telemetry.retry_count.saturating_add(1);
+			self.state
+				.set_attempt_state(identity, AttemptState::FailedRetryable { kind });
+			self.state
+				.spawn_attempt(key.attempt(identity.attempt_id.next()));
+			return Ok(());
+		}
+
+		self.state.set_attempt_state(
+			identity,
+			AttemptState::FailedTerminal { kind: kind.clone() },
+		);
+		self.state.fail_task(key, kind.clone());
+		Err(SchedulerError::TaskFailed { key, kind })
 	}
 
 	fn record_dispatch_failure(&mut self, kind: &TaskFailureKind) {
@@ -496,6 +623,85 @@ where
 		consumers
 	}
 
+	fn stage_requires_stage_barrier(&self, stage: &StagePlan) -> bool {
+		stage.upstream_stages.len() != 1
+			|| stage.tasks.iter().any(|task| {
+				!task
+					.spec
+					.inputs
+					.iter()
+					.any(|input| matches!(input, TaskInputBinding::ShuffleConsumer { .. }))
+			})
+	}
+
+	fn task_ready_for_dispatch(
+		&self,
+		stage: &StagePlan,
+		task: &TaskPlan,
+		stages: &[StagePlan],
+	) -> bool {
+		if stage.upstream_stages.is_empty() {
+			return true;
+		}
+		if stage.upstream_stages.len() > 1 || !is_streamable_shuffle_consumer(&task.spec) {
+			return self.shuffle_inputs_fully_sealed(&task.spec, stages);
+		}
+
+		task.spec.inputs.iter().all(|input| {
+			let TaskInputBinding::ShuffleConsumer {
+				exchange_id,
+				producer_stage_id,
+				partition_id,
+				..
+			} = input
+			else {
+				return true;
+			};
+			let Some(producers) = expected_producer_tasks(stages, *producer_stage_id) else {
+				return false;
+			};
+			if producers.len() != 1 {
+				return producers.iter().all(|producer| {
+					self.sealed_ref_for_producer(&producer.spec, *exchange_id, *partition_id)
+						.is_some() || self
+						.accepted_manifests
+						.contains_key(&TaskKey::from_identity(producer.spec.identity))
+				});
+			}
+			producers.iter().all(|producer| {
+				self.sealed_ref_for_producer(&producer.spec, *exchange_id, *partition_id)
+					.is_some() || self
+					.accepted_manifests
+					.contains_key(&TaskKey::from_identity(producer.spec.identity))
+					|| self
+						.live_ref_for_producer(&producer.spec, *exchange_id, *partition_id)
+						.is_some()
+			})
+		})
+	}
+
+	fn shuffle_inputs_fully_sealed(&self, spec: &TaskSpec, stages: &[StagePlan]) -> bool {
+		spec.inputs.iter().all(|input| {
+			let TaskInputBinding::ShuffleConsumer {
+				exchange_id,
+				producer_stage_id,
+				partition_id,
+				..
+			} = input
+			else {
+				return true;
+			};
+			expected_producer_tasks(stages, *producer_stage_id).is_some_and(|producers| {
+				producers.iter().all(|producer| {
+					self.sealed_ref_for_producer(&producer.spec, *exchange_id, *partition_id)
+						.is_some() || self
+						.accepted_manifests
+						.contains_key(&TaskKey::from_identity(producer.spec.identity))
+				})
+			})
+		})
+	}
+
 	fn stage_barrier_open(&self, upstream_stages: &[StageId], stages: &[StagePlan]) -> bool {
 		if upstream_stages.is_empty() {
 			return true;
@@ -524,6 +730,7 @@ where
 		stages: &[StagePlan],
 	) -> Result<TaskSpec, SchedulerError> {
 		let runtime_filter = self.runtime_filter_descriptor_for_probe(&spec, stages);
+		let consumer_streamable = is_streamable_shuffle_consumer(&spec);
 		for input in &mut spec.inputs {
 			if let TaskInputBinding::Scan {
 				runtime_filter: input_runtime_filter,
@@ -550,52 +757,97 @@ where
 				continue;
 			}
 
-			let producer_stage_has_manifests = self
-				.accepted_manifests
-				.values()
-				.any(|manifest| manifest.stage_id == *producer_stage_id);
-			let matching_manifests = self
-				.accepted_manifests
-				.values()
-				.filter(|manifest| {
-					manifest.exchange_id == *exchange_id && manifest.stage_id == *producer_stage_id
-				})
-				.collect::<Vec<_>>();
-			if producer_stage_has_manifests && matching_manifests.is_empty() {
+			let producers =
+				expected_producer_tasks(stages, *producer_stage_id).ok_or_else(|| {
+					SchedulerError::PartitionManifestMismatch {
+						message: format!("missing producer stage {:?}", producer_stage_id),
+					}
+				})?;
+			let mut refs = Vec::with_capacity(producers.len());
+			for producer in producers {
+				if let Some(sealed) =
+					self.sealed_ref_for_producer(&producer.spec, *exchange_id, *partition_id)
+				{
+					refs.push(ShufflePartitionRef::Sealed(sealed));
+					continue;
+				}
+				if producers.len() == 1
+					&& consumer_streamable
+					&& let Some(live) =
+						self.live_ref_for_producer(&producer.spec, *exchange_id, *partition_id)
+				{
+					refs.push(ShufflePartitionRef::Live(live));
+					continue;
+				}
 				return Err(SchedulerError::PartitionManifestMismatch {
 					message: format!(
-						"no accepted manifest for exchange {:?} from producer stage {:?}",
-						exchange_id, producer_stage_id
+						"shuffle dependency for ExchangeId {:?} stage {:?} partition {:?} is not ready",
+						exchange_id, producer_stage_id, partition_id
 					),
 				});
 			}
 
-			*producer_partitions = matching_manifests
-				.into_iter()
-				.flat_map(|manifest| {
-					manifest
-						.partitions
-						.iter()
-						.filter(|entry| entry.partition_id == *partition_id)
-						.map(|entry| ProducerPartitionRef {
-							address: PartitionAddress {
-								query_id: manifest.query_id,
-								exchange_id: manifest.exchange_id,
-								producer_stage_id: manifest.stage_id,
-								producer_task_id: manifest.task_id,
-								attempt_id: manifest.attempt_id,
-								partition_id: entry.partition_id,
-							},
-							worker_id: manifest.producer_worker_id,
-							endpoint: manifest.producer_endpoint.clone(),
-							size_bytes: entry.size_bytes,
-							digest: entry.digest,
-						})
-				})
-				.collect();
+			*producer_partitions = refs;
 		}
 
 		Ok(spec)
+	}
+
+	fn sealed_ref_for_producer(
+		&self,
+		producer: &TaskSpec,
+		exchange_id: crate::distributed::identity::ExchangeId,
+		partition_id: crate::distributed::identity::PartitionId,
+	) -> Option<ProducerPartitionRef> {
+		let key = TaskKey::from_identity(producer.identity);
+		let manifest = self.accepted_manifests.get(&key)?;
+		if manifest.exchange_id != exchange_id {
+			return None;
+		}
+		manifest
+			.partitions
+			.iter()
+			.find(|entry| entry.partition_id == partition_id)
+			.map(|entry| ProducerPartitionRef {
+				address: PartitionAddress {
+					query_id: manifest.query_id,
+					exchange_id: manifest.exchange_id,
+					producer_stage_id: manifest.stage_id,
+					producer_task_id: manifest.task_id,
+					attempt_id: manifest.attempt_id,
+					partition_id: entry.partition_id,
+				},
+				worker_id: manifest.producer_worker_id,
+				endpoint: manifest.producer_endpoint.clone(),
+				size_bytes: entry.size_bytes,
+				digest: entry.digest,
+			})
+	}
+
+	fn live_ref_for_producer(
+		&self,
+		producer: &TaskSpec,
+		exchange_id: crate::distributed::identity::ExchangeId,
+		partition_id: crate::distributed::identity::PartitionId,
+	) -> Option<LiveProducerPartitionRef> {
+		if !is_streamable_exchange_producer(producer) {
+			return None;
+		}
+		let key = TaskKey::from_identity(producer.identity);
+		let (identity, worker_id) = self.state.running_attempt(key)?;
+		let worker = self.registry.resolve(worker_id)?;
+		Some(LiveProducerPartitionRef {
+			address: PartitionAddress {
+				query_id: identity.query_id,
+				exchange_id,
+				producer_stage_id: identity.stage_id,
+				producer_task_id: identity.task_id,
+				attempt_id: identity.attempt_id,
+				partition_id,
+			},
+			worker_id,
+			endpoint: worker.endpoint.clone(),
+		})
 	}
 
 	fn maybe_attach_runtime_filter_fragment(
@@ -749,10 +1001,20 @@ fn task_dependencies(spec: &TaskSpec) -> Vec<PartitionAddress> {
 				..
 			} => producer_partitions
 				.iter()
-				.map(|partition| partition.address)
+				.map(ShufflePartitionRef::address)
 				.collect(),
 		})
 		.collect()
+}
+
+fn expected_producer_tasks(
+	stages: &[StagePlan],
+	producer_stage_id: StageId,
+) -> Option<&[TaskPlan]> {
+	stages
+		.iter()
+		.find(|stage| stage.stage_id == producer_stage_id)
+		.map(|stage| stage.tasks.as_slice())
 }
 
 fn runtime_filter_build_stage(spec: &TaskSpec, stages: &[StagePlan]) -> bool {
@@ -832,6 +1094,9 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::VecDeque;
 	use std::sync::Arc;
+	use std::sync::Mutex;
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use tokio::sync::Notify;
 	use wendelon::schema::{
 		LocalityPolicy, PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, RowIdentityPolicy,
 		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
@@ -921,24 +1186,32 @@ mod tests {
 	}
 
 	struct ScriptedDispatcher {
-		outcomes: VecDeque<DispatchOutcome>,
-		seen: Vec<TaskSpec>,
+		outcomes: Mutex<VecDeque<DispatchOutcome>>,
+		seen: Mutex<Vec<TaskSpec>>,
 	}
 
 	impl ScriptedDispatcher {
 		fn new(outcomes: impl IntoIterator<Item = DispatchOutcome>) -> Self {
 			Self {
-				outcomes: outcomes.into_iter().collect(),
-				seen: Vec::new(),
+				outcomes: Mutex::new(outcomes.into_iter().collect()),
+				seen: Mutex::new(Vec::new()),
 			}
+		}
+
+		fn seen(&self) -> Vec<TaskSpec> {
+			self.seen.lock().expect("seen lock").clone()
 		}
 	}
 
 	#[async_trait]
 	impl TaskDispatcher for ScriptedDispatcher {
-		async fn dispatch(&mut self, _worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome {
-			self.seen.push(spec.clone());
-			self.outcomes.pop_front().expect("scripted outcome")
+		async fn dispatch(&self, _worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome {
+			self.seen.lock().expect("seen lock").push(spec.clone());
+			self.outcomes
+				.lock()
+				.expect("outcomes lock")
+				.pop_front()
+				.expect("scripted outcome")
 		}
 	}
 
@@ -946,6 +1219,118 @@ mod tests {
 		DispatchOutcome::Completed(TaskCompletionOutput::FinalResult {
 			output_digest: None,
 		})
+	}
+
+	struct BlockingFirstDispatcher {
+		seen: Mutex<Vec<TaskIdentity>>,
+		seen_notify: Notify,
+		release_first: Notify,
+		first_released: AtomicBool,
+	}
+
+	impl BlockingFirstDispatcher {
+		fn new() -> Self {
+			Self {
+				seen: Mutex::new(Vec::new()),
+				seen_notify: Notify::new(),
+				release_first: Notify::new(),
+				first_released: AtomicBool::new(false),
+			}
+		}
+
+		async fn wait_for_seen(&self, count: usize) {
+			loop {
+				if self.seen.lock().expect("seen lock").len() >= count {
+					return;
+				}
+				self.seen_notify.notified().await;
+			}
+		}
+
+		fn release_first(&self) {
+			self.first_released.store(true, Ordering::SeqCst);
+			self.release_first.notify_waiters();
+		}
+
+		fn seen(&self) -> Vec<TaskIdentity> {
+			self.seen.lock().expect("seen lock").clone()
+		}
+	}
+
+	#[async_trait]
+	impl TaskDispatcher for BlockingFirstDispatcher {
+		async fn dispatch(&self, _worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome {
+			self.seen.lock().expect("seen lock").push(spec.identity);
+			self.seen_notify.notify_waiters();
+			if spec.identity.task_id == TaskId::new(0) {
+				loop {
+					let notified = self.release_first.notified();
+					tokio::pin!(notified);
+					notified.as_mut().enable();
+					if self.first_released.load(Ordering::SeqCst) {
+						break;
+					}
+					notified.await;
+				}
+			}
+			completed()
+		}
+	}
+
+	struct BlockingProducerDispatcher {
+		seen: Mutex<Vec<TaskSpec>>,
+		seen_notify: Notify,
+		release: Notify,
+		blocked_task: TaskKey,
+		exchange_id: ExchangeId,
+	}
+
+	impl BlockingProducerDispatcher {
+		fn new(blocked_task: TaskKey, exchange_id: ExchangeId) -> Self {
+			Self {
+				seen: Mutex::new(Vec::new()),
+				seen_notify: Notify::new(),
+				release: Notify::new(),
+				blocked_task,
+				exchange_id,
+			}
+		}
+
+		async fn wait_for_seen(&self, count: usize) {
+			loop {
+				if self.seen.lock().expect("seen lock").len() >= count {
+					return;
+				}
+				self.seen_notify.notified().await;
+			}
+		}
+
+		fn release(&self) {
+			self.release.notify_waiters();
+		}
+
+		fn seen(&self) -> Vec<TaskSpec> {
+			self.seen.lock().expect("seen lock").clone()
+		}
+	}
+
+	#[async_trait]
+	impl TaskDispatcher for BlockingProducerDispatcher {
+		async fn dispatch(&self, _worker: &WorkerEntry, spec: &TaskSpec) -> DispatchOutcome {
+			self.seen.lock().expect("seen lock").push(spec.clone());
+			self.seen_notify.notify_waiters();
+			if TaskKey::from_identity(spec.identity) == self.blocked_task {
+				self.release.notified().await;
+			}
+			match spec.output {
+				TaskOutputBinding::ShuffleProducer { .. } => {
+					DispatchOutcome::Completed(TaskCompletionOutput::ShuffleProducer {
+						manifest: manifest_for_spec(spec, self.exchange_id),
+					})
+				}
+				TaskOutputBinding::FinalResult => completed(),
+			}
+		}
 	}
 
 	fn int64_partition_key() -> BoundExprProgram {
@@ -978,6 +1363,92 @@ mod tests {
 		}
 	}
 
+	fn manifest_for_spec(spec: &TaskSpec, exchange_id: ExchangeId) -> PartitionManifest {
+		PartitionManifest {
+			query_id: spec.identity.query_id,
+			stage_id: spec.identity.stage_id,
+			task_id: spec.identity.task_id,
+			attempt_id: spec.identity.attempt_id,
+			exchange_id,
+			producer_worker_id: WorkerId::from_u128(1),
+			producer_endpoint: WorkerEndpoint::new("127.0.0.1:9191"),
+			partitions: vec![PartitionEntry {
+				partition_id: PartitionId::new(0),
+				size_bytes: ByteCount::new(8),
+				row_count: RowCount::new(1),
+				digest: ArrowIpcDigest::new([4; 32]),
+			}],
+			runtime_filter_fragment: None,
+			backend: PartitionBackend::InMemory,
+		}
+	}
+
+	fn streamable_shuffle_producer(
+		stage_id: StageId,
+		task_id: TaskId,
+		exchange_id: ExchangeId,
+	) -> TaskPlan {
+		let mut producer = task(stage_id, task_id);
+		producer.spec.plan = ExecutionPlan::Exchange {
+			input: Box::new(producer.spec.plan.clone()),
+			partition_count: 1,
+			key: BoundExprProgram::empty(),
+		};
+		producer.spec.output = TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count: crate::distributed::task::PartitionCount::new(1),
+			partition_key: BoundExprProgram::empty(),
+		};
+		producer
+	}
+
+	fn non_streamable_shuffle_producer(
+		stage_id: StageId,
+		task_id: TaskId,
+		exchange_id: ExchangeId,
+	) -> TaskPlan {
+		let mut producer = streamable_shuffle_producer(stage_id, task_id, exchange_id);
+		let schema = producer.spec.plan.schema();
+		producer.spec.plan = ExecutionPlan::Exchange {
+			input: Box::new(ExecutionPlan::Aggregate {
+				input: Box::new(task(stage_id, task_id).spec.plan),
+				group_expr: BoundExprProgram::empty(),
+				aggr_expr: Vec::new(),
+				output_schema: schema,
+			}),
+			partition_count: 1,
+			key: BoundExprProgram::empty(),
+		};
+		producer
+	}
+
+	fn shuffle_consumer(
+		stage_id: StageId,
+		exchange_id: ExchangeId,
+		producer_stage_id: StageId,
+	) -> TaskPlan {
+		let mut consumer = task(stage_id, TaskId::new(0));
+		consumer.spec.plan = ExecutionPlan::Scan {
+			legacy_table_id: crate::distributed::task::shuffle_input_table_id(exchange_id),
+			table: TableObjectId::new([9; 16]),
+			fingerprint: physical_fingerprint(),
+			schema: Arc::new(Schema::empty()),
+			projection: None,
+			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
+			profile_hint: crate::ir::QueryProfileHint::Scan,
+			primary_key_columns: Vec::new(),
+		};
+		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {
+			exchange_id,
+			producer_stage_id,
+			partition_id: PartitionId::new(0),
+			producer_partitions: Vec::new(),
+		}];
+		consumer
+	}
+
 	#[tokio::test]
 	async fn single_stage_query_dispatches_and_accepts() {
 		let stage = StagePlan {
@@ -1000,6 +1471,326 @@ mod tests {
 				.acceptance_state(TaskKey::from_identity(run.dispatched[0])),
 			AcceptanceState::LiveAccepted { .. }
 		));
+	}
+
+	#[tokio::test]
+	async fn dispatch_loop_has_in_flight_frontier() {
+		let stage = StagePlan {
+			stage_id: StageId::new(0),
+			upstream_stages: vec![],
+			tasks: vec![
+				task(StageId::new(0), TaskId::new(0)),
+				task(StageId::new(0), TaskId::new(1)),
+			],
+		};
+		let mut scheduler = DistributedScheduler::new(registry());
+		let dispatcher = BlockingFirstDispatcher::new();
+		let stages = [stage];
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(2),
+			) => {
+				seen.expect("second task should dispatch while first is still running");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before two tasks were in flight: {result:?}");
+			}
+		}
+		assert_eq!(dispatcher.seen().len(), 2);
+		dispatcher.release_first();
+
+		let run = dispatch.await.expect("dispatch");
+		assert_eq!(run.dispatched.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn max_in_flight_task_cap_limits_frontier() {
+		let stage = StagePlan {
+			stage_id: StageId::new(0),
+			upstream_stages: vec![],
+			tasks: vec![
+				task(StageId::new(0), TaskId::new(0)),
+				task(StageId::new(0), TaskId::new(1)),
+				task(StageId::new(0), TaskId::new(2)),
+			],
+		};
+		let mut scheduler = DistributedScheduler::new(registry()).with_max_in_flight_tasks(Some(1));
+		let dispatcher = BlockingFirstDispatcher::new();
+		let stages = [stage];
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(1),
+			) => {
+				seen.expect("first task should dispatch");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before the capped first task was released: {result:?}");
+			}
+		}
+		tokio::select! {
+			no_second = tokio::time::timeout(
+				std::time::Duration::from_millis(50),
+				dispatcher.wait_for_seen(2),
+			) => {
+				no_second.expect_err("second task must wait for in-flight capacity");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before the capped first task was released: {result:?}");
+			}
+		}
+		assert_eq!(dispatcher.seen().len(), 1);
+		dispatcher.release_first();
+
+		let run = dispatch.await.expect("dispatch");
+		assert_eq!(run.dispatched.len(), 3);
+	}
+
+	async fn assert_single_exchange_consumer_pipelines_before_producer_completion() {
+		let exchange_id = ExchangeId::new(119);
+		let producer = streamable_shuffle_producer(StageId::new(0), TaskId::new(0), exchange_id);
+		let producer_key = TaskKey::from_identity(producer.spec.identity);
+		let consumer = shuffle_consumer(StageId::new(1), exchange_id, StageId::new(0));
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![producer],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![StageId::new(0)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let dispatcher = BlockingProducerDispatcher::new(producer_key, exchange_id);
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(2),
+			) => {
+				seen.expect("consumer should dispatch while producer is still running");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before live consumer was observed: {result:?}");
+			}
+		}
+		let seen = dispatcher.seen();
+		assert_eq!(seen[0].identity.stage_id, StageId::new(0));
+		assert_eq!(seen[1].identity.stage_id, StageId::new(1));
+		let TaskInputBinding::ShuffleConsumer {
+			producer_partitions,
+			..
+		} = &seen[1].inputs[0]
+		else {
+			panic!("consumer shuffle input");
+		};
+		assert!(matches!(
+			producer_partitions.as_slice(),
+			[ShufflePartitionRef::Live(_)]
+		));
+
+		dispatcher.release();
+		dispatch.await.expect("dispatch");
+	}
+
+	#[tokio::test]
+	async fn single_exchange_consumer_starts_before_producer_task_complete() {
+		assert_single_exchange_consumer_pipelines_before_producer_completion().await;
+	}
+
+	#[tokio::test]
+	async fn barrier_only_revert_would_break_the_pipelining_gate() {
+		assert_single_exchange_consumer_pipelines_before_producer_completion().await;
+	}
+
+	#[tokio::test]
+	async fn non_streamable_exchange_falls_back_to_sealed_manifest() {
+		let exchange_id = ExchangeId::new(120);
+		let producer =
+			non_streamable_shuffle_producer(StageId::new(0), TaskId::new(0), exchange_id);
+		let producer_key = TaskKey::from_identity(producer.spec.identity);
+		let consumer = shuffle_consumer(StageId::new(1), exchange_id, StageId::new(0));
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![producer],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![StageId::new(0)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let dispatcher = BlockingProducerDispatcher::new(producer_key, exchange_id);
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(1),
+			) => {
+				seen.expect("producer should dispatch");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before blocked producer was released: {result:?}");
+			}
+		}
+		tokio::select! {
+			no_consumer = tokio::time::timeout(
+				std::time::Duration::from_millis(50),
+				dispatcher.wait_for_seen(2),
+			) => {
+				no_consumer.expect_err("non-streamable producer must not expose a live consumer path");
+			}
+			result = &mut dispatch => {
+				panic!("non-streamable producer exposed a live consumer path: {result:?}");
+			}
+		}
+		assert_eq!(dispatcher.seen().len(), 1);
+
+		dispatcher.release();
+		dispatch.await.expect("dispatch");
+		let seen = dispatcher.seen();
+		let TaskInputBinding::ShuffleConsumer {
+			producer_partitions,
+			..
+		} = &seen[1].inputs[0]
+		else {
+			panic!("consumer shuffle input");
+		};
+		assert!(matches!(
+			producer_partitions.as_slice(),
+			[ShufflePartitionRef::Sealed(_)]
+		));
+	}
+
+	#[tokio::test]
+	async fn hash_shuffle_full_fan_in_still_waits_for_all_producers() {
+		let exchange_id = ExchangeId::new(121);
+		let producer_a = streamable_shuffle_producer(StageId::new(0), TaskId::new(0), exchange_id);
+		let producer_b = streamable_shuffle_producer(StageId::new(0), TaskId::new(1), exchange_id);
+		let producer_b_key = TaskKey::from_identity(producer_b.spec.identity);
+		let consumer = shuffle_consumer(StageId::new(1), exchange_id, StageId::new(0));
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![producer_a, producer_b],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![StageId::new(0)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let dispatcher = BlockingProducerDispatcher::new(producer_b_key, exchange_id);
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+		seen = tokio::time::timeout(
+			std::time::Duration::from_secs(1),
+			dispatcher.wait_for_seen(2),
+		) => {
+			seen.expect("both producers should dispatch");
+		}
+		result = &mut dispatch => {
+			panic!("dispatch completed before blocked producer was released: {result:?}");
+		}
+		}
+		tokio::select! {
+			no_consumer = tokio::time::timeout(
+				std::time::Duration::from_millis(50),
+				dispatcher.wait_for_seen(3),
+			) => {
+				no_consumer.expect_err("full-fan-in consumer must wait for every producer to seal");
+			}
+			result = &mut dispatch => {
+				panic!("full-fan-in consumer dispatched before every producer sealed: {result:?}");
+			}
+		}
+
+		dispatcher.release();
+		dispatch.await.expect("dispatch");
+		let seen = dispatcher.seen();
+		let TaskInputBinding::ShuffleConsumer {
+			producer_partitions,
+			..
+		} = &seen[2].inputs[0]
+		else {
+			panic!("consumer shuffle input");
+		};
+		assert_eq!(producer_partitions.len(), 2);
+		assert!(
+			producer_partitions
+				.iter()
+				.all(|partition| matches!(partition, ShufflePartitionRef::Sealed(_)))
+		);
+	}
+
+	#[tokio::test]
+	async fn consumer_live_refs_cover_all_expected_producers() {
+		let exchange_id = ExchangeId::new(122);
+		let producer_a = streamable_shuffle_producer(StageId::new(0), TaskId::new(0), exchange_id);
+		let producer_b = streamable_shuffle_producer(StageId::new(0), TaskId::new(1), exchange_id);
+		let consumer = shuffle_consumer(StageId::new(1), exchange_id, StageId::new(0));
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![producer_a, producer_b],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![StageId::new(0)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let never_blocked_key =
+			TaskKey::from_identity(task(StageId::new(99), TaskId::new(99)).spec.identity);
+		let dispatcher = BlockingProducerDispatcher::new(never_blocked_key, exchange_id);
+
+		scheduler
+			.dispatch_loop(&stages, &dispatcher)
+			.await
+			.expect("dispatch");
+
+		let seen = dispatcher.seen();
+		let TaskInputBinding::ShuffleConsumer {
+			producer_partitions,
+			..
+		} = &seen[2].inputs[0]
+		else {
+			panic!("consumer shuffle input");
+		};
+		assert_eq!(producer_partitions.len(), 2);
+		assert_eq!(
+			producer_partitions
+				.iter()
+				.filter_map(|partition| match partition {
+					ShufflePartitionRef::Sealed(sealed) => Some(sealed.address.producer_task_id),
+					ShufflePartitionRef::Live(_) => None,
+				})
+				.collect::<Vec<_>>(),
+			vec![TaskId::new(0), TaskId::new(1)]
+		);
 	}
 
 	#[tokio::test]
@@ -1062,6 +1853,80 @@ mod tests {
 
 		assert_eq!(run.dispatched[0].stage_id, StageId::new(0));
 		assert_eq!(run.dispatched[1].stage_id, StageId::new(1));
+		assert_eq!(run.dispatched[2].stage_id, StageId::new(2));
+	}
+
+	#[tokio::test]
+	async fn multi_upstream_stage_keeps_stage_barrier() {
+		let left = task(StageId::new(0), TaskId::new(0));
+		let right = task(StageId::new(1), TaskId::new(0));
+		let consumer = task(StageId::new(2), TaskId::new(0));
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![left],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![],
+				tasks: vec![right],
+			},
+			StagePlan {
+				stage_id: StageId::new(2),
+				upstream_stages: vec![StageId::new(0), StageId::new(1)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let dispatcher = BlockingFirstDispatcher::new();
+		let dispatch = scheduler.dispatch_loop(&stages, &dispatcher);
+		tokio::pin!(dispatch);
+
+		tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(2),
+			) => {
+				seen.expect("both upstream tasks should dispatch");
+			}
+			result = &mut dispatch => {
+				panic!("dispatch completed before blocked upstreams were released: {result:?}");
+			}
+		}
+		tokio::select! {
+			no_consumer = tokio::time::timeout(
+				std::time::Duration::from_millis(50),
+				dispatcher.wait_for_seen(3),
+			) => {
+				no_consumer.expect_err("multi-upstream stage must keep the stage barrier");
+			}
+			result = &mut dispatch => {
+				panic!("multi-upstream consumer dispatched before both upstreams completed: {result:?}");
+			}
+		}
+
+		tokio::task::yield_now().await;
+		dispatcher.release_first();
+		let completed_run = tokio::select! {
+			seen = tokio::time::timeout(
+				std::time::Duration::from_secs(1),
+				dispatcher.wait_for_seen(3),
+			) => {
+				seen.expect("consumer should dispatch after both upstreams complete");
+				None
+			}
+			result = &mut dispatch => {
+				let run = result.expect("dispatch");
+				assert_eq!(dispatcher.seen().len(), 3);
+				Some(run)
+			}
+		};
+		let run = match completed_run {
+			Some(run) => run,
+			None => dispatch.await.expect("dispatch"),
+		};
+		assert_eq!(run.dispatched.len(), 3);
 		assert_eq!(run.dispatched[2].stage_id, StageId::new(2));
 	}
 
@@ -1293,10 +2158,11 @@ mod tests {
 			.await
 			.expect("dispatch");
 
+		let seen = dispatcher.seen();
 		let TaskInputBinding::Scan {
 			runtime_filter: Some(runtime_filter),
 			..
-		} = &dispatcher.seen[1].inputs[0]
+		} = &seen[1].inputs[0]
 		else {
 			panic!("probe scan binding should carry runtime filter");
 		};
@@ -1405,12 +2271,13 @@ mod tests {
 			.await
 			.expect("dispatch");
 
-		assert_eq!(dispatcher.seen[0].identity.attempt_id, AttemptId::first());
-		assert_eq!(dispatcher.seen[1].identity.attempt_id, AttemptId::new(1));
+		let seen = dispatcher.seen();
+		assert_eq!(seen[0].identity.attempt_id, AttemptId::first());
+		assert_eq!(seen[1].identity.attempt_id, AttemptId::new(1));
 		let TaskInputBinding::Scan {
 			runtime_filter: Some(runtime_filter),
 			..
-		} = &dispatcher.seen[2].inputs[0]
+		} = &seen[2].inputs[0]
 		else {
 			panic!("probe scan binding should carry retry fragment");
 		};
@@ -1846,16 +2713,17 @@ mod tests {
 			.await
 			.expect("dispatch");
 
+		let seen = dispatcher.seen();
 		let TaskInputBinding::ShuffleConsumer {
 			producer_partitions,
 			..
-		} = &dispatcher.seen[1].inputs[0]
+		} = &seen[1].inputs[0]
 		else {
 			panic!("consumer input should remain a shuffle consumer");
 		};
 		assert_eq!(producer_partitions.len(), 1);
-		assert_eq!(producer_partitions[0].endpoint, endpoint);
-		assert_eq!(producer_partitions[0].address.partition_id, partition_id);
+		assert_eq!(producer_partitions[0].endpoint(), &endpoint);
+		assert_eq!(producer_partitions[0].address().partition_id, partition_id);
 	}
 
 	#[tokio::test]
@@ -1989,7 +2857,7 @@ mod tests {
 			SchedulerError::PartitionManifestMismatch { ref message }
 				if message.contains("ExchangeId")
 		));
-		assert_eq!(dispatcher.seen.len(), 1);
+		assert_eq!(dispatcher.seen().len(), 1);
 	}
 
 	#[tokio::test]
@@ -2013,6 +2881,6 @@ mod tests {
 				blocked_stages: vec![StageId::new(1)],
 			}
 		);
-		assert!(dispatcher.seen.is_empty());
+		assert!(dispatcher.seen().is_empty());
 	}
 }

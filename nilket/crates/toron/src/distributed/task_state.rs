@@ -121,6 +121,21 @@ impl TaskStateStore {
 		self.attempts.get(&identity)
 	}
 
+	pub fn running_attempt(&self, key: TaskKey) -> Option<(TaskIdentity, WorkerId)> {
+		self.attempts
+			.iter()
+			.filter_map(|(identity, state)| {
+				if TaskKey::from_identity(*identity) == key
+					&& let AttemptState::Running { worker_id } = state
+				{
+					Some((*identity, *worker_id))
+				} else {
+					None
+				}
+			})
+			.min_by_key(|(identity, _)| identity.attempt_id)
+	}
+
 	pub fn pending_attempt(&self, key: TaskKey) -> Option<TaskIdentity> {
 		self.attempts
 			.iter()

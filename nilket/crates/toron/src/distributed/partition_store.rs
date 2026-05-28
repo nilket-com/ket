@@ -1,13 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
+use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::distributed::budget::{
 	BudgetDimension, BudgetRejection, BudgetReservation, BudgetTracker, ByteCount, QueryBudget,
+};
+use crate::distributed::cancellation::{
+	DownstreamCancellationContext, DownstreamCancellationTrigger,
 };
 use crate::distributed::identity::{AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId};
 use crate::distributed::task::{
@@ -28,6 +34,40 @@ pub trait PartitionStore: Send + Sync {
 		address: PartitionAddress,
 		expected_attempt: AttemptId,
 	) -> Result<PartitionPayload, PartitionMissingReason>;
+	fn open_live(&self, address: PartitionAddress) -> Result<(), PartitionStoreError> {
+		let _ = address;
+		Err(PartitionStoreError::LiveUnsupported)
+	}
+	fn open_live_with_downstream_cancellation(
+		&self,
+		address: PartitionAddress,
+		downstream_cancellation: Option<DownstreamCancellationContext>,
+	) -> Result<(), PartitionStoreError> {
+		let _ = downstream_cancellation;
+		self.open_live(address)
+	}
+	fn append_live(&self, payload: PartitionPayload) -> Result<(), PartitionStoreError> {
+		let _ = payload;
+		Err(PartitionStoreError::LiveUnsupported)
+	}
+	fn seal_live(
+		&self,
+		manifest: PartitionManifest,
+	) -> Result<PartitionManifest, PartitionStoreError> {
+		let _ = manifest;
+		Err(PartitionStoreError::LiveUnsupported)
+	}
+	fn cancel_live(&self, address: PartitionAddress, reason: PartitionMissingReason) {
+		let _ = (address, reason);
+	}
+	fn pull_live(
+		&self,
+		address: PartitionAddress,
+		expected_attempt: AttemptId,
+	) -> Result<LivePartitionStream, PartitionMissingReason> {
+		let _ = (address, expected_attempt);
+		Err(PartitionMissingReason::StoreEvicted)
+	}
 	fn remove_query(&self, query_id: QueryId);
 	fn cancel_query(&self, query_id: QueryId);
 }
@@ -116,6 +156,66 @@ impl PartitionPayload {
 	}
 }
 
+pub struct LivePartitionStream {
+	chunks: BoxStream<'static, Result<PartitionPayload, PartitionMissingReason>>,
+	cancel_on_drop: Option<LivePartitionCancelOnDrop>,
+}
+
+struct LivePartitionCancelOnDrop {
+	inner: Arc<RwLock<PartitionStoreInner>>,
+	address: PartitionAddress,
+}
+
+impl LivePartitionStream {
+	fn with_cancel_on_drop(
+		chunks: BoxStream<'static, Result<PartitionPayload, PartitionMissingReason>>,
+		inner: Arc<RwLock<PartitionStoreInner>>,
+		address: PartitionAddress,
+	) -> Self {
+		Self {
+			chunks,
+			cancel_on_drop: Some(LivePartitionCancelOnDrop { inner, address }),
+		}
+	}
+
+	pub async fn next(&mut self) -> Option<Result<PartitionPayload, PartitionMissingReason>> {
+		let next = self.chunks.next().await;
+		if next.is_none() || matches!(next, Some(Err(_))) {
+			self.cancel_on_drop = None;
+		}
+		next
+	}
+}
+
+impl LivePartitionCancelOnDrop {
+	fn cancel(&self) {
+		let downstream_cancellation = {
+			let mut inner = self.inner.write().expect("partition store poisoned");
+			let Some(live) = inner.live_partitions.get_mut(&self.address) else {
+				return;
+			};
+			if live.sealed || live.cancelled.is_some() {
+				return;
+			}
+			live.cancelled = Some(PartitionMissingReason::CancelledTaskCleanup);
+			live.notify.notify_waiters();
+			live.downstream_cancellation.clone()
+		};
+		if let Some(downstream_cancellation) = downstream_cancellation {
+			downstream_cancellation
+				.cancel_registered_attempts(DownstreamCancellationTrigger::WorkerCancelTask);
+		}
+	}
+}
+
+impl Drop for LivePartitionStream {
+	fn drop(&mut self) {
+		if let Some(cancel) = &self.cancel_on_drop {
+			cancel.cancel();
+		}
+	}
+}
+
 #[derive(Debug, Error)]
 pub enum PartitionStoreError {
 	#[error("query has been cancelled: {query_id:?}")]
@@ -146,6 +246,8 @@ pub enum PartitionStoreError {
 		operation: &'static str,
 		message: String,
 	},
+	#[error("live partition lifecycle is unsupported by this partition store")]
+	LiveUnsupported,
 }
 
 impl From<BudgetRejection> for PartitionStoreError {
@@ -160,7 +262,7 @@ impl From<BudgetRejection> for PartitionStoreError {
 
 #[derive(Debug)]
 pub struct InMemoryPartitionStore {
-	inner: RwLock<PartitionStoreInner>,
+	inner: Arc<RwLock<PartitionStoreInner>>,
 	budget: BudgetTracker,
 }
 
@@ -169,7 +271,33 @@ struct PartitionStoreInner {
 	manifests: HashMap<ManifestKey, PartitionManifest>,
 	partitions: HashMap<PartitionAddress, PartitionPayload>,
 	reservations: HashMap<PartitionAddress, BudgetReservation>,
+	live_partitions: HashMap<PartitionAddress, LivePartition>,
 	cancelled_queries: HashSet<QueryId>,
+}
+
+#[derive(Debug)]
+struct LivePartition {
+	opened: bool,
+	chunks: Vec<PartitionPayload>,
+	reservations: Vec<BudgetReservation>,
+	sealed: bool,
+	cancelled: Option<PartitionMissingReason>,
+	downstream_cancellation: Option<DownstreamCancellationContext>,
+	notify: Arc<Notify>,
+}
+
+impl LivePartition {
+	fn placeholder() -> Self {
+		Self {
+			opened: false,
+			chunks: Vec::new(),
+			reservations: Vec::new(),
+			sealed: false,
+			cancelled: None,
+			downstream_cancellation: None,
+			notify: Arc::new(Notify::new()),
+		}
+	}
 }
 
 impl InMemoryPartitionStore {
@@ -179,7 +307,7 @@ impl InMemoryPartitionStore {
 
 	pub fn with_budget(budget: QueryBudget) -> Self {
 		Self {
-			inner: RwLock::new(PartitionStoreInner::default()),
+			inner: Arc::new(RwLock::new(PartitionStoreInner::default())),
 			budget: BudgetTracker::new(budget),
 		}
 	}
@@ -279,6 +407,196 @@ impl PartitionStore for InMemoryPartitionStore {
 		Err(PartitionMissingReason::StoreEvicted)
 	}
 
+	fn open_live(&self, address: PartitionAddress) -> Result<(), PartitionStoreError> {
+		self.open_live_with_downstream_cancellation(address, None)
+	}
+
+	fn open_live_with_downstream_cancellation(
+		&self,
+		address: PartitionAddress,
+		downstream_cancellation: Option<DownstreamCancellationContext>,
+	) -> Result<(), PartitionStoreError> {
+		let mut inner = self.inner.write().expect("partition store poisoned");
+		if inner.cancelled_queries.contains(&address.query_id) {
+			return Err(PartitionStoreError::CancelledQuery {
+				query_id: address.query_id,
+			});
+		}
+		if inner.partitions.contains_key(&address) {
+			return Err(PartitionStoreError::DuplicatePartition { address });
+		}
+		let live = inner
+			.live_partitions
+			.entry(address)
+			.or_insert_with(LivePartition::placeholder);
+		live.opened = true;
+		if downstream_cancellation.is_some() {
+			live.downstream_cancellation = downstream_cancellation;
+		}
+		live.notify.notify_waiters();
+		Ok(())
+	}
+
+	fn append_live(&self, payload: PartitionPayload) -> Result<(), PartitionStoreError> {
+		let reservation = self
+			.budget
+			.reserve(BudgetDimension::ShuffleBytes, payload.size_bytes())?;
+		let mut inner = self.inner.write().expect("partition store poisoned");
+		if inner.cancelled_queries.contains(&payload.address.query_id) {
+			return Err(PartitionStoreError::CancelledQuery {
+				query_id: payload.address.query_id,
+			});
+		}
+		let live = inner
+			.live_partitions
+			.entry(payload.address)
+			.or_insert_with(LivePartition::placeholder);
+		if live.cancelled.is_some() || live.sealed {
+			return Err(PartitionStoreError::CancelledQuery {
+				query_id: payload.address.query_id,
+			});
+		}
+		live.opened = true;
+		live.chunks.push(payload);
+		live.reservations.push(reservation);
+		live.notify.notify_waiters();
+		Ok(())
+	}
+
+	fn seal_live(
+		&self,
+		mut manifest: PartitionManifest,
+	) -> Result<PartitionManifest, PartitionStoreError> {
+		let key = ManifestKey::from_manifest(&manifest);
+		let mut inner = self.inner.write().expect("partition store poisoned");
+		if inner.cancelled_queries.contains(&manifest.query_id) {
+			return Err(PartitionStoreError::CancelledQuery {
+				query_id: manifest.query_id,
+			});
+		}
+
+		let mut entries = Vec::new();
+		let mut sealed_payloads = Vec::new();
+		let mut sealed_notifies = Vec::new();
+		for entry in &manifest.partitions {
+			let partition_id = entry.partition_id;
+			let address = PartitionAddress {
+				query_id: manifest.query_id,
+				exchange_id: manifest.exchange_id,
+				producer_stage_id: manifest.stage_id,
+				producer_task_id: manifest.task_id,
+				attempt_id: manifest.attempt_id,
+				partition_id,
+			};
+			let published_payload = inner.partitions.get(&address).cloned();
+			let Some(live) = inner.live_partitions.get_mut(&address) else {
+				continue;
+			};
+			if let Some(payload) = published_payload {
+				entries.push(payload.entry());
+				live.sealed = true;
+				sealed_notifies.push(live.notify.clone());
+				continue;
+			}
+			let mut bytes = Vec::new();
+			let mut row_count = 0u64;
+			for chunk in &live.chunks {
+				bytes.extend_from_slice(&chunk.bytes);
+				row_count = row_count.saturating_add(chunk.row_count.get());
+			}
+			let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
+			let payload = PartitionPayload::new(address, bytes, RowCount::new(row_count), digest);
+			entries.push(payload.entry());
+			live.sealed = true;
+			sealed_notifies.push(live.notify.clone());
+			sealed_payloads.push((address, payload));
+		}
+		for (address, payload) in sealed_payloads {
+			inner.partitions.insert(address, payload);
+		}
+		for notify in sealed_notifies {
+			notify.notify_waiters();
+		}
+		if !entries.is_empty() {
+			manifest.partitions = entries;
+		}
+		inner.manifests.insert(key, manifest.clone());
+		Ok(manifest)
+	}
+
+	fn cancel_live(&self, address: PartitionAddress, reason: PartitionMissingReason) {
+		let mut inner = self.inner.write().expect("partition store poisoned");
+		let live = inner
+			.live_partitions
+			.entry(address)
+			.or_insert_with(LivePartition::placeholder);
+		live.cancelled = Some(reason);
+		live.notify.notify_waiters();
+	}
+
+	fn pull_live(
+		&self,
+		address: PartitionAddress,
+		expected_attempt: AttemptId,
+	) -> Result<LivePartitionStream, PartitionMissingReason> {
+		if address.attempt_id != expected_attempt {
+			return Err(PartitionMissingReason::AttemptStale {
+				expected_attempt,
+				observed_attempt: address.attempt_id,
+			});
+		}
+		let inner = self.inner.clone();
+		{
+			let mut guard = inner.write().expect("partition store poisoned");
+			if guard.cancelled_queries.contains(&address.query_id) {
+				return Err(PartitionMissingReason::CancelledTaskCleanup);
+			}
+			guard
+				.live_partitions
+				.entry(address)
+				.or_insert_with(LivePartition::placeholder);
+		}
+		Ok(LivePartitionStream::with_cancel_on_drop(
+			stream::unfold(
+				(inner.clone(), address, 0usize),
+				|(inner, address, index)| async move {
+					loop {
+						let notify = {
+							let guard = inner.read().expect("partition store poisoned");
+							if guard.cancelled_queries.contains(&address.query_id) {
+								return Some((
+									Err(PartitionMissingReason::CancelledTaskCleanup),
+									(inner.clone(), address, index),
+								));
+							}
+							let live = guard.live_partitions.get(&address)?;
+							if let Some(reason) = &live.cancelled {
+								return Some((
+									Err(reason.clone()),
+									(inner.clone(), address, index),
+								));
+							}
+							if let Some(chunk) = live.chunks.get(index) {
+								return Some((
+									Ok(chunk.clone()),
+									(inner.clone(), address, index + 1),
+								));
+							}
+							if live.sealed {
+								return None;
+							}
+							live.notify.clone()
+						};
+						notify.notified().await;
+					}
+				},
+			)
+			.boxed(),
+			inner,
+			address,
+		))
+	}
+
 	fn remove_query(&self, query_id: QueryId) {
 		let mut inner = self.inner.write().expect("partition store poisoned");
 		inner.manifests.retain(|key, _| key.query_id != query_id);
@@ -287,6 +605,9 @@ impl PartitionStore for InMemoryPartitionStore {
 			.retain(|address, _| address.query_id != query_id);
 		inner
 			.reservations
+			.retain(|address, _| address.query_id != query_id);
+		inner
+			.live_partitions
 			.retain(|address, _| address.query_id != query_id);
 	}
 
@@ -300,6 +621,14 @@ impl PartitionStore for InMemoryPartitionStore {
 		inner
 			.reservations
 			.retain(|address, _| address.query_id != query_id);
+		for live in inner
+			.live_partitions
+			.values_mut()
+			.filter(|live| !live.sealed)
+		{
+			live.cancelled = Some(PartitionMissingReason::CancelledTaskCleanup);
+			live.notify.notify_waiters();
+		}
 	}
 }
 
@@ -617,6 +946,42 @@ impl PartitionStore for HybridPartitionStore {
 		}
 	}
 
+	fn open_live(&self, address: PartitionAddress) -> Result<(), PartitionStoreError> {
+		self.in_memory.open_live(address)
+	}
+
+	fn open_live_with_downstream_cancellation(
+		&self,
+		address: PartitionAddress,
+		downstream_cancellation: Option<DownstreamCancellationContext>,
+	) -> Result<(), PartitionStoreError> {
+		self.in_memory
+			.open_live_with_downstream_cancellation(address, downstream_cancellation)
+	}
+
+	fn append_live(&self, payload: PartitionPayload) -> Result<(), PartitionStoreError> {
+		self.in_memory.append_live(payload)
+	}
+
+	fn seal_live(
+		&self,
+		manifest: PartitionManifest,
+	) -> Result<PartitionManifest, PartitionStoreError> {
+		self.in_memory.seal_live(manifest)
+	}
+
+	fn cancel_live(&self, address: PartitionAddress, reason: PartitionMissingReason) {
+		self.in_memory.cancel_live(address, reason);
+	}
+
+	fn pull_live(
+		&self,
+		address: PartitionAddress,
+		expected_attempt: AttemptId,
+	) -> Result<LivePartitionStream, PartitionMissingReason> {
+		self.in_memory.pull_live(address, expected_attempt)
+	}
+
 	fn remove_query(&self, query_id: QueryId) {
 		self.in_memory.remove_query(query_id);
 		self.encrypted_spill.remove_query(query_id);
@@ -737,6 +1102,144 @@ mod tests {
 
 		assert_eq!(store.manifest(key), Some(manifest));
 		assert_eq!(store.pull(payload.address, AttemptId::first()), Ok(payload));
+	}
+
+	#[tokio::test]
+	async fn live_pull_before_open_waits_for_open_append_or_cancel() {
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let address = address(AttemptId::first());
+		let expected = payload(address);
+		let reader = store.clone();
+		let read = tokio::spawn(async move {
+			let mut stream = reader
+				.pull_live(address, AttemptId::first())
+				.expect("live pull");
+			stream.next().await.expect("chunk").expect("live chunk")
+		});
+
+		tokio::task::yield_now().await;
+		store.open_live(address).expect("open live");
+		store.append_live(expected.clone()).expect("append live");
+
+		let observed = tokio::time::timeout(std::time::Duration::from_secs(1), read)
+			.await
+			.expect("live pull should wake")
+			.expect("reader task");
+		assert_eq!(observed, expected);
+	}
+
+	#[tokio::test]
+	async fn live_cancel_wakes_blocked_reader_without_partial_success() {
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let address = address(AttemptId::first());
+		let reader = store.clone();
+		let read = tokio::spawn(async move {
+			let mut stream = reader
+				.pull_live(address, AttemptId::first())
+				.expect("live pull");
+			stream.next().await.expect("terminal error")
+		});
+
+		tokio::task::yield_now().await;
+		store.cancel_live(address, PartitionMissingReason::WorkerLost);
+
+		let observed = tokio::time::timeout(std::time::Duration::from_secs(1), read)
+			.await
+			.expect("live cancel should wake")
+			.expect("reader task");
+		assert_eq!(observed, Err(PartitionMissingReason::WorkerLost));
+	}
+
+	#[tokio::test]
+	async fn live_partition_failure_fails_query_without_partial_success() {
+		let store = InMemoryPartitionStore::new();
+		let address = address(AttemptId::first());
+		let chunk = payload(address);
+
+		store.open_live(address).expect("open live");
+		store.append_live(chunk).expect("append live");
+		store.cancel_live(address, PartitionMissingReason::WorkerLost);
+
+		let mut stream = store
+			.pull_live(address, AttemptId::first())
+			.expect("live pull");
+		let observed = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+			.await
+			.expect("live failure should wake")
+			.expect("terminal failure");
+		assert_eq!(observed, Err(PartitionMissingReason::WorkerLost));
+	}
+
+	#[tokio::test]
+	async fn dropping_live_reader_cancels_unsealed_partition() {
+		let store = InMemoryPartitionStore::new();
+		let address = address(AttemptId::first());
+		store.open_live(address).expect("open live");
+
+		let stream = store
+			.pull_live(address, AttemptId::first())
+			.expect("live pull");
+		drop(stream);
+
+		let mut observed = store
+			.pull_live(address, AttemptId::first())
+			.expect("second live pull");
+		let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), observed.next())
+			.await
+			.expect("drop cancellation should wake")
+			.expect("terminal cancellation");
+		assert_eq!(terminal, Err(PartitionMissingReason::CancelledTaskCleanup));
+	}
+
+	#[test]
+	fn live_seal_surfaces_manifest_and_sealed_pull() {
+		let store = InMemoryPartitionStore::new();
+		let payload = payload(address(AttemptId::first()));
+		let manifest = manifest(&payload);
+		let key = ManifestKey::from_manifest(&manifest);
+
+		store.open_live(payload.address).expect("open live");
+		store.append_live(payload.clone()).expect("append live");
+		let sealed = store.seal_live(manifest).expect("seal live");
+
+		assert_eq!(store.manifest(key), Some(sealed.clone()));
+		let pulled = store
+			.pull(payload.address, AttemptId::first())
+			.expect("sealed pull");
+		assert_eq!(pulled.bytes, payload.bytes);
+		assert_eq!(pulled.row_count, payload.row_count);
+		assert_eq!(pulled.digest, sealed.partitions[0].digest);
+	}
+
+	#[test]
+	fn live_seal_preserves_pre_published_sealed_payload() {
+		let store = InMemoryPartitionStore::new();
+		let live_payload = payload(address(AttemptId::first()));
+		let sealed_payload = PartitionPayload::new(
+			live_payload.address,
+			vec![8, 7, 6, 5],
+			RowCount::new(9),
+			ArrowIpcDigest::new([4; 32]),
+		);
+		let manifest = manifest(&sealed_payload);
+		let key = ManifestKey::from_manifest(&manifest);
+
+		store.open_live(live_payload.address).expect("open live");
+		store.append_live(live_payload).expect("append live");
+		store
+			.publish(manifest.clone(), vec![sealed_payload.clone()])
+			.expect("publish sealed payload");
+		let sealed = store.seal_live(manifest).expect("seal live");
+
+		assert_eq!(store.manifest(key), Some(sealed.clone()));
+		assert_eq!(sealed.partitions[0].digest, sealed_payload.digest);
+		assert_eq!(sealed.partitions[0].row_count, sealed_payload.row_count);
+		let pulled = store
+			.pull(sealed_payload.address, AttemptId::first())
+			.expect("sealed pull");
+		assert_eq!(pulled.bytes, sealed_payload.bytes);
+		assert_eq!(pulled.row_count, sealed_payload.row_count);
+		assert_eq!(pulled.digest, sealed_payload.digest);
 	}
 
 	#[test]

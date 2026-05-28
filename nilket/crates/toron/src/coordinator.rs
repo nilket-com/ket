@@ -595,7 +595,8 @@ where
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let stages = fragment_plan(bound, self.fragment_config(context, query_budget))
 			.map_err(fragment_error)?;
-		let mut scheduler = DistributedScheduler::new(self.registry.clone());
+		let mut scheduler = DistributedScheduler::new(self.registry.clone())
+			.with_max_in_flight_tasks(query_budget.max_in_flight_tasks);
 		let mut dispatcher =
 			NetworkTaskDispatcher::new(self.memory.clone(), self.transport.clone())
 				.with_active_query(active_query.clone());

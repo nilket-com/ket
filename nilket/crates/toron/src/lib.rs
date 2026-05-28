@@ -1015,15 +1015,17 @@ mod tests {
 			exchange_id: address.exchange_id,
 			producer_stage_id: address.producer_stage_id,
 			partition_id: address.partition_id,
-			producer_partitions: vec![ProducerPartitionRef {
-				address,
-				worker_id: producer_worker_id,
-				endpoint: producer_endpoint,
-				size_bytes: ByteCount::new(
-					u64::try_from(partition_bytes.len()).expect("payload length fits u64"),
-				),
-				digest: ArrowIpcDigest::new(wendelon::hash::blake3::digest(&partition_bytes)),
-			}],
+			producer_partitions: vec![crate::distributed::task::ShufflePartitionRef::Sealed(
+				ProducerPartitionRef {
+					address,
+					worker_id: producer_worker_id,
+					endpoint: producer_endpoint,
+					size_bytes: ByteCount::new(
+						u64::try_from(partition_bytes.len()).expect("payload length fits u64"),
+					),
+					digest: ArrowIpcDigest::new(wendelon::hash::blake3::digest(&partition_bytes)),
+				},
+			)],
 		}];
 
 		let results = ToronCoordinator::new(memory)

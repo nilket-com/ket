@@ -279,12 +279,20 @@ impl DownstreamCancellationContext {
 		self.registry.is_cancelled()
 	}
 
+	pub async fn cancelled(&self) {
+		self.registry.cancelled().await;
+	}
+
 	pub fn register_wendelon_table_query_attempt(
 		&self,
 		sender: Arc<dyn WendelonTableQueryCancelSender>,
 		attempt: WendelonTableQueryAttempt,
 	) -> Result<DownstreamAttemptGuard, DownstreamRegistrationError> {
 		self.registry.register_table_query_attempt(sender, attempt)
+	}
+
+	pub fn cancel_registered_attempts(&self, trigger: DownstreamCancellationTrigger) {
+		self.registry.cancel_registered_attempts(trigger);
 	}
 }
 
@@ -301,6 +309,7 @@ pub struct DownstreamAttemptRegistry {
 	inner: Arc<Mutex<DownstreamAttemptRegistryInner>>,
 	fanout_permits: Arc<Semaphore>,
 	metrics: Option<Arc<DownstreamCancellationMetrics>>,
+	notify: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -330,6 +339,7 @@ impl DownstreamAttemptRegistry {
 			inner: Arc::new(Mutex::new(DownstreamAttemptRegistryInner::default())),
 			fanout_permits,
 			metrics,
+			notify: Arc::new(Notify::new()),
 		}
 	}
 
@@ -351,6 +361,18 @@ impl DownstreamAttemptRegistry {
 			.lock()
 			.expect("downstream attempt registry poisoned")
 			.cancelled
+	}
+
+	pub async fn cancelled(&self) {
+		loop {
+			let notified = self.notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			if self.is_cancelled() {
+				return;
+			}
+			notified.await;
+		}
 	}
 
 	pub fn active_len(&self) -> usize {
@@ -397,6 +419,7 @@ impl DownstreamAttemptRegistry {
 			inner.cancelled = true;
 			inner.attempts.values().cloned().collect::<Vec<_>>()
 		};
+		self.notify.notify_waiters();
 		if attempts.is_empty() {
 			return;
 		}

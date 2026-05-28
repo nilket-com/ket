@@ -608,6 +608,7 @@ fn bench_budget(build_rows: usize, probe_rows: usize, worker_count: usize) -> Qu
 		),
 		max_arrow_ipc_frame: FrameByteLen::from_u32(u32::MAX),
 		cancellation_grace: DurationMillis::new(1_000),
+		max_in_flight_tasks: None,
 	}
 }
 

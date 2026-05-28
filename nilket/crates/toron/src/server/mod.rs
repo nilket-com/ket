@@ -20,9 +20,10 @@ use crate::distributed::partition_store::{
 };
 use crate::distributed::scheduler::{DispatchOutcome, TaskDispatcher};
 use crate::distributed::task::{
-	ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionManifest, ProducerPartitionRef,
-	TaskCompletionOutput, TaskInputBinding, TaskOutputBinding, TaskSpec, TaskTelemetry,
-	TaskTelemetryLabels, shuffle_input_table_id,
+	ArrowIpcDigest, LiveProducerPartitionRef, PartitionAddress, PartitionBackend,
+	PartitionManifest, RowCount, ShufflePartitionRef, TaskCompletionOutput, TaskInputBinding,
+	TaskOutputBinding, TaskSpec, TaskTelemetry, TaskTelemetryLabels,
+	is_streamable_exchange_producer, is_streamable_shuffle_consumer, shuffle_input_table_id,
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::error::{
@@ -30,7 +31,9 @@ use crate::error::{
 	TaskFailureKind, WireError,
 };
 use crate::exec::{ExecutionContext, Executor};
-use crate::ir::{ExecutionPlan, JoinStrategy, MorselId, TableId};
+use crate::ir::{
+	BoundExprProgram, ExecutionPlan, FilterDisposition, JoinStrategy, MorselId, TableId,
+};
 use crate::storage::{ScanRequest, ScanStream, StorageScan};
 use crate::wire::{
 	ArrowIpcBytes, CancelTaskPayload, EnvelopeIdentity, MessageKind, PartitionDataPayload,
@@ -38,11 +41,13 @@ use crate::wire::{
 	TaskBatchPayload, TaskCancelledPayload, TaskCompletePayload, TaskFailedPayload,
 	TaskStartedPayload, WireEnvelope, decode_payload, encode_payload,
 };
+use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use std::collections::HashMap;
+use futures::StreamExt;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -61,6 +66,7 @@ pub struct ToronWorker {
 
 struct TaskExecutionReport {
 	results: Vec<RecordBatch>,
+	output: Option<TaskCompletionOutput>,
 	telemetry: TaskTelemetry,
 }
 
@@ -184,9 +190,15 @@ impl ToronWorker {
 			} else {
 				spec.context.trace_context
 			};
-			let results = if overrides.is_empty() {
+			let (results, output) = if is_streamable_exchange_producer(spec) {
+				self.execute_live_shuffle_producer(spec, task_context, morsel)
+					.await?
+			} else if self.has_live_shuffle_input(spec) && is_streamable_shuffle_consumer(spec) {
+				self.execute_live_shuffle_consumer(spec, task_context, morsel)
+					.await?
+			} else if overrides.is_empty() {
 				let executor = Executor::with_context(self.storage.clone(), task_context);
-				executor.execute_bound(&spec.plan, morsel).await?
+				(executor.execute_bound(&spec.plan, morsel).await?, None)
 			} else {
 				let executor = Executor::with_context(
 					Arc::new(TaskInputStorageScan {
@@ -198,7 +210,7 @@ impl ToronWorker {
 					}),
 					task_context,
 				);
-				executor.execute_bound(&spec.plan, morsel).await?
+				(executor.execute_bound(&spec.plan, morsel).await?, None)
 			};
 			record_worker_telemetry(&telemetry, |task| {
 				task.counters.emitted_rows =
@@ -209,6 +221,7 @@ impl ToronWorker {
 			});
 			Ok(TaskExecutionReport {
 				results,
+				output,
 				telemetry: snapshot_worker_telemetry(&telemetry),
 			})
 		}
@@ -223,13 +236,19 @@ impl ToronWorker {
 
 	async fn pull_shuffle_inputs(
 		&self,
-		partitions: &[ProducerPartitionRef],
+		partitions: &[ShufflePartitionRef],
 	) -> Result<(Vec<RecordBatch>, u64), QueryError> {
 		let coordinator = ToronCoordinator::new(self.memory.clone());
 		let mut batches = Vec::new();
 		let mut pulled_bytes = 0u64;
 
 		for partition in partitions {
+			let Some(partition) = partition.as_sealed() else {
+				return Err(QueryError::Internal {
+					message: "internal: live shuffle partition reached sealed pull path"
+						.to_string(),
+				});
+			};
 			let stream = tokio::net::TcpStream::connect(partition.endpoint.as_str()).await?;
 			let payload = coordinator
 				.pull_partition_from_worker(stream, partition.address, partition.address.attempt_id)
@@ -257,6 +276,12 @@ impl ToronWorker {
 			else {
 				continue;
 			};
+			if producer_partitions
+				.iter()
+				.any(|partition| matches!(partition, ShufflePartitionRef::Live(_)))
+			{
+				continue;
+			}
 			let table_id = shuffle_input_table_id(*exchange_id);
 			let (batches, pulled_bytes) = self.pull_shuffle_inputs(producer_partitions).await?;
 			telemetry.pulled_shuffle_bytes =
@@ -285,6 +310,135 @@ impl ToronWorker {
 		}
 
 		Ok((overrides, telemetry))
+	}
+
+	fn has_live_shuffle_input(&self, spec: &TaskSpec) -> bool {
+		spec.inputs.iter().any(|input| {
+			matches!(
+				input,
+				TaskInputBinding::ShuffleConsumer {
+					producer_partitions,
+					..
+				} if producer_partitions
+					.iter()
+					.any(|partition| matches!(partition, ShufflePartitionRef::Live(_)))
+			)
+		})
+	}
+
+	async fn execute_live_shuffle_producer(
+		&self,
+		spec: &TaskSpec,
+		task_context: ExecutionContext,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<(Vec<RecordBatch>, Option<TaskCompletionOutput>), QueryError> {
+		let TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count,
+			partition_key,
+		} = &spec.output
+		else {
+			return Err(QueryError::Internal {
+				message: "internal: live producer without shuffle output".to_string(),
+			});
+		};
+		let ExecutionPlan::Exchange { input, .. } = &spec.plan else {
+			return Err(QueryError::Internal {
+				message: "internal: live producer without terminal exchange".to_string(),
+			});
+		};
+		let partition_count_usize =
+			usize::try_from(partition_count.get()).expect("partition count fits usize");
+		let schema = input.schema();
+		let addresses = (0..partition_count.get())
+			.map(|partition| PartitionAddress {
+				query_id: spec.identity.query_id,
+				exchange_id: *exchange_id,
+				producer_stage_id: spec.identity.stage_id,
+				producer_task_id: spec.identity.task_id,
+				attempt_id: spec.identity.attempt_id,
+				partition_id: PartitionId::new(partition),
+			})
+			.collect::<Vec<_>>();
+		for address in &addresses {
+			self.partition_store
+				.open_live_with_downstream_cancellation(
+					*address,
+					task_context.downstream_cancellation.clone(),
+				)
+				.map_err(partition_store_publish_error)?;
+		}
+
+		let executor = Executor::with_context(self.storage.clone(), task_context);
+		let partition_store = self.partition_store.clone();
+		let mut partition_batches: Vec<Vec<RecordBatch>> =
+			(0..partition_count_usize).map(|_| Vec::new()).collect();
+		let mut append_batch = |batch: RecordBatch| -> Result<bool, QueryError> {
+			for (partition, partition_batch) in
+				partition_record_batch(&executor, &batch, partition_count.get(), partition_key)?
+					.into_iter()
+					.enumerate()
+			{
+				let Some(partition_batch) = partition_batch else {
+					continue;
+				};
+				let bytes = encode_record_batch(&partition_batch)?;
+				let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
+				let payload = PartitionPayload::new(
+					addresses[partition],
+					bytes,
+					RowCount::new(
+						u64::try_from(partition_batch.num_rows()).expect("row count fits u64"),
+					),
+					digest,
+				);
+				partition_store
+					.append_live(payload)
+					.map_err(partition_store_publish_error)?;
+				partition_batches[partition].push(partition_batch);
+			}
+			Ok(true)
+		};
+		drive_streamable_plan(input, &executor, morsel, &mut append_batch).await?;
+
+		let results = partition_batches
+			.into_iter()
+			.map(|batches| {
+				if batches.is_empty() {
+					Ok(RecordBatch::new_empty(schema.clone()))
+				} else {
+					Ok(arrow::compute::concat_batches(&schema, &batches)?)
+				}
+			})
+			.collect::<Result<Vec<_>, QueryError>>()?;
+		let output = self.publish_task_output(spec.identity, spec, &results)?;
+		if let TaskCompletionOutput::ShuffleProducer { manifest } = &output {
+			self.partition_store
+				.seal_live(manifest.clone())
+				.map_err(partition_store_publish_error)?;
+		}
+		Ok((results, Some(output)))
+	}
+
+	async fn execute_live_shuffle_consumer(
+		&self,
+		spec: &TaskSpec,
+		task_context: ExecutionContext,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<(Vec<RecordBatch>, Option<TaskCompletionOutput>), QueryError> {
+		let storage = Arc::new(LiveInputStorageScan {
+			base: self.storage.clone(),
+			partition_store: self.partition_store.clone(),
+			live_overrides: live_scan_overrides(spec),
+		});
+		let executor = Executor::with_context(storage, task_context);
+		let mut results = Vec::new();
+		let mut collect = |batch: RecordBatch| -> Result<bool, QueryError> {
+			results.push(batch);
+			Ok(true)
+		};
+		drive_streamable_plan(&spec.plan, &executor, morsel, &mut collect).await?;
+		Ok((results, None))
 	}
 
 	fn publish_task_output(
@@ -510,8 +664,12 @@ impl ToronWorker {
 								send_task_failed(&mut stream, identity, error).await?;
 								continue 'connection;
 							}
-							match self.publish_task_output(identity, &payload.spec, &report.results)
-							{
+							let published_output = if let Some(output) = report.output.take() {
+								Ok(output)
+							} else {
+								self.publish_task_output(identity, &payload.spec, &report.results)
+							};
+							match published_output {
 								Ok(output) => {
 									if active_task.signal.is_cancelled() {
 										self.partition_store.cancel_query(identity.query_id);
@@ -1021,9 +1179,15 @@ fn validate_broadcast_caps(spec: &TaskSpec) -> Result<(), QueryError> {
 			TaskInputBinding::Scan { .. } => None,
 		})
 		.flatten()
-		.fold(0u64, |total, partition| {
-			total.saturating_add(partition.size_bytes.get())
-		});
+		.try_fold(0u64, |total, partition| {
+			let Some(partition) = partition.as_sealed() else {
+				return Err(QueryError::Internal {
+					message: "internal: live shuffle partition reached broadcast cap validator"
+						.to_string(),
+				});
+			};
+			Ok(total.saturating_add(partition.size_bytes.get()))
+		})?;
 	let worker_count = spec
 		.inputs
 		.iter()
@@ -1103,6 +1267,7 @@ mod tests {
 		ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOperation,
 	};
 	use crate::distributed::budget::{QueryBudget, TaskBudget};
+	use crate::distributed::cancellation::DownstreamAttemptRegistry;
 	use crate::distributed::identity::{AttemptId, ExchangeId, QueryId, StageId, TaskId};
 	use crate::distributed::task::{
 		ArrowIpcDigest, PartitionAddress, PartitionCount, ProducerPartitionRef,
@@ -1239,7 +1404,7 @@ mod tests {
 					exchange_id: ExchangeId::new(0),
 					producer_stage_id: StageId::new(0),
 					partition_id: PartitionId::new(0),
-					producer_partitions: vec![ProducerPartitionRef {
+					producer_partitions: vec![ShufflePartitionRef::Sealed(ProducerPartitionRef {
 						address: PartitionAddress {
 							query_id: QueryId::from_u128(1),
 							exchange_id: ExchangeId::new(0),
@@ -1252,7 +1417,7 @@ mod tests {
 						endpoint: WorkerEndpoint::new("127.0.0.1:0"),
 						size_bytes: ByteCount::new(8),
 						digest: ArrowIpcDigest::new([0; 32]),
-					}],
+					})],
 				},
 			],
 			output: TaskOutputBinding::FinalResult,
@@ -1940,6 +2105,403 @@ mod tests {
 		}
 	}
 
+	struct TwoBatchBlockingStorageScan {
+		schema: SchemaRef,
+		first: RecordBatch,
+		second: RecordBatch,
+		release_tail: Arc<Notify>,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageScan for TwoBatchBlockingStorageScan {
+		async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+			let first = self.first.clone();
+			let second = self.second.clone();
+			let release_tail = self.release_tail.clone();
+			let stream = futures::stream::unfold(0_u8, move |state| {
+				let first = first.clone();
+				let second = second.clone();
+				let release_tail = release_tail.clone();
+				async move {
+					match state {
+						0 => Some((Ok(first), 1)),
+						1 => {
+							release_tail.notified().await;
+							Some((Ok(second), 2))
+						}
+						_ => None,
+					}
+				}
+			})
+			.boxed();
+			Ok(ScanStream::new(
+				self.schema.clone(),
+				request.session_id,
+				request.query_id,
+				stream,
+			))
+		}
+	}
+
+	struct CancellationAwareTwoBatchStorageScan {
+		schema: SchemaRef,
+		first: RecordBatch,
+		second: RecordBatch,
+		second_emitted: Arc<AtomicBool>,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageScan for CancellationAwareTwoBatchStorageScan {
+		async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+			let first = self.first.clone();
+			let second = self.second.clone();
+			let second_emitted = self.second_emitted.clone();
+			let downstream_cancellation = request
+				.downstream_cancellation
+				.clone()
+				.expect("live producer scan should carry downstream cancellation");
+			let stream = futures::stream::unfold(0_u8, move |state| {
+				let first = first.clone();
+				let second = second.clone();
+				let second_emitted = second_emitted.clone();
+				let downstream_cancellation = downstream_cancellation.clone();
+				async move {
+					match state {
+						0 => Some((Ok(first), 1)),
+						1 => {
+							downstream_cancellation.cancelled().await;
+							Some((Err(StorageError::Cancelled), 2))
+						}
+						_ => {
+							second_emitted.store(true, Ordering::SeqCst);
+							Some((Ok(second), 3))
+						}
+					}
+				}
+			})
+			.boxed();
+			Ok(ScanStream::new(
+				self.schema.clone(),
+				request.session_id,
+				request.query_id,
+				stream,
+			))
+		}
+	}
+
+	#[tokio::test]
+	async fn streaming_exchange_producer_appends_before_execute_bound_would_return() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let first = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+		)
+		.expect("first batch");
+		let second = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![3_i64, 4]))],
+		)
+		.expect("second batch");
+		let release_tail = Arc::new(Notify::new());
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(TwoBatchBlockingStorageScan {
+				schema,
+				first,
+				second,
+				release_tail: release_tail.clone(),
+			}),
+			Arc::new(MemoryManager::new(8, 1024 * 1024)),
+			store.clone(),
+			WorkerId::from_u128(17),
+			WorkerEndpoint::new("local"),
+		));
+		let exchange_id = ExchangeId::new(119);
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(119),
+			StageId::new(0),
+			TaskId::new(0),
+			AttemptId::first(),
+		);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: ExecutionPlan::Exchange {
+				input: Box::new(scan(TableId(1), 1)),
+				partition_count: 1,
+				key: BoundExprProgram::empty(),
+			},
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::ShuffleProducer {
+				exchange_id,
+				partition_count: PartitionCount::new(1),
+				partition_key: BoundExprProgram::empty(),
+			},
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let address = PartitionAddress {
+			query_id: identity.query_id,
+			exchange_id,
+			producer_stage_id: identity.stage_id,
+			producer_task_id: identity.task_id,
+			attempt_id: identity.attempt_id,
+			partition_id: PartitionId::new(0),
+		};
+		let mut live = store
+			.pull_live(address, AttemptId::first())
+			.expect("live pull");
+		let task = tokio::spawn(async move {
+			worker
+				.execute_task_local_with_telemetry(&spec, None)
+				.await
+				.expect("live producer")
+		});
+
+		let payload = tokio::time::timeout(Duration::from_secs(1), live.next())
+			.await
+			.expect("first live payload before scan tail release")
+			.expect("payload")
+			.expect("payload ok");
+		assert_eq!(
+			decode_record_batches(&payload.bytes).unwrap()[0].num_rows(),
+			2
+		);
+		release_tail.notify_waiters();
+		let report = task.await.expect("producer task");
+		assert!(matches!(
+			report.output,
+			Some(TaskCompletionOutput::ShuffleProducer { .. })
+		));
+	}
+
+	#[tokio::test]
+	async fn live_consumer_does_not_materialize_all_shuffle_input_before_execution() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2]))])
+			.expect("batch");
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let exchange_id = ExchangeId::new(120);
+		let address = PartitionAddress {
+			query_id: QueryId::from_u128(120),
+			exchange_id,
+			producer_stage_id: StageId::new(0),
+			producer_task_id: TaskId::new(0),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(0),
+		};
+		store.open_live(address).expect("open live");
+		let bytes = encode_record_batch(&batch).expect("encode");
+		store
+			.append_live(PartitionPayload::new(
+				address,
+				bytes.clone(),
+				RowCount::new(2),
+				ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes)),
+			))
+			.expect("append live");
+		let worker = ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan {
+				table_data: RecordBatch::new_empty(batch.schema()),
+			}),
+			Arc::new(MemoryManager::new(8, 1024 * 1024)),
+			store,
+			WorkerId::from_u128(18),
+			WorkerEndpoint::new("local"),
+		);
+		let scan = scan(
+			crate::distributed::task::shuffle_input_table_id(exchange_id),
+			2,
+		);
+		let spec = TaskSpec {
+			identity: TaskIdentity::new(
+				QueryId::from_u128(120),
+				StageId::new(1),
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: Some(PartitionId::new(0)),
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: ExecutionPlan::Take {
+				input: Box::new(scan),
+				limit: 1,
+				output_schema: batch.schema(),
+			},
+			inputs: vec![TaskInputBinding::ShuffleConsumer {
+				exchange_id,
+				producer_stage_id: StageId::new(0),
+				partition_id: PartitionId::new(0),
+				producer_partitions: vec![ShufflePartitionRef::Live(LiveProducerPartitionRef {
+					address,
+					worker_id: WorkerId::from_u128(17),
+					endpoint: WorkerEndpoint::new("local"),
+				})],
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+
+		let report = tokio::time::timeout(
+			Duration::from_secs(1),
+			worker.execute_task_local_with_telemetry(&spec, None),
+		)
+		.await
+		.expect("consumer should not wait for live seal")
+		.expect("live consumer");
+
+		assert_eq!(report.results.len(), 1);
+		assert_eq!(report.results[0].num_rows(), 1);
+	}
+
+	#[tokio::test]
+	async fn downstream_take_cancels_live_shuffle_and_stops_upstream_scan() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let first = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+		)
+		.expect("first batch");
+		let second = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![3_i64, 4]))],
+		)
+		.expect("second batch");
+		let second_emitted = Arc::new(AtomicBool::new(false));
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let producer_worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(CancellationAwareTwoBatchStorageScan {
+				schema: schema.clone(),
+				first,
+				second,
+				second_emitted: second_emitted.clone(),
+			}),
+			Arc::new(MemoryManager::new(8, 1024 * 1024)),
+			store.clone(),
+			WorkerId::from_u128(19),
+			WorkerEndpoint::new("local"),
+		));
+		let consumer_worker = ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan {
+				table_data: RecordBatch::new_empty(schema.clone()),
+			}),
+			Arc::new(MemoryManager::new(8, 1024 * 1024)),
+			store,
+			WorkerId::from_u128(20),
+			WorkerEndpoint::new("local"),
+		);
+		let query_id = QueryId::from_u128(119_001);
+		let exchange_id = ExchangeId::new(121);
+		let producer_identity = TaskIdentity::new(
+			query_id,
+			StageId::new(0),
+			TaskId::new(0),
+			AttemptId::first(),
+		);
+		let producer_spec = TaskSpec {
+			identity: producer_identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: ExecutionPlan::Exchange {
+				input: Box::new(scan(TableId(1), 3)),
+				partition_count: 1,
+				key: BoundExprProgram::empty(),
+			},
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::ShuffleProducer {
+				exchange_id,
+				partition_count: PartitionCount::new(1),
+				partition_key: BoundExprProgram::empty(),
+			},
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let address = PartitionAddress {
+			query_id,
+			exchange_id,
+			producer_stage_id: producer_identity.stage_id,
+			producer_task_id: producer_identity.task_id,
+			attempt_id: producer_identity.attempt_id,
+			partition_id: PartitionId::new(0),
+		};
+		let downstream = DownstreamAttemptRegistry::with_default_limits(None);
+		let producer = {
+			let producer_worker = producer_worker.clone();
+			let producer_spec = producer_spec.clone();
+			let downstream_cancellation = downstream.context();
+			tokio::spawn(async move {
+				producer_worker
+					.execute_task_local_with_telemetry(
+						&producer_spec,
+						Some(downstream_cancellation),
+					)
+					.await
+			})
+		};
+		let scan = scan(shuffle_input_table_id(exchange_id), 4);
+		let consumer_spec = TaskSpec {
+			identity: TaskIdentity::new(
+				query_id,
+				StageId::new(1),
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: Some(PartitionId::new(0)),
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: ExecutionPlan::Take {
+				input: Box::new(scan),
+				limit: 1,
+				output_schema: schema,
+			},
+			inputs: vec![TaskInputBinding::ShuffleConsumer {
+				exchange_id,
+				producer_stage_id: StageId::new(0),
+				partition_id: PartitionId::new(0),
+				producer_partitions: vec![ShufflePartitionRef::Live(LiveProducerPartitionRef {
+					address,
+					worker_id: WorkerId::from_u128(19),
+					endpoint: WorkerEndpoint::new("local"),
+				})],
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+
+		let consumer_report = tokio::time::timeout(
+			Duration::from_secs(1),
+			consumer_worker.execute_task_local_with_telemetry(&consumer_spec, None),
+		)
+		.await
+		.expect("consumer should finish from the first live chunk")
+		.expect("consumer report");
+		assert_eq!(consumer_report.results.len(), 1);
+		assert_eq!(consumer_report.results[0].num_rows(), 1);
+
+		let producer_error = tokio::time::timeout(Duration::from_secs(1), producer)
+			.await
+			.expect("producer should observe downstream cancellation")
+			.expect("producer task join")
+			.err()
+			.expect("producer scan should be cancelled");
+		match producer_error {
+			QueryError::Storage(StorageError::Cancelled)
+			| QueryError::Execution(ExecutionError::Storage(StorageError::Cancelled)) => {}
+			other => panic!("unexpected producer error: {other:?}"),
+		}
+		assert!(
+			!second_emitted.load(Ordering::SeqCst),
+			"producer must not emit the second scan batch after downstream take finishes"
+		);
+	}
+
 	fn scan(table_id: TableId, object_byte: u8) -> ExecutionPlan {
 		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 		let descriptor = TableSchemaDescriptor::new(
@@ -1968,16 +2530,205 @@ mod tests {
 	}
 }
 
+type StreamableBatchFuture<'a> =
+	std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, QueryError>> + Send + 'a>>;
+
+fn drive_streamable_plan<'a>(
+	plan: &'a ExecutionPlan,
+	executor: &'a Executor,
+	morsel: Option<(MorselId, u32)>,
+	on_batch: &'a mut (dyn FnMut(RecordBatch) -> Result<bool, QueryError> + Send + 'a),
+) -> StreamableBatchFuture<'a> {
+	Box::pin(async move {
+		match plan {
+			ExecutionPlan::Scan {
+				legacy_table_id,
+				table,
+				fingerprint,
+				projection,
+				pbc_program,
+				row_limit,
+				row_identity,
+				profile_hint,
+				..
+			} => {
+				if *row_limit == Some(0) {
+					return Ok(true);
+				}
+				let context = executor.context();
+				let req = ScanRequest {
+					session_id: context.session_id,
+					query_id: context.query_id,
+					tenant_id: context.tenant_id,
+					table_id: *legacy_table_id,
+					table_object_id: *table,
+					physical_descriptor_fingerprint: *fingerprint,
+					read_bound: context.read_bound,
+					projected_columns: projection.clone(),
+					pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
+					runtime_filter: context.runtime_filter.clone(),
+					row_identity: *row_identity,
+					profile_hint: Some(*profile_hint),
+					trace_context: context.trace_context,
+					morsel,
+					row_limit: *row_limit,
+					downstream_cancellation: context.downstream_cancellation.clone(),
+				};
+				let stream = executor.storage_arc().scan(req).await?;
+				let mut stream = stream.into_batches();
+				let mut rows = 0usize;
+				while let Some(batch) = stream.next().await {
+					let mut batch = batch?;
+					if let Some(limit) = row_limit {
+						if rows >= *limit {
+							break;
+						}
+						if batch.num_rows() > limit.saturating_sub(rows) {
+							batch = batch.slice(0, limit.saturating_sub(rows));
+						}
+						rows = rows.saturating_add(batch.num_rows());
+					}
+					if batch.num_rows() == 0 {
+						continue;
+					}
+					if !on_batch(batch)? {
+						return Ok(false);
+					}
+				}
+				Ok(true)
+			}
+			ExecutionPlan::Filter {
+				input,
+				predicate,
+				disposition,
+			} => {
+				let mut filter_batch = |batch: RecordBatch| -> Result<bool, QueryError> {
+					if *disposition == FilterDisposition::FullyPushed {
+						return on_batch(batch);
+					}
+					for filtered in executor.filter_batches_with_bound_predicate(
+						predicate,
+						vec![batch],
+						"filter predicate",
+					)? {
+						if filtered.num_rows() > 0 && !on_batch(filtered)? {
+							return Ok(false);
+						}
+					}
+					Ok(true)
+				};
+				drive_streamable_plan(input, executor, morsel, &mut filter_batch).await
+			}
+			ExecutionPlan::Project {
+				input,
+				exprs,
+				output_schema,
+			} => {
+				let mut project_batch = |batch: RecordBatch| -> Result<bool, QueryError> {
+					let cols = executor.evaluate_bound_program(exprs, &batch)?;
+					on_batch(RecordBatch::try_new(output_schema.clone(), cols)?)
+				};
+				drive_streamable_plan(input, executor, morsel, &mut project_batch).await
+			}
+			ExecutionPlan::Take {
+				input,
+				limit,
+				output_schema,
+			} => {
+				if *limit == 0 {
+					let empty = RecordBatch::new_empty(output_schema.clone());
+					let _ = on_batch(empty)?;
+					return Ok(false);
+				}
+				let mut remaining = *limit;
+				let mut take_batch = |batch: RecordBatch| -> Result<bool, QueryError> {
+					if remaining == 0 {
+						return Ok(false);
+					}
+					let batch = if batch.num_rows() > remaining {
+						batch.slice(0, remaining)
+					} else {
+						batch
+					};
+					remaining = remaining.saturating_sub(batch.num_rows());
+					if batch.num_rows() > 0 && !on_batch(batch)? {
+						return Ok(false);
+					}
+					Ok(remaining > 0)
+				};
+				drive_streamable_plan(input, executor, morsel, &mut take_batch).await
+			}
+			ExecutionPlan::Exchange { .. }
+			| ExecutionPlan::Sort { .. }
+			| ExecutionPlan::Aggregate { .. }
+			| ExecutionPlan::Join { .. }
+			| ExecutionPlan::EmptyRelation { .. }
+			| ExecutionPlan::SystemTable { .. }
+			| ExecutionPlan::CreateTable { .. }
+			| ExecutionPlan::CreateLogicalType { .. }
+			| ExecutionPlan::CreateTableAsSelect { .. }
+			| ExecutionPlan::DropTable { .. }
+			| ExecutionPlan::Delete { .. }
+			| ExecutionPlan::Update { .. }
+			| ExecutionPlan::Insert { .. }
+			| ExecutionPlan::InsertSelect { .. } => Err(QueryError::Internal {
+				message: "internal: non-streamable plan reached live stream path".to_string(),
+			}),
+		}
+	})
+}
+
+fn partition_record_batch(
+	executor: &Executor,
+	batch: &RecordBatch,
+	partition_count: u32,
+	key: &BoundExprProgram,
+) -> Result<Vec<Option<RecordBatch>>, QueryError> {
+	let key_arrays = executor.evaluate_bound_program(key, batch)?;
+	let mut builders: Vec<Vec<u32>> = (0..partition_count).map(|_| Vec::new()).collect();
+	for row in 0..batch.num_rows() {
+		let bucket = crate::exec::partition_bucket(&key_arrays, row, partition_count)?;
+		builders[bucket].push(row as u32);
+	}
+	builders
+		.into_iter()
+		.map(|indices| {
+			if indices.is_empty() {
+				return Ok(None);
+			}
+			let indices_arr = arrow::array::UInt32Array::from(indices);
+			let cols = batch
+				.columns()
+				.iter()
+				.map(|col| arrow::compute::take(col, &indices_arr, None))
+				.collect::<Result<Vec<ArrayRef>, _>>()?;
+			Ok(Some(RecordBatch::try_new(batch.schema(), cols)?))
+		})
+		.collect()
+}
+
 #[derive(Clone)]
 struct ScanOverride {
 	schema: SchemaRef,
 	batches: Vec<RecordBatch>,
 }
 
+#[derive(Clone)]
+struct LiveScanOverride {
+	schema: SchemaRef,
+	partitions: Vec<LiveProducerPartitionRef>,
+}
+
 struct TaskInputStorageScan {
 	base: Arc<dyn StorageScan>,
 	overrides: HashMap<TableId, ScanOverride>,
 	legacy_single_override: Option<ScanOverride>,
+}
+
+struct LiveInputStorageScan {
+	base: Arc<dyn StorageScan>,
+	partition_store: Arc<dyn PartitionStore>,
+	live_overrides: HashMap<TableId, LiveScanOverride>,
 }
 
 #[async_trait::async_trait]
@@ -2002,6 +2753,110 @@ impl StorageScan for TaskInputStorageScan {
 
 		self.base.scan(request).await
 	}
+}
+
+#[async_trait::async_trait]
+impl StorageScan for LiveInputStorageScan {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		if let Some(override_entry) = self.live_overrides.get(&request.table_id) {
+			let schema = override_entry.schema.clone();
+			let session_id = request.session_id;
+			let query_id = request.query_id;
+			let partitions = override_entry.partitions.clone();
+			let partition_store = self.partition_store.clone();
+			let stream = futures::stream::unfold(
+				LiveScanState {
+					partition_store,
+					partitions,
+					next_partition: 0,
+					current: None,
+					pending: VecDeque::new(),
+				},
+				|mut state| async move {
+					loop {
+						if let Some(batch) = state.pending.pop_front() {
+							return Some((Ok(batch), state));
+						}
+						if state.current.is_none() {
+							let partition = state.partitions.get(state.next_partition)?.clone();
+							state.next_partition += 1;
+							match state
+								.partition_store
+								.pull_live(partition.address, partition.address.attempt_id)
+							{
+								Ok(stream) => state.current = Some(stream),
+								Err(reason) => {
+									return Some((
+										Err(storage_error_from_partition_missing(reason)),
+										state,
+									));
+								}
+							}
+						}
+						let current = state.current.as_mut().expect("current live stream");
+						match current.next().await {
+							Some(Ok(payload)) => match decode_record_batches(&payload.bytes) {
+								Ok(batches) => state.pending.extend(batches),
+								Err(error) => {
+									return Some((
+										Err(storage_error_from_query_error(error)),
+										state,
+									));
+								}
+							},
+							Some(Err(reason)) => {
+								return Some((
+									Err(storage_error_from_partition_missing(reason)),
+									state,
+								));
+							}
+							None => state.current = None,
+						}
+					}
+				},
+			)
+			.boxed();
+			return Ok(ScanStream::new(schema, session_id, query_id, stream));
+		}
+		self.base.scan(request).await
+	}
+}
+
+struct LiveScanState {
+	partition_store: Arc<dyn PartitionStore>,
+	partitions: Vec<LiveProducerPartitionRef>,
+	next_partition: usize,
+	current: Option<crate::distributed::partition_store::LivePartitionStream>,
+	pending: VecDeque<RecordBatch>,
+}
+
+fn live_scan_overrides(spec: &TaskSpec) -> HashMap<TableId, LiveScanOverride> {
+	let mut overrides = HashMap::new();
+	for input in &spec.inputs {
+		let TaskInputBinding::ShuffleConsumer {
+			exchange_id,
+			producer_partitions,
+			..
+		} = input
+		else {
+			continue;
+		};
+		let partitions = producer_partitions
+			.iter()
+			.filter_map(|partition| match partition {
+				ShufflePartitionRef::Live(live) => Some(live.clone()),
+				ShufflePartitionRef::Sealed(_) => None,
+			})
+			.collect::<Vec<_>>();
+		if partitions.is_empty() {
+			continue;
+		}
+		let table_id = shuffle_input_table_id(*exchange_id);
+		let schema =
+			scan_schema_for_table_id(&spec.plan, table_id).unwrap_or_else(|| spec.plan.schema());
+		overrides.insert(table_id, LiveScanOverride { schema, partitions });
+	}
+	overrides
 }
 
 fn legacy_single_shuffle_override(
@@ -2087,7 +2942,7 @@ where
 	Transport: ToronTransport + Send + Sync,
 {
 	async fn dispatch(
-		&mut self,
+		&self,
 		worker: &crate::distributed::worker_registry::WorkerEntry,
 		spec: &TaskSpec,
 	) -> DispatchOutcome {
@@ -2467,6 +3322,21 @@ fn partition_missing_error(reason: PartitionMissingReason) -> QueryError {
 	QueryError::Runtime(RuntimeError::PartitionStoreMismatch {
 		message: format!("{reason:?}"),
 	})
+}
+
+fn storage_error_from_partition_missing(reason: PartitionMissingReason) -> StorageError {
+	match reason {
+		PartitionMissingReason::CancelledTaskCleanup => StorageError::Cancelled,
+		other => StorageError::Internal {
+			message: format!("live partition unavailable: {other:?}"),
+		},
+	}
+}
+
+fn storage_error_from_query_error(error: QueryError) -> StorageError {
+	StorageError::Internal {
+		message: error.to_string(),
+	}
 }
 
 fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {

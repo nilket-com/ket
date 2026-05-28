@@ -83,6 +83,8 @@ pub struct QueryBudget {
 	pub broadcast_replicated_bytes_per_query: ByteCount,
 	pub max_arrow_ipc_frame: FrameByteLen,
 	pub cancellation_grace: DurationMillis,
+	#[serde(default)]
+	pub max_in_flight_tasks: Option<usize>,
 }
 
 impl QueryBudget {
@@ -97,6 +99,7 @@ impl QueryBudget {
 			broadcast_replicated_bytes_per_query: ByteCount::new(1024 * 1024 * 1024),
 			max_arrow_ipc_frame: FrameByteLen::from_u32(16 * 1024 * 1024),
 			cancellation_grace: DurationMillis::new(1_000),
+			max_in_flight_tasks: None,
 		}
 	}
 }
