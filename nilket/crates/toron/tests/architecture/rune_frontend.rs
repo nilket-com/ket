@@ -21,6 +21,10 @@ fn binder_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
 }
 
+fn lib_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source")
+}
+
 fn catalog_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
 }
@@ -2138,6 +2142,125 @@ pub(crate) fn adr129_no_executor_fragmenter_scheduler_wendelon_change() {
 		"ADR129 optimizer spine leaked outside ir/planner/binder/catalog:\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
+}
+
+#[test]
+pub(crate) fn adr130_right_build_is_binder_physical_rewrite_not_new_strategy() {
+	let binder = binder_source();
+	let ir = ir_source();
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+	let bind_join = source_block(&binder, "async fn bind_join");
+	let join_strategy = source_block(&ir, "pub enum JoinStrategy");
+	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
+
+	assert!(binder.contains("enum JoinPhysicalPlacement"));
+	assert!(binder.contains("SwappedRightBuild"));
+	assert!(binder.contains("enum BroadcastBuildSide"));
+	assert!(bind_join.contains("std::mem::swap(&mut left_plan, &mut right_plan)"));
+	assert!(bind_join.contains("std::mem::swap(&mut left_keys, &mut right_keys)"));
+	assert!(
+		bind_join.contains("std::mem::swap(&mut left_resolved_keys, &mut right_resolved_keys)")
+	);
+	assert!(join_strategy.contains("HashPartitioned"));
+	assert!(join_strategy.contains("Broadcast"));
+	assert_eq!(enum_variant_count(&join_strategy), 2);
+	assert!(!ir.contains("RightBroadcast"));
+	assert!(!execution_plan.contains("build_side"));
+	assert!(!execution_plan.contains("BroadcastBuildSide"));
+	assert!(!execution_plan.contains("JoinPhysicalPlacement"));
+}
+
+#[test]
+pub(crate) fn adr130_right_build_wraps_restoring_projection() {
+	let binder = binder_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+	let restore = source_block(&binder, "fn restore_declared_join_order_project");
+
+	assert!(bind_join.contains("declared_output_schema"));
+	assert!(bind_join.contains("declared_scope"));
+	assert!(bind_join.contains("restore_declared_join_order_project("));
+	assert!(restore.contains("declared_right_width..declared_right_width + declared_left_width"));
+	assert!(restore.contains("chain(0..declared_right_width)"));
+	assert!(restore.contains("BoundExprProgramBuilder::new()"));
+	assert!(restore.contains("decode_column_logical_type(field)"));
+	assert!(restore.contains("builder.append_column(ResolvedColumn"));
+	assert!(restore.contains("validate()"));
+	assert!(restore.contains("ExecutionPlan::Project"));
+	assert!(restore.contains("output_schema: declared_output_schema"));
+}
+
+#[test]
+pub(crate) fn adr130_decision_helper_single_seam() {
+	let binder = binder_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+	let choose_join_strategy = source_block(&binder, "fn choose_join_strategy");
+	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+
+	assert_eq!(binder.matches("fn choose_join_strategy(").count(), 1);
+	assert!(bind_join.contains("choose_join_strategy("));
+	assert!(!bind_join.contains("byte_upper_bound"));
+	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
+	assert!(choose_join_strategy.contains("right_facts: PlanOptimizerFacts"));
+	assert!(
+		choose_join_strategy.contains("choose_auto_join_strategy(kind, left_facts, right_facts")
+	);
+	assert!(choose_auto.contains("left_facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("right_facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("left_facts.byte_upper_bound"));
+	assert!(choose_auto.contains("right_facts.byte_upper_bound"));
+	assert!(choose_auto.contains("BroadcastBuildSide::Left"));
+	assert!(choose_auto.contains("BroadcastBuildSide::Right"));
+	assert!(choose_auto.contains("JoinPhysicalPlacement::Natural"));
+	assert!(choose_auto.contains("JoinPhysicalPlacement::SwappedRightBuild"));
+}
+
+#[test]
+pub(crate) fn adr130_no_fragmenter_executor_wire_change() {
+	let manifest_dir = manifest_dir();
+
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/distributed/fragment.rs"),
+		manifest_dir.join("src/distributed/scheduler.rs"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+	] {
+		let offenders = std::fs::read_to_string(&path)
+			.expect("read Toron source")
+			.lines()
+			.enumerate()
+			.filter(|(_, line)| {
+				line.contains("SwappedRightBuild")
+					|| line.contains("BroadcastBuildSide")
+					|| line.contains("JoinPhysicalPlacement")
+			})
+			.map(|(idx, line)| (path.clone(), idx + 1, line.to_string()))
+			.collect::<Vec<_>>();
+		assert!(
+			offenders.is_empty(),
+			"ADR130 right-build placement leaked into execution substrate:\n{}",
+			format_offenders(&manifest_dir, &offenders)
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr130_behavior_gates_cover_tiny_right_and_left_tie_fence() {
+	let binder = binder_source();
+	let lib = lib_source();
+
+	for gate in [
+		"sql_fact_left_tiny_right_infers_broadcast",
+		"both_sides_tiny_prefers_left_build",
+		"right_tiny_left_deep_join_stays_hash",
+		"pinned_broadcast_still_wins_and_fail_loud",
+		"right_build_swapped_plan_is_valid_left_build_broadcast",
+	] {
+		assert!(binder.contains(gate), "missing ADR130 behavior gate {gate}");
+	}
+	assert!(lib.contains("right_build_broadcast_preserves_output_schema_and_values"));
+	assert!(lib.contains("right_build_broadcast_byte_identical_to_hash"));
 }
 
 #[test]

@@ -32,7 +32,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use crate::binder::{PlannerConfig, bind};
-	use crate::catalog::MockCatalog;
+	use crate::catalog::{MockCatalog, TableOptimizerFacts};
 	use crate::coordinator::DistributedQueryCoordinator;
 	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
@@ -682,6 +682,56 @@ mod tests {
 
 		assert_eq!(broadcast_digest, hash_digest);
 		assert_eq!(broadcast_digest, rune_digest);
+	}
+
+	#[tokio::test]
+	async fn right_build_broadcast_preserves_output_schema_and_values() {
+		let hash_results = run_distributed_join_query(sql_fact_dim_join_plan(), 16).await;
+		let broadcast_results = run_distributed_join_query_with_catalog_config(
+			sql_fact_dim_join_plan(),
+			3,
+			join_catalog_with_optimizer_facts(64 * 1024 * 1024, 1_024),
+			PlannerConfig {
+				auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+				..PlannerConfig::default()
+			},
+		)
+		.await;
+
+		assert_fact_dim_join_matches_hash(&hash_results, &broadcast_results);
+	}
+
+	#[tokio::test]
+	async fn right_build_broadcast_byte_identical_to_hash() {
+		let local_hash = run_local_join_query_with_catalog_config(
+			sql_fact_dim_join_plan(),
+			join_catalog(),
+			PlannerConfig::default(),
+		)
+		.await;
+		let local_broadcast = run_local_join_query_with_catalog_config(
+			sql_fact_dim_join_plan(),
+			join_catalog_with_optimizer_facts(64 * 1024 * 1024, 1_024),
+			PlannerConfig {
+				auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+				..PlannerConfig::default()
+			},
+		)
+		.await;
+		assert_fact_dim_join_matches_hash(&local_hash, &local_broadcast);
+
+		let distributed_hash = run_distributed_join_query(sql_fact_dim_join_plan(), 16).await;
+		let distributed_broadcast = run_distributed_join_query_with_catalog_config(
+			sql_fact_dim_join_plan(),
+			3,
+			join_catalog_with_optimizer_facts(64 * 1024 * 1024, 1_024),
+			PlannerConfig {
+				auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+				..PlannerConfig::default()
+			},
+		)
+		.await;
+		assert_fact_dim_join_matches_hash(&distributed_hash, &distributed_broadcast);
 	}
 
 	#[tokio::test]
@@ -1341,6 +1391,32 @@ mod tests {
 	}
 
 	fn join_catalog() -> Arc<MockCatalog> {
+		Arc::new(join_catalog_inner())
+	}
+
+	fn join_catalog_with_optimizer_facts(
+		orders_byte_upper_bound: u64,
+		customers_byte_upper_bound: u64,
+	) -> Arc<MockCatalog> {
+		let mut catalog = join_catalog_inner();
+		for (table, bytes) in [
+			("orders", orders_byte_upper_bound),
+			("customers", customers_byte_upper_bound),
+		] {
+			catalog
+				.seed_optimizer_facts(
+					&crate::catalog::TableRef::new(table),
+					TableOptimizerFacts {
+						byte_upper_bound: Some(ByteCount::new(bytes)),
+						row_upper_bound: None,
+					},
+				)
+				.expect("seed optimizer facts");
+		}
+		Arc::new(catalog)
+	}
+
+	fn join_catalog_inner() -> MockCatalog {
 		let mut catalog = MockCatalog::new();
 		catalog
 			.register_descriptor(
@@ -1368,7 +1444,7 @@ mod tests {
 				),
 			)
 			.unwrap();
-		Arc::new(catalog)
+		catalog
 	}
 
 	fn named_descriptor(id_byte: u8, table: &str, schema: Schema) -> TableSchemaDescriptor {
@@ -1480,6 +1556,12 @@ mod tests {
 			.expect("SQL hash join plan")
 	}
 
+	fn sql_fact_dim_join_plan() -> LogicalPlan {
+		crate::sql_planner::SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("SQL fact-dim join plan")
+	}
+
 	fn sql_broadcast_join_plan() -> LogicalPlan {
 		crate::sql_planner::SqlPlanner::new()
 			.plan(
@@ -1533,13 +1615,60 @@ mod tests {
 			.unwrap()
 	}
 
+	async fn run_local_join_query_with_catalog_config(
+		plan: LogicalPlan,
+		catalog: Arc<MockCatalog>,
+		planner_config: PlannerConfig,
+	) -> Vec<RecordBatch> {
+		let bound = bind(&plan, catalog.as_ref(), &planner_config)
+			.await
+			.expect("bind local join query");
+		Executor::new(join_storage())
+			.execute_bound(&bound, None)
+			.await
+			.expect("execute local join query")
+	}
+
+	async fn run_distributed_join_query_with_catalog_config(
+		plan: LogicalPlan,
+		connections: usize,
+		catalog: Arc<MockCatalog>,
+		planner_config: PlannerConfig,
+	) -> Vec<RecordBatch> {
+		run_distributed_join_query_with_catalog_config_and_budget(
+			plan,
+			connections,
+			catalog,
+			planner_config,
+			QueryBudget::test_default(),
+		)
+		.await
+		.unwrap()
+	}
+
 	async fn run_distributed_join_query_with_budget(
 		plan: LogicalPlan,
+		connections: usize,
+		query_budget: QueryBudget,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		run_distributed_join_query_with_catalog_config_and_budget(
+			plan,
+			connections,
+			join_catalog(),
+			PlannerConfig::default(),
+			query_budget,
+		)
+		.await
+	}
+
+	async fn run_distributed_join_query_with_catalog_config_and_budget(
+		plan: LogicalPlan,
 		_connections: usize,
+		catalog: Arc<MockCatalog>,
+		planner_config: PlannerConfig,
 		query_budget: QueryBudget,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let memory = test_memory();
-		let catalog = join_catalog();
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let endpoint = WorkerEndpoint::new(listener.local_addr().unwrap().to_string());
 		let worker_id = WorkerId::from_u128(101);
@@ -1594,7 +1723,7 @@ mod tests {
 			registry,
 			memory,
 			Arc::new(TcpTransport::new()),
-			PlannerConfig::default(),
+			planner_config,
 			query_budget,
 		);
 
@@ -1602,6 +1731,36 @@ mod tests {
 		shutdown_tx.send(true).unwrap();
 		server_handle.await.unwrap();
 		results
+	}
+
+	fn assert_fact_dim_join_matches_hash(
+		hash_results: &[RecordBatch],
+		broadcast_results: &[RecordBatch],
+	) {
+		assert!(!hash_results.is_empty());
+		assert!(!broadcast_results.is_empty());
+		assert_eq!(
+			field_names(hash_results[0].schema().as_ref()),
+			vec!["id", "customer_id", "id", "region"]
+		);
+		assert_eq!(
+			field_names(broadcast_results[0].schema().as_ref()),
+			vec!["id", "customer_id", "id", "region"]
+		);
+		assert_eq!(broadcast_results[0].schema(), hash_results[0].schema());
+		assert_eq!(
+			canonical_arrow_ipc_digest(broadcast_results, SortPolicy::FullRowLex)
+				.expect("right-build broadcast digest"),
+			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	fn field_names(schema: &Schema) -> Vec<&str> {
+		schema
+			.fields()
+			.iter()
+			.map(|field| field.name().as_str())
+			.collect()
 	}
 
 	struct MultiTableStorageScan {

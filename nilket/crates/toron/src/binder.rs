@@ -185,13 +185,27 @@ impl PlanOptimizerFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JoinStrategyDecision {
 	strategy: JoinStrategy,
+	placement: JoinPhysicalPlacement,
 	reason: JoinStrategyDecisionReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinPhysicalPlacement {
+	Natural,
+	SwappedRightBuild,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BroadcastBuildSide {
+	Left,
+	Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinStrategyDecisionReason {
 	PinnedByAuthor,
 	BroadcastInferred {
+		build_side: BroadcastBuildSide,
 		build_bytes: ByteCount,
 		threshold: ByteCount,
 	},
@@ -205,6 +219,7 @@ enum HashByDefaultReason {
 	AutoBroadcastDisabled,
 	NonInnerJoin,
 	LeftInputNotSingleBaseRelation,
+	RightInputNotSingleBaseRelation,
 	MissingBuildByteUpperBound,
 	BuildByteUpperBoundAboveThreshold,
 }
@@ -1082,6 +1097,16 @@ impl<'a> Binder<'a> {
 			right_resolved_keys.push(right_key);
 		}
 
+		let declared_left_width = left_plan.schema().fields().len();
+		let declared_right_width = right_plan.schema().fields().len();
+		let declared_output_schema = join_schema(kind, &left_plan.schema(), &right_plan.schema());
+		let declared_scope = RelationScope::join(
+			kind,
+			&left_plan.scope,
+			&right_plan.scope,
+			&declared_output_schema,
+		);
+
 		let decision = choose_join_strategy(
 			strategy_intent,
 			kind,
@@ -1103,10 +1128,19 @@ impl<'a> Binder<'a> {
 						DEFAULT_AUTO_JOIN_PARTITION_COUNT,
 					)?;
 				}
-				JoinStrategy::Broadcast => {
-					left_plan.plan =
-						exchange_for_join_keys(left_plan.plan, &left_resolved_keys, 1)?;
-				}
+				JoinStrategy::Broadcast => match decision.placement {
+					JoinPhysicalPlacement::Natural => {
+						left_plan.plan =
+							exchange_for_join_keys(left_plan.plan, &left_resolved_keys, 1)?;
+					}
+					JoinPhysicalPlacement::SwappedRightBuild => {
+						right_plan.plan =
+							exchange_for_join_keys(right_plan.plan, &right_resolved_keys, 1)?;
+						std::mem::swap(&mut left_plan, &mut right_plan);
+						std::mem::swap(&mut left_keys, &mut right_keys);
+						std::mem::swap(&mut left_resolved_keys, &mut right_resolved_keys);
+					}
+				},
 			}
 		}
 
@@ -1118,20 +1152,30 @@ impl<'a> Binder<'a> {
 			&left_keys,
 			&right_keys,
 		)?;
-		let output_schema = join_schema(kind, &left_plan.schema(), &right_plan.schema());
-		let scope = RelationScope::join(kind, &left_plan.scope, &right_plan.scope, &output_schema);
+		let physical_output_schema = join_schema(kind, &left_plan.schema(), &right_plan.schema());
+		let join_plan = ExecutionPlan::Join {
+			left: Box::new(left_plan.plan),
+			right: Box::new(right_plan.plan),
+			kind,
+			left_keys,
+			right_keys,
+			strategy: decision.strategy,
+			output_schema: physical_output_schema.clone(),
+		};
+		let plan = match decision.placement {
+			JoinPhysicalPlacement::Natural => join_plan,
+			JoinPhysicalPlacement::SwappedRightBuild => restore_declared_join_order_project(
+				join_plan,
+				&physical_output_schema,
+				declared_output_schema,
+				declared_left_width,
+				declared_right_width,
+			)?,
+		};
 
 		Ok(ScopedExecutionPlan::new_with_facts(
-			ExecutionPlan::Join {
-				left: Box::new(left_plan.plan),
-				right: Box::new(right_plan.plan),
-				kind,
-				left_keys,
-				right_keys,
-				strategy: decision.strategy,
-				output_schema,
-			},
-			scope,
+			plan,
+			declared_scope,
 			PlanOptimizerFacts::composite_unknown(),
 		))
 	}
@@ -3717,21 +3761,25 @@ fn choose_join_strategy(
 	intent: JoinStrategyIntent,
 	kind: JoinKind,
 	left_facts: PlanOptimizerFacts,
-	_right_facts: PlanOptimizerFacts,
+	right_facts: PlanOptimizerFacts,
 	config: &PlannerConfig,
 ) -> JoinStrategyDecision {
 	match intent {
 		JoinStrategyIntent::Pinned(strategy) => JoinStrategyDecision {
 			strategy,
+			placement: JoinPhysicalPlacement::Natural,
 			reason: JoinStrategyDecisionReason::PinnedByAuthor,
 		},
-		JoinStrategyIntent::Auto => choose_auto_join_strategy(kind, left_facts, config),
+		JoinStrategyIntent::Auto => {
+			choose_auto_join_strategy(kind, left_facts, right_facts, config)
+		}
 	}
 }
 
 fn choose_auto_join_strategy(
 	kind: JoinKind,
 	left_facts: PlanOptimizerFacts,
+	right_facts: PlanOptimizerFacts,
 	config: &PlannerConfig,
 ) -> JoinStrategyDecision {
 	let Some(threshold) = effective_auto_broadcast_threshold(config) else {
@@ -3743,24 +3791,45 @@ fn choose_auto_join_strategy(
 	if left_facts.origin != PlanOrigin::SingleBaseRelation {
 		return hash_join_decision(HashByDefaultReason::LeftInputNotSingleBaseRelation);
 	}
-	let Some(build_bytes) = left_facts.byte_upper_bound else {
+	if right_facts.origin != PlanOrigin::SingleBaseRelation {
+		return hash_join_decision(HashByDefaultReason::RightInputNotSingleBaseRelation);
+	}
+	if let Some(build_bytes) = left_facts.byte_upper_bound {
+		if build_bytes < threshold {
+			return JoinStrategyDecision {
+				strategy: JoinStrategy::Broadcast,
+				placement: JoinPhysicalPlacement::Natural,
+				reason: JoinStrategyDecisionReason::BroadcastInferred {
+					build_side: BroadcastBuildSide::Left,
+					build_bytes,
+					threshold,
+				},
+			};
+		}
+	}
+	if let Some(build_bytes) = right_facts.byte_upper_bound {
+		if build_bytes < threshold {
+			return JoinStrategyDecision {
+				strategy: JoinStrategy::Broadcast,
+				placement: JoinPhysicalPlacement::SwappedRightBuild,
+				reason: JoinStrategyDecisionReason::BroadcastInferred {
+					build_side: BroadcastBuildSide::Right,
+					build_bytes,
+					threshold,
+				},
+			};
+		}
+	}
+	if left_facts.byte_upper_bound.is_none() || right_facts.byte_upper_bound.is_none() {
 		return hash_join_decision(HashByDefaultReason::MissingBuildByteUpperBound);
-	};
-	if build_bytes >= threshold {
-		return hash_join_decision(HashByDefaultReason::BuildByteUpperBoundAboveThreshold);
 	}
-	JoinStrategyDecision {
-		strategy: JoinStrategy::Broadcast,
-		reason: JoinStrategyDecisionReason::BroadcastInferred {
-			build_bytes,
-			threshold,
-		},
-	}
+	hash_join_decision(HashByDefaultReason::BuildByteUpperBoundAboveThreshold)
 }
 
 fn hash_join_decision(reason: HashByDefaultReason) -> JoinStrategyDecision {
 	JoinStrategyDecision {
 		strategy: JoinStrategy::HashPartitioned,
+		placement: JoinPhysicalPlacement::Natural,
 		reason: JoinStrategyDecisionReason::HashByDefault { reason },
 	}
 }
@@ -3773,6 +3842,61 @@ fn effective_auto_broadcast_threshold(config: &PlannerConfig) -> Option<ByteCoun
 
 fn default_auto_broadcast_cap_ceiling() -> ByteCount {
 	ByteCount::new(QueryBudget::default().broadcast_build_bytes_per_task.get() / 4)
+}
+
+fn restore_declared_join_order_project(
+	input: ExecutionPlan,
+	physical_output_schema: &SchemaRef,
+	declared_output_schema: SchemaRef,
+	declared_left_width: usize,
+	declared_right_width: usize,
+) -> Result<ExecutionPlan, BindingError> {
+	let physical_width = physical_output_schema.fields().len();
+	if physical_width != declared_left_width + declared_right_width
+		|| declared_output_schema.fields().len() != physical_width
+	{
+		return Err(BindingError::UnsupportedExpression {
+			message: "right-build broadcast join projection arity mismatch".to_string(),
+		});
+	}
+
+	let restore_ordinals = (declared_right_width..declared_right_width + declared_left_width)
+		.chain(0..declared_right_width);
+	let mut builder = BoundExprProgramBuilder::new();
+	for physical_ordinal in restore_ordinals {
+		let field = physical_output_schema.field(physical_ordinal);
+		let logical_type = decode_column_logical_type(field).map_err(|error| {
+			BindingError::UnsupportedExpression {
+				message: error.to_string(),
+			}
+		})?;
+		let node = builder.append_column(ResolvedColumn {
+			name: ColumnName(field.name().clone()),
+			ordinal: ColumnOrdinal(
+				u32::try_from(physical_ordinal).expect("column ordinal overflow"),
+			),
+			data_type: field.data_type().clone(),
+			nullable: field.is_nullable(),
+			pbc_eligible: is_pbc_eligible_type(field.data_type()),
+		});
+		if !builder.set_node_logical_type(node, logical_type) {
+			return Err(BindingError::UnsupportedExpression {
+				message: "right-build broadcast join projection target is malformed".to_string(),
+			});
+		}
+		builder.push_root(node);
+	}
+	let exprs = builder.build();
+	exprs
+		.validate()
+		.map_err(|error| BindingError::UnsupportedExpression {
+			message: format!("{error:?}"),
+		})?;
+	Ok(ExecutionPlan::Project {
+		input: Box::new(input),
+		exprs,
+		output_schema: declared_output_schema,
+	})
 }
 
 fn exchange_for_join_keys(
@@ -7212,7 +7336,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn sql_unhinted_unknown_large_and_tiny_right_joins_stay_hash() {
+	async fn sql_unhinted_unknown_and_large_joins_stay_hash() {
 		let logical = SqlPlanner::new()
 			.plan("SELECT * FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
 			.expect("plan SQL join");
@@ -7228,7 +7352,10 @@ mod tests {
 			.await
 			.expect("bind large join");
 		assert_join_strategy(&large, JoinStrategy::HashPartitioned);
+	}
 
+	#[tokio::test]
+	async fn sql_fact_left_tiny_right_infers_broadcast() {
 		let mut right_tiny_catalog = join_catalog();
 		seed_byte_upper_bound(&mut right_tiny_catalog, "orders", 64 * 1024 * 1024);
 		seed_byte_upper_bound(&mut right_tiny_catalog, "customers", 1_024);
@@ -7242,11 +7369,138 @@ mod tests {
 		)
 		.await
 		.expect("bind right-tiny join");
-		assert_join_strategy(&right_tiny, JoinStrategy::HashPartitioned);
+		assert_join_strategy(&right_tiny, JoinStrategy::Broadcast);
+		let ExecutionPlan::Project {
+			input,
+			exprs,
+			output_schema,
+		} = right_tiny
+		else {
+			panic!("right-build broadcast must restore declared order with a project");
+		};
+		assert_eq!(
+			field_names(&output_schema),
+			vec!["id", "customer_id", "id", "region"]
+		);
+		assert_eq!(
+			exprs
+				.root_columns()
+				.expect("right-build restore roots are columns")
+				.into_iter()
+				.map(|column| column.ordinal)
+				.collect::<Vec<_>>(),
+			vec![
+				ColumnOrdinal(2),
+				ColumnOrdinal(3),
+				ColumnOrdinal(0),
+				ColumnOrdinal(1)
+			]
+		);
+		let ExecutionPlan::Join {
+			left,
+			right,
+			left_keys,
+			right_keys,
+			output_schema,
+			..
+		} = input.as_ref()
+		else {
+			panic!("restore project must wrap the physical join");
+		};
+		assert_eq!(
+			field_names(output_schema),
+			vec!["id", "region", "id", "customer_id"]
+		);
+		assert!(matches!(terminal_exchange(left), Some((1, _))));
+		assert!(terminal_exchange(right).is_none());
+		assert_eq!(left_keys, &vec![ColumnOrdinal(0)]);
+		assert_eq!(right_keys, &vec![ColumnOrdinal(1)]);
 	}
 
 	#[tokio::test]
-	async fn sql_broadcast_hint_stays_pinned_and_fail_loud() {
+	async fn right_build_swapped_plan_is_valid_left_build_broadcast() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan right-tiny SQL join");
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind right-tiny join");
+		let ExecutionPlan::Project { input, .. } = plan else {
+			panic!("right-build broadcast must be restored after a physical swap");
+		};
+		let ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} = input.as_ref()
+		else {
+			panic!("restore project must wrap physical broadcast join");
+		};
+
+		assert_eq!(*strategy, JoinStrategy::Broadcast);
+		assert!(matches!(terminal_exchange(left), Some((1, _))));
+		assert!(terminal_exchange(right).is_none());
+	}
+
+	#[tokio::test]
+	async fn both_sides_tiny_prefers_left_build() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 1_024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan SQL join");
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind tiny-tie join");
+
+		let ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			output_schema,
+			..
+		} = plan
+		else {
+			panic!("left tie winner should keep natural join shape");
+		};
+		assert_eq!(strategy, JoinStrategy::Broadcast);
+		assert_eq!(
+			field_names(&output_schema),
+			vec!["id", "customer_id", "id", "region"]
+		);
+		assert!(matches!(terminal_exchange(&left), Some((1, _))));
+		assert!(terminal_exchange(&right).is_none());
+	}
+
+	#[tokio::test]
+	async fn right_tiny_left_deep_join_stays_hash() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan left-deep right-tiny SQL join");
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind left-deep probe right-tiny join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+	}
+
+	#[tokio::test]
+	async fn pinned_broadcast_still_wins_and_fail_loud() {
 		let logical = SqlPlanner::new()
 			.plan(
 				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
@@ -7319,14 +7573,46 @@ mod tests {
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				row_upper_bound: None,
 			},
-			PlanOptimizerFacts::default(),
+			PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: None,
+				row_upper_bound: None,
+			},
 			&config,
 		);
 
 		assert_eq!(decision.strategy, JoinStrategy::Broadcast);
+		assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
 		assert_eq!(
 			decision.reason,
 			JoinStrategyDecisionReason::BroadcastInferred {
+				build_side: BroadcastBuildSide::Left,
+				build_bytes: ByteCount::new(1_024),
+				threshold: ByteCount::new(4_096),
+			}
+		);
+
+		let decision = choose_join_strategy(
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: None,
+				row_upper_bound: None,
+			},
+			PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(1_024)),
+				row_upper_bound: None,
+			},
+			&config,
+		);
+		assert_eq!(decision.strategy, JoinStrategy::Broadcast);
+		assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::BroadcastInferred {
+				build_side: BroadcastBuildSide::Right,
 				build_bytes: ByteCount::new(1_024),
 				threshold: ByteCount::new(4_096),
 			}
@@ -7401,10 +7687,30 @@ mod tests {
 	}
 
 	fn assert_join_strategy(plan: &ExecutionPlan, expected: JoinStrategy) {
-		match plan {
+		match first_join_plan(plan) {
 			ExecutionPlan::Join { strategy, .. } => assert_eq!(*strategy, expected),
 			other => panic!("expected join, got {other:?}"),
 		}
+	}
+
+	fn first_join_plan(plan: &ExecutionPlan) -> &ExecutionPlan {
+		match plan {
+			ExecutionPlan::Join { .. } => plan,
+			ExecutionPlan::Filter { input, .. }
+			| ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Take { input, .. } => first_join_plan(input),
+			other => other,
+		}
+	}
+
+	fn field_names(schema: &SchemaRef) -> Vec<&str> {
+		schema
+			.fields()
+			.iter()
+			.map(|field| field.name().as_str())
+			.collect()
 	}
 
 	fn join_catalog() -> MockCatalog {
