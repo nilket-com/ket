@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–127 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–128 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,33 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 127 promoted; ADR 128 candidates
+### ADR 128 promoted; ADR 129 candidates
+
+ADR 128 promoted **SQL broadcast join hint authoring** — closes the broadcast
+authoring story (125 did Rune; this does SQL). `SELECT /*+ BROADCAST(alias) */
+… INNER JOIN …` lowers to the existing `JoinStrategy::Broadcast` via a strict
+raw-text recognizer over `OptimizerHint.text`; build-side resolution through
+121's `plan_qualifiers`; no-silent-fallback reject of malformed / right-side /
+non-INNER / ambiguous / composite-left / unused hints; EXISTS stays hash. **No
+dialect/parser/substrate change** — `GenericDialect` already captures comment
+hints (`generic.rs:288`); the cut replaces `lower_select`'s blanket hint reject
+(`:2560`) only. Behavioral 3-of-3 with the promoted mechanics incorporating
+three sqlparser-layer grounding corrections (wrong crate version 0.59→0.62;
+hints are raw text not parsed `Expr`; `GenericDialect` already captures →
+Claude's `ToronDialect` was unnecessary and conceded iter-2). Retargets
+`adr125_no_sql_hint_authoring_yet` →
+`adr128_sql_broadcast_hint_authoring_is_narrow`; adds a
+`generic_dialect_remains` guard memorializing the no-dialect-change correction.
+
+**ADR 129 lead candidates** (no strong continuity pull — broadcast surface now
+whole, live-shuffle memory chain has one remaining link): chunk-granular sealed
+manifest (the last live-shuffle memory link — true 1-copy, consumer-`pull`-API
+break); executor build/probe reorder → streamable joins (the big distributed
+arc); non-INNER broadcast widening (per-kind binder/fragmenter proofs);
+frontend (qualified `t.*`, joins over derived tables). Evidence-gate the pick
+on whatever the 128 feat surfaces.
+
+### ADR 127 promoted (HISTORICAL)
 
 ADR 127 promoted **Live-chunk release after seal** — the second link of the
 live-shuffle memory chain, collapsing the 2-copy steady state ADR 126 left.
@@ -69,14 +95,6 @@ is inherent; literal-constant is the deferred chunk-granular manifest). No
 scheduler/consumer/wire change. 15th grounding-correction arc note: the final
 promotion corrected the shorthand "3-of-3" wording against the actual peer
 files — convergence was substantive, not a same-number iteration claim.
-
-**ADR 128 lead candidate — SQL broadcast join hint authoring** (Codex+Gemini's
-iter-0 pick, deferred by sequencing not correctness): retarget
-`adr125_no_sql_hint_authoring_yet`, read `optimizer_hints` in `lower_select`
-(`sql_planner.rs:2560`), lower `/*+ BROADCAST(alias) */` to the existing
-`JoinStrategy::Broadcast`. No preprocessor, no sqlparser change — the AST
-already carries hints. INNER-only, hinted relation = left/build, reject
-mismatched/unused hints.
 
 ### ADR 126 promoted (HISTORICAL)
 
@@ -114,11 +132,9 @@ restructure executor); multi-producer fan-in + remote live transport
 (Codex's three-substrate framing); configurable `LIVE_BACKLOG_DEPTH` via
 `QueryBudget`.
 
-**Broadcast continuation:** SQL broadcast hint authoring (needs
-`sqlparser` hint preservation grounding — don't invent a preprocessor);
-non-INNER broadcast widening (binder + fragmenter per-kind correctness
-proofs); cost-based strategy selection (needs cardinality estimates not
-in IR today).
+**Broadcast continuation:** non-INNER broadcast widening (binder + fragmenter
+per-kind correctness proofs); cost-based strategy selection (needs cardinality
+estimates not in IR today).
 
 **Identity tier:** logical-type lifecycle (`DROP`/`ALTER LOGICAL TYPE` —
 cross-ring DROP + referential integrity, bounded 090 re-open);
