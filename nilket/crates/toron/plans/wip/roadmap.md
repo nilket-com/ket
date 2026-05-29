@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–129 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–130 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,34 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 129 promoted; ADR 130 candidates
+### ADR 130 promoted; ADR 131 candidates
+
+ADR 130 promoted **Right-Side Build Selection (Tiny-Right Broadcast Inference)**
+— the second auto rule on 129's optimizer fact spine, delivering the canonical
+star-schema win `SELECT * FROM fact f JOIN dim d` (dim on the right) that 129
+left as hash. A new arm in `choose_auto_join_strategy` reads the parked
+`_right_facts`; right-build is a **binder-only physical swap** (operands + paired
+keys) reusing the existing left-build broadcast contract, then a **restoring
+`Project`** preserves declared `(fact, dim)` column order. Grounded: 105's
+project fusion does NOT elide a reorder permutation (`binder.rs:4783`), so the
+projection is a permanent but cheap `ArrayRef`-clone column permutation — named,
+not hidden. INNER-only;
+single-base build **and** probe (probe-side fence defers multi-way ordering);
+left wins ties; reuses 129's dark-launch config + hard-byte facts; pinned hints
+unchanged. No `ExecutionPlan::Join`/executor/fragmenter/wire change (build side
+is a binder-local decision receipt, no new `JoinStrategy` variant). Genuine
+3-of-3 at mechanism level. Load-bearing gate: `SELECT *` byte-identical (column
+order AND digest) swapped-broadcast vs hash.
+
+**ADR 131 lead candidates:** smaller-of-two cost comparison (the first real
+cost *weigh* vs. 129/130's single-side thresholds); build-side independence
+(Fork B — drop 130's restoring projection if a workload justifies it); multi-way
+star-join ordering (lifts 130's probe-side fence); Wendelon-backed live
+table-size facts (storage-ring producer — flips dark-launch to default-on);
+selectivity propagation; optimizer `EXPLAIN` over the reason receipts.
+Evidence-gate the pick on the 130 feat.
+
+### ADR 129 promoted (HISTORICAL)
 
 ADR 129 promoted **Optimizer Fact Spine for Tiny Broadcast Inference** — the
 roadmap pivot's first step toward a cost-based optimizer. Builds a conservative
