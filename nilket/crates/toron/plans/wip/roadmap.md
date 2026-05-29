@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–126 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–127 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,39 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 126 promoted; ADR 127 candidates
+### ADR 127 promoted; ADR 128 candidates
+
+ADR 127 promoted **Live-chunk release after seal** — the second link of the
+live-shuffle memory chain, collapsing the 2-copy steady state ADR 126 left.
+Grounded 3-of-3 (Claude final pass, Codex iter-1, Gemini iter-1) on: a
+lock-coupled `active_readers` count on `LivePartition` (no count for a
+fallback-only `pull_live`); a stream-owned reader guard with dual duty (decrement
+once on both stream-end paths **and** preserve 124's unsealed-abnormal-drop
+cancellation); idempotent `release_live_chunks_if_idle` (drop `live.chunks` +
+the 124 append-side `live.reservations`, never the 126 sealed reservation)
+triggered at seal-if-idle and last-reader-end; and the **correctness spine** —
+`pull_live` falls back to the sealed payload from `inner.partitions` when
+`sealed && chunks` empty (bypassing pacing, yielding once for index 0, erroring
+on missing-sealed rather than silent EOF). This also closes a latent
+silent-empty-read bug at `partition_store.rs:733`. **Topic was an operator
+steer to B over the peers' iter-0 lean to C (SQL broadcast hints)** —
+conditioned on the fallback, exactly the B-blocker Codex named; surfaced not
+papered. Named for the common-case reclaim (one resident copy after
+release/drain), NOT constant memory (worst case — reader mid-stream at seal —
+is inherent; literal-constant is the deferred chunk-granular manifest). No
+scheduler/consumer/wire change. 15th grounding-correction arc note: the final
+promotion corrected the shorthand "3-of-3" wording against the actual peer
+files — convergence was substantive, not a same-number iteration claim.
+
+**ADR 128 lead candidate — SQL broadcast join hint authoring** (Codex+Gemini's
+iter-0 pick, deferred by sequencing not correctness): retarget
+`adr125_no_sql_hint_authoring_yet`, read `optimizer_hints` in `lower_select`
+(`sql_planner.rs:2560`), lower `/*+ BROADCAST(alias) */` to the existing
+`JoinStrategy::Broadcast`. No preprocessor, no sqlparser change — the AST
+already carries hints. INNER-only, hinted relation = left/build, reject
+mismatched/unused hints.
+
+### ADR 126 promoted (HISTORICAL)
 
 ADR 126 promoted **Live-shuffle seal correction** — the first link of ADR
 125's deferred "live shuffle memory chain." Genuine 3-of-3 (Fork A) after
@@ -70,12 +102,10 @@ retry-from-zero). 14th grounding-correction in the 119→126 arc (Claude's
 Fork B→A on grounded schema-availability). Substrate behavior change; no new
 IR/opcode/wire type.
 
-**Live shuffle memory chain — remaining links** (post-126):
+**Live shuffle memory chain — remaining link** (post-127):
 chunk-granular sealed manifest (true constant-memory / single-copy:
 multi-entry-per-partition manifest OR streaming sealed assembly — the only
-path to "1 copy"); opportunistic live-chunk release after seal when no
-readers remain (reclaims the 2nd copy without the full representation
-change).
+path to "1 copy" without retaining one sealed partition payload in the store).
 
 **Distributed execution arc:** executor build/probe reorder (pairs with
 124 for end-to-end natural backpressure); output-side
