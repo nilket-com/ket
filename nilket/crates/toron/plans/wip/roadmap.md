@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–128 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–129 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,40 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 128 promoted; ADR 129 candidates
+### ADR 129 promoted; ADR 130 candidates
+
+ADR 129 promoted **Optimizer Fact Spine for Tiny Broadcast Inference** — the
+roadmap pivot's first step toward a cost-based optimizer. Builds a conservative
+**fact spine** (hard `byte`/`row` upper bounds on `TableBinding`, propagated to
+bound subplans) and spends it on one fenced rule: unhinted INNER joins whose
+**syntactic-left** input is a single base relation with a hard byte bound below an
+effective dark-launched threshold infer `JoinStrategy::Broadcast`; everything
+else stays hash. Seam is **binding-time** (grounded: `SqlPlanner` is a
+catalog-free unit struct; the binder owns catalog + `PlannerConfig`) via a single
+`choose_join_strategy(...) -> {strategy, reason}` helper (the spine-honesty gate —
+a 2nd CBO rule is a new arm, not a new branch). `LogicalPlan::Join` gains
+`JoinStrategyIntent::{Auto, Pinned}`; `ExecutionPlan::Join` stays concrete; `Auto`
+never survives binding. Fork A exchange placement (pinned stays planner-shaped,
+auto shaped in binder) as **named temporary debt**. Row facts from `Take`/`LIMIT
+0`/`EmptyRelation` folded into the spine but **carried, not scheduled on** (no
+fragmenter/dispatch change). Config dark-launched `None`; the effective threshold
+is capped by a static conservative broadcast-cap ceiling until actual
+`QueryBudget` reaches binding, so production inference stays inert until a real
+Wendelon-facts producer ADR plus knob enablement. Genuine 3-of-3 after three
+grounding corrections (planner→binder placement; hard-bounds over `confidence`;
+no-hash-hint precedence gate — ADR 128 only added `BROADCAST`). Retargets
+122/125/128 join guards; do-no-harm inference, fail-loud hints unchanged.
+
+**ADR 130 lead candidates** (the CBO arc now has a spine to extend): right-side
+build selection + output-order preservation (the real `fact JOIN dim`
+star-schema win — dim on the right); Wendelon-backed live table-size facts
+(storage-ring producer ADR — flips 129's config to default-on); unify exchange
+insertion (pays the Fork-A debt once a pinned-reshaping rule earns it);
+selectivity propagation; fold ADR 116 take / ADR 095 empty-relation into the
+general fact model; zero-worker / coordinator-local placement; optimizer
+`EXPLAIN` over the reason receipts. Evidence-gate the pick on the 129 feat.
+
+### ADR 128 promoted (HISTORICAL)
 
 ADR 128 promoted **SQL broadcast join hint authoring** — closes the broadcast
 authoring story (125 did Rune; this does SQL). `SELECT /*+ BROADCAST(alias) */
