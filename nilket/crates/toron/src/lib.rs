@@ -735,6 +735,23 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn dominance_right_build_byte_identical_to_hash_over_tcp() {
+		let hash_results = run_distributed_join_query(sql_fact_dim_join_plan(), 16).await;
+		let broadcast_results = run_distributed_join_query_with_catalog_config(
+			sql_fact_dim_join_plan(),
+			3,
+			join_catalog_with_optimizer_facts(3_072, 1_024),
+			PlannerConfig {
+				auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+				..PlannerConfig::default()
+			},
+		)
+		.await;
+
+		assert_fact_dim_join_matches_hash(&hash_results, &broadcast_results);
+	}
+
+	#[tokio::test]
 	async fn filtered_probe_broadcast_byte_identical_to_hash_over_tcp() {
 		let hash_results =
 			run_distributed_join_query(filtered_fact_probe_dim_left_join_plan(), 16).await;

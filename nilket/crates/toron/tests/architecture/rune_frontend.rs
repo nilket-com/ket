@@ -2387,7 +2387,7 @@ pub(crate) fn adr130_behavior_gates_cover_tiny_right_and_left_tie_fence() {
 
 	for gate in [
 		"sql_fact_left_tiny_right_infers_broadcast",
-		"both_sides_tiny_prefers_left_build",
+		"both_sides_tiny_equal_keeps_left_build",
 		"right_tiny_left_deep_join_stays_hash",
 		"pinned_broadcast_still_wins_and_fail_loud",
 		"right_build_swapped_plan_is_valid_left_build_broadcast",

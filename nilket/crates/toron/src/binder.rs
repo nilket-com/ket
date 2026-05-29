@@ -208,6 +208,7 @@ enum JoinStrategyDecisionReason {
 		build_side: BroadcastBuildSide,
 		build_bytes: ByteCount,
 		threshold: ByteCount,
+		rejected_side_bytes: Option<ByteCount>,
 	},
 	HashByDefault {
 		reason: HashByDefaultReason,
@@ -3819,31 +3820,46 @@ fn choose_auto_join_strategy(
 		None
 	};
 
-	if let Some(build_bytes) = left_build_bytes {
-		if right_input.probe_scan_linear {
-			return JoinStrategyDecision {
-				strategy: JoinStrategy::Broadcast,
-				placement: JoinPhysicalPlacement::Natural,
-				reason: JoinStrategyDecisionReason::BroadcastInferred {
-					build_side: BroadcastBuildSide::Left,
-					build_bytes,
-					threshold,
-				},
-			};
-		}
-	}
-	if let Some(build_bytes) = right_build_bytes {
-		if left_input.probe_scan_linear {
-			return JoinStrategyDecision {
-				strategy: JoinStrategy::Broadcast,
-				placement: JoinPhysicalPlacement::SwappedRightBuild,
-				reason: JoinStrategyDecisionReason::BroadcastInferred {
-					build_side: BroadcastBuildSide::Right,
-					build_bytes,
-					threshold,
-				},
-			};
-		}
+	let left_viable = left_build_bytes.filter(|_| right_input.probe_scan_linear);
+	let right_viable = right_build_bytes.filter(|_| left_input.probe_scan_linear);
+	let chosen = match (left_viable, right_viable) {
+		(Some(left), Some(right)) if right_build_materially_smaller(left, right) => Some((
+			BroadcastBuildSide::Right,
+			JoinPhysicalPlacement::SwappedRightBuild,
+			right,
+			Some(left),
+		)),
+		(Some(left), Some(right)) => Some((
+			BroadcastBuildSide::Left,
+			JoinPhysicalPlacement::Natural,
+			left,
+			Some(right),
+		)),
+		(Some(left), None) => Some((
+			BroadcastBuildSide::Left,
+			JoinPhysicalPlacement::Natural,
+			left,
+			None,
+		)),
+		(None, Some(right)) => Some((
+			BroadcastBuildSide::Right,
+			JoinPhysicalPlacement::SwappedRightBuild,
+			right,
+			None,
+		)),
+		(None, None) => None,
+	};
+	if let Some((build_side, placement, build_bytes, rejected_side_bytes)) = chosen {
+		return JoinStrategyDecision {
+			strategy: JoinStrategy::Broadcast,
+			placement,
+			reason: JoinStrategyDecisionReason::BroadcastInferred {
+				build_side,
+				build_bytes,
+				threshold,
+				rejected_side_bytes,
+			},
+		};
 	}
 	if left_build_bytes.is_some() || right_build_bytes.is_some() {
 		return hash_join_decision(HashByDefaultReason::ProbeNotScanLinear);
@@ -3858,6 +3874,13 @@ fn choose_auto_join_strategy(
 		return hash_join_decision(HashByDefaultReason::MissingBuildByteUpperBound);
 	}
 	hash_join_decision(HashByDefaultReason::BuildByteUpperBoundAboveThreshold)
+}
+
+const AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR: u64 = 2;
+
+fn right_build_materially_smaller(left_bytes: ByteCount, right_bytes: ByteCount) -> bool {
+	u128::from(right_bytes.get()) * u128::from(AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR)
+		<= u128::from(left_bytes.get())
 }
 
 fn broadcast_probe_is_scan_linear(plan: &ExecutionPlan) -> bool {
@@ -7506,7 +7529,72 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn both_sides_tiny_prefers_left_build() {
+	async fn both_sides_eligible_right_materially_smaller_prefers_right_build() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 3_072);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan SQL join");
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind dominance-selected right-build join");
+
+		let ExecutionPlan::Project {
+			input,
+			output_schema,
+			..
+		} = plan
+		else {
+			panic!("right dominance should swap physical build and restore declared order");
+		};
+		assert_eq!(
+			field_names(&output_schema),
+			vec!["id", "customer_id", "id", "region"]
+		);
+		let ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} = input.as_ref()
+		else {
+			panic!("restore project must wrap physical broadcast join");
+		};
+		assert_eq!(*strategy, JoinStrategy::Broadcast);
+		assert!(matches!(terminal_exchange(left), Some((1, _))));
+		assert!(terminal_exchange(right).is_none());
+
+		let decision = choose_join_strategy(
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(3_072)),
+				row_upper_bound: None,
+			}),
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(1_024)),
+				row_upper_bound: None,
+			}),
+			&auto_broadcast_config(4_096),
+		);
+		assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::BroadcastInferred {
+				build_side: BroadcastBuildSide::Right,
+				build_bytes: ByteCount::new(1_024),
+				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: Some(ByteCount::new(3_072)),
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn both_sides_tiny_equal_keeps_left_build() {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "orders", 1_024);
 		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
@@ -7535,6 +7623,64 @@ mod tests {
 		);
 		assert!(matches!(terminal_exchange(&left), Some((1, _))));
 		assert!(terminal_exchange(&right).is_none());
+
+		let decision = choose_join_strategy(
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(1_024)),
+				row_upper_bound: None,
+			}),
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(1_024)),
+				row_upper_bound: None,
+			}),
+			&auto_broadcast_config(4_096),
+		);
+		assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::BroadcastInferred {
+				build_side: BroadcastBuildSide::Left,
+				build_bytes: ByteCount::new(1_024),
+				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: Some(ByteCount::new(1_024)),
+			}
+		);
+	}
+
+	#[test]
+	fn both_sides_eligible_near_tie_keeps_left_build() {
+		let config = auto_broadcast_config(4_096);
+		let decision = choose_join_strategy(
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(1_536)),
+				row_upper_bound: None,
+			}),
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(1_024)),
+				row_upper_bound: None,
+			}),
+			&config,
+		);
+
+		assert_eq!(decision.strategy, JoinStrategy::Broadcast);
+		assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::BroadcastInferred {
+				build_side: BroadcastBuildSide::Left,
+				build_bytes: ByteCount::new(1_536),
+				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: Some(ByteCount::new(1_024)),
+			}
+		);
 	}
 
 	#[tokio::test]
@@ -7849,6 +7995,7 @@ mod tests {
 				build_side: BroadcastBuildSide::Left,
 				build_bytes: ByteCount::new(1_024),
 				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: None,
 			}
 		);
 
@@ -7875,8 +8022,61 @@ mod tests {
 				build_side: BroadcastBuildSide::Right,
 				build_bytes: ByteCount::new(1_024),
 				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: None,
 			}
 		);
+	}
+
+	#[test]
+	fn sole_eligible_side_reports_no_rejected_bytes() {
+		let config = auto_broadcast_config(4_096);
+		for (left_bytes, right_bytes, expected_side, expected_placement) in [
+			(
+				Some(1_024),
+				None,
+				BroadcastBuildSide::Left,
+				JoinPhysicalPlacement::Natural,
+			),
+			(
+				None,
+				Some(1_024),
+				BroadcastBuildSide::Right,
+				JoinPhysicalPlacement::SwappedRightBuild,
+			),
+		] {
+			let decision = choose_join_strategy(
+				JoinStrategyIntent::Auto,
+				JoinKind::Inner,
+				join_input(PlanOptimizerFacts {
+					origin: PlanOrigin::SingleBaseRelation,
+					byte_upper_bound: left_bytes.map(ByteCount::new),
+					row_upper_bound: None,
+				}),
+				join_input(PlanOptimizerFacts {
+					origin: PlanOrigin::SingleBaseRelation,
+					byte_upper_bound: right_bytes.map(ByteCount::new),
+					row_upper_bound: None,
+				}),
+				&config,
+			);
+
+			assert_eq!(decision.strategy, JoinStrategy::Broadcast);
+			assert_eq!(decision.placement, expected_placement);
+			match decision.reason {
+				JoinStrategyDecisionReason::BroadcastInferred {
+					build_side,
+					build_bytes,
+					threshold,
+					rejected_side_bytes,
+				} => {
+					assert_eq!(build_side, expected_side);
+					assert_eq!(build_bytes, ByteCount::new(1_024));
+					assert_eq!(threshold, ByteCount::new(4_096));
+					assert_eq!(rejected_side_bytes, None);
+				}
+				other => panic!("expected inferred broadcast reason, got {other:?}"),
+			}
+		}
 	}
 
 	#[tokio::test]
