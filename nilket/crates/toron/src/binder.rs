@@ -220,8 +220,15 @@ enum HashByDefaultReason {
 	NonInnerJoin,
 	LeftInputNotSingleBaseRelation,
 	RightInputNotSingleBaseRelation,
+	ProbeNotScanLinear,
 	MissingBuildByteUpperBound,
 	BuildByteUpperBoundAboveThreshold,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JoinInputOptimization {
+	facts: PlanOptimizerFacts,
+	probe_scan_linear: bool,
 }
 
 struct ExprBindContext<'a> {
@@ -1110,8 +1117,14 @@ impl<'a> Binder<'a> {
 		let decision = choose_join_strategy(
 			strategy_intent,
 			kind,
-			left_plan.facts,
-			right_plan.facts,
+			JoinInputOptimization {
+				facts: left_plan.facts,
+				probe_scan_linear: broadcast_probe_is_scan_linear(&left_plan.plan),
+			},
+			JoinInputOptimization {
+				facts: right_plan.facts,
+				probe_scan_linear: broadcast_probe_is_scan_linear(&right_plan.plan),
+			},
 			self.config,
 		);
 		if matches!(strategy_intent, JoinStrategyIntent::Auto) {
@@ -3760,8 +3773,8 @@ struct ResolvedLogicalColumn {
 fn choose_join_strategy(
 	intent: JoinStrategyIntent,
 	kind: JoinKind,
-	left_facts: PlanOptimizerFacts,
-	right_facts: PlanOptimizerFacts,
+	left_input: JoinInputOptimization,
+	right_input: JoinInputOptimization,
 	config: &PlannerConfig,
 ) -> JoinStrategyDecision {
 	match intent {
@@ -3771,15 +3784,15 @@ fn choose_join_strategy(
 			reason: JoinStrategyDecisionReason::PinnedByAuthor,
 		},
 		JoinStrategyIntent::Auto => {
-			choose_auto_join_strategy(kind, left_facts, right_facts, config)
+			choose_auto_join_strategy(kind, left_input, right_input, config)
 		}
 	}
 }
 
 fn choose_auto_join_strategy(
 	kind: JoinKind,
-	left_facts: PlanOptimizerFacts,
-	right_facts: PlanOptimizerFacts,
+	left_input: JoinInputOptimization,
+	right_input: JoinInputOptimization,
 	config: &PlannerConfig,
 ) -> JoinStrategyDecision {
 	let Some(threshold) = effective_auto_broadcast_threshold(config) else {
@@ -3788,14 +3801,26 @@ fn choose_auto_join_strategy(
 	if kind != JoinKind::Inner {
 		return hash_join_decision(HashByDefaultReason::NonInnerJoin);
 	}
-	if left_facts.origin != PlanOrigin::SingleBaseRelation {
-		return hash_join_decision(HashByDefaultReason::LeftInputNotSingleBaseRelation);
-	}
-	if right_facts.origin != PlanOrigin::SingleBaseRelation {
-		return hash_join_decision(HashByDefaultReason::RightInputNotSingleBaseRelation);
-	}
-	if let Some(build_bytes) = left_facts.byte_upper_bound {
-		if build_bytes < threshold {
+
+	let left_build_bytes = if left_input.facts.origin == PlanOrigin::SingleBaseRelation {
+		left_input
+			.facts
+			.byte_upper_bound
+			.filter(|build_bytes| *build_bytes < threshold)
+	} else {
+		None
+	};
+	let right_build_bytes = if right_input.facts.origin == PlanOrigin::SingleBaseRelation {
+		right_input
+			.facts
+			.byte_upper_bound
+			.filter(|build_bytes| *build_bytes < threshold)
+	} else {
+		None
+	};
+
+	if let Some(build_bytes) = left_build_bytes {
+		if right_input.probe_scan_linear {
 			return JoinStrategyDecision {
 				strategy: JoinStrategy::Broadcast,
 				placement: JoinPhysicalPlacement::Natural,
@@ -3807,8 +3832,8 @@ fn choose_auto_join_strategy(
 			};
 		}
 	}
-	if let Some(build_bytes) = right_facts.byte_upper_bound {
-		if build_bytes < threshold {
+	if let Some(build_bytes) = right_build_bytes {
+		if left_input.probe_scan_linear {
 			return JoinStrategyDecision {
 				strategy: JoinStrategy::Broadcast,
 				placement: JoinPhysicalPlacement::SwappedRightBuild,
@@ -3820,10 +3845,43 @@ fn choose_auto_join_strategy(
 			};
 		}
 	}
-	if left_facts.byte_upper_bound.is_none() || right_facts.byte_upper_bound.is_none() {
+	if left_build_bytes.is_some() || right_build_bytes.is_some() {
+		return hash_join_decision(HashByDefaultReason::ProbeNotScanLinear);
+	}
+	if left_input.facts.origin != PlanOrigin::SingleBaseRelation {
+		return hash_join_decision(HashByDefaultReason::LeftInputNotSingleBaseRelation);
+	}
+	if right_input.facts.origin != PlanOrigin::SingleBaseRelation {
+		return hash_join_decision(HashByDefaultReason::RightInputNotSingleBaseRelation);
+	}
+	if left_input.facts.byte_upper_bound.is_none() || right_input.facts.byte_upper_bound.is_none() {
 		return hash_join_decision(HashByDefaultReason::MissingBuildByteUpperBound);
 	}
 	hash_join_decision(HashByDefaultReason::BuildByteUpperBoundAboveThreshold)
+}
+
+fn broadcast_probe_is_scan_linear(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Scan { row_limit, .. } => row_limit.is_none(),
+		ExecutionPlan::Filter { input, .. } | ExecutionPlan::Project { input, .. } => {
+			broadcast_probe_is_scan_linear(input)
+		}
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Aggregate { .. }
+		| ExecutionPlan::Exchange { .. }
+		| ExecutionPlan::Sort { .. }
+		| ExecutionPlan::Take { .. }
+		| ExecutionPlan::Join { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => false,
+	}
 }
 
 fn hash_join_decision(reason: HashByDefaultReason) -> JoinStrategyDecision {
@@ -7500,6 +7558,208 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn left_tiny_with_filtered_probe_infers_broadcast() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		let filtered_orders = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(
+					TableRef::new("orders"),
+					"customer_id",
+				)),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(2)))),
+			),
+		};
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			right: Box::new(filtered_orders),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind left-tiny filtered-probe join");
+
+		let ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} = plan
+		else {
+			panic!("expected natural broadcast join");
+		};
+		assert_eq!(strategy, JoinStrategy::Broadcast);
+		assert!(matches!(terminal_exchange(&left), Some((1, _))));
+		assert!(terminal_exchange(&right).is_none());
+	}
+
+	#[tokio::test]
+	async fn right_tiny_with_projected_probe_infers_broadcast() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let projected_orders = LogicalPlan::Project {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			exprs: vec![
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("orders"), "id"),
+			],
+			output_names: vec![Some("customer_id".to_string()), Some("id".to_string())],
+		};
+		let logical = LogicalPlan::Join {
+			left: Box::new(projected_orders),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::column("customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind right-tiny projected-probe join");
+
+		let ExecutionPlan::Project {
+			input,
+			output_schema,
+			..
+		} = plan
+		else {
+			panic!("right-build broadcast must restore declared order with a project");
+		};
+		assert_eq!(
+			field_names(&output_schema),
+			vec!["customer_id", "id", "id", "region"]
+		);
+		let ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} = input.as_ref()
+		else {
+			panic!("restore project must wrap the physical join");
+		};
+		assert_eq!(*strategy, JoinStrategy::Broadcast);
+		assert!(matches!(terminal_exchange(left), Some((1, _))));
+		assert!(terminal_exchange(right).is_none());
+	}
+
+	#[tokio::test]
+	async fn probe_containing_join_stays_hash() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan nested-probe SQL join");
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind nested-probe join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+	}
+
+	#[tokio::test]
+	async fn probe_with_aggregate_stays_hash() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let aggregate_orders = LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			group_expr: vec![Expr::qualified_column(
+				TableRef::new("orders"),
+				"customer_id",
+			)],
+			aggr_expr: Vec::new(),
+		};
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			right: Box::new(aggregate_orders),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::column("customer_id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind aggregate-probe join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+	}
+
+	#[tokio::test]
+	async fn probe_with_take_or_limited_scan_stays_hash() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let taken_orders = LogicalPlan::Take {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			limit: 1,
+		};
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			right: Box::new(taken_orders.clone()),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind take-probe join");
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+
+		let limited_scan = bind(&taken_orders, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind limited scan");
+		assert!(!broadcast_probe_is_scan_linear(&limited_scan));
+	}
+
+	#[tokio::test]
 	async fn pinned_broadcast_still_wins_and_fail_loud() {
 		let logical = SqlPlanner::new()
 			.plan(
@@ -7568,16 +7828,16 @@ mod tests {
 		let decision = choose_join_strategy(
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
-			PlanOptimizerFacts {
+			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				row_upper_bound: None,
-			},
-			PlanOptimizerFacts {
+			}),
+			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: None,
 				row_upper_bound: None,
-			},
+			}),
 			&config,
 		);
 
@@ -7595,16 +7855,16 @@ mod tests {
 		let decision = choose_join_strategy(
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
-			PlanOptimizerFacts {
+			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: None,
 				row_upper_bound: None,
-			},
-			PlanOptimizerFacts {
+			}),
+			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				row_upper_bound: None,
-			},
+			}),
 			&config,
 		);
 		assert_eq!(decision.strategy, JoinStrategy::Broadcast);
@@ -7684,6 +7944,13 @@ mod tests {
 				},
 			)
 			.expect("seed optimizer facts");
+	}
+
+	fn join_input(facts: PlanOptimizerFacts) -> JoinInputOptimization {
+		JoinInputOptimization {
+			facts,
+			probe_scan_linear: true,
+		}
 	}
 
 	fn assert_join_strategy(plan: &ExecutionPlan, expected: JoinStrategy) {

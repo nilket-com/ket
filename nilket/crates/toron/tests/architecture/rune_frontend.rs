@@ -2046,7 +2046,7 @@ pub(crate) fn adr129_tiny_broadcast_requires_hard_byte_upper_bound() {
 
 	assert!(choose_auto.contains("kind != JoinKind::Inner"));
 	assert!(choose_auto.contains("PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("left_facts.byte_upper_bound"));
+	assert!(choose_auto.contains("left_input.facts.byte_upper_bound"));
 	assert!(choose_auto.contains("MissingBuildByteUpperBound"));
 	assert!(choose_auto.contains("effective_auto_broadcast_threshold"));
 	assert!(choose_auto.contains("BuildByteUpperBoundAboveThreshold"));
@@ -2201,18 +2201,153 @@ pub(crate) fn adr130_decision_helper_single_seam() {
 	assert!(bind_join.contains("choose_join_strategy("));
 	assert!(!bind_join.contains("byte_upper_bound"));
 	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
-	assert!(choose_join_strategy.contains("right_facts: PlanOptimizerFacts"));
+	assert!(choose_join_strategy.contains("left_input: JoinInputOptimization"));
+	assert!(choose_join_strategy.contains("right_input: JoinInputOptimization"));
 	assert!(
-		choose_join_strategy.contains("choose_auto_join_strategy(kind, left_facts, right_facts")
+		choose_join_strategy.contains("choose_auto_join_strategy(kind, left_input, right_input")
 	);
-	assert!(choose_auto.contains("left_facts.origin != PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("right_facts.origin != PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("left_facts.byte_upper_bound"));
-	assert!(choose_auto.contains("right_facts.byte_upper_bound"));
+	assert!(choose_auto.contains("let left_build_bytes"));
+	assert!(choose_auto.contains("let right_build_bytes"));
+	assert!(choose_auto.contains("right_input.probe_scan_linear"));
+	assert!(choose_auto.contains("left_input.probe_scan_linear"));
+	assert!(choose_auto.contains("left_input.facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("right_input.facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("left_input.facts.byte_upper_bound"));
+	assert!(choose_auto.contains("right_input.facts.byte_upper_bound"));
 	assert!(choose_auto.contains("BroadcastBuildSide::Left"));
 	assert!(choose_auto.contains("BroadcastBuildSide::Right"));
 	assert!(choose_auto.contains("JoinPhysicalPlacement::Natural"));
 	assert!(choose_auto.contains("JoinPhysicalPlacement::SwappedRightBuild"));
+}
+
+#[test]
+pub(crate) fn adr131_probe_eligibility_is_scan_linear_execution_plan_walk() {
+	let binder = binder_source();
+	let helper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
+
+	assert_eq!(
+		binder.matches("fn broadcast_probe_is_scan_linear(").count(),
+		1
+	);
+	assert!(helper.contains("match plan"));
+	assert!(helper.contains("ExecutionPlan::Scan { row_limit, .. } => row_limit.is_none()"));
+	assert!(helper.contains("ExecutionPlan::Filter { input, .. }"));
+	assert!(helper.contains("ExecutionPlan::Project { input, .. }"));
+	assert!(helper.contains("broadcast_probe_is_scan_linear(input)"));
+	assert!(!helper.contains("_ =>"));
+	assert!(!helper.contains("ExecutionPlan::Alias"));
+}
+
+#[test]
+pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_nested_shapes() {
+	let binder = binder_source();
+	let helper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
+
+	for rejected in [
+		"ExecutionPlan::Join",
+		"ExecutionPlan::Aggregate",
+		"ExecutionPlan::Sort",
+		"ExecutionPlan::Take",
+		"ExecutionPlan::Exchange",
+		"ExecutionPlan::SystemTable",
+		"ExecutionPlan::EmptyRelation",
+		"ExecutionPlan::CreateTable",
+		"ExecutionPlan::CreateLogicalType",
+		"ExecutionPlan::CreateTableAsSelect",
+		"ExecutionPlan::DropTable",
+		"ExecutionPlan::Delete",
+		"ExecutionPlan::Update",
+		"ExecutionPlan::Insert",
+		"ExecutionPlan::InsertSelect",
+	] {
+		assert!(
+			helper.contains(rejected),
+			"scan-linear helper missing rejected variant {rejected}"
+		);
+	}
+	assert!(helper.contains("=> false"));
+}
+
+#[test]
+pub(crate) fn adr131_build_side_still_requires_single_base_hard_bytes() {
+	let binder = binder_source();
+	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+
+	assert!(choose_auto.contains("left_input.facts.origin == PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("right_input.facts.origin == PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("left_input.facts.byte_upper_bound"));
+	assert!(choose_auto.contains("right_input.facts.byte_upper_bound"));
+	assert!(choose_auto.contains("build_bytes < threshold"));
+	assert!(choose_auto.contains("MissingBuildByteUpperBound"));
+	assert!(choose_auto.contains("BuildByteUpperBoundAboveThreshold"));
+}
+
+#[test]
+pub(crate) fn adr131_strategy_decision_remains_single_helper() {
+	let binder = binder_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+	let choose_join_strategy = source_block(&binder, "fn choose_join_strategy");
+	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+
+	assert_eq!(binder.matches("fn choose_join_strategy(").count(), 1);
+	assert!(bind_join.contains("JoinInputOptimization"));
+	assert!(
+		bind_join.contains("probe_scan_linear: broadcast_probe_is_scan_linear(&left_plan.plan)")
+	);
+	assert!(
+		bind_join.contains("probe_scan_linear: broadcast_probe_is_scan_linear(&right_plan.plan)")
+	);
+	assert!(bind_join.contains("choose_join_strategy("));
+	assert!(!bind_join.contains("byte_upper_bound"));
+	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
+	assert!(choose_join_strategy.contains("JoinStrategyIntent::Pinned(strategy)"));
+	assert!(choose_join_strategy.contains("JoinStrategyIntent::Auto"));
+	assert!(choose_auto.contains("ProbeNotScanLinear"));
+}
+
+#[test]
+pub(crate) fn adr131_no_executor_fragmenter_scheduler_wire_or_wendelon_change() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"JoinInputOptimization",
+		"broadcast_probe_is_scan_linear",
+		"ProbeNotScanLinear",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/distributed"),
+		manifest_dir.join("src/server"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR131 probe eligibility leaked into execution/distributed/wire/Wendelon substrate:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
 }
 
 #[test]

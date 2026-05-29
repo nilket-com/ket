@@ -735,6 +735,31 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn filtered_probe_broadcast_byte_identical_to_hash_over_tcp() {
+		let hash_results =
+			run_distributed_join_query(filtered_fact_probe_dim_left_join_plan(), 16).await;
+		let broadcast_results = run_distributed_join_query_with_catalog_config(
+			filtered_fact_probe_dim_left_join_plan(),
+			3,
+			join_catalog_with_optimizer_facts(64 * 1024 * 1024, 1_024),
+			PlannerConfig {
+				auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+				..PlannerConfig::default()
+			},
+		)
+		.await;
+
+		assert!(!hash_results.is_empty());
+		assert!(!broadcast_results.is_empty());
+		assert_eq!(broadcast_results[0].schema(), hash_results[0].schema());
+		assert_eq!(
+			canonical_arrow_ipc_digest(&broadcast_results, SortPolicy::FullRowLex)
+				.expect("filtered-probe broadcast digest"),
+			canonical_arrow_ipc_digest(&hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	#[tokio::test]
 	async fn sql_broadcast_hint_respects_cap_terminally() {
 		let mut query_budget = QueryBudget::test_default();
 		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
@@ -1560,6 +1585,34 @@ mod tests {
 		crate::sql_planner::SqlPlanner::new()
 			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 			.expect("SQL fact-dim join plan")
+	}
+
+	fn filtered_fact_probe_dim_left_join_plan() -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: crate::catalog::TableRef::new("customers"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::Filter {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("orders"),
+					projection: None,
+				}),
+				predicate: Expr::Eq(
+					Box::new(Expr::qualified_column(
+						crate::catalog::TableRef::new("orders"),
+						"customer_id",
+					)),
+					Box::new(Expr::Literal(ScalarValue::Int64(Some(2)))),
+				),
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}
 	}
 
 	fn sql_broadcast_join_plan() -> LogicalPlan {
