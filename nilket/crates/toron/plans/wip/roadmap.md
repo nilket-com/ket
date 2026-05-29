@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–132 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–133 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,33 +46,33 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 132 promoted; ADR 133 candidates
+### ADR 133 promoted; ADR 134 candidates
 
-ADR 132 promoted **Smaller-Build Dominance Comparator** — the first real cost
-comparison in the CBO arc. When *both* INNER-join inputs are eligible broadcast
-builds (single base relation + hard `byte_upper_bound < threshold` + opposite side
-scan-linear), the binder now picks the materially-smaller build instead of
-always-left. Materiality is a named **integer** factor with exact `u128` math —
-`AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR = 2` (`right*2 <= left`) — deliberately
-left-biased: ties/near-ties keep left (Natural) because 130's right-build carries
-a permanent restoring `Project`. Grounded: `ByteCount` is `u64`, so integer/u128
-avoids float-on-bytes (Gemini conceded its iter-1 `0.8` float to this). The
-private `BroadcastInferred` receipt gains `rejected_side_bytes: Option<ByteCount>`
-(magnitude of the unchosen eligible side) for a future `EXPLAIN`. Comparator lives
-in the single `choose_auto_join_strategy` seam; reuses 130's swap + 131's
-scan-linear predicate; no new `JoinStrategy`/`ExecutionPlan` variant, no config
-knob, no executor/fragmenter/scheduler/wire/Wendelon change. Genuine 3-of-3.
-Load-bearing gate: `both_sides_eligible_right_materially_smaller_prefers_right_build`
-(left=3072,right=1024) fails on the pre-132 always-left code; the 130 tie test is
-retargeted to prove the margin.
+ADR 133 promoted **Binder Optimizer Trace Receipts** — makes the CBO arc 129–132
+durable and inspectable. The binder computed `JoinStrategyDecision { strategy,
+placement, reason }`, used strategy/placement to build the plan, and **dropped the
+reason** — so *why* a join chose hash or broadcast was testable only by plan-shape
+inference. A new `bind_with_trace` path now **always** collects a crate-private
+`OptimizerTrace` — one `DecisionReceipt { join_index, strategy, placement, reason }`
+per join (auto / every hash reason / pinned) — threaded as `&mut` (no `RefCell`);
+plain `bind` is a thin wrapper that discards it and stays structurally identical.
+The four reason enums move module-private → `pub(crate)` (required for tests; never
+bare `pub`, never on `ExecutionPlan`/wire). Identity is a deterministic
+`join_index` (self-join-safe; human qualifiers deferred). Genuine 3-of-3 +
+operator-selected: Gemini conceded multi-way and Claude conceded public EXPLAIN,
+both → trace-first; Codex's iter-2 EXPLAIN-feasibility grounding instead de-risks
+the follow-on. No executor/fragmenter/scheduler/wire/Wendelon change. Load-bearing
+gate: `bind_remains_structurally_identical_with_and_without_trace`.
 
-**ADR 133 lead candidates:** multi-way star-join ordering (lifts 131's nested-join
-probe fence — needs recursive fragmentation of a nested broadcast probe, real
-substrate work); Wendelon-backed live table-size facts (storage-ring producer —
-flips 129's dark-launch to default-on); optimizer `EXPLAIN` over the now-richer
-reason receipts (132 makes it worth building — ≥2 comparison-bearing decisions +
-`rejected_side_bytes` magnitudes); selectivity propagation. Evidence-gate the pick
-on the 132 feat.
+**ADR 134 lead candidates:** public `EXPLAIN <query>` rendered from this trace —
+lower the currently-`unsupported` `Statement::Explain`, bind via `bind_with_trace`,
+and render trace rows through the existing SQL result path, likely by adding an
+EXPLAIN-shaped system table plan (grounded feasible: system-table rows already
+materialize to `RecordBatch` at `exec.rs:667`; no new wire message should be
+needed). Then Wendelon-backed live table-size facts (cross-ring producer → flip
+dark-launch toward default-on, EXPLAIN validates it); recursive fragmentation /
+multi-way star-join substrate; selectivity + richer cost. Evidence-gate the pick on
+the 133 feat.
 
 ### ADR 129 promoted (HISTORICAL)
 
