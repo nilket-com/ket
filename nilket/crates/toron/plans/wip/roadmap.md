@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–124 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–125 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,52 +46,60 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 124 promoted; ADR 125 candidates
+### ADR 125 promoted; ADR 126 candidates
 
-ADR 124 promoted **bounded live-partition backpressure** — the producer-side
-repair of 123's deliberately-dropped natural-backpressure boundary. Pacing
-semaphore additive over the existing `LivePartition.chunks` replay ledger
-(`LIVE_BACKLOG_DEPTH = 4`); async `PartitionStore::append_live` via
-`async_trait`; `farthest_released_index` invariant against retry-replay
-permit double-release; sealed materialization preserved (Codex A locked after
-Gemini conceded "no sealed materialization" on `scheduler.rs:856-885`'s
-no-restart grounding). **Honesty boundary:** bounds unread backlog per
-partition, NOT total live shuffle memory — producer-side `partition_batches`
-retention at `server/mod.rs:470-471` preserved in V1 as a named follow-on.
-Twelfth grounding-correction in the 119→124 arc.
+ADR 125 promoted **Rune broadcast join authoring** — single new method
+`df.broadcast_join(other, on)` (receiver = LEFT = build = small);
+strategy-aware helper rename `build_hash_join_plan` →
+`build_join_plan(.., strategy)` with internal `JoinStrategy` match (no
+compat wrapper); INNER-only at API construction + defensive frontend
+reject; 3 callsite updates + 3 retargeted 122 guards + 6 new 125 guards +
+9 behavior gates; G-A authored equivalence mirrors `lib.rs:594` end-to-end.
+Genuine 3-of-3 after iter-1 grounding toppled the Gemini/Codex iter-0
+"constant-memory live shuffle" framing (13th grounding-correction in the
+119→125 arc — `partition_store.rs:501-515` + `server/mod.rs:511` showed
+`live.chunks` retains all encoded bytes through seal AND publish path
+double-encodes + double-reserves). No substrate change.
 
-**124 follow-ons:** `partition_batches` retention removal (constant-memory
-live shuffle from claim to truth); executor build/probe reorder (end-to-end
-natural backpressure for joins); configurable `LIVE_BACKLOG_DEPTH` via
-`QueryBudget`; consumer-pull-side bounded channel.
+**Live shuffle memory chain** (Codex's deferred honest scope):
+ledger-backed live shuffle sealing (drop `partition_batches` RecordBatch
+retention + double publish/budget reservation; **must include
+empty-partition schema-bearing Arrow IPC fix** — `seal_live` produces
+empty bytes for never-appended partitions); chunk-granular sealed manifest
+(true constant-memory; multi-entry-per-partition OR streaming sealed
+assembly).
 
-**123 follow-ons (still-deferred):** output-side joins-as-streamable-producers;
-multi-producer fan-in + remote live transport (fragmenter parallelism +
-cross-worker live reads); mixed streamable+sealed multi-upstream (A2);
-Rune-authored broadcast join + SQL hint (broadcast execution exists
-end-to-end at `fragment.rs:473`; only the frontend bridge is missing).
+**Distributed execution arc:** executor build/probe reorder (pairs with
+124 for end-to-end natural backpressure); output-side
+joins-as-streamable-producers (widen `streamable_unary_plan` for `Join` +
+restructure executor); multi-producer fan-in + remote live transport
+(Codex's three-substrate framing); configurable `LIVE_BACKLOG_DEPTH` via
+`QueryBudget`.
+
+**Broadcast continuation:** SQL broadcast hint authoring (needs
+`sqlparser` hint preservation grounding — don't invent a preprocessor);
+non-INNER broadcast widening (binder + fragmenter per-kind correctness
+proofs); cost-based strategy selection (needs cardinality estimates not
+in IR today).
 
 **Identity tier:** logical-type lifecycle (`DROP`/`ALTER LOGICAL TYPE` —
 cross-ring DROP + referential integrity, bounded 090 re-open);
-declared-additive types (`SUM(Money) → Money` via a logical-type property —
-narrows the 113 deferral); PK/FK-derived identity (blocked on FK support at
-`sql_planner.rs:663`).
+declared-additive types (`SUM(Money) → Money` via logical-type property);
+PK/FK-derived identity (blocked on FK support at `sql_planner.rs:663`).
 
 **Frontend:** qualified wildcards (`t.*` + mixed — planner↔binder
-restructuring or a `Wildcard` IR variant); qualified DML RETURNING; DML
+restructuring or `Wildcard` IR variant); qualified DML RETURNING; DML
 target aliases / qualified assignment targets; SQL joins around derived
 tables / GROUP BY over joins; Rune sort/limit; SIMILAR TO / RLIKE / REGEXP.
 
-**Distributed / execution:** streamable Sort/Aggregate coverage (120 V2 —
-top-k bounded buffers + partial+merge); row-group-lazy-from-disk scan (118
-follow-on — per disk page laziness); cost-based broadcast strategy selection
-(needs cardinality estimates not in IR today).
+**Distributed (other):** streamable Sort/Aggregate coverage (120 V2 —
+top-k bounded buffers + partial+merge); row-group-lazy-from-disk scan
+(118 follow-on — per disk page laziness).
 
-**Optimizer / catalog:** general project-fusion beyond 105's adjacent-identity
-case (evidence-gated); further `information_schema` relations (constraints /
-indexes / PK-FK / views — each gated on the harder modeling pieces);
-Wendelon `*V1`/`*v1` de-version sweep (Wendelon-home chore, placement
-follows code-locality).
+**Optimizer / catalog:** general project-fusion beyond 105's
+adjacent-identity case (evidence-gated); further `information_schema`
+relations (constraints / indexes / PK-FK / views); Wendelon `*V1`/`*v1`
+de-version sweep (Wendelon-home chore).
 
 **Long-horizon:** subquery/`UNNEST`/row-value `IN`; `CHECK`/`DEFAULT`;
 `ALTER`/composite-PK/`UNIQUE`; pre-op intent audit; fragmentable bulk DML;
