@@ -59,6 +59,7 @@ mod tests {
 		AggregateFunction, BoundExprProgram, ExecutionPlan, Expr, JoinKind, JoinStrategy,
 		LogicalPlan, MorselId, ScalarValue, StageId, TableId,
 	};
+	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::server::{
 		NetworkTaskDispatcher, ToronCoordinator, ToronWorker, memory::MemoryManager,
 		spill::SpillManager, transport::TcpTransport,
@@ -611,6 +612,45 @@ mod tests {
 		let err = run_distributed_join_query_with_budget(broadcast_join_plan(), 2, query_budget)
 			.await
 			.expect_err("broadcast cap must fail");
+
+		assert!(matches!(
+			err,
+			QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::BroadcastReplication,
+					..
+				},
+				..
+			})
+		));
+	}
+
+	#[tokio::test]
+	async fn rune_authored_broadcast_join_digest_matches_hash_join_over_tcp() {
+		let hash_results = run_distributed_join_query(rune_hash_join_plan().await, 16).await;
+		let broadcast_results =
+			run_distributed_join_query(rune_broadcast_join_plan().await, 3).await;
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&broadcast_results, SortPolicy::FullRowLex)
+				.expect("broadcast digest"),
+			canonical_arrow_ipc_digest(&hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	#[tokio::test]
+	async fn rune_authored_broadcast_join_respects_cap_terminally() {
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+
+		let err = run_distributed_join_query_with_budget(
+			rune_broadcast_join_plan().await,
+			2,
+			query_budget,
+		)
+		.await
+		.expect_err("Rune-authored broadcast cap must fail");
 
 		assert!(matches!(
 			err,
@@ -1382,6 +1422,45 @@ mod tests {
 		}
 	}
 
+	async fn rune_hash_join_plan() -> LogicalPlan {
+		rune_join_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("customers")
+               .inner_join(
+                   ctx.table("orders"),
+                   qcol("customers", "id").eq(qcol("orders", "customer_id"))
+               )
+        }
+    "#,
+		)
+		.await
+	}
+
+	async fn rune_broadcast_join_plan() -> LogicalPlan {
+		rune_join_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("customers")
+               .broadcast_join(
+                   ctx.table("orders"),
+                   qcol("customers", "id").eq(qcol("orders", "customer_id"))
+               )
+        }
+    "#,
+		)
+		.await
+	}
+
+	async fn rune_join_plan(script: &str) -> LogicalPlan {
+		let config = RuneSandboxConfig::v1_default();
+		let engine = RuneEngine::with_config(config).expect("Rune engine");
+		engine
+			.execute_script(script, &config)
+			.await
+			.expect("Rune-authored join plan")
+	}
+
 	async fn run_distributed_join_query(plan: LogicalPlan, connections: usize) -> Vec<RecordBatch> {
 		run_distributed_join_query_with_budget(plan, connections, QueryBudget::test_default())
 			.await
@@ -1390,7 +1469,7 @@ mod tests {
 
 	async fn run_distributed_join_query_with_budget(
 		plan: LogicalPlan,
-		connections: usize,
+		_connections: usize,
 		query_budget: QueryBudget,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let memory = test_memory();
@@ -1405,14 +1484,22 @@ mod tests {
 			worker_id,
 			endpoint.clone(),
 		));
+		let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 		let server_handle = tokio::spawn(async move {
 			let mut handles = Vec::new();
-			for _ in 0..connections {
-				let (server_stream, _) = listener.accept().await.unwrap();
-				let worker = worker.clone();
-				handles.push(tokio::spawn(async move {
-					worker.handle_connection(server_stream).await.unwrap();
-				}));
+			loop {
+				tokio::select! {
+					accepted = listener.accept() => {
+						let (server_stream, _) = accepted.unwrap();
+						let worker = worker.clone();
+						handles.push(tokio::spawn(async move {
+							worker.handle_connection(server_stream).await.unwrap();
+						}));
+					}
+					_ = shutdown_rx.changed() => {
+						break;
+					}
+				}
 			}
 			for handle in handles {
 				handle.await.unwrap();
@@ -1446,6 +1533,7 @@ mod tests {
 		);
 
 		let results = coordinator.execute_query(&plan).await;
+		shutdown_tx.send(true).unwrap();
 		server_handle.await.unwrap();
 		results
 	}

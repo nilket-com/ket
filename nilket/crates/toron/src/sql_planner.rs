@@ -2643,7 +2643,7 @@ impl SqlPlanner {
 			}
 			let right = self.lower_table_factor(&join.relation)?;
 			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
-			plan = build_hash_join_plan(plan, right, kind, on)?;
+			plan = build_join_plan(plan, right, kind, on, JoinStrategy::HashPartitioned)?;
 		}
 
 		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation)
@@ -3595,7 +3595,7 @@ impl SqlPlanner {
 			};
 		}
 
-		build_hash_join_plan(
+		build_join_plan(
 			outer_plan,
 			inner_plan,
 			if negated {
@@ -3604,6 +3604,7 @@ impl SqlPlanner {
 				JoinKind::LeftSemi
 			},
 			on,
+			JoinStrategy::HashPartitioned,
 		)
 	}
 
@@ -4039,28 +4040,49 @@ impl SqlPlanner {
 	}
 }
 
-pub(crate) fn build_hash_join_plan(
+pub(crate) fn build_join_plan(
 	left: LogicalPlan,
 	right: LogicalPlan,
 	kind: JoinKind,
 	on: Vec<(Expr, Expr)>,
+	strategy: JoinStrategy,
 ) -> Result<LogicalPlan, FrontendError> {
 	let (left_keys, right_keys) = derive_join_exchange_keys(&on, &left, &right)?;
-	Ok(LogicalPlan::Join {
-		left: Box::new(LogicalPlan::Exchange {
-			input: Box::new(left),
-			partition_count: DEFAULT_JOIN_PARTITION_COUNT,
-			key: left_keys,
+	match strategy {
+		JoinStrategy::HashPartitioned => Ok(LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Exchange {
+				input: Box::new(left),
+				partition_count: DEFAULT_JOIN_PARTITION_COUNT,
+				key: left_keys,
+			}),
+			right: Box::new(LogicalPlan::Exchange {
+				input: Box::new(right),
+				partition_count: DEFAULT_JOIN_PARTITION_COUNT,
+				key: right_keys,
+			}),
+			kind,
+			on,
+			strategy,
 		}),
-		right: Box::new(LogicalPlan::Exchange {
-			input: Box::new(right),
-			partition_count: DEFAULT_JOIN_PARTITION_COUNT,
-			key: right_keys,
-		}),
-		kind,
-		on,
-		strategy: JoinStrategy::HashPartitioned,
-	})
+		JoinStrategy::Broadcast => {
+			if kind != JoinKind::Inner {
+				return Err(unsupported(
+					"broadcast join is only supported for INNER joins",
+				));
+			}
+			Ok(LogicalPlan::Join {
+				left: Box::new(LogicalPlan::Exchange {
+					input: Box::new(left),
+					partition_count: 1,
+					key: left_keys,
+				}),
+				right: Box::new(right),
+				kind,
+				on,
+				strategy,
+			})
+		}
+	}
 }
 
 pub(crate) fn expr_to_join_keys(expr: &Expr) -> Result<Vec<(Expr, Expr)>, FrontendError> {
@@ -6269,6 +6291,33 @@ mod tests {
 			}
 			other => panic!("expected join plan, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn build_join_plan_rejects_broadcast_non_inner_at_frontend() {
+		let err = build_join_plan(
+			LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			},
+			LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			},
+			JoinKind::LeftOuter,
+			vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			JoinStrategy::Broadcast,
+		)
+		.expect_err("non-INNER broadcast join must reject");
+
+		assert!(
+			err.to_string()
+				.contains("broadcast join is only supported for INNER joins"),
+			"{err}"
+		);
 	}
 
 	fn assert_classifier_rejects(sql: &str) {

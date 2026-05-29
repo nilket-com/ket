@@ -42,6 +42,13 @@ fn source_block(source: &str, marker: &str) -> String {
 		.1
 }
 
+fn broadcast_strategy_arm(builder: &str) -> &str {
+	builder
+		.split("JoinStrategy::Broadcast =>")
+		.nth(1)
+		.expect("missing Broadcast strategy arm")
+}
+
 fn registered_rune_function_names(module: &str) -> Vec<String> {
 	let mut names = Vec::new();
 	for line in module.lines() {
@@ -1713,16 +1720,25 @@ pub(crate) fn adr122_rune_join_surface_exposed_without_join_kind_type() {
 pub(crate) fn adr122_join_builder_is_pair_shaped_and_shared() {
 	let planner = sql_planner_source();
 	let rune = rune_engine_source();
-	let builder = source_block(&planner, "pub(crate) fn build_hash_join_plan");
+	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
 	let lower_exists = source_block(&planner, "fn lower_exists_join");
 
 	assert!(builder.contains("on: Vec<(Expr, Expr)>"));
+	assert!(builder.contains("strategy: JoinStrategy"));
 	assert!(builder.contains("derive_join_exchange_keys(&on, &left, &right)?"));
 	assert!(builder.contains("LogicalPlan::Join"));
 	assert!(builder.contains("JoinStrategy::HashPartitioned"));
-	assert!(planner.contains("plan = build_hash_join_plan(plan, right, kind, on)?;"));
-	assert!(lower_exists.contains("build_hash_join_plan("));
-	assert!(rune.contains("build_hash_join_plan(left, right, kind, pairs)"));
+	assert!(builder.contains("JoinStrategy::Broadcast"));
+	assert!(planner.contains(
+		"plan = build_join_plan(plan, right, kind, on, JoinStrategy::HashPartitioned)?;"
+	));
+	assert!(lower_exists.contains("build_join_plan("));
+	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
+	assert!(
+		rune.contains("join_with_strategy(left, right, kind, on, JoinStrategy::HashPartitioned)")
+	);
+	assert!(rune.contains("build_join_plan(left, right, kind, pairs, strategy)"));
+	assert!(!planner.contains("fn build_hash_join_plan"));
 }
 
 #[test]
@@ -1748,12 +1764,132 @@ pub(crate) fn adr122_rune_predicate_bridge_is_narrow_and_sql_does_not_call_it() 
 #[test]
 pub(crate) fn adr122_join_builder_inserts_terminal_hash_exchanges() {
 	let planner = sql_planner_source();
-	let builder = source_block(&planner, "pub(crate) fn build_hash_join_plan");
+	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
+	let hash_arm = builder
+		.split("JoinStrategy::HashPartitioned =>")
+		.nth(1)
+		.and_then(|rest| rest.split("JoinStrategy::Broadcast =>").next())
+		.expect("HashPartitioned arm");
 
-	assert_eq!(builder.matches("LogicalPlan::Exchange").count(), 2);
-	assert_eq!(builder.matches("DEFAULT_JOIN_PARTITION_COUNT").count(), 2);
-	assert!(builder.contains("key: left_keys"));
-	assert!(builder.contains("key: right_keys"));
+	assert_eq!(hash_arm.matches("LogicalPlan::Exchange").count(), 2);
+	assert_eq!(hash_arm.matches("DEFAULT_JOIN_PARTITION_COUNT").count(), 2);
+	assert!(hash_arm.contains("key: left_keys"));
+	assert!(hash_arm.contains("key: right_keys"));
+}
+
+#[test]
+pub(crate) fn adr125_rune_exposes_single_broadcast_join_authoring_method() {
+	let rune = rune_engine_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let names = registered_rune_function_names(&module);
+
+	assert!(
+		rune.contains("pub fn broadcast_join(self, right: RuneDataFrame, on: RuneExpr)"),
+		"RuneDataFrame missing broadcast_join surface"
+	);
+	assert!(
+		names.iter().any(|name| name == "broadcast_join"),
+		"Rune module did not register broadcast_join: {names:?}"
+	);
+	assert!(rune.contains("JoinStrategy::Broadcast"));
+	for method in [
+		"broadcast_left_join",
+		"broadcast_right_join",
+		"broadcast_full_join",
+		"broadcast_left_semi_join",
+		"broadcast_right_semi_join",
+		"broadcast_left_anti_join",
+		"broadcast_right_anti_join",
+	] {
+		assert!(
+			!rune.contains(method),
+			"unexpected per-kind broadcast method `{method}`"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr125_strategy_aware_join_builder_is_single_helper() {
+	let planner = sql_planner_source();
+	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
+	let rune = rune_engine_source();
+
+	assert_eq!(planner.matches("pub(crate) fn build_join_plan(").count(), 1);
+	assert!(!planner.contains("fn build_hash_join_plan"));
+	assert!(builder.contains("JoinStrategy::HashPartitioned =>"));
+	assert!(builder.contains("JoinStrategy::Broadcast =>"));
+	assert!(planner.contains("JoinStrategy::HashPartitioned"));
+	assert!(rune.contains("JoinStrategy::HashPartitioned"));
+	assert!(rune.contains("JoinStrategy::Broadcast"));
+}
+
+#[test]
+pub(crate) fn adr125_frontend_rejects_broadcast_non_inner() {
+	let planner = sql_planner_source();
+	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
+	let broadcast_arm = broadcast_strategy_arm(&builder);
+
+	assert!(broadcast_arm.contains("kind != JoinKind::Inner"));
+	assert!(broadcast_arm.contains("broadcast join is only supported for INNER joins"));
+}
+
+#[test]
+pub(crate) fn adr125_broadcast_authoring_builds_left_exchange_one_and_bare_right() {
+	let planner = sql_planner_source();
+	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
+	let broadcast_arm = broadcast_strategy_arm(&builder);
+
+	assert_eq!(broadcast_arm.matches("LogicalPlan::Exchange").count(), 1);
+	assert!(broadcast_arm.contains("partition_count: 1"));
+	assert!(broadcast_arm.contains("key: left_keys"));
+	assert!(broadcast_arm.contains("right: Box::new(right)"));
+	assert!(!broadcast_arm.contains("DEFAULT_JOIN_PARTITION_COUNT"));
+}
+
+#[test]
+pub(crate) fn adr125_no_executor_fragmenter_binder_pbc_wendelon_change() {
+	let manifest_dir = manifest_dir();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/pbc.rs"),
+		manifest_dir.join("src/binder.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read Toron source");
+		assert!(
+			!source.contains("ADR 125") && !source.contains("adr125"),
+			"ADR 125 marker leaked into {}",
+			path.display()
+		);
+	}
+
+	let mut offenders = source_lines(&manifest_dir.join("src/distributed"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("ADR 125") || line.contains("adr125"))
+		.collect::<Vec<_>>();
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| line.contains("ADR 125") || line.contains("adr125")),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR 125 marker leaked into executor-adjacent code:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr125_no_sql_hint_authoring_yet() {
+	let planner = sql_planner_source();
+	let lower_exists = source_block(&planner, "fn lower_exists_join");
+
+	assert!(planner.contains(
+		"plan = build_join_plan(plan, right, kind, on, JoinStrategy::HashPartitioned)?;"
+	));
+	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
+	assert!(!lower_exists.contains("JoinStrategy::Broadcast"));
+	assert!(!planner.contains("broadcast hint"));
+	assert!(!planner.contains("BROADCAST"));
 }
 
 #[test]
@@ -1821,24 +1957,37 @@ pub(crate) fn adr122_no_executor_pbc_wendelon_or_scheduler_change() {
 	] {
 		let source = std::fs::read_to_string(&path).expect("read Toron source");
 		assert!(
-			!source.contains("ADR 122") && !source.contains("adr122"),
-			"ADR 122 marker leaked into {}",
+			!source.contains("ADR 122")
+				&& !source.contains("adr122")
+				&& !source.contains("ADR 125")
+				&& !source.contains("adr125"),
+			"ADR 122/125 marker leaked into {}",
 			path.display()
 		);
 	}
 
 	let mut offenders = source_lines(&manifest_dir.join("src/distributed"))
 		.into_iter()
-		.filter(|(_, _, line)| line.contains("ADR 122") || line.contains("adr122"))
+		.filter(|(_, _, line)| {
+			line.contains("ADR 122")
+				|| line.contains("adr122")
+				|| line.contains("ADR 125")
+				|| line.contains("adr125")
+		})
 		.collect::<Vec<_>>();
 	offenders.extend(
 		source_lines(&wendelon_manifest_dir().join("src"))
 			.into_iter()
-			.filter(|(_, _, line)| line.contains("ADR 122") || line.contains("adr122")),
+			.filter(|(_, _, line)| {
+				line.contains("ADR 122")
+					|| line.contains("adr122")
+					|| line.contains("ADR 125")
+					|| line.contains("adr125")
+			}),
 	);
 	assert!(
 		offenders.is_empty(),
-		"ADR 122 marker leaked into executor-adjacent code:\n{}",
+		"ADR 122/125 marker leaked into executor-adjacent code:\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
 }

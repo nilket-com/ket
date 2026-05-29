@@ -17,6 +17,7 @@ use toron::exec::Executor;
 use toron::ir::{
 	BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, FilterDisposition, JoinKind,
 	JoinStrategy, LogicalPlan, LogicalTypeId, ScalarValue, TableId, decode_column_logical_type,
+	field_with_logical_type_metadata,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -358,6 +359,122 @@ async fn rune_join_wraps_both_inputs_in_hash_exchanges() {
 }
 
 #[tokio::test]
+async fn rune_authored_broadcast_join_constructs_validated_broadcast_plan() {
+	let logical = rune_region_broadcast_join_plan().await;
+	let LogicalPlan::Join {
+		left,
+		right,
+		kind,
+		on,
+		strategy,
+	} = logical
+	else {
+		panic!("expected Rune broadcast join, got {logical:?}");
+	};
+
+	assert_eq!(kind, JoinKind::Inner);
+	assert_eq!(strategy, JoinStrategy::Broadcast);
+	assert_eq!(on.len(), 1);
+	assert_qualified_column(&on[0].0, "r", "region");
+	assert_qualified_column(&on[0].1, "s", "region");
+
+	let LogicalPlan::Exchange {
+		input,
+		partition_count,
+		key,
+	} = left.as_ref()
+	else {
+		panic!("expected broadcast build exchange on left, got {left:?}");
+	};
+	assert_eq!(*partition_count, 1);
+	assert_eq!(key.len(), 1);
+	assert_qualified_column(&key[0], "r", "region");
+	assert!(
+		contains_scan_named(input, "regions"),
+		"receiver/build side must contain regions scan"
+	);
+	assert!(
+		!matches!(right.as_ref(), LogicalPlan::Exchange { .. }),
+		"broadcast probe side must remain bare"
+	);
+	assert!(
+		contains_scan_named(right.as_ref(), "sales"),
+		"argument/probe side must contain sales scan"
+	);
+}
+
+#[tokio::test]
+async fn broadcast_join_qualifier_resolution_matches_hash() {
+	let hash = rune_region_join_plan().await;
+	let broadcast = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .broadcast_join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+        }
+    "#,
+	)
+	.await
+	.expect("Rune broadcast join plan");
+
+	let LogicalPlan::Join {
+		left: hash_left,
+		right: hash_right,
+		on: hash_on,
+		strategy: hash_strategy,
+		..
+	} = hash
+	else {
+		panic!("expected hash join");
+	};
+	let LogicalPlan::Join {
+		left: broadcast_left,
+		on: broadcast_on,
+		strategy: broadcast_strategy,
+		..
+	} = broadcast
+	else {
+		panic!("expected broadcast join");
+	};
+	assert_eq!(hash_strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(broadcast_strategy, JoinStrategy::Broadcast);
+
+	assert_eq!(hash_on.len(), 1);
+	assert_eq!(broadcast_on.len(), 1);
+	assert_qualified_column(&hash_on[0].0, "s", "region");
+	assert_qualified_column(&hash_on[0].1, "r", "region");
+	assert_qualified_column(&broadcast_on[0].0, "s", "region");
+	assert_qualified_column(&broadcast_on[0].1, "r", "region");
+
+	let LogicalPlan::Exchange {
+		key: hash_left_key, ..
+	} = hash_left.as_ref()
+	else {
+		panic!("expected hash left exchange");
+	};
+	let LogicalPlan::Exchange {
+		key: hash_right_key,
+		..
+	} = hash_right.as_ref()
+	else {
+		panic!("expected hash right exchange");
+	};
+	let LogicalPlan::Exchange {
+		key: broadcast_left_key,
+		..
+	} = broadcast_left.as_ref()
+	else {
+		panic!("expected broadcast left exchange");
+	};
+	assert_qualified_column(&hash_left_key[0], "s", "region");
+	assert_qualified_column(&hash_right_key[0], "r", "region");
+	assert_qualified_column(&broadcast_left_key[0], "s", "region");
+}
+
+#[tokio::test]
 async fn rune_join_multi_column_predicate_decomposes_to_key_pairs() {
 	let logical = rune_plan(
 		r#"
@@ -420,10 +537,38 @@ async fn rune_join_named_methods_lower_to_existing_join_kinds() {
     "#
 		);
 		let logical = rune_plan(&script).await.expect("Rune named join method");
-		let LogicalPlan::Join { kind, .. } = logical else {
+		let LogicalPlan::Join {
+			kind,
+			strategy,
+			left,
+			right,
+			..
+		} = logical
+		else {
 			panic!("expected Rune join for {method}");
 		};
 		assert_eq!(kind, expected, "{method}");
+		assert_eq!(strategy, JoinStrategy::HashPartitioned, "{method}");
+		assert!(
+			matches!(
+				left.as_ref(),
+				LogicalPlan::Exchange {
+					partition_count: 4,
+					..
+				}
+			),
+			"{method} left input must remain hash-exchanged"
+		);
+		assert!(
+			matches!(
+				right.as_ref(),
+				LogicalPlan::Exchange {
+					partition_count: 4,
+					..
+				}
+			),
+			"{method} right input must remain hash-exchanged"
+		);
 	}
 }
 
@@ -605,6 +750,25 @@ async fn rune_join_predicate_without_equi_key_rejects() {
 }
 
 #[tokio::test]
+async fn rune_broadcast_join_predicate_without_equi_key_rejects() {
+	let error = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("regions").alias("r")
+               .broadcast_join(
+                   ctx.table("sales").alias("s"),
+                   qcol("r", "region").gt(qcol("s", "region"))
+               )
+        }
+    "#,
+	)
+	.await
+	.expect_err("non-equi Rune broadcast join predicate must reject");
+
+	assert_frontend_message_contains(error, "JOIN predicate requires equality key predicates");
+}
+
+#[tokio::test]
 async fn rune_join_logical_identity_mismatch_rejects() {
 	let logical = rune_plan(
 		r#"
@@ -625,6 +789,39 @@ async fn rune_join_logical_identity_mismatch_rejects() {
 		.expect_err("nominal mismatch join key must reject");
 
 	assert_nominal_mismatch(error, "CustomerId", "ProductId", "Int64");
+}
+
+#[tokio::test]
+async fn rune_authored_broadcast_join_preserves_logical_identity() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").alias("s")
+               .broadcast_join(
+                   ctx.table("regions").alias("r"),
+                   qcol("s", "region").eq(qcol("r", "region"))
+               )
+               .project_named([qcol("s", "id").named("id")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune broadcast join logical identity plan");
+	let bound = bind(
+		&logical,
+		&catalog_with_sales_id_logical(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind broadcast join over identity-bearing sales");
+	let ExecutionPlan::Project { output_schema, .. } = bound else {
+		panic!("expected project over broadcast join");
+	};
+
+	assert_eq!(
+		decode_column_logical_type(output_schema.field(0)).expect("decode joined output identity"),
+		CUSTOMER_ID_LOGICAL_TYPE
+	);
 }
 
 #[tokio::test]
@@ -2320,6 +2517,22 @@ async fn rune_region_join_plan() -> LogicalPlan {
 	.expect("Rune region join plan")
 }
 
+async fn rune_region_broadcast_join_plan() -> LogicalPlan {
+	rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("regions").alias("r")
+               .broadcast_join(
+                   ctx.table("sales").alias("s"),
+                   qcol("r", "region").eq(qcol("s", "region"))
+               )
+        }
+    "#,
+	)
+	.await
+	.expect("Rune region broadcast join plan")
+}
+
 async fn bind_rune_nominal_filter(script: &str) -> Result<ExecutionPlan, BindingError> {
 	let logical = rune_plan(script).await.expect("Rune nominal plan");
 	bind(&logical, &catalog(), &PlannerConfig::default()).await
@@ -2388,9 +2601,37 @@ fn catalog() -> MockCatalog {
 	catalog
 }
 
+fn catalog_with_sales_id_logical() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(1),
+			descriptor(1, "sales", sales_schema_with_logical_id().as_ref(), "id"),
+		)
+		.expect("register sales");
+	catalog
+		.register_descriptor(
+			TableId(2),
+			descriptor(2, "regions", regions_schema().as_ref(), "region"),
+		)
+		.expect("register regions");
+	catalog
+}
+
 fn sales_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
+		Field::new("region", DataType::Utf8, true),
+		Field::new("amount", DataType::Int32, true),
+		Field::new("status", DataType::Utf8, true),
+		Field::new("price", DataType::Float64, true),
+		Field::new("active", DataType::Boolean, true),
+	]))
+}
+
+fn sales_schema_with_logical_id() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		field_with_logical_type_metadata("id", DataType::Int64, false, CUSTOMER_ID_LOGICAL_TYPE),
 		Field::new("region", DataType::Utf8, true),
 		Field::new("amount", DataType::Int32, true),
 		Field::new("status", DataType::Utf8, true),

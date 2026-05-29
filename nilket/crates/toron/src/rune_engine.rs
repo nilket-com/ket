@@ -1,10 +1,10 @@
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, LogicalPlan, LogicalTypeId,
-	PRODUCT_ID_LOGICAL_TYPE, ScalarValue, SortExpr,
+	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, LogicalPlan,
+	LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, ScalarValue, SortExpr,
 };
-use crate::sql_planner::{SqlPlanner, build_hash_join_plan, expr_to_join_keys};
+use crate::sql_planner::{SqlPlanner, build_join_plan, expr_to_join_keys};
 use arrow::datatypes::DataType;
 use rune::alloc::limit;
 use rune::runtime::{TypeHash, VmResult, budget};
@@ -234,6 +234,18 @@ impl RuneDataFrame {
 		join_with_kind(self.plan, right.plan, JoinKind::Inner, on)
 	}
 
+	/// Broadcast-join `self` as the left/build side and probe `right`.
+	/// INNER-only. `small.broadcast_join(big, on)` broadcasts `small`.
+	pub fn broadcast_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		join_with_strategy(
+			self.plan,
+			right.plan,
+			JoinKind::Inner,
+			on,
+			JoinStrategy::Broadcast,
+		)
+	}
+
 	pub fn left_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
 		join_with_kind(self.plan, right.plan, JoinKind::LeftOuter, on)
 	}
@@ -407,11 +419,21 @@ fn join_with_kind(
 	kind: JoinKind,
 	on: RuneExpr,
 ) -> VmResult<RuneDataFrame> {
+	join_with_strategy(left, right, kind, on, JoinStrategy::HashPartitioned)
+}
+
+fn join_with_strategy(
+	left: LogicalPlan,
+	right: LogicalPlan,
+	kind: JoinKind,
+	on: RuneExpr,
+	strategy: JoinStrategy,
+) -> VmResult<RuneDataFrame> {
 	let pairs = match expr_to_join_keys(&on.expr) {
 		Ok(pairs) => pairs,
 		Err(error) => return VmResult::panic(error.to_string()),
 	};
-	match build_hash_join_plan(left, right, kind, pairs) {
+	match build_join_plan(left, right, kind, pairs, strategy) {
 		Ok(plan) => VmResult::Ok(RuneDataFrame { plan }),
 		Err(error) => VmResult::panic(error.to_string()),
 	}
@@ -876,6 +898,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("alias", RuneDataFrame::alias)?;
 	m.associated_function("join", RuneDataFrame::join)?;
 	m.associated_function("inner_join", RuneDataFrame::inner_join)?;
+	m.associated_function("broadcast_join", RuneDataFrame::broadcast_join)?;
 	m.associated_function("left_join", RuneDataFrame::left_join)?;
 	m.associated_function("right_join", RuneDataFrame::right_join)?;
 	m.associated_function("full_join", RuneDataFrame::full_join)?;
