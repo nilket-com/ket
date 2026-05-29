@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–125 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–126 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,28 +46,36 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 125 promoted; ADR 126 candidates
+### ADR 126 promoted; ADR 127 candidates
 
-ADR 125 promoted **Rune broadcast join authoring** — single new method
-`df.broadcast_join(other, on)` (receiver = LEFT = build = small);
-strategy-aware helper rename `build_hash_join_plan` →
-`build_join_plan(.., strategy)` with internal `JoinStrategy` match (no
-compat wrapper); INNER-only at API construction + defensive frontend
-reject; 3 callsite updates + 3 retargeted 122 guards + 6 new 125 guards +
-9 behavior gates; G-A authored equivalence mirrors `lib.rs:594` end-to-end.
-Genuine 3-of-3 after iter-1 grounding toppled the Gemini/Codex iter-0
-"constant-memory live shuffle" framing (13th grounding-correction in the
-119→125 arc — `partition_store.rs:501-515` + `server/mod.rs:511` showed
-`live.chunks` retains all encoded bytes through seal AND publish path
-double-encodes + double-reserves). No substrate change.
+ADR 126 promoted **Live-shuffle seal correction** — the first link of ADR
+125's deferred "live shuffle memory chain." Genuine 3-of-3 (Fork A) after
+Codex's iter-0 *proved* (throwaway Arrow IPC test) a latent multi-chunk
+data-loss bug: `seal_live`'s chunk fallback byte-concatenated N framed IPC
+streams, and the single `StreamReader` stops at the first EOS → only the
+first chunk's rows survive (invisible because the one covering test used
+synthetic non-IPC bytes). The cut makes `live.chunks` the **single source**
+seal derives from via streaming Arrow IPC reassembly (decode→write→drop per
+chunk); drops `partition_batches` decoded retention + the live producer's
+redundant `publish_task_output` + `TaskBatch` transmission (general publish
+path preserved for non-live producers); carries `schema: Option<SchemaRef>`
+on `LivePartition` so empty partitions seal as schema-bearing IPC; reserves
+the sealed payload atomically (no partial publish on budget exhaustion);
+manifest-derived telemetry; **retargets the one 124 guard**
+(`adr124_seal_live_materializes_from_chunks` → reassembly invariant). Named
+"correction," NOT "single-pass/constant-memory" — encode count stays 2,
+resident copies stay 2 (chunks stay resident for in-flight `pull_live` +
+retry-from-zero). 14th grounding-correction in the 119→126 arc (Claude's
+"3→1 copy" headline + "no 124 guard inverts" both corrected; Gemini conceded
+Fork B→A on grounded schema-availability). Substrate behavior change; no new
+IR/opcode/wire type.
 
-**Live shuffle memory chain** (Codex's deferred honest scope):
-ledger-backed live shuffle sealing (drop `partition_batches` RecordBatch
-retention + double publish/budget reservation; **must include
-empty-partition schema-bearing Arrow IPC fix** — `seal_live` produces
-empty bytes for never-appended partitions); chunk-granular sealed manifest
-(true constant-memory; multi-entry-per-partition OR streaming sealed
-assembly).
+**Live shuffle memory chain — remaining links** (post-126):
+chunk-granular sealed manifest (true constant-memory / single-copy:
+multi-entry-per-partition manifest OR streaming sealed assembly — the only
+path to "1 copy"); opportunistic live-chunk release after seal when no
+readers remain (reclaims the 2nd copy without the full representation
+change).
 
 **Distributed execution arc:** executor build/probe reorder (pairs with
 124 for end-to-end natural backpressure); output-side
