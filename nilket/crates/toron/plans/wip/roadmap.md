@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–131 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–132 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,35 +46,33 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 131 promoted; ADR 132 candidates
+### ADR 132 promoted; ADR 133 candidates
 
-ADR 131 promoted **Scan-linear Broadcast Probe Eligibility** — corrects ADR 130's
-over-strict probe fence (which silently regressed 129) by splitting build
-eligibility (a *fact* predicate: single base relation + hard byte bound) from
-probe eligibility (a *plan-shape* predicate). The probe may now be **scan-linear**
-— a `Scan { row_limit: None }` optionally wrapped in row-local `Filter`/`Project`
-— restoring the filtered/projected-fact star-schema path 130 narrowed
-(`dim JOIN (fact WHERE …)` and `(fact WHERE …) JOIN dim`). Grounded in the
-share-scan substrate: the broadcast consumer applies the probe per morsel
-(`TaskInputBinding::Scan { share }`), so nested-join (not recursively fragmented),
-aggregate/sort/take (global/ordering), exchange (repartition), limited-scan
-(per-worker limit), system-table probes (duplicate per worker), and empty probes
-(unneeded for this cut) stay hash. `bind_join` computes two
-scan-linear bools and passes them via `JoinInputOptimization` into the single
-`choose_auto_join_strategy` seam; the predicate is an **exhaustive**
-`ExecutionPlan` walk (compiler forces a decision on new variants). 130's swap +
-restoring projection and left-wins tie are unchanged; the 130 single-seam guard
-is **retargeted**, not deleted. Genuine 3-of-3. Load-bearing gate:
-`left_tiny_with_filtered_probe_infers_broadcast` fails on the pre-131 code.
+ADR 132 promoted **Smaller-Build Dominance Comparator** — the first real cost
+comparison in the CBO arc. When *both* INNER-join inputs are eligible broadcast
+builds (single base relation + hard `byte_upper_bound < threshold` + opposite side
+scan-linear), the binder now picks the materially-smaller build instead of
+always-left. Materiality is a named **integer** factor with exact `u128` math —
+`AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR = 2` (`right*2 <= left`) — deliberately
+left-biased: ties/near-ties keep left (Natural) because 130's right-build carries
+a permanent restoring `Project`. Grounded: `ByteCount` is `u64`, so integer/u128
+avoids float-on-bytes (Gemini conceded its iter-1 `0.8` float to this). The
+private `BroadcastInferred` receipt gains `rejected_side_bytes: Option<ByteCount>`
+(magnitude of the unchosen eligible side) for a future `EXPLAIN`. Comparator lives
+in the single `choose_auto_join_strategy` seam; reuses 130's swap + 131's
+scan-linear predicate; no new `JoinStrategy`/`ExecutionPlan` variant, no config
+knob, no executor/fragmenter/scheduler/wire/Wendelon change. Genuine 3-of-3.
+Load-bearing gate: `both_sides_eligible_right_materially_smaller_prefers_right_build`
+(left=3072,right=1024) fails on the pre-132 always-left code; the 130 tie test is
+retargeted to prove the margin.
 
-**ADR 132 lead candidates:** smaller-build dominance comparator (the first real
-cost *weigh* — choose the materially-smaller build when both sides are eligible,
-with a named left-biased margin, on the now-honest predicate); multi-way
-star-join ordering (133+ — lifts the nested-join probe fence; needs recursive
-fragmentation of a nested broadcast probe, real substrate work); Wendelon-backed
-live table-size facts (storage-ring producer — flips dark-launch to default-on);
-selectivity propagation; optimizer `EXPLAIN` over the reason receipts (now able
-to report `ProbeNotScanLinear`). Evidence-gate the pick on the 131 feat.
+**ADR 133 lead candidates:** multi-way star-join ordering (lifts 131's nested-join
+probe fence — needs recursive fragmentation of a nested broadcast probe, real
+substrate work); Wendelon-backed live table-size facts (storage-ring producer —
+flips 129's dark-launch to default-on); optimizer `EXPLAIN` over the now-richer
+reason receipts (132 makes it worth building — ≥2 comparison-bearing decisions +
+`rejected_side_bytes` magnitudes); selectivity propagation. Evidence-gate the pick
+on the 132 feat.
 
 ### ADR 129 promoted (HISTORICAL)
 
