@@ -19,7 +19,10 @@ use toron::distributed::worker_registry::{
 	WorkerEndpoint, WorkerEntry, WorkerLease, WorkerResourceState, WorkerStatus,
 };
 use toron::error::StorageError;
-use toron::ir::{Expr, JoinKind, JoinStrategy, LogicalPlan, QueryProfileHint, SessionId, TableId};
+use toron::ir::{
+	Expr, JoinKind, JoinStrategy, JoinStrategyIntent, LogicalPlan, QueryProfileHint, SessionId,
+	TableId,
+};
 use toron::server::{
 	NetworkTaskDispatcher, ToronWorker, memory::MemoryManager, transport::TcpTransport,
 };
@@ -265,7 +268,7 @@ fn join_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
-		strategy: JoinStrategy::HashPartitioned,
+		strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 	}
 }
 

@@ -27,7 +27,7 @@ use toron::distributed::worker_registry::{
 	WorkerEntry, WorkerLease, WorkerRegistry, WorkerResourceState, WorkerStatus,
 };
 use toron::error::StorageError;
-use toron::ir::{Expr, JoinKind, JoinStrategy, LogicalPlan, TableId};
+use toron::ir::{Expr, JoinKind, JoinStrategy, JoinStrategyIntent, LogicalPlan, TableId};
 use toron::server::{
 	NetworkTaskDispatcher, ToronWorker, memory::MemoryManager, transport::TcpTransport,
 };
@@ -946,7 +946,7 @@ fn join_plan(
 		right: Box::new(right),
 		kind,
 		on: join_on(key_shape),
-		strategy: strategy.join_strategy(),
+		strategy_intent: JoinStrategyIntent::Pinned(strategy.join_strategy()),
 	}
 }
 

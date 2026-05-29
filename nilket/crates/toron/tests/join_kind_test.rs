@@ -5,8 +5,8 @@ use toron::binder::{PlannerConfig, bind, join_schema};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::error::BindingError;
 use toron::ir::{
-	CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, LogicalPlan, LogicalTypeId,
-	PRODUCT_ID_LOGICAL_TYPE, TableId,
+	CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, JoinStrategyIntent, LogicalPlan,
+	LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use wendelon::schema::{
@@ -236,7 +236,7 @@ fn nominal_join_plan(left_logical: LogicalTypeId, right_logical: LogicalTypeId) 
 			logical_key("left_t", left_logical),
 			logical_key("right_t", right_logical),
 		)],
-		strategy: JoinStrategy::HashPartitioned,
+		strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 	}
 }
 
@@ -263,7 +263,7 @@ fn hash_join_plan(kind: JoinKind) -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("left_t"), "id"),
 			Expr::qualified_column(TableRef::new("right_t"), "id"),
 		)],
-		strategy: JoinStrategy::HashPartitioned,
+		strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 	}
 }
 
@@ -286,7 +286,7 @@ fn broadcast_join_plan(kind: JoinKind) -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("left_t"), "id"),
 			Expr::qualified_column(TableRef::new("right_t"), "id"),
 		)],
-		strategy: JoinStrategy::Broadcast,
+		strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
 	}
 }
 

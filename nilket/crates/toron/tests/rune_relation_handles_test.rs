@@ -16,8 +16,8 @@ use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
 	BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategy, LogicalPlan, LogicalTypeId, ScalarValue, TableId, decode_column_logical_type,
-	field_with_logical_type_metadata,
+	JoinStrategy, JoinStrategyIntent, LogicalPlan, LogicalTypeId, ScalarValue, TableId,
+	decode_column_logical_type, field_with_logical_type_metadata,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -325,14 +325,17 @@ async fn rune_join_wraps_both_inputs_in_hash_exchanges() {
 		right,
 		kind,
 		on,
-		strategy,
+		strategy_intent,
 	} = logical
 	else {
 		panic!("expected Rune join, got {logical:?}");
 	};
 
 	assert_eq!(kind, JoinKind::Inner);
-	assert_eq!(strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(
+		strategy_intent,
+		JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned)
+	);
 	assert_eq!(on.len(), 1);
 	let LogicalPlan::Exchange {
 		partition_count: left_partitions,
@@ -366,14 +369,17 @@ async fn rune_authored_broadcast_join_constructs_validated_broadcast_plan() {
 		right,
 		kind,
 		on,
-		strategy,
+		strategy_intent,
 	} = logical
 	else {
 		panic!("expected Rune broadcast join, got {logical:?}");
 	};
 
 	assert_eq!(kind, JoinKind::Inner);
-	assert_eq!(strategy, JoinStrategy::Broadcast);
+	assert_eq!(
+		strategy_intent,
+		JoinStrategyIntent::Pinned(JoinStrategy::Broadcast)
+	);
 	assert_eq!(on.len(), 1);
 	assert_qualified_column(&on[0].0, "r", "region");
 	assert_qualified_column(&on[0].1, "s", "region");
@@ -424,7 +430,7 @@ async fn broadcast_join_qualifier_resolution_matches_hash() {
 		left: hash_left,
 		right: hash_right,
 		on: hash_on,
-		strategy: hash_strategy,
+		strategy_intent: hash_strategy,
 		..
 	} = hash
 	else {
@@ -433,14 +439,20 @@ async fn broadcast_join_qualifier_resolution_matches_hash() {
 	let LogicalPlan::Join {
 		left: broadcast_left,
 		on: broadcast_on,
-		strategy: broadcast_strategy,
+		strategy_intent: broadcast_strategy,
 		..
 	} = broadcast
 	else {
 		panic!("expected broadcast join");
 	};
-	assert_eq!(hash_strategy, JoinStrategy::HashPartitioned);
-	assert_eq!(broadcast_strategy, JoinStrategy::Broadcast);
+	assert_eq!(
+		hash_strategy,
+		JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned)
+	);
+	assert_eq!(
+		broadcast_strategy,
+		JoinStrategyIntent::Pinned(JoinStrategy::Broadcast)
+	);
 
 	assert_eq!(hash_on.len(), 1);
 	assert_eq!(broadcast_on.len(), 1);
@@ -539,7 +551,7 @@ async fn rune_join_named_methods_lower_to_existing_join_kinds() {
 		let logical = rune_plan(&script).await.expect("Rune named join method");
 		let LogicalPlan::Join {
 			kind,
-			strategy,
+			strategy_intent,
 			left,
 			right,
 			..
@@ -548,7 +560,11 @@ async fn rune_join_named_methods_lower_to_existing_join_kinds() {
 			panic!("expected Rune join for {method}");
 		};
 		assert_eq!(kind, expected, "{method}");
-		assert_eq!(strategy, JoinStrategy::HashPartitioned, "{method}");
+		assert_eq!(
+			strategy_intent,
+			JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			"{method}"
+		);
 		assert!(
 			matches!(
 				left.as_ref(),

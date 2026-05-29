@@ -21,6 +21,10 @@ fn binder_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
 }
 
+fn catalog_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
+}
+
 fn exec_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source")
 }
@@ -1888,7 +1892,8 @@ pub(crate) fn adr128_sql_broadcast_hint_authoring_is_narrow() {
 	assert!(planner.contains("fn parse_broadcast_hint_text"));
 	assert!(planner.contains("BROADCAST"));
 	assert!(lower_select.contains("parse_broadcast_join_hint(optimizer_hints)?"));
-	assert!(lower_select.contains("join_strategy_for_hint"));
+	assert!(lower_select.contains("join_strategy_intent_for_hint"));
+	assert!(lower_select.contains("build_auto_join_plan(plan, right, kind, on)"));
 	assert!(lower_select.contains("build_join_plan(plan, right, kind, on, strategy)?"));
 	assert!(planner.contains("JoinStrategy::Broadcast"));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
@@ -1953,6 +1958,184 @@ pub(crate) fn adr128_broadcast_hints_do_not_touch_execution_substrate() {
 	assert!(
 		offenders.is_empty(),
 		"ADR 128 marker leaked into executor-adjacent code:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr129_table_binding_carries_optimizer_facts() {
+	let catalog = catalog_source();
+	let table_binding = source_block(&catalog, "pub struct TableBinding");
+	let mock_catalog = source_block(&catalog, "impl MockCatalog");
+
+	assert!(catalog.contains("pub struct TableOptimizerFacts"));
+	assert!(catalog.contains("byte_upper_bound: Option<ByteCount>"));
+	assert!(catalog.contains("row_upper_bound: Option<RowCount>"));
+	assert!(table_binding.contains("optimizer_facts: TableOptimizerFacts"));
+	assert!(mock_catalog.contains("seed_optimizer_facts("));
+	assert!(mock_catalog.contains("seed_optimizer_facts_for_table_id("));
+}
+
+#[test]
+pub(crate) fn adr129_logical_join_has_strategy_intent_execution_join_concrete() {
+	let ir = ir_source();
+	let execution =
+		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
+	let logical_plan = source_block(&ir, "pub enum LogicalPlan");
+	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
+
+	assert!(ir.contains("pub enum JoinStrategyIntent"));
+	assert!(ir.contains("Auto"));
+	assert!(ir.contains("Pinned(JoinStrategy)"));
+	assert!(logical_plan.contains("strategy_intent: JoinStrategyIntent"));
+	assert!(!logical_plan.contains("strategy: JoinStrategy"));
+	assert!(execution_plan.contains("strategy: JoinStrategy"));
+	assert!(!execution_plan.contains("JoinStrategyIntent"));
+}
+
+#[test]
+pub(crate) fn adr129_auto_resolves_only_in_binder() {
+	let planner = sql_planner_source();
+	let binder = binder_source();
+	let exec = exec_source();
+	let manifest_dir = manifest_dir();
+
+	assert!(planner.contains("JoinStrategyIntent::Auto"));
+	assert!(planner.contains("build_auto_join_plan"));
+	assert!(binder.contains("choose_join_strategy("));
+	assert!(binder.contains("JoinStrategyIntent::Auto"));
+	assert!(!exec.contains("JoinStrategyIntent"));
+
+	let offenders = source_lines(&manifest_dir.join("src/distributed"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("JoinStrategyIntent"))
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"JoinStrategyIntent leaked into distributed substrate:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr129_strategy_decision_is_single_helper() {
+	let binder = binder_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+	let choose_join_strategy = source_block(&binder, "fn choose_join_strategy");
+	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+
+	assert_eq!(binder.matches("fn choose_join_strategy(").count(), 1);
+	assert!(bind_join.contains("choose_join_strategy("));
+	assert!(bind_join.contains("match decision.strategy"));
+	assert!(!bind_join.contains("byte_upper_bound"));
+	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
+	assert!(choose_join_strategy.contains("JoinStrategyIntent::Pinned(strategy)"));
+	assert!(choose_join_strategy.contains("JoinStrategyIntent::Auto"));
+	assert!(choose_auto.contains("JoinStrategy::Broadcast"));
+	assert!(choose_auto.contains("hash_join_decision"));
+}
+
+#[test]
+pub(crate) fn adr129_tiny_broadcast_requires_hard_byte_upper_bound() {
+	let binder = binder_source();
+	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+
+	assert!(choose_auto.contains("kind != JoinKind::Inner"));
+	assert!(choose_auto.contains("PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("left_facts.byte_upper_bound"));
+	assert!(choose_auto.contains("MissingBuildByteUpperBound"));
+	assert!(choose_auto.contains("effective_auto_broadcast_threshold"));
+	assert!(choose_auto.contains("BuildByteUpperBoundAboveThreshold"));
+	assert!(!choose_auto.contains("confidence"));
+}
+
+#[test]
+pub(crate) fn adr129_exchange_insertion_split_is_temporary() {
+	let planner = sql_planner_source();
+	let binder = binder_source();
+	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
+	let build_auto_join_plan = source_block(&planner, "pub(crate) fn build_auto_join_plan");
+	let bind_join = source_block(&binder, "async fn bind_join");
+
+	assert!(build_join_plan.contains("JoinStrategyIntent::Pinned(strategy)"));
+	assert!(build_auto_join_plan.contains("JoinStrategyIntent::Auto"));
+	assert!(bind_join.contains("exchange_for_join_keys"));
+	assert!(bind_join.contains("JoinStrategy::HashPartitioned"));
+	assert!(bind_join.contains("JoinStrategy::Broadcast"));
+}
+
+#[test]
+pub(crate) fn adr129_row_facts_carried_but_not_scheduled_on() {
+	let binder = binder_source();
+	let manifest_dir = manifest_dir();
+
+	assert!(binder.contains("row_upper_bound"));
+	assert!(binder.contains("RowCount::new(0)"));
+	assert!(binder.contains("fn take(self, limit: usize)"));
+
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/distributed/fragment.rs"),
+		manifest_dir.join("src/distributed/scheduler.rs"),
+		manifest_dir.join("src/server/mod.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read execution substrate source");
+		offenders.extend(
+			source
+				.lines()
+				.enumerate()
+				.filter(|(_, line)| line.contains("row_upper_bound"))
+				.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"row facts consumed by scheduling/execution substrate:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr129_no_executor_fragmenter_scheduler_wendelon_change() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"JoinStrategyIntent",
+		"PlanOptimizerFacts",
+		"TableOptimizerFacts",
+		"choose_join_strategy",
+		"auto_broadcast_max_build_bytes",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/distributed"),
+		manifest_dir.join("src/server"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR129 optimizer spine leaked outside ir/planner/binder/catalog:\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
 }

@@ -617,6 +617,12 @@ pub enum JoinStrategy {
 	Broadcast,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinStrategyIntent {
+	Auto,
+	Pinned(JoinStrategy),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortExpr {
 	pub expr: Expr,
@@ -692,7 +698,7 @@ pub enum LogicalPlan {
 		right: Box<LogicalPlan>,
 		kind: JoinKind,
 		on: Vec<(Expr, Expr)>,
-		strategy: JoinStrategy,
+		strategy_intent: JoinStrategyIntent,
 	},
 	CreateTable {
 		name: TableRef,

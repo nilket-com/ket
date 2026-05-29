@@ -57,7 +57,7 @@ mod tests {
 	use crate::exec::Executor;
 	use crate::ir::{
 		AggregateFunction, BoundExprProgram, ExecutionPlan, Expr, JoinKind, JoinStrategy,
-		LogicalPlan, MorselId, ScalarValue, SortExpr, StageId, TableId,
+		JoinStrategyIntent, LogicalPlan, MorselId, ScalarValue, SortExpr, StageId, TableId,
 	};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::server::{
@@ -574,7 +574,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		let results = run_distributed_join_query(plan, 8).await;
@@ -1437,7 +1437,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
-			strategy: JoinStrategy::Broadcast,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
 		}
 	}
 
@@ -1470,7 +1470,7 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		}
 	}
 

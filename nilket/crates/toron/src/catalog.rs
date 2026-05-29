@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::distributed::budget::{QueryBudget, TenantBudgetPolicy, TenantDescriptorSyncAccountant};
+use crate::distributed::budget::{
+	ByteCount, QueryBudget, TenantBudgetPolicy, TenantDescriptorSyncAccountant,
+};
+use crate::distributed::task::RowCount;
 use crate::error::{CatalogError, StorageError};
 use crate::ir::{
 	ColumnOrdinal, CreateTableRowIdentity, LogicalTypeRegistry, LogicalTypeResolver,
@@ -72,6 +75,12 @@ impl TableRowIdentity {
 	}
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableOptimizerFacts {
+	pub byte_upper_bound: Option<ByteCount>,
+	pub row_upper_bound: Option<RowCount>,
+}
+
 #[derive(Clone)]
 pub struct TableBinding {
 	pub legacy_table_id: TableId,
@@ -82,6 +91,7 @@ pub struct TableBinding {
 	pub row_identity: TableRowIdentity,
 	pub pbc_eligible_columns: HashSet<ColumnOrdinal>,
 	pub primary_key_columns: HashSet<ColumnOrdinal>,
+	pub optimizer_facts: TableOptimizerFacts,
 }
 
 impl TableBinding {
@@ -191,6 +201,7 @@ impl TableBinding {
 			row_identity,
 			pbc_eligible_columns,
 			primary_key_columns,
+			optimizer_facts: TableOptimizerFacts::default(),
 		}
 	}
 
@@ -526,6 +537,45 @@ impl MockCatalog {
 		inner.by_ref.insert((tenant_id, table_ref), legacy_table_id);
 		inner.by_id.insert((tenant_id, legacy_table_id), binding);
 		bump_next_table_id(&mut inner, legacy_table_id);
+		Ok(())
+	}
+
+	pub fn seed_optimizer_facts(
+		&mut self,
+		table_ref: &TableRef,
+		facts: TableOptimizerFacts,
+	) -> Result<(), CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		let table_id = inner
+			.by_ref
+			.get(&(self.tenant_id, table_ref.clone()))
+			.copied()
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: table_name(table_ref),
+			})?;
+		let binding = inner
+			.by_id
+			.get_mut(&(self.tenant_id, table_id))
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: table_name(table_ref),
+			})?;
+		binding.optimizer_facts = facts;
+		Ok(())
+	}
+
+	pub fn seed_optimizer_facts_for_table_id(
+		&mut self,
+		table_id: TableId,
+		facts: TableOptimizerFacts,
+	) -> Result<(), CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		let binding = inner
+			.by_id
+			.get_mut(&(self.tenant_id, table_id))
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: format!("{table_id:?}"),
+			})?;
+		binding.optimizer_facts = facts;
 		Ok(())
 	}
 

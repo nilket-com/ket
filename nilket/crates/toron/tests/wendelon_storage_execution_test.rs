@@ -338,6 +338,7 @@ async fn wendelon_declined_time_bucket_filter_matches_in_memory_baseline() {
 	};
 	let config = PlannerConfig {
 		allow_experimental_kernels: true,
+		..PlannerConfig::default()
 	};
 	let bound = bind_plan(&descriptor, &plan, &config).await;
 	assert_filter_declined_without_pbc(&bound);

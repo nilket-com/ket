@@ -9,7 +9,7 @@ use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
-use toron::ir::{Expr, LogicalPlan, TableId};
+use toron::ir::{Expr, JoinStrategy, JoinStrategyIntent, LogicalPlan, TableId};
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -262,7 +262,7 @@ fn duplicate_alias_join_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("x"), "id"),
 			Expr::qualified_column(TableRef::new("x"), "id"),
 		)],
-		strategy: toron::ir::JoinStrategy::Broadcast,
+		strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
 	}
 }
 

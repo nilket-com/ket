@@ -11,18 +11,21 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use crate::aggregate_kernel::{
 	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
 };
-use crate::catalog::{Catalog, TableBinding, TableRef, TableRowIdentity};
+use crate::catalog::{Catalog, TableBinding, TableOptimizerFacts, TableRef, TableRowIdentity};
+use crate::distributed::budget::{ByteCount, QueryBudget};
+use crate::distributed::task::RowCount;
 use crate::error::BindingError;
 use crate::exec::Executor;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
 	ColumnOrdinal, ColumnRef, CreateTableColumnType, CreateTableSchema, ExecutionPlan,
-	ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan,
-	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
-	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
-	arithmetic_output_type, decode_column_logical_type, decode_column_logical_type_with_resolver,
-	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
+	ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind, JoinStrategy,
+	JoinStrategyIntent, LogicalPlan, LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver,
+	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
+	ScalarValue, SortExpr, SystemTableKind, arithmetic_output_type, decode_column_logical_type,
+	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, logical_type_name,
+	logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -35,6 +38,7 @@ use wendelon_client::{
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
+const DEFAULT_AUTO_JOIN_PARTITION_COUNT: u32 = 4;
 const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
 	STORAGE_ROW_HLC_COLUMN,
 	STORAGE_ROW_KEY_ID_COLUMN,
@@ -55,6 +59,7 @@ const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlannerConfig {
 	pub allow_experimental_kernels: bool,
+	pub auto_broadcast_max_build_bytes: Option<ByteCount>,
 }
 
 pub async fn bind(
@@ -74,21 +79,134 @@ struct Binder<'a> {
 struct ScopedExecutionPlan {
 	plan: ExecutionPlan,
 	scope: RelationScope,
+	facts: PlanOptimizerFacts,
 }
 
 impl ScopedExecutionPlan {
 	fn new(plan: ExecutionPlan, scope: RelationScope) -> Self {
-		Self { plan, scope }
+		Self {
+			plan,
+			scope,
+			facts: PlanOptimizerFacts::default(),
+		}
+	}
+
+	fn new_with_facts(
+		plan: ExecutionPlan,
+		scope: RelationScope,
+		facts: PlanOptimizerFacts,
+	) -> Self {
+		Self { plan, scope, facts }
 	}
 
 	fn empty_scope(plan: ExecutionPlan) -> Self {
 		let scope = RelationScope::empty(plan.schema());
-		Self { plan, scope }
+		Self {
+			plan,
+			scope,
+			facts: PlanOptimizerFacts::default(),
+		}
 	}
 
 	fn schema(&self) -> SchemaRef {
 		self.plan.schema()
 	}
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PlanOptimizerFacts {
+	origin: PlanOrigin,
+	byte_upper_bound: Option<ByteCount>,
+	row_upper_bound: Option<RowCount>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PlanOrigin {
+	#[default]
+	Unknown,
+	SingleBaseRelation,
+	Composite,
+}
+
+impl PlanOptimizerFacts {
+	fn from_table(facts: TableOptimizerFacts) -> Self {
+		Self {
+			origin: PlanOrigin::SingleBaseRelation,
+			byte_upper_bound: facts.byte_upper_bound,
+			row_upper_bound: facts.row_upper_bound,
+		}
+	}
+
+	fn composite_unknown() -> Self {
+		Self {
+			origin: PlanOrigin::Composite,
+			byte_upper_bound: None,
+			row_upper_bound: None,
+		}
+	}
+
+	fn composite_with_row(row_upper_bound: Option<RowCount>) -> Self {
+		Self {
+			origin: PlanOrigin::Composite,
+			byte_upper_bound: None,
+			row_upper_bound,
+		}
+	}
+
+	fn composite_with_bounds(
+		byte_upper_bound: Option<ByteCount>,
+		row_upper_bound: Option<RowCount>,
+	) -> Self {
+		Self {
+			origin: PlanOrigin::Composite,
+			byte_upper_bound,
+			row_upper_bound,
+		}
+	}
+
+	fn empty_relation() -> Self {
+		Self::composite_with_bounds(Some(ByteCount::ZERO), Some(RowCount::new(0)))
+	}
+
+	fn exchange(self) -> Self {
+		Self::composite_with_bounds(self.byte_upper_bound, self.row_upper_bound)
+	}
+
+	fn take(self, limit: usize) -> Self {
+		let limit = RowCount::new(u64::try_from(limit).unwrap_or(u64::MAX));
+		let row_upper_bound = self
+			.row_upper_bound
+			.map(|row| std::cmp::min(row, limit))
+			.or(Some(limit));
+		Self::composite_with_row(row_upper_bound)
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JoinStrategyDecision {
+	strategy: JoinStrategy,
+	reason: JoinStrategyDecisionReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinStrategyDecisionReason {
+	PinnedByAuthor,
+	BroadcastInferred {
+		build_bytes: ByteCount,
+		threshold: ByteCount,
+	},
+	HashByDefault {
+		reason: HashByDefaultReason,
+	},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashByDefaultReason {
+	AutoBroadcastDisabled,
+	NonInnerJoin,
+	LeftInputNotSingleBaseRelation,
+	MissingBuildByteUpperBound,
+	BuildByteUpperBoundAboveThreshold,
 }
 
 struct ExprBindContext<'a> {
@@ -106,6 +224,7 @@ impl<'a> Binder<'a> {
 			match plan {
 				LogicalPlan::Scan { table, projection } => {
 					let binding = self.catalog.resolve_table_id(*table).await?;
+					let facts = PlanOptimizerFacts::from_table(binding.optimizer_facts);
 					let projection = projection
 						.as_ref()
 						.map(|columns| {
@@ -120,7 +239,8 @@ impl<'a> Binder<'a> {
 						.transpose()?;
 
 					let plan = scan_plan(binding, projection);
-					Ok(ScopedExecutionPlan::empty_scope(plan))
+					let scope = RelationScope::empty(plan.schema());
+					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
 				LogicalPlan::ScanNamed { table, projection } => {
 					if is_information_schema_namespace(table) {
@@ -131,6 +251,7 @@ impl<'a> Binder<'a> {
 						return Ok(ScopedExecutionPlan::new(plan, scope));
 					}
 					let binding = self.catalog.resolve_table(table).await?;
+					let facts = PlanOptimizerFacts::from_table(binding.optimizer_facts);
 					let projection = projection
 						.as_ref()
 						.map(|columns| {
@@ -146,7 +267,7 @@ impl<'a> Binder<'a> {
 
 					let plan = scan_plan(binding, projection);
 					let scope = RelationScope::scan(table.clone(), &plan.schema());
-					Ok(ScopedExecutionPlan::new(plan, scope))
+					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
 				LogicalPlan::Alias {
 					input,
@@ -154,12 +275,14 @@ impl<'a> Binder<'a> {
 					columns,
 				} => {
 					let input = self.bind_plan(input).await?;
+					let facts = input.facts;
 					let plan = bind_alias_column_rename(input.plan, columns)?;
 					let scope = RelationScope::alias(alias.clone(), &plan.schema());
-					Ok(ScopedExecutionPlan::new(plan, scope))
+					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
 				LogicalPlan::Filter { input, predicate } => {
 					let input = self.bind_plan(input).await?;
+					let input_facts = input.facts;
 					let bound_predicate = self
 						.bind_expr_program_scoped(
 							std::slice::from_ref(predicate),
@@ -176,7 +299,12 @@ impl<'a> Binder<'a> {
 						&logical_types,
 					);
 					let scope = input_scope.with_schema(plan.schema());
-					Ok(ScopedExecutionPlan::new(plan, scope))
+					let facts = if matches!(plan, ExecutionPlan::EmptyRelation { .. }) {
+						PlanOptimizerFacts::empty_relation()
+					} else {
+						PlanOptimizerFacts::composite_with_row(input_facts.row_upper_bound)
+					};
+					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
 				LogicalPlan::Project {
 					input,
@@ -190,19 +318,21 @@ impl<'a> Binder<'a> {
 						});
 					}
 					let input = self.bind_plan(input).await?;
+					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
 					let exprs = self
 						.bind_projection_expr_program_scoped(exprs, &input.schema(), &input.scope)
 						.await?;
 					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
 					let scope = input.scope.project(&exprs, &output_schema);
 
-					Ok(ScopedExecutionPlan::new(
+					Ok(ScopedExecutionPlan::new_with_facts(
 						ExecutionPlan::Project {
 							input: Box::new(input.plan),
 							exprs,
 							output_schema,
 						},
 						scope,
+						facts,
 					))
 				}
 				LogicalPlan::Aggregate {
@@ -230,7 +360,7 @@ impl<'a> Binder<'a> {
 					let output_schema = aggregate_schema(&group_expr, &bound_aggr_expr);
 					let scope = input.scope.aggregate(&group_expr, &output_schema);
 
-					Ok(ScopedExecutionPlan::new(
+					Ok(ScopedExecutionPlan::new_with_facts(
 						ExecutionPlan::Aggregate {
 							input: Box::new(input.plan),
 							group_expr,
@@ -238,6 +368,7 @@ impl<'a> Binder<'a> {
 							output_schema,
 						},
 						scope,
+						PlanOptimizerFacts::composite_unknown(),
 					))
 				}
 				LogicalPlan::Exchange {
@@ -246,19 +377,21 @@ impl<'a> Binder<'a> {
 					key,
 				} => {
 					let input = self.bind_plan(input).await?;
+					let facts = input.facts.exchange();
 					let input_schema = input.schema();
 					let key = self
 						.bind_expr_program_scoped(key, &input_schema, &input.scope)
 						.await?;
 					let scope = input.scope.with_schema(input_schema);
 
-					Ok(ScopedExecutionPlan::new(
+					Ok(ScopedExecutionPlan::new_with_facts(
 						ExecutionPlan::Exchange {
 							input: Box::new(input.plan),
 							partition_count: *partition_count,
 							key,
 						},
 						scope,
+						facts,
 					))
 				}
 				LogicalPlan::Sort {
@@ -268,11 +401,12 @@ impl<'a> Binder<'a> {
 					offset,
 				} => {
 					let input = self.bind_plan(input).await?;
+					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
 					let output_schema = input.schema();
 					let order_by = bind_sort_keys(order_by, &output_schema, &input.scope)?;
 					let scope = input.scope.with_schema(output_schema.clone());
 
-					Ok(ScopedExecutionPlan::new(
+					Ok(ScopedExecutionPlan::new_with_facts(
 						ExecutionPlan::Sort {
 							input: Box::new(input.plan),
 							order_by,
@@ -281,19 +415,22 @@ impl<'a> Binder<'a> {
 							output_schema,
 						},
 						scope,
+						facts,
 					))
 				}
 				LogicalPlan::Take { input, limit } => {
 					let input = self.bind_plan(input).await?;
+					let facts = input.facts.take(*limit);
 					let output_schema = input.schema();
 					let scope = input.scope.with_schema(output_schema.clone());
-					Ok(ScopedExecutionPlan::new(
+					Ok(ScopedExecutionPlan::new_with_facts(
 						ExecutionPlan::Take {
 							input: Box::new(input.plan),
 							limit: *limit,
 							output_schema,
 						},
 						scope,
+						facts,
 					))
 				}
 				LogicalPlan::Join {
@@ -301,8 +438,11 @@ impl<'a> Binder<'a> {
 					right,
 					kind,
 					on,
-					strategy,
-				} => self.bind_join(left, right, *kind, on, *strategy).await,
+					strategy_intent,
+				} => {
+					self.bind_join(left, right, *kind, on, *strategy_intent)
+						.await
+				}
 				LogicalPlan::CreateTable {
 					name,
 					schema,
@@ -923,12 +1063,14 @@ impl<'a> Binder<'a> {
 		right: &LogicalPlan,
 		kind: JoinKind,
 		on: &[(Expr, Expr)],
-		strategy: JoinStrategy,
+		strategy_intent: JoinStrategyIntent,
 	) -> Result<ScopedExecutionPlan, BindingError> {
-		let left_plan = self.bind_plan(left).await?;
-		let right_plan = self.bind_plan(right).await?;
+		let mut left_plan = self.bind_plan(left).await?;
+		let mut right_plan = self.bind_plan(right).await?;
 		let mut left_keys = Vec::new();
 		let mut right_keys = Vec::new();
+		let mut left_resolved_keys = Vec::new();
+		let mut right_resolved_keys = Vec::new();
 
 		for (left_expr, right_expr) in on {
 			let (left_key, right_key) =
@@ -936,11 +1078,41 @@ impl<'a> Binder<'a> {
 			validate_join_key_types(&left_key, &right_key)?;
 			left_keys.push(left_key.column.ordinal);
 			right_keys.push(right_key.column.ordinal);
+			left_resolved_keys.push(left_key);
+			right_resolved_keys.push(right_key);
+		}
+
+		let decision = choose_join_strategy(
+			strategy_intent,
+			kind,
+			left_plan.facts,
+			right_plan.facts,
+			self.config,
+		);
+		if matches!(strategy_intent, JoinStrategyIntent::Auto) {
+			match decision.strategy {
+				JoinStrategy::HashPartitioned => {
+					left_plan.plan = exchange_for_join_keys(
+						left_plan.plan,
+						&left_resolved_keys,
+						DEFAULT_AUTO_JOIN_PARTITION_COUNT,
+					)?;
+					right_plan.plan = exchange_for_join_keys(
+						right_plan.plan,
+						&right_resolved_keys,
+						DEFAULT_AUTO_JOIN_PARTITION_COUNT,
+					)?;
+				}
+				JoinStrategy::Broadcast => {
+					left_plan.plan =
+						exchange_for_join_keys(left_plan.plan, &left_resolved_keys, 1)?;
+				}
+			}
 		}
 
 		validate_strategy_shape(
 			kind,
-			strategy,
+			decision.strategy,
 			&left_plan.plan,
 			&right_plan.plan,
 			&left_keys,
@@ -949,17 +1121,18 @@ impl<'a> Binder<'a> {
 		let output_schema = join_schema(kind, &left_plan.schema(), &right_plan.schema());
 		let scope = RelationScope::join(kind, &left_plan.scope, &right_plan.scope, &output_schema);
 
-		Ok(ScopedExecutionPlan::new(
+		Ok(ScopedExecutionPlan::new_with_facts(
 			ExecutionPlan::Join {
 				left: Box::new(left_plan.plan),
 				right: Box::new(right_plan.plan),
 				kind,
 				left_keys,
 				right_keys,
-				strategy,
+				strategy: decision.strategy,
 				output_schema,
 			},
 			scope,
+			PlanOptimizerFacts::composite_unknown(),
 		))
 	}
 
@@ -3538,6 +3711,94 @@ struct ResolvedJoinKey {
 struct ResolvedLogicalColumn {
 	column: ResolvedColumn,
 	logical_type: LogicalTypeId,
+}
+
+fn choose_join_strategy(
+	intent: JoinStrategyIntent,
+	kind: JoinKind,
+	left_facts: PlanOptimizerFacts,
+	_right_facts: PlanOptimizerFacts,
+	config: &PlannerConfig,
+) -> JoinStrategyDecision {
+	match intent {
+		JoinStrategyIntent::Pinned(strategy) => JoinStrategyDecision {
+			strategy,
+			reason: JoinStrategyDecisionReason::PinnedByAuthor,
+		},
+		JoinStrategyIntent::Auto => choose_auto_join_strategy(kind, left_facts, config),
+	}
+}
+
+fn choose_auto_join_strategy(
+	kind: JoinKind,
+	left_facts: PlanOptimizerFacts,
+	config: &PlannerConfig,
+) -> JoinStrategyDecision {
+	let Some(threshold) = effective_auto_broadcast_threshold(config) else {
+		return hash_join_decision(HashByDefaultReason::AutoBroadcastDisabled);
+	};
+	if kind != JoinKind::Inner {
+		return hash_join_decision(HashByDefaultReason::NonInnerJoin);
+	}
+	if left_facts.origin != PlanOrigin::SingleBaseRelation {
+		return hash_join_decision(HashByDefaultReason::LeftInputNotSingleBaseRelation);
+	}
+	let Some(build_bytes) = left_facts.byte_upper_bound else {
+		return hash_join_decision(HashByDefaultReason::MissingBuildByteUpperBound);
+	};
+	if build_bytes >= threshold {
+		return hash_join_decision(HashByDefaultReason::BuildByteUpperBoundAboveThreshold);
+	}
+	JoinStrategyDecision {
+		strategy: JoinStrategy::Broadcast,
+		reason: JoinStrategyDecisionReason::BroadcastInferred {
+			build_bytes,
+			threshold,
+		},
+	}
+}
+
+fn hash_join_decision(reason: HashByDefaultReason) -> JoinStrategyDecision {
+	JoinStrategyDecision {
+		strategy: JoinStrategy::HashPartitioned,
+		reason: JoinStrategyDecisionReason::HashByDefault { reason },
+	}
+}
+
+fn effective_auto_broadcast_threshold(config: &PlannerConfig) -> Option<ByteCount> {
+	let configured = config.auto_broadcast_max_build_bytes?;
+	let static_cap = default_auto_broadcast_cap_ceiling();
+	Some(std::cmp::min(configured, static_cap))
+}
+
+fn default_auto_broadcast_cap_ceiling() -> ByteCount {
+	ByteCount::new(QueryBudget::default().broadcast_build_bytes_per_task.get() / 4)
+}
+
+fn exchange_for_join_keys(
+	input: ExecutionPlan,
+	keys: &[ResolvedJoinKey],
+	partition_count: u32,
+) -> Result<ExecutionPlan, BindingError> {
+	Ok(ExecutionPlan::Exchange {
+		input: Box::new(input),
+		partition_count,
+		key: join_key_program(keys)?,
+	})
+}
+
+fn join_key_program(keys: &[ResolvedJoinKey]) -> Result<BoundExprProgram, BindingError> {
+	let mut builder = BoundExprProgramBuilder::new();
+	for key in keys {
+		let node = builder.append_column(key.column.clone());
+		if !builder.set_node_logical_type(node, key.logical_type) {
+			return Err(BindingError::UnsupportedExpression {
+				message: "logical join key target is malformed".to_string(),
+			});
+		}
+		builder.push_root(node);
+	}
+	Ok(builder.build())
 }
 
 fn join_key_column_ref(expr: &Expr) -> Result<(&ColumnRef, LogicalTypeId), BindingError> {
@@ -6201,6 +6462,7 @@ mod tests {
 	use super::*;
 	use crate::catalog::MockCatalog;
 	use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, TableId};
+	use crate::sql_planner::SqlPlanner;
 	use arrow::datatypes::{Field, Schema};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -6416,6 +6678,7 @@ mod tests {
 			&catalog,
 			&PlannerConfig {
 				allow_experimental_kernels: true,
+				..PlannerConfig::default()
 			},
 		)
 		.await
@@ -6589,7 +6852,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		let plan = bind(&plan, &catalog, &PlannerConfig::default())
@@ -6624,7 +6887,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		let plan = bind(&plan, &catalog, &PlannerConfig::default())
@@ -6652,7 +6915,7 @@ mod tests {
 			right: Box::new(exchanged_named_scan("customers", "id", 2)),
 			kind: JoinKind::Inner,
 			on: vec![(Expr::column("id"), Expr::column("id"))],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		let err = bind(&plan, &catalog, &PlannerConfig::default())
@@ -6673,7 +6936,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("missing"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		let err = bind(&plan, &catalog, &PlannerConfig::default())
@@ -6703,7 +6966,7 @@ mod tests {
 				),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 		let computed = LogicalPlan::Join {
 			left: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
@@ -6713,7 +6976,7 @@ mod tests {
 				Expr::Literal(ScalarValue::Int64(Some(7))),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		assert!(matches!(
@@ -6741,7 +7004,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "region"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		assert!(matches!(
@@ -6760,7 +7023,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("left_floats"), "f"),
 				Expr::qualified_column(TableRef::new("right_floats"), "f"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		assert!(matches!(
@@ -6782,7 +7045,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 		let key_mismatch = LogicalPlan::Join {
 			left: Box::new(exchanged_named_scan("orders", "id", 2)),
@@ -6792,7 +7055,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy: JoinStrategy::HashPartitioned,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
 		};
 
 		assert!(matches!(
@@ -6823,7 +7086,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy: JoinStrategy::Broadcast,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
 		};
 
 		assert!(matches!(
@@ -6847,7 +7110,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy: JoinStrategy::Broadcast,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
 		};
 
 		assert!(matches!(
@@ -6875,7 +7138,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy: JoinStrategy::Broadcast,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
 		};
 		let wrong_left_partition_count = LogicalPlan::Join {
 			left: Box::new(exchanged_named_scan("customers", "id", 4)),
@@ -6888,7 +7151,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy: JoinStrategy::Broadcast,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
 		};
 		let both_sides_published = LogicalPlan::Join {
 			left: Box::new(exchanged_named_scan("customers", "id", 1)),
@@ -6898,7 +7161,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy: JoinStrategy::Broadcast,
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
 		};
 
 		for plan in [
@@ -6915,12 +7178,233 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn auto_broadcast_sql_unhinted_tiny_left_join_infers_broadcast() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
+			.expect("plan SQL join");
+		assert!(matches!(
+			logical,
+			LogicalPlan::Join {
+				strategy_intent: JoinStrategyIntent::Auto,
+				..
+			}
+		));
+
+		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind inferred broadcast");
+
+		let ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} = plan
+		else {
+			panic!("expected join");
+		};
+		assert_eq!(strategy, JoinStrategy::Broadcast);
+		assert!(matches!(terminal_exchange(&left), Some((1, _))));
+		assert!(terminal_exchange(&right).is_none());
+	}
+
+	#[tokio::test]
+	async fn sql_unhinted_unknown_large_and_tiny_right_joins_stay_hash() {
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
+			.expect("plan SQL join");
+
+		let unknown = bind(&logical, &join_catalog(), &auto_broadcast_config(4_096))
+			.await
+			.expect("bind unknown-size join");
+		assert_join_strategy(&unknown, JoinStrategy::HashPartitioned);
+
+		let mut large_catalog = join_catalog();
+		seed_byte_upper_bound(&mut large_catalog, "customers", 8_192);
+		let large = bind(&logical, &large_catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind large join");
+		assert_join_strategy(&large, JoinStrategy::HashPartitioned);
+
+		let mut right_tiny_catalog = join_catalog();
+		seed_byte_upper_bound(&mut right_tiny_catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut right_tiny_catalog, "customers", 1_024);
+		let right_tiny = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan right-tiny SQL join");
+		let right_tiny = bind(
+			&right_tiny,
+			&right_tiny_catalog,
+			&auto_broadcast_config(4_096),
+		)
+		.await
+		.expect("bind right-tiny join");
+		assert_join_strategy(&right_tiny, JoinStrategy::HashPartitioned);
+	}
+
+	#[tokio::test]
+	async fn sql_broadcast_hint_stays_pinned_and_fail_loud() {
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan hinted broadcast");
+		assert!(matches!(
+			logical,
+			LogicalPlan::Join {
+				strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+				..
+			}
+		));
+
+		let plan = bind(&logical, &join_catalog(), &PlannerConfig::default())
+			.await
+			.expect("pinned broadcast binds without auto config");
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+
+		let err = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c LEFT JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect_err("non-inner broadcast hint fails before inference");
+		assert!(
+			err.to_string()
+				.contains("broadcast join is only supported for INNER joins"),
+			"{err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn pinned_author_choice_not_downgraded_or_upgraded_by_inference() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+
+		let pinned_hash = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("customers", "id", 2)),
+			right: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+		};
+		let plan = bind(&pinned_hash, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind pinned hash");
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+
+		let pinned_broadcast = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan pinned broadcast");
+		let plan = bind(&pinned_broadcast, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind pinned broadcast");
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+	}
+
+	#[test]
+	fn inferred_broadcast_carries_reason_receipt() {
+		let config = auto_broadcast_config(4_096);
+		let decision = choose_join_strategy(
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(1_024)),
+				row_upper_bound: None,
+			},
+			PlanOptimizerFacts::default(),
+			&config,
+		);
+
+		assert_eq!(decision.strategy, JoinStrategy::Broadcast);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::BroadcastInferred {
+				build_bytes: ByteCount::new(1_024),
+				threshold: ByteCount::new(4_096),
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn take_or_empty_relation_seeds_row_bound_without_dispatch_change() {
+		let catalog = join_catalog();
+		let config = PlannerConfig::default();
+		let take = LogicalPlan::Take {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			limit: 0,
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &config,
+		}
+		.bind_plan(&take)
+		.await
+		.expect("bind take");
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(0)));
+
+		let empty = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Literal(ScalarValue::Boolean(Some(false))),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &config,
+		}
+		.bind_plan(&empty)
+		.await
+		.expect("bind empty");
+		assert!(matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+		assert_eq!(scoped.facts.byte_upper_bound, Some(ByteCount::ZERO));
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(0)));
+	}
+
 	fn catalog() -> MockCatalog {
 		let mut catalog = MockCatalog::new();
 		catalog
 			.register_descriptor(TableId(1), descriptor())
 			.expect("register descriptor");
 		catalog
+	}
+
+	fn auto_broadcast_config(max_build_bytes: u64) -> PlannerConfig {
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(max_build_bytes)),
+			..PlannerConfig::default()
+		}
+	}
+
+	fn seed_byte_upper_bound(catalog: &mut MockCatalog, table: &str, bytes: u64) {
+		catalog
+			.seed_optimizer_facts(
+				&TableRef::new(table),
+				TableOptimizerFacts {
+					byte_upper_bound: Some(ByteCount::new(bytes)),
+					row_upper_bound: None,
+				},
+			)
+			.expect("seed optimizer facts");
+	}
+
+	fn assert_join_strategy(plan: &ExecutionPlan, expected: JoinStrategy) {
+		match plan {
+			ExecutionPlan::Join { strategy, .. } => assert_eq!(*strategy, expected),
+			other => panic!("expected join, got {other:?}"),
+		}
 	}
 
 	fn join_catalog() -> MockCatalog {
