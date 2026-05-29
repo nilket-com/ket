@@ -72,6 +72,95 @@ pub(crate) fn build_runtime_filter_fragment(
 	build_bloom_runtime_filter_fragment(batches, ordinal, key_type, non_null_count)
 }
 
+pub(crate) struct RuntimeFilterFragmentBuilder {
+	ordinal: ColumnOrdinal,
+	key_type: RuntimeFilterKeyType,
+	encoded_keys: HashSet<Vec<u8>>,
+	exact_payload_bytes: usize,
+	exact_overflow: bool,
+	non_null_count: usize,
+	saw_batch: bool,
+}
+
+impl RuntimeFilterFragmentBuilder {
+	pub(crate) fn new(key: &BoundExprProgram) -> Option<Self> {
+		let (ordinal, key_type) = single_supported_key(key)?;
+		Some(Self {
+			ordinal,
+			key_type,
+			encoded_keys: HashSet::new(),
+			exact_payload_bytes: 0,
+			exact_overflow: false,
+			non_null_count: 0,
+			saw_batch: false,
+		})
+	}
+
+	pub(crate) fn push_batch(&mut self, batch: &RecordBatch) -> Result<(), ExecutionError> {
+		self.saw_batch = true;
+		let array = runtime_filter_key_array(batch, self.ordinal)?;
+		for row in 0..batch.num_rows() {
+			let Some(encoded) =
+				encode_runtime_filter_key(array.as_ref(), row).map_err(runtime_filter_error)?
+			else {
+				continue;
+			};
+			self.non_null_count = self.non_null_count.saturating_add(1);
+			if self.encoded_keys.insert(encoded.clone()) && !self.exact_overflow {
+				self.exact_payload_bytes = self
+					.exact_payload_bytes
+					.saturating_add(exact_payload_len(&encoded).map_err(runtime_filter_error)?);
+				if self.exact_payload_bytes > EXACT_FILTER_MAX_BYTES {
+					self.exact_overflow = true;
+				}
+			}
+		}
+		Ok(())
+	}
+
+	pub(crate) fn finish(self) -> Result<Option<RuntimeFilterFragment>, ExecutionError> {
+		if !self.saw_batch {
+			return Ok(None);
+		}
+		if !self.exact_overflow {
+			let exact_set = runtime_filter_exact_set_from_encoded_keys(
+				self.encoded_keys.into_iter().collect(),
+				u32::try_from(EXACT_FILTER_MAX_BYTES).expect("exact filter byte budget fits u32"),
+			)
+			.map_err(runtime_filter_error)?;
+			return Ok(Some(RuntimeFilterFragment {
+				key_encoding_version: RUNTIME_FILTER_KEY_ENCODING_VERSION,
+				key_types: vec![self.key_type],
+				kind: RuntimeFilterKind::ExactSet(exact_set),
+			}));
+		}
+
+		let sizing_key_count = if self.non_null_count > cap_distinct_threshold() {
+			self.non_null_count
+		} else {
+			self.encoded_keys.len()
+		};
+		let sizing = bloom_sizing(sizing_key_count);
+		let mut payload = vec![0u8; sizing.byte_budget];
+		for encoded in &self.encoded_keys {
+			insert_key(&mut payload, sizing.bit_count, sizing.hash_count, encoded);
+		}
+		Ok(Some(RuntimeFilterFragment {
+			key_encoding_version: RUNTIME_FILTER_KEY_ENCODING_VERSION,
+			key_types: vec![self.key_type],
+			kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+				hash_seed: RUNTIME_FILTER_HASH_SEED,
+				bit_count: sizing.bit_count,
+				hash_count: sizing.hash_count,
+				byte_budget: u32::try_from(sizing.byte_budget)
+					.expect("filter byte budget fits u32"),
+				target_fp_rate_bp: TARGET_FP_RATE_BP,
+				payload,
+			}),
+		}))
+	}
+}
+
 fn build_bloom_runtime_filter_fragment(
 	batches: &[RecordBatch],
 	ordinal: ColumnOrdinal,
@@ -421,6 +510,32 @@ mod tests {
 		for row in 0..batch.num_rows() {
 			assert!(runtime_filter_might_contain(&descriptor, batch.column(0), row).unwrap());
 		}
+	}
+
+	#[test]
+	fn runtime_filter_incremental_builder_matches_batch_builder() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let first = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from_iter_values(0_i64..2048)) as ArrayRef],
+		)
+		.unwrap();
+		let second = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(Int64Array::from_iter_values(2048_i64..4096)) as ArrayRef],
+		)
+		.unwrap();
+		let batches = vec![first, second];
+		let key = key_expr(DataType::Int64, true);
+		let expected = build_runtime_filter_fragment(&batches, &key)
+			.unwrap()
+			.expect("fragment");
+		let mut builder = RuntimeFilterFragmentBuilder::new(&key).expect("supported key");
+		for batch in &batches {
+			builder.push_batch(batch).unwrap();
+		}
+
+		assert_eq!(builder.finish().unwrap(), Some(expected));
 	}
 
 	#[test]

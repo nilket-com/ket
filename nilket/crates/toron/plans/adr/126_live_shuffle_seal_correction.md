@@ -118,7 +118,9 @@ optional. Opportunistic refcounted release is a named follow-on.
 **D8 — Scope boundary.** Touch surface is precisely: a shared Arrow IPC helper
 module (codec + reassembly), `partition_store.rs` (schema field + seal rewrite +
 seal reservation), `server/mod.rs` (live open with schema, drop retention,
-suppress results, manifest telemetry), and the architecture guards. **No**
+suppress results, manifest telemetry), `exec/runtime_filter.rs` (manifest
+fragment generation without retained results), the legacy `lib.rs` spill-path
+regression, and the architecture guards. **No**
 chunk-granular sealed manifest, **no** virtual sealed payload aliasing live
 chunks, **no** remote live transport / multi-producer fan-in, **no** build/probe
 reorder, **no** Arrow IPC wire-format change, **no** SQL/Rune authoring change.

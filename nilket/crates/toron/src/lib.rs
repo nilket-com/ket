@@ -57,7 +57,7 @@ mod tests {
 	use crate::exec::Executor;
 	use crate::ir::{
 		AggregateFunction, BoundExprProgram, ExecutionPlan, Expr, JoinKind, JoinStrategy,
-		LogicalPlan, MorselId, ScalarValue, StageId, TableId,
+		LogicalPlan, MorselId, ScalarValue, SortExpr, StageId, TableId,
 	};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::server::{
@@ -701,9 +701,18 @@ mod tests {
 		let plan = LogicalPlan::Exchange {
 			partition_count: 2,
 			key: vec![Expr::column("key")],
-			input: Box::new(LogicalPlan::Scan {
-				table: TableId(1),
-				projection: None,
+			input: Box::new(LogicalPlan::Sort {
+				input: Box::new(LogicalPlan::Scan {
+					table: TableId(1),
+					projection: None,
+				}),
+				order_by: vec![SortExpr {
+					expr: Expr::column("key"),
+					descending: false,
+					nulls_first: false,
+				}],
+				limit: None,
+				offset: 0,
 			}),
 		};
 		let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())

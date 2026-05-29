@@ -1,3 +1,4 @@
+pub(crate) mod arrow_ipc;
 pub mod budget;
 pub mod cancellation;
 pub mod context;

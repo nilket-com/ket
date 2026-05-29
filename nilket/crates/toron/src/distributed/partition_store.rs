@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use arrow::datatypes::SchemaRef;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 
+use crate::distributed::arrow_ipc::{ArrowIpcError, reassemble_partition_chunks};
 use crate::distributed::budget::{
 	BudgetDimension, BudgetRejection, BudgetReservation, BudgetTracker, ByteCount, QueryBudget,
 };
@@ -37,17 +39,22 @@ pub trait PartitionStore: Send + Sync {
 		address: PartitionAddress,
 		expected_attempt: AttemptId,
 	) -> Result<PartitionPayload, PartitionMissingReason>;
-	fn open_live(&self, address: PartitionAddress) -> Result<(), PartitionStoreError> {
-		let _ = address;
+	fn open_live(
+		&self,
+		address: PartitionAddress,
+		schema: SchemaRef,
+	) -> Result<(), PartitionStoreError> {
+		let _ = (address, schema);
 		Err(PartitionStoreError::LiveUnsupported)
 	}
 	fn open_live_with_downstream_cancellation(
 		&self,
 		address: PartitionAddress,
+		schema: SchemaRef,
 		downstream_cancellation: Option<DownstreamCancellationContext>,
 	) -> Result<(), PartitionStoreError> {
 		let _ = downstream_cancellation;
-		self.open_live(address)
+		self.open_live(address, schema)
 	}
 	async fn append_live(&self, payload: PartitionPayload) -> Result<(), PartitionStoreError> {
 		let _ = payload;
@@ -250,6 +257,11 @@ pub enum PartitionStoreError {
 		operation: &'static str,
 		message: String,
 	},
+	#[error("partition store Arrow IPC error during {operation}: {message}")]
+	ArrowIpc {
+		operation: &'static str,
+		message: String,
+	},
 	#[error("live partition lifecycle is unsupported by this partition store")]
 	LiveUnsupported,
 }
@@ -260,6 +272,15 @@ impl From<BudgetRejection> for PartitionStoreError {
 			dimension: rejection.dimension,
 			requested: rejection.requested,
 			available: rejection.available,
+		}
+	}
+}
+
+impl From<ArrowIpcError> for PartitionStoreError {
+	fn from(error: ArrowIpcError) -> Self {
+		Self::ArrowIpc {
+			operation: "live-seal-reassembly",
+			message: error.to_string(),
 		}
 	}
 }
@@ -282,6 +303,7 @@ struct PartitionStoreInner {
 #[derive(Debug)]
 struct LivePartition {
 	opened: bool,
+	schema: Option<SchemaRef>,
 	chunks: Vec<PartitionPayload>,
 	reservations: Vec<BudgetReservation>,
 	sealed: bool,
@@ -296,6 +318,7 @@ impl LivePartition {
 	fn placeholder() -> Self {
 		Self {
 			opened: false,
+			schema: None,
 			chunks: Vec::new(),
 			reservations: Vec::new(),
 			sealed: false,
@@ -416,13 +439,18 @@ impl PartitionStore for InMemoryPartitionStore {
 		Err(PartitionMissingReason::StoreEvicted)
 	}
 
-	fn open_live(&self, address: PartitionAddress) -> Result<(), PartitionStoreError> {
-		self.open_live_with_downstream_cancellation(address, None)
+	fn open_live(
+		&self,
+		address: PartitionAddress,
+		schema: SchemaRef,
+	) -> Result<(), PartitionStoreError> {
+		self.open_live_with_downstream_cancellation(address, schema, None)
 	}
 
 	fn open_live_with_downstream_cancellation(
 		&self,
 		address: PartitionAddress,
+		schema: SchemaRef,
 		downstream_cancellation: Option<DownstreamCancellationContext>,
 	) -> Result<(), PartitionStoreError> {
 		let mut inner = self.inner.write().expect("partition store poisoned");
@@ -439,6 +467,7 @@ impl PartitionStore for InMemoryPartitionStore {
 			.entry(address)
 			.or_insert_with(LivePartition::placeholder);
 		live.opened = true;
+		live.schema = Some(schema);
 		if downstream_cancellation.is_some() {
 			live.downstream_cancellation = downstream_cancellation;
 		}
@@ -521,54 +550,105 @@ impl PartitionStore for InMemoryPartitionStore {
 		&self,
 		mut manifest: PartitionManifest,
 	) -> Result<PartitionManifest, PartitionStoreError> {
+		enum SealInput {
+			Published(PartitionAddress, PartitionPayload),
+			Chunks {
+				address: PartitionAddress,
+				schema: Option<SchemaRef>,
+				chunks: Vec<PartitionPayload>,
+			},
+		}
+
 		let key = ManifestKey::from_manifest(&manifest);
+
+		let inputs = {
+			let inner = self.inner.read().expect("partition store poisoned");
+			if inner.cancelled_queries.contains(&manifest.query_id) {
+				return Err(PartitionStoreError::CancelledQuery {
+					query_id: manifest.query_id,
+				});
+			}
+
+			let mut inputs = Vec::new();
+			for entry in &manifest.partitions {
+				let partition_id = entry.partition_id;
+				let address = PartitionAddress {
+					query_id: manifest.query_id,
+					exchange_id: manifest.exchange_id,
+					producer_stage_id: manifest.stage_id,
+					producer_task_id: manifest.task_id,
+					attempt_id: manifest.attempt_id,
+					partition_id,
+				};
+				let published_payload = inner.partitions.get(&address).cloned();
+				let Some(live) = inner.live_partitions.get(&address) else {
+					continue;
+				};
+				if let Some(payload) = published_payload {
+					inputs.push(SealInput::Published(address, payload));
+					continue;
+				}
+				inputs.push(SealInput::Chunks {
+					address,
+					schema: live.schema.clone(),
+					chunks: live.chunks.clone(),
+				});
+			}
+			inputs
+		};
+
+		let mut sealed_payloads = Vec::new();
+		for input in inputs {
+			match input {
+				SealInput::Published(address, payload) => {
+					sealed_payloads.push((address, payload, None));
+				}
+				SealInput::Chunks {
+					address,
+					schema,
+					chunks,
+				} => {
+					let (bytes, row_count) = reassemble_partition_chunks(schema, &chunks)?;
+					let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
+					let payload = PartitionPayload::new(address, bytes, row_count, digest);
+					let reservation = self
+						.budget
+						.reserve(BudgetDimension::ShuffleBytes, payload.size_bytes())?;
+					sealed_payloads.push((address, payload, Some(reservation)));
+				}
+			}
+		}
+
 		let mut inner = self.inner.write().expect("partition store poisoned");
 		if inner.cancelled_queries.contains(&manifest.query_id) {
 			return Err(PartitionStoreError::CancelledQuery {
 				query_id: manifest.query_id,
 			});
 		}
+		for (address, _, reservation) in &sealed_payloads {
+			if reservation.is_some() && inner.partitions.contains_key(address) {
+				return Err(PartitionStoreError::DuplicatePartition { address: *address });
+			}
+		}
 
 		let mut entries = Vec::new();
-		let mut sealed_payloads = Vec::new();
 		let mut sealed_notifies = Vec::new();
-		for entry in &manifest.partitions {
-			let partition_id = entry.partition_id;
-			let address = PartitionAddress {
-				query_id: manifest.query_id,
-				exchange_id: manifest.exchange_id,
-				producer_stage_id: manifest.stage_id,
-				producer_task_id: manifest.task_id,
-				attempt_id: manifest.attempt_id,
-				partition_id,
-			};
-			let published_payload = inner.partitions.get(&address).cloned();
-			let Some(live) = inner.live_partitions.get_mut(&address) else {
-				continue;
-			};
-			if let Some(payload) = published_payload {
-				entries.push(payload.entry());
+		for (address, payload, reservation) in sealed_payloads {
+			let entry = payload.entry();
+			let notify = {
+				let Some(live) = inner.live_partitions.get_mut(&address) else {
+					continue;
+				};
 				live.sealed = true;
 				live.pacing_semaphore.close();
-				sealed_notifies.push(live.notify.clone());
-				continue;
+				live.notify.clone()
+			};
+			entries.push(entry);
+			sealed_notifies.push(notify);
+			if let Some(reservation) = reservation {
+				inner.partitions.insert(address, payload);
+				inner.reservations.insert(address, reservation);
 			}
-			let mut bytes = Vec::new();
-			let mut row_count = 0u64;
-			for chunk in &live.chunks {
-				bytes.extend_from_slice(&chunk.bytes);
-				row_count = row_count.saturating_add(chunk.row_count.get());
-			}
-			let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
-			let payload = PartitionPayload::new(address, bytes, RowCount::new(row_count), digest);
-			entries.push(payload.entry());
-			live.sealed = true;
-			live.pacing_semaphore.close();
-			sealed_notifies.push(live.notify.clone());
-			sealed_payloads.push((address, payload));
-		}
-		for (address, payload) in sealed_payloads {
-			inner.partitions.insert(address, payload);
 		}
 		for notify in sealed_notifies {
 			notify.notify_waiters();
@@ -1025,17 +1105,25 @@ impl PartitionStore for HybridPartitionStore {
 		}
 	}
 
-	fn open_live(&self, address: PartitionAddress) -> Result<(), PartitionStoreError> {
-		self.in_memory.open_live(address)
+	fn open_live(
+		&self,
+		address: PartitionAddress,
+		schema: SchemaRef,
+	) -> Result<(), PartitionStoreError> {
+		self.in_memory.open_live(address, schema)
 	}
 
 	fn open_live_with_downstream_cancellation(
 		&self,
 		address: PartitionAddress,
+		schema: SchemaRef,
 		downstream_cancellation: Option<DownstreamCancellationContext>,
 	) -> Result<(), PartitionStoreError> {
-		self.in_memory
-			.open_live_with_downstream_cancellation(address, downstream_cancellation)
+		self.in_memory.open_live_with_downstream_cancellation(
+			address,
+			schema,
+			downstream_cancellation,
+		)
 	}
 
 	async fn append_live(&self, payload: PartitionPayload) -> Result<(), PartitionStoreError> {
@@ -1125,9 +1213,13 @@ fn same_logical_partition(candidate: PartitionAddress, requested: PartitionAddre
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::distributed::arrow_ipc::{decode_record_batches, encode_record_batch};
 	use crate::distributed::identity::WorkerId;
 	use crate::distributed::task::PartitionBackend;
 	use crate::distributed::worker_registry::WorkerEndpoint;
+	use arrow::array::Int64Array;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use arrow::record_batch::RecordBatch;
 
 	fn address(attempt_id: AttemptId) -> PartitionAddress {
 		PartitionAddress {
@@ -1144,21 +1236,77 @@ mod tests {
 		payload_with_bytes(address, vec![1, 2, 3])
 	}
 
+	fn test_schema() -> SchemaRef {
+		Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+	}
+
 	fn payload_with_bytes(address: PartitionAddress, bytes: Vec<u8>) -> PartitionPayload {
 		let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
 		PartitionPayload::new(address, bytes, RowCount::new(1), digest)
 	}
 
+	fn ipc_batch(values: &[i64]) -> RecordBatch {
+		RecordBatch::try_new(
+			test_schema(),
+			vec![Arc::new(Int64Array::from(values.to_vec()))],
+		)
+		.expect("ipc test batch")
+	}
+
+	fn ipc_payload(address: PartitionAddress, values: &[i64]) -> PartitionPayload {
+		let batch = ipc_batch(values);
+		let bytes = encode_record_batch(&batch).expect("encode ipc payload");
+		let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
+		PartitionPayload::new(
+			address,
+			bytes,
+			RowCount::new(u64::try_from(values.len()).expect("row count fits u64")),
+			digest,
+		)
+	}
+
+	fn decoded_i64_values(bytes: &[u8]) -> Vec<i64> {
+		let batches = decode_record_batches(bytes).expect("decode ipc payload");
+		let mut values = Vec::new();
+		for batch in batches {
+			let array = batch
+				.column(0)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.expect("int64 column");
+			for row in 0..array.len() {
+				values.push(array.value(row));
+			}
+		}
+		values
+	}
+
 	fn manifest(payload: &PartitionPayload) -> PartitionManifest {
+		manifest_for_entry(payload.address, payload.entry())
+	}
+
+	fn manifest_for_address(address: PartitionAddress) -> PartitionManifest {
+		manifest_for_entry(
+			address,
+			PartitionEntry {
+				partition_id: address.partition_id,
+				size_bytes: ByteCount::ZERO,
+				row_count: RowCount::new(0),
+				digest: ArrowIpcDigest::new([0; 32]),
+			},
+		)
+	}
+
+	fn manifest_for_entry(address: PartitionAddress, entry: PartitionEntry) -> PartitionManifest {
 		PartitionManifest {
-			query_id: payload.address.query_id,
-			stage_id: payload.address.producer_stage_id,
-			task_id: payload.address.producer_task_id,
-			attempt_id: payload.address.attempt_id,
-			exchange_id: payload.address.exchange_id,
+			query_id: address.query_id,
+			stage_id: address.producer_stage_id,
+			task_id: address.producer_task_id,
+			attempt_id: address.attempt_id,
+			exchange_id: address.exchange_id,
 			producer_worker_id: WorkerId::from_u128(6),
 			producer_endpoint: WorkerEndpoint::new("127.0.0.1:9000"),
-			partitions: vec![payload.entry()],
+			partitions: vec![entry],
 			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		}
@@ -1197,7 +1345,7 @@ mod tests {
 		});
 
 		tokio::task::yield_now().await;
-		store.open_live(address).expect("open live");
+		store.open_live(address, test_schema()).expect("open live");
 		store
 			.append_live(expected.clone())
 			.await
@@ -1238,7 +1386,7 @@ mod tests {
 		let address = address(AttemptId::first());
 		let chunk = payload(address);
 
-		store.open_live(address).expect("open live");
+		store.open_live(address, test_schema()).expect("open live");
 		store.append_live(chunk).await.expect("append live");
 		store.cancel_live(address, PartitionMissingReason::WorkerLost);
 
@@ -1256,7 +1404,7 @@ mod tests {
 	async fn dropping_live_reader_cancels_unsealed_partition() {
 		let store = InMemoryPartitionStore::new();
 		let address = address(AttemptId::first());
-		store.open_live(address).expect("open live");
+		store.open_live(address, test_schema()).expect("open live");
 
 		let stream = store
 			.pull_live(address, AttemptId::first())
@@ -1277,7 +1425,7 @@ mod tests {
 	async fn live_producer_blocks_when_backlog_full_until_consumer_pulls() {
 		let store = Arc::new(InMemoryPartitionStore::new());
 		let address = address(AttemptId::first());
-		store.open_live(address).expect("open live");
+		store.open_live(address, test_schema()).expect("open live");
 		for value in 0..LIVE_BACKLOG_DEPTH {
 			store
 				.append_live(payload_with_bytes(address, vec![value as u8]))
@@ -1319,7 +1467,7 @@ mod tests {
 	async fn pull_releases_one_backlog_slot_once() {
 		let store = Arc::new(InMemoryPartitionStore::new());
 		let address = address(AttemptId::first());
-		store.open_live(address).expect("open live");
+		store.open_live(address, test_schema()).expect("open live");
 		for value in 0..LIVE_BACKLOG_DEPTH {
 			store
 				.append_live(payload_with_bytes(address, vec![value as u8]))
@@ -1394,7 +1542,7 @@ mod tests {
 	async fn cancel_live_wakes_blocked_appender_with_cancellation() {
 		let store = Arc::new(InMemoryPartitionStore::new());
 		let address = address(AttemptId::first());
-		store.open_live(address).expect("open live");
+		store.open_live(address, test_schema()).expect("open live");
 		for value in 0..LIVE_BACKLOG_DEPTH {
 			store
 				.append_live(payload_with_bytes(address, vec![value as u8]))
@@ -1428,15 +1576,19 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn seal_with_live_chunks_materializes_sealed_payload() {
+	async fn live_seal_reassembles_multi_chunk_arrow_ipc() {
 		let store = InMemoryPartitionStore::new();
 		let address = address(AttemptId::first());
-		let chunks = [vec![1, 2], vec![3, 4, 5], vec![6]];
-		let first_payload = payload_with_bytes(address, chunks[0].clone());
-		store.open_live(address).expect("open live");
-		for chunk in &chunks {
+		let chunk_rows: [&[i64]; 3] = [&[1, 2], &[3, 4, 5], &[6]];
+		let payloads = chunk_rows
+			.iter()
+			.map(|values| ipc_payload(address, values))
+			.collect::<Vec<_>>();
+		let first_payload = payloads[0].clone();
+		store.open_live(address, test_schema()).expect("open live");
+		for payload in &payloads {
 			store
-				.append_live(payload_with_bytes(address, chunk.clone()))
+				.append_live(payload.clone())
 				.await
 				.expect("append chunk");
 		}
@@ -1450,7 +1602,7 @@ mod tests {
 				.expect("first chunk")
 				.expect("first chunk ok")
 				.bytes,
-			chunks[0]
+			payloads[0].bytes
 		);
 
 		let sealed = store
@@ -1459,13 +1611,34 @@ mod tests {
 		let pulled = store
 			.pull(address, AttemptId::first())
 			.expect("sealed pull");
-		let expected_bytes = chunks.concat();
-		assert_eq!(pulled.bytes, expected_bytes);
-		assert_eq!(pulled.row_count, RowCount::new(3));
+		assert_eq!(decoded_i64_values(&pulled.bytes), vec![1, 2, 3, 4, 5, 6]);
+		assert_eq!(pulled.row_count, RowCount::new(6));
 		assert_eq!(
 			pulled.digest,
-			ArrowIpcDigest::new(wendelon::hash::blake3::digest(&expected_bytes))
+			ArrowIpcDigest::new(wendelon::hash::blake3::digest(&pulled.bytes))
 		);
+		assert_eq!(sealed.partitions[0], pulled.entry());
+	}
+
+	#[tokio::test]
+	async fn live_seal_empty_partition_emits_schema_bearing_ipc() {
+		let store = InMemoryPartitionStore::new();
+		let address = address(AttemptId::first());
+		let schema = test_schema();
+		store.open_live(address, schema.clone()).expect("open live");
+
+		let sealed = store
+			.seal_live(manifest_for_address(address))
+			.expect("seal empty live");
+		let pulled = store
+			.pull(address, AttemptId::first())
+			.expect("sealed pull");
+		let batches = decode_record_batches(&pulled.bytes).expect("decode empty payload");
+
+		assert_eq!(pulled.row_count, RowCount::new(0));
+		assert_eq!(batches.len(), 1);
+		assert_eq!(batches[0].num_rows(), 0);
+		assert_eq!(batches[0].schema().as_ref(), schema.as_ref());
 		assert_eq!(sealed.partitions[0], pulled.entry());
 	}
 
@@ -1473,12 +1646,15 @@ mod tests {
 	async fn late_sealed_pull_after_streaming_succeeds() {
 		let store = InMemoryPartitionStore::new();
 		let address = address(AttemptId::first());
-		let chunks = [vec![7], vec![8], vec![9]];
-		let first_payload = payload_with_bytes(address, chunks[0].clone());
-		store.open_live(address).expect("open live");
-		for chunk in &chunks {
+		let payloads = [[7], [8], [9]]
+			.iter()
+			.map(|values| ipc_payload(address, values))
+			.collect::<Vec<_>>();
+		let first_payload = payloads[0].clone();
+		store.open_live(address, test_schema()).expect("open live");
+		for payload in &payloads {
 			store
-				.append_live(payload_with_bytes(address, chunk.clone()))
+				.append_live(payload.clone())
 				.await
 				.expect("append chunk");
 		}
@@ -1486,7 +1662,7 @@ mod tests {
 			let mut stream = store
 				.pull_live(address, AttemptId::first())
 				.expect("live pull");
-			for chunk in &chunks {
+			for payload in &payloads {
 				assert_eq!(
 					stream
 						.next()
@@ -1494,7 +1670,7 @@ mod tests {
 						.expect("streamed chunk")
 						.expect("streamed chunk ok")
 						.bytes,
-					*chunk
+					payload.bytes
 				);
 			}
 		}
@@ -1505,7 +1681,7 @@ mod tests {
 		let pulled = store
 			.pull(address, AttemptId::first())
 			.expect("late sealed pull");
-		assert_eq!(pulled.bytes, chunks.concat());
+		assert_eq!(decoded_i64_values(&pulled.bytes), vec![7, 8, 9]);
 		assert_eq!(pulled.row_count, RowCount::new(3));
 	}
 
@@ -1513,12 +1689,15 @@ mod tests {
 	async fn retry_pull_live_restarts_from_index_zero() {
 		let store = InMemoryPartitionStore::new();
 		let address = address(AttemptId::first());
-		let chunks = [vec![10], vec![11], vec![12]];
-		let first_payload = payload_with_bytes(address, chunks[0].clone());
-		store.open_live(address).expect("open live");
-		for chunk in &chunks {
+		let payloads = [[10], [11], [12]]
+			.iter()
+			.map(|values| ipc_payload(address, values))
+			.collect::<Vec<_>>();
+		let first_payload = payloads[0].clone();
+		store.open_live(address, test_schema()).expect("open live");
+		for payload in &payloads {
 			store
-				.append_live(payload_with_bytes(address, chunk.clone()))
+				.append_live(payload.clone())
 				.await
 				.expect("append chunk");
 		}
@@ -1533,13 +1712,13 @@ mod tests {
 				.expect("first attempt chunk")
 				.expect("first attempt chunk ok")
 				.bytes,
-			chunks[0]
+			payloads[0].bytes
 		);
 
 		let mut retry = store
 			.pull_live(address, AttemptId::first())
 			.expect("retry live pull");
-		for chunk in &chunks {
+		for payload in &payloads {
 			assert_eq!(
 				retry
 					.next()
@@ -1547,7 +1726,7 @@ mod tests {
 					.expect("retry chunk")
 					.expect("retry chunk ok")
 					.bytes,
-				*chunk
+				payload.bytes
 			);
 		}
 		store
@@ -1562,7 +1741,7 @@ mod tests {
 			..QueryBudget::test_default()
 		}));
 		let address = address(AttemptId::first());
-		store.open_live(address).expect("open live");
+		store.open_live(address, test_schema()).expect("open live");
 
 		let rejected = store
 			.append_live(payload_with_bytes(
@@ -1613,13 +1792,90 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn seal_live_reserves_materialized_sealed_payload() {
+		let store = InMemoryPartitionStore::with_budget(QueryBudget {
+			shuffle_bytes_published_per_task: ByteCount::new(1_000_000),
+			..QueryBudget::test_default()
+		});
+		let address = address(AttemptId::first());
+		let payload = ipc_payload(address, &[1, 2, 3]);
+
+		store.open_live(address, test_schema()).expect("open live");
+		store
+			.append_live(payload.clone())
+			.await
+			.expect("append live");
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			payload.size_bytes()
+		);
+
+		store.seal_live(manifest(&payload)).expect("seal live");
+		let pulled = store
+			.pull(address, AttemptId::first())
+			.expect("sealed pull");
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			payload.size_bytes().saturating_add(pulled.size_bytes())
+		);
+
+		store.remove_query(address.query_id);
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			ByteCount::ZERO
+		);
+	}
+
+	#[tokio::test]
+	async fn seal_live_over_shuffle_budget_is_rejected_without_partial_publish() {
+		let address = address(AttemptId::first());
+		let payload = ipc_payload(address, &[1, 2, 3]);
+		let store = InMemoryPartitionStore::with_budget(QueryBudget {
+			shuffle_bytes_published_per_task: payload.size_bytes(),
+			..QueryBudget::test_default()
+		});
+		let key = ManifestKey::from_address(address);
+
+		store.open_live(address, test_schema()).expect("open live");
+		store
+			.append_live(payload.clone())
+			.await
+			.expect("append live");
+		let rejected = store.seal_live(manifest(&payload));
+
+		assert!(matches!(
+			rejected,
+			Err(PartitionStoreError::BudgetExhausted {
+				dimension: BudgetDimension::ShuffleBytes,
+				..
+			})
+		));
+		assert_eq!(store.manifest(key), None);
+		assert_eq!(
+			store.pull(address, AttemptId::first()),
+			Err(PartitionMissingReason::StoreEvicted)
+		);
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			payload.size_bytes()
+		);
+		store.remove_query(address.query_id);
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			ByteCount::ZERO
+		);
+	}
+
+	#[tokio::test]
 	async fn live_seal_surfaces_manifest_and_sealed_pull() {
 		let store = InMemoryPartitionStore::new();
-		let payload = payload(address(AttemptId::first()));
+		let payload = ipc_payload(address(AttemptId::first()), &[1, 2, 3]);
 		let manifest = manifest(&payload);
 		let key = ManifestKey::from_manifest(&manifest);
 
-		store.open_live(payload.address).expect("open live");
+		store
+			.open_live(payload.address, test_schema())
+			.expect("open live");
 		store
 			.append_live(payload.clone())
 			.await
@@ -1648,7 +1904,9 @@ mod tests {
 		let manifest = manifest(&sealed_payload);
 		let key = ManifestKey::from_manifest(&manifest);
 
-		store.open_live(live_payload.address).expect("open live");
+		store
+			.open_live(live_payload.address, test_schema())
+			.expect("open live");
 		store.append_live(live_payload).await.expect("append live");
 		store
 			.publish(manifest.clone(), vec![sealed_payload.clone()])

@@ -9,6 +9,7 @@ use crate::audit::{
 };
 use crate::binder::PlannerConfig;
 use crate::catalog::Catalog;
+use crate::distributed::arrow_ipc::{decode_record_batches, encode_record_batch};
 use crate::distributed::budget::{BudgetDimension, ByteCount};
 use crate::distributed::cancellation::{
 	ActiveQueryHandle, ActiveTaskRegistry, DownstreamCancellationContext,
@@ -21,8 +22,8 @@ use crate::distributed::partition_store::{
 use crate::distributed::scheduler::{DispatchOutcome, TaskDispatcher};
 use crate::distributed::task::{
 	ArrowIpcDigest, LiveProducerPartitionRef, PartitionAddress, PartitionBackend, PartitionCount,
-	PartitionManifest, RowCount, ShufflePartitionRef, TaskCompletionOutput, TaskInputBinding,
-	TaskOutputBinding, TaskSpec, TaskTelemetry, TaskTelemetryLabels,
+	PartitionEntry, PartitionManifest, RowCount, ShufflePartitionRef, TaskCompletionOutput,
+	TaskInputBinding, TaskOutputBinding, TaskSpec, TaskTelemetry, TaskTelemetryLabels,
 	is_streamable_exchange_producer, is_streamable_final_result, is_streamable_shuffle_consumer,
 	shuffle_input_table_id,
 };
@@ -31,7 +32,7 @@ use crate::error::{
 	ExecutionError, PartitionMissingReason, QueryError, RuntimeError, StorageError,
 	TaskFailureKind, WireError,
 };
-use crate::exec::{ExecutionContext, Executor};
+use crate::exec::{ExecutionContext, Executor, runtime_filter::RuntimeFilterFragmentBuilder};
 use crate::ir::{
 	BoundExprProgram, ExecutionPlan, FilterDisposition, JoinStrategy, MorselId, TableId,
 };
@@ -44,8 +45,6 @@ use crate::wire::{
 };
 use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use std::collections::{HashMap, VecDeque};
@@ -301,9 +300,27 @@ impl ToronWorker {
 					(executor.execute_bound(&spec.plan, morsel).await?, None)
 				};
 			record_worker_telemetry(&telemetry, |task| {
-				task.counters.emitted_rows =
-					results.iter().map(RecordBatch::num_rows).sum::<usize>() as u64 + streamed_rows;
-				task.counters.emitted_batches = results.len() as u64 + streamed_batches;
+				let (result_rows, result_batches) = match &output {
+					Some(TaskCompletionOutput::ShuffleProducer { manifest })
+						if is_streamable_exchange_producer(spec) && results.is_empty() =>
+					{
+						(
+							manifest
+								.partitions
+								.iter()
+								.map(|partition| partition.row_count.get())
+								.sum::<u64>(),
+							u64::try_from(manifest.partitions.len())
+								.expect("manifest partition count fits u64"),
+						)
+					}
+					_ => (
+						results.iter().map(RecordBatch::num_rows).sum::<usize>() as u64,
+						results.len() as u64,
+					),
+				};
+				task.counters.emitted_rows = result_rows.saturating_add(streamed_rows);
+				task.counters.emitted_batches = result_batches.saturating_add(streamed_batches);
 				task.phases.batch_encode_micros = task
 					.phases
 					.batch_encode_micros
@@ -460,6 +477,7 @@ impl ToronWorker {
 			self.partition_store
 				.open_live_with_downstream_cancellation(
 					*address,
+					schema.clone(),
 					task_context.downstream_cancellation.clone(),
 				)
 				.map_err(partition_store_publish_error)?;
@@ -467,35 +485,53 @@ impl ToronWorker {
 
 		let executor = Executor::with_context(self.storage.clone(), task_context);
 		let partition_store = self.partition_store.clone();
-		let mut partition_batches: Vec<Vec<RecordBatch>> =
-			(0..partition_count_usize).map(|_| Vec::new()).collect();
 		let mut append_sink = LiveAppendStreamableBatchSink {
 			executor: &executor,
 			partition_store,
 			addresses: &addresses,
 			partition_count: *partition_count,
 			partition_key,
-			partition_batches: &mut partition_batches,
+			runtime_filter_builder: RuntimeFilterFragmentBuilder::new(partition_key),
+			partition_row_counts: vec![0; partition_count_usize],
+			partition_chunk_counts: vec![0; partition_count_usize],
+			emitted_rows: 0,
+			emitted_batches: 0,
 		};
 		drive_streamable_plan(input, &executor, morsel, &mut append_sink).await?;
+		let runtime_filter_fragment = append_sink
+			.runtime_filter_builder
+			.take()
+			.map(RuntimeFilterFragmentBuilder::finish)
+			.transpose()?
+			.flatten();
 
-		let results = partition_batches
-			.into_iter()
-			.map(|batches| {
-				if batches.is_empty() {
-					Ok(RecordBatch::new_empty(schema.clone()))
-				} else {
-					Ok(arrow::compute::concat_batches(&schema, &batches)?)
-				}
-			})
-			.collect::<Result<Vec<_>, QueryError>>()?;
-		let output = self.publish_task_output(spec.identity, spec, &results)?;
-		if let TaskCompletionOutput::ShuffleProducer { manifest } = &output {
-			self.partition_store
-				.seal_live(manifest.clone())
-				.map_err(partition_store_publish_error)?;
-		}
-		Ok((results, Some(output)))
+		let manifest = PartitionManifest {
+			query_id: spec.identity.query_id,
+			stage_id: spec.identity.stage_id,
+			task_id: spec.identity.task_id,
+			attempt_id: spec.identity.attempt_id,
+			exchange_id: *exchange_id,
+			producer_worker_id: self.worker_id,
+			producer_endpoint: self.endpoint.clone(),
+			partitions: (0..partition_count.get())
+				.map(|partition| PartitionEntry {
+					partition_id: PartitionId::new(partition),
+					size_bytes: ByteCount::ZERO,
+					row_count: RowCount::new(0),
+					digest: ArrowIpcDigest::new([0; 32]),
+				})
+				.collect(),
+			runtime_filter_fragment,
+			backend: PartitionBackend::InMemory,
+		};
+		let manifest = self
+			.partition_store
+			.seal_live(manifest)
+			.map_err(partition_store_publish_error)?;
+		Ok((
+			Vec::new(),
+			Some(TaskCompletionOutput::ShuffleProducer { manifest }),
+		))
 	}
 
 	async fn execute_live_shuffle_consumer(
@@ -704,9 +740,12 @@ impl ToronWorker {
 								let encoded_batch = match encode_record_batch(batch) {
 									Ok(encoded_batch) => encoded_batch,
 									Err(error) => {
-										let error = match audit_recorder.record_failed(&error).await
+										let query_error: QueryError = error.into();
+										let error = match audit_recorder
+											.record_failed(&query_error)
+											.await
 										{
-											Ok(()) => error,
+											Ok(()) => query_error,
 											Err(audit_error) => {
 												tracing::warn!(error = %audit_error, "required worker failure audit unavailable");
 												audit_unavailable_task_error()
@@ -2595,10 +2634,165 @@ mod tests {
 		);
 		release_tail.notify_waiters();
 		let report = task.await.expect("producer task");
+		let manifest = match report.output {
+			Some(TaskCompletionOutput::ShuffleProducer { manifest }) => manifest,
+			other => panic!("expected shuffle output, got {other:?}"),
+		};
+		assert!(report.results.is_empty());
+		assert_eq!(
+			manifest
+				.partitions
+				.iter()
+				.map(|partition| partition.row_count.get())
+				.sum::<u64>(),
+			4
+		);
+		assert_eq!(report.telemetry.counters.emitted_rows, 4);
+		assert_eq!(report.telemetry.counters.emitted_batches, 1);
+	}
+
+	async fn run_single_partition_live_shuffle_producer(rows: Vec<i64>) -> TaskExecutionReport {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(rows))])
+			.expect("live producer batch");
+		let worker = ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan { table_data: batch }),
+			Arc::new(MemoryManager::new(8, 1024 * 1024)),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(1260),
+			WorkerEndpoint::new("local"),
+		);
+		let spec = TaskSpec {
+			identity: TaskIdentity::new(
+				QueryId::from_u128(1260),
+				StageId::new(0),
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: ExecutionPlan::Exchange {
+				input: Box::new(scan(TableId(1), 1)),
+				partition_count: 1,
+				key: BoundExprProgram::empty(),
+			},
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::ShuffleProducer {
+				exchange_id: ExchangeId::new(1260),
+				partition_count: PartitionCount::new(1),
+				partition_key: BoundExprProgram::empty(),
+			},
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+
+		worker
+			.execute_task_local_with_telemetry(&spec, None)
+			.await
+			.expect("live shuffle producer")
+	}
+
+	#[tokio::test]
+	async fn live_shuffle_producer_returns_no_result_batches() {
+		let report = run_single_partition_live_shuffle_producer(vec![1, 2, 3]).await;
+		assert!(report.results.is_empty());
 		assert!(matches!(
 			report.output,
 			Some(TaskCompletionOutput::ShuffleProducer { .. })
 		));
+	}
+
+	#[tokio::test]
+	async fn live_shuffle_producer_telemetry_uses_manifest_rows() {
+		let report = run_single_partition_live_shuffle_producer(vec![1, 2, 3, 4]).await;
+		assert!(report.results.is_empty());
+		assert_eq!(report.telemetry.counters.emitted_rows, 4);
+		assert_eq!(report.telemetry.counters.emitted_batches, 1);
+	}
+
+	#[tokio::test]
+	async fn live_shuffle_worker_sends_no_task_batch_for_shuffle_producer() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+		)
+		.expect("batch");
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan { table_data: batch }),
+			memory.clone(),
+			Arc::new(InMemoryPartitionStore::new()),
+			WorkerId::from_u128(126),
+			WorkerEndpoint::new("local"),
+		));
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(126),
+			StageId::new(0),
+			TaskId::new(0),
+			AttemptId::first(),
+		);
+		let exchange_id = ExchangeId::new(126);
+		let spec = TaskSpec {
+			identity,
+			partition: None,
+			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			plan: ExecutionPlan::Exchange {
+				input: Box::new(scan(TableId(1), 1)),
+				partition_count: 1,
+				key: BoundExprProgram::empty(),
+			},
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
+			output: TaskOutputBinding::ShuffleProducer {
+				exchange_id,
+				partition_count: PartitionCount::new(1),
+				partition_key: BoundExprProgram::empty(),
+			},
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let (mut client, server) = test_duplex(1024 * 1024);
+		let worker_handle = tokio::spawn(async move { worker.handle_connection(server).await });
+
+		send_payload(
+			&mut client,
+			MessageKind::StartTask,
+			EnvelopeIdentity::task(identity),
+			None,
+			&StartTaskPayload { spec },
+		)
+		.await
+		.expect("send start task");
+		let started = read_envelope(&mut client, memory.as_ref())
+			.await
+			.expect("read task started");
+		assert_eq!(started.kind, MessageKind::TaskStarted);
+		let complete = read_envelope(&mut client, memory.as_ref())
+			.await
+			.expect("read task complete");
+		assert_eq!(complete.kind, MessageKind::TaskComplete);
+		let payload: TaskCompletePayload = decode_payload(&complete.payload).expect("complete");
+		let TaskCompletionOutput::ShuffleProducer { manifest } = payload.output else {
+			panic!("expected shuffle output");
+		};
+		assert_eq!(manifest.partitions.len(), 1);
+		assert_eq!(manifest.partitions[0].row_count, RowCount::new(3));
+		assert_eq!(
+			payload.telemetry.expect("telemetry").counters.emitted_rows,
+			3
+		);
+
+		drop(client);
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
 	}
 
 	#[tokio::test]
@@ -2730,7 +2924,7 @@ mod tests {
 			attempt_id: AttemptId::first(),
 			partition_id: PartitionId::new(0),
 		};
-		store.open_live(address).expect("open live");
+		store.open_live(address, batch.schema()).expect("open live");
 		let bytes = encode_record_batch(&batch).expect("encode");
 		store
 			.append_live(PartitionPayload::new(
@@ -2982,7 +3176,7 @@ mod tests {
 		worker_id: WorkerId,
 		endpoint: WorkerEndpoint,
 	) {
-		store.open_live(address).expect("open live");
+		store.open_live(address, batch.schema()).expect("open live");
 		let bytes = encode_record_batch(batch).expect("encode live batch");
 		let payload = PartitionPayload::new(
 			address,
@@ -3224,39 +3418,49 @@ struct LiveAppendStreamableBatchSink<'a> {
 	addresses: &'a [PartitionAddress],
 	partition_count: PartitionCount,
 	partition_key: &'a BoundExprProgram,
-	partition_batches: &'a mut Vec<Vec<RecordBatch>>,
+	runtime_filter_builder: Option<RuntimeFilterFragmentBuilder>,
+	partition_row_counts: Vec<u64>,
+	partition_chunk_counts: Vec<u64>,
+	emitted_rows: u64,
+	emitted_batches: u64,
 }
 
 impl StreamableBatchSink for LiveAppendStreamableBatchSink<'_> {
 	fn emit<'a>(&'a mut self, batch: RecordBatch) -> StreamableBatchFuture<'a> {
 		Box::pin(async move {
-			for (partition, partition_batch) in partition_record_batch(
+			let partitioned_batches = partition_record_batch(
 				self.executor,
 				&batch,
 				self.partition_count.get(),
 				self.partition_key,
-			)?
-			.into_iter()
-			.enumerate()
-			{
+			)?;
+			if let Some(builder) = &mut self.runtime_filter_builder {
+				builder.push_batch(&batch)?;
+			}
+			for (partition, partition_batch) in partitioned_batches.into_iter().enumerate() {
 				let Some(partition_batch) = partition_batch else {
 					continue;
 				};
+				let row_count =
+					u64::try_from(partition_batch.num_rows()).expect("row count fits u64");
 				let bytes = encode_record_batch(&partition_batch)?;
 				let digest = ArrowIpcDigest::new(wendelon::hash::blake3::digest(&bytes));
 				let payload = PartitionPayload::new(
 					self.addresses[partition],
 					bytes,
-					RowCount::new(
-						u64::try_from(partition_batch.num_rows()).expect("row count fits u64"),
-					),
+					RowCount::new(row_count),
 					digest,
 				);
 				self.partition_store
 					.append_live(payload)
 					.await
 					.map_err(partition_store_publish_error)?;
-				self.partition_batches[partition].push(partition_batch);
+				self.partition_row_counts[partition] =
+					self.partition_row_counts[partition].saturating_add(row_count);
+				self.partition_chunk_counts[partition] =
+					self.partition_chunk_counts[partition].saturating_add(1);
+				self.emitted_rows = self.emitted_rows.saturating_add(row_count);
+				self.emitted_batches = self.emitted_batches.saturating_add(1);
 			}
 			Ok(true)
 		})
@@ -3683,7 +3887,7 @@ impl StorageScan for LiveInputStorageScan {
 								Ok(batches) => state.pending.extend(batches),
 								Err(error) => {
 									return Some((
-										Err(storage_error_from_query_error(error)),
+										Err(storage_error_from_query_error(error.into())),
 										state,
 									));
 								}
@@ -3957,8 +4161,7 @@ impl ToronCoordinator {
 						});
 					}
 					let batch_decode_started = Instant::now();
-					let mut reader = StreamReader::try_new(payload.payload.as_slice(), None)?;
-					while let Some(batch) = reader.next().transpose()? {
+					for batch in decode_record_batches(payload.payload.as_slice())? {
 						if forward_final_batches {
 							if let Some(batch_sent) = &final_result_batch_sent {
 								batch_sent.store(true, Ordering::SeqCst);
@@ -4228,25 +4431,6 @@ fn task_envelope_identity(identity: EnvelopeIdentity) -> Result<TaskIdentity, Qu
 			expected: "task envelope identity",
 		}),
 	}
-}
-
-fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, QueryError> {
-	let mut buffer = Vec::new();
-	{
-		let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())?;
-		writer.write(batch)?;
-		writer.finish()?;
-	}
-	Ok(buffer)
-}
-
-fn decode_record_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, QueryError> {
-	let mut reader = StreamReader::try_new(bytes, None)?;
-	let mut batches = Vec::new();
-	while let Some(batch) = reader.next().transpose()? {
-		batches.push(batch);
-	}
-	Ok(batches)
 }
 
 fn partition_missing_error(reason: PartitionMissingReason) -> QueryError {
