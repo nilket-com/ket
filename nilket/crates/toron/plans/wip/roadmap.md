@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–130 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–131 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,32 +46,35 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 130 promoted; ADR 131 candidates
+### ADR 131 promoted; ADR 132 candidates
 
-ADR 130 promoted **Right-Side Build Selection (Tiny-Right Broadcast Inference)**
-— the second auto rule on 129's optimizer fact spine, delivering the canonical
-star-schema win `SELECT * FROM fact f JOIN dim d` (dim on the right) that 129
-left as hash. A new arm in `choose_auto_join_strategy` reads the parked
-`_right_facts`; right-build is a **binder-only physical swap** (operands + paired
-keys) reusing the existing left-build broadcast contract, then a **restoring
-`Project`** preserves declared `(fact, dim)` column order. Grounded: 105's
-project fusion does NOT elide a reorder permutation (`binder.rs:4783`), so the
-projection is a permanent but cheap `ArrayRef`-clone column permutation — named,
-not hidden. INNER-only;
-single-base build **and** probe (probe-side fence defers multi-way ordering);
-left wins ties; reuses 129's dark-launch config + hard-byte facts; pinned hints
-unchanged. No `ExecutionPlan::Join`/executor/fragmenter/wire change (build side
-is a binder-local decision receipt, no new `JoinStrategy` variant). Genuine
-3-of-3 at mechanism level. Load-bearing gate: `SELECT *` byte-identical (column
-order AND digest) swapped-broadcast vs hash.
+ADR 131 promoted **Scan-linear Broadcast Probe Eligibility** — corrects ADR 130's
+over-strict probe fence (which silently regressed 129) by splitting build
+eligibility (a *fact* predicate: single base relation + hard byte bound) from
+probe eligibility (a *plan-shape* predicate). The probe may now be **scan-linear**
+— a `Scan { row_limit: None }` optionally wrapped in row-local `Filter`/`Project`
+— restoring the filtered/projected-fact star-schema path 130 narrowed
+(`dim JOIN (fact WHERE …)` and `(fact WHERE …) JOIN dim`). Grounded in the
+share-scan substrate: the broadcast consumer applies the probe per morsel
+(`TaskInputBinding::Scan { share }`), so nested-join (not recursively fragmented),
+aggregate/sort/take (global/ordering), exchange (repartition), limited-scan
+(per-worker limit), system-table probes (duplicate per worker), and empty probes
+(unneeded for this cut) stay hash. `bind_join` computes two
+scan-linear bools and passes them via `JoinInputOptimization` into the single
+`choose_auto_join_strategy` seam; the predicate is an **exhaustive**
+`ExecutionPlan` walk (compiler forces a decision on new variants). 130's swap +
+restoring projection and left-wins tie are unchanged; the 130 single-seam guard
+is **retargeted**, not deleted. Genuine 3-of-3. Load-bearing gate:
+`left_tiny_with_filtered_probe_infers_broadcast` fails on the pre-131 code.
 
-**ADR 131 lead candidates:** smaller-of-two cost comparison (the first real
-cost *weigh* vs. 129/130's single-side thresholds); build-side independence
-(Fork B — drop 130's restoring projection if a workload justifies it); multi-way
-star-join ordering (lifts 130's probe-side fence); Wendelon-backed live
-table-size facts (storage-ring producer — flips dark-launch to default-on);
-selectivity propagation; optimizer `EXPLAIN` over the reason receipts.
-Evidence-gate the pick on the 130 feat.
+**ADR 132 lead candidates:** smaller-build dominance comparator (the first real
+cost *weigh* — choose the materially-smaller build when both sides are eligible,
+with a named left-biased margin, on the now-honest predicate); multi-way
+star-join ordering (133+ — lifts the nested-join probe fence; needs recursive
+fragmentation of a nested broadcast probe, real substrate work); Wendelon-backed
+live table-size facts (storage-ring producer — flips dark-launch to default-on);
+selectivity propagation; optimizer `EXPLAIN` over the reason receipts (now able
+to report `ProbeNotScanLinear`). Evidence-gate the pick on the 131 feat.
 
 ### ADR 129 promoted (HISTORICAL)
 
