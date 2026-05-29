@@ -1729,9 +1729,7 @@ pub(crate) fn adr122_join_builder_is_pair_shaped_and_shared() {
 	assert!(builder.contains("LogicalPlan::Join"));
 	assert!(builder.contains("JoinStrategy::HashPartitioned"));
 	assert!(builder.contains("JoinStrategy::Broadcast"));
-	assert!(planner.contains(
-		"plan = build_join_plan(plan, right, kind, on, JoinStrategy::HashPartitioned)?;"
-	));
+	assert!(planner.contains("build_join_plan(plan, right, kind, on, strategy)?"));
 	assert!(lower_exists.contains("build_join_plan("));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
 	assert!(
@@ -1879,17 +1877,84 @@ pub(crate) fn adr125_no_executor_fragmenter_binder_pbc_wendelon_change() {
 }
 
 #[test]
-pub(crate) fn adr125_no_sql_hint_authoring_yet() {
+pub(crate) fn adr128_sql_broadcast_hint_authoring_is_narrow() {
 	let planner = sql_planner_source();
+	let lower_select = source_block(&planner, "fn lower_select");
 	let lower_exists = source_block(&planner, "fn lower_exists_join");
 
-	assert!(planner.contains(
-		"plan = build_join_plan(plan, right, kind, on, JoinStrategy::HashPartitioned)?;"
-	));
+	assert!(planner.contains("OptimizerHint"));
+	assert!(planner.contains("OptimizerHintStyle"));
+	assert!(planner.contains("fn parse_broadcast_join_hint"));
+	assert!(planner.contains("fn parse_broadcast_hint_text"));
+	assert!(planner.contains("BROADCAST"));
+	assert!(lower_select.contains("parse_broadcast_join_hint(optimizer_hints)?"));
+	assert!(lower_select.contains("join_strategy_for_hint"));
+	assert!(lower_select.contains("build_join_plan(plan, right, kind, on, strategy)?"));
+	assert!(planner.contains("JoinStrategy::Broadcast"));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
 	assert!(!lower_exists.contains("JoinStrategy::Broadcast"));
-	assert!(!planner.contains("broadcast hint"));
-	assert!(!planner.contains("BROADCAST"));
+	assert!(planner.contains("only /*+ BROADCAST(alias) */ optimizer hints are supported"));
+}
+
+#[test]
+pub(crate) fn adr128_generic_dialect_remains_the_sql_dialect() {
+	let planner = sql_planner_source();
+	let parse_broadcast_join_hint = source_block(&planner, "fn parse_broadcast_join_hint");
+	let parse_broadcast_hint_text = source_block(&planner, "fn parse_broadcast_hint_text");
+
+	assert!(planner.contains("use sqlparser::dialect::GenericDialect;"));
+	assert!(planner.matches("GenericDialect {}").count() >= 2);
+	assert!(!planner.contains("ToronDialect"));
+	assert!(!planner.contains("AnsiDialect"));
+	assert!(!parse_broadcast_join_hint.contains("Parser::parse_sql"));
+	assert!(!parse_broadcast_hint_text.contains("Parser::parse_sql"));
+}
+
+#[test]
+pub(crate) fn adr128_broadcast_hint_recognizer_consumes_optimizer_hint_text() {
+	let planner = sql_planner_source();
+	let parse_broadcast_join_hint = source_block(&planner, "fn parse_broadcast_join_hint");
+	let parse_broadcast_hint_text = source_block(&planner, "fn parse_broadcast_hint_text");
+
+	assert!(parse_broadcast_join_hint.contains("hints: &[OptimizerHint]"));
+	assert!(parse_broadcast_join_hint.contains("OptimizerHintStyle::MultiLine"));
+	assert!(parse_broadcast_join_hint.contains("parse_broadcast_hint_text(&hint.text)"));
+	assert!(parse_broadcast_hint_text.contains("text: &str"));
+	assert!(parse_broadcast_hint_text.contains("BROADCAST"));
+	assert!(!parse_broadcast_join_hint.contains("sql: &str"));
+	assert!(!parse_broadcast_hint_text.contains("sql: &str"));
+}
+
+#[test]
+pub(crate) fn adr128_broadcast_hints_do_not_touch_execution_substrate() {
+	let manifest_dir = manifest_dir();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/pbc.rs"),
+		manifest_dir.join("src/binder.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read Toron source");
+		assert!(
+			!source.contains("ADR 128") && !source.contains("adr128"),
+			"ADR 128 marker leaked into {}",
+			path.display()
+		);
+	}
+
+	let mut offenders = source_lines(&manifest_dir.join("src/distributed"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("ADR 128") || line.contains("adr128"))
+		.collect::<Vec<_>>();
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| line.contains("ADR 128") || line.contains("adr128")),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR 128 marker leaked into executor-adjacent code:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
 }
 
 #[test]

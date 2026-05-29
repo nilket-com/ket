@@ -665,6 +665,49 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn sql_broadcast_hint_digest_matches_hash_join_over_tcp() {
+		let hash_results = run_distributed_join_query(sql_hash_join_plan(), 16).await;
+		let broadcast_results = run_distributed_join_query(sql_broadcast_join_plan(), 3).await;
+		let rune_broadcast_results =
+			run_distributed_join_query(rune_broadcast_join_plan().await, 3).await;
+
+		let hash_digest =
+			canonical_arrow_ipc_digest(&hash_results, SortPolicy::FullRowLex).expect("hash digest");
+		let broadcast_digest =
+			canonical_arrow_ipc_digest(&broadcast_results, SortPolicy::FullRowLex)
+				.expect("SQL broadcast digest");
+		let rune_digest =
+			canonical_arrow_ipc_digest(&rune_broadcast_results, SortPolicy::FullRowLex)
+				.expect("Rune broadcast digest");
+
+		assert_eq!(broadcast_digest, hash_digest);
+		assert_eq!(broadcast_digest, rune_digest);
+	}
+
+	#[tokio::test]
+	async fn sql_broadcast_hint_respects_cap_terminally() {
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+
+		let err =
+			run_distributed_join_query_with_budget(sql_broadcast_join_plan(), 2, query_budget)
+				.await
+				.expect_err("SQL broadcast cap must fail");
+
+		assert!(matches!(
+			err,
+			QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::BroadcastReplication,
+					..
+				},
+				..
+			})
+		));
+	}
+
+	#[tokio::test]
 	async fn shuffle_task_complete_publishes_partition_manifest() {
 		let schema = Arc::new(Schema::new(vec![
 			Field::new("key", DataType::Int32, false),
@@ -1429,6 +1472,20 @@ mod tests {
 			)],
 			strategy: JoinStrategy::HashPartitioned,
 		}
+	}
+
+	fn sql_hash_join_plan() -> LogicalPlan {
+		crate::sql_planner::SqlPlanner::new()
+			.plan("SELECT * FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
+			.expect("SQL hash join plan")
+	}
+
+	fn sql_broadcast_join_plan() -> LogicalPlan {
+		crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("SQL broadcast join plan")
 	}
 
 	async fn rune_hash_join_plan() -> LogicalPlan {

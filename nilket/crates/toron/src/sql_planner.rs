@@ -12,9 +12,9 @@ use sqlparser::ast::{
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, Delete,
 	ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
 	FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident, Insert,
-	JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderBy,
-	OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableConstraint,
-	TableFactor, TableObject, UnaryOperator, Value,
+	JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType,
+	OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr,
+	Statement, TableAlias, TableConstraint, TableFactor, TableObject, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -50,6 +50,12 @@ const STORAGE_SYNTHETIC_COLUMN_NAMES: &[&str] = &[
 	STORAGE_ROW_TOMBSTONE_COLUMN,
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BroadcastJoinHint {
+	target: TableRef,
+	consumed: bool,
+}
+
 fn object_name_part_ident<'a>(
 	part: &'a ObjectNamePart,
 	context: &str,
@@ -78,6 +84,77 @@ fn stripped_sql_value(expr: &SqlExpr) -> Option<&Value> {
 
 fn expr_is_null_literal(expr: &SqlExpr) -> bool {
 	matches!(stripped_sql_value(expr), Some(Value::Null))
+}
+
+fn parse_broadcast_join_hint(
+	hints: &[OptimizerHint],
+) -> Result<Option<BroadcastJoinHint>, FrontendError> {
+	if hints.is_empty() {
+		return Ok(None);
+	}
+	if hints.len() != 1 {
+		return Err(unsupported(
+			"only one /*+ BROADCAST(alias) */ optimizer hint is supported",
+		));
+	}
+
+	let hint = &hints[0];
+	if !hint.prefix.is_empty() || !matches!(&hint.style, OptimizerHintStyle::MultiLine) {
+		return Err(unsupported(
+			"only /*+ BROADCAST(alias) */ optimizer hints are supported",
+		));
+	}
+
+	Ok(Some(BroadcastJoinHint {
+		target: parse_broadcast_hint_text(&hint.text)?,
+		consumed: false,
+	}))
+}
+
+fn parse_broadcast_hint_text(text: &str) -> Result<TableRef, FrontendError> {
+	const BROADCAST: &str = "BROADCAST";
+	let text = text.trim();
+	if text.len() < BROADCAST.len() {
+		return Err(unsupported(
+			"only /*+ BROADCAST(alias) */ optimizer hints are supported",
+		));
+	}
+	let (keyword, rest) = text.split_at(BROADCAST.len());
+	if !keyword.eq_ignore_ascii_case(BROADCAST) {
+		return Err(unsupported(
+			"only /*+ BROADCAST(alias) */ optimizer hints are supported",
+		));
+	}
+	let rest = rest.trim_start();
+	let Some(rest) = rest.strip_prefix('(') else {
+		return Err(unsupported(
+			"only /*+ BROADCAST(alias) */ optimizer hints are supported",
+		));
+	};
+	let Some(close_paren) = rest.find(')') else {
+		return Err(unsupported(
+			"only /*+ BROADCAST(alias) */ optimizer hints are supported",
+		));
+	};
+	let target = rest[..close_paren].trim();
+	let trailing = rest[close_paren + 1..].trim();
+	if !trailing.is_empty() || !is_unquoted_ascii_identifier(target) {
+		return Err(unsupported(
+			"only /*+ BROADCAST(alias) */ optimizer hints are supported",
+		));
+	}
+	Ok(TableRef::new(target.to_string()))
+}
+
+fn is_unquoted_ascii_identifier(value: &str) -> bool {
+	let mut bytes = value.bytes();
+	let Some(first) = bytes.next() else {
+		return false;
+	};
+	if !(first.is_ascii_alphabetic() || first == b'_') {
+		return false;
+	}
+	bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn is_row_value_expr(expr: &SqlExpr) -> bool {
@@ -2557,9 +2634,7 @@ impl SqlPlanner {
 		} = select;
 		let _parser_metadata_only = (select_token, top_before_distinct, window_before_qualify);
 
-		if !optimizer_hints.is_empty() {
-			return Err(unsupported("optimizer hints are not supported"));
-		}
+		let mut broadcast_hint = parse_broadcast_join_hint(optimizer_hints)?;
 		if distinct.is_some() {
 			return Err(unsupported("DISTINCT is not supported"));
 		}
@@ -2643,8 +2718,10 @@ impl SqlPlanner {
 			}
 			let right = self.lower_table_factor(&join.relation)?;
 			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
-			plan = build_join_plan(plan, right, kind, on, JoinStrategy::HashPartitioned)?;
+			let strategy = join_strategy_for_hint(&mut broadcast_hint, &plan, &right, kind)?;
+			plan = build_join_plan(plan, right, kind, on, strategy)?;
 		}
+		reject_unused_broadcast_hint(&broadcast_hint)?;
 
 		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation)
 		if let Some(selection) = selection {
@@ -6158,6 +6235,76 @@ fn expr_side(expr: &Expr, left: &[TableRef], right: &[TableRef]) -> Option<JoinS
 	}
 }
 
+fn join_strategy_for_hint(
+	broadcast_hint: &mut Option<BroadcastJoinHint>,
+	left: &LogicalPlan,
+	right: &LogicalPlan,
+	kind: JoinKind,
+) -> Result<JoinStrategy, FrontendError> {
+	let Some(hint) = broadcast_hint.as_mut() else {
+		return Ok(JoinStrategy::HashPartitioned);
+	};
+	if hint.consumed {
+		return Ok(JoinStrategy::HashPartitioned);
+	}
+
+	let left_qualifiers = plan_qualifiers(left);
+	let right_qualifiers = plan_qualifiers(right);
+	let left_matches = qualifier_match_count(&left_qualifiers, &hint.target);
+	let right_matches = qualifier_match_count(&right_qualifiers, &hint.target);
+
+	if left_matches + right_matches > 1 {
+		return Err(unsupported(format!(
+			"broadcast hint target `{}` is ambiguous",
+			hint.target.table
+		)));
+	}
+	if right_matches > 0 {
+		return Err(unsupported(format!(
+			"broadcast hint target `{}` must be the left/build side of the join",
+			hint.target.table
+		)));
+	}
+	if left_matches > 0 {
+		if left_qualifiers.len() != 1 {
+			return Err(unsupported(format!(
+				"broadcast hint target `{}` is inside a composite left join input",
+				hint.target.table
+			)));
+		}
+		if kind != JoinKind::Inner {
+			return Err(unsupported(
+				"broadcast join is only supported for INNER joins",
+			));
+		}
+		hint.consumed = true;
+		return Ok(JoinStrategy::Broadcast);
+	}
+
+	Ok(JoinStrategy::HashPartitioned)
+}
+
+fn qualifier_match_count(qualifiers: &[TableRef], target: &TableRef) -> usize {
+	qualifiers
+		.iter()
+		.filter(|qualifier| *qualifier == target)
+		.count()
+}
+
+fn reject_unused_broadcast_hint(
+	broadcast_hint: &Option<BroadcastJoinHint>,
+) -> Result<(), FrontendError> {
+	if let Some(hint) = broadcast_hint
+		&& !hint.consumed
+	{
+		return Err(unsupported(format!(
+			"broadcast hint target `{}` did not match a left/build join input",
+			hint.target.table
+		)));
+	}
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -6294,6 +6441,140 @@ mod tests {
 	}
 
 	#[test]
+	fn generic_dialect_preserves_select_optimizer_hints() {
+		let select = parse_select(
+			"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+		);
+
+		assert_eq!(select.optimizer_hints.len(), 1);
+		let hint = &select.optimizer_hints[0];
+		assert_eq!(hint.prefix, "");
+		assert_eq!(hint.text.trim(), "BROADCAST(c)");
+		assert!(matches!(hint.style, OptimizerHintStyle::MultiLine));
+	}
+
+	#[test]
+	fn sql_broadcast_hint_emits_broadcast_join_shape() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan broadcast join");
+
+		match plan {
+			LogicalPlan::Join {
+				left,
+				right,
+				kind,
+				strategy,
+				on,
+			} => {
+				assert_eq!(kind, JoinKind::Inner);
+				assert_eq!(strategy, JoinStrategy::Broadcast);
+				assert_eq!(on.len(), 1);
+				match *left {
+					LogicalPlan::Exchange {
+						partition_count,
+						input,
+						..
+					} => {
+						assert_eq!(partition_count, 1);
+						assert!(matches!(
+							*input,
+							LogicalPlan::Alias {
+								ref alias,
+								..
+							} if alias == &TableRef::new("c")
+						));
+					}
+					other => panic!("expected broadcast build exchange, got {other:?}"),
+				}
+				assert!(matches!(
+					*right,
+					LogicalPlan::Alias {
+						ref alias,
+						..
+					} if alias == &TableRef::new("o")
+				));
+			}
+			other => panic!("expected join plan, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn sql_broadcast_hint_targeting_probe_rejects() {
+		assert_plan_rejects(
+			"SELECT /*+ BROADCAST(o) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			"left/build side",
+		);
+	}
+
+	#[test]
+	fn sql_broadcast_hint_non_inner_rejects() {
+		assert_plan_rejects(
+			"SELECT /*+ BROADCAST(c) */ * FROM customers c LEFT JOIN orders o ON c.id = o.customer_id",
+			"broadcast join is only supported for INNER joins",
+		);
+	}
+
+	#[test]
+	fn sql_broadcast_hint_malformed_unknown_duplicate_rejects() {
+		for sql in [
+			"SELECT /*+ FOO(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			"SELECT /*+ BROADCAST() */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			"SELECT /*+ BROADCAST(c, o) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			"SELECT /*+ BROADCAST(c) extra */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			"SELECT /*toron+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			"SELECT --+ BROADCAST(c)\n * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			"SELECT /*+ BROADCAST(c) */ /*+ BROADCAST(o) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+		] {
+			assert_plan_rejects(sql, "BROADCAST");
+		}
+	}
+
+	#[test]
+	fn sql_broadcast_hint_unused_rejects() {
+		assert_plan_rejects(
+			"SELECT /*+ BROADCAST(c) */ * FROM customers o INNER JOIN orders r ON o.id = r.customer_id",
+			"did not match",
+		);
+		assert_plan_rejects(
+			"SELECT /*+ BROADCAST(c) */ * FROM customers c",
+			"did not match",
+		);
+	}
+
+	#[test]
+	fn sql_broadcast_hint_composite_left_rejects() {
+		let left = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+		let right = LogicalPlan::ScanNamed {
+			table: TableRef::new("lineitem"),
+			projection: None,
+		};
+		let mut hint = Some(BroadcastJoinHint {
+			target: TableRef::new("customers"),
+			consumed: false,
+		});
+
+		let err = join_strategy_for_hint(&mut hint, &left, &right, JoinKind::Inner)
+			.expect_err("composite left broadcast should reject");
+
+		assert!(err.to_string().contains("composite left"), "{err}");
+	}
+
+	#[test]
 	fn build_join_plan_rejects_broadcast_non_inner_at_frontend() {
 		let err = build_join_plan(
 			LogicalPlan::ScanNamed {
@@ -6330,6 +6611,26 @@ mod tests {
 			)
 			.expect_err("classifier should reject");
 		assert!(err.to_string().contains("unsupported"), "{sql}: {err}");
+	}
+
+	fn assert_plan_rejects(sql: &str, expected: &str) {
+		let err = SqlPlanner::new().plan(sql).expect_err("SQL should reject");
+		assert!(
+			err.to_string().contains(expected),
+			"{sql}: expected `{expected}` in {err}"
+		);
+	}
+
+	fn parse_select(sql: &str) -> Select {
+		let dialect = GenericDialect {};
+		let mut ast = Parser::parse_sql(&dialect, sql).expect("parse sql");
+		let Statement::Query(query) = ast.remove(0) else {
+			panic!("expected query");
+		};
+		let SetExpr::Select(select) = *query.body else {
+			panic!("expected select");
+		};
+		*select
 	}
 
 	fn parse_selection(sql: &str) -> SqlExpr {
