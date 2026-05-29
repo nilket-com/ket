@@ -168,49 +168,64 @@ impl PartitionPayload {
 
 pub struct LivePartitionStream {
 	chunks: BoxStream<'static, Result<PartitionPayload, PartitionMissingReason>>,
-	cancel_on_drop: Option<LivePartitionCancelOnDrop>,
+	reader_guard: Option<LivePartitionReaderGuard>,
 }
 
-struct LivePartitionCancelOnDrop {
+struct LivePartitionReaderGuard {
 	inner: Arc<RwLock<PartitionStoreInner>>,
 	address: PartitionAddress,
 }
 
 impl LivePartitionStream {
-	fn with_cancel_on_drop(
+	fn without_reader_guard(
+		chunks: BoxStream<'static, Result<PartitionPayload, PartitionMissingReason>>,
+	) -> Self {
+		Self {
+			chunks,
+			reader_guard: None,
+		}
+	}
+
+	fn with_reader_guard(
 		chunks: BoxStream<'static, Result<PartitionPayload, PartitionMissingReason>>,
 		inner: Arc<RwLock<PartitionStoreInner>>,
 		address: PartitionAddress,
 	) -> Self {
 		Self {
 			chunks,
-			cancel_on_drop: Some(LivePartitionCancelOnDrop { inner, address }),
+			reader_guard: Some(LivePartitionReaderGuard { inner, address }),
 		}
 	}
 
 	pub async fn next(&mut self) -> Option<Result<PartitionPayload, PartitionMissingReason>> {
 		let next = self.chunks.next().await;
 		if next.is_none() || matches!(next, Some(Err(_))) {
-			self.cancel_on_drop = None;
+			if let Some(guard) = self.reader_guard.take() {
+				guard.finish(false);
+			}
 		}
 		next
 	}
 }
 
-impl LivePartitionCancelOnDrop {
-	fn cancel(&self) {
+impl LivePartitionReaderGuard {
+	fn finish(self, cancel_if_unsealed: bool) {
 		let downstream_cancellation = {
 			let mut inner = self.inner.write().expect("partition store poisoned");
 			let Some(live) = inner.live_partitions.get_mut(&self.address) else {
 				return;
 			};
-			if live.sealed || live.cancelled.is_some() {
-				return;
+			debug_assert!(live.active_readers > 0);
+			live.active_readers = live.active_readers.saturating_sub(1);
+			if cancel_if_unsealed && !live.sealed && live.cancelled.is_none() {
+				live.cancelled = Some(PartitionMissingReason::CancelledTaskCleanup);
+				live.notify.notify_waiters();
+				live.pacing_semaphore.close();
+				live.downstream_cancellation.clone()
+			} else {
+				release_live_chunks_if_idle(live);
+				None
 			}
-			live.cancelled = Some(PartitionMissingReason::CancelledTaskCleanup);
-			live.notify.notify_waiters();
-			live.pacing_semaphore.close();
-			live.downstream_cancellation.clone()
 		};
 		if let Some(downstream_cancellation) = downstream_cancellation {
 			downstream_cancellation
@@ -221,8 +236,8 @@ impl LivePartitionCancelOnDrop {
 
 impl Drop for LivePartitionStream {
 	fn drop(&mut self) {
-		if let Some(cancel) = &self.cancel_on_drop {
-			cancel.cancel();
+		if let Some(guard) = self.reader_guard.take() {
+			guard.finish(true);
 		}
 	}
 }
@@ -311,6 +326,7 @@ struct LivePartition {
 	downstream_cancellation: Option<DownstreamCancellationContext>,
 	notify: Arc<Notify>,
 	pacing_semaphore: Arc<Semaphore>,
+	active_readers: usize,
 	farthest_released_index: usize,
 }
 
@@ -326,8 +342,16 @@ impl LivePartition {
 			downstream_cancellation: None,
 			notify: Arc::new(Notify::new()),
 			pacing_semaphore: Arc::new(Semaphore::new(LIVE_BACKLOG_DEPTH)),
+			active_readers: 0,
 			farthest_released_index: 0,
 		}
+	}
+}
+
+fn release_live_chunks_if_idle(live: &mut LivePartition) {
+	if live.sealed && live.active_readers == 0 {
+		live.chunks.clear();
+		live.reservations.clear();
 	}
 }
 
@@ -635,20 +659,25 @@ impl PartitionStore for InMemoryPartitionStore {
 		let mut sealed_notifies = Vec::new();
 		for (address, payload, reservation) in sealed_payloads {
 			let entry = payload.entry();
-			let notify = {
-				let Some(live) = inner.live_partitions.get_mut(&address) else {
-					continue;
-				};
-				live.sealed = true;
-				live.pacing_semaphore.close();
-				live.notify.clone()
-			};
+			if !inner.live_partitions.contains_key(&address) {
+				continue;
+			}
 			entries.push(entry);
-			sealed_notifies.push(notify);
 			if let Some(reservation) = reservation {
 				inner.partitions.insert(address, payload);
 				inner.reservations.insert(address, reservation);
 			}
+			let notify = {
+				let live = inner
+					.live_partitions
+					.get_mut(&address)
+					.expect("live partition checked above");
+				live.sealed = true;
+				live.pacing_semaphore.close();
+				release_live_chunks_if_idle(live);
+				live.notify.clone()
+			};
+			sealed_notifies.push(notify);
 		}
 		for notify in sealed_notifies {
 			notify.notify_waiters();
@@ -683,17 +712,41 @@ impl PartitionStore for InMemoryPartitionStore {
 			});
 		}
 		let inner = self.inner.clone();
-		{
+		let fallback = {
 			let mut guard = inner.write().expect("partition store poisoned");
 			if guard.cancelled_queries.contains(&address.query_id) {
 				return Err(PartitionMissingReason::CancelledTaskCleanup);
 			}
-			guard
-				.live_partitions
-				.entry(address)
-				.or_insert_with(LivePartition::placeholder);
+			let use_fallback = {
+				let live = guard
+					.live_partitions
+					.entry(address)
+					.or_insert_with(LivePartition::placeholder);
+				if live.cancelled.is_none() && live.sealed && live.chunks.is_empty() {
+					true
+				} else {
+					live.active_readers += 1;
+					false
+				}
+			};
+			if use_fallback {
+				Some(
+					guard
+						.partitions
+						.get(&address)
+						.cloned()
+						.ok_or(PartitionMissingReason::StoreEvicted)?,
+				)
+			} else {
+				None
+			}
+		};
+		if let Some(payload) = fallback {
+			return Ok(LivePartitionStream::without_reader_guard(
+				stream::once(async move { Ok(payload) }).boxed(),
+			));
 		}
-		Ok(LivePartitionStream::with_cancel_on_drop(
+		Ok(LivePartitionStream::with_reader_guard(
 			stream::unfold(
 				(inner.clone(), address, 0usize),
 				|(inner, address, index)| async move {
@@ -729,6 +782,17 @@ impl PartitionStore for InMemoryPartitionStore {
 									live.pacing_semaphore.add_permits(1);
 								}
 								return Some((Ok(chunk), (inner.clone(), address, index + 1)));
+							}
+							if live.sealed && live.chunks.is_empty() {
+								if index == 0 {
+									let payload = guard
+										.partitions
+										.get(&address)
+										.cloned()
+										.ok_or(PartitionMissingReason::StoreEvicted);
+									return Some((payload, (inner.clone(), address, 1)));
+								}
+								return None;
 							}
 							if live.sealed {
 								return None;
@@ -1281,6 +1345,45 @@ mod tests {
 		values
 	}
 
+	fn payloads_size(payloads: &[PartitionPayload]) -> ByteCount {
+		payloads.iter().fold(ByteCount::ZERO, |total, payload| {
+			total.saturating_add(payload.size_bytes())
+		})
+	}
+
+	fn live_chunk_state(
+		store: &InMemoryPartitionStore,
+		address: PartitionAddress,
+	) -> (usize, usize, usize) {
+		let inner = store.inner.read().expect("partition store poisoned");
+		let live = inner.live_partitions.get(&address).expect("live partition");
+		(
+			live.chunks.len(),
+			live.reservations.len(),
+			live.farthest_released_index,
+		)
+	}
+
+	async fn expect_live_payload(
+		stream: &mut LivePartitionStream,
+		label: &'static str,
+	) -> PartitionPayload {
+		tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+			.await
+			.expect(label)
+			.expect("live stream yielded payload")
+			.expect("live payload ok")
+	}
+
+	async fn expect_live_eof(stream: &mut LivePartitionStream, label: &'static str) {
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+				.await
+				.expect(label)
+				.is_none()
+		);
+	}
+
 	fn manifest(payload: &PartitionPayload) -> PartitionManifest {
 		manifest_for_entry(payload.address, payload.entry())
 	}
@@ -1401,7 +1504,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn dropping_live_reader_cancels_unsealed_partition() {
+	async fn abnormal_drop_of_unsealed_reader_still_cancels() {
 		let store = InMemoryPartitionStore::new();
 		let address = address(AttemptId::first());
 		store.open_live(address, test_schema()).expect("open live");
@@ -1814,15 +1917,327 @@ mod tests {
 		let pulled = store
 			.pull(address, AttemptId::first())
 			.expect("sealed pull");
+		{
+			let inner = store.inner.read().expect("partition store poisoned");
+			assert!(inner.partitions.contains_key(&address));
+			assert!(inner.reservations.contains_key(&address));
+			let live = inner.live_partitions.get(&address).expect("live partition");
+			assert!(live.reservations.is_empty());
+		}
 		assert_eq!(
 			store.budget_used(BudgetDimension::ShuffleBytes),
-			payload.size_bytes().saturating_add(pulled.size_bytes())
+			pulled.size_bytes()
 		);
 
 		store.remove_query(address.query_id);
 		assert_eq!(
 			store.budget_used(BudgetDimension::ShuffleBytes),
 			ByteCount::ZERO
+		);
+	}
+
+	#[tokio::test]
+	async fn release_on_seal_when_no_readers() {
+		let store = InMemoryPartitionStore::with_budget(QueryBudget {
+			shuffle_bytes_published_per_task: ByteCount::new(1_000_000),
+			..QueryBudget::test_default()
+		});
+		let address = address(AttemptId::first());
+		let payloads = [[1, 2], [3, 4]]
+			.iter()
+			.map(|values| ipc_payload(address, values))
+			.collect::<Vec<_>>();
+		store.open_live(address, test_schema()).expect("open live");
+		for payload in &payloads {
+			store
+				.append_live(payload.clone())
+				.await
+				.expect("append live");
+		}
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			payloads_size(&payloads)
+		);
+
+		store.seal_live(manifest(&payloads[0])).expect("seal live");
+		let pulled = store
+			.pull(address, AttemptId::first())
+			.expect("sealed pull");
+
+		assert_eq!(live_chunk_state(&store, address), (0, 0, 0));
+		assert_eq!(decoded_i64_values(&pulled.bytes), vec![1, 2, 3, 4]);
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			pulled.size_bytes()
+		);
+	}
+
+	#[tokio::test]
+	async fn release_on_last_reader_end_after_seal() {
+		let store = InMemoryPartitionStore::with_budget(QueryBudget {
+			shuffle_bytes_published_per_task: ByteCount::new(1_000_000),
+			..QueryBudget::test_default()
+		});
+		let live_address = address(AttemptId::first());
+		let payloads = [[10], [11]]
+			.iter()
+			.map(|values| ipc_payload(live_address, values))
+			.collect::<Vec<_>>();
+		store
+			.open_live(live_address, test_schema())
+			.expect("open live");
+		for payload in &payloads {
+			store
+				.append_live(payload.clone())
+				.await
+				.expect("append live");
+		}
+		let mut stream = store
+			.pull_live(live_address, AttemptId::first())
+			.expect("live pull");
+
+		store.seal_live(manifest(&payloads[0])).expect("seal live");
+		assert_eq!(live_chunk_state(&store, live_address).0, payloads.len());
+		for payload in &payloads {
+			assert_eq!(
+				expect_live_payload(&mut stream, "live chunk should arrive")
+					.await
+					.bytes,
+				payload.bytes
+			);
+		}
+		expect_live_eof(&mut stream, "sealed stream should end").await;
+		assert_eq!(
+			live_chunk_state(&store, live_address),
+			(0, 0, payloads.len())
+		);
+
+		let early_address = address(AttemptId::new(2));
+		let early_payloads = [[20], [21]]
+			.iter()
+			.map(|values| ipc_payload(early_address, values))
+			.collect::<Vec<_>>();
+		store
+			.open_live(early_address, test_schema())
+			.expect("open second live");
+		for payload in &early_payloads {
+			store
+				.append_live(payload.clone())
+				.await
+				.expect("append second live");
+		}
+		let stream = store
+			.pull_live(early_address, AttemptId::new(2))
+			.expect("second live pull");
+		store
+			.seal_live(manifest(&early_payloads[0]))
+			.expect("seal second live");
+		assert_eq!(
+			live_chunk_state(&store, early_address).0,
+			early_payloads.len()
+		);
+		drop(stream);
+		assert_eq!(live_chunk_state(&store, early_address), (0, 0, 0));
+	}
+
+	#[tokio::test]
+	async fn seal_waits_for_all_active_live_readers() {
+		let store = InMemoryPartitionStore::new();
+		let address = address(AttemptId::first());
+		let payload = ipc_payload(address, &[1, 2, 3]);
+		store.open_live(address, test_schema()).expect("open live");
+		store
+			.append_live(payload.clone())
+			.await
+			.expect("append live");
+
+		let first = store
+			.pull_live(address, AttemptId::first())
+			.expect("first live pull");
+		let second = store
+			.pull_live(address, AttemptId::first())
+			.expect("second live pull");
+		store.seal_live(manifest(&payload)).expect("seal live");
+		assert_eq!(live_chunk_state(&store, address).0, 1);
+
+		drop(first);
+		assert_eq!(live_chunk_state(&store, address).0, 1);
+		drop(second);
+		assert_eq!(live_chunk_state(&store, address), (0, 0, 0));
+	}
+
+	#[tokio::test]
+	async fn pull_live_after_release_serves_sealed_payload() {
+		let store = InMemoryPartitionStore::new();
+		let address = address(AttemptId::first());
+		let chunk_rows: [&[i64]; 2] = [&[30], &[31, 32]];
+		let payloads = chunk_rows
+			.into_iter()
+			.map(|values| ipc_payload(address, values))
+			.collect::<Vec<_>>();
+		store.open_live(address, test_schema()).expect("open live");
+		for payload in &payloads {
+			store
+				.append_live(payload.clone())
+				.await
+				.expect("append live");
+		}
+		store.seal_live(manifest(&payloads[0])).expect("seal live");
+		assert_eq!(live_chunk_state(&store, address).0, 0);
+
+		let mut stream = store
+			.pull_live(address, AttemptId::first())
+			.expect("fallback live pull");
+		let fallback = expect_live_payload(&mut stream, "fallback payload should arrive").await;
+		assert_eq!(decoded_i64_values(&fallback.bytes), vec![30, 31, 32]);
+		expect_live_eof(&mut stream, "fallback stream should yield once").await;
+	}
+
+	#[tokio::test]
+	async fn retry_from_zero_after_release_is_correct() {
+		let store = InMemoryPartitionStore::new();
+		let address = address(AttemptId::first());
+		let payloads = [[40], [41], [42]]
+			.iter()
+			.map(|values| ipc_payload(address, values))
+			.collect::<Vec<_>>();
+		store.open_live(address, test_schema()).expect("open live");
+		for payload in &payloads {
+			store
+				.append_live(payload.clone())
+				.await
+				.expect("append live");
+		}
+		store.seal_live(manifest(&payloads[0])).expect("seal live");
+		assert_eq!(live_chunk_state(&store, address).0, 0);
+
+		for label in ["first retry", "second retry"] {
+			let mut stream = store
+				.pull_live(address, AttemptId::first())
+				.expect("retry live pull");
+			let payload = expect_live_payload(&mut stream, label).await;
+			assert_eq!(decoded_i64_values(&payload.bytes), vec![40, 41, 42]);
+			expect_live_eof(&mut stream, "retry fallback should end").await;
+		}
+	}
+
+	#[tokio::test]
+	async fn released_chunks_free_append_reservation() {
+		let store = InMemoryPartitionStore::with_budget(QueryBudget {
+			shuffle_bytes_published_per_task: ByteCount::new(1_000_000),
+			..QueryBudget::test_default()
+		});
+		let address = address(AttemptId::first());
+		let payload = ipc_payload(address, &[50, 51]);
+		store.open_live(address, test_schema()).expect("open live");
+		store
+			.append_live(payload.clone())
+			.await
+			.expect("append live");
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			payload.size_bytes()
+		);
+
+		store.seal_live(manifest(&payload)).expect("seal live");
+		let pulled = store
+			.pull(address, AttemptId::first())
+			.expect("sealed pull");
+		assert_eq!(live_chunk_state(&store, address), (0, 0, 0));
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			pulled.size_bytes()
+		);
+
+		store.remove_query(address.query_id);
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			ByteCount::ZERO
+		);
+	}
+
+	#[tokio::test]
+	async fn fallback_stream_does_not_add_pacing_permits() {
+		let store = InMemoryPartitionStore::new();
+		let address = address(AttemptId::first());
+		let payload = ipc_payload(address, &[60, 61]);
+		store.open_live(address, test_schema()).expect("open live");
+		store
+			.append_live(payload.clone())
+			.await
+			.expect("append live");
+		store.seal_live(manifest(&payload)).expect("seal live");
+		assert_eq!(live_chunk_state(&store, address), (0, 0, 0));
+
+		let mut stream = store
+			.pull_live(address, AttemptId::first())
+			.expect("fallback live pull");
+		let payload = expect_live_payload(&mut stream, "fallback payload").await;
+		assert_eq!(decoded_i64_values(&payload.bytes), vec![60, 61]);
+		expect_live_eof(&mut stream, "fallback stream should end").await;
+		assert_eq!(live_chunk_state(&store, address), (0, 0, 0));
+	}
+
+	#[tokio::test]
+	async fn double_release_is_noop() {
+		let store = InMemoryPartitionStore::with_budget(QueryBudget {
+			shuffle_bytes_published_per_task: ByteCount::new(1_000_000),
+			..QueryBudget::test_default()
+		});
+		let address = address(AttemptId::first());
+		let payload = ipc_payload(address, &[70]);
+		store.open_live(address, test_schema()).expect("open live");
+		store
+			.append_live(payload.clone())
+			.await
+			.expect("append live");
+		store.seal_live(manifest(&payload)).expect("seal live");
+		let pulled = store
+			.pull(address, AttemptId::first())
+			.expect("sealed pull");
+		{
+			let mut inner = store.inner.write().expect("partition store poisoned");
+			let live = inner
+				.live_partitions
+				.get_mut(&address)
+				.expect("live partition");
+			release_live_chunks_if_idle(live);
+			release_live_chunks_if_idle(live);
+		}
+		assert_eq!(live_chunk_state(&store, address), (0, 0, 0));
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			pulled.size_bytes()
+		);
+	}
+
+	#[tokio::test]
+	async fn fallback_yields_once_not_for_index_gt_zero() {
+		let store = InMemoryPartitionStore::new();
+		let address = address(AttemptId::first());
+		let payload = ipc_payload(address, &[80, 81]);
+		store.open_live(address, test_schema()).expect("open live");
+		store
+			.append_live(payload.clone())
+			.await
+			.expect("append live");
+		store.seal_live(manifest(&payload)).expect("seal live");
+
+		let mut stream = store
+			.pull_live(address, AttemptId::first())
+			.expect("fallback live pull");
+		let fallback = expect_live_payload(&mut stream, "fallback payload").await;
+		assert_eq!(decoded_i64_values(&fallback.bytes), vec![80, 81]);
+		expect_live_eof(&mut stream, "fallback emits once").await;
+
+		{
+			let mut inner = store.inner.write().expect("partition store poisoned");
+			inner.partitions.remove(&address);
+			inner.reservations.remove(&address);
+		}
+		assert_eq!(
+			store.pull_live(address, AttemptId::first()).err(),
+			Some(PartitionMissingReason::StoreEvicted)
 		);
 	}
 

@@ -608,6 +608,99 @@ pub(crate) fn adr124_pull_live_unfolds_by_index_for_replay() {
 }
 
 #[test]
+pub(crate) fn adr127_live_partition_tracks_active_readers() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let live_partition = source
+		.split("struct LivePartition {")
+		.nth(1)
+		.and_then(|rest| rest.split("impl LivePartition").next())
+		.expect("LivePartition block");
+	let in_memory_impl = source
+		.split("impl PartitionStore for InMemoryPartitionStore")
+		.nth(1)
+		.expect("in-memory partition store impl");
+	let pull_live = in_memory_impl
+		.split("fn pull_live")
+		.nth(1)
+		.and_then(|rest| rest.split("fn remove_query").next())
+		.expect("pull_live body");
+	let stream_guard = source
+		.split("struct LivePartitionReaderGuard")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Drop for LivePartitionStream").next())
+		.expect("LivePartitionReaderGuard block");
+
+	assert!(live_partition.contains("active_readers: usize"));
+	assert!(source.contains("active_readers: 0"));
+	assert!(pull_live.contains("live.active_readers += 1"));
+	assert!(stream_guard.contains("live.active_readers.saturating_sub(1)"));
+	assert!(stream_guard.contains("release_live_chunks_if_idle(live)"));
+}
+
+#[test]
+pub(crate) fn adr127_release_drops_chunks_and_reservations() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let release = source
+		.split("fn release_live_chunks_if_idle")
+		.nth(1)
+		.and_then(|rest| rest.split("impl InMemoryPartitionStore").next())
+		.expect("release helper body");
+	let in_memory_impl = source
+		.split("impl PartitionStore for InMemoryPartitionStore")
+		.nth(1)
+		.expect("in-memory partition store impl");
+	let seal_live = in_memory_impl
+		.split("fn seal_live")
+		.nth(1)
+		.and_then(|rest| rest.split("fn cancel_live").next())
+		.expect("seal_live body");
+	let reader_guard = source
+		.split("impl LivePartitionReaderGuard")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Drop for LivePartitionStream").next())
+		.expect("reader guard impl");
+
+	assert!(release.contains("live.sealed && live.active_readers == 0"));
+	assert!(release.contains("live.chunks.clear()"));
+	assert!(release.contains("live.reservations.clear()"));
+	assert!(seal_live.contains("inner.partitions.insert(address, payload)"));
+	assert!(seal_live.contains("release_live_chunks_if_idle(live)"));
+	assert!(reader_guard.contains("release_live_chunks_if_idle(live)"));
+}
+
+#[test]
+pub(crate) fn adr127_pull_live_falls_back_to_sealed_payload() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+		.expect("read partition store");
+	let in_memory_impl = source
+		.split("impl PartitionStore for InMemoryPartitionStore")
+		.nth(1)
+		.expect("in-memory partition store impl");
+	let pull_live = in_memory_impl
+		.split("fn pull_live")
+		.nth(1)
+		.and_then(|rest| rest.split("fn remove_query").next())
+		.expect("pull_live body");
+	let fallback = pull_live
+		.split("if live.sealed && live.chunks.is_empty()")
+		.nth(1)
+		.and_then(|rest| rest.split("if live.sealed").next())
+		.expect("sealed fallback branch");
+
+	assert!(pull_live.contains("LivePartitionStream::without_reader_guard"));
+	assert!(pull_live.contains(".partitions"));
+	assert!(pull_live.contains("PartitionMissingReason::StoreEvicted"));
+	assert!(fallback.contains(".partitions"));
+	assert!(fallback.contains(".get(&address)"));
+	assert!(fallback.contains(".cloned()"));
+	assert!(fallback.contains("index == 0"));
+	assert!(!fallback.contains("farthest_released_index"));
+	assert!(!fallback.contains("add_permits"));
+}
+
+#[test]
 pub(crate) fn adr124_cancel_live_closes_pacing_semaphore() {
 	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
 		.expect("read partition store");
