@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–137 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–138 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,54 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 137 promoted; ADR 138 candidates
+### ADR 138 promoted; ADR 139 candidates
+
+ADR 138 promoted **Estimate-Tolerant Per-Row Materialized-Size Model** — the cut where the
+council, on an operator steer, traded the spine's "hard upper bound only" purism for an
+honest estimate. 137 left a row-bounded relation with `row_upper_bound` set but
+`byte_upper_bound` untouched, so a *string-bearing tiny dimension* still hashed: the chooser
+is byte-only and nothing converts rows to bytes, and there is no hard length signal for
+`Utf8`/`Binary` (refinements are value-only; the descriptor carries no per-column width). The
+grounded reframe: the runtime caps a broadcast build against **actual encoded Arrow IPC
+payload bytes** (`PartitionPayload::size_bytes`), failing with a typed `BudgetExhausted` —
+never wrong rows — and already tolerates an imprecise planner (`cap/4` = 16 MiB ceiling vs a
+1 MiB default threshold vs 64 MiB runtime cap → ~64× headroom *by design*). So undercount is
+an **availability** concern, not a correctness one, and a conservative over-count estimate
+beats refusing to broadcast every string dimension forever. **D1:** a new
+`estimated_byte_size` channel beside the **untouched** hard `byte_upper_bound`; **138 never
+writes the hard field** — Toron computes *estimates*, only the storage ring (136/136-W) issues
+hard byte facts (the cross-ring [[logical_identity_receipt_doctrine]] cut). Fixed-width is an
+exact-*ish* estimate, string/binary a looser one — **both** in `estimated_byte_size`, after
+Codex grounded that Toron cannot prove the encoded-IPC byte unit the runtime actually meters.
+**D2:** over-count biased, validated `estimated_byte_size ≥ encode_record_batch(..).len()` at
+`R ∈ {1,8,1000}` (the real unit, framing included); any nested/dict column ⇒ estimate `None`.
+**D3:** chooser prefers hard (`broadcast_inferred`), falls back to estimate
+(`broadcast_estimated`) only when hard is absent — and reads byte-typed fields only, so 137's
+chooser-byte-only guard stays green. **D4:** distinct `BroadcastEstimated` receipt → EXPLAIN
+labels estimated vs hard (134). **D5:** binder-local; derive at `from_table` (descriptor rows)
++ post-137-PK-cap, carried through 137's row-local helpers; default threshold **unchanged**.
+**`Take` dropped (grounded):** `take` returns `Composite`, and the chooser only reads build
+bytes for `SingleBaseRelation`, so `LIMIT n` cannot broadcast without a 129-retargeting
+lineage decision — a named follow-on, not an accidental side effect (corrected an earlier
+"fold 116" framing). **Named residual:** until ADR 139, a gross (>headroom) under-estimate of a
+genuinely-large input fails the query where hash would have succeeded (availability, not wrong
+rows). Genuine 3-of-3 + operator on B′ after two iter-3 promotion blockers were ground shut
+(Take lineage; encoded-IPC byte unit → fixed-width demoted to the estimate channel). Headline
+gate (Rune+SQL): `string_bearing_tiny_dim_infers_broadcast_by_estimate` from a hard row source
+(fails on `main`); seven `adr138_*` guards + 129–137 regressions incl. the two 137 honesty
+guards un-retargeted.
+
+**ADR 139 lead candidates:** **runtime broadcast-build → hash fallback** (the keystone the
+138 reframe named — catch the build-side `BudgetExhausted` and degrade *that join* to hash
+instead of failing the query; retires 138's availability residual *and* independently hardens
+every existing hard-bound broadcast against a mis-set cap; distributed-runtime ADR —
+fragmenter/server/scheduler) — strong continuity, my lean; a **length-carrying logical-type
+refinement** (would promote `Utf8`/`Binary` width from estimate to a *hard* bound); **`Take`/
+`LIMIT` single-base lineage** (129-retarget so limited dims broadcast); the **136-W** Wendelon
+hard-facts producer (Wendelon-home); remote-live multi-producer fan-in; multi-column /
+histogram selectivity; join reordering. Evidence-gate the next pick on the 138 feat.
+
+### ADR 137 promoted; ADR 138 candidates (HISTORICAL)
 
 ADR 137 promoted **Fact-Spine Preservation Through Row-Local Volume-Non-Increasing
 Nodes** — the natural IQ step now that 136 made base facts real in production. 136 let
