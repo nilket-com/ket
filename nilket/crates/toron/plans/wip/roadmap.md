@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–140 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–141 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,52 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 140 promoted; ADR 141 candidates
+### ADR 141 promoted; ADR 142 candidates
+
+ADR 141 promoted **Labeled NDV Equality Selectivity Estimates** — the first stats-backed CBO cut,
+attacking the *root* of the 138/139/140 arc (blunt estimates → over-cap broadcasts) instead of the
+recovery symptom. Toron consumes a labeled **approximate** per-column distinct-count (NDV)
+optimizer fact — `DistinctCountFact { Exact(u64), Approx { estimate, rel_err_ppm } }` (integer error
+so it derives `Eq`) — riding the descriptor-adjacent fact sidecar (136 pattern: serialized
+`DescriptorOptimizerFacts` gets `column_ndv` entries, normalized into a `TableOptimizerFacts`
+`BTreeMap`, and then carried onto `ExecutionPlan::Scan` beside `primary_key_columns`). A `Filter`
+proving `col = <literal>` over a single-base scan derives
+`estimated_row_count = 0` for a hard zero-row base, else `max(1, ceil(base_rows / max(1, NDV(col))))`
+into a **new estimate-only channel**
+(`PlanOptimizerFacts.estimated_row_count`, never the hard `row_upper_bound` — even for `Exact`;
+hard-from-exact needs a freshness/coverage doctrine, deferred), which feeds 138's
+`estimated_byte_size` — so a common star-schema **build-side filtered dimension**
+(`customers.filter(region == "north")` in Rune/direct IR; 137 leaves it at full dim size, 138 then
+estimates too big) gets a realistic filtered estimate and broadcasts. **The runtime stays honest:**
+approximate ≠ hard (guarded); equality-only (ranges need quantiles — the
+*second* stats cut); top-level `AND` takes the **single most-selective factor** and stacked filters
+take `min` (no independence product); a skewed-key under-estimate that over-caps is recovered by
+139/140 replay (the net that licenses spending an approximate estimate). **Two grounded premises:**
+Wendelon's HLL/small-set distinct-counts are **opt-in persisted CSB stats, not always-on**
+(`ColumnStatsPolicyV1` defaults empty) → 141 is a 136-style **consumer-now / producer-named** pair
+(141-T inert until 141-W, fixture-testable now); and SQL lowers `WHERE` **after** the join
+(`sql_planner.rs:3693`) so the dim build side is unfiltered → the headline is **Rune + direct-IR**,
+SQL join-filter pushdown a named follow-on ([[rune_is_primary_interface]]). Genuine 3-of-3 (no
+divergence); Codex's `rel_err_ppm`-keeps-`Eq` and stacked-filter-`min` refinements folded. Headline
+gate: `rune_equality_filtered_dim_with_ndv_infers_broadcast_by_estimate` (fails on `main`).
+
+**ADR 142 lead candidates:** **141-W** — the Wendelon NDV producer (expose table-identity-keyed
+per-column NDV adjacent to descriptor sync, merging persisted CSB HLL across row-groups, preferring
+a complete small-set as `Exact`; decide the opt-in-vs-default-stats-policy question) — the
+cross-ring half that makes 141 fire in production; **SQL join-filter pushdown** (side-local `WHERE`
+to the build / joins around filtered derived tables — unlocks the SQL headline 141 deferred);
+**quantile/range selectivity** (the *second* stats cut — inequality selectivity + 138 byte-estimate
+hardening; KLL is a query aggregate, not maintained, so a new Wendelon producer extension);
+hard-from-exact (a stats-freshness/coverage doctrine letting a fresh exact small-set write a hard
+bound); 140's A1 (exact join-identified replay); multi-column stats. **Forward arc (named, not
+next):** **Theta-sketch join-key intersection** — HLL gives union/cardinality but *not* intersection
+(inclusion-exclusion compounds error), so join cardinality (`|fact ⋈ dim|`) needs Theta-sketches;
+a future Wendelon producer maintains per-join-key Theta-sketches → labeled-approximate join
+selectivity → the line **NDV equality selectivity (141) → quantile/range selectivity →
+Theta-sketch join-key intersection → join selectivity → join reordering**. Evidence-gate the next
+pick on the 141 feat.
+
+### ADR 140 promoted; ADR 141 candidates (HISTORICAL)
 
 ADR 140 promoted **Failed-Task-Scoped Broadcast Replay** — sharpens ADR 139's blunt recovery.
 139 made an over-cap broadcast an availability event recoverable by a one-shot whole-query hash
