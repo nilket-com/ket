@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–139 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–140 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,51 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 139 promoted; ADR 140 candidates
+### ADR 140 promoted; ADR 141 candidates
+
+ADR 140 promoted **Failed-Task-Scoped Broadcast Replay** — sharpens ADR 139's blunt recovery.
+139 made an over-cap broadcast an availability event recoverable by a one-shot whole-query hash
+replay, but its `force_hash_joins` was **global**: one over-cap build demoted *every* replayable
+broadcast in the query, and a Rune/Direct pin *anywhere* vetoed replay entirely — degrading the
+common ADR 135 broadcast-star (lose dim1/dim3 to recover dim2). 140 gives each join a stable
+**`JoinReplayId`** (the existing deterministic bind-time `join_index`, carried on
+`ExecutionPlan::Join` with a reduced replay-eligibility tag, preserved through fragmentation),
+replaces `force_hash_joins: bool` with `force_hash_join_ids: BTreeSet<JoinReplayId>`, and on a
+`BudgetExhausted(BroadcastReplication)` failure collects the **replayable broadcast id *set* in
+the failed task** from that execution metadata and replays forcing only that set to hash — healthy
+broadcasts in other tasks/stages stay broadcast, and a SQL/Auto broadcast replays even when a Rune
+pin lives elsewhere (the named 139 mixed-source gap). Source eligibility per 139 (Auto/SqlHint
+replayable; Rune/Direct terminal) is now keyed by id, replacing 139's global terminal-pin veto,
+without carrying full `JoinStrategyIntent` into execution IR. **The corrected trap:** *not*
+"single-broadcast-or-terminal"
+(both Gemini's and Claude's iter-1 floated it) — a star co-locates all dim builds in one consumer
+task (`fragment_broadcast_join_plan`), so >1 broadcast → terminal where 139 *succeeds*; the policy
+is **demote the set**, never worse than 139. **Honest scope:** A2 demotes the failed task's whole
+replayable set — a single-task star still demotes all its dims (= 139 for the pure star), because
+the worker's coarse failure carries no per-build id; per-dim-in-star precision is the **A1
+follow-on** (a worker failure-hint + per-build cap validation — a wire/payload change the operator
+scoped out: "small, Toron-local"). Every 139 fence preserved (one-shot, `!batch_sent`, fresh
+non-`AttemptId` namespace, `BroadcastReplication`-only, mutation paths out, coordinator-owned, 138
+split untouched). Consensus: A2 (Claude + Gemini + operator's "small, Toron-local" steer); Codex's
+stronger join-*identified* A1 surfaced transparently as the follow-on, not folded. Headline gate:
+`mixed_sql_and_rune_broadcast_plan_replays_sql_preserves_rune` (fails on `main`).
+
+**ADR 141 lead candidates:** **stats-backed optimizer facts (operator-confirmed next direction,
+selectivity-first).** Wendelon is *not* absolute-facts-only — it has **KLL approximate quantiles**
+(a query aggregate) and **maintained per-column row-group stats (HLL cardinality, bloom,
+small-set)**. A 136-W-style cross-ring pair exposes these as **labeled-approximate** optimizer
+facts Toron consumes in the estimate/selectivity channels — *never* as hard `byte_upper_bound`
+receipts (channel honesty: approximate ≠ hard). **Lead with selectivity** — HLL cardinality is
+already maintained per-column, so equality/filter/join selectivity is the best-grounded first
+stats ADR (the real CBO substrate Gemini has wanted since 137, → eventual join reordering);
+per-column byte/length quantiles are a *second* cut (a new producer extension — not maintained
+today). This attacks the *root* of the 138/139/140 arc (bad estimates → over-caps) rather than
+the recovery symptom. Also queued: **ADR 140's A1** (exact join-identified replay via a worker
+failure-hint — `ShuffleConsumer { broadcast_join_id }` + per-build cap validation, for single-task
+star per-dim precision); generic `ShuffleBytes` fan-out recovery; `Take`/`LIMIT` single-base
+lineage. Evidence-gate the next pick on the 140 feat.
+
+### ADR 139 promoted; ADR 140 candidates (HISTORICAL)
 
 ADR 139 promoted **Source-Aware Broadcast-Cap Hash Replay** — the keystone that retires ADR
 138's named availability residual (an estimated broadcast whose *actual* encoded bytes exceed
