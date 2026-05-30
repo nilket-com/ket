@@ -1,8 +1,9 @@
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, LogicalPlan,
-	LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, ScalarValue, SortExpr,
+	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy,
+	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, ScalarValue,
+	SortExpr,
 };
 use crate::sql_planner::{SqlPlanner, build_join_plan, expr_to_join_keys};
 use arrow::datatypes::DataType;
@@ -441,7 +442,14 @@ fn join_with_strategy(
 		Ok(pairs) => pairs,
 		Err(error) => return VmResult::panic(error.to_string()),
 	};
-	match build_join_plan(left, right, kind, pairs, strategy) {
+	match build_join_plan(
+		left,
+		right,
+		kind,
+		pairs,
+		strategy,
+		JoinStrategyPinSource::Rune,
+	) {
 		Ok(plan) => VmResult::Ok(RuneDataFrame { plan }),
 		Err(error) => VmResult::panic(error.to_string()),
 	}

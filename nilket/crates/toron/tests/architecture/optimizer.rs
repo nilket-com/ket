@@ -39,6 +39,11 @@ fn config_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config source")
 }
 
+fn coordinator_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source")
+}
+
 fn daemon_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source")
 }
@@ -1108,4 +1113,255 @@ pub(crate) fn adr138_no_substrate_or_wire_change() {
 	assert!(lib.contains("distributed_broadcast_join_over_cap_fails_terminally_over_tcp"));
 	assert!(lib.contains("rune_authored_broadcast_join_respects_cap_terminally"));
 	assert!(lib.contains("TaskFailureKind::BudgetExhausted"));
+}
+
+#[test]
+pub(crate) fn adr139_join_strategy_intent_carries_pin_source() {
+	let ir = ir_source();
+	let planner = planner_source();
+	let rune = rune_source();
+	let lib = lib_source();
+	let intent = source_block(&ir, "pub enum JoinStrategyIntent");
+	let source = source_block(&ir, "pub enum JoinStrategyPinSource");
+	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
+
+	assert!(intent.contains("Pinned {"));
+	assert!(intent.contains("strategy: JoinStrategy"));
+	assert!(intent.contains("source: JoinStrategyPinSource"));
+	assert!(source.contains("Direct"));
+	assert!(source.contains("SqlHint"));
+	assert!(source.contains("Rune"));
+	assert!(build_join_plan.contains("source: JoinStrategyPinSource"));
+	assert!(planner.contains("source: JoinStrategyPinSource::SqlHint"));
+	assert!(rune.contains("JoinStrategyPinSource::Rune"));
+	assert!(lib.contains("sql_and_rune_broadcast_pins_have_distinct_sources"));
+}
+
+#[test]
+pub(crate) fn adr139_sql_hint_pin_is_replayable() {
+	let planner = planner_source();
+	let coordinator = coordinator_source();
+	let lib = lib_source();
+
+	assert!(planner.contains("source: JoinStrategyPinSource::SqlHint"));
+	assert!(coordinator.contains("source: JoinStrategyPinSource::SqlHint"));
+	assert!(coordinator.contains("has_replayable_candidate = true"));
+	assert!(lib.contains("sql_broadcast_hint_over_cap_replays_as_hash"));
+}
+
+#[test]
+pub(crate) fn adr139_rune_broadcast_pin_is_terminal() {
+	let rune = rune_source();
+	let coordinator = coordinator_source();
+	let lib = lib_source();
+
+	assert!(rune.contains("JoinStrategyPinSource::Rune"));
+	assert!(coordinator.contains("JoinStrategyPinSource::Rune | JoinStrategyPinSource::Direct"));
+	assert!(coordinator.contains("has_terminal_pinned_broadcast = true"));
+	assert!(lib.contains("rune_authored_broadcast_join_respects_cap_terminally"));
+}
+
+#[test]
+pub(crate) fn adr139_direct_broadcast_pin_is_terminal() {
+	let coordinator = coordinator_source();
+	let lib = lib_source();
+
+	assert!(coordinator.contains("JoinStrategyPinSource::Rune | JoinStrategyPinSource::Direct"));
+	assert!(lib.contains("direct_pinned_broadcast_over_cap_stays_terminal"));
+	assert!(lib.contains("source: JoinStrategyPinSource::Direct"));
+}
+
+#[test]
+pub(crate) fn adr139_broadcast_replication_not_marked_retryable() {
+	let budget = std::fs::read_to_string(manifest_dir().join("src/distributed/budget.rs"))
+		.expect("read budget source");
+	let retryable = source_block(&budget, "pub const fn retryable");
+
+	assert!(budget.contains("BroadcastReplication"));
+	assert!(retryable.contains("Self::Memory | Self::ShuffleBytes"));
+	assert!(!retryable.contains("BroadcastReplication"));
+}
+
+#[test]
+pub(crate) fn adr139_replay_trigger_classifies_scheduler_error_before_query_error_mapping() {
+	let coordinator = coordinator_source();
+	let trigger = source_block(&coordinator, "fn broadcast_cap_replay_trigger");
+	let non_streaming = coordinator
+		.split("execute_bound_distributed_attempt(")
+		.nth(1)
+		.and_then(|rest| rest.split("async fn admit_query").next())
+		.expect("non-streaming distributed read loop");
+	let streaming = coordinator
+		.split("async fn run_streaming_read_driver")
+		.nth(1)
+		.and_then(|rest| rest.split("fn spawn_remote_cancel_fanout_task").next())
+		.expect("streaming read driver");
+	let streaming_trigger = streaming
+		.find("broadcast_cap_replay_trigger(&error, &stages")
+		.expect("streaming trigger before mapping");
+	let streaming_map = streaming
+		.find("let error = scheduler_error(error)")
+		.expect("streaming scheduler_error mapping");
+
+	assert!(trigger.contains("SchedulerError::TaskFailed"));
+	assert!(trigger.contains("TaskFailureKind::BudgetExhausted"));
+	assert!(trigger.contains("BudgetDimension::BroadcastReplication"));
+	assert!(trigger.contains("task_key_contains_broadcast_join(stages, *key)"));
+	assert!(non_streaming.contains("DistributedAttemptError::Scheduler { error, stages }"));
+	assert!(non_streaming.contains("broadcast_cap_replay_trigger(&error, &stages"));
+	assert!(streaming_trigger < streaming_map);
+}
+
+#[test]
+pub(crate) fn adr139_replay_owned_by_coordinator_not_scheduler() {
+	let coordinator = coordinator_source();
+	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+
+	assert!(coordinator.contains("retried_broadcast_replay"));
+	assert!(coordinator.contains("force_hash_joins = true"));
+	assert!(coordinator.contains("broadcast_cap_replay_trigger"));
+	assert!(!scheduler.contains("force_hash_joins"));
+	assert!(!scheduler.contains("broadcast_cap_replay"));
+}
+
+#[test]
+pub(crate) fn adr139_mutation_paths_return_before_broadcast_replay() {
+	let coordinator = coordinator_source();
+	let execute = source_block(&coordinator, "async fn execute_query_with_admission");
+	let replay_state = execute
+		.find("let replay_class = plan_broadcast_replay_class(plan)")
+		.expect("broadcast replay state in read path");
+
+	assert!(execute[..replay_state].contains("LogicalPlan::Insert { .. }"));
+	assert!(execute[..replay_state].contains("LogicalPlan::InsertSelect { .. }"));
+	assert!(execute[..replay_state].contains("LogicalPlan::CreateTableAsSelect { .. }"));
+	assert!(execute[..replay_state].contains("LogicalPlan::Delete { .. }"));
+	assert!(execute[..replay_state].contains("LogicalPlan::Update { .. }"));
+	assert!(execute[..replay_state].matches("return result;").count() >= 2);
+	assert!(!execute[..replay_state].contains("retried_broadcast_replay"));
+	assert!(!execute[..replay_state].contains("force_hash_joins = true"));
+}
+
+#[test]
+pub(crate) fn adr139_streaming_replay_requires_no_batch_sent() {
+	let coordinator = coordinator_source();
+	let streaming = source_block(&coordinator, "async fn run_streaming_read_driver");
+	let trigger = streaming
+		.find("broadcast_cap_replay_trigger(&error, &stages")
+		.expect("streaming broadcast replay trigger");
+	let force_hash = streaming
+		.find("config.force_hash_joins = true")
+		.expect("streaming replay force-hash switch");
+
+	assert!(trigger < force_hash);
+	assert!(streaming[trigger..force_hash].contains("&& !batch_sent.load(Ordering::SeqCst)"));
+	assert!(
+		streaming
+			.contains("with_final_result_sender(Some(sender.clone()), Some(batch_sent.clone()))")
+	);
+}
+
+#[test]
+pub(crate) fn adr139_replay_mode_demotes_auto_and_sql_broadcasts_only() {
+	let binder = binder_source();
+	let choose = source_block(&binder, "fn choose_join_strategy");
+	let bind_join = source_block(&binder, "async fn bind_join");
+
+	assert!(choose.contains("JoinStrategyIntent::Auto if config.force_hash_joins"));
+	assert!(choose.contains("source: JoinStrategyPinSource::SqlHint"));
+	assert!(choose.contains("HashAfterBroadcastCap"));
+	assert!(choose.contains("JoinStrategyIntent::Pinned { strategy, .. }"));
+	assert!(bind_join.contains("force_demoted_sql_broadcast"));
+	assert!(bind_join.contains("strip_root_exchange(left_plan.plan)"));
+	assert!(binder.contains("force_hash_joins_demotes_auto_and_sql_broadcast_only"));
+}
+
+#[test]
+pub(crate) fn adr139_replay_mode_installs_hash_exchanges_for_demoted_pins() {
+	let binder = binder_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+
+	assert!(bind_join.contains("force_demoted_sql_broadcast"));
+	assert!(bind_join.contains("strip_root_exchange(left_plan.plan)"));
+	assert!(bind_join.contains("exchange_for_join_keys("));
+	assert!(binder.contains("terminal_exchange(&left)"));
+	assert!(binder.contains("terminal_exchange(&right)"));
+	assert!(binder.contains("DEFAULT_AUTO_JOIN_PARTITION_COUNT"));
+}
+
+#[test]
+pub(crate) fn adr139_replay_attempt_has_no_broadcast_join_and_is_one_shot() {
+	let binder = binder_source();
+	let coordinator = coordinator_source();
+
+	assert!(binder.contains("HashAfterBroadcastCap"));
+	assert!(binder.contains("assert_join_strategy(&auto_plan, JoinStrategy::HashPartitioned)"));
+	assert!(binder.contains("assert_eq!(strategy, JoinStrategy::HashPartitioned)"));
+	assert!(coordinator.contains("let mut retried_broadcast_replay = false"));
+	assert!(coordinator.contains("&& !retried_broadcast_replay"));
+	assert!(coordinator.contains("retried_broadcast_replay = true"));
+	assert!(!coordinator.contains("BudgetDimension::ShuffleBytes"));
+}
+
+#[test]
+pub(crate) fn adr139_shuffle_bytes_not_a_replay_trigger() {
+	let coordinator = coordinator_source();
+	let trigger = source_block(&coordinator, "fn broadcast_cap_replay_trigger");
+
+	assert!(trigger.contains("BudgetDimension::BroadcastReplication"));
+	assert!(!trigger.contains("ShuffleBytes"));
+}
+
+#[test]
+pub(crate) fn adr139_fragment_namespace_offsets_stage_and_exchange_ids() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragment source");
+	let config = source_block(&fragment, "pub struct FragmentPlanConfig");
+	let allocator_new = source_block(&fragment, "fn new(id_namespace: u32)");
+	let lib = lib_source();
+
+	assert!(config.contains("id_namespace: u32"));
+	assert!(fragment.contains("with_id_namespace"));
+	assert!(fragment.contains("FRAGMENT_ID_NAMESPACE_STRIDE"));
+	assert!(allocator_new.contains("checked_mul(FRAGMENT_ID_NAMESPACE_STRIDE)"));
+	assert!(allocator_new.contains("next_stage: base"));
+	assert!(allocator_new.contains("next_exchange: base"));
+	assert!(!allocator_new.contains("AttemptId"));
+	assert!(lib.contains("replay_uses_fresh_fragment_namespace"));
+}
+
+#[test]
+pub(crate) fn adr139_attempt_id_not_used_as_replay_namespace() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragment source");
+	let coordinator = coordinator_source();
+	let allocator_new = source_block(&fragment, "fn new(id_namespace: u32)");
+
+	assert!(allocator_new.contains("id_namespace"));
+	assert!(!allocator_new.contains("AttemptId"));
+	assert!(coordinator.contains("fragment_id_namespace"));
+	assert!(!coordinator.contains("AttemptId::new(fragment_id_namespace"));
+}
+
+#[test]
+pub(crate) fn adr139_partition_payload_size_unit_unchanged() {
+	let partition_store =
+		std::fs::read_to_string(manifest_dir().join("src/distributed/partition_store.rs"))
+			.expect("read partition store source");
+	let payload_size = source_block(&partition_store, "pub fn size_bytes");
+
+	assert!(payload_size.contains("ByteCount::from_usize(self.bytes.len())"));
+}
+
+#[test]
+pub(crate) fn adr139_138_estimate_channel_untouched() {
+	let binder = binder_source();
+	let lib = lib_source();
+
+	assert!(binder.contains("byte_upper_bound: Option<ByteCount>"));
+	assert!(binder.contains("estimated_byte_size: Option<ByteCount>"));
+	assert!(binder.contains("fn derive_estimated_byte_size"));
+	assert!(lib.contains("estimated_broadcast_over_cap_replays_as_hash_and_matches_digest"));
+	assert!(lib.contains("hard_bound_broadcast_over_cap_replays_as_hash_and_matches_digest"));
 }

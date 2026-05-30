@@ -13,8 +13,8 @@ mod write;
 use crate::binder::{PlannerConfig, bind};
 use crate::catalog::{Catalog, InvalidatedDescriptor};
 use crate::distributed::budget::{
-	AdmissionAttempt, AdmissionPolicy, AdmissionReservation, AdmissionResource, BudgetRejection,
-	QueryBudget, TaskBudget, TenantAdmissionController, TenantAdmissionRejection,
+	AdmissionAttempt, AdmissionPolicy, AdmissionReservation, AdmissionResource, BudgetDimension,
+	BudgetRejection, QueryBudget, TaskBudget, TenantAdmissionController, TenantAdmissionRejection,
 	TenantAdmissionRejectionCounters, TenantBudgetPolicy, TenantConcurrencyRejection,
 };
 use crate::distributed::cancellation::{
@@ -25,7 +25,8 @@ use crate::distributed::cancellation::{
 use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use crate::distributed::identity::QueryId;
-use crate::distributed::scheduler::{DistributedScheduler, SchedulerError};
+use crate::distributed::scheduler::{DistributedScheduler, SchedulerError, StagePlan};
+use crate::distributed::task_state::TaskKey;
 use crate::distributed::worker_registry::WorkerRegistry;
 use crate::error::{
 	CatalogError, ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind,
@@ -33,7 +34,8 @@ use crate::error::{
 use crate::exec::{ExecutionContext, Executor};
 use crate::ir::{
 	BoundReturningProjection, ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan,
-	FilterDisposition, LogicalPlan, MorselId, TableId, data_type_to_logical_type_physical,
+	FilterDisposition, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
+	MorselId, TableId, data_type_to_logical_type_physical,
 };
 use crate::server::{
 	NetworkTaskDispatcher, ToronCoordinator, memory::MemoryManager, transport::ToronTransport,
@@ -649,38 +651,55 @@ where
 			return result;
 		}
 
+		let replay_class = plan_broadcast_replay_class(plan);
+		let mut planner_config = self.config.clone();
+		let mut retried_broadcast_replay = false;
+		let mut fragment_id_namespace = 0;
 		let mut retried_descriptor_evolution = false;
 		let mut invalidated = Vec::new();
 		loop {
-			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
 			if !invalidated.is_empty() {
 				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
 			}
 			match self
-				.execute_bound_distributed_with_context(
+				.execute_bound_distributed_attempt(
 					bound,
 					&context,
 					query_budget,
 					active_query.clone(),
+					fragment_id_namespace,
 				)
 				.await
 			{
 				Ok(results) => return Ok(results),
-				Err(error)
-					if descriptor_evolved_table_id(&error).is_some()
-						&& !retried_descriptor_evolution =>
+				Err(DistributedAttemptError::Scheduler { error, stages })
+					if broadcast_cap_replay_trigger(&error, &stages, replay_class)
+						&& !retried_broadcast_replay =>
 				{
-					if let Some(stale) =
-						invalidate_descriptor_evolution(catalog.as_ref(), &error).await?
+					planner_config.force_hash_joins = true;
+					fragment_id_namespace = next_fragment_id_namespace(fragment_id_namespace)?;
+					retried_broadcast_replay = true;
+					continue;
+				}
+				Err(error) => {
+					let error = error.into_query_error();
+					if descriptor_evolved_table_id(&error).is_some()
+						&& !retried_descriptor_evolution
 					{
-						invalidated.push(stale);
+						if let Some(stale) =
+							invalidate_descriptor_evolution(catalog.as_ref(), &error).await?
+						{
+							invalidated.push(stale);
+						}
+						retried_descriptor_evolution = true;
+						continue;
 					}
-					retried_descriptor_evolution = true;
+					if descriptor_evolved_table_id(&error).is_some() {
+						return Err(QueryError::SchemaInstability);
+					}
+					return Err(error);
 				}
-				Err(error) if descriptor_evolved_table_id(&error).is_some() => {
-					return Err(QueryError::SchemaInstability);
-				}
-				Err(error) => return Err(error),
 			}
 		}
 	}
@@ -781,8 +800,25 @@ where
 		query_budget: QueryBudget,
 		active_query: Option<ActiveQueryHandle>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let stages = fragment_plan(bound, self.fragment_config(context, query_budget))
-			.map_err(fragment_error)?;
+		self.execute_bound_distributed_attempt(bound, context, query_budget, active_query, 0)
+			.await
+			.map_err(DistributedAttemptError::into_query_error)
+	}
+
+	async fn execute_bound_distributed_attempt(
+		&self,
+		bound: ExecutionPlan,
+		context: &ExecutionContext,
+		query_budget: QueryBudget,
+		active_query: Option<ActiveQueryHandle>,
+		fragment_id_namespace: u32,
+	) -> Result<Vec<RecordBatch>, DistributedAttemptError> {
+		let stages = fragment_plan(
+			bound,
+			self.fragment_config(context, query_budget)
+				.with_id_namespace(fragment_id_namespace),
+		)
+		.map_err(DistributedAttemptError::Fragment)?;
 		let mut scheduler = DistributedScheduler::new(self.registry.clone())
 			.with_max_in_flight_tasks(query_budget.max_in_flight_tasks);
 		let mut dispatcher =
@@ -797,7 +833,7 @@ where
 				{
 					scheduler.cancel_query(context.query_id);
 				}
-				return Err(scheduler_error(error));
+				return Err(DistributedAttemptError::Scheduler { error, stages });
 			}
 		};
 		Ok(run.final_results)
@@ -850,6 +886,10 @@ where
 	Registry: WorkerRegistry + ?Sized + 'static,
 	Transport: ToronTransport + ?Sized + 'static,
 {
+	let replay_class = plan_broadcast_replay_class(&plan);
+	let mut config = config;
+	let mut retried_broadcast_replay = false;
+	let mut fragment_id_namespace = 0;
 	let mut retried_descriptor_evolution = false;
 	let mut invalidated = Vec::new();
 	loop {
@@ -865,7 +905,8 @@ where
 				context.query_id,
 				TaskBudget::from_query_budget(query_budget),
 			)
-			.with_task_context(TaskExecutionContext::from_execution_context(&context)),
+			.with_task_context(TaskExecutionContext::from_execution_context(&context))
+			.with_id_namespace(fragment_id_namespace),
 		)
 		.map_err(fragment_error)?;
 		let mut scheduler = DistributedScheduler::new(registry.clone())
@@ -878,6 +919,15 @@ where
 			Err(error) => {
 				if active_query.is_cancelled() {
 					scheduler.cancel_query(context.query_id);
+				}
+				if broadcast_cap_replay_trigger(&error, &stages, replay_class)
+					&& !retried_broadcast_replay
+					&& !batch_sent.load(Ordering::SeqCst)
+				{
+					config.force_hash_joins = true;
+					fragment_id_namespace = next_fragment_id_namespace(fragment_id_namespace)?;
+					retried_broadcast_replay = true;
+					continue;
 				}
 				let error = scheduler_error(error);
 				if descriptor_evolved_table_id(&error).is_some()
@@ -1002,9 +1052,176 @@ fn logical_plan_is_distributed_read(plan: &LogicalPlan) -> bool {
 	)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BroadcastReplayClass {
+	NotReplayable,
+	Replayable,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BroadcastReplayScan {
+	has_replayable_candidate: bool,
+	has_terminal_pinned_broadcast: bool,
+}
+
+fn plan_broadcast_replay_class(plan: &LogicalPlan) -> BroadcastReplayClass {
+	let scan = scan_logical_plan_for_broadcast_replay(plan);
+	if scan.has_replayable_candidate && !scan.has_terminal_pinned_broadcast {
+		BroadcastReplayClass::Replayable
+	} else {
+		BroadcastReplayClass::NotReplayable
+	}
+}
+
+fn scan_logical_plan_for_broadcast_replay(plan: &LogicalPlan) -> BroadcastReplayScan {
+	match plan {
+		LogicalPlan::Join {
+			left,
+			right,
+			strategy_intent,
+			..
+		} => {
+			let mut scan = merge_broadcast_replay_scans(
+				scan_logical_plan_for_broadcast_replay(left),
+				scan_logical_plan_for_broadcast_replay(right),
+			);
+			match strategy_intent {
+				JoinStrategyIntent::Auto => scan.has_replayable_candidate = true,
+				JoinStrategyIntent::Pinned {
+					strategy: JoinStrategy::Broadcast,
+					source: JoinStrategyPinSource::SqlHint,
+				} => scan.has_replayable_candidate = true,
+				JoinStrategyIntent::Pinned {
+					strategy: JoinStrategy::Broadcast,
+					source: JoinStrategyPinSource::Rune | JoinStrategyPinSource::Direct,
+				} => scan.has_terminal_pinned_broadcast = true,
+				JoinStrategyIntent::Pinned {
+					strategy: JoinStrategy::HashPartitioned,
+					..
+				} => {}
+			}
+			scan
+		}
+		LogicalPlan::Alias { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. }
+		| LogicalPlan::Explain { input }
+		| LogicalPlan::CreateTableAsSelect { source: input, .. }
+		| LogicalPlan::InsertSelect { source: input, .. } => {
+			scan_logical_plan_for_broadcast_replay(input)
+		}
+		LogicalPlan::Scan { .. }
+		| LogicalPlan::ScanNamed { .. }
+		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
+		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
+		| LogicalPlan::Insert { .. } => BroadcastReplayScan::default(),
+	}
+}
+
+fn merge_broadcast_replay_scans(
+	left: BroadcastReplayScan,
+	right: BroadcastReplayScan,
+) -> BroadcastReplayScan {
+	BroadcastReplayScan {
+		has_replayable_candidate: left.has_replayable_candidate || right.has_replayable_candidate,
+		has_terminal_pinned_broadcast: left.has_terminal_pinned_broadcast
+			|| right.has_terminal_pinned_broadcast,
+	}
+}
+
+fn broadcast_cap_replay_trigger(
+	error: &SchedulerError,
+	stages: &[StagePlan],
+	replay_class: BroadcastReplayClass,
+) -> bool {
+	matches!(replay_class, BroadcastReplayClass::Replayable)
+		&& matches!(
+			error,
+			SchedulerError::TaskFailed {
+				key,
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::BroadcastReplication,
+					..
+				},
+			} if task_key_contains_broadcast_join(stages, *key)
+		)
+}
+
+fn task_key_contains_broadcast_join(stages: &[StagePlan], key: TaskKey) -> bool {
+	stages.iter().any(|stage| {
+		stage.stage_id == key.stage_id
+			&& stage.tasks.iter().any(|task| {
+				TaskKey::from_identity(task.spec.identity) == key
+					&& execution_plan_contains_broadcast_join(&task.spec.plan)
+			})
+	})
+}
+
+fn execution_plan_contains_broadcast_join(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} => {
+			*strategy == JoinStrategy::Broadcast
+				|| execution_plan_contains_broadcast_join(left)
+				|| execution_plan_contains_broadcast_join(right)
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => execution_plan_contains_broadcast_join(input),
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => false,
+	}
+}
+
+fn next_fragment_id_namespace(current: u32) -> Result<u32, QueryError> {
+	current.checked_add(1).ok_or_else(|| QueryError::Internal {
+		message: "fragment id namespace overflow during broadcast-cap replay".to_string(),
+	})
+}
+
 struct AdmittedQuery {
 	query_budget: QueryBudget,
 	_reservation: AdmissionReservation,
+}
+
+enum DistributedAttemptError {
+	Fragment(FragmentError),
+	Scheduler {
+		error: SchedulerError,
+		stages: Vec<StagePlan>,
+	},
+}
+
+impl DistributedAttemptError {
+	fn into_query_error(self) -> QueryError {
+		match self {
+			Self::Fragment(error) => fragment_error(error),
+			Self::Scheduler { error, .. } => scheduler_error(error),
+		}
+	}
 }
 
 fn budget_rejection_query_error(rejection: BudgetRejection) -> QueryError {

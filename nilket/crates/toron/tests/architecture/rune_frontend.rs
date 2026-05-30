@@ -1737,13 +1737,13 @@ pub(crate) fn adr122_join_builder_is_pair_shaped_and_shared() {
 	assert!(builder.contains("LogicalPlan::Join"));
 	assert!(builder.contains("JoinStrategy::HashPartitioned"));
 	assert!(builder.contains("JoinStrategy::Broadcast"));
-	assert!(planner.contains("build_join_plan(plan, right, kind, on, strategy)?"));
+	assert!(planner.contains("build_join_plan(plan, right, kind, on, strategy, source)?"));
 	assert!(lower_exists.contains("build_join_plan("));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
 	assert!(
 		rune.contains("join_with_strategy(left, right, kind, on, JoinStrategy::HashPartitioned)")
 	);
-	assert!(rune.contains("build_join_plan(left, right, kind, pairs, strategy)"));
+	assert!(rune.contains("build_join_plan(") && rune.contains("JoinStrategyPinSource::Rune"));
 	assert!(!planner.contains("fn build_hash_join_plan"));
 }
 
@@ -1898,7 +1898,7 @@ pub(crate) fn adr128_sql_broadcast_hint_authoring_is_narrow() {
 	assert!(lower_select.contains("parse_broadcast_join_hint(optimizer_hints)?"));
 	assert!(lower_select.contains("join_strategy_intent_for_hint"));
 	assert!(lower_select.contains("build_auto_join_plan(plan, right, kind, on)"));
-	assert!(lower_select.contains("build_join_plan(plan, right, kind, on, strategy)?"));
+	assert!(lower_select.contains("build_join_plan(plan, right, kind, on, strategy, source)?"));
 	assert!(planner.contains("JoinStrategy::Broadcast"));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
 	assert!(!lower_exists.contains("JoinStrategy::Broadcast"));
@@ -1990,7 +1990,7 @@ pub(crate) fn adr129_logical_join_has_strategy_intent_execution_join_concrete() 
 
 	assert!(ir.contains("pub enum JoinStrategyIntent"));
 	assert!(ir.contains("Auto"));
-	assert!(ir.contains("Pinned(JoinStrategy)"));
+	assert!(ir.contains("Pinned {"));
 	assert!(logical_plan.contains("strategy_intent: JoinStrategyIntent"));
 	assert!(!logical_plan.contains("strategy: JoinStrategy"));
 	assert!(execution_plan.contains("strategy: JoinStrategy"));
@@ -2033,7 +2033,7 @@ pub(crate) fn adr129_strategy_decision_is_single_helper() {
 	assert!(bind_join.contains("match decision.strategy"));
 	assert!(!bind_join.contains("byte_upper_bound"));
 	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
-	assert!(choose_join_strategy.contains("JoinStrategyIntent::Pinned(strategy)"));
+	assert!(choose_join_strategy.contains("JoinStrategyIntent::Pinned { strategy, .. }"));
 	assert!(choose_join_strategy.contains("JoinStrategyIntent::Auto"));
 	assert!(choose_auto.contains("JoinStrategy::Broadcast"));
 	assert!(choose_auto.contains("hash_join_decision"));
@@ -2059,7 +2059,7 @@ pub(crate) fn adr129_exchange_insertion_split_is_temporary() {
 	let build_auto_join_plan = source_block(&planner, "pub(crate) fn build_auto_join_plan");
 	let bind_join = source_block(&binder, "async fn bind_join");
 
-	assert!(build_join_plan.contains("JoinStrategyIntent::Pinned(strategy)"));
+	assert!(build_join_plan.contains("JoinStrategyIntent::Pinned { strategy, source }"));
 	assert!(build_auto_join_plan.contains("JoinStrategyIntent::Auto"));
 	assert!(bind_join.contains("exchange_for_join_keys"));
 	assert!(bind_join.contains("JoinStrategy::HashPartitioned"));
@@ -2301,7 +2301,7 @@ pub(crate) fn adr131_strategy_decision_remains_single_helper() {
 	assert!(bind_join.contains("choose_join_strategy("));
 	assert!(!bind_join.contains("byte_upper_bound"));
 	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
-	assert!(choose_join_strategy.contains("JoinStrategyIntent::Pinned(strategy)"));
+	assert!(choose_join_strategy.contains("JoinStrategyIntent::Pinned { strategy, .. }"));
 	assert!(choose_join_strategy.contains("JoinStrategyIntent::Auto"));
 	assert!(choose_auto.contains("ProbeNotScanLinear"));
 }
@@ -2390,7 +2390,7 @@ pub(crate) fn adr130_behavior_gates_cover_tiny_right_and_left_tie_fence() {
 		"sql_fact_left_tiny_right_infers_broadcast",
 		"both_sides_tiny_equal_keeps_left_build",
 		"right_tiny_left_deep_join_infers_broadcast_star",
-		"pinned_broadcast_still_wins_and_fail_loud",
+		"sql_broadcast_hint_binds_pinned_by_author",
 		"right_build_swapped_plan_is_valid_left_build_broadcast",
 	] {
 		assert!(binder.contains(gate), "missing ADR130 behavior gate {gate}");

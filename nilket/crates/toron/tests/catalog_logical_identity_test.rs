@@ -11,8 +11,9 @@ use toron::error::{BindingError, CatalogError, QueryError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, JoinKind, JoinStrategy,
-	JoinStrategyIntent, LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan, LogicalTypeId,
-	PRODUCT_ID_LOGICAL_TYPE, QueryId, ScalarValue, SessionId, TableId, decode_column_logical_type,
+	JoinStrategyIntent, JoinStrategyPinSource, LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan,
+	LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, QueryId, ScalarValue, SessionId, TableId,
+	decode_column_logical_type,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
@@ -834,7 +835,10 @@ fn join_plan(left_key: Expr, right_key: Expr) -> LogicalPlan {
 		}),
 		kind: JoinKind::Inner,
 		on: vec![(left_key, right_key)],
-		strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+		strategy_intent: JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::HashPartitioned,
+			source: JoinStrategyPinSource::Direct,
+		},
 	}
 }
 

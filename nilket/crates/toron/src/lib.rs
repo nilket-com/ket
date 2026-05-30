@@ -28,7 +28,7 @@ mod tests {
 	use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
-	use std::collections::HashMap;
+	use std::collections::{HashMap, HashSet};
 	use std::sync::Arc;
 
 	use crate::binder::{PlannerConfig, bind};
@@ -36,6 +36,7 @@ mod tests {
 	use crate::coordinator::DistributedQueryCoordinator;
 	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
+	use crate::distributed::fragment::{FragmentPlanConfig, fragment_plan};
 	use crate::distributed::identity::{
 		AttemptId, ExchangeId, LeaseEpoch, PartitionId, QueryId, TaskId, TaskIdentity, WorkerId,
 	};
@@ -57,7 +58,8 @@ mod tests {
 	use crate::exec::Executor;
 	use crate::ir::{
 		AggregateFunction, BoundExprProgram, ExecutionPlan, Expr, JoinKind, JoinStrategy,
-		JoinStrategyIntent, LogicalPlan, MorselId, ScalarValue, SortExpr, StageId, TableId,
+		JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, MorselId, ScalarValue, SortExpr,
+		StageId, TableId,
 	};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::server::{
@@ -574,7 +576,10 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		let results = run_distributed_join_query(plan, 8).await;
@@ -626,6 +631,19 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn direct_pinned_broadcast_over_cap_stays_terminal() {
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+
+		let err = run_distributed_join_query_with_budget(broadcast_join_plan(), 2, query_budget)
+			.await
+			.expect_err("direct pinned broadcast cap must fail");
+
+		assert_broadcast_cap_error(err);
+	}
+
+	#[tokio::test]
 	async fn rune_authored_broadcast_join_digest_matches_hash_join_over_tcp() {
 		let hash_results = run_distributed_join_query(rune_hash_join_plan().await, 16).await;
 		let broadcast_results =
@@ -652,16 +670,7 @@ mod tests {
 		.await
 		.expect_err("Rune-authored broadcast cap must fail");
 
-		assert!(matches!(
-			err,
-			QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
-				kind: TaskFailureKind::BudgetExhausted {
-					dimension: BudgetDimension::BroadcastReplication,
-					..
-				},
-				..
-			})
-		));
+		assert_broadcast_cap_error(err);
 	}
 
 	#[tokio::test]
@@ -682,6 +691,16 @@ mod tests {
 
 		assert_eq!(broadcast_digest, hash_digest);
 		assert_eq!(broadcast_digest, rune_digest);
+	}
+
+	#[tokio::test]
+	async fn sql_and_rune_broadcast_pins_have_distinct_sources() {
+		assert_broadcast_pin_source(&sql_broadcast_join_plan(), JoinStrategyPinSource::SqlHint);
+		assert_broadcast_pin_source(
+			&rune_broadcast_join_plan().await,
+			JoinStrategyPinSource::Rune,
+		);
+		assert_broadcast_pin_source(&broadcast_join_plan(), JoinStrategyPinSource::Direct);
 	}
 
 	#[tokio::test]
@@ -804,26 +823,96 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn sql_broadcast_hint_respects_cap_terminally() {
+	async fn estimated_broadcast_over_cap_replays_as_hash_and_matches_digest() {
+		let hash_results = run_distributed_join_query(sql_fact_dim_join_plan(), 16).await;
 		let mut query_budget = QueryBudget::test_default();
 		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
 		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
 
-		let err =
+		let replay_results = run_distributed_join_query_with_catalog_config_and_budget(
+			sql_fact_dim_join_plan(),
+			3,
+			join_catalog_with_customers_row_upper_bound(12),
+			PlannerConfig::default(),
+			query_budget,
+		)
+		.await
+		.expect("estimated broadcast should replay as hash");
+
+		assert_fact_dim_join_matches_hash(&hash_results, &replay_results);
+	}
+
+	#[tokio::test]
+	async fn hard_bound_broadcast_over_cap_replays_as_hash_and_matches_digest() {
+		let hash_results = run_distributed_join_query(sql_fact_dim_join_plan(), 16).await;
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+
+		let replay_results = run_distributed_join_query_with_catalog_config_and_budget(
+			sql_fact_dim_join_plan(),
+			3,
+			join_catalog_with_optimizer_facts(64 * 1024 * 1024, 1_024),
+			PlannerConfig::default(),
+			query_budget,
+		)
+		.await
+		.expect("hard-bound broadcast should replay as hash");
+
+		assert_fact_dim_join_matches_hash(&hash_results, &replay_results);
+	}
+
+	#[tokio::test]
+	async fn sql_broadcast_hint_over_cap_replays_as_hash() {
+		let hash_results = run_distributed_join_query(sql_hash_join_plan(), 16).await;
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+
+		let replay_results =
 			run_distributed_join_query_with_budget(sql_broadcast_join_plan(), 2, query_budget)
 				.await
-				.expect_err("SQL broadcast cap must fail");
+				.expect("SQL broadcast hint should replay as hash");
 
-		assert!(matches!(
-			err,
-			QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
-				kind: TaskFailureKind::BudgetExhausted {
-					dimension: BudgetDimension::BroadcastReplication,
-					..
-				},
-				..
-			})
-		));
+		assert_eq!(
+			canonical_arrow_ipc_digest(&replay_results, SortPolicy::FullRowLex)
+				.expect("SQL replay digest"),
+			canonical_arrow_ipc_digest(&hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	#[tokio::test]
+	async fn replay_uses_fresh_fragment_namespace() {
+		let bound = bind(
+			&hash_join_customers_left_plan(),
+			join_catalog().as_ref(),
+			&PlannerConfig::default(),
+		)
+		.await
+		.expect("bind hash join");
+		let query_id = QueryId::from_u128(139);
+		let config = FragmentPlanConfig::new(
+			query_id,
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		);
+		let stages0 = fragment_plan(bound.clone(), config).expect("fragment attempt 0");
+		let stages1 = fragment_plan(bound, config.with_id_namespace(1)).expect("fragment replay");
+
+		assert!(
+			stage_ids(&stages0).is_disjoint(&stage_ids(&stages1)),
+			"replay stages must not reuse attempt-0 stage ids"
+		);
+		assert!(
+			exchange_ids(&stages0).is_disjoint(&exchange_ids(&stages1)),
+			"replay exchanges must not reuse attempt-0 exchange ids"
+		);
+		assert!(
+			stages1
+				.iter()
+				.flat_map(|stage| &stage.tasks)
+				.all(|task| task.spec.identity.query_id == query_id
+					&& task.spec.identity.attempt_id == AttemptId::first())
+		);
 	}
 
 	#[tokio::test]
@@ -1485,6 +1574,22 @@ mod tests {
 		Arc::new(catalog)
 	}
 
+	fn join_catalog_with_customers_row_upper_bound(
+		customers_row_upper_bound: u64,
+	) -> Arc<MockCatalog> {
+		let mut catalog = join_catalog_inner();
+		catalog
+			.seed_optimizer_facts(
+				&crate::catalog::TableRef::new("customers"),
+				TableOptimizerFacts {
+					byte_upper_bound: None,
+					row_upper_bound: Some(RowCount::new(customers_row_upper_bound)),
+				},
+			)
+			.expect("seed customers row optimizer facts");
+		Arc::new(catalog)
+	}
+
 	fn join_catalog_inner() -> MockCatalog {
 		let mut catalog = MockCatalog::new();
 		catalog
@@ -1582,7 +1687,10 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Direct,
+			},
 		}
 	}
 
@@ -1615,7 +1723,10 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		}
 	}
 
@@ -1860,6 +1971,52 @@ mod tests {
 				.expect("right-build broadcast digest"),
 			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex).expect("hash digest")
 		);
+	}
+
+	fn assert_broadcast_cap_error(error: QueryError) {
+		assert!(matches!(
+			error,
+			QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::BroadcastReplication,
+					..
+				},
+				..
+			})
+		));
+	}
+
+	fn assert_broadcast_pin_source(plan: &LogicalPlan, expected: JoinStrategyPinSource) {
+		match plan {
+			LogicalPlan::Join {
+				strategy_intent:
+					JoinStrategyIntent::Pinned {
+						strategy: JoinStrategy::Broadcast,
+						source,
+					},
+				..
+			} => assert_eq!(*source, expected),
+			other => panic!("expected pinned broadcast join, got {other:?}"),
+		}
+	}
+
+	fn stage_ids(stages: &[StagePlan]) -> HashSet<crate::distributed::identity::StageId> {
+		stages.iter().map(|stage| stage.stage_id).collect()
+	}
+
+	fn exchange_ids(stages: &[StagePlan]) -> HashSet<ExchangeId> {
+		let mut ids = HashSet::new();
+		for task in stages.iter().flat_map(|stage| &stage.tasks) {
+			for input in &task.spec.inputs {
+				if let TaskInputBinding::ShuffleConsumer { exchange_id, .. } = input {
+					ids.insert(*exchange_id);
+				}
+			}
+			if let TaskOutputBinding::ShuffleProducer { exchange_id, .. } = &task.spec.output {
+				ids.insert(*exchange_id);
+			}
+		}
+		ids
 	}
 
 	fn field_names(schema: &Schema) -> Vec<&str> {

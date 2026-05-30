@@ -16,8 +16,9 @@ use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
 	BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategy, JoinStrategyIntent, LogicalPlan, LogicalTypeId, ScalarValue, SystemTableKind,
-	TableId, decode_column_logical_type, field_with_logical_type_metadata,
+	JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId,
+	ScalarValue, SystemTableKind, TableId, decode_column_logical_type,
+	field_with_logical_type_metadata,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -366,7 +367,10 @@ async fn rune_join_wraps_both_inputs_in_hash_exchanges() {
 	assert_eq!(kind, JoinKind::Inner);
 	assert_eq!(
 		strategy_intent,
-		JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned)
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::HashPartitioned,
+			source: JoinStrategyPinSource::Rune
+		}
 	);
 	assert_eq!(on.len(), 1);
 	let LogicalPlan::Exchange {
@@ -410,7 +414,10 @@ async fn rune_authored_broadcast_join_constructs_validated_broadcast_plan() {
 	assert_eq!(kind, JoinKind::Inner);
 	assert_eq!(
 		strategy_intent,
-		JoinStrategyIntent::Pinned(JoinStrategy::Broadcast)
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::Rune
+		}
 	);
 	assert_eq!(on.len(), 1);
 	assert_qualified_column(&on[0].0, "r", "region");
@@ -565,11 +572,17 @@ async fn broadcast_join_qualifier_resolution_matches_hash() {
 	};
 	assert_eq!(
 		hash_strategy,
-		JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned)
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::HashPartitioned,
+			source: JoinStrategyPinSource::Rune
+		}
 	);
 	assert_eq!(
 		broadcast_strategy,
-		JoinStrategyIntent::Pinned(JoinStrategy::Broadcast)
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::Rune
+		}
 	);
 
 	assert_eq!(hash_on.len(), 1);
@@ -680,7 +693,10 @@ async fn rune_join_named_methods_lower_to_existing_join_kinds() {
 		assert_eq!(kind, expected, "{method}");
 		assert_eq!(
 			strategy_intent,
-			JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Rune
+			},
 			"{method}"
 		);
 		assert!(

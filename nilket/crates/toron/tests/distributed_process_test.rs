@@ -24,7 +24,7 @@ use toron::distributed::worker_registry::{
 };
 use toron::ir::{
 	AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
-	LogicalPlan, SortExpr, TableId,
+	JoinStrategyPinSource, LogicalPlan, SortExpr, TableId,
 };
 use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
@@ -1595,7 +1595,10 @@ fn hash_join_plan_with_partitions_and_kind(partition_count: u32, kind: JoinKind)
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 		)],
-		strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+		strategy_intent: JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::HashPartitioned,
+			source: JoinStrategyPinSource::Direct,
+		},
 	}
 }
 
@@ -1618,7 +1621,10 @@ fn broadcast_join_plan() -> LogicalPlan {
 			Expr::qualified_column(TableRef::new("customers"), "id"),
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 		)],
-		strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+		strategy_intent: JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::Direct,
+		},
 	}
 }
 

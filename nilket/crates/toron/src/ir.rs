@@ -620,7 +620,17 @@ pub enum JoinStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinStrategyIntent {
 	Auto,
-	Pinned(JoinStrategy),
+	Pinned {
+		strategy: JoinStrategy,
+		source: JoinStrategyPinSource,
+	},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinStrategyPinSource {
+	Direct,
+	SqlHint,
+	Rune,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

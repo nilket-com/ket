@@ -4,7 +4,8 @@ use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, CreateTableColumn, CreateTableColumnType, CreateTableRowIdentity,
 	CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy, JoinStrategyIntent,
-	LogicalPlan, ReturningProjection, ScalarValue, SortExpr, data_type_to_logical_type_physical,
+	JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue, SortExpr,
+	data_type_to_logical_type_physical,
 };
 use arrow::datatypes::DataType;
 use sqlparser::ast::{
@@ -2789,8 +2790,8 @@ impl SqlPlanner {
 				join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right, kind)?;
 			plan = match strategy_intent {
 				JoinStrategyIntent::Auto => build_auto_join_plan(plan, right, kind, on),
-				JoinStrategyIntent::Pinned(strategy) => {
-					build_join_plan(plan, right, kind, on, strategy)?
+				JoinStrategyIntent::Pinned { strategy, source } => {
+					build_join_plan(plan, right, kind, on, strategy, source)?
 				}
 			};
 		}
@@ -3755,6 +3756,7 @@ impl SqlPlanner {
 			},
 			on,
 			JoinStrategy::HashPartitioned,
+			JoinStrategyPinSource::Direct,
 		)
 	}
 
@@ -4196,6 +4198,7 @@ pub(crate) fn build_join_plan(
 	kind: JoinKind,
 	on: Vec<(Expr, Expr)>,
 	strategy: JoinStrategy,
+	source: JoinStrategyPinSource,
 ) -> Result<LogicalPlan, FrontendError> {
 	let (left_keys, right_keys) = derive_join_exchange_keys(&on, &left, &right)?;
 	match strategy {
@@ -4212,7 +4215,7 @@ pub(crate) fn build_join_plan(
 			}),
 			kind,
 			on,
-			strategy_intent: JoinStrategyIntent::Pinned(strategy),
+			strategy_intent: JoinStrategyIntent::Pinned { strategy, source },
 		}),
 		JoinStrategy::Broadcast => {
 			if kind != JoinKind::Inner {
@@ -4229,7 +4232,7 @@ pub(crate) fn build_join_plan(
 				right: Box::new(right),
 				kind,
 				on,
-				strategy_intent: JoinStrategyIntent::Pinned(strategy),
+				strategy_intent: JoinStrategyIntent::Pinned { strategy, source },
 			})
 		}
 	}
@@ -6368,7 +6371,10 @@ fn join_strategy_intent_for_hint(
 			));
 		}
 		hint.consumed = true;
-		return Ok(JoinStrategyIntent::Pinned(JoinStrategy::Broadcast));
+		return Ok(JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::SqlHint,
+		});
 	}
 
 	Ok(JoinStrategyIntent::Auto)
@@ -6550,7 +6556,10 @@ mod tests {
 				assert_eq!(kind, JoinKind::Inner);
 				assert_eq!(
 					strategy_intent,
-					JoinStrategyIntent::Pinned(JoinStrategy::Broadcast)
+					JoinStrategyIntent::Pinned {
+						strategy: JoinStrategy::Broadcast,
+						source: JoinStrategyPinSource::SqlHint
+					}
 				);
 				assert_eq!(on.len(), 1);
 				match *left {
@@ -6638,7 +6647,10 @@ mod tests {
 			}),
 			kind: JoinKind::Inner,
 			on: vec![],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 		let right = LogicalPlan::ScanNamed {
 			table: TableRef::new("lineitem"),
@@ -6672,6 +6684,7 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
 			JoinStrategy::Broadcast,
+			JoinStrategyPinSource::Direct,
 		)
 		.expect_err("non-INNER broadcast join must reject");
 

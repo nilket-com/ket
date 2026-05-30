@@ -21,11 +21,11 @@ use crate::ir::{
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
 	ColumnOrdinal, ColumnRef, CreateTableColumnType, CreateTableSchema, ExecutionPlan,
 	ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind, JoinStrategy,
-	JoinStrategyIntent, LogicalPlan, LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver,
-	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
-	ScalarValue, SortExpr, SystemTableKind, arithmetic_output_type, decode_column_logical_type,
-	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, logical_type_name,
-	logical_type_spec, schema_for_exprs,
+	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId, LogicalTypeRegistry,
+	LogicalTypeResolver, LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn,
+	ReturningProjection, ScalarValue, SortExpr, SystemTableKind, arithmetic_output_type,
+	decode_column_logical_type, decode_column_logical_type_with_resolver,
+	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -64,6 +64,7 @@ const RECORD_BATCH_IPC_FRAMING_OVERHEAD_BYTES: u64 = 16 * 1024;
 pub struct PlannerConfig {
 	pub allow_experimental_kernels: bool,
 	pub auto_broadcast_max_build_bytes: Option<ByteCount>,
+	pub force_hash_joins: bool,
 }
 
 impl Default for PlannerConfig {
@@ -71,6 +72,7 @@ impl Default for PlannerConfig {
 		Self {
 			allow_experimental_kernels: false,
 			auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
+			force_hash_joins: false,
 		}
 	}
 }
@@ -415,6 +417,7 @@ pub(crate) enum HashByDefaultReason {
 	ProbeNotScanLinear,
 	MissingBuildByteUpperBound,
 	BuildByteUpperBoundAboveThreshold,
+	HashAfterBroadcastCap,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1385,7 +1388,18 @@ impl<'a> Binder<'a> {
 			placement: decision.placement,
 			reason: decision.reason,
 		});
-		if matches!(strategy_intent, JoinStrategyIntent::Auto) {
+		let force_demoted_sql_broadcast = matches!(
+			strategy_intent,
+			JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::SqlHint,
+			}
+		) && self.config.force_hash_joins
+			&& decision.strategy == JoinStrategy::HashPartitioned;
+		if force_demoted_sql_broadcast {
+			left_plan.plan = strip_root_exchange(left_plan.plan);
+		}
+		if matches!(strategy_intent, JoinStrategyIntent::Auto) || force_demoted_sql_broadcast {
 			match decision.strategy {
 				JoinStrategy::HashPartitioned => {
 					left_plan.plan = exchange_for_join_keys(
@@ -4052,7 +4066,14 @@ fn choose_join_strategy(
 	config: &PlannerConfig,
 ) -> JoinStrategyDecision {
 	match intent {
-		JoinStrategyIntent::Pinned(strategy) => JoinStrategyDecision {
+		JoinStrategyIntent::Auto if config.force_hash_joins => {
+			hash_join_decision(HashByDefaultReason::HashAfterBroadcastCap)
+		}
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::SqlHint,
+		} if config.force_hash_joins => hash_join_decision(HashByDefaultReason::HashAfterBroadcastCap),
+		JoinStrategyIntent::Pinned { strategy, .. } => JoinStrategyDecision {
 			strategy,
 			placement: JoinPhysicalPlacement::Natural,
 			reason: JoinStrategyDecisionReason::PinnedByAuthor,
@@ -4298,6 +4319,13 @@ fn exchange_for_join_keys(
 		partition_count,
 		key: join_key_program(keys)?,
 	})
+}
+
+fn strip_root_exchange(input: ExecutionPlan) -> ExecutionPlan {
+	match input {
+		ExecutionPlan::Exchange { input, .. } => *input,
+		other => other,
+	}
 }
 
 fn join_key_program(keys: &[ResolvedJoinKey]) -> Result<BoundExprProgram, BindingError> {
@@ -4743,6 +4771,7 @@ fn hash_by_default_reason_label(reason: HashByDefaultReason) -> &'static str {
 		HashByDefaultReason::BuildByteUpperBoundAboveThreshold => {
 			"build_byte_upper_bound_above_threshold"
 		}
+		HashByDefaultReason::HashAfterBroadcastCap => "hash_after_broadcast_cap",
 	}
 }
 
@@ -7541,7 +7570,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		let plan = bind(&plan, &catalog, &PlannerConfig::default())
@@ -7576,7 +7608,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		let plan = bind(&plan, &catalog, &PlannerConfig::default())
@@ -7604,7 +7639,10 @@ mod tests {
 			right: Box::new(exchanged_named_scan("customers", "id", 2)),
 			kind: JoinKind::Inner,
 			on: vec![(Expr::column("id"), Expr::column("id"))],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		let err = bind(&plan, &catalog, &PlannerConfig::default())
@@ -7625,7 +7663,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("missing"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		let err = bind(&plan, &catalog, &PlannerConfig::default())
@@ -7655,7 +7696,10 @@ mod tests {
 				),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 		let computed = LogicalPlan::Join {
 			left: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
@@ -7665,7 +7709,10 @@ mod tests {
 				Expr::Literal(ScalarValue::Int64(Some(7))),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		assert!(matches!(
@@ -7693,7 +7740,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "region"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		assert!(matches!(
@@ -7712,7 +7762,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("left_floats"), "f"),
 				Expr::qualified_column(TableRef::new("right_floats"), "f"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		assert!(matches!(
@@ -7734,7 +7787,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 		let key_mismatch = LogicalPlan::Join {
 			left: Box::new(exchanged_named_scan("orders", "id", 2)),
@@ -7744,7 +7800,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		assert!(matches!(
@@ -7775,7 +7834,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		assert!(matches!(
@@ -7799,7 +7861,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		assert!(matches!(
@@ -7827,7 +7892,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 		let wrong_left_partition_count = LogicalPlan::Join {
 			left: Box::new(exchanged_named_scan("customers", "id", 4)),
@@ -7840,7 +7908,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 		let both_sides_published = LogicalPlan::Join {
 			left: Box::new(exchanged_named_scan("customers", "id", 1)),
@@ -7850,7 +7921,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 
 		for plan in [
@@ -9008,7 +9082,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn pinned_broadcast_still_wins_and_fail_loud() {
+	async fn sql_broadcast_hint_binds_pinned_by_author() {
 		let logical = SqlPlanner::new()
 			.plan(
 				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
@@ -9017,7 +9091,10 @@ mod tests {
 		assert!(matches!(
 			logical,
 			LogicalPlan::Join {
-				strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::Broadcast),
+				strategy_intent: JoinStrategyIntent::Pinned {
+					strategy: JoinStrategy::Broadcast,
+					source: JoinStrategyPinSource::SqlHint
+				},
 				..
 			}
 		));
@@ -9040,6 +9117,85 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn force_hash_joins_demotes_auto_and_sql_broadcast_only() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let force_hash = PlannerConfig {
+			force_hash_joins: true,
+			..PlannerConfig::default()
+		};
+
+		let auto_logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan auto join");
+		let (auto_plan, auto_trace) = bind_with_trace(&auto_logical, &catalog, &force_hash)
+			.await
+			.expect("bind force-hash auto join");
+		assert_join_strategy(&auto_plan, JoinStrategy::HashPartitioned);
+		assert!(matches!(
+			auto_trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::HashAfterBroadcastCap
+			}
+		));
+
+		let sql_hint = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan SQL hinted broadcast");
+		let (sql_plan, sql_trace) = bind_with_trace(&sql_hint, &catalog, &force_hash)
+			.await
+			.expect("bind force-hash SQL hint");
+		let ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} = sql_plan
+		else {
+			panic!("force-hash SQL hint should bind as a hash join");
+		};
+		assert_eq!(strategy, JoinStrategy::HashPartitioned);
+		assert!(matches!(
+			terminal_exchange(&left),
+			Some((DEFAULT_AUTO_JOIN_PARTITION_COUNT, _))
+		));
+		assert!(matches!(
+			terminal_exchange(&right),
+			Some((DEFAULT_AUTO_JOIN_PARTITION_COUNT, _))
+		));
+		assert!(matches!(
+			sql_trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::HashAfterBroadcastCap
+			}
+		));
+
+		let direct = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("customers", "id", 1)),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Direct,
+			},
+		};
+		let direct_plan = bind(&direct, &catalog, &force_hash)
+			.await
+			.expect("bind direct pinned broadcast under force hash");
+		assert_join_strategy(&direct_plan, JoinStrategy::Broadcast);
+	}
+
+	#[tokio::test]
 	async fn pinned_author_choice_not_downgraded_or_upgraded_by_inference() {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
@@ -9052,7 +9208,10 @@ mod tests {
 				Expr::qualified_column(TableRef::new("customers"), "id"),
 				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			)],
-			strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::HashPartitioned,
+				source: JoinStrategyPinSource::Direct,
+			},
 		};
 		let plan = bind(&pinned_hash, &catalog, &auto_broadcast_config(4_096))
 			.await
@@ -9993,7 +10152,10 @@ mod tests {
 					Expr::qualified_column(TableRef::new("o"), "customer_id"),
 					Expr::qualified_column(TableRef::new("c1"), "id"),
 				)],
-				strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+				strategy_intent: JoinStrategyIntent::Pinned {
+					strategy: JoinStrategy::HashPartitioned,
+					source: JoinStrategyPinSource::Direct,
+				},
 			}),
 			right: Box::new(aliased_named_scan("customers", "c2")),
 			kind: JoinKind::Inner,

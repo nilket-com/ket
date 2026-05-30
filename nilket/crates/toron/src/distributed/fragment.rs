@@ -25,6 +25,7 @@ pub struct FragmentPlanConfig {
 	pub task_budget: TaskBudget,
 	pub worker_count: u32,
 	pub runtime_filters_enabled: bool,
+	pub id_namespace: u32,
 }
 
 impl FragmentPlanConfig {
@@ -35,6 +36,7 @@ impl FragmentPlanConfig {
 			task_budget,
 			worker_count: 1,
 			runtime_filters_enabled: true,
+			id_namespace: 0,
 		}
 	}
 
@@ -50,6 +52,11 @@ impl FragmentPlanConfig {
 
 	pub const fn with_runtime_filters_enabled(mut self, enabled: bool) -> Self {
 		self.runtime_filters_enabled = enabled;
+		self
+	}
+
+	pub const fn with_id_namespace(mut self, id_namespace: u32) -> Self {
+		self.id_namespace = id_namespace;
 		self
 	}
 }
@@ -86,15 +93,31 @@ pub enum FragmentError {
 	InsertSelectNotFragmentable,
 	#[error("CREATE TABLE AS SELECT is a coordinator-only data-plane operation")]
 	CreateTableAsSelectNotFragmentable,
+	#[error("fragment id namespace {namespace} exceeds the stage/exchange id range")]
+	FragmentIdNamespaceOverflow { namespace: u32 },
 }
 
-#[derive(Debug, Default)]
+const FRAGMENT_ID_NAMESPACE_STRIDE: u32 = 1_000_000;
+
+#[derive(Debug)]
 struct FragmentIdAllocator {
 	next_stage: u32,
 	next_exchange: u32,
 }
 
 impl FragmentIdAllocator {
+	fn new(id_namespace: u32) -> Result<Self, FragmentError> {
+		let base = id_namespace
+			.checked_mul(FRAGMENT_ID_NAMESPACE_STRIDE)
+			.ok_or(FragmentError::FragmentIdNamespaceOverflow {
+				namespace: id_namespace,
+			})?;
+		Ok(Self {
+			next_stage: base,
+			next_exchange: base,
+		})
+	}
+
 	fn alloc_stage(&mut self) -> StageId {
 		let id = StageId::new(self.next_stage);
 		self.next_stage = self.next_stage.saturating_add(1);
@@ -192,7 +215,7 @@ pub fn fragment_plan(
 		return Err(FragmentError::CreateTableAsSelectNotFragmentable);
 	}
 
-	let mut allocator = FragmentIdAllocator::default();
+	let mut allocator = FragmentIdAllocator::new(config.id_namespace)?;
 	let (stages, _) = fragment_execution_plan(
 		plan,
 		FragmentTerminalOutput::FinalResult,
