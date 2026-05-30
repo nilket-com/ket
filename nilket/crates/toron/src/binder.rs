@@ -18,13 +18,13 @@ use crate::error::BindingError;
 use crate::exec::Executor;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
-	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp, ColumnName,
-	ColumnOrdinal, ColumnRef, CreateTableColumnType, CreateTableSchema, ExecutionPlan,
-	ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind, JoinStrategy,
-	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId, LogicalTypeRegistry,
-	LogicalTypeResolver, LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn,
-	ReturningProjection, ScalarValue, SortExpr, SystemTableKind, arithmetic_output_type,
-	decode_column_logical_type, decode_column_logical_type_with_resolver,
+	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp,
+	BroadcastReplayEligibility, ColumnName, ColumnOrdinal, ColumnRef, CreateTableColumnType,
+	CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral,
+	JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
+	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
+	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
+	arithmetic_output_type, decode_column_logical_type, decode_column_logical_type_with_resolver,
 	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
@@ -60,11 +60,11 @@ const DEFAULT_UTF8_BINARY_PAYLOAD_BYTES: u64 = 256;
 const DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES: u64 = 1024;
 const RECORD_BATCH_IPC_FRAMING_OVERHEAD_BYTES: u64 = 16 * 1024;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PlannerConfig {
 	pub allow_experimental_kernels: bool,
 	pub auto_broadcast_max_build_bytes: Option<ByteCount>,
-	pub force_hash_joins: bool,
+	pub force_hash_join_ids: BTreeSet<JoinReplayId>,
 }
 
 impl Default for PlannerConfig {
@@ -72,7 +72,7 @@ impl Default for PlannerConfig {
 		Self {
 			allow_experimental_kernels: false,
 			auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
-			force_hash_joins: false,
+			force_hash_join_ids: BTreeSet::new(),
 		}
 	}
 }
@@ -1368,7 +1368,10 @@ impl<'a> Binder<'a> {
 			&declared_output_schema,
 		);
 
+		let join_index = trace.join_decisions.len();
+		let replay_id = JoinReplayId(join_index as u32);
 		let decision = choose_join_strategy(
+			replay_id,
 			strategy_intent,
 			kind,
 			JoinInputOptimization {
@@ -1381,7 +1384,6 @@ impl<'a> Binder<'a> {
 			},
 			self.config,
 		);
-		let join_index = trace.join_decisions.len();
 		trace.join_decisions.push(DecisionReceipt {
 			target: JoinTraceTarget { join_index },
 			strategy: decision.strategy,
@@ -1394,7 +1396,7 @@ impl<'a> Binder<'a> {
 				strategy: JoinStrategy::Broadcast,
 				source: JoinStrategyPinSource::SqlHint,
 			}
-		) && self.config.force_hash_joins
+		) && self.config.force_hash_join_ids.contains(&replay_id)
 			&& decision.strategy == JoinStrategy::HashPartitioned;
 		if force_demoted_sql_broadcast {
 			left_plan.plan = strip_root_exchange(left_plan.plan);
@@ -1439,6 +1441,8 @@ impl<'a> Binder<'a> {
 		)?;
 		let physical_output_schema = join_schema(kind, &left_plan.schema(), &right_plan.schema());
 		let join_plan = ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility: broadcast_replay_eligibility(strategy_intent),
 			left: Box::new(left_plan.plan),
 			right: Box::new(right_plan.plan),
 			kind,
@@ -4058,21 +4062,34 @@ struct ResolvedLogicalColumn {
 	logical_type: LogicalTypeId,
 }
 
+fn broadcast_replay_eligibility(intent: JoinStrategyIntent) -> BroadcastReplayEligibility {
+	match intent {
+		JoinStrategyIntent::Auto
+		| JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::SqlHint,
+		} => BroadcastReplayEligibility::Replayable,
+		JoinStrategyIntent::Pinned { .. } => BroadcastReplayEligibility::Terminal,
+	}
+}
+
 fn choose_join_strategy(
+	replay_id: JoinReplayId,
 	intent: JoinStrategyIntent,
 	kind: JoinKind,
 	left_input: JoinInputOptimization,
 	right_input: JoinInputOptimization,
 	config: &PlannerConfig,
 ) -> JoinStrategyDecision {
+	let force_hash = config.force_hash_join_ids.contains(&replay_id);
 	match intent {
-		JoinStrategyIntent::Auto if config.force_hash_joins => {
+		JoinStrategyIntent::Auto if force_hash => {
 			hash_join_decision(HashByDefaultReason::HashAfterBroadcastCap)
 		}
 		JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::SqlHint,
-		} if config.force_hash_joins => hash_join_decision(HashByDefaultReason::HashAfterBroadcastCap),
+		} if force_hash => hash_join_decision(HashByDefaultReason::HashAfterBroadcastCap),
 		JoinStrategyIntent::Pinned { strategy, .. } => JoinStrategyDecision {
 			strategy,
 			placement: JoinPhysicalPlacement::Natural,
@@ -4207,6 +4224,8 @@ fn broadcast_probe_is_scan_linear(plan: &ExecutionPlan) -> bool {
 			broadcast_probe_is_scan_linear(input)
 		}
 		ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left,
 			right,
 			kind,
@@ -5279,6 +5298,8 @@ fn optimize_for_required(
 			))
 		}
 		ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left,
 			right,
 			kind,
@@ -5298,6 +5319,8 @@ fn optimize_for_required(
 			);
 			Ok((
 				ExecutionPlan::Join {
+					replay_id,
+					replay_eligibility,
 					left: Box::new(left),
 					right: Box::new(right),
 					kind,
@@ -8145,6 +8168,7 @@ mod tests {
 		assert!(terminal_exchange(right).is_none());
 
 		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
 			join_input(PlanOptimizerFacts {
@@ -8263,6 +8287,7 @@ mod tests {
 		assert!(terminal_exchange(&right).is_none());
 
 		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
 			join_input(PlanOptimizerFacts {
@@ -8295,6 +8320,7 @@ mod tests {
 	fn both_sides_eligible_near_tie_keeps_left_build() {
 		let config = auto_broadcast_config(4_096);
 		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
 			join_input(PlanOptimizerFacts {
@@ -8343,6 +8369,84 @@ mod tests {
 			.expect("bind left-deep probe right-tiny join");
 
 		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 2);
+	}
+
+	#[tokio::test]
+	async fn join_replay_id_deterministic_across_rebind() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan left-deep SQL join");
+
+		let (plan_a, trace_a) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("first bind");
+		let (plan_b, trace_b) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("second bind");
+
+		let targets_a: Vec<_> = trace_a
+			.join_decisions
+			.iter()
+			.map(|receipt| receipt.target.join_index)
+			.collect();
+		let targets_b: Vec<_> = trace_b
+			.join_decisions
+			.iter()
+			.map(|receipt| receipt.target.join_index)
+			.collect();
+		assert_eq!(targets_a, vec![0, 1]);
+		assert_eq!(targets_a, targets_b);
+
+		let mut ids_a = Vec::new();
+		let mut ids_b = Vec::new();
+		collect_join_replay_ids(&plan_a, &mut ids_a);
+		collect_join_replay_ids(&plan_b, &mut ids_b);
+		assert_eq!(ids_a, vec![JoinReplayId(1), JoinReplayId(0)]);
+		assert_eq!(ids_a, ids_b);
+	}
+
+	#[tokio::test]
+	async fn force_hash_join_ids_demotes_only_targeted_join() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan left-deep SQL join");
+		let config = PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+			force_hash_join_ids: BTreeSet::from([JoinReplayId(1)]),
+			..PlannerConfig::default()
+		};
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &config)
+			.await
+			.expect("bind targeted replay");
+
+		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 1);
+		assert_join_strategy_count(&plan, JoinStrategy::HashPartitioned, 1);
+		assert_eq!(trace.join_decisions[0].strategy, JoinStrategy::Broadcast);
+		assert_eq!(
+			trace.join_decisions[1].strategy,
+			JoinStrategy::HashPartitioned
+		);
+		assert!(matches!(
+			trace.join_decisions[1].reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::HashAfterBroadcastCap
+			}
+		));
 	}
 
 	#[tokio::test]
@@ -9117,12 +9221,12 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn force_hash_joins_demotes_auto_and_sql_broadcast_only() {
+	async fn force_hash_join_ids_demotes_auto_and_sql_broadcast_only() {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
 		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
 		let force_hash = PlannerConfig {
-			force_hash_joins: true,
+			force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
 			..PlannerConfig::default()
 		};
 
@@ -9193,6 +9297,69 @@ mod tests {
 			.await
 			.expect("bind direct pinned broadcast under force hash");
 		assert_join_strategy(&direct_plan, JoinStrategy::Broadcast);
+	}
+
+	#[tokio::test]
+	async fn mixed_sql_and_rune_broadcast_plan_replays_sql_preserves_rune() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let sql_broadcast = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan SQL hinted broadcast");
+		let rune_build = LogicalPlan::Alias {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			alias: TableRef::new("c2"),
+			columns: Vec::new(),
+		};
+		let mixed = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Exchange {
+				partition_count: 1,
+				key: vec![Expr::qualified_column(TableRef::new("c2"), "id")],
+				input: Box::new(rune_build),
+			}),
+			right: Box::new(sql_broadcast),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("c2"), "id"),
+				Expr::qualified_column(TableRef::new("c"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Rune,
+			},
+		};
+		let config = PlannerConfig {
+			force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
+			..PlannerConfig::default()
+		};
+
+		let (plan, trace) = bind_with_trace(&mixed, &catalog, &config)
+			.await
+			.expect("bind mixed SQL/Rune targeted replay");
+		let mut metadata = Vec::new();
+		collect_join_replay_metadata(&plan, &mut metadata);
+
+		assert_eq!(
+			trace.join_decisions[0].strategy,
+			JoinStrategy::HashPartitioned
+		);
+		assert_eq!(trace.join_decisions[1].strategy, JoinStrategy::Broadcast);
+		assert!(metadata.contains(&(
+			JoinReplayId(0),
+			BroadcastReplayEligibility::Replayable,
+			JoinStrategy::HashPartitioned,
+		)));
+		assert!(metadata.contains(&(
+			JoinReplayId(1),
+			BroadcastReplayEligibility::Terminal,
+			JoinStrategy::Broadcast,
+		)));
 	}
 
 	#[tokio::test]
@@ -9514,6 +9681,7 @@ mod tests {
 	fn inferred_broadcast_carries_reason_receipt() {
 		let config = auto_broadcast_config(4_096);
 		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
 			join_input(PlanOptimizerFacts {
@@ -9544,6 +9712,7 @@ mod tests {
 		);
 
 		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
 			join_input(PlanOptimizerFacts {
@@ -9591,6 +9760,7 @@ mod tests {
 			),
 		] {
 			let decision = choose_join_strategy(
+				JoinReplayId::SYNTHETIC,
 				JoinStrategyIntent::Auto,
 				JoinKind::Inner,
 				join_input(PlanOptimizerFacts {
@@ -9631,6 +9801,7 @@ mod tests {
 	fn hard_byte_bound_still_wins_over_estimate() {
 		let config = auto_broadcast_config(4_096);
 		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
 			join_input(PlanOptimizerFacts {
@@ -9657,6 +9828,7 @@ mod tests {
 		);
 
 		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
 			join_input(PlanOptimizerFacts {
@@ -9688,6 +9860,7 @@ mod tests {
 	fn estimate_above_effective_threshold_hashes() {
 		let config = auto_broadcast_config(4_096);
 		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
 			JoinStrategyIntent::Auto,
 			JoinKind::Inner,
 			join_input(PlanOptimizerFacts {
@@ -10006,6 +10179,75 @@ mod tests {
 			| ExecutionPlan::Exchange { input, .. }
 			| ExecutionPlan::Sort { input, .. }
 			| ExecutionPlan::Take { input, .. } => collect_join_strategies(input, strategies),
+			ExecutionPlan::EmptyRelation { .. }
+			| ExecutionPlan::SystemTable { .. }
+			| ExecutionPlan::Scan { .. }
+			| ExecutionPlan::CreateTable { .. }
+			| ExecutionPlan::CreateLogicalType { .. }
+			| ExecutionPlan::CreateTableAsSelect { .. }
+			| ExecutionPlan::DropTable { .. }
+			| ExecutionPlan::Delete { .. }
+			| ExecutionPlan::Update { .. }
+			| ExecutionPlan::Insert { .. }
+			| ExecutionPlan::InsertSelect { .. } => {}
+		}
+	}
+
+	fn collect_join_replay_ids(plan: &ExecutionPlan, ids: &mut Vec<JoinReplayId>) {
+		match plan {
+			ExecutionPlan::Join {
+				replay_id,
+				left,
+				right,
+				..
+			} => {
+				ids.push(*replay_id);
+				collect_join_replay_ids(left, ids);
+				collect_join_replay_ids(right, ids);
+			}
+			ExecutionPlan::Filter { input, .. }
+			| ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Exchange { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Take { input, .. } => collect_join_replay_ids(input, ids),
+			ExecutionPlan::EmptyRelation { .. }
+			| ExecutionPlan::SystemTable { .. }
+			| ExecutionPlan::Scan { .. }
+			| ExecutionPlan::CreateTable { .. }
+			| ExecutionPlan::CreateLogicalType { .. }
+			| ExecutionPlan::CreateTableAsSelect { .. }
+			| ExecutionPlan::DropTable { .. }
+			| ExecutionPlan::Delete { .. }
+			| ExecutionPlan::Update { .. }
+			| ExecutionPlan::Insert { .. }
+			| ExecutionPlan::InsertSelect { .. } => {}
+		}
+	}
+
+	fn collect_join_replay_metadata(
+		plan: &ExecutionPlan,
+		metadata: &mut Vec<(JoinReplayId, BroadcastReplayEligibility, JoinStrategy)>,
+	) {
+		match plan {
+			ExecutionPlan::Join {
+				replay_id,
+				replay_eligibility,
+				strategy,
+				left,
+				right,
+				..
+			} => {
+				metadata.push((*replay_id, *replay_eligibility, *strategy));
+				collect_join_replay_metadata(left, metadata);
+				collect_join_replay_metadata(right, metadata);
+			}
+			ExecutionPlan::Filter { input, .. }
+			| ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Exchange { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Take { input, .. } => collect_join_replay_metadata(input, metadata),
 			ExecutionPlan::EmptyRelation { .. }
 			| ExecutionPlan::SystemTable { .. }
 			| ExecutionPlan::Scan { .. }

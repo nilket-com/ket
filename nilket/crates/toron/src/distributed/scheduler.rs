@@ -25,6 +25,8 @@ use crate::error::TaskFailureKind;
 use crate::exec::runtime_filter::{
 	build_runtime_filter_fragment, descriptor_from_fragment, merge_fragments,
 };
+#[cfg(test)]
+use crate::ir::{BroadcastReplayEligibility, JoinReplayId};
 use crate::ir::{ExecutionPlan, JoinStrategy};
 use wendelon::schema::PhysicalDescriptorFingerprint;
 
@@ -1668,6 +1670,8 @@ mod tests {
 		let left_schema = left.schema();
 		let right_schema = right.schema();
 		consumer.spec.plan = ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
 			left: Box::new(left),
 			right: Box::new(right),
 			kind,

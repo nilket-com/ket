@@ -1408,7 +1408,10 @@ mod tests {
 	use crate::distributed::task::{
 		ArrowIpcDigest, PartitionAddress, PartitionCount, ProducerPartitionRef,
 	};
-	use crate::ir::{BoundExprProgram, ColumnOrdinal, JoinKind, QueryProfileHint};
+	use crate::ir::{
+		BoundExprProgram, BroadcastReplayEligibility, ColumnOrdinal, JoinKind, JoinReplayId,
+		QueryProfileHint,
+	};
 	use crate::storage::InMemoryStorageScan;
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
@@ -1517,6 +1520,8 @@ mod tests {
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
 			plan: ExecutionPlan::Join {
+				replay_id: JoinReplayId::SYNTHETIC,
+				replay_eligibility: BroadcastReplayEligibility::Terminal,
 				left: Box::new(scan(TableId(1), 1)),
 				right: Box::new(scan(TableId(2), 2)),
 				kind: JoinKind::Inner,
@@ -3019,6 +3024,8 @@ mod tests {
 		let left = scan(TableId(1), 41);
 		let right = scan(TableId(2), 42);
 		let plan = ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
 			left: Box::new(left.clone()),
 			right: Box::new(right.clone()),
 			kind: JoinKind::Inner,
@@ -3119,6 +3126,8 @@ mod tests {
 			partition: Some(PartitionId::new(0)),
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
 			plan: ExecutionPlan::Join {
+				replay_id: JoinReplayId::SYNTHETIC,
+				replay_eligibility: BroadcastReplayEligibility::Terminal,
 				left: Box::new(left.clone()),
 				right: Box::new(right.clone()),
 				kind,

@@ -6,14 +6,14 @@ use crate::distributed::cancellation::DownstreamCancellationContext;
 use crate::distributed::task::TaskTelemetry;
 use crate::error::ExecutionError;
 #[cfg(test)]
-use crate::ir::JoinStrategy;
-#[cfg(test)]
 use crate::ir::arithmetic_output_type;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
 	MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
 };
+#[cfg(test)]
+use crate::ir::{BroadcastReplayEligibility, JoinReplayId, JoinStrategy};
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
 use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
@@ -5651,6 +5651,8 @@ mod tests {
 			Field::new("right_value", DataType::Int32, true),
 		]));
 		let plan = ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
 			left: Box::new(test_scan_plan(TableId(1), left_schema, 1)),
 			right: Box::new(test_scan_plan(TableId(2), right_schema, 2)),
 			kind: JoinKind::Inner,
@@ -5702,6 +5704,8 @@ mod tests {
 			Field::new("right_value", DataType::Int32, true),
 		]));
 		let plan = ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
 			left: Box::new(test_scan_plan(TableId(1), left_schema.clone(), 1)),
 			right: Box::new(test_scan_plan(TableId(2), right_schema.clone(), 2)),
 			kind: JoinKind::Inner,
@@ -6240,6 +6244,8 @@ mod tests {
 		let context = ExecutionContext::local_test().with_task_budget(budget);
 		let executor = Executor::with_context(storage, context);
 		let plan = ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
 			left: Box::new(test_scan_plan(TableId(1), left_schema, 1)),
 			right: Box::new(test_scan_plan(TableId(2), right_schema, 2)),
 			kind: JoinKind::Inner,

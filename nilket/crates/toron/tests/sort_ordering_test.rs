@@ -14,9 +14,10 @@ use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBindi
 use toron::error::{BindingError, ExecutionError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	BoundExprProgram, BoundExprProgramBuilder, ColumnName, ColumnOrdinal, ExecutionPlan,
-	ExecutionSortKey, Expr, FilterDisposition, JoinKind, JoinStrategy, LogicalPlan,
-	QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, TableId,
+	BoundExprProgram, BoundExprProgramBuilder, BroadcastReplayEligibility, ColumnName,
+	ColumnOrdinal, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, JoinKind,
+	JoinReplayId, JoinStrategy, LogicalPlan, QueryProfileHint, ResolvedColumn, ScalarValue,
+	SortExpr, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -752,6 +753,8 @@ fn project_join_output(input: ExecutionPlan) -> ExecutionPlan {
 
 fn join_plan(left: ExecutionPlan, right: ExecutionPlan, strategy: JoinStrategy) -> ExecutionPlan {
 	ExecutionPlan::Join {
+		replay_id: JoinReplayId::SYNTHETIC,
+		replay_eligibility: BroadcastReplayEligibility::Terminal,
 		left: Box::new(left),
 		right: Box::new(right),
 		kind: JoinKind::Inner,

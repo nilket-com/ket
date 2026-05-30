@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +34,9 @@ use crate::error::{
 };
 use crate::exec::{ExecutionContext, Executor};
 use crate::ir::{
-	BoundReturningProjection, ColumnOrdinal, CreateTableRowIdentity, ExecutionPlan,
-	FilterDisposition, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
-	MorselId, TableId, data_type_to_logical_type_physical,
+	BoundReturningProjection, BroadcastReplayEligibility, ColumnOrdinal, CreateTableRowIdentity,
+	ExecutionPlan, FilterDisposition, JoinReplayId, JoinStrategy, LogicalPlan, MorselId, TableId,
+	data_type_to_logical_type_physical,
 };
 use crate::server::{
 	NetworkTaskDispatcher, ToronCoordinator, memory::MemoryManager, transport::ToronTransport,
@@ -651,7 +652,6 @@ where
 			return result;
 		}
 
-		let replay_class = plan_broadcast_replay_class(plan);
 		let mut planner_config = self.config.clone();
 		let mut retried_broadcast_replay = false;
 		let mut fragment_id_namespace = 0;
@@ -673,14 +673,35 @@ where
 				.await
 			{
 				Ok(results) => return Ok(results),
-				Err(DistributedAttemptError::Scheduler { error, stages })
-					if broadcast_cap_replay_trigger(&error, &stages, replay_class)
-						&& !retried_broadcast_replay =>
-				{
-					planner_config.force_hash_joins = true;
-					fragment_id_namespace = next_fragment_id_namespace(fragment_id_namespace)?;
-					retried_broadcast_replay = true;
-					continue;
+				Err(DistributedAttemptError::Scheduler { error, stages }) => {
+					if !retried_broadcast_replay {
+						if let Some(force_hash_join_ids) =
+							broadcast_cap_replay_trigger(&error, &stages)
+						{
+							planner_config.force_hash_join_ids = force_hash_join_ids;
+							fragment_id_namespace =
+								next_fragment_id_namespace(fragment_id_namespace)?;
+							retried_broadcast_replay = true;
+							continue;
+						}
+					}
+					let error =
+						DistributedAttemptError::Scheduler { error, stages }.into_query_error();
+					if descriptor_evolved_table_id(&error).is_some()
+						&& !retried_descriptor_evolution
+					{
+						if let Some(stale) =
+							invalidate_descriptor_evolution(catalog.as_ref(), &error).await?
+						{
+							invalidated.push(stale);
+						}
+						retried_descriptor_evolution = true;
+						continue;
+					}
+					if descriptor_evolved_table_id(&error).is_some() {
+						return Err(QueryError::SchemaInstability);
+					}
+					return Err(error);
 				}
 				Err(error) => {
 					let error = error.into_query_error();
@@ -886,7 +907,6 @@ where
 	Registry: WorkerRegistry + ?Sized + 'static,
 	Transport: ToronTransport + ?Sized + 'static,
 {
-	let replay_class = plan_broadcast_replay_class(&plan);
 	let mut config = config;
 	let mut retried_broadcast_replay = false;
 	let mut fragment_id_namespace = 0;
@@ -920,14 +940,14 @@ where
 				if active_query.is_cancelled() {
 					scheduler.cancel_query(context.query_id);
 				}
-				if broadcast_cap_replay_trigger(&error, &stages, replay_class)
-					&& !retried_broadcast_replay
-					&& !batch_sent.load(Ordering::SeqCst)
-				{
-					config.force_hash_joins = true;
-					fragment_id_namespace = next_fragment_id_namespace(fragment_id_namespace)?;
-					retried_broadcast_replay = true;
-					continue;
+				if !retried_broadcast_replay && !batch_sent.load(Ordering::SeqCst) {
+					if let Some(force_hash_join_ids) = broadcast_cap_replay_trigger(&error, &stages)
+					{
+						config.force_hash_join_ids = force_hash_join_ids;
+						fragment_id_namespace = next_fragment_id_namespace(fragment_id_namespace)?;
+						retried_broadcast_replay = true;
+						continue;
+					}
 				}
 				let error = scheduler_error(error);
 				if descriptor_evolved_table_id(&error).is_some()
@@ -1052,136 +1072,64 @@ fn logical_plan_is_distributed_read(plan: &LogicalPlan) -> bool {
 	)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BroadcastReplayClass {
-	NotReplayable,
-	Replayable,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct BroadcastReplayScan {
-	has_replayable_candidate: bool,
-	has_terminal_pinned_broadcast: bool,
-}
-
-fn plan_broadcast_replay_class(plan: &LogicalPlan) -> BroadcastReplayClass {
-	let scan = scan_logical_plan_for_broadcast_replay(plan);
-	if scan.has_replayable_candidate && !scan.has_terminal_pinned_broadcast {
-		BroadcastReplayClass::Replayable
-	} else {
-		BroadcastReplayClass::NotReplayable
-	}
-}
-
-fn scan_logical_plan_for_broadcast_replay(plan: &LogicalPlan) -> BroadcastReplayScan {
-	match plan {
-		LogicalPlan::Join {
-			left,
-			right,
-			strategy_intent,
-			..
-		} => {
-			let mut scan = merge_broadcast_replay_scans(
-				scan_logical_plan_for_broadcast_replay(left),
-				scan_logical_plan_for_broadcast_replay(right),
-			);
-			match strategy_intent {
-				JoinStrategyIntent::Auto => scan.has_replayable_candidate = true,
-				JoinStrategyIntent::Pinned {
-					strategy: JoinStrategy::Broadcast,
-					source: JoinStrategyPinSource::SqlHint,
-				} => scan.has_replayable_candidate = true,
-				JoinStrategyIntent::Pinned {
-					strategy: JoinStrategy::Broadcast,
-					source: JoinStrategyPinSource::Rune | JoinStrategyPinSource::Direct,
-				} => scan.has_terminal_pinned_broadcast = true,
-				JoinStrategyIntent::Pinned {
-					strategy: JoinStrategy::HashPartitioned,
-					..
-				} => {}
-			}
-			scan
-		}
-		LogicalPlan::Alias { input, .. }
-		| LogicalPlan::Filter { input, .. }
-		| LogicalPlan::Project { input, .. }
-		| LogicalPlan::Aggregate { input, .. }
-		| LogicalPlan::Exchange { input, .. }
-		| LogicalPlan::Sort { input, .. }
-		| LogicalPlan::Take { input, .. }
-		| LogicalPlan::Explain { input }
-		| LogicalPlan::CreateTableAsSelect { source: input, .. }
-		| LogicalPlan::InsertSelect { source: input, .. } => {
-			scan_logical_plan_for_broadcast_replay(input)
-		}
-		LogicalPlan::Scan { .. }
-		| LogicalPlan::ScanNamed { .. }
-		| LogicalPlan::CreateTable { .. }
-		| LogicalPlan::CreateLogicalType { .. }
-		| LogicalPlan::DropTable { .. }
-		| LogicalPlan::Delete { .. }
-		| LogicalPlan::Update { .. }
-		| LogicalPlan::Insert { .. } => BroadcastReplayScan::default(),
-	}
-}
-
-fn merge_broadcast_replay_scans(
-	left: BroadcastReplayScan,
-	right: BroadcastReplayScan,
-) -> BroadcastReplayScan {
-	BroadcastReplayScan {
-		has_replayable_candidate: left.has_replayable_candidate || right.has_replayable_candidate,
-		has_terminal_pinned_broadcast: left.has_terminal_pinned_broadcast
-			|| right.has_terminal_pinned_broadcast,
-	}
-}
-
 fn broadcast_cap_replay_trigger(
 	error: &SchedulerError,
 	stages: &[StagePlan],
-	replay_class: BroadcastReplayClass,
-) -> bool {
-	matches!(replay_class, BroadcastReplayClass::Replayable)
-		&& matches!(
-			error,
-			SchedulerError::TaskFailed {
-				key,
-				kind: TaskFailureKind::BudgetExhausted {
-					dimension: BudgetDimension::BroadcastReplication,
-					..
-				},
-			} if task_key_contains_broadcast_join(stages, *key)
-		)
+) -> Option<BTreeSet<JoinReplayId>> {
+	let SchedulerError::TaskFailed {
+		key,
+		kind:
+			TaskFailureKind::BudgetExhausted {
+				dimension: BudgetDimension::BroadcastReplication,
+				..
+			},
+	} = error
+	else {
+		return None;
+	};
+	let ids = task_key_replayable_broadcast_join_ids(stages, *key);
+	(!ids.is_empty()).then_some(ids)
 }
 
-fn task_key_contains_broadcast_join(stages: &[StagePlan], key: TaskKey) -> bool {
-	stages.iter().any(|stage| {
-		stage.stage_id == key.stage_id
-			&& stage.tasks.iter().any(|task| {
-				TaskKey::from_identity(task.spec.identity) == key
-					&& execution_plan_contains_broadcast_join(&task.spec.plan)
-			})
-	})
+fn task_key_replayable_broadcast_join_ids(
+	stages: &[StagePlan],
+	key: TaskKey,
+) -> BTreeSet<JoinReplayId> {
+	let mut ids = BTreeSet::new();
+	for stage in stages.iter().filter(|stage| stage.stage_id == key.stage_id) {
+		for task in &stage.tasks {
+			if TaskKey::from_identity(task.spec.identity) == key {
+				collect_replayable_broadcast_join_ids(&task.spec.plan, &mut ids);
+			}
+		}
+	}
+	ids
 }
 
-fn execution_plan_contains_broadcast_join(plan: &ExecutionPlan) -> bool {
+fn collect_replayable_broadcast_join_ids(plan: &ExecutionPlan, ids: &mut BTreeSet<JoinReplayId>) {
 	match plan {
 		ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left,
 			right,
 			strategy,
 			..
 		} => {
-			*strategy == JoinStrategy::Broadcast
-				|| execution_plan_contains_broadcast_join(left)
-				|| execution_plan_contains_broadcast_join(right)
+			if *strategy == JoinStrategy::Broadcast
+				&& *replay_eligibility == BroadcastReplayEligibility::Replayable
+			{
+				ids.insert(*replay_id);
+			}
+			collect_replayable_broadcast_join_ids(left, ids);
+			collect_replayable_broadcast_join_ids(right, ids);
 		}
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
-		| ExecutionPlan::Take { input, .. } => execution_plan_contains_broadcast_join(input),
+		| ExecutionPlan::Take { input, .. } => collect_replayable_broadcast_join_ids(input, ids),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -1192,7 +1140,7 @@ fn execution_plan_contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Delete { .. }
 		| ExecutionPlan::Update { .. }
 		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => false,
+		| ExecutionPlan::InsertSelect { .. } => {}
 	}
 }
 

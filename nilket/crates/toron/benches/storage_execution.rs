@@ -330,6 +330,8 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			output_schema,
 		},
 		ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left,
 			right,
 			kind,
@@ -338,6 +340,8 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			strategy,
 			output_schema,
 		} => ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left: Box::new(disable_pbc(*left)),
 			right: Box::new(disable_pbc(*right)),
 			kind,

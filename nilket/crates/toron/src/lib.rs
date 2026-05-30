@@ -798,6 +798,34 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn broadcast_star_over_cap_replays_all_task_local_dims_and_succeeds() {
+		let logical = sql_fact_two_dim_join_plan();
+		let hash_results = run_distributed_join_query(logical.clone(), 16).await;
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+
+		let replay_results = run_distributed_join_query_with_catalog_config_and_budget(
+			logical,
+			3,
+			join_catalog_with_optimizer_facts(64 * 1024 * 1024, 1_024),
+			PlannerConfig {
+				auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+				..PlannerConfig::default()
+			},
+			query_budget,
+		)
+		.await
+		.expect("broadcast star should replay as hash");
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&replay_results, SortPolicy::FullRowLex)
+				.expect("broadcast-star replay digest"),
+			canonical_arrow_ipc_digest(&hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	#[tokio::test]
 	async fn filtered_probe_broadcast_byte_identical_to_hash_over_tcp() {
 		let hash_results =
 			run_distributed_join_query(filtered_fact_probe_dim_left_join_plan(), 16).await;

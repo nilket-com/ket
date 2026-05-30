@@ -9,7 +9,10 @@ use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
-use toron::ir::{ColumnOrdinal, ExecutionPlan, JoinKind, JoinStrategy, QueryProfileHint, TableId};
+use toron::ir::{
+	BroadcastReplayEligibility, ColumnOrdinal, ExecutionPlan, JoinKind, JoinReplayId, JoinStrategy,
+	QueryProfileHint, TableId,
+};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -353,6 +356,8 @@ fn join_plan(
 	right_keys: Vec<ColumnOrdinal>,
 ) -> ExecutionPlan {
 	ExecutionPlan::Join {
+		replay_id: JoinReplayId::SYNTHETIC,
+		replay_eligibility: BroadcastReplayEligibility::Terminal,
 		left: Box::new(scan_plan(TableId(1), left_schema.clone(), 1)),
 		right: Box::new(scan_plan(TableId(2), right_schema.clone(), 2)),
 		kind,

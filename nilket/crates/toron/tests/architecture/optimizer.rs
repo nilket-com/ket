@@ -1140,33 +1140,32 @@ pub(crate) fn adr139_join_strategy_intent_carries_pin_source() {
 #[test]
 pub(crate) fn adr139_sql_hint_pin_is_replayable() {
 	let planner = planner_source();
-	let coordinator = coordinator_source();
+	let binder = binder_source();
 	let lib = lib_source();
 
 	assert!(planner.contains("source: JoinStrategyPinSource::SqlHint"));
-	assert!(coordinator.contains("source: JoinStrategyPinSource::SqlHint"));
-	assert!(coordinator.contains("has_replayable_candidate = true"));
+	assert!(binder.contains("source: JoinStrategyPinSource::SqlHint"));
+	assert!(binder.contains("BroadcastReplayEligibility::Replayable"));
 	assert!(lib.contains("sql_broadcast_hint_over_cap_replays_as_hash"));
 }
 
 #[test]
 pub(crate) fn adr139_rune_broadcast_pin_is_terminal() {
 	let rune = rune_source();
-	let coordinator = coordinator_source();
+	let binder = binder_source();
 	let lib = lib_source();
 
 	assert!(rune.contains("JoinStrategyPinSource::Rune"));
-	assert!(coordinator.contains("JoinStrategyPinSource::Rune | JoinStrategyPinSource::Direct"));
-	assert!(coordinator.contains("has_terminal_pinned_broadcast = true"));
+	assert!(binder.contains("BroadcastReplayEligibility::Terminal"));
 	assert!(lib.contains("rune_authored_broadcast_join_respects_cap_terminally"));
 }
 
 #[test]
 pub(crate) fn adr139_direct_broadcast_pin_is_terminal() {
-	let coordinator = coordinator_source();
+	let binder = binder_source();
 	let lib = lib_source();
 
-	assert!(coordinator.contains("JoinStrategyPinSource::Rune | JoinStrategyPinSource::Direct"));
+	assert!(binder.contains("BroadcastReplayEligibility::Terminal"));
 	assert!(lib.contains("direct_pinned_broadcast_over_cap_stays_terminal"));
 	assert!(lib.contains("source: JoinStrategyPinSource::Direct"));
 }
@@ -1206,7 +1205,7 @@ pub(crate) fn adr139_replay_trigger_classifies_scheduler_error_before_query_erro
 	assert!(trigger.contains("SchedulerError::TaskFailed"));
 	assert!(trigger.contains("TaskFailureKind::BudgetExhausted"));
 	assert!(trigger.contains("BudgetDimension::BroadcastReplication"));
-	assert!(trigger.contains("task_key_contains_broadcast_join(stages, *key)"));
+	assert!(trigger.contains("task_key_replayable_broadcast_join_ids(stages, *key)"));
 	assert!(non_streaming.contains("DistributedAttemptError::Scheduler { error, stages }"));
 	assert!(non_streaming.contains("broadcast_cap_replay_trigger(&error, &stages"));
 	assert!(streaming_trigger < streaming_map);
@@ -1219,9 +1218,9 @@ pub(crate) fn adr139_replay_owned_by_coordinator_not_scheduler() {
 		.expect("read scheduler source");
 
 	assert!(coordinator.contains("retried_broadcast_replay"));
-	assert!(coordinator.contains("force_hash_joins = true"));
+	assert!(coordinator.contains("force_hash_join_ids = force_hash_join_ids"));
 	assert!(coordinator.contains("broadcast_cap_replay_trigger"));
-	assert!(!scheduler.contains("force_hash_joins"));
+	assert!(!scheduler.contains("force_hash_join_ids"));
 	assert!(!scheduler.contains("broadcast_cap_replay"));
 }
 
@@ -1230,7 +1229,7 @@ pub(crate) fn adr139_mutation_paths_return_before_broadcast_replay() {
 	let coordinator = coordinator_source();
 	let execute = source_block(&coordinator, "async fn execute_query_with_admission");
 	let replay_state = execute
-		.find("let replay_class = plan_broadcast_replay_class(plan)")
+		.find("let mut planner_config = self.config.clone()")
 		.expect("broadcast replay state in read path");
 
 	assert!(execute[..replay_state].contains("LogicalPlan::Insert { .. }"));
@@ -1240,7 +1239,7 @@ pub(crate) fn adr139_mutation_paths_return_before_broadcast_replay() {
 	assert!(execute[..replay_state].contains("LogicalPlan::Update { .. }"));
 	assert!(execute[..replay_state].matches("return result;").count() >= 2);
 	assert!(!execute[..replay_state].contains("retried_broadcast_replay"));
-	assert!(!execute[..replay_state].contains("force_hash_joins = true"));
+	assert!(!execute[..replay_state].contains("force_hash_join_ids"));
 }
 
 #[test]
@@ -1251,11 +1250,11 @@ pub(crate) fn adr139_streaming_replay_requires_no_batch_sent() {
 		.find("broadcast_cap_replay_trigger(&error, &stages")
 		.expect("streaming broadcast replay trigger");
 	let force_hash = streaming
-		.find("config.force_hash_joins = true")
+		.find("config.force_hash_join_ids = force_hash_join_ids")
 		.expect("streaming replay force-hash switch");
 
 	assert!(trigger < force_hash);
-	assert!(streaming[trigger..force_hash].contains("&& !batch_sent.load(Ordering::SeqCst)"));
+	assert!(streaming[..force_hash].contains("!batch_sent.load(Ordering::SeqCst)"));
 	assert!(
 		streaming
 			.contains("with_final_result_sender(Some(sender.clone()), Some(batch_sent.clone()))")
@@ -1268,13 +1267,15 @@ pub(crate) fn adr139_replay_mode_demotes_auto_and_sql_broadcasts_only() {
 	let choose = source_block(&binder, "fn choose_join_strategy");
 	let bind_join = source_block(&binder, "async fn bind_join");
 
-	assert!(choose.contains("JoinStrategyIntent::Auto if config.force_hash_joins"));
+	assert!(choose.contains("replay_id: JoinReplayId"));
+	assert!(choose.contains("force_hash_join_ids.contains(&replay_id)"));
+	assert!(choose.contains("JoinStrategyIntent::Auto if force_hash"));
 	assert!(choose.contains("source: JoinStrategyPinSource::SqlHint"));
 	assert!(choose.contains("HashAfterBroadcastCap"));
 	assert!(choose.contains("JoinStrategyIntent::Pinned { strategy, .. }"));
 	assert!(bind_join.contains("force_demoted_sql_broadcast"));
 	assert!(bind_join.contains("strip_root_exchange(left_plan.plan)"));
-	assert!(binder.contains("force_hash_joins_demotes_auto_and_sql_broadcast_only"));
+	assert!(binder.contains("force_hash_join_ids_demotes_auto_and_sql_broadcast_only"));
 }
 
 #[test]
@@ -1299,7 +1300,7 @@ pub(crate) fn adr139_replay_attempt_has_no_broadcast_join_and_is_one_shot() {
 	assert!(binder.contains("assert_join_strategy(&auto_plan, JoinStrategy::HashPartitioned)"));
 	assert!(binder.contains("assert_eq!(strategy, JoinStrategy::HashPartitioned)"));
 	assert!(coordinator.contains("let mut retried_broadcast_replay = false"));
-	assert!(coordinator.contains("&& !retried_broadcast_replay"));
+	assert!(coordinator.contains("if !retried_broadcast_replay"));
 	assert!(coordinator.contains("retried_broadcast_replay = true"));
 	assert!(!coordinator.contains("BudgetDimension::ShuffleBytes"));
 }
@@ -1364,4 +1365,161 @@ pub(crate) fn adr139_138_estimate_channel_untouched() {
 	assert!(binder.contains("fn derive_estimated_byte_size"));
 	assert!(lib.contains("estimated_broadcast_over_cap_replays_as_hash_and_matches_digest"));
 	assert!(lib.contains("hard_bound_broadcast_over_cap_replays_as_hash_and_matches_digest"));
+}
+
+#[test]
+pub(crate) fn adr140_execution_join_carries_stable_replay_id_and_replay_eligibility() {
+	let execution = execution_source();
+	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
+	let join_replay_id = source_block(&execution, "pub struct JoinReplayId");
+	let replay_eligibility = source_block(&execution, "pub enum BroadcastReplayEligibility");
+
+	assert!(join_replay_id.contains("pub struct JoinReplayId(pub u32)"));
+	assert!(
+		execution
+			.contains("PartialOrd, Ord, Hash, Serialize, Deserialize)]\npub struct JoinReplayId")
+	);
+	assert!(replay_eligibility.contains("Replayable"));
+	assert!(replay_eligibility.contains("Terminal"));
+	assert!(execution_plan.contains("replay_id: JoinReplayId"));
+	assert!(execution_plan.contains("replay_eligibility: BroadcastReplayEligibility"));
+	assert!(!execution_plan.contains("JoinStrategyIntent"));
+}
+
+#[test]
+pub(crate) fn adr140_join_replay_id_is_trace_join_index_deterministic() {
+	let binder = binder_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+
+	assert!(bind_join.contains("let join_index = trace.join_decisions.len()"));
+	assert!(bind_join.contains("let replay_id = JoinReplayId(join_index as u32)"));
+	assert!(bind_join.contains("choose_join_strategy("));
+	assert!(bind_join.contains("replay_id,"));
+	assert!(bind_join.contains("target: JoinTraceTarget { join_index }"));
+	assert!(binder.contains("join_replay_id_deterministic_across_rebind"));
+}
+
+#[test]
+pub(crate) fn adr140_optimizer_receipt_target_uses_join_replay_id() {
+	let binder = binder_source();
+	let target = source_block(&binder, "struct JoinTraceTarget");
+	let bind_join = source_block(&binder, "async fn bind_join");
+
+	assert!(target.contains("join_index: usize"));
+	assert!(!target.contains("TableId"));
+	assert!(bind_join.contains("let replay_id = JoinReplayId(join_index as u32)"));
+	assert!(bind_join.contains("target: JoinTraceTarget { join_index }"));
+}
+
+#[test]
+pub(crate) fn adr140_fragment_rewrites_preserve_join_replay_metadata() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragment source");
+	let join_boundary = source_block(&fragment, "struct JoinBoundary");
+	let hash_fragment = source_block(&fragment, "fn fragment_hash_join_plan");
+	let star_rewrite = source_block(&fragment, "fn rewrite_broadcast_star_probe");
+	let replace_exchange = source_block(&fragment, "fn replace_exchange_with_scan");
+
+	assert!(join_boundary.contains("replay_id: JoinReplayId"));
+	assert!(join_boundary.contains("replay_eligibility: BroadcastReplayEligibility"));
+	assert!(hash_fragment.contains("replay_id: join.replay_id"));
+	assert!(hash_fragment.contains("replay_eligibility: join.replay_eligibility"));
+	assert!(star_rewrite.contains("replay_id,"));
+	assert!(star_rewrite.contains("replay_eligibility,"));
+	assert!(replace_exchange.contains("replay_id,"));
+	assert!(replace_exchange.contains("replay_eligibility,"));
+}
+
+#[test]
+pub(crate) fn adr140_replay_force_hash_targets_join_id_set_not_global_bool() {
+	let binder = binder_source();
+	let coordinator = coordinator_source();
+	let config = source_block(&binder, "pub struct PlannerConfig");
+	let choose = source_block(&binder, "fn choose_join_strategy");
+
+	assert!(config.contains("force_hash_join_ids: BTreeSet<JoinReplayId>"));
+	assert!(!config.contains("force_hash_joins: bool"));
+	assert!(choose.contains("replay_id: JoinReplayId"));
+	assert!(choose.contains("force_hash_join_ids.contains(&replay_id)"));
+	assert!(coordinator.contains("force_hash_join_ids = force_hash_join_ids"));
+	assert!(!coordinator.contains("force_hash_joins = true"));
+}
+
+#[test]
+pub(crate) fn adr140_terminal_pins_do_not_globally_veto_replay() {
+	let binder = binder_source();
+	let coordinator = coordinator_source();
+
+	assert!(binder.contains("fn broadcast_replay_eligibility"));
+	assert!(binder.contains("BroadcastReplayEligibility::Replayable"));
+	assert!(binder.contains("BroadcastReplayEligibility::Terminal"));
+	assert!(!coordinator.contains("has_terminal_pinned_broadcast"));
+	assert!(!coordinator.contains("plan_broadcast_replay_class"));
+	assert!(coordinator.contains("collect_replayable_broadcast_join_ids"));
+	assert!(coordinator.contains("BroadcastReplayEligibility::Replayable"));
+	assert!(binder.contains("mixed_sql_and_rune_broadcast_plan_replays_sql_preserves_rune"));
+}
+
+#[test]
+pub(crate) fn adr140_failed_task_collects_replayable_id_set_not_single() {
+	let coordinator = coordinator_source();
+	let lib = lib_source();
+	let trigger = source_block(&coordinator, "fn broadcast_cap_replay_trigger");
+	let task_collect = source_block(&coordinator, "fn task_key_replayable_broadcast_join_ids");
+	let plan_collect = source_block(&coordinator, "fn collect_replayable_broadcast_join_ids");
+
+	assert!(trigger.contains("Option<BTreeSet<JoinReplayId>>"));
+	assert!(trigger.contains("task_key_replayable_broadcast_join_ids(stages, *key)"));
+	assert!(trigger.contains("(!ids.is_empty()).then_some(ids)"));
+	assert!(task_collect.contains("let mut ids = BTreeSet::new()"));
+	assert!(plan_collect.contains("ids.insert(*replay_id)"));
+	assert!(plan_collect.contains("collect_replayable_broadcast_join_ids(left, ids)"));
+	assert!(plan_collect.contains("collect_replayable_broadcast_join_ids(right, ids)"));
+	assert!(!coordinator.contains("single_broadcast"));
+	assert!(lib.contains("broadcast_star_over_cap_replays_all_task_local_dims_and_succeeds"));
+}
+
+#[test]
+pub(crate) fn adr140_preserves_139_fences() {
+	let coordinator = coordinator_source();
+	let streaming = source_block(&coordinator, "async fn run_streaming_read_driver");
+	let trigger = source_block(&coordinator, "fn broadcast_cap_replay_trigger");
+	let execute = source_block(&coordinator, "async fn execute_query_with_admission");
+
+	assert!(coordinator.contains("let mut retried_broadcast_replay = false"));
+	assert!(coordinator.contains("retried_broadcast_replay = true"));
+	assert!(streaming.contains("!batch_sent.load(Ordering::SeqCst)"));
+	assert!(coordinator.contains("fragment_id_namespace"));
+	assert!(coordinator.contains("next_fragment_id_namespace"));
+	assert!(trigger.contains("BudgetDimension::BroadcastReplication"));
+	assert!(!trigger.contains("ShuffleBytes"));
+	assert!(execute.contains("LogicalPlan::Insert { .. }"));
+	assert!(execute.contains("LogicalPlan::Delete { .. }"));
+	assert!(execute.contains("LogicalPlan::Update { .. }"));
+}
+
+#[test]
+pub(crate) fn adr140_no_failure_wire_or_shufflebytes_scope_change() {
+	let coordinator = coordinator_source();
+	let trigger = source_block(&coordinator, "fn broadcast_cap_replay_trigger");
+	let server =
+		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
+	let task = std::fs::read_to_string(manifest_dir().join("src/distributed/task.rs"))
+		.expect("read task source");
+
+	assert!(trigger.contains("BudgetDimension::BroadcastReplication"));
+	assert!(!trigger.contains("ShuffleBytes"));
+	assert!(!server.contains("replay_hint"));
+	assert!(!task.contains("broadcast_join_id"));
+	assert!(!task.contains("replay_hint"));
+}
+
+#[test]
+pub(crate) fn adr140_138_fact_split_untouched() {
+	let binder = binder_source();
+
+	assert!(binder.contains("byte_upper_bound: Option<ByteCount>"));
+	assert!(binder.contains("estimated_byte_size: Option<ByteCount>"));
+	assert!(binder.contains("fn derive_estimated_byte_size"));
+	assert!(!binder.contains("estimated_byte_size: None,\n\t\t\tbyte_upper_bound"));
 }

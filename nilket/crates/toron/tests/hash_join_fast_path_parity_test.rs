@@ -6,7 +6,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::error::StorageError;
 use toron::exec::Executor;
-use toron::ir::{ColumnOrdinal, ExecutionPlan, JoinKind, JoinStrategy, QueryProfileHint, TableId};
+use toron::ir::{
+	BroadcastReplayEligibility, ColumnOrdinal, ExecutionPlan, JoinKind, JoinReplayId, JoinStrategy,
+	QueryProfileHint, TableId,
+};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -269,6 +272,8 @@ async fn run_join(
 ) -> RecordBatch {
 	let output_schema = join_output_schema(&left_schema, &right_schema);
 	let plan = ExecutionPlan::Join {
+		replay_id: JoinReplayId::SYNTHETIC,
+		replay_eligibility: BroadcastReplayEligibility::Terminal,
 		left: Box::new(scan_plan(TableId(1), left_schema, 1)),
 		right: Box::new(scan_plan(TableId(2), right_schema, 2)),
 		kind: JoinKind::Inner,

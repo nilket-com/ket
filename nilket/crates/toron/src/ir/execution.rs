@@ -17,6 +17,19 @@ use wendelon_client::LogicalTypeRefinementPredicate;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ColumnOrdinal(pub u32);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct JoinReplayId(pub u32);
+
+impl JoinReplayId {
+	pub const SYNTHETIC: Self = Self(u32::MAX);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BroadcastReplayEligibility {
+	Replayable,
+	Terminal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnName(pub String);
 
@@ -244,6 +257,8 @@ pub enum ExecutionPlan {
 		output_schema: SchemaRef,
 	},
 	Join {
+		replay_id: JoinReplayId,
+		replay_eligibility: BroadcastReplayEligibility,
 		left: Box<ExecutionPlan>,
 		right: Box<ExecutionPlan>,
 		kind: JoinKind,

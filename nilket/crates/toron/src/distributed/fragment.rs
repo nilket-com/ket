@@ -14,8 +14,8 @@ use crate::distributed::task::{
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
-	BoundExprProgram, ColumnOrdinal, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
-	JoinStrategy, QueryProfileHint,
+	BoundExprProgram, BroadcastReplayEligibility, ColumnOrdinal, ExecutionPlan, ExecutionSortKey,
+	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, QueryProfileHint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +408,8 @@ fn fragment_hash_join_plan(
 	let right_scan_metadata =
 		first_scan_metadata(&right_boundary.input).ok_or(FragmentError::MissingScanMetadata)?;
 	let join_replacement = ExecutionPlan::Join {
+		replay_id: join.replay_id,
+		replay_eligibility: join.replay_eligibility,
 		left: Box::new(shuffle_input_scan(
 			left_scan_metadata,
 			left_boundary.input.schema(),
@@ -594,6 +596,8 @@ fn rewrite_broadcast_star_probe(
 ) -> Result<ExecutionPlan, FragmentError> {
 	match plan {
 		ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left,
 			right,
 			kind,
@@ -630,6 +634,8 @@ fn rewrite_broadcast_star_probe(
 				boundary: build_boundary,
 			});
 			Ok(ExecutionPlan::Join {
+				replay_id,
+				replay_eligibility,
 				left: Box::new(build_scan),
 				right: Box::new(rewrite_broadcast_star_probe(*right, allocator, builds)?),
 				kind,
@@ -752,6 +758,8 @@ struct ExchangeBoundary {
 
 #[derive(Debug, Clone)]
 struct JoinBoundary {
+	replay_id: JoinReplayId,
+	replay_eligibility: BroadcastReplayEligibility,
 	left: Box<ExecutionPlan>,
 	right: Box<ExecutionPlan>,
 	kind: JoinKind,
@@ -966,6 +974,8 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 	match plan {
 		ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left,
 			right,
 			kind,
@@ -974,6 +984,8 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 			strategy,
 			output_schema,
 		} => Some(JoinBoundary {
+			replay_id: *replay_id,
+			replay_eligibility: *replay_eligibility,
 			left: left.clone(),
 			right: right.clone(),
 			kind: *kind,
@@ -1218,6 +1230,8 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			output_schema,
 		},
 		ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left,
 			right,
 			kind,
@@ -1226,6 +1240,8 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			strategy,
 			output_schema,
 		} => ExecutionPlan::Join {
+			replay_id,
+			replay_eligibility,
 			left: Box::new(replace_exchange_with_scan(*left, scan)),
 			right: Box::new(replace_exchange_with_scan(*right, scan)),
 			kind,
@@ -1570,6 +1586,8 @@ mod tests {
 	#[test]
 	fn hash_join_composite_key_is_not_runtime_filter_eligible() {
 		let plan = ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
 			left: Box::new(exchanged_scan(TableId(1), 2)),
 			right: Box::new(exchanged_scan(TableId(2), 2)),
 			kind: JoinKind::Inner,
@@ -1835,6 +1853,8 @@ mod tests {
 		kind: JoinKind,
 	) -> ExecutionPlan {
 		ExecutionPlan::Join {
+			replay_id: JoinReplayId::SYNTHETIC,
+			replay_eligibility: BroadcastReplayEligibility::Terminal,
 			left: Box::new(left),
 			right: Box::new(right),
 			kind,
