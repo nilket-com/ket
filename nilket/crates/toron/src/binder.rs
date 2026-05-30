@@ -67,13 +67,44 @@ pub async fn bind(
 	catalog: &dyn Catalog,
 	config: &PlannerConfig,
 ) -> Result<ExecutionPlan, BindingError> {
-	let plan = Binder { catalog, config }.bind_plan(plan).await?;
-	push_down_scan_projection(plan.plan)
+	let (plan, _) = bind_with_trace(plan, catalog, config).await?;
+	Ok(plan)
+}
+
+pub(crate) async fn bind_with_trace(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Result<(ExecutionPlan, OptimizerTrace), BindingError> {
+	let mut trace = OptimizerTrace::default();
+	let plan = Binder { catalog, config }
+		.bind_plan_with_trace(plan, &mut trace)
+		.await?;
+	let plan = push_down_scan_projection(plan.plan)?;
+	Ok((plan, trace))
 }
 
 struct Binder<'a> {
 	catalog: &'a dyn Catalog,
 	config: &'a PlannerConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JoinTraceTarget {
+	pub(crate) join_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecisionReceipt {
+	pub(crate) target: JoinTraceTarget,
+	pub(crate) strategy: JoinStrategy,
+	pub(crate) placement: JoinPhysicalPlacement,
+	pub(crate) reason: JoinStrategyDecisionReason,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OptimizerTrace {
+	pub(crate) join_decisions: Vec<DecisionReceipt>,
 }
 
 struct ScopedExecutionPlan {
@@ -190,19 +221,19 @@ struct JoinStrategyDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinPhysicalPlacement {
+pub(crate) enum JoinPhysicalPlacement {
 	Natural,
 	SwappedRightBuild,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BroadcastBuildSide {
+pub(crate) enum BroadcastBuildSide {
 	Left,
 	Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinStrategyDecisionReason {
+pub(crate) enum JoinStrategyDecisionReason {
 	PinnedByAuthor,
 	BroadcastInferred {
 		build_side: BroadcastBuildSide,
@@ -216,7 +247,7 @@ enum JoinStrategyDecisionReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HashByDefaultReason {
+pub(crate) enum HashByDefaultReason {
 	AutoBroadcastDisabled,
 	NonInnerJoin,
 	LeftInputNotSingleBaseRelation,
@@ -239,9 +270,21 @@ struct ExprBindContext<'a> {
 }
 
 impl<'a> Binder<'a> {
+	#[cfg(test)]
 	fn bind_plan<'b>(
 		&'b self,
 		plan: &'b LogicalPlan,
+	) -> Pin<Box<dyn Future<Output = Result<ScopedExecutionPlan, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			let mut trace = OptimizerTrace::default();
+			self.bind_plan_with_trace(plan, &mut trace).await
+		})
+	}
+
+	fn bind_plan_with_trace<'b>(
+		&'b self,
+		plan: &'b LogicalPlan,
+		trace: &'b mut OptimizerTrace,
 	) -> Pin<Box<dyn Future<Output = Result<ScopedExecutionPlan, BindingError>> + Send + 'b>> {
 		Box::pin(async move {
 			match plan {
@@ -297,14 +340,14 @@ impl<'a> Binder<'a> {
 					alias,
 					columns,
 				} => {
-					let input = self.bind_plan(input).await?;
+					let input = self.bind_plan_with_trace(input, trace).await?;
 					let facts = input.facts;
 					let plan = bind_alias_column_rename(input.plan, columns)?;
 					let scope = RelationScope::alias(alias.clone(), &plan.schema());
 					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
 				LogicalPlan::Filter { input, predicate } => {
-					let input = self.bind_plan(input).await?;
+					let input = self.bind_plan_with_trace(input, trace).await?;
 					let input_facts = input.facts;
 					let bound_predicate = self
 						.bind_expr_program_scoped(
@@ -340,7 +383,7 @@ impl<'a> Binder<'a> {
 								.to_string(),
 						});
 					}
-					let input = self.bind_plan(input).await?;
+					let input = self.bind_plan_with_trace(input, trace).await?;
 					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
 					let exprs = self
 						.bind_projection_expr_program_scoped(exprs, &input.schema(), &input.scope)
@@ -363,7 +406,7 @@ impl<'a> Binder<'a> {
 					group_expr,
 					aggr_expr,
 				} => {
-					let input = self.bind_plan(input).await?;
+					let input = self.bind_plan_with_trace(input, trace).await?;
 					let input_schema = input.schema();
 					let group_expr = self
 						.bind_expr_program_scoped(group_expr, &input_schema, &input.scope)
@@ -399,7 +442,7 @@ impl<'a> Binder<'a> {
 					partition_count,
 					key,
 				} => {
-					let input = self.bind_plan(input).await?;
+					let input = self.bind_plan_with_trace(input, trace).await?;
 					let facts = input.facts.exchange();
 					let input_schema = input.schema();
 					let key = self
@@ -423,7 +466,7 @@ impl<'a> Binder<'a> {
 					limit,
 					offset,
 				} => {
-					let input = self.bind_plan(input).await?;
+					let input = self.bind_plan_with_trace(input, trace).await?;
 					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
 					let output_schema = input.schema();
 					let order_by = bind_sort_keys(order_by, &output_schema, &input.scope)?;
@@ -442,7 +485,7 @@ impl<'a> Binder<'a> {
 					))
 				}
 				LogicalPlan::Take { input, limit } => {
-					let input = self.bind_plan(input).await?;
+					let input = self.bind_plan_with_trace(input, trace).await?;
 					let facts = input.facts.take(*limit);
 					let output_schema = input.schema();
 					let scope = input.scope.with_schema(output_schema.clone());
@@ -463,7 +506,7 @@ impl<'a> Binder<'a> {
 					on,
 					strategy_intent,
 				} => {
-					self.bind_join(left, right, *kind, on, *strategy_intent)
+					self.bind_join(left, right, *kind, on, *strategy_intent, trace)
 						.await
 				}
 				LogicalPlan::CreateTable {
@@ -496,7 +539,13 @@ impl<'a> Binder<'a> {
 					source,
 				} => {
 					let plan = self
-						.bind_create_table_as_select(table, *if_not_exists, *or_replace, source)
+						.bind_create_table_as_select(
+							table,
+							*if_not_exists,
+							*or_replace,
+							source,
+							trace,
+						)
 						.await?;
 					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
@@ -546,7 +595,13 @@ impl<'a> Binder<'a> {
 					returning,
 				} => {
 					let plan = self
-						.bind_insert_select(table, columns.as_deref(), source, returning.as_ref())
+						.bind_insert_select(
+							table,
+							columns.as_deref(),
+							source,
+							returning.as_ref(),
+							trace,
+						)
 						.await?;
 					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
@@ -710,9 +765,10 @@ impl<'a> Binder<'a> {
 		if_not_exists: bool,
 		or_replace: bool,
 		source: &LogicalPlan,
+		trace: &mut OptimizerTrace,
 	) -> Result<ExecutionPlan, BindingError> {
 		reject_information_schema_target(table)?;
-		let source = self.bind_plan(source).await?;
+		let source = self.bind_plan_with_trace(source, trace).await?;
 		let source = source.plan;
 		let source_schema = source.schema();
 		let schema = infer_ctas_schema(&source_schema)?;
@@ -873,6 +929,7 @@ impl<'a> Binder<'a> {
 		columns: Option<&[String]>,
 		source: &LogicalPlan,
 		returning: Option<&ReturningProjection>,
+		trace: &mut OptimizerTrace,
 	) -> Result<ExecutionPlan, BindingError> {
 		reject_information_schema_target(table)?;
 		let binding = self.catalog.resolve_table(table).await?;
@@ -880,7 +937,7 @@ impl<'a> Binder<'a> {
 		let returning = self.bind_returning_projection(returning, &schema).await?;
 		let target_columns = resolve_insert_target_columns(&schema, columns)?;
 		validate_omitted_insert_target_columns(&schema, &target_columns)?;
-		let source = self.bind_plan(source).await?;
+		let source = self.bind_plan_with_trace(source, trace).await?;
 		let source = source.plan;
 		let source_schema = source.schema();
 		if source_schema.fields().len() != target_columns.len() {
@@ -1087,9 +1144,10 @@ impl<'a> Binder<'a> {
 		kind: JoinKind,
 		on: &[(Expr, Expr)],
 		strategy_intent: JoinStrategyIntent,
+		trace: &mut OptimizerTrace,
 	) -> Result<ScopedExecutionPlan, BindingError> {
-		let mut left_plan = self.bind_plan(left).await?;
-		let mut right_plan = self.bind_plan(right).await?;
+		let mut left_plan = self.bind_plan_with_trace(left, trace).await?;
+		let mut right_plan = self.bind_plan_with_trace(right, trace).await?;
 		let mut left_keys = Vec::new();
 		let mut right_keys = Vec::new();
 		let mut left_resolved_keys = Vec::new();
@@ -1128,6 +1186,13 @@ impl<'a> Binder<'a> {
 			},
 			self.config,
 		);
+		let join_index = trace.join_decisions.len();
+		trace.join_decisions.push(DecisionReceipt {
+			target: JoinTraceTarget { join_index },
+			strategy: decision.strategy,
+			placement: decision.placement,
+			reason: decision.reason,
+		});
 		if matches!(strategy_intent, JoinStrategyIntent::Auto) {
 			match decision.strategy {
 				JoinStrategy::HashPartitioned => {
@@ -7594,6 +7659,64 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn trace_records_broadcast_inference_with_rejected_magnitude() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 3_072);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan SQL join");
+
+		let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind with trace");
+
+		assert_eq!(trace.join_decisions.len(), 1);
+		let receipt = trace.join_decisions[0];
+		assert_eq!(receipt.target.join_index, 0);
+		assert_eq!(receipt.strategy, JoinStrategy::Broadcast);
+		assert_eq!(receipt.placement, JoinPhysicalPlacement::SwappedRightBuild);
+		assert_eq!(
+			receipt.reason,
+			JoinStrategyDecisionReason::BroadcastInferred {
+				build_side: BroadcastBuildSide::Right,
+				build_bytes: ByteCount::new(1_024),
+				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: Some(ByteCount::new(3_072)),
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn trace_records_left_tie_with_rejected_right_bytes() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 1_024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan SQL join");
+
+		let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind with trace");
+
+		assert_eq!(trace.join_decisions.len(), 1);
+		let receipt = trace.join_decisions[0];
+		assert_eq!(receipt.target.join_index, 0);
+		assert_eq!(receipt.strategy, JoinStrategy::Broadcast);
+		assert_eq!(receipt.placement, JoinPhysicalPlacement::Natural);
+		assert_eq!(
+			receipt.reason,
+			JoinStrategyDecisionReason::BroadcastInferred {
+				build_side: BroadcastBuildSide::Left,
+				build_bytes: ByteCount::new(1_024),
+				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: Some(ByteCount::new(1_024)),
+			}
+		);
+	}
+
+	#[tokio::test]
 	async fn both_sides_tiny_equal_keeps_left_build() {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "orders", 1_024);
@@ -7834,6 +7957,43 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn trace_records_hash_reason_for_non_scan_linear_probe() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan nested-probe SQL join");
+
+		let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind with trace");
+
+		assert_eq!(trace.join_decisions.len(), 2);
+		assert_eq!(
+			trace
+				.join_decisions
+				.iter()
+				.map(|receipt| receipt.target.join_index)
+				.collect::<Vec<_>>(),
+			vec![0, 1]
+		);
+		let receipt = trace.join_decisions[1];
+		assert_eq!(receipt.strategy, JoinStrategy::HashPartitioned);
+		assert_eq!(receipt.placement, JoinPhysicalPlacement::Natural);
+		assert_eq!(
+			receipt.reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::ProbeNotScanLinear,
+			}
+		);
+	}
+
+	#[tokio::test]
 	async fn probe_with_aggregate_stays_hash() {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
@@ -7966,6 +8126,73 @@ mod tests {
 			.await
 			.expect("bind pinned broadcast");
 		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+	}
+
+	#[tokio::test]
+	async fn trace_records_pinned_strategy_intent() {
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan hinted broadcast");
+
+		let (_plan, trace) = bind_with_trace(&logical, &join_catalog(), &PlannerConfig::default())
+			.await
+			.expect("bind with trace");
+
+		assert_eq!(trace.join_decisions.len(), 1);
+		let receipt = trace.join_decisions[0];
+		assert_eq!(receipt.target.join_index, 0);
+		assert_eq!(receipt.strategy, JoinStrategy::Broadcast);
+		assert_eq!(receipt.placement, JoinPhysicalPlacement::Natural);
+		assert_eq!(receipt.reason, JoinStrategyDecisionReason::PinnedByAuthor);
+	}
+
+	#[tokio::test]
+	async fn trace_indexes_each_join_deterministically() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan two-join SQL");
+
+		let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind with trace");
+
+		assert_eq!(
+			trace
+				.join_decisions
+				.iter()
+				.map(|receipt| receipt.target.join_index)
+				.collect::<Vec<_>>(),
+			vec![0, 1]
+		);
+	}
+
+	#[tokio::test]
+	async fn bind_remains_structurally_identical_with_and_without_trace() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 3_072);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan SQL join");
+
+		let plain = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind without trace");
+		let (traced, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind with trace");
+
+		assert!(!trace.join_decisions.is_empty());
+		assert_eq!(format!("{plain:?}"), format!("{traced:?}"));
 	}
 
 	#[test]

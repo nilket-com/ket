@@ -173,3 +173,184 @@ pub(crate) fn adr132_no_executor_fragmenter_scheduler_wire_or_wendelon_change() 
 		format_offenders(&manifest_dir, &offenders)
 	);
 }
+
+#[test]
+pub(crate) fn adr133_optimizer_trace_is_binder_local() {
+	let manifest_dir = manifest_dir();
+	let binder = binder_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+
+	assert!(binder.contains("pub(crate) struct JoinTraceTarget"));
+	assert!(binder.contains("pub(crate) struct DecisionReceipt"));
+	assert!(binder.contains("pub(crate) struct OptimizerTrace"));
+	assert!(bind_join.contains("trace.join_decisions.push(DecisionReceipt"));
+	assert!(bind_join.contains("target: JoinTraceTarget { join_index }"));
+	assert!(bind_join.contains("reason: decision.reason"));
+
+	let markers = ["OptimizerTrace", "DecisionReceipt", "JoinTraceTarget"];
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(path, _, line)| {
+			path.file_name().and_then(|name| name.to_str()) != Some("binder.rs")
+				&& markers.iter().any(|marker| line.contains(marker))
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR133 trace markers leaked outside binder.rs:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr133_trace_types_are_crate_private_not_public() {
+	let binder = binder_source();
+
+	for marker in [
+		"pub(crate) struct JoinTraceTarget",
+		"pub(crate) struct DecisionReceipt",
+		"pub(crate) struct OptimizerTrace",
+		"pub(crate) enum JoinPhysicalPlacement",
+		"pub(crate) enum BroadcastBuildSide",
+		"pub(crate) enum JoinStrategyDecisionReason",
+		"pub(crate) enum HashByDefaultReason",
+	] {
+		assert!(
+			binder.contains(marker),
+			"missing crate-private marker {marker}"
+		);
+	}
+
+	for forbidden in [
+		"pub struct JoinTraceTarget",
+		"pub struct DecisionReceipt",
+		"pub struct OptimizerTrace",
+		"pub enum JoinPhysicalPlacement",
+		"pub enum BroadcastBuildSide",
+		"pub enum JoinStrategyDecisionReason",
+		"pub enum HashByDefaultReason",
+	] {
+		assert!(
+			!binder.contains(forbidden),
+			"ADR133 trace type is public instead of pub(crate): {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr133_bind_is_wrapper_over_bind_with_trace() {
+	let binder = binder_source();
+	let bind_entry = source_block(&binder, "pub async fn bind");
+	let bind_with_trace = source_block(&binder, "pub(crate) async fn bind_with_trace");
+
+	assert!(bind_entry.contains("bind_with_trace(plan, catalog, config).await?"));
+	assert!(!bind_entry.contains("Binder { catalog, config }"));
+	assert!(!bind_entry.contains("bind_plan_with_trace"));
+	assert!(bind_with_trace.contains("let mut trace = OptimizerTrace::default()"));
+	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace)"));
+	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan)?"));
+	assert!(bind_with_trace.contains("Ok((plan, trace))"));
+}
+
+#[test]
+pub(crate) fn adr133_no_trace_on_execution_plan_or_wire() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"OptimizerTrace",
+		"DecisionReceipt",
+		"JoinTraceTarget",
+		"JoinStrategyDecisionReason",
+		"HashByDefaultReason",
+		"JoinPhysicalPlacement",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/ir/execution.rs"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("src/distributed"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR133 trace/reason types leaked into execution plan or wire:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr133_no_public_explain_surface() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lower_statement = source_block(&planner, "fn lower_statement");
+
+	assert!(!planner.contains("bind_with_trace"));
+	assert!(!planner.contains("OptimizerTrace"));
+	assert!(!lower_statement.contains("Statement::Explain"));
+	assert!(lower_statement.contains("unsupported SQL statement"));
+}
+
+#[test]
+pub(crate) fn adr133_no_executor_fragmenter_scheduler_or_wendelon_change() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"OptimizerTrace",
+		"DecisionReceipt",
+		"JoinTraceTarget",
+		"bind_with_trace",
+		"JoinStrategyDecisionReason",
+		"HashByDefaultReason",
+		"JoinPhysicalPlacement",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/distributed"),
+		manifest_dir.join("src/server"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR133 trace leaked into executor/distributed/wire/Wendelon substrate:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
