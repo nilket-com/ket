@@ -208,6 +208,34 @@ impl PlanOptimizerFacts {
 		Self::composite_with_bounds(Some(ByteCount::ZERO), Some(RowCount::new(0)))
 	}
 
+	fn preserve_volume_non_increasing(self) -> Self {
+		self
+	}
+
+	fn preserve_through_project(self, exprs: &BoundExprProgram) -> Self {
+		if project_roots_are_distinct_columns(exprs) {
+			return self.preserve_volume_non_increasing();
+		}
+
+		Self {
+			origin: self.origin,
+			byte_upper_bound: None,
+			row_upper_bound: self.row_upper_bound,
+		}
+	}
+
+	fn with_pk_row_cap(self) -> Self {
+		let cap = RowCount::new(1);
+		let row_upper_bound = self
+			.row_upper_bound
+			.map(|row| std::cmp::min(row, cap))
+			.or(Some(cap));
+		Self {
+			row_upper_bound,
+			..self
+		}
+	}
+
 	fn exchange(self) -> Self {
 		Self::composite_with_bounds(self.byte_upper_bound, self.row_upper_bound)
 	}
@@ -220,6 +248,16 @@ impl PlanOptimizerFacts {
 			.or(Some(limit));
 		Self::composite_with_row(row_upper_bound)
 	}
+}
+
+fn project_roots_are_distinct_columns(exprs: &BoundExprProgram) -> bool {
+	let mut seen = HashSet::new();
+	exprs.roots.iter().all(|root| {
+		let Some(BoundExprNode::Column(column)) = exprs.node(*root) else {
+			return false;
+		};
+		seen.insert(column.ordinal)
+	})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +406,8 @@ impl<'a> Binder<'a> {
 					require_single_boolean_root(&bound_predicate, "WHERE")?;
 					let logical_types = self.catalog.logical_type_registry();
 					let input_scope = input.scope.clone();
+					let has_pk_row_cap =
+						filter_includes_primary_key_row_cap(&bound_predicate, &input.plan);
 					let (plan, _) = plan_filter_with_predicate_pushdown(
 						input.plan,
 						bound_predicate,
@@ -376,8 +416,12 @@ impl<'a> Binder<'a> {
 					let scope = input_scope.with_schema(plan.schema());
 					let facts = if matches!(plan, ExecutionPlan::EmptyRelation { .. }) {
 						PlanOptimizerFacts::empty_relation()
+					} else if has_pk_row_cap {
+						input_facts
+							.preserve_volume_non_increasing()
+							.with_pk_row_cap()
 					} else {
-						PlanOptimizerFacts::composite_with_row(input_facts.row_upper_bound)
+						input_facts.preserve_volume_non_increasing()
 					};
 					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
@@ -393,10 +437,10 @@ impl<'a> Binder<'a> {
 						});
 					}
 					let input = self.bind_plan_with_trace(input, trace).await?;
-					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
 					let exprs = self
 						.bind_projection_expr_program_scoped(exprs, &input.schema(), &input.scope)
 						.await?;
+					let facts = input.facts.preserve_through_project(&exprs);
 					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
 					let scope = input.scope.project(&exprs, &output_schema);
 
@@ -3502,10 +3546,26 @@ fn predicate_includes_primary_key_equality(
 	predicate: &BoundExprProgram,
 	primary_key_columns: &[ColumnOrdinal],
 ) -> bool {
+	if primary_key_columns.len() != 1 {
+		return false;
+	}
 	let Some(root) = predicate.single_root() else {
 		return false;
 	};
 	predicate_node_includes_primary_key_equality(predicate, root, primary_key_columns)
+}
+
+fn filter_includes_primary_key_row_cap(
+	predicate: &BoundExprProgram,
+	input: &ExecutionPlan,
+) -> bool {
+	match input {
+		ExecutionPlan::Scan {
+			primary_key_columns,
+			..
+		} => predicate_includes_primary_key_equality(predicate, primary_key_columns),
+		_ => false,
+	}
 }
 
 fn predicate_node_includes_primary_key_equality(
@@ -8084,6 +8144,333 @@ mod tests {
 			.expect("bind known-empty broadcast join");
 
 		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+	}
+
+	#[tokio::test]
+	async fn filtered_tiny_dim_infers_broadcast() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), None);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+			),
+		};
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(filtered_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind filtered tiny dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+	}
+
+	#[tokio::test]
+	async fn narrowing_project_tiny_dim_infers_broadcast() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), None);
+		let projected_customers = LogicalPlan::Project {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			exprs: vec![
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("customers"), "region"),
+			],
+			output_names: vec![Some("id".to_string()), Some("region".to_string())],
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&projected_customers)
+		.await
+		.expect("bind projected tiny dimension");
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.byte_upper_bound, Some(ByteCount::new(1_024)));
+
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(projected_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind narrowing projected tiny dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+	}
+
+	#[tokio::test]
+	async fn expression_project_drops_byte_bound_and_hashes() {
+		let catalog =
+			descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), Some(12));
+		let expression_customers = LogicalPlan::Project {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			exprs: vec![
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::Add(
+					Box::new(Expr::qualified_column(TableRef::new("customers"), "id")),
+					Box::new(Expr::Literal(ScalarValue::Int64(Some(1)))),
+				),
+			],
+			output_names: vec![Some("id".to_string()), Some("next_id".to_string())],
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&expression_customers)
+		.await
+		.expect("bind expression projected tiny dimension");
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(12)));
+
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(expression_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind expression projected tiny dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+	}
+
+	#[tokio::test]
+	async fn duplicate_project_drops_byte_bound() {
+		let catalog =
+			descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), Some(12));
+		let duplicate_customers = LogicalPlan::Project {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			exprs: vec![
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			],
+			output_names: vec![Some("id".to_string()), Some("id_again".to_string())],
+		};
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&duplicate_customers)
+		.await
+		.expect("bind duplicate projected tiny dimension");
+
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(12)));
+	}
+
+	#[tokio::test]
+	async fn pk_filtered_large_table_caps_rows_but_still_hashes() {
+		let catalog =
+			descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(64 * 1024 * 1024), None);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "id")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
+			),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind PK-filtered large table");
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(
+			scoped.facts.byte_upper_bound,
+			Some(ByteCount::new(64 * 1024 * 1024))
+		);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(1)));
+
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(filtered_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind PK-filtered large table join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+	}
+
+	#[tokio::test]
+	async fn composite_pk_single_column_filter_does_not_cap_rows() {
+		let mut catalog = MockCatalog::new();
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("part", DataType::Int64, false),
+		]));
+		let descriptor = named_descriptor(31, "composite_pk", schema.as_ref().clone());
+		let mut binding = TableBinding::new_with_primary_key_columns(
+			TableId(31),
+			descriptor.table_object_id,
+			descriptor.schema_generation,
+			descriptor.physical_descriptor_fingerprint,
+			schema,
+			HashSet::from([ColumnOrdinal(0), ColumnOrdinal(1)]),
+		);
+		binding.optimizer_facts = TableOptimizerFacts {
+			byte_upper_bound: Some(ByteCount::new(1_024)),
+			row_upper_bound: None,
+		};
+		catalog
+			.register_table(TableRef::new("composite_pk"), binding)
+			.expect("register composite-PK binding");
+		let filtered = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("composite_pk"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("composite_pk"), "id")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
+			),
+		};
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered)
+		.await
+		.expect("bind composite-PK component filter");
+
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.byte_upper_bound, Some(ByteCount::new(1_024)));
+		assert_eq!(scoped.facts.row_upper_bound, None);
+	}
+
+	#[tokio::test]
+	async fn aggregate_or_expanding_project_stays_composite() {
+		let catalog =
+			descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), Some(12));
+		let aggregate_customers = LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			group_expr: vec![Expr::qualified_column(TableRef::new("customers"), "region")],
+			aggr_expr: Vec::new(),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&aggregate_customers)
+		.await
+		.expect("bind aggregate tiny dimension");
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.row_upper_bound, None);
+
+		let project_over_aggregate = LogicalPlan::Project {
+			input: Box::new(aggregate_customers),
+			exprs: vec![Expr::column("region")],
+			output_names: vec![Some("region".to_string())],
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&project_over_aggregate)
+		.await
+		.expect("bind project over aggregate tiny dimension");
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+	}
+
+	#[tokio::test]
+	async fn filtered_dim_without_facts_still_hashes() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, None);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+			),
+		};
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(filtered_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind filtered dimension without facts join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
 	}
 
 	#[tokio::test]

@@ -72,7 +72,8 @@ width/byte-from-rows model (→ 138); `ExecutionPlan`/wire/fragmenter/scheduler;
 
 ## Acceptance
 Direct binder fixtures for filtered and narrowing-projected tiny dims infer broadcast
-over real facts with no seeding; expression-project + aggregate stay `Composite`;
-single-col-PK filter caps rows to 1 yet a large table still hashes; composite-PK
-component filters do not cap rows; missing facts hash; all row-local fact computation
-routes through the shared helpers; five `adr137_*` + 129–136 guards green.
+over real facts with no seeding; expression/duplicate projects preserve lineage + row
+but drop bytes and hash; aggregates stay `Composite`; single-col-PK filter caps rows
+to 1 yet a large table still hashes; composite-PK component filters do not cap rows;
+missing facts hash; all row-local fact computation routes through the shared helpers;
+five `adr137_*` + 129–136 guards green.

@@ -778,3 +778,146 @@ pub(crate) fn adr136_no_wendelon_producer_in_toron() {
 		format_offenders(&manifest_dir, &offenders)
 	);
 }
+
+#[test]
+pub(crate) fn adr137_filter_preserves_single_base_facts() {
+	let binder = binder_source();
+	let facts_impl = source_block(&binder, "impl PlanOptimizerFacts");
+	let filter_arm = binder
+		.split("LogicalPlan::Filter { input, predicate } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Project").next())
+		.expect("Filter bind arm");
+
+	assert!(facts_impl.contains("fn preserve_volume_non_increasing(self) -> Self"));
+	assert!(filter_arm.contains("input_facts.preserve_volume_non_increasing()"));
+	assert!(filter_arm.contains("filter_includes_primary_key_row_cap"));
+	assert!(filter_arm.contains(".with_pk_row_cap()"));
+	assert!(!filter_arm.contains("PlanOptimizerFacts::composite_with_row"));
+	assert!(binder.contains("filtered_tiny_dim_infers_broadcast"));
+	assert!(binder.contains("filtered_dim_without_facts_still_hashes"));
+}
+
+#[test]
+pub(crate) fn adr137_project_preserves_byte_bound_only_for_column_subset() {
+	let binder = binder_source();
+	let facts_impl = source_block(&binder, "impl PlanOptimizerFacts");
+	let project_helper = source_block(&binder, "fn project_roots_are_distinct_columns");
+	let project_arm = binder
+		.split("LogicalPlan::Project {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Aggregate").next())
+		.expect("Project bind arm");
+
+	assert!(facts_impl.contains("fn preserve_through_project"));
+	assert!(facts_impl.contains("project_roots_are_distinct_columns(exprs)"));
+	assert!(facts_impl.contains("byte_upper_bound: None"));
+	assert!(project_helper.contains("BoundExprNode::Column(column)"));
+	assert!(project_helper.contains("seen.insert(column.ordinal)"));
+	assert!(project_arm.contains("input.facts.preserve_through_project(&exprs)"));
+	assert!(!project_arm.contains("PlanOptimizerFacts::composite_with_row"));
+	assert!(binder.contains("narrowing_project_tiny_dim_infers_broadcast"));
+	assert!(binder.contains("expression_project_drops_byte_bound_and_hashes"));
+	assert!(binder.contains("duplicate_project_drops_byte_bound"));
+}
+
+#[test]
+pub(crate) fn adr137_pk_row_cap_does_not_shrink_byte_bound() {
+	let binder = binder_source();
+	let with_pk_cap = source_block(&binder, "fn with_pk_row_cap");
+	let pk_recognizer = source_block(&binder, "fn predicate_includes_primary_key_equality");
+	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+
+	assert!(with_pk_cap.contains("RowCount::new(1)"));
+	assert!(with_pk_cap.contains("row_upper_bound"));
+	assert!(!with_pk_cap.contains("byte_upper_bound"));
+	assert!(pk_recognizer.contains("primary_key_columns.len() != 1"));
+	assert!(!choose_auto.contains("row_upper_bound"));
+	assert!(binder.contains("pk_filtered_large_table_caps_rows_but_still_hashes"));
+	assert!(binder.contains("composite_pk_single_column_filter_does_not_cap_rows"));
+}
+
+#[test]
+pub(crate) fn adr137_row_local_facts_go_through_shared_helper() {
+	let binder = binder_source();
+	let facts_impl = source_block(&binder, "impl PlanOptimizerFacts");
+	let filter_arm = binder
+		.split("LogicalPlan::Filter { input, predicate } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Project").next())
+		.expect("Filter bind arm");
+	let project_arm = binder
+		.split("LogicalPlan::Project {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Aggregate").next())
+		.expect("Project bind arm");
+	let sort_arm = binder
+		.split("LogicalPlan::Sort {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Take").next())
+		.expect("Sort bind arm");
+
+	assert_eq!(
+		facts_impl
+			.matches("fn preserve_volume_non_increasing")
+			.count(),
+		1
+	);
+	assert_eq!(facts_impl.matches("fn preserve_through_project").count(), 1);
+	assert_eq!(facts_impl.matches("fn with_pk_row_cap").count(), 1);
+	assert!(filter_arm.contains("preserve_volume_non_increasing"));
+	assert!(project_arm.contains("preserve_through_project"));
+	for arm in [filter_arm, project_arm] {
+		assert!(!arm.contains("PlanOptimizerFacts {"));
+		assert!(!arm.contains("PlanOptimizerFacts::composite_with_row"));
+		assert!(!arm.contains("PlanOptimizerFacts::composite_with_bounds"));
+	}
+	assert!(sort_arm.contains("PlanOptimizerFacts::composite_with_row"));
+}
+
+#[test]
+pub(crate) fn adr137_no_substrate_or_wire_change() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"preserve_volume_non_increasing",
+		"preserve_through_project",
+		"with_pk_row_cap",
+		"project_roots_are_distinct_columns",
+		"filter_includes_primary_key_row_cap",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/distributed"),
+		manifest_dir.join("src/server"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR137 row-local fact helpers leaked into execution/distributed/wire/Wendelon substrate:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}

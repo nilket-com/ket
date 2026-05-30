@@ -92,12 +92,14 @@ surface.
   selecting `id, region` from `dim` as the build input preserves the byte bound.
 - `expression_project_drops_byte_bound_and_hashes` — a direct expression project keeps
   row + origin, drops byte → hash (no false broadcast).
+- `duplicate_project_drops_byte_bound` — duplicate column roots are not a
+  volume-non-increasing byte proof; lineage + row survive, byte drops.
 - `pk_filtered_large_table_caps_rows_but_still_hashes` — the honest D3 gate: row cap
   to 1 shows in binder facts, strategy stays hash (no width model yet).
 - `composite_pk_single_column_filter_does_not_cap_rows` — a predicate on one component
   of a multi-column descriptor PK is not a ≤1-row proof.
 - `aggregate_or_expanding_project_stays_composite` — non-subset project / aggregate
-  stays `Composite`.
+  over a `Composite` input stays `Composite`; `Aggregate` itself stays `Composite`.
 - `filtered_dim_without_facts_still_hashes` — missing facts → hash (do-no-harm).
 - Regressions: 129–136 optimizer / EXPLAIN / star gates green.
 
@@ -138,9 +140,10 @@ reordering; the 136-W Wendelon producer.
 ## Promotion criteria
 Direct binder fixtures for a filtered and a narrowing-projected tiny dimension each
 infer broadcast over real facts with no `seed_optimizer_facts` (fail on `main`); an
-expression project and an aggregate stay `Composite`; a single-column-PK-equality
-filter on a large table caps rows to 1 yet still hashes; a composite-PK component
-filter does not cap rows; missing facts hash; all row-local fact computation routes
-through the shared helpers (guarded); the five `adr137_*` guards + 129–136 guards
-green; `cargo test -p toron`, `--test architecture_test -- adr137`, `cargo check -p
-toron --all-targets`, `git diff --check` all green.
+expression/duplicate project keeps lineage + row but drops bytes and hashes; an
+aggregate stays `Composite`; a single-column-PK-equality filter on a large table caps
+rows to 1 yet still hashes; a composite-PK component filter does not cap rows; missing
+facts hash; all row-local fact computation routes through the shared helpers
+(guarded); the five `adr137_*` guards + 129–136 guards green; `cargo test -p toron`,
+`--test architecture_test -- adr137`, `cargo check -p toron --all-targets`, `git diff
+--check` all green.
