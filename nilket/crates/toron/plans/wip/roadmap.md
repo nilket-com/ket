@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–135 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–136 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,38 +46,45 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 135 promoted; ADR 136 candidates
+### ADR 136 promoted; ADR 137 candidates
 
-ADR 135 promoted **Broadcast-Star Recursive Probe Fragmentation** — the first
-multi-way distributed-join cut. Lifts ADR 131's nested-join probe fence for **one
-shape**: a left-deep INNER broadcast-star chain `fact ⋈ dim1 ⋈ dim2 …` (auto builds
-are tiny single-base relations; pinned builds are already-authored one-partition
-broadcast builds; shared probe = the fact scan) is flattened by the
-fragmenter into **one scan-share probe stage (fact scanned once) + N one-partition
-broadcast build upstreams**, reusing ADR 123's multi-upstream consumers
-(`TaskSpec.inputs: Vec<TaskInputBinding>`) — no new stage topology, no new IR/wire
-type. Delivers the concrete star-schema win and unblocks the Rune-prescribed
-multi-way broadcast (`dim2.broadcast_join(dim1.broadcast_join(fact,on1),on2)`)
-fenced to hash today. Binder widens `broadcast_probe_is_scan_linear` for the star
-shape only (every other nested/hash/global/limited probe stays `ProbeNotScanLinear`);
-the flatten composes 130's per-link restoring projections so output is
-**digest+column-identical to hash** (the load-bearing spine,
-`three_way_broadcast_star_digest_matches_hash_over_tcp`); pinned-unsupported nested
-probes reject fail-loud; EXPLAIN emits N per-link receipts (133/134). Sealed
-multi-upstream is the correctness baseline (cross-worker builds use sealed
-manifests; same-worker live overlap opportunistic; remote-live fan-in deferred).
-Genuine 3-of-3: Gemini conceded the general fragmenter, Claude moved off facts-flip
-and added the output-order spine, Codex scoped it + grounded that the multi-upstream
-substrate already exists. 131 nested-probe + fragmenter-input-shape guards
-retargeted, not deleted.
+ADR 136 promoted **Wendelon-Backed Hard Table-Size Facts (Toron consumer + default
+flip)** — the "data data data" cut that makes the 129–135 CBO spine fire on real
+production tables instead of test-only `seed_optimizer_facts`. Today
+`from_descriptor_with_logical_types` ends at `optimizer_facts:
+TableOptimizerFacts::default()` (`catalog.rs:204`) → every Wendelon-built catalog is
+blind → hash. 136 lets hard table-size facts ride a **descriptor-adjacent sidecar**
+(keyed by `(tenant, table_object_id, schema_generation, physical_fingerprint,
+manifest_epoch)`; `TableSchemaDescriptor` untouched) into `TableOptimizerFacts` via
+facts-aware constructor/registry/bootstrap/sync paths; descriptor-only paths keep
+defaulting unknown. **Cross-ring pair:** this council promotes **136-T** (the Toron
+consumer + flip); the **136-W** producer (table-identity-keyed hard-facts ledger) is
+named as a precise contract and handed to Wendelon's sequence — Wendelon owns its
+producer; Toron holds no stats cache. Hard bounds only: unknown/absent/mismatched →
+hash; producer-stale facts arrive as absent/unknown. Overcount suppresses broadcast
+(safe); **undercount is a correctness bug**. Two load-bearing safety calls: the byte
+fact is a
+**materialized** build-footprint upper bound (named `materialized_byte_upper_bound`),
+never compressed storage `size_bytes` (which would undercount decompressed Arrow
+size → wrong broadcast) — Claude's correction; and descriptor refresh must update
+`optimizer_facts` **even when descriptor identity is unchanged** (facts track
+`manifest_epoch`, a tiny dim grows without a schema change) — Codex's correction.
+`PlannerConfig::default()` flips to `Some(1 MiB)` (clamped by the 16 MiB cap
+ceiling) — **inert until 136-W ships** (no facts → do-no-harm hash), so 136-T lands
+first and is fixture-testable now. Known-empty normalizes to both `row_upper_bound`
+0 and materialized bytes 0, so it broadcasts below cap while staying distinct from
+unknown (folds ADR 095). EXPLAIN (134) is the validation surface.
+Quorum: operator + Claude + Codex; Gemini held selectivity (→ 137 lead). Headline
+gate: `star_query_infers_broadcast_without_seed_optimizer_facts` (SQL + Rune).
 
-**ADR 136 lead candidates:** the cross-ring **facts-flip** (Wendelon producer
-exposes manifest `size_bytes`/`row_count` on the descriptor → Toron consumes in
-`from_descriptor` + flips the dark-launch default-on; the substrate can now execute
-the multi-way plans it would infer, and EXPLAIN validates it) — the step that makes
-129–135 *fire* in production; general recursive fragmentation (right-deep/bushy /
-hash); remote-live multi-producer fan-in; selectivity propagation. Evidence-gate the
-next pick on the 135 feat.
+**ADR 137 lead candidates:** **fact-spine selectivity propagation through filters**
+(Gemini — row-local nodes preserve upper bounds; PK-equality `col = literal` →
+`row_upper_bound` 1, but broadcast still needs a separately proved hard byte cap
+under the current byte-first chooser; `fact ⋈ (tiny_dim WHERE …)` infers broadcast)
+— the natural IQ step now that base facts flow; the **136-W** Wendelon producer ADR
+(the other half of the pair); remote-live
+multi-producer fan-in (complete 135's live path for pinned-Rune broadcast); richer
+cost units; join reordering. Evidence-gate the next pick on the 136 feat.
 
 ### ADR 129 promoted (HISTORICAL)
 
