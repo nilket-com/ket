@@ -31,6 +31,18 @@ fn lib_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source")
 }
 
+fn catalog_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
+}
+
+fn config_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config source")
+}
+
+fn daemon_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon source")
+}
+
 fn source_block(source: &str, marker: &str) -> String {
 	brace_blocks_after_marker(source, marker)
 		.into_iter()
@@ -643,6 +655,126 @@ pub(crate) fn adr133_no_executor_fragmenter_scheduler_or_wendelon_change() {
 	assert!(
 		offenders.is_empty(),
 		"ADR133 trace leaked into executor/distributed/wire/Wendelon substrate:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr136_table_schema_descriptor_not_modified() {
+	let wendelon_table =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+			.expect("read Wendelon table schema source");
+	let catalog = catalog_source();
+
+	assert!(!wendelon_table.contains("optimizer_facts"));
+	assert!(!wendelon_table.contains("materialized_byte_upper_bound"));
+	assert!(catalog.contains("pub struct DescriptorOptimizerFacts"));
+}
+
+#[test]
+pub(crate) fn adr136_facts_are_descriptor_adjacent_sidecar() {
+	let catalog = catalog_source();
+	let config = config_source();
+	let daemon = daemon_source();
+	let sidecar = source_block(&catalog, "struct DescriptorOptimizerFacts");
+
+	for required in [
+		"schema_generation: u64",
+		"physical_descriptor_fingerprint: PhysicalDescriptorFingerprint",
+		"manifest_epoch: u64",
+		"materialized_byte_upper_bound: Option<ByteCount>",
+		"row_upper_bound: Option<RowCount>",
+	] {
+		assert!(
+			sidecar.contains(required),
+			"missing sidecar field {required}"
+		);
+	}
+	assert!(config.contains("optimizer_facts: Option<DescriptorOptimizerFacts>"));
+	assert!(config.contains("load_descriptor_bootstrap_with_optimizer_facts"));
+	assert!(daemon.contains("load_descriptor_bootstrap_with_optimizer_facts"));
+	assert!(daemon.contains("from_tenant_descriptors_with_facts"));
+}
+
+#[test]
+pub(crate) fn adr136_table_binding_constructible_with_optimizer_facts() {
+	let catalog = catalog_source();
+	let binding_impl = source_block(&catalog, "impl TableBinding");
+
+	assert!(binding_impl.contains("from_descriptor_with_optimizer_facts"));
+	assert!(binding_impl.contains("from_descriptor_with_logical_types_and_optimizer_facts"));
+	assert!(binding_impl.contains(".for_descriptor(descriptor)"));
+	assert!(catalog.contains("descriptor_sidecar_facts_populate_table_optimizer_facts"));
+	assert!(catalog.contains("legacy_descriptor_paths_still_default_unknown"));
+	assert!(catalog.contains("mismatched_facts_default_to_unknown"));
+	assert!(catalog.contains("known_empty_sidecar_normalizes_to_zero_bytes"));
+}
+
+#[test]
+pub(crate) fn adr136_descriptor_refresh_updates_optimizer_facts() {
+	let catalog = catalog_source();
+
+	assert!(catalog.contains("from_tenant_descriptors_with_facts"));
+	assert!(catalog.contains("register_descriptor_for_tenant_with_facts"));
+	assert!(catalog.contains("sync_descriptor_for_tenant_with_facts"));
+	assert!(catalog.contains("sync_latest_descriptor_for_tenant_with_facts"));
+	assert!(catalog.contains("existing.optimizer_facts != candidate.optimizer_facts"));
+	assert!(catalog.contains("facts_refresh_updates_binding_without_descriptor_identity_change"));
+}
+
+#[test]
+pub(crate) fn adr136_planner_default_enables_auto_broadcast() {
+	let binder = binder_source();
+	let planner_config = source_block(&binder, "pub struct PlannerConfig");
+	let default_impl = source_block(&binder, "impl Default for PlannerConfig");
+
+	assert!(planner_config.contains("auto_broadcast_max_build_bytes: Option<ByteCount>"));
+	assert!(default_impl.contains("auto_broadcast_max_build_bytes"));
+	assert!(default_impl.contains("Some(ByteCount::new(1024 * 1024))"));
+	assert!(binder.contains("star_query_infers_broadcast_without_seed_optimizer_facts"));
+	assert!(
+		binder.contains("rune_ctx_sql_star_query_infers_broadcast_without_seed_optimizer_facts")
+	);
+}
+
+#[test]
+pub(crate) fn adr136_missing_facts_still_hash() {
+	let binder = binder_source();
+	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+
+	assert!(choose_auto.contains("HashByDefaultReason::MissingBuildByteUpperBound"));
+	assert!(binder.contains("planner_default_on_missing_facts_still_hashes"));
+}
+
+#[test]
+pub(crate) fn adr136_byte_upper_bound_is_materialized() {
+	let catalog = catalog_source();
+	let config = config_source();
+	let sidecar = source_block(&catalog, "struct DescriptorOptimizerFacts");
+
+	assert!(sidecar.contains("materialized_byte_upper_bound"));
+	assert!(config.contains("optimizer_facts: Option<DescriptorOptimizerFacts>"));
+	assert!(!catalog.contains("estimated_size_bytes"));
+	assert!(!catalog.contains("LsmRunSummary"));
+	assert!(!config.contains("estimated_size_bytes"));
+	assert!(!config.contains("LsmRunSummary"));
+}
+
+#[test]
+pub(crate) fn adr136_no_wendelon_producer_in_toron() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"DescriptorOptimizerFacts",
+		"optimizer_facts",
+		"materialized_byte_upper_bound",
+	];
+	let offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker)))
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR136 Toron-side facts leaked into Wendelon producer/schema source:\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
 }

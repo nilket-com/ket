@@ -14,6 +14,7 @@ use crate::audit::{
 	ArchiveAuditConfig, AuditArchiveLockMode, AuditSinksConfig,
 	DEFAULT_AUDIT_ARCHIVE_MAX_SEGMENT_BYTES, SyslogAuditConfig, parse_toron_audit_node_numeric,
 };
+use crate::catalog::DescriptorOptimizerFacts;
 use crate::distributed::budget::{
 	AdmissionPolicy, ByteCount, DurationMillis, TenantBudget, TenantBudgetPolicy,
 	derive_max_concurrent_descriptor_syncs, derive_max_concurrent_queries,
@@ -353,6 +354,8 @@ pub struct DescriptorBootstrapEntry {
 	pub tenant_id: u64,
 	pub table_id: u64,
 	pub descriptor: wendelon_client::TableSchemaDescriptor,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub optimizer_facts: Option<DescriptorOptimizerFacts>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,7 +368,15 @@ struct RawDescriptorBootstrapEntry {
 	tenant_id: Option<u64>,
 	table_id: Option<u64>,
 	descriptor: wendelon_client::TableSchemaDescriptor,
+	optimizer_facts: Option<DescriptorOptimizerFacts>,
 }
+
+pub type DescriptorBootstrapRecord = (
+	TenantId,
+	TableId,
+	wendelon_client::TableSchemaDescriptor,
+	Option<DescriptorOptimizerFacts>,
+);
 
 #[derive(Debug, Deserialize)]
 struct RawToronBootstrapConfig {
@@ -659,6 +670,15 @@ pub fn write_example_config(path: impl AsRef<Path>) -> Result<(), ToronConfigErr
 pub fn load_descriptor_bootstrap(
 	path: impl AsRef<Path>,
 ) -> Result<Vec<(TenantId, TableId, wendelon_client::TableSchemaDescriptor)>, ToronConfigError> {
+	Ok(load_descriptor_bootstrap_with_optimizer_facts(path)?
+		.into_iter()
+		.map(|(tenant_id, table_id, descriptor, _)| (tenant_id, table_id, descriptor))
+		.collect())
+}
+
+pub fn load_descriptor_bootstrap_with_optimizer_facts(
+	path: impl AsRef<Path>,
+) -> Result<Vec<DescriptorBootstrapRecord>, ToronConfigError> {
 	let bootstrap: RawDescriptorBootstrap = serde_json::from_str(&std::fs::read_to_string(path)?)?;
 	let mut descriptors = Vec::with_capacity(bootstrap.tables.len());
 	for table in bootstrap.tables {
@@ -674,7 +694,12 @@ pub fn load_descriptor_bootstrap(
 		if table_id == 0 {
 			return Err(invalid("descriptor bootstrap table_id 0 is reserved"));
 		}
-		descriptors.push((TenantId(tenant_id), TableId(table_id), table.descriptor));
+		descriptors.push((
+			TenantId(tenant_id),
+			TableId(table_id),
+			table.descriptor,
+			table.optimizer_facts,
+		));
 	}
 	Ok(descriptors)
 }

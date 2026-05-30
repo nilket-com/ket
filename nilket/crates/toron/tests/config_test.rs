@@ -4,14 +4,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Field, Schema};
-use toron::catalog::{TableRef, WendelonDescriptorRegistry};
+use toron::catalog::{DescriptorOptimizerFacts, TableRef, WendelonDescriptorRegistry};
 #[cfg(feature = "otlp-http")]
 use toron::config::TelemetryProtocol;
 use toron::config::{
 	AuditConfig, DescriptorBootstrap, DescriptorBootstrapEntry, load_descriptor_bootstrap,
-	load_toron_bootstrap_config, render_example_config,
+	load_descriptor_bootstrap_with_optimizer_facts, load_toron_bootstrap_config,
+	render_example_config,
 };
 use toron::distributed::budget::{ByteCount, QueryBudget};
+use toron::distributed::task::RowCount;
 use toron::ir::TableId;
 use toron::sql_wire::{
 	DEFAULT_SQL_REQUEST_FRAME_BYTES, DEFAULT_SQL_STATEMENT_BYTES,
@@ -1018,11 +1020,13 @@ fn descriptor_bootstrap_rejects_duplicate_table_id_within_tenant() {
 			tenant_id: 7,
 			table_id: 11,
 			descriptor: first,
+			optimizer_facts: None,
 		},
 		DescriptorBootstrapEntry {
 			tenant_id: 7,
 			table_id: 11,
 			descriptor: second,
+			optimizer_facts: None,
 		},
 	])
 	.err()
@@ -1045,11 +1049,13 @@ fn descriptor_bootstrap_rejects_duplicate_table_name_within_tenant() {
 			tenant_id: 7,
 			table_id: 11,
 			descriptor: first,
+			optimizer_facts: None,
 		},
 		DescriptorBootstrapEntry {
 			tenant_id: 7,
 			table_id: 12,
 			descriptor: second,
+			optimizer_facts: None,
 		},
 	])
 	.err()
@@ -1070,11 +1076,13 @@ fn descriptor_bootstrap_allows_same_table_id_across_tenants() {
 			tenant_id: 7,
 			table_id: 11,
 			descriptor: descriptor_with_identity(0xC7, 1, "config_test", "sales"),
+			optimizer_facts: None,
 		},
 		DescriptorBootstrapEntry {
 			tenant_id: 8,
 			table_id: 11,
 			descriptor: descriptor_with_identity(0xC8, 1, "config_test", "refunds"),
+			optimizer_facts: None,
 		},
 	])
 	.expect("same table_id across tenants");
@@ -1101,11 +1109,13 @@ fn descriptor_bootstrap_allows_same_table_name_across_tenants() {
 			tenant_id: 7,
 			table_id: 11,
 			descriptor: descriptor_with_identity(0xD7, 1, "config_test", "sales"),
+			optimizer_facts: None,
 		},
 		DescriptorBootstrapEntry {
 			tenant_id: 8,
 			table_id: 12,
 			descriptor: descriptor_with_identity(0xD8, 1, "config_test", "sales"),
+			optimizer_facts: None,
 		},
 	])
 	.expect("same table name across tenants");
@@ -1131,11 +1141,13 @@ fn descriptor_bootstrap_loads_two_tenants_into_one_registry() {
 			tenant_id: 7,
 			table_id: 1,
 			descriptor: tenant_7_descriptor.clone(),
+			optimizer_facts: None,
 		},
 		DescriptorBootstrapEntry {
 			tenant_id: 8,
 			table_id: 1,
 			descriptor: tenant_8_descriptor.clone(),
+			optimizer_facts: None,
 		},
 	])
 	.expect("two-tenant descriptor registry");
@@ -1157,6 +1169,7 @@ fn descriptor_bootstrap_preserves_physical_fingerprint() {
 		tenant_id: 7,
 		table_id: 9,
 		descriptor: descriptor.clone(),
+		optimizer_facts: None,
 	}])
 	.expect("descriptor registry");
 
@@ -1200,6 +1213,7 @@ fn descriptor_bootstrap_json_example_round_trips() {
 			tenant_id: 7,
 			table_id: 1,
 			descriptor: descriptor(),
+			optimizer_facts: None,
 		}],
 	};
 
@@ -1212,6 +1226,42 @@ fn descriptor_bootstrap_json_example_round_trips() {
 }
 
 #[test]
+fn descriptor_bootstrap_optimizer_facts_are_sidecar_optional() {
+	let descriptor = descriptor();
+	let facts = DescriptorOptimizerFacts {
+		schema_generation: descriptor.schema_generation,
+		physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+		manifest_epoch: 12,
+		materialized_byte_upper_bound: Some(ByteCount::new(8_192)),
+		row_upper_bound: Some(RowCount::new(1_000)),
+	};
+	let bootstrap = DescriptorBootstrap {
+		tables: vec![DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 1,
+			descriptor,
+			optimizer_facts: Some(facts),
+		}],
+	};
+	let path = write_descriptor_bootstrap_json(
+		"descriptor-facts",
+		serde_json::to_value(bootstrap).expect("serialize descriptor facts bootstrap"),
+	);
+
+	let records =
+		load_descriptor_bootstrap_with_optimizer_facts(&path).expect("load facts bootstrap");
+	let legacy = load_descriptor_bootstrap(&path).expect("legacy loader drops facts");
+
+	assert_eq!(records.len(), 1);
+	assert_eq!(records[0].0, TenantId(7));
+	assert_eq!(records[0].1, TableId(1));
+	assert_eq!(records[0].3, Some(facts));
+	assert_eq!(legacy.len(), 1);
+	assert_eq!(legacy[0].0, TenantId(7));
+	assert_eq!(legacy[0].1, TableId(1));
+}
+
+#[test]
 fn same_table_object_id_across_different_tenants_is_allowed() {
 	let tenant_7 = descriptor_with_identity(0xAA, 7, "config_test", "sales");
 	let tenant_8 = descriptor_with_identity(0xAA, 8, "config_test", "sales");
@@ -1220,11 +1270,13 @@ fn same_table_object_id_across_different_tenants_is_allowed() {
 			tenant_id: 7,
 			table_id: 1,
 			descriptor: tenant_7,
+			optimizer_facts: None,
 		},
 		DescriptorBootstrapEntry {
 			tenant_id: 8,
 			table_id: 1,
 			descriptor: tenant_8,
+			optimizer_facts: None,
 		},
 	])
 	.expect("same object id across tenants");

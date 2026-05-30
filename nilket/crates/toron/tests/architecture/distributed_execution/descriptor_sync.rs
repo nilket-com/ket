@@ -117,17 +117,16 @@ pub(crate) fn adr051_descriptor_bootstrap_allows_duplicate_keys_across_tenants()
 }
 
 #[test]
-pub(crate) fn adr051_loader_returns_tenant_table_descriptor_triples() {
+pub(crate) fn adr051_loader_returns_tenant_table_descriptor_records() {
 	let config =
 		std::fs::read_to_string(manifest_dir().join("src/config.rs")).expect("read config");
 
 	assert!(config.contains("pub fn load_descriptor_bootstrap"));
+	assert!(config.contains("pub fn load_descriptor_bootstrap_with_optimizer_facts"));
 	assert!(config.contains("Vec<(TenantId, TableId, wendelon_client::TableSchemaDescriptor)>"));
-	assert!(
-		config.contains(
-			"descriptors.push((TenantId(tenant_id), TableId(table_id), table.descriptor))"
-		)
-	);
+	assert!(config.contains("DescriptorBootstrapRecord"));
+	assert!(config.contains("optimizer_facts: Option<DescriptorOptimizerFacts>"));
+	assert!(config.contains("table.optimizer_facts"));
 }
 
 #[test]
@@ -140,8 +139,8 @@ pub(crate) fn adr051_daemon_uses_tenant_explicit_registry_constructor() {
 		.expect("ToronDaemon::start_with_client")
 		.1;
 
-	assert!(startup.contains("WendelonDescriptorRegistry::from_tenant_descriptors"));
-	assert!(startup.contains("descriptor_triples"));
+	assert!(startup.contains("WendelonDescriptorRegistry::from_tenant_descriptors_with_facts"));
+	assert!(startup.contains("descriptor_records"));
 	assert!(!startup.contains("WendelonDescriptorRegistry::from_descriptors("));
 }
 
@@ -164,11 +163,12 @@ pub(crate) fn adr051_daemon_bootstrap_does_not_default_to_node_tenant() {
 pub(crate) fn adr051_registry_constructor_is_atomic_for_bootstrap() {
 	let catalog =
 		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
-	let constructor = brace_blocks_after_marker(&catalog, "pub fn from_tenant_descriptors")
-		.into_iter()
-		.next()
-		.expect("from_tenant_descriptors")
-		.1;
+	let constructor =
+		brace_blocks_after_marker(&catalog, "pub fn from_tenant_descriptors_with_facts")
+			.into_iter()
+			.next()
+			.expect("from_tenant_descriptors_with_facts")
+			.1;
 
 	assert!(constructor.contains("let registry = Self::default();"));
 	assert!(constructor.contains("Ok(registry)"));
@@ -186,9 +186,12 @@ pub(crate) fn adr051_descriptor_identity_fields_are_preserved() {
 		.expect("read config test");
 
 	assert!(config.contains("table.descriptor"));
-	assert!(catalog.contains(
-		"TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?"
-	));
+	assert!(
+		catalog.contains("TableBinding::from_descriptor_with_logical_types_and_optimizer_facts")
+	);
+	assert!(catalog.contains("table_id,"));
+	assert!(catalog.contains("&descriptor,"));
+	assert!(catalog.contains("optimizer_facts,"));
 	assert!(catalog.contains("LogicalTypeResolver::with_registry"));
 	assert!(config_test.contains("descriptor_bootstrap_preserves_physical_fingerprint"));
 	assert!(!config.contains("table_object_id ="));
@@ -495,11 +498,12 @@ pub(crate) fn adr053_descriptor_sync_uses_client_facade() {
 pub(crate) fn adr053_sync_merges_registry_in_place_no_arc_swap() {
 	let catalog =
 		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
-	let helper = brace_blocks_after_marker(&catalog, "pub fn sync_descriptor_for_tenant")
-		.into_iter()
-		.next()
-		.expect("sync_descriptor_for_tenant")
-		.1;
+	let helper =
+		brace_blocks_after_marker(&catalog, "pub fn sync_descriptor_for_tenant_with_facts")
+			.into_iter()
+			.next()
+			.expect("sync_descriptor_for_tenant_with_facts")
+			.1;
 
 	assert!(helper.contains("let mut state = self"));
 	assert!(helper.contains(".inner"));

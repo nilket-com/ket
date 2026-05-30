@@ -81,6 +81,40 @@ pub struct TableOptimizerFacts {
 	pub row_upper_bound: Option<RowCount>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescriptorOptimizerFacts {
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub manifest_epoch: u64,
+	pub materialized_byte_upper_bound: Option<ByteCount>,
+	pub row_upper_bound: Option<RowCount>,
+}
+
+impl DescriptorOptimizerFacts {
+	pub fn for_descriptor(
+		self,
+		descriptor: &wendelon_client::TableSchemaDescriptor,
+	) -> TableOptimizerFacts {
+		if self.schema_generation != descriptor.schema_generation
+			|| self.physical_descriptor_fingerprint != descriptor.physical_descriptor_fingerprint
+		{
+			return TableOptimizerFacts::default();
+		}
+
+		let byte_upper_bound = match (
+			self.materialized_byte_upper_bound,
+			self.row_upper_bound.map(RowCount::get),
+		) {
+			(None, Some(0)) => Some(ByteCount::ZERO),
+			(byte_upper_bound, _) => byte_upper_bound,
+		};
+		TableOptimizerFacts {
+			byte_upper_bound,
+			row_upper_bound: self.row_upper_bound,
+		}
+	}
+}
+
 #[derive(Clone)]
 pub struct TableBinding {
 	pub legacy_table_id: TableId,
@@ -99,10 +133,19 @@ impl TableBinding {
 		legacy_table_id: TableId,
 		descriptor: &wendelon_client::TableSchemaDescriptor,
 	) -> Result<Self, CatalogError> {
-		Self::from_descriptor_with_logical_types(
+		Self::from_descriptor_with_optimizer_facts(legacy_table_id, descriptor, None)
+	}
+
+	pub fn from_descriptor_with_optimizer_facts(
+		legacy_table_id: TableId,
+		descriptor: &wendelon_client::TableSchemaDescriptor,
+		optimizer_facts: Option<DescriptorOptimizerFacts>,
+	) -> Result<Self, CatalogError> {
+		Self::from_descriptor_with_logical_types_and_optimizer_facts(
 			legacy_table_id,
 			descriptor,
 			LogicalTypeResolver::seed_only(),
+			optimizer_facts,
 		)
 	}
 
@@ -110,6 +153,20 @@ impl TableBinding {
 		legacy_table_id: TableId,
 		descriptor: &wendelon_client::TableSchemaDescriptor,
 		logical_types: LogicalTypeResolver<'_>,
+	) -> Result<Self, CatalogError> {
+		Self::from_descriptor_with_logical_types_and_optimizer_facts(
+			legacy_table_id,
+			descriptor,
+			logical_types,
+			None,
+		)
+	}
+
+	pub fn from_descriptor_with_logical_types_and_optimizer_facts(
+		legacy_table_id: TableId,
+		descriptor: &wendelon_client::TableSchemaDescriptor,
+		logical_types: LogicalTypeResolver<'_>,
+		optimizer_facts: Option<DescriptorOptimizerFacts>,
 	) -> Result<Self, CatalogError> {
 		let schema = Arc::new(descriptor.arrow_schema().map_err(|error| {
 			CatalogError::FingerprintResolution {
@@ -121,7 +178,7 @@ impl TableBinding {
 		let row_identity = table_row_identity(&schema, descriptor)?;
 		let primary_key_columns = primary_key_columns(&schema, descriptor)?;
 
-		Ok(Self::new_with_row_identity(
+		let mut binding = Self::new_with_row_identity(
 			legacy_table_id,
 			descriptor.table_object_id,
 			descriptor.schema_generation,
@@ -129,7 +186,11 @@ impl TableBinding {
 			schema,
 			row_identity,
 			primary_key_columns,
-		))
+		);
+		binding.optimizer_facts = optimizer_facts
+			.map(|facts| facts.for_descriptor(descriptor))
+			.unwrap_or_default();
+		Ok(binding)
 	}
 
 	pub fn new(
@@ -1037,9 +1098,32 @@ impl WendelonDescriptorRegistry {
 		tenant_id: TenantId,
 		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptor)>,
 	) -> Result<Self, CatalogError> {
+		Self::from_descriptors_for_tenant_with_facts(
+			tenant_id,
+			descriptors
+				.into_iter()
+				.map(|(table_id, descriptor)| (table_id, descriptor, None)),
+		)
+	}
+
+	pub fn from_descriptors_for_tenant_with_facts(
+		tenant_id: TenantId,
+		descriptors: impl IntoIterator<
+			Item = (
+				TableId,
+				wendelon_client::TableSchemaDescriptor,
+				Option<DescriptorOptimizerFacts>,
+			),
+		>,
+	) -> Result<Self, CatalogError> {
 		let registry = Self::default();
-		for (table_id, descriptor) in descriptors {
-			registry.register_descriptor_for_tenant(tenant_id, table_id, descriptor)?;
+		for (table_id, descriptor, optimizer_facts) in descriptors {
+			registry.register_descriptor_for_tenant_with_facts(
+				tenant_id,
+				table_id,
+				descriptor,
+				optimizer_facts,
+			)?;
 		}
 		Ok(registry)
 	}
@@ -1049,8 +1133,25 @@ impl WendelonDescriptorRegistry {
 			Item = (TenantId, TableId, wendelon_client::TableSchemaDescriptor),
 		>,
 	) -> Result<Self, CatalogError> {
+		Self::from_tenant_descriptors_with_facts(
+			descriptors
+				.into_iter()
+				.map(|(tenant_id, table_id, descriptor)| (tenant_id, table_id, descriptor, None)),
+		)
+	}
+
+	pub fn from_tenant_descriptors_with_facts(
+		descriptors: impl IntoIterator<
+			Item = (
+				TenantId,
+				TableId,
+				wendelon_client::TableSchemaDescriptor,
+				Option<DescriptorOptimizerFacts>,
+			),
+		>,
+	) -> Result<Self, CatalogError> {
 		let registry = Self::default();
-		for (tenant_id, table_id, descriptor) in descriptors {
+		for (tenant_id, table_id, descriptor, optimizer_facts) in descriptors {
 			if tenant_id.0 == 0 {
 				return Err(CatalogError::AdminFailed {
 					message: "descriptor bootstrap tenant_id 0 is reserved".to_string(),
@@ -1089,8 +1190,12 @@ impl WendelonDescriptorRegistry {
 				.get(&tenant_id)
 				.map(LogicalTypeResolver::with_registry)
 				.unwrap_or_else(LogicalTypeResolver::seed_only);
-			let binding =
-				TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?;
+			let binding = TableBinding::from_descriptor_with_logical_types_and_optimizer_facts(
+				table_id,
+				&descriptor,
+				resolver,
+				optimizer_facts,
+			)?;
 			insert_wendelon_descriptor_locked(
 				&mut state,
 				tenant_id,
@@ -1110,6 +1215,16 @@ impl WendelonDescriptorRegistry {
 		table_id: TableId,
 		descriptor: wendelon_client::TableSchemaDescriptor,
 	) -> Result<(), CatalogError> {
+		self.register_descriptor_for_tenant_with_facts(tenant_id, table_id, descriptor, None)
+	}
+
+	pub fn register_descriptor_for_tenant_with_facts(
+		&self,
+		tenant_id: TenantId,
+		table_id: TableId,
+		descriptor: wendelon_client::TableSchemaDescriptor,
+		optimizer_facts: Option<DescriptorOptimizerFacts>,
+	) -> Result<(), CatalogError> {
 		let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
 		let unqualified_ref = TableRef::new(&descriptor.table_name);
 		let mut state = self
@@ -1121,8 +1236,12 @@ impl WendelonDescriptorRegistry {
 			.get(&tenant_id)
 			.map(LogicalTypeResolver::with_registry)
 			.unwrap_or_else(LogicalTypeResolver::seed_only);
-		let binding =
-			TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?;
+		let binding = TableBinding::from_descriptor_with_logical_types_and_optimizer_facts(
+			table_id,
+			&descriptor,
+			resolver,
+			optimizer_facts,
+		)?;
 		insert_wendelon_descriptor_locked(
 			&mut state,
 			tenant_id,
@@ -1139,6 +1258,16 @@ impl WendelonDescriptorRegistry {
 		tenant_id: TenantId,
 		requested: &TableRef,
 		descriptor: wendelon_client::TableSchemaDescriptor,
+	) -> Result<TableBinding, CatalogError> {
+		self.sync_descriptor_for_tenant_with_facts(tenant_id, requested, descriptor, None)
+	}
+
+	pub fn sync_descriptor_for_tenant_with_facts(
+		&self,
+		tenant_id: TenantId,
+		requested: &TableRef,
+		descriptor: wendelon_client::TableSchemaDescriptor,
+		optimizer_facts: Option<DescriptorOptimizerFacts>,
 	) -> Result<TableBinding, CatalogError> {
 		let table_ref = canonical_table_ref(requested);
 		let namespace = table_ref
@@ -1177,12 +1306,26 @@ impl WendelonDescriptorRegistry {
 				.ok_or_else(|| CatalogError::TableNotFound {
 					table: table_name(&table_ref),
 				})?;
-			let candidate = TableBinding::from_descriptor_with_logical_types(
+			let candidate = TableBinding::from_descriptor_with_logical_types_and_optimizer_facts(
 				existing_table_id,
 				&descriptor,
 				resolver,
+				optimizer_facts,
 			)?;
 			if same_descriptor_identity(&existing, &candidate) {
+				if existing.optimizer_facts != candidate.optimizer_facts {
+					state
+						.by_id
+						.insert((tenant_id, existing_table_id), candidate.clone());
+					state
+						.descriptors
+						.insert((tenant_id, existing_table_id), descriptor);
+					state
+						.by_ref
+						.entry((tenant_id, unqualified_ref))
+						.or_insert(existing_table_id);
+					return Ok(candidate);
+				}
 				return Ok(existing);
 			}
 			return Err(CatalogError::AdminFailed {
@@ -1194,8 +1337,12 @@ impl WendelonDescriptorRegistry {
 		}
 
 		let table_id = allocate_wendelon_table_id_locked(&mut state);
-		let binding =
-			TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?;
+		let binding = TableBinding::from_descriptor_with_logical_types_and_optimizer_facts(
+			table_id,
+			&descriptor,
+			resolver,
+			optimizer_facts,
+		)?;
 		insert_wendelon_descriptor_locked(
 			&mut state,
 			tenant_id,
@@ -1212,6 +1359,15 @@ impl WendelonDescriptorRegistry {
 		&self,
 		tenant_id: TenantId,
 		descriptor: wendelon_client::TableSchemaDescriptor,
+	) -> Result<TableBinding, CatalogError> {
+		self.sync_latest_descriptor_for_tenant_with_facts(tenant_id, descriptor, None)
+	}
+
+	pub fn sync_latest_descriptor_for_tenant_with_facts(
+		&self,
+		tenant_id: TenantId,
+		descriptor: wendelon_client::TableSchemaDescriptor,
+		optimizer_facts: Option<DescriptorOptimizerFacts>,
 	) -> Result<TableBinding, CatalogError> {
 		let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
 		let unqualified_ref = TableRef::new(&descriptor.table_name);
@@ -1235,10 +1391,11 @@ impl WendelonDescriptorRegistry {
 				.ok_or_else(|| CatalogError::TableNotFound {
 					table: table_name(&table_ref),
 				})?;
-			let binding = TableBinding::from_descriptor_with_logical_types(
+			let binding = TableBinding::from_descriptor_with_logical_types_and_optimizer_facts(
 				existing_table_id,
 				&descriptor,
 				resolver,
+				optimizer_facts,
 			)?;
 			if existing.table != binding.table {
 				return Err(CatalogError::AdminFailed {
@@ -1262,8 +1419,12 @@ impl WendelonDescriptorRegistry {
 		}
 
 		let table_id = allocate_wendelon_table_id_locked(&mut state);
-		let binding =
-			TableBinding::from_descriptor_with_logical_types(table_id, &descriptor, resolver)?;
+		let binding = TableBinding::from_descriptor_with_logical_types_and_optimizer_facts(
+			table_id,
+			&descriptor,
+			resolver,
+			optimizer_facts,
+		)?;
 		insert_wendelon_descriptor_locked(
 			&mut state,
 			tenant_id,
@@ -1659,6 +1820,26 @@ impl WendelonCatalog {
 	) -> Result<Self, CatalogError> {
 		Ok(Self {
 			registry: Arc::new(WendelonDescriptorRegistry::from_descriptors(descriptors)?),
+			..Self::default()
+		})
+	}
+
+	pub fn from_descriptors_with_optimizer_facts(
+		descriptors: impl IntoIterator<
+			Item = (
+				TableId,
+				wendelon_client::TableSchemaDescriptor,
+				Option<DescriptorOptimizerFacts>,
+			),
+		>,
+	) -> Result<Self, CatalogError> {
+		Ok(Self {
+			registry: Arc::new(
+				WendelonDescriptorRegistry::from_descriptors_for_tenant_with_facts(
+					TenantId(1),
+					descriptors,
+				)?,
+			),
 			..Self::default()
 		})
 	}
@@ -2628,6 +2809,94 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn descriptor_sidecar_facts_populate_table_optimizer_facts() {
+		let descriptor = descriptor();
+		let binding = TableBinding::from_descriptor_with_optimizer_facts(
+			TableId(9),
+			&descriptor,
+			Some(descriptor_optimizer_facts(
+				&descriptor,
+				Some(4_096),
+				Some(1_000),
+			)),
+		)
+		.expect("binding with optimizer facts");
+
+		assert_eq!(
+			binding.optimizer_facts,
+			TableOptimizerFacts {
+				byte_upper_bound: Some(ByteCount::new(4_096)),
+				row_upper_bound: Some(RowCount::new(1_000)),
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn legacy_descriptor_paths_still_default_unknown() {
+		let descriptor = descriptor();
+		let binding =
+			TableBinding::from_descriptor(TableId(9), &descriptor).expect("legacy binding");
+		let registry = WendelonDescriptorRegistry::from_descriptors_for_tenant(
+			TenantId(7),
+			[(TableId(9), descriptor.clone())],
+		)
+		.expect("legacy registry");
+
+		assert_eq!(binding.optimizer_facts, TableOptimizerFacts::default());
+		assert_eq!(
+			registry
+				.resolve_table(TenantId(7), &TableRef::with_schema("bench", "orders"))
+				.expect("resolve legacy registry")
+				.optimizer_facts,
+			TableOptimizerFacts::default()
+		);
+	}
+
+	#[tokio::test]
+	async fn mismatched_facts_default_to_unknown() {
+		let descriptor = descriptor();
+		let stale_descriptor = descriptor_with_identity(0xCB, descriptor.schema_generation);
+		for stale_facts in [
+			DescriptorOptimizerFacts {
+				physical_descriptor_fingerprint: stale_descriptor.physical_descriptor_fingerprint,
+				..descriptor_optimizer_facts(&descriptor, Some(1_024), Some(10))
+			},
+			DescriptorOptimizerFacts {
+				schema_generation: descriptor.schema_generation + 1,
+				..descriptor_optimizer_facts(&descriptor, Some(1_024), Some(10))
+			},
+		] {
+			let binding = TableBinding::from_descriptor_with_optimizer_facts(
+				TableId(9),
+				&descriptor,
+				Some(stale_facts),
+			)
+			.expect("binding with stale facts");
+
+			assert_eq!(binding.optimizer_facts, TableOptimizerFacts::default());
+		}
+	}
+
+	#[tokio::test]
+	async fn known_empty_sidecar_normalizes_to_zero_bytes() {
+		let descriptor = descriptor();
+		let binding = TableBinding::from_descriptor_with_optimizer_facts(
+			TableId(9),
+			&descriptor,
+			Some(descriptor_optimizer_facts(&descriptor, None, Some(0))),
+		)
+		.expect("binding with empty facts");
+
+		assert_eq!(
+			binding.optimizer_facts,
+			TableOptimizerFacts {
+				byte_upper_bound: Some(ByteCount::ZERO),
+				row_upper_bound: Some(RowCount::new(0)),
+			}
+		);
+	}
+
+	#[tokio::test]
 	async fn resolve_table_bind_miss_fetches_descriptor_and_returns_binding() {
 		let descriptor = descriptor();
 		let client = Arc::new(FakeDescriptorSyncClient::new([Ok(Some(
@@ -3332,6 +3601,51 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn facts_refresh_updates_binding_without_descriptor_identity_change() {
+		let descriptor = descriptor();
+		let registry = WendelonDescriptorRegistry::from_descriptors_for_tenant_with_facts(
+			TenantId(7),
+			[(
+				TableId(9),
+				descriptor.clone(),
+				Some(descriptor_optimizer_facts(
+					&descriptor,
+					Some(8_192),
+					Some(1_000),
+				)),
+			)],
+		)
+		.expect("registry");
+
+		let refreshed = registry
+			.sync_descriptor_for_tenant_with_facts(
+				TenantId(7),
+				&TableRef::with_schema("bench", "orders"),
+				descriptor.clone(),
+				Some(descriptor_optimizer_facts(
+					&descriptor,
+					Some(1_024),
+					Some(1_000),
+				)),
+			)
+			.expect("refresh facts");
+
+		assert_eq!(refreshed.legacy_table_id, TableId(9));
+		assert_eq!(
+			refreshed.optimizer_facts.byte_upper_bound,
+			Some(ByteCount::new(1_024))
+		);
+		assert_eq!(
+			registry
+				.resolve_table(TenantId(7), &TableRef::with_schema("bench", "orders"))
+				.expect("resolve refreshed facts")
+				.optimizer_facts
+				.byte_upper_bound,
+			Some(ByteCount::new(1_024))
+		);
+	}
+
+	#[tokio::test]
 	async fn registry_sync_descriptor_for_tenant_rejects_existing_conflict() {
 		let registry = WendelonDescriptorRegistry::from_descriptors_for_tenant(
 			TenantId(7),
@@ -3552,6 +3866,20 @@ mod tests {
 
 	fn descriptor_with_identity(id_byte: u8, generation: u64) -> TableSchemaDescriptor {
 		named_descriptor_with_identity(id_byte, generation, "bench", "orders")
+	}
+
+	fn descriptor_optimizer_facts(
+		descriptor: &TableSchemaDescriptor,
+		materialized_bytes: Option<u64>,
+		rows: Option<u64>,
+	) -> DescriptorOptimizerFacts {
+		DescriptorOptimizerFacts {
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			manifest_epoch: 11,
+			materialized_byte_upper_bound: materialized_bytes.map(ByteCount::new),
+			row_upper_bound: rows.map(RowCount::new),
+		}
 	}
 
 	fn named_descriptor_with_identity(

@@ -25,7 +25,8 @@ use crate::audit::{
 use crate::catalog::{WendelonCatalog, WendelonDescriptorRegistry};
 use crate::config::{
 	OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC, ToronBootstrapConfig, ToronConfigError,
-	ToronWendelonStorageConfig, load_descriptor_bootstrap, load_toron_bootstrap_config,
+	ToronWendelonStorageConfig, load_descriptor_bootstrap_with_optimizer_facts,
+	load_toron_bootstrap_config,
 };
 use crate::coordinator::DistributedQueryCoordinator;
 use crate::distributed::budget::{
@@ -158,14 +159,14 @@ impl ToronDaemon {
 				message: OBSERVABILITY_REQUIRES_TLS_DIAGNOSTIC.to_string(),
 			});
 		}
-		let descriptor_triples = match &config.catalog.descriptor_bootstrap_path {
-			Some(path) => load_descriptor_bootstrap(path)?,
+		let descriptor_records = match &config.catalog.descriptor_bootstrap_path {
+			Some(path) => load_descriptor_bootstrap_with_optimizer_facts(path)?,
 			None => Vec::new(),
 		};
-		let descriptors_loaded = descriptor_triples.len() as u64;
-		let registry = Arc::new(WendelonDescriptorRegistry::from_tenant_descriptors(
-			descriptor_triples,
-		)?);
+		let descriptors_loaded = descriptor_records.len() as u64;
+		let registry = Arc::new(
+			WendelonDescriptorRegistry::from_tenant_descriptors_with_facts(descriptor_records)?,
+		);
 		tracing::info!("descriptor_registry_constructed");
 
 		let tenant_id = config.node.tenant_id;

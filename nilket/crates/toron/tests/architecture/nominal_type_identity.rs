@@ -289,7 +289,10 @@ pub(crate) fn adr088_field_metadata_decoder_validates_parse_registry_and_physica
 #[test]
 pub(crate) fn adr088_descriptor_binding_validates_declared_logical_metadata() {
 	let catalog = catalog_source();
-	let from_descriptor = source_block(&catalog, "pub fn from_descriptor_with_logical_types");
+	let from_descriptor = source_block(
+		&catalog,
+		"pub fn from_descriptor_with_logical_types_and_optimizer_facts",
+	);
 
 	let arrow_schema = from_descriptor
 		.find("descriptor.arrow_schema()")

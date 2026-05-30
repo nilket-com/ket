@@ -381,6 +381,8 @@ pub(crate) fn adr042_descriptor_bootstrap_is_product_type_with_table_ids() {
 	assert!(config.contains("pub table_id: u64"));
 	assert!(config.contains("pub descriptor: wendelon_client::TableSchemaDescriptor"));
 	assert!(config.contains("Vec<(TenantId, TableId, wendelon_client::TableSchemaDescriptor)>"));
+	assert!(config.contains("pub type DescriptorBootstrapRecord"));
+	assert!(config.contains("optimizer_facts: Option<DescriptorOptimizerFacts>"));
 }
 
 #[test]
@@ -429,7 +431,7 @@ pub(crate) fn adr042_descriptor_bootstrap_is_startup_only() {
 		.expect("ToronDaemon::start_with_client")
 		.1;
 
-	assert!(startup.contains("load_descriptor_bootstrap(path)?"));
+	assert!(startup.contains("load_descriptor_bootstrap_with_optimizer_facts(path)?"));
 	for forbidden in [
 		"list_descriptors",
 		"refresh_descriptor",

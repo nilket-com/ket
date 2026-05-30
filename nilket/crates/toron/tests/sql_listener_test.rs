@@ -1232,6 +1232,7 @@ fn write_descriptor_bootstrap_for_tenant(
 			tenant_id: tenant_id.0,
 			table_id: 1,
 			descriptor,
+			optimizer_facts: None,
 		}],
 	};
 	std::fs::write(&path, serde_json::to_string_pretty(&bootstrap).unwrap())

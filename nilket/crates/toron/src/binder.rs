@@ -56,10 +56,19 @@ const INFORMATION_SCHEMA_TABLES_TABLE: &str = "tables";
 const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = "columns";
 const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct PlannerConfig {
 	pub allow_experimental_kernels: bool,
 	pub auto_broadcast_max_build_bytes: Option<ByteCount>,
+}
+
+impl Default for PlannerConfig {
+	fn default() -> Self {
+		Self {
+			allow_experimental_kernels: false,
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
+		}
+	}
 }
 
 pub async fn bind(
@@ -6907,8 +6916,9 @@ fn is_pbc_eligible_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::catalog::MockCatalog;
+	use crate::catalog::{DescriptorOptimizerFacts, MockCatalog, WendelonCatalog};
 	use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, TableId};
+	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::sql_planner::SqlPlanner;
 	use arrow::datatypes::{Field, Schema};
 	use wendelon::schema::{
@@ -7678,6 +7688,26 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn planner_default_on_missing_facts_still_hashes() {
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
+			.expect("plan SQL join");
+
+		let (plan, trace) = bind_with_trace(&logical, &join_catalog(), &PlannerConfig::default())
+			.await
+			.expect("bind missing-facts default join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+		assert_eq!(trace.join_decisions.len(), 1);
+		assert_eq!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::MissingBuildByteUpperBound,
+			}
+		);
+	}
+
+	#[tokio::test]
 	async fn sql_fact_left_tiny_right_infers_broadcast() {
 		let mut right_tiny_catalog = join_catalog();
 		seed_byte_upper_bound(&mut right_tiny_catalog, "orders", 64 * 1024 * 1024);
@@ -8001,6 +8031,59 @@ mod tests {
 			.expect("bind left-deep probe right-tiny join");
 
 		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 2);
+	}
+
+	#[tokio::test]
+	async fn star_query_infers_broadcast_without_seed_optimizer_facts() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), None);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan descriptor-sidecar SQL join");
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind descriptor-sidecar broadcast star");
+
+		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 2);
+	}
+
+	#[tokio::test]
+	async fn rune_ctx_sql_star_query_infers_broadcast_without_seed_optimizer_facts() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), None);
+		let logical = rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM orders o \
+                     INNER JOIN customers c1 ON o.customer_id = c1.id \
+                     INNER JOIN customers c2 ON o.customer_id = c2.id")
+        }
+    "#,
+		)
+		.await;
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind descriptor-sidecar Rune broadcast star");
+
+		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 2);
+	}
+
+	#[tokio::test]
+	async fn known_empty_table_infers_broadcast() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(0));
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan known-empty join");
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind known-empty broadcast join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
 	}
 
 	#[tokio::test]
@@ -8751,6 +8834,70 @@ mod tests {
 				},
 			)
 			.expect("seed optimizer facts");
+	}
+
+	fn descriptor_sidecar_join_catalog(
+		orders_byte_upper_bound: Option<u64>,
+		customers_byte_upper_bound: Option<u64>,
+		customers_row_upper_bound: Option<u64>,
+	) -> WendelonCatalog {
+		let orders = named_descriptor(
+			1,
+			"orders",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("customer_id", DataType::Int64, false),
+			]),
+		);
+		let customers = named_descriptor(
+			2,
+			"customers",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("region", DataType::Utf8, true),
+			]),
+		);
+		WendelonCatalog::from_descriptors_with_optimizer_facts([
+			(
+				TableId(1),
+				orders.clone(),
+				orders_byte_upper_bound
+					.map(|bytes| descriptor_sidecar_facts(&orders, Some(bytes), None)),
+			),
+			(
+				TableId(2),
+				customers.clone(),
+				Some(descriptor_sidecar_facts(
+					&customers,
+					customers_byte_upper_bound,
+					customers_row_upper_bound,
+				)),
+			),
+		])
+		.expect("descriptor-sidecar catalog")
+	}
+
+	fn descriptor_sidecar_facts(
+		descriptor: &TableSchemaDescriptor,
+		materialized_byte_upper_bound: Option<u64>,
+		row_upper_bound: Option<u64>,
+	) -> DescriptorOptimizerFacts {
+		DescriptorOptimizerFacts {
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			manifest_epoch: 7,
+			materialized_byte_upper_bound: materialized_byte_upper_bound.map(ByteCount::new),
+			row_upper_bound: row_upper_bound.map(RowCount::new),
+		}
+	}
+
+	async fn rune_plan(script: &str) -> LogicalPlan {
+		let config = RuneSandboxConfig::v1_default();
+		let engine = RuneEngine::with_config(config).expect("Rune engine");
+		engine
+			.execute_script(script, &config)
+			.await
+			.expect("Rune-authored plan")
 	}
 
 	async fn bind_explain_rows(
