@@ -70,6 +70,8 @@ pub enum FragmentError {
 	BroadcastNonInner { kind: JoinKind },
 	#[error("broadcast build input must terminate in a single-partition exchange")]
 	BroadcastBuildNotPublished,
+	#[error("broadcast probe must be scan-linear or a left-deep broadcast star")]
+	BroadcastProbeNotStarLinear,
 	#[error("CREATE TABLE is a coordinator-only catalog operation")]
 	CreateTableNotFragmentable,
 	#[error("DROP TABLE is a coordinator-only catalog operation")]
@@ -481,37 +483,37 @@ fn fragment_broadcast_join_plan(
 		return Err(FragmentError::BroadcastNonInner { kind: join.kind });
 	}
 	reject_sort_barrier_inside_join_inputs(&join)?;
-	let build_boundary = extract_exchange(*join.left)?;
-	if build_boundary.partition_count != 1 {
-		return Err(FragmentError::BroadcastBuildNotPublished);
+	let BroadcastStarPlan {
+		plan: consumer_plan,
+		builds,
+	} = collect_broadcast_star_plan(plan, allocator)?;
+	if builds.is_empty() {
+		return Err(FragmentError::BroadcastProbeNotStarLinear);
 	}
-	if matches!(join.right.as_ref(), ExecutionPlan::Exchange { .. }) {
-		return Err(FragmentError::BroadcastBuildNotPublished);
-	}
-
-	let build_exchange_id = allocator.alloc_exchange();
-	let build_stage_id = allocator.alloc_stage();
 	let join_stage_id = allocator.alloc_stage();
 	let worker_count = config.worker_count.max(1);
-	let build_scan_metadata =
-		first_scan_metadata(&build_boundary.input).ok_or(FragmentError::MissingScanMetadata)?;
-	let join_replacement = ExecutionPlan::Join {
-		left: Box::new(shuffle_input_scan(
-			build_scan_metadata,
-			build_boundary.input.schema(),
-			build_exchange_id,
-		)),
-		right: join.right,
-		kind: join.kind,
-		left_keys: join.left_keys,
-		right_keys: join.right_keys,
-		strategy: join.strategy,
-		output_schema: join.output_schema,
-	};
-	let consumer_plan = terminal_output.wrap_plan(replace_first_join(plan, join_replacement));
+	let consumer_plan = terminal_output.wrap_plan(consumer_plan);
 	let consumer_output = terminal_output.task_output();
+	let build_inputs = builds
+		.iter()
+		.map(|build| TaskInputBinding::ShuffleConsumer {
+			exchange_id: build.exchange_id,
+			producer_stage_id: build.stage_id,
+			partition_id: PartitionId::new(0),
+			producer_partitions: Vec::new(),
+		})
+		.collect::<Vec<_>>();
 	let consumer_tasks = (0..worker_count)
 		.map(|worker_index| {
+			let mut inputs = Vec::with_capacity(1 + build_inputs.len());
+			inputs.push(TaskInputBinding::Scan {
+				share: Some(ScanShare {
+					worker_index,
+					worker_count,
+				}),
+				runtime_filter: None,
+			});
+			inputs.extend(build_inputs.clone());
 			TaskPlan::new(TaskSpec {
 				identity: TaskIdentity::new(
 					config.query_id,
@@ -522,21 +524,7 @@ fn fragment_broadcast_join_plan(
 				partition: None,
 				context: config.task_context,
 				plan: consumer_plan.clone(),
-				inputs: vec![
-					TaskInputBinding::Scan {
-						share: Some(ScanShare {
-							worker_index,
-							worker_count,
-						}),
-						runtime_filter: None,
-					},
-					TaskInputBinding::ShuffleConsumer {
-						exchange_id: build_exchange_id,
-						producer_stage_id: build_stage_id,
-						partition_id: PartitionId::new(0),
-						producer_partitions: Vec::new(),
-					},
-				],
+				inputs,
 				output: consumer_output.clone(),
 				budget: config.task_budget,
 				trace: None,
@@ -544,24 +532,127 @@ fn fragment_broadcast_join_plan(
 		})
 		.collect();
 
-	let stages = vec![
-		StagePlan {
-			stage_id: build_stage_id,
+	let mut upstream_stages = Vec::with_capacity(builds.len());
+	let mut stages = Vec::with_capacity(builds.len() + 1);
+	for build in builds {
+		upstream_stages.push(build.stage_id);
+		stages.push(StagePlan {
+			stage_id: build.stage_id,
 			upstream_stages: vec![],
 			tasks: vec![producer_task(
 				config,
-				build_stage_id,
-				build_exchange_id,
-				build_boundary,
+				build.stage_id,
+				build.exchange_id,
+				build.boundary,
 			)],
-		},
-		StagePlan {
-			stage_id: join_stage_id,
-			upstream_stages: vec![build_stage_id],
-			tasks: consumer_tasks,
-		},
-	];
+		});
+	}
+	stages.push(StagePlan {
+		stage_id: join_stage_id,
+		upstream_stages,
+		tasks: consumer_tasks,
+	});
 	Ok((stages, join_stage_id))
+}
+
+fn collect_broadcast_star_plan(
+	plan: ExecutionPlan,
+	allocator: &mut FragmentIdAllocator,
+) -> Result<BroadcastStarPlan, FragmentError> {
+	let mut builds = Vec::new();
+	let plan = rewrite_broadcast_star_probe(plan, allocator, &mut builds)?;
+	Ok(BroadcastStarPlan { plan, builds })
+}
+
+fn rewrite_broadcast_star_probe(
+	plan: ExecutionPlan,
+	allocator: &mut FragmentIdAllocator,
+	builds: &mut Vec<BroadcastStarBuild>,
+) -> Result<ExecutionPlan, FragmentError> {
+	match plan {
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			strategy,
+			output_schema,
+		} => {
+			if kind != JoinKind::Inner {
+				return Err(FragmentError::BroadcastNonInner { kind });
+			}
+			if strategy != JoinStrategy::Broadcast {
+				return Err(FragmentError::BroadcastProbeNotStarLinear);
+			}
+			let build_boundary = extract_exchange(*left)?;
+			if build_boundary.partition_count != 1 {
+				return Err(FragmentError::BroadcastBuildNotPublished);
+			}
+			if contains_join(&build_boundary.input) {
+				return Err(FragmentError::BroadcastProbeNotStarLinear);
+			}
+			let build_scan_metadata = first_scan_metadata(&build_boundary.input)
+				.ok_or(FragmentError::MissingScanMetadata)?;
+			let build_exchange_id = allocator.alloc_exchange();
+			let build_stage_id = allocator.alloc_stage();
+			let build_scan = shuffle_input_scan(
+				build_scan_metadata,
+				build_boundary.input.schema(),
+				build_exchange_id,
+			);
+			builds.push(BroadcastStarBuild {
+				exchange_id: build_exchange_id,
+				stage_id: build_stage_id,
+				boundary: build_boundary,
+			});
+			Ok(ExecutionPlan::Join {
+				left: Box::new(build_scan),
+				right: Box::new(rewrite_broadcast_star_probe(*right, allocator, builds)?),
+				kind,
+				left_keys,
+				right_keys,
+				strategy,
+				output_schema,
+			})
+		}
+		ExecutionPlan::Filter {
+			input,
+			predicate,
+			disposition,
+		} => Ok(ExecutionPlan::Filter {
+			input: Box::new(rewrite_broadcast_star_probe(*input, allocator, builds)?),
+			predicate,
+			disposition,
+		}),
+		ExecutionPlan::Project {
+			input,
+			exprs,
+			output_schema,
+		} => Ok(ExecutionPlan::Project {
+			input: Box::new(rewrite_broadcast_star_probe(*input, allocator, builds)?),
+			exprs,
+			output_schema,
+		}),
+		leaf @ ExecutionPlan::Scan {
+			row_limit: None, ..
+		} => Ok(leaf),
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Aggregate { .. }
+		| ExecutionPlan::Exchange { .. }
+		| ExecutionPlan::Sort { .. }
+		| ExecutionPlan::Take { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => Err(FragmentError::BroadcastProbeNotStarLinear),
+	}
 }
 
 fn producer_task(
@@ -645,6 +736,19 @@ struct JoinBoundary {
 	right_keys: Vec<ColumnOrdinal>,
 	strategy: JoinStrategy,
 	output_schema: SchemaRef,
+}
+
+#[derive(Debug, Clone)]
+struct BroadcastStarBuild {
+	exchange_id: ExchangeId,
+	stage_id: StageId,
+	boundary: ExchangeBoundary,
+}
+
+#[derive(Debug, Clone)]
+struct BroadcastStarPlan {
+	plan: ExecutionPlan,
+	builds: Vec<BroadcastStarBuild>,
 }
 
 #[derive(Debug, Clone)]
@@ -1530,6 +1634,81 @@ mod tests {
 					&& *partition_id == PartitionId::new(0)
 			));
 		}
+	}
+
+	#[test]
+	fn three_way_broadcast_star_flattens_to_single_probe_stage() {
+		let inner = join_plan(
+			exchanged_scan(TableId(1), 1),
+			scan_plan_with_table(TableId(2), 2),
+			JoinStrategy::Broadcast,
+		);
+		let outer = join_plan(
+			exchanged_scan(TableId(3), 1),
+			inner,
+			JoinStrategy::Broadcast,
+		);
+
+		let stages =
+			fragment_plan(outer, config().with_worker_count(4)).expect("fragment star broadcast");
+
+		assert_eq!(stages.len(), 3);
+		assert_eq!(
+			stages[2].upstream_stages,
+			vec![StageId::new(0), StageId::new(1)]
+		);
+		assert_eq!(stages[2].tasks.len(), 4);
+		for (worker_index, task) in stages[2].tasks.iter().enumerate() {
+			assert_eq!(task.spec.inputs.len(), 3);
+			assert!(matches!(
+				&task.spec.inputs[0],
+				TaskInputBinding::Scan {
+					share: Some(ScanShare {
+						worker_index: observed,
+						worker_count,
+					}),
+					..
+				} if *observed == u32::try_from(worker_index).unwrap() && *worker_count == 4
+			));
+			for (input_index, (exchange_id, producer_stage_id)) in [
+				(ExchangeId::new(0), StageId::new(0)),
+				(ExchangeId::new(1), StageId::new(1)),
+			]
+			.into_iter()
+			.enumerate()
+			{
+				assert!(matches!(
+					&task.spec.inputs[input_index + 1],
+					TaskInputBinding::ShuffleConsumer {
+						exchange_id: observed_exchange,
+						producer_stage_id: observed_stage,
+						partition_id,
+						..
+					} if *observed_exchange == exchange_id
+						&& *observed_stage == producer_stage_id
+						&& *partition_id == PartitionId::new(0)
+				));
+			}
+		}
+	}
+
+	#[test]
+	fn pinned_broadcast_unsupported_nested_probe_rejects() {
+		let nested_hash_probe = join_plan(
+			exchanged_scan(TableId(2), 2),
+			exchanged_scan(TableId(3), 2),
+			JoinStrategy::HashPartitioned,
+		);
+		let plan = join_plan(
+			exchanged_scan(TableId(1), 1),
+			nested_hash_probe,
+			JoinStrategy::Broadcast,
+		);
+
+		assert_eq!(
+			fragment_plan(plan, config().with_worker_count(3)).expect_err("reject nested probe"),
+			FragmentError::BroadcastProbeNotStarLinear
+		);
 	}
 
 	#[test]

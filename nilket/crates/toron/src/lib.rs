@@ -752,6 +752,33 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn three_way_broadcast_star_digest_matches_hash_over_tcp() {
+		let logical = sql_fact_two_dim_join_plan();
+		let hash_results = run_distributed_join_query(logical.clone(), 16).await;
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(64 * 1024);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(512 * 1024);
+		let broadcast_results = run_distributed_join_query_with_catalog_config_and_budget(
+			logical,
+			3,
+			join_catalog_with_optimizer_facts(64 * 1024 * 1024, 1_024),
+			PlannerConfig {
+				auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+				..PlannerConfig::default()
+			},
+			query_budget,
+		)
+		.await
+		.expect("execute broadcast-star join");
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&broadcast_results, SortPolicy::FullRowLex)
+				.expect("broadcast-star digest"),
+			canonical_arrow_ipc_digest(&hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	#[tokio::test]
 	async fn filtered_probe_broadcast_byte_identical_to_hash_over_tcp() {
 		let hash_results =
 			run_distributed_join_query(filtered_fact_probe_dim_left_join_plan(), 16).await;
@@ -1602,6 +1629,16 @@ mod tests {
 		crate::sql_planner::SqlPlanner::new()
 			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 			.expect("SQL fact-dim join plan")
+	}
+
+	fn sql_fact_two_dim_join_plan() -> LogicalPlan {
+		crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("SQL fact-two-dim join plan")
 	}
 
 	fn filtered_fact_probe_dim_left_join_plan() -> LogicalPlan {

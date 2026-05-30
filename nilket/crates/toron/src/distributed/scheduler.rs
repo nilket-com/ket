@@ -25,7 +25,7 @@ use crate::error::TaskFailureKind;
 use crate::exec::runtime_filter::{
 	build_runtime_filter_fragment, descriptor_from_fragment, merge_fragments,
 };
-use crate::ir::ExecutionPlan;
+use crate::ir::{ExecutionPlan, JoinStrategy};
 use wendelon::schema::PhysicalDescriptorFingerprint;
 
 #[derive(Debug, Clone)]
@@ -656,9 +656,9 @@ where
 			.iter()
 			.all(|upstream| is_streamable_producer_stage(*upstream, stages));
 		let streamable_both = stage.upstream_stages.len() > 1 && upstreams_all_streamable_producers;
-		let live_eligible = (stage.upstream_stages.len() == 1
-			&& is_streamable_shuffle_consumer(&task.spec))
-			|| streamable_both;
+		let live_eligible = !contains_broadcast_join(&task.spec.plan)
+			&& ((stage.upstream_stages.len() == 1 && is_streamable_shuffle_consumer(&task.spec))
+				|| streamable_both);
 		if !live_eligible {
 			return self.shuffle_inputs_fully_sealed(&task.spec, stages);
 		}
@@ -789,8 +789,8 @@ where
 	) -> Result<TaskSpec, SchedulerError> {
 		let runtime_filter = self.runtime_filter_descriptor_for_probe(&spec, stages);
 		let consumer_streamable = is_streamable_shuffle_consumer(&spec);
-		let consumer_streamable_both =
-			spec_all_shuffle_inputs_from_streamable_producer_stages(&spec, stages);
+		let consumer_streamable_both = !contains_broadcast_join(&spec.plan)
+			&& spec_all_shuffle_inputs_from_streamable_producer_stages(&spec, stages);
 		for input in &mut spec.inputs {
 			if let TaskInputBinding::Scan {
 				runtime_filter: input_runtime_filter,
@@ -1104,6 +1104,38 @@ fn spec_all_shuffle_inputs_from_streamable_producer_stages(
 		&& producer_stage_ids
 			.iter()
 			.all(|stage_id| is_streamable_producer_stage(*stage_id, stages))
+}
+
+fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} => {
+			*strategy == JoinStrategy::Broadcast
+				|| contains_broadcast_join(left)
+				|| contains_broadcast_join(right)
+		}
+		ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => contains_broadcast_join(input),
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => false,
+	}
 }
 
 fn runtime_filter_build_stage(spec: &TaskSpec, stages: &[StagePlan]) -> bool {

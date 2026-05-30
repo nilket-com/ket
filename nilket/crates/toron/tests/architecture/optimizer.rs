@@ -27,6 +27,10 @@ fn exec_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read executor source")
 }
 
+fn lib_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source")
+}
+
 fn source_block(source: &str, marker: &str) -> String {
 	brace_blocks_after_marker(source, marker)
 		.into_iter()
@@ -330,6 +334,36 @@ pub(crate) fn adr133_no_public_explain_surface() {
 	assert!(binder.contains("SystemTableKind::OptimizerExplain"));
 	assert!(!execution.contains("OptimizerTrace"));
 	assert!(!execution.contains("DecisionReceipt"));
+}
+
+#[test]
+pub(crate) fn adr135_probe_eligibility_and_behavior_gates_cover_broadcast_star() {
+	let binder = binder_source();
+	let lib = lib_source();
+	let helper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
+
+	for marker in [
+		"ExecutionPlan::Join {",
+		"*kind == JoinKind::Inner",
+		"*strategy == JoinStrategy::Broadcast",
+		"matches!(terminal_exchange(left), Some((1, _)))",
+		"broadcast_probe_is_scan_linear(right)",
+		"| ExecutionPlan::Join { .. }",
+	] {
+		assert!(
+			helper.contains(marker),
+			"missing ADR135 helper marker {marker}"
+		);
+	}
+	for gate in [
+		"right_tiny_left_deep_join_infers_broadcast_star",
+		"nested_hash_probe_still_stays_hash",
+		"explain_broadcast_star_emits_one_receipt_per_link",
+		"explain_probe_not_scan_linear_reports_hash_reason_detail",
+	] {
+		assert!(binder.contains(gate), "missing ADR135 binder gate {gate}");
+	}
+	assert!(lib.contains("three_way_broadcast_star_digest_matches_hash_over_tcp"));
 }
 
 #[test]

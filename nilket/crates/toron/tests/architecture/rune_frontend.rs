@@ -2239,12 +2239,11 @@ pub(crate) fn adr131_probe_eligibility_is_scan_linear_execution_plan_walk() {
 }
 
 #[test]
-pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_nested_shapes() {
+pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_non_star_shapes() {
 	let binder = binder_source();
 	let helper = source_block(&binder, "fn broadcast_probe_is_scan_linear");
 
 	for rejected in [
-		"ExecutionPlan::Join",
 		"ExecutionPlan::Aggregate",
 		"ExecutionPlan::Sort",
 		"ExecutionPlan::Take",
@@ -2265,6 +2264,7 @@ pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_nested_shapes()
 			"scan-linear helper missing rejected variant {rejected}"
 		);
 	}
+	assert!(helper.contains("| ExecutionPlan::Join { .. }"));
 	assert!(helper.contains("=> false"));
 }
 
@@ -2388,7 +2388,7 @@ pub(crate) fn adr130_behavior_gates_cover_tiny_right_and_left_tie_fence() {
 	for gate in [
 		"sql_fact_left_tiny_right_infers_broadcast",
 		"both_sides_tiny_equal_keeps_left_build",
-		"right_tiny_left_deep_join_stays_hash",
+		"right_tiny_left_deep_join_infers_broadcast_star",
 		"pinned_broadcast_still_wins_and_fail_loud",
 		"right_build_swapped_plan_is_valid_left_build_broadcast",
 	] {

@@ -302,9 +302,11 @@ pub(crate) fn adr123_task_ready_for_dispatch_relaxes_for_streamable_both() {
 	assert!(readiness.contains("stage.upstream_stages.len() == 1"));
 	assert!(readiness.contains("is_streamable_shuffle_consumer(&task.spec)"));
 	assert!(readiness.contains("|| streamable_both"));
+	assert!(readiness.contains("!contains_broadcast_join(&task.spec.plan)"));
 	assert!(readiness.contains("live_input_worker_for_all_shuffle_inputs"));
 	assert!(readiness.contains("self.shuffle_inputs_fully_sealed"));
 	assert!(materialize.contains("spec_all_shuffle_inputs_from_streamable_producer_stages"));
+	assert!(materialize.contains("!contains_broadcast_join(&spec.plan)"));
 	assert!(materialize.contains("consumer_streamable || consumer_streamable_both"));
 }
 
@@ -1065,6 +1067,10 @@ pub(crate) fn broadcast_join_fragmenter_input_shape_is_architecture_guarded() {
 
 	assert_eq!(broadcast.matches("TaskInputBinding::Scan").count(), 1);
 	assert!(broadcast.contains("share: Some(ScanShare"));
+	assert!(broadcast.contains("collect_broadcast_star_plan(plan, allocator)"));
+	assert!(broadcast.contains("let build_inputs = builds"));
+	assert!(broadcast.contains("Vec::with_capacity(1 + build_inputs.len())"));
+	assert!(broadcast.contains("inputs.extend(build_inputs.clone())"));
 	assert_eq!(
 		broadcast
 			.matches("TaskInputBinding::ShuffleConsumer")
@@ -1072,5 +1078,9 @@ pub(crate) fn broadcast_join_fragmenter_input_shape_is_architecture_guarded() {
 		1
 	);
 	assert!(broadcast.contains("partition_id: PartitionId::new(0)"));
+	assert!(broadcast.contains("upstream_stages.push(build.stage_id)"));
+	assert!(broadcast.contains("rewrite_broadcast_star_probe"));
+	assert!(broadcast.contains("FragmentError::BroadcastProbeNotStarLinear"));
+	assert!(broadcast.contains("contains_join(&build_boundary.input)"));
 	assert!(!broadcast.contains("share: None"));
 }

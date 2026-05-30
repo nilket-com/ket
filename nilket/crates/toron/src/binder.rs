@@ -3963,6 +3963,18 @@ fn broadcast_probe_is_scan_linear(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::Filter { input, .. } | ExecutionPlan::Project { input, .. } => {
 			broadcast_probe_is_scan_linear(input)
 		}
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			strategy,
+			..
+		} if *kind == JoinKind::Inner
+			&& *strategy == JoinStrategy::Broadcast
+			&& matches!(terminal_exchange(left), Some((1, _))) =>
+		{
+			broadcast_probe_is_scan_linear(right)
+		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Aggregate { .. }
@@ -7972,7 +7984,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn right_tiny_left_deep_join_stays_hash() {
+	async fn right_tiny_left_deep_join_infers_broadcast_star() {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
 		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
@@ -7988,7 +8000,7 @@ mod tests {
 			.await
 			.expect("bind left-deep probe right-tiny join");
 
-		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 2);
 	}
 
 	#[tokio::test]
@@ -8102,23 +8114,18 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn probe_containing_join_stays_hash() {
+	async fn nested_hash_probe_still_stays_hash() {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
 		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
-		let logical = SqlPlanner::new()
-			.plan(
-				"SELECT * FROM orders o \
-				 INNER JOIN customers c1 ON o.customer_id = c1.id \
-				 INNER JOIN customers c2 ON o.customer_id = c2.id",
-			)
-			.expect("plan nested-probe SQL join");
+		let logical = nested_hash_probe_with_tiny_right();
 
 		let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
 			.await
 			.expect("bind nested-probe join");
 
 		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+		assert_join_strategy_count(&plan, JoinStrategy::HashPartitioned, 2);
 	}
 
 	#[tokio::test]
@@ -8126,13 +8133,7 @@ mod tests {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
 		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
-		let logical = SqlPlanner::new()
-			.plan(
-				"SELECT * FROM orders o \
-				 INNER JOIN customers c1 ON o.customer_id = c1.id \
-				 INNER JOIN customers c2 ON o.customer_id = c2.id",
-			)
-			.expect("plan nested-probe SQL join");
+		let logical = nested_hash_probe_with_tiny_right();
 
 		let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
 			.await
@@ -8393,13 +8394,9 @@ mod tests {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
 		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
-		let logical = SqlPlanner::new()
-			.plan(
-				"EXPLAIN SELECT * FROM orders o \
-				 INNER JOIN customers c1 ON o.customer_id = c1.id \
-				 INNER JOIN customers c2 ON o.customer_id = c2.id",
-			)
-			.expect("plan EXPLAIN nested-probe join");
+		let logical = LogicalPlan::Explain {
+			input: Box::new(nested_hash_probe_with_tiny_right()),
+		};
 
 		let (_schema, rows) =
 			bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
@@ -8418,6 +8415,41 @@ mod tests {
 			rows[1][4],
 			ScalarValue::Utf8(Some("probe_not_scan_linear".to_string()))
 		);
+	}
+
+	#[tokio::test]
+	async fn explain_broadcast_star_emits_one_receipt_per_link() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"EXPLAIN SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan EXPLAIN broadcast-star join");
+
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+
+		assert_eq!(rows.len(), 2);
+		assert_eq!(
+			rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+			vec![ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(1))]
+		);
+		for row in rows {
+			assert_eq!(row[1], ScalarValue::Utf8(Some("broadcast".to_string())));
+			assert_eq!(
+				row[2],
+				ScalarValue::Utf8(Some("swapped_right_build".to_string()))
+			);
+			assert_eq!(
+				row[3],
+				ScalarValue::Utf8(Some("broadcast_inferred".to_string()))
+			);
+			assert_eq!(row[5], ScalarValue::Utf8(Some("right".to_string())));
+		}
 	}
 
 	#[tokio::test]
@@ -8748,6 +8780,54 @@ mod tests {
 		}
 	}
 
+	fn assert_join_strategy_count(
+		plan: &ExecutionPlan,
+		expected: JoinStrategy,
+		expected_count: usize,
+	) {
+		let mut observed = Vec::new();
+		collect_join_strategies(plan, &mut observed);
+		assert_eq!(
+			observed
+				.into_iter()
+				.filter(|strategy| *strategy == expected)
+				.count(),
+			expected_count
+		);
+	}
+
+	fn collect_join_strategies(plan: &ExecutionPlan, strategies: &mut Vec<JoinStrategy>) {
+		match plan {
+			ExecutionPlan::Join {
+				left,
+				right,
+				strategy,
+				..
+			} => {
+				strategies.push(*strategy);
+				collect_join_strategies(left, strategies);
+				collect_join_strategies(right, strategies);
+			}
+			ExecutionPlan::Filter { input, .. }
+			| ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Exchange { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Take { input, .. } => collect_join_strategies(input, strategies),
+			ExecutionPlan::EmptyRelation { .. }
+			| ExecutionPlan::SystemTable { .. }
+			| ExecutionPlan::Scan { .. }
+			| ExecutionPlan::CreateTable { .. }
+			| ExecutionPlan::CreateLogicalType { .. }
+			| ExecutionPlan::CreateTableAsSelect { .. }
+			| ExecutionPlan::DropTable { .. }
+			| ExecutionPlan::Delete { .. }
+			| ExecutionPlan::Update { .. }
+			| ExecutionPlan::Insert { .. }
+			| ExecutionPlan::InsertSelect { .. } => {}
+		}
+	}
+
 	fn first_join_plan(plan: &ExecutionPlan) -> &ExecutionPlan {
 		match plan {
 			ExecutionPlan::Join { .. } => plan,
@@ -8838,6 +8918,57 @@ mod tests {
 			}),
 			partition_count,
 			key: vec![Expr::qualified_column(TableRef::new(table), key)],
+		}
+	}
+
+	fn aliased_named_scan(table: &str, alias: &str) -> LogicalPlan {
+		LogicalPlan::Alias {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new(table),
+				projection: None,
+			}),
+			alias: TableRef::new(alias),
+			columns: Vec::new(),
+		}
+	}
+
+	fn exchanged_aliased_named_scan(
+		table: &str,
+		alias: &str,
+		key: &str,
+		partition_count: u32,
+	) -> LogicalPlan {
+		LogicalPlan::Exchange {
+			input: Box::new(aliased_named_scan(table, alias)),
+			partition_count,
+			key: vec![Expr::qualified_column(TableRef::new(alias), key)],
+		}
+	}
+
+	fn nested_hash_probe_with_tiny_right() -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Join {
+				left: Box::new(exchanged_aliased_named_scan(
+					"orders",
+					"o",
+					"customer_id",
+					2,
+				)),
+				right: Box::new(exchanged_aliased_named_scan("customers", "c1", "id", 2)),
+				kind: JoinKind::Inner,
+				on: vec![(
+					Expr::qualified_column(TableRef::new("o"), "customer_id"),
+					Expr::qualified_column(TableRef::new("c1"), "id"),
+				)],
+				strategy_intent: JoinStrategyIntent::Pinned(JoinStrategy::HashPartitioned),
+			}),
+			right: Box::new(aliased_named_scan("customers", "c2")),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("o"), "customer_id"),
+				Expr::qualified_column(TableRef::new("c2"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
 		}
 	}
 
