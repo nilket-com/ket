@@ -10,11 +10,12 @@ use arrow::datatypes::DataType;
 use sqlparser::ast::{
 	Assignment, AssignmentTarget, BinaryOperator, CaseWhen, CastKind, ColumnDef, ColumnOption,
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, Delete,
-	ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg, FunctionArgExpr,
-	FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident, Insert,
-	JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType,
-	OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr,
-	Statement, TableAlias, TableConstraint, TableFactor, TableObject, UnaryOperator, Value,
+	DescribeAlias, ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg,
+	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
+	Ident, Insert, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
+	ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem,
+	SetExpr, Statement, TableAlias, TableConstraint, TableFactor, TableObject, UnaryOperator,
+	Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -1524,14 +1525,80 @@ impl SqlPlanner {
 	fn lower_statement(&self, statement: &Statement) -> Result<LogicalPlan, FrontendError> {
 		match statement {
 			Statement::Query(query) => self.lower_query(query),
+			Statement::Explain {
+				describe_alias,
+				analyze,
+				verbose,
+				query_plan,
+				estimate,
+				statement,
+				format,
+				options,
+			} => self.lower_explain_statement(
+				*describe_alias,
+				*analyze,
+				*verbose,
+				*query_plan,
+				*estimate,
+				statement,
+				format,
+				options,
+			),
+			Statement::ExplainTable { .. } => Err(unsupported("EXPLAIN TABLE is not supported")),
 			Statement::CreateTable(create_table) => self.lower_create_table(create_table),
 			Statement::Insert(insert) => self.lower_insert(insert),
 			Statement::Delete(delete) => self.lower_delete(delete),
 			Statement::Update(update) => self.lower_update(update),
 			Statement::Drop { .. } => self.lower_drop_table(statement),
 			_ => Err(unsupported(
-				"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported",
+				"unsupported SQL statement; only SELECT, EXPLAIN, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported",
 			)),
+		}
+	}
+
+	fn lower_explain_statement(
+		&self,
+		describe_alias: DescribeAlias,
+		analyze: bool,
+		verbose: bool,
+		query_plan: bool,
+		estimate: bool,
+		statement: &Statement,
+		format: &Option<sqlparser::ast::AnalyzeFormatKind>,
+		options: &Option<Vec<sqlparser::ast::UtilityOption>>,
+	) -> Result<LogicalPlan, FrontendError> {
+		if describe_alias != DescribeAlias::Explain {
+			return Err(unsupported(
+				"DESC and DESCRIBE aliases are not supported for EXPLAIN",
+			));
+		}
+		if analyze {
+			return Err(unsupported("EXPLAIN ANALYZE is not supported"));
+		}
+		if verbose {
+			return Err(unsupported("EXPLAIN VERBOSE is not supported"));
+		}
+		if query_plan {
+			return Err(unsupported("EXPLAIN QUERY PLAN is not supported"));
+		}
+		if estimate {
+			return Err(unsupported("EXPLAIN ESTIMATE is not supported"));
+		}
+		if format.is_some() {
+			return Err(unsupported("EXPLAIN FORMAT is not supported"));
+		}
+		if options.is_some() {
+			return Err(unsupported("EXPLAIN options are not supported"));
+		}
+
+		match statement {
+			Statement::Query(query) => Ok(LogicalPlan::Explain {
+				input: Box::new(self.lower_query(query)?),
+			}),
+			Statement::Explain { .. } | Statement::ExplainTable { .. } => {
+				Err(unsupported("nested EXPLAIN is not supported"))
+			}
+			_ => Err(unsupported("EXPLAIN supports SELECT queries only")),
 		}
 	}
 
@@ -5845,6 +5912,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			strategy_intent: _,
 		} => true,
 		LogicalPlan::CreateTable { .. }
+		| LogicalPlan::Explain { .. }
 		| LogicalPlan::CreateLogicalType { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
@@ -6231,6 +6299,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 			}
 		},
 		LogicalPlan::Scan { .. }
+		| LogicalPlan::Explain { .. }
 		| LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateLogicalType { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }

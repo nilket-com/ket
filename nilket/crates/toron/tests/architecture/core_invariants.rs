@@ -95,9 +95,10 @@ pub(crate) fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 18);
+	assert_eq!(enum_variant_count(logical_plan), 19);
 	assert!(logical_plan.contains("Sort {"));
 	assert!(logical_plan.contains("Take {"));
+	assert!(logical_plan.contains("Explain {"));
 	assert!(logical_plan.contains("CreateTable {"));
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));

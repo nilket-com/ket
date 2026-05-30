@@ -246,6 +246,14 @@ impl RuneDataFrame {
 		)
 	}
 
+	pub fn explain(self) -> Self {
+		Self {
+			plan: LogicalPlan::Explain {
+				input: Box::new(self.plan),
+			},
+		}
+	}
+
 	pub fn left_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
 		join_with_kind(self.plan, right.plan, JoinKind::LeftOuter, on)
 	}
@@ -899,6 +907,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("join", RuneDataFrame::join)?;
 	m.associated_function("inner_join", RuneDataFrame::inner_join)?;
 	m.associated_function("broadcast_join", RuneDataFrame::broadcast_join)?;
+	m.associated_function("explain", RuneDataFrame::explain)?;
 	m.associated_function("left_join", RuneDataFrame::left_join)?;
 	m.associated_function("right_join", RuneDataFrame::right_join)?;
 	m.associated_function("full_join", RuneDataFrame::full_join)?;

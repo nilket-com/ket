@@ -700,6 +700,9 @@ pub enum LogicalPlan {
 		on: Vec<(Expr, Expr)>,
 		strategy_intent: JoinStrategyIntent,
 	},
+	Explain {
+		input: Box<LogicalPlan>,
+	},
 	CreateTable {
 		name: TableRef,
 		schema: CreateTableSchema,

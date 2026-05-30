@@ -2106,7 +2106,7 @@ pub(crate) fn adr073_no_new_sql_capability_surface() {
 		);
 	}
 	assert!(dispatch_body.contains(
-		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported"
+		"unsupported SQL statement; only SELECT, EXPLAIN, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported"
 	));
 }
 

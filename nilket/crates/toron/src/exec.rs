@@ -624,6 +624,9 @@ impl Executor {
 				LogicalPlan::Join { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical join execution",
 				}),
+				LogicalPlan::Explain { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound EXPLAIN execution",
+				}),
 				LogicalPlan::CreateTable { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound CREATE TABLE execution",
 				}),

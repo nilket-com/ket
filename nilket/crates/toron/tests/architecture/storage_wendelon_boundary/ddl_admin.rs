@@ -32,7 +32,7 @@ pub(crate) fn adr029_sql_planner_accepts_only_select_and_create_table() {
 	assert!(dispatch_body.contains("Statement::Delete(delete)"));
 	assert!(dispatch_body.contains("Statement::Drop { .. }"));
 	assert!(dispatch_body.contains(
-		"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported"
+		"unsupported SQL statement; only SELECT, EXPLAIN, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported"
 	));
 	assert!(!dispatch_body.contains("only SELECT and CREATE TABLE are supported"));
 	assert!(!dispatch_body.contains("only SELECT is supported"));
@@ -267,8 +267,9 @@ pub(crate) fn adr033_logical_variant_count_is_13() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 18);
+	assert_eq!(enum_variant_count(logical_plan), 19);
 	assert!(logical_plan.contains("CreateTableAsSelect {"));
+	assert!(logical_plan.contains("Explain {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));
 	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("table: TableRef,"));
@@ -833,8 +834,9 @@ pub(crate) fn adr034_logical_variant_count_is_14() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 18);
+	assert_eq!(enum_variant_count(logical_plan), 19);
 	assert!(logical_plan.contains("CreateLogicalType {"));
+	assert!(logical_plan.contains("Explain {"));
 	assert!(logical_plan.contains("DropTable {"));
 	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("name: TableRef,"));

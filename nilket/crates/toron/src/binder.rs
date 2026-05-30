@@ -509,6 +509,10 @@ impl<'a> Binder<'a> {
 					self.bind_join(left, right, *kind, on, *strategy_intent, trace)
 						.await
 				}
+				LogicalPlan::Explain { input } => {
+					let plan = self.bind_explain(input).await?;
+					Ok(ScopedExecutionPlan::empty_scope(plan))
+				}
 				LogicalPlan::CreateTable {
 					name,
 					schema,
@@ -607,6 +611,11 @@ impl<'a> Binder<'a> {
 				}
 			}
 		})
+	}
+
+	async fn bind_explain(&self, input: &LogicalPlan) -> Result<ExecutionPlan, BindingError> {
+		let (_input_plan, trace) = bind_with_trace(input, self.catalog, self.config).await?;
+		optimizer_explain_plan(trace)
 	}
 
 	async fn bind_create_table(
@@ -4349,6 +4358,162 @@ fn information_schema_schemata_schema() -> SchemaRef {
 		DataType::Utf8,
 		false,
 	)]))
+}
+
+fn optimizer_explain_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("join_index", DataType::Int64, false),
+		Field::new("strategy", DataType::Utf8, false),
+		Field::new("placement", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("reason_detail", DataType::Utf8, true),
+		Field::new("build_side", DataType::Utf8, true),
+		Field::new("build_bytes", DataType::Int64, true),
+		Field::new("threshold_bytes", DataType::Int64, true),
+		Field::new("rejected_side_bytes", DataType::Int64, true),
+	]))
+}
+
+fn optimizer_explain_plan(trace: OptimizerTrace) -> Result<ExecutionPlan, BindingError> {
+	let rows = trace
+		.join_decisions
+		.iter()
+		.map(optimizer_explain_row)
+		.collect::<Result<Vec<_>, _>>()?;
+	system_table_plan(
+		SystemTableKind::OptimizerExplain,
+		optimizer_explain_schema(),
+		rows,
+		None,
+	)
+}
+
+fn optimizer_explain_row(receipt: &DecisionReceipt) -> Result<Vec<ScalarValue>, BindingError> {
+	let (build_side, build_bytes, threshold_bytes, rejected_side_bytes) =
+		optimizer_explain_build_columns(receipt)?;
+	Ok(vec![
+		ScalarValue::Int64(Some(usize_to_i64(receipt.target.join_index, "join_index")?)),
+		ScalarValue::Utf8(Some(join_strategy_label(receipt.strategy).to_string())),
+		ScalarValue::Utf8(Some(
+			join_physical_placement_label(receipt.placement).to_string(),
+		)),
+		ScalarValue::Utf8(Some(
+			join_strategy_decision_reason_label(&receipt.reason).to_string(),
+		)),
+		ScalarValue::Utf8(
+			join_strategy_decision_reason_detail(&receipt.reason).map(str::to_string),
+		),
+		ScalarValue::Utf8(build_side.map(str::to_string)),
+		ScalarValue::Int64(build_bytes),
+		ScalarValue::Int64(threshold_bytes),
+		ScalarValue::Int64(rejected_side_bytes),
+	])
+}
+
+fn optimizer_explain_build_columns(
+	receipt: &DecisionReceipt,
+) -> Result<(Option<&'static str>, Option<i64>, Option<i64>, Option<i64>), BindingError> {
+	match receipt.reason {
+		JoinStrategyDecisionReason::BroadcastInferred {
+			build_side,
+			build_bytes,
+			threshold,
+			rejected_side_bytes,
+		} => Ok((
+			Some(broadcast_build_side_label(build_side)),
+			Some(byte_count_to_i64(build_bytes, "build_bytes")?),
+			Some(byte_count_to_i64(threshold, "threshold_bytes")?),
+			rejected_side_bytes
+				.map(|bytes| byte_count_to_i64(bytes, "rejected_side_bytes"))
+				.transpose()?,
+		)),
+		JoinStrategyDecisionReason::PinnedByAuthor
+			if receipt.strategy == JoinStrategy::Broadcast =>
+		{
+			Ok((
+				Some(match receipt.placement {
+					JoinPhysicalPlacement::Natural => "left",
+					JoinPhysicalPlacement::SwappedRightBuild => "right",
+				}),
+				None,
+				None,
+				None,
+			))
+		}
+		JoinStrategyDecisionReason::PinnedByAuthor
+		| JoinStrategyDecisionReason::HashByDefault { .. } => Ok((None, None, None, None)),
+	}
+}
+
+fn join_strategy_label(strategy: JoinStrategy) -> &'static str {
+	match strategy {
+		JoinStrategy::HashPartitioned => "hash_partitioned",
+		JoinStrategy::Broadcast => "broadcast",
+	}
+}
+
+fn join_physical_placement_label(placement: JoinPhysicalPlacement) -> &'static str {
+	match placement {
+		JoinPhysicalPlacement::Natural => "natural",
+		JoinPhysicalPlacement::SwappedRightBuild => "swapped_right_build",
+	}
+}
+
+fn join_strategy_decision_reason_label(reason: &JoinStrategyDecisionReason) -> &'static str {
+	match reason {
+		JoinStrategyDecisionReason::PinnedByAuthor => "pinned_by_author",
+		JoinStrategyDecisionReason::BroadcastInferred { .. } => "broadcast_inferred",
+		JoinStrategyDecisionReason::HashByDefault { .. } => "hash_by_default",
+	}
+}
+
+fn join_strategy_decision_reason_detail(
+	reason: &JoinStrategyDecisionReason,
+) -> Option<&'static str> {
+	match reason {
+		JoinStrategyDecisionReason::HashByDefault { reason } => {
+			Some(hash_by_default_reason_label(*reason))
+		}
+		JoinStrategyDecisionReason::PinnedByAuthor
+		| JoinStrategyDecisionReason::BroadcastInferred { .. } => None,
+	}
+}
+
+fn hash_by_default_reason_label(reason: HashByDefaultReason) -> &'static str {
+	match reason {
+		HashByDefaultReason::AutoBroadcastDisabled => "auto_broadcast_disabled",
+		HashByDefaultReason::NonInnerJoin => "non_inner_join",
+		HashByDefaultReason::LeftInputNotSingleBaseRelation => {
+			"left_input_not_single_base_relation"
+		}
+		HashByDefaultReason::RightInputNotSingleBaseRelation => {
+			"right_input_not_single_base_relation"
+		}
+		HashByDefaultReason::ProbeNotScanLinear => "probe_not_scan_linear",
+		HashByDefaultReason::MissingBuildByteUpperBound => "missing_build_byte_upper_bound",
+		HashByDefaultReason::BuildByteUpperBoundAboveThreshold => {
+			"build_byte_upper_bound_above_threshold"
+		}
+	}
+}
+
+fn broadcast_build_side_label(side: BroadcastBuildSide) -> &'static str {
+	match side {
+		BroadcastBuildSide::Left => "left",
+		BroadcastBuildSide::Right => "right",
+	}
+}
+
+fn byte_count_to_i64(value: ByteCount, column: &'static str) -> Result<i64, BindingError> {
+	i64::try_from(value.get()).map_err(|_| BindingError::UnsupportedExpression {
+		message: format!("optimizer explain {column} exceeds i64::MAX"),
+	})
+}
+
+fn usize_to_i64(value: usize, column: &'static str) -> Result<i64, BindingError> {
+	i64::try_from(value).map_err(|_| BindingError::UnsupportedExpression {
+		message: format!("optimizer explain {column} exceeds i64::MAX"),
+	})
 }
 
 fn system_table_plan(
@@ -8195,6 +8360,189 @@ mod tests {
 		assert_eq!(format!("{plain:?}"), format!("{traced:?}"));
 	}
 
+	#[tokio::test]
+	async fn sql_explain_broadcast_inference_renders_receipt_rows() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 3_072);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("EXPLAIN SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan EXPLAIN join");
+
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+
+		assert_eq!(
+			rows,
+			vec![vec![
+				ScalarValue::Int64(Some(0)),
+				ScalarValue::Utf8(Some("broadcast".to_string())),
+				ScalarValue::Utf8(Some("swapped_right_build".to_string())),
+				ScalarValue::Utf8(Some("broadcast_inferred".to_string())),
+				ScalarValue::Utf8(None),
+				ScalarValue::Utf8(Some("right".to_string())),
+				ScalarValue::Int64(Some(1_024)),
+				ScalarValue::Int64(Some(4_096)),
+				ScalarValue::Int64(Some(3_072)),
+			]]
+		);
+	}
+
+	#[tokio::test]
+	async fn explain_probe_not_scan_linear_reports_hash_reason_detail() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"EXPLAIN SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan EXPLAIN nested-probe join");
+
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+
+		assert_eq!(rows.len(), 2);
+		assert_eq!(rows[1][0], ScalarValue::Int64(Some(1)));
+		assert_eq!(
+			rows[1][1],
+			ScalarValue::Utf8(Some("hash_partitioned".to_string()))
+		);
+		assert_eq!(
+			rows[1][3],
+			ScalarValue::Utf8(Some("hash_by_default".to_string()))
+		);
+		assert_eq!(
+			rows[1][4],
+			ScalarValue::Utf8(Some("probe_not_scan_linear".to_string()))
+		);
+	}
+
+	#[tokio::test]
+	async fn explain_pinned_broadcast_reports_pinned_by_author() {
+		let logical = SqlPlanner::new()
+			.plan(
+				"EXPLAIN SELECT /*+ BROADCAST(c) */ * \
+				 FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan EXPLAIN hinted broadcast");
+
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &join_catalog(), &PlannerConfig::default()).await;
+
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0][1], ScalarValue::Utf8(Some("broadcast".to_string())));
+		assert_eq!(rows[0][2], ScalarValue::Utf8(Some("natural".to_string())));
+		assert_eq!(
+			rows[0][3],
+			ScalarValue::Utf8(Some("pinned_by_author".to_string()))
+		);
+		assert_eq!(rows[0][4], ScalarValue::Utf8(None));
+		assert_eq!(rows[0][5], ScalarValue::Utf8(Some("left".to_string())));
+	}
+
+	#[tokio::test]
+	async fn explain_emits_one_row_per_join_in_index_order() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan(
+				"EXPLAIN SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id",
+			)
+			.expect("plan EXPLAIN two-join SQL");
+
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+
+		assert_eq!(
+			rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+			vec![ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(1))]
+		);
+	}
+
+	#[tokio::test]
+	async fn explain_result_schema_is_stable() {
+		let logical = SqlPlanner::new()
+			.plan("EXPLAIN SELECT * FROM orders")
+			.expect("plan EXPLAIN scan");
+
+		let (schema, rows) =
+			bind_explain_rows(&logical, &join_catalog(), &PlannerConfig::default()).await;
+
+		assert!(rows.is_empty());
+		assert_eq!(
+			schema
+				.fields()
+				.iter()
+				.map(|field| (
+					field.name().as_str(),
+					field.data_type(),
+					field.is_nullable()
+				))
+				.collect::<Vec<_>>(),
+			vec![
+				("join_index", &DataType::Int64, false),
+				("strategy", &DataType::Utf8, false),
+				("placement", &DataType::Utf8, false),
+				("reason", &DataType::Utf8, false),
+				("reason_detail", &DataType::Utf8, true),
+				("build_side", &DataType::Utf8, true),
+				("build_bytes", &DataType::Int64, true),
+				("threshold_bytes", &DataType::Int64, true),
+				("rejected_side_bytes", &DataType::Int64, true),
+			]
+		);
+	}
+
+	#[test]
+	fn ctx_sql_explain_is_read_only_relation() {
+		let logical = SqlPlanner::new()
+			.plan_relation("EXPLAIN SELECT * FROM orders")
+			.expect("ctx.sql accepts read-only EXPLAIN");
+
+		assert!(matches!(logical, LogicalPlan::Explain { .. }));
+	}
+
+	#[test]
+	fn ctx_sql_explain_rejects_mutation_explain() {
+		let error = SqlPlanner::new()
+			.plan_relation("EXPLAIN INSERT INTO orders (id, customer_id) VALUES (1, 2)")
+			.expect_err("ctx.sql rejects EXPLAIN over mutation");
+
+		assert!(
+			error
+				.to_string()
+				.contains("EXPLAIN supports SELECT queries only"),
+			"{error}"
+		);
+	}
+
+	#[test]
+	fn sql_explain_accepts_only_default_query_form() {
+		let planner = SqlPlanner::new();
+		for sql in [
+			"DESC SELECT * FROM orders",
+			"DESCRIBE SELECT * FROM orders",
+			"EXPLAIN ANALYZE SELECT * FROM orders",
+			"EXPLAIN VERBOSE SELECT * FROM orders",
+			"EXPLAIN QUERY PLAN SELECT * FROM orders",
+			"EXPLAIN ESTIMATE SELECT * FROM orders",
+			"EXPLAIN (ANALYZE TRUE) SELECT * FROM orders",
+			"EXPLAIN FORMAT JSON SELECT * FROM orders",
+			"EXPLAIN TABLE orders",
+			"EXPLAIN EXPLAIN SELECT * FROM orders",
+			"EXPLAIN INSERT INTO orders (id, customer_id) VALUES (1, 2)",
+		] {
+			assert!(planner.plan(sql).is_err(), "{sql} must be rejected");
+		}
+		assert!(planner.plan("EXPLAIN SELECT * FROM orders").is_ok());
+	}
+
 	#[test]
 	fn inferred_broadcast_carries_reason_receipt() {
 		let config = auto_broadcast_config(4_096);
@@ -8371,6 +8719,19 @@ mod tests {
 				},
 			)
 			.expect("seed optimizer facts");
+	}
+
+	async fn bind_explain_rows(
+		logical: &LogicalPlan,
+		catalog: &MockCatalog,
+		config: &PlannerConfig,
+	) -> (SchemaRef, Vec<Vec<ScalarValue>>) {
+		let plan = bind(logical, catalog, config).await.expect("bind EXPLAIN");
+		let ExecutionPlan::SystemTable { kind, schema, rows } = plan else {
+			panic!("expected optimizer explain system table");
+		};
+		assert_eq!(kind, SystemTableKind::OptimizerExplain);
+		(schema, rows)
 	}
 
 	fn join_input(facts: PlanOptimizerFacts) -> JoinInputOptimization {

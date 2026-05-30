@@ -306,7 +306,8 @@ impl StatementClass {
 			| LogicalPlan::Exchange { .. }
 			| LogicalPlan::Sort { .. }
 			| LogicalPlan::Take { .. }
-			| LogicalPlan::Join { .. } => Self::Select,
+			| LogicalPlan::Join { .. }
+			| LogicalPlan::Explain { .. } => Self::Select,
 		}
 	}
 

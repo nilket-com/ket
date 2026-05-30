@@ -349,7 +349,7 @@ fn planner_preserves_non_create_table_statement_rejects() {
 	] {
 		assert_frontend_error(
 			sql,
-			"unsupported SQL statement; only SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported",
+			"unsupported SQL statement; only SELECT, EXPLAIN, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE are supported",
 		);
 	}
 }

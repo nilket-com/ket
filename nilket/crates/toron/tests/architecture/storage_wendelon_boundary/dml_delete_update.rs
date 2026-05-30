@@ -419,8 +419,9 @@ pub(crate) fn adr032_logical_plan_retains_insert_select_variant() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 18);
+	assert_eq!(enum_variant_count(logical_plan), 19);
 	assert!(logical_plan.contains("InsertSelect {"));
+	assert!(logical_plan.contains("Explain {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));
 	assert!(logical_plan.contains("DropTable {"));
 	assert!(logical_plan.contains("Update {"));
@@ -799,7 +800,9 @@ pub(crate) fn adr036_sql_planner_accepts_delete() {
 		.expect("read SQL planner source");
 
 	assert!(planner.contains("Statement::Delete(delete) => self.lower_delete(delete)"));
-	assert!(planner.contains("SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE"));
+	assert!(
+		planner.contains("SELECT, EXPLAIN, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE")
+	);
 }
 
 #[test]
@@ -910,8 +913,9 @@ pub(crate) fn adr036_logical_variant_count_is_15() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 18);
+	assert_eq!(enum_variant_count(logical_plan), 19);
 	assert!(logical_plan.contains("Delete {"));
+	assert!(logical_plan.contains("Explain {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));
 	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("table: TableRef,"));
@@ -1351,7 +1355,10 @@ pub(crate) fn adr063_unsupported_statement_text_lists_update() {
 		.1;
 	let dispatch_body = format!("{plan_body}\n{lower_statement}");
 
-	assert!(dispatch_body.contains("SELECT, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE"));
+	assert!(
+		dispatch_body
+			.contains("SELECT, EXPLAIN, CREATE TABLE, INSERT, UPDATE, DELETE, and DROP TABLE")
+	);
 }
 
 #[test]

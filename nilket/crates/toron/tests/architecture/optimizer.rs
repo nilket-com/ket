@@ -4,6 +4,29 @@ fn binder_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
 }
 
+fn ir_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source")
+}
+
+fn execution_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source")
+}
+
+fn planner_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source")
+}
+
+fn rune_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/rune_engine.rs"))
+		.expect("read Rune engine source")
+}
+
+fn exec_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read executor source")
+}
+
 fn source_block(source: &str, marker: &str) -> String {
 	brace_blocks_after_marker(source, marker)
 		.into_iter()
@@ -296,14 +319,249 @@ pub(crate) fn adr133_no_trace_on_execution_plan_or_wire() {
 
 #[test]
 pub(crate) fn adr133_no_public_explain_surface() {
-	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
-		.expect("read SQL planner source");
-	let lower_statement = source_block(&planner, "fn lower_statement");
+	let planner = planner_source();
+	let binder = binder_source();
+	let execution = execution_source();
 
 	assert!(!planner.contains("bind_with_trace"));
 	assert!(!planner.contains("OptimizerTrace"));
-	assert!(!lower_statement.contains("Statement::Explain"));
-	assert!(lower_statement.contains("unsupported SQL statement"));
+	assert!(!planner.contains("DecisionReceipt"));
+	assert!(binder.contains("fn optimizer_explain_plan"));
+	assert!(binder.contains("SystemTableKind::OptimizerExplain"));
+	assert!(!execution.contains("OptimizerTrace"));
+	assert!(!execution.contains("DecisionReceipt"));
+}
+
+#[test]
+pub(crate) fn adr134_single_shared_explain_node() {
+	let ir = ir_source();
+	let execution = execution_source();
+	let logical_plan = source_block(&ir, "pub enum LogicalPlan");
+	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
+
+	assert_eq!(logical_plan.matches("Explain {").count(), 1);
+	assert!(logical_plan.contains("input: Box<LogicalPlan>"));
+	assert!(!execution_plan.contains("Explain {"));
+	assert!(execution.contains("OptimizerExplain"));
+}
+
+#[test]
+pub(crate) fn adr134_sql_lowers_explain_to_logical_node() {
+	let planner = planner_source();
+	let lower_statement = source_block(&planner, "fn lower_statement");
+	let lower_explain = source_block(&planner, "fn lower_explain_statement");
+
+	assert!(lower_statement.contains("Statement::Explain"));
+	assert!(lower_statement.contains("self.lower_explain_statement"));
+	assert!(lower_explain.contains("Statement::Query(query)"));
+	assert!(lower_explain.contains("LogicalPlan::Explain"));
+	assert!(lower_explain.contains("input: Box::new(self.lower_query(query)?)"));
+	assert!(!lower_explain.contains("bind_with_trace"));
+	assert!(!lower_explain.contains("OptimizerTrace"));
+}
+
+#[test]
+pub(crate) fn adr134_rune_dataframe_explain_wraps_logical_node() {
+	let rune = rune_source();
+	let explain_method = source_block(&rune, "pub fn explain");
+	let module = source_block(&rune, "pub fn create_toron_module");
+
+	assert!(explain_method.contains("plan: LogicalPlan::Explain"));
+	assert!(explain_method.contains("input: Box::new(self.plan)"));
+	assert!(module.contains("m.associated_function(\"explain\", RuneDataFrame::explain)?;"));
+	assert!(!explain_method.contains("bind"));
+	assert!(!explain_method.contains("execute"));
+}
+
+#[test]
+pub(crate) fn adr134_explain_binds_via_bind_with_trace_not_execute() {
+	let binder = binder_source();
+	let bind_plan = source_block(&binder, "fn bind_plan_with_trace");
+	let bind_explain = source_block(&binder, "async fn bind_explain");
+
+	assert!(bind_plan.contains("LogicalPlan::Explain { input }"));
+	assert!(bind_plan.contains("self.bind_explain(input).await?"));
+	assert!(bind_explain.contains("bind_with_trace(input, self.catalog, self.config).await?"));
+	assert!(bind_explain.contains("optimizer_explain_plan(trace)"));
+	for forbidden in ["Executor", "execute_bound", ".execute(", "StorageScan"] {
+		assert!(
+			!bind_explain.contains(forbidden),
+			"EXPLAIN bind path must not execute inner query: {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr134_explain_renders_via_systemtable_existing_result_path() {
+	let binder = binder_source();
+	let execution = execution_source();
+	let exec = exec_source();
+	let optimizer_explain = source_block(&binder, "fn optimizer_explain_plan");
+
+	assert!(execution.contains("OptimizerExplain"));
+	assert!(optimizer_explain.contains("SystemTableKind::OptimizerExplain"));
+	assert!(optimizer_explain.contains("system_table_plan("));
+	assert!(exec.contains("ExecutionPlan::SystemTable { schema, rows, .. }"));
+	assert!(!execution.contains("OptimizerTrace"));
+	assert!(!execution.contains("DecisionReceipt"));
+}
+
+#[test]
+pub(crate) fn adr134_sql_explain_accepts_only_default_query_form() {
+	let planner = planner_source();
+	let lower_explain = source_block(&planner, "fn lower_explain_statement");
+
+	for required in [
+		"describe_alias != DescribeAlias::Explain",
+		"EXPLAIN ANALYZE is not supported",
+		"EXPLAIN VERBOSE is not supported",
+		"EXPLAIN QUERY PLAN is not supported",
+		"EXPLAIN ESTIMATE is not supported",
+		"EXPLAIN FORMAT is not supported",
+		"EXPLAIN options are not supported",
+		"EXPLAIN TABLE is not supported",
+		"nested EXPLAIN is not supported",
+		"EXPLAIN supports SELECT queries only",
+	] {
+		assert!(
+			planner.contains(required) || lower_explain.contains(required),
+			"EXPLAIN default-only guard missing {required}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr134_schema_labels_are_stable_not_debug() {
+	let binder = binder_source();
+	let schema = source_block(&binder, "fn optimizer_explain_schema");
+	let row = source_block(&binder, "fn optimizer_explain_row");
+
+	for label in [
+		"join_index",
+		"strategy",
+		"placement",
+		"reason",
+		"reason_detail",
+		"build_side",
+		"build_bytes",
+		"threshold_bytes",
+		"rejected_side_bytes",
+		"hash_partitioned",
+		"broadcast",
+		"natural",
+		"swapped_right_build",
+		"pinned_by_author",
+		"broadcast_inferred",
+		"hash_by_default",
+		"probe_not_scan_linear",
+	] {
+		assert!(
+			binder.contains(label),
+			"missing stable EXPLAIN label {label}"
+		);
+	}
+	assert!(row.contains("join_strategy_label"));
+	assert!(row.contains("join_physical_placement_label"));
+	assert!(row.contains("join_strategy_decision_reason_label"));
+	assert!(!row.contains("Debug"));
+	assert!(!row.contains("{:?}"));
+	assert!(schema.contains("Field::new(\"join_index\", DataType::Int64, false)"));
+}
+
+#[test]
+pub(crate) fn adr134_join_trace_target_remains_index_only() {
+	let binder = binder_source();
+	let target = source_block(&binder, "struct JoinTraceTarget");
+
+	assert!(target.contains("join_index: usize"));
+	for forbidden in ["qualifier", "table", "alias", "label", "name"] {
+		assert!(
+			!target.contains(forbidden),
+			"JoinTraceTarget must remain index-only: {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr134_explain_is_join_decision_only_not_plan_tree_or_analyze() {
+	let binder = binder_source();
+	let planner = planner_source();
+	let schema = source_block(&binder, "fn optimizer_explain_schema");
+	let lower_explain = source_block(&planner, "fn lower_explain_statement");
+
+	assert!(lower_explain.contains("EXPLAIN ANALYZE is not supported"));
+	assert!(lower_explain.contains("EXPLAIN QUERY PLAN is not supported"));
+	for forbidden in [
+		"operator",
+		"node",
+		"plan_text",
+		"subplan",
+		"runtime",
+		"actual",
+	] {
+		assert!(
+			!schema.contains(forbidden),
+			"optimizer EXPLAIN schema grew plan-tree/analyze field {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr134_reason_types_stay_crate_private_and_off_wire() {
+	let manifest_dir = manifest_dir();
+	let binder = binder_source();
+	let markers = [
+		"OptimizerTrace",
+		"DecisionReceipt",
+		"JoinTraceTarget",
+		"JoinStrategyDecisionReason",
+		"HashByDefaultReason",
+		"JoinPhysicalPlacement",
+	];
+
+	for marker in [
+		"pub(crate) struct JoinTraceTarget",
+		"pub(crate) struct DecisionReceipt",
+		"pub(crate) struct OptimizerTrace",
+		"pub(crate) enum JoinStrategyDecisionReason",
+	] {
+		assert!(binder.contains(marker));
+	}
+
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read wire source");
+		offenders.extend(
+			source
+				.lines()
+				.enumerate()
+				.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+				.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR134 trace/reason types leaked onto wire:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr134_ctx_sql_allows_readonly_explain_but_still_rejects_mutations() {
+	let planner = planner_source();
+	let rune = rune_source();
+	let plan_relation = source_block(&planner, "pub fn plan_relation");
+	let terminal = source_block(&planner, "fn relation_plan_is_terminal");
+	let lower_explain = source_block(&planner, "fn lower_explain_statement");
+
+	assert!(rune.contains("SqlPlanner::new().plan_relation(&query)"));
+	assert!(plan_relation.contains("relation_plan_is_terminal(&plan)"));
+	assert!(!terminal.contains("LogicalPlan::Explain"));
+	assert!(lower_explain.contains("EXPLAIN supports SELECT queries only"));
+	assert!(binder_source().contains("ctx_sql_explain_rejects_mutation_explain"));
 }
 
 #[test]

@@ -16,10 +16,11 @@ use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
 	BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategy, JoinStrategyIntent, LogicalPlan, LogicalTypeId, ScalarValue, TableId,
-	decode_column_logical_type, field_with_logical_type_metadata,
+	JoinStrategy, JoinStrategyIntent, LogicalPlan, LogicalTypeId, ScalarValue, SystemTableKind,
+	TableId, decode_column_logical_type, field_with_logical_type_metadata,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
+use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -102,6 +103,37 @@ async fn rune_ctx_sql_rejects_create_insert_update_delete_drop() {
 			.expect_err("ctx.sql must reject terminal statements");
 		assert_frontend_message_contains(error, "ctx.sql accepts single query relations only");
 	}
+}
+
+#[tokio::test]
+async fn ctx_sql_explain_is_read_only_relation() {
+	let plan = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("EXPLAIN SELECT * FROM sales")
+        }
+    "#,
+	)
+	.await
+	.expect("ctx.sql EXPLAIN SELECT");
+
+	assert!(matches!(plan, LogicalPlan::Explain { .. }));
+	assert!(!is_terminal_plan(&plan));
+}
+
+#[tokio::test]
+async fn ctx_sql_explain_rejects_mutation_explain() {
+	let error = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("EXPLAIN INSERT INTO sales (id, region, amount, status) VALUES (7, 'east', 9, 'open')")
+        }
+    "#,
+	)
+	.await
+	.expect_err("ctx.sql must reject EXPLAIN over mutation");
+
+	assert_frontend_message_contains(error, "EXPLAIN supports SELECT queries only");
 }
 
 #[tokio::test]
@@ -407,6 +439,92 @@ async fn rune_authored_broadcast_join_constructs_validated_broadcast_plan() {
 		contains_scan_named(right.as_ref(), "sales"),
 		"argument/probe side must contain sales scan"
 	);
+}
+
+#[tokio::test]
+async fn rune_explain_broadcast_join_yields_decision_rows() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("regions").alias("r")
+               .broadcast_join(
+                   ctx.table("sales").alias("s"),
+                   qcol("r", "region").eq(qcol("s", "region"))
+               )
+               .explain()
+        }
+    "#,
+	)
+	.await
+	.expect("Rune explain broadcast join");
+
+	let LogicalPlan::Explain { .. } = logical else {
+		panic!("expected Rune explain plan, got {logical:?}");
+	};
+	let batches = run_logical(&logical).await;
+
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(0)]);
+	assert_eq!(
+		string_column_rows(&batches, 1),
+		vec![Some("broadcast".to_string())]
+	);
+	assert_eq!(
+		string_column_rows(&batches, 3),
+		vec![Some("pinned_by_author".to_string())]
+	);
+}
+
+#[tokio::test]
+async fn sql_explain_matches_rune_explain_rows() {
+	let sql = SqlPlanner::new()
+		.plan(
+			"EXPLAIN SELECT /*+ BROADCAST(r) */ * \
+			 FROM regions r INNER JOIN sales s ON r.region = s.region",
+		)
+		.expect("plan SQL EXPLAIN");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("regions").alias("r")
+               .broadcast_join(
+                   ctx.table("sales").alias("s"),
+                   qcol("r", "region").eq(qcol("s", "region"))
+               )
+               .explain()
+        }
+    "#,
+	)
+	.await
+	.expect("Rune explain broadcast join");
+
+	assert_eq!(
+		explain_rows_for_assertion(&run_logical(&sql).await),
+		explain_rows_for_assertion(&run_logical(&rune).await)
+	);
+}
+
+#[tokio::test]
+async fn explain_binds_but_does_not_execute_inner_query() {
+	let logical = SqlPlanner::new()
+		.plan("EXPLAIN SELECT * FROM sales")
+		.expect("plan EXPLAIN scan");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind EXPLAIN scan");
+	assert!(matches!(
+		bound,
+		ExecutionPlan::SystemTable {
+			kind: SystemTableKind::OptimizerExplain,
+			..
+		}
+	));
+
+	let batches = Executor::new(Arc::new(PanicScan))
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute EXPLAIN system table");
+
+	assert_eq!(total_rows(&batches), 0);
 }
 
 #[tokio::test]
@@ -2747,6 +2865,15 @@ struct FixtureScan {
 	batches: HashMap<TableId, RecordBatch>,
 }
 
+struct PanicScan;
+
+#[async_trait::async_trait]
+impl StorageScan for PanicScan {
+	async fn scan(&self, _request: ScanRequest) -> Result<ScanStream, StorageError> {
+		panic!("EXPLAIN must not execute the inner query")
+	}
+}
+
 #[async_trait::async_trait]
 impl StorageScan for FixtureScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
@@ -2804,6 +2931,7 @@ fn contains_scan_named(plan: &LogicalPlan, table: &str) -> bool {
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
 		| LogicalPlan::Take { input, .. }
+		| LogicalPlan::Explain { input }
 		| LogicalPlan::CreateTableAsSelect { source: input, .. }
 		| LogicalPlan::InsertSelect { source: input, .. } => contains_scan_named(input, table),
 		LogicalPlan::Join { left, right, .. } => {
@@ -3014,6 +3142,40 @@ fn string_column_rows(batches: &[RecordBatch], column: usize) -> Vec<Option<Stri
 				.collect::<Vec<_>>()
 		})
 		.collect()
+}
+
+fn explain_rows_for_assertion(batches: &[RecordBatch]) -> Vec<Vec<Option<String>>> {
+	let mut rows = Vec::new();
+	for batch in batches {
+		for row_idx in 0..batch.num_rows() {
+			let mut row = Vec::new();
+			for column_idx in 0..batch.num_columns() {
+				let array = batch.column(column_idx);
+				if array.is_null(row_idx) {
+					row.push(None);
+					continue;
+				}
+				let value = match array.data_type() {
+					DataType::Int64 => array
+						.as_any()
+						.downcast_ref::<Int64Array>()
+						.expect("Int64 explain column")
+						.value(row_idx)
+						.to_string(),
+					DataType::Utf8 => array
+						.as_any()
+						.downcast_ref::<StringArray>()
+						.expect("Utf8 explain column")
+						.value(row_idx)
+						.to_string(),
+					other => panic!("unexpected EXPLAIN data type {other:?}"),
+				};
+				row.push(Some(value));
+			}
+			rows.push(row);
+		}
+	}
+	rows
 }
 
 fn assert_null_column(batches: &[RecordBatch], column: usize, expected_len: usize) {
