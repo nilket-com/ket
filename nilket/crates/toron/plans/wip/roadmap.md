@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–134 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–135 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,36 +46,38 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 134 promoted; ADR 135 candidates
+### ADR 135 promoted; ADR 136 candidates
 
-ADR 134 promoted **Optimizer Join-Decision EXPLAIN (SQL + Rune)** — exposes ADR
-133's `OptimizerTrace` as a read-only diagnostic relation through **both**
-frontends. **Rune `RuneDataFrame::explain()` is primary** (the operator steer:
-Rune is the primary interface, SQL secondary compatibility — a Rune *script* can't
-reach the crate-private `bind_with_trace`, so `.explain()` is the only way to
-inspect a hand-prescribed Rune plan like `dim.broadcast_join(fact,on).explain()`);
-SQL `EXPLAIN <query>` mirrors it. Both lower to one shared `LogicalPlan::Explain`
-node, bound via `bind_with_trace`, rendered as `ExecutionPlan::SystemTable`
-(`SystemTableKind::OptimizerExplain`) through the existing `ResultBatch` path — no
-new SQL wire frame. EXPLAIN **binds the inner plan but never executes it**; it is a
-read-only relation, so `ctx.sql("EXPLAIN SELECT")` is allowed while mutation
-EXPLAIN still rejects (ADR 079 terminal guard retargeted to DDL/DML only). Stable
-schema: `join_index · strategy · placement · reason · reason_detail · build_side ·
-build_bytes · threshold_bytes · rejected_side_bytes` (snake_case strings, never
-Rust `Debug`); ADR 133's index-only `JoinTraceTarget` stays unchanged, with
-human-readable join labels deferred. Reason/trace types stay `pub(crate)`, rendered
-to scalars only (ADR 133's `no_public_explain_surface` guard retargeted). Genuine
-3-of-3 after Claude conceded SQL-only → both frontends on the operator steer + the
-`pub(crate)` grounding. No new strategy logic/substrate. Load-bearing gate:
-`sql_explain_matches_rune_explain_rows` (SQL↔Rune row parity).
+ADR 135 promoted **Broadcast-Star Recursive Probe Fragmentation** — the first
+multi-way distributed-join cut. Lifts ADR 131's nested-join probe fence for **one
+shape**: a left-deep INNER broadcast-star chain `fact ⋈ dim1 ⋈ dim2 …` (auto builds
+are tiny single-base relations; pinned builds are already-authored one-partition
+broadcast builds; shared probe = the fact scan) is flattened by the
+fragmenter into **one scan-share probe stage (fact scanned once) + N one-partition
+broadcast build upstreams**, reusing ADR 123's multi-upstream consumers
+(`TaskSpec.inputs: Vec<TaskInputBinding>`) — no new stage topology, no new IR/wire
+type. Delivers the concrete star-schema win and unblocks the Rune-prescribed
+multi-way broadcast (`dim2.broadcast_join(dim1.broadcast_join(fact,on1),on2)`)
+fenced to hash today. Binder widens `broadcast_probe_is_scan_linear` for the star
+shape only (every other nested/hash/global/limited probe stays `ProbeNotScanLinear`);
+the flatten composes 130's per-link restoring projections so output is
+**digest+column-identical to hash** (the load-bearing spine,
+`three_way_broadcast_star_digest_matches_hash_over_tcp`); pinned-unsupported nested
+probes reject fail-loud; EXPLAIN emits N per-link receipts (133/134). Sealed
+multi-upstream is the correctness baseline (cross-worker builds use sealed
+manifests; same-worker live overlap opportunistic; remote-live fan-in deferred).
+Genuine 3-of-3: Gemini conceded the general fragmenter, Claude moved off facts-flip
+and added the output-order spine, Codex scoped it + grounded that the multi-upstream
+substrate already exists. 131 nested-probe + fragmenter-input-shape guards
+retargeted, not deleted.
 
-**ADR 135 lead candidates:** Wendelon-backed live table-size facts (cross-ring
-storage-ring producer → flip 129's dark-launch toward default-on; EXPLAIN now
-validates it) — the step that makes 129–132 actually fire in production; recursive
-fragmentation / multi-way star-join substrate (the petabyte-fact ⋈ many-tiny-dims
-vision — lifts 131's nested-join probe fence); `EXPLAIN ANALYZE` / fuller plan
-rendering; selectivity propagation + richer cost. Evidence-gate the pick on the
-134 feat.
+**ADR 136 lead candidates:** the cross-ring **facts-flip** (Wendelon producer
+exposes manifest `size_bytes`/`row_count` on the descriptor → Toron consumes in
+`from_descriptor` + flips the dark-launch default-on; the substrate can now execute
+the multi-way plans it would infer, and EXPLAIN validates it) — the step that makes
+129–135 *fire* in production; general recursive fragmentation (right-deep/bushy /
+hash); remote-live multi-producer fan-in; selectivity propagation. Evidence-gate the
+next pick on the 135 feat.
 
 ### ADR 129 promoted (HISTORICAL)
 
