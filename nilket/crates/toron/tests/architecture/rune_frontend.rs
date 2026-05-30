@@ -2045,8 +2045,6 @@ pub(crate) fn adr129_tiny_broadcast_requires_hard_byte_upper_bound() {
 	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
 
 	assert!(choose_auto.contains("kind != JoinKind::Inner"));
-	assert!(choose_auto.contains("PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("left_input.facts.byte_upper_bound"));
 	assert!(choose_auto.contains("MissingBuildByteUpperBound"));
 	assert!(choose_auto.contains("effective_auto_broadcast_threshold"));
 	assert!(choose_auto.contains("BuildByteUpperBoundAboveThreshold"));
@@ -2206,14 +2204,14 @@ pub(crate) fn adr130_decision_helper_single_seam() {
 	assert!(
 		choose_join_strategy.contains("choose_auto_join_strategy(kind, left_input, right_input")
 	);
-	assert!(choose_auto.contains("let left_build_bytes"));
-	assert!(choose_auto.contains("let right_build_bytes"));
+	assert!(choose_auto.contains("let left_build_candidate"));
+	assert!(choose_auto.contains("let right_build_candidate"));
 	assert!(choose_auto.contains("right_input.probe_scan_linear"));
 	assert!(choose_auto.contains("left_input.probe_scan_linear"));
-	assert!(choose_auto.contains("left_input.facts.origin != PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("right_input.facts.origin != PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("left_input.facts.byte_upper_bound"));
-	assert!(choose_auto.contains("right_input.facts.byte_upper_bound"));
+	assert!(
+		choose_auto.contains("left_input.facts.origin != PlanOrigin::SingleBaseRelation")
+			&& choose_auto.contains("right_input.facts.origin != PlanOrigin::SingleBaseRelation")
+	);
 	assert!(choose_auto.contains("BroadcastBuildSide::Left"));
 	assert!(choose_auto.contains("BroadcastBuildSide::Right"));
 	assert!(choose_auto.contains("JoinPhysicalPlacement::Natural"));
@@ -2272,12 +2270,15 @@ pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_non_star_shapes
 pub(crate) fn adr131_build_side_still_requires_single_base_hard_bytes() {
 	let binder = binder_source();
 	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+	let candidate = source_block(&binder, "fn build_byte_candidate");
 
-	assert!(choose_auto.contains("left_input.facts.origin == PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("right_input.facts.origin == PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("left_input.facts.byte_upper_bound"));
-	assert!(choose_auto.contains("right_input.facts.byte_upper_bound"));
-	assert!(choose_auto.contains("build_bytes < threshold"));
+	assert!(candidate.contains("facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("left_input.facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(choose_auto.contains("right_input.facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(
+		candidate.contains("facts.byte_upper_bound") && candidate.contains("estimated_byte_size")
+	);
+	assert!(candidate.contains("build_bytes < threshold"));
 	assert!(choose_auto.contains("MissingBuildByteUpperBound"));
 	assert!(choose_auto.contains("BuildByteUpperBoundAboveThreshold"));
 }

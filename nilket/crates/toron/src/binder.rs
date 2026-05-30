@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::aggregate_kernel::{
@@ -55,6 +55,10 @@ const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
 const INFORMATION_SCHEMA_TABLES_TABLE: &str = "tables";
 const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = "columns";
 const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
+const ARROW_BUFFER_ALIGNMENT_BYTES: u64 = 64;
+const DEFAULT_UTF8_BINARY_PAYLOAD_BYTES: u64 = 256;
+const DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES: u64 = 1024;
+const RECORD_BATCH_IPC_FRAMING_OVERHEAD_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PlannerConfig {
@@ -157,6 +161,7 @@ impl ScopedExecutionPlan {
 struct PlanOptimizerFacts {
 	origin: PlanOrigin,
 	byte_upper_bound: Option<ByteCount>,
+	estimated_byte_size: Option<ByteCount>,
 	row_upper_bound: Option<RowCount>,
 }
 
@@ -173,6 +178,7 @@ impl PlanOptimizerFacts {
 		Self {
 			origin: PlanOrigin::SingleBaseRelation,
 			byte_upper_bound: facts.byte_upper_bound,
+			estimated_byte_size: None,
 			row_upper_bound: facts.row_upper_bound,
 		}
 	}
@@ -181,6 +187,7 @@ impl PlanOptimizerFacts {
 		Self {
 			origin: PlanOrigin::Composite,
 			byte_upper_bound: None,
+			estimated_byte_size: None,
 			row_upper_bound: None,
 		}
 	}
@@ -189,6 +196,7 @@ impl PlanOptimizerFacts {
 		Self {
 			origin: PlanOrigin::Composite,
 			byte_upper_bound: None,
+			estimated_byte_size: None,
 			row_upper_bound,
 		}
 	}
@@ -200,6 +208,7 @@ impl PlanOptimizerFacts {
 		Self {
 			origin: PlanOrigin::Composite,
 			byte_upper_bound,
+			estimated_byte_size: None,
 			row_upper_bound,
 		}
 	}
@@ -220,6 +229,7 @@ impl PlanOptimizerFacts {
 		Self {
 			origin: self.origin,
 			byte_upper_bound: None,
+			estimated_byte_size: None,
 			row_upper_bound: self.row_upper_bound,
 		}
 	}
@@ -248,6 +258,30 @@ impl PlanOptimizerFacts {
 			.or(Some(limit));
 		Self::composite_with_row(row_upper_bound)
 	}
+
+	fn derive_estimated_byte_size(self, schema: &Schema) -> Self {
+		if self.origin != PlanOrigin::SingleBaseRelation {
+			return self;
+		}
+		let Some(row_upper_bound) = self.row_upper_bound else {
+			return self;
+		};
+		let Some(estimated_byte_size) = estimate_materialized_byte_size(row_upper_bound, schema)
+		else {
+			return Self {
+				estimated_byte_size: None,
+				..self
+			};
+		};
+		Self {
+			estimated_byte_size: Some(
+				self.estimated_byte_size
+					.map(|existing| std::cmp::min(existing, estimated_byte_size))
+					.unwrap_or(estimated_byte_size),
+			),
+			..self
+		}
+	}
 }
 
 fn project_roots_are_distinct_columns(exprs: &BoundExprProgram) -> bool {
@@ -258,6 +292,79 @@ fn project_roots_are_distinct_columns(exprs: &BoundExprProgram) -> bool {
 		};
 		seen.insert(column.ordinal)
 	})
+}
+
+fn estimate_materialized_byte_size(
+	row_upper_bound: RowCount,
+	schema: &Schema,
+) -> Option<ByteCount> {
+	let rows = row_upper_bound.get();
+	let mut bytes = RECORD_BATCH_IPC_FRAMING_OVERHEAD_BYTES;
+	for field in schema.fields() {
+		let per_row = per_row_estimate_bytes(field.data_type())?;
+		let values = pad_to_arrow_buffer_alignment(rows.saturating_mul(per_row));
+		let validity = pad_to_arrow_buffer_alignment(div_ceil_u64(rows, 8));
+		bytes = bytes.saturating_add(values).saturating_add(validity);
+	}
+	Some(ByteCount::new(bytes))
+}
+
+fn per_row_estimate_bytes(data_type: &DataType) -> Option<u64> {
+	match data_type {
+		DataType::Null => Some(0),
+		DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1),
+		DataType::Int16 | DataType::UInt16 | DataType::Float16 => Some(2),
+		DataType::Int32
+		| DataType::UInt32
+		| DataType::Float32
+		| DataType::Date32
+		| DataType::Time32(_)
+		| DataType::Interval(IntervalUnit::YearMonth)
+		| DataType::Decimal32(_, _) => Some(4),
+		DataType::Int64
+		| DataType::UInt64
+		| DataType::Float64
+		| DataType::Timestamp(_, _)
+		| DataType::Date64
+		| DataType::Time64(_)
+		| DataType::Duration(_)
+		| DataType::Interval(IntervalUnit::DayTime)
+		| DataType::Decimal64(_, _) => Some(8),
+		DataType::Interval(IntervalUnit::MonthDayNano) | DataType::Decimal128(_, _) => Some(16),
+		DataType::Decimal256(_, _) => Some(32),
+		DataType::FixedSizeBinary(width) => u64::try_from(*width).ok(),
+		DataType::Utf8 | DataType::Binary => Some(4 + DEFAULT_UTF8_BINARY_PAYLOAD_BYTES),
+		DataType::LargeUtf8 | DataType::LargeBinary => {
+			Some(8 + DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES)
+		}
+		DataType::BinaryView
+		| DataType::Utf8View
+		| DataType::List(_)
+		| DataType::ListView(_)
+		| DataType::FixedSizeList(_, _)
+		| DataType::LargeList(_)
+		| DataType::LargeListView(_)
+		| DataType::Struct(_)
+		| DataType::Union(_, _)
+		| DataType::Dictionary(_, _)
+		| DataType::Map(_, _)
+		| DataType::RunEndEncoded(_, _) => None,
+	}
+}
+
+fn pad_to_arrow_buffer_alignment(bytes: u64) -> u64 {
+	if bytes == 0 {
+		return 0;
+	}
+	bytes
+		.checked_add(ARROW_BUFFER_ALIGNMENT_BYTES - 1)
+		.map(|bytes| bytes & !(ARROW_BUFFER_ALIGNMENT_BYTES - 1))
+		.unwrap_or(u64::MAX)
+}
+
+fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
+	debug_assert!(divisor > 0);
+	value / divisor + u64::from(value % divisor != 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +395,12 @@ pub(crate) enum JoinStrategyDecisionReason {
 		threshold: ByteCount,
 		rejected_side_bytes: Option<ByteCount>,
 	},
+	BroadcastEstimated {
+		build_side: BroadcastBuildSide,
+		estimated_byte_size: ByteCount,
+		threshold: ByteCount,
+		rejected_side_bytes: Option<ByteCount>,
+	},
 	HashByDefault {
 		reason: HashByDefaultReason,
 	},
@@ -308,6 +421,18 @@ pub(crate) enum HashByDefaultReason {
 struct JoinInputOptimization {
 	facts: PlanOptimizerFacts,
 	probe_scan_linear: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildByteSource {
+	Hard,
+	Estimated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BuildByteCandidate {
+	bytes: ByteCount,
+	source: BuildByteSource,
 }
 
 struct ExprBindContext<'a> {
@@ -337,7 +462,7 @@ impl<'a> Binder<'a> {
 			match plan {
 				LogicalPlan::Scan { table, projection } => {
 					let binding = self.catalog.resolve_table_id(*table).await?;
-					let facts = PlanOptimizerFacts::from_table(binding.optimizer_facts);
+					let optimizer_facts = binding.optimizer_facts;
 					let projection = projection
 						.as_ref()
 						.map(|columns| {
@@ -352,6 +477,8 @@ impl<'a> Binder<'a> {
 						.transpose()?;
 
 					let plan = scan_plan(binding, projection);
+					let facts = PlanOptimizerFacts::from_table(optimizer_facts)
+						.derive_estimated_byte_size(plan.schema().as_ref());
 					let scope = RelationScope::empty(plan.schema());
 					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
@@ -364,7 +491,7 @@ impl<'a> Binder<'a> {
 						return Ok(ScopedExecutionPlan::new(plan, scope));
 					}
 					let binding = self.catalog.resolve_table(table).await?;
-					let facts = PlanOptimizerFacts::from_table(binding.optimizer_facts);
+					let optimizer_facts = binding.optimizer_facts;
 					let projection = projection
 						.as_ref()
 						.map(|columns| {
@@ -379,6 +506,8 @@ impl<'a> Binder<'a> {
 						.transpose()?;
 
 					let plan = scan_plan(binding, projection);
+					let facts = PlanOptimizerFacts::from_table(optimizer_facts)
+						.derive_estimated_byte_size(plan.schema().as_ref());
 					let scope = RelationScope::scan(table.clone(), &plan.schema());
 					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
@@ -422,7 +551,8 @@ impl<'a> Binder<'a> {
 							.with_pk_row_cap()
 					} else {
 						input_facts.preserve_volume_non_increasing()
-					};
+					}
+					.derive_estimated_byte_size(plan.schema().as_ref());
 					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
 				LogicalPlan::Project {
@@ -3946,37 +4076,25 @@ fn choose_auto_join_strategy(
 		return hash_join_decision(HashByDefaultReason::NonInnerJoin);
 	}
 
-	let left_build_bytes = if left_input.facts.origin == PlanOrigin::SingleBaseRelation {
-		left_input
-			.facts
-			.byte_upper_bound
-			.filter(|build_bytes| *build_bytes < threshold)
-	} else {
-		None
-	};
-	let right_build_bytes = if right_input.facts.origin == PlanOrigin::SingleBaseRelation {
-		right_input
-			.facts
-			.byte_upper_bound
-			.filter(|build_bytes| *build_bytes < threshold)
-	} else {
-		None
-	};
+	let left_build_candidate = build_byte_candidate(left_input.facts, threshold);
+	let right_build_candidate = build_byte_candidate(right_input.facts, threshold);
 
-	let left_viable = left_build_bytes.filter(|_| right_input.probe_scan_linear);
-	let right_viable = right_build_bytes.filter(|_| left_input.probe_scan_linear);
+	let left_viable = left_build_candidate.filter(|_| right_input.probe_scan_linear);
+	let right_viable = right_build_candidate.filter(|_| left_input.probe_scan_linear);
 	let chosen = match (left_viable, right_viable) {
-		(Some(left), Some(right)) if right_build_materially_smaller(left, right) => Some((
-			BroadcastBuildSide::Right,
-			JoinPhysicalPlacement::SwappedRightBuild,
-			right,
-			Some(left),
-		)),
+		(Some(left), Some(right)) if right_build_materially_smaller(left.bytes, right.bytes) => {
+			Some((
+				BroadcastBuildSide::Right,
+				JoinPhysicalPlacement::SwappedRightBuild,
+				right,
+				Some(left.bytes),
+			))
+		}
 		(Some(left), Some(right)) => Some((
 			BroadcastBuildSide::Left,
 			JoinPhysicalPlacement::Natural,
 			left,
-			Some(right),
+			Some(right.bytes),
 		)),
 		(Some(left), None) => Some((
 			BroadcastBuildSide::Left,
@@ -3992,19 +4110,28 @@ fn choose_auto_join_strategy(
 		)),
 		(None, None) => None,
 	};
-	if let Some((build_side, placement, build_bytes, rejected_side_bytes)) = chosen {
-		return JoinStrategyDecision {
-			strategy: JoinStrategy::Broadcast,
-			placement,
-			reason: JoinStrategyDecisionReason::BroadcastInferred {
+	if let Some((build_side, placement, candidate, rejected_side_bytes)) = chosen {
+		let reason = match candidate.source {
+			BuildByteSource::Hard => JoinStrategyDecisionReason::BroadcastInferred {
 				build_side,
-				build_bytes,
+				build_bytes: candidate.bytes,
+				threshold,
+				rejected_side_bytes,
+			},
+			BuildByteSource::Estimated => JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side,
+				estimated_byte_size: candidate.bytes,
 				threshold,
 				rejected_side_bytes,
 			},
 		};
+		return JoinStrategyDecision {
+			strategy: JoinStrategy::Broadcast,
+			placement,
+			reason,
+		};
 	}
-	if left_build_bytes.is_some() || right_build_bytes.is_some() {
+	if left_build_candidate.is_some() || right_build_candidate.is_some() {
 		return hash_join_decision(HashByDefaultReason::ProbeNotScanLinear);
 	}
 	if left_input.facts.origin != PlanOrigin::SingleBaseRelation {
@@ -4013,13 +4140,39 @@ fn choose_auto_join_strategy(
 	if right_input.facts.origin != PlanOrigin::SingleBaseRelation {
 		return hash_join_decision(HashByDefaultReason::RightInputNotSingleBaseRelation);
 	}
-	if left_input.facts.byte_upper_bound.is_none() || right_input.facts.byte_upper_bound.is_none() {
+	if !has_build_size_fact(left_input.facts) || !has_build_size_fact(right_input.facts) {
 		return hash_join_decision(HashByDefaultReason::MissingBuildByteUpperBound);
 	}
 	hash_join_decision(HashByDefaultReason::BuildByteUpperBoundAboveThreshold)
 }
 
 const AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR: u64 = 2;
+
+fn build_byte_candidate(
+	facts: PlanOptimizerFacts,
+	threshold: ByteCount,
+) -> Option<BuildByteCandidate> {
+	if facts.origin != PlanOrigin::SingleBaseRelation {
+		return None;
+	}
+	if let Some(build_bytes) = facts.byte_upper_bound {
+		return (build_bytes < threshold).then_some(BuildByteCandidate {
+			bytes: build_bytes,
+			source: BuildByteSource::Hard,
+		});
+	}
+	facts
+		.estimated_byte_size
+		.filter(|estimated_byte_size| *estimated_byte_size < threshold)
+		.map(|estimated_byte_size| BuildByteCandidate {
+			bytes: estimated_byte_size,
+			source: BuildByteSource::Estimated,
+		})
+}
+
+fn has_build_size_fact(facts: PlanOptimizerFacts) -> bool {
+	facts.byte_upper_bound.is_some() || facts.estimated_byte_size.is_some()
+}
 
 fn right_build_materially_smaller(left_bytes: ByteCount, right_bytes: ByteCount) -> bool {
 	u128::from(right_bytes.get()) * u128::from(AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR)
@@ -4508,6 +4661,19 @@ fn optimizer_explain_build_columns(
 				.map(|bytes| byte_count_to_i64(bytes, "rejected_side_bytes"))
 				.transpose()?,
 		)),
+		JoinStrategyDecisionReason::BroadcastEstimated {
+			build_side,
+			estimated_byte_size,
+			threshold,
+			rejected_side_bytes,
+		} => Ok((
+			Some(broadcast_build_side_label(build_side)),
+			Some(byte_count_to_i64(estimated_byte_size, "build_bytes")?),
+			Some(byte_count_to_i64(threshold, "threshold_bytes")?),
+			rejected_side_bytes
+				.map(|bytes| byte_count_to_i64(bytes, "rejected_side_bytes"))
+				.transpose()?,
+		)),
 		JoinStrategyDecisionReason::PinnedByAuthor
 			if receipt.strategy == JoinStrategy::Broadcast =>
 		{
@@ -4544,6 +4710,7 @@ fn join_strategy_decision_reason_label(reason: &JoinStrategyDecisionReason) -> &
 	match reason {
 		JoinStrategyDecisionReason::PinnedByAuthor => "pinned_by_author",
 		JoinStrategyDecisionReason::BroadcastInferred { .. } => "broadcast_inferred",
+		JoinStrategyDecisionReason::BroadcastEstimated { .. } => "broadcast_estimated",
 		JoinStrategyDecisionReason::HashByDefault { .. } => "hash_by_default",
 	}
 }
@@ -4556,7 +4723,8 @@ fn join_strategy_decision_reason_detail(
 			Some(hash_by_default_reason_label(*reason))
 		}
 		JoinStrategyDecisionReason::PinnedByAuthor
-		| JoinStrategyDecisionReason::BroadcastInferred { .. } => None,
+		| JoinStrategyDecisionReason::BroadcastInferred { .. }
+		| JoinStrategyDecisionReason::BroadcastEstimated { .. } => None,
 	}
 }
 
@@ -6977,9 +7145,13 @@ fn is_pbc_eligible_type(data_type: &DataType) -> bool {
 mod tests {
 	use super::*;
 	use crate::catalog::{DescriptorOptimizerFacts, MockCatalog, WendelonCatalog};
+	use crate::distributed::arrow_ipc::encode_record_batch;
 	use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, TableId};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::sql_planner::SqlPlanner;
+	use arrow::array::{
+		ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
+	};
 	use arrow::datatypes::{Field, Schema};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -7904,11 +8076,13 @@ mod tests {
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(3_072)),
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			&auto_broadcast_config(4_096),
@@ -8020,11 +8194,13 @@ mod tests {
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			&auto_broadcast_config(4_096),
@@ -8050,11 +8226,13 @@ mod tests {
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_536)),
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			&config,
@@ -8130,6 +8308,134 @@ mod tests {
 			.expect("bind descriptor-sidecar Rune broadcast star");
 
 		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 2);
+	}
+
+	#[tokio::test]
+	async fn string_bearing_tiny_dim_infers_broadcast_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(12));
+		let logical = rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM orders o \
+                     INNER JOIN customers c ON o.customer_id = c.id")
+        }
+    "#,
+		)
+		.await;
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind estimate-backed Rune join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert_eq!(trace.join_decisions.len(), 1);
+		match trace.join_decisions[0].reason {
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side,
+				estimated_byte_size,
+				threshold,
+				rejected_side_bytes,
+			} => {
+				assert_eq!(build_side, BroadcastBuildSide::Right);
+				assert!(estimated_byte_size < threshold);
+				assert_eq!(rejected_side_bytes, None);
+			}
+			other => panic!("expected estimated broadcast receipt, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn pk_filtered_string_dim_broadcasts_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, None);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "id")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
+			),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind PK-filtered string dimension");
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(1)));
+		assert!(scoped.facts.estimated_byte_size.is_some());
+
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(filtered_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind PK-filtered estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn estimated_size_over_counts_encoded_payload() {
+		for rows in [1_usize, 8, 1_000] {
+			for batch in representative_estimate_batches(rows) {
+				let estimate = estimate_materialized_byte_size(
+					RowCount::new(u64::try_from(rows).expect("test rows fit u64")),
+					batch.schema().as_ref(),
+				)
+				.expect("representative schema is estimate-supported");
+				let encoded =
+					encode_record_batch(&batch).expect("representative batch encodes to IPC");
+				assert!(
+					estimate.get()
+						>= u64::try_from(encoded.len()).expect("encoded length fits u64"),
+					"estimate {estimate:?} under-counted encoded IPC bytes {} for schema {:?} rows {rows}",
+					encoded.len(),
+					batch.schema()
+				);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn estimated_broadcast_receipt_is_labeled_estimated() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(12));
+		let logical = SqlPlanner::new()
+			.plan("EXPLAIN SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan estimated EXPLAIN join");
+
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &catalog, &PlannerConfig::default()).await;
+
+		assert_eq!(rows.len(), 1);
+		assert_eq!(
+			rows[0][3],
+			ScalarValue::Utf8(Some("broadcast_estimated".to_string()))
+		);
+		assert_eq!(rows[0][5], ScalarValue::Utf8(Some("right".to_string())));
+		assert!(matches!(rows[0][6], ScalarValue::Int64(Some(bytes)) if bytes > 0));
 	}
 
 	#[tokio::test]
@@ -9054,11 +9360,13 @@ mod tests {
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: None,
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			&config,
@@ -9082,11 +9390,13 @@ mod tests {
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: None,
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
+				estimated_byte_size: None,
 				row_upper_bound: None,
 			}),
 			&config,
@@ -9127,11 +9437,13 @@ mod tests {
 				join_input(PlanOptimizerFacts {
 					origin: PlanOrigin::SingleBaseRelation,
 					byte_upper_bound: left_bytes.map(ByteCount::new),
+					estimated_byte_size: None,
 					row_upper_bound: None,
 				}),
 				join_input(PlanOptimizerFacts {
 					origin: PlanOrigin::SingleBaseRelation,
 					byte_upper_bound: right_bytes.map(ByteCount::new),
+					estimated_byte_size: None,
 					row_upper_bound: None,
 				}),
 				&config,
@@ -9154,6 +9466,136 @@ mod tests {
 				other => panic!("expected inferred broadcast reason, got {other:?}"),
 			}
 		}
+	}
+
+	#[test]
+	fn hard_byte_bound_still_wins_over_estimate() {
+		let config = auto_broadcast_config(4_096);
+		let decision = choose_join_strategy(
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(8_192)),
+				estimated_byte_size: Some(ByteCount::new(1_024)),
+				row_upper_bound: Some(RowCount::new(1)),
+			}),
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(8_192)),
+				estimated_byte_size: None,
+				row_upper_bound: None,
+			}),
+			&config,
+		);
+
+		assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::BuildByteUpperBoundAboveThreshold,
+			}
+		);
+
+		let decision = choose_join_strategy(
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(2_048)),
+				estimated_byte_size: Some(ByteCount::new(512)),
+				row_upper_bound: Some(RowCount::new(1)),
+			}),
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(8_192)),
+				estimated_byte_size: None,
+				row_upper_bound: None,
+			}),
+			&config,
+		);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::BroadcastInferred {
+				build_side: BroadcastBuildSide::Left,
+				build_bytes: ByteCount::new(2_048),
+				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: None,
+			}
+		);
+	}
+
+	#[test]
+	fn estimate_above_effective_threshold_hashes() {
+		let config = auto_broadcast_config(4_096);
+		let decision = choose_join_strategy(
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: None,
+				estimated_byte_size: Some(ByteCount::new(8_192)),
+				row_upper_bound: Some(RowCount::new(100)),
+			}),
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: None,
+				estimated_byte_size: Some(ByteCount::new(8_192)),
+				row_upper_bound: Some(RowCount::new(100)),
+			}),
+			&config,
+		);
+
+		assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::BuildByteUpperBoundAboveThreshold,
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn take_limited_dim_still_hashes() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(12));
+		let taken_customers = LogicalPlan::Take {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			limit: 1,
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&taken_customers)
+		.await
+		.expect("bind limited dimension");
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_byte_size, None);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(1)));
+
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(taken_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind take-limited dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
 	}
 
 	#[tokio::test]
@@ -9287,9 +9729,66 @@ mod tests {
 			.expect("Rune-authored plan")
 	}
 
+	fn representative_estimate_batches(rows: usize) -> Vec<RecordBatch> {
+		let fixed_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int32, true),
+		]));
+		let string_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("label", DataType::Utf8, true),
+		]));
+		let binary_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("payload", DataType::Binary, true),
+		]));
+		let large_string_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("description", DataType::LargeUtf8, true),
+		]));
+
+		vec![
+			RecordBatch::try_new(
+				fixed_schema,
+				vec![
+					Arc::new(Int64Array::from_iter_values(0_i64..rows as i64)) as ArrayRef,
+					Arc::new(Int32Array::from_iter_values(
+						(0..rows).map(|value| value as i32),
+					)) as ArrayRef,
+				],
+			)
+			.expect("fixed-width representative batch"),
+			RecordBatch::try_new(
+				string_schema,
+				vec![
+					Arc::new(Int64Array::from_iter_values(0_i64..rows as i64)) as ArrayRef,
+					Arc::new(StringArray::from(vec![Some("north"); rows])) as ArrayRef,
+				],
+			)
+			.expect("Utf8 representative batch"),
+			RecordBatch::try_new(
+				binary_schema,
+				vec![
+					Arc::new(Int64Array::from_iter_values(0_i64..rows as i64)) as ArrayRef,
+					Arc::new(BinaryArray::from_iter_values(vec![b"abc".as_slice(); rows]))
+						as ArrayRef,
+				],
+			)
+			.expect("Binary representative batch"),
+			RecordBatch::try_new(
+				large_string_schema,
+				vec![
+					Arc::new(Int64Array::from_iter_values(0_i64..rows as i64)) as ArrayRef,
+					Arc::new(LargeStringArray::from(vec![Some("north"); rows])) as ArrayRef,
+				],
+			)
+			.expect("LargeUtf8 representative batch"),
+		]
+	}
+
 	async fn bind_explain_rows(
 		logical: &LogicalPlan,
-		catalog: &MockCatalog,
+		catalog: &dyn Catalog,
 		config: &PlannerConfig,
 	) -> (SchemaRef, Vec<Vec<ScalarValue>>) {
 		let plan = bind(logical, catalog, config).await.expect("bind EXPLAIN");

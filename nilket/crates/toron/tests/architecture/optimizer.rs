@@ -67,7 +67,7 @@ pub(crate) fn adr132_dominance_comparator_in_single_helper() {
 			.count(),
 		1
 	);
-	assert!(choose_auto.contains("right_build_materially_smaller(left, right)"));
+	assert!(choose_auto.contains("right_build_materially_smaller(left.bytes, right.bytes)"));
 	assert!(choose_auto.contains("let left_viable"));
 	assert!(choose_auto.contains("let right_viable"));
 	assert!(choose_auto.contains("match (left_viable, right_viable)"));
@@ -80,16 +80,17 @@ pub(crate) fn adr132_dominance_comparator_in_single_helper() {
 pub(crate) fn adr132_dominance_is_integer_ratio_over_hard_bytes() {
 	let binder = binder_source();
 	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+	let candidate = source_block(&binder, "fn build_byte_candidate");
 	let helper = source_block(&binder, "fn right_build_materially_smaller");
 
 	assert!(binder.contains("const AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR: u64 = 2"));
 	assert!(helper.contains("u128::from(right_bytes.get())"));
 	assert!(helper.contains("u128::from(AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR)"));
 	assert!(helper.contains("<= u128::from(left_bytes.get())"));
-	assert!(choose_auto.contains("left_build_bytes"));
-	assert!(choose_auto.contains("right_build_bytes"));
-	assert!(choose_auto.contains("byte_upper_bound"));
-	assert!(choose_auto.contains("filter(|build_bytes| *build_bytes < threshold)"));
+	assert!(choose_auto.contains("left_build_candidate"));
+	assert!(choose_auto.contains("right_build_candidate"));
+	assert!(candidate.contains("byte_upper_bound"));
+	assert!(candidate.contains("build_bytes < threshold"));
 	for forbidden in [
 		"f32",
 		"f64",
@@ -111,7 +112,7 @@ pub(crate) fn adr132_left_biased_hysteresis() {
 	let binder = binder_source();
 	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
 
-	assert!(choose_auto.contains("right_build_materially_smaller(left, right)"));
+	assert!(choose_auto.contains("right_build_materially_smaller(left.bytes, right.bytes)"));
 	assert!(choose_auto.contains("BroadcastBuildSide::Right"));
 	assert!(choose_auto.contains("JoinPhysicalPlacement::SwappedRightBuild"));
 	assert!(choose_auto.contains("(Some(left), Some(right)) => Some(("));
@@ -129,8 +130,8 @@ pub(crate) fn adr132_broadcast_inferred_receipt_carries_rejected_side_bytes() {
 
 	assert!(reason.contains("rejected_side_bytes: Option<ByteCount>"));
 	assert!(choose_auto.contains("rejected_side_bytes"));
-	assert!(choose_auto.contains("Some(left)"));
-	assert!(choose_auto.contains("Some(right)"));
+	assert!(choose_auto.contains("Some(left.bytes)"));
+	assert!(choose_auto.contains("Some(right.bytes)"));
 	assert!(choose_auto.contains("None"));
 	assert!(binder.contains("sole_eligible_side_reports_no_rejected_bytes"));
 }
@@ -920,4 +921,191 @@ pub(crate) fn adr137_no_substrate_or_wire_change() {
 		"ADR137 row-local fact helpers leaked into execution/distributed/wire/Wendelon substrate:\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
+}
+
+#[test]
+pub(crate) fn adr138_byte_upper_bound_not_written_by_toron_derivation() {
+	let binder = binder_source();
+	let facts = source_block(&binder, "struct PlanOptimizerFacts");
+	let derive = source_block(&binder, "fn derive_estimated_byte_size");
+	let estimator = source_block(&binder, "fn estimate_materialized_byte_size");
+
+	assert!(facts.contains("byte_upper_bound: Option<ByteCount>"));
+	assert!(facts.contains("estimated_byte_size: Option<ByteCount>"));
+	assert!(derive.contains("estimated_byte_size"));
+	assert!(derive.contains("estimate_materialized_byte_size"));
+	assert!(!derive.contains("byte_upper_bound"));
+	assert!(!estimator.contains("byte_upper_bound"));
+	assert!(binder.contains("hard_byte_bound_still_wins_over_estimate"));
+}
+
+#[test]
+pub(crate) fn adr138_estimate_and_derivation_live_in_one_helper() {
+	let binder = binder_source();
+	let scan_arm = binder
+		.split("LogicalPlan::Scan { table, projection } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::ScanNamed").next())
+		.expect("Scan bind arm");
+	let scan_named_arm = binder
+		.split("LogicalPlan::ScanNamed { table, projection } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Alias").next())
+		.expect("ScanNamed bind arm");
+	let filter_arm = binder
+		.split("LogicalPlan::Filter { input, predicate } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Project").next())
+		.expect("Filter bind arm");
+	let project_helper = source_block(&binder, "fn preserve_through_project");
+
+	assert_eq!(binder.matches("fn derive_estimated_byte_size").count(), 1);
+	assert_eq!(
+		binder.matches("fn estimate_materialized_byte_size").count(),
+		1
+	);
+	assert_eq!(binder.matches("fn per_row_estimate_bytes").count(), 1);
+	assert!(binder.contains("DEFAULT_UTF8_BINARY_PAYLOAD_BYTES"));
+	assert!(binder.contains("DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES"));
+	assert!(binder.contains("RECORD_BATCH_IPC_FRAMING_OVERHEAD_BYTES"));
+	assert!(scan_arm.contains(".derive_estimated_byte_size(plan.schema().as_ref())"));
+	assert!(scan_named_arm.contains(".derive_estimated_byte_size(plan.schema().as_ref())"));
+	assert!(filter_arm.contains(".derive_estimated_byte_size(plan.schema().as_ref())"));
+	assert!(project_helper.contains("estimated_byte_size: None"));
+	assert!(binder.contains("string_bearing_tiny_dim_infers_broadcast_by_estimate"));
+	assert!(binder.contains("pk_filtered_string_dim_broadcasts_by_estimate"));
+}
+
+#[test]
+pub(crate) fn adr138_estimate_over_counts_encoded_payload_unit() {
+	let binder = binder_source();
+	let estimator = source_block(&binder, "fn estimate_materialized_byte_size");
+	let per_row = source_block(&binder, "fn per_row_estimate_bytes");
+
+	assert!(binder.contains("estimated_size_over_counts_encoded_payload"));
+	assert!(binder.contains("encode_record_batch"));
+	assert!(binder.contains("representative_estimate_batches"));
+	assert!(estimator.contains("pad_to_arrow_buffer_alignment"));
+	assert!(estimator.contains("div_ceil_u64(rows, 8)"));
+	assert!(estimator.contains("saturating_add"));
+	assert!(per_row.contains("DataType::Utf8 | DataType::Binary"));
+	assert!(per_row.contains("DataType::LargeUtf8 | DataType::LargeBinary"));
+	assert!(per_row.contains("DataType::Dictionary(_, _)"));
+	assert!(per_row.contains("DataType::RunEndEncoded(_, _)"));
+	assert!(per_row.contains("=> None"));
+}
+
+#[test]
+pub(crate) fn adr138_chooser_prefers_hard_then_estimate_and_labels_estimated() {
+	let binder = binder_source();
+	let reason = source_block(&binder, "enum JoinStrategyDecisionReason");
+	let candidate = source_block(&binder, "fn build_byte_candidate");
+	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
+	let explain_columns = source_block(&binder, "fn optimizer_explain_build_columns");
+	let label = source_block(&binder, "fn join_strategy_decision_reason_label");
+
+	let hard_index = candidate
+		.find("if let Some(build_bytes) = facts.byte_upper_bound")
+		.expect("hard byte path");
+	let estimate_index = candidate
+		.find("estimated_byte_size")
+		.expect("estimated byte path");
+	assert!(
+		hard_index < estimate_index,
+		"hard byte candidate must be considered before estimate"
+	);
+	assert!(candidate.contains("return (build_bytes < threshold).then_some"));
+	assert!(choose_auto.contains("BuildByteSource::Hard"));
+	assert!(choose_auto.contains("BuildByteSource::Estimated"));
+	assert!(reason.contains("BroadcastEstimated"));
+	assert!(reason.contains("estimated_byte_size: ByteCount"));
+	assert!(explain_columns.contains("JoinStrategyDecisionReason::BroadcastEstimated"));
+	assert!(label.contains("\"broadcast_estimated\""));
+	assert!(binder.contains("estimated_broadcast_receipt_is_labeled_estimated"));
+	assert!(binder.contains("estimate_above_effective_threshold_hashes"));
+}
+
+#[test]
+pub(crate) fn adr138_take_lineage_unchanged() {
+	let binder = binder_source();
+	let take_helper = source_block(&binder, "fn take");
+	let take_arm = binder
+		.split("LogicalPlan::Take { input, limit } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Join").next())
+		.expect("Take bind arm");
+
+	assert!(take_helper.contains("Self::composite_with_row(row_upper_bound)"));
+	assert!(!take_helper.contains("derive_estimated_byte_size"));
+	assert!(take_arm.contains("input.facts.take(*limit)"));
+	assert!(!take_arm.contains("derive_estimated_byte_size"));
+	assert!(binder.contains("take_limited_dim_still_hashes"));
+}
+
+#[test]
+pub(crate) fn adr138_default_threshold_unchanged() {
+	let binder = binder_source();
+	let default_impl = source_block(&binder, "impl Default for PlannerConfig");
+	let cap_ceiling = source_block(&binder, "fn default_auto_broadcast_cap_ceiling");
+
+	assert!(default_impl.contains("Some(ByteCount::new(1024 * 1024))"));
+	assert!(cap_ceiling.contains("broadcast_build_bytes_per_task.get() / 4"));
+	assert!(!default_impl.contains("estimated_byte_size"));
+	assert!(!default_impl.contains("RECORD_BATCH_IPC_FRAMING_OVERHEAD_BYTES"));
+}
+
+#[test]
+pub(crate) fn adr138_no_substrate_or_wire_change() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"estimated_byte_size",
+		"estimate_materialized_byte_size",
+		"per_row_estimate_bytes",
+		"BroadcastEstimated",
+		"broadcast_estimated",
+		"DEFAULT_UTF8_BINARY_PAYLOAD_BYTES",
+		"RECORD_BATCH_IPC_FRAMING_OVERHEAD_BYTES",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/distributed"),
+		manifest_dir.join("src/server"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("src/catalog.rs"),
+		manifest_dir.join("src/config.rs"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR138 estimate markers leaked into execution/distributed/wire/catalog/config/Wendelon substrate:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+
+	let lib = lib_source();
+	assert!(lib.contains("distributed_broadcast_join_over_cap_fails_terminally_over_tcp"));
+	assert!(lib.contains("rune_authored_broadcast_join_respects_cap_terminally"));
+	assert!(lib.contains("TaskFailureKind::BudgetExhausted"));
 }
