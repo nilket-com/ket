@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–138 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–139 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,48 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 138 promoted; ADR 139 candidates
+### ADR 139 promoted; ADR 140 candidates
+
+ADR 139 promoted **Source-Aware Broadcast-Cap Hash Replay** — the keystone that retires ADR
+138's named availability residual (an estimated broadcast whose *actual* encoded bytes exceed
+the runtime cap fails the query where hash would have completed). The runtime caps a broadcast
+build against actual encoded Arrow IPC payload bytes (`PartitionPayload::size_bytes`), failing
+with a typed `BudgetExhausted(BroadcastReplication)` — never wrong rows — so an over-cap
+broadcast is a **resource-admission miss, not a query meaning error**. 139 converts it into a
+**one-shot, coordinator-owned, whole-query hash replay**: the coordinator already runs a
+`!batch_sent`-gated whole-query retry for descriptor evolution (`coordinator.rs:836`), so the
+replay is the same loop with a force-hash policy on the second attempt — no in-flight subtree
+re-fragmentation (broadcast and hash are disjoint fragment topologies). **Who degrades depends
+on how the broadcast was authored** (the operator's Rune/SQL steer): `JoinStrategyIntent::Pinned`
+gains a `source: {Direct, SqlHint, Rune}` provenance (it previously erased authoring). **Auto**
+(138 estimate / 136 hard) and **SQL `/*+ BROADCAST */`** broadcasts **replay → hash** (protect
+the naive user); **Rune `broadcast_join`** and **direct/programmatic** pins **stay terminal**
+(absolute control / explicit command — fail-loud). This synthesizes the fail-loud-for-authored-intent
+discipline (kept on Rune + Direct, the prescriptive/programmatic surfaces) with the
+pragmatic degrade (SQL, the compatibility surface) — [[rune_is_primary_interface]]. A plan with
+*any* terminal pinned broadcast does not replay (keeps the replay attempt provably
+broadcast-free; mixed-source per-join replay is the follow-on). Trigger is **`BroadcastReplication`
+only** — `ShuffleBytes` is excluded because `shuffle_bytes_published_per_task` is a per-task
+*total* and a single-producer broadcast build's hash version publishes the same total against the
+same budget (hash replay can't relieve it; replication is what hash eliminates). Replay preserves
+the external `QueryId` under a fresh stage/exchange id namespace (not `AttemptId` — the scheduler
+rewrites attempt ids) so attempt-0 published partitions can't collide; one-shot; reads only
+(`!batch_sent`-gated; mutation paths out); demoted SQL broadcasts install hash exchanges; the
+estimate-driven case returns the **forced-hash digest** (byte-identical — the V1 bar).
+Consensus: one-shot replay mechanism 3-of-3; source-aware D4 policy operator + Codex + Claude
+(after three grounded concessions — iter-0 tractability, iter-4 Direct-pins + ShuffleBytes).
+Headline gate: `estimated_broadcast_over_cap_replays_as_hash_and_matches_digest` (Rune+SQL).
+
+**ADR 140 lead candidates:** **targeted mixed-source per-join replay** (join identity
+bind→fragment→failure — closes 139's mixed-plan SQL-protection gap and removes the
+whole-query-replay bluntness); **length-carrying logical-type refinement** (promotes
+`Utf8`/`Binary` from a 138 *estimate* to a *hard* `byte_upper_bound` — shrinks the estimate
+surface; likely a Toron+Wendelon pair); **`Take`/`LIMIT` single-base lineage** (129-retarget so
+row-capped dims broadcast); generic `ShuffleBytes` recovery via multi-producer fan-out; the
+**136-W** Wendelon hard-facts producer (Wendelon-home); remote-live multi-producer fan-in;
+multi-column / histogram selectivity; join reordering. Evidence-gate the next pick on the 139 feat.
+
+### ADR 138 promoted; ADR 139 candidates (HISTORICAL)
 
 ADR 138 promoted **Estimate-Tolerant Per-Row Materialized-Size Model** — the cut where the
 council, on an operator steer, traded the spine's "hard upper bound only" purism for an
