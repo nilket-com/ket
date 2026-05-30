@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–133 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–134 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,33 +46,36 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 133 promoted; ADR 134 candidates
+### ADR 134 promoted; ADR 135 candidates
 
-ADR 133 promoted **Binder Optimizer Trace Receipts** — makes the CBO arc 129–132
-durable and inspectable. The binder computed `JoinStrategyDecision { strategy,
-placement, reason }`, used strategy/placement to build the plan, and **dropped the
-reason** — so *why* a join chose hash or broadcast was testable only by plan-shape
-inference. A new `bind_with_trace` path now **always** collects a crate-private
-`OptimizerTrace` — one `DecisionReceipt { join_index, strategy, placement, reason }`
-per join (auto / every hash reason / pinned) — threaded as `&mut` (no `RefCell`);
-plain `bind` is a thin wrapper that discards it and stays structurally identical.
-The four reason enums move module-private → `pub(crate)` (required for tests; never
-bare `pub`, never on `ExecutionPlan`/wire). Identity is a deterministic
-`join_index` (self-join-safe; human qualifiers deferred). Genuine 3-of-3 +
-operator-selected: Gemini conceded multi-way and Claude conceded public EXPLAIN,
-both → trace-first; Codex's iter-2 EXPLAIN-feasibility grounding instead de-risks
-the follow-on. No executor/fragmenter/scheduler/wire/Wendelon change. Load-bearing
-gate: `bind_remains_structurally_identical_with_and_without_trace`.
+ADR 134 promoted **Optimizer Join-Decision EXPLAIN (SQL + Rune)** — exposes ADR
+133's `OptimizerTrace` as a read-only diagnostic relation through **both**
+frontends. **Rune `RuneDataFrame::explain()` is primary** (the operator steer:
+Rune is the primary interface, SQL secondary compatibility — a Rune *script* can't
+reach the crate-private `bind_with_trace`, so `.explain()` is the only way to
+inspect a hand-prescribed Rune plan like `dim.broadcast_join(fact,on).explain()`);
+SQL `EXPLAIN <query>` mirrors it. Both lower to one shared `LogicalPlan::Explain`
+node, bound via `bind_with_trace`, rendered as `ExecutionPlan::SystemTable`
+(`SystemTableKind::OptimizerExplain`) through the existing `ResultBatch` path — no
+new SQL wire frame. EXPLAIN **binds the inner plan but never executes it**; it is a
+read-only relation, so `ctx.sql("EXPLAIN SELECT")` is allowed while mutation
+EXPLAIN still rejects (ADR 079 terminal guard retargeted to DDL/DML only). Stable
+schema: `join_index · strategy · placement · reason · reason_detail · build_side ·
+build_bytes · threshold_bytes · rejected_side_bytes` (snake_case strings, never
+Rust `Debug`); ADR 133's index-only `JoinTraceTarget` stays unchanged, with
+human-readable join labels deferred. Reason/trace types stay `pub(crate)`, rendered
+to scalars only (ADR 133's `no_public_explain_surface` guard retargeted). Genuine
+3-of-3 after Claude conceded SQL-only → both frontends on the operator steer + the
+`pub(crate)` grounding. No new strategy logic/substrate. Load-bearing gate:
+`sql_explain_matches_rune_explain_rows` (SQL↔Rune row parity).
 
-**ADR 134 lead candidates:** public `EXPLAIN <query>` rendered from this trace —
-lower the currently-`unsupported` `Statement::Explain`, bind via `bind_with_trace`,
-and render trace rows through the existing SQL result path, likely by adding an
-EXPLAIN-shaped system table plan (grounded feasible: system-table rows already
-materialize to `RecordBatch` at `exec.rs:667`; no new wire message should be
-needed). Then Wendelon-backed live table-size facts (cross-ring producer → flip
-dark-launch toward default-on, EXPLAIN validates it); recursive fragmentation /
-multi-way star-join substrate; selectivity + richer cost. Evidence-gate the pick on
-the 133 feat.
+**ADR 135 lead candidates:** Wendelon-backed live table-size facts (cross-ring
+storage-ring producer → flip 129's dark-launch toward default-on; EXPLAIN now
+validates it) — the step that makes 129–132 actually fire in production; recursive
+fragmentation / multi-way star-join substrate (the petabyte-fact ⋈ many-tiny-dims
+vision — lifts 131's nested-join probe fence); `EXPLAIN ANALYZE` / fuller plan
+rendering; selectivity propagation + richer cost. Evidence-gate the pick on the
+134 feat.
 
 ### ADR 129 promoted (HISTORICAL)
 
