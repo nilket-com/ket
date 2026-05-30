@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–136 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–137 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,52 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 136 promoted; ADR 137 candidates
+### ADR 137 promoted; ADR 138 candidates
+
+ADR 137 promoted **Fact-Spine Preservation Through Row-Local Volume-Non-Increasing
+Nodes** — the natural IQ step now that 136 made base facts real in production. 136 let
+`byte_upper_bound`/`row_upper_bound` flow, but the binder threw them away the moment a
+relation was wrapped: `Filter` (`binder.rs:380`) and `Project` (`:396`) each replaced
+the child facts with `composite_with_row(...)` (`PlanOrigin::Composite`, byte `None`),
+so the join chooser's single-base + byte-bound requirement (`:3950/3953`, `:3889/3897`)
+rejected the build → every build-side `Filter`/`Project` shape silently demoted a tiny
+dimension to hash. Yet a filter only *removes* rows and a column-subset project only
+*drops* columns — neither grows the relation, so the hard upper bounds stay valid and
+the origin stays single-base. **D1:** `Filter` preserves the full single-base spine
+(origin+byte+row).
+**D2:** `Project` preserves byte facts **only** for a pure distinct-column
+subset/permutation; an expression/cast/literal/dup project keeps row + single-base
+lineage but **drops byte** (it may grow bytes); aggregating/expanding stays `Composite`.
+**D3:** single-column PK equality (`primary_key_columns.len()==1`, that column, non-null
+literal) caps `row_upper_bound=1` but **never shrinks byte** — the chooser is byte-only,
+so a PK-filtered large table **caps rows yet still hashes**; gated honestly as *caps
+rows, still hashes* (the [[feedback_cut_must_deliver_the_name]] discipline — no name the
+mechanism can't deliver). **D4:** one guarded place — `preserve_volume_non_increasing` /
+`preserve_through_project` / `with_pk_row_cap` on `PlanOptimizerFacts`, so the invariant
+can't silently rot. **D5:** binder-local — no new fact unit, width model, or
+substrate/wire/fragmenter/scheduler change; EXPLAIN (134) is the validation surface.
+**`Sort` considered and dropped (grounded):** it is the third `composite_with_row` site
+(`:479`) and volume-non-increasing, so folding it looked free — but every surface
+`ORDER BY` lowers as `Sort { input: Exchange{partition_count:1} }`
+(`apply_order_by_limit_tail`), and the one-partition `Exchange` already resets origin to
+`Composite` *below* the Sort, so Sort preservation is **inert** for SQL/Rune; revisit
+only if a direct-IR un-exchanged `Sort` becomes reachable (Codex's caught caveat,
+confirmed against `sql_planner.rs`). Genuine 3-of-3 on B′ (Gemini withdrew the
+overclaimed `pk_filtered_large_table_infers_broadcast` gate, conceding the byte-only
+grounding). Headline binder gate: `filtered_tiny_dim_infers_broadcast` (fails on
+`main`); five `adr137_*` guards + 129–136 regressions.
+
+**ADR 138 lead candidates:** **hard per-row materialized-width model** (the direct
+138 follow-on — converts a row cap into a `byte_upper_bound` so a PK-filtered/known-small
+row from a large table actually broadcasts; bounded-width schemas: fixed Arrow types
+always, `Utf8`/`Binary` via a refinement max-length, else keep input byte bound) — the
+natural completion of 137's honestly-deferred half; the **136-W** Wendelon hard-facts
+producer (the other half of the 136 pair, Wendelon-home); remote-live multi-producer
+fan-in (complete 135's live path for pinned-Rune broadcast); richer cost units;
+multi-column / range / histogram selectivity; join reordering. Evidence-gate the next
+pick on the 137 feat.
+
+### ADR 136 promoted; ADR 137 candidates (HISTORICAL)
 
 ADR 136 promoted **Wendelon-Backed Hard Table-Size Facts (Toron consumer + default
 flip)** — the "data data data" cut that makes the 129–135 CBO spine fire on real
