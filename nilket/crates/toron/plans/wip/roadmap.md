@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–143 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–144 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,61 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 143 promoted; ADR 144 candidates
+### ADR 144 promoted; ADR 145 candidates
+
+ADR 144 promoted **Labeled Range Selectivity from Maintained Min/Max** — the second
+stats-backed selectivity class (the first since equality NDV), attacking range
+predicates (`< <= > >=`, `BETWEEN`) that got a blunt default (the 141 guard
+`range_filter_does_not_use_ndv_selectivity` pinned it). Wendelon already maintains
+**always-on** per-column min/max + null/non-null counts
+(`build_always_on_column_stats_block`, `stats.rs:638`) — *always-on*, unlike the
+*opt-in* HLL/small-set NDV the 141→143 path rides, so range selectivity **fires
+broadly day-one**. v1 is **min/max** (KLL/quantile skew-precision is the named
+follow-on, `sketch.rs` is query-aggregate-only). A cross-ring cut mirroring 142:
+Wendelon adds `column_range: Vec<ColumnRangeFact>` (additive on the 142
+`TABLE_OPTIMIZER_FACTS_GET` blob); the range scalar tag/decode contract is
+schema-owned and re-exported through `wendelon-client` (no Toron import of Wendelon
+storage stats), and mixed-version postcard compatibility must be explicit rather
+than assumed from `serde(default)`. Toron maps the fact and the binder derives a
+**labeled approximate** uniform selectivity into the **estimate channel only**
+(`estimated_row_count`, never `row_upper_bound`/`byte_upper_bound`, never elides a
+scan), feeding 138's byte estimate → broadcast. **The load-bearing grounding:** live
+facts map `row_upper_bound` to **`None`** (`catalog.rs::descriptor_optimizer_facts_from_storage`),
+so the fact **carries its own `non_null_count`** and the estimate derives from it —
+estimating from `row_upper_bound` would have shipped **inert** (the 141/142
+build-but-dark lesson; Codex's iter-2 catch, verified, over Claude's iter-1
+`base_rows`). **Discrete-domain interpolation** `ceil(non_null_count · overlap /
+(max−min+1))`; **`BETWEEN` is a real band** (intersect same-column bounds, tightest
+[low,high], contradictory → 0; over a stacked-`min`); **estimate from min/max — not
+NDV** (D8 retargets the range guard; NDV stays equality-only); **full-contributor
+coverage or absent** (reuse 142's fence — a partial/truncated merge narrows the
+range → under-estimate → over-broadcast, the aggressive direction); **141
+no-independence** (single tightest estimate across equality + range, no product).
+**v1 consumer decodes `Int32`/`Int64` only** (Toron's literal surface);
+unsigned/date/timestamp ride the sidecar fail-open; float/decimal/utf8/binary/bool
+fail open. No default-policy flip, no hard bound, no scan elision. Genuine 3-of-3
+(min/max-v1 from iter-1; `non_null_count` inertness fix + band + discrete interp
+converged Codex+Gemini, conceded by Claude on verified grounding). Headline gate:
+`range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate` (fails on
+`main`).
+
+**ADR 145 lead candidates:** **KLL/quantile precision** (skew-aware range
+selectivity where min/max uniformity is too coarse — a *new maintained* producer,
+evidence-gated on 144's feat showing uniformity-miss cases); **SQL
+derived-tables-in-joins** (the Toron-local frontend completion 143/144 deferred —
+lift the `FROM fact JOIN (SELECT … WHERE …) d` reject, machinery exists at
+`lower_derived_table:3624`, spine survives `Alias`, `binder.rs:560`); **date/timestamp
++ unsigned range consumer** (decode the tags 144's producer already emits — a small
+consumer-only extension); **hard-from-exact** (freshness/coverage doctrine letting a
+fresh complete `Exact`/full-coverage min/max write a hard bound — would let 141/144
+provable-empty become hard); **stats default-policy flip** (widen NDV coverage past
+opt-in); **Theta-sketch join-key intersection** (the join-cardinality arc; heaviest);
+140 A1; multi-column/correlated selectivity. **Forward arc:** `NDV equality (141) →
+142 producer → 143 SQL → 144 min/max range → KLL/quantile → Theta-sketch join-key
+intersection → join selectivity → join reordering`. Evidence-gate the next pick on
+the 144 feat.
+
+### ADR 143 promoted; ADR 144 candidates (HISTORICAL)
 
 ADR 143 promoted **SQL Inner-Join Side-Local Filter Pushdown** — the
 secondary-frontend completion of 141's headline, worth doing now that 142 made the
