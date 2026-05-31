@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–141 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–142 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,48 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 141 promoted; ADR 142 candidates
+### ADR 142 promoted; ADR 143 candidates
+
+ADR 142 promoted **Wendelon NDV Optimizer Fact Producer** — the **cross-ring activation cut** that
+makes the built-but-dark 129→141 CBO consumer live for covered opt-in tables. 141 landed the Toron NDV consumer,
+but live descriptor sync emitted no facts (`column_ndv: Vec::new()`); 142 has **Wendelon produce**
+table-level per-column NDV from its already-maintained **opt-in HLL/small-set** stats and **Toron
+fetch** it during descriptor sync into `DescriptorOptimizerFacts.column_ndv`. **Wendelon-owned fact
+type** (`TableOptimizerFactsV1 { …identity…, column_ndv: Vec<ColumnNdvFactV1> }`,
+`NdvFactV1 = Exact{count} | Approx{estimate, rel_err_ppm}`; no Toron import — Toron maps it). **A
+separate, fail-open facts RPC** (`TABLE_OPTIMIZER_FACTS_GET` ~`0x46/0x47`, *not* folded into
+descriptor get/list, which stay length-checked descriptor-only): fetch failure / unsupported / stale
+identity / no coverage all degrade to descriptor-only sync — the endpoint is **advisory, never a
+planning availability dependency**, and Toron caches no Wendelon stats. **Full live-contributor
+coverage or absent (D3):** a table-level NDV requires every visible contributor — **active tail +
+sealed L1 + tiered runs** — to carry compatible stats; otherwise the column is unknown, and the
+producer **does not scan active data at sync time** to manufacture a fact (sparse rollout is the
+right trade). **Merge raw HLL registers** (`HllRegisters::merge`, estimate from merged), not
+per-contributor `DistinctCount` scalars; complete small-set union → `Exact`; quantize
+`std_err`→`rel_err_ppm` at the boundary (141 chose integer error to keep facts `Eq`). **No
+default-policy flip, no `TableSchemaDescriptor` mutation, no hard-bound write; the 141 consumer is
+unchanged** — NDV stays labeled-approximate in the estimate channel. **Risk vocabulary corrected:**
+the aggressive (over-broadcast) risk is an *under-estimated row count from an inflated NDV*
+(HLL inflation / skew / stale / hot literal), bounded by 139/140 replay — a partial-subset merge
+*under*-counts NDV → *over*-estimates rows → conservative; so all-contributors-or-absent is a
+**fact-honesty** fence, not over-broadcast prevention (corrects the iter-1/Gemini framing). Genuine
+3-of-3 on Codex's final iter-2; Gemini's reversed coverage-fence rationale surfaced + corrected.
+Headline gate: `rune_equality_filtered_dim_broadcasts_over_wendelon_ndv_no_seed` (fails on `main`).
+
+**ADR 143 lead candidates:** **SQL join-filter pushdown** (side-local `WHERE` to the build / joins
+around filtered derived tables — unlocks the SQL form of 141's headline, the secondary frontend; now
+worth doing since 142 makes facts real); **stats default-policy decision** (a storage-cost product
+call to widen NDV coverage beyond opt-in columns — would make 142 fire on more tables);
+**quantile/range selectivity** (the *second* stats producer — inequality selectivity + 138 byte
+hardening; KLL is a query aggregate, a new maintained-producer extension); **hard-from-exact** (a
+stats-freshness/coverage doctrine letting a fresh complete small-set `Exact` write a hard bound);
+140's A1 (exact join-identified replay); multi-column stats. **Forward arc (named, not next):** HLL
+is for single-column NDV, *not* intersections — **Theta-sketches** are the likely Wendelon family
+for join-key intersection facts → `NDV equality selectivity (141) → 142 producer → quantile/range →
+Theta-sketch join-key intersection → join selectivity → join reordering`. Evidence-gate the next
+pick on the 142 feat.
+
+### ADR 141 promoted; ADR 142 candidates (HISTORICAL)
 
 ADR 141 promoted **Labeled NDV Equality Selectivity Estimates** — the first stats-backed CBO cut,
 attacking the *root* of the 138/139/140 arc (blunt estimates → over-cap broadcasts) instead of the
