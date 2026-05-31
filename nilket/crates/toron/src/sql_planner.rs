@@ -2779,13 +2779,43 @@ impl SqlPlanner {
 		{
 			return Err(unsupported("joins around derived tables are not supported"));
 		}
+		let all_inner_join_chain = table_with_joins.joins.iter().all(|join| {
+			join_operator_kind_for_filter_pushdown(&join.join_operator) == Some(JoinKind::Inner)
+		});
+		let mut pending_where_conjuncts = match (all_inner_join_chain, selection.as_ref()) {
+			(true, Some(selection)) => split_top_level_and(selection),
+			_ => Vec::new(),
+		};
+		let mut pushed_leftmost_filter = false;
 		let mut plan = self.lower_table_factor(&table_with_joins.relation)?;
 		for join in &table_with_joins.joins {
 			if table_factor_is_derived(&join.relation) {
 				return Err(unsupported("joins around derived tables are not supported"));
 			}
-			let right = self.lower_table_factor(&join.relation)?;
+			let mut right = self.lower_table_factor(&join.relation)?;
 			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
+			if all_inner_join_chain {
+				let right_qualifiers = plan_qualifiers(&right);
+				if !pushed_leftmost_filter {
+					let left_qualifiers = plan_qualifiers(&plan);
+					plan = self.push_side_local_join_filters(
+						plan,
+						&mut pending_where_conjuncts,
+						&left_qualifiers,
+						&right_qualifiers,
+						JoinFilterTarget::Left,
+					)?;
+					pushed_leftmost_filter = true;
+				}
+				let left_qualifiers = plan_qualifiers(&plan);
+				right = self.push_side_local_join_filters(
+					right,
+					&mut pending_where_conjuncts,
+					&left_qualifiers,
+					&right_qualifiers,
+					JoinFilterTarget::Right,
+				)?;
+			}
 			let strategy_intent =
 				join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right, kind)?;
 			plan = match strategy_intent {
@@ -2799,7 +2829,13 @@ impl SqlPlanner {
 
 		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation)
 		if let Some(selection) = selection {
-			plan = self.lower_where(plan, selection)?;
+			if all_inner_join_chain {
+				if let Some(selection) = combine_and_sql_exprs(&pending_where_conjuncts) {
+					plan = self.lower_where(plan, &selection)?;
+				}
+			} else {
+				plan = self.lower_where(plan, selection)?;
+			}
 		}
 		if group_keys.is_some() && plan_contains_join(&plan) {
 			return Err(unsupported("GROUP BY over joins is not supported"));
@@ -3672,6 +3708,35 @@ impl SqlPlanner {
 			}
 			_ => Err(unsupported("unsupported table factor")),
 		}
+	}
+
+	fn push_side_local_join_filters<'a>(
+		&self,
+		input: LogicalPlan,
+		pending: &mut Vec<&'a SqlExpr>,
+		left_qualifiers: &[TableRef],
+		right_qualifiers: &[TableRef],
+		target: JoinFilterTarget,
+	) -> Result<LogicalPlan, FrontendError> {
+		let mut pushed = Vec::new();
+		let mut residual = Vec::with_capacity(pending.len());
+		for conjunct in pending.drain(..) {
+			if join_filter_conjunct_matches(conjunct, left_qualifiers, right_qualifiers, target) {
+				let predicate = self.lower_expr(conjunct)?;
+				pushed.push(predicate);
+			} else {
+				residual.push(conjunct);
+			}
+		}
+		*pending = residual;
+
+		let Some(predicate) = combine_and_exprs(pushed) else {
+			return Ok(input);
+		};
+		Ok(LogicalPlan::Filter {
+			input: Box::new(input),
+			predicate,
+		})
 	}
 
 	fn lower_where(
@@ -5948,9 +6013,16 @@ enum ColumnScope {
 	Inner,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinFilterTarget {
+	Left,
+	Right,
+}
+
 #[derive(Default)]
 struct ScopeRefs {
 	outer: bool,
+	inner: bool,
 	unsupported: bool,
 }
 
@@ -5972,6 +6044,37 @@ fn combine_and_exprs(exprs: Vec<Expr>) -> Option<Expr> {
 	Some(exprs.fold(first, |left, right| {
 		Expr::And(Box::new(left), Box::new(right))
 	}))
+}
+
+fn combine_and_sql_exprs(exprs: &[&SqlExpr]) -> Option<SqlExpr> {
+	let mut exprs = exprs.iter().copied();
+	let first = exprs.next()?.clone();
+	Some(exprs.fold(first, |left, right| SqlExpr::BinaryOp {
+		left: Box::new(left),
+		op: BinaryOperator::And,
+		right: Box::new(right.clone()),
+	}))
+}
+
+fn join_operator_kind_for_filter_pushdown(operator: &JoinOperator) -> Option<JoinKind> {
+	match operator {
+		JoinOperator::Join(_) | JoinOperator::Inner(_) => Some(JoinKind::Inner),
+		JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => Some(JoinKind::LeftOuter),
+		JoinOperator::Right(_) | JoinOperator::RightOuter(_) => Some(JoinKind::RightOuter),
+		JoinOperator::FullOuter(_) => Some(JoinKind::FullOuter),
+		JoinOperator::Semi(_) | JoinOperator::LeftSemi(_) => Some(JoinKind::LeftSemi),
+		JoinOperator::RightSemi(_) => Some(JoinKind::RightSemi),
+		JoinOperator::Anti(_) | JoinOperator::LeftAnti(_) => Some(JoinKind::LeftAnti),
+		JoinOperator::RightAnti(_) => Some(JoinKind::RightAnti),
+		JoinOperator::CrossJoin(_)
+		| JoinOperator::CrossApply
+		| JoinOperator::OuterApply
+		| JoinOperator::AsOf { .. }
+		| JoinOperator::StraightJoin(_)
+		| JoinOperator::ArrayJoin
+		| JoinOperator::LeftArrayJoin
+		| JoinOperator::InnerArrayJoin => None,
+	}
 }
 
 fn validate_exists_query_shape(query: &Query) -> Result<(), FrontendError> {
@@ -6186,7 +6289,7 @@ fn collect_scope_refs(
 			};
 			match resolve_column_scope(&qualifier, outer_qualifiers, inner_qualifiers) {
 				Ok(ColumnScope::Outer) => refs.outer = true,
-				Ok(ColumnScope::Inner) => {}
+				Ok(ColumnScope::Inner) => refs.inner = true,
 				Err(_) => refs.unsupported = true,
 			}
 		}
@@ -6194,6 +6297,23 @@ fn collect_scope_refs(
 		SqlExpr::BinaryOp { left, right, .. } => {
 			collect_scope_refs(left, outer_qualifiers, inner_qualifiers, refs)?;
 			collect_scope_refs(right, outer_qualifiers, inner_qualifiers, refs)?;
+		}
+		SqlExpr::InList { expr, list, .. } => {
+			collect_scope_refs(expr, outer_qualifiers, inner_qualifiers, refs)?;
+			for item in list {
+				collect_scope_refs(item, outer_qualifiers, inner_qualifiers, refs)?;
+			}
+		}
+		SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+			collect_scope_refs(expr, outer_qualifiers, inner_qualifiers, refs)?;
+			collect_scope_refs(pattern, outer_qualifiers, inner_qualifiers, refs)?;
+		}
+		SqlExpr::Between {
+			expr, low, high, ..
+		} => {
+			collect_scope_refs(expr, outer_qualifiers, inner_qualifiers, refs)?;
+			collect_scope_refs(low, outer_qualifiers, inner_qualifiers, refs)?;
+			collect_scope_refs(high, outer_qualifiers, inner_qualifiers, refs)?;
 		}
 		SqlExpr::Case {
 			operand,
@@ -6250,6 +6370,22 @@ fn collect_scope_refs(
 		_ => {}
 	}
 	Ok(())
+}
+
+fn join_filter_conjunct_matches(
+	conjunct: &SqlExpr,
+	left_qualifiers: &[TableRef],
+	right_qualifiers: &[TableRef],
+	target: JoinFilterTarget,
+) -> bool {
+	let mut refs = ScopeRefs::default();
+	if collect_scope_refs(conjunct, left_qualifiers, right_qualifiers, &mut refs).is_err() {
+		return false;
+	}
+	match target {
+		JoinFilterTarget::Left => refs.outer && !refs.inner && !refs.unsupported,
+		JoinFilterTarget::Right => refs.inner && !refs.outer && !refs.unsupported,
+	}
 }
 
 fn alias_column_names(alias: &TableAlias) -> Result<Vec<String>, FrontendError> {
@@ -6525,6 +6661,159 @@ mod tests {
 	}
 
 	#[test]
+	fn sql_inner_join_pushes_right_local_conjunct_to_right_input() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.region = 'north'",
+			)
+			.expect("plan pushed right filter");
+
+		match plan {
+			LogicalPlan::Join { right, kind, .. } => {
+				assert_eq!(kind, JoinKind::Inner);
+				let predicate = assert_filter_on_alias(&right, "c");
+				assert_expr_references(predicate, "c", "region");
+				assert_eq!(filter_count(&right), 1);
+			}
+			other => panic!("expected join plan, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn sql_inner_join_pushes_right_local_like_conjunct_to_right_input() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.region LIKE 'n%'",
+			)
+			.expect("plan pushed right LIKE filter");
+
+		match plan {
+			LogicalPlan::Join { right, kind, .. } => {
+				assert_eq!(kind, JoinKind::Inner);
+				let predicate = assert_filter_on_alias(&right, "c");
+				assert_expr_references(predicate, "c", "region");
+				assert_eq!(filter_count(&right), 1);
+			}
+			other => panic!("expected join plan, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn sql_inner_join_pushes_leftmost_local_conjunct_to_left_input() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM customers c \
+				 INNER JOIN orders o ON c.id = o.customer_id \
+				 WHERE c.region = 'north'",
+			)
+			.expect("plan pushed leftmost filter");
+
+		match plan {
+			LogicalPlan::Join { left, kind, .. } => {
+				assert_eq!(kind, JoinKind::Inner);
+				let predicate = assert_filter_on_alias(&left, "c");
+				assert_expr_references(predicate, "c", "region");
+				assert_eq!(filter_count(&left), 1);
+			}
+			other => panic!("expected join plan, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn sql_multi_dim_star_pushes_each_filter_to_tightest_input() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id \
+				 WHERE c1.region = 'west' AND c2.region = 'east'",
+			)
+			.expect("plan multi-dim pushed filters");
+
+		match plan {
+			LogicalPlan::Join { left, right, .. } => {
+				let outer_predicate = assert_filter_on_alias(&right, "c2");
+				assert_expr_references(outer_predicate, "c2", "region");
+				match *left {
+					LogicalPlan::Join { right, .. } => {
+						let inner_predicate = assert_filter_on_alias(&right, "c1");
+						assert_expr_references(inner_predicate, "c1", "region");
+					}
+					other => panic!("expected nested join on left, got {other:?}"),
+				}
+			}
+			other => panic!("expected join plan, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn sql_cross_side_conjunct_remains_residual() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE o.id = c.id",
+			)
+			.expect("plan cross-side residual");
+
+		match plan {
+			LogicalPlan::Filter { input, predicate } => {
+				assert_expr_references(&predicate, "o", "id");
+				assert_expr_references(&predicate, "c", "id");
+				assert!(matches!(*input, LogicalPlan::Join { .. }));
+			}
+			other => panic!("expected residual filter above join, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn sql_unqualified_conjunct_remains_residual() {
+		let sql = "SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id WHERE region = 'north'";
+		let plan = SqlPlanner::new().plan(sql).expect("plan residual filter");
+		assert!(
+			matches!(plan, LogicalPlan::Filter { .. }),
+			"{sql}: {plan:?}"
+		);
+		assert_eq!(filter_count(&plan), 1, "{sql}: {plan:?}");
+	}
+
+	#[test]
+	fn sql_constant_conjunct_remains_residual() {
+		let sql =
+			"SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id WHERE 1 = 1";
+		let plan = SqlPlanner::new().plan(sql).expect("plan residual filter");
+		assert!(
+			matches!(plan, LogicalPlan::Filter { .. }),
+			"{sql}: {plan:?}"
+		);
+		assert_eq!(filter_count(&plan), 1, "{sql}: {plan:?}");
+	}
+
+	#[test]
+	fn sql_outer_join_chain_disables_filter_pushdown() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT c.id, b.x \
+				 FROM a INNER JOIN b ON a.k = b.k \
+				 RIGHT OUTER JOIN c ON c.j = b.j \
+				 WHERE b.x = 1",
+			)
+			.expect("plan outer-chain residual");
+
+		assert_eq!(filter_count(&plan), 1, "{plan:?}");
+		match plan {
+			LogicalPlan::Project { input, .. } => {
+				assert!(matches!(*input, LogicalPlan::Filter { .. }));
+			}
+			other => panic!("expected project over residual filter, got {other:?}"),
+		}
+	}
+
+	#[test]
 	fn generic_dialect_preserves_select_optimizer_hints() {
 		let select = parse_select(
 			"SELECT /*+ BROADCAST(c) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
@@ -6588,6 +6877,43 @@ mod tests {
 				));
 			}
 			other => panic!("expected join plan, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn sql_filter_pushdown_preserves_broadcast_hint_resolution() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c \
+				 INNER JOIN orders o ON c.id = o.customer_id \
+				 WHERE c.region = 'west'",
+			)
+			.expect("plan hinted pushed filter");
+
+		match plan {
+			LogicalPlan::Join {
+				left,
+				kind,
+				strategy_intent,
+				..
+			} => {
+				assert_eq!(kind, JoinKind::Inner);
+				assert_eq!(
+					strategy_intent,
+					JoinStrategyIntent::Pinned {
+						strategy: JoinStrategy::Broadcast,
+						source: JoinStrategyPinSource::SqlHint
+					}
+				);
+				match *left {
+					LogicalPlan::Exchange { input, .. } => {
+						let predicate = assert_filter_on_alias(&input, "c");
+						assert_expr_references(predicate, "c", "region");
+					}
+					other => panic!("expected broadcast exchange, got {other:?}"),
+				}
+			}
+			other => panic!("expected hinted join plan, got {other:?}"),
 		}
 	}
 
@@ -6745,5 +7071,96 @@ mod tests {
 		};
 		assert_eq!(column.qualifier.as_ref(), Some(&TableRef::new(qualifier)));
 		assert_eq!(column.name.0, name);
+	}
+
+	fn assert_filter_on_alias<'a>(plan: &'a LogicalPlan, alias: &str) -> &'a Expr {
+		let LogicalPlan::Filter { input, predicate } = plan else {
+			panic!("expected filter on {alias}, got {plan:?}");
+		};
+		assert!(matches!(
+			input.as_ref(),
+			LogicalPlan::Alias { alias: observed, .. } if observed == &TableRef::new(alias)
+		));
+		predicate
+	}
+
+	fn assert_expr_references(expr: &Expr, qualifier: &str, name: &str) {
+		assert!(
+			expr_references(expr, qualifier, name),
+			"expected {expr:?} to reference {qualifier}.{name}"
+		);
+	}
+
+	fn expr_references(expr: &Expr, qualifier: &str, name: &str) -> bool {
+		match expr {
+			Expr::Column(column) => {
+				column.qualifier.as_ref() == Some(&TableRef::new(qualifier))
+					&& column.name.0 == name
+			}
+			Expr::LogicalAscription { expr, .. }
+			| Expr::SqlLogicalCast { expr, .. }
+			| Expr::Not(expr)
+			| Expr::IsNull(expr)
+			| Expr::IsNotNull(expr)
+			| Expr::TimeBucket(_, expr)
+			| Expr::Cast(expr, _)
+			| Expr::TryCast(expr, _) => expr_references(expr, qualifier, name),
+			Expr::Add(left, right)
+			| Expr::Sub(left, right)
+			| Expr::Mul(left, right)
+			| Expr::Div(left, right)
+			| Expr::Eq(left, right)
+			| Expr::Neq(left, right)
+			| Expr::Lt(left, right)
+			| Expr::Lte(left, right)
+			| Expr::Gt(left, right)
+			| Expr::Gte(left, right)
+			| Expr::And(left, right)
+			| Expr::Or(left, right) => {
+				expr_references(left, qualifier, name) || expr_references(right, qualifier, name)
+			}
+			Expr::InList { expr, list, .. } => {
+				expr_references(expr, qualifier, name)
+					|| list
+						.iter()
+						.any(|expr| expr_references(expr, qualifier, name))
+			}
+			Expr::Like { expr, .. } => expr_references(expr, qualifier, name),
+			Expr::Case {
+				when_then,
+				else_expr,
+			} => {
+				when_then.iter().any(|(when, then)| {
+					expr_references(when, qualifier, name) || expr_references(then, qualifier, name)
+				}) || else_expr
+					.as_ref()
+					.is_some_and(|expr| expr_references(expr, qualifier, name))
+			}
+			Expr::Literal(_) | Expr::UntypedNull => false,
+		}
+	}
+
+	fn filter_count(plan: &LogicalPlan) -> usize {
+		match plan {
+			LogicalPlan::Filter { input, .. } => 1 + filter_count(input),
+			LogicalPlan::Alias { input, .. }
+			| LogicalPlan::Project { input, .. }
+			| LogicalPlan::Aggregate { input, .. }
+			| LogicalPlan::Exchange { input, .. }
+			| LogicalPlan::Sort { input, .. }
+			| LogicalPlan::Take { input, .. }
+			| LogicalPlan::Explain { input } => filter_count(input),
+			LogicalPlan::Join { left, right, .. } => filter_count(left) + filter_count(right),
+			LogicalPlan::CreateTableAsSelect { source, .. } => filter_count(source),
+			LogicalPlan::Scan { .. }
+			| LogicalPlan::ScanNamed { .. }
+			| LogicalPlan::CreateTable { .. }
+			| LogicalPlan::CreateLogicalType { .. }
+			| LogicalPlan::DropTable { .. }
+			| LogicalPlan::Delete { .. }
+			| LogicalPlan::Update { .. }
+			| LogicalPlan::Insert { .. }
+			| LogicalPlan::InsertSelect { .. } => 0,
+		}
 	}
 }

@@ -8895,6 +8895,116 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn sql_equality_filtered_dim_with_wendelon_ndv_infers_broadcast_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.region = 'north'",
+			)
+			.expect("plan SQL NDV-filtered dimension join");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind SQL NDV-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn sql_inner_join_pushes_leftmost_local_conjunct_to_left_input() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM customers c \
+				 INNER JOIN orders o ON c.id = o.customer_id \
+				 WHERE c.region = 'north'",
+			)
+			.expect("plan SQL leftmost-filtered dimension join");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind SQL leftmost NDV-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Left,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn sql_multi_dim_star_each_filtered_dim_broadcasts() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c1 ON o.customer_id = c1.id \
+				 INNER JOIN customers c2 ON o.customer_id = c2.id \
+				 WHERE c1.region = 'west' AND c2.region = 'east'",
+			)
+			.expect("plan SQL filtered two-dimension star");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind SQL filtered two-dimension star");
+
+		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 2);
+		assert_eq!(trace.join_decisions.len(), 2);
+		assert!(trace.join_decisions.iter().all(|decision| matches!(
+			decision.reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		)));
+	}
+
+	#[tokio::test]
 	async fn missing_ndv_keeps_137_138_behavior() {
 		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(20_000));
 		let filtered_customers = LogicalPlan::Filter {

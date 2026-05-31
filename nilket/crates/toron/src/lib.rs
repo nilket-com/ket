@@ -851,6 +851,91 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn sql_filter_pushdown_digest_matches_above_join_filter() {
+		let pushed = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders \
+				 INNER JOIN customers ON orders.customer_id = customers.id \
+				 WHERE customers.region = 'west'",
+			)
+			.expect("plan pushed SQL filter");
+		let above_join = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::Join {
+				left: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("orders"),
+					projection: None,
+				}),
+				right: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("customers"),
+					projection: None,
+				}),
+				kind: JoinKind::Inner,
+				on: vec![(
+					Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+					Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+				)],
+				strategy_intent: JoinStrategyIntent::Auto,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(
+					crate::catalog::TableRef::new("customers"),
+					"region",
+				)),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("west".to_string())))),
+			),
+		};
+		let catalog = join_catalog_with_customers_row_upper_bound_and_ndv(
+			20_000,
+			BTreeMap::from([(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)]),
+		);
+
+		let pushed_results = run_local_join_query_with_catalog_config(
+			pushed,
+			catalog.clone(),
+			PlannerConfig::default(),
+		)
+		.await;
+		let above_join_results =
+			run_local_join_query_with_catalog_config(above_join, catalog, PlannerConfig::default())
+				.await;
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&pushed_results, SortPolicy::FullRowLex)
+				.expect("pushed digest"),
+			canonical_arrow_ipc_digest(&above_join_results, SortPolicy::FullRowLex)
+				.expect("above-join digest")
+		);
+	}
+
+	#[tokio::test]
+	async fn sql_outer_join_chain_filter_stays_above_and_returns_empty_counterexample() {
+		let plan = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT c.id, b.x \
+				 FROM a INNER JOIN b ON a.k = b.k \
+				 RIGHT OUTER JOIN c ON c.j = b.j \
+				 WHERE b.x = 1",
+			)
+			.expect("plan outer-chain counterexample");
+		let catalog = outer_join_counterexample_catalog();
+		let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+			.await
+			.expect("bind outer-chain counterexample");
+		let results = Executor::new(outer_join_counterexample_storage())
+			.execute_bound(&bound, None)
+			.await
+			.expect("execute outer-chain counterexample");
+
+		assert_eq!(results.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+	}
+
+	#[tokio::test]
 	async fn estimated_broadcast_over_cap_replays_as_hash_and_matches_digest() {
 		let hash_results = run_distributed_join_query(sql_fact_dim_join_plan(), 16).await;
 		let mut query_budget = QueryBudget::test_default();
@@ -1734,6 +1819,95 @@ mod tests {
 		})
 	}
 
+	fn outer_join_counterexample_catalog() -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		for (table_id, id_byte, table, fields) in [
+			(
+				TableId(1),
+				11,
+				"a",
+				vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("k", DataType::Int64, false),
+				],
+			),
+			(
+				TableId(2),
+				12,
+				"b",
+				vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("k", DataType::Int64, false),
+					Field::new("j", DataType::Int64, false),
+					Field::new("x", DataType::Int64, true),
+				],
+			),
+			(
+				TableId(3),
+				13,
+				"c",
+				vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("j", DataType::Int64, false),
+				],
+			),
+		] {
+			catalog
+				.register_descriptor(
+					table_id,
+					named_descriptor(id_byte, table, Schema::new(fields)),
+				)
+				.unwrap();
+		}
+		Arc::new(catalog)
+	}
+
+	fn outer_join_counterexample_storage() -> Arc<MultiTableStorageScan> {
+		let a_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("k", DataType::Int64, false),
+		]));
+		let b_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("k", DataType::Int64, false),
+			Field::new("j", DataType::Int64, false),
+			Field::new("x", DataType::Int64, true),
+		]));
+		let c_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("j", DataType::Int64, false),
+		]));
+		let a = RecordBatch::try_new(
+			a_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1])),
+				Arc::new(Int64Array::from(vec![1])),
+			],
+		)
+		.unwrap();
+		let b = RecordBatch::try_new(
+			b_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![2])),
+				Arc::new(Int64Array::from(vec![1])),
+				Arc::new(Int64Array::from(vec![9])),
+				Arc::new(Int64Array::from(vec![Some(2_i64)])),
+			],
+		)
+		.unwrap();
+		let c = RecordBatch::try_new(
+			c_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![100])),
+				Arc::new(Int64Array::from(vec![9])),
+			],
+		)
+		.unwrap();
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([(TableId(1), a), (TableId(2), b), (TableId(3), c)]),
+		})
+	}
+
 	fn broadcast_join_plan() -> LogicalPlan {
 		LogicalPlan::Join {
 			left: Box::new(LogicalPlan::Exchange {
@@ -2149,6 +2323,13 @@ mod tests {
 				} else {
 					batch.slice(0, 0)
 				};
+			}
+			if let Some(pbc) = request.pbc_predicate {
+				batch = wendelon::schema::pbc::execute(&pbc, &batch).map_err(|error| {
+					StorageError::InvalidPbcProgram {
+						message: format!("{error:?}"),
+					}
+				})?;
 			}
 			Ok(ScanStream::from_batches(
 				batch.schema(),

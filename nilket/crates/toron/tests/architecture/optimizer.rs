@@ -1799,17 +1799,95 @@ pub(crate) fn adr142_141_consumer_unchanged_no_hard_bound_writes() {
 }
 
 #[test]
-pub(crate) fn adr141_no_sql_join_filter_pushdown_in_this_cut() {
+pub(crate) fn adr143_sql_join_filter_pushdown_is_planner_lowering_only() {
+	let manifest_dir = manifest_dir();
 	let planner = planner_source();
 	let lower_select = source_block(&planner, "fn lower_select");
 	let lower_where = source_block(&planner, "fn lower_where");
+	let push = source_block(&planner, "fn push_side_local_join_filters");
+	let collect = source_block(&planner, "fn collect_scope_refs");
+	let matcher = source_block(&planner, "fn join_filter_conjunct_matches");
+	let operator_kind = source_block(&planner, "fn join_operator_kind_for_filter_pushdown");
 
 	assert!(lower_select.contains("for join in &table_with_joins.joins"));
-	assert!(lower_select.contains("plan = self.lower_where(plan, selection)?"));
+	assert!(lower_select.contains("all_inner_join_chain"));
+	assert!(lower_select.contains("join_operator_kind_for_filter_pushdown"));
+	assert!(lower_select.contains("split_top_level_and(selection)"));
+	assert!(lower_select.contains("JoinFilterTarget::Left"));
+	assert!(lower_select.contains("JoinFilterTarget::Right"));
+	assert!(lower_select.contains("combine_and_sql_exprs"));
+	assert!(lower_select.contains("self.lower_where(plan, &selection)?"));
+	assert!(lower_select.contains("self.lower_where(plan, selection)?"));
 	assert!(lower_select.contains("joins around derived tables are not supported"));
 	assert!(lower_where.contains("plan = LogicalPlan::Filter"));
-	assert!(!planner.contains("side_local_join_filter"));
-	assert!(!planner.contains("push_join_filter"));
+	assert!(push.contains("pending.drain(..)"));
+	assert!(push.contains("join_filter_conjunct_matches"));
+	assert!(push.contains("self.lower_expr(conjunct)?"));
+	assert!(push.contains("pushed.push(predicate)"));
+	assert!(push.contains("LogicalPlan::Filter"));
+	assert!(collect.contains("Ok(ColumnScope::Inner) => refs.inner = true"));
+	assert!(matcher.contains("refs.outer && !refs.inner && !refs.unsupported"));
+	assert!(matcher.contains("refs.inner && !refs.outer && !refs.unsupported"));
+	assert!(operator_kind.contains("JoinOperator::Join(_) | JoinOperator::Inner(_)"));
+	assert!(operator_kind.contains("Some(JoinKind::Inner)"));
+	assert!(!planner.contains("side_local_join_filter_predicate"));
+	assert!(!planner.contains("pbc_ineligible_false_expr"));
+
+	let markers = [
+		"JoinFilterTarget",
+		"push_side_local_join_filters",
+		"join_filter_conjunct_matches",
+		"join_operator_kind_for_filter_pushdown",
+		"all_inner_join_chain",
+	];
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(path, _, line)| {
+			path.file_name().and_then(|name| name.to_str()) != Some("sql_planner.rs")
+				&& markers.iter().any(|marker| line.contains(marker))
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR143 SQL join-filter pushdown leaked outside SQL planner source:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr143_behavior_gates_cover_planner_binder_and_runtime() {
+	let planner = planner_source();
+	let binder = binder_source();
+	let lib = lib_source();
+	let multi_table_scan = source_block(&lib, "impl StorageScan for MultiTableStorageScan");
+
+	for gate in [
+		"sql_inner_join_pushes_right_local_conjunct_to_right_input",
+		"sql_inner_join_pushes_leftmost_local_conjunct_to_left_input",
+		"sql_multi_dim_star_pushes_each_filter_to_tightest_input",
+		"sql_cross_side_conjunct_remains_residual",
+		"sql_unqualified_conjunct_remains_residual",
+		"sql_constant_conjunct_remains_residual",
+		"sql_outer_join_chain_disables_filter_pushdown",
+		"sql_filter_pushdown_preserves_broadcast_hint_resolution",
+	] {
+		assert!(planner.contains(gate), "missing ADR143 planner gate {gate}");
+	}
+	for gate in [
+		"sql_equality_filtered_dim_with_wendelon_ndv_infers_broadcast_by_estimate",
+		"sql_inner_join_pushes_leftmost_local_conjunct_to_left_input",
+		"sql_multi_dim_star_each_filtered_dim_broadcasts",
+	] {
+		assert!(binder.contains(gate), "missing ADR143 binder gate {gate}");
+	}
+	for gate in [
+		"sql_filter_pushdown_digest_matches_above_join_filter",
+		"sql_outer_join_chain_filter_stays_above_and_returns_empty_counterexample",
+	] {
+		assert!(lib.contains(gate), "missing ADR143 runtime gate {gate}");
+	}
+	assert!(multi_table_scan.contains("request.pbc_predicate"));
+	assert!(multi_table_scan.contains("wendelon::schema::pbc::execute"));
 }
 
 #[test]
