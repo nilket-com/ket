@@ -45,8 +45,9 @@ use crate::schema::{
 	LogicalTypeListRequestMeta, LogicalTypeListResponseMeta, MsgType, NodeId, PolicyGeneration,
 	ProtocolVersionWindow, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta,
 	TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta, TableDescriptorListRequestMeta,
-	TableDescriptorListResponseMeta, TableObjectId, TableRetentionPolicy, TableSchemaDescriptor,
-	TenantId, TenantKekId, TransferToken, decode_table_schema_descriptor_v1,
+	TableDescriptorListResponseMeta, TableObjectId, TableOptimizerFactsGetRequestMeta,
+	TableOptimizerFactsGetResponseMeta, TableRetentionPolicy, TableSchemaDescriptor, TenantId,
+	TenantKekId, TransferToken, decode_table_schema_descriptor_v1, encode_table_optimizer_facts,
 	encode_table_schema_descriptor_v1, epoch_entry_var_schema,
 };
 #[cfg(test)]
@@ -94,6 +95,15 @@ struct TableDescriptorGetRequest {
 	tenant_id: TenantId,
 	namespace: String,
 	table_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableOptimizerFactsGetRequest {
+	tenant_id: TenantId,
+	namespace: String,
+	table_name: String,
+	schema_generation: u64,
+	physical_descriptor_fingerprint: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -533,6 +543,38 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn build_table_optimizer_facts_get_frame(
+		&self,
+		stream_id: u32,
+		meta: TableOptimizerFactsGetResponseMeta,
+		facts: Option<&[u8]>,
+	) -> std::io::Result<HrftFrame> {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let trailing = facts.map(|bytes| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec().extend_from_slice(bytes);
+			buf
+		});
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0),
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing,
+		})
+	}
+
 	fn build_logical_type_get_frame(
 		&self,
 		stream_id: u32,
@@ -720,6 +762,30 @@ impl WendelonControlServer {
 		)
 	}
 
+	fn table_optimizer_facts_get_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		Self::observe_table_optimizer_facts_get_reason(reason_code);
+		self.build_table_optimizer_facts_get_frame(
+			frame.header.stream_id,
+			TableOptimizerFactsGetResponseMeta {
+				accepted: 0,
+				reason_code,
+				_pad1: [0; 6],
+				leader_hint: leader_hint.unwrap_or(NodeId {
+					id: 0,
+					_reserved: 0,
+				}),
+				facts_len: 0,
+				_pad2: [0; 4],
+			},
+			None,
+		)
+	}
+
 	fn logical_type_get_rejection(
 		&self,
 		frame: &HrftFrame,
@@ -777,6 +843,23 @@ impl WendelonControlServer {
 			CONTROL_REASON_INVALID_CONFIG => {
 				metrics().control_descriptor_get_invalid_request_total.inc()
 			}
+			_ => {}
+		}
+	}
+
+	fn observe_table_optimizer_facts_get_reason(reason_code: u8) {
+		match reason_code {
+			CONTROL_REASON_GRANTED => metrics().control_optimizer_facts_get_success_total.inc(),
+			CONTROL_REASON_NOT_FOUND => metrics().control_optimizer_facts_get_not_found_total.inc(),
+			CONTROL_REASON_NOT_LEADER => {
+				metrics().control_optimizer_facts_get_not_leader_total.inc()
+			}
+			CONTROL_REASON_AUTHORIZATION_FAILED => metrics()
+				.control_optimizer_facts_get_authorization_failed_total
+				.inc(),
+			CONTROL_REASON_INVALID_CONFIG => metrics()
+				.control_optimizer_facts_get_invalid_request_total
+				.inc(),
 			_ => {}
 		}
 	}
@@ -1363,6 +1446,18 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn decode_table_optimizer_facts_get_request(
+		meta: TableOptimizerFactsGetRequestMeta,
+	) -> std::io::Result<TableOptimizerFactsGetRequest> {
+		Ok(TableOptimizerFactsGetRequest {
+			tenant_id: meta.tenant_id,
+			namespace: decode_descriptor_wire_name("namespace", &meta.namespace)?,
+			table_name: decode_descriptor_wire_name("table name", &meta.table_name)?,
+			schema_generation: meta.schema_generation,
+			physical_descriptor_fingerprint: meta.physical_descriptor_fingerprint,
+		})
+	}
+
 	fn decode_logical_type_get_request(
 		meta: LogicalTypeGetRequestMeta,
 	) -> std::io::Result<LogicalTypeGetRequest> {
@@ -1540,6 +1635,138 @@ impl WendelonControlServer {
 				_pad2: [0; 4],
 			},
 			Some(&descriptors_bytes),
+		)
+	}
+
+	async fn handle_table_optimizer_facts_get(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		metrics().control_optimizer_facts_get_requests_total.inc();
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return self.table_optimizer_facts_get_rejection(
+				&frame,
+				CONTROL_REASON_INVALID_CONFIG,
+				None,
+			);
+		}
+
+		let raw_meta: TableOptimizerFactsGetRequestMeta =
+			if frame.meta.len() == std::mem::size_of::<TableOptimizerFactsGetRequestMeta>() {
+				*bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<TableOptimizerFactsGetRequestMeta>()],
+				)
+			} else {
+				return self.table_optimizer_facts_get_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					None,
+				);
+			};
+		if Self::authorize_descriptor_get_actor(&context.actor, raw_meta.tenant_id).is_err() {
+			return self.table_optimizer_facts_get_rejection(
+				&frame,
+				CONTROL_REASON_AUTHORIZATION_FAILED,
+				None,
+			);
+		}
+
+		let request = match Self::decode_table_optimizer_facts_get_request(raw_meta) {
+			Ok(request) => request,
+			Err(_) => {
+				return self.table_optimizer_facts_get_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					None,
+				);
+			}
+		};
+		if !self.is_leader().await {
+			return self.table_optimizer_facts_get_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+
+		let snapshot = self.state_machine.state_snapshot().await;
+		let Some(descriptor) = snapshot.table_schemas.latest_by_name(
+			request.tenant_id,
+			request.namespace.as_str(),
+			request.table_name.as_str(),
+		) else {
+			return self.table_optimizer_facts_get_rejection(
+				&frame,
+				CONTROL_REASON_NOT_FOUND,
+				None,
+			);
+		};
+		if descriptor.schema_generation != request.schema_generation
+			|| descriptor.physical_descriptor_fingerprint.as_bytes()
+				!= &request.physical_descriptor_fingerprint
+		{
+			Self::observe_table_optimizer_facts_get_reason(CONTROL_REASON_GRANTED);
+			return self.build_table_optimizer_facts_get_frame(
+				frame.header.stream_id,
+				TableOptimizerFactsGetResponseMeta {
+					accepted: 1,
+					reason_code: CONTROL_REASON_GRANTED,
+					_pad1: [0; 6],
+					leader_hint: self.local_node,
+					facts_len: 0,
+					_pad2: [0; 4],
+				},
+				None,
+			);
+		}
+		let Some(storage_manager) = self.storage_manager.as_ref() else {
+			Self::observe_table_optimizer_facts_get_reason(CONTROL_REASON_GRANTED);
+			return self.build_table_optimizer_facts_get_frame(
+				frame.header.stream_id,
+				TableOptimizerFactsGetResponseMeta {
+					accepted: 1,
+					reason_code: CONTROL_REASON_GRANTED,
+					_pad1: [0; 6],
+					leader_hint: self.local_node,
+					facts_len: 0,
+					_pad2: [0; 4],
+				},
+				None,
+			);
+		};
+		let facts = storage_manager
+			.table_optimizer_facts(request.tenant_id, descriptor)
+			.await?;
+		let facts_bytes = facts
+			.as_ref()
+			.map(encode_table_optimizer_facts)
+			.transpose()?;
+		let facts_len = facts_bytes
+			.as_ref()
+			.map(|bytes| u32::try_from(bytes.len()))
+			.transpose()
+			.map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"encoded optimizer facts exceed u32 wire length",
+				)
+			})?
+			.unwrap_or(0);
+		Self::observe_table_optimizer_facts_get_reason(CONTROL_REASON_GRANTED);
+		self.build_table_optimizer_facts_get_frame(
+			frame.header.stream_id,
+			TableOptimizerFactsGetResponseMeta {
+				accepted: 1,
+				reason_code: CONTROL_REASON_GRANTED,
+				_pad1: [0; 6],
+				leader_hint: self.local_node,
+				facts_len,
+				_pad2: [0; 4],
+			},
+			facts_bytes.as_deref(),
 		)
 	}
 
@@ -3572,6 +3799,10 @@ impl ControlRingServer for WendelonControlServer {
 			MsgType::TABLE_DESCRIPTOR_LIST_REQ => {
 				self.handle_table_descriptor_list(&context, frame).await?
 			}
+			MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ => {
+				self.handle_table_optimizer_facts_get(&context, frame)
+					.await?
+			}
 			MsgType::LOGICAL_TYPE_GET_REQ => self.handle_logical_type_get(&context, frame).await?,
 			MsgType::LOGICAL_TYPE_LIST_REQ => {
 				self.handle_logical_type_list(&context, frame).await?
@@ -4381,6 +4612,39 @@ mod tests {
 		for line in rendered
 			.lines()
 			.filter(|line| line.contains("wendelon_control_descriptor_get"))
+		{
+			assert!(!line.contains('{'));
+		}
+	}
+
+	#[test]
+	fn optimizer_facts_get_metrics_count_aggregate_outcomes() {
+		let registry = crate::metrics::MetricsRegistry::default();
+		registry.control_optimizer_facts_get_requests_total.inc();
+		registry.control_optimizer_facts_get_success_total.inc();
+		registry.control_optimizer_facts_get_not_found_total.inc();
+		registry.control_optimizer_facts_get_not_leader_total.inc();
+		registry
+			.control_optimizer_facts_get_authorization_failed_total
+			.inc();
+		registry
+			.control_optimizer_facts_get_invalid_request_total
+			.inc();
+
+		let rendered = registry.render_prometheus();
+		for metric in [
+			"wendelon_control_optimizer_facts_get_requests_total 1",
+			"wendelon_control_optimizer_facts_get_success_total 1",
+			"wendelon_control_optimizer_facts_get_not_found_total 1",
+			"wendelon_control_optimizer_facts_get_not_leader_total 1",
+			"wendelon_control_optimizer_facts_get_authorization_failed_total 1",
+			"wendelon_control_optimizer_facts_get_invalid_request_total 1",
+		] {
+			assert!(rendered.contains(metric), "missing metric sample {metric}");
+		}
+		for line in rendered
+			.lines()
+			.filter(|line| line.contains("wendelon_control_optimizer_facts_get"))
 		{
 			assert!(!line.contains('{'));
 		}

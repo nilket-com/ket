@@ -40,10 +40,10 @@ broadcast"; the direction is reversed. The rule is unchanged; the rationale is h
 **D1 — Wendelon owns the producer fact type (no Toron import).** A Wendelon-owned,
 descriptor-adjacent payload:
 ```rust
-TableOptimizerFactsV1 { table_object_id, schema_generation, physical_descriptor_fingerprint,
-                        producer_epoch, column_ndv: Vec<ColumnNdvFactV1> }
-ColumnNdvFactV1 { column_ordinal: u16, distinct: NdvFactV1 }
-NdvFactV1 = Exact { count: u64 } | Approx { estimate: u64, rel_err_ppm: u32 }
+TableOptimizerFacts { table_object_id, schema_generation, physical_descriptor_fingerprint,
+                        producer_epoch, column_ndv: Vec<ColumnNdvFact> }
+ColumnNdvFact { column_ordinal: u16, distinct: NdvFact }
+NdvFact = Exact { count: u64 } | Approx { estimate: u64, rel_err_ppm: u32 }
 ```
 Wendelon does not import Toron optimizer types; **Toron maps** this into
 `DescriptorOptimizerFacts.column_ndv` and lets `for_descriptor` perform the final identity gate.

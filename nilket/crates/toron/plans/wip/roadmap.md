@@ -53,8 +53,8 @@ makes the built-but-dark 129→141 CBO consumer live for covered opt-in tables. 
 but live descriptor sync emitted no facts (`column_ndv: Vec::new()`); 142 has **Wendelon produce**
 table-level per-column NDV from its already-maintained **opt-in HLL/small-set** stats and **Toron
 fetch** it during descriptor sync into `DescriptorOptimizerFacts.column_ndv`. **Wendelon-owned fact
-type** (`TableOptimizerFactsV1 { …identity…, column_ndv: Vec<ColumnNdvFactV1> }`,
-`NdvFactV1 = Exact{count} | Approx{estimate, rel_err_ppm}`; no Toron import — Toron maps it). **A
+type** (`TableOptimizerFacts { …identity…, column_ndv: Vec<ColumnNdvFact> }`,
+`NdvFact = Exact{count} | Approx{estimate, rel_err_ppm}`; no Toron import — Toron maps it). **A
 separate, fail-open facts RPC** (`TABLE_OPTIMIZER_FACTS_GET` ~`0x46/0x47`, *not* folded into
 descriptor get/list, which stay length-checked descriptor-only): fetch failure / unsupported / stale
 identity / no coverage all degrade to descriptor-only sync — the endpoint is **advisory, never a

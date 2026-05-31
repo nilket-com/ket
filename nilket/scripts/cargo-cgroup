@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+	cat >&2 <<'EOF'
+Usage: scripts/cargo-cgroup <cargo-subcommand> [cargo-args...]
+
+Runs cargo inside a constrained user cgroup scope, with CPU affinity,
+low IO priority, one cargo build job, and one Rust test thread by default.
+
+Environment overrides:
+  CARGO_CGROUP_BACKEND=auto        # auto, systemd, nerdctl, affinity
+  CARGO_CGROUP_CPUS=0-1
+  CARGO_CGROUP_CPU_QUOTA=150%
+  CARGO_CGROUP_CONTAINER_CPUS=1.5
+  CARGO_CGROUP_MEMORY_HIGH=8G
+  CARGO_CGROUP_MEMORY_MAX=12G
+  CARGO_CGROUP_TASKS_MAX=256
+  CARGO_CGROUP_IO_WEIGHT=10
+  CARGO_CGROUP_NICE=19
+  CARGO_CGROUP_JOBS=1
+  CARGO_CGROUP_RUST_TEST_THREADS=1
+  CARGO_CGROUP_IMAGE=rust:1
+  CARGO_CGROUP_ALLOW_AFFINITY_ONLY=0
+
+Examples:
+  scripts/cargo-cgroup test -p toron --test architecture_test -- adr142
+  scripts/cargo-cgroup check -p wendelon --all-targets
+
+Containerd backend:
+  CARGO_CGROUP_BACKEND=nerdctl scripts/cargo-cgroup test -p toron
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+if [[ $# -eq 0 ]]; then
+	usage
+	exit 64
+fi
+
+backend="${CARGO_CGROUP_BACKEND:-auto}"
+cpus="${CARGO_CGROUP_CPUS:-0-1}"
+cpu_quota="${CARGO_CGROUP_CPU_QUOTA:-150%}"
+container_cpus="${CARGO_CGROUP_CONTAINER_CPUS:-1.5}"
+memory_high="${CARGO_CGROUP_MEMORY_HIGH:-8G}"
+memory_max="${CARGO_CGROUP_MEMORY_MAX:-12G}"
+tasks_max="${CARGO_CGROUP_TASKS_MAX:-256}"
+io_weight="${CARGO_CGROUP_IO_WEIGHT:-10}"
+nice_level="${CARGO_CGROUP_NICE:-19}"
+jobs="${CARGO_CGROUP_JOBS:-1}"
+test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1}"
+progress="${CARGO_TERM_PROGRESS_WHEN:-never}"
+image="${CARGO_CGROUP_IMAGE:-rust:1}"
+allow_affinity_only="${CARGO_CGROUP_ALLOW_AFFINITY_ONLY:-0}"
+
+wrapped_cmd=(
+	taskset -c "${cpus}"
+	ionice -c 3
+	env
+	"CARGO_BUILD_JOBS=${jobs}"
+	"RUST_TEST_THREADS=${test_threads}"
+	"CARGO_TERM_PROGRESS_WHEN=${progress}"
+	cargo
+	"$@"
+)
+
+systemd_available() {
+	command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
+nerdctl_available() {
+	command -v nerdctl >/dev/null 2>&1 && nerdctl info >/dev/null 2>&1
+}
+
+run_systemd() {
+	exec systemd-run --user --scope --same-dir --wait --collect --quiet \
+		--nice="${nice_level}" \
+		--property="CPUQuota=${cpu_quota}" \
+		--property="MemoryHigh=${memory_high}" \
+		--property="MemoryMax=${memory_max}" \
+		--property="TasksMax=${tasks_max}" \
+		--property="IOWeight=${io_weight}" \
+		"${wrapped_cmd[@]}"
+}
+
+run_nerdctl() {
+	repo_dir="$(pwd -P)"
+	cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+
+	exec nerdctl run --rm \
+		--cpus="${container_cpus}" \
+		--cpuset-cpus="${cpus}" \
+		--memory="${memory_max}" \
+		--memory-reservation="${memory_high}" \
+		--pids-limit="${tasks_max}" \
+		--workdir /work \
+		--user "$(id -u):$(id -g)" \
+		--env HOME=/tmp \
+		--env CARGO_HOME=/cargo-home \
+		--env "CARGO_BUILD_JOBS=${jobs}" \
+		--env "RUST_TEST_THREADS=${test_threads}" \
+		--env "CARGO_TERM_PROGRESS_WHEN=${progress}" \
+		--volume "${repo_dir}:/work" \
+		--volume "${cargo_home}:/cargo-home" \
+		"${image}" \
+		cargo "$@"
+}
+
+run_affinity_only() {
+	if [[ "${allow_affinity_only}" != "1" && "${backend}" != "affinity" ]]; then
+		cat >&2 <<'EOF'
+cargo-cgroup: no cgroup backend is available.
+
+Set CARGO_CGROUP_BACKEND=systemd when the user systemd bus is available,
+or CARGO_CGROUP_BACKEND=nerdctl when containerd is reachable.
+
+To deliberately run without cgroup memory/task limits, set:
+  CARGO_CGROUP_ALLOW_AFFINITY_ONLY=1
+EOF
+		exit 70
+	fi
+
+	echo "cargo-cgroup: using taskset/ionice/nice without cgroup memory/task limits" >&2
+	exec nice -n "${nice_level}" "${wrapped_cmd[@]}"
+}
+
+case "${backend}" in
+	auto)
+		if systemd_available; then
+			run_systemd
+		elif nerdctl_available; then
+			run_nerdctl "$@"
+		else
+			run_affinity_only
+		fi
+		;;
+	systemd)
+		if ! systemd_available; then
+			echo "cargo-cgroup: systemd user scope is unavailable" >&2
+			exit 70
+		fi
+		run_systemd
+		;;
+	nerdctl | containerd)
+		if ! nerdctl_available; then
+			echo "cargo-cgroup: nerdctl/containerd is unavailable" >&2
+			exit 70
+		fi
+		run_nerdctl "$@"
+		;;
+	affinity)
+		run_affinity_only
+		;;
+	*)
+		echo "cargo-cgroup: unknown backend '${backend}'" >&2
+		exit 64
+		;;
+esac

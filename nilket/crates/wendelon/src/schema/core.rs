@@ -470,6 +470,27 @@ pub struct TableDescriptorListResponseMeta {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
+pub struct TableOptimizerFactsGetRequestMeta {
+	pub tenant_id: TenantId,
+	pub namespace: [u8; 128],
+	pub table_name: [u8; 128],
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct TableOptimizerFactsGetResponseMeta {
+	pub accepted: u8,
+	pub reason_code: u8,
+	pub _pad1: [u8; 6],
+	pub leader_hint: NodeId,
+	pub facts_len: u32,
+	pub _pad2: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
 pub struct LogicalTypeGetRequestMeta {
 	pub tenant_id: TenantId,
 	pub name: [u8; 128],
@@ -693,6 +714,8 @@ impl MsgType {
 	pub const LOGICAL_TYPE_LIST_RESP: Self = Self(0x43);
 	pub const TABLE_DESCRIPTOR_LIST_REQ: Self = Self(0x44);
 	pub const TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45);
+	pub const TABLE_OPTIMIZER_FACTS_GET_REQ: Self = Self(0x46);
+	pub const TABLE_OPTIMIZER_FACTS_GET_RESP: Self = Self(0x47);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -1575,6 +1598,8 @@ const _: () = assert!(std::mem::size_of::<TableDescriptorGetRequestMeta>() == 26
 const _: () = assert!(std::mem::size_of::<TableDescriptorGetResponseMeta>() == 24);
 const _: () = assert!(std::mem::size_of::<TableDescriptorListRequestMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<TableDescriptorListResponseMeta>() == 24);
+const _: () = assert!(std::mem::size_of::<TableOptimizerFactsGetRequestMeta>() == 304);
+const _: () = assert!(std::mem::size_of::<TableOptimizerFactsGetResponseMeta>() == 24);
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 24);
 const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 120);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
@@ -1607,6 +1632,7 @@ mod tests {
 		LogicalTypeListResponseMeta, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta,
 		ReadStatus, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
 		TableDescriptorListRequestMeta, TableDescriptorListResponseMeta,
+		TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
 	};
 
 	#[test]
@@ -1670,6 +1696,8 @@ mod tests {
 		assert_eq!(MsgType::TABLE_DESCRIPTOR_GET_RESP.0, 0x3D);
 		assert_eq!(MsgType::TABLE_DESCRIPTOR_LIST_REQ.0, 0x44);
 		assert_eq!(MsgType::TABLE_DESCRIPTOR_LIST_RESP.0, 0x45);
+		assert_eq!(MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ.0, 0x46);
+		assert_eq!(MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP.0, 0x47);
 
 		assert_eq!(std::mem::size_of::<TableDescriptorGetRequestMeta>(), 264);
 		assert_eq!(
@@ -1724,6 +1752,55 @@ mod tests {
 		);
 		assert_eq!(
 			std::mem::offset_of!(TableDescriptorListResponseMeta, descriptors_len),
+			16
+		);
+
+		assert_eq!(
+			std::mem::size_of::<TableOptimizerFactsGetRequestMeta>(),
+			304
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableOptimizerFactsGetRequestMeta, tenant_id),
+			0
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableOptimizerFactsGetRequestMeta, namespace),
+			8
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableOptimizerFactsGetRequestMeta, table_name),
+			136
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableOptimizerFactsGetRequestMeta, schema_generation),
+			264
+		);
+		assert_eq!(
+			std::mem::offset_of!(
+				TableOptimizerFactsGetRequestMeta,
+				physical_descriptor_fingerprint
+			),
+			272
+		);
+
+		assert_eq!(
+			std::mem::size_of::<TableOptimizerFactsGetResponseMeta>(),
+			24
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableOptimizerFactsGetResponseMeta, accepted),
+			0
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableOptimizerFactsGetResponseMeta, reason_code),
+			1
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableOptimizerFactsGetResponseMeta, leader_hint),
+			8
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableOptimizerFactsGetResponseMeta, facts_len),
 			16
 		);
 	}

@@ -1958,15 +1958,28 @@ fn test_adr051_descriptor_fingerprint_split_boundaries() {
 	}
 
 	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
-	if !manager_source.contains("logical_schema_fingerprint: LogicalSchemaFingerprint")
-		|| !manager_source.contains("descriptor.logical_schema_fingerprint")
+	let tiered_stats_cache_key_block = manager_source
+		.split_once("struct TieredStatsCacheKey {")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.unwrap_or("");
+	let tiered_stats_cache_key_builder = manager_source
+		.split_once("fn tiered_stats_cache_key(")
+		.and_then(|(_, rest)| rest.split_once("\n#[derive(Clone, Debug, Default, PartialEq, Eq)]"))
+		.map(|(block, _)| block)
+		.unwrap_or("");
+	let tiered_stats_cache_key_surface =
+		format!("{tiered_stats_cache_key_block}\n{tiered_stats_cache_key_builder}");
+	if !tiered_stats_cache_key_surface
+		.contains("logical_schema_fingerprint: LogicalSchemaFingerprint")
+		|| !tiered_stats_cache_key_surface.contains("descriptor.logical_schema_fingerprint")
 	{
 		violations.push(
 			"src/storage/manager.rs: tiered stats cache key must bind logical fingerprint"
 				.to_string(),
 		);
 	}
-	if manager_source.contains("physical_descriptor_fingerprint") {
+	if tiered_stats_cache_key_surface.contains("physical_descriptor_fingerprint") {
 		violations.push(
 			"src/storage/manager.rs: tiered stats cache key must not bind physical fingerprint"
 				.to_string(),

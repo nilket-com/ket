@@ -771,8 +771,8 @@ pub(crate) fn adr136_no_wendelon_producer_in_toron() {
 	let manifest_dir = manifest_dir();
 	let markers = [
 		"DescriptorOptimizerFacts",
-		"optimizer_facts",
 		"materialized_byte_upper_bound",
+		"row_upper_bound",
 	];
 	let offenders = source_lines(&wendelon_manifest_dir().join("src"))
 		.into_iter()
@@ -1654,16 +1654,148 @@ pub(crate) fn adr141_scan_ndv_is_bind_time_only_not_executed() {
 }
 
 #[test]
-pub(crate) fn adr141_no_wendelon_producer_in_toron() {
-	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
-		.into_iter()
-		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
-		.collect::<Vec<_>>()
-		.join("\n");
+pub(crate) fn adr141_wendelon_producer_is_142_owned_and_toron_types_do_not_leak() {
+	let facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
 
-	assert!(!wendelon_source.contains("DistinctCountFact"));
-	assert!(!wendelon_source.contains("DescriptorColumnNdvFact"));
-	assert!(!wendelon_source.contains("column_ndv"));
+	assert!(facts.contains("pub struct TableOptimizerFacts"));
+	assert!(facts.contains("pub struct ColumnNdvFact"));
+	assert!(facts.contains("pub enum NdvFact"));
+	assert!(
+		!facts.contains("V1"),
+		"new Wendelon optimizer fact types must follow no-version-suffixes.md"
+	);
+	assert!(!facts.contains("DistinctCountFact"));
+	assert!(!facts.contains("DescriptorColumnNdvFact"));
+	assert!(!facts.contains("DescriptorOptimizerFacts"));
+}
+
+#[test]
+pub(crate) fn adr142_wendelon_optimizer_facts_have_no_toron_dependency() {
+	let manifest = std::fs::read_to_string(wendelon_manifest_dir().join("Cargo.toml"))
+		.expect("read Wendelon manifest");
+	let facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
+
+	assert!(!manifest.contains("toron"));
+	assert!(!facts.contains("toron"));
+	assert!(facts.contains("rel_err_ppm: u32"));
+	assert!(!facts.contains("f64"));
+}
+
+#[test]
+pub(crate) fn adr142_table_schema_descriptor_not_mutated_for_optimizer_facts() {
+	let table = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema");
+	let descriptor = source_block(&table, "pub struct TableSchemaDescriptor");
+
+	assert!(!descriptor.contains("TableOptimizerFacts"));
+	assert!(!descriptor.contains("column_ndv"));
+	assert!(!descriptor.contains("NdvFact"));
+}
+
+#[test]
+pub(crate) fn adr142_descriptor_get_list_wire_contracts_unchanged_and_facts_are_separate() {
+	let core = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/core.rs"))
+		.expect("read Wendelon schema core");
+	let client = std::fs::read_to_string(wendelon_manifest_dir().join("src/client/core.rs"))
+		.expect("read Wendelon client");
+
+	assert!(core.contains("TABLE_DESCRIPTOR_GET_REQ: Self = Self(0x3C)"));
+	assert!(core.contains("TABLE_DESCRIPTOR_GET_RESP: Self = Self(0x3D)"));
+	assert!(core.contains("TABLE_DESCRIPTOR_LIST_REQ: Self = Self(0x44)"));
+	assert!(core.contains("TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45)"));
+	assert!(core.contains("TABLE_OPTIMIZER_FACTS_GET_REQ: Self = Self(0x46)"));
+	assert!(core.contains("TABLE_OPTIMIZER_FACTS_GET_RESP: Self = Self(0x47)"));
+	assert!(client.contains("TABLE_DESCRIPTOR_GET_RESP descriptor_len mismatch"));
+	assert!(client.contains("TABLE_DESCRIPTOR_LIST_RESP descriptors_len mismatch"));
+	assert!(client.contains("TABLE_OPTIMIZER_FACTS_GET_RESP facts_len mismatch"));
+
+	let facts_get = source_block(&client, "pub async fn get_table_optimizer_facts");
+	assert!(
+		!facts_get.contains("Wendelon"),
+		"new optimizer-facts protocol errors must follow no-project-name-in-protocols.md"
+	);
+}
+
+#[test]
+pub(crate) fn adr142_default_stats_policy_stays_empty() {
+	let table = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema");
+
+	assert!(
+		table.contains("#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]")
+	);
+	assert!(table.contains("stats_policy: ColumnStatsPolicyV1::default()"));
+}
+
+#[test]
+pub(crate) fn adr142_ndv_requires_full_contributor_coverage() {
+	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
+		.expect("read Wendelon slab manager");
+	let facts = source_block(&manager, "pub async fn table_optimizer_facts");
+	let local = source_block(&manager, "async fn has_uncovered_local_rows_for_descriptor");
+	let tiered = source_block(&manager, "async fn load_tiered_optimizer_stats_contributor");
+
+	assert!(facts.contains("has_uncovered_local_rows_for_descriptor"));
+	assert!(facts.contains("return Ok(None)"));
+	assert!(facts.contains("load_tiered_optimizer_stats_contributor"));
+	assert!(local.contains("secondary_index_table_ids_from_plaintext"));
+	assert!(tiered.contains("TieredStatsContributor::OtherTable"));
+}
+
+#[test]
+pub(crate) fn adr142_hll_merge_uses_registers_not_estimate_scalars() {
+	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
+		.expect("read Wendelon slab manager");
+	let helper = source_block(&manager, "fn ndv_fact_for_column");
+
+	assert!(helper.contains("HllRegisters::from_registers"));
+	assert!(helper.contains("merged.precision() == registers.precision()"));
+	assert!(helper.contains("merged.merge(&registers)"));
+	assert!(helper.contains("hll_complete = false"));
+	assert!(helper.contains("merged_hll.estimate()"));
+	assert!(!helper.contains("distinct_count_for_column_ordinal"));
+}
+
+#[test]
+pub(crate) fn adr142_fact_fetch_is_fail_open_and_no_toron_stats_cache() {
+	let catalog = catalog_source();
+	let sync = source_block(&catalog, "async fn resolve_table_sync_owner");
+
+	assert!(sync.contains("get_table_optimizer_facts"));
+	assert!(sync.contains(".ok()\n\t\t\t\t\t.flatten()"));
+	assert!(sync.contains("sync_descriptor_for_tenant_with_facts"));
+	assert!(catalog.contains("facts_fetch_failure_syncs_descriptor_without_facts"));
+	assert!(!catalog.contains("wendelon_stats_cache"));
+	assert!(!catalog.contains("background stats scanner"));
+}
+
+#[test]
+pub(crate) fn adr142_141_consumer_unchanged_no_hard_bound_writes() {
+	let catalog = catalog_source();
+	let mapper = source_block(&catalog, "fn descriptor_optimizer_facts_from_storage");
+	let binder = binder_source();
+
+	assert!(mapper.contains("facts.schema_generation != descriptor.schema_generation"));
+	assert!(mapper.contains("facts.physical_descriptor_fingerprint"));
+	assert!(mapper.contains("materialized_byte_upper_bound: None"));
+	assert!(mapper.contains("row_upper_bound: None"));
+	assert!(mapper.contains("column_ndv"));
+	assert!(catalog.contains("produced_ndv_never_writes_hard_bound"));
+	assert!(binder.contains("fn filter_equality_ndv_estimated_row_count"));
+	assert!(binder.contains("fn estimated_rows_for_ndv"));
+	assert!(binder.contains("rune_equality_filtered_dim_broadcasts_over_wendelon_ndv_no_seed"));
 }
 
 #[test]

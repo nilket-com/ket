@@ -24,8 +24,9 @@ use wendelon::schema::{
 	TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
 };
 use wendelon_client::{
-	Client, ClientError, DropOperationId, LogicalTypeDefinition, SchemaGeneration,
-	SchemaUpdateReceipt, TableSchemaUpdateRequest,
+	Client, ClientError, DropOperationId, LogicalTypeDefinition, NdvFact as StorageNdvFact,
+	SchemaGeneration, SchemaUpdateReceipt, TableOptimizerFacts as StorageTableOptimizerFacts,
+	TableSchemaUpdateRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -140,6 +141,45 @@ impl DescriptorOptimizerFacts {
 	}
 }
 
+fn descriptor_optimizer_facts_from_storage(
+	facts: StorageTableOptimizerFacts,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> Option<DescriptorOptimizerFacts> {
+	if facts.table_object_id != descriptor.table_object_id {
+		return None;
+	}
+	if facts.schema_generation != descriptor.schema_generation
+		|| facts.physical_descriptor_fingerprint != descriptor.physical_descriptor_fingerprint
+	{
+		return None;
+	}
+	let column_ndv = facts
+		.column_ndv
+		.into_iter()
+		.map(|fact| DescriptorColumnNdvFact {
+			column_ordinal: ColumnOrdinal(u32::from(fact.column_ordinal)),
+			distinct_count: match fact.distinct {
+				StorageNdvFact::Exact { count } => DistinctCountFact::Exact(count),
+				StorageNdvFact::Approx {
+					estimate,
+					rel_err_ppm,
+				} => DistinctCountFact::Approx {
+					estimate,
+					rel_err_ppm,
+				},
+			},
+		})
+		.collect();
+	Some(DescriptorOptimizerFacts {
+		schema_generation: facts.schema_generation,
+		physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+		manifest_epoch: facts.producer_epoch,
+		materialized_byte_upper_bound: None,
+		row_upper_bound: None,
+		column_ndv,
+	})
+}
+
 fn descriptor_column_ndv(
 	column_ndv: Vec<DescriptorColumnNdvFact>,
 	descriptor: &wendelon_client::TableSchemaDescriptor,
@@ -148,6 +188,7 @@ fn descriptor_column_ndv(
 		.arrow_schema()
 		.map(|schema| schema.fields().len())
 		.unwrap_or(0);
+	// Wendelon emits at most one fact per ordinal; BTreeMap keeps duplicate input deterministic.
 	column_ndv
 		.into_iter()
 		.filter(|fact| (fact.column_ordinal.0 as usize) < column_count)
@@ -426,6 +467,14 @@ trait DescriptorSyncClient: Send + Sync {
 		table_name: &str,
 	) -> Result<Option<wendelon_client::TableSchemaDescriptor>, ClientError>;
 
+	async fn get_table_optimizer_facts(
+		&self,
+		tenant_id: WendelonTenantId,
+		namespace: &str,
+		table_name: &str,
+		descriptor: &wendelon_client::TableSchemaDescriptor,
+	) -> Result<Option<wendelon_client::TableOptimizerFacts>, ClientError>;
+
 	async fn list_table_schema_descriptors(
 		&self,
 		tenant_id: WendelonTenantId,
@@ -448,6 +497,16 @@ impl DescriptorSyncClient for Client {
 		table_name: &str,
 	) -> Result<Option<wendelon_client::TableSchemaDescriptor>, ClientError> {
 		Client::get_table_schema_descriptor(self, tenant_id, namespace, table_name).await
+	}
+
+	async fn get_table_optimizer_facts(
+		&self,
+		tenant_id: WendelonTenantId,
+		namespace: &str,
+		table_name: &str,
+		descriptor: &wendelon_client::TableSchemaDescriptor,
+	) -> Result<Option<wendelon_client::TableOptimizerFacts>, ClientError> {
+		Client::get_table_optimizer_facts(self, tenant_id, namespace, table_name, descriptor).await
 	}
 
 	async fn list_table_schema_descriptors(
@@ -2023,10 +2082,27 @@ impl WendelonCatalog {
 		};
 
 		let result = match descriptor_result {
-			Ok(Some(descriptor)) => self
-				.registry
-				.sync_descriptor_for_tenant(self.tenant_id, &table_ref, descriptor)
-				.map_err(|error| descriptor_sync_admin_failed(&table_ref, error)),
+			Ok(Some(descriptor)) => {
+				let optimizer_facts = client
+					.get_table_optimizer_facts(
+						wendelon_tenant,
+						&key.namespace,
+						&key.table_name,
+						&descriptor,
+					)
+					.await
+					.ok()
+					.flatten()
+					.and_then(|facts| descriptor_optimizer_facts_from_storage(facts, &descriptor));
+				self.registry
+					.sync_descriptor_for_tenant_with_facts(
+						self.tenant_id,
+						&table_ref,
+						descriptor,
+						optimizer_facts,
+					)
+					.map_err(|error| descriptor_sync_admin_failed(&table_ref, error))
+			}
 			Ok(None) => Err(CatalogError::TableNotFound {
 				table: table_name(&table_ref),
 			}),
@@ -2594,6 +2670,7 @@ mod tests {
 	struct FakeDescriptorSyncClient {
 		responses: tokio::sync::Mutex<VecDeque<Result<Option<TableSchemaDescriptor>, ClientError>>>,
 		list_responses: Mutex<VecDeque<Result<Vec<TableSchemaDescriptor>, ClientError>>>,
+		facts_responses: Mutex<VecDeque<Result<Option<StorageTableOptimizerFacts>, ClientError>>>,
 		requests: tokio::sync::Mutex<Vec<(WendelonTenantId, String, String)>>,
 		logical_type_definitions: Vec<LogicalTypeDefinition>,
 		calls: AtomicU64,
@@ -2611,6 +2688,7 @@ mod tests {
 			Self {
 				responses: tokio::sync::Mutex::new(responses.into_iter().collect()),
 				list_responses: Mutex::new(VecDeque::new()),
+				facts_responses: Mutex::new(VecDeque::new()),
 				requests: tokio::sync::Mutex::new(Vec::new()),
 				logical_type_definitions: Vec::new(),
 				calls: AtomicU64::new(0),
@@ -2627,6 +2705,17 @@ mod tests {
 			definitions: impl IntoIterator<Item = LogicalTypeDefinition>,
 		) -> Self {
 			self.logical_type_definitions = definitions.into_iter().collect();
+			self
+		}
+
+		fn with_optimizer_facts(
+			self,
+			responses: impl IntoIterator<Item = Result<Option<StorageTableOptimizerFacts>, ClientError>>,
+		) -> Self {
+			*self
+				.facts_responses
+				.lock()
+				.expect("fake facts response lock poisoned") = responses.into_iter().collect();
 			self
 		}
 
@@ -2707,6 +2796,20 @@ mod tests {
 				.await
 				.pop_front()
 				.expect("fake descriptor response")
+		}
+
+		async fn get_table_optimizer_facts(
+			&self,
+			_tenant_id: WendelonTenantId,
+			_namespace: &str,
+			_table_name: &str,
+			_descriptor: &TableSchemaDescriptor,
+		) -> Result<Option<StorageTableOptimizerFacts>, ClientError> {
+			self.facts_responses
+				.lock()
+				.expect("fake facts response lock poisoned")
+				.pop_front()
+				.unwrap_or(Ok(None))
 		}
 
 		async fn list_table_schema_descriptors(
@@ -2963,6 +3066,140 @@ mod tests {
 			descriptor.physical_descriptor_fingerprint
 		);
 		assert_eq!(catalog.descriptor_sync_metrics().snapshot().success, 1);
+	}
+
+	#[tokio::test]
+	async fn resolve_table_bind_miss_maps_storage_optimizer_facts() {
+		let descriptor = descriptor();
+		let facts = StorageTableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 17,
+			column_ndv: vec![wendelon_client::ColumnNdvFact {
+				column_ordinal: 1,
+				distinct: StorageNdvFact::Approx {
+					estimate: 100,
+					rel_err_ppm: 26_000,
+				},
+			}],
+		};
+		let client = Arc::new(
+			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
+				.with_optimizer_facts([Ok(Some(facts))]),
+		);
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor");
+
+		assert_eq!(
+			resolved.optimizer_facts.column_ndv.get(&ColumnOrdinal(1)),
+			Some(&DistinctCountFact::Approx {
+				estimate: 100,
+				rel_err_ppm: 26_000,
+			})
+		);
+		assert_eq!(resolved.optimizer_facts.row_upper_bound, None);
+		assert_eq!(resolved.optimizer_facts.byte_upper_bound, None);
+	}
+
+	#[test]
+	fn produced_ndv_never_writes_hard_bound() {
+		let descriptor = descriptor();
+		let facts = descriptor_optimizer_facts_from_storage(
+			StorageTableOptimizerFacts {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+				producer_epoch: 17,
+				column_ndv: vec![wendelon_client::ColumnNdvFact {
+					column_ordinal: 1,
+					distinct: StorageNdvFact::Exact { count: 4 },
+				}],
+			},
+			&descriptor,
+		)
+		.expect("storage facts map");
+
+		assert_eq!(facts.materialized_byte_upper_bound, None);
+		assert_eq!(facts.row_upper_bound, None);
+		let table_facts = facts.for_descriptor(&descriptor);
+		assert_eq!(table_facts.byte_upper_bound, None);
+		assert_eq!(table_facts.row_upper_bound, None);
+		assert_eq!(
+			table_facts.column_ndv.get(&ColumnOrdinal(1)),
+			Some(&DistinctCountFact::Exact(4))
+		);
+	}
+
+	#[test]
+	fn descriptor_identity_mismatch_drops_fact() {
+		let descriptor = descriptor();
+		let stale_descriptor = descriptor_with_identity(0xCB, descriptor.schema_generation);
+		let facts = StorageTableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation + 1,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 17,
+			column_ndv: vec![wendelon_client::ColumnNdvFact {
+				column_ordinal: 1,
+				distinct: StorageNdvFact::Exact { count: 4 },
+			}],
+		};
+		assert_eq!(
+			descriptor_optimizer_facts_from_storage(facts, &descriptor),
+			None
+		);
+
+		let facts = StorageTableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: stale_descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 17,
+			column_ndv: vec![wendelon_client::ColumnNdvFact {
+				column_ordinal: 1,
+				distinct: StorageNdvFact::Exact { count: 4 },
+			}],
+		};
+		assert_eq!(
+			descriptor_optimizer_facts_from_storage(facts, &descriptor),
+			None
+		);
+	}
+
+	#[tokio::test]
+	async fn facts_fetch_failure_syncs_descriptor_without_facts() {
+		let descriptor = descriptor();
+		let client = Arc::new(
+			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))]).with_optimizer_facts([
+				Err(ClientError::Io(std::io::Error::new(
+					std::io::ErrorKind::ConnectionReset,
+					"facts unavailable",
+				))),
+			]),
+		);
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor");
+
+		assert_eq!(resolved.table, descriptor.table_object_id);
+		assert!(resolved.optimizer_facts.column_ndv.is_empty());
 	}
 
 	#[tokio::test]

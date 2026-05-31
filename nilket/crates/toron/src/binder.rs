@@ -8853,6 +8853,48 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn rune_equality_filtered_dim_broadcasts_over_wendelon_ndv_no_seed() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let logical = rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("customers").alias("c")
+               .filter(qcol("c", "region").eq(lit_str("north")))
+               .auto_join(
+                   ctx.table("orders").alias("o"),
+                   qcol("c", "id").eq(qcol("o", "customer_id"))
+               )
+        }
+    "#,
+		)
+		.await;
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind Rune NDV-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Left,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
 	async fn missing_ndv_keeps_137_138_behavior() {
 		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(20_000));
 		let filtered_customers = LogicalPlan::Filter {

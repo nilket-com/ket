@@ -53,14 +53,15 @@ use crate::schema::table::{
 	validate_table_write_request_batch,
 };
 use crate::schema::{
-	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, CompactionJobId,
-	CompactionLevelIndex, EncodingPageByteOffset, HybridTimestamp,
+	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnNdvFact,
+	CompactionJobId, CompactionLevelIndex, EncodingPageByteOffset, HllPrecision, HybridTimestamp,
 	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
-	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch,
+	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
 	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
 	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
 	SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader, SupersessionMetadata,
-	TableLifecycleCatalog, TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
+	TableLifecycleCatalog, TableOptimizerFacts, TenantId, TenantKekId, TombstoneMetadata,
+	WriterNodeId,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnOrdinalSet, ColumnarFallbackReason,
@@ -143,9 +144,11 @@ use crate::storage::secondary_index_backfill::{
 use crate::storage::secondary_index_segment::{
 	SecondaryIndexSegment, secondary_index_segment_storage_path,
 };
+use crate::storage::sketch::HllRegisters;
 use crate::storage::stats::{
 	ColumnStatsDescriptorIdentity, ParsedColumnStatsBlock,
-	build_column_stats_block_with_ciphertext_budget, locator_flags_for_parsed_column_stats_block,
+	build_column_stats_block_with_ciphertext_budget, decode_column_stats_payload,
+	locator_flags_for_parsed_column_stats_block,
 	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
 };
 use crate::storage::{
@@ -563,6 +566,164 @@ pub struct SlabManager {
 	/// locator identity. This avoids repeated L2 range reads and
 	/// AEAD decrypts for WFRM query bursts over the same cold slab.
 	tiered_stats_cache: DashMap<TieredStatsCacheKey, ParsedColumnStatsBlock>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NdvColumnCandidate {
+	ordinal: u16,
+	small_set_max_values: Option<u32>,
+	small_set_max_bytes: Option<u32>,
+	hll_enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+enum TieredStatsContributor {
+	Matching(ParsedColumnStatsBlock),
+	OtherTable,
+	Missing,
+}
+
+fn ndv_column_candidates(
+	descriptor: &TableSchemaDescriptor,
+) -> std::io::Result<BTreeMap<u16, NdvColumnCandidate>> {
+	let schema = descriptor.arrow_schema()?;
+	let mut candidates = BTreeMap::new();
+	for spec in &descriptor.stats_policy.small_sets {
+		if let Some(ordinal) = schema
+			.fields()
+			.iter()
+			.position(|field| field.name() == &spec.column_name)
+		{
+			let entry = candidates
+				.entry(ordinal as u16)
+				.or_insert(NdvColumnCandidate {
+					ordinal: ordinal as u16,
+					small_set_max_values: None,
+					small_set_max_bytes: None,
+					hll_enabled: false,
+				});
+			entry.small_set_max_values = Some(spec.max_distinct_values.get());
+			entry.small_set_max_bytes = Some(spec.max_bytes.get());
+		}
+	}
+	for spec in &descriptor.stats_policy.hll_distincts {
+		if let Some(ordinal) = schema
+			.fields()
+			.iter()
+			.position(|field| field.name() == &spec.column_name)
+		{
+			let entry = candidates
+				.entry(ordinal as u16)
+				.or_insert(NdvColumnCandidate {
+					ordinal: ordinal as u16,
+					small_set_max_values: None,
+					small_set_max_bytes: None,
+					hll_enabled: false,
+				});
+			entry.hll_enabled = true;
+		}
+	}
+	Ok(candidates)
+}
+
+fn ndv_fact_for_column(
+	candidate: &NdvColumnCandidate,
+	blocks: &[ParsedColumnStatsBlock],
+) -> std::io::Result<Option<NdvFact>> {
+	let mut exact_values = BTreeSet::<Vec<u8>>::new();
+	let mut exact_complete =
+		candidate.small_set_max_values.is_some() && candidate.small_set_max_bytes.is_some();
+	let mut merged_hll: Option<HllRegisters> = None;
+	let mut hll_complete = candidate.hll_enabled;
+
+	for block in blocks {
+		let Some(entry) = block
+			.columns
+			.iter()
+			.find(|entry| entry.column_ordinal == candidate.ordinal)
+		else {
+			return Ok(None);
+		};
+		let payload = decode_column_stats_payload(entry)?;
+		if exact_complete {
+			if let Some(values) = payload.small_set.as_ref() {
+				for value in values {
+					exact_values.insert(value.clone());
+				}
+				let value_count = u32::try_from(exact_values.len()).unwrap_or(u32::MAX);
+				let byte_count = exact_values.iter().try_fold(0_u32, |sum, value| {
+					let len = u32::try_from(value.len()).map_err(|_| ())?;
+					sum.checked_add(len).ok_or(())
+				});
+				let value_over_cap = match candidate.small_set_max_values {
+					Some(cap) => value_count > cap,
+					None => true,
+				};
+				let bytes_over_cap = match (byte_count, candidate.small_set_max_bytes) {
+					(Ok(bytes), Some(cap)) => bytes > cap,
+					_ => true,
+				};
+				if value_over_cap || bytes_over_cap {
+					exact_complete = false;
+				}
+			} else {
+				exact_complete = false;
+			}
+		}
+		if hll_complete {
+			if let Some(hll) = payload.hll_distinct.as_ref() {
+				let registers = HllPrecision::new(hll.precision).and_then(|precision| {
+					HllRegisters::from_registers(precision, hll.registers.clone())
+				});
+				match (merged_hll.as_mut(), registers) {
+					(Some(merged), Ok(registers))
+						if merged.precision() == registers.precision() =>
+					{
+						merged.merge(&registers)?;
+					}
+					(None, Ok(registers)) => {
+						merged_hll = Some(registers);
+					}
+					_ => {
+						hll_complete = false;
+					}
+				}
+			} else {
+				hll_complete = false;
+			}
+		}
+	}
+
+	if exact_complete {
+		let count = u64::try_from(exact_values.len()).unwrap_or(u64::MAX);
+		return Ok(Some(NdvFact::Exact { count }));
+	}
+	if hll_complete {
+		if let Some(merged_hll) = merged_hll {
+			let estimate = merged_hll.estimate()?.round();
+			let estimate = if estimate.is_sign_negative() {
+				0
+			} else if estimate > u64::MAX as f64 {
+				u64::MAX
+			} else {
+				estimate as u64
+			};
+			let register_count = merged_hll.registers().len() as f64;
+			let rel_err_ppm = ((1.04 / register_count.sqrt()) * 1_000_000.0).ceil();
+			let rel_err_ppm = if rel_err_ppm.is_sign_negative() {
+				0
+			} else if rel_err_ppm > u32::MAX as f64 {
+				u32::MAX
+			} else {
+				rel_err_ppm as u32
+			};
+			return Ok(Some(NdvFact::Approx {
+				estimate,
+				rel_err_ppm,
+			}));
+		}
+	}
+	Ok(None)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4700,6 +4861,206 @@ impl SlabManager {
 		}
 		self.tiered_stats_cache.insert(cache_key, parsed.clone());
 		Ok(Some(parsed))
+	}
+
+	async fn load_tiered_optimizer_stats_contributor(
+		&self,
+		pointer: &TieredSlabPointer,
+		descriptor: &TableSchemaDescriptor,
+	) -> std::io::Result<TieredStatsContributor> {
+		metrics().pbc_slab_stats_consulted_total.inc();
+		let Some(cache_key) = tiered_stats_cache_key(pointer, descriptor) else {
+			metrics().pbc_slab_stats_missing_total.inc();
+			return Ok(TieredStatsContributor::Missing);
+		};
+		if let Some(entry) = self.tiered_stats_cache.get(&cache_key) {
+			metrics().pbc_slab_stats_cache_hits_total.inc();
+			return Ok(TieredStatsContributor::Matching(entry.value().clone()));
+		}
+		let Some(l2) = self.config.l2.as_ref() else {
+			metrics().pbc_slab_stats_missing_total.inc();
+			return Ok(TieredStatsContributor::Missing);
+		};
+		metrics().pbc_slab_stats_cache_misses_total.inc();
+		let metadata = l2.head(&pointer.l2_uri).await?;
+		let tail_start = metadata
+			.size_bytes
+			.saturating_sub(self.config.rehydration.tail_read_window_bytes);
+		let tail_window = l2
+			.get_range(&pointer.l2_uri, tail_start..metadata.size_bytes)
+			.await?;
+		let additional_metadata_range = match self.config.crypto.additional_tiered_metadata_range(
+			pointer.slab_id,
+			metadata.size_bytes,
+			tail_window.as_ref(),
+		) {
+			Ok(range) => range,
+			Err(error) => {
+				metrics().pbc_slab_stats_decrypt_failed_total.inc();
+				return Err(error);
+			}
+		};
+		let additional_metadata = match additional_metadata_range {
+			Some(range) => Some(l2.get_range(&pointer.l2_uri, range).await?),
+			None => None,
+		};
+		let Some(plan) = self.config.crypto.plan_tiered_stats_block_read(
+			pointer.slab_id,
+			metadata.size_bytes,
+			tail_window.as_ref(),
+			additional_metadata.as_deref(),
+		)?
+		else {
+			metrics().pbc_slab_stats_missing_total.inc();
+			return Ok(TieredStatsContributor::Missing);
+		};
+		let locator = plan.locator();
+		if pointer.stats_format_version != Some(locator.stats_format_version)
+			|| pointer.stats_block_len != Some(locator.stats_block_len)
+			|| pointer.stats_block_hash128 != Some(locator.stats_block_hash128)
+		{
+			metrics().pbc_slab_stats_pointer_drift_total.inc();
+			return Ok(TieredStatsContributor::Missing);
+		}
+		let stats_ciphertext = l2
+			.get_range(&pointer.l2_uri, plan.stats_range_in_object())
+			.await?;
+		let stats = plan.decrypt(stats_ciphertext.as_ref(), descriptor.schema_generation)?;
+		let parsed = parse_column_stats_block(&stats.plaintext)?;
+		let parsed_identity = ColumnStatsDescriptorIdentity::from_header(&parsed.header);
+		let descriptor_identity = ColumnStatsDescriptorIdentity::from_descriptor(descriptor);
+		if parsed_identity == descriptor_identity {
+			self.tiered_stats_cache.insert(cache_key, parsed.clone());
+			return Ok(TieredStatsContributor::Matching(parsed));
+		}
+		if parsed.header.table_object_id != descriptor.table_object_id {
+			return Ok(TieredStatsContributor::OtherTable);
+		}
+		if parsed.header.schema_generation == descriptor.schema_generation
+			&& parsed.header.logical_schema_fingerprint != descriptor.logical_schema_fingerprint
+		{
+			if let Some(tenant_id) = pointer.tenant_id {
+				metrics().observe_storage_csb_logical_fingerprint_mismatch(
+					tenant_id,
+					descriptor.table_object_id,
+				);
+				metrics()
+					.observe_storage_csb_pre_adr_051_cliff(tenant_id, descriptor.table_object_id);
+			}
+		}
+		metrics().pbc_slab_stats_pointer_drift_total.inc();
+		Ok(TieredStatsContributor::Missing)
+	}
+
+	pub async fn table_optimizer_facts(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+	) -> std::io::Result<Option<TableOptimizerFacts>> {
+		let candidates = ndv_column_candidates(descriptor)?;
+		if candidates.is_empty() {
+			return Ok(None);
+		}
+		if self
+			.has_uncovered_local_rows_for_descriptor(tenant_id, descriptor)
+			.await?
+		{
+			return Ok(None);
+		}
+
+		let producer_epoch = self.compaction_manifest_snapshot().manifest_epoch.get();
+		let mut blocks = Vec::new();
+		for pointer in self.list_tiered_slabs().await {
+			if let Some(pointer_tenant_id) = pointer.tenant_id
+				&& pointer_tenant_id != tenant_id
+			{
+				continue;
+			}
+			match self
+				.load_tiered_optimizer_stats_contributor(&pointer, descriptor)
+				.await
+				.unwrap_or(TieredStatsContributor::Missing)
+			{
+				TieredStatsContributor::Matching(block) => blocks.push(block),
+				TieredStatsContributor::OtherTable => continue,
+				TieredStatsContributor::Missing => return Ok(None),
+			}
+		}
+		if blocks.is_empty() {
+			return Ok(None);
+		}
+
+		let mut column_ndv = Vec::new();
+		for candidate in candidates.values() {
+			if let Some(distinct) = ndv_fact_for_column(candidate, &blocks)? {
+				column_ndv.push(ColumnNdvFact {
+					column_ordinal: candidate.ordinal,
+					distinct,
+				});
+			}
+		}
+		if column_ndv.is_empty() {
+			return Ok(None);
+		}
+		Ok(Some(TableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch,
+			column_ndv,
+		}))
+	}
+
+	async fn has_uncovered_local_rows_for_descriptor(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+	) -> std::io::Result<bool> {
+		let (active_slab_id, sealed_slab_ids) = {
+			let state = self.state.lock().await;
+			let mut sealed = state
+				.sealed
+				.iter()
+				.map(|entry| *entry.key())
+				.collect::<Vec<_>>();
+			sealed.sort_unstable();
+			(state.active.slab_id(), sealed)
+		};
+		if self
+			.record_rows_for_slab(active_slab_id)
+			.iter()
+			.any(|row| row.tenant_id == tenant_id)
+		{
+			return Ok(true);
+		}
+		for slab_id in sealed_slab_ids {
+			let tenant_rows = self
+				.record_rows_for_slab(slab_id)
+				.into_iter()
+				.filter(|row| row.tenant_id == tenant_id)
+				.collect::<Vec<_>>();
+			if tenant_rows.is_empty() {
+				continue;
+			}
+			if matches!(
+				descriptor.row_identity_policy,
+				RowIdentityPolicy::PrimaryKey(_)
+			) {
+				return Ok(true);
+			}
+			let plaintext = self.read_sealed_raw(slab_id).await?;
+			let table_ids = self.secondary_index_table_ids_from_plaintext(slab_id, &plaintext)?;
+			if table_ids.contains(&(tenant_id, descriptor.table_object_id)) {
+				return Ok(true);
+			}
+			if !table_ids
+				.iter()
+				.any(|(row_tenant, _)| *row_tenant == tenant_id)
+			{
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 
 	pub(crate) fn active_tenant_kek_id(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
@@ -14665,8 +15026,10 @@ mod tests {
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
 	use crate::storage::multirow::pack_record_batch_by_bucket;
 	use crate::storage::stats::{
-		ARROW_STATS_TAG_INT64, decode_column_stats_payload, encode_signed_stat_value,
-		parse_column_stats_block,
+		ARROW_STATS_TAG_INT64, COLUMN_STAT_HAS_HLL, COLUMN_STAT_HAS_NON_NULL_COUNT,
+		COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_SMALL_SET, ColumnStatsBlockEntry,
+		ColumnStatsBlockHeader, decode_column_stats_payload, encode_length_prefixed_bytes,
+		encode_signed_stat_value, parse_column_stats_block,
 	};
 	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
@@ -14708,6 +15071,233 @@ mod tests {
 		let crypto = Arc::new(CryptoManager::new_dev());
 		crypto.install_local_only_for_tests(tenant()).unwrap();
 		crypto
+	}
+
+	fn optimizer_fact_stats_header(column_block_count: u32) -> ColumnStatsBlockHeader {
+		ColumnStatsBlockHeader {
+			table_object_id: TableObjectId::new([0x42; 16]),
+			schema_generation: 7,
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([0x51; 32]),
+			row_count: 1,
+			column_block_count,
+		}
+	}
+
+	fn optimizer_fact_block(columns: Vec<ColumnStatsBlockEntry>) -> ParsedColumnStatsBlock {
+		ParsedColumnStatsBlock {
+			header: optimizer_fact_stats_header(columns.len() as u32),
+			columns,
+		}
+	}
+
+	fn optimizer_fact_small_set_entry(values: &[&[u8]]) -> ColumnStatsBlockEntry {
+		let mut payload = Vec::new();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&(values.len() as u64).to_be_bytes());
+		payload.extend_from_slice(&(values.len() as u32).to_be_bytes());
+		for value in values {
+			encode_length_prefixed_bytes(&mut payload, *value).expect("encode small-set value");
+		}
+		ColumnStatsBlockEntry {
+			column_ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_INT64,
+			stat_flags: COLUMN_STAT_HAS_NULL_COUNT
+				| COLUMN_STAT_HAS_NON_NULL_COUNT
+				| COLUMN_STAT_HAS_SMALL_SET,
+			payload,
+		}
+	}
+
+	fn optimizer_fact_hll_entry(precision: u8, values: &[&[u8]]) -> ColumnStatsBlockEntry {
+		let precision = HllPrecision::new(precision).expect("test HLL precision");
+		let mut hll = HllRegisters::new(precision);
+		for value in values {
+			hll.insert(*value);
+		}
+		let mut payload = Vec::new();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&(values.len() as u64).to_be_bytes());
+		payload.push(precision.get());
+		payload.extend_from_slice(hll.registers());
+		ColumnStatsBlockEntry {
+			column_ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_INT64,
+			stat_flags: COLUMN_STAT_HAS_NULL_COUNT
+				| COLUMN_STAT_HAS_NON_NULL_COUNT
+				| COLUMN_STAT_HAS_HLL,
+			payload,
+		}
+	}
+
+	#[test]
+	fn complete_small_set_produces_exact_ndv_fact() {
+		let candidate = NdvColumnCandidate {
+			ordinal: 1,
+			small_set_max_values: Some(8),
+			small_set_max_bytes: Some(128),
+			hll_enabled: false,
+		};
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_small_set_entry(&[
+				b"east".as_slice(),
+				b"west".as_slice(),
+			])]),
+			optimizer_fact_block(vec![optimizer_fact_small_set_entry(&[
+				b"east".as_slice(),
+				b"north".as_slice(),
+			])]),
+		];
+
+		assert_eq!(
+			ndv_fact_for_column(&candidate, &blocks).expect("small-set NDV"),
+			Some(NdvFact::Exact { count: 3 })
+		);
+	}
+
+	#[test]
+	fn compatible_hll_contributors_produce_approx_ndv_fact() {
+		let candidate = NdvColumnCandidate {
+			ordinal: 1,
+			small_set_max_values: None,
+			small_set_max_bytes: None,
+			hll_enabled: true,
+		};
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_hll_entry(
+				10,
+				&[b"east".as_slice(), b"west".as_slice()],
+			)]),
+			optimizer_fact_block(vec![optimizer_fact_hll_entry(
+				10,
+				&[b"north".as_slice(), b"south".as_slice()],
+			)]),
+		];
+
+		match ndv_fact_for_column(&candidate, &blocks).expect("HLL NDV") {
+			Some(NdvFact::Approx {
+				estimate,
+				rel_err_ppm,
+			}) => {
+				assert!(estimate > 0);
+				assert!(rel_err_ppm > 0);
+			}
+			other => panic!("expected approximate HLL NDV fact, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn partial_contributor_coverage_emits_no_ndv_fact() {
+		let candidate = NdvColumnCandidate {
+			ordinal: 1,
+			small_set_max_values: Some(8),
+			small_set_max_bytes: Some(128),
+			hll_enabled: false,
+		};
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_small_set_entry(&[b"east".as_slice()])]),
+			optimizer_fact_block(Vec::new()),
+		];
+
+		assert_eq!(
+			ndv_fact_for_column(&candidate, &blocks).expect("partial NDV"),
+			None
+		);
+	}
+
+	#[test]
+	fn incompatible_hll_precision_emits_no_ndv_fact() {
+		let candidate = NdvColumnCandidate {
+			ordinal: 1,
+			small_set_max_values: None,
+			small_set_max_bytes: None,
+			hll_enabled: true,
+		};
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_hll_entry(10, &[b"east".as_slice()])]),
+			optimizer_fact_block(vec![optimizer_fact_hll_entry(11, &[b"west".as_slice()])]),
+		];
+
+		assert_eq!(
+			ndv_fact_for_column(&candidate, &blocks).expect("incompatible HLL NDV"),
+			None
+		);
+	}
+
+	#[tokio::test]
+	async fn table_optimizer_facts_merges_tiered_small_sets_into_exact_ndv() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-exact").await;
+		let descriptor = optimizer_fact_region_descriptor();
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_region_batch(&[(1, Some("east")), (2, Some("west"))]),
+			"optimizer-facts-exact-a",
+			10,
+		)
+		.await;
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_region_batch(&[(3, Some("east")), (4, Some("north"))]),
+			"optimizer-facts-exact-b",
+			20,
+		)
+		.await;
+
+		let facts = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered tiered facts");
+
+		assert_eq!(facts.table_object_id, descriptor.table_object_id);
+		assert_eq!(facts.schema_generation, descriptor.schema_generation);
+		assert_eq!(
+			facts.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+		assert_eq!(facts.column_ndv.len(), 1);
+		assert_eq!(facts.column_ndv[0].column_ordinal, 1);
+		assert_eq!(facts.column_ndv[0].distinct, NdvFact::Exact { count: 3 });
+	}
+
+	#[tokio::test]
+	async fn active_l1_without_stats_makes_ndv_unknown() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-active-l1").await;
+		let descriptor = optimizer_fact_region_descriptor();
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_region_batch(&[(1, Some("east")), (2, Some("west"))]),
+			"optimizer-facts-active-l1",
+			10,
+		)
+		.await;
+
+		let covered = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered tiered facts before active append");
+		assert_eq!(covered.column_ndv[0].distinct, NdvFact::Exact { count: 2 });
+
+		append_optimizer_fact_rows(
+			&mgr,
+			&descriptor,
+			&optimizer_fact_region_batch(&[(3, Some("south"))]),
+			30,
+		)
+		.await;
+
+		assert_eq!(
+			mgr.table_optimizer_facts(tenant(), &descriptor)
+				.await
+				.unwrap(),
+			None
+		);
 	}
 
 	#[test]
@@ -15364,6 +15954,157 @@ mod tests {
 
 	async fn fresh_manager() -> Arc<SlabManager> {
 		fresh_manager_with_group_commit(GroupCommitConfig::default()).await
+	}
+
+	async fn fresh_manager_with_l2(tag: &str) -> (Arc<SlabManager>, Arc<dyn ObjectStore>) {
+		let l1_dir = fresh_dir(&format!("{tag}-l1"));
+		let l2_root = fresh_dir(&format!("{tag}-l2"));
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		(manager, l2)
+	}
+
+	fn optimizer_fact_region_descriptor() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let mut descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([0xA2; 16]),
+			3,
+			"analytics",
+			"customers",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		descriptor.validate().unwrap();
+		descriptor
+	}
+
+	fn optimizer_fact_region_batch(rows: &[(i64, Option<&str>)]) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("region", DataType::LargeUtf8, true),
+			])),
+			vec![
+				Arc::new(Int64Array::from(
+					rows.iter().map(|(id, _)| Some(*id)).collect::<Vec<_>>(),
+				)) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(
+					rows.iter()
+						.map(|(_, region)| *region)
+						.collect::<Vec<Option<&str>>>(),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap()
+	}
+
+	async fn append_optimizer_fact_rows(
+		manager: &Arc<SlabManager>,
+		descriptor: &TableSchemaDescriptor,
+		batch: &RecordBatch,
+		hlc_base: u64,
+	) {
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			batch,
+			descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		for row in 0..batch.num_rows() {
+			let row_batch = batch.slice(row, 1);
+			let frame = encode_test_batch(&row_batch);
+			manager
+				.append_durable_with_locality(
+					tenant(),
+					admission.key_identities[row],
+					admission.localities[row],
+					hlc(hlc_base + row as u64),
+					&frame,
+				)
+				.await
+				.unwrap();
+		}
+	}
+
+	async fn tier_optimizer_fact_batch(
+		manager: &Arc<SlabManager>,
+		l2: &Arc<dyn ObjectStore>,
+		descriptor: &TableSchemaDescriptor,
+		batch: &RecordBatch,
+		object_prefix: &str,
+		hlc_base: u64,
+	) -> SlabId {
+		append_optimizer_fact_rows(manager, descriptor, batch, hlc_base).await;
+		let slab_id = force_seal_active(manager).await;
+		let raw = manager.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = manager
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2
+			.put(
+				&format!("{object_prefix}/slab_{slab_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		manager
+			.apply_tier_slab(TieredSlabPointer {
+				slab_id,
+				l2_uri,
+				payload_hash: crate::hash::content::digest(&encrypted.bytes),
+				is_encrypted: true,
+				tenant_id: Some(encrypted.tenant_id),
+				tenant_kek_id: Some(encrypted.tenant_kek_id),
+				stats_format_version: Some(locator.stats_format_version),
+				stats_block_len: Some(locator.stats_block_len),
+				stats_block_hash128: Some(locator.stats_block_hash128),
+				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
+			})
+			.await
+			.unwrap();
+		slab_id
 	}
 
 	struct DirectLsmCommitter {

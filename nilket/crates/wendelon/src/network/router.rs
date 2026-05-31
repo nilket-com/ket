@@ -184,7 +184,8 @@ impl HrftService for MsgRouter {
 			},
 			x if x == MsgType::REVOCATION_ADMIN_REQ.0
 				|| x == MsgType::TABLE_DESCRIPTOR_GET_REQ.0
-				|| x == MsgType::TABLE_DESCRIPTOR_LIST_REQ.0 =>
+				|| x == MsgType::TABLE_DESCRIPTOR_LIST_REQ.0
+				|| x == MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ.0 =>
 			{
 				match &self.control {
 					Some(h) => h.handle_control_frame(context, frame).await,
@@ -192,7 +193,8 @@ impl HrftService for MsgRouter {
 				}
 			}
 			x if x == MsgType::TABLE_DESCRIPTOR_GET_RESP.0
-				|| x == MsgType::TABLE_DESCRIPTOR_LIST_RESP.0 =>
+				|| x == MsgType::TABLE_DESCRIPTOR_LIST_RESP.0
+				|| x == MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP.0 =>
 			{
 				Err(Error::new(
 					ErrorKind::InvalidData,

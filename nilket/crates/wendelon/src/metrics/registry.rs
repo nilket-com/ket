@@ -2449,6 +2449,12 @@ pub struct MetricsRegistry {
 	pub control_descriptor_get_not_leader_total: Counter,
 	pub control_descriptor_get_authorization_failed_total: Counter,
 	pub control_descriptor_get_invalid_request_total: Counter,
+	pub control_optimizer_facts_get_requests_total: Counter,
+	pub control_optimizer_facts_get_success_total: Counter,
+	pub control_optimizer_facts_get_not_found_total: Counter,
+	pub control_optimizer_facts_get_not_leader_total: Counter,
+	pub control_optimizer_facts_get_authorization_failed_total: Counter,
+	pub control_optimizer_facts_get_invalid_request_total: Counter,
 	data_ring_write_outcomes: WriteOutcomeCounters,
 	pub data_ring_lease_refresh_passes_total: Counter,
 	pub data_ring_lease_grants_total: Counter,
@@ -2714,6 +2720,12 @@ impl Default for MetricsRegistry {
 			control_descriptor_get_not_leader_total: Counter::default(),
 			control_descriptor_get_authorization_failed_total: Counter::default(),
 			control_descriptor_get_invalid_request_total: Counter::default(),
+			control_optimizer_facts_get_requests_total: Counter::default(),
+			control_optimizer_facts_get_success_total: Counter::default(),
+			control_optimizer_facts_get_not_found_total: Counter::default(),
+			control_optimizer_facts_get_not_leader_total: Counter::default(),
+			control_optimizer_facts_get_authorization_failed_total: Counter::default(),
+			control_optimizer_facts_get_invalid_request_total: Counter::default(),
 			data_ring_write_outcomes: WriteOutcomeCounters::default(),
 			data_ring_lease_refresh_passes_total: Counter::default(),
 			data_ring_lease_grants_total: Counter::default(),
@@ -4293,6 +4305,43 @@ impl MetricsRegistry {
 			"wendelon_control_descriptor_get_invalid_request_total",
 			"Control Ring table descriptor get requests rejected as malformed.",
 			self.control_descriptor_get_invalid_request_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_optimizer_facts_get_requests_total",
+			"Control Ring table optimizer facts get requests handled.",
+			self.control_optimizer_facts_get_requests_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_optimizer_facts_get_success_total",
+			"Control Ring table optimizer facts get requests that were granted.",
+			self.control_optimizer_facts_get_success_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_optimizer_facts_get_not_found_total",
+			"Control Ring table optimizer facts get requests for absent table names.",
+			self.control_optimizer_facts_get_not_found_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_optimizer_facts_get_not_leader_total",
+			"Control Ring table optimizer facts get requests rejected by non-leaders.",
+			self.control_optimizer_facts_get_not_leader_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_optimizer_facts_get_authorization_failed_total",
+			"Control Ring table optimizer facts get requests rejected by authorization.",
+			self.control_optimizer_facts_get_authorization_failed_total
+				.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_control_optimizer_facts_get_invalid_request_total",
+			"Control Ring table optimizer facts get requests rejected as malformed.",
+			self.control_optimizer_facts_get_invalid_request_total.get(),
 		);
 		render_counter(
 			&mut out,

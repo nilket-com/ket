@@ -62,11 +62,12 @@ pub use wendelon::integration::compute::{
 	validate_query_session_audit_attribution, validate_traceparent,
 };
 pub use wendelon::schema::{
-	CdcCursor, CdcRejectCode, CdcSubscribeBound, Consistency as ReadConsistency,
+	CdcCursor, CdcRejectCode, CdcSubscribeBound, ColumnNdvFact, Consistency as ReadConsistency,
 	DurabilityLevel as DurabilityClass, IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint,
-	PbcRejectCode, PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1,
-	RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicyV1, StateDigest,
-	TableObjectId, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
+	NdvFact, PbcRejectCode, PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1,
+	PrimaryKeyEncodingV1, RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicyV1,
+	StateDigest, TableObjectId, TableOptimizerFacts, TableSchemaDescriptor,
+	TableSpreadLocalityDescriptorV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -535,6 +536,19 @@ impl Client {
 	) -> Result<Option<TableSchemaDescriptor>, ClientError> {
 		self.inner
 			.get_table_schema_descriptor(tenant_id, namespace, table_name)
+			.await
+			.map_err(ClientError::from)
+	}
+
+	pub async fn get_table_optimizer_facts(
+		&self,
+		tenant_id: TenantId,
+		namespace: &str,
+		table_name: &str,
+		descriptor: &TableSchemaDescriptor,
+	) -> Result<Option<TableOptimizerFacts>, ClientError> {
+		self.inner
+			.get_table_optimizer_facts(tenant_id, namespace, table_name, descriptor)
 			.await
 			.map_err(ClientError::from)
 	}

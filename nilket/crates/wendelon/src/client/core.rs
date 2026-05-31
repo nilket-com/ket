@@ -68,12 +68,13 @@ use crate::schema::{
 	STORAGE_ROW_KEY_ID_COLUMN, StateDigest, TableDeleteRowsRequestMeta,
 	TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
 	TableDescriptorListRequestMeta, TableDescriptorListResponseMeta, TableObjectId,
+	TableOptimizerFacts, TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
 	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
 	TableQueryRequestMeta, TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta,
 	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
-	column_projection_prefix_ranges, decode_table_schema_descriptor_v1, read_key_schema,
-	read_value_schema, table_spread_prefix_ranges, validate_table_write_request_batch,
-	write_payload_schema,
+	column_projection_prefix_ranges, decode_table_optimizer_facts,
+	decode_table_schema_descriptor_v1, read_key_schema, read_value_schema,
+	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
 use arrow::array::{Array, FixedSizeBinaryBuilder, LargeBinaryArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -342,6 +343,12 @@ pub struct TableDescriptorGetResult {
 pub struct TableDescriptorListResult {
 	pub response: TableDescriptorListResponseMeta,
 	pub descriptors: Vec<TableSchemaDescriptor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TableOptimizerFactsGetResult {
+	pub response: TableOptimizerFactsGetResponseMeta,
+	pub facts: Option<TableOptimizerFacts>,
 }
 
 #[derive(Clone, Debug)]
@@ -832,6 +839,84 @@ impl WendelonClient {
 					return Err(Error::new(
 						ErrorKind::Other,
 						format!("Wendelon table descriptor get failed: reason_code={other}"),
+					));
+				}
+			}
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	/// Fetch advisory optimizer facts for a descriptor identity from
+	/// the Control Ring leader. Absence and not-found responses map to
+	/// `None`; transport/protocol failures remain errors so callers can
+	/// decide whether to fail open.
+	pub async fn get_table_optimizer_facts(
+		&self,
+		tenant_id: TenantId,
+		namespace: &str,
+		table_name: &str,
+		descriptor: &TableSchemaDescriptor,
+	) -> std::io::Result<Option<TableOptimizerFacts>> {
+		let request = TableOptimizerFactsGetRequestMeta {
+			tenant_id,
+			namespace: encode_descriptor_wire_name("namespace", namespace)?,
+			table_name: encode_descriptor_wire_name("table name", table_name)?,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: *descriptor.physical_descriptor_fingerprint.as_bytes(),
+		};
+		let mut preferred_target = self.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = match preferred_target.or_else(|| self.leader()) {
+				Some(target) => target,
+				None => {
+					self.refresh_topology().await?;
+					self.leader().ok_or_else(|| {
+						Error::new(
+							ErrorKind::NotConnected,
+							"table optimizer facts get requires a known Control Ring leader",
+						)
+					})?
+				}
+			};
+			let result = self
+				.table_optimizer_facts_get_once(target, &request)
+				.await?;
+			if result.response.leader_hint.id != 0 {
+				*self.leader.write().unwrap() = Some(result.response.leader_hint);
+			}
+			match result.response.reason_code {
+				code if result.response.accepted == 1 && code == CONTROL_REASON_GRANTED => {
+					return Ok(result.facts);
+				}
+				CONTROL_REASON_NOT_FOUND => return Ok(None),
+				CONTROL_REASON_NOT_LEADER => {
+					if attempt + 1 == DATA_RETRY_BUDGET {
+						return Err(Error::new(
+							ErrorKind::NotConnected,
+							"table optimizer facts get retry budget exhausted",
+						));
+					}
+					let retry =
+						RetryDirective::redirect(nonzero_node_id(result.response.leader_hint));
+					self.prepare_retry(None, retry).await?;
+					preferred_target = retry.preferred_target.or_else(|| self.leader());
+				}
+				CONTROL_REASON_AUTHORIZATION_FAILED => {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"table optimizer facts get authorization failed",
+					));
+				}
+				CONTROL_REASON_INVALID_CONFIG => {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"table optimizer facts get request was invalid",
+					));
+				}
+				other => {
+					return Err(Error::new(
+						ErrorKind::Other,
+						format!("table optimizer facts get failed: reason_code={other}"),
 					));
 				}
 			}
@@ -1335,6 +1420,39 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 		let frame = read_frame(&mut *stream, &self.pool).await?;
 		decode_table_descriptor_list_response_frame(frame)
+	}
+
+	async fn table_optimizer_facts_get_once(
+		&self,
+		target: NodeId,
+		request: &TableOptimizerFactsGetRequestMeta,
+	) -> std::io::Result<TableOptimizerFactsGetResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<TableOptimizerFactsGetRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(request),
+			None,
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_table_optimizer_facts_get_response_frame(frame)
 	}
 
 	async fn logical_type_get_once(
@@ -2686,6 +2804,88 @@ fn decode_table_descriptor_list_response_frame(
 	})
 }
 
+fn decode_table_optimizer_facts_get_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<TableOptimizerFactsGetResult> {
+	if frame.header.msg_type != MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected TABLE_OPTIMIZER_FACTS_GET_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() != std::mem::size_of::<TableOptimizerFactsGetResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_OPTIMIZER_FACTS_GET_RESP meta size mismatch",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_OPTIMIZER_FACTS_GET_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: TableOptimizerFactsGetResponseMeta = *bytemuck::from_bytes(
+		&frame.meta[..std::mem::size_of::<TableOptimizerFactsGetResponseMeta>()],
+	);
+	let facts = if response.accepted == 1 {
+		if response.reason_code != CONTROL_REASON_GRANTED {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_OPTIMIZER_FACTS_GET_RESP accepted response must use granted reason",
+			));
+		}
+		if response.facts_len == 0 {
+			if frame.trailing.is_some() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_OPTIMIZER_FACTS_GET_RESP empty response must not carry facts payload",
+				));
+			}
+			None
+		} else {
+			let trailing = frame.trailing.as_ref().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_OPTIMIZER_FACTS_GET_RESP accepted response missing facts payload",
+				)
+			})?;
+			if response.facts_len as usize != trailing.len() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"TABLE_OPTIMIZER_FACTS_GET_RESP facts_len mismatch: meta={} actual={}",
+						response.facts_len,
+						trailing.len()
+					),
+				));
+			}
+			Some(decode_table_optimizer_facts(&trailing[..])?)
+		}
+	} else {
+		if response.accepted != 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"TABLE_OPTIMIZER_FACTS_GET_RESP invalid accepted value {}",
+					response.accepted
+				),
+			));
+		}
+		if response.facts_len != 0 || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_OPTIMIZER_FACTS_GET_RESP rejected response must not carry facts payload",
+			));
+		}
+		None
+	};
+	Ok(TableOptimizerFactsGetResult { response, facts })
+}
+
 fn decode_logical_type_get_response_frame(
 	frame: crate::network::core::HrftFrame,
 ) -> std::io::Result<LogicalTypeGetResult> {
@@ -3103,10 +3303,11 @@ mod tests {
 		TransportConnection, TransportProvider, TransportStream, TransportTier,
 	};
 	use crate::schema::{
-		ClientWriteId, ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicy,
+		ClientWriteId, ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicy, NdvFact,
 		PrimaryKeyDescriptorV1, ProjectionFunctionV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
-		encode_table_schema_descriptor_v1, encode_table_schema_descriptors,
+		TableObjectId, TableOptimizerFacts, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
+		encode_table_optimizer_facts, encode_table_schema_descriptor_v1,
+		encode_table_schema_descriptors,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use async_trait::async_trait;
@@ -3383,6 +3584,91 @@ mod tests {
 			},
 			trailing,
 		}
+	}
+
+	#[test]
+	fn client_table_optimizer_facts_response_decodes_optional_payload() {
+		let descriptor = table_query_descriptor(LocalityPolicy::default_table_spread());
+		let facts = TableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 7,
+			column_ndv: vec![crate::schema::ColumnNdvFact {
+				column_ordinal: 1,
+				distinct: NdvFact::Approx {
+					estimate: 42,
+					rel_err_ppm: 26_000,
+				},
+			}],
+		};
+		let facts_bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
+		let frame = crate::network::core::HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP.0,
+				flags: 0,
+				stream_id: 0,
+				meta_len: std::mem::size_of::<TableOptimizerFactsGetResponseMeta>() as u32,
+				arrow_len: 0,
+				trailing_len: facts_bytes.len() as u32,
+			},
+			meta: crate::network::pool::PooledBuf::orphan(
+				bytemuck::bytes_of(&TableOptimizerFactsGetResponseMeta {
+					accepted: 1,
+					reason_code: CONTROL_REASON_GRANTED,
+					_pad1: [0; 6],
+					leader_hint: NodeId {
+						id: 1,
+						_reserved: 0,
+					},
+					facts_len: facts_bytes.len() as u32,
+					_pad2: [0; 4],
+				})
+				.to_vec(),
+			),
+			arrow_payload: None,
+			trailing: Some(crate::network::pool::PooledBuf::orphan(facts_bytes)),
+		};
+
+		let decoded = decode_table_optimizer_facts_get_response_frame(frame).expect("decode facts");
+		assert_eq!(decoded.facts, Some(facts));
+	}
+
+	#[test]
+	fn client_table_optimizer_facts_response_rejects_length_mismatch() {
+		let frame = crate::network::core::HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP.0,
+				flags: 0,
+				stream_id: 0,
+				meta_len: std::mem::size_of::<TableOptimizerFactsGetResponseMeta>() as u32,
+				arrow_len: 0,
+				trailing_len: 1,
+			},
+			meta: crate::network::pool::PooledBuf::orphan(
+				bytemuck::bytes_of(&TableOptimizerFactsGetResponseMeta {
+					accepted: 1,
+					reason_code: CONTROL_REASON_GRANTED,
+					_pad1: [0; 6],
+					leader_hint: NodeId {
+						id: 1,
+						_reserved: 0,
+					},
+					facts_len: 2,
+					_pad2: [0; 4],
+				})
+				.to_vec(),
+			),
+			arrow_payload: None,
+			trailing: Some(crate::network::pool::PooledBuf::orphan(vec![0])),
+		};
+
+		let err = decode_table_optimizer_facts_get_response_frame(frame).unwrap_err();
+		assert!(err.to_string().contains("facts_len mismatch"));
 	}
 
 	#[tokio::test]

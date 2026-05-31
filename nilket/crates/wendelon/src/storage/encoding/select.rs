@@ -1335,7 +1335,15 @@ mod tests {
 		String::from_utf8(output.stdout)
 			.unwrap()
 			.lines()
-			.find_map(|line| line.strip_prefix(line_prefix).map(str::to_owned))
+			.find_map(|line| {
+				line.strip_prefix(line_prefix)
+					.map(str::to_owned)
+					.or_else(|| {
+						line.split_once(" ... ")
+							.and_then(|(_, rest)| rest.strip_prefix(line_prefix))
+							.map(str::to_owned)
+					})
+			})
 			.expect("child determinism digest line")
 	}
 

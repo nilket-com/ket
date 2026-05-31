@@ -25,9 +25,9 @@ background scanner; appending facts to descriptor get/list responses.
    141 headline over a **live Wendelon-produced** NDV (multi-contributor, HLL on `region`), no Toron
    seed — **fails on `main`** (live sync emits no facts). `facts_fetch_failure_syncs_descriptor_without_facts`
    + `table_without_stats… inert` green before + after.
-1. **(Wendelon) Producer fact type (D1):** `TableOptimizerFactsV1 { table_object_id, schema_generation,
-   physical_descriptor_fingerprint, producer_epoch, column_ndv: Vec<ColumnNdvFactV1> }`;
-   `ColumnNdvFactV1 { column_ordinal, distinct: NdvFactV1 }`; `NdvFactV1 = Exact{count} | Approx{estimate, rel_err_ppm}`.
+1. **(Wendelon) Producer fact type (D1):** `TableOptimizerFacts { table_object_id, schema_generation,
+   physical_descriptor_fingerprint, producer_epoch, column_ndv: Vec<ColumnNdvFact> }`;
+   `ColumnNdvFact { column_ordinal, distinct: NdvFact }`; `NdvFact = Exact{count} | Approx{estimate, rel_err_ppm}`.
    No Toron import.
 2. **(Wendelon) Coverage inventory + merge (D3/D4):** for the descriptor identity, enumerate **all
    visible contributors (active tail + sealed L1 + tiered runs)**. Per column: if **any** visible
@@ -38,11 +38,11 @@ background scanner; appending facts to descriptor get/list responses.
    time** — absent maintained stats → unknown.
 3. **(Wendelon) Control RPC (D2):** `TABLE_OPTIMIZER_FACTS_GET_REQ/RESP` (separate from descriptor
    get/list; those wire contracts unchanged). Request: tenant + namespace/table + descriptor identity.
-   Response: length-delimited `TableOptimizerFactsV1` blob (or empty). Server-side absence/unsupported
+   Response: length-delimited `TableOptimizerFacts` blob (or empty). Server-side absence/unsupported
    → empty, not error.
 4. **(Toron) Fail-open sync wiring (D5):** after the descriptor fetch, the descriptor-sync client
-   issues the optional facts fetch for that exact identity; on success map `TableOptimizerFactsV1` →
-   `DescriptorOptimizerFacts.column_ndv` (`NdvFactV1` → `DistinctCountFact`) and call
+   issues the optional facts fetch for that exact identity; on success map `TableOptimizerFacts` →
+   `DescriptorOptimizerFacts.column_ndv` (`NdvFact` → `DistinctCountFact`) and call
    `sync_descriptor_for_tenant_with_facts` (`for_descriptor` re-validates identity); on any
    failure/unsupported/empty → the descriptor-only path. **No Toron-side stats cache, no background
    scanner.** Replace the descriptor-only sync call in `resolve_table_sync_owner` with a
@@ -64,7 +64,7 @@ for column c at descriptor identity D:
   elif every contributor has compatible HLL: Approx{ estimate = merged_hll.estimate(),
                                                      rel_err_ppm = ceil(std_err*1e6) clamp u32::MAX }
   else: omit
-expose: TableOptimizerFactsV1 via TABLE_OPTIMIZER_FACTS_GET (separate, fail-open); keyed by D
+expose: TableOptimizerFacts via TABLE_OPTIMIZER_FACTS_GET (separate, fail-open); keyed by D
 Toron: descriptor get → optional facts get(D) → map → sync_descriptor_for_tenant_with_facts | descriptor-only
 ```
 Opt-in stats only (no default flip). Estimate-channel only. No active-data scan at sync.
