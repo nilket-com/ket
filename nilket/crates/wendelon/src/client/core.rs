@@ -3601,6 +3601,7 @@ mod tests {
 					rel_err_ppm: 26_000,
 				},
 			}],
+			column_range: Vec::new(),
 		};
 		let facts_bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
 		let frame = crate::network::core::HrftFrame {

@@ -1173,6 +1173,7 @@ fn shuffle_input_scan(
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: Vec::new(),
 		column_ndv: Vec::new(),
+		column_range: Vec::new(),
 	}
 }
 
@@ -1796,6 +1797,7 @@ mod tests {
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 			column_ndv: Vec::new(),
+			column_range: Vec::new(),
 		}
 	}
 
@@ -1838,6 +1840,7 @@ mod tests {
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
 			column_ndv: Vec::new(),
+			column_range: Vec::new(),
 		}
 	}
 

@@ -1,8 +1,20 @@
-use crate::schema::LogicalSchemaFingerprint;
 use crate::schema::table::{
 	COLUMN_STATS_CSB_AEAD_TAG_BYTES, COLUMN_STATS_HLL_MAX_PRECISION,
 	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnHllSpecV1, ColumnSmallSetSpecV1,
 	TableObjectId, TableSchemaDescriptor, max_column_stats_block_ciphertext_bytes_for_slab_payload,
+};
+pub use crate::schema::{
+	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
+	ARROW_STATS_TAG_DATE64, ARROW_STATS_TAG_INT8, ARROW_STATS_TAG_INT16, ARROW_STATS_TAG_INT32,
+	ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_BINARY, ARROW_STATS_TAG_LARGE_UTF8,
+	ARROW_STATS_TAG_OPAQUE_UNSUPPORTED, ARROW_STATS_TAG_TIMESTAMP_MICROSECOND,
+	ARROW_STATS_TAG_TIMESTAMP_MILLISECOND, ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
+	ARROW_STATS_TAG_UINT8, ARROW_STATS_TAG_UINT16, ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64,
+	ARROW_STATS_TAG_UTF8,
+};
+use crate::schema::{
+	LogicalSchemaFingerprint, encode_signed_optimizer_fact_scalar,
+	encode_unsigned_optimizer_fact_scalar,
 };
 use arrow::array::{
 	Array, BinaryArray, BooleanArray, LargeBinaryArray, LargeStringArray, PrimitiveArray,
@@ -43,26 +55,6 @@ pub const COLUMN_STAT_HAS_SMALL_SET: u16 = 1 << 6;
 pub const COLUMN_STAT_MIN_TRUNCATED: u16 = 1 << 7;
 pub const COLUMN_STAT_MAX_TRUNCATED: u16 = 1 << 8;
 pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1111_1110_0000_0000;
-
-pub const ARROW_STATS_TAG_INT8: u8 = 0x01;
-pub const ARROW_STATS_TAG_INT16: u8 = 0x02;
-pub const ARROW_STATS_TAG_INT32: u8 = 0x03;
-pub const ARROW_STATS_TAG_INT64: u8 = 0x04;
-pub const ARROW_STATS_TAG_UINT8: u8 = 0x05;
-pub const ARROW_STATS_TAG_UINT16: u8 = 0x06;
-pub const ARROW_STATS_TAG_UINT32: u8 = 0x07;
-pub const ARROW_STATS_TAG_UINT64: u8 = 0x08;
-pub const ARROW_STATS_TAG_OPAQUE_UNSUPPORTED: u8 = 0x0E;
-pub const ARROW_STATS_TAG_UTF8: u8 = 0x10;
-pub const ARROW_STATS_TAG_LARGE_UTF8: u8 = 0x11;
-pub const ARROW_STATS_TAG_BINARY: u8 = 0x12;
-pub const ARROW_STATS_TAG_LARGE_BINARY: u8 = 0x13;
-pub const ARROW_STATS_TAG_TIMESTAMP_MILLISECOND: u8 = 0x20;
-pub const ARROW_STATS_TAG_TIMESTAMP_MICROSECOND: u8 = 0x21;
-pub const ARROW_STATS_TAG_TIMESTAMP_NANOSECOND: u8 = 0x22;
-pub const ARROW_STATS_TAG_DATE32: u8 = 0x30;
-pub const ARROW_STATS_TAG_DATE64: u8 = 0x31;
-pub const ARROW_STATS_TAG_BOOLEAN: u8 = 0x40;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnStatsBlockHeader {
@@ -459,51 +451,11 @@ fn stats_tag_uses_prefix_truncation(tag: u8) -> bool {
 }
 
 pub fn encode_signed_stat_value(value: i64, byte_width: usize) -> std::io::Result<Vec<u8>> {
-	if !matches!(byte_width, 1 | 2 | 4 | 8) {
-		return Err(Error::new(
-			ErrorKind::InvalidInput,
-			"signed stat byte width must be one of 1, 2, 4, 8",
-		));
-	}
-	let bits = byte_width * 8;
-	let min = -(1_i128 << (bits - 1));
-	let max = (1_i128 << (bits - 1)) - 1;
-	let value_i128 = i128::from(value);
-	if value_i128 < min || value_i128 > max {
-		return Err(Error::new(
-			ErrorKind::InvalidInput,
-			"signed stat value exceeds requested byte width",
-		));
-	}
-	let sign_bit = 1_u64 << (bits - 1);
-	let mask = if bits == 64 {
-		u64::MAX
-	} else {
-		(1_u64 << bits) - 1
-	};
-	let biased = ((value as u64) & mask) ^ sign_bit;
-	Ok(biased.to_be_bytes()[8 - byte_width..].to_vec())
+	encode_signed_optimizer_fact_scalar(value, byte_width)
 }
 
 pub fn encode_unsigned_stat_value(value: u64, byte_width: usize) -> std::io::Result<Vec<u8>> {
-	if !matches!(byte_width, 1 | 2 | 4 | 8) {
-		return Err(Error::new(
-			ErrorKind::InvalidInput,
-			"unsigned stat byte width must be one of 1, 2, 4, 8",
-		));
-	}
-	let max = if byte_width == 8 {
-		u64::MAX
-	} else {
-		(1_u64 << (byte_width * 8)) - 1
-	};
-	if value > max {
-		return Err(Error::new(
-			ErrorKind::InvalidInput,
-			"unsigned stat value exceeds requested byte width",
-		));
-	}
-	Ok(value.to_be_bytes()[8 - byte_width..].to_vec())
+	encode_unsigned_optimizer_fact_scalar(value, byte_width)
 }
 
 pub fn encode_bool_stat_value(value: bool) -> [u8; 1] {

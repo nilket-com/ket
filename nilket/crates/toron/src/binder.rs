@@ -12,7 +12,8 @@ use crate::aggregate_kernel::{
 	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
 };
 use crate::catalog::{
-	Catalog, DistinctCountFact, TableBinding, TableOptimizerFacts, TableRef, TableRowIdentity,
+	Catalog, DistinctCountFact, RangeFact, TableBinding, TableOptimizerFacts, TableRef,
+	TableRowIdentity,
 };
 use crate::distributed::budget::{ByteCount, QueryBudget};
 use crate::distributed::task::RowCount;
@@ -35,8 +36,9 @@ use wendelon::schema::{
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
 };
 use wendelon_client::{
-	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
-	TableSchemaDescriptor,
+	ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64, LogicalTypeRefinementComparisonOp,
+	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor,
+	decode_signed_optimizer_fact_scalar,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -582,6 +584,13 @@ impl<'a> Binder<'a> {
 						&input.plan,
 						input_facts,
 					);
+					let range_estimated_row_count = filter_range_selectivity_estimated_row_count(
+						&bound_predicate,
+						&input.plan,
+						input_facts,
+					);
+					let estimated_row_count =
+						min_optional_row_count(ndv_estimated_row_count, range_estimated_row_count);
 					let (plan, _) = plan_filter_with_predicate_pushdown(
 						input.plan,
 						bound_predicate,
@@ -597,7 +606,7 @@ impl<'a> Binder<'a> {
 					} else {
 						input_facts.preserve_volume_non_increasing()
 					};
-					let facts = if let Some(estimated_row_count) = ndv_estimated_row_count {
+					let facts = if let Some(estimated_row_count) = estimated_row_count {
 						facts.with_estimated_row_count(estimated_row_count)
 					} else {
 						facts
@@ -3670,6 +3679,12 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		.iter()
 		.map(|(ordinal, distinct_count)| (*ordinal, *distinct_count))
 		.collect::<Vec<_>>();
+	let column_range = binding
+		.optimizer_facts
+		.column_range
+		.iter()
+		.map(|(ordinal, range)| (*ordinal, range.clone()))
+		.collect::<Vec<_>>();
 	ExecutionPlan::Scan {
 		legacy_table_id: binding.legacy_table_id,
 		table: binding.table,
@@ -3682,6 +3697,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: sorted_columns(&binding.primary_key_columns),
 		column_ndv,
+		column_range,
 	}
 }
 
@@ -3854,6 +3870,209 @@ fn column_ndv_for_input(
 		}
 		ExecutionPlan::Filter { input, .. } => column_ndv_for_input(input, requested_column),
 		_ => None,
+	}
+}
+
+fn filter_range_selectivity_estimated_row_count(
+	predicate: &BoundExprProgram,
+	input: &ExecutionPlan,
+	facts: PlanOptimizerFacts,
+) -> Option<RowCount> {
+	if facts.origin != PlanOrigin::SingleBaseRelation {
+		return None;
+	}
+	let root = predicate.single_root()?;
+	let mut conjuncts = Vec::new();
+	collect_top_level_bound_and(predicate, root, &mut conjuncts);
+	let mut intervals = HashMap::<ColumnOrdinal, RangeInterval>::new();
+
+	for conjunct in conjuncts {
+		let Some(atom) = range_atom(predicate, conjunct, input) else {
+			continue;
+		};
+		intervals
+			.entry(atom.column)
+			.or_default()
+			.apply(atom.op, atom.literal_value);
+	}
+
+	let mut estimate = None;
+	for (column, interval) in intervals {
+		let range = column_range_for_input(input, column)?;
+		let column_estimate = estimated_rows_for_range(range, interval)?;
+		estimate = min_optional_row_count(estimate, Some(column_estimate));
+	}
+	estimate
+}
+
+#[derive(Debug, Clone)]
+struct RangeAtom {
+	column: ColumnOrdinal,
+	op: BoundBinaryOp,
+	literal_value: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RangeInterval {
+	lower_inclusive: Option<i128>,
+	upper_inclusive: Option<i128>,
+}
+
+impl RangeInterval {
+	fn apply(&mut self, op: BoundBinaryOp, literal_value: i64) {
+		let value = i128::from(literal_value);
+		match op {
+			BoundBinaryOp::Gt => {
+				self.lower_inclusive = Some(
+					self.lower_inclusive
+						.map(|current| current.max(value + 1))
+						.unwrap_or(value + 1),
+				);
+			}
+			BoundBinaryOp::Gte => {
+				self.lower_inclusive = Some(
+					self.lower_inclusive
+						.map(|current| current.max(value))
+						.unwrap_or(value),
+				);
+			}
+			BoundBinaryOp::Lt => {
+				self.upper_inclusive = Some(
+					self.upper_inclusive
+						.map(|current| current.min(value - 1))
+						.unwrap_or(value - 1),
+				);
+			}
+			BoundBinaryOp::Lte => {
+				self.upper_inclusive = Some(
+					self.upper_inclusive
+						.map(|current| current.min(value))
+						.unwrap_or(value),
+				);
+			}
+			_ => {}
+		}
+	}
+}
+
+fn range_atom(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	input: &ExecutionPlan,
+) -> Option<RangeAtom> {
+	let BoundExprNode::Binary { op, left, right } = program.node(id)? else {
+		return None;
+	};
+	if !matches!(
+		op,
+		BoundBinaryOp::Lt | BoundBinaryOp::Lte | BoundBinaryOp::Gt | BoundBinaryOp::Gte
+	) {
+		return None;
+	}
+	range_atom_sides(program, op.clone(), *left, *right, input)
+		.or_else(|| range_atom_sides(program, flip_range_op(op.clone()), *right, *left, input))
+}
+
+fn range_atom_sides(
+	program: &BoundExprProgram,
+	op: BoundBinaryOp,
+	column_side: BoundExprId,
+	literal_side: BoundExprId,
+	input: &ExecutionPlan,
+) -> Option<RangeAtom> {
+	let Some(BoundExprNode::Column(column)) = program.node(column_side) else {
+		return None;
+	};
+	let Some(BoundExprNode::Literal(literal)) = program.node(literal_side) else {
+		return None;
+	};
+	let range = column_range_for_input(input, column.ordinal)?;
+	let value = program.literals.get(*literal as usize)?;
+	let literal_value = range_literal_value(range, value)?;
+	Some(RangeAtom {
+		column: column.ordinal,
+		op,
+		literal_value,
+	})
+}
+
+fn flip_range_op(op: BoundBinaryOp) -> BoundBinaryOp {
+	match op {
+		BoundBinaryOp::Lt => BoundBinaryOp::Gt,
+		BoundBinaryOp::Lte => BoundBinaryOp::Gte,
+		BoundBinaryOp::Gt => BoundBinaryOp::Lt,
+		BoundBinaryOp::Gte => BoundBinaryOp::Lte,
+		other => other,
+	}
+}
+
+fn range_literal_value(range: &RangeFact, value: &ScalarValue) -> Option<i64> {
+	match (range.arrow_type_tag, value) {
+		(ARROW_STATS_TAG_INT32, ScalarValue::Int32(Some(value))) => Some(i64::from(*value)),
+		(ARROW_STATS_TAG_INT64, ScalarValue::Int64(Some(value))) => Some(*value),
+		_ => None,
+	}
+}
+
+fn column_range_for_input(
+	input: &ExecutionPlan,
+	requested_column: ColumnOrdinal,
+) -> Option<&RangeFact> {
+	match input {
+		ExecutionPlan::Scan { column_range, .. } => column_range
+			.iter()
+			.find_map(|(column, range)| (*column == requested_column).then_some(range)),
+		ExecutionPlan::Filter { input, .. } => column_range_for_input(input, requested_column),
+		_ => None,
+	}
+}
+
+fn estimated_rows_for_range(range: &RangeFact, interval: RangeInterval) -> Option<RowCount> {
+	if range.non_null_count == 0 {
+		return Some(RowCount::new(0));
+	}
+	let min = decode_range_i64(range.arrow_type_tag, range.min.as_deref()?)?;
+	let max = decode_range_i64(range.arrow_type_tag, range.max.as_deref()?)?;
+	if max < min {
+		return None;
+	}
+	let envelope_low = i128::from(min);
+	let envelope_high = i128::from(max);
+	let low = interval
+		.lower_inclusive
+		.unwrap_or(envelope_low)
+		.max(envelope_low);
+	let high = interval
+		.upper_inclusive
+		.unwrap_or(envelope_high)
+		.min(envelope_high);
+	if low > high {
+		return Some(RowCount::new(0));
+	}
+	let domain_width = u128::try_from(envelope_high - envelope_low + 1).ok()?;
+	let overlap_width = u128::try_from(high - low + 1).ok()?;
+	if domain_width == 0 {
+		return None;
+	}
+	let numerator = u128::from(range.non_null_count).checked_mul(overlap_width)?;
+	let estimate = numerator.div_ceil(domain_width);
+	Some(RowCount::new(u64::try_from(estimate).unwrap_or(u64::MAX)))
+}
+
+fn decode_range_i64(arrow_type_tag: u8, bytes: &[u8]) -> Option<i64> {
+	match arrow_type_tag {
+		ARROW_STATS_TAG_INT32 if bytes.len() == 4 => decode_signed_optimizer_fact_scalar(bytes),
+		ARROW_STATS_TAG_INT64 if bytes.len() == 8 => decode_signed_optimizer_fact_scalar(bytes),
+		_ => None,
+	}
+}
+
+fn min_optional_row_count(left: Option<RowCount>, right: Option<RowCount>) -> Option<RowCount> {
+	match (left, right) {
+		(Some(left), Some(right)) => Some(std::cmp::min(left, right)),
+		(Some(left), None) => Some(left),
+		(None, Some(right)) => Some(right),
+		(None, None) => None,
 	}
 }
 
@@ -5261,6 +5480,7 @@ fn optimize_for_required(
 			profile_hint,
 			primary_key_columns,
 			column_ndv,
+			column_range,
 		} => {
 			let all_columns = all_columns(&schema);
 			let required = required_output.unwrap_or(all_columns);
@@ -5280,6 +5500,12 @@ fn optimize_for_required(
 						.map(|mapped| (mapped, distinct_count))
 				})
 				.collect();
+			let column_range = column_range
+				.into_iter()
+				.filter_map(|(column, range)| {
+					remap.get(&column).copied().map(|mapped| (mapped, range))
+				})
+				.collect();
 
 			Ok((
 				ExecutionPlan::Scan {
@@ -5294,6 +5520,7 @@ fn optimize_for_required(
 					profile_hint,
 					primary_key_columns,
 					column_ndv,
+					column_range,
 				},
 				remap,
 			))
@@ -7359,7 +7586,8 @@ fn is_pbc_eligible_type(data_type: &DataType) -> bool {
 mod tests {
 	use super::*;
 	use crate::catalog::{
-		DescriptorColumnNdvFact, DescriptorOptimizerFacts, MockCatalog, WendelonCatalog,
+		DescriptorColumnNdvFact, DescriptorColumnRangeFact, DescriptorOptimizerFacts, MockCatalog,
+		RangeFact, WendelonCatalog,
 	};
 	use crate::distributed::arrow_ipc::encode_record_batch;
 	use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, TableId};
@@ -9117,38 +9345,304 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn range_filter_does_not_use_ndv_selectivity() {
-		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+	async fn range_filter_uses_min_max_range_selectivity_not_ndv() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
 			Some(64 * 1024 * 1024),
 			None,
 			Some(20_000),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("amount", DataType::Int64, true),
+			]),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1))],
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(89)))),
+			),
+		)
+		.await
+		.expect("bind range-filtered dimension with NDV present");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+		assert_ne!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(20_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn range_filter_estimates_without_row_upper_bound() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Lte(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(9)))),
+			),
+		)
+		.await
+		.expect("bind row-bound-free range filter");
+
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+		assert!(scoped.facts.estimated_byte_size.is_some());
+	}
+
+	#[tokio::test]
+	async fn range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.amount BETWEEN 10 AND 19",
+			)
+			.expect("plan SQL range-filtered dimension join");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind SQL range-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn range_lt_and_gt_estimate_clipped_fraction() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::And(
+				Box::new(Expr::Gt(
+					Box::new(customer_column("amount")),
+					Box::new(Expr::Literal(ScalarValue::Int64(Some(-10)))),
+				)),
+				Box::new(Expr::Lt(
+					Box::new(customer_column("amount")),
+					Box::new(Expr::Literal(ScalarValue::Int64(Some(10)))),
+				)),
+			),
+		)
+		.await
+		.expect("bind clipped range filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+	}
+
+	#[tokio::test]
+	async fn range_between_intersects_same_column_bounds() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let scoped = bind_filtered_customers(&catalog, customer_amount_between(10, 19))
+			.await
+			.expect("bind intersected range filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+		assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(200)));
+	}
+
+	#[tokio::test]
+	async fn range_multiple_bounds_keep_tightest_interval() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::And(
+				Box::new(Expr::And(
+					Box::new(Expr::Gte(
+						Box::new(customer_column("amount")),
+						Box::new(Expr::Literal(ScalarValue::Int64(Some(10)))),
+					)),
+					Box::new(Expr::Gte(
+						Box::new(customer_column("amount")),
+						Box::new(Expr::Literal(ScalarValue::Int64(Some(50)))),
+					)),
+				)),
+				Box::new(Expr::And(
+					Box::new(Expr::Lte(
+						Box::new(customer_column("amount")),
+						Box::new(Expr::Literal(ScalarValue::Int64(Some(90)))),
+					)),
+					Box::new(Expr::Lte(
+						Box::new(customer_column("amount")),
+						Box::new(Expr::Literal(ScalarValue::Int64(Some(70)))),
+					)),
+				)),
+			),
+		)
+		.await
+		.expect("bind multiple-bound range filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(210)));
+	}
+
+	#[tokio::test]
+	async fn range_constant_column_min_equals_max_no_div_by_zero() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(7, 7, 123))],
+		);
+		let at_value = bind_filtered_customers(&catalog, customer_amount_between(7, 7))
+			.await
+			.expect("bind constant-column matching range");
+		let above_value = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
+			),
+		)
+		.await
+		.expect("bind constant-column disjoint range");
+
+		assert_eq!(at_value.facts.estimated_row_count, Some(RowCount::new(123)));
+		assert_eq!(
+			above_value.facts.estimated_row_count,
+			Some(RowCount::new(0))
+		);
+	}
+
+	#[tokio::test]
+	async fn range_outside_envelope_estimates_zero_without_hard_bound() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(200)))),
+			),
+		)
+		.await
+		.expect("bind outside-envelope range filter");
+
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn range_utf8_and_float_facts_fail_open() {
+		let utf8_catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("label", DataType::Utf8, true),
+			]),
+			Vec::new(),
 			vec![(
 				ColumnOrdinal(1),
-				DistinctCountFact::Approx {
-					estimate: 10_000,
-					rel_err_ppm: 26_000,
+				RangeFact {
+					arrow_type_tag: wendelon_client::ARROW_STATS_TAG_UTF8,
+					null_count: 0,
+					non_null_count: 100,
+					min: Some(b"a".to_vec()),
+					max: Some(b"z".to_vec()),
 				},
 			)],
 		);
-		let filtered_customers = LogicalPlan::Filter {
-			input: Box::new(LogicalPlan::ScanNamed {
-				table: TableRef::new("customers"),
-				projection: None,
-			}),
-			predicate: Expr::Gt(
-				Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
-				Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+		let utf8_scoped = bind_filtered_customers(
+			&utf8_catalog,
+			Expr::Gt(
+				Box::new(customer_column("label")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("m".to_string())))),
 			),
-		};
-		let scoped = Binder {
-			catalog: &catalog,
-			config: &PlannerConfig::default(),
-		}
-		.bind_plan(&filtered_customers)
+		)
 		.await
-		.expect("bind range-filtered dimension");
+		.expect("bind UTF8 range filter");
 
-		assert_eq!(scoped.facts.estimated_row_count, None);
+		let float_catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("score", DataType::Float64, true),
+			]),
+			Vec::new(),
+			vec![(
+				ColumnOrdinal(1),
+				RangeFact {
+					arrow_type_tag: wendelon_client::ARROW_STATS_TAG_OPAQUE_UNSUPPORTED,
+					null_count: 0,
+					non_null_count: 100,
+					min: None,
+					max: None,
+				},
+			)],
+		);
+		let float_scoped = bind_filtered_customers(
+			&float_catalog,
+			Expr::Gt(
+				Box::new(customer_column("score")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(0.5)))),
+			),
+		)
+		.await
+		.expect("bind float range filter");
+
+		assert_eq!(utf8_scoped.facts.estimated_row_count, None);
+		assert_eq!(float_scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn range_and_equality_take_single_tightest_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(1_000),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("amount", DataType::Int64, true),
+				Field::new("region", DataType::Utf8, true),
+			]),
+			vec![(ColumnOrdinal(2), DistinctCountFact::Exact(10))],
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::And(
+				Box::new(customer_amount_between(10, 19)),
+				Box::new(Expr::Eq(
+					Box::new(customer_column("region")),
+					Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+				)),
+			),
+		)
+		.await
+		.expect("bind range and equality filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+		assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(10)));
 	}
 
 	#[tokio::test]
@@ -9482,6 +9976,7 @@ mod tests {
 			byte_upper_bound: Some(ByteCount::new(1_024)),
 			row_upper_bound: None,
 			column_ndv: Default::default(),
+			column_range: Default::default(),
 		};
 		catalog
 			.register_table(TableRef::new("composite_pk"), binding)
@@ -10631,6 +11126,7 @@ mod tests {
 					byte_upper_bound: Some(ByteCount::new(bytes)),
 					row_upper_bound: None,
 					column_ndv: Default::default(),
+					column_range: Default::default(),
 				},
 			)
 			.expect("seed optimizer facts");
@@ -10667,12 +11163,47 @@ mod tests {
 		)
 	}
 
+	fn descriptor_sidecar_join_catalog_with_customer_range(
+		customers_row_upper_bound: Option<u64>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			customers_row_upper_bound,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("amount", DataType::Int64, true),
+			]),
+			Vec::new(),
+			column_range,
+		)
+	}
+
 	fn descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
 		orders_byte_upper_bound: Option<u64>,
 		customers_byte_upper_bound: Option<u64>,
 		customers_row_upper_bound: Option<u64>,
 		customers_schema: Schema,
 		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			orders_byte_upper_bound,
+			customers_byte_upper_bound,
+			customers_row_upper_bound,
+			customers_schema,
+			column_ndv,
+			Vec::new(),
+		)
+	}
+
+	fn descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+		orders_byte_upper_bound: Option<u64>,
+		customers_byte_upper_bound: Option<u64>,
+		customers_row_upper_bound: Option<u64>,
+		customers_schema: Schema,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
 	) -> WendelonCatalog {
 		let orders = named_descriptor(
 			1,
@@ -10687,8 +11218,9 @@ mod tests {
 			(
 				TableId(1),
 				orders.clone(),
-				orders_byte_upper_bound
-					.map(|bytes| descriptor_sidecar_facts(&orders, Some(bytes), None, Vec::new())),
+				orders_byte_upper_bound.map(|bytes| {
+					descriptor_sidecar_facts(&orders, Some(bytes), None, Vec::new(), Vec::new())
+				}),
 			),
 			(
 				TableId(2),
@@ -10698,6 +11230,7 @@ mod tests {
 					customers_byte_upper_bound,
 					customers_row_upper_bound,
 					column_ndv,
+					column_range,
 				)),
 			),
 		])
@@ -10709,6 +11242,7 @@ mod tests {
 		materialized_byte_upper_bound: Option<u64>,
 		row_upper_bound: Option<u64>,
 		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
 	) -> DescriptorOptimizerFacts {
 		DescriptorOptimizerFacts {
 			schema_generation: descriptor.schema_generation,
@@ -10723,7 +11257,60 @@ mod tests {
 					distinct_count,
 				})
 				.collect(),
+			column_range: column_range
+				.into_iter()
+				.map(|(column_ordinal, range)| DescriptorColumnRangeFact {
+					column_ordinal,
+					range,
+				})
+				.collect(),
 		}
+	}
+
+	fn range_fact_i64(min: i64, max: i64, non_null_count: u64) -> RangeFact {
+		RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+			null_count: 0,
+			non_null_count,
+			min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(min, 8).unwrap()),
+			max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(max, 8).unwrap()),
+		}
+	}
+
+	fn customer_column(name: &str) -> Expr {
+		Expr::qualified_column(TableRef::new("customers"), name)
+	}
+
+	fn customer_amount_between(low: i64, high: i64) -> Expr {
+		Expr::And(
+			Box::new(Expr::Gte(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(low)))),
+			)),
+			Box::new(Expr::Lte(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(high)))),
+			)),
+		)
+	}
+
+	async fn bind_filtered_customers(
+		catalog: &dyn Catalog,
+		predicate: Expr,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate,
+		};
+		Binder {
+			catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
 	}
 
 	async fn rune_plan(script: &str) -> LogicalPlan {

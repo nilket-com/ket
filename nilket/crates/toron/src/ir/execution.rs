@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{DistinctCountFact, TableRef};
+use crate::catalog::{DistinctCountFact, RangeFact, TableRef};
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{
 	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId, ScalarValue,
@@ -223,6 +223,7 @@ pub enum ExecutionPlan {
 		profile_hint: QueryProfileHint,
 		primary_key_columns: Vec<ColumnOrdinal>,
 		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
 	},
 	Filter {
 		input: Box<ExecutionPlan>,

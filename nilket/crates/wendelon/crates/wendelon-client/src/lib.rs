@@ -62,12 +62,19 @@ pub use wendelon::integration::compute::{
 	validate_query_session_audit_attribution, validate_traceparent,
 };
 pub use wendelon::schema::{
-	CdcCursor, CdcRejectCode, CdcSubscribeBound, ColumnNdvFact, Consistency as ReadConsistency,
-	DurabilityLevel as DurabilityClass, IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint,
-	NdvFact, PbcRejectCode, PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1,
-	PrimaryKeyEncodingV1, RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicyV1,
-	StateDigest, TableObjectId, TableOptimizerFacts, TableSchemaDescriptor,
-	TableSpreadLocalityDescriptorV1,
+	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
+	ARROW_STATS_TAG_DATE64, ARROW_STATS_TAG_INT8, ARROW_STATS_TAG_INT16, ARROW_STATS_TAG_INT32,
+	ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_BINARY, ARROW_STATS_TAG_LARGE_UTF8,
+	ARROW_STATS_TAG_OPAQUE_UNSUPPORTED, ARROW_STATS_TAG_TIMESTAMP_MICROSECOND,
+	ARROW_STATS_TAG_TIMESTAMP_MILLISECOND, ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
+	ARROW_STATS_TAG_UINT8, ARROW_STATS_TAG_UINT16, ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64,
+	ARROW_STATS_TAG_UTF8, CdcCursor, CdcRejectCode, CdcSubscribeBound, ColumnNdvFact,
+	ColumnRangeFact, Consistency as ReadConsistency, DurabilityLevel as DurabilityClass,
+	IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint, NdvFact, PbcRejectCode,
+	PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy,
+	RuntimeFilterDescriptor, SchemaEvolutionPolicyV1, StateDigest, TableObjectId,
+	TableOptimizerFacts, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
+	decode_signed_optimizer_fact_scalar, encode_signed_optimizer_fact_scalar,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

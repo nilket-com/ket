@@ -1710,6 +1710,7 @@ mod tests {
 						byte_upper_bound: Some(ByteCount::new(bytes)),
 						row_upper_bound: None,
 						column_ndv: Default::default(),
+						column_range: Default::default(),
 					},
 				)
 				.expect("seed optimizer facts");
@@ -1738,6 +1739,7 @@ mod tests {
 					byte_upper_bound: None,
 					row_upper_bound: Some(RowCount::new(customers_row_upper_bound)),
 					column_ndv,
+					column_range: Default::default(),
 				},
 			)
 			.expect("seed customers row optimizer facts");

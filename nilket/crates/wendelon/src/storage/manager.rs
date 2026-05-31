@@ -54,14 +54,14 @@ use crate::schema::table::{
 };
 use crate::schema::{
 	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnNdvFact,
-	CompactionJobId, CompactionLevelIndex, EncodingPageByteOffset, HllPrecision, HybridTimestamp,
-	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
-	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
-	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
-	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
+	ColumnRangeFact, CompactionJobId, CompactionLevelIndex, EncodingPageByteOffset, HllPrecision,
+	HybridTimestamp, INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix,
+	IndexObjectId, IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint,
+	ManifestEpoch, NdvFact, RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount,
+	RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
 	SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader, SupersessionMetadata,
 	TableLifecycleCatalog, TableOptimizerFacts, TenantId, TenantKekId, TombstoneMetadata,
-	WriterNodeId,
+	WriterNodeId, range_fact_tag_supported,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnOrdinalSet, ColumnarFallbackReason,
@@ -146,9 +146,9 @@ use crate::storage::secondary_index_segment::{
 };
 use crate::storage::sketch::HllRegisters;
 use crate::storage::stats::{
-	ColumnStatsDescriptorIdentity, ParsedColumnStatsBlock,
-	build_column_stats_block_with_ciphertext_budget, decode_column_stats_payload,
-	locator_flags_for_parsed_column_stats_block,
+	COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsDescriptorIdentity,
+	ParsedColumnStatsBlock, arrow_stats_type_tag, build_column_stats_block_with_ciphertext_budget,
+	decode_column_stats_payload, locator_flags_for_parsed_column_stats_block,
 	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
 };
 use crate::storage::{
@@ -576,6 +576,12 @@ struct NdvColumnCandidate {
 	hll_enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RangeColumnCandidate {
+	ordinal: u16,
+	arrow_type_tag: u8,
+}
+
 #[derive(Clone, Debug)]
 enum TieredStatsContributor {
 	Matching(ParsedColumnStatsBlock),
@@ -621,6 +627,28 @@ fn ndv_column_candidates(
 					hll_enabled: false,
 				});
 			entry.hll_enabled = true;
+		}
+	}
+	Ok(candidates)
+}
+
+fn range_column_candidates(
+	descriptor: &TableSchemaDescriptor,
+) -> std::io::Result<BTreeMap<u16, RangeColumnCandidate>> {
+	let schema = descriptor.arrow_schema()?;
+	let mut candidates = BTreeMap::new();
+	for (ordinal, field) in schema.fields().iter().enumerate() {
+		let Some(arrow_type_tag) = arrow_stats_type_tag(field.data_type()) else {
+			continue;
+		};
+		if range_fact_tag_supported(arrow_type_tag) {
+			candidates.insert(
+				ordinal as u16,
+				RangeColumnCandidate {
+					ordinal: ordinal as u16,
+					arrow_type_tag,
+				},
+			);
 		}
 	}
 	Ok(candidates)
@@ -724,6 +752,83 @@ fn ndv_fact_for_column(
 		}
 	}
 	Ok(None)
+}
+
+fn range_fact_for_column(
+	candidate: &RangeColumnCandidate,
+	blocks: &[ParsedColumnStatsBlock],
+) -> std::io::Result<Option<ColumnRangeFact>> {
+	let mut null_count = 0_u64;
+	let mut non_null_count = 0_u64;
+	let mut min: Option<Vec<u8>> = None;
+	let mut max: Option<Vec<u8>> = None;
+
+	for block in blocks {
+		let Some(entry) = block
+			.columns
+			.iter()
+			.find(|entry| entry.column_ordinal == candidate.ordinal)
+		else {
+			return Ok(None);
+		};
+		if entry.arrow_type_tag != candidate.arrow_type_tag {
+			return Ok(None);
+		}
+		let payload = decode_column_stats_payload(entry)?;
+		let Some(block_null_count) = payload.null_count else {
+			return Ok(None);
+		};
+		let Some(block_non_null_count) = payload.non_null_count else {
+			return Ok(None);
+		};
+		null_count = null_count
+			.checked_add(block_null_count)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "range fact null_count overflow"))?;
+		non_null_count = non_null_count
+			.checked_add(block_non_null_count)
+			.ok_or_else(|| {
+				Error::new(ErrorKind::InvalidData, "range fact non_null_count overflow")
+			})?;
+		if block_non_null_count == 0 {
+			continue;
+		}
+		if entry.stat_flags & (COLUMN_STAT_MIN_TRUNCATED | COLUMN_STAT_MAX_TRUNCATED) != 0 {
+			return Ok(None);
+		}
+		let (Some(block_min), Some(block_max)) = (payload.min, payload.max) else {
+			return Ok(None);
+		};
+		if min
+			.as_deref()
+			.map(|current| block_min.as_slice() < current)
+			.unwrap_or(true)
+		{
+			min = Some(block_min);
+		}
+		if max
+			.as_deref()
+			.map(|current| block_max.as_slice() > current)
+			.unwrap_or(true)
+		{
+			max = Some(block_max);
+		}
+	}
+
+	if non_null_count == 0 {
+		min = None;
+		max = None;
+	} else if min.is_none() || max.is_none() {
+		return Ok(None);
+	}
+
+	Ok(Some(ColumnRangeFact {
+		column_ordinal: candidate.ordinal,
+		arrow_type_tag: candidate.arrow_type_tag,
+		null_count,
+		non_null_count,
+		min,
+		max,
+	}))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4957,8 +5062,9 @@ impl SlabManager {
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptor,
 	) -> std::io::Result<Option<TableOptimizerFacts>> {
-		let candidates = ndv_column_candidates(descriptor)?;
-		if candidates.is_empty() {
+		let ndv_candidates = ndv_column_candidates(descriptor)?;
+		let range_candidates = range_column_candidates(descriptor)?;
+		if ndv_candidates.is_empty() && range_candidates.is_empty() {
 			return Ok(None);
 		}
 		if self
@@ -4991,7 +5097,7 @@ impl SlabManager {
 		}
 
 		let mut column_ndv = Vec::new();
-		for candidate in candidates.values() {
+		for candidate in ndv_candidates.values() {
 			if let Some(distinct) = ndv_fact_for_column(candidate, &blocks)? {
 				column_ndv.push(ColumnNdvFact {
 					column_ordinal: candidate.ordinal,
@@ -4999,7 +5105,13 @@ impl SlabManager {
 				});
 			}
 		}
-		if column_ndv.is_empty() {
+		let mut column_range = Vec::new();
+		for candidate in range_candidates.values() {
+			if let Some(range) = range_fact_for_column(candidate, &blocks)? {
+				column_range.push(range);
+			}
+		}
+		if column_ndv.is_empty() && column_range.is_empty() {
 			return Ok(None);
 		}
 		Ok(Some(TableOptimizerFacts {
@@ -5008,6 +5120,7 @@ impl SlabManager {
 			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 			producer_epoch,
 			column_ndv,
+			column_range,
 		}))
 	}
 
@@ -15026,10 +15139,12 @@ mod tests {
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
 	use crate::storage::multirow::pack_record_batch_by_bucket;
 	use crate::storage::stats::{
-		ARROW_STATS_TAG_INT64, COLUMN_STAT_HAS_HLL, COLUMN_STAT_HAS_NON_NULL_COUNT,
-		COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_SMALL_SET, ColumnStatsBlockEntry,
-		ColumnStatsBlockHeader, decode_column_stats_payload, encode_length_prefixed_bytes,
-		encode_signed_stat_value, parse_column_stats_block,
+		ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_UTF8, COLUMN_STAT_HAS_HLL,
+		COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_HAS_NON_NULL_COUNT,
+		COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_SMALL_SET, COLUMN_STAT_MAX_TRUNCATED,
+		COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry, ColumnStatsBlockHeader,
+		decode_column_stats_payload, encode_length_prefixed_bytes, encode_signed_stat_value,
+		parse_column_stats_block,
 	};
 	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
@@ -15129,6 +15244,54 @@ mod tests {
 		}
 	}
 
+	fn optimizer_fact_range_entry(
+		column_ordinal: u16,
+		arrow_type_tag: u8,
+		null_count: u64,
+		values: &[i64],
+	) -> ColumnStatsBlockEntry {
+		let mut payload = Vec::new();
+		if let Some(min) = values.iter().min() {
+			encode_length_prefixed_bytes(&mut payload, &encode_signed_stat_value(*min, 8).unwrap())
+				.unwrap();
+		}
+		if let Some(max) = values.iter().max() {
+			encode_length_prefixed_bytes(&mut payload, &encode_signed_stat_value(*max, 8).unwrap())
+				.unwrap();
+		}
+		payload.extend_from_slice(&null_count.to_be_bytes());
+		payload.extend_from_slice(&(values.len() as u64).to_be_bytes());
+		let mut stat_flags = COLUMN_STAT_HAS_NULL_COUNT | COLUMN_STAT_HAS_NON_NULL_COUNT;
+		if !values.is_empty() {
+			stat_flags |= COLUMN_STAT_HAS_MIN | COLUMN_STAT_HAS_MAX;
+		}
+		ColumnStatsBlockEntry {
+			column_ordinal,
+			arrow_type_tag,
+			stat_flags,
+			payload,
+		}
+	}
+
+	fn optimizer_fact_truncated_utf8_range_entry() -> ColumnStatsBlockEntry {
+		let mut payload = Vec::new();
+		encode_length_prefixed_bytes(&mut payload, b"abc").unwrap();
+		encode_length_prefixed_bytes(&mut payload, b"zzz").unwrap();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&1_u64.to_be_bytes());
+		ColumnStatsBlockEntry {
+			column_ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_LARGE_UTF8,
+			stat_flags: COLUMN_STAT_HAS_MIN
+				| COLUMN_STAT_HAS_MAX
+				| COLUMN_STAT_HAS_NULL_COUNT
+				| COLUMN_STAT_HAS_NON_NULL_COUNT
+				| COLUMN_STAT_MIN_TRUNCATED
+				| COLUMN_STAT_MAX_TRUNCATED,
+			payload,
+		}
+	}
+
 	#[test]
 	fn complete_small_set_produces_exact_ndv_fact() {
 		let candidate = NdvColumnCandidate {
@@ -15223,6 +15386,76 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn range_fact_merges_counts_min_and_max() {
+		let candidate = RangeColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_INT64,
+		};
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_range_entry(
+				1,
+				ARROW_STATS_TAG_INT64,
+				1,
+				&[10, 20],
+			)]),
+			optimizer_fact_block(vec![optimizer_fact_range_entry(
+				1,
+				ARROW_STATS_TAG_INT64,
+				2,
+				&[-5, 40],
+			)]),
+		];
+
+		let fact = range_fact_for_column(&candidate, &blocks)
+			.expect("range fact")
+			.expect("complete range fact");
+		assert_eq!(fact.column_ordinal, 1);
+		assert_eq!(fact.arrow_type_tag, ARROW_STATS_TAG_INT64);
+		assert_eq!(fact.null_count, 3);
+		assert_eq!(fact.non_null_count, 4);
+		assert_eq!(fact.min, Some(encode_signed_stat_value(-5, 8).unwrap()));
+		assert_eq!(fact.max, Some(encode_signed_stat_value(40, 8).unwrap()));
+	}
+
+	#[test]
+	fn range_fact_all_null_has_no_min_max() {
+		let candidate = RangeColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_INT64,
+		};
+		let blocks = vec![optimizer_fact_block(vec![optimizer_fact_range_entry(
+			1,
+			ARROW_STATS_TAG_INT64,
+			3,
+			&[],
+		)])];
+
+		let fact = range_fact_for_column(&candidate, &blocks)
+			.expect("range fact")
+			.expect("all-null range fact");
+		assert_eq!(fact.null_count, 3);
+		assert_eq!(fact.non_null_count, 0);
+		assert_eq!(fact.min, None);
+		assert_eq!(fact.max, None);
+	}
+
+	#[test]
+	fn range_truncated_min_max_omits_fact() {
+		let candidate = RangeColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_LARGE_UTF8,
+		};
+		let blocks = vec![optimizer_fact_block(vec![
+			optimizer_fact_truncated_utf8_range_entry(),
+		])];
+
+		assert_eq!(
+			range_fact_for_column(&candidate, &blocks).expect("truncated range fact"),
+			None
+		);
+	}
+
 	#[tokio::test]
 	async fn table_optimizer_facts_merges_tiered_small_sets_into_exact_ndv() {
 		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-exact").await;
@@ -15264,6 +15497,49 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn range_fact_with_empty_stats_policy_is_produced_from_min_max() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-empty-policy").await;
+		let descriptor = optimizer_fact_amount_descriptor();
+		assert_eq!(descriptor.stats_policy, ColumnStatsPolicyV1::default());
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_amount_batch(&[(1, Some(10)), (2, Some(20))]),
+			"optimizer-facts-range-empty-policy-a",
+			10,
+		)
+		.await;
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_amount_batch(&[(3, Some(-5)), (4, None), (5, Some(40))]),
+			"optimizer-facts-range-empty-policy-b",
+			20,
+		)
+		.await;
+
+		let facts = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered range facts");
+
+		assert!(facts.column_ndv.is_empty());
+		let amount = facts
+			.column_range
+			.iter()
+			.find(|fact| fact.column_ordinal == 1)
+			.expect("amount range fact");
+		assert_eq!(amount.arrow_type_tag, ARROW_STATS_TAG_INT64);
+		assert_eq!(amount.null_count, 1);
+		assert_eq!(amount.non_null_count, 4);
+		assert_eq!(amount.min, Some(encode_signed_stat_value(-5, 8).unwrap()));
+		assert_eq!(amount.max, Some(encode_signed_stat_value(40, 8).unwrap()));
+	}
+
+	#[tokio::test]
 	async fn active_l1_without_stats_makes_ndv_unknown() {
 		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-active-l1").await;
 		let descriptor = optimizer_fact_region_descriptor();
@@ -15288,6 +15564,43 @@ mod tests {
 			&mgr,
 			&descriptor,
 			&optimizer_fact_region_batch(&[(3, Some("south"))]),
+			30,
+		)
+		.await;
+
+		assert_eq!(
+			mgr.table_optimizer_facts(tenant(), &descriptor)
+				.await
+				.unwrap(),
+			None
+		);
+	}
+
+	#[tokio::test]
+	async fn range_fact_requires_full_contributor_coverage() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-active-l1").await;
+		let descriptor = optimizer_fact_amount_descriptor();
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_amount_batch(&[(1, Some(10)), (2, Some(20))]),
+			"optimizer-facts-range-active-l1",
+			10,
+		)
+		.await;
+
+		let covered = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered range facts before active append");
+		assert!(!covered.column_range.is_empty());
+
+		append_optimizer_fact_rows(
+			&mgr,
+			&descriptor,
+			&optimizer_fact_amount_batch(&[(3, Some(30))]),
 			30,
 		)
 		.await;
@@ -16009,6 +16322,27 @@ mod tests {
 		descriptor
 	}
 
+	fn optimizer_fact_amount_descriptor() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+		]);
+		let mut descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([0xA3; 16]),
+			3,
+			"analytics",
+			"amounts",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		descriptor.validate().unwrap();
+		descriptor
+	}
+
 	fn optimizer_fact_region_batch(rows: &[(i64, Option<&str>)]) -> RecordBatch {
 		RecordBatch::try_new(
 			Arc::new(Schema::new(vec![
@@ -16023,6 +16357,26 @@ mod tests {
 					rows.iter()
 						.map(|(_, region)| *region)
 						.collect::<Vec<Option<&str>>>(),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap()
+	}
+
+	fn optimizer_fact_amount_batch(rows: &[(i64, Option<i64>)]) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("amount", DataType::Int64, true),
+			])),
+			vec![
+				Arc::new(Int64Array::from(
+					rows.iter().map(|(id, _)| Some(*id)).collect::<Vec<_>>(),
+				)) as Arc<dyn Array>,
+				Arc::new(Int64Array::from(
+					rows.iter()
+						.map(|(_, amount)| *amount)
+						.collect::<Vec<Option<i64>>>(),
 				)) as Arc<dyn Array>,
 			],
 		)

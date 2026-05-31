@@ -268,6 +268,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			profile_hint,
 			primary_key_columns,
 			column_ndv,
+			column_range,
 			..
 		} => ExecutionPlan::Scan {
 			legacy_table_id,
@@ -280,6 +281,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			profile_hint,
 			primary_key_columns,
 			column_ndv,
+			column_range,
 			row_identity: RowIdentityProjection::None,
 		},
 		ExecutionPlan::Filter {

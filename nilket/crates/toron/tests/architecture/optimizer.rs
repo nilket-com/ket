@@ -1613,7 +1613,8 @@ pub(crate) fn adr141_equality_only_no_range_in_or_multicolumn_selectivity() {
 	assert!(!helper.contains("BoundBinaryOp::Or"));
 	assert!(!helper.contains("BoundBinaryOp::Lt"));
 	assert!(!helper.contains("BoundExprNode::InList"));
-	assert!(binder.contains("range_filter_does_not_use_ndv_selectivity"));
+	assert!(binder.contains("fn filter_range_selectivity_estimated_row_count"));
+	assert!(binder.contains("range_filter_uses_min_max_range_selectivity_not_ndv"));
 }
 
 #[test]
@@ -1737,6 +1738,183 @@ pub(crate) fn adr142_default_stats_policy_stays_empty() {
 		table.contains("#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]")
 	);
 	assert!(table.contains("stats_policy: ColumnStatsPolicyV1::default()"));
+}
+
+#[test]
+pub(crate) fn adr144_range_facts_are_descriptor_sidecars() {
+	let catalog = catalog_source();
+	let execution = execution_source();
+	let table = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema");
+	let wendelon_facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
+	let descriptor = source_block(&table, "pub struct TableSchemaDescriptor");
+
+	assert!(wendelon_facts.contains("pub struct ColumnRangeFact"));
+	assert!(catalog.contains("pub struct RangeFact"));
+	assert!(catalog.contains("pub struct DescriptorColumnRangeFact"));
+	assert!(catalog.contains("column_range: BTreeMap<ColumnOrdinal, RangeFact>"));
+	assert!(catalog.contains("column_range: Vec<DescriptorColumnRangeFact>"));
+	assert!(catalog.contains("fn descriptor_column_range"));
+	assert!(catalog.contains("descriptor_optimizer_facts_from_storage"));
+	assert!(execution.contains("column_range: Vec<(ColumnOrdinal, RangeFact)>"));
+	assert!(!descriptor.contains("ColumnRangeFact"));
+	assert!(!descriptor.contains("column_range"));
+}
+
+#[test]
+pub(crate) fn adr144_default_stats_policy_remains_empty() {
+	let table = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema");
+	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
+		.expect("read Wendelon slab manager");
+
+	assert!(table.contains("stats_policy: ColumnStatsPolicyV1::default()"));
+	assert!(manager.contains("range_fact_with_empty_stats_policy_is_produced_from_min_max"));
+}
+
+#[test]
+pub(crate) fn adr144_range_scalar_tags_are_schema_owned() {
+	let binder = binder_source();
+	let schema_facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
+	let storage_stats =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/stats.rs"))
+			.expect("read Wendelon storage stats");
+	let client = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("crates")
+			.join("wendelon-client")
+			.join("src")
+			.join("lib.rs"),
+	)
+	.expect("read wendelon-client lib");
+
+	assert!(schema_facts.contains("pub const ARROW_STATS_TAG_INT64"));
+	assert!(schema_facts.contains("pub fn decode_signed_optimizer_fact_scalar"));
+	assert!(schema_facts.contains("pub fn encode_signed_optimizer_fact_scalar"));
+	assert!(storage_stats.contains("pub use crate::schema::{"));
+	assert!(client.contains("ARROW_STATS_TAG_INT64"));
+	assert!(client.contains("ARROW_STATS_TAG_UTF8"));
+	assert!(client.contains("decode_signed_optimizer_fact_scalar"));
+	assert!(binder.contains("wendelon_client::{"));
+	assert!(binder.contains("decode_signed_optimizer_fact_scalar"));
+	assert!(!binder.contains("wendelon::storage::stats"));
+}
+
+#[test]
+pub(crate) fn adr144_range_fact_wire_compatibility_is_explicit() {
+	let schema_facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
+
+	assert!(schema_facts.contains("struct LegacyTableOptimizerFacts"));
+	assert!(schema_facts.contains("impl From<LegacyTableOptimizerFacts> for TableOptimizerFacts"));
+	assert!(schema_facts.contains("postcard::from_bytes::<LegacyTableOptimizerFacts>(bytes)"));
+	assert!(schema_facts.contains("column_range: Vec::new()"));
+	assert!(schema_facts.contains("table_optimizer_facts_legacy_payload_decodes_empty_range"));
+}
+
+#[test]
+pub(crate) fn adr144_range_selectivity_estimate_channel_only() {
+	let binder = binder_source();
+	let filter_arm = binder
+		.split("LogicalPlan::Filter")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Project").next())
+		.expect("Filter bind arm");
+	let range = source_block(&binder, "fn filter_range_selectivity_estimated_row_count");
+	let estimate = source_block(&binder, "fn estimated_rows_for_range");
+
+	assert!(filter_arm.contains("filter_range_selectivity_estimated_row_count"));
+	assert!(filter_arm.contains("min_optional_row_count"));
+	assert!(filter_arm.contains(".with_estimated_row_count(estimated_row_count)"));
+	assert!(range.contains("facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(estimate.contains("range.non_null_count"));
+	assert!(!range.contains("row_upper_bound"));
+	assert!(!range.contains("byte_upper_bound"));
+	assert!(!estimate.contains("row_upper_bound"));
+	assert!(!estimate.contains("byte_upper_bound"));
+	assert!(!estimate.contains("EmptyRelation"));
+	assert!(binder.contains("range_filter_estimates_without_row_upper_bound"));
+	assert!(binder.contains("range_outside_envelope_estimates_zero_without_hard_bound"));
+}
+
+#[test]
+pub(crate) fn adr144_ndv_helper_remains_equality_only() {
+	let binder = binder_source();
+	let ndv = source_block(
+		&binder,
+		"fn predicate_node_equality_ndv_estimated_row_count",
+	);
+	let range = source_block(&binder, "fn filter_range_selectivity_estimated_row_count");
+
+	assert!(ndv.contains("BoundBinaryOp::Eq"));
+	assert!(!ndv.contains("BoundBinaryOp::Lt"));
+	assert!(!ndv.contains("BoundBinaryOp::Gte"));
+	assert!(!range.contains("column_ndv"));
+	assert!(binder.contains("range_and_equality_take_single_tightest_estimate"));
+}
+
+#[test]
+pub(crate) fn adr144_no_kll_quantile_optimizer_fact() {
+	let binder = binder_source();
+	let schema_facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
+	let range = source_block(&binder, "fn filter_range_selectivity_estimated_row_count");
+
+	for forbidden in [
+		"Kll",
+		"KLL",
+		"Quantile",
+		"quantile",
+		"Histogram",
+		"histogram",
+	] {
+		assert!(
+			!schema_facts.contains(forbidden),
+			"range optimizer facts must not introduce {forbidden}"
+		);
+		assert!(
+			!range.contains(forbidden),
+			"range selectivity helper must not introduce {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr144_range_producer_reuses_full_coverage_and_truncation_fence() {
+	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
+		.expect("read Wendelon slab manager");
+	let table_facts = source_block(&manager, "pub async fn table_optimizer_facts");
+	let range_fact = source_block(&manager, "fn range_fact_for_column");
+
+	assert!(table_facts.contains("has_uncovered_local_rows_for_descriptor"));
+	assert!(table_facts.contains("return Ok(None)"));
+	assert!(range_fact.contains("COLUMN_STAT_MIN_TRUNCATED"));
+	assert!(range_fact.contains("COLUMN_STAT_MAX_TRUNCATED"));
+	assert!(range_fact.contains("non_null_count"));
+	assert!(manager.contains("range_fact_requires_full_contributor_coverage"));
+	assert!(manager.contains("range_truncated_min_max_omits_fact"));
 }
 
 #[test]

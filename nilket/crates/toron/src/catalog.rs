@@ -97,11 +97,27 @@ pub struct DescriptorColumnNdvFact {
 	pub distinct_count: DistinctCountFact,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RangeFact {
+	pub arrow_type_tag: u8,
+	pub null_count: u64,
+	pub non_null_count: u64,
+	pub min: Option<Vec<u8>>,
+	pub max: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DescriptorColumnRangeFact {
+	pub column_ordinal: ColumnOrdinal,
+	pub range: RangeFact,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableOptimizerFacts {
 	pub byte_upper_bound: Option<ByteCount>,
 	pub row_upper_bound: Option<RowCount>,
 	pub column_ndv: BTreeMap<ColumnOrdinal, DistinctCountFact>,
+	pub column_range: BTreeMap<ColumnOrdinal, RangeFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +129,8 @@ pub struct DescriptorOptimizerFacts {
 	pub row_upper_bound: Option<RowCount>,
 	#[serde(default)]
 	pub column_ndv: Vec<DescriptorColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<DescriptorColumnRangeFact>,
 }
 
 impl DescriptorOptimizerFacts {
@@ -137,6 +155,7 @@ impl DescriptorOptimizerFacts {
 			byte_upper_bound,
 			row_upper_bound: self.row_upper_bound,
 			column_ndv: descriptor_column_ndv(self.column_ndv, descriptor),
+			column_range: descriptor_column_range(self.column_range, descriptor),
 		}
 	}
 }
@@ -170,6 +189,20 @@ fn descriptor_optimizer_facts_from_storage(
 			},
 		})
 		.collect();
+	let column_range = facts
+		.column_range
+		.into_iter()
+		.map(|fact| DescriptorColumnRangeFact {
+			column_ordinal: ColumnOrdinal(u32::from(fact.column_ordinal)),
+			range: RangeFact {
+				arrow_type_tag: fact.arrow_type_tag,
+				null_count: fact.null_count,
+				non_null_count: fact.non_null_count,
+				min: fact.min,
+				max: fact.max,
+			},
+		})
+		.collect();
 	Some(DescriptorOptimizerFacts {
 		schema_generation: facts.schema_generation,
 		physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
@@ -177,6 +210,7 @@ fn descriptor_optimizer_facts_from_storage(
 		materialized_byte_upper_bound: None,
 		row_upper_bound: None,
 		column_ndv,
+		column_range,
 	})
 }
 
@@ -193,6 +227,21 @@ fn descriptor_column_ndv(
 		.into_iter()
 		.filter(|fact| (fact.column_ordinal.0 as usize) < column_count)
 		.map(|fact| (fact.column_ordinal, fact.distinct_count))
+		.collect()
+}
+
+fn descriptor_column_range(
+	column_range: Vec<DescriptorColumnRangeFact>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> BTreeMap<ColumnOrdinal, RangeFact> {
+	let column_count = descriptor
+		.arrow_schema()
+		.map(|schema| schema.fields().len())
+		.unwrap_or(0);
+	column_range
+		.into_iter()
+		.filter(|fact| (fact.column_ordinal.0 as usize) < column_count)
+		.map(|fact| (fact.column_ordinal, fact.range))
 		.collect()
 }
 
@@ -2971,6 +3020,7 @@ mod tests {
 				byte_upper_bound: Some(ByteCount::new(4_096)),
 				row_upper_bound: Some(RowCount::new(1_000)),
 				column_ndv: Default::default(),
+				column_range: Default::default(),
 			}
 		);
 	}
@@ -3037,6 +3087,7 @@ mod tests {
 				byte_upper_bound: Some(ByteCount::ZERO),
 				row_upper_bound: Some(RowCount::new(0)),
 				column_ndv: Default::default(),
+				column_range: Default::default(),
 			}
 		);
 	}
@@ -3083,6 +3134,7 @@ mod tests {
 					rel_err_ppm: 26_000,
 				},
 			}],
+			column_range: Vec::new(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3111,6 +3163,52 @@ mod tests {
 		assert_eq!(resolved.optimizer_facts.byte_upper_bound, None);
 	}
 
+	#[tokio::test]
+	async fn resolve_table_bind_miss_maps_storage_range_optimizer_facts() {
+		let descriptor = descriptor();
+		let facts = StorageTableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 17,
+			column_ndv: Vec::new(),
+			column_range: vec![wendelon_client::ColumnRangeFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				null_count: 2,
+				non_null_count: 10,
+				min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(0, 4).unwrap()),
+				max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(99, 4).unwrap()),
+			}],
+		};
+		let client = Arc::new(
+			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
+				.with_optimizer_facts([Ok(Some(facts))]),
+		);
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor");
+
+		let range = resolved
+			.optimizer_facts
+			.column_range
+			.get(&ColumnOrdinal(1))
+			.expect("amount range fact");
+		assert_eq!(range.arrow_type_tag, wendelon_client::ARROW_STATS_TAG_INT32);
+		assert_eq!(range.null_count, 2);
+		assert_eq!(range.non_null_count, 10);
+		assert_eq!(resolved.optimizer_facts.row_upper_bound, None);
+		assert_eq!(resolved.optimizer_facts.byte_upper_bound, None);
+	}
+
 	#[test]
 	fn produced_ndv_never_writes_hard_bound() {
 		let descriptor = descriptor();
@@ -3124,6 +3222,7 @@ mod tests {
 					column_ordinal: 1,
 					distinct: StorageNdvFact::Exact { count: 4 },
 				}],
+				column_range: Vec::new(),
 			},
 			&descriptor,
 		)
@@ -3153,6 +3252,7 @@ mod tests {
 				column_ordinal: 1,
 				distinct: StorageNdvFact::Exact { count: 4 },
 			}],
+			column_range: Vec::new(),
 		};
 		assert_eq!(
 			descriptor_optimizer_facts_from_storage(facts, &descriptor),
@@ -3168,6 +3268,7 @@ mod tests {
 				column_ordinal: 1,
 				distinct: StorageNdvFact::Exact { count: 4 },
 			}],
+			column_range: Vec::new(),
 		};
 		assert_eq!(
 			descriptor_optimizer_facts_from_storage(facts, &descriptor),
@@ -4159,6 +4260,7 @@ mod tests {
 			materialized_byte_upper_bound: materialized_bytes.map(ByteCount::new),
 			row_upper_bound: rows.map(RowCount::new),
 			column_ndv: Vec::new(),
+			column_range: Vec::new(),
 		}
 	}
 
