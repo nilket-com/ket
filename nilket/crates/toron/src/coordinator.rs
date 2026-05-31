@@ -1817,6 +1817,7 @@ fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, 
 		row_limit: None,
 		profile_hint: *profile_hint,
 		primary_key_columns: Vec::new(),
+		column_ndv: Vec::new(),
 	};
 
 	if let Some(predicate) = predicate {

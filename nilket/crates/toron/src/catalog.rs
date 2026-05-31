@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -75,19 +75,43 @@ impl TableRowIdentity {
 	}
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DistinctCountFact {
+	Exact(u64),
+	Approx { estimate: u64, rel_err_ppm: u32 },
+}
+
+impl DistinctCountFact {
+	pub const fn point_estimate(self) -> u64 {
+		match self {
+			Self::Exact(value) => value,
+			Self::Approx { estimate, .. } => estimate,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DescriptorColumnNdvFact {
+	pub column_ordinal: ColumnOrdinal,
+	pub distinct_count: DistinctCountFact,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableOptimizerFacts {
 	pub byte_upper_bound: Option<ByteCount>,
 	pub row_upper_bound: Option<RowCount>,
+	pub column_ndv: BTreeMap<ColumnOrdinal, DistinctCountFact>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescriptorOptimizerFacts {
 	pub schema_generation: u64,
 	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
 	pub manifest_epoch: u64,
 	pub materialized_byte_upper_bound: Option<ByteCount>,
 	pub row_upper_bound: Option<RowCount>,
+	#[serde(default)]
+	pub column_ndv: Vec<DescriptorColumnNdvFact>,
 }
 
 impl DescriptorOptimizerFacts {
@@ -111,8 +135,24 @@ impl DescriptorOptimizerFacts {
 		TableOptimizerFacts {
 			byte_upper_bound,
 			row_upper_bound: self.row_upper_bound,
+			column_ndv: descriptor_column_ndv(self.column_ndv, descriptor),
 		}
 	}
+}
+
+fn descriptor_column_ndv(
+	column_ndv: Vec<DescriptorColumnNdvFact>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> BTreeMap<ColumnOrdinal, DistinctCountFact> {
+	let column_count = descriptor
+		.arrow_schema()
+		.map(|schema| schema.fields().len())
+		.unwrap_or(0);
+	column_ndv
+		.into_iter()
+		.filter(|fact| (fact.column_ordinal.0 as usize) < column_count)
+		.map(|fact| (fact.column_ordinal, fact.distinct_count))
+		.collect()
 }
 
 #[derive(Clone)]
@@ -2827,6 +2867,7 @@ mod tests {
 			TableOptimizerFacts {
 				byte_upper_bound: Some(ByteCount::new(4_096)),
 				row_upper_bound: Some(RowCount::new(1_000)),
+				column_ndv: Default::default(),
 			}
 		);
 	}
@@ -2892,6 +2933,7 @@ mod tests {
 			TableOptimizerFacts {
 				byte_upper_bound: Some(ByteCount::ZERO),
 				row_upper_bound: Some(RowCount::new(0)),
+				column_ndv: Default::default(),
 			}
 		);
 	}
@@ -3879,6 +3921,7 @@ mod tests {
 			manifest_epoch: 11,
 			materialized_byte_upper_bound: materialized_bytes.map(ByteCount::new),
 			row_upper_bound: rows.map(RowCount::new),
+			column_ndv: Vec::new(),
 		}
 	}
 

@@ -1234,13 +1234,14 @@ fn descriptor_bootstrap_optimizer_facts_are_sidecar_optional() {
 		manifest_epoch: 12,
 		materialized_byte_upper_bound: Some(ByteCount::new(8_192)),
 		row_upper_bound: Some(RowCount::new(1_000)),
+		column_ndv: Vec::new(),
 	};
 	let bootstrap = DescriptorBootstrap {
 		tables: vec![DescriptorBootstrapEntry {
 			tenant_id: 7,
 			table_id: 1,
 			descriptor,
-			optimizer_facts: Some(facts),
+			optimizer_facts: Some(facts.clone()),
 		}],
 	};
 	let path = write_descriptor_bootstrap_json(
@@ -1259,6 +1260,39 @@ fn descriptor_bootstrap_optimizer_facts_are_sidecar_optional() {
 	assert_eq!(legacy.len(), 1);
 	assert_eq!(legacy[0].0, TenantId(7));
 	assert_eq!(legacy[0].1, TableId(1));
+}
+
+#[test]
+fn descriptor_bootstrap_optimizer_facts_column_ndv_defaults_when_missing() {
+	let descriptor = descriptor();
+	let facts = DescriptorOptimizerFacts {
+		schema_generation: descriptor.schema_generation,
+		physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+		manifest_epoch: 12,
+		materialized_byte_upper_bound: Some(ByteCount::new(8_192)),
+		row_upper_bound: Some(RowCount::new(1_000)),
+		column_ndv: Vec::new(),
+	};
+	let bootstrap = DescriptorBootstrap {
+		tables: vec![DescriptorBootstrapEntry {
+			tenant_id: 7,
+			table_id: 1,
+			descriptor,
+			optimizer_facts: Some(facts.clone()),
+		}],
+	};
+	let mut value = serde_json::to_value(bootstrap).expect("serialize descriptor facts bootstrap");
+	value["tables"][0]["optimizer_facts"]
+		.as_object_mut()
+		.expect("optimizer facts object")
+		.remove("column_ndv");
+	let path = write_descriptor_bootstrap_json("descriptor-facts-missing-column-ndv", value);
+
+	let records =
+		load_descriptor_bootstrap_with_optimizer_facts(&path).expect("load facts bootstrap");
+
+	assert_eq!(records.len(), 1);
+	assert_eq!(records[0].3, Some(facts));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy,
+	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
 	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, ScalarValue,
 	SortExpr,
 };
@@ -233,6 +233,22 @@ impl RuneDataFrame {
 
 	pub fn inner_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
 		join_with_kind(self.plan, right.plan, JoinKind::Inner, on)
+	}
+
+	pub fn auto_join(self, right: RuneDataFrame, on: RuneExpr) -> VmResult<Self> {
+		let pairs = match expr_to_join_keys(&on.expr) {
+			Ok(pairs) => pairs,
+			Err(error) => return VmResult::panic(error.to_string()),
+		};
+		VmResult::Ok(Self {
+			plan: LogicalPlan::Join {
+				left: Box::new(self.plan),
+				right: Box::new(right.plan),
+				kind: JoinKind::Inner,
+				on: pairs,
+				strategy_intent: JoinStrategyIntent::Auto,
+			},
+		})
 	}
 
 	/// Broadcast-join `self` as the left/build side and probe `right`.
@@ -914,6 +930,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("alias", RuneDataFrame::alias)?;
 	m.associated_function("join", RuneDataFrame::join)?;
 	m.associated_function("inner_join", RuneDataFrame::inner_join)?;
+	m.associated_function("auto_join", RuneDataFrame::auto_join)?;
 	m.associated_function("broadcast_join", RuneDataFrame::broadcast_join)?;
 	m.associated_function("explain", RuneDataFrame::explain)?;
 	m.associated_function("left_join", RuneDataFrame::left_join)?;

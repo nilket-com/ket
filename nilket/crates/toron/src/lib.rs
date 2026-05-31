@@ -28,11 +28,11 @@ mod tests {
 	use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
-	use std::collections::{HashMap, HashSet};
+	use std::collections::{BTreeMap, HashMap, HashSet};
 	use std::sync::Arc;
 
 	use crate::binder::{PlannerConfig, bind};
-	use crate::catalog::{MockCatalog, TableOptimizerFacts};
+	use crate::catalog::{DistinctCountFact, MockCatalog, TableOptimizerFacts};
 	use crate::coordinator::DistributedQueryCoordinator;
 	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
@@ -57,9 +57,9 @@ mod tests {
 	use crate::error::{QueryError, StorageError, TaskFailureKind};
 	use crate::exec::Executor;
 	use crate::ir::{
-		AggregateFunction, BoundExprProgram, ExecutionPlan, Expr, JoinKind, JoinStrategy,
-		JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, MorselId, ScalarValue, SortExpr,
-		StageId, TableId,
+		AggregateFunction, BoundExprProgram, ColumnOrdinal, ExecutionPlan, Expr, JoinKind,
+		JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, MorselId,
+		ScalarValue, SortExpr, StageId, TableId,
 	};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::server::{
@@ -871,6 +871,35 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn ndv_underestimate_over_cap_replays_as_hash() {
+		let hash_results = run_distributed_join_query(ndv_filtered_fact_dim_join_plan(), 16).await;
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+
+		let replay_results = run_distributed_join_query_with_catalog_config_and_budget(
+			ndv_filtered_fact_dim_join_plan(),
+			3,
+			join_catalog_with_customers_row_upper_bound_and_ndv(
+				20_000,
+				BTreeMap::from([(
+					ColumnOrdinal(1),
+					DistinctCountFact::Approx {
+						estimate: 20_000,
+						rel_err_ppm: 26_000,
+					},
+				)]),
+			),
+			PlannerConfig::default(),
+			query_budget,
+		)
+		.await
+		.expect("NDV-estimated broadcast should replay as hash");
+
+		assert_fact_dim_join_matches_hash(&hash_results, &replay_results);
+	}
+
+	#[tokio::test]
 	async fn hard_bound_broadcast_over_cap_replays_as_hash_and_matches_digest() {
 		let hash_results = run_distributed_join_query(sql_fact_dim_join_plan(), 16).await;
 		let mut query_budget = QueryBudget::test_default();
@@ -1595,6 +1624,7 @@ mod tests {
 					TableOptimizerFacts {
 						byte_upper_bound: Some(ByteCount::new(bytes)),
 						row_upper_bound: None,
+						column_ndv: Default::default(),
 					},
 				)
 				.expect("seed optimizer facts");
@@ -1605,6 +1635,16 @@ mod tests {
 	fn join_catalog_with_customers_row_upper_bound(
 		customers_row_upper_bound: u64,
 	) -> Arc<MockCatalog> {
+		join_catalog_with_customers_row_upper_bound_and_ndv(
+			customers_row_upper_bound,
+			BTreeMap::new(),
+		)
+	}
+
+	fn join_catalog_with_customers_row_upper_bound_and_ndv(
+		customers_row_upper_bound: u64,
+		column_ndv: BTreeMap<ColumnOrdinal, DistinctCountFact>,
+	) -> Arc<MockCatalog> {
 		let mut catalog = join_catalog_inner();
 		catalog
 			.seed_optimizer_facts(
@@ -1612,6 +1652,7 @@ mod tests {
 				TableOptimizerFacts {
 					byte_upper_bound: None,
 					row_upper_bound: Some(RowCount::new(customers_row_upper_bound)),
+					column_ndv,
 				},
 			)
 			.expect("seed customers row optimizer facts");
@@ -1768,6 +1809,34 @@ mod tests {
 		crate::sql_planner::SqlPlanner::new()
 			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 			.expect("SQL fact-dim join plan")
+	}
+
+	fn ndv_filtered_fact_dim_join_plan() -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: crate::catalog::TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::Filter {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("customers"),
+					projection: None,
+				}),
+				predicate: Expr::Eq(
+					Box::new(Expr::qualified_column(
+						crate::catalog::TableRef::new("customers"),
+						"region",
+					)),
+					Box::new(Expr::Literal(ScalarValue::Utf8(Some("west".to_string())))),
+				),
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}
 	}
 
 	fn sql_fact_two_dim_join_plan() -> LogicalPlan {

@@ -1034,6 +1034,7 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 		row_limit: None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: vec![],
+		column_ndv: Vec::new(),
 	}
 }
 

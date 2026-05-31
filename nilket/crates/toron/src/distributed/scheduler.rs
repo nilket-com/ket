@@ -1281,6 +1281,7 @@ mod tests {
 				row_limit: None,
 				profile_hint: crate::ir::QueryProfileHint::Scan,
 				primary_key_columns: Vec::new(),
+				column_ndv: Vec::new(),
 			},
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1630,6 +1631,7 @@ mod tests {
 			row_limit: None,
 			profile_hint: crate::ir::QueryProfileHint::Scan,
 			primary_key_columns: Vec::new(),
+			column_ndv: Vec::new(),
 		};
 		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {
 			exchange_id,
@@ -1653,6 +1655,7 @@ mod tests {
 			row_limit: None,
 			profile_hint: crate::ir::QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
+			column_ndv: Vec::new(),
 		}
 	}
 

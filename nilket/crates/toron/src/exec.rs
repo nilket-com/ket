@@ -5219,6 +5219,7 @@ mod tests {
 			row_limit: None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
+			column_ndv: Vec::new(),
 		};
 
 		executor
@@ -6205,6 +6206,7 @@ mod tests {
 			row_limit: None,
 			profile_hint: QueryProfileHint::Scan,
 			primary_key_columns: vec![ColumnOrdinal(0)],
+			column_ndv: Vec::new(),
 		}
 	}
 

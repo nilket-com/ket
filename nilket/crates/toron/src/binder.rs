@@ -11,7 +11,9 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use crate::aggregate_kernel::{
 	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
 };
-use crate::catalog::{Catalog, TableBinding, TableOptimizerFacts, TableRef, TableRowIdentity};
+use crate::catalog::{
+	Catalog, DistinctCountFact, TableBinding, TableOptimizerFacts, TableRef, TableRowIdentity,
+};
 use crate::distributed::budget::{ByteCount, QueryBudget};
 use crate::distributed::task::RowCount;
 use crate::error::BindingError;
@@ -164,6 +166,7 @@ struct PlanOptimizerFacts {
 	origin: PlanOrigin,
 	byte_upper_bound: Option<ByteCount>,
 	estimated_byte_size: Option<ByteCount>,
+	estimated_row_count: Option<RowCount>,
 	row_upper_bound: Option<RowCount>,
 }
 
@@ -181,6 +184,7 @@ impl PlanOptimizerFacts {
 			origin: PlanOrigin::SingleBaseRelation,
 			byte_upper_bound: facts.byte_upper_bound,
 			estimated_byte_size: None,
+			estimated_row_count: None,
 			row_upper_bound: facts.row_upper_bound,
 		}
 	}
@@ -190,6 +194,7 @@ impl PlanOptimizerFacts {
 			origin: PlanOrigin::Composite,
 			byte_upper_bound: None,
 			estimated_byte_size: None,
+			estimated_row_count: None,
 			row_upper_bound: None,
 		}
 	}
@@ -199,6 +204,7 @@ impl PlanOptimizerFacts {
 			origin: PlanOrigin::Composite,
 			byte_upper_bound: None,
 			estimated_byte_size: None,
+			estimated_row_count: None,
 			row_upper_bound,
 		}
 	}
@@ -211,6 +217,7 @@ impl PlanOptimizerFacts {
 			origin: PlanOrigin::Composite,
 			byte_upper_bound,
 			estimated_byte_size: None,
+			estimated_row_count: None,
 			row_upper_bound,
 		}
 	}
@@ -232,6 +239,7 @@ impl PlanOptimizerFacts {
 			origin: self.origin,
 			byte_upper_bound: None,
 			estimated_byte_size: None,
+			estimated_row_count: self.estimated_row_count,
 			row_upper_bound: self.row_upper_bound,
 		}
 	}
@@ -242,8 +250,25 @@ impl PlanOptimizerFacts {
 			.row_upper_bound
 			.map(|row| std::cmp::min(row, cap))
 			.or(Some(cap));
+		let estimated_row_count = self.estimated_row_count.map(|row| std::cmp::min(row, cap));
 		Self {
 			row_upper_bound,
+			estimated_row_count,
+			..self
+		}
+	}
+
+	fn with_estimated_row_count(self, estimate: RowCount) -> Self {
+		let estimate = self
+			.estimated_row_count
+			.map(|existing| std::cmp::min(existing, estimate))
+			.unwrap_or(estimate);
+		let estimate = self
+			.row_upper_bound
+			.map(|row_upper_bound| std::cmp::min(row_upper_bound, estimate))
+			.unwrap_or(estimate);
+		Self {
+			estimated_row_count: Some(estimate),
 			..self
 		}
 	}
@@ -265,11 +290,11 @@ impl PlanOptimizerFacts {
 		if self.origin != PlanOrigin::SingleBaseRelation {
 			return self;
 		}
-		let Some(row_upper_bound) = self.row_upper_bound else {
+		let Some(row_count) = estimate_row_source(self.row_upper_bound, self.estimated_row_count)
+		else {
 			return self;
 		};
-		let Some(estimated_byte_size) = estimate_materialized_byte_size(row_upper_bound, schema)
-		else {
+		let Some(estimated_byte_size) = estimate_materialized_byte_size(row_count, schema) else {
 			return Self {
 				estimated_byte_size: None,
 				..self
@@ -283,6 +308,18 @@ impl PlanOptimizerFacts {
 			),
 			..self
 		}
+	}
+}
+
+fn estimate_row_source(
+	row_upper_bound: Option<RowCount>,
+	estimated_row_count: Option<RowCount>,
+) -> Option<RowCount> {
+	match (row_upper_bound, estimated_row_count) {
+		(Some(hard), Some(estimated)) => Some(std::cmp::min(hard, estimated)),
+		(Some(hard), None) => Some(hard),
+		(None, Some(estimated)) => Some(estimated),
+		(None, None) => None,
 	}
 }
 
@@ -465,7 +502,7 @@ impl<'a> Binder<'a> {
 			match plan {
 				LogicalPlan::Scan { table, projection } => {
 					let binding = self.catalog.resolve_table_id(*table).await?;
-					let optimizer_facts = binding.optimizer_facts;
+					let optimizer_facts = binding.optimizer_facts.clone();
 					let projection = projection
 						.as_ref()
 						.map(|columns| {
@@ -494,7 +531,7 @@ impl<'a> Binder<'a> {
 						return Ok(ScopedExecutionPlan::new(plan, scope));
 					}
 					let binding = self.catalog.resolve_table(table).await?;
-					let optimizer_facts = binding.optimizer_facts;
+					let optimizer_facts = binding.optimizer_facts.clone();
 					let projection = projection
 						.as_ref()
 						.map(|columns| {
@@ -540,6 +577,11 @@ impl<'a> Binder<'a> {
 					let input_scope = input.scope.clone();
 					let has_pk_row_cap =
 						filter_includes_primary_key_row_cap(&bound_predicate, &input.plan);
+					let ndv_estimated_row_count = filter_equality_ndv_estimated_row_count(
+						&bound_predicate,
+						&input.plan,
+						input_facts,
+					);
 					let (plan, _) = plan_filter_with_predicate_pushdown(
 						input.plan,
 						bound_predicate,
@@ -554,6 +596,11 @@ impl<'a> Binder<'a> {
 							.with_pk_row_cap()
 					} else {
 						input_facts.preserve_volume_non_increasing()
+					};
+					let facts = if let Some(estimated_row_count) = ndv_estimated_row_count {
+						facts.with_estimated_row_count(estimated_row_count)
+					} else {
+						facts
 					}
 					.derive_estimated_byte_size(plan.schema().as_ref());
 					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
@@ -3617,6 +3664,12 @@ fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 }
 
 fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> ExecutionPlan {
+	let column_ndv = binding
+		.optimizer_facts
+		.column_ndv
+		.iter()
+		.map(|(ordinal, distinct_count)| (*ordinal, *distinct_count))
+		.collect::<Vec<_>>();
 	ExecutionPlan::Scan {
 		legacy_table_id: binding.legacy_table_id,
 		table: binding.table,
@@ -3628,6 +3681,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		row_identity: crate::storage::RowIdentityProjection::None,
 		profile_hint: QueryProfileHint::Scan,
 		primary_key_columns: sorted_columns(&binding.primary_key_columns),
+		column_ndv,
 	}
 }
 
@@ -3714,6 +3768,103 @@ fn filter_includes_primary_key_row_cap(
 		} => predicate_includes_primary_key_equality(predicate, primary_key_columns),
 		_ => false,
 	}
+}
+
+fn filter_equality_ndv_estimated_row_count(
+	predicate: &BoundExprProgram,
+	input: &ExecutionPlan,
+	facts: PlanOptimizerFacts,
+) -> Option<RowCount> {
+	if facts.origin != PlanOrigin::SingleBaseRelation {
+		return None;
+	}
+	let base_rows = facts.row_upper_bound?;
+	let root = predicate.single_root()?;
+	predicate_node_equality_ndv_estimated_row_count(predicate, root, input, base_rows)
+}
+
+fn predicate_node_equality_ndv_estimated_row_count(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	input: &ExecutionPlan,
+	base_rows: RowCount,
+) -> Option<RowCount> {
+	match program.node(id) {
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::Eq,
+			left,
+			right,
+		}) => equality_ndv_estimated_row_count(program, *left, *right, input, base_rows)
+			.or_else(|| equality_ndv_estimated_row_count(program, *right, *left, input, base_rows)),
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::And,
+			left,
+			right,
+		}) => {
+			let left =
+				predicate_node_equality_ndv_estimated_row_count(program, *left, input, base_rows);
+			let right =
+				predicate_node_equality_ndv_estimated_row_count(program, *right, input, base_rows);
+			match (left, right) {
+				(Some(left), Some(right)) => Some(std::cmp::min(left, right)),
+				(Some(left), None) => Some(left),
+				(None, Some(right)) => Some(right),
+				(None, None) => None,
+			}
+		}
+		_ => None,
+	}
+}
+
+fn equality_ndv_estimated_row_count(
+	program: &BoundExprProgram,
+	column_side: BoundExprId,
+	literal_side: BoundExprId,
+	input: &ExecutionPlan,
+	base_rows: RowCount,
+) -> Option<RowCount> {
+	let Some(BoundExprNode::Column(column)) = program.node(column_side) else {
+		return None;
+	};
+	let Some(BoundExprNode::Literal(literal)) = program.node(literal_side) else {
+		return None;
+	};
+	let Some(value) = program.literals.get(*literal as usize) else {
+		return None;
+	};
+	if !literal_is_non_null(value) {
+		return None;
+	}
+	let distinct_count = column_ndv_for_input(input, column.ordinal)?;
+	Some(estimated_rows_for_ndv(
+		base_rows,
+		distinct_count.point_estimate(),
+	))
+}
+
+fn column_ndv_for_input(
+	input: &ExecutionPlan,
+	requested_column: ColumnOrdinal,
+) -> Option<DistinctCountFact> {
+	match input {
+		ExecutionPlan::Scan { column_ndv, .. } => {
+			column_ndv.iter().find_map(|(column, distinct_count)| {
+				(*column == requested_column).then_some(*distinct_count)
+			})
+		}
+		ExecutionPlan::Filter { input, .. } => column_ndv_for_input(input, requested_column),
+		_ => None,
+	}
+}
+
+fn estimated_rows_for_ndv(base_rows: RowCount, ndv: u64) -> RowCount {
+	let rows = base_rows.get();
+	if rows == 0 {
+		return RowCount::new(0);
+	}
+	let divisor = u128::from(ndv.max(1));
+	let estimated = (u128::from(rows) + divisor - 1) / divisor;
+	RowCount::new(u64::try_from(estimated).unwrap_or(u64::MAX).max(1))
 }
 
 fn predicate_node_includes_primary_key_equality(
@@ -5109,6 +5260,7 @@ fn optimize_for_required(
 			row_identity,
 			profile_hint,
 			primary_key_columns,
+			column_ndv,
 		} => {
 			let all_columns = all_columns(&schema);
 			let required = required_output.unwrap_or(all_columns);
@@ -5118,6 +5270,15 @@ fn optimize_for_required(
 			let primary_key_columns = primary_key_columns
 				.into_iter()
 				.filter_map(|column| remap.get(&column).copied())
+				.collect();
+			let column_ndv = column_ndv
+				.into_iter()
+				.filter_map(|(column, distinct_count)| {
+					remap
+						.get(&column)
+						.copied()
+						.map(|mapped| (mapped, distinct_count))
+				})
 				.collect();
 
 			Ok((
@@ -5132,6 +5293,7 @@ fn optimize_for_required(
 					row_identity,
 					profile_hint,
 					primary_key_columns,
+					column_ndv,
 				},
 				remap,
 			))
@@ -7196,7 +7358,9 @@ fn is_pbc_eligible_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::catalog::{DescriptorOptimizerFacts, MockCatalog, WendelonCatalog};
+	use crate::catalog::{
+		DescriptorColumnNdvFact, DescriptorOptimizerFacts, MockCatalog, WendelonCatalog,
+	};
 	use crate::distributed::arrow_ipc::encode_record_batch;
 	use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, TableId};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
@@ -8175,12 +8339,14 @@ mod tests {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(3_072)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			&auto_broadcast_config(4_096),
@@ -8294,12 +8460,14 @@ mod tests {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			&auto_broadcast_config(4_096),
@@ -8327,12 +8495,14 @@ mod tests {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_536)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			&config,
@@ -8573,6 +8743,309 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[tokio::test]
+	async fn direct_equality_filtered_dim_with_ndv_infers_broadcast_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+			),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind NDV-filtered dimension");
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(2)));
+		assert!(scoped.facts.estimated_byte_size.is_some());
+
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(filtered_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind NDV-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn rune_equality_filtered_dim_with_ndv_infers_broadcast_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let logical = rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("customers").alias("c")
+               .filter(qcol("c", "region").eq(lit_str("north")))
+               .auto_join(
+                   ctx.table("orders").alias("o"),
+                   qcol("c", "id").eq(qcol("o", "customer_id"))
+               )
+        }
+    "#,
+		)
+		.await;
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind Rune NDV-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Left,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn missing_ndv_keeps_137_138_behavior() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(20_000));
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+			),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind filtered dimension without NDV");
+		assert_eq!(scoped.facts.estimated_row_count, None);
+
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(filtered_customers),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind missing-NDV dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+	}
+
+	#[tokio::test]
+	async fn ndv_selectivity_writes_estimated_row_count_not_hard_bound() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+			),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind NDV-filtered dimension");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(2)));
+		assert!(scoped.facts.estimated_byte_size.is_some());
+	}
+
+	#[tokio::test]
+	async fn exact_ndv_still_uses_estimate_channel() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+			),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind exact-NDV filtered dimension");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(2)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+	}
+
+	#[tokio::test]
+	async fn range_filter_does_not_use_ndv_selectivity() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::Gt(
+				Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+				Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+			),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind range-filtered dimension");
+
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn and_filter_uses_single_equality_not_independence_product() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(10_000),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("region", DataType::Utf8, true),
+				Field::new("segment", DataType::Utf8, true),
+			]),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+		);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: Expr::And(
+				Box::new(Expr::Eq(
+					Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+					Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
+				)),
+				Box::new(Expr::Eq(
+					Box::new(Expr::qualified_column(
+						TableRef::new("customers"),
+						"segment",
+					)),
+					Box::new(Expr::Literal(ScalarValue::Utf8(Some(
+						"enterprise".to_string(),
+					)))),
+				)),
+			),
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind AND-filtered dimension");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+		assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(1)));
 	}
 
 	#[test]
@@ -8856,6 +9329,7 @@ mod tests {
 		binding.optimizer_facts = TableOptimizerFacts {
 			byte_upper_bound: Some(ByteCount::new(1_024)),
 			row_upper_bound: None,
+			column_ndv: Default::default(),
 		};
 		catalog
 			.register_table(TableRef::new("composite_pk"), binding)
@@ -9688,12 +10162,14 @@ mod tests {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: None,
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			&config,
@@ -9719,12 +10195,14 @@ mod tests {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: None,
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(1_024)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			&config,
@@ -9767,12 +10245,14 @@ mod tests {
 					origin: PlanOrigin::SingleBaseRelation,
 					byte_upper_bound: left_bytes.map(ByteCount::new),
 					estimated_byte_size: None,
+					estimated_row_count: None,
 					row_upper_bound: None,
 				}),
 				join_input(PlanOptimizerFacts {
 					origin: PlanOrigin::SingleBaseRelation,
 					byte_upper_bound: right_bytes.map(ByteCount::new),
 					estimated_byte_size: None,
+					estimated_row_count: None,
 					row_upper_bound: None,
 				}),
 				&config,
@@ -9808,12 +10288,14 @@ mod tests {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(8_192)),
 				estimated_byte_size: Some(ByteCount::new(1_024)),
+				estimated_row_count: None,
 				row_upper_bound: Some(RowCount::new(1)),
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(8_192)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			&config,
@@ -9835,12 +10317,14 @@ mod tests {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(2_048)),
 				estimated_byte_size: Some(ByteCount::new(512)),
+				estimated_row_count: None,
 				row_upper_bound: Some(RowCount::new(1)),
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: Some(ByteCount::new(8_192)),
 				estimated_byte_size: None,
+				estimated_row_count: None,
 				row_upper_bound: None,
 			}),
 			&config,
@@ -9867,12 +10351,14 @@ mod tests {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: None,
 				estimated_byte_size: Some(ByteCount::new(8_192)),
+				estimated_row_count: None,
 				row_upper_bound: Some(RowCount::new(100)),
 			}),
 			join_input(PlanOptimizerFacts {
 				origin: PlanOrigin::SingleBaseRelation,
 				byte_upper_bound: None,
 				estimated_byte_size: Some(ByteCount::new(8_192)),
+				estimated_row_count: None,
 				row_upper_bound: Some(RowCount::new(100)),
 			}),
 			&config,
@@ -9992,6 +10478,7 @@ mod tests {
 				TableOptimizerFacts {
 					byte_upper_bound: Some(ByteCount::new(bytes)),
 					row_upper_bound: None,
+					column_ndv: Default::default(),
 				},
 			)
 			.expect("seed optimizer facts");
@@ -10002,6 +10489,39 @@ mod tests {
 		customers_byte_upper_bound: Option<u64>,
 		customers_row_upper_bound: Option<u64>,
 	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customer_ndv(
+			orders_byte_upper_bound,
+			customers_byte_upper_bound,
+			customers_row_upper_bound,
+			Vec::new(),
+		)
+	}
+
+	fn descriptor_sidecar_join_catalog_with_customer_ndv(
+		orders_byte_upper_bound: Option<u64>,
+		customers_byte_upper_bound: Option<u64>,
+		customers_row_upper_bound: Option<u64>,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			orders_byte_upper_bound,
+			customers_byte_upper_bound,
+			customers_row_upper_bound,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("region", DataType::Utf8, true),
+			]),
+			column_ndv,
+		)
+	}
+
+	fn descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+		orders_byte_upper_bound: Option<u64>,
+		customers_byte_upper_bound: Option<u64>,
+		customers_row_upper_bound: Option<u64>,
+		customers_schema: Schema,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+	) -> WendelonCatalog {
 		let orders = named_descriptor(
 			1,
 			"orders",
@@ -10010,20 +10530,13 @@ mod tests {
 				Field::new("customer_id", DataType::Int64, false),
 			]),
 		);
-		let customers = named_descriptor(
-			2,
-			"customers",
-			Schema::new(vec![
-				Field::new("id", DataType::Int64, false),
-				Field::new("region", DataType::Utf8, true),
-			]),
-		);
+		let customers = named_descriptor(2, "customers", customers_schema);
 		WendelonCatalog::from_descriptors_with_optimizer_facts([
 			(
 				TableId(1),
 				orders.clone(),
 				orders_byte_upper_bound
-					.map(|bytes| descriptor_sidecar_facts(&orders, Some(bytes), None)),
+					.map(|bytes| descriptor_sidecar_facts(&orders, Some(bytes), None, Vec::new())),
 			),
 			(
 				TableId(2),
@@ -10032,6 +10545,7 @@ mod tests {
 					&customers,
 					customers_byte_upper_bound,
 					customers_row_upper_bound,
+					column_ndv,
 				)),
 			),
 		])
@@ -10042,6 +10556,7 @@ mod tests {
 		descriptor: &TableSchemaDescriptor,
 		materialized_byte_upper_bound: Option<u64>,
 		row_upper_bound: Option<u64>,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
 	) -> DescriptorOptimizerFacts {
 		DescriptorOptimizerFacts {
 			schema_generation: descriptor.schema_generation,
@@ -10049,6 +10564,13 @@ mod tests {
 			manifest_epoch: 7,
 			materialized_byte_upper_bound: materialized_byte_upper_bound.map(ByteCount::new),
 			row_upper_bound: row_upper_bound.map(RowCount::new),
+			column_ndv: column_ndv
+				.into_iter()
+				.map(|(column_ordinal, distinct_count)| DescriptorColumnNdvFact {
+					column_ordinal,
+					distinct_count,
+				})
+				.collect(),
 		}
 	}
 

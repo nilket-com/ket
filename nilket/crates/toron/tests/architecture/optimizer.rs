@@ -1523,3 +1523,189 @@ pub(crate) fn adr140_138_fact_split_untouched() {
 	assert!(binder.contains("fn derive_estimated_byte_size"));
 	assert!(!binder.contains("estimated_byte_size: None,\n\t\t\tbyte_upper_bound"));
 }
+
+#[test]
+pub(crate) fn adr141_column_ndv_fact_is_descriptor_adjacent_not_schema_descriptor() {
+	let catalog = catalog_source();
+	let table_policy = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema");
+
+	assert!(catalog.contains("pub struct DescriptorColumnNdvFact"));
+	assert!(catalog.contains("pub struct DescriptorOptimizerFacts"));
+	assert!(catalog.contains("#[serde(default)]"));
+	assert!(catalog.contains("pub column_ndv: Vec<DescriptorColumnNdvFact>"));
+	assert!(catalog.contains("pub struct TableOptimizerFacts"));
+	assert!(catalog.contains("pub column_ndv: BTreeMap<ColumnOrdinal, DistinctCountFact>"));
+	assert!(!table_policy.contains("column_ndv"));
+	assert!(!table_policy.contains("DistinctCountFact"));
+}
+
+#[test]
+pub(crate) fn adr141_ndv_fact_is_labeled_exact_or_approximate() {
+	let catalog = catalog_source();
+	let fact = source_block(&catalog, "pub enum DistinctCountFact");
+
+	assert!(fact.contains("Exact(u64)"));
+	assert!(fact.contains("Approx { estimate: u64, rel_err_ppm: u32 }"));
+	assert!(!fact.contains("f64"));
+	assert!(catalog.contains("pub const fn point_estimate"));
+}
+
+#[test]
+pub(crate) fn adr141_selectivity_writes_estimated_row_count_only() {
+	let binder = binder_source();
+	let facts = source_block(&binder, "impl PlanOptimizerFacts");
+	let filter_arm = binder
+		.split("LogicalPlan::Filter { input, predicate } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Project").next())
+		.expect("Filter bind arm");
+
+	assert!(binder.contains("estimated_row_count: Option<RowCount>"));
+	assert!(facts.contains("fn with_estimated_row_count"));
+	assert!(facts.contains("estimated_row_count: Some(estimate)"));
+	assert!(!facts.contains("byte_upper_bound: Some(estimate"));
+	assert!(filter_arm.contains("filter_equality_ndv_estimated_row_count"));
+	assert!(filter_arm.contains(".with_estimated_row_count(estimated_row_count)"));
+	assert!(binder.contains("ndv_selectivity_writes_estimated_row_count_not_hard_bound"));
+}
+
+#[test]
+pub(crate) fn adr141_exact_ndv_does_not_write_hard_bound_this_cut() {
+	let binder = binder_source();
+	let catalog = catalog_source();
+	let selectivity = source_block(&binder, "fn equality_ndv_estimated_row_count");
+	let fact = source_block(&catalog, "pub enum DistinctCountFact");
+
+	assert!(fact.contains("Exact(u64)"));
+	assert!(selectivity.contains("distinct_count.point_estimate()"));
+	assert!(!selectivity.contains("with_pk_row_cap"));
+	assert!(binder.contains("exact_ndv_still_uses_estimate_channel"));
+}
+
+#[test]
+pub(crate) fn adr141_estimated_rows_feed_estimated_bytes_not_hard_bytes() {
+	let binder = binder_source();
+	let derive = source_block(&binder, "fn derive_estimated_byte_size");
+	let row_source = source_block(&binder, "fn estimate_row_source");
+	let choose = source_block(&binder, "fn build_byte_candidate");
+
+	assert!(derive.contains("estimate_row_source(self.row_upper_bound, self.estimated_row_count)"));
+	assert!(derive.contains("estimate_materialized_byte_size(row_count, schema)"));
+	assert!(row_source.contains("Some(std::cmp::min(hard, estimated))"));
+	assert!(
+		choose.find("facts.byte_upper_bound").unwrap()
+			< choose.find("estimated_byte_size").unwrap()
+	);
+	assert!(!derive.contains("byte_upper_bound: Some"));
+}
+
+#[test]
+pub(crate) fn adr141_equality_only_no_range_in_or_multicolumn_selectivity() {
+	let binder = binder_source();
+	let helper = source_block(
+		&binder,
+		"fn predicate_node_equality_ndv_estimated_row_count",
+	);
+
+	assert!(helper.contains("BoundBinaryOp::Eq"));
+	assert!(helper.contains("BoundBinaryOp::And"));
+	assert!(!helper.contains("BoundBinaryOp::Or"));
+	assert!(!helper.contains("BoundBinaryOp::Lt"));
+	assert!(!helper.contains("BoundExprNode::InList"));
+	assert!(binder.contains("range_filter_does_not_use_ndv_selectivity"));
+}
+
+#[test]
+pub(crate) fn adr141_and_filters_do_not_multiply_ndv_selectivities() {
+	let binder = binder_source();
+	let helper = source_block(
+		&binder,
+		"fn predicate_node_equality_ndv_estimated_row_count",
+	);
+	let facts = source_block(&binder, "fn with_estimated_row_count");
+
+	assert!(helper.contains("Some(std::cmp::min(left, right))"));
+	assert!(facts.contains("std::cmp::min(existing, estimate)"));
+	assert!(binder.contains("and_filter_uses_single_equality_not_independence_product"));
+}
+
+#[test]
+pub(crate) fn adr141_missing_ndv_is_inert() {
+	let binder = binder_source();
+	let lookup = source_block(&binder, "fn column_ndv_for_input");
+
+	assert!(lookup.contains("Option<DistinctCountFact>"));
+	assert!(lookup.contains("find_map"));
+	assert!(binder.contains("missing_ndv_keeps_137_138_behavior"));
+}
+
+#[test]
+pub(crate) fn adr141_scan_ndv_is_bind_time_only_not_executed() {
+	let execution = execution_source();
+	let binder = binder_source();
+	let exec = exec_source();
+	let execute_bound = source_block(&exec, "pub fn execute_bound");
+
+	assert!(execution.contains("column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>"));
+	assert!(binder.contains("column_ndv_for_input"));
+	assert!(binder.contains("scan_plan"));
+	assert!(!execute_bound.contains("column_ndv"));
+}
+
+#[test]
+pub(crate) fn adr141_no_wendelon_producer_in_toron() {
+	let wendelon_source = source_files(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read Wendelon source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(!wendelon_source.contains("DistinctCountFact"));
+	assert!(!wendelon_source.contains("DescriptorColumnNdvFact"));
+	assert!(!wendelon_source.contains("column_ndv"));
+}
+
+#[test]
+pub(crate) fn adr141_no_sql_join_filter_pushdown_in_this_cut() {
+	let planner = planner_source();
+	let lower_select = source_block(&planner, "fn lower_select");
+	let lower_where = source_block(&planner, "fn lower_where");
+
+	assert!(lower_select.contains("for join in &table_with_joins.joins"));
+	assert!(lower_select.contains("plan = self.lower_where(plan, selection)?"));
+	assert!(lower_select.contains("joins around derived tables are not supported"));
+	assert!(lower_where.contains("plan = LogicalPlan::Filter"));
+	assert!(!planner.contains("side_local_join_filter"));
+	assert!(!planner.contains("push_join_filter"));
+}
+
+#[test]
+pub(crate) fn adr141_138_hard_estimate_split_untouched() {
+	let binder = binder_source();
+	let choose = source_block(&binder, "fn build_byte_candidate");
+
+	assert!(binder.contains("byte_upper_bound: Option<ByteCount>"));
+	assert!(binder.contains("estimated_byte_size: Option<ByteCount>"));
+	assert!(binder.contains("estimated_row_count: Option<RowCount>"));
+	assert!(
+		choose.find("facts.byte_upper_bound").unwrap()
+			< choose.find("estimated_byte_size").unwrap()
+	);
+	assert!(!choose.contains("estimated_row_count"));
+}
+
+#[test]
+pub(crate) fn adr141_139_140_replay_fences_untouched() {
+	let coordinator = coordinator_source();
+	let binder = binder_source();
+	let lib = lib_source();
+	let trigger = source_block(&coordinator, "fn broadcast_cap_replay_trigger");
+	let config = source_block(&binder, "pub struct PlannerConfig");
+
+	assert!(trigger.contains("BudgetDimension::BroadcastReplication"));
+	assert!(!trigger.contains("ShuffleBytes"));
+	assert!(coordinator.contains("let mut retried_broadcast_replay = false"));
+	assert!(config.contains("force_hash_join_ids: BTreeSet<JoinReplayId>"));
+	assert!(lib.contains("ndv_underestimate_over_cap_replays_as_hash"));
+}
