@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–142 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–143 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,62 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 142 promoted; ADR 143 candidates
+### ADR 143 promoted; ADR 144 candidates
+
+ADR 143 promoted **SQL Inner-Join Side-Local Filter Pushdown** — the
+secondary-frontend completion of 141's headline, worth doing now that 142 made the
+NDV facts live. SQL lowered `WHERE` *above* the join (`Filter(Join(...))`,
+`sql_planner.rs:2782–2802`), so the chooser (`binder.rs:1420`, bottom-up, sees only
+children) was handed the **unfiltered** dimension → 138 over-estimates → hash, where
+Rune (`Join(..., Filter(dim))` by construction, `rune_engine.rs:302`) broadcasts.
+143 splits the top-level `WHERE` conjuncts and pushes each **side-local** one onto
+its **tightest single base input** during `lower_select`, reusing
+`split_top_level_and` + `collect_scope_refs` (+ a new `ScopeRefs.inner` flag) +
+`plan_qualifiers` (recurses through `Filter`), emitting existing
+`LogicalPlan::Filter` nodes — **no binder/chooser/executor/replay/Wendelon change**.
+**Placement resolved an iter-1 cross-over to the SQL frontend on grounding** (a
+binder LP rewrite would reimplement the `SqlExpr` classifiers on logical `Expr`, and
+its frontend-agnostic generality is illusory — Rune builds the filtered shape
+directly, so SQL is the sole `Filter(Join)` producer; a binder phase is the right
+refactor only when a second such frontend lands). **The load-bearing correction: the
+all-inner-chain fence** — a *per-join* push (push at an inner boundary, skip at an
+outer one) and an *upfront* push (wrap the owning factor before the chain is built)
+are **both unsound** when an outer join sits *above* a pushed input
+(`a INNER JOIN b RIGHT OUTER JOIN c WHERE b.x=1` → ∅ correctly, `{id, NULL}` if `b`
+is pre-filtered, because `b` is on the RIGHT join's null-producing side); so pushdown
+activates **only when every FROM join lowers to `Inner`**, else the full `WHERE`
+stays above (byte-identical to `main`). **Tightest single input incl. the leftmost
+base** — broadcast-relevant, not probe-only (the chooser evaluates a left build
+candidate, `binder.rs:4268`, so a dim authored left broadcasts only when its leftmost
+filter is pushed). Pushdown is **decoupled from NDV estimability** (push every
+supported side-local predicate; non-estimable ones still earn runtime scan
+selectivity); **residual preservation through the unchanged `lower_where`** (EXISTS
+verbatim), pinned by a pushed-vs-above-join digest-equivalence gate. Retargets
+`adr141_no_sql_join_filter_pushdown_in_this_cut` → six `adr143_*` guards. Genuine
+3-of-3: topic + placement converged by iter-2; the fence correction (Claude, against
+a per-join/upfront framing) adopted by **both** peers from a data-grounded
+counterexample by iter-3; Codex's leftmost-is-broadcast-relevant refinement folded.
+Headline gate: `sql_equality_filtered_dim_with_wendelon_ndv_infers_broadcast_by_estimate`
+(fails on `main`).
+
+**ADR 144 lead candidates:** **quantile/range selectivity** — the *second* stats
+producer (inequality selectivity via Wendelon KLL + 138 byte hardening; a new
+maintained-producer extension; the named arc-next, now gated on 143's feat
+evidence); **SQL derived-table-in-join** (lift the `FROM fact JOIN (SELECT … WHERE …)
+d` reject, `sql_planner.rs:2778, 2784` — the other filtered-build-side authoring,
+143's nearest neighbor); **mixed-chain path-aware pushdown** (143's named follow-on —
+push a conjunct iff its target base is on the preserved side of every join above it,
+widening past the all-inner fence); **stats default-policy flip** (a storage-cost
+product call to widen NDV coverage past opt-in — would make 142/143 fire on more
+tables); **hard-from-exact** (a freshness/coverage doctrine letting a fresh complete
+small-set `Exact` write a hard bound); 140's A1 (join-identified replay);
+multi-column stats. **Forward arc (named, not next):** `NDV equality selectivity
+(141) → 142 producer → 143 SQL spends it → quantile/range → Theta-sketch join-key
+intersection → join selectivity → join reordering` (HLL is single-column NDV, *not*
+intersections — Theta-sketches are the likely family for join-key intersection
+facts). Evidence-gate the next pick on the 143 feat.
+
+### ADR 142 promoted; ADR 143 candidates (HISTORICAL)
 
 ADR 142 promoted **Wendelon NDV Optimizer Fact Producer** — the **cross-ring activation cut** that
 makes the built-but-dark 129→141 CBO consumer live for covered opt-in tables. 141 landed the Toron NDV consumer,
