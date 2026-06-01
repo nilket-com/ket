@@ -2775,13 +2775,22 @@ impl SqlPlanner {
 		if group_keys.is_some() && !table_with_joins.joins.is_empty() {
 			return Err(unsupported("GROUP BY over joins is not supported"));
 		}
-		if table_factor_is_derived(&table_with_joins.relation) && !table_with_joins.joins.is_empty()
-		{
-			return Err(unsupported("joins around derived tables are not supported"));
-		}
 		let all_inner_join_chain = table_with_joins.joins.iter().all(|join| {
 			join_operator_kind_for_filter_pushdown(&join.join_operator) == Some(JoinKind::Inner)
 		});
+		let contains_derived_join_factor = table_factor_is_derived(&table_with_joins.relation)
+			|| table_with_joins
+				.joins
+				.iter()
+				.any(|join| table_factor_is_derived(&join.relation));
+		if contains_derived_join_factor
+			&& !table_with_joins.joins.is_empty()
+			&& !all_inner_join_chain
+		{
+			return Err(unsupported(
+				"derived tables in joins are only supported in all-inner chains",
+			));
+		}
 		let mut pending_where_conjuncts = match (all_inner_join_chain, selection.as_ref()) {
 			(true, Some(selection)) => split_top_level_and(selection),
 			_ => Vec::new(),
@@ -2789,9 +2798,6 @@ impl SqlPlanner {
 		let mut pushed_leftmost_filter = false;
 		let mut plan = self.lower_table_factor(&table_with_joins.relation)?;
 		for join in &table_with_joins.joins {
-			if table_factor_is_derived(&join.relation) {
-				return Err(unsupported("joins around derived tables are not supported"));
-			}
 			let mut right = self.lower_table_factor(&join.relation)?;
 			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
 			if all_inner_join_chain {
@@ -6721,6 +6727,107 @@ mod tests {
 			}
 			other => panic!("expected join plan, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn sql_derived_join_digest_matches_hand_authored_logical_plan() {
+		let observed = SqlPlanner::new()
+			.plan(
+				"SELECT o.id, c.amount \
+				 FROM orders o \
+				 INNER JOIN (SELECT id, amount FROM customers WHERE amount BETWEEN 10 AND 19) c \
+				 ON o.customer_id = c.id",
+			)
+			.expect("plan SQL derived join");
+		let hand_authored = LogicalPlan::Project {
+			input: Box::new(LogicalPlan::Join {
+				left: Box::new(LogicalPlan::Alias {
+					input: Box::new(LogicalPlan::ScanNamed {
+						table: TableRef::new("orders"),
+						projection: None,
+					}),
+					alias: TableRef::new("o"),
+					columns: Vec::new(),
+				}),
+				right: Box::new(LogicalPlan::Alias {
+					input: Box::new(LogicalPlan::Project {
+						input: Box::new(LogicalPlan::Filter {
+							input: Box::new(LogicalPlan::ScanNamed {
+								table: TableRef::new("customers"),
+								projection: None,
+							}),
+							predicate: Expr::And(
+								Box::new(Expr::Gte(
+									Box::new(Expr::column("amount")),
+									Box::new(Expr::Literal(ScalarValue::Int32(Some(10)))),
+								)),
+								Box::new(Expr::Lte(
+									Box::new(Expr::column("amount")),
+									Box::new(Expr::Literal(ScalarValue::Int32(Some(19)))),
+								)),
+							),
+						}),
+						exprs: vec![Expr::column("id"), Expr::column("amount")],
+						output_names: vec![None, None],
+					}),
+					alias: TableRef::new("c"),
+					columns: Vec::new(),
+				}),
+				kind: JoinKind::Inner,
+				on: vec![(
+					Expr::qualified_column(TableRef::new("o"), "customer_id"),
+					Expr::qualified_column(TableRef::new("c"), "id"),
+				)],
+				strategy_intent: JoinStrategyIntent::Auto,
+			}),
+			exprs: vec![
+				Expr::qualified_column(TableRef::new("o"), "id"),
+				Expr::qualified_column(TableRef::new("c"), "amount"),
+			],
+			output_names: vec![None, None],
+		};
+
+		assert_eq!(format!("{observed:?}"), format!("{hand_authored:?}"));
+	}
+
+	#[test]
+	fn sql_outer_join_around_derived_table_stays_rejected() {
+		assert_plan_rejects(
+			"SELECT * FROM orders o \
+			 LEFT JOIN (SELECT id FROM customers) c ON o.customer_id = c.id",
+			"derived tables in joins are only supported in all-inner chains",
+		);
+	}
+
+	#[test]
+	fn sql_join_inside_derived_table_stays_rejected() {
+		assert_plan_rejects(
+			"SELECT * FROM orders o \
+			 INNER JOIN (SELECT c.id FROM customers c INNER JOIN orders o2 ON c.id = o2.customer_id) d \
+			 ON o.customer_id = d.id",
+			"joins inside derived tables are not supported",
+		);
+	}
+
+	#[test]
+	fn sql_nested_lateral_sampled_derived_join_fences_hold() {
+		assert_plan_rejects(
+			"SELECT * FROM orders o \
+			 INNER JOIN (SELECT id FROM (SELECT id FROM customers) nested) c \
+			 ON o.customer_id = c.id",
+			"nested derived tables are not supported",
+		);
+		assert_plan_rejects(
+			"SELECT * FROM orders o \
+			 INNER JOIN LATERAL (SELECT id FROM customers) c ON o.customer_id = c.id",
+			"lateral derived tables are not supported",
+		);
+		assert_plan_rejects(
+			"SELECT * FROM orders o \
+			 INNER JOIN (SELECT id FROM customers) c TABLESAMPLE SYSTEM (10) \
+			 ON o.customer_id = c.id",
+			"sampled derived tables are not supported",
+		);
 	}
 
 	#[test]

@@ -820,7 +820,7 @@ pub(crate) fn adr137_project_preserves_byte_bound_only_for_column_subset() {
 	assert!(facts_impl.contains("byte_upper_bound: None"));
 	assert!(project_helper.contains("BoundExprNode::Column(column)"));
 	assert!(project_helper.contains("seen.insert(column.ordinal)"));
-	assert!(project_arm.contains("input.facts.preserve_through_project(&exprs)"));
+	assert!(project_arm.contains(".preserve_through_project(&exprs, &output_schema)"));
 	assert!(!project_arm.contains("PlanOptimizerFacts::composite_with_row"));
 	assert!(binder.contains("narrowing_project_tiny_dim_infers_broadcast"));
 	assert!(binder.contains("expression_project_drops_byte_bound_and_hashes"));
@@ -976,6 +976,7 @@ pub(crate) fn adr138_estimate_and_derivation_live_in_one_helper() {
 	assert!(scan_arm.contains(".derive_estimated_byte_size(plan.schema().as_ref())"));
 	assert!(scan_named_arm.contains(".derive_estimated_byte_size(plan.schema().as_ref())"));
 	assert!(filter_arm.contains(".derive_estimated_byte_size(plan.schema().as_ref())"));
+	assert!(project_helper.contains("derive_estimated_byte_size(output_schema)"));
 	assert!(project_helper.contains("estimated_byte_size: None"));
 	assert!(binder.contains("string_bearing_tiny_dim_infers_broadcast_by_estimate"));
 	assert!(binder.contains("pk_filtered_string_dim_broadcasts_by_estimate"));
@@ -1996,7 +1997,7 @@ pub(crate) fn adr143_sql_join_filter_pushdown_is_planner_lowering_only() {
 	assert!(lower_select.contains("combine_and_sql_exprs"));
 	assert!(lower_select.contains("self.lower_where(plan, &selection)?"));
 	assert!(lower_select.contains("self.lower_where(plan, selection)?"));
-	assert!(lower_select.contains("joins around derived tables are not supported"));
+	assert!(!lower_select.contains("joins around derived tables are not supported"));
 	assert!(lower_where.contains("plan = LogicalPlan::Filter"));
 	assert!(push.contains("pending.drain(..)"));
 	assert!(push.contains("join_filter_conjunct_matches"));
@@ -2066,6 +2067,164 @@ pub(crate) fn adr143_behavior_gates_cover_planner_binder_and_runtime() {
 	}
 	assert!(multi_table_scan.contains("request.pbc_predicate"));
 	assert!(multi_table_scan.contains("wendelon::schema::pbc::execute"));
+}
+
+#[test]
+pub(crate) fn adr145_derived_tables_allowed_in_inner_join_chains() {
+	let planner = planner_source();
+	let lower_select = source_block(&planner, "fn lower_select");
+
+	assert!(lower_select.contains("let all_inner_join_chain"));
+	assert!(lower_select.contains("let contains_derived_join_factor"));
+	assert!(lower_select.contains("table_factor_is_derived(&table_with_joins.relation)"));
+	assert!(lower_select.contains(".any(|join| table_factor_is_derived(&join.relation))"));
+	assert!(lower_select.contains("&& !table_with_joins.joins.is_empty()"));
+	assert!(lower_select.contains("&& !all_inner_join_chain"));
+	assert!(
+		lower_select.contains("derived tables in joins are only supported in all-inner chains")
+	);
+	assert!(
+		lower_select
+			.contains("let mut plan = self.lower_table_factor(&table_with_joins.relation)?")
+	);
+	assert!(lower_select.contains("let mut right = self.lower_table_factor(&join.relation)?"));
+	assert!(!lower_select.contains("joins around derived tables are not supported"));
+	assert!(planner.contains("sql_derived_join_digest_matches_hand_authored_logical_plan"));
+}
+
+#[test]
+pub(crate) fn adr145_derived_join_rejects_non_inner_chains() {
+	let planner = planner_source();
+	let lower_select = source_block(&planner, "fn lower_select");
+
+	assert!(
+		lower_select.contains("derived tables in joins are only supported in all-inner chains")
+	);
+	for gate in [
+		"sql_outer_join_around_derived_table_stays_rejected",
+		"sql_join_inside_derived_table_stays_rejected",
+		"sql_nested_lateral_sampled_derived_join_fences_hold",
+	] {
+		assert!(planner.contains(gate), "missing ADR145 planner gate {gate}");
+	}
+}
+
+#[test]
+pub(crate) fn adr145_derived_join_keeps_v1_derived_fences() {
+	let planner = planner_source();
+	let table_factor = source_block(&planner, "fn lower_table_factor");
+	let select_shape = source_block(&planner, "fn validate_derived_select_shape");
+	let query_shape = source_block(&planner, "fn validate_derived_query_shape");
+
+	for marker in [
+		"lateral derived tables are not supported",
+		"sampled derived tables are not supported",
+		"derived tables require an alias",
+		"derived table alias AT is not supported",
+		"lower_derived_table",
+	] {
+		assert!(
+			table_factor.contains(marker),
+			"missing derived table-factor fence {marker}"
+		);
+	}
+	for marker in [
+		"joins inside derived tables are not supported",
+		"nested derived tables are not supported",
+	] {
+		assert!(
+			select_shape.contains(marker),
+			"missing derived select-shape fence {marker}"
+		);
+	}
+	assert!(query_shape.contains("unsupported derived table query body"));
+}
+
+#[test]
+pub(crate) fn adr145_pure_subset_project_rederives_projected_byte_estimate() {
+	let binder = binder_source();
+	let facts_impl = source_block(&binder, "impl PlanOptimizerFacts");
+	let project_arm = binder
+		.split("LogicalPlan::Project {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Aggregate").next())
+		.expect("Project bind arm");
+
+	assert!(facts_impl.contains(
+		"fn preserve_through_project(self, exprs: &BoundExprProgram, output_schema: &Schema) -> Self"
+	));
+	assert!(facts_impl.contains("project_roots_are_distinct_columns(exprs)"));
+	assert!(facts_impl.contains("derive_estimated_byte_size(output_schema)"));
+	assert!(project_arm.contains("schema_for_exprs_with_output_names(&exprs, output_names)"));
+	assert!(project_arm.contains(".preserve_through_project(&exprs, &output_schema)"));
+	assert!(binder.contains("pure_subset_project_shrinks_estimated_byte_size"));
+	assert!(binder.contains("sql_join_projected_derived_dim_broadcasts_where_full_column_hashes"));
+}
+
+#[test]
+pub(crate) fn adr145_expression_projects_do_not_shrink_estimated_bytes() {
+	let binder = binder_source();
+	let project_helper = source_block(&binder, "fn preserve_through_project");
+
+	assert!(project_helper.contains("estimated_byte_size: None"));
+	assert!(binder.contains("expression_project_keeps_byte_estimate_none"));
+}
+
+#[test]
+pub(crate) fn adr145_broadcast_hints_resolve_derived_aliases() {
+	let binder = binder_source();
+	let planner = planner_source();
+
+	assert!(binder.contains("sql_broadcast_hint_targets_derived_alias"));
+	assert!(
+		planner.contains("join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right, kind)")
+	);
+}
+
+#[test]
+pub(crate) fn adr145_no_wendelon_executor_storage_or_chooser_change() {
+	let manifest_dir = manifest_dir();
+	let binder = binder_source();
+	let choose = source_block(&binder, "fn choose_auto_join_strategy");
+	let candidate = source_block(&binder, "fn build_byte_candidate");
+	let markers = [
+		"sql_join_projected_derived_dim_broadcasts_where_full_column_hashes",
+		"contains_derived_join_factor",
+		"pure_subset_project_shrinks_estimated_byte_size",
+		"wide_customer_sql_schema",
+		"preserve_through_project(&exprs, &output_schema)",
+		"derived tables in joins are only supported in all-inner chains",
+	];
+	let mut offenders = Vec::new();
+
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/coordinator.rs"),
+		manifest_dir.join("src/storage.rs"),
+	] {
+		let source = std::fs::read_to_string(&path).expect("read Toron source");
+		offenders.extend(
+			source
+				.lines()
+				.enumerate()
+				.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+				.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+		);
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR145 planner/binder-only markers leaked into executor/storage/coordinator/Wendelon source:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+	assert!(!choose.contains("Derived"));
+	assert!(!choose.contains("Project"));
+	assert!(!candidate.contains("Derived"));
+	assert!(!candidate.contains("Project"));
 }
 
 #[test]

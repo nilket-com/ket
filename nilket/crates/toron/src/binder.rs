@@ -232,9 +232,11 @@ impl PlanOptimizerFacts {
 		self
 	}
 
-	fn preserve_through_project(self, exprs: &BoundExprProgram) -> Self {
+	fn preserve_through_project(self, exprs: &BoundExprProgram, output_schema: &Schema) -> Self {
 		if project_roots_are_distinct_columns(exprs) {
-			return self.preserve_volume_non_increasing();
+			return self
+				.preserve_volume_non_increasing()
+				.derive_estimated_byte_size(output_schema);
 		}
 
 		Self {
@@ -629,8 +631,8 @@ impl<'a> Binder<'a> {
 					let exprs = self
 						.bind_projection_expr_program_scoped(exprs, &input.schema(), &input.scope)
 						.await?;
-					let facts = input.facts.preserve_through_project(&exprs);
 					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
+					let facts = input.facts.preserve_through_project(&exprs, &output_schema);
 					let scope = input.scope.project(&exprs, &output_schema);
 
 					Ok(ScopedExecutionPlan::new_with_facts(
@@ -9426,6 +9428,162 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn sql_join_projected_derived_dim_broadcasts_where_full_column_hashes() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			wide_customer_sql_schema(),
+			Vec::new(),
+			vec![(ColumnOrdinal(1), range_fact_i32(0, 99, 1_000))],
+		);
+		let config = auto_broadcast_config(32 * 1024);
+		let full_column = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.amount BETWEEN 10 AND 19",
+			)
+			.expect("plan full-column range-filtered join");
+		let projected_derived = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN (SELECT id, amount FROM customers WHERE amount BETWEEN 10 AND 19) c \
+				 ON o.customer_id = c.id",
+			)
+			.expect("plan projected derived range-filtered join");
+
+		let (full_plan, full_trace) = bind_with_trace(&full_column, &catalog, &config)
+			.await
+			.expect("bind full-column filtered join");
+		let (projected_plan, projected_trace) =
+			bind_with_trace(&projected_derived, &catalog, &config)
+				.await
+				.expect("bind projected derived filtered join");
+
+		assert_join_strategy(&full_plan, JoinStrategy::HashPartitioned);
+		assert!(matches!(
+			full_trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::BuildByteUpperBoundAboveThreshold
+			}
+		));
+		match first_join_plan(&projected_plan) {
+			ExecutionPlan::Join { strategy, .. } => assert_eq!(
+				*strategy,
+				JoinStrategy::Broadcast,
+				"projected derived join trace: {:?}",
+				projected_trace.join_decisions
+			),
+			other => panic!("expected join, got {other:?}"),
+		}
+		match projected_trace.join_decisions[0].reason {
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side,
+				estimated_byte_size,
+				threshold,
+				..
+			} => {
+				assert_eq!(build_side, BroadcastBuildSide::Right);
+				assert!(estimated_byte_size < threshold);
+			}
+			other => panic!("expected estimated broadcast, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn sql_join_right_derived_range_filtered_dim_broadcasts_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN (SELECT id, amount FROM customers WHERE amount BETWEEN 10 AND 19) c \
+				 ON o.customer_id = c.id",
+			)
+			.expect("plan right derived range-filtered join");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind right derived range-filtered join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn sql_join_left_derived_range_filtered_dim_broadcasts_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM (SELECT id, amount FROM customers WHERE amount BETWEEN 10 AND 19) c \
+				 INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan left derived range-filtered join");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind left derived range-filtered join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Left,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn sql_join_derived_alias_column_list_resolves_join_keys() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), None);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT c.cid, c.label \
+				 FROM orders o \
+				 INNER JOIN (SELECT id, region FROM customers) c(cid, label) \
+				 ON o.customer_id = c.cid",
+			)
+			.expect("plan derived alias-column join");
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind derived alias-column join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+	}
+
+	#[tokio::test]
+	async fn sql_broadcast_hint_targets_derived_alias() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), Some(1_024), None);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * \
+				 FROM (SELECT id, region FROM customers) c \
+				 INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("plan broadcast hint targeting derived alias");
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind broadcast-hinted derived join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+	}
+
+	#[tokio::test]
 	async fn range_lt_and_gt_estimate_clipped_fraction() {
 		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
 			None,
@@ -9462,6 +9620,120 @@ mod tests {
 
 		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
 		assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(200)));
+	}
+
+	#[tokio::test]
+	async fn pure_subset_project_shrinks_estimated_byte_size() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			wide_customer_schema(),
+			Vec::new(),
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let filtered_customers = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate: customer_amount_between(10, 19),
+		};
+		let filtered = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind full-width filtered customers");
+		let projected_customers = LogicalPlan::Project {
+			input: Box::new(filtered_customers),
+			exprs: vec![customer_column("id"), customer_column("amount")],
+			output_names: vec![Some("id".to_string()), Some("amount".to_string())],
+		};
+		let projected = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&projected_customers)
+		.await
+		.expect("bind projected filtered customers");
+
+		assert_eq!(filtered.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(projected.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(filtered.facts.byte_upper_bound, None);
+		assert_eq!(projected.facts.byte_upper_bound, None);
+		assert_eq!(filtered.facts.estimated_row_count, Some(RowCount::new(100)));
+		assert_eq!(
+			projected.facts.estimated_row_count,
+			Some(RowCount::new(100))
+		);
+		let filtered_bytes = filtered
+			.facts
+			.estimated_byte_size
+			.expect("full-width filter should derive estimated bytes");
+		let projected_bytes = projected
+			.facts
+			.estimated_byte_size
+			.expect("pure subset project should re-derive estimated bytes");
+		assert!(
+			projected_bytes < filtered_bytes,
+			"projected bytes {projected_bytes:?} should shrink from full-width {filtered_bytes:?}"
+		);
+		let expected_projected = estimate_materialized_byte_size(
+			RowCount::new(100),
+			&Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("amount", DataType::Int64, true),
+			]),
+		)
+		.expect("projected fixed-width estimate");
+		assert_eq!(
+			projected.facts.estimated_byte_size,
+			Some(expected_projected)
+		);
+	}
+
+	#[tokio::test]
+	async fn expression_project_keeps_byte_estimate_none() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			wide_customer_schema(),
+			Vec::new(),
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let projected_customers = LogicalPlan::Project {
+			input: Box::new(LogicalPlan::Filter {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: TableRef::new("customers"),
+					projection: None,
+				}),
+				predicate: customer_amount_between(10, 19),
+			}),
+			exprs: vec![
+				customer_column("id"),
+				Expr::Add(
+					Box::new(customer_column("amount")),
+					Box::new(Expr::Literal(ScalarValue::Int64(Some(1)))),
+				),
+			],
+			output_names: vec![Some("id".to_string()), Some("next_amount".to_string())],
+		};
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&projected_customers)
+		.await
+		.expect("bind expression project over filtered customers");
+
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_byte_size, None);
 	}
 
 	#[tokio::test]
@@ -11180,6 +11452,32 @@ mod tests {
 		)
 	}
 
+	fn wide_customer_schema() -> Schema {
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+			Field::new("region", DataType::Utf8, true),
+			Field::new("segment", DataType::Utf8, true),
+			Field::new("status", DataType::Utf8, true),
+			Field::new("tier", DataType::Utf8, true),
+			Field::new("notes", DataType::Utf8, true),
+			Field::new("profile", DataType::LargeUtf8, true),
+		])
+	}
+
+	fn wide_customer_sql_schema() -> Schema {
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int32, true),
+			Field::new("region", DataType::Utf8, true),
+			Field::new("segment", DataType::Utf8, true),
+			Field::new("status", DataType::Utf8, true),
+			Field::new("tier", DataType::Utf8, true),
+			Field::new("notes", DataType::Utf8, true),
+			Field::new("profile", DataType::LargeUtf8, true),
+		])
+	}
+
 	fn descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
 		orders_byte_upper_bound: Option<u64>,
 		customers_byte_upper_bound: Option<u64>,
@@ -11274,6 +11572,20 @@ mod tests {
 			non_null_count,
 			min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(min, 8).unwrap()),
 			max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(max, 8).unwrap()),
+		}
+	}
+
+	fn range_fact_i32(min: i32, max: i32, non_null_count: u64) -> RangeFact {
+		RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+			null_count: 0,
+			non_null_count,
+			min: Some(
+				wendelon_client::encode_signed_optimizer_fact_scalar(i64::from(min), 4).unwrap(),
+			),
+			max: Some(
+				wendelon_client::encode_signed_optimizer_fact_scalar(i64::from(max), 4).unwrap(),
+			),
 		}
 	}
 

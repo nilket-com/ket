@@ -1747,8 +1747,10 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 			"missing select-shape marker {marker}"
 		);
 	}
-	assert!(lower_select.contains("table_factor_is_derived"));
-	assert!(lower_select.contains("joins around derived tables are not supported"));
+	assert!(lower_select.contains("contains_derived_join_factor"));
+	assert!(
+		lower_select.contains("derived tables in joins are only supported in all-inner chains")
+	);
 	assert!(
 		logical_type_ddl.contains("derived_table_source_scope_rejects_general_subquery_features")
 	);
