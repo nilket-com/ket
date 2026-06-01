@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–145 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–146 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,62 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 145 promoted; ADR 146 candidates
+### ADR 146 promoted; ADR 147 candidates
+
+ADR 146 promoted **Hard Table-Size Optimizer Facts (Live Hard Row Upper Bounds)** —
+**lights the dark hard channel**, the through-line gap across 141→145: production
+catalogs mapped `row_upper_bound`/`byte_upper_bound` to `None`
+(`catalog.rs::descriptor_optimizer_facts_from_storage`), so the whole CBO ran on
+estimates + 139/140 replay. 146 activates the **row** half: Wendelon emits an exact
+hard `row_upper_bound` (sum of `ColumnStatsBlockHeader::row_count` under the existing
+142/144 all-contributors coverage fence) on the facts blob; Toron imports it into the
+consumer ADR 136 already built (drop the hard-coded `None`). **Two production wins
+from the one missing piece:** (a) unfiltered small dims **broadcast** (no row source
+to anchor a byte estimate before — `fact JOIN small_dim` hashed); (b) **141/142
+equality-NDV finally fires live** — `filter_equality_ndv_estimated_row_count`
+(`binder.rs:3791`) is gated `base_rows = facts.row_upper_bound?`, so it was **inert
+on real tables** (seeded fixtures only); 146 supplies `base_rows`. **Row-hard /
+byte-estimated split:** no Wendelon materialized-byte field — ADR 138 established
+Toron can't *prove* the encoded-IPC byte unit (fixed-width byte is an estimate), so a
+hard byte producer is the deferred 136-W-byte follow-on (never compressed
+`size_bytes`); 138 anchors the byte *estimate* to the hard rows (145 sharpened it).
+**Producer restructure:** `table_optimizer_facts` early-returned `None` with no
+NDV/range candidates (`manager.rs:5067`) — row production is made
+candidate-independent so stat-less (string-only) tables get a hard row count too.
+**Truthful zero, no new elision:** a covered empty table emits `row_upper_bound = 0`
+(sizing-only; `for_descriptor` normalizes row-0→byte-0) — grounded that a row-0
+*fact* does **not** create `EmptyRelation` today (`binder.rs:9820`; elision is
+static-false-predicate-only), so it's replay-protected; the hard-zero *fold*
+(scan→`EmptyRelation` rewrite) is the deferred correctness-sensitive follow-on
+(resolved Gemini's iter-1 elide-on-0 → no-new-elision on Claude's grounding).
+**Post-139/140 hard-bound risk model:** a stale-low row bound (zero or non-zero) →
+over-broadcast → replay → byte-identical; the only un-replay-protected consumer
+(elision) is excluded. Retargets the ADR 142 hard-bound guard (NDV/range still don't
+synthesize hard bounds; only the explicit Wendelon field maps). Cross-ring activation
+in the Toron sequence (142/144 precedent). Genuine 3-of-3 (Live Hard Row Upper Bounds;
+row=0/no-elision resolved on Claude's grounding; byte half deferred on 138's
+encoded-IPC-not-provable grounding). Headline gate:
+`wendelon_live_row_upper_bound_enables_unseeded_small_dimension_broadcast` (live,
+unseeded; fails on `main`).
+
+**ADR 147 lead candidates:** **136-W-byte — hard materialized-byte producer** (the
+deferred byte half: a *proven* materialized/encoded build-footprint upper bound — the
+hard part 138 declined; never compressed `size_bytes`; would give replay-independent
+hard-byte broadcast); **hard zero-row folds** (the deferred elision: promote a
+complete-small-set membership-absence / 144 out-of-range / row-0 to `EmptyRelation`
+with an airtight elision-freshness doctrine — fold ADR 095; Gemini's narrowed lead);
+**KLL/quantile range precision** (skew-aware 144 follow-on; new maintained producer;
+evidence-gate on a measured min/max-uniformity miss); **float range selectivity** (the
+one excluded type Toron has — producer float-tag + IEEE order-preserving encode +
+continuous consumer); **temporal types (Date32 start)** (unblocks 144's date/timestamp
+range consumer; Toron `ScalarValue` lacks temporal; multi-ADR); 140 A1;
+multi-column/correlated selectivity. **Forward arc:** `… → 146 hard row bound →
+(136-W-byte hard materialized bound · hard-zero folds) → KLL/quantile → Theta-sketch
+join-key intersection → join selectivity → reordering` (Theta still gated on both a
+set-sketch substrate and a join-reordering consumer, neither of which exists).
+Evidence-gate the next pick on the 146 feat.
+
+### ADR 145 promoted; ADR 146 candidates (HISTORICAL)
 
 ADR 145 promoted **SQL Derived Tables in Joins (+ Projected Build-Side Byte
 Estimation)** — completes the SQL filtered-build authoring surface 143/144 opened,
