@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–144 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–145 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,60 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 144 promoted; ADR 145 candidates
+### ADR 145 promoted; ADR 146 candidates
+
+ADR 145 promoted **SQL Derived Tables in Joins (+ Projected Build-Side Byte
+Estimation)** — completes the SQL filtered-build authoring surface 143/144 opened,
+and unlocks **build-side column pruning**. SQL rejected a derived table as a join
+factor (`sql_planner.rs:2778, 2792`), so a user couldn't author the projected
+filtered-dim shape Rune builds directly — `Join(fact, Alias(Project(Filter(Scan))))`
+— that prunes the build to the join's needed columns. **The load-bearing council
+correction: this is NOT a frontend-only cut.** All three iter-1 drafts (Claude
+included) asserted the column-pruning win falls out of lifting the reject; Claude's
+iter-2 checked the byte path and showed it does not — `estimated_byte_size` is
+derived at the **Filter** on the *full* schema (`binder.rs:614`), and a pure-subset
+`Project` preserves that full-width estimate **unchanged** (`preserve_through_project`,
+`binder.rs:235`), and the chooser reads the stored fact, not the projected schema. So
+the cut is **two coupled halves**: **D1 (frontend)** admit v1 derived tables as join
+factors in all-inner chains (reuse `validate_derived_select_shape`; no new IR); **D2
+(binder)** re-derive `estimated_byte_size` at a pure-subset project from the projected
+`output_schema` (`derive_estimated_byte_size` is `SingleBaseRelation`-gated,
+`min`-combining, schema-width → a **monotonic estimate shrink**, estimate-channel
+only, never the hard `byte_upper_bound`). D2 is a **latent over-estimate fix that
+travels with the ADR** — every pure-subset project today (Rune `.select()` included)
+carries inflated full-width bytes. **Honesty gate** (`sql_join_projected_derived_dim_broadcasts_where_full_column_hashes`):
+the projected derived dim broadcasts where the full-column 143 form hashes under
+identical 144 facts — **fails on `main`, and fails if either half is reverted**. The
+headline works via **fact propagation** (the selective predicate lives inside the
+derived table → inner Filter reads scan facts → D2 carries the reduced byte estimate
+up through Project + Alias); no through-`Alias` fact lookup added; 143 pushdown +
+all-inner fence preserved. Reconciles the guards D2 reopens (143 no-longer-blanket-
+derived-reject; 137 still owns conservative hard byte; 138 still estimate-only).
+Genuine 3-of-3 (D1 from iter-1; D2 — Claude's iter-2 byte-path catch — carried by
+the merged final plan). No chooser, executor, storage, or Wendelon change beyond
+the named binder estimate refinement.
+
+**ADR 146 lead candidates:** **136-W hard table-size producer** (light the dark
+hard channel — live `row_upper_bound`/`byte_upper_bound` are `None`,
+`catalog.rs::descriptor_optimizer_facts_from_storage`; a Wendelon producer of hard
+table-size bounds the 129/136 spine already consumes); **hard zero-row folds /
+hard-from-exact** (complete-small-set membership absence + 144 out-of-range →
+*hard* 0-row → prune/short-circuit, fold ADR 095; needs the freshness doctrine,
+narrowed per the 145 cycle to provable-empty since Exact NDV gives no hard
+non-empty bound); **KLL/quantile range precision** (skew-aware 144 follow-on; a new
+maintained producer, evidence-gate on a measured min/max-uniformity miss);
+**float range selectivity** (the one excluded type Toron *has* — producer float-tag
++ order-preserving IEEE encode + continuous consumer); **temporal types in Toron**
+(the big unlock behind 144's blocked date/timestamp range consumer — Toron's
+`ScalarValue` is `{Bool,Int32,Int64,Float32,Float64,Utf8}`; a multi-ADR feature,
+could start with `Date32`); 140 A1; multi-column/correlated selectivity. **Forward
+arc:** `... → 145 column pruning → (hard channel: 136-W / hard-from-exact) →
+KLL/quantile → Theta-sketch join-key intersection → join selectivity → join
+reordering` (Theta stays gated on both a set-sketch substrate *and* a
+join-reordering consumer, neither of which exists). Evidence-gate the next pick on
+the 145 feat.
+
+### ADR 144 promoted; ADR 145 candidates (HISTORICAL)
 
 ADR 144 promoted **Labeled Range Selectivity from Maintained Min/Max** — the second
 stats-backed selectivity class (the first since equality NDV), attacking range
