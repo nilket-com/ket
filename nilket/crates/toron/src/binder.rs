@@ -3815,6 +3815,17 @@ fn predicate_node_equality_ndv_estimated_row_count(
 			right,
 		}) => equality_ndv_estimated_row_count(program, *left, *right, input, base_rows)
 			.or_else(|| equality_ndv_estimated_row_count(program, *right, *left, input, base_rows)),
+		Some(BoundExprNode::InList {
+			expr,
+			list,
+			negated,
+		}) => {
+			if *negated {
+				None
+			} else {
+				in_list_ndv_estimated_row_count(program, *expr, list, input, base_rows)
+			}
+		}
 		Some(BoundExprNode::Binary {
 			op: BoundBinaryOp::And,
 			left,
@@ -3859,6 +3870,107 @@ fn equality_ndv_estimated_row_count(
 		base_rows,
 		distinct_count.point_estimate(),
 	))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum InListLiteralKey {
+	Boolean(bool),
+	Int32(i32),
+	Int64(i64),
+	Float32(u32),
+	Float64(u64),
+	Utf8(String),
+}
+
+enum InListLiteralCardinality {
+	Key(InListLiteralKey),
+	Null,
+}
+
+fn in_list_ndv_estimated_row_count(
+	program: &BoundExprProgram,
+	expr: BoundExprId,
+	list: &[BoundExprId],
+	input: &ExecutionPlan,
+	base_rows: RowCount,
+) -> Option<RowCount> {
+	let Some(BoundExprNode::Column(column)) = program.node(expr) else {
+		return None;
+	};
+	let distinct_count = column_ndv_for_input(input, column.ordinal)?;
+	let mut literal_keys = BTreeSet::new();
+	for item in list {
+		match in_list_literal_cardinality(program, *item)? {
+			InListLiteralCardinality::Key(key) => {
+				literal_keys.insert(key);
+			}
+			InListLiteralCardinality::Null => {}
+		}
+	}
+	if literal_keys.is_empty() {
+		return None;
+	}
+	let rows_per_value = estimated_rows_for_ndv(base_rows, distinct_count.point_estimate());
+	let distinct_literal_count = u64::try_from(literal_keys.len()).unwrap_or(u64::MAX);
+	let estimated_rows = rows_per_value.get().saturating_mul(distinct_literal_count);
+	Some(RowCount::new(std::cmp::min(
+		base_rows.get(),
+		estimated_rows,
+	)))
+}
+
+fn in_list_literal_cardinality(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+) -> Option<InListLiteralCardinality> {
+	match program.node(id)? {
+		BoundExprNode::NullLiteral => Some(InListLiteralCardinality::Null),
+		BoundExprNode::Literal(literal) => {
+			in_list_scalar_literal_cardinality(program.literals.get(*literal as usize)?)
+		}
+		_ => None,
+	}
+}
+
+fn in_list_scalar_literal_cardinality(value: &ScalarValue) -> Option<InListLiteralCardinality> {
+	match value {
+		ScalarValue::Boolean(Some(value)) => Some(InListLiteralCardinality::Key(
+			InListLiteralKey::Boolean(*value),
+		)),
+		ScalarValue::Boolean(None) => Some(InListLiteralCardinality::Null),
+		ScalarValue::Int32(Some(value)) => Some(InListLiteralCardinality::Key(
+			InListLiteralKey::Int32(*value),
+		)),
+		ScalarValue::Int32(None) => Some(InListLiteralCardinality::Null),
+		ScalarValue::Int64(Some(value)) => Some(InListLiteralCardinality::Key(
+			InListLiteralKey::Int64(*value),
+		)),
+		ScalarValue::Int64(None) => Some(InListLiteralCardinality::Null),
+		ScalarValue::Float32(Some(value)) => {
+			if !value.is_finite() {
+				return None;
+			}
+			let value = if *value == 0.0 { 0.0 } else { *value };
+			Some(InListLiteralCardinality::Key(InListLiteralKey::Float32(
+				value.to_bits(),
+			)))
+		}
+		ScalarValue::Float32(None) => Some(InListLiteralCardinality::Null),
+		ScalarValue::Float64(Some(value)) => {
+			if !value.is_finite() {
+				return None;
+			}
+			let value = if *value == 0.0 { 0.0 } else { *value };
+			Some(InListLiteralCardinality::Key(InListLiteralKey::Float64(
+				value.to_bits(),
+			)))
+		}
+		ScalarValue::Float64(None) => Some(InListLiteralCardinality::Null),
+		ScalarValue::Utf8(Some(value)) => Some(InListLiteralCardinality::Key(
+			InListLiteralKey::Utf8(value.clone()),
+		)),
+		ScalarValue::Utf8(None) => Some(InListLiteralCardinality::Null),
+	}
 }
 
 fn column_ndv_for_input(
@@ -9320,6 +9432,343 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn in_list_filtered_dim_with_wendelon_ndv_infers_broadcast_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 10_000,
+					rel_err_ppm: 26_000,
+				},
+			)],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.region IN ('north', 'south')",
+			)
+			.expect("plan SQL IN-list NDV-filtered dimension join");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind SQL IN-list NDV-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn in_list_ndv_estimates_distinct_non_null_literals() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![utf8_literal("north"), utf8_literal("south")],
+				false,
+			),
+		)
+		.await
+		.expect("bind IN-list NDV-filtered dimension");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(4)));
+		assert!(scoped.facts.estimated_byte_size.is_some());
+	}
+
+	#[tokio::test]
+	async fn in_list_ndv_deduplicates_duplicate_literals() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![
+					utf8_literal("north"),
+					utf8_literal("north"),
+					utf8_literal("south"),
+				],
+				false,
+			),
+		)
+		.await
+		.expect("bind duplicate-literal IN-list");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(4)));
+	}
+
+	#[tokio::test]
+	async fn in_list_ndv_ignores_null_literals() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![
+					utf8_literal("north"),
+					Expr::Literal(ScalarValue::Utf8(None)),
+					utf8_literal("south"),
+				],
+				false,
+			),
+		)
+		.await
+		.expect("bind NULL-containing IN-list");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(4)));
+	}
+
+	#[tokio::test]
+	async fn in_list_ndv_all_null_list_fails_open() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![
+					Expr::Literal(ScalarValue::Utf8(None)),
+					Expr::Literal(ScalarValue::Utf8(None)),
+				],
+				false,
+			),
+		)
+		.await
+		.expect("bind all-NULL IN-list");
+
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn in_list_non_finite_float_literal_fails_open() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(1_000),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("score", DataType::Float64, true),
+			]),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"score",
+				vec![
+					Expr::Literal(ScalarValue::Float64(Some(0.5))),
+					Expr::Literal(ScalarValue::Float64(Some(f64::INFINITY))),
+				],
+				false,
+			),
+		)
+		.await
+		.expect("bind non-finite float IN-list");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(1_000)));
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn in_list_k_exceeds_ndv_caps_at_base_rows() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(10),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(3))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![
+					utf8_literal("north"),
+					utf8_literal("south"),
+					utf8_literal("east"),
+					utf8_literal("west"),
+				],
+				false,
+			),
+		)
+		.await
+		.expect("bind IN-list with k above NDV");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(10)));
+	}
+
+	#[tokio::test]
+	async fn not_in_does_not_use_ndv_selectivity() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![utf8_literal("north"), utf8_literal("south")],
+				true,
+			),
+		)
+		.await
+		.expect("bind NOT IN-list");
+
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn in_list_without_ndv_or_row_bound_fails_open() {
+		let missing_ndv =
+			descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(20_000));
+		let missing_ndv_scoped = bind_filtered_customers(
+			&missing_ndv,
+			customer_in_list(
+				"region",
+				vec![utf8_literal("north"), utf8_literal("south")],
+				false,
+			),
+		)
+		.await
+		.expect("bind IN-list without NDV");
+		assert_eq!(missing_ndv_scoped.facts.estimated_row_count, None);
+
+		let missing_row_bound = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let missing_row_bound_scoped = bind_filtered_customers(
+			&missing_row_bound,
+			customer_in_list(
+				"region",
+				vec![utf8_literal("north"), utf8_literal("south")],
+				false,
+			),
+		)
+		.await
+		.expect("bind IN-list without row bound");
+		assert_eq!(missing_row_bound_scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn in_list_and_equality_keep_tightest_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(1_000),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("region", DataType::Utf8, true),
+				Field::new("segment", DataType::Utf8, true),
+			]),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(10)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(1_000)),
+			],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::And(
+				Box::new(customer_in_list(
+					"region",
+					vec![utf8_literal("north"), utf8_literal("south")],
+					false,
+				)),
+				Box::new(Expr::Eq(
+					Box::new(customer_column("segment")),
+					Box::new(utf8_literal("retail")),
+				)),
+			),
+		)
+		.await
+		.expect("bind IN-list and equality filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(1)));
+		assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(200)));
+	}
+
+	#[tokio::test]
+	async fn in_list_does_not_write_hard_bounds_or_empty_relation() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![utf8_literal("north"), utf8_literal("south")],
+				false,
+			),
+		)
+		.await
+		.expect("bind IN-list estimate-channel filter");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(4)));
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn equality_ndv_existing_behavior_unchanged() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Eq(
+				Box::new(customer_column("region")),
+				Box::new(utf8_literal("north")),
+			),
+		)
+		.await
+		.expect("bind equality NDV-filtered dimension");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(2)));
+	}
+
+	#[tokio::test]
 	async fn rune_equality_filtered_dim_with_ndv_infers_broadcast_by_estimate() {
 		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
 			Some(64 * 1024 * 1024),
@@ -12155,6 +12604,18 @@ mod tests {
 
 	fn customer_column(name: &str) -> Expr {
 		Expr::qualified_column(TableRef::new("customers"), name)
+	}
+
+	fn utf8_literal(value: &str) -> Expr {
+		Expr::Literal(ScalarValue::Utf8(Some(value.to_string())))
+	}
+
+	fn customer_in_list(column: &str, list: Vec<Expr>, negated: bool) -> Expr {
+		Expr::InList {
+			expr: Box::new(customer_column(column)),
+			list,
+			negated,
+		}
 	}
 
 	fn customer_amount_between(low: i64, high: i64) -> Expr {

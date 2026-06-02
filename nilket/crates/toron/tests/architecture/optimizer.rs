@@ -1598,7 +1598,7 @@ pub(crate) fn adr141_estimated_rows_feed_estimated_bytes_not_hard_bytes() {
 }
 
 #[test]
-pub(crate) fn adr141_equality_only_no_range_in_or_multicolumn_selectivity() {
+pub(crate) fn adr141_ndv_selectivity_excludes_or_range_and_multicolumn() {
 	let binder = binder_source();
 	let helper = source_block(
 		&binder,
@@ -1609,7 +1609,6 @@ pub(crate) fn adr141_equality_only_no_range_in_or_multicolumn_selectivity() {
 	assert!(helper.contains("BoundBinaryOp::And"));
 	assert!(!helper.contains("BoundBinaryOp::Or"));
 	assert!(!helper.contains("BoundBinaryOp::Lt"));
-	assert!(!helper.contains("BoundExprNode::InList"));
 	assert!(binder.contains("fn filter_range_selectivity_estimated_row_count"));
 	assert!(binder.contains("range_filter_uses_min_max_range_selectivity_not_ndv"));
 }
@@ -2001,6 +2000,68 @@ pub(crate) fn adr147_float_range_facts_are_finite_and_estimate_channel_only() {
 	assert!(binder.contains("integer_range_facts_keep_discrete_interpolation"));
 	assert!(binder.contains("utf8_range_facts_still_fail_open"));
 	assert!(binder.contains("opaque_float_range_facts_still_fail_open"));
+}
+
+#[test]
+pub(crate) fn adr148_in_list_ndv_selectivity_is_consumer_only_and_estimate_channel() {
+	let binder = binder_source();
+	let filter = source_block(&binder, "fn filter_equality_ndv_estimated_row_count");
+	let predicate = source_block(
+		&binder,
+		"fn predicate_node_equality_ndv_estimated_row_count",
+	);
+	let helper = source_block(&binder, "fn in_list_ndv_estimated_row_count");
+	let literal = source_block(&binder, "fn in_list_literal_cardinality");
+	let scalar = source_block(&binder, "fn in_list_scalar_literal_cardinality");
+	let key = source_block(&binder, "enum InListLiteralKey");
+
+	assert!(predicate.contains("BoundExprNode::InList"));
+	assert!(predicate.contains("negated"));
+	assert!(predicate.contains("in_list_ndv_estimated_row_count"));
+	assert!(filter.contains("facts.origin != PlanOrigin::SingleBaseRelation"));
+	assert!(filter.contains("facts.row_upper_bound?"));
+	assert!(helper.contains("BoundExprNode::Column"));
+	assert!(helper.contains("column_ndv_for_input"));
+	assert!(helper.contains("BTreeSet"));
+	assert!(helper.contains("in_list_literal_cardinality"));
+	assert!(helper.contains("estimated_rows_for_ndv"));
+	assert!(literal.contains("BoundExprNode::NullLiteral"));
+	assert!(scalar.contains("is_finite"));
+	assert!(key.contains("Float32(u32)"));
+	assert!(key.contains("Float64(u64)"));
+	for forbidden in [
+		"byte_upper_bound",
+		"row_upper_bound: Some",
+		"EmptyRelation",
+		"TableOptimizerFacts",
+		"DescriptorOptimizerFacts",
+		"column_range",
+		"Kll",
+		"KLL",
+		"CountMin",
+		"Count-Min",
+		"Theta",
+		"tensor",
+		"Wendelon",
+		"wendelon",
+	] {
+		assert!(
+			!helper.contains(forbidden),
+			"IN-list NDV helper leaked forbidden marker {forbidden}"
+		);
+	}
+	assert!(binder.contains("in_list_filtered_dim_with_wendelon_ndv_infers_broadcast_by_estimate"));
+	assert!(binder.contains("in_list_ndv_estimates_distinct_non_null_literals"));
+	assert!(binder.contains("in_list_ndv_deduplicates_duplicate_literals"));
+	assert!(binder.contains("in_list_ndv_ignores_null_literals"));
+	assert!(binder.contains("in_list_ndv_all_null_list_fails_open"));
+	assert!(binder.contains("in_list_non_finite_float_literal_fails_open"));
+	assert!(binder.contains("in_list_k_exceeds_ndv_caps_at_base_rows"));
+	assert!(binder.contains("not_in_does_not_use_ndv_selectivity"));
+	assert!(binder.contains("in_list_without_ndv_or_row_bound_fails_open"));
+	assert!(binder.contains("in_list_and_equality_keep_tightest_estimate"));
+	assert!(binder.contains("in_list_does_not_write_hard_bounds_or_empty_relation"));
+	assert!(binder.contains("equality_ndv_existing_behavior_unchanged"));
 }
 
 #[test]
