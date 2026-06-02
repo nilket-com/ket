@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–147 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–148 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,57 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 147 promoted; ADR 148 candidates
+### ADR 148 promoted; ADR 149 candidates
+
+ADR 148 promoted **IN-List Equality Selectivity from Existing NDV Facts** — the
+**predicate-shape** analogue of 147's type-shape completion: `141 equality NDV → 142
+producer → 146 live base_rows → 148 IN-list spends the same fact`. A **Toron-only
+consumer cut** (no Wendelon producer/schema/wire/fact-struct change, no type-system,
+no snapshot infra), **estimate-channel only**. `col IN (v₁…vₖ)` was ignoring the live
+NDV fact and falling back to the blunt default → IN-filtered dims hash. 148 extends
+`predicate_node_equality_ndv_estimated_row_count` (`binder.rs`) with a positive
+single-column `BoundExprNode::InList` arm over `SingleBaseRelation`: estimate
+`min(base_rows, k·ceil(base_rows/NDV))` where `k` = distinct non-null literals,
+`base_rows` = 146's live `row_upper_bound`. **Disjoint-union math:** distinct equality
+classes on one column are disjoint (a row has one value), so the sum is the exact
+union of present values; the conservative over-count is from per-value `ceil` + rare/
+absent literals (suppresses some broadcasts — safe); it must never under-count by
+assuming independence. **Load-bearing literal handling (D3):** dedup via a typed
+`InListLiteralKey` (normalize `-0.0`→`+0.0`, key by bits — no reliance on
+`ScalarValue` hashability); null members ignored; **any non-finite float literal
+fails open the *whole* estimate — never skip a member, since skipping a `+inf`
+(which can match rows) would under-count `k` → over-broadcast**. `NOT IN`/tuple/
+subquery/expression-side IN out of scope. AND keeps 141's `min` (no correlation
+model); estimate-channel only (never `row_upper_bound`/`byte_upper_bound`/
+`EmptyRelation`). Converged 3-of-3 (Claude + Codex led IN-list from iter-0; Gemini's
+hard-byte lead grounded as a proof-heavy follow-on — 138's encoded-IPC unit isn't the
+schema width, so a hard byte fact needs a measured framing/buffer ledger, not a
+relabeled estimate). Headline gate:
+`in_list_filtered_dim_with_wendelon_ndv_infers_broadcast_by_estimate`
+(`WHERE region IN ('north','south')`, ndv=100, base=10_000 → ~200 rows → broadcast;
+fails on `main`).
+
+**ADR 149 lead candidates:** **136-W-byte hard materialized-byte producer** (the
+deferred byte half — *the proof is the feature*: a measured encoded-IPC framing/
+alignment/validity-buffer upper-bound ledger for an eligible fixed-width type fence,
+never compressed `size_bytes`; marginal-but-real after 146's row-anchored estimate —
+it earns `BroadcastInferred`/no-replay for the slice where the conservative estimate
+is just over threshold but the hard bound is under); **read-snapshot isolation +
+`provenance_hlc`** (the prerequisite that unblocks **hard-zero folds** — production
+reads are `HlcBound(0)`=latest with no `AS OF`, so elision is inert until bounded
+snapshots + a facts-validity receipt exist; a distributed-consistency cut, not a
+planner cut); **temporal types (Date32 start)** (unblocks 144's dark date/timestamp
+producer + the #1 analytical range filter; full engine-breadth — `ScalarValue`/
+literals/Arrow kernels/exec/display); **decimal range** (needs a `Decimal` scalar —
+engine-breadth); **KLL/quantile** (skew-aware range; evidence-gate on a measured
+min/max-uniformity miss); **Count-Min/heavy-hitter** (equality refinement after
+measured hot-key skew — the IN-list/equality estimate under-estimates hot keys today,
+replay-recovered); 140 A1; multi-column/correlated. **Forward arc:** `… → 147 float
+range → 148 IN-list → hard-byte proof / snapshot+hard-zero / temporal+decimal breadth
+→ KLL or heavy-hitter after measured misses → Theta join-key intersection → join
+selectivity → reordering`. Evidence-gate the next pick on the 148 feat.
+
+### ADR 147 promoted; ADR 148 candidates (HISTORICAL)
 
 ADR 147 promoted **Float Range Selectivity from Maintained Min/Max** — completes
 144's range story for Toron's last **native** scalar family (`f32`/`f64`); 144's
