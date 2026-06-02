@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–146 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–147 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,57 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 146 promoted; ADR 147 candidates
+### ADR 147 promoted; ADR 148 candidates
+
+ADR 147 promoted **Float Range Selectivity from Maintained Min/Max** — completes
+144's range story for Toron's last **native** scalar family (`f32`/`f64`); 144's
+consumer decoded only `Int32`/`Int64`, so float columns were dark
+(`arrow_stats_type_tag` returns `None` → CSB emits `OPAQUE_UNSUPPORTED`;
+`range_fact_tag_supported` excludes float; the Toron helper is integer-shaped). A
+**pure optimizer cut, no engine-breadth** (Toron already executes `f32`/`f64`),
+**estimate-channel only** (no hard bounds, no `EmptyRelation`). Cross-ring like 144:
+Wendelon adds schema-owned `ARROW_STATS_TAG_FLOAT32/64` (client-re-exported; tag-only,
+no struct change) + a **finite-float min/max producer**, Toron consumes via a
+**typed range domain**. **Two load-bearing impl realities (Claude's iter-4):** (1)
+the producer is a min/max *computation arm* in `collect_column_stats_in_one_pass`,
+not just a tag — downcast `Float32Array`/`Float64Array`, fold via `partial_cmp`,
+**suppress the column on any NaN/±∞** (undefined order / mis-summarized envelope),
+**normalize `-0.0`→`+0.0`**, encode order-preserving big-endian (sign-bit flip ≥0 /
+all-bits <0);
+(2) continuous intervals **can't reuse 144's integer `+1` successor** — `score > 0.8`
+is *exclusive* 0.8, so the `Real` interval carries an explicit **inclusivity** flag,
+which is the only thing distinguishing `>= max` (1 row) from `> max` (0 rows). The
+`Integral` arm stays 144 **verbatim** (regression-guarded). Selectivity: `min==max`
+all-or-zero, continuous `(high−low)/(max−min)`, non-empty overlap floors at ≥1 row,
+outside-envelope → estimate 0 (never hard). Float ≠ Decimal (no Decimal scalar →
+currency stays fail-open). **Hard-zero folds grounded out of this cycle** (the
+3-iter debate): elision is correctness-sharp and its freshness proof is both absent
+*and inert if built* — production reads are `HlcBound(0)`=latest (`daemon.rs:1274`),
+no `AS OF`/bounded-snapshot path, so a correct contract would fire for zero queries
+(Codex's stale-cache counterexample + Claude's read-bound grounding; a Claude↔Codex
+iter-1 cross-over resolved on grounding, Claude retracted + proved the inertness).
+Retargets 144's `range_utf8_and_float_facts_fail_open`; keeps 144 estimate-channel +
+146 no-elision guards intact. Genuine 3-of-3. Headline gate:
+`float_range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate`
+(fails on `main`).
+
+**ADR 148 lead candidates:** **hard zero-row folds** (the deferred 146/147
+elision — needs *both* a cross-ring facts/snapshot-validity receipt, e.g. Gemini's
+`provenance_hlc`, *and* bounded-snapshot reads, since `HlcBound(0)`=latest makes it
+inert today — a distributed-snapshot-isolation cut, not a planner cut); **136-W-byte
+hard materialized-byte producer** (the deferred byte half — marginal post-146's
+row-anchored estimate + needs a *measured* encoded-size ledger, never compressed
+`size_bytes`); **decimal range** (needs a `Decimal` scalar — engine-breadth);
+**temporal types (Date32 start)** (unblocks 144's dark date/timestamp producer; the
+#1 analytical range filter; engine-breadth — `ScalarValue` lacks temporal);
+**KLL/quantile range precision** (skew-aware; new maintained producer; evidence-gate
+on a measured min/max-uniformity miss); 140 A1; multi-column/correlated selectivity.
+**Forward arc:** `… → 146 hard row → 147 float range → (hard-zero once snapshot reads
+exist · 136-W-byte · decimal/temporal) → KLL/quantile → Theta-sketch join-key
+intersection → join selectivity → reordering`. Evidence-gate the next pick on the
+147 feat.
+
+### ADR 146 promoted; ADR 147 candidates (HISTORICAL)
 
 ADR 146 promoted **Hard Table-Size Optimizer Facts (Live Hard Row Upper Bounds)** —
 **lights the dark hard channel**, the through-line gap across 141→145: production
