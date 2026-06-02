@@ -465,13 +465,13 @@ pub(crate) fn adr033_schema_inference_uses_adr029_type_lattice() {
 		"DataType::Float32",
 		"DataType::Float64",
 		"DataType::Utf8",
+		"DataType::Date32",
 	] {
 		assert!(
 			type_lattice.contains(data_type),
 			"CTAS type lattice missing {data_type}"
 		);
 	}
-	assert!(!type_lattice.contains("DataType::Date32"));
 	assert!(!type_lattice.contains("DataType::Null"));
 	assert!(!type_lattice.contains("DataType::UInt32"));
 }

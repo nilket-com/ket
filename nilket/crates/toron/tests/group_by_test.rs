@@ -2210,7 +2210,7 @@ async fn sql_cast_rejects_unsupported_targets_sources_and_syntax() {
 		matches!(
 			err,
 			BindingError::TypeMismatch { ref message }
-				if message == "unsupported CAST: Utf8 to Int64; only Int32, Int64, Float32, and Float64 are supported"
+				if message == "unsupported CAST: Utf8 to Int64; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
 		),
 		"unexpected binding error: {err:?}"
 	);
@@ -2244,7 +2244,7 @@ async fn sql_try_cast_rejects_unsupported_targets_sources_and_syntax() {
 		matches!(
 			err,
 			BindingError::TypeMismatch { ref message }
-				if message == "unsupported TRY_CAST/SAFE_CAST: Utf8 to Int64; only Int32, Int64, Float32, and Float64 are supported"
+				if message == "unsupported TRY_CAST/SAFE_CAST: Utf8 to Int64; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
 		),
 		"unexpected binding error: {err:?}"
 	);

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Date32Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -29,7 +29,10 @@ use wendelon::schema::{STORAGE_ROW_KEY_ID_COLUMN, TableObjectId};
 #[test]
 fn planner_accepts_literal_insert_surface() {
 	let plan = SqlPlanner::new()
-		.plan("INSERT INTO app.sales (name, id) VALUES ('Alice', 1), ('Bob', 2)")
+		.plan(
+			"INSERT INTO app.sales (name, id, sold_on) \
+			 VALUES ('Alice', 1, DATE '2024-01-01'), ('Bob', 2, Date32 '2024-02-29')",
+		)
 		.expect("plan insert");
 
 	let LogicalPlan::Insert {
@@ -43,17 +46,26 @@ fn planner_accepts_literal_insert_surface() {
 	};
 
 	assert_eq!(table, TableRef::with_schema("app", "sales"));
-	assert_eq!(columns, Some(vec!["name".to_string(), "id".to_string()]));
+	assert_eq!(
+		columns,
+		Some(vec![
+			"name".to_string(),
+			"id".to_string(),
+			"sold_on".to_string()
+		])
+	);
 	assert_eq!(
 		rows,
 		vec![
 			vec![
 				InsertLiteral::Utf8("Alice".to_string()),
-				InsertLiteral::Int64(1)
+				InsertLiteral::Int64(1),
+				InsertLiteral::Date32(19_723)
 			],
 			vec![
 				InsertLiteral::Utf8("Bob".to_string()),
-				InsertLiteral::Int64(2)
+				InsertLiteral::Int64(2),
+				InsertLiteral::Date32(19_782)
 			],
 		]
 	);
@@ -150,10 +162,6 @@ fn planner_rejects_unsupported_insert_shapes() {
 			"must be VALUES only",
 		),
 		("INSERT OVERWRITE TABLE t (a) VALUES (1)", "OVERWRITE"),
-		(
-			"INSERT INTO t (a) VALUES (DATE '2024-01-01')",
-			"must be literals",
-		),
 		("INSERT INTO t (a) VALUES (1 + 2)", "must be literals"),
 		("INSERT INTO t (a) VALUES (now())", "must be literals"),
 	] {
@@ -237,13 +245,17 @@ async fn binder_coerces_all_create_table_types() {
 				Field::new("f64_value", DataType::Float64, false),
 				Field::new("label", DataType::Utf8, false),
 				Field::new("active", DataType::Boolean, false),
+				Field::new("event_date", DataType::Date32, false),
 			]),
 			false,
 		)
 		.await
 		.expect("create metrics");
 	let plan = SqlPlanner::new()
-		.plan("INSERT INTO metrics VALUES (1, 9007199254740991, 1.25, 2.5, 'ok', TRUE)")
+		.plan(
+			"INSERT INTO metrics VALUES \
+			 (1, 9007199254740991, 1.25, 2.5, 'ok', TRUE, DATE '2024-01-01')",
+		)
 		.expect("plan insert");
 
 	let bound = bind(&plan, &catalog, &PlannerConfig::default())
@@ -262,6 +274,7 @@ async fn binder_coerces_all_create_table_types() {
 			ScalarValue::Float64(Some(2.5)),
 			ScalarValue::Utf8(Some("ok".to_string())),
 			ScalarValue::Boolean(Some(true)),
+			ScalarValue::Date32(Some(19_723)),
 		]]
 	);
 }
@@ -489,6 +502,46 @@ async fn query_coordinator_executes_insert_and_select_round_trip() {
 	assert_eq!(ids.value(1), 2);
 	assert_eq!(names.value(0), "Alice");
 	assert_eq!(names.value(1), "Bob");
+}
+
+#[tokio::test]
+async fn query_coordinator_executes_date32_insert_round_trip() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let executor = Executor::new(storage.clone());
+	let coordinator =
+		QueryCoordinator::with_writer(catalog, executor, PlannerConfig::default(), storage.clone());
+	let planner = SqlPlanner::new();
+
+	for sql in [
+		"CREATE TABLE events (id INT NOT NULL, event_date DATE)",
+		"INSERT INTO events VALUES (1, DATE '2024-01-01'), (2, Date32 '2024-02-29')",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let results = coordinator
+		.execute_query(
+			&planner
+				.plan("SELECT id, event_date FROM events ORDER BY id")
+				.expect("plan select"),
+			None,
+		)
+		.await
+		.expect("select");
+	let schema = results[0].schema();
+	let batch = arrow::compute::concat_batches(&schema, results.iter()).expect("concat results");
+	let dates = batch
+		.column(1)
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("Date32 column");
+
+	assert_eq!(batch.column(1).data_type(), &DataType::Date32);
+	assert_eq!(dates.values(), &[19_723, 19_782]);
 }
 
 #[tokio::test]

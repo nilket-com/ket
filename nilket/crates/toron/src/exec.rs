@@ -18,9 +18,10 @@ use crate::ir::{BroadcastReplayEligibility, JoinReplayId, JoinStrategy};
 use crate::ir::{Expr, LogicalPlan};
 use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
 use arrow::array::{
-	Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float32Builder, Float64Array,
-	Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
-	StringArray, StringBuilder, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Float32Array,
+	Float32Builder, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder,
+	Int64Array, Int64Builder, StringArray, StringBuilder, UInt8Array, UInt16Array, UInt32Array,
+	UInt64Array,
 };
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or, or_kleene};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -868,6 +869,7 @@ impl Executor {
 					ScalarValue::Int64(v) => {
 						Ok(Arc::new(arrow::array::Int64Array::from(vec![*v; num_rows])))
 					}
+					ScalarValue::Date32(v) => Ok(Arc::new(Date32Array::from(vec![*v; num_rows]))),
 					ScalarValue::Float32(v) => {
 						Ok(Arc::new(arrow::array::Float32Array::from(vec![
 							*v;
@@ -1730,6 +1732,7 @@ fn literal_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
 		ScalarValue::Boolean(value) => Arc::new(BooleanArray::from(vec![*value; num_rows])),
 		ScalarValue::Int32(value) => Arc::new(Int32Array::from(vec![*value; num_rows])),
 		ScalarValue::Int64(value) => Arc::new(Int64Array::from(vec![*value; num_rows])),
+		ScalarValue::Date32(value) => Arc::new(Date32Array::from(vec![*value; num_rows])),
 		ScalarValue::Float32(value) => Arc::new(Float32Array::from(vec![*value; num_rows])),
 		ScalarValue::Float64(value) => Arc::new(Float64Array::from(vec![*value; num_rows])),
 		ScalarValue::Utf8(value) => {
@@ -1812,6 +1815,17 @@ fn system_table_array(
 					ScalarValue::Int64(Some(value)) => builder.append_value(*value),
 					ScalarValue::Int64(None) => builder.append_null(),
 					other => return Err(system_table_type_mismatch(field_name, "Int64", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Date32 => {
+			let mut builder = Date32Builder::with_capacity(rows.len());
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Date32(Some(value)) => builder.append_value(*value),
+					ScalarValue::Date32(None) => builder.append_null(),
+					other => return Err(system_table_type_mismatch(field_name, "Date32", other)),
 				}
 			}
 			Ok(Arc::new(builder.finish()))
@@ -2878,6 +2892,7 @@ fn estimated_build_hash_bytes(key_arrays: &[ArrayRef], rows: usize) -> u64 {
 			DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
 			DataType::Int16 | DataType::UInt16 => 2,
 			DataType::Int32 | DataType::UInt32 | DataType::Float32 => 4,
+			DataType::Date32 => 4,
 			DataType::Int64 | DataType::UInt64 | DataType::Float64 => 8,
 			DataType::Utf8 => 32,
 			_ => 16,
@@ -3437,6 +3452,14 @@ fn encode_partition_key_value(
 			encoded.push(4);
 			encoded.extend_from_slice(&values.value(row).to_le_bytes());
 		}
+		DataType::Date32 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<Date32Array>()
+				.expect("date32 data type");
+			encoded.push(13);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
 		DataType::Int64 => {
 			let values = array
 				.as_any()
@@ -3525,6 +3548,7 @@ enum GroupValue {
 	Boolean(bool),
 	Int32(i32),
 	Int64(i64),
+	Date32(i32),
 	Utf8(String),
 }
 
@@ -3667,6 +3691,9 @@ fn group_value(array: &ArrayRef, row: usize) -> Result<GroupValue, ExecutionErro
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
 		return Ok(GroupValue::Int64(array.value(row)));
+	}
+	if let Some(array) = array.as_any().downcast_ref::<Date32Array>() {
+		return Ok(GroupValue::Date32(array.value(row)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
 		return Ok(GroupValue::Utf8(array.value(row).to_string()));
@@ -4277,6 +4304,15 @@ fn group_column(
 				.map(|key| match &key[idx] {
 					GroupValue::Null => Ok(None),
 					GroupValue::Int64(value) => Ok(Some(*value)),
+					other => Err(group_type_error(data_type, other)),
+				})
+				.collect::<Result<Vec<_>, _>>()?,
+		))),
+		arrow::datatypes::DataType::Date32 => Ok(Arc::new(Date32Array::from(
+			keys.iter()
+				.map(|key| match &key[idx] {
+					GroupValue::Null => Ok(None),
+					GroupValue::Date32(value) => Ok(Some(*value)),
 					other => Err(group_type_error(data_type, other)),
 				})
 				.collect::<Result<Vec<_>, _>>()?,

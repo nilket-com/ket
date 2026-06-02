@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Date32Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -431,16 +431,15 @@ async fn binder_rejects_invalid_ctas_inferred_schema() {
 		.await
 		.expect("create Date32 source");
 	let plan = SqlPlanner::new()
-		.plan("CREATE TABLE unsupported AS SELECT d FROM dated")
-		.expect("plan CTAS");
-	let err = bind(&plan, &catalog, &PlannerConfig::default())
+		.plan("CREATE TABLE dated_copy AS SELECT d FROM dated")
+		.expect("plan Date32 CTAS");
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
 		.await
-		.expect_err("unsupported CTAS type should reject");
-	assert!(
-		err.to_string()
-			.contains("unsupported CTAS output column type"),
-		"unexpected error: {err}"
-	);
+		.expect("Date32 CTAS should bind");
+	let ExecutionPlan::CreateTableAsSelect { schema, .. } = bound else {
+		panic!("expected CTAS execution plan");
+	};
+	assert_field(&schema, 0, "d", &DataType::Date32, false);
 }
 
 #[tokio::test]
@@ -476,6 +475,39 @@ async fn query_coordinator_executes_projection_ctas() {
 	assert_eq!(ids.values(), &[1, 2]);
 	assert_eq!(names.value(0), "Alice");
 	assert_eq!(names.value(1), "Bob");
+}
+
+#[tokio::test]
+async fn query_coordinator_executes_date32_projection_ctas() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+
+	for sql in [
+		"CREATE TABLE dated (id INT NOT NULL, d DATE)",
+		"INSERT INTO dated VALUES (1, DATE '2024-01-01'), (2, Date32 '2024-02-29')",
+		"CREATE TABLE dated_copy AS SELECT id, d FROM dated",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let binding = catalog
+		.resolve_table(&TableRef::new("dated_copy"))
+		.await
+		.expect("resolve Date32 CTAS table");
+	assert_field(&binding.schema, 0, "id", &DataType::Int32, false);
+	assert_field(&binding.schema, 1, "d", &DataType::Date32, true);
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT id, d FROM dated_copy ORDER BY id",
+	)
+	.await;
+	let dates = date32_column(&batch, 1);
+	assert_eq!(int32_column(&batch, 0).values(), &[1, 2]);
+	assert_eq!(dates.values(), &[19_723, 19_782]);
 }
 
 #[tokio::test]
@@ -1053,6 +1085,14 @@ fn int64_column(batch: &RecordBatch, index: usize) -> &Int64Array {
 		.as_any()
 		.downcast_ref::<Int64Array>()
 		.expect("Int64 column")
+}
+
+fn date32_column(batch: &RecordBatch, index: usize) -> &Date32Array {
+	batch
+		.column(index)
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("Date32 column")
 }
 
 fn string_column(batch: &RecordBatch, index: usize) -> &StringArray {

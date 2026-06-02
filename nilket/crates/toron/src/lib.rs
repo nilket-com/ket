@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod coordinator;
 pub mod daemon;
+mod date32;
 pub mod distributed;
 pub mod error;
 pub mod exec;

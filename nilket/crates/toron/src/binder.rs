@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::date32::parse_date_ymd;
 use arrow::array::{Array, BooleanArray};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -36,10 +37,11 @@ use wendelon::schema::{
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
 };
 use wendelon_client::{
-	ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
-	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
-	TableSchemaDescriptor, decode_float32_optimizer_fact_scalar,
-	decode_float64_optimizer_fact_scalar, decode_signed_optimizer_fact_scalar,
+	ARROW_STATS_TAG_DATE32, ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64,
+	ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64, LogicalTypeRefinementComparisonOp,
+	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor,
+	decode_float32_optimizer_fact_scalar, decode_float64_optimizer_fact_scalar,
+	decode_signed_optimizer_fact_scalar,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -1825,6 +1827,7 @@ fn typed_null_for_data_type(data_type: &DataType) -> Result<ScalarValue, Binding
 		DataType::Boolean => Ok(ScalarValue::Boolean(None)),
 		DataType::Int32 => Ok(ScalarValue::Int32(None)),
 		DataType::Int64 => Ok(ScalarValue::Int64(None)),
+		DataType::Date32 => Ok(ScalarValue::Date32(None)),
 		DataType::Float32 => Ok(ScalarValue::Float32(None)),
 		DataType::Float64 => Ok(ScalarValue::Float64(None)),
 		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
@@ -1906,6 +1909,7 @@ fn is_supported_ctas_column_type(data_type: &DataType) -> bool {
 		DataType::Boolean
 			| DataType::Int32
 			| DataType::Int64
+			| DataType::Date32
 			| DataType::Float32
 			| DataType::Float64
 			| DataType::Utf8
@@ -2459,6 +2463,7 @@ fn predicate_carrier_literal(
 enum CarrierLiteral {
 	Int32(i32),
 	Int64(i64),
+	Date32(i32),
 	Float32(FiniteF32),
 	Float64(FiniteF64),
 	Utf8(String),
@@ -2487,6 +2492,9 @@ fn carrier_literal_from_scalar(value: &ScalarValue, carrier: &DataType) -> Optio
 	match (carrier, value) {
 		(DataType::Int32, ScalarValue::Int32(Some(value))) => Some(CarrierLiteral::Int32(*value)),
 		(DataType::Int64, ScalarValue::Int64(Some(value))) => Some(CarrierLiteral::Int64(*value)),
+		(DataType::Date32, ScalarValue::Date32(Some(value))) => {
+			Some(CarrierLiteral::Date32(*value))
+		}
 		(DataType::Float32, ScalarValue::Float32(Some(value))) => {
 			FiniteF32::new(*value).map(CarrierLiteral::Float32)
 		}
@@ -2739,6 +2747,7 @@ enum CarrierDomain {
 	Empty,
 	Int32(OrderedDomain<i32>),
 	Int64(OrderedDomain<i64>),
+	Date32(OrderedDomain<i32>),
 	Float32(OrderedDomain<FiniteF32>),
 	Float64(OrderedDomain<FiniteF64>),
 	Utf8(Utf8Domain),
@@ -2763,6 +2772,14 @@ impl CarrierDomain {
 					Some(Self::Empty)
 				} else {
 					Some(Self::Int64(domain))
+				}
+			}
+			(Self::Date32(left), Self::Date32(right)) => {
+				let domain = left.intersect(right);
+				if domain.is_empty() {
+					Some(Self::Empty)
+				} else {
+					Some(Self::Date32(domain))
 				}
 			}
 			(Self::Float32(left), Self::Float32(right)) => {
@@ -2864,6 +2881,9 @@ fn domain_from_comparison(op: RefinementCmpOp, literal: CarrierLiteral) -> Optio
 		}
 		CarrierLiteral::Int64(value) => {
 			ordered_domain_from_comparison(op, value).map(CarrierDomain::Int64)
+		}
+		CarrierLiteral::Date32(value) => {
+			ordered_domain_from_comparison(op, value).map(CarrierDomain::Date32)
 		}
 		CarrierLiteral::Float32(value) => {
 			ordered_domain_from_comparison(op, value).map(CarrierDomain::Float32)
@@ -3877,6 +3897,7 @@ enum InListLiteralKey {
 	Boolean(bool),
 	Int32(i32),
 	Int64(i64),
+	Date32(i32),
 	Float32(u32),
 	Float64(u64),
 	Utf8(String),
@@ -3946,6 +3967,10 @@ fn in_list_scalar_literal_cardinality(value: &ScalarValue) -> Option<InListLiter
 			InListLiteralKey::Int64(*value),
 		)),
 		ScalarValue::Int64(None) => Some(InListLiteralCardinality::Null),
+		ScalarValue::Date32(Some(value)) => Some(InListLiteralCardinality::Key(
+			InListLiteralKey::Date32(*value),
+		)),
+		ScalarValue::Date32(None) => Some(InListLiteralCardinality::Null),
 		ScalarValue::Float32(Some(value)) => {
 			if !value.is_finite() {
 				return None;
@@ -4259,6 +4284,9 @@ fn range_scalar_for_fact(range: &RangeFact, value: &ScalarValue) -> Option<Range
 		(ARROW_STATS_TAG_INT64, ScalarValue::Int64(Some(value))) => {
 			Some(RangeScalar::Integral(i128::from(*value)))
 		}
+		(ARROW_STATS_TAG_DATE32, ScalarValue::Date32(Some(value))) => {
+			Some(RangeScalar::Integral(i128::from(*value)))
+		}
 		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Int32(Some(value))) => {
 			Some(RangeScalar::Real(f64::from(*value)))
 		}
@@ -4450,6 +4478,8 @@ fn decode_range_scalar(arrow_type_tag: u8, bytes: &[u8]) -> Option<RangeScalar> 
 			.map(|value| RangeScalar::Integral(value.into())),
 		ARROW_STATS_TAG_INT64 if bytes.len() == 8 => decode_signed_optimizer_fact_scalar(bytes)
 			.map(|value| RangeScalar::Integral(value.into())),
+		ARROW_STATS_TAG_DATE32 if bytes.len() == 4 => decode_signed_optimizer_fact_scalar(bytes)
+			.map(|value| RangeScalar::Integral(value.into())),
 		ARROW_STATS_TAG_FLOAT32 if bytes.len() == 4 => {
 			decode_float32_optimizer_fact_scalar(bytes).map(|value| RangeScalar::Real(value.into()))
 		}
@@ -4532,6 +4562,7 @@ fn literal_is_non_null(value: &ScalarValue) -> bool {
 		ScalarValue::Boolean(value) => value.is_some(),
 		ScalarValue::Int32(value) => value.is_some(),
 		ScalarValue::Int64(value) => value.is_some(),
+		ScalarValue::Date32(value) => value.is_some(),
 		ScalarValue::Float32(value) => value.is_some(),
 		ScalarValue::Float64(value) => value.is_some(),
 		ScalarValue::Utf8(value) => value.is_some(),
@@ -5705,6 +5736,7 @@ fn sql_carrier_keyword(data_type: &DataType) -> Result<&'static str, BindingErro
 	match data_type {
 		DataType::Int32 => Ok("INT"),
 		DataType::Int64 => Ok("BIGINT"),
+		DataType::Date32 => Ok("DATE"),
 		DataType::Float32 => Ok("REAL"),
 		DataType::Float64 => Ok("DOUBLE"),
 		DataType::Utf8 => Ok("TEXT"),
@@ -7199,10 +7231,10 @@ fn bind_explicit_cast(
 		.node_type(inner)
 		.cloned()
 		.expect("builder returns typed cast input");
-	if !is_supported_explicit_numeric_cast(&source, target) {
+	if source != *target && !is_supported_explicit_numeric_cast(&source, target) {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
-				"unsupported CAST: {source:?} to {target:?}; only Int32, Int64, Float32, and Float64 are supported"
+				"unsupported CAST: {source:?} to {target:?}; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
 			),
 		});
 	}
@@ -7224,10 +7256,10 @@ fn bind_try_cast(
 		.node_type(inner)
 		.cloned()
 		.expect("builder returns typed try-cast input");
-	if !is_supported_explicit_numeric_cast(&source, target) {
+	if source != *target && !is_supported_explicit_numeric_cast(&source, target) {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
-				"unsupported TRY_CAST/SAFE_CAST: {source:?} to {target:?}; only Int32, Int64, Float32, and Float64 are supported"
+				"unsupported TRY_CAST/SAFE_CAST: {source:?} to {target:?}; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
 			),
 		});
 	}
@@ -7347,6 +7379,10 @@ fn coerce_insert_literal(
 			DataType::Float64 => Ok(ScalarValue::Float64(Some(*value as f64))),
 			_ => Err(insert_type_mismatch(column, literal, target)),
 		},
+		InsertLiteral::Date32(value) => match target {
+			DataType::Date32 => Ok(ScalarValue::Date32(Some(*value))),
+			_ => Err(insert_type_mismatch(column, literal, target)),
+		},
 		InsertLiteral::Float64(value) => match target {
 			DataType::Float32 => Ok(ScalarValue::Float32(Some(*value as f32))),
 			DataType::Float64 => Ok(ScalarValue::Float64(Some(*value))),
@@ -7437,7 +7473,7 @@ fn bind_comparison(
 	}
 	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
 	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
-	coerce_comparison_literals(builder, left, right);
+	coerce_comparison_literals(builder, left, right)?;
 	let left_type = builder
 		.node_type(left)
 		.cloned()
@@ -7497,7 +7533,7 @@ fn bind_in_list(
 		} else {
 			bind_expr_into_program(builder, item, input_schema, ctx)?
 		};
-		coerce_comparison_literals(builder, expr, item);
+		coerce_comparison_literals(builder, expr, item)?;
 		let current_expr_type = builder
 			.node_type(expr)
 			.cloned()
@@ -7665,27 +7701,33 @@ fn coerce_comparison_literals(
 	builder: &mut BoundExprProgramBuilder,
 	left: BoundExprId,
 	right: BoundExprId,
-) {
+) -> Result<(), BindingError> {
 	if builder.literal(left).is_some() && builder.literal(right).is_some() {
-		return;
+		return Ok(());
 	}
 	if let Some(value) = builder.literal(left).cloned() {
 		let Some(data_type) = builder.node_type(right).cloned() else {
-			return;
+			return Ok(());
 		};
-		let _ = builder.rewrite_literal(left, coerce_literal_value(value, &data_type));
-		return;
+		let value = coerce_literal_value(value, &data_type)?;
+		let _ = builder.rewrite_literal(left, value);
+		return Ok(());
 	}
 	if let Some(value) = builder.literal(right).cloned() {
 		let Some(data_type) = builder.node_type(left).cloned() else {
-			return;
+			return Ok(());
 		};
-		let _ = builder.rewrite_literal(right, coerce_literal_value(value, &data_type));
+		let value = coerce_literal_value(value, &data_type)?;
+		let _ = builder.rewrite_literal(right, value);
 	}
+	Ok(())
 }
 
-fn coerce_literal_value(value: ScalarValue, target_type: &DataType) -> ScalarValue {
-	match (value, target_type) {
+fn coerce_literal_value(
+	value: ScalarValue,
+	target_type: &DataType,
+) -> Result<ScalarValue, BindingError> {
+	Ok(match (value, target_type) {
 		(ScalarValue::Int32(value), DataType::Int64) => ScalarValue::Int64(value.map(i64::from)),
 		(ScalarValue::Int32(value), DataType::Float32) => {
 			ScalarValue::Float32(value.map(|value| value as f32))
@@ -7702,8 +7744,16 @@ fn coerce_literal_value(value: ScalarValue, target_type: &DataType) -> ScalarVal
 		(ScalarValue::Float64(value), DataType::Float32) => {
 			ScalarValue::Float32(value.map(|value| value as f32))
 		}
+		(ScalarValue::Utf8(Some(value)), DataType::Date32) => {
+			ScalarValue::Date32(Some(parse_date_ymd(&value).map_err(|error| {
+				BindingError::TypeMismatch {
+					message: error.to_string(),
+				}
+			})?))
+		}
+		(ScalarValue::Utf8(None), DataType::Date32) => ScalarValue::Date32(None),
 		(value, _) => value,
-	}
+	})
 }
 
 fn bind_boolean(
@@ -9545,6 +9595,40 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn date32_in_list_ndv_estimates_distinct_non_null_literals() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(10_000),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("signup_date", DataType::Date32, true),
+			]),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"signup_date",
+				vec![
+					date32_literal(19_723),
+					date32_literal(19_723),
+					Expr::Literal(ScalarValue::Date32(None)),
+					date32_literal(19_724),
+				],
+				false,
+			),
+		)
+		.await
+		.expect("bind Date32 IN-list NDV-filtered dimension");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(10_000)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(200)));
+		assert!(scoped.facts.estimated_byte_size.is_some());
+	}
+
+	#[tokio::test]
 	async fn in_list_ndv_all_null_list_fails_open() {
 		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
 			Some(64 * 1024 * 1024),
@@ -10128,6 +10212,65 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn date32_comparisons_coerce_bare_string_literals_only_against_date32() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(10_000),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("signup_date", DataType::Date32, true),
+				Field::new("region", DataType::Utf8, true),
+			]),
+			Vec::new(),
+		);
+
+		for sql in [
+			"SELECT * FROM customers WHERE signup_date = '2024-01-01'",
+			"SELECT * FROM customers WHERE signup_date IN ('2024-01-01', DATE '2024-01-02', NULL)",
+		] {
+			let logical = SqlPlanner::new().plan(sql).expect("plan Date32 SQL");
+			Binder {
+				catalog: &catalog,
+				config: &PlannerConfig::default(),
+			}
+			.bind_plan(&logical)
+			.await
+			.expect("bind Date32 string coercion");
+		}
+
+		for (sql, diagnostic) in [
+			(
+				"SELECT * FROM customers WHERE signup_date = '2024-02-30'",
+				"invalid Date32 literal",
+			),
+			(
+				"SELECT * FROM customers WHERE signup_date = 19723",
+				"comparison operands have different types",
+			),
+			(
+				"SELECT * FROM customers WHERE region = DATE '2024-01-01'",
+				"comparison operands have different types",
+			),
+		] {
+			let logical = SqlPlanner::new().plan(sql).expect("plan Date32 SQL");
+			let err = Binder {
+				catalog: &catalog,
+				config: &PlannerConfig::default(),
+			}
+			.bind_plan(&logical)
+			.await;
+			let Err(err) = err else {
+				panic!("invalid Date32 comparison should reject");
+			};
+			assert!(
+				err.to_string().contains(diagnostic),
+				"expected diagnostic {diagnostic:?}, got {err}"
+			);
+		}
+	}
+
+	#[tokio::test]
 	async fn range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate() {
 		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
 			None,
@@ -10144,6 +10287,33 @@ mod tests {
 		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
 			.await
 			.expect("bind SQL range-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn date32_range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_date_range(range_fact_date32(
+			19_723, 19_822, 1_000,
+		));
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+					 INNER JOIN customers c ON o.customer_id = c.id \
+					 WHERE c.signup_date BETWEEN DATE '2024-01-10' AND DATE '2024-01-19'",
+			)
+			.expect("plan SQL Date32 range-filtered dimension join");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind SQL Date32 range-estimated dimension join");
 
 		assert_join_strategy(&plan, JoinStrategy::Broadcast);
 		assert!(matches!(
@@ -10751,6 +10921,24 @@ mod tests {
 		)
 		.await
 		.expect("bind integer discrete range filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+	}
+
+	#[tokio::test]
+	async fn date32_range_facts_keep_discrete_interpolation() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_date_range(range_fact_date32(
+			19_723, 19_822, 1_000,
+		));
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("signup_date")),
+				Box::new(date32_literal(19_812)),
+			),
+		)
+		.await
+		.expect("bind Date32 discrete range filter");
 
 		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
 	}
@@ -12455,6 +12643,22 @@ mod tests {
 		)
 	}
 
+	fn descriptor_sidecar_join_catalog_with_customer_date_range(
+		range: RangeFact,
+	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("signup_date", DataType::Date32, true),
+			]),
+			Vec::new(),
+			vec![(ColumnOrdinal(1), range)],
+		)
+	}
+
 	fn wide_customer_schema() -> Schema {
 		Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
@@ -12592,6 +12796,20 @@ mod tests {
 		}
 	}
 
+	fn range_fact_date32(min: i32, max: i32, non_null_count: u64) -> RangeFact {
+		RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_DATE32,
+			null_count: 0,
+			non_null_count,
+			min: Some(
+				wendelon_client::encode_signed_optimizer_fact_scalar(i64::from(min), 4).unwrap(),
+			),
+			max: Some(
+				wendelon_client::encode_signed_optimizer_fact_scalar(i64::from(max), 4).unwrap(),
+			),
+		}
+	}
+
 	fn range_fact_f64(min: f64, max: f64, non_null_count: u64) -> RangeFact {
 		RangeFact {
 			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_FLOAT64,
@@ -12608,6 +12826,10 @@ mod tests {
 
 	fn utf8_literal(value: &str) -> Expr {
 		Expr::Literal(ScalarValue::Utf8(Some(value.to_string())))
+	}
+
+	fn date32_literal(value: i32) -> Expr {
+		Expr::Literal(ScalarValue::Date32(Some(value)))
 	}
 
 	fn customer_in_list(column: &str, list: Vec<Expr>, negated: bool) -> Expr {

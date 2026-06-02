@@ -37,7 +37,9 @@ fn planner_accepts_create_table_surface() {
 				price DOUBLE,
 				score REAL,
 				name TEXT,
-				active BOOLEAN
+				active BOOLEAN,
+				created_on DATE,
+				expires_on Date32
 			)",
 		)
 		.expect("plan create table");
@@ -63,6 +65,8 @@ fn planner_accepts_create_table_surface() {
 	assert_create_column(&schema, 3, "score", &DataType::Float32, true);
 	assert_create_column(&schema, 4, "name", &DataType::Utf8, true);
 	assert_create_column(&schema, 5, "active", &DataType::Boolean, true);
+	assert_create_column(&schema, 6, "created_on", &DataType::Date32, true);
+	assert_create_column(&schema, 7, "expires_on", &DataType::Date32, true);
 }
 
 #[test]

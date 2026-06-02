@@ -664,11 +664,14 @@ fn decode_sql_batch(
 }
 
 fn render_batches(batches: &[RecordBatch]) -> Result<(), arrow::error::ArrowError> {
+	println!("{}", format_batches_for_display(batches)?);
+	Ok(())
+}
+
+fn format_batches_for_display(batches: &[RecordBatch]) -> Result<String, arrow::error::ArrowError> {
 	let total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
 	let rendered = arrow_cast::pretty::pretty_format_batches(batches)?;
-	println!("{rendered}");
-	println!("({total_rows} rows)");
-	Ok(())
+	Ok(format!("{rendered}\n({total_rows} rows)"))
 }
 
 fn print_usage(program: &str) {
@@ -707,6 +710,30 @@ mod tests {
 
 	fn args(values: &[&str]) -> Vec<String> {
 		values.iter().map(|value| value.to_string()).collect()
+	}
+
+	#[test]
+	fn date32_select_output_renders_iso_date() {
+		let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+			arrow::datatypes::Field::new("event_date", arrow::datatypes::DataType::Date32, true),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(arrow::array::Date32Array::from(vec![
+				Some(19_723),
+				Some(19_782),
+				None,
+			]))],
+		)
+		.expect("Date32 batch");
+
+		let rendered = format_batches_for_display(&[batch]).expect("render Date32 batch");
+
+		assert!(rendered.contains("2024-01-01"));
+		assert!(rendered.contains("2024-02-29"));
+		assert!(rendered.contains("(3 rows)"));
+		assert!(!rendered.contains("19723"));
+		assert!(!rendered.contains("19782"));
 	}
 
 	fn clear_sql_env() {

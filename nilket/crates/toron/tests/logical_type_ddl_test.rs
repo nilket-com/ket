@@ -2356,6 +2356,7 @@ async fn information_schema_columns_lists_authoritative_columns() {
 		&Schema::new(vec![
 			arrow::datatypes::Field::new("event_id", DataType::Int64, false),
 			arrow::datatypes::Field::new("event_name", DataType::Utf8, true),
+			arrow::datatypes::Field::new("event_date", DataType::Date32, false),
 		]),
 	);
 	let catalog: Arc<dyn Catalog> = Arc::new(RefreshingTableDescriptorCatalog {
@@ -2382,26 +2383,46 @@ async fn information_schema_columns_lists_authoritative_columns() {
 
 	assert_eq!(
 		string_rows(&batch, 0),
-		vec![Some("analytics".to_string()), Some("analytics".to_string())]
+		vec![
+			Some("analytics".to_string()),
+			Some("analytics".to_string()),
+			Some("analytics".to_string())
+		]
 	);
 	assert_eq!(
 		string_rows(&batch, 1),
-		vec![Some("events".to_string()), Some("events".to_string())]
+		vec![
+			Some("events".to_string()),
+			Some("events".to_string()),
+			Some("events".to_string())
+		]
 	);
 	assert_eq!(
 		string_rows(&batch, 2),
-		vec![Some("event_id".to_string()), Some("event_name".to_string())]
+		vec![
+			Some("event_id".to_string()),
+			Some("event_name".to_string()),
+			Some("event_date".to_string())
+		]
 	);
-	assert_eq!(int64_rows(&batch, 3), vec![Some(1), Some(2)]);
+	assert_eq!(int64_rows(&batch, 3), vec![Some(1), Some(2), Some(3)]);
 	assert_eq!(
 		string_rows(&batch, 4),
-		vec![Some("BIGINT".to_string()), Some("TEXT".to_string())]
+		vec![
+			Some("BIGINT".to_string()),
+			Some("TEXT".to_string()),
+			Some("DATE".to_string())
+		]
 	);
 	assert_eq!(
 		string_rows(&batch, 5),
-		vec![Some("NO".to_string()), Some("YES".to_string())]
+		vec![
+			Some("NO".to_string()),
+			Some("YES".to_string()),
+			Some("NO".to_string())
+		]
 	);
-	assert_eq!(string_rows(&batch, 6), vec![None, None]);
+	assert_eq!(string_rows(&batch, 6), vec![None, None, None]);
 }
 
 #[tokio::test]

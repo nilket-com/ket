@@ -1,5 +1,6 @@
 use crate::aggregate_kernel;
 use crate::catalog::TableRef;
+use crate::date32::parse_date_ymd;
 use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, CreateTableColumn, CreateTableColumnType, CreateTableRowIdentity,
@@ -15,8 +16,8 @@ use sqlparser::ast::{
 	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
 	Ident, Insert, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
 	ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem,
-	SetExpr, Statement, TableAlias, TableConstraint, TableFactor, TableObject, UnaryOperator,
-	Value,
+	SetExpr, Statement, TableAlias, TableConstraint, TableFactor, TableObject, TypedString,
+	UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -256,6 +257,7 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 		| SqlDataType::DoublePrecision
 		| SqlDataType::Float8
 		| SqlDataType::Float64 => Ok(DataType::Float64),
+		SqlDataType::Date | SqlDataType::Date32 => Ok(DataType::Date32),
 		SqlDataType::Float(_) => Err(unsupported(
 			"unsupported CAST target type: FLOAT (precision-parameter ambiguous; use REAL, DOUBLE PRECISION, FLOAT32, or FLOAT64)",
 		)),
@@ -263,6 +265,18 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 			"unsupported CAST target type: {other}"
 		))),
 	}
+}
+
+fn is_date_sql_type(data_type: &SqlDataType) -> bool {
+	matches!(data_type, SqlDataType::Date | SqlDataType::Date32)
+}
+
+fn typed_string_value(typed: &TypedString) -> Result<String, FrontendError> {
+	typed
+		.value
+		.clone()
+		.into_string()
+		.ok_or_else(|| unsupported("typed string literal body must be a string literal"))
 }
 
 fn take_sql_word(input: &str) -> Option<(&str, &str)> {
@@ -976,6 +990,12 @@ fn lower_insert_source(
 
 fn lower_insert_literal(expr: &SqlExpr) -> Result<InsertLiteral, FrontendError> {
 	match expr {
+		SqlExpr::TypedString(typed) if is_date_sql_type(&typed.data_type) => {
+			let value = typed_string_value(typed)?;
+			parse_date_ymd(&value)
+				.map(InsertLiteral::Date32)
+				.map_err(|error| unsupported(error.to_string()))
+		}
 		SqlExpr::Value(value) => match &value.value {
 			Value::Null => Ok(InsertLiteral::Null),
 			Value::Boolean(value) => Ok(InsertLiteral::Boolean(*value)),
@@ -1186,6 +1206,9 @@ fn lower_create_table_data_type(
 		| SqlDataType::DoublePrecision
 		| SqlDataType::Float8
 		| SqlDataType::Float64 => Ok(CreateTableColumnType::Physical(DataType::Float64)),
+		SqlDataType::Date | SqlDataType::Date32 => {
+			Ok(CreateTableColumnType::Physical(DataType::Date32))
+		}
 		SqlDataType::Text
 		| SqlDataType::String(_)
 		| SqlDataType::Varchar(_)
@@ -3904,6 +3927,12 @@ impl SqlPlanner {
 				Value::Null => Ok(Expr::UntypedNull),
 				_ => Err(unsupported(format!("unsupported value: {val:?}"))),
 			},
+			SqlExpr::TypedString(typed) if is_date_sql_type(&typed.data_type) => {
+				let value = typed_string_value(typed)?;
+				parse_date_ymd(&value)
+					.map(|value| Expr::Literal(ScalarValue::Date32(Some(value))))
+					.map_err(|error| unsupported(error.to_string()))
+			}
 			SqlExpr::BinaryOp { left, op, right } => {
 				let l = Box::new(self.lower_expr(left)?);
 				let r = Box::new(self.lower_expr(right)?);
@@ -5113,16 +5142,20 @@ fn hash_scalar_structural(value: &ScalarValue, state: &mut impl Hasher) {
 			2u8.hash(state);
 			value.hash(state);
 		}
-		ScalarValue::Float32(value) => {
+		ScalarValue::Date32(value) => {
 			3u8.hash(state);
+			value.hash(state);
+		}
+		ScalarValue::Float32(value) => {
+			4u8.hash(state);
 			value.map(f32::to_bits).hash(state);
 		}
 		ScalarValue::Float64(value) => {
-			4u8.hash(state);
+			5u8.hash(state);
 			value.map(f64::to_bits).hash(state);
 		}
 		ScalarValue::Utf8(value) => {
-			5u8.hash(state);
+			6u8.hash(state);
 			value.hash(state);
 		}
 	}
@@ -5133,6 +5166,7 @@ fn scalar_structural_eq(left: &ScalarValue, right: &ScalarValue) -> bool {
 		(ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left == right,
 		(ScalarValue::Int32(left), ScalarValue::Int32(right)) => left == right,
 		(ScalarValue::Int64(left), ScalarValue::Int64(right)) => left == right,
+		(ScalarValue::Date32(left), ScalarValue::Date32(right)) => left == right,
 		(ScalarValue::Float32(left), ScalarValue::Float32(right)) => {
 			left.map(f32::to_bits) == right.map(f32::to_bits)
 		}
@@ -5148,8 +5182,9 @@ fn hash_data_type_structural(data_type: &DataType, state: &mut impl Hasher) {
 	match data_type {
 		DataType::Int32 => 0u8.hash(state),
 		DataType::Int64 => 1u8.hash(state),
-		DataType::Float32 => 2u8.hash(state),
-		DataType::Float64 => 3u8.hash(state),
+		DataType::Date32 => 2u8.hash(state),
+		DataType::Float32 => 3u8.hash(state),
+		DataType::Float64 => 4u8.hash(state),
 		other => {
 			255u8.hash(state);
 			format!("{other:?}").hash(state);

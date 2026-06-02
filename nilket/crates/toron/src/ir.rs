@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::catalog::TableRef;
 pub use crate::distributed::identity::{QueryId, StageId};
@@ -452,6 +453,7 @@ pub enum ScalarValue {
 	Boolean(Option<bool>),
 	Int32(Option<i32>),
 	Int64(Option<i64>),
+	Date32(Option<i32>),
 	Float32(Option<f32>),
 	Float64(Option<f64>),
 	Utf8(Option<String>),
@@ -463,9 +465,31 @@ impl ScalarValue {
 			Self::Boolean(_) => DataType::Boolean,
 			Self::Int32(_) => DataType::Int32,
 			Self::Int64(_) => DataType::Int64,
+			Self::Date32(_) => DataType::Date32,
 			Self::Float32(_) => DataType::Float32,
 			Self::Float64(_) => DataType::Float64,
 			Self::Utf8(_) => DataType::Utf8,
+		}
+	}
+}
+
+impl fmt::Display for ScalarValue {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Boolean(Some(value)) => write!(f, "{value}"),
+			Self::Boolean(None) => f.write_str("NULL"),
+			Self::Int32(Some(value)) => write!(f, "{value}"),
+			Self::Int32(None) => f.write_str("NULL"),
+			Self::Int64(Some(value)) => write!(f, "{value}"),
+			Self::Int64(None) => f.write_str("NULL"),
+			Self::Date32(Some(value)) => f.write_str(&crate::date32::format_date_ymd(*value)),
+			Self::Date32(None) => f.write_str("NULL"),
+			Self::Float32(Some(value)) => write!(f, "{value}"),
+			Self::Float32(None) => f.write_str("NULL"),
+			Self::Float64(Some(value)) => write!(f, "{value}"),
+			Self::Float64(None) => f.write_str("NULL"),
+			Self::Utf8(Some(value)) => f.write_str(value),
+			Self::Utf8(None) => f.write_str("NULL"),
 		}
 	}
 }
@@ -646,6 +670,7 @@ pub enum InsertLiteral {
 	Boolean(bool),
 	Int64(i64),
 	UInt64(u64),
+	Date32(i32),
 	Float64(f64),
 	Utf8(String),
 }

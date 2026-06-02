@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-	Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float32Builder, Float64Array,
-	Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Builder, Float32Array, Float32Builder,
+	Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray,
+	StringBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -462,6 +463,7 @@ fn is_supported_insert_select_target(data_type: &DataType) -> bool {
 		DataType::Boolean
 			| DataType::Int32
 			| DataType::Int64
+			| DataType::Date32
 			| DataType::Float32
 			| DataType::Float64
 			| DataType::Utf8
@@ -510,6 +512,17 @@ fn build_array(
 					ScalarValue::Int64(Some(value)) => builder.append_value(*value),
 					ScalarValue::Int64(None) => builder.append_null(),
 					other => return Err(type_mismatch(field_index, "Int64", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Date32 => {
+			let mut builder = Date32Builder::with_capacity(rows.len());
+			for row in rows {
+				match scalar_at(row, field_index)? {
+					ScalarValue::Date32(Some(value)) => builder.append_value(*value),
+					ScalarValue::Date32(None) => builder.append_null(),
+					other => return Err(type_mismatch(field_index, "Date32", other)),
 				}
 			}
 			Ok(Arc::new(builder.finish()))

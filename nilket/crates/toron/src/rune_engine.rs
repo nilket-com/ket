@@ -1,4 +1,5 @@
 use crate::catalog::TableRef;
+use crate::date32::parse_date_ymd;
 use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
@@ -545,6 +546,15 @@ pub fn lit_i64(value: i64) -> RuneExpr {
 	}
 }
 
+pub fn lit_date(value: String) -> VmResult<RuneExpr> {
+	match parse_date_ymd(&value) {
+		Ok(value) => VmResult::Ok(RuneExpr {
+			expr: Expr::Literal(ScalarValue::Date32(Some(value))),
+		}),
+		Err(error) => VmResult::panic(error.to_string()),
+	}
+}
+
 pub fn asc(expr: RuneExpr) -> RuneSortKey {
 	expr.asc()
 }
@@ -905,6 +915,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lit_f64"], lit_f64).build()?;
 	m.function(["lit_bool"], lit_bool).build()?;
 	m.function(["lit_i64"], lit_i64).build()?;
+	m.function(["lit_date"], lit_date).build()?;
 	m.function(["asc"], asc).build()?;
 	m.function(["desc"], desc).build()?;
 	m.function(["when"], when).build()?;

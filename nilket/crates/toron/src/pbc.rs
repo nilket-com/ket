@@ -219,6 +219,11 @@ fn emit_literal(val: &ScalarValue, bytecode: &mut Vec<u8>) -> Result<(), Pushdow
 			bytecode.push(OP_PUSH_INT);
 			bytecode.extend_from_slice(&v.to_le_bytes());
 		}
+		ScalarValue::Date32(Some(_)) => {
+			return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+				"Date32 literals require type-preserving PBC support".to_string(),
+			));
+		}
 		ScalarValue::Float32(Some(v)) => {
 			bytecode.push(OP_PUSH_FLOAT);
 			bytecode.extend_from_slice(&(*v as f64).to_le_bytes());
