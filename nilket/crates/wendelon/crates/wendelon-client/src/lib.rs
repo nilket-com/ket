@@ -63,18 +63,21 @@ pub use wendelon::integration::compute::{
 };
 pub use wendelon::schema::{
 	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
-	ARROW_STATS_TAG_DATE64, ARROW_STATS_TAG_INT8, ARROW_STATS_TAG_INT16, ARROW_STATS_TAG_INT32,
-	ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_BINARY, ARROW_STATS_TAG_LARGE_UTF8,
-	ARROW_STATS_TAG_OPAQUE_UNSUPPORTED, ARROW_STATS_TAG_TIMESTAMP_MICROSECOND,
-	ARROW_STATS_TAG_TIMESTAMP_MILLISECOND, ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
-	ARROW_STATS_TAG_UINT8, ARROW_STATS_TAG_UINT16, ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64,
-	ARROW_STATS_TAG_UTF8, CdcCursor, CdcRejectCode, CdcSubscribeBound, ColumnNdvFact,
-	ColumnRangeFact, Consistency as ReadConsistency, DurabilityLevel as DurabilityClass,
-	IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint, NdvFact, PbcRejectCode,
-	PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy,
-	RuntimeFilterDescriptor, SchemaEvolutionPolicyV1, StateDigest, TableObjectId,
-	TableOptimizerFacts, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
-	decode_signed_optimizer_fact_scalar, encode_signed_optimizer_fact_scalar,
+	ARROW_STATS_TAG_DATE64, ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT8,
+	ARROW_STATS_TAG_INT16, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
+	ARROW_STATS_TAG_LARGE_BINARY, ARROW_STATS_TAG_LARGE_UTF8, ARROW_STATS_TAG_OPAQUE_UNSUPPORTED,
+	ARROW_STATS_TAG_TIMESTAMP_MICROSECOND, ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
+	ARROW_STATS_TAG_TIMESTAMP_NANOSECOND, ARROW_STATS_TAG_UINT8, ARROW_STATS_TAG_UINT16,
+	ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64, ARROW_STATS_TAG_UTF8, CdcCursor, CdcRejectCode,
+	CdcSubscribeBound, ColumnNdvFact, ColumnRangeFact, Consistency as ReadConsistency,
+	DurabilityLevel as DurabilityClass, IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint,
+	NdvFact, PbcRejectCode, PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1,
+	PrimaryKeyEncodingV1, RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicyV1,
+	StateDigest, TableObjectId, TableOptimizerFacts, TableSchemaDescriptor,
+	TableSpreadLocalityDescriptorV1, decode_float32_optimizer_fact_scalar,
+	decode_float64_optimizer_fact_scalar, decode_signed_optimizer_fact_scalar,
+	encode_float32_optimizer_fact_scalar, encode_float64_optimizer_fact_scalar,
+	encode_signed_optimizer_fact_scalar,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

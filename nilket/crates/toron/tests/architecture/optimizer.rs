@@ -1684,11 +1684,12 @@ pub(crate) fn adr142_wendelon_optimizer_facts_have_no_toron_dependency() {
 			.join("optimizer_facts.rs"),
 	)
 	.expect("read Wendelon optimizer facts");
+	let ndv_fact = source_block(&facts, "pub enum NdvFact");
 
 	assert!(!manifest.contains("toron"));
 	assert!(!facts.contains("toron"));
 	assert!(facts.contains("rel_err_ppm: u32"));
-	assert!(!facts.contains("f64"));
+	assert!(!ndv_fact.contains("f64"));
 }
 
 #[test]
@@ -1912,6 +1913,94 @@ pub(crate) fn adr144_range_producer_reuses_full_coverage_and_truncation_fence() 
 	assert!(range_fact.contains("non_null_count"));
 	assert!(manager.contains("range_fact_requires_full_contributor_coverage"));
 	assert!(manager.contains("range_truncated_min_max_omits_fact"));
+}
+
+#[test]
+pub(crate) fn adr147_float_range_facts_are_finite_and_estimate_channel_only() {
+	let binder = binder_source();
+	let schema_facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
+	let storage_stats =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/stats.rs"))
+			.expect("read Wendelon storage stats");
+	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
+		.expect("read Wendelon slab manager");
+	let client = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("crates")
+			.join("wendelon-client")
+			.join("src")
+			.join("lib.rs"),
+	)
+	.expect("read wendelon-client lib");
+	let arrow_tag = source_block(&storage_stats, "pub fn arrow_stats_type_tag");
+	let collect = source_block(&storage_stats, "fn collect_column_stats_in_one_pass");
+	let collect_f32 = source_block(&storage_stats, "fn collect_float32_column_stats");
+	let collect_f64 = source_block(&storage_stats, "fn collect_float64_column_stats");
+	let scalar = source_block(&binder, "fn range_scalar_for_fact");
+	let real_estimate = source_block(&binder, "fn estimated_rows_for_real_range");
+
+	assert!(schema_facts.contains("pub const ARROW_STATS_TAG_FLOAT32"));
+	assert!(schema_facts.contains("pub const ARROW_STATS_TAG_FLOAT64"));
+	assert!(schema_facts.contains("pub fn encode_float32_optimizer_fact_scalar"));
+	assert!(schema_facts.contains("pub fn encode_float64_optimizer_fact_scalar"));
+	assert!(schema_facts.contains("pub fn decode_float32_optimizer_fact_scalar"));
+	assert!(schema_facts.contains("pub fn decode_float64_optimizer_fact_scalar"));
+	assert!(schema_facts.contains("float_canonical_encode_round_trips_and_orders"));
+	assert!(schema_facts.contains("range_fact_tag_supported"));
+	assert!(client.contains("ARROW_STATS_TAG_FLOAT64"));
+	assert!(client.contains("encode_float64_optimizer_fact_scalar"));
+	assert!(client.contains("decode_float64_optimizer_fact_scalar"));
+	assert!(arrow_tag.contains("DataType::Float32"));
+	assert!(arrow_tag.contains("DataType::Float64"));
+	assert!(collect.contains("collect_float32_column_stats"));
+	assert!(collect.contains("collect_float64_column_stats"));
+	assert!(collect_f32.contains("partial_cmp"));
+	assert!(collect_f64.contains("partial_cmp"));
+	assert!(storage_stats.contains("counts_only_column_stats"));
+	assert!(storage_stats.contains("float_stats_normalizes_negative_zero"));
+	assert!(storage_stats.contains("table_optimizer_facts_emits_float_range_for_finite_values"));
+	assert!(
+		storage_stats.contains("table_optimizer_facts_suppresses_float_range_with_nan_or_infinity")
+	);
+	assert!(manager.contains("table_optimizer_facts_emits_float_range_for_finite_values"));
+	assert!(manager.contains("table_optimizer_facts_suppresses_float_range_with_nan_or_infinity"));
+	assert!(binder.contains("enum RangeScalar"));
+	assert!(binder.contains("RangeScalar::Integral"));
+	assert!(binder.contains("RangeScalar::Real"));
+	assert!(binder.contains("struct FloatBound"));
+	assert!(binder.contains("RangeInterval::Real"));
+	assert!(scalar.contains("ScalarValue::Int32"));
+	assert!(scalar.contains("ScalarValue::Int64"));
+	assert!(scalar.contains("ScalarValue::Float32"));
+	assert!(scalar.contains("ScalarValue::Float64"));
+	assert!(scalar.contains("exact_i64_to_f64"));
+	assert!(real_estimate.contains("real_interval_contains_value"));
+	assert!(real_estimate.contains("clip_real_lower"));
+	assert!(real_estimate.contains("clip_real_upper"));
+	assert!(!real_estimate.contains("row_upper_bound"));
+	assert!(!real_estimate.contains("byte_upper_bound"));
+	assert!(!real_estimate.contains("EmptyRelation"));
+	assert!(!real_estimate.contains("Kll"));
+	assert!(!real_estimate.contains("Quantile"));
+	assert!(
+		binder.contains(
+			"float_range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate"
+		)
+	);
+	assert!(
+		binder.contains("float_range_endpoint_inclusive_ge_max_estimates_one_row_but_gt_max_zero")
+	);
+	assert!(binder.contains("float_range_does_not_write_hard_bounds_or_empty_relation"));
+	assert!(binder.contains("int_literal_against_float_fact_consumed_as_f64"));
+	assert!(binder.contains("integer_range_facts_keep_discrete_interpolation"));
+	assert!(binder.contains("utf8_range_facts_still_fail_open"));
+	assert!(binder.contains("opaque_float_range_facts_still_fail_open"));
 }
 
 #[test]

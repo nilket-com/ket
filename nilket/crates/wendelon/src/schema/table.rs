@@ -2755,10 +2755,11 @@ fn estimated_canonical_stats_value_bytes(data_type: &DataType) -> Option<u64> {
 	match data_type {
 		DataType::Int8 | DataType::UInt8 | DataType::Boolean => Some(1),
 		DataType::Int16 | DataType::UInt16 => Some(2),
-		DataType::Int32 | DataType::UInt32 | DataType::Date32 => Some(4),
+		DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => Some(4),
 		DataType::Int64 | DataType::UInt64 | DataType::Timestamp(_, _) | DataType::Date64 => {
 			Some(8)
 		}
+		DataType::Float64 => Some(8),
 		DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
 			Some(COLUMN_STATS_DEFAULT_STRING_PREFIX_BYTES)
 		}

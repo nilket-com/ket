@@ -15,7 +15,7 @@ Environment overrides:
   CARGO_CGROUP_CONTAINER_CPUS=1.5
   CARGO_CGROUP_MEMORY_HIGH=8G
   CARGO_CGROUP_MEMORY_MAX=12G
-  CARGO_CGROUP_TASKS_MAX=256
+  CARGO_CGROUP_TASKS_MAX=512
   CARGO_CGROUP_IO_WEIGHT=10
   CARGO_CGROUP_NICE=19
   CARGO_CGROUP_JOBS=1
@@ -48,7 +48,7 @@ cpu_quota="${CARGO_CGROUP_CPU_QUOTA:-150%}"
 container_cpus="${CARGO_CGROUP_CONTAINER_CPUS:-1.5}"
 memory_high="${CARGO_CGROUP_MEMORY_HIGH:-8G}"
 memory_max="${CARGO_CGROUP_MEMORY_MAX:-12G}"
-tasks_max="${CARGO_CGROUP_TASKS_MAX:-256}"
+tasks_max="${CARGO_CGROUP_TASKS_MAX:-512}"
 io_weight="${CARGO_CGROUP_IO_WEIGHT:-10}"
 nice_level="${CARGO_CGROUP_NICE:-19}"
 jobs="${CARGO_CGROUP_JOBS:-1}"
@@ -77,7 +77,7 @@ nerdctl_available() {
 }
 
 run_systemd() {
-	exec systemd-run --user --scope --same-dir --wait --collect --quiet \
+	exec systemd-run --user --same-dir --wait --collect --quiet --pipe \
 		--nice="${nice_level}" \
 		--property="CPUQuota=${cpu_quota}" \
 		--property="MemoryHigh=${memory_high}" \

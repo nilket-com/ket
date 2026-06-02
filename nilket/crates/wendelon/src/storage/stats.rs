@@ -5,20 +5,21 @@ use crate::schema::table::{
 };
 pub use crate::schema::{
 	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
-	ARROW_STATS_TAG_DATE64, ARROW_STATS_TAG_INT8, ARROW_STATS_TAG_INT16, ARROW_STATS_TAG_INT32,
-	ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_BINARY, ARROW_STATS_TAG_LARGE_UTF8,
-	ARROW_STATS_TAG_OPAQUE_UNSUPPORTED, ARROW_STATS_TAG_TIMESTAMP_MICROSECOND,
-	ARROW_STATS_TAG_TIMESTAMP_MILLISECOND, ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
-	ARROW_STATS_TAG_UINT8, ARROW_STATS_TAG_UINT16, ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64,
-	ARROW_STATS_TAG_UTF8,
+	ARROW_STATS_TAG_DATE64, ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT8,
+	ARROW_STATS_TAG_INT16, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
+	ARROW_STATS_TAG_LARGE_BINARY, ARROW_STATS_TAG_LARGE_UTF8, ARROW_STATS_TAG_OPAQUE_UNSUPPORTED,
+	ARROW_STATS_TAG_TIMESTAMP_MICROSECOND, ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
+	ARROW_STATS_TAG_TIMESTAMP_NANOSECOND, ARROW_STATS_TAG_UINT8, ARROW_STATS_TAG_UINT16,
+	ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64, ARROW_STATS_TAG_UTF8,
 };
 use crate::schema::{
-	LogicalSchemaFingerprint, encode_signed_optimizer_fact_scalar,
+	LogicalSchemaFingerprint, encode_float32_optimizer_fact_scalar,
+	encode_float64_optimizer_fact_scalar, encode_signed_optimizer_fact_scalar,
 	encode_unsigned_optimizer_fact_scalar,
 };
 use arrow::array::{
-	Array, BinaryArray, BooleanArray, LargeBinaryArray, LargeStringArray, PrimitiveArray,
-	StringArray,
+	Array, BinaryArray, BooleanArray, Float32Array, Float64Array, LargeBinaryArray,
+	LargeStringArray, PrimitiveArray, StringArray,
 };
 use arrow::datatypes::{
 	ArrowPrimitiveType, DataType, Date32Type, Date64Type, Field, Int8Type, Int16Type, Int32Type,
@@ -26,6 +27,7 @@ use arrow::datatypes::{
 	TimestampNanosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::record_batch::RecordBatch;
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::io::{Error, ErrorKind};
 use std::time::Instant;
@@ -389,6 +391,8 @@ pub fn arrow_stats_type_tag(data_type: &DataType) -> Option<u8> {
 		DataType::UInt16 => Some(ARROW_STATS_TAG_UINT16),
 		DataType::UInt32 => Some(ARROW_STATS_TAG_UINT32),
 		DataType::UInt64 => Some(ARROW_STATS_TAG_UINT64),
+		DataType::Float32 => Some(ARROW_STATS_TAG_FLOAT32),
+		DataType::Float64 => Some(ARROW_STATS_TAG_FLOAT64),
 		DataType::Utf8 => Some(ARROW_STATS_TAG_UTF8),
 		DataType::LargeUtf8 => Some(ARROW_STATS_TAG_LARGE_UTF8),
 		DataType::Binary => Some(ARROW_STATS_TAG_BINARY),
@@ -418,6 +422,8 @@ pub fn is_valid_v1_arrow_stats_tag(tag: u8) -> bool {
 			| ARROW_STATS_TAG_UINT16
 			| ARROW_STATS_TAG_UINT32
 			| ARROW_STATS_TAG_UINT64
+			| ARROW_STATS_TAG_FLOAT32
+			| ARROW_STATS_TAG_FLOAT64
 			| ARROW_STATS_TAG_OPAQUE_UNSUPPORTED
 			| ARROW_STATS_TAG_UTF8
 			| ARROW_STATS_TAG_LARGE_UTF8
@@ -456,6 +462,14 @@ pub fn encode_signed_stat_value(value: i64, byte_width: usize) -> std::io::Resul
 
 pub fn encode_unsigned_stat_value(value: u64, byte_width: usize) -> std::io::Result<Vec<u8>> {
 	encode_unsigned_optimizer_fact_scalar(value, byte_width)
+}
+
+pub fn encode_float32_stat_value(value: f32) -> std::io::Result<Vec<u8>> {
+	encode_float32_optimizer_fact_scalar(value)
+}
+
+pub fn encode_float64_stat_value(value: f64) -> std::io::Result<Vec<u8>> {
+	encode_float64_optimizer_fact_scalar(value)
 }
 
 pub fn encode_bool_stat_value(value: bool) -> [u8; 1] {
@@ -1171,6 +1185,29 @@ fn collect_column_stats_in_one_pass(
 		array.len().saturating_sub(array.null_count()),
 		"non_null_count",
 	)?;
+	match data_type {
+		DataType::Float32 => {
+			return collect_float32_column_stats(
+				array,
+				null_count,
+				non_null_count,
+				bloom_spec,
+				hll_spec,
+				small_set_spec,
+			);
+		}
+		DataType::Float64 => {
+			return collect_float64_column_stats(
+				array,
+				null_count,
+				non_null_count,
+				bloom_spec,
+				hll_spec,
+				small_set_spec,
+			);
+		}
+		_ => {}
+	}
 	let mut min = None::<Vec<u8>>;
 	let mut max = None::<Vec<u8>>;
 	let mut bloom = bloom_spec
@@ -1231,6 +1268,226 @@ fn collect_column_stats_in_one_pass(
 		})
 		.transpose()?;
 
+	Ok(CollectedColumnStats {
+		min,
+		max,
+		min_truncated,
+		max_truncated,
+		null_count,
+		non_null_count,
+		bloom,
+		hll,
+		small_set,
+	})
+}
+
+fn collect_float32_column_stats(
+	array: &dyn Array,
+	null_count: u64,
+	non_null_count: u64,
+	bloom_spec: Option<&ColumnBloomSpecV1>,
+	hll_spec: Option<&ColumnHllSpecV1>,
+	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+) -> std::io::Result<CollectedColumnStats> {
+	let typed = downcast_array::<Float32Array>(array)?;
+	let mut min = None::<f32>;
+	let mut max = None::<f32>;
+	let mut bloom = bloom_spec
+		.map(|spec| new_bloom_filter_for_row_count(array.len(), spec.bits_per_row.get()))
+		.transpose()?;
+	let mut hll = hll_spec
+		.map(|spec| new_hll_distinct(spec.precision.get()))
+		.transpose()?;
+	let mut small_set = small_set_spec.map(SmallSetCollector::new);
+	let mut saw_non_finite = false;
+
+	for row in 0..typed.len() {
+		if !typed.is_valid(row) {
+			continue;
+		}
+		let value = typed.value(row);
+		if !value.is_finite() {
+			saw_non_finite = true;
+			continue;
+		}
+		let value = if value == 0.0 { 0.0 } else { value };
+		min = Some(match min {
+			Some(current)
+				if current
+					.partial_cmp(&value)
+					.is_some_and(|ordering| ordering != Ordering::Greater) =>
+			{
+				current
+			}
+			_ => value,
+		});
+		max = Some(match max {
+			Some(current)
+				if current
+					.partial_cmp(&value)
+					.is_some_and(|ordering| ordering != Ordering::Less) =>
+			{
+				current
+			}
+			_ => value,
+		});
+		let encoded = encode_float32_stat_value(value)?;
+		insert_opt_in_encoded_value(&encoded, &mut bloom, &mut hll, &mut small_set)?;
+	}
+
+	if saw_non_finite {
+		return Ok(counts_only_column_stats(null_count, non_null_count));
+	}
+	let min = min.map(encode_float32_stat_value).transpose()?;
+	let max = max.map(encode_float32_stat_value).transpose()?;
+	finish_collected_column_stats(
+		min,
+		max,
+		false,
+		false,
+		null_count,
+		non_null_count,
+		bloom,
+		hll,
+		small_set,
+	)
+}
+
+fn collect_float64_column_stats(
+	array: &dyn Array,
+	null_count: u64,
+	non_null_count: u64,
+	bloom_spec: Option<&ColumnBloomSpecV1>,
+	hll_spec: Option<&ColumnHllSpecV1>,
+	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+) -> std::io::Result<CollectedColumnStats> {
+	let typed = downcast_array::<Float64Array>(array)?;
+	let mut min = None::<f64>;
+	let mut max = None::<f64>;
+	let mut bloom = bloom_spec
+		.map(|spec| new_bloom_filter_for_row_count(array.len(), spec.bits_per_row.get()))
+		.transpose()?;
+	let mut hll = hll_spec
+		.map(|spec| new_hll_distinct(spec.precision.get()))
+		.transpose()?;
+	let mut small_set = small_set_spec.map(SmallSetCollector::new);
+	let mut saw_non_finite = false;
+
+	for row in 0..typed.len() {
+		if !typed.is_valid(row) {
+			continue;
+		}
+		let value = typed.value(row);
+		if !value.is_finite() {
+			saw_non_finite = true;
+			continue;
+		}
+		let value = if value == 0.0 { 0.0 } else { value };
+		min = Some(match min {
+			Some(current)
+				if current
+					.partial_cmp(&value)
+					.is_some_and(|ordering| ordering != Ordering::Greater) =>
+			{
+				current
+			}
+			_ => value,
+		});
+		max = Some(match max {
+			Some(current)
+				if current
+					.partial_cmp(&value)
+					.is_some_and(|ordering| ordering != Ordering::Less) =>
+			{
+				current
+			}
+			_ => value,
+		});
+		let encoded = encode_float64_stat_value(value)?;
+		insert_opt_in_encoded_value(&encoded, &mut bloom, &mut hll, &mut small_set)?;
+	}
+
+	if saw_non_finite {
+		return Ok(counts_only_column_stats(null_count, non_null_count));
+	}
+	let min = min.map(encode_float64_stat_value).transpose()?;
+	let max = max.map(encode_float64_stat_value).transpose()?;
+	finish_collected_column_stats(
+		min,
+		max,
+		false,
+		false,
+		null_count,
+		non_null_count,
+		bloom,
+		hll,
+		small_set,
+	)
+}
+
+fn insert_opt_in_encoded_value(
+	value: &[u8],
+	bloom: &mut Option<ColumnStatsBloomPayload>,
+	hll: &mut Option<ColumnStatsHllPayload>,
+	small_set: &mut Option<SmallSetCollector>,
+) -> std::io::Result<()> {
+	if let Some(bloom) = bloom.as_mut()
+		&& bloom.bit_count != 0
+	{
+		bloom_insert_encoded_value(bloom, value);
+	}
+	if let Some(hll) = hll.as_mut() {
+		hll_insert_encoded_value(hll, value);
+	}
+	if let Some(small_set) = small_set.as_mut() {
+		small_set.insert(value.to_vec())?;
+	}
+	Ok(())
+}
+
+fn counts_only_column_stats(null_count: u64, non_null_count: u64) -> CollectedColumnStats {
+	CollectedColumnStats {
+		min: None,
+		max: None,
+		min_truncated: false,
+		max_truncated: false,
+		null_count,
+		non_null_count,
+		bloom: None,
+		hll: None,
+		small_set: None,
+	}
+}
+
+fn finish_collected_column_stats(
+	min: Option<Vec<u8>>,
+	max: Option<Vec<u8>>,
+	min_truncated: bool,
+	max_truncated: bool,
+	null_count: u64,
+	non_null_count: u64,
+	bloom: Option<ColumnStatsBloomPayload>,
+	hll: Option<ColumnStatsHllPayload>,
+	small_set: Option<SmallSetCollector>,
+) -> std::io::Result<CollectedColumnStats> {
+	let bloom = bloom.map(|bloom| {
+		let mut payload = Vec::new();
+		encode_bloom_filter(&mut payload, &bloom);
+		payload
+	});
+	let hll = hll.map(|hll| {
+		let mut payload = Vec::new();
+		encode_hll_distinct(&mut payload, &hll);
+		payload
+	});
+	let small_set = small_set
+		.and_then(SmallSetCollector::finish)
+		.map(|values| {
+			let mut payload = Vec::new();
+			encode_small_set(&mut payload, &values)?;
+			Ok::<_, std::io::Error>(payload)
+		})
+		.transpose()?;
 	Ok(CollectedColumnStats {
 		min,
 		max,
@@ -1855,7 +2112,7 @@ mod tests {
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		SmallSetByteCap, SmallSetValueCap,
 	};
-	use arrow::array::{Float64Array, Int64Array, LargeStringArray};
+	use arrow::array::{Float32Array, Float64Array, Int64Array, LargeStringArray};
 	use arrow::datatypes::{Field, Schema};
 	use std::sync::Arc;
 
@@ -2988,7 +3245,7 @@ mod tests {
 	}
 
 	#[test]
-	fn builder_emits_opaque_entry_for_unstattable_column_type() {
+	fn table_optimizer_facts_emits_float_range_for_finite_values() {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("score", DataType::Float64, true),
@@ -3007,24 +3264,93 @@ mod tests {
 		let parsed = parse_column_stats_block(&encoded).unwrap();
 		assert_eq!(parsed.columns.len(), 2);
 
-		let opaque = &parsed.columns[1];
-		assert_eq!(opaque.column_ordinal, 1);
-		assert_eq!(opaque.arrow_type_tag, ARROW_STATS_TAG_OPAQUE_UNSUPPORTED);
+		let score = &parsed.columns[1];
+		assert_eq!(score.column_ordinal, 1);
+		assert_eq!(score.arrow_type_tag, ARROW_STATS_TAG_FLOAT64);
 		assert_eq!(
-			opaque.stat_flags,
-			COLUMN_STAT_HAS_NULL_COUNT | COLUMN_STAT_HAS_NON_NULL_COUNT
+			score.stat_flags,
+			COLUMN_STAT_HAS_MIN
+				| COLUMN_STAT_HAS_MAX
+				| COLUMN_STAT_HAS_NULL_COUNT
+				| COLUMN_STAT_HAS_NON_NULL_COUNT
 		);
-		validate_column_stats_entry(opaque).unwrap();
-		let decoded = decode_column_stats_payload(opaque).unwrap();
-		assert_eq!(decoded.min, None);
-		assert_eq!(decoded.max, None);
+		validate_column_stats_entry(score).unwrap();
+		let decoded = decode_column_stats_payload(score).unwrap();
+		assert_eq!(decoded.min, Some(encode_float64_stat_value(1.5).unwrap()));
+		assert_eq!(decoded.max, Some(encode_float64_stat_value(2.5).unwrap()));
 		assert_eq!(decoded.null_count, Some(1));
 		assert_eq!(decoded.non_null_count, Some(2));
 		assert_eq!(decoded.small_set, None);
-		assert!(!column_stats_entry_matches_data_type(
-			opaque,
+		assert!(column_stats_entry_matches_data_type(
+			score,
 			&DataType::Float64
 		));
+	}
+
+	#[test]
+	fn table_optimizer_facts_suppresses_float_range_with_nan_or_infinity() {
+		for (tag, score_column) in [
+			(
+				"nan",
+				Arc::new(Float64Array::from(vec![
+					Some(1.5),
+					Some(f64::NAN),
+					Some(2.5),
+				])) as Arc<dyn Array>,
+			),
+			(
+				"inf",
+				Arc::new(Float64Array::from(vec![
+					Some(1.5),
+					Some(f64::INFINITY),
+					Some(2.5),
+				])) as Arc<dyn Array>,
+			),
+		] {
+			let schema = Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("score", DataType::Float64, true),
+			]);
+			let descriptor = stats_descriptor(&schema);
+			let batch = RecordBatch::try_new(
+				Arc::new(schema),
+				vec![
+					Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as Arc<dyn Array>,
+					score_column,
+				],
+			)
+			.unwrap();
+
+			let encoded = build_always_on_column_stats_block(&descriptor, &batch).unwrap();
+			let parsed = parse_column_stats_block(&encoded).unwrap();
+			let score = &parsed.columns[1];
+			assert_eq!(score.arrow_type_tag, ARROW_STATS_TAG_FLOAT64, "{tag}");
+			assert_eq!(
+				score.stat_flags,
+				COLUMN_STAT_HAS_NULL_COUNT | COLUMN_STAT_HAS_NON_NULL_COUNT,
+				"{tag}"
+			);
+			let decoded = decode_column_stats_payload(score).unwrap();
+			assert_eq!(decoded.min, None, "{tag}");
+			assert_eq!(decoded.max, None, "{tag}");
+			assert_eq!(decoded.null_count, Some(0), "{tag}");
+			assert_eq!(decoded.non_null_count, Some(3), "{tag}");
+			assert_eq!(decoded.bloom_filter, None, "{tag}");
+			assert_eq!(decoded.hll_distinct, None, "{tag}");
+			assert_eq!(decoded.small_set, None, "{tag}");
+		}
+	}
+
+	#[test]
+	fn float_stats_normalizes_negative_zero() {
+		let values = Float32Array::from(vec![Some(-0.0_f32), Some(0.0), Some(1.0)]);
+		let (min, max, min_truncated, max_truncated) =
+			min_max_for_array(&DataType::Float32, &values, 64).unwrap();
+
+		assert_eq!(min, Some(encode_float32_stat_value(0.0).unwrap()));
+		assert_eq!(max, Some(encode_float32_stat_value(1.0).unwrap()));
+		assert!(!min_truncated);
+		assert!(!max_truncated);
 	}
 
 	#[test]

@@ -15138,16 +15138,16 @@ mod tests {
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
 	use crate::storage::multirow::pack_record_batch_by_bucket;
 	use crate::storage::stats::{
-		ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_UTF8, COLUMN_STAT_HAS_HLL,
-		COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_HAS_NON_NULL_COUNT,
-		COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_SMALL_SET, COLUMN_STAT_MAX_TRUNCATED,
-		COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry, ColumnStatsBlockHeader,
-		decode_column_stats_payload, encode_length_prefixed_bytes, encode_signed_stat_value,
-		parse_column_stats_block,
+		ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_UTF8,
+		COLUMN_STAT_HAS_HLL, COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN,
+		COLUMN_STAT_HAS_NON_NULL_COUNT, COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_SMALL_SET,
+		COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry,
+		ColumnStatsBlockHeader, decode_column_stats_payload, encode_float64_stat_value,
+		encode_length_prefixed_bytes, encode_signed_stat_value, parse_column_stats_block,
 	};
 	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
-		Array, BooleanArray, FixedSizeBinaryBuilder, Int64Array, LargeBinaryBuilder,
+		Array, BooleanArray, FixedSizeBinaryBuilder, Float64Array, Int64Array, LargeBinaryBuilder,
 		LargeStringArray, StringArray, UInt8Array, UInt64Array, UInt64Builder,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
@@ -15631,6 +15631,78 @@ mod tests {
 		assert_eq!(amount.non_null_count, 4);
 		assert_eq!(amount.min, Some(encode_signed_stat_value(-5, 8).unwrap()));
 		assert_eq!(amount.max, Some(encode_signed_stat_value(40, 8).unwrap()));
+	}
+
+	#[tokio::test]
+	async fn table_optimizer_facts_emits_float_range_for_finite_values() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-float-range").await;
+		let descriptor = optimizer_fact_score_descriptor();
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_score_batch(&[(1, Some(0.25)), (2, Some(0.75))]),
+			"optimizer-facts-float-range-a",
+			10,
+		)
+		.await;
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_score_batch(&[(3, Some(-0.5)), (4, None), (5, Some(1.0))]),
+			"optimizer-facts-float-range-b",
+			20,
+		)
+		.await;
+
+		let facts = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered float range facts");
+
+		let score = facts
+			.column_range
+			.iter()
+			.find(|fact| fact.column_ordinal == 1)
+			.expect("score range fact");
+		assert_eq!(facts.row_upper_bound, Some(5));
+		assert_eq!(score.arrow_type_tag, ARROW_STATS_TAG_FLOAT64);
+		assert_eq!(score.null_count, 1);
+		assert_eq!(score.non_null_count, 4);
+		assert_eq!(score.min, Some(encode_float64_stat_value(-0.5).unwrap()));
+		assert_eq!(score.max, Some(encode_float64_stat_value(1.0).unwrap()));
+	}
+
+	#[tokio::test]
+	async fn table_optimizer_facts_suppresses_float_range_with_nan_or_infinity() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-float-nonfinite").await;
+		let descriptor = optimizer_fact_score_descriptor();
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_score_batch(&[(1, Some(0.25)), (2, Some(f64::NAN))]),
+			"optimizer-facts-float-nonfinite-a",
+			10,
+		)
+		.await;
+
+		let facts = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered float range facts");
+
+		assert!(
+			facts
+				.column_range
+				.iter()
+				.all(|fact| fact.column_ordinal != 1),
+			"non-finite score column must not produce a range fact"
+		);
+		assert_eq!(facts.row_upper_bound, Some(2));
 	}
 
 	#[tokio::test]
@@ -16439,6 +16511,27 @@ mod tests {
 		descriptor
 	}
 
+	fn optimizer_fact_score_descriptor() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("score", DataType::Float64, true),
+		]);
+		let mut descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([0xA5; 16]),
+			3,
+			"analytics",
+			"scores",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		descriptor.validate().unwrap();
+		descriptor
+	}
+
 	fn optimizer_fact_candidate_less_descriptor() -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![Field::new("status", DataType::LargeUtf8, false)]);
 		let descriptor = TableSchemaDescriptor::new(
@@ -16490,6 +16583,26 @@ mod tests {
 					rows.iter()
 						.map(|(_, amount)| *amount)
 						.collect::<Vec<Option<i64>>>(),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap()
+	}
+
+	fn optimizer_fact_score_batch(rows: &[(i64, Option<f64>)]) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("score", DataType::Float64, true),
+			])),
+			vec![
+				Arc::new(Int64Array::from(
+					rows.iter().map(|(id, _)| Some(*id)).collect::<Vec<_>>(),
+				)) as Arc<dyn Array>,
+				Arc::new(Float64Array::from(
+					rows.iter()
+						.map(|(_, score)| *score)
+						.collect::<Vec<Option<f64>>>(),
 				)) as Arc<dyn Array>,
 			],
 		)

@@ -10,6 +10,8 @@ pub const ARROW_STATS_TAG_UINT8: u8 = 0x05;
 pub const ARROW_STATS_TAG_UINT16: u8 = 0x06;
 pub const ARROW_STATS_TAG_UINT32: u8 = 0x07;
 pub const ARROW_STATS_TAG_UINT64: u8 = 0x08;
+pub const ARROW_STATS_TAG_FLOAT32: u8 = 0x09;
+pub const ARROW_STATS_TAG_FLOAT64: u8 = 0x0A;
 pub const ARROW_STATS_TAG_OPAQUE_UNSUPPORTED: u8 = 0x0E;
 pub const ARROW_STATS_TAG_UTF8: u8 = 0x10;
 pub const ARROW_STATS_TAG_LARGE_UTF8: u8 = 0x11;
@@ -119,6 +121,8 @@ pub fn range_fact_tag_supported(tag: u8) -> bool {
 			| ARROW_STATS_TAG_UINT16
 			| ARROW_STATS_TAG_UINT32
 			| ARROW_STATS_TAG_UINT64
+			| ARROW_STATS_TAG_FLOAT32
+			| ARROW_STATS_TAG_FLOAT64
 			| ARROW_STATS_TAG_TIMESTAMP_MILLISECOND
 			| ARROW_STATS_TAG_TIMESTAMP_MICROSECOND
 			| ARROW_STATS_TAG_TIMESTAMP_NANOSECOND
@@ -176,6 +180,72 @@ pub fn decode_signed_optimizer_fact_scalar(bytes: &[u8]) -> Option<i64> {
 		raw
 	};
 	Some(sign_extended as i64)
+}
+
+pub fn encode_float32_optimizer_fact_scalar(value: f32) -> std::io::Result<Vec<u8>> {
+	if !value.is_finite() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"float32 optimizer fact scalar must be finite",
+		));
+	}
+	let value = if value == 0.0 { 0.0 } else { value };
+	let raw = value.to_bits();
+	let sign_bit = 1_u32 << 31;
+	let ordered = if raw & sign_bit == 0 {
+		raw ^ sign_bit
+	} else {
+		!raw
+	};
+	Ok(ordered.to_be_bytes().to_vec())
+}
+
+pub fn decode_float32_optimizer_fact_scalar(bytes: &[u8]) -> Option<f32> {
+	let raw_ordered = u32::from_be_bytes(bytes.try_into().ok()?);
+	let sign_bit = 1_u32 << 31;
+	let raw = if raw_ordered & sign_bit != 0 {
+		raw_ordered ^ sign_bit
+	} else {
+		!raw_ordered
+	};
+	let value = f32::from_bits(raw);
+	if !value.is_finite() {
+		return None;
+	}
+	Some(if value == 0.0 { 0.0 } else { value })
+}
+
+pub fn encode_float64_optimizer_fact_scalar(value: f64) -> std::io::Result<Vec<u8>> {
+	if !value.is_finite() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"float64 optimizer fact scalar must be finite",
+		));
+	}
+	let value = if value == 0.0 { 0.0 } else { value };
+	let raw = value.to_bits();
+	let sign_bit = 1_u64 << 63;
+	let ordered = if raw & sign_bit == 0 {
+		raw ^ sign_bit
+	} else {
+		!raw
+	};
+	Ok(ordered.to_be_bytes().to_vec())
+}
+
+pub fn decode_float64_optimizer_fact_scalar(bytes: &[u8]) -> Option<f64> {
+	let raw_ordered = u64::from_be_bytes(bytes.try_into().ok()?);
+	let sign_bit = 1_u64 << 63;
+	let raw = if raw_ordered & sign_bit != 0 {
+		raw_ordered ^ sign_bit
+	} else {
+		!raw_ordered
+	};
+	let value = f64::from_bits(raw);
+	if !value.is_finite() {
+		return None;
+	}
+	Some(if value == 0.0 { 0.0 } else { value })
 }
 
 pub fn encode_unsigned_optimizer_fact_scalar(
@@ -258,6 +328,39 @@ mod tests {
 			let encoded = encode_signed_optimizer_fact_scalar(value, width).unwrap();
 			assert_eq!(decode_signed_optimizer_fact_scalar(&encoded), Some(value));
 		}
+	}
+
+	#[test]
+	fn float_canonical_encode_round_trips_and_orders() {
+		let values = [-10.5_f64, -1.0, -0.0, 0.0, 0.25, 7.5];
+		let encoded = values
+			.into_iter()
+			.map(|value| encode_float64_optimizer_fact_scalar(value).unwrap())
+			.collect::<Vec<_>>();
+		assert!(encoded.windows(2).all(|pair| pair[0] <= pair[1]));
+		assert_eq!(encoded[2], encoded[3]);
+		assert_eq!(decode_float64_optimizer_fact_scalar(&encoded[2]), Some(0.0));
+		assert_eq!(
+			decode_float64_optimizer_fact_scalar(
+				&encode_float64_optimizer_fact_scalar(-10.5).unwrap()
+			),
+			Some(-10.5)
+		);
+
+		let values = [-3.25_f32, -0.0, 0.0, 4.5];
+		let encoded = values
+			.into_iter()
+			.map(|value| encode_float32_optimizer_fact_scalar(value).unwrap())
+			.collect::<Vec<_>>();
+		assert!(encoded.windows(2).all(|pair| pair[0] <= pair[1]));
+		assert_eq!(encoded[1], encoded[2]);
+		assert_eq!(decode_float32_optimizer_fact_scalar(&encoded[3]), Some(4.5));
+
+		assert!(encode_float64_optimizer_fact_scalar(f64::NAN).is_err());
+		assert!(encode_float64_optimizer_fact_scalar(f64::INFINITY).is_err());
+		assert_eq!(decode_float64_optimizer_fact_scalar(&[0_u8; 7]), None);
+		let ordered_nan = (f64::NAN.to_bits() ^ (1_u64 << 63)).to_be_bytes();
+		assert_eq!(decode_float64_optimizer_fact_scalar(&ordered_nan), None);
 	}
 
 	#[test]

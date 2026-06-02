@@ -36,9 +36,10 @@ use wendelon::schema::{
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
 };
 use wendelon_client::{
-	ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64, LogicalTypeRefinementComparisonOp,
-	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor,
-	decode_signed_optimizer_fact_scalar,
+	ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
+	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
+	TableSchemaDescriptor, decode_float32_optimizer_fact_scalar,
+	decode_float64_optimizer_fact_scalar, decode_signed_optimizer_fact_scalar,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -3894,7 +3895,7 @@ fn filter_range_selectivity_estimated_row_count(
 		};
 		intervals
 			.entry(atom.column)
-			.or_default()
+			.or_insert_with(|| RangeInterval::for_scalar(atom.literal_value))
 			.apply(atom.op, atom.literal_value);
 	}
 
@@ -3911,48 +3912,178 @@ fn filter_range_selectivity_estimated_row_count(
 struct RangeAtom {
 	column: ColumnOrdinal,
 	op: BoundBinaryOp,
-	literal_value: i64,
+	literal_value: RangeScalar,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct RangeInterval {
-	lower_inclusive: Option<i128>,
-	upper_inclusive: Option<i128>,
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RangeScalar {
+	Integral(i128),
+	Real(f64),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FloatBound {
+	value: f64,
+	inclusive: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RangeInterval {
+	Integral {
+		lower_inclusive: Option<i128>,
+		upper_inclusive: Option<i128>,
+	},
+	Real {
+		lower: Option<FloatBound>,
+		upper: Option<FloatBound>,
+	},
 }
 
 impl RangeInterval {
-	fn apply(&mut self, op: BoundBinaryOp, literal_value: i64) {
-		let value = i128::from(literal_value);
-		match op {
-			BoundBinaryOp::Gt => {
-				self.lower_inclusive = Some(
-					self.lower_inclusive
-						.map(|current| current.max(value + 1))
-						.unwrap_or(value + 1),
-				);
-			}
-			BoundBinaryOp::Gte => {
-				self.lower_inclusive = Some(
-					self.lower_inclusive
-						.map(|current| current.max(value))
-						.unwrap_or(value),
-				);
-			}
-			BoundBinaryOp::Lt => {
-				self.upper_inclusive = Some(
-					self.upper_inclusive
-						.map(|current| current.min(value - 1))
-						.unwrap_or(value - 1),
-				);
-			}
-			BoundBinaryOp::Lte => {
-				self.upper_inclusive = Some(
-					self.upper_inclusive
-						.map(|current| current.min(value))
-						.unwrap_or(value),
-				);
+	fn for_scalar(value: RangeScalar) -> Self {
+		match value {
+			RangeScalar::Integral(_) => Self::Integral {
+				lower_inclusive: None,
+				upper_inclusive: None,
+			},
+			RangeScalar::Real(_) => Self::Real {
+				lower: None,
+				upper: None,
+			},
+		}
+	}
+
+	fn apply(&mut self, op: BoundBinaryOp, literal_value: RangeScalar) {
+		match (self, literal_value) {
+			(
+				RangeInterval::Integral {
+					lower_inclusive,
+					upper_inclusive,
+				},
+				RangeScalar::Integral(value),
+			) => apply_integral_range_bound(op, value, lower_inclusive, upper_inclusive),
+			(RangeInterval::Real { lower, upper }, RangeScalar::Real(value)) => {
+				apply_real_range_bound(op, value, lower, upper)
 			}
 			_ => {}
+		}
+	}
+}
+
+fn apply_integral_range_bound(
+	op: BoundBinaryOp,
+	value: i128,
+	lower_inclusive: &mut Option<i128>,
+	upper_inclusive: &mut Option<i128>,
+) {
+	match op {
+		BoundBinaryOp::Gt => {
+			*lower_inclusive = Some(
+				lower_inclusive
+					.map(|current| current.max(value + 1))
+					.unwrap_or(value + 1),
+			);
+		}
+		BoundBinaryOp::Gte => {
+			*lower_inclusive = Some(
+				lower_inclusive
+					.map(|current| current.max(value))
+					.unwrap_or(value),
+			);
+		}
+		BoundBinaryOp::Lt => {
+			*upper_inclusive = Some(
+				upper_inclusive
+					.map(|current| current.min(value - 1))
+					.unwrap_or(value - 1),
+			);
+		}
+		BoundBinaryOp::Lte => {
+			*upper_inclusive = Some(
+				upper_inclusive
+					.map(|current| current.min(value))
+					.unwrap_or(value),
+			);
+		}
+		_ => {}
+	}
+}
+
+fn apply_real_range_bound(
+	op: BoundBinaryOp,
+	value: f64,
+	lower: &mut Option<FloatBound>,
+	upper: &mut Option<FloatBound>,
+) {
+	match op {
+		BoundBinaryOp::Gt => {
+			*lower = Some(tightest_real_lower(
+				*lower,
+				FloatBound {
+					value,
+					inclusive: false,
+				},
+			));
+		}
+		BoundBinaryOp::Gte => {
+			*lower = Some(tightest_real_lower(
+				*lower,
+				FloatBound {
+					value,
+					inclusive: true,
+				},
+			));
+		}
+		BoundBinaryOp::Lt => {
+			*upper = Some(tightest_real_upper(
+				*upper,
+				FloatBound {
+					value,
+					inclusive: false,
+				},
+			));
+		}
+		BoundBinaryOp::Lte => {
+			*upper = Some(tightest_real_upper(
+				*upper,
+				FloatBound {
+					value,
+					inclusive: true,
+				},
+			));
+		}
+		_ => {}
+	}
+}
+
+fn tightest_real_lower(current: Option<FloatBound>, candidate: FloatBound) -> FloatBound {
+	let Some(current) = current else {
+		return candidate;
+	};
+	if candidate.value > current.value {
+		candidate
+	} else if candidate.value < current.value {
+		current
+	} else {
+		FloatBound {
+			value: current.value,
+			inclusive: current.inclusive && candidate.inclusive,
+		}
+	}
+}
+
+fn tightest_real_upper(current: Option<FloatBound>, candidate: FloatBound) -> FloatBound {
+	let Some(current) = current else {
+		return candidate;
+	};
+	if candidate.value < current.value {
+		candidate
+	} else if candidate.value > current.value {
+		current
+	} else {
+		FloatBound {
+			value: current.value,
+			inclusive: current.inclusive && candidate.inclusive,
 		}
 	}
 }
@@ -3990,7 +4121,7 @@ fn range_atom_sides(
 	};
 	let range = column_range_for_input(input, column.ordinal)?;
 	let value = program.literals.get(*literal as usize)?;
-	let literal_value = range_literal_value(range, value)?;
+	let literal_value = range_scalar_for_fact(range, value)?;
 	Some(RangeAtom {
 		column: column.ordinal,
 		op,
@@ -4008,12 +4139,37 @@ fn flip_range_op(op: BoundBinaryOp) -> BoundBinaryOp {
 	}
 }
 
-fn range_literal_value(range: &RangeFact, value: &ScalarValue) -> Option<i64> {
+fn range_scalar_for_fact(range: &RangeFact, value: &ScalarValue) -> Option<RangeScalar> {
 	match (range.arrow_type_tag, value) {
-		(ARROW_STATS_TAG_INT32, ScalarValue::Int32(Some(value))) => Some(i64::from(*value)),
-		(ARROW_STATS_TAG_INT64, ScalarValue::Int64(Some(value))) => Some(*value),
+		(ARROW_STATS_TAG_INT32, ScalarValue::Int32(Some(value))) => {
+			Some(RangeScalar::Integral(i128::from(*value)))
+		}
+		(ARROW_STATS_TAG_INT64, ScalarValue::Int64(Some(value))) => {
+			Some(RangeScalar::Integral(i128::from(*value)))
+		}
+		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Int32(Some(value))) => {
+			Some(RangeScalar::Real(f64::from(*value)))
+		}
+		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Int64(Some(value))) => {
+			exact_i64_to_f64(*value).map(RangeScalar::Real)
+		}
+		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Float32(Some(value))) => {
+			value
+				.is_finite()
+				.then_some(RangeScalar::Real(f64::from(*value)))
+		}
+		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Float64(Some(value))) => {
+			value.is_finite().then_some(RangeScalar::Real(*value))
+		}
 		_ => None,
 	}
+}
+
+fn exact_i64_to_f64(value: i64) -> Option<f64> {
+	const MAX_EXACT_F64_INTEGER: i64 = 9_007_199_254_740_992;
+	(-MAX_EXACT_F64_INTEGER..=MAX_EXACT_F64_INTEGER)
+		.contains(&value)
+		.then_some(value as f64)
 }
 
 fn column_range_for_input(
@@ -4033,21 +4189,42 @@ fn estimated_rows_for_range(range: &RangeFact, interval: RangeInterval) -> Optio
 	if range.non_null_count == 0 {
 		return Some(RowCount::new(0));
 	}
-	let min = decode_range_i64(range.arrow_type_tag, range.min.as_deref()?)?;
-	let max = decode_range_i64(range.arrow_type_tag, range.max.as_deref()?)?;
-	if max < min {
+	let min = decode_range_scalar(range.arrow_type_tag, range.min.as_deref()?)?;
+	let max = decode_range_scalar(range.arrow_type_tag, range.max.as_deref()?)?;
+	match (min, max, interval) {
+		(
+			RangeScalar::Integral(min),
+			RangeScalar::Integral(max),
+			RangeInterval::Integral {
+				lower_inclusive,
+				upper_inclusive,
+			},
+		) => estimated_rows_for_integral_range(
+			range.non_null_count,
+			min,
+			max,
+			lower_inclusive,
+			upper_inclusive,
+		),
+		(RangeScalar::Real(min), RangeScalar::Real(max), RangeInterval::Real { lower, upper }) => {
+			estimated_rows_for_real_range(range.non_null_count, min, max, lower, upper)
+		}
+		_ => None,
+	}
+}
+
+fn estimated_rows_for_integral_range(
+	non_null_count: u64,
+	envelope_low: i128,
+	envelope_high: i128,
+	lower_inclusive: Option<i128>,
+	upper_inclusive: Option<i128>,
+) -> Option<RowCount> {
+	if envelope_high < envelope_low {
 		return None;
 	}
-	let envelope_low = i128::from(min);
-	let envelope_high = i128::from(max);
-	let low = interval
-		.lower_inclusive
-		.unwrap_or(envelope_low)
-		.max(envelope_low);
-	let high = interval
-		.upper_inclusive
-		.unwrap_or(envelope_high)
-		.min(envelope_high);
+	let low = lower_inclusive.unwrap_or(envelope_low).max(envelope_low);
+	let high = upper_inclusive.unwrap_or(envelope_high).min(envelope_high);
 	if low > high {
 		return Some(RowCount::new(0));
 	}
@@ -4056,15 +4233,117 @@ fn estimated_rows_for_range(range: &RangeFact, interval: RangeInterval) -> Optio
 	if domain_width == 0 {
 		return None;
 	}
-	let numerator = u128::from(range.non_null_count).checked_mul(overlap_width)?;
+	let numerator = u128::from(non_null_count).checked_mul(overlap_width)?;
 	let estimate = numerator.div_ceil(domain_width);
 	Some(RowCount::new(u64::try_from(estimate).unwrap_or(u64::MAX)))
 }
 
-fn decode_range_i64(arrow_type_tag: u8, bytes: &[u8]) -> Option<i64> {
+fn estimated_rows_for_real_range(
+	non_null_count: u64,
+	envelope_low: f64,
+	envelope_high: f64,
+	lower: Option<FloatBound>,
+	upper: Option<FloatBound>,
+) -> Option<RowCount> {
+	if !envelope_low.is_finite() || !envelope_high.is_finite() || envelope_high < envelope_low {
+		return None;
+	}
+	if envelope_high == envelope_low {
+		return Some(
+			if real_interval_contains_value(lower, upper, envelope_low) {
+				RowCount::new(non_null_count)
+			} else {
+				RowCount::new(0)
+			},
+		);
+	}
+	if real_interval_is_empty(lower, upper) {
+		return Some(RowCount::new(0));
+	}
+	let low = clip_real_lower(lower, envelope_low);
+	let high = clip_real_upper(upper, envelope_high);
+	if low.value > high.value {
+		return Some(RowCount::new(0));
+	}
+	if low.value == high.value {
+		return Some(if low.inclusive && high.inclusive {
+			RowCount::new(1)
+		} else {
+			RowCount::new(0)
+		});
+	}
+	let width = envelope_high - envelope_low;
+	if width <= 0.0 {
+		return None;
+	}
+	let frac = ((high.value - low.value) / width).clamp(0.0, 1.0);
+	if frac == 0.0 {
+		return Some(RowCount::new(0));
+	}
+	let estimate = ((non_null_count as f64) * frac).ceil().max(1.0);
+	let estimate = if estimate > u64::MAX as f64 {
+		u64::MAX
+	} else {
+		estimate as u64
+	};
+	Some(RowCount::new(estimate))
+}
+
+fn real_interval_contains_value(
+	lower: Option<FloatBound>,
+	upper: Option<FloatBound>,
+	value: f64,
+) -> bool {
+	lower
+		.map(|bound| value > bound.value || (value == bound.value && bound.inclusive))
+		.unwrap_or(true)
+		&& upper
+			.map(|bound| value < bound.value || (value == bound.value && bound.inclusive))
+			.unwrap_or(true)
+}
+
+fn real_interval_is_empty(lower: Option<FloatBound>, upper: Option<FloatBound>) -> bool {
+	match (lower, upper) {
+		(Some(lower), Some(upper)) if lower.value > upper.value => true,
+		(Some(lower), Some(upper)) if lower.value == upper.value => {
+			!(lower.inclusive && upper.inclusive)
+		}
+		_ => false,
+	}
+}
+
+fn clip_real_lower(lower: Option<FloatBound>, envelope_low: f64) -> FloatBound {
+	match lower {
+		Some(bound) if bound.value > envelope_low => bound,
+		_ => FloatBound {
+			value: envelope_low,
+			inclusive: true,
+		},
+	}
+}
+
+fn clip_real_upper(upper: Option<FloatBound>, envelope_high: f64) -> FloatBound {
+	match upper {
+		Some(bound) if bound.value < envelope_high => bound,
+		_ => FloatBound {
+			value: envelope_high,
+			inclusive: true,
+		},
+	}
+}
+
+fn decode_range_scalar(arrow_type_tag: u8, bytes: &[u8]) -> Option<RangeScalar> {
 	match arrow_type_tag {
-		ARROW_STATS_TAG_INT32 if bytes.len() == 4 => decode_signed_optimizer_fact_scalar(bytes),
-		ARROW_STATS_TAG_INT64 if bytes.len() == 8 => decode_signed_optimizer_fact_scalar(bytes),
+		ARROW_STATS_TAG_INT32 if bytes.len() == 4 => decode_signed_optimizer_fact_scalar(bytes)
+			.map(|value| RangeScalar::Integral(value.into())),
+		ARROW_STATS_TAG_INT64 if bytes.len() == 8 => decode_signed_optimizer_fact_scalar(bytes)
+			.map(|value| RangeScalar::Integral(value.into())),
+		ARROW_STATS_TAG_FLOAT32 if bytes.len() == 4 => {
+			decode_float32_optimizer_fact_scalar(bytes).map(|value| RangeScalar::Real(value.into()))
+		}
+		ARROW_STATS_TAG_FLOAT64 if bytes.len() == 8 => {
+			decode_float64_optimizer_fact_scalar(bytes).map(RangeScalar::Real)
+		}
 		_ => None,
 	}
 }
@@ -9428,6 +9707,41 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn float_range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("score", DataType::Float64, true),
+			]),
+			Vec::new(),
+			vec![(ColumnOrdinal(1), range_fact_f64(0.0, 1.0, 1_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.score >= 0.8",
+			)
+			.expect("plan SQL float range-filtered dimension join");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind SQL float range-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
 	async fn sql_join_projected_derived_dim_broadcasts_where_full_column_hashes() {
 		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
 			Some(64 * 1024 * 1024),
@@ -9620,6 +9934,83 @@ mod tests {
 
 		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
 		assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(200)));
+	}
+
+	#[tokio::test]
+	async fn float_range_continuous_midpoint_estimates_half_non_null_rows() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_score_range(range_fact_f64(
+			0.0, 1.0, 1_000,
+		));
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Lte(
+				Box::new(customer_column("score")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(0.5)))),
+			),
+		)
+		.await
+		.expect("bind midpoint float range filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(500)));
+	}
+
+	#[tokio::test]
+	async fn float_range_endpoint_inclusive_ge_max_estimates_one_row_but_gt_max_zero() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_score_range(range_fact_f64(
+			0.0, 1.0, 1_000,
+		));
+		let inclusive = bind_filtered_customers(
+			&catalog,
+			Expr::Gte(
+				Box::new(customer_column("score")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(1.0)))),
+			),
+		)
+		.await
+		.expect("bind inclusive endpoint float range filter");
+		let exclusive = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("score")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(1.0)))),
+			),
+		)
+		.await
+		.expect("bind exclusive endpoint float range filter");
+
+		assert_eq!(inclusive.facts.estimated_row_count, Some(RowCount::new(1)));
+		assert_eq!(exclusive.facts.estimated_row_count, Some(RowCount::new(0)));
+	}
+
+	#[tokio::test]
+	async fn float_range_constant_column_min_equals_max_no_div_by_zero() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_score_range(range_fact_f64(
+			7.0, 7.0, 123,
+		));
+		let at_value = bind_filtered_customers(
+			&catalog,
+			Expr::Gte(
+				Box::new(customer_column("score")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(7.0)))),
+			),
+		)
+		.await
+		.expect("bind constant float range matching value");
+		let above_value = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("score")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(7.0)))),
+			),
+		)
+		.await
+		.expect("bind constant float range above value");
+
+		assert_eq!(at_value.facts.estimated_row_count, Some(RowCount::new(123)));
+		assert_eq!(
+			above_value.facts.estimated_row_count,
+			Some(RowCount::new(0))
+		);
 	}
 
 	#[tokio::test]
@@ -9821,7 +10212,102 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn range_utf8_and_float_facts_fail_open() {
+	async fn float_range_outside_envelope_estimates_zero_without_hard_bound() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_score_range(range_fact_f64(
+			0.0, 1.0, 1_000,
+		));
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("score")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(2.0)))),
+			),
+		)
+		.await
+		.expect("bind outside-envelope float range filter");
+
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn float_range_does_not_write_hard_bounds_or_empty_relation() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_score_range(range_fact_f64(
+			0.0, 1.0, 1_000,
+		));
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Lt(
+				Box::new(customer_column("score")),
+				Box::new(Expr::Literal(ScalarValue::Float64(Some(-1.0)))),
+			),
+		)
+		.await
+		.expect("bind disjoint float range filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[test]
+	fn int_literal_against_float_fact_consumed_as_f64() {
+		let range = range_fact_f64(0.0, 10.0, 100);
+
+		assert_eq!(
+			range_scalar_for_fact(&range, &ScalarValue::Int32(Some(7))),
+			Some(RangeScalar::Real(7.0))
+		);
+		assert_eq!(
+			range_scalar_for_fact(&range, &ScalarValue::Int64(Some(7))),
+			Some(RangeScalar::Real(7.0))
+		);
+		assert_eq!(
+			range_scalar_for_fact(&range, &ScalarValue::Float32(Some(2.5))),
+			Some(RangeScalar::Real(2.5))
+		);
+		assert_eq!(
+			range_scalar_for_fact(&range, &ScalarValue::Float64(Some(2.5))),
+			Some(RangeScalar::Real(2.5))
+		);
+		assert_eq!(
+			range_scalar_for_fact(&range, &ScalarValue::Int64(Some(i64::MAX))),
+			None
+		);
+		assert_eq!(
+			range_scalar_for_fact(&range, &ScalarValue::Float64(Some(f64::NAN))),
+			None
+		);
+		assert_eq!(
+			range_scalar_for_fact(&range, &ScalarValue::Float64(None)),
+			None
+		);
+	}
+
+	#[tokio::test]
+	async fn integer_range_facts_keep_discrete_interpolation() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(89)))),
+			),
+		)
+		.await
+		.expect("bind integer discrete range filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+	}
+
+	#[tokio::test]
+	async fn utf8_range_facts_still_fail_open() {
 		let utf8_catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
 			Some(64 * 1024 * 1024),
 			None,
@@ -9852,7 +10338,12 @@ mod tests {
 		.await
 		.expect("bind UTF8 range filter");
 
-		let float_catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+		assert_eq!(utf8_scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn opaque_float_range_facts_still_fail_open() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
 			Some(64 * 1024 * 1024),
 			None,
 			None,
@@ -9872,18 +10363,17 @@ mod tests {
 				},
 			)],
 		);
-		let float_scoped = bind_filtered_customers(
-			&float_catalog,
+		let scoped = bind_filtered_customers(
+			&catalog,
 			Expr::Gt(
 				Box::new(customer_column("score")),
 				Box::new(Expr::Literal(ScalarValue::Float64(Some(0.5)))),
 			),
 		)
 		.await
-		.expect("bind float range filter");
+		.expect("bind opaque float range filter");
 
-		assert_eq!(utf8_scoped.facts.estimated_row_count, None);
-		assert_eq!(float_scoped.facts.estimated_row_count, None);
+		assert_eq!(scoped.facts.estimated_row_count, None);
 	}
 
 	#[tokio::test]
@@ -11500,6 +11990,22 @@ mod tests {
 		)
 	}
 
+	fn descriptor_sidecar_join_catalog_with_customer_score_range(
+		range: RangeFact,
+	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("score", DataType::Float64, true),
+			]),
+			Vec::new(),
+			vec![(ColumnOrdinal(1), range)],
+		)
+	}
+
 	fn wide_customer_schema() -> Schema {
 		Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
@@ -11634,6 +12140,16 @@ mod tests {
 			max: Some(
 				wendelon_client::encode_signed_optimizer_fact_scalar(i64::from(max), 4).unwrap(),
 			),
+		}
+	}
+
+	fn range_fact_f64(min: f64, max: f64, non_null_count: u64) -> RangeFact {
+		RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_FLOAT64,
+			null_count: 0,
+			non_null_count,
+			min: Some(wendelon_client::encode_float64_optimizer_fact_scalar(min).unwrap()),
+			max: Some(wendelon_client::encode_float64_optimizer_fact_scalar(max).unwrap()),
 		}
 	}
 
