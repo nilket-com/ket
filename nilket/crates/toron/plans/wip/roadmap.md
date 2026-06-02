@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–148 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–149 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,55 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 148 promoted; ADR 149 candidates
+### ADR 149 promoted; ADR 150 candidates
+
+ADR 149 promoted **Temporal Date32 Selectivity Breadth** — makes `Date32` a
+first-class Toron scalar so date filters (the #1 analytical predicate) can reach the
+optimizer facts Wendelon **already produces** (Date32 min/max, signed-4-byte day
+numbers, `ARROW_STATS_TAG_DATE32`, `stats.rs:1774`). The producer + 144's discrete
+integral range math are done, so the cut is the **scalar foundation** (literal,
+comparison, exec, display) with range/equality/IN selectivity falling out for free.
+**Toron-only, estimate-channel only, no Wendelon change.** **Pivoted from hard
+materialized bytes** (rejected: Wendelon per-contributor framing isn't a hard bound
+in Toron's runtime IPC unit — encoded framing scales with the runtime `live.chunks`
+count, not the contributor count — and `BroadcastInferred` does **not** retire replay,
+which fires on actual `PartitionPayload::size_bytes` over-cap by *source*, not by the
+reason label; so hard-byte was a relabeled estimate for an EXPLAIN string — Claude's
+two groundings, endorsed by Codex + operator; a real hard-byte ADR needs a measured
+encoded-size ledger or a runtime batch-count contract). **Decisions:**
+`ScalarValue::Date32(Option<i32>)`; **both literal forms (bounded-lenient)** — explicit
+`DATE 'YYYY-MM-DD'` (`SqlExpr::TypedString`, the sqlparser-0.62 AST) + a **bare
+`Utf8`-literal→`Date32` coercion** against a Date32 column (the resolved strict-vs-lenient
+divergence — grounded that it *extends the existing* `coerce_literal_value` hook
+`binder.rs:7687`, literal-only + target-gated, reusing the strict `parse_date_ymd`;
+Codex conceded iter-5 — without it the #1 bare-string date filter wouldn't bind);
+**strict int↔date** (Date32 facts spend only Date32 literals; a raw i32 day number
+can't); Arrow-`Date32Array` execution + ISO display; direct DDL carrier
+(`Physical(DataType::Date32)`, **no `LogicalTypePhysical` bump** — deferred);
+**PBC pushdown preserves Date32 type or declines** (never a raw-int opcode); the
+trivial consumer decodes `ARROW_STATS_TAG_DATE32` as `RangeScalar::Integral` and
+reuses 144/141/148 estimate-only. Genuine 3-of-3 (coercion resolved on grounding;
+`LogicalTypePhysical` deferral on the direct DDL carrier). Headline gate:
+`date32_range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate`
+(fails on `main`).
+
+**ADR 150 lead candidates:** **Date64/Timestamp selectivity** (the immediate
+same-pattern follow-on — i64-backed, reuse 149's machinery; Timestamp adds time-unit
++ timezone semantics worth its own cut); **decimal range/scalar breadth** (currency
+columns — needs a `Decimal` scalar, engine-breadth); **measured-skew heavy-hitter /
+Count-Min equality refinement** (equality + IN-list under-estimate hot keys today —
+`base_rows/NDV` is wrong for skew, replay-recovered — gate on a *measured* miss, export
+a consumer-shaped `column_value_frequency`); **KLL/quantile range precision** (gate on
+a measured min/max-uniformity miss); **tighten the byte estimate** (the 149-pivot
+leftover (C) — replace the fat 16 KiB framing constant in `estimated_byte_size`; tiny,
+estimate-channel, replay-covered — fold into adjacent work, not its own ADR); **hard
+materialized bytes done right** (a measured encoded-size ledger or single-batch encode
+contract — deferred); **136-W/hard-zero/snapshot** (the deferred hard-channel +
+elision items). **Forward arc:** `… → 149 Date32 → Date64/Timestamp → decimal →
+measured-skew sketches → Theta join-key intersection → join selectivity → reordering`.
+Evidence-gate the next pick on the 149 feat.
+
+### ADR 148 promoted; ADR 149 candidates (HISTORICAL)
 
 ADR 148 promoted **IN-List Equality Selectivity from Existing NDV Facts** — the
 **predicate-shape** analogue of 147's type-shape completion: `141 equality NDV → 142
