@@ -10008,6 +10008,54 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn hard_row_bound_anchors_scan_byte_estimate() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(12));
+		let logical = LogicalPlan::ScanNamed {
+			table: TableRef::new("customers"),
+			projection: None,
+		};
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind hard-row scan");
+
+		assert!(matches!(&scoped.plan, ExecutionPlan::Scan { .. }));
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(12)));
+		let expected =
+			estimate_materialized_byte_size(RowCount::new(12), scoped.plan.schema().as_ref())
+				.expect("fixed scan estimate");
+		assert_eq!(scoped.facts.estimated_byte_size, Some(expected));
+	}
+
+	#[tokio::test]
+	async fn row_zero_fact_does_not_elide_scan() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(0));
+		let logical = LogicalPlan::ScanNamed {
+			table: TableRef::new("customers"),
+			projection: None,
+		};
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind zero-row scan");
+
+		assert!(matches!(&scoped.plan, ExecutionPlan::Scan { .. }));
+		assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
+		assert_eq!(scoped.facts.byte_upper_bound, Some(ByteCount::ZERO));
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(0)));
+	}
+
+	#[tokio::test]
 	async fn known_empty_table_infers_broadcast() {
 		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(0));
 		let logical = SqlPlanner::new()

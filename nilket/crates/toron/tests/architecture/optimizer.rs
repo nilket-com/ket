@@ -769,11 +769,7 @@ pub(crate) fn adr136_byte_upper_bound_is_materialized() {
 #[test]
 pub(crate) fn adr136_no_wendelon_producer_in_toron() {
 	let manifest_dir = manifest_dir();
-	let markers = [
-		"DescriptorOptimizerFacts",
-		"materialized_byte_upper_bound",
-		"row_upper_bound",
-	];
+	let markers = ["DescriptorOptimizerFacts", "materialized_byte_upper_bound"];
 	let offenders = source_lines(&wendelon_manifest_dir().join("src"))
 		.into_iter()
 		.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker)))
@@ -1961,7 +1957,7 @@ pub(crate) fn adr142_fact_fetch_is_fail_open_and_no_toron_stats_cache() {
 }
 
 #[test]
-pub(crate) fn adr142_141_consumer_unchanged_no_hard_bound_writes() {
+pub(crate) fn adr142_141_consumer_maps_only_explicit_hard_bounds() {
 	let catalog = catalog_source();
 	let mapper = source_block(&catalog, "fn descriptor_optimizer_facts_from_storage");
 	let binder = binder_source();
@@ -1969,9 +1965,10 @@ pub(crate) fn adr142_141_consumer_unchanged_no_hard_bound_writes() {
 	assert!(mapper.contains("facts.schema_generation != descriptor.schema_generation"));
 	assert!(mapper.contains("facts.physical_descriptor_fingerprint"));
 	assert!(mapper.contains("materialized_byte_upper_bound: None"));
-	assert!(mapper.contains("row_upper_bound: None"));
+	assert!(mapper.contains("row_upper_bound: facts.row_upper_bound.map(RowCount::new)"));
 	assert!(mapper.contains("column_ndv"));
 	assert!(catalog.contains("produced_ndv_never_writes_hard_bound"));
+	assert!(catalog.contains("storage_optimizer_facts_map_hard_row_bound"));
 	assert!(binder.contains("fn filter_equality_ndv_estimated_row_count"));
 	assert!(binder.contains("fn estimated_rows_for_ndv"));
 	assert!(binder.contains("rune_equality_filtered_dim_broadcasts_over_wendelon_ndv_no_seed"));
@@ -2225,6 +2222,100 @@ pub(crate) fn adr145_no_wendelon_executor_storage_or_chooser_change() {
 	assert!(!choose.contains("Project"));
 	assert!(!candidate.contains("Derived"));
 	assert!(!candidate.contains("Project"));
+}
+
+#[test]
+pub(crate) fn adr146_hard_row_bounds_are_optimizer_facts_not_descriptor_metadata() {
+	let catalog = catalog_source();
+	let table = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read Wendelon table schema");
+	let wendelon_facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
+	let descriptor = source_block(&table, "pub struct TableSchemaDescriptor");
+
+	assert!(wendelon_facts.contains("pub row_upper_bound: Option<u64>"));
+	assert!(wendelon_facts.contains("TableOptimizerFactsWithoutRowBound"));
+	assert!(catalog.contains("row_upper_bound: Option<RowCount>"));
+	assert!(!wendelon_facts.contains("materialized_byte_upper_bound"));
+	assert!(!descriptor.contains("row_upper_bound"));
+	assert!(!descriptor.contains("materialized_byte_upper_bound"));
+}
+
+#[test]
+pub(crate) fn adr146_row_bound_producer_is_coverage_proven_and_candidate_independent() {
+	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
+		.expect("read Wendelon slab manager");
+	let table_facts = source_block(&manager, "pub async fn table_optimizer_facts");
+
+	assert!(table_facts.contains("has_uncovered_local_rows_for_descriptor"));
+	assert!(table_facts.contains("TieredStatsContributor::Missing => return Ok(None)"));
+	assert!(table_facts.contains("row_upper_bound_for_blocks(&blocks)"));
+	assert!(table_facts.contains("row_upper_bound: Some(row_upper_bound)"));
+	assert!(!table_facts.contains("ndv_candidates.is_empty() && range_candidates.is_empty()"));
+	assert!(manager.contains("table_optimizer_facts_emits_row_bound_for_candidate_less_table"));
+	assert!(manager.contains("table_optimizer_facts_known_empty_emits_zero_row_bound"));
+	assert!(manager.contains("table_optimizer_facts_missing_tiered_stats_suppresses_row_bound"));
+	assert!(manager.contains("row_upper_bound_saturates_on_overflow"));
+}
+
+#[test]
+pub(crate) fn adr146_toron_imports_row_bound_without_materialized_byte_producer() {
+	let catalog = catalog_source();
+	let mapper = source_block(&catalog, "fn descriptor_optimizer_facts_from_storage");
+
+	assert!(mapper.contains("row_upper_bound: facts.row_upper_bound.map(RowCount::new)"));
+	assert!(mapper.contains("materialized_byte_upper_bound: None"));
+	assert!(!mapper.contains("materialized_byte_upper_bound: facts"));
+	assert!(catalog.contains("storage_optimizer_facts_map_hard_row_bound"));
+	assert!(catalog.contains("storage_optimizer_facts_known_empty_normalizes_to_zero_bytes"));
+	assert!(catalog.contains("produced_ndv_never_writes_hard_bound"));
+}
+
+#[test]
+pub(crate) fn adr146_hard_row_bound_drives_estimates_without_scan_elision() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn derive_estimated_byte_size");
+	let scan_named = binder
+		.split("LogicalPlan::ScanNamed")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Alias").next())
+		.expect("ScanNamed bind arm");
+
+	assert!(
+		estimate.contains("estimate_row_source(self.row_upper_bound, self.estimated_row_count)")
+	);
+	assert!(scan_named.contains("PlanOptimizerFacts::from_table(optimizer_facts)"));
+	assert!(scan_named.contains("derive_estimated_byte_size(plan.schema().as_ref())"));
+	assert!(!scan_named.contains("EmptyRelation"));
+	assert!(binder.contains("hard_row_bound_anchors_scan_byte_estimate"));
+	assert!(binder.contains("row_zero_fact_does_not_elide_scan"));
+	assert!(binder.contains("known_empty_table_infers_broadcast"));
+	assert!(binder.contains("direct_equality_filtered_dim_with_ndv_infers_broadcast_by_estimate"));
+}
+
+#[test]
+pub(crate) fn adr146_no_compressed_bytes_or_descriptor_counts_as_hard_fact_source() {
+	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
+		.expect("read Wendelon slab manager");
+	let wendelon_facts = std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("src")
+			.join("schema")
+			.join("optimizer_facts.rs"),
+	)
+	.expect("read Wendelon optimizer facts");
+	let table_facts = source_block(&manager, "pub async fn table_optimizer_facts");
+
+	assert!(!wendelon_facts.contains("compressed"));
+	assert!(!wendelon_facts.contains("materialized_byte"));
+	assert!(!table_facts.contains("size_bytes"));
+	assert!(!table_facts.contains("materialized_byte"));
+	assert!(!table_facts.contains("descriptor.row_count"));
 }
 
 #[test]

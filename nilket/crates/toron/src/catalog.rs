@@ -208,7 +208,7 @@ fn descriptor_optimizer_facts_from_storage(
 		physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
 		manifest_epoch: facts.producer_epoch,
 		materialized_byte_upper_bound: None,
-		row_upper_bound: None,
+		row_upper_bound: facts.row_upper_bound.map(RowCount::new),
 		column_ndv,
 		column_range,
 	})
@@ -3127,6 +3127,7 @@ mod tests {
 			schema_generation: descriptor.schema_generation,
 			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 			producer_epoch: 17,
+			row_upper_bound: None,
 			column_ndv: vec![wendelon_client::ColumnNdvFact {
 				column_ordinal: 1,
 				distinct: StorageNdvFact::Approx {
@@ -3171,6 +3172,7 @@ mod tests {
 			schema_generation: descriptor.schema_generation,
 			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 			producer_epoch: 17,
+			row_upper_bound: None,
 			column_ndv: Vec::new(),
 			column_range: vec![wendelon_client::ColumnRangeFact {
 				column_ordinal: 1,
@@ -3218,6 +3220,7 @@ mod tests {
 				schema_generation: descriptor.schema_generation,
 				physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 				producer_epoch: 17,
+				row_upper_bound: None,
 				column_ndv: vec![wendelon_client::ColumnNdvFact {
 					column_ordinal: 1,
 					distinct: StorageNdvFact::Exact { count: 4 },
@@ -3240,6 +3243,54 @@ mod tests {
 	}
 
 	#[test]
+	fn storage_optimizer_facts_map_hard_row_bound() {
+		let descriptor = descriptor();
+		let facts = descriptor_optimizer_facts_from_storage(
+			StorageTableOptimizerFacts {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+				producer_epoch: 17,
+				row_upper_bound: Some(12),
+				column_ndv: Vec::new(),
+				column_range: Vec::new(),
+			},
+			&descriptor,
+		)
+		.expect("storage facts map");
+
+		assert_eq!(facts.materialized_byte_upper_bound, None);
+		assert_eq!(facts.row_upper_bound, Some(RowCount::new(12)));
+		let table_facts = facts.for_descriptor(&descriptor);
+		assert_eq!(table_facts.byte_upper_bound, None);
+		assert_eq!(table_facts.row_upper_bound, Some(RowCount::new(12)));
+	}
+
+	#[test]
+	fn storage_optimizer_facts_known_empty_normalizes_to_zero_bytes() {
+		let descriptor = descriptor();
+		let facts = descriptor_optimizer_facts_from_storage(
+			StorageTableOptimizerFacts {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+				producer_epoch: 17,
+				row_upper_bound: Some(0),
+				column_ndv: Vec::new(),
+				column_range: Vec::new(),
+			},
+			&descriptor,
+		)
+		.expect("storage facts map");
+
+		assert_eq!(facts.materialized_byte_upper_bound, None);
+		assert_eq!(facts.row_upper_bound, Some(RowCount::new(0)));
+		let table_facts = facts.for_descriptor(&descriptor);
+		assert_eq!(table_facts.byte_upper_bound, Some(ByteCount::ZERO));
+		assert_eq!(table_facts.row_upper_bound, Some(RowCount::new(0)));
+	}
+
+	#[test]
 	fn descriptor_identity_mismatch_drops_fact() {
 		let descriptor = descriptor();
 		let stale_descriptor = descriptor_with_identity(0xCB, descriptor.schema_generation);
@@ -3248,6 +3299,7 @@ mod tests {
 			schema_generation: descriptor.schema_generation + 1,
 			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 			producer_epoch: 17,
+			row_upper_bound: Some(12),
 			column_ndv: vec![wendelon_client::ColumnNdvFact {
 				column_ordinal: 1,
 				distinct: StorageNdvFact::Exact { count: 4 },
@@ -3264,6 +3316,7 @@ mod tests {
 			schema_generation: descriptor.schema_generation,
 			physical_descriptor_fingerprint: stale_descriptor.physical_descriptor_fingerprint,
 			producer_epoch: 17,
+			row_upper_bound: Some(12),
 			column_ndv: vec![wendelon_client::ColumnNdvFact {
 				column_ordinal: 1,
 				distinct: StorageNdvFact::Exact { count: 4 },

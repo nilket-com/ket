@@ -29,6 +29,8 @@ pub struct TableOptimizerFacts {
 	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
 	pub producer_epoch: u64,
 	#[serde(default)]
+	pub row_upper_bound: Option<u64>,
+	#[serde(default)]
 	pub column_ndv: Vec<ColumnNdvFact>,
 	#[serde(default)]
 	pub column_range: Vec<ColumnRangeFact>,
@@ -66,6 +68,32 @@ struct LegacyTableOptimizerFacts {
 	pub column_ndv: Vec<ColumnNdvFact>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TableOptimizerFactsWithoutRowBound {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+}
+
+impl From<TableOptimizerFactsWithoutRowBound> for TableOptimizerFacts {
+	fn from(facts: TableOptimizerFactsWithoutRowBound) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: None,
+			column_ndv: facts.column_ndv,
+			column_range: facts.column_range,
+		}
+	}
+}
+
 impl From<LegacyTableOptimizerFacts> for TableOptimizerFacts {
 	fn from(facts: LegacyTableOptimizerFacts) -> Self {
 		Self {
@@ -73,6 +101,7 @@ impl From<LegacyTableOptimizerFacts> for TableOptimizerFacts {
 			schema_generation: facts.schema_generation,
 			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
 			producer_epoch: facts.producer_epoch,
+			row_upper_bound: None,
 			column_ndv: facts.column_ndv,
 			column_range: Vec::new(),
 		}
@@ -185,16 +214,19 @@ pub fn encode_table_optimizer_facts(facts: &TableOptimizerFacts) -> std::io::Res
 pub fn decode_table_optimizer_facts(bytes: &[u8]) -> std::io::Result<TableOptimizerFacts> {
 	match postcard::from_bytes(bytes) {
 		Ok(facts) => Ok(facts),
-		Err(new_err) => postcard::from_bytes::<LegacyTableOptimizerFacts>(bytes)
-			.map(TableOptimizerFacts::from)
-			.map_err(|legacy_err| {
-				Error::new(
-					ErrorKind::InvalidData,
-					format!(
-						"failed to decode table optimizer facts: {new_err}; legacy decode also failed: {legacy_err}"
-					),
-				)
-			}),
+		Err(new_err) => match postcard::from_bytes::<TableOptimizerFactsWithoutRowBound>(bytes) {
+			Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+			Err(without_row_err) => postcard::from_bytes::<LegacyTableOptimizerFacts>(bytes)
+				.map(TableOptimizerFacts::from)
+				.map_err(|legacy_err| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"failed to decode table optimizer facts: {new_err}; without-row-bound decode also failed: {without_row_err}; legacy decode also failed: {legacy_err}"
+						),
+					)
+				}),
+		},
 	}
 }
 
@@ -245,6 +277,7 @@ mod tests {
 		let decoded = decode_table_optimizer_facts(&bytes).expect("decode legacy facts");
 		assert_eq!(decoded.table_object_id, legacy.table_object_id);
 		assert_eq!(decoded.schema_generation, legacy.schema_generation);
+		assert_eq!(decoded.row_upper_bound, None);
 		assert_eq!(decoded.column_ndv, legacy.column_ndv);
 		assert!(decoded.column_range.is_empty());
 	}
@@ -252,6 +285,29 @@ mod tests {
 	#[test]
 	fn table_optimizer_facts_round_trips_range_facts() {
 		let facts = TableOptimizerFacts {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: vec![ColumnRangeFact {
+				column_ordinal: 0,
+				arrow_type_tag: ARROW_STATS_TAG_INT64,
+				null_count: 1,
+				non_null_count: 2,
+				min: Some(encode_signed_optimizer_fact_scalar(-5, 8).unwrap()),
+				max: Some(encode_signed_optimizer_fact_scalar(7, 8).unwrap()),
+			}],
+		};
+
+		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
+		assert_eq!(decode_table_optimizer_facts(&bytes).unwrap(), facts);
+	}
+
+	#[test]
+	fn table_optimizer_facts_current_payload_decodes_row_bound_absent() {
+		let without_row_bound = TableOptimizerFactsWithoutRowBound {
 			table_object_id: table_id(),
 			schema_generation: 7,
 			physical_descriptor_fingerprint: fingerprint(),
@@ -266,8 +322,15 @@ mod tests {
 				max: Some(encode_signed_optimizer_fact_scalar(7, 8).unwrap()),
 			}],
 		};
+		let bytes = postcard::to_allocvec(&without_row_bound).expect("encode current facts");
 
-		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
-		assert_eq!(decode_table_optimizer_facts(&bytes).unwrap(), facts);
+		let decoded = decode_table_optimizer_facts(&bytes).expect("decode current facts");
+		assert_eq!(decoded.table_object_id, without_row_bound.table_object_id);
+		assert_eq!(
+			decoded.schema_generation,
+			without_row_bound.schema_generation
+		);
+		assert_eq!(decoded.row_upper_bound, None);
+		assert_eq!(decoded.column_range, without_row_bound.column_range);
 	}
 }

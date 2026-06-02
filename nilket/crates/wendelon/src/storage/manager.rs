@@ -831,6 +831,12 @@ fn range_fact_for_column(
 	}))
 }
 
+fn row_upper_bound_for_blocks(blocks: &[ParsedColumnStatsBlock]) -> u64 {
+	blocks.iter().fold(0_u64, |rows, block| {
+		rows.saturating_add(block.header.row_count)
+	})
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecondaryIndexSegmentInfo {
 	pub tenant_id: TenantId,
@@ -5064,9 +5070,6 @@ impl SlabManager {
 	) -> std::io::Result<Option<TableOptimizerFacts>> {
 		let ndv_candidates = ndv_column_candidates(descriptor)?;
 		let range_candidates = range_column_candidates(descriptor)?;
-		if ndv_candidates.is_empty() && range_candidates.is_empty() {
-			return Ok(None);
-		}
 		if self
 			.has_uncovered_local_rows_for_descriptor(tenant_id, descriptor)
 			.await?
@@ -5092,9 +5095,7 @@ impl SlabManager {
 				TieredStatsContributor::Missing => return Ok(None),
 			}
 		}
-		if blocks.is_empty() {
-			return Ok(None);
-		}
+		let row_upper_bound = row_upper_bound_for_blocks(&blocks);
 
 		let mut column_ndv = Vec::new();
 		for candidate in ndv_candidates.values() {
@@ -5111,14 +5112,12 @@ impl SlabManager {
 				column_range.push(range);
 			}
 		}
-		if column_ndv.is_empty() && column_range.is_empty() {
-			return Ok(None);
-		}
 		Ok(Some(TableOptimizerFacts {
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
 			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 			producer_epoch,
+			row_upper_bound: Some(row_upper_bound),
 			column_ndv,
 			column_range,
 		}))
@@ -15205,6 +15204,12 @@ mod tests {
 		}
 	}
 
+	fn optimizer_fact_block_with_row_count(row_count: u64) -> ParsedColumnStatsBlock {
+		let mut block = optimizer_fact_block(Vec::new());
+		block.header.row_count = row_count;
+		block
+	}
+
 	fn optimizer_fact_small_set_entry(values: &[&[u8]]) -> ColumnStatsBlockEntry {
 		let mut payload = Vec::new();
 		payload.extend_from_slice(&0_u64.to_be_bytes());
@@ -15456,6 +15461,16 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn row_upper_bound_saturates_on_overflow() {
+		let blocks = vec![
+			optimizer_fact_block_with_row_count(u64::MAX - 1),
+			optimizer_fact_block_with_row_count(7),
+		];
+
+		assert_eq!(row_upper_bound_for_blocks(&blocks), u64::MAX);
+	}
+
 	#[tokio::test]
 	async fn table_optimizer_facts_merges_tiered_small_sets_into_exact_ndv() {
 		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-exact").await;
@@ -15494,6 +15509,84 @@ mod tests {
 		assert_eq!(facts.column_ndv.len(), 1);
 		assert_eq!(facts.column_ndv[0].column_ordinal, 1);
 		assert_eq!(facts.column_ndv[0].distinct, NdvFact::Exact { count: 3 });
+		assert_eq!(facts.row_upper_bound, Some(4));
+	}
+
+	#[tokio::test]
+	async fn table_optimizer_facts_emits_row_bound_for_candidate_less_table() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-stat-less-row").await;
+		let descriptor = optimizer_fact_candidate_less_descriptor();
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_candidate_less_batch(&["new", "paid"]),
+			"optimizer-facts-stat-less-row-a",
+			10,
+		)
+		.await;
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_candidate_less_batch(&["shipped", "settled", "closed"]),
+			"optimizer-facts-stat-less-row-b",
+			20,
+		)
+		.await;
+
+		let facts = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered row facts");
+
+		assert_eq!(facts.row_upper_bound, Some(5));
+		assert!(facts.column_ndv.is_empty());
+		assert!(facts.column_range.is_empty());
+	}
+
+	#[tokio::test]
+	async fn table_optimizer_facts_known_empty_emits_zero_row_bound() {
+		let (mgr, _l2) = fresh_manager_with_l2("optimizer-facts-known-empty").await;
+		let descriptor = optimizer_fact_candidate_less_descriptor();
+
+		let facts = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("known-empty row fact");
+
+		assert_eq!(facts.row_upper_bound, Some(0));
+		assert!(facts.column_ndv.is_empty());
+		assert!(facts.column_range.is_empty());
+	}
+
+	#[tokio::test]
+	async fn table_optimizer_facts_missing_tiered_stats_suppresses_row_bound() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-missing-row").await;
+		let descriptor = optimizer_fact_candidate_less_descriptor();
+		let slab_id = tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_candidate_less_batch(&["new", "paid"]),
+			"optimizer-facts-missing-row",
+			10,
+		)
+		.await;
+		let mut pointer = mgr.tier_pointer(slab_id).await.expect("tier pointer");
+		pointer.stats_format_version = None;
+		pointer.stats_block_len = None;
+		pointer.stats_block_hash128 = None;
+		mgr.apply_tier_slab(pointer).await.unwrap();
+
+		assert_eq!(
+			mgr.table_optimizer_facts(tenant(), &descriptor)
+				.await
+				.unwrap(),
+			None
+		);
 	}
 
 	#[tokio::test]
@@ -15532,6 +15625,7 @@ mod tests {
 			.iter()
 			.find(|fact| fact.column_ordinal == 1)
 			.expect("amount range fact");
+		assert_eq!(facts.row_upper_bound, Some(5));
 		assert_eq!(amount.arrow_type_tag, ARROW_STATS_TAG_INT64);
 		assert_eq!(amount.null_count, 1);
 		assert_eq!(amount.non_null_count, 4);
@@ -15559,6 +15653,7 @@ mod tests {
 			.unwrap()
 			.expect("covered tiered facts before active append");
 		assert_eq!(covered.column_ndv[0].distinct, NdvFact::Exact { count: 2 });
+		assert_eq!(covered.row_upper_bound, Some(2));
 
 		append_optimizer_fact_rows(
 			&mgr,
@@ -15596,6 +15691,7 @@ mod tests {
 			.unwrap()
 			.expect("covered range facts before active append");
 		assert!(!covered.column_range.is_empty());
+		assert_eq!(covered.row_upper_bound, Some(2));
 
 		append_optimizer_fact_rows(
 			&mgr,
@@ -16343,6 +16439,23 @@ mod tests {
 		descriptor
 	}
 
+	fn optimizer_fact_candidate_less_descriptor() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![Field::new("status", DataType::LargeUtf8, false)]);
+		let descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([0xA4; 16]),
+			3,
+			"analytics",
+			"statuses",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("status")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.validate().unwrap();
+		descriptor
+	}
+
 	fn optimizer_fact_region_batch(rows: &[(i64, Option<&str>)]) -> RecordBatch {
 		RecordBatch::try_new(
 			Arc::new(Schema::new(vec![
@@ -16379,6 +16492,20 @@ mod tests {
 						.collect::<Vec<Option<i64>>>(),
 				)) as Arc<dyn Array>,
 			],
+		)
+		.unwrap()
+	}
+
+	fn optimizer_fact_candidate_less_batch(values: &[&str]) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new(
+				"status",
+				DataType::LargeUtf8,
+				false,
+			)])),
+			vec![Arc::new(LargeStringArray::from(
+				values.iter().map(|value| Some(*value)).collect::<Vec<_>>(),
+			)) as Arc<dyn Array>],
 		)
 		.unwrap()
 	}

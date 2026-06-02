@@ -3594,6 +3594,7 @@ mod tests {
 			schema_generation: descriptor.schema_generation,
 			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 			producer_epoch: 7,
+			row_upper_bound: Some(42),
 			column_ndv: vec![crate::schema::ColumnNdvFact {
 				column_ordinal: 1,
 				distinct: NdvFact::Approx {
