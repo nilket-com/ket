@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–153 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–154 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,51 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 153 promoted; ADR 154 candidates
+### ADR 154 promoted; ADR 155 candidates
+
+ADR 154 promoted **Measured Skew Miss Evidence** — the disciplined return to the CBO
+spine after the temporal arc: a **Toron-local evidence cut** resolving the ~13-ADR
+standing gate (*"measured-skew is gated on a measured miss we don't have"*). It **changes
+no behavior** — uniform NDV selectivity (141/148), the chooser, 139/140 replay, and
+Wendelon are untouched. It turns the theoretical hot-key gap into a **checked-in
+deterministic test artifact** + a **precise next-fact contract**. **Two separated
+measurements (the honesty core):** **(a) raw miss** — a deterministic skewed dim
+(seeded `column_ndv = D`, hot literal at `H ≫ ceil(N/D)` rows, direct `LogicalPlan` so the
+filter lands on the build side, *not* SQL `WHERE`) where `facts.estimated_row_count ==
+ceil(N/D)` while actual hot rows ≫ that; **(b) decision-boundary crossing** — sized to
+cross the broadcast cap → `BroadcastEstimated` → `BudgetExhausted(BroadcastReplication)`
+→ 139/140 replay. The miss **matters only at (b)**: 139/140 give ~64× headroom, so a
+**wrong-but-absorbed** gate (miss under the cap completes without replay) makes the cut
+**decision-resolving** rather than assuming harm. **Forward deliverable:** an inert,
+not-wired `HeavyHitterFact { column_ordinal, entries: Vec<{value_key, frequency}>,
+exactness, coverage }` contract — `value_key` uses ADR148-compatible canonical scalar-key
+semantics, tracked hot literal → `frequency`, untracked → uniform tail `(base_rows − Σ
+frequency)/(D − k)`, all-contributors coverage (142), estimate-only — so ADR 155's
+producer builds to spec. **Observational via existing `facts.estimated_row_count`;
+no public EXPLAIN expansion** (`optimizer_explain_schema` unchanged), no Wendelon change,
+estimate/replay fences intact. Genuine 3-of-3 (Codex: not-benchmark-only; Claude: the
+two-claim split + wrong-but-absorbed; Codex+Gemini: the Top-K contract); two Gemini
+fixture divergences resolved (direct `LogicalPlan` over SQL `WHERE`; wrong-but-absorbed
+included). Headline gates: `skewed_hot_key_filter_records_uniform_ndv_miss` +
+`uniform_ndv_hot_key_miss_triggers_broadcast_replay`.
+
+**ADR 155 lead candidates:** **heavy-hitter / top-k fact producer + consumer** (the
+direct sequel **if 154's (b) gate fires** — a cross-ring Wendelon producer of per-column
+top-k (value, frequency) built to 154's D7 contract + a Toron consumer that spends
+`frequency` for tracked hot literals; exact top-k first, Count-Min only with exposed
+error bounds; equality/`IN` only, all-contributors coverage like 142); **reprioritize off
+the spine if 154 shows wrong-but-absorbed** (the miss is real but within 139/140 headroom
+→ the producer is low-value; pivot to CONVERT/units or another axis with evidence in
+hand); **dimensioned `CONVERT` / units arc** (brainstorm 009 — point/delta proven across
+fixed + calendar deltas; the parallel breadth track, linear-units-first); **KLL/quantile
+range skew** (the range analogue — its own measured-miss gate); **`SET TIME ZONE` / REPL
+client**; **tighten the byte estimate** (`binder.rs:70`). **Forward arc:** `154 skew
+evidence → (if (b)) 155 heavy-hitter producer + selectivity correction → KLL/quantile
+range evidence → Theta join-key intersection → join selectivity → reordering` ·
+*(parallel: CONVERT/units)*. **155's pick is gated on the 154 feat's measured outcome** —
+(b)-fires → producer; absorbed → reprioritize.
+
+### ADR 153 promoted; ADR 154 candidates (HISTORICAL)
 
 ADR 153 promoted **Calendar Month-Year Interval Arithmetic** — adds the Time
 dimension's **calendar** delta (152 built the fixed delta; this closes the temporal
