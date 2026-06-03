@@ -11,7 +11,7 @@ use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
 	MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId, TemporalExtractField,
-	TemporalTruncField,
+	TemporalTruncField, nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{BroadcastReplayEligibility, JoinReplayId, JoinStrategy};
@@ -19,12 +19,12 @@ use crate::ir::{BroadcastReplayEligibility, JoinReplayId, JoinStrategy};
 use crate::ir::{Expr, LogicalPlan};
 use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
 use arrow::array::{
-	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Float32Array,
-	Float32Builder, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder,
-	Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMicrosecondArray,
-	TimestampMicrosecondBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
-	TimestampNanosecondArray, TimestampNanosecondBuilder, UInt8Array, UInt16Array, UInt32Array,
-	UInt64Array,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder,
+	DurationNanosecondArray, DurationNanosecondBuilder, Float32Array, Float32Builder, Float64Array,
+	Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
+	StringArray, StringBuilder, TimestampMicrosecondArray, TimestampMicrosecondBuilder,
+	TimestampMillisecondArray, TimestampMillisecondBuilder, TimestampNanosecondArray,
+	TimestampNanosecondBuilder, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or, or_kleene};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -875,6 +875,12 @@ impl Executor {
 					ScalarValue::Date32(v) => Ok(Arc::new(Date32Array::from(vec![*v; num_rows]))),
 					ScalarValue::Timestamp { value, unit } => {
 						Ok(timestamp_literal_array(value, *unit, num_rows))
+					}
+					ScalarValue::Interval(value) => {
+						Ok(Arc::new(DurationNanosecondArray::from(vec![
+							*value;
+							num_rows
+						])))
 					}
 					ScalarValue::Float32(v) => {
 						Ok(Arc::new(arrow::array::Float32Array::from(vec![
@@ -1782,6 +1788,9 @@ fn literal_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
 		ScalarValue::Int64(value) => Arc::new(Int64Array::from(vec![*value; num_rows])),
 		ScalarValue::Date32(value) => Arc::new(Date32Array::from(vec![*value; num_rows])),
 		ScalarValue::Timestamp { value, unit } => timestamp_literal_array(value, *unit, num_rows),
+		ScalarValue::Interval(value) => {
+			Arc::new(DurationNanosecondArray::from(vec![*value; num_rows]))
+		}
 		ScalarValue::Float32(value) => Arc::new(Float32Array::from(vec![*value; num_rows])),
 		ScalarValue::Float64(value) => Arc::new(Float64Array::from(vec![*value; num_rows])),
 		ScalarValue::Utf8(value) => {
@@ -1896,6 +1905,23 @@ fn system_table_array(
 		}
 		DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "UTC" => {
 			build_system_timestamp_array(*unit, rows, field_index, field_name)
+		}
+		DataType::Duration(TimeUnit::Nanosecond) => {
+			let mut builder = DurationNanosecondBuilder::with_capacity(rows.len());
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Interval(Some(value)) => builder.append_value(*value),
+					ScalarValue::Interval(None) => builder.append_null(),
+					other => {
+						return Err(system_table_type_mismatch(
+							field_name,
+							"Duration(Nanosecond)",
+							other,
+						));
+					}
+				}
+			}
+			Ok(Arc::new(builder.finish()))
 		}
 		DataType::Float32 => {
 			let mut builder = Float32Builder::with_capacity(rows.len());
@@ -2060,6 +2086,10 @@ fn evaluate_bound_binary(
 				BoundBinaryOp::Div => ArithmeticOp::Div,
 				_ => unreachable!("arithmetic op matched"),
 			};
+			if let Some(result) = evaluate_temporal_arithmetic(arithmetic_op, left_arr, right_arr)?
+			{
+				return Ok(result);
+			}
 			let left_type =
 				program
 					.node_type(left)
@@ -4779,6 +4809,9 @@ fn evaluate_unbound_arithmetic(
 	left: ArrayRef,
 	right: ArrayRef,
 ) -> Result<ArrayRef, ExecutionError> {
+	if let Some(result) = evaluate_temporal_arithmetic(op, &left, &right)? {
+		return Ok(result);
+	}
 	let output_type =
 		arithmetic_output_type(left.data_type(), right.data_type()).ok_or_else(|| {
 			ExecutionError::InvalidExpression {
@@ -5249,6 +5282,336 @@ fn evaluate_arithmetic(
 	}
 }
 
+fn evaluate_temporal_arithmetic(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<Option<ArrayRef>, ExecutionError> {
+	let left_unit = temporal_timestamp_unit(left.data_type())?;
+	let right_unit = temporal_timestamp_unit(right.data_type())?;
+	let left_is_interval = left.data_type() == &DataType::Duration(TimeUnit::Nanosecond);
+	let right_is_interval = right.data_type() == &DataType::Duration(TimeUnit::Nanosecond);
+	if left_unit.is_none() && right_unit.is_none() && !left_is_interval && !right_is_interval {
+		return Ok(None);
+	}
+	if left.len() != right.len() {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"temporal arithmetic operand length mismatch: left {}, right {}",
+				left.len(),
+				right.len()
+			),
+		});
+	}
+	if (left_is_interval || right_is_interval)
+		&& matches!(op, ArithmeticOp::Mul | ArithmeticOp::Div)
+	{
+		return Err(ExecutionError::InvalidExpression {
+			message: "Interval multiplication and division are deferred".to_string(),
+		});
+	}
+
+	match op {
+		ArithmeticOp::Add => match (left_unit, right_unit, left_is_interval, right_is_interval) {
+			(Some(unit), None, false, true) => {
+				let durations = as_duration_nanos(right, "Timestamp + Interval right operand")?;
+				Ok(Some(evaluate_timestamp_interval(
+					op, left, durations, unit,
+				)?))
+			}
+			(None, Some(unit), true, false) => {
+				let durations = as_duration_nanos(left, "Interval + Timestamp left operand")?;
+				Ok(Some(evaluate_timestamp_interval(
+					op, right, durations, unit,
+				)?))
+			}
+			(None, None, true, true) => Ok(Some(evaluate_interval_interval(op, left, right)?)),
+			(Some(_), Some(_), _, _) => Err(ExecutionError::InvalidExpression {
+				message: "Timestamp + Timestamp is not supported".to_string(),
+			}),
+			_ => Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"Interval arithmetic expects Interval and UTC Timestamp operands, got {:?} and {:?}",
+					left.data_type(),
+					right.data_type()
+				),
+			}),
+		},
+		ArithmeticOp::Sub => match (left_unit, right_unit, left_is_interval, right_is_interval) {
+			(Some(unit), None, false, true) => {
+				let durations = as_duration_nanos(right, "Timestamp - Interval right operand")?;
+				Ok(Some(evaluate_timestamp_interval(
+					op, left, durations, unit,
+				)?))
+			}
+			(Some(left_unit), Some(right_unit), _, _) => {
+				if left_unit != right_unit {
+					return Err(ExecutionError::InvalidExpression {
+						message: "mixed-unit Timestamp - Timestamp is deferred in ADR 152"
+							.to_string(),
+					});
+				}
+				Ok(Some(evaluate_timestamp_difference(left, right, left_unit)?))
+			}
+			(None, Some(_), true, false) => Err(ExecutionError::InvalidExpression {
+				message: "Interval - Timestamp is not supported".to_string(),
+			}),
+			(None, None, true, true) => Ok(Some(evaluate_interval_interval(op, left, right)?)),
+			_ => Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"Interval arithmetic expects Interval and UTC Timestamp operands, got {:?} and {:?}",
+					left.data_type(),
+					right.data_type()
+				),
+			}),
+		},
+		ArithmeticOp::Mul | ArithmeticOp::Div => Ok(None),
+	}
+}
+
+fn temporal_timestamp_unit(data_type: &DataType) -> Result<Option<TimeUnit>, ExecutionError> {
+	match data_type {
+		DataType::Timestamp(
+			unit @ (TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond),
+			Some(timezone),
+		) if timezone.as_ref() == "UTC" => Ok(Some(*unit)),
+		DataType::Timestamp(_, None) => Err(ExecutionError::InvalidExpression {
+			message: "temporal interval arithmetic does not support Timestamp without timezone"
+				.to_string(),
+		}),
+		DataType::Timestamp(_, Some(timezone)) if timezone.as_ref() != "UTC" => {
+			Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"temporal interval arithmetic requires UTC Timestamp, got timezone {timezone}"
+				),
+			})
+		}
+		DataType::Timestamp(unit, Some(_)) => Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"temporal interval arithmetic does not support Timestamp unit {unit:?}"
+			),
+		}),
+		_ => Ok(None),
+	}
+}
+
+fn evaluate_timestamp_interval(
+	op: ArithmeticOp,
+	timestamps: &ArrayRef,
+	durations: &DurationNanosecondArray,
+	unit: TimeUnit,
+) -> Result<ArrayRef, ExecutionError> {
+	if let Some(array) = timestamps
+		.as_any()
+		.downcast_ref::<TimestampMillisecondArray>()
+	{
+		return timestamp_interval_array(op, array, durations, unit);
+	}
+	if let Some(array) = timestamps
+		.as_any()
+		.downcast_ref::<TimestampMicrosecondArray>()
+	{
+		return timestamp_interval_array(op, array, durations, unit);
+	}
+	if let Some(array) = timestamps
+		.as_any()
+		.downcast_ref::<TimestampNanosecondArray>()
+	{
+		return timestamp_interval_array(op, array, durations, unit);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"Timestamp +/- Interval expects Timestamp input, got {:?}",
+			timestamps.data_type()
+		),
+	})
+}
+
+fn timestamp_interval_array<T>(
+	op: ArithmeticOp,
+	timestamps: &T,
+	durations: &DurationNanosecondArray,
+	unit: TimeUnit,
+) -> Result<ArrayRef, ExecutionError>
+where
+	for<'a> &'a T: IntoIterator<Item = Option<i64>>,
+	T: Array,
+{
+	let values = timestamps
+		.into_iter()
+		.zip(durations.iter())
+		.map(|(timestamp, interval_nanos)| {
+			let Some(timestamp) = timestamp else {
+				return Ok(None);
+			};
+			let Some(interval_nanos) = interval_nanos else {
+				return Ok(None);
+			};
+			let interval_ticks =
+				checked_interval_nanos_to_timestamp_ticks_exec(interval_nanos, unit)?;
+			let value = match op {
+				ArithmeticOp::Add => timestamp.checked_add(interval_ticks),
+				ArithmeticOp::Sub => timestamp.checked_sub(interval_ticks),
+				ArithmeticOp::Mul | ArithmeticOp::Div => None,
+			}
+			.ok_or_else(|| temporal_arithmetic_overflow_exec(op, timestamps.data_type()))?;
+			Ok(Some(value))
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(timestamp_array_from_values(unit, values))
+}
+
+fn evaluate_timestamp_difference(
+	left: &ArrayRef,
+	right: &ArrayRef,
+	unit: TimeUnit,
+) -> Result<ArrayRef, ExecutionError> {
+	if let (Some(left), Some(right)) = (
+		left.as_any().downcast_ref::<TimestampMillisecondArray>(),
+		right.as_any().downcast_ref::<TimestampMillisecondArray>(),
+	) {
+		return timestamp_difference_array(left, right, unit);
+	}
+	if let (Some(left), Some(right)) = (
+		left.as_any().downcast_ref::<TimestampMicrosecondArray>(),
+		right.as_any().downcast_ref::<TimestampMicrosecondArray>(),
+	) {
+		return timestamp_difference_array(left, right, unit);
+	}
+	if let (Some(left), Some(right)) = (
+		left.as_any().downcast_ref::<TimestampNanosecondArray>(),
+		right.as_any().downcast_ref::<TimestampNanosecondArray>(),
+	) {
+		return timestamp_difference_array(left, right, unit);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"Timestamp - Timestamp expects matching timestamp arrays, got {:?} and {:?}",
+			left.data_type(),
+			right.data_type()
+		),
+	})
+}
+
+fn timestamp_difference_array<T>(
+	left: &T,
+	right: &T,
+	unit: TimeUnit,
+) -> Result<ArrayRef, ExecutionError>
+where
+	for<'a> &'a T: IntoIterator<Item = Option<i64>>,
+	T: Array,
+{
+	let nanos_per_unit =
+		nanos_per_timestamp_unit(unit).ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("Timestamp unit {unit:?} is not supported for interval arithmetic"),
+		})?;
+	let data_type = left.data_type().clone();
+	let values = left
+		.into_iter()
+		.zip(right.into_iter())
+		.map(|(left_value, right_value)| {
+			let Some(left_value) = left_value else {
+				return Ok(None);
+			};
+			let Some(right_value) = right_value else {
+				return Ok(None);
+			};
+			let ticks = left_value
+				.checked_sub(right_value)
+				.ok_or_else(|| temporal_arithmetic_overflow_exec(ArithmeticOp::Sub, &data_type))?;
+			let nanos = ticks.checked_mul(nanos_per_unit).ok_or_else(|| {
+				temporal_arithmetic_overflow_exec(
+					ArithmeticOp::Sub,
+					&DataType::Duration(TimeUnit::Nanosecond),
+				)
+			})?;
+			Ok(Some(nanos))
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(Arc::new(DurationNanosecondArray::from(values)) as ArrayRef)
+}
+
+fn evaluate_interval_interval(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let left = as_duration_nanos(left, "Interval arithmetic left operand")?;
+	let right = as_duration_nanos(right, "Interval arithmetic right operand")?;
+	let values = left
+		.iter()
+		.zip(right.iter())
+		.map(|(left, right)| {
+			let Some(left) = left else {
+				return Ok(None);
+			};
+			let Some(right) = right else {
+				return Ok(None);
+			};
+			let value = match op {
+				ArithmeticOp::Add => left.checked_add(right),
+				ArithmeticOp::Sub => left.checked_sub(right),
+				ArithmeticOp::Mul | ArithmeticOp::Div => None,
+			}
+			.ok_or_else(|| {
+				temporal_arithmetic_overflow_exec(op, &DataType::Duration(TimeUnit::Nanosecond))
+			})?;
+			Ok(Some(value))
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(Arc::new(DurationNanosecondArray::from(values)) as ArrayRef)
+}
+
+fn timestamp_array_from_values(unit: TimeUnit, values: Vec<Option<i64>>) -> ArrayRef {
+	match unit {
+		TimeUnit::Millisecond => {
+			Arc::new(TimestampMillisecondArray::from(values).with_timezone("UTC")) as ArrayRef
+		}
+		TimeUnit::Microsecond => {
+			Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef
+		}
+		TimeUnit::Nanosecond => {
+			Arc::new(TimestampNanosecondArray::from(values).with_timezone("UTC")) as ArrayRef
+		}
+		TimeUnit::Second => unreachable!("TimestampSecond is not a supported Toron timestamp unit"),
+	}
+}
+
+fn checked_interval_nanos_to_timestamp_ticks_exec(
+	interval_nanos: i64,
+	unit: TimeUnit,
+) -> Result<i64, ExecutionError> {
+	let nanos_per_unit =
+		nanos_per_timestamp_unit(unit).ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("Timestamp unit {unit:?} is not supported for interval arithmetic"),
+		})?;
+	if interval_nanos % nanos_per_unit != 0 {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"interval nanoseconds {interval_nanos} are not exactly representable at {} precision",
+				timestamp_precision_name(unit)
+			),
+		});
+	}
+	Ok(interval_nanos / nanos_per_unit)
+}
+
+fn timestamp_precision_name(unit: TimeUnit) -> &'static str {
+	match unit {
+		TimeUnit::Second => "second",
+		TimeUnit::Millisecond => "millisecond",
+		TimeUnit::Microsecond => "microsecond",
+		TimeUnit::Nanosecond => "nanosecond",
+	}
+}
+
+fn temporal_arithmetic_overflow_exec(op: ArithmeticOp, data_type: &DataType) -> ExecutionError {
+	ExecutionError::Kernel {
+		message: format!("temporal arithmetic overflow: {}({data_type:?})", op.name()),
+	}
+}
+
 fn evaluate_int32_arithmetic(
 	op: ArithmeticOp,
 	left: &ArrayRef,
@@ -5404,6 +5767,18 @@ fn as_int64<'a>(
 		.downcast_ref::<Int64Array>()
 		.ok_or_else(|| ExecutionError::InvalidExpression {
 			message: format!("{context} must be Int64"),
+		})
+}
+
+fn as_duration_nanos<'a>(
+	array: &'a ArrayRef,
+	context: &'static str,
+) -> Result<&'a DurationNanosecondArray, ExecutionError> {
+	array
+		.as_any()
+		.downcast_ref::<DurationNanosecondArray>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("{context} must be Duration(Nanosecond)"),
 		})
 }
 

@@ -455,9 +455,23 @@ pub enum ScalarValue {
 	Int64(Option<i64>),
 	Date32(Option<i32>),
 	Timestamp { value: Option<i64>, unit: TimeUnit },
+	Interval(Option<i64>),
 	Float32(Option<f32>),
 	Float64(Option<f64>),
 	Utf8(Option<String>),
+}
+
+pub fn interval_data_type() -> DataType {
+	DataType::Duration(TimeUnit::Nanosecond)
+}
+
+pub fn nanos_per_timestamp_unit(unit: TimeUnit) -> Option<i64> {
+	match unit {
+		TimeUnit::Second => Some(1_000_000_000),
+		TimeUnit::Millisecond => Some(1_000_000),
+		TimeUnit::Microsecond => Some(1_000),
+		TimeUnit::Nanosecond => Some(1),
+	}
 }
 
 impl ScalarValue {
@@ -468,6 +482,7 @@ impl ScalarValue {
 			Self::Int64(_) => DataType::Int64,
 			Self::Date32(_) => DataType::Date32,
 			Self::Timestamp { unit, .. } => crate::timestamp::utc_timestamp_data_type(*unit),
+			Self::Interval(_) => interval_data_type(),
 			Self::Float32(_) => DataType::Float32,
 			Self::Float64(_) => DataType::Float64,
 			Self::Utf8(_) => DataType::Utf8,
@@ -491,6 +506,8 @@ impl fmt::Display for ScalarValue {
 				unit,
 			} => f.write_str(&crate::timestamp::format_utc_timestamp(*value, *unit)),
 			Self::Timestamp { value: None, .. } => f.write_str("NULL"),
+			Self::Interval(Some(value)) => write!(f, "{value}ns"),
+			Self::Interval(None) => f.write_str("NULL"),
 			Self::Float32(Some(value)) => write!(f, "{value}"),
 			Self::Float32(None) => f.write_str("NULL"),
 			Self::Float64(Some(value)) => write!(f, "{value}"),

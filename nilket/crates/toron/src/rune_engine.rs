@@ -567,6 +567,43 @@ pub fn lit_timestamp(value: String) -> VmResult<RuneExpr> {
 	}
 }
 
+fn interval_literal(amount: i64, nanos_per_unit: i64, unit: &'static str) -> VmResult<RuneExpr> {
+	match amount.checked_mul(nanos_per_unit) {
+		Some(nanos) => VmResult::Ok(RuneExpr {
+			expr: Expr::Literal(ScalarValue::Interval(Some(nanos))),
+		}),
+		None => VmResult::panic(format!("interval {unit} value overflows i64 nanoseconds")),
+	}
+}
+
+pub fn nanoseconds(value: i64) -> VmResult<RuneExpr> {
+	interval_literal(value, 1, "nanoseconds")
+}
+
+pub fn microseconds(value: i64) -> VmResult<RuneExpr> {
+	interval_literal(value, 1_000, "microseconds")
+}
+
+pub fn milliseconds(value: i64) -> VmResult<RuneExpr> {
+	interval_literal(value, 1_000_000, "milliseconds")
+}
+
+pub fn seconds(value: i64) -> VmResult<RuneExpr> {
+	interval_literal(value, 1_000_000_000, "seconds")
+}
+
+pub fn minutes(value: i64) -> VmResult<RuneExpr> {
+	interval_literal(value, 60 * 1_000_000_000, "minutes")
+}
+
+pub fn hours(value: i64) -> VmResult<RuneExpr> {
+	interval_literal(value, 60 * 60 * 1_000_000_000, "hours")
+}
+
+pub fn days(value: i64) -> VmResult<RuneExpr> {
+	interval_literal(value, 24 * 60 * 60 * 1_000_000_000, "days")
+}
+
 pub fn asc(expr: RuneExpr) -> RuneSortKey {
 	expr.asc()
 }
@@ -957,6 +994,13 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lit_i64"], lit_i64).build()?;
 	m.function(["lit_date"], lit_date).build()?;
 	m.function(["lit_timestamp"], lit_timestamp).build()?;
+	m.function(["nanoseconds"], nanoseconds).build()?;
+	m.function(["microseconds"], microseconds).build()?;
+	m.function(["milliseconds"], milliseconds).build()?;
+	m.function(["seconds"], seconds).build()?;
+	m.function(["minutes"], minutes).build()?;
+	m.function(["hours"], hours).build()?;
+	m.function(["days"], days).build()?;
 	m.function(["asc"], asc).build()?;
 	m.function(["desc"], desc).build()?;
 	m.function(["when"], when).build()?;

@@ -15,10 +15,10 @@ use sqlparser::ast::{
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, DateTimeField,
 	Delete, DescribeAlias, ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg,
 	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
-	Ident, Insert, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
-	ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem,
-	SetExpr, Statement, TableAlias, TableConstraint, TableFactor, TableObject, TimezoneInfo,
-	TypedString, UnaryOperator, Value,
+	Ident, Insert, Interval as SqlInterval, JoinConstraint, JoinOperator, LimitClause, ObjectName,
+	ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query,
+	Select, SelectItem, SetExpr, Statement, TableAlias, TableConstraint, TableFactor, TableObject,
+	TimezoneInfo, TypedString, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -226,6 +226,7 @@ fn reject_nested_aggregate(expr: &SqlExpr) -> Result<(), FrontendError> {
 		}
 		SqlExpr::Cast { expr, .. }
 		| SqlExpr::Extract { expr, .. }
+		| SqlExpr::Interval(SqlInterval { value: expr, .. })
 		| SqlExpr::UnaryOp { expr, .. } => reject_nested_aggregate(expr),
 		SqlExpr::AtTimeZone {
 			timestamp,
@@ -411,6 +412,137 @@ fn lower_extract_datetime_field(
 		| DateTimeField::TimezoneRegion
 		| DateTimeField::NoDateTime
 		| DateTimeField::Custom(_) => Err(unsupported(format!("unsupported EXTRACT field: {field}"))),
+	}
+}
+
+fn lower_interval_literal(interval: &SqlInterval) -> Result<Expr, FrontendError> {
+	if interval.last_field.is_some()
+		|| interval.leading_precision.is_some()
+		|| interval.fractional_seconds_precision.is_some()
+	{
+		return Err(unsupported(
+			"INTERVAL ranges and precision are not supported; use a single fixed-duration unit",
+		));
+	}
+	let nanos = match &interval.leading_field {
+		Some(field) => {
+			let amount = interval_literal_integer(&interval.value)?;
+			checked_interval_nanos(amount, interval_field_nanos(field)?)
+		}
+		None => {
+			let value = interval_literal_string(&interval.value)?;
+			parse_simple_interval_string(&value)
+		}
+	}?;
+	Ok(Expr::Literal(ScalarValue::Interval(Some(nanos))))
+}
+
+fn interval_literal_integer(expr: &SqlExpr) -> Result<i64, FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Value(value) => match &value.value {
+			Value::Number(value, _) => parse_interval_i64(value),
+			Value::SingleQuotedString(value) => parse_interval_i64(value.trim()),
+			_ => Err(unsupported(
+				"INTERVAL value must be an integer literal for fixed-duration intervals",
+			)),
+		},
+		SqlExpr::UnaryOp {
+			op: UnaryOperator::Minus,
+			expr,
+		} => interval_literal_integer(expr).and_then(|value| {
+			value
+				.checked_neg()
+				.ok_or_else(|| unsupported("INTERVAL value overflows i64 fixed-duration range"))
+		}),
+		SqlExpr::UnaryOp {
+			op: UnaryOperator::Plus,
+			expr,
+		} => interval_literal_integer(expr),
+		_ => Err(unsupported(
+			"INTERVAL value must be a literal for fixed-duration intervals",
+		)),
+	}
+}
+
+fn interval_literal_string(expr: &SqlExpr) -> Result<String, FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Value(value) => match &value.value {
+			Value::SingleQuotedString(value) => Ok(value.clone()),
+			_ => Err(unsupported(
+				"INTERVAL without an explicit unit expects a string literal like '7 days'",
+			)),
+		},
+		_ => Err(unsupported(
+			"INTERVAL without an explicit unit expects a string literal like '7 days'",
+		)),
+	}
+}
+
+fn parse_simple_interval_string(value: &str) -> Result<i64, FrontendError> {
+	let parts = value.split_whitespace().collect::<Vec<_>>();
+	if parts.len() != 2 {
+		return Err(unsupported(
+			"INTERVAL string must be a single fixed-duration amount and unit",
+		));
+	}
+	let amount = parse_interval_i64(parts[0])?;
+	let nanos = interval_unit_word_nanos(parts[1])?;
+	checked_interval_nanos(amount, nanos)
+}
+
+fn parse_interval_i64(value: &str) -> Result<i64, FrontendError> {
+	value
+		.parse::<i64>()
+		.map_err(|_| unsupported("INTERVAL value must be an integer literal within i64 range"))
+}
+
+fn checked_interval_nanos(amount: i64, nanos_per_unit: i64) -> Result<i64, FrontendError> {
+	(i128::from(amount) * i128::from(nanos_per_unit))
+		.try_into()
+		.map_err(|_| unsupported("INTERVAL literal overflows i64 nanoseconds"))
+}
+
+fn interval_field_nanos(field: &DateTimeField) -> Result<i64, FrontendError> {
+	match field {
+		DateTimeField::Nanosecond | DateTimeField::Nanoseconds => Ok(1),
+		DateTimeField::Microsecond | DateTimeField::Microseconds => Ok(1_000),
+		DateTimeField::Millisecond | DateTimeField::Milliseconds => Ok(1_000_000),
+		DateTimeField::Second | DateTimeField::Seconds => Ok(1_000_000_000),
+		DateTimeField::Minute | DateTimeField::Minutes => Ok(60 * 1_000_000_000),
+		DateTimeField::Hour | DateTimeField::Hours => Ok(60 * 60 * 1_000_000_000),
+		DateTimeField::Day | DateTimeField::Days => Ok(24 * 60 * 60 * 1_000_000_000),
+		DateTimeField::Year
+		| DateTimeField::Years
+		| DateTimeField::Month
+		| DateTimeField::Months
+		| DateTimeField::Week(_)
+		| DateTimeField::Weeks
+		| DateTimeField::Quarter => Err(unsupported(format!(
+			"calendar INTERVAL unit {field} is not supported in fixed-duration intervals"
+		))),
+		other => Err(unsupported(format!(
+			"unsupported fixed-duration INTERVAL unit: {other}"
+		))),
+	}
+}
+
+fn interval_unit_word_nanos(unit: &str) -> Result<i64, FrontendError> {
+	match unit.to_ascii_lowercase().as_str() {
+		"nanosecond" | "nanoseconds" | "ns" => Ok(1),
+		"microsecond" | "microseconds" | "us" => Ok(1_000),
+		"millisecond" | "milliseconds" | "ms" => Ok(1_000_000),
+		"second" | "seconds" | "s" => Ok(1_000_000_000),
+		"minute" | "minutes" | "min" | "mins" => Ok(60 * 1_000_000_000),
+		"hour" | "hours" | "h" => Ok(60 * 60 * 1_000_000_000),
+		"day" | "days" | "d" => Ok(24 * 60 * 60 * 1_000_000_000),
+		"week" | "weeks" | "month" | "months" | "quarter" | "quarters" | "year" | "years" => {
+			Err(unsupported(format!(
+				"calendar INTERVAL unit {unit} is not supported in fixed-duration intervals"
+			)))
+		}
+		_ => Err(unsupported(format!(
+			"unsupported fixed-duration INTERVAL unit: {unit}"
+		))),
 	}
 }
 
@@ -4102,6 +4234,7 @@ impl SqlPlanner {
 					})
 					.map_err(|error| unsupported(error.to_string()))
 			}
+			SqlExpr::Interval(interval) => lower_interval_literal(interval),
 			SqlExpr::BinaryOp { left, op, right } => {
 				let l = Box::new(self.lower_expr(left)?);
 				let r = Box::new(self.lower_expr(right)?);
@@ -5387,16 +5520,20 @@ fn hash_scalar_structural(value: &ScalarValue, state: &mut impl Hasher) {
 			unit.hash(state);
 			value.hash(state);
 		}
-		ScalarValue::Float32(value) => {
+		ScalarValue::Interval(value) => {
 			5u8.hash(state);
+			value.hash(state);
+		}
+		ScalarValue::Float32(value) => {
+			6u8.hash(state);
 			value.map(f32::to_bits).hash(state);
 		}
 		ScalarValue::Float64(value) => {
-			6u8.hash(state);
+			7u8.hash(state);
 			value.map(f64::to_bits).hash(state);
 		}
 		ScalarValue::Utf8(value) => {
-			7u8.hash(state);
+			8u8.hash(state);
 			value.hash(state);
 		}
 	}
@@ -5418,6 +5555,7 @@ fn scalar_structural_eq(left: &ScalarValue, right: &ScalarValue) -> bool {
 				unit: right_unit,
 			},
 		) => left_unit == right_unit && left_value == right_value,
+		(ScalarValue::Interval(left), ScalarValue::Interval(right)) => left == right,
 		(ScalarValue::Float32(left), ScalarValue::Float32(right)) => {
 			left.map(f32::to_bits) == right.map(f32::to_bits)
 		}
@@ -5701,6 +5839,7 @@ fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
 			expr_contains_aggregate_call(expr)
 		}
+		SqlExpr::Interval(SqlInterval { value, .. }) => expr_contains_aggregate_call(value),
 		SqlExpr::AtTimeZone {
 			timestamp,
 			time_zone,
@@ -5732,6 +5871,7 @@ fn expr_contains_subquery(expr: &SqlExpr) -> bool {
 				}) || else_result.as_deref().is_some_and(expr_contains_subquery)
 		}
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => expr_contains_subquery(expr),
+		SqlExpr::Interval(SqlInterval { value, .. }) => expr_contains_subquery(value),
 		SqlExpr::AtTimeZone {
 			timestamp,
 			time_zone,
@@ -5777,6 +5917,7 @@ fn expr_contains_window_function(expr: &SqlExpr) -> bool {
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
 			expr_contains_window_function(expr)
 		}
+		SqlExpr::Interval(SqlInterval { value, .. }) => expr_contains_window_function(value),
 		SqlExpr::AtTimeZone {
 			timestamp,
 			time_zone,
@@ -5867,6 +6008,9 @@ fn expr_contains_nonaggregate_column_reference(expr: &SqlExpr) -> bool {
 		}
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
 			expr_contains_nonaggregate_column_reference(expr)
+		}
+		SqlExpr::Interval(SqlInterval { value, .. }) => {
+			expr_contains_nonaggregate_column_reference(value)
 		}
 		SqlExpr::AtTimeZone {
 			timestamp,

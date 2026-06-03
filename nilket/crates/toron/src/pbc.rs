@@ -2,6 +2,7 @@ use crate::ir::{
 	BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram, BoundUnaryOp, ColumnOrdinal,
 	ScalarValue,
 };
+use arrow::datatypes::{DataType, TimeUnit};
 
 // Import OP codes from Wendelon.
 use wendelon::schema::pbc::{
@@ -90,6 +91,11 @@ impl PbcCompiler {
 					));
 				}
 				BoundExprNode::Binary { op, left, right } => {
+					if binary_has_fixed_duration_interval_type(program, Some(id), *left, *right) {
+						return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+							"fixed-duration interval arithmetic is not PBC-eligible".to_string(),
+						));
+					}
 					if matches!(
 						op,
 						BoundBinaryOp::Add
@@ -184,6 +190,13 @@ impl PbcCompiler {
 					"NULL literal reached PBC emitter".to_string(),
 				));
 			}
+			BoundExprNode::Binary { left, right, .. }
+				if binary_has_fixed_duration_interval_type(program, None, *left, *right) =>
+			{
+				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+					"fixed-duration interval arithmetic is not PBC-eligible".to_string(),
+				));
+			}
 			BoundExprNode::Binary { op, .. } => bytecode.push(binary_opcode(op)?),
 			BoundExprNode::Unary { op, .. } => bytecode.push(unary_opcode(op)),
 			BoundExprNode::InList { list, negated, .. } => {
@@ -215,6 +228,27 @@ impl PbcCompiler {
 	}
 }
 
+fn binary_has_fixed_duration_interval_type(
+	program: &BoundExprProgram,
+	output: Option<BoundExprId>,
+	left: BoundExprId,
+	right: BoundExprId,
+) -> bool {
+	output
+		.and_then(|id| program.node_type(id))
+		.is_some_and(is_fixed_duration_interval_type)
+		|| program
+			.node_type(left)
+			.is_some_and(is_fixed_duration_interval_type)
+		|| program
+			.node_type(right)
+			.is_some_and(is_fixed_duration_interval_type)
+}
+
+fn is_fixed_duration_interval_type(data_type: &DataType) -> bool {
+	matches!(data_type, DataType::Duration(TimeUnit::Nanosecond))
+}
+
 fn emit_literal(val: &ScalarValue, bytecode: &mut Vec<u8>) -> Result<(), PushdownDeclineReason> {
 	match val {
 		ScalarValue::Boolean(Some(v)) => {
@@ -237,6 +271,11 @@ fn emit_literal(val: &ScalarValue, bytecode: &mut Vec<u8>) -> Result<(), Pushdow
 		ScalarValue::Timestamp { value: Some(_), .. } => {
 			return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 				"Timestamp literals require type-preserving PBC support".to_string(),
+			));
+		}
+		ScalarValue::Interval(Some(_)) => {
+			return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+				"fixed-duration interval literals are not PBC-eligible".to_string(),
 			));
 		}
 		ScalarValue::Float32(Some(v)) => {
@@ -436,6 +475,26 @@ mod tests {
 			res3,
 			Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 				"Timestamp literals require type-preserving PBC support".to_string()
+			))
+		);
+
+		// 4. Fixed-duration interval operands are not in the PBC type catalog.
+		let expr4 = program(|builder| {
+			let duration = column(
+				builder,
+				"elapsed",
+				5,
+				DataType::Duration(TimeUnit::Nanosecond),
+				true,
+			);
+			let value = builder.append_literal(ScalarValue::Interval(Some(1_000_000_000)));
+			builder.append_binary(BoundBinaryOp::Gt, duration, value, DataType::Boolean)
+		});
+		let res4 = compiler.compile(Some(&expr4), None);
+		assert_eq!(
+			res4,
+			Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+				"fixed-duration interval arithmetic is not PBC-eligible".to_string()
 			))
 		);
 	}

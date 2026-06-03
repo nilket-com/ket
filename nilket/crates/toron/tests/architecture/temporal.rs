@@ -373,3 +373,94 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 	assert!(!planner.contains("SET TIME ZONE"));
 	assert!(binder.contains("date_trunc is not supported for Date64"));
 }
+
+#[test]
+pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
+	let binder = source("src/binder.rs");
+	let ir = source("src/ir.rs");
+	let execution_ir = source("src/ir/execution.rs");
+	let planner = source("src/sql_planner.rs");
+	let exec = source("src/exec.rs");
+	let pbc = source("src/pbc.rs");
+	let rune = source("src/rune_engine.rs");
+	let lower_expr = source_block(&planner, "fn lower_expr");
+	let bind_arithmetic = source_block(&binder, "fn bind_arithmetic");
+	let arithmetic_output = source_block(&execution_ir, "pub fn arithmetic_output_type");
+	let temporal_exec = source_block(&exec, "fn evaluate_temporal_arithmetic");
+	let reject_nested = source_block(&planner, "fn reject_nested_aggregate");
+	let contains_aggregate = source_block(&planner, "fn expr_contains_aggregate_call");
+	let contains_subquery = source_block(&planner, "fn expr_contains_subquery");
+	let contains_window = source_block(&planner, "fn expr_contains_window_function");
+	let contains_column = source_block(&planner, "fn expr_contains_nonaggregate_column_reference");
+
+	assert!(ir.contains("Interval(Option<i64>)"));
+	assert!(ir.contains("pub fn interval_data_type() -> DataType"));
+	assert!(ir.contains("DataType::Duration(TimeUnit::Nanosecond)"));
+	assert!(ir.contains("Self::Interval(_) => interval_data_type()"));
+	assert!(!source_block(&execution_ir, "pub enum BoundExprNode").contains("Interval"));
+	assert!(arithmetic_output.contains("DataType::*"));
+	assert!(!arithmetic_output.contains("Duration"));
+	assert!(!arithmetic_output.contains("Timestamp"));
+	assert!(bind_arithmetic.contains("temporal_arithmetic_output_type(&op"));
+	assert!(
+		bind_arithmetic
+			.find("temporal_arithmetic_output_type(&op")
+			.expect("temporal branch")
+			< bind_arithmetic
+				.find("arithmetic_output_type(&left_type, &right_type)")
+				.expect("numeric branch")
+	);
+	assert!(binder.contains("fn fold_temporal_arithmetic"));
+	assert!(binder.contains("Date32 +/- Interval is deferred"));
+	assert!(binder.contains("mixed-unit Timestamp - Timestamp is deferred in ADR 152"));
+	assert!(binder.contains("not exactly representable at {} precision"));
+	assert!(lower_expr.contains("SqlExpr::Interval(interval) => lower_interval_literal(interval)"));
+	assert!(planner.contains("fn lower_interval_literal"));
+	assert!(planner.contains("DateTimeField::Day | DateTimeField::Days"));
+	assert!(planner.contains("24 * 60 * 60 * 1_000_000_000"));
+	assert!(planner.contains("calendar INTERVAL unit"));
+	assert!(reject_nested.contains("SqlExpr::Interval(SqlInterval { value: expr, .. })"));
+	assert!(contains_aggregate.contains("SqlExpr::Interval(SqlInterval { value, .. })"));
+	assert!(contains_subquery.contains("SqlExpr::Interval(SqlInterval { value, .. })"));
+	assert!(contains_window.contains("SqlExpr::Interval(SqlInterval { value, .. })"));
+	assert!(contains_column.contains("SqlExpr::Interval(SqlInterval { value, .. })"));
+	assert!(exec.contains("DurationNanosecondArray"));
+	assert!(temporal_exec.contains("Timestamp + Timestamp is not supported"));
+	assert!(temporal_exec.contains("Interval - Timestamp is not supported"));
+	assert!(exec.contains("fn checked_interval_nanos_to_timestamp_ticks_exec"));
+	assert!(!temporal_exec.contains("arrow::compute"));
+	assert!(pbc.contains("fixed-duration interval arithmetic is not PBC-eligible"));
+	assert!(pbc.contains("DataType::Duration(TimeUnit::Nanosecond)"));
+	for required in [
+		"pub fn nanoseconds(value: i64)",
+		"pub fn microseconds(value: i64)",
+		"pub fn milliseconds(value: i64)",
+		"pub fn seconds(value: i64)",
+		"pub fn minutes(value: i64)",
+		"pub fn hours(value: i64)",
+		"pub fn days(value: i64)",
+		"m.function([\"days\"], days).build()?;",
+	] {
+		assert!(rune.contains(required), "Rune missing {required}");
+	}
+	for required_test in [
+		"relative_interval_filter_spends_timestamp_range_fact",
+		"timestamp_plus_interval_preserves_utc_instant_type",
+		"timestamp_minus_interval_preserves_utc_instant_type",
+		"timestamp_minus_timestamp_returns_interval_in_shared_unit",
+		"mixed_unit_timestamp_difference_rejects_in_v1",
+		"interval_plus_interval_returns_interval",
+		"interval_comparison_orders_fixed_durations",
+		"timestamp_plus_timestamp_rejects",
+		"interval_day_is_fixed_86400s_not_civil",
+		"non_representable_interval_precision_rejects",
+		"calendar_month_year_interval_literal_rejects_in_v1",
+		"date32_plus_interval_rejects_in_v1",
+		"rune_interval_arithmetic_matches_sql",
+	] {
+		assert!(
+			binder.contains(required_test),
+			"missing behavior gate {required_test}"
+		);
+	}
+}

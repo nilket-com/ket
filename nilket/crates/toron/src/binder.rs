@@ -30,8 +30,8 @@ use crate::ir::{
 	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
 	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
 	TemporalExtractField, TemporalTruncField, arithmetic_output_type, decode_column_logical_type,
-	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, logical_type_name,
-	logical_type_spec, schema_for_exprs,
+	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
+	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -1876,6 +1876,7 @@ fn typed_null_for_data_type(data_type: &DataType) -> Result<ScalarValue, Binding
 		}
 		DataType::Float32 => Ok(ScalarValue::Float32(None)),
 		DataType::Float64 => Ok(ScalarValue::Float64(None)),
+		DataType::Duration(TimeUnit::Nanosecond) => Ok(ScalarValue::Interval(None)),
 		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
 		other => Err(BindingError::TypeMismatch {
 			message: format!("unsupported NULL target type: {other:?}"),
@@ -4105,6 +4106,8 @@ fn in_list_scalar_literal_cardinality(value: &ScalarValue) -> Option<InListLiter
 			*unit, *value,
 		))),
 		ScalarValue::Timestamp { value: None, .. } => Some(InListLiteralCardinality::Null),
+		ScalarValue::Interval(Some(_)) => None,
+		ScalarValue::Interval(None) => Some(InListLiteralCardinality::Null),
 		ScalarValue::Float32(Some(value)) => {
 			if !value.is_finite() {
 				return None;
@@ -4738,6 +4741,7 @@ fn literal_is_non_null(value: &ScalarValue) -> bool {
 		ScalarValue::Int64(value) => value.is_some(),
 		ScalarValue::Date32(value) => value.is_some(),
 		ScalarValue::Timestamp { value, .. } => value.is_some(),
+		ScalarValue::Interval(value) => value.is_some(),
 		ScalarValue::Float32(value) => value.is_some(),
 		ScalarValue::Float64(value) => value.is_some(),
 		ScalarValue::Utf8(value) => value.is_some(),
@@ -7193,6 +7197,304 @@ fn supported_timestamp_unit(
 	}
 }
 
+fn temporal_arithmetic_output_type(
+	op: &BoundBinaryOp,
+	left: &DataType,
+	right: &DataType,
+) -> Result<Option<DataType>, BindingError> {
+	let left_is_interval = is_interval_type(left);
+	let right_is_interval = is_interval_type(right);
+	let left_is_timestamp = matches!(left, DataType::Timestamp(_, _));
+	let right_is_timestamp = matches!(right, DataType::Timestamp(_, _));
+	let date32_interval = (matches!(left, DataType::Date32) && right_is_interval)
+		|| (left_is_interval && matches!(right, DataType::Date32));
+	if date32_interval && matches!(op, BoundBinaryOp::Add | BoundBinaryOp::Sub) {
+		return Err(BindingError::TypeMismatch {
+			message: "Date32 +/- Interval is deferred; use Timestamp arithmetic".to_string(),
+		});
+	}
+	if (left_is_interval || right_is_interval)
+		&& matches!(op, BoundBinaryOp::Mul | BoundBinaryOp::Div)
+	{
+		return Err(BindingError::TypeMismatch {
+			message: "Interval multiplication and division are deferred".to_string(),
+		});
+	}
+
+	match op {
+		BoundBinaryOp::Add => match (
+			left_is_timestamp,
+			right_is_timestamp,
+			left_is_interval,
+			right_is_interval,
+		) {
+			(true, true, _, _) => Err(BindingError::TypeMismatch {
+				message: "Timestamp + Timestamp is not supported".to_string(),
+			}),
+			(true, false, false, true) => {
+				let unit = timestamp_arithmetic_unit(left, "Timestamp + Interval")?;
+				Ok(Some(DataType::Timestamp(unit, Some("UTC".into()))))
+			}
+			(false, true, true, false) => {
+				let unit = timestamp_arithmetic_unit(right, "Interval + Timestamp")?;
+				Ok(Some(DataType::Timestamp(unit, Some("UTC".into()))))
+			}
+			(false, false, true, true) => Ok(Some(interval_data_type())),
+			(_, _, true, _) | (_, _, _, true) => Err(BindingError::TypeMismatch {
+				message: format!(
+					"Interval arithmetic expects Interval and UTC Timestamp operands, got {left:?} and {right:?}"
+				),
+			}),
+			_ => Ok(None),
+		},
+		BoundBinaryOp::Sub => match (
+			left_is_timestamp,
+			right_is_timestamp,
+			left_is_interval,
+			right_is_interval,
+		) {
+			(true, true, _, _) => {
+				let left_unit = timestamp_arithmetic_unit(left, "Timestamp - Timestamp")?;
+				let right_unit = timestamp_arithmetic_unit(right, "Timestamp - Timestamp")?;
+				if left_unit != right_unit {
+					return Err(BindingError::TypeMismatch {
+						message: "mixed-unit Timestamp - Timestamp is deferred in ADR 152"
+							.to_string(),
+					});
+				}
+				Ok(Some(interval_data_type()))
+			}
+			(true, false, false, true) => {
+				let unit = timestamp_arithmetic_unit(left, "Timestamp - Interval")?;
+				Ok(Some(DataType::Timestamp(unit, Some("UTC".into()))))
+			}
+			(false, true, true, false) => Err(BindingError::TypeMismatch {
+				message: "Interval - Timestamp is not supported".to_string(),
+			}),
+			(false, false, true, true) => Ok(Some(interval_data_type())),
+			(_, _, true, _) | (_, _, _, true) => Err(BindingError::TypeMismatch {
+				message: format!(
+					"Interval arithmetic expects Interval and UTC Timestamp operands, got {left:?} and {right:?}"
+				),
+			}),
+			_ => Ok(None),
+		},
+		BoundBinaryOp::Mul | BoundBinaryOp::Div => Ok(None),
+		BoundBinaryOp::Eq
+		| BoundBinaryOp::Neq
+		| BoundBinaryOp::Lt
+		| BoundBinaryOp::Lte
+		| BoundBinaryOp::Gt
+		| BoundBinaryOp::Gte
+		| BoundBinaryOp::And
+		| BoundBinaryOp::Or => Ok(None),
+	}
+}
+
+fn is_interval_type(data_type: &DataType) -> bool {
+	matches!(data_type, DataType::Duration(TimeUnit::Nanosecond))
+}
+
+fn timestamp_arithmetic_unit(
+	data_type: &DataType,
+	operator: &str,
+) -> Result<TimeUnit, BindingError> {
+	match data_type {
+		DataType::Timestamp(
+			unit @ (TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond),
+			Some(timezone),
+		) if timezone.as_ref() == "UTC" => Ok(*unit),
+		DataType::Timestamp(_, None) => Err(BindingError::TypeMismatch {
+			message: format!("{operator} does not support Timestamp without timezone"),
+		}),
+		DataType::Timestamp(_, Some(timezone)) if timezone.as_ref() != "UTC" => {
+			Err(BindingError::TypeMismatch {
+				message: format!("{operator} requires UTC Timestamp, got timezone {timezone}"),
+			})
+		}
+		DataType::Timestamp(unit, Some(_)) => Err(BindingError::TypeMismatch {
+			message: format!("{operator} does not support Timestamp unit {unit:?}"),
+		}),
+		other => Err(BindingError::TypeMismatch {
+			message: format!("{operator} expects Timestamp input, got {other:?}"),
+		}),
+	}
+}
+
+fn fold_temporal_arithmetic(
+	op: &BoundBinaryOp,
+	left: &ScalarValue,
+	right: &ScalarValue,
+	output_type: &DataType,
+) -> Result<ScalarValue, BindingError> {
+	if !literal_is_non_null(left) || !literal_is_non_null(right) {
+		return typed_null_for_data_type(output_type);
+	}
+	match (op, left, right) {
+		(
+			&BoundBinaryOp::Add,
+			ScalarValue::Timestamp {
+				value: Some(timestamp),
+				unit,
+			},
+			ScalarValue::Interval(Some(nanos)),
+		) => Ok(ScalarValue::Timestamp {
+			value: Some(checked_timestamp_interval_op(
+				*timestamp, *nanos, *unit, op,
+			)?),
+			unit: *unit,
+		}),
+		(
+			&BoundBinaryOp::Add,
+			ScalarValue::Interval(Some(nanos)),
+			ScalarValue::Timestamp {
+				value: Some(timestamp),
+				unit,
+			},
+		) => Ok(ScalarValue::Timestamp {
+			value: Some(checked_timestamp_interval_op(
+				*timestamp, *nanos, *unit, op,
+			)?),
+			unit: *unit,
+		}),
+		(
+			&BoundBinaryOp::Sub,
+			ScalarValue::Timestamp {
+				value: Some(timestamp),
+				unit,
+			},
+			ScalarValue::Interval(Some(nanos)),
+		) => Ok(ScalarValue::Timestamp {
+			value: Some(checked_timestamp_interval_op(
+				*timestamp, *nanos, *unit, op,
+			)?),
+			unit: *unit,
+		}),
+		(
+			&BoundBinaryOp::Sub,
+			ScalarValue::Timestamp {
+				value: Some(left),
+				unit,
+			},
+			ScalarValue::Timestamp {
+				value: Some(right),
+				unit: right_unit,
+			},
+		) if unit == right_unit => Ok(ScalarValue::Interval(Some(
+			checked_timestamp_difference_nanos(*left, *right, *unit)?,
+		))),
+		(
+			&BoundBinaryOp::Add,
+			ScalarValue::Interval(Some(left)),
+			ScalarValue::Interval(Some(right)),
+		) => Ok(ScalarValue::Interval(Some(
+			left.checked_add(*right)
+				.ok_or_else(|| temporal_arithmetic_overflow(op, output_type))?,
+		))),
+		(
+			&BoundBinaryOp::Sub,
+			ScalarValue::Interval(Some(left)),
+			ScalarValue::Interval(Some(right)),
+		) => Ok(ScalarValue::Interval(Some(
+			left.checked_sub(*right)
+				.ok_or_else(|| temporal_arithmetic_overflow(op, output_type))?,
+		))),
+		_ => Err(BindingError::TypeMismatch {
+			message: format!(
+				"unsupported temporal arithmetic literal operands: {left:?} and {right:?}"
+			),
+		}),
+	}
+}
+
+fn checked_timestamp_interval_op(
+	timestamp: i64,
+	interval_nanos: i64,
+	unit: TimeUnit,
+	op: &BoundBinaryOp,
+) -> Result<i64, BindingError> {
+	let interval_ticks = checked_interval_nanos_to_timestamp_ticks(interval_nanos, unit)?;
+	match op {
+		BoundBinaryOp::Add => timestamp.checked_add(interval_ticks),
+		BoundBinaryOp::Sub => timestamp.checked_sub(interval_ticks),
+		_ => None,
+	}
+	.ok_or_else(|| temporal_arithmetic_overflow(op, &DataType::Timestamp(unit, Some("UTC".into()))))
+}
+
+fn checked_timestamp_difference_nanos(
+	left: i64,
+	right: i64,
+	unit: TimeUnit,
+) -> Result<i64, BindingError> {
+	let diff = left.checked_sub(right).ok_or_else(|| {
+		temporal_arithmetic_overflow(
+			&BoundBinaryOp::Sub,
+			&DataType::Timestamp(unit, Some("UTC".into())),
+		)
+	})?;
+	let nanos_per_unit =
+		nanos_per_timestamp_unit(unit).ok_or_else(|| BindingError::TypeMismatch {
+			message: format!("Timestamp unit {unit:?} is not supported for interval arithmetic"),
+		})?;
+	diff.checked_mul(nanos_per_unit)
+		.ok_or_else(|| temporal_arithmetic_overflow(&BoundBinaryOp::Sub, &interval_data_type()))
+}
+
+fn checked_interval_nanos_to_timestamp_ticks(
+	interval_nanos: i64,
+	unit: TimeUnit,
+) -> Result<i64, BindingError> {
+	let nanos_per_unit =
+		nanos_per_timestamp_unit(unit).ok_or_else(|| BindingError::TypeMismatch {
+			message: format!("Timestamp unit {unit:?} is not supported for interval arithmetic"),
+		})?;
+	if interval_nanos % nanos_per_unit != 0 {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"interval nanoseconds {interval_nanos} are not exactly representable at {} precision",
+				timestamp_precision_name(unit)
+			),
+		});
+	}
+	Ok(interval_nanos / nanos_per_unit)
+}
+
+fn timestamp_precision_name(unit: TimeUnit) -> &'static str {
+	match unit {
+		TimeUnit::Second => "second",
+		TimeUnit::Millisecond => "millisecond",
+		TimeUnit::Microsecond => "microsecond",
+		TimeUnit::Nanosecond => "nanosecond",
+	}
+}
+
+fn temporal_arithmetic_overflow(op: &BoundBinaryOp, data_type: &DataType) -> BindingError {
+	BindingError::TypeMismatch {
+		message: format!(
+			"temporal arithmetic overflow: {}({data_type:?})",
+			bound_arithmetic_name(op)
+		),
+	}
+}
+
+fn bound_arithmetic_name(op: &BoundBinaryOp) -> &'static str {
+	match op {
+		BoundBinaryOp::Add => "add",
+		BoundBinaryOp::Sub => "sub",
+		BoundBinaryOp::Mul => "mul",
+		BoundBinaryOp::Div => "div",
+		BoundBinaryOp::Eq
+		| BoundBinaryOp::Neq
+		| BoundBinaryOp::Lt
+		| BoundBinaryOp::Lte
+		| BoundBinaryOp::Gt
+		| BoundBinaryOp::Gte
+		| BoundBinaryOp::And
+		| BoundBinaryOp::Or => "non-arithmetic",
+	}
+}
+
 fn bind_logical_ascription(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
@@ -7371,6 +7673,17 @@ fn bind_arithmetic(
 		.node_type(right)
 		.cloned()
 		.expect("builder returns typed right node");
+	if let Some(output_type) = temporal_arithmetic_output_type(&op, &left_type, &right_type)? {
+		if let (Some(left_literal), Some(right_literal)) = (
+			builder.literal(left).cloned(),
+			builder.literal(right).cloned(),
+		) {
+			let folded =
+				fold_temporal_arithmetic(&op, &left_literal, &right_literal, &output_type)?;
+			return Ok(builder.append_literal(folded));
+		}
+		return Ok(builder.append_binary(op, left, right, output_type));
+	}
 	let output_type =
 		arithmetic_output_type(&left_type, &right_type).ok_or_else(|| {
 			BindingError::TypeMismatch {
@@ -8450,14 +8763,16 @@ mod tests {
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::sql_planner::SqlPlanner;
 	use arrow::array::{
-		ArrayRef, BinaryArray, Date32Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-		TimestampMillisecondArray,
+		ArrayRef, BinaryArray, Date32Array, DurationNanosecondArray, Int32Array, Int64Array,
+		LargeStringArray, StringArray, TimestampMillisecondArray,
 	};
 	use arrow::datatypes::{Field, Schema};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
 	};
+
+	const DAY_NANOS: i64 = 86_400_000_000_000;
 
 	#[test]
 	fn predicate_pushdown_emitted_splits_preserve_kleene_3vl() {
@@ -11662,6 +11977,354 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn timestamp_plus_interval_preserves_utc_instant_type() {
+		let program = bind_temporal_expr(
+			Expr::Add(
+				Box::new(Expr::column("event_time")),
+				Box::new(interval_literal(DAY_NANOS)),
+			),
+			"UTC",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-01T00:00:00Z"), 0),
+		)
+		.expect("evaluate timestamp + interval");
+		let values = outputs[0]
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("timestamp output");
+
+		assert_eq!(values.value(0), timestamp_ms("2024-01-02T00:00:00Z"));
+		assert_eq!(
+			values.data_type(),
+			&DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+		);
+	}
+
+	#[test]
+	fn timestamp_minus_interval_preserves_utc_instant_type() {
+		let program = bind_temporal_expr(
+			Expr::Sub(
+				Box::new(Expr::column("event_time")),
+				Box::new(interval_literal(DAY_NANOS)),
+			),
+			"UTC",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-02T00:00:00Z"), 0),
+		)
+		.expect("evaluate timestamp - interval");
+		let values = outputs[0]
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("timestamp output");
+
+		assert_eq!(values.value(0), timestamp_ms("2024-01-01T00:00:00Z"));
+		assert_eq!(
+			values.data_type(),
+			&DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+		);
+	}
+
+	#[test]
+	fn timestamp_minus_timestamp_returns_interval_in_shared_unit() {
+		let program = bind_temporal_expr(
+			Expr::Sub(
+				Box::new(Expr::column("event_time")),
+				Box::new(Expr::Literal(ScalarValue::Timestamp {
+					value: Some(timestamp_ms("2024-01-01T00:00:00Z")),
+					unit: TimeUnit::Millisecond,
+				})),
+			),
+			"UTC",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-02T00:00:00Z"), 0),
+		)
+		.expect("evaluate timestamp - timestamp");
+		let values = outputs[0]
+			.as_any()
+			.downcast_ref::<DurationNanosecondArray>()
+			.expect("duration output");
+
+		assert_eq!(values.value(0), DAY_NANOS);
+		assert_eq!(
+			program.node_type(program.roots[0]),
+			Some(&DataType::Duration(TimeUnit::Nanosecond))
+		);
+	}
+
+	#[test]
+	fn mixed_unit_timestamp_difference_rejects_in_v1() {
+		let err = try_bind_temporal_expr(
+			Expr::Sub(
+				Box::new(Expr::column("event_time")),
+				Box::new(Expr::Literal(ScalarValue::Timestamp {
+					value: Some(timestamp_ns("2024-01-01T00:00:00Z")),
+					unit: TimeUnit::Nanosecond,
+				})),
+			),
+			"UTC",
+		)
+		.expect_err("mixed timestamp units should reject");
+
+		assert!(
+			err.to_string()
+				.contains("mixed-unit Timestamp - Timestamp is deferred")
+		);
+	}
+
+	#[test]
+	fn interval_plus_interval_returns_interval() {
+		let program = bind_temporal_expr(
+			Expr::Add(
+				Box::new(interval_literal(1_000_000_000)),
+				Box::new(interval_literal(2_000_000_000)),
+			),
+			"UTC",
+		);
+		let root = program.single_root().expect("single root");
+		let Some(BoundExprNode::Literal(slot)) = program.node(root) else {
+			panic!("expected folded interval literal");
+		};
+
+		assert_eq!(
+			program.literals[*slot as usize],
+			ScalarValue::Interval(Some(3_000_000_000))
+		);
+		assert_eq!(
+			program.node_type(root),
+			Some(&DataType::Duration(TimeUnit::Nanosecond))
+		);
+	}
+
+	#[test]
+	fn interval_comparison_orders_fixed_durations() {
+		let program = bind_temporal_expr(
+			Expr::Gt(
+				Box::new(interval_literal(2 * DAY_NANOS)),
+				Box::new(interval_literal(DAY_NANOS)),
+			),
+			"UTC",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-01T00:00:00Z"), 0),
+		)
+		.expect("evaluate interval comparison");
+		let values = outputs[0]
+			.as_any()
+			.downcast_ref::<BooleanArray>()
+			.expect("boolean output");
+
+		assert!(values.value(0));
+	}
+
+	#[test]
+	fn timestamp_plus_timestamp_rejects() {
+		let err = try_bind_temporal_expr(
+			Expr::Add(
+				Box::new(Expr::column("event_time")),
+				Box::new(Expr::Literal(ScalarValue::Timestamp {
+					value: Some(timestamp_ms("2024-01-01T00:00:00Z")),
+					unit: TimeUnit::Millisecond,
+				})),
+			),
+			"UTC",
+		)
+		.expect_err("timestamp + timestamp should reject");
+
+		assert!(err.to_string().contains("Timestamp + Timestamp"));
+	}
+
+	#[test]
+	fn interval_day_is_fixed_86400s_not_civil() {
+		let plan = SqlPlanner::new()
+			.plan("SELECT INTERVAL '1 day' FROM sales")
+			.expect("plan interval day");
+		let LogicalPlan::Project { exprs, .. } = plan else {
+			panic!("expected project");
+		};
+
+		assert!(matches!(
+			&exprs[0],
+			Expr::Literal(ScalarValue::Interval(Some(value))) if *value == DAY_NANOS
+		));
+	}
+
+	#[test]
+	fn non_representable_interval_precision_rejects() {
+		let err = try_bind_temporal_expr(
+			Expr::Add(
+				Box::new(Expr::Literal(ScalarValue::Timestamp {
+					value: Some(timestamp_ms("2024-01-01T00:00:00Z")),
+					unit: TimeUnit::Millisecond,
+				})),
+				Box::new(interval_literal(1_000)),
+			),
+			"UTC",
+		)
+		.expect_err("literal microsecond interval should not fold against millisecond timestamp");
+
+		assert!(
+			err.to_string()
+				.contains("not exactly representable at millisecond precision")
+		);
+	}
+
+	#[test]
+	fn non_representable_interval_precision_runtime_rejects() {
+		let program = bind_temporal_expr(
+			Expr::Add(
+				Box::new(Expr::column("event_time")),
+				Box::new(interval_literal(1_000)),
+			),
+			"UTC",
+		);
+		let err = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-01T00:00:00Z"), 0),
+		)
+		.expect_err("runtime microsecond interval should reject against millisecond timestamp");
+
+		assert!(
+			err.to_string()
+				.contains("not exactly representable at millisecond precision")
+		);
+	}
+
+	#[test]
+	fn calendar_month_year_interval_literal_rejects_in_v1() {
+		for sql in [
+			"SELECT INTERVAL '1 month' FROM sales",
+			"SELECT INTERVAL '1' YEAR FROM sales",
+		] {
+			let err = SqlPlanner::new()
+				.plan(sql)
+				.expect_err("calendar interval should reject");
+			assert!(err.to_string().contains("calendar INTERVAL unit"));
+		}
+	}
+
+	#[test]
+	fn date32_plus_interval_rejects_in_v1() {
+		let err = try_bind_temporal_expr(
+			Expr::Add(
+				Box::new(Expr::column("signup_date")),
+				Box::new(interval_literal(DAY_NANOS)),
+			),
+			"UTC",
+		)
+		.expect_err("Date32 + interval should reject");
+
+		assert!(err.to_string().contains("Date32 +/- Interval is deferred"));
+	}
+
+	#[tokio::test]
+	async fn rune_interval_arithmetic_matches_sql() {
+		let sql = SqlPlanner::new()
+			.plan("SELECT observed_at - INTERVAL '7 days' FROM customers")
+			.expect("plan SQL interval arithmetic");
+		let rune = rune_plan(
+			r#"
+            pub fn main(ctx) {
+                ctx.table("customers").project([col("observed_at").sub(days(7))])
+            }
+        "#,
+		)
+		.await;
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(10),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new(
+					"observed_at",
+					crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond),
+					true,
+				),
+			]),
+			Vec::new(),
+		);
+
+		for logical in [sql, rune] {
+			let ExecutionPlan::Project { exprs, .. } =
+				bind(&logical, &catalog, &PlannerConfig::default())
+					.await
+					.expect("bind interval project")
+			else {
+				panic!("expected project");
+			};
+			let root = exprs.single_root().expect("single root");
+			assert_eq!(
+				exprs.node_type(root),
+				Some(&DataType::Timestamp(
+					TimeUnit::Millisecond,
+					Some("UTC".into())
+				))
+			);
+			let Some(BoundExprNode::Binary { op, right, .. }) = exprs.node(root) else {
+				panic!("expected timestamp - interval binary");
+			};
+			assert_eq!(*op, BoundBinaryOp::Sub);
+			assert_eq!(
+				exprs.node_type(*right),
+				Some(&DataType::Duration(TimeUnit::Nanosecond))
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn relative_interval_filter_spends_timestamp_range_fact() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new(
+					"observed_at",
+					crate::timestamp::utc_timestamp_data_type(TimeUnit::Nanosecond),
+					true,
+				),
+			]),
+			Vec::new(),
+			vec![(
+				ColumnOrdinal(1),
+				range_fact_timestamp_ns(
+					timestamp_ns("2025-12-01T00:00:00Z"),
+					timestamp_ns("2026-02-01T00:00:00Z"),
+					20_000,
+				),
+			)],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.observed_at > TIMESTAMPTZ '2026-01-01T00:00:00Z' - INTERVAL '7 days'",
+			)
+			.expect("plan relative interval filter");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind relative interval range-estimated join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
 	#[tokio::test]
 	async fn timestamp_precision_loss_in_target_unit_is_bind_error() {
 		let instant = timestamp_ms("2024-01-01T00:00:00Z");
@@ -13848,9 +14511,28 @@ mod tests {
 		}
 	}
 
+	fn range_fact_timestamp_ns(min: i64, max: i64, non_null_count: u64) -> RangeFact {
+		RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
+			null_count: 0,
+			non_null_count,
+			min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(min, 8).unwrap()),
+			max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(max, 8).unwrap()),
+		}
+	}
+
 	fn timestamp_ms(value: &str) -> i64 {
 		crate::timestamp::parse_explicit_timestamptz(value, TimeUnit::Millisecond)
 			.expect("timestamp literal")
+	}
+
+	fn timestamp_ns(value: &str) -> i64 {
+		crate::timestamp::parse_explicit_timestamptz(value, TimeUnit::Nanosecond)
+			.expect("timestamp literal")
+	}
+
+	fn interval_literal(nanos: i64) -> Expr {
+		Expr::Literal(ScalarValue::Interval(Some(nanos)))
 	}
 
 	fn temporal_schema() -> SchemaRef {
@@ -13878,6 +14560,13 @@ mod tests {
 	}
 
 	fn bind_temporal_expr(expr: Expr, session_timezone: &str) -> BoundExprProgram {
+		try_bind_temporal_expr(expr, session_timezone).expect("bind temporal expr")
+	}
+
+	fn try_bind_temporal_expr(
+		expr: Expr,
+		session_timezone: &str,
+	) -> Result<BoundExprProgram, BindingError> {
 		let config = PlannerConfig::default().with_session_timezone(session_timezone);
 		let logical_casts = HashMap::new();
 		let ctx = ExprBindContext {
@@ -13888,7 +14577,7 @@ mod tests {
 			logical_casts: &logical_casts,
 			relation_scope: None,
 		};
-		bind_expr_program(&[expr], &temporal_schema(), &ctx).expect("bind temporal expr")
+		bind_expr_program(&[expr], &temporal_schema(), &ctx)
 	}
 
 	fn range_fact_f64(min: f64, max: f64, non_null_count: u64) -> RangeFact {

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use arrow::array::{
-	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Builder, Float32Array, Float32Builder,
-	Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray,
-	StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
-	TimestampNanosecondBuilder,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Builder, DurationNanosecondBuilder,
+	Float32Array, Float32Builder, Float64Array, Float64Builder, Int32Array, Int32Builder,
+	Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMicrosecondBuilder,
+	TimestampMillisecondBuilder, TimestampNanosecondBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -530,6 +530,17 @@ fn build_array(
 		}
 		DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "UTC" => {
 			build_timestamp_array(*unit, rows, field_index)
+		}
+		DataType::Duration(TimeUnit::Nanosecond) => {
+			let mut builder = DurationNanosecondBuilder::with_capacity(rows.len());
+			for row in rows {
+				match scalar_at(row, field_index)? {
+					ScalarValue::Interval(Some(value)) => builder.append_value(*value),
+					ScalarValue::Interval(None) => builder.append_null(),
+					other => return Err(type_mismatch(field_index, "Duration(Nanosecond)", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
 		}
 		DataType::Float32 => {
 			let mut builder = Float32Builder::with_capacity(rows.len());
