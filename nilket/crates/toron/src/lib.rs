@@ -30,10 +30,12 @@ mod tests {
 	use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
-	use std::collections::{BTreeMap, HashMap, HashSet};
+	use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 	use std::sync::Arc;
 
-	use crate::binder::{PlannerConfig, bind};
+	use crate::binder::{
+		BroadcastBuildSide, JoinStrategyDecisionReason, PlannerConfig, bind, bind_with_trace,
+	};
 	use crate::catalog::{DistinctCountFact, MockCatalog, TableOptimizerFacts};
 	use crate::coordinator::DistributedQueryCoordinator;
 	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
@@ -45,7 +47,9 @@ mod tests {
 	use crate::distributed::partition_store::{
 		HybridPartitionStore, InMemoryPartitionStore, PartitionPayload, PartitionStore,
 	};
-	use crate::distributed::scheduler::{DistributedScheduler, StagePlan, TaskPlan};
+	use crate::distributed::scheduler::{
+		DistributedScheduler, SchedulerError, StagePlan, TaskPlan,
+	};
 	use crate::distributed::task::{
 		ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionCount, PartitionManifest,
 		ProducerPartitionRef, RowCount, TaskCompletionOutput, TaskInputBinding, TaskOutputBinding,
@@ -56,12 +60,12 @@ mod tests {
 		ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
 		WorkerEndpoint, WorkerEntry, WorkerLease, WorkerResourceState, WorkerStatus,
 	};
-	use crate::error::{QueryError, StorageError, TaskFailureKind};
+	use crate::error::{QueryError, RuntimeError, StorageError, TaskFailureKind};
 	use crate::exec::Executor;
 	use crate::ir::{
 		AggregateFunction, BoundExprProgram, ColumnOrdinal, ExecutionPlan, Expr, JoinKind,
-		JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, MorselId,
-		ScalarValue, SortExpr, StageId, TableId,
+		JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
+		MorselId, ScalarValue, SortExpr, StageId, TableId,
 	};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::server::{
@@ -986,6 +990,88 @@ mod tests {
 		assert_fact_dim_join_matches_hash(&hash_results, &replay_results);
 	}
 
+	mod skew_evidence {
+		use super::*;
+
+		#[tokio::test]
+		async fn uniform_ndv_hot_key_miss_triggers_broadcast_replay() {
+			let fixture = skewed_join_fixture();
+			let auto_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_skewed_hot_key_binds_as_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+			let hash_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					hash_plan,
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
+						..PlannerConfig::default()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash skewed join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let replay =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					PlannerConfig::default(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("skewed NDV-estimated broadcast should replay as hash");
+
+			assert!(
+				replay.replayed,
+				"expected broadcast-cap replay for hot-key miss"
+			);
+			assert_skewed_join_matches_hash(&hash.results, &replay.results);
+		}
+
+		#[tokio::test]
+		async fn uniform_ndv_miss_within_headroom_is_absorbed_no_replay() {
+			let fixture = skewed_join_fixture();
+			let auto_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_skewed_hot_key_binds_as_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+			let actual_hot_rows = fixture.actual_hot_rows;
+
+			let run =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					PlannerConfig::default(),
+					QueryBudget::test_default(),
+					fixture.storage,
+				)
+				.await
+				.expect("absorbed skew miss should complete as broadcast");
+
+			assert!(
+				!run.replayed,
+				"hot-key miss under the runtime cap should not need hash replay"
+			);
+			assert_eq!(
+				run.results.iter().map(RecordBatch::num_rows).sum::<usize>(),
+				actual_hot_rows
+			);
+		}
+	}
+
 	#[tokio::test]
 	async fn hard_bound_broadcast_over_cap_replays_as_hash_and_matches_digest() {
 		let hash_results = run_distributed_join_query(sql_fact_dim_join_plan(), 16).await;
@@ -1823,6 +1909,73 @@ mod tests {
 		})
 	}
 
+	struct SkewedJoinFixture {
+		catalog: Arc<MockCatalog>,
+		storage: Arc<dyn StorageScan>,
+		actual_hot_rows: usize,
+	}
+
+	fn skewed_join_fixture() -> SkewedJoinFixture {
+		const BASE_ROWS: usize = 10_000;
+		const HOT_ROWS: usize = 5_000;
+		const NDV: u64 = 100;
+
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let customers_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::Utf8, true),
+		]));
+		let orders = RecordBatch::try_new(
+			orders_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..BASE_ROWS as i64)),
+				Arc::new(Int64Array::from_iter_values(0..BASE_ROWS as i64)),
+			],
+		)
+		.expect("skewed orders");
+		let mut regions = Vec::with_capacity(BASE_ROWS);
+		for row in 0..BASE_ROWS {
+			if row < HOT_ROWS {
+				regions.push(Some("hot".to_string()));
+			} else {
+				let tail = (row - HOT_ROWS) % (NDV as usize - 1);
+				regions.push(Some(format!("tail_{tail}")));
+			}
+		}
+		let customers = RecordBatch::try_new(
+			customers_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..BASE_ROWS as i64)),
+				Arc::new(StringArray::from(regions)),
+			],
+		)
+		.expect("skewed customers");
+		let storage = Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([(TableId(1), orders), (TableId(2), customers)]),
+		});
+		let mut catalog = join_catalog_inner();
+		catalog
+			.seed_optimizer_facts(
+				&crate::catalog::TableRef::new("customers"),
+				TableOptimizerFacts {
+					byte_upper_bound: None,
+					row_upper_bound: Some(RowCount::new(BASE_ROWS as u64)),
+					column_ndv: BTreeMap::from([(ColumnOrdinal(1), DistinctCountFact::Exact(NDV))]),
+					column_range: Default::default(),
+				},
+			)
+			.expect("seed skewed customers optimizer facts");
+
+		SkewedJoinFixture {
+			catalog: Arc::new(catalog),
+			storage,
+			actual_hot_rows: HOT_ROWS,
+		}
+	}
+
 	fn outer_join_counterexample_catalog() -> Arc<MockCatalog> {
 		let mut catalog = MockCatalog::new();
 		for (table_id, id_byte, table, fields) in [
@@ -2014,6 +2167,34 @@ mod tests {
 				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
 			)],
 			strategy_intent: JoinStrategyIntent::Auto,
+		}
+	}
+
+	fn skewed_hot_key_fact_dim_join_plan(strategy_intent: JoinStrategyIntent) -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: crate::catalog::TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::Filter {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("customers"),
+					projection: None,
+				}),
+				predicate: Expr::Eq(
+					Box::new(Expr::qualified_column(
+						crate::catalog::TableRef::new("customers"),
+						"region",
+					)),
+					Box::new(Expr::Literal(ScalarValue::Utf8(Some("hot".to_string())))),
+				),
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+			)],
+			strategy_intent,
 		}
 	}
 
@@ -2226,6 +2407,150 @@ mod tests {
 		results
 	}
 
+	struct ReplaySignalRun {
+		results: Vec<RecordBatch>,
+		replayed: bool,
+	}
+
+	async fn run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+		plan: LogicalPlan,
+		catalog: Arc<MockCatalog>,
+		planner_config: PlannerConfig,
+		query_budget: QueryBudget,
+		storage: Arc<dyn StorageScan>,
+	) -> Result<ReplaySignalRun, QueryError> {
+		let memory = test_memory();
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+		let endpoint = WorkerEndpoint::new(listener.local_addr()?.to_string());
+		let worker_id = WorkerId::from_u128(101);
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			storage,
+			memory.clone(),
+			Arc::new(InMemoryPartitionStore::new()),
+			worker_id,
+			endpoint.clone(),
+		));
+		let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+		let server_handle = tokio::spawn(async move {
+			let mut handles = Vec::new();
+			loop {
+				tokio::select! {
+					accepted = listener.accept() => {
+						let (server_stream, _) = accepted.unwrap();
+						let worker = worker.clone();
+						handles.push(tokio::spawn(async move {
+							worker.handle_connection(server_stream).await.unwrap();
+						}));
+					}
+					_ = shutdown_rx.changed() => {
+						break;
+					}
+				}
+			}
+			for handle in handles {
+				handle.await.unwrap();
+			}
+		});
+		let registry = Arc::new(StaticWorkerRegistry::new([WorkerEntry {
+			worker_id,
+			endpoint,
+			lease: WorkerLease {
+				last_heartbeat: UnixMillis::new(1),
+				epoch: LeaseEpoch::new(1),
+			},
+			capabilities: WorkerCapabilities {
+				advertised_memory: ByteCount::new(1024 * 1024),
+				simd_width: SimdLaneCount::new(8),
+				spill_capacity_reserved: ByteCount::new(1024 * 1024),
+			},
+			resources: WorkerResourceState {
+				in_flight: ByteCount::ZERO,
+				active_tasks: ActiveTaskCount::default(),
+			},
+			status: WorkerStatus::Live,
+		}]));
+
+		let result = run_distributed_attempts_with_replay_signal(
+			plan,
+			catalog,
+			registry,
+			memory,
+			planner_config,
+			query_budget,
+		)
+		.await;
+		shutdown_tx.send(true).unwrap();
+		server_handle.await.unwrap();
+		result
+	}
+
+	async fn run_distributed_attempts_with_replay_signal(
+		plan: LogicalPlan,
+		catalog: Arc<MockCatalog>,
+		registry: Arc<StaticWorkerRegistry>,
+		memory: Arc<MemoryManager>,
+		mut planner_config: PlannerConfig,
+		query_budget: QueryBudget,
+	) -> Result<ReplaySignalRun, QueryError> {
+		let query_id = QueryId::new();
+		let mut replayed = false;
+		let mut fragment_id_namespace = 0_u32;
+		loop {
+			let bound = bind(&plan, catalog.as_ref(), &planner_config).await?;
+			let stages = fragment_plan(
+				bound,
+				FragmentPlanConfig::new(query_id, TaskBudget::from_query_budget(query_budget))
+					.with_id_namespace(fragment_id_namespace),
+			)
+			.map_err(|error| QueryError::Remote {
+				message: format!("{error:?}"),
+			})?;
+			let mut scheduler = DistributedScheduler::new(registry.clone())
+				.with_max_in_flight_tasks(query_budget.max_in_flight_tasks);
+			let dispatcher = NetworkTaskDispatcher::new(memory.clone(), TcpTransport::new());
+			match scheduler.dispatch_loop(&stages, &dispatcher).await {
+				Ok(run) => {
+					return Ok(ReplaySignalRun {
+						results: run.final_results,
+						replayed,
+					});
+				}
+				Err(error) if !replayed && broadcast_replication_exhausted(&error) => {
+					planner_config.force_hash_join_ids = BTreeSet::from([JoinReplayId(0)]);
+					fragment_id_namespace = fragment_id_namespace
+						.checked_add(1)
+						.expect("test fragment namespace overflow");
+					replayed = true;
+				}
+				Err(error) => return Err(scheduler_error_for_test(error)),
+			}
+		}
+	}
+
+	fn broadcast_replication_exhausted(error: &SchedulerError) -> bool {
+		matches!(
+			error,
+			SchedulerError::TaskFailed {
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::BroadcastReplication,
+					..
+				},
+				..
+			}
+		)
+	}
+
+	fn scheduler_error_for_test(error: SchedulerError) -> QueryError {
+		match error {
+			SchedulerError::TaskFailed { kind, .. } => {
+				QueryError::Runtime(RuntimeError::TaskFailure { kind })
+			}
+			other => QueryError::Remote {
+				message: format!("{other:?}"),
+			},
+		}
+	}
+
 	fn assert_fact_dim_join_matches_hash(
 		hash_results: &[RecordBatch],
 		broadcast_results: &[RecordBatch],
@@ -2245,6 +2570,50 @@ mod tests {
 			canonical_arrow_ipc_digest(broadcast_results, SortPolicy::FullRowLex)
 				.expect("right-build broadcast digest"),
 			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	async fn assert_skewed_hot_key_binds_as_estimated_broadcast(
+		plan: &LogicalPlan,
+		catalog: &MockCatalog,
+	) {
+		let (_bound, trace) = bind_with_trace(plan, catalog, &PlannerConfig::default())
+			.await
+			.expect("bind skewed hot-key join with trace");
+		assert_eq!(trace.join_decisions.len(), 1);
+		match trace.join_decisions[0].reason {
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side,
+				estimated_byte_size,
+				threshold,
+				..
+			} => {
+				assert_eq!(build_side, BroadcastBuildSide::Right);
+				assert!(estimated_byte_size < threshold);
+			}
+			other => panic!("expected estimated broadcast for skewed hot key, got {other:?}"),
+		}
+	}
+
+	fn assert_skewed_join_matches_hash(
+		hash_results: &[RecordBatch],
+		broadcast_results: &[RecordBatch],
+	) {
+		assert!(!hash_results.is_empty());
+		assert!(!broadcast_results.is_empty());
+		assert_eq!(
+			field_names(hash_results[0].schema().as_ref()),
+			vec!["id", "customer_id", "id", "region"]
+		);
+		assert_eq!(
+			field_names(broadcast_results[0].schema().as_ref()),
+			vec!["id", "customer_id", "id", "region"]
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(broadcast_results, SortPolicy::FullRowLex)
+				.expect("skew replay digest"),
+			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex)
+				.expect("skew hash digest")
 		);
 	}
 

@@ -10792,6 +10792,126 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn skewed_hot_key_filter_records_uniform_ndv_miss() {
+		const BASE_ROWS: u64 = 10_000;
+		const NDV: u64 = 100;
+		const ACTUAL_HOT_ROWS: u64 = 5_000;
+		const MISS_RATIO_THRESHOLD: u64 = 25;
+		let uniform_estimate = RowCount::new(BASE_ROWS.div_ceil(NDV));
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(BASE_ROWS),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(NDV))],
+		);
+
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Eq(
+				Box::new(customer_column("region")),
+				Box::new(utf8_literal("hot")),
+			),
+		)
+		.await
+		.expect("bind skewed hot-key equality filter");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(BASE_ROWS)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(uniform_estimate));
+		assert!(
+			ACTUAL_HOT_ROWS >= uniform_estimate.get() * MISS_RATIO_THRESHOLD,
+			"expected hot-key actual rows {ACTUAL_HOT_ROWS} to materially exceed uniform estimate {:?}",
+			uniform_estimate
+		);
+	}
+
+	#[tokio::test]
+	async fn uniform_ndv_hot_key_in_list_miss_is_measured() {
+		const BASE_ROWS: u64 = 10_000;
+		const NDV: u64 = 100;
+		const ACTUAL_HOT_ROWS: u64 = 5_000;
+		const ACTUAL_TAIL0_ROWS: u64 = 51;
+		const MISS_RATIO_THRESHOLD: u64 = 20;
+		let rows_per_value = BASE_ROWS.div_ceil(NDV);
+		let expected_estimate = RowCount::new(rows_per_value * 2);
+		let actual_rows = ACTUAL_HOT_ROWS + ACTUAL_TAIL0_ROWS;
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(BASE_ROWS),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(NDV))],
+		);
+
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![utf8_literal("hot"), utf8_literal("tail_0")],
+				false,
+			),
+		)
+		.await
+		.expect("bind skewed hot-key IN-list filter");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(BASE_ROWS)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(expected_estimate));
+		assert!(
+			actual_rows >= expected_estimate.get() * MISS_RATIO_THRESHOLD,
+			"expected IN-list actual rows {actual_rows} to materially exceed uniform estimate {:?}",
+			expected_estimate
+		);
+	}
+
+	#[tokio::test]
+	async fn skew_miss_measurement_does_not_change_estimated_row_count() {
+		const BASE_ROWS: u64 = 10_000;
+		const NDV: u64 = 100;
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(BASE_ROWS),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(NDV))],
+		);
+
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Eq(
+				Box::new(customer_column("region")),
+				Box::new(utf8_literal("hot")),
+			),
+		)
+		.await
+		.expect("bind skew evidence filter");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(BASE_ROWS.div_ceil(NDV)))
+		);
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(BASE_ROWS)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert!(scoped.facts.estimated_byte_size.is_some());
+	}
+
+	#[tokio::test]
+	async fn non_ndv_filters_do_not_emit_skew_evidence() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(10_000));
+
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Eq(
+				Box::new(customer_column("region")),
+				Box::new(utf8_literal("hot")),
+			),
+		)
+		.await
+		.expect("bind non-NDV equality filter");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(10_000)));
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
 	async fn not_in_does_not_use_ndv_selectivity() {
 		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
 			Some(64 * 1024 * 1024),
