@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use crate::date32::parse_date_ymd;
 use arrow::array::{Array, BooleanArray};
-use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use chrono_tz::Tz;
 
 use crate::aggregate_kernel::{
 	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
@@ -38,10 +39,11 @@ use wendelon::schema::{
 };
 use wendelon_client::{
 	ARROW_STATS_TAG_DATE32, ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64,
-	ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64, LogicalTypeRefinementComparisonOp,
-	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor,
-	decode_float32_optimizer_fact_scalar, decode_float64_optimizer_fact_scalar,
-	decode_signed_optimizer_fact_scalar,
+	ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_TIMESTAMP_MICROSECOND,
+	ARROW_STATS_TAG_TIMESTAMP_MILLISECOND, ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
+	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
+	TableSchemaDescriptor, decode_float32_optimizer_fact_scalar,
+	decode_float64_optimizer_fact_scalar, decode_signed_optimizer_fact_scalar,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -72,6 +74,7 @@ pub struct PlannerConfig {
 	pub allow_experimental_kernels: bool,
 	pub auto_broadcast_max_build_bytes: Option<ByteCount>,
 	pub force_hash_join_ids: BTreeSet<JoinReplayId>,
+	pub session_timezone: String,
 }
 
 impl Default for PlannerConfig {
@@ -80,7 +83,23 @@ impl Default for PlannerConfig {
 			allow_experimental_kernels: false,
 			auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
 			force_hash_join_ids: BTreeSet::new(),
+			session_timezone: "UTC".to_string(),
 		}
+	}
+}
+
+impl PlannerConfig {
+	pub fn with_session_timezone(mut self, session_timezone: impl Into<String>) -> Self {
+		self.session_timezone = session_timezone.into();
+		self
+	}
+
+	fn resolved_session_timezone(&self) -> Result<Tz, BindingError> {
+		crate::timestamp::parse_session_timezone(&self.session_timezone).map_err(|error| {
+			BindingError::TypeMismatch {
+				message: error.to_string(),
+			}
+		})
 	}
 }
 
@@ -484,6 +503,7 @@ struct BuildByteCandidate {
 
 struct ExprBindContext<'a> {
 	config: &'a PlannerConfig,
+	session_timezone: Tz,
 	logical_casts: &'a HashMap<String, LogicalTypeSpec>,
 	relation_scope: Option<&'a RelationScope>,
 }
@@ -924,6 +944,7 @@ impl<'a> Binder<'a> {
 		let logical_casts = self.resolve_logical_casts(exprs).await?;
 		let ctx = ExprBindContext {
 			config: self.config,
+			session_timezone: self.config.resolved_session_timezone()?,
 			logical_casts: &logical_casts,
 			relation_scope,
 		};
@@ -958,6 +979,7 @@ impl<'a> Binder<'a> {
 		let logical_casts = self.resolve_logical_casts(exprs).await?;
 		let ctx = ExprBindContext {
 			config: self.config,
+			session_timezone: self.config.resolved_session_timezone()?,
 			logical_casts: &logical_casts,
 			relation_scope,
 		};
@@ -990,6 +1012,7 @@ impl<'a> Binder<'a> {
 		let logical_casts = self.resolve_logical_casts(args).await?;
 		let ctx = ExprBindContext {
 			config: self.config,
+			session_timezone: self.config.resolved_session_timezone()?,
 			logical_casts: &logical_casts,
 			relation_scope,
 		};
@@ -1121,6 +1144,7 @@ impl<'a> Binder<'a> {
 			.map(|column| column.0 as usize)
 			.collect::<Vec<_>>();
 		let expected_arity = target_indices.len();
+		let session_timezone = self.config.resolved_session_timezone()?;
 
 		let mut bound_rows = Vec::with_capacity(rows.len());
 		for (row_index, row) in rows.iter().enumerate() {
@@ -1137,15 +1161,18 @@ impl<'a> Binder<'a> {
 			let bound_row = if columns.is_none() {
 				row.iter()
 					.zip(schema_fields.iter())
-					.map(|(literal, field)| coerce_insert_literal(literal, field))
+					.map(|(literal, field)| coerce_insert_literal(literal, field, session_timezone))
 					.collect::<Result<Vec<_>, _>>()?
 			} else {
 				let mut values = vec![None; schema_fields.len()];
 				for ((literal, target_index), _position) in
 					row.iter().zip(target_indices.iter().copied()).zip(0..)
 				{
-					values[target_index] =
-						Some(coerce_insert_literal(literal, schema.field(target_index))?);
+					values[target_index] = Some(coerce_insert_literal(
+						literal,
+						schema.field(target_index),
+						session_timezone,
+					)?);
 				}
 				for (field_index, value) in values.iter_mut().enumerate() {
 					if value.is_none() {
@@ -1828,6 +1855,18 @@ fn typed_null_for_data_type(data_type: &DataType) -> Result<ScalarValue, Binding
 		DataType::Int32 => Ok(ScalarValue::Int32(None)),
 		DataType::Int64 => Ok(ScalarValue::Int64(None)),
 		DataType::Date32 => Ok(ScalarValue::Date32(None)),
+		DataType::Timestamp(unit, Some(timezone))
+			if timezone.as_ref() == "UTC"
+				&& matches!(
+					unit,
+					TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond
+				) =>
+		{
+			Ok(ScalarValue::Timestamp {
+				value: None,
+				unit: *unit,
+			})
+		}
 		DataType::Float32 => Ok(ScalarValue::Float32(None)),
 		DataType::Float64 => Ok(ScalarValue::Float64(None)),
 		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
@@ -1913,7 +1952,7 @@ fn is_supported_ctas_column_type(data_type: &DataType) -> bool {
 			| DataType::Float32
 			| DataType::Float64
 			| DataType::Utf8
-	)
+	) || crate::timestamp::is_supported_utc_timestamp(data_type)
 }
 
 fn bind_sort_keys(
@@ -2464,6 +2503,7 @@ enum CarrierLiteral {
 	Int32(i32),
 	Int64(i64),
 	Date32(i32),
+	Timestamp(i64),
 	Float32(FiniteF32),
 	Float64(FiniteF64),
 	Utf8(String),
@@ -2495,6 +2535,13 @@ fn carrier_literal_from_scalar(value: &ScalarValue, carrier: &DataType) -> Optio
 		(DataType::Date32, ScalarValue::Date32(Some(value))) => {
 			Some(CarrierLiteral::Date32(*value))
 		}
+		(
+			DataType::Timestamp(target_unit, Some(timezone)),
+			ScalarValue::Timestamp {
+				value: Some(value),
+				unit,
+			},
+		) if timezone.as_ref() == "UTC" && target_unit == unit => Some(CarrierLiteral::Timestamp(*value)),
 		(DataType::Float32, ScalarValue::Float32(Some(value))) => {
 			FiniteF32::new(*value).map(CarrierLiteral::Float32)
 		}
@@ -2748,6 +2795,7 @@ enum CarrierDomain {
 	Int32(OrderedDomain<i32>),
 	Int64(OrderedDomain<i64>),
 	Date32(OrderedDomain<i32>),
+	Timestamp(OrderedDomain<i64>),
 	Float32(OrderedDomain<FiniteF32>),
 	Float64(OrderedDomain<FiniteF64>),
 	Utf8(Utf8Domain),
@@ -2780,6 +2828,14 @@ impl CarrierDomain {
 					Some(Self::Empty)
 				} else {
 					Some(Self::Date32(domain))
+				}
+			}
+			(Self::Timestamp(left), Self::Timestamp(right)) => {
+				let domain = left.intersect(right);
+				if domain.is_empty() {
+					Some(Self::Empty)
+				} else {
+					Some(Self::Timestamp(domain))
 				}
 			}
 			(Self::Float32(left), Self::Float32(right)) => {
@@ -2884,6 +2940,9 @@ fn domain_from_comparison(op: RefinementCmpOp, literal: CarrierLiteral) -> Optio
 		}
 		CarrierLiteral::Date32(value) => {
 			ordered_domain_from_comparison(op, value).map(CarrierDomain::Date32)
+		}
+		CarrierLiteral::Timestamp(value) => {
+			ordered_domain_from_comparison(op, value).map(CarrierDomain::Timestamp)
 		}
 		CarrierLiteral::Float32(value) => {
 			ordered_domain_from_comparison(op, value).map(CarrierDomain::Float32)
@@ -3898,6 +3957,7 @@ enum InListLiteralKey {
 	Int32(i32),
 	Int64(i64),
 	Date32(i32),
+	Timestamp(TimeUnit, i64),
 	Float32(u32),
 	Float64(u64),
 	Utf8(String),
@@ -3971,6 +4031,13 @@ fn in_list_scalar_literal_cardinality(value: &ScalarValue) -> Option<InListLiter
 			InListLiteralKey::Date32(*value),
 		)),
 		ScalarValue::Date32(None) => Some(InListLiteralCardinality::Null),
+		ScalarValue::Timestamp {
+			value: Some(value),
+			unit,
+		} => Some(InListLiteralCardinality::Key(InListLiteralKey::Timestamp(
+			*unit, *value,
+		))),
+		ScalarValue::Timestamp { value: None, .. } => Some(InListLiteralCardinality::Null),
 		ScalarValue::Float32(Some(value)) => {
 			if !value.is_finite() {
 				return None;
@@ -4258,7 +4325,7 @@ fn range_atom_sides(
 	};
 	let range = column_range_for_input(input, column.ordinal)?;
 	let value = program.literals.get(*literal as usize)?;
-	let literal_value = range_scalar_for_fact(range, value)?;
+	let literal_value = range_scalar_for_fact(range, &column.data_type, value)?;
 	Some(RangeAtom {
 		column: column.ordinal,
 		op,
@@ -4276,31 +4343,63 @@ fn flip_range_op(op: BoundBinaryOp) -> BoundBinaryOp {
 	}
 }
 
-fn range_scalar_for_fact(range: &RangeFact, value: &ScalarValue) -> Option<RangeScalar> {
-	match (range.arrow_type_tag, value) {
-		(ARROW_STATS_TAG_INT32, ScalarValue::Int32(Some(value))) => {
+fn range_scalar_for_fact(
+	range: &RangeFact,
+	column_type: &DataType,
+	value: &ScalarValue,
+) -> Option<RangeScalar> {
+	match (range.arrow_type_tag, column_type, value) {
+		(ARROW_STATS_TAG_INT32, DataType::Int32, ScalarValue::Int32(Some(value))) => {
 			Some(RangeScalar::Integral(i128::from(*value)))
 		}
-		(ARROW_STATS_TAG_INT64, ScalarValue::Int64(Some(value))) => {
+		(ARROW_STATS_TAG_INT64, DataType::Int64, ScalarValue::Int64(Some(value))) => {
 			Some(RangeScalar::Integral(i128::from(*value)))
 		}
-		(ARROW_STATS_TAG_DATE32, ScalarValue::Date32(Some(value))) => {
+		(ARROW_STATS_TAG_DATE32, DataType::Date32, ScalarValue::Date32(Some(value))) => {
 			Some(RangeScalar::Integral(i128::from(*value)))
 		}
-		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Int32(Some(value))) => {
+		(
+			ARROW_STATS_TAG_TIMESTAMP_MILLISECOND
+			| ARROW_STATS_TAG_TIMESTAMP_MICROSECOND
+			| ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
+			DataType::Timestamp(column_unit, Some(timezone)),
+			ScalarValue::Timestamp {
+				value: Some(value),
+				unit,
+			},
+		) if timezone.as_ref() == "UTC"
+			&& timestamp_fact_unit(range.arrow_type_tag) == Some(*column_unit)
+			&& column_unit == unit =>
+		{
+			Some(RangeScalar::Integral(i128::from(*value)))
+		}
+		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, _, ScalarValue::Int32(Some(value))) => {
 			Some(RangeScalar::Real(f64::from(*value)))
 		}
-		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Int64(Some(value))) => {
+		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, _, ScalarValue::Int64(Some(value))) => {
 			exact_i64_to_f64(*value).map(RangeScalar::Real)
 		}
-		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Float32(Some(value))) => {
-			value
-				.is_finite()
-				.then_some(RangeScalar::Real(f64::from(*value)))
-		}
-		(ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64, ScalarValue::Float64(Some(value))) => {
-			value.is_finite().then_some(RangeScalar::Real(*value))
-		}
+		(
+			ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64,
+			_,
+			ScalarValue::Float32(Some(value)),
+		) => value
+			.is_finite()
+			.then_some(RangeScalar::Real(f64::from(*value))),
+		(
+			ARROW_STATS_TAG_FLOAT32 | ARROW_STATS_TAG_FLOAT64,
+			_,
+			ScalarValue::Float64(Some(value)),
+		) => value.is_finite().then_some(RangeScalar::Real(*value)),
+		_ => None,
+	}
+}
+
+fn timestamp_fact_unit(arrow_type_tag: u8) -> Option<TimeUnit> {
+	match arrow_type_tag {
+		ARROW_STATS_TAG_TIMESTAMP_MILLISECOND => Some(TimeUnit::Millisecond),
+		ARROW_STATS_TAG_TIMESTAMP_MICROSECOND => Some(TimeUnit::Microsecond),
+		ARROW_STATS_TAG_TIMESTAMP_NANOSECOND => Some(TimeUnit::Nanosecond),
 		_ => None,
 	}
 }
@@ -4480,6 +4579,14 @@ fn decode_range_scalar(arrow_type_tag: u8, bytes: &[u8]) -> Option<RangeScalar> 
 			.map(|value| RangeScalar::Integral(value.into())),
 		ARROW_STATS_TAG_DATE32 if bytes.len() == 4 => decode_signed_optimizer_fact_scalar(bytes)
 			.map(|value| RangeScalar::Integral(value.into())),
+		ARROW_STATS_TAG_TIMESTAMP_MILLISECOND
+		| ARROW_STATS_TAG_TIMESTAMP_MICROSECOND
+		| ARROW_STATS_TAG_TIMESTAMP_NANOSECOND
+			if bytes.len() == 8 =>
+		{
+			decode_signed_optimizer_fact_scalar(bytes)
+				.map(|value| RangeScalar::Integral(value.into()))
+		}
 		ARROW_STATS_TAG_FLOAT32 if bytes.len() == 4 => {
 			decode_float32_optimizer_fact_scalar(bytes).map(|value| RangeScalar::Real(value.into()))
 		}
@@ -4563,6 +4670,7 @@ fn literal_is_non_null(value: &ScalarValue) -> bool {
 		ScalarValue::Int32(value) => value.is_some(),
 		ScalarValue::Int64(value) => value.is_some(),
 		ScalarValue::Date32(value) => value.is_some(),
+		ScalarValue::Timestamp { value, .. } => value.is_some(),
 		ScalarValue::Float32(value) => value.is_some(),
 		ScalarValue::Float64(value) => value.is_some(),
 		ScalarValue::Utf8(value) => value.is_some(),
@@ -5737,6 +5845,7 @@ fn sql_carrier_keyword(data_type: &DataType) -> Result<&'static str, BindingErro
 		DataType::Int32 => Ok("INT"),
 		DataType::Int64 => Ok("BIGINT"),
 		DataType::Date32 => Ok("DATE"),
+		DataType::Timestamp(_, Some(timezone)) if timezone.as_ref() == "UTC" => Ok("TIMESTAMPTZ"),
 		DataType::Float32 => Ok("REAL"),
 		DataType::Float64 => Ok("DOUBLE"),
 		DataType::Utf8 => Ok("TEXT"),
@@ -7342,6 +7451,7 @@ fn is_insert_select_coercible(source: &DataType, target: &DataType) -> bool {
 fn coerce_insert_literal(
 	literal: &InsertLiteral,
 	field: &Field,
+	session_timezone: Tz,
 ) -> Result<ScalarValue, BindingError> {
 	let target = field.data_type();
 	let column = field.name();
@@ -7383,6 +7493,17 @@ fn coerce_insert_literal(
 			DataType::Date32 => Ok(ScalarValue::Date32(Some(*value))),
 			_ => Err(insert_type_mismatch(column, literal, target)),
 		},
+		InsertLiteral::Timestamp { value, unit } => match target {
+			DataType::Timestamp(target_unit, Some(timezone))
+				if timezone.as_ref() == "UTC" && *target_unit == *unit =>
+			{
+				Ok(ScalarValue::Timestamp {
+					value: Some(*value),
+					unit: *unit,
+				})
+			}
+			_ => Err(insert_type_mismatch(column, literal, target)),
+		},
 		InsertLiteral::Float64(value) => match target {
 			DataType::Float32 => Ok(ScalarValue::Float32(Some(*value as f32))),
 			DataType::Float64 => Ok(ScalarValue::Float64(Some(*value))),
@@ -7390,6 +7511,22 @@ fn coerce_insert_literal(
 		},
 		InsertLiteral::Utf8(value) => match target {
 			DataType::Utf8 => Ok(ScalarValue::Utf8(Some(value.clone()))),
+			DataType::Timestamp(unit, Some(timezone))
+				if timezone.as_ref() == "UTC"
+					&& matches!(
+						unit,
+						TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond
+					) =>
+			{
+				Ok(ScalarValue::Timestamp {
+					value: Some(parse_timestamp_text_for_bind(
+						value,
+						session_timezone,
+						*unit,
+					)?),
+					unit: *unit,
+				})
+			}
 			_ => Err(insert_type_mismatch(column, literal, target)),
 		},
 	}
@@ -7473,7 +7610,7 @@ fn bind_comparison(
 	}
 	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
 	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
-	coerce_comparison_literals(builder, left, right)?;
+	coerce_comparison_literals(builder, left, right, ctx.session_timezone)?;
 	let left_type = builder
 		.node_type(left)
 		.cloned()
@@ -7533,7 +7670,7 @@ fn bind_in_list(
 		} else {
 			bind_expr_into_program(builder, item, input_schema, ctx)?
 		};
-		coerce_comparison_literals(builder, expr, item)?;
+		coerce_comparison_literals(builder, expr, item, ctx.session_timezone)?;
 		let current_expr_type = builder
 			.node_type(expr)
 			.cloned()
@@ -7701,6 +7838,7 @@ fn coerce_comparison_literals(
 	builder: &mut BoundExprProgramBuilder,
 	left: BoundExprId,
 	right: BoundExprId,
+	session_timezone: Tz,
 ) -> Result<(), BindingError> {
 	if builder.literal(left).is_some() && builder.literal(right).is_some() {
 		return Ok(());
@@ -7709,7 +7847,7 @@ fn coerce_comparison_literals(
 		let Some(data_type) = builder.node_type(right).cloned() else {
 			return Ok(());
 		};
-		let value = coerce_literal_value(value, &data_type)?;
+		let value = coerce_literal_value(value, &data_type, session_timezone)?;
 		let _ = builder.rewrite_literal(left, value);
 		return Ok(());
 	}
@@ -7717,7 +7855,7 @@ fn coerce_comparison_literals(
 		let Some(data_type) = builder.node_type(left).cloned() else {
 			return Ok(());
 		};
-		let value = coerce_literal_value(value, &data_type)?;
+		let value = coerce_literal_value(value, &data_type, session_timezone)?;
 		let _ = builder.rewrite_literal(right, value);
 	}
 	Ok(())
@@ -7726,6 +7864,7 @@ fn coerce_comparison_literals(
 fn coerce_literal_value(
 	value: ScalarValue,
 	target_type: &DataType,
+	session_timezone: Tz,
 ) -> Result<ScalarValue, BindingError> {
 	Ok(match (value, target_type) {
 		(ScalarValue::Int32(value), DataType::Int64) => ScalarValue::Int64(value.map(i64::from)),
@@ -7752,7 +7891,47 @@ fn coerce_literal_value(
 			})?))
 		}
 		(ScalarValue::Utf8(None), DataType::Date32) => ScalarValue::Date32(None),
+		(ScalarValue::Utf8(Some(value)), DataType::Timestamp(unit, Some(timezone)))
+			if timezone.as_ref() == "UTC"
+				&& matches!(
+					unit,
+					TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond
+				) =>
+		{
+			ScalarValue::Timestamp {
+				value: Some(parse_timestamp_text_for_bind(
+					&value,
+					session_timezone,
+					*unit,
+				)?),
+				unit: *unit,
+			}
+		}
+		(ScalarValue::Utf8(None), DataType::Timestamp(unit, Some(timezone)))
+			if timezone.as_ref() == "UTC"
+				&& matches!(
+					unit,
+					TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond
+				) =>
+		{
+			ScalarValue::Timestamp {
+				value: None,
+				unit: *unit,
+			}
+		}
 		(value, _) => value,
+	})
+}
+
+fn parse_timestamp_text_for_bind(
+	value: &str,
+	session_timezone: Tz,
+	unit: TimeUnit,
+) -> Result<i64, BindingError> {
+	crate::timestamp::parse_timestamp_text(value, session_timezone, unit).map_err(|error| {
+		BindingError::TypeMismatch {
+			message: error.to_string(),
+		}
 	})
 }
 
@@ -10326,6 +10505,37 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn timestamp_session_zone_range_filtered_dim_infers_broadcast_by_estimate() {
+		let catalog =
+			descriptor_sidecar_join_catalog_with_customer_timestamp_range(range_fact_timestamp_ms(
+				timestamp_ms("2025-12-01T06:00:00Z"),
+				timestamp_ms("2026-02-01T06:00:00Z"),
+				20_000,
+			));
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.observed_at >= '2026-01-01'",
+			)
+			.expect("plan SQL timestamp range-filtered dimension join");
+		let config = PlannerConfig::default().with_session_timezone("America/Chicago");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &config)
+			.await
+			.expect("bind SQL timestamp range-estimated dimension join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
 	async fn float_range_filtered_dim_with_wendelon_min_max_infers_broadcast_by_estimate() {
 		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
 			Some(64 * 1024 * 1024),
@@ -10810,6 +11020,295 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn timestamp_string_range_uses_session_timezone_for_estimate() {
+		let instant = timestamp_ms("2024-03-10T08:00:00Z");
+		let catalog = descriptor_sidecar_join_catalog_with_customer_timestamp_range(
+			range_fact_timestamp_ms(instant, instant, 10),
+		);
+		let scoped = bind_filtered_customers_with_config(
+			&catalog,
+			customer_timestamp_between_strings("2024-03-10 03:00:00", "2024-03-10 03:00:00"),
+			PlannerConfig::default().with_session_timezone("America/Chicago"),
+		)
+		.await
+		.expect("bind timestamp range with session timezone");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(10)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+	}
+
+	#[tokio::test]
+	async fn bare_string_timestamp_interpreted_in_session_zone() {
+		let central_midnight = timestamp_ms("2024-01-01T06:00:00Z");
+		let catalog = descriptor_sidecar_join_catalog_with_customer_timestamp_range(
+			range_fact_timestamp_ms(central_midnight, central_midnight, 10),
+		);
+
+		let central = bind_filtered_customers_with_config(
+			&catalog,
+			customer_timestamp_between_strings("2024-01-01 00:00:00", "2024-01-01 00:00:00"),
+			PlannerConfig::default().with_session_timezone("America/Chicago"),
+		)
+		.await
+		.expect("bind Central timestamp range");
+		let eastern = bind_filtered_customers_with_config(
+			&catalog,
+			customer_timestamp_between_strings("2024-01-01 00:00:00", "2024-01-01 00:00:00"),
+			PlannerConfig::default().with_session_timezone("America/New_York"),
+		)
+		.await
+		.expect("bind Eastern timestamp range");
+
+		assert_eq!(central.facts.estimated_row_count, Some(RowCount::new(10)));
+		assert_eq!(eastern.facts.estimated_row_count, Some(RowCount::new(0)));
+	}
+
+	#[tokio::test]
+	async fn bare_string_timestamp_with_explicit_offset_normalizes_to_utc() {
+		let utc_midnight = timestamp_ms("2024-01-01T00:00:00Z");
+		let catalog = descriptor_sidecar_join_catalog_with_customer_timestamp_range(
+			range_fact_timestamp_ms(utc_midnight, utc_midnight, 10),
+		);
+
+		let explicit_z = bind_filtered_customers_with_config(
+			&catalog,
+			customer_timestamp_between_strings("2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"),
+			PlannerConfig::default().with_session_timezone("America/Chicago"),
+		)
+		.await
+		.expect("bind explicit-offset timestamp string range");
+		let explicit_offset = bind_filtered_customers_with_config(
+			&catalog,
+			customer_timestamp_between_strings(
+				"2023-12-31T18:00:00-06:00",
+				"2023-12-31T18:00:00-06:00",
+			),
+			PlannerConfig::default().with_session_timezone("America/New_York"),
+		)
+		.await
+		.expect("bind explicit numeric-offset timestamp string range");
+
+		assert_eq!(
+			explicit_z.facts.estimated_row_count,
+			Some(RowCount::new(10))
+		);
+		assert_eq!(
+			explicit_offset.facts.estimated_row_count,
+			Some(RowCount::new(10))
+		);
+	}
+
+	#[test]
+	fn insert_timestamp_bare_string_with_explicit_offset_normalizes_to_utc() {
+		let field = Field::new(
+			"observed_at",
+			crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond),
+			true,
+		);
+		let value = coerce_insert_literal(
+			&InsertLiteral::Utf8("2024-01-01T00:00:00Z".to_string()),
+			&field,
+			"America/Chicago".parse::<Tz>().expect("session timezone"),
+		)
+		.expect("coerce explicit-offset timestamp string");
+
+		assert_eq!(
+			value,
+			ScalarValue::Timestamp {
+				value: Some(timestamp_ms("2024-01-01T00:00:00Z")),
+				unit: TimeUnit::Millisecond,
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn timestamp_string_dst_gap_is_binding_error() {
+		let instant = timestamp_ms("2024-03-10T08:00:00Z");
+		let catalog = descriptor_sidecar_join_catalog_with_customer_timestamp_range(
+			range_fact_timestamp_ms(instant, instant, 10),
+		);
+		let err = match bind_filtered_customers_with_config(
+			&catalog,
+			Expr::Gte(
+				Box::new(customer_column("observed_at")),
+				Box::new(utf8_literal("2024-03-10 02:30:00")),
+			),
+			PlannerConfig::default().with_session_timezone("America/Chicago"),
+		)
+		.await
+		{
+			Ok(_) => panic!("DST gap should reject"),
+			Err(error) => error,
+		};
+
+		assert!(err.to_string().contains("does not exist"));
+	}
+
+	#[tokio::test]
+	async fn timestamp_string_dst_fold_chooses_earlier_instant() {
+		let earlier_fold = timestamp_ms("2024-11-03T06:30:00Z");
+		let catalog = descriptor_sidecar_join_catalog_with_customer_timestamp_range(
+			range_fact_timestamp_ms(earlier_fold, earlier_fold, 10),
+		);
+		let scoped = bind_filtered_customers_with_config(
+			&catalog,
+			customer_timestamp_between_strings("2024-11-03 01:30:00", "2024-11-03 01:30:00"),
+			PlannerConfig::default().with_session_timezone("America/Chicago"),
+		)
+		.await
+		.expect("bind ambiguous timestamp fold");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(10)));
+	}
+
+	#[tokio::test]
+	async fn timestamp_precision_loss_in_target_unit_is_bind_error() {
+		let instant = timestamp_ms("2024-01-01T00:00:00Z");
+		let catalog = descriptor_sidecar_join_catalog_with_customer_timestamp_range(
+			range_fact_timestamp_ms(instant, instant, 10),
+		);
+		let err = match bind_filtered_customers_with_config(
+			&catalog,
+			Expr::Gte(
+				Box::new(customer_column("observed_at")),
+				Box::new(utf8_literal("2024-01-01 00:00:00.000001")),
+			),
+			PlannerConfig::default().with_session_timezone("UTC"),
+		)
+		.await
+		{
+			Ok(_) => panic!("precision-losing timestamp should reject"),
+			Err(error) => error,
+		};
+
+		assert!(
+			err.to_string()
+				.contains("not exactly representable at millisecond precision")
+		);
+	}
+
+	#[tokio::test]
+	async fn timestamp_in_list_uses_existing_ndv_fact_and_writes_no_hard_bounds() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(20_000),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new(
+					"observed_at",
+					crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond),
+					true,
+				),
+			]),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		let scoped = bind_filtered_customers_with_config(
+			&catalog,
+			customer_in_list(
+				"observed_at",
+				vec![
+					utf8_literal("2024-01-01 00:00:00"),
+					utf8_literal("2024-01-02 00:00:00"),
+					utf8_literal("2024-01-01 00:00:00"),
+				],
+				false,
+			),
+			PlannerConfig::default().with_session_timezone("UTC"),
+		)
+		.await
+		.expect("bind timestamp IN-list");
+
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(4)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[test]
+	fn timestamp_range_fact_requires_timestamp_column_and_matching_unit() {
+		let range = range_fact_timestamp_ms(10, 20, 100);
+		let timestamp_type = crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond);
+		let naive_timestamp_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+		let non_utc_timestamp_type =
+			DataType::Timestamp(TimeUnit::Millisecond, Some("America/Chicago".into()));
+
+		assert_eq!(
+			range_scalar_for_fact(
+				&range,
+				&timestamp_type,
+				&ScalarValue::Timestamp {
+					value: Some(12),
+					unit: TimeUnit::Millisecond
+				}
+			),
+			Some(RangeScalar::Integral(12))
+		);
+		assert_eq!(
+			range_scalar_for_fact(&range, &DataType::Int64, &ScalarValue::Int64(Some(12))),
+			None
+		);
+		assert_eq!(
+			range_scalar_for_fact(
+				&range,
+				&timestamp_type,
+				&ScalarValue::Timestamp {
+					value: Some(12),
+					unit: TimeUnit::Microsecond
+				}
+			),
+			None
+		);
+		assert_eq!(
+			range_scalar_for_fact(
+				&range,
+				&naive_timestamp_type,
+				&ScalarValue::Timestamp {
+					value: Some(12),
+					unit: TimeUnit::Millisecond
+				}
+			),
+			None
+		);
+		assert_eq!(
+			range_scalar_for_fact(
+				&range,
+				&non_utc_timestamp_type,
+				&ScalarValue::Timestamp {
+					value: Some(12),
+					unit: TimeUnit::Millisecond
+				}
+			),
+			None
+		);
+	}
+
+	#[test]
+	fn date32_stays_civil_not_timestamp_day_boundary_and_date64_fact_remains_dark() {
+		let date32_range = range_fact_date32(19_723, 19_724, 2);
+		let date64_range = RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_DATE64,
+			null_count: 0,
+			non_null_count: 2,
+			min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(0, 8).unwrap()),
+			max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(86_400_000, 8).unwrap()),
+		};
+		let timestamp = ScalarValue::Timestamp {
+			value: Some(timestamp_ms("2024-01-01T00:00:00Z")),
+			unit: TimeUnit::Millisecond,
+		};
+
+		assert_eq!(
+			range_scalar_for_fact(&date32_range, &DataType::Date32, &timestamp),
+			None
+		);
+		assert_eq!(
+			range_scalar_for_fact(&date64_range, &DataType::Date64, &timestamp),
+			None
+		);
+	}
+
+	#[tokio::test]
 	async fn range_outside_envelope_estimates_zero_without_hard_bound() {
 		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
 			None,
@@ -10877,31 +11376,39 @@ mod tests {
 		let range = range_fact_f64(0.0, 10.0, 100);
 
 		assert_eq!(
-			range_scalar_for_fact(&range, &ScalarValue::Int32(Some(7))),
+			range_scalar_for_fact(&range, &DataType::Float64, &ScalarValue::Int32(Some(7))),
 			Some(RangeScalar::Real(7.0))
 		);
 		assert_eq!(
-			range_scalar_for_fact(&range, &ScalarValue::Int64(Some(7))),
+			range_scalar_for_fact(&range, &DataType::Float64, &ScalarValue::Int64(Some(7))),
 			Some(RangeScalar::Real(7.0))
 		);
 		assert_eq!(
-			range_scalar_for_fact(&range, &ScalarValue::Float32(Some(2.5))),
+			range_scalar_for_fact(&range, &DataType::Float64, &ScalarValue::Float32(Some(2.5))),
 			Some(RangeScalar::Real(2.5))
 		);
 		assert_eq!(
-			range_scalar_for_fact(&range, &ScalarValue::Float64(Some(2.5))),
+			range_scalar_for_fact(&range, &DataType::Float64, &ScalarValue::Float64(Some(2.5))),
 			Some(RangeScalar::Real(2.5))
 		);
 		assert_eq!(
-			range_scalar_for_fact(&range, &ScalarValue::Int64(Some(i64::MAX))),
+			range_scalar_for_fact(
+				&range,
+				&DataType::Float64,
+				&ScalarValue::Int64(Some(i64::MAX))
+			),
 			None
 		);
 		assert_eq!(
-			range_scalar_for_fact(&range, &ScalarValue::Float64(Some(f64::NAN))),
+			range_scalar_for_fact(
+				&range,
+				&DataType::Float64,
+				&ScalarValue::Float64(Some(f64::NAN))
+			),
 			None
 		);
 		assert_eq!(
-			range_scalar_for_fact(&range, &ScalarValue::Float64(None)),
+			range_scalar_for_fact(&range, &DataType::Float64, &ScalarValue::Float64(None)),
 			None
 		);
 	}
@@ -12659,6 +13166,26 @@ mod tests {
 		)
 	}
 
+	fn descriptor_sidecar_join_catalog_with_customer_timestamp_range(
+		range: RangeFact,
+	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new(
+					"observed_at",
+					crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond),
+					true,
+				),
+			]),
+			Vec::new(),
+			vec![(ColumnOrdinal(1), range)],
+		)
+	}
+
 	fn wide_customer_schema() -> Schema {
 		Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
@@ -12810,6 +13337,21 @@ mod tests {
 		}
 	}
 
+	fn range_fact_timestamp_ms(min: i64, max: i64, non_null_count: u64) -> RangeFact {
+		RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
+			null_count: 0,
+			non_null_count,
+			min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(min, 8).unwrap()),
+			max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(max, 8).unwrap()),
+		}
+	}
+
+	fn timestamp_ms(value: &str) -> i64 {
+		crate::timestamp::parse_explicit_timestamptz(value, TimeUnit::Millisecond)
+			.expect("timestamp literal")
+	}
+
 	fn range_fact_f64(min: f64, max: f64, non_null_count: u64) -> RangeFact {
 		RangeFact {
 			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_FLOAT64,
@@ -12853,9 +13395,30 @@ mod tests {
 		)
 	}
 
+	fn customer_timestamp_between_strings(low: &str, high: &str) -> Expr {
+		Expr::And(
+			Box::new(Expr::Gte(
+				Box::new(customer_column("observed_at")),
+				Box::new(utf8_literal(low)),
+			)),
+			Box::new(Expr::Lte(
+				Box::new(customer_column("observed_at")),
+				Box::new(utf8_literal(high)),
+			)),
+		)
+	}
+
 	async fn bind_filtered_customers(
 		catalog: &dyn Catalog,
 		predicate: Expr,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		bind_filtered_customers_with_config(catalog, predicate, PlannerConfig::default()).await
+	}
+
+	async fn bind_filtered_customers_with_config(
+		catalog: &dyn Catalog,
+		predicate: Expr,
+		config: PlannerConfig,
 	) -> Result<ScopedExecutionPlan, BindingError> {
 		let filtered_customers = LogicalPlan::Filter {
 			input: Box::new(LogicalPlan::ScanNamed {
@@ -12866,7 +13429,7 @@ mod tests {
 		};
 		Binder {
 			catalog,
-			config: &PlannerConfig::default(),
+			config: &config,
 		}
 		.bind_plan(&filtered_customers)
 		.await

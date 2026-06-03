@@ -239,7 +239,7 @@ fn planner_rejects_unsupported_create_table_shapes() {
 		),
 		(
 			"CREATE TABLE t (a TIMESTAMP)",
-			"unsupported CREATE TABLE column type: TIMESTAMP",
+			"TIMESTAMP WITHOUT TIME ZONE is not supported; use TIMESTAMPTZ",
 		),
 		(
 			"CREATE TABLE t (a INT NULL NOT NULL)",

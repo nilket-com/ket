@@ -3,9 +3,10 @@ use std::sync::Arc;
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Builder, Float32Array, Float32Builder,
 	Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray,
-	StringBuilder,
+	StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+	TimestampNanosecondBuilder,
 };
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use crate::binder::TABLE_WRITE_MAX_ROWS;
@@ -467,7 +468,7 @@ fn is_supported_insert_select_target(data_type: &DataType) -> bool {
 			| DataType::Float32
 			| DataType::Float64
 			| DataType::Utf8
-	)
+	) || crate::timestamp::is_supported_utc_timestamp(data_type)
 }
 
 fn is_numeric_type(data_type: &DataType) -> bool {
@@ -527,6 +528,9 @@ fn build_array(
 			}
 			Ok(Arc::new(builder.finish()))
 		}
+		DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "UTC" => {
+			build_timestamp_array(*unit, rows, field_index)
+		}
 		DataType::Float32 => {
 			let mut builder = Float32Builder::with_capacity(rows.len());
 			for row in rows {
@@ -562,6 +566,90 @@ fn build_array(
 		}
 		other => Err(StorageError::Internal {
 			message: format!("unsupported INSERT materialization type: {other:?}"),
+		}),
+	}
+}
+
+fn build_timestamp_array(
+	unit: TimeUnit,
+	rows: &[Vec<ScalarValue>],
+	field_index: usize,
+) -> Result<ArrayRef, StorageError> {
+	match unit {
+		TimeUnit::Millisecond => {
+			let mut builder =
+				TimestampMillisecondBuilder::with_capacity(rows.len()).with_timezone("UTC");
+			for row in rows {
+				match scalar_at(row, field_index)? {
+					ScalarValue::Timestamp {
+						value: Some(value),
+						unit: TimeUnit::Millisecond,
+					} => builder.append_value(*value),
+					ScalarValue::Timestamp {
+						value: None,
+						unit: TimeUnit::Millisecond,
+					} => builder.append_null(),
+					other => {
+						return Err(type_mismatch(
+							field_index,
+							"Timestamp(Millisecond, UTC)",
+							other,
+						));
+					}
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		TimeUnit::Microsecond => {
+			let mut builder =
+				TimestampMicrosecondBuilder::with_capacity(rows.len()).with_timezone("UTC");
+			for row in rows {
+				match scalar_at(row, field_index)? {
+					ScalarValue::Timestamp {
+						value: Some(value),
+						unit: TimeUnit::Microsecond,
+					} => builder.append_value(*value),
+					ScalarValue::Timestamp {
+						value: None,
+						unit: TimeUnit::Microsecond,
+					} => builder.append_null(),
+					other => {
+						return Err(type_mismatch(
+							field_index,
+							"Timestamp(Microsecond, UTC)",
+							other,
+						));
+					}
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		TimeUnit::Nanosecond => {
+			let mut builder =
+				TimestampNanosecondBuilder::with_capacity(rows.len()).with_timezone("UTC");
+			for row in rows {
+				match scalar_at(row, field_index)? {
+					ScalarValue::Timestamp {
+						value: Some(value),
+						unit: TimeUnit::Nanosecond,
+					} => builder.append_value(*value),
+					ScalarValue::Timestamp {
+						value: None,
+						unit: TimeUnit::Nanosecond,
+					} => builder.append_null(),
+					other => {
+						return Err(type_mismatch(
+							field_index,
+							"Timestamp(Nanosecond, UTC)",
+							other,
+						));
+					}
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		TimeUnit::Second => Err(StorageError::Internal {
+			message: "unsupported INSERT timestamp unit: Second".to_string(),
 		}),
 	}
 }

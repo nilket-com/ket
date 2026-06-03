@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{
+	ArrayRef, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+	TimestampNanosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use serde_bytes::ByteBuf;
@@ -933,12 +937,54 @@ async fn handle_sql_connection(
 			};
 			let statement_class = StatementClass::from_plan(&plan);
 			crate::telemetry::record_query_statement_class(&query_span, statement_class);
+			let session_timezone = request.session_timezone.trim().to_string();
+			if let Err(error) = crate::timestamp::parse_session_timezone(&session_timezone) {
+				crate::telemetry::record_query_outcome(&query_span, "error");
+				query_span.record("toron.error_class", "binding");
+				let audit_event = ToronAuditEvent::query_outcome(
+					ToronAuditOperation::QueryPlannedError,
+					tenant_id,
+					session_id,
+					frame.query_id,
+					statement_class,
+					AuditOutcome::Denied,
+				)
+				.with_sql_error_code(SqlErrorCode::BindingError)
+				.with_duration(query_started.elapsed());
+				if !record_sql_audit_required_or_error(
+					&audit,
+					audit_event,
+					&mut stream,
+					frame.query_id,
+				)
+				.await?
+				{
+					return Ok(());
+				}
+				return write_sql_error(
+					&mut stream,
+					frame.query_id,
+					SqlErrorCode::BindingError,
+					error.to_string(),
+				)
+				.await;
+			}
+			let planner_config = coordinator
+				.planner_config()
+				.with_session_timezone(session_timezone.clone());
 			let mut context = sql_execution_context(tenant_id, frame.query_id, session_id);
 			context.trace_context = query_trace.trace_context();
 			let returns_rows = sql_plan_returns_rows(&plan);
-			let execution = coordinator
-				.execute_query_with_context(&plan, context)
-				.instrument(query_span.clone());
+			let execution = async {
+				if session_timezone == "UTC" {
+					coordinator.execute_query_with_context(&plan, context).await
+				} else {
+					coordinator
+						.execute_query_with_context_and_config(&plan, context, planner_config)
+						.await
+				}
+			}
+			.instrument(query_span.clone());
 			tokio::pin!(execution);
 			let timeout_sleep = tokio::time::sleep(timeout_duration);
 			tokio::pin!(timeout_sleep);
@@ -1086,6 +1132,7 @@ async fn handle_sql_connection(
 				}
 				None => unreachable!("SQL execution select always returns or exits"),
 			};
+			let batches = restamp_sql_result_timezones(&batches, &session_timezone)?;
 			let row_count = if returns_rows {
 				batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64
 			} else {
@@ -1423,6 +1470,75 @@ fn sql_affected_row_count(batches: &[RecordBatch]) -> u64 {
 		.unwrap_or(0)
 }
 
+fn restamp_sql_result_timezones(
+	batches: &[RecordBatch],
+	session_timezone: &str,
+) -> Result<Vec<RecordBatch>, QueryError> {
+	batches
+		.iter()
+		.map(|batch| restamp_sql_result_batch(batch, session_timezone))
+		.collect()
+}
+
+fn restamp_sql_result_batch(
+	batch: &RecordBatch,
+	session_timezone: &str,
+) -> Result<RecordBatch, QueryError> {
+	let fields = batch
+		.schema()
+		.fields()
+		.iter()
+		.map(|field| restamp_sql_result_field(field.as_ref(), session_timezone))
+		.collect::<Vec<_>>();
+	let columns = batch
+		.columns()
+		.iter()
+		.map(|column| restamp_sql_result_array(column, session_timezone))
+		.collect::<Vec<_>>();
+	RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(QueryError::from)
+}
+
+fn restamp_sql_result_field(field: &Field, session_timezone: &str) -> Field {
+	let data_type = match field.data_type() {
+		DataType::Timestamp(unit, _) => {
+			DataType::Timestamp(*unit, Some(session_timezone.to_string().into()))
+		}
+		other => other.clone(),
+	};
+	Field::new(field.name().clone(), data_type, field.is_nullable())
+		.with_metadata(field.metadata().clone())
+}
+
+fn restamp_sql_result_array(array: &ArrayRef, session_timezone: &str) -> ArrayRef {
+	match array.data_type() {
+		DataType::Timestamp(TimeUnit::Millisecond, _) => Arc::new(
+			array
+				.as_any()
+				.downcast_ref::<TimestampMillisecondArray>()
+				.expect("timestamp millisecond data type")
+				.clone()
+				.with_timezone(session_timezone.to_string()),
+		),
+		DataType::Timestamp(TimeUnit::Microsecond, _) => Arc::new(
+			array
+				.as_any()
+				.downcast_ref::<TimestampMicrosecondArray>()
+				.expect("timestamp microsecond data type")
+				.clone()
+				.with_timezone(session_timezone.to_string()),
+		),
+		DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(
+			array
+				.as_any()
+				.downcast_ref::<TimestampNanosecondArray>()
+				.expect("timestamp nanosecond data type")
+				.clone()
+				.with_timezone(session_timezone.to_string()),
+		),
+		_ => array.clone(),
+	}
+}
+
 fn encode_sql_batch(batch: &RecordBatch) -> Result<Vec<u8>, QueryError> {
 	let mut buffer = Vec::new();
 	{
@@ -1611,6 +1727,37 @@ mod tests {
 
 		assert_eq!(code, SqlErrorCode::ResourceExhausted);
 		assert_eq!(message, "tenant concurrency limit exhausted");
+	}
+
+	#[test]
+	fn sql_result_timestamp_restamp_preserves_utc_ticks_and_sets_session_zone() {
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"observed_at",
+			DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+			true,
+		)]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(
+				TimestampMillisecondArray::from(vec![Some(1_704_091_200_000i64)])
+					.with_timezone("UTC"),
+			)],
+		)
+		.expect("timestamp batch");
+
+		let restamped = restamp_sql_result_timezones(&[batch], "America/Chicago")
+			.expect("restamp timestamp result");
+
+		assert_eq!(
+			restamped[0].schema().field(0).data_type(),
+			&DataType::Timestamp(TimeUnit::Millisecond, Some("America/Chicago".into()))
+		);
+		let values = restamped[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("timestamp array");
+		assert_eq!(values.value(0), 1_704_091_200_000i64);
 	}
 
 	#[test]

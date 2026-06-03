@@ -2033,7 +2033,7 @@ async fn computed_aggregate_arguments_preserve_binder_domain_errors() {
 		matches!(
 			err,
 			BindingError::TypeMismatch { ref message }
-				if message == "unsupported CAST: Utf8 to Int64; only Int32, Int64, Float32, and Float64 are supported"
+				if message == "unsupported CAST: Utf8 to Int64; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
 		),
 		"unexpected CAST domain error: {err:?}"
 	);

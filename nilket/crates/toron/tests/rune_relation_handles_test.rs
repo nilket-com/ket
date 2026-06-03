@@ -5,7 +5,7 @@ use std::time::Duration;
 use arrow::array::{
 	Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
@@ -1384,6 +1384,47 @@ async fn rune_lit_i64_preserves_wide_integer_in_logical_plan() {
 		right.as_ref(),
 		Expr::Literal(ScalarValue::Int64(Some(3_000_000_000)))
 	));
+}
+
+#[tokio::test]
+async fn rune_lit_timestamp_lowers_explicit_offset_to_utc_nanos() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("id").eq(lit_timestamp("2024-01-01T00:00:00-06:00")))
+        }
+    "#,
+	)
+	.await
+	.expect("lit_timestamp filter plan");
+
+	let LogicalPlan::Filter { predicate, .. } = logical else {
+		panic!("expected filter plan");
+	};
+	let Expr::Eq(_, right) = predicate else {
+		panic!("expected equality predicate, got {predicate:?}");
+	};
+	assert!(matches!(
+		right.as_ref(),
+		Expr::Literal(ScalarValue::Timestamp {
+			value: Some(1_704_088_800_000_000_000),
+			unit: TimeUnit::Nanosecond
+		})
+	));
+
+	let err = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").filter(col("id").eq(lit_timestamp("2024-01-01 00:00:00")))
+        }
+    "#,
+	)
+	.await
+	.expect_err("offset-less timestamp should reject");
+	assert!(
+		err.to_string().contains("explicit offset"),
+		"unexpected lit_timestamp error: {err}"
+	);
 }
 
 #[tokio::test]

@@ -22,12 +22,22 @@ pub struct SqlFrame {
 
 impl SqlFrame {
 	pub fn execute(query_id: QueryId, statement: String, timeout_seconds: Option<u32>) -> Self {
+		Self::execute_with_timezone(query_id, statement, timeout_seconds, "UTC")
+	}
+
+	pub fn execute_with_timezone(
+		query_id: QueryId,
+		statement: String,
+		timeout_seconds: Option<u32>,
+		session_timezone: impl Into<String>,
+	) -> Self {
 		Self {
 			protocol_version: SqlProtocolVersion::Current,
 			query_id,
 			message: SqlMessage::Execute(ExecuteRequest {
 				statement,
 				statement_timeout_seconds: timeout_seconds,
+				session_timezone: session_timezone.into(),
 			}),
 		}
 	}
@@ -59,6 +69,7 @@ pub enum SqlMessage {
 pub struct ExecuteRequest {
 	pub statement: String,
 	pub statement_timeout_seconds: Option<u32>,
+	pub session_timezone: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,4 +162,31 @@ where
 	decode_payload(&payload)
 		.map(Ok)
 		.map_err(|error| Error::new(ErrorKind::InvalidData, error))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn execute_request_carries_session_timezone() {
+		let default = SqlFrame::execute(QueryId::from_u128(1), "SELECT 1".to_string(), None);
+		let SqlMessage::Execute(default_request) = default.message else {
+			panic!("expected execute request");
+		};
+		assert_eq!(default_request.session_timezone, "UTC");
+
+		let explicit = SqlFrame::execute_with_timezone(
+			QueryId::from_u128(2),
+			"SELECT 1".to_string(),
+			Some(7),
+			"America/Chicago",
+		);
+		let SqlMessage::Execute(explicit_request) = explicit.message else {
+			panic!("expected execute request");
+		};
+		assert_eq!(explicit_request.statement, "SELECT 1");
+		assert_eq!(explicit_request.statement_timeout_seconds, Some(7));
+		assert_eq!(explicit_request.session_timezone, "America/Chicago");
+	}
 }

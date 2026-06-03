@@ -8,7 +8,8 @@ use crate::ir::{
 	JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue, SortExpr,
 	data_type_to_logical_type_physical,
 };
-use arrow::datatypes::DataType;
+use crate::timestamp::{parse_explicit_timestamptz, utc_timestamp_data_type};
+use arrow::datatypes::{DataType, TimeUnit};
 use sqlparser::ast::{
 	Assignment, AssignmentTarget, BinaryOperator, CaseWhen, CastKind, ColumnDef, ColumnOption,
 	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, Delete,
@@ -16,8 +17,8 @@ use sqlparser::ast::{
 	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
 	Ident, Insert, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
 	ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem,
-	SetExpr, Statement, TableAlias, TableConstraint, TableFactor, TableObject, TypedString,
-	UnaryOperator, Value,
+	SetExpr, Statement, TableAlias, TableConstraint, TableFactor, TableObject, TimezoneInfo,
+	TypedString, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -258,6 +259,13 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 		| SqlDataType::Float8
 		| SqlDataType::Float64 => Ok(DataType::Float64),
 		SqlDataType::Date | SqlDataType::Date32 => Ok(DataType::Date32),
+		SqlDataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => Ok(
+			utc_timestamp_data_type(timestamp_unit_for_precision(*precision)?),
+		),
+		SqlDataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
+		| SqlDataType::TimestampNtz(_) => Err(unsupported(
+			"TIMESTAMP WITHOUT TIME ZONE is not supported; use TIMESTAMPTZ",
+		)),
 		SqlDataType::Float(_) => Err(unsupported(
 			"unsupported CAST target type: FLOAT (precision-parameter ambiguous; use REAL, DOUBLE PRECISION, FLOAT32, or FLOAT64)",
 		)),
@@ -269,6 +277,30 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 
 fn is_date_sql_type(data_type: &SqlDataType) -> bool {
 	matches!(data_type, SqlDataType::Date | SqlDataType::Date32)
+}
+
+fn timestamp_unit_for_precision(precision: Option<u64>) -> Result<TimeUnit, FrontendError> {
+	match precision {
+		None | Some(9) => Ok(TimeUnit::Nanosecond),
+		Some(6) => Ok(TimeUnit::Microsecond),
+		Some(3) => Ok(TimeUnit::Millisecond),
+		Some(other) => Err(unsupported(format!(
+			"unsupported TIMESTAMPTZ precision {other}; use 3, 6, or 9"
+		))),
+	}
+}
+
+fn timestamptz_sql_unit(data_type: &SqlDataType) -> Result<Option<TimeUnit>, FrontendError> {
+	match data_type {
+		SqlDataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+			Ok(Some(timestamp_unit_for_precision(*precision)?))
+		}
+		SqlDataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
+		| SqlDataType::TimestampNtz(_) => Err(unsupported(
+			"TIMESTAMP WITHOUT TIME ZONE is not supported; use TIMESTAMPTZ",
+		)),
+		_ => Ok(None),
+	}
 }
 
 fn typed_string_value(typed: &TypedString) -> Result<String, FrontendError> {
@@ -996,6 +1028,17 @@ fn lower_insert_literal(expr: &SqlExpr) -> Result<InsertLiteral, FrontendError> 
 				.map(InsertLiteral::Date32)
 				.map_err(|error| unsupported(error.to_string()))
 		}
+		SqlExpr::TypedString(typed) => {
+			let Some(unit) = timestamptz_sql_unit(&typed.data_type)? else {
+				return Err(unsupported(
+					"INSERT VALUES must be literals; complex expressions not supported",
+				));
+			};
+			let value = typed_string_value(typed)?;
+			parse_explicit_timestamptz(&value, unit)
+				.map(|value| InsertLiteral::Timestamp { value, unit })
+				.map_err(|error| unsupported(error.to_string()))
+		}
 		SqlExpr::Value(value) => match &value.value {
 			Value::Null => Ok(InsertLiteral::Null),
 			Value::Boolean(value) => Ok(InsertLiteral::Boolean(*value)),
@@ -1209,6 +1252,15 @@ fn lower_create_table_data_type(
 		SqlDataType::Date | SqlDataType::Date32 => {
 			Ok(CreateTableColumnType::Physical(DataType::Date32))
 		}
+		SqlDataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+			Ok(CreateTableColumnType::Physical(utc_timestamp_data_type(
+				timestamp_unit_for_precision(*precision)?,
+			)))
+		}
+		SqlDataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
+		| SqlDataType::TimestampNtz(_) => Err(unsupported(
+			"TIMESTAMP WITHOUT TIME ZONE is not supported; use TIMESTAMPTZ",
+		)),
 		SqlDataType::Text
 		| SqlDataType::String(_)
 		| SqlDataType::Varchar(_)
@@ -3933,6 +3985,20 @@ impl SqlPlanner {
 					.map(|value| Expr::Literal(ScalarValue::Date32(Some(value))))
 					.map_err(|error| unsupported(error.to_string()))
 			}
+			SqlExpr::TypedString(typed) => {
+				let Some(unit) = timestamptz_sql_unit(&typed.data_type)? else {
+					return Err(unsupported(format!("unsupported typed literal: {typed:?}")));
+				};
+				let value = typed_string_value(typed)?;
+				parse_explicit_timestamptz(&value, unit)
+					.map(|value| {
+						Expr::Literal(ScalarValue::Timestamp {
+							value: Some(value),
+							unit,
+						})
+					})
+					.map_err(|error| unsupported(error.to_string()))
+			}
 			SqlExpr::BinaryOp { left, op, right } => {
 				let l = Box::new(self.lower_expr(left)?);
 				let r = Box::new(self.lower_expr(right)?);
@@ -5146,16 +5212,21 @@ fn hash_scalar_structural(value: &ScalarValue, state: &mut impl Hasher) {
 			3u8.hash(state);
 			value.hash(state);
 		}
-		ScalarValue::Float32(value) => {
+		ScalarValue::Timestamp { value, unit } => {
 			4u8.hash(state);
+			unit.hash(state);
+			value.hash(state);
+		}
+		ScalarValue::Float32(value) => {
+			5u8.hash(state);
 			value.map(f32::to_bits).hash(state);
 		}
 		ScalarValue::Float64(value) => {
-			5u8.hash(state);
+			6u8.hash(state);
 			value.map(f64::to_bits).hash(state);
 		}
 		ScalarValue::Utf8(value) => {
-			6u8.hash(state);
+			7u8.hash(state);
 			value.hash(state);
 		}
 	}
@@ -5167,6 +5238,16 @@ fn scalar_structural_eq(left: &ScalarValue, right: &ScalarValue) -> bool {
 		(ScalarValue::Int32(left), ScalarValue::Int32(right)) => left == right,
 		(ScalarValue::Int64(left), ScalarValue::Int64(right)) => left == right,
 		(ScalarValue::Date32(left), ScalarValue::Date32(right)) => left == right,
+		(
+			ScalarValue::Timestamp {
+				value: left_value,
+				unit: left_unit,
+			},
+			ScalarValue::Timestamp {
+				value: right_value,
+				unit: right_unit,
+			},
+		) => left_unit == right_unit && left_value == right_value,
 		(ScalarValue::Float32(left), ScalarValue::Float32(right)) => {
 			left.map(f32::to_bits) == right.map(f32::to_bits)
 		}
@@ -5183,8 +5264,12 @@ fn hash_data_type_structural(data_type: &DataType, state: &mut impl Hasher) {
 		DataType::Int32 => 0u8.hash(state),
 		DataType::Int64 => 1u8.hash(state),
 		DataType::Date32 => 2u8.hash(state),
-		DataType::Float32 => 3u8.hash(state),
-		DataType::Float64 => 4u8.hash(state),
+		DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "UTC" => {
+			3u8.hash(state);
+			unit.hash(state);
+		}
+		DataType::Float32 => 4u8.hash(state),
+		DataType::Float64 => 5u8.hash(state),
 		other => {
 			255u8.hash(state);
 			format!("{other:?}").hash(state);
@@ -6599,6 +6684,43 @@ mod tests {
 			err.to_string()
 				.contains("table functions are not supported")
 		);
+	}
+
+	#[test]
+	fn create_table_timestamptz_lowers_to_utc_timestamp() {
+		let plan = SqlPlanner::new()
+			.plan("CREATE TABLE events (ts TIMESTAMPTZ)")
+			.expect("plan timestamptz table");
+		let LogicalPlan::CreateTable { schema, .. } = plan else {
+			panic!("expected CREATE TABLE");
+		};
+		let CreateTableColumnType::Physical(data_type) = &schema.columns[0].column_type else {
+			panic!("expected physical column");
+		};
+
+		assert_eq!(
+			data_type,
+			&DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+		);
+	}
+
+	#[test]
+	fn timestamp_without_timezone_is_rejected() {
+		let err = SqlPlanner::new()
+			.plan("CREATE TABLE events (ts TIMESTAMP)")
+			.expect_err("naive timestamp should reject");
+
+		assert!(err.to_string().contains("TIMESTAMP WITHOUT TIME ZONE"));
+	}
+
+	#[test]
+	fn timestamptz_typed_literal_requires_explicit_offset() {
+		let err = SqlPlanner::new()
+			.plan("SELECT TIMESTAMPTZ '2024-01-01 00:00:00' FROM events")
+			.expect_err("offset-less timestamptz should reject");
+
+		let message = err.to_string();
+		assert!(message.contains("explicit offset"), "{message}");
 	}
 
 	#[test]

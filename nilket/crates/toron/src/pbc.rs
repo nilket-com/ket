@@ -224,6 +224,11 @@ fn emit_literal(val: &ScalarValue, bytecode: &mut Vec<u8>) -> Result<(), Pushdow
 				"Date32 literals require type-preserving PBC support".to_string(),
 			));
 		}
+		ScalarValue::Timestamp { value: Some(_), .. } => {
+			return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+				"Timestamp literals require type-preserving PBC support".to_string(),
+			));
+		}
 		ScalarValue::Float32(Some(v)) => {
 			bytecode.push(OP_PUSH_FLOAT);
 			bytecode.extend_from_slice(&(*v as f64).to_le_bytes());
@@ -285,7 +290,7 @@ mod tests {
 	use crate::storage::InMemoryStorageScan;
 
 	use arrow::array::{Int32Array, StringArray};
-	use arrow::datatypes::{DataType, Field, Schema};
+	use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 	use arrow::record_batch::RecordBatch;
 	use std::sync::Arc;
 	use std::time::Duration;
@@ -406,6 +411,23 @@ mod tests {
 		});
 		let res2 = compiler.compile(Some(&expr2), None);
 		assert_eq!(res2, Err(PushdownDeclineReason::NullLiteralUnrepresentable));
+
+		// 3. Timestamp literals are not raw Int64 PBC operands.
+		let expr3 = program(|builder| {
+			let ts = column(builder, "observed_at_ticks", 4, DataType::Int64, true);
+			let value = builder.append_literal(ScalarValue::Timestamp {
+				value: Some(1_700_000_000_000),
+				unit: TimeUnit::Millisecond,
+			});
+			builder.append_binary(BoundBinaryOp::Eq, ts, value, DataType::Boolean)
+		});
+		let res3 = compiler.compile(Some(&expr3), None);
+		assert_eq!(
+			res3,
+			Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+				"Timestamp literals require type-preserving PBC support".to_string()
+			))
+		);
 	}
 
 	#[test]

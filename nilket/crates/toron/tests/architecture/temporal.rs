@@ -114,3 +114,155 @@ pub(crate) fn adr149_date32_selectivity_breadth_is_typed_and_estimate_only() {
 	assert!(cli.contains("fn date32_select_output_renders_iso_date"));
 	assert!(cli.contains("format_batches_for_display"));
 }
+
+#[test]
+pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
+	let binder = source("src/binder.rs");
+	let ir = source("src/ir.rs");
+	let planner = source("src/sql_planner.rs");
+	let exec = source("src/exec.rs");
+	let write = source("src/coordinator/write.rs");
+	let pbc = source("src/pbc.rs");
+	let rune = source("src/rune_engine.rs");
+	let cli = source("src/cli.rs");
+	let daemon = source("src/daemon.rs");
+	let sql_wire = source("src/sql_wire.rs");
+	let timestamp = source("src/timestamp.rs");
+	let ctas_test = source("tests/ctas_test.rs");
+	let rune_test = source("tests/rune_relation_handles_test.rs");
+	let scalar = source_block(&ir, "pub enum ScalarValue");
+	let insert_literal = source_block(&ir, "pub enum InsertLiteral");
+	let lower_create = source_block(&planner, "fn lower_create_table_data_type");
+	let lower_insert = source_block(&planner, "fn lower_insert_literal");
+	let lower_expr = source_block(&planner, "fn lower_expr");
+	let typed_null = source_block(&binder, "fn typed_null_for_data_type");
+	let ctas_lattice = source_block(&binder, "fn is_supported_ctas_column_type");
+	let coerce_insert = source_block(&binder, "fn coerce_insert_literal");
+	let coerce_compare = source_block(&binder, "fn coerce_literal_value");
+	let in_list_scalar = source_block(&binder, "fn in_list_scalar_literal_cardinality");
+	let in_list_key = source_block(&binder, "enum InListLiteralKey");
+	let carrier_literal = source_block(&binder, "enum CarrierLiteral");
+	let carrier_domain = source_block(&binder, "enum CarrierDomain");
+	let range_scalar = source_block(&binder, "fn range_scalar_for_fact");
+	let decode_range = source_block(&binder, "fn decode_range_scalar");
+	let sql_keyword = source_block(&binder, "fn sql_carrier_keyword");
+	let pbc_literal = source_block(&pbc, "fn emit_literal");
+	let literal_array = source_block(&exec, "fn timestamp_literal_array");
+	let encode_partition = source_block(&exec, "fn encode_partition_key_value");
+	let group_array = source_block(&exec, "fn group_column");
+	let write_build_array = source_block(&write, "fn build_array");
+	let write_timestamp_array = source_block(&write, "fn build_timestamp_array");
+	let restamp = source_block(&daemon, "fn restamp_sql_result_field");
+
+	for required in [
+		"parse_session_timezone",
+		"parse_explicit_timestamptz",
+		"parse_wall_clock_timestamp",
+		"parse_timestamp_text",
+		"LocalResult::None",
+		"LocalResult::Ambiguous",
+		"wall-clock time does not exist in timezone",
+		"timestamp is not exactly representable at millisecond precision",
+	] {
+		assert!(
+			timestamp.contains(required),
+			"timestamp helper missing {required}"
+		);
+	}
+	assert!(scalar.contains("Timestamp { value: Option<i64>, unit: TimeUnit }"));
+	assert!(ir.contains("utc_timestamp_data_type(*unit)"));
+	assert!(ir.contains("format_utc_timestamp"));
+	assert!(insert_literal.contains("Timestamp { value: i64, unit: TimeUnit }"));
+	assert!(lower_create.contains("TimezoneInfo::WithTimeZone | TimezoneInfo::Tz"));
+	assert!(lower_create.contains("utc_timestamp_data_type"));
+	assert!(planner.contains("TIMESTAMP WITHOUT TIME ZONE is not supported; use TIMESTAMPTZ"));
+	assert!(planner.contains("unsupported TIMESTAMPTZ precision"));
+	assert!(lower_insert.contains("parse_explicit_timestamptz"));
+	assert!(lower_insert.contains("InsertLiteral::Timestamp"));
+	assert!(lower_expr.contains("ScalarValue::Timestamp"));
+	assert!(lower_expr.contains("parse_explicit_timestamptz"));
+	assert!(binder.contains("pub session_timezone: String"));
+	assert!(binder.contains("session_timezone: \"UTC\".to_string()"));
+	assert!(binder.contains("with_session_timezone"));
+	assert!(binder.contains("resolved_session_timezone"));
+	assert!(!binder.contains("iana_time_zone"));
+	assert!(typed_null.contains("DataType::Timestamp(unit, Some(timezone))"));
+	assert!(typed_null.contains("timezone.as_ref() == \"UTC\""));
+	assert!(ctas_lattice.contains("crate::timestamp::is_supported_utc_timestamp(data_type)"));
+	assert!(coerce_insert.contains("InsertLiteral::Timestamp { value, unit }"));
+	assert!(coerce_insert.contains("parse_timestamp_text_for_bind"));
+	assert!(
+		coerce_compare.contains(
+			"(ScalarValue::Utf8(Some(value)), DataType::Timestamp(unit, Some(timezone)))"
+		)
+	);
+	assert!(coerce_compare.contains("parse_timestamp_text_for_bind"));
+	assert!(coerce_compare.contains("timezone.as_ref() == \"UTC\""));
+	assert!(
+		coerce_compare
+			.contains("TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond")
+	);
+	assert!(in_list_key.contains("Timestamp(TimeUnit, i64)"));
+	assert!(in_list_scalar.contains("ScalarValue::Timestamp"));
+	assert!(carrier_literal.contains("Timestamp(i64)"));
+	assert!(carrier_domain.contains("Timestamp(OrderedDomain<i64>)"));
+	assert!(range_scalar.contains("ARROW_STATS_TAG_TIMESTAMP_MILLISECOND"));
+	assert!(range_scalar.contains("ARROW_STATS_TAG_TIMESTAMP_MICROSECOND"));
+	assert!(range_scalar.contains("ARROW_STATS_TAG_TIMESTAMP_NANOSECOND"));
+	assert!(range_scalar.contains("DataType::Timestamp(column_unit, Some(timezone))"));
+	assert!(range_scalar.contains("timestamp_fact_unit(range.arrow_type_tag)"));
+	assert!(range_scalar.contains("column_unit == unit"));
+	assert!(!range_scalar.contains("ARROW_STATS_TAG_DATE64"));
+	assert!(decode_range.contains("ARROW_STATS_TAG_TIMESTAMP_MILLISECOND"));
+	assert!(decode_range.contains("decode_signed_optimizer_fact_scalar"));
+	assert!(sql_keyword.contains("DataType::Timestamp(_, Some(timezone))"));
+	assert!(sql_keyword.contains("Ok(\"TIMESTAMPTZ\")"));
+	assert!(literal_array.contains("TimestampMillisecondArray"));
+	assert!(literal_array.contains("with_timezone(\"UTC\")"));
+	assert!(encode_partition.contains("encoded.push(14)"));
+	assert!(encode_partition.contains("encoded.push(15)"));
+	assert!(encode_partition.contains("encoded.push(16)"));
+	assert!(group_array.contains("TimestampNanosecondArray"));
+	assert!(group_array.contains("with_timezone(\"UTC\")"));
+	assert!(write_build_array.contains("build_timestamp_array"));
+	assert!(write_timestamp_array.contains("TimestampNanosecondBuilder"));
+	assert!(write_timestamp_array.contains("with_timezone(\"UTC\")"));
+	assert!(pbc_literal.contains("ScalarValue::Timestamp { value: Some(_), .. }"));
+	assert!(pbc_literal.contains("Timestamp literals require type-preserving PBC support"));
+	assert!(rune.contains("pub fn lit_timestamp(value: String)"));
+	assert!(rune.contains("parse_explicit_timestamptz(&value, TimeUnit::Nanosecond)"));
+	assert!(rune.contains("ScalarValue::Timestamp"));
+	assert!(rune.contains("m.function([\"lit_timestamp\"], lit_timestamp).build()?;"));
+	assert!(sql_wire.contains("pub fn execute_with_timezone"));
+	assert!(sql_wire.contains("pub session_timezone: String"));
+	assert!(cli.contains("\"--timezone\""));
+	assert!(cli.contains("iana_time_zone::get_timezone"));
+	assert!(daemon.contains("parse_session_timezone(&session_timezone)"));
+	assert!(daemon.contains("with_session_timezone(session_timezone.clone())"));
+	assert!(
+		daemon.contains("execute_query_with_context_and_config(&plan, context, planner_config)")
+	);
+	assert!(
+		restamp.contains("DataType::Timestamp(*unit, Some(session_timezone.to_string().into()))")
+	);
+	assert!(daemon.contains("fn restamp_sql_result_array"));
+	assert!(daemon.contains("with_timezone(session_timezone.to_string())"));
+	assert!(
+		binder.contains("timestamp_session_zone_range_filtered_dim_infers_broadcast_by_estimate")
+	);
+	assert!(binder.contains("timestamp_string_range_uses_session_timezone_for_estimate"));
+	assert!(binder.contains("bare_string_timestamp_interpreted_in_session_zone"));
+	assert!(binder.contains("bare_string_timestamp_with_explicit_offset_normalizes_to_utc"));
+	assert!(binder.contains("insert_timestamp_bare_string_with_explicit_offset_normalizes_to_utc"));
+	assert!(binder.contains("timestamp_string_dst_gap_is_binding_error"));
+	assert!(binder.contains("timestamp_string_dst_fold_chooses_earlier_instant"));
+	assert!(binder.contains("timestamp_precision_loss_in_target_unit_is_bind_error"));
+	assert!(binder.contains("timestamp_in_list_uses_existing_ndv_fact_and_writes_no_hard_bounds"));
+	assert!(binder.contains("timestamp_range_fact_requires_timestamp_column_and_matching_unit"));
+	assert!(
+		binder
+			.contains("date32_stays_civil_not_timestamp_day_boundary_and_date64_fact_remains_dark")
+	);
+	assert!(ctas_test.contains("query_coordinator_executes_timestamptz_projection_ctas"));
+	assert!(rune_test.contains("rune_lit_timestamp_lowers_explicit_offset_to_utc_nanos"));
+}

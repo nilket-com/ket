@@ -402,6 +402,10 @@ where
 		self.tenant_admission.clone()
 	}
 
+	pub fn planner_config(&self) -> PlannerConfig {
+		self.config.clone()
+	}
+
 	pub fn admission_rejection_counters(&self) -> TenantAdmissionRejectionCounters {
 		self.admission_rejections.clone()
 	}
@@ -561,6 +565,132 @@ where
 		cancellation
 	}
 
+	pub async fn execute_query_with_context_and_config(
+		&self,
+		plan: &LogicalPlan,
+		context: ExecutionContext,
+		planner_config: PlannerConfig,
+	) -> Result<Vec<RecordBatch>, QueryError>
+	where
+		Registry: 'static,
+		Transport: 'static,
+	{
+		if logical_plan_is_distributed_read(plan) {
+			let mut stream = self
+				.execute_query_stream_with_context_and_config(plan, context, planner_config)
+				.await?;
+			let mut batches = Vec::new();
+			while let Some(batch) = stream.next().await {
+				batches.push(batch?);
+			}
+			return Ok(batches);
+		}
+		let admitted = self.admit_query(&context).await?;
+		let query_budget = admitted.query_budget;
+		let downstream = DownstreamAttemptRegistry::new(
+			self.downstream_cancel_fanout_permits.clone(),
+			self.downstream_cancellation_metrics.clone(),
+		);
+		let active_query = self.active_queries.register_with_downstream(
+			context.tenant_id,
+			context.query_id,
+			downstream,
+		);
+		let active_query_handle = active_query.handle();
+		let context = context.with_downstream_cancellation(Some(
+			active_query_handle.downstream_cancellation_context(),
+		));
+		let result = self
+			.execute_query_with_config_admission(
+				plan,
+				context,
+				query_budget,
+				Some(active_query_handle),
+				planner_config,
+			)
+			.await;
+		drop(active_query);
+		drop(admitted);
+		result
+	}
+
+	pub async fn execute_query_stream_with_context_and_config(
+		&self,
+		plan: &LogicalPlan,
+		context: ExecutionContext,
+		planner_config: PlannerConfig,
+	) -> Result<DistributedResultStream, QueryError>
+	where
+		Registry: 'static,
+		Transport: 'static,
+	{
+		if !logical_plan_is_distributed_read(plan) {
+			return Err(QueryError::Internal {
+				message: "execute_query_stream supports read queries only in ADR 120 V1"
+					.to_string(),
+			});
+		}
+		let admitted = self.admit_query(&context).await?;
+		let query_budget = admitted.query_budget;
+		let downstream = DownstreamAttemptRegistry::new(
+			self.downstream_cancel_fanout_permits.clone(),
+			self.downstream_cancellation_metrics.clone(),
+		);
+		let active_query = self.active_queries.register_with_downstream(
+			context.tenant_id,
+			context.query_id,
+			downstream,
+		);
+		let active_query_handle = active_query.handle();
+		let context = context.with_downstream_cancellation(Some(
+			active_query_handle.downstream_cancellation_context(),
+		));
+		let (sender, receiver) = mpsc::channel(DISTRIBUTED_RESULT_STREAM_DEPTH);
+		let batch_sent = Arc::new(AtomicBool::new(false));
+		let cancel_remote = self.remote_cancel_spawner();
+		let driver_cancel_remote = cancel_remote.clone();
+		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
+		let registry = Arc::clone(&self.registry);
+		let memory = Arc::clone(&self.memory);
+		let transport = Arc::clone(&self.transport);
+		let config = planner_config;
+		let plan = plan.clone();
+		let stream_active_query = active_query_handle.clone();
+		tokio::spawn(async move {
+			let _admitted = admitted;
+			let _active_query = active_query;
+			let result = run_streaming_read_driver(
+				plan.clone(),
+				catalog,
+				registry,
+				memory,
+				transport,
+				config,
+				context,
+				query_budget,
+				active_query_handle.clone(),
+				sender.clone(),
+				batch_sent,
+			)
+			.await;
+			if let Err(error) = result {
+				let _ = sender.send(Err(error)).await;
+			}
+			if active_query_handle.is_cancelled() {
+				let (first_request, remote_tasks) =
+					active_query_handle.cancel(CancellationTrigger::ClientDisconnect);
+				if first_request && !remote_tasks.is_empty() {
+					driver_cancel_remote(CancellationTrigger::ClientDisconnect, remote_tasks);
+				}
+			}
+		});
+		Ok(DistributedResultStream::new(
+			receiver,
+			stream_active_query,
+			cancel_remote,
+		))
+	}
+
 	fn remote_cancel_spawner(&self) -> RemoteCancelSpawner
 	where
 		Transport: 'static,
@@ -653,6 +783,151 @@ where
 		}
 
 		let mut planner_config = self.config.clone();
+		let mut retried_broadcast_replay = false;
+		let mut fragment_id_namespace = 0;
+		let mut retried_descriptor_evolution = false;
+		let mut invalidated = Vec::new();
+		loop {
+			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			if !invalidated.is_empty() {
+				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
+			}
+			match self
+				.execute_bound_distributed_attempt(
+					bound,
+					&context,
+					query_budget,
+					active_query.clone(),
+					fragment_id_namespace,
+				)
+				.await
+			{
+				Ok(results) => return Ok(results),
+				Err(DistributedAttemptError::Scheduler { error, stages }) => {
+					if !retried_broadcast_replay {
+						if let Some(force_hash_join_ids) =
+							broadcast_cap_replay_trigger(&error, &stages)
+						{
+							planner_config.force_hash_join_ids = force_hash_join_ids;
+							fragment_id_namespace =
+								next_fragment_id_namespace(fragment_id_namespace)?;
+							retried_broadcast_replay = true;
+							continue;
+						}
+					}
+					let error =
+						DistributedAttemptError::Scheduler { error, stages }.into_query_error();
+					if descriptor_evolved_table_id(&error).is_some()
+						&& !retried_descriptor_evolution
+					{
+						if let Some(stale) =
+							invalidate_descriptor_evolution(catalog.as_ref(), &error).await?
+						{
+							invalidated.push(stale);
+						}
+						retried_descriptor_evolution = true;
+						continue;
+					}
+					if descriptor_evolved_table_id(&error).is_some() {
+						return Err(QueryError::SchemaInstability);
+					}
+					return Err(error);
+				}
+				Err(error) => {
+					let error = error.into_query_error();
+					if descriptor_evolved_table_id(&error).is_some()
+						&& !retried_descriptor_evolution
+					{
+						if let Some(stale) =
+							invalidate_descriptor_evolution(catalog.as_ref(), &error).await?
+						{
+							invalidated.push(stale);
+						}
+						retried_descriptor_evolution = true;
+						continue;
+					}
+					if descriptor_evolved_table_id(&error).is_some() {
+						return Err(QueryError::SchemaInstability);
+					}
+					return Err(error);
+				}
+			}
+		}
+	}
+
+	async fn execute_query_with_config_admission(
+		&self,
+		plan: &LogicalPlan,
+		context: ExecutionContext,
+		query_budget: QueryBudget,
+		active_query: Option<ActiveQueryHandle>,
+		planner_config: PlannerConfig,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
+		if matches!(
+			plan,
+			LogicalPlan::CreateTable { .. }
+				| LogicalPlan::CreateLogicalType { .. }
+				| LogicalPlan::DropTable { .. }
+		) {
+			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			return execute_catalog_plan(catalog.as_ref(), self.admin.as_ref(), &context, &bound)
+				.await;
+		}
+		if matches!(plan, LogicalPlan::Insert { .. }) {
+			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let source_executor = DistributedMutationSourceExecutor {
+				coordinator: self,
+				context: &context,
+				query_budget,
+				active_query: active_query.clone(),
+			};
+			let result = execute_write_plan_with_source(
+				catalog.as_ref(),
+				self.writer.as_ref(),
+				self.deleter.as_ref(),
+				self.admin.as_ref(),
+				&context,
+				&source_executor,
+				&bound,
+			)
+			.await;
+			if let Err(error) = &result {
+				invalidate_descriptor_evolution_on_error(catalog.as_ref(), error).await?;
+			}
+			return result;
+		}
+		if matches!(
+			plan,
+			LogicalPlan::InsertSelect { .. }
+				| LogicalPlan::CreateTableAsSelect { .. }
+				| LogicalPlan::Delete { .. }
+				| LogicalPlan::Update { .. }
+		) {
+			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let source_executor = DistributedMutationSourceExecutor {
+				coordinator: self,
+				context: &context,
+				query_budget,
+				active_query: active_query.clone(),
+			};
+			let result = execute_write_plan_with_source(
+				catalog.as_ref(),
+				self.writer.as_ref(),
+				self.deleter.as_ref(),
+				self.admin.as_ref(),
+				&context,
+				&source_executor,
+				&bound,
+			)
+			.await;
+			if let Err(error) = &result {
+				invalidate_descriptor_evolution_on_error(catalog.as_ref(), error).await?;
+			}
+			return result;
+		}
+
+		let mut planner_config = planner_config;
 		let mut retried_broadcast_replay = false;
 		let mut fragment_id_namespace = 0;
 		let mut retried_descriptor_evolution = false;

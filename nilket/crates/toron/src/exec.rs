@@ -20,7 +20,9 @@ use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId,
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Float32Array,
 	Float32Builder, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder,
-	Int64Array, Int64Builder, StringArray, StringBuilder, UInt8Array, UInt16Array, UInt32Array,
+	Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMicrosecondArray,
+	TimestampMicrosecondBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
+	TimestampNanosecondArray, TimestampNanosecondBuilder, UInt8Array, UInt16Array, UInt32Array,
 	UInt64Array,
 };
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or, or_kleene};
@@ -31,7 +33,7 @@ use arrow::compute::kernels::comparison::{
 use arrow::compute::{
 	SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
 use std::collections::hash_map::Entry;
@@ -870,6 +872,9 @@ impl Executor {
 						Ok(Arc::new(arrow::array::Int64Array::from(vec![*v; num_rows])))
 					}
 					ScalarValue::Date32(v) => Ok(Arc::new(Date32Array::from(vec![*v; num_rows]))),
+					ScalarValue::Timestamp { value, unit } => {
+						Ok(timestamp_literal_array(value, *unit, num_rows))
+					}
 					ScalarValue::Float32(v) => {
 						Ok(Arc::new(arrow::array::Float32Array::from(vec![
 							*v;
@@ -1733,11 +1738,27 @@ fn literal_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
 		ScalarValue::Int32(value) => Arc::new(Int32Array::from(vec![*value; num_rows])),
 		ScalarValue::Int64(value) => Arc::new(Int64Array::from(vec![*value; num_rows])),
 		ScalarValue::Date32(value) => Arc::new(Date32Array::from(vec![*value; num_rows])),
+		ScalarValue::Timestamp { value, unit } => timestamp_literal_array(value, *unit, num_rows),
 		ScalarValue::Float32(value) => Arc::new(Float32Array::from(vec![*value; num_rows])),
 		ScalarValue::Float64(value) => Arc::new(Float64Array::from(vec![*value; num_rows])),
 		ScalarValue::Utf8(value) => {
 			Arc::new(StringArray::from(vec![value.clone().as_deref(); num_rows]))
 		}
+	}
+}
+
+fn timestamp_literal_array(value: &Option<i64>, unit: TimeUnit, num_rows: usize) -> ArrayRef {
+	match unit {
+		TimeUnit::Millisecond => {
+			Arc::new(TimestampMillisecondArray::from(vec![*value; num_rows]).with_timezone("UTC"))
+		}
+		TimeUnit::Microsecond => {
+			Arc::new(TimestampMicrosecondArray::from(vec![*value; num_rows]).with_timezone("UTC"))
+		}
+		TimeUnit::Nanosecond => {
+			Arc::new(TimestampNanosecondArray::from(vec![*value; num_rows]).with_timezone("UTC"))
+		}
+		TimeUnit::Second => unreachable!("TimestampSecond is not a supported Toron timestamp unit"),
 	}
 }
 
@@ -1830,6 +1851,9 @@ fn system_table_array(
 			}
 			Ok(Arc::new(builder.finish()))
 		}
+		DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "UTC" => {
+			build_system_timestamp_array(*unit, rows, field_index, field_name)
+		}
 		DataType::Float32 => {
 			let mut builder = Float32Builder::with_capacity(rows.len());
 			for row in rows {
@@ -1865,6 +1889,91 @@ fn system_table_array(
 		}
 		other => Err(ExecutionError::InvalidExpression {
 			message: format!("unsupported system table column type: {other:?}"),
+		}),
+	}
+}
+
+fn build_system_timestamp_array(
+	unit: TimeUnit,
+	rows: &[Vec<ScalarValue>],
+	field_index: usize,
+	field_name: &str,
+) -> Result<ArrayRef, ExecutionError> {
+	match unit {
+		TimeUnit::Millisecond => {
+			let mut builder =
+				TimestampMillisecondBuilder::with_capacity(rows.len()).with_timezone("UTC");
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Timestamp {
+						value: Some(value),
+						unit: TimeUnit::Millisecond,
+					} => builder.append_value(*value),
+					ScalarValue::Timestamp {
+						value: None,
+						unit: TimeUnit::Millisecond,
+					} => builder.append_null(),
+					other => {
+						return Err(system_table_type_mismatch(
+							field_name,
+							"Timestamp(Millisecond, UTC)",
+							other,
+						));
+					}
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		TimeUnit::Microsecond => {
+			let mut builder =
+				TimestampMicrosecondBuilder::with_capacity(rows.len()).with_timezone("UTC");
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Timestamp {
+						value: Some(value),
+						unit: TimeUnit::Microsecond,
+					} => builder.append_value(*value),
+					ScalarValue::Timestamp {
+						value: None,
+						unit: TimeUnit::Microsecond,
+					} => builder.append_null(),
+					other => {
+						return Err(system_table_type_mismatch(
+							field_name,
+							"Timestamp(Microsecond, UTC)",
+							other,
+						));
+					}
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		TimeUnit::Nanosecond => {
+			let mut builder =
+				TimestampNanosecondBuilder::with_capacity(rows.len()).with_timezone("UTC");
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::Timestamp {
+						value: Some(value),
+						unit: TimeUnit::Nanosecond,
+					} => builder.append_value(*value),
+					ScalarValue::Timestamp {
+						value: None,
+						unit: TimeUnit::Nanosecond,
+					} => builder.append_null(),
+					other => {
+						return Err(system_table_type_mismatch(
+							field_name,
+							"Timestamp(Nanosecond, UTC)",
+							other,
+						));
+					}
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		TimeUnit::Second => Err(ExecutionError::InvalidExpression {
+			message: "unsupported system table timestamp unit: Second".to_string(),
 		}),
 	}
 }
@@ -2893,7 +3002,7 @@ fn estimated_build_hash_bytes(key_arrays: &[ArrayRef], rows: usize) -> u64 {
 			DataType::Int16 | DataType::UInt16 => 2,
 			DataType::Int32 | DataType::UInt32 | DataType::Float32 => 4,
 			DataType::Date32 => 4,
-			DataType::Int64 | DataType::UInt64 | DataType::Float64 => 8,
+			DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp(_, _) => 8,
 			DataType::Utf8 => 32,
 			_ => 16,
 		})
@@ -3460,6 +3569,34 @@ fn encode_partition_key_value(
 			encoded.push(13);
 			encoded.extend_from_slice(&values.value(row).to_le_bytes());
 		}
+		DataType::Timestamp(TimeUnit::Millisecond, Some(timezone))
+			if timezone.as_ref() == "UTC" =>
+		{
+			let values = array
+				.as_any()
+				.downcast_ref::<TimestampMillisecondArray>()
+				.expect("timestamp millisecond data type");
+			encoded.push(14);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::Timestamp(TimeUnit::Microsecond, Some(timezone))
+			if timezone.as_ref() == "UTC" =>
+		{
+			let values = array
+				.as_any()
+				.downcast_ref::<TimestampMicrosecondArray>()
+				.expect("timestamp microsecond data type");
+			encoded.push(15);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) if timezone.as_ref() == "UTC" => {
+			let values = array
+				.as_any()
+				.downcast_ref::<TimestampNanosecondArray>()
+				.expect("timestamp nanosecond data type");
+			encoded.push(16);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
 		DataType::Int64 => {
 			let values = array
 				.as_any()
@@ -3549,6 +3686,7 @@ enum GroupValue {
 	Int32(i32),
 	Int64(i64),
 	Date32(i32),
+	Timestamp(TimeUnit, i64),
 	Utf8(String),
 }
 
@@ -3694,6 +3832,24 @@ fn group_value(array: &ArrayRef, row: usize) -> Result<GroupValue, ExecutionErro
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Date32Array>() {
 		return Ok(GroupValue::Date32(array.value(row)));
+	}
+	if let Some(array) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+		return Ok(GroupValue::Timestamp(
+			TimeUnit::Millisecond,
+			array.value(row),
+		));
+	}
+	if let Some(array) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+		return Ok(GroupValue::Timestamp(
+			TimeUnit::Microsecond,
+			array.value(row),
+		));
+	}
+	if let Some(array) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+		return Ok(GroupValue::Timestamp(
+			TimeUnit::Nanosecond,
+			array.value(row),
+		));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
 		return Ok(GroupValue::Utf8(array.value(row).to_string()));
@@ -4317,6 +4473,54 @@ fn group_column(
 				})
 				.collect::<Result<Vec<_>, _>>()?,
 		))),
+		arrow::datatypes::DataType::Timestamp(TimeUnit::Millisecond, Some(timezone))
+			if timezone.as_ref() == "UTC" =>
+		{
+			Ok(Arc::new(
+				TimestampMillisecondArray::from(
+					keys.iter()
+						.map(|key| match &key[idx] {
+							GroupValue::Null => Ok(None),
+							GroupValue::Timestamp(TimeUnit::Millisecond, value) => Ok(Some(*value)),
+							other => Err(group_type_error(data_type, other)),
+						})
+						.collect::<Result<Vec<_>, _>>()?,
+				)
+				.with_timezone("UTC"),
+			))
+		}
+		arrow::datatypes::DataType::Timestamp(TimeUnit::Microsecond, Some(timezone))
+			if timezone.as_ref() == "UTC" =>
+		{
+			Ok(Arc::new(
+				TimestampMicrosecondArray::from(
+					keys.iter()
+						.map(|key| match &key[idx] {
+							GroupValue::Null => Ok(None),
+							GroupValue::Timestamp(TimeUnit::Microsecond, value) => Ok(Some(*value)),
+							other => Err(group_type_error(data_type, other)),
+						})
+						.collect::<Result<Vec<_>, _>>()?,
+				)
+				.with_timezone("UTC"),
+			))
+		}
+		arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone))
+			if timezone.as_ref() == "UTC" =>
+		{
+			Ok(Arc::new(
+				TimestampNanosecondArray::from(
+					keys.iter()
+						.map(|key| match &key[idx] {
+							GroupValue::Null => Ok(None),
+							GroupValue::Timestamp(TimeUnit::Nanosecond, value) => Ok(Some(*value)),
+							other => Err(group_type_error(data_type, other)),
+						})
+						.collect::<Result<Vec<_>, _>>()?,
+				)
+				.with_timezone("UTC"),
+			))
+		}
 		arrow::datatypes::DataType::Utf8 => Ok(Arc::new(StringArray::from(
 			keys.iter()
 				.map(|key| match &key[idx] {

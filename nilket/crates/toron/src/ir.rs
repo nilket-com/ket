@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::catalog::TableRef;
 pub use crate::distributed::identity::{QueryId, StageId};
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use serde::{Deserialize, Serialize};
 use wendelon_client::{
 	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinition, LogicalTypePhysical,
@@ -454,6 +454,7 @@ pub enum ScalarValue {
 	Int32(Option<i32>),
 	Int64(Option<i64>),
 	Date32(Option<i32>),
+	Timestamp { value: Option<i64>, unit: TimeUnit },
 	Float32(Option<f32>),
 	Float64(Option<f64>),
 	Utf8(Option<String>),
@@ -466,6 +467,7 @@ impl ScalarValue {
 			Self::Int32(_) => DataType::Int32,
 			Self::Int64(_) => DataType::Int64,
 			Self::Date32(_) => DataType::Date32,
+			Self::Timestamp { unit, .. } => crate::timestamp::utc_timestamp_data_type(*unit),
 			Self::Float32(_) => DataType::Float32,
 			Self::Float64(_) => DataType::Float64,
 			Self::Utf8(_) => DataType::Utf8,
@@ -484,6 +486,11 @@ impl fmt::Display for ScalarValue {
 			Self::Int64(None) => f.write_str("NULL"),
 			Self::Date32(Some(value)) => f.write_str(&crate::date32::format_date_ymd(*value)),
 			Self::Date32(None) => f.write_str("NULL"),
+			Self::Timestamp {
+				value: Some(value),
+				unit,
+			} => f.write_str(&crate::timestamp::format_utc_timestamp(*value, *unit)),
+			Self::Timestamp { value: None, .. } => f.write_str("NULL"),
 			Self::Float32(Some(value)) => write!(f, "{value}"),
 			Self::Float32(None) => f.write_str("NULL"),
 			Self::Float64(Some(value)) => write!(f, "{value}"),
@@ -671,6 +678,7 @@ pub enum InsertLiteral {
 	Int64(i64),
 	UInt64(u64),
 	Date32(i32),
+	Timestamp { value: i64, unit: TimeUnit },
 	Float64(f64),
 	Utf8(String),
 }

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, Date32Array, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{
+	Array, Date32Array, Int32Array, Int64Array, StringArray, TimestampNanosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use toron::binder::{PlannerConfig, bind};
@@ -508,6 +510,52 @@ async fn query_coordinator_executes_date32_projection_ctas() {
 	let dates = date32_column(&batch, 1);
 	assert_eq!(int32_column(&batch, 0).values(), &[1, 2]);
 	assert_eq!(dates.values(), &[19_723, 19_782]);
+}
+
+#[tokio::test]
+async fn query_coordinator_executes_timestamptz_projection_ctas() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+
+	for sql in [
+		"CREATE TABLE events (id INT NOT NULL, ts TIMESTAMPTZ)",
+		"INSERT INTO events VALUES (1, TIMESTAMPTZ '2024-01-01T00:00:00Z'), (2, TIMESTAMPTZ '2024-01-01T06:00:00Z')",
+		"CREATE TABLE event_copy AS SELECT id, ts FROM events",
+	] {
+		coordinator
+			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
+			.await
+			.expect(sql);
+	}
+
+	let binding = catalog
+		.resolve_table(&TableRef::new("event_copy"))
+		.await
+		.expect("resolve TIMESTAMPTZ CTAS table");
+	assert_field(&binding.schema, 0, "id", &DataType::Int32, false);
+	assert_field(
+		&binding.schema,
+		1,
+		"ts",
+		&DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+		true,
+	);
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT id, ts FROM event_copy ORDER BY id",
+	)
+	.await;
+	let timestamps = timestamp_ns_column(&batch, 1);
+	assert_eq!(int32_column(&batch, 0).values(), &[1, 2]);
+	assert_eq!(
+		timestamps.values(),
+		&[1_704_067_200_000_000_000, 1_704_088_800_000_000_000]
+	);
+	assert_eq!(
+		timestamps.data_type(),
+		&DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+	);
 }
 
 #[tokio::test]
@@ -1093,6 +1141,14 @@ fn date32_column(batch: &RecordBatch, index: usize) -> &Date32Array {
 		.as_any()
 		.downcast_ref::<Date32Array>()
 		.expect("Date32 column")
+}
+
+fn timestamp_ns_column(batch: &RecordBatch, index: usize) -> &TimestampNanosecondArray {
+	batch
+		.column(index)
+		.as_any()
+		.downcast_ref::<TimestampNanosecondArray>()
+		.expect("TimestampNanosecond column")
 }
 
 fn string_column(batch: &RecordBatch, index: usize) -> &StringArray {

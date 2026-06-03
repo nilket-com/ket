@@ -21,6 +21,7 @@ const AUTHENTICATED_CONNECTION_ERROR_PREFIX: &str =
 struct SqlClientOptions {
 	endpoint: SocketAddr,
 	tls: Option<SqlClientTlsOptions>,
+	session_timezone: String,
 }
 
 struct SqlClientTlsOptions {
@@ -429,6 +430,7 @@ fn parse_sql_args(args: &[String]) -> Result<(SqlClientOptions, &[String]), Stri
 	let mut cert_flag: Option<PathBuf> = None;
 	let mut key_flag: Option<PathBuf> = None;
 	let mut ca_flag: Option<PathBuf> = None;
+	let mut timezone_flag: Option<String> = None;
 	let mut index = 0usize;
 
 	while let Some(arg) = args.get(index) {
@@ -471,6 +473,14 @@ fn parse_sql_args(args: &[String]) -> Result<(SqlClientOptions, &[String]), Stri
 					Some(PathBuf::from(args.get(index + 1).ok_or_else(|| {
 						"toron sql --ca requires <path>".to_string()
 					})?));
+				index += 2;
+			}
+			"--timezone" => {
+				timezone_flag = Some(
+					args.get(index + 1)
+						.ok_or_else(|| "toron sql --timezone requires <iana-timezone>".to_string())?
+						.clone(),
+				);
 				index += 2;
 			}
 			flag if flag.starts_with("--") => {
@@ -532,7 +542,19 @@ fn parse_sql_args(args: &[String]) -> Result<(SqlClientOptions, &[String]), Stri
 			"toron sql TLS options require server name, cert, key, and CA together".to_string(),
 		);
 	};
-	Ok((SqlClientOptions { endpoint, tls }, &args[index..]))
+	let session_timezone = timezone_flag.unwrap_or_else(detect_local_timezone);
+	Ok((
+		SqlClientOptions {
+			endpoint,
+			tls,
+			session_timezone,
+		},
+		&args[index..],
+	))
+}
+
+fn detect_local_timezone() -> String {
+	iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string())
 }
 
 async fn run_sql_async(options: SqlClientOptions, statement: String) -> ExitCode {
@@ -604,7 +626,12 @@ async fn run_sql_async(options: SqlClientOptions, statement: String) -> ExitCode
 		}
 	};
 	let query_id = crate::distributed::identity::QueryId::new();
-	let request = crate::sql_wire::SqlFrame::execute(query_id, statement, None);
+	let request = crate::sql_wire::SqlFrame::execute_with_timezone(
+		query_id,
+		statement,
+		None,
+		options.session_timezone,
+	);
 	if let Err(error) = crate::sql_wire::write_frame(&mut stream, &request).await {
 		eprintln!("failed to send toron sql request: {error}");
 		return ExitCode::from(2);
@@ -676,7 +703,7 @@ fn format_batches_for_display(batches: &[RecordBatch]) -> Result<String, arrow::
 
 fn print_usage(program: &str) {
 	eprintln!(
-		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql [--endpoint <socket-addr>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] <statement...>\n  {program} inspect [--endpoint <socket-addr>] --server-name <dns-name> --cert <path> --key <path> --ca <path> [--json]"
+		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql [--endpoint <socket-addr>] [--timezone <iana-timezone>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] <statement...>\n  {program} inspect [--endpoint <socket-addr>] --server-name <dns-name> --cert <path> --key <path> --ca <path> [--json]"
 	);
 }
 
@@ -734,6 +761,85 @@ mod tests {
 		assert!(rendered.contains("(3 rows)"));
 		assert!(!rendered.contains("19723"));
 		assert!(!rendered.contains("19782"));
+	}
+
+	#[test]
+	fn timestamp_select_output_renders_session_timezone() {
+		let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+			arrow::datatypes::Field::new(
+				"observed_at",
+				arrow::datatypes::DataType::Timestamp(
+					arrow::datatypes::TimeUnit::Millisecond,
+					Some("America/Chicago".into()),
+				),
+				true,
+			),
+		]));
+		let utc_value = crate::timestamp::parse_explicit_timestamptz(
+			"2024-01-01T06:00:00Z",
+			arrow::datatypes::TimeUnit::Millisecond,
+		)
+		.expect("timestamp");
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(
+				arrow::array::TimestampMillisecondArray::from(vec![Some(utc_value)])
+					.with_timezone("America/Chicago"),
+			)],
+		)
+		.expect("timestamp batch");
+
+		let rendered = format_batches_for_display(&[batch]).expect("render timestamp batch");
+
+		assert!(rendered.contains("2024-01-01T00:00:00"));
+		assert!(!rendered.contains("2024-01-01T06:00:00"));
+		assert!(rendered.contains("(1 rows)"));
+	}
+
+	#[test]
+	fn cli_sql_timezone_flag_stamps_execute_request() {
+		let _guard = SQL_ENV_LOCK.lock().expect("lock SQL env");
+		clear_sql_env();
+		let cli_args = args(&[
+			"--timezone",
+			"America/Chicago",
+			"SELECT",
+			"TIMESTAMPTZ",
+			"'2024-01-01T00:00:00Z'",
+		]);
+
+		let (options, statement) = parse_sql_args(&cli_args).expect("timezone flag parses");
+
+		assert_eq!(options.session_timezone, "America/Chicago");
+		assert_eq!(statement, &cli_args[2..]);
+		let frame = crate::sql_wire::SqlFrame::execute_with_timezone(
+			crate::distributed::identity::QueryId::from_u128(150),
+			statement.join(" "),
+			None,
+			options.session_timezone,
+		);
+		let crate::sql_wire::SqlMessage::Execute(request) = frame.message else {
+			panic!("expected execute request");
+		};
+		assert_eq!(request.session_timezone, "America/Chicago");
+		assert_eq!(
+			request.statement,
+			"SELECT TIMESTAMPTZ '2024-01-01T00:00:00Z'"
+		);
+	}
+
+	#[test]
+	fn cli_sql_auto_detects_timezone_with_utc_fallback() {
+		let _guard = SQL_ENV_LOCK.lock().expect("lock SQL env");
+		clear_sql_env();
+		let detected = detect_local_timezone();
+		assert!(!detected.is_empty());
+
+		let cli_args = args(&["SELECT", "1"]);
+		let (options, statement) = parse_sql_args(&cli_args).expect("default timezone parses");
+
+		assert_eq!(options.session_timezone, detected);
+		assert_eq!(statement, &cli_args[..]);
 	}
 
 	fn clear_sql_env() {
@@ -1682,6 +1788,7 @@ mod tests {
 				key_path: pki.client_key.clone(),
 				ca_path: pki.wrong_ca_cert.clone(),
 			}),
+			session_timezone: "UTC".to_string(),
 		};
 
 		let exit = run_sql_async(options, "SELECT 1".to_string()).await;

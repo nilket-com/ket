@@ -7,7 +7,7 @@ use crate::ir::{
 	SortExpr,
 };
 use crate::sql_planner::{SqlPlanner, build_join_plan, expr_to_join_keys};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 use rune::alloc::limit;
 use rune::runtime::{TypeHash, VmResult, budget};
 use rune::{Any, Context, Diagnostics, Module, Source, Sources, Unit, Vm};
@@ -555,6 +555,18 @@ pub fn lit_date(value: String) -> VmResult<RuneExpr> {
 	}
 }
 
+pub fn lit_timestamp(value: String) -> VmResult<RuneExpr> {
+	match crate::timestamp::parse_explicit_timestamptz(&value, TimeUnit::Nanosecond) {
+		Ok(value) => VmResult::Ok(RuneExpr {
+			expr: Expr::Literal(ScalarValue::Timestamp {
+				value: Some(value),
+				unit: TimeUnit::Nanosecond,
+			}),
+		}),
+		Err(error) => VmResult::panic(error.to_string()),
+	}
+}
+
 pub fn asc(expr: RuneExpr) -> RuneSortKey {
 	expr.asc()
 }
@@ -916,6 +928,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lit_bool"], lit_bool).build()?;
 	m.function(["lit_i64"], lit_i64).build()?;
 	m.function(["lit_date"], lit_date).build()?;
+	m.function(["lit_timestamp"], lit_timestamp).build()?;
 	m.function(["asc"], asc).build()?;
 	m.function(["desc"], desc).build()?;
 	m.function(["when"], when).build()?;
