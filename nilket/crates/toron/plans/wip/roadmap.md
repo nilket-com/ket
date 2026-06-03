@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–150 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–151 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,57 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 150 promoted; ADR 151 candidates
+### ADR 151 promoted; ADR 152 candidates
+
+ADR 151 promoted **Session-Zoned Temporal Operations** — makes the 149/150
+`Date32`/`Timestamp` scalars *computable*, not just filterable: SQL `EXTRACT`/
+`date_part`/`date_trunc`/`AT TIME ZONE` + first-class Rune helpers, **Toron-only**
+(no Wendelon producer, fact schema, PBC opcode, persistent session, or
+`SET TIME ZONE`). Toron has **no scalar-function framework**, so these are
+hand-wired `Expr`/`BoundExprNode` variants following the `TimeBucket` precedent
+(typed field enums; the single-input node already threaded through every
+structural site). **Load-bearing decisions:** **bind-time zone resolution** — the
+executor is **session-stateless** (`evaluate_bound_program_without_storage` has no
+`PlannerConfig`), so the effective zone is resolved at bind (where the ctx carries
+the resolved `session_timezone: Tz`, `binder.rs:506`) and **baked into the bound
+node** (grounded 2-of-3 over Gemini's exec-time injection, which couldn't read a
+session zone the executor lacks and was type-directed); **structural (not type-directed)
+zone detection** — a plain UTC column and `AT TIME ZONE 'UTC'` are both
+`Timestamp(_, Some("UTC"))`, so bind inspects the explicit `Expr::AtTimeZone`
+wrapper, never the `DataType` tag, else the plain column wrongly extracts in UTC
+instead of the session zone; `date_trunc` is a **calendar helper reusing 150's
+`chrono-tz`/DST machinery verbatim** (`utc_datetime_from_ticks` → `with_timezone`
+→ truncate civil → `from_local_datetime` [gap→error, fold→earlier] →
+`ticks_from_utc_datetime`), **not** `TimeBucket` floor-division (which mis-buckets
+DST-day/month/year), returning a UTC instant at bucket-start; `AT TIME ZONE`
+annotates a UTC instant (same ticks, never naive `Timestamp(_, None)`); 150's
+result-restamp retargeted to preserve explicit non-UTC zones (`daemon.rs:1473`);
+`EXTRACT`/`date_part`→`Int32`; `TIME_BUCKET` stays fenced-experimental; optimizer/
+PBC unchanged (declines all three; 150's `range_scalar_for_fact` UTC-column fence
+intact). Genuine 3-of-3 on topic/scope/semantics; the resolution *mechanism* was a
+2-of-3 resolved on the session-stateless-executor grounding (Gemini's ADR prose
+correct, impl mechanism grounded-against). Headline gate:
+`extract_hour_from_timestamp_at_time_zone_uses_named_zone` (session NY,
+`EXTRACT(HOUR FROM event_time AT TIME ZONE 'America/Chicago')` → Chicago hour;
+fails on `main`).
+
+**ADR 152 lead candidates:** **interval arithmetic** (the deferred temporal
+completion — `ts ± INTERVAL`, needs a new `Interval` scalar + typed add; the
+natural "finish temporal" follow-on, a genuine mechanism boundary 151 stopped at);
+**measured-skew heavy-hitter / Count-Min** (the first estimate-*quality* spine cut
+— equality/IN under-estimate hot keys under the uniform assumption all of
+141/148/149/150/151 rests on; **still gated on a *measured* miss** + a new Wendelon
+producer, so evidence first); **`week`/`quarter` + Date32 `date_trunc`** (small
+temporal completion — separate week-start/ISO + quarter calendar policy; fold-able,
+not its own ADR); **`SET TIME ZONE` / REPL client** (the deferred persistent-session
+surface — net-new client/protocol, the honest home for `SET`; no `SET` handler, no
+REPL today); **tighten the byte estimate** (`binder.rs:70` 16 KiB framing constant
+— tiny, fold into the next estimate-surface cut). **Forward arc:** `151 temporal
+ops → (intervals · measured-miss → skew/quantile estimate quality) → Theta
+join-key intersection → join selectivity → reordering`. Evidence-gate the next
+pick on the 151 feat.
+
+### ADR 150 promoted; ADR 151 candidates (HISTORICAL)
 
 ADR 150 promoted **Timezone-Aware Timestamp Selectivity + Per-Request Session
 Timezone** — makes `Timestamp` a first-class **UTC-instant** Toron scalar so event-time
