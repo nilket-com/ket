@@ -439,12 +439,17 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 		"pub fn minutes(value: i64)",
 		"pub fn hours(value: i64)",
 		"pub fn days(value: i64)",
+		"pub fn months(value: i64)",
+		"pub fn years(value: i64)",
 		"m.function([\"days\"], days).build()?;",
+		"m.function([\"months\"], months).build()?;",
+		"m.function([\"years\"], years).build()?;",
 	] {
 		assert!(rune.contains(required), "Rune missing {required}");
 	}
 	for required_test in [
 		"relative_interval_filter_spends_timestamp_range_fact",
+		"relative_calendar_month_filter_spends_timestamp_range_fact",
 		"timestamp_plus_interval_preserves_utc_instant_type",
 		"timestamp_minus_interval_preserves_utc_instant_type",
 		"timestamp_minus_timestamp_returns_interval_in_shared_unit",
@@ -454,13 +459,95 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 		"timestamp_plus_timestamp_rejects",
 		"interval_day_is_fixed_86400s_not_civil",
 		"non_representable_interval_precision_rejects",
-		"calendar_month_year_interval_literal_rejects_in_v1",
+		"calendar_month_year_interval_literals_are_year_month",
+		"timestamp_plus_calendar_interval_uses_session_zone_and_eom_clamp",
+		"timestamp_calendar_literal_arithmetic_folds_in_bind",
+		"date32_calendar_arithmetic_clamps_end_of_month",
+		"calendar_interval_plus_interval_returns_year_month",
+		"calendar_interval_runtime_array_arithmetic_uses_year_month",
+		"calendar_interval_comparison_rejects",
+		"calendar_fixed_interval_mix_rejects",
 		"date32_plus_interval_rejects_in_v1",
 		"rune_interval_arithmetic_matches_sql",
+		"rune_calendar_interval_arithmetic_matches_sql",
 	] {
 		assert!(
 			binder.contains(required_test),
 			"missing behavior gate {required_test}"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr153_calendar_month_year_interval_arithmetic_is_session_framed() {
+	let binder = source("src/binder.rs");
+	let ir = source("src/ir.rs");
+	let planner = source("src/sql_planner.rs");
+	let exec = source("src/exec.rs");
+	let timestamp = source("src/timestamp.rs");
+	let date32 = source("src/date32.rs");
+	let pbc = source("src/pbc.rs");
+	let rune = source("src/rune_engine.rs");
+	let write = source("src/coordinator/write.rs");
+	let bind_arithmetic = source_block(&binder, "fn bind_arithmetic");
+	let calendar_output = source_block(&binder, "fn calendar_arithmetic_output_type");
+	let calendar_fold = source_block(&binder, "fn fold_calendar_arithmetic");
+	let calendar_exec = source_block(&exec, "fn evaluate_calendar_arithmetic");
+	let timestamp_helper = source_block(&timestamp, "pub(crate) fn add_calendar_months");
+	let date32_helper = source_block(&date32, "pub(crate) fn add_calendar_months");
+
+	assert!(ir.contains("CalendarMonthInterval(Option<i32>)"));
+	assert!(ir.contains("pub fn calendar_month_interval_data_type() -> DataType"));
+	assert!(ir.contains("DataType::Interval(IntervalUnit::YearMonth)"));
+	assert!(planner.contains("LoweredIntervalLiteral::CalendarMonths"));
+	assert!(planner.contains("ScalarValue::CalendarMonthInterval(Some(months))"));
+	assert!(planner.contains("DateTimeField::Month | DateTimeField::Months"));
+	assert!(planner.contains("DateTimeField::Year | DateTimeField::Years"));
+	assert!(planner.contains("checked_interval_months(amount, 12)"));
+	assert!(rune.contains("fn calendar_interval_literal"));
+	assert!(rune.contains("ScalarValue::CalendarMonthInterval(Some(months))"));
+	assert!(rune.contains("pub fn months(value: i64)"));
+	assert!(rune.contains("pub fn years(value: i64)"));
+
+	assert!(bind_arithmetic.contains("calendar_arithmetic_output_type(&op"));
+	assert!(
+		bind_arithmetic
+			.find("calendar_arithmetic_output_type(&op")
+			.expect("calendar branch")
+			< bind_arithmetic
+				.find("temporal_arithmetic_output_type(&op")
+				.expect("fixed temporal branch")
+	);
+	assert!(calendar_output.contains("Timestamp + CalendarMonthInterval"));
+	assert!(calendar_output.contains("CalendarMonthInterval + Timestamp"));
+	assert!(calendar_output.contains("DataType::Date32"));
+	assert!(calendar_output.contains("CalendarMonthInterval - Timestamp is not supported"));
+	assert!(binder.contains("fn bind_calendar_arithmetic_operands"));
+	assert!(binder.contains("fn bind_calendar_timestamp_operand"));
+	assert!(binder.contains("builder.append_at_time_zone"));
+	assert!(binder.contains("CalendarMonthInterval comparison is deferred"));
+	assert!(calendar_fold.contains("add_calendar_months_for_bind"));
+	assert!(calendar_fold.contains("add_date32_calendar_months_for_bind"));
+	assert!(binder.contains("crate::timestamp::add_calendar_months"));
+	assert!(binder.contains("crate::date32::add_calendar_months"));
+
+	assert!(timestamp_helper.contains("Months::new"));
+	assert!(timestamp_helper.contains("resolve_local_datetime"));
+	assert!(timestamp.contains("fn resolve_local_datetime"));
+	assert!(date32_helper.contains("civil_from_days"));
+	assert!(date32_helper.contains("days_from_civil"));
+	assert!(date32.contains("fn days_in_month_i64"));
+
+	assert!(exec.contains("IntervalYearMonthArray"));
+	assert!(exec.contains("IntervalYearMonthBuilder"));
+	assert!(exec.contains("fn evaluate_calendar_arithmetic"));
+	assert!(exec.contains("fn calendar_timestamp_context"));
+	assert!(exec.contains("parse_temporal_execution_zone(zone.as_ref())"));
+	assert!(calendar_exec.contains("evaluate_timestamp_calendar_interval"));
+	assert!(calendar_exec.contains("evaluate_date32_calendar_interval"));
+	assert!(calendar_exec.contains("evaluate_calendar_interval_interval"));
+	assert!(!calendar_exec.contains("arrow::compute"));
+	assert!(write.contains("IntervalYearMonthBuilder"));
+	assert!(pbc.contains("calendar interval arithmetic is not PBC-eligible"));
+	assert!(pbc.contains("calendar interval literals are not PBC-eligible"));
 }

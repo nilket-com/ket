@@ -576,6 +576,24 @@ fn interval_literal(amount: i64, nanos_per_unit: i64, unit: &'static str) -> VmR
 	}
 }
 
+fn calendar_interval_literal(
+	amount: i64,
+	months_per_unit: i64,
+	unit: &'static str,
+) -> VmResult<RuneExpr> {
+	match amount
+		.checked_mul(months_per_unit)
+		.and_then(|months| i32::try_from(months).ok())
+	{
+		Some(months) => VmResult::Ok(RuneExpr {
+			expr: Expr::Literal(ScalarValue::CalendarMonthInterval(Some(months))),
+		}),
+		None => VmResult::panic(format!(
+			"interval {unit} value overflows i32 calendar months"
+		)),
+	}
+}
+
 pub fn nanoseconds(value: i64) -> VmResult<RuneExpr> {
 	interval_literal(value, 1, "nanoseconds")
 }
@@ -602,6 +620,14 @@ pub fn hours(value: i64) -> VmResult<RuneExpr> {
 
 pub fn days(value: i64) -> VmResult<RuneExpr> {
 	interval_literal(value, 24 * 60 * 60 * 1_000_000_000, "days")
+}
+
+pub fn months(value: i64) -> VmResult<RuneExpr> {
+	calendar_interval_literal(value, 1, "months")
+}
+
+pub fn years(value: i64) -> VmResult<RuneExpr> {
+	calendar_interval_literal(value, 12, "years")
 }
 
 pub fn asc(expr: RuneExpr) -> RuneSortKey {
@@ -1001,6 +1027,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["minutes"], minutes).build()?;
 	m.function(["hours"], hours).build()?;
 	m.function(["days"], days).build()?;
+	m.function(["months"], months).build()?;
+	m.function(["years"], years).build()?;
 	m.function(["asc"], asc).build()?;
 	m.function(["desc"], desc).build()?;
 	m.function(["when"], when).build()?;

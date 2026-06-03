@@ -29,7 +29,8 @@ use crate::ir::{
 	JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
 	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
 	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
-	TemporalExtractField, TemporalTruncField, arithmetic_output_type, decode_column_logical_type,
+	TemporalExtractField, TemporalTruncField, arithmetic_output_type,
+	calendar_month_interval_data_type, decode_column_logical_type,
 	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
 	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, schema_for_exprs,
 };
@@ -1877,6 +1878,7 @@ fn typed_null_for_data_type(data_type: &DataType) -> Result<ScalarValue, Binding
 		DataType::Float32 => Ok(ScalarValue::Float32(None)),
 		DataType::Float64 => Ok(ScalarValue::Float64(None)),
 		DataType::Duration(TimeUnit::Nanosecond) => Ok(ScalarValue::Interval(None)),
+		DataType::Interval(IntervalUnit::YearMonth) => Ok(ScalarValue::CalendarMonthInterval(None)),
 		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
 		other => Err(BindingError::TypeMismatch {
 			message: format!("unsupported NULL target type: {other:?}"),
@@ -4108,6 +4110,8 @@ fn in_list_scalar_literal_cardinality(value: &ScalarValue) -> Option<InListLiter
 		ScalarValue::Timestamp { value: None, .. } => Some(InListLiteralCardinality::Null),
 		ScalarValue::Interval(Some(_)) => None,
 		ScalarValue::Interval(None) => Some(InListLiteralCardinality::Null),
+		ScalarValue::CalendarMonthInterval(Some(_)) => None,
+		ScalarValue::CalendarMonthInterval(None) => Some(InListLiteralCardinality::Null),
 		ScalarValue::Float32(Some(value)) => {
 			if !value.is_finite() {
 				return None;
@@ -4742,6 +4746,7 @@ fn literal_is_non_null(value: &ScalarValue) -> bool {
 		ScalarValue::Date32(value) => value.is_some(),
 		ScalarValue::Timestamp { value, .. } => value.is_some(),
 		ScalarValue::Interval(value) => value.is_some(),
+		ScalarValue::CalendarMonthInterval(value) => value.is_some(),
 		ScalarValue::Float32(value) => value.is_some(),
 		ScalarValue::Float64(value) => value.is_some(),
 		ScalarValue::Utf8(value) => value.is_some(),
@@ -7168,6 +7173,62 @@ fn temporal_operand_zone<'a>(
 	}
 }
 
+fn calendar_arithmetic_timezone(
+	ctx: &ExprBindContext<'_>,
+	left_expr: &Expr,
+	right_expr: &Expr,
+	left_type: &DataType,
+	right_type: &DataType,
+) -> Result<Tz, BindingError> {
+	let zone = if matches!(left_type, DataType::Timestamp(_, _)) {
+		temporal_operand_zone(ctx, left_expr)?.0
+	} else if matches!(right_type, DataType::Timestamp(_, _)) {
+		temporal_operand_zone(ctx, right_expr)?.0
+	} else {
+		ctx.session_timezone.to_string()
+	};
+	crate::timestamp::parse_session_timezone(&zone).map_err(|error| BindingError::TypeMismatch {
+		message: error.to_string(),
+	})
+}
+
+fn bind_calendar_arithmetic_operands(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	left_expr: &Expr,
+	right_expr: &Expr,
+	left: BoundExprId,
+	right: BoundExprId,
+	left_type: &DataType,
+	right_type: &DataType,
+) -> Result<(BoundExprId, BoundExprId), BindingError> {
+	let left = bind_calendar_timestamp_operand(builder, ctx, left_expr, left, left_type)?;
+	let right = bind_calendar_timestamp_operand(builder, ctx, right_expr, right, right_type)?;
+	Ok((left, right))
+}
+
+fn bind_calendar_timestamp_operand(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	original: &Expr,
+	bound: BoundExprId,
+	data_type: &DataType,
+) -> Result<BoundExprId, BindingError> {
+	if !matches!(data_type, DataType::Timestamp(_, _)) {
+		return Ok(bound);
+	}
+	let unit = calendar_timestamp_arithmetic_unit(data_type, "CalendarMonthInterval arithmetic")?;
+	let (zone, _, explicit_zone) = temporal_operand_zone(ctx, original)?;
+	if explicit_zone {
+		return Ok(bound);
+	}
+	Ok(builder.append_at_time_zone(
+		bound,
+		zone.clone(),
+		DataType::Timestamp(unit, Some(zone.into())),
+	))
+}
+
 fn validate_temporal_zone(zone: &str) -> Result<String, BindingError> {
 	crate::timestamp::parse_session_timezone(zone)
 		.map(|zone| zone.to_string())
@@ -7291,8 +7352,130 @@ fn temporal_arithmetic_output_type(
 	}
 }
 
+fn calendar_arithmetic_output_type(
+	op: &BoundBinaryOp,
+	left: &DataType,
+	right: &DataType,
+) -> Result<Option<DataType>, BindingError> {
+	let left_is_calendar = is_calendar_month_interval_type(left);
+	let right_is_calendar = is_calendar_month_interval_type(right);
+	if !left_is_calendar && !right_is_calendar {
+		return Ok(None);
+	}
+	if (left_is_calendar && is_interval_type(right))
+		|| (is_interval_type(left) && right_is_calendar)
+	{
+		return Err(BindingError::TypeMismatch {
+			message:
+				"CalendarMonthInterval and fixed-duration Interval arithmetic is not supported"
+					.to_string(),
+		});
+	}
+	if matches!(op, BoundBinaryOp::Mul | BoundBinaryOp::Div) {
+		return Err(BindingError::TypeMismatch {
+			message: "CalendarMonthInterval multiplication and division are deferred".to_string(),
+		});
+	}
+
+	let left_is_timestamp = matches!(left, DataType::Timestamp(_, _));
+	let right_is_timestamp = matches!(right, DataType::Timestamp(_, _));
+	let left_is_date32 = matches!(left, DataType::Date32);
+	let right_is_date32 = matches!(right, DataType::Date32);
+
+	match op {
+		BoundBinaryOp::Add => match (
+			left_is_timestamp,
+			right_is_timestamp,
+			left_is_date32,
+			right_is_date32,
+			left_is_calendar,
+			right_is_calendar,
+		) {
+			(true, false, false, false, false, true) => {
+				let unit =
+					calendar_timestamp_arithmetic_unit(left, "Timestamp + CalendarMonthInterval")?;
+				Ok(Some(DataType::Timestamp(unit, Some("UTC".into()))))
+			}
+			(false, true, false, false, true, false) => {
+				let unit =
+					calendar_timestamp_arithmetic_unit(right, "CalendarMonthInterval + Timestamp")?;
+				Ok(Some(DataType::Timestamp(unit, Some("UTC".into()))))
+			}
+			(false, false, true, false, false, true) => Ok(Some(DataType::Date32)),
+			(false, false, false, false, true, true) => {
+				Ok(Some(calendar_month_interval_data_type()))
+			}
+			_ => Err(calendar_arithmetic_mismatch(left, right)),
+		},
+		BoundBinaryOp::Sub => match (
+			left_is_timestamp,
+			right_is_timestamp,
+			left_is_date32,
+			right_is_date32,
+			left_is_calendar,
+			right_is_calendar,
+		) {
+			(true, false, false, false, false, true) => {
+				let unit =
+					calendar_timestamp_arithmetic_unit(left, "Timestamp - CalendarMonthInterval")?;
+				Ok(Some(DataType::Timestamp(unit, Some("UTC".into()))))
+			}
+			(false, false, true, false, false, true) => Ok(Some(DataType::Date32)),
+			(false, false, false, false, true, true) => {
+				Ok(Some(calendar_month_interval_data_type()))
+			}
+			(false, true, false, false, true, false) => Err(BindingError::TypeMismatch {
+				message: "CalendarMonthInterval - Timestamp is not supported".to_string(),
+			}),
+			_ => Err(calendar_arithmetic_mismatch(left, right)),
+		},
+		BoundBinaryOp::Mul | BoundBinaryOp::Div => Ok(None),
+		BoundBinaryOp::Eq
+		| BoundBinaryOp::Neq
+		| BoundBinaryOp::Lt
+		| BoundBinaryOp::Lte
+		| BoundBinaryOp::Gt
+		| BoundBinaryOp::Gte
+		| BoundBinaryOp::And
+		| BoundBinaryOp::Or => Ok(None),
+	}
+}
+
+fn calendar_arithmetic_mismatch(left: &DataType, right: &DataType) -> BindingError {
+	BindingError::TypeMismatch {
+		message: format!(
+			"CalendarMonthInterval arithmetic expects Timestamp, Date32, or CalendarMonthInterval operands, got {left:?} and {right:?}"
+		),
+	}
+}
+
+fn is_calendar_month_interval_type(data_type: &DataType) -> bool {
+	matches!(data_type, DataType::Interval(IntervalUnit::YearMonth))
+}
+
 fn is_interval_type(data_type: &DataType) -> bool {
 	matches!(data_type, DataType::Duration(TimeUnit::Nanosecond))
+}
+
+fn calendar_timestamp_arithmetic_unit(
+	data_type: &DataType,
+	operator: &str,
+) -> Result<TimeUnit, BindingError> {
+	match data_type {
+		DataType::Timestamp(
+			unit @ (TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond),
+			Some(_),
+		) => Ok(*unit),
+		DataType::Timestamp(_, None) => Err(BindingError::TypeMismatch {
+			message: format!("{operator} does not support Timestamp without timezone"),
+		}),
+		DataType::Timestamp(unit, Some(_)) => Err(BindingError::TypeMismatch {
+			message: format!("{operator} does not support Timestamp unit {unit:?}"),
+		}),
+		other => Err(BindingError::TypeMismatch {
+			message: format!("{operator} expects Timestamp input, got {other:?}"),
+		}),
+	}
 }
 
 fn timestamp_arithmetic_unit(
@@ -7319,6 +7502,129 @@ fn timestamp_arithmetic_unit(
 			message: format!("{operator} expects Timestamp input, got {other:?}"),
 		}),
 	}
+}
+
+fn fold_calendar_arithmetic(
+	op: &BoundBinaryOp,
+	left: &ScalarValue,
+	right: &ScalarValue,
+	output_type: &DataType,
+	timezone: Tz,
+) -> Result<ScalarValue, BindingError> {
+	if !literal_is_non_null(left) || !literal_is_non_null(right) {
+		return typed_null_for_data_type(output_type);
+	}
+	match (op, left, right) {
+		(
+			&BoundBinaryOp::Add,
+			ScalarValue::Timestamp {
+				value: Some(timestamp),
+				unit,
+			},
+			ScalarValue::CalendarMonthInterval(Some(months)),
+		) => Ok(ScalarValue::Timestamp {
+			value: Some(add_calendar_months_for_bind(
+				*timestamp, *unit, timezone, *months,
+			)?),
+			unit: *unit,
+		}),
+		(
+			&BoundBinaryOp::Add,
+			ScalarValue::CalendarMonthInterval(Some(months)),
+			ScalarValue::Timestamp {
+				value: Some(timestamp),
+				unit,
+			},
+		) => Ok(ScalarValue::Timestamp {
+			value: Some(add_calendar_months_for_bind(
+				*timestamp, *unit, timezone, *months,
+			)?),
+			unit: *unit,
+		}),
+		(
+			&BoundBinaryOp::Sub,
+			ScalarValue::Timestamp {
+				value: Some(timestamp),
+				unit,
+			},
+			ScalarValue::CalendarMonthInterval(Some(months)),
+		) => Ok(ScalarValue::Timestamp {
+			value: Some(add_calendar_months_for_bind(
+				*timestamp,
+				*unit,
+				timezone,
+				negate_calendar_months(*months, op, output_type)?,
+			)?),
+			unit: *unit,
+		}),
+		(
+			&BoundBinaryOp::Add,
+			ScalarValue::Date32(Some(days)),
+			ScalarValue::CalendarMonthInterval(Some(months)),
+		) => Ok(ScalarValue::Date32(Some(
+			add_date32_calendar_months_for_bind(*days, *months)?,
+		))),
+		(
+			&BoundBinaryOp::Sub,
+			ScalarValue::Date32(Some(days)),
+			ScalarValue::CalendarMonthInterval(Some(months)),
+		) => Ok(ScalarValue::Date32(Some(
+			add_date32_calendar_months_for_bind(
+				*days,
+				negate_calendar_months(*months, op, output_type)?,
+			)?,
+		))),
+		(
+			&BoundBinaryOp::Add,
+			ScalarValue::CalendarMonthInterval(Some(left)),
+			ScalarValue::CalendarMonthInterval(Some(right)),
+		) => Ok(ScalarValue::CalendarMonthInterval(Some(
+			left.checked_add(*right)
+				.ok_or_else(|| temporal_arithmetic_overflow(op, output_type))?,
+		))),
+		(
+			&BoundBinaryOp::Sub,
+			ScalarValue::CalendarMonthInterval(Some(left)),
+			ScalarValue::CalendarMonthInterval(Some(right)),
+		) => Ok(ScalarValue::CalendarMonthInterval(Some(
+			left.checked_sub(*right)
+				.ok_or_else(|| temporal_arithmetic_overflow(op, output_type))?,
+		))),
+		_ => Err(BindingError::TypeMismatch {
+			message: format!(
+				"unsupported calendar interval arithmetic literal operands: {left:?} and {right:?}"
+			),
+		}),
+	}
+}
+
+fn add_calendar_months_for_bind(
+	timestamp: i64,
+	unit: TimeUnit,
+	timezone: Tz,
+	months: i32,
+) -> Result<i64, BindingError> {
+	crate::timestamp::add_calendar_months(timestamp, unit, timezone, months).map_err(|error| {
+		BindingError::TypeMismatch {
+			message: error.to_string(),
+		}
+	})
+}
+
+fn add_date32_calendar_months_for_bind(days: i32, months: i32) -> Result<i32, BindingError> {
+	crate::date32::add_calendar_months(days, months).map_err(|error| BindingError::TypeMismatch {
+		message: error.to_string(),
+	})
+}
+
+fn negate_calendar_months(
+	months: i32,
+	op: &BoundBinaryOp,
+	output_type: &DataType,
+) -> Result<i32, BindingError> {
+	months
+		.checked_neg()
+		.ok_or_else(|| temporal_arithmetic_overflow(op, output_type))
 }
 
 fn fold_temporal_arithmetic(
@@ -7663,6 +7969,8 @@ fn bind_arithmetic(
 		}
 		(false, false) => {}
 	}
+	let left_expr = left;
+	let right_expr = right;
 	let left = bind_expr_into_program(builder, left, input_schema, ctx)?;
 	let right = bind_expr_into_program(builder, right, input_schema, ctx)?;
 	let left_type = builder
@@ -7673,6 +7981,34 @@ fn bind_arithmetic(
 		.node_type(right)
 		.cloned()
 		.expect("builder returns typed right node");
+	if let Some(output_type) = calendar_arithmetic_output_type(&op, &left_type, &right_type)? {
+		if let (Some(left_literal), Some(right_literal)) = (
+			builder.literal(left).cloned(),
+			builder.literal(right).cloned(),
+		) {
+			let timezone =
+				calendar_arithmetic_timezone(ctx, left_expr, right_expr, &left_type, &right_type)?;
+			let folded = fold_calendar_arithmetic(
+				&op,
+				&left_literal,
+				&right_literal,
+				&output_type,
+				timezone,
+			)?;
+			return Ok(builder.append_literal(folded));
+		}
+		let (left, right) = bind_calendar_arithmetic_operands(
+			builder,
+			ctx,
+			left_expr,
+			right_expr,
+			left,
+			right,
+			&left_type,
+			&right_type,
+		)?;
+		return Ok(builder.append_binary(op, left, right, output_type));
+	}
 	if let Some(output_type) = temporal_arithmetic_output_type(&op, &left_type, &right_type)? {
 		if let (Some(left_literal), Some(right_literal)) = (
 			builder.literal(left).cloned(),
@@ -8117,6 +8453,7 @@ fn bind_comparison(
 				.node_type(right)
 				.cloned()
 				.expect("builder returns typed comparison right");
+			reject_calendar_month_interval_comparison(&right_type)?;
 			let left = resolve_untyped_null(builder, &right_type)?;
 			nominal_compatible(
 				&right_type,
@@ -8138,6 +8475,7 @@ fn bind_comparison(
 				.node_type(left)
 				.cloned()
 				.expect("builder returns typed comparison left");
+			reject_calendar_month_interval_comparison(&left_type)?;
 			let right = resolve_untyped_null(builder, &left_type)?;
 			nominal_compatible(
 				&left_type,
@@ -8166,6 +8504,8 @@ fn bind_comparison(
 		.node_type(right)
 		.cloned()
 		.expect("builder returns typed comparison right");
+	reject_calendar_month_interval_comparison(&left_type)?;
+	reject_calendar_month_interval_comparison(&right_type)?;
 	if left_type != right_type {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
@@ -8187,6 +8527,15 @@ fn bind_comparison(
 		builder.literal(right).is_some(),
 	)?;
 	Ok(builder.append_binary(op, left, right, DataType::Boolean))
+}
+
+fn reject_calendar_month_interval_comparison(data_type: &DataType) -> Result<(), BindingError> {
+	if is_calendar_month_interval_type(data_type) {
+		return Err(BindingError::TypeMismatch {
+			message: "CalendarMonthInterval comparison is deferred".to_string(),
+		});
+	}
+	Ok(())
 }
 
 fn bind_in_list(
@@ -8222,10 +8571,12 @@ fn bind_in_list(
 			.node_type(expr)
 			.cloned()
 			.expect("builder returns typed IN target");
+		reject_calendar_month_interval_comparison(&current_expr_type)?;
 		let item_type = builder
 			.node_type(item)
 			.cloned()
 			.expect("builder returns typed IN member");
+		reject_calendar_month_interval_comparison(&item_type)?;
 		if current_expr_type != item_type {
 			return Err(BindingError::TypeMismatch {
 				message: format!(
@@ -8286,6 +8637,7 @@ fn bind_in_list_with_untyped_target(
 		});
 	}
 	let target_type = case_common_type(&types)?;
+	reject_calendar_month_interval_comparison(&target_type)?;
 	let expr = resolve_untyped_null(builder, &target_type)?;
 	let mut bound_items = Vec::with_capacity(inputs.len());
 	for input in inputs {
@@ -12198,16 +12550,195 @@ mod tests {
 	}
 
 	#[test]
-	fn calendar_month_year_interval_literal_rejects_in_v1() {
-		for sql in [
-			"SELECT INTERVAL '1 month' FROM sales",
-			"SELECT INTERVAL '1' YEAR FROM sales",
+	fn calendar_month_year_interval_literals_are_year_month() {
+		for (sql, expected) in [
+			("SELECT INTERVAL '1 month' FROM sales", 1),
+			("SELECT INTERVAL '12 months' FROM sales", 12),
+			("SELECT INTERVAL '1 year' FROM sales", 12),
+			("SELECT INTERVAL '2 years' FROM sales", 24),
+			("SELECT INTERVAL '1' MONTH FROM sales", 1),
+			("SELECT INTERVAL '1' YEAR FROM sales", 12),
 		] {
-			let err = SqlPlanner::new()
-				.plan(sql)
-				.expect_err("calendar interval should reject");
-			assert!(err.to_string().contains("calendar INTERVAL unit"));
+			let plan = SqlPlanner::new().plan(sql).expect("plan calendar interval");
+			let LogicalPlan::Project { exprs, .. } = plan else {
+				panic!("expected project");
+			};
+			assert!(matches!(
+				&exprs[0],
+				Expr::Literal(ScalarValue::CalendarMonthInterval(Some(value))) if *value == expected
+			));
 		}
+	}
+
+	#[test]
+	fn timestamp_plus_calendar_interval_uses_session_zone_and_eom_clamp() {
+		let program = bind_temporal_expr(
+			Expr::Add(
+				Box::new(Expr::column("event_time")),
+				Box::new(calendar_month_literal(1)),
+			),
+			"America/Chicago",
+		);
+		let root = program.single_root().expect("single root");
+		let Some(BoundExprNode::Binary { left, right, .. }) = program.node(root) else {
+			panic!("expected calendar arithmetic binary");
+		};
+		match program.node(*left) {
+			Some(BoundExprNode::AtTimeZone { zone, .. }) => assert_eq!(zone, "America/Chicago"),
+			other => panic!("expected session-zone timestamp operand, got {other:?}"),
+		}
+		assert_eq!(
+			program.node_type(*right),
+			Some(&DataType::Interval(IntervalUnit::YearMonth))
+		);
+
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-31T06:00:00Z"), 0),
+		)
+		.expect("evaluate timestamp + calendar interval");
+		let values = outputs[0]
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("timestamp output");
+
+		assert_eq!(values.value(0), timestamp_ms("2024-02-29T06:00:00Z"));
+		assert_eq!(
+			values.data_type(),
+			&DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+		);
+	}
+
+	#[test]
+	fn timestamp_calendar_literal_arithmetic_folds_in_bind() {
+		let program = bind_temporal_expr(
+			Expr::Sub(
+				Box::new(Expr::Literal(ScalarValue::Timestamp {
+					value: Some(timestamp_ms("2026-01-31T00:00:00Z")),
+					unit: TimeUnit::Millisecond,
+				})),
+				Box::new(calendar_month_literal(1)),
+			),
+			"UTC",
+		);
+		let root = program.single_root().expect("single root");
+		let Some(BoundExprNode::Literal(slot)) = program.node(root) else {
+			panic!("expected folded timestamp literal");
+		};
+
+		assert_eq!(
+			program.literals[*slot as usize],
+			ScalarValue::Timestamp {
+				value: Some(timestamp_ms("2025-12-31T00:00:00Z")),
+				unit: TimeUnit::Millisecond,
+			}
+		);
+	}
+
+	#[test]
+	fn date32_calendar_arithmetic_clamps_end_of_month() {
+		let program = bind_temporal_expr(
+			Expr::Sub(
+				Box::new(Expr::column("signup_date")),
+				Box::new(calendar_month_literal(12)),
+			),
+			"UTC",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(
+				timestamp_ms("2024-01-01T00:00:00Z"),
+				parse_date_ymd("2024-02-29").expect("date"),
+			),
+		)
+		.expect("evaluate Date32 calendar arithmetic");
+		let values = outputs[0]
+			.as_any()
+			.downcast_ref::<Date32Array>()
+			.expect("Date32 output");
+
+		assert_eq!(values.value(0), parse_date_ymd("2023-02-28").expect("date"));
+		assert_eq!(program.node_type(program.roots[0]), Some(&DataType::Date32));
+	}
+
+	#[test]
+	fn calendar_interval_plus_interval_returns_year_month() {
+		let program = bind_temporal_expr(
+			Expr::Add(
+				Box::new(calendar_month_literal(1)),
+				Box::new(calendar_month_literal(12)),
+			),
+			"UTC",
+		);
+		let root = program.single_root().expect("single root");
+		let Some(BoundExprNode::Literal(slot)) = program.node(root) else {
+			panic!("expected folded calendar interval literal");
+		};
+
+		assert_eq!(
+			program.literals[*slot as usize],
+			ScalarValue::CalendarMonthInterval(Some(13))
+		);
+		assert_eq!(
+			program.node_type(root),
+			Some(&DataType::Interval(IntervalUnit::YearMonth))
+		);
+	}
+
+	#[test]
+	fn calendar_interval_runtime_array_arithmetic_uses_year_month() {
+		let program = bind_temporal_expr(
+			Expr::Add(
+				Box::new(Expr::column("event_time")),
+				Box::new(calendar_month_literal(1)),
+			),
+			"UTC",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-31T00:00:00Z"), 0),
+		)
+		.expect("evaluate calendar interval array arithmetic");
+		let values = outputs[0]
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("timestamp output");
+
+		assert_eq!(values.value(0), timestamp_ms("2024-02-29T00:00:00Z"));
+	}
+
+	#[test]
+	fn calendar_interval_comparison_rejects() {
+		let err = try_bind_temporal_expr(
+			Expr::Gt(
+				Box::new(calendar_month_literal(2)),
+				Box::new(calendar_month_literal(1)),
+			),
+			"UTC",
+		)
+		.expect_err("calendar interval comparison should reject");
+
+		assert!(
+			err.to_string()
+				.contains("CalendarMonthInterval comparison is deferred")
+		);
+	}
+
+	#[test]
+	fn calendar_fixed_interval_mix_rejects() {
+		let err = try_bind_temporal_expr(
+			Expr::Add(
+				Box::new(calendar_month_literal(1)),
+				Box::new(interval_literal(DAY_NANOS)),
+			),
+			"UTC",
+		)
+		.expect_err("calendar/fixed interval mix should reject");
+
+		assert!(
+			err.to_string()
+				.contains("fixed-duration Interval arithmetic is not supported")
+		);
 	}
 
 	#[test]
@@ -12280,6 +12811,68 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn rune_calendar_interval_arithmetic_matches_sql() {
+		let sql = SqlPlanner::new()
+			.plan("SELECT observed_at + INTERVAL '1 month' FROM customers")
+			.expect("plan SQL calendar interval arithmetic");
+		let rune = rune_plan(
+			r#"
+            pub fn main(ctx) {
+                ctx.table("customers").project([col("observed_at").add(months(1))])
+            }
+        "#,
+		)
+		.await;
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(10),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new(
+					"observed_at",
+					crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond),
+					true,
+				),
+			]),
+			Vec::new(),
+		);
+
+		for logical in [sql, rune] {
+			let ExecutionPlan::Project { exprs, .. } = bind(
+				&logical,
+				&catalog,
+				&PlannerConfig::default().with_session_timezone("America/Chicago"),
+			)
+			.await
+			.expect("bind calendar interval project") else {
+				panic!("expected project");
+			};
+			let root = exprs.single_root().expect("single root");
+			assert_eq!(
+				exprs.node_type(root),
+				Some(&DataType::Timestamp(
+					TimeUnit::Millisecond,
+					Some("UTC".into())
+				))
+			);
+			let Some(BoundExprNode::Binary { left, right, .. }) = exprs.node(root) else {
+				panic!("expected timestamp + calendar interval binary");
+			};
+			assert_eq!(
+				exprs.node_type(*right),
+				Some(&DataType::Interval(IntervalUnit::YearMonth))
+			);
+			match exprs.node(*left) {
+				Some(BoundExprNode::AtTimeZone { zone, .. }) => {
+					assert_eq!(zone, "America/Chicago")
+				}
+				other => panic!("expected session-zone timestamp operand, got {other:?}"),
+			}
+		}
+	}
+
+	#[tokio::test]
 	async fn relative_interval_filter_spends_timestamp_range_fact() {
 		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
 			Some(64 * 1024 * 1024),
@@ -12314,6 +12907,56 @@ mod tests {
 		let (plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
 			.await
 			.expect("bind relative interval range-estimated join");
+
+		assert_join_strategy(&plan, JoinStrategy::Broadcast);
+		assert!(matches!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Right,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn relative_calendar_month_filter_spends_timestamp_range_fact() {
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_ndv_and_range(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new(
+					"observed_at",
+					crate::timestamp::utc_timestamp_data_type(TimeUnit::Nanosecond),
+					true,
+				),
+			]),
+			Vec::new(),
+			vec![(
+				ColumnOrdinal(1),
+				range_fact_timestamp_ns(
+					timestamp_ns("2025-12-01T00:00:00Z"),
+					timestamp_ns("2026-02-01T00:00:00Z"),
+					20_000,
+				),
+			)],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 WHERE c.observed_at > TIMESTAMPTZ '2026-01-31T00:00:00Z' - INTERVAL '1 month'",
+			)
+			.expect("plan relative calendar month filter");
+
+		let (plan, trace) = bind_with_trace(
+			&logical,
+			&catalog,
+			&PlannerConfig::default().with_session_timezone("UTC"),
+		)
+		.await
+		.expect("bind relative calendar month range-estimated join");
 
 		assert_join_strategy(&plan, JoinStrategy::Broadcast);
 		assert!(matches!(
@@ -14533,6 +15176,10 @@ mod tests {
 
 	fn interval_literal(nanos: i64) -> Expr {
 		Expr::Literal(ScalarValue::Interval(Some(nanos)))
+	}
+
+	fn calendar_month_literal(months: i32) -> Expr {
+		Expr::Literal(ScalarValue::CalendarMonthInterval(Some(months)))
 	}
 
 	fn temporal_schema() -> SchemaRef {

@@ -22,9 +22,10 @@ use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder,
 	DurationNanosecondArray, DurationNanosecondBuilder, Float32Array, Float32Builder, Float64Array,
 	Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
-	StringArray, StringBuilder, TimestampMicrosecondArray, TimestampMicrosecondBuilder,
-	TimestampMillisecondArray, TimestampMillisecondBuilder, TimestampNanosecondArray,
-	TimestampNanosecondBuilder, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+	IntervalYearMonthArray, IntervalYearMonthBuilder, StringArray, StringBuilder,
+	TimestampMicrosecondArray, TimestampMicrosecondBuilder, TimestampMillisecondArray,
+	TimestampMillisecondBuilder, TimestampNanosecondArray, TimestampNanosecondBuilder, UInt8Array,
+	UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or, or_kleene};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -34,7 +35,7 @@ use arrow::compute::kernels::comparison::{
 use arrow::compute::{
 	SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
 use std::collections::hash_map::Entry;
@@ -878,6 +879,12 @@ impl Executor {
 					}
 					ScalarValue::Interval(value) => {
 						Ok(Arc::new(DurationNanosecondArray::from(vec![
+							*value;
+							num_rows
+						])))
+					}
+					ScalarValue::CalendarMonthInterval(value) => {
+						Ok(Arc::new(IntervalYearMonthArray::from(vec![
 							*value;
 							num_rows
 						])))
@@ -1791,6 +1798,9 @@ fn literal_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
 		ScalarValue::Interval(value) => {
 			Arc::new(DurationNanosecondArray::from(vec![*value; num_rows]))
 		}
+		ScalarValue::CalendarMonthInterval(value) => {
+			Arc::new(IntervalYearMonthArray::from(vec![*value; num_rows]))
+		}
 		ScalarValue::Float32(value) => Arc::new(Float32Array::from(vec![*value; num_rows])),
 		ScalarValue::Float64(value) => Arc::new(Float64Array::from(vec![*value; num_rows])),
 		ScalarValue::Utf8(value) => {
@@ -1916,6 +1926,23 @@ fn system_table_array(
 						return Err(system_table_type_mismatch(
 							field_name,
 							"Duration(Nanosecond)",
+							other,
+						));
+					}
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Interval(IntervalUnit::YearMonth) => {
+			let mut builder = IntervalYearMonthBuilder::with_capacity(rows.len());
+			for row in rows {
+				match system_scalar_at(row, field_index)? {
+					ScalarValue::CalendarMonthInterval(Some(value)) => builder.append_value(*value),
+					ScalarValue::CalendarMonthInterval(None) => builder.append_null(),
+					other => {
+						return Err(system_table_type_mismatch(
+							field_name,
+							"Interval(YearMonth)",
 							other,
 						));
 					}
@@ -5287,6 +5314,20 @@ fn evaluate_temporal_arithmetic(
 	left: &ArrayRef,
 	right: &ArrayRef,
 ) -> Result<Option<ArrayRef>, ExecutionError> {
+	let left_is_calendar = is_calendar_month_interval_type_exec(left.data_type());
+	let right_is_calendar = is_calendar_month_interval_type_exec(right.data_type());
+	if left_is_calendar || right_is_calendar {
+		if left.len() != right.len() {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"temporal arithmetic operand length mismatch: left {}, right {}",
+					left.len(),
+					right.len()
+				),
+			});
+		}
+		return Ok(Some(evaluate_calendar_arithmetic(op, left, right)?));
+	}
 	let left_unit = temporal_timestamp_unit(left.data_type())?;
 	let right_unit = temporal_timestamp_unit(right.data_type())?;
 	let left_is_interval = left.data_type() == &DataType::Duration(TimeUnit::Nanosecond);
@@ -5366,6 +5407,298 @@ fn evaluate_temporal_arithmetic(
 			}),
 		},
 		ArithmeticOp::Mul | ArithmeticOp::Div => Ok(None),
+	}
+}
+
+fn evaluate_calendar_arithmetic(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let left_timestamp = calendar_timestamp_context(left.data_type())?;
+	let right_timestamp = calendar_timestamp_context(right.data_type())?;
+	let left_is_calendar = is_calendar_month_interval_type_exec(left.data_type());
+	let right_is_calendar = is_calendar_month_interval_type_exec(right.data_type());
+	let left_is_date32 = matches!(left.data_type(), DataType::Date32);
+	let right_is_date32 = matches!(right.data_type(), DataType::Date32);
+
+	if (left_is_calendar || right_is_calendar)
+		&& matches!(op, ArithmeticOp::Mul | ArithmeticOp::Div)
+	{
+		return Err(ExecutionError::InvalidExpression {
+			message: "CalendarMonthInterval multiplication and division are deferred".to_string(),
+		});
+	}
+	if (left_is_calendar && right.data_type() == &DataType::Duration(TimeUnit::Nanosecond))
+		|| (left.data_type() == &DataType::Duration(TimeUnit::Nanosecond) && right_is_calendar)
+	{
+		return Err(ExecutionError::InvalidExpression {
+			message:
+				"CalendarMonthInterval and fixed-duration Interval arithmetic is not supported"
+					.to_string(),
+		});
+	}
+
+	match op {
+		ArithmeticOp::Add => match (
+			left_timestamp,
+			right_timestamp,
+			left_is_date32,
+			right_is_date32,
+			left_is_calendar,
+			right_is_calendar,
+		) {
+			(Some((unit, timezone)), None, false, false, false, true) => {
+				let intervals = as_interval_year_month(
+					right,
+					"Timestamp + CalendarMonthInterval right operand",
+				)?;
+				evaluate_timestamp_calendar_interval(op, left, intervals, unit, timezone)
+			}
+			(None, Some((unit, timezone)), false, false, true, false) => {
+				let intervals =
+					as_interval_year_month(left, "CalendarMonthInterval + Timestamp left operand")?;
+				evaluate_timestamp_calendar_interval(op, right, intervals, unit, timezone)
+			}
+			(None, None, true, false, false, true) => {
+				let intervals =
+					as_interval_year_month(right, "Date32 + CalendarMonthInterval right operand")?;
+				evaluate_date32_calendar_interval(op, left, intervals)
+			}
+			(None, None, false, false, true, true) => {
+				evaluate_calendar_interval_interval(op, left, right)
+			}
+			_ => Err(calendar_arithmetic_mismatch_exec(
+				left.data_type(),
+				right.data_type(),
+			)),
+		},
+		ArithmeticOp::Sub => match (
+			left_timestamp,
+			right_timestamp,
+			left_is_date32,
+			right_is_date32,
+			left_is_calendar,
+			right_is_calendar,
+		) {
+			(Some((unit, timezone)), None, false, false, false, true) => {
+				let intervals = as_interval_year_month(
+					right,
+					"Timestamp - CalendarMonthInterval right operand",
+				)?;
+				evaluate_timestamp_calendar_interval(op, left, intervals, unit, timezone)
+			}
+			(None, None, true, false, false, true) => {
+				let intervals =
+					as_interval_year_month(right, "Date32 - CalendarMonthInterval right operand")?;
+				evaluate_date32_calendar_interval(op, left, intervals)
+			}
+			(None, None, false, false, true, true) => {
+				evaluate_calendar_interval_interval(op, left, right)
+			}
+			(None, Some(_), false, false, true, false) => Err(ExecutionError::InvalidExpression {
+				message: "CalendarMonthInterval - Timestamp is not supported".to_string(),
+			}),
+			_ => Err(calendar_arithmetic_mismatch_exec(
+				left.data_type(),
+				right.data_type(),
+			)),
+		},
+		ArithmeticOp::Mul | ArithmeticOp::Div => Err(ExecutionError::InvalidExpression {
+			message: "CalendarMonthInterval multiplication and division are deferred".to_string(),
+		}),
+	}
+}
+
+fn calendar_timestamp_context(
+	data_type: &DataType,
+) -> Result<Option<(TimeUnit, chrono_tz::Tz)>, ExecutionError> {
+	match data_type {
+		DataType::Timestamp(
+			unit @ (TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond),
+			Some(zone),
+		) => Ok(Some((*unit, parse_temporal_execution_zone(zone.as_ref())?))),
+		DataType::Timestamp(_, None) => Err(ExecutionError::InvalidExpression {
+			message: "calendar interval arithmetic does not support Timestamp without timezone"
+				.to_string(),
+		}),
+		DataType::Timestamp(unit, Some(_)) => Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"calendar interval arithmetic does not support Timestamp unit {unit:?}"
+			),
+		}),
+		_ => Ok(None),
+	}
+}
+
+fn is_calendar_month_interval_type_exec(data_type: &DataType) -> bool {
+	matches!(data_type, DataType::Interval(IntervalUnit::YearMonth))
+}
+
+fn evaluate_timestamp_calendar_interval(
+	op: ArithmeticOp,
+	timestamps: &ArrayRef,
+	intervals: &IntervalYearMonthArray,
+	unit: TimeUnit,
+	timezone: chrono_tz::Tz,
+) -> Result<ArrayRef, ExecutionError> {
+	if let Some(array) = timestamps
+		.as_any()
+		.downcast_ref::<TimestampMillisecondArray>()
+	{
+		return timestamp_calendar_interval_array(op, array, intervals, unit, timezone);
+	}
+	if let Some(array) = timestamps
+		.as_any()
+		.downcast_ref::<TimestampMicrosecondArray>()
+	{
+		return timestamp_calendar_interval_array(op, array, intervals, unit, timezone);
+	}
+	if let Some(array) = timestamps
+		.as_any()
+		.downcast_ref::<TimestampNanosecondArray>()
+	{
+		return timestamp_calendar_interval_array(op, array, intervals, unit, timezone);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"Timestamp +/- CalendarMonthInterval expects Timestamp input, got {:?}",
+			timestamps.data_type()
+		),
+	})
+}
+
+fn timestamp_calendar_interval_array<T>(
+	op: ArithmeticOp,
+	timestamps: &T,
+	intervals: &IntervalYearMonthArray,
+	unit: TimeUnit,
+	timezone: chrono_tz::Tz,
+) -> Result<ArrayRef, ExecutionError>
+where
+	for<'a> &'a T: IntoIterator<Item = Option<i64>>,
+	T: Array,
+{
+	let data_type = timestamps.data_type().clone();
+	let values = timestamps
+		.into_iter()
+		.zip(intervals.iter())
+		.map(|(timestamp, months)| {
+			let Some(timestamp) = timestamp else {
+				return Ok(None);
+			};
+			let Some(months) = months else {
+				return Ok(None);
+			};
+			let months = match op {
+				ArithmeticOp::Add => months,
+				ArithmeticOp::Sub => negate_calendar_months_exec(months, op, &data_type)?,
+				ArithmeticOp::Mul | ArithmeticOp::Div => {
+					return Err(ExecutionError::InvalidExpression {
+						message: "CalendarMonthInterval multiplication and division are deferred"
+							.to_string(),
+					});
+				}
+			};
+			crate::timestamp::add_calendar_months(timestamp, unit, timezone, months)
+				.map(Some)
+				.map_err(|error| ExecutionError::InvalidExpression {
+					message: error.to_string(),
+				})
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(timestamp_array_from_values(unit, values))
+}
+
+fn evaluate_date32_calendar_interval(
+	op: ArithmeticOp,
+	dates: &ArrayRef,
+	intervals: &IntervalYearMonthArray,
+) -> Result<ArrayRef, ExecutionError> {
+	let Some(dates) = dates.as_any().downcast_ref::<Date32Array>() else {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"Date32 +/- CalendarMonthInterval expects Date32 input, got {:?}",
+				dates.data_type()
+			),
+		});
+	};
+	let data_type = dates.data_type().clone();
+	let values = dates
+		.iter()
+		.zip(intervals.iter())
+		.map(|(days, months)| {
+			let Some(days) = days else {
+				return Ok(None);
+			};
+			let Some(months) = months else {
+				return Ok(None);
+			};
+			let months = match op {
+				ArithmeticOp::Add => months,
+				ArithmeticOp::Sub => negate_calendar_months_exec(months, op, &data_type)?,
+				ArithmeticOp::Mul | ArithmeticOp::Div => {
+					return Err(ExecutionError::InvalidExpression {
+						message: "CalendarMonthInterval multiplication and division are deferred"
+							.to_string(),
+					});
+				}
+			};
+			crate::date32::add_calendar_months(days, months)
+				.map(Some)
+				.map_err(|error| ExecutionError::InvalidExpression {
+					message: error.to_string(),
+				})
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
+}
+
+fn evaluate_calendar_interval_interval(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let left = as_interval_year_month(left, "CalendarMonthInterval arithmetic left operand")?;
+	let right = as_interval_year_month(right, "CalendarMonthInterval arithmetic right operand")?;
+	let data_type = DataType::Interval(IntervalUnit::YearMonth);
+	let values = left
+		.iter()
+		.zip(right.iter())
+		.map(|(left, right)| {
+			let Some(left) = left else {
+				return Ok(None);
+			};
+			let Some(right) = right else {
+				return Ok(None);
+			};
+			let value = match op {
+				ArithmeticOp::Add => left.checked_add(right),
+				ArithmeticOp::Sub => left.checked_sub(right),
+				ArithmeticOp::Mul | ArithmeticOp::Div => None,
+			}
+			.ok_or_else(|| temporal_arithmetic_overflow_exec(op, &data_type))?;
+			Ok(Some(value))
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(Arc::new(IntervalYearMonthArray::from(values)) as ArrayRef)
+}
+
+fn negate_calendar_months_exec(
+	months: i32,
+	op: ArithmeticOp,
+	data_type: &DataType,
+) -> Result<i32, ExecutionError> {
+	months
+		.checked_neg()
+		.ok_or_else(|| temporal_arithmetic_overflow_exec(op, data_type))
+}
+
+fn calendar_arithmetic_mismatch_exec(left: &DataType, right: &DataType) -> ExecutionError {
+	ExecutionError::InvalidExpression {
+		message: format!(
+			"CalendarMonthInterval arithmetic expects Timestamp, Date32, or CalendarMonthInterval operands, got {left:?} and {right:?}"
+		),
 	}
 }
 
@@ -5779,6 +6112,18 @@ fn as_duration_nanos<'a>(
 		.downcast_ref::<DurationNanosecondArray>()
 		.ok_or_else(|| ExecutionError::InvalidExpression {
 			message: format!("{context} must be Duration(Nanosecond)"),
+		})
+}
+
+fn as_interval_year_month<'a>(
+	array: &'a ArrayRef,
+	context: &'static str,
+) -> Result<&'a IntervalYearMonthArray, ExecutionError> {
+	array
+		.as_any()
+		.downcast_ref::<IntervalYearMonthArray>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("{context} must be Interval(YearMonth)"),
 		})
 }
 

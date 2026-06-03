@@ -104,6 +104,22 @@ pub(crate) fn date32_extract(
 	i32::try_from(value).map_err(|_| Date32ParseError::new(field.as_str(), "field out of range"))
 }
 
+pub(crate) fn add_calendar_months(days: i32, months: i32) -> Result<i32, Date32ParseError> {
+	let original = days.to_string();
+	let (year, month, day) = civil_from_days(i64::from(days));
+	let total_months = i128::from(year) * 12 + i128::from(month - 1) + i128::from(months);
+	let new_year = total_months.div_euclid(12);
+	let new_month0 = total_months.rem_euclid(12);
+	let new_year = i64::try_from(new_year)
+		.map_err(|_| Date32ParseError::new(&original, "calendar month year out of range"))?;
+	let new_month = i64::try_from(new_month0 + 1)
+		.map_err(|_| Date32ParseError::new(&original, "calendar month out of range"))?;
+	let max_day = days_in_month_i64(new_year, new_month);
+	let new_day = i64::from(day).min(max_day);
+	i32::try_from(days_from_civil(new_year, new_month, new_day))
+		.map_err(|_| Date32ParseError::new(&original, "day count out of i32 range"))
+}
+
 fn parse_decimal(bytes: &[u8]) -> u32 {
 	bytes
 		.iter()
@@ -115,6 +131,16 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 		1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
 		4 | 6 | 9 | 11 => 30,
 		2 if is_leap_year(year) => 29,
+		2 => 28,
+		_ => 0,
+	}
+}
+
+fn days_in_month_i64(year: i64, month: i64) -> i64 {
+	match month {
+		1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+		4 | 6 | 9 | 11 => 30,
+		2 if is_leap_year_i64(year) => 29,
 		2 => 28,
 		_ => 0,
 	}

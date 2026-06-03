@@ -421,20 +421,30 @@ fn lower_interval_literal(interval: &SqlInterval) -> Result<Expr, FrontendError>
 		|| interval.fractional_seconds_precision.is_some()
 	{
 		return Err(unsupported(
-			"INTERVAL ranges and precision are not supported; use a single fixed-duration unit",
+			"INTERVAL ranges and precision are not supported; use a single supported unit",
 		));
 	}
-	let nanos = match &interval.leading_field {
+	let value = match &interval.leading_field {
 		Some(field) => {
 			let amount = interval_literal_integer(&interval.value)?;
-			checked_interval_nanos(amount, interval_field_nanos(field)?)
+			interval_field_value(amount, field)
 		}
 		None => {
 			let value = interval_literal_string(&interval.value)?;
 			parse_simple_interval_string(&value)
 		}
 	}?;
-	Ok(Expr::Literal(ScalarValue::Interval(Some(nanos))))
+	Ok(Expr::Literal(match value {
+		LoweredIntervalLiteral::FixedNanos(nanos) => ScalarValue::Interval(Some(nanos)),
+		LoweredIntervalLiteral::CalendarMonths(months) => {
+			ScalarValue::CalendarMonthInterval(Some(months))
+		}
+	}))
+}
+
+enum LoweredIntervalLiteral {
+	FixedNanos(i64),
+	CalendarMonths(i32),
 }
 
 fn interval_literal_integer(expr: &SqlExpr) -> Result<i64, FrontendError> {
@@ -442,9 +452,7 @@ fn interval_literal_integer(expr: &SqlExpr) -> Result<i64, FrontendError> {
 		SqlExpr::Value(value) => match &value.value {
 			Value::Number(value, _) => parse_interval_i64(value),
 			Value::SingleQuotedString(value) => parse_interval_i64(value.trim()),
-			_ => Err(unsupported(
-				"INTERVAL value must be an integer literal for fixed-duration intervals",
-			)),
+			_ => Err(unsupported("INTERVAL value must be an integer literal")),
 		},
 		SqlExpr::UnaryOp {
 			op: UnaryOperator::Minus,
@@ -452,15 +460,13 @@ fn interval_literal_integer(expr: &SqlExpr) -> Result<i64, FrontendError> {
 		} => interval_literal_integer(expr).and_then(|value| {
 			value
 				.checked_neg()
-				.ok_or_else(|| unsupported("INTERVAL value overflows i64 fixed-duration range"))
+				.ok_or_else(|| unsupported("INTERVAL value overflows i64 range"))
 		}),
 		SqlExpr::UnaryOp {
 			op: UnaryOperator::Plus,
 			expr,
 		} => interval_literal_integer(expr),
-		_ => Err(unsupported(
-			"INTERVAL value must be a literal for fixed-duration intervals",
-		)),
+		_ => Err(unsupported("INTERVAL value must be a literal")),
 	}
 }
 
@@ -478,16 +484,15 @@ fn interval_literal_string(expr: &SqlExpr) -> Result<String, FrontendError> {
 	}
 }
 
-fn parse_simple_interval_string(value: &str) -> Result<i64, FrontendError> {
+fn parse_simple_interval_string(value: &str) -> Result<LoweredIntervalLiteral, FrontendError> {
 	let parts = value.split_whitespace().collect::<Vec<_>>();
 	if parts.len() != 2 {
 		return Err(unsupported(
-			"INTERVAL string must be a single fixed-duration amount and unit",
+			"INTERVAL string must be a single amount and unit",
 		));
 	}
 	let amount = parse_interval_i64(parts[0])?;
-	let nanos = interval_unit_word_nanos(parts[1])?;
-	checked_interval_nanos(amount, nanos)
+	interval_word_value(amount, parts[1])
 }
 
 fn parse_interval_i64(value: &str) -> Result<i64, FrontendError> {
@@ -502,47 +507,88 @@ fn checked_interval_nanos(amount: i64, nanos_per_unit: i64) -> Result<i64, Front
 		.map_err(|_| unsupported("INTERVAL literal overflows i64 nanoseconds"))
 }
 
-fn interval_field_nanos(field: &DateTimeField) -> Result<i64, FrontendError> {
+fn checked_interval_months(amount: i64, months_per_unit: i64) -> Result<i32, FrontendError> {
+	(i128::from(amount) * i128::from(months_per_unit))
+		.try_into()
+		.map_err(|_| unsupported("INTERVAL literal overflows i32 calendar months"))
+}
+
+fn interval_field_value(
+	amount: i64,
+	field: &DateTimeField,
+) -> Result<LoweredIntervalLiteral, FrontendError> {
 	match field {
-		DateTimeField::Nanosecond | DateTimeField::Nanoseconds => Ok(1),
-		DateTimeField::Microsecond | DateTimeField::Microseconds => Ok(1_000),
-		DateTimeField::Millisecond | DateTimeField::Milliseconds => Ok(1_000_000),
-		DateTimeField::Second | DateTimeField::Seconds => Ok(1_000_000_000),
-		DateTimeField::Minute | DateTimeField::Minutes => Ok(60 * 1_000_000_000),
-		DateTimeField::Hour | DateTimeField::Hours => Ok(60 * 60 * 1_000_000_000),
-		DateTimeField::Day | DateTimeField::Days => Ok(24 * 60 * 60 * 1_000_000_000),
-		DateTimeField::Year
-		| DateTimeField::Years
-		| DateTimeField::Month
-		| DateTimeField::Months
-		| DateTimeField::Week(_)
-		| DateTimeField::Weeks
-		| DateTimeField::Quarter => Err(unsupported(format!(
-			"calendar INTERVAL unit {field} is not supported in fixed-duration intervals"
-		))),
-		other => Err(unsupported(format!(
-			"unsupported fixed-duration INTERVAL unit: {other}"
-		))),
+		DateTimeField::Nanosecond | DateTimeField::Nanoseconds => Ok(
+			LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(amount, 1)?),
+		),
+		DateTimeField::Microsecond | DateTimeField::Microseconds => Ok(
+			LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(amount, 1_000)?),
+		),
+		DateTimeField::Millisecond | DateTimeField::Milliseconds => Ok(
+			LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(amount, 1_000_000)?),
+		),
+		DateTimeField::Second | DateTimeField::Seconds => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 1_000_000_000)?,
+		)),
+		DateTimeField::Minute | DateTimeField::Minutes => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 60 * 1_000_000_000)?,
+		)),
+		DateTimeField::Hour | DateTimeField::Hours => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 60 * 60 * 1_000_000_000)?,
+		)),
+		DateTimeField::Day | DateTimeField::Days => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 24 * 60 * 60 * 1_000_000_000)?,
+		)),
+		DateTimeField::Month | DateTimeField::Months => Ok(LoweredIntervalLiteral::CalendarMonths(
+			checked_interval_months(amount, 1)?,
+		)),
+		DateTimeField::Year | DateTimeField::Years => Ok(LoweredIntervalLiteral::CalendarMonths(
+			checked_interval_months(amount, 12)?,
+		)),
+		DateTimeField::Week(_) | DateTimeField::Weeks | DateTimeField::Quarter => {
+			Err(unsupported(format!(
+				"calendar INTERVAL unit {field} is not supported; use month/year or day-and-smaller fixed intervals"
+			)))
+		}
+		other => Err(unsupported(format!("unsupported INTERVAL unit: {other}"))),
 	}
 }
 
-fn interval_unit_word_nanos(unit: &str) -> Result<i64, FrontendError> {
+fn interval_word_value(amount: i64, unit: &str) -> Result<LoweredIntervalLiteral, FrontendError> {
 	match unit.to_ascii_lowercase().as_str() {
-		"nanosecond" | "nanoseconds" | "ns" => Ok(1),
-		"microsecond" | "microseconds" | "us" => Ok(1_000),
-		"millisecond" | "milliseconds" | "ms" => Ok(1_000_000),
-		"second" | "seconds" | "s" => Ok(1_000_000_000),
-		"minute" | "minutes" | "min" | "mins" => Ok(60 * 1_000_000_000),
-		"hour" | "hours" | "h" => Ok(60 * 60 * 1_000_000_000),
-		"day" | "days" | "d" => Ok(24 * 60 * 60 * 1_000_000_000),
-		"week" | "weeks" | "month" | "months" | "quarter" | "quarters" | "year" | "years" => {
-			Err(unsupported(format!(
-				"calendar INTERVAL unit {unit} is not supported in fixed-duration intervals"
-			)))
-		}
-		_ => Err(unsupported(format!(
-			"unsupported fixed-duration INTERVAL unit: {unit}"
+		"nanosecond" | "nanoseconds" | "ns" => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 1)?,
+		)),
+		"microsecond" | "microseconds" | "us" => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 1_000)?,
+		)),
+		"millisecond" | "milliseconds" | "ms" => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 1_000_000)?,
+		)),
+		"second" | "seconds" | "s" => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 1_000_000_000)?,
+		)),
+		"minute" | "minutes" | "min" | "mins" => Ok(LoweredIntervalLiteral::FixedNanos(
+			checked_interval_nanos(amount, 60 * 1_000_000_000)?,
+		)),
+		"hour" | "hours" | "h" => Ok(LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(
+			amount,
+			60 * 60 * 1_000_000_000,
+		)?)),
+		"day" | "days" | "d" => Ok(LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(
+			amount,
+			24 * 60 * 60 * 1_000_000_000,
+		)?)),
+		"month" | "months" => Ok(LoweredIntervalLiteral::CalendarMonths(
+			checked_interval_months(amount, 1)?,
+		)),
+		"year" | "years" => Ok(LoweredIntervalLiteral::CalendarMonths(
+			checked_interval_months(amount, 12)?,
+		)),
+		"week" | "weeks" | "quarter" | "quarters" => Err(unsupported(format!(
+			"calendar INTERVAL unit {unit} is not supported; use month/year or day-and-smaller fixed intervals"
 		))),
+		_ => Err(unsupported(format!("unsupported INTERVAL unit: {unit}"))),
 	}
 }
 
@@ -5524,16 +5570,20 @@ fn hash_scalar_structural(value: &ScalarValue, state: &mut impl Hasher) {
 			5u8.hash(state);
 			value.hash(state);
 		}
-		ScalarValue::Float32(value) => {
+		ScalarValue::CalendarMonthInterval(value) => {
 			6u8.hash(state);
+			value.hash(state);
+		}
+		ScalarValue::Float32(value) => {
+			7u8.hash(state);
 			value.map(f32::to_bits).hash(state);
 		}
 		ScalarValue::Float64(value) => {
-			7u8.hash(state);
+			8u8.hash(state);
 			value.map(f64::to_bits).hash(state);
 		}
 		ScalarValue::Utf8(value) => {
-			8u8.hash(state);
+			9u8.hash(state);
 			value.hash(state);
 		}
 	}
@@ -5556,6 +5606,9 @@ fn scalar_structural_eq(left: &ScalarValue, right: &ScalarValue) -> bool {
 			},
 		) => left_unit == right_unit && left_value == right_value,
 		(ScalarValue::Interval(left), ScalarValue::Interval(right)) => left == right,
+		(ScalarValue::CalendarMonthInterval(left), ScalarValue::CalendarMonthInterval(right)) => {
+			left == right
+		}
 		(ScalarValue::Float32(left), ScalarValue::Float32(right)) => {
 			left.map(f32::to_bits) == right.map(f32::to_bits)
 		}

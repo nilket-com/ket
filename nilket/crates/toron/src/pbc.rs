@@ -2,7 +2,7 @@ use crate::ir::{
 	BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram, BoundUnaryOp, ColumnOrdinal,
 	ScalarValue,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 
 // Import OP codes from Wendelon.
 use wendelon::schema::pbc::{
@@ -94,6 +94,11 @@ impl PbcCompiler {
 					if binary_has_fixed_duration_interval_type(program, Some(id), *left, *right) {
 						return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 							"fixed-duration interval arithmetic is not PBC-eligible".to_string(),
+						));
+					}
+					if binary_has_calendar_month_interval_type(program, Some(id), *left, *right) {
+						return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+							"calendar interval arithmetic is not PBC-eligible".to_string(),
 						));
 					}
 					if matches!(
@@ -197,6 +202,13 @@ impl PbcCompiler {
 					"fixed-duration interval arithmetic is not PBC-eligible".to_string(),
 				));
 			}
+			BoundExprNode::Binary { left, right, .. }
+				if binary_has_calendar_month_interval_type(program, None, *left, *right) =>
+			{
+				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+					"calendar interval arithmetic is not PBC-eligible".to_string(),
+				));
+			}
 			BoundExprNode::Binary { op, .. } => bytecode.push(binary_opcode(op)?),
 			BoundExprNode::Unary { op, .. } => bytecode.push(unary_opcode(op)),
 			BoundExprNode::InList { list, negated, .. } => {
@@ -249,6 +261,27 @@ fn is_fixed_duration_interval_type(data_type: &DataType) -> bool {
 	matches!(data_type, DataType::Duration(TimeUnit::Nanosecond))
 }
 
+fn binary_has_calendar_month_interval_type(
+	program: &BoundExprProgram,
+	output: Option<BoundExprId>,
+	left: BoundExprId,
+	right: BoundExprId,
+) -> bool {
+	output
+		.and_then(|id| program.node_type(id))
+		.is_some_and(is_calendar_month_interval_type)
+		|| program
+			.node_type(left)
+			.is_some_and(is_calendar_month_interval_type)
+		|| program
+			.node_type(right)
+			.is_some_and(is_calendar_month_interval_type)
+}
+
+fn is_calendar_month_interval_type(data_type: &DataType) -> bool {
+	matches!(data_type, DataType::Interval(IntervalUnit::YearMonth))
+}
+
 fn emit_literal(val: &ScalarValue, bytecode: &mut Vec<u8>) -> Result<(), PushdownDeclineReason> {
 	match val {
 		ScalarValue::Boolean(Some(v)) => {
@@ -276,6 +309,11 @@ fn emit_literal(val: &ScalarValue, bytecode: &mut Vec<u8>) -> Result<(), Pushdow
 		ScalarValue::Interval(Some(_)) => {
 			return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 				"fixed-duration interval literals are not PBC-eligible".to_string(),
+			));
+		}
+		ScalarValue::CalendarMonthInterval(Some(_)) => {
+			return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+				"calendar interval literals are not PBC-eligible".to_string(),
 			));
 		}
 		ScalarValue::Float32(Some(v)) => {

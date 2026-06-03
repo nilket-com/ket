@@ -3,10 +3,10 @@ use std::sync::Arc;
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Builder, DurationNanosecondBuilder,
 	Float32Array, Float32Builder, Float64Array, Float64Builder, Int32Array, Int32Builder,
-	Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMicrosecondBuilder,
-	TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+	Int64Array, Int64Builder, IntervalYearMonthBuilder, StringArray, StringBuilder,
+	TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
 };
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use crate::binder::TABLE_WRITE_MAX_ROWS;
@@ -538,6 +538,17 @@ fn build_array(
 					ScalarValue::Interval(Some(value)) => builder.append_value(*value),
 					ScalarValue::Interval(None) => builder.append_null(),
 					other => return Err(type_mismatch(field_index, "Duration(Nanosecond)", other)),
+				}
+			}
+			Ok(Arc::new(builder.finish()))
+		}
+		DataType::Interval(IntervalUnit::YearMonth) => {
+			let mut builder = IntervalYearMonthBuilder::with_capacity(rows.len());
+			for row in rows {
+				match scalar_at(row, field_index)? {
+					ScalarValue::CalendarMonthInterval(Some(value)) => builder.append_value(*value),
+					ScalarValue::CalendarMonthInterval(None) => builder.append_null(),
+					other => return Err(type_mismatch(field_index, "Interval(YearMonth)", other)),
 				}
 			}
 			Ok(Arc::new(builder.finish()))

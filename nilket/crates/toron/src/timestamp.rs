@@ -2,8 +2,8 @@ use std::fmt;
 
 use arrow::datatypes::TimeUnit;
 use chrono::{
-	DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone,
-	Timelike, Utc,
+	DateTime, Datelike, LocalResult, Months, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat,
+	TimeZone, Timelike, Utc,
 };
 use chrono_tz::Tz;
 
@@ -77,22 +77,7 @@ pub(crate) fn parse_wall_clock_timestamp(
 	unit: TimeUnit,
 ) -> Result<i64, TimestampParseError> {
 	let naive = parse_local_naive_timestamp(value)?;
-	let local = match timezone.from_local_datetime(&naive) {
-		LocalResult::Single(value) => value,
-		LocalResult::Ambiguous(left, right) => {
-			if left.with_timezone(&Utc) <= right.with_timezone(&Utc) {
-				left
-			} else {
-				right
-			}
-		}
-		LocalResult::None => {
-			return Err(TimestampParseError::new(
-				value,
-				format!("wall-clock time does not exist in timezone {timezone}"),
-			));
-		}
-	};
+	let local = resolve_local_datetime(value, timezone, naive)?;
 	ticks_from_utc_datetime(local.with_timezone(&Utc), unit, value)
 }
 
@@ -193,23 +178,50 @@ pub(crate) fn timestamp_trunc(
 			.and_hms_nano_opt(local.hour(), local.minute(), local.second(), 0)
 			.expect("second from DateTime is valid"),
 	};
-	let local = match timezone.from_local_datetime(&naive) {
-		LocalResult::Single(value) => value,
+	let local = resolve_local_datetime(&value.to_string(), timezone, naive)?;
+	ticks_from_utc_datetime(local.with_timezone(&Utc), unit, &value.to_string())
+}
+
+pub(crate) fn add_calendar_months(
+	value: i64,
+	unit: TimeUnit,
+	timezone: Tz,
+	months: i32,
+) -> Result<i64, TimestampParseError> {
+	let original = value.to_string();
+	let datetime = utc_datetime_from_ticks(value, unit)
+		.ok_or_else(|| TimestampParseError::new(&original, "timestamp out of range"))?;
+	let local = datetime.with_timezone(&timezone);
+	let naive = local.naive_local();
+	let adjusted = if months >= 0 {
+		naive.checked_add_months(Months::new(months as u32))
+	} else {
+		naive.checked_sub_months(Months::new(months.unsigned_abs()))
+	}
+	.ok_or_else(|| TimestampParseError::new(&original, "timestamp calendar month overflow"))?;
+	let local = resolve_local_datetime(&original, timezone, adjusted)?;
+	ticks_from_utc_datetime(local.with_timezone(&Utc), unit, &original)
+}
+
+fn resolve_local_datetime(
+	original: &str,
+	timezone: Tz,
+	naive: NaiveDateTime,
+) -> Result<DateTime<Tz>, TimestampParseError> {
+	match timezone.from_local_datetime(&naive) {
+		LocalResult::Single(value) => Ok(value),
 		LocalResult::Ambiguous(left, right) => {
 			if left.with_timezone(&Utc) <= right.with_timezone(&Utc) {
-				left
+				Ok(left)
 			} else {
-				right
+				Ok(right)
 			}
 		}
-		LocalResult::None => {
-			return Err(TimestampParseError::new(
-				&value.to_string(),
-				format!("wall-clock time does not exist in timezone {timezone}"),
-			));
-		}
-	};
-	ticks_from_utc_datetime(local.with_timezone(&Utc), unit, &value.to_string())
+		LocalResult::None => Err(TimestampParseError::new(
+			original,
+			format!("wall-clock time does not exist in timezone {timezone}"),
+		)),
+	}
 }
 
 fn parse_local_naive_timestamp(value: &str) -> Result<NaiveDateTime, TimestampParseError> {

@@ -717,6 +717,7 @@ impl BoundExprProgram {
 						| ScalarValue::Int64(None)
 						| ScalarValue::Date32(None)
 						| ScalarValue::Interval(None)
+						| ScalarValue::CalendarMonthInterval(None)
 						| ScalarValue::Float32(None)
 						| ScalarValue::Float64(None)
 						| ScalarValue::Utf8(None)
