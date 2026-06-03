@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–151 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–152 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,50 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 151 promoted; ADR 152 candidates
+### ADR 152 promoted; ADR 153 candidates
+
+ADR 152 promoted **Fixed-Duration Interval Delta Arithmetic** — adds the Time
+dimension's **delta** scalar (151's named deferral; brainstorm-009's first
+point/delta instance). `ScalarValue::Interval(Option<i64>)` = signed elapsed
+**nanoseconds**, physical carrier **Arrow `Duration(Nanosecond)`** (not Arrow
+`Interval`, the calendar type — the fixed/calendar split maps onto Arrow's own
+`Duration`/`Interval` split). **Fixed-duration only** (ns/us/ms/s/min/hour/`day`=
+86 400 s explicitly fixed-not-civil); week/month/quarter/year + compound ranges
+reject. Point/delta algebra bind-typed: `Timestamp ± Interval → Timestamp`,
+`Interval + Timestamp → Timestamp` (add-only), `Timestamp − Timestamp → Interval`
+(matching-unit, mixed rejects), `Interval ± Interval → Interval`, interval
+ordering; `Timestamp + Timestamp`/`Date32 ± Interval`/`Interval × ÷` reject.
+**No new IR node** — reuses `Add`/`Sub` + `Binary` via a dedicated **no-cast
+temporal branch** (the generic binder's `cast_if_needed` would corrupt
+`ts + interval` to `ts + ts`). **Precision is preserve-and-reject** (checked-
+divisible ns→unit; non-representable errors, never silent-round — 150's discipline)
+and all arithmetic is checked (overflow errors, never wraps). **Literal±literal
+folds at bind** (new, contained — no const-fold pass existed) → a flat `Timestamp`
+literal that 150's `range_scalar_for_fact` spends, so `event_time > TIMESTAMPTZ '…'
+- INTERVAL '7 days'` broadcasts: **Interval is on the pushdown spine, not sugar.**
+Rune-first constructors; PBC declines; manual checked tick math (no Arrow
+duration/interval kernel — zone-free, needs none of 151's session machinery).
+3-of-3 on topic/algebra/scope; two Gemini impl-level divergences resolved on
+grounding (physical carrier = `Duration` not `Interval`; precision = reject not
+truncate). Headline gate: `relative_interval_filter_spends_timestamp_range_fact`
+(fails on `main`). Known bound: i64-ns caps a single interval at ±~292 y
+(`ts(ms)−ts(ms)` of distant instants errors, never wrong; `i128` is the follow-on).
+
+**ADR 153 lead candidates:** **calendar intervals** (`month`/`year`/civil-day —
+zone-dependent, *reuses* 151's `from_local_datetime` civil path; the direct
+temporal follow-on, now with the Arrow `Interval` carrier reserved); **`Date32 ±
+Interval` / civil-date arithmetic** (pairs with calendar intervals — Date32 is
+civil); **measured-skew heavy-hitter / Count-Min** (the first estimate-*quality*
+spine cut — still gated on a *measured* miss + a Wendelon producer; evidence
+first); **dimensioned `CONVERT` / units arc** (brainstorm 009 — now with point/delta
+proven on Time; a deliberate type-system pivot, not a spine cut); **`SET TIME ZONE`
+/ REPL client** (deferred persistent-session surface); **tighten the byte estimate**
+(`binder.rs:70` 16 KiB constant — fold into the next estimate-surface cut).
+**Forward arc:** `152 Interval → (calendar intervals · Date32 arithmetic ·
+CONVERT/units arc) · (measured-miss → skew/quantile) → Theta join-key intersection
+→ join selectivity → reordering`. Evidence-gate the next pick on the 152 feat.
+
+### ADR 151 promoted; ADR 152 candidates (HISTORICAL)
 
 ADR 151 promoted **Session-Zoned Temporal Operations** — makes the 149/150
 `Date32`/`Timestamp` scalars *computable*, not just filterable: SQL `EXTRACT`/
