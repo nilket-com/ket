@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–149 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–150 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,58 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 149 promoted; ADR 150 candidates
+### ADR 150 promoted; ADR 151 candidates
+
+ADR 150 promoted **Timezone-Aware Timestamp Selectivity + Per-Request Session
+Timezone** — makes `Timestamp` a first-class **UTC-instant** Toron scalar so event-time
+filters (the #1 analytical predicate alongside dates) reach the min/max facts Wendelon
+**already produces** for all three units (`ARROW_STATS_TAG_TIMESTAMP_{MS,US,NS}`,
+`storage/stats.rs:400–406`); the producer + 144's integral range math are done, so the engine
+half mirrors 149's Date32 scalar-foundation cut. **Folded in (operator's "one big cut"):** a
+**per-request session timezone** so the #1 bare-string filter interprets in the user's zone.
+**Toron-only, estimate-channel only, no Wendelon change.** The operator's doctrine — "a date
+without a timezone is a fundamental type error" — sharpened to its precise target: the error is
+the **naive instant** (`Timestamp(_, None)`); a civil **date** (`Date32`, 149) is a *different
+category* (a calendar coordinate, legitimately zone-free), so **149 is not reopened** (the
+two-category model). **Decisions:** `ScalarValue::Timestamp { value: Option<i64>, unit }`
+(UTC-normalized, ms/us/ns, naive never constructed); **per-request session timezone**
+(`session_timezone` on `ExecuteRequest` + `PlannerConfig`, plumbed via the **coordinator
+clone-and-stamp override** the 139/140 replay path already uses, `coordinator.rs:655`; resolved
+once via `chrono-tz`, **never ambient at bind**); **three literal classes** (explicit-naive-typed
+→ reject; explicit-offset/`TIMESTAMPTZ` → normalize UTC; **bare string target-gated → interpret
+in the session zone** via 149's `coerce_literal_value` hook — bounded-lenient, the resolved
+strict-vs-lenient divergence, no UTC-guess because the zone is *declared*); **DST policy**
+(gap→bind error, fold→earlier instant, invalid zone→bind error); **fact-spending via the column
+`DataType`** (the tz-agnostic tag is insufficient — naive/non-UTC/unit-mismatch/Date32/Date64/
+raw-int fail open); reuse 144/141/148 estimate-only; Arrow `Timestamp*Array` exec + **session-zone
+output rendering** (tz-restamp + arrow `chrono-tz` feature); **PBC declines** (no untyped-int
+opcode); **client per-invocation** (`toron sql --timezone <IANA>` + `iana-time-zone`
+auto-detect — **no `SET`/REPL**, a deferred client-surface ADR); Date32 civil / Date64 dark.
+**Deps:** `chrono-tz` + `iana-time-zone` direct Toron deps + arrow `chrono-tz` feature.
+Operator-approved Claude/Codex convergence; **Gemini's unified-instant model rejected** (Date32-as-
+session-midnight-instant reopens 149 and makes a civil date mean a different instant per
+session). Headline gate:
+`timestamp_session_zone_range_filtered_dim_infers_broadcast_by_estimate` (CT-session bare-string
+event-time filter → `BroadcastEstimated`; fails on `main`).
+
+**ADR 151 lead candidates:** **persistent-session / `SET TIME ZONE` client ADR** (the deferred
+client surface — a REPL/driver session so the session zone persists across statements, the
+honest home for `SET`; net-new client-surface, not a temporal helper); **`AT TIME ZONE` +
+temporal arithmetic** (`date_trunc`/`EXTRACT`/intervals — runtime temporal *operations* on the
+now-landed instant scalar; sqlparser already exposes `Expr::AtTimeZone`); **Date64/decimal
+breadth** (decimal needs a new `Decimal` scalar + cross-ring producer — heavier than temporal
+was; Date64 still has no coherent role); **measured-skew heavy-hitter / Count-Min** (the first
+estimate-*quality* cut — equality/IN under-estimate hot keys under the uniform assumption all of
+141/148/149/150 rests on; needs a new Wendelon producer + a *measured* miss to gate);
+**KLL/quantile range precision** (gate on a measured min/max-uniformity miss); **tighten the byte
+estimate** (the 149-pivot leftover C — replace the fat 16 KiB framing constant; tiny, fold into
+adjacent work); **136-W/hard-zero/snapshot** (the deferred hard-channel + elision items — a
+distributed-snapshot-isolation cut). **Forward arc:** `… → 149 Date32 → 150 Timestamp +
+session-tz → (SET/REPL client · AT TIME ZONE/arithmetic · Date64/decimal) → measured-skew
+sketches → Theta join-key intersection → join selectivity → reordering`. Evidence-gate the next
+pick on the 150 feat.
+
+### ADR 149 promoted; ADR 150 candidates (HISTORICAL)
 
 ADR 149 promoted **Temporal Date32 Selectivity Breadth** — makes `Date32` a
 first-class Toron scalar so date filters (the #1 analytical predicate) can reach the
