@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–152 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–153 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,52 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 152 promoted; ADR 153 candidates
+### ADR 153 promoted; ADR 154 candidates
+
+ADR 153 promoted **Calendar Month-Year Interval Arithmetic** — adds the Time
+dimension's **calendar** delta (152 built the fixed delta; this closes the temporal
+arc), the missing piece for MoM/YoY analytics. `ScalarValue::CalendarMonthInterval(
+Option<i32>)` = signed **months**, physical Arrow **`Interval(YearMonth)`** (disjoint
+from 152's `Duration`; `MonthDayNano` deferred for the later mixed-calendar cut).
+**Month/year only** — `INTERVAL '1 day'` **stays 152's fixed 86 400 s** (one SQL
+spelling, one meaning); week/quarter/compound reject. Algebra: `Timestamp ±
+CalendarMonthInterval → Timestamp`, `cal + ts → ts`, `Date32 ± cal → Date32` (zone-free
+civil), `cal ± cal → cal`; reject `cal − ts`, `ts + ts`, **`cal ± fixed Interval`** (no
+category coercion), comparison/scaling. `ts − ts` stays 152's fixed `Duration`; calendar
+intervals are **literal-construct-only**. **Load-bearing runtime-frame decision (grounded
+Claude+Codex):** calendar timestamp math is zone-dependent but the executor is
+**session-stateless**, so the effective zone is **resolved at bind** (explicit `AT TIME
+ZONE` else session) and **carried to exec as Arrow tz metadata** via 151's inserted
+`AtTimeZone` lens; **exec reads timestamp array timezone metadata** as the civil frame
+and never asks for session state (over Gemini's under-specified "feed the timezone to
+exec," which would repeat 152's session-stateless violation). **End-of-month clamping is
+chrono machinery** (checked month add/subtract on local naive values; Jan 31 + 1 month
+→ Feb 28/29; `checked_*` errors on overflow); DST reuses 151's `from_local_datetime`.
+**Literal calendar arithmetic folds at bind** (effective zone known) → flat `Timestamp`
+literal spending 150's range facts → YoY/MoM filters broadcast
+(stays on the pushdown spine). No new IR node (reuses `Binary` + `AtTimeZone` + 152
+seams); PBC declines `Interval(YearMonth)`; Rune `months(n)`/`years(n)` beside 152's
+`days(n)`; Toron-only, no Arrow calendar kernel. 3-of-3 on topic/scope/carrier; the
+runtime-frame mechanism promoted from the identical Claude+Codex grounding. Headline gate:
+`relative_calendar_month_filter_spends_timestamp_range_fact` (fails on `main`).
+
+**ADR 154 lead candidates — the temporal arc is now closed; a real arc-boundary pick:**
+**measured-skew heavy-hitter / Count-Min** (the first estimate-*quality* spine cut —
+breaks the uniform assumption all of 141→153 rests on; still gated on a *measured* miss +
+a Wendelon producer, so the honest form may be an **evidence-generation cut**: a
+bench/trace harness that produces the miss and names the fact shape); **dimensioned
+`CONVERT` / units arc** (brainstorm 009 — point/delta now proven on Time across fixed +
+calendar; a deliberate type-system pivot, linear-units-first); **temporal calendar tail**
+(civil day/week/quarter syntax + `MonthDayNano` mixing + calendar comparison — small
+completions, fold-able, low priority now that month/year ships); **`SET TIME ZONE` / REPL
+client** (deferred persistent-session surface); **tighten the byte estimate**
+(`binder.rs:70` 16 KiB — fold into the next estimate-surface cut). **Forward arc:** `153
+calendar interval (closes temporal) → (measured-miss → skew/quantile spine) · (CONVERT/
+units pivot) → Theta join-key intersection → join selectivity → reordering`. Four cycles
+of temporal (149–153) are done; ADR 154 is a genuine spine-vs-breadth pivot — evidence-gate
+the next pick on the 153 feat.
+
+### ADR 152 promoted; ADR 153 candidates (HISTORICAL)
 
 ADR 152 promoted **Fixed-Duration Interval Delta Arithmetic** — adds the Time
 dimension's **delta** scalar (151's named deferral; brainstorm-009's first
