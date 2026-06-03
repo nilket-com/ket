@@ -29,8 +29,9 @@ use crate::ir::{
 	JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
 	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
 	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
-	arithmetic_output_type, decode_column_logical_type, decode_column_logical_type_with_resolver,
-	field_with_logical_type_metadata, logical_type_name, logical_type_spec, schema_for_exprs,
+	TemporalExtractField, TemporalTruncField, arithmetic_output_type, decode_column_logical_type,
+	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, logical_type_name,
+	logical_type_spec, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -1697,7 +1698,10 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::TimeBucket(_, inner) => reject_storage_synthetic_returning_reference(inner),
+		| Expr::TimeBucket(_, inner)
+		| Expr::AtTimeZone(inner, _)
+		| Expr::Extract(_, inner)
+		| Expr::DateTrunc(_, inner) => reject_storage_synthetic_returning_reference(inner),
 		Expr::InList { expr, list, .. } => {
 			reject_storage_synthetic_returning_reference(expr)?;
 			for item in list {
@@ -1757,7 +1761,10 @@ fn collect_logical_cast_names(
 		| Expr::IsNull(expr)
 		| Expr::IsNotNull(expr)
 		| Expr::Like { expr, .. }
-		| Expr::TimeBucket(_, expr) => collect_logical_cast_names(expr, names),
+		| Expr::TimeBucket(_, expr)
+		| Expr::AtTimeZone(expr, _)
+		| Expr::Extract(_, expr)
+		| Expr::DateTrunc(_, expr) => collect_logical_cast_names(expr, names),
 		Expr::InList { expr, list, .. } => {
 			collect_logical_cast_names(expr, names)?;
 			for item in list {
@@ -3515,6 +3522,18 @@ fn clone_bound_subgraph(
 			let input = clone_bound_subgraph(source, *input, builder, remap)?;
 			builder.append_time_bucket(*interval, input, output_type)
 		}
+		BoundExprNode::AtTimeZone { input, zone } => {
+			let input = clone_bound_subgraph(source, *input, builder, remap)?;
+			builder.append_at_time_zone(input, zone.clone(), output_type)
+		}
+		BoundExprNode::Extract { field, zone, input } => {
+			let input = clone_bound_subgraph(source, *input, builder, remap)?;
+			builder.append_extract(*field, zone.clone(), input, output_type)
+		}
+		BoundExprNode::DateTrunc { field, zone, input } => {
+			let input = clone_bound_subgraph(source, *input, builder, remap)?;
+			builder.append_date_trunc(*field, zone.clone(), input, output_type)
+		}
 	};
 	if let Some(logical_type) = source.node_logical_type(id) {
 		builder.set_node_logical_type(cloned, logical_type);
@@ -3691,6 +3710,51 @@ fn bound_subgraphs_structurally_equal_inner(
 			left_interval == right_interval
 				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
 		}
+		(
+			Some(BoundExprNode::AtTimeZone {
+				input: left_input,
+				zone: left_zone,
+			}),
+			Some(BoundExprNode::AtTimeZone {
+				input: right_input,
+				zone: right_zone,
+			}),
+		) => {
+			left_zone == right_zone
+				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
+		}
+		(
+			Some(BoundExprNode::Extract {
+				field: left_field,
+				zone: left_zone,
+				input: left_input,
+			}),
+			Some(BoundExprNode::Extract {
+				field: right_field,
+				zone: right_zone,
+				input: right_input,
+			}),
+		) => {
+			left_field == right_field
+				&& left_zone == right_zone
+				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
+		}
+		(
+			Some(BoundExprNode::DateTrunc {
+				field: left_field,
+				zone: left_zone,
+				input: left_input,
+			}),
+			Some(BoundExprNode::DateTrunc {
+				field: right_field,
+				zone: right_zone,
+				input: right_input,
+			}),
+		) => {
+			left_field == right_field
+				&& left_zone == right_zone
+				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
+		}
 		_ => false,
 	}
 }
@@ -3731,7 +3795,10 @@ fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
-		| BoundExprNode::TimeBucket { input, .. } => vec![*input],
+		| BoundExprNode::TimeBucket { input, .. }
+		| BoundExprNode::AtTimeZone { input, .. }
+		| BoundExprNode::Extract { input, .. }
+		| BoundExprNode::DateTrunc { input, .. } => vec![*input],
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {
 			let mut children = Vec::with_capacity(list.len() + 1);
@@ -6551,7 +6618,10 @@ fn collect_program_node_columns(
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
 		| Some(BoundExprNode::Like { expr: input, .. })
-		| Some(BoundExprNode::TimeBucket { input, .. }) => {
+		| Some(BoundExprNode::TimeBucket { input, .. })
+		| Some(BoundExprNode::AtTimeZone { input, .. })
+		| Some(BoundExprNode::Extract { input, .. })
+		| Some(BoundExprNode::DateTrunc { input, .. }) => {
 			collect_program_node_columns(program, *input, columns);
 		}
 		Some(BoundExprNode::Binary { left, right, .. }) => {
@@ -6775,6 +6845,20 @@ fn offset_bound_node(node: BoundExprNode, node_offset: u32, literal_offset: u32)
 			interval,
 			input: offset_id(input),
 		},
+		BoundExprNode::AtTimeZone { input, zone } => BoundExprNode::AtTimeZone {
+			input: offset_id(input),
+			zone,
+		},
+		BoundExprNode::Extract { field, zone, input } => BoundExprNode::Extract {
+			field,
+			zone,
+			input: offset_id(input),
+		},
+		BoundExprNode::DateTrunc { field, zone, input } => BoundExprNode::DateTrunc {
+			field,
+			zone,
+			input: offset_id(input),
+		},
 	}
 }
 
@@ -6956,6 +7040,156 @@ fn bind_expr_into_program(
 			}
 			Ok(builder.append_time_bucket(*interval, inner, DataType::Int64))
 		}
+		Expr::AtTimeZone(inner, zone) => bind_at_time_zone(builder, input_schema, ctx, inner, zone),
+		Expr::Extract(field, inner) => {
+			bind_temporal_extract(builder, input_schema, ctx, *field, inner)
+		}
+		Expr::DateTrunc(field, inner) => bind_date_trunc(builder, input_schema, ctx, *field, inner),
+	}
+}
+
+fn bind_at_time_zone(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	inner: &Expr,
+	zone: &str,
+) -> Result<BoundExprId, BindingError> {
+	let zone = validate_temporal_zone(zone)?;
+	let input = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+	let input_type =
+		builder
+			.node_type(input)
+			.cloned()
+			.ok_or_else(|| BindingError::UnsupportedExpression {
+				message: "AT TIME ZONE input is malformed".to_string(),
+			})?;
+	let unit = supported_timestamp_unit(&input_type, "AT TIME ZONE")?;
+	Ok(builder.append_at_time_zone(
+		input,
+		zone.clone(),
+		DataType::Timestamp(unit, Some(zone.into())),
+	))
+}
+
+fn bind_temporal_extract(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	field: TemporalExtractField,
+	inner: &Expr,
+) -> Result<BoundExprId, BindingError> {
+	let (zone, operand, explicit_zone) = temporal_operand_zone(ctx, inner)?;
+	let input = bind_expr_into_program(builder, operand, input_schema, ctx)?;
+	let input_type =
+		builder
+			.node_type(input)
+			.cloned()
+			.ok_or_else(|| BindingError::UnsupportedExpression {
+				message: "EXTRACT input is malformed".to_string(),
+			})?;
+	match input_type {
+		DataType::Date32 if explicit_zone => Err(BindingError::TypeMismatch {
+			message: "AT TIME ZONE requires Timestamp".to_string(),
+		}),
+		DataType::Date32 => {
+			if !field.is_date32_supported() {
+				return Err(BindingError::TypeMismatch {
+					message: format!("EXTRACT {} is not supported for Date32", field.as_str()),
+				});
+			}
+			Ok(builder.append_extract(field, None, input, DataType::Int32))
+		}
+		DataType::Date64 => Err(BindingError::TypeMismatch {
+			message: "EXTRACT is not supported for Date64".to_string(),
+		}),
+		data_type @ DataType::Timestamp(_, _) => {
+			supported_timestamp_unit(&data_type, "EXTRACT")?;
+			Ok(builder.append_extract(field, Some(zone), input, DataType::Int32))
+		}
+		other => Err(BindingError::TypeMismatch {
+			message: format!("EXTRACT expects Timestamp or Date32 input, got {other:?}"),
+		}),
+	}
+}
+
+fn bind_date_trunc(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	field: TemporalTruncField,
+	inner: &Expr,
+) -> Result<BoundExprId, BindingError> {
+	let (zone, operand, explicit_zone) = temporal_operand_zone(ctx, inner)?;
+	let input = bind_expr_into_program(builder, operand, input_schema, ctx)?;
+	let input_type =
+		builder
+			.node_type(input)
+			.cloned()
+			.ok_or_else(|| BindingError::UnsupportedExpression {
+				message: "date_trunc input is malformed".to_string(),
+			})?;
+	match input_type {
+		DataType::Date32 if explicit_zone => Err(BindingError::TypeMismatch {
+			message: "AT TIME ZONE requires Timestamp".to_string(),
+		}),
+		DataType::Date32 => Err(BindingError::TypeMismatch {
+			message: "Date32 date_trunc is deferred in ADR 151".to_string(),
+		}),
+		DataType::Date64 => Err(BindingError::TypeMismatch {
+			message: "date_trunc is not supported for Date64".to_string(),
+		}),
+		data_type @ DataType::Timestamp(_, _) => {
+			let unit = supported_timestamp_unit(&data_type, "date_trunc")?;
+			Ok(builder.append_date_trunc(
+				field,
+				zone,
+				input,
+				DataType::Timestamp(unit, Some("UTC".into())),
+			))
+		}
+		other => Err(BindingError::TypeMismatch {
+			message: format!("date_trunc expects Timestamp input, got {other:?}"),
+		}),
+	}
+}
+
+fn temporal_operand_zone<'a>(
+	ctx: &ExprBindContext<'_>,
+	inner: &'a Expr,
+) -> Result<(String, &'a Expr, bool), BindingError> {
+	match inner {
+		Expr::AtTimeZone(timestamp, zone) => Ok((validate_temporal_zone(zone)?, timestamp, true)),
+		_ => Ok((ctx.session_timezone.to_string(), inner, false)),
+	}
+}
+
+fn validate_temporal_zone(zone: &str) -> Result<String, BindingError> {
+	crate::timestamp::parse_session_timezone(zone)
+		.map(|zone| zone.to_string())
+		.map_err(|error| BindingError::TypeMismatch {
+			message: error.to_string(),
+		})
+}
+
+fn supported_timestamp_unit(
+	data_type: &DataType,
+	operator: &str,
+) -> Result<TimeUnit, BindingError> {
+	match data_type {
+		DataType::Timestamp(
+			unit @ (TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond),
+			Some(_),
+		) => Ok(*unit),
+		DataType::Timestamp(_, None) => Err(BindingError::TypeMismatch {
+			message: format!("{operator} does not support Timestamp without timezone"),
+		}),
+		DataType::Timestamp(unit, Some(_)) => Err(BindingError::TypeMismatch {
+			message: format!("{operator} does not support Timestamp unit {unit:?}"),
+		}),
+		other => Err(BindingError::TypeMismatch {
+			message: format!("{operator} expects Timestamp input, got {other:?}"),
+		}),
 	}
 }
 
@@ -8216,7 +8450,8 @@ mod tests {
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::sql_planner::SqlPlanner;
 	use arrow::array::{
-		ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
+		ArrayRef, BinaryArray, Date32Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+		TimestampMillisecondArray,
 	};
 	use arrow::datatypes::{Field, Schema};
 	use wendelon::schema::{
@@ -11161,6 +11396,272 @@ mod tests {
 		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(10)));
 	}
 
+	#[test]
+	fn extract_hour_from_timestamp_at_time_zone_uses_named_zone() {
+		let program = bind_temporal_expr(
+			Expr::Extract(
+				TemporalExtractField::Hour,
+				Box::new(Expr::AtTimeZone(
+					Box::new(Expr::column("event_time")),
+					"America/Chicago".to_string(),
+				)),
+			),
+			"America/New_York",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-01T06:30:00Z"), 0),
+		)
+		.expect("evaluate extract");
+		let hours = outputs[0]
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("hour output");
+
+		assert_eq!(hours.value(0), 0);
+	}
+
+	#[test]
+	fn extract_utc_column_without_at_time_zone_uses_session_zone() {
+		let central = bind_temporal_expr(
+			Expr::Extract(
+				TemporalExtractField::Hour,
+				Box::new(Expr::column("event_time")),
+			),
+			"America/Chicago",
+		);
+		let eastern = bind_temporal_expr(
+			Expr::Extract(
+				TemporalExtractField::Hour,
+				Box::new(Expr::column("event_time")),
+			),
+			"America/New_York",
+		);
+		let batch = temporal_batch(timestamp_ms("2024-01-01T06:30:00Z"), 0);
+		let central = Executor::evaluate_bound_program_without_storage(&central, &batch)
+			.expect("evaluate Central extract");
+		let eastern = Executor::evaluate_bound_program_without_storage(&eastern, &batch)
+			.expect("evaluate Eastern extract");
+
+		assert_eq!(
+			central[0]
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.expect("Central hour")
+				.value(0),
+			0
+		);
+		assert_eq!(
+			eastern[0]
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.expect("Eastern hour")
+				.value(0),
+			1
+		);
+	}
+
+	#[test]
+	fn extract_at_time_zone_utc_uses_utc_not_session_zone() {
+		let program = bind_temporal_expr(
+			Expr::Extract(
+				TemporalExtractField::Hour,
+				Box::new(Expr::AtTimeZone(
+					Box::new(Expr::column("event_time")),
+					"UTC".to_string(),
+				)),
+			),
+			"America/Chicago",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-01T06:30:00Z"), 0),
+		)
+		.expect("evaluate UTC extract");
+
+		assert_eq!(
+			outputs[0]
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.expect("UTC hour")
+				.value(0),
+			6
+		);
+	}
+
+	#[test]
+	fn date_trunc_day_returns_utc_instant_for_session_local_midnight() {
+		let program = bind_temporal_expr(
+			Expr::DateTrunc(
+				TemporalTruncField::Day,
+				Box::new(Expr::column("event_time")),
+			),
+			"America/Chicago",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-01T12:34:56Z"), 0),
+		)
+		.expect("evaluate date_trunc");
+		let truncated = outputs[0]
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("truncated timestamp");
+
+		assert_eq!(truncated.value(0), timestamp_ms("2024-01-01T06:00:00Z"));
+		assert_eq!(
+			truncated.data_type(),
+			&DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+		);
+	}
+
+	#[test]
+	fn date_trunc_day_at_time_zone_returns_utc_instant_for_local_midnight() {
+		let program = bind_temporal_expr(
+			Expr::DateTrunc(
+				TemporalTruncField::Day,
+				Box::new(Expr::AtTimeZone(
+					Box::new(Expr::column("event_time")),
+					"America/New_York".to_string(),
+				)),
+			),
+			"America/Chicago",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-01T12:34:56Z"), 0),
+		)
+		.expect("evaluate explicit-zone date_trunc");
+		let truncated = outputs[0]
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("truncated timestamp");
+
+		assert_eq!(truncated.value(0), timestamp_ms("2024-01-01T05:00:00Z"));
+	}
+
+	#[test]
+	fn date_trunc_day_across_dst_reuses_adr150_gap_fold_policy() {
+		let program = bind_temporal_expr(
+			Expr::DateTrunc(
+				TemporalTruncField::Day,
+				Box::new(Expr::column("event_time")),
+			),
+			"America/Chicago",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-03-10T12:34:56Z"), 0),
+		)
+		.expect("evaluate DST date_trunc");
+		let truncated = outputs[0]
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("truncated timestamp");
+
+		assert_eq!(truncated.value(0), timestamp_ms("2024-03-10T06:00:00Z"));
+		assert_ne!(truncated.value(0), timestamp_ms("2024-03-10T00:00:00Z"));
+	}
+
+	#[test]
+	fn date32_extract_is_civil_and_zone_free() {
+		let days = parse_date_ymd("2024-02-29").expect("date");
+		let program = bind_temporal_expr(
+			Expr::Extract(
+				TemporalExtractField::DayOfYear,
+				Box::new(Expr::column("signup_date")),
+			),
+			"America/Chicago",
+		);
+		let outputs = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&temporal_batch(timestamp_ms("2024-01-01T00:00:00Z"), days),
+		)
+		.expect("evaluate Date32 extract");
+		let doy = outputs[0]
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("doy output");
+
+		assert_eq!(doy.value(0), 60);
+		assert_eq!(program.node_type(program.roots[0]), Some(&DataType::Int32));
+	}
+
+	#[test]
+	fn at_time_zone_rejects_date32_operand() {
+		let schema = temporal_schema();
+		let config = PlannerConfig::default().with_session_timezone("UTC");
+		let logical_casts = HashMap::new();
+		let ctx = ExprBindContext {
+			config: &config,
+			session_timezone: config
+				.resolved_session_timezone()
+				.expect("session timezone"),
+			logical_casts: &logical_casts,
+			relation_scope: None,
+		};
+		let err = bind_expr_program(
+			&[Expr::Extract(
+				TemporalExtractField::Day,
+				Box::new(Expr::AtTimeZone(
+					Box::new(Expr::column("signup_date")),
+					"UTC".to_string(),
+				)),
+			)],
+			&schema,
+			&ctx,
+		)
+		.expect_err("Date32 AT TIME ZONE should reject");
+
+		assert!(err.to_string().contains("AT TIME ZONE requires Timestamp"));
+	}
+
+	#[tokio::test]
+	async fn rune_date_trunc_day_groups_event_time_in_session_zone() {
+		let logical = rune_plan(
+			r#"
+            pub fn main(ctx) {
+                ctx.table("customers")
+                   .project([date_trunc("day", col("observed_at"))])
+            }
+        "#,
+		)
+		.await;
+		let catalog = descriptor_sidecar_join_catalog_with_customers_schema_and_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(10),
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new(
+					"observed_at",
+					crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond),
+					true,
+				),
+			]),
+			Vec::new(),
+		);
+		let plan = bind(
+			&logical,
+			&catalog,
+			&PlannerConfig::default().with_session_timezone("America/Chicago"),
+		)
+		.await
+		.expect("bind Rune temporal plan");
+		let ExecutionPlan::Project { exprs, .. } = plan else {
+			panic!("expected project");
+		};
+		let root = exprs.single_root().expect("single root");
+
+		match exprs.node(root) {
+			Some(BoundExprNode::DateTrunc { field, zone, .. }) => {
+				assert_eq!(*field, TemporalTruncField::Day);
+				assert_eq!(zone, "America/Chicago");
+			}
+			other => panic!("expected DateTrunc node, got {other:?}"),
+		}
+	}
+
 	#[tokio::test]
 	async fn timestamp_precision_loss_in_target_unit_is_bind_error() {
 		let instant = timestamp_ms("2024-01-01T00:00:00Z");
@@ -13350,6 +13851,44 @@ mod tests {
 	fn timestamp_ms(value: &str) -> i64 {
 		crate::timestamp::parse_explicit_timestamptz(value, TimeUnit::Millisecond)
 			.expect("timestamp literal")
+	}
+
+	fn temporal_schema() -> SchemaRef {
+		Arc::new(Schema::new(vec![
+			Field::new(
+				"event_time",
+				crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond),
+				true,
+			),
+			Field::new("signup_date", DataType::Date32, true),
+		]))
+	}
+
+	fn temporal_batch(event_time: i64, signup_date: i32) -> RecordBatch {
+		RecordBatch::try_new(
+			temporal_schema(),
+			vec![
+				Arc::new(
+					TimestampMillisecondArray::from(vec![Some(event_time)]).with_timezone("UTC"),
+				) as ArrayRef,
+				Arc::new(Date32Array::from(vec![Some(signup_date)])) as ArrayRef,
+			],
+		)
+		.expect("temporal batch")
+	}
+
+	fn bind_temporal_expr(expr: Expr, session_timezone: &str) -> BoundExprProgram {
+		let config = PlannerConfig::default().with_session_timezone(session_timezone);
+		let logical_casts = HashMap::new();
+		let ctx = ExprBindContext {
+			config: &config,
+			session_timezone: config
+				.resolved_session_timezone()
+				.expect("session timezone"),
+			logical_casts: &logical_casts,
+			relation_scope: None,
+		};
+		bind_expr_program(&[expr], &temporal_schema(), &ctx).expect("bind temporal expr")
 	}
 
 	fn range_fact_f64(min: f64, max: f64, non_null_count: u64) -> RangeFact {

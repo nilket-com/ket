@@ -2,9 +2,12 @@ use std::fmt;
 
 use arrow::datatypes::TimeUnit;
 use chrono::{
-	DateTime, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone, Utc,
+	DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone,
+	Timelike, Utc,
 };
 use chrono_tz::Tz;
+
+use crate::ir::{TemporalExtractField, TemporalTruncField};
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 const NANOS_PER_MILLISECOND: i128 = 1_000_000;
@@ -116,6 +119,97 @@ pub(crate) fn format_timestamp_in_zone(value: i64, unit: TimeUnit, timezone: Tz)
 	datetime
 		.with_timezone(&timezone)
 		.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
+pub(crate) fn timestamp_extract(
+	value: i64,
+	unit: TimeUnit,
+	timezone: Tz,
+	field: TemporalExtractField,
+) -> Result<i32, TimestampParseError> {
+	let datetime = utc_datetime_from_ticks(value, unit)
+		.ok_or_else(|| TimestampParseError::new(&value.to_string(), "timestamp out of range"))?;
+	let local = datetime.with_timezone(&timezone);
+	let value = match field {
+		TemporalExtractField::Year => local.year(),
+		TemporalExtractField::IsoYear => local.iso_week().year(),
+		TemporalExtractField::Quarter => {
+			i32::try_from((local.month0() / 3) + 1).expect("quarter fits in i32")
+		}
+		TemporalExtractField::Month => i32::try_from(local.month()).expect("month fits in i32"),
+		TemporalExtractField::Week | TemporalExtractField::IsoWeek => {
+			i32::try_from(local.iso_week().week()).expect("week fits in i32")
+		}
+		TemporalExtractField::Day => i32::try_from(local.day()).expect("day fits in i32"),
+		TemporalExtractField::DayOfWeek => {
+			i32::try_from(local.weekday().num_days_from_sunday()).expect("dow fits in i32")
+		}
+		TemporalExtractField::DayOfYear => i32::try_from(local.ordinal()).expect("doy fits in i32"),
+		TemporalExtractField::Hour => i32::try_from(local.hour()).expect("hour fits in i32"),
+		TemporalExtractField::Minute => i32::try_from(local.minute()).expect("minute fits in i32"),
+		TemporalExtractField::Second => i32::try_from(local.second()).expect("second fits in i32"),
+		TemporalExtractField::Millisecond => {
+			i32::try_from(local.nanosecond() / 1_000_000).expect("millisecond fits in i32")
+		}
+		TemporalExtractField::Microsecond => {
+			i32::try_from(local.nanosecond() / 1_000).expect("microsecond fits in i32")
+		}
+		TemporalExtractField::Nanosecond => {
+			i32::try_from(local.nanosecond()).expect("nanosecond fits in i32")
+		}
+	};
+	Ok(value)
+}
+
+pub(crate) fn timestamp_trunc(
+	value: i64,
+	unit: TimeUnit,
+	timezone: Tz,
+	field: TemporalTruncField,
+) -> Result<i64, TimestampParseError> {
+	let datetime = utc_datetime_from_ticks(value, unit)
+		.ok_or_else(|| TimestampParseError::new(&value.to_string(), "timestamp out of range"))?;
+	let local = datetime.with_timezone(&timezone);
+	let date = local.date_naive();
+	let naive = match field {
+		TemporalTruncField::Year => NaiveDate::from_ymd_opt(local.year(), 1, 1)
+			.expect("valid year from DateTime")
+			.and_hms_nano_opt(0, 0, 0, 0)
+			.expect("midnight is valid"),
+		TemporalTruncField::Month => NaiveDate::from_ymd_opt(local.year(), local.month(), 1)
+			.expect("valid month from DateTime")
+			.and_hms_nano_opt(0, 0, 0, 0)
+			.expect("midnight is valid"),
+		TemporalTruncField::Day => date
+			.and_hms_nano_opt(0, 0, 0, 0)
+			.expect("midnight is valid"),
+		TemporalTruncField::Hour => date
+			.and_hms_nano_opt(local.hour(), 0, 0, 0)
+			.expect("hour from DateTime is valid"),
+		TemporalTruncField::Minute => date
+			.and_hms_nano_opt(local.hour(), local.minute(), 0, 0)
+			.expect("minute from DateTime is valid"),
+		TemporalTruncField::Second => date
+			.and_hms_nano_opt(local.hour(), local.minute(), local.second(), 0)
+			.expect("second from DateTime is valid"),
+	};
+	let local = match timezone.from_local_datetime(&naive) {
+		LocalResult::Single(value) => value,
+		LocalResult::Ambiguous(left, right) => {
+			if left.with_timezone(&Utc) <= right.with_timezone(&Utc) {
+				left
+			} else {
+				right
+			}
+		}
+		LocalResult::None => {
+			return Err(TimestampParseError::new(
+				&value.to_string(),
+				format!("wall-clock time does not exist in timezone {timezone}"),
+			));
+		}
+	};
+	ticks_from_utc_datetime(local.with_timezone(&Utc), unit, &value.to_string())
 }
 
 fn parse_local_naive_timestamp(value: &str) -> Result<NaiveDateTime, TimestampParseError> {

@@ -4,7 +4,7 @@ use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
 	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, ScalarValue,
-	SortExpr,
+	SortExpr, TemporalExtractField, TemporalTruncField,
 };
 use crate::sql_planner::{SqlPlanner, build_join_plan, expr_to_join_keys};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -633,6 +633,34 @@ pub fn time_bucket(interval_str: String, ts: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn extract(field: String, expr: RuneExpr) -> VmResult<RuneExpr> {
+	let Some(field) = TemporalExtractField::parse_name(&field) else {
+		return VmResult::panic(format!("unsupported EXTRACT field: {field}"));
+	};
+	VmResult::Ok(RuneExpr {
+		expr: Expr::Extract(field, Box::new(expr.expr)),
+	})
+}
+
+pub fn date_part(field: String, expr: RuneExpr) -> VmResult<RuneExpr> {
+	extract(field, expr)
+}
+
+pub fn date_trunc(field: String, expr: RuneExpr) -> VmResult<RuneExpr> {
+	let Some(field) = TemporalTruncField::parse_name(&field) else {
+		return VmResult::panic(format!("unsupported date_trunc field: {field}"));
+	};
+	VmResult::Ok(RuneExpr {
+		expr: Expr::DateTrunc(field, Box::new(expr.expr)),
+	})
+}
+
+pub fn at_time_zone(expr: RuneExpr, zone: String) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::AtTimeZone(Box::new(expr.expr), zone),
+	}
+}
+
 pub fn linear_regress(y: RuneExpr, x: RuneExpr) -> RuneAggr {
 	RuneAggr {
 		func: AggregateFunction::LinearRegress,
@@ -938,6 +966,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["type_f32"], type_f32).build()?;
 	m.function(["type_f64"], type_f64).build()?;
 	m.function(["time_bucket"], time_bucket).build()?;
+	m.function(["extract"], extract).build()?;
+	m.function(["date_part"], date_part).build()?;
+	m.function(["date_trunc"], date_trunc).build()?;
+	m.function(["at_time_zone"], at_time_zone).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
 	m.function(["count_all"], count_all).build()?;

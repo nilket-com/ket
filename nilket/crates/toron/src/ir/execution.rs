@@ -7,7 +7,7 @@ use crate::catalog::{DistinctCountFact, RangeFact, TableRef};
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{
 	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId, ScalarValue,
-	field_with_logical_type_metadata,
+	TemporalExtractField, TemporalTruncField, field_with_logical_type_metadata,
 };
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
@@ -113,6 +113,20 @@ pub enum BoundExprNode {
 	},
 	TimeBucket {
 		interval: std::time::Duration,
+		input: BoundExprId,
+	},
+	AtTimeZone {
+		input: BoundExprId,
+		zone: String,
+	},
+	Extract {
+		field: TemporalExtractField,
+		zone: Option<String>,
+		input: BoundExprId,
+	},
+	DateTrunc {
+		field: TemporalTruncField,
+		zone: String,
 		input: BoundExprId,
 	},
 }
@@ -530,6 +544,38 @@ impl BoundExprProgramBuilder {
 		self.append_node(BoundExprNode::TimeBucket { interval, input }, output_type)
 	}
 
+	pub fn append_at_time_zone(
+		&mut self,
+		input: BoundExprId,
+		zone: String,
+		output_type: DataType,
+	) -> BoundExprId {
+		self.assert_existing_child(input);
+		self.append_node(BoundExprNode::AtTimeZone { input, zone }, output_type)
+	}
+
+	pub fn append_extract(
+		&mut self,
+		field: TemporalExtractField,
+		zone: Option<String>,
+		input: BoundExprId,
+		output_type: DataType,
+	) -> BoundExprId {
+		self.assert_existing_child(input);
+		self.append_node(BoundExprNode::Extract { field, zone, input }, output_type)
+	}
+
+	pub fn append_date_trunc(
+		&mut self,
+		field: TemporalTruncField,
+		zone: String,
+		input: BoundExprId,
+		output_type: DataType,
+	) -> BoundExprId {
+		self.assert_existing_child(input);
+		self.append_node(BoundExprNode::DateTrunc { field, zone, input }, output_type)
+	}
+
 	pub fn push_root(&mut self, id: BoundExprId) {
 		self.assert_existing_child(id);
 		self.roots.push(id);
@@ -709,7 +755,10 @@ impl BoundExprProgram {
 				}
 				Some(nullable)
 			}
-			BoundExprNode::TimeBucket { input, .. } => self.node_nullable(*input),
+			BoundExprNode::TimeBucket { input, .. }
+			| BoundExprNode::AtTimeZone { input, .. }
+			| BoundExprNode::Extract { input, .. }
+			| BoundExprNode::DateTrunc { input, .. } => self.node_nullable(*input),
 		}
 	}
 
@@ -862,6 +911,28 @@ impl BoundExprProgram {
 			BoundExprNode::TimeBucket { interval, input } => {
 				format!("TIME_BUCKET({interval:?}, {})", self.pretty_node(*input))
 			}
+			BoundExprNode::AtTimeZone { input, zone } => {
+				format!("AT_TIME_ZONE({}, {zone:?})", self.pretty_node(*input))
+			}
+			BoundExprNode::Extract { field, zone, input } => match zone {
+				Some(zone) => format!(
+					"EXTRACT({} FROM {} AT {zone:?})",
+					field.as_str(),
+					self.pretty_node(*input)
+				),
+				None => format!(
+					"EXTRACT({} FROM {})",
+					field.as_str(),
+					self.pretty_node(*input)
+				),
+			},
+			BoundExprNode::DateTrunc { field, zone, input } => {
+				format!(
+					"DATE_TRUNC({}, {} AT {zone:?})",
+					field.as_str(),
+					self.pretty_node(*input)
+				)
+			}
 		}
 	}
 }
@@ -875,7 +946,10 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
-		| BoundExprNode::TimeBucket { input, .. } => vec![*input],
+		| BoundExprNode::TimeBucket { input, .. }
+		| BoundExprNode::AtTimeZone { input, .. }
+		| BoundExprNode::Extract { input, .. }
+		| BoundExprNode::DateTrunc { input, .. } => vec![*input],
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {
 			let mut children = Vec::with_capacity(list.len() + 1);

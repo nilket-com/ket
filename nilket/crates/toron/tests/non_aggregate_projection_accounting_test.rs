@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use toron::error::FrontendError;
-use toron::ir::{Expr, LogicalPlan, ScalarValue};
+use toron::ir::{Expr, LogicalPlan, ScalarValue, TemporalExtractField, TemporalTruncField};
 use toron::sql_planner::SqlPlanner;
 
 #[test]
@@ -134,6 +134,64 @@ fn valid_time_bucket_still_lowers() {
 	};
 	assert_eq!(*interval, Duration::from_secs(3600));
 	assert_column(inner, "ts");
+}
+
+#[test]
+fn extract_at_time_zone_lowers() {
+	let plan = plan_sql("SELECT EXTRACT(HOUR FROM ts AT TIME ZONE 'America/Chicago') FROM sales");
+
+	let LogicalPlan::Project { exprs, .. } = plan else {
+		panic!("expected project");
+	};
+	let Expr::Extract(field, inner) = &exprs[0] else {
+		panic!("expected extract");
+	};
+	assert_eq!(*field, TemporalExtractField::Hour);
+	let Expr::AtTimeZone(inner, zone) = inner.as_ref() else {
+		panic!("expected AT TIME ZONE operand");
+	};
+	assert_eq!(zone, "America/Chicago");
+	assert_column(inner, "ts");
+}
+
+#[test]
+fn date_part_alias_lowers_to_extract() {
+	let plan = plan_sql("SELECT date_part('doy', signup_date) FROM sales");
+
+	let LogicalPlan::Project { exprs, .. } = plan else {
+		panic!("expected project");
+	};
+	let Expr::Extract(field, inner) = &exprs[0] else {
+		panic!("expected extract");
+	};
+	assert_eq!(*field, TemporalExtractField::DayOfYear);
+	assert_column(inner, "signup_date");
+}
+
+#[test]
+fn date_trunc_lowers() {
+	let plan = plan_sql("SELECT date_trunc('day', ts) FROM sales");
+
+	let LogicalPlan::Project { exprs, .. } = plan else {
+		panic!("expected project");
+	};
+	let Expr::DateTrunc(field, inner) = &exprs[0] else {
+		panic!("expected date_trunc");
+	};
+	assert_eq!(*field, TemporalTruncField::Day);
+	assert_column(inner, "ts");
+}
+
+#[test]
+fn temporal_operation_unsupported_shapes_reject_cleanly() {
+	for sql in [
+		"SELECT ts AT TIME ZONE zone_name FROM sales",
+		"SELECT date_part('epoch', ts) FROM sales",
+		"SELECT date_trunc('week', ts) FROM sales",
+		"SELECT EXTRACT(ISODOW FROM ts) FROM sales",
+	] {
+		assert_unsupported(sql);
+	}
 }
 
 fn plan_sql(sql: &str) -> LogicalPlan {

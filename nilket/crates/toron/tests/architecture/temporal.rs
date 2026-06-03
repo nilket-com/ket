@@ -266,3 +266,110 @@ pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
 	assert!(ctas_test.contains("query_coordinator_executes_timestamptz_projection_ctas"));
 	assert!(rune_test.contains("rune_lit_timestamp_lowers_explicit_offset_to_utc_nanos"));
 }
+
+#[test]
+pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_executed() {
+	let binder = source("src/binder.rs");
+	let ir = source("src/ir.rs");
+	let execution_ir = source("src/ir/execution.rs");
+	let planner = source("src/sql_planner.rs");
+	let exec = source("src/exec.rs");
+	let timestamp = source("src/timestamp.rs");
+	let date32 = source("src/date32.rs");
+	let daemon = source("src/daemon.rs");
+	let pbc = source("src/pbc.rs");
+	let rune = source("src/rune_engine.rs");
+	let lower_expr = source_block(&planner, "fn lower_expr");
+	let bind_expr = source_block(&binder, "fn bind_expr_into_program");
+	let bind_extract = source_block(&binder, "fn bind_temporal_extract");
+	let bind_trunc = source_block(&binder, "fn bind_date_trunc");
+	let operand_zone = source_block(&binder, "fn temporal_operand_zone");
+	let range_scalar = source_block(&binder, "fn range_scalar_for_fact");
+	let restamp_field = source_block(&daemon, "fn restamp_sql_result_field");
+	let restamp_array = source_block(&daemon, "fn restamp_sql_result_array");
+	let bound_node = source_block(&execution_ir, "pub enum BoundExprNode");
+
+	for required in [
+		"pub enum TemporalExtractField",
+		"pub enum TemporalTruncField",
+		"AtTimeZone(Box<Expr>, String)",
+		"Extract(TemporalExtractField, Box<Expr>)",
+		"DateTrunc(TemporalTruncField, Box<Expr>)",
+		"Self::AtTimeZone(_, _)",
+		"Self::Extract(_, _)",
+		"Self::DateTrunc(_, _)",
+	] {
+		assert!(ir.contains(required), "IR missing {required}");
+	}
+	for required in [
+		"AtTimeZone {",
+		"Extract {",
+		"zone: Option<String>",
+		"DateTrunc {",
+		"append_at_time_zone",
+		"append_extract",
+		"append_date_trunc",
+	] {
+		assert!(
+			execution_ir.contains(required),
+			"bound IR missing {required}"
+		);
+	}
+	assert!(bound_node.contains("field: TemporalExtractField"));
+	assert!(bound_node.contains("field: TemporalTruncField"));
+	assert!(lower_expr.contains("SqlExpr::Extract { field, expr, .. }"));
+	assert!(lower_expr.contains("SqlExpr::AtTimeZone"));
+	assert!(lower_expr.contains("function_name_eq(&f.name, \"DATE_PART\")"));
+	assert!(lower_expr.contains("function_name_eq(&f.name, \"DATE_TRUNC\")"));
+	assert!(planner.contains("lower_extract_datetime_field"));
+	assert!(planner.contains("unsupported EXTRACT field"));
+	assert!(planner.contains("unsupported date_trunc field"));
+	assert!(bind_expr.contains("Expr::AtTimeZone(inner, zone)"));
+	assert!(bind_expr.contains("Expr::Extract(field, inner)"));
+	assert!(bind_expr.contains("Expr::DateTrunc(field, inner)"));
+	assert!(operand_zone.contains("Expr::AtTimeZone(timestamp, zone)"));
+	assert!(operand_zone.contains("ctx.session_timezone.to_string()"));
+	assert!(!operand_zone.contains("DataType::Timestamp"));
+	assert!(bind_extract.contains("field.is_date32_supported()"));
+	assert!(bind_extract.contains("builder.append_extract(field, None"));
+	assert!(bind_extract.contains("builder.append_extract(field, Some(zone)"));
+	assert!(bind_extract.contains("AT TIME ZONE requires Timestamp"));
+	assert!(bind_trunc.contains("Date32 date_trunc is deferred in ADR 151"));
+	assert!(bind_trunc.contains("DataType::Timestamp(unit, Some(\"UTC\".into()))"));
+	assert!(timestamp.contains("pub(crate) fn timestamp_extract"));
+	assert!(timestamp.contains("pub(crate) fn timestamp_trunc"));
+	assert!(timestamp.contains("timezone.from_local_datetime(&naive)"));
+	assert!(timestamp.contains("LocalResult::None"));
+	assert!(timestamp.contains("LocalResult::Ambiguous"));
+	assert!(date32.contains("pub(crate) fn date32_extract"));
+	assert!(exec.contains("fn evaluate_at_time_zone"));
+	assert!(exec.contains("fn evaluate_extract"));
+	assert!(exec.contains("fn evaluate_date_trunc"));
+	assert!(exec.contains("BoundExprNode::AtTimeZone"));
+	assert!(exec.contains("BoundExprNode::Extract"));
+	assert!(exec.contains("BoundExprNode::DateTrunc"));
+	assert!(restamp_field.contains("timezone.as_ref() == \"UTC\""));
+	assert!(restamp_field.contains("other => other.clone()"));
+	assert!(restamp_array.contains("timezone.as_ref() == \"UTC\""));
+	assert!(pbc.contains("BoundExprNode::AtTimeZone"));
+	assert!(pbc.contains("BoundExprNode::Extract"));
+	assert!(pbc.contains("BoundExprNode::DateTrunc"));
+	assert!(pbc.contains("session-zoned temporal operations are not PBC-eligible"));
+	assert!(rune.contains("pub fn extract(field: String, expr: RuneExpr)"));
+	assert!(rune.contains("pub fn date_trunc(field: String, expr: RuneExpr)"));
+	assert!(rune.contains("pub fn at_time_zone(expr: RuneExpr, zone: String)"));
+	assert!(rune.contains("m.function([\"date_trunc\"], date_trunc).build()?;"));
+	assert!(!range_scalar.contains("Some(\"America/Chicago\""));
+	assert!(binder.contains("extract_hour_from_timestamp_at_time_zone_uses_named_zone"));
+	assert!(binder.contains("extract_utc_column_without_at_time_zone_uses_session_zone"));
+	assert!(binder.contains("extract_at_time_zone_utc_uses_utc_not_session_zone"));
+	assert!(binder.contains("date_trunc_day_returns_utc_instant_for_session_local_midnight"));
+	assert!(binder.contains("date_trunc_day_at_time_zone_returns_utc_instant_for_local_midnight"));
+	assert!(binder.contains("date_trunc_day_across_dst_reuses_adr150_gap_fold_policy"));
+	assert!(binder.contains("date32_extract_is_civil_and_zone_free"));
+	assert!(binder.contains("at_time_zone_rejects_date32_operand"));
+	assert!(binder.contains("rune_date_trunc_day_groups_event_time_in_session_zone"));
+	assert!(daemon.contains("sql_result_timestamp_restamp_preserves_explicit_non_utc_zone"));
+	assert!(!planner.contains("SET TIME ZONE"));
+	assert!(binder.contains("date_trunc is not supported for Date64"));
+}

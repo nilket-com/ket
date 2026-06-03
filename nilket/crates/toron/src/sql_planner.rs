@@ -6,14 +6,14 @@ use crate::ir::{
 	AggregateFunction, CreateTableColumn, CreateTableColumnType, CreateTableRowIdentity,
 	CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy, JoinStrategyIntent,
 	JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue, SortExpr,
-	data_type_to_logical_type_physical,
+	TemporalExtractField, TemporalTruncField, data_type_to_logical_type_physical,
 };
 use crate::timestamp::{parse_explicit_timestamptz, utc_timestamp_data_type};
 use arrow::datatypes::{DataType, TimeUnit};
 use sqlparser::ast::{
 	Assignment, AssignmentTarget, BinaryOperator, CaseWhen, CastKind, ColumnDef, ColumnOption,
-	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, Delete,
-	DescribeAlias, ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg,
+	ColumnOptionDef, CreateTable, CreateTableOptions, DataType as SqlDataType, DateTimeField,
+	Delete, DescribeAlias, ExactNumberInfo, Expr as SqlExpr, FromTable, Function, FunctionArg,
 	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
 	Ident, Insert, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
 	ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query, Select, SelectItem,
@@ -224,7 +224,16 @@ fn reject_nested_aggregate(expr: &SqlExpr) -> Result<(), FrontendError> {
 			}
 			Ok(())
 		}
-		SqlExpr::Cast { expr, .. } | SqlExpr::UnaryOp { expr, .. } => reject_nested_aggregate(expr),
+		SqlExpr::Cast { expr, .. }
+		| SqlExpr::Extract { expr, .. }
+		| SqlExpr::UnaryOp { expr, .. } => reject_nested_aggregate(expr),
+		SqlExpr::AtTimeZone {
+			timestamp,
+			time_zone,
+		} => {
+			reject_nested_aggregate(timestamp)?;
+			reject_nested_aggregate(time_zone)
+		}
 		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) | SqlExpr::Nested(inner) => {
 			reject_nested_aggregate(inner)
 		}
@@ -309,6 +318,100 @@ fn typed_string_value(typed: &TypedString) -> Result<String, FrontendError> {
 		.clone()
 		.into_string()
 		.ok_or_else(|| unsupported("typed string literal body must be a string literal"))
+}
+
+fn function_name_eq(name: &ObjectName, expected: &str) -> bool {
+	name.to_string().eq_ignore_ascii_case(expected)
+}
+
+fn function_arg_list<'a>(
+	args: &'a FunctionArguments,
+	error_message: &'static str,
+) -> Result<&'a [FunctionArg], FrontendError> {
+	match args {
+		FunctionArguments::List(list) => Ok(&list.args),
+		_ => Err(unsupported(error_message)),
+	}
+}
+
+fn string_literal_function_arg(
+	arg: &FunctionArg,
+	error_message: &'static str,
+) -> Result<String, FrontendError> {
+	match arg {
+		FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+			sql_string_literal_expr(expr, error_message)
+		}
+		_ => Err(unsupported(error_message)),
+	}
+}
+
+fn sql_string_literal_expr(
+	expr: &SqlExpr,
+	error_message: &'static str,
+) -> Result<String, FrontendError> {
+	match sql_value(expr) {
+		Some(Value::SingleQuotedString(value)) => Ok(value.clone()),
+		_ => Err(unsupported(error_message)),
+	}
+}
+
+fn lower_temporal_extract_name(value: &str) -> Result<TemporalExtractField, FrontendError> {
+	TemporalExtractField::parse_name(value)
+		.ok_or_else(|| unsupported(format!("unsupported EXTRACT field: {value}")))
+}
+
+fn lower_temporal_trunc_name(value: &str) -> Result<TemporalTruncField, FrontendError> {
+	TemporalTruncField::parse_name(value)
+		.ok_or_else(|| unsupported(format!("unsupported date_trunc field: {value}")))
+}
+
+fn lower_extract_datetime_field(
+	field: &DateTimeField,
+) -> Result<TemporalExtractField, FrontendError> {
+	match field {
+		DateTimeField::Year | DateTimeField::Years => Ok(TemporalExtractField::Year),
+		DateTimeField::Isoyear => Ok(TemporalExtractField::IsoYear),
+		DateTimeField::Quarter => Ok(TemporalExtractField::Quarter),
+		DateTimeField::Month | DateTimeField::Months => Ok(TemporalExtractField::Month),
+		DateTimeField::Week(None) | DateTimeField::Weeks => Ok(TemporalExtractField::Week),
+		DateTimeField::Week(Some(_)) => {
+			Err(unsupported(format!("unsupported EXTRACT field: {field}")))
+		}
+		DateTimeField::IsoWeek => Ok(TemporalExtractField::IsoWeek),
+		DateTimeField::Day | DateTimeField::Days => Ok(TemporalExtractField::Day),
+		DateTimeField::Dow | DateTimeField::DayOfWeek => Ok(TemporalExtractField::DayOfWeek),
+		DateTimeField::Doy | DateTimeField::DayOfYear => Ok(TemporalExtractField::DayOfYear),
+		DateTimeField::Hour | DateTimeField::Hours => Ok(TemporalExtractField::Hour),
+		DateTimeField::Minute | DateTimeField::Minutes => Ok(TemporalExtractField::Minute),
+		DateTimeField::Second | DateTimeField::Seconds => Ok(TemporalExtractField::Second),
+		DateTimeField::Millisecond | DateTimeField::Milliseconds => {
+			Ok(TemporalExtractField::Millisecond)
+		}
+		DateTimeField::Microsecond | DateTimeField::Microseconds => {
+			Ok(TemporalExtractField::Microsecond)
+		}
+		DateTimeField::Nanosecond | DateTimeField::Nanoseconds => {
+			Ok(TemporalExtractField::Nanosecond)
+		}
+		DateTimeField::Century
+		| DateTimeField::Decade
+		| DateTimeField::Epoch
+		| DateTimeField::Isodow
+		| DateTimeField::Julian
+		| DateTimeField::Millenium
+		| DateTimeField::Millennium
+		| DateTimeField::Date
+		| DateTimeField::Datetime
+		| DateTimeField::Time
+		| DateTimeField::Timezone
+		| DateTimeField::TimezoneAbbr
+		| DateTimeField::TimezoneHour
+		| DateTimeField::TimezoneMinute
+		| DateTimeField::TimezoneRegion
+		| DateTimeField::NoDateTime
+		| DateTimeField::Custom(_) => Err(unsupported(format!("unsupported EXTRACT field: {field}"))),
+	}
 }
 
 fn take_sql_word(input: &str) -> Option<(&str, &str)> {
@@ -4103,6 +4206,20 @@ impl SqlPlanner {
 			}
 			SqlExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.lower_expr(expr)?))),
 			SqlExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.lower_expr(expr)?))),
+			SqlExpr::Extract { field, expr, .. } => Ok(Expr::Extract(
+				lower_extract_datetime_field(field)?,
+				Box::new(self.lower_expr(expr)?),
+			)),
+			SqlExpr::AtTimeZone {
+				timestamp,
+				time_zone,
+			} => Ok(Expr::AtTimeZone(
+				Box::new(self.lower_expr(timestamp)?),
+				sql_string_literal_expr(
+					time_zone,
+					"AT TIME ZONE expects a string literal timezone",
+				)?,
+			)),
 			SqlExpr::Nested(expr) => self.lower_expr(expr),
 			SqlExpr::Function(f) => match conditional_sugar_function_name(&f.name) {
 				Some(ConditionalSugarFunction::Coalesce) => self.lower_coalesce(f),
@@ -4114,7 +4231,33 @@ impl SqlPlanner {
 					self.lower_ifnull_nvl(f)
 				}
 				Some(ConditionalSugarFunction::Nvl2) => self.lower_nvl2(f),
-				None if f.name.to_string().to_uppercase() == "TIME_BUCKET" => {
+				None if function_name_eq(&f.name, "DATE_PART") => {
+					let args = function_arg_list(&f.args, "date_part expects arguments")?;
+					if args.len() != 2 {
+						return Err(unsupported("date_part expects exactly two arguments"));
+					}
+					let field = string_literal_function_arg(
+						&args[0],
+						"date_part expects a string literal field",
+					)?;
+					let field = lower_temporal_extract_name(&field)?;
+					let expr = self.lower_arg(&args[1])?;
+					Ok(Expr::Extract(field, Box::new(expr)))
+				}
+				None if function_name_eq(&f.name, "DATE_TRUNC") => {
+					let args = function_arg_list(&f.args, "date_trunc expects arguments")?;
+					if args.len() != 2 {
+						return Err(unsupported("date_trunc expects exactly two arguments"));
+					}
+					let field = string_literal_function_arg(
+						&args[0],
+						"date_trunc expects a string literal field",
+					)?;
+					let field = lower_temporal_trunc_name(&field)?;
+					let expr = self.lower_arg(&args[1])?;
+					Ok(Expr::DateTrunc(field, Box::new(expr)))
+				}
+				None if function_name_eq(&f.name, "TIME_BUCKET") => {
 					let args = match &f.args {
 						sqlparser::ast::FunctionArguments::List(l) => &l.args,
 						_ => return Err(unsupported("TIME_BUCKET expects arguments")),
@@ -4526,7 +4669,10 @@ fn validate_hidden_sort_key_refs(
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::TimeBucket(_, inner) => validate_hidden_sort_key_refs(inner, visible_names),
+		| Expr::TimeBucket(_, inner)
+		| Expr::AtTimeZone(inner, _)
+		| Expr::Extract(_, inner)
+		| Expr::DateTrunc(_, inner) => validate_hidden_sort_key_refs(inner, visible_names),
 		Expr::InList { expr, list, .. } => {
 			validate_hidden_sort_key_refs(expr, visible_names)?;
 			for item in list {
@@ -5070,6 +5216,21 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 				hash_expr_structural(else_expr, state);
 			}
 		}
+		Expr::AtTimeZone(inner, zone) => {
+			25u8.hash(state);
+			zone.hash(state);
+			hash_expr_structural(inner, state);
+		}
+		Expr::Extract(field, inner) => {
+			26u8.hash(state);
+			field.hash(state);
+			hash_expr_structural(inner, state);
+		}
+		Expr::DateTrunc(field, inner) => {
+			27u8.hash(state);
+			field.hash(state);
+			hash_expr_structural(inner, state);
+		}
 	}
 }
 
@@ -5128,6 +5289,15 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 		| (Expr::IsNotNull(left), Expr::IsNotNull(right)) => expr_structural_eq(left, right),
 		(Expr::TimeBucket(left_interval, left), Expr::TimeBucket(right_interval, right)) => {
 			left_interval == right_interval && expr_structural_eq(left, right)
+		}
+		(Expr::AtTimeZone(left, left_zone), Expr::AtTimeZone(right, right_zone)) => {
+			left_zone == right_zone && expr_structural_eq(left, right)
+		}
+		(Expr::Extract(left_field, left), Expr::Extract(right_field, right)) => {
+			left_field == right_field && expr_structural_eq(left, right)
+		}
+		(Expr::DateTrunc(left_field, left), Expr::DateTrunc(right_field, right)) => {
+			left_field == right_field && expr_structural_eq(left, right)
 		}
 		(
 			Expr::Like {
@@ -5448,7 +5618,10 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::TimeBucket(_, inner) => expr_contains_qualified_column(inner),
+		| Expr::TimeBucket(_, inner)
+		| Expr::AtTimeZone(inner, _)
+		| Expr::Extract(_, inner)
+		| Expr::DateTrunc(_, inner) => expr_contains_qualified_column(inner),
 		Expr::InList { expr, list, .. } => {
 			expr_contains_qualified_column(expr) || list.iter().any(expr_contains_qualified_column)
 		}
@@ -5525,7 +5698,13 @@ fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 				.as_deref()
 				.is_some_and(expr_contains_aggregate_call)
 		}
-		SqlExpr::Cast { expr, .. } => expr_contains_aggregate_call(expr),
+		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
+			expr_contains_aggregate_call(expr)
+		}
+		SqlExpr::AtTimeZone {
+			timestamp,
+			time_zone,
+		} => expr_contains_aggregate_call(timestamp) || expr_contains_aggregate_call(time_zone),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
@@ -5552,7 +5731,11 @@ fn expr_contains_subquery(expr: &SqlExpr) -> bool {
 						|| expr_contains_subquery(&case_when.result)
 				}) || else_result.as_deref().is_some_and(expr_contains_subquery)
 		}
-		SqlExpr::Cast { expr, .. } => expr_contains_subquery(expr),
+		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => expr_contains_subquery(expr),
+		SqlExpr::AtTimeZone {
+			timestamp,
+			time_zone,
+		} => expr_contains_subquery(timestamp) || expr_contains_subquery(time_zone),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
@@ -5591,7 +5774,13 @@ fn expr_contains_window_function(expr: &SqlExpr) -> bool {
 				.as_deref()
 				.is_some_and(expr_contains_window_function)
 		}
-		SqlExpr::Cast { expr, .. } => expr_contains_window_function(expr),
+		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
+			expr_contains_window_function(expr)
+		}
+		SqlExpr::AtTimeZone {
+			timestamp,
+			time_zone,
+		} => expr_contains_window_function(timestamp) || expr_contains_window_function(time_zone),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
@@ -5676,7 +5865,16 @@ fn expr_contains_nonaggregate_column_reference(expr: &SqlExpr) -> bool {
 				.as_deref()
 				.is_some_and(expr_contains_nonaggregate_column_reference)
 		}
-		SqlExpr::Cast { expr, .. } => expr_contains_nonaggregate_column_reference(expr),
+		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
+			expr_contains_nonaggregate_column_reference(expr)
+		}
+		SqlExpr::AtTimeZone {
+			timestamp,
+			time_zone,
+		} => {
+			expr_contains_nonaggregate_column_reference(timestamp)
+				|| expr_contains_nonaggregate_column_reference(time_zone)
+		}
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
@@ -6018,6 +6216,16 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 			*interval,
 			Box::new(canonical_aggregate_signature_expr(inner)),
 		),
+		Expr::AtTimeZone(inner, zone) => Expr::AtTimeZone(
+			Box::new(canonical_aggregate_signature_expr(inner)),
+			zone.clone(),
+		),
+		Expr::Extract(field, inner) => {
+			Expr::Extract(*field, Box::new(canonical_aggregate_signature_expr(inner)))
+		}
+		Expr::DateTrunc(field, inner) => {
+			Expr::DateTrunc(*field, Box::new(canonical_aggregate_signature_expr(inner)))
+		}
 	}
 }
 
@@ -7367,6 +7575,9 @@ mod tests {
 			| Expr::IsNull(expr)
 			| Expr::IsNotNull(expr)
 			| Expr::TimeBucket(_, expr)
+			| Expr::AtTimeZone(expr, _)
+			| Expr::Extract(_, expr)
+			| Expr::DateTrunc(_, expr)
 			| Expr::Cast(expr, _)
 			| Expr::TryCast(expr, _) => expr_references(expr, qualifier, name),
 			Expr::Add(left, right)

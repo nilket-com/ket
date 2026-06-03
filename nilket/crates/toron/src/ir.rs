@@ -523,6 +523,125 @@ impl ColumnRef {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TemporalExtractField {
+	Year,
+	IsoYear,
+	Quarter,
+	Month,
+	Week,
+	IsoWeek,
+	Day,
+	DayOfWeek,
+	DayOfYear,
+	Hour,
+	Minute,
+	Second,
+	Millisecond,
+	Microsecond,
+	Nanosecond,
+}
+
+impl TemporalExtractField {
+	pub fn parse_name(value: &str) -> Option<Self> {
+		match normalized_temporal_field_name(value).as_str() {
+			"year" | "years" => Some(Self::Year),
+			"isoyear" => Some(Self::IsoYear),
+			"quarter" | "quarters" => Some(Self::Quarter),
+			"month" | "months" => Some(Self::Month),
+			"week" | "weeks" => Some(Self::Week),
+			"isoweek" => Some(Self::IsoWeek),
+			"day" | "days" => Some(Self::Day),
+			"dow" | "dayofweek" => Some(Self::DayOfWeek),
+			"doy" | "dayofyear" => Some(Self::DayOfYear),
+			"hour" | "hours" => Some(Self::Hour),
+			"minute" | "minutes" => Some(Self::Minute),
+			"second" | "seconds" => Some(Self::Second),
+			"millisecond" | "milliseconds" => Some(Self::Millisecond),
+			"microsecond" | "microseconds" => Some(Self::Microsecond),
+			"nanosecond" | "nanoseconds" => Some(Self::Nanosecond),
+			_ => None,
+		}
+	}
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Year => "year",
+			Self::IsoYear => "isoyear",
+			Self::Quarter => "quarter",
+			Self::Month => "month",
+			Self::Week => "week",
+			Self::IsoWeek => "isoweek",
+			Self::Day => "day",
+			Self::DayOfWeek => "dow",
+			Self::DayOfYear => "doy",
+			Self::Hour => "hour",
+			Self::Minute => "minute",
+			Self::Second => "second",
+			Self::Millisecond => "millisecond",
+			Self::Microsecond => "microsecond",
+			Self::Nanosecond => "nanosecond",
+		}
+	}
+
+	pub fn is_date32_supported(self) -> bool {
+		matches!(
+			self,
+			Self::Year
+				| Self::IsoYear
+				| Self::Quarter
+				| Self::Month
+				| Self::Week | Self::IsoWeek
+				| Self::Day | Self::DayOfWeek
+				| Self::DayOfYear
+		)
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TemporalTruncField {
+	Year,
+	Month,
+	Day,
+	Hour,
+	Minute,
+	Second,
+}
+
+impl TemporalTruncField {
+	pub fn parse_name(value: &str) -> Option<Self> {
+		match normalized_temporal_field_name(value).as_str() {
+			"year" | "years" => Some(Self::Year),
+			"month" | "months" => Some(Self::Month),
+			"day" | "days" => Some(Self::Day),
+			"hour" | "hours" => Some(Self::Hour),
+			"minute" | "minutes" => Some(Self::Minute),
+			"second" | "seconds" => Some(Self::Second),
+			_ => None,
+		}
+	}
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Year => "year",
+			Self::Month => "month",
+			Self::Day => "day",
+			Self::Hour => "hour",
+			Self::Minute => "minute",
+			Self::Second => "second",
+		}
+	}
+}
+
+fn normalized_temporal_field_name(value: &str) -> String {
+	value
+		.trim()
+		.chars()
+		.filter(|character| !matches!(character, '_' | '-' | ' '))
+		.flat_map(char::to_lowercase)
+		.collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
 	Column(ColumnRef),
@@ -570,6 +689,9 @@ pub enum Expr {
 	IsNull(Box<Expr>),
 	IsNotNull(Box<Expr>),
 	TimeBucket(std::time::Duration, Box<Expr>),
+	AtTimeZone(Box<Expr>, String),
+	Extract(TemporalExtractField, Box<Expr>),
+	DateTrunc(TemporalTruncField, Box<Expr>),
 }
 
 impl Expr {
@@ -599,7 +721,10 @@ impl Expr {
 			| Self::Div(_, _)
 			| Self::Like { .. }
 			| Self::Case { .. }
-			| Self::TimeBucket(_, _) => false,
+			| Self::TimeBucket(_, _)
+			| Self::AtTimeZone(_, _)
+			| Self::Extract(_, _)
+			| Self::DateTrunc(_, _) => false,
 			Self::Eq(left, right)
 			| Self::Neq(left, right)
 			| Self::Lt(left, right)

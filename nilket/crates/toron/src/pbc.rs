@@ -143,6 +143,13 @@ impl PbcCompiler {
 				BoundExprNode::TimeBucket { .. } => {
 					return Err(PushdownDeclineReason::ExperimentalKernelInPredicate);
 				}
+				BoundExprNode::AtTimeZone { .. }
+				| BoundExprNode::Extract { .. }
+				| BoundExprNode::DateTrunc { .. } => {
+					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+						"session-zoned temporal operations are not PBC-eligible".to_string(),
+					));
+				}
 			}
 		}
 		Ok(())
@@ -195,7 +202,10 @@ impl PbcCompiler {
 			| BoundExprNode::TryCast { .. }
 			| BoundExprNode::Like { .. }
 			| BoundExprNode::Case { .. }
-			| BoundExprNode::TimeBucket { .. } => {
+			| BoundExprNode::TimeBucket { .. }
+			| BoundExprNode::AtTimeZone { .. }
+			| BoundExprNode::Extract { .. }
+			| BoundExprNode::DateTrunc { .. } => {
 				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 					"unsupported node reached PBC emitter".to_string(),
 				));

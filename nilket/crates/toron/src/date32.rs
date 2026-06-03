@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::ir::TemporalExtractField;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Date32ParseError {
 	value: String,
@@ -70,6 +72,38 @@ pub(crate) fn format_date_ymd(days: i32) -> String {
 	}
 }
 
+pub(crate) fn date32_extract(
+	days: i32,
+	field: TemporalExtractField,
+) -> Result<i32, Date32ParseError> {
+	let days = i64::from(days);
+	let (year, month, day) = civil_from_days(days);
+	let value = match field {
+		TemporalExtractField::Year => year,
+		TemporalExtractField::IsoYear => iso_year_week(days).0,
+		TemporalExtractField::Quarter => i64::from((month - 1) / 3 + 1),
+		TemporalExtractField::Month => i64::from(month),
+		TemporalExtractField::Week | TemporalExtractField::IsoWeek => {
+			i64::from(iso_year_week(days).1)
+		}
+		TemporalExtractField::Day => i64::from(day),
+		TemporalExtractField::DayOfWeek => (days + 4).rem_euclid(7),
+		TemporalExtractField::DayOfYear => i64::from(day_of_year(year, month, day)),
+		TemporalExtractField::Hour
+		| TemporalExtractField::Minute
+		| TemporalExtractField::Second
+		| TemporalExtractField::Millisecond
+		| TemporalExtractField::Microsecond
+		| TemporalExtractField::Nanosecond => {
+			return Err(Date32ParseError::new(
+				field.as_str(),
+				"time-of-day field is not supported for Date32",
+			));
+		}
+	};
+	i32::try_from(value).map_err(|_| Date32ParseError::new(field.as_str(), "field out of range"))
+}
+
 fn parse_decimal(bytes: &[u8]) -> u32 {
 	bytes
 		.iter()
@@ -88,6 +122,25 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 
 fn is_leap_year(year: u32) -> bool {
 	(year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn is_leap_year_i64(year: i64) -> bool {
+	(year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn day_of_year(year: i64, month: u32, day: u32) -> u32 {
+	const COMMON: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+	const LEAP: [u32; 12] = [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
+	let table = if is_leap_year_i64(year) { LEAP } else { COMMON };
+	table[usize::try_from(month - 1).expect("month index")] + day
+}
+
+fn iso_year_week(days: i64) -> (i64, u32) {
+	let monday_zero = (days + 3).rem_euclid(7);
+	let thursday = days + (3 - monday_zero);
+	let (iso_year, _, _) = civil_from_days(thursday);
+	let week = ((thursday - days_from_civil(iso_year, 1, 1)) / 7) + 1;
+	(iso_year, u32::try_from(week).expect("ISO week in range"))
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {

@@ -10,7 +10,8 @@ use crate::ir::arithmetic_output_type;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
-	MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
+	MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId, TemporalExtractField,
+	TemporalTruncField,
 };
 #[cfg(test)]
 use crate::ir::{BroadcastReplayEligibility, JoinReplayId, JoinStrategy};
@@ -1083,6 +1084,36 @@ impl Executor {
 					})
 				}
 			}
+			Expr::AtTimeZone(inner, zone) => {
+				let arr = self.evaluate_expr(inner, batch)?;
+				evaluate_at_time_zone(&arr, zone)
+			}
+			Expr::Extract(field, inner) => match inner.as_ref() {
+				Expr::AtTimeZone(timestamp, zone) => {
+					let arr = self.evaluate_expr(timestamp, batch)?;
+					evaluate_extract(*field, Some(zone), &arr)
+				}
+				_ => {
+					let arr = self.evaluate_expr(inner, batch)?;
+					if arr.data_type() == &DataType::Date32 {
+						evaluate_extract(*field, None, &arr)
+					} else {
+						Err(ExecutionError::InvalidExpression {
+							message: "unbound EXTRACT on Timestamp requires explicit AT TIME ZONE"
+								.to_string(),
+						})
+					}
+				}
+			},
+			Expr::DateTrunc(field, inner) => match inner.as_ref() {
+				Expr::AtTimeZone(timestamp, zone) => {
+					let arr = self.evaluate_expr(timestamp, batch)?;
+					evaluate_date_trunc(*field, zone, &arr)
+				}
+				_ => Err(ExecutionError::InvalidExpression {
+					message: "unbound date_trunc requires explicit AT TIME ZONE".to_string(),
+				}),
+			},
 		}
 	}
 
@@ -1182,6 +1213,18 @@ impl Executor {
 				BoundExprNode::TimeBucket { interval, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
 					evaluate_time_bucket(*interval, &arr)?
+				}
+				BoundExprNode::AtTimeZone { input, zone } => {
+					let arr = evaluated_child(&outputs, *input)?;
+					evaluate_at_time_zone(&arr, zone)?
+				}
+				BoundExprNode::Extract { field, zone, input } => {
+					let arr = evaluated_child(&outputs, *input)?;
+					evaluate_extract(*field, zone.as_ref(), &arr)?
+				}
+				BoundExprNode::DateTrunc { field, zone, input } => {
+					let arr = evaluated_child(&outputs, *input)?;
+					evaluate_date_trunc(*field, zone, &arr)?
 				}
 			};
 			outputs[idx] = Some(output);
@@ -2113,6 +2156,169 @@ fn evaluate_like(
 		(true, true) => arrow_nilike(expr_arr, &pattern)?,
 	};
 	Ok(Arc::new(result) as ArrayRef)
+}
+
+fn evaluate_at_time_zone(arr: &ArrayRef, zone: &str) -> Result<ArrayRef, ExecutionError> {
+	parse_temporal_execution_zone(zone)?;
+	if let Some(array) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+		return Ok(Arc::new(array.clone().with_timezone(zone.to_string())) as ArrayRef);
+	}
+	if let Some(array) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+		return Ok(Arc::new(array.clone().with_timezone(zone.to_string())) as ArrayRef);
+	}
+	if let Some(array) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+		return Ok(Arc::new(array.clone().with_timezone(zone.to_string())) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"AT TIME ZONE expects Timestamp input, got {:?}",
+			arr.data_type()
+		),
+	})
+}
+
+fn evaluate_extract(
+	field: TemporalExtractField,
+	zone: Option<&String>,
+	arr: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	if let Some(zone) = zone {
+		let timezone = parse_temporal_execution_zone(zone)?;
+		if let Some(array) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+			return timestamp_extract_array(array, TimeUnit::Millisecond, timezone, field);
+		}
+		if let Some(array) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+			return timestamp_extract_array(array, TimeUnit::Microsecond, timezone, field);
+		}
+		if let Some(array) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+			return timestamp_extract_array(array, TimeUnit::Nanosecond, timezone, field);
+		}
+		return Err(ExecutionError::InvalidExpression {
+			message: format!("EXTRACT expects Timestamp input, got {:?}", arr.data_type()),
+		});
+	}
+	let Some(array) = arr.as_any().downcast_ref::<Date32Array>() else {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"Date32 EXTRACT expects Date32 input, got {:?}",
+				arr.data_type()
+			),
+		});
+	};
+	if !field.is_date32_supported() {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!("EXTRACT {} is not supported for Date32", field.as_str()),
+		});
+	}
+	let mut builder = Int32Builder::with_capacity(array.len());
+	for value in array.iter() {
+		match value {
+			Some(value) => {
+				builder.append_value(crate::date32::date32_extract(value, field).map_err(
+					|error| ExecutionError::InvalidExpression {
+						message: error.to_string(),
+					},
+				)?)
+			}
+			None => builder.append_null(),
+		}
+	}
+	Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+fn timestamp_extract_array<T>(
+	array: &T,
+	unit: TimeUnit,
+	timezone: chrono_tz::Tz,
+	field: TemporalExtractField,
+) -> Result<ArrayRef, ExecutionError>
+where
+	for<'a> &'a T: IntoIterator<Item = Option<i64>>,
+	T: Array,
+{
+	let mut builder = Int32Builder::with_capacity(array.len());
+	for value in array {
+		match value {
+			Some(value) => builder.append_value(
+				crate::timestamp::timestamp_extract(value, unit, timezone, field).map_err(
+					|error| ExecutionError::InvalidExpression {
+						message: error.to_string(),
+					},
+				)?,
+			),
+			None => builder.append_null(),
+		}
+	}
+	Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+fn evaluate_date_trunc(
+	field: TemporalTruncField,
+	zone: &str,
+	arr: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let timezone = parse_temporal_execution_zone(zone)?;
+	if let Some(array) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+		return timestamp_trunc_array(array, TimeUnit::Millisecond, timezone, field);
+	}
+	if let Some(array) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+		return timestamp_trunc_array(array, TimeUnit::Microsecond, timezone, field);
+	}
+	if let Some(array) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+		return timestamp_trunc_array(array, TimeUnit::Nanosecond, timezone, field);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"date_trunc expects Timestamp input, got {:?}",
+			arr.data_type()
+		),
+	})
+}
+
+fn timestamp_trunc_array<T>(
+	array: &T,
+	unit: TimeUnit,
+	timezone: chrono_tz::Tz,
+	field: TemporalTruncField,
+) -> Result<ArrayRef, ExecutionError>
+where
+	for<'a> &'a T: IntoIterator<Item = Option<i64>>,
+	T: Array,
+{
+	let values = array
+		.into_iter()
+		.map(|value| {
+			value
+				.map(|value| {
+					crate::timestamp::timestamp_trunc(value, unit, timezone, field).map_err(
+						|error| ExecutionError::InvalidExpression {
+							message: error.to_string(),
+						},
+					)
+				})
+				.transpose()
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(match unit {
+		TimeUnit::Millisecond => {
+			Arc::new(TimestampMillisecondArray::from(values).with_timezone("UTC")) as ArrayRef
+		}
+		TimeUnit::Microsecond => {
+			Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef
+		}
+		TimeUnit::Nanosecond => {
+			Arc::new(TimestampNanosecondArray::from(values).with_timezone("UTC")) as ArrayRef
+		}
+		TimeUnit::Second => unreachable!("TimestampSecond is not a supported Toron timestamp unit"),
+	})
+}
+
+fn parse_temporal_execution_zone(zone: &str) -> Result<chrono_tz::Tz, ExecutionError> {
+	crate::timestamp::parse_session_timezone(zone).map_err(|error| {
+		ExecutionError::InvalidExpression {
+			message: error.to_string(),
+		}
+	})
 }
 
 fn evaluate_time_bucket(

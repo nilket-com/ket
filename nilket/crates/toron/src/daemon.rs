@@ -1500,7 +1500,7 @@ fn restamp_sql_result_batch(
 
 fn restamp_sql_result_field(field: &Field, session_timezone: &str) -> Field {
 	let data_type = match field.data_type() {
-		DataType::Timestamp(unit, _) => {
+		DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "UTC" => {
 			DataType::Timestamp(*unit, Some(session_timezone.to_string().into()))
 		}
 		other => other.clone(),
@@ -1511,30 +1511,40 @@ fn restamp_sql_result_field(field: &Field, session_timezone: &str) -> Field {
 
 fn restamp_sql_result_array(array: &ArrayRef, session_timezone: &str) -> ArrayRef {
 	match array.data_type() {
-		DataType::Timestamp(TimeUnit::Millisecond, _) => Arc::new(
-			array
-				.as_any()
-				.downcast_ref::<TimestampMillisecondArray>()
-				.expect("timestamp millisecond data type")
-				.clone()
-				.with_timezone(session_timezone.to_string()),
-		),
-		DataType::Timestamp(TimeUnit::Microsecond, _) => Arc::new(
-			array
-				.as_any()
-				.downcast_ref::<TimestampMicrosecondArray>()
-				.expect("timestamp microsecond data type")
-				.clone()
-				.with_timezone(session_timezone.to_string()),
-		),
-		DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(
-			array
-				.as_any()
-				.downcast_ref::<TimestampNanosecondArray>()
-				.expect("timestamp nanosecond data type")
-				.clone()
-				.with_timezone(session_timezone.to_string()),
-		),
+		DataType::Timestamp(TimeUnit::Millisecond, Some(timezone))
+			if timezone.as_ref() == "UTC" =>
+		{
+			Arc::new(
+				array
+					.as_any()
+					.downcast_ref::<TimestampMillisecondArray>()
+					.expect("timestamp millisecond data type")
+					.clone()
+					.with_timezone(session_timezone.to_string()),
+			)
+		}
+		DataType::Timestamp(TimeUnit::Microsecond, Some(timezone))
+			if timezone.as_ref() == "UTC" =>
+		{
+			Arc::new(
+				array
+					.as_any()
+					.downcast_ref::<TimestampMicrosecondArray>()
+					.expect("timestamp microsecond data type")
+					.clone()
+					.with_timezone(session_timezone.to_string()),
+			)
+		}
+		DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) if timezone.as_ref() == "UTC" => {
+			Arc::new(
+				array
+					.as_any()
+					.downcast_ref::<TimestampNanosecondArray>()
+					.expect("timestamp nanosecond data type")
+					.clone()
+					.with_timezone(session_timezone.to_string()),
+			)
+		}
 		_ => array.clone(),
 	}
 }
@@ -1701,6 +1711,7 @@ mod tests {
 	use super::*;
 	use crate::distributed::budget::{BudgetDimension, ByteCount};
 	use crate::error::{ExecutionError, RuntimeError, TaskFailureKind};
+	use arrow::array::Array;
 
 	#[test]
 	fn budget_exhausted_maps_to_resource_exhausted_sql_error() {
@@ -1757,6 +1768,41 @@ mod tests {
 			.as_any()
 			.downcast_ref::<TimestampMillisecondArray>()
 			.expect("timestamp array");
+		assert_eq!(values.value(0), 1_704_091_200_000i64);
+	}
+
+	#[test]
+	fn sql_result_timestamp_restamp_preserves_explicit_non_utc_zone() {
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"observed_at",
+			DataType::Timestamp(TimeUnit::Millisecond, Some("America/Chicago".into())),
+			true,
+		)]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(
+				TimestampMillisecondArray::from(vec![Some(1_704_091_200_000i64)])
+					.with_timezone("America/Chicago"),
+			)],
+		)
+		.expect("timestamp batch");
+
+		let restamped = restamp_sql_result_timezones(&[batch], "America/New_York")
+			.expect("restamp timestamp result");
+
+		assert_eq!(
+			restamped[0].schema().field(0).data_type(),
+			&DataType::Timestamp(TimeUnit::Millisecond, Some("America/Chicago".into()))
+		);
+		let values = restamped[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.expect("timestamp array");
+		assert_eq!(
+			values.data_type(),
+			&DataType::Timestamp(TimeUnit::Millisecond, Some("America/Chicago".into()))
+		);
 		assert_eq!(values.value(0), 1_704_091_200_000i64);
 	}
 

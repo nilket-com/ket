@@ -501,6 +501,9 @@ pub(crate) fn adr025_order_by_cast_uses_hidden_sort_projection() {
 	assert!(validator.contains("Expr::SqlLogicalCast { expr: inner, .. }"));
 	assert!(validator.contains("| Expr::Cast(inner, _)"));
 	assert!(validator.contains("| Expr::TryCast(inner, _)"));
+	assert!(validator.contains("| Expr::AtTimeZone(inner, _)"));
+	assert!(validator.contains("| Expr::Extract(_, inner)"));
+	assert!(validator.contains("| Expr::DateTrunc(_, inner)"));
 	assert!(!planner.contains("fn expr_contains_cast_family"));
 
 	let hidden_projection = brace_blocks_after_marker(&planner, "fn add_hidden_sort_projection")
@@ -1028,6 +1031,9 @@ pub(crate) fn adr027_hidden_sort_key_refs_are_visible_outputs() {
 		assert!(validator.contains(&format!("Expr::{op}(inner)")));
 	}
 	assert!(validator.contains("Expr::TimeBucket(_, inner)"));
+	assert!(validator.contains("| Expr::AtTimeZone(inner, _)"));
+	assert!(validator.contains("| Expr::Extract(_, inner)"));
+	assert!(validator.contains("| Expr::DateTrunc(_, inner)"));
 }
 
 #[test]
@@ -1135,6 +1141,9 @@ pub(crate) fn adr028_aggregate_signature_visitors_are_exhaustive() {
 		"Expr::IsNull",
 		"Expr::IsNotNull",
 		"Expr::TimeBucket",
+		"Expr::AtTimeZone",
+		"Expr::Extract",
+		"Expr::DateTrunc",
 	] {
 		assert!(
 			hash_body.contains(variant),
@@ -1240,6 +1249,8 @@ pub(crate) fn adr028_nested_aggregate_rejects_at_sql_walk() {
 		"SqlExpr::Cast",
 		"SqlExpr::IsNull",
 		"SqlExpr::IsNotNull",
+		"SqlExpr::Extract",
+		"SqlExpr::AtTimeZone",
 		"SqlExpr::Nested",
 	] {
 		assert!(walker.contains(arm), "walker missing {arm}");
