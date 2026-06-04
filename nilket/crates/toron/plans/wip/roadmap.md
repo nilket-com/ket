@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–154 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–155 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,51 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 154 promoted; ADR 155 candidates
+### ADR 155 promoted; ADR 156 candidates
+
+ADR 155 promoted **Heavy-Hitter Top-K NDV Selectivity Consumer** — spends ADR 154's
+measured skew evidence: Toron learns to consume exact per-column top-k value frequencies
+for equality/positive-`IN` selectivity, **built dark** (the 141→142 pattern), fixture-
+tested now, inert in production until the Wendelon producer (156). **Placement was the
+load-bearing call** (Claude's grounding, adopted 3-of-3 + operator-named "Consumer"):
+Wendelon has **no frequency stat** (`small_set` = distinct-values-only `stats.rs:129`,
+HLL = cardinality), so the producer is a **new maintained Space-Saving/Misra-Gries
+sketch** — a separate Wendelon-home cut (discipline #5), *not* a cheap 144-style
+candidate-loop. **Consumer:** reuses 148's key promoted to a shared `ScalarLiteralKey`
+while preserving the current Key/Null/Unsupported literal classification (no wire
+`Vec<u8>` in 155 — that's 156); carrier `column_heavy_hitters` mirrors
+`column_ndv` (`TableOptimizerFacts` BTreeMap + `DescriptorOptimizerFacts` serde-default
+Vec + `Scan` Vec + `for_descriptor` + dark `descriptor_optimizer_facts_from_storage`),
+**remapped in `optimize_for_required` like `column_ndv`/`column_range`** under projection
+pushdown. **Formula** (inject at `equality_ndv_estimated_row_count`/`in_list_…`): tracked
+equality → `min(freq, B)`, untracked → uniform tail `ceil((B−T)/max(D−K,1))` where `T`
+is the sum of all fact entries, `IN` → matched tracked sum `M` plus
+`min(B−T, miss×tail)`, capped at `B`; absent/invalid/unsupported → existing 141/148
+behavior; all-tracked `IN` may spend `M` without a tail, but mixed tracked/untracked `IN`
+falls back if the tail is unavailable.
+Seeded-fact validation (drop `freq==0` or `T>B`). **Estimate-channel only** with the
+risk-direction honesty: spending `frequency` → larger estimate → hash; stale-high →
+unnecessary hash (perf, never wrong), stale-low → over-broadcast → 139/140 replay
+(recovered). Genuine 3-of-3, no residual divergence. Headline gate closes 154's (b) loop:
+`hot_key_filter_with_heavy_hitter_fact_estimates_frequency_and_hashes` (seed `{region:
+{'hot'→5000}}` → estimate 5000 not 100 → hash up front → `replayed == false`; fails on `main`).
+
+**ADR 156 lead candidates:** **Wendelon heavy-hitter sketch producer + activation**
+(the direct sequel — a *new maintained* Space-Saving/Misra-Gries top-k stat at
+ingest/compaction, the wire `value_key: Vec<u8>` ↔ `ScalarLiteralKey` encoding, the
+`TABLE_OPTIMIZER_FACTS_GET` extension, all-contributors coverage like 142; **Wendelon-home**,
+relocates to the Wendelon sequence — this makes 155's consumer *live* and turns the dark
+headline into a production fix); **Count-Min** (only with an exposed no-under-count error
+bound — its own ADR); **KLL/quantile range-skew evidence** (the range analogue of 154 —
+own measured-miss cut); **dimensioned `CONVERT`/units** (the parallel breadth track —
+point/delta proven across fixed+calendar); **`SET TIME ZONE`/REPL**, **byte-estimate
+tighten** (`binder.rs:70`). **Forward arc:** `155 consumer (dark) → 156 Wendelon producer
+(activation) → live equality/IN skew correction → KLL range-skew → Theta join-key
+intersection → join selectivity → reordering` · *(parallel: CONVERT/units)*. **156 is
+Wendelon-home** — drafted in the Wendelon council / relocates at promotion per
+ring-product-placement.
+
+### ADR 154 promoted; ADR 155 candidates (HISTORICAL)
 
 ADR 154 promoted **Measured Skew Miss Evidence** — the disciplined return to the CBO
 spine after the temporal arc: a **Toron-local evidence cut** resolving the ~13-ADR
