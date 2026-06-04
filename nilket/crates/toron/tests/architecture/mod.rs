@@ -9,6 +9,7 @@ pub(crate) mod observability_telemetry;
 pub(crate) mod optimizer;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod qualified_resolution;
+pub(crate) mod range_skew;
 pub(crate) mod ring_placement;
 pub(crate) mod rune_frontend;
 pub(crate) mod sql_planner_surface;

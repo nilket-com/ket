@@ -12121,6 +12121,52 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn range_skew_measurement_does_not_change_estimated_rows_for_range() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 10_000, 10_000))],
+		);
+		let scoped = bind_filtered_customers(&catalog, customer_amount_between(0, 100))
+			.await
+			.expect("bind range-skew evidence filter");
+		let estimated_rows = RowCount::new(101);
+
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(estimated_rows));
+		assert_eq!(
+			scoped.facts.estimated_byte_size,
+			estimate_materialized_byte_size(estimated_rows, scoped.plan.schema().as_ref())
+		);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn min_max_envelope_pruning_still_correct_out_of_range_is_zero() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 10_000, 10_000))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(20_000)))),
+			),
+		)
+		.await
+		.expect("bind out-of-envelope range-skew filter");
+
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert_eq!(
+			scoped.facts.estimated_byte_size,
+			estimate_materialized_byte_size(RowCount::new(0), scoped.plan.schema().as_ref())
+		);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
 	async fn float_range_continuous_midpoint_estimates_half_non_null_rows() {
 		let catalog = descriptor_sidecar_join_catalog_with_customer_score_range(range_fact_f64(
 			0.0, 1.0, 1_000,

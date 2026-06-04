@@ -37,8 +37,8 @@ mod tests {
 		BroadcastBuildSide, JoinStrategyDecisionReason, PlannerConfig, bind, bind_with_trace,
 	};
 	use crate::catalog::{
-		Catalog, ColumnHeavyHitterFact, DistinctCountFact, MockCatalog, TableOptimizerFacts,
-		WendelonCatalog,
+		Catalog, ColumnHeavyHitterFact, DistinctCountFact, MockCatalog, RangeFact,
+		TableOptimizerFacts, WendelonCatalog,
 	};
 	use crate::coordinator::DistributedQueryCoordinator;
 	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
@@ -1072,6 +1072,130 @@ mod tests {
 				run.results.iter().map(RecordBatch::num_rows).sum::<usize>(),
 				actual_hot_rows
 			);
+		}
+
+		#[tokio::test]
+		async fn range_skew_filter_records_min_max_uniform_miss() {
+			let fixture = range_skew_join_fixture();
+			let filtered = range_skew_filtered_customers_plan(range_skew_amount_between(
+				RANGE_SKEW_FILTER_LOW,
+				RANGE_SKEW_FILTER_HIGH,
+			));
+			let bound = bind(
+				&filtered,
+				fixture.catalog.as_ref(),
+				&PlannerConfig::default(),
+			)
+			.await
+			.expect("bind range-skew filtered customers");
+			let results = Executor::new(fixture.storage.clone())
+				.execute_bound(&bound, None)
+				.await
+				.expect("execute range-skew filtered customers");
+			let actual_rows = results.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+			assert_eq!(actual_rows, fixture.actual_range_rows);
+			assert_eq!(
+				RANGE_SKEW_UNIFORM_ESTIMATE,
+				((RANGE_SKEW_BASE_ROWS as u64)
+					* ((RANGE_SKEW_FILTER_HIGH - RANGE_SKEW_FILTER_LOW + 1) as u64))
+					.div_ceil((RANGE_SKEW_ENVELOPE_HIGH - RANGE_SKEW_FILTER_LOW + 1) as u64)
+			);
+			assert!(
+				fixture.actual_range_rows as u64 > RANGE_SKEW_UNIFORM_ESTIMATE * 80,
+				"clustered actual rows should materially exceed the min/max uniform estimate"
+			);
+			assert_range_skew_binds_as_estimated_broadcast(
+				&range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto),
+				fixture.catalog.as_ref(),
+			)
+			.await;
+		}
+
+		#[tokio::test]
+		async fn range_skew_miss_triggers_broadcast_replay() {
+			let fixture = range_skew_join_fixture();
+			let auto_plan = range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_range_skew_binds_as_estimated_broadcast(&auto_plan, fixture.catalog.as_ref())
+				.await;
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto),
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
+						..PlannerConfig::default()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash range-skew join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let replay =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					PlannerConfig::default(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("range-skew estimated broadcast should replay as hash");
+
+			assert!(
+				replay.replayed,
+				"expected broadcast-cap replay for range skew miss"
+			);
+			assert_range_skew_join_matches_hash(&hash.results, &replay.results);
+		}
+
+		#[tokio::test]
+		async fn range_skew_miss_within_headroom_is_absorbed_no_replay() {
+			let fixture = range_skew_join_fixture();
+			let auto_plan = range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_range_skew_binds_as_estimated_broadcast(&auto_plan, fixture.catalog.as_ref())
+				.await;
+			let actual_range_rows = fixture.actual_range_rows;
+
+			let run =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					PlannerConfig::default(),
+					QueryBudget::test_default(),
+					fixture.storage,
+				)
+				.await
+				.expect("absorbed range-skew miss should complete as broadcast");
+
+			assert!(
+				!run.replayed,
+				"range-skew miss under the runtime cap should not need hash replay"
+			);
+			assert_eq!(
+				run.results.iter().map(RecordBatch::num_rows).sum::<usize>(),
+				actual_range_rows
+			);
+		}
+
+		#[tokio::test]
+		async fn range_skew_evidence_uses_range_fact_not_heavy_hitter_or_ndv() {
+			let facts = range_skew_customers_optimizer_facts();
+			assert!(facts.column_ndv.is_empty());
+			assert_eq!(facts.column_range.len(), 1);
+			assert!(facts.column_heavy_hitters.is_empty());
+
+			let fixture = range_skew_join_fixture();
+			assert_range_skew_binds_as_estimated_broadcast(
+				&range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto),
+				fixture.catalog.as_ref(),
+			)
+			.await;
 		}
 
 		#[tokio::test]
@@ -2205,6 +2329,132 @@ mod tests {
 		})
 	}
 
+	const RANGE_SKEW_BASE_ROWS: usize = 10_000;
+	const RANGE_SKEW_CLUSTER_ROWS: usize = 9_000;
+	const RANGE_SKEW_FILTER_LOW: i64 = 0;
+	const RANGE_SKEW_FILTER_HIGH: i64 = 100;
+	const RANGE_SKEW_ENVELOPE_HIGH: i64 = 10_000;
+	const RANGE_SKEW_UNIFORM_ESTIMATE: u64 = 101;
+
+	struct RangeSkewJoinFixture {
+		catalog: Arc<dyn Catalog>,
+		storage: Arc<dyn StorageScan>,
+		actual_range_rows: usize,
+	}
+
+	fn range_skew_join_fixture() -> RangeSkewJoinFixture {
+		RangeSkewJoinFixture {
+			catalog: Arc::new(range_skew_join_catalog()),
+			storage: range_skew_join_storage(),
+			actual_range_rows: RANGE_SKEW_CLUSTER_ROWS,
+		}
+	}
+
+	fn range_skew_join_catalog() -> MockCatalog {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"orders",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("customer_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"customers",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("amount", DataType::Int64, true),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.seed_optimizer_facts(
+				&crate::catalog::TableRef::new("customers"),
+				range_skew_customers_optimizer_facts(),
+			)
+			.expect("seed range-skew customers optimizer facts");
+		catalog
+	}
+
+	fn range_skew_customers_optimizer_facts() -> TableOptimizerFacts {
+		TableOptimizerFacts {
+			byte_upper_bound: None,
+			row_upper_bound: None,
+			column_ndv: Default::default(),
+			column_range: BTreeMap::from([(ColumnOrdinal(1), range_skew_amount_range_fact())]),
+			column_heavy_hitters: Default::default(),
+		}
+	}
+
+	fn range_skew_amount_range_fact() -> RangeFact {
+		RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+			null_count: 0,
+			non_null_count: RANGE_SKEW_BASE_ROWS as u64,
+			min: Some(
+				wendelon_client::encode_signed_optimizer_fact_scalar(RANGE_SKEW_FILTER_LOW, 8)
+					.unwrap(),
+			),
+			max: Some(
+				wendelon_client::encode_signed_optimizer_fact_scalar(RANGE_SKEW_ENVELOPE_HIGH, 8)
+					.unwrap(),
+			),
+		}
+	}
+
+	fn range_skew_join_storage() -> Arc<dyn StorageScan> {
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let customers_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+		]));
+		let orders = RecordBatch::try_new(
+			orders_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..RANGE_SKEW_BASE_ROWS as i64)),
+				Arc::new(Int64Array::from_iter_values(0..RANGE_SKEW_BASE_ROWS as i64)),
+			],
+		)
+		.expect("range-skew orders");
+		let customers = RecordBatch::try_new(
+			customers_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..RANGE_SKEW_BASE_ROWS as i64)),
+				Arc::new(Int64Array::from_iter_values(
+					(0..RANGE_SKEW_BASE_ROWS).map(range_skew_amount),
+				)),
+			],
+		)
+		.expect("range-skew customers");
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([(TableId(1), orders), (TableId(2), customers)]),
+		})
+	}
+
+	fn range_skew_amount(row: usize) -> i64 {
+		if row < RANGE_SKEW_CLUSTER_ROWS {
+			(row % ((RANGE_SKEW_FILTER_HIGH - RANGE_SKEW_FILTER_LOW + 1) as usize)) as i64
+		} else if row == RANGE_SKEW_CLUSTER_ROWS {
+			RANGE_SKEW_ENVELOPE_HIGH
+		} else {
+			RANGE_SKEW_FILTER_HIGH + 1 + (row - RANGE_SKEW_CLUSTER_ROWS - 1) as i64
+		}
+	}
+
 	fn outer_join_counterexample_catalog() -> Arc<MockCatalog> {
 		let mut catalog = MockCatalog::new();
 		for (table_id, id_byte, table, fields) in [
@@ -2425,6 +2675,51 @@ mod tests {
 			)],
 			strategy_intent,
 		}
+	}
+
+	fn range_skew_fact_dim_join_plan(strategy_intent: JoinStrategyIntent) -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: crate::catalog::TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(range_skew_filtered_customers_plan(
+				range_skew_amount_between(RANGE_SKEW_FILTER_LOW, RANGE_SKEW_FILTER_HIGH),
+			)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+			)],
+			strategy_intent,
+		}
+	}
+
+	fn range_skew_filtered_customers_plan(predicate: Expr) -> LogicalPlan {
+		LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: crate::catalog::TableRef::new("customers"),
+				projection: None,
+			}),
+			predicate,
+		}
+	}
+
+	fn range_skew_amount_between(low: i64, high: i64) -> Expr {
+		Expr::And(
+			Box::new(Expr::Gte(
+				Box::new(range_skew_amount_column()),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(low)))),
+			)),
+			Box::new(Expr::Lte(
+				Box::new(range_skew_amount_column()),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(high)))),
+			)),
+		)
+	}
+
+	fn range_skew_amount_column() -> Expr {
+		Expr::qualified_column(crate::catalog::TableRef::new("customers"), "amount")
 	}
 
 	fn sql_fact_two_dim_join_plan() -> LogicalPlan {
@@ -2846,6 +3141,28 @@ mod tests {
 		);
 	}
 
+	async fn assert_range_skew_binds_as_estimated_broadcast(
+		plan: &LogicalPlan,
+		catalog: &dyn Catalog,
+	) {
+		let (_bound, trace) = bind_with_trace(plan, catalog, &PlannerConfig::default())
+			.await
+			.expect("bind range-skew join with trace");
+		assert_eq!(trace.join_decisions.len(), 1);
+		match trace.join_decisions[0].reason {
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side,
+				estimated_byte_size,
+				threshold,
+				..
+			} => {
+				assert_eq!(build_side, BroadcastBuildSide::Right);
+				assert!(estimated_byte_size < threshold);
+			}
+			other => panic!("expected estimated broadcast for range skew, got {other:?}"),
+		}
+	}
+
 	fn assert_skewed_join_matches_hash(
 		hash_results: &[RecordBatch],
 		broadcast_results: &[RecordBatch],
@@ -2865,6 +3182,28 @@ mod tests {
 				.expect("skew replay digest"),
 			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex)
 				.expect("skew hash digest")
+		);
+	}
+
+	fn assert_range_skew_join_matches_hash(
+		hash_results: &[RecordBatch],
+		broadcast_results: &[RecordBatch],
+	) {
+		assert!(!hash_results.is_empty());
+		assert!(!broadcast_results.is_empty());
+		assert_eq!(
+			field_names(hash_results[0].schema().as_ref()),
+			vec!["id", "customer_id", "id", "amount"]
+		);
+		assert_eq!(
+			field_names(broadcast_results[0].schema().as_ref()),
+			vec!["id", "customer_id", "id", "amount"]
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(broadcast_results, SortPolicy::FullRowLex)
+				.expect("range skew replay digest"),
+			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex)
+				.expect("range skew hash digest")
 		);
 	}
 
