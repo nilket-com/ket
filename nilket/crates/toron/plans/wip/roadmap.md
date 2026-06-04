@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–156 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–157 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,51 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 156 promoted; ADR 157 candidates
+### ADR 157 promoted; ADR 158 candidates
+
+ADR 157 promoted **Measured Range-Skew Miss Evidence** — applies ADR 154's evidence
+discipline to *range* selectivity, the next estimate-quality frontier after the 154→155→156
+equality/IN heavy-hitter arc went live. **Toron-local evidence cut, no behavior change**:
+proves whether 144/147's min/max-uniform range estimate materially misses, and names the
+future quantile fact contract without building it. **The precise locus:** min/max is *not*
+wrong — it stays correct for envelope pruning (out-of-range→0); the miss is **in-envelope
+uniformity** (`estimated_rows_for_integral_range` = `non_null_count × overlap/domain`), exactly
+as 154 measured the NDV-uniform assumption not NDV. **Deterministic fixture (3-of-3, RNG-free,
+direct `LogicalPlan`):** `amount: Int64`, seeded `RangeFact(0, 10_000, non_null_count=10_000)`,
+actual 9_000 rows clustered in `[0,100]` with tail rows outside the filter stretching the
+envelope → `amount BETWEEN 0 AND 100` estimates **101** vs actual **9_000** (~89×
+under-count). **The 154 three-state split:** (a) raw miss; (b)
+decision-boundary → `BroadcastEstimated` → `BudgetExhausted(BroadcastReplication)` → 139/140
+replay; (c) wrong-but-absorbed (under default budget, no replay) — so the cut is
+decision-resolving either way. **Forward deliverable (inert):** `ColumnRangeDistributionFact`
+(KLL/equi-depth quantile, refines *in-envelope* interpolation, min/max stays the envelope fact)
+— a **distribution/quantile, NOT a top-k** (a different consumer contract than 155/156's
+`HeavyHitterFact`); `KllSketch` exists today only as aggregate-state. Estimate-channel only;
+no Wendelon/producer/public-EXPLAIN change; guards in a fresh `range_skew.rs` (not the
+over-ceiling `optimizer.rs`). Genuine 3-of-3, no residual divergence. **Brainstorm 010
+(SQL-auto / Rune-cockpit over one fact spine)** folded 3-of-3 as forward doctrine: 157 produces
+a *gauge reading* that belongs in the future Rune optimizer cockpit, not SQL `EXPLAIN` — which
+is *why* it keeps that out of the public surface. Headline gates:
+`range_skew_filter_records_min_max_uniform_miss` + `range_skew_miss_triggers_broadcast_replay`.
+
+**ADR 158 lead candidates:** **KLL / range-distribution producer + consumer** (the direct sequel
+**if 157's (b) gate fires** — a Wendelon quantile stats payload built to 157's D5 contract +
+a Toron consumer that refines in-envelope range selectivity; the 156-pattern cross-ring
+producer-activation, Toron-sequence; exact KLL vs equi-depth buckets is the iter-1 call);
+**reprioritize off the spine if 157 shows wrong-but-absorbed** (the range miss is real but within
+139/140 headroom → low-value producer; pivot); **dimensioned `CONVERT` / linear units** (the
+parallel breadth track, de-risked, operator-energy); **Theta join-key intersection** (the
+join-cardinality arc — heaviest, needs a set-sketch substrate); **the Rune optimizer cockpit**
+(brainstorm 010 — a thin Rune-only observability API the fact spine feeds; a deliberate breadth
+cut alongside CONVERT); **Count-Min** (error-bounded frequencies, own consumer contract).
+**Council hygiene (carry):** `main` still has 2 pre-existing red architecture guards (`adr077`
+`optimizer.rs` line-ceiling; `adr031` BoundExprNode count) — a standalone cleanup + **add the
+full `architecture_test` binary to the review checklist**. **Forward arc:** `157 range-skew
+evidence → (if (b)) 158 KLL range-distribution producer+consumer → Theta join-key intersection →
+join selectivity → reordering` · *(parallel: Linear-Dimension CONVERT; Rune optimizer cockpit,
+brainstorm 010)*. Evidence-gate 158 on the 157 feat's measured outcome.
+
+### ADR 156 promoted; ADR 157 candidates (HISTORICAL)
 
 ADR 156 promoted **Heavy-Hitter Top-K Optimizer Fact Producer** — makes ADR 155's dark
 heavy-hitter consumer **live**, closing `154 measured miss → 155 consumer → 156 producer`
