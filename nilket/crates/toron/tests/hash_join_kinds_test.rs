@@ -498,6 +498,7 @@ fn scan_plan(table_id: TableId, schema: SchemaRef, object_byte: u8) -> Execution
 		primary_key_columns: vec![ColumnOrdinal(0)],
 		column_ndv: Vec::new(),
 		column_range: Vec::new(),
+		column_heavy_hitters: Vec::new(),
 	}
 }
 

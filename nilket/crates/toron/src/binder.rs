@@ -14,8 +14,8 @@ use crate::aggregate_kernel::{
 	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
 };
 use crate::catalog::{
-	Catalog, DistinctCountFact, RangeFact, TableBinding, TableOptimizerFacts, TableRef,
-	TableRowIdentity,
+	Catalog, ColumnHeavyHitterFact, DistinctCountFact, RangeFact, TableBinding,
+	TableOptimizerFacts, TableRef, TableRowIdentity,
 };
 use crate::distributed::budget::{ByteCount, QueryBudget};
 use crate::distributed::task::RowCount;
@@ -28,11 +28,12 @@ use crate::ir::{
 	CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral,
 	JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
 	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
-	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarValue, SortExpr, SystemTableKind,
-	TemporalExtractField, TemporalTruncField, arithmetic_output_type,
-	calendar_month_interval_data_type, decode_column_logical_type,
-	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
-	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, schema_for_exprs,
+	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarLiteralKey,
+	ScalarLiteralKeyClassification, ScalarValue, SortExpr, SystemTableKind, TemporalExtractField,
+	TemporalTruncField, arithmetic_output_type, calendar_month_interval_data_type,
+	decode_column_logical_type, decode_column_logical_type_with_resolver,
+	field_with_logical_type_metadata, interval_data_type, logical_type_name, logical_type_spec,
+	nanos_per_timestamp_unit, scalar_literal_key, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -3837,6 +3838,12 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		.iter()
 		.map(|(ordinal, range)| (*ordinal, range.clone()))
 		.collect::<Vec<_>>();
+	let column_heavy_hitters = binding
+		.optimizer_facts
+		.column_heavy_hitters
+		.iter()
+		.map(|(ordinal, fact)| (*ordinal, fact.clone()))
+		.collect::<Vec<_>>();
 	ExecutionPlan::Scan {
 		legacy_table_id: binding.legacy_table_id,
 		table: binding.table,
@@ -3850,6 +3857,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		primary_key_columns: sorted_columns(&binding.primary_key_columns),
 		column_ndv,
 		column_range,
+		column_heavy_hitters,
 	}
 }
 
@@ -4014,28 +4022,17 @@ fn equality_ndv_estimated_row_count(
 	if !literal_is_non_null(value) {
 		return None;
 	}
+	if let Some(fact) = column_heavy_hitter_for_input(input, column.ordinal)
+		&& let Some(estimate) =
+			heavy_hitter_equality_estimate(fact, value, input, column.ordinal, base_rows)
+	{
+		return Some(estimate);
+	}
 	let distinct_count = column_ndv_for_input(input, column.ordinal)?;
 	Some(estimated_rows_for_ndv(
 		base_rows,
 		distinct_count.point_estimate(),
 	))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum InListLiteralKey {
-	Boolean(bool),
-	Int32(i32),
-	Int64(i64),
-	Date32(i32),
-	Timestamp(TimeUnit, i64),
-	Float32(u32),
-	Float64(u64),
-	Utf8(String),
-}
-
-enum InListLiteralCardinality {
-	Key(InListLiteralKey),
-	Null,
 }
 
 fn in_list_ndv_estimated_row_count(
@@ -4048,19 +4045,26 @@ fn in_list_ndv_estimated_row_count(
 	let Some(BoundExprNode::Column(column)) = program.node(expr) else {
 		return None;
 	};
-	let distinct_count = column_ndv_for_input(input, column.ordinal)?;
 	let mut literal_keys = BTreeSet::new();
 	for item in list {
 		match in_list_literal_cardinality(program, *item)? {
-			InListLiteralCardinality::Key(key) => {
+			ScalarLiteralKeyClassification::Key(key) => {
 				literal_keys.insert(key);
 			}
-			InListLiteralCardinality::Null => {}
+			ScalarLiteralKeyClassification::Null => {}
+			ScalarLiteralKeyClassification::Unsupported => return None,
 		}
 	}
 	if literal_keys.is_empty() {
 		return None;
 	}
+	if let Some(fact) = column_heavy_hitter_for_input(input, column.ordinal)
+		&& let Some(estimate) =
+			heavy_hitter_in_list_estimate(fact, &literal_keys, input, column.ordinal, base_rows)
+	{
+		return Some(estimate);
+	}
+	let distinct_count = column_ndv_for_input(input, column.ordinal)?;
 	let rows_per_value = estimated_rows_for_ndv(base_rows, distinct_count.point_estimate());
 	let distinct_literal_count = u64::try_from(literal_keys.len()).unwrap_or(u64::MAX);
 	let estimated_rows = rows_per_value.get().saturating_mul(distinct_literal_count);
@@ -4073,69 +4077,13 @@ fn in_list_ndv_estimated_row_count(
 fn in_list_literal_cardinality(
 	program: &BoundExprProgram,
 	id: BoundExprId,
-) -> Option<InListLiteralCardinality> {
+) -> Option<ScalarLiteralKeyClassification> {
 	match program.node(id)? {
-		BoundExprNode::NullLiteral => Some(InListLiteralCardinality::Null),
+		BoundExprNode::NullLiteral => Some(ScalarLiteralKeyClassification::Null),
 		BoundExprNode::Literal(literal) => {
-			in_list_scalar_literal_cardinality(program.literals.get(*literal as usize)?)
+			Some(scalar_literal_key(program.literals.get(*literal as usize)?))
 		}
 		_ => None,
-	}
-}
-
-fn in_list_scalar_literal_cardinality(value: &ScalarValue) -> Option<InListLiteralCardinality> {
-	match value {
-		ScalarValue::Boolean(Some(value)) => Some(InListLiteralCardinality::Key(
-			InListLiteralKey::Boolean(*value),
-		)),
-		ScalarValue::Boolean(None) => Some(InListLiteralCardinality::Null),
-		ScalarValue::Int32(Some(value)) => Some(InListLiteralCardinality::Key(
-			InListLiteralKey::Int32(*value),
-		)),
-		ScalarValue::Int32(None) => Some(InListLiteralCardinality::Null),
-		ScalarValue::Int64(Some(value)) => Some(InListLiteralCardinality::Key(
-			InListLiteralKey::Int64(*value),
-		)),
-		ScalarValue::Int64(None) => Some(InListLiteralCardinality::Null),
-		ScalarValue::Date32(Some(value)) => Some(InListLiteralCardinality::Key(
-			InListLiteralKey::Date32(*value),
-		)),
-		ScalarValue::Date32(None) => Some(InListLiteralCardinality::Null),
-		ScalarValue::Timestamp {
-			value: Some(value),
-			unit,
-		} => Some(InListLiteralCardinality::Key(InListLiteralKey::Timestamp(
-			*unit, *value,
-		))),
-		ScalarValue::Timestamp { value: None, .. } => Some(InListLiteralCardinality::Null),
-		ScalarValue::Interval(Some(_)) => None,
-		ScalarValue::Interval(None) => Some(InListLiteralCardinality::Null),
-		ScalarValue::CalendarMonthInterval(Some(_)) => None,
-		ScalarValue::CalendarMonthInterval(None) => Some(InListLiteralCardinality::Null),
-		ScalarValue::Float32(Some(value)) => {
-			if !value.is_finite() {
-				return None;
-			}
-			let value = if *value == 0.0 { 0.0 } else { *value };
-			Some(InListLiteralCardinality::Key(InListLiteralKey::Float32(
-				value.to_bits(),
-			)))
-		}
-		ScalarValue::Float32(None) => Some(InListLiteralCardinality::Null),
-		ScalarValue::Float64(Some(value)) => {
-			if !value.is_finite() {
-				return None;
-			}
-			let value = if *value == 0.0 { 0.0 } else { *value };
-			Some(InListLiteralCardinality::Key(InListLiteralKey::Float64(
-				value.to_bits(),
-			)))
-		}
-		ScalarValue::Float64(None) => Some(InListLiteralCardinality::Null),
-		ScalarValue::Utf8(Some(value)) => Some(InListLiteralCardinality::Key(
-			InListLiteralKey::Utf8(value.clone()),
-		)),
-		ScalarValue::Utf8(None) => Some(InListLiteralCardinality::Null),
 	}
 }
 
@@ -4152,6 +4100,116 @@ fn column_ndv_for_input(
 		ExecutionPlan::Filter { input, .. } => column_ndv_for_input(input, requested_column),
 		_ => None,
 	}
+}
+
+fn column_heavy_hitter_for_input(
+	input: &ExecutionPlan,
+	requested_column: ColumnOrdinal,
+) -> Option<&ColumnHeavyHitterFact> {
+	match input {
+		ExecutionPlan::Scan {
+			column_heavy_hitters,
+			..
+		} => column_heavy_hitters
+			.iter()
+			.find_map(|(column, fact)| (*column == requested_column).then_some(fact)),
+		ExecutionPlan::Filter { input, .. } => {
+			column_heavy_hitter_for_input(input, requested_column)
+		}
+		_ => None,
+	}
+}
+
+fn heavy_hitter_equality_estimate(
+	fact: &ColumnHeavyHitterFact,
+	value: &ScalarValue,
+	input: &ExecutionPlan,
+	column: ColumnOrdinal,
+	base_rows: RowCount,
+) -> Option<RowCount> {
+	let total_frequency = heavy_hitter_total_frequency(fact, base_rows)?;
+	let ScalarLiteralKeyClassification::Key(key) = scalar_literal_key(value) else {
+		return None;
+	};
+	if let Some(frequency) = fact.entries.get(&key) {
+		return Some(RowCount::new((*frequency).min(base_rows.get())));
+	}
+	let distinct_count = column_ndv_for_input(input, column)?;
+	heavy_hitter_uniform_tail_from_total(
+		fact,
+		base_rows,
+		distinct_count.point_estimate(),
+		total_frequency,
+	)
+}
+
+fn heavy_hitter_in_list_estimate(
+	fact: &ColumnHeavyHitterFact,
+	literal_keys: &BTreeSet<ScalarLiteralKey>,
+	input: &ExecutionPlan,
+	column: ColumnOrdinal,
+	base_rows: RowCount,
+) -> Option<RowCount> {
+	let total_frequency = heavy_hitter_total_frequency(fact, base_rows)?;
+	let mut matched_frequency = 0_u64;
+	let mut missed_keys = 0_u64;
+	for key in literal_keys {
+		if let Some(frequency) = fact.entries.get(key) {
+			matched_frequency = matched_frequency.saturating_add(*frequency);
+		} else {
+			missed_keys = missed_keys.saturating_add(1);
+		}
+	}
+	if missed_keys == 0 {
+		return Some(RowCount::new(matched_frequency.min(base_rows.get())));
+	}
+	let distinct_count = column_ndv_for_input(input, column)?;
+	let tail = heavy_hitter_uniform_tail_from_total(
+		fact,
+		base_rows,
+		distinct_count.point_estimate(),
+		total_frequency,
+	)?;
+	let remaining_rows = base_rows.get().saturating_sub(total_frequency);
+	let tail_rows = missed_keys.saturating_mul(tail.get()).min(remaining_rows);
+	Some(RowCount::new(
+		base_rows
+			.get()
+			.min(matched_frequency.saturating_add(tail_rows)),
+	))
+}
+
+fn heavy_hitter_total_frequency(fact: &ColumnHeavyHitterFact, base_rows: RowCount) -> Option<u64> {
+	let mut total = 0_u64;
+	for frequency in fact.entries.values() {
+		if *frequency == 0 {
+			return None;
+		}
+		total = total.checked_add(*frequency)?;
+		if total > base_rows.get() {
+			return None;
+		}
+	}
+	Some(total)
+}
+
+fn heavy_hitter_uniform_tail_from_total(
+	fact: &ColumnHeavyHitterFact,
+	base_rows: RowCount,
+	ndv: u64,
+	total_frequency: u64,
+) -> Option<RowCount> {
+	let tracked_count = u64::try_from(fact.entries.len()).unwrap_or(u64::MAX);
+	let tail_distinct = ndv.saturating_sub(tracked_count).max(1);
+	let remaining_rows = base_rows.get().saturating_sub(total_frequency);
+	let estimated =
+		(u128::from(remaining_rows) + u128::from(tail_distinct) - 1) / u128::from(tail_distinct);
+	Some(RowCount::new(
+		u64::try_from(estimated)
+			.unwrap_or(u64::MAX)
+			.min(remaining_rows)
+			.min(base_rows.get()),
+	))
 }
 
 fn filter_range_selectivity_estimated_row_count(
@@ -6091,6 +6149,7 @@ fn optimize_for_required(
 			primary_key_columns,
 			column_ndv,
 			column_range,
+			column_heavy_hitters,
 		} => {
 			let all_columns = all_columns(&schema);
 			let required = required_output.unwrap_or(all_columns);
@@ -6116,6 +6175,12 @@ fn optimize_for_required(
 					remap.get(&column).copied().map(|mapped| (mapped, range))
 				})
 				.collect();
+			let column_heavy_hitters = column_heavy_hitters
+				.into_iter()
+				.filter_map(|(column, fact)| {
+					remap.get(&column).copied().map(|mapped| (mapped, fact))
+				})
+				.collect();
 
 			Ok((
 				ExecutionPlan::Scan {
@@ -6131,6 +6196,7 @@ fn optimize_for_required(
 					primary_key_columns,
 					column_ndv,
 					column_range,
+					column_heavy_hitters,
 				},
 				remap,
 			))
@@ -10894,6 +10960,273 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn hot_key_equality_uses_heavy_hitter_frequency() {
+		let catalog =
+			descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_and_heavy_hitters(
+				Some(64 * 1024 * 1024),
+				None,
+				Some(10_000),
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("region", DataType::Utf8, true),
+				]),
+				vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+				Vec::new(),
+				vec![(ColumnOrdinal(1), utf8_heavy_hitter_fact(&[("hot", 5_000)]))],
+			);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Eq(
+				Box::new(customer_column("region")),
+				Box::new(utf8_literal("hot")),
+			),
+		)
+		.await
+		.expect("bind heavy-hitter equality");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(10_000)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+	}
+
+	#[tokio::test]
+	async fn untracked_literal_uses_uniform_tail_not_global_uniform() {
+		let catalog =
+			descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_and_heavy_hitters(
+				Some(64 * 1024 * 1024),
+				None,
+				Some(10_000),
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("region", DataType::Utf8, true),
+				]),
+				vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+				Vec::new(),
+				vec![(ColumnOrdinal(1), utf8_heavy_hitter_fact(&[("hot", 5_000)]))],
+			);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Eq(
+				Box::new(customer_column("region")),
+				Box::new(utf8_literal("tail_0")),
+			),
+		)
+		.await
+		.expect("bind heavy-hitter tail equality");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(51)));
+		assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+	}
+
+	#[tokio::test]
+	async fn hot_key_in_list_sums_tracked_frequencies_and_uniform_tail() {
+		let catalog =
+			descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_and_heavy_hitters(
+				Some(64 * 1024 * 1024),
+				None,
+				Some(10_000),
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("region", DataType::Utf8, true),
+				]),
+				vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+				Vec::new(),
+				vec![(ColumnOrdinal(1), utf8_heavy_hitter_fact(&[("hot", 5_000)]))],
+			);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![utf8_literal("hot"), utf8_literal("tail_0")],
+				false,
+			),
+		)
+		.await
+		.expect("bind heavy-hitter IN-list");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_051)));
+		assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(200)));
+	}
+
+	#[tokio::test]
+	async fn missing_heavy_hitter_fact_preserves_141_148_uniform_ndv_behavior() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_ndv(
+			Some(64 * 1024 * 1024),
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+		);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"region",
+				vec![utf8_literal("hot"), utf8_literal("tail_0")],
+				false,
+			),
+		)
+		.await
+		.expect("bind IN-list without heavy hitters");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(200)));
+	}
+
+	#[tokio::test]
+	async fn invalid_heavy_hitter_fact_zero_freq_or_over_base_is_ignored() {
+		for fact in [
+			utf8_heavy_hitter_fact(&[("hot", 0)]),
+			utf8_heavy_hitter_fact(&[("hot", 10_001)]),
+		] {
+			let catalog =
+				descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_and_heavy_hitters(
+					Some(64 * 1024 * 1024),
+					None,
+					Some(10_000),
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("region", DataType::Utf8, true),
+					]),
+					vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+					Vec::new(),
+					vec![(ColumnOrdinal(1), fact)],
+				);
+			let scoped = bind_filtered_customers(
+				&catalog,
+				Expr::Eq(
+					Box::new(customer_column("region")),
+					Box::new(utf8_literal("hot")),
+				),
+			)
+			.await
+			.expect("bind invalid heavy-hitter equality");
+
+			assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
+		}
+	}
+
+	#[tokio::test]
+	async fn non_finite_or_unsupported_literal_fails_open_to_existing_behavior() {
+		let catalog =
+			descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_and_heavy_hitters(
+				Some(64 * 1024 * 1024),
+				None,
+				Some(1_000),
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("score", DataType::Float64, true),
+				]),
+				vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+				Vec::new(),
+				vec![(
+					ColumnOrdinal(1),
+					heavy_hitter_fact(vec![(ScalarLiteralKey::Float64(0.5_f64.to_bits()), 500)]),
+				)],
+			);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			customer_in_list(
+				"score",
+				vec![
+					Expr::Literal(ScalarValue::Float64(Some(0.5))),
+					Expr::Literal(ScalarValue::Float64(Some(f64::INFINITY))),
+				],
+				false,
+			),
+		)
+		.await
+		.expect("bind unsupported heavy-hitter IN-list");
+
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn heavy_hitter_estimate_stays_estimate_channel_not_hard_bound() {
+		let catalog =
+			descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_and_heavy_hitters(
+				Some(64 * 1024 * 1024),
+				None,
+				Some(10_000),
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("region", DataType::Utf8, true),
+				]),
+				vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+				Vec::new(),
+				vec![(ColumnOrdinal(1), utf8_heavy_hitter_fact(&[("hot", 5_000)]))],
+			);
+		let scoped = bind_filtered_customers(
+			&catalog,
+			Expr::Eq(
+				Box::new(customer_column("region")),
+				Box::new(utf8_literal("hot")),
+			),
+		)
+		.await
+		.expect("bind estimate-channel heavy-hitter filter");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
+		assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(10_000)));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[test]
+	fn heavy_hitter_fact_projection_remaps_with_scan_projection() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+			Field::new("region", DataType::Utf8, true),
+		]));
+		let descriptor = named_descriptor(41, "customers", schema.as_ref().clone());
+		let plan = ExecutionPlan::Scan {
+			legacy_table_id: TableId(41),
+			table: descriptor.table_object_id,
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: None,
+			pbc_program: None,
+			row_limit: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: Vec::new(),
+			column_ndv: vec![(ColumnOrdinal(2), DistinctCountFact::Exact(100))],
+			column_range: Vec::new(),
+			column_heavy_hitters: vec![(
+				ColumnOrdinal(2),
+				utf8_heavy_hitter_fact(&[("hot", 5_000)]),
+			)],
+		};
+
+		let (optimized, _) = optimize_for_required(plan, Some(BTreeSet::from([ColumnOrdinal(2)])))
+			.expect("optimize scan projection");
+		let ExecutionPlan::Scan {
+			projection,
+			schema,
+			column_ndv,
+			column_heavy_hitters,
+			..
+		} = optimized
+		else {
+			panic!("expected optimized scan");
+		};
+
+		assert_eq!(projection, Some(vec![ColumnOrdinal(2)]));
+		assert_eq!(schema.field(0).name(), "region");
+		assert_eq!(
+			column_ndv,
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))]
+		);
+		assert_eq!(column_heavy_hitters.len(), 1);
+		assert_eq!(column_heavy_hitters[0].0, ColumnOrdinal(0));
+		assert_eq!(
+			column_heavy_hitters[0]
+				.1
+				.entries
+				.get(&ScalarLiteralKey::Utf8("hot".to_string())),
+			Some(&5_000)
+		);
+	}
+
+	#[tokio::test]
 	async fn non_ndv_filters_do_not_emit_skew_evidence() {
 		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(10_000));
 
@@ -13858,6 +14191,7 @@ mod tests {
 			row_upper_bound: None,
 			column_ndv: Default::default(),
 			column_range: Default::default(),
+			column_heavy_hitters: Default::default(),
 		};
 		catalog
 			.register_table(TableRef::new("composite_pk"), binding)
@@ -15008,6 +15342,7 @@ mod tests {
 					row_upper_bound: None,
 					column_ndv: Default::default(),
 					column_range: Default::default(),
+					column_heavy_hitters: Default::default(),
 				},
 			)
 			.expect("seed optimizer facts");
@@ -15164,6 +15499,26 @@ mod tests {
 		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
 		column_range: Vec<(ColumnOrdinal, RangeFact)>,
 	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_and_heavy_hitters(
+			orders_byte_upper_bound,
+			customers_byte_upper_bound,
+			customers_row_upper_bound,
+			customers_schema,
+			column_ndv,
+			column_range,
+			Vec::new(),
+		)
+	}
+
+	fn descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_and_heavy_hitters(
+		orders_byte_upper_bound: Option<u64>,
+		customers_byte_upper_bound: Option<u64>,
+		customers_row_upper_bound: Option<u64>,
+		customers_schema: Schema,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+		column_heavy_hitters: Vec<(ColumnOrdinal, ColumnHeavyHitterFact)>,
+	) -> WendelonCatalog {
 		let orders = named_descriptor(
 			1,
 			"orders",
@@ -15178,7 +15533,14 @@ mod tests {
 				TableId(1),
 				orders.clone(),
 				orders_byte_upper_bound.map(|bytes| {
-					descriptor_sidecar_facts(&orders, Some(bytes), None, Vec::new(), Vec::new())
+					descriptor_sidecar_facts(
+						&orders,
+						Some(bytes),
+						None,
+						Vec::new(),
+						Vec::new(),
+						Vec::new(),
+					)
 				}),
 			),
 			(
@@ -15190,6 +15552,7 @@ mod tests {
 					customers_row_upper_bound,
 					column_ndv,
 					column_range,
+					column_heavy_hitters,
 				)),
 			),
 		])
@@ -15202,6 +15565,7 @@ mod tests {
 		row_upper_bound: Option<u64>,
 		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
 		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+		column_heavy_hitters: Vec<(ColumnOrdinal, ColumnHeavyHitterFact)>,
 	) -> DescriptorOptimizerFacts {
 		DescriptorOptimizerFacts {
 			schema_generation: descriptor.schema_generation,
@@ -15223,7 +15587,33 @@ mod tests {
 					range,
 				})
 				.collect(),
+			column_heavy_hitters: column_heavy_hitters
+				.into_iter()
+				.map(
+					|(column_ordinal, fact)| crate::catalog::DescriptorColumnHeavyHitterFact {
+						column_ordinal,
+						fact,
+					},
+				)
+				.collect(),
 		}
+	}
+
+	fn heavy_hitter_fact(entries: Vec<(ScalarLiteralKey, u64)>) -> ColumnHeavyHitterFact {
+		ColumnHeavyHitterFact {
+			entries: entries.into_iter().collect(),
+		}
+	}
+
+	fn utf8_heavy_hitter_fact(entries: &[(&str, u64)]) -> ColumnHeavyHitterFact {
+		heavy_hitter_fact(
+			entries
+				.iter()
+				.map(|(value, frequency)| {
+					(ScalarLiteralKey::Utf8((*value).to_string()), *frequency)
+				})
+				.collect(),
+		)
 	}
 
 	fn range_fact_i64(min: i64, max: i64, non_null_count: u64) -> RangeFact {

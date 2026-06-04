@@ -1283,6 +1283,7 @@ mod tests {
 				primary_key_columns: Vec::new(),
 				column_ndv: Vec::new(),
 				column_range: Vec::new(),
+				column_heavy_hitters: Vec::new(),
 			},
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1634,6 +1635,7 @@ mod tests {
 			primary_key_columns: Vec::new(),
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		};
 		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {
 			exchange_id,
@@ -1659,6 +1661,7 @@ mod tests {
 			primary_key_columns: vec![ColumnOrdinal(0)],
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		}
 	}
 

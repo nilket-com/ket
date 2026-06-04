@@ -36,8 +36,8 @@ pub(crate) fn adr149_date32_selectivity_breadth_is_typed_and_estimate_only() {
 	let ctas_lattice = source_block(&binder, "fn is_supported_ctas_column_type");
 	let coerce_insert = source_block(&binder, "fn coerce_insert_literal");
 	let coerce_compare = source_block(&binder, "fn coerce_literal_value");
-	let in_list_scalar = source_block(&binder, "fn in_list_scalar_literal_cardinality");
-	let in_list_key = source_block(&binder, "enum InListLiteralKey");
+	let in_list_scalar = source_block(&ir, "pub fn scalar_literal_key");
+	let in_list_key = source_block(&ir, "pub enum ScalarLiteralKey");
 	let carrier_literal = source_block(&binder, "enum CarrierLiteral");
 	let carrier_domain = source_block(&binder, "enum CarrierDomain");
 	let range_scalar = source_block(&binder, "fn range_scalar_for_fact");
@@ -139,8 +139,8 @@ pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
 	let ctas_lattice = source_block(&binder, "fn is_supported_ctas_column_type");
 	let coerce_insert = source_block(&binder, "fn coerce_insert_literal");
 	let coerce_compare = source_block(&binder, "fn coerce_literal_value");
-	let in_list_scalar = source_block(&binder, "fn in_list_scalar_literal_cardinality");
-	let in_list_key = source_block(&binder, "enum InListLiteralKey");
+	let in_list_scalar = source_block(&ir, "pub fn scalar_literal_key");
+	let in_list_key = source_block(&ir, "pub enum ScalarLiteralKey");
 	let carrier_literal = source_block(&binder, "enum CarrierLiteral");
 	let carrier_domain = source_block(&binder, "enum CarrierDomain");
 	let range_scalar = source_block(&binder, "fn range_scalar_for_fact");

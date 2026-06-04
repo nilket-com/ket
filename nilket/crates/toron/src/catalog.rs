@@ -14,7 +14,7 @@ use crate::distributed::task::RowCount;
 use crate::error::{CatalogError, StorageError};
 use crate::ir::{
 	ColumnOrdinal, CreateTableRowIdentity, LogicalTypeRegistry, LogicalTypeResolver,
-	LogicalTypeSpec, TableId, decode_column_logical_type_with_resolver,
+	LogicalTypeSpec, ScalarLiteralKey, TableId, decode_column_logical_type_with_resolver,
 };
 use crate::storage::TenantId;
 use wendelon::integration::compute::SchemaIntentId;
@@ -112,12 +112,24 @@ pub struct DescriptorColumnRangeFact {
 	pub range: RangeFact,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ColumnHeavyHitterFact {
+	pub entries: BTreeMap<ScalarLiteralKey, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DescriptorColumnHeavyHitterFact {
+	pub column_ordinal: ColumnOrdinal,
+	pub fact: ColumnHeavyHitterFact,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableOptimizerFacts {
 	pub byte_upper_bound: Option<ByteCount>,
 	pub row_upper_bound: Option<RowCount>,
 	pub column_ndv: BTreeMap<ColumnOrdinal, DistinctCountFact>,
 	pub column_range: BTreeMap<ColumnOrdinal, RangeFact>,
+	pub column_heavy_hitters: BTreeMap<ColumnOrdinal, ColumnHeavyHitterFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +143,8 @@ pub struct DescriptorOptimizerFacts {
 	pub column_ndv: Vec<DescriptorColumnNdvFact>,
 	#[serde(default)]
 	pub column_range: Vec<DescriptorColumnRangeFact>,
+	#[serde(default)]
+	pub column_heavy_hitters: Vec<DescriptorColumnHeavyHitterFact>,
 }
 
 impl DescriptorOptimizerFacts {
@@ -156,6 +170,10 @@ impl DescriptorOptimizerFacts {
 			row_upper_bound: self.row_upper_bound,
 			column_ndv: descriptor_column_ndv(self.column_ndv, descriptor),
 			column_range: descriptor_column_range(self.column_range, descriptor),
+			column_heavy_hitters: descriptor_column_heavy_hitters(
+				self.column_heavy_hitters,
+				descriptor,
+			),
 		}
 	}
 }
@@ -211,6 +229,7 @@ fn descriptor_optimizer_facts_from_storage(
 		row_upper_bound: facts.row_upper_bound.map(RowCount::new),
 		column_ndv,
 		column_range,
+		column_heavy_hitters: Vec::new(),
 	})
 }
 
@@ -242,6 +261,21 @@ fn descriptor_column_range(
 		.into_iter()
 		.filter(|fact| (fact.column_ordinal.0 as usize) < column_count)
 		.map(|fact| (fact.column_ordinal, fact.range))
+		.collect()
+}
+
+fn descriptor_column_heavy_hitters(
+	column_heavy_hitters: Vec<DescriptorColumnHeavyHitterFact>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> BTreeMap<ColumnOrdinal, ColumnHeavyHitterFact> {
+	let column_count = descriptor
+		.arrow_schema()
+		.map(|schema| schema.fields().len())
+		.unwrap_or(0);
+	column_heavy_hitters
+		.into_iter()
+		.filter(|fact| (fact.column_ordinal.0 as usize) < column_count)
+		.map(|fact| (fact.column_ordinal, fact.fact))
 		.collect()
 }
 
@@ -3021,6 +3055,7 @@ mod tests {
 				row_upper_bound: Some(RowCount::new(1_000)),
 				column_ndv: Default::default(),
 				column_range: Default::default(),
+				column_heavy_hitters: Default::default(),
 			}
 		);
 	}
@@ -3088,6 +3123,7 @@ mod tests {
 				row_upper_bound: Some(RowCount::new(0)),
 				column_ndv: Default::default(),
 				column_range: Default::default(),
+				column_heavy_hitters: Default::default(),
 			}
 		);
 	}
@@ -4314,6 +4350,7 @@ mod tests {
 			row_upper_bound: rows.map(RowCount::new),
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		}
 	}
 

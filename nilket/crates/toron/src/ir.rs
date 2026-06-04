@@ -496,6 +496,75 @@ impl ScalarValue {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ScalarLiteralKey {
+	Boolean(bool),
+	Int32(i32),
+	Int64(i64),
+	Date32(i32),
+	Timestamp(TimeUnit, i64),
+	Float32(u32),
+	Float64(u64),
+	Utf8(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarLiteralKeyClassification {
+	Key(ScalarLiteralKey),
+	Null,
+	Unsupported,
+}
+
+pub fn scalar_literal_key(value: &ScalarValue) -> ScalarLiteralKeyClassification {
+	match value {
+		ScalarValue::Boolean(Some(value)) => {
+			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Boolean(*value))
+		}
+		ScalarValue::Boolean(None) => ScalarLiteralKeyClassification::Null,
+		ScalarValue::Int32(Some(value)) => {
+			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Int32(*value))
+		}
+		ScalarValue::Int32(None) => ScalarLiteralKeyClassification::Null,
+		ScalarValue::Int64(Some(value)) => {
+			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Int64(*value))
+		}
+		ScalarValue::Int64(None) => ScalarLiteralKeyClassification::Null,
+		ScalarValue::Date32(Some(value)) => {
+			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Date32(*value))
+		}
+		ScalarValue::Date32(None) => ScalarLiteralKeyClassification::Null,
+		ScalarValue::Timestamp {
+			value: Some(value),
+			unit,
+		} => ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Timestamp(*unit, *value)),
+		ScalarValue::Timestamp { value: None, .. } => ScalarLiteralKeyClassification::Null,
+		ScalarValue::Interval(Some(_)) => ScalarLiteralKeyClassification::Unsupported,
+		ScalarValue::Interval(None) => ScalarLiteralKeyClassification::Null,
+		ScalarValue::CalendarMonthInterval(Some(_)) => ScalarLiteralKeyClassification::Unsupported,
+		ScalarValue::CalendarMonthInterval(None) => ScalarLiteralKeyClassification::Null,
+		ScalarValue::Float32(Some(value)) => {
+			if !value.is_finite() {
+				return ScalarLiteralKeyClassification::Unsupported;
+			}
+			let value = if *value == 0.0 { 0.0 } else { *value };
+			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Float32(value.to_bits()))
+		}
+		ScalarValue::Float32(None) => ScalarLiteralKeyClassification::Null,
+		ScalarValue::Float64(Some(value)) => {
+			if !value.is_finite() {
+				return ScalarLiteralKeyClassification::Unsupported;
+			}
+			let value = if *value == 0.0 { 0.0 } else { *value };
+			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Float64(value.to_bits()))
+		}
+		ScalarValue::Float64(None) => ScalarLiteralKeyClassification::Null,
+		ScalarValue::Utf8(Some(value)) => {
+			ScalarLiteralKeyClassification::Key(ScalarLiteralKey::Utf8(value.clone()))
+		}
+		ScalarValue::Utf8(None) => ScalarLiteralKeyClassification::Null,
+	}
+}
+
 impl fmt::Display for ScalarValue {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {

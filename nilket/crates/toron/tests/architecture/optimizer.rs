@@ -2005,6 +2005,7 @@ pub(crate) fn adr147_float_range_facts_are_finite_and_estimate_channel_only() {
 #[test]
 pub(crate) fn adr148_in_list_ndv_selectivity_is_consumer_only_and_estimate_channel() {
 	let binder = binder_source();
+	let ir = ir_source();
 	let filter = source_block(&binder, "fn filter_equality_ndv_estimated_row_count");
 	let predicate = source_block(
 		&binder,
@@ -2012,8 +2013,8 @@ pub(crate) fn adr148_in_list_ndv_selectivity_is_consumer_only_and_estimate_chann
 	);
 	let helper = source_block(&binder, "fn in_list_ndv_estimated_row_count");
 	let literal = source_block(&binder, "fn in_list_literal_cardinality");
-	let scalar = source_block(&binder, "fn in_list_scalar_literal_cardinality");
-	let key = source_block(&binder, "enum InListLiteralKey");
+	let scalar = source_block(&ir, "pub fn scalar_literal_key");
+	let key = source_block(&ir, "pub enum ScalarLiteralKey");
 
 	assert!(predicate.contains("BoundExprNode::InList"));
 	assert!(predicate.contains("negated"));
@@ -2026,6 +2027,7 @@ pub(crate) fn adr148_in_list_ndv_selectivity_is_consumer_only_and_estimate_chann
 	assert!(helper.contains("in_list_literal_cardinality"));
 	assert!(helper.contains("estimated_rows_for_ndv"));
 	assert!(literal.contains("BoundExprNode::NullLiteral"));
+	assert!(literal.contains("scalar_literal_key"));
 	assert!(scalar.contains("is_finite"));
 	assert!(key.contains("Float32(u32)"));
 	assert!(key.contains("Float64(u64)"));
@@ -2512,26 +2514,42 @@ pub(crate) fn adr154_uniform_ndv_math_stays_current_behavior() {
 	assert!(in_list.contains("distinct_literal_count"));
 	assert!(estimator.contains("let divisor = u128::from(ndv.max(1))"));
 	assert!(estimator.contains("/ divisor"));
-	for forbidden in ["HeavyHitter", "CountMin", "TopK", "frequency"] {
-		assert!(
-			!equality.contains(forbidden) && !in_list.contains(forbidden),
-			"uniform NDV helper unexpectedly contains {forbidden}"
-		);
-	}
 	assert!(binder.contains("skewed_hot_key_filter_records_uniform_ndv_miss"));
 	assert!(binder.contains("uniform_ndv_hot_key_in_list_miss_is_measured"));
 	assert!(lib.contains("uniform_ndv_hot_key_miss_triggers_broadcast_replay"));
 	assert!(lib.contains("uniform_ndv_miss_within_headroom_is_absorbed_no_replay"));
+	assert!(binder.contains("missing_heavy_hitter_fact_preserves_141_148_uniform_ndv_behavior"));
 }
 
 #[test]
-pub(crate) fn adr154_no_live_heavy_hitter_or_count_min_producer() {
-	let offenders = source_lines(&manifest_dir().join("src"))
+pub(crate) fn adr155_heavy_hitter_is_estimate_only_consumer() {
+	let binder = binder_source();
+	let equality = source_block(&binder, "fn heavy_hitter_equality_estimate");
+	let in_list = source_block(&binder, "fn heavy_hitter_in_list_estimate");
+	let tail = source_block(&binder, "fn heavy_hitter_uniform_tail_from_total");
+
+	assert!(binder.contains("fn column_heavy_hitter_for_input"));
+	assert!(binder.contains("fn heavy_hitter_total_frequency"));
+	assert!(binder.contains("hot_key_equality_uses_heavy_hitter_frequency"));
+	assert!(binder.contains("heavy_hitter_estimate_stays_estimate_channel_not_hard_bound"));
+	for block in [equality, in_list, tail] {
+		for forbidden in ["row_upper_bound", "byte_upper_bound", "EmptyRelation"] {
+			assert!(
+				!block.contains(forbidden),
+				"heavy-hitter consumer must not write hard-bound surface {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+pub(crate) fn adr155_no_wendelon_heavy_hitter_producer_or_count_min() {
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
 		.into_iter()
-		.chain(source_lines(&wendelon_manifest_dir().join("src")))
 		.filter(|(_, _, line)| {
 			[
 				"HeavyHitter",
+				"heavy_hitter",
 				"CountMin",
 				"Count-Min",
 				"TopK",
@@ -2544,8 +2562,37 @@ pub(crate) fn adr154_no_live_heavy_hitter_or_count_min_producer() {
 		.collect::<Vec<_>>();
 
 	assert!(
-		offenders.is_empty(),
-		"ADR154 must not add a live heavy-hitter/count-min producer: {offenders:?}"
+		wendelon_offenders.is_empty(),
+		"ADR155 is Toron-consumer-only; Wendelon producer markers found: {wendelon_offenders:?}"
+	);
+
+	let count_min_offenders = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.chain(source_lines(&wendelon_manifest_dir().join("src")))
+		.filter(|(_, _, line)| {
+			["CountMin", "Count-Min"]
+				.iter()
+				.any(|marker| line.contains(marker))
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		count_min_offenders.is_empty(),
+		"ADR155 must not introduce Count-Min sketch code: {count_min_offenders:?}"
+	);
+}
+
+#[test]
+pub(crate) fn adr155_descriptor_sync_emits_empty_heavy_hitter_facts() {
+	let catalog = catalog_source();
+	let sync = source_block(&catalog, "fn descriptor_optimizer_facts_from_storage");
+
+	assert!(catalog.contains("ColumnHeavyHitterFact"));
+	assert!(catalog.contains("DescriptorColumnHeavyHitterFact"));
+	assert!(sync.contains("column_heavy_hitters: Vec::new()"));
+	assert!(
+		!sync.contains("ColumnHeavyHitterFact {"),
+		"descriptor sync must stay dark until ADR156 producer lands"
 	);
 }
 

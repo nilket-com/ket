@@ -36,7 +36,9 @@ mod tests {
 	use crate::binder::{
 		BroadcastBuildSide, JoinStrategyDecisionReason, PlannerConfig, bind, bind_with_trace,
 	};
-	use crate::catalog::{DistinctCountFact, MockCatalog, TableOptimizerFacts};
+	use crate::catalog::{
+		ColumnHeavyHitterFact, DistinctCountFact, MockCatalog, TableOptimizerFacts,
+	};
 	use crate::coordinator::DistributedQueryCoordinator;
 	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
@@ -65,7 +67,7 @@ mod tests {
 	use crate::ir::{
 		AggregateFunction, BoundExprProgram, ColumnOrdinal, ExecutionPlan, Expr, JoinKind,
 		JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
-		MorselId, ScalarValue, SortExpr, StageId, TableId,
+		MorselId, ScalarLiteralKey, ScalarValue, SortExpr, StageId, TableId,
 	};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::server::{
@@ -1070,6 +1072,98 @@ mod tests {
 				actual_hot_rows
 			);
 		}
+
+		#[tokio::test]
+		async fn hot_key_filter_with_heavy_hitter_fact_estimates_frequency_and_hashes() {
+			let fixture = skewed_join_fixture_with_heavy_hitter_hot_key();
+			let auto_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_skewed_hot_key_binds_without_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto),
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
+						..PlannerConfig::default()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash heavy-hitter skewed join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let run =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					PlannerConfig::default(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("heavy-hitter-estimated hash should execute without broadcast replay");
+
+			assert!(
+				!run.replayed,
+				"heavy-hitter fact should hash up front without broadcast replay"
+			);
+			assert_skewed_join_matches_hash(&hash.results, &run.results);
+		}
+
+		#[tokio::test]
+		async fn stale_low_heavy_hitter_frequency_still_replays_as_hash() {
+			let fixture = skewed_join_fixture_with_heavy_hitter_frequency(100);
+			let auto_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_skewed_hot_key_binds_as_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto),
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
+						..PlannerConfig::default()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash stale-low skewed join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let replay =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					PlannerConfig::default(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("stale-low heavy-hitter broadcast should replay as hash");
+
+			assert!(
+				replay.replayed,
+				"stale-low heavy-hitter fact should remain broadcast-replay safe"
+			);
+			assert_skewed_join_matches_hash(&hash.results, &replay.results);
+		}
 	}
 
 	#[tokio::test]
@@ -1799,6 +1893,7 @@ mod tests {
 						row_upper_bound: None,
 						column_ndv: Default::default(),
 						column_range: Default::default(),
+						column_heavy_hitters: Default::default(),
 					},
 				)
 				.expect("seed optimizer facts");
@@ -1828,6 +1923,7 @@ mod tests {
 					row_upper_bound: Some(RowCount::new(customers_row_upper_bound)),
 					column_ndv,
 					column_range: Default::default(),
+					column_heavy_hitters: Default::default(),
 				},
 			)
 			.expect("seed customers row optimizer facts");
@@ -1916,6 +2012,25 @@ mod tests {
 	}
 
 	fn skewed_join_fixture() -> SkewedJoinFixture {
+		skewed_join_fixture_with_heavy_hitters(BTreeMap::new())
+	}
+
+	fn skewed_join_fixture_with_heavy_hitter_hot_key() -> SkewedJoinFixture {
+		skewed_join_fixture_with_heavy_hitter_frequency(5_000)
+	}
+
+	fn skewed_join_fixture_with_heavy_hitter_frequency(frequency: u64) -> SkewedJoinFixture {
+		skewed_join_fixture_with_heavy_hitters(BTreeMap::from([(
+			ColumnOrdinal(1),
+			ColumnHeavyHitterFact {
+				entries: BTreeMap::from([(ScalarLiteralKey::Utf8("hot".to_string()), frequency)]),
+			},
+		)]))
+	}
+
+	fn skewed_join_fixture_with_heavy_hitters(
+		column_heavy_hitters: BTreeMap<ColumnOrdinal, ColumnHeavyHitterFact>,
+	) -> SkewedJoinFixture {
 		const BASE_ROWS: usize = 10_000;
 		const HOT_ROWS: usize = 5_000;
 		const NDV: u64 = 100;
@@ -1965,6 +2080,7 @@ mod tests {
 					row_upper_bound: Some(RowCount::new(BASE_ROWS as u64)),
 					column_ndv: BTreeMap::from([(ColumnOrdinal(1), DistinctCountFact::Exact(NDV))]),
 					column_range: Default::default(),
+					column_heavy_hitters,
 				},
 			)
 			.expect("seed skewed customers optimizer facts");
@@ -2593,6 +2709,28 @@ mod tests {
 			}
 			other => panic!("expected estimated broadcast for skewed hot key, got {other:?}"),
 		}
+	}
+
+	async fn assert_skewed_hot_key_binds_without_estimated_broadcast(
+		plan: &LogicalPlan,
+		catalog: &MockCatalog,
+	) {
+		let (_bound, trace) = bind_with_trace(plan, catalog, &PlannerConfig::default())
+			.await
+			.expect("bind heavy-hitter skewed hot-key join with trace");
+		assert_eq!(trace.join_decisions.len(), 1);
+		assert_eq!(
+			trace.join_decisions[0].strategy,
+			JoinStrategy::HashPartitioned
+		);
+		assert!(
+			!matches!(
+				trace.join_decisions[0].reason,
+				JoinStrategyDecisionReason::BroadcastEstimated { .. }
+			),
+			"heavy-hitter hot key should not bind as BroadcastEstimated: {:?}",
+			trace.join_decisions[0].reason
+		);
 	}
 
 	fn assert_skewed_join_matches_hash(

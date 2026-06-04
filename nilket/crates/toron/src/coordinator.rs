@@ -2093,6 +2093,7 @@ fn derive_delete_candidate_plan(bound: &ExecutionPlan) -> Result<ExecutionPlan, 
 		profile_hint: *profile_hint,
 		primary_key_columns: Vec::new(),
 		column_ndv: Vec::new(),
+		column_heavy_hitters: Vec::new(),
 		column_range: Vec::new(),
 	};
 

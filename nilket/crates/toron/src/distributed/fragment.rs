@@ -1174,6 +1174,7 @@ fn shuffle_input_scan(
 		primary_key_columns: Vec::new(),
 		column_ndv: Vec::new(),
 		column_range: Vec::new(),
+		column_heavy_hitters: Vec::new(),
 	}
 }
 
@@ -1798,6 +1799,7 @@ mod tests {
 			primary_key_columns: vec![ColumnOrdinal(0)],
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		}
 	}
 
@@ -1841,6 +1843,7 @@ mod tests {
 			primary_key_columns: vec![ColumnOrdinal(0)],
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		}
 	}
 
