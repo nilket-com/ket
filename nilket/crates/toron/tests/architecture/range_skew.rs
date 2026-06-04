@@ -77,7 +77,7 @@ pub(crate) fn adr157_range_selectivity_is_min_max_uniform_no_quantile_fact() {
 }
 
 #[test]
-pub(crate) fn adr157_no_live_range_distribution_optimizer_fact_or_producer() {
+pub(crate) fn adr157_range_distribution_activation_is_later_adr158_159_work() {
 	let catalog = catalog_source();
 	let binder = binder_source();
 	let schema_facts = wendelon_optimizer_facts_source();
@@ -90,12 +90,13 @@ pub(crate) fn adr157_no_live_range_distribution_optimizer_fact_or_producer() {
 	assert!(sketch.contains("pub struct KllSketch"));
 	assert!(catalog.contains("pub struct ColumnRangeDistributionFact"));
 	assert!(binder.contains("fn column_range_distribution_for_input"));
-	assert!(descriptor_sync.contains("column_range_distributions: Vec::new()"));
+	assert!(schema_facts.contains("pub struct ColumnRangeDistributionFact"));
+	assert!(descriptor_sync.contains("descriptor_column_range_distributions_from_storage"));
+	assert!(table_optimizer_facts.contains("column_range_distributions"));
 	for forbidden in [
 		"ColumnQuantileFact",
 		"RangeDistributionPayload",
 		"column_quantiles",
-		"KllSketch",
 	] {
 		assert!(
 			!schema_facts.contains(forbidden),
@@ -110,6 +111,10 @@ pub(crate) fn adr157_no_live_range_distribution_optimizer_fact_or_producer() {
 			"table optimizer fact producer gained range-distribution marker {forbidden}"
 		);
 	}
+	assert!(
+		!schema_facts.contains("KllSketch") && !descriptor_sync.contains("KllSketch"),
+		"KLL sketch state must stay out of the optimizer fact wire and Toron descriptor sync"
+	);
 }
 
 #[test]

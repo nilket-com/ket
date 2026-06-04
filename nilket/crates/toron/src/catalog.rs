@@ -249,6 +249,10 @@ pub(crate) fn descriptor_optimizer_facts_from_storage(
 			},
 		})
 		.collect();
+	let column_range_distributions = descriptor_column_range_distributions_from_storage(
+		facts.column_range_distributions,
+		descriptor,
+	);
 	let column_heavy_hitters = descriptor_column_heavy_hitters_from_storage(
 		facts.column_heavy_hitters,
 		facts.row_upper_bound,
@@ -262,9 +266,48 @@ pub(crate) fn descriptor_optimizer_facts_from_storage(
 		row_upper_bound: facts.row_upper_bound.map(RowCount::new),
 		column_ndv,
 		column_range,
-		column_range_distributions: Vec::new(),
+		column_range_distributions,
 		column_heavy_hitters,
 	})
+}
+
+fn descriptor_column_range_distributions_from_storage(
+	column_range_distributions: Vec<wendelon_client::ColumnRangeDistributionFact>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> Vec<DescriptorColumnRangeDistributionFact> {
+	let Ok(schema) = descriptor.arrow_schema() else {
+		return Vec::new();
+	};
+	column_range_distributions
+		.into_iter()
+		.filter_map(|fact| {
+			let column_ordinal = ColumnOrdinal(u32::from(fact.column_ordinal));
+			let field = schema.fields().get(column_ordinal.0 as usize)?;
+			let fact = ColumnRangeDistributionFact {
+				arrow_type_tag: fact.arrow_type_tag,
+				non_null_count: fact.non_null_count,
+				rank_error_ppm: fact.rank_error_ppm,
+				buckets: fact
+					.buckets
+					.into_iter()
+					.map(|bucket| RangeDistributionBucket {
+						lower: bucket.lower,
+						upper: bucket.upper,
+						count: bucket.count,
+					})
+					.collect(),
+			};
+			if !range_distribution_tag_matches_data_type(fact.arrow_type_tag, field.data_type())
+				|| !valid_range_distribution_fact(&fact)
+			{
+				return None;
+			}
+			Some(DescriptorColumnRangeDistributionFact {
+				column_ordinal,
+				fact,
+			})
+		})
+		.collect()
 }
 
 fn descriptor_column_heavy_hitters_from_storage(
@@ -3436,6 +3479,7 @@ mod tests {
 				},
 			}],
 			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 		};
 		let client = Arc::new(
@@ -3483,6 +3527,7 @@ mod tests {
 				min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(0, 4).unwrap()),
 				max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(99, 4).unwrap()),
 			}],
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 		};
 		let client = Arc::new(
@@ -3524,6 +3569,7 @@ mod tests {
 			row_upper_bound: Some(12),
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: vec![wendelon_client::ColumnHeavyHitterFact {
 				column_ordinal: 1,
 				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
@@ -3555,6 +3601,142 @@ mod tests {
 			.get(&ColumnOrdinal(1))
 			.expect("amount heavy-hitter fact");
 		assert_eq!(fact.entries.get(&ScalarLiteralKey::Int32(42)), Some(&5));
+	}
+
+	#[tokio::test]
+	async fn descriptor_sync_maps_supported_range_distribution_storage_facts() {
+		let descriptor = descriptor();
+		let lower = wendelon_client::encode_signed_optimizer_fact_scalar(0, 4).unwrap();
+		let upper = wendelon_client::encode_signed_optimizer_fact_scalar(100, 4).unwrap();
+		let facts = StorageTableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 17,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: vec![wendelon_client::ColumnRangeDistributionFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				non_null_count: 10,
+				rank_error_ppm: 10_000,
+				buckets: vec![wendelon_client::RangeDistributionBucket {
+					lower: lower.clone(),
+					upper: upper.clone(),
+					count: 10,
+				}],
+			}],
+			column_heavy_hitters: Vec::new(),
+		};
+		let client = Arc::new(
+			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
+				.with_optimizer_facts([Ok(Some(facts))]),
+		);
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor");
+
+		let fact = resolved
+			.optimizer_facts
+			.column_range_distributions
+			.get(&ColumnOrdinal(1))
+			.expect("amount range-distribution fact");
+		assert_eq!(fact.arrow_type_tag, wendelon_client::ARROW_STATS_TAG_INT32);
+		assert_eq!(fact.non_null_count, 10);
+		assert_eq!(fact.rank_error_ppm, 10_000);
+		assert_eq!(
+			fact.buckets,
+			vec![RangeDistributionBucket {
+				lower,
+				upper,
+				count: 10,
+			}]
+		);
+	}
+
+	#[test]
+	fn descriptor_sync_drops_invalid_range_distribution_storage_facts() {
+		let descriptor = descriptor();
+		let lower = wendelon_client::encode_signed_optimizer_fact_scalar(0, 4).unwrap();
+		let upper = wendelon_client::encode_signed_optimizer_fact_scalar(100, 4).unwrap();
+		let invalid_facts = vec![
+			wendelon_client::ColumnRangeDistributionFact {
+				column_ordinal: 99,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				non_null_count: 10,
+				rank_error_ppm: 10_000,
+				buckets: vec![wendelon_client::RangeDistributionBucket {
+					lower: lower.clone(),
+					upper: upper.clone(),
+					count: 10,
+				}],
+			},
+			wendelon_client::ColumnRangeDistributionFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+				non_null_count: 10,
+				rank_error_ppm: 10_000,
+				buckets: vec![wendelon_client::RangeDistributionBucket {
+					lower: vec![0; 8],
+					upper: vec![1; 8],
+					count: 10,
+				}],
+			},
+			wendelon_client::ColumnRangeDistributionFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				non_null_count: 10,
+				rank_error_ppm: 10_000,
+				buckets: vec![wendelon_client::RangeDistributionBucket {
+					lower: upper.clone(),
+					upper: lower.clone(),
+					count: 10,
+				}],
+			},
+			wendelon_client::ColumnRangeDistributionFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				non_null_count: 10,
+				rank_error_ppm: 10_000,
+				buckets: vec![wendelon_client::RangeDistributionBucket {
+					lower: lower.clone(),
+					upper: upper.clone(),
+					count: 11,
+				}],
+			},
+		];
+		let facts = descriptor_optimizer_facts_from_storage(
+			StorageTableOptimizerFacts {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+				producer_epoch: 17,
+				row_upper_bound: Some(12),
+				column_ndv: Vec::new(),
+				column_range: Vec::new(),
+				column_range_distributions: invalid_facts,
+				column_heavy_hitters: Vec::new(),
+			},
+			&descriptor,
+		)
+		.expect("storage facts map");
+
+		assert!(facts.column_range_distributions.is_empty());
+		assert!(
+			facts
+				.for_descriptor(&descriptor)
+				.column_range_distributions
+				.is_empty()
+		);
 	}
 
 	#[test]
@@ -3618,6 +3800,7 @@ mod tests {
 				row_upper_bound: Some(12),
 				column_ndv: Vec::new(),
 				column_range: Vec::new(),
+				column_range_distributions: Vec::new(),
 				column_heavy_hitters: invalid_facts,
 			},
 			&descriptor,
@@ -3648,6 +3831,7 @@ mod tests {
 					distinct: StorageNdvFact::Exact { count: 4 },
 				}],
 				column_range: Vec::new(),
+				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
 			},
 			&descriptor,
@@ -3677,6 +3861,7 @@ mod tests {
 				row_upper_bound: Some(12),
 				column_ndv: Vec::new(),
 				column_range: Vec::new(),
+				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
 			},
 			&descriptor,
@@ -3702,6 +3887,7 @@ mod tests {
 				row_upper_bound: Some(0),
 				column_ndv: Vec::new(),
 				column_range: Vec::new(),
+				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
 			},
 			&descriptor,
@@ -3730,6 +3916,7 @@ mod tests {
 				distinct: StorageNdvFact::Exact { count: 4 },
 			}],
 			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 		};
 		assert_eq!(
@@ -3748,6 +3935,7 @@ mod tests {
 				distinct: StorageNdvFact::Exact { count: 4 },
 			}],
 			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 		};
 		assert_eq!(

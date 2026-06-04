@@ -72,7 +72,8 @@ const ADR039_STATS_FLAG_HAS_SMALL_SET: u16 = 1 << 1;
 const ADR039_STATS_FLAG_HAS_BLOOM: u16 = 1 << 2;
 const ADR039_STATS_FLAG_HAS_HLL: u16 = 1 << 3;
 const ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED: u16 = 1 << 4;
-const ADR039_STATS_FLAGS_RESERVED_MASK: u16 = !0x001F;
+const ADR159_STATS_FLAG_HAS_RANGE_DISTRIBUTION: u16 = 1 << 5;
+const ADR039_STATS_FLAGS_RESERVED_MASK: u16 = !0x003F;
 const _: [(); ADR039_STATS_LOCATOR_OFFSET] =
 	[(); ADR_TIERED_SLAB_HMAC_OFFSET + ADR_TIERED_SLAB_HMAC_BYTES];
 const _: [(); ADR_TIERED_SLAB_FOOTER_BYTES] =
@@ -1009,6 +1010,10 @@ impl TieredStatsBlockLocator {
 
 	pub fn has_hll(self) -> bool {
 		self.stats_flags & ADR039_STATS_FLAG_HAS_HLL != 0
+	}
+
+	pub fn has_range_distribution(self) -> bool {
+		self.stats_flags & ADR159_STATS_FLAG_HAS_RANGE_DISTRIBUTION != 0
 	}
 }
 
@@ -6621,7 +6626,7 @@ mod tests {
 		);
 
 		let mut reserved_flag = suffix;
-		reserved_flag[2..4].copy_from_slice(&(valid_flags | (1 << 5)).to_be_bytes());
+		reserved_flag[2..4].copy_from_slice(&(valid_flags | (1 << 6)).to_be_bytes());
 		let err =
 			parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, &reserved_flag)
 				.unwrap_err();

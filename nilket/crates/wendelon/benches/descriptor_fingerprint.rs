@@ -192,6 +192,7 @@ fn stats_policy_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error
 		hll_distincts: vec![ColumnHllSpecV1::new("region")],
 		small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 		heavy_hitters: Vec::new(),
+		range_distributions: Vec::new(),
 	};
 	descriptor.refresh_descriptor_fingerprints()?;
 	Ok(descriptor)

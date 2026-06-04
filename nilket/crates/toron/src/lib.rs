@@ -77,10 +77,11 @@ mod tests {
 	};
 	use crate::storage::{InMemoryStorageScan, ScanRequest, ScanStream, StorageScan};
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		KllK, LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
 	};
 	use wendelon::storage::file_ops::BlockingFileOps;
+	use wendelon::storage::sketch::KllSketch;
 
 	fn test_memory() -> Arc<MemoryManager> {
 		Arc::new(MemoryManager::new(10, 1024 * 1024))
@@ -1229,6 +1230,51 @@ mod tests {
 		}
 
 		#[tokio::test]
+		async fn produced_range_distribution_fact_makes_clustered_filter_hash_without_seeding() {
+			let fixture = range_skew_join_fixture_with_produced_storage_range_distribution_fact();
+			let auto_plan = range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_range_distribution_binds_without_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto),
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
+						..range_distribution_hash_config()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash produced range-distribution join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let run =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					range_distribution_hash_config(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("produced range-distribution fact should execute as hash without replay");
+
+			assert!(
+				!run.replayed,
+				"produced range-distribution fact should hash up front without broadcast replay"
+			);
+			assert_range_skew_join_matches_hash(&hash.results, &run.results);
+		}
+
+		#[tokio::test]
 		async fn range_skew_evidence_uses_range_fact_not_heavy_hitter_or_ndv() {
 			let facts = range_skew_customers_optimizer_facts();
 			assert!(facts.column_ndv.is_empty());
@@ -2278,6 +2324,7 @@ mod tests {
 				distinct: wendelon_client::NdvFact::Exact { count: NDV },
 			}],
 			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: vec![wendelon_client::ColumnHeavyHitterFact {
 				column_ordinal: 1,
 				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_UTF8,
@@ -2408,6 +2455,73 @@ mod tests {
 		}
 	}
 
+	fn range_skew_join_fixture_with_produced_storage_range_distribution_fact()
+	-> RangeSkewJoinFixture {
+		let orders_descriptor = named_descriptor(
+			1,
+			"orders",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("customer_id", DataType::Int64, false),
+			]),
+		);
+		let customers_descriptor = named_descriptor(
+			2,
+			"customers",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("amount", DataType::Int64, true),
+			]),
+		);
+		let storage_facts = wendelon_client::TableOptimizerFacts {
+			table_object_id: customers_descriptor.table_object_id,
+			schema_generation: customers_descriptor.schema_generation,
+			physical_descriptor_fingerprint: customers_descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 159,
+			row_upper_bound: Some(RANGE_SKEW_BASE_ROWS as u64),
+			column_ndv: Vec::new(),
+			column_range: vec![wendelon_client::ColumnRangeFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+				null_count: 0,
+				non_null_count: RANGE_SKEW_BASE_ROWS as u64,
+				min: Some(
+					wendelon_client::encode_signed_optimizer_fact_scalar(RANGE_SKEW_FILTER_LOW, 8)
+						.unwrap(),
+				),
+				max: Some(
+					wendelon_client::encode_signed_optimizer_fact_scalar(
+						RANGE_SKEW_ENVELOPE_HIGH,
+						8,
+					)
+					.unwrap(),
+				),
+			}],
+			column_range_distributions: vec![range_skew_produced_storage_distribution_fact()],
+			column_heavy_hitters: Vec::new(),
+		};
+		let descriptor_facts = crate::catalog::descriptor_optimizer_facts_from_storage(
+			storage_facts,
+			&customers_descriptor,
+		)
+		.expect("storage optimizer facts map through descriptor sync");
+		assert!(
+			!descriptor_facts.column_range_distributions.is_empty(),
+			"storage-mapped range-distribution fact should be non-empty"
+		);
+		let catalog = WendelonCatalog::from_descriptors_with_optimizer_facts([
+			(TableId(1), orders_descriptor, None),
+			(TableId(2), customers_descriptor, Some(descriptor_facts)),
+		])
+		.expect("descriptor registry with produced range-distribution facts");
+
+		RangeSkewJoinFixture {
+			catalog: Arc::new(catalog),
+			storage: range_skew_join_storage(),
+			actual_range_rows: RANGE_SKEW_CLUSTER_ROWS,
+		}
+	}
+
 	fn range_skew_join_catalog() -> MockCatalog {
 		range_skew_join_catalog_with_customers_optimizer_facts(
 			range_skew_customers_optimizer_facts(),
@@ -2508,6 +2622,31 @@ mod tests {
 					1_000,
 				),
 			],
+		}
+	}
+
+	fn range_skew_produced_storage_distribution_fact()
+	-> wendelon_client::ColumnRangeDistributionFact {
+		let mut sketch = KllSketch::new(
+			wendelon_client::ARROW_STATS_TAG_INT64,
+			KllK::new(2048),
+			0x5A17_1590,
+		)
+		.expect("range-skew KLL sketch");
+		for row in 0..RANGE_SKEW_BASE_ROWS {
+			sketch.insert(
+				wendelon_client::encode_signed_optimizer_fact_scalar(range_skew_amount(row), 8)
+					.unwrap(),
+			);
+		}
+		let buckets = sketch.query_buckets(64).expect("range-skew buckets");
+		assert!(!buckets.is_empty());
+		wendelon_client::ColumnRangeDistributionFact {
+			column_ordinal: 1,
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+			non_null_count: sketch.total_item_count(),
+			rank_error_ppm: sketch.rank_error_ppm(),
+			buckets,
 		}
 	}
 

@@ -1,11 +1,12 @@
 use crate::hash::descriptor_fingerprint::{
 	self, LogicalSchemaFingerprint, PhysicalDescriptorFingerprint,
 };
+use crate::schema::aggregate::{AGG_KLL_DEFAULT_K, AGG_KLL_MAX_K, AGG_KLL_MIN_K, validate_kll_k};
 use crate::schema::pbc::{
 	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, Program as PbcProgram,
 };
 use crate::schema::{
-	ByteCount, ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex,
+	ByteCount, ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, KllK,
 	Locality, MaxRowCount, NodeId, TargetRowCount, TenantId, WriteResponseMeta, WriterNodeId,
 	write_payload_schema,
 };
@@ -485,6 +486,7 @@ impl PbcRejectCode {
 	pub const PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH: Self = Self(0x3909);
 	pub const PBC_REJECT_STATS_DECRYPT_FAILED: Self = Self(0x390A);
 	pub const PBC_REJECT_STATS_HEAVY_HITTER_INVALID: Self = Self(0x390B);
+	pub const PBC_REJECT_STATS_KLL_K_INVALID: Self = Self(0x390C);
 	// ADR 045 reject codes for append-only table operations.
 	pub const PBC_REJECT_APPEND_ONLY_UPDATE: Self = Self(0x3A01);
 	pub const PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY: Self = Self(0x3A02);
@@ -530,6 +532,7 @@ impl PbcRejectCode {
 			0x3909 => "PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH",
 			0x390A => "PBC_REJECT_STATS_DECRYPT_FAILED",
 			0x390B => "PBC_REJECT_STATS_HEAVY_HITTER_INVALID",
+			0x390C => "PBC_REJECT_STATS_KLL_K_INVALID",
 			0x3A01 => "PBC_REJECT_APPEND_ONLY_UPDATE",
 			0x3A02 => "PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY",
 			0x3A03 => "PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW",
@@ -1335,6 +1338,8 @@ pub struct ColumnStatsPolicyV1 {
 	pub small_sets: Vec<ColumnSmallSetSpecV1>,
 	#[serde(default)]
 	pub heavy_hitters: Vec<ColumnHeavyHitterSpec>,
+	#[serde(default)]
+	pub range_distributions: Vec<ColumnRangeDistributionSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1409,6 +1414,34 @@ impl ColumnSmallSetSpecV1 {
 			column_name: column_name.into(),
 			max_distinct_values: SmallSetValueCap::new(max_distinct_values)?,
 			max_bytes: SmallSetByteCap::new(max_bytes)?,
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnRangeDistributionSpec {
+	pub column_name: String,
+	pub k: KllK,
+}
+
+impl ColumnRangeDistributionSpec {
+	pub fn new(column_name: impl Into<String>) -> Self {
+		Self {
+			column_name: column_name.into(),
+			k: KllK::new(AGG_KLL_DEFAULT_K),
+		}
+	}
+
+	pub fn with_k(column_name: impl Into<String>, k: u32) -> std::io::Result<Self> {
+		validate_kll_k(k).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				format!("KLL k must be in {AGG_KLL_MIN_K}..={AGG_KLL_MAX_K}"),
+			)
+		})?;
+		Ok(Self {
+			column_name: column_name.into(),
+			k: KllK::new(k),
 		})
 	}
 }
@@ -2700,6 +2733,7 @@ fn validate_stats_policy(schema: &Schema, policy: &ColumnStatsPolicyV1) -> std::
 	validate_hll_stats_policy(schema, &policy.hll_distincts)?;
 	validate_small_set_stats_policy(schema, &policy.small_sets)?;
 	validate_heavy_hitter_stats_policy(schema, &policy.heavy_hitters)?;
+	validate_range_distribution_stats_policy(schema, &policy.range_distributions)?;
 	validate_stats_policy_budget(schema, policy)?;
 	Ok(())
 }
@@ -2783,6 +2817,33 @@ fn estimate_stats_policy_csb_ciphertext_bytes(
 	for spec in &policy.heavy_hitters {
 		bytes = bytes
 			.checked_add(u64::from(spec.max_bytes))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+	}
+	for spec in &policy.range_distributions {
+		let field = schema.field_with_name(&spec.column_name).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: range-distribution stats column {:?} is not present in Arrow schema",
+					PbcRejectCode::PBC_REJECT_STATS_COLUMN_UNKNOWN,
+					spec.column_name
+				),
+			)
+		})?;
+		let value_bytes = estimated_range_distribution_value_bytes(field.data_type())
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+		let retained = u64::from(spec.k.get());
+		let per_value_bytes = 4_u64
+			.checked_add(value_bytes)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+		let retained_bytes = retained
+			.checked_mul(per_value_bytes)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+		let sketch_bytes = 20_u64
+			.checked_add(retained_bytes)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+		bytes = bytes
+			.checked_add(sketch_bytes)
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
 	}
 	Ok(bytes)
@@ -2955,6 +3016,59 @@ fn validate_heavy_hitter_stats_policy(
 	Ok(())
 }
 
+fn validate_range_distribution_stats_policy(
+	schema: &Schema,
+	specs: &[ColumnRangeDistributionSpec],
+) -> std::io::Result<()> {
+	let mut seen = BTreeSet::new();
+	for spec in specs {
+		validate_descriptor_name("stats range-distribution column", &spec.column_name)?;
+		if !seen.insert(spec.column_name.clone()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: duplicate range-distribution stats column {:?}",
+					PbcRejectCode::PBC_REJECT_STATS_DUPLICATE_COLUMN,
+					spec.column_name
+				),
+			));
+		}
+		if let Err(err) = validate_kll_k(spec.k.get()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: range-distribution KLL k for {:?} is invalid: {:?}",
+					PbcRejectCode::PBC_REJECT_STATS_KLL_K_INVALID,
+					spec.column_name,
+					err
+				),
+			));
+		}
+		let field = schema.field_with_name(&spec.column_name).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: range-distribution stats column {:?} is not present in Arrow schema",
+					PbcRejectCode::PBC_REJECT_STATS_COLUMN_UNKNOWN,
+					spec.column_name
+				),
+			)
+		})?;
+		if !is_supported_range_distribution_stats_type(field.data_type()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: range-distribution stats column {:?} uses unsupported V1 type {:?}",
+					PbcRejectCode::PBC_REJECT_STATS_UNSUPPORTED_TYPE,
+					spec.column_name,
+					field.data_type()
+				),
+			));
+		}
+	}
+	Ok(())
+}
+
 fn validate_heavy_hitter_caps(max_entries: u16, max_bytes: u32) -> std::io::Result<()> {
 	if max_entries == 0 || max_entries > COLUMN_STATS_HEAVY_HITTER_MAX_ENTRIES {
 		return Err(Error::new(
@@ -3040,6 +3154,21 @@ pub fn is_supported_heavy_hitter_stats_type(data_type: &DataType) -> bool {
 			| DataType::Float64
 			| DataType::Utf8
 	)
+}
+
+pub fn is_supported_range_distribution_stats_type(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+	)
+}
+
+fn estimated_range_distribution_value_bytes(data_type: &DataType) -> Option<u64> {
+	match data_type {
+		DataType::Int32 | DataType::Float32 => Some(4),
+		DataType::Int64 | DataType::Float64 => Some(8),
+		_ => None,
+	}
 }
 
 fn validate_clustering_type_and_width(
@@ -4428,6 +4557,7 @@ mod tests {
 				hll_distincts: vec![ColumnHllSpecV1::new("id")],
 				small_sets: vec![ColumnSmallSetSpecV1::new("active")],
 				heavy_hitters: vec![ColumnHeavyHitterSpec::new("active")],
+				range_distributions: Vec::new(),
 			},
 		)
 		.unwrap();

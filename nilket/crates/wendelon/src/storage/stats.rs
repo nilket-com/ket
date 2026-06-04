@@ -1,7 +1,7 @@
 use crate::schema::table::{
 	COLUMN_STATS_CSB_AEAD_TAG_BYTES, COLUMN_STATS_HLL_MAX_PRECISION,
 	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnHeavyHitterSpec, ColumnHllSpecV1,
-	ColumnSmallSetSpecV1, TableObjectId, TableSchemaDescriptor,
+	ColumnRangeDistributionSpec, ColumnSmallSetSpecV1, TableObjectId, TableSchemaDescriptor,
 	max_column_stats_block_ciphertext_bytes_for_slab_payload,
 };
 pub use crate::schema::{
@@ -14,7 +14,7 @@ pub use crate::schema::{
 	ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64, ARROW_STATS_TAG_UTF8,
 };
 use crate::schema::{
-	LogicalSchemaFingerprint, encode_float32_optimizer_fact_scalar,
+	KllK, LogicalSchemaFingerprint, encode_float32_optimizer_fact_scalar,
 	encode_float64_optimizer_fact_scalar, encode_signed_optimizer_fact_scalar,
 	encode_unsigned_optimizer_fact_scalar,
 };
@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind};
 use std::time::Instant;
 
-use crate::storage::sketch::SpaceSaving;
+use crate::storage::sketch::{KllSketch, SpaceSaving};
 
 pub const COLUMN_STATS_BLOCK_MAGIC: [u8; 8] = *b"WNDSTAT1";
 pub const COLUMN_STATS_BLOCK_FORMAT_VERSION: u32 = 1;
@@ -47,6 +47,7 @@ const COLUMN_STATS_BLOOM_SIPHASH_ALT_K0: u64 = 0x1716_1514_1312_1110;
 const COLUMN_STATS_BLOOM_SIPHASH_ALT_K1: u64 = 0x1F1E_1D1C_1B1A_1918;
 const COLUMN_STATS_HLL_SIPHASH_K0: u64 = 0x2726_2524_2322_2120;
 const COLUMN_STATS_HLL_SIPHASH_K1: u64 = 0x2F2E_2D2C_2B2A_2928;
+const COLUMN_STATS_KLL_COMPACTION_SEED: u32 = 0x5A17_1590;
 const _: [(); COLUMN_STATS_BLOCK_HEADER_BYTES] = [(); 8 + 4 + 16 + 8 + 32 + 8 + 4 + 4];
 const _: [(); COLUMN_STATS_COLUMN_HEADER_BYTES] = [(); 2 + 1 + 1 + 1 + 4];
 
@@ -60,7 +61,8 @@ pub const COLUMN_STAT_HAS_SMALL_SET: u16 = 1 << 6;
 pub const COLUMN_STAT_MIN_TRUNCATED: u16 = 1 << 7;
 pub const COLUMN_STAT_MAX_TRUNCATED: u16 = 1 << 8;
 pub const COLUMN_STAT_HAS_HEAVY_HITTERS: u16 = 1 << 9;
-pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1111_1100_0000_0000;
+pub const COLUMN_STAT_HAS_RANGE_DISTRIBUTION: u16 = 1 << 10;
+pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1111_1000_0000_0000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnStatsBlockHeader {
@@ -135,6 +137,14 @@ pub struct ColumnStatsHeavyHitterPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnStatsKllPayload {
+	pub k: KllK,
+	pub total_item_count: u64,
+	pub compaction_seed: u32,
+	pub retained_values: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedColumnStatsPayload {
 	pub min: Option<Vec<u8>>,
 	pub max: Option<Vec<u8>>,
@@ -144,6 +154,7 @@ pub struct DecodedColumnStatsPayload {
 	pub hll_distinct: Option<ColumnStatsHllPayload>,
 	pub small_set: Option<Vec<Vec<u8>>>,
 	pub heavy_hitters: Option<ColumnStatsHeavyHitterPayload>,
+	pub range_distribution: Option<ColumnStatsKllPayload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -556,6 +567,7 @@ pub fn canonical_stats_for_array_slice(
 		None,
 		None,
 		None,
+		None,
 	)?;
 	Ok(Some(CanonicalStatsValues {
 		null_count: stats.null_count,
@@ -710,6 +722,11 @@ fn build_column_stats_block_internal(
 			.heavy_hitters
 			.iter()
 			.find(|spec| spec.column_name.as_str() == field.name().as_str());
+		let range_distribution_spec = descriptor
+			.stats_policy
+			.range_distributions
+			.iter()
+			.find(|spec| spec.column_name.as_str() == field.name().as_str());
 		pending.push(build_pending_column_stats_entry(
 			column_ordinal,
 			field.as_ref(),
@@ -719,6 +736,7 @@ fn build_column_stats_block_internal(
 			hll_spec,
 			small_set_spec,
 			heavy_hitter_spec,
+			range_distribution_spec,
 			max_ciphertext_bytes.is_none(),
 		)?);
 	}
@@ -796,6 +814,16 @@ pub fn decode_column_stats_payload(
 	} else {
 		None
 	};
+	let range_distribution = if entry.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION != 0 {
+		Some(read_kll_range_distribution(
+			&entry.payload,
+			&mut cursor,
+			entry.arrow_type_tag,
+			non_null_count,
+		)?)
+	} else {
+		None
+	};
 	if cursor != entry.payload.len() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -811,6 +839,7 @@ pub fn decode_column_stats_payload(
 		hll_distinct,
 		small_set,
 		heavy_hitters,
+		range_distribution,
 	})
 }
 
@@ -1014,10 +1043,12 @@ struct PendingColumnStatsEntry {
 	hll: Option<Vec<u8>>,
 	small_set: Option<Vec<u8>>,
 	heavy_hitters: Option<Vec<u8>>,
+	range_distribution: Option<Vec<u8>>,
 	select_bloom: bool,
 	select_hll: bool,
 	select_small_set: bool,
 	select_heavy_hitters: bool,
+	select_range_distribution: bool,
 }
 
 impl PendingColumnStatsEntry {
@@ -1046,6 +1077,12 @@ impl PendingColumnStatsEntry {
 				self.entry.payload.extend_from_slice(&payload);
 			}
 		}
+		if self.select_range_distribution {
+			if let Some(payload) = self.range_distribution.take() {
+				self.entry.stat_flags |= COLUMN_STAT_HAS_RANGE_DISTRIBUTION;
+				self.entry.payload.extend_from_slice(&payload);
+			}
+		}
 		self.entry
 	}
 }
@@ -1056,6 +1093,7 @@ enum OptInStatKind {
 	Bloom,
 	Hll,
 	HeavyHitters,
+	RangeDistribution,
 }
 
 fn apply_opt_in_stats_budget(
@@ -1073,6 +1111,7 @@ fn apply_opt_in_stats_budget(
 		OptInStatKind::Bloom,
 		OptInStatKind::Hll,
 		OptInStatKind::HeavyHitters,
+		OptInStatKind::RangeDistribution,
 	] {
 		for entry in pending.iter_mut() {
 			maybe_select_opt_in_stat(entry, kind, &mut plaintext_len, max_plaintext_len)?;
@@ -1108,6 +1147,7 @@ fn maybe_select_opt_in_stat(
 		OptInStatKind::Bloom => entry.bloom.as_ref().map(Vec::len),
 		OptInStatKind::Hll => entry.hll.as_ref().map(Vec::len),
 		OptInStatKind::HeavyHitters => entry.heavy_hitters.as_ref().map(Vec::len),
+		OptInStatKind::RangeDistribution => entry.range_distribution.as_ref().map(Vec::len),
 	};
 	let Some(payload_len) = payload_len else {
 		return Ok(());
@@ -1124,6 +1164,7 @@ fn maybe_select_opt_in_stat(
 		OptInStatKind::Bloom => entry.select_bloom = true,
 		OptInStatKind::Hll => entry.select_hll = true,
 		OptInStatKind::HeavyHitters => entry.select_heavy_hitters = true,
+		OptInStatKind::RangeDistribution => entry.select_range_distribution = true,
 	}
 	Ok(())
 }
@@ -1139,6 +1180,7 @@ struct CollectedColumnStats {
 	hll: Option<Vec<u8>>,
 	small_set: Option<Vec<u8>>,
 	heavy_hitters: Option<Vec<u8>>,
+	range_distribution: Option<Vec<u8>>,
 }
 
 fn build_pending_column_stats_entry(
@@ -1150,6 +1192,7 @@ fn build_pending_column_stats_entry(
 	hll_spec: Option<&ColumnHllSpecV1>,
 	small_set_spec: Option<&ColumnSmallSetSpecV1>,
 	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
+	range_distribution_spec: Option<&ColumnRangeDistributionSpec>,
 	select_all_opt_ins: bool,
 ) -> std::io::Result<PendingColumnStatsEntry> {
 	let Some(arrow_type_tag) = arrow_stats_type_tag(field.data_type()) else {
@@ -1172,10 +1215,12 @@ fn build_pending_column_stats_entry(
 			hll: None,
 			small_set: None,
 			heavy_hitters: None,
+			range_distribution: None,
 			select_bloom: select_all_opt_ins,
 			select_hll: select_all_opt_ins,
 			select_small_set: select_all_opt_ins,
 			select_heavy_hitters: select_all_opt_ins,
+			select_range_distribution: select_all_opt_ins,
 		});
 	};
 	let stats = collect_column_stats_in_one_pass(
@@ -1187,6 +1232,7 @@ fn build_pending_column_stats_entry(
 		hll_spec,
 		small_set_spec,
 		heavy_hitter_spec,
+		range_distribution_spec,
 	)?;
 	let mut stat_flags = COLUMN_STAT_HAS_NULL_COUNT | COLUMN_STAT_HAS_NON_NULL_COUNT;
 	let mut payload = Vec::new();
@@ -1217,10 +1263,12 @@ fn build_pending_column_stats_entry(
 		hll: stats.hll,
 		small_set: stats.small_set,
 		heavy_hitters: stats.heavy_hitters,
+		range_distribution: stats.range_distribution,
 		select_bloom: select_all_opt_ins,
 		select_hll: select_all_opt_ins,
 		select_small_set: select_all_opt_ins,
 		select_heavy_hitters: select_all_opt_ins,
+		select_range_distribution: select_all_opt_ins,
 	})
 }
 
@@ -1233,6 +1281,7 @@ fn collect_column_stats_in_one_pass(
 	hll_spec: Option<&ColumnHllSpecV1>,
 	small_set_spec: Option<&ColumnSmallSetSpecV1>,
 	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
+	range_distribution_spec: Option<&ColumnRangeDistributionSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
 	let null_count = column_stats_count(array.null_count(), "null_count")?;
 	let non_null_count = column_stats_count(
@@ -1249,6 +1298,7 @@ fn collect_column_stats_in_one_pass(
 				hll_spec,
 				small_set_spec,
 				heavy_hitter_spec,
+				range_distribution_spec,
 			);
 		}
 		DataType::Float64 => {
@@ -1260,6 +1310,7 @@ fn collect_column_stats_in_one_pass(
 				hll_spec,
 				small_set_spec,
 				heavy_hitter_spec,
+				range_distribution_spec,
 			);
 		}
 		_ => {}
@@ -1274,6 +1325,9 @@ fn collect_column_stats_in_one_pass(
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
 	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
+	let mut range_distribution = range_distribution_spec
+		.map(|spec| KllSketch::new(arrow_type_tag, spec.k, COLUMN_STATS_KLL_COMPACTION_SEED))
+		.transpose()?;
 
 	for_each_encoded_non_null_value(data_type, array, |value| {
 		if min
@@ -1300,6 +1354,9 @@ fn collect_column_stats_in_one_pass(
 		}
 		if let Some(small_set) = small_set.as_mut() {
 			small_set.insert(value.clone())?;
+		}
+		if let Some(range_distribution) = range_distribution.as_mut() {
+			range_distribution.insert(value.clone());
 		}
 		if let Some(heavy_hitters) = heavy_hitters.as_mut() {
 			heavy_hitters.insert(value)?;
@@ -1336,6 +1393,13 @@ fn collect_column_stats_in_one_pass(
 			Ok::<_, std::io::Error>(bytes)
 		})
 		.transpose()?;
+	let range_distribution = range_distribution
+		.map(|sketch| {
+			let mut bytes = Vec::new();
+			encode_kll_range_distribution(&mut bytes, &sketch)?;
+			Ok::<_, std::io::Error>(bytes)
+		})
+		.transpose()?;
 
 	Ok(CollectedColumnStats {
 		min,
@@ -1348,6 +1412,7 @@ fn collect_column_stats_in_one_pass(
 		hll,
 		small_set,
 		heavy_hitters,
+		range_distribution,
 	})
 }
 
@@ -1359,6 +1424,7 @@ fn collect_float32_column_stats(
 	hll_spec: Option<&ColumnHllSpecV1>,
 	small_set_spec: Option<&ColumnSmallSetSpecV1>,
 	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
+	range_distribution_spec: Option<&ColumnRangeDistributionSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
 	let typed = downcast_array::<Float32Array>(array)?;
 	let mut min = None::<f32>;
@@ -1371,6 +1437,15 @@ fn collect_float32_column_stats(
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
 	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
+	let mut range_distribution = range_distribution_spec
+		.map(|spec| {
+			KllSketch::new(
+				ARROW_STATS_TAG_FLOAT32,
+				spec.k,
+				COLUMN_STATS_KLL_COMPACTION_SEED,
+			)
+		})
+		.transpose()?;
 	let mut saw_non_finite = false;
 
 	for row in 0..typed.len() {
@@ -1410,6 +1485,7 @@ fn collect_float32_column_stats(
 			&mut hll,
 			&mut small_set,
 			&mut heavy_hitters,
+			&mut range_distribution,
 		)?;
 	}
 
@@ -1429,6 +1505,7 @@ fn collect_float32_column_stats(
 		hll,
 		small_set,
 		heavy_hitters,
+		range_distribution,
 	)
 }
 
@@ -1440,6 +1517,7 @@ fn collect_float64_column_stats(
 	hll_spec: Option<&ColumnHllSpecV1>,
 	small_set_spec: Option<&ColumnSmallSetSpecV1>,
 	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
+	range_distribution_spec: Option<&ColumnRangeDistributionSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
 	let typed = downcast_array::<Float64Array>(array)?;
 	let mut min = None::<f64>;
@@ -1452,6 +1530,15 @@ fn collect_float64_column_stats(
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
 	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
+	let mut range_distribution = range_distribution_spec
+		.map(|spec| {
+			KllSketch::new(
+				ARROW_STATS_TAG_FLOAT64,
+				spec.k,
+				COLUMN_STATS_KLL_COMPACTION_SEED,
+			)
+		})
+		.transpose()?;
 	let mut saw_non_finite = false;
 
 	for row in 0..typed.len() {
@@ -1491,6 +1578,7 @@ fn collect_float64_column_stats(
 			&mut hll,
 			&mut small_set,
 			&mut heavy_hitters,
+			&mut range_distribution,
 		)?;
 	}
 
@@ -1510,6 +1598,7 @@ fn collect_float64_column_stats(
 		hll,
 		small_set,
 		heavy_hitters,
+		range_distribution,
 	)
 }
 
@@ -1519,6 +1608,7 @@ fn insert_opt_in_encoded_value(
 	hll: &mut Option<ColumnStatsHllPayload>,
 	small_set: &mut Option<SmallSetCollector>,
 	heavy_hitters: &mut Option<HeavyHitterCollector>,
+	range_distribution: &mut Option<KllSketch>,
 ) -> std::io::Result<()> {
 	if let Some(bloom) = bloom.as_mut()
 		&& bloom.bit_count != 0
@@ -1530,6 +1620,9 @@ fn insert_opt_in_encoded_value(
 	}
 	if let Some(small_set) = small_set.as_mut() {
 		small_set.insert(value.to_vec())?;
+	}
+	if let Some(range_distribution) = range_distribution.as_mut() {
+		range_distribution.insert(value.to_vec());
 	}
 	if let Some(heavy_hitters) = heavy_hitters.as_mut() {
 		heavy_hitters.insert(value.to_vec())?;
@@ -1549,6 +1642,7 @@ fn counts_only_column_stats(null_count: u64, non_null_count: u64) -> CollectedCo
 		hll: None,
 		small_set: None,
 		heavy_hitters: None,
+		range_distribution: None,
 	}
 }
 
@@ -1563,6 +1657,7 @@ fn finish_collected_column_stats(
 	hll: Option<ColumnStatsHllPayload>,
 	small_set: Option<SmallSetCollector>,
 	heavy_hitters: Option<HeavyHitterCollector>,
+	range_distribution: Option<KllSketch>,
 ) -> std::io::Result<CollectedColumnStats> {
 	let bloom = bloom.map(|bloom| {
 		let mut payload = Vec::new();
@@ -1591,6 +1686,13 @@ fn finish_collected_column_stats(
 			Ok::<_, std::io::Error>(bytes)
 		})
 		.transpose()?;
+	let range_distribution = range_distribution
+		.map(|sketch| {
+			let mut bytes = Vec::new();
+			encode_kll_range_distribution(&mut bytes, &sketch)?;
+			Ok::<_, std::io::Error>(bytes)
+		})
+		.transpose()?;
 	Ok(CollectedColumnStats {
 		min,
 		max,
@@ -1602,6 +1704,7 @@ fn finish_collected_column_stats(
 		hll,
 		small_set,
 		heavy_hitters,
+		range_distribution,
 	})
 }
 
@@ -1655,6 +1758,13 @@ pub fn locator_flags_for_parsed_column_stats_block(parsed: &ParsedColumnStatsBlo
 		.any(|entry| entry.stat_flags & COLUMN_STAT_HAS_HEAVY_HITTERS != 0)
 	{
 		flags |= 1 << 4;
+	}
+	if parsed
+		.columns
+		.iter()
+		.any(|entry| entry.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION != 0)
+	{
+		flags |= 1 << 5;
 	}
 	flags
 }
@@ -1718,6 +1828,45 @@ fn encode_bloom_filter(out: &mut Vec<u8>, bloom: &ColumnStatsBloomPayload) {
 fn encode_hll_distinct(out: &mut Vec<u8>, hll: &ColumnStatsHllPayload) {
 	out.push(hll.precision);
 	out.extend_from_slice(&hll.registers);
+}
+
+fn encode_kll_range_distribution(out: &mut Vec<u8>, sketch: &KllSketch) -> std::io::Result<()> {
+	let value_width = range_distribution_value_width(sketch.arrow_type_tag()).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"CSB range-distribution KLL type is unsupported",
+		)
+	})?;
+	out.extend_from_slice(&sketch.k().get().to_be_bytes());
+	out.extend_from_slice(&sketch.total_item_count().to_be_bytes());
+	out.extend_from_slice(&sketch.compaction_seed().to_be_bytes());
+	let mut values = sketch.retained_values().to_vec();
+	values.sort();
+	let value_count = u32::try_from(values.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"CSB range-distribution retained value_count exceeds u32::MAX",
+		)
+	})?;
+	out.extend_from_slice(&value_count.to_be_bytes());
+	for value in values {
+		if value.len() != value_width {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"CSB range-distribution retained value has wrong width",
+			));
+		}
+		encode_length_prefixed_bytes(out, &value)?;
+	}
+	Ok(())
+}
+
+fn range_distribution_value_width(arrow_type_tag: u8) -> Option<usize> {
+	match arrow_type_tag {
+		ARROW_STATS_TAG_INT32 | ARROW_STATS_TAG_FLOAT32 => Some(4),
+		ARROW_STATS_TAG_INT64 | ARROW_STATS_TAG_FLOAT64 => Some(8),
+		_ => None,
+	}
 }
 
 fn new_bloom_filter_for_row_count(
@@ -2184,6 +2333,7 @@ fn min_max_for_array(
 		None,
 		None,
 		None,
+		None,
 	)?;
 	Ok((
 		stats.min,
@@ -2400,6 +2550,80 @@ fn read_heavy_hitters(
 	Ok(ColumnStatsHeavyHitterPayload { complete, entries })
 }
 
+fn read_kll_range_distribution(
+	bytes: &[u8],
+	cursor: &mut usize,
+	arrow_type_tag: u8,
+	non_null_count: Option<u64>,
+) -> std::io::Result<ColumnStatsKllPayload> {
+	let value_width = range_distribution_value_width(arrow_type_tag).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"CSB range-distribution KLL type is unsupported",
+		)
+	})?;
+	let k = read_u32_be(bytes, cursor, "range_distribution_k")?;
+	let total_item_count = read_u64_be(bytes, cursor, "range_distribution_total_item_count")?;
+	let compaction_seed = read_u32_be(bytes, cursor, "range_distribution_compaction_seed")?;
+	let retained_count = read_u32_be(bytes, cursor, "range_distribution_retained_count")? as usize;
+	if let Some(non_null_count) = non_null_count
+		&& total_item_count > non_null_count
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"CSB range-distribution total_item_count exceeds non_null_count",
+		));
+	}
+	let mut retained_values = Vec::with_capacity(retained_count);
+	for _ in 0..retained_count {
+		let value = read_length_prefixed_bytes(bytes, cursor)?;
+		if value.len() != value_width {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB range-distribution retained value has wrong width",
+			));
+		}
+		retained_values.push(value);
+	}
+	if total_item_count == 0 && !retained_values.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"CSB range-distribution empty sketch retained values",
+		));
+	}
+	if retained_values.len() > usize::try_from(total_item_count).unwrap_or(usize::MAX) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"CSB range-distribution retained values exceed total_item_count",
+		));
+	}
+	let k = KllK::new(k);
+	KllSketch::from_retained_values(
+		arrow_type_tag,
+		k,
+		total_item_count,
+		retained_values.clone(),
+		compaction_seed,
+	)?;
+	Ok(ColumnStatsKllPayload {
+		k,
+		total_item_count,
+		compaction_seed,
+		retained_values,
+	})
+}
+
+fn read_u32_be(bytes: &[u8], cursor: &mut usize, field: &str) -> std::io::Result<u32> {
+	let value = bytes.get(*cursor..*cursor + 4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			format!("CSB payload truncated while reading {field}"),
+		)
+	})?;
+	*cursor += 4;
+	Ok(u32::from_be_bytes(value.try_into().expect("slice len")))
+}
+
 fn read_u64_be(bytes: &[u8], cursor: &mut usize, field: &str) -> std::io::Result<u64> {
 	let value = bytes.get(*cursor..*cursor + 8).ok_or_else(|| {
 		Error::new(
@@ -2415,9 +2639,10 @@ fn read_u64_be(bytes: &[u8], cursor: &mut usize, field: &str) -> std::io::Result
 mod tests {
 	use super::*;
 	use crate::schema::table::{
-		BloomBitsPerRow, ColumnHeavyHitterSpec, ColumnHllSpecV1, ColumnSmallSetSpecV1,
-		ColumnStatsPolicyV1, HllPrecision, LocalityPolicy, PrimaryKeyDescriptorV1,
-		RowIdentityPolicy, SchemaEvolutionPolicyV1, SmallSetByteCap, SmallSetValueCap,
+		BloomBitsPerRow, ColumnHeavyHitterSpec, ColumnHllSpecV1, ColumnRangeDistributionSpec,
+		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, HllPrecision, LocalityPolicy,
+		PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1, SmallSetByteCap,
+		SmallSetValueCap,
 	};
 	use arrow::array::{Float32Array, Float64Array, Int64Array, LargeStringArray, StringArray};
 	use arrow::datatypes::{Field, Schema};
@@ -3074,6 +3299,7 @@ mod tests {
 			hll_distincts: vec![ColumnHllSpecV1::new("region")],
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 			heavy_hitters: Vec::new(),
+			range_distributions: Vec::new(),
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -3114,6 +3340,7 @@ mod tests {
 			hll_distinct: None,
 			small_set: None,
 			heavy_hitters: None,
+			range_distribution: None,
 		};
 		assert_eq!(
 			distinct_count_for_column_stats_payload(&bloom_only).unwrap(),
@@ -3175,6 +3402,7 @@ mod tests {
 			hll_distincts: vec![ColumnHllSpecV1::new("region")],
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 			heavy_hitters: Vec::new(),
+			range_distributions: Vec::new(),
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -3220,6 +3448,62 @@ mod tests {
 		assert_ne!(region.stat_flags & COLUMN_STAT_HAS_BLOOM, 0);
 		assert_ne!(region.stat_flags & COLUMN_STAT_HAS_HLL, 0);
 		assert_ne!(region.stat_flags & COLUMN_STAT_HAS_SMALL_SET, 0);
+	}
+
+	#[test]
+	fn ciphertext_budget_trims_range_distribution_but_unbounded_keeps_it() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+		]);
+		let mut descriptor = stats_descriptor(&schema);
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			range_distributions: vec![ColumnRangeDistributionSpec::with_k("amount", 100).unwrap()],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as Arc<dyn Array>,
+				Arc::new(Int64Array::from(vec![Some(10), Some(20), Some(30)])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+
+		let budgeted = build_column_stats_block_with_ciphertext_budget(
+			&descriptor,
+			&batch,
+			COLUMN_STATS_DEFAULT_PREFIX_BYTES,
+			0,
+		)
+		.unwrap();
+		let parsed = parse_column_stats_block(&budgeted).unwrap();
+		let amount = &parsed.columns[1];
+		assert_eq!(amount.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION, 0);
+		assert_eq!(
+			decode_column_stats_payload(amount)
+				.unwrap()
+				.range_distribution,
+			None
+		);
+
+		let unbounded = build_column_stats_block_with_ciphertext_budget(
+			&descriptor,
+			&batch,
+			COLUMN_STATS_DEFAULT_PREFIX_BYTES,
+			usize::MAX,
+		)
+		.unwrap();
+		let parsed = parse_column_stats_block(&unbounded).unwrap();
+		let amount = &parsed.columns[1];
+		assert_ne!(amount.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION, 0);
+		assert!(
+			decode_column_stats_payload(amount)
+				.unwrap()
+				.range_distribution
+				.is_some()
+		);
 	}
 
 	#[test]
@@ -3801,6 +4085,62 @@ mod tests {
 					frequency: 2,
 				},
 			]
+		);
+	}
+
+	#[test]
+	fn range_distribution_stats_builds_kll_payload_and_locator_flag() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+		]);
+		let mut descriptor = stats_descriptor(&schema);
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			range_distributions: vec![ColumnRangeDistributionSpec::with_k("amount", 100).unwrap()],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)]))
+					as Arc<dyn Array>,
+				Arc::new(Int64Array::from(vec![
+					Some(10),
+					Some(20),
+					None,
+					Some(10_000),
+				])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+
+		let encoded = build_always_on_column_stats_block(&descriptor, &batch).unwrap();
+		let parsed = parse_column_stats_block(&encoded).unwrap();
+		assert_ne!(
+			locator_flags_for_parsed_column_stats_block(&parsed) & (1 << 5),
+			0
+		);
+		let amount = &parsed.columns[1];
+		assert_ne!(amount.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION, 0);
+		let decoded = decode_column_stats_payload(amount).unwrap();
+		let range_distribution = decoded
+			.range_distribution
+			.expect("range-distribution payload");
+		assert_eq!(range_distribution.k, KllK::new(100));
+		assert_eq!(range_distribution.total_item_count, 3);
+		assert_eq!(range_distribution.retained_values.len(), 3);
+		assert!(
+			range_distribution
+				.retained_values
+				.binary_search(&encode_signed_optimizer_fact_scalar(10, 8).unwrap())
+				.is_ok()
+		);
+		assert!(
+			range_distribution
+				.retained_values
+				.binary_search(&encode_signed_optimizer_fact_scalar(10_000, 8).unwrap())
+				.is_ok()
 		);
 	}
 

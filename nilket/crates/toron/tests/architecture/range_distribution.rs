@@ -37,7 +37,7 @@ fn source_block(source: &str, marker: &str) -> String {
 }
 
 #[test]
-pub(crate) fn adr158_range_distribution_consumer_is_dark_toron_only() {
+pub(crate) fn adr158_range_distribution_consumer_is_storage_activated_by_159() {
 	let binder = binder_source();
 	let catalog = catalog_source();
 	let execution = execution_source();
@@ -60,36 +60,27 @@ pub(crate) fn adr158_range_distribution_consumer_is_dark_toron_only() {
 		)
 	);
 	assert!(binder.contains("fn column_range_distribution_for_input"));
-	assert!(sync.contains("column_range_distributions: Vec::new()"));
+	assert!(sync.contains("descriptor_column_range_distributions_from_storage"));
+	assert!(catalog.contains("fn descriptor_column_range_distributions_from_storage"));
 }
 
 #[test]
-pub(crate) fn adr158_no_wendelon_range_distribution_producer_yet() {
+pub(crate) fn adr159_wendelon_range_distribution_producer_is_live_and_bucketed() {
 	let facts = wendelon_optimizer_facts_source();
 	let manager = wendelon_manager_source();
 	let stats = wendelon_stats_source();
 	let table_optimizer_facts = source_block(&manager, "pub async fn table_optimizer_facts");
 
-	for forbidden in [
-		"ColumnRangeDistributionFact",
-		"RangeDistributionBucket",
-		"RangeDistributionPayload",
-		"column_range_distributions",
-		"COLUMN_STAT_HAS_RANGE_DISTRIBUTION",
-	] {
-		assert!(
-			!facts.contains(forbidden),
-			"Wendelon optimizer-facts wire gained range-distribution marker {forbidden}"
-		);
-		assert!(
-			!table_optimizer_facts.contains(forbidden),
-			"Wendelon table optimizer fact producer gained range-distribution marker {forbidden}"
-		);
-		assert!(
-			!stats.contains(forbidden),
-			"Wendelon stats payload gained range-distribution marker {forbidden}"
-		);
-	}
+	assert!(facts.contains("pub struct ColumnRangeDistributionFact"));
+	assert!(facts.contains("pub struct RangeDistributionBucket"));
+	assert!(facts.contains("pub column_range_distributions"));
+	assert!(stats.contains("COLUMN_STAT_HAS_RANGE_DISTRIBUTION"));
+	assert!(stats.contains("fn read_kll_range_distribution"));
+	assert!(manager.contains("fn range_distribution_fact_for_column"));
+	assert!(manager.contains("fn range_distribution_column_candidates"));
+	assert!(table_optimizer_facts.contains("column_range_distributions.push(fact)"));
+	assert!(!facts.contains("KllSketch"));
+	assert!(!facts.contains("RangeDistributionPayload"));
 }
 
 #[test]
@@ -134,9 +125,14 @@ pub(crate) fn adr158_range_distribution_is_estimate_channel_only() {
 
 #[test]
 pub(crate) fn adr158_range_distribution_names_are_brand_clean() {
-	let offenders = source_lines(&manifest_dir().join("src"))
+	let mut lines = source_lines(&manifest_dir().join("src"));
+	lines.extend(source_lines(&wendelon_manifest_dir().join("src")));
+	let offenders = lines
 		.into_iter()
-		.filter(|(_, _, line)| line.contains("RangeDistribution") && line.contains("V1"))
+		.filter(|(_, _, line)| {
+			line.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+				.any(|token| token.contains("RangeDistribution") && token.contains("V1"))
+		})
 		.collect::<Vec<_>>();
 
 	assert!(

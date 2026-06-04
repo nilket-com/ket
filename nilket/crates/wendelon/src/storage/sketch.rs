@@ -1,7 +1,7 @@
 use crate::schema::aggregate::{
 	AGG_KLL_DEFAULT_K, AGG_KLL_MAX_K, AGG_KLL_MIN_K, AggregateState, validate_kll_k,
 };
-use crate::schema::{HllPrecision, KllK};
+use crate::schema::{HllPrecision, KllK, RangeDistributionBucket};
 use crate::storage::ColumnStatsHllPayload;
 use crate::storage::stats::estimate_hll_distinct_count;
 use std::collections::BTreeMap;
@@ -225,8 +225,82 @@ impl KllSketch {
 		&self.values
 	}
 
+	pub fn arrow_type_tag(&self) -> u8 {
+		self.arrow_type_tag
+	}
+
+	pub fn k(&self) -> KllK {
+		self.k
+	}
+
 	pub fn total_item_count(&self) -> u64 {
 		self.total_item_count
+	}
+
+	pub fn compaction_seed(&self) -> u32 {
+		self.compaction_seed
+	}
+
+	pub fn rank_error_ppm(&self) -> u32 {
+		ceil_div_u64(1_000_000, u64::from(self.k.get()))
+			.try_into()
+			.unwrap_or(u32::MAX)
+	}
+
+	pub fn query_buckets(
+		&self,
+		requested_count: usize,
+	) -> std::io::Result<Vec<RangeDistributionBucket>> {
+		if requested_count == 0 || self.total_item_count == 0 || self.values.is_empty() {
+			return Ok(Vec::new());
+		}
+		let rank_error_ppm = self.rank_error_ppm().max(1);
+		let resolution_cap = (1_000_000 / rank_error_ppm).max(1) as usize;
+		let total_count = usize::try_from(self.total_item_count).unwrap_or(usize::MAX);
+		let bucket_count = requested_count.min(resolution_cap).min(total_count).max(1);
+		let mut values = self.values.clone();
+		values.sort();
+		let base_count = self.total_item_count / bucket_count as u64;
+		let mut remainder = self.total_item_count % bucket_count as u64;
+		let mut start_rank = 0_u64;
+		let mut buckets: Vec<RangeDistributionBucket> =
+			Vec::with_capacity(bucket_count.min(values.len()));
+		for _ in 0..bucket_count {
+			let mut count = base_count;
+			if remainder != 0 {
+				count = count.saturating_add(1);
+				remainder -= 1;
+			}
+			if count == 0 {
+				continue;
+			}
+			let end_rank = start_rank.saturating_add(count).saturating_sub(1);
+			let start_index =
+				kll_rank_to_retained_index(start_rank, self.total_item_count, values.len());
+			let end_index =
+				kll_rank_to_retained_index(end_rank, self.total_item_count, values.len());
+			let lower = values[start_index].clone();
+			let upper = values[end_index.max(start_index)].clone();
+			if let Some(previous) = buckets.last_mut()
+				&& lower <= previous.upper
+			{
+				if upper > previous.upper {
+					previous.upper = upper;
+				}
+				previous.count = previous.count.checked_add(count).ok_or_else(|| {
+					Error::new(ErrorKind::InvalidData, "KLL bucket count overflow")
+				})?;
+				start_rank = start_rank.saturating_add(count);
+				continue;
+			}
+			buckets.push(RangeDistributionBucket {
+				lower,
+				upper,
+				count,
+			});
+			start_rank = start_rank.saturating_add(count);
+		}
+		Ok(buckets)
 	}
 
 	pub fn into_state(mut self) -> AggregateState {
@@ -267,6 +341,23 @@ impl KllSketch {
 	}
 }
 
+fn ceil_div_u64(numerator: u64, denominator: u64) -> u64 {
+	if denominator == 0 {
+		return u64::MAX;
+	}
+	numerator.div_ceil(denominator)
+}
+
+fn kll_rank_to_retained_index(rank: u64, total_count: u64, retained_count: usize) -> usize {
+	if retained_count == 0 || total_count == 0 {
+		return 0;
+	}
+	let index = (u128::from(rank) * retained_count as u128) / u128::from(total_count);
+	usize::try_from(index)
+		.unwrap_or(usize::MAX)
+		.min(retained_count.saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -299,5 +390,25 @@ mod tests {
 		}
 		assert_eq!(a.retained_values(), b.retained_values());
 		assert_eq!(a.total_item_count(), 200);
+	}
+
+	#[test]
+	fn kll_query_buckets_merges_duplicate_boundaries_and_preserves_count() {
+		let mut sketch = KllSketch::new(0x04, KllK::new(64), 7).unwrap();
+		for _ in 0..90 {
+			sketch.insert(0_i64.to_be_bytes().to_vec());
+		}
+		for value in 1_i64..=10 {
+			sketch.insert(value.to_be_bytes().to_vec());
+		}
+
+		let buckets = sketch.query_buckets(64).unwrap();
+		assert!(!buckets.is_empty());
+		assert!(buckets.windows(2).all(|pair| pair[0].upper < pair[1].lower));
+		assert_eq!(
+			buckets.iter().map(|bucket| bucket.count).sum::<u64>(),
+			sketch.total_item_count()
+		);
+		assert_eq!(sketch.rank_error_ppm(), 15_625);
 	}
 }

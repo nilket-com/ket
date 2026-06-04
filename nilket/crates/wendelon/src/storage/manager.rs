@@ -53,9 +53,10 @@ use crate::schema::table::{
 	validate_table_write_request_batch,
 };
 use crate::schema::{
+	ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
 	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnHeavyHitterEntry,
-	ColumnHeavyHitterFact, ColumnNdvFact, ColumnRangeFact, CompactionJobId, CompactionLevelIndex,
-	EncodingPageByteOffset, HllPrecision, HybridTimestamp,
+	ColumnHeavyHitterFact, ColumnNdvFact, ColumnRangeDistributionFact, ColumnRangeFact,
+	CompactionJobId, CompactionLevelIndex, EncodingPageByteOffset, HllPrecision, HybridTimestamp,
 	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
 	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
 	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
@@ -145,7 +146,7 @@ use crate::storage::secondary_index_backfill::{
 use crate::storage::secondary_index_segment::{
 	SecondaryIndexSegment, secondary_index_segment_storage_path,
 };
-use crate::storage::sketch::HllRegisters;
+use crate::storage::sketch::{HllRegisters, KllSketch};
 use crate::storage::stats::{
 	COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsDescriptorIdentity,
 	ParsedColumnStatsBlock, arrow_stats_type_tag, build_column_stats_block_with_ciphertext_budget,
@@ -591,6 +592,14 @@ struct HeavyHitterColumnCandidate {
 	max_bytes: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RangeDistributionColumnCandidate {
+	ordinal: u16,
+	arrow_type_tag: u8,
+}
+
+const RANGE_DISTRIBUTION_BUCKET_COUNT: usize = 64;
+
 #[derive(Clone, Debug)]
 enum TieredStatsContributor {
 	Matching(ParsedColumnStatsBlock),
@@ -690,6 +699,44 @@ fn heavy_hitter_column_candidates(
 		}
 	}
 	Ok(candidates)
+}
+
+fn range_distribution_column_candidates(
+	descriptor: &TableSchemaDescriptor,
+) -> std::io::Result<BTreeMap<u16, RangeDistributionColumnCandidate>> {
+	let schema = descriptor.arrow_schema()?;
+	let mut candidates = BTreeMap::new();
+	for spec in &descriptor.stats_policy.range_distributions {
+		if let Some((ordinal, field)) = schema
+			.fields()
+			.iter()
+			.enumerate()
+			.find(|(_, field)| field.name() == &spec.column_name)
+		{
+			let Some(arrow_type_tag) = arrow_stats_type_tag(field.data_type()) else {
+				continue;
+			};
+			if range_distribution_value_width(arrow_type_tag).is_none() {
+				continue;
+			}
+			candidates.insert(
+				ordinal as u16,
+				RangeDistributionColumnCandidate {
+					ordinal: ordinal as u16,
+					arrow_type_tag,
+				},
+			);
+		}
+	}
+	Ok(candidates)
+}
+
+fn range_distribution_value_width(arrow_type_tag: u8) -> Option<usize> {
+	match arrow_type_tag {
+		ARROW_STATS_TAG_INT32 | ARROW_STATS_TAG_FLOAT32 => Some(4),
+		ARROW_STATS_TAG_INT64 | ARROW_STATS_TAG_FLOAT64 => Some(8),
+		_ => None,
+	}
 }
 
 fn ndv_fact_for_column(
@@ -866,6 +913,57 @@ fn range_fact_for_column(
 		non_null_count,
 		min,
 		max,
+	}))
+}
+
+fn range_distribution_fact_for_column(
+	candidate: &RangeDistributionColumnCandidate,
+	blocks: &[ParsedColumnStatsBlock],
+) -> std::io::Result<Option<ColumnRangeDistributionFact>> {
+	let mut merged: Option<KllSketch> = None;
+	for block in blocks {
+		let Some(entry) = block
+			.columns
+			.iter()
+			.find(|entry| entry.column_ordinal == candidate.ordinal)
+		else {
+			return Ok(None);
+		};
+		if entry.arrow_type_tag != candidate.arrow_type_tag {
+			return Ok(None);
+		}
+		let payload = decode_column_stats_payload(entry)?;
+		let Some(kll) = payload.range_distribution else {
+			return Ok(None);
+		};
+		let sketch = KllSketch::from_retained_values(
+			candidate.arrow_type_tag,
+			kll.k,
+			kll.total_item_count,
+			kll.retained_values,
+			kll.compaction_seed,
+		)?;
+		if let Some(merged) = merged.as_mut() {
+			if merged.merge(&sketch).is_err() {
+				return Ok(None);
+			}
+		} else {
+			merged = Some(sketch);
+		}
+	}
+	let Some(merged) = merged else {
+		return Ok(None);
+	};
+	let buckets = merged.query_buckets(RANGE_DISTRIBUTION_BUCKET_COUNT)?;
+	if buckets.is_empty() {
+		return Ok(None);
+	}
+	Ok(Some(ColumnRangeDistributionFact {
+		column_ordinal: candidate.ordinal,
+		arrow_type_tag: candidate.arrow_type_tag,
+		non_null_count: merged.total_item_count(),
+		rank_error_ppm: merged.rank_error_ppm(),
+		buckets,
 	}))
 }
 
@@ -5212,6 +5310,7 @@ impl SlabManager {
 		let ndv_candidates = ndv_column_candidates(descriptor)?;
 		let range_candidates = range_column_candidates(descriptor)?;
 		let heavy_hitter_candidates = heavy_hitter_column_candidates(descriptor)?;
+		let range_distribution_candidates = range_distribution_column_candidates(descriptor)?;
 		if self
 			.has_uncovered_local_rows_for_descriptor(tenant_id, descriptor)
 			.await?
@@ -5260,6 +5359,12 @@ impl SlabManager {
 				column_heavy_hitters.push(fact);
 			}
 		}
+		let mut column_range_distributions = Vec::new();
+		for candidate in range_distribution_candidates.values() {
+			if let Some(fact) = range_distribution_fact_for_column(candidate, &blocks)? {
+				column_range_distributions.push(fact);
+			}
+		}
 		Ok(Some(TableOptimizerFacts {
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
@@ -5268,6 +5373,7 @@ impl SlabManager {
 			row_upper_bound: Some(row_upper_bound),
 			column_ndv,
 			column_range,
+			column_range_distributions,
 			column_heavy_hitters,
 		}))
 	}
@@ -15270,13 +15376,13 @@ mod tests {
 	use super::*;
 	use crate::crypto::CryptoManager;
 	use crate::schema::table::{
-		ColumnHeavyHitterSpec, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicy,
-		MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy,
-		RecordLayoutPolicy, RowIdentityPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
-		STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
-		STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
-		TableSpreadLocalityDescriptorV1, default_kv_table_descriptor_v1,
-		encode_table_write_row_count,
+		ColumnHeavyHitterSpec, ColumnRangeDistributionSpec, ColumnSmallSetSpecV1,
+		ColumnStatsPolicyV1, LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+		RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, STORAGE_ROW_HLC_COLUMN,
+		STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+		STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
+		default_kv_table_descriptor_v1, encode_table_write_row_count,
 	};
 	use crate::schema::{
 		BufferValueIndex, EncodingPageIndex, IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId,
@@ -15291,10 +15397,11 @@ mod tests {
 		ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_UTF8,
 		ARROW_STATS_TAG_UTF8, COLUMN_STAT_HAS_HEAVY_HITTERS, COLUMN_STAT_HAS_HLL,
 		COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_HAS_NON_NULL_COUNT,
-		COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_SMALL_SET, COLUMN_STAT_MAX_TRUNCATED,
-		COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry, ColumnStatsBlockHeader,
-		decode_column_stats_payload, encode_float64_stat_value, encode_length_prefixed_bytes,
-		encode_signed_stat_value, parse_column_stats_block,
+		COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_RANGE_DISTRIBUTION, COLUMN_STAT_HAS_SMALL_SET,
+		COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry,
+		ColumnStatsBlockHeader, build_always_on_column_stats_block, decode_column_stats_payload,
+		encode_float64_stat_value, encode_length_prefixed_bytes, encode_signed_stat_value,
+		parse_column_stats_block,
 	};
 	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
@@ -15770,6 +15877,61 @@ mod tests {
 	}
 
 	#[test]
+	fn partial_contributor_coverage_suppresses_range_distribution_fact() {
+		let descriptor = optimizer_fact_amount_range_distribution_descriptor(100);
+		let candidate = RangeDistributionColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_INT64,
+		};
+		let blocks = vec![
+			optimizer_fact_range_distribution_block(
+				&descriptor,
+				&optimizer_fact_amount_batch(&[(1, Some(10)), (2, Some(20))]),
+			),
+			optimizer_fact_block(Vec::new()),
+		];
+
+		assert_eq!(
+			range_distribution_fact_for_column(&candidate, &blocks)
+				.expect("range-distribution fact"),
+			None
+		);
+	}
+
+	#[test]
+	fn range_distribution_fact_rank_error_reflects_k_and_preserves_count() {
+		let descriptor = optimizer_fact_amount_range_distribution_descriptor(100);
+		let candidate = RangeDistributionColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_INT64,
+		};
+		let blocks = vec![optimizer_fact_range_distribution_block(
+			&descriptor,
+			&optimizer_fact_amount_batch(&[
+				(1, Some(0)),
+				(2, Some(10)),
+				(3, Some(20)),
+				(4, Some(30)),
+				(5, Some(40)),
+			]),
+		)];
+
+		let fact = range_distribution_fact_for_column(&candidate, &blocks)
+			.expect("range-distribution fact")
+			.expect("complete range-distribution fact");
+		assert_eq!(fact.column_ordinal, 1);
+		assert_eq!(fact.arrow_type_tag, ARROW_STATS_TAG_INT64);
+		assert_eq!(fact.non_null_count, 5);
+		assert_eq!(fact.rank_error_ppm, 10_000);
+		assert!(!fact.buckets.is_empty());
+		assert!(fact.buckets.len() <= RANGE_DISTRIBUTION_BUCKET_COUNT);
+		assert_eq!(
+			fact.buckets.iter().map(|bucket| bucket.count).sum::<u64>(),
+			5
+		);
+	}
+
+	#[test]
 	fn row_upper_bound_saturates_on_overflow() {
 		let blocks = vec![
 			optimizer_fact_block_with_row_count(u64::MAX - 1),
@@ -15874,6 +16036,68 @@ mod tests {
 					frequency: 1,
 				},
 			]
+		);
+	}
+
+	#[tokio::test]
+	async fn table_optimizer_facts_merges_tiered_range_distributions_into_global_buckets() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-distribution").await;
+		let descriptor = optimizer_fact_amount_range_distribution_descriptor(100);
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_amount_batch(&[
+				(1, Some(0)),
+				(2, Some(0)),
+				(3, Some(50)),
+				(4, Some(100)),
+			]),
+			"optimizer-facts-range-distribution-a",
+			10,
+		)
+		.await;
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_amount_batch(&[
+				(5, Some(0)),
+				(6, Some(75)),
+				(7, Some(10_000)),
+				(8, None),
+			]),
+			"optimizer-facts-range-distribution-b",
+			20,
+		)
+		.await;
+
+		let facts = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered range-distribution facts");
+
+		assert_eq!(facts.row_upper_bound, Some(8));
+		assert_eq!(facts.column_range_distributions.len(), 1);
+		let fact = &facts.column_range_distributions[0];
+		assert_eq!(fact.column_ordinal, 1);
+		assert_eq!(fact.arrow_type_tag, ARROW_STATS_TAG_INT64);
+		assert_eq!(fact.non_null_count, 7);
+		assert_eq!(fact.rank_error_ppm, 10_000);
+		assert!(!fact.buckets.is_empty());
+		assert!(fact.buckets.len() <= RANGE_DISTRIBUTION_BUCKET_COUNT);
+		assert_eq!(
+			fact.buckets.iter().map(|bucket| bucket.count).sum::<u64>(),
+			7
+		);
+		assert_eq!(
+			fact.buckets.first().map(|bucket| bucket.lower.as_slice()),
+			Some(encode_signed_stat_value(0, 8).unwrap().as_slice())
+		);
+		assert_eq!(
+			fact.buckets.last().map(|bucket| bucket.upper.as_slice()),
+			Some(encode_signed_stat_value(10_000, 8).unwrap().as_slice())
 		);
 	}
 
@@ -16899,6 +17123,30 @@ mod tests {
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		descriptor.validate().unwrap();
 		descriptor
+	}
+
+	fn optimizer_fact_amount_range_distribution_descriptor(k: u32) -> TableSchemaDescriptor {
+		let mut descriptor = optimizer_fact_amount_descriptor();
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			range_distributions: vec![ColumnRangeDistributionSpec::with_k("amount", k).unwrap()],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		descriptor.validate().unwrap();
+		descriptor
+	}
+
+	fn optimizer_fact_range_distribution_block(
+		descriptor: &TableSchemaDescriptor,
+		batch: &RecordBatch,
+	) -> ParsedColumnStatsBlock {
+		let encoded = build_always_on_column_stats_block(descriptor, batch).unwrap();
+		let parsed = parse_column_stats_block(&encoded).unwrap();
+		assert_ne!(
+			parsed.columns[1].stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION,
+			0
+		);
+		parsed
 	}
 
 	fn optimizer_fact_score_descriptor() -> TableSchemaDescriptor {
