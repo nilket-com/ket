@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–157 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–158 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,52 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 157 promoted; ADR 158 candidates
+### ADR 158 promoted; ADR 159 candidates
+
+ADR 158 promoted **Range-Distribution Selectivity Consumer** — spends ADR 157's measured
+range-skew evidence: a **Toron-only consumer, built dark** (the 141/155 pattern), refining
+in-envelope range selectivity *when a distribution fact is present*, fixture-tested now, inert in
+production until the Wendelon producer (159). **Consumer-first split** (3-of-3; grounded — Wendelon's
+`KllSketch` is aggregate-state-not-CSB-payload, so the producer is a new maintained sketch, the
+155/156 situation, *not* the 144 reuse). **Contract = bucket/CDF, sketch-agnostic** (Claude+Codex
+grounded over Gemini's `Kll{bytes}` enum — a `Kll`-bytes payload would couple Toron's optimizer-fact
+to Wendelon's private aggregate-state; the schema-owned-contract discipline): `ColumnRangeDistributionFact
+{ arrow_type_tag, non_null_count, rank_error_ppm, buckets: Vec<{lower, upper, count}> }`. KLL is a
+159 producer candidate/internal algorithm if chosen (queried into buckets before the wire); equi-depth
+is `rank_error_ppm`-honest buckets. **Consumer refines in-envelope only:** envelope-prune via
+`RangeFact` first (min/max owns zero-out, out-of-range → 0), then Σ covered-bucket counts +
+partial-overlap interpolation; **fail-open
+to 144/147 uniform** when absent/malformed/type-mismatch. **Approximate, not exact** (`rank_error_ppm`
+rides the fact — distinct from 156's exact-or-decline); estimate-channel only, 139/140-backstopped,
+never hard bound/`EmptyRelation`. Carrier mirrors `column_range` + **projection remap** in
+`optimize_for_required` (the 155 catch). **No new range-distribution `*V1` type names.** **Why dark
+(the load-bearing property):** absent fact → exact 144/147 min/max-uniform estimate and chooser path;
+the proof is
+`absent_range_distribution_falls_back_to_min_max_uniform` asserting *exact* equality (not "no crash")
+— without it, an empty-fact-handling bug (`Some(0)`/floor/div-by-zero) would silently regress every
+range filter fleet-wide → over-broadcast→replay tax, on a feature delivering nothing until 159. Two
+safety layers: provable-darkness (protects production) + estimate-channel-only (protects correctness).
+Genuine 3-of-3 on the dark-consumer pattern; the bucket contract grounded 2-of-3. Headline gate:
+`range_distribution_fact_makes_clustered_range_filter_hash_without_replay` (157's clustered fixture +
+seeded bucket fact → ~9_000 not 101 → hashes, `replayed == false`; fails on `main`).
+
+**ADR 159 lead candidates:** **Wendelon range-distribution producer + activation** (the direct sequel
+— a maintained KLL/equi-depth CSB payload built to 158's bucket contract: opt-in per-column policy,
+ingest/compaction merge, the `TABLE_OPTIMIZER_FACTS_GET` extension, all-contributors coverage like
+142/156, descriptor sync mapping; **grounds the KLL-vs-equi-depth call** where merge/rank-error/
+serialization are real; **brand-clean names even when extending `ColumnStatsPolicyV1`**; Toron-sequence
+cross-ring producer like 156 — makes 158's dark consumer *live*); **dimensioned `CONVERT` / linear
+units** (the parallel breadth track, de-risked, operator-energy); **Rune optimizer cockpit** (brainstorm
+010 — the thin Rune-only observability API the fact spine now feeds: NDV / min-max / top-k / range-
+distribution receipts + confidence labels; a deliberate breadth cut); **Theta join-key intersection**
+(the join-cardinality arc — heaviest, needs a set-sketch substrate). **Council hygiene (carry):** `main`
+still has 2 pre-existing red architecture guards (`adr077` `optimizer.rs` line-ceiling; `adr031`
+BoundExprNode count) — a standalone cleanup + **add the full `architecture_test` binary to the review
+checklist**. **Forward arc:** `158 range-distribution consumer (dark) → 159 Wendelon producer (live) →
+range selectivity live → Theta join-key intersection → join selectivity → reordering` · *(parallel:
+CONVERT/units; Rune cockpit, brainstorm 010)*. Evidence-gate 159 on the 158 feat.
+
+### ADR 157 promoted; ADR 158 candidates (HISTORICAL)
 
 ADR 157 promoted **Measured Range-Skew Miss Evidence** — applies ADR 154's evidence
 discipline to *range* selectivity, the next estimate-quality frontier after the 154→155→156
