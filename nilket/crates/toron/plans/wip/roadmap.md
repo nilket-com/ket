@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–155 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–156 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,52 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 155 promoted; ADR 156 candidates
+### ADR 156 promoted; ADR 157 candidates
+
+ADR 156 promoted **Heavy-Hitter Top-K Optimizer Fact Producer** — makes ADR 155's dark
+heavy-hitter consumer **live**, closing `154 measured miss → 155 consumer → 156 producer`
+into a production fix. A **Toron-sequence cross-ring producer + activation** (the
+142/144/147 pattern — *not* Wendelon-relocated; corrects the prior roadmap note). Wendelon
+adds an **opt-in per-column** heavy-hitter stats payload (`ColumnStatsPolicyV1.heavy_hitters`,
+default-empty, budgeted `max_entries`/`max_bytes`), built **at write/compaction** (recomputed
+from survivors, never request-time scan), behind a named CSB flag (`COLUMN_STAT_HAS_HEAVY_HITTERS
+= 1<<9`); aggregates fully-covered payloads into `TABLE_OPTIMIZER_FACTS_GET`; Toron only
+**maps** them into 155's carrier (replace the dark `Vec::new()`), binder/chooser/replay
+unchanged. **Load-bearing correctness contract (Codex's exact-or-decline merge, 3-of-3):** 155
+spends `frequency` as *exact*, so a bounded Space-Saving/Misra-Gries sketch is a *candidate
+selector only* — the CSB payload stores **exact** counts for emitted keys + a `complete` flag
+that is true only when all distinct local keys fit `max_entries`/`max_bytes`;
+**absence from an incomplete local top-k is unknown, not zero**, so a table-level key is exact
+only if every contributor proves it (has it, or `complete` proves absence), else that key is
+omitted. After exact totals are known, policy `max_entries`/`max_bytes` caps are applied
+deterministically; the column fact is omitted only if no entries survive. This keeps 155's
+`Σ frequency`/uniform-tail honest across tiered/merged tables; undercounting-as-exact would
+re-create the 154 over-broadcast. Estimate-channel only; 142 all-contributors coverage fence;
+`ScalarLiteralKey` never crosses the wire (only `(arrow_type_tag, value_key: Vec<u8>)`);
+mixed-version postcard compatibility uses an explicit without-heavy-hitters decoder, not
+`#[serde(default)]` alone; Count-Min deferred (no error-bound consumer). Genuine 3-of-3
+(placement Toron-sequence, the merge proof, opt-in/CSB-flag, wire boundary). Headline gate:
+`produced_heavy_hitter_fact_makes_hot_key_filter_hash_without_seeding` (Wendelon-produced
+frequency → hot key hashes, `replayed == false`, no test seeding; fails on `main`).
+
+**ADR 157 lead candidates:** **equality/IN heavy-hitter selectivity now live** — the
+154→155→156 arc is *complete in production*; the spine's next estimate-quality frontier is
+**KLL/quantile range-skew evidence** (the 154 *measurement* pattern for ranges: do the 144/147
+min/max-uniform *range* estimates miss on non-uniform spread? gate the eventual KLL producer);
+**dimensioned `CONVERT`/units arc** (the parallel breadth track, de-risked across fixed+calendar
+deltas, linear-units-first — now well-positioned since the equality-skew spine is live);
+**Count-Min / error-bounded frequencies** (extend 155/156 to approximate hot keys with an
+exposed no-under-count bound — its own consumer-contract ADR); **Theta join-key intersection**
+(the join-cardinality arc — heaviest, needs a set-sketch substrate); **`SET TIME ZONE`/REPL**,
+**byte-estimate tighten**. **Council hygiene (carry):** `main` has 2 pre-existing red
+architecture guards (`adr077` `optimizer.rs` line-ceiling; `adr031` BoundExprNode count) — a
+small standalone cleanup + **add the full `architecture_test` binary to the review checklist**
+(targeted `--test architecture_test adrNNN` masked them). **Forward arc:** `156 producer (live)
+→ KLL range-skew evidence → (range heavy-hitter / Count-Min) → Theta join-key intersection →
+join selectivity → reordering` · *(parallel: CONVERT/units)*. Evidence-gate the next pick on
+the 156 feat.
+
+### ADR 155 promoted; ADR 156 candidates (HISTORICAL)
 
 ADR 155 promoted **Heavy-Hitter Top-K NDV Selectivity Consumer** — spends ADR 154's
 measured skew evidence: Toron learns to consume exact per-column top-k value frequencies
