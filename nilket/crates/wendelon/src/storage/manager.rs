@@ -53,12 +53,13 @@ use crate::schema::table::{
 	validate_table_write_request_batch,
 };
 use crate::schema::{
-	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnNdvFact,
-	ColumnRangeFact, CompactionJobId, CompactionLevelIndex, EncodingPageByteOffset, HllPrecision,
-	HybridTimestamp, INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix,
-	IndexObjectId, IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint,
-	ManifestEpoch, NdvFact, RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount,
-	RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
+	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnHeavyHitterEntry,
+	ColumnHeavyHitterFact, ColumnNdvFact, ColumnRangeFact, CompactionJobId, CompactionLevelIndex,
+	EncodingPageByteOffset, HllPrecision, HybridTimestamp,
+	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
+	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
+	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
+	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
 	SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader, SupersessionMetadata,
 	TableLifecycleCatalog, TableOptimizerFacts, TenantId, TenantKekId, TombstoneMetadata,
 	WriterNodeId, range_fact_tag_supported,
@@ -582,6 +583,14 @@ struct RangeColumnCandidate {
 	arrow_type_tag: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeavyHitterColumnCandidate {
+	ordinal: u16,
+	arrow_type_tag: u8,
+	max_entries: u16,
+	max_bytes: u32,
+}
+
 #[derive(Clone, Debug)]
 enum TieredStatsContributor {
 	Matching(ParsedColumnStatsBlock),
@@ -647,6 +656,35 @@ fn range_column_candidates(
 				RangeColumnCandidate {
 					ordinal: ordinal as u16,
 					arrow_type_tag,
+				},
+			);
+		}
+	}
+	Ok(candidates)
+}
+
+fn heavy_hitter_column_candidates(
+	descriptor: &TableSchemaDescriptor,
+) -> std::io::Result<BTreeMap<u16, HeavyHitterColumnCandidate>> {
+	let schema = descriptor.arrow_schema()?;
+	let mut candidates = BTreeMap::new();
+	for spec in &descriptor.stats_policy.heavy_hitters {
+		if let Some((ordinal, field)) = schema
+			.fields()
+			.iter()
+			.enumerate()
+			.find(|(_, field)| field.name() == &spec.column_name)
+		{
+			let Some(arrow_type_tag) = arrow_stats_type_tag(field.data_type()) else {
+				continue;
+			};
+			candidates.insert(
+				ordinal as u16,
+				HeavyHitterColumnCandidate {
+					ordinal: ordinal as u16,
+					arrow_type_tag,
+					max_entries: spec.max_entries,
+					max_bytes: spec.max_bytes,
 				},
 			);
 		}
@@ -829,6 +867,109 @@ fn range_fact_for_column(
 		min,
 		max,
 	}))
+}
+
+fn heavy_hitter_fact_for_column(
+	candidate: &HeavyHitterColumnCandidate,
+	blocks: &[ParsedColumnStatsBlock],
+) -> std::io::Result<Option<ColumnHeavyHitterFact>> {
+	let mut contributors = Vec::with_capacity(blocks.len());
+	let mut candidate_keys = BTreeSet::<Vec<u8>>::new();
+	for block in blocks {
+		let Some(entry) = block
+			.columns
+			.iter()
+			.find(|entry| entry.column_ordinal == candidate.ordinal)
+		else {
+			return Ok(None);
+		};
+		if entry.arrow_type_tag != candidate.arrow_type_tag {
+			return Ok(None);
+		}
+		let payload = decode_column_stats_payload(entry)?;
+		let Some(heavy_hitters) = payload.heavy_hitters else {
+			return Ok(None);
+		};
+		for entry in &heavy_hitters.entries {
+			candidate_keys.insert(entry.value_key.clone());
+		}
+		contributors.push(heavy_hitters);
+	}
+
+	let mut exact_entries = Vec::new();
+	for key in candidate_keys {
+		let mut frequency = 0_u64;
+		let mut known = true;
+		for contributor in &contributors {
+			match contributor
+				.entries
+				.binary_search_by(|entry| entry.value_key.as_slice().cmp(key.as_slice()))
+			{
+				Ok(index) => {
+					frequency = frequency
+						.checked_add(contributor.entries[index].frequency)
+						.ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidData,
+								"heavy-hitter fact frequency overflow",
+							)
+						})?;
+				}
+				Err(_) if contributor.complete => {}
+				Err(_) => {
+					known = false;
+					break;
+				}
+			}
+		}
+		if known && frequency != 0 {
+			exact_entries.push(ColumnHeavyHitterEntry {
+				value_key: key,
+				frequency,
+			});
+		}
+	}
+
+	exact_entries.sort_by(|left, right| {
+		right
+			.frequency
+			.cmp(&left.frequency)
+			.then_with(|| left.value_key.cmp(&right.value_key))
+	});
+	let max_entries = usize::from(candidate.max_entries);
+	let max_bytes = candidate.max_bytes as usize;
+	let mut selected = Vec::new();
+	for entry in exact_entries {
+		if selected.len() >= max_entries {
+			break;
+		}
+		selected.push(entry);
+		if heavy_hitter_fact_entries_encoded_len(&selected)? > max_bytes {
+			selected.pop();
+			break;
+		}
+	}
+	if selected.is_empty() {
+		return Ok(None);
+	}
+	selected.sort_by(|left, right| left.value_key.cmp(&right.value_key));
+	Ok(Some(ColumnHeavyHitterFact {
+		column_ordinal: candidate.ordinal,
+		arrow_type_tag: candidate.arrow_type_tag,
+		entries: selected,
+	}))
+}
+
+fn heavy_hitter_fact_entries_encoded_len(
+	entries: &[ColumnHeavyHitterEntry],
+) -> std::io::Result<usize> {
+	entries.iter().try_fold(1_usize + 4, |bytes, entry| {
+		bytes
+			.checked_add(4)
+			.and_then(|bytes| bytes.checked_add(entry.value_key.len()))
+			.and_then(|bytes| bytes.checked_add(8))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "heavy-hitter fact byte overflow"))
+	})
 }
 
 fn row_upper_bound_for_blocks(blocks: &[ParsedColumnStatsBlock]) -> u64 {
@@ -5070,6 +5211,7 @@ impl SlabManager {
 	) -> std::io::Result<Option<TableOptimizerFacts>> {
 		let ndv_candidates = ndv_column_candidates(descriptor)?;
 		let range_candidates = range_column_candidates(descriptor)?;
+		let heavy_hitter_candidates = heavy_hitter_column_candidates(descriptor)?;
 		if self
 			.has_uncovered_local_rows_for_descriptor(tenant_id, descriptor)
 			.await?
@@ -5112,6 +5254,12 @@ impl SlabManager {
 				column_range.push(range);
 			}
 		}
+		let mut column_heavy_hitters = Vec::new();
+		for candidate in heavy_hitter_candidates.values() {
+			if let Some(fact) = heavy_hitter_fact_for_column(candidate, &blocks)? {
+				column_heavy_hitters.push(fact);
+			}
+		}
 		Ok(Some(TableOptimizerFacts {
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
@@ -5120,6 +5268,7 @@ impl SlabManager {
 			row_upper_bound: Some(row_upper_bound),
 			column_ndv,
 			column_range,
+			column_heavy_hitters,
 		}))
 	}
 
@@ -15121,12 +15270,13 @@ mod tests {
 	use super::*;
 	use crate::crypto::CryptoManager;
 	use crate::schema::table::{
-		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicy, MultiRowLayoutDescriptor,
-		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
-		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-		STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
-		default_kv_table_descriptor_v1, encode_table_write_row_count,
+		ColumnHeavyHitterSpec, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicy,
+		MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy,
+		RecordLayoutPolicy, RowIdentityPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
+		STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+		STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
+		TableSpreadLocalityDescriptorV1, default_kv_table_descriptor_v1,
+		encode_table_write_row_count,
 	};
 	use crate::schema::{
 		BufferValueIndex, EncodingPageIndex, IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId,
@@ -15139,11 +15289,12 @@ mod tests {
 	use crate::storage::multirow::pack_record_batch_by_bucket;
 	use crate::storage::stats::{
 		ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_UTF8,
-		COLUMN_STAT_HAS_HLL, COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN,
-		COLUMN_STAT_HAS_NON_NULL_COUNT, COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_SMALL_SET,
-		COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry,
-		ColumnStatsBlockHeader, decode_column_stats_payload, encode_float64_stat_value,
-		encode_length_prefixed_bytes, encode_signed_stat_value, parse_column_stats_block,
+		ARROW_STATS_TAG_UTF8, COLUMN_STAT_HAS_HEAVY_HITTERS, COLUMN_STAT_HAS_HLL,
+		COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_HAS_NON_NULL_COUNT,
+		COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_SMALL_SET, COLUMN_STAT_MAX_TRUNCATED,
+		COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry, ColumnStatsBlockHeader,
+		decode_column_stats_payload, encode_float64_stat_value, encode_length_prefixed_bytes,
+		encode_signed_stat_value, parse_column_stats_block,
 	};
 	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
@@ -15245,6 +15396,30 @@ mod tests {
 			stat_flags: COLUMN_STAT_HAS_NULL_COUNT
 				| COLUMN_STAT_HAS_NON_NULL_COUNT
 				| COLUMN_STAT_HAS_HLL,
+			payload,
+		}
+	}
+
+	fn optimizer_fact_heavy_hitter_entry(
+		complete: bool,
+		entries: &[(&[u8], u64)],
+		non_null_count: u64,
+	) -> ColumnStatsBlockEntry {
+		let mut payload = Vec::new();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&non_null_count.to_be_bytes());
+		payload.push(u8::from(complete));
+		payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+		for (value, frequency) in entries {
+			encode_length_prefixed_bytes(&mut payload, value).expect("encode heavy-hitter value");
+			payload.extend_from_slice(&frequency.to_be_bytes());
+		}
+		ColumnStatsBlockEntry {
+			column_ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_UTF8,
+			stat_flags: COLUMN_STAT_HAS_NULL_COUNT
+				| COLUMN_STAT_HAS_NON_NULL_COUNT
+				| COLUMN_STAT_HAS_HEAVY_HITTERS,
 			payload,
 		}
 	}
@@ -15462,6 +15637,139 @@ mod tests {
 	}
 
 	#[test]
+	fn heavy_hitter_fact_merges_exact_frequencies_per_key() {
+		let candidate = HeavyHitterColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_UTF8,
+			max_entries: 8,
+			max_bytes: 256,
+		};
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_heavy_hitter_entry(
+				true,
+				&[(b"cold".as_slice(), 1), (b"hot".as_slice(), 3)],
+				4,
+			)]),
+			optimizer_fact_block(vec![optimizer_fact_heavy_hitter_entry(
+				true,
+				&[(b"hot".as_slice(), 2), (b"warm".as_slice(), 1)],
+				3,
+			)]),
+		];
+
+		let fact = heavy_hitter_fact_for_column(&candidate, &blocks)
+			.expect("heavy-hitter fact")
+			.expect("complete heavy-hitter fact");
+		assert_eq!(fact.column_ordinal, 1);
+		assert_eq!(fact.arrow_type_tag, ARROW_STATS_TAG_UTF8);
+		assert_eq!(
+			fact.entries,
+			vec![
+				ColumnHeavyHitterEntry {
+					value_key: b"cold".to_vec(),
+					frequency: 1,
+				},
+				ColumnHeavyHitterEntry {
+					value_key: b"hot".to_vec(),
+					frequency: 5,
+				},
+				ColumnHeavyHitterEntry {
+					value_key: b"warm".to_vec(),
+					frequency: 1,
+				},
+			]
+		);
+	}
+
+	#[test]
+	fn incomplete_contributor_topk_absence_is_unknown_not_zero() {
+		let candidate = HeavyHitterColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_UTF8,
+			max_entries: 8,
+			max_bytes: 256,
+		};
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_heavy_hitter_entry(
+				false,
+				&[(b"hot".as_slice(), 3)],
+				10,
+			)]),
+			optimizer_fact_block(vec![optimizer_fact_heavy_hitter_entry(
+				true,
+				&[(b"cold".as_slice(), 2), (b"hot".as_slice(), 1)],
+				3,
+			)]),
+		];
+
+		let fact = heavy_hitter_fact_for_column(&candidate, &blocks)
+			.expect("heavy-hitter fact")
+			.expect("hot key remains exact");
+		assert_eq!(
+			fact.entries,
+			vec![ColumnHeavyHitterEntry {
+				value_key: b"hot".to_vec(),
+				frequency: 4,
+			}]
+		);
+	}
+
+	#[test]
+	fn table_heavy_hitter_fact_respects_max_entries_and_max_bytes() {
+		let candidate = HeavyHitterColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_UTF8,
+			max_entries: 1,
+			max_bytes: 32,
+		};
+		let blocks = vec![optimizer_fact_block(vec![
+			optimizer_fact_heavy_hitter_entry(
+				true,
+				&[
+					(b"cold".as_slice(), 1),
+					(b"hot".as_slice(), 9),
+					(b"warm".as_slice(), 3),
+				],
+				13,
+			),
+		])];
+
+		let fact = heavy_hitter_fact_for_column(&candidate, &blocks)
+			.expect("heavy-hitter fact")
+			.expect("capped heavy-hitter fact");
+		assert_eq!(
+			fact.entries,
+			vec![ColumnHeavyHitterEntry {
+				value_key: b"hot".to_vec(),
+				frequency: 9,
+			}]
+		);
+	}
+
+	#[test]
+	fn partial_contributor_coverage_suppresses_heavy_hitter_fact() {
+		let candidate = HeavyHitterColumnCandidate {
+			ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_UTF8,
+			max_entries: 8,
+			max_bytes: 256,
+		};
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_heavy_hitter_entry(
+				true,
+				&[(b"hot".as_slice(), 3)],
+				3,
+			)]),
+			optimizer_fact_block(Vec::new()),
+		];
+
+		assert_eq!(
+			heavy_hitter_fact_for_column(&candidate, &blocks).expect("heavy-hitter fact"),
+			None
+		);
+	}
+
+	#[test]
 	fn row_upper_bound_saturates_on_overflow() {
 		let blocks = vec![
 			optimizer_fact_block_with_row_count(u64::MAX - 1),
@@ -15510,6 +15818,63 @@ mod tests {
 		assert_eq!(facts.column_ndv[0].column_ordinal, 1);
 		assert_eq!(facts.column_ndv[0].distinct, NdvFact::Exact { count: 3 });
 		assert_eq!(facts.row_upper_bound, Some(4));
+	}
+
+	#[tokio::test]
+	async fn table_optimizer_facts_merges_tiered_heavy_hitters_into_exact_facts() {
+		let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-heavy-hitter").await;
+		let descriptor = optimizer_fact_utf8_region_heavy_hitter_descriptor();
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_utf8_region_batch(&[
+				(1, Some("hot")),
+				(2, Some("cold")),
+				(3, Some("hot")),
+			]),
+			"optimizer-facts-heavy-hitter-a",
+			10,
+		)
+		.await;
+		tier_optimizer_fact_batch(
+			&mgr,
+			&l2,
+			&descriptor,
+			&optimizer_fact_utf8_region_batch(&[(4, Some("warm")), (5, Some("hot"))]),
+			"optimizer-facts-heavy-hitter-b",
+			20,
+		)
+		.await;
+
+		let facts = mgr
+			.table_optimizer_facts(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.expect("covered heavy-hitter facts");
+
+		assert_eq!(facts.row_upper_bound, Some(5));
+		assert_eq!(facts.column_heavy_hitters.len(), 1);
+		let fact = &facts.column_heavy_hitters[0];
+		assert_eq!(fact.column_ordinal, 1);
+		assert_eq!(fact.arrow_type_tag, ARROW_STATS_TAG_UTF8);
+		assert_eq!(
+			fact.entries,
+			vec![
+				ColumnHeavyHitterEntry {
+					value_key: b"cold".to_vec(),
+					frequency: 1,
+				},
+				ColumnHeavyHitterEntry {
+					value_key: b"hot".to_vec(),
+					frequency: 3,
+				},
+				ColumnHeavyHitterEntry {
+					value_key: b"warm".to_vec(),
+					frequency: 1,
+				},
+			]
+		);
 	}
 
 	#[tokio::test]
@@ -16490,6 +16855,31 @@ mod tests {
 		descriptor
 	}
 
+	fn optimizer_fact_utf8_region_heavy_hitter_descriptor() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::Utf8, true),
+		]);
+		let mut descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([0xA6; 16]),
+			3,
+			"analytics",
+			"customers",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			heavy_hitters: vec![ColumnHeavyHitterSpec::with_caps("region", 4, 256).unwrap()],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		descriptor.validate().unwrap();
+		descriptor
+	}
+
 	fn optimizer_fact_amount_descriptor() -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
@@ -16560,6 +16950,26 @@ mod tests {
 					rows.iter().map(|(id, _)| Some(*id)).collect::<Vec<_>>(),
 				)) as Arc<dyn Array>,
 				Arc::new(LargeStringArray::from(
+					rows.iter()
+						.map(|(_, region)| *region)
+						.collect::<Vec<Option<&str>>>(),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap()
+	}
+
+	fn optimizer_fact_utf8_region_batch(rows: &[(i64, Option<&str>)]) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("region", DataType::Utf8, true),
+			])),
+			vec![
+				Arc::new(Int64Array::from(
+					rows.iter().map(|(id, _)| Some(*id)).collect::<Vec<_>>(),
+				)) as Arc<dyn Array>,
+				Arc::new(StringArray::from(
 					rows.iter()
 						.map(|(_, region)| *region)
 						.collect::<Vec<Option<&str>>>(),

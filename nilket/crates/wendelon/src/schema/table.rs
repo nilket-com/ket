@@ -14,7 +14,7 @@ use arrow::array::{
 	LargeStringArray, StringArray, TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array,
 	UInt64Array,
 };
-use arrow::datatypes::{DataType, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -79,6 +79,10 @@ pub const COLUMN_STATS_SMALL_SET_DEFAULT_MAX_DISTINCT_VALUES: u32 = 4096;
 pub const COLUMN_STATS_SMALL_SET_MAX_DISTINCT_VALUES: u32 = 4096;
 pub const COLUMN_STATS_SMALL_SET_DEFAULT_MAX_BYTES: u32 = 32 * 1024;
 pub const COLUMN_STATS_SMALL_SET_MAX_BYTES: u32 = 32 * 1024;
+pub const COLUMN_STATS_HEAVY_HITTER_DEFAULT_MAX_ENTRIES: u16 = 4096;
+pub const COLUMN_STATS_HEAVY_HITTER_MAX_ENTRIES: u16 = 4096;
+pub const COLUMN_STATS_HEAVY_HITTER_DEFAULT_MAX_BYTES: u32 = 32 * 1024;
+pub const COLUMN_STATS_HEAVY_HITTER_MAX_BYTES: u32 = 32 * 1024;
 pub const COLUMN_STATS_CIPHERTEXT_BUDGET_DIVISOR: u64 = 256;
 pub const COLUMN_STATS_DESCRIPTOR_SLAB_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 pub const COLUMN_STATS_CSB_AEAD_TAG_BYTES: u64 = 16;
@@ -480,6 +484,7 @@ impl PbcRejectCode {
 	pub const PBC_REJECT_STATS_FORMAT_VERSION: Self = Self(0x3908);
 	pub const PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH: Self = Self(0x3909);
 	pub const PBC_REJECT_STATS_DECRYPT_FAILED: Self = Self(0x390A);
+	pub const PBC_REJECT_STATS_HEAVY_HITTER_INVALID: Self = Self(0x390B);
 	// ADR 045 reject codes for append-only table operations.
 	pub const PBC_REJECT_APPEND_ONLY_UPDATE: Self = Self(0x3A01);
 	pub const PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY: Self = Self(0x3A02);
@@ -524,6 +529,7 @@ impl PbcRejectCode {
 			0x3908 => "PBC_REJECT_STATS_FORMAT_VERSION",
 			0x3909 => "PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH",
 			0x390A => "PBC_REJECT_STATS_DECRYPT_FAILED",
+			0x390B => "PBC_REJECT_STATS_HEAVY_HITTER_INVALID",
 			0x3A01 => "PBC_REJECT_APPEND_ONLY_UPDATE",
 			0x3A02 => "PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY",
 			0x3A03 => "PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW",
@@ -1327,6 +1333,8 @@ pub struct ColumnStatsPolicyV1 {
 	pub bloom_filters: Vec<ColumnBloomSpecV1>,
 	pub hll_distincts: Vec<ColumnHllSpecV1>,
 	pub small_sets: Vec<ColumnSmallSetSpecV1>,
+	#[serde(default)]
+	pub heavy_hitters: Vec<ColumnHeavyHitterSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1401,6 +1409,36 @@ impl ColumnSmallSetSpecV1 {
 			column_name: column_name.into(),
 			max_distinct_values: SmallSetValueCap::new(max_distinct_values)?,
 			max_bytes: SmallSetByteCap::new(max_bytes)?,
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnHeavyHitterSpec {
+	pub column_name: String,
+	pub max_entries: u16,
+	pub max_bytes: u32,
+}
+
+impl ColumnHeavyHitterSpec {
+	pub fn new(column_name: impl Into<String>) -> Self {
+		Self {
+			column_name: column_name.into(),
+			max_entries: COLUMN_STATS_HEAVY_HITTER_DEFAULT_MAX_ENTRIES,
+			max_bytes: COLUMN_STATS_HEAVY_HITTER_DEFAULT_MAX_BYTES,
+		}
+	}
+
+	pub fn with_caps(
+		column_name: impl Into<String>,
+		max_entries: u16,
+		max_bytes: u32,
+	) -> std::io::Result<Self> {
+		validate_heavy_hitter_caps(max_entries, max_bytes)?;
+		Ok(Self {
+			column_name: column_name.into(),
+			max_entries,
+			max_bytes,
 		})
 	}
 }
@@ -2661,6 +2699,7 @@ fn validate_stats_policy(schema: &Schema, policy: &ColumnStatsPolicyV1) -> std::
 	validate_bloom_stats_policy(schema, &policy.bloom_filters)?;
 	validate_hll_stats_policy(schema, &policy.hll_distincts)?;
 	validate_small_set_stats_policy(schema, &policy.small_sets)?;
+	validate_heavy_hitter_stats_policy(schema, &policy.heavy_hitters)?;
 	validate_stats_policy_budget(schema, policy)?;
 	Ok(())
 }
@@ -2739,6 +2778,11 @@ fn estimate_stats_policy_csb_ciphertext_bytes(
 	for spec in &policy.small_sets {
 		bytes = bytes
 			.checked_add(u64::from(spec.max_bytes.get()))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+	}
+	for spec in &policy.heavy_hitters {
+		bytes = bytes
+			.checked_add(u64::from(spec.max_bytes))
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
 	}
 	Ok(bytes)
@@ -2867,11 +2911,77 @@ fn validate_small_set_stats_policy(
 	Ok(())
 }
 
-fn validate_stats_policy_column_type(
+fn validate_heavy_hitter_stats_policy(
 	schema: &Schema,
+	specs: &[ColumnHeavyHitterSpec],
+) -> std::io::Result<()> {
+	let mut seen = BTreeSet::new();
+	for spec in specs {
+		validate_descriptor_name("stats heavy-hitter column", &spec.column_name)?;
+		if !seen.insert(spec.column_name.clone()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: duplicate heavy-hitter stats column {:?}",
+					PbcRejectCode::PBC_REJECT_STATS_DUPLICATE_COLUMN,
+					spec.column_name
+				),
+			));
+		}
+		if let Err(err) = validate_heavy_hitter_caps(spec.max_entries, spec.max_bytes) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: heavy-hitter stats limits for {:?} are invalid: {}",
+					PbcRejectCode::PBC_REJECT_STATS_HEAVY_HITTER_INVALID,
+					spec.column_name,
+					err
+				),
+			));
+		}
+		let field = validate_stats_policy_column_type(schema, &spec.column_name, "heavy-hitter")?;
+		if !is_supported_heavy_hitter_stats_type(field.data_type()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: heavy-hitter stats column {:?} uses unsupported V1 type {:?}",
+					PbcRejectCode::PBC_REJECT_STATS_UNSUPPORTED_TYPE,
+					spec.column_name,
+					field.data_type()
+				),
+			));
+		}
+	}
+	Ok(())
+}
+
+fn validate_heavy_hitter_caps(max_entries: u16, max_bytes: u32) -> std::io::Result<()> {
+	if max_entries == 0 || max_entries > COLUMN_STATS_HEAVY_HITTER_MAX_ENTRIES {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"heavy-hitter max_entries must be in 1..={}",
+				COLUMN_STATS_HEAVY_HITTER_MAX_ENTRIES
+			),
+		));
+	}
+	if max_bytes < 5 || max_bytes > COLUMN_STATS_HEAVY_HITTER_MAX_BYTES {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"heavy-hitter max_bytes must be in 5..={}",
+				COLUMN_STATS_HEAVY_HITTER_MAX_BYTES
+			),
+		));
+	}
+	Ok(())
+}
+
+fn validate_stats_policy_column_type<'a>(
+	schema: &'a Schema,
 	column_name: &str,
 	stat_kind: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<&'a Field> {
 	let field = schema.field_with_name(column_name).map_err(|_| {
 		Error::new(
 			ErrorKind::InvalidData,
@@ -2891,7 +3001,7 @@ fn validate_stats_policy_column_type(
 			),
 		));
 	}
-	Ok(())
+	Ok(field)
 }
 
 pub fn is_supported_column_stats_type(data_type: &DataType) -> bool {
@@ -2913,6 +3023,22 @@ pub fn is_supported_column_stats_type(data_type: &DataType) -> bool {
 			| DataType::LargeUtf8
 			| DataType::Binary
 			| DataType::LargeBinary
+	)
+}
+
+pub fn is_supported_heavy_hitter_stats_type(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Boolean
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::Date32
+			| DataType::Timestamp(TimeUnit::Millisecond, _)
+			| DataType::Timestamp(TimeUnit::Microsecond, _)
+			| DataType::Timestamp(TimeUnit::Nanosecond, _)
+			| DataType::Float32
+			| DataType::Float64
+			| DataType::Utf8
 	)
 }
 
@@ -4301,6 +4427,7 @@ mod tests {
 				bloom_filters: vec![ColumnBloomSpecV1::new("region")],
 				hll_distincts: vec![ColumnHllSpecV1::new("id")],
 				small_sets: vec![ColumnSmallSetSpecV1::new("active")],
+				heavy_hitters: vec![ColumnHeavyHitterSpec::new("active")],
 			},
 		)
 		.unwrap();
@@ -4410,6 +4537,24 @@ mod tests {
 				.contains("PBC_REJECT_STATS_SMALLSET_INVALID")
 		);
 
+		let invalid_heavy_hitter = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				heavy_hitters: vec![ColumnHeavyHitterSpec {
+					column_name: "id".into(),
+					max_entries: 0,
+					max_bytes: COLUMN_STATS_HEAVY_HITTER_DEFAULT_MAX_BYTES,
+				}],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			invalid_heavy_hitter
+				.to_string()
+				.contains("PBC_REJECT_STATS_HEAVY_HITTER_INVALID")
+		);
+
 		let budget = descriptor_with_stats(
 			&schema,
 			ColumnStatsPolicyV1 {
@@ -4459,6 +4604,13 @@ mod tests {
 			COLUMN_STATS_SMALL_SET_DEFAULT_MAX_BYTES
 		);
 		assert!(SmallSetByteCap::new(COLUMN_STATS_SMALL_SET_MAX_BYTES + 1).is_err());
+		assert!(ColumnHeavyHitterSpec::with_caps("id", 1, 5).is_ok());
+		assert!(ColumnHeavyHitterSpec::with_caps("id", 0, 5).is_err());
+		assert!(ColumnHeavyHitterSpec::with_caps("id", 1, 4).is_err());
+		assert!(
+			ColumnHeavyHitterSpec::with_caps("id", COLUMN_STATS_HEAVY_HITTER_MAX_ENTRIES + 1, 5)
+				.is_err()
+		);
 	}
 
 	#[test]

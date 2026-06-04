@@ -2544,28 +2544,6 @@ pub(crate) fn adr155_heavy_hitter_is_estimate_only_consumer() {
 
 #[test]
 pub(crate) fn adr155_no_wendelon_heavy_hitter_producer_or_count_min() {
-	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
-		.into_iter()
-		.filter(|(_, _, line)| {
-			[
-				"HeavyHitter",
-				"heavy_hitter",
-				"CountMin",
-				"Count-Min",
-				"TopK",
-				"top_k",
-				"frequency",
-			]
-			.iter()
-			.any(|marker| line.contains(marker))
-		})
-		.collect::<Vec<_>>();
-
-	assert!(
-		wendelon_offenders.is_empty(),
-		"ADR155 is Toron-consumer-only; Wendelon producer markers found: {wendelon_offenders:?}"
-	);
-
 	let count_min_offenders = source_lines(&manifest_dir().join("src"))
 		.into_iter()
 		.chain(source_lines(&wendelon_manifest_dir().join("src")))
@@ -2589,10 +2567,12 @@ pub(crate) fn adr155_descriptor_sync_emits_empty_heavy_hitter_facts() {
 
 	assert!(catalog.contains("ColumnHeavyHitterFact"));
 	assert!(catalog.contains("DescriptorColumnHeavyHitterFact"));
-	assert!(sync.contains("column_heavy_hitters: Vec::new()"));
+	assert!(sync.contains("descriptor_column_heavy_hitters_from_storage"));
+	assert!(catalog.contains("descriptor_sync_maps_supported_heavy_hitter_storage_facts"));
 	assert!(
-		!sync.contains("ColumnHeavyHitterFact {"),
-		"descriptor sync must stay dark until ADR156 producer lands"
+		catalog.contains(
+			"descriptor_sync_drops_invalid_zero_duplicate_or_over_base_heavy_hitter_fact"
+		)
 	);
 }
 

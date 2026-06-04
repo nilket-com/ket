@@ -1,5 +1,6 @@
 pub(crate) mod core_invariants;
 pub(crate) mod distributed_execution;
+pub(crate) mod heavy_hitter;
 pub(crate) mod network_tls;
 pub(crate) mod nominal_type_identity;
 pub(crate) mod null_semantics;

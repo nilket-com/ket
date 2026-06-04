@@ -191,6 +191,7 @@ fn stats_policy_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error
 		bloom_filters: vec![ColumnBloomSpecV1::new("region")],
 		hll_distincts: vec![ColumnHllSpecV1::new("region")],
 		small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+		heavy_hitters: Vec::new(),
 	};
 	descriptor.refresh_descriptor_fingerprints()?;
 	Ok(descriptor)

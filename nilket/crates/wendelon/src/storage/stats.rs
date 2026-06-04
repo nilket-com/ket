@@ -1,7 +1,8 @@
 use crate::schema::table::{
 	COLUMN_STATS_CSB_AEAD_TAG_BYTES, COLUMN_STATS_HLL_MAX_PRECISION,
-	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnHllSpecV1, ColumnSmallSetSpecV1,
-	TableObjectId, TableSchemaDescriptor, max_column_stats_block_ciphertext_bytes_for_slab_payload,
+	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnHeavyHitterSpec, ColumnHllSpecV1,
+	ColumnSmallSetSpecV1, TableObjectId, TableSchemaDescriptor,
+	max_column_stats_block_ciphertext_bytes_for_slab_payload,
 };
 pub use crate::schema::{
 	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
@@ -28,9 +29,11 @@ use arrow::datatypes::{
 };
 use arrow::record_batch::RecordBatch;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind};
 use std::time::Instant;
+
+use crate::storage::sketch::SpaceSaving;
 
 pub const COLUMN_STATS_BLOCK_MAGIC: [u8; 8] = *b"WNDSTAT1";
 pub const COLUMN_STATS_BLOCK_FORMAT_VERSION: u32 = 1;
@@ -56,7 +59,8 @@ pub const COLUMN_STAT_HAS_HLL: u16 = 1 << 5;
 pub const COLUMN_STAT_HAS_SMALL_SET: u16 = 1 << 6;
 pub const COLUMN_STAT_MIN_TRUNCATED: u16 = 1 << 7;
 pub const COLUMN_STAT_MAX_TRUNCATED: u16 = 1 << 8;
-pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1111_1110_0000_0000;
+pub const COLUMN_STAT_HAS_HEAVY_HITTERS: u16 = 1 << 9;
+pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1111_1100_0000_0000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnStatsBlockHeader {
@@ -119,6 +123,18 @@ pub struct ColumnStatsHllPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnStatsHeavyHitterEntry {
+	pub value_key: Vec<u8>,
+	pub frequency: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnStatsHeavyHitterPayload {
+	pub complete: bool,
+	pub entries: Vec<ColumnStatsHeavyHitterEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedColumnStatsPayload {
 	pub min: Option<Vec<u8>>,
 	pub max: Option<Vec<u8>>,
@@ -127,6 +143,7 @@ pub struct DecodedColumnStatsPayload {
 	pub bloom_filter: Option<ColumnStatsBloomPayload>,
 	pub hll_distinct: Option<ColumnStatsHllPayload>,
 	pub small_set: Option<Vec<Vec<u8>>>,
+	pub heavy_hitters: Option<ColumnStatsHeavyHitterPayload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -538,6 +555,7 @@ pub fn canonical_stats_for_array_slice(
 		None,
 		None,
 		None,
+		None,
 	)?;
 	Ok(Some(CanonicalStatsValues {
 		null_count: stats.null_count,
@@ -687,6 +705,11 @@ fn build_column_stats_block_internal(
 			.small_sets
 			.iter()
 			.find(|spec| spec.column_name.as_str() == field.name().as_str());
+		let heavy_hitter_spec = descriptor
+			.stats_policy
+			.heavy_hitters
+			.iter()
+			.find(|spec| spec.column_name.as_str() == field.name().as_str());
 		pending.push(build_pending_column_stats_entry(
 			column_ordinal,
 			field.as_ref(),
@@ -695,6 +718,7 @@ fn build_column_stats_block_internal(
 			bloom_spec,
 			hll_spec,
 			small_set_spec,
+			heavy_hitter_spec,
 			max_ciphertext_bytes.is_none(),
 		)?);
 	}
@@ -763,6 +787,15 @@ pub fn decode_column_stats_payload(
 	} else {
 		None
 	};
+	let heavy_hitters = if entry.stat_flags & COLUMN_STAT_HAS_HEAVY_HITTERS != 0 {
+		Some(read_heavy_hitters(
+			&entry.payload,
+			&mut cursor,
+			non_null_count,
+		)?)
+	} else {
+		None
+	};
 	if cursor != entry.payload.len() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -777,6 +810,7 @@ pub fn decode_column_stats_payload(
 		bloom_filter,
 		hll_distinct,
 		small_set,
+		heavy_hitters,
 	})
 }
 
@@ -979,9 +1013,11 @@ struct PendingColumnStatsEntry {
 	bloom: Option<Vec<u8>>,
 	hll: Option<Vec<u8>>,
 	small_set: Option<Vec<u8>>,
+	heavy_hitters: Option<Vec<u8>>,
 	select_bloom: bool,
 	select_hll: bool,
 	select_small_set: bool,
+	select_heavy_hitters: bool,
 }
 
 impl PendingColumnStatsEntry {
@@ -1004,6 +1040,12 @@ impl PendingColumnStatsEntry {
 				self.entry.payload.extend_from_slice(&payload);
 			}
 		}
+		if self.select_heavy_hitters {
+			if let Some(payload) = self.heavy_hitters.take() {
+				self.entry.stat_flags |= COLUMN_STAT_HAS_HEAVY_HITTERS;
+				self.entry.payload.extend_from_slice(&payload);
+			}
+		}
 		self.entry
 	}
 }
@@ -1013,6 +1055,7 @@ enum OptInStatKind {
 	SmallSet,
 	Bloom,
 	Hll,
+	HeavyHitters,
 }
 
 fn apply_opt_in_stats_budget(
@@ -1029,6 +1072,7 @@ fn apply_opt_in_stats_budget(
 		OptInStatKind::SmallSet,
 		OptInStatKind::Bloom,
 		OptInStatKind::Hll,
+		OptInStatKind::HeavyHitters,
 	] {
 		for entry in pending.iter_mut() {
 			maybe_select_opt_in_stat(entry, kind, &mut plaintext_len, max_plaintext_len)?;
@@ -1063,6 +1107,7 @@ fn maybe_select_opt_in_stat(
 		OptInStatKind::SmallSet => entry.small_set.as_ref().map(Vec::len),
 		OptInStatKind::Bloom => entry.bloom.as_ref().map(Vec::len),
 		OptInStatKind::Hll => entry.hll.as_ref().map(Vec::len),
+		OptInStatKind::HeavyHitters => entry.heavy_hitters.as_ref().map(Vec::len),
 	};
 	let Some(payload_len) = payload_len else {
 		return Ok(());
@@ -1078,6 +1123,7 @@ fn maybe_select_opt_in_stat(
 		OptInStatKind::SmallSet => entry.select_small_set = true,
 		OptInStatKind::Bloom => entry.select_bloom = true,
 		OptInStatKind::Hll => entry.select_hll = true,
+		OptInStatKind::HeavyHitters => entry.select_heavy_hitters = true,
 	}
 	Ok(())
 }
@@ -1092,6 +1138,7 @@ struct CollectedColumnStats {
 	bloom: Option<Vec<u8>>,
 	hll: Option<Vec<u8>>,
 	small_set: Option<Vec<u8>>,
+	heavy_hitters: Option<Vec<u8>>,
 }
 
 fn build_pending_column_stats_entry(
@@ -1102,6 +1149,7 @@ fn build_pending_column_stats_entry(
 	bloom_spec: Option<&ColumnBloomSpecV1>,
 	hll_spec: Option<&ColumnHllSpecV1>,
 	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
 	select_all_opt_ins: bool,
 ) -> std::io::Result<PendingColumnStatsEntry> {
 	let Some(arrow_type_tag) = arrow_stats_type_tag(field.data_type()) else {
@@ -1123,9 +1171,11 @@ fn build_pending_column_stats_entry(
 			bloom: None,
 			hll: None,
 			small_set: None,
+			heavy_hitters: None,
 			select_bloom: select_all_opt_ins,
 			select_hll: select_all_opt_ins,
 			select_small_set: select_all_opt_ins,
+			select_heavy_hitters: select_all_opt_ins,
 		});
 	};
 	let stats = collect_column_stats_in_one_pass(
@@ -1136,6 +1186,7 @@ fn build_pending_column_stats_entry(
 		bloom_spec,
 		hll_spec,
 		small_set_spec,
+		heavy_hitter_spec,
 	)?;
 	let mut stat_flags = COLUMN_STAT_HAS_NULL_COUNT | COLUMN_STAT_HAS_NON_NULL_COUNT;
 	let mut payload = Vec::new();
@@ -1165,9 +1216,11 @@ fn build_pending_column_stats_entry(
 		bloom: stats.bloom,
 		hll: stats.hll,
 		small_set: stats.small_set,
+		heavy_hitters: stats.heavy_hitters,
 		select_bloom: select_all_opt_ins,
 		select_hll: select_all_opt_ins,
 		select_small_set: select_all_opt_ins,
+		select_heavy_hitters: select_all_opt_ins,
 	})
 }
 
@@ -1179,6 +1232,7 @@ fn collect_column_stats_in_one_pass(
 	bloom_spec: Option<&ColumnBloomSpecV1>,
 	hll_spec: Option<&ColumnHllSpecV1>,
 	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
 	let null_count = column_stats_count(array.null_count(), "null_count")?;
 	let non_null_count = column_stats_count(
@@ -1194,6 +1248,7 @@ fn collect_column_stats_in_one_pass(
 				bloom_spec,
 				hll_spec,
 				small_set_spec,
+				heavy_hitter_spec,
 			);
 		}
 		DataType::Float64 => {
@@ -1204,6 +1259,7 @@ fn collect_column_stats_in_one_pass(
 				bloom_spec,
 				hll_spec,
 				small_set_spec,
+				heavy_hitter_spec,
 			);
 		}
 		_ => {}
@@ -1217,6 +1273,7 @@ fn collect_column_stats_in_one_pass(
 		.map(|spec| new_hll_distinct(spec.precision.get()))
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
+	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
 
 	for_each_encoded_non_null_value(data_type, array, |value| {
 		if min
@@ -1242,7 +1299,10 @@ fn collect_column_stats_in_one_pass(
 			hll_insert_encoded_value(hll, &value);
 		}
 		if let Some(small_set) = small_set.as_mut() {
-			small_set.insert(value)?;
+			small_set.insert(value.clone())?;
+		}
+		if let Some(heavy_hitters) = heavy_hitters.as_mut() {
+			heavy_hitters.insert(value)?;
 		}
 		Ok(())
 	})?;
@@ -1267,6 +1327,15 @@ fn collect_column_stats_in_one_pass(
 			Ok::<_, std::io::Error>(payload)
 		})
 		.transpose()?;
+	let heavy_hitters = heavy_hitters
+		.map(HeavyHitterCollector::finish)
+		.transpose()?
+		.map(|payload| {
+			let mut bytes = Vec::new();
+			encode_heavy_hitters(&mut bytes, &payload)?;
+			Ok::<_, std::io::Error>(bytes)
+		})
+		.transpose()?;
 
 	Ok(CollectedColumnStats {
 		min,
@@ -1278,6 +1347,7 @@ fn collect_column_stats_in_one_pass(
 		bloom,
 		hll,
 		small_set,
+		heavy_hitters,
 	})
 }
 
@@ -1288,6 +1358,7 @@ fn collect_float32_column_stats(
 	bloom_spec: Option<&ColumnBloomSpecV1>,
 	hll_spec: Option<&ColumnHllSpecV1>,
 	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
 	let typed = downcast_array::<Float32Array>(array)?;
 	let mut min = None::<f32>;
@@ -1299,6 +1370,7 @@ fn collect_float32_column_stats(
 		.map(|spec| new_hll_distinct(spec.precision.get()))
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
+	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
 	let mut saw_non_finite = false;
 
 	for row in 0..typed.len() {
@@ -1332,7 +1404,13 @@ fn collect_float32_column_stats(
 			_ => value,
 		});
 		let encoded = encode_float32_stat_value(value)?;
-		insert_opt_in_encoded_value(&encoded, &mut bloom, &mut hll, &mut small_set)?;
+		insert_opt_in_encoded_value(
+			&encoded,
+			&mut bloom,
+			&mut hll,
+			&mut small_set,
+			&mut heavy_hitters,
+		)?;
 	}
 
 	if saw_non_finite {
@@ -1350,6 +1428,7 @@ fn collect_float32_column_stats(
 		bloom,
 		hll,
 		small_set,
+		heavy_hitters,
 	)
 }
 
@@ -1360,6 +1439,7 @@ fn collect_float64_column_stats(
 	bloom_spec: Option<&ColumnBloomSpecV1>,
 	hll_spec: Option<&ColumnHllSpecV1>,
 	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
 	let typed = downcast_array::<Float64Array>(array)?;
 	let mut min = None::<f64>;
@@ -1371,6 +1451,7 @@ fn collect_float64_column_stats(
 		.map(|spec| new_hll_distinct(spec.precision.get()))
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
+	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
 	let mut saw_non_finite = false;
 
 	for row in 0..typed.len() {
@@ -1404,7 +1485,13 @@ fn collect_float64_column_stats(
 			_ => value,
 		});
 		let encoded = encode_float64_stat_value(value)?;
-		insert_opt_in_encoded_value(&encoded, &mut bloom, &mut hll, &mut small_set)?;
+		insert_opt_in_encoded_value(
+			&encoded,
+			&mut bloom,
+			&mut hll,
+			&mut small_set,
+			&mut heavy_hitters,
+		)?;
 	}
 
 	if saw_non_finite {
@@ -1422,6 +1509,7 @@ fn collect_float64_column_stats(
 		bloom,
 		hll,
 		small_set,
+		heavy_hitters,
 	)
 }
 
@@ -1430,6 +1518,7 @@ fn insert_opt_in_encoded_value(
 	bloom: &mut Option<ColumnStatsBloomPayload>,
 	hll: &mut Option<ColumnStatsHllPayload>,
 	small_set: &mut Option<SmallSetCollector>,
+	heavy_hitters: &mut Option<HeavyHitterCollector>,
 ) -> std::io::Result<()> {
 	if let Some(bloom) = bloom.as_mut()
 		&& bloom.bit_count != 0
@@ -1441,6 +1530,9 @@ fn insert_opt_in_encoded_value(
 	}
 	if let Some(small_set) = small_set.as_mut() {
 		small_set.insert(value.to_vec())?;
+	}
+	if let Some(heavy_hitters) = heavy_hitters.as_mut() {
+		heavy_hitters.insert(value.to_vec())?;
 	}
 	Ok(())
 }
@@ -1456,6 +1548,7 @@ fn counts_only_column_stats(null_count: u64, non_null_count: u64) -> CollectedCo
 		bloom: None,
 		hll: None,
 		small_set: None,
+		heavy_hitters: None,
 	}
 }
 
@@ -1469,6 +1562,7 @@ fn finish_collected_column_stats(
 	bloom: Option<ColumnStatsBloomPayload>,
 	hll: Option<ColumnStatsHllPayload>,
 	small_set: Option<SmallSetCollector>,
+	heavy_hitters: Option<HeavyHitterCollector>,
 ) -> std::io::Result<CollectedColumnStats> {
 	let bloom = bloom.map(|bloom| {
 		let mut payload = Vec::new();
@@ -1488,6 +1582,15 @@ fn finish_collected_column_stats(
 			Ok::<_, std::io::Error>(payload)
 		})
 		.transpose()?;
+	let heavy_hitters = heavy_hitters
+		.map(HeavyHitterCollector::finish)
+		.transpose()?
+		.map(|payload| {
+			let mut bytes = Vec::new();
+			encode_heavy_hitters(&mut bytes, &payload)?;
+			Ok::<_, std::io::Error>(bytes)
+		})
+		.transpose()?;
 	Ok(CollectedColumnStats {
 		min,
 		max,
@@ -1498,6 +1601,7 @@ fn finish_collected_column_stats(
 		bloom,
 		hll,
 		small_set,
+		heavy_hitters,
 	})
 }
 
@@ -1545,6 +1649,13 @@ pub fn locator_flags_for_parsed_column_stats_block(parsed: &ParsedColumnStatsBlo
 	{
 		flags |= 1 << 3;
 	}
+	if parsed
+		.columns
+		.iter()
+		.any(|entry| entry.stat_flags & COLUMN_STAT_HAS_HEAVY_HITTERS != 0)
+	{
+		flags |= 1 << 4;
+	}
 	flags
 }
 
@@ -1558,6 +1669,43 @@ fn encode_small_set(out: &mut Vec<u8>, values: &[Vec<u8>]) -> std::io::Result<()
 	out.extend_from_slice(&value_count.to_be_bytes());
 	for value in values {
 		encode_length_prefixed_bytes(out, value)?;
+	}
+	Ok(())
+}
+
+pub fn heavy_hitter_payload_encoded_len(
+	entries: &[ColumnStatsHeavyHitterEntry],
+) -> std::io::Result<usize> {
+	entries.iter().try_fold(1_usize + 4, |bytes, entry| {
+		bytes
+			.checked_add(4)
+			.and_then(|bytes| bytes.checked_add(entry.value_key.len()))
+			.and_then(|bytes| bytes.checked_add(8))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "CSB heavy-hitter byte overflow"))
+	})
+}
+
+fn encode_heavy_hitters(
+	out: &mut Vec<u8>,
+	payload: &ColumnStatsHeavyHitterPayload,
+) -> std::io::Result<()> {
+	out.push(u8::from(payload.complete));
+	let value_count = u32::try_from(payload.entries.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"CSB heavy-hitter value_count exceeds u32::MAX",
+		)
+	})?;
+	out.extend_from_slice(&value_count.to_be_bytes());
+	for entry in &payload.entries {
+		if entry.frequency == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"CSB heavy-hitter frequency must be non-zero",
+			));
+		}
+		encode_length_prefixed_bytes(out, &entry.value_key)?;
+		out.extend_from_slice(&entry.frequency.to_be_bytes());
 	}
 	Ok(())
 }
@@ -1932,6 +2080,92 @@ impl SmallSetCollector {
 	}
 }
 
+struct HeavyHitterCollector {
+	max_entries: usize,
+	max_bytes: usize,
+	candidates: SpaceSaving<Vec<u8>>,
+	frequencies: BTreeMap<Vec<u8>, u64>,
+}
+
+impl HeavyHitterCollector {
+	fn new(spec: &ColumnHeavyHitterSpec) -> Self {
+		let max_entries = usize::from(spec.max_entries);
+		Self {
+			max_entries,
+			max_bytes: spec.max_bytes as usize,
+			candidates: SpaceSaving::new(max_entries),
+			frequencies: BTreeMap::new(),
+		}
+	}
+
+	fn insert(&mut self, value: Vec<u8>) -> std::io::Result<()> {
+		self.candidates.insert(value.clone());
+		let frequency = self.frequencies.entry(value).or_insert(0);
+		*frequency = frequency.checked_add(1).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB heavy-hitter frequency overflow",
+			)
+		})?;
+		Ok(())
+	}
+
+	fn finish(self) -> std::io::Result<ColumnStatsHeavyHitterPayload> {
+		let all_entries = self
+			.frequencies
+			.iter()
+			.map(|(value_key, frequency)| ColumnStatsHeavyHitterEntry {
+				value_key: value_key.clone(),
+				frequency: *frequency,
+			})
+			.collect::<Vec<_>>();
+		if all_entries.len() <= self.max_entries
+			&& heavy_hitter_payload_encoded_len(&all_entries)? <= self.max_bytes
+		{
+			return Ok(ColumnStatsHeavyHitterPayload {
+				complete: true,
+				entries: all_entries,
+			});
+		}
+
+		let mut entries = self
+			.candidates
+			.keys()
+			.iter()
+			.filter_map(|key| {
+				self.frequencies
+					.get(key)
+					.map(|frequency| ColumnStatsHeavyHitterEntry {
+						value_key: key.clone(),
+						frequency: *frequency,
+					})
+			})
+			.collect::<Vec<_>>();
+		entries.sort_by(|left, right| {
+			right
+				.frequency
+				.cmp(&left.frequency)
+				.then_with(|| left.value_key.cmp(&right.value_key))
+		});
+		let mut selected = Vec::new();
+		for entry in entries {
+			if selected.len() >= self.max_entries {
+				break;
+			}
+			selected.push(entry);
+			if heavy_hitter_payload_encoded_len(&selected)? > self.max_bytes {
+				selected.pop();
+				break;
+			}
+		}
+		selected.sort_by(|left, right| left.value_key.cmp(&right.value_key));
+		Ok(ColumnStatsHeavyHitterPayload {
+			complete: false,
+			entries: selected,
+		})
+	}
+}
+
 #[cfg(test)]
 fn min_max_for_array(
 	data_type: &DataType,
@@ -1946,6 +2180,7 @@ fn min_max_for_array(
 		array,
 		arrow_type_tag,
 		prefix_cap,
+		None,
 		None,
 		None,
 		None,
@@ -2093,6 +2328,78 @@ fn read_small_set(bytes: &[u8], cursor: &mut usize) -> std::io::Result<Vec<Vec<u
 	Ok(values)
 }
 
+fn read_heavy_hitters(
+	bytes: &[u8],
+	cursor: &mut usize,
+	non_null_count: Option<u64>,
+) -> std::io::Result<ColumnStatsHeavyHitterPayload> {
+	let complete = *bytes.get(*cursor).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			"CSB payload truncated while reading heavy-hitter complete flag",
+		)
+	})?;
+	*cursor += 1;
+	let complete = match complete {
+		0 => false,
+		1 => true,
+		_ => {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB heavy-hitter complete flag must be 0 or 1",
+			));
+		}
+	};
+	let count_bytes = bytes.get(*cursor..*cursor + 4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			"CSB payload truncated while reading heavy-hitter value_count",
+		)
+	})?;
+	*cursor += 4;
+	let value_count = u32::from_be_bytes(count_bytes.try_into().expect("slice len")) as usize;
+	let mut entries = Vec::with_capacity(value_count);
+	let mut frequency_sum = 0_u64;
+	for _ in 0..value_count {
+		let value_key = read_length_prefixed_bytes(bytes, cursor)?;
+		if entries
+			.last()
+			.is_some_and(|previous: &ColumnStatsHeavyHitterEntry| previous.value_key >= value_key)
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB heavy-hitter values must be sorted and unique",
+			));
+		}
+		let frequency = read_u64_be(bytes, cursor, "heavy_hitter_frequency")?;
+		if frequency == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB heavy-hitter frequency must be non-zero",
+			));
+		}
+		frequency_sum = frequency_sum.checked_add(frequency).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"CSB heavy-hitter frequency sum overflow",
+			)
+		})?;
+		entries.push(ColumnStatsHeavyHitterEntry {
+			value_key,
+			frequency,
+		});
+	}
+	if let Some(non_null_count) = non_null_count
+		&& frequency_sum > non_null_count
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"CSB heavy-hitter frequency sum exceeds non_null_count",
+		));
+	}
+	Ok(ColumnStatsHeavyHitterPayload { complete, entries })
+}
+
 fn read_u64_be(bytes: &[u8], cursor: &mut usize, field: &str) -> std::io::Result<u64> {
 	let value = bytes.get(*cursor..*cursor + 8).ok_or_else(|| {
 		Error::new(
@@ -2108,11 +2415,11 @@ fn read_u64_be(bytes: &[u8], cursor: &mut usize, field: &str) -> std::io::Result
 mod tests {
 	use super::*;
 	use crate::schema::table::{
-		BloomBitsPerRow, ColumnHllSpecV1, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, HllPrecision,
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		SmallSetByteCap, SmallSetValueCap,
+		BloomBitsPerRow, ColumnHeavyHitterSpec, ColumnHllSpecV1, ColumnSmallSetSpecV1,
+		ColumnStatsPolicyV1, HllPrecision, LocalityPolicy, PrimaryKeyDescriptorV1,
+		RowIdentityPolicy, SchemaEvolutionPolicyV1, SmallSetByteCap, SmallSetValueCap,
 	};
-	use arrow::array::{Float32Array, Float64Array, Int64Array, LargeStringArray};
+	use arrow::array::{Float32Array, Float64Array, Int64Array, LargeStringArray, StringArray};
 	use arrow::datatypes::{Field, Schema};
 	use std::sync::Arc;
 
@@ -2766,6 +3073,7 @@ mod tests {
 			}],
 			hll_distincts: vec![ColumnHllSpecV1::new("region")],
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			heavy_hitters: Vec::new(),
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -2805,6 +3113,7 @@ mod tests {
 			bloom_filter: decoded.bloom_filter,
 			hll_distinct: None,
 			small_set: None,
+			heavy_hitters: None,
 		};
 		assert_eq!(
 			distinct_count_for_column_stats_payload(&bloom_only).unwrap(),
@@ -2865,6 +3174,7 @@ mod tests {
 			}],
 			hll_distincts: vec![ColumnHllSpecV1::new("region")],
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			heavy_hitters: Vec::new(),
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -3439,5 +3749,159 @@ mod tests {
 			prune_by_encoded_any_of(region, &[b"mx".to_vec()]).unwrap(),
 			ColumnStatsPrune::MayMatch
 		);
+	}
+
+	#[test]
+	fn heavy_hitter_stats_build_counts_emitted_keys_exactly() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::Utf8, true),
+		]);
+		let mut descriptor = stats_descriptor(&schema);
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			heavy_hitters: vec![ColumnHeavyHitterSpec::with_caps("region", 4, 128).unwrap()],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)]))
+					as Arc<dyn Array>,
+				Arc::new(StringArray::from(vec![
+					Some("hot"),
+					Some("cold"),
+					Some("hot"),
+					None,
+				])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+
+		let encoded = build_always_on_column_stats_block(&descriptor, &batch).unwrap();
+		let parsed = parse_column_stats_block(&encoded).unwrap();
+		assert_ne!(
+			locator_flags_for_parsed_column_stats_block(&parsed) & (1 << 4),
+			0
+		);
+		let region = &parsed.columns[1];
+		assert_ne!(region.stat_flags & COLUMN_STAT_HAS_HEAVY_HITTERS, 0);
+		let decoded = decode_column_stats_payload(region).unwrap();
+		let heavy_hitters = decoded.heavy_hitters.expect("heavy-hitter payload");
+		assert!(heavy_hitters.complete);
+		assert_eq!(
+			heavy_hitters.entries,
+			vec![
+				ColumnStatsHeavyHitterEntry {
+					value_key: b"cold".to_vec(),
+					frequency: 1,
+				},
+				ColumnStatsHeavyHitterEntry {
+					value_key: b"hot".to_vec(),
+					frequency: 2,
+				},
+			]
+		);
+	}
+
+	#[test]
+	fn heavy_hitter_complete_flag_requires_exact_distinct_and_byte_fit() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::Utf8, true),
+		]);
+		let mut descriptor = stats_descriptor(&schema);
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			heavy_hitters: vec![ColumnHeavyHitterSpec::with_caps("region", 1, 128).unwrap()],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema.clone()),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])) as Arc<dyn Array>,
+				Arc::new(StringArray::from(vec![
+					Some("hot"),
+					Some("cold"),
+					Some("hot"),
+				])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let encoded = build_always_on_column_stats_block(&descriptor, &batch).unwrap();
+		let parsed = parse_column_stats_block(&encoded).unwrap();
+		let heavy_hitters = decode_column_stats_payload(&parsed.columns[1])
+			.unwrap()
+			.heavy_hitters
+			.expect("heavy-hitter payload");
+		assert!(!heavy_hitters.complete);
+
+		let mut byte_capped = descriptor.clone();
+		byte_capped.stats_policy = ColumnStatsPolicyV1 {
+			heavy_hitters: vec![ColumnHeavyHitterSpec::with_caps("region", 4, 5).unwrap()],
+			..ColumnStatsPolicyV1::default()
+		};
+		byte_capped.refresh_descriptor_fingerprints().unwrap();
+		let encoded = build_always_on_column_stats_block(&byte_capped, &batch).unwrap();
+		let parsed = parse_column_stats_block(&encoded).unwrap();
+		let heavy_hitters = decode_column_stats_payload(&parsed.columns[1])
+			.unwrap()
+			.heavy_hitters
+			.expect("heavy-hitter payload");
+		assert!(!heavy_hitters.complete);
+		assert!(heavy_hitters.entries.is_empty());
+	}
+
+	#[test]
+	fn heavy_hitter_payload_rejects_zero_duplicate_or_over_count() {
+		let base_flags = COLUMN_STAT_HAS_NULL_COUNT
+			| COLUMN_STAT_HAS_NON_NULL_COUNT
+			| COLUMN_STAT_HAS_HEAVY_HITTERS;
+		let mut zero = Vec::new();
+		zero.extend_from_slice(&0_u64.to_be_bytes());
+		zero.extend_from_slice(&1_u64.to_be_bytes());
+		zero.push(1);
+		zero.extend_from_slice(&1_u32.to_be_bytes());
+		encode_length_prefixed_bytes(&mut zero, b"hot").unwrap();
+		zero.extend_from_slice(&0_u64.to_be_bytes());
+		let entry = ColumnStatsBlockEntry {
+			column_ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_UTF8,
+			stat_flags: base_flags,
+			payload: zero,
+		};
+		assert!(decode_column_stats_payload(&entry).is_err());
+
+		let mut duplicate = Vec::new();
+		duplicate.extend_from_slice(&0_u64.to_be_bytes());
+		duplicate.extend_from_slice(&3_u64.to_be_bytes());
+		duplicate.push(1);
+		duplicate.extend_from_slice(&2_u32.to_be_bytes());
+		for value in [b"hot".as_slice(), b"hot".as_slice()] {
+			encode_length_prefixed_bytes(&mut duplicate, value).unwrap();
+			duplicate.extend_from_slice(&1_u64.to_be_bytes());
+		}
+		let entry = ColumnStatsBlockEntry {
+			column_ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_UTF8,
+			stat_flags: base_flags,
+			payload: duplicate,
+		};
+		assert!(decode_column_stats_payload(&entry).is_err());
+
+		let mut over_count = Vec::new();
+		over_count.extend_from_slice(&0_u64.to_be_bytes());
+		over_count.extend_from_slice(&1_u64.to_be_bytes());
+		over_count.push(1);
+		over_count.extend_from_slice(&1_u32.to_be_bytes());
+		encode_length_prefixed_bytes(&mut over_count, b"hot").unwrap();
+		over_count.extend_from_slice(&2_u64.to_be_bytes());
+		let entry = ColumnStatsBlockEntry {
+			column_ordinal: 1,
+			arrow_type_tag: ARROW_STATS_TAG_UTF8,
+			stat_flags: base_flags,
+			payload: over_count,
+		};
+		assert!(decode_column_stats_payload(&entry).is_err());
 	}
 }

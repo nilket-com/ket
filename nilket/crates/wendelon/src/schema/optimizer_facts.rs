@@ -36,6 +36,8 @@ pub struct TableOptimizerFacts {
 	pub column_ndv: Vec<ColumnNdvFact>,
 	#[serde(default)]
 	pub column_range: Vec<ColumnRangeFact>,
+	#[serde(default)]
+	pub column_heavy_hitters: Vec<ColumnHeavyHitterFact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +54,19 @@ pub struct ColumnRangeFact {
 	pub non_null_count: u64,
 	pub min: Option<Vec<u8>>,
 	pub max: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnHeavyHitterFact {
+	pub column_ordinal: u16,
+	pub arrow_type_tag: u8,
+	pub entries: Vec<ColumnHeavyHitterEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ColumnHeavyHitterEntry {
+	pub value_key: Vec<u8>,
+	pub frequency: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +97,35 @@ struct TableOptimizerFactsWithoutRowBound {
 	pub column_range: Vec<ColumnRangeFact>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TableOptimizerFactsWithoutHeavyHitters {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub row_upper_bound: Option<u64>,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+}
+
+impl From<TableOptimizerFactsWithoutHeavyHitters> for TableOptimizerFacts {
+	fn from(facts: TableOptimizerFactsWithoutHeavyHitters) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: facts.row_upper_bound,
+			column_ndv: facts.column_ndv,
+			column_range: facts.column_range,
+			column_heavy_hitters: Vec::new(),
+		}
+	}
+}
+
 impl From<TableOptimizerFactsWithoutRowBound> for TableOptimizerFacts {
 	fn from(facts: TableOptimizerFactsWithoutRowBound) -> Self {
 		Self {
@@ -92,6 +136,7 @@ impl From<TableOptimizerFactsWithoutRowBound> for TableOptimizerFacts {
 			row_upper_bound: None,
 			column_ndv: facts.column_ndv,
 			column_range: facts.column_range,
+			column_heavy_hitters: Vec::new(),
 		}
 	}
 }
@@ -106,6 +151,7 @@ impl From<LegacyTableOptimizerFacts> for TableOptimizerFacts {
 			row_upper_bound: None,
 			column_ndv: facts.column_ndv,
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		}
 	}
 }
@@ -284,19 +330,26 @@ pub fn encode_table_optimizer_facts(facts: &TableOptimizerFacts) -> std::io::Res
 pub fn decode_table_optimizer_facts(bytes: &[u8]) -> std::io::Result<TableOptimizerFacts> {
 	match postcard::from_bytes(bytes) {
 		Ok(facts) => Ok(facts),
-		Err(new_err) => match postcard::from_bytes::<TableOptimizerFactsWithoutRowBound>(bytes) {
-			Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
-			Err(without_row_err) => postcard::from_bytes::<LegacyTableOptimizerFacts>(bytes)
-				.map(TableOptimizerFacts::from)
-				.map_err(|legacy_err| {
-					Error::new(
-						ErrorKind::InvalidData,
-						format!(
-							"failed to decode table optimizer facts: {new_err}; without-row-bound decode also failed: {without_row_err}; legacy decode also failed: {legacy_err}"
-						),
-					)
-				}),
-		},
+		Err(new_err) => {
+			match postcard::from_bytes::<TableOptimizerFactsWithoutHeavyHitters>(bytes) {
+				Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+				Err(without_heavy_err) => {
+					match postcard::from_bytes::<TableOptimizerFactsWithoutRowBound>(bytes) {
+						Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+						Err(without_row_err) => postcard::from_bytes::<LegacyTableOptimizerFacts>(bytes)
+							.map(TableOptimizerFacts::from)
+							.map_err(|legacy_err| {
+								Error::new(
+									ErrorKind::InvalidData,
+									format!(
+										"failed to decode table optimizer facts: {new_err}; without-heavy-hitters decode also failed: {without_heavy_err}; without-row-bound decode also failed: {without_row_err}; legacy decode also failed: {legacy_err}"
+									),
+								)
+							}),
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -383,6 +436,7 @@ mod tests {
 		assert_eq!(decoded.row_upper_bound, None);
 		assert_eq!(decoded.column_ndv, legacy.column_ndv);
 		assert!(decoded.column_range.is_empty());
+		assert!(decoded.column_heavy_hitters.is_empty());
 	}
 
 	#[test]
@@ -402,10 +456,48 @@ mod tests {
 				min: Some(encode_signed_optimizer_fact_scalar(-5, 8).unwrap()),
 				max: Some(encode_signed_optimizer_fact_scalar(7, 8).unwrap()),
 			}],
+			column_heavy_hitters: Vec::new(),
 		};
 
 		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
 		assert_eq!(decode_table_optimizer_facts(&bytes).unwrap(), facts);
+	}
+
+	#[test]
+	fn table_optimizer_facts_round_trips_heavy_hitters_and_legacy_decodes_empty() {
+		let facts = TableOptimizerFacts {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_heavy_hitters: vec![ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: ARROW_STATS_TAG_UTF8,
+				entries: vec![ColumnHeavyHitterEntry {
+					value_key: b"hot".to_vec(),
+					frequency: 5,
+				}],
+			}],
+		};
+		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
+		assert_eq!(decode_table_optimizer_facts(&bytes).unwrap(), facts);
+
+		let without_heavy = TableOptimizerFactsWithoutHeavyHitters {
+			table_object_id: table_id(),
+			schema_generation: 7,
+			physical_descriptor_fingerprint: fingerprint(),
+			producer_epoch: 9,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+		};
+		let bytes = postcard::to_allocvec(&without_heavy).expect("encode without-heavy facts");
+		let decoded = decode_table_optimizer_facts(&bytes).expect("decode without-heavy facts");
+		assert_eq!(decoded.row_upper_bound, Some(12));
+		assert!(decoded.column_heavy_hitters.is_empty());
 	}
 
 	#[test]

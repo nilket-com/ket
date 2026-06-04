@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -178,7 +178,7 @@ impl DescriptorOptimizerFacts {
 	}
 }
 
-fn descriptor_optimizer_facts_from_storage(
+pub(crate) fn descriptor_optimizer_facts_from_storage(
 	facts: StorageTableOptimizerFacts,
 	descriptor: &wendelon_client::TableSchemaDescriptor,
 ) -> Option<DescriptorOptimizerFacts> {
@@ -221,6 +221,11 @@ fn descriptor_optimizer_facts_from_storage(
 			},
 		})
 		.collect();
+	let column_heavy_hitters = descriptor_column_heavy_hitters_from_storage(
+		facts.column_heavy_hitters,
+		facts.row_upper_bound,
+		descriptor,
+	);
 	Some(DescriptorOptimizerFacts {
 		schema_generation: facts.schema_generation,
 		physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
@@ -229,8 +234,110 @@ fn descriptor_optimizer_facts_from_storage(
 		row_upper_bound: facts.row_upper_bound.map(RowCount::new),
 		column_ndv,
 		column_range,
-		column_heavy_hitters: Vec::new(),
+		column_heavy_hitters,
 	})
+}
+
+fn descriptor_column_heavy_hitters_from_storage(
+	column_heavy_hitters: Vec<wendelon_client::ColumnHeavyHitterFact>,
+	row_upper_bound: Option<u64>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> Vec<DescriptorColumnHeavyHitterFact> {
+	let column_count = descriptor
+		.arrow_schema()
+		.map(|schema| schema.fields().len())
+		.unwrap_or(0);
+	column_heavy_hitters
+		.into_iter()
+		.filter_map(|fact| {
+			let column_ordinal = ColumnOrdinal(u32::from(fact.column_ordinal));
+			if (column_ordinal.0 as usize) >= column_count {
+				return None;
+			}
+			let mut entries = BTreeMap::new();
+			let mut frequency_sum = 0_u64;
+			for entry in fact.entries {
+				if entry.frequency == 0 {
+					return None;
+				}
+				let key =
+					scalar_literal_key_from_storage_fact(fact.arrow_type_tag, &entry.value_key)?;
+				if entries.insert(key, entry.frequency).is_some() {
+					return None;
+				}
+				frequency_sum = frequency_sum.checked_add(entry.frequency)?;
+			}
+			if entries.is_empty() {
+				return None;
+			}
+			if let Some(row_upper_bound) = row_upper_bound
+				&& frequency_sum > row_upper_bound
+			{
+				return None;
+			}
+			Some(DescriptorColumnHeavyHitterFact {
+				column_ordinal,
+				fact: ColumnHeavyHitterFact { entries },
+			})
+		})
+		.collect()
+}
+
+fn scalar_literal_key_from_storage_fact(tag: u8, bytes: &[u8]) -> Option<ScalarLiteralKey> {
+	match tag {
+		wendelon_client::ARROW_STATS_TAG_BOOLEAN => match bytes {
+			[0] => Some(ScalarLiteralKey::Boolean(false)),
+			[1] => Some(ScalarLiteralKey::Boolean(true)),
+			_ => None,
+		},
+		wendelon_client::ARROW_STATS_TAG_INT32 => {
+			let value = wendelon_client::decode_signed_optimizer_fact_scalar(bytes)?;
+			Some(ScalarLiteralKey::Int32(i32::try_from(value).ok()?))
+		}
+		wendelon_client::ARROW_STATS_TAG_INT64 => Some(ScalarLiteralKey::Int64(
+			wendelon_client::decode_signed_optimizer_fact_scalar(bytes)?,
+		)),
+		wendelon_client::ARROW_STATS_TAG_DATE32 => {
+			let value = wendelon_client::decode_signed_optimizer_fact_scalar(bytes)?;
+			Some(ScalarLiteralKey::Date32(i32::try_from(value).ok()?))
+		}
+		wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MILLISECOND => {
+			Some(ScalarLiteralKey::Timestamp(
+				TimeUnit::Millisecond,
+				wendelon_client::decode_signed_optimizer_fact_scalar(bytes)?,
+			))
+		}
+		wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MICROSECOND => {
+			Some(ScalarLiteralKey::Timestamp(
+				TimeUnit::Microsecond,
+				wendelon_client::decode_signed_optimizer_fact_scalar(bytes)?,
+			))
+		}
+		wendelon_client::ARROW_STATS_TAG_TIMESTAMP_NANOSECOND => Some(ScalarLiteralKey::Timestamp(
+			TimeUnit::Nanosecond,
+			wendelon_client::decode_signed_optimizer_fact_scalar(bytes)?,
+		)),
+		wendelon_client::ARROW_STATS_TAG_FLOAT32 => {
+			let value = wendelon_client::decode_float32_optimizer_fact_scalar(bytes)?;
+			if !value.is_finite() {
+				return None;
+			}
+			let value = if value == 0.0 { 0.0 } else { value };
+			Some(ScalarLiteralKey::Float32(value.to_bits()))
+		}
+		wendelon_client::ARROW_STATS_TAG_FLOAT64 => {
+			let value = wendelon_client::decode_float64_optimizer_fact_scalar(bytes)?;
+			if !value.is_finite() {
+				return None;
+			}
+			let value = if value == 0.0 { 0.0 } else { value };
+			Some(ScalarLiteralKey::Float64(value.to_bits()))
+		}
+		wendelon_client::ARROW_STATS_TAG_UTF8 => Some(ScalarLiteralKey::Utf8(
+			String::from_utf8(bytes.to_vec()).ok()?,
+		)),
+		_ => None,
+	}
 }
 
 fn descriptor_column_ndv(
@@ -3172,6 +3279,7 @@ mod tests {
 				},
 			}],
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3218,6 +3326,7 @@ mod tests {
 				min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(0, 4).unwrap()),
 				max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(99, 4).unwrap()),
 			}],
+			column_heavy_hitters: Vec::new(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3247,6 +3356,126 @@ mod tests {
 		assert_eq!(resolved.optimizer_facts.byte_upper_bound, None);
 	}
 
+	#[tokio::test]
+	async fn descriptor_sync_maps_supported_heavy_hitter_storage_facts() {
+		let descriptor = descriptor();
+		let facts = StorageTableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 17,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_heavy_hitters: vec![wendelon_client::ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				entries: vec![wendelon_client::ColumnHeavyHitterEntry {
+					value_key: wendelon_client::encode_signed_optimizer_fact_scalar(42, 4).unwrap(),
+					frequency: 5,
+				}],
+			}],
+		};
+		let client = Arc::new(
+			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
+				.with_optimizer_facts([Ok(Some(facts))]),
+		);
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor");
+
+		let fact = resolved
+			.optimizer_facts
+			.column_heavy_hitters
+			.get(&ColumnOrdinal(1))
+			.expect("amount heavy-hitter fact");
+		assert_eq!(fact.entries.get(&ScalarLiteralKey::Int32(42)), Some(&5));
+	}
+
+	#[test]
+	fn descriptor_sync_drops_invalid_zero_duplicate_or_over_base_heavy_hitter_fact() {
+		let descriptor = descriptor();
+		let valid_key = wendelon_client::encode_signed_optimizer_fact_scalar(42, 4).unwrap();
+		let invalid_facts = vec![
+			wendelon_client::ColumnHeavyHitterFact {
+				column_ordinal: 99,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				entries: vec![wendelon_client::ColumnHeavyHitterEntry {
+					value_key: valid_key.clone(),
+					frequency: 1,
+				}],
+			},
+			wendelon_client::ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_UINT32,
+				entries: vec![wendelon_client::ColumnHeavyHitterEntry {
+					value_key: vec![0, 0, 0, 1],
+					frequency: 1,
+				}],
+			},
+			wendelon_client::ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				entries: vec![wendelon_client::ColumnHeavyHitterEntry {
+					value_key: valid_key.clone(),
+					frequency: 0,
+				}],
+			},
+			wendelon_client::ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				entries: vec![
+					wendelon_client::ColumnHeavyHitterEntry {
+						value_key: valid_key.clone(),
+						frequency: 1,
+					},
+					wendelon_client::ColumnHeavyHitterEntry {
+						value_key: valid_key.clone(),
+						frequency: 1,
+					},
+				],
+			},
+			wendelon_client::ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+				entries: vec![wendelon_client::ColumnHeavyHitterEntry {
+					value_key: valid_key,
+					frequency: 13,
+				}],
+			},
+		];
+		let facts = descriptor_optimizer_facts_from_storage(
+			StorageTableOptimizerFacts {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+				producer_epoch: 17,
+				row_upper_bound: Some(12),
+				column_ndv: Vec::new(),
+				column_range: Vec::new(),
+				column_heavy_hitters: invalid_facts,
+			},
+			&descriptor,
+		)
+		.expect("storage facts map");
+
+		assert!(facts.column_heavy_hitters.is_empty());
+		assert!(
+			facts
+				.for_descriptor(&descriptor)
+				.column_heavy_hitters
+				.is_empty()
+		);
+	}
+
 	#[test]
 	fn produced_ndv_never_writes_hard_bound() {
 		let descriptor = descriptor();
@@ -3262,6 +3491,7 @@ mod tests {
 					distinct: StorageNdvFact::Exact { count: 4 },
 				}],
 				column_range: Vec::new(),
+				column_heavy_hitters: Vec::new(),
 			},
 			&descriptor,
 		)
@@ -3290,6 +3520,7 @@ mod tests {
 				row_upper_bound: Some(12),
 				column_ndv: Vec::new(),
 				column_range: Vec::new(),
+				column_heavy_hitters: Vec::new(),
 			},
 			&descriptor,
 		)
@@ -3314,6 +3545,7 @@ mod tests {
 				row_upper_bound: Some(0),
 				column_ndv: Vec::new(),
 				column_range: Vec::new(),
+				column_heavy_hitters: Vec::new(),
 			},
 			&descriptor,
 		)
@@ -3341,6 +3573,7 @@ mod tests {
 				distinct: StorageNdvFact::Exact { count: 4 },
 			}],
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		};
 		assert_eq!(
 			descriptor_optimizer_facts_from_storage(facts, &descriptor),
@@ -3358,6 +3591,7 @@ mod tests {
 				distinct: StorageNdvFact::Exact { count: 4 },
 			}],
 			column_range: Vec::new(),
+			column_heavy_hitters: Vec::new(),
 		};
 		assert_eq!(
 			descriptor_optimizer_facts_from_storage(facts, &descriptor),

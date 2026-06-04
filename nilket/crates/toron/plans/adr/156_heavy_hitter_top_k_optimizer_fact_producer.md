@@ -29,7 +29,7 @@ range/join selectivity, or Count-Min.
 
 **D2 — Opt-in per-column stats policy (default-empty, budgeted).** Extend
 `ColumnStatsPolicyV1` (`schema/table.rs:1326`, beside `bloom_filters`/`hll_distincts`/
-`small_sets`) with `heavy_hitters: Vec<ColumnHeavyHitterSpecV1 { column_name, max_entries,
+`small_sets`) with `heavy_hitters: Vec<ColumnHeavyHitterSpec { column_name, max_entries,
 max_bytes }>` + `validate_heavy_hitter_stats_policy` (mirror `validate_small_set_stats_policy`
 `:2663`: dup/unknown column reject, unsupported type reject, invalid caps reject, CSB budget
 counts `max_bytes`). **No default-policy flip** — top-k counting is costlier than min/max;

@@ -4,6 +4,7 @@ use crate::schema::aggregate::{
 use crate::schema::{HllPrecision, KllK};
 use crate::storage::ColumnStatsHllPayload;
 use crate::storage::stats::estimate_hll_distinct_count;
+use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +94,56 @@ fn hll_register_index_and_rank(hash: u64, precision: u8) -> (usize, u8) {
 	let max_rank = 64 - precision + 1;
 	let rank = (remaining.leading_zeros() + 1).min(u32::from(max_rank)) as u8;
 	(index, rank)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceSaving<K> {
+	capacity: usize,
+	counts: BTreeMap<K, u64>,
+}
+
+impl<K> SpaceSaving<K>
+where
+	K: Ord + Clone,
+{
+	pub fn new(capacity: usize) -> Self {
+		Self {
+			capacity,
+			counts: BTreeMap::new(),
+		}
+	}
+
+	pub fn insert(&mut self, key: K) {
+		if self.capacity == 0 {
+			return;
+		}
+		if let Some(count) = self.counts.get_mut(&key) {
+			*count = count.saturating_add(1);
+			return;
+		}
+		if self.counts.len() < self.capacity {
+			self.counts.insert(key, 1);
+			return;
+		}
+		let Some((evicted_key, evicted_count)) = self
+			.counts
+			.iter()
+			.min_by(|(left_key, left_count), (right_key, right_count)| {
+				left_count
+					.cmp(right_count)
+					.then_with(|| left_key.cmp(right_key))
+			})
+			.map(|(key, count)| (key.clone(), *count))
+		else {
+			return;
+		};
+		self.counts.remove(&evicted_key);
+		self.counts.insert(key, evicted_count.saturating_add(1));
+	}
+
+	pub fn keys(&self) -> Vec<K> {
+		self.counts.keys().cloned().collect()
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

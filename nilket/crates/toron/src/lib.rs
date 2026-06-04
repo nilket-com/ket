@@ -37,7 +37,8 @@ mod tests {
 		BroadcastBuildSide, JoinStrategyDecisionReason, PlannerConfig, bind, bind_with_trace,
 	};
 	use crate::catalog::{
-		ColumnHeavyHitterFact, DistinctCountFact, MockCatalog, TableOptimizerFacts,
+		Catalog, ColumnHeavyHitterFact, DistinctCountFact, MockCatalog, TableOptimizerFacts,
+		WendelonCatalog,
 	};
 	use crate::coordinator::DistributedQueryCoordinator;
 	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
@@ -1120,6 +1121,52 @@ mod tests {
 		}
 
 		#[tokio::test]
+		async fn produced_heavy_hitter_fact_makes_hot_key_filter_hash_without_seeding() {
+			let fixture = skewed_join_fixture_with_produced_storage_heavy_hitter_fact();
+			let auto_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_skewed_hot_key_binds_without_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto),
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
+						..PlannerConfig::default()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash produced-heavy-hitter skewed join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let run =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					PlannerConfig::default(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("produced heavy-hitter fact should execute as hash without replay");
+
+			assert!(
+				!run.replayed,
+				"produced heavy-hitter fact should hash up front without broadcast replay"
+			);
+			assert_skewed_join_matches_hash(&hash.results, &run.results);
+		}
+
+		#[tokio::test]
 		async fn stale_low_heavy_hitter_frequency_still_replays_as_hash() {
 			let fixture = skewed_join_fixture_with_heavy_hitter_frequency(100);
 			let auto_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
@@ -2006,7 +2053,7 @@ mod tests {
 	}
 
 	struct SkewedJoinFixture {
-		catalog: Arc<MockCatalog>,
+		catalog: Arc<dyn Catalog>,
 		storage: Arc<dyn StorageScan>,
 		actual_hot_rows: usize,
 	}
@@ -2028,6 +2075,69 @@ mod tests {
 		)]))
 	}
 
+	fn skewed_join_fixture_with_produced_storage_heavy_hitter_fact() -> SkewedJoinFixture {
+		const BASE_ROWS: usize = 10_000;
+		const HOT_ROWS: usize = 5_000;
+		const NDV: u64 = 100;
+
+		let orders_descriptor = named_descriptor(
+			1,
+			"orders",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("customer_id", DataType::Int64, false),
+			]),
+		);
+		let customers_descriptor = named_descriptor(
+			2,
+			"customers",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("region", DataType::Utf8, true),
+			]),
+		);
+		let storage_facts = wendelon_client::TableOptimizerFacts {
+			table_object_id: customers_descriptor.table_object_id,
+			schema_generation: customers_descriptor.schema_generation,
+			physical_descriptor_fingerprint: customers_descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 156,
+			row_upper_bound: Some(BASE_ROWS as u64),
+			column_ndv: vec![wendelon_client::ColumnNdvFact {
+				column_ordinal: 1,
+				distinct: wendelon_client::NdvFact::Exact { count: NDV },
+			}],
+			column_range: Vec::new(),
+			column_heavy_hitters: vec![wendelon_client::ColumnHeavyHitterFact {
+				column_ordinal: 1,
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_UTF8,
+				entries: vec![wendelon_client::ColumnHeavyHitterEntry {
+					value_key: b"hot".to_vec(),
+					frequency: HOT_ROWS as u64,
+				}],
+			}],
+		};
+		let descriptor_facts = crate::catalog::descriptor_optimizer_facts_from_storage(
+			storage_facts,
+			&customers_descriptor,
+		)
+		.expect("storage optimizer facts map through descriptor sync");
+		assert!(
+			!descriptor_facts.column_heavy_hitters.is_empty(),
+			"storage-mapped heavy-hitter fact should be non-empty"
+		);
+		let catalog = WendelonCatalog::from_descriptors_with_optimizer_facts([
+			(TableId(1), orders_descriptor, None),
+			(TableId(2), customers_descriptor, Some(descriptor_facts)),
+		])
+		.expect("descriptor registry with produced heavy-hitter facts");
+
+		SkewedJoinFixture {
+			catalog: Arc::new(catalog),
+			storage: skewed_join_storage(BASE_ROWS, HOT_ROWS, NDV),
+			actual_hot_rows: HOT_ROWS,
+		}
+	}
+
 	fn skewed_join_fixture_with_heavy_hitters(
 		column_heavy_hitters: BTreeMap<ColumnOrdinal, ColumnHeavyHitterFact>,
 	) -> SkewedJoinFixture {
@@ -2035,42 +2145,6 @@ mod tests {
 		const HOT_ROWS: usize = 5_000;
 		const NDV: u64 = 100;
 
-		let orders_schema = Arc::new(Schema::new(vec![
-			Field::new("id", DataType::Int64, false),
-			Field::new("customer_id", DataType::Int64, false),
-		]));
-		let customers_schema = Arc::new(Schema::new(vec![
-			Field::new("id", DataType::Int64, false),
-			Field::new("region", DataType::Utf8, true),
-		]));
-		let orders = RecordBatch::try_new(
-			orders_schema,
-			vec![
-				Arc::new(Int64Array::from_iter_values(0..BASE_ROWS as i64)),
-				Arc::new(Int64Array::from_iter_values(0..BASE_ROWS as i64)),
-			],
-		)
-		.expect("skewed orders");
-		let mut regions = Vec::with_capacity(BASE_ROWS);
-		for row in 0..BASE_ROWS {
-			if row < HOT_ROWS {
-				regions.push(Some("hot".to_string()));
-			} else {
-				let tail = (row - HOT_ROWS) % (NDV as usize - 1);
-				regions.push(Some(format!("tail_{tail}")));
-			}
-		}
-		let customers = RecordBatch::try_new(
-			customers_schema,
-			vec![
-				Arc::new(Int64Array::from_iter_values(0..BASE_ROWS as i64)),
-				Arc::new(StringArray::from(regions)),
-			],
-		)
-		.expect("skewed customers");
-		let storage = Arc::new(MultiTableStorageScan {
-			tables: HashMap::from([(TableId(1), orders), (TableId(2), customers)]),
-		});
 		let mut catalog = join_catalog_inner();
 		catalog
 			.seed_optimizer_facts(
@@ -2087,9 +2161,48 @@ mod tests {
 
 		SkewedJoinFixture {
 			catalog: Arc::new(catalog),
-			storage,
+			storage: skewed_join_storage(BASE_ROWS, HOT_ROWS, NDV),
 			actual_hot_rows: HOT_ROWS,
 		}
+	}
+
+	fn skewed_join_storage(base_rows: usize, hot_rows: usize, ndv: u64) -> Arc<dyn StorageScan> {
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let customers_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::Utf8, true),
+		]));
+		let orders = RecordBatch::try_new(
+			orders_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..base_rows as i64)),
+				Arc::new(Int64Array::from_iter_values(0..base_rows as i64)),
+			],
+		)
+		.expect("skewed orders");
+		let mut regions = Vec::with_capacity(base_rows);
+		for row in 0..base_rows {
+			if row < hot_rows {
+				regions.push(Some("hot".to_string()));
+			} else {
+				let tail = (row - hot_rows) % (ndv as usize - 1);
+				regions.push(Some(format!("tail_{tail}")));
+			}
+		}
+		let customers = RecordBatch::try_new(
+			customers_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..base_rows as i64)),
+				Arc::new(StringArray::from(regions)),
+			],
+		)
+		.expect("skewed customers");
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([(TableId(1), orders), (TableId(2), customers)]),
+		})
 	}
 
 	fn outer_join_counterexample_catalog() -> Arc<MockCatalog> {
@@ -2407,7 +2520,7 @@ mod tests {
 
 	async fn run_local_join_query_with_catalog_config(
 		plan: LogicalPlan,
-		catalog: Arc<MockCatalog>,
+		catalog: Arc<dyn Catalog>,
 		planner_config: PlannerConfig,
 	) -> Vec<RecordBatch> {
 		let bound = bind(&plan, catalog.as_ref(), &planner_config)
@@ -2422,7 +2535,7 @@ mod tests {
 	async fn run_distributed_join_query_with_catalog_config(
 		plan: LogicalPlan,
 		connections: usize,
-		catalog: Arc<MockCatalog>,
+		catalog: Arc<dyn Catalog>,
 		planner_config: PlannerConfig,
 	) -> Vec<RecordBatch> {
 		run_distributed_join_query_with_catalog_config_and_budget(
@@ -2454,7 +2567,7 @@ mod tests {
 	async fn run_distributed_join_query_with_catalog_config_and_budget(
 		plan: LogicalPlan,
 		_connections: usize,
-		catalog: Arc<MockCatalog>,
+		catalog: Arc<dyn Catalog>,
 		planner_config: PlannerConfig,
 		query_budget: QueryBudget,
 	) -> Result<Vec<RecordBatch>, QueryError> {
@@ -2530,7 +2643,7 @@ mod tests {
 
 	async fn run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
 		plan: LogicalPlan,
-		catalog: Arc<MockCatalog>,
+		catalog: Arc<dyn Catalog>,
 		planner_config: PlannerConfig,
 		query_budget: QueryBudget,
 		storage: Arc<dyn StorageScan>,
@@ -2602,7 +2715,7 @@ mod tests {
 
 	async fn run_distributed_attempts_with_replay_signal(
 		plan: LogicalPlan,
-		catalog: Arc<MockCatalog>,
+		catalog: Arc<dyn Catalog>,
 		registry: Arc<StaticWorkerRegistry>,
 		memory: Arc<MemoryManager>,
 		mut planner_config: PlannerConfig,
@@ -2691,7 +2804,7 @@ mod tests {
 
 	async fn assert_skewed_hot_key_binds_as_estimated_broadcast(
 		plan: &LogicalPlan,
-		catalog: &MockCatalog,
+		catalog: &dyn Catalog,
 	) {
 		let (_bound, trace) = bind_with_trace(plan, catalog, &PlannerConfig::default())
 			.await
@@ -2713,7 +2826,7 @@ mod tests {
 
 	async fn assert_skewed_hot_key_binds_without_estimated_broadcast(
 		plan: &LogicalPlan,
-		catalog: &MockCatalog,
+		catalog: &dyn Catalog,
 	) {
 		let (_bound, trace) = bind_with_trace(plan, catalog, &PlannerConfig::default())
 			.await

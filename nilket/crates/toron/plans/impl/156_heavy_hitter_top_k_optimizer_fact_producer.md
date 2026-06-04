@@ -21,7 +21,7 @@ consumer). All anchors verified on `main`.
 
 ## Phase 1 — Opt-in policy (schema/table.rs)
 
-`ColumnHeavyHitterSpecV1 { column_name, max_entries: u16, max_bytes: u32 }`; add
+`ColumnHeavyHitterSpec { column_name, max_entries: u16, max_bytes: u32 }`; add
 `heavy_hitters: Vec<…>` to `ColumnStatsPolicyV1` (`:1326`); `validate_heavy_hitter_stats_policy`
 (mirror `validate_small_set_stats_policy:2663`). Default empty; no policy flip.
 
