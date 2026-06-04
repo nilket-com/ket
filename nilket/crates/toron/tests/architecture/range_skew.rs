@@ -183,3 +183,86 @@ pub(crate) fn adr157_min_max_envelope_pruning_unchanged() {
 	assert!(binder.contains("range_outside_envelope_estimates_zero_without_hard_bound"));
 	assert!(binder.contains("min_max_envelope_pruning_still_correct_out_of_range_is_zero"));
 }
+
+#[test]
+pub(crate) fn adr141_139_140_replay_fences_untouched() {
+	let coordinator = coordinator_source();
+	let binder = binder_source();
+	let lib = lib_source();
+	let trigger = source_block(&coordinator, "fn broadcast_cap_replay_trigger");
+	let config = source_block(&binder, "pub struct PlannerConfig");
+
+	assert!(trigger.contains("BudgetDimension::BroadcastReplication"));
+	assert!(!trigger.contains("ShuffleBytes"));
+	assert!(coordinator.contains("let mut retried_broadcast_replay = false"));
+	assert!(config.contains("force_hash_join_ids: BTreeSet<JoinReplayId>"));
+	assert!(lib.contains("ndv_underestimate_over_cap_replays_as_hash"));
+}
+
+#[test]
+pub(crate) fn adr154_uniform_ndv_math_stays_current_behavior() {
+	let binder = binder_source();
+	let equality = source_block(&binder, "fn equality_ndv_estimated_row_count");
+	let in_list = source_block(&binder, "fn in_list_ndv_estimated_row_count");
+	let estimator = source_block(&binder, "fn estimated_rows_for_ndv");
+	let lib = lib_source();
+
+	assert!(equality.contains("estimated_rows_for_ndv"));
+	assert!(equality.contains("distinct_count.point_estimate()"));
+	assert!(in_list.contains("estimated_rows_for_ndv"));
+	assert!(in_list.contains("distinct_literal_count"));
+	assert!(estimator.contains("let divisor = u128::from(ndv.max(1))"));
+	assert!(estimator.contains("/ divisor"));
+	assert!(binder.contains("skewed_hot_key_filter_records_uniform_ndv_miss"));
+	assert!(binder.contains("uniform_ndv_hot_key_in_list_miss_is_measured"));
+	assert!(lib.contains("uniform_ndv_hot_key_miss_triggers_broadcast_replay"));
+	assert!(lib.contains("uniform_ndv_miss_within_headroom_is_absorbed_no_replay"));
+	assert!(binder.contains("missing_heavy_hitter_fact_preserves_141_148_uniform_ndv_behavior"));
+}
+
+#[test]
+pub(crate) fn adr154_no_public_filter_explain_surface() {
+	let binder = binder_source();
+	let explain_schema = source_block(&binder, "fn optimizer_explain_schema");
+	let explain_plan = source_block(&binder, "fn optimizer_explain_plan");
+
+	assert!(explain_schema.contains("\"join_index\""));
+	assert!(explain_schema.contains("\"strategy\""));
+	assert!(explain_schema.contains("\"reason\""));
+	for forbidden in [
+		"filter_index",
+		"estimated_rows",
+		"actual_rows",
+		"ndv",
+		"hot_key",
+		"skew",
+	] {
+		assert!(
+			!explain_schema.contains(forbidden),
+			"optimizer EXPLAIN schema gained filter/skew column {forbidden}"
+		);
+	}
+	assert!(explain_plan.contains("join_decisions"));
+	assert!(!explain_plan.contains("filter_estimates"));
+}
+
+#[test]
+pub(crate) fn adr154_estimate_channel_and_replay_fences_untouched() {
+	let binder = binder_source();
+	let coordinator = coordinator_source();
+	let with_estimate = source_block(&binder, "fn with_estimated_row_count");
+	let build_candidate = source_block(&binder, "fn build_byte_candidate");
+	let trigger = source_block(&coordinator, "fn broadcast_cap_replay_trigger");
+	let lib = lib_source();
+
+	assert!(with_estimate.contains("estimated_row_count: Some(estimate)"));
+	assert!(!with_estimate.contains("byte_upper_bound: Some"));
+	assert!(
+		build_candidate.find("facts.byte_upper_bound").unwrap()
+			< build_candidate.find("estimated_byte_size").unwrap()
+	);
+	assert!(trigger.contains("BudgetDimension::BroadcastReplication"));
+	assert!(!trigger.contains("ShuffleBytes"));
+	assert!(binder.contains("skew_miss_measurement_does_not_change_estimated_row_count"));
+	assert!(lib.contains("run_distributed_attempts_with_replay_signal"));
+}

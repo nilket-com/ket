@@ -4,6 +4,10 @@ fn catalog_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
 }
 
+fn binder_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
+}
+
 fn lib_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source")
 }
@@ -146,4 +150,59 @@ pub(crate) fn adr156_descriptor_sync_maps_heavy_hitters_fail_open() {
 		)
 	);
 	assert!(lib.contains("produced_heavy_hitter_fact_makes_hot_key_filter_hash_without_seeding"));
+}
+
+#[test]
+pub(crate) fn adr155_heavy_hitter_is_estimate_only_consumer() {
+	let binder = binder_source();
+	let equality = source_block(&binder, "fn heavy_hitter_equality_estimate");
+	let in_list = source_block(&binder, "fn heavy_hitter_in_list_estimate");
+	let tail = source_block(&binder, "fn heavy_hitter_uniform_tail_from_total");
+
+	assert!(binder.contains("fn column_heavy_hitter_for_input"));
+	assert!(binder.contains("fn heavy_hitter_total_frequency"));
+	assert!(binder.contains("hot_key_equality_uses_heavy_hitter_frequency"));
+	assert!(binder.contains("heavy_hitter_estimate_stays_estimate_channel_not_hard_bound"));
+	for block in [equality, in_list, tail] {
+		for forbidden in ["row_upper_bound", "byte_upper_bound", "EmptyRelation"] {
+			assert!(
+				!block.contains(forbidden),
+				"heavy-hitter consumer must not write hard-bound surface {forbidden}"
+			);
+		}
+	}
+}
+
+#[test]
+pub(crate) fn adr155_no_wendelon_heavy_hitter_producer_or_count_min() {
+	let count_min_offenders = source_lines(&manifest_dir().join("src"))
+		.into_iter()
+		.chain(source_lines(&wendelon_manifest_dir().join("src")))
+		.filter(|(_, _, line)| {
+			["CountMin", "Count-Min"]
+				.iter()
+				.any(|marker| line.contains(marker))
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		count_min_offenders.is_empty(),
+		"ADR155 must not introduce Count-Min sketch code: {count_min_offenders:?}"
+	);
+}
+
+#[test]
+pub(crate) fn adr155_descriptor_sync_emits_empty_heavy_hitter_facts() {
+	let catalog = catalog_source();
+	let sync = source_block(&catalog, "fn descriptor_optimizer_facts_from_storage");
+
+	assert!(catalog.contains("ColumnHeavyHitterFact"));
+	assert!(catalog.contains("DescriptorColumnHeavyHitterFact"));
+	assert!(sync.contains("descriptor_column_heavy_hitters_from_storage"));
+	assert!(catalog.contains("descriptor_sync_maps_supported_heavy_hitter_storage_facts"));
+	assert!(
+		catalog.contains(
+			"descriptor_sync_drops_invalid_zero_duplicate_or_over_base_heavy_hitter_fact"
+		)
+	);
 }
