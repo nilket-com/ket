@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–158 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–159 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,54 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 158 promoted; ADR 159 candidates
+### ADR 159 promoted; ADR 160 candidates
+
+ADR 159 promoted **Range-Distribution Optimizer Fact Producer + Activation** — builds the **live**
+producer to 158's bucket/CDF contract and **flips the dark consumer on**: a maintained **KLL** sketch
+per opt-in column, merged across tiered slabs, queried into equal-mass buckets at the wire. **Single
+cross-ring Toron ADR** — placement resolved Toron-home on the operator's **provenance principle**
+("would Wendelon build a maintained quantile sketch if Toron didn't exist? No → Toron-home"), overruling
+my own producer/consumer-split lean and Codex's full-relocate (the principle, not just the precedent,
+now lives in the placement convention). **F1 = KLL, forced by the merge model** (self-verified): slabs
+seal *independently*, so no slab knows the global domain → every boundary-carrying histogram
+(equi-depth, equi-width) is unmergeable across the tiered `ndv_fact_for_column`→`HllRegisters::merge`
+path → only **boundary-free KLL** survives; equal-mass buckets are derived *post-merge* from the global
+CDF. KLL is Wendelon-private aggregate-state (like HLL registers); only buckets cross
+`TABLE_OPTIMIZER_FACTS_GET`. The same insight explains **why 159 is approximate where 156 was exact**:
+mergeability and exactness trade off — heavy-hitter keeps exactness by *declining* on incomplete;
+a full distribution **buys mergeability with rank-error** (`rank_error_ppm` = the price, honestly
+carried). **Coverage = all-contributors-or-decline** (the NDV/HLL pattern, no complete-flag) → partial
+coverage = absence → **158's proven dark min/max-uniform fallback fires**. Approximation can still miss,
+so the safety boundary is `rank_error_ppm` labeling, estimate-channel-only spending, and replay-backed
+recovery. **Opt-in policy**
+`ColumnRangeDistributionSpec { column_name, k: KllK }` on `ColumnStatsPolicyV1` (brand-clean, no new
+`*V1`; reuse existing `KllK` with `AGG_KLL_DEFAULT_K = 200` and bounds `64..=2048`;
+`rank_error_ppm` derived conservatively from the sketch/k); lowest-priority in
+`apply_opt_in_stats_budget`. **Fixed N=64 equal-mass buckets** on the wire (decoupled from `k`; honesty
+cap `N·rank_error ≲ 1`). Estimate-channel only (`adr136` hard-field
+markers gain **no** range entry). Every producer seam mirrors an HLL sibling (build `:1227`, encode/decode
+`:1718`/`:2284`, merge `manager.rs:695`, coverage `:5216`, policy `table.rs:1332`, budget `:1061`),
+so the cut is large but templated; Phase 4 is the one-line dark→live flip
+(`descriptor_optimizer_facts_from_storage` stops emitting empty). **Headline:**
+`produced_range_distribution_fact_makes_clustered_filter_hash_without_seeding` (mirrors 156's
+`lib.rs:1293`) — 157's clustered fixture ingested through the real producer across **≥2 sealed slabs**
+(`force_seal_active_for_test`) → estimates ~9_000 from live merged buckets → hashes, `replayed == false`;
+fails on `main`. Closes the **157→158→159 range-selectivity arc — range selectivity is now LIVE.**
+
+**ADR 160 lead candidates:** **Theta join-key intersection** (the join-cardinality arc — now unblocked
+by live single-column selectivity; heaviest, needs a set-sketch substrate for key-overlap estimation;
+the natural sequel to "range selectivity live"); **dimensioned `CONVERT` / linear units** (the parallel
+breadth track, de-risked, operator-energy, brainstorm 009); **Rune optimizer cockpit** (brainstorm 010 —
+the fact spine now carries NDV / min-max / top-k / **range-distribution + `rank_error_ppm`** receipts;
+the first concrete gauge surface, Rune-primary); **KLL `k` auto-tuning** (feedback loop from observed
+selectivity-miss → adjust per-column `k`; small, evidence-driven). **Council hygiene (carry):** the
+standalone architecture cleanup restored the full binary; keep the full `architecture_test` binary in the
+review checklist so targeted ADR runs do not mask cross-guard drift. **Forward arc:** `159 range
+selectivity live → Theta join-key intersection → join
+selectivity → reordering` · *(parallel: CONVERT/units; Rune cockpit, brainstorm 010)*. Evidence-gate 160
+on the 159 feat.
+
+### ADR 158 promoted; ADR 159 candidates (HISTORICAL)
 
 ADR 158 promoted **Range-Distribution Selectivity Consumer** — spends ADR 157's measured
 range-skew evidence: a **Toron-only consumer, built dark** (the 141/155 pattern), refining
