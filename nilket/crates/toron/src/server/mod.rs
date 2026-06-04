@@ -3396,6 +3396,7 @@ mod tests {
 			primary_key_columns: vec![ColumnOrdinal(0)],
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 		}
 	}

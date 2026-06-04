@@ -1236,6 +1236,7 @@ fn descriptor_bootstrap_optimizer_facts_are_sidecar_optional() {
 		row_upper_bound: Some(RowCount::new(1_000)),
 		column_ndv: Vec::new(),
 		column_range: Vec::new(),
+		column_range_distributions: Vec::new(),
 		column_heavy_hitters: Vec::new(),
 	};
 	let bootstrap = DescriptorBootstrap {
@@ -1275,6 +1276,7 @@ fn descriptor_bootstrap_optimizer_facts_column_ndv_defaults_when_missing() {
 		row_upper_bound: Some(RowCount::new(1_000)),
 		column_ndv: Vec::new(),
 		column_range: Vec::new(),
+		column_range_distributions: Vec::new(),
 		column_heavy_hitters: Vec::new(),
 	};
 	let bootstrap = DescriptorBootstrap {

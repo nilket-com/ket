@@ -57,7 +57,6 @@ pub(crate) fn adr157_range_selectivity_is_min_max_uniform_no_quantile_fact() {
 	assert!(real.contains("clip_real_lower"));
 	assert!(real.contains("ceil().max(1.0)"));
 	for forbidden in [
-		"ColumnRangeDistributionFact",
 		"ColumnQuantileFact",
 		"RangeDistributionPayload",
 		"column_quantiles",
@@ -80,17 +79,19 @@ pub(crate) fn adr157_range_selectivity_is_min_max_uniform_no_quantile_fact() {
 #[test]
 pub(crate) fn adr157_no_live_range_distribution_optimizer_fact_or_producer() {
 	let catalog = catalog_source();
+	let binder = binder_source();
 	let schema_facts = wendelon_optimizer_facts_source();
 	let manager = wendelon_manager_source();
 	let sketch = wendelon_sketch_source();
 	let descriptor_sync = source_block(&catalog, "fn descriptor_optimizer_facts_from_storage");
-	let descriptor_range = source_block(&catalog, "fn descriptor_column_range");
 	let table_optimizer_facts = source_block(&manager, "pub async fn table_optimizer_facts");
 
 	assert!(schema_facts.contains("pub struct ColumnRangeFact"));
 	assert!(sketch.contains("pub struct KllSketch"));
+	assert!(catalog.contains("pub struct ColumnRangeDistributionFact"));
+	assert!(binder.contains("fn column_range_distribution_for_input"));
+	assert!(descriptor_sync.contains("column_range_distributions: Vec::new()"));
 	for forbidden in [
-		"ColumnRangeDistributionFact",
 		"ColumnQuantileFact",
 		"RangeDistributionPayload",
 		"column_quantiles",
@@ -101,8 +102,8 @@ pub(crate) fn adr157_no_live_range_distribution_optimizer_fact_or_producer() {
 			"optimizer facts schema gained range-distribution marker {forbidden}"
 		);
 		assert!(
-			!descriptor_sync.contains(forbidden) && !descriptor_range.contains(forbidden),
-			"descriptor sync gained range-distribution marker {forbidden}"
+			!descriptor_sync.contains(forbidden),
+			"descriptor sync gained producer/sketch marker {forbidden}"
 		);
 		assert!(
 			!table_optimizer_facts.contains(forbidden),

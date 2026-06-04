@@ -113,6 +113,27 @@ pub struct DescriptorColumnRangeFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RangeDistributionBucket {
+	pub lower: Vec<u8>,
+	pub upper: Vec<u8>,
+	pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ColumnRangeDistributionFact {
+	pub arrow_type_tag: u8,
+	pub non_null_count: u64,
+	pub rank_error_ppm: u32,
+	pub buckets: Vec<RangeDistributionBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DescriptorColumnRangeDistributionFact {
+	pub column_ordinal: ColumnOrdinal,
+	pub fact: ColumnRangeDistributionFact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnHeavyHitterFact {
 	pub entries: BTreeMap<ScalarLiteralKey, u64>,
 }
@@ -129,6 +150,7 @@ pub struct TableOptimizerFacts {
 	pub row_upper_bound: Option<RowCount>,
 	pub column_ndv: BTreeMap<ColumnOrdinal, DistinctCountFact>,
 	pub column_range: BTreeMap<ColumnOrdinal, RangeFact>,
+	pub column_range_distributions: BTreeMap<ColumnOrdinal, ColumnRangeDistributionFact>,
 	pub column_heavy_hitters: BTreeMap<ColumnOrdinal, ColumnHeavyHitterFact>,
 }
 
@@ -143,6 +165,8 @@ pub struct DescriptorOptimizerFacts {
 	pub column_ndv: Vec<DescriptorColumnNdvFact>,
 	#[serde(default)]
 	pub column_range: Vec<DescriptorColumnRangeFact>,
+	#[serde(default)]
+	pub column_range_distributions: Vec<DescriptorColumnRangeDistributionFact>,
 	#[serde(default)]
 	pub column_heavy_hitters: Vec<DescriptorColumnHeavyHitterFact>,
 }
@@ -170,6 +194,10 @@ impl DescriptorOptimizerFacts {
 			row_upper_bound: self.row_upper_bound,
 			column_ndv: descriptor_column_ndv(self.column_ndv, descriptor),
 			column_range: descriptor_column_range(self.column_range, descriptor),
+			column_range_distributions: descriptor_column_range_distributions(
+				self.column_range_distributions,
+				descriptor,
+			),
 			column_heavy_hitters: descriptor_column_heavy_hitters(
 				self.column_heavy_hitters,
 				descriptor,
@@ -234,6 +262,7 @@ pub(crate) fn descriptor_optimizer_facts_from_storage(
 		row_upper_bound: facts.row_upper_bound.map(RowCount::new),
 		column_ndv,
 		column_range,
+		column_range_distributions: Vec::new(),
 		column_heavy_hitters,
 	})
 }
@@ -369,6 +398,132 @@ fn descriptor_column_range(
 		.filter(|fact| (fact.column_ordinal.0 as usize) < column_count)
 		.map(|fact| (fact.column_ordinal, fact.range))
 		.collect()
+}
+
+fn descriptor_column_range_distributions(
+	column_range_distributions: Vec<DescriptorColumnRangeDistributionFact>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> BTreeMap<ColumnOrdinal, ColumnRangeDistributionFact> {
+	let Ok(schema) = descriptor.arrow_schema() else {
+		return BTreeMap::new();
+	};
+	column_range_distributions
+		.into_iter()
+		.filter_map(|fact| {
+			let field = schema.fields().get(fact.column_ordinal.0 as usize)?;
+			if !range_distribution_tag_matches_data_type(
+				fact.fact.arrow_type_tag,
+				field.data_type(),
+			) {
+				return None;
+			}
+			valid_range_distribution_fact(&fact.fact).then_some((fact.column_ordinal, fact.fact))
+		})
+		.collect()
+}
+
+fn range_distribution_tag_matches_data_type(tag: u8, data_type: &DataType) -> bool {
+	match (tag, data_type) {
+		(wendelon_client::ARROW_STATS_TAG_INT32, DataType::Int32)
+		| (wendelon_client::ARROW_STATS_TAG_INT64, DataType::Int64)
+		| (wendelon_client::ARROW_STATS_TAG_DATE32, DataType::Date32)
+		| (wendelon_client::ARROW_STATS_TAG_FLOAT32, DataType::Float32)
+		| (wendelon_client::ARROW_STATS_TAG_FLOAT64, DataType::Float64) => true,
+		(
+			wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
+			DataType::Timestamp(TimeUnit::Millisecond, Some(timezone)),
+		)
+		| (
+			wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MICROSECOND,
+			DataType::Timestamp(TimeUnit::Microsecond, Some(timezone)),
+		)
+		| (
+			wendelon_client::ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
+			DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)),
+		) => timezone.as_ref() == "UTC",
+		_ => false,
+	}
+}
+
+fn valid_range_distribution_fact(fact: &ColumnRangeDistributionFact) -> bool {
+	if fact.non_null_count == 0 || fact.buckets.is_empty() {
+		return false;
+	}
+	let mut total = 0_u64;
+	let mut previous_upper: Option<RangeDistributionScalar> = None;
+	for bucket in &fact.buckets {
+		if bucket.count == 0 {
+			return false;
+		}
+		let Some(lower) = decode_range_distribution_scalar(fact.arrow_type_tag, &bucket.lower)
+		else {
+			return false;
+		};
+		let Some(upper) = decode_range_distribution_scalar(fact.arrow_type_tag, &bucket.upper)
+		else {
+			return false;
+		};
+		if lower > upper {
+			return false;
+		}
+		if previous_upper.is_some_and(|previous| previous >= lower) {
+			return false;
+		}
+		total = match total.checked_add(bucket.count) {
+			Some(total) if total <= fact.non_null_count => total,
+			_ => return false,
+		};
+		previous_upper = Some(upper);
+	}
+	true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+enum RangeDistributionScalar {
+	Integral(i128),
+	Real(f64),
+}
+
+fn decode_range_distribution_scalar(tag: u8, bytes: &[u8]) -> Option<RangeDistributionScalar> {
+	match tag {
+		wendelon_client::ARROW_STATS_TAG_INT32 if bytes.len() == 4 => {
+			wendelon_client::decode_signed_optimizer_fact_scalar(bytes)
+				.map(i128::from)
+				.map(RangeDistributionScalar::Integral)
+		}
+		wendelon_client::ARROW_STATS_TAG_INT64 if bytes.len() == 8 => {
+			wendelon_client::decode_signed_optimizer_fact_scalar(bytes)
+				.map(i128::from)
+				.map(RangeDistributionScalar::Integral)
+		}
+		wendelon_client::ARROW_STATS_TAG_DATE32 if bytes.len() == 4 => {
+			wendelon_client::decode_signed_optimizer_fact_scalar(bytes)
+				.map(i128::from)
+				.map(RangeDistributionScalar::Integral)
+		}
+		wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MILLISECOND
+		| wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MICROSECOND
+		| wendelon_client::ARROW_STATS_TAG_TIMESTAMP_NANOSECOND
+			if bytes.len() == 8 =>
+		{
+			wendelon_client::decode_signed_optimizer_fact_scalar(bytes)
+				.map(i128::from)
+				.map(RangeDistributionScalar::Integral)
+		}
+		wendelon_client::ARROW_STATS_TAG_FLOAT32 if bytes.len() == 4 => {
+			let value = wendelon_client::decode_float32_optimizer_fact_scalar(bytes)?;
+			value
+				.is_finite()
+				.then_some(RangeDistributionScalar::Real(f64::from(value)))
+		}
+		wendelon_client::ARROW_STATS_TAG_FLOAT64 if bytes.len() == 8 => {
+			let value = wendelon_client::decode_float64_optimizer_fact_scalar(bytes)?;
+			value
+				.is_finite()
+				.then_some(RangeDistributionScalar::Real(value))
+		}
+		_ => None,
+	}
 }
 
 fn descriptor_column_heavy_hitters(
@@ -3162,6 +3317,7 @@ mod tests {
 				row_upper_bound: Some(RowCount::new(1_000)),
 				column_ndv: Default::default(),
 				column_range: Default::default(),
+				column_range_distributions: Default::default(),
 				column_heavy_hitters: Default::default(),
 			}
 		);
@@ -3230,6 +3386,7 @@ mod tests {
 				row_upper_bound: Some(RowCount::new(0)),
 				column_ndv: Default::default(),
 				column_range: Default::default(),
+				column_range_distributions: Default::default(),
 				column_heavy_hitters: Default::default(),
 			}
 		);
@@ -4584,6 +4741,7 @@ mod tests {
 			row_upper_bound: rows.map(RowCount::new),
 			column_ndv: Vec::new(),
 			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 		}
 	}

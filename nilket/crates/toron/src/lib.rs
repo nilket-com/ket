@@ -37,8 +37,8 @@ mod tests {
 		BroadcastBuildSide, JoinStrategyDecisionReason, PlannerConfig, bind, bind_with_trace,
 	};
 	use crate::catalog::{
-		Catalog, ColumnHeavyHitterFact, DistinctCountFact, MockCatalog, RangeFact,
-		TableOptimizerFacts, WendelonCatalog,
+		Catalog, ColumnHeavyHitterFact, ColumnRangeDistributionFact, DistinctCountFact,
+		MockCatalog, RangeDistributionBucket, RangeFact, TableOptimizerFacts, WendelonCatalog,
 	};
 	use crate::coordinator::DistributedQueryCoordinator;
 	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
@@ -1184,6 +1184,51 @@ mod tests {
 		}
 
 		#[tokio::test]
+		async fn range_distribution_fact_makes_clustered_range_filter_hash_without_replay() {
+			let fixture = range_skew_join_fixture_with_range_distribution();
+			let auto_plan = range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto);
+			assert_range_distribution_binds_without_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					range_skew_fact_dim_join_plan(JoinStrategyIntent::Auto),
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0)]),
+						..range_distribution_hash_config()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash range-distribution join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let run =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					range_distribution_hash_config(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("range-distribution hash join should not replay");
+
+			assert!(
+				!run.replayed,
+				"distribution estimate should bind hash directly"
+			);
+			assert_range_skew_join_matches_hash(&hash.results, &run.results);
+		}
+
+		#[tokio::test]
 		async fn range_skew_evidence_uses_range_fact_not_heavy_hitter_or_ndv() {
 			let facts = range_skew_customers_optimizer_facts();
 			assert!(facts.column_ndv.is_empty());
@@ -2064,6 +2109,7 @@ mod tests {
 						row_upper_bound: None,
 						column_ndv: Default::default(),
 						column_range: Default::default(),
+						column_range_distributions: Default::default(),
 						column_heavy_hitters: Default::default(),
 					},
 				)
@@ -2094,6 +2140,7 @@ mod tests {
 					row_upper_bound: Some(RowCount::new(customers_row_upper_bound)),
 					column_ndv,
 					column_range: Default::default(),
+					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 				},
 			)
@@ -2278,6 +2325,7 @@ mod tests {
 					row_upper_bound: Some(RowCount::new(BASE_ROWS as u64)),
 					column_ndv: BTreeMap::from([(ColumnOrdinal(1), DistinctCountFact::Exact(NDV))]),
 					column_range: Default::default(),
+					column_range_distributions: Default::default(),
 					column_heavy_hitters,
 				},
 			)
@@ -2350,7 +2398,25 @@ mod tests {
 		}
 	}
 
+	fn range_skew_join_fixture_with_range_distribution() -> RangeSkewJoinFixture {
+		RangeSkewJoinFixture {
+			catalog: Arc::new(range_skew_join_catalog_with_customers_optimizer_facts(
+				range_skew_customers_optimizer_facts_with_range_distribution(),
+			)),
+			storage: range_skew_join_storage(),
+			actual_range_rows: RANGE_SKEW_CLUSTER_ROWS,
+		}
+	}
+
 	fn range_skew_join_catalog() -> MockCatalog {
+		range_skew_join_catalog_with_customers_optimizer_facts(
+			range_skew_customers_optimizer_facts(),
+		)
+	}
+
+	fn range_skew_join_catalog_with_customers_optimizer_facts(
+		customers_facts: TableOptimizerFacts,
+	) -> MockCatalog {
 		let mut catalog = MockCatalog::new();
 		catalog
 			.register_descriptor(
@@ -2379,10 +2445,7 @@ mod tests {
 			)
 			.unwrap();
 		catalog
-			.seed_optimizer_facts(
-				&crate::catalog::TableRef::new("customers"),
-				range_skew_customers_optimizer_facts(),
-			)
+			.seed_optimizer_facts(&crate::catalog::TableRef::new("customers"), customers_facts)
 			.expect("seed range-skew customers optimizer facts");
 		catalog
 	}
@@ -2393,6 +2456,21 @@ mod tests {
 			row_upper_bound: None,
 			column_ndv: Default::default(),
 			column_range: BTreeMap::from([(ColumnOrdinal(1), range_skew_amount_range_fact())]),
+			column_range_distributions: Default::default(),
+			column_heavy_hitters: Default::default(),
+		}
+	}
+
+	fn range_skew_customers_optimizer_facts_with_range_distribution() -> TableOptimizerFacts {
+		TableOptimizerFacts {
+			byte_upper_bound: None,
+			row_upper_bound: None,
+			column_ndv: Default::default(),
+			column_range: BTreeMap::from([(ColumnOrdinal(1), range_skew_amount_range_fact())]),
+			column_range_distributions: BTreeMap::from([(
+				ColumnOrdinal(1),
+				range_skew_amount_distribution_fact(),
+			)]),
 			column_heavy_hitters: Default::default(),
 		}
 	}
@@ -2410,6 +2488,38 @@ mod tests {
 				wendelon_client::encode_signed_optimizer_fact_scalar(RANGE_SKEW_ENVELOPE_HIGH, 8)
 					.unwrap(),
 			),
+		}
+	}
+
+	fn range_skew_amount_distribution_fact() -> ColumnRangeDistributionFact {
+		ColumnRangeDistributionFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+			non_null_count: RANGE_SKEW_BASE_ROWS as u64,
+			rank_error_ppm: 17,
+			buckets: vec![
+				range_skew_distribution_bucket(
+					RANGE_SKEW_FILTER_LOW,
+					RANGE_SKEW_FILTER_HIGH,
+					9_000,
+				),
+				range_skew_distribution_bucket(
+					RANGE_SKEW_FILTER_HIGH + 1,
+					RANGE_SKEW_ENVELOPE_HIGH,
+					1_000,
+				),
+			],
+		}
+	}
+
+	fn range_skew_distribution_bucket(
+		lower: i64,
+		upper: i64,
+		count: u64,
+	) -> RangeDistributionBucket {
+		RangeDistributionBucket {
+			lower: wendelon_client::encode_signed_optimizer_fact_scalar(lower, 8).unwrap(),
+			upper: wendelon_client::encode_signed_optimizer_fact_scalar(upper, 8).unwrap(),
+			count,
 		}
 	}
 
@@ -3160,6 +3270,35 @@ mod tests {
 				assert!(estimated_byte_size < threshold);
 			}
 			other => panic!("expected estimated broadcast for range skew, got {other:?}"),
+		}
+	}
+
+	async fn assert_range_distribution_binds_without_estimated_broadcast(
+		plan: &LogicalPlan,
+		catalog: &dyn Catalog,
+	) {
+		let (_bound, trace) = bind_with_trace(plan, catalog, &range_distribution_hash_config())
+			.await
+			.expect("bind range-distribution join with trace");
+		assert_eq!(trace.join_decisions.len(), 1);
+		assert_eq!(
+			trace.join_decisions[0].strategy,
+			JoinStrategy::HashPartitioned
+		);
+		assert!(
+			!matches!(
+				trace.join_decisions[0].reason,
+				JoinStrategyDecisionReason::BroadcastEstimated { .. }
+			),
+			"range distribution should not bind as BroadcastEstimated: {:?}",
+			trace.join_decisions[0].reason
+		);
+	}
+
+	fn range_distribution_hash_config() -> PlannerConfig {
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(32 * 1024)),
+			..PlannerConfig::default()
 		}
 	}
 

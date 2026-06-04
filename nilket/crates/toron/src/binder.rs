@@ -14,8 +14,8 @@ use crate::aggregate_kernel::{
 	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
 };
 use crate::catalog::{
-	Catalog, ColumnHeavyHitterFact, DistinctCountFact, RangeFact, TableBinding,
-	TableOptimizerFacts, TableRef, TableRowIdentity,
+	Catalog, ColumnHeavyHitterFact, ColumnRangeDistributionFact, DistinctCountFact, RangeFact,
+	TableBinding, TableOptimizerFacts, TableRef, TableRowIdentity,
 };
 use crate::distributed::budget::{ByteCount, QueryBudget};
 use crate::distributed::task::RowCount;
@@ -3838,6 +3838,12 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		.iter()
 		.map(|(ordinal, range)| (*ordinal, range.clone()))
 		.collect::<Vec<_>>();
+	let column_range_distributions = binding
+		.optimizer_facts
+		.column_range_distributions
+		.iter()
+		.map(|(ordinal, fact)| (*ordinal, fact.clone()))
+		.collect::<Vec<_>>();
 	let column_heavy_hitters = binding
 		.optimizer_facts
 		.column_heavy_hitters
@@ -3857,6 +3863,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		primary_key_columns: sorted_columns(&binding.primary_key_columns),
 		column_ndv,
 		column_range,
+		column_range_distributions,
 		column_heavy_hitters,
 	}
 }
@@ -4238,7 +4245,8 @@ fn filter_range_selectivity_estimated_row_count(
 	let mut estimate = None;
 	for (column, interval) in intervals {
 		let range = column_range_for_input(input, column)?;
-		let column_estimate = estimated_rows_for_range(range, interval)?;
+		let distribution = column_range_distribution_for_input(input, column);
+		let column_estimate = estimated_rows_for_range(range, distribution, interval)?;
 		estimate = min_optional_row_count(estimate, Some(column_estimate));
 	}
 	estimate
@@ -4556,7 +4564,29 @@ fn column_range_for_input(
 	}
 }
 
-fn estimated_rows_for_range(range: &RangeFact, interval: RangeInterval) -> Option<RowCount> {
+fn column_range_distribution_for_input(
+	input: &ExecutionPlan,
+	requested_column: ColumnOrdinal,
+) -> Option<&ColumnRangeDistributionFact> {
+	match input {
+		ExecutionPlan::Scan {
+			column_range_distributions,
+			..
+		} => column_range_distributions
+			.iter()
+			.find_map(|(column, fact)| (*column == requested_column).then_some(fact)),
+		ExecutionPlan::Filter { input, .. } => {
+			column_range_distribution_for_input(input, requested_column)
+		}
+		_ => None,
+	}
+}
+
+fn estimated_rows_for_range(
+	range: &RangeFact,
+	distribution: Option<&ColumnRangeDistributionFact>,
+	interval: RangeInterval,
+) -> Option<RowCount> {
 	if range.non_null_count == 0 {
 		return Some(RowCount::new(0));
 	}
@@ -4576,9 +4606,19 @@ fn estimated_rows_for_range(range: &RangeFact, interval: RangeInterval) -> Optio
 			max,
 			lower_inclusive,
 			upper_inclusive,
+			distribution,
+			range.arrow_type_tag,
 		),
 		(RangeScalar::Real(min), RangeScalar::Real(max), RangeInterval::Real { lower, upper }) => {
-			estimated_rows_for_real_range(range.non_null_count, min, max, lower, upper)
+			estimated_rows_for_real_range(
+				range.non_null_count,
+				min,
+				max,
+				lower,
+				upper,
+				distribution,
+				range.arrow_type_tag,
+			)
 		}
 		_ => None,
 	}
@@ -4590,6 +4630,8 @@ fn estimated_rows_for_integral_range(
 	envelope_high: i128,
 	lower_inclusive: Option<i128>,
 	upper_inclusive: Option<i128>,
+	distribution: Option<&ColumnRangeDistributionFact>,
+	arrow_type_tag: u8,
 ) -> Option<RowCount> {
 	if envelope_high < envelope_low {
 		return None;
@@ -4598,6 +4640,11 @@ fn estimated_rows_for_integral_range(
 	let high = upper_inclusive.unwrap_or(envelope_high).min(envelope_high);
 	if low > high {
 		return Some(RowCount::new(0));
+	}
+	if let Some(estimate) =
+		range_distribution_integral_estimate(distribution, arrow_type_tag, low, high)
+	{
+		return Some(estimate);
 	}
 	let domain_width = u128::try_from(envelope_high - envelope_low + 1).ok()?;
 	let overlap_width = u128::try_from(high - low + 1).ok()?;
@@ -4609,12 +4656,75 @@ fn estimated_rows_for_integral_range(
 	Some(RowCount::new(u64::try_from(estimate).unwrap_or(u64::MAX)))
 }
 
+fn range_distribution_integral_estimate(
+	distribution: Option<&ColumnRangeDistributionFact>,
+	arrow_type_tag: u8,
+	low: i128,
+	high: i128,
+) -> Option<RowCount> {
+	let fact = distribution?;
+	if fact.arrow_type_tag != arrow_type_tag || fact.non_null_count == 0 || fact.buckets.is_empty()
+	{
+		return None;
+	}
+	let mut total_count = 0_u64;
+	let mut estimated = 0_u64;
+	let mut previous_upper: Option<i128> = None;
+	for bucket in &fact.buckets {
+		if bucket.count == 0 {
+			return None;
+		}
+		let RangeScalar::Integral(bucket_low) =
+			decode_range_scalar(fact.arrow_type_tag, &bucket.lower)?
+		else {
+			return None;
+		};
+		let RangeScalar::Integral(bucket_high) =
+			decode_range_scalar(fact.arrow_type_tag, &bucket.upper)?
+		else {
+			return None;
+		};
+		if bucket_high < bucket_low {
+			return None;
+		}
+		if previous_upper.is_some_and(|previous| previous >= bucket_low) {
+			return None;
+		}
+		total_count = total_count.checked_add(bucket.count)?;
+		if total_count > fact.non_null_count {
+			return None;
+		}
+		let overlap_low = low.max(bucket_low);
+		let overlap_high = high.min(bucket_high);
+		if overlap_low <= overlap_high {
+			let bucket_estimate = if low <= bucket_low && bucket_high <= high {
+				bucket.count
+			} else {
+				let bucket_width =
+					u128::try_from(bucket_high.checked_sub(bucket_low)?.checked_add(1)?).ok()?;
+				let overlap_width =
+					u128::try_from(overlap_high.checked_sub(overlap_low)?.checked_add(1)?).ok()?;
+				let numerator = u128::from(bucket.count).checked_mul(overlap_width)?;
+				let estimate = numerator.div_ceil(bucket_width).max(1);
+				u64::try_from(estimate)
+					.unwrap_or(u64::MAX)
+					.min(bucket.count)
+			};
+			estimated = estimated.checked_add(bucket_estimate)?;
+		}
+		previous_upper = Some(bucket_high);
+	}
+	Some(RowCount::new(estimated.min(fact.non_null_count)))
+}
+
 fn estimated_rows_for_real_range(
 	non_null_count: u64,
 	envelope_low: f64,
 	envelope_high: f64,
 	lower: Option<FloatBound>,
 	upper: Option<FloatBound>,
+	distribution: Option<&ColumnRangeDistributionFact>,
+	arrow_type_tag: u8,
 ) -> Option<RowCount> {
 	if !envelope_low.is_finite() || !envelope_high.is_finite() || envelope_high < envelope_low {
 		return None;
@@ -4643,6 +4753,11 @@ fn estimated_rows_for_real_range(
 			RowCount::new(0)
 		});
 	}
+	if let Some(estimate) =
+		range_distribution_real_estimate(distribution, arrow_type_tag, low.value, high.value)
+	{
+		return Some(estimate);
+	}
 	let width = envelope_high - envelope_low;
 	if width <= 0.0 {
 		return None;
@@ -4658,6 +4773,75 @@ fn estimated_rows_for_real_range(
 		estimate as u64
 	};
 	Some(RowCount::new(estimate))
+}
+
+fn range_distribution_real_estimate(
+	distribution: Option<&ColumnRangeDistributionFact>,
+	arrow_type_tag: u8,
+	low: f64,
+	high: f64,
+) -> Option<RowCount> {
+	let fact = distribution?;
+	if fact.arrow_type_tag != arrow_type_tag || fact.non_null_count == 0 || fact.buckets.is_empty()
+	{
+		return None;
+	}
+	let mut total_count = 0_u64;
+	let mut estimated = 0_u64;
+	let mut previous_upper: Option<f64> = None;
+	for bucket in &fact.buckets {
+		if bucket.count == 0 {
+			return None;
+		}
+		let RangeScalar::Real(bucket_low) =
+			decode_range_scalar(fact.arrow_type_tag, &bucket.lower)?
+		else {
+			return None;
+		};
+		let RangeScalar::Real(bucket_high) =
+			decode_range_scalar(fact.arrow_type_tag, &bucket.upper)?
+		else {
+			return None;
+		};
+		if !bucket_low.is_finite() || !bucket_high.is_finite() || bucket_high <= bucket_low {
+			return None;
+		}
+		if previous_upper.is_some_and(|previous| previous >= bucket_low) {
+			return None;
+		}
+		total_count = total_count.checked_add(bucket.count)?;
+		if total_count > fact.non_null_count {
+			return None;
+		}
+		let overlap_low = low.max(bucket_low);
+		let overlap_high = high.min(bucket_high);
+		if overlap_low < overlap_high {
+			let bucket_estimate = if low <= bucket_low && bucket_high <= high {
+				bucket.count
+			} else {
+				let bucket_width = bucket_high - bucket_low;
+				let overlap_width = overlap_high - overlap_low;
+				if bucket_width <= 0.0 || overlap_width <= 0.0 {
+					return None;
+				}
+				let estimate = ((bucket.count as f64) * (overlap_width / bucket_width))
+					.ceil()
+					.max(1.0);
+				if !estimate.is_finite() {
+					return None;
+				}
+				if estimate > u64::MAX as f64 {
+					u64::MAX
+				} else {
+					estimate as u64
+				}
+				.min(bucket.count)
+			};
+			estimated = estimated.checked_add(bucket_estimate)?;
+		}
+		previous_upper = Some(bucket_high);
+	}
+	Some(RowCount::new(estimated.min(fact.non_null_count)))
 }
 
 fn real_interval_contains_value(
@@ -6149,6 +6333,7 @@ fn optimize_for_required(
 			primary_key_columns,
 			column_ndv,
 			column_range,
+			column_range_distributions,
 			column_heavy_hitters,
 		} => {
 			let all_columns = all_columns(&schema);
@@ -6175,6 +6360,12 @@ fn optimize_for_required(
 					remap.get(&column).copied().map(|mapped| (mapped, range))
 				})
 				.collect();
+			let column_range_distributions = column_range_distributions
+				.into_iter()
+				.filter_map(|(column, fact)| {
+					remap.get(&column).copied().map(|mapped| (mapped, fact))
+				})
+				.collect();
 			let column_heavy_hitters = column_heavy_hitters
 				.into_iter()
 				.filter_map(|(column, fact)| {
@@ -6196,6 +6387,7 @@ fn optimize_for_required(
 					primary_key_columns,
 					column_ndv,
 					column_range,
+					column_range_distributions,
 					column_heavy_hitters,
 				},
 				remap,
@@ -9173,8 +9365,8 @@ fn is_pbc_eligible_type(data_type: &DataType) -> bool {
 mod tests {
 	use super::*;
 	use crate::catalog::{
-		DescriptorColumnNdvFact, DescriptorColumnRangeFact, DescriptorOptimizerFacts, MockCatalog,
-		RangeFact, WendelonCatalog,
+		DescriptorColumnNdvFact, DescriptorColumnRangeDistributionFact, DescriptorColumnRangeFact,
+		DescriptorOptimizerFacts, MockCatalog, RangeDistributionBucket, RangeFact, WendelonCatalog,
 	};
 	use crate::distributed::arrow_ipc::encode_record_batch;
 	use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, TableId};
@@ -11190,6 +11382,7 @@ mod tests {
 			primary_key_columns: Vec::new(),
 			column_ndv: vec![(ColumnOrdinal(2), DistinctCountFact::Exact(100))],
 			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
 			column_heavy_hitters: vec![(
 				ColumnOrdinal(2),
 				utf8_heavy_hitter_fact(&[("hot", 5_000)]),
@@ -11224,6 +11417,52 @@ mod tests {
 				.get(&ScalarLiteralKey::Utf8("hot".to_string())),
 			Some(&5_000)
 		);
+	}
+
+	#[test]
+	fn range_distribution_fact_projection_remaps_with_scan_projection() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::Utf8, true),
+			Field::new("amount", DataType::Int64, true),
+		]));
+		let descriptor = named_descriptor(42, "customers", schema.as_ref().clone());
+		let plan = ExecutionPlan::Scan {
+			legacy_table_id: TableId(42),
+			table: descriptor.table_object_id,
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: None,
+			pbc_program: None,
+			row_limit: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: Vec::new(),
+			column_ndv: Vec::new(),
+			column_range: vec![(ColumnOrdinal(2), range_fact_i64(0, 10_000, 10_000))],
+			column_range_distributions: vec![(ColumnOrdinal(2), range_distribution_fact_i64(17))],
+			column_heavy_hitters: Vec::new(),
+		};
+
+		let (optimized, _) = optimize_for_required(plan, Some(BTreeSet::from([ColumnOrdinal(2)])))
+			.expect("optimize scan projection");
+		let ExecutionPlan::Scan {
+			projection,
+			schema,
+			column_range,
+			column_range_distributions,
+			..
+		} = optimized
+		else {
+			panic!("expected optimized scan");
+		};
+
+		assert_eq!(projection, Some(vec![ColumnOrdinal(2)]));
+		assert_eq!(schema.field(0).name(), "amount");
+		assert_eq!(column_range[0].0, ColumnOrdinal(0));
+		assert_eq!(column_range_distributions.len(), 1);
+		assert_eq!(column_range_distributions[0].0, ColumnOrdinal(0));
+		assert_eq!(column_range_distributions[0].1.rank_error_ppm, 17);
 	}
 
 	#[tokio::test]
@@ -12139,6 +12378,114 @@ mod tests {
 			estimate_materialized_byte_size(estimated_rows, scoped.plan.schema().as_ref())
 		);
 		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn absent_range_distribution_falls_back_to_min_max_uniform() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			None,
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 10_000, 10_000))],
+		);
+		let scoped = bind_filtered_customers(&catalog, customer_amount_between(0, 100))
+			.await
+			.expect("bind range filter without distribution");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(101)));
+	}
+
+	#[tokio::test]
+	async fn distribution_refines_in_envelope_min_max_still_zeroes_out_of_range() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range_distribution(
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 10_000, 10_000))],
+			vec![(ColumnOrdinal(1), range_distribution_fact_i64(17))],
+		);
+		let clustered = bind_filtered_customers(&catalog, customer_amount_between(0, 100))
+			.await
+			.expect("bind clustered range filter with distribution");
+		let outside = bind_filtered_customers(
+			&catalog,
+			Expr::Gt(
+				Box::new(customer_column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(20_000)))),
+			),
+		)
+		.await
+		.expect("bind out-of-envelope range filter with distribution");
+
+		assert_eq!(
+			clustered.facts.estimated_row_count,
+			Some(RowCount::new(9_000))
+		);
+		assert_eq!(outside.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert!(!matches!(outside.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn malformed_or_mismatched_range_distribution_fails_open() {
+		let uniform = Some(RowCount::new(101));
+		for fact in [
+			ColumnRangeDistributionFact {
+				arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+				non_null_count: 10_000,
+				rank_error_ppm: 17,
+				buckets: Vec::new(),
+			},
+			range_distribution_fact_i32(17),
+		] {
+			let catalog = descriptor_sidecar_join_catalog_with_customer_range_distribution(
+				vec![(ColumnOrdinal(1), range_fact_i64(0, 10_000, 10_000))],
+				vec![(ColumnOrdinal(1), fact)],
+			);
+			let scoped = bind_filtered_customers(&catalog, customer_amount_between(0, 100))
+				.await
+				.expect("bind malformed/mismatched range-distribution filter");
+
+			assert_eq!(scoped.facts.estimated_row_count, uniform);
+		}
+	}
+
+	#[tokio::test]
+	async fn range_distribution_estimate_stays_estimate_channel_not_hard_bound() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range_distribution(
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 10_000, 10_000))],
+			vec![(ColumnOrdinal(1), range_distribution_fact_i64(17))],
+		);
+		let scoped = bind_filtered_customers(&catalog, customer_amount_between(0, 100))
+			.await
+			.expect("bind clustered range filter with distribution");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(9_000)));
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn range_distribution_rank_error_is_visible_on_fact() {
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range_distribution(
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 10_000, 10_000))],
+			vec![(ColumnOrdinal(1), range_distribution_fact_i64(26_000))],
+		);
+		let plan = bind(
+			&LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			},
+			&catalog,
+			&PlannerConfig::default(),
+		)
+		.await
+		.expect("bind scan with range distribution");
+		let ExecutionPlan::Scan {
+			column_range_distributions,
+			..
+		} = plan
+		else {
+			panic!("expected scan");
+		};
+
+		assert_eq!(column_range_distributions.len(), 1);
+		assert_eq!(column_range_distributions[0].1.rank_error_ppm, 26_000);
 	}
 
 	#[tokio::test]
@@ -14237,6 +14584,7 @@ mod tests {
 			row_upper_bound: None,
 			column_ndv: Default::default(),
 			column_range: Default::default(),
+			column_range_distributions: Default::default(),
 			column_heavy_hitters: Default::default(),
 		};
 		catalog
@@ -15388,6 +15736,7 @@ mod tests {
 					row_upper_bound: None,
 					column_ndv: Default::default(),
 					column_range: Default::default(),
+					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 				},
 			)
@@ -15439,6 +15788,25 @@ mod tests {
 			]),
 			Vec::new(),
 			column_range,
+		)
+	}
+
+	fn descriptor_sidecar_join_catalog_with_customer_range_distribution(
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+		column_range_distributions: Vec<(ColumnOrdinal, ColumnRangeDistributionFact)>,
+	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_distributions_and_heavy_hitters(
+			Some(64 * 1024 * 1024),
+			None,
+			None,
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("amount", DataType::Int64, true),
+			]),
+			Vec::new(),
+			column_range,
+			column_range_distributions,
+			Vec::new(),
 		)
 	}
 
@@ -15565,6 +15933,28 @@ mod tests {
 		column_range: Vec<(ColumnOrdinal, RangeFact)>,
 		column_heavy_hitters: Vec<(ColumnOrdinal, ColumnHeavyHitterFact)>,
 	) -> WendelonCatalog {
+		descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_distributions_and_heavy_hitters(
+			orders_byte_upper_bound,
+			customers_byte_upper_bound,
+			customers_row_upper_bound,
+			customers_schema,
+			column_ndv,
+			column_range,
+			Vec::new(),
+			column_heavy_hitters,
+		)
+	}
+
+	fn descriptor_sidecar_join_catalog_with_customers_schema_ndv_range_distributions_and_heavy_hitters(
+		orders_byte_upper_bound: Option<u64>,
+		customers_byte_upper_bound: Option<u64>,
+		customers_row_upper_bound: Option<u64>,
+		customers_schema: Schema,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+		column_range_distributions: Vec<(ColumnOrdinal, ColumnRangeDistributionFact)>,
+		column_heavy_hitters: Vec<(ColumnOrdinal, ColumnHeavyHitterFact)>,
+	) -> WendelonCatalog {
 		let orders = named_descriptor(
 			1,
 			"orders",
@@ -15579,10 +15969,11 @@ mod tests {
 				TableId(1),
 				orders.clone(),
 				orders_byte_upper_bound.map(|bytes| {
-					descriptor_sidecar_facts(
+					descriptor_sidecar_facts_with_range_distributions(
 						&orders,
 						Some(bytes),
 						None,
+						Vec::new(),
 						Vec::new(),
 						Vec::new(),
 						Vec::new(),
@@ -15592,12 +15983,13 @@ mod tests {
 			(
 				TableId(2),
 				customers.clone(),
-				Some(descriptor_sidecar_facts(
+				Some(descriptor_sidecar_facts_with_range_distributions(
 					&customers,
 					customers_byte_upper_bound,
 					customers_row_upper_bound,
 					column_ndv,
 					column_range,
+					column_range_distributions,
 					column_heavy_hitters,
 				)),
 			),
@@ -15605,12 +15997,13 @@ mod tests {
 		.expect("descriptor-sidecar catalog")
 	}
 
-	fn descriptor_sidecar_facts(
+	fn descriptor_sidecar_facts_with_range_distributions(
 		descriptor: &TableSchemaDescriptor,
 		materialized_byte_upper_bound: Option<u64>,
 		row_upper_bound: Option<u64>,
 		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
 		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+		column_range_distributions: Vec<(ColumnOrdinal, ColumnRangeDistributionFact)>,
 		column_heavy_hitters: Vec<(ColumnOrdinal, ColumnHeavyHitterFact)>,
 	) -> DescriptorOptimizerFacts {
 		DescriptorOptimizerFacts {
@@ -15632,6 +16025,15 @@ mod tests {
 					column_ordinal,
 					range,
 				})
+				.collect(),
+			column_range_distributions: column_range_distributions
+				.into_iter()
+				.map(
+					|(column_ordinal, fact)| DescriptorColumnRangeDistributionFact {
+						column_ordinal,
+						fact,
+					},
+				)
 				.collect(),
 			column_heavy_hitters: column_heavy_hitters
 				.into_iter()
@@ -15669,6 +16071,56 @@ mod tests {
 			non_null_count,
 			min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(min, 8).unwrap()),
 			max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(max, 8).unwrap()),
+		}
+	}
+
+	fn range_distribution_fact_i64(rank_error_ppm: u32) -> ColumnRangeDistributionFact {
+		ColumnRangeDistributionFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+			non_null_count: 10_000,
+			rank_error_ppm,
+			buckets: vec![
+				range_distribution_bucket_i64(0, 100, 9_000),
+				range_distribution_bucket_i64(101, 10_000, 1_000),
+			],
+		}
+	}
+
+	fn range_distribution_fact_i32(rank_error_ppm: u32) -> ColumnRangeDistributionFact {
+		ColumnRangeDistributionFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT32,
+			non_null_count: 10_000,
+			rank_error_ppm,
+			buckets: vec![
+				range_distribution_bucket_i32(0, 100, 9_000),
+				range_distribution_bucket_i32(101, 10_000, 1_000),
+			],
+		}
+	}
+
+	fn range_distribution_bucket_i64(
+		lower: i64,
+		upper: i64,
+		count: u64,
+	) -> RangeDistributionBucket {
+		RangeDistributionBucket {
+			lower: wendelon_client::encode_signed_optimizer_fact_scalar(lower, 8).unwrap(),
+			upper: wendelon_client::encode_signed_optimizer_fact_scalar(upper, 8).unwrap(),
+			count,
+		}
+	}
+
+	fn range_distribution_bucket_i32(
+		lower: i32,
+		upper: i32,
+		count: u64,
+	) -> RangeDistributionBucket {
+		RangeDistributionBucket {
+			lower: wendelon_client::encode_signed_optimizer_fact_scalar(i64::from(lower), 4)
+				.unwrap(),
+			upper: wendelon_client::encode_signed_optimizer_fact_scalar(i64::from(upper), 4)
+				.unwrap(),
+			count,
 		}
 	}
 
