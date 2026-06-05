@@ -1472,13 +1472,18 @@ impl<'a> Binder<'a> {
 			&right_plan.scope,
 			&declared_output_schema,
 		);
-		let join_estimated_row_count = match (left_keys.as_slice(), right_keys.as_slice()) {
+		let join_estimated_row_count = match (
+			left_resolved_keys.as_slice(),
+			right_resolved_keys.as_slice(),
+		) {
 			([left_key], [right_key]) => join_output_ndv_containment_estimate(
 				kind,
 				&left_plan,
 				&right_plan,
-				*left_key,
-				*right_key,
+				left_key.column.ordinal,
+				right_key.column.ordinal,
+				&left_key.column.data_type,
+				&right_key.column.data_type,
 			),
 			_ => None,
 		};
@@ -4166,6 +4171,35 @@ fn clean_base_column_ndv_for_join_input(
 	})
 }
 
+fn clean_base_column_range_for_join_input(
+	input: &ExecutionPlan,
+	requested_output_column: ColumnOrdinal,
+) -> Option<RangeFact> {
+	let ExecutionPlan::Scan {
+		projection,
+		column_range,
+		..
+	} = input
+	else {
+		return None;
+	};
+
+	let descriptor_column = match projection {
+		Some(columns) => {
+			let requested_index = usize::try_from(requested_output_column.0).ok()?;
+			columns
+				.get(requested_index)
+				.copied()
+				.unwrap_or(requested_output_column)
+		}
+		None => requested_output_column,
+	};
+
+	column_range
+		.iter()
+		.find_map(|(column, range)| (*column == descriptor_column).then(|| range.clone()))
+}
+
 fn ndv_containment_join_rows(
 	left_rows: RowCount,
 	right_rows: RowCount,
@@ -4195,6 +4229,8 @@ fn join_output_ndv_containment_estimate(
 	right: &ScopedExecutionPlan,
 	left_key: ColumnOrdinal,
 	right_key: ColumnOrdinal,
+	left_key_type: &DataType,
+	right_key_type: &DataType,
 ) -> Option<RowCount> {
 	if kind != JoinKind::Inner
 		|| left.facts.origin != PlanOrigin::SingleBaseRelation
@@ -4210,7 +4246,95 @@ fn join_output_ndv_containment_estimate(
 	let left_ndv = clean_base_column_ndv_for_join_input(&left.plan, left_key)?;
 	let right_ndv = clean_base_column_ndv_for_join_input(&right.plan, right_key)?;
 
-	ndv_containment_join_rows(left_rows, right_rows, left_ndv, right_ndv)
+	let base = ndv_containment_join_rows(left_rows, right_rows, left_ndv, right_ndv)?;
+	let Some(left_range) = clean_base_column_range_for_join_input(&left.plan, left_key) else {
+		return Some(base);
+	};
+	let Some(right_range) = clean_base_column_range_for_join_input(&right.plan, right_key) else {
+		return Some(base);
+	};
+	range_refined_containment_join_rows(
+		base,
+		&left_range,
+		left_key_type,
+		&right_range,
+		right_key_type,
+	)
+	.or(Some(base))
+}
+
+fn range_refined_containment_join_rows(
+	base: RowCount,
+	left_range: &RangeFact,
+	left_key_type: &DataType,
+	right_range: &RangeFact,
+	right_key_type: &DataType,
+) -> Option<RowCount> {
+	let (overlap_width, min_width) =
+		join_key_range_overlap_fraction(left_range, left_key_type, right_range, right_key_type)?;
+	if min_width == 0 {
+		return None;
+	}
+	if overlap_width == 0 {
+		return Some(RowCount::new(0));
+	}
+	let refined = u128::from(base.get()).checked_mul(overlap_width)? / min_width;
+	let refined = if refined == 0 && base.get() > 0 {
+		1
+	} else {
+		refined
+	};
+	Some(RowCount::new(u64::try_from(refined).unwrap_or(u64::MAX)))
+}
+
+fn join_key_range_overlap_fraction(
+	left_range: &RangeFact,
+	left_key_type: &DataType,
+	right_range: &RangeFact,
+	right_key_type: &DataType,
+) -> Option<(u128, u128)> {
+	if !range_tag_matches_join_key_type(left_range.arrow_type_tag, left_key_type)
+		|| !range_tag_matches_join_key_type(right_range.arrow_type_tag, right_key_type)
+		|| left_range.arrow_type_tag != right_range.arrow_type_tag
+	{
+		return None;
+	}
+
+	let left_min = decode_range_scalar(left_range.arrow_type_tag, left_range.min.as_deref()?)?;
+	let left_max = decode_range_scalar(left_range.arrow_type_tag, left_range.max.as_deref()?)?;
+	let right_min = decode_range_scalar(right_range.arrow_type_tag, right_range.min.as_deref()?)?;
+	let right_max = decode_range_scalar(right_range.arrow_type_tag, right_range.max.as_deref()?)?;
+	let (
+		RangeScalar::Integral(left_min),
+		RangeScalar::Integral(left_max),
+		RangeScalar::Integral(right_min),
+		RangeScalar::Integral(right_max),
+	) = (left_min, left_max, right_min, right_max)
+	else {
+		return None;
+	};
+
+	let left_width = integral_range_width(left_min, left_max)?;
+	let right_width = integral_range_width(right_min, right_max)?;
+	let min_width = left_width.min(right_width);
+	if min_width == 0 {
+		return None;
+	}
+
+	let overlap_low = left_min.max(right_min);
+	let overlap_high = left_max.min(right_max);
+	if overlap_high < overlap_low {
+		return Some((0, 1));
+	}
+	let overlap_width = integral_range_width(overlap_low, overlap_high)?;
+	Some((overlap_width, min_width))
+}
+
+fn integral_range_width(low: i128, high: i128) -> Option<u128> {
+	if high < low {
+		return None;
+	}
+	u128::try_from(high.checked_sub(low)?.checked_add(1)?).ok()
 }
 
 fn column_heavy_hitter_for_input(
@@ -4645,6 +4769,21 @@ fn timestamp_fact_unit(arrow_type_tag: u8) -> Option<TimeUnit> {
 		ARROW_STATS_TAG_TIMESTAMP_MICROSECOND => Some(TimeUnit::Microsecond),
 		ARROW_STATS_TAG_TIMESTAMP_NANOSECOND => Some(TimeUnit::Nanosecond),
 		_ => None,
+	}
+}
+
+fn range_tag_matches_join_key_type(arrow_type_tag: u8, key_type: &DataType) -> bool {
+	match (arrow_type_tag, key_type) {
+		(ARROW_STATS_TAG_INT32, DataType::Int32)
+		| (ARROW_STATS_TAG_INT64, DataType::Int64)
+		| (ARROW_STATS_TAG_DATE32, DataType::Date32) => true,
+		(
+			ARROW_STATS_TAG_TIMESTAMP_MILLISECOND
+			| ARROW_STATS_TAG_TIMESTAMP_MICROSECOND
+			| ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
+			DataType::Timestamp(unit, Some(timezone)),
+		) => timezone.as_ref() == "UTC" && timestamp_fact_unit(arrow_type_tag) == Some(*unit),
+		_ => false,
 	}
 }
 
@@ -14623,6 +14762,358 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn clean_base_join_range_maps_scan_projection() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let descriptor = named_descriptor(43, "projected_orders", schema.as_ref().clone());
+		let range = range_fact_i64(10, 20, 11);
+		let scan = ExecutionPlan::Scan {
+			legacy_table_id: TableId(43),
+			table: descriptor.table_object_id,
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: Some(vec![ColumnOrdinal(2)]),
+			pbc_program: None,
+			row_limit: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: Vec::new(),
+			column_ndv: Vec::new(),
+			column_range: vec![(ColumnOrdinal(2), range.clone())],
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+		};
+
+		assert_eq!(
+			clean_base_column_range_for_join_input(&scan, ColumnOrdinal(0)),
+			Some(range)
+		);
+	}
+
+	#[tokio::test]
+	async fn disjoint_join_key_ranges_estimate_empty_not_containment_product() {
+		let sql = "SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id";
+		let mut ranged_catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges(
+			&mut ranged_catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+			vec![(ColumnOrdinal(1), range_fact_i64(1, 5, 10_000))],
+		);
+		seed_table_optimizer_facts_with_ranges(
+			&mut ranged_catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+			vec![(ColumnOrdinal(0), range_fact_i64(100, 200, 5_000))],
+		);
+		let ranged = Binder {
+			catalog: &ranged_catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&SqlPlanner::new().plan(sql).expect("plan ranged join"))
+		.await
+		.expect("bind ranged join");
+
+		let mut base_catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut base_catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut base_catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+		);
+		let base = Binder {
+			catalog: &base_catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&SqlPlanner::new().plan(sql).expect("plan base join"))
+		.await
+		.expect("bind base join");
+
+		assert_eq!(base.facts.estimated_row_count, Some(RowCount::new(50_000)));
+		assert_eq!(ranged.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert_eq!(ranged.facts.row_upper_bound, None);
+		assert_eq!(ranged.facts.byte_upper_bound, None);
+		assert!(!matches!(ranged.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn partial_overlap_join_scales_containment_down() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"orders",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"customers",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+			vec![(ColumnOrdinal(0), range_fact_i64(50, 149, 1_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan partial-overlap join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind partial-overlap join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
+	}
+
+	#[test]
+	fn range_overlap_refinement_never_exceeds_containment() {
+		let int64 = DataType::Int64;
+		let base = RowCount::new(10_000);
+		for (left, right) in [
+			(range_fact_i64(0, 99, 100), range_fact_i64(50, 149, 100)),
+			(range_fact_i64(0, 9, 10), range_fact_i64(0, 99, 100)),
+			(range_fact_i64(0, 99, 100), range_fact_i64(200, 299, 100)),
+			(range_fact_i64(-50, 50, 101), range_fact_i64(0, 200, 201)),
+		] {
+			let refined = range_refined_containment_join_rows(base, &left, &int64, &right, &int64)
+				.expect("range refinement");
+			assert!(refined <= base, "{refined:?} exceeded {base:?}");
+		}
+	}
+
+	#[test]
+	fn contained_range_scores_full_overlap() {
+		let int64 = DataType::Int64;
+		let base = RowCount::new(10_000);
+		let refined = range_refined_containment_join_rows(
+			base,
+			&range_fact_i64(0, 9, 10),
+			&int64,
+			&range_fact_i64(0, 99, 100),
+			&int64,
+		)
+		.expect("contained range refinement");
+
+		assert_eq!(refined, base);
+	}
+
+	#[tokio::test]
+	async fn join_range_overlap_fails_open_without_range_fact() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+			vec![(ColumnOrdinal(1), range_fact_i64(1, 5, 10_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan one-sided range join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind one-sided range join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(50_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn join_range_overlap_fails_open_on_fact_tag_type_mismatch() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+			vec![(ColumnOrdinal(1), range_fact_i32(1, 5, 10_000))],
+		);
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+			vec![(ColumnOrdinal(0), range_fact_i64(100, 200, 5_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan mismatched range-tag join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind mismatched range-tag join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(50_000))
+		);
+	}
+
+	#[test]
+	fn range_overlap_real_lane_fails_open_in_helper() {
+		assert_eq!(
+			join_key_range_overlap_fraction(
+				&range_fact_f64(0.0, 10.0, 10),
+				&DataType::Float64,
+				&range_fact_f64(5.0, 15.0, 10),
+				&DataType::Float64,
+			),
+			None
+		);
+	}
+
+	#[test]
+	fn integral_lane_covers_date32_and_timestamp_join_keys() {
+		assert_eq!(
+			join_key_range_overlap_fraction(
+				&range_fact_date32(10, 20, 11),
+				&DataType::Date32,
+				&range_fact_date32(15, 25, 11),
+				&DataType::Date32,
+			),
+			Some((6, 11))
+		);
+		let timestamp_ms_type = crate::timestamp::utc_timestamp_data_type(TimeUnit::Millisecond);
+		assert_eq!(
+			join_key_range_overlap_fraction(
+				&range_fact_timestamp_ms(10, 20, 11),
+				&timestamp_ms_type,
+				&range_fact_timestamp_ms(15, 25, 11),
+				&timestamp_ms_type,
+			),
+			Some((6, 11))
+		);
+		assert_eq!(
+			join_key_range_overlap_fraction(
+				&range_fact_timestamp_ns(10, 20, 11),
+				&timestamp_ms_type,
+				&range_fact_timestamp_ns(15, 25, 11),
+				&timestamp_ms_type,
+			),
+			None
+		);
+	}
+
+	#[tokio::test]
+	async fn join_range_overlap_skips_filtered_input() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+			vec![(ColumnOrdinal(1), range_fact_i64(1, 5, 10_000))],
+		);
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![
+				(ColumnOrdinal(0), DistinctCountFact::Exact(500)),
+				(ColumnOrdinal(1), DistinctCountFact::Exact(50)),
+			],
+			vec![(ColumnOrdinal(0), range_fact_i64(100, 200, 5_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o INNER JOIN customers c \
+				 ON o.customer_id = c.id WHERE c.region = 'north'",
+			)
+			.expect("plan filtered-input range-overlap join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind filtered-input range-overlap join");
+
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn join_range_overlap_is_estimate_channel_not_emptyrelation() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+			vec![(ColumnOrdinal(1), range_fact_i64(1, 5, 10_000))],
+		);
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+			vec![(ColumnOrdinal(0), range_fact_i64(100, 200, 5_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan disjoint estimate-channel join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind disjoint estimate-channel join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
 	#[tokio::test]
 	async fn join_output_containment_skips_multi_key_join() {
 		let mut catalog = join_catalog();
@@ -16381,6 +16872,29 @@ mod tests {
 					row_upper_bound: row_upper_bound.map(RowCount::new),
 					column_ndv: column_ndv.into_iter().collect(),
 					column_range: Default::default(),
+					column_range_distributions: Default::default(),
+					column_heavy_hitters: Default::default(),
+				},
+			)
+			.expect("seed optimizer facts");
+	}
+
+	fn seed_table_optimizer_facts_with_ranges(
+		catalog: &mut MockCatalog,
+		table: &str,
+		byte_upper_bound: Option<u64>,
+		row_upper_bound: Option<u64>,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+	) {
+		catalog
+			.seed_optimizer_facts(
+				&TableRef::new(table),
+				TableOptimizerFacts {
+					byte_upper_bound: byte_upper_bound.map(ByteCount::new),
+					row_upper_bound: row_upper_bound.map(RowCount::new),
+					column_ndv: column_ndv.into_iter().collect(),
+					column_range: column_range.into_iter().collect(),
 					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 				},

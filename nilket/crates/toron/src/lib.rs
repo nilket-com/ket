@@ -1040,6 +1040,115 @@ mod tests {
 		);
 	}
 
+	#[tokio::test]
+	async fn range_disjoint_child_join_broadcasts_zero_estimate_without_replay() {
+		let plan = join_cardinality_three_table_plan();
+		let catalog = join_cardinality_catalog_with_join_key_ranges(
+			Some(range_fact_i64(1, 5, 10_000)),
+			Some(range_fact_i64(100, 200, 10_000)),
+		);
+		assert_range_disjoint_child_join_binds_parent_as_estimated_broadcast(
+			&plan,
+			catalog.as_ref(),
+		)
+		.await;
+		let storage = join_cardinality_disjoint_storage();
+
+		let hash = run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+			plan.clone(),
+			catalog.clone(),
+			PlannerConfig {
+				force_hash_join_ids: BTreeSet::from([JoinReplayId(0), JoinReplayId(1)]),
+				..PlannerConfig::default()
+			},
+			QueryBudget::test_default(),
+			storage.clone(),
+		)
+		.await
+		.expect("execute forced hash disjoint range join");
+		assert!(!hash.replayed, "forced hash baseline should not replay");
+
+		let run = run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+			plan,
+			catalog,
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+			storage,
+		)
+		.await
+		.expect("range-disjoint estimated broadcast should complete");
+
+		assert!(
+			!run.replayed,
+			"clean disjoint range estimate should complete without replay"
+		);
+		assert_eq!(
+			hash.results
+				.iter()
+				.map(RecordBatch::num_rows)
+				.sum::<usize>(),
+			0
+		);
+		assert_eq!(
+			run.results.iter().map(RecordBatch::num_rows).sum::<usize>(),
+			0
+		);
+	}
+
+	#[tokio::test]
+	async fn stale_disjoint_join_range_underestimate_replays_as_hash_and_matches_digest() {
+		let plan = join_cardinality_three_table_plan();
+		let catalog = join_cardinality_catalog_with_join_key_ranges(
+			Some(range_fact_i64(1, 5, 10_000)),
+			Some(range_fact_i64(100, 200, 10_000)),
+		);
+		assert_range_disjoint_child_join_binds_parent_as_estimated_broadcast(
+			&plan,
+			catalog.as_ref(),
+		)
+		.await;
+		let storage = join_cardinality_storage();
+
+		let hash = run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+			plan.clone(),
+			catalog.clone(),
+			PlannerConfig {
+				force_hash_join_ids: BTreeSet::from([JoinReplayId(0), JoinReplayId(1)]),
+				..PlannerConfig::default()
+			},
+			QueryBudget::test_default(),
+			storage.clone(),
+		)
+		.await
+		.expect("execute forced hash stale-disjoint range join");
+		assert!(!hash.replayed, "forced hash baseline should not replay");
+
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+		let replay =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				plan,
+				catalog,
+				PlannerConfig::default(),
+				query_budget,
+				storage,
+			)
+			.await
+			.expect("stale range-underestimated broadcast should replay as hash");
+
+		assert!(
+			replay.replayed,
+			"stale disjoint range estimate should replay when runtime bytes exceed cap"
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&replay.results, SortPolicy::FullRowLex)
+				.expect("stale range replay digest"),
+			canonical_arrow_ipc_digest(&hash.results, SortPolicy::FullRowLex)
+				.expect("forced hash digest")
+		);
+	}
+
 	mod skew_evidence {
 		use super::*;
 
@@ -2282,6 +2391,13 @@ mod tests {
 	}
 
 	fn join_cardinality_catalog() -> Arc<MockCatalog> {
+		join_cardinality_catalog_with_join_key_ranges(None, None)
+	}
+
+	fn join_cardinality_catalog_with_join_key_ranges(
+		orders_range: Option<RangeFact>,
+		customers_range: Option<RangeFact>,
+	) -> Arc<MockCatalog> {
 		let mut catalog = MockCatalog::new();
 		catalog
 			.register_descriptor(
@@ -2319,12 +2435,10 @@ mod tests {
 				),
 			)
 			.unwrap();
-		for table in ["orders", "customers"] {
-			let join_key = if table == "orders" {
-				ColumnOrdinal(1)
-			} else {
-				ColumnOrdinal(0)
-			};
+		for (table, join_key, range) in [
+			("orders", ColumnOrdinal(1), orders_range),
+			("customers", ColumnOrdinal(0), customers_range),
+		] {
 			catalog
 				.seed_optimizer_facts(
 					&crate::catalog::TableRef::new(table),
@@ -2332,7 +2446,9 @@ mod tests {
 						byte_upper_bound: None,
 						row_upper_bound: Some(RowCount::new(1)),
 						column_ndv: BTreeMap::from([(join_key, DistinctCountFact::Exact(1_000))]),
-						column_range: Default::default(),
+						column_range: range
+							.map(|range| BTreeMap::from([(join_key, range)]))
+							.unwrap_or_default(),
 						column_range_distributions: Default::default(),
 						column_heavy_hitters: Default::default(),
 					},
@@ -2340,6 +2456,16 @@ mod tests {
 				.expect("seed stale-low join cardinality facts");
 		}
 		Arc::new(catalog)
+	}
+
+	fn range_fact_i64(min: i64, max: i64, non_null_count: u64) -> RangeFact {
+		RangeFact {
+			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
+			null_count: 0,
+			non_null_count,
+			min: Some(wendelon_client::encode_signed_optimizer_fact_scalar(min, 8).unwrap()),
+			max: Some(wendelon_client::encode_signed_optimizer_fact_scalar(max, 8).unwrap()),
+		}
 	}
 
 	fn named_descriptor(id_byte: u8, table: &str, schema: Schema) -> TableSchemaDescriptor {
@@ -2415,6 +2541,46 @@ mod tests {
 		let regions = RecordBatch::try_new(
 			regions_schema,
 			vec![Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50]))],
+		)
+		.unwrap();
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([
+				(TableId(1), orders),
+				(TableId(2), customers),
+				(TableId(3), regions),
+			]),
+		})
+	}
+
+	fn join_cardinality_disjoint_storage() -> Arc<MultiTableStorageScan> {
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let customers_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region_id", DataType::Int64, false),
+		]));
+		let regions_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let orders = RecordBatch::try_new(
+			orders_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![100, 101, 102])),
+				Arc::new(Int64Array::from(vec![1, 2, 3])),
+			],
+		)
+		.unwrap();
+		let customers = RecordBatch::try_new(
+			customers_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![100, 101])),
+				Arc::new(Int64Array::from(vec![10, 20])),
+			],
+		)
+		.unwrap();
+		let regions = RecordBatch::try_new(
+			regions_schema,
+			vec![Arc::new(Int64Array::from(vec![10, 20]))],
 		)
 		.unwrap();
 		Arc::new(MultiTableStorageScan {
@@ -3494,6 +3660,30 @@ mod tests {
 				.expect("right-build broadcast digest"),
 			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex).expect("hash digest")
 		);
+	}
+
+	async fn assert_range_disjoint_child_join_binds_parent_as_estimated_broadcast(
+		plan: &LogicalPlan,
+		catalog: &dyn Catalog,
+	) {
+		let (_bound, trace) = bind_with_trace(plan, catalog, &PlannerConfig::default())
+			.await
+			.expect("bind range-disjoint join with trace");
+		assert_eq!(trace.join_decisions.len(), 2);
+		match trace.join_decisions[1].reason {
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side,
+				estimated_byte_size,
+				threshold,
+				..
+			} => {
+				assert_eq!(build_side, BroadcastBuildSide::Left);
+				assert!(estimated_byte_size < threshold);
+			}
+			other => panic!(
+				"expected parent estimated broadcast for range-disjoint child join, got {other:?}"
+			),
+		}
 	}
 
 	async fn assert_skewed_hot_key_binds_as_estimated_broadcast(

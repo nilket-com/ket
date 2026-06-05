@@ -13,6 +13,10 @@ fn fragment_source() -> String {
 		.expect("read fragment source")
 }
 
+fn lib_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source")
+}
+
 fn source_block(source: &str, marker: &str) -> String {
 	brace_blocks_after_marker(source, marker)
 		.into_iter()
@@ -61,6 +65,128 @@ pub(crate) fn adr160_join_containment_requires_clean_base_ndv() {
 	assert!(binder.contains("join_output_containment_skips_filtered_input_ndv"));
 	assert!(binder.contains("join_output_containment_skips_multi_key_join"));
 	assert!(binder.contains("join_output_containment_skips_non_inner_join"));
+}
+
+#[test]
+pub(crate) fn adr161_range_overlap_requires_clean_base_range() {
+	let binder = binder_source();
+	let lookup = source_block(&binder, "fn clean_base_column_range_for_join_input");
+	let estimate = source_block(&binder, "fn join_output_ndv_containment_estimate");
+
+	assert!(lookup.contains("ExecutionPlan::Scan"));
+	assert!(lookup.contains("projection"));
+	assert!(lookup.contains("column_range"));
+	assert!(!lookup.contains("ExecutionPlan::Filter"));
+	assert!(estimate.contains("clean_base_column_range_for_join_input"));
+	assert!(!estimate.contains("column_range_for_input"));
+	assert!(binder.contains("clean_base_join_range_maps_scan_projection"));
+	assert!(binder.contains("join_range_overlap_skips_filtered_input"));
+}
+
+#[test]
+pub(crate) fn adr161_range_overlap_only_tightens_containment() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn join_output_ndv_containment_estimate");
+	let refined = source_block(&binder, "fn range_refined_containment_join_rows");
+	let overlap = source_block(&binder, "fn join_key_range_overlap_fraction");
+
+	assert!(estimate.contains("let base = ndv_containment_join_rows"));
+	assert!(estimate.contains(".or(Some(base))"));
+	assert!(refined.contains("join_key_range_overlap_fraction"));
+	assert!(refined.contains("return Some(RowCount::new(0))"));
+	assert!(refined.contains("checked_mul(overlap_width)"));
+	assert!(refined.contains("/ min_width"));
+	assert!(overlap.contains("let min_width = left_width.min(right_width);"));
+	assert!(overlap.contains("let overlap_low = left_min.max(right_min);"));
+	assert!(overlap.contains("let overlap_high = left_max.min(right_max);"));
+	assert!(overlap.contains("return Some((0, 1));"));
+	assert!(binder.contains("range_overlap_refinement_never_exceeds_containment"));
+	assert!(binder.contains("contained_range_scores_full_overlap"));
+}
+
+#[test]
+pub(crate) fn adr161_range_overlap_validates_fact_tag_against_key_type() {
+	let binder = binder_source();
+	let overlap = source_block(&binder, "fn join_key_range_overlap_fraction");
+	let tag_match = source_block(&binder, "fn range_tag_matches_join_key_type");
+
+	assert!(
+		overlap
+			.contains("range_tag_matches_join_key_type(left_range.arrow_type_tag, left_key_type)")
+	);
+	assert!(
+		overlap.contains(
+			"range_tag_matches_join_key_type(right_range.arrow_type_tag, right_key_type)"
+		)
+	);
+	assert!(overlap.contains("left_range.arrow_type_tag != right_range.arrow_type_tag"));
+	assert!(overlap.contains("RangeScalar::Integral"));
+	assert!(!overlap.contains("RangeScalar::Real"));
+	assert!(tag_match.contains("(ARROW_STATS_TAG_INT32, DataType::Int32)"));
+	assert!(tag_match.contains("(ARROW_STATS_TAG_INT64, DataType::Int64)"));
+	assert!(tag_match.contains("(ARROW_STATS_TAG_DATE32, DataType::Date32)"));
+	assert!(tag_match.contains("DataType::Timestamp(unit, Some(timezone))"));
+	assert!(tag_match.contains("timezone.as_ref() == \"UTC\""));
+	assert!(tag_match.contains("timestamp_fact_unit(arrow_type_tag) == Some(*unit)"));
+	assert!(binder.contains("join_range_overlap_fails_open_on_fact_tag_type_mismatch"));
+	assert!(binder.contains("range_overlap_real_lane_fails_open_in_helper"));
+	assert!(binder.contains("integral_lane_covers_date32_and_timestamp_join_keys"));
+}
+
+#[test]
+pub(crate) fn adr161_range_overlap_spends_existing_composite_estimated_wire() {
+	let binder = binder_source();
+	let lib = lib_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+	let facts = source_block(&binder, "fn composite_with_join_estimate");
+
+	assert!(bind_join.contains("join_output_ndv_containment_estimate"));
+	assert!(bind_join.contains("PlanOptimizerFacts::composite_with_join_estimate"));
+	assert!(facts.contains("estimated_row_count"));
+	assert!(facts.contains("estimated_byte_size"));
+	assert!(facts.contains("estimate_materialized_byte_size"));
+	assert!(facts.contains("row_upper_bound: None"));
+	assert!(facts.contains("byte_upper_bound: None"));
+	assert!(lib.contains("range_disjoint_child_join_broadcasts_zero_estimate_without_replay"));
+	assert!(
+		lib.contains("stale_disjoint_join_range_underestimate_replays_as_hash_and_matches_digest")
+	);
+}
+
+#[test]
+pub(crate) fn adr161_no_emptyrelation_from_disjoint_join() {
+	let binder = binder_source();
+	let refined = source_block(&binder, "fn range_refined_containment_join_rows");
+
+	assert!(refined.contains("RowCount::new(0)"));
+	assert!(!refined.contains("EmptyRelation"));
+	assert!(binder.contains("join_range_overlap_is_estimate_channel_not_emptyrelation"));
+}
+
+#[test]
+pub(crate) fn adr161_no_wendelon_or_descriptor_sidecar_range_overlap_join_surface() {
+	let catalog = catalog_source();
+	let descriptor_facts = source_block(&catalog, "struct DescriptorOptimizerFacts");
+	let storage_sync = source_block(&catalog, "fn descriptor_optimizer_facts_from_storage");
+	let offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("join_key_range")
+				|| line.contains("JoinRangeOverlap")
+				|| line.contains("range-overlap join")
+				|| line.contains("range_overlap_join")
+		})
+		.collect::<Vec<_>>();
+
+	assert!(!descriptor_facts.contains("range_overlap"));
+	assert!(!descriptor_facts.contains("join_key_range"));
+	assert!(!storage_sync.contains("range_overlap"));
+	assert!(!storage_sync.contains("join_key_range"));
+	assert!(
+		offenders.is_empty(),
+		"ADR161 range-overlap join refinement must not alter Wendelon fact surfaces:\n{}",
+		format_offenders(&manifest_dir(), &offenders)
+	);
 }
 
 #[test]
