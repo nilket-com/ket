@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–159 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–160 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,43 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 159 promoted; ADR 160 candidates
+### ADR 160 promoted; ADR 161 candidates
+
+ADR 160 promoted **Join-Output Cardinality from NDV Containment** — opens the **join-cardinality arc**,
+reusing existing NDV (the 144 pattern, *not* a from-scratch Theta sketch — the roadmap's "Theta" lead was
+reframed on grounding: join cardinality is greenfield (`bind_join` emits `composite_unknown()`) and NDV
+facts already exist). A **complete Toron-local cut**, two halves: (1) a join-output `estimated_row_count`
+from System-R **containment** `|L⋈R| ≈ |L|·|R| / max(ndv(L.x), ndv(R.y))` (the join analog of 144's
+NDV-uniform filter estimate, same NDV facts), fired only on clean `Scan ⋈ Scan` (`SingleBaseRelation`
+inputs — base NDV is stale over a `Filter`; fail-open otherwise), single equi-key first, checked/floored-≥1/
+capped-at-cross-product; (2) the **consumer wire** — relax `build_byte_candidate` to size a parent join's
+build side from a **composite estimated** input. **Why complete not dark:** the estimate would be inert
+(the chooser's `build_byte_candidate` rejected `origin != SingleBaseRelation`), so a dark estimate is a
+fact nobody reads (the too-granular shape); and relaxing the gate is **replay-safe** — the over-cap→hash
+broadcast replay is **origin-agnostic** (verified: trigger = `BudgetExhausted{BroadcastReplication}` byte
+budget; eligibility = `JoinStrategyIntent` Auto=Replayable; recovery = force-hash; none consult
+`PlanOrigin`). So 160 opens the **estimate-channel** path for composite build sides only
+(`BroadcastEstimated`, replayable); the **hard/terminal** path (`BroadcastInferred`) stays
+`SingleBaseRelation`-only (a derived cardinality is never a hard bound). Estimate-channel only,
+139/140-backstopped, `adr136` markers gain no join entry. **Headline:** `(orders ⋈ customers) ⋈ regions`
+— the inner join's containment estimate sizes the outer join's build side → broadcasts without replay
+(fails on `main`: inner = `composite_unknown` → no broadcast); **paired** with a disjoint-key over-estimate
+that over-broadcasts and recovers byte-identically as hash (the D6 safety proof). **Containment's known
+weakness** (disjoint / skew-correlated keys) is named as the future measured-miss → Theta/MinHash target;
+160 is the baseline that makes the miss measurable.
+
+**ADR 161 lead candidates:** **measured disjoint/skew-key join-miss evidence** (the 154/157 evidence
+pattern, now that 160 gives a baseline to measure against — the direct sequel that grounds whether a
+key-overlap sketch is worth it); **Theta/MinHash join-key intersection producer** (the 156/159 new-sketch
+pattern — gated on the evidence above; do not build before the miss is shown); **dimensioned `CONVERT` /
+linear units** (the parallel breadth track, brainstorm 009, operator-energy); **Rune optimizer cockpit**
+(brainstorm 010 — the fact spine now carries NDV / min-max / top-k / range-distribution + `rank_error_ppm`
+/ **join cardinality** receipts; Rune-primary). **Forward arc:** `160 join cardinality (live for 2-join
+strategy) → measured disjoint/skew-key miss evidence → Theta/MinHash producer → multi-join reordering` ·
+*(parallel: CONVERT/units; Rune cockpit, brainstorm 010)*. Evidence-gate 161 on the 160 feat. *(Hygiene
+carry retired — adr077/adr031 went green at the 159 review; the full architecture binary is clean.)*
+
+### ADR 159 promoted; ADR 160 candidates (HISTORICAL)
 
 ADR 159 promoted **Range-Distribution Optimizer Fact Producer + Activation** — builds the **live**
 producer to 158's bucket/CDF contract and **flips the dark consumer on**: a maintained **KLL** sketch
