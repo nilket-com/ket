@@ -17,6 +17,21 @@ fn lib_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source")
 }
 
+fn wendelon_optimizer_facts_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/optimizer_facts.rs"))
+		.expect("read wendelon optimizer facts source")
+}
+
+fn wendelon_storage_manager_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
+		.expect("read wendelon storage manager source")
+}
+
+fn wendelon_storage_stats_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/stats.rs"))
+		.expect("read wendelon storage stats source")
+}
+
 fn source_block(source: &str, marker: &str) -> String {
 	brace_blocks_after_marker(source, marker)
 		.into_iter()
@@ -308,23 +323,154 @@ pub(crate) fn adr163_no_wendelon_tuple_top_k_surface() {
 	offenders.extend(source_lines(&wendelon_manifest_dir().join("src")));
 	let offenders = offenders
 		.into_iter()
-		.filter(|(_, _, line)| {
-			[
-				"ColumnGroupTopK",
-				"TupleTopK",
-				"column_group_top_k",
-				"tuple_top_k",
-			]
-			.iter()
-			.any(|forbidden| line.contains(forbidden))
-		})
+		.filter(|(_, _, line)| line.contains("TupleTopK") || line.contains("tuple_top_k"))
 		.collect::<Vec<_>>();
 
 	assert!(
 		offenders.is_empty(),
-		"ADR163 defers Wendelon tuple top-k production; no source surface should be added yet:\n{}",
+		"ADR163 deferred tuple top-k naming; ADR164 owns ColumnGroupTopK, but tuple_top_k remains forbidden:\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
+}
+
+#[test]
+pub(crate) fn adr164_group_top_k_is_estimate_channel_only() {
+	let binder = binder_source();
+	let lib = lib_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+	let facts = source_block(&binder, "fn composite_with_join_estimate");
+
+	assert!(estimate.contains("clean_base_column_group_top_k_for_join_input"));
+	assert!(estimate.contains("hot_tuple_join_contribution"));
+	assert!(estimate.contains("let candidate = RowCount::new"));
+	assert!(estimate.contains("refined.get().max(candidate.get())"));
+	assert!(!estimate.contains("row_upper_bound:"));
+	assert!(!estimate.contains("byte_upper_bound:"));
+	assert!(!estimate.contains("EmptyRelation"));
+	assert!(facts.contains("estimated_row_count"));
+	assert!(facts.contains("estimated_byte_size"));
+	assert!(facts.contains("row_upper_bound: None"));
+	assert!(facts.contains("byte_upper_bound: None"));
+	assert!(binder.contains("multi_key_skew_never_lowers_163_prior"));
+	assert!(
+		lib.contains("live_column_group_top_k_recovers_multi_key_skew_and_hashes_without_seeding")
+	);
+}
+
+#[test]
+pub(crate) fn adr164_consumer_dark_without_group_top_k() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+
+	assert!(estimate.contains("_ => return Some(refined)"));
+	assert!(estimate.contains("None => return Some(refined)"));
+	assert!(binder.contains("absent_column_group_top_k_falls_back_to_163_byte_identical"));
+}
+
+#[test]
+pub(crate) fn adr164_consumer_uses_exact_hot_floor_not_fake_residual() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+	let hot_tuple = source_block(&binder, "fn hot_tuple_join_contribution");
+	let hot_add = source_block(&binder, "impl HotBothJoinContribution");
+
+	assert!(hot_tuple.contains("left.entries.len() <= right.entries.len()"));
+	assert!(hot_tuple.contains("right.entries.get(key)"));
+	assert!(hot_tuple.contains("column_group_top_k_total_frequency(left, left_rows)?"));
+	assert!(hot_add.contains("checked_mul"));
+	assert!(hot_add.contains("checked_add"));
+	assert!(estimate.contains("let candidate = RowCount::new"));
+	assert!(estimate.contains("refined.get().max(candidate.get())"));
+	assert!(!estimate.contains("saturating_sub(hot_tuple"));
+	assert!(!estimate.contains("hot_tuple.rows.checked_add"));
+	assert!(!estimate.contains("residual"));
+	assert!(binder.contains("hot_tuple_contribution_is_exact_product_of_frequencies"));
+	assert!(binder.contains("consumer_uses_exact_hot_floor_not_fake_residual"));
+}
+
+#[test]
+pub(crate) fn adr164_exact_or_decline_not_approximate_merge() {
+	let manager = wendelon_storage_manager_source();
+	let stats = wendelon_storage_stats_source();
+	let merge = source_block(&manager, "fn column_group_top_k_fact_for_group");
+	let collector = source_block(&stats, "impl GroupTopKCollector");
+
+	assert!(merge.contains("payload.group_top_k"));
+	assert!(merge.contains("candidate_keys.insert(entry.value_keys.clone())"));
+	assert!(merge.contains("binary_search_by(|entry| entry.value_keys.cmp(&key))"));
+	assert!(merge.contains("Err(_) if contributor.complete => {}"));
+	assert!(merge.contains("Err(_) =>"));
+	assert!(merge.contains("known = false"));
+	assert!(merge.contains("return Ok(None)"));
+	assert!(stats.contains("SpaceSaving<Vec<Vec<u8>>>"));
+	assert!(collector.contains("complete: true"));
+	assert!(collector.contains("complete: false"));
+	assert!(!merge.contains("estimate"));
+	assert!(!merge.contains("rank_error"));
+	assert!(manager.contains("column_group_top_k_declines_on_partial_coverage"));
+}
+
+#[test]
+pub(crate) fn adr164_group_top_k_sketch_is_wendelon_private() {
+	let manifest_dir = manifest_dir();
+	let toron_offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("SpaceSaving<Vec<Vec<u8>>>")
+				|| line.contains("ColumnStatsGroupTopKPayload")
+				|| line.contains("ColumnStatsGroupTopKEntry")
+		})
+		.collect::<Vec<_>>();
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir().join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("ScalarLiteralKey"))
+		.collect::<Vec<_>>();
+
+	assert!(
+		toron_offenders.is_empty(),
+		"ADR164 Toron must consume mapped facts, not Wendelon group top-k sketch payloads:\n{}",
+		format_offenders(&manifest_dir, &toron_offenders)
+	);
+	assert!(
+		wendelon_offenders.is_empty(),
+		"ADR164 Wendelon wire must stay byte-keyed and must not depend on Toron ScalarLiteralKey:\n{}",
+		format_offenders(&wendelon_manifest_dir(), &wendelon_offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr164_group_top_k_wire_does_not_use_toron_scalar_literal_key() {
+	let optimizer_facts = wendelon_optimizer_facts_source();
+	let catalog = catalog_source();
+	let storage_sync = source_block(&catalog, "fn descriptor_column_group_top_k_from_storage");
+	let descriptor_sync = source_block(&catalog, "fn descriptor_column_group_top_k");
+
+	assert!(optimizer_facts.contains("pub struct ColumnGroupTopKFact"));
+	assert!(optimizer_facts.contains("pub column_ordinals: Vec<u16>"));
+	assert!(optimizer_facts.contains("pub arrow_type_tags: Vec<u8>"));
+	assert!(optimizer_facts.contains("pub value_keys: Vec<Vec<u8>>"));
+	assert!(!optimizer_facts.contains("ScalarLiteralKey"));
+	assert!(storage_sync.contains("scalar_literal_key_from_storage_fact"));
+	assert!(storage_sync.contains("scalar_literal_key_matches_data_type"));
+	assert!(descriptor_sync.contains("scalar_literal_key_matches_data_type"));
+	assert!(catalog.contains("descriptor_sync_maps_supported_column_group_top_k_storage_facts"));
+}
+
+#[test]
+pub(crate) fn adr164_group_top_k_csb_payload_is_anchored_not_format_bumped() {
+	let stats = wendelon_storage_stats_source();
+	let attach = source_block(&stats, "fn attach_group_top_k_payloads");
+	let pending_finish = source_block(&stats, "fn finish");
+
+	assert!(stats.contains("COLUMN_STATS_BLOCK_FORMAT_VERSION: u32 = 1"));
+	assert!(stats.contains("COLUMN_STAT_HAS_GROUP_TOP_K"));
+	assert!(stats.contains("COLUMN_STAT_HAS_GROUP_TOP_K: u16 = 1 << 11"));
+	assert!(attach.contains("descriptor.stats_policy.column_group_top_k"));
+	assert!(attach.contains("let anchor_ordinal = resolved"));
+	assert!(attach.contains(".min()"));
+	assert!(attach.contains("pending_entry.group_top_k = Some(bytes)"));
+	assert!(pending_finish.contains("self.entry.stat_flags |= COLUMN_STAT_HAS_GROUP_TOP_K"));
+	assert!(stats.contains("column_group_top_k_builds_tuple_payload_and_skips_null_components"));
 }
 
 #[test]

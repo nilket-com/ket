@@ -54,9 +54,10 @@ use crate::schema::table::{
 };
 use crate::schema::{
 	ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
-	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnHeavyHitterEntry,
-	ColumnHeavyHitterFact, ColumnNdvFact, ColumnRangeDistributionFact, ColumnRangeFact,
-	CompactionJobId, CompactionLevelIndex, EncodingPageByteOffset, HllPrecision, HybridTimestamp,
+	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnGroupTopKEntry,
+	ColumnGroupTopKFact, ColumnHeavyHitterEntry, ColumnHeavyHitterFact, ColumnNdvFact,
+	ColumnRangeDistributionFact, ColumnRangeFact, CompactionJobId, CompactionLevelIndex,
+	EncodingPageByteOffset, HllPrecision, HybridTimestamp,
 	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
 	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
 	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
@@ -149,8 +150,10 @@ use crate::storage::secondary_index_segment::{
 use crate::storage::sketch::{HllRegisters, KllSketch};
 use crate::storage::stats::{
 	COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsDescriptorIdentity,
-	ParsedColumnStatsBlock, arrow_stats_type_tag, build_column_stats_block_with_ciphertext_budget,
-	decode_column_stats_payload, locator_flags_for_parsed_column_stats_block,
+	ColumnStatsGroupTopKEntry, ColumnStatsGroupTopKPayload, ParsedColumnStatsBlock,
+	arrow_stats_type_tag, build_column_stats_block_with_ciphertext_budget,
+	decode_column_stats_payload, group_top_k_payload_encoded_len,
+	locator_flags_for_parsed_column_stats_block,
 	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
 };
 use crate::storage::{
@@ -592,6 +595,14 @@ struct HeavyHitterColumnCandidate {
 	max_bytes: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColumnGroupTopKCandidate {
+	column_ordinals: Vec<u16>,
+	arrow_type_tags: Vec<u8>,
+	max_entries: u16,
+	max_bytes: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RangeDistributionColumnCandidate {
 	ordinal: u16,
@@ -697,6 +708,48 @@ fn heavy_hitter_column_candidates(
 				},
 			);
 		}
+	}
+	Ok(candidates)
+}
+
+fn column_group_top_k_candidates(
+	descriptor: &TableSchemaDescriptor,
+) -> std::io::Result<BTreeMap<u16, ColumnGroupTopKCandidate>> {
+	let schema = descriptor.arrow_schema()?;
+	let mut candidates = BTreeMap::new();
+	for spec in &descriptor.stats_policy.column_group_top_k {
+		let mut column_ordinals = Vec::with_capacity(spec.column_names.len());
+		let mut arrow_type_tags = Vec::with_capacity(spec.column_names.len());
+		for column_name in &spec.column_names {
+			let Some((ordinal, field)) = schema
+				.fields()
+				.iter()
+				.enumerate()
+				.find(|(_, field)| field.name() == column_name)
+			else {
+				continue;
+			};
+			let Some(arrow_type_tag) = arrow_stats_type_tag(field.data_type()) else {
+				continue;
+			};
+			column_ordinals.push(ordinal as u16);
+			arrow_type_tags.push(arrow_type_tag);
+		}
+		if column_ordinals.len() != spec.column_names.len() || column_ordinals.len() < 2 {
+			continue;
+		}
+		let Some(anchor_ordinal) = column_ordinals.iter().min().copied() else {
+			continue;
+		};
+		candidates.insert(
+			anchor_ordinal,
+			ColumnGroupTopKCandidate {
+				column_ordinals,
+				arrow_type_tags,
+				max_entries: spec.max_entries,
+				max_bytes: spec.max_bytes,
+			},
+		);
 	}
 	Ok(candidates)
 }
@@ -1068,6 +1121,124 @@ fn heavy_hitter_fact_entries_encoded_len(
 			.and_then(|bytes| bytes.checked_add(8))
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "heavy-hitter fact byte overflow"))
 	})
+}
+
+fn column_group_top_k_fact_for_group(
+	candidate: &ColumnGroupTopKCandidate,
+	blocks: &[ParsedColumnStatsBlock],
+) -> std::io::Result<Option<ColumnGroupTopKFact>> {
+	let Some(anchor_ordinal) = candidate.column_ordinals.iter().min().copied() else {
+		return Ok(None);
+	};
+	let anchor_tag = candidate
+		.column_ordinals
+		.iter()
+		.position(|ordinal| *ordinal == anchor_ordinal)
+		.and_then(|index| candidate.arrow_type_tags.get(index))
+		.copied()
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "group top-k anchor tag missing"))?;
+	let mut contributors = Vec::with_capacity(blocks.len());
+	let mut candidate_keys = BTreeSet::<Vec<Vec<u8>>>::new();
+	for block in blocks {
+		let Some(entry) = block
+			.columns
+			.iter()
+			.find(|entry| entry.column_ordinal == anchor_ordinal)
+		else {
+			return Ok(None);
+		};
+		if entry.arrow_type_tag != anchor_tag {
+			return Ok(None);
+		}
+		let payload = decode_column_stats_payload(entry)?;
+		let Some(group_top_k) = payload.group_top_k else {
+			return Ok(None);
+		};
+		if group_top_k.column_ordinals != candidate.column_ordinals
+			|| group_top_k.arrow_type_tags != candidate.arrow_type_tags
+		{
+			return Ok(None);
+		}
+		for entry in &group_top_k.entries {
+			candidate_keys.insert(entry.value_keys.clone());
+		}
+		contributors.push(group_top_k);
+	}
+
+	let mut exact_entries = Vec::new();
+	for key in candidate_keys {
+		let mut frequency = 0_u64;
+		let mut known = true;
+		for contributor in &contributors {
+			match contributor
+				.entries
+				.binary_search_by(|entry| entry.value_keys.cmp(&key))
+			{
+				Ok(index) => {
+					frequency = frequency
+						.checked_add(contributor.entries[index].frequency)
+						.ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidData,
+								"group top-k fact frequency overflow",
+							)
+						})?;
+				}
+				Err(_) if contributor.complete => {}
+				Err(_) => {
+					known = false;
+					break;
+				}
+			}
+		}
+		if known && frequency != 0 {
+			exact_entries.push(ColumnGroupTopKEntry {
+				value_keys: key,
+				frequency,
+			});
+		}
+	}
+
+	exact_entries.sort_by(|left, right| {
+		right
+			.frequency
+			.cmp(&left.frequency)
+			.then_with(|| left.value_keys.cmp(&right.value_keys))
+	});
+	let max_entries = usize::from(candidate.max_entries);
+	let max_bytes = candidate.max_bytes as usize;
+	let mut selected = Vec::new();
+	for entry in exact_entries {
+		if selected.len() >= max_entries {
+			break;
+		}
+		selected.push(entry);
+		let payload = ColumnStatsGroupTopKPayload {
+			column_ordinals: candidate.column_ordinals.clone(),
+			arrow_type_tags: candidate.arrow_type_tags.clone(),
+			complete: false,
+			entries: selected
+				.iter()
+				.map(|entry| ColumnStatsGroupTopKEntry {
+					value_keys: entry.value_keys.clone(),
+					frequency: entry.frequency,
+				})
+				.collect(),
+		};
+		if group_top_k_payload_encoded_len(&payload)? > max_bytes {
+			selected.pop();
+			break;
+		}
+	}
+	if selected.is_empty() {
+		return Ok(None);
+	}
+	selected.sort_by(|left, right| left.value_keys.cmp(&right.value_keys));
+	Ok(Some(ColumnGroupTopKFact {
+		column_ordinals: candidate.column_ordinals.clone(),
+		arrow_type_tags: candidate.arrow_type_tags.clone(),
+		entries: selected,
+	}))
 }
 
 fn row_upper_bound_for_blocks(blocks: &[ParsedColumnStatsBlock]) -> u64 {
@@ -5311,6 +5482,7 @@ impl SlabManager {
 		let range_candidates = range_column_candidates(descriptor)?;
 		let heavy_hitter_candidates = heavy_hitter_column_candidates(descriptor)?;
 		let range_distribution_candidates = range_distribution_column_candidates(descriptor)?;
+		let column_group_top_k_candidates = column_group_top_k_candidates(descriptor)?;
 		if self
 			.has_uncovered_local_rows_for_descriptor(tenant_id, descriptor)
 			.await?
@@ -5359,6 +5531,12 @@ impl SlabManager {
 				column_heavy_hitters.push(fact);
 			}
 		}
+		let mut column_group_top_k = Vec::new();
+		for candidate in column_group_top_k_candidates.values() {
+			if let Some(fact) = column_group_top_k_fact_for_group(candidate, &blocks)? {
+				column_group_top_k.push(fact);
+			}
+		}
 		let mut column_range_distributions = Vec::new();
 		for candidate in range_distribution_candidates.values() {
 			if let Some(fact) = range_distribution_fact_for_column(candidate, &blocks)? {
@@ -5375,6 +5553,7 @@ impl SlabManager {
 			column_range,
 			column_range_distributions,
 			column_heavy_hitters,
+			column_group_top_k,
 		}))
 	}
 
@@ -15395,13 +15574,13 @@ mod tests {
 	use crate::storage::multirow::pack_record_batch_by_bucket;
 	use crate::storage::stats::{
 		ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_UTF8,
-		ARROW_STATS_TAG_UTF8, COLUMN_STAT_HAS_HEAVY_HITTERS, COLUMN_STAT_HAS_HLL,
-		COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_HAS_NON_NULL_COUNT,
-		COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_HAS_RANGE_DISTRIBUTION, COLUMN_STAT_HAS_SMALL_SET,
-		COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry,
-		ColumnStatsBlockHeader, build_always_on_column_stats_block, decode_column_stats_payload,
-		encode_float64_stat_value, encode_length_prefixed_bytes, encode_signed_stat_value,
-		parse_column_stats_block,
+		ARROW_STATS_TAG_UTF8, COLUMN_STAT_HAS_GROUP_TOP_K, COLUMN_STAT_HAS_HEAVY_HITTERS,
+		COLUMN_STAT_HAS_HLL, COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN,
+		COLUMN_STAT_HAS_NON_NULL_COUNT, COLUMN_STAT_HAS_NULL_COUNT,
+		COLUMN_STAT_HAS_RANGE_DISTRIBUTION, COLUMN_STAT_HAS_SMALL_SET, COLUMN_STAT_MAX_TRUNCATED,
+		COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry, ColumnStatsBlockHeader,
+		build_always_on_column_stats_block, decode_column_stats_payload, encode_float64_stat_value,
+		encode_length_prefixed_bytes, encode_signed_stat_value, parse_column_stats_block,
 	};
 	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
@@ -15527,6 +15706,53 @@ mod tests {
 			stat_flags: COLUMN_STAT_HAS_NULL_COUNT
 				| COLUMN_STAT_HAS_NON_NULL_COUNT
 				| COLUMN_STAT_HAS_HEAVY_HITTERS,
+			payload,
+		}
+	}
+
+	fn optimizer_fact_group_top_k_entry(
+		column_ordinals: &[u16],
+		arrow_type_tags: &[u8],
+		complete: bool,
+		entries: &[(Vec<Vec<u8>>, u64)],
+	) -> ColumnStatsBlockEntry {
+		let anchor = column_ordinals
+			.iter()
+			.min()
+			.copied()
+			.expect("group top-k anchor");
+		let anchor_tag = column_ordinals
+			.iter()
+			.position(|ordinal| *ordinal == anchor)
+			.and_then(|index| arrow_type_tags.get(index))
+			.copied()
+			.expect("group top-k anchor tag");
+		let non_null_count = entries.iter().map(|(_, frequency)| *frequency).sum::<u64>();
+		let mut sorted_entries = entries.to_vec();
+		sorted_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+		let mut payload = Vec::new();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&non_null_count.to_be_bytes());
+		payload.push(u8::from(complete));
+		payload.extend_from_slice(&(column_ordinals.len() as u32).to_be_bytes());
+		for (ordinal, tag) in column_ordinals.iter().zip(arrow_type_tags) {
+			payload.extend_from_slice(&ordinal.to_be_bytes());
+			payload.push(*tag);
+		}
+		payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+		for (value_keys, frequency) in &sorted_entries {
+			for value_key in value_keys {
+				encode_length_prefixed_bytes(&mut payload, value_key)
+					.expect("encode group top-k value");
+			}
+			payload.extend_from_slice(&frequency.to_be_bytes());
+		}
+		ColumnStatsBlockEntry {
+			column_ordinal: anchor,
+			arrow_type_tag: anchor_tag,
+			stat_flags: COLUMN_STAT_HAS_NULL_COUNT
+				| COLUMN_STAT_HAS_NON_NULL_COUNT
+				| COLUMN_STAT_HAS_GROUP_TOP_K,
 			payload,
 		}
 	}
@@ -15785,6 +16011,97 @@ mod tests {
 					frequency: 1,
 				},
 			]
+		);
+	}
+
+	#[test]
+	fn column_group_top_k_merges_across_two_slabs() {
+		let candidate = ColumnGroupTopKCandidate {
+			column_ordinals: vec![1, 2],
+			arrow_type_tags: vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+			max_entries: 8,
+			max_bytes: 512,
+		};
+		let hot = vec![
+			encode_signed_stat_value(7, 8).unwrap(),
+			encode_signed_stat_value(2, 8).unwrap(),
+		];
+		let cold = vec![
+			encode_signed_stat_value(8, 8).unwrap(),
+			encode_signed_stat_value(2, 8).unwrap(),
+		];
+		let warm = vec![
+			encode_signed_stat_value(7, 8).unwrap(),
+			encode_signed_stat_value(3, 8).unwrap(),
+		];
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_group_top_k_entry(
+				&[1, 2],
+				&[ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+				true,
+				&[(cold.clone(), 1), (hot.clone(), 3)],
+			)]),
+			optimizer_fact_block(vec![optimizer_fact_group_top_k_entry(
+				&[1, 2],
+				&[ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+				true,
+				&[(hot.clone(), 2), (warm.clone(), 1)],
+			)]),
+		];
+
+		let fact = column_group_top_k_fact_for_group(&candidate, &blocks)
+			.expect("group top-k fact")
+			.expect("complete group top-k fact");
+		assert_eq!(fact.column_ordinals, vec![1, 2]);
+		assert_eq!(
+			fact.arrow_type_tags,
+			vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64]
+		);
+		assert_eq!(
+			fact.entries,
+			vec![
+				ColumnGroupTopKEntry {
+					value_keys: hot,
+					frequency: 5,
+				},
+				ColumnGroupTopKEntry {
+					value_keys: warm,
+					frequency: 1,
+				},
+				ColumnGroupTopKEntry {
+					value_keys: cold,
+					frequency: 1,
+				},
+			]
+		);
+	}
+
+	#[test]
+	fn column_group_top_k_declines_on_partial_coverage() {
+		let candidate = ColumnGroupTopKCandidate {
+			column_ordinals: vec![1, 2],
+			arrow_type_tags: vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+			max_entries: 8,
+			max_bytes: 512,
+		};
+		let hot = vec![
+			encode_signed_stat_value(7, 8).unwrap(),
+			encode_signed_stat_value(2, 8).unwrap(),
+		];
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_group_top_k_entry(
+				&[1, 2],
+				&[ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+				true,
+				&[(hot, 3)],
+			)]),
+			optimizer_fact_block(Vec::new()),
+		];
+
+		assert_eq!(
+			column_group_top_k_fact_for_group(&candidate, &blocks)
+				.expect("group top-k partial coverage"),
+			None
 		);
 	}
 

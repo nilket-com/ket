@@ -40,6 +40,8 @@ pub struct TableOptimizerFacts {
 	pub column_range_distributions: Vec<ColumnRangeDistributionFact>,
 	#[serde(default)]
 	pub column_heavy_hitters: Vec<ColumnHeavyHitterFact>,
+	#[serde(default)]
+	pub column_group_top_k: Vec<ColumnGroupTopKFact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +86,19 @@ pub struct ColumnHeavyHitterFact {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ColumnHeavyHitterEntry {
 	pub value_key: Vec<u8>,
+	pub frequency: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnGroupTopKFact {
+	pub column_ordinals: Vec<u16>,
+	pub arrow_type_tags: Vec<u8>,
+	pub entries: Vec<ColumnGroupTopKEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ColumnGroupTopKEntry {
+	pub value_keys: Vec<Vec<u8>>,
 	pub frequency: u64,
 }
 
@@ -145,6 +160,41 @@ struct TableOptimizerFactsWithoutRangeDistributions {
 	pub column_heavy_hitters: Vec<ColumnHeavyHitterFact>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TableOptimizerFactsWithoutColumnGroupTopK {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub producer_epoch: u64,
+	#[serde(default)]
+	pub row_upper_bound: Option<u64>,
+	#[serde(default)]
+	pub column_ndv: Vec<ColumnNdvFact>,
+	#[serde(default)]
+	pub column_range: Vec<ColumnRangeFact>,
+	#[serde(default)]
+	pub column_range_distributions: Vec<ColumnRangeDistributionFact>,
+	#[serde(default)]
+	pub column_heavy_hitters: Vec<ColumnHeavyHitterFact>,
+}
+
+impl From<TableOptimizerFactsWithoutColumnGroupTopK> for TableOptimizerFacts {
+	fn from(facts: TableOptimizerFactsWithoutColumnGroupTopK) -> Self {
+		Self {
+			table_object_id: facts.table_object_id,
+			schema_generation: facts.schema_generation,
+			physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
+			producer_epoch: facts.producer_epoch,
+			row_upper_bound: facts.row_upper_bound,
+			column_ndv: facts.column_ndv,
+			column_range: facts.column_range,
+			column_range_distributions: facts.column_range_distributions,
+			column_heavy_hitters: facts.column_heavy_hitters,
+			column_group_top_k: Vec::new(),
+		}
+	}
+}
+
 impl From<TableOptimizerFactsWithoutRangeDistributions> for TableOptimizerFacts {
 	fn from(facts: TableOptimizerFactsWithoutRangeDistributions) -> Self {
 		Self {
@@ -157,6 +207,7 @@ impl From<TableOptimizerFactsWithoutRangeDistributions> for TableOptimizerFacts 
 			column_range: facts.column_range,
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: facts.column_heavy_hitters,
+			column_group_top_k: Vec::new(),
 		}
 	}
 }
@@ -173,6 +224,7 @@ impl From<TableOptimizerFactsWithoutHeavyHitters> for TableOptimizerFacts {
 			column_range: facts.column_range,
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
 		}
 	}
 }
@@ -189,6 +241,7 @@ impl From<TableOptimizerFactsWithoutRowBound> for TableOptimizerFacts {
 			column_range: facts.column_range,
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
 		}
 	}
 }
@@ -205,6 +258,7 @@ impl From<LegacyTableOptimizerFacts> for TableOptimizerFacts {
 			column_range: Vec::new(),
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
 		}
 	}
 }
@@ -384,24 +438,33 @@ pub fn decode_table_optimizer_facts(bytes: &[u8]) -> std::io::Result<TableOptimi
 	match postcard::from_bytes(bytes) {
 		Ok(facts) => Ok(facts),
 		Err(new_err) => {
-			match postcard::from_bytes::<TableOptimizerFactsWithoutRangeDistributions>(bytes) {
+			match postcard::from_bytes::<TableOptimizerFactsWithoutColumnGroupTopK>(bytes) {
 				Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
-				Err(without_range_distribution_err) => {
-					match postcard::from_bytes::<TableOptimizerFactsWithoutHeavyHitters>(bytes) {
+				Err(without_group_top_k_err) => {
+					match postcard::from_bytes::<TableOptimizerFactsWithoutRangeDistributions>(
+						bytes,
+					) {
 						Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
-						Err(without_heavy_err) => {
-							match postcard::from_bytes::<TableOptimizerFactsWithoutRowBound>(bytes) {
+						Err(without_range_distribution_err) => {
+							match postcard::from_bytes::<TableOptimizerFactsWithoutHeavyHitters>(
+								bytes,
+							) {
 								Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
-								Err(without_row_err) => postcard::from_bytes::<LegacyTableOptimizerFacts>(bytes)
-									.map(TableOptimizerFacts::from)
-									.map_err(|legacy_err| {
-										Error::new(
-											ErrorKind::InvalidData,
-											format!(
-												"failed to decode table optimizer facts: {new_err}; without-range-distributions decode also failed: {without_range_distribution_err}; without-heavy-hitters decode also failed: {without_heavy_err}; without-row-bound decode also failed: {without_row_err}; legacy decode also failed: {legacy_err}"
-											),
-										)
-									}),
+								Err(without_heavy_err) => {
+									match postcard::from_bytes::<TableOptimizerFactsWithoutRowBound>(bytes) {
+										Ok(facts) => Ok(TableOptimizerFacts::from(facts)),
+										Err(without_row_err) => postcard::from_bytes::<LegacyTableOptimizerFacts>(bytes)
+											.map(TableOptimizerFacts::from)
+											.map_err(|legacy_err| {
+												Error::new(
+													ErrorKind::InvalidData,
+													format!(
+														"failed to decode table optimizer facts: {new_err}; without-column-group-top-k decode also failed: {without_group_top_k_err}; without-range-distributions decode also failed: {without_range_distribution_err}; without-heavy-hitters decode also failed: {without_heavy_err}; without-row-bound decode also failed: {without_row_err}; legacy decode also failed: {legacy_err}"
+													),
+												)
+											}),
+									}
+								}
 							}
 						}
 					}
@@ -496,6 +559,7 @@ mod tests {
 		assert!(decoded.column_range.is_empty());
 		assert!(decoded.column_range_distributions.is_empty());
 		assert!(decoded.column_heavy_hitters.is_empty());
+		assert!(decoded.column_group_top_k.is_empty());
 	}
 
 	#[test]
@@ -517,6 +581,7 @@ mod tests {
 			}],
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
 		};
 
 		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
@@ -545,6 +610,7 @@ mod tests {
 				}],
 			}],
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
 		};
 
 		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
@@ -570,6 +636,17 @@ mod tests {
 					frequency: 5,
 				}],
 			}],
+			column_group_top_k: vec![ColumnGroupTopKFact {
+				column_ordinals: vec![0, 1],
+				arrow_type_tags: vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_UTF8],
+				entries: vec![ColumnGroupTopKEntry {
+					value_keys: vec![
+						encode_signed_optimizer_fact_scalar(7, 8).unwrap(),
+						b"hot".to_vec(),
+					],
+					frequency: 3,
+				}],
+			}],
 		};
 		let bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
 		assert_eq!(decode_table_optimizer_facts(&bytes).unwrap(), facts);
@@ -588,6 +665,7 @@ mod tests {
 		assert_eq!(decoded.row_upper_bound, Some(12));
 		assert!(decoded.column_range_distributions.is_empty());
 		assert!(decoded.column_heavy_hitters.is_empty());
+		assert!(decoded.column_group_top_k.is_empty());
 
 		let without_range_distribution = TableOptimizerFactsWithoutRangeDistributions {
 			table_object_id: table_id(),
@@ -611,6 +689,7 @@ mod tests {
 		let decoded = decode_table_optimizer_facts(&bytes).expect("decode without-range facts");
 		assert_eq!(decoded.row_upper_bound, Some(12));
 		assert!(decoded.column_range_distributions.is_empty());
+		assert!(decoded.column_group_top_k.is_empty());
 		assert_eq!(
 			decoded.column_heavy_hitters,
 			without_range_distribution.column_heavy_hitters
@@ -645,5 +724,6 @@ mod tests {
 		assert_eq!(decoded.row_upper_bound, None);
 		assert_eq!(decoded.column_range, without_row_bound.column_range);
 		assert!(decoded.column_range_distributions.is_empty());
+		assert!(decoded.column_group_top_k.is_empty());
 	}
 }

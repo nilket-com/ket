@@ -1340,6 +1340,8 @@ pub struct ColumnStatsPolicyV1 {
 	pub heavy_hitters: Vec<ColumnHeavyHitterSpec>,
 	#[serde(default)]
 	pub range_distributions: Vec<ColumnRangeDistributionSpec>,
+	#[serde(default)]
+	pub column_group_top_k: Vec<ColumnGroupTopKSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1470,6 +1472,36 @@ impl ColumnHeavyHitterSpec {
 		validate_heavy_hitter_caps(max_entries, max_bytes)?;
 		Ok(Self {
 			column_name: column_name.into(),
+			max_entries,
+			max_bytes,
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnGroupTopKSpec {
+	pub column_names: Vec<String>,
+	pub max_entries: u16,
+	pub max_bytes: u32,
+}
+
+impl ColumnGroupTopKSpec {
+	pub fn new(column_names: impl Into<Vec<String>>) -> Self {
+		Self {
+			column_names: column_names.into(),
+			max_entries: COLUMN_STATS_HEAVY_HITTER_DEFAULT_MAX_ENTRIES,
+			max_bytes: COLUMN_STATS_HEAVY_HITTER_DEFAULT_MAX_BYTES,
+		}
+	}
+
+	pub fn with_caps(
+		column_names: impl Into<Vec<String>>,
+		max_entries: u16,
+		max_bytes: u32,
+	) -> std::io::Result<Self> {
+		validate_heavy_hitter_caps(max_entries, max_bytes)?;
+		Ok(Self {
+			column_names: column_names.into(),
 			max_entries,
 			max_bytes,
 		})
@@ -2734,6 +2766,7 @@ fn validate_stats_policy(schema: &Schema, policy: &ColumnStatsPolicyV1) -> std::
 	validate_small_set_stats_policy(schema, &policy.small_sets)?;
 	validate_heavy_hitter_stats_policy(schema, &policy.heavy_hitters)?;
 	validate_range_distribution_stats_policy(schema, &policy.range_distributions)?;
+	validate_column_group_top_k_stats_policy(schema, &policy.column_group_top_k)?;
 	validate_stats_policy_budget(schema, policy)?;
 	Ok(())
 }
@@ -2815,6 +2848,11 @@ fn estimate_stats_policy_csb_ciphertext_bytes(
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
 	}
 	for spec in &policy.heavy_hitters {
+		bytes = bytes
+			.checked_add(u64::from(spec.max_bytes))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+	}
+	for spec in &policy.column_group_top_k {
 		bytes = bytes
 			.checked_add(u64::from(spec.max_bytes))
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
@@ -3009,6 +3047,102 @@ fn validate_heavy_hitter_stats_policy(
 					PbcRejectCode::PBC_REJECT_STATS_UNSUPPORTED_TYPE,
 					spec.column_name,
 					field.data_type()
+				),
+			));
+		}
+	}
+	Ok(())
+}
+
+fn validate_column_group_top_k_stats_policy(
+	schema: &Schema,
+	specs: &[ColumnGroupTopKSpec],
+) -> std::io::Result<()> {
+	let mut seen_groups = BTreeSet::new();
+	let mut seen_anchors = BTreeSet::new();
+	for spec in specs {
+		if spec.column_names.len() < 2 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: column-group top-k stats must name at least two columns",
+					PbcRejectCode::PBC_REJECT_STATS_HEAVY_HITTER_INVALID
+				),
+			));
+		}
+		if let Err(err) = validate_heavy_hitter_caps(spec.max_entries, spec.max_bytes) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: column-group top-k stats limits for {:?} are invalid: {}",
+					PbcRejectCode::PBC_REJECT_STATS_HEAVY_HITTER_INVALID,
+					spec.column_names,
+					err
+				),
+			));
+		}
+
+		let mut group_names = BTreeSet::new();
+		let mut group_key = Vec::with_capacity(spec.column_names.len());
+		let mut anchor = usize::MAX;
+		for column_name in &spec.column_names {
+			validate_descriptor_name("stats column-group top-k column", column_name)?;
+			if !group_names.insert(column_name.clone()) {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"{}: duplicate column-group top-k stats column {:?}",
+						PbcRejectCode::PBC_REJECT_STATS_DUPLICATE_COLUMN,
+						column_name
+					),
+				));
+			}
+			let (ordinal, field) = schema
+				.fields()
+				.iter()
+				.enumerate()
+				.find(|(_, field)| field.name() == column_name)
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"{}: column-group top-k stats column {:?} is not present in Arrow schema",
+							PbcRejectCode::PBC_REJECT_STATS_COLUMN_UNKNOWN,
+							column_name
+						),
+					)
+				})?;
+			if !is_supported_heavy_hitter_stats_type(field.data_type()) {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"{}: column-group top-k stats column {:?} uses unsupported V1 type {:?}",
+						PbcRejectCode::PBC_REJECT_STATS_UNSUPPORTED_TYPE,
+						column_name,
+						field.data_type()
+					),
+				));
+			}
+			anchor = anchor.min(ordinal);
+			group_key.push(ordinal);
+		}
+		group_key.sort_unstable();
+		if !seen_groups.insert(group_key) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: duplicate column-group top-k stats group {:?}",
+					PbcRejectCode::PBC_REJECT_STATS_DUPLICATE_COLUMN,
+					spec.column_names
+				),
+			));
+		}
+		if !seen_anchors.insert(anchor) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: column-group top-k stats groups must not share CSB anchor column",
+					PbcRejectCode::PBC_REJECT_STATS_DUPLICATE_COLUMN
 				),
 			));
 		}
@@ -4558,6 +4692,10 @@ mod tests {
 				small_sets: vec![ColumnSmallSetSpecV1::new("active")],
 				heavy_hitters: vec![ColumnHeavyHitterSpec::new("active")],
 				range_distributions: Vec::new(),
+				column_group_top_k: vec![ColumnGroupTopKSpec::new(vec![
+					"id".to_string(),
+					"active".to_string(),
+				])],
 			},
 		)
 		.unwrap();
@@ -4683,6 +4821,37 @@ mod tests {
 			invalid_heavy_hitter
 				.to_string()
 				.contains("PBC_REJECT_STATS_HEAVY_HITTER_INVALID")
+		);
+
+		let invalid_group_top_k = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				column_group_top_k: vec![ColumnGroupTopKSpec::new(vec!["id".to_string()])],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			invalid_group_top_k
+				.to_string()
+				.contains("PBC_REJECT_STATS_HEAVY_HITTER_INVALID")
+		);
+
+		let duplicate_group_top_k_column = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				column_group_top_k: vec![ColumnGroupTopKSpec::new(vec![
+					"id".to_string(),
+					"id".to_string(),
+				])],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			duplicate_group_top_k_column
+				.to_string()
+				.contains("PBC_REJECT_STATS_DUPLICATE_COLUMN")
 		);
 
 		let budget = descriptor_with_stats(

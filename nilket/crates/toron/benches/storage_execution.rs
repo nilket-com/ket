@@ -272,6 +272,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			column_range,
 			column_range_distributions,
 			column_heavy_hitters,
+			column_group_top_k,
 			..
 		} => ExecutionPlan::Scan {
 			legacy_table_id,
@@ -291,6 +292,7 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			column_range,
 			column_range_distributions,
 			column_heavy_hitters,
+			column_group_top_k,
 			row_identity: RowIdentityProjection::None,
 		},
 		ExecutionPlan::Filter {

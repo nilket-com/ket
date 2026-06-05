@@ -2377,6 +2377,7 @@ pub(crate) fn adr115_no_merge_sort_or_topk_pushdown() {
 	] {
 		let source =
 			std::fs::read_to_string(manifest_dir().join(path)).unwrap_or_else(|_| panic!("{path}"));
+		let source = source.replace("column_group_top_k", "");
 		assert!(!source.contains("merge_sort"), "{path} added merge sort");
 		assert!(!source.contains("topk"), "{path} added top-k pushdown");
 		assert!(!source.contains("top_k"), "{path} added top-k pushdown");

@@ -139,9 +139,21 @@ pub struct ColumnHeavyHitterFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ColumnGroupTopKFact {
+	pub arrow_type_tags: Vec<u8>,
+	pub entries: BTreeMap<Vec<ScalarLiteralKey>, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DescriptorColumnHeavyHitterFact {
 	pub column_ordinal: ColumnOrdinal,
 	pub fact: ColumnHeavyHitterFact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DescriptorColumnGroupTopKFact {
+	pub column_ordinals: Vec<ColumnOrdinal>,
+	pub fact: ColumnGroupTopKFact,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -152,6 +164,7 @@ pub struct TableOptimizerFacts {
 	pub column_range: BTreeMap<ColumnOrdinal, RangeFact>,
 	pub column_range_distributions: BTreeMap<ColumnOrdinal, ColumnRangeDistributionFact>,
 	pub column_heavy_hitters: BTreeMap<ColumnOrdinal, ColumnHeavyHitterFact>,
+	pub column_group_top_k: BTreeMap<Vec<ColumnOrdinal>, ColumnGroupTopKFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +182,8 @@ pub struct DescriptorOptimizerFacts {
 	pub column_range_distributions: Vec<DescriptorColumnRangeDistributionFact>,
 	#[serde(default)]
 	pub column_heavy_hitters: Vec<DescriptorColumnHeavyHitterFact>,
+	#[serde(default)]
+	pub column_group_top_k: Vec<DescriptorColumnGroupTopKFact>,
 }
 
 impl DescriptorOptimizerFacts {
@@ -202,6 +217,7 @@ impl DescriptorOptimizerFacts {
 				self.column_heavy_hitters,
 				descriptor,
 			),
+			column_group_top_k: descriptor_column_group_top_k(self.column_group_top_k, descriptor),
 		}
 	}
 }
@@ -258,6 +274,11 @@ pub(crate) fn descriptor_optimizer_facts_from_storage(
 		facts.row_upper_bound,
 		descriptor,
 	);
+	let column_group_top_k = descriptor_column_group_top_k_from_storage(
+		facts.column_group_top_k,
+		facts.row_upper_bound,
+		descriptor,
+	);
 	Some(DescriptorOptimizerFacts {
 		schema_generation: facts.schema_generation,
 		physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
@@ -268,6 +289,7 @@ pub(crate) fn descriptor_optimizer_facts_from_storage(
 		column_range,
 		column_range_distributions,
 		column_heavy_hitters,
+		column_group_top_k,
 	})
 }
 
@@ -355,6 +377,79 @@ fn descriptor_column_heavy_hitters_from_storage(
 		.collect()
 }
 
+fn descriptor_column_group_top_k_from_storage(
+	column_group_top_k: Vec<wendelon_client::ColumnGroupTopKFact>,
+	row_upper_bound: Option<u64>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> Vec<DescriptorColumnGroupTopKFact> {
+	let Ok(schema) = descriptor.arrow_schema() else {
+		return Vec::new();
+	};
+	column_group_top_k
+		.into_iter()
+		.filter_map(|fact| {
+			if fact.column_ordinals.len() < 2
+				|| fact.column_ordinals.len() != fact.arrow_type_tags.len()
+			{
+				return None;
+			}
+			let mut seen_ordinals = HashSet::new();
+			let mut column_ordinals = Vec::with_capacity(fact.column_ordinals.len());
+			let mut field_types = Vec::with_capacity(fact.column_ordinals.len());
+			for (ordinal, tag) in fact.column_ordinals.iter().zip(&fact.arrow_type_tags) {
+				let column_ordinal = ColumnOrdinal(u32::from(*ordinal));
+				if !seen_ordinals.insert(column_ordinal) {
+					return None;
+				}
+				let field = schema.fields().get(column_ordinal.0 as usize)?;
+				if !storage_fact_tag_matches_data_type(*tag, field.data_type()) {
+					return None;
+				}
+				column_ordinals.push(column_ordinal);
+				field_types.push(field.data_type().clone());
+			}
+
+			let mut entries = BTreeMap::new();
+			let mut frequency_sum = 0_u64;
+			for entry in fact.entries {
+				if entry.frequency == 0 || entry.value_keys.len() != fact.arrow_type_tags.len() {
+					return None;
+				}
+				let mut tuple_key = Vec::with_capacity(entry.value_keys.len());
+				for (tag, value_key) in fact.arrow_type_tags.iter().zip(&entry.value_keys) {
+					tuple_key.push(scalar_literal_key_from_storage_fact(*tag, value_key)?);
+				}
+				if tuple_key
+					.iter()
+					.zip(&field_types)
+					.any(|(key, data_type)| !scalar_literal_key_matches_data_type(key, data_type))
+				{
+					return None;
+				}
+				if entries.insert(tuple_key, entry.frequency).is_some() {
+					return None;
+				}
+				frequency_sum = frequency_sum.checked_add(entry.frequency)?;
+			}
+			if entries.is_empty() {
+				return None;
+			}
+			if let Some(row_upper_bound) = row_upper_bound
+				&& frequency_sum > row_upper_bound
+			{
+				return None;
+			}
+			Some(DescriptorColumnGroupTopKFact {
+				column_ordinals,
+				fact: ColumnGroupTopKFact {
+					arrow_type_tags: fact.arrow_type_tags,
+					entries,
+				},
+			})
+		})
+		.collect()
+}
+
 fn scalar_literal_key_from_storage_fact(tag: u8, bytes: &[u8]) -> Option<ScalarLiteralKey> {
 	match tag {
 		wendelon_client::ARROW_STATS_TAG_BOOLEAN => match bytes {
@@ -409,6 +504,47 @@ fn scalar_literal_key_from_storage_fact(tag: u8, bytes: &[u8]) -> Option<ScalarL
 			String::from_utf8(bytes.to_vec()).ok()?,
 		)),
 		_ => None,
+	}
+}
+
+fn storage_fact_tag_matches_data_type(tag: u8, data_type: &DataType) -> bool {
+	match (tag, data_type) {
+		(wendelon_client::ARROW_STATS_TAG_BOOLEAN, DataType::Boolean)
+		| (wendelon_client::ARROW_STATS_TAG_INT32, DataType::Int32)
+		| (wendelon_client::ARROW_STATS_TAG_INT64, DataType::Int64)
+		| (wendelon_client::ARROW_STATS_TAG_DATE32, DataType::Date32)
+		| (wendelon_client::ARROW_STATS_TAG_FLOAT32, DataType::Float32)
+		| (wendelon_client::ARROW_STATS_TAG_FLOAT64, DataType::Float64)
+		| (wendelon_client::ARROW_STATS_TAG_UTF8, DataType::Utf8) => true,
+		(
+			wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
+			DataType::Timestamp(TimeUnit::Millisecond, Some(timezone)),
+		)
+		| (
+			wendelon_client::ARROW_STATS_TAG_TIMESTAMP_MICROSECOND,
+			DataType::Timestamp(TimeUnit::Microsecond, Some(timezone)),
+		)
+		| (
+			wendelon_client::ARROW_STATS_TAG_TIMESTAMP_NANOSECOND,
+			DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)),
+		) => timezone.as_ref() == "UTC",
+		_ => false,
+	}
+}
+
+fn scalar_literal_key_matches_data_type(key: &ScalarLiteralKey, data_type: &DataType) -> bool {
+	match (key, data_type) {
+		(ScalarLiteralKey::Boolean(_), DataType::Boolean)
+		| (ScalarLiteralKey::Int32(_), DataType::Int32)
+		| (ScalarLiteralKey::Int64(_), DataType::Int64)
+		| (ScalarLiteralKey::Date32(_), DataType::Date32)
+		| (ScalarLiteralKey::Float32(_), DataType::Float32)
+		| (ScalarLiteralKey::Float64(_), DataType::Float64)
+		| (ScalarLiteralKey::Utf8(_), DataType::Utf8) => true,
+		(ScalarLiteralKey::Timestamp(unit, _), DataType::Timestamp(key_unit, Some(timezone))) => {
+			timezone.as_ref() == "UTC" && unit == key_unit
+		}
+		_ => false,
 	}
 }
 
@@ -581,6 +717,51 @@ fn descriptor_column_heavy_hitters(
 		.into_iter()
 		.filter(|fact| (fact.column_ordinal.0 as usize) < column_count)
 		.map(|fact| (fact.column_ordinal, fact.fact))
+		.collect()
+}
+
+fn descriptor_column_group_top_k(
+	column_group_top_k: Vec<DescriptorColumnGroupTopKFact>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> BTreeMap<Vec<ColumnOrdinal>, ColumnGroupTopKFact> {
+	let Ok(schema) = descriptor.arrow_schema() else {
+		return BTreeMap::new();
+	};
+	column_group_top_k
+		.into_iter()
+		.filter_map(|fact| {
+			if fact.column_ordinals.len() < 2
+				|| fact.column_ordinals.len() != fact.fact.arrow_type_tags.len()
+			{
+				return None;
+			}
+			let mut seen_ordinals = HashSet::new();
+			let mut field_types = Vec::with_capacity(fact.column_ordinals.len());
+			for (column_ordinal, tag) in fact.column_ordinals.iter().zip(&fact.fact.arrow_type_tags)
+			{
+				if !seen_ordinals.insert(*column_ordinal) {
+					return None;
+				}
+				let field = schema.fields().get(column_ordinal.0 as usize)?;
+				if !storage_fact_tag_matches_data_type(*tag, field.data_type()) {
+					return None;
+				}
+				field_types.push(field.data_type().clone());
+			}
+			for (tuple_key, frequency) in &fact.fact.entries {
+				if *frequency == 0 || tuple_key.len() != fact.column_ordinals.len() {
+					return None;
+				}
+				if tuple_key
+					.iter()
+					.zip(&field_types)
+					.any(|(key, data_type)| !scalar_literal_key_matches_data_type(key, data_type))
+				{
+					return None;
+				}
+			}
+			Some((fact.column_ordinals, fact.fact))
+		})
 		.collect()
 }
 
@@ -3362,6 +3543,7 @@ mod tests {
 				column_range: Default::default(),
 				column_range_distributions: Default::default(),
 				column_heavy_hitters: Default::default(),
+				column_group_top_k: Default::default(),
 			}
 		);
 	}
@@ -3431,6 +3613,7 @@ mod tests {
 				column_range: Default::default(),
 				column_range_distributions: Default::default(),
 				column_heavy_hitters: Default::default(),
+				column_group_top_k: Default::default(),
 			}
 		);
 	}
@@ -3481,6 +3664,7 @@ mod tests {
 			column_range: Vec::new(),
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3529,6 +3713,7 @@ mod tests {
 			}],
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3578,6 +3763,7 @@ mod tests {
 					frequency: 5,
 				}],
 			}],
+			column_group_top_k: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3601,6 +3787,65 @@ mod tests {
 			.get(&ColumnOrdinal(1))
 			.expect("amount heavy-hitter fact");
 		assert_eq!(fact.entries.get(&ScalarLiteralKey::Int32(42)), Some(&5));
+	}
+
+	#[tokio::test]
+	async fn descriptor_sync_maps_supported_column_group_top_k_storage_facts() {
+		let descriptor = descriptor();
+		let tuple = vec![
+			wendelon_client::encode_signed_optimizer_fact_scalar(42, 4).unwrap(),
+			"north".as_bytes().to_vec(),
+		];
+		let facts = StorageTableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 17,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: vec![wendelon_client::ColumnGroupTopKFact {
+				column_ordinals: vec![1, 2],
+				arrow_type_tags: vec![
+					wendelon_client::ARROW_STATS_TAG_INT32,
+					wendelon_client::ARROW_STATS_TAG_UTF8,
+				],
+				entries: vec![wendelon_client::ColumnGroupTopKEntry {
+					value_keys: tuple,
+					frequency: 5,
+				}],
+			}],
+		};
+		let client = Arc::new(
+			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
+				.with_optimizer_facts([Ok(Some(facts))]),
+		);
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor");
+
+		let fact = resolved
+			.optimizer_facts
+			.column_group_top_k
+			.get(&vec![ColumnOrdinal(1), ColumnOrdinal(2)])
+			.expect("column-group top-k fact");
+		assert_eq!(
+			fact.entries.get(&vec![
+				ScalarLiteralKey::Int32(42),
+				ScalarLiteralKey::Utf8("north".to_string())
+			]),
+			Some(&5)
+		);
 	}
 
 	#[tokio::test]
@@ -3628,6 +3873,7 @@ mod tests {
 				}],
 			}],
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3725,6 +3971,7 @@ mod tests {
 				column_range: Vec::new(),
 				column_range_distributions: invalid_facts,
 				column_heavy_hitters: Vec::new(),
+				column_group_top_k: Default::default(),
 			},
 			&descriptor,
 		)
@@ -3802,6 +4049,7 @@ mod tests {
 				column_range: Vec::new(),
 				column_range_distributions: Vec::new(),
 				column_heavy_hitters: invalid_facts,
+				column_group_top_k: Default::default(),
 			},
 			&descriptor,
 		)
@@ -3833,6 +4081,7 @@ mod tests {
 				column_range: Vec::new(),
 				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
+				column_group_top_k: Default::default(),
 			},
 			&descriptor,
 		)
@@ -3863,6 +4112,7 @@ mod tests {
 				column_range: Vec::new(),
 				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
+				column_group_top_k: Default::default(),
 			},
 			&descriptor,
 		)
@@ -3889,6 +4139,7 @@ mod tests {
 				column_range: Vec::new(),
 				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
+				column_group_top_k: Default::default(),
 			},
 			&descriptor,
 		)
@@ -3918,6 +4169,7 @@ mod tests {
 			column_range: Vec::new(),
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
 		};
 		assert_eq!(
 			descriptor_optimizer_facts_from_storage(facts, &descriptor),
@@ -3937,6 +4189,7 @@ mod tests {
 			column_range: Vec::new(),
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
 		};
 		assert_eq!(
 			descriptor_optimizer_facts_from_storage(facts, &descriptor),
@@ -4931,6 +5184,7 @@ mod tests {
 			column_range: Vec::new(),
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
 		}
 	}
 

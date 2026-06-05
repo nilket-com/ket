@@ -1173,6 +1173,7 @@ fn shuffle_input_scan(
 		column_range: Vec::new(),
 		column_range_distributions: Vec::new(),
 		column_heavy_hitters: Vec::new(),
+		column_group_top_k: Vec::new(),
 	}
 }
 
@@ -1839,6 +1840,7 @@ mod tests {
 			column_range: Vec::new(),
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
 		}
 	}
 
@@ -1884,6 +1886,7 @@ mod tests {
 			column_range: Vec::new(),
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
 		}
 	}
 

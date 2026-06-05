@@ -3605,6 +3605,7 @@ mod tests {
 			column_range: Vec::new(),
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Vec::new(),
 		};
 		let facts_bytes = encode_table_optimizer_facts(&facts).expect("encode facts");
 		let frame = crate::network::core::HrftFrame {

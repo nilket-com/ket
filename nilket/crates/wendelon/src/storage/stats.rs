@@ -1,8 +1,8 @@
 use crate::schema::table::{
 	COLUMN_STATS_CSB_AEAD_TAG_BYTES, COLUMN_STATS_HLL_MAX_PRECISION,
-	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnHeavyHitterSpec, ColumnHllSpecV1,
-	ColumnRangeDistributionSpec, ColumnSmallSetSpecV1, TableObjectId, TableSchemaDescriptor,
-	max_column_stats_block_ciphertext_bytes_for_slab_payload,
+	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnGroupTopKSpec, ColumnHeavyHitterSpec,
+	ColumnHllSpecV1, ColumnRangeDistributionSpec, ColumnSmallSetSpecV1, TableObjectId,
+	TableSchemaDescriptor, max_column_stats_block_ciphertext_bytes_for_slab_payload,
 };
 pub use crate::schema::{
 	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
@@ -24,7 +24,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{
 	ArrowPrimitiveType, DataType, Date32Type, Date64Type, Field, Int8Type, Int16Type, Int32Type,
-	Int64Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+	Int64Type, Schema, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
 	TimestampNanosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::record_batch::RecordBatch;
@@ -62,7 +62,8 @@ pub const COLUMN_STAT_MIN_TRUNCATED: u16 = 1 << 7;
 pub const COLUMN_STAT_MAX_TRUNCATED: u16 = 1 << 8;
 pub const COLUMN_STAT_HAS_HEAVY_HITTERS: u16 = 1 << 9;
 pub const COLUMN_STAT_HAS_RANGE_DISTRIBUTION: u16 = 1 << 10;
-pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1111_1000_0000_0000;
+pub const COLUMN_STAT_HAS_GROUP_TOP_K: u16 = 1 << 11;
+pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1111_0000_0000_0000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnStatsBlockHeader {
@@ -137,6 +138,20 @@ pub struct ColumnStatsHeavyHitterPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnStatsGroupTopKEntry {
+	pub value_keys: Vec<Vec<u8>>,
+	pub frequency: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnStatsGroupTopKPayload {
+	pub column_ordinals: Vec<u16>,
+	pub arrow_type_tags: Vec<u8>,
+	pub complete: bool,
+	pub entries: Vec<ColumnStatsGroupTopKEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnStatsKllPayload {
 	pub k: KllK,
 	pub total_item_count: u64,
@@ -155,6 +170,7 @@ pub struct DecodedColumnStatsPayload {
 	pub small_set: Option<Vec<Vec<u8>>>,
 	pub heavy_hitters: Option<ColumnStatsHeavyHitterPayload>,
 	pub range_distribution: Option<ColumnStatsKllPayload>,
+	pub group_top_k: Option<ColumnStatsGroupTopKPayload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -740,6 +756,13 @@ fn build_column_stats_block_internal(
 			max_ciphertext_bytes.is_none(),
 		)?);
 	}
+	attach_group_top_k_payloads(
+		descriptor,
+		&schema,
+		batch,
+		&mut pending,
+		max_ciphertext_bytes.is_none(),
+	)?;
 	apply_opt_in_stats_budget(&mut pending, max_ciphertext_bytes)?;
 	let columns = pending
 		.into_iter()
@@ -763,6 +786,120 @@ fn build_column_stats_block_internal(
 	crate::metrics::global().observe_pbc_slab_stats_build(start.elapsed());
 	crate::metrics::global().observe_pbc_slab_stats_block_bytes(encoded.len() as u64);
 	Ok(encoded)
+}
+
+fn attach_group_top_k_payloads(
+	descriptor: &TableSchemaDescriptor,
+	schema: &Schema,
+	batch: &RecordBatch,
+	pending: &mut [PendingColumnStatsEntry],
+	select_all_opt_ins: bool,
+) -> std::io::Result<()> {
+	for spec in &descriptor.stats_policy.column_group_top_k {
+		let resolved = resolve_group_top_k_spec(schema, spec)?;
+		let anchor_ordinal = resolved
+			.column_ordinals
+			.iter()
+			.min()
+			.copied()
+			.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "CSB group top-k has no anchor"))?;
+		let anchor = usize::from(anchor_ordinal);
+		let pending_entry = pending.get_mut(anchor).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group top-k anchor ordinal is out of range",
+			)
+		})?;
+		let payload = collect_group_top_k_payload(batch, &resolved)?;
+		let mut bytes = Vec::new();
+		encode_group_top_k(&mut bytes, &payload)?;
+		pending_entry.group_top_k = Some(bytes);
+		pending_entry.select_group_top_k = select_all_opt_ins;
+	}
+	Ok(())
+}
+
+struct ResolvedGroupTopKSpec {
+	column_ordinals: Vec<u16>,
+	arrow_type_tags: Vec<u8>,
+	max_entries: u16,
+	max_bytes: u32,
+}
+
+fn resolve_group_top_k_spec(
+	schema: &Schema,
+	spec: &ColumnGroupTopKSpec,
+) -> std::io::Result<ResolvedGroupTopKSpec> {
+	let mut column_ordinals = Vec::with_capacity(spec.column_names.len());
+	let mut arrow_type_tags = Vec::with_capacity(spec.column_names.len());
+	for column_name in &spec.column_names {
+		let (ordinal, field) = schema
+			.fields()
+			.iter()
+			.enumerate()
+			.find(|(_, field)| field.name() == column_name)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!("CSB group top-k column {column_name:?} is missing"),
+				)
+			})?;
+		let ordinal = u16::try_from(ordinal).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group top-k ordinal exceeds u16::MAX",
+			)
+		})?;
+		let arrow_type_tag = arrow_stats_type_tag(field.data_type()).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group top-k column type is unsupported",
+			)
+		})?;
+		column_ordinals.push(ordinal);
+		arrow_type_tags.push(arrow_type_tag);
+	}
+	Ok(ResolvedGroupTopKSpec {
+		column_ordinals,
+		arrow_type_tags,
+		max_entries: spec.max_entries,
+		max_bytes: spec.max_bytes,
+	})
+}
+
+fn collect_group_top_k_payload(
+	batch: &RecordBatch,
+	spec: &ResolvedGroupTopKSpec,
+) -> std::io::Result<ColumnStatsGroupTopKPayload> {
+	let mut collector = GroupTopKCollector::new(
+		spec.column_ordinals.clone(),
+		spec.arrow_type_tags.clone(),
+		spec.max_entries,
+		spec.max_bytes,
+	);
+	let schema = batch.schema();
+	for row in 0..batch.num_rows() {
+		let mut value_keys = Vec::with_capacity(spec.column_ordinals.len());
+		let mut complete_tuple = true;
+		for ordinal in &spec.column_ordinals {
+			let ordinal = usize::from(*ordinal);
+			let Some(field) = schema.fields().get(ordinal) else {
+				complete_tuple = false;
+				break;
+			};
+			let Some(value_key) =
+				encoded_value_at(field.data_type(), batch.column(ordinal).as_ref(), row)?
+			else {
+				complete_tuple = false;
+				break;
+			};
+			value_keys.push(value_key);
+		}
+		if complete_tuple {
+			collector.insert(value_keys)?;
+		}
+	}
+	collector.finish()
 }
 
 pub fn decode_column_stats_payload(
@@ -824,6 +961,15 @@ pub fn decode_column_stats_payload(
 	} else {
 		None
 	};
+	let group_top_k = if entry.stat_flags & COLUMN_STAT_HAS_GROUP_TOP_K != 0 {
+		Some(read_group_top_k(
+			&entry.payload,
+			&mut cursor,
+			non_null_count,
+		)?)
+	} else {
+		None
+	};
 	if cursor != entry.payload.len() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -840,6 +986,7 @@ pub fn decode_column_stats_payload(
 		small_set,
 		heavy_hitters,
 		range_distribution,
+		group_top_k,
 	})
 }
 
@@ -1044,11 +1191,13 @@ struct PendingColumnStatsEntry {
 	small_set: Option<Vec<u8>>,
 	heavy_hitters: Option<Vec<u8>>,
 	range_distribution: Option<Vec<u8>>,
+	group_top_k: Option<Vec<u8>>,
 	select_bloom: bool,
 	select_hll: bool,
 	select_small_set: bool,
 	select_heavy_hitters: bool,
 	select_range_distribution: bool,
+	select_group_top_k: bool,
 }
 
 impl PendingColumnStatsEntry {
@@ -1083,6 +1232,12 @@ impl PendingColumnStatsEntry {
 				self.entry.payload.extend_from_slice(&payload);
 			}
 		}
+		if self.select_group_top_k {
+			if let Some(payload) = self.group_top_k.take() {
+				self.entry.stat_flags |= COLUMN_STAT_HAS_GROUP_TOP_K;
+				self.entry.payload.extend_from_slice(&payload);
+			}
+		}
 		self.entry
 	}
 }
@@ -1094,6 +1249,7 @@ enum OptInStatKind {
 	Hll,
 	HeavyHitters,
 	RangeDistribution,
+	GroupTopK,
 }
 
 fn apply_opt_in_stats_budget(
@@ -1112,6 +1268,7 @@ fn apply_opt_in_stats_budget(
 		OptInStatKind::Hll,
 		OptInStatKind::HeavyHitters,
 		OptInStatKind::RangeDistribution,
+		OptInStatKind::GroupTopK,
 	] {
 		for entry in pending.iter_mut() {
 			maybe_select_opt_in_stat(entry, kind, &mut plaintext_len, max_plaintext_len)?;
@@ -1148,6 +1305,7 @@ fn maybe_select_opt_in_stat(
 		OptInStatKind::Hll => entry.hll.as_ref().map(Vec::len),
 		OptInStatKind::HeavyHitters => entry.heavy_hitters.as_ref().map(Vec::len),
 		OptInStatKind::RangeDistribution => entry.range_distribution.as_ref().map(Vec::len),
+		OptInStatKind::GroupTopK => entry.group_top_k.as_ref().map(Vec::len),
 	};
 	let Some(payload_len) = payload_len else {
 		return Ok(());
@@ -1165,6 +1323,7 @@ fn maybe_select_opt_in_stat(
 		OptInStatKind::Hll => entry.select_hll = true,
 		OptInStatKind::HeavyHitters => entry.select_heavy_hitters = true,
 		OptInStatKind::RangeDistribution => entry.select_range_distribution = true,
+		OptInStatKind::GroupTopK => entry.select_group_top_k = true,
 	}
 	Ok(())
 }
@@ -1216,11 +1375,13 @@ fn build_pending_column_stats_entry(
 			small_set: None,
 			heavy_hitters: None,
 			range_distribution: None,
+			group_top_k: None,
 			select_bloom: select_all_opt_ins,
 			select_hll: select_all_opt_ins,
 			select_small_set: select_all_opt_ins,
 			select_heavy_hitters: select_all_opt_ins,
 			select_range_distribution: select_all_opt_ins,
+			select_group_top_k: select_all_opt_ins,
 		});
 	};
 	let stats = collect_column_stats_in_one_pass(
@@ -1264,11 +1425,13 @@ fn build_pending_column_stats_entry(
 		small_set: stats.small_set,
 		heavy_hitters: stats.heavy_hitters,
 		range_distribution: stats.range_distribution,
+		group_top_k: None,
 		select_bloom: select_all_opt_ins,
 		select_hll: select_all_opt_ins,
 		select_small_set: select_all_opt_ins,
 		select_heavy_hitters: select_all_opt_ins,
 		select_range_distribution: select_all_opt_ins,
+		select_group_top_k: select_all_opt_ins,
 	})
 }
 
@@ -1766,6 +1929,13 @@ pub fn locator_flags_for_parsed_column_stats_block(parsed: &ParsedColumnStatsBlo
 	{
 		flags |= 1 << 5;
 	}
+	if parsed
+		.columns
+		.iter()
+		.any(|entry| entry.stat_flags & COLUMN_STAT_HAS_GROUP_TOP_K != 0)
+	{
+		flags |= 1 << 6;
+	}
 	flags
 }
 
@@ -1815,6 +1985,77 @@ fn encode_heavy_hitters(
 			));
 		}
 		encode_length_prefixed_bytes(out, &entry.value_key)?;
+		out.extend_from_slice(&entry.frequency.to_be_bytes());
+	}
+	Ok(())
+}
+
+pub fn group_top_k_payload_encoded_len(
+	payload: &ColumnStatsGroupTopKPayload,
+) -> std::io::Result<usize> {
+	let header = 1_usize
+		.checked_add(4)
+		.and_then(|bytes| bytes.checked_add(payload.column_ordinals.len().checked_mul(3)?))
+		.and_then(|bytes| bytes.checked_add(4))
+		.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "CSB group top-k byte overflow"))?;
+	payload.entries.iter().try_fold(header, |bytes, entry| {
+		let key_bytes = entry.value_keys.iter().try_fold(0_usize, |sum, value| {
+			sum.checked_add(4)
+				.and_then(|sum| sum.checked_add(value.len()))
+				.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "CSB group top-k byte overflow"))
+		})?;
+		bytes
+			.checked_add(key_bytes)
+			.and_then(|bytes| bytes.checked_add(8))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "CSB group top-k byte overflow"))
+	})
+}
+
+fn encode_group_top_k(
+	out: &mut Vec<u8>,
+	payload: &ColumnStatsGroupTopKPayload,
+) -> std::io::Result<()> {
+	if payload.column_ordinals.len() != payload.arrow_type_tags.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"CSB group top-k ordinals and type tags must have the same arity",
+		));
+	}
+	out.push(u8::from(payload.complete));
+	let arity = u32::try_from(payload.column_ordinals.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"CSB group top-k arity exceeds u32::MAX",
+		)
+	})?;
+	out.extend_from_slice(&arity.to_be_bytes());
+	for (ordinal, tag) in payload.column_ordinals.iter().zip(&payload.arrow_type_tags) {
+		out.extend_from_slice(&ordinal.to_be_bytes());
+		out.push(*tag);
+	}
+	let entry_count = u32::try_from(payload.entries.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"CSB group top-k entry count exceeds u32::MAX",
+		)
+	})?;
+	out.extend_from_slice(&entry_count.to_be_bytes());
+	for entry in &payload.entries {
+		if entry.value_keys.len() != payload.column_ordinals.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group top-k tuple arity does not match payload arity",
+			));
+		}
+		if entry.frequency == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group top-k frequency must be non-zero",
+			));
+		}
+		for value_key in &entry.value_keys {
+			encode_length_prefixed_bytes(out, value_key)?;
+		}
 		out.extend_from_slice(&entry.frequency.to_be_bytes());
 	}
 	Ok(())
@@ -2079,6 +2320,83 @@ where
 	}
 }
 
+fn encoded_value_at(
+	data_type: &DataType,
+	array: &dyn Array,
+	row: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+	match data_type {
+		DataType::Int8 => encoded_signed_value_at::<Int8Type>(array, row, 1),
+		DataType::Int16 => encoded_signed_value_at::<Int16Type>(array, row, 2),
+		DataType::Int32 => encoded_signed_value_at::<Int32Type>(array, row, 4),
+		DataType::Int64 => encoded_signed_value_at::<Int64Type>(array, row, 8),
+		DataType::Timestamp(TimeUnit::Millisecond, _) => {
+			encoded_signed_value_at::<TimestampMillisecondType>(array, row, 8)
+		}
+		DataType::Timestamp(TimeUnit::Microsecond, _) => {
+			encoded_signed_value_at::<TimestampMicrosecondType>(array, row, 8)
+		}
+		DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+			encoded_signed_value_at::<TimestampNanosecondType>(array, row, 8)
+		}
+		DataType::Date32 => encoded_signed_value_at::<Date32Type>(array, row, 4),
+		DataType::Boolean => {
+			let typed = downcast_array::<BooleanArray>(array)?;
+			Ok(typed
+				.is_valid(row)
+				.then(|| encode_bool_stat_value(typed.value(row)).to_vec()))
+		}
+		DataType::Float32 => {
+			let typed = downcast_array::<Float32Array>(array)?;
+			if !typed.is_valid(row) {
+				return Ok(None);
+			}
+			let value = typed.value(row);
+			if !value.is_finite() {
+				return Ok(None);
+			}
+			let value = if value == 0.0 { 0.0 } else { value };
+			encode_float32_stat_value(value).map(Some)
+		}
+		DataType::Float64 => {
+			let typed = downcast_array::<Float64Array>(array)?;
+			if !typed.is_valid(row) {
+				return Ok(None);
+			}
+			let value = typed.value(row);
+			if !value.is_finite() {
+				return Ok(None);
+			}
+			let value = if value == 0.0 { 0.0 } else { value };
+			encode_float64_stat_value(value).map(Some)
+		}
+		DataType::Utf8 => {
+			let typed = downcast_array::<StringArray>(array)?;
+			Ok(typed
+				.is_valid(row)
+				.then(|| typed.value(row).as_bytes().to_vec()))
+		}
+		_ => Ok(None),
+	}
+}
+
+fn encoded_signed_value_at<T>(
+	array: &dyn Array,
+	row: usize,
+	byte_width: usize,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+	T: ArrowPrimitiveType,
+	T::Native: Copy + Into<i64>,
+{
+	let typed = downcast_array::<PrimitiveArray<T>>(array)?;
+	if typed.is_valid(row) {
+		encode_signed_stat_value(typed.value(row).into(), byte_width).map(Some)
+	} else {
+		Ok(None)
+	}
+}
+
 fn emit_signed_values<T, F>(
 	array: &dyn Array,
 	byte_width: usize,
@@ -2309,6 +2627,112 @@ impl HeavyHitterCollector {
 		}
 		selected.sort_by(|left, right| left.value_key.cmp(&right.value_key));
 		Ok(ColumnStatsHeavyHitterPayload {
+			complete: false,
+			entries: selected,
+		})
+	}
+}
+
+struct GroupTopKCollector {
+	column_ordinals: Vec<u16>,
+	arrow_type_tags: Vec<u8>,
+	max_entries: usize,
+	max_bytes: usize,
+	candidates: SpaceSaving<Vec<Vec<u8>>>,
+	frequencies: BTreeMap<Vec<Vec<u8>>, u64>,
+}
+
+impl GroupTopKCollector {
+	fn new(
+		column_ordinals: Vec<u16>,
+		arrow_type_tags: Vec<u8>,
+		max_entries: u16,
+		max_bytes: u32,
+	) -> Self {
+		let max_entries = usize::from(max_entries);
+		Self {
+			column_ordinals,
+			arrow_type_tags,
+			max_entries,
+			max_bytes: max_bytes as usize,
+			candidates: SpaceSaving::new(max_entries),
+			frequencies: BTreeMap::new(),
+		}
+	}
+
+	fn insert(&mut self, value_keys: Vec<Vec<u8>>) -> std::io::Result<()> {
+		self.candidates.insert(value_keys.clone());
+		let frequency = self.frequencies.entry(value_keys).or_insert(0);
+		*frequency = frequency.checked_add(1).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group top-k frequency overflow",
+			)
+		})?;
+		Ok(())
+	}
+
+	fn finish(self) -> std::io::Result<ColumnStatsGroupTopKPayload> {
+		let all_entries = self
+			.frequencies
+			.iter()
+			.map(|(value_keys, frequency)| ColumnStatsGroupTopKEntry {
+				value_keys: value_keys.clone(),
+				frequency: *frequency,
+			})
+			.collect::<Vec<_>>();
+		let complete_payload = ColumnStatsGroupTopKPayload {
+			column_ordinals: self.column_ordinals.clone(),
+			arrow_type_tags: self.arrow_type_tags.clone(),
+			complete: true,
+			entries: all_entries,
+		};
+		if complete_payload.entries.len() <= self.max_entries
+			&& group_top_k_payload_encoded_len(&complete_payload)? <= self.max_bytes
+		{
+			return Ok(complete_payload);
+		}
+
+		let mut entries = self
+			.candidates
+			.keys()
+			.iter()
+			.filter_map(|key| {
+				self.frequencies
+					.get(key)
+					.map(|frequency| ColumnStatsGroupTopKEntry {
+						value_keys: key.clone(),
+						frequency: *frequency,
+					})
+			})
+			.collect::<Vec<_>>();
+		entries.sort_by(|left, right| {
+			right
+				.frequency
+				.cmp(&left.frequency)
+				.then_with(|| left.value_keys.cmp(&right.value_keys))
+		});
+		let mut selected = Vec::new();
+		for entry in entries {
+			if selected.len() >= self.max_entries {
+				break;
+			}
+			selected.push(entry);
+			let candidate = ColumnStatsGroupTopKPayload {
+				column_ordinals: self.column_ordinals.clone(),
+				arrow_type_tags: self.arrow_type_tags.clone(),
+				complete: false,
+				entries: selected.clone(),
+			};
+			if group_top_k_payload_encoded_len(&candidate)? > self.max_bytes {
+				selected.pop();
+				break;
+			}
+		}
+		selected.sort_by(|left, right| left.value_keys.cmp(&right.value_keys));
+		Ok(ColumnStatsGroupTopKPayload {
+			column_ordinals: self.column_ordinals,
+			arrow_type_tags: self.arrow_type_tags,
 			complete: false,
 			entries: selected,
 		})
@@ -2550,6 +2974,127 @@ fn read_heavy_hitters(
 	Ok(ColumnStatsHeavyHitterPayload { complete, entries })
 }
 
+fn read_group_top_k(
+	bytes: &[u8],
+	cursor: &mut usize,
+	non_null_count: Option<u64>,
+) -> std::io::Result<ColumnStatsGroupTopKPayload> {
+	let complete = *bytes.get(*cursor).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			"CSB group top-k payload truncated while reading complete flag",
+		)
+	})?;
+	*cursor += 1;
+	let complete = match complete {
+		0 => false,
+		1 => true,
+		_ => {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB group top-k complete flag must be 0 or 1",
+			));
+		}
+	};
+	let arity_bytes = bytes.get(*cursor..*cursor + 4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			"CSB group top-k payload truncated while reading arity",
+		)
+	})?;
+	*cursor += 4;
+	let arity = u32::from_be_bytes(arity_bytes.try_into().expect("slice len")) as usize;
+	if arity < 2 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"CSB group top-k arity must be at least two",
+		));
+	}
+	let mut column_ordinals = Vec::with_capacity(arity);
+	let mut arrow_type_tags = Vec::with_capacity(arity);
+	for _ in 0..arity {
+		let ordinal_bytes = bytes.get(*cursor..*cursor + 2).ok_or_else(|| {
+			Error::new(
+				ErrorKind::UnexpectedEof,
+				"CSB group top-k payload truncated while reading column ordinal",
+			)
+		})?;
+		*cursor += 2;
+		let ordinal = u16::from_be_bytes(ordinal_bytes.try_into().expect("slice len"));
+		let tag = *bytes.get(*cursor).ok_or_else(|| {
+			Error::new(
+				ErrorKind::UnexpectedEof,
+				"CSB group top-k payload truncated while reading type tag",
+			)
+		})?;
+		*cursor += 1;
+		if !is_valid_v1_arrow_stats_tag(tag) || tag == ARROW_STATS_TAG_OPAQUE_UNSUPPORTED {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB group top-k type tag is unsupported",
+			));
+		}
+		column_ordinals.push(ordinal);
+		arrow_type_tags.push(tag);
+	}
+	let count_bytes = bytes.get(*cursor..*cursor + 4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			"CSB group top-k payload truncated while reading entry count",
+		)
+	})?;
+	*cursor += 4;
+	let entry_count = u32::from_be_bytes(count_bytes.try_into().expect("slice len")) as usize;
+	let mut entries = Vec::with_capacity(entry_count);
+	let mut frequency_sum = 0_u64;
+	for _ in 0..entry_count {
+		let mut value_keys = Vec::with_capacity(arity);
+		for _ in 0..arity {
+			value_keys.push(read_length_prefixed_bytes(bytes, cursor)?);
+		}
+		if entries
+			.last()
+			.is_some_and(|previous: &ColumnStatsGroupTopKEntry| previous.value_keys >= value_keys)
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB group top-k values must be sorted and unique",
+			));
+		}
+		let frequency = read_u64_be(bytes, cursor, "group_top_k_frequency")?;
+		if frequency == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB group top-k frequency must be non-zero",
+			));
+		}
+		frequency_sum = frequency_sum.checked_add(frequency).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"CSB group top-k frequency sum overflow",
+			)
+		})?;
+		entries.push(ColumnStatsGroupTopKEntry {
+			value_keys,
+			frequency,
+		});
+	}
+	if let Some(non_null_count) = non_null_count
+		&& frequency_sum > non_null_count
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"CSB group top-k frequency sum exceeds anchor non_null_count",
+		));
+	}
+	Ok(ColumnStatsGroupTopKPayload {
+		column_ordinals,
+		arrow_type_tags,
+		complete,
+		entries,
+	})
+}
+
 fn read_kll_range_distribution(
 	bytes: &[u8],
 	cursor: &mut usize,
@@ -2639,10 +3184,10 @@ fn read_u64_be(bytes: &[u8], cursor: &mut usize, field: &str) -> std::io::Result
 mod tests {
 	use super::*;
 	use crate::schema::table::{
-		BloomBitsPerRow, ColumnHeavyHitterSpec, ColumnHllSpecV1, ColumnRangeDistributionSpec,
-		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, HllPrecision, LocalityPolicy,
-		PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1, SmallSetByteCap,
-		SmallSetValueCap,
+		BloomBitsPerRow, ColumnGroupTopKSpec, ColumnHeavyHitterSpec, ColumnHllSpecV1,
+		ColumnRangeDistributionSpec, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, HllPrecision,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		SmallSetByteCap, SmallSetValueCap,
 	};
 	use arrow::array::{Float32Array, Float64Array, Int64Array, LargeStringArray, StringArray};
 	use arrow::datatypes::{Field, Schema};
@@ -3300,6 +3845,7 @@ mod tests {
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 			heavy_hitters: Vec::new(),
 			range_distributions: Vec::new(),
+			column_group_top_k: Vec::new(),
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -3341,6 +3887,7 @@ mod tests {
 			small_set: None,
 			heavy_hitters: None,
 			range_distribution: None,
+			group_top_k: None,
 		};
 		assert_eq!(
 			distinct_count_for_column_stats_payload(&bloom_only).unwrap(),
@@ -3403,6 +3950,7 @@ mod tests {
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 			heavy_hitters: Vec::new(),
 			range_distributions: Vec::new(),
+			column_group_top_k: Vec::new(),
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -4142,6 +4690,64 @@ mod tests {
 				.binary_search(&encode_signed_optimizer_fact_scalar(10_000, 8).unwrap())
 				.is_ok()
 		);
+	}
+
+	#[test]
+	fn column_group_top_k_builds_tuple_payload_and_skips_null_components() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, true),
+			Field::new("region_id", DataType::Int64, true),
+		]);
+		let mut descriptor = stats_descriptor(&schema);
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			column_group_top_k: vec![
+				ColumnGroupTopKSpec::with_caps(
+					vec!["customer_id".to_string(), "region_id".to_string()],
+					8,
+					512,
+				)
+				.unwrap(),
+			],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)]))
+					as Arc<dyn Array>,
+				Arc::new(Int64Array::from(vec![Some(7), Some(7), Some(8), None])) as Arc<dyn Array>,
+				Arc::new(Int64Array::from(vec![Some(2), Some(2), None, Some(2)])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+
+		let encoded = build_always_on_column_stats_block(&descriptor, &batch).unwrap();
+		let parsed = parse_column_stats_block(&encoded).unwrap();
+		assert_ne!(
+			locator_flags_for_parsed_column_stats_block(&parsed) & (1 << 6),
+			0
+		);
+		let anchor = &parsed.columns[1];
+		assert_ne!(anchor.stat_flags & COLUMN_STAT_HAS_GROUP_TOP_K, 0);
+		let decoded = decode_column_stats_payload(anchor).unwrap();
+		let group = decoded.group_top_k.expect("group top-k payload");
+		assert!(group.complete);
+		assert_eq!(group.column_ordinals, vec![1, 2]);
+		assert_eq!(
+			group.arrow_type_tags,
+			vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64]
+		);
+		assert_eq!(group.entries.len(), 1);
+		assert_eq!(
+			group.entries[0].value_keys,
+			vec![
+				encode_signed_optimizer_fact_scalar(7, 8).unwrap(),
+				encode_signed_optimizer_fact_scalar(2, 8).unwrap(),
+			]
+		);
+		assert_eq!(group.entries[0].frequency, 2);
 	}
 
 	#[test]

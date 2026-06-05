@@ -4,7 +4,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{
-	ColumnHeavyHitterFact, ColumnRangeDistributionFact, DistinctCountFact, RangeFact, TableRef,
+	ColumnGroupTopKFact, ColumnHeavyHitterFact, ColumnRangeDistributionFact, DistinctCountFact,
+	RangeFact, TableRef,
 };
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{
@@ -242,6 +243,7 @@ pub enum ExecutionPlan {
 		column_range: Vec<(ColumnOrdinal, RangeFact)>,
 		column_range_distributions: Vec<(ColumnOrdinal, ColumnRangeDistributionFact)>,
 		column_heavy_hitters: Vec<(ColumnOrdinal, ColumnHeavyHitterFact)>,
+		column_group_top_k: Vec<(Vec<ColumnOrdinal>, ColumnGroupTopKFact)>,
 	},
 	Filter {
 		input: Box<ExecutionPlan>,

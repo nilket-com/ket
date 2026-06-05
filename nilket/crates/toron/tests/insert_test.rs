@@ -1359,6 +1359,7 @@ fn scan_plan(binding: &TableBinding) -> ExecutionPlan {
 		column_range: Vec::new(),
 		column_range_distributions: Vec::new(),
 		column_heavy_hitters: Vec::new(),
+		column_group_top_k: Vec::new(),
 	}
 }
 
