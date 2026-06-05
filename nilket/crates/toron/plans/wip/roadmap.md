@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–161 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–162 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,48 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 161 promoted; ADR 162 candidates
+### ADR 162 promoted; ADR 163 candidates
+
+ADR 162 promoted **Heavy-Hitter Join-Skew Refinement** — takes the **skew** half 161 left: at `L.x = R.y`,
+recover the *exact* contribution of keys hot on both sides from 156's already-produced top-k, leave the
+cold keys to 160/161 containment. **Toron-home** (consumer reuse of 156's facts; no new Wendelon
+production — provenance test). **Decomposition (no double-count):** `candidate = exact_hot_both +
+residual_containment` where `exact_hot_both = Σ_{v∈H} freq_L(v)·freq_R(v)` over `H = hot_L ∩ hot_R` (exact,
+since 156 emits only exactly-counted keys present in both maps; absent keys are untracked, not zero), and
+the residual runs 160/161 containment on the cold keys with the hot-both rows/keys **removed**
+(`|L|−Σfreq_L`, `ndv_L−|H|`, saturating). The whale case: `customer 7`
+× 50k orders × 50k payments = 2.5B rows that uniform containment spreads across `max(ndv)` and badly
+under-counts (154's hot-key miss across two tables) — the intersection recovers it to the row.
+**Direction-honest (distinct from 161's pure tightening):** 162 can move the estimate *up* — co-hot
+correlation produces more rows than uniform assumes; that's the safe direction (higher → hash; the
+*dangerous* error is the under-estimate → broadcast → replay, which 162 fixes; over-correction → missed
+broadcast, never incorrect). **Pure superset of 161:** `H = ∅` (anti-correlated / no HH facts) ⇒
+`exact_hot_both = 0`, residual unreduced ⇒ **byte-identical to 161**; with co-hot facts, returned estimate
+is `max(prior_160_161, exact_hot_both + residual)` so 162 never lowers 160/161; disjoint ranges ⇒ no
+shared key ⇒ estimate `0` (a contradictory shared HH sidecar is ignored by the zero-overlap prior guard,
+preserving 161's disjoint win). **Residual re-applies 161 range-overlap** by sequencing the two existing
+helpers (`ndv_containment_join_rows:4203` →
+`range_refined_containment_join_rows:4266`) on the reduced inputs — no new `containment_then_range` helper.
+**Full hot+cold sum, not the hot-only `max(containment, hot_both)` floor** (that floor under-counts the
+cold residual, re-introducing the under-estimate); the final `max(prior_160_161, sum)` is only the baseline
+guard. Estimate-channel, 139/140-backstopped, clean `Scan⋈Scan` / Inner / single-key (160/161 disciplines),
+`adr136` markers unchanged. **Headline:** `orders ⋈ payments` on `customer_id` with a shared whale →
+estimate ≫ uniform → **hash, no replay** (160/161 would broadcast → over-cap → replay). Anti-correlated
+hot keys (hot-one-side) stay in the residual; the one-sided `freq_L·R_threshold` bound is deferred.
+
+**ADR 163 lead candidates:** **measured *residual* join-miss evidence** (the 154/157 pattern — now that
+160/161/162 exhaust the cheap reuses, measure what the three still miss on a join: the honest gate before
+any new sketch; likely small); **Theta/MinHash key-overlap producer** (the 156/159 new-sketch pattern,
+Toron-sequence cross-ring — gated on the evidence; possibly closed out entirely if the residual is
+negligible); **multi-key equi-joins** (product-of-per-key-selectivities — the deferred 160/161/162
+generalization, a cheap completion); **dimensioned `CONVERT` / linear units** (parallel breadth, brainstorm
+009, operator-energy); **Rune optimizer cockpit** (brainstorm 010 — the fact spine now carries NDV /
+min-max / top-k / range-distribution / join-cardinality / overlap-fraction / **join-skew** gauges).
+**Forward arc:** `162 heavy-hitter skew → measured residual miss → Theta only for the residual → multi-join
+reordering` · *(parallel: CONVERT/units; Rune cockpit)*. Evidence-gate 163 on the 162 feat; the cheap-reuse
+arc (160→161→162) is now complete.
+
+### ADR 161 promoted; ADR 162 candidates (HISTORICAL)
 
 ADR 161 promoted **Join-Key Range-Overlap Refinement for NDV Containment** — a **pure tightening** of
 160's containment estimate, reusing the live min/max `RangeFact`s (158/159) on the join keys. **Reframed
