@@ -101,10 +101,12 @@ opens with an explicit hello that does three things:
    their own** `plans/wip/{name}_*` files: no code edits, no `git`
    commits, no promotion, no implementation — transient plans for peers
    to read, nothing else. (The operator promotes and implements.)
-3. **Hydrates context.** Point at `plans/wip/roadmap.md` (the curated
-   state + next-topic seeds) and the last `plan: adr NNN …` commit. A
-   model's persistent memory helps, but the roadmap + last plan commit
-   are the authoritative re-grounding.
+3. **Hydrates context.** Point at the **latest ADR's "Forward arc" +
+   "Deferred (named)" sections** (the freshest next-topic source — there
+   is no central roadmap; see [`prioritization.md`](prioritization.md))
+   and the last `plan: adr NNN …` commit. A model's persistent memory
+   helps, but the latest ADR + last plan commit are the authoritative
+   re-grounding.
 
 ## The cycle
 
@@ -113,8 +115,8 @@ deliberately — the focus is worth more than the throughput.
 
 1. **iter-0 ADR = topic menu** (when the next topic is unknown). Just an
    ADR file, no impl doc — the degenerate "choose the topic" case.
-   Drafts survey the roadmap seeds, ground the candidates against the
-   code, and recommend. *Topic selection is part of iter-0, not a
+   Drafts survey the latest ADR's deferred/forward-arc, ground the
+   candidates against the code, and recommend. *Topic selection is part of iter-0, not a
    separate step.*
 2. **Lock one topic.** Once chosen, stay on it; carry everything else.
 3. **Converge** across iterations (`iter_1`, `iter_2`, …): each model
@@ -154,12 +156,12 @@ crates/{toron|wendelon}/plans/wip/{name}_iter_{ITER}_impl_{NNN}.md
 
 ## Promotion mechanics (operator)
 
-A promotion commit is **exactly three files** — the canonical ADR, its
-impl plan, and the roadmap — as `plan: adr NNN <topic>` (co-author
-trailer; direct to `main` per repo convention). The roadmap rotates:
-add a Status entry, open a fresh `### ADR N promoted; ADR N+1
-candidates` head, mark the prior head `(HISTORICAL)`. wip iters stay
-untracked.
+A promotion commit is **exactly two files** — the canonical ADR and its
+impl plan — as `plan: adr NNN <topic>` (co-author trailer; direct to
+`main` per repo convention). There is no central roadmap to rotate (it
+was retired into [`prioritization.md`](prioritization.md); git holds the
+history); the next-topic hints live in the new ADR's "Forward arc" +
+"Deferred (named)" sections. wip iters stay untracked.
 
 ## The plan→implement block-chain
 
