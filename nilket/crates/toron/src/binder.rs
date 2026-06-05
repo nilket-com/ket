@@ -1485,6 +1485,11 @@ impl<'a> Binder<'a> {
 				&left_key.column.data_type,
 				&right_key.column.data_type,
 			),
+			(left_keys, right_keys)
+				if left_keys.len() == right_keys.len() && left_keys.len() >= 2 =>
+			{
+				multi_key_join_cardinality(kind, &left_plan, &right_plan, left_keys, right_keys)
+			}
 			_ => None,
 		};
 
@@ -4258,8 +4263,23 @@ fn ndv_containment_join_rows_from_points(
 		return None;
 	}
 
+	ndv_containment_join_rows_from_denominator(
+		left_rows,
+		right_rows,
+		u128::from(left_ndv.max(right_ndv)),
+	)
+}
+
+fn ndv_containment_join_rows_from_denominator(
+	left_rows: RowCount,
+	right_rows: RowCount,
+	denominator: u128,
+) -> Option<RowCount> {
+	if denominator == 0 {
+		return None;
+	}
+
 	let numerator = u128::from(left_rows.get()) * u128::from(right_rows.get());
-	let denominator = u128::from(left_ndv.max(right_ndv));
 	let estimated = if numerator == 0 {
 		0
 	} else {
@@ -4267,6 +4287,80 @@ fn ndv_containment_join_rows_from_points(
 	};
 
 	Some(RowCount::new(u64::try_from(estimated).unwrap_or(u64::MAX)))
+}
+
+fn multiply_denominator_capped_at_numerator(
+	denominator: u128,
+	factor: u128,
+	numerator: u128,
+) -> Option<u128> {
+	if factor == 0 {
+		return None;
+	}
+	if numerator > 0 && denominator >= numerator {
+		return Some(numerator);
+	}
+	match denominator.checked_mul(factor) {
+		Some(product) if numerator > 0 => Some(product.min(numerator)),
+		Some(product) => Some(product),
+		None if numerator > 0 => Some(numerator),
+		None => Some(u128::MAX),
+	}
+}
+
+fn multi_key_join_cardinality(
+	kind: JoinKind,
+	left: &ScopedExecutionPlan,
+	right: &ScopedExecutionPlan,
+	left_keys: &[ResolvedJoinKey],
+	right_keys: &[ResolvedJoinKey],
+) -> Option<RowCount> {
+	if kind != JoinKind::Inner
+		|| left_keys.len() != right_keys.len()
+		|| left_keys.len() < 2
+		|| left.facts.origin != PlanOrigin::SingleBaseRelation
+		|| right.facts.origin != PlanOrigin::SingleBaseRelation
+	{
+		return None;
+	}
+
+	let left_rows =
+		estimate_row_source(left.facts.row_upper_bound, left.facts.estimated_row_count)?;
+	let right_rows =
+		estimate_row_source(right.facts.row_upper_bound, right.facts.estimated_row_count)?;
+	let numerator = u128::from(left_rows.get()) * u128::from(right_rows.get());
+	let mut denominator = 1_u128;
+	for (left_key, right_key) in left_keys.iter().zip(right_keys) {
+		let left_ndv = clean_base_column_ndv_for_join_input(&left.plan, left_key.column.ordinal)?
+			.point_estimate();
+		let right_ndv =
+			clean_base_column_ndv_for_join_input(&right.plan, right_key.column.ordinal)?
+				.point_estimate();
+		denominator = multiply_denominator_capped_at_numerator(
+			denominator,
+			u128::from(left_ndv.max(right_ndv)),
+			numerator,
+		)?;
+	}
+
+	let mut refined =
+		ndv_containment_join_rows_from_denominator(left_rows, right_rows, denominator)?;
+	for (left_key, right_key) in left_keys.iter().zip(right_keys) {
+		if let (Some(left_range), Some(right_range)) = (
+			clean_base_column_range_for_join_input(&left.plan, left_key.column.ordinal),
+			clean_base_column_range_for_join_input(&right.plan, right_key.column.ordinal),
+		) {
+			refined = range_refined_containment_join_rows(
+				refined,
+				&left_range,
+				&left_key.column.data_type,
+				&right_range,
+				&right_key.column.data_type,
+			)
+			.unwrap_or(refined);
+		}
+	}
+	Some(refined)
 }
 
 fn join_output_ndv_containment_estimate(
@@ -15496,6 +15590,45 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn single_key_join_unchanged_byte_identical_to_162() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"orders",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+			vec![(ColumnOrdinal(1), int64_heavy_hitter_fact(&[(50, 100)]))],
+		);
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"customers",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+			vec![(ColumnOrdinal(0), range_fact_i64(50, 149, 1_000))],
+			vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(50, 100)]))],
+		);
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan single-key 162 regression join"),
+		)
+		.await
+		.expect("bind single-key 162 regression join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(14_091))
+		);
+	}
+
+	#[tokio::test]
 	async fn disjoint_range_zero_dominates_stale_shared_hot_key() {
 		let mut catalog = join_catalog();
 		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
@@ -15659,57 +15792,303 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn join_output_containment_skips_multi_key_join() {
-		let mut catalog = join_catalog();
+	async fn multi_key_denominator_is_product_of_per_key_max_ndv() {
+		let mut catalog = multi_key_join_catalog();
 		seed_table_optimizer_facts(
 			&mut catalog,
-			"orders",
+			"order_items",
 			None,
 			Some(10_000),
 			vec![
-				(ColumnOrdinal(0), DistinctCountFact::Exact(10_000)),
 				(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
 			],
 		);
 		seed_table_optimizer_facts(
 			&mut catalog,
-			"customers",
+			"line_prices",
 			None,
 			Some(5_000),
-			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
-		);
-		let logical = LogicalPlan::Join {
-			left: Box::new(LogicalPlan::ScanNamed {
-				table: TableRef::new("orders"),
-				projection: None,
-			}),
-			right: Box::new(LogicalPlan::ScanNamed {
-				table: TableRef::new("customers"),
-				projection: None,
-			}),
-			kind: JoinKind::Inner,
-			on: vec![
-				(
-					Expr::qualified_column(TableRef::new("orders"), "customer_id"),
-					Expr::qualified_column(TableRef::new("customers"), "id"),
-				),
-				(
-					Expr::qualified_column(TableRef::new("orders"), "id"),
-					Expr::qualified_column(TableRef::new("customers"), "id"),
-				),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(500)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(5)),
 			],
-			strategy_intent: JoinStrategyIntent::Auto,
-		};
+		);
 
 		let scoped = Binder {
 			catalog: &catalog,
 			config: &PlannerConfig::default(),
 		}
-		.bind_plan(&logical)
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
 		.await
-		.expect("bind multi-key containment join");
+		.expect("bind multi-key product denominator join");
 
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+	}
+
+	#[tokio::test]
+	async fn multi_key_fails_open_when_any_key_lacks_ndv() {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"order_items",
+			None,
+			Some(10_000),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+			],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"line_prices",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(500))],
+		);
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind missing multi-key NDV join");
+
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 		assert_eq!(scoped.facts.estimated_row_count, None);
+		assert_eq!(scoped.facts.estimated_byte_size, None);
+	}
+
+	#[tokio::test]
+	async fn multi_key_range_overlap_folds_per_key() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts_with_ranges(
+				&mut catalog,
+				table,
+				None,
+				Some(10_000),
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+				],
+				match table {
+					"order_items" => vec![
+						(ColumnOrdinal(1), range_fact_i64(0, 99, 10_000)),
+						(ColumnOrdinal(2), range_fact_i64(0, 99, 10_000)),
+					],
+					"line_prices" => vec![
+						(ColumnOrdinal(1), range_fact_i64(50, 149, 10_000)),
+						(ColumnOrdinal(2), range_fact_i64(90, 189, 10_000)),
+					],
+					_ => unreachable!(),
+				},
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key range fold join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(500)));
+	}
+
+	#[tokio::test]
+	async fn multi_key_range_malformed_key_keeps_multi_key_ndv_estimate() {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"order_items",
+			None,
+			Some(10_000),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+			vec![
+				(ColumnOrdinal(1), range_fact_i32(0, 99, 10_000)),
+				(ColumnOrdinal(2), range_fact_i64(0, 99, 10_000)),
+			],
+		);
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"line_prices",
+			None,
+			Some(10_000),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+			vec![
+				(ColumnOrdinal(1), range_fact_i64(50, 149, 10_000)),
+				(ColumnOrdinal(2), range_fact_i64(50, 149, 10_000)),
+			],
+		);
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key malformed range join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
+	}
+
+	#[tokio::test]
+	async fn multi_key_disjoint_on_any_key_estimates_empty() {
+		let scoped = bind_multi_key_disjoint_join().await;
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+	}
+
+	#[tokio::test]
+	async fn multi_key_is_estimate_channel_not_emptyrelation() {
+		let scoped = bind_multi_key_disjoint_join().await;
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn multi_key_three_key_join_does_not_spuriously_zero() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts(
+				&mut catalog,
+				table,
+				None,
+				Some(1),
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(u64::MAX)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(u64::MAX)),
+					(ColumnOrdinal(3), DistinctCountFact::Exact(u64::MAX)),
+				],
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&[
+			"order_id", "line_no", "shard_id",
+		]))
+		.await
+		.expect("bind three-key no-spurious-zero join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(1)));
+	}
+
+	#[tokio::test]
+	async fn multi_key_three_key_disjoint_estimates_zero() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts_with_ranges(
+				&mut catalog,
+				table,
+				None,
+				Some(1),
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(u64::MAX)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(u64::MAX)),
+					(ColumnOrdinal(3), DistinctCountFact::Exact(u64::MAX)),
+				],
+				match table {
+					"order_items" => vec![(ColumnOrdinal(2), range_fact_i64(0, 0, 1))],
+					"line_prices" => vec![(ColumnOrdinal(2), range_fact_i64(1, 1, 1))],
+					_ => unreachable!(),
+				},
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&[
+			"order_id", "line_no", "shard_id",
+		]))
+		.await
+		.expect("bind three-key disjoint join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+	}
+
+	#[tokio::test]
+	async fn multi_key_does_not_apply_heavy_hitter() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+				&mut catalog,
+				table,
+				None,
+				Some(10_000),
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+				],
+				Vec::new(),
+				vec![(ColumnOrdinal(1), int64_heavy_hitter_fact(&[(7, 5_000)]))],
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key HH-deferred join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(10_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn multi_key_join_estimates_from_product_denominator_not_composite_unknown() {
+		let mut catalog = multi_key_parent_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts(
+				&mut catalog,
+				table,
+				None,
+				Some(10_000),
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(10_000)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(10_000)),
+				],
+			);
+		}
+
+		let (_plan, trace) = bind_with_trace(
+			&multi_key_parent_join_logical(),
+			&catalog,
+			&auto_broadcast_config(512 * 1024),
+		)
+		.await
+		.expect("bind headline multi-key join");
+
+		assert_eq!(trace.join_decisions.len(), 2);
+		assert!(matches!(
+			trace.join_decisions[1].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Left,
+				..
+			}
+		));
 	}
 
 	#[tokio::test]
@@ -18354,6 +18733,141 @@ mod tests {
 			)
 			.expect("register regions");
 		catalog
+	}
+
+	fn multi_key_join_catalog() -> MockCatalog {
+		let mut catalog = MockCatalog::new();
+		register_multi_key_tables(&mut catalog);
+		catalog
+	}
+
+	fn multi_key_parent_join_catalog() -> MockCatalog {
+		let mut catalog = multi_key_join_catalog();
+		catalog
+			.register_descriptor(
+				TableId(12),
+				named_descriptor(
+					12,
+					"regions",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.expect("register multi-key regions");
+		catalog
+	}
+
+	fn register_multi_key_tables(catalog: &mut MockCatalog) {
+		catalog
+			.register_descriptor(
+				TableId(10),
+				named_descriptor(
+					10,
+					"order_items",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("order_id", DataType::Int64, false),
+						Field::new("line_no", DataType::Int64, false),
+						Field::new("shard_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.expect("register order_items");
+		catalog
+			.register_descriptor(
+				TableId(11),
+				named_descriptor(
+					11,
+					"line_prices",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("order_id", DataType::Int64, false),
+						Field::new("line_no", DataType::Int64, false),
+						Field::new("shard_id", DataType::Int64, false),
+						Field::new("region_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.expect("register line_prices");
+	}
+
+	fn multi_key_join_logical(keys: &[&str]) -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("order_items"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("line_prices"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: keys
+				.iter()
+				.map(|key| {
+					(
+						Expr::qualified_column(TableRef::new("order_items"), *key),
+						Expr::qualified_column(TableRef::new("line_prices"), *key),
+					)
+				})
+				.collect(),
+			strategy_intent: JoinStrategyIntent::Auto,
+		}
+	}
+
+	fn multi_key_parent_join_logical() -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(multi_key_join_logical(&["order_id", "line_no"])),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("regions"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("line_prices"), "region_id"),
+				Expr::qualified_column(TableRef::new("regions"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}
+	}
+
+	async fn bind_multi_key_disjoint_join() -> ScopedExecutionPlan {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"order_items",
+			None,
+			Some(10_000),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+			vec![
+				(ColumnOrdinal(1), range_fact_i64(0, 99, 10_000)),
+				(ColumnOrdinal(2), range_fact_i64(0, 99, 10_000)),
+			],
+		);
+		seed_table_optimizer_facts_with_ranges(
+			&mut catalog,
+			"line_prices",
+			None,
+			Some(10_000),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+			vec![
+				(ColumnOrdinal(1), range_fact_i64(1_000, 1_099, 10_000)),
+				(ColumnOrdinal(2), range_fact_i64(50, 149, 10_000)),
+			],
+		);
+
+		Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key disjoint range join")
 	}
 
 	fn float_join_catalog() -> MockCatalog {

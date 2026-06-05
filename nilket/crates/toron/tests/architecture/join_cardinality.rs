@@ -49,6 +49,8 @@ pub(crate) fn adr160_join_containment_requires_clean_base_ndv() {
 	let estimate = source_block(&binder, "fn join_output_ndv_containment_estimate");
 	let formula = source_block(&binder, "fn ndv_containment_join_rows");
 	let point_formula = source_block(&binder, "fn ndv_containment_join_rows_from_points");
+	let denominator_formula =
+		source_block(&binder, "fn ndv_containment_join_rows_from_denominator");
 
 	assert!(lookup.contains("ExecutionPlan::Scan"));
 	assert!(lookup.contains("projection"));
@@ -62,10 +64,10 @@ pub(crate) fn adr160_join_containment_requires_clean_base_ndv() {
 	assert!(formula.contains("point_estimate"));
 	assert!(formula.contains("ndv_containment_join_rows_from_points"));
 	assert!(point_formula.contains("left_ndv == 0 || right_ndv == 0"));
-	assert!(point_formula.contains("u128::from(left_rows.get())"));
-	assert!(point_formula.contains("u64::try_from(estimated).unwrap_or(u64::MAX)"));
+	assert!(point_formula.contains("ndv_containment_join_rows_from_denominator"));
+	assert!(denominator_formula.contains("u128::from(left_rows.get())"));
+	assert!(denominator_formula.contains("u64::try_from(estimated).unwrap_or(u64::MAX)"));
 	assert!(binder.contains("join_output_containment_skips_filtered_input_ndv"));
-	assert!(binder.contains("join_output_containment_skips_multi_key_join"));
 	assert!(binder.contains("join_output_containment_skips_non_inner_join"));
 }
 
@@ -239,6 +241,90 @@ pub(crate) fn adr162_join_skew_keeps_160_161_prior_floor() {
 	assert!(binder.contains("join_skew_never_lowers_161_prior"));
 	assert!(binder.contains("join_skew_fails_open_on_key_type_mismatch_or_invalid_frequency"));
 	assert!(binder.contains("disjoint_range_zero_dominates_stale_shared_hot_key"));
+}
+
+#[test]
+pub(crate) fn adr163_multi_key_denominator_is_product() {
+	let binder = binder_source();
+	let bind_join = source_block(&binder, "async fn bind_join");
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+	let denominator = source_block(&binder, "fn ndv_containment_join_rows_from_denominator");
+	let multiply = source_block(&binder, "fn multiply_denominator_capped_at_numerator");
+
+	assert!(bind_join.contains("left_keys.len() == right_keys.len() && left_keys.len() >= 2"));
+	assert!(bind_join.contains("multi_key_join_cardinality"));
+	assert!(estimate.contains("left_keys.len() < 2"));
+	assert!(estimate.contains("left_ndv.max(right_ndv)"));
+	assert!(estimate.contains("multiply_denominator_capped_at_numerator"));
+	assert!(denominator.contains("((numerator - 1) / denominator) + 1"));
+	assert!(multiply.contains("checked_mul"));
+	assert!(multiply.contains("product.min(numerator)"));
+	assert!(binder.contains("multi_key_denominator_is_product_of_per_key_max_ndv"));
+	assert!(binder.contains("multi_key_three_key_join_does_not_spuriously_zero"));
+	assert!(binder.contains("single_key_join_unchanged_byte_identical_to_162"));
+}
+
+#[test]
+pub(crate) fn adr163_multi_key_requires_clean_base_ndv() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+
+	assert!(estimate.contains("kind != JoinKind::Inner"));
+	assert!(estimate.contains("PlanOrigin::SingleBaseRelation"));
+	assert!(estimate.contains("estimate_row_source"));
+	assert!(estimate.contains("clean_base_column_ndv_for_join_input"));
+	assert!(!estimate.contains("column_ndv_for_input"));
+	assert!(binder.contains("multi_key_fails_open_when_any_key_lacks_ndv"));
+}
+
+#[test]
+pub(crate) fn adr163_multi_key_range_fold_reuses_161_fail_open() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+
+	assert!(estimate.contains("clean_base_column_range_for_join_input"));
+	assert!(estimate.contains("range_refined_containment_join_rows"));
+	assert!(estimate.contains(".unwrap_or(refined)"));
+	assert!(binder.contains("multi_key_range_overlap_folds_per_key"));
+	assert!(binder.contains("multi_key_range_malformed_key_keeps_multi_key_ndv_estimate"));
+	assert!(binder.contains("multi_key_disjoint_on_any_key_estimates_empty"));
+	assert!(binder.contains("multi_key_three_key_disjoint_estimates_zero"));
+}
+
+#[test]
+pub(crate) fn adr163_multi_key_defers_heavy_hitter() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+
+	assert!(!estimate.contains("column_heavy_hitters"));
+	assert!(!estimate.contains("clean_base_column_heavy_hitter_for_join_input"));
+	assert!(binder.contains("multi_key_does_not_apply_heavy_hitter"));
+}
+
+#[test]
+pub(crate) fn adr163_no_wendelon_tuple_top_k_surface() {
+	let manifest_dir = manifest_dir();
+	let mut offenders = source_lines(&manifest_dir.join("src"));
+	offenders.extend(source_lines(&wendelon_manifest_dir().join("src")));
+	let offenders = offenders
+		.into_iter()
+		.filter(|(_, _, line)| {
+			[
+				"ColumnGroupTopK",
+				"TupleTopK",
+				"column_group_top_k",
+				"tuple_top_k",
+			]
+			.iter()
+			.any(|forbidden| line.contains(forbidden))
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"ADR163 defers Wendelon tuple top-k production; no source surface should be added yet:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
 }
 
 #[test]
