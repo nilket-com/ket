@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–160 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–161 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,45 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 160 promoted; ADR 161 candidates
+### ADR 161 promoted; ADR 162 candidates
+
+ADR 161 promoted **Join-Key Range-Overlap Refinement for NDV Containment** — a **pure tightening** of
+160's containment estimate, reusing the live min/max `RangeFact`s (158/159) on the join keys. **Reframed
+from the roadmap's "evidence → Theta":** containment's weakness splits into *disjoint* keys (a cheap
+reuse fix needing no evidence — min/max *prove* emptiness under the optimizer fact contract) and
+*skew-correlated* keys (the half that warrants evidence + heavy-hitter/Theta). 161 takes the
+disjoint/partial-overlap half. **Load-bearing
+invariant:** only keys in the overlap `[max(min_L,min_R), min(max_L,max_R)]` can join; outside keys are
+phantom matches containment over-counted — so the refinement only *removes* phantoms: **`refined ≤
+containment`, always** (monotone; never inflates, never more wrong than 160; under-counts still
+139/140-backstopped). Disjoint key ranges → estimate `0`; partial → scaled; contained/identical →
+unchanged. **Fraction `f = overlap_w / min(width_L, width_R)`** — the *derived* safe
+coarsening of the exact two-sided participation model (`E' = |L|oL·|R|oR / max(ndv_L·oL, ndv_R·oR)`): exact
+at disjoint/contained/symmetric-partial, safe-direction (under-tightening) error only on asymmetric-partial;
+**`min` not `max`/union** (max would wrongly penalize the contained `L⊂R` case). **Integral type lane**
+(Int32/Int64/Date32/Timestamp via one `i128` path, `+1` inclusive width — every common join key), with the
+consumer validating each range tag against the join key type because descriptor range import is ordinal-only;
+**Real fails open at the helper** (SQL float join keys are already rejected before estimation).
+**Estimate-channel only** — disjoint → estimate `0`, **not** a hard `EmptyRelation` prune (that crosses into the correctness
+channel with its own replay grounding — deferred, D7). Fires only on clean `Scan ⋈ Scan`, Inner, single-key
+(160 disciplines); no execution-side change (sharpens the estimate 160's consumer wire already reads).
+**Headline:** disjoint `region` ranges (`[1,5]` vs `[100,200]`) → refined `estimated_row_count == 0` where
+160 estimated `|L|·|R|/max(ndv) > 0`; paired partial-overlap-scales-down. **Payoff gate:** a 2-join plan
+spends that zero child estimate through 160's existing composite `BroadcastEstimated` wire without replay,
+plus a stale-range pair proving tight-budget replay still matches forced hash.
+
+**ADR 162 lead candidates:** **heavy-hitter-join skew refinement** (the skew half — intersect per-side
+top-k on the join keys, reuse 155/156; the direct sequel, catches the hot-key join miss range-overlap
+can't); **measured residual join-miss evidence** (the 154/157 pattern — warranted now for what survives
+161 + heavy-hitter, to gate any new sketch); **Theta/MinHash key-overlap producer** (the 156/159 new-sketch
+pattern — gated on the evidence; likely a small residual after the two cheap reuses); **dimensioned
+`CONVERT` / linear units** (parallel breadth, brainstorm 009, operator-energy); **Rune optimizer cockpit**
+(brainstorm 010 — the fact spine now carries join cardinality + overlap-fraction gauges). **Forward arc:**
+`161 range-overlap tightening → heavy-hitter-join skew → measured residual miss → Theta only for the
+residual → multi-join reordering` · *(parallel: CONVERT/units; Rune cockpit)*. Evidence-gate 162 on the
+161 feat.
+
+### ADR 160 promoted; ADR 161 candidates (HISTORICAL)
 
 ADR 160 promoted **Join-Output Cardinality from NDV Containment** — opens the **join-cardinality arc**,
 reusing existing NDV (the 144 pattern, *not* a from-scratch Theta sketch — the roadmap's "Theta" lead was
