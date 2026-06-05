@@ -2267,23 +2267,6 @@ pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_non_star_shapes
 }
 
 #[test]
-pub(crate) fn adr131_build_side_still_requires_single_base_hard_bytes() {
-	let binder = binder_source();
-	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
-	let candidate = source_block(&binder, "fn build_byte_candidate");
-
-	assert!(candidate.contains("facts.origin != PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("left_input.facts.origin != PlanOrigin::SingleBaseRelation"));
-	assert!(choose_auto.contains("right_input.facts.origin != PlanOrigin::SingleBaseRelation"));
-	assert!(
-		candidate.contains("facts.byte_upper_bound") && candidate.contains("estimated_byte_size")
-	);
-	assert!(candidate.contains("build_bytes < threshold"));
-	assert!(choose_auto.contains("MissingBuildByteUpperBound"));
-	assert!(choose_auto.contains("BuildByteUpperBoundAboveThreshold"));
-}
-
-#[test]
 pub(crate) fn adr131_strategy_decision_remains_single_helper() {
 	let binder = binder_source();
 	let bind_join = source_block(&binder, "async fn bind_join");

@@ -994,6 +994,52 @@ mod tests {
 		assert_fact_dim_join_matches_hash(&hash_results, &replay_results);
 	}
 
+	#[tokio::test]
+	async fn overestimated_inner_join_broadcast_over_cap_replays_as_hash_and_matches_digest() {
+		let plan = join_cardinality_three_table_plan();
+		let catalog = join_cardinality_catalog();
+		let storage = join_cardinality_storage();
+
+		let hash = run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+			plan.clone(),
+			catalog.clone(),
+			PlannerConfig {
+				force_hash_join_ids: BTreeSet::from([JoinReplayId(0), JoinReplayId(1)]),
+				..PlannerConfig::default()
+			},
+			QueryBudget::test_default(),
+			storage.clone(),
+		)
+		.await
+		.expect("execute forced hash containment join");
+		assert!(!hash.replayed, "forced hash baseline should not replay");
+
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+		let replay =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				plan,
+				catalog,
+				PlannerConfig::default(),
+				query_budget,
+				storage,
+			)
+			.await
+			.expect("containment-estimated broadcast should replay as hash");
+
+		assert!(
+			replay.replayed,
+			"expected broadcast-cap replay for containment-estimated parent join"
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&replay.results, SortPolicy::FullRowLex)
+				.expect("containment replay digest"),
+			canonical_arrow_ipc_digest(&hash.results, SortPolicy::FullRowLex)
+				.expect("forced hash digest")
+		);
+	}
+
 	mod skew_evidence {
 		use super::*;
 
@@ -2225,6 +2271,77 @@ mod tests {
 		catalog
 	}
 
+	fn join_cardinality_three_table_plan() -> LogicalPlan {
+		crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 INNER JOIN regions r ON c.region_id = r.id",
+			)
+			.expect("join-cardinality SQL plan")
+	}
+
+	fn join_cardinality_catalog() -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"orders",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("customer_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"customers",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("region_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(3),
+				named_descriptor(
+					3,
+					"regions",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.unwrap();
+		for table in ["orders", "customers"] {
+			let join_key = if table == "orders" {
+				ColumnOrdinal(1)
+			} else {
+				ColumnOrdinal(0)
+			};
+			catalog
+				.seed_optimizer_facts(
+					&crate::catalog::TableRef::new(table),
+					TableOptimizerFacts {
+						byte_upper_bound: None,
+						row_upper_bound: Some(RowCount::new(1)),
+						column_ndv: BTreeMap::from([(join_key, DistinctCountFact::Exact(1_000))]),
+						column_range: Default::default(),
+						column_range_distributions: Default::default(),
+						column_heavy_hitters: Default::default(),
+					},
+				)
+				.expect("seed stale-low join cardinality facts");
+		}
+		Arc::new(catalog)
+	}
+
 	fn named_descriptor(id_byte: u8, table: &str, schema: Schema) -> TableSchemaDescriptor {
 		TableSchemaDescriptor::new(
 			TableObjectId::new([id_byte; 16]),
@@ -2266,6 +2383,46 @@ mod tests {
 		.unwrap();
 		Arc::new(MultiTableStorageScan {
 			tables: HashMap::from([(TableId(1), orders), (TableId(2), customers)]),
+		})
+	}
+
+	fn join_cardinality_storage() -> Arc<MultiTableStorageScan> {
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let customers_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region_id", DataType::Int64, false),
+		]));
+		let regions_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let orders = RecordBatch::try_new(
+			orders_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![100, 101, 102, 103, 104, 105])),
+				Arc::new(Int64Array::from(vec![1, 2, 2, 3, 4, 5])),
+			],
+		)
+		.unwrap();
+		let customers = RecordBatch::try_new(
+			customers_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+				Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+			],
+		)
+		.unwrap();
+		let regions = RecordBatch::try_new(
+			regions_schema,
+			vec![Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50]))],
+		)
+		.unwrap();
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([
+				(TableId(1), orders),
+				(TableId(2), customers),
+				(TableId(3), regions),
+			]),
 		})
 	}
 
@@ -3288,29 +3445,22 @@ mod tests {
 						replayed,
 					});
 				}
-				Err(error) if !replayed && broadcast_replication_exhausted(&error) => {
-					planner_config.force_hash_join_ids = BTreeSet::from([JoinReplayId(0)]);
-					fragment_id_namespace = fragment_id_namespace
-						.checked_add(1)
-						.expect("test fragment namespace overflow");
-					replayed = true;
+				Err(error) if !replayed => {
+					if let Some(force_hash_join_ids) =
+						crate::coordinator::broadcast_cap_replay_trigger(&error, &stages)
+					{
+						planner_config.force_hash_join_ids = force_hash_join_ids;
+						fragment_id_namespace = fragment_id_namespace
+							.checked_add(1)
+							.expect("test fragment namespace overflow");
+						replayed = true;
+					} else {
+						return Err(scheduler_error_for_test(error));
+					}
 				}
 				Err(error) => return Err(scheduler_error_for_test(error)),
 			}
 		}
-	}
-
-	fn broadcast_replication_exhausted(error: &SchedulerError) -> bool {
-		matches!(
-			error,
-			SchedulerError::TaskFailed {
-				kind: TaskFailureKind::BudgetExhausted {
-					dimension: BudgetDimension::BroadcastReplication,
-					..
-				},
-				..
-			}
-		)
 	}
 
 	fn scheduler_error_for_test(error: SchedulerError) -> QueryError {

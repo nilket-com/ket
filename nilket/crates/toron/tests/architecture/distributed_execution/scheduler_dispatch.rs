@@ -1081,6 +1081,8 @@ pub(crate) fn broadcast_join_fragmenter_input_shape_is_architecture_guarded() {
 	assert!(broadcast.contains("upstream_stages.push(build.stage_id)"));
 	assert!(broadcast.contains("rewrite_broadcast_star_probe"));
 	assert!(broadcast.contains("FragmentError::BroadcastProbeNotStarLinear"));
-	assert!(broadcast.contains("contains_join(&build_boundary.input)"));
+	assert!(broadcast.contains("first_scan_metadata(&build_boundary.input)"));
+	assert!(source.contains("broadcast_composite_build_fragments_to_single_build_producer"));
+	assert!(!broadcast.contains("contains_join(&build_boundary.input)"));
 	assert!(!broadcast.contains("share: None"));
 }

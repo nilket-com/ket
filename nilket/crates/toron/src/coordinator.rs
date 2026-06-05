@@ -1347,7 +1347,7 @@ fn logical_plan_is_distributed_read(plan: &LogicalPlan) -> bool {
 	)
 }
 
-fn broadcast_cap_replay_trigger(
+pub(crate) fn broadcast_cap_replay_trigger(
 	error: &SchedulerError,
 	stages: &[StagePlan],
 ) -> Option<BTreeSet<JoinReplayId>> {

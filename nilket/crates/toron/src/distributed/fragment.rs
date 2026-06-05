@@ -616,9 +616,6 @@ fn rewrite_broadcast_star_probe(
 			if build_boundary.partition_count != 1 {
 				return Err(FragmentError::BroadcastBuildNotPublished);
 			}
-			if contains_join(&build_boundary.input) {
-				return Err(FragmentError::BroadcastProbeNotStarLinear);
-			}
 			let build_scan_metadata = first_scan_metadata(&build_boundary.input)
 				.ok_or(FragmentError::MissingScanMetadata)?;
 			let build_exchange_id = allocator.alloc_exchange();
@@ -1667,6 +1664,46 @@ mod tests {
 					..
 				} if *observed == u32::try_from(worker_index).unwrap() && *worker_count == 3
 			));
+			assert!(matches!(
+				&task.spec.inputs[1],
+				TaskInputBinding::ShuffleConsumer {
+					exchange_id,
+					producer_stage_id,
+					partition_id,
+					..
+				} if *exchange_id == ExchangeId::new(0)
+					&& *producer_stage_id == StageId::new(0)
+					&& *partition_id == PartitionId::new(0)
+			));
+		}
+	}
+
+	#[test]
+	fn broadcast_composite_build_fragments_to_single_build_producer() {
+		let build = join_plan(
+			exchanged_scan(TableId(1), 2),
+			exchanged_scan(TableId(2), 2),
+			JoinStrategy::HashPartitioned,
+		);
+		let plan = join_plan(
+			ExecutionPlan::Exchange {
+				input: Box::new(build),
+				partition_count: 1,
+				key: key_expr(),
+			},
+			scan_plan_with_table(TableId(3), 3),
+			JoinStrategy::Broadcast,
+		);
+
+		let stages =
+			fragment_plan(plan, config().with_worker_count(3)).expect("fragment composite build");
+
+		assert_eq!(stages.len(), 2);
+		assert!(contains_join(&stages[0].tasks[0].spec.plan));
+		assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
+		assert_eq!(stages[1].tasks.len(), 3);
+		for task in &stages[1].tasks {
+			assert_eq!(task.spec.inputs.len(), 2);
 			assert!(matches!(
 				&task.spec.inputs[1],
 				TaskInputBinding::ShuffleConsumer {

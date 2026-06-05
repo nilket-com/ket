@@ -226,6 +226,20 @@ impl PlanOptimizerFacts {
 		}
 	}
 
+	fn composite_with_join_estimate(
+		estimated_row_count: Option<RowCount>,
+		output_schema: &Schema,
+	) -> Self {
+		Self {
+			origin: PlanOrigin::Composite,
+			byte_upper_bound: None,
+			estimated_byte_size: estimated_row_count
+				.and_then(|rows| estimate_materialized_byte_size(rows, output_schema)),
+			estimated_row_count,
+			row_upper_bound: None,
+		}
+	}
+
 	fn composite_with_row(row_upper_bound: Option<RowCount>) -> Self {
 		Self {
 			origin: PlanOrigin::Composite,
@@ -1458,6 +1472,16 @@ impl<'a> Binder<'a> {
 			&right_plan.scope,
 			&declared_output_schema,
 		);
+		let join_estimated_row_count = match (left_keys.as_slice(), right_keys.as_slice()) {
+			([left_key], [right_key]) => join_output_ndv_containment_estimate(
+				kind,
+				&left_plan,
+				&right_plan,
+				*left_key,
+				*right_key,
+			),
+			_ => None,
+		};
 
 		let join_index = trace.join_decisions.len();
 		let replay_id = JoinReplayId(join_index as u32);
@@ -1542,6 +1566,10 @@ impl<'a> Binder<'a> {
 			strategy: decision.strategy,
 			output_schema: physical_output_schema.clone(),
 		};
+		let output_facts = PlanOptimizerFacts::composite_with_join_estimate(
+			join_estimated_row_count,
+			declared_output_schema.as_ref(),
+		);
 		let plan = match decision.placement {
 			JoinPhysicalPlacement::Natural => join_plan,
 			JoinPhysicalPlacement::SwappedRightBuild => restore_declared_join_order_project(
@@ -1556,7 +1584,7 @@ impl<'a> Binder<'a> {
 		Ok(ScopedExecutionPlan::new_with_facts(
 			plan,
 			declared_scope,
-			PlanOptimizerFacts::composite_unknown(),
+			output_facts,
 		))
 	}
 
@@ -4109,6 +4137,82 @@ fn column_ndv_for_input(
 	}
 }
 
+fn clean_base_column_ndv_for_join_input(
+	input: &ExecutionPlan,
+	requested_output_column: ColumnOrdinal,
+) -> Option<DistinctCountFact> {
+	let ExecutionPlan::Scan {
+		projection,
+		column_ndv,
+		..
+	} = input
+	else {
+		return None;
+	};
+
+	let descriptor_column = match projection {
+		Some(columns) => {
+			let requested_index = usize::try_from(requested_output_column.0).ok()?;
+			columns
+				.get(requested_index)
+				.copied()
+				.unwrap_or(requested_output_column)
+		}
+		None => requested_output_column,
+	};
+
+	column_ndv.iter().find_map(|(column, distinct_count)| {
+		(*column == descriptor_column).then_some(*distinct_count)
+	})
+}
+
+fn ndv_containment_join_rows(
+	left_rows: RowCount,
+	right_rows: RowCount,
+	left_distinct_count: DistinctCountFact,
+	right_distinct_count: DistinctCountFact,
+) -> Option<RowCount> {
+	let left_ndv = left_distinct_count.point_estimate();
+	let right_ndv = right_distinct_count.point_estimate();
+	if left_ndv == 0 || right_ndv == 0 {
+		return None;
+	}
+
+	let numerator = u128::from(left_rows.get()) * u128::from(right_rows.get());
+	let denominator = u128::from(left_ndv.max(right_ndv));
+	let estimated = if numerator == 0 {
+		0
+	} else {
+		((numerator - 1) / denominator) + 1
+	};
+
+	Some(RowCount::new(u64::try_from(estimated).unwrap_or(u64::MAX)))
+}
+
+fn join_output_ndv_containment_estimate(
+	kind: JoinKind,
+	left: &ScopedExecutionPlan,
+	right: &ScopedExecutionPlan,
+	left_key: ColumnOrdinal,
+	right_key: ColumnOrdinal,
+) -> Option<RowCount> {
+	if kind != JoinKind::Inner
+		|| left.facts.origin != PlanOrigin::SingleBaseRelation
+		|| right.facts.origin != PlanOrigin::SingleBaseRelation
+	{
+		return None;
+	}
+
+	let left_rows =
+		estimate_row_source(left.facts.row_upper_bound, left.facts.estimated_row_count)?;
+	let right_rows =
+		estimate_row_source(right.facts.row_upper_bound, right.facts.estimated_row_count)?;
+	let left_ndv = clean_base_column_ndv_for_join_input(&left.plan, left_key)?;
+	let right_ndv = clean_base_column_ndv_for_join_input(&right.plan, right_key)?;
+
+	ndv_containment_join_rows(left_rows, right_rows, left_ndv, right_ndv)
+}
+
 fn column_heavy_hitter_for_input(
 	input: &ExecutionPlan,
 	requested_column: ColumnOrdinal,
@@ -5410,22 +5514,31 @@ fn build_byte_candidate(
 	facts: PlanOptimizerFacts,
 	threshold: ByteCount,
 ) -> Option<BuildByteCandidate> {
-	if facts.origin != PlanOrigin::SingleBaseRelation {
-		return None;
+	match facts.origin {
+		PlanOrigin::SingleBaseRelation => {
+			if let Some(build_bytes) = facts.byte_upper_bound {
+				return (build_bytes < threshold).then_some(BuildByteCandidate {
+					bytes: build_bytes,
+					source: BuildByteSource::Hard,
+				});
+			}
+			facts
+				.estimated_byte_size
+				.filter(|estimated_byte_size| *estimated_byte_size < threshold)
+				.map(|estimated_byte_size| BuildByteCandidate {
+					bytes: estimated_byte_size,
+					source: BuildByteSource::Estimated,
+				})
+		}
+		PlanOrigin::Composite => facts
+			.estimated_byte_size
+			.filter(|estimated_byte_size| *estimated_byte_size < threshold)
+			.map(|estimated_byte_size| BuildByteCandidate {
+				bytes: estimated_byte_size,
+				source: BuildByteSource::Estimated,
+			}),
+		PlanOrigin::Unknown => None,
 	}
-	if let Some(build_bytes) = facts.byte_upper_bound {
-		return (build_bytes < threshold).then_some(BuildByteCandidate {
-			bytes: build_bytes,
-			source: BuildByteSource::Hard,
-		});
-	}
-	facts
-		.estimated_byte_size
-		.filter(|estimated_byte_size| *estimated_byte_size < threshold)
-		.map(|estimated_byte_size| BuildByteCandidate {
-			bytes: estimated_byte_size,
-			source: BuildByteSource::Estimated,
-		})
 }
 
 fn has_build_size_fact(facts: PlanOptimizerFacts) -> bool {
@@ -14276,6 +14389,516 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn join_output_containment_estimate_matches_formula() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan containment-estimated join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind containment-estimated join");
+
+		let expected_rows = RowCount::new(50_000);
+		let expected_bytes =
+			estimate_materialized_byte_size(expected_rows, scoped.schema().as_ref())
+				.expect("join schema is byte-estimable");
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.estimated_row_count, Some(expected_rows));
+		assert_eq!(scoped.facts.estimated_byte_size, Some(expected_bytes));
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.row_upper_bound, None);
+	}
+
+	#[tokio::test]
+	async fn join_output_containment_zero_rows_estimates_zero_without_empty_relation() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(0),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan zero-row containment join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind zero-row containment join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn join_output_containment_positive_inputs_floor_to_one() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(1),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(1),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(10_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan positive-floor containment join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind positive-floor containment join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(1)));
+	}
+
+	#[tokio::test]
+	async fn join_output_containment_fails_open_without_ndv() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+		);
+		seed_table_optimizer_facts(&mut catalog, "customers", None, Some(5_000), Vec::new());
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan missing-NDV containment join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind missing-NDV containment join");
+
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.estimated_row_count, None);
+		assert_eq!(scoped.facts.estimated_byte_size, None);
+	}
+
+	#[tokio::test]
+	async fn join_output_containment_rejects_zero_ndv() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(0))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan zero-NDV containment join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind zero-NDV containment join");
+
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn join_output_containment_skips_filtered_input_ndv() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![
+				(ColumnOrdinal(0), DistinctCountFact::Exact(500)),
+				(ColumnOrdinal(1), DistinctCountFact::Exact(50)),
+			],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o INNER JOIN customers c \
+				 ON o.customer_id = c.id WHERE c.region = 'north'",
+			)
+			.expect("plan filtered-input containment join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind filtered-input containment join");
+
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[test]
+	fn join_output_containment_maps_scan_projection_ndv() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let descriptor = named_descriptor(43, "projected_orders", schema.as_ref().clone());
+		let scan = ExecutionPlan::Scan {
+			legacy_table_id: TableId(43),
+			table: descriptor.table_object_id,
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: Some(vec![ColumnOrdinal(2)]),
+			pbc_program: None,
+			row_limit: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: Vec::new(),
+			column_ndv: vec![(ColumnOrdinal(2), DistinctCountFact::Exact(777))],
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+		};
+
+		assert_eq!(
+			clean_base_column_ndv_for_join_input(&scan, ColumnOrdinal(0)),
+			Some(DistinctCountFact::Exact(777))
+		);
+	}
+
+	#[tokio::test]
+	async fn join_output_containment_skips_multi_key_join() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![
+				(ColumnOrdinal(0), DistinctCountFact::Exact(10_000)),
+				(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+			],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+		);
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![
+				(
+					Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+					Expr::qualified_column(TableRef::new("customers"), "id"),
+				),
+				(
+					Expr::qualified_column(TableRef::new("orders"), "id"),
+					Expr::qualified_column(TableRef::new("customers"), "id"),
+				),
+			],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind multi-key containment join");
+
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[tokio::test]
+	async fn join_output_containment_skips_non_inner_join() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+		);
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			kind: JoinKind::LeftOuter,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind non-inner containment join");
+
+		assert_eq!(scoped.facts.estimated_row_count, None);
+	}
+
+	#[test]
+	fn composite_hard_bound_build_side_still_rejected() {
+		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::Composite,
+				byte_upper_bound: Some(ByteCount::new(1_024)),
+				estimated_byte_size: None,
+				estimated_row_count: None,
+				row_upper_bound: Some(RowCount::new(1)),
+			}),
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(8_192)),
+				estimated_byte_size: None,
+				estimated_row_count: None,
+				row_upper_bound: None,
+			}),
+			&auto_broadcast_config(4_096),
+		);
+
+		assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::HashByDefault {
+				reason: HashByDefaultReason::LeftInputNotSingleBaseRelation,
+			}
+		);
+	}
+
+	#[test]
+	fn composite_estimate_channel_broadcasts_without_hard_bound_authority() {
+		let decision = choose_join_strategy(
+			JoinReplayId::SYNTHETIC,
+			JoinStrategyIntent::Auto,
+			JoinKind::Inner,
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::Composite,
+				byte_upper_bound: Some(ByteCount::new(1)),
+				estimated_byte_size: Some(ByteCount::new(1_024)),
+				estimated_row_count: Some(RowCount::new(10)),
+				row_upper_bound: None,
+			}),
+			join_input(PlanOptimizerFacts {
+				origin: PlanOrigin::SingleBaseRelation,
+				byte_upper_bound: Some(ByteCount::new(8_192)),
+				estimated_byte_size: None,
+				estimated_row_count: None,
+				row_upper_bound: None,
+			}),
+			&auto_broadcast_config(4_096),
+		);
+
+		assert_eq!(decision.strategy, JoinStrategy::Broadcast);
+		assert_eq!(
+			decision.reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Left,
+				estimated_byte_size: ByteCount::new(1_024),
+				threshold: ByteCount::new(4_096),
+				rejected_side_bytes: None,
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn take_limited_composite_still_does_not_broadcast_without_join_estimated_bytes() {
+		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(12));
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::Take {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: TableRef::new("customers"),
+					projection: None,
+				}),
+				limit: 1,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let plan = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind take-limited composite join");
+
+		assert_join_strategy(&plan, JoinStrategy::HashPartitioned);
+	}
+
+	#[tokio::test]
+	async fn join_output_containment_estimate_channel_not_hard_bound() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
+		);
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan estimate-channel containment join");
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&logical)
+		.await
+		.expect("bind estimate-channel containment join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(50_000))
+		);
+		assert!(scoped.facts.estimated_byte_size.is_some());
+		assert_eq!(scoped.facts.byte_upper_bound, None);
+		assert_eq!(scoped.facts.row_upper_bound, None);
+		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[tokio::test]
+	async fn two_join_plan_broadcasts_small_inner_join_output_by_containment_without_replay() {
+		let mut catalog = join_cardinality_catalog();
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"customers",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(10_000))],
+		);
+		let logical = SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders o \
+				 INNER JOIN customers c ON o.customer_id = c.id \
+				 INNER JOIN regions r ON c.region_id = r.id",
+			)
+			.expect("plan containment-broadcast two-join SQL");
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(512 * 1024))
+			.await
+			.expect("bind containment-broadcast two-join SQL");
+
+		assert_join_strategy_count(&plan, JoinStrategy::Broadcast, 2);
+		assert_eq!(trace.join_decisions.len(), 2);
+		assert!(matches!(
+			trace.join_decisions[1].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Left,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
 	async fn estimated_broadcast_receipt_is_labeled_estimated() {
 		let catalog = descriptor_sidecar_join_catalog(Some(64 * 1024 * 1024), None, Some(12));
 		let logical = SqlPlanner::new()
@@ -15743,6 +16366,28 @@ mod tests {
 			.expect("seed optimizer facts");
 	}
 
+	fn seed_table_optimizer_facts(
+		catalog: &mut MockCatalog,
+		table: &str,
+		byte_upper_bound: Option<u64>,
+		row_upper_bound: Option<u64>,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+	) {
+		catalog
+			.seed_optimizer_facts(
+				&TableRef::new(table),
+				TableOptimizerFacts {
+					byte_upper_bound: byte_upper_bound.map(ByteCount::new),
+					row_upper_bound: row_upper_bound.map(RowCount::new),
+					column_ndv: column_ndv.into_iter().collect(),
+					column_range: Default::default(),
+					column_range_distributions: Default::default(),
+					column_heavy_hitters: Default::default(),
+				},
+			)
+			.expect("seed optimizer facts");
+	}
+
 	fn descriptor_sidecar_join_catalog(
 		orders_byte_upper_bound: Option<u64>,
 		customers_byte_upper_bound: Option<u64>,
@@ -16576,6 +17221,47 @@ mod tests {
 				),
 			)
 			.expect("register customers");
+		catalog
+	}
+
+	fn join_cardinality_catalog() -> MockCatalog {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"orders",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("customer_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.expect("register orders");
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"customers",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("region_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.expect("register customers");
+		catalog
+			.register_descriptor(
+				TableId(3),
+				named_descriptor(
+					3,
+					"regions",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.expect("register regions");
 		catalog
 	}
 
