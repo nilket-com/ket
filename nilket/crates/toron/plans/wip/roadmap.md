@@ -11,7 +11,7 @@ the forward view + the active line.
 
 ## Status
 
-ADRs 001–162 promoted (implemented unless a `feat` is still pending — check
+ADRs 001–163 promoted (implemented unless a `feat` is still pending — check
 `git log`). Per-ADR detail in `plans/adr/NNN_*.md`.
 
 ## V1 target
@@ -46,7 +46,50 @@ because storage and compute are independent products.
 
 ## Forward sequence
 
-### ADR 162 promoted; ADR 163 candidates
+### ADR 163 promoted; ADR 164 candidates
+
+ADR 163 promoted **Multi-Key Equi-Join Cardinality** — fills a **verified total gap**: composite-key joins
+(`L.a=R.a AND L.b=R.b`) got *no* estimate (the seam matched a single-element slice, binder.rs:1479, else
+`composite_unknown`). Generalize to all key pairs under **attribute independence**: `|L⋈R| ≈ |L|·|R| / Π_k
+max(ndv(L.k), ndv(R.k))` — the textbook multi-column estimate, the `k≥2` generalization of 160's
+single-key containment. **Range-overlap composes conjunctively** (a row matches on *all* keys, each needing
+its value in that key's overlap) → fractions multiply, and **any single disjoint key proves the whole join
+empty** (more keys = more chances to prove emptiness). Reuses every 160/161 helper *per key* — only new
+code is the product denominator + the per-key range fold. **Single-key byte-identical to 162** (factor
+`ndv_containment_join_rows_from_denominator`; `_from_points` delegates with `denom = max`). **iter-2
+verified the fold is correct:** disjoint-`0` propagates because 161's floor `if refined==0 && base>0 {1}`
+only bumps a *positive* base that rounded to 0 (a sliver), never reviving a disjoint-proven-empty join;
+`_from_denominator`'s `((num−1)/denom)+1` keeps `base≥1` for any non-empty input regardless of how large
+`Π max(ndv)` grows — so only a *truly disjoint* key yields `0`. **The new risk (named):** independence
+over-states `denom` on *correlated* keys (`ndv(a,b) ≈ ndv(a)`, not the product) → **under-estimate** (→
+broadcast → replay) — the multi-key analog of 160's containment assumption; ships the independent baseline,
+estimate-channel/139-140-backstopped, correlation deferred to the residual evidence. **Heavy-hitter (162)
+stays single-key** — multi-key skew lives in the hot *tuple* `(a,b)`, which *cannot* be reconstructed from
+156's per-column marginals (the correlation problem). Clean `Scan⋈Scan`/Inner/all-keys-need-clean-base-NDV,
+estimate-channel, `adr136` markers unchanged, no execution-side change. **Headline:** `order_items ⋈
+line_prices` on `(order_id, line_no)` — `composite_unknown` on `main` → real product-denominator estimate
+that flips the strategy; paired disjoint-on-any-key → `0`.
+
+**ADR 164 lead candidates:** **Wendelon composite/tuple heavy-hitter top-k producer + multi-key-skew
+consumer** (the operator's call: multi-key skew is the **first join-arc need that requires *new* Wendelon
+production** — the cheap reuses 160–163 are exhausted. A Space-Saving sketch keyed on the multi-column tuple
+`(a,b,…)`, extending **156** per-column → composite, same exact-or-decline merge; **Toron-sequence cross-ring
+producer, the 156/159 pattern** — Wendelon owns the maintained composite sketch, Toron consumes it in a
+multi-key-skew refinement, the 162-analog for tuples, with brand-clean Wendelon names such as
+`ColumnGroupTopKSpec`, `ColumnGroupTopKFact`, and `ColumnGroupTopKEntry` (no new `*V1` suffixes). A
+*proven build pattern* — the concrete lead beyond the cheap reuses, more so than the vague "Theta");
+**measured residual join-miss evidence** (the 154/157
+gate over the *complete* estimator — containment+range+skew+multi-key independence — to scope the composite
+producer + whether correlation/Theta matter; likely the honest precursor to the producer); **dimensioned
+`CONVERT` / linear units** (parallel breadth, brainstorm 009, operator-energy); **Rune optimizer cockpit**
+(brainstorm 010 — the fact spine now carries NDV / min-max / top-k / range-distribution / join-cardinality /
+overlap-fraction / join-skew / multi-key gauges). **Forward arc:** `163 multi-key containment → measured
+residual miss → composite/tuple top-k producer (156/159 pattern) for multi-key skew + Theta only for the
+cold-key overlap residual → multi-join reordering` · *(parallel: CONVERT/units; Rune cockpit)*. The
+cheap-reuse join arc (160→161→162→163) is **complete**; 164 is where new Wendelon production re-enters, or
+where the residual evidence shows it isn't needed.
+
+### ADR 162 promoted; ADR 163 candidates (HISTORICAL)
 
 ADR 162 promoted **Heavy-Hitter Join-Skew Refinement** — takes the **skew** half 161 left: at `L.x = R.y`,
 recover the *exact* contribution of keys hot on both sides from 156's already-produced top-k, leave the
