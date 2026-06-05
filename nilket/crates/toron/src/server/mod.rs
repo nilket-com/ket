@@ -3399,6 +3399,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		}
 	}
 }

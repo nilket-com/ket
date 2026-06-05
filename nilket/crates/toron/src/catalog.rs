@@ -156,6 +156,12 @@ pub struct DescriptorColumnGroupTopKFact {
 	pub fact: ColumnGroupTopKFact,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DescriptorColumnGroupNdvFact {
+	pub column_ordinals: Vec<ColumnOrdinal>,
+	pub distinct_count: DistinctCountFact,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableOptimizerFacts {
 	pub byte_upper_bound: Option<ByteCount>,
@@ -165,6 +171,7 @@ pub struct TableOptimizerFacts {
 	pub column_range_distributions: BTreeMap<ColumnOrdinal, ColumnRangeDistributionFact>,
 	pub column_heavy_hitters: BTreeMap<ColumnOrdinal, ColumnHeavyHitterFact>,
 	pub column_group_top_k: BTreeMap<Vec<ColumnOrdinal>, ColumnGroupTopKFact>,
+	pub column_group_ndv: BTreeMap<Vec<ColumnOrdinal>, DistinctCountFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +191,8 @@ pub struct DescriptorOptimizerFacts {
 	pub column_heavy_hitters: Vec<DescriptorColumnHeavyHitterFact>,
 	#[serde(default)]
 	pub column_group_top_k: Vec<DescriptorColumnGroupTopKFact>,
+	#[serde(default)]
+	pub column_group_ndv: Vec<DescriptorColumnGroupNdvFact>,
 }
 
 impl DescriptorOptimizerFacts {
@@ -218,6 +227,7 @@ impl DescriptorOptimizerFacts {
 				descriptor,
 			),
 			column_group_top_k: descriptor_column_group_top_k(self.column_group_top_k, descriptor),
+			column_group_ndv: descriptor_column_group_ndv(self.column_group_ndv, descriptor),
 		}
 	}
 }
@@ -239,16 +249,7 @@ pub(crate) fn descriptor_optimizer_facts_from_storage(
 		.into_iter()
 		.map(|fact| DescriptorColumnNdvFact {
 			column_ordinal: ColumnOrdinal(u32::from(fact.column_ordinal)),
-			distinct_count: match fact.distinct {
-				StorageNdvFact::Exact { count } => DistinctCountFact::Exact(count),
-				StorageNdvFact::Approx {
-					estimate,
-					rel_err_ppm,
-				} => DistinctCountFact::Approx {
-					estimate,
-					rel_err_ppm,
-				},
-			},
+			distinct_count: distinct_count_from_storage(fact.distinct),
 		})
 		.collect();
 	let column_range = facts
@@ -279,6 +280,8 @@ pub(crate) fn descriptor_optimizer_facts_from_storage(
 		facts.row_upper_bound,
 		descriptor,
 	);
+	let column_group_ndv =
+		descriptor_column_group_ndv_from_storage(facts.column_group_ndv, descriptor);
 	Some(DescriptorOptimizerFacts {
 		schema_generation: facts.schema_generation,
 		physical_descriptor_fingerprint: facts.physical_descriptor_fingerprint,
@@ -290,7 +293,21 @@ pub(crate) fn descriptor_optimizer_facts_from_storage(
 		column_range_distributions,
 		column_heavy_hitters,
 		column_group_top_k,
+		column_group_ndv,
 	})
+}
+
+fn distinct_count_from_storage(distinct: StorageNdvFact) -> DistinctCountFact {
+	match distinct {
+		StorageNdvFact::Exact { count } => DistinctCountFact::Exact(count),
+		StorageNdvFact::Approx {
+			estimate,
+			rel_err_ppm,
+		} => DistinctCountFact::Approx {
+			estimate,
+			rel_err_ppm,
+		},
+	}
 }
 
 fn descriptor_column_range_distributions_from_storage(
@@ -445,6 +462,41 @@ fn descriptor_column_group_top_k_from_storage(
 					arrow_type_tags: fact.arrow_type_tags,
 					entries,
 				},
+			})
+		})
+		.collect()
+}
+
+fn descriptor_column_group_ndv_from_storage(
+	column_group_ndv: Vec<wendelon_client::ColumnGroupNdvFact>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> Vec<DescriptorColumnGroupNdvFact> {
+	let Ok(schema) = descriptor.arrow_schema() else {
+		return Vec::new();
+	};
+	column_group_ndv
+		.into_iter()
+		.filter_map(|fact| {
+			if fact.column_ordinals.len() < 2 {
+				return None;
+			}
+			let distinct_count = distinct_count_from_storage(fact.distinct);
+			if distinct_count.point_estimate() == 0 {
+				return None;
+			}
+			let mut seen_ordinals = HashSet::new();
+			let mut column_ordinals = Vec::with_capacity(fact.column_ordinals.len());
+			for ordinal in fact.column_ordinals {
+				let column_ordinal = ColumnOrdinal(u32::from(ordinal));
+				if !seen_ordinals.insert(column_ordinal) {
+					return None;
+				}
+				schema.fields().get(column_ordinal.0 as usize)?;
+				column_ordinals.push(column_ordinal);
+			}
+			Some(DescriptorColumnGroupNdvFact {
+				column_ordinals,
+				distinct_count,
 			})
 		})
 		.collect()
@@ -761,6 +813,39 @@ fn descriptor_column_group_top_k(
 				}
 			}
 			Some((fact.column_ordinals, fact.fact))
+		})
+		.collect()
+}
+
+fn descriptor_column_group_ndv(
+	column_group_ndv: Vec<DescriptorColumnGroupNdvFact>,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
+) -> BTreeMap<Vec<ColumnOrdinal>, DistinctCountFact> {
+	let column_count = descriptor
+		.arrow_schema()
+		.map(|schema| schema.fields().len())
+		.unwrap_or(0);
+	let mut seen_groups = HashSet::new();
+	column_group_ndv
+		.into_iter()
+		.filter_map(|fact| {
+			if fact.column_ordinals.len() < 2 || fact.distinct_count.point_estimate() == 0 {
+				return None;
+			}
+			let mut seen_ordinals = HashSet::new();
+			for column_ordinal in &fact.column_ordinals {
+				if !seen_ordinals.insert(*column_ordinal)
+					|| (column_ordinal.0 as usize) >= column_count
+				{
+					return None;
+				}
+			}
+			let mut group_key = fact.column_ordinals.clone();
+			group_key.sort();
+			if !seen_groups.insert(group_key) {
+				return None;
+			}
+			Some((fact.column_ordinals, fact.distinct_count))
 		})
 		.collect()
 }
@@ -3544,6 +3629,7 @@ mod tests {
 				column_range_distributions: Default::default(),
 				column_heavy_hitters: Default::default(),
 				column_group_top_k: Default::default(),
+				column_group_ndv: Default::default(),
 			}
 		);
 	}
@@ -3614,6 +3700,7 @@ mod tests {
 				column_range_distributions: Default::default(),
 				column_heavy_hitters: Default::default(),
 				column_group_top_k: Default::default(),
+				column_group_ndv: Default::default(),
 			}
 		);
 	}
@@ -3665,6 +3752,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3714,6 +3802,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3764,6 +3853,7 @@ mod tests {
 				}],
 			}],
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3817,6 +3907,7 @@ mod tests {
 					frequency: 5,
 				}],
 			}],
+			column_group_ndv: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3849,6 +3940,50 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn descriptor_sync_maps_supported_column_group_ndv_storage_facts() {
+		let descriptor = descriptor();
+		let facts = StorageTableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 17,
+			row_upper_bound: Some(12),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
+			column_group_ndv: vec![wendelon_client::ColumnGroupNdvFact {
+				column_ordinals: vec![1, 2],
+				distinct: StorageNdvFact::Exact { count: 7 },
+			}],
+		};
+		let client = Arc::new(
+			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
+				.with_optimizer_facts([Ok(Some(facts))]),
+		);
+		let catalog = catalog_with_fake_client(
+			TenantId(7),
+			Arc::new(WendelonDescriptorRegistry::default()),
+			Arc::clone(&client),
+			descriptor_sync_accountant(1),
+		);
+
+		let resolved = catalog
+			.resolve_table(&TableRef::with_schema("bench", "orders"))
+			.await
+			.expect("resolve synced descriptor");
+
+		assert_eq!(
+			resolved
+				.optimizer_facts
+				.column_group_ndv
+				.get(&vec![ColumnOrdinal(1), ColumnOrdinal(2)]),
+			Some(&DistinctCountFact::Exact(7))
+		);
+	}
+
+	#[tokio::test]
 	async fn descriptor_sync_maps_supported_range_distribution_storage_facts() {
 		let descriptor = descriptor();
 		let lower = wendelon_client::encode_signed_optimizer_fact_scalar(0, 4).unwrap();
@@ -3874,6 +4009,7 @@ mod tests {
 			}],
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		let client = Arc::new(
 			FakeDescriptorSyncClient::new([Ok(Some(descriptor.clone()))])
@@ -3972,6 +4108,7 @@ mod tests {
 				column_range_distributions: invalid_facts,
 				column_heavy_hitters: Vec::new(),
 				column_group_top_k: Default::default(),
+				column_group_ndv: Default::default(),
 			},
 			&descriptor,
 		)
@@ -4050,6 +4187,7 @@ mod tests {
 				column_range_distributions: Vec::new(),
 				column_heavy_hitters: invalid_facts,
 				column_group_top_k: Default::default(),
+				column_group_ndv: Default::default(),
 			},
 			&descriptor,
 		)
@@ -4060,6 +4198,54 @@ mod tests {
 			facts
 				.for_descriptor(&descriptor)
 				.column_heavy_hitters
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn descriptor_sync_drops_invalid_column_group_ndv_storage_facts() {
+		let descriptor = descriptor();
+		let invalid_facts = vec![
+			wendelon_client::ColumnGroupNdvFact {
+				column_ordinals: vec![1],
+				distinct: StorageNdvFact::Exact { count: 1 },
+			},
+			wendelon_client::ColumnGroupNdvFact {
+				column_ordinals: vec![1, 99],
+				distinct: StorageNdvFact::Exact { count: 1 },
+			},
+			wendelon_client::ColumnGroupNdvFact {
+				column_ordinals: vec![1, 1],
+				distinct: StorageNdvFact::Exact { count: 1 },
+			},
+			wendelon_client::ColumnGroupNdvFact {
+				column_ordinals: vec![1, 2],
+				distinct: StorageNdvFact::Exact { count: 0 },
+			},
+		];
+		let facts = descriptor_optimizer_facts_from_storage(
+			StorageTableOptimizerFacts {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+				producer_epoch: 17,
+				row_upper_bound: Some(12),
+				column_ndv: Vec::new(),
+				column_range: Vec::new(),
+				column_range_distributions: Vec::new(),
+				column_heavy_hitters: Vec::new(),
+				column_group_top_k: Default::default(),
+				column_group_ndv: invalid_facts,
+			},
+			&descriptor,
+		)
+		.expect("storage facts map");
+
+		assert!(facts.column_group_ndv.is_empty());
+		assert!(
+			facts
+				.for_descriptor(&descriptor)
+				.column_group_ndv
 				.is_empty()
 		);
 	}
@@ -4082,6 +4268,7 @@ mod tests {
 				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
 				column_group_top_k: Default::default(),
+				column_group_ndv: Default::default(),
 			},
 			&descriptor,
 		)
@@ -4113,6 +4300,7 @@ mod tests {
 				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
 				column_group_top_k: Default::default(),
+				column_group_ndv: Default::default(),
 			},
 			&descriptor,
 		)
@@ -4140,6 +4328,7 @@ mod tests {
 				column_range_distributions: Vec::new(),
 				column_heavy_hitters: Vec::new(),
 				column_group_top_k: Default::default(),
+				column_group_ndv: Default::default(),
 			},
 			&descriptor,
 		)
@@ -4170,6 +4359,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		assert_eq!(
 			descriptor_optimizer_facts_from_storage(facts, &descriptor),
@@ -4190,6 +4380,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		assert_eq!(
 			descriptor_optimizer_facts_from_storage(facts, &descriptor),
@@ -5185,6 +5376,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		}
 	}
 

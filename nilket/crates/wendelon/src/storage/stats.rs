@@ -1,8 +1,8 @@
 use crate::schema::table::{
 	COLUMN_STATS_CSB_AEAD_TAG_BYTES, COLUMN_STATS_HLL_MAX_PRECISION,
-	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnGroupTopKSpec, ColumnHeavyHitterSpec,
-	ColumnHllSpecV1, ColumnRangeDistributionSpec, ColumnSmallSetSpecV1, TableObjectId,
-	TableSchemaDescriptor, max_column_stats_block_ciphertext_bytes_for_slab_payload,
+	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnGroupNdvSpec, ColumnGroupTopKSpec,
+	ColumnHeavyHitterSpec, ColumnHllSpecV1, ColumnRangeDistributionSpec, ColumnSmallSetSpecV1,
+	TableObjectId, TableSchemaDescriptor, max_column_stats_block_ciphertext_bytes_for_slab_payload,
 };
 pub use crate::schema::{
 	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
@@ -63,7 +63,8 @@ pub const COLUMN_STAT_MAX_TRUNCATED: u16 = 1 << 8;
 pub const COLUMN_STAT_HAS_HEAVY_HITTERS: u16 = 1 << 9;
 pub const COLUMN_STAT_HAS_RANGE_DISTRIBUTION: u16 = 1 << 10;
 pub const COLUMN_STAT_HAS_GROUP_TOP_K: u16 = 1 << 11;
-pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1111_0000_0000_0000;
+pub const COLUMN_STAT_HAS_GROUP_NDV: u16 = 1 << 12;
+pub const COLUMN_STAT_RESERVED_MASK: u16 = 0b1110_0000_0000_0000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnStatsBlockHeader {
@@ -152,6 +153,14 @@ pub struct ColumnStatsGroupTopKPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnStatsGroupNdvPayload {
+	pub column_ordinals: Vec<u16>,
+	pub arrow_type_tags: Vec<u8>,
+	pub exact_values: Option<Vec<Vec<u8>>>,
+	pub hll_distinct: ColumnStatsHllPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnStatsKllPayload {
 	pub k: KllK,
 	pub total_item_count: u64,
@@ -171,6 +180,7 @@ pub struct DecodedColumnStatsPayload {
 	pub heavy_hitters: Option<ColumnStatsHeavyHitterPayload>,
 	pub range_distribution: Option<ColumnStatsKllPayload>,
 	pub group_top_k: Option<ColumnStatsGroupTopKPayload>,
+	pub group_ndv: Option<ColumnStatsGroupNdvPayload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -763,6 +773,13 @@ fn build_column_stats_block_internal(
 		&mut pending,
 		max_ciphertext_bytes.is_none(),
 	)?;
+	attach_group_ndv_payloads(
+		descriptor,
+		&schema,
+		batch,
+		&mut pending,
+		max_ciphertext_bytes.is_none(),
+	)?;
 	apply_opt_in_stats_budget(&mut pending, max_ciphertext_bytes)?;
 	let columns = pending
 		.into_iter()
@@ -879,24 +896,135 @@ fn collect_group_top_k_payload(
 	);
 	let schema = batch.schema();
 	for row in 0..batch.num_rows() {
-		let mut value_keys = Vec::with_capacity(spec.column_ordinals.len());
-		let mut complete_tuple = true;
-		for ordinal in &spec.column_ordinals {
-			let ordinal = usize::from(*ordinal);
-			let Some(field) = schema.fields().get(ordinal) else {
-				complete_tuple = false;
-				break;
-			};
-			let Some(value_key) =
-				encoded_value_at(field.data_type(), batch.column(ordinal).as_ref(), row)?
-			else {
-				complete_tuple = false;
-				break;
-			};
-			value_keys.push(value_key);
-		}
-		if complete_tuple {
+		if let Some(value_keys) =
+			group_tuple_value_keys_at(&schema, batch, &spec.column_ordinals, row)?
+		{
 			collector.insert(value_keys)?;
+		}
+	}
+	collector.finish()
+}
+
+fn group_tuple_value_keys_at(
+	schema: &Schema,
+	batch: &RecordBatch,
+	column_ordinals: &[u16],
+	row: usize,
+) -> std::io::Result<Option<Vec<Vec<u8>>>> {
+	let mut value_keys = Vec::with_capacity(column_ordinals.len());
+	for ordinal in column_ordinals {
+		let ordinal = usize::from(*ordinal);
+		let Some(field) = schema.fields().get(ordinal) else {
+			return Ok(None);
+		};
+		let Some(value_key) =
+			encoded_value_at(field.data_type(), batch.column(ordinal).as_ref(), row)?
+		else {
+			return Ok(None);
+		};
+		value_keys.push(value_key);
+	}
+	Ok(Some(value_keys))
+}
+
+fn attach_group_ndv_payloads(
+	descriptor: &TableSchemaDescriptor,
+	schema: &Schema,
+	batch: &RecordBatch,
+	pending: &mut [PendingColumnStatsEntry],
+	select_all_opt_ins: bool,
+) -> std::io::Result<()> {
+	for spec in &descriptor.stats_policy.column_group_ndv {
+		let resolved = resolve_group_ndv_spec(schema, spec)?;
+		let anchor_ordinal = resolved
+			.column_ordinals
+			.iter()
+			.min()
+			.copied()
+			.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "CSB group NDV has no anchor"))?;
+		let anchor = usize::from(anchor_ordinal);
+		let pending_entry = pending.get_mut(anchor).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group NDV anchor ordinal is out of range",
+			)
+		})?;
+		let payload = collect_group_ndv_payload(batch, &resolved)?;
+		let mut bytes = Vec::new();
+		encode_group_ndv(&mut bytes, &payload)?;
+		pending_entry.group_ndv = Some(bytes);
+		pending_entry.select_group_ndv = select_all_opt_ins;
+	}
+	Ok(())
+}
+
+struct ResolvedGroupNdvSpec {
+	column_ordinals: Vec<u16>,
+	arrow_type_tags: Vec<u8>,
+	precision: u8,
+	exact_max_distinct_values: u32,
+	exact_max_bytes: u32,
+}
+
+fn resolve_group_ndv_spec(
+	schema: &Schema,
+	spec: &ColumnGroupNdvSpec,
+) -> std::io::Result<ResolvedGroupNdvSpec> {
+	let mut column_ordinals = Vec::with_capacity(spec.column_names.len());
+	let mut arrow_type_tags = Vec::with_capacity(spec.column_names.len());
+	for column_name in &spec.column_names {
+		let (ordinal, field) = schema
+			.fields()
+			.iter()
+			.enumerate()
+			.find(|(_, field)| field.name() == column_name)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!("CSB group NDV column {column_name:?} is missing"),
+				)
+			})?;
+		let ordinal = u16::try_from(ordinal).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group NDV ordinal exceeds u16::MAX",
+			)
+		})?;
+		let arrow_type_tag = arrow_stats_type_tag(field.data_type()).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group NDV column type is unsupported",
+			)
+		})?;
+		column_ordinals.push(ordinal);
+		arrow_type_tags.push(arrow_type_tag);
+	}
+	Ok(ResolvedGroupNdvSpec {
+		column_ordinals,
+		arrow_type_tags,
+		precision: spec.precision.get(),
+		exact_max_distinct_values: spec.exact_max_distinct_values.get(),
+		exact_max_bytes: spec.exact_max_bytes.get(),
+	})
+}
+
+fn collect_group_ndv_payload(
+	batch: &RecordBatch,
+	spec: &ResolvedGroupNdvSpec,
+) -> std::io::Result<ColumnStatsGroupNdvPayload> {
+	let mut collector = GroupNdvCollector::new(
+		spec.column_ordinals.clone(),
+		spec.arrow_type_tags.clone(),
+		spec.precision,
+		spec.exact_max_distinct_values,
+		spec.exact_max_bytes,
+	)?;
+	let schema = batch.schema();
+	for row in 0..batch.num_rows() {
+		if let Some(value_keys) =
+			group_tuple_value_keys_at(&schema, batch, &spec.column_ordinals, row)?
+		{
+			collector.insert(&value_keys)?;
 		}
 	}
 	collector.finish()
@@ -970,6 +1098,11 @@ pub fn decode_column_stats_payload(
 	} else {
 		None
 	};
+	let group_ndv = if entry.stat_flags & COLUMN_STAT_HAS_GROUP_NDV != 0 {
+		Some(read_group_ndv(&entry.payload, &mut cursor)?)
+	} else {
+		None
+	};
 	if cursor != entry.payload.len() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -987,6 +1120,7 @@ pub fn decode_column_stats_payload(
 		heavy_hitters,
 		range_distribution,
 		group_top_k,
+		group_ndv,
 	})
 }
 
@@ -1192,12 +1326,14 @@ struct PendingColumnStatsEntry {
 	heavy_hitters: Option<Vec<u8>>,
 	range_distribution: Option<Vec<u8>>,
 	group_top_k: Option<Vec<u8>>,
+	group_ndv: Option<Vec<u8>>,
 	select_bloom: bool,
 	select_hll: bool,
 	select_small_set: bool,
 	select_heavy_hitters: bool,
 	select_range_distribution: bool,
 	select_group_top_k: bool,
+	select_group_ndv: bool,
 }
 
 impl PendingColumnStatsEntry {
@@ -1238,6 +1374,12 @@ impl PendingColumnStatsEntry {
 				self.entry.payload.extend_from_slice(&payload);
 			}
 		}
+		if self.select_group_ndv {
+			if let Some(payload) = self.group_ndv.take() {
+				self.entry.stat_flags |= COLUMN_STAT_HAS_GROUP_NDV;
+				self.entry.payload.extend_from_slice(&payload);
+			}
+		}
 		self.entry
 	}
 }
@@ -1250,6 +1392,7 @@ enum OptInStatKind {
 	HeavyHitters,
 	RangeDistribution,
 	GroupTopK,
+	GroupNdv,
 }
 
 fn apply_opt_in_stats_budget(
@@ -1269,6 +1412,7 @@ fn apply_opt_in_stats_budget(
 		OptInStatKind::HeavyHitters,
 		OptInStatKind::RangeDistribution,
 		OptInStatKind::GroupTopK,
+		OptInStatKind::GroupNdv,
 	] {
 		for entry in pending.iter_mut() {
 			maybe_select_opt_in_stat(entry, kind, &mut plaintext_len, max_plaintext_len)?;
@@ -1306,6 +1450,7 @@ fn maybe_select_opt_in_stat(
 		OptInStatKind::HeavyHitters => entry.heavy_hitters.as_ref().map(Vec::len),
 		OptInStatKind::RangeDistribution => entry.range_distribution.as_ref().map(Vec::len),
 		OptInStatKind::GroupTopK => entry.group_top_k.as_ref().map(Vec::len),
+		OptInStatKind::GroupNdv => entry.group_ndv.as_ref().map(Vec::len),
 	};
 	let Some(payload_len) = payload_len else {
 		return Ok(());
@@ -1324,6 +1469,7 @@ fn maybe_select_opt_in_stat(
 		OptInStatKind::HeavyHitters => entry.select_heavy_hitters = true,
 		OptInStatKind::RangeDistribution => entry.select_range_distribution = true,
 		OptInStatKind::GroupTopK => entry.select_group_top_k = true,
+		OptInStatKind::GroupNdv => entry.select_group_ndv = true,
 	}
 	Ok(())
 }
@@ -1376,12 +1522,14 @@ fn build_pending_column_stats_entry(
 			heavy_hitters: None,
 			range_distribution: None,
 			group_top_k: None,
+			group_ndv: None,
 			select_bloom: select_all_opt_ins,
 			select_hll: select_all_opt_ins,
 			select_small_set: select_all_opt_ins,
 			select_heavy_hitters: select_all_opt_ins,
 			select_range_distribution: select_all_opt_ins,
 			select_group_top_k: select_all_opt_ins,
+			select_group_ndv: select_all_opt_ins,
 		});
 	};
 	let stats = collect_column_stats_in_one_pass(
@@ -1426,12 +1574,14 @@ fn build_pending_column_stats_entry(
 		heavy_hitters: stats.heavy_hitters,
 		range_distribution: stats.range_distribution,
 		group_top_k: None,
+		group_ndv: None,
 		select_bloom: select_all_opt_ins,
 		select_hll: select_all_opt_ins,
 		select_small_set: select_all_opt_ins,
 		select_heavy_hitters: select_all_opt_ins,
 		select_range_distribution: select_all_opt_ins,
 		select_group_top_k: select_all_opt_ins,
+		select_group_ndv: select_all_opt_ins,
 	})
 }
 
@@ -1936,6 +2086,13 @@ pub fn locator_flags_for_parsed_column_stats_block(parsed: &ParsedColumnStatsBlo
 	{
 		flags |= 1 << 6;
 	}
+	if parsed
+		.columns
+		.iter()
+		.any(|entry| entry.stat_flags & COLUMN_STAT_HAS_GROUP_NDV != 0)
+	{
+		flags |= 1 << 7;
+	}
 	flags
 }
 
@@ -2058,6 +2215,50 @@ fn encode_group_top_k(
 		}
 		out.extend_from_slice(&entry.frequency.to_be_bytes());
 	}
+	Ok(())
+}
+
+fn encode_group_ndv(
+	out: &mut Vec<u8>,
+	payload: &ColumnStatsGroupNdvPayload,
+) -> std::io::Result<()> {
+	if payload.column_ordinals.len() != payload.arrow_type_tags.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"CSB group NDV ordinals and type tags must have the same arity",
+		));
+	}
+	let arity = u32::try_from(payload.column_ordinals.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"CSB group NDV arity exceeds u32::MAX",
+		)
+	})?;
+	if arity < 2 {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"CSB group NDV arity must be at least two",
+		));
+	}
+	out.extend_from_slice(&arity.to_be_bytes());
+	for (ordinal, tag) in payload.column_ordinals.iter().zip(&payload.arrow_type_tags) {
+		out.extend_from_slice(&ordinal.to_be_bytes());
+		out.push(*tag);
+	}
+	match payload.exact_values.as_ref() {
+		Some(values) => {
+			out.push(1);
+			if values.windows(2).any(|window| window[0] >= window[1]) {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"CSB group NDV exact values must be sorted and unique",
+				));
+			}
+			encode_small_set(out, values)?;
+		}
+		None => out.push(0),
+	}
+	encode_hll_distinct(out, &payload.hll_distinct);
 	Ok(())
 }
 
@@ -2739,6 +2940,102 @@ impl GroupTopKCollector {
 	}
 }
 
+struct GroupNdvCollector {
+	column_ordinals: Vec<u16>,
+	arrow_type_tags: Vec<u8>,
+	exact_max_distinct_values: u32,
+	exact_max_bytes: u32,
+	exact_values: Option<BTreeSet<Vec<u8>>>,
+	hll_distinct: ColumnStatsHllPayload,
+}
+
+impl GroupNdvCollector {
+	fn new(
+		column_ordinals: Vec<u16>,
+		arrow_type_tags: Vec<u8>,
+		precision: u8,
+		exact_max_distinct_values: u32,
+		exact_max_bytes: u32,
+	) -> std::io::Result<Self> {
+		Ok(Self {
+			column_ordinals,
+			arrow_type_tags,
+			exact_max_distinct_values,
+			exact_max_bytes,
+			exact_values: Some(BTreeSet::new()),
+			hll_distinct: new_hll_distinct(precision)?,
+		})
+	}
+
+	fn insert(&mut self, value_keys: &[Vec<u8>]) -> std::io::Result<()> {
+		let tuple_key = encode_group_tuple_key(value_keys)?;
+		hll_insert_encoded_value(&mut self.hll_distinct, &tuple_key);
+		if let Some(exact_values) = self.exact_values.as_mut() {
+			exact_values.insert(tuple_key);
+			if group_ndv_exact_set_exceeds_caps(
+				exact_values,
+				self.exact_max_distinct_values,
+				self.exact_max_bytes,
+			)? {
+				self.exact_values = None;
+			}
+		}
+		Ok(())
+	}
+
+	fn finish(self) -> std::io::Result<ColumnStatsGroupNdvPayload> {
+		Ok(ColumnStatsGroupNdvPayload {
+			column_ordinals: self.column_ordinals,
+			arrow_type_tags: self.arrow_type_tags,
+			exact_values: self
+				.exact_values
+				.map(|values| values.into_iter().collect::<Vec<_>>()),
+			hll_distinct: self.hll_distinct,
+		})
+	}
+}
+
+fn encode_group_tuple_key(value_keys: &[Vec<u8>]) -> std::io::Result<Vec<u8>> {
+	let mut encoded = Vec::new();
+	let arity = u32::try_from(value_keys.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"CSB group tuple arity exceeds u32::MAX",
+		)
+	})?;
+	encoded.extend_from_slice(&arity.to_be_bytes());
+	for value_key in value_keys {
+		encode_length_prefixed_bytes(&mut encoded, value_key)?;
+	}
+	Ok(encoded)
+}
+
+fn group_ndv_exact_set_exceeds_caps(
+	values: &BTreeSet<Vec<u8>>,
+	max_distinct_values: u32,
+	max_bytes: u32,
+) -> std::io::Result<bool> {
+	let value_count = u32::try_from(values.len()).unwrap_or(u32::MAX);
+	if value_count > max_distinct_values {
+		return Ok(true);
+	}
+	let byte_count = values.iter().try_fold(0_u32, |sum, value| {
+		let len = u32::try_from(value.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group NDV exact value length exceeds u32::MAX",
+			)
+		})?;
+		sum.checked_add(len).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"CSB group NDV exact byte count overflow",
+			)
+		})
+	})?;
+	Ok(byte_count > max_bytes)
+}
+
 #[cfg(test)]
 fn min_max_for_array(
 	data_type: &DataType,
@@ -3092,6 +3389,74 @@ fn read_group_top_k(
 		arrow_type_tags,
 		complete,
 		entries,
+	})
+}
+
+fn read_group_ndv(bytes: &[u8], cursor: &mut usize) -> std::io::Result<ColumnStatsGroupNdvPayload> {
+	let arity_bytes = bytes.get(*cursor..*cursor + 4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			"CSB group NDV payload truncated while reading arity",
+		)
+	})?;
+	*cursor += 4;
+	let arity = u32::from_be_bytes(arity_bytes.try_into().expect("slice len")) as usize;
+	if arity < 2 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"CSB group NDV arity must be at least two",
+		));
+	}
+	let mut column_ordinals = Vec::with_capacity(arity);
+	let mut arrow_type_tags = Vec::with_capacity(arity);
+	for _ in 0..arity {
+		let ordinal_bytes = bytes.get(*cursor..*cursor + 2).ok_or_else(|| {
+			Error::new(
+				ErrorKind::UnexpectedEof,
+				"CSB group NDV payload truncated while reading column ordinal",
+			)
+		})?;
+		*cursor += 2;
+		let ordinal = u16::from_be_bytes(ordinal_bytes.try_into().expect("slice len"));
+		let tag = *bytes.get(*cursor).ok_or_else(|| {
+			Error::new(
+				ErrorKind::UnexpectedEof,
+				"CSB group NDV payload truncated while reading type tag",
+			)
+		})?;
+		*cursor += 1;
+		if !is_valid_v1_arrow_stats_tag(tag) || tag == ARROW_STATS_TAG_OPAQUE_UNSUPPORTED {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB group NDV type tag is unsupported",
+			));
+		}
+		column_ordinals.push(ordinal);
+		arrow_type_tags.push(tag);
+	}
+	let exact_flag = *bytes.get(*cursor).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			"CSB group NDV payload truncated while reading exact flag",
+		)
+	})?;
+	*cursor += 1;
+	let exact_values = match exact_flag {
+		0 => None,
+		1 => Some(read_small_set(bytes, cursor)?),
+		_ => {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CSB group NDV exact flag must be 0 or 1",
+			));
+		}
+	};
+	let hll_distinct = read_hll_distinct(bytes, cursor)?;
+	Ok(ColumnStatsGroupNdvPayload {
+		column_ordinals,
+		arrow_type_tags,
+		exact_values,
+		hll_distinct,
 	})
 }
 
@@ -3846,6 +4211,7 @@ mod tests {
 			heavy_hitters: Vec::new(),
 			range_distributions: Vec::new(),
 			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -3888,6 +4254,7 @@ mod tests {
 			heavy_hitters: None,
 			range_distribution: None,
 			group_top_k: None,
+			group_ndv: None,
 		};
 		assert_eq!(
 			distinct_count_for_column_stats_payload(&bloom_only).unwrap(),
@@ -3951,6 +4318,7 @@ mod tests {
 			heavy_hitters: Vec::new(),
 			range_distributions: Vec::new(),
 			column_group_top_k: Vec::new(),
+			column_group_ndv: Vec::new(),
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -4748,6 +5116,63 @@ mod tests {
 			]
 		);
 		assert_eq!(group.entries[0].frequency, 2);
+	}
+
+	#[test]
+	fn column_group_ndv_builds_tuple_payload_and_skips_null_components() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, true),
+			Field::new("region_id", DataType::Int64, true),
+		]);
+		let mut descriptor = stats_descriptor(&schema);
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			column_group_ndv: vec![
+				ColumnGroupNdvSpec::with_caps(
+					vec!["customer_id".to_string(), "region_id".to_string()],
+					10,
+					8,
+					512,
+				)
+				.unwrap(),
+			],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)]))
+					as Arc<dyn Array>,
+				Arc::new(Int64Array::from(vec![Some(7), Some(7), Some(8), None])) as Arc<dyn Array>,
+				Arc::new(Int64Array::from(vec![Some(2), Some(2), None, Some(2)])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+
+		let encoded = build_always_on_column_stats_block(&descriptor, &batch).unwrap();
+		let parsed = parse_column_stats_block(&encoded).unwrap();
+		assert_ne!(
+			locator_flags_for_parsed_column_stats_block(&parsed) & (1 << 7),
+			0
+		);
+		let anchor = &parsed.columns[1];
+		assert_ne!(anchor.stat_flags & COLUMN_STAT_HAS_GROUP_NDV, 0);
+		let decoded = decode_column_stats_payload(anchor).unwrap();
+		let group = decoded.group_ndv.expect("group NDV payload");
+		assert_eq!(group.column_ordinals, vec![1, 2]);
+		assert_eq!(
+			group.arrow_type_tags,
+			vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64]
+		);
+		assert_eq!(group.hll_distinct.precision, 10);
+		assert_eq!(group.hll_distinct.registers.len(), 1 << 10);
+		let expected_tuple = encode_group_tuple_key(&[
+			encode_signed_optimizer_fact_scalar(7, 8).unwrap(),
+			encode_signed_optimizer_fact_scalar(2, 8).unwrap(),
+		])
+		.unwrap();
+		assert_eq!(group.exact_values, Some(vec![expected_tuple]));
 	}
 
 	#[test]

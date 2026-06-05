@@ -22,6 +22,11 @@ fn wendelon_optimizer_facts_source() -> String {
 		.expect("read wendelon optimizer facts source")
 }
 
+fn wendelon_schema_table_source() -> String {
+	std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
+		.expect("read wendelon table schema source")
+}
+
 fn wendelon_storage_manager_source() -> String {
 	std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
 		.expect("read wendelon storage manager source")
@@ -471,6 +476,150 @@ pub(crate) fn adr164_group_top_k_csb_payload_is_anchored_not_format_bumped() {
 	assert!(attach.contains("pending_entry.group_top_k = Some(bytes)"));
 	assert!(pending_finish.contains("self.entry.stat_flags |= COLUMN_STAT_HAS_GROUP_TOP_K"));
 	assert!(stats.contains("column_group_top_k_builds_tuple_payload_and_skips_null_components"));
+}
+
+#[test]
+pub(crate) fn adr165_group_ndv_is_estimate_channel_only() {
+	let binder = binder_source();
+	let lib = lib_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+	let facts = source_block(&binder, "fn composite_with_join_estimate");
+
+	assert!(estimate.contains("clean_base_column_group_ndv_for_join_input"));
+	assert!(estimate.contains("composite_denominator"));
+	assert!(estimate.contains("denominator = denominator.min(u128::from(composite_denominator));"));
+	assert!(!estimate.contains("row_upper_bound:"));
+	assert!(!estimate.contains("byte_upper_bound:"));
+	assert!(!estimate.contains("EmptyRelation"));
+	assert!(facts.contains("estimated_row_count"));
+	assert!(facts.contains("estimated_byte_size"));
+	assert!(facts.contains("row_upper_bound: None"));
+	assert!(facts.contains("byte_upper_bound: None"));
+	assert!(binder.contains("multi_key_group_ndv_caps_product_denominator"));
+	assert!(binder.contains("multi_key_group_ndv_never_lowers_163_prior"));
+	assert!(lib.contains(
+		"live_column_group_ndv_recovers_multi_key_containment_and_hashes_without_seeding"
+	));
+}
+
+#[test]
+pub(crate) fn adr165_consumer_dark_without_group_ndv() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+	let lookup = source_block(&binder, "fn clean_base_column_group_ndv_for_join_input");
+
+	assert!(lookup.contains("ExecutionPlan::Scan"));
+	assert!(lookup.contains("projection"));
+	assert!(lookup.contains("column_group_ndv"));
+	assert!(!lookup.contains("ExecutionPlan::Filter"));
+	assert!(estimate.contains("if let (Some(left_group_ndv), Some(right_group_ndv))"));
+	assert!(binder.contains("absent_column_group_ndv_falls_back_to_164_byte_identical"));
+	assert!(binder.contains("multi_key_group_ndv_requires_both_sides"));
+}
+
+#[test]
+pub(crate) fn adr165_group_ndv_cap_is_raising_only() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+
+	assert!(estimate.contains("left_group_ndv"));
+	assert!(estimate.contains("right_group_ndv"));
+	assert!(estimate.contains(".max(right_group_ndv.point_estimate())"));
+	assert!(estimate.contains("denominator = denominator.min(u128::from(composite_denominator));"));
+	assert!(!estimate.contains("denominator = u128::from(composite_denominator);"));
+	assert!(binder.contains("multi_key_group_ndv_caps_product_denominator"));
+	assert!(binder.contains("multi_key_group_ndv_never_lowers_163_prior"));
+}
+
+#[test]
+pub(crate) fn adr165_group_ndv_registers_are_wendelon_private() {
+	let manifest_dir = manifest_dir();
+	let toron_offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("ColumnStatsGroupNdvPayload")
+				|| line.contains("GroupNdvCollector")
+				|| line.contains("HllRegisters")
+				|| line.contains("hll_distinct.registers")
+		})
+		.collect::<Vec<_>>();
+	let manager = wendelon_storage_manager_source();
+	let stats = wendelon_storage_stats_source();
+	let merge = source_block(&manager, "fn column_group_ndv_fact_for_group");
+	let collector = source_block(&stats, "impl GroupNdvCollector");
+
+	assert!(
+		toron_offenders.is_empty(),
+		"ADR165 Toron must consume mapped group NDV facts, not Wendelon HLL/register payloads:\n{}",
+		format_offenders(&manifest_dir, &toron_offenders)
+	);
+	assert!(merge.contains("HllRegisters::from_registers"));
+	assert!(merge.contains("merged.merge(&registers)"));
+	assert!(merge.contains("NdvFact::Exact"));
+	assert!(merge.contains("NdvFact::Approx"));
+	assert!(collector.contains("hll_insert_encoded_value"));
+	assert!(manager.contains("column_group_ndv_merges_hll_when_exact_sets_are_absent"));
+}
+
+#[test]
+pub(crate) fn adr165_group_ndv_wire_does_not_use_toron_scalar_literal_key() {
+	let optimizer_facts = wendelon_optimizer_facts_source();
+	let catalog = catalog_source();
+	let fact = source_block(&optimizer_facts, "pub struct ColumnGroupNdvFact");
+	let storage_sync = source_block(&catalog, "fn descriptor_column_group_ndv_from_storage");
+	let descriptor_sync = source_block(&catalog, "fn descriptor_column_group_ndv");
+
+	assert!(fact.contains("pub column_ordinals: Vec<u16>"));
+	assert!(fact.contains("pub distinct: NdvFact"));
+	assert!(!fact.contains("arrow_type_tags"));
+	assert!(!fact.contains("value_keys"));
+	assert!(!fact.contains("ScalarLiteralKey"));
+	assert!(!fact.contains("registers"));
+	assert!(!optimizer_facts.contains("ScalarLiteralKey"));
+	assert!(storage_sync.contains("distinct_count_from_storage"));
+	assert!(!storage_sync.contains("ScalarLiteralKey"));
+	assert!(!descriptor_sync.contains("ScalarLiteralKey"));
+	assert!(catalog.contains("descriptor_sync_maps_supported_column_group_ndv_storage_facts"));
+	assert!(catalog.contains("descriptor_sync_drops_invalid_column_group_ndv_storage_facts"));
+}
+
+#[test]
+pub(crate) fn adr165_group_ndv_names_are_brand_clean_and_unsuffixed() {
+	let table = wendelon_schema_table_source();
+	let optimizer_facts = wendelon_optimizer_facts_source();
+	let manifest_dir = manifest_dir();
+	let toron_offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("GroupNdvV1")
+				|| line.contains("GroupNdvSpecV1")
+				|| line.contains("ColumnGroupNdvFactV1")
+				|| line.contains("column_group_ndv_v1")
+		})
+		.collect::<Vec<_>>();
+	let wendelon_manifest_dir = wendelon_manifest_dir();
+	let wendelon_offenders = source_lines(&wendelon_manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("GroupNdvV1")
+				|| line.contains("GroupNdvSpecV1")
+				|| line.contains("ColumnGroupNdvFactV1")
+				|| line.contains("column_group_ndv_v1")
+		})
+		.collect::<Vec<_>>();
+
+	assert!(table.contains("pub struct ColumnGroupNdvSpec"));
+	assert!(optimizer_facts.contains("pub struct ColumnGroupNdvFact"));
+	assert!(
+		toron_offenders.is_empty(),
+		"ADR165 Toron group NDV names must stay unsuffixed:\n{}",
+		format_offenders(&manifest_dir, &toron_offenders)
+	);
+	assert!(
+		wendelon_offenders.is_empty(),
+		"ADR165 Wendelon group NDV names must stay unsuffixed:\n{}",
+		format_offenders(&wendelon_manifest_dir, &wendelon_offenders)
+	);
 }
 
 #[test]

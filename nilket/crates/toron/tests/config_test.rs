@@ -1239,6 +1239,7 @@ fn descriptor_bootstrap_optimizer_facts_are_sidecar_optional() {
 		column_range_distributions: Vec::new(),
 		column_heavy_hitters: Vec::new(),
 		column_group_top_k: Vec::new(),
+		column_group_ndv: Vec::new(),
 	};
 	let bootstrap = DescriptorBootstrap {
 		tables: vec![DescriptorBootstrapEntry {
@@ -1280,6 +1281,7 @@ fn descriptor_bootstrap_optimizer_facts_column_ndv_defaults_when_missing() {
 		column_range_distributions: Vec::new(),
 		column_heavy_hitters: Vec::new(),
 		column_group_top_k: Vec::new(),
+		column_group_ndv: Vec::new(),
 	};
 	let bootstrap = DescriptorBootstrap {
 		tables: vec![DescriptorBootstrapEntry {

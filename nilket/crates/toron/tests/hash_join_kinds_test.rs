@@ -501,6 +501,7 @@ fn scan_plan(table_id: TableId, schema: SchemaRef, object_byte: u8) -> Execution
 		column_range_distributions: Vec::new(),
 		column_heavy_hitters: Vec::new(),
 		column_group_top_k: Vec::new(),
+		column_group_ndv: Vec::new(),
 	}
 }
 

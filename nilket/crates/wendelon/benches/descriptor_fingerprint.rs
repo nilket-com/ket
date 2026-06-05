@@ -194,6 +194,7 @@ fn stats_policy_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error
 		heavy_hitters: Vec::new(),
 		range_distributions: Vec::new(),
 		column_group_top_k: Vec::new(),
+		column_group_ndv: Vec::new(),
 	};
 	descriptor.refresh_descriptor_fingerprints()?;
 	Ok(descriptor)

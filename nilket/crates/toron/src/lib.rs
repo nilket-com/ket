@@ -1691,6 +1691,57 @@ mod tests {
 		}
 
 		#[tokio::test]
+		async fn live_column_group_ndv_recovers_multi_key_containment_and_hashes_without_seeding() {
+			let fixture = multi_key_join_fixture_with_produced_storage_group_ndv_fact();
+			let actual_rows = fixture.actual_rows;
+			let auto_plan = multi_key_group_ndv_parent_join_plan();
+			assert_multi_key_group_ndv_binds_without_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					multi_key_group_ndv_parent_join_plan(),
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0), JoinReplayId(1)]),
+						..multi_key_group_ndv_hash_config()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash produced group NDV join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let run =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					multi_key_group_ndv_hash_config(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("produced group NDV fact should execute as hash without replay");
+
+			assert!(
+				!run.replayed,
+				"produced column-group NDV fact should hash parent join up front"
+			);
+			assert_eq!(
+				run.results.iter().map(RecordBatch::num_rows).sum::<usize>(),
+				actual_rows
+			);
+			assert_multi_key_group_top_k_join_matches_hash(&hash.results, &run.results);
+		}
+
+		#[tokio::test]
 		async fn stale_low_heavy_hitter_frequency_still_replays_as_hash() {
 			let fixture = skewed_join_fixture_with_heavy_hitter_frequency(100);
 			let auto_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
@@ -2467,6 +2518,7 @@ mod tests {
 						column_range_distributions: Default::default(),
 						column_heavy_hitters: Default::default(),
 						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
 					},
 				)
 				.expect("seed optimizer facts");
@@ -2499,6 +2551,7 @@ mod tests {
 					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 					column_group_top_k: Default::default(),
+					column_group_ndv: Default::default(),
 				},
 			)
 			.expect("seed customers row optimizer facts");
@@ -2615,6 +2668,7 @@ mod tests {
 						column_range_distributions: Default::default(),
 						column_heavy_hitters,
 						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
 					},
 				)
 				.expect("seed join-skew cardinality facts");
@@ -2680,6 +2734,7 @@ mod tests {
 						column_range_distributions: Default::default(),
 						column_heavy_hitters: Default::default(),
 						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
 					},
 				)
 				.expect("seed stale-low join cardinality facts");
@@ -2886,6 +2941,7 @@ mod tests {
 				}],
 			}],
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		let descriptor_facts = crate::catalog::descriptor_optimizer_facts_from_storage(
 			storage_facts,
@@ -2928,6 +2984,7 @@ mod tests {
 					column_range_distributions: Default::default(),
 					column_heavy_hitters,
 					column_group_top_k: Default::default(),
+					column_group_ndv: Default::default(),
 				},
 			)
 			.expect("seed skewed customers optimizer facts");
@@ -3073,6 +3130,7 @@ mod tests {
 					frequency: GROUP_TOP_K_HOT_ROWS as u64,
 				}],
 			}],
+			column_group_ndv: Default::default(),
 		};
 		let descriptor_facts =
 			crate::catalog::descriptor_optimizer_facts_from_storage(storage_facts, descriptor)
@@ -3160,6 +3218,165 @@ mod tests {
 		(order_ids, line_nos)
 	}
 
+	const GROUP_NDV_BASE_ROWS: usize = 400;
+	const GROUP_NDV_GROUPS: usize = 4;
+	const GROUP_NDV_ROWS_PER_GROUP: usize = GROUP_NDV_BASE_ROWS / GROUP_NDV_GROUPS;
+
+	fn multi_key_join_fixture_with_produced_storage_group_ndv_fact() -> MultiKeyGroupTopKFixture {
+		let order_items_descriptor = named_descriptor(
+			10,
+			"order_items",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("order_id", DataType::Int64, false),
+				Field::new("line_no", DataType::Int64, false),
+				Field::new("shard_id", DataType::Int64, false),
+			]),
+		);
+		let line_prices_descriptor = named_descriptor(
+			11,
+			"line_prices",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("order_id", DataType::Int64, false),
+				Field::new("line_no", DataType::Int64, false),
+				Field::new("shard_id", DataType::Int64, false),
+				Field::new("region_id", DataType::Int64, false),
+			]),
+		);
+		let regions_descriptor = named_descriptor(
+			12,
+			"regions",
+			Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+		);
+
+		let order_items_facts = multi_key_group_ndv_descriptor_facts(&order_items_descriptor);
+		let line_prices_facts = multi_key_group_ndv_descriptor_facts(&line_prices_descriptor);
+		let catalog = WendelonCatalog::from_descriptors_with_optimizer_facts([
+			(TableId(10), order_items_descriptor, Some(order_items_facts)),
+			(TableId(11), line_prices_descriptor, Some(line_prices_facts)),
+			(TableId(12), regions_descriptor, None),
+		])
+		.expect("descriptor registry with produced group NDV facts");
+
+		MultiKeyGroupTopKFixture {
+			catalog: Arc::new(catalog),
+			storage: multi_key_group_ndv_storage(),
+			actual_rows: GROUP_NDV_GROUPS * GROUP_NDV_ROWS_PER_GROUP * GROUP_NDV_ROWS_PER_GROUP,
+		}
+	}
+
+	fn multi_key_group_ndv_descriptor_facts(
+		descriptor: &TableSchemaDescriptor,
+	) -> crate::catalog::DescriptorOptimizerFacts {
+		let storage_facts = wendelon_client::TableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 165,
+			row_upper_bound: Some(GROUP_NDV_BASE_ROWS as u64),
+			column_ndv: vec![
+				wendelon_client::ColumnNdvFact {
+					column_ordinal: 1,
+					distinct: wendelon_client::NdvFact::Exact {
+						count: GROUP_NDV_GROUPS as u64,
+					},
+				},
+				wendelon_client::ColumnNdvFact {
+					column_ordinal: 2,
+					distinct: wendelon_client::NdvFact::Exact {
+						count: GROUP_NDV_GROUPS as u64,
+					},
+				},
+			],
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
+			column_group_ndv: vec![wendelon_client::ColumnGroupNdvFact {
+				column_ordinals: vec![1, 2],
+				distinct: wendelon_client::NdvFact::Exact {
+					count: GROUP_NDV_GROUPS as u64,
+				},
+			}],
+		};
+		let descriptor_facts =
+			crate::catalog::descriptor_optimizer_facts_from_storage(storage_facts, descriptor)
+				.expect("storage optimizer facts map through descriptor sync");
+		assert!(
+			!descriptor_facts.column_group_ndv.is_empty(),
+			"storage-mapped group NDV fact should be non-empty"
+		);
+		descriptor_facts
+	}
+
+	fn multi_key_group_ndv_storage() -> Arc<dyn StorageScan> {
+		let order_items_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("order_id", DataType::Int64, false),
+			Field::new("line_no", DataType::Int64, false),
+			Field::new("shard_id", DataType::Int64, false),
+		]));
+		let line_prices_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("order_id", DataType::Int64, false),
+			Field::new("line_no", DataType::Int64, false),
+			Field::new("shard_id", DataType::Int64, false),
+			Field::new("region_id", DataType::Int64, false),
+		]));
+		let regions_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+		let (order_ids, line_nos) = multi_key_group_ndv_keys();
+		let order_items = RecordBatch::try_new(
+			order_items_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..GROUP_NDV_BASE_ROWS as i64)),
+				Arc::new(Int64Array::from(order_ids.clone())),
+				Arc::new(Int64Array::from(line_nos.clone())),
+				Arc::new(Int64Array::from_iter_values(0..GROUP_NDV_BASE_ROWS as i64)),
+			],
+		)
+		.expect("group NDV order_items");
+		let line_prices = RecordBatch::try_new(
+			line_prices_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..GROUP_NDV_BASE_ROWS as i64)),
+				Arc::new(Int64Array::from(order_ids)),
+				Arc::new(Int64Array::from(line_nos)),
+				Arc::new(Int64Array::from_iter_values(0..GROUP_NDV_BASE_ROWS as i64)),
+				Arc::new(Int64Array::from(vec![1_i64; GROUP_NDV_BASE_ROWS])),
+			],
+		)
+		.expect("group NDV line_prices");
+		let regions = RecordBatch::try_new(
+			regions_schema,
+			vec![Arc::new(Int64Array::from(vec![1_i64]))],
+		)
+		.expect("group NDV regions");
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([
+				(TableId(10), order_items),
+				(TableId(11), line_prices),
+				(TableId(12), regions),
+			]),
+		})
+	}
+
+	fn multi_key_group_ndv_keys() -> (Vec<i64>, Vec<i64>) {
+		let mut order_ids = Vec::with_capacity(GROUP_NDV_BASE_ROWS);
+		let mut line_nos = Vec::with_capacity(GROUP_NDV_BASE_ROWS);
+		for row in 0..GROUP_NDV_BASE_ROWS {
+			let group = (row / GROUP_NDV_ROWS_PER_GROUP) as i64;
+			order_ids.push(group);
+			line_nos.push(group);
+		}
+		(order_ids, line_nos)
+	}
+
+	fn multi_key_group_ndv_parent_join_plan() -> LogicalPlan {
+		multi_key_group_top_k_parent_join_plan()
+	}
+
 	fn multi_key_group_top_k_parent_join_plan() -> LogicalPlan {
 		LogicalPlan::Join {
 			left: Box::new(LogicalPlan::Join {
@@ -3210,6 +3427,13 @@ mod tests {
 	}
 
 	fn multi_key_group_top_k_hash_config() -> PlannerConfig {
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(512 * 1024)),
+			..PlannerConfig::default()
+		}
+	}
+
+	fn multi_key_group_ndv_hash_config() -> PlannerConfig {
 		PlannerConfig {
 			auto_broadcast_max_build_bytes: Some(ByteCount::new(512 * 1024)),
 			..PlannerConfig::default()
@@ -3292,6 +3516,7 @@ mod tests {
 			column_range_distributions: vec![range_skew_produced_storage_distribution_fact()],
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		let descriptor_facts = crate::catalog::descriptor_optimizer_facts_from_storage(
 			storage_facts,
@@ -3366,6 +3591,7 @@ mod tests {
 			column_range_distributions: Default::default(),
 			column_heavy_hitters: Default::default(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		}
 	}
 
@@ -3381,6 +3607,7 @@ mod tests {
 			)]),
 			column_heavy_hitters: Default::default(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		}
 	}
 
@@ -4264,6 +4491,28 @@ mod tests {
 				JoinStrategyDecisionReason::BroadcastEstimated { .. }
 			),
 			"group top-k child estimate should prevent parent estimated broadcast: {:?}",
+			trace.join_decisions[1].reason
+		);
+	}
+
+	async fn assert_multi_key_group_ndv_binds_without_estimated_broadcast(
+		plan: &LogicalPlan,
+		catalog: &dyn Catalog,
+	) {
+		let (_bound, trace) = bind_with_trace(plan, catalog, &multi_key_group_ndv_hash_config())
+			.await
+			.expect("bind multi-key group NDV join with trace");
+		assert_eq!(trace.join_decisions.len(), 2);
+		assert_eq!(
+			trace.join_decisions[1].strategy,
+			JoinStrategy::HashPartitioned
+		);
+		assert!(
+			!matches!(
+				trace.join_decisions[1].reason,
+				JoinStrategyDecisionReason::BroadcastEstimated { .. }
+			),
+			"group NDV child estimate should prevent parent estimated broadcast: {:?}",
 			trace.join_decisions[1].reason
 		);
 	}

@@ -54,10 +54,10 @@ use crate::schema::table::{
 };
 use crate::schema::{
 	ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
-	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnGroupTopKEntry,
-	ColumnGroupTopKFact, ColumnHeavyHitterEntry, ColumnHeavyHitterFact, ColumnNdvFact,
-	ColumnRangeDistributionFact, ColumnRangeFact, CompactionJobId, CompactionLevelIndex,
-	EncodingPageByteOffset, HllPrecision, HybridTimestamp,
+	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnGroupNdvFact,
+	ColumnGroupTopKEntry, ColumnGroupTopKFact, ColumnHeavyHitterEntry, ColumnHeavyHitterFact,
+	ColumnNdvFact, ColumnRangeDistributionFact, ColumnRangeFact, CompactionJobId,
+	CompactionLevelIndex, EncodingPageByteOffset, HllPrecision, HybridTimestamp,
 	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
 	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
 	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
@@ -603,6 +603,15 @@ struct ColumnGroupTopKCandidate {
 	max_bytes: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColumnGroupNdvCandidate {
+	column_ordinals: Vec<u16>,
+	arrow_type_tags: Vec<u8>,
+	precision: HllPrecision,
+	exact_max_distinct_values: u32,
+	exact_max_bytes: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RangeDistributionColumnCandidate {
 	ordinal: u16,
@@ -748,6 +757,49 @@ fn column_group_top_k_candidates(
 				arrow_type_tags,
 				max_entries: spec.max_entries,
 				max_bytes: spec.max_bytes,
+			},
+		);
+	}
+	Ok(candidates)
+}
+
+fn column_group_ndv_candidates(
+	descriptor: &TableSchemaDescriptor,
+) -> std::io::Result<BTreeMap<u16, ColumnGroupNdvCandidate>> {
+	let schema = descriptor.arrow_schema()?;
+	let mut candidates = BTreeMap::new();
+	for spec in &descriptor.stats_policy.column_group_ndv {
+		let mut column_ordinals = Vec::with_capacity(spec.column_names.len());
+		let mut arrow_type_tags = Vec::with_capacity(spec.column_names.len());
+		for column_name in &spec.column_names {
+			let Some((ordinal, field)) = schema
+				.fields()
+				.iter()
+				.enumerate()
+				.find(|(_, field)| field.name() == column_name)
+			else {
+				continue;
+			};
+			let Some(arrow_type_tag) = arrow_stats_type_tag(field.data_type()) else {
+				continue;
+			};
+			column_ordinals.push(ordinal as u16);
+			arrow_type_tags.push(arrow_type_tag);
+		}
+		if column_ordinals.len() != spec.column_names.len() || column_ordinals.len() < 2 {
+			continue;
+		}
+		let Some(anchor_ordinal) = column_ordinals.iter().min().copied() else {
+			continue;
+		};
+		candidates.insert(
+			anchor_ordinal,
+			ColumnGroupNdvCandidate {
+				column_ordinals,
+				arrow_type_tags,
+				precision: spec.precision,
+				exact_max_distinct_values: spec.exact_max_distinct_values.get(),
+				exact_max_bytes: spec.exact_max_bytes.get(),
 			},
 		);
 	}
@@ -1239,6 +1291,143 @@ fn column_group_top_k_fact_for_group(
 		arrow_type_tags: candidate.arrow_type_tags.clone(),
 		entries: selected,
 	}))
+}
+
+fn column_group_ndv_fact_for_group(
+	candidate: &ColumnGroupNdvCandidate,
+	blocks: &[ParsedColumnStatsBlock],
+) -> std::io::Result<Option<ColumnGroupNdvFact>> {
+	let Some(anchor_ordinal) = candidate.column_ordinals.iter().min().copied() else {
+		return Ok(None);
+	};
+	let anchor_tag = candidate
+		.column_ordinals
+		.iter()
+		.position(|ordinal| *ordinal == anchor_ordinal)
+		.and_then(|index| candidate.arrow_type_tags.get(index))
+		.copied()
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "group NDV anchor tag missing"))?;
+	let mut exact_values = BTreeSet::<Vec<u8>>::new();
+	let mut exact_complete = true;
+	let mut merged_hll: Option<HllRegisters> = None;
+	for block in blocks {
+		let Some(entry) = block
+			.columns
+			.iter()
+			.find(|entry| entry.column_ordinal == anchor_ordinal)
+		else {
+			return Ok(None);
+		};
+		if entry.arrow_type_tag != anchor_tag {
+			return Ok(None);
+		}
+		let payload = decode_column_stats_payload(entry)?;
+		let Some(group_ndv) = payload.group_ndv else {
+			return Ok(None);
+		};
+		if group_ndv.column_ordinals != candidate.column_ordinals
+			|| group_ndv.arrow_type_tags != candidate.arrow_type_tags
+			|| group_ndv.hll_distinct.precision != candidate.precision.get()
+		{
+			return Ok(None);
+		}
+		if exact_complete {
+			if let Some(values) = group_ndv.exact_values.as_ref() {
+				for value in values {
+					exact_values.insert(value.clone());
+				}
+				if group_ndv_exact_set_exceeds_caps(
+					&exact_values,
+					candidate.exact_max_distinct_values,
+					candidate.exact_max_bytes,
+				)? {
+					exact_complete = false;
+					exact_values.clear();
+				}
+			} else {
+				exact_complete = false;
+				exact_values.clear();
+			}
+		}
+		let registers = HllPrecision::new(group_ndv.hll_distinct.precision).and_then(|precision| {
+			HllRegisters::from_registers(precision, group_ndv.hll_distinct.registers.clone())
+		});
+		match (merged_hll.as_mut(), registers) {
+			(Some(merged), Ok(registers)) if merged.precision() == registers.precision() => {
+				merged.merge(&registers)?;
+			}
+			(None, Ok(registers)) => {
+				merged_hll = Some(registers);
+			}
+			_ => return Ok(None),
+		}
+	}
+
+	let distinct = if exact_complete {
+		let count = u64::try_from(exact_values.len()).unwrap_or(u64::MAX);
+		if count == 0 {
+			return Ok(None);
+		}
+		NdvFact::Exact { count }
+	} else {
+		let Some(merged_hll) = merged_hll else {
+			return Ok(None);
+		};
+		let estimate = merged_hll.estimate()?.round();
+		let estimate = if estimate.is_sign_negative() {
+			0
+		} else if estimate > u64::MAX as f64 {
+			u64::MAX
+		} else {
+			estimate as u64
+		};
+		if estimate == 0 {
+			return Ok(None);
+		}
+		let register_count = merged_hll.registers().len() as f64;
+		let rel_err_ppm = ((1.04 / register_count.sqrt()) * 1_000_000.0).ceil();
+		let rel_err_ppm = if rel_err_ppm.is_sign_negative() {
+			0
+		} else if rel_err_ppm > u32::MAX as f64 {
+			u32::MAX
+		} else {
+			rel_err_ppm as u32
+		};
+		NdvFact::Approx {
+			estimate,
+			rel_err_ppm,
+		}
+	};
+	Ok(Some(ColumnGroupNdvFact {
+		column_ordinals: candidate.column_ordinals.clone(),
+		distinct,
+	}))
+}
+
+fn group_ndv_exact_set_exceeds_caps(
+	values: &BTreeSet<Vec<u8>>,
+	max_distinct_values: u32,
+	max_bytes: u32,
+) -> std::io::Result<bool> {
+	let value_count = u32::try_from(values.len()).unwrap_or(u32::MAX);
+	if value_count > max_distinct_values {
+		return Ok(true);
+	}
+	let byte_count = values.iter().try_fold(0_u32, |sum, value| {
+		let len = u32::try_from(value.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"group NDV exact value length exceeds u32::MAX",
+			)
+		})?;
+		sum.checked_add(len).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"group NDV exact byte count overflow",
+			)
+		})
+	})?;
+	Ok(byte_count > max_bytes)
 }
 
 fn row_upper_bound_for_blocks(blocks: &[ParsedColumnStatsBlock]) -> u64 {
@@ -5483,6 +5672,7 @@ impl SlabManager {
 		let heavy_hitter_candidates = heavy_hitter_column_candidates(descriptor)?;
 		let range_distribution_candidates = range_distribution_column_candidates(descriptor)?;
 		let column_group_top_k_candidates = column_group_top_k_candidates(descriptor)?;
+		let column_group_ndv_candidates = column_group_ndv_candidates(descriptor)?;
 		if self
 			.has_uncovered_local_rows_for_descriptor(tenant_id, descriptor)
 			.await?
@@ -5537,6 +5727,12 @@ impl SlabManager {
 				column_group_top_k.push(fact);
 			}
 		}
+		let mut column_group_ndv = Vec::new();
+		for candidate in column_group_ndv_candidates.values() {
+			if let Some(fact) = column_group_ndv_fact_for_group(candidate, &blocks)? {
+				column_group_ndv.push(fact);
+			}
+		}
 		let mut column_range_distributions = Vec::new();
 		for candidate in range_distribution_candidates.values() {
 			if let Some(fact) = range_distribution_fact_for_column(candidate, &blocks)? {
@@ -5554,6 +5750,7 @@ impl SlabManager {
 			column_range_distributions,
 			column_heavy_hitters,
 			column_group_top_k,
+			column_group_ndv,
 		}))
 	}
 
@@ -15574,9 +15771,9 @@ mod tests {
 	use crate::storage::multirow::pack_record_batch_by_bucket;
 	use crate::storage::stats::{
 		ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_UTF8,
-		ARROW_STATS_TAG_UTF8, COLUMN_STAT_HAS_GROUP_TOP_K, COLUMN_STAT_HAS_HEAVY_HITTERS,
-		COLUMN_STAT_HAS_HLL, COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN,
-		COLUMN_STAT_HAS_NON_NULL_COUNT, COLUMN_STAT_HAS_NULL_COUNT,
+		ARROW_STATS_TAG_UTF8, COLUMN_STAT_HAS_GROUP_NDV, COLUMN_STAT_HAS_GROUP_TOP_K,
+		COLUMN_STAT_HAS_HEAVY_HITTERS, COLUMN_STAT_HAS_HLL, COLUMN_STAT_HAS_MAX,
+		COLUMN_STAT_HAS_MIN, COLUMN_STAT_HAS_NON_NULL_COUNT, COLUMN_STAT_HAS_NULL_COUNT,
 		COLUMN_STAT_HAS_RANGE_DISTRIBUTION, COLUMN_STAT_HAS_SMALL_SET, COLUMN_STAT_MAX_TRUNCATED,
 		COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry, ColumnStatsBlockHeader,
 		build_always_on_column_stats_block, decode_column_stats_payload, encode_float64_stat_value,
@@ -15755,6 +15952,80 @@ mod tests {
 				| COLUMN_STAT_HAS_GROUP_TOP_K,
 			payload,
 		}
+	}
+
+	fn optimizer_fact_group_ndv_entry(
+		column_ordinals: &[u16],
+		arrow_type_tags: &[u8],
+		precision: u8,
+		exact_tuples: Option<&[Vec<Vec<u8>>]>,
+		hll_tuples: &[Vec<Vec<u8>>],
+	) -> ColumnStatsBlockEntry {
+		let anchor = column_ordinals
+			.iter()
+			.min()
+			.copied()
+			.expect("group NDV anchor");
+		let anchor_tag = column_ordinals
+			.iter()
+			.position(|ordinal| *ordinal == anchor)
+			.and_then(|index| arrow_type_tags.get(index))
+			.copied()
+			.expect("group NDV anchor tag");
+		let precision = HllPrecision::new(precision).expect("test HLL precision");
+		let mut hll = HllRegisters::new(precision);
+		let hll_tuple_keys = hll_tuples
+			.iter()
+			.map(|tuple| group_ndv_tuple_key_for_test(tuple))
+			.collect::<Vec<_>>();
+		for tuple_key in &hll_tuple_keys {
+			hll.insert(tuple_key);
+		}
+		let mut payload = Vec::new();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&(hll_tuples.len() as u64).to_be_bytes());
+		payload.extend_from_slice(&(column_ordinals.len() as u32).to_be_bytes());
+		for (ordinal, tag) in column_ordinals.iter().zip(arrow_type_tags) {
+			payload.extend_from_slice(&ordinal.to_be_bytes());
+			payload.push(*tag);
+		}
+		match exact_tuples {
+			Some(exact_tuples) => {
+				payload.push(1);
+				let mut exact_values = exact_tuples
+					.iter()
+					.map(|tuple| group_ndv_tuple_key_for_test(tuple))
+					.collect::<Vec<_>>();
+				exact_values.sort();
+				exact_values.dedup();
+				payload.extend_from_slice(&(exact_values.len() as u32).to_be_bytes());
+				for value in exact_values {
+					encode_length_prefixed_bytes(&mut payload, &value)
+						.expect("encode group NDV exact value");
+				}
+			}
+			None => payload.push(0),
+		}
+		payload.push(precision.get());
+		payload.extend_from_slice(hll.registers());
+		ColumnStatsBlockEntry {
+			column_ordinal: anchor,
+			arrow_type_tag: anchor_tag,
+			stat_flags: COLUMN_STAT_HAS_NULL_COUNT
+				| COLUMN_STAT_HAS_NON_NULL_COUNT
+				| COLUMN_STAT_HAS_GROUP_NDV,
+			payload,
+		}
+	}
+
+	fn group_ndv_tuple_key_for_test(value_keys: &[Vec<u8>]) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		encoded.extend_from_slice(&(value_keys.len() as u32).to_be_bytes());
+		for value_key in value_keys {
+			encode_length_prefixed_bytes(&mut encoded, value_key)
+				.expect("encode group NDV tuple component");
+		}
+		encoded
 	}
 
 	fn optimizer_fact_range_entry(
@@ -16103,6 +16374,141 @@ mod tests {
 				.expect("group top-k partial coverage"),
 			None
 		);
+	}
+
+	#[test]
+	fn column_group_ndv_merges_exact_tuple_sets_across_two_slabs() {
+		let candidate = ColumnGroupNdvCandidate {
+			column_ordinals: vec![1, 2],
+			arrow_type_tags: vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+			precision: HllPrecision::new(10).unwrap(),
+			exact_max_distinct_values: 8,
+			exact_max_bytes: 1024,
+		};
+		let hot = vec![
+			encode_signed_stat_value(7, 8).unwrap(),
+			encode_signed_stat_value(2, 8).unwrap(),
+		];
+		let cold = vec![
+			encode_signed_stat_value(8, 8).unwrap(),
+			encode_signed_stat_value(2, 8).unwrap(),
+		];
+		let warm = vec![
+			encode_signed_stat_value(7, 8).unwrap(),
+			encode_signed_stat_value(3, 8).unwrap(),
+		];
+		let first = vec![hot.clone(), cold.clone()];
+		let second = vec![hot, warm];
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_group_ndv_entry(
+				&[1, 2],
+				&[ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+				10,
+				Some(&first),
+				&first,
+			)]),
+			optimizer_fact_block(vec![optimizer_fact_group_ndv_entry(
+				&[1, 2],
+				&[ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+				10,
+				Some(&second),
+				&second,
+			)]),
+		];
+
+		let fact = column_group_ndv_fact_for_group(&candidate, &blocks)
+			.expect("group NDV fact")
+			.expect("complete group NDV fact");
+		assert_eq!(fact.column_ordinals, vec![1, 2]);
+		assert_eq!(fact.distinct, NdvFact::Exact { count: 3 });
+	}
+
+	#[test]
+	fn column_group_ndv_declines_on_partial_coverage() {
+		let candidate = ColumnGroupNdvCandidate {
+			column_ordinals: vec![1, 2],
+			arrow_type_tags: vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+			precision: HllPrecision::new(10).unwrap(),
+			exact_max_distinct_values: 8,
+			exact_max_bytes: 1024,
+		};
+		let hot = vec![
+			encode_signed_stat_value(7, 8).unwrap(),
+			encode_signed_stat_value(2, 8).unwrap(),
+		];
+		let tuples = vec![hot];
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_group_ndv_entry(
+				&[1, 2],
+				&[ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+				10,
+				Some(&tuples),
+				&tuples,
+			)]),
+			optimizer_fact_block(Vec::new()),
+		];
+
+		assert_eq!(
+			column_group_ndv_fact_for_group(&candidate, &blocks)
+				.expect("group NDV partial coverage"),
+			None
+		);
+	}
+
+	#[test]
+	fn column_group_ndv_merges_hll_when_exact_sets_are_absent() {
+		let candidate = ColumnGroupNdvCandidate {
+			column_ordinals: vec![1, 2],
+			arrow_type_tags: vec![ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+			precision: HllPrecision::new(10).unwrap(),
+			exact_max_distinct_values: 1,
+			exact_max_bytes: 1,
+		};
+		let first = vec![
+			vec![
+				encode_signed_stat_value(1, 8).unwrap(),
+				encode_signed_stat_value(1, 8).unwrap(),
+			],
+			vec![
+				encode_signed_stat_value(2, 8).unwrap(),
+				encode_signed_stat_value(1, 8).unwrap(),
+			],
+		];
+		let second = vec![vec![
+			encode_signed_stat_value(3, 8).unwrap(),
+			encode_signed_stat_value(1, 8).unwrap(),
+		]];
+		let blocks = vec![
+			optimizer_fact_block(vec![optimizer_fact_group_ndv_entry(
+				&[1, 2],
+				&[ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+				10,
+				None,
+				&first,
+			)]),
+			optimizer_fact_block(vec![optimizer_fact_group_ndv_entry(
+				&[1, 2],
+				&[ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_INT64],
+				10,
+				None,
+				&second,
+			)]),
+		];
+
+		match column_group_ndv_fact_for_group(&candidate, &blocks).expect("group NDV HLL") {
+			Some(ColumnGroupNdvFact {
+				column_ordinals,
+				distinct: NdvFact::Approx {
+					estimate,
+					rel_err_ppm,
+				},
+			}) => {
+				assert_eq!(column_ordinals, vec![1, 2]);
+				assert!(estimate > 0);
+				assert!(rel_err_ppm > 0);
+			}
+			other => panic!("expected approximate group NDV fact, got {other:?}"),
+		}
 	}
 
 	#[test]

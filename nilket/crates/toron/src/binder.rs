@@ -3895,6 +3895,12 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		.iter()
 		.map(|(ordinals, fact)| (ordinals.clone(), fact.clone()))
 		.collect::<Vec<_>>();
+	let column_group_ndv = binding
+		.optimizer_facts
+		.column_group_ndv
+		.iter()
+		.map(|(ordinals, fact)| (ordinals.clone(), *fact))
+		.collect::<Vec<_>>();
 	ExecutionPlan::Scan {
 		legacy_table_id: binding.legacy_table_id,
 		table: binding.table,
@@ -3911,6 +3917,7 @@ fn scan_plan(binding: TableBinding, projection: Option<Vec<ColumnOrdinal>>) -> E
 		column_range_distributions,
 		column_heavy_hitters,
 		column_group_top_k,
+		column_group_ndv,
 	}
 }
 
@@ -4319,6 +4326,53 @@ fn clean_base_column_group_top_k_for_join_input(
 	None
 }
 
+fn clean_base_column_group_ndv_for_join_input(
+	input: &ExecutionPlan,
+	requested_output_columns: &[ColumnOrdinal],
+) -> Option<DistinctCountFact> {
+	let ExecutionPlan::Scan {
+		projection,
+		column_group_ndv,
+		..
+	} = input
+	else {
+		return None;
+	};
+	if requested_output_columns.len() < 2 {
+		return None;
+	}
+
+	let mut descriptor_columns = Vec::with_capacity(requested_output_columns.len());
+	for requested_output_column in requested_output_columns {
+		let descriptor_column = match projection {
+			Some(columns) => {
+				let requested_index = usize::try_from(requested_output_column.0).ok()?;
+				columns
+					.get(requested_index)
+					.copied()
+					.unwrap_or(*requested_output_column)
+			}
+			None => *requested_output_column,
+		};
+		descriptor_columns.push(descriptor_column);
+	}
+	let requested_set = descriptor_columns.iter().copied().collect::<BTreeSet<_>>();
+	if requested_set.len() != descriptor_columns.len() {
+		return None;
+	}
+
+	for (fact_columns, distinct_count) in column_group_ndv {
+		if fact_columns.len() != descriptor_columns.len()
+			|| fact_columns.iter().copied().collect::<BTreeSet<_>>() != requested_set
+			|| distinct_count.point_estimate() == 0
+		{
+			continue;
+		}
+		return Some(*distinct_count);
+	}
+	None
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct HotBothJoinContribution {
 	rows: u128,
@@ -4427,6 +4481,25 @@ fn multi_key_join_cardinality(
 			numerator,
 		)?;
 	}
+	let left_key_ordinals = left_keys
+		.iter()
+		.map(|key| key.column.ordinal)
+		.collect::<Vec<_>>();
+	let right_key_ordinals = right_keys
+		.iter()
+		.map(|key| key.column.ordinal)
+		.collect::<Vec<_>>();
+	if let (Some(left_group_ndv), Some(right_group_ndv)) = (
+		clean_base_column_group_ndv_for_join_input(&left.plan, &left_key_ordinals),
+		clean_base_column_group_ndv_for_join_input(&right.plan, &right_key_ordinals),
+	) {
+		let composite_denominator = left_group_ndv
+			.point_estimate()
+			.max(right_group_ndv.point_estimate());
+		if composite_denominator != 0 {
+			denominator = denominator.min(u128::from(composite_denominator));
+		}
+	}
 
 	let mut refined =
 		ndv_containment_join_rows_from_denominator(left_rows, right_rows, denominator)?;
@@ -4448,14 +4521,6 @@ fn multi_key_join_cardinality(
 	if refined.get() == 0 {
 		return Some(refined);
 	}
-	let left_key_ordinals = left_keys
-		.iter()
-		.map(|key| key.column.ordinal)
-		.collect::<Vec<_>>();
-	let right_key_ordinals = right_keys
-		.iter()
-		.map(|key| key.column.ordinal)
-		.collect::<Vec<_>>();
 	let left_key_types = left_keys
 		.iter()
 		.map(|key| key.column.data_type.clone())
@@ -7070,6 +7135,7 @@ fn optimize_for_required(
 			column_range_distributions,
 			column_heavy_hitters,
 			column_group_top_k,
+			column_group_ndv,
 		} => {
 			let all_columns = all_columns(&schema);
 			let required = required_output.unwrap_or(all_columns);
@@ -7117,6 +7183,16 @@ fn optimize_for_required(
 					Some((mapped, fact))
 				})
 				.collect();
+			let column_group_ndv = column_group_ndv
+				.into_iter()
+				.filter_map(|(columns, fact)| {
+					let mapped = columns
+						.iter()
+						.map(|column| remap.get(column).copied())
+						.collect::<Option<Vec<_>>>()?;
+					Some((mapped, fact))
+				})
+				.collect();
 
 			Ok((
 				ExecutionPlan::Scan {
@@ -7135,6 +7211,7 @@ fn optimize_for_required(
 					column_range_distributions,
 					column_heavy_hitters,
 					column_group_top_k,
+					column_group_ndv,
 				},
 				remap,
 			))
@@ -12134,6 +12211,7 @@ mod tests {
 				utf8_heavy_hitter_fact(&[("hot", 5_000)]),
 			)],
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 
 		let (optimized, _) = optimize_for_required(plan, Some(BTreeSet::from([ColumnOrdinal(2)])))
@@ -12190,6 +12268,7 @@ mod tests {
 			column_range_distributions: vec![(ColumnOrdinal(2), range_distribution_fact_i64(17))],
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 
 		let (optimized, _) = optimize_for_required(plan, Some(BTreeSet::from([ColumnOrdinal(2)])))
@@ -15251,6 +15330,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 
 		assert_eq!(
@@ -15284,6 +15364,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: Vec::new(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 
 		assert_eq!(
@@ -15317,6 +15398,7 @@ mod tests {
 			column_range_distributions: Vec::new(),
 			column_heavy_hitters: vec![(ColumnOrdinal(2), fact.clone())],
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 
 		assert_eq!(
@@ -16060,6 +16142,123 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn multi_key_group_ndv_caps_product_denominator() {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_column_group_ndv(
+			&mut catalog,
+			"order_items",
+			10_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+			],
+			vec![(
+				vec![ColumnOrdinal(2), ColumnOrdinal(1)],
+				DistinctCountFact::Exact(200),
+			)],
+		);
+		seed_table_optimizer_facts_with_column_group_ndv(
+			&mut catalog,
+			"line_prices",
+			5_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(500)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(5)),
+			],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key group NDV join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(250_000))
+		);
+		assert_eq!(scoped.facts.row_upper_bound, None);
+	}
+
+	#[tokio::test]
+	async fn multi_key_group_ndv_requires_both_sides() {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_column_group_ndv(
+			&mut catalog,
+			"order_items",
+			10_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+			],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(200),
+			)],
+		);
+		seed_table_optimizer_facts(
+			&mut catalog,
+			"line_prices",
+			None,
+			Some(5_000),
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(500)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(5)),
+			],
+		);
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind one-sided group NDV join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
+	}
+
+	#[tokio::test]
+	async fn multi_key_group_ndv_never_lowers_163_prior() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts_with_column_group_ndv(
+				&mut catalog,
+				table,
+				match table {
+					"order_items" => 10_000,
+					"line_prices" => 5_000,
+					_ => unreachable!(),
+				},
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+				],
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					DistinctCountFact::Exact(20_000),
+				)],
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind oversized group NDV join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
+	}
+
+	#[tokio::test]
 	async fn multi_key_fails_open_when_any_key_lacks_ndv() {
 		let mut catalog = multi_key_join_catalog();
 		seed_table_optimizer_facts(
@@ -16335,6 +16534,39 @@ mod tests {
 		assert_eq!(
 			scoped.facts.estimated_row_count,
 			Some(RowCount::new(10_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn absent_column_group_ndv_falls_back_to_164_byte_identical() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts_with_column_group_top_k(
+				&mut catalog,
+				table,
+				10_000,
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(10_000)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(10_000)),
+				],
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					int64_group_top_k_fact(&[([7, 2], 5_000)]),
+				)],
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind absent group NDV join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(25_000_000))
 		);
 	}
 
@@ -17070,6 +17302,7 @@ mod tests {
 			column_range_distributions: Default::default(),
 			column_heavy_hitters: Default::default(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		};
 		catalog
 			.register_table(TableRef::new("composite_pk"), binding)
@@ -18223,6 +18456,7 @@ mod tests {
 					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 					column_group_top_k: Default::default(),
+					column_group_ndv: Default::default(),
 				},
 			)
 			.expect("seed optimizer facts");
@@ -18246,6 +18480,7 @@ mod tests {
 					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 					column_group_top_k: Default::default(),
+					column_group_ndv: Default::default(),
 				},
 			)
 			.expect("seed optimizer facts");
@@ -18270,6 +18505,7 @@ mod tests {
 					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 					column_group_top_k: Default::default(),
+					column_group_ndv: Default::default(),
 				},
 			)
 			.expect("seed optimizer facts");
@@ -18295,6 +18531,7 @@ mod tests {
 					column_range_distributions: Default::default(),
 					column_heavy_hitters: column_heavy_hitters.into_iter().collect(),
 					column_group_top_k: Default::default(),
+					column_group_ndv: Default::default(),
 				},
 			)
 			.expect("seed optimizer facts");
@@ -18318,6 +18555,31 @@ mod tests {
 					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 					column_group_top_k: column_group_top_k.into_iter().collect(),
+					column_group_ndv: Default::default(),
+				},
+			)
+			.expect("seed optimizer facts");
+	}
+
+	fn seed_table_optimizer_facts_with_column_group_ndv(
+		catalog: &mut MockCatalog,
+		table: &str,
+		row_upper_bound: u64,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_group_ndv: Vec<(Vec<ColumnOrdinal>, DistinctCountFact)>,
+	) {
+		catalog
+			.seed_optimizer_facts(
+				&TableRef::new(table),
+				TableOptimizerFacts {
+					byte_upper_bound: None,
+					row_upper_bound: Some(RowCount::new(row_upper_bound)),
+					column_ndv: column_ndv.into_iter().collect(),
+					column_range: Default::default(),
+					column_range_distributions: Default::default(),
+					column_heavy_hitters: Default::default(),
+					column_group_top_k: Default::default(),
+					column_group_ndv: column_group_ndv.into_iter().collect(),
 				},
 			)
 			.expect("seed optimizer facts");
@@ -18625,6 +18887,7 @@ mod tests {
 				)
 				.collect(),
 			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
 		}
 	}
 

@@ -244,6 +244,7 @@ pub enum ExecutionPlan {
 		column_range_distributions: Vec<(ColumnOrdinal, ColumnRangeDistributionFact)>,
 		column_heavy_hitters: Vec<(ColumnOrdinal, ColumnHeavyHitterFact)>,
 		column_group_top_k: Vec<(Vec<ColumnOrdinal>, ColumnGroupTopKFact)>,
+		column_group_ndv: Vec<(Vec<ColumnOrdinal>, DistinctCountFact)>,
 	},
 	Filter {
 		input: Box<ExecutionPlan>,
