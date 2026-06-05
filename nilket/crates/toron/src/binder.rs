@@ -4200,6 +4200,43 @@ fn clean_base_column_range_for_join_input(
 		.find_map(|(column, range)| (*column == descriptor_column).then(|| range.clone()))
 }
 
+fn clean_base_column_heavy_hitter_for_join_input(
+	input: &ExecutionPlan,
+	requested_output_column: ColumnOrdinal,
+) -> Option<&ColumnHeavyHitterFact> {
+	let ExecutionPlan::Scan {
+		projection,
+		column_heavy_hitters,
+		..
+	} = input
+	else {
+		return None;
+	};
+
+	let descriptor_column = match projection {
+		Some(columns) => {
+			let requested_index = usize::try_from(requested_output_column.0).ok()?;
+			columns
+				.get(requested_index)
+				.copied()
+				.unwrap_or(requested_output_column)
+		}
+		None => requested_output_column,
+	};
+
+	column_heavy_hitters
+		.iter()
+		.find_map(|(column, fact)| (*column == descriptor_column).then_some(fact))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HotBothJoinContribution {
+	rows: u128,
+	count: u64,
+	left_rows: u128,
+	right_rows: u128,
+}
+
 fn ndv_containment_join_rows(
 	left_rows: RowCount,
 	right_rows: RowCount,
@@ -4208,6 +4245,15 @@ fn ndv_containment_join_rows(
 ) -> Option<RowCount> {
 	let left_ndv = left_distinct_count.point_estimate();
 	let right_ndv = right_distinct_count.point_estimate();
+	ndv_containment_join_rows_from_points(left_rows, right_rows, left_ndv, right_ndv)
+}
+
+fn ndv_containment_join_rows_from_points(
+	left_rows: RowCount,
+	right_rows: RowCount,
+	left_ndv: u64,
+	right_ndv: u64,
+) -> Option<RowCount> {
 	if left_ndv == 0 || right_ndv == 0 {
 		return None;
 	}
@@ -4245,22 +4291,150 @@ fn join_output_ndv_containment_estimate(
 		estimate_row_source(right.facts.row_upper_bound, right.facts.estimated_row_count)?;
 	let left_ndv = clean_base_column_ndv_for_join_input(&left.plan, left_key)?;
 	let right_ndv = clean_base_column_ndv_for_join_input(&right.plan, right_key)?;
+	let left_ndv_point = left_ndv.point_estimate();
+	let right_ndv_point = right_ndv.point_estimate();
 
 	let base = ndv_containment_join_rows(left_rows, right_rows, left_ndv, right_ndv)?;
-	let Some(left_range) = clean_base_column_range_for_join_input(&left.plan, left_key) else {
-		return Some(base);
+	let left_range = clean_base_column_range_for_join_input(&left.plan, left_key);
+	let right_range = clean_base_column_range_for_join_input(&right.plan, right_key);
+	let range_overlap = match (&left_range, &right_range) {
+		(Some(left_range), Some(right_range)) => {
+			join_key_range_overlap_fraction(left_range, left_key_type, right_range, right_key_type)
+		}
+		_ => None,
 	};
-	let Some(right_range) = clean_base_column_range_for_join_input(&right.plan, right_key) else {
-		return Some(base);
+	let prior = match (&left_range, &right_range) {
+		(Some(left_range), Some(right_range)) => range_refined_containment_join_rows(
+			base,
+			left_range,
+			left_key_type,
+			right_range,
+			right_key_type,
+		)
+		.unwrap_or(base),
+		_ => base,
 	};
-	range_refined_containment_join_rows(
-		base,
-		&left_range,
-		left_key_type,
-		&right_range,
-		right_key_type,
-	)
-	.or(Some(base))
+	if matches!(range_overlap, Some((0, _))) {
+		return Some(prior);
+	}
+
+	let hot_both = match (
+		clean_base_column_heavy_hitter_for_join_input(&left.plan, left_key),
+		clean_base_column_heavy_hitter_for_join_input(&right.plan, right_key),
+	) {
+		(Some(left_fact), Some(right_fact)) => match hot_both_join_contribution(
+			left_fact,
+			left_rows,
+			left_key_type,
+			right_fact,
+			right_rows,
+			right_key_type,
+		) {
+			Some(hot_both) => hot_both,
+			None => return Some(prior),
+		},
+		_ => return Some(prior),
+	};
+	let residual_left_rows = u128::from(left_rows.get()).saturating_sub(hot_both.left_rows);
+	let residual_right_rows = u128::from(right_rows.get()).saturating_sub(hot_both.right_rows);
+	let residual_left_ndv = left_ndv_point.saturating_sub(hot_both.count);
+	let residual_right_ndv = right_ndv_point.saturating_sub(hot_both.count);
+	let residual = if residual_left_rows == 0 || residual_right_rows == 0 {
+		0
+	} else if residual_left_ndv == 0 || residual_right_ndv == 0 {
+		return Some(prior);
+	} else {
+		let cold_base = ndv_containment_join_rows_from_points(
+			RowCount::new(u64::try_from(residual_left_rows).unwrap_or(u64::MAX)),
+			RowCount::new(u64::try_from(residual_right_rows).unwrap_or(u64::MAX)),
+			residual_left_ndv,
+			residual_right_ndv,
+		)?;
+		let refined = match (&left_range, &right_range) {
+			(Some(left_range), Some(right_range)) => range_refined_containment_join_rows(
+				cold_base,
+				left_range,
+				left_key_type,
+				right_range,
+				right_key_type,
+			)
+			.unwrap_or(cold_base),
+			_ => cold_base,
+		};
+		u128::from(refined.get())
+	};
+	let total = hot_both.rows.checked_add(residual)?;
+	let candidate = RowCount::new(u64::try_from(total).unwrap_or(u64::MAX));
+	Some(RowCount::new(prior.get().max(candidate.get())))
+}
+
+fn hot_both_join_contribution(
+	left: &ColumnHeavyHitterFact,
+	left_rows: RowCount,
+	left_key_type: &DataType,
+	right: &ColumnHeavyHitterFact,
+	right_rows: RowCount,
+	right_key_type: &DataType,
+) -> Option<HotBothJoinContribution> {
+	heavy_hitter_total_frequency(left, left_rows)?;
+	heavy_hitter_total_frequency(right, right_rows)?;
+	if !heavy_hitter_fact_matches_join_key_type(left, left_key_type)
+		|| !heavy_hitter_fact_matches_join_key_type(right, right_key_type)
+	{
+		return None;
+	}
+
+	let mut contribution = HotBothJoinContribution::default();
+	if left.entries.len() <= right.entries.len() {
+		for (key, left_frequency) in &left.entries {
+			let Some(right_frequency) = right.entries.get(key) else {
+				continue;
+			};
+			contribution.add(*left_frequency, *right_frequency)?;
+		}
+	} else {
+		for (key, right_frequency) in &right.entries {
+			let Some(left_frequency) = left.entries.get(key) else {
+				continue;
+			};
+			contribution.add(*left_frequency, *right_frequency)?;
+		}
+	}
+	Some(contribution)
+}
+
+impl HotBothJoinContribution {
+	fn add(&mut self, left_frequency: u64, right_frequency: u64) -> Option<()> {
+		let rows = u128::from(left_frequency).checked_mul(u128::from(right_frequency))?;
+		self.rows = self.rows.checked_add(rows)?;
+		self.count = self.count.checked_add(1)?;
+		self.left_rows = self.left_rows.checked_add(u128::from(left_frequency))?;
+		self.right_rows = self.right_rows.checked_add(u128::from(right_frequency))?;
+		Some(())
+	}
+}
+
+fn heavy_hitter_fact_matches_join_key_type(
+	fact: &ColumnHeavyHitterFact,
+	key_type: &DataType,
+) -> bool {
+	fact.entries
+		.keys()
+		.all(|key| scalar_literal_key_matches_join_key_type(key, key_type))
+}
+
+fn scalar_literal_key_matches_join_key_type(key: &ScalarLiteralKey, key_type: &DataType) -> bool {
+	match (key, key_type) {
+		(ScalarLiteralKey::Boolean(_), DataType::Boolean)
+		| (ScalarLiteralKey::Int32(_), DataType::Int32)
+		| (ScalarLiteralKey::Int64(_), DataType::Int64)
+		| (ScalarLiteralKey::Date32(_), DataType::Date32)
+		| (ScalarLiteralKey::Utf8(_), DataType::Utf8) => true,
+		(ScalarLiteralKey::Timestamp(unit, _), DataType::Timestamp(key_unit, Some(timezone))) => {
+			timezone.as_ref() == "UTC" && unit == key_unit
+		}
+		_ => false,
+	}
 }
 
 fn range_refined_containment_join_rows(
@@ -14794,6 +14968,38 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn clean_base_join_heavy_hitter_maps_scan_projection() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int64, true),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let descriptor = named_descriptor(43, "projected_orders", schema.as_ref().clone());
+		let fact = int64_heavy_hitter_fact(&[(7, 500)]);
+		let scan = ExecutionPlan::Scan {
+			legacy_table_id: TableId(43),
+			table: descriptor.table_object_id,
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: Some(vec![ColumnOrdinal(2)]),
+			pbc_program: None,
+			row_limit: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: Vec::new(),
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: vec![(ColumnOrdinal(2), fact.clone())],
+		};
+
+		assert_eq!(
+			clean_base_column_heavy_hitter_for_join_input(&scan, ColumnOrdinal(0)),
+			Some(&fact)
+		);
+	}
+
 	#[tokio::test]
 	async fn disjoint_join_key_ranges_estimate_empty_not_containment_product() {
 		let sql = "SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id";
@@ -15112,6 +15318,344 @@ mod tests {
 		assert_eq!(scoped.facts.row_upper_bound, None);
 		assert_eq!(scoped.facts.byte_upper_bound, None);
 		assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
+	}
+
+	#[test]
+	fn hot_both_contribution_is_exact_product_of_frequencies() {
+		let left = int64_heavy_hitter_fact(&[(7, 5), (9, 3)]);
+		let right = int64_heavy_hitter_fact(&[(7, 11), (10, 13)]);
+		let contribution = hot_both_join_contribution(
+			&left,
+			RowCount::new(8),
+			&DataType::Int64,
+			&right,
+			RowCount::new(24),
+			&DataType::Int64,
+		)
+		.expect("valid hot-both contribution");
+
+		assert_eq!(contribution.rows, 55);
+		assert_eq!(contribution.count, 1);
+		assert_eq!(contribution.left_rows, 5);
+		assert_eq!(contribution.right_rows, 11);
+	}
+
+	#[tokio::test]
+	async fn co_hot_join_recovers_skew_and_hashes_without_replay() {
+		let sql = "SELECT * FROM orders o \
+			INNER JOIN customers c ON o.customer_id = c.id \
+			INNER JOIN regions r ON c.region_id = r.id";
+		let mut uniform_catalog = join_cardinality_catalog();
+		seed_table_optimizer_facts(
+			&mut uniform_catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+		);
+		seed_table_optimizer_facts(
+			&mut uniform_catalog,
+			"customers",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(10_000))],
+		);
+		let logical = SqlPlanner::new().plan(sql).expect("plan co-hot join");
+		let (_uniform_plan, uniform_trace) = bind_with_trace(
+			&logical,
+			&uniform_catalog,
+			&auto_broadcast_config(512 * 1024),
+		)
+		.await
+		.expect("bind uniform co-hot baseline");
+		assert_eq!(uniform_trace.join_decisions.len(), 2);
+		assert!(matches!(
+			uniform_trace.join_decisions[1].reason,
+			JoinStrategyDecisionReason::BroadcastEstimated {
+				build_side: BroadcastBuildSide::Left,
+				..
+			}
+		));
+
+		let mut skew_catalog = join_cardinality_catalog();
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut skew_catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+			Vec::new(),
+			vec![(ColumnOrdinal(1), int64_heavy_hitter_fact(&[(7, 5_000)]))],
+		);
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut skew_catalog,
+			"customers",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(10_000))],
+			Vec::new(),
+			vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 5_000)]))],
+		);
+		let (skew_plan, skew_trace) =
+			bind_with_trace(&logical, &skew_catalog, &auto_broadcast_config(512 * 1024))
+				.await
+				.expect("bind co-hot join");
+
+		assert_eq!(skew_trace.join_decisions.len(), 2);
+		assert_eq!(
+			skew_trace.join_decisions[1].strategy,
+			JoinStrategy::HashPartitioned
+		);
+		assert!(
+			!matches!(
+				skew_trace.join_decisions[1].reason,
+				JoinStrategyDecisionReason::BroadcastEstimated { .. }
+			),
+			"co-hot child estimate should prevent parent estimated broadcast: {:?}",
+			skew_trace.join_decisions[1].reason
+		);
+		assert_join_strategy_count(&skew_plan, JoinStrategy::HashPartitioned, 1);
+	}
+
+	#[tokio::test]
+	async fn no_shared_hot_keys_falls_back_to_161_containment() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(10_000))],
+			Vec::new(),
+			vec![(ColumnOrdinal(1), int64_heavy_hitter_fact(&[(7, 5_000)]))],
+		);
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"customers",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(10_000))],
+			Vec::new(),
+			vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(8, 5_000)]))],
+		);
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan no-shared-hot join"),
+		)
+		.await
+		.expect("bind no-shared-hot join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(10_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn residual_excludes_hot_both_rows_and_keys_no_double_count() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"orders",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+			vec![(ColumnOrdinal(1), int64_heavy_hitter_fact(&[(50, 100)]))],
+		);
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"customers",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+			vec![(ColumnOrdinal(0), range_fact_i64(50, 149, 1_000))],
+			vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(50, 100)]))],
+		);
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan residual hot-both join"),
+		)
+		.await
+		.expect("bind residual hot-both join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(14_091))
+		);
+	}
+
+	#[tokio::test]
+	async fn disjoint_range_zero_dominates_stale_shared_hot_key() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"orders",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 10, 1_000))],
+			vec![(ColumnOrdinal(1), int64_heavy_hitter_fact(&[(7, 500)]))],
+		);
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"customers",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+			vec![(ColumnOrdinal(0), range_fact_i64(100, 200, 1_000))],
+			vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 500)]))],
+		);
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan disjoint stale-HH join"),
+		)
+		.await
+		.expect("bind disjoint stale-HH join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+	}
+
+	#[tokio::test]
+	async fn join_skew_never_lowers_161_prior() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"orders",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+			Vec::new(),
+			vec![(ColumnOrdinal(1), int64_heavy_hitter_fact(&[(7, 1)]))],
+		);
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"customers",
+			None,
+			Some(1_000),
+			vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+			Vec::new(),
+			vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 100)]))],
+		);
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan prior-floor join"),
+		)
+		.await
+		.expect("bind prior-floor join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(10_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn join_skew_fails_open_on_key_type_mismatch_or_invalid_frequency() {
+		for invalid_fact in [
+			utf8_heavy_hitter_fact(&[("7", 500)]),
+			int64_heavy_hitter_fact(&[(7, 0)]),
+			int64_heavy_hitter_fact(&[(7, 1_001)]),
+		] {
+			let mut catalog = join_catalog();
+			seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+				&mut catalog,
+				"orders",
+				None,
+				Some(1_000),
+				vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+				Vec::new(),
+				vec![(ColumnOrdinal(1), invalid_fact)],
+			);
+			seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+				&mut catalog,
+				"customers",
+				None,
+				Some(1_000),
+				vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+				Vec::new(),
+				vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 500)]))],
+			);
+			let scoped = Binder {
+				catalog: &catalog,
+				config: &PlannerConfig::default(),
+			}
+			.bind_plan(
+				&SqlPlanner::new()
+					.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+					.expect("plan invalid-HH join"),
+			)
+			.await
+			.expect("bind invalid-HH join");
+
+			assert_eq!(
+				scoped.facts.estimated_row_count,
+				Some(RowCount::new(10_000))
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn join_skew_skips_filtered_input() {
+		let mut catalog = join_catalog();
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"orders",
+			None,
+			Some(10_000),
+			vec![(ColumnOrdinal(1), DistinctCountFact::Exact(1_000))],
+			Vec::new(),
+			vec![(ColumnOrdinal(1), int64_heavy_hitter_fact(&[(7, 5_000)]))],
+		);
+		seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+			&mut catalog,
+			"customers",
+			None,
+			Some(5_000),
+			vec![
+				(ColumnOrdinal(0), DistinctCountFact::Exact(500)),
+				(ColumnOrdinal(1), DistinctCountFact::Exact(50)),
+			],
+			Vec::new(),
+			vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 5_000)]))],
+		);
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan(
+					"SELECT * FROM orders o INNER JOIN customers c \
+					 ON o.customer_id = c.id WHERE c.region = 'north'",
+				)
+				.expect("plan filtered HH join"),
+		)
+		.await
+		.expect("bind filtered HH join");
+
+		assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
+		assert_eq!(scoped.facts.estimated_row_count, None);
 	}
 
 	#[tokio::test]
@@ -16902,6 +17446,30 @@ mod tests {
 			.expect("seed optimizer facts");
 	}
 
+	fn seed_table_optimizer_facts_with_ranges_and_heavy_hitters(
+		catalog: &mut MockCatalog,
+		table: &str,
+		byte_upper_bound: Option<u64>,
+		row_upper_bound: Option<u64>,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+		column_heavy_hitters: Vec<(ColumnOrdinal, ColumnHeavyHitterFact)>,
+	) {
+		catalog
+			.seed_optimizer_facts(
+				&TableRef::new(table),
+				TableOptimizerFacts {
+					byte_upper_bound: byte_upper_bound.map(ByteCount::new),
+					row_upper_bound: row_upper_bound.map(RowCount::new),
+					column_ndv: column_ndv.into_iter().collect(),
+					column_range: column_range.into_iter().collect(),
+					column_range_distributions: Default::default(),
+					column_heavy_hitters: column_heavy_hitters.into_iter().collect(),
+				},
+			)
+			.expect("seed optimizer facts");
+	}
+
 	fn descriptor_sidecar_join_catalog(
 		orders_byte_upper_bound: Option<u64>,
 		customers_byte_upper_bound: Option<u64>,
@@ -17219,6 +17787,15 @@ mod tests {
 				.map(|(value, frequency)| {
 					(ScalarLiteralKey::Utf8((*value).to_string()), *frequency)
 				})
+				.collect(),
+		)
+	}
+
+	fn int64_heavy_hitter_fact(entries: &[(i64, u64)]) -> ColumnHeavyHitterFact {
+		heavy_hitter_fact(
+			entries
+				.iter()
+				.map(|(value, frequency)| (ScalarLiteralKey::Int64(*value), *frequency))
 				.collect(),
 		)
 	}

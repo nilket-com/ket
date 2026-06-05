@@ -48,6 +48,7 @@ pub(crate) fn adr160_join_containment_requires_clean_base_ndv() {
 	let lookup = source_block(&binder, "fn clean_base_column_ndv_for_join_input");
 	let estimate = source_block(&binder, "fn join_output_ndv_containment_estimate");
 	let formula = source_block(&binder, "fn ndv_containment_join_rows");
+	let point_formula = source_block(&binder, "fn ndv_containment_join_rows_from_points");
 
 	assert!(lookup.contains("ExecutionPlan::Scan"));
 	assert!(lookup.contains("projection"));
@@ -59,9 +60,10 @@ pub(crate) fn adr160_join_containment_requires_clean_base_ndv() {
 	assert!(estimate.contains("clean_base_column_ndv_for_join_input"));
 	assert!(!estimate.contains("column_ndv_for_input"));
 	assert!(formula.contains("point_estimate"));
-	assert!(formula.contains("left_ndv == 0 || right_ndv == 0"));
-	assert!(formula.contains("u128::from(left_rows.get())"));
-	assert!(formula.contains("u64::try_from(estimated).unwrap_or(u64::MAX)"));
+	assert!(formula.contains("ndv_containment_join_rows_from_points"));
+	assert!(point_formula.contains("left_ndv == 0 || right_ndv == 0"));
+	assert!(point_formula.contains("u128::from(left_rows.get())"));
+	assert!(point_formula.contains("u64::try_from(estimated).unwrap_or(u64::MAX)"));
 	assert!(binder.contains("join_output_containment_skips_filtered_input_ndv"));
 	assert!(binder.contains("join_output_containment_skips_multi_key_join"));
 	assert!(binder.contains("join_output_containment_skips_non_inner_join"));
@@ -91,7 +93,9 @@ pub(crate) fn adr161_range_overlap_only_tightens_containment() {
 	let overlap = source_block(&binder, "fn join_key_range_overlap_fraction");
 
 	assert!(estimate.contains("let base = ndv_containment_join_rows"));
-	assert!(estimate.contains(".or(Some(base))"));
+	assert!(estimate.contains("let prior ="));
+	assert!(estimate.contains("range_refined_containment_join_rows"));
+	assert!(estimate.contains(".unwrap_or(base)"));
 	assert!(refined.contains("join_key_range_overlap_fraction"));
 	assert!(refined.contains("return Some(RowCount::new(0))"));
 	assert!(refined.contains("checked_mul(overlap_width)"));
@@ -161,6 +165,80 @@ pub(crate) fn adr161_no_emptyrelation_from_disjoint_join() {
 	assert!(refined.contains("RowCount::new(0)"));
 	assert!(!refined.contains("EmptyRelation"));
 	assert!(binder.contains("join_range_overlap_is_estimate_channel_not_emptyrelation"));
+}
+
+#[test]
+pub(crate) fn adr162_join_skew_is_estimate_channel_only() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn join_output_ndv_containment_estimate");
+	let facts = source_block(&binder, "fn composite_with_join_estimate");
+
+	assert!(estimate.contains("hot_both_join_contribution"));
+	assert!(estimate.contains("prior.get().max(candidate.get())"));
+	assert!(!estimate.contains("row_upper_bound:"));
+	assert!(!estimate.contains("byte_upper_bound:"));
+	assert!(!estimate.contains("EmptyRelation"));
+	assert!(facts.contains("estimated_row_count"));
+	assert!(facts.contains("estimated_byte_size"));
+	assert!(facts.contains("row_upper_bound: None"));
+	assert!(facts.contains("byte_upper_bound: None"));
+	assert!(binder.contains("co_hot_join_recovers_skew_and_hashes_without_replay"));
+}
+
+#[test]
+pub(crate) fn adr162_hot_both_removed_from_residual() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn join_output_ndv_containment_estimate");
+	let hot_both = source_block(&binder, "fn hot_both_join_contribution");
+	let hot_both_add = source_block(&binder, "impl HotBothJoinContribution");
+
+	assert!(hot_both.contains("left.entries.len() <= right.entries.len()"));
+	assert!(hot_both.contains("right.entries.get(key)"));
+	assert!(hot_both_add.contains("checked_mul"));
+	assert!(hot_both_add.contains("checked_add"));
+	assert!(estimate.contains("saturating_sub(hot_both.left_rows)"));
+	assert!(estimate.contains("saturating_sub(hot_both.right_rows)"));
+	assert!(estimate.contains("saturating_sub(hot_both.count)"));
+	assert!(estimate.contains("hot_both.rows.checked_add(residual)"));
+	assert!(binder.contains("hot_both_contribution_is_exact_product_of_frequencies"));
+	assert!(binder.contains("residual_excludes_hot_both_rows_and_keys_no_double_count"));
+}
+
+#[test]
+pub(crate) fn adr162_requires_clean_base_heavy_hitter() {
+	let binder = binder_source();
+	let lookup = source_block(&binder, "fn clean_base_column_heavy_hitter_for_join_input");
+	let estimate = source_block(&binder, "fn join_output_ndv_containment_estimate");
+	let key_type = source_block(&binder, "fn scalar_literal_key_matches_join_key_type");
+
+	assert!(lookup.contains("ExecutionPlan::Scan"));
+	assert!(lookup.contains("projection"));
+	assert!(lookup.contains("column_heavy_hitters"));
+	assert!(!lookup.contains("ExecutionPlan::Filter"));
+	assert!(estimate.contains("clean_base_column_heavy_hitter_for_join_input"));
+	assert!(!estimate.contains("column_heavy_hitter_for_input"));
+	assert!(key_type.contains("ScalarLiteralKey::Int64"));
+	assert!(key_type.contains("DataType::Timestamp(key_unit, Some(timezone))"));
+	assert!(key_type.contains("timezone.as_ref() == \"UTC\""));
+	assert!(binder.contains("clean_base_join_heavy_hitter_maps_scan_projection"));
+	assert!(binder.contains("join_skew_skips_filtered_input"));
+}
+
+#[test]
+pub(crate) fn adr162_join_skew_keeps_160_161_prior_floor() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn join_output_ndv_containment_estimate");
+	let hot_both = source_block(&binder, "fn hot_both_join_contribution");
+
+	assert!(estimate.contains("let prior ="));
+	assert!(estimate.contains("return Some(prior)"));
+	assert!(estimate.contains("matches!(range_overlap, Some((0, _)))"));
+	assert!(estimate.contains("prior.get().max(candidate.get())"));
+	assert!(hot_both.contains("heavy_hitter_total_frequency(left, left_rows)?"));
+	assert!(hot_both.contains("heavy_hitter_fact_matches_join_key_type"));
+	assert!(binder.contains("join_skew_never_lowers_161_prior"));
+	assert!(binder.contains("join_skew_fails_open_on_key_type_mismatch_or_invalid_frequency"));
+	assert!(binder.contains("disjoint_range_zero_dominates_stale_shared_hot_key"));
 }
 
 #[test]

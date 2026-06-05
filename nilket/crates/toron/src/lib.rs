@@ -1041,6 +1041,109 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn co_hot_join_recovers_skew_and_hashes_without_replay() {
+		let plan = join_cardinality_three_table_plan();
+		let uniform_catalog = join_cardinality_catalog_with_join_key_skew_facts(false);
+		let skew_catalog = join_cardinality_catalog_with_join_key_skew_facts(true);
+		let storage = join_cardinality_storage();
+		let planner_config = || PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(512 * 1024)),
+			..PlannerConfig::default()
+		};
+
+		let (_uniform_bound, uniform_trace) =
+			bind_with_trace(&plan, uniform_catalog.as_ref(), &planner_config())
+				.await
+				.expect("bind stale-uniform join-skew baseline");
+		assert_eq!(uniform_trace.join_decisions.len(), 2);
+		assert!(
+			matches!(
+				uniform_trace.join_decisions[1].reason,
+				JoinStrategyDecisionReason::BroadcastEstimated {
+					build_side: BroadcastBuildSide::Left,
+					..
+				}
+			),
+			"stale uniform facts should leave the parent join as estimated broadcast: {:?}",
+			uniform_trace.join_decisions[1].reason
+		);
+
+		let mut replay_budget = QueryBudget::test_default();
+		replay_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		replay_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+		let replay =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				plan.clone(),
+				uniform_catalog,
+				planner_config(),
+				replay_budget,
+				storage.clone(),
+			)
+			.await
+			.expect("stale-uniform parent broadcast should replay");
+		assert!(
+			replay.replayed,
+			"same plan without co-hot facts should replay under a tiny broadcast cap"
+		);
+
+		let (_skew_bound, skew_trace) =
+			bind_with_trace(&plan, skew_catalog.as_ref(), &planner_config())
+				.await
+				.expect("bind co-hot join-skew estimate");
+		assert_eq!(skew_trace.join_decisions.len(), 2);
+		assert_eq!(
+			skew_trace.join_decisions[1].strategy,
+			JoinStrategy::HashPartitioned
+		);
+		assert!(
+			!matches!(
+				skew_trace.join_decisions[1].reason,
+				JoinStrategyDecisionReason::BroadcastEstimated { .. }
+			),
+			"co-hot child estimate should prevent parent estimated broadcast: {:?}",
+			skew_trace.join_decisions[1].reason
+		);
+
+		let hash = run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+			plan.clone(),
+			skew_catalog.clone(),
+			PlannerConfig {
+				force_hash_join_ids: BTreeSet::from([JoinReplayId(0), JoinReplayId(1)]),
+				..planner_config()
+			},
+			QueryBudget::test_default(),
+			storage.clone(),
+		)
+		.await
+		.expect("execute forced hash co-hot join");
+		assert!(!hash.replayed, "forced hash baseline should not replay");
+
+		let mut hash_budget = QueryBudget::test_default();
+		hash_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		hash_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+		let run = run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+			plan,
+			skew_catalog,
+			planner_config(),
+			hash_budget,
+			storage,
+		)
+		.await
+		.expect("co-hot join-skew estimate should execute as hash without replay");
+
+		assert!(
+			!run.replayed,
+			"co-hot join-skew estimate should hash up front without broadcast replay"
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&run.results, SortPolicy::FullRowLex)
+				.expect("co-hot no-replay digest"),
+			canonical_arrow_ipc_digest(&hash.results, SortPolicy::FullRowLex)
+				.expect("forced hash digest")
+		);
+	}
+
+	#[tokio::test]
 	async fn range_disjoint_child_join_broadcasts_zero_estimate_without_replay() {
 		let plan = join_cardinality_three_table_plan();
 		let catalog = join_cardinality_catalog_with_join_key_ranges(
@@ -2392,6 +2495,77 @@ mod tests {
 
 	fn join_cardinality_catalog() -> Arc<MockCatalog> {
 		join_cardinality_catalog_with_join_key_ranges(None, None)
+	}
+
+	fn join_cardinality_catalog_with_join_key_skew_facts(
+		include_heavy_hitters: bool,
+	) -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"orders",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("customer_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"customers",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("region_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(3),
+				named_descriptor(
+					3,
+					"regions",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.unwrap();
+		for (table, join_key) in [
+			("orders", ColumnOrdinal(1)),
+			("customers", ColumnOrdinal(0)),
+		] {
+			let column_heavy_hitters = include_heavy_hitters
+				.then(|| {
+					BTreeMap::from([(
+						join_key,
+						ColumnHeavyHitterFact {
+							entries: BTreeMap::from([(ScalarLiteralKey::Int64(2), 5_000)]),
+						},
+					)])
+				})
+				.unwrap_or_default();
+			catalog
+				.seed_optimizer_facts(
+					&crate::catalog::TableRef::new(table),
+					TableOptimizerFacts {
+						byte_upper_bound: Some(ByteCount::new(2 * 1024 * 1024)),
+						row_upper_bound: Some(RowCount::new(10_000)),
+						column_ndv: BTreeMap::from([(join_key, DistinctCountFact::Exact(10_000))]),
+						column_range: Default::default(),
+						column_range_distributions: Default::default(),
+						column_heavy_hitters,
+					},
+				)
+				.expect("seed join-skew cardinality facts");
+		}
+		Arc::new(catalog)
 	}
 
 	fn join_cardinality_catalog_with_join_key_ranges(
