@@ -773,7 +773,9 @@ pub(crate) fn adr170_untyped_null_arithmetic_rejects_logical_operands_for_all_op
 	}
 	assert!(null_guard.contains("LogicalArithmeticDomain::Identity(spec)"));
 	assert!(null_guard.contains("non_arithmetic_logical_type_error("));
-	assert!(null_guard.contains("LogicalArithmeticDomain::Quantity(_)"));
+	assert!(null_guard.contains("LogicalArithmeticDomain::Quantity(spec)"));
+	assert!(null_guard.contains("quantity_kind_for_spec(&spec)"));
+	assert!(null_guard.contains("point_arithmetic_error(&spec"));
 	assert!(null_guard.contains("unit arithmetic with untyped NULL"));
 }
 
@@ -1528,29 +1530,31 @@ pub(crate) fn adr167_dimensioned_arithmetic_rejects_implicit_unit_coercion() {
 }
 
 #[test]
-pub(crate) fn adr167_linear_float64_only_no_affine_offset() {
+pub(crate) fn adr167_linear_float64_only_affine_fenced_by_171() {
 	let binder = binder_source();
 	let planner = sql_planner_source();
 	let wendelon = wendelon_compute_source();
 	let bind_convert = source_block(&binder, "fn bind_sql_convert");
 	let unit_scale = source_block(&binder, "fn unit_scale_to_f64");
+	let unit_offset = source_block(&binder, "fn unit_offset_to_f64");
 	let parse_clauses = source_block(&planner, "fn parse_create_logical_type_clauses");
 	let scale_parser = source_block(&planner, "fn parse_positive_decimal_scale");
+	let offset_parser = source_block(&planner, "fn parse_signed_decimal_offset");
 	let unit_validate = source_block(&wendelon, "impl LogicalTypeUnit");
 
 	assert!(parse_clauses.contains("LogicalTypePhysical::Float64"));
 	assert!(unit_validate.contains("LogicalTypePhysical::Float64"));
 	assert!(scale_parser.contains("numerator == 0"));
 	assert!(unit_scale.contains("scale.numerator as f64 / scale.denominator as f64"));
+	assert!(offset_parser.contains("UnitOffset::ZERO"));
+	assert!(unit_offset.contains("offset.numerator as f64 / offset.denominator as f64"));
 	assert!(bind_convert.contains("source_type != DataType::Float64"));
 	assert!(bind_convert.contains("target_spec.physical != DataType::Float64"));
 	assert!(bind_convert.contains("builder.append_binary(BoundBinaryOp::Mul"));
-	assert!(!bind_convert.contains("BoundBinaryOp::Add"));
-	assert!(!bind_convert.contains("BoundBinaryOp::Sub"));
-	for source in [bind_convert, parse_clauses, unit_validate] {
-		assert!(!source.to_ascii_lowercase().contains("offset"));
-		assert!(!source.to_ascii_lowercase().contains("affine"));
-	}
+	assert!(bind_convert.contains("BoundBinaryOp::Add"));
+	assert!(parse_clauses.contains("OFFSET_TO_BASE"));
+	assert!(parse_clauses.contains("UnitQuantityKind::Point"));
+	assert!(unit_validate.contains("UnitQuantityKind::Delta"));
 }
 
 #[test]
@@ -1580,11 +1584,17 @@ pub(crate) fn adr167_wendelon_unit_names_are_brand_clean_and_unsuffixed() {
 
 	assert!(wendelon.contains("pub struct UnitScale"));
 	assert!(wendelon.contains("pub struct LogicalTypeUnit"));
+	assert!(wendelon.contains("pub enum UnitQuantityKind"));
+	assert!(wendelon.contains("pub struct UnitOffset"));
 	assert!(client.contains("LogicalTypeUnit"));
 	assert!(client.contains("UnitScale"));
+	assert!(client.contains("UnitQuantityKind"));
+	assert!(client.contains("UnitOffset"));
 	for bad_name in [
 		"UnitScaleV1",
 		"LogicalTypeUnitV1",
+		"UnitQuantityKindV1",
+		"UnitOffsetV1",
 		"DimensionedQuantityV1",
 		"UnitDescriptorV1",
 		"UnitPolicyV1",
@@ -1592,6 +1602,132 @@ pub(crate) fn adr167_wendelon_unit_names_are_brand_clean_and_unsuffixed() {
 		assert!(!wendelon.contains(bad_name));
 		assert!(!client.contains(bad_name));
 	}
+}
+
+#[test]
+pub(crate) fn adr171_unit_metadata_has_kind_and_signed_offset() {
+	let wendelon = wendelon_compute_source();
+	let unit = source_block(&wendelon, "pub struct LogicalTypeUnit");
+	let kind = source_block(&wendelon, "pub enum UnitQuantityKind");
+	let offset = source_block(&wendelon, "pub struct UnitOffset");
+	let scale = source_block(&wendelon, "pub struct UnitScale");
+
+	assert!(unit.contains("pub quantity_kind: UnitQuantityKind"));
+	assert!(unit.contains("pub offset_to_base: UnitOffset"));
+	assert!(kind.contains("Delta"));
+	assert!(kind.contains("Point"));
+	assert!(offset.contains("pub numerator: i64"));
+	assert!(offset.contains("pub denominator: u64"));
+	assert!(scale.contains("pub numerator: u64"));
+	assert!(scale.contains("pub denominator: u64"));
+}
+
+#[test]
+pub(crate) fn adr171_no_premature_legacy_decode_scaffolding() {
+	let wendelon = wendelon_compute_source();
+	let wendelon_tests = std::fs::read_to_string(
+		wendelon_manifest_dir().join("tests/compute_integration_contract.rs"),
+	)
+	.expect("read Wendelon compute integration tests");
+
+	for forbidden in [
+		"LegacyLogicalTypeUnit",
+		"LegacyLogicalTypeDefinition",
+		"WithoutAffine",
+		"old-shape",
+		"old shape",
+	] {
+		assert!(!wendelon.contains(forbidden));
+		assert!(!wendelon_tests.contains(forbidden));
+	}
+}
+
+#[test]
+pub(crate) fn adr171_delta_offset_rejects() {
+	let wendelon = wendelon_compute_source();
+	let unit_validate = source_block(&wendelon, "impl LogicalTypeUnit");
+	let offset = source_block(&wendelon, "impl UnitOffset");
+
+	assert!(offset.contains("self.denominator == 0"));
+	assert!(unit_validate.contains("UnitQuantityKind::Delta"));
+	assert!(unit_validate.contains("!self.offset_to_base.is_zero()"));
+	assert!(unit_validate.contains("logical type delta unit offset must be zero"));
+}
+
+#[test]
+pub(crate) fn adr171_affine_convert_is_bind_desugared_not_executor_kernel() {
+	let binder = binder_source();
+	let exec = exec_source();
+	let bind_convert = source_block(&binder, "fn bind_sql_convert");
+
+	assert!(bind_convert.contains("quantity_kind"));
+	assert!(bind_convert.contains("offset_to_base"));
+	assert!(bind_convert.contains("unit_offset_to_f64"));
+	assert!(bind_convert.contains("builder.append_binary(BoundBinaryOp::Mul"));
+	assert!(bind_convert.contains("builder.append_binary(BoundBinaryOp::Add"));
+	assert!(bind_convert.contains("builder.set_node_logical_type(output, target_spec.id)"));
+	assert!(exec.contains("unresolved SQL CONVERT reached execution"));
+	assert!(!exec.contains("fn evaluate_sql_convert"));
+}
+
+#[test]
+pub(crate) fn adr171_convert_dispatches_by_quantity_kind() {
+	let binder = binder_source();
+	let bind_convert = source_block(&binder, "fn bind_sql_convert");
+	let mismatch = bind_convert
+		.find("source_unit.quantity_kind != target_unit.quantity_kind")
+		.expect("point/delta mismatch guard");
+	let append = bind_convert
+		.find("builder.append_binary(BoundBinaryOp::Mul")
+		.expect("CONVERT arithmetic append");
+
+	assert!(mismatch < append);
+	assert!(bind_convert.contains("CONVERT point/delta mismatch"));
+	assert!(bind_convert.contains("UnitQuantityKind::Point"));
+}
+
+#[test]
+pub(crate) fn adr171_point_quantities_do_not_reach_linear_dimensioned_arithmetic() {
+	let binder = binder_source();
+	let logical = source_block(&binder, "fn bind_logical_arithmetic");
+	let dimensioned = source_block(&binder, "fn bind_dimensioned_arithmetic");
+	let logical_point = logical
+		.find("UnitQuantityKind::Point")
+		.expect("logical point fence");
+	let non_add = logical
+		.find("if !matches!(op, BoundBinaryOp::Add)")
+		.expect("non-Add handoff");
+
+	assert!(logical_point < non_add);
+	assert!(logical.contains("point_arithmetic_error"));
+	assert!(dimensioned.contains("UnitQuantityKind::Point"));
+	assert!(dimensioned.contains("point_arithmetic_error"));
+}
+
+#[test]
+pub(crate) fn adr171_sum_avg_reject_point_quantities() {
+	let binder = binder_source();
+	let additive = source_block(&binder, "fn additive_unit_aggregate_logical_type");
+	let point = additive
+		.find("UnitQuantityKind::Point")
+		.expect("point aggregate fence");
+	let preserve = additive
+		.find("input_type == output_type")
+		.expect("unit preserve check");
+
+	assert!(point < preserve);
+	assert!(additive.contains("point_arithmetic_error"));
+}
+
+#[test]
+pub(crate) fn adr171_no_executor_pbc_or_optimizer_surface() {
+	let exec = exec_source();
+	let pbc = pbc_source();
+
+	assert!(!exec.contains("fn evaluate_sql_convert"));
+	assert!(!pbc.contains("UnitQuantityKind"));
+	assert!(!pbc.contains("offset_to_base"));
+	assert!(!pbc.contains("UnitOffset"));
 }
 
 #[test]

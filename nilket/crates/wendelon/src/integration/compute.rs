@@ -348,10 +348,52 @@ impl UnitScale {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitQuantityKind {
+	Delta,
+	Point,
+}
+
+impl Default for UnitQuantityKind {
+	fn default() -> Self {
+		Self::Delta
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UnitOffset {
+	pub numerator: i64,
+	pub denominator: u64,
+}
+
+impl UnitOffset {
+	pub const ZERO: Self = Self {
+		numerator: 0,
+		denominator: 1,
+	};
+
+	pub fn is_zero(&self) -> bool {
+		self.numerator == 0
+	}
+
+	pub fn validate(&self) -> std::io::Result<()> {
+		if self.denominator == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"logical type unit offset denominator must be nonzero",
+			));
+		}
+		Ok(())
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LogicalTypeUnit {
 	pub dimension: String,
 	pub scale_to_base: UnitScale,
+	pub quantity_kind: UnitQuantityKind,
+	pub offset_to_base: UnitOffset,
 }
 
 impl LogicalTypeUnit {
@@ -363,7 +405,15 @@ impl LogicalTypeUnit {
 			));
 		}
 		validate_logical_type_unit_dimension(&self.dimension)?;
-		self.scale_to_base.validate()
+		self.scale_to_base.validate()?;
+		self.offset_to_base.validate()?;
+		if self.quantity_kind == UnitQuantityKind::Delta && !self.offset_to_base.is_zero() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"logical type delta unit offset must be zero",
+			));
+		}
+		Ok(())
 	}
 }
 

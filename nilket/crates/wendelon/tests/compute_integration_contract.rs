@@ -6,11 +6,12 @@ use wendelon::integration::compute::{
 	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
 	LogicalTypeUnit, SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES, SchemaGeneration, SchemaIntentId,
 	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
-	StorageQuotaMetadataV1, StorageStatusKind, UnitScale, decode_logical_type_definition_create,
-	decode_logical_type_definitions, decode_schema_update_envelope_v1,
-	encode_logical_type_definition_create, encode_logical_type_definitions,
-	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
-	prepare_query_session_handoff, validate_query_session_audit_attribution,
+	StorageQuotaMetadataV1, StorageStatusKind, UnitOffset, UnitQuantityKind, UnitScale,
+	decode_logical_type_definition_create, decode_logical_type_definitions,
+	decode_schema_update_envelope_v1, encode_logical_type_definition_create,
+	encode_logical_type_definitions, encode_schema_update_envelope_v1, map_read_status_for_compute,
+	map_write_status_for_compute, prepare_query_session_handoff,
+	validate_query_session_audit_attribution,
 };
 use wendelon::network::cert_issuance_policy::{
 	CertAuthorityKind, CertIssuancePolicy, QUERY_SESSION_CERT_MAX_TTL,
@@ -202,6 +203,8 @@ fn logical_type_unit_metadata_roundtrips_and_participates_in_idempotence() {
 			numerator: 201_168,
 			denominator: 125,
 		},
+		quantity_kind: UnitQuantityKind::Delta,
+		offset_to_base: UnitOffset::ZERO,
 	};
 	let create = LogicalTypeDefinitionCreate {
 		name: "Mile".to_string(),
@@ -225,7 +228,40 @@ fn logical_type_unit_metadata_roundtrips_and_participates_in_idempotence() {
 }
 
 #[test]
-fn logical_type_unit_metadata_requires_float64_and_positive_scale() {
+fn logical_type_unit_affine_metadata_roundtrips() {
+	let unit = LogicalTypeUnit {
+		dimension: "Temperature".to_string(),
+		scale_to_base: UnitScale {
+			numerator: 1,
+			denominator: 1,
+		},
+		quantity_kind: UnitQuantityKind::Point,
+		offset_to_base: UnitOffset {
+			numerator: 5463,
+			denominator: 20,
+		},
+	};
+	let create = LogicalTypeDefinitionCreate {
+		name: "Celsius".to_string(),
+		physical: LogicalTypePhysical::Float64,
+		refinement: None,
+		unit: Some(unit.clone()),
+	};
+
+	let payload = encode_logical_type_definition_create(&create).unwrap();
+	assert_eq!(
+		decode_logical_type_definition_create(&payload).unwrap(),
+		create
+	);
+
+	let mut catalog = LogicalTypeCatalog::default();
+	let tenant = TenantId::new(7);
+	let definition = catalog.create(tenant, create).unwrap();
+	assert_eq!(definition.unit, Some(unit));
+}
+
+#[test]
+fn logical_type_unit_metadata_requires_float64_positive_scale_and_valid_offset() {
 	let invalid_physical = LogicalTypeDefinitionCreate {
 		name: "Mile".to_string(),
 		physical: LogicalTypePhysical::Int64,
@@ -236,6 +272,8 @@ fn logical_type_unit_metadata_requires_float64_and_positive_scale() {
 				numerator: 1,
 				denominator: 1,
 			},
+			quantity_kind: UnitQuantityKind::Delta,
+			offset_to_base: UnitOffset::ZERO,
 		}),
 	};
 	assert!(encode_logical_type_definition_create(&invalid_physical).is_err());
@@ -250,9 +288,49 @@ fn logical_type_unit_metadata_requires_float64_and_positive_scale() {
 				numerator: 0,
 				denominator: 1,
 			},
+			quantity_kind: UnitQuantityKind::Delta,
+			offset_to_base: UnitOffset::ZERO,
 		}),
 	};
 	assert!(encode_logical_type_definition_create(&invalid_scale).is_err());
+
+	let invalid_offset_denominator = LogicalTypeDefinitionCreate {
+		name: "Celsius".to_string(),
+		physical: LogicalTypePhysical::Float64,
+		refinement: None,
+		unit: Some(LogicalTypeUnit {
+			dimension: "Temperature".to_string(),
+			scale_to_base: UnitScale {
+				numerator: 1,
+				denominator: 1,
+			},
+			quantity_kind: UnitQuantityKind::Point,
+			offset_to_base: UnitOffset {
+				numerator: 1,
+				denominator: 0,
+			},
+		}),
+	};
+	assert!(encode_logical_type_definition_create(&invalid_offset_denominator).is_err());
+
+	let invalid_delta_offset = LogicalTypeDefinitionCreate {
+		name: "CelsiusDelta".to_string(),
+		physical: LogicalTypePhysical::Float64,
+		refinement: None,
+		unit: Some(LogicalTypeUnit {
+			dimension: "Temperature".to_string(),
+			scale_to_base: UnitScale {
+				numerator: 1,
+				denominator: 1,
+			},
+			quantity_kind: UnitQuantityKind::Delta,
+			offset_to_base: UnitOffset {
+				numerator: 1,
+				denominator: 1,
+			},
+		}),
+	};
+	assert!(encode_logical_type_definition_create(&invalid_delta_offset).is_err());
 }
 
 #[test]

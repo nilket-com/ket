@@ -28,7 +28,10 @@ use wendelon::schema::{
 	TableObjectId, TableSchemaDescriptor,
 	pbc::{OP_IN_LIST, OP_NOT},
 };
-use wendelon_client::{LogicalTypeDefinition, LogicalTypePhysical, LogicalTypeUnit, UnitScale};
+use wendelon_client::{
+	LogicalTypeDefinition, LogicalTypePhysical, LogicalTypeUnit, UnitOffset, UnitQuantityKind,
+	UnitScale,
+};
 
 fn sandbox_config() -> RuneSandboxConfig {
 	RuneSandboxConfig {
@@ -3049,6 +3052,8 @@ fn catalog_with_dimensioned_price() -> MockCatalog {
 						numerator: 201168,
 						denominator: 125,
 					},
+					quantity_kind: UnitQuantityKind::Delta,
+					offset_to_base: UnitOffset::ZERO,
 				}),
 			},
 		)
@@ -3067,6 +3072,8 @@ fn catalog_with_dimensioned_price() -> MockCatalog {
 						numerator: 1000,
 						denominator: 1,
 					},
+					quantity_kind: UnitQuantityKind::Delta,
+					offset_to_base: UnitOffset::ZERO,
 				}),
 			},
 		)

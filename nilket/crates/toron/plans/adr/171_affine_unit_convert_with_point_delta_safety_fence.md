@@ -43,16 +43,14 @@ metadata with:
 - `offset_to_base: UnitOffset`, an exact signed rational with signed numerator
   and positive denominator.
 
-Existing logical types without these fields decode as `Delta` with zero offset.
+Existing unit DDL without the new clauses creates `Delta` with zero offset.
 `UnitScale` remains positive-only. `UnitOffset` is separate because offsets can
 be negative and because reusing a scale type would make validation misleading.
 
 **D2 - Public names are brand-clean and unsuffixed.** The public Wendelon/Toron
 metadata names should be neutral unit-language names such as
 `UnitQuantityKind` and `UnitOffset`. Do not add new `V1`, `Descriptor`, `Policy`,
-or Toron-branded names for this unit metadata. Private old-shape decode helpers
-may say `Legacy`, but the public contract should not spread Wendelon version
-suffix habits.
+or Toron-branded names for this unit metadata.
 
 **D3 - DDL is explicit and defaults to legacy linear semantics.** Existing unit
 DDL keeps working:
@@ -136,11 +134,11 @@ explicit `CONVERT`.
 is no executor kernel, PBC opcode, optimizer-fact surface, or storage runtime
 operation for affine conversion.
 
-**D9 - Explicit legacy decode is required.** Catalog bytes written before ADR 171
-must decode to `Delta` zero-offset units. Because this is postcard-carried
-metadata, the implementation should include explicit old-shape decode fallback
-for logical-type definitions and definition-create payloads rather than relying
-on default-field optimism.
+**D9 - No premature backward-compatibility scaffolding.** Wendelon convention
+`no-premature-backward-compat.md` applies: this is an in-flight schema contract,
+not a deployed external stability boundary. Change the unit metadata shape
+directly. Do not add legacy decode structs, tolerant decoders, or old-shape
+decode tests for ADR 171.
 
 ## Headline Gates
 
@@ -162,8 +160,8 @@ on default-field optimism.
 
 - `point_comparison_and_selection_stay_valid` - point comparison, `MIN(point)`,
   `MAX(point)`, and `COUNT(point)` keep the existing behavior.
-- `legacy_linear_units_remain_delta_zero_offset` - a pre-171 unit payload with
-  only `dimension + scale_to_base` decodes as `Delta` with `offset_to_base = 0/1`.
+- `linear_unit_ddl_defaults_to_delta_zero_offset` - DDL with only
+  `DIMENSION + SCALE_TO_BASE` creates `Delta` with `offset_to_base = 0/1`.
 - `linear_unit_convert_arithmetic_and_aggregation_regressions_stay_green` -
   Mile/Kilometer `CONVERT`, same-unit linear arithmetic, `SUM(Mile)`, and ADR
   167/168/170 gates still pass.
@@ -180,9 +178,9 @@ on default-field optimism.
   metadata introduces no new `V1`, `Descriptor`, `Policy`, or Toron-branded names.
 - `adr171_unit_metadata_has_kind_and_signed_offset` - `LogicalTypeUnit` carries a
   `UnitQuantityKind` and a signed `UnitOffset`, not a reused positive `UnitScale`.
-- `adr171_legacy_units_decode_as_delta_zero_offset` - Wendelon decode contains an
-  explicit old-shape fallback for logical-type definitions, definition-create
-  payloads, and vectors.
+- `adr171_no_premature_legacy_decode_scaffolding` - Wendelon does not add
+  legacy unit structs, tolerant old-shape decoders, or old-shape decode tests
+  for this in-flight metadata change.
 - `adr171_delta_offset_rejects` - validation rejects nonzero offsets on `Delta`.
 - `adr171_affine_convert_is_bind_desugared_not_executor_kernel` -
   `bind_sql_convert` consumes `quantity_kind` and `offset_to_base`; `exec.rs`

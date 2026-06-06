@@ -30,7 +30,7 @@ use wendelon::schema::{
 };
 use wendelon_client::{
 	LogicalTypePhysical, LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate,
-	LogicalTypeRefinementValue, LogicalTypeUnit, UnitScale,
+	LogicalTypeRefinementValue, LogicalTypeUnit, UnitOffset, UnitQuantityKind, UnitScale,
 };
 
 fn unsupported(message: impl Into<String>) -> FrontendError {
@@ -729,9 +729,40 @@ fn parse_create_logical_type_clauses(
 			"CREATE LOGICAL TYPE unit metadata requires DOUBLE/FLOAT64 physical type",
 		));
 	}
+	let scale_to_base = parse_positive_decimal_scale(scale)?;
+	let mut rest = rest.trim();
+	let mut offset_to_base = UnitOffset::ZERO;
+	let mut offset_explicit = false;
+	if let Some(after_offset) = strip_sql_keyword_prefix(rest, "OFFSET_TO_BASE") {
+		let Some((offset, after_offset_value)) = take_sql_word(after_offset) else {
+			return Err(unsupported(
+				"CREATE LOGICAL TYPE OFFSET_TO_BASE requires a signed decimal",
+			));
+		};
+		offset_to_base = parse_signed_decimal_offset(offset)?;
+		offset_explicit = true;
+		rest = after_offset_value.trim();
+	}
+	let mut quantity_kind = UnitQuantityKind::Delta;
+	if let Some((kind, after_kind)) = take_sql_word(rest) {
+		if kind.eq_ignore_ascii_case("POINT") {
+			quantity_kind = UnitQuantityKind::Point;
+			rest = after_kind.trim();
+		} else if kind.eq_ignore_ascii_case("DELTA") {
+			quantity_kind = UnitQuantityKind::Delta;
+			rest = after_kind.trim();
+		}
+	}
+	if offset_explicit && !offset_to_base.is_zero() && quantity_kind == UnitQuantityKind::Delta {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE nonzero OFFSET_TO_BASE requires POINT",
+		));
+	}
 	let unit = LogicalTypeUnit {
 		dimension: dimension.to_string(),
-		scale_to_base: parse_positive_decimal_scale(scale)?,
+		scale_to_base,
+		quantity_kind,
+		offset_to_base,
 	};
 	let refinement = parse_create_logical_type_refinement_clause(rest.trim(), physical)?;
 	Ok((Some(unit), refinement))
@@ -825,6 +856,82 @@ fn parse_positive_decimal_scale(value: &str) -> Result<UnitScale, FrontendError>
 	Ok(UnitScale {
 		numerator: numerator / divisor,
 		denominator: denominator / divisor,
+	})
+}
+
+fn parse_signed_decimal_offset(value: &str) -> Result<UnitOffset, FrontendError> {
+	if value.contains(['e', 'E']) {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE OFFSET_TO_BASE supports signed decimal literals only",
+		));
+	}
+	let (negative, digits) = if let Some(rest) = value.strip_prefix('-') {
+		(true, rest)
+	} else if let Some(rest) = value.strip_prefix('+') {
+		(false, rest)
+	} else {
+		(false, value)
+	};
+	let mut parts = digits.split('.');
+	let whole = parts.next().unwrap_or_default();
+	let fraction = parts.next();
+	if parts.next().is_some()
+		|| whole.is_empty()
+		|| !whole.bytes().all(|byte| byte.is_ascii_digit())
+		|| fraction
+			.map(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+			.unwrap_or(false)
+	{
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE OFFSET_TO_BASE supports signed decimal literals only",
+		));
+	}
+	let mut numerator = whole
+		.parse::<u64>()
+		.map_err(|_| unsupported("CREATE LOGICAL TYPE OFFSET_TO_BASE decimal is out of range"))?;
+	let mut denominator = 1_u64;
+	if let Some(fraction) = fraction {
+		let scale = 10_u64.checked_pow(fraction.len() as u32).ok_or_else(|| {
+			unsupported("CREATE LOGICAL TYPE OFFSET_TO_BASE decimal is out of range")
+		})?;
+		let fraction_value = fraction.parse::<u64>().map_err(|_| {
+			unsupported("CREATE LOGICAL TYPE OFFSET_TO_BASE decimal is out of range")
+		})?;
+		numerator = numerator
+			.checked_mul(scale)
+			.and_then(|value| value.checked_add(fraction_value))
+			.ok_or_else(|| {
+				unsupported("CREATE LOGICAL TYPE OFFSET_TO_BASE decimal is out of range")
+			})?;
+		denominator = scale;
+	}
+	if numerator == 0 {
+		return Ok(UnitOffset::ZERO);
+	}
+	let divisor = gcd_u64(numerator, denominator);
+	let numerator = numerator / divisor;
+	let denominator = denominator / divisor;
+	let max_positive = i64::MAX as u64;
+	let signed_numerator = if negative {
+		if numerator == max_positive + 1 {
+			i64::MIN
+		} else if numerator <= max_positive {
+			-(numerator as i64)
+		} else {
+			return Err(unsupported(
+				"CREATE LOGICAL TYPE OFFSET_TO_BASE decimal is out of range",
+			));
+		}
+	} else if numerator <= max_positive {
+		numerator as i64
+	} else {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE OFFSET_TO_BASE decimal is out of range",
+		));
+	};
+	Ok(UnitOffset {
+		numerator: signed_numerator,
+		denominator,
 	})
 }
 

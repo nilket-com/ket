@@ -45,9 +45,9 @@ use wendelon_client::{
 	ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
 	ARROW_STATS_TAG_TIMESTAMP_MICROSECOND, ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
 	ARROW_STATS_TAG_TIMESTAMP_NANOSECOND, ARROW_STATS_TAG_UTF8, LogicalTypeRefinementComparisonOp,
-	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor, UnitScale,
-	decode_float32_optimizer_fact_scalar, decode_float64_optimizer_fact_scalar,
-	decode_signed_optimizer_fact_scalar,
+	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor, UnitOffset,
+	UnitQuantityKind, UnitScale, decode_float32_optimizer_fact_scalar,
+	decode_float64_optimizer_fact_scalar, decode_signed_optimizer_fact_scalar,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -9113,6 +9113,17 @@ fn bind_sql_convert(
 			),
 		});
 	}
+	if source_unit.quantity_kind != target_unit.quantity_kind {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"CONVERT point/delta mismatch: source {} is {:?}, target {} is {:?}",
+				source_spec.name,
+				source_unit.quantity_kind,
+				target_spec.name,
+				target_unit.quantity_kind
+			),
+		});
+	}
 	let factor = unit_scale_to_f64(&source_unit.scale_to_base)
 		/ unit_scale_to_f64(&target_unit.scale_to_base);
 	if !factor.is_finite() || factor <= 0.0 {
@@ -9123,8 +9134,27 @@ fn bind_sql_convert(
 			),
 		});
 	}
+	let shift = if source_unit.quantity_kind == UnitQuantityKind::Point {
+		(unit_offset_to_f64(&source_unit.offset_to_base)
+			- unit_offset_to_f64(&target_unit.offset_to_base))
+			/ unit_scale_to_f64(&target_unit.scale_to_base)
+	} else {
+		0.0
+	};
+	if !shift.is_finite() {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"CONVERT affine shift from {} to {} is invalid",
+				source_spec.name, target_spec.name
+			),
+		});
+	}
 	let factor = builder.append_literal(ScalarValue::Float64(Some(factor)));
-	let output = builder.append_binary(BoundBinaryOp::Mul, source, factor, DataType::Float64);
+	let mut output = builder.append_binary(BoundBinaryOp::Mul, source, factor, DataType::Float64);
+	if shift != 0.0 {
+		let shift = builder.append_literal(ScalarValue::Float64(Some(shift)));
+		output = builder.append_binary(BoundBinaryOp::Add, output, shift, DataType::Float64);
+	}
 	if !builder.set_node_logical_type(output, target_spec.id) {
 		return Err(BindingError::UnsupportedExpression {
 			message: "CONVERT target logical identity is malformed".to_string(),
@@ -9135,6 +9165,10 @@ fn bind_sql_convert(
 
 fn unit_scale_to_f64(scale: &UnitScale) -> f64 {
 	scale.numerator as f64 / scale.denominator as f64
+}
+
+fn unit_offset_to_f64(offset: &UnitOffset) -> f64 {
+	offset.numerator as f64 / offset.denominator as f64
 }
 
 fn validate_logical_ascription_physical(
@@ -9362,6 +9396,16 @@ fn bind_logical_arithmetic(
 			arithmetic_symbol(op),
 		));
 	}
+	if let LogicalArithmeticDomain::Quantity(spec) = &left_domain
+		&& quantity_kind_for_spec(spec) == Some(UnitQuantityKind::Point)
+	{
+		return Err(point_arithmetic_error(spec, arithmetic_symbol(op)));
+	}
+	if let LogicalArithmeticDomain::Quantity(spec) = &right_domain
+		&& quantity_kind_for_spec(spec) == Some(UnitQuantityKind::Point)
+	{
+		return Err(point_arithmetic_error(spec, arithmetic_symbol(op)));
+	}
 	if !matches!(op, BoundBinaryOp::Add) {
 		return Ok(None);
 	}
@@ -9402,9 +9446,15 @@ fn reject_logical_arithmetic_with_untyped_null(
 ) -> Result<(), BindingError> {
 	match logical_arithmetic_domain_for_node(ctx, builder, typed_operand)? {
 		LogicalArithmeticDomain::Naked => Ok(()),
-		LogicalArithmeticDomain::Quantity(_) => Err(unit_type_mismatch(
-			"unit arithmetic with untyped NULL requires an explicit typed NULL or primitive CAST",
-		)),
+		LogicalArithmeticDomain::Quantity(spec) => {
+			if quantity_kind_for_spec(&spec) == Some(UnitQuantityKind::Point) {
+				Err(point_arithmetic_error(&spec, arithmetic_symbol(op)))
+			} else {
+				Err(unit_type_mismatch(
+					"unit arithmetic with untyped NULL requires an explicit typed NULL or primitive CAST",
+				))
+			}
+		}
 		LogicalArithmeticDomain::Identity(spec) => Err(non_arithmetic_logical_type_error(
 			&spec.name,
 			arithmetic_symbol(op),
@@ -9431,6 +9481,16 @@ fn bind_dimensioned_arithmetic(
 	let right_unit = logical_unit_for_node(ctx, builder, right)?;
 	if left_unit.is_none() && right_unit.is_none() {
 		return Ok(None);
+	}
+	if let Some(spec) = left_unit.as_ref()
+		&& quantity_kind_for_spec(spec) == Some(UnitQuantityKind::Point)
+	{
+		return Err(point_arithmetic_error(spec, arithmetic_symbol(op)));
+	}
+	if let Some(spec) = right_unit.as_ref()
+		&& quantity_kind_for_spec(spec) == Some(UnitQuantityKind::Point)
+	{
+		return Err(point_arithmetic_error(spec, arithmetic_symbol(op)));
 	}
 
 	match op {
@@ -9607,6 +9667,19 @@ fn require_compatible_units(
 fn unit_type_mismatch(message: impl Into<String>) -> BindingError {
 	BindingError::TypeMismatch {
 		message: message.into(),
+	}
+}
+
+fn quantity_kind_for_spec(spec: &LogicalTypeSpec) -> Option<UnitQuantityKind> {
+	spec.unit.as_ref().map(|unit| unit.quantity_kind)
+}
+
+fn point_arithmetic_error(spec: &LogicalTypeSpec, context: &str) -> BindingError {
+	BindingError::TypeMismatch {
+		message: format!(
+			"point quantity {} does not support arithmetic for {context}; point/delta quantity algebra is deferred, use an explicit primitive CAST for raw math",
+			spec.name
+		),
 	}
 }
 
@@ -10724,6 +10797,9 @@ fn additive_unit_aggregate_logical_type(
 			aggregate_name,
 		)),
 		LogicalArithmeticDomain::Quantity(spec) => {
+			if quantity_kind_for_spec(&spec) == Some(UnitQuantityKind::Point) {
+				return Err(point_arithmetic_error(&spec, aggregate_name));
+			}
 			let Some(input_type) = call.args.root_type(0) else {
 				return Ok(LogicalTypeId::NAKED);
 			};

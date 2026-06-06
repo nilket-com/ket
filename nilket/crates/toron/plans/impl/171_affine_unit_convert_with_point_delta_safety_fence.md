@@ -65,25 +65,19 @@ Implementation notes:
 - Use product-neutral public names. Avoid new `V1`, `Descriptor`, `Policy`, or
   Toron-branded types for this metadata.
 
-## Phase 2 - Legacy Decode
+## Phase 2 - No Premature Backward-Compatibility Scaffolding
 
-Do explicit old-shape fallback for catalog bytes written before ADR 171.
+Follow `crates/wendelon/plans/conventions/no-premature-backward-compat.md`.
+Change the logical-type unit metadata shape directly:
 
-Recommended shape:
+- no `LegacyLogicalTypeUnit` / old-shape helper structs;
+- no tolerant fallback decoders;
+- no old-shape decode tests;
+- no "reserved for later" fields or version-suffix names.
 
-- Keep the public current structs clean.
-- Add private `LegacyLogicalTypeUnit`, `LegacyLogicalTypeDefinitionCreate`, and
-  `LegacyLogicalTypeDefinition` helpers in the Wendelon integration module.
-- Decode current shape first.
-- On decode error, decode the legacy shape and map every legacy unit to:
-  `quantity_kind = UnitQuantityKind::Delta` and `offset_to_base = UnitOffset::ZERO`.
-- Apply the same mapping to single definition-create payloads, single definition
-  payloads, and `Vec<LogicalTypeDefinition>` payloads.
-- After mapping, run current validation.
-
-Do not rely only on `#[serde(default)]`: this metadata is postcard-carried, and
-the compatibility gate should prove old bytes decode, not just that new Rust
-values have defaults.
+The defaulting behavior ADR 171 needs is source-level DDL behavior: unit DDL
+without `POINT`/`DELTA` or `OFFSET_TO_BASE` creates `Delta` with
+`UnitOffset::ZERO`.
 
 ## Phase 3 - Toron Plumbing
 
@@ -254,7 +248,7 @@ Toron tests, likely in `crates/toron/tests/logical_type_ddl_test.rs`:
   - same-dimension different-unit comparison rejects until explicit `CONVERT`;
   - `MIN`/`MAX` preserve point identity;
   - `COUNT` is naked.
-- `legacy_linear_units_remain_delta_zero_offset`
+- `linear_unit_ddl_defaults_to_delta_zero_offset`
   - DDL without new clauses behaves as before.
 - `linear_unit_convert_arithmetic_and_aggregation_regressions_stay_green`
   - Mile/Kilometer `CONVERT`, same-unit linear arithmetic, scalar scaling,
@@ -269,9 +263,6 @@ Toron tests, likely in `crates/toron/tests/logical_type_ddl_test.rs`:
 Wendelon integration contract tests:
 
 - current `LogicalTypeUnit` round-trips with `Point` and a signed offset;
-- `LogicalTypeDefinitionCreate` and `LogicalTypeDefinition` old-shape bytes
-  decode to `Delta` zero offset;
-- vector old-shape bytes decode every unit the same way;
 - validation rejects zero offset denominator;
 - validation rejects nonzero delta offset;
 - public names stay unsuffixed and brand-clean.
@@ -286,7 +277,7 @@ a small dedicated logical-unit file if the current file is too crowded:
 
 - `adr171_unit_metadata_is_brand_clean_and_unsuffixed`
 - `adr171_unit_metadata_has_kind_and_signed_offset`
-- `adr171_legacy_units_decode_as_delta_zero_offset`
+- `adr171_no_premature_legacy_decode_scaffolding`
 - `adr171_delta_offset_rejects`
 - `adr171_affine_convert_is_bind_desugared_not_executor_kernel`
 - `adr171_convert_dispatches_by_quantity_kind`
@@ -333,16 +324,16 @@ git diff --check
 ```
 
 If exact Wendelon test filters differ, preserve the coverage: metadata roundtrip,
-legacy decode, validation, Toron affine behavior, Rune parity, full architecture
-binary, and ADR 167/168/170 regressions.
+validation, Toron affine behavior, Rune parity, full architecture binary, and
+ADR 167/168/170 regressions.
 
 ## Risks
 
 - **Offset-only regression:** if implementation uses nonzero offset as the whole
   affine discriminator, `Kelvin` and `KelvinDelta` collapse. Review for explicit
   `quantity_kind` usage.
-- **Postcard compatibility:** old logical-type bytes must decode via an actual
-  fallback path.
+- **Premature compatibility drift:** do not add legacy decode structs or
+  old-shape tests for this in-flight metadata change.
 - **Delta offset validation:** default kind is `Delta`; a nonzero offset with no
   `POINT` token must reject.
 - **Formula placement:** only point `CONVERT` applies offsets; delta `CONVERT`

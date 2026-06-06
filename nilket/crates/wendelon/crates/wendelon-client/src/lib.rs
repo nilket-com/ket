@@ -55,11 +55,12 @@ pub use wendelon::integration::compute::{
 	LogicalTypeRefinementValue, LogicalTypeUnit, SchemaGeneration, SchemaIntentId,
 	SchemaIntentOrigin, SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1,
 	SchemaUpdateEnvelopeV1, StorageQuotaMetadataV1, StorageStatusKind, TableSchemaDropFields,
-	TableSchemaDropRequest, UnitScale, WendelonAdminError, decode_logical_type_definition,
-	decode_logical_type_definitions, decode_schema_update_envelope_v1,
-	encode_logical_type_definition_create, encode_logical_type_definitions,
-	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
-	prepare_query_session_handoff, validate_query_session_audit_attribution, validate_traceparent,
+	TableSchemaDropRequest, UnitOffset, UnitQuantityKind, UnitScale, WendelonAdminError,
+	decode_logical_type_definition, decode_logical_type_definitions,
+	decode_schema_update_envelope_v1, encode_logical_type_definition_create,
+	encode_logical_type_definitions, encode_schema_update_envelope_v1, map_read_status_for_compute,
+	map_write_status_for_compute, prepare_query_session_handoff,
+	validate_query_session_audit_attribution, validate_traceparent,
 };
 pub use wendelon::schema::{
 	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
