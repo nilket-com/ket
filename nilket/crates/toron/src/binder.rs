@@ -45,9 +45,10 @@ use wendelon_client::{
 	ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
 	ARROW_STATS_TAG_TIMESTAMP_MICROSECOND, ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
 	ARROW_STATS_TAG_TIMESTAMP_NANOSECOND, ARROW_STATS_TAG_UTF8, LogicalTypeRefinementComparisonOp,
-	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor, UnitOffset,
-	UnitQuantityKind, UnitScale, decode_float32_optimizer_fact_scalar,
-	decode_float64_optimizer_fact_scalar, decode_signed_optimizer_fact_scalar,
+	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, LogicalTypeUnit,
+	TableSchemaDescriptor, UnitOffset, UnitQuantityKind, UnitScale,
+	decode_float32_optimizer_fact_scalar, decode_float64_optimizer_fact_scalar,
+	decode_signed_optimizer_fact_scalar,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -633,6 +634,7 @@ impl<'a> Binder<'a> {
 						&bound_predicate,
 						&input.plan,
 						input_facts,
+						&logical_types,
 					);
 					let estimated_row_count =
 						min_optional_row_count(ndv_estimated_row_count, range_estimated_row_count);
@@ -1120,7 +1122,8 @@ impl<'a> Binder<'a> {
 		let (bound_predicate, pbc_program, profile_hint) = match bound_predicate {
 			Some(program) => {
 				let scan = scan_plan(binding.clone(), None);
-				let pushdown = predicate_pushdown_plan(program, &scan);
+				let logical_types = self.catalog.logical_type_registry();
+				let pushdown = predicate_pushdown_plan(program, &scan, &logical_types);
 				(
 					pushdown.residual_predicate,
 					pushdown.pbc_program,
@@ -2167,7 +2170,7 @@ fn plan_filter_with_predicate_pushdown(
 		);
 	}
 
-	let pushdown = predicate_pushdown_plan(predicate, &input);
+	let pushdown = predicate_pushdown_plan(predicate, &input, logical_types);
 	let profile_hint = pushdown
 		.profile_hint
 		.or(fallback_profile)
@@ -3050,6 +3053,7 @@ where
 fn predicate_pushdown_plan(
 	predicate: BoundExprProgram,
 	input: &ExecutionPlan,
+	logical_types: &LogicalTypeRegistry,
 ) -> PredicatePushdownPlan {
 	let fallback_profile = scan_profile_hint(&predicate, input);
 	let Some((pushed_predicate, residual_predicate)) = partition_bound_predicate(&predicate) else {
@@ -3060,6 +3064,9 @@ fn predicate_pushdown_plan(
 			profile_hint: fallback_profile,
 		};
 	};
+
+	let derived_predicate = converted_linear_pushdown_predicate(&predicate, logical_types);
+	let pushed_predicate = combine_pushdown_predicates(pushed_predicate, derived_predicate);
 
 	let Some(pushed_predicate) = pushed_predicate else {
 		return PredicatePushdownPlan {
@@ -3085,6 +3092,234 @@ fn predicate_pushdown_plan(
 		residual_predicate,
 		pbc_program: Some(pbc_program),
 		profile_hint,
+	}
+}
+
+fn combine_pushdown_predicates(
+	pushed: Option<BoundExprProgram>,
+	derived: Option<BoundExprProgram>,
+) -> Option<BoundExprProgram> {
+	match (pushed, derived) {
+		(Some(pushed), Some(derived)) => combine_bound_programs_as_and(vec![pushed, derived])
+			.ok()
+			.flatten(),
+		(Some(pushed), None) => Some(pushed),
+		(None, Some(derived)) => Some(derived),
+		(None, None) => None,
+	}
+}
+
+#[derive(Debug, Clone)]
+struct LinearConvertedComparison {
+	column: ResolvedColumn,
+	source_logical: LogicalTypeId,
+	factor: f64,
+	op: BoundBinaryOp,
+	constant: f64,
+}
+
+fn converted_linear_pushdown_predicate(
+	predicate: &BoundExprProgram,
+	logical_types: &LogicalTypeRegistry,
+) -> Option<BoundExprProgram> {
+	let root = predicate.single_root()?;
+	let mut conjuncts = Vec::new();
+	collect_top_level_bound_and(predicate, root, &mut conjuncts);
+	let derived = conjuncts
+		.into_iter()
+		.filter_map(|conjunct| {
+			match_linear_converted_comparison(predicate, conjunct, logical_types)
+				.and_then(|comparison| derived_linear_converted_predicate(&comparison))
+		})
+		.collect::<Vec<_>>();
+
+	combine_bound_programs_as_and(derived).ok().flatten()
+}
+
+fn match_linear_converted_comparison(
+	program: &BoundExprProgram,
+	root: BoundExprId,
+	logical_types: &LogicalTypeRegistry,
+) -> Option<LinearConvertedComparison> {
+	let BoundExprNode::Binary { op, left, right } = program.node(root)? else {
+		return None;
+	};
+	if !matches!(
+		op,
+		BoundBinaryOp::Lt | BoundBinaryOp::Lte | BoundBinaryOp::Gt | BoundBinaryOp::Gte
+	) {
+		return None;
+	}
+	match_linear_converted_comparison_sides(program, op.clone(), *left, *right, logical_types)
+		.or_else(|| {
+			match_linear_converted_comparison_sides(
+				program,
+				flip_range_op(op.clone()),
+				*right,
+				*left,
+				logical_types,
+			)
+		})
+}
+
+fn match_linear_converted_comparison_sides(
+	program: &BoundExprProgram,
+	op: BoundBinaryOp,
+	converted_side: BoundExprId,
+	literal_side: BoundExprId,
+	logical_types: &LogicalTypeRegistry,
+) -> Option<LinearConvertedComparison> {
+	let constant = finite_float64_literal(program, literal_side)?;
+	let (column_id, column, factor) = match_linear_converted_mul(program, converted_side)?;
+	let target_logical = program.node_logical_type(converted_side)?;
+	let source_logical = program.node_logical_type(column_id)?;
+	let source_spec = LogicalTypeResolver::with_registry(logical_types).spec(source_logical)?;
+	let target_spec = LogicalTypeResolver::with_registry(logical_types).spec(target_logical)?;
+	let source_unit = source_spec.unit.as_ref()?;
+	let target_unit = target_spec.unit.as_ref()?;
+	if source_spec.physical != DataType::Float64 || target_spec.physical != DataType::Float64 {
+		return None;
+	}
+	if source_unit.quantity_kind != UnitQuantityKind::Delta
+		|| target_unit.quantity_kind != UnitQuantityKind::Delta
+	{
+		return None;
+	}
+	if source_unit.dimension != target_unit.dimension {
+		return None;
+	}
+	let transform = logical_unit_convert_transform(source_unit, target_unit);
+	if !transform.factor.is_finite() || transform.factor <= 0.0 || transform.shift != 0.0 {
+		return None;
+	}
+	if factor.to_bits() != transform.factor.to_bits() {
+		return None;
+	}
+	Some(LinearConvertedComparison {
+		column,
+		source_logical,
+		factor,
+		op,
+		constant,
+	})
+}
+
+fn match_linear_converted_mul(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+) -> Option<(BoundExprId, ResolvedColumn, f64)> {
+	let BoundExprNode::Binary {
+		op: BoundBinaryOp::Mul,
+		left,
+		right,
+	} = program.node(id)?
+	else {
+		return None;
+	};
+	match_linear_converted_mul_sides(program, *left, *right)
+		.or_else(|| match_linear_converted_mul_sides(program, *right, *left))
+}
+
+fn match_linear_converted_mul_sides(
+	program: &BoundExprProgram,
+	column_side: BoundExprId,
+	literal_side: BoundExprId,
+) -> Option<(BoundExprId, ResolvedColumn, f64)> {
+	let Some(BoundExprNode::Column(column)) = program.node(column_side) else {
+		return None;
+	};
+	if !column.pbc_eligible || column.data_type != DataType::Float64 {
+		return None;
+	}
+	let factor = finite_float64_literal(program, literal_side)?;
+	if factor <= 0.0 {
+		return None;
+	}
+	Some((column_side, column.clone(), factor))
+}
+
+fn finite_float64_literal(program: &BoundExprProgram, id: BoundExprId) -> Option<f64> {
+	let Some(BoundExprNode::Literal(literal)) = program.node(id) else {
+		return None;
+	};
+	let Some(ScalarValue::Float64(Some(value))) = program.literals.get(*literal as usize) else {
+		return None;
+	};
+	value.is_finite().then_some(*value)
+}
+
+fn derived_linear_converted_predicate(
+	comparison: &LinearConvertedComparison,
+) -> Option<BoundExprProgram> {
+	let threshold =
+		widened_converted_linear_threshold(comparison.constant, comparison.factor, &comparison.op)?;
+
+	let mut builder = BoundExprProgramBuilder::new();
+	let column = builder.append_column(comparison.column.clone());
+	if !builder.set_node_logical_type(column, comparison.source_logical) {
+		return None;
+	}
+	let literal = builder.append_literal(ScalarValue::Float64(Some(threshold)));
+	let root = builder.append_binary(comparison.op.clone(), column, literal, DataType::Boolean);
+	builder.push_root(root);
+	let program = builder.build();
+	program.validate().ok()?;
+	Some(program)
+}
+
+fn widened_converted_linear_threshold(
+	constant: f64,
+	factor: f64,
+	op: &BoundBinaryOp,
+) -> Option<f64> {
+	if !constant.is_finite() || !factor.is_finite() || factor <= 0.0 {
+		return None;
+	}
+	let threshold = constant / factor;
+	if !threshold.is_finite() {
+		return None;
+	}
+	let widened = match op {
+		BoundBinaryOp::Gt | BoundBinaryOp::Gte => next_float_down(threshold),
+		BoundBinaryOp::Lt | BoundBinaryOp::Lte => next_float_up(threshold),
+		_ => return None,
+	};
+	widened.is_finite().then_some(widened)
+}
+
+fn next_float_up(value: f64) -> f64 {
+	if value.is_nan() || value == f64::INFINITY {
+		return value;
+	}
+	if value == f64::NEG_INFINITY {
+		return f64::MIN;
+	}
+	if value == 0.0 {
+		return f64::from_bits(1);
+	}
+	let bits = value.to_bits();
+	if value > 0.0 {
+		f64::from_bits(bits + 1)
+	} else {
+		f64::from_bits(bits - 1)
+	}
+}
+
+fn next_float_down(value: f64) -> f64 {
+	if value.is_nan() || value == f64::NEG_INFINITY {
+		return value;
+	}
+	if value == f64::INFINITY {
+		return f64::MAX;
+	}
+	if value == 0.0 {
+		return -f64::from_bits(1);
+	}
+	let bits = value.to_bits();
+	if value > 0.0 {
+		f64::from_bits(bits - 1)
+	} else {
+		f64::from_bits(bits + 1)
 	}
 }
 
@@ -5066,6 +5301,7 @@ fn filter_range_selectivity_estimated_row_count(
 	predicate: &BoundExprProgram,
 	input: &ExecutionPlan,
 	facts: PlanOptimizerFacts,
+	logical_types: &LogicalTypeRegistry,
 ) -> Option<RowCount> {
 	if facts.origin != PlanOrigin::SingleBaseRelation {
 		return None;
@@ -5076,7 +5312,9 @@ fn filter_range_selectivity_estimated_row_count(
 	let mut intervals = HashMap::<ColumnOrdinal, RangeInterval>::new();
 
 	for conjunct in conjuncts {
-		let Some(atom) = range_atom(predicate, conjunct, input) else {
+		let Some(atom) = range_atom(predicate, conjunct, input)
+			.or_else(|| converted_linear_range_atom(predicate, conjunct, input, logical_types))
+		else {
 			continue;
 		};
 		intervals
@@ -5093,6 +5331,28 @@ fn filter_range_selectivity_estimated_row_count(
 		estimate = min_optional_row_count(estimate, Some(column_estimate));
 	}
 	estimate
+}
+
+fn converted_linear_range_atom(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	input: &ExecutionPlan,
+	logical_types: &LogicalTypeRegistry,
+) -> Option<RangeAtom> {
+	let comparison = match_linear_converted_comparison(program, id, logical_types)?;
+	let threshold =
+		widened_converted_linear_threshold(comparison.constant, comparison.factor, &comparison.op)?;
+	let range = column_range_for_input(input, comparison.column.ordinal)?;
+	let literal_value = range_scalar_for_fact(
+		range,
+		&comparison.column.data_type,
+		&ScalarValue::Float64(Some(threshold)),
+	)?;
+	Some(RangeAtom {
+		column: comparison.column.ordinal,
+		op: comparison.op,
+		literal_value,
+	})
 }
 
 #[derive(Debug, Clone)]
@@ -9124,9 +9384,8 @@ fn bind_sql_convert(
 			),
 		});
 	}
-	let factor = unit_scale_to_f64(&source_unit.scale_to_base)
-		/ unit_scale_to_f64(&target_unit.scale_to_base);
-	if !factor.is_finite() || factor <= 0.0 {
+	let transform = logical_unit_convert_transform(source_unit, target_unit);
+	if !transform.factor.is_finite() || transform.factor <= 0.0 {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
 				"CONVERT scale from {} to {} is invalid",
@@ -9134,14 +9393,7 @@ fn bind_sql_convert(
 			),
 		});
 	}
-	let shift = if source_unit.quantity_kind == UnitQuantityKind::Point {
-		(unit_offset_to_f64(&source_unit.offset_to_base)
-			- unit_offset_to_f64(&target_unit.offset_to_base))
-			/ unit_scale_to_f64(&target_unit.scale_to_base)
-	} else {
-		0.0
-	};
-	if !shift.is_finite() {
+	if !transform.shift.is_finite() {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
 				"CONVERT affine shift from {} to {} is invalid",
@@ -9149,10 +9401,10 @@ fn bind_sql_convert(
 			),
 		});
 	}
-	let factor = builder.append_literal(ScalarValue::Float64(Some(factor)));
+	let factor = builder.append_literal(ScalarValue::Float64(Some(transform.factor)));
 	let mut output = builder.append_binary(BoundBinaryOp::Mul, source, factor, DataType::Float64);
-	if shift != 0.0 {
-		let shift = builder.append_literal(ScalarValue::Float64(Some(shift)));
+	if transform.shift != 0.0 {
+		let shift = builder.append_literal(ScalarValue::Float64(Some(transform.shift)));
 		output = builder.append_binary(BoundBinaryOp::Add, output, shift, DataType::Float64);
 	}
 	if !builder.set_node_logical_type(output, target_spec.id) {
@@ -9161,6 +9413,28 @@ fn bind_sql_convert(
 		});
 	}
 	Ok(output)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LogicalUnitConvertTransform {
+	factor: f64,
+	shift: f64,
+}
+
+fn logical_unit_convert_transform(
+	source_unit: &LogicalTypeUnit,
+	target_unit: &LogicalTypeUnit,
+) -> LogicalUnitConvertTransform {
+	let factor = unit_scale_to_f64(&source_unit.scale_to_base)
+		/ unit_scale_to_f64(&target_unit.scale_to_base);
+	let shift = if source_unit.quantity_kind == UnitQuantityKind::Point {
+		(unit_offset_to_f64(&source_unit.offset_to_base)
+			- unit_offset_to_f64(&target_unit.offset_to_base))
+			/ unit_scale_to_f64(&target_unit.scale_to_base)
+	} else {
+		0.0
+	};
+	LogicalUnitConvertTransform { factor, shift }
 }
 
 fn unit_scale_to_f64(scale: &UnitScale) -> f64 {
@@ -11069,6 +11343,7 @@ mod tests {
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
 	};
+	use wendelon_client::{LogicalTypeDefinition, LogicalTypePhysical};
 
 	const DAY_NANOS: i64 = 86_400_000_000_000;
 
@@ -11342,6 +11617,128 @@ mod tests {
 			}
 			other => panic!("expected filter, got {other:?}"),
 		}
+	}
+
+	#[tokio::test]
+	async fn converted_linear_predicate_pushes_as_bare_column() {
+		let catalog = converted_unit_catalog(false);
+		let scoped = bind_sql_scoped(
+			&catalog,
+			"SELECT * FROM customers WHERE CONVERT(distance_mile, Kilometer) > CAST(10.0 AS Kilometer)",
+		)
+		.await;
+
+		let (disposition, pbc_attached) =
+			first_filter_scan_state(&scoped.plan).expect("converted filter");
+		assert_eq!(disposition, FilterDisposition::EvaluateInToron);
+		assert!(pbc_attached, "converted linear predicate should attach PBC");
+	}
+
+	#[tokio::test]
+	async fn converted_linear_predicate_spends_source_range_fact() {
+		let catalog = converted_unit_catalog(true);
+		let scoped = bind_sql_scoped(
+			&catalog,
+			"SELECT * FROM customers WHERE CONVERT(distance_mile, Kilometer) > CAST(10.0 AS Kilometer)",
+		)
+		.await;
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(938)));
+	}
+
+	#[tokio::test]
+	async fn linear_convert_pushdown_matches_all_range_directions() {
+		let catalog = converted_unit_catalog(false);
+		for op in ["<", "<=", ">", ">="] {
+			let scoped = bind_sql_scoped(
+				&catalog,
+				&format!(
+					"SELECT * FROM customers WHERE CONVERT(distance_mile, Kilometer) {op} CAST(10.0 AS Kilometer)"
+				),
+			)
+			.await;
+			let (disposition, pbc_attached) =
+				first_filter_scan_state(&scoped.plan).expect("converted filter");
+			assert_eq!(disposition, FilterDisposition::EvaluateInToron);
+			assert!(pbc_attached, "converted predicate {op} should attach PBC");
+		}
+	}
+
+	#[tokio::test]
+	async fn affine_point_converted_predicate_stays_residual() {
+		let catalog = point_unit_catalog();
+		let scoped = bind_sql_scoped(
+			&catalog,
+			"SELECT * FROM temperatures WHERE CONVERT(temp_c, Fahrenheit) > CAST(50.0 AS Fahrenheit)",
+		)
+		.await;
+
+		let (disposition, pbc_attached) =
+			first_filter_scan_state(&scoped.plan).expect("affine converted filter");
+		assert_eq!(disposition, FilterDisposition::EvaluateInToron);
+		assert!(!pbc_attached, "affine point CONVERT stays residual-only");
+	}
+
+	#[tokio::test]
+	async fn equality_on_converted_column_stays_residual() {
+		let catalog = converted_unit_catalog(false);
+		let scoped = bind_sql_scoped(
+			&catalog,
+			"SELECT * FROM customers WHERE CONVERT(distance_mile, Kilometer) = CAST(10.0 AS Kilometer)",
+		)
+		.await;
+
+		let (disposition, pbc_attached) =
+			first_filter_scan_state(&scoped.plan).expect("converted equality filter");
+		assert_eq!(disposition, FilterDisposition::EvaluateInToron);
+		assert!(!pbc_attached, "converted equality is deferred");
+	}
+
+	#[tokio::test]
+	async fn naked_arithmetic_scaled_predicate_stays_residual() {
+		let catalog = converted_unit_catalog(false);
+		let scoped = bind_sql_scoped(
+			&catalog,
+			"SELECT * FROM customers WHERE distance_mile * 1.609344 > CAST(10.0 AS Mile)",
+		)
+		.await;
+
+		let (disposition, pbc_attached) =
+			first_filter_scan_state(&scoped.plan).expect("scaled arithmetic filter");
+		assert_eq!(disposition, FilterDisposition::EvaluateInToron);
+		assert!(!pbc_attached, "shape-only scaled arithmetic must not push");
+	}
+
+	#[tokio::test]
+	async fn converted_pushdown_rejects_factor_metadata_mismatch() {
+		let catalog = converted_unit_catalog(false);
+		let registry = catalog.logical_type_registry();
+		let binding = catalog
+			.resolve_table(&TableRef::new("customers"))
+			.await
+			.expect("resolve customers");
+		let scan = scan_plan(binding, None);
+		let mut builder = BoundExprProgramBuilder::new();
+		let source = builder.append_column(ResolvedColumn {
+			name: ColumnName("distance_mile".to_string()),
+			ordinal: ColumnOrdinal(1),
+			data_type: DataType::Float64,
+			nullable: true,
+			pbc_eligible: true,
+		});
+		assert!(builder.set_node_logical_type(source, mile_logical_type()));
+		let factor = builder.append_literal(ScalarValue::Float64(Some(1.0)));
+		let converted =
+			builder.append_binary(BoundBinaryOp::Mul, source, factor, DataType::Float64);
+		assert!(builder.set_node_logical_type(converted, kilometer_logical_type()));
+		let constant = builder.append_literal(ScalarValue::Float64(Some(10.0)));
+		let root = builder.append_binary(BoundBinaryOp::Gt, converted, constant, DataType::Boolean);
+		builder.push_root(root);
+		let program = builder.build();
+
+		let pushdown = predicate_pushdown_plan(program, &scan, &registry);
+		assert!(pushdown.pbc_program.is_none());
+		assert!(pushdown.residual_predicate.is_some());
 	}
 
 	#[tokio::test]
@@ -19756,6 +20153,227 @@ mod tests {
 			.register_descriptor(TableId(1), descriptor())
 			.expect("register descriptor");
 		catalog
+	}
+
+	async fn bind_sql_scoped(catalog: &dyn Catalog, sql: &str) -> ScopedExecutionPlan {
+		let logical = SqlPlanner::new().plan(sql).expect("plan SQL");
+		let config = PlannerConfig::default();
+		Binder {
+			catalog,
+			config: &config,
+		}
+		.bind_plan(&logical)
+		.await
+		.expect(sql)
+	}
+
+	fn converted_unit_catalog(seed_range: bool) -> MockCatalog {
+		let mut catalog = MockCatalog::new();
+		register_logical_type(&catalog, mile_definition());
+		register_logical_type(&catalog, kilometer_definition());
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			field_with_logical_type_metadata(
+				"distance_mile",
+				DataType::Float64,
+				true,
+				mile_logical_type(),
+			),
+		]);
+		catalog
+			.register_descriptor(TableId(44), named_descriptor(44, "customers", schema))
+			.expect("register converted-unit descriptor");
+		if seed_range {
+			catalog
+				.seed_optimizer_facts(
+					&TableRef::new("customers"),
+					TableOptimizerFacts {
+						byte_upper_bound: None,
+						row_upper_bound: Some(RowCount::new(1_000)),
+						column_ndv: Default::default(),
+						column_range: [(ColumnOrdinal(1), range_fact_f64(0.0, 100.0, 1_000))]
+							.into_iter()
+							.collect(),
+						column_range_distributions: Default::default(),
+						column_heavy_hitters: Default::default(),
+						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
+					},
+				)
+				.expect("seed converted-unit range fact");
+		}
+		catalog
+	}
+
+	fn point_unit_catalog() -> MockCatalog {
+		let mut catalog = MockCatalog::new();
+		register_logical_type(&catalog, celsius_definition());
+		register_logical_type(&catalog, fahrenheit_definition());
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			field_with_logical_type_metadata(
+				"temp_c",
+				DataType::Float64,
+				true,
+				celsius_logical_type(),
+			),
+		]);
+		catalog
+			.register_descriptor(TableId(45), named_descriptor(45, "temperatures", schema))
+			.expect("register point-unit descriptor");
+		catalog
+	}
+
+	fn register_logical_type(catalog: &MockCatalog, definition: LogicalTypeDefinition) {
+		catalog
+			.register_logical_type_for_tenant(crate::storage::TenantId(1), definition)
+			.expect("register logical type");
+	}
+
+	fn mile_logical_type() -> LogicalTypeId {
+		LogicalTypeId(crate::ir::DURABLE_LOGICAL_TYPE_MIN_ID)
+	}
+
+	fn kilometer_logical_type() -> LogicalTypeId {
+		LogicalTypeId(crate::ir::DURABLE_LOGICAL_TYPE_MIN_ID + 1)
+	}
+
+	fn celsius_logical_type() -> LogicalTypeId {
+		LogicalTypeId(crate::ir::DURABLE_LOGICAL_TYPE_MIN_ID + 10)
+	}
+
+	fn fahrenheit_logical_type() -> LogicalTypeId {
+		LogicalTypeId(crate::ir::DURABLE_LOGICAL_TYPE_MIN_ID + 11)
+	}
+
+	fn mile_definition() -> LogicalTypeDefinition {
+		delta_unit_definition(
+			mile_logical_type(),
+			"Mile",
+			UnitScale {
+				numerator: 201_168,
+				denominator: 125,
+			},
+		)
+	}
+
+	fn kilometer_definition() -> LogicalTypeDefinition {
+		delta_unit_definition(
+			kilometer_logical_type(),
+			"Kilometer",
+			UnitScale {
+				numerator: 1_000,
+				denominator: 1,
+			},
+		)
+	}
+
+	fn delta_unit_definition(
+		id: LogicalTypeId,
+		name: &str,
+		scale_to_base: UnitScale,
+	) -> LogicalTypeDefinition {
+		LogicalTypeDefinition {
+			logical_type_id: id.0,
+			name: name.to_string(),
+			physical: LogicalTypePhysical::Float64,
+			refinement: None,
+			unit: Some(LogicalTypeUnit {
+				dimension: "Length".to_string(),
+				scale_to_base,
+				quantity_kind: UnitQuantityKind::Delta,
+				offset_to_base: UnitOffset::ZERO,
+				delta_unit: None,
+			}),
+		}
+	}
+
+	fn celsius_definition() -> LogicalTypeDefinition {
+		point_unit_definition(
+			celsius_logical_type(),
+			"Celsius",
+			UnitScale {
+				numerator: 1,
+				denominator: 1,
+			},
+			UnitOffset {
+				numerator: 5_463,
+				denominator: 20,
+			},
+		)
+	}
+
+	fn fahrenheit_definition() -> LogicalTypeDefinition {
+		point_unit_definition(
+			fahrenheit_logical_type(),
+			"Fahrenheit",
+			UnitScale {
+				numerator: 5,
+				denominator: 9,
+			},
+			UnitOffset {
+				numerator: 45_967,
+				denominator: 180,
+			},
+		)
+	}
+
+	fn point_unit_definition(
+		id: LogicalTypeId,
+		name: &str,
+		scale_to_base: UnitScale,
+		offset_to_base: UnitOffset,
+	) -> LogicalTypeDefinition {
+		LogicalTypeDefinition {
+			logical_type_id: id.0,
+			name: name.to_string(),
+			physical: LogicalTypePhysical::Float64,
+			refinement: None,
+			unit: Some(LogicalTypeUnit {
+				dimension: "Temperature".to_string(),
+				scale_to_base,
+				quantity_kind: UnitQuantityKind::Point,
+				offset_to_base,
+				delta_unit: None,
+			}),
+		}
+	}
+
+	fn first_filter_scan_state(plan: &ExecutionPlan) -> Option<(FilterDisposition, bool)> {
+		match plan {
+			ExecutionPlan::Filter {
+				input, disposition, ..
+			} => Some((*disposition, scan_has_pbc(input))),
+			ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Exchange { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Take { input, .. } => first_filter_scan_state(input),
+			ExecutionPlan::Join { left, right, .. } => {
+				first_filter_scan_state(left).or_else(|| first_filter_scan_state(right))
+			}
+			ExecutionPlan::CreateTableAsSelect { source, .. }
+			| ExecutionPlan::Update { source, .. }
+			| ExecutionPlan::InsertSelect { source, .. } => first_filter_scan_state(source),
+			_ => None,
+		}
+	}
+
+	fn scan_has_pbc(plan: &ExecutionPlan) -> bool {
+		match plan {
+			ExecutionPlan::Scan { pbc_program, .. } => pbc_program.is_some(),
+			ExecutionPlan::Filter { input, .. }
+			| ExecutionPlan::Project { input, .. }
+			| ExecutionPlan::Aggregate { input, .. }
+			| ExecutionPlan::Exchange { input, .. }
+			| ExecutionPlan::Sort { input, .. }
+			| ExecutionPlan::Take { input, .. } => scan_has_pbc(input),
+			ExecutionPlan::Join { left, right, .. } => scan_has_pbc(left) || scan_has_pbc(right),
+			ExecutionPlan::CreateTableAsSelect { source, .. }
+			| ExecutionPlan::Update { source, .. }
+			| ExecutionPlan::InsertSelect { source, .. } => scan_has_pbc(source),
+			_ => false,
+		}
 	}
 
 	fn auto_broadcast_config(max_build_bytes: u64) -> PlannerConfig {

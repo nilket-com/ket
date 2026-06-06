@@ -1042,7 +1042,7 @@ pub(crate) fn adr036_binder_delete_allows_residual_predicates() {
 		.expect("bind_delete body")
 		.1;
 
-	assert!(bind_delete.contains("predicate_pushdown_plan(program, &scan)"));
+	assert!(bind_delete.contains("predicate_pushdown_plan(program, &scan, &logical_types)"));
 	assert!(bind_delete.contains("pushdown.residual_predicate"));
 	assert!(bind_delete.contains("pushdown.pbc_program"));
 	for forbidden in [

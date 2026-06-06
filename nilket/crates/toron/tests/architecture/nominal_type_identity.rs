@@ -1424,6 +1424,7 @@ pub(crate) fn adr167_convert_is_transient_ir_and_bind_desugared() {
 	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
 	let bind_expr = source_block(&binder, "fn bind_expr_into_program");
 	let bind_convert = source_block(&binder, "fn bind_sql_convert");
+	let convert_transform = source_block(&binder, "fn logical_unit_convert_transform");
 
 	assert!(expr_enum.contains("SqlConvert {"));
 	assert!(expr_enum.contains("target_logical_name: String"));
@@ -1431,8 +1432,9 @@ pub(crate) fn adr167_convert_is_transient_ir_and_bind_desugared() {
 	assert!(!execution_plan.contains("SqlConvert"));
 	assert!(bind_expr.contains("Expr::SqlConvert"));
 	assert!(bind_expr.contains("bind_sql_convert"));
-	assert!(bind_convert.contains("unit_scale_to_f64(&source_unit.scale_to_base)"));
-	assert!(bind_convert.contains("unit_scale_to_f64(&target_unit.scale_to_base)"));
+	assert!(bind_convert.contains("logical_unit_convert_transform(source_unit, target_unit)"));
+	assert!(convert_transform.contains("unit_scale_to_f64(&source_unit.scale_to_base)"));
+	assert!(convert_transform.contains("unit_scale_to_f64(&target_unit.scale_to_base)"));
 	assert!(bind_convert.contains("builder.append_literal(ScalarValue::Float64"));
 	assert!(bind_convert.contains("builder.append_binary(BoundBinaryOp::Mul"));
 	assert!(bind_convert.contains("builder.set_node_logical_type(output, target_spec.id)"));
@@ -1659,10 +1661,13 @@ pub(crate) fn adr171_affine_convert_is_bind_desugared_not_executor_kernel() {
 	let binder = binder_source();
 	let exec = exec_source();
 	let bind_convert = source_block(&binder, "fn bind_sql_convert");
+	let convert_transform = source_block(&binder, "fn logical_unit_convert_transform");
 
 	assert!(bind_convert.contains("quantity_kind"));
-	assert!(bind_convert.contains("offset_to_base"));
-	assert!(bind_convert.contains("unit_offset_to_f64"));
+	assert!(bind_convert.contains("logical_unit_convert_transform(source_unit, target_unit)"));
+	assert!(convert_transform.contains("offset_to_base"));
+	assert!(convert_transform.contains("unit_offset_to_f64"));
+	assert!(convert_transform.contains("UnitQuantityKind::Point"));
 	assert!(bind_convert.contains("builder.append_binary(BoundBinaryOp::Mul"));
 	assert!(bind_convert.contains("builder.append_binary(BoundBinaryOp::Add"));
 	assert!(bind_convert.contains("builder.set_node_logical_type(output, target_spec.id)"));
@@ -1674,6 +1679,7 @@ pub(crate) fn adr171_affine_convert_is_bind_desugared_not_executor_kernel() {
 pub(crate) fn adr171_convert_dispatches_by_quantity_kind() {
 	let binder = binder_source();
 	let bind_convert = source_block(&binder, "fn bind_sql_convert");
+	let convert_transform = source_block(&binder, "fn logical_unit_convert_transform");
 	let mismatch = bind_convert
 		.find("source_unit.quantity_kind != target_unit.quantity_kind")
 		.expect("point/delta mismatch guard");
@@ -1683,7 +1689,7 @@ pub(crate) fn adr171_convert_dispatches_by_quantity_kind() {
 
 	assert!(mismatch < append);
 	assert!(bind_convert.contains("CONVERT point/delta mismatch"));
-	assert!(bind_convert.contains("UnitQuantityKind::Point"));
+	assert!(convert_transform.contains("UnitQuantityKind::Point"));
 }
 
 #[test]

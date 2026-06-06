@@ -725,7 +725,7 @@ pub(crate) fn adr075_partial_pushdown_covers_select_update_delete_scan_sites() {
 	assert!(update_helper.contains("self.catalog.logical_type_registry()"));
 	assert!(update_helper.contains("plan_filter_with_predicate_pushdown("));
 	assert!(update_helper.contains("&logical_types"));
-	assert!(binder.contains("predicate_pushdown_plan(program, &scan)"));
+	assert!(binder.contains("predicate_pushdown_plan(program, &scan, &logical_types)"));
 	assert!(coordinator.contains("if let Some(predicate) = predicate"));
 	assert!(predicate_test.contains("where_like_residual_splits_from_pbc_conjunct"));
 	assert!(update_test.contains("binder_update_splits_pbc_conjunct_from_like_residual"));
@@ -1022,7 +1022,7 @@ pub(crate) fn adr078_select_update_delete_share_boolean_factoring_path() {
 	assert!(update_helper.contains("self.catalog.logical_type_registry()"));
 	assert!(update_helper.contains("plan_filter_with_predicate_pushdown("));
 	assert!(update_helper.contains("&logical_types"));
-	assert!(binder.contains("predicate_pushdown_plan(program, &scan)"));
+	assert!(binder.contains("predicate_pushdown_plan(program, &scan, &logical_types)"));
 	assert!(
 		predicate_test.contains("where_common_pushable_conjunct_factors_out_with_minimal_residual")
 	);
@@ -1365,7 +1365,7 @@ pub(crate) fn adr095_filter_elision_runs_before_pbc_pushdown() {
 		.find("static_filter_class(&input, &original_predicate, logical_types)")
 		.expect("static classifier call");
 	let pushdown = filter_helper
-		.find("predicate_pushdown_plan(predicate, &input)")
+		.find("predicate_pushdown_plan(predicate, &input, logical_types)")
 		.expect("predicate pushdown call");
 
 	assert!(classifier < pushdown);
