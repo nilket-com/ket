@@ -1834,7 +1834,8 @@ pub(crate) fn adr100_no_projected_scan_receipt_until_elision_has_a_consumer() {
 
 	assert!(bind_entry.contains("bind_with_trace(plan, catalog, config).await?"));
 	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace)"));
-	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan)?"));
+	assert!(bind_with_trace.contains("let logical_types = catalog.logical_type_registry()"));
+	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan, &logical_types)?"));
 	assert!(receipt.contains("projection: None"));
 	assert!(!receipt.contains("projection: Some"));
 }
@@ -2037,7 +2038,7 @@ pub(crate) fn adr105_project_coalescing_lives_in_existing_post_bind_optimizer() 
 	let optimizer = first_block(&binder, "fn optimize_for_required");
 
 	assert!(bind_entry.contains("bind_with_trace(plan, catalog, config).await?"));
-	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan)?"));
+	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan, &logical_types)?"));
 	assert!(optimizer.contains("collapse_adjacent_identity_project(input, exprs, output_schema)"));
 }
 

@@ -482,11 +482,14 @@ pub(crate) fn adr089_group_keys_preserve_identity_aggregate_outputs_are_adr113_o
 	let aggregate_field = source_block(&binder, "fn aggregate_field");
 
 	assert!(aggregate_schema.contains("schema_for_exprs(group_expr)"));
-	assert!(aggregate_schema.contains("fields.push(aggregate_field(call))"));
+	assert!(aggregate_schema.contains("fields.push(aggregate_field(call, logical_types))"));
 	assert!(!aggregate_schema.contains("field_with_logical_type_metadata"));
 	assert!(!aggregate_schema.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
 	assert!(!aggregate_field.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
-	assert!(aggregate_field.contains("aggregate_output_logical_type(call, field.data_type())"));
+	assert!(
+		aggregate_field
+			.contains("aggregate_output_logical_type(call, field.data_type(), logical_types)")
+	);
 }
 
 #[test]
@@ -496,18 +499,21 @@ pub(crate) fn adr113_min_max_preserve_aggregate_identity() {
 	let output_identity = source_block(&binder, "fn aggregate_output_logical_type");
 
 	assert!(aggregate_field.contains("aggregate_kernel::stable_output_field(call)"));
-	assert!(aggregate_field.contains("aggregate_output_logical_type(call, field.data_type())"));
+	assert!(
+		aggregate_field
+			.contains("aggregate_output_logical_type(call, field.data_type(), logical_types)")
+	);
 	assert!(aggregate_field.contains("field_with_logical_type_metadata"));
 
 	assert!(output_identity.contains("call.args.root_logical_type(0)"));
 	assert!(output_identity.contains("call.args.root_type(0)"));
 	assert!(output_identity.contains("AggregateFunction::Min | AggregateFunction::Max"));
 	assert!(output_identity.contains("input_type != output_type"));
+	assert!(output_identity.contains("AggregateFunction::Sum | AggregateFunction::Avg"));
+	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
 	for naked in [
 		"AggregateFunction::CountAll",
 		"AggregateFunction::Count",
-		"AggregateFunction::Sum",
-		"AggregateFunction::Avg",
 		"AggregateFunction::LinearRegress",
 		"AggregateFunction::ApproxQuantile(_)",
 	] {
@@ -516,6 +522,113 @@ pub(crate) fn adr113_min_max_preserve_aggregate_identity() {
 			"missing naked arm for {naked}"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr168_sum_avg_preserve_only_declared_unit_identity() {
+	let binder = binder_source();
+	let output_identity = source_block(&binder, "fn aggregate_output_logical_type");
+	let additive = source_block(&binder, "fn additive_unit_aggregate_logical_type");
+
+	assert!(output_identity.contains("AggregateFunction::Sum | AggregateFunction::Avg"));
+	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
+	assert!(additive.contains("call.args.root_logical_type(0)"));
+	assert!(additive.contains("call.args.root_type(0)"));
+	assert!(additive.contains("input_type != output_type"));
+	assert!(additive.contains("LogicalTypeResolver::with_registry(logical_types)"));
+	assert!(additive.contains("spec.unit.is_some()"));
+	assert!(additive.contains("spec.physical == *output_type"));
+}
+
+#[test]
+pub(crate) fn adr168_non_unit_nominal_sum_avg_stay_naked() {
+	let binder = binder_source();
+	let additive = source_block(&binder, "fn additive_unit_aggregate_logical_type");
+
+	assert!(additive.contains("if spec.unit.is_some() && spec.physical == *output_type"));
+	assert!(additive.contains("} else {\n\t\tLogicalTypeId::NAKED\n\t}"));
+	assert!(additive.contains("return LogicalTypeId::NAKED"));
+}
+
+#[test]
+pub(crate) fn adr168_aggregate_schema_threads_logical_registry_through_pruning() {
+	let binder = binder_source();
+	let aggregate_schema = source_block(&binder, "fn aggregate_schema");
+	let aggregate_field = source_block(&binder, "fn aggregate_field");
+	let aggregate_output = source_block(&binder, "fn aggregate_output_logical_type");
+	let pushdown = source_block(&binder, "fn push_down_scan_projection");
+	let optimize = source_block(&binder, "fn optimize_for_required");
+
+	for (name, block) in [
+		("aggregate_schema", aggregate_schema.as_str()),
+		("aggregate_field", aggregate_field.as_str()),
+		("aggregate_output_logical_type", aggregate_output.as_str()),
+		("push_down_scan_projection", pushdown.as_str()),
+		("optimize_for_required", optimize.as_str()),
+	] {
+		assert!(
+			block.contains("logical_types: &LogicalTypeRegistry"),
+			"{name} must accept the logical type registry"
+		);
+	}
+	assert!(pushdown.contains("optimize_for_required(plan, None, logical_types)"));
+	assert!(optimize.contains("aggregate_schema(&group_expr, &aggr_expr, logical_types)"));
+	assert!(
+		optimize.contains("optimize_for_required(*input, Some(child_required), logical_types)")
+	);
+}
+
+#[test]
+pub(crate) fn adr168_count_and_statistical_aggregates_stay_naked() {
+	let binder = binder_source();
+	let output_identity = source_block(&binder, "fn aggregate_output_logical_type");
+
+	for naked in [
+		"AggregateFunction::CountAll",
+		"AggregateFunction::Count",
+		"AggregateFunction::LinearRegress",
+		"AggregateFunction::ApproxQuantile(_)",
+	] {
+		assert!(
+			output_identity.contains(naked),
+			"missing naked aggregate arm for {naked}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr168_aggregate_kernel_executor_pbc_stay_physical_only() {
+	let aggregate_kernel = aggregate_kernel_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+
+	for (name, source) in [
+		("aggregate_kernel.rs", aggregate_kernel.as_str()),
+		("exec.rs", exec.as_str()),
+		("pbc.rs", pbc.as_str()),
+	] {
+		assert!(
+			!source.contains("field_with_logical_type_metadata"),
+			"{name} must not write logical field metadata"
+		);
+		assert!(
+			!source.contains("LogicalTypeResolver::with_registry"),
+			"{name} must not resolve logical type metadata for aggregates"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr168_no_wendelon_wire_or_storage_surface() {
+	let wendelon_table = wendelon_table_source();
+	let storage = storage_source();
+	let pbc = pbc_source();
+
+	assert!(!wendelon_table.contains("AggregateFunction"));
+	assert!(!storage.contains("AggregateFunction"));
+	assert!(!storage.contains("aggregate_output_logical_type"));
+	assert!(!pbc.contains("Convert"));
+	assert!(!pbc.contains("AggregateFunction"));
 }
 
 #[test]

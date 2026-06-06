@@ -293,7 +293,8 @@ pub(crate) fn adr133_bind_is_wrapper_over_bind_with_trace() {
 	assert!(!bind_entry.contains("bind_plan_with_trace"));
 	assert!(bind_with_trace.contains("let mut trace = OptimizerTrace::default()"));
 	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace)"));
-	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan)?"));
+	assert!(bind_with_trace.contains("let logical_types = catalog.logical_type_registry()"));
+	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan, &logical_types)?"));
 	assert!(bind_with_trace.contains("Ok((plan, trace))"));
 }
 

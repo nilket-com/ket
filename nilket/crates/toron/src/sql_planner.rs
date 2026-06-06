@@ -3840,6 +3840,13 @@ impl SqlPlanner {
 			SqlExpr::Cast { expr, .. } => {
 				self.discover_aggregate_calls(expr, mode, source, catalog)
 			}
+			SqlExpr::Convert { expr, styles, .. } => {
+				self.discover_aggregate_calls(expr, mode, source, catalog)?;
+				for style in styles {
+					self.discover_aggregate_calls(style, mode, source, catalog)?;
+				}
+				Ok(())
+			}
 			SqlExpr::UnaryOp { expr, .. }
 			| SqlExpr::IsNull(expr)
 			| SqlExpr::IsNotNull(expr)
@@ -3931,6 +3938,13 @@ impl SqlPlanner {
 				})?;
 				Ok(SqlExpr::Function(rewritten))
 			}
+			SqlExpr::Function(function) if function_name_eq(&function.name, "CONVERT") => {
+				let mut rewritten = function.clone();
+				rewritten.args = rewrite_function_argument_exprs(&function.args, |expr| {
+					self.rewrite_aggregate_calls_for_projection(expr, mode, catalog)
+				})?;
+				Ok(SqlExpr::Function(rewritten))
+			}
 			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
 				left: Box::new(self.rewrite_aggregate_calls_for_projection(left, mode, catalog)?),
 				op: op.clone(),
@@ -3993,6 +4007,24 @@ impl SqlPlanner {
 					format: format.clone(),
 				})
 			}
+			SqlExpr::Convert {
+				is_try,
+				expr,
+				data_type,
+				charset,
+				target_before_value,
+				styles,
+			} => Ok(SqlExpr::Convert {
+				is_try: *is_try,
+				expr: Box::new(self.rewrite_aggregate_calls_for_projection(expr, mode, catalog)?),
+				data_type: data_type.clone(),
+				charset: charset.clone(),
+				target_before_value: *target_before_value,
+				styles: styles
+					.iter()
+					.map(|style| self.rewrite_aggregate_calls_for_projection(style, mode, catalog))
+					.collect::<Result<Vec<_>, FrontendError>>()?,
+			}),
 			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
 				self.rewrite_aggregate_calls_for_projection(inner, mode, catalog)?,
 			))),
@@ -6134,6 +6166,9 @@ fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
 			expr_contains_aggregate_call(expr)
 		}
+		SqlExpr::Convert { expr, styles, .. } => {
+			expr_contains_aggregate_call(expr) || styles.iter().any(expr_contains_aggregate_call)
+		}
 		SqlExpr::Interval(SqlInterval { value, .. }) => expr_contains_aggregate_call(value),
 		SqlExpr::AtTimeZone {
 			timestamp,
@@ -6303,6 +6338,12 @@ fn expr_contains_nonaggregate_column_reference(expr: &SqlExpr) -> bool {
 		}
 		SqlExpr::Cast { expr, .. } | SqlExpr::Extract { expr, .. } => {
 			expr_contains_nonaggregate_column_reference(expr)
+		}
+		SqlExpr::Convert { expr, styles, .. } => {
+			expr_contains_nonaggregate_column_reference(expr)
+				|| styles
+					.iter()
+					.any(expr_contains_nonaggregate_column_reference)
 		}
 		SqlExpr::Interval(SqlInterval { value, .. }) => {
 			expr_contains_nonaggregate_column_reference(value)

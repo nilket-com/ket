@@ -125,7 +125,8 @@ pub(crate) async fn bind_with_trace(
 	let plan = Binder { catalog, config }
 		.bind_plan_with_trace(plan, &mut trace)
 		.await?;
-	let plan = push_down_scan_projection(plan.plan)?;
+	let logical_types = catalog.logical_type_registry();
+	let plan = push_down_scan_projection(plan.plan, &logical_types)?;
 	Ok((plan, trace))
 }
 
@@ -709,7 +710,9 @@ impl<'a> Binder<'a> {
 							.await?,
 						);
 					}
-					let output_schema = aggregate_schema(&group_expr, &bound_aggr_expr);
+					let logical_types = self.catalog.logical_type_registry();
+					let output_schema =
+						aggregate_schema(&group_expr, &bound_aggr_expr, &logical_types);
 					let scope = input.scope.aggregate(&group_expr, &output_schema);
 
 					Ok(ScopedExecutionPlan::new_with_facts(
@@ -7134,8 +7137,11 @@ fn project_scalar_rows(
 
 type OrdinalRemap = HashMap<ColumnOrdinal, ColumnOrdinal>;
 
-fn push_down_scan_projection(plan: ExecutionPlan) -> Result<ExecutionPlan, BindingError> {
-	let (plan, _) = optimize_for_required(plan, None)?;
+fn push_down_scan_projection(
+	plan: ExecutionPlan,
+	logical_types: &LogicalTypeRegistry,
+) -> Result<ExecutionPlan, BindingError> {
+	let (plan, _) = optimize_for_required(plan, None, logical_types)?;
 	Ok(plan)
 }
 
@@ -7166,6 +7172,7 @@ fn apply_safe_row_limit_to_scan(plan: &mut ExecutionPlan, limit: usize) -> bool 
 fn optimize_for_required(
 	plan: ExecutionPlan,
 	required_output: Option<BTreeSet<ColumnOrdinal>>,
+	logical_types: &LogicalTypeRegistry,
 ) -> Result<(ExecutionPlan, OrdinalRemap), BindingError> {
 	match plan {
 		ExecutionPlan::EmptyRelation { schema } => {
@@ -7292,7 +7299,8 @@ fn optimize_for_required(
 			if disposition == FilterDisposition::EvaluateInToron {
 				collect_program_columns(&predicate, &mut child_required);
 			}
-			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
+			let (input, remap) =
+				optimize_for_required(*input, Some(child_required), logical_types)?;
 			let predicate = if disposition == FilterDisposition::EvaluateInToron {
 				rewrite_program_ordinals(predicate, &remap)?
 			} else {
@@ -7319,7 +7327,8 @@ fn optimize_for_required(
 			let exprs = project_program_roots(&exprs, &requested_outputs_vec)?;
 			let mut child_required = BTreeSet::new();
 			collect_program_columns(&exprs, &mut child_required);
-			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
+			let (input, remap) =
+				optimize_for_required(*input, Some(child_required), logical_types)?;
 			let exprs = rewrite_program_ordinals(exprs, &remap)?;
 			let output_schema = schema_for_projected_exprs_with_existing_names(
 				&exprs,
@@ -7345,7 +7354,8 @@ fn optimize_for_required(
 				collect_program_columns(&call.args, &mut child_required);
 			}
 
-			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
+			let (input, remap) =
+				optimize_for_required(*input, Some(child_required), logical_types)?;
 			let group_expr = rewrite_program_ordinals(group_expr, &remap)?;
 			let aggr_expr = aggr_expr
 				.into_iter()
@@ -7356,7 +7366,7 @@ fn optimize_for_required(
 					})
 				})
 				.collect::<Result<Vec<_>, BindingError>>()?;
-			let output_schema = aggregate_schema(&group_expr, &aggr_expr);
+			let output_schema = aggregate_schema(&group_expr, &aggr_expr, logical_types);
 			let output_remap = ordinal_remap(
 				&output_columns(output_schema.fields().len())
 					.iter()
@@ -7382,7 +7392,8 @@ fn optimize_for_required(
 			let output_required = required_output.unwrap_or_else(|| all_columns(&input.schema()));
 			let mut child_required = output_required.clone();
 			collect_program_columns(&key, &mut child_required);
-			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
+			let (input, remap) =
+				optimize_for_required(*input, Some(child_required), logical_types)?;
 			let key = rewrite_program_ordinals(key, &remap)?;
 			Ok((
 				ExecutionPlan::Exchange {
@@ -7401,7 +7412,7 @@ fn optimize_for_required(
 			output_schema,
 		} => {
 			let output_len = output_schema.fields().len();
-			let (input, _) = optimize_for_required(*input, None)?;
+			let (input, _) = optimize_for_required(*input, None, logical_types)?;
 			let output_remap = ordinal_remap(
 				&output_columns(output_len)
 					.iter()
@@ -7426,7 +7437,7 @@ fn optimize_for_required(
 			output_schema,
 		} => {
 			let output_len = output_schema.fields().len();
-			let (mut input, _) = optimize_for_required(*input, None)?;
+			let (mut input, _) = optimize_for_required(*input, None, logical_types)?;
 			apply_safe_row_limit_to_scan(&mut input, limit);
 			let output_remap = ordinal_remap(
 				&output_columns(output_len)
@@ -7454,8 +7465,8 @@ fn optimize_for_required(
 			strategy,
 			output_schema,
 		} => {
-			let (left, _) = optimize_for_required(*left, None)?;
-			let (right, _) = optimize_for_required(*right, None)?;
+			let (left, _) = optimize_for_required(*left, None, logical_types)?;
+			let (right, _) = optimize_for_required(*right, None, logical_types)?;
 			let output_len = output_schema.fields().len();
 			let output_remap = ordinal_remap(
 				&output_columns(output_len)
@@ -7515,7 +7526,7 @@ fn optimize_for_required(
 			or_replace,
 			source,
 		} => {
-			let (source, _) = optimize_for_required(*source, None)?;
+			let (source, _) = optimize_for_required(*source, None, logical_types)?;
 			Ok((
 				ExecutionPlan::CreateTableAsSelect {
 					table,
@@ -7562,7 +7573,7 @@ fn optimize_for_required(
 			profile_hint,
 			returning,
 		} => {
-			let (source, _) = optimize_for_required(*source, None)?;
+			let (source, _) = optimize_for_required(*source, None, logical_types)?;
 			Ok((
 				ExecutionPlan::Update {
 					legacy_table_id,
@@ -7603,7 +7614,7 @@ fn optimize_for_required(
 			source,
 			returning,
 		} => {
-			let (source, _) = optimize_for_required(*source, None)?;
+			let (source, _) = optimize_for_required(*source, None, logical_types)?;
 			Ok((
 				ExecutionPlan::InsertSelect {
 					legacy_table_id,
@@ -10407,7 +10418,11 @@ fn resolved_logical_column_at_ordinal(
 	})
 }
 
-fn aggregate_schema(group_expr: &BoundExprProgram, aggr_expr: &[BoundAggregateCall]) -> SchemaRef {
+fn aggregate_schema(
+	group_expr: &BoundExprProgram,
+	aggr_expr: &[BoundAggregateCall],
+	logical_types: &LogicalTypeRegistry,
+) -> SchemaRef {
 	let mut fields = Vec::new();
 	let group_schema = schema_for_exprs(group_expr);
 	fields.extend(
@@ -10417,7 +10432,7 @@ fn aggregate_schema(group_expr: &BoundExprProgram, aggr_expr: &[BoundAggregateCa
 			.map(|field| field.as_ref().clone()),
 	);
 	for call in aggr_expr {
-		fields.push(aggregate_field(call));
+		fields.push(aggregate_field(call, logical_types));
 	}
 	Arc::new(Schema::new(fields))
 }
@@ -10475,7 +10490,7 @@ fn schema_for_projected_exprs_with_existing_names(
 	Arc::new(Schema::new(fields))
 }
 
-fn aggregate_field(call: &BoundAggregateCall) -> Field {
+fn aggregate_field(call: &BoundAggregateCall, logical_types: &LogicalTypeRegistry) -> Field {
 	let field =
 		aggregate_kernel::stable_output_field(call).unwrap_or_else(|| match call.function {
 			AggregateFunction::LinearRegress => Field::new("linreg", DataType::Float64, true),
@@ -10487,7 +10502,7 @@ fn aggregate_field(call: &BoundAggregateCall) -> Field {
 			| AggregateFunction::Max
 			| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
 		});
-	let logical_type = aggregate_output_logical_type(call, field.data_type());
+	let logical_type = aggregate_output_logical_type(call, field.data_type(), logical_types);
 	if logical_type.is_naked() {
 		field
 	} else {
@@ -10503,6 +10518,7 @@ fn aggregate_field(call: &BoundAggregateCall) -> Field {
 fn aggregate_output_logical_type(
 	call: &BoundAggregateCall,
 	output_type: &DataType,
+	logical_types: &LogicalTypeRegistry,
 ) -> LogicalTypeId {
 	match call.function {
 		AggregateFunction::Min | AggregateFunction::Max => {
@@ -10518,12 +10534,37 @@ fn aggregate_output_logical_type(
 				logical_type
 			}
 		}
+		AggregateFunction::Sum | AggregateFunction::Avg => {
+			additive_unit_aggregate_logical_type(call, output_type, logical_types)
+		}
 		AggregateFunction::CountAll
 		| AggregateFunction::Count
-		| AggregateFunction::Sum
-		| AggregateFunction::Avg
 		| AggregateFunction::LinearRegress
 		| AggregateFunction::ApproxQuantile(_) => LogicalTypeId::NAKED,
+	}
+}
+
+fn additive_unit_aggregate_logical_type(
+	call: &BoundAggregateCall,
+	output_type: &DataType,
+	logical_types: &LogicalTypeRegistry,
+) -> LogicalTypeId {
+	let Some(logical_type) = call.args.root_logical_type(0) else {
+		return LogicalTypeId::NAKED;
+	};
+	let Some(input_type) = call.args.root_type(0) else {
+		return LogicalTypeId::NAKED;
+	};
+	if logical_type.is_naked() || input_type != output_type {
+		return LogicalTypeId::NAKED;
+	}
+	let Some(spec) = LogicalTypeResolver::with_registry(logical_types).spec(logical_type) else {
+		return LogicalTypeId::NAKED;
+	};
+	if spec.unit.is_some() && spec.physical == *output_type {
+		logical_type
+	} else {
+		LogicalTypeId::NAKED
 	}
 }
 
@@ -12570,8 +12611,13 @@ mod tests {
 			column_group_ndv: Default::default(),
 		};
 
-		let (optimized, _) = optimize_for_required(plan, Some(BTreeSet::from([ColumnOrdinal(2)])))
-			.expect("optimize scan projection");
+		let logical_types = LogicalTypeRegistry::default();
+		let (optimized, _) = optimize_for_required(
+			plan,
+			Some(BTreeSet::from([ColumnOrdinal(2)])),
+			&logical_types,
+		)
+		.expect("optimize scan projection");
 		let ExecutionPlan::Scan {
 			projection,
 			schema,
@@ -12627,8 +12673,13 @@ mod tests {
 			column_group_ndv: Default::default(),
 		};
 
-		let (optimized, _) = optimize_for_required(plan, Some(BTreeSet::from([ColumnOrdinal(2)])))
-			.expect("optimize scan projection");
+		let logical_types = LogicalTypeRegistry::default();
+		let (optimized, _) = optimize_for_required(
+			plan,
+			Some(BTreeSet::from([ColumnOrdinal(2)])),
+			&logical_types,
+		)
+		.expect("optimize scan projection");
 		let ExecutionPlan::Scan {
 			projection,
 			schema,

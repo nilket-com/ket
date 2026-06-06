@@ -14,10 +14,10 @@ use toron::coordinator::QueryCoordinator;
 use toron::error::{BindingError, CatalogError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	BoundExprNode, BoundExprProgram, CUSTOMER_ID_LOGICAL_TYPE, CreateTableColumnType,
-	DURABLE_LOGICAL_TYPE_MIN_ID, ExecutionPlan, Expr, LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan,
-	LogicalTypeId, ScalarValue, TableId, decode_column_logical_type,
-	field_with_logical_type_metadata,
+	BoundExprNode, BoundExprProgram, CUSTOMER_ID_LOGICAL_TYPE, ColumnOrdinal,
+	CreateTableColumnType, DURABLE_LOGICAL_TYPE_MIN_ID, ExecutionPlan, Expr,
+	LOGICAL_TYPE_ID_METADATA_KEY, LogicalPlan, LogicalTypeId, ScalarValue, TableId,
+	decode_column_logical_type, field_with_logical_type_metadata,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
@@ -1048,6 +1048,304 @@ async fn dimensioned_comparison_requires_same_unit_or_explicit_convert() {
 			"expected diagnostic {diagnostic:?}, got {message}"
 		);
 	}
+}
+
+#[tokio::test]
+async fn aggregation_is_type_unit_aware() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT MIN(customer_id), SUM(distance), SUM(customer_id), COUNT(distance) FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(
+		schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3),
+	);
+	assert_schema_identity(
+		schema.as_ref(),
+		1,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+	);
+	assert_schema_identity(schema.as_ref(), 2, LogicalTypeId::NAKED);
+	assert_schema_identity(schema.as_ref(), 3, LogicalTypeId::NAKED);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(int64_rows(&batch, 0), vec![Some(7)]);
+	assert_eq!(float64_rows(&batch, 1), vec![Some(3.0)]);
+	assert_eq!(int64_rows(&batch, 2), vec![Some(14)]);
+	assert_eq!(int64_rows(&batch, 3), vec![Some(2)]);
+}
+
+#[tokio::test]
+async fn sum_avg_preserve_additive_unit_identity() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT SUM(distance), AVG(distance) FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(
+		schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+	);
+	assert_schema_identity(
+		schema.as_ref(),
+		1,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+	);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(3.0)]);
+	assert_eq!(float64_rows(&batch, 1), vec![Some(1.5)]);
+}
+
+#[tokio::test]
+async fn aggregate_unit_convert_preserves_quantity() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT CONVERT(SUM(distance), Kilometer) FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(
+		schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 1),
+	);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	let rows = float64_rows(&batch, 0);
+	let [Some(value)] = rows.as_slice() else {
+		panic!("expected single converted aggregate value");
+	};
+	assert!((*value - 4.828032).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn sum_after_convert_preserves_target_unit() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT SUM(CONVERT(distance, Kilometer)) FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(
+		schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 1),
+	);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	let rows = float64_rows(&batch, 0);
+	let [Some(value)] = rows.as_slice() else {
+		panic!("expected single converted aggregate value");
+	};
+	assert!((*value - 4.828032).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn pruned_sum_unit_identity_matches_full_input_aggregate() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let full = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT SUM(customer_id), SUM(distance), SUM(other_distance), SUM(mass), SUM(raw) FROM aggregate_samples",
+	)
+	.await;
+	let full_identity =
+		decode_column_logical_type(full.schema().field(1)).expect("decode full aggregate identity");
+	assert_eq!(full_identity, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+
+	let pruned_sql = "SELECT SUM(distance) FROM aggregate_samples";
+	let pruned = bind_sql(&catalog, &planner, pruned_sql).await;
+	let pruned_identity = decode_column_logical_type(pruned.schema().field(0))
+		.expect("decode pruned aggregate identity");
+	assert_eq!(pruned_identity, full_identity);
+	assert!(
+		contains_scan_projection(&pruned, &[ColumnOrdinal(1)]),
+		"expected single-column distance scan projection after pruning, got {pruned:?}"
+	);
+
+	let batch = concat_query(&coordinator, &planner, pruned_sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(3.0)]);
+}
+
+#[tokio::test]
+async fn min_max_preserve_unit_identity() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT MIN(distance), MAX(distance) FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(
+		schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+	);
+	assert_schema_identity(
+		schema.as_ref(),
+		1,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+	);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(1.0)]);
+	assert_eq!(float64_rows(&batch, 1), vec![Some(2.0)]);
+}
+
+#[tokio::test]
+async fn sum_avg_of_non_unit_nominal_identity_are_naked() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT SUM(customer_id), AVG(customer_id) FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(schema.as_ref(), 0, LogicalTypeId::NAKED);
+	assert_schema_identity(schema.as_ref(), 1, LogicalTypeId::NAKED);
+}
+
+#[tokio::test]
+async fn sum_avg_of_naked_input_stay_naked() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT SUM(raw), AVG(raw), SUM(CAST(distance AS DOUBLE)) FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(schema.as_ref(), 0, LogicalTypeId::NAKED);
+	assert_schema_identity(schema.as_ref(), 1, LogicalTypeId::NAKED);
+	assert_schema_identity(schema.as_ref(), 2, LogicalTypeId::NAKED);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(6.0)]);
+	assert_eq!(float64_rows(&batch, 1), vec![Some(3.0)]);
+	assert_eq!(float64_rows(&batch, 2), vec![Some(3.0)]);
+}
+
+#[tokio::test]
+async fn count_of_dimensioned_unit_is_naked() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT COUNT(distance), COUNT(*) FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(schema.as_ref(), 0, LogicalTypeId::NAKED);
+	assert_schema_identity(schema.as_ref(), 1, LogicalTypeId::NAKED);
+}
+
+#[tokio::test]
+async fn experimental_unit_aggregates_are_naked() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT LINEAR_REGRESS(distance, raw), APPROX_QUANTILE(distance, 0.5) FROM aggregate_samples";
+	let config = PlannerConfig {
+		allow_experimental_kernels: true,
+		..PlannerConfig::default()
+	};
+	let bound = bind(
+		&planner.plan(sql).expect("plan experimental aggregates"),
+		catalog.as_ref(),
+		&config,
+	)
+	.await
+	.expect(sql);
+	let schema = bound.schema();
+	assert_schema_identity(schema.as_ref(), 0, LogicalTypeId::NAKED);
+	assert_schema_identity(schema.as_ref(), 1, LogicalTypeId::NAKED);
+}
+
+#[tokio::test]
+async fn aggregated_unit_composes_with_167_safety() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	for (sql, diagnostic) in [
+		(
+			"SELECT SUM(distance) + AVG(mass) FROM aggregate_samples",
+			"dimension mismatch",
+		),
+		(
+			"SELECT SUM(distance) + AVG(other_distance) FROM aggregate_samples",
+			"require explicit CONVERT",
+		),
+	] {
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, diagnostic).await;
+	}
+}
+
+#[tokio::test]
+async fn group_by_with_type_unit_aggregate_preserves_identity() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT customer_id, SUM(distance), MIN(customer_id) FROM aggregate_samples GROUP BY customer_id";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(
+		schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3),
+	);
+	assert_schema_identity(
+		schema.as_ref(),
+		1,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+	);
+	assert_schema_identity(
+		schema.as_ref(),
+		2,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3),
+	);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(int64_rows(&batch, 0), vec![Some(7)]);
+	assert_eq!(float64_rows(&batch, 1), vec![Some(3.0)]);
+	assert_eq!(int64_rows(&batch, 2), vec![Some(7)]);
+}
+
+#[tokio::test]
+async fn unit_aggregate_identity_flows_through_ctas() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+	execute(
+		&coordinator,
+		&planner,
+		"CREATE TABLE aggregate_totals AS SELECT SUM(distance) AS total_distance FROM aggregate_samples",
+	)
+	.await;
+
+	let binding = catalog
+		.resolve_table(&TableRef::new("aggregate_totals"))
+		.await
+		.expect("CTAS aggregate target resolves");
+	assert_schema_identity(
+		binding.schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+	);
+}
+
+#[tokio::test]
+async fn sum_mixed_unit_expression_requires_convert_before_aggregate() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT SUM(distance + other_distance) FROM aggregate_samples",
+		"require explicit CONVERT",
+	)
+	.await;
 }
 
 #[tokio::test]
@@ -3590,6 +3888,17 @@ async fn setup_dimensioned_trips(coordinator: &QueryCoordinator, planner: &SqlPl
 	}
 }
 
+async fn setup_type_unit_aggregate_samples(coordinator: &QueryCoordinator, planner: &SqlPlanner) {
+	setup_dimensioned_trips(coordinator, planner).await;
+	for sql in [
+		"CREATE TABLE aggregate_samples (customer_id CustomerId, distance Mile, other_distance Kilometer, mass Kilogram, raw DOUBLE)",
+		"INSERT INTO aggregate_samples VALUES (7, 1.0, 1.0, 1.0, 2.0)",
+		"INSERT INTO aggregate_samples VALUES (7, 2.0, 2.0, 3.0, 4.0)",
+	] {
+		execute(coordinator, planner, sql).await;
+	}
+}
+
 async fn bind_sql(catalog: &MockCatalog, planner: &SqlPlanner, sql: &str) -> ExecutionPlan {
 	bind(
 		&planner.plan(sql).expect("plan SQL"),
@@ -3623,6 +3932,13 @@ fn assert_project_identity(bound: ExecutionPlan, expected: LogicalTypeId) {
 	assert_eq!(
 		decode_column_logical_type(output_schema.field(0))
 			.expect("decode projection logical identity"),
+		expected
+	);
+}
+
+fn assert_schema_identity(schema: &Schema, index: usize, expected: LogicalTypeId) {
+	assert_eq!(
+		decode_column_logical_type(schema.field(index)).expect("decode field logical identity"),
 		expected
 	);
 }
@@ -3836,6 +4152,24 @@ fn contains_scan(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::CreateTableAsSelect { source, .. }
 		| ExecutionPlan::Update { source, .. }
 		| ExecutionPlan::InsertSelect { source, .. } => contains_scan(source),
+		_ => false,
+	}
+}
+
+fn contains_scan_projection(plan: &ExecutionPlan, expected: &[ColumnOrdinal]) -> bool {
+	match plan {
+		ExecutionPlan::Scan { projection, .. } => projection.as_deref() == Some(expected),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => contains_scan_projection(input, expected),
+		ExecutionPlan::Join { left, right, .. } => {
+			contains_scan_projection(left, expected) || contains_scan_projection(right, expected)
+		}
+		ExecutionPlan::CreateTableAsSelect { source, .. }
+		| ExecutionPlan::Update { source, .. }
+		| ExecutionPlan::InsertSelect { source, .. } => contains_scan_projection(source, expected),
 		_ => false,
 	}
 }
