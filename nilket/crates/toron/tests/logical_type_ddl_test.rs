@@ -1204,34 +1204,146 @@ async fn min_max_preserve_unit_identity() {
 }
 
 #[tokio::test]
-async fn strict_additive_operations_reject_identity() {
+async fn strict_identity_arithmetic_rejects_all_operators() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
 
 	for sql in [
 		"SELECT customer_id + 1 FROM aggregate_samples",
 		"SELECT customer_id + customer_id FROM aggregate_samples",
-		"SELECT customer_id + NULL FROM aggregate_samples",
-		"SELECT NULL + customer_id FROM aggregate_samples",
+		"SELECT customer_id - 1 FROM aggregate_samples",
+		"SELECT customer_id * 2 FROM aggregate_samples",
+		"SELECT customer_id / 2 FROM aggregate_samples",
+		"SELECT customer_id - customer_id FROM aggregate_samples",
+		"SELECT customer_id * customer_id FROM aggregate_samples",
+		"SELECT customer_id / customer_id FROM aggregate_samples",
 		"SELECT SUM(customer_id) FROM aggregate_samples",
 		"SELECT AVG(customer_id) FROM aggregate_samples",
 	] {
-		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "not an additive quantity")
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "not an arithmetic quantity")
 			.await;
 	}
 }
 
 #[tokio::test]
-async fn explicit_cast_erases_identity_for_addition() {
+async fn explicit_cast_erases_identity_for_all_arithmetic() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
 
-	let sql = "SELECT CAST(customer_id AS BIGINT) + 1 FROM aggregate_samples";
-	let bound = bind_sql(&catalog, &planner, sql).await;
-	assert_project_identity(bound, LogicalTypeId::NAKED);
+	for (sql, expected) in [
+		(
+			"SELECT CAST(customer_id AS BIGINT) + 1 FROM aggregate_samples",
+			vec![Some(8), Some(8)],
+		),
+		(
+			"SELECT CAST(customer_id AS BIGINT) - 1 FROM aggregate_samples",
+			vec![Some(6), Some(6)],
+		),
+		(
+			"SELECT CAST(customer_id AS BIGINT) * 2 FROM aggregate_samples",
+			vec![Some(14), Some(14)],
+		),
+		(
+			"SELECT CAST(customer_id AS BIGINT) / 2 FROM aggregate_samples",
+			vec![Some(3), Some(3)],
+		),
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert_project_identity(bound, LogicalTypeId::NAKED);
 
-	let batch = concat_query(&coordinator, &planner, sql).await;
-	assert_eq!(int64_rows(&batch, 0), vec![Some(8), Some(8)]);
+		let batch = concat_query(&coordinator, &planner, sql).await;
+		assert_eq!(int64_rows(&batch, 0), expected);
+	}
+}
+
+#[tokio::test]
+async fn quantity_subtraction_and_scalar_scaling_unchanged() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	for (sql, expected) in [
+		(
+			"SELECT distance - distance FROM aggregate_samples",
+			vec![Some(0.0), Some(0.0)],
+		),
+		(
+			"SELECT distance * 2 FROM aggregate_samples",
+			vec![Some(2.0), Some(4.0)],
+		),
+		(
+			"SELECT 2 * distance FROM aggregate_samples",
+			vec![Some(2.0), Some(4.0)],
+		),
+		(
+			"SELECT distance / 2 FROM aggregate_samples",
+			vec![Some(0.5), Some(1.0)],
+		),
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+
+		let batch = concat_query(&coordinator, &planner, sql).await;
+		assert_eq!(float64_rows(&batch, 0), expected);
+	}
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT distance - other_distance FROM aggregate_samples",
+		"require explicit CONVERT",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn logical_null_arithmetic_rejects_for_all_operators() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	for sql in [
+		"SELECT customer_id + NULL FROM aggregate_samples",
+		"SELECT NULL + customer_id FROM aggregate_samples",
+		"SELECT customer_id - NULL FROM aggregate_samples",
+		"SELECT NULL - customer_id FROM aggregate_samples",
+		"SELECT customer_id * NULL FROM aggregate_samples",
+		"SELECT NULL * customer_id FROM aggregate_samples",
+		"SELECT customer_id / NULL FROM aggregate_samples",
+		"SELECT NULL / customer_id FROM aggregate_samples",
+	] {
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "not an arithmetic quantity")
+			.await;
+	}
+
+	for sql in [
+		"SELECT distance + NULL FROM aggregate_samples",
+		"SELECT NULL + distance FROM aggregate_samples",
+		"SELECT distance - NULL FROM aggregate_samples",
+		"SELECT NULL - distance FROM aggregate_samples",
+		"SELECT distance * NULL FROM aggregate_samples",
+		"SELECT NULL * distance FROM aggregate_samples",
+		"SELECT distance / NULL FROM aggregate_samples",
+		"SELECT NULL / distance FROM aggregate_samples",
+	] {
+		expect_plan_or_bind_error_contains(
+			&catalog,
+			&planner,
+			sql,
+			"unit arithmetic with untyped NULL",
+		)
+		.await;
+	}
+
+	for sql in [
+		"SELECT distance * CAST(NULL AS DOUBLE) FROM aggregate_samples",
+		"SELECT CAST(NULL AS DOUBLE) * distance FROM aggregate_samples",
+		"SELECT distance / CAST(NULL AS DOUBLE) FROM aggregate_samples",
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+
+		let batch = concat_query(&coordinator, &planner, sql).await;
+		assert_eq!(float64_rows(&batch, 0), vec![None, None]);
+	}
 }
 
 #[tokio::test]
@@ -1294,15 +1406,33 @@ async fn identity_comparison_and_selection_still_allowed() {
 }
 
 #[tokio::test]
-async fn naked_numeric_addition_and_sum_stay_unchanged() {
+async fn naked_numeric_arithmetic_unchanged() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
 
-	let addition_sql = "SELECT raw + raw FROM aggregate_samples";
-	let addition = bind_sql(&catalog, &planner, addition_sql).await;
-	assert_project_identity(addition, LogicalTypeId::NAKED);
-	let batch = concat_query(&coordinator, &planner, addition_sql).await;
-	assert_eq!(float64_rows(&batch, 0), vec![Some(4.0), Some(8.0)]);
+	for (sql, expected) in [
+		(
+			"SELECT raw + raw FROM aggregate_samples",
+			vec![Some(4.0), Some(8.0)],
+		),
+		(
+			"SELECT raw - raw FROM aggregate_samples",
+			vec![Some(0.0), Some(0.0)],
+		),
+		(
+			"SELECT raw * raw FROM aggregate_samples",
+			vec![Some(4.0), Some(16.0)],
+		),
+		(
+			"SELECT raw / raw FROM aggregate_samples",
+			vec![Some(1.0), Some(1.0)],
+		),
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert_project_identity(bound, LogicalTypeId::NAKED);
+		let batch = concat_query(&coordinator, &planner, sql).await;
+		assert_eq!(float64_rows(&batch, 0), expected);
+	}
 
 	let sql = "SELECT SUM(raw), AVG(raw), SUM(CAST(distance AS DOUBLE)) FROM aggregate_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
@@ -1951,7 +2081,7 @@ async fn refined_logical_type_insert_values_allows_null_and_rejects_violation() 
 }
 
 #[tokio::test]
-async fn refinement_identity_addition_rejects() {
+async fn refinement_identity_arithmetic_rejects() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_person_id_people(&coordinator, &planner).await;
 	execute(
@@ -1964,19 +2094,28 @@ async fn refinement_identity_addition_rejects() {
 	for sql in [
 		"SELECT id + 0 FROM people",
 		"SELECT id + id FROM people",
+		"SELECT id - 1 FROM people",
+		"SELECT id * 2 FROM people",
+		"SELECT id / 2 FROM people",
 		"SELECT SUM(id) FROM people",
 		"SELECT AVG(id) FROM people",
 	] {
-		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "not an additive quantity")
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "not an arithmetic quantity")
 			.await;
 	}
 
-	let sql = "SELECT CAST(id AS BIGINT) + 0 FROM people";
-	let bound = bind_sql(&catalog, &planner, sql).await;
-	assert_project_identity(bound, LogicalTypeId::NAKED);
+	for (sql, expected) in [
+		("SELECT CAST(id AS BIGINT) + 0 FROM people", vec![Some(1)]),
+		("SELECT CAST(id AS BIGINT) - 1 FROM people", vec![Some(0)]),
+		("SELECT CAST(id AS BIGINT) * 2 FROM people", vec![Some(2)]),
+		("SELECT CAST(id AS BIGINT) / 1 FROM people", vec![Some(1)]),
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert_project_identity(bound, LogicalTypeId::NAKED);
 
-	let batch = concat_query(&coordinator, &planner, sql).await;
-	assert_eq!(int64_rows(&batch, 0), vec![Some(1)]);
+		let batch = concat_query(&coordinator, &planner, sql).await;
+		assert_eq!(int64_rows(&batch, 0), expected);
+	}
 }
 
 #[tokio::test]

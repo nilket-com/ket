@@ -2591,7 +2591,7 @@ async fn rune_nominal_both_side_cast_binds() {
 }
 
 #[tokio::test]
-async fn rune_identity_additive_rejects_and_cast_erases() {
+async fn rune_identity_arithmetic_rejects_and_cast_erases_all_operators() {
 	for (script, context) in [
 		(
 			r#"
@@ -2603,6 +2603,39 @@ async fn rune_identity_additive_rejects_and_cast_erases() {
         }
     "#,
 			"identity addition",
+		),
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("id").as_logical_type::<CustomerId>().sub(lit_i64(1)).named("bad")
+               ])
+        }
+    "#,
+			"identity subtraction",
+		),
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("id").as_logical_type::<CustomerId>().mul(lit_i64(2)).named("bad")
+               ])
+        }
+    "#,
+			"identity multiplication",
+		),
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("id").as_logical_type::<CustomerId>().div(lit_i64(2)).named("bad")
+               ])
+        }
+    "#,
+			"identity division",
 		),
 		(
 			r#"
@@ -2629,10 +2662,10 @@ async fn rune_identity_additive_rejects_and_cast_erases() {
 		let error = bind(&logical, &catalog(), &PlannerConfig::default())
 			.await
 			.unwrap_err();
-		assert_binding_type_mismatch_contains(error, "not an additive quantity");
+		assert_binding_type_mismatch_contains(error, "not an arithmetic quantity");
 	}
 
-	let addition = rune_plan(
+	let arithmetic = rune_plan(
 		r#"
         pub fn main(ctx) {
             ctx.table("sales")
@@ -2640,34 +2673,60 @@ async fn rune_identity_additive_rejects_and_cast_erases() {
                    col("id").as_logical_type::<CustomerId>()
                        .cast(type_i64())
                        .add(lit_i64(1))
-                       .named("raw_id_plus_one")
+                       .named("raw_id_plus_one"),
+                   col("id").as_logical_type::<CustomerId>()
+                       .cast(type_i64())
+                       .sub(lit_i64(1))
+                       .named("raw_id_minus_one"),
+                   col("id").as_logical_type::<CustomerId>()
+                       .cast(type_i64())
+                       .mul(lit_i64(2))
+                       .named("raw_id_times_two"),
+                   col("id").as_logical_type::<CustomerId>()
+                       .cast(type_i64())
+                       .div(lit_i64(1))
+                       .named("raw_id_div_one")
                ])
         }
     "#,
 	)
 	.await
-	.expect("cast-erased identity addition plan");
-	let bound = bind(&addition, &catalog(), &PlannerConfig::default())
+	.expect("cast-erased identity arithmetic plan");
+	let bound = bind(&arithmetic, &catalog(), &PlannerConfig::default())
 		.await
-		.expect("cast-erased identity addition binds");
+		.expect("cast-erased identity arithmetic binds");
 	let ExecutionPlan::Project {
 		exprs,
 		output_schema,
 		..
 	} = bound
 	else {
-		panic!("expected cast-erased addition project");
+		panic!("expected cast-erased arithmetic project");
 	};
-	assert_eq!(exprs.root_logical_type(0), Some(LogicalTypeId::NAKED));
-	assert_eq!(
-		decode_column_logical_type(output_schema.field(0))
-			.expect("decode cast-erased addition identity"),
-		LogicalTypeId::NAKED
-	);
-	let batches = run_logical(&addition).await;
+	for index in 0..4 {
+		assert_eq!(exprs.root_logical_type(index), Some(LogicalTypeId::NAKED));
+		assert_eq!(
+			decode_column_logical_type(output_schema.field(index))
+				.expect("decode cast-erased arithmetic identity"),
+			LogicalTypeId::NAKED
+		);
+	}
+	let batches = run_logical(&arithmetic).await;
 	assert_eq!(
 		int64_column_rows(&batches, 0),
 		vec![Some(2), Some(3), Some(4), Some(5), Some(6), Some(7)]
+	);
+	assert_eq!(
+		int64_column_rows(&batches, 1),
+		vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
+	);
+	assert_eq!(
+		int64_column_rows(&batches, 2),
+		vec![Some(2), Some(4), Some(6), Some(8), Some(10), Some(12)]
+	);
+	assert_eq!(
+		int64_column_rows(&batches, 3),
+		vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
 	);
 
 	let aggregates = rune_plan(

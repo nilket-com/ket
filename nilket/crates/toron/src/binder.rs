@@ -9180,8 +9180,11 @@ fn bind_arithmetic(
 				.node_type(right)
 				.cloned()
 				.expect("builder returns typed right node");
-			if matches!(op, BoundBinaryOp::Add) {
-				reject_logical_addition_with_untyped_null(builder, ctx, right)?;
+			if matches!(
+				op,
+				BoundBinaryOp::Add | BoundBinaryOp::Sub | BoundBinaryOp::Mul | BoundBinaryOp::Div
+			) {
+				reject_logical_arithmetic_with_untyped_null(builder, ctx, &op, right)?;
 			}
 			let output_type =
 				arithmetic_output_type(&right_type, &right_type).ok_or_else(|| {
@@ -9201,8 +9204,11 @@ fn bind_arithmetic(
 				.node_type(left)
 				.cloned()
 				.expect("builder returns typed left node");
-			if matches!(op, BoundBinaryOp::Add) {
-				reject_logical_addition_with_untyped_null(builder, ctx, left)?;
+			if matches!(
+				op,
+				BoundBinaryOp::Add | BoundBinaryOp::Sub | BoundBinaryOp::Mul | BoundBinaryOp::Div
+			) {
+				reject_logical_arithmetic_with_untyped_null(builder, ctx, &op, left)?;
 			}
 			let output_type = arithmetic_output_type(&left_type, &left_type).ok_or_else(|| {
 				BindingError::TypeMismatch {
@@ -9268,9 +9274,11 @@ fn bind_arithmetic(
 		}
 		return Ok(builder.append_binary(op, left, right, output_type));
 	}
-	if matches!(op, BoundBinaryOp::Add)
-		&& let Some(output) =
-			bind_logical_addition(builder, ctx, left, right, &left_type, &right_type)?
+	if matches!(
+		op,
+		BoundBinaryOp::Add | BoundBinaryOp::Sub | BoundBinaryOp::Mul | BoundBinaryOp::Div
+	) && let Some(output) =
+		bind_logical_arithmetic(builder, ctx, &op, left, right, &left_type, &right_type)?
 	{
 		return Ok(output);
 	}
@@ -9292,29 +9300,29 @@ fn bind_arithmetic(
 	Ok(builder.append_binary(op, left, right, output_type))
 }
 
-enum AdditiveLogicalDomain {
+enum LogicalArithmeticDomain {
 	Naked,
 	Quantity(LogicalTypeSpec),
 	Identity(LogicalTypeSpec),
 }
 
-fn additive_logical_domain_for_node(
+fn logical_arithmetic_domain_for_node(
 	ctx: &ExprBindContext<'_>,
 	builder: &BoundExprProgramBuilder,
 	id: BoundExprId,
-) -> Result<AdditiveLogicalDomain, BindingError> {
+) -> Result<LogicalArithmeticDomain, BindingError> {
 	let logical_type = builder
 		.node_logical_type(id)
-		.expect("builder returns logical type for additive domain lookup");
-	additive_logical_domain_for_type(logical_type, ctx.logical_type_registry)
+		.expect("builder returns logical type for arithmetic domain lookup");
+	logical_arithmetic_domain_for_type(logical_type, ctx.logical_type_registry)
 }
 
-fn additive_logical_domain_for_type(
+fn logical_arithmetic_domain_for_type(
 	logical_type: LogicalTypeId,
 	logical_types: &LogicalTypeRegistry,
-) -> Result<AdditiveLogicalDomain, BindingError> {
+) -> Result<LogicalArithmeticDomain, BindingError> {
 	if logical_type.is_naked() {
-		return Ok(AdditiveLogicalDomain::Naked);
+		return Ok(LogicalArithmeticDomain::Naked);
 	}
 	let spec = LogicalTypeResolver::with_registry(logical_types)
 		.spec(logical_type)
@@ -9322,15 +9330,16 @@ fn additive_logical_domain_for_type(
 			message: format!("unknown logical type {}", logical_type_name(logical_type)),
 		})?;
 	if spec.unit.is_some() {
-		Ok(AdditiveLogicalDomain::Quantity(spec))
+		Ok(LogicalArithmeticDomain::Quantity(spec))
 	} else {
-		Ok(AdditiveLogicalDomain::Identity(spec))
+		Ok(LogicalArithmeticDomain::Identity(spec))
 	}
 }
 
-fn bind_logical_addition(
+fn bind_logical_arithmetic(
 	builder: &mut BoundExprProgramBuilder,
 	ctx: &ExprBindContext<'_>,
+	op: &BoundBinaryOp,
 	left: BoundExprId,
 	right: BoundExprId,
 	left_type: &DataType,
@@ -9338,14 +9347,29 @@ fn bind_logical_addition(
 ) -> Result<Option<BoundExprId>, BindingError> {
 	let left_logical = builder
 		.node_logical_type(left)
-		.expect("builder returns logical type for addition left");
-	let left_domain = additive_logical_domain_for_node(ctx, builder, left)?;
-	let right_domain = additive_logical_domain_for_node(ctx, builder, right)?;
+		.expect("builder returns logical type for arithmetic left");
+	let left_domain = logical_arithmetic_domain_for_node(ctx, builder, left)?;
+	let right_domain = logical_arithmetic_domain_for_node(ctx, builder, right)?;
+	if let LogicalArithmeticDomain::Identity(spec) = &left_domain {
+		return Err(non_arithmetic_logical_type_error(
+			&spec.name,
+			arithmetic_symbol(op),
+		));
+	}
+	if let LogicalArithmeticDomain::Identity(spec) = &right_domain {
+		return Err(non_arithmetic_logical_type_error(
+			&spec.name,
+			arithmetic_symbol(op),
+		));
+	}
+	if !matches!(op, BoundBinaryOp::Add) {
+		return Ok(None);
+	}
 	match (left_domain, right_domain) {
-		(AdditiveLogicalDomain::Naked, AdditiveLogicalDomain::Naked) => Ok(None),
+		(LogicalArithmeticDomain::Naked, LogicalArithmeticDomain::Naked) => Ok(None),
 		(
-			AdditiveLogicalDomain::Quantity(left_unit),
-			AdditiveLogicalDomain::Quantity(right_unit),
+			LogicalArithmeticDomain::Quantity(left_unit),
+			LogicalArithmeticDomain::Quantity(right_unit),
 		) => {
 			require_compatible_units(&left_unit, &right_unit)?;
 			Ok(Some(append_dimensioned_arithmetic(
@@ -9358,29 +9382,33 @@ fn bind_logical_addition(
 				left_logical,
 			)?))
 		}
-		(AdditiveLogicalDomain::Quantity(_), AdditiveLogicalDomain::Naked)
-		| (AdditiveLogicalDomain::Naked, AdditiveLogicalDomain::Quantity(_)) => Err(unit_type_mismatch(
-			"unit arithmetic requires both operands to be the same unit; CONVERT explicitly before combining with a scalar",
-		)),
-		(AdditiveLogicalDomain::Identity(spec), _) | (_, AdditiveLogicalDomain::Identity(spec)) => {
-			Err(non_additive_logical_type_error(&spec.name, "+"))
+		(LogicalArithmeticDomain::Quantity(_), LogicalArithmeticDomain::Naked)
+		| (LogicalArithmeticDomain::Naked, LogicalArithmeticDomain::Quantity(_)) => {
+			Err(unit_type_mismatch(
+				"unit arithmetic requires both operands to be the same unit; CONVERT explicitly before combining with a scalar",
+			))
+		}
+		(LogicalArithmeticDomain::Identity(_), _) | (_, LogicalArithmeticDomain::Identity(_)) => {
+			unreachable!("identity operands handled before operator-specific arithmetic")
 		}
 	}
 }
 
-fn reject_logical_addition_with_untyped_null(
+fn reject_logical_arithmetic_with_untyped_null(
 	builder: &BoundExprProgramBuilder,
 	ctx: &ExprBindContext<'_>,
+	op: &BoundBinaryOp,
 	typed_operand: BoundExprId,
 ) -> Result<(), BindingError> {
-	match additive_logical_domain_for_node(ctx, builder, typed_operand)? {
-		AdditiveLogicalDomain::Naked => Ok(()),
-		AdditiveLogicalDomain::Quantity(_) => Err(unit_type_mismatch(
-			"unit arithmetic requires both operands to be the same unit; CONVERT explicitly before combining with NULL",
+	match logical_arithmetic_domain_for_node(ctx, builder, typed_operand)? {
+		LogicalArithmeticDomain::Naked => Ok(()),
+		LogicalArithmeticDomain::Quantity(_) => Err(unit_type_mismatch(
+			"unit arithmetic with untyped NULL requires an explicit typed NULL or primitive CAST",
 		)),
-		AdditiveLogicalDomain::Identity(spec) => {
-			Err(non_additive_logical_type_error(&spec.name, "+"))
-		}
+		LogicalArithmeticDomain::Identity(spec) => Err(non_arithmetic_logical_type_error(
+			&spec.name,
+			arithmetic_symbol(op),
+		)),
 	}
 }
 
@@ -9582,10 +9610,27 @@ fn unit_type_mismatch(message: impl Into<String>) -> BindingError {
 	}
 }
 
-fn non_additive_logical_type_error(type_name: &str, context: &str) -> BindingError {
+fn arithmetic_symbol(op: &BoundBinaryOp) -> &'static str {
+	match op {
+		BoundBinaryOp::Add => "+",
+		BoundBinaryOp::Sub => "-",
+		BoundBinaryOp::Mul => "*",
+		BoundBinaryOp::Div => "/",
+		BoundBinaryOp::Eq
+		| BoundBinaryOp::Neq
+		| BoundBinaryOp::Lt
+		| BoundBinaryOp::Lte
+		| BoundBinaryOp::Gt
+		| BoundBinaryOp::Gte
+		| BoundBinaryOp::And
+		| BoundBinaryOp::Or => "arithmetic",
+	}
+}
+
+fn non_arithmetic_logical_type_error(type_name: &str, context: &str) -> BindingError {
 	BindingError::TypeMismatch {
 		message: format!(
-			"logical type {type_name} is not an additive quantity for {context}; use an explicit primitive CAST to perform raw numeric arithmetic"
+			"logical type {type_name} is not an arithmetic quantity for {context}; use an explicit primitive CAST to perform raw numeric arithmetic"
 		),
 	}
 }
@@ -10672,12 +10717,13 @@ fn additive_unit_aggregate_logical_type(
 		AggregateFunction::Avg => "AVG",
 		_ => unreachable!("additive helper is only used by SUM/AVG"),
 	};
-	match additive_logical_domain_for_type(logical_type, logical_types)? {
-		AdditiveLogicalDomain::Naked => Ok(LogicalTypeId::NAKED),
-		AdditiveLogicalDomain::Identity(spec) => {
-			Err(non_additive_logical_type_error(&spec.name, aggregate_name))
-		}
-		AdditiveLogicalDomain::Quantity(spec) => {
+	match logical_arithmetic_domain_for_type(logical_type, logical_types)? {
+		LogicalArithmeticDomain::Naked => Ok(LogicalTypeId::NAKED),
+		LogicalArithmeticDomain::Identity(spec) => Err(non_arithmetic_logical_type_error(
+			&spec.name,
+			aggregate_name,
+		)),
+		LogicalArithmeticDomain::Quantity(spec) => {
 			let Some(input_type) = call.args.root_type(0) else {
 				return Ok(LogicalTypeId::NAKED);
 			};

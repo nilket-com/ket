@@ -534,8 +534,8 @@ pub(crate) fn adr168_sum_avg_preserve_only_declared_unit_identity() {
 	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
 	assert!(additive.contains("call.args.root_logical_type(0)"));
 	assert!(additive.contains("call.args.root_type(0)"));
-	assert!(additive.contains("additive_logical_domain_for_type(logical_type, logical_types)?"));
-	assert!(additive.contains("AdditiveLogicalDomain::Quantity(spec)"));
+	assert!(additive.contains("logical_arithmetic_domain_for_type(logical_type, logical_types)?"));
+	assert!(additive.contains("LogicalArithmeticDomain::Quantity(spec)"));
 	assert!(additive.contains("input_type == output_type"));
 	assert!(additive.contains("spec.physical == *output_type"));
 }
@@ -590,11 +590,11 @@ pub(crate) fn adr168_count_and_statistical_aggregates_stay_naked() {
 pub(crate) fn adr169_addition_gates_logical_identity_before_numeric_fallback() {
 	let binder = binder_source();
 	let arithmetic = source_block(&binder, "fn bind_arithmetic");
-	let logical_add = source_block(&binder, "fn bind_logical_addition");
-	let null_add = source_block(&binder, "fn reject_logical_addition_with_untyped_null");
+	let logical_arithmetic = source_block(&binder, "fn bind_logical_arithmetic");
+	let null_arithmetic = source_block(&binder, "fn reject_logical_arithmetic_with_untyped_null");
 	let logical_gate = arithmetic
-		.find("bind_logical_addition")
-		.expect("logical addition gate");
+		.find("bind_logical_arithmetic")
+		.expect("logical arithmetic gate");
 	let dimensioned_gate = arithmetic
 		.find("bind_dimensioned_arithmetic")
 		.expect("dimensioned arithmetic gate");
@@ -604,23 +604,24 @@ pub(crate) fn adr169_addition_gates_logical_identity_before_numeric_fallback() {
 
 	assert!(logical_gate < dimensioned_gate);
 	assert!(dimensioned_gate < numeric_fallback);
-	assert!(arithmetic.contains("reject_logical_addition_with_untyped_null"));
-	assert!(logical_add.contains("AdditiveLogicalDomain::Identity(spec)"));
-	assert!(logical_add.contains("non_additive_logical_type_error(&spec.name, \"+\")"));
-	assert!(null_add.contains("AdditiveLogicalDomain::Identity(spec)"));
-	assert!(null_add.contains("non_additive_logical_type_error(&spec.name, \"+\")"));
+	assert!(arithmetic.contains("reject_logical_arithmetic_with_untyped_null"));
+	assert!(logical_arithmetic.contains("LogicalArithmeticDomain::Identity(spec)"));
+	assert!(logical_arithmetic.contains("non_arithmetic_logical_type_error("));
+	assert!(logical_arithmetic.contains("arithmetic_symbol(op)"));
+	assert!(null_arithmetic.contains("LogicalArithmeticDomain::Identity(spec)"));
+	assert!(null_arithmetic.contains("non_arithmetic_logical_type_error("));
 }
 
 #[test]
 pub(crate) fn adr169_non_unit_logical_identity_is_not_treated_as_naked() {
 	let binder = binder_source();
-	let domain = source_block(&binder, "fn additive_logical_domain_for_type");
+	let domain = source_block(&binder, "fn logical_arithmetic_domain_for_type");
 
 	assert!(domain.contains("logical_type.is_naked()"));
 	assert!(domain.contains("LogicalTypeResolver::with_registry(logical_types)"));
 	assert!(domain.contains("spec.unit.is_some()"));
-	assert!(domain.contains("AdditiveLogicalDomain::Quantity(spec)"));
-	assert!(domain.contains("AdditiveLogicalDomain::Identity(spec)"));
+	assert!(domain.contains("LogicalArithmeticDomain::Quantity(spec)"));
+	assert!(domain.contains("LogicalArithmeticDomain::Identity(spec)"));
 	assert!(!domain.contains("logical_type_spec("));
 }
 
@@ -634,9 +635,10 @@ pub(crate) fn adr169_sum_avg_reject_non_additive_identity() {
 	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
 	assert!(additive.contains("AggregateFunction::Sum => \"SUM\""));
 	assert!(additive.contains("AggregateFunction::Avg => \"AVG\""));
-	assert!(additive.contains("AdditiveLogicalDomain::Identity(spec)"));
-	assert!(additive.contains("non_additive_logical_type_error(&spec.name, aggregate_name)"));
-	assert!(additive.contains("AdditiveLogicalDomain::Quantity(spec)"));
+	assert!(additive.contains("LogicalArithmeticDomain::Identity(spec)"));
+	assert!(additive.contains("non_arithmetic_logical_type_error("));
+	assert!(additive.contains("aggregate_name"));
+	assert!(additive.contains("LogicalArithmeticDomain::Quantity(spec)"));
 	assert!(additive.contains("spec.physical == *output_type"));
 }
 
@@ -651,10 +653,10 @@ pub(crate) fn adr169_selection_cardinality_and_comparison_stay_identity_aware() 
 	assert!(comparison.contains("nominal_compatible("));
 	assert!(in_list.contains("nominal_compatible("));
 	assert!(nominal.contains("BindingError::NominalTypeMismatch"));
-	assert!(!comparison.contains("additive_logical_domain"));
-	assert!(!in_list.contains("additive_logical_domain"));
-	assert!(!static_filter.contains("additive_logical_domain"));
-	assert!(!static_filter.contains("non_additive_logical_type_error"));
+	assert!(!comparison.contains("logical_arithmetic_domain"));
+	assert!(!in_list.contains("logical_arithmetic_domain"));
+	assert!(!static_filter.contains("logical_arithmetic_domain"));
+	assert!(!static_filter.contains("non_arithmetic_logical_type_error"));
 }
 
 #[test]
@@ -674,8 +676,227 @@ pub(crate) fn adr169_identity_additive_gate_is_frontend_shared() {
 	assert!(bind_expr.contains("bind_arithmetic"));
 	assert!(bind_aggregate.contains("bind_stable_aggregate_call"));
 	assert!(bind_stable_aggregate.contains("bind_expr_program(args, input_schema, ctx)?"));
-	assert!(arithmetic.contains("bind_logical_addition"));
+	assert!(arithmetic.contains("bind_logical_arithmetic"));
 	assert!(aggregate_schema.contains("aggregate_field(call, logical_types)?"));
+}
+
+#[test]
+pub(crate) fn adr170_all_arithmetic_operators_gate_logical_identity() {
+	let binder = binder_source();
+	let arithmetic = source_block(&binder, "fn bind_arithmetic");
+	let logical_gate = arithmetic
+		.find("bind_logical_arithmetic")
+		.expect("logical arithmetic gate");
+	let dimensioned_gate = arithmetic
+		.find("bind_dimensioned_arithmetic")
+		.expect("dimensioned arithmetic gate");
+	let numeric_fallback = arithmetic
+		.find("arithmetic_output_type(&left_type, &right_type)")
+		.expect("numeric fallback");
+
+	for op in [
+		"BoundBinaryOp::Add",
+		"BoundBinaryOp::Sub",
+		"BoundBinaryOp::Mul",
+		"BoundBinaryOp::Div",
+	] {
+		assert!(
+			arithmetic.contains(op),
+			"missing arithmetic operator gate {op}"
+		);
+	}
+	assert!(logical_gate < dimensioned_gate);
+	assert!(dimensioned_gate < numeric_fallback);
+}
+
+#[test]
+pub(crate) fn adr170_logical_gate_runs_after_temporal_before_dimensioned() {
+	let binder = binder_source();
+	let arithmetic = source_block(&binder, "fn bind_arithmetic");
+	let calendar = arithmetic
+		.find("calendar_arithmetic_output_type")
+		.expect("calendar arithmetic");
+	let temporal = arithmetic
+		.find("temporal_arithmetic_output_type")
+		.expect("temporal arithmetic");
+	let logical = arithmetic
+		.find("bind_logical_arithmetic")
+		.expect("logical arithmetic");
+	let dimensioned = arithmetic
+		.find("bind_dimensioned_arithmetic")
+		.expect("dimensioned arithmetic");
+	let physical = arithmetic
+		.find("arithmetic_output_type(&left_type, &right_type)")
+		.expect("physical fallback");
+
+	assert!(calendar < temporal);
+	assert!(temporal < logical);
+	assert!(logical < dimensioned);
+	assert!(dimensioned < physical);
+}
+
+#[test]
+pub(crate) fn adr170_identity_rejects_every_arithmetic_operator() {
+	let binder = binder_source();
+	let logical = source_block(&binder, "fn bind_logical_arithmetic");
+	let identity = logical
+		.find("LogicalArithmeticDomain::Identity(spec)")
+		.expect("identity reject");
+	let non_add = logical
+		.find("if !matches!(op, BoundBinaryOp::Add)")
+		.expect("non-add fallthrough");
+
+	assert!(identity < non_add);
+	assert!(logical.contains("non_arithmetic_logical_type_error("));
+	assert!(logical.contains("arithmetic_symbol(op)"));
+}
+
+#[test]
+pub(crate) fn adr170_untyped_null_arithmetic_rejects_logical_operands_for_all_operators() {
+	let binder = binder_source();
+	let arithmetic = source_block(&binder, "fn bind_arithmetic");
+	let null_guard = source_block(&binder, "fn reject_logical_arithmetic_with_untyped_null");
+
+	assert_eq!(
+		arithmetic
+			.matches("reject_logical_arithmetic_with_untyped_null")
+			.count(),
+		2
+	);
+	for op in [
+		"BoundBinaryOp::Add",
+		"BoundBinaryOp::Sub",
+		"BoundBinaryOp::Mul",
+		"BoundBinaryOp::Div",
+	] {
+		assert!(arithmetic.contains(op), "missing NULL arithmetic op {op}");
+	}
+	assert!(null_guard.contains("LogicalArithmeticDomain::Identity(spec)"));
+	assert!(null_guard.contains("non_arithmetic_logical_type_error("));
+	assert!(null_guard.contains("LogicalArithmeticDomain::Quantity(_)"));
+	assert!(null_guard.contains("unit arithmetic with untyped NULL"));
+}
+
+#[test]
+pub(crate) fn adr170_refinement_types_are_non_arithmetic_identities() {
+	let binder = binder_source();
+	let domain = source_block(&binder, "fn logical_arithmetic_domain_for_type");
+
+	assert!(domain.contains("spec.unit.is_some()"));
+	assert!(domain.contains("LogicalArithmeticDomain::Quantity(spec)"));
+	assert!(domain.contains("LogicalArithmeticDomain::Identity(spec)"));
+	assert!(!domain.contains("refinement"));
+}
+
+#[test]
+pub(crate) fn adr170_quantity_arithmetic_unchanged() {
+	let binder = binder_source();
+	let logical = source_block(&binder, "fn bind_logical_arithmetic");
+	let dimensioned = source_block(&binder, "fn bind_dimensioned_arithmetic");
+
+	assert!(logical.contains("if !matches!(op, BoundBinaryOp::Add)"));
+	assert_eq!(logical.matches("append_dimensioned_arithmetic").count(), 1);
+	for marker in [
+		"BoundBinaryOp::Add | BoundBinaryOp::Sub",
+		"BoundBinaryOp::Mul => match",
+		"BoundBinaryOp::Div => match",
+		"unit multiplication that creates derived dimensions is deferred",
+		"unit division that creates ratios is deferred",
+	] {
+		assert!(
+			dimensioned.contains(marker),
+			"dimensioned arithmetic missing {marker}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr170_comparison_selection_stay_identity_aware() {
+	let binder = binder_source();
+	let comparison = source_block(&binder, "fn bind_comparison");
+	let in_list = source_block(&binder, "fn bind_in_list");
+	let static_filter = source_block(&binder, "fn static_filter_atom_class");
+	let aggregate_output = source_block(&binder, "fn aggregate_output_logical_type");
+
+	for (name, block) in [
+		("comparison", comparison.as_str()),
+		("in_list", in_list.as_str()),
+		("static_filter", static_filter.as_str()),
+		("aggregate_output", aggregate_output.as_str()),
+	] {
+		assert!(
+			!block.contains("bind_logical_arithmetic"),
+			"{name} must not route through arithmetic gate"
+		);
+		assert!(
+			!block.contains("non_arithmetic_logical_type_error"),
+			"{name} must not use arithmetic diagnostic"
+		);
+	}
+	assert!(comparison.contains("nominal_compatible("));
+	assert!(in_list.contains("nominal_compatible("));
+	assert!(aggregate_output.contains("AggregateFunction::Min | AggregateFunction::Max"));
+	assert!(aggregate_output.contains("AggregateFunction::Count"));
+}
+
+#[test]
+pub(crate) fn adr170_identity_arithmetic_gate_is_frontend_shared() {
+	let rune = rune_engine_source();
+	let binder = binder_source();
+	let bind_expr = source_block(&binder, "fn bind_expr_into_program");
+	let arithmetic = source_block(&binder, "fn bind_arithmetic");
+
+	for marker in [
+		"expr: Expr::Add(Box::new(self.expr), Box::new(other.expr))",
+		"expr: Expr::Sub(Box::new(self.expr), Box::new(other.expr))",
+		"expr: Expr::Mul(Box::new(self.expr), Box::new(other.expr))",
+		"expr: Expr::Div(Box::new(self.expr), Box::new(other.expr))",
+		"expr: Expr::Cast(Box::new(self.expr), target.data_type)",
+	] {
+		assert!(rune.contains(marker), "Rune missing shared marker {marker}");
+	}
+	for marker in [
+		"Expr::Add(left, right)",
+		"Expr::Sub(left, right)",
+		"Expr::Mul(left, right)",
+		"Expr::Div(left, right)",
+		"bind_arithmetic",
+	] {
+		assert!(bind_expr.contains(marker), "binder missing marker {marker}");
+	}
+	assert!(arithmetic.contains("bind_logical_arithmetic"));
+	assert!(!rune.contains("bind_logical_arithmetic"));
+	assert!(!rune.contains("non_arithmetic_logical_type_error"));
+}
+
+#[test]
+pub(crate) fn adr170_no_runtime_storage_or_wire_surface() {
+	let execution = execution_source();
+	let exec = exec_source();
+	let aggregate_kernel = aggregate_kernel_source();
+	let pbc = pbc_source();
+	let storage = storage_source();
+	let wendelon = wendelon_table_source();
+
+	for (name, source) in [
+		("execution.rs", execution.as_str()),
+		("exec.rs", exec.as_str()),
+		("aggregate_kernel.rs", aggregate_kernel.as_str()),
+		("pbc.rs", pbc.as_str()),
+		("storage.rs", storage.as_str()),
+		("wendelon table.rs", wendelon.as_str()),
+	] {
+		assert!(
+			!source.contains("LogicalArithmeticDomain"),
+			"{name} must not expose the binder-only arithmetic discriminator"
+		);
+		assert!(
+			!source.contains("non_arithmetic_logical_type_error"),
+			"{name} must not expose the binder-only arithmetic diagnostic"
+		);
+	}
+	assert!(!exec.contains("evaluate_logical_arithmetic"));
+	assert!(!pbc.contains("OP_LOGICAL_ARITHMETIC"));
 }
 
 #[test]
@@ -696,19 +917,19 @@ pub(crate) fn adr169_no_runtime_storage_or_wire_surface() {
 		("wendelon table.rs", wendelon.as_str()),
 	] {
 		assert!(
-			!source.contains("AdditiveLogicalDomain"),
-			"{name} must not expose the binder-only additive discriminator"
+			!source.contains("LogicalArithmeticDomain"),
+			"{name} must not expose the binder-only arithmetic discriminator"
 		);
 		assert!(
-			!source.contains("non_additive_logical_type_error"),
-			"{name} must not expose the binder-only additive diagnostic"
+			!source.contains("non_arithmetic_logical_type_error"),
+			"{name} must not expose the binder-only arithmetic diagnostic"
 		);
 	}
 	assert!(!execution.contains("NonAdditiveLogicalType"));
 	assert!(!exec.contains("evaluate_logical_addition"));
 	assert!(!pbc.contains("OP_LOGICAL_ADD"));
 	assert!(!storage.contains("NonAdditiveLogicalType"));
-	assert!(!wendelon.contains("AdditiveLogicalDomain"));
+	assert!(!wendelon.contains("LogicalArithmeticDomain"));
 }
 
 #[test]
