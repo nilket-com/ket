@@ -37,6 +37,10 @@ use wendelon_client::{
 	UnitScale,
 };
 
+const TEMPERATURE_CELSIUS_DELTA_ID: LogicalTypeId = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID);
+const TEMPERATURE_CELSIUS_ID: LogicalTypeId = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 2);
+const TEMPERATURE_KELVIN_ID: LogicalTypeId = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3);
+
 #[tokio::test]
 async fn ddl_define_then_use_creates_durable_typed_descriptor() {
 	let (catalog, coordinator, planner) = logical_type_coordinator();
@@ -144,13 +148,14 @@ fn ddl_create_logical_type_unit_metadata_lowers() {
 	);
 	assert_eq!(unit.quantity_kind, UnitQuantityKind::Delta);
 	assert_eq!(unit.offset_to_base, UnitOffset::ZERO);
+	assert_eq!(unit.delta_unit, None);
 }
 
 #[test]
 fn ddl_create_logical_type_affine_metadata_lowers() {
 	let plan = SqlPlanner::new()
 		.plan(
-			"CREATE LOGICAL TYPE Celsius AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 OFFSET_TO_BASE 273.15 POINT",
+			"CREATE LOGICAL TYPE Celsius AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 OFFSET_TO_BASE 273.15 POINT DELTA_UNIT CelsiusDelta",
 		)
 		.expect("plan affine dimensioned logical type");
 
@@ -183,6 +188,7 @@ fn ddl_create_logical_type_affine_metadata_lowers() {
 			denominator: 20,
 		}
 	);
+	assert_eq!(unit.delta_unit.as_deref(), Some("CelsiusDelta"));
 }
 
 #[test]
@@ -221,6 +227,22 @@ fn ddl_create_logical_type_unit_metadata_rejects_non_float64_and_invalid_scale()
 			"CREATE LOGICAL TYPE Bad AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 OFFSET_TO_BASE 273.15 DELTA",
 			"nonzero OFFSET_TO_BASE requires POINT",
 		),
+		(
+			"CREATE LOGICAL TYPE Bad AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 DELTA DELTA_UNIT CelsiusDelta",
+			"DELTA_UNIT requires POINT",
+		),
+		(
+			"CREATE LOGICAL TYPE Bad AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 DELTA_UNIT CelsiusDelta",
+			"DELTA_UNIT requires POINT",
+		),
+		(
+			"CREATE LOGICAL TYPE Bad AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT DELTA_UNIT",
+			"DELTA_UNIT requires an unquoted logical type identifier",
+		),
+		(
+			"CREATE LOGICAL TYPE Bad AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT DELTA_UNIT app.CelsiusDelta",
+			"must be unquoted ASCII identifiers",
+		),
 	] {
 		let err = SqlPlanner::new().plan(sql).expect_err(sql);
 		assert!(
@@ -228,6 +250,74 @@ fn ddl_create_logical_type_unit_metadata_rejects_non_float64_and_invalid_scale()
 			"expected diagnostic {diagnostic:?}, got {err}"
 		);
 	}
+}
+
+#[tokio::test]
+async fn delta_unit_pairing_validated_at_create() {
+	let (_catalog, coordinator, planner) = logical_type_writer_coordinator();
+
+	expect_query_error_contains(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE ForwardPoint AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT DELTA_UNIT ForwardDelta",
+		"not found",
+	)
+	.await;
+
+	execute(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE CelsiusDelta AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 DELTA",
+	)
+	.await;
+	execute(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE Celsius AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 OFFSET_TO_BASE 273.15 POINT DELTA_UNIT CelsiusDelta",
+	)
+	.await;
+
+	execute(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE Kelvin AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT",
+	)
+	.await;
+	expect_query_error_contains(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE WrongKind AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT DELTA_UNIT Kelvin",
+		"must be a Delta",
+	)
+	.await;
+
+	execute(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE LengthDelta AS DOUBLE DIMENSION Length SCALE_TO_BASE 1 DELTA",
+	)
+	.await;
+	expect_query_error_contains(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE WrongDimension AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT DELTA_UNIT LengthDelta",
+		"dimension must match",
+	)
+	.await;
+
+	execute(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE FahrenheitDelta AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 0.5555555555555556 DELTA",
+	)
+	.await;
+	expect_query_error_contains(
+		&coordinator,
+		&planner,
+		"CREATE LOGICAL TYPE WrongScale AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT DELTA_UNIT FahrenheitDelta",
+		"scale must match",
+	)
+	.await;
 }
 
 #[tokio::test]
@@ -980,7 +1070,7 @@ async fn convert_temperature_point_uses_affine_offset_and_preserves_target_ident
 
 	let sql = "SELECT CONVERT(celsius, Kelvin) FROM temperature_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
-	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 1));
+	assert_project_identity(bound, TEMPERATURE_KELVIN_ID);
 
 	let batch = concat_query(&coordinator, &planner, sql).await;
 	let rows = float64_rows(&batch, 0);
@@ -997,7 +1087,7 @@ async fn convert_fahrenheit_point_to_celsius_point_uses_offset() {
 
 	let sql = "SELECT CONVERT(fahrenheit, Celsius) FROM temperature_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
-	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+	assert_project_identity(bound, TEMPERATURE_CELSIUS_ID);
 
 	let batch = concat_query(&coordinator, &planner, sql).await;
 	let rows = float64_rows(&batch, 0);
@@ -1017,7 +1107,7 @@ async fn convert_temperature_delta_uses_scale_only() {
 
 	let sql = "SELECT CONVERT(fahrenheit_delta, CelsiusDelta) FROM temperature_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
-	assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3));
+	assert_project_identity(bound, TEMPERATURE_CELSIUS_DELTA_ID);
 
 	let batch = concat_query(&coordinator, &planner, sql).await;
 	let rows = float64_rows(&batch, 0);
@@ -1041,23 +1131,155 @@ async fn point_delta_convert_mismatch_rejects() {
 }
 
 #[tokio::test]
-async fn point_quantity_arithmetic_rejects_until_delta_result_identity_exists() {
+async fn point_plus_point_and_point_scaling_still_reject() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_temperature_samples(&coordinator, &planner).await;
 
 	for sql in [
 		"SELECT celsius + celsius FROM temperature_samples",
 		"SELECT kelvin + kelvin FROM temperature_samples",
-		"SELECT celsius - celsius FROM temperature_samples",
 		"SELECT celsius * 2 FROM temperature_samples",
 		"SELECT celsius / 2 FROM temperature_samples",
+		"SELECT 2 * celsius FROM temperature_samples",
 		"SELECT SUM(celsius) FROM temperature_samples",
 		"SELECT SUM(kelvin) FROM temperature_samples",
-		"SELECT AVG(celsius) FROM temperature_samples",
 	] {
 		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "point/delta quantity algebra")
 			.await;
 	}
+}
+
+#[tokio::test]
+async fn point_minus_point_yields_declared_delta() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_temperature_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT CAST(37.0 AS Celsius) - CAST(36.0 AS Celsius) FROM temperature_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	assert_project_identity(bound, TEMPERATURE_CELSIUS_DELTA_ID);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(1.0)]);
+}
+
+#[tokio::test]
+async fn point_plus_delta_yields_point() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_temperature_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT celsius + celsius_delta, celsius_delta + celsius, celsius - celsius_delta FROM temperature_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(schema.as_ref(), 0, TEMPERATURE_CELSIUS_ID);
+	assert_schema_identity(schema.as_ref(), 1, TEMPERATURE_CELSIUS_ID);
+	assert_schema_identity(schema.as_ref(), 2, TEMPERATURE_CELSIUS_ID);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(5.0)]);
+	assert_eq!(float64_rows(&batch, 1), vec![Some(5.0)]);
+	assert_eq!(float64_rows(&batch, 2), vec![Some(-5.0)]);
+}
+
+#[tokio::test]
+async fn avg_of_points_is_point_sum_of_points_rejects() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_temperature_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT AVG(celsius), AVG(kelvin) FROM temperature_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	let schema = bound.schema();
+	assert_schema_identity(schema.as_ref(), 0, TEMPERATURE_CELSIUS_ID);
+	assert_schema_identity(schema.as_ref(), 1, TEMPERATURE_KELVIN_ID);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(0.0)]);
+	assert_eq!(float64_rows(&batch, 1), vec![Some(273.15)]);
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT SUM(celsius) FROM temperature_samples",
+		"point/delta quantity algebra",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn point_without_delta_unit_subtraction_rejects() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_temperature_samples(&coordinator, &planner).await;
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT kelvin - kelvin FROM temperature_samples",
+		"has no declared delta unit",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn cross_unit_point_subtraction_requires_convert() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_temperature_samples(&coordinator, &planner).await;
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT celsius - fahrenheit FROM temperature_samples",
+		"CONVERT explicitly",
+	)
+	.await;
+
+	let sql = "SELECT celsius - CONVERT(fahrenheit, Celsius) FROM temperature_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	assert_project_identity(bound, TEMPERATURE_CELSIUS_DELTA_ID);
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	let rows = float64_rows(&batch, 0);
+	let [Some(value)] = rows.as_slice() else {
+		panic!("expected single converted point delta");
+	};
+	assert!(value.abs() < 1e-10, "expected zero delta, got {value}");
+}
+
+#[tokio::test]
+async fn mismatched_delta_arithmetic_rejects() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_temperature_samples(&coordinator, &planner).await;
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT celsius + fahrenheit_delta FROM temperature_samples",
+		"not the declared delta unit",
+	)
+	.await;
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT celsius_delta - celsius FROM temperature_samples",
+		"delta minus point",
+	)
+	.await;
+
+	let sql = "SELECT celsius + CONVERT(fahrenheit_delta, CelsiusDelta) FROM temperature_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	assert_project_identity(bound, TEMPERATURE_CELSIUS_ID);
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(5.0)]);
+}
+
+#[tokio::test]
+async fn point_delta_roundtrip() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_temperature_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT celsius + (celsius - celsius) FROM temperature_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	assert_project_identity(bound, TEMPERATURE_CELSIUS_ID);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(0.0)]);
 }
 
 #[tokio::test]
@@ -1087,22 +1309,10 @@ async fn point_comparison_and_selection_stay_valid() {
 		"SELECT MIN(celsius), MAX(celsius), COUNT(celsius), MIN(kelvin) FROM temperature_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
 	let schema = bound.schema();
-	assert_schema_identity(
-		schema.as_ref(),
-		0,
-		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
-	);
-	assert_schema_identity(
-		schema.as_ref(),
-		1,
-		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
-	);
+	assert_schema_identity(schema.as_ref(), 0, TEMPERATURE_CELSIUS_ID);
+	assert_schema_identity(schema.as_ref(), 1, TEMPERATURE_CELSIUS_ID);
 	assert_schema_identity(schema.as_ref(), 2, LogicalTypeId::NAKED);
-	assert_schema_identity(
-		schema.as_ref(),
-		3,
-		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 1),
-	);
+	assert_schema_identity(schema.as_ref(), 3, TEMPERATURE_KELVIN_ID);
 
 	let batch = concat_query(&coordinator, &planner, sql).await;
 	assert_eq!(float64_rows(&batch, 0), vec![Some(0.0)]);
@@ -4345,11 +4555,11 @@ async fn setup_type_unit_aggregate_samples(coordinator: &QueryCoordinator, plann
 
 async fn setup_temperature_samples(coordinator: &QueryCoordinator, planner: &SqlPlanner) {
 	for sql in [
-		"CREATE LOGICAL TYPE Celsius AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 OFFSET_TO_BASE 273.15 POINT",
-		"CREATE LOGICAL TYPE Kelvin AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT",
-		"CREATE LOGICAL TYPE Fahrenheit AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 0.5555555555555556 OFFSET_TO_BASE 255.3722222222222 POINT",
 		"CREATE LOGICAL TYPE CelsiusDelta AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 DELTA",
 		"CREATE LOGICAL TYPE FahrenheitDelta AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 0.5555555555555556 DELTA",
+		"CREATE LOGICAL TYPE Celsius AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 OFFSET_TO_BASE 273.15 POINT DELTA_UNIT CelsiusDelta",
+		"CREATE LOGICAL TYPE Kelvin AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 1 POINT",
+		"CREATE LOGICAL TYPE Fahrenheit AS DOUBLE DIMENSION Temperature SCALE_TO_BASE 0.5555555555555556 OFFSET_TO_BASE 255.3722222222222 POINT DELTA_UNIT FahrenheitDelta",
 		"CREATE TABLE temperature_samples (celsius Celsius, kelvin Kelvin, fahrenheit Fahrenheit, celsius_delta CelsiusDelta, fahrenheit_delta FahrenheitDelta)",
 		"INSERT INTO temperature_samples VALUES (0.0, 273.15, 32.0, 5.0, 9.0)",
 	] {

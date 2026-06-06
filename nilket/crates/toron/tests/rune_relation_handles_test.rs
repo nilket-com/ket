@@ -47,6 +47,10 @@ fn fragment_config() -> FragmentPlanConfig {
 	)
 }
 
+const RUNE_TEMPERATURE_CELSIUS_DELTA: LogicalTypeId = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID);
+const RUNE_TEMPERATURE_CELSIUS: LogicalTypeId = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 2);
+const RUNE_TEMPERATURE_KELVIN: LogicalTypeId = LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3);
+
 async fn rune_plan(script: &str) -> Result<LogicalPlan, FrontendError> {
 	let config = sandbox_config();
 	let engine = RuneEngine::with_config(config).expect("engine");
@@ -2888,6 +2892,123 @@ async fn rune_convert_matches_sql_convert_bind_path() {
 	}
 }
 
+#[tokio::test]
+async fn rune_point_delta_arithmetic_matches_sql_bind_path() {
+	let catalog = catalog_with_temperature_points();
+	let sql = SqlPlanner::new()
+		.plan(
+			"SELECT celsius - celsius AS dc, celsius + celsius_delta AS c1, celsius_delta + celsius AS c2, celsius - celsius_delta AS c3 FROM temps",
+		)
+		.expect("plan SQL point/delta arithmetic");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("temps").project_named([
+                col("celsius").sub(col("celsius")).named("dc"),
+                col("celsius").add(col("celsius_delta")).named("c1"),
+                col("celsius_delta").add(col("celsius")).named("c2"),
+                col("celsius").sub(col("celsius_delta")).named("c3"),
+            ])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune point/delta arithmetic");
+
+	let sql_bound = bind(&sql, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL point/delta arithmetic");
+	let rune_bound = bind(&rune, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune point/delta arithmetic");
+
+	for bound in [sql_bound, rune_bound] {
+		let ExecutionPlan::Project {
+			exprs,
+			output_schema,
+			..
+		} = bound
+		else {
+			panic!("expected point/delta project");
+		};
+		for (index, expected) in [
+			RUNE_TEMPERATURE_CELSIUS_DELTA,
+			RUNE_TEMPERATURE_CELSIUS,
+			RUNE_TEMPERATURE_CELSIUS,
+			RUNE_TEMPERATURE_CELSIUS,
+		]
+		.into_iter()
+		.enumerate()
+		{
+			assert_eq!(exprs.root_logical_type(index), Some(expected));
+			assert_eq!(
+				decode_column_logical_type(output_schema.field(index))
+					.expect("decode point/delta output identity"),
+				expected
+			);
+		}
+	}
+
+	let aggregate = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("temps").aggregate([], [avg(col("celsius"))])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune point AVG");
+	let bound = bind(&aggregate, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune point AVG");
+	assert_eq!(
+		decode_column_logical_type(bound.schema().field(0)).expect("decode point AVG identity"),
+		RUNE_TEMPERATURE_CELSIUS
+	);
+
+	for (script, context, diagnostic) in [
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("temps").project_named([
+                col("celsius").add(col("celsius")).named("bad")
+            ])
+        }
+    "#,
+			"point + point",
+			"point/delta quantity algebra",
+		),
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("temps").aggregate([], [sum(col("celsius"))])
+        }
+    "#,
+			"SUM(point)",
+			"point/delta quantity algebra",
+		),
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("temps").project_named([
+                col("kelvin").sub(col("kelvin")).named("bad")
+            ])
+        }
+    "#,
+			"point without delta unit",
+			"has no declared delta unit",
+		),
+	] {
+		let logical = rune_plan(script)
+			.await
+			.unwrap_or_else(|error| panic!("{context} plan failed: {error:?}"));
+		let error = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_err();
+		assert_binding_type_mismatch_contains(error, diagnostic);
+	}
+}
+
 async fn predicate_operator_compound_filter_plan() -> LogicalPlan {
 	rune_plan(
 		r#"
@@ -3054,6 +3175,7 @@ fn catalog_with_dimensioned_price() -> MockCatalog {
 					},
 					quantity_kind: UnitQuantityKind::Delta,
 					offset_to_base: UnitOffset::ZERO,
+					delta_unit: None,
 				}),
 			},
 		)
@@ -3074,6 +3196,7 @@ fn catalog_with_dimensioned_price() -> MockCatalog {
 					},
 					quantity_kind: UnitQuantityKind::Delta,
 					offset_to_base: UnitOffset::ZERO,
+					delta_unit: None,
 				}),
 			},
 		)
@@ -3089,6 +3212,74 @@ fn catalog_with_dimensioned_price() -> MockCatalog {
 			),
 		)
 		.expect("register sales");
+	catalog
+}
+
+fn catalog_with_temperature_points() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	for definition in [
+		LogicalTypeDefinition {
+			logical_type_id: RUNE_TEMPERATURE_CELSIUS_DELTA.0,
+			name: "CelsiusDelta".to_string(),
+			physical: LogicalTypePhysical::Float64,
+			refinement: None,
+			unit: Some(LogicalTypeUnit {
+				dimension: "Temperature".to_string(),
+				scale_to_base: UnitScale {
+					numerator: 1,
+					denominator: 1,
+				},
+				quantity_kind: UnitQuantityKind::Delta,
+				offset_to_base: UnitOffset::ZERO,
+				delta_unit: None,
+			}),
+		},
+		LogicalTypeDefinition {
+			logical_type_id: RUNE_TEMPERATURE_CELSIUS.0,
+			name: "Celsius".to_string(),
+			physical: LogicalTypePhysical::Float64,
+			refinement: None,
+			unit: Some(LogicalTypeUnit {
+				dimension: "Temperature".to_string(),
+				scale_to_base: UnitScale {
+					numerator: 1,
+					denominator: 1,
+				},
+				quantity_kind: UnitQuantityKind::Point,
+				offset_to_base: UnitOffset {
+					numerator: 5463,
+					denominator: 20,
+				},
+				delta_unit: Some("CelsiusDelta".to_string()),
+			}),
+		},
+		LogicalTypeDefinition {
+			logical_type_id: RUNE_TEMPERATURE_KELVIN.0,
+			name: "Kelvin".to_string(),
+			physical: LogicalTypePhysical::Float64,
+			refinement: None,
+			unit: Some(LogicalTypeUnit {
+				dimension: "Temperature".to_string(),
+				scale_to_base: UnitScale {
+					numerator: 1,
+					denominator: 1,
+				},
+				quantity_kind: UnitQuantityKind::Point,
+				offset_to_base: UnitOffset::ZERO,
+				delta_unit: None,
+			}),
+		},
+	] {
+		catalog
+			.register_logical_type_for_tenant(TenantId(1), definition)
+			.expect("register temperature logical type");
+	}
+	catalog
+		.register_descriptor(
+			TableId(1),
+			descriptor(1, "temps", temperature_schema().as_ref(), "id"),
+		)
+		.expect("register temps");
 	catalog
 }
 
@@ -3127,6 +3318,30 @@ fn sales_schema_with_dimensioned_price() -> SchemaRef {
 			LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
 		),
 		Field::new("active", DataType::Boolean, true),
+	]))
+}
+
+fn temperature_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		field_with_logical_type_metadata(
+			"celsius",
+			DataType::Float64,
+			true,
+			RUNE_TEMPERATURE_CELSIUS,
+		),
+		field_with_logical_type_metadata(
+			"celsius_delta",
+			DataType::Float64,
+			true,
+			RUNE_TEMPERATURE_CELSIUS_DELTA,
+		),
+		field_with_logical_type_metadata(
+			"kelvin",
+			DataType::Float64,
+			true,
+			RUNE_TEMPERATURE_KELVIN,
+		),
 	]))
 }
 

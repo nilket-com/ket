@@ -394,6 +394,7 @@ pub struct LogicalTypeUnit {
 	pub scale_to_base: UnitScale,
 	pub quantity_kind: UnitQuantityKind,
 	pub offset_to_base: UnitOffset,
+	pub delta_unit: Option<String>,
 }
 
 impl LogicalTypeUnit {
@@ -412,6 +413,15 @@ impl LogicalTypeUnit {
 				ErrorKind::InvalidData,
 				"logical type delta unit offset must be zero",
 			));
+		}
+		if let Some(delta_unit) = &self.delta_unit {
+			if self.quantity_kind != UnitQuantityKind::Point {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"logical type delta_unit is legal only for point units",
+				));
+			}
+			validate_logical_type_name(delta_unit)?;
 		}
 		Ok(())
 	}
@@ -567,6 +577,7 @@ impl LogicalTypeCatalog {
 				"logical type name already exists with a different physical type, refinement, or unit metadata",
 			));
 		}
+		self.validate_delta_unit_pairing(tenant_id, &create)?;
 		let definition = LogicalTypeDefinition {
 			logical_type_id: self.next_id_for_tenant(tenant_id)?,
 			name: create.name,
@@ -594,6 +605,56 @@ impl LogicalTypeCatalog {
 		);
 		self.by_id.insert(id_key, definition.clone());
 		Ok(definition)
+	}
+
+	fn validate_delta_unit_pairing(
+		&self,
+		tenant_id: TenantId,
+		create: &LogicalTypeDefinitionCreate,
+	) -> std::io::Result<()> {
+		let Some(point_unit) = create.unit.as_ref() else {
+			return Ok(());
+		};
+		let Some(delta_unit_name) = point_unit.delta_unit.as_ref() else {
+			return Ok(());
+		};
+		let Some(delta_definition) = self.get_by_name(tenant_id, delta_unit_name) else {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("delta unit {delta_unit_name} not found"),
+			));
+		};
+		let Some(delta_unit) = delta_definition.unit.as_ref() else {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("delta unit {delta_unit_name} is not a dimensioned logical type"),
+			));
+		};
+		if delta_unit.quantity_kind != UnitQuantityKind::Delta {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("delta unit {delta_unit_name} must be a Delta unit"),
+			));
+		}
+		if delta_definition.physical != create.physical {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("delta unit {delta_unit_name} physical type must match point unit"),
+			));
+		}
+		if delta_unit.dimension != point_unit.dimension {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("delta unit {delta_unit_name} dimension must match point unit"),
+			));
+		}
+		if delta_unit.scale_to_base != point_unit.scale_to_base {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("delta unit {delta_unit_name} scale must match point unit"),
+			));
+		}
+		Ok(())
 	}
 
 	pub fn get_by_name(&self, tenant_id: TenantId, name: &str) -> Option<&LogicalTypeDefinition> {

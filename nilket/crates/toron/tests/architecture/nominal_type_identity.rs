@@ -1692,31 +1692,177 @@ pub(crate) fn adr171_point_quantities_do_not_reach_linear_dimensioned_arithmetic
 	let logical = source_block(&binder, "fn bind_logical_arithmetic");
 	let dimensioned = source_block(&binder, "fn bind_dimensioned_arithmetic");
 	let logical_point = logical
-		.find("UnitQuantityKind::Point")
-		.expect("logical point fence");
+		.find("if domain_is_point(&left_domain) || domain_is_point(&right_domain)")
+		.expect("logical point/delta handoff");
 	let non_add = logical
 		.find("if !matches!(op, BoundBinaryOp::Add)")
 		.expect("non-Add handoff");
 
 	assert!(logical_point < non_add);
+	assert!(logical.contains("bind_point_delta_arithmetic"));
 	assert!(logical.contains("point_arithmetic_error"));
 	assert!(dimensioned.contains("UnitQuantityKind::Point"));
 	assert!(dimensioned.contains("point_arithmetic_error"));
 }
 
 #[test]
-pub(crate) fn adr171_sum_avg_reject_point_quantities() {
+pub(crate) fn adr172_point_delta_arithmetic_replaces_point_fence() {
+	let binder = binder_source();
+	let logical = source_block(&binder, "fn bind_logical_arithmetic");
+	let point_delta = source_block(&binder, "fn bind_point_delta_arithmetic");
+	let legacy_fence = logical
+		.find("quantity_kind_for_spec(spec) == Some(UnitQuantityKind::Point)")
+		.expect("defense-in-depth point fence");
+	let point_handoff = logical
+		.find("bind_point_delta_arithmetic")
+		.expect("point/delta algebra handoff");
+
+	assert!(point_handoff < legacy_fence);
+	assert!(point_delta.contains("bind_point_delta_quantity_arithmetic"));
+	assert!(point_delta.contains("LogicalArithmeticDomain::Naked"));
+	assert!(point_delta.contains("point_arithmetic_error"));
+}
+
+#[test]
+pub(crate) fn adr172_point_minus_point_resolves_declared_delta() {
+	let binder = binder_source();
+	let point_delta = source_block(&binder, "fn bind_point_delta_quantity_arithmetic");
+	let paired = source_block(&binder, "fn paired_delta_spec");
+
+	assert!(point_delta.contains("(true, true, BoundBinaryOp::Sub)"));
+	assert!(point_delta.contains("left_spec.id != right_spec.id"));
+	assert!(point_delta.contains("let delta_spec = paired_delta_spec"));
+	assert!(point_delta.contains("delta_spec.id"));
+	assert!(paired.contains("point_unit.delta_unit.as_deref()"));
+	assert!(paired.contains("LogicalTypeResolver::with_registry(logical_types)"));
+	assert!(paired.contains("spec_by_name(delta_name)"));
+	assert!(paired.contains("validate_declared_delta_unit(point, &delta)"));
+}
+
+#[test]
+pub(crate) fn adr172_point_plus_delta_preserves_point_identity() {
+	let binder = binder_source();
+	let point_delta = source_block(&binder, "fn bind_point_delta_quantity_arithmetic");
+	let require = source_block(&binder, "fn require_declared_delta_unit");
+	let validate = source_block(&binder, "fn validate_declared_delta_unit");
+
+	assert!(point_delta.contains("(true, false, BoundBinaryOp::Add | BoundBinaryOp::Sub)"));
+	assert!(point_delta.contains("require_declared_delta_unit(left_spec, right_spec"));
+	assert!(point_delta.contains("left_spec.id"));
+	assert!(point_delta.contains("(false, true, BoundBinaryOp::Add)"));
+	assert!(point_delta.contains("require_declared_delta_unit(right_spec, left_spec"));
+	assert!(point_delta.contains("right_spec.id"));
+	assert!(point_delta.contains("delta minus point is not supported"));
+	assert!(require.contains("paired.id != delta.id"));
+	assert!(validate.contains("!is_delta_quantity(delta)"));
+	assert!(validate.contains("point_unit.dimension != delta_unit.dimension"));
+	assert!(validate.contains("point_unit.scale_to_base != delta_unit.scale_to_base"));
+}
+
+#[test]
+pub(crate) fn adr172_avg_of_points_preserved_sum_still_rejects() {
 	let binder = binder_source();
 	let additive = source_block(&binder, "fn additive_unit_aggregate_logical_type");
 	let point = additive
 		.find("UnitQuantityKind::Point")
-		.expect("point aggregate fence");
-	let preserve = additive
-		.find("input_type == output_type")
-		.expect("unit preserve check");
+		.expect("point aggregate branch");
+	let avg = additive
+		.find("matches!(call.function, AggregateFunction::Avg)")
+		.expect("AVG point branch");
+	let reject = additive
+		.find("return Err(point_arithmetic_error(&spec, aggregate_name));")
+		.expect("SUM point reject");
 
-	assert!(point < preserve);
+	assert!(point < avg);
+	assert!(avg < reject);
+	assert!(additive.contains("if input_type == output_type && spec.physical == *output_type"));
+	assert!(additive.contains("return Ok(logical_type)"));
 	assert!(additive.contains("point_arithmetic_error"));
+}
+
+#[test]
+pub(crate) fn adr172_point_scaling_and_point_plus_point_reject() {
+	let binder = binder_source();
+	let point_delta = source_block(&binder, "fn bind_point_delta_quantity_arithmetic");
+
+	assert!(point_delta.contains("(true, true, BoundBinaryOp::Add)"));
+	assert!(point_delta.contains("\"point + point\""));
+	assert!(point_delta.contains("BoundBinaryOp::Mul | BoundBinaryOp::Div"));
+	assert!(point_delta.contains("point_arithmetic_error"));
+}
+
+#[test]
+pub(crate) fn adr172_delta_unit_pairing_validated_at_create() {
+	let sql = sql_planner_source();
+	let wendelon = wendelon_compute_source();
+	let parse = source_block(&sql, "fn parse_create_logical_type_clauses");
+	let create = source_block(&wendelon, "pub fn create");
+	let pairing = source_block(&wendelon, "fn validate_delta_unit_pairing");
+
+	assert!(parse.contains("\"DELTA_UNIT\""));
+	assert!(parse.contains("quantity_kind != UnitQuantityKind::Point"));
+	assert!(parse.contains("validate_sql_logical_type_name("));
+	assert!(create.contains("self.validate_delta_unit_pairing(tenant_id, &create)?"));
+	assert!(pairing.contains("self.get_by_name(tenant_id, delta_unit_name)"));
+	assert!(pairing.contains("UnitQuantityKind::Delta"));
+	assert!(pairing.contains("delta_unit.dimension != point_unit.dimension"));
+	assert!(pairing.contains("delta_unit.scale_to_base != point_unit.scale_to_base"));
+}
+
+#[test]
+pub(crate) fn adr172_delta_unit_is_direct_shape_change_no_legacy_default() {
+	let wendelon = wendelon_compute_source();
+	let wendelon_tests = std::fs::read_to_string(
+		wendelon_manifest_dir().join("tests/compute_integration_contract.rs"),
+	)
+	.expect("read Wendelon compute integration tests");
+	let unit = source_block(&wendelon, "pub struct LogicalTypeUnit");
+
+	assert!(unit.contains("pub delta_unit: Option<String>"));
+	assert!(!unit.contains("serde(default)"));
+	for forbidden in [
+		"LegacyLogicalTypeUnit",
+		"LegacyLogicalTypeDefinition",
+		"WithoutDeltaUnit",
+		"old-shape",
+		"old shape",
+	] {
+		assert!(!wendelon.contains(forbidden));
+		assert!(!wendelon_tests.contains(forbidden));
+	}
+}
+
+#[test]
+pub(crate) fn adr172_no_runtime_storage_or_descriptor_surface() {
+	let exec = exec_source();
+	let pbc = pbc_source();
+	let storage = storage_source();
+	let catalog = catalog_source();
+	let table = wendelon_table_source();
+	let raft = wendelon_raft_storage_source();
+	let control = wendelon_control_source();
+	let client = wendelon_client_core_source();
+
+	for source in [exec, pbc, storage, catalog, table, raft, control, client] {
+		assert!(!source.contains("delta_unit"));
+		assert!(!source.contains("DELTA_UNIT"));
+	}
+}
+
+#[test]
+pub(crate) fn adr172_point_delta_is_frontend_shared() {
+	let binder = binder_source();
+	let rune = rune_engine_source();
+	let logical = source_block(&binder, "fn bind_logical_arithmetic");
+	let rune_expr = source_block(&rune, "impl RuneExpr");
+
+	assert!(logical.contains("bind_point_delta_arithmetic"));
+	assert!(rune_expr.contains("Expr::Add"));
+	assert!(rune_expr.contains("Expr::Sub"));
+	assert!(rune_expr.contains("Expr::Mul"));
+	assert!(rune_expr.contains("Expr::Div"));
+	assert!(!rune.contains("UnitQuantityKind"));
+	assert!(!rune.contains("point/delta quantity algebra"));
 }
 
 #[test]

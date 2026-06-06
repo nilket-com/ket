@@ -744,6 +744,7 @@ fn parse_create_logical_type_clauses(
 		rest = after_offset_value.trim();
 	}
 	let mut quantity_kind = UnitQuantityKind::Delta;
+	let mut delta_unit = None;
 	if let Some((kind, after_kind)) = take_sql_word(rest) {
 		if kind.eq_ignore_ascii_case("POINT") {
 			quantity_kind = UnitQuantityKind::Point;
@@ -752,6 +753,21 @@ fn parse_create_logical_type_clauses(
 			quantity_kind = UnitQuantityKind::Delta;
 			rest = after_kind.trim();
 		}
+	}
+	if let Some(after_delta_unit) = strip_sql_keyword_prefix(rest, "DELTA_UNIT") {
+		if quantity_kind != UnitQuantityKind::Point {
+			return Err(unsupported("CREATE LOGICAL TYPE DELTA_UNIT requires POINT"));
+		}
+		let Some((delta_unit_name, after_delta_unit_name)) = take_sql_word(after_delta_unit) else {
+			return Err(unsupported(
+				"CREATE LOGICAL TYPE DELTA_UNIT requires an unquoted logical type identifier",
+			));
+		};
+		delta_unit = Some(validate_sql_logical_type_name(
+			"CREATE LOGICAL TYPE DELTA_UNIT",
+			delta_unit_name,
+		)?);
+		rest = after_delta_unit_name.trim();
 	}
 	if offset_explicit && !offset_to_base.is_zero() && quantity_kind == UnitQuantityKind::Delta {
 		return Err(unsupported(
@@ -763,6 +779,7 @@ fn parse_create_logical_type_clauses(
 		scale_to_base,
 		quantity_kind,
 		offset_to_base,
+		delta_unit,
 	};
 	let refinement = parse_create_logical_type_refinement_clause(rest.trim(), physical)?;
 	Ok((Some(unit), refinement))

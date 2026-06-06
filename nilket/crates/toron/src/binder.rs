@@ -9396,6 +9396,19 @@ fn bind_logical_arithmetic(
 			arithmetic_symbol(op),
 		));
 	}
+	if domain_is_point(&left_domain) || domain_is_point(&right_domain) {
+		return bind_point_delta_arithmetic(
+			builder,
+			ctx,
+			op,
+			left,
+			right,
+			left_type,
+			right_type,
+			&left_domain,
+			&right_domain,
+		);
+	}
 	if let LogicalArithmeticDomain::Quantity(spec) = &left_domain
 		&& quantity_kind_for_spec(spec) == Some(UnitQuantityKind::Point)
 	{
@@ -9435,6 +9448,111 @@ fn bind_logical_arithmetic(
 		(LogicalArithmeticDomain::Identity(_), _) | (_, LogicalArithmeticDomain::Identity(_)) => {
 			unreachable!("identity operands handled before operator-specific arithmetic")
 		}
+	}
+}
+
+fn bind_point_delta_arithmetic(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	op: &BoundBinaryOp,
+	left: BoundExprId,
+	right: BoundExprId,
+	left_type: &DataType,
+	right_type: &DataType,
+	left_domain: &LogicalArithmeticDomain,
+	right_domain: &LogicalArithmeticDomain,
+) -> Result<Option<BoundExprId>, BindingError> {
+	match (left_domain, right_domain) {
+		(
+			LogicalArithmeticDomain::Quantity(left_spec),
+			LogicalArithmeticDomain::Quantity(right_spec),
+		) => bind_point_delta_quantity_arithmetic(
+			builder, ctx, op, left, right, left_type, right_type, left_spec, right_spec,
+		),
+		(LogicalArithmeticDomain::Quantity(spec), LogicalArithmeticDomain::Naked)
+		| (LogicalArithmeticDomain::Naked, LogicalArithmeticDomain::Quantity(spec))
+			if is_point_quantity(spec) =>
+		{
+			Err(point_arithmetic_error(spec, arithmetic_symbol(op)))
+		}
+		_ => Ok(None),
+	}
+}
+
+fn bind_point_delta_quantity_arithmetic(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	op: &BoundBinaryOp,
+	left: BoundExprId,
+	right: BoundExprId,
+	left_type: &DataType,
+	right_type: &DataType,
+	left_spec: &LogicalTypeSpec,
+	right_spec: &LogicalTypeSpec,
+) -> Result<Option<BoundExprId>, BindingError> {
+	let left_is_point = is_point_quantity(left_spec);
+	let right_is_point = is_point_quantity(right_spec);
+	if !left_is_point && !right_is_point {
+		return Ok(None);
+	}
+	match (left_is_point, right_is_point, op) {
+		(true, true, BoundBinaryOp::Sub) => {
+			if left_spec.id != right_spec.id {
+				return Err(unit_type_mismatch(format!(
+					"point subtraction requires both operands to be the same point unit; CONVERT explicitly before subtracting {} and {}",
+					left_spec.name, right_spec.name
+				)));
+			}
+			let delta_spec = paired_delta_spec(left_spec, ctx.logical_type_registry)?;
+			Ok(Some(append_dimensioned_arithmetic(
+				builder,
+				BoundBinaryOp::Sub,
+				left,
+				right,
+				left_type,
+				right_type,
+				delta_spec.id,
+			)?))
+		}
+		(true, true, BoundBinaryOp::Add) => Err(point_arithmetic_error(left_spec, "point + point")),
+		(true, false, BoundBinaryOp::Add | BoundBinaryOp::Sub) => {
+			require_declared_delta_unit(left_spec, right_spec, ctx.logical_type_registry)?;
+			Ok(Some(append_dimensioned_arithmetic(
+				builder,
+				op.clone(),
+				left,
+				right,
+				left_type,
+				right_type,
+				left_spec.id,
+			)?))
+		}
+		(false, true, BoundBinaryOp::Add) => {
+			require_declared_delta_unit(right_spec, left_spec, ctx.logical_type_registry)?;
+			Ok(Some(append_dimensioned_arithmetic(
+				builder,
+				BoundBinaryOp::Add,
+				left,
+				right,
+				left_type,
+				right_type,
+				right_spec.id,
+			)?))
+		}
+		(false, true, BoundBinaryOp::Sub) => Err(unit_type_mismatch(format!(
+			"delta minus point is not supported; subtract a declared delta unit from point {} instead",
+			right_spec.name
+		))),
+		(true, _, BoundBinaryOp::Mul | BoundBinaryOp::Div)
+		| (_, true, BoundBinaryOp::Mul | BoundBinaryOp::Div) => Err(point_arithmetic_error(
+			if left_is_point { left_spec } else { right_spec },
+			arithmetic_symbol(op),
+		)),
+		(true, _, _) | (_, true, _) => Err(point_arithmetic_error(
+			if left_is_point { left_spec } else { right_spec },
+			arithmetic_symbol(op),
+		)),
+		(false, false, _) => Ok(None),
 	}
 }
 
@@ -9670,14 +9788,111 @@ fn unit_type_mismatch(message: impl Into<String>) -> BindingError {
 	}
 }
 
+fn domain_is_point(domain: &LogicalArithmeticDomain) -> bool {
+	match domain {
+		LogicalArithmeticDomain::Quantity(spec) => is_point_quantity(spec),
+		LogicalArithmeticDomain::Naked | LogicalArithmeticDomain::Identity(_) => false,
+	}
+}
+
 fn quantity_kind_for_spec(spec: &LogicalTypeSpec) -> Option<UnitQuantityKind> {
 	spec.unit.as_ref().map(|unit| unit.quantity_kind)
+}
+
+fn is_point_quantity(spec: &LogicalTypeSpec) -> bool {
+	quantity_kind_for_spec(spec) == Some(UnitQuantityKind::Point)
+}
+
+fn is_delta_quantity(spec: &LogicalTypeSpec) -> bool {
+	quantity_kind_for_spec(spec) == Some(UnitQuantityKind::Delta)
+}
+
+fn paired_delta_spec(
+	point: &LogicalTypeSpec,
+	logical_types: &LogicalTypeRegistry,
+) -> Result<LogicalTypeSpec, BindingError> {
+	let Some(point_unit) = point.unit.as_ref() else {
+		return Err(unit_type_mismatch(format!(
+			"point type {} is not dimensioned",
+			point.name
+		)));
+	};
+	let Some(delta_name) = point_unit.delta_unit.as_deref() else {
+		return Err(unit_type_mismatch(format!(
+			"point type {} has no declared delta unit",
+			point.name
+		)));
+	};
+	let delta = LogicalTypeResolver::with_registry(logical_types)
+		.spec_by_name(delta_name)
+		.ok_or_else(|| {
+			unit_type_mismatch(format!(
+				"declared delta unit {delta_name} for point type {} was not found",
+				point.name
+			))
+		})?;
+	validate_declared_delta_unit(point, &delta)?;
+	Ok(delta)
+}
+
+fn require_declared_delta_unit(
+	point: &LogicalTypeSpec,
+	delta: &LogicalTypeSpec,
+	logical_types: &LogicalTypeRegistry,
+) -> Result<(), BindingError> {
+	let paired = paired_delta_spec(point, logical_types)?;
+	if paired.id != delta.id {
+		return Err(unit_type_mismatch(format!(
+			"delta unit {} is not the declared delta unit for point type {}; CONVERT explicitly",
+			delta.name, point.name
+		)));
+	}
+	Ok(())
+}
+
+fn validate_declared_delta_unit(
+	point: &LogicalTypeSpec,
+	delta: &LogicalTypeSpec,
+) -> Result<(), BindingError> {
+	if !is_delta_quantity(delta) {
+		return Err(unit_type_mismatch(format!(
+			"declared delta unit {} for point type {} must be a Delta unit",
+			delta.name, point.name
+		)));
+	}
+	if point.physical != delta.physical {
+		return Err(unit_type_mismatch(format!(
+			"declared delta unit {} physical type must match point type {}",
+			delta.name, point.name
+		)));
+	}
+	let point_unit = point
+		.unit
+		.as_ref()
+		.expect("caller validates point quantity");
+	let delta_unit = delta
+		.unit
+		.as_ref()
+		.expect("delta quantity has unit metadata");
+	if point_unit.dimension != delta_unit.dimension {
+		return Err(unit_type_mismatch(format!(
+			"declared delta unit {} dimension must match point type {}",
+			delta.name, point.name
+		)));
+	}
+	if point_unit.scale_to_base != delta_unit.scale_to_base {
+		return Err(unit_type_mismatch(format!(
+			"declared delta unit {} scale must match point type {}",
+			delta.name, point.name
+		)));
+	}
+	Ok(())
 }
 
 fn point_arithmetic_error(spec: &LogicalTypeSpec, context: &str) -> BindingError {
 	BindingError::TypeMismatch {
 		message: format!(
-			"point quantity {} does not support arithmetic for {context}; point/delta quantity algebra is deferred, use an explicit primitive CAST for raw math",
+			"point quantity {} does not support arithmetic for {context}; point/delta quantity algebra allows only operations with the declared delta unit, use an explicit primitive CAST for raw math",
 			spec.name
 		),
 	}
@@ -10798,6 +11013,15 @@ fn additive_unit_aggregate_logical_type(
 		)),
 		LogicalArithmeticDomain::Quantity(spec) => {
 			if quantity_kind_for_spec(&spec) == Some(UnitQuantityKind::Point) {
+				if matches!(call.function, AggregateFunction::Avg) {
+					let Some(input_type) = call.args.root_type(0) else {
+						return Ok(LogicalTypeId::NAKED);
+					};
+					if input_type == output_type && spec.physical == *output_type {
+						return Ok(logical_type);
+					}
+					return Ok(LogicalTypeId::NAKED);
+				}
 				return Err(point_arithmetic_error(&spec, aggregate_name));
 			}
 			let Some(input_type) = call.args.root_type(0) else {
