@@ -66,7 +66,7 @@ pub(crate) fn adr173_converted_pushdown_is_metadata_authenticated() {
 pub(crate) fn adr173_converted_pushdown_keeps_original_residual_exact() {
 	let binder = source("src/binder.rs");
 	let pushdown_plan = first_block(&binder, "fn predicate_pushdown_plan");
-	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let partitioner = first_block(&binder, "fn partition_bound_predicate");
 
 	assert!(pushdown_plan.contains("residual_predicate.or(Some(predicate))"));

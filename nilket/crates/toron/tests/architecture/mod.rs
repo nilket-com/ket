@@ -1,4 +1,5 @@
 pub(crate) mod converted_predicate_pushdown;
+pub(crate) mod cockpit;
 pub(crate) mod core_invariants;
 pub(crate) mod distributed_execution;
 pub(crate) mod heavy_hitter;

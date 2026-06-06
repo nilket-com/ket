@@ -478,14 +478,21 @@ async fn rune_explain_broadcast_join_yields_decision_rows() {
 	};
 	let batches = run_logical(&logical).await;
 
-	assert_eq!(int64_column_rows(&batches, 0), vec![Some(0)]);
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![Some("join".to_string())]
+	);
 	assert_eq!(
 		string_column_rows(&batches, 1),
+		vec![Some("join[0]".to_string())]
+	);
+	assert_eq!(
+		string_column_rows(&batches, 2),
 		vec![Some("broadcast".to_string())]
 	);
 	assert_eq!(
 		string_column_rows(&batches, 3),
-		vec![Some("pinned_by_author".to_string())]
+		vec![Some("natural:pinned_by_author".to_string())]
 	);
 }
 
@@ -515,6 +522,36 @@ async fn sql_explain_matches_rune_explain_rows() {
 	assert_eq!(
 		explain_rows_for_assertion(&run_logical(&sql).await),
 		explain_rows_for_assertion(&run_logical(&rune).await)
+	);
+}
+
+#[tokio::test]
+async fn rune_explain_renders_scan_filter_receipts() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .filter(col("amount").gt(lit(10)))
+               .explain()
+        }
+    "#,
+	)
+	.await
+	.expect("Rune explain scan filter");
+
+	let batches = run_logical(&logical).await;
+
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![Some("scan_filter".to_string())]
+	);
+	assert_eq!(
+		string_column_rows(&batches, 1),
+		vec![Some("scan[0] table_id=1".to_string())]
+	);
+	assert_eq!(
+		string_column_rows(&batches, 2),
+		vec![Some("fully_pushed".to_string())]
 	);
 }
 

@@ -123,12 +123,11 @@ pub(crate) fn adr157_public_explain_surface_stays_closed() {
 	let explain_schema = source_block(&binder, "fn optimizer_explain_schema");
 	let explain_plan = source_block(&binder, "fn optimizer_explain_plan");
 
-	assert!(explain_schema.contains("\"join_index\""));
-	assert!(explain_schema.contains("\"strategy\""));
-	assert!(explain_schema.contains("\"reason\""));
+	assert!(explain_schema.contains("\"decision_kind\""));
+	assert!(explain_schema.contains("\"outcome\""));
+	assert!(explain_schema.contains("\"detail\""));
 	for forbidden in [
 		"filter_index",
-		"estimated_rows",
 		"actual_rows",
 		"range_skew",
 		"uniform_estimate",
@@ -146,6 +145,7 @@ pub(crate) fn adr157_public_explain_surface_stays_closed() {
 		);
 	}
 	assert!(explain_plan.contains("join_decisions"));
+	assert!(explain_plan.contains("scan_filter_decisions"));
 	assert!(!explain_plan.contains("filter_estimates"));
 }
 
@@ -231,14 +231,12 @@ pub(crate) fn adr154_no_public_filter_explain_surface() {
 	let explain_schema = source_block(&binder, "fn optimizer_explain_schema");
 	let explain_plan = source_block(&binder, "fn optimizer_explain_plan");
 
-	assert!(explain_schema.contains("\"join_index\""));
-	assert!(explain_schema.contains("\"strategy\""));
-	assert!(explain_schema.contains("\"reason\""));
+	assert!(explain_schema.contains("\"decision_kind\""));
+	assert!(explain_schema.contains("\"outcome\""));
+	assert!(explain_schema.contains("\"detail\""));
 	for forbidden in [
 		"filter_index",
-		"estimated_rows",
 		"actual_rows",
-		"ndv",
 		"hot_key",
 		"skew",
 	] {
@@ -248,6 +246,7 @@ pub(crate) fn adr154_no_public_filter_explain_surface() {
 		);
 	}
 	assert!(explain_plan.contains("join_decisions"));
+	assert!(explain_plan.contains("scan_filter_decisions"));
 	assert!(!explain_plan.contains("filter_estimates"));
 }
 

@@ -488,13 +488,17 @@ pub(crate) fn adr134_schema_labels_are_stable_not_debug() {
 	let binder = binder_source();
 	let schema = source_block(&binder, "fn optimizer_explain_schema");
 	let row = source_block(&binder, "fn optimizer_explain_row");
+	let scan_row = source_block(&binder, "fn optimizer_explain_scan_filter_row");
+	let join_detail = source_block(&binder, "fn join_strategy_decision_detail_label");
 
 	for label in [
-		"join_index",
-		"strategy",
-		"placement",
-		"reason",
-		"reason_detail",
+		"decision_kind",
+		"target",
+		"outcome",
+		"detail",
+		"estimated_rows",
+		"spent_fact",
+		"spent_column",
 		"build_side",
 		"build_bytes",
 		"threshold_bytes",
@@ -514,11 +518,15 @@ pub(crate) fn adr134_schema_labels_are_stable_not_debug() {
 		);
 	}
 	assert!(row.contains("join_strategy_label"));
-	assert!(row.contains("join_physical_placement_label"));
-	assert!(row.contains("join_strategy_decision_reason_label"));
+	assert!(row.contains("join_strategy_decision_detail_label"));
+	assert!(join_detail.contains("join_physical_placement_label"));
+	assert!(join_detail.contains("join_strategy_decision_reason_label"));
+	assert!(scan_row.contains("scan_filter_outcome_label"));
+	assert!(scan_row.contains("spent_fact_label"));
 	assert!(!row.contains("Debug"));
 	assert!(!row.contains("{:?}"));
-	assert!(schema.contains("Field::new(\"join_index\", DataType::Int64, false)"));
+	assert!(schema.contains("Field::new(\"decision_kind\", DataType::Utf8, false)"));
+	assert!(schema.contains("Field::new(\"estimated_rows\", DataType::Int64, true)"));
 }
 
 #[test]

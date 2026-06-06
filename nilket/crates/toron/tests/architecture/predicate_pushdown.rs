@@ -717,7 +717,7 @@ pub(crate) fn adr075_partial_pushdown_covers_select_update_delete_scan_sites() {
 		.nth(1)
 		.and_then(|rest| rest.split("LogicalPlan::Project").next())
 		.expect("Filter bind arm");
-	assert!(filter_arm.contains("plan_filter_with_predicate_pushdown("));
+	assert!(filter_arm.contains("plan_filter_with_predicate_pushdown_evidence("));
 	assert!(filter_arm.contains("input.plan"));
 	assert!(filter_arm.contains("bound_predicate"));
 	assert!(filter_arm.contains("&logical_types"));
@@ -1014,7 +1014,7 @@ pub(crate) fn adr078_select_update_delete_share_boolean_factoring_path() {
 		.nth(1)
 		.and_then(|rest| rest.split("LogicalPlan::Project").next())
 		.expect("Filter bind arm");
-	assert!(filter_arm.contains("plan_filter_with_predicate_pushdown("));
+	assert!(filter_arm.contains("plan_filter_with_predicate_pushdown_evidence("));
 	assert!(filter_arm.contains("input.plan"));
 	assert!(filter_arm.contains("bound_predicate"));
 	assert!(filter_arm.contains("&logical_types"));
@@ -1360,7 +1360,7 @@ pub(crate) fn adr095_empty_relation_is_execution_plan_only() {
 #[test]
 pub(crate) fn adr095_filter_elision_runs_before_pbc_pushdown() {
 	let binder = source("src/binder.rs");
-	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let classifier = filter_helper
 		.find("static_filter_class(&input, &original_predicate, logical_types)")
 		.expect("static classifier call");
@@ -1467,7 +1467,7 @@ pub(crate) fn adr095_no_sql_pbc_wendelon_storage_surface() {
 #[test]
 pub(crate) fn adr097_refinement_elision_uses_durable_registry_not_seed() {
 	let binder = source("src/binder.rs");
-	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
 	let refinement_helper = first_block(&binder, "fn refinement_static_filter_class");
 
@@ -1517,7 +1517,7 @@ pub(crate) fn adr097_refinement_elision_reuses_095_empty_relation() {
 	let binder = source("src/binder.rs");
 	let execution = source("src/ir/execution.rs");
 	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
-	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 
 	assert!(filter_helper.contains("ExecutionPlan::EmptyRelation"));
 	assert!(execution_plan.contains("CreateLogicalType"));
@@ -1633,7 +1633,7 @@ pub(crate) fn adr098_and_decomposition_inherits_097_durable_registry_and_scan_pr
 #[test]
 pub(crate) fn adr098_and_elision_reuses_095_empty_relation_no_alwayspass() {
 	let binder = source("src/binder.rs");
-	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown");
+	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 
 	assert!(filter_helper.contains("ExecutionPlan::EmptyRelation"));
