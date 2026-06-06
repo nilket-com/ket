@@ -712,7 +712,7 @@ impl<'a> Binder<'a> {
 					}
 					let logical_types = self.catalog.logical_type_registry();
 					let output_schema =
-						aggregate_schema(&group_expr, &bound_aggr_expr, &logical_types);
+						aggregate_schema(&group_expr, &bound_aggr_expr, &logical_types)?;
 					let scope = input.scope.aggregate(&group_expr, &output_schema);
 
 					Ok(ScopedExecutionPlan::new_with_facts(
@@ -7366,7 +7366,7 @@ fn optimize_for_required(
 					})
 				})
 				.collect::<Result<Vec<_>, BindingError>>()?;
-			let output_schema = aggregate_schema(&group_expr, &aggr_expr, logical_types);
+			let output_schema = aggregate_schema(&group_expr, &aggr_expr, logical_types)?;
 			let output_remap = ordinal_remap(
 				&output_columns(output_schema.fields().len())
 					.iter()
@@ -9180,6 +9180,9 @@ fn bind_arithmetic(
 				.node_type(right)
 				.cloned()
 				.expect("builder returns typed right node");
+			if matches!(op, BoundBinaryOp::Add) {
+				reject_logical_addition_with_untyped_null(builder, ctx, right)?;
+			}
 			let output_type =
 				arithmetic_output_type(&right_type, &right_type).ok_or_else(|| {
 					BindingError::TypeMismatch {
@@ -9198,6 +9201,9 @@ fn bind_arithmetic(
 				.node_type(left)
 				.cloned()
 				.expect("builder returns typed left node");
+			if matches!(op, BoundBinaryOp::Add) {
+				reject_logical_addition_with_untyped_null(builder, ctx, left)?;
+			}
 			let output_type = arithmetic_output_type(&left_type, &left_type).ok_or_else(|| {
 				BindingError::TypeMismatch {
 					message: format!(
@@ -9262,6 +9268,12 @@ fn bind_arithmetic(
 		}
 		return Ok(builder.append_binary(op, left, right, output_type));
 	}
+	if matches!(op, BoundBinaryOp::Add)
+		&& let Some(output) =
+			bind_logical_addition(builder, ctx, left, right, &left_type, &right_type)?
+	{
+		return Ok(output);
+	}
 	if let Some(output) =
 		bind_dimensioned_arithmetic(builder, ctx, left, right, &left_type, &right_type, &op)?
 	{
@@ -9278,6 +9290,98 @@ fn bind_arithmetic(
 	let left = cast_if_needed(builder, left, &output_type)?;
 	let right = cast_if_needed(builder, right, &output_type)?;
 	Ok(builder.append_binary(op, left, right, output_type))
+}
+
+enum AdditiveLogicalDomain {
+	Naked,
+	Quantity(LogicalTypeSpec),
+	Identity(LogicalTypeSpec),
+}
+
+fn additive_logical_domain_for_node(
+	ctx: &ExprBindContext<'_>,
+	builder: &BoundExprProgramBuilder,
+	id: BoundExprId,
+) -> Result<AdditiveLogicalDomain, BindingError> {
+	let logical_type = builder
+		.node_logical_type(id)
+		.expect("builder returns logical type for additive domain lookup");
+	additive_logical_domain_for_type(logical_type, ctx.logical_type_registry)
+}
+
+fn additive_logical_domain_for_type(
+	logical_type: LogicalTypeId,
+	logical_types: &LogicalTypeRegistry,
+) -> Result<AdditiveLogicalDomain, BindingError> {
+	if logical_type.is_naked() {
+		return Ok(AdditiveLogicalDomain::Naked);
+	}
+	let spec = LogicalTypeResolver::with_registry(logical_types)
+		.spec(logical_type)
+		.ok_or_else(|| BindingError::UnsupportedExpression {
+			message: format!("unknown logical type {}", logical_type_name(logical_type)),
+		})?;
+	if spec.unit.is_some() {
+		Ok(AdditiveLogicalDomain::Quantity(spec))
+	} else {
+		Ok(AdditiveLogicalDomain::Identity(spec))
+	}
+}
+
+fn bind_logical_addition(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	left: BoundExprId,
+	right: BoundExprId,
+	left_type: &DataType,
+	right_type: &DataType,
+) -> Result<Option<BoundExprId>, BindingError> {
+	let left_logical = builder
+		.node_logical_type(left)
+		.expect("builder returns logical type for addition left");
+	let left_domain = additive_logical_domain_for_node(ctx, builder, left)?;
+	let right_domain = additive_logical_domain_for_node(ctx, builder, right)?;
+	match (left_domain, right_domain) {
+		(AdditiveLogicalDomain::Naked, AdditiveLogicalDomain::Naked) => Ok(None),
+		(
+			AdditiveLogicalDomain::Quantity(left_unit),
+			AdditiveLogicalDomain::Quantity(right_unit),
+		) => {
+			require_compatible_units(&left_unit, &right_unit)?;
+			Ok(Some(append_dimensioned_arithmetic(
+				builder,
+				BoundBinaryOp::Add,
+				left,
+				right,
+				left_type,
+				right_type,
+				left_logical,
+			)?))
+		}
+		(AdditiveLogicalDomain::Quantity(_), AdditiveLogicalDomain::Naked)
+		| (AdditiveLogicalDomain::Naked, AdditiveLogicalDomain::Quantity(_)) => Err(unit_type_mismatch(
+			"unit arithmetic requires both operands to be the same unit; CONVERT explicitly before combining with a scalar",
+		)),
+		(AdditiveLogicalDomain::Identity(spec), _) | (_, AdditiveLogicalDomain::Identity(spec)) => {
+			Err(non_additive_logical_type_error(&spec.name, "+"))
+		}
+	}
+}
+
+fn reject_logical_addition_with_untyped_null(
+	builder: &BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	typed_operand: BoundExprId,
+) -> Result<(), BindingError> {
+	match additive_logical_domain_for_node(ctx, builder, typed_operand)? {
+		AdditiveLogicalDomain::Naked => Ok(()),
+		AdditiveLogicalDomain::Quantity(_) => Err(unit_type_mismatch(
+			"unit arithmetic requires both operands to be the same unit; CONVERT explicitly before combining with NULL",
+		)),
+		AdditiveLogicalDomain::Identity(spec) => {
+			Err(non_additive_logical_type_error(&spec.name, "+"))
+		}
+	}
 }
 
 fn bind_dimensioned_arithmetic(
@@ -9475,6 +9579,14 @@ fn require_compatible_units(
 fn unit_type_mismatch(message: impl Into<String>) -> BindingError {
 	BindingError::TypeMismatch {
 		message: message.into(),
+	}
+}
+
+fn non_additive_logical_type_error(type_name: &str, context: &str) -> BindingError {
+	BindingError::TypeMismatch {
+		message: format!(
+			"logical type {type_name} is not an additive quantity for {context}; use an explicit primitive CAST to perform raw numeric arithmetic"
+		),
 	}
 }
 
@@ -10422,7 +10534,7 @@ fn aggregate_schema(
 	group_expr: &BoundExprProgram,
 	aggr_expr: &[BoundAggregateCall],
 	logical_types: &LogicalTypeRegistry,
-) -> SchemaRef {
+) -> Result<SchemaRef, BindingError> {
 	let mut fields = Vec::new();
 	let group_schema = schema_for_exprs(group_expr);
 	fields.extend(
@@ -10432,9 +10544,9 @@ fn aggregate_schema(
 			.map(|field| field.as_ref().clone()),
 	);
 	for call in aggr_expr {
-		fields.push(aggregate_field(call, logical_types));
+		fields.push(aggregate_field(call, logical_types)?);
 	}
-	Arc::new(Schema::new(fields))
+	Ok(Arc::new(Schema::new(fields)))
 }
 
 fn schema_for_exprs_with_output_names(
@@ -10490,7 +10602,10 @@ fn schema_for_projected_exprs_with_existing_names(
 	Arc::new(Schema::new(fields))
 }
 
-fn aggregate_field(call: &BoundAggregateCall, logical_types: &LogicalTypeRegistry) -> Field {
+fn aggregate_field(
+	call: &BoundAggregateCall,
+	logical_types: &LogicalTypeRegistry,
+) -> Result<Field, BindingError> {
 	let field =
 		aggregate_kernel::stable_output_field(call).unwrap_or_else(|| match call.function {
 			AggregateFunction::LinearRegress => Field::new("linreg", DataType::Float64, true),
@@ -10502,16 +10617,16 @@ fn aggregate_field(call: &BoundAggregateCall, logical_types: &LogicalTypeRegistr
 			| AggregateFunction::Max
 			| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
 		});
-	let logical_type = aggregate_output_logical_type(call, field.data_type(), logical_types);
+	let logical_type = aggregate_output_logical_type(call, field.data_type(), logical_types)?;
 	if logical_type.is_naked() {
-		field
+		Ok(field)
 	} else {
-		field_with_logical_type_metadata(
+		Ok(field_with_logical_type_metadata(
 			field.name().clone(),
 			field.data_type().clone(),
 			field.is_nullable(),
 			logical_type,
-		)
+		))
 	}
 }
 
@@ -10519,19 +10634,19 @@ fn aggregate_output_logical_type(
 	call: &BoundAggregateCall,
 	output_type: &DataType,
 	logical_types: &LogicalTypeRegistry,
-) -> LogicalTypeId {
+) -> Result<LogicalTypeId, BindingError> {
 	match call.function {
 		AggregateFunction::Min | AggregateFunction::Max => {
 			let Some(logical_type) = call.args.root_logical_type(0) else {
-				return LogicalTypeId::NAKED;
+				return Ok(LogicalTypeId::NAKED);
 			};
 			let Some(input_type) = call.args.root_type(0) else {
-				return LogicalTypeId::NAKED;
+				return Ok(LogicalTypeId::NAKED);
 			};
 			if logical_type.is_naked() || input_type != output_type {
-				LogicalTypeId::NAKED
+				Ok(LogicalTypeId::NAKED)
 			} else {
-				logical_type
+				Ok(logical_type)
 			}
 		}
 		AggregateFunction::Sum | AggregateFunction::Avg => {
@@ -10540,7 +10655,7 @@ fn aggregate_output_logical_type(
 		AggregateFunction::CountAll
 		| AggregateFunction::Count
 		| AggregateFunction::LinearRegress
-		| AggregateFunction::ApproxQuantile(_) => LogicalTypeId::NAKED,
+		| AggregateFunction::ApproxQuantile(_) => Ok(LogicalTypeId::NAKED),
 	}
 }
 
@@ -10548,23 +10663,30 @@ fn additive_unit_aggregate_logical_type(
 	call: &BoundAggregateCall,
 	output_type: &DataType,
 	logical_types: &LogicalTypeRegistry,
-) -> LogicalTypeId {
+) -> Result<LogicalTypeId, BindingError> {
 	let Some(logical_type) = call.args.root_logical_type(0) else {
-		return LogicalTypeId::NAKED;
+		return Ok(LogicalTypeId::NAKED);
 	};
-	let Some(input_type) = call.args.root_type(0) else {
-		return LogicalTypeId::NAKED;
+	let aggregate_name = match call.function {
+		AggregateFunction::Sum => "SUM",
+		AggregateFunction::Avg => "AVG",
+		_ => unreachable!("additive helper is only used by SUM/AVG"),
 	};
-	if logical_type.is_naked() || input_type != output_type {
-		return LogicalTypeId::NAKED;
-	}
-	let Some(spec) = LogicalTypeResolver::with_registry(logical_types).spec(logical_type) else {
-		return LogicalTypeId::NAKED;
-	};
-	if spec.unit.is_some() && spec.physical == *output_type {
-		logical_type
-	} else {
-		LogicalTypeId::NAKED
+	match additive_logical_domain_for_type(logical_type, logical_types)? {
+		AdditiveLogicalDomain::Naked => Ok(LogicalTypeId::NAKED),
+		AdditiveLogicalDomain::Identity(spec) => {
+			Err(non_additive_logical_type_error(&spec.name, aggregate_name))
+		}
+		AdditiveLogicalDomain::Quantity(spec) => {
+			let Some(input_type) = call.args.root_type(0) else {
+				return Ok(LogicalTypeId::NAKED);
+			};
+			if input_type == output_type && spec.physical == *output_type {
+				Ok(logical_type)
+			} else {
+				Ok(LogicalTypeId::NAKED)
+			}
+		}
 	}
 }
 

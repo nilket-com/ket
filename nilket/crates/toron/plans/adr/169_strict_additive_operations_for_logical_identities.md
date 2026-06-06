@@ -25,6 +25,11 @@ The current bind path already exposes the seam:
   a unit spec only when `LogicalTypeSpec.unit.is_some()`.
 - A non-unit logical id resolves to a spec with `unit.is_none()`, so it currently
   behaves like "no unit" and can fall through to physical numeric addition.
+- Refinement-only logical types such as
+  `PersonId AS BIGINT CHECK (VALUE > 0)` also have `unit.is_none()`. ADR 169
+  intentionally includes them in the Identity bucket: arithmetic over the
+  carrier is meaningful only after an explicit primitive cast erases the logical
+  receipt.
 - ADR 168's aggregate rule intentionally left `SUM(CustomerId)` and
   `AVG(CustomerId)` naked rather than preserved. That was safe relative to
   identity propagation, but still permits meaningless carrier arithmetic.
@@ -47,7 +52,9 @@ unit metadata through the durable logical-type registry.
 Quantity only when it resolves through
 `LogicalTypeResolver::with_registry(logical_types)` to a spec with
 `unit.is_some()`. A non-naked logical type with `unit.is_none()` is an Identity.
-Do not use seed-only logical type lookup.
+This includes refinement-only logical types: a `CHECK` predicate constrains the
+carrier, but does not make the logical type an additive quantity. Do not use
+seed-only logical type lookup.
 
 **D2 - Binary `+` rejects Identity operands.** If either operand of
 `BoundBinaryOp::Add` is an Identity, bind rejects before physical numeric
@@ -127,6 +134,10 @@ optimizer-fact, or wire change lands in this ADR.
   rejects with dimension mismatch.
 - `naked_numeric_addition_and_sum_stay_unchanged` - ordinary numeric `+`,
   `SUM(raw)`, and `AVG(raw)` still work and remain naked.
+- `refinement_identity_addition_rejects` - a refinement-only logical type such
+  as `PersonId AS BIGINT CHECK (VALUE > 0)` rejects `id + 0`, `id + id`,
+  `SUM(id)`, and `AVG(id)`, while `CAST(id AS BIGINT) + 0` remains the explicit
+  erasure path.
 - `count_and_statistical_aggregates_stay_unchanged` - `COUNT(customer_id)` stays
   naked; experimental/statistical aggregate policy is not widened.
 - `explicit_cast_sum_avg_erasure_stays_valid` -

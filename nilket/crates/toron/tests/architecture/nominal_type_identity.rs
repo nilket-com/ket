@@ -482,13 +482,13 @@ pub(crate) fn adr089_group_keys_preserve_identity_aggregate_outputs_are_adr113_o
 	let aggregate_field = source_block(&binder, "fn aggregate_field");
 
 	assert!(aggregate_schema.contains("schema_for_exprs(group_expr)"));
-	assert!(aggregate_schema.contains("fields.push(aggregate_field(call, logical_types))"));
+	assert!(aggregate_schema.contains("fields.push(aggregate_field(call, logical_types)?)"));
 	assert!(!aggregate_schema.contains("field_with_logical_type_metadata"));
 	assert!(!aggregate_schema.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
 	assert!(!aggregate_field.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
 	assert!(
 		aggregate_field
-			.contains("aggregate_output_logical_type(call, field.data_type(), logical_types)")
+			.contains("aggregate_output_logical_type(call, field.data_type(), logical_types)?")
 	);
 }
 
@@ -501,7 +501,7 @@ pub(crate) fn adr113_min_max_preserve_aggregate_identity() {
 	assert!(aggregate_field.contains("aggregate_kernel::stable_output_field(call)"));
 	assert!(
 		aggregate_field
-			.contains("aggregate_output_logical_type(call, field.data_type(), logical_types)")
+			.contains("aggregate_output_logical_type(call, field.data_type(), logical_types)?")
 	);
 	assert!(aggregate_field.contains("field_with_logical_type_metadata"));
 
@@ -534,20 +534,10 @@ pub(crate) fn adr168_sum_avg_preserve_only_declared_unit_identity() {
 	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
 	assert!(additive.contains("call.args.root_logical_type(0)"));
 	assert!(additive.contains("call.args.root_type(0)"));
-	assert!(additive.contains("input_type != output_type"));
-	assert!(additive.contains("LogicalTypeResolver::with_registry(logical_types)"));
-	assert!(additive.contains("spec.unit.is_some()"));
+	assert!(additive.contains("additive_logical_domain_for_type(logical_type, logical_types)?"));
+	assert!(additive.contains("AdditiveLogicalDomain::Quantity(spec)"));
+	assert!(additive.contains("input_type == output_type"));
 	assert!(additive.contains("spec.physical == *output_type"));
-}
-
-#[test]
-pub(crate) fn adr168_non_unit_nominal_sum_avg_stay_naked() {
-	let binder = binder_source();
-	let additive = source_block(&binder, "fn additive_unit_aggregate_logical_type");
-
-	assert!(additive.contains("if spec.unit.is_some() && spec.physical == *output_type"));
-	assert!(additive.contains("} else {\n\t\tLogicalTypeId::NAKED\n\t}"));
-	assert!(additive.contains("return LogicalTypeId::NAKED"));
 }
 
 #[test]
@@ -572,7 +562,7 @@ pub(crate) fn adr168_aggregate_schema_threads_logical_registry_through_pruning()
 		);
 	}
 	assert!(pushdown.contains("optimize_for_required(plan, None, logical_types)"));
-	assert!(optimize.contains("aggregate_schema(&group_expr, &aggr_expr, logical_types)"));
+	assert!(optimize.contains("aggregate_schema(&group_expr, &aggr_expr, logical_types)?"));
 	assert!(
 		optimize.contains("optimize_for_required(*input, Some(child_required), logical_types)")
 	);
@@ -594,6 +584,131 @@ pub(crate) fn adr168_count_and_statistical_aggregates_stay_naked() {
 			"missing naked aggregate arm for {naked}"
 		);
 	}
+}
+
+#[test]
+pub(crate) fn adr169_addition_gates_logical_identity_before_numeric_fallback() {
+	let binder = binder_source();
+	let arithmetic = source_block(&binder, "fn bind_arithmetic");
+	let logical_add = source_block(&binder, "fn bind_logical_addition");
+	let null_add = source_block(&binder, "fn reject_logical_addition_with_untyped_null");
+	let logical_gate = arithmetic
+		.find("bind_logical_addition")
+		.expect("logical addition gate");
+	let dimensioned_gate = arithmetic
+		.find("bind_dimensioned_arithmetic")
+		.expect("dimensioned arithmetic gate");
+	let numeric_fallback = arithmetic
+		.find("arithmetic_output_type(&left_type, &right_type)")
+		.expect("numeric fallback");
+
+	assert!(logical_gate < dimensioned_gate);
+	assert!(dimensioned_gate < numeric_fallback);
+	assert!(arithmetic.contains("reject_logical_addition_with_untyped_null"));
+	assert!(logical_add.contains("AdditiveLogicalDomain::Identity(spec)"));
+	assert!(logical_add.contains("non_additive_logical_type_error(&spec.name, \"+\")"));
+	assert!(null_add.contains("AdditiveLogicalDomain::Identity(spec)"));
+	assert!(null_add.contains("non_additive_logical_type_error(&spec.name, \"+\")"));
+}
+
+#[test]
+pub(crate) fn adr169_non_unit_logical_identity_is_not_treated_as_naked() {
+	let binder = binder_source();
+	let domain = source_block(&binder, "fn additive_logical_domain_for_type");
+
+	assert!(domain.contains("logical_type.is_naked()"));
+	assert!(domain.contains("LogicalTypeResolver::with_registry(logical_types)"));
+	assert!(domain.contains("spec.unit.is_some()"));
+	assert!(domain.contains("AdditiveLogicalDomain::Quantity(spec)"));
+	assert!(domain.contains("AdditiveLogicalDomain::Identity(spec)"));
+	assert!(!domain.contains("logical_type_spec("));
+}
+
+#[test]
+pub(crate) fn adr169_sum_avg_reject_non_additive_identity() {
+	let binder = binder_source();
+	let output_identity = source_block(&binder, "fn aggregate_output_logical_type");
+	let additive = source_block(&binder, "fn additive_unit_aggregate_logical_type");
+
+	assert!(output_identity.contains("AggregateFunction::Sum | AggregateFunction::Avg"));
+	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
+	assert!(additive.contains("AggregateFunction::Sum => \"SUM\""));
+	assert!(additive.contains("AggregateFunction::Avg => \"AVG\""));
+	assert!(additive.contains("AdditiveLogicalDomain::Identity(spec)"));
+	assert!(additive.contains("non_additive_logical_type_error(&spec.name, aggregate_name)"));
+	assert!(additive.contains("AdditiveLogicalDomain::Quantity(spec)"));
+	assert!(additive.contains("spec.physical == *output_type"));
+}
+
+#[test]
+pub(crate) fn adr169_selection_cardinality_and_comparison_stay_identity_aware() {
+	let binder = binder_source();
+	let comparison = source_block(&binder, "fn bind_comparison");
+	let in_list = source_block(&binder, "fn bind_in_list");
+	let nominal = source_block(&binder, "fn nominal_compatible");
+	let static_filter = source_block(&binder, "fn static_filter_atom_class");
+
+	assert!(comparison.contains("nominal_compatible("));
+	assert!(in_list.contains("nominal_compatible("));
+	assert!(nominal.contains("BindingError::NominalTypeMismatch"));
+	assert!(!comparison.contains("additive_logical_domain"));
+	assert!(!in_list.contains("additive_logical_domain"));
+	assert!(!static_filter.contains("additive_logical_domain"));
+	assert!(!static_filter.contains("non_additive_logical_type_error"));
+}
+
+#[test]
+pub(crate) fn adr169_identity_additive_gate_is_frontend_shared() {
+	let rune = rune_engine_source();
+	let binder = binder_source();
+	let bind_expr = source_block(&binder, "fn bind_expr_into_program");
+	let bind_aggregate = source_block(&binder, "fn bind_aggregate_call(");
+	let bind_stable_aggregate = source_block(&binder, "fn bind_stable_aggregate_call");
+	let arithmetic = source_block(&binder, "fn bind_arithmetic");
+	let aggregate_schema = source_block(&binder, "fn aggregate_schema");
+
+	assert!(rune.contains("expr: Expr::Add(Box::new(self.expr), Box::new(other.expr))"));
+	assert!(rune.contains("expr: Expr::Cast(Box::new(self.expr), target.data_type)"));
+	assert!(rune.contains("Expr::LogicalAscription"));
+	assert!(bind_expr.contains("Expr::Add(left, right)"));
+	assert!(bind_expr.contains("bind_arithmetic"));
+	assert!(bind_aggregate.contains("bind_stable_aggregate_call"));
+	assert!(bind_stable_aggregate.contains("bind_expr_program(args, input_schema, ctx)?"));
+	assert!(arithmetic.contains("bind_logical_addition"));
+	assert!(aggregate_schema.contains("aggregate_field(call, logical_types)?"));
+}
+
+#[test]
+pub(crate) fn adr169_no_runtime_storage_or_wire_surface() {
+	let ir = ir_source();
+	let execution = execution_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+	let storage = storage_source();
+	let wendelon = wendelon_table_source();
+
+	for (name, source) in [
+		("ir.rs", ir.as_str()),
+		("execution.rs", execution.as_str()),
+		("exec.rs", exec.as_str()),
+		("pbc.rs", pbc.as_str()),
+		("storage.rs", storage.as_str()),
+		("wendelon table.rs", wendelon.as_str()),
+	] {
+		assert!(
+			!source.contains("AdditiveLogicalDomain"),
+			"{name} must not expose the binder-only additive discriminator"
+		);
+		assert!(
+			!source.contains("non_additive_logical_type_error"),
+			"{name} must not expose the binder-only additive diagnostic"
+		);
+	}
+	assert!(!execution.contains("NonAdditiveLogicalType"));
+	assert!(!exec.contains("evaluate_logical_addition"));
+	assert!(!pbc.contains("OP_LOGICAL_ADD"));
+	assert!(!storage.contains("NonAdditiveLogicalType"));
+	assert!(!wendelon.contains("AdditiveLogicalDomain"));
 }
 
 #[test]

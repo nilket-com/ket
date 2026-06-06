@@ -48,6 +48,11 @@ Behavior:
 - resolved spec with `unit.is_none()` -> `Identity(spec)`;
 - unresolved non-naked id fails closed with a binding error.
 
+`unit.is_none()` intentionally includes refinement-only logical types such as
+`PersonId AS BIGINT CHECK (VALUE > 0)`. The refinement predicate is still a
+logical receipt; additive carrier arithmetic requires explicit primitive
+erasure first.
+
 Reuse this helper for scalar addition. If it is also useful for aggregates,
 add a sibling helper over `LogicalTypeRegistry` and `LogicalTypeId`:
 
@@ -192,6 +197,11 @@ Supporting:
   - `COUNT(customer_id)` remains naked.
 - `naked_numeric_addition_and_sum_stay_unchanged`
   - raw numeric addition, `SUM(raw)`, and `AVG(raw)` still execute.
+- `refinement_identity_addition_rejects`
+  - `id + 0`, `id + id`, `SUM(id)`, and `AVG(id)` over a refinement-only
+    logical type such as `PersonId AS BIGINT CHECK (VALUE > 0)` reject with the
+    non-additive diagnostic;
+  - `CAST(id AS BIGINT) + 0` remains valid and produces a naked numeric output.
 - `rune_identity_additive_rejects_and_cast_erases`
   - build through the Rune frontend: `customer_id.add(1)`,
     `sum(customer_id)`, and `avg(customer_id)` reject with the non-additive

@@ -1055,7 +1055,7 @@ async fn aggregation_is_type_unit_aware() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
 
-	let sql = "SELECT MIN(customer_id), SUM(distance), SUM(customer_id), COUNT(distance) FROM aggregate_samples";
+	let sql = "SELECT MIN(customer_id), SUM(distance), COUNT(distance) FROM aggregate_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
 	let schema = bound.schema();
 	assert_schema_identity(
@@ -1069,19 +1069,23 @@ async fn aggregation_is_type_unit_aware() {
 		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
 	);
 	assert_schema_identity(schema.as_ref(), 2, LogicalTypeId::NAKED);
-	assert_schema_identity(schema.as_ref(), 3, LogicalTypeId::NAKED);
 
 	let batch = concat_query(&coordinator, &planner, sql).await;
 	assert_eq!(int64_rows(&batch, 0), vec![Some(7)]);
 	assert_eq!(float64_rows(&batch, 1), vec![Some(3.0)]);
-	assert_eq!(int64_rows(&batch, 2), vec![Some(14)]);
-	assert_eq!(int64_rows(&batch, 3), vec![Some(2)]);
+	assert_eq!(int64_rows(&batch, 2), vec![Some(2)]);
 }
 
 #[tokio::test]
-async fn sum_avg_preserve_additive_unit_identity() {
+async fn quantity_addition_and_aggregation_still_work() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let addition_sql = "SELECT distance + distance FROM aggregate_samples";
+	let addition = bind_sql(&catalog, &planner, addition_sql).await;
+	assert_project_identity(addition, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+	let addition = concat_query(&coordinator, &planner, addition_sql).await;
+	assert_eq!(float64_rows(&addition, 0), vec![Some(2.0), Some(4.0)]);
 
 	let sql = "SELECT SUM(distance), AVG(distance) FROM aggregate_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
@@ -1154,7 +1158,7 @@ async fn pruned_sum_unit_identity_matches_full_input_aggregate() {
 	let full = bind_sql(
 		&catalog,
 		&planner,
-		"SELECT SUM(customer_id), SUM(distance), SUM(other_distance), SUM(mass), SUM(raw) FROM aggregate_samples",
+		"SELECT MIN(customer_id), SUM(distance), SUM(other_distance), SUM(mass), SUM(raw) FROM aggregate_samples",
 	)
 	.await;
 	let full_identity =
@@ -1200,21 +1204,105 @@ async fn min_max_preserve_unit_identity() {
 }
 
 #[tokio::test]
-async fn sum_avg_of_non_unit_nominal_identity_are_naked() {
+async fn strict_additive_operations_reject_identity() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
 
-	let sql = "SELECT SUM(customer_id), AVG(customer_id) FROM aggregate_samples";
+	for sql in [
+		"SELECT customer_id + 1 FROM aggregate_samples",
+		"SELECT customer_id + customer_id FROM aggregate_samples",
+		"SELECT customer_id + NULL FROM aggregate_samples",
+		"SELECT NULL + customer_id FROM aggregate_samples",
+		"SELECT SUM(customer_id) FROM aggregate_samples",
+		"SELECT AVG(customer_id) FROM aggregate_samples",
+	] {
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "not an additive quantity")
+			.await;
+	}
+}
+
+#[tokio::test]
+async fn explicit_cast_erases_identity_for_addition() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT CAST(customer_id AS BIGINT) + 1 FROM aggregate_samples";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	assert_project_identity(bound, LogicalTypeId::NAKED);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(int64_rows(&batch, 0), vec![Some(8), Some(8)]);
+}
+
+#[tokio::test]
+async fn explicit_cast_sum_avg_erasure_stays_valid() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let sql = "SELECT SUM(CAST(customer_id AS BIGINT)), AVG(CAST(customer_id AS BIGINT)) FROM aggregate_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
 	let schema = bound.schema();
 	assert_schema_identity(schema.as_ref(), 0, LogicalTypeId::NAKED);
 	assert_schema_identity(schema.as_ref(), 1, LogicalTypeId::NAKED);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(int64_rows(&batch, 0), vec![Some(14)]);
+	assert_eq!(float64_rows(&batch, 1), vec![Some(7.0)]);
 }
 
 #[tokio::test]
-async fn sum_avg_of_naked_input_stay_naked() {
+async fn identity_comparison_and_selection_still_allowed() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let selection_sql = "SELECT customer_id FROM aggregate_samples WHERE customer_id = 7";
+	let selection = bind_sql(&catalog, &planner, selection_sql).await;
+	let schema = selection.schema();
+	assert_schema_identity(
+		schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3),
+	);
+	let batch = concat_query(&coordinator, &planner, selection_sql).await;
+	assert_eq!(int64_rows(&batch, 0), vec![Some(7), Some(7)]);
+
+	let comparison_sql = "SELECT customer_id = customer_id FROM aggregate_samples";
+	let comparison = bind_sql(&catalog, &planner, comparison_sql).await;
+	assert_project_identity(comparison, LogicalTypeId::NAKED);
+	let batch = concat_query(&coordinator, &planner, comparison_sql).await;
+	assert_eq!(bool_rows(&batch, 0), vec![Some(true), Some(true)]);
+
+	let aggregate_sql =
+		"SELECT MIN(customer_id), MAX(customer_id), COUNT(customer_id) FROM aggregate_samples";
+	let aggregate = bind_sql(&catalog, &planner, aggregate_sql).await;
+	let schema = aggregate.schema();
+	assert_schema_identity(
+		schema.as_ref(),
+		0,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3),
+	);
+	assert_schema_identity(
+		schema.as_ref(),
+		1,
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 3),
+	);
+	assert_schema_identity(schema.as_ref(), 2, LogicalTypeId::NAKED);
+	let batch = concat_query(&coordinator, &planner, aggregate_sql).await;
+	assert_eq!(int64_rows(&batch, 0), vec![Some(7)]);
+	assert_eq!(int64_rows(&batch, 1), vec![Some(7)]);
+	assert_eq!(int64_rows(&batch, 2), vec![Some(2)]);
+}
+
+#[tokio::test]
+async fn naked_numeric_addition_and_sum_stay_unchanged() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
+
+	let addition_sql = "SELECT raw + raw FROM aggregate_samples";
+	let addition = bind_sql(&catalog, &planner, addition_sql).await;
+	assert_project_identity(addition, LogicalTypeId::NAKED);
+	let batch = concat_query(&coordinator, &planner, addition_sql).await;
+	assert_eq!(float64_rows(&batch, 0), vec![Some(4.0), Some(8.0)]);
 
 	let sql = "SELECT SUM(raw), AVG(raw), SUM(CAST(distance AS DOUBLE)) FROM aggregate_samples";
 	let bound = bind_sql(&catalog, &planner, sql).await;
@@ -1863,6 +1951,35 @@ async fn refined_logical_type_insert_values_allows_null_and_rejects_violation() 
 }
 
 #[tokio::test]
+async fn refinement_identity_addition_rejects() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_person_id_people(&coordinator, &planner).await;
+	execute(
+		&coordinator,
+		&planner,
+		"INSERT INTO people VALUES (1, 'ok')",
+	)
+	.await;
+
+	for sql in [
+		"SELECT id + 0 FROM people",
+		"SELECT id + id FROM people",
+		"SELECT SUM(id) FROM people",
+		"SELECT AVG(id) FROM people",
+	] {
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "not an additive quantity")
+			.await;
+	}
+
+	let sql = "SELECT CAST(id AS BIGINT) + 0 FROM people";
+	let bound = bind_sql(&catalog, &planner, sql).await;
+	assert_project_identity(bound, LogicalTypeId::NAKED);
+
+	let batch = concat_query(&coordinator, &planner, sql).await;
+	assert_eq!(int64_rows(&batch, 0), vec![Some(1)]);
+}
+
+#[tokio::test]
 async fn refined_logical_type_write_boundary_covers_select_update_and_ctas() {
 	let (_catalog, coordinator, planner) = logical_type_writer_coordinator();
 
@@ -1968,7 +2085,7 @@ async fn derived_table_computed_projection_binds_but_does_not_refinement_elide()
 	let bound = bind_sql(
 		&catalog,
 		&planner,
-		"SELECT id FROM (SELECT id + 0 AS id FROM people) AS p WHERE id < 0",
+		"SELECT id FROM (SELECT CAST(id AS BIGINT) + 0 AS id FROM people) AS p WHERE id < 0",
 	)
 	.await;
 
@@ -1984,7 +2101,7 @@ async fn derived_table_outer_projection_is_unconstrained() {
 	let bound = bind_sql(
 		&catalog,
 		&planner,
-		"SELECT person_id + 1 FROM (SELECT id AS person_id FROM people) AS p WHERE person_id < 0",
+		"SELECT CAST(person_id AS BIGINT) + 1 FROM (SELECT id AS person_id FROM people) AS p WHERE person_id < 0",
 	)
 	.await;
 
@@ -2203,7 +2320,7 @@ async fn alias_columns_computed_projection_still_not_transparent() {
 	let bound = bind_sql(
 		&catalog,
 		&planner,
-		"SELECT computed FROM (SELECT id + 0 FROM people) AS p(computed) WHERE computed < 0",
+		"SELECT computed FROM (SELECT CAST(id AS BIGINT) + 0 FROM people) AS p(computed) WHERE computed < 0",
 	)
 	.await;
 

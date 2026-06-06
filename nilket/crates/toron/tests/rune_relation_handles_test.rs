@@ -2591,6 +2591,117 @@ async fn rune_nominal_both_side_cast_binds() {
 }
 
 #[tokio::test]
+async fn rune_identity_additive_rejects_and_cast_erases() {
+	for (script, context) in [
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("id").as_logical_type::<CustomerId>().add(lit_i64(1)).named("bad")
+               ])
+        }
+    "#,
+			"identity addition",
+		),
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [sum(col("id").as_logical_type::<CustomerId>())])
+        }
+    "#,
+			"identity SUM",
+		),
+		(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [avg(col("id").as_logical_type::<CustomerId>())])
+        }
+    "#,
+			"identity AVG",
+		),
+	] {
+		let logical = rune_plan(script)
+			.await
+			.unwrap_or_else(|error| panic!("{context} plan failed: {error:?}"));
+		let error = bind(&logical, &catalog(), &PlannerConfig::default())
+			.await
+			.unwrap_err();
+		assert_binding_type_mismatch_contains(error, "not an additive quantity");
+	}
+
+	let addition = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project_named([
+                   col("id").as_logical_type::<CustomerId>()
+                       .cast(type_i64())
+                       .add(lit_i64(1))
+                       .named("raw_id_plus_one")
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("cast-erased identity addition plan");
+	let bound = bind(&addition, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("cast-erased identity addition binds");
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = bound
+	else {
+		panic!("expected cast-erased addition project");
+	};
+	assert_eq!(exprs.root_logical_type(0), Some(LogicalTypeId::NAKED));
+	assert_eq!(
+		decode_column_logical_type(output_schema.field(0))
+			.expect("decode cast-erased addition identity"),
+		LogicalTypeId::NAKED
+	);
+	let batches = run_logical(&addition).await;
+	assert_eq!(
+		int64_column_rows(&batches, 0),
+		vec![Some(2), Some(3), Some(4), Some(5), Some(6), Some(7)]
+	);
+
+	let aggregates = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [
+                   sum(col("id").as_logical_type::<CustomerId>().cast(type_i64())),
+                   avg(col("id").as_logical_type::<CustomerId>().cast(type_i64())),
+               ])
+        }
+    "#,
+	)
+	.await
+	.expect("cast-erased identity aggregate plan");
+	let bound = bind(&aggregates, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("cast-erased identity aggregates bind");
+	assert_eq!(
+		decode_column_logical_type(bound.schema().field(0))
+			.expect("decode cast-erased SUM identity"),
+		LogicalTypeId::NAKED
+	);
+	assert_eq!(
+		decode_column_logical_type(bound.schema().field(1))
+			.expect("decode cast-erased AVG identity"),
+		LogicalTypeId::NAKED
+	);
+	let batches = run_logical(&aggregates).await;
+	assert_eq!(int64_column_rows(&batches, 0), vec![Some(21)]);
+	assert_eq!(float64_column_rows(&batches, 1), vec![Some(3.5)]);
+}
+
+#[tokio::test]
 async fn rune_nominal_one_side_cast_still_rejects() {
 	let error = bind_rune_nominal_filter(
 		r#"
