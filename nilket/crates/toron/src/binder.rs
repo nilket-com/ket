@@ -4489,6 +4489,7 @@ fn multi_key_join_cardinality(
 		.iter()
 		.map(|key| key.column.ordinal)
 		.collect::<Vec<_>>();
+	let mut effective_group_denominator = None;
 	if let (Some(left_group_ndv), Some(right_group_ndv)) = (
 		clean_base_column_group_ndv_for_join_input(&left.plan, &left_key_ordinals),
 		clean_base_column_group_ndv_for_join_input(&right.plan, &right_key_ordinals),
@@ -4498,6 +4499,7 @@ fn multi_key_join_cardinality(
 			.max(right_group_ndv.point_estimate());
 		if composite_denominator != 0 {
 			denominator = denominator.min(u128::from(composite_denominator));
+			effective_group_denominator = Some(denominator);
 		}
 	}
 
@@ -4546,9 +4548,55 @@ fn multi_key_join_cardinality(
 		},
 		_ => return Some(refined),
 	};
-	let candidate = RowCount::new(u64::try_from(hot_tuple.rows).unwrap_or(u64::MAX));
-	let refined = RowCount::new(refined.get().max(candidate.get()));
-	Some(refined)
+	let hot_floor = RowCount::new(
+		refined
+			.get()
+			.max(u64::try_from(hot_tuple.rows).unwrap_or(u64::MAX)),
+	);
+	let Some(effective_group_denominator) = effective_group_denominator else {
+		return Some(hot_floor);
+	};
+
+	let cold_left_rows = u128::from(left_rows.get()).saturating_sub(hot_tuple.left_rows);
+	let cold_right_rows = u128::from(right_rows.get()).saturating_sub(hot_tuple.right_rows);
+	let cold_denominator = effective_group_denominator.saturating_sub(u128::from(hot_tuple.count));
+	let cold_residual = if cold_left_rows == 0 || cold_right_rows == 0 {
+		0
+	} else if cold_denominator == 0 {
+		return Some(hot_floor);
+	} else {
+		let Some(mut cold_refined) = ndv_containment_join_rows_from_denominator(
+			RowCount::new(u64::try_from(cold_left_rows).unwrap_or(u64::MAX)),
+			RowCount::new(u64::try_from(cold_right_rows).unwrap_or(u64::MAX)),
+			cold_denominator,
+		) else {
+			return Some(hot_floor);
+		};
+		for (left_key, right_key) in left_keys.iter().zip(right_keys) {
+			if let (Some(left_range), Some(right_range)) = (
+				clean_base_column_range_for_join_input(&left.plan, left_key.column.ordinal),
+				clean_base_column_range_for_join_input(&right.plan, right_key.column.ordinal),
+			) {
+				cold_refined = range_refined_containment_join_rows(
+					cold_refined,
+					&left_range,
+					&left_key.column.data_type,
+					&right_range,
+					&right_key.column.data_type,
+				)
+				.unwrap_or(cold_refined);
+			}
+		}
+		u128::from(cold_refined.get())
+	};
+	let Some(candidate) = hot_tuple.rows.checked_add(cold_residual) else {
+		return Some(hot_floor);
+	};
+	Some(RowCount::new(
+		hot_floor
+			.get()
+			.max(u64::try_from(candidate).unwrap_or(u64::MAX)),
+	))
 }
 
 fn join_output_ndv_containment_estimate(
@@ -16648,6 +16696,450 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn hot_plus_cold_no_double_counts_hot_tuples() {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+			&mut catalog,
+			"order_items",
+			1_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(1_000)),
+			],
+			Vec::new(),
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				int64_group_top_k_fact(&[([7, 2], 20)]),
+			)],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+		seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+			&mut catalog,
+			"line_prices",
+			1_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(1_000)),
+			],
+			Vec::new(),
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				int64_group_top_k_fact(&[([7, 2], 30)]),
+			)],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind hot+cold no-double-count join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(10_203))
+		);
+	}
+
+	#[tokio::test]
+	async fn cold_ndv_uses_effective_composite_not_independence_proxy_or_raw_overcount() {
+		let mut catalog = multi_key_join_catalog();
+		for (table, frequency) in [("order_items", 100), ("line_prices", 100)] {
+			seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+				&mut catalog,
+				table,
+				1_000,
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(10)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+				],
+				Vec::new(),
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					int64_group_top_k_fact(&[([7, 2], frequency)]),
+				)],
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					DistinctCountFact::Approx {
+						estimate: 1_000,
+						rel_err_ppm: 100_000,
+					},
+				)],
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind effective composite denominator join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(18_182))
+		);
+	}
+
+	#[tokio::test]
+	async fn hot_plus_cold_never_lowers_post_165() {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+			&mut catalog,
+			"order_items",
+			10_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(10)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+			],
+			Vec::new(),
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				int64_group_top_k_fact(&[([7, 2], 200)]),
+			)],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+		seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+			&mut catalog,
+			"line_prices",
+			10_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(10)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+			],
+			Vec::new(),
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				int64_group_top_k_fact(&[([7, 2], 50)]),
+			)],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind hot+cold prior floor join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(1_000_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn only_one_group_fact_present_is_byte_identical_to_post_165() {
+		let mut top_k_only = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts_with_column_group_top_k(
+				&mut top_k_only,
+				table,
+				10_000,
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(10_000)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(10_000)),
+				],
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					int64_group_top_k_fact(&[([7, 2], 5_000)]),
+				)],
+			);
+		}
+		let top_k_scoped = Binder {
+			catalog: &top_k_only,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind top-k-only post-165 join");
+
+		assert_eq!(
+			top_k_scoped.facts.estimated_row_count,
+			Some(RowCount::new(25_000_000))
+		);
+
+		let mut group_ndv_only = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_column_group_ndv(
+			&mut group_ndv_only,
+			"order_items",
+			10_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+			],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(200),
+			)],
+		);
+		seed_table_optimizer_facts_with_column_group_ndv(
+			&mut group_ndv_only,
+			"line_prices",
+			5_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(500)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(5)),
+			],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+		let group_ndv_scoped = Binder {
+			catalog: &group_ndv_only,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind group-NDV-only post-165 join");
+
+		assert_eq!(
+			group_ndv_scoped.facts.estimated_row_count,
+			Some(RowCount::new(250_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn hot_plus_cold_fails_open_without_either_group_fact() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts(
+				&mut catalog,
+				table,
+				None,
+				Some(10_000),
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+				],
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind no-group-facts join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(10_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn cold_residual_zero_when_all_tuples_hot() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+				&mut catalog,
+				table,
+				100,
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(10)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(10)),
+				],
+				Vec::new(),
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					int64_group_top_k_fact(&[([7, 2], 100)]),
+				)],
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					DistinctCountFact::Exact(1),
+				)],
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind all-hot cold residual join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(10_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn cold_ndv_zero_with_cold_rows_declines_to_post_165() {
+		let mut catalog = multi_key_join_catalog();
+		for table in ["order_items", "line_prices"] {
+			seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+				&mut catalog,
+				table,
+				1_000,
+				vec![
+					(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+					(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+				],
+				Vec::new(),
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					int64_group_top_k_fact(&[([7, 2], 10), ([8, 3], 10)]),
+				)],
+				vec![(
+					vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+					DistinctCountFact::Exact(2),
+				)],
+			);
+		}
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind zero cold NDV with cold rows join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(500_000))
+		);
+	}
+
+	#[tokio::test]
+	async fn cold_residual_applies_range_overlap() {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+			&mut catalog,
+			"order_items",
+			1_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+			vec![
+				(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000)),
+				(ColumnOrdinal(2), range_fact_i64(0, 99, 1_000)),
+			],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				int64_group_top_k_fact(&[([75, 2], 100)]),
+			)],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+		seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+			&mut catalog,
+			"line_prices",
+			1_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+			vec![
+				(ColumnOrdinal(1), range_fact_i64(50, 149, 1_000)),
+				(ColumnOrdinal(2), range_fact_i64(0, 99, 1_000)),
+			],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				int64_group_top_k_fact(&[([75, 2], 100)]),
+			)],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind cold range-overlap join");
+
+		assert_eq!(
+			scoped.facts.estimated_row_count,
+			Some(RowCount::new(14_091))
+		);
+	}
+
+	#[tokio::test]
+	async fn disjoint_join_short_circuits_before_hot_plus_cold() {
+		let mut catalog = multi_key_join_catalog();
+		seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+			&mut catalog,
+			"order_items",
+			1_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+			vec![
+				(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000)),
+				(ColumnOrdinal(2), range_fact_i64(0, 99, 1_000)),
+			],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				int64_group_top_k_fact(&[([7, 2], 100)]),
+			)],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+		seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+			&mut catalog,
+			"line_prices",
+			1_000,
+			vec![
+				(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+				(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			],
+			vec![
+				(ColumnOrdinal(1), range_fact_i64(1_000, 1_099, 1_000)),
+				(ColumnOrdinal(2), range_fact_i64(0, 99, 1_000)),
+			],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				int64_group_top_k_fact(&[([7, 2], 100)]),
+			)],
+			vec![(
+				vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+				DistinctCountFact::Exact(100),
+			)],
+		);
+
+		let scoped = Binder {
+			catalog: &catalog,
+			config: &PlannerConfig::default(),
+		}
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind disjoint stale hot+cold join");
+
+		assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
+	}
+
+	#[tokio::test]
 	async fn column_group_top_k_normalizes_group_order_to_join_key_order() {
 		let mut catalog = multi_key_join_catalog();
 		seed_table_optimizer_facts_with_column_group_top_k(
@@ -18579,6 +19071,32 @@ mod tests {
 					column_range_distributions: Default::default(),
 					column_heavy_hitters: Default::default(),
 					column_group_top_k: Default::default(),
+					column_group_ndv: column_group_ndv.into_iter().collect(),
+				},
+			)
+			.expect("seed optimizer facts");
+	}
+
+	fn seed_table_optimizer_facts_with_column_group_top_k_ndv_and_ranges(
+		catalog: &mut MockCatalog,
+		table: &str,
+		row_upper_bound: u64,
+		column_ndv: Vec<(ColumnOrdinal, DistinctCountFact)>,
+		column_range: Vec<(ColumnOrdinal, RangeFact)>,
+		column_group_top_k: Vec<(Vec<ColumnOrdinal>, ColumnGroupTopKFact)>,
+		column_group_ndv: Vec<(Vec<ColumnOrdinal>, DistinctCountFact)>,
+	) {
+		catalog
+			.seed_optimizer_facts(
+				&TableRef::new(table),
+				TableOptimizerFacts {
+					byte_upper_bound: None,
+					row_upper_bound: Some(RowCount::new(row_upper_bound)),
+					column_ndv: column_ndv.into_iter().collect(),
+					column_range: column_range.into_iter().collect(),
+					column_range_distributions: Default::default(),
+					column_heavy_hitters: Default::default(),
+					column_group_top_k: column_group_top_k.into_iter().collect(),
 					column_group_ndv: column_group_ndv.into_iter().collect(),
 				},
 			)

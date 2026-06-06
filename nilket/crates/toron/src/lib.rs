@@ -1742,6 +1742,58 @@ mod tests {
 		}
 
 		#[tokio::test]
+		async fn live_column_group_hot_cold_recovers_multi_key_skew_and_correlation_without_seeding()
+		 {
+			let fixture = multi_key_join_fixture_with_produced_storage_group_hot_cold_facts();
+			let actual_rows = fixture.actual_rows;
+			let auto_plan = multi_key_group_top_k_parent_join_plan();
+			assert_multi_key_group_hot_cold_binds_without_estimated_broadcast(
+				&auto_plan,
+				fixture.catalog.as_ref(),
+			)
+			.await;
+
+			let hash =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					multi_key_group_top_k_parent_join_plan(),
+					fixture.catalog.clone(),
+					PlannerConfig {
+						force_hash_join_ids: BTreeSet::from([JoinReplayId(0), JoinReplayId(1)]),
+						..multi_key_group_hot_cold_hash_config()
+					},
+					QueryBudget::test_default(),
+					fixture.storage.clone(),
+				)
+				.await
+				.expect("execute forced hash produced group hot+cold join");
+			assert!(!hash.replayed, "forced hash baseline should not replay");
+
+			let mut query_budget = QueryBudget::test_default();
+			query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+			query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+			let run =
+				run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+					auto_plan,
+					fixture.catalog,
+					multi_key_group_hot_cold_hash_config(),
+					query_budget,
+					fixture.storage,
+				)
+				.await
+				.expect("produced group hot+cold facts should execute as hash without replay");
+
+			assert!(
+				!run.replayed,
+				"produced column-group hot+cold facts should hash parent join up front"
+			);
+			assert_eq!(
+				run.results.iter().map(RecordBatch::num_rows).sum::<usize>(),
+				actual_rows
+			);
+			assert_multi_key_group_top_k_join_matches_hash(&hash.results, &run.results);
+		}
+
+		#[tokio::test]
 		async fn stale_low_heavy_hitter_frequency_still_replays_as_hash() {
 			let fixture = skewed_join_fixture_with_heavy_hitter_frequency(100);
 			let auto_plan = skewed_hot_key_fact_dim_join_plan(JoinStrategyIntent::Auto);
@@ -3373,6 +3425,203 @@ mod tests {
 		(order_ids, line_nos)
 	}
 
+	const GROUP_HOT_COLD_BASE_ROWS: usize = 1_000;
+	const GROUP_HOT_COLD_HOT_ROWS: usize = 100;
+	const GROUP_HOT_COLD_GROUPS: u64 = 100;
+
+	fn multi_key_join_fixture_with_produced_storage_group_hot_cold_facts()
+	-> MultiKeyGroupTopKFixture {
+		let order_items_descriptor = named_descriptor(
+			10,
+			"order_items",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("order_id", DataType::Int64, false),
+				Field::new("line_no", DataType::Int64, false),
+				Field::new("shard_id", DataType::Int64, false),
+			]),
+		);
+		let line_prices_descriptor = named_descriptor(
+			11,
+			"line_prices",
+			Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("order_id", DataType::Int64, false),
+				Field::new("line_no", DataType::Int64, false),
+				Field::new("shard_id", DataType::Int64, false),
+				Field::new("region_id", DataType::Int64, false),
+			]),
+		);
+		let regions_descriptor = named_descriptor(
+			12,
+			"regions",
+			Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+		);
+
+		let order_items_facts = multi_key_group_hot_cold_descriptor_facts(&order_items_descriptor);
+		let line_prices_facts = multi_key_group_hot_cold_descriptor_facts(&line_prices_descriptor);
+		let catalog = WendelonCatalog::from_descriptors_with_optimizer_facts([
+			(TableId(10), order_items_descriptor, Some(order_items_facts)),
+			(TableId(11), line_prices_descriptor, Some(line_prices_facts)),
+			(TableId(12), regions_descriptor, None),
+		])
+		.expect("descriptor registry with produced group hot+cold facts");
+
+		MultiKeyGroupTopKFixture {
+			catalog: Arc::new(catalog),
+			storage: multi_key_group_hot_cold_storage(),
+			actual_rows: multi_key_group_hot_cold_actual_rows(),
+		}
+	}
+
+	fn multi_key_group_hot_cold_descriptor_facts(
+		descriptor: &TableSchemaDescriptor,
+	) -> crate::catalog::DescriptorOptimizerFacts {
+		let storage_facts = wendelon_client::TableOptimizerFacts {
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			producer_epoch: 166,
+			row_upper_bound: Some(GROUP_HOT_COLD_BASE_ROWS as u64),
+			column_ndv: vec![
+				wendelon_client::ColumnNdvFact {
+					column_ordinal: 1,
+					distinct: wendelon_client::NdvFact::Exact {
+						count: GROUP_HOT_COLD_GROUPS,
+					},
+				},
+				wendelon_client::ColumnNdvFact {
+					column_ordinal: 2,
+					distinct: wendelon_client::NdvFact::Exact {
+						count: GROUP_HOT_COLD_GROUPS,
+					},
+				},
+			],
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: vec![wendelon_client::ColumnGroupTopKFact {
+				column_ordinals: vec![1, 2],
+				arrow_type_tags: vec![
+					wendelon_client::ARROW_STATS_TAG_INT64,
+					wendelon_client::ARROW_STATS_TAG_INT64,
+				],
+				entries: vec![wendelon_client::ColumnGroupTopKEntry {
+					value_keys: vec![
+						wendelon_client::encode_signed_optimizer_fact_scalar(7, 8).unwrap(),
+						wendelon_client::encode_signed_optimizer_fact_scalar(2, 8).unwrap(),
+					],
+					frequency: GROUP_HOT_COLD_HOT_ROWS as u64,
+				}],
+			}],
+			column_group_ndv: vec![wendelon_client::ColumnGroupNdvFact {
+				column_ordinals: vec![1, 2],
+				distinct: wendelon_client::NdvFact::Exact {
+					count: GROUP_HOT_COLD_GROUPS,
+				},
+			}],
+		};
+		let descriptor_facts =
+			crate::catalog::descriptor_optimizer_facts_from_storage(storage_facts, descriptor)
+				.expect("storage optimizer facts map through descriptor sync");
+		assert!(
+			!descriptor_facts.column_group_top_k.is_empty(),
+			"storage-mapped group top-k fact should be non-empty"
+		);
+		assert!(
+			!descriptor_facts.column_group_ndv.is_empty(),
+			"storage-mapped group NDV fact should be non-empty"
+		);
+		descriptor_facts
+	}
+
+	fn multi_key_group_hot_cold_storage() -> Arc<dyn StorageScan> {
+		let order_items_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("order_id", DataType::Int64, false),
+			Field::new("line_no", DataType::Int64, false),
+			Field::new("shard_id", DataType::Int64, false),
+		]));
+		let line_prices_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("order_id", DataType::Int64, false),
+			Field::new("line_no", DataType::Int64, false),
+			Field::new("shard_id", DataType::Int64, false),
+			Field::new("region_id", DataType::Int64, false),
+		]));
+		let regions_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+		let (order_ids, line_nos) = multi_key_group_hot_cold_keys();
+		let order_items = RecordBatch::try_new(
+			order_items_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(
+					0..GROUP_HOT_COLD_BASE_ROWS as i64,
+				)),
+				Arc::new(Int64Array::from(order_ids.clone())),
+				Arc::new(Int64Array::from(line_nos.clone())),
+				Arc::new(Int64Array::from_iter_values(
+					0..GROUP_HOT_COLD_BASE_ROWS as i64,
+				)),
+			],
+		)
+		.expect("group hot+cold order_items");
+		let line_prices = RecordBatch::try_new(
+			line_prices_schema,
+			vec![
+				Arc::new(Int64Array::from_iter_values(
+					0..GROUP_HOT_COLD_BASE_ROWS as i64,
+				)),
+				Arc::new(Int64Array::from(order_ids)),
+				Arc::new(Int64Array::from(line_nos)),
+				Arc::new(Int64Array::from_iter_values(
+					0..GROUP_HOT_COLD_BASE_ROWS as i64,
+				)),
+				Arc::new(Int64Array::from(vec![1_i64; GROUP_HOT_COLD_BASE_ROWS])),
+			],
+		)
+		.expect("group hot+cold line_prices");
+		let regions = RecordBatch::try_new(
+			regions_schema,
+			vec![Arc::new(Int64Array::from(vec![1_i64]))],
+		)
+		.expect("group hot+cold regions");
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([
+				(TableId(10), order_items),
+				(TableId(11), line_prices),
+				(TableId(12), regions),
+			]),
+		})
+	}
+
+	fn multi_key_group_hot_cold_keys() -> (Vec<i64>, Vec<i64>) {
+		let mut order_ids = Vec::with_capacity(GROUP_HOT_COLD_BASE_ROWS);
+		let mut line_nos = Vec::with_capacity(GROUP_HOT_COLD_BASE_ROWS);
+		for row in 0..GROUP_HOT_COLD_BASE_ROWS {
+			if row < GROUP_HOT_COLD_HOT_ROWS {
+				order_ids.push(7);
+				line_nos.push(2);
+			} else {
+				let group =
+					((row - GROUP_HOT_COLD_HOT_ROWS) % (GROUP_HOT_COLD_GROUPS as usize - 1)) as i64;
+				let value = 1_000 + group;
+				order_ids.push(value);
+				line_nos.push(value);
+			}
+		}
+		(order_ids, line_nos)
+	}
+
+	fn multi_key_group_hot_cold_actual_rows() -> usize {
+		let cold_rows = GROUP_HOT_COLD_BASE_ROWS - GROUP_HOT_COLD_HOT_ROWS;
+		let cold_groups = GROUP_HOT_COLD_GROUPS as usize - 1;
+		let base = cold_rows / cold_groups;
+		let extra = cold_rows % cold_groups;
+		let cold_matches = extra * (base + 1) * (base + 1) + (cold_groups - extra) * base * base;
+		GROUP_HOT_COLD_HOT_ROWS * GROUP_HOT_COLD_HOT_ROWS + cold_matches
+	}
+
 	fn multi_key_group_ndv_parent_join_plan() -> LogicalPlan {
 		multi_key_group_top_k_parent_join_plan()
 	}
@@ -3436,6 +3685,13 @@ mod tests {
 	fn multi_key_group_ndv_hash_config() -> PlannerConfig {
 		PlannerConfig {
 			auto_broadcast_max_build_bytes: Some(ByteCount::new(512 * 1024)),
+			..PlannerConfig::default()
+		}
+	}
+
+	fn multi_key_group_hot_cold_hash_config() -> PlannerConfig {
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
 			..PlannerConfig::default()
 		}
 	}
@@ -4513,6 +4769,29 @@ mod tests {
 				JoinStrategyDecisionReason::BroadcastEstimated { .. }
 			),
 			"group NDV child estimate should prevent parent estimated broadcast: {:?}",
+			trace.join_decisions[1].reason
+		);
+	}
+
+	async fn assert_multi_key_group_hot_cold_binds_without_estimated_broadcast(
+		plan: &LogicalPlan,
+		catalog: &dyn Catalog,
+	) {
+		let (_bound, trace) =
+			bind_with_trace(plan, catalog, &multi_key_group_hot_cold_hash_config())
+				.await
+				.expect("bind multi-key group hot+cold join with trace");
+		assert_eq!(trace.join_decisions.len(), 2);
+		assert_eq!(
+			trace.join_decisions[1].strategy,
+			JoinStrategy::HashPartitioned
+		);
+		assert!(
+			!matches!(
+				trace.join_decisions[1].reason,
+				JoinStrategyDecisionReason::BroadcastEstimated { .. }
+			),
+			"group hot+cold child estimate should prevent parent estimated broadcast: {:?}",
 			trace.join_decisions[1].reason
 		);
 	}

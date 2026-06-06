@@ -347,8 +347,8 @@ pub(crate) fn adr164_group_top_k_is_estimate_channel_only() {
 
 	assert!(estimate.contains("clean_base_column_group_top_k_for_join_input"));
 	assert!(estimate.contains("hot_tuple_join_contribution"));
-	assert!(estimate.contains("let candidate = RowCount::new"));
-	assert!(estimate.contains("refined.get().max(candidate.get())"));
+	assert!(estimate.contains("let hot_floor ="));
+	assert!(estimate.contains(".max(u64::try_from(hot_tuple.rows).unwrap_or(u64::MAX))"));
 	assert!(!estimate.contains("row_upper_bound:"));
 	assert!(!estimate.contains("byte_upper_bound:"));
 	assert!(!estimate.contains("EmptyRelation"));
@@ -384,13 +384,12 @@ pub(crate) fn adr164_consumer_uses_exact_hot_floor_not_fake_residual() {
 	assert!(hot_tuple.contains("column_group_top_k_total_frequency(left, left_rows)?"));
 	assert!(hot_add.contains("checked_mul"));
 	assert!(hot_add.contains("checked_add"));
-	assert!(estimate.contains("let candidate = RowCount::new"));
-	assert!(estimate.contains("refined.get().max(candidate.get())"));
-	assert!(!estimate.contains("saturating_sub(hot_tuple"));
-	assert!(!estimate.contains("hot_tuple.rows.checked_add"));
-	assert!(!estimate.contains("residual"));
+	assert!(estimate.contains("let hot_floor ="));
+	assert!(estimate.contains("return Some(hot_floor);"));
+	assert!(estimate.contains("let Some(effective_group_denominator)"));
 	assert!(binder.contains("hot_tuple_contribution_is_exact_product_of_frequencies"));
 	assert!(binder.contains("consumer_uses_exact_hot_floor_not_fake_residual"));
+	assert!(binder.contains("only_one_group_fact_present_is_byte_identical_to_post_165"));
 }
 
 #[test]
@@ -619,6 +618,82 @@ pub(crate) fn adr165_group_ndv_names_are_brand_clean_and_unsuffixed() {
 		wendelon_offenders.is_empty(),
 		"ADR165 Wendelon group NDV names must stay unsuffixed:\n{}",
 		format_offenders(&wendelon_manifest_dir, &wendelon_offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr166_hot_plus_cold_is_estimate_channel_only() {
+	let binder = binder_source();
+	let lib = lib_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+	let facts = source_block(&binder, "fn composite_with_join_estimate");
+
+	assert!(estimate.contains("hot_tuple.rows.checked_add(cold_residual)"));
+	assert!(estimate.contains("Some(RowCount::new("));
+	assert!(estimate.contains("hot_floor"));
+	assert!(estimate.contains(".max(u64::try_from(candidate).unwrap_or(u64::MAX))"));
+	assert!(!estimate.contains("row_upper_bound:"));
+	assert!(!estimate.contains("byte_upper_bound:"));
+	assert!(!estimate.contains("EmptyRelation"));
+	assert!(facts.contains("estimated_row_count"));
+	assert!(facts.contains("estimated_byte_size"));
+	assert!(facts.contains("row_upper_bound: None"));
+	assert!(facts.contains("byte_upper_bound: None"));
+	assert!(binder.contains("hot_plus_cold_never_lowers_post_165"));
+	assert!(lib.contains(
+		"live_column_group_hot_cold_recovers_multi_key_skew_and_correlation_without_seeding"
+	));
+}
+
+#[test]
+pub(crate) fn adr166_requires_both_group_facts() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+
+	assert!(estimate.contains("effective_group_denominator"));
+	assert!(estimate.contains("clean_base_column_group_ndv_for_join_input"));
+	assert!(estimate.contains("clean_base_column_group_top_k_for_join_input"));
+	assert!(estimate.contains("let Some(mut cold_refined)"));
+	assert!(estimate.contains("return Some(hot_floor);"));
+	assert!(binder.contains("only_one_group_fact_present_is_byte_identical_to_post_165"));
+	assert!(binder.contains("hot_plus_cold_fails_open_without_either_group_fact"));
+}
+
+#[test]
+pub(crate) fn adr166_hot_plus_cold_removes_hot_from_cold() {
+	let binder = binder_source();
+	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
+
+	assert!(estimate.contains("saturating_sub(hot_tuple.left_rows)"));
+	assert!(estimate.contains("saturating_sub(hot_tuple.right_rows)"));
+	assert!(estimate.contains("saturating_sub(u128::from(hot_tuple.count))"));
+	assert!(estimate.contains("hot_tuple.rows.checked_add(cold_residual)"));
+	assert!(binder.contains("hot_plus_cold_no_double_counts_hot_tuples"));
+	assert!(
+		binder
+			.contains("cold_ndv_uses_effective_composite_not_independence_proxy_or_raw_overcount")
+	);
+	assert!(binder.contains("cold_ndv_zero_with_cold_rows_declines_to_post_165"));
+}
+
+#[test]
+pub(crate) fn adr166_no_new_producer_or_wire() {
+	let wendelon_manifest_dir = wendelon_manifest_dir();
+	let offenders = source_lines(&wendelon_manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("HotCold")
+				|| line.contains("hot_cold")
+				|| line.contains("ColumnGroupResidual")
+				|| line.contains("GroupResidual")
+				|| line.contains("group_residual")
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"ADR166 is a Toron-only consumer and must not add Wendelon producer/wire surfaces:\n{}",
+		format_offenders(&wendelon_manifest_dir, &offenders)
 	);
 }
 
