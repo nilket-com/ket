@@ -4422,6 +4422,7 @@ mod tests {
 			name: "PersonId".to_string(),
 			physical: LogicalTypePhysical::Int64,
 			refinement: None,
+			unit: None,
 		};
 		let descriptor = logical_descriptor(definition.logical_type_id);
 		let client = Arc::new(
@@ -4464,6 +4465,7 @@ mod tests {
 			name: "PersonId".to_string(),
 			physical: LogicalTypePhysical::Int64,
 			refinement: None,
+			unit: None,
 		};
 		let client =
 			Arc::new(FakeDescriptorSyncClient::new([]).with_logical_types([definition.clone()]));

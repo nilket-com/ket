@@ -1585,6 +1585,7 @@ async fn execute_catalog_plan(
 			name,
 			physical,
 			refinement,
+			unit,
 		} => {
 			let physical = data_type_to_logical_type_physical(physical).ok_or_else(|| {
 				QueryError::Internal {
@@ -1599,6 +1600,7 @@ async fn execute_catalog_plan(
 					name: name.clone(),
 					physical,
 					refinement: refinement.clone(),
+					unit: unit.clone(),
 				})
 				.await?;
 			Ok(Vec::new())

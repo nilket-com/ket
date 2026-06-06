@@ -109,6 +109,7 @@ pub struct CreateLogicalTypeRequest {
 	pub name: String,
 	pub physical: wendelon_client::LogicalTypePhysical,
 	pub refinement: Option<wendelon_client::LogicalTypeRefinementPredicate>,
+	pub unit: Option<wendelon_client::LogicalTypeUnit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,11 +493,12 @@ impl StorageAdmin for WendelonStorageAdmin {
 	) -> Result<CreateLogicalTypeOutcome, StorageError> {
 		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
 		let create_request =
-			wendelon_client::LogicalTypeDefinitionCreateRequest::create_with_refinement(
+			wendelon_client::LogicalTypeDefinitionCreateRequest::create_with_metadata(
 				tenant_id,
 				request.name.clone(),
 				request.physical,
 				request.refinement.clone(),
+				request.unit.clone(),
 				wendelon_client::SchemaIntentId::new(*uuid::Uuid::new_v4().as_bytes()),
 			);
 		self.client

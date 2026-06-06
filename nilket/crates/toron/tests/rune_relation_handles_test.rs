@@ -15,19 +15,20 @@ use toron::distributed::identity::QueryId;
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId,
-	ScalarValue, SystemTableKind, TableId, decode_column_logical_type,
-	field_with_logical_type_metadata,
+	BoundBinaryOp, BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, DURABLE_LOGICAL_TYPE_MIN_ID,
+	ExecutionPlan, Expr, FilterDisposition, JoinKind, JoinStrategy, JoinStrategyIntent,
+	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, ScalarValue, SystemTableKind, TableId,
+	decode_column_logical_type, field_with_logical_type_metadata,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
-use toron::storage::{ScanRequest, ScanStream, StorageScan};
+use toron::storage::{ScanRequest, ScanStream, StorageScan, TenantId};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
 	pbc::{OP_IN_LIST, OP_NOT},
 };
+use wendelon_client::{LogicalTypeDefinition, LogicalTypePhysical, LogicalTypeUnit, UnitScale};
 
 fn sandbox_config() -> RuneSandboxConfig {
 	RuneSandboxConfig {
@@ -2661,6 +2662,59 @@ async fn rune_nominal_ascribed_literal_identity_is_preserved() {
 	assert_nominal_mismatch(error, "CustomerId", "naked", "Float64");
 }
 
+#[tokio::test]
+async fn rune_convert_matches_sql_convert_bind_path() {
+	let catalog = catalog_with_dimensioned_price();
+	let sql = SqlPlanner::new()
+		.plan("SELECT CONVERT(price, Kilometer) AS km FROM sales")
+		.expect("plan SQL CONVERT");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project_named([convert(col("price"), "Kilometer").named("km")])
+        }
+    "#,
+	)
+	.await
+	.expect("Rune CONVERT");
+
+	let sql_bound = bind(&sql, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL CONVERT");
+	let rune_bound = bind(&rune, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune CONVERT");
+
+	for bound in [sql_bound, rune_bound] {
+		let ExecutionPlan::Project {
+			exprs,
+			output_schema,
+			..
+		} = bound
+		else {
+			panic!("expected project");
+		};
+		let root = exprs.single_root().expect("single projection root");
+		assert!(matches!(
+			exprs.node(root),
+			Some(BoundExprNode::Binary {
+				op: BoundBinaryOp::Mul,
+				..
+			})
+		));
+		assert_eq!(exprs.root_type(0), Some(&DataType::Float64));
+		assert_eq!(
+			exprs.root_logical_type(0),
+			Some(LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 1))
+		);
+		assert_eq!(
+			decode_column_logical_type(output_schema.field(0))
+				.expect("decode convert output identity"),
+			LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 1)
+		);
+	}
+}
+
 async fn predicate_operator_compound_filter_plan() -> LogicalPlan {
 	rune_plan(
 		r#"
@@ -2809,6 +2863,58 @@ fn catalog_with_sales_id_logical() -> MockCatalog {
 	catalog
 }
 
+fn catalog_with_dimensioned_price() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_logical_type_for_tenant(
+			TenantId(1),
+			LogicalTypeDefinition {
+				logical_type_id: DURABLE_LOGICAL_TYPE_MIN_ID,
+				name: "Mile".to_string(),
+				physical: LogicalTypePhysical::Float64,
+				refinement: None,
+				unit: Some(LogicalTypeUnit {
+					dimension: "Length".to_string(),
+					scale_to_base: UnitScale {
+						numerator: 201168,
+						denominator: 125,
+					},
+				}),
+			},
+		)
+		.expect("register Mile");
+	catalog
+		.register_logical_type_for_tenant(
+			TenantId(1),
+			LogicalTypeDefinition {
+				logical_type_id: DURABLE_LOGICAL_TYPE_MIN_ID + 1,
+				name: "Kilometer".to_string(),
+				physical: LogicalTypePhysical::Float64,
+				refinement: None,
+				unit: Some(LogicalTypeUnit {
+					dimension: "Length".to_string(),
+					scale_to_base: UnitScale {
+						numerator: 1000,
+						denominator: 1,
+					},
+				}),
+			},
+		)
+		.expect("register Kilometer");
+	catalog
+		.register_descriptor(
+			TableId(1),
+			descriptor(
+				1,
+				"sales",
+				sales_schema_with_dimensioned_price().as_ref(),
+				"id",
+			),
+		)
+		.expect("register sales");
+	catalog
+}
+
 fn sales_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
@@ -2827,6 +2933,22 @@ fn sales_schema_with_logical_id() -> SchemaRef {
 		Field::new("amount", DataType::Int32, true),
 		Field::new("status", DataType::Utf8, true),
 		Field::new("price", DataType::Float64, true),
+		Field::new("active", DataType::Boolean, true),
+	]))
+}
+
+fn sales_schema_with_dimensioned_price() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("region", DataType::Utf8, true),
+		Field::new("amount", DataType::Int32, true),
+		Field::new("status", DataType::Utf8, true),
+		field_with_logical_type_metadata(
+			"price",
+			DataType::Float64,
+			true,
+			LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID),
+		),
 		Field::new("active", DataType::Boolean, true),
 	]))
 }

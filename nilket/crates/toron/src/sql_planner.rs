@@ -30,7 +30,7 @@ use wendelon::schema::{
 };
 use wendelon_client::{
 	LogicalTypePhysical, LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate,
-	LogicalTypeRefinementValue,
+	LogicalTypeRefinementValue, LogicalTypeUnit, UnitScale,
 };
 
 fn unsupported(message: impl Into<String>) -> FrontendError {
@@ -676,7 +676,7 @@ fn try_lower_create_logical_type(sql: &str) -> Result<Option<LogicalPlan>, Front
 	let physical_carrier = data_type_to_logical_type_physical(&physical).ok_or_else(|| {
 		unsupported("CREATE LOGICAL TYPE physical type must be a primitive logical-type carrier")
 	})?;
-	let refinement = parse_create_logical_type_refinement_clause(rest.trim(), physical_carrier)?;
+	let (unit, refinement) = parse_create_logical_type_clauses(rest.trim(), physical_carrier)?;
 	if let Some(refinement) = &refinement {
 		refinement
 			.validate_for_physical(physical_carrier)
@@ -686,7 +686,55 @@ fn try_lower_create_logical_type(sql: &str) -> Result<Option<LogicalPlan>, Front
 		name: name.to_string(),
 		physical,
 		refinement,
+		unit,
 	}))
+}
+
+fn parse_create_logical_type_clauses(
+	clause: &str,
+	physical: LogicalTypePhysical,
+) -> Result<
+	(
+		Option<LogicalTypeUnit>,
+		Option<LogicalTypeRefinementPredicate>,
+	),
+	FrontendError,
+> {
+	let clause = clause.trim();
+	if clause.is_empty() {
+		return Ok((None, None));
+	}
+	let Some(after_dimension) = strip_sql_keyword_prefix(clause, "DIMENSION") else {
+		let refinement = parse_create_logical_type_refinement_clause(clause, physical)?;
+		return Ok((None, refinement));
+	};
+	let Some((dimension, rest)) = take_sql_word(after_dimension) else {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE DIMENSION requires an unquoted ASCII identifier",
+		));
+	};
+	validate_logical_type_unit_dimension(dimension)?;
+	let Some(after_scale) = strip_sql_keyword_prefix(rest, "SCALE_TO_BASE") else {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE DIMENSION requires SCALE_TO_BASE <decimal>",
+		));
+	};
+	let Some((scale, rest)) = take_sql_word(after_scale) else {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE SCALE_TO_BASE requires a positive decimal",
+		));
+	};
+	if !matches!(physical, LogicalTypePhysical::Float64) {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE unit metadata requires DOUBLE/FLOAT64 physical type",
+		));
+	}
+	let unit = LogicalTypeUnit {
+		dimension: dimension.to_string(),
+		scale_to_base: parse_positive_decimal_scale(scale)?,
+	};
+	let refinement = parse_create_logical_type_refinement_clause(rest.trim(), physical)?;
+	Ok((Some(unit), refinement))
 }
 
 fn parse_create_logical_type_refinement_clause(
@@ -712,6 +760,81 @@ fn parse_create_logical_type_refinement_clause(
 		return Err(unsupported("CREATE LOGICAL TYPE CHECK cannot be empty"));
 	}
 	parse_logical_type_refinement_predicate(inner, physical).map(Some)
+}
+
+fn validate_logical_type_unit_dimension(value: &str) -> Result<(), FrontendError> {
+	if value.is_empty()
+		|| value.eq_ignore_ascii_case("naked")
+		|| value.contains('.')
+		|| value
+			.bytes()
+			.any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+	{
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE unit dimension must be a one-part unquoted ASCII identifier",
+		));
+	}
+	Ok(())
+}
+
+fn parse_positive_decimal_scale(value: &str) -> Result<UnitScale, FrontendError> {
+	if value.contains(['e', 'E']) || value.starts_with(['+', '-']) {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE SCALE_TO_BASE supports positive decimal literals only",
+		));
+	}
+	let mut parts = value.split('.');
+	let whole = parts.next().unwrap_or_default();
+	let fraction = parts.next();
+	if parts.next().is_some()
+		|| whole.is_empty()
+		|| !whole.bytes().all(|byte| byte.is_ascii_digit())
+		|| fraction
+			.map(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+			.unwrap_or(false)
+	{
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE SCALE_TO_BASE supports positive decimal literals only",
+		));
+	}
+	let mut numerator = whole
+		.parse::<u64>()
+		.map_err(|_| unsupported("CREATE LOGICAL TYPE SCALE_TO_BASE decimal is out of range"))?;
+	let mut denominator = 1_u64;
+	if let Some(fraction) = fraction {
+		let scale = 10_u64.checked_pow(fraction.len() as u32).ok_or_else(|| {
+			unsupported("CREATE LOGICAL TYPE SCALE_TO_BASE decimal is out of range")
+		})?;
+		let fraction_value = fraction.parse::<u64>().map_err(|_| {
+			unsupported("CREATE LOGICAL TYPE SCALE_TO_BASE decimal is out of range")
+		})?;
+		numerator = numerator
+			.checked_mul(scale)
+			.and_then(|value| value.checked_add(fraction_value))
+			.ok_or_else(|| {
+				unsupported("CREATE LOGICAL TYPE SCALE_TO_BASE decimal is out of range")
+			})?;
+		denominator = scale;
+	}
+	if numerator == 0 {
+		return Err(unsupported(
+			"CREATE LOGICAL TYPE SCALE_TO_BASE must be greater than zero",
+		));
+	}
+	let divisor = gcd_u64(numerator, denominator);
+	Ok(UnitScale {
+		numerator: numerator / divisor,
+		denominator: denominator / divisor,
+	})
+}
+
+fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+	while right != 0 {
+		let next = left % right;
+		left = right;
+		right = next;
+	}
+	left
 }
 
 fn strip_sql_keyword_prefix<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
@@ -1581,6 +1704,32 @@ fn lower_cast_logical_type_name(
 	lower_sql_logical_type_name("CAST", name, modifiers)
 }
 
+fn lower_convert_target_logical_name(expr: &SqlExpr) -> Result<String, FrontendError> {
+	match expr {
+		SqlExpr::Identifier(ident) => validate_sql_logical_type_ident("CONVERT", ident),
+		SqlExpr::Value(value) => match &value.value {
+			Value::SingleQuotedString(name) => validate_sql_logical_type_name("CONVERT", name),
+			_ => Err(unsupported(
+				"CONVERT target must be an unquoted logical type identifier",
+			)),
+		},
+		_ => Err(unsupported(
+			"CONVERT target must be an unquoted logical type identifier",
+		)),
+	}
+}
+
+fn lower_convert_data_type_target_logical_name(
+	data_type: &SqlDataType,
+) -> Result<String, FrontendError> {
+	match lower_cast_target(data_type)? {
+		LoweredCastTarget::LogicalName(logical_name) => Ok(logical_name),
+		LoweredCastTarget::Physical(_) => Err(unsupported(
+			"CONVERT target must be a dimensioned logical type identifier",
+		)),
+	}
+}
+
 fn lower_sql_logical_type_name(
 	context: &'static str,
 	name: &ObjectName,
@@ -1597,18 +1746,31 @@ fn lower_sql_logical_type_name(
 		)));
 	};
 	let ident = object_name_part_ident(part, &format!("{context} logical type name"))?;
+	validate_sql_logical_type_ident(context, ident)
+}
+
+fn validate_sql_logical_type_ident(
+	context: &'static str,
+	ident: &Ident,
+) -> Result<String, FrontendError> {
 	if ident.quote_style.is_some() {
 		return Err(unsupported(format!(
 			"{context} logical type names must be unquoted ASCII identifiers"
 		)));
 	}
-	if ident.value.eq_ignore_ascii_case("naked") {
+	validate_sql_logical_type_name(context, &ident.value)
+}
+
+fn validate_sql_logical_type_name(
+	context: &'static str,
+	name: &str,
+) -> Result<String, FrontendError> {
+	if name.eq_ignore_ascii_case("naked") {
 		return Err(unsupported(format!(
 			"{context} logical type name cannot be the naked sentinel"
 		)));
 	}
-	if ident
-		.value
+	if name
 		.bytes()
 		.any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
 	{
@@ -1616,7 +1778,7 @@ fn lower_sql_logical_type_name(
 			"{context} logical type names must be unquoted ASCII identifiers"
 		)));
 	}
-	Ok(ident.value.clone())
+	Ok(name.to_string())
 }
 
 fn check_unique_column_names(columns: &[CreateTableColumn]) -> Result<(), FrontendError> {
@@ -4341,6 +4503,21 @@ impl SqlPlanner {
 			SqlExpr::InUnnest { .. } => Err(unsupported("IN UNNEST is not supported")),
 			SqlExpr::SimilarTo { .. } => Err(unsupported("SIMILAR TO is not supported")),
 			SqlExpr::RLike { .. } => Err(unsupported("RLIKE is not supported")),
+			SqlExpr::Convert {
+				is_try,
+				expr,
+				data_type,
+				charset,
+				target_before_value,
+				styles,
+			} => self.lower_convert_ast(
+				*is_try,
+				expr,
+				data_type.as_ref(),
+				charset.as_ref(),
+				*target_before_value,
+				styles,
+			),
 			SqlExpr::Cast {
 				kind,
 				expr,
@@ -4410,6 +4587,7 @@ impl SqlPlanner {
 					self.lower_ifnull_nvl(f)
 				}
 				Some(ConditionalSugarFunction::Nvl2) => self.lower_nvl2(f),
+				None if function_name_eq(&f.name, "CONVERT") => self.lower_convert(f),
 				None if function_name_eq(&f.name, "DATE_PART") => {
 					let args = function_arg_list(&f.args, "date_part expects arguments")?;
 					if args.len() != 2 {
@@ -4490,6 +4668,49 @@ impl SqlPlanner {
 				Box::new(self.lower_expr(truthy)?),
 			)],
 			else_expr: Some(Box::new(self.lower_expr(falsy)?)),
+		})
+	}
+
+	fn lower_convert(&self, function: &Function) -> Result<Expr, FrontendError> {
+		let args = function_positional_args(function, "CONVERT")?;
+		let [expr, target] = args.as_slice() else {
+			return Err(unsupported("CONVERT requires exactly two arguments"));
+		};
+		Ok(Expr::SqlConvert {
+			expr: Box::new(self.lower_expr(expr)?),
+			target_logical_name: lower_convert_target_logical_name(target)?,
+		})
+	}
+
+	fn lower_convert_ast(
+		&self,
+		is_try: bool,
+		expr: &SqlExpr,
+		data_type: Option<&SqlDataType>,
+		charset: Option<&ObjectName>,
+		target_before_value: bool,
+		styles: &[SqlExpr],
+	) -> Result<Expr, FrontendError> {
+		if is_try {
+			return Err(unsupported("TRY_CONVERT to logical units is not supported"));
+		}
+		if target_before_value {
+			return Err(unsupported(
+				"CONVERT target must follow the source expression",
+			));
+		}
+		if charset.is_some() {
+			return Err(unsupported("CONVERT CHARACTER SET is not supported"));
+		}
+		if !styles.is_empty() {
+			return Err(unsupported("CONVERT style arguments are not supported"));
+		}
+		let data_type = data_type
+			.ok_or_else(|| unsupported("CONVERT requires a target logical type identifier"))?;
+		let target_logical_name = lower_convert_data_type_target_logical_name(data_type)?;
+		Ok(Expr::SqlConvert {
+			expr: Box::new(self.lower_expr(expr)?),
+			target_logical_name,
 		})
 	}
 
@@ -4805,6 +5026,7 @@ fn sort_key_is_direct_output_reference(expr: &Expr) -> bool {
 			expr,
 			Expr::LogicalAscription { expr, .. }
 				| Expr::SqlLogicalCast { expr, .. }
+				| Expr::SqlConvert { expr, .. }
 				if sort_key_is_direct_output_reference(expr)
 		)
 }
@@ -4827,6 +5049,7 @@ fn validate_hidden_sort_key_refs(
 			validate_hidden_sort_key_refs(inner, visible_names)
 		}
 		Expr::SqlLogicalCast { expr: inner, .. }
+		| Expr::SqlConvert { expr: inner, .. }
 		| Expr::Cast(inner, _)
 		| Expr::TryCast(inner, _) => validate_hidden_sort_key_refs(inner, visible_names),
 		Expr::Add(left, right)
@@ -5380,6 +5603,14 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			try_cast.hash(state);
 			hash_expr_structural(expr, state);
 		}
+		Expr::SqlConvert {
+			expr,
+			target_logical_name,
+		} => {
+			28u8.hash(state);
+			target_logical_name.hash(state);
+			hash_expr_structural(expr, state);
+		}
 		Expr::Case {
 			when_then,
 			else_expr,
@@ -5449,6 +5680,16 @@ fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 				&& left_try_cast == right_try_cast
 				&& expr_structural_eq(left_inner, right_inner)
 		}
+		(
+			Expr::SqlConvert {
+				expr: left_inner,
+				target_logical_name: left_logical_name,
+			},
+			Expr::SqlConvert {
+				expr: right_inner,
+				target_logical_name: right_logical_name,
+			},
+		) => left_logical_name == right_logical_name && expr_structural_eq(left_inner, right_inner),
 		(Expr::Add(left_left, left_right), Expr::Add(right_left, right_right))
 		| (Expr::Sub(left_left, left_right), Expr::Sub(right_left, right_right))
 		| (Expr::Mul(left_left, left_right), Expr::Mul(right_left, right_right))
@@ -5790,9 +6031,9 @@ fn select_expr_is_computed(expr: &SqlExpr) -> bool {
 fn logical_expr_output_name(expr: &Expr, idx: usize) -> String {
 	match expr {
 		Expr::Column(column) => column.name.0.clone(),
-		Expr::LogicalAscription { expr, .. } | Expr::SqlLogicalCast { expr, .. } => {
-			logical_expr_output_name(expr, idx)
-		}
+		Expr::LogicalAscription { expr, .. }
+		| Expr::SqlLogicalCast { expr, .. }
+		| Expr::SqlConvert { expr, .. } => logical_expr_output_name(expr, idx),
 		_ => format!("col_{idx}"),
 	}
 }
@@ -5803,6 +6044,7 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		Expr::Literal(_) | Expr::UntypedNull => false,
 		Expr::LogicalAscription { expr: inner, .. }
 		| Expr::SqlLogicalCast { expr: inner, .. }
+		| Expr::SqlConvert { expr: inner, .. }
 		| Expr::Cast(inner, _)
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)
@@ -6343,6 +6585,13 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 			expr: Box::new(canonical_aggregate_signature_expr(expr)),
 			logical_name: logical_name.clone(),
 			try_cast: *try_cast,
+		},
+		Expr::SqlConvert {
+			expr,
+			target_logical_name,
+		} => Expr::SqlConvert {
+			expr: Box::new(canonical_aggregate_signature_expr(expr)),
+			target_logical_name: target_logical_name.clone(),
 		},
 		Expr::Cast(inner, data_type) => Expr::Cast(
 			Box::new(canonical_aggregate_signature_expr(inner)),
@@ -7768,6 +8017,7 @@ mod tests {
 			}
 			Expr::LogicalAscription { expr, .. }
 			| Expr::SqlLogicalCast { expr, .. }
+			| Expr::SqlConvert { expr, .. }
 			| Expr::Not(expr)
 			| Expr::IsNull(expr)
 			| Expr::IsNotNull(expr)

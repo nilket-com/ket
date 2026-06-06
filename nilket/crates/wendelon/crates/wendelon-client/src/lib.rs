@@ -52,14 +52,14 @@ pub use wendelon::integration::compute::{
 	ComputeTraceContextV1, DropOperationId, LOGICAL_TYPE_INTERNAL_NAMESPACE,
 	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinition, LogicalTypeDefinitionCreate,
 	LogicalTypePhysical, LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate,
-	LogicalTypeRefinementValue, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
-	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
-	StorageQuotaMetadataV1, StorageStatusKind, TableSchemaDropFields, TableSchemaDropRequest,
-	WendelonAdminError, decode_logical_type_definition, decode_logical_type_definitions,
-	decode_schema_update_envelope_v1, encode_logical_type_definition_create,
-	encode_logical_type_definitions, encode_schema_update_envelope_v1, map_read_status_for_compute,
-	map_write_status_for_compute, prepare_query_session_handoff,
-	validate_query_session_audit_attribution, validate_traceparent,
+	LogicalTypeRefinementValue, LogicalTypeUnit, SchemaGeneration, SchemaIntentId,
+	SchemaIntentOrigin, SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1,
+	SchemaUpdateEnvelopeV1, StorageQuotaMetadataV1, StorageStatusKind, TableSchemaDropFields,
+	TableSchemaDropRequest, UnitScale, WendelonAdminError, decode_logical_type_definition,
+	decode_logical_type_definitions, decode_schema_update_envelope_v1,
+	encode_logical_type_definition_create, encode_logical_type_definitions,
+	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
+	prepare_query_session_handoff, validate_query_session_audit_attribution, validate_traceparent,
 };
 pub use wendelon::schema::{
 	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
@@ -327,6 +327,7 @@ pub struct LogicalTypeDefinitionCreateRequest {
 	pub name: String,
 	pub physical: LogicalTypePhysical,
 	pub refinement: Option<LogicalTypeRefinementPredicate>,
+	pub unit: Option<LogicalTypeUnit>,
 	pub intent_id: SchemaIntentId,
 }
 
@@ -342,6 +343,7 @@ impl LogicalTypeDefinitionCreateRequest {
 			name: name.into(),
 			physical,
 			refinement: None,
+			unit: None,
 			intent_id,
 		}
 	}
@@ -358,6 +360,25 @@ impl LogicalTypeDefinitionCreateRequest {
 			name: name.into(),
 			physical,
 			refinement,
+			unit: None,
+			intent_id,
+		}
+	}
+
+	pub fn create_with_metadata(
+		tenant_id: TenantId,
+		name: impl Into<String>,
+		physical: LogicalTypePhysical,
+		refinement: Option<LogicalTypeRefinementPredicate>,
+		unit: Option<LogicalTypeUnit>,
+		intent_id: SchemaIntentId,
+	) -> Self {
+		Self {
+			tenant_id,
+			name: name.into(),
+			physical,
+			refinement,
+			unit,
 			intent_id,
 		}
 	}
@@ -367,6 +388,7 @@ impl LogicalTypeDefinitionCreateRequest {
 			name: self.name.clone(),
 			physical: self.physical,
 			refinement: self.refinement.clone(),
+			unit: self.unit.clone(),
 		})?;
 		Ok(SchemaUpdateEnvelopeV1::compute_client_intent(
 			self.tenant_id,

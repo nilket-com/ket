@@ -71,6 +71,17 @@ fn wendelon_client_core_source() -> String {
 		.expect("read Wendelon client core source")
 }
 
+fn wendelon_client_lib_source() -> String {
+	std::fs::read_to_string(
+		wendelon_manifest_dir()
+			.join("crates")
+			.join("wendelon-client")
+			.join("src")
+			.join("lib.rs"),
+	)
+	.expect("read Wendelon client lib source")
+}
+
 fn storage_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/storage.rs")).expect("read storage source")
 }
@@ -711,12 +722,15 @@ pub(crate) fn adr091_sql_planner_records_custom_type_names_without_catalog_resol
 	let planner = sql_planner_source();
 	let lower_type = source_block(&planner, "fn lower_create_table_data_type");
 	let lower_logical = source_block(&planner, "fn lower_sql_logical_type_name");
+	let validate_ident = source_block(&planner, "fn validate_sql_logical_type_ident");
+	let validate_name = source_block(&planner, "fn validate_sql_logical_type_name");
 
 	assert!(lower_type.contains("SqlDataType::Custom(name, modifiers)"));
 	assert!(lower_type.contains("CreateTableColumnType::LogicalName"));
-	assert!(lower_logical.contains("ident.quote_style.is_some()"));
-	assert!(lower_logical.contains("eq_ignore_ascii_case(\"naked\")"));
-	assert!(lower_logical.contains("ident.value.clone()"));
+	assert!(lower_logical.contains("validate_sql_logical_type_ident"));
+	assert!(validate_ident.contains("ident.quote_style.is_some()"));
+	assert!(validate_name.contains("eq_ignore_ascii_case(\"naked\")"));
+	assert!(validate_name.contains("Ok(name.to_string())"));
 	assert!(!lower_type.contains("resolve_durable_logical_type_by_name"));
 	assert!(!lower_type.contains("resolve_logical_type_by_name"));
 }
@@ -847,16 +861,26 @@ pub(crate) fn adr092_planner_records_logical_cast_names_without_resolution() {
 	let lower_cast = source_block(&planner, "fn lower_cast_target");
 	let lower_logical = source_block(&planner, "fn lower_cast_logical_type_name");
 	let lower_shared = source_block(&planner, "fn lower_sql_logical_type_name");
+	let validate_ident = source_block(&planner, "fn validate_sql_logical_type_ident");
+	let validate_name = source_block(&planner, "fn validate_sql_logical_type_name");
 	let lower_expr = source_block(&planner, "fn lower_expr");
 
 	assert!(lower_cast.contains("SqlDataType::Custom(name, modifiers)"));
 	assert!(lower_cast.contains("LoweredCastTarget::LogicalName"));
 	assert!(lower_logical.contains("lower_sql_logical_type_name(\"CAST\""));
-	assert!(lower_shared.contains("ident.quote_style.is_some()"));
-	assert!(lower_shared.contains("eq_ignore_ascii_case(\"naked\")"));
+	assert!(lower_shared.contains("validate_sql_logical_type_ident"));
+	assert!(validate_ident.contains("ident.quote_style.is_some()"));
+	assert!(validate_name.contains("eq_ignore_ascii_case(\"naked\")"));
 	assert!(lower_expr.contains("Expr::SqlLogicalCast"));
 	assert!(lower_expr.contains("try_cast: true"));
-	for block in [lower_cast, lower_logical, lower_shared, lower_expr] {
+	for block in [
+		lower_cast,
+		lower_logical,
+		lower_shared,
+		validate_ident,
+		validate_name,
+		lower_expr,
+	] {
 		assert!(!block.contains("resolve_durable_logical_type_by_name"));
 		assert!(!block.contains("logical_type_spec_by_name"));
 	}
@@ -873,9 +897,12 @@ pub(crate) fn adr092_binder_resolves_sql_logical_casts_registry_only_before_sync
 	assert!(resolve.contains("resolve_durable_logical_type_by_name(&name)"));
 	assert!(resolve.contains("HashMap<String, LogicalTypeSpec>"));
 	assert!(bind_program.contains("ExprBindContext"));
-	assert!(bind_program.contains("logical_casts: &logical_casts"));
+	assert!(bind_program.contains("logical_type_specs: &logical_casts"));
+	assert!(bind_program.contains("logical_type_registry: &logical_type_registry"));
 	assert!(collect.contains("Expr::SqlLogicalCast"));
 	assert!(collect.contains("names.insert(logical_name.clone())"));
+	assert!(collect.contains("Expr::SqlConvert"));
+	assert!(collect.contains("names.insert(target_logical_name.clone())"));
 	assert!(!resolve.contains("logical_type_spec_by_name"));
 	assert!(!resolve.contains("seed_logical_type_spec_by_name"));
 }
@@ -916,6 +943,206 @@ pub(crate) fn adr092_sql_logical_cast_does_not_add_execution_kernel_or_pbc_opcod
 	assert!(!exec.contains("fn evaluate_sql_logical_cast"));
 	assert!(!pbc.contains("SqlLogicalCast"));
 	assert!(!pbc.contains("OP_LOGICAL_CAST"));
+}
+
+#[test]
+pub(crate) fn adr167_cast_path_contains_no_unit_transform() {
+	let binder = binder_source();
+	let bind_cast = source_block(&binder, "fn bind_sql_logical_cast");
+
+	assert!(bind_cast.contains("source == spec.physical"));
+	assert!(bind_cast.contains("is_supported_explicit_numeric_cast"));
+	assert!(!bind_cast.contains("scale_to_base"));
+	assert!(!bind_cast.contains("unit_scale_to_f64"));
+	assert!(!bind_cast.contains("bind_sql_convert"));
+	assert!(!bind_cast.contains("SqlConvert"));
+	assert!(!bind_cast.contains("dimension mismatch"));
+}
+
+#[test]
+pub(crate) fn adr167_convert_is_transient_ir_and_bind_desugared() {
+	let ir = ir_source();
+	let execution = execution_source();
+	let binder = binder_source();
+	let expr_enum = ir
+		.split("pub enum Expr")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Expr").next())
+		.expect("Expr enum");
+	let bound_node = source_block(&execution, "pub enum BoundExprNode");
+	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
+	let bind_expr = source_block(&binder, "fn bind_expr_into_program");
+	let bind_convert = source_block(&binder, "fn bind_sql_convert");
+
+	assert!(expr_enum.contains("SqlConvert {"));
+	assert!(expr_enum.contains("target_logical_name: String"));
+	assert!(!bound_node.contains("SqlConvert"));
+	assert!(!execution_plan.contains("SqlConvert"));
+	assert!(bind_expr.contains("Expr::SqlConvert"));
+	assert!(bind_expr.contains("bind_sql_convert"));
+	assert!(bind_convert.contains("unit_scale_to_f64(&source_unit.scale_to_base)"));
+	assert!(bind_convert.contains("unit_scale_to_f64(&target_unit.scale_to_base)"));
+	assert!(bind_convert.contains("builder.append_literal(ScalarValue::Float64"));
+	assert!(bind_convert.contains("builder.append_binary(BoundBinaryOp::Mul"));
+	assert!(bind_convert.contains("builder.set_node_logical_type(output, target_spec.id)"));
+}
+
+#[test]
+pub(crate) fn adr167_no_executor_kernel_or_pbc_opcode() {
+	let ir = ir_source();
+	let exec = exec_source();
+	let pbc = pbc_source();
+	let pbc_helper = source_block(&ir, "pub fn is_pbc_pushdown_eligible");
+
+	assert!(pbc_helper.contains("Self::SqlConvert { .. }"));
+	assert!(pbc_helper.contains("=> false"));
+	assert!(exec.contains("unresolved SQL CONVERT reached execution"));
+	assert!(!exec.contains("fn evaluate_sql_convert"));
+	assert!(!exec.contains("evaluate_convert"));
+	assert!(!pbc.contains("SqlConvert"));
+	assert!(!pbc.contains("OP_CONVERT"));
+}
+
+#[test]
+pub(crate) fn adr167_units_are_durable_logical_type_metadata_not_arrow_sidecar() {
+	let ir = ir_source();
+	let execution = execution_source();
+	let storage = storage_source();
+	let wendelon = wendelon_compute_source();
+	let spec = source_block(&ir, "pub struct LogicalTypeSpec");
+	let create_plan = source_block(&execution, "pub enum ExecutionPlan");
+	let create_request = source_block(&storage, "pub struct CreateLogicalTypeRequest");
+	let field_writer = source_block(&ir, "pub fn field_with_logical_type_metadata");
+
+	assert!(spec.contains("pub unit: Option<LogicalTypeUnit>"));
+	assert!(create_plan.contains("unit: Option<wendelon_client::LogicalTypeUnit>"));
+	assert!(create_request.contains("pub unit: Option<wendelon_client::LogicalTypeUnit>"));
+	assert!(wendelon.contains("pub struct LogicalTypeUnit"));
+	assert!(wendelon.contains("pub unit: Option<LogicalTypeUnit>"));
+	assert!(field_writer.contains("LOGICAL_TYPE_ID_METADATA_KEY"));
+	assert!(!field_writer.contains("LogicalTypeUnit"));
+	assert!(!field_writer.contains("scale_to_base"));
+	assert!(!field_writer.contains("dimension"));
+}
+
+#[test]
+pub(crate) fn adr167_unit_sql_resolution_is_durable_only_not_seed_first() {
+	let binder = binder_source();
+	let planner = sql_planner_source();
+	let resolve = source_block(&binder, "async fn resolve_logical_casts");
+	let collect = source_block(&binder, "fn collect_logical_cast_names");
+	let bind_convert = source_block(&binder, "fn bind_sql_convert");
+	let lower_convert = source_block(&planner, "fn lower_convert(");
+	let lower_convert_ast = source_block(&planner, "fn lower_convert_ast");
+	let lower_target = source_block(&planner, "fn lower_convert_target_logical_name");
+
+	assert!(resolve.contains("resolve_durable_logical_type_by_name(&name)"));
+	assert!(!resolve.contains("logical_type_spec_by_name"));
+	assert!(!resolve.contains("seed_logical_type_spec_by_name"));
+	assert!(collect.contains("Expr::SqlConvert"));
+	assert!(collect.contains("names.insert(target_logical_name.clone())"));
+	assert!(bind_convert.contains("logical_type_specs"));
+	assert!(bind_convert.contains("LogicalTypeResolver::with_registry(ctx.logical_type_registry)"));
+	assert!(!bind_convert.contains("seed_logical_type_spec"));
+	assert!(lower_convert.contains("Expr::SqlConvert"));
+	assert!(lower_convert_ast.contains("Expr::SqlConvert"));
+	assert!(lower_target.contains("validate_sql_logical_type_name"));
+	assert!(!lower_convert.contains("resolve_durable_logical_type_by_name"));
+	assert!(!lower_convert_ast.contains("resolve_durable_logical_type_by_name"));
+	assert!(!lower_target.contains("resolve_durable_logical_type_by_name"));
+}
+
+#[test]
+pub(crate) fn adr167_dimensioned_arithmetic_rejects_implicit_unit_coercion() {
+	let binder = binder_source();
+	let arithmetic = source_block(&binder, "fn bind_arithmetic");
+	let dimensioned = source_block(&binder, "fn bind_dimensioned_arithmetic");
+	let comparison = source_block(&binder, "fn bind_dimensioned_comparison");
+	let compatible = source_block(&binder, "fn require_compatible_units");
+	let dimensioned_call = arithmetic
+		.find("bind_dimensioned_arithmetic")
+		.expect("dimensioned arithmetic gate");
+	let numeric_fallback = arithmetic
+		.find("arithmetic_output_type(&left_type, &right_type)")
+		.expect("ordinary numeric fallback");
+
+	assert!(dimensioned_call < numeric_fallback);
+	assert!(dimensioned.contains("BoundBinaryOp::Add | BoundBinaryOp::Sub"));
+	assert!(dimensioned.contains("unit arithmetic requires both operands"));
+	assert!(
+		dimensioned.contains("unit multiplication that creates derived dimensions is deferred")
+	);
+	assert!(dimensioned.contains("naked numeric divided by a unit is deferred"));
+	assert!(comparison.contains("unit comparison requires both operands"));
+	assert!(compatible.contains("require explicit CONVERT"));
+	assert!(compatible.contains("dimension mismatch"));
+}
+
+#[test]
+pub(crate) fn adr167_linear_float64_only_no_affine_offset() {
+	let binder = binder_source();
+	let planner = sql_planner_source();
+	let wendelon = wendelon_compute_source();
+	let bind_convert = source_block(&binder, "fn bind_sql_convert");
+	let unit_scale = source_block(&binder, "fn unit_scale_to_f64");
+	let parse_clauses = source_block(&planner, "fn parse_create_logical_type_clauses");
+	let scale_parser = source_block(&planner, "fn parse_positive_decimal_scale");
+	let unit_validate = source_block(&wendelon, "impl LogicalTypeUnit");
+
+	assert!(parse_clauses.contains("LogicalTypePhysical::Float64"));
+	assert!(unit_validate.contains("LogicalTypePhysical::Float64"));
+	assert!(scale_parser.contains("numerator == 0"));
+	assert!(unit_scale.contains("scale.numerator as f64 / scale.denominator as f64"));
+	assert!(bind_convert.contains("source_type != DataType::Float64"));
+	assert!(bind_convert.contains("target_spec.physical != DataType::Float64"));
+	assert!(bind_convert.contains("builder.append_binary(BoundBinaryOp::Mul"));
+	assert!(!bind_convert.contains("BoundBinaryOp::Add"));
+	assert!(!bind_convert.contains("BoundBinaryOp::Sub"));
+	for source in [bind_convert, parse_clauses, unit_validate] {
+		assert!(!source.to_ascii_lowercase().contains("offset"));
+		assert!(!source.to_ascii_lowercase().contains("affine"));
+	}
+}
+
+#[test]
+pub(crate) fn adr167_frontends_share_convert_bind_path() {
+	let planner = sql_planner_source();
+	let rune = rune_engine_source();
+	let binder = binder_source();
+	let lower_sql = source_block(&planner, "fn lower_convert(");
+	let lower_sql_ast = source_block(&planner, "fn lower_convert_ast");
+	let rune_convert = source_block(&rune, "pub fn convert");
+	let rune_module = source_block(&rune, "pub fn create_toron_module");
+	let bind_expr = source_block(&binder, "fn bind_expr_into_program");
+
+	assert!(lower_sql.contains("Expr::SqlConvert"));
+	assert!(lower_sql_ast.contains("Expr::SqlConvert"));
+	assert!(rune_convert.contains("Expr::SqlConvert"));
+	assert!(rune_module.contains("m.function([\"convert\"], convert).build()?"));
+	assert!(rune_module.contains("m.associated_function(\"convert\", RuneExpr::convert)?"));
+	assert!(bind_expr.contains("Expr::SqlConvert"));
+	assert!(bind_expr.contains("bind_sql_convert"));
+}
+
+#[test]
+pub(crate) fn adr167_wendelon_unit_names_are_brand_clean_and_unsuffixed() {
+	let wendelon = wendelon_compute_source();
+	let client = wendelon_client_lib_source();
+
+	assert!(wendelon.contains("pub struct UnitScale"));
+	assert!(wendelon.contains("pub struct LogicalTypeUnit"));
+	assert!(client.contains("LogicalTypeUnit"));
+	assert!(client.contains("UnitScale"));
+	for bad_name in [
+		"UnitScaleV1",
+		"LogicalTypeUnitV1",
+		"DimensionedQuantityV1",
+		"UnitDescriptorV1",
+		"UnitPolicyV1",
+	] {
+		assert!(!wendelon.contains(bad_name));
+		assert!(!client.contains(bad_name));
+	}
 }
 
 #[test]

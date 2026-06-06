@@ -34,6 +34,7 @@ fn planner_accepts_create_logical_type_surface() {
 		name,
 		physical,
 		refinement,
+		unit,
 	} = plan
 	else {
 		panic!("expected create logical type");
@@ -41,6 +42,7 @@ fn planner_accepts_create_logical_type_surface() {
 	assert_eq!(name, "CustomerId");
 	assert_eq!(physical, DataType::Int64);
 	assert!(refinement.is_none());
+	assert!(unit.is_none());
 }
 
 #[test]
@@ -163,6 +165,7 @@ fn logical_type_definition_survives_catalog_resync() {
 				name: "PersonId".to_string(),
 				physical: LogicalTypePhysical::Int64,
 				refinement: None,
+				unit: None,
 			},
 		)
 		.expect("create durable definition");
@@ -242,6 +245,7 @@ async fn binder_lowers_create_logical_type_without_engine_surface_changes() {
 		name,
 		physical,
 		refinement,
+		unit,
 	} = bound
 	else {
 		panic!("expected create logical type execution plan");
@@ -249,6 +253,7 @@ async fn binder_lowers_create_logical_type_without_engine_surface_changes() {
 	assert_eq!(name, "PersonId");
 	assert_eq!(physical, DataType::Int64);
 	assert!(refinement.is_none());
+	assert!(unit.is_none());
 }
 
 #[derive(Default)]
@@ -291,6 +296,7 @@ impl StorageAdmin for LogicalTypeAdmin {
 					name: request.name,
 					physical: request.physical,
 					refinement: request.refinement,
+					unit: request.unit,
 				},
 			)
 			.map_err(|error| StorageError::Internal {
@@ -306,6 +312,7 @@ fn person_id_definition() -> LogicalTypeDefinition {
 		name: "PersonId".to_string(),
 		physical: LogicalTypePhysical::Int64,
 		refinement: None,
+		unit: None,
 	}
 }
 

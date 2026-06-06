@@ -546,6 +546,35 @@ pub fn lit_i64(value: i64) -> RuneExpr {
 	}
 }
 
+pub fn convert(expr: RuneExpr, target_logical_name: String) -> VmResult<RuneExpr> {
+	match validate_rune_logical_type_name("CONVERT", &target_logical_name) {
+		Ok(target_logical_name) => VmResult::Ok(RuneExpr {
+			expr: Expr::SqlConvert {
+				expr: Box::new(expr.expr),
+				target_logical_name,
+			},
+		}),
+		Err(error) => VmResult::panic(error),
+	}
+}
+
+fn validate_rune_logical_type_name(context: &'static str, name: &str) -> Result<String, String> {
+	if name.eq_ignore_ascii_case("naked") {
+		return Err(format!(
+			"{context} logical type name cannot be the naked sentinel"
+		));
+	}
+	if name
+		.bytes()
+		.any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+	{
+		return Err(format!(
+			"{context} logical type names must be one-part ASCII identifiers"
+		));
+	}
+	Ok(name.to_string())
+}
+
 pub fn lit_date(value: String) -> VmResult<RuneExpr> {
 	match parse_date_ymd(&value) {
 		Ok(value) => VmResult::Ok(RuneExpr {
@@ -916,6 +945,10 @@ impl RuneExpr {
 		}
 	}
 
+	pub fn convert(self, target_logical_name: String) -> VmResult<RuneExpr> {
+		convert(self, target_logical_name)
+	}
+
 	fn logical_ascription(self, logical_type: LogicalTypeId) -> RuneExpr {
 		RuneExpr {
 			expr: Expr::LogicalAscription {
@@ -1018,6 +1051,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lit_f64"], lit_f64).build()?;
 	m.function(["lit_bool"], lit_bool).build()?;
 	m.function(["lit_i64"], lit_i64).build()?;
+	m.function(["convert"], convert).build()?;
 	m.function(["lit_date"], lit_date).build()?;
 	m.function(["lit_timestamp"], lit_timestamp).build()?;
 	m.function(["nanoseconds"], nanoseconds).build()?;
@@ -1099,6 +1133,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("div", RuneExpr::div)?;
 	m.associated_function("cast", RuneExpr::cast)?;
 	m.associated_function("try_cast", RuneExpr::try_cast)?;
+	m.associated_function("convert", RuneExpr::convert)?;
 	m.associated_function(
 		rune::Params::new("as_logical_type", [CustomerId::HASH]),
 		RuneExpr::as_customer_id,

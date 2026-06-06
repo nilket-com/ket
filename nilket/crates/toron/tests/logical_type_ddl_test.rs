@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{BooleanArray, Int32Array, Int64Array, StringArray};
+use arrow::array::{BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -33,7 +33,7 @@ use wendelon::schema::{
 };
 use wendelon_client::{
 	LogicalTypeDefinition, LogicalTypePhysical, LogicalTypeRefinementComparisonOp,
-	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
+	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, UnitScale,
 };
 
 #[tokio::test]
@@ -88,6 +88,7 @@ fn ddl_create_logical_type_check_lowers_portable_refinement() {
 		name,
 		physical,
 		refinement: Some(refinement),
+		unit,
 	} = plan
 	else {
 		panic!("expected refined create logical type");
@@ -95,6 +96,7 @@ fn ddl_create_logical_type_check_lowers_portable_refinement() {
 
 	assert_eq!(name, "PersonId");
 	assert_eq!(physical, DataType::Int64);
+	assert!(unit.is_none());
 	assert_eq!(
 		refinement,
 		LogicalTypeRefinementPredicate::And(vec![
@@ -113,6 +115,35 @@ fn ddl_create_logical_type_check_lowers_portable_refinement() {
 }
 
 #[test]
+fn ddl_create_logical_type_unit_metadata_lowers() {
+	let plan = SqlPlanner::new()
+		.plan("CREATE LOGICAL TYPE Mile AS DOUBLE DIMENSION Length SCALE_TO_BASE 1609.344")
+		.expect("plan dimensioned logical type");
+
+	let LogicalPlan::CreateLogicalType {
+		name,
+		physical,
+		refinement,
+		unit: Some(unit),
+	} = plan
+	else {
+		panic!("expected dimensioned create logical type");
+	};
+
+	assert_eq!(name, "Mile");
+	assert_eq!(physical, DataType::Float64);
+	assert!(refinement.is_none());
+	assert_eq!(unit.dimension, "Length");
+	assert_eq!(
+		unit.scale_to_base,
+		UnitScale {
+			numerator: 201168,
+			denominator: 125,
+		}
+	);
+}
+
+#[test]
 fn ddl_create_logical_type_check_rejects_unbounded_boolean_shapes() {
 	for sql in [
 		"CREATE LOGICAL TYPE PersonId AS BIGINT CHECK (VALUE > 0 OR VALUE < -10)",
@@ -122,6 +153,30 @@ fn ddl_create_logical_type_check_rejects_unbounded_boolean_shapes() {
 			.plan(sql)
 			.expect_err("unsupported refinement shape rejects");
 		assert!(format!("{err:?}").contains("does not support"));
+	}
+}
+
+#[test]
+fn ddl_create_logical_type_unit_metadata_rejects_non_float64_and_invalid_scale() {
+	for (sql, diagnostic) in [
+		(
+			"CREATE LOGICAL TYPE Bad AS BIGINT DIMENSION Length SCALE_TO_BASE 1",
+			"unit metadata requires",
+		),
+		(
+			"CREATE LOGICAL TYPE Bad AS DOUBLE DIMENSION Length SCALE_TO_BASE 0",
+			"must be greater than zero",
+		),
+		(
+			"CREATE LOGICAL TYPE Bad AS DOUBLE DIMENSION app.Length SCALE_TO_BASE 1",
+			"one-part unquoted ASCII identifier",
+		),
+	] {
+		let err = SqlPlanner::new().plan(sql).expect_err(sql);
+		assert!(
+			err.to_string().contains(diagnostic),
+			"expected diagnostic {diagnostic:?}, got {err}"
+		);
 	}
 }
 
@@ -519,6 +574,52 @@ fn logical_cast_planner_rejects_bounded_invalid_logical_type_name_shapes() {
 	}
 }
 
+#[test]
+fn convert_planner_records_custom_target_without_catalog_resolution() {
+	let plan = SqlPlanner::new()
+		.plan("SELECT CONVERT(distance, Kilometer) AS km FROM trips")
+		.expect("planner records custom CONVERT target");
+	let LogicalPlan::Project { exprs, .. } = plan else {
+		panic!("expected project");
+	};
+	let toron::ir::Expr::SqlConvert {
+		target_logical_name,
+		..
+	} = &exprs[0]
+	else {
+		panic!("expected transient SQL CONVERT");
+	};
+	assert_eq!(target_logical_name, "Kilometer");
+}
+
+#[test]
+fn convert_planner_rejects_bounded_invalid_logical_type_name_shapes() {
+	for (sql, diagnostic) in [
+		(
+			"SELECT CONVERT(distance, naked) FROM trips",
+			"naked sentinel",
+		),
+		(
+			r#"SELECT CONVERT(distance, "Kilometer") FROM trips"#,
+			"unquoted ASCII identifiers",
+		),
+		(
+			"SELECT CONVERT(distance, app.Kilometer) FROM trips",
+			"one-part names",
+		),
+		(
+			"SELECT CONVERT(distance, Kilometer(1)) FROM trips",
+			"do not support modifiers",
+		),
+	] {
+		let err = SqlPlanner::new().plan(sql).expect_err(sql);
+		assert!(
+			err.to_string().contains(diagnostic),
+			"expected diagnostic {diagnostic:?}, got {err}"
+		);
+	}
+}
+
 #[tokio::test]
 async fn logical_cast_static_seed_does_not_satisfy_sql_name() {
 	let (catalog, coordinator, planner) = logical_type_coordinator();
@@ -742,6 +843,211 @@ async fn logical_cast_same_physical_utf8_ascribes_without_cast_kernel() {
 		exprs.root_logical_type(0),
 		Some(LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID))
 	);
+}
+
+#[tokio::test]
+async fn convert_cast_mile_to_kilometer_preserves_quantity_and_carries_target_identity() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	let bound = bind_sql(
+		&catalog,
+		&planner,
+		"SELECT CONVERT(distance, Kilometer) AS km FROM trips",
+	)
+	.await;
+	let ExecutionPlan::Project {
+		exprs,
+		output_schema,
+		..
+	} = bound
+	else {
+		panic!("expected project");
+	};
+	let root = exprs.single_root().expect("single projection root");
+	assert!(matches!(
+		exprs.node(root),
+		Some(BoundExprNode::Binary {
+			op: toron::ir::BoundBinaryOp::Mul,
+			..
+		})
+	));
+	assert_eq!(exprs.root_type(0), Some(&DataType::Float64));
+	assert_eq!(
+		exprs.root_logical_type(0),
+		Some(LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 1))
+	);
+	assert_eq!(
+		decode_column_logical_type(output_schema.field(0)).expect("decode projection identity"),
+		LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID + 1)
+	);
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT CONVERT(distance, Kilometer) AS km FROM trips",
+	)
+	.await;
+	let rows = float64_rows(&batch, 0);
+	let [Some(value)] = rows.as_slice() else {
+		panic!("expected single converted value");
+	};
+	assert!((*value - 1.609344).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn convert_rejects_naked_source_nondimensioned_target_and_cross_dimension() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	for (sql, diagnostic) in [
+		(
+			"SELECT CONVERT(raw, Kilometer) FROM trips",
+			"source must be a dimensioned",
+		),
+		(
+			"SELECT CONVERT(distance, CustomerId) FROM trips",
+			"target must be a dimensioned",
+		),
+		(
+			"SELECT CONVERT(distance, Kilogram) FROM trips",
+			"dimension mismatch",
+		),
+	] {
+		let err = bind_sql_error(&catalog, &planner, sql).await;
+		let message = format!("{err:?}");
+		assert!(
+			message.contains(diagnostic),
+			"expected diagnostic {diagnostic:?}, got {message}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn same_unit_add_preserves_unit() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	let sum = bind_sql(&catalog, &planner, "SELECT distance + distance FROM trips").await;
+	assert_project_identity(sum, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+	let sum = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT distance + distance FROM trips",
+	)
+	.await;
+	assert_eq!(float64_rows(&sum, 0), vec![Some(2.0)]);
+}
+
+#[tokio::test]
+async fn same_dimension_different_unit_arithmetic_requires_convert() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT distance + other_distance FROM trips",
+		"require explicit CONVERT",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn cross_dimension_arithmetic_rejects() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	expect_plan_or_bind_error_contains(
+		&catalog,
+		&planner,
+		"SELECT distance + mass FROM trips",
+		"dimension mismatch",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn unit_plus_naked_numeric_rejects() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	for sql in [
+		"SELECT distance + raw FROM trips",
+		"SELECT distance + 3.0 FROM trips",
+		"SELECT 3.0 + distance FROM trips",
+	] {
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, "requires both operands").await;
+	}
+}
+
+#[tokio::test]
+async fn dimensioned_scalar_multiplication_preserves_unit() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	for (sql, expected) in [
+		("SELECT distance * 2.0 FROM trips", 2.0),
+		("SELECT 2.0 * distance FROM trips", 2.0),
+		("SELECT distance / 2.0 FROM trips", 0.5),
+	] {
+		let bound = bind_sql(&catalog, &planner, sql).await;
+		assert_project_identity(bound, LogicalTypeId(DURABLE_LOGICAL_TYPE_MIN_ID));
+		let batch = concat_query(&coordinator, &planner, sql).await;
+		assert_eq!(float64_rows(&batch, 0), vec![Some(expected)]);
+	}
+}
+
+#[tokio::test]
+async fn derived_dimension_multiplication_is_deferred() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	for (sql, diagnostic) in [
+		(
+			"SELECT distance * distance FROM trips",
+			"derived dimensions",
+		),
+		("SELECT distance / distance FROM trips", "creates ratios"),
+		(
+			"SELECT 2.0 / distance FROM trips",
+			"naked numeric divided by a unit",
+		),
+	] {
+		expect_plan_or_bind_error_contains(&catalog, &planner, sql, diagnostic).await;
+	}
+}
+
+#[tokio::test]
+async fn dimensioned_comparison_requires_same_unit_or_explicit_convert() {
+	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
+	setup_dimensioned_trips(&coordinator, &planner).await;
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT distance > CAST(0.5 AS Mile) FROM trips",
+	)
+	.await;
+	assert_eq!(bool_rows(&batch, 0), vec![Some(true)]);
+
+	for (sql, diagnostic) in [
+		(
+			"SELECT distance > CAST(1.0 AS Kilometer) FROM trips",
+			"require explicit CONVERT",
+		),
+		(
+			"SELECT distance > raw FROM trips",
+			"unit comparison requires",
+		),
+	] {
+		let err = bind_sql_error(&catalog, &planner, sql).await;
+		let message = format!("{err:?}");
+		assert!(
+			message.contains(diagnostic),
+			"expected diagnostic {diagnostic:?}, got {message}"
+		);
+	}
 }
 
 #[tokio::test]
@@ -1211,6 +1517,7 @@ async fn ctas_try_cast_materializes_nullable_logical_identity_and_survives_resyn
 				name: "CustomerId".to_string(),
 				physical: LogicalTypePhysical::Int64,
 				refinement: None,
+				unit: None,
 			},
 		)
 		.expect("sync logical type definition");
@@ -3270,6 +3577,19 @@ async fn setup_case_identity_orders(coordinator: &QueryCoordinator, planner: &Sq
 	}
 }
 
+async fn setup_dimensioned_trips(coordinator: &QueryCoordinator, planner: &SqlPlanner) {
+	for sql in [
+		"CREATE LOGICAL TYPE Mile AS DOUBLE DIMENSION Length SCALE_TO_BASE 1609.344",
+		"CREATE LOGICAL TYPE Kilometer AS DOUBLE DIMENSION Length SCALE_TO_BASE 1000",
+		"CREATE LOGICAL TYPE Kilogram AS DOUBLE DIMENSION Mass SCALE_TO_BASE 1",
+		"CREATE LOGICAL TYPE CustomerId AS BIGINT",
+		"CREATE TABLE trips (distance Mile, other_distance Kilometer, mass Kilogram, raw DOUBLE)",
+		"INSERT INTO trips VALUES (1.0, 1.0, 1.0, 2.0)",
+	] {
+		execute(coordinator, planner, sql).await;
+	}
+}
+
 async fn bind_sql(catalog: &MockCatalog, planner: &SqlPlanner, sql: &str) -> ExecutionPlan {
 	bind(
 		&planner.plan(sql).expect("plan SQL"),
@@ -3414,6 +3734,7 @@ fn logical_type_definition(
 		name: name.to_string(),
 		physical,
 		refinement,
+		unit: None,
 	}
 }
 
@@ -3450,6 +3771,16 @@ fn int64_rows(batch: &RecordBatch, column: usize) -> Vec<Option<i64>> {
 		.as_any()
 		.downcast_ref::<Int64Array>()
 		.expect("Int64 column")
+		.iter()
+		.collect()
+}
+
+fn float64_rows(batch: &RecordBatch, column: usize) -> Vec<Option<f64>> {
+	batch
+		.column(column)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("Float64 column")
 		.iter()
 		.collect()
 }
@@ -3720,6 +4051,7 @@ impl StorageAdmin for RegisteringLogicalTypeAdmin {
 					name: request.name,
 					physical: request.physical,
 					refinement: request.refinement,
+					unit: request.unit,
 				},
 			)
 			.map_err(|error| StorageError::Internal {

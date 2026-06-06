@@ -325,6 +325,49 @@ pub enum LogicalTypePhysical {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UnitScale {
+	pub numerator: u64,
+	pub denominator: u64,
+}
+
+impl UnitScale {
+	pub fn validate(&self) -> std::io::Result<()> {
+		if self.numerator == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"logical type unit scale numerator must be nonzero",
+			));
+		}
+		if self.denominator == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"logical type unit scale denominator must be nonzero",
+			));
+		}
+		Ok(())
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LogicalTypeUnit {
+	pub dimension: String,
+	pub scale_to_base: UnitScale,
+}
+
+impl LogicalTypeUnit {
+	pub fn validate_for_physical(&self, physical: LogicalTypePhysical) -> std::io::Result<()> {
+		if physical != LogicalTypePhysical::Float64 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"logical type unit metadata requires Float64 physical carrier",
+			));
+		}
+		validate_logical_type_unit_dimension(&self.dimension)?;
+		self.scale_to_base.validate()
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogicalTypeRefinementPredicate {
 	Comparison {
@@ -385,6 +428,8 @@ pub struct LogicalTypeDefinitionCreate {
 	pub name: String,
 	pub physical: LogicalTypePhysical,
 	pub refinement: Option<LogicalTypeRefinementPredicate>,
+	#[serde(default)]
+	pub unit: Option<LogicalTypeUnit>,
 }
 
 impl LogicalTypeDefinitionCreate {
@@ -392,6 +437,9 @@ impl LogicalTypeDefinitionCreate {
 		validate_logical_type_name(self.name.as_str())?;
 		if let Some(refinement) = &self.refinement {
 			refinement.validate_for_physical(self.physical)?;
+		}
+		if let Some(unit) = &self.unit {
+			unit.validate_for_physical(self.physical)?;
 		}
 		Ok(())
 	}
@@ -403,6 +451,8 @@ pub struct LogicalTypeDefinition {
 	pub name: String,
 	pub physical: LogicalTypePhysical,
 	pub refinement: Option<LogicalTypeRefinementPredicate>,
+	#[serde(default)]
+	pub unit: Option<LogicalTypeUnit>,
 }
 
 impl LogicalTypeDefinition {
@@ -416,6 +466,9 @@ impl LogicalTypeDefinition {
 		validate_logical_type_name(self.name.as_str())?;
 		if let Some(refinement) = &self.refinement {
 			refinement.validate_for_physical(self.physical)?;
+		}
+		if let Some(unit) = &self.unit {
+			unit.validate_for_physical(self.physical)?;
 		}
 		Ok(())
 	}
@@ -453,12 +506,15 @@ impl LogicalTypeCatalog {
 						"logical type catalog name index references a missing id",
 					)
 				})?;
-			if existing.physical == create.physical && existing.refinement == create.refinement {
+			if existing.physical == create.physical
+				&& existing.refinement == create.refinement
+				&& existing.unit == create.unit
+			{
 				return Ok(existing.clone());
 			}
 			return Err(Error::new(
 				ErrorKind::AlreadyExists,
-				"logical type name already exists with a different physical type or refinement",
+				"logical type name already exists with a different physical type, refinement, or unit metadata",
 			));
 		}
 		let definition = LogicalTypeDefinition {
@@ -466,6 +522,7 @@ impl LogicalTypeCatalog {
 			name: create.name,
 			physical: create.physical,
 			refinement: create.refinement,
+			unit: create.unit,
 		};
 		definition.validate()?;
 		let id_key = LogicalTypeIdCatalogKey {
@@ -716,6 +773,31 @@ fn validate_logical_type_name(value: &str) -> std::io::Result<()> {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"naked is a reserved logical type sentinel",
+		));
+	}
+	Ok(())
+}
+
+fn validate_logical_type_unit_dimension(value: &str) -> std::io::Result<()> {
+	if value.is_empty() || value.len() > 128 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"logical type unit dimension length is out of bounds",
+		));
+	}
+	if value.eq_ignore_ascii_case("naked") {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"naked is a reserved logical type unit dimension",
+		));
+	}
+	if !value
+		.bytes()
+		.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"logical type unit dimension must be a one-part ASCII identifier",
 		));
 	}
 	Ok(())

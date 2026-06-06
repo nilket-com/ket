@@ -301,6 +301,7 @@ pub enum ExecutionPlan {
 		name: String,
 		physical: DataType,
 		refinement: Option<LogicalTypeRefinementPredicate>,
+		unit: Option<wendelon_client::LogicalTypeUnit>,
 	},
 	CreateTableAsSelect {
 		table: TableRef,

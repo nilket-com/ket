@@ -45,7 +45,7 @@ use wendelon_client::{
 	ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32, ARROW_STATS_TAG_INT64,
 	ARROW_STATS_TAG_TIMESTAMP_MICROSECOND, ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
 	ARROW_STATS_TAG_TIMESTAMP_NANOSECOND, ARROW_STATS_TAG_UTF8, LogicalTypeRefinementComparisonOp,
-	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor,
+	LogicalTypeRefinementPredicate, LogicalTypeRefinementValue, TableSchemaDescriptor, UnitScale,
 	decode_float32_optimizer_fact_scalar, decode_float64_optimizer_fact_scalar,
 	decode_signed_optimizer_fact_scalar,
 };
@@ -522,7 +522,8 @@ struct BuildByteCandidate {
 struct ExprBindContext<'a> {
 	config: &'a PlannerConfig,
 	session_timezone: Tz,
-	logical_casts: &'a HashMap<String, LogicalTypeSpec>,
+	logical_type_specs: &'a HashMap<String, LogicalTypeSpec>,
+	logical_type_registry: &'a LogicalTypeRegistry,
 	relation_scope: Option<&'a RelationScope>,
 }
 
@@ -814,11 +815,13 @@ impl<'a> Binder<'a> {
 					name,
 					physical,
 					refinement,
+					unit,
 				} => Ok(ScopedExecutionPlan::empty_scope(
 					ExecutionPlan::CreateLogicalType {
 						name: name.clone(),
 						physical: physical.clone(),
 						refinement: refinement.clone(),
+						unit: unit.clone(),
 					},
 				)),
 				LogicalPlan::CreateTableAsSelect {
@@ -960,10 +963,12 @@ impl<'a> Binder<'a> {
 		relation_scope: Option<&RelationScope>,
 	) -> Result<BoundExprProgram, BindingError> {
 		let logical_casts = self.resolve_logical_casts(exprs).await?;
+		let logical_type_registry = self.catalog.logical_type_registry();
 		let ctx = ExprBindContext {
 			config: self.config,
 			session_timezone: self.config.resolved_session_timezone()?,
-			logical_casts: &logical_casts,
+			logical_type_specs: &logical_casts,
+			logical_type_registry: &logical_type_registry,
 			relation_scope,
 		};
 		bind_expr_program(exprs, input_schema, &ctx)
@@ -995,10 +1000,12 @@ impl<'a> Binder<'a> {
 		relation_scope: Option<&RelationScope>,
 	) -> Result<BoundExprProgram, BindingError> {
 		let logical_casts = self.resolve_logical_casts(exprs).await?;
+		let logical_type_registry = self.catalog.logical_type_registry();
 		let ctx = ExprBindContext {
 			config: self.config,
 			session_timezone: self.config.resolved_session_timezone()?,
-			logical_casts: &logical_casts,
+			logical_type_specs: &logical_casts,
+			logical_type_registry: &logical_type_registry,
 			relation_scope,
 		};
 		bind_expr_program_with_null_policy(
@@ -1028,10 +1035,12 @@ impl<'a> Binder<'a> {
 		relation_scope: Option<&RelationScope>,
 	) -> Result<BoundAggregateCall, BindingError> {
 		let logical_casts = self.resolve_logical_casts(args).await?;
+		let logical_type_registry = self.catalog.logical_type_registry();
 		let ctx = ExprBindContext {
 			config: self.config,
 			session_timezone: self.config.resolved_session_timezone()?,
-			logical_casts: &logical_casts,
+			logical_type_specs: &logical_casts,
+			logical_type_registry: &logical_type_registry,
 			relation_scope,
 		};
 		bind_aggregate_call(function, args, input_schema, &ctx)
@@ -1733,6 +1742,7 @@ fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), Bindi
 		Expr::Column(_) | Expr::Literal(_) | Expr::UntypedNull => Ok(()),
 		Expr::LogicalAscription { expr: inner, .. }
 		| Expr::SqlLogicalCast { expr: inner, .. }
+		| Expr::SqlConvert { expr: inner, .. }
 		| Expr::Cast(inner, _)
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)
@@ -1793,6 +1803,13 @@ fn collect_logical_cast_names(
 			try_cast: _,
 		} => {
 			names.insert(logical_name.clone());
+			collect_logical_cast_names(expr, names)
+		}
+		Expr::SqlConvert {
+			expr,
+			target_logical_name,
+		} => {
+			names.insert(target_logical_name.clone());
 			collect_logical_cast_names(expr, names)
 		}
 		Expr::LogicalAscription { expr, .. }
@@ -6437,6 +6454,7 @@ fn join_key_column_ref(expr: &Expr) -> Result<(&ColumnRef, LogicalTypeId), Bindi
 			_ => Err(BindingError::JoinComputedKeyUnsupported),
 		},
 		Expr::SqlLogicalCast { .. } => Err(BindingError::JoinComputedKeyUnsupported),
+		Expr::SqlConvert { .. } => Err(BindingError::JoinComputedKeyUnsupported),
 		Expr::Eq(_, _) => Err(BindingError::JoinPredicateNotEqui),
 		_ => Err(BindingError::JoinComputedKeyUnsupported),
 	}
@@ -7480,11 +7498,13 @@ fn optimize_for_required(
 			name,
 			physical,
 			refinement,
+			unit,
 		} => Ok((
 			ExecutionPlan::CreateLogicalType {
 				name,
 				physical,
 				refinement,
+				unit,
 			},
 			OrdinalRemap::new(),
 		)),
@@ -8091,6 +8111,10 @@ fn bind_expr_into_program(
 			logical_name,
 			try_cast,
 		} => bind_sql_logical_cast(builder, input_schema, ctx, expr, logical_name, *try_cast),
+		Expr::SqlConvert {
+			expr,
+			target_logical_name,
+		} => bind_sql_convert(builder, input_schema, ctx, expr, target_logical_name),
 		Expr::Cast(inner, target) => bind_explicit_cast(builder, input_schema, ctx, inner, target),
 		Expr::TryCast(inner, target) => bind_try_cast(builder, input_schema, ctx, inner, target),
 		Expr::Add(left, right) => {
@@ -8963,14 +8987,11 @@ fn bind_sql_logical_cast(
 	logical_name: &str,
 	try_cast: bool,
 ) -> Result<BoundExprId, BindingError> {
-	let spec =
-		ctx.logical_casts
-			.get(logical_name)
-			.ok_or_else(|| BindingError::UnsupportedExpression {
-				message: format!(
-					"internal: SQL logical CAST target {logical_name} was not resolved"
-				),
-			})?;
+	let spec = ctx.logical_type_specs.get(logical_name).ok_or_else(|| {
+		BindingError::UnsupportedExpression {
+			message: format!("internal: SQL logical CAST target {logical_name} was not resolved"),
+		}
+	})?;
 	if is_untyped_null(inner) {
 		let output = resolve_untyped_null(builder, &spec.physical)?;
 		let existing = builder
@@ -9022,6 +9043,87 @@ fn bind_sql_logical_cast(
 		});
 	}
 	Ok(output)
+}
+
+fn bind_sql_convert(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	inner: &Expr,
+	target_logical_name: &str,
+) -> Result<BoundExprId, BindingError> {
+	let target_spec = ctx
+		.logical_type_specs
+		.get(target_logical_name)
+		.ok_or_else(|| BindingError::UnsupportedExpression {
+			message: format!("internal: SQL CONVERT target {target_logical_name} was not resolved"),
+		})?;
+	let target_unit = target_spec
+		.unit
+		.as_ref()
+		.ok_or_else(|| BindingError::TypeMismatch {
+			message: "CONVERT target must be a dimensioned logical type".to_string(),
+		})?;
+	if target_spec.physical != DataType::Float64 {
+		return Err(BindingError::TypeMismatch {
+			message: "CONVERT supports Float64 dimensioned logical types only".to_string(),
+		});
+	}
+
+	let source = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+	let source_type = builder
+		.node_type(source)
+		.cloned()
+		.expect("builder returns typed CONVERT source");
+	let source_logical = builder
+		.node_logical_type(source)
+		.expect("builder returns logical type for CONVERT source");
+	let source_spec = LogicalTypeResolver::with_registry(ctx.logical_type_registry)
+		.spec(source_logical)
+		.ok_or_else(|| BindingError::TypeMismatch {
+			message: "CONVERT source must be a dimensioned logical type".to_string(),
+		})?;
+	let source_unit = source_spec
+		.unit
+		.as_ref()
+		.ok_or_else(|| BindingError::TypeMismatch {
+			message: "CONVERT source must be a dimensioned logical type".to_string(),
+		})?;
+	if source_type != DataType::Float64 || source_spec.physical != DataType::Float64 {
+		return Err(BindingError::TypeMismatch {
+			message: "CONVERT supports Float64 dimensioned logical types only".to_string(),
+		});
+	}
+	if source_unit.dimension != target_unit.dimension {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"CONVERT dimension mismatch: source {} is {}, target {} is {}",
+				source_spec.name, source_unit.dimension, target_spec.name, target_unit.dimension
+			),
+		});
+	}
+	let factor = unit_scale_to_f64(&source_unit.scale_to_base)
+		/ unit_scale_to_f64(&target_unit.scale_to_base);
+	if !factor.is_finite() || factor <= 0.0 {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"CONVERT scale from {} to {} is invalid",
+				source_spec.name, target_spec.name
+			),
+		});
+	}
+	let factor = builder.append_literal(ScalarValue::Float64(Some(factor)));
+	let output = builder.append_binary(BoundBinaryOp::Mul, source, factor, DataType::Float64);
+	if !builder.set_node_logical_type(output, target_spec.id) {
+		return Err(BindingError::UnsupportedExpression {
+			message: "CONVERT target logical identity is malformed".to_string(),
+		});
+	}
+	Ok(output)
+}
+
+fn unit_scale_to_f64(scale: &UnitScale) -> f64 {
+	scale.numerator as f64 / scale.denominator as f64
 }
 
 fn validate_logical_ascription_physical(
@@ -9149,6 +9251,11 @@ fn bind_arithmetic(
 		}
 		return Ok(builder.append_binary(op, left, right, output_type));
 	}
+	if let Some(output) =
+		bind_dimensioned_arithmetic(builder, ctx, left, right, &left_type, &right_type, &op)?
+	{
+		return Ok(output);
+	}
 	let output_type =
 		arithmetic_output_type(&left_type, &right_type).ok_or_else(|| {
 			BindingError::TypeMismatch {
@@ -9160,6 +9267,204 @@ fn bind_arithmetic(
 	let left = cast_if_needed(builder, left, &output_type)?;
 	let right = cast_if_needed(builder, right, &output_type)?;
 	Ok(builder.append_binary(op, left, right, output_type))
+}
+
+fn bind_dimensioned_arithmetic(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	left: BoundExprId,
+	right: BoundExprId,
+	left_type: &DataType,
+	right_type: &DataType,
+	op: &BoundBinaryOp,
+) -> Result<Option<BoundExprId>, BindingError> {
+	let left_logical = builder
+		.node_logical_type(left)
+		.expect("builder returns logical type for arithmetic left");
+	let right_logical = builder
+		.node_logical_type(right)
+		.expect("builder returns logical type for arithmetic right");
+	let left_unit = logical_unit_for_node(ctx, builder, left)?;
+	let right_unit = logical_unit_for_node(ctx, builder, right)?;
+	if left_unit.is_none() && right_unit.is_none() {
+		return Ok(None);
+	}
+
+	match op {
+		BoundBinaryOp::Add | BoundBinaryOp::Sub => {
+			let (Some(left_unit), Some(right_unit)) = (left_unit, right_unit) else {
+				return Err(unit_type_mismatch(
+					"unit arithmetic requires both operands to be the same unit; CONVERT explicitly before combining with a scalar",
+				));
+			};
+			require_compatible_units(&left_unit, &right_unit)?;
+			let output = append_dimensioned_arithmetic(
+				builder,
+				op.clone(),
+				left,
+				right,
+				left_type,
+				right_type,
+				left_logical,
+			)?;
+			Ok(Some(output))
+		}
+		BoundBinaryOp::Mul => match (left_unit, right_unit) {
+			(Some(_), Some(_)) => Err(unit_type_mismatch(
+				"unit multiplication that creates derived dimensions is deferred",
+			)),
+			(Some(_), None) if right_logical.is_naked() => Ok(Some(append_dimensioned_arithmetic(
+				builder,
+				op.clone(),
+				left,
+				right,
+				left_type,
+				right_type,
+				left_logical,
+			)?)),
+			(None, Some(_)) if left_logical.is_naked() => Ok(Some(append_dimensioned_arithmetic(
+				builder,
+				op.clone(),
+				left,
+				right,
+				left_type,
+				right_type,
+				right_logical,
+			)?)),
+			_ => Err(unit_type_mismatch(
+				"unit multiplication supports only one dimensioned operand and one naked numeric operand",
+			)),
+		},
+		BoundBinaryOp::Div => match (left_unit, right_unit) {
+			(Some(_), Some(_)) => Err(unit_type_mismatch(
+				"unit division that creates ratios is deferred",
+			)),
+			(Some(_), None) if right_logical.is_naked() => Ok(Some(append_dimensioned_arithmetic(
+				builder,
+				op.clone(),
+				left,
+				right,
+				left_type,
+				right_type,
+				left_logical,
+			)?)),
+			(None, Some(_)) => Err(unit_type_mismatch(
+				"naked numeric divided by a unit is deferred",
+			)),
+			_ => Err(unit_type_mismatch(
+				"unit division supports only a dimensioned numerator and naked numeric denominator",
+			)),
+		},
+		_ => Ok(None),
+	}
+}
+
+fn append_dimensioned_arithmetic(
+	builder: &mut BoundExprProgramBuilder,
+	op: BoundBinaryOp,
+	left: BoundExprId,
+	right: BoundExprId,
+	left_type: &DataType,
+	right_type: &DataType,
+	output_logical: LogicalTypeId,
+) -> Result<BoundExprId, BindingError> {
+	let output_type =
+		arithmetic_output_type(left_type, right_type).ok_or_else(|| BindingError::TypeMismatch {
+			message: format!(
+				"unit arithmetic operands must be Int32, Int64, Float32, or Float64, got {left_type:?} and {right_type:?}"
+			),
+		})?;
+	let left = cast_if_needed(builder, left, &output_type)?;
+	let right = cast_if_needed(builder, right, &output_type)?;
+	let output = builder.append_binary(op, left, right, output_type);
+	if !builder.set_node_logical_type(output, output_logical) {
+		return Err(BindingError::UnsupportedExpression {
+			message: "unit arithmetic logical identity target is malformed".to_string(),
+		});
+	}
+	Ok(output)
+}
+
+fn bind_dimensioned_comparison(
+	builder: &mut BoundExprProgramBuilder,
+	ctx: &ExprBindContext<'_>,
+	left: BoundExprId,
+	right: BoundExprId,
+	op: &BoundBinaryOp,
+) -> Result<Option<BoundExprId>, BindingError> {
+	let left_unit = logical_unit_for_node(ctx, builder, left)?;
+	let right_unit = logical_unit_for_node(ctx, builder, right)?;
+	if left_unit.is_none() && right_unit.is_none() {
+		return Ok(None);
+	}
+	let (Some(left_unit), Some(right_unit)) = (left_unit, right_unit) else {
+		return Err(unit_type_mismatch(
+			"unit comparison requires both operands to be the same unit; CONVERT explicitly",
+		));
+	};
+	require_compatible_units(&left_unit, &right_unit)?;
+	Ok(Some(builder.append_binary(
+		op.clone(),
+		left,
+		right,
+		DataType::Boolean,
+	)))
+}
+
+fn logical_unit_for_node(
+	ctx: &ExprBindContext<'_>,
+	builder: &BoundExprProgramBuilder,
+	id: BoundExprId,
+) -> Result<Option<LogicalTypeSpec>, BindingError> {
+	let logical_type = builder
+		.node_logical_type(id)
+		.expect("builder returns logical type for unit lookup");
+	if logical_type.is_naked() {
+		return Ok(None);
+	}
+	let spec = LogicalTypeResolver::with_registry(ctx.logical_type_registry)
+		.spec(logical_type)
+		.ok_or_else(|| BindingError::UnsupportedExpression {
+			message: format!("unknown logical type {}", logical_type_name(logical_type)),
+		})?;
+	if spec.unit.is_some() {
+		Ok(Some(spec))
+	} else {
+		Ok(None)
+	}
+}
+
+fn require_compatible_units(
+	left: &LogicalTypeSpec,
+	right: &LogicalTypeSpec,
+) -> Result<(), BindingError> {
+	if left.id == right.id {
+		return Ok(());
+	}
+	let left_unit = left
+		.unit
+		.as_ref()
+		.expect("caller passes dimensioned left logical type");
+	let right_unit = right
+		.unit
+		.as_ref()
+		.expect("caller passes dimensioned right logical type");
+	if left_unit.dimension == right_unit.dimension {
+		return Err(unit_type_mismatch(format!(
+			"same-dimension units {} and {} require explicit CONVERT",
+			left.name, right.name
+		)));
+	}
+	Err(unit_type_mismatch(format!(
+		"dimension mismatch: cannot combine {} ({}) and {} ({})",
+		left.name, left_unit.dimension, right.name, right_unit.dimension
+	)))
+}
+
+fn unit_type_mismatch(message: impl Into<String>) -> BindingError {
+	BindingError::TypeMismatch {
+		message: message.into(),
+	}
 }
 
 fn bind_case(
@@ -9635,6 +9940,9 @@ fn bind_comparison(
 		.expect("builder returns typed comparison right");
 	reject_calendar_month_interval_comparison(&left_type)?;
 	reject_calendar_month_interval_comparison(&right_type)?;
+	if let Some(output) = bind_dimensioned_comparison(builder, ctx, left, right, &op)? {
+		return Ok(output);
+	}
 	if left_type != right_type {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
@@ -13980,12 +14288,14 @@ mod tests {
 		let schema = temporal_schema();
 		let config = PlannerConfig::default().with_session_timezone("UTC");
 		let logical_casts = HashMap::new();
+		let logical_type_registry = LogicalTypeRegistry::default();
 		let ctx = ExprBindContext {
 			config: &config,
 			session_timezone: config
 				.resolved_session_timezone()
 				.expect("session timezone"),
-			logical_casts: &logical_casts,
+			logical_type_specs: &logical_casts,
+			logical_type_registry: &logical_type_registry,
 			relation_scope: None,
 		};
 		let err = bind_expr_program(
@@ -19616,12 +19926,14 @@ mod tests {
 	) -> Result<BoundExprProgram, BindingError> {
 		let config = PlannerConfig::default().with_session_timezone(session_timezone);
 		let logical_casts = HashMap::new();
+		let logical_type_registry = LogicalTypeRegistry::default();
 		let ctx = ExprBindContext {
 			config: &config,
 			session_timezone: config
 				.resolved_session_timezone()
 				.expect("session timezone"),
-			logical_casts: &logical_casts,
+			logical_type_specs: &logical_casts,
+			logical_type_registry: &logical_type_registry,
 			relation_scope: None,
 		};
 		bind_expr_program(&[expr], &temporal_schema(), &ctx)

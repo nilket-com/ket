@@ -4,9 +4,9 @@ use wendelon::integration::compute::{
 	ComputeTraceContextV1, LOGICAL_TYPE_INTERNAL_NAMESPACE, LOGICAL_TYPE_RESERVED_STATIC_MAX_ID,
 	LogicalTypeCatalog, LogicalTypeDefinitionCreate, LogicalTypePhysical,
 	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
-	SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES, SchemaGeneration, SchemaIntentId,
+	LogicalTypeUnit, SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES, SchemaGeneration, SchemaIntentId,
 	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
-	StorageQuotaMetadataV1, StorageStatusKind, decode_logical_type_definition_create,
+	StorageQuotaMetadataV1, StorageStatusKind, UnitScale, decode_logical_type_definition_create,
 	decode_logical_type_definitions, decode_schema_update_envelope_v1,
 	encode_logical_type_definition_create, encode_logical_type_definitions,
 	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
@@ -123,6 +123,7 @@ fn logical_type_definition_payload_roundtrips_and_uses_schema_object_kind() {
 		name: "CustomerId".to_string(),
 		physical: LogicalTypePhysical::Int64,
 		refinement: None,
+		unit: None,
 	};
 	let payload = encode_logical_type_definition_create(&create).unwrap();
 	let envelope = SchemaUpdateEnvelopeV1::compute_client_intent(
@@ -161,6 +162,7 @@ fn logical_type_refinement_payload_roundtrips_and_participates_in_idempotence() 
 		name: "PersonId".to_string(),
 		physical: LogicalTypePhysical::Int64,
 		refinement: Some(refinement.clone()),
+		unit: None,
 	};
 
 	let payload = encode_logical_type_definition_create(&create).unwrap();
@@ -183,12 +185,74 @@ fn logical_type_refinement_payload_roundtrips_and_participates_in_idempotence() 
 					name: "PersonId".to_string(),
 					physical: LogicalTypePhysical::Int64,
 					refinement: None,
+					unit: None,
 				},
 			)
 			.unwrap_err()
 			.kind(),
 		std::io::ErrorKind::AlreadyExists
 	);
+}
+
+#[test]
+fn logical_type_unit_metadata_roundtrips_and_participates_in_idempotence() {
+	let unit = LogicalTypeUnit {
+		dimension: "Length".to_string(),
+		scale_to_base: UnitScale {
+			numerator: 201_168,
+			denominator: 125,
+		},
+	};
+	let create = LogicalTypeDefinitionCreate {
+		name: "Mile".to_string(),
+		physical: LogicalTypePhysical::Float64,
+		refinement: None,
+		unit: Some(unit.clone()),
+	};
+
+	let payload = encode_logical_type_definition_create(&create).unwrap();
+	assert_eq!(
+		decode_logical_type_definition_create(&payload).unwrap(),
+		create
+	);
+
+	let mut catalog = LogicalTypeCatalog::default();
+	let tenant = TenantId::new(7);
+	let first = catalog.create(tenant, create.clone()).unwrap();
+	let duplicate = catalog.create(tenant, create).unwrap();
+	assert_eq!(first, duplicate);
+	assert_eq!(first.unit, Some(unit));
+}
+
+#[test]
+fn logical_type_unit_metadata_requires_float64_and_positive_scale() {
+	let invalid_physical = LogicalTypeDefinitionCreate {
+		name: "Mile".to_string(),
+		physical: LogicalTypePhysical::Int64,
+		refinement: None,
+		unit: Some(LogicalTypeUnit {
+			dimension: "Length".to_string(),
+			scale_to_base: UnitScale {
+				numerator: 1,
+				denominator: 1,
+			},
+		}),
+	};
+	assert!(encode_logical_type_definition_create(&invalid_physical).is_err());
+
+	let invalid_scale = LogicalTypeDefinitionCreate {
+		name: "Mile".to_string(),
+		physical: LogicalTypePhysical::Float64,
+		refinement: None,
+		unit: Some(LogicalTypeUnit {
+			dimension: "Length".to_string(),
+			scale_to_base: UnitScale {
+				numerator: 0,
+				denominator: 1,
+			},
+		}),
+	};
+	assert!(encode_logical_type_definition_create(&invalid_scale).is_err());
 }
 
 #[test]
@@ -202,6 +266,7 @@ fn logical_type_catalog_allocates_durable_ids_and_is_idempotent() {
 				name: "PersonId".to_string(),
 				physical: LogicalTypePhysical::Int64,
 				refinement: None,
+				unit: None,
 			},
 		)
 		.unwrap();
@@ -212,6 +277,7 @@ fn logical_type_catalog_allocates_durable_ids_and_is_idempotent() {
 				name: "PersonId".to_string(),
 				physical: LogicalTypePhysical::Int64,
 				refinement: None,
+				unit: None,
 			},
 		)
 		.unwrap();
@@ -237,6 +303,7 @@ fn logical_type_catalog_allocates_durable_ids_and_is_idempotent() {
 					name: "PersonId".to_string(),
 					physical: LogicalTypePhysical::Int32,
 					refinement: None,
+					unit: None,
 				},
 			)
 			.unwrap_err()

@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
 use serde::{Deserialize, Serialize};
 use wendelon_client::{
 	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinition, LogicalTypePhysical,
-	LogicalTypeRefinementPredicate,
+	LogicalTypeRefinementPredicate, LogicalTypeUnit,
 };
 
 #[path = "ir/execution.rs"]
@@ -37,6 +37,7 @@ pub struct LogicalTypeSpec {
 	pub name: String,
 	pub physical: DataType,
 	pub refinement: Option<LogicalTypeRefinementPredicate>,
+	pub unit: Option<LogicalTypeUnit>,
 }
 
 pub fn seed_logical_type_spec(id: LogicalTypeId) -> Option<LogicalTypeSpec> {
@@ -46,18 +47,21 @@ pub fn seed_logical_type_spec(id: LogicalTypeId) -> Option<LogicalTypeSpec> {
 			name: "naked".to_string(),
 			physical: DataType::Null,
 			refinement: None,
+			unit: None,
 		}),
 		CUSTOMER_ID_LOGICAL_TYPE => Some(LogicalTypeSpec {
 			id,
 			name: "CustomerId".to_string(),
 			physical: DataType::Int64,
 			refinement: None,
+			unit: None,
 		}),
 		PRODUCT_ID_LOGICAL_TYPE => Some(LogicalTypeSpec {
 			id,
 			name: "ProductId".to_string(),
 			physical: DataType::Int64,
 			refinement: None,
+			unit: None,
 		}),
 		_ => None,
 	}
@@ -123,6 +127,7 @@ impl LogicalTypeRegistry {
 			name: definition.name,
 			physical: logical_type_physical_to_data_type(definition.physical),
 			refinement: definition.refinement,
+			unit: definition.unit,
 		};
 		if let Some(existing) = self.by_id.get(&spec.id) {
 			if existing == &spec {
@@ -757,6 +762,10 @@ pub enum Expr {
 		logical_name: String,
 		try_cast: bool,
 	},
+	SqlConvert {
+		expr: Box<Expr>,
+		target_logical_name: String,
+	},
 	Cast(Box<Expr>, DataType),
 	TryCast(Box<Expr>, DataType),
 	Add(Box<Expr>, Box<Expr>),
@@ -814,6 +823,7 @@ impl Expr {
 			Self::UntypedNull => false,
 			Self::LogicalAscription { expr, .. } => expr.is_pbc_pushdown_eligible(),
 			Self::SqlLogicalCast { .. }
+			| Self::SqlConvert { .. }
 			| Self::Cast(_, _)
 			| Self::TryCast(_, _)
 			| Self::Add(_, _)
@@ -983,6 +993,7 @@ pub enum LogicalPlan {
 		name: String,
 		physical: DataType,
 		refinement: Option<LogicalTypeRefinementPredicate>,
+		unit: Option<LogicalTypeUnit>,
 	},
 	CreateTableAsSelect {
 		table: TableRef,

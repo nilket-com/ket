@@ -918,6 +918,9 @@ impl Executor {
 			Expr::SqlLogicalCast { .. } => Err(ExecutionError::Kernel {
 				message: "internal: unresolved SQL logical CAST reached execution".to_string(),
 			}),
+			Expr::SqlConvert { .. } => Err(ExecutionError::Kernel {
+				message: "internal: unresolved SQL CONVERT reached execution".to_string(),
+			}),
 			Expr::Add(left, right) => {
 				let left_arr = self.evaluate_expr(left, batch)?;
 				let right_arr = self.evaluate_expr(right, batch)?;
