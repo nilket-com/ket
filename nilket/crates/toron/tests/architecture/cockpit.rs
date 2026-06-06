@@ -105,7 +105,9 @@ pub(crate) fn adr174_scan_filter_receipt_is_cheap() {
 		assert!(!block.contains("BoundExprProgram"));
 		assert!(!block.contains("PbcProgram"));
 	}
-	assert!(binder.contains("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) struct ScanFilterReceipt"));
+	assert!(binder.contains(
+		"#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) struct ScanFilterReceipt"
+	));
 	assert!(receipt.contains("estimated_rows: Option<RowCount>"));
 	assert!(receipt.contains("spent_column: Option<ColumnOrdinal>"));
 }
@@ -200,9 +202,185 @@ pub(crate) fn adr174_cockpit_is_frontend_shared() {
 	let bind_explain = first_block(&binder, "async fn bind_explain");
 	let rune_explain = first_block(&rune, "pub fn explain");
 
-	assert!(bind_explain.contains("bind_with_trace(input, self.catalog, self.config).await?"));
-	assert!(bind_explain.contains("optimizer_explain_plan(trace)"));
+	assert!(
+		bind_explain.contains("bind_with_explain_trace(input, self.catalog, self.config).await?")
+	);
+	assert!(bind_explain.contains("optimizer_explain_plan(trace, Some(render_trace))"));
 	assert!(rune_explain.contains("LogicalPlan::Explain"));
 	assert!(!rune.contains("ScanFilterReceipt"));
 	assert!(!rune.contains("scan_filter_decisions"));
+}
+
+#[test]
+pub(crate) fn adr175_render_trace_is_explain_only() {
+	let binder = source("src/binder.rs");
+	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_explain = first_block(&binder, "async fn bind_explain");
+
+	assert!(binder.contains("struct OptimizerExplainRenderTrace"));
+	assert!(binder.contains("struct ScanFilterRenderReceipt"));
+	assert!(bind_with_trace.contains("let mut render_trace = None;"));
+	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace, &mut render_trace)"));
+	assert!(!bind_with_trace.contains("OptimizerExplainRenderTrace::default"));
+	assert!(bind_with_explain_trace.contains("Some(OptimizerExplainRenderTrace::default())"));
+	assert!(
+		bind_with_explain_trace
+			.contains("bind_plan_with_trace(plan, &mut trace, &mut render_trace)")
+	);
+	assert!(
+		bind_explain.contains("bind_with_explain_trace(input, self.catalog, self.config).await?")
+	);
+	assert!(bind_explain.contains("optimizer_explain_plan(trace, Some(render_trace))"));
+}
+
+#[test]
+pub(crate) fn adr175_scan_filter_receipt_remains_cheap() {
+	let binder = source("src/binder.rs");
+	let receipt = first_block(&binder, "struct ScanFilterReceipt");
+	let trace = first_block(&binder, "struct OptimizerTrace");
+	let render_receipt = first_block(&binder, "struct ScanFilterRenderReceipt");
+
+	assert!(binder.contains(
+		"#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) struct ScanFilterReceipt"
+	));
+	for forbidden in ["String", "BoundExprProgram", "ExecutionPlan", "PbcProgram"] {
+		assert!(
+			!receipt.contains(forbidden),
+			"cheap receipt must not contain {forbidden}"
+		);
+		assert!(
+			!trace.contains(forbidden),
+			"normal optimizer trace must not contain {forbidden}"
+		);
+	}
+	assert!(render_receipt.contains("predicate_text: Option<String>"));
+	assert!(render_receipt.contains("pushed_predicate_text: Option<String>"));
+	assert!(render_receipt.contains("residual_predicate_text: Option<String>"));
+	assert!(render_receipt.contains("spent_column_name: Option<String>"));
+}
+
+#[test]
+pub(crate) fn adr175_partial_pushdown_text_is_captured_before_lowering() {
+	let binder = source("src/binder.rs");
+	let helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
+
+	let render_capture = helper
+		.find("let predicate_render = render_predicates.then")
+		.expect("render capture");
+	let pbc_lowering = helper
+		.find("if let Some(pbc_program) = pushdown.pbc_program")
+		.expect("PBC lowering");
+	assert!(
+		render_capture < pbc_lowering,
+		"pushed predicate text must be captured before lowering to PBC"
+	);
+	assert!(helper.contains("pushed_predicate_text: pushdown"));
+	assert!(helper.contains("residual_predicate_text: pushdown"));
+	assert!(helper.contains("map(BoundExprProgram::pretty)"));
+}
+
+#[test]
+pub(crate) fn adr175_predicate_text_uses_bound_program_pretty() {
+	let binder = source("src/binder.rs");
+	let filter = filter_arm(&binder);
+	let helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
+	let render_row = first_block(&binder, "fn optimizer_explain_scan_filter_row");
+	let render_region = format!("{filter}\n{helper}\n{render_row}");
+
+	assert!(filter.contains("bound_predicate.pretty()"));
+	assert!(helper.contains("BoundExprProgram::pretty"));
+	for forbidden in ["SqlPlanner", "plan_relation", "lower_expr", "parse"] {
+		assert!(
+			!render_region.contains(forbidden),
+			"predicate render must not depend on SQL round-trip rendering: {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr175_spent_column_name_is_source_ordinal_safe() {
+	let binder = source("src/binder.rs");
+	let helper = first_block(&binder, "fn spent_column_name_for_predicate");
+	let filter = filter_arm(&binder);
+
+	assert!(filter.contains("spent_column_name_for_predicate(&bound_predicate, column)"));
+	assert!(helper.contains("resolved.ordinal != column"));
+	assert!(helper.contains("return None"));
+	assert!(helper.contains("resolved.name.0.clone()"));
+	assert!(!helper.contains("schema.field"));
+	assert!(!helper.contains("resolve_table"));
+}
+
+#[test]
+pub(crate) fn adr175_no_table_name_reverse_lookup_claim() {
+	let binder = source("src/binder.rs");
+	let target_label = first_block(&binder, "fn scan_filter_target_label");
+	let scan_row = first_block(&binder, "fn optimizer_explain_scan_filter_row");
+	let render_region = format!("{target_label}\n{scan_row}");
+
+	assert!(target_label.contains("table_id"));
+	for forbidden in ["TableRef", "resolve_table", "table_name", "TableBinding"] {
+		assert!(
+			!render_region.contains(forbidden),
+			"175 must not claim render-time table-name reverse lookup: {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr175_cockpit_is_frontend_shared() {
+	let binder = source("src/binder.rs");
+	let rune = source("src/rune_engine.rs");
+	let bind_explain = first_block(&binder, "async fn bind_explain");
+	let rune_explain = first_block(&rune, "pub fn explain");
+
+	assert!(
+		bind_explain.contains("bind_with_explain_trace(input, self.catalog, self.config).await?")
+	);
+	assert!(bind_explain.contains("optimizer_explain_plan(trace, Some(render_trace))"));
+	assert!(rune_explain.contains("LogicalPlan::Explain"));
+	assert!(rune_explain.contains("input: Box::new(self.plan)"));
+	assert!(!rune.contains("OptimizerExplainRenderTrace"));
+	assert!(!rune.contains("ScanFilterRenderReceipt"));
+	assert!(!rune.contains("predicate_text"));
+}
+
+#[test]
+pub(crate) fn adr175_no_runtime_storage_or_producer_surface() {
+	let manifest = manifest_dir();
+	let markers = [
+		"OptimizerExplainRenderTrace",
+		"ScanFilterRenderReceipt",
+		"ScanFilterPredicateRender",
+		"predicate_text",
+		"pushed_predicate_text",
+		"residual_predicate_text",
+		"spent_column_name",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/ir.rs"),
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/catalog.rs"),
+		manifest.join("src/distributed"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR175 render sidecar leaked outside binder/system-table surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
 }

@@ -292,7 +292,7 @@ pub(crate) fn adr133_bind_is_wrapper_over_bind_with_trace() {
 	assert!(!bind_entry.contains("Binder { catalog, config }"));
 	assert!(!bind_entry.contains("bind_plan_with_trace"));
 	assert!(bind_with_trace.contains("let mut trace = OptimizerTrace::default()"));
-	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace)"));
+	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace, &mut render_trace)"));
 	assert!(bind_with_trace.contains("let logical_types = catalog.logical_type_registry()"));
 	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan, &logical_types)?"));
 	assert!(bind_with_trace.contains("Ok((plan, trace))"));
@@ -434,8 +434,10 @@ pub(crate) fn adr134_explain_binds_via_bind_with_trace_not_execute() {
 
 	assert!(bind_plan.contains("LogicalPlan::Explain { input }"));
 	assert!(bind_plan.contains("self.bind_explain(input).await?"));
-	assert!(bind_explain.contains("bind_with_trace(input, self.catalog, self.config).await?"));
-	assert!(bind_explain.contains("optimizer_explain_plan(trace)"));
+	assert!(
+		bind_explain.contains("bind_with_explain_trace(input, self.catalog, self.config).await?")
+	);
+	assert!(bind_explain.contains("optimizer_explain_plan(trace, Some(render_trace))"));
 	for forbidden in ["Executor", "execute_bound", ".execute(", "StorageScan"] {
 		assert!(
 			!bind_explain.contains(forbidden),

@@ -29,11 +29,12 @@ use crate::ir::{
 	JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
 	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
 	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarLiteralKey,
-	ScalarLiteralKeyClassification, ScalarValue, SortExpr, SystemTableKind, TemporalExtractField,
-	TableId, TemporalTruncField, arithmetic_output_type, calendar_month_interval_data_type,
-	decode_column_logical_type, decode_column_logical_type_with_resolver,
-	field_with_logical_type_metadata, interval_data_type, logical_type_name, logical_type_spec,
-	nanos_per_timestamp_unit, scalar_literal_key, schema_for_exprs,
+	ScalarLiteralKeyClassification, ScalarValue, SortExpr, SystemTableKind, TableId,
+	TemporalExtractField, TemporalTruncField, arithmetic_output_type,
+	calendar_month_interval_data_type, decode_column_logical_type,
+	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
+	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, scalar_literal_key,
+	schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 use wendelon::schema::{
@@ -123,12 +124,29 @@ pub(crate) async fn bind_with_trace(
 	config: &PlannerConfig,
 ) -> Result<(ExecutionPlan, OptimizerTrace), BindingError> {
 	let mut trace = OptimizerTrace::default();
+	let mut render_trace = None;
 	let plan = Binder { catalog, config }
-		.bind_plan_with_trace(plan, &mut trace)
+		.bind_plan_with_trace(plan, &mut trace, &mut render_trace)
 		.await?;
 	let logical_types = catalog.logical_type_registry();
 	let plan = push_down_scan_projection(plan.plan, &logical_types)?;
 	Ok((plan, trace))
+}
+
+async fn bind_with_explain_trace(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Result<(ExecutionPlan, OptimizerTrace, OptimizerExplainRenderTrace), BindingError> {
+	let mut trace = OptimizerTrace::default();
+	let mut render_trace = Some(OptimizerExplainRenderTrace::default());
+	let plan = Binder { catalog, config }
+		.bind_plan_with_trace(plan, &mut trace, &mut render_trace)
+		.await?;
+	let logical_types = catalog.logical_type_registry();
+	let plan = push_down_scan_projection(plan.plan, &logical_types)?;
+	let render_trace = render_trace.expect("render trace remains present");
+	Ok((plan, trace, render_trace))
 }
 
 struct Binder<'a> {
@@ -203,6 +221,28 @@ struct ScanFilterPushdownEvidence {
 pub(crate) struct OptimizerTrace {
 	pub(crate) join_decisions: Vec<DecisionReceipt>,
 	pub(crate) scan_filter_decisions: Vec<ScanFilterReceipt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OptimizerExplainRenderTrace {
+	scan_filters: Vec<ScanFilterRenderReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanFilterRenderReceipt {
+	target: ScanTraceTarget,
+	predicate_text: Option<String>,
+	pushed_predicate_text: Option<String>,
+	residual_predicate_text: Option<String>,
+	spent_column_name: Option<String>,
+}
+
+impl OptimizerExplainRenderTrace {
+	fn scan_filter(&self, target: ScanTraceTarget) -> Option<&ScanFilterRenderReceipt> {
+		self.scan_filters
+			.iter()
+			.find(|receipt| receipt.target == target)
+	}
 }
 
 struct ScopedExecutionPlan {
@@ -588,7 +628,9 @@ impl<'a> Binder<'a> {
 	) -> Pin<Box<dyn Future<Output = Result<ScopedExecutionPlan, BindingError>> + Send + 'b>> {
 		Box::pin(async move {
 			let mut trace = OptimizerTrace::default();
-			self.bind_plan_with_trace(plan, &mut trace).await
+			let mut render_trace = None;
+			self.bind_plan_with_trace(plan, &mut trace, &mut render_trace)
+				.await
 		})
 	}
 
@@ -596,6 +638,7 @@ impl<'a> Binder<'a> {
 		&'b self,
 		plan: &'b LogicalPlan,
 		trace: &'b mut OptimizerTrace,
+		render_trace: &'b mut Option<OptimizerExplainRenderTrace>,
 	) -> Pin<Box<dyn Future<Output = Result<ScopedExecutionPlan, BindingError>> + Send + 'b>> {
 		Box::pin(async move {
 			match plan {
@@ -655,14 +698,18 @@ impl<'a> Binder<'a> {
 					alias,
 					columns,
 				} => {
-					let input = self.bind_plan_with_trace(input, trace).await?;
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace)
+						.await?;
 					let facts = input.facts;
 					let plan = bind_alias_column_rename(input.plan, columns)?;
 					let scope = RelationScope::alias(alias.clone(), &plan.schema());
 					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
 				}
 				LogicalPlan::Filter { input, predicate } => {
-					let input = self.bind_plan_with_trace(input, trace).await?;
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace)
+						.await?;
 					let input_facts = input.facts;
 					let bound_predicate = self
 						.bind_expr_program_scoped(
@@ -698,28 +745,61 @@ impl<'a> Binder<'a> {
 						input_facts,
 						&logical_types,
 					);
-					let selected_estimate_evidence =
-						min_filter_estimate_evidence(ndv_estimate_evidence, range_estimate_evidence);
+					let selected_estimate_evidence = min_filter_estimate_evidence(
+						ndv_estimate_evidence,
+						range_estimate_evidence,
+					);
 					let estimated_row_count =
 						min_optional_row_count(ndv_estimated_row_count, range_estimated_row_count);
-					let (plan, _, pushdown_evidence) = plan_filter_with_predicate_pushdown_evidence(
-						input.plan,
-						bound_predicate,
-						&logical_types,
-					);
+					let render_predicates = render_trace.is_some();
+					let predicate_text = render_predicates.then(|| bound_predicate.pretty());
+					let spent_column_name = if render_predicates {
+						selected_estimate_evidence
+							.and_then(|evidence| evidence.column)
+							.and_then(|column| {
+								spent_column_name_for_predicate(&bound_predicate, column)
+							})
+					} else {
+						None
+					};
+					let (plan, _, pushdown_evidence, predicate_render) =
+						plan_filter_with_predicate_pushdown_evidence(
+							input.plan,
+							bound_predicate,
+							&logical_types,
+							render_predicates,
+						);
 					let scan_index = trace.scan_filter_decisions.len();
+					let target = ScanTraceTarget {
+						scan_index,
+						table_id: pushdown_evidence.table_id,
+					};
 					trace.scan_filter_decisions.push(ScanFilterReceipt {
-						target: ScanTraceTarget {
-							scan_index,
-							table_id: pushdown_evidence.table_id,
-						},
+						target,
 						outcome: pushdown_evidence.outcome,
 						converted_pushdown: pushdown_evidence.converted_pushdown,
 						profile_hint: pushdown_evidence.profile_hint,
 						estimated_rows: selected_estimate_evidence.map(|evidence| evidence.rows),
 						spent_fact: selected_estimate_evidence.map(|evidence| evidence.source),
-						spent_column: selected_estimate_evidence.and_then(|evidence| evidence.column),
+						spent_column: selected_estimate_evidence
+							.and_then(|evidence| evidence.column),
 					});
+					if let Some(render_trace) = render_trace.as_mut() {
+						let (pushed_predicate_text, residual_predicate_text) =
+							match predicate_render {
+								Some(render) => {
+									(render.pushed_predicate_text, render.residual_predicate_text)
+								}
+								None => (None, None),
+							};
+						render_trace.scan_filters.push(ScanFilterRenderReceipt {
+							target,
+							predicate_text,
+							pushed_predicate_text,
+							residual_predicate_text,
+							spent_column_name,
+						});
+					}
 					let scope = input_scope.with_schema(plan.schema());
 					let facts = if matches!(plan, ExecutionPlan::EmptyRelation { .. }) {
 						PlanOptimizerFacts::empty_relation()
@@ -749,7 +829,9 @@ impl<'a> Binder<'a> {
 								.to_string(),
 						});
 					}
-					let input = self.bind_plan_with_trace(input, trace).await?;
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace)
+						.await?;
 					let exprs = self
 						.bind_projection_expr_program_scoped(exprs, &input.schema(), &input.scope)
 						.await?;
@@ -772,7 +854,9 @@ impl<'a> Binder<'a> {
 					group_expr,
 					aggr_expr,
 				} => {
-					let input = self.bind_plan_with_trace(input, trace).await?;
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace)
+						.await?;
 					let input_schema = input.schema();
 					let group_expr = self
 						.bind_expr_program_scoped(group_expr, &input_schema, &input.scope)
@@ -810,7 +894,9 @@ impl<'a> Binder<'a> {
 					partition_count,
 					key,
 				} => {
-					let input = self.bind_plan_with_trace(input, trace).await?;
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace)
+						.await?;
 					let facts = input.facts.exchange();
 					let input_schema = input.schema();
 					let key = self
@@ -834,7 +920,9 @@ impl<'a> Binder<'a> {
 					limit,
 					offset,
 				} => {
-					let input = self.bind_plan_with_trace(input, trace).await?;
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace)
+						.await?;
 					let facts = PlanOptimizerFacts::composite_with_row(input.facts.row_upper_bound);
 					let output_schema = input.schema();
 					let order_by = bind_sort_keys(order_by, &output_schema, &input.scope)?;
@@ -853,7 +941,9 @@ impl<'a> Binder<'a> {
 					))
 				}
 				LogicalPlan::Take { input, limit } => {
-					let input = self.bind_plan_with_trace(input, trace).await?;
+					let input = self
+						.bind_plan_with_trace(input, trace, render_trace)
+						.await?;
 					let facts = input.facts.take(*limit);
 					let output_schema = input.schema();
 					let scope = input.scope.with_schema(output_schema.clone());
@@ -874,8 +964,16 @@ impl<'a> Binder<'a> {
 					on,
 					strategy_intent,
 				} => {
-					self.bind_join(left, right, *kind, on, *strategy_intent, trace)
-						.await
+					self.bind_join(
+						left,
+						right,
+						*kind,
+						on,
+						*strategy_intent,
+						trace,
+						render_trace,
+					)
+					.await
 				}
 				LogicalPlan::Explain { input } => {
 					let plan = self.bind_explain(input).await?;
@@ -919,6 +1017,7 @@ impl<'a> Binder<'a> {
 							*or_replace,
 							source,
 							trace,
+							render_trace,
 						)
 						.await?;
 					Ok(ScopedExecutionPlan::empty_scope(plan))
@@ -975,6 +1074,7 @@ impl<'a> Binder<'a> {
 							source,
 							returning.as_ref(),
 							trace,
+							render_trace,
 						)
 						.await?;
 					Ok(ScopedExecutionPlan::empty_scope(plan))
@@ -984,8 +1084,9 @@ impl<'a> Binder<'a> {
 	}
 
 	async fn bind_explain(&self, input: &LogicalPlan) -> Result<ExecutionPlan, BindingError> {
-		let (_input_plan, trace) = bind_with_trace(input, self.catalog, self.config).await?;
-		optimizer_explain_plan(trace)
+		let (_input_plan, trace, render_trace) =
+			bind_with_explain_trace(input, self.catalog, self.config).await?;
+		optimizer_explain_plan(trace, Some(render_trace))
 	}
 
 	async fn bind_create_table(
@@ -1154,9 +1255,12 @@ impl<'a> Binder<'a> {
 		or_replace: bool,
 		source: &LogicalPlan,
 		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 	) -> Result<ExecutionPlan, BindingError> {
 		reject_information_schema_target(table)?;
-		let source = self.bind_plan_with_trace(source, trace).await?;
+		let source = self
+			.bind_plan_with_trace(source, trace, render_trace)
+			.await?;
 		let source = source.plan;
 		let source_schema = source.schema();
 		let schema = infer_ctas_schema(&source_schema)?;
@@ -1323,6 +1427,7 @@ impl<'a> Binder<'a> {
 		source: &LogicalPlan,
 		returning: Option<&ReturningProjection>,
 		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 	) -> Result<ExecutionPlan, BindingError> {
 		reject_information_schema_target(table)?;
 		let binding = self.catalog.resolve_table(table).await?;
@@ -1330,7 +1435,9 @@ impl<'a> Binder<'a> {
 		let returning = self.bind_returning_projection(returning, &schema).await?;
 		let target_columns = resolve_insert_target_columns(&schema, columns)?;
 		validate_omitted_insert_target_columns(&schema, &target_columns)?;
-		let source = self.bind_plan_with_trace(source, trace).await?;
+		let source = self
+			.bind_plan_with_trace(source, trace, render_trace)
+			.await?;
 		let source = source.plan;
 		let source_schema = source.schema();
 		if source_schema.fields().len() != target_columns.len() {
@@ -1538,9 +1645,12 @@ impl<'a> Binder<'a> {
 		on: &[(Expr, Expr)],
 		strategy_intent: JoinStrategyIntent,
 		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 	) -> Result<ScopedExecutionPlan, BindingError> {
-		let mut left_plan = self.bind_plan_with_trace(left, trace).await?;
-		let mut right_plan = self.bind_plan_with_trace(right, trace).await?;
+		let mut left_plan = self.bind_plan_with_trace(left, trace, render_trace).await?;
+		let mut right_plan = self
+			.bind_plan_with_trace(right, trace, render_trace)
+			.await?;
 		let mut left_keys = Vec::new();
 		let mut right_keys = Vec::new();
 		let mut left_resolved_keys = Vec::new();
@@ -2222,6 +2332,12 @@ struct PredicatePushdownPlan {
 	converted_pushdown: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanFilterPredicateRender {
+	pushed_predicate_text: Option<String>,
+	residual_predicate_text: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StaticFilterClass {
 	AlwaysPass,
@@ -2234,8 +2350,8 @@ fn plan_filter_with_predicate_pushdown(
 	predicate: BoundExprProgram,
 	logical_types: &LogicalTypeRegistry,
 ) -> (ExecutionPlan, QueryProfileHint) {
-	let (plan, profile_hint, _) =
-		plan_filter_with_predicate_pushdown_evidence(input, predicate, logical_types);
+	let (plan, profile_hint, _, _) =
+		plan_filter_with_predicate_pushdown_evidence(input, predicate, logical_types, false);
 	(plan, profile_hint)
 }
 
@@ -2243,7 +2359,13 @@ fn plan_filter_with_predicate_pushdown_evidence(
 	mut input: ExecutionPlan,
 	predicate: BoundExprProgram,
 	logical_types: &LogicalTypeRegistry,
-) -> (ExecutionPlan, QueryProfileHint, ScanFilterPushdownEvidence) {
+	render_predicates: bool,
+) -> (
+	ExecutionPlan,
+	QueryProfileHint,
+	ScanFilterPushdownEvidence,
+	Option<ScanFilterPredicateRender>,
+) {
 	let table_id = scan_table_id(&input);
 	let original_predicate = predicate.clone();
 	let fallback_profile = scan_profile_hint(&original_predicate, &input);
@@ -2263,10 +2385,21 @@ fn plan_filter_with_predicate_pushdown_evidence(
 				profile_hint,
 				table_id,
 			},
+			None,
 		);
 	}
 
 	let pushdown = predicate_pushdown_plan(predicate, &input, logical_types);
+	let predicate_render = render_predicates.then(|| ScanFilterPredicateRender {
+		pushed_predicate_text: pushdown
+			.pushed_predicate
+			.as_ref()
+			.map(BoundExprProgram::pretty),
+		residual_predicate_text: pushdown
+			.residual_predicate
+			.as_ref()
+			.map(BoundExprProgram::pretty),
+	});
 	let profile_hint = pushdown
 		.profile_hint
 		.or(fallback_profile)
@@ -2288,11 +2421,8 @@ fn plan_filter_with_predicate_pushdown_evidence(
 					FilterDisposition::FullyPushed,
 				),
 			};
-			let outcome = scan_filter_outcome_from_disposition(
-				profile_hint,
-				disposition,
-				has_residual,
-			);
+			let outcome =
+				scan_filter_outcome_from_disposition(profile_hint, disposition, has_residual);
 			return (
 				ExecutionPlan::Filter {
 					input: Box::new(filter_input),
@@ -2306,12 +2436,17 @@ fn plan_filter_with_predicate_pushdown_evidence(
 					profile_hint,
 					table_id,
 				},
+				predicate_render,
 			);
 		}
 
 		let mut filter_input = filter_input;
 		let fallback_profile = fallback_profile.unwrap_or(QueryProfileHint::Scan);
 		apply_scan_profile_hint(&mut filter_input, Some(fallback_profile));
+		let predicate_render = render_predicates.then(|| ScanFilterPredicateRender {
+			pushed_predicate_text: None,
+			residual_predicate_text: Some(original_predicate.pretty()),
+		});
 		return (
 			ExecutionPlan::Filter {
 				input: Box::new(filter_input),
@@ -2329,9 +2464,17 @@ fn plan_filter_with_predicate_pushdown_evidence(
 				profile_hint: fallback_profile,
 				table_id,
 			},
+			predicate_render,
 		);
 	}
 
+	let residual_predicate_text = render_predicates.then(|| {
+		pushdown
+			.residual_predicate
+			.as_ref()
+			.map(BoundExprProgram::pretty)
+			.unwrap_or_else(|| original_predicate.pretty())
+	});
 	(
 		ExecutionPlan::Filter {
 			input: Box::new(input),
@@ -2349,6 +2492,10 @@ fn plan_filter_with_predicate_pushdown_evidence(
 			profile_hint,
 			table_id,
 		},
+		render_predicates.then(|| ScanFilterPredicateRender {
+			pushed_predicate_text: None,
+			residual_predicate_text,
+		}),
 	)
 }
 
@@ -2360,6 +2507,29 @@ fn scan_table_id(input: &ExecutionPlan) -> Option<TableId> {
 		ExecutionPlan::Filter { input, .. } => scan_table_id(input),
 		_ => None,
 	}
+}
+
+fn spent_column_name_for_predicate(
+	predicate: &BoundExprProgram,
+	column: ColumnOrdinal,
+) -> Option<String> {
+	let mut name: Option<String> = None;
+	for node in &predicate.nodes {
+		let BoundExprNode::Column(resolved) = node else {
+			continue;
+		};
+		if resolved.ordinal != column {
+			continue;
+		}
+		if name
+			.as_deref()
+			.is_some_and(|existing| existing != resolved.name.0)
+		{
+			return None;
+		}
+		name.get_or_insert_with(|| resolved.name.0.clone());
+	}
+	name
 }
 
 fn scan_filter_outcome_from_disposition(
@@ -7353,9 +7523,13 @@ fn optimizer_explain_schema() -> SchemaRef {
 		Field::new("target", DataType::Utf8, false),
 		Field::new("outcome", DataType::Utf8, false),
 		Field::new("detail", DataType::Utf8, true),
+		Field::new("predicate_text", DataType::Utf8, true),
+		Field::new("pushed_predicate_text", DataType::Utf8, true),
+		Field::new("residual_predicate_text", DataType::Utf8, true),
 		Field::new("estimated_rows", DataType::Int64, true),
 		Field::new("spent_fact", DataType::Utf8, true),
 		Field::new("spent_column", DataType::Utf8, true),
+		Field::new("spent_column_name", DataType::Utf8, true),
 		Field::new("build_side", DataType::Utf8, true),
 		Field::new("build_bytes", DataType::Int64, true),
 		Field::new("threshold_bytes", DataType::Int64, true),
@@ -7363,17 +7537,26 @@ fn optimizer_explain_schema() -> SchemaRef {
 	]))
 }
 
-fn optimizer_explain_plan(trace: OptimizerTrace) -> Result<ExecutionPlan, BindingError> {
+fn optimizer_explain_plan(
+	trace: OptimizerTrace,
+	render_trace: Option<OptimizerExplainRenderTrace>,
+) -> Result<ExecutionPlan, BindingError> {
 	let mut rows = trace
 		.join_decisions
 		.iter()
 		.map(optimizer_explain_row)
 		.collect::<Result<Vec<_>, _>>()?;
+	let render_trace = render_trace.as_ref();
 	rows.extend(
 		trace
 			.scan_filter_decisions
 			.iter()
-			.map(optimizer_explain_scan_filter_row)
+			.map(|receipt| {
+				optimizer_explain_scan_filter_row(
+					receipt,
+					render_trace.and_then(|trace| trace.scan_filter(receipt.target)),
+				)
+			})
 			.collect::<Result<Vec<_>, _>>()?,
 	);
 	system_table_plan(
@@ -7392,7 +7575,11 @@ fn optimizer_explain_row(receipt: &DecisionReceipt) -> Result<Vec<ScalarValue>, 
 		ScalarValue::Utf8(Some(join_target_label(receipt.target)?)),
 		ScalarValue::Utf8(Some(join_strategy_label(receipt.strategy).to_string())),
 		ScalarValue::Utf8(Some(join_strategy_decision_detail_label(receipt))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
 		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(build_side.map(str::to_string)),
@@ -7404,6 +7591,7 @@ fn optimizer_explain_row(receipt: &DecisionReceipt) -> Result<Vec<ScalarValue>, 
 
 fn optimizer_explain_scan_filter_row(
 	receipt: &ScanFilterReceipt,
+	render_receipt: Option<&ScanFilterRenderReceipt>,
 ) -> Result<Vec<ScalarValue>, BindingError> {
 	Ok(vec![
 		ScalarValue::Utf8(Some("scan_filter".to_string())),
@@ -7413,6 +7601,11 @@ fn optimizer_explain_scan_filter_row(
 			receipt.converted_pushdown,
 		))),
 		ScalarValue::Utf8(Some(profile_hint_label(receipt.profile_hint).to_string())),
+		ScalarValue::Utf8(render_receipt.and_then(|receipt| receipt.predicate_text.clone())),
+		ScalarValue::Utf8(render_receipt.and_then(|receipt| receipt.pushed_predicate_text.clone())),
+		ScalarValue::Utf8(
+			render_receipt.and_then(|receipt| receipt.residual_predicate_text.clone()),
+		),
 		ScalarValue::Int64(
 			receipt
 				.estimated_rows
@@ -7420,12 +7613,8 @@ fn optimizer_explain_scan_filter_row(
 				.transpose()?,
 		),
 		ScalarValue::Utf8(receipt.spent_fact.map(spent_fact_label).map(str::to_string)),
-		ScalarValue::Utf8(
-			receipt
-				.spent_column
-				.map(column_ordinal_label)
-				.transpose()?,
-		),
+		ScalarValue::Utf8(receipt.spent_column.map(column_ordinal_label).transpose()?),
+		ScalarValue::Utf8(render_receipt.and_then(|receipt| receipt.spent_column_name.clone())),
 		ScalarValue::Utf8(None),
 		ScalarValue::Int64(None),
 		ScalarValue::Int64(None),
@@ -19183,8 +19372,8 @@ mod tests {
 			rows[0][3],
 			ScalarValue::Utf8(Some("swapped_right_build:broadcast_estimated".to_string()))
 		);
-		assert_eq!(rows[0][7], ScalarValue::Utf8(Some("right".to_string())));
-		assert!(matches!(rows[0][8], ScalarValue::Int64(Some(bytes)) if bytes > 0));
+		assert_eq!(rows[0][11], ScalarValue::Utf8(Some("right".to_string())));
+		assert!(matches!(rows[0][12], ScalarValue::Int64(Some(bytes)) if bytes > 0));
 	}
 
 	#[tokio::test]
@@ -20089,6 +20278,66 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn explain_plans_unchanged_under_render_capture() {
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM customers WHERE amount > 49")
+			.expect("plan filtered query");
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			Some(1_000),
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+
+		let (plain_plan, plain_trace) =
+			bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+				.await
+				.expect("bind normal trace");
+		let (explain_plan, explain_trace, render_trace) =
+			bind_with_explain_trace(&logical, &catalog, &PlannerConfig::default())
+				.await
+				.expect("bind explain trace");
+
+		assert_eq!(plain_trace, explain_trace);
+		assert_eq!(format!("{plain_plan:?}"), format!("{explain_plan:?}"));
+		assert_eq!(render_trace.scan_filters.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn normal_bind_does_not_materialize_explain_render_strings() {
+		let logical = SqlPlanner::new()
+			.plan("SELECT * FROM customers WHERE amount > 49")
+			.expect("plan filtered query");
+		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
+			Some(1_000),
+			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
+		);
+
+		let (_plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind normal trace");
+		let trace_debug = format!("{trace:?}");
+
+		assert_eq!(trace.scan_filter_decisions.len(), 1);
+		assert!(!trace_debug.contains("predicate_text"));
+		assert!(!trace_debug.contains("root["));
+		assert!(!trace_debug.contains("amount#"));
+	}
+
+	#[test]
+	fn spent_column_name_declines_when_source_ordinal_is_ambiguous() {
+		let mut builder = BoundExprProgramBuilder::new();
+		let left = builder.append_column(test_bool_column("amount", 1, true));
+		let right = builder.append_column(test_bool_column("renamed_amount", 1, true));
+		let root = builder.append_binary(BoundBinaryOp::And, left, right, DataType::Boolean);
+		builder.push_root(root);
+		let predicate = builder.build();
+
+		assert_eq!(
+			spent_column_name_for_predicate(&predicate, ColumnOrdinal(1)),
+			None
+		);
+	}
+
+	#[tokio::test]
 	async fn sql_explain_broadcast_inference_renders_receipt_rows() {
 		let mut catalog = join_catalog();
 		seed_byte_upper_bound(&mut catalog, "orders", 3_072);
@@ -20107,7 +20356,11 @@ mod tests {
 				ScalarValue::Utf8(Some("join[0]".to_string())),
 				ScalarValue::Utf8(Some("broadcast".to_string())),
 				ScalarValue::Utf8(Some("swapped_right_build:broadcast_inferred".to_string())),
+				ScalarValue::Utf8(None),
+				ScalarValue::Utf8(None),
+				ScalarValue::Utf8(None),
 				ScalarValue::Int64(None),
+				ScalarValue::Utf8(None),
 				ScalarValue::Utf8(None),
 				ScalarValue::Utf8(None),
 				ScalarValue::Utf8(Some("right".to_string())),
@@ -20116,6 +20369,27 @@ mod tests {
 				ScalarValue::Int64(Some(3_072)),
 			]]
 		);
+	}
+
+	#[tokio::test]
+	async fn join_rows_keep_scan_readability_columns_null() {
+		let mut catalog = join_catalog();
+		seed_byte_upper_bound(&mut catalog, "orders", 3_072);
+		seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+		let logical = SqlPlanner::new()
+			.plan("EXPLAIN SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+			.expect("plan EXPLAIN join");
+
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0][0], ScalarValue::Utf8(Some("join".to_string())));
+		assert_eq!(rows[0][4], ScalarValue::Utf8(None));
+		assert_eq!(rows[0][5], ScalarValue::Utf8(None));
+		assert_eq!(rows[0][6], ScalarValue::Utf8(None));
+		assert_eq!(rows[0][10], ScalarValue::Utf8(None));
+		assert_eq!(rows[0][11], ScalarValue::Utf8(Some("right".to_string())));
 	}
 
 	#[tokio::test]
@@ -20176,7 +20450,7 @@ mod tests {
 				row[3],
 				ScalarValue::Utf8(Some("swapped_right_build:broadcast_inferred".to_string()))
 			);
-			assert_eq!(row[7], ScalarValue::Utf8(Some("right".to_string())));
+			assert_eq!(row[11], ScalarValue::Utf8(Some("right".to_string())));
 		}
 	}
 
@@ -20200,8 +20474,8 @@ mod tests {
 			rows[0][3],
 			ScalarValue::Utf8(Some("natural:pinned_by_author".to_string()))
 		);
-		assert_eq!(rows[0][4], ScalarValue::Int64(None));
-		assert_eq!(rows[0][7], ScalarValue::Utf8(Some("left".to_string())));
+		assert_eq!(rows[0][7], ScalarValue::Int64(None));
+		assert_eq!(rows[0][11], ScalarValue::Utf8(Some("left".to_string())));
 	}
 
 	#[tokio::test]
@@ -20248,15 +20522,19 @@ mod tests {
 					field.data_type(),
 					field.is_nullable()
 				))
-			.collect::<Vec<_>>(),
+				.collect::<Vec<_>>(),
 			vec![
 				("decision_kind", &DataType::Utf8, false),
 				("target", &DataType::Utf8, false),
 				("outcome", &DataType::Utf8, false),
 				("detail", &DataType::Utf8, true),
+				("predicate_text", &DataType::Utf8, true),
+				("pushed_predicate_text", &DataType::Utf8, true),
+				("residual_predicate_text", &DataType::Utf8, true),
 				("estimated_rows", &DataType::Int64, true),
 				("spent_fact", &DataType::Utf8, true),
 				("spent_column", &DataType::Utf8, true),
+				("spent_column_name", &DataType::Utf8, true),
 				("build_side", &DataType::Utf8, true),
 				("build_bytes", &DataType::Int64, true),
 				("threshold_bytes", &DataType::Int64, true),
@@ -20275,17 +20553,26 @@ mod tests {
 			bind_explain_rows(&logical, &join_catalog(), &PlannerConfig::default()).await;
 
 		assert_eq!(rows.len(), 1);
-		assert_eq!(rows[0][0], ScalarValue::Utf8(Some("scan_filter".to_string())));
+		assert_eq!(
+			rows[0][0],
+			ScalarValue::Utf8(Some("scan_filter".to_string()))
+		);
 		assert_eq!(
 			rows[0][1],
 			ScalarValue::Utf8(Some("scan[0] table_id=2".to_string()))
 		);
-		assert_eq!(rows[0][2], ScalarValue::Utf8(Some("fully_pushed".to_string())));
+		assert_eq!(
+			rows[0][2],
+			ScalarValue::Utf8(Some("fully_pushed".to_string()))
+		);
 		assert_eq!(rows[0][3], ScalarValue::Utf8(Some("scan".to_string())));
+		assert_utf8_contains(&rows[0][4], "region");
+		assert_utf8_contains(&rows[0][5], "region");
+		assert_eq!(rows[0][6], ScalarValue::Utf8(None));
 	}
 
 	#[tokio::test]
-	async fn scan_filter_receipt_marks_converted_pushdown() {
+	async fn explain_scan_filter_renders_original_pushed_and_residual_predicates() {
 		let catalog = converted_unit_catalog(false);
 		let logical = SqlPlanner::new()
 			.plan(
@@ -20306,10 +20593,32 @@ mod tests {
 			rows[0][2],
 			ScalarValue::Utf8(Some("partially_pushed:converted".to_string()))
 		);
+		assert_utf8_contains(&rows[0][4], "distance_mile");
+		assert_utf8_contains(&rows[0][5], "distance_mile");
+		assert_utf8_contains(&rows[0][6], "distance_mile");
 	}
 
 	#[tokio::test]
-	async fn scan_filter_receipt_records_selectivity_estimate() {
+	async fn converted_pushdown_predicate_text_shows_source_column() {
+		let catalog = converted_unit_catalog(false);
+		let logical = SqlPlanner::new()
+			.plan(
+				"EXPLAIN SELECT * FROM customers \
+				 WHERE CONVERT(distance_mile, Kilometer) > CAST(10.0 AS Kilometer)",
+			)
+			.expect("plan EXPLAIN converted pushed scan");
+
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &catalog, &PlannerConfig::default()).await;
+
+		assert_eq!(rows.len(), 1);
+		assert_utf8_contains(&rows[0][4], "distance_mile");
+		assert_utf8_contains(&rows[0][5], "distance_mile");
+		assert_utf8_contains(&rows[0][6], "distance_mile");
+	}
+
+	#[tokio::test]
+	async fn explain_scan_filter_renders_spent_column_name() {
 		let catalog = descriptor_sidecar_join_catalog_with_customer_range(
 			Some(1_000),
 			vec![(ColumnOrdinal(1), range_fact_i64(0, 99, 1_000))],
@@ -20322,9 +20631,10 @@ mod tests {
 			bind_explain_rows(&logical, &catalog, &PlannerConfig::default()).await;
 
 		assert_eq!(rows.len(), 1);
-		assert_eq!(rows[0][4], ScalarValue::Int64(Some(500)));
-		assert_eq!(rows[0][5], ScalarValue::Utf8(Some("range".to_string())));
-		assert_eq!(rows[0][6], ScalarValue::Utf8(Some("col[1]".to_string())));
+		assert_eq!(rows[0][7], ScalarValue::Int64(Some(500)));
+		assert_eq!(rows[0][8], ScalarValue::Utf8(Some("range".to_string())));
+		assert_eq!(rows[0][9], ScalarValue::Utf8(Some("col[1]".to_string())));
+		assert_eq!(rows[0][10], ScalarValue::Utf8(Some("amount".to_string())));
 	}
 
 	#[tokio::test]
@@ -20341,12 +20651,16 @@ mod tests {
 			bind_explain_rows(&logical, &catalog, &PlannerConfig::default()).await;
 
 		assert_eq!(rows.len(), 1);
-		assert_eq!(rows[0][4], ScalarValue::Int64(Some(938)));
+		assert_eq!(rows[0][7], ScalarValue::Int64(Some(938)));
 		assert_eq!(
-			rows[0][5],
+			rows[0][8],
 			ScalarValue::Utf8(Some("converted_range".to_string()))
 		);
-		assert_eq!(rows[0][6], ScalarValue::Utf8(Some("col[1]".to_string())));
+		assert_eq!(rows[0][9], ScalarValue::Utf8(Some("col[1]".to_string())));
+		assert_eq!(
+			rows[0][10],
+			ScalarValue::Utf8(Some("distance_mile".to_string()))
+		);
 	}
 
 	#[tokio::test]
@@ -20360,12 +20674,18 @@ mod tests {
 			bind_explain_rows(&logical, &catalog, &PlannerConfig::default()).await;
 
 		assert_eq!(rows.len(), 1);
-		assert_eq!(rows[0][2], ScalarValue::Utf8(Some("residual_only".to_string())));
-		assert_eq!(rows[0][4], ScalarValue::Int64(None));
+		assert_eq!(
+			rows[0][2],
+			ScalarValue::Utf8(Some("residual_only".to_string()))
+		);
+		assert_eq!(rows[0][7], ScalarValue::Int64(None));
+		assert_utf8_contains(&rows[0][4], "amount");
+		assert_eq!(rows[0][5], ScalarValue::Utf8(None));
+		assert_utf8_contains(&rows[0][6], "amount");
 	}
 
 	#[tokio::test]
-	async fn scan_filter_receipt_records_static_elision() {
+	async fn explain_scan_filter_static_elision_renders_original_predicate() {
 		let logical = SqlPlanner::new()
 			.plan("EXPLAIN SELECT * FROM customers WHERE FALSE")
 			.expect("plan EXPLAIN static-elided scan");
@@ -20374,8 +20694,14 @@ mod tests {
 			bind_explain_rows(&logical, &join_catalog(), &PlannerConfig::default()).await;
 
 		assert_eq!(rows.len(), 1);
-		assert_eq!(rows[0][2], ScalarValue::Utf8(Some("static_elided".to_string())));
+		assert_eq!(
+			rows[0][2],
+			ScalarValue::Utf8(Some("static_elided".to_string()))
+		);
 		assert_eq!(rows[0][3], ScalarValue::Utf8(Some("scan".to_string())));
+		assert_utf8_contains(&rows[0][4], "Boolean(Some(false))");
+		assert_eq!(rows[0][5], ScalarValue::Utf8(None));
+		assert_eq!(rows[0][6], ScalarValue::Utf8(None));
 	}
 
 	#[tokio::test]
@@ -20392,8 +20718,14 @@ mod tests {
 			rows[0][1],
 			ScalarValue::Utf8(Some("scan[0] table_id=1".to_string()))
 		);
-		assert_eq!(rows[0][2], ScalarValue::Utf8(Some("point_read".to_string())));
-		assert_eq!(rows[0][3], ScalarValue::Utf8(Some("point_read".to_string())));
+		assert_eq!(
+			rows[0][2],
+			ScalarValue::Utf8(Some("point_read".to_string()))
+		);
+		assert_eq!(
+			rows[0][3],
+			ScalarValue::Utf8(Some("point_read".to_string()))
+		);
 	}
 
 	#[test]
@@ -21834,6 +22166,16 @@ mod tests {
 		};
 		assert_eq!(kind, SystemTableKind::OptimizerExplain);
 		(schema, rows)
+	}
+
+	fn assert_utf8_contains(value: &ScalarValue, expected: &str) {
+		let ScalarValue::Utf8(Some(text)) = value else {
+			panic!("expected Utf8 containing {expected:?}, got {value:?}");
+		};
+		assert!(
+			text.contains(expected),
+			"expected {text:?} to contain {expected:?}"
+		);
 	}
 
 	fn join_input(facts: PlanOptimizerFacts) -> JoinInputOptimization {

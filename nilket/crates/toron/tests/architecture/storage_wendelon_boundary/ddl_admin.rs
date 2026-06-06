@@ -381,7 +381,7 @@ pub(crate) fn adr033_binder_binds_source_before_inferring_schema() {
 		.expect("bind_create_table_as_select body")
 		.1;
 	let bind_source = body
-		.find("self.bind_plan_with_trace(source, trace).await?")
+		.find("bind_plan_with_trace(source, trace, render_trace)")
 		.expect("source bind");
 	let infer_schema = body.find("infer_ctas_schema").expect("schema inference");
 
@@ -1285,7 +1285,7 @@ pub(crate) fn adr061_ctas_binds_source_before_existing_target_skip() {
 		.expect("bind_create_table_as_select")
 		.1;
 	let bind_source = bind_body
-		.find("self.bind_plan_with_trace(source, trace).await?")
+		.find("bind_plan_with_trace(source, trace, render_trace)")
 		.expect("source bind");
 	let infer_schema = bind_body
 		.find("infer_ctas_schema")

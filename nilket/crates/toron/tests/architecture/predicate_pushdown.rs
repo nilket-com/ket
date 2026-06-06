@@ -1833,7 +1833,7 @@ pub(crate) fn adr100_no_projected_scan_receipt_until_elision_has_a_consumer() {
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 
 	assert!(bind_entry.contains("bind_with_trace(plan, catalog, config).await?"));
-	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace)"));
+	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace, &mut render_trace)"));
 	assert!(bind_with_trace.contains("let logical_types = catalog.logical_type_registry()"));
 	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan, &logical_types)?"));
 	assert!(receipt.contains("projection: None"));

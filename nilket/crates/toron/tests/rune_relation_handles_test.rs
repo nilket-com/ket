@@ -526,7 +526,7 @@ async fn sql_explain_matches_rune_explain_rows() {
 }
 
 #[tokio::test]
-async fn rune_explain_renders_scan_filter_receipts() {
+async fn rune_explain_renders_readable_scan_filter_receipts() {
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
@@ -553,6 +553,24 @@ async fn rune_explain_renders_scan_filter_receipts() {
 		string_column_rows(&batches, 2),
 		vec![Some("fully_pushed".to_string())]
 	);
+	let predicate_text = string_column_rows(&batches, 4);
+	let pushed_predicate_text = string_column_rows(&batches, 5);
+	let residual_predicate_text = string_column_rows(&batches, 6);
+	assert!(
+		predicate_text
+			.first()
+			.and_then(|text| text.as_deref())
+			.is_some_and(|text| text.contains("amount")),
+		"predicate text should render the Rune filter column: {predicate_text:?}"
+	);
+	assert!(
+		pushed_predicate_text
+			.first()
+			.and_then(|text| text.as_deref())
+			.is_some_and(|text| text.contains("amount")),
+		"pushed predicate text should render the Rune filter column: {pushed_predicate_text:?}"
+	);
+	assert_eq!(residual_predicate_text, vec![None]);
 }
 
 #[tokio::test]
