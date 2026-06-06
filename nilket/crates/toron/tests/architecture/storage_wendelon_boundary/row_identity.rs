@@ -14,8 +14,7 @@ use super::{
 pub(crate) fn adr036_synthetic_identity_still_not_sql_visible() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 
 	for source in [&planner, &binder] {
 		assert!(source.contains("STORAGE_SYNTHETIC_COLUMN_NAMES"));
@@ -391,7 +390,7 @@ pub(crate) fn adr037_scan_schema_appends_identity_only_when_requested() {
 
 #[test]
 pub(crate) fn adr037_binder_default_scans_use_no_row_identity() {
-	let binder = std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("binder");
+	let binder = binder_source();
 	let scan_plan = brace_blocks_after_marker(&binder, "fn scan_plan")
 		.into_iter()
 		.next()
@@ -705,8 +704,7 @@ pub(crate) fn adr062_execution_create_table_carries_row_identity() {
 
 #[test]
 pub(crate) fn adr062_binder_preserves_create_table_row_identity() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 
 	assert!(binder.contains("row_identity: row_identity.clone()"));
 	assert!(binder.contains("row_identity,"));
@@ -845,8 +843,7 @@ pub(crate) fn adr062_update_surface_is_present_under_pk_update_contract_after_ad
 	let logical = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR");
 	let execution =
 		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter");
 	let server =
@@ -956,8 +953,7 @@ pub(crate) fn adr062_prior_adr033_to_061_guards_continue_to_pass_except_retarget
 
 #[test]
 pub(crate) fn adr063_binder_requires_primary_key_row_identity() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -971,8 +967,7 @@ pub(crate) fn adr063_binder_requires_primary_key_row_identity() {
 
 #[test]
 pub(crate) fn adr063_binder_rejects_primary_key_assignment() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -987,8 +982,7 @@ pub(crate) fn adr063_binder_rejects_primary_key_assignment() {
 pub(crate) fn adr035_synthetic_names_remain_rejected_in_sql() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 
 	for source in [&planner, &binder] {
 		assert!(source.contains("STORAGE_SYNTHETIC_COLUMN_NAMES"));

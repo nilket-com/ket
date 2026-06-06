@@ -1,9 +1,5 @@
 use super::support::*;
 
-fn binder_source() -> String {
-	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
-}
-
 fn ir_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source")
 }
@@ -144,6 +140,8 @@ pub(crate) fn adr132_broadcast_inferred_receipt_carries_rejected_side_bytes() {
 #[test]
 pub(crate) fn adr132_no_config_or_public_explain_surface() {
 	let manifest_dir = manifest_dir();
+	let binder_root = manifest_dir.join("src").join("binder.rs");
+	let binder_dir = manifest_dir.join("src/binder");
 	let binder = binder_source();
 	let planner_config = source_block(&binder, "pub struct PlannerConfig");
 
@@ -154,19 +152,21 @@ pub(crate) fn adr132_no_config_or_public_explain_surface() {
 	let mut offenders = source_lines(&manifest_dir.join("src"))
 		.into_iter()
 		.filter(|(path, _, line)| {
-			path.file_name().and_then(|name| name.to_str()) != Some("binder.rs")
+			path != &binder_root
+				&& !path.starts_with(&binder_dir)
 				&& (line.contains("rejected_side_bytes")
 					|| line.contains("AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR")
 					|| line.contains("right_build_materially_smaller"))
 		})
 		.collect::<Vec<_>>();
-	offenders.extend(
-		source_lines(&manifest_dir.join("src"))
-			.into_iter()
-			.filter(|(_, _, line)| {
-				line.contains("EXPLAIN") && line.contains("rejected_side_bytes")
-			}),
-	);
+	offenders.extend(source_lines(&manifest_dir.join("src")).into_iter().filter(
+		|(path, _, line)| {
+			path != &binder_root
+				&& !path.starts_with(&binder_dir)
+				&& line.contains("EXPLAIN")
+				&& line.contains("rejected_side_bytes")
+		},
+	));
 	assert!(
 		offenders.is_empty(),
 		"ADR132 receipt/config leaked into public source surface:\n{}",
@@ -222,6 +222,8 @@ pub(crate) fn adr132_no_executor_fragmenter_scheduler_wire_or_wendelon_change() 
 #[test]
 pub(crate) fn adr133_optimizer_trace_is_binder_local() {
 	let manifest_dir = manifest_dir();
+	let binder_root = manifest_dir.join("src").join("binder.rs");
+	let binder_dir = manifest_dir.join("src/binder");
 	let binder = binder_source();
 	let bind_join = source_block(&binder, "async fn bind_join");
 
@@ -236,7 +238,8 @@ pub(crate) fn adr133_optimizer_trace_is_binder_local() {
 	let offenders = source_lines(&manifest_dir.join("src"))
 		.into_iter()
 		.filter(|(path, _, line)| {
-			path.file_name().and_then(|name| name.to_str()) != Some("binder.rs")
+			path != &binder_root
+				&& !path.starts_with(&binder_dir)
 				&& markers.iter().any(|marker| line.contains(marker))
 		})
 		.collect::<Vec<_>>();

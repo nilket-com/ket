@@ -459,8 +459,7 @@ pub(crate) fn adr074_in_list_is_first_class_expr_and_bound_node() {
 	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read ir");
 	let execution_ir =
 		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec ir");
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 
 	assert!(ir.contains("InList {"));
 	assert!(ir.contains("Self::InList { expr, list, .. }"));
@@ -576,8 +575,7 @@ pub(crate) fn adr075_like_ilike_are_first_class_residual_only_predicates() {
 		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec ir");
 	let planner =
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
 	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
 
@@ -609,7 +607,7 @@ pub(crate) fn adr108_case_is_residual_bound_expression() {
 		std::fs::read_to_string(manifest_dir.join("src/ir/execution.rs")).expect("read exec ir");
 	let planner =
 		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read planner");
-	let binder = std::fs::read_to_string(manifest_dir.join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let pbc = std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read pbc");
 	let exec = std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read exec");
 	let storage =
@@ -660,8 +658,7 @@ pub(crate) fn adr108_case_is_residual_bound_expression() {
 
 #[test]
 pub(crate) fn adr075_partial_pushdown_splits_bound_top_level_and_only() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let splitter = brace_blocks_after_marker(&binder, "fn partition_bound_predicate")
 		.into_iter()
 		.next()
@@ -700,8 +697,7 @@ pub(crate) fn adr075_partial_pushdown_splits_bound_top_level_and_only() {
 
 #[test]
 pub(crate) fn adr075_partial_pushdown_covers_select_update_delete_scan_sites() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
 	let predicate_test =
@@ -734,8 +730,7 @@ pub(crate) fn adr075_partial_pushdown_covers_select_update_delete_scan_sites() {
 
 #[test]
 pub(crate) fn adr078_recursive_splitter_hosts_or_not_extraction_rules() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let partitioner = brace_blocks_after_marker(&binder, "fn partition_bound_predicate")
 		.into_iter()
 		.next()
@@ -755,8 +750,7 @@ pub(crate) fn adr078_recursive_splitter_hosts_or_not_extraction_rules() {
 
 #[test]
 pub(crate) fn adr078_pushed_predicate_is_necessary_for_original() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
 		.into_iter()
 		.next()
@@ -778,8 +772,7 @@ pub(crate) fn adr078_pushed_predicate_is_necessary_for_original() {
 
 #[test]
 pub(crate) fn adr078_factoring_preserves_3vl_where_true_set() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let predicate_test =
 		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
 			.expect("read predicate tests");
@@ -797,8 +790,7 @@ pub(crate) fn adr078_factoring_preserves_3vl_where_true_set() {
 
 #[test]
 pub(crate) fn adr078_fully_pushable_or_and_not_still_push_as_whole_subtrees() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let predicate_test =
 		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
 			.expect("read predicate tests");
@@ -816,8 +808,7 @@ pub(crate) fn adr078_fully_pushable_or_and_not_still_push_as_whole_subtrees() {
 
 #[test]
 pub(crate) fn adr078_top_level_and_split_remains_minimal() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let splitter = brace_blocks_after_marker(&binder, "fn split_boolean_tree")
 		.into_iter()
 		.next()
@@ -835,8 +826,7 @@ pub(crate) fn adr078_top_level_and_split_remains_minimal() {
 
 #[test]
 pub(crate) fn adr078_mixed_or_does_not_push_one_branch_only() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
 		.into_iter()
 		.next()
@@ -853,8 +843,7 @@ pub(crate) fn adr078_mixed_or_does_not_push_one_branch_only() {
 
 #[test]
 pub(crate) fn adr078_common_or_factor_requires_presence_in_every_branch() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
 		.into_iter()
 		.next()
@@ -869,8 +858,7 @@ pub(crate) fn adr078_common_or_factor_requires_presence_in_every_branch() {
 
 #[test]
 pub(crate) fn adr078_common_factor_matching_is_structural_not_algebraic() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let structural =
 		brace_blocks_after_marker(&binder, "fn bound_subgraphs_structurally_equal_inner")
 			.into_iter()
@@ -902,8 +890,7 @@ pub(crate) fn adr078_common_factor_matching_is_structural_not_algebraic() {
 
 #[test]
 pub(crate) fn adr078_not_or_extracts_only_compilable_branch_negations() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let not_or = brace_blocks_after_marker(&binder, "fn try_extract_not_or_branch_negations")
 		.into_iter()
 		.next()
@@ -925,8 +912,7 @@ pub(crate) fn adr078_not_or_extracts_only_compilable_branch_negations() {
 
 #[test]
 pub(crate) fn adr078_not_and_does_not_push_individual_negated_terms() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let not_or = brace_blocks_after_marker(&binder, "fn try_extract_not_or_branch_negations")
 		.into_iter()
 		.next()
@@ -943,8 +929,7 @@ pub(crate) fn adr078_not_and_does_not_push_individual_negated_terms() {
 
 #[test]
 pub(crate) fn adr078_boolean_factoring_has_bounded_extraction_budget() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let predicate_test =
 		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
 			.expect("read predicate tests");
@@ -966,8 +951,7 @@ pub(crate) fn adr078_boolean_factoring_has_bounded_extraction_budget() {
 
 #[test]
 pub(crate) fn adr078_pushdown_classification_still_uses_compile_pbc_attempts() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 
 	for marker in [
 		"compile_pbc(&whole).is_some()",
@@ -984,8 +968,7 @@ pub(crate) fn adr078_pushdown_classification_still_uses_compile_pbc_attempts() {
 
 #[test]
 pub(crate) fn adr078_factored_pushdown_drives_scan_profile() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let predicate_test =
 		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
 			.expect("read predicate tests");
@@ -999,8 +982,7 @@ pub(crate) fn adr078_factored_pushdown_drives_scan_profile() {
 
 #[test]
 pub(crate) fn adr078_select_update_delete_share_boolean_factoring_path() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let predicate_test =
 		std::fs::read_to_string(manifest_dir().join("tests/predicate_widening_test.rs"))
 			.expect("read predicate tests");
@@ -1037,8 +1019,7 @@ pub(crate) fn adr078_select_update_delete_share_boolean_factoring_path() {
 
 #[test]
 pub(crate) fn adr094_common_or_factor_reconstructs_minimal_residual() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
 		.into_iter()
 		.next()
@@ -1061,8 +1042,7 @@ pub(crate) fn adr094_common_or_factor_reconstructs_minimal_residual() {
 
 #[test]
 pub(crate) fn adr094_not_or_reconstructs_remaining_branch_negations() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let not_or = brace_blocks_after_marker(&binder, "fn try_extract_not_or_branch_negations")
 		.into_iter()
 		.next()
@@ -1087,8 +1067,7 @@ pub(crate) fn adr094_not_or_reconstructs_remaining_branch_negations() {
 
 #[test]
 pub(crate) fn adr094_branch_strips_to_true_removes_common_or_residual() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let common = brace_blocks_after_marker(&binder, "fn try_extract_common_or_factors")
 		.into_iter()
 		.next()
@@ -1108,8 +1087,7 @@ pub(crate) fn adr094_branch_strips_to_true_removes_common_or_residual() {
 
 #[test]
 pub(crate) fn adr094_minimal_residual_preserves_078_kleene_gate() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 
 	assert!(binder.contains("predicate_pushdown_emitted_splits_preserve_kleene_3vl"));
 	assert!(binder.contains("property_common_or_three_branch_program"));
@@ -1359,7 +1337,7 @@ pub(crate) fn adr095_empty_relation_is_execution_plan_only() {
 
 #[test]
 pub(crate) fn adr095_filter_elision_runs_before_pbc_pushdown() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let classifier = filter_helper
 		.find("static_filter_class(&input, &original_predicate, logical_types)")
@@ -1375,7 +1353,7 @@ pub(crate) fn adr095_filter_elision_runs_before_pbc_pushdown() {
 
 #[test]
 pub(crate) fn adr095_static_filter_classifier_is_error_conservative() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let atom_classifier = first_block(&binder, "fn static_filter_atom_class");
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 	let closed_root = first_block(&binder, "fn closed_root_filter_class");
@@ -1420,7 +1398,11 @@ pub(crate) fn adr095_plan_walkers_handle_empty_relation_as_leaf() {
 		("src/server/mod.rs", "fn contains_broadcast_join"),
 		("src/server/mod.rs", "fn scan_schema_for_table_id"),
 	] {
-		let source = source(relative);
+		let source = if relative == "src/binder.rs" {
+			binder_source()
+		} else {
+			source(relative)
+		};
 		let block = first_block(&source, marker);
 		assert!(
 			block.contains("ExecutionPlan::EmptyRelation"),
@@ -1466,7 +1448,7 @@ pub(crate) fn adr095_no_sql_pbc_wendelon_storage_surface() {
 
 #[test]
 pub(crate) fn adr097_refinement_elision_uses_durable_registry_not_seed() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
 	let refinement_helper = first_block(&binder, "fn refinement_static_filter_class");
@@ -1483,7 +1465,7 @@ pub(crate) fn adr097_refinement_elision_uses_durable_registry_not_seed() {
 
 #[test]
 pub(crate) fn adr097_refinement_elision_requires_stored_scan_column_provenance() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
@@ -1500,7 +1482,7 @@ pub(crate) fn adr097_refinement_elision_requires_stored_scan_column_provenance()
 
 #[test]
 pub(crate) fn adr097_refinement_elision_only_from_durable_stored_scan_receipts() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
@@ -1514,7 +1496,7 @@ pub(crate) fn adr097_refinement_elision_only_from_durable_stored_scan_receipts()
 
 #[test]
 pub(crate) fn adr097_refinement_elision_reuses_095_empty_relation() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let execution = source("src/ir/execution.rs");
 	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
 	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
@@ -1527,7 +1509,7 @@ pub(crate) fn adr097_refinement_elision_reuses_095_empty_relation() {
 
 #[test]
 pub(crate) fn adr097_static_filter_class_is_structural_3vl_and_error_conservative() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let atom_classifier = first_block(&binder, "fn static_filter_atom_class");
 	let refinement_helper = first_block(&binder, "fn refinement_static_filter_class");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
@@ -1544,7 +1526,7 @@ pub(crate) fn adr097_static_filter_class_is_structural_3vl_and_error_conservativ
 
 #[test]
 pub(crate) fn adr098_and_decomposition_runs_unified_atom_classifier() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let classifier = first_block(&binder, "fn static_filter_class");
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 	let atom_classifier = first_block(&binder, "fn static_filter_atom_class");
@@ -1565,7 +1547,7 @@ pub(crate) fn adr098_and_decomposition_runs_unified_atom_classifier() {
 
 #[test]
 pub(crate) fn adr098_and_elision_requires_error_free_siblings() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 	let conjunct_checker = first_block(&binder, "fn static_elision_error_free_conjunct");
 	let node_checker = first_block(&binder, "fn static_elision_error_free_node");
@@ -1616,7 +1598,7 @@ pub(crate) fn adr098_and_elision_requires_error_free_siblings() {
 
 #[test]
 pub(crate) fn adr098_and_decomposition_inherits_097_durable_registry_and_scan_provenance() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
@@ -1632,7 +1614,7 @@ pub(crate) fn adr098_and_decomposition_inherits_097_durable_registry_and_scan_pr
 
 #[test]
 pub(crate) fn adr098_and_elision_reuses_095_empty_relation_no_alwayspass() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 
@@ -1645,7 +1627,7 @@ pub(crate) fn adr098_and_elision_reuses_095_empty_relation_no_alwayspass() {
 
 #[test]
 pub(crate) fn adr098_no_boolean_algebra_beyond_and() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 	let node_checker = first_block(&binder, "fn static_elision_error_free_node");
 
@@ -1666,7 +1648,7 @@ pub(crate) fn adr098_no_boolean_algebra_beyond_and() {
 
 #[test]
 pub(crate) fn adr098_no_wendelon_pbc_executor_storage_or_wire_change() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
 	let executor = source("src/exec.rs");
 	let storage = source("src/storage.rs");
@@ -1758,7 +1740,7 @@ pub(crate) fn adr100_derived_table_source_is_narrow_not_general_subquery_support
 
 #[test]
 pub(crate) fn adr100_refinement_provenance_crosses_only_transparent_project() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 	let child_ordinal = first_block(&binder, "fn transparent_project_child_ordinal");
 
@@ -1776,7 +1758,7 @@ pub(crate) fn adr100_refinement_provenance_crosses_only_transparent_project() {
 
 #[test]
 pub(crate) fn adr100_refinement_receipt_root_is_scan_or_transparent_project_chain() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
@@ -1793,7 +1775,7 @@ pub(crate) fn adr100_refinement_receipt_root_is_scan_or_transparent_project_chai
 
 #[test]
 pub(crate) fn adr100_refinement_receipt_reuses_089_identity_no_redrive() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let scan_atom = first_block(&binder, "fn stored_scan_refinement_atom");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 
@@ -1811,7 +1793,7 @@ pub(crate) fn adr100_refinement_receipt_reuses_089_identity_no_redrive() {
 
 #[test]
 pub(crate) fn adr100_eager_error_fence_policy_unchanged() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let classifier = first_block(&binder, "fn static_filter_class");
 	let and_classifier = first_block(&binder, "fn static_filter_and_class");
 	let conjunct_checker = first_block(&binder, "fn static_elision_error_free_conjunct");
@@ -1827,7 +1809,7 @@ pub(crate) fn adr100_eager_error_fence_policy_unchanged() {
 
 #[test]
 pub(crate) fn adr100_no_projected_scan_receipt_until_elision_has_a_consumer() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let bind_entry = first_block(&binder, "pub async fn bind");
 	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
@@ -1847,7 +1829,7 @@ pub(crate) fn adr100_no_ir_exec_pbc_storage_or_wendelon_change() {
 	let execution = source("src/ir/execution.rs");
 	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
 	let planner = source("src/sql_planner.rs");
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
 	let executor = source("src/exec.rs");
 	let storage = source("src/storage.rs");
@@ -1909,7 +1891,7 @@ pub(crate) fn adr104_alias_column_lists_are_single_bind_time_mechanism() {
 
 #[test]
 pub(crate) fn adr104_binder_alias_columns_build_ordinal_identity_project() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let bind_plan = first_block(&binder, "fn bind_plan_with_trace");
 	let helper = first_block(&binder, "fn bind_alias_column_rename");
 
@@ -1928,7 +1910,7 @@ pub(crate) fn adr104_binder_alias_columns_build_ordinal_identity_project() {
 
 #[test]
 pub(crate) fn adr104_alias_column_renames_reuse_transparent_project_receipt() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let child_ordinal = first_block(&binder, "fn transparent_project_child_ordinal");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 	let helper = first_block(&binder, "fn bind_alias_column_rename");
@@ -1952,7 +1934,7 @@ pub(crate) fn adr104_no_execution_pbc_storage_wendelon_information_schema_surfac
 	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
 	let execution = source("src/ir/execution.rs");
 	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
 	let pbc = source("src/pbc.rs");
 	let executor = source("src/exec.rs");
@@ -2032,7 +2014,7 @@ pub(crate) fn adr103_alias_column_guards_retarget_to_104_unified_path() {
 
 #[test]
 pub(crate) fn adr105_project_coalescing_lives_in_existing_post_bind_optimizer() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let bind_entry = first_block(&binder, "pub async fn bind");
 	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
 	let optimizer = first_block(&binder, "fn optimize_for_required");
@@ -2044,7 +2026,7 @@ pub(crate) fn adr105_project_coalescing_lives_in_existing_post_bind_optimizer() 
 
 #[test]
 pub(crate) fn adr105_coalescing_is_adjacent_project_only() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let helper = first_block(&binder, "fn collapse_adjacent_identity_project");
 
 	assert!(helper.contains("ExecutionPlan::Project { output_schema, .. }"));
@@ -2069,7 +2051,7 @@ pub(crate) fn adr105_coalescing_is_adjacent_project_only() {
 
 #[test]
 pub(crate) fn adr105_identity_requires_ordinal_and_metadata_match() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let helper = first_block(&binder, "fn is_metadata_transparent_identity_project");
 
 	assert!(helper.contains("BoundExprNode::Column(column)"));
@@ -2083,7 +2065,7 @@ pub(crate) fn adr105_identity_requires_ordinal_and_metadata_match() {
 
 #[test]
 pub(crate) fn adr105_identity_check_ignores_names_parent_schema_wins() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let helper = first_block(&binder, "fn is_metadata_transparent_identity_project");
 	let coalescer = first_block(&binder, "fn collapse_adjacent_identity_project");
 
@@ -2099,7 +2081,7 @@ pub(crate) fn adr105_no_sql_ir_exec_pbc_storage_wendelon_information_schema_surf
 	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
 	let execution = source("src/ir/execution.rs");
 	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
 	let pbc = source("src/pbc.rs");
 	let executor = source("src/exec.rs");
@@ -2227,7 +2209,7 @@ pub(crate) fn adr106_general_derived_source_fences_remain() {
 pub(crate) fn adr106_alias_column_rename_remains_generic_bound_project() {
 	let planner = source("src/sql_planner.rs");
 	let lower_derived = first_block(&planner, "fn lower_derived_table");
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let bind_plan = first_block(&binder, "fn bind_plan_with_trace");
 	let helper = first_block(&binder, "fn bind_alias_column_rename");
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
@@ -2256,7 +2238,7 @@ pub(crate) fn adr106_no_ir_exec_pbc_storage_wendelon_information_schema_surface(
 	let logical_plan = first_block(&logical, "pub enum LogicalPlan");
 	let execution = source("src/ir/execution.rs");
 	let execution_plan = first_block(&execution, "pub enum ExecutionPlan");
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let information_schema = first_block(&binder, "async fn bind_information_schema_relation");
 	let pbc = source("src/pbc.rs");
 	let executor = source("src/exec.rs");
@@ -2306,7 +2288,7 @@ pub(crate) fn adr106_no_ir_exec_pbc_storage_wendelon_information_schema_surface(
 
 #[test]
 pub(crate) fn adr097_cast_try_cast_remain_ephemeral_not_receipts() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let logical_type_ddl = source("tests/logical_type_ddl_test.rs");
 	let sql_logical_cast = first_block(&binder, "fn bind_sql_logical_cast");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
@@ -2332,7 +2314,7 @@ pub(crate) fn adr097_no_wendelon_096_contract_pbc_executor_storage_or_wire_chang
 	assert!(sql_planner.contains("CREATE LOGICAL TYPE CHECK"));
 	assert!(sql_planner.contains("parse_create_logical_type_refinement_clause"));
 
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
 	let executor = source("src/exec.rs");
 	let storage = source("src/storage.rs");

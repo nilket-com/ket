@@ -373,8 +373,7 @@ pub(crate) fn adr033_planner_rejects_ctas_column_list_while_allowing_if_not_exis
 
 #[test]
 pub(crate) fn adr033_binder_binds_source_before_inferring_schema() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let body = brace_blocks_after_marker(&binder, "async fn bind_create_table_as_select")
 		.into_iter()
 		.next()
@@ -392,8 +391,7 @@ pub(crate) fn adr033_binder_binds_source_before_inferring_schema() {
 
 #[test]
 pub(crate) fn adr033_schema_inference_rejects_synthetic_names() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let infer = brace_blocks_after_marker(&binder, "fn infer_ctas_schema")
 		.into_iter()
 		.next()
@@ -436,8 +434,7 @@ pub(crate) fn adr033_schema_inference_rejects_synthetic_names() {
 
 #[test]
 pub(crate) fn adr033_schema_inference_rejects_duplicate_names() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let infer = brace_blocks_after_marker(&binder, "fn infer_ctas_schema")
 		.into_iter()
 		.next()
@@ -450,8 +447,7 @@ pub(crate) fn adr033_schema_inference_rejects_duplicate_names() {
 
 #[test]
 pub(crate) fn adr033_schema_inference_uses_adr029_type_lattice() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let type_lattice = brace_blocks_after_marker(&binder, "fn is_supported_ctas_column_type")
 		.into_iter()
 		.next()
@@ -894,8 +890,7 @@ pub(crate) fn adr034_execution_drop_table_has_no_identity_or_box() {
 
 #[test]
 pub(crate) fn adr034_binder_drop_table_is_pass_through() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let drop_arm = binder
 		.split("LogicalPlan::DropTable")
 		.nth(1)
@@ -1207,8 +1202,7 @@ pub(crate) fn adr061_ctas_ir_carries_if_not_exists() {
 		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR");
 	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR");
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let planner =
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
 
@@ -1275,8 +1269,7 @@ pub(crate) fn adr061_ctas_write_is_gated_on_created_outcome() {
 
 #[test]
 pub(crate) fn adr061_ctas_binds_source_before_existing_target_skip() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator");
 	let bind_body = brace_blocks_after_marker(&binder, "async fn bind_create_table_as_select")
@@ -1450,13 +1443,12 @@ pub(crate) fn adr038_no_background_gc_or_scheduler() {
 #[test]
 pub(crate) fn adr038_no_dedicated_create_or_replace_sql_surface() {
 	let manifest_dir = manifest_dir();
-	for path in [
-		manifest_dir.join("src/ir.rs"),
-		manifest_dir.join("src/ir/execution.rs"),
-		manifest_dir.join("src/sql_planner.rs"),
-		manifest_dir.join("src/binder.rs"),
+	for source in [
+		std::fs::read_to_string(manifest_dir.join("src/ir.rs")).expect("read source"),
+		std::fs::read_to_string(manifest_dir.join("src/ir/execution.rs")).expect("read source"),
+		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read source"),
+		binder_source(),
 	] {
-		let source = std::fs::read_to_string(&path).expect("read source");
 		assert!(!source.contains("CreateOrReplaceTable"));
 		assert!(!source.contains("TableSchemaReplaceRequest"));
 		assert!(!source.contains("drop_table_with_replacement"));

@@ -175,6 +175,48 @@ pub(crate) fn source_files(root: &Path) -> Vec<PathBuf> {
 	files
 }
 
+pub(crate) fn binder_root_source() -> String {
+	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder root source")
+}
+
+pub(crate) fn binder_source_files() -> Vec<PathBuf> {
+	let src = manifest_dir().join("src");
+	let module_root = src.join("binder");
+	let mut production = Vec::new();
+	let mut tests = Vec::new();
+
+	if module_root.exists() {
+		for path in source_files(&module_root) {
+			let is_test_file = path
+				.strip_prefix(&module_root)
+				.ok()
+				.and_then(|relative| relative.components().next())
+				.is_some_and(|component| component.as_os_str() == std::ffi::OsStr::new("tests"));
+			if is_test_file || path.file_name() == Some(std::ffi::OsStr::new("tests.rs")) {
+				tests.push(path);
+			} else {
+				production.push(path);
+			}
+		}
+	}
+
+	production.sort();
+	tests.sort();
+
+	let mut files = vec![src.join("binder.rs")];
+	files.extend(production);
+	files.extend(tests);
+	files
+}
+
+pub(crate) fn binder_source() -> String {
+	binder_source_files()
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read binder source"))
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
 pub(crate) fn architecture_corpus_source() -> String {
 	let architecture_dir = manifest_dir().join("tests/architecture");
 	source_files(&architecture_dir)

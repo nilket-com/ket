@@ -2,7 +2,7 @@ use super::support::*;
 
 #[test]
 pub(crate) fn adr173_converted_linear_predicate_is_derived_before_pbc() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let pushdown_plan = first_block(&binder, "fn predicate_pushdown_plan");
 	let derived = first_block(&binder, "fn converted_linear_pushdown_predicate");
 	let derived_program = first_block(&binder, "fn derived_linear_converted_predicate");
@@ -31,7 +31,7 @@ pub(crate) fn adr173_converted_linear_predicate_is_derived_before_pbc() {
 
 #[test]
 pub(crate) fn adr173_converted_pushdown_is_metadata_authenticated() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let matcher = first_block(&binder, "fn match_linear_converted_comparison_sides");
 	let mul = first_block(&binder, "fn match_linear_converted_mul");
 	let mul_sides = first_block(&binder, "fn match_linear_converted_mul_sides");
@@ -64,7 +64,7 @@ pub(crate) fn adr173_converted_pushdown_is_metadata_authenticated() {
 
 #[test]
 pub(crate) fn adr173_converted_pushdown_keeps_original_residual_exact() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let pushdown_plan = first_block(&binder, "fn predicate_pushdown_plan");
 	let filter_helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let partitioner = first_block(&binder, "fn partition_bound_predicate");
@@ -81,7 +81,7 @@ pub(crate) fn adr173_converted_pushdown_keeps_original_residual_exact() {
 
 #[test]
 pub(crate) fn adr173_range_selectivity_uses_converted_source_atoms() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let range = first_block(&binder, "fn filter_range_selectivity_estimated_row_count");
 	let converted_atom = first_block(&binder, "fn converted_linear_range_atom");
 
@@ -100,7 +100,7 @@ pub(crate) fn adr173_range_selectivity_uses_converted_source_atoms() {
 
 #[test]
 pub(crate) fn adr173_thresholds_are_widened_outward_by_one_float() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let widening = first_block(&binder, "fn widened_converted_linear_threshold");
 	let next_up = first_block(&binder, "fn next_float_up");
 	let next_down = first_block(&binder, "fn next_float_down");
@@ -119,7 +119,7 @@ pub(crate) fn adr173_thresholds_are_widened_outward_by_one_float() {
 
 #[test]
 pub(crate) fn adr173_affine_equality_and_nonconvert_arithmetic_are_deferred() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let comparison = first_block(&binder, "fn match_linear_converted_comparison");
 	let matcher = first_block(&binder, "fn match_linear_converted_comparison_sides");
 	let mul = first_block(&binder, "fn match_linear_converted_mul");
@@ -174,7 +174,7 @@ pub(crate) fn adr173_no_new_storage_or_wendelon_wire_surface() {
 
 #[test]
 pub(crate) fn adr173_converted_pushdown_is_frontend_shared_bound_ir() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let pushdown_plan = first_block(&binder, "fn predicate_pushdown_plan");
 	let comparison = first_block(&binder, "fn match_linear_converted_comparison");
 	let mul_sides = first_block(&binder, "fn match_linear_converted_mul_sides");

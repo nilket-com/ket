@@ -122,8 +122,7 @@ pub(crate) fn adr064_returning_projection_vocab_is_intentionally_narrow() {
 
 #[test]
 pub(crate) fn adr064_returning_binds_against_target_user_schema() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let helper = brace_blocks_after_marker(&binder, "fn bind_returning_projection")
 		.into_iter()
 		.next()
@@ -253,8 +252,7 @@ pub(crate) fn adr064_complete_row_count_matches_storage_receipt_and_returned_row
 
 #[test]
 pub(crate) fn adr064_no_new_pk_gate_for_insert_or_delete_returning() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_insert = brace_blocks_after_marker(&binder, "async fn bind_insert(")
 		.into_iter()
 		.next()
@@ -274,8 +272,7 @@ pub(crate) fn adr064_no_new_pk_gate_for_insert_or_delete_returning() {
 
 #[test]
 pub(crate) fn adr064_update_returning_inherits_pk_update_contract() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update(")
 		.into_iter()
 		.next()
@@ -355,8 +352,7 @@ pub(crate) fn adr064_update_returning_uses_post_update_rows() {
 
 #[test]
 pub(crate) fn adr064_returning_star_hides_storage_synthetic_columns() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let delete_test = std::fs::read_to_string(manifest_dir().join("tests/delete_test.rs"))
 		.expect("read delete tests");
 

@@ -14,7 +14,7 @@ fn source_block(source: &str, marker: &str) -> String {
 
 #[test]
 pub(crate) fn adr149_date32_selectivity_breadth_is_typed_and_estimate_only() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let ir = source("src/ir.rs");
 	let planner = source("src/sql_planner.rs");
 	let exec = source("src/exec.rs");
@@ -117,7 +117,7 @@ pub(crate) fn adr149_date32_selectivity_breadth_is_typed_and_estimate_only() {
 
 #[test]
 pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let ir = source("src/ir.rs");
 	let planner = source("src/sql_planner.rs");
 	let exec = source("src/exec.rs");
@@ -269,7 +269,7 @@ pub(crate) fn adr150_timestamp_is_tz_anchored_and_estimate_only() {
 
 #[test]
 pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_executed() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let ir = source("src/ir.rs");
 	let execution_ir = source("src/ir/execution.rs");
 	let planner = source("src/sql_planner.rs");
@@ -376,7 +376,7 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 
 #[test]
 pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let ir = source("src/ir.rs");
 	let execution_ir = source("src/ir/execution.rs");
 	let planner = source("src/sql_planner.rs");
@@ -480,7 +480,7 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 
 #[test]
 pub(crate) fn adr153_calendar_month_year_interval_arithmetic_is_session_framed() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let ir = source("src/ir.rs");
 	let planner = source("src/sql_planner.rs");
 	let exec = source("src/exec.rs");

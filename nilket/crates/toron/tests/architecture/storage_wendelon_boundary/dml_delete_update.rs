@@ -189,8 +189,7 @@ pub(crate) fn adr031_executor_evaluates_program_linearly() {
 
 #[test]
 pub(crate) fn adr031_binder_emits_bound_expr_program() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	assert!(binder.contains("BoundExprProgramBuilder"));
 	assert!(binder.contains("fn bind_expr_program"));
 	assert!(binder.contains("fn bind_expr_into_program"));
@@ -574,8 +573,7 @@ pub(crate) fn adr032_sql_planner_splits_values_and_select_sources() {
 
 #[test]
 pub(crate) fn adr032_binder_enforces_source_target_arity() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let bind_insert_select = brace_blocks_after_marker(&binder, "async fn bind_insert_select")
 		.into_iter()
 		.next()
@@ -1012,8 +1010,7 @@ pub(crate) fn adr036_delete_has_no_filter_disposition_field() {
 
 #[test]
 pub(crate) fn adr036_binder_delete_uses_boolean_root_validator() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let bind_delete = brace_blocks_after_marker(&binder, "async fn bind_delete")
 		.into_iter()
 		.next()
@@ -1034,8 +1031,7 @@ pub(crate) fn adr036_binder_delete_uses_boolean_root_validator() {
 
 #[test]
 pub(crate) fn adr036_binder_delete_allows_residual_predicates() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let bind_delete = brace_blocks_after_marker(&binder, "async fn bind_delete")
 		.into_iter()
 		.next()
@@ -1504,8 +1500,7 @@ pub(crate) fn adr063_execution_update_shape_is_source_bearing() {
 
 #[test]
 pub(crate) fn adr063_binder_builds_full_row_source_projection() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -1522,8 +1517,7 @@ pub(crate) fn adr063_binder_builds_full_row_source_projection() {
 
 #[test]
 pub(crate) fn adr063_update_source_scan_does_not_request_append_identity() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -1537,8 +1531,7 @@ pub(crate) fn adr063_update_source_scan_does_not_request_append_identity() {
 
 #[test]
 pub(crate) fn adr063_update_reuses_existing_point_read_profile() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let predicate_helper =
 		brace_blocks_after_marker(&binder, "fn bind_update_source_for_predicate")
 			.into_iter()
@@ -1619,8 +1612,7 @@ pub(crate) fn adr063_sql_response_is_complete_only_for_non_returning_dml_after_a
 
 #[test]
 pub(crate) fn adr063_no_transaction_lock_compare_swap_surface_after_adr070() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")

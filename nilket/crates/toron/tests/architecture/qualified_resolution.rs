@@ -2,10 +2,6 @@
 
 use super::support::*;
 
-fn binder_source() -> String {
-	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
-}
-
 fn planner_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source")

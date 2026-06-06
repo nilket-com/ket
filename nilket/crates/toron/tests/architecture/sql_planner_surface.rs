@@ -206,8 +206,7 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 
 #[test]
 pub(crate) fn bind_expr_remains_aggregate_free() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let bind_expr = brace_blocks_after_marker(&binder, "fn bind_expr_into_program")
 		.into_iter()
 		.next()
@@ -234,8 +233,7 @@ pub(crate) fn adr017_order_by_aggregate_call_guards_are_narrow() {
 	assert!(!planner.contains("HavingAggregateScope"));
 	assert!(!planner.contains("rewrite_having_aggregate_calls"));
 
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let bind_expr = brace_blocks_after_marker(&binder, "fn bind_expr_into_program")
 		.into_iter()
 		.next()
@@ -272,8 +270,7 @@ pub(crate) fn adr018_scalar_aggregate_having_order_by_guards_are_narrow() {
 		)
 	);
 
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let bind_expr = brace_blocks_after_marker(&binder, "fn bind_expr_into_program")
 		.into_iter()
 		.next()
@@ -389,8 +386,7 @@ pub(crate) fn adr024_scalar_arithmetic_guards_are_narrow() {
 	assert!(!planner.contains("aggregate arguments must be simple column references"));
 	assert!(planner.contains("aggregate arguments must not contain aggregate calls"));
 
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	assert!(binder.contains("fn bind_arithmetic"));
 	assert!(binder.contains("fn is_widening_cast"));
 	for conversion in [
@@ -561,8 +557,7 @@ pub(crate) fn adr025_sql_cast_target_type_normalization() {
 
 #[test]
 pub(crate) fn adr025_explicit_cast_policy_is_separate_from_implicit_widening() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let explicit_cast = brace_blocks_after_marker(&binder, "fn bind_explicit_cast")
 		.into_iter()
 		.next()
@@ -825,8 +820,7 @@ pub(crate) fn adr026_try_cast_lowers_via_planner() {
 
 #[test]
 pub(crate) fn adr026_try_cast_policy_is_separate() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let bind_try_cast = brace_blocks_after_marker(&binder, "fn bind_try_cast")
 		.into_iter()
 		.next()
@@ -1306,8 +1300,7 @@ pub(crate) fn adr028_aggregate_output_names_stay_kernel_names() {
 
 #[test]
 pub(crate) fn adr028_binder_executor_aggregate_args_preserved() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	let stable_bind = brace_blocks_after_marker(&binder, "fn bind_stable_aggregate_call")
 		.into_iter()
 		.next()
@@ -1363,8 +1356,7 @@ pub(crate) fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
 	assert!(planner.contains("MAX requires one argument"));
 	assert!(planner.contains("unsupported aggregate function"));
 
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	assert!(binder.contains("expects Int32, Int64, Float32, or Float64 input"));
 
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
@@ -1412,8 +1404,7 @@ pub(crate) fn adr020_avg_aggregate_kernel_guards_are_narrow() {
 	assert!(planner.contains("AVG requires one argument"));
 	assert!(planner.contains("unsupported aggregate function"));
 
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 	assert!(binder.contains("AVG expects numeric input"));
 
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
@@ -1484,8 +1475,7 @@ pub(crate) fn adr070_planner_lowers_missing_update_selection_to_none() {
 
 #[test]
 pub(crate) fn adr070_update_without_where_is_not_lowered_as_true_literal() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let all_rows = brace_blocks_after_marker(&binder, "fn bind_update_source_for_all_rows")
 		.into_iter()
 		.next()
@@ -1509,8 +1499,7 @@ pub(crate) fn adr070_update_without_where_is_not_lowered_as_true_literal() {
 
 #[test]
 pub(crate) fn adr070_update_without_where_builds_project_over_scan_without_filter() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -1534,8 +1523,7 @@ pub(crate) fn adr070_update_without_where_builds_project_over_scan_without_filte
 
 #[test]
 pub(crate) fn adr070_update_without_where_scan_uses_no_append_identity() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -1554,8 +1542,7 @@ pub(crate) fn adr070_update_without_where_scan_uses_no_append_identity() {
 
 #[test]
 pub(crate) fn adr070_update_without_where_profile_hint_is_scan() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let all_rows = brace_blocks_after_marker(&binder, "fn bind_update_source_for_all_rows")
 		.into_iter()
 		.next()
@@ -1569,8 +1556,7 @@ pub(crate) fn adr070_update_without_where_profile_hint_is_scan() {
 
 #[test]
 pub(crate) fn adr070_update_where_pk_equality_point_read_profile_still_works() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let predicate_helper =
 		brace_blocks_after_marker(&binder, "fn bind_update_source_for_predicate")
 			.into_iter()
@@ -1591,8 +1577,7 @@ pub(crate) fn adr070_update_where_pk_equality_point_read_profile_still_works() {
 
 #[test]
 pub(crate) fn adr070_update_without_where_still_requires_pk_table() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -1609,8 +1594,7 @@ pub(crate) fn adr070_update_without_where_still_requires_pk_table() {
 
 #[test]
 pub(crate) fn adr070_update_without_where_preserves_pk_immutability() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let bind_update = brace_blocks_after_marker(&binder, "async fn bind_update")
 		.into_iter()
 		.next()
@@ -1705,8 +1689,7 @@ pub(crate) fn adr070_delete_no_where_semantics_unchanged() {
 
 #[test]
 pub(crate) fn adr070_no_transaction_lock_cas_retry_or_safety_knob() {
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
 	let config =
@@ -2395,8 +2378,7 @@ pub(crate) fn adr116_unordered_limit_is_take_not_sort() {
 	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
 	let execution_ir = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 
 	assert!(planner.contains("LIMIT/OFFSET without ORDER BY is not supported"));
 	assert!(rune.contains("LIMIT/OFFSET without ORDER BY is not supported"));

@@ -8,7 +8,7 @@ pub(crate) fn adr109_conditional_sugar_desugars_to_case() {
 		std::fs::read_to_string(manifest_dir.join("src/ir/execution.rs")).expect("read exec ir");
 	let planner =
 		std::fs::read_to_string(manifest_dir.join("src/sql_planner.rs")).expect("read planner");
-	let binder = std::fs::read_to_string(manifest_dir.join("src/binder.rs")).expect("read binder");
+	let binder = binder_source();
 	let pbc = std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read pbc");
 	let exec = std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read exec");
 
@@ -111,7 +111,7 @@ pub(crate) fn adr109_conditional_sugar_desugars_to_case() {
 #[test]
 pub(crate) fn adr112_null_sentinel_retired() {
 	let planner = source("src/sql_planner.rs");
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let bind_case = brace_blocks_after_marker(&binder, "fn bind_case")
 		.into_iter()
 		.next()
@@ -159,7 +159,7 @@ pub(crate) fn adr112_explicit_null_is_transient_binder_consumed() {
 	let execution_ir = source("src/ir/execution.rs");
 	let exec = source("src/exec.rs");
 	let planner = source("src/sql_planner.rs");
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
 	let expr_enum = ir
 		.split("pub enum Expr")
@@ -200,7 +200,7 @@ pub(crate) fn adr112_explicit_null_is_transient_binder_consumed() {
 
 #[test]
 pub(crate) fn adr112_null_predicates_stay_residual() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let pbc = source("src/pbc.rs");
 	let comparison = brace_blocks_after_marker(&binder, "fn bind_comparison")
 		.into_iter()
@@ -224,7 +224,7 @@ pub(crate) fn adr112_null_predicates_stay_residual() {
 #[test]
 pub(crate) fn adr114_contextless_null_projection_is_result_position_only() {
 	let execution_ir = source("src/ir/execution.rs");
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let exec = source("src/exec.rs");
 	let pbc = source("src/pbc.rs");
 	let bound_node = execution_ir

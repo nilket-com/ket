@@ -4,10 +4,6 @@ fn catalog_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
 }
 
-fn binder_source() -> String {
-	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
-}
-
 fn lib_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source")
 }

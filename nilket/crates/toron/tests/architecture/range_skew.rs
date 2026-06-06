@@ -1,9 +1,5 @@
 use super::support::*;
 
-fn binder_source() -> String {
-	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
-}
-
 fn catalog_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog source")
 }
@@ -234,12 +230,7 @@ pub(crate) fn adr154_no_public_filter_explain_surface() {
 	assert!(explain_schema.contains("\"decision_kind\""));
 	assert!(explain_schema.contains("\"outcome\""));
 	assert!(explain_schema.contains("\"detail\""));
-	for forbidden in [
-		"filter_index",
-		"actual_rows",
-		"hot_key",
-		"skew",
-	] {
+	for forbidden in ["filter_index", "actual_rows", "hot_key", "skew"] {
 		assert!(
 			!explain_schema.contains(forbidden),
 			"optimizer EXPLAIN schema gained filter/skew column {forbidden}"

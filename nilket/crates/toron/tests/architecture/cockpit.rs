@@ -44,7 +44,7 @@ fn source_lines_for_path(path: &Path) -> Vec<(PathBuf, usize, String)> {
 
 #[test]
 pub(crate) fn adr174_optimizer_trace_carries_scan_filter_receipts() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let trace = first_block(&binder, "struct OptimizerTrace");
 	let filter = filter_arm(&binder);
 
@@ -61,7 +61,7 @@ pub(crate) fn adr174_optimizer_trace_carries_scan_filter_receipts() {
 
 #[test]
 pub(crate) fn adr174_scan_filter_receipt_is_observational() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	for marker in [
 		"fn predicate_pushdown_plan",
 		"fn plan_filter_with_predicate_pushdown_evidence",
@@ -82,7 +82,7 @@ pub(crate) fn adr174_scan_filter_receipt_is_observational() {
 
 #[test]
 pub(crate) fn adr174_pushdown_helper_does_not_mutate_trace() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 
 	assert!(helper.contains("ScanFilterPushdownEvidence"));
@@ -94,7 +94,7 @@ pub(crate) fn adr174_pushdown_helper_does_not_mutate_trace() {
 
 #[test]
 pub(crate) fn adr174_scan_filter_receipt_is_cheap() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let receipt = first_block(&binder, "struct ScanFilterReceipt");
 	let target = first_block(&binder, "struct ScanTraceTarget");
 	let source = first_block(&binder, "enum FilterEstimateSource");
@@ -114,7 +114,7 @@ pub(crate) fn adr174_scan_filter_receipt_is_cheap() {
 
 #[test]
 pub(crate) fn adr174_explain_schema_is_unified_decision_kind() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let schema = first_block(&binder, "fn optimizer_explain_schema");
 	let plan = optimizer_explain_plan_region(&binder);
 	let join_row = first_block(&binder, "fn optimizer_explain_row");
@@ -144,7 +144,7 @@ pub(crate) fn adr174_explain_schema_is_unified_decision_kind() {
 
 #[test]
 pub(crate) fn adr174_join_receipts_preserved() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let join_row = first_block(&binder, "fn optimizer_explain_row");
 	let detail = first_block(&binder, "fn join_strategy_decision_detail_label");
 	let build = first_block(&binder, "fn optimizer_explain_build_columns");
@@ -197,7 +197,7 @@ pub(crate) fn adr174_no_runtime_storage_or_producer_surface() {
 
 #[test]
 pub(crate) fn adr174_cockpit_is_frontend_shared() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let rune = source("src/rune_engine.rs");
 	let bind_explain = first_block(&binder, "async fn bind_explain");
 	let rune_explain = first_block(&rune, "pub fn explain");
@@ -213,7 +213,7 @@ pub(crate) fn adr174_cockpit_is_frontend_shared() {
 
 #[test]
 pub(crate) fn adr175_render_trace_is_explain_only() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
 	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
 	let bind_explain = first_block(&binder, "async fn bind_explain");
@@ -236,7 +236,7 @@ pub(crate) fn adr175_render_trace_is_explain_only() {
 
 #[test]
 pub(crate) fn adr175_scan_filter_receipt_remains_cheap() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let receipt = first_block(&binder, "struct ScanFilterReceipt");
 	let trace = first_block(&binder, "struct OptimizerTrace");
 	let render_receipt = first_block(&binder, "struct ScanFilterRenderReceipt");
@@ -262,7 +262,7 @@ pub(crate) fn adr175_scan_filter_receipt_remains_cheap() {
 
 #[test]
 pub(crate) fn adr175_partial_pushdown_text_is_captured_before_lowering() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 
 	let render_capture = helper
@@ -282,7 +282,7 @@ pub(crate) fn adr175_partial_pushdown_text_is_captured_before_lowering() {
 
 #[test]
 pub(crate) fn adr175_predicate_text_uses_bound_program_pretty() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let filter = filter_arm(&binder);
 	let helper = first_block(&binder, "fn plan_filter_with_predicate_pushdown_evidence");
 	let render_row = first_block(&binder, "fn optimizer_explain_scan_filter_row");
@@ -300,7 +300,7 @@ pub(crate) fn adr175_predicate_text_uses_bound_program_pretty() {
 
 #[test]
 pub(crate) fn adr175_spent_column_name_is_source_ordinal_safe() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let helper = first_block(&binder, "fn spent_column_name_for_predicate");
 	let filter = filter_arm(&binder);
 
@@ -314,7 +314,7 @@ pub(crate) fn adr175_spent_column_name_is_source_ordinal_safe() {
 
 #[test]
 pub(crate) fn adr175_no_table_name_reverse_lookup_claim() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let target_label = first_block(&binder, "fn scan_filter_target_label");
 	let scan_row = first_block(&binder, "fn optimizer_explain_scan_filter_row");
 	let render_region = format!("{target_label}\n{scan_row}");
@@ -330,7 +330,7 @@ pub(crate) fn adr175_no_table_name_reverse_lookup_claim() {
 
 #[test]
 pub(crate) fn adr175_cockpit_is_frontend_shared() {
-	let binder = source("src/binder.rs");
+	let binder = binder_source();
 	let rune = source("src/rune_engine.rs");
 	let bind_explain = first_block(&binder, "async fn bind_explain");
 	let rune_explain = first_block(&rune, "pub fn explain");

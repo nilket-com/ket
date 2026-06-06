@@ -17,10 +17,6 @@ fn ir_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source")
 }
 
-fn binder_source() -> String {
-	std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source")
-}
-
 fn lib_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source")
 }
@@ -196,8 +192,7 @@ pub(crate) fn adr079_sql_alias_can_feed_rune_column_expression() {
 pub(crate) fn adr079_nested_sql_aggregate_continuation_binds_inner_alias() {
 	let tests = std::fs::read_to_string(manifest_dir().join("tests/rune_relation_handles_test.rs"))
 		.expect("read ADR 079 integration test");
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let binder = binder_source();
 
 	assert!(tests.contains("rune_sql_group_by_alias_can_feed_outer_sum_and_bind"));
 	assert!(tests.contains("bind(&logical, &catalog(), &PlannerConfig::default())"));
@@ -1855,16 +1850,20 @@ pub(crate) fn adr125_broadcast_authoring_builds_left_exchange_one_and_bare_right
 #[test]
 pub(crate) fn adr125_no_executor_fragmenter_binder_pbc_wendelon_change() {
 	let manifest_dir = manifest_dir();
-	for path in [
-		manifest_dir.join("src/exec.rs"),
-		manifest_dir.join("src/pbc.rs"),
-		manifest_dir.join("src/binder.rs"),
+	for (label, source) in [
+		(
+			"src/exec.rs",
+			std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read Toron source"),
+		),
+		(
+			"src/pbc.rs",
+			std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read Toron source"),
+		),
+		("src/binder.rs + src/binder/", binder_source()),
 	] {
-		let source = std::fs::read_to_string(&path).expect("read Toron source");
 		assert!(
 			!source.contains("ADR 125") && !source.contains("adr125"),
-			"ADR 125 marker leaked into {}",
-			path.display()
+			"ADR 125 marker leaked into {label}"
 		);
 	}
 
@@ -1937,16 +1936,20 @@ pub(crate) fn adr128_broadcast_hint_recognizer_consumes_optimizer_hint_text() {
 #[test]
 pub(crate) fn adr128_broadcast_hints_do_not_touch_execution_substrate() {
 	let manifest_dir = manifest_dir();
-	for path in [
-		manifest_dir.join("src/exec.rs"),
-		manifest_dir.join("src/pbc.rs"),
-		manifest_dir.join("src/binder.rs"),
+	for (label, source) in [
+		(
+			"src/exec.rs",
+			std::fs::read_to_string(manifest_dir.join("src/exec.rs")).expect("read Toron source"),
+		),
+		(
+			"src/pbc.rs",
+			std::fs::read_to_string(manifest_dir.join("src/pbc.rs")).expect("read Toron source"),
+		),
+		("src/binder.rs + src/binder/", binder_source()),
 	] {
-		let source = std::fs::read_to_string(&path).expect("read Toron source");
 		assert!(
 			!source.contains("ADR 128") && !source.contains("adr128"),
-			"ADR 128 marker leaked into {}",
-			path.display()
+			"ADR 128 marker leaked into {label}"
 		);
 	}
 
