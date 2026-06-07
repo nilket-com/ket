@@ -175,7 +175,11 @@ async fn bind_with_explain_trace(
 	let logical_types = catalog.logical_type_registry();
 	let plan = push_down_scan_projection(plan.plan, &logical_types)?;
 	let mut render_trace = render_trace.expect("render trace remains present");
-	if render_trace.join_order.is_none() {
+	render_trace.snowflake_order =
+		analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions);
+	if render_trace.snowflake_order.is_some() {
+		render_trace.join_order = None;
+	} else if render_trace.join_order.is_none() {
 		render_trace.join_order = analyze(&render_trace.join_order_edges);
 	}
 	Ok((plan, trace, render_trace))

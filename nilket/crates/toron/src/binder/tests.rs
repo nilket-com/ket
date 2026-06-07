@@ -8735,6 +8735,227 @@ async fn non_star_join_declines_with_reason() {
 }
 
 #[tokio::test]
+async fn snowflake_order_evidence_reports_nested_declared_vs_preferred() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
+		.expect("plan snowflake EXPLAIN");
+
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &auto_broadcast_config(1)).await;
+	let row = join_order_snowflake_row(&rows);
+
+	assert_eq!(
+		row[0],
+		ScalarValue::Utf8(Some("join_order_snowflake".to_string()))
+	);
+	assert_eq!(
+		row[1],
+		ScalarValue::Utf8(Some("snowflake[probe=o]".to_string()))
+	);
+	assert_eq!(row[2], ScalarValue::Utf8(Some("would_reorder".to_string())));
+	assert_utf8_contains(&row[3], "root=o");
+	assert_utf8_contains(&row[3], "declared_order=[c,s]");
+	assert_utf8_contains(&row[3], "cost_preferred_order=[s,c]");
+	assert_utf8_contains(&row[3], "root=c");
+	assert_utf8_contains(&row[3], "declared_order=[r,g]");
+	assert_utf8_contains(&row[3], "cost_preferred_order=[g,r]");
+	assert_utf8_contains(&row[3], "c:5000000:single_key_ndv_containment:soft");
+	assert_utf8_contains(&row[3], "s:100000:single_key_ndv_containment:soft");
+	assert_utf8_contains(&row[3], "r:100000:single_key_ndv_containment:soft");
+	assert_utf8_contains(&row[3], "g:5000:single_key_ndv_containment:soft");
+}
+
+#[tokio::test]
+async fn snowflake_order_evidence_is_observational() {
+	let (catalog, storage) = snowflake_order_execution_fixture().await;
+	let config = auto_broadcast_config(1);
+	let logical = SqlPlanner::new()
+		.plan(non_optimal_snowflake_order_project_sql())
+		.expect("plan snowflake SQL");
+
+	let (plain_plan, plain_trace) = bind_with_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind snowflake without render trace");
+	let (explain_plan, explain_trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &config)
+			.await
+			.expect("bind snowflake with render trace");
+
+	assert_eq!(plain_trace, explain_trace);
+	assert_eq!(format!("{plain_plan:?}"), format!("{explain_plan:?}"));
+	assert!(render_trace.snowflake_order.is_some());
+	assert!(render_trace.join_order.is_none());
+
+	let (_schema, rows) = execute_star_order_query(
+		&catalog,
+		storage,
+		non_optimal_snowflake_order_project_sql(),
+		&config,
+	)
+	.await;
+	assert_eq!(
+		rows,
+		vec![
+			vec![Some(1), Some(10), Some(100), Some(10_000), Some(1_000)],
+			vec![Some(2), Some(20), Some(200), Some(20_000), Some(2_000)],
+			vec![Some(3), Some(10), Some(100), Some(10_000), Some(1_000)],
+		]
+	);
+}
+
+#[tokio::test]
+async fn snowflake_recognized_supersedes_flat_missing_relation_decline() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
+		.expect("plan snowflake EXPLAIN");
+
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &auto_broadcast_config(1)).await;
+
+	assert!(
+		rows.iter()
+			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string())) })
+	);
+	assert!(!rows.iter().any(|row| {
+		row[0] == ScalarValue::Utf8(Some("join_order".to_string()))
+			&& row[2] == ScalarValue::Utf8(Some("declined_missing_relation_label".to_string()))
+	}));
+}
+
+#[tokio::test]
+async fn snowflake_branch_links_outer_dimension_to_inner_probe() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(non_optimal_snowflake_order_sql())
+		.expect("plan snowflake SQL");
+
+	let (_plan, _trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(1))
+			.await
+			.expect("bind snowflake render trace");
+	let evidence = render_trace
+		.snowflake_order
+		.as_ref()
+		.expect("snowflake evidence");
+
+	assert_eq!(evidence.ranking.probe, "o");
+	assert_eq!(evidence.branches.len(), 1);
+	assert_eq!(evidence.branches[0].dimension, "c");
+	assert_eq!(evidence.branches[0].evidence.ranking.probe, "c");
+}
+
+#[tokio::test]
+async fn flat_star_emits_no_snowflake_row() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
+		.expect("plan flat star EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+
+	assert!(
+		rows.iter()
+			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order".to_string())) })
+	);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string())) })
+	);
+}
+
+#[test]
+fn galaxy_or_shared_dimension_declines_snowflake() {
+	let edges = vec![
+		snowflake_test_edge(0, "orders", "customers", 0, 1_000, true),
+		snowflake_test_edge(1, "invoices", "regions", 1, 100, true),
+	];
+	let decisions = vec![
+		snowflake_test_decision(
+			0,
+			JoinStrategy::HashPartitioned,
+			JoinPhysicalPlacement::Natural,
+		),
+		snowflake_test_decision(
+			1,
+			JoinStrategy::HashPartitioned,
+			JoinPhysicalPlacement::Natural,
+		),
+	];
+
+	assert!(analyze_snowflake(&edges, &decisions).is_none());
+}
+
+#[tokio::test]
+async fn snowflake_evidence_records_per_edge_strategy_without_gating() {
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", mixed_strategy_snowflake_order_sql()))
+		.expect("plan mixed-strategy snowflake EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let row = join_order_snowflake_row(&rows);
+
+	assert_utf8_contains(&row[3], "s:broadcast/swapped_right_build");
+	assert_utf8_contains(&row[3], "c:hash_partitioned/natural");
+}
+
+#[tokio::test]
+async fn snowflake_order_evidence_is_explain_gated() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(non_optimal_snowflake_order_sql())
+		.expect("plan snowflake SQL");
+
+	let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(1))
+		.await
+		.expect("bind normal snowflake trace");
+	let trace_debug = format!("{trace:?}");
+	assert!(!trace_debug.contains("JoinOrderEdgeEvidence"));
+	assert!(!trace_debug.contains("SnowflakeOrderEvidence"));
+
+	let (_plan, _trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(1))
+			.await
+			.expect("bind snowflake explain trace");
+	assert!(render_trace.snowflake_order.is_some());
+}
+
+#[tokio::test]
+async fn snowflake_explain_analyze_shows_plan_evidence_without_runtime_or_verdict() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(non_optimal_snowflake_order_sql())
+		.expect("plan snowflake SQL");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(1))
+		.await
+		.expect("bind snowflake analyze");
+	assert!(binding.replay_ids.is_empty());
+
+	let plan = render_explain_analyze(binding, &[]).expect("render snowflake analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+
+	assert!(
+		rows.iter()
+			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string())) })
+	);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_runtime".to_string())) })
+	);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_verdict".to_string())) })
+	);
+}
+
+#[tokio::test]
 async fn star_order_evidence_agrees_when_declared_is_optimal() {
 	let catalog = star_join_order_catalog();
 	let sql = "SELECT * FROM orders o \
@@ -9014,6 +9235,48 @@ async fn rune_explain_shows_star_order_evidence() {
 	assert_eq!(row[2], ScalarValue::Utf8(Some("reordered".to_string())));
 	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
 	assert_utf8_contains(&row[3], "applied_order=[s,p,c]");
+}
+
+#[tokio::test]
+async fn rune_explain_shows_snowflake_order_evidence() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o")
+               .auto_join(
+                   ctx.table("customers").alias("c"),
+                   qcol("o", "customer_id").eq(qcol("c", "id"))
+               )
+               .auto_join(
+                   ctx.table("regions").alias("r"),
+                   qcol("c", "region_id").eq(qcol("r", "id"))
+               )
+               .auto_join(
+                   ctx.table("segments").alias("g"),
+                   qcol("c", "segment_id").eq(qcol("g", "id"))
+               )
+               .auto_join(
+                   ctx.table("stores").alias("s"),
+                   qcol("o", "store_id").eq(qcol("s", "id"))
+               )
+               .explain()
+        }
+    "#,
+	)
+	.await;
+
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &auto_broadcast_config(1)).await;
+	let row = join_order_snowflake_row(&rows);
+
+	assert_eq!(
+		row[0],
+		ScalarValue::Utf8(Some("join_order_snowflake".to_string()))
+	);
+	assert_utf8_contains(&row[3], "root=o");
+	assert_utf8_contains(&row[3], "root=c");
+	assert_utf8_contains(&row[3], "cost_preferred_order=[s,c]");
+	assert_utf8_contains(&row[3], "cost_preferred_order=[g,r]");
 }
 
 #[tokio::test]
@@ -10731,6 +10994,13 @@ fn join_order_row(rows: &[Vec<ScalarValue>]) -> &[ScalarValue] {
 		.expect("join_order evidence row")
 }
 
+fn join_order_snowflake_row(rows: &[Vec<ScalarValue>]) -> &[ScalarValue] {
+	rows.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string())))
+		.map(Vec::as_slice)
+		.expect("join_order_snowflake evidence row")
+}
+
 fn broadcast_build_scan_ids_in_applied_order(plan: &ExecutionPlan) -> Vec<TableId> {
 	let mut top_down_build_ids = Vec::new();
 	collect_broadcast_build_scan_ids_top_down(plan, &mut top_down_build_ids);
@@ -11058,6 +11328,140 @@ fn mixed_strategy_star_join_order_catalog() -> MockCatalog {
 	catalog
 }
 
+fn snowflake_join_order_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	register_snowflake_join_order_tables(&mut catalog);
+	seed_snowflake_join_order_facts(&mut catalog, None, None, None, None, None);
+	catalog
+}
+
+fn mixed_strategy_snowflake_join_order_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	register_snowflake_join_order_tables(&mut catalog);
+	seed_snowflake_join_order_facts(
+		&mut catalog,
+		Some(64 * 1024 * 1024),
+		Some(8_192),
+		Some(8_192),
+		Some(8_192),
+		Some(1_024),
+	);
+	catalog
+}
+
+fn register_snowflake_join_order_tables(catalog: &mut MockCatalog) {
+	catalog
+		.register_descriptor(
+			TableId(31),
+			named_descriptor(
+				31,
+				"orders",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("customer_id", DataType::Int64, false),
+					Field::new("store_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register snowflake orders");
+	catalog
+		.register_descriptor(
+			TableId(32),
+			named_descriptor(
+				32,
+				"customers",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("region_id", DataType::Int64, false),
+					Field::new("segment_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register snowflake customers");
+	catalog
+		.register_descriptor(
+			TableId(33),
+			named_descriptor(
+				33,
+				"regions",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register snowflake regions");
+	catalog
+		.register_descriptor(
+			TableId(34),
+			named_descriptor(
+				34,
+				"segments",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register snowflake segments");
+	catalog
+		.register_descriptor(
+			TableId(35),
+			named_descriptor(
+				35,
+				"stores",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register snowflake stores");
+}
+
+fn seed_snowflake_join_order_facts(
+	catalog: &mut MockCatalog,
+	order_bytes: Option<u64>,
+	customer_bytes: Option<u64>,
+	region_bytes: Option<u64>,
+	segment_bytes: Option<u64>,
+	store_bytes: Option<u64>,
+) {
+	seed_table_optimizer_facts(
+		catalog,
+		"orders",
+		order_bytes,
+		Some(100_000),
+		vec![
+			(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"customers",
+		customer_bytes,
+		Some(5_000),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"regions",
+		region_bytes,
+		Some(2_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"segments",
+		segment_bytes,
+		Some(100),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"stores",
+		store_bytes,
+		Some(100),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+}
+
 fn seed_star_join_order_facts_with_bytes(
 	catalog: &mut MockCatalog,
 	customer_bytes: u64,
@@ -11102,6 +11506,23 @@ async fn star_order_execution_fixture() -> (MockCatalog, Arc<InMemoryTableStorag
 	let catalog = hash_star_join_order_catalog();
 	let storage = Arc::new(InMemoryTableStorage::new());
 	for (table_id, descriptor, batch) in star_order_storage_batches() {
+		write_star_order_table(storage.as_ref(), table_id, &descriptor, batch).await;
+	}
+	(catalog, storage)
+}
+
+async fn snowflake_order_execution_fixture() -> (MockCatalog, Arc<InMemoryTableStorage>) {
+	let mut catalog = snowflake_join_order_catalog();
+	seed_snowflake_join_order_facts(
+		&mut catalog,
+		Some(64 * 1024 * 1024),
+		Some(8_192),
+		Some(8_192),
+		Some(8_192),
+		Some(8_192),
+	);
+	let storage = Arc::new(InMemoryTableStorage::new());
+	for (table_id, descriptor, batch) in snowflake_order_storage_batches() {
 		write_star_order_table(storage.as_ref(), table_id, &descriptor, batch).await;
 	}
 	(catalog, storage)
@@ -11169,6 +11590,84 @@ fn star_order_storage_batches() -> Vec<(TableId, TableSchemaDescriptor, RecordBa
 			record_batch_i64(
 				stores.arrow_schema().expect("stores schema").into(),
 				vec![vec![1000, 2000, 3000]],
+			),
+		),
+	]
+}
+
+fn snowflake_order_storage_batches() -> Vec<(TableId, TableSchemaDescriptor, RecordBatch)> {
+	let orders = named_descriptor(
+		31,
+		"orders",
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+			Field::new("store_id", DataType::Int64, false),
+		]),
+	);
+	let customers = named_descriptor(
+		32,
+		"customers",
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region_id", DataType::Int64, false),
+			Field::new("segment_id", DataType::Int64, false),
+		]),
+	);
+	let regions = named_descriptor(
+		33,
+		"regions",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	let segments = named_descriptor(
+		34,
+		"segments",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	let stores = named_descriptor(
+		35,
+		"stores",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	vec![
+		(
+			TableId(31),
+			orders.clone(),
+			record_batch_i64(
+				orders.arrow_schema().expect("orders schema").into(),
+				vec![vec![1, 2, 3], vec![10, 20, 10], vec![1000, 2000, 1000]],
+			),
+		),
+		(
+			TableId(32),
+			customers.clone(),
+			record_batch_i64(
+				customers.arrow_schema().expect("customers schema").into(),
+				vec![vec![10, 20], vec![100, 200], vec![10_000, 20_000]],
+			),
+		),
+		(
+			TableId(33),
+			regions.clone(),
+			record_batch_i64(
+				regions.arrow_schema().expect("regions schema").into(),
+				vec![vec![100, 200]],
+			),
+		),
+		(
+			TableId(34),
+			segments.clone(),
+			record_batch_i64(
+				segments.arrow_schema().expect("segments schema").into(),
+				vec![vec![10_000, 20_000]],
+			),
+		),
+		(
+			TableId(35),
+			stores.clone(),
+			record_batch_i64(
+				stores.arrow_schema().expect("stores schema").into(),
+				vec![vec![1000, 2000]],
 			),
 		),
 	]
@@ -11338,6 +11837,30 @@ fn non_optimal_star_order_project_sql() -> &'static str {
 	 INNER JOIN stores s ON o.store_id = s.id"
 }
 
+fn non_optimal_snowflake_order_sql() -> &'static str {
+	"SELECT * FROM orders o \
+	 INNER JOIN customers c ON o.customer_id = c.id \
+	 INNER JOIN regions r ON c.region_id = r.id \
+	 INNER JOIN segments g ON c.segment_id = g.id \
+	 INNER JOIN stores s ON o.store_id = s.id"
+}
+
+fn mixed_strategy_snowflake_order_sql() -> &'static str {
+	"SELECT * FROM orders o \
+	 INNER JOIN stores s ON o.store_id = s.id \
+	 INNER JOIN customers c ON o.customer_id = c.id \
+	 INNER JOIN regions r ON c.region_id = r.id \
+	 INNER JOIN segments g ON c.segment_id = g.id"
+}
+
+fn non_optimal_snowflake_order_project_sql() -> &'static str {
+	"SELECT o.id, c.id, r.id, g.id, s.id FROM orders o \
+	 INNER JOIN customers c ON o.customer_id = c.id \
+	 INNER JOIN regions r ON c.region_id = r.id \
+	 INNER JOIN segments g ON c.segment_id = g.id \
+	 INNER JOIN stores s ON o.store_id = s.id"
+}
+
 fn preferred_star_order_sql() -> &'static str {
 	"SELECT * FROM orders o \
 	 INNER JOIN stores s ON o.store_id = s.id \
@@ -11350,6 +11873,39 @@ fn preferred_star_order_project_sql() -> &'static str {
 	 INNER JOIN stores s ON o.store_id = s.id \
 	 INNER JOIN products p ON o.product_id = p.id \
 	 INNER JOIN customers c ON o.customer_id = c.id"
+}
+
+fn snowflake_test_edge(
+	join_index: usize,
+	probe: &str,
+	dimension: &str,
+	declared_position: usize,
+	estimated_rows: u64,
+	probe_scan_linear: bool,
+) -> JoinOrderEdgeEvidence {
+	JoinOrderEdgeEvidence {
+		target: JoinTraceTarget { join_index },
+		probe: Some(probe.to_string()),
+		dimension: Some(dimension.to_string()),
+		declared_position,
+		estimated_rows: Some(RowCount::new(estimated_rows)),
+		estimate_source: JoinOrderEstimateSource::SingleKeyNdvContainment,
+		inner_equi: true,
+		probe_scan_linear,
+	}
+}
+
+fn snowflake_test_decision(
+	join_index: usize,
+	strategy: JoinStrategy,
+	placement: JoinPhysicalPlacement,
+) -> DecisionReceipt {
+	DecisionReceipt {
+		target: JoinTraceTarget { join_index },
+		strategy,
+		placement,
+		reason: JoinStrategyDecisionReason::PinnedByAuthor,
+	}
 }
 
 fn join_cardinality_catalog() -> MockCatalog {

@@ -74,6 +74,7 @@ pub(super) struct OptimizerExplainRenderTrace {
 	pub(super) scan_filters: Vec<ScanFilterRenderReceipt>,
 	pub(super) join_order_edges: Vec<JoinOrderEdgeEvidence>,
 	pub(super) join_order: Option<StarOrderOutcome>,
+	pub(super) snowflake_order: Option<SnowflakeOrderEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +196,9 @@ pub(super) fn optimizer_explain_plan(
 			})
 			.collect::<Result<Vec<_>, _>>()?,
 	);
+	if let Some(evidence) = render_trace.and_then(|trace| trace.snowflake_order.as_ref()) {
+		rows.push(optimizer_explain_snowflake_order_row(evidence)?);
+	}
 	if let Some(outcome) = render_trace.and_then(|trace| trace.join_order.as_ref()) {
 		rows.push(optimizer_explain_join_order_row(outcome)?);
 	}
@@ -275,6 +279,9 @@ fn optimizer_analyze_rows(
 	render_trace: &OptimizerExplainRenderTrace,
 	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
 ) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	if let Some(evidence) = render_trace.snowflake_order.as_ref() {
+		return Ok(vec![optimizer_analyze_snowflake_order_row(evidence)]);
+	}
 	let Some(StarOrderOutcome::Recognized(evidence)) = render_trace.join_order.as_ref() else {
 		return Ok(Vec::new());
 	};
@@ -424,6 +431,43 @@ pub(super) fn optimizer_explain_join_order_row(
 		ScalarValue::Int64(None),
 		ScalarValue::Int64(None),
 	])
+}
+
+pub(super) fn optimizer_explain_snowflake_order_row(
+	evidence: &SnowflakeOrderEvidence,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_snowflake".to_string())),
+		ScalarValue::Utf8(Some(snowflake_order_target_label(evidence))),
+		ScalarValue::Utf8(Some(snowflake_order_outcome_label(evidence).to_string())),
+		ScalarValue::Utf8(Some(snowflake_order_detail_label(evidence))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	])
+}
+
+fn optimizer_analyze_snowflake_order_row(evidence: &SnowflakeOrderEvidence) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_snowflake".to_string())),
+		ScalarValue::Utf8(Some(snowflake_order_target_label(evidence))),
+		ScalarValue::Utf8(Some(snowflake_order_outcome_label(evidence).to_string())),
+		ScalarValue::Utf8(Some(snowflake_order_detail_label(evidence))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
 }
 
 pub(super) fn optimizer_explain_scan_filter_row(
@@ -635,6 +679,99 @@ pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 				star_order_decline_reason_label(decline.reason),
 				decline.edge_count
 			)
+		}
+	}
+}
+
+pub(super) fn snowflake_order_target_label(evidence: &SnowflakeOrderEvidence) -> String {
+	format!("snowflake[probe={}]", evidence.ranking.probe)
+}
+
+pub(super) fn snowflake_order_outcome_label(evidence: &SnowflakeOrderEvidence) -> &'static str {
+	if snowflake_order_would_reorder(evidence) {
+		"would_reorder"
+	} else {
+		"would_keep_declared"
+	}
+}
+
+fn snowflake_order_would_reorder(evidence: &SnowflakeOrderEvidence) -> bool {
+	evidence.ranking.action == StarOrderAction::Reordered
+		|| evidence
+			.branches
+			.iter()
+			.any(|branch| snowflake_order_would_reorder(&branch.evidence))
+}
+
+pub(super) fn snowflake_order_detail_label(evidence: &SnowflakeOrderEvidence) -> String {
+	snowflake_order_level_detail_label(evidence)
+}
+
+fn snowflake_order_level_detail_label(evidence: &SnowflakeOrderEvidence) -> String {
+	let ranking = &evidence.ranking;
+	format!(
+		"root={}; action={}; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}/{}; estimates=[{}]; strategies=[{}]; branches=[{}]",
+		ranking.probe,
+		snowflake_order_action_label(ranking.action),
+		ranking
+			.dimensions
+			.iter()
+			.map(|dim| dim.dimension.as_str())
+			.collect::<Vec<_>>()
+			.join(","),
+		ranking.declared_order.join(","),
+		ranking.cost_preferred_order.join(","),
+		ranking.declared_cost,
+		ranking.preferred_cost,
+		join_order_estimate_confidence_label(ranking.confidence),
+		STAR_ORDER_SOFT_MARGIN_NUMERATOR,
+		STAR_ORDER_SOFT_MARGIN_DENOMINATOR,
+		ranking
+			.dimensions
+			.iter()
+			.map(|dim| format!(
+				"{}:{}:{}:{}",
+				dim.dimension,
+				dim.estimated_rows.get(),
+				join_order_estimate_source_label(dim.estimate_source),
+				join_order_estimate_confidence_label(dim.confidence)
+			))
+			.collect::<Vec<_>>()
+			.join(","),
+		evidence
+			.edge_strategies
+			.iter()
+			.map(snowflake_edge_strategy_label)
+			.collect::<Vec<_>>()
+			.join(","),
+		evidence
+			.branches
+			.iter()
+			.map(|branch| format!(
+				"{}:{{{}}}",
+				branch.dimension,
+				snowflake_order_level_detail_label(&branch.evidence)
+			))
+			.collect::<Vec<_>>()
+			.join("|")
+	)
+}
+
+fn snowflake_edge_strategy_label(strategy: &SnowflakeEdgeStrategy) -> String {
+	format!(
+		"{}:{}/{}:scan_linear={}",
+		strategy.dimension,
+		join_strategy_label(strategy.strategy),
+		join_physical_placement_label(strategy.placement),
+		strategy.probe_scan_linear
+	)
+}
+
+fn snowflake_order_action_label(action: StarOrderAction) -> &'static str {
+	match action {
+		StarOrderAction::Reordered => "would_reorder",
+		StarOrderAction::KeptAlreadyOptimal | StarOrderAction::KeptInsufficientMargin => {
+			"would_keep_declared"
 		}
 	}
 }

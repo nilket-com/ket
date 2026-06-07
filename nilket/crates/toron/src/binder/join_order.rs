@@ -60,6 +60,19 @@ pub(super) enum StarOrderStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StarOrderRanking {
+	pub(super) probe: String,
+	pub(super) dimensions: Vec<JoinOrderDimEvidence>,
+	pub(super) declared_order: Vec<String>,
+	pub(super) cost_preferred_order: Vec<String>,
+	pub(super) declared_cost: u128,
+	pub(super) preferred_cost: u128,
+	pub(super) orders_agree: bool,
+	pub(super) action: StarOrderAction,
+	pub(super) confidence: JoinOrderEstimateConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StarOrderEvidence {
 	pub(super) probe: String,
 	pub(super) dimensions: Vec<JoinOrderDimEvidence>,
@@ -95,6 +108,27 @@ pub(super) struct StarOrderDecline {
 pub(super) enum StarOrderOutcome {
 	Recognized(StarOrderEvidence),
 	Declined(StarOrderDecline),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SnowflakeOrderEvidence {
+	pub(super) ranking: StarOrderRanking,
+	pub(super) edge_strategies: Vec<SnowflakeEdgeStrategy>,
+	pub(super) branches: Vec<SnowflakeBranch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SnowflakeBranch {
+	pub(super) dimension: String,
+	pub(super) evidence: SnowflakeOrderEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SnowflakeEdgeStrategy {
+	pub(super) dimension: String,
+	pub(super) strategy: JoinStrategy,
+	pub(super) placement: JoinPhysicalPlacement,
+	pub(super) probe_scan_linear: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +574,142 @@ pub(super) fn analyze(edges: &[JoinOrderEdgeEvidence]) -> Option<StarOrderOutcom
 	))
 }
 
+pub(super) fn analyze_snowflake(
+	edges: &[JoinOrderEdgeEvidence],
+	decisions: &[DecisionReceipt],
+) -> Option<SnowflakeOrderEvidence> {
+	if edges.len() < 2 {
+		return None;
+	}
+
+	let mut adjacency = BTreeMap::<String, Vec<usize>>::new();
+	let mut probes = BTreeSet::new();
+	let mut dimensions = BTreeSet::new();
+	let mut dimension_parent = BTreeMap::<String, String>::new();
+	for (edge_index, edge) in edges.iter().enumerate() {
+		if !edge.inner_equi {
+			return None;
+		}
+		let probe = edge.probe.as_ref()?;
+		let dimension = edge.dimension.as_ref()?;
+		if probe == dimension || edge.estimated_rows.is_none() {
+			return None;
+		}
+		let decision = decisions.get(edge.target.join_index)?;
+		if decision.target != edge.target {
+			return None;
+		}
+		if dimension_parent
+			.insert(dimension.clone(), probe.clone())
+			.is_some()
+		{
+			return None;
+		}
+		adjacency.entry(probe.clone()).or_default().push(edge_index);
+		probes.insert(probe.clone());
+		dimensions.insert(dimension.clone());
+	}
+
+	if !dimensions
+		.iter()
+		.any(|dimension| probes.contains(dimension))
+	{
+		return None;
+	}
+	let roots = probes
+		.iter()
+		.filter(|probe| !dimensions.contains(*probe))
+		.collect::<Vec<_>>();
+	if roots.len() != 1 {
+		return None;
+	}
+	let root = roots[0].as_str();
+
+	let mut visited_nodes = BTreeSet::new();
+	let mut visited_edges = BTreeSet::new();
+	let evidence = snowflake_order_level(
+		root,
+		edges,
+		decisions,
+		&adjacency,
+		&mut visited_nodes,
+		&mut visited_edges,
+	)?;
+	if visited_edges.len() != edges.len() {
+		return None;
+	}
+	Some(evidence)
+}
+
+fn snowflake_order_level(
+	probe: &str,
+	edges: &[JoinOrderEdgeEvidence],
+	decisions: &[DecisionReceipt],
+	adjacency: &BTreeMap<String, Vec<usize>>,
+	visited_nodes: &mut BTreeSet<String>,
+	visited_edges: &mut BTreeSet<usize>,
+) -> Option<SnowflakeOrderEvidence> {
+	if !visited_nodes.insert(probe.to_string()) {
+		return None;
+	}
+	let direct_edges = adjacency.get(probe)?;
+	let mut dimensions = Vec::with_capacity(direct_edges.len());
+	let mut edge_strategies = Vec::with_capacity(direct_edges.len());
+	for (declared_position, edge_index) in direct_edges.iter().copied().enumerate() {
+		if !visited_edges.insert(edge_index) {
+			return None;
+		}
+		let edge = edges.get(edge_index)?;
+		let dimension = edge.dimension.as_ref()?;
+		let decision = decisions.get(edge.target.join_index)?;
+		if decision.target != edge.target {
+			return None;
+		}
+		dimensions.push(JoinOrderDimEvidence {
+			dimension: dimension.clone(),
+			declared_position,
+			estimated_rows: edge.estimated_rows?,
+			estimate_source: edge.estimate_source,
+			confidence: JoinOrderEstimateConfidence::Soft,
+		});
+		edge_strategies.push(SnowflakeEdgeStrategy {
+			dimension: dimension.clone(),
+			strategy: decision.strategy,
+			placement: decision.placement,
+			probe_scan_linear: edge.probe_scan_linear,
+		});
+	}
+
+	let ranking = rank_star_order(
+		probe.to_string(),
+		dimensions,
+		JoinOrderEstimateConfidence::Soft,
+	);
+	let mut branches = Vec::new();
+	for edge_index in direct_edges.iter().copied() {
+		let dimension = edges.get(edge_index)?.dimension.as_ref()?;
+		if adjacency.contains_key(dimension) {
+			branches.push(SnowflakeBranch {
+				dimension: dimension.clone(),
+				evidence: snowflake_order_level(
+					dimension,
+					edges,
+					decisions,
+					adjacency,
+					visited_nodes,
+					visited_edges,
+				)?,
+			});
+		}
+	}
+
+	Some(SnowflakeOrderEvidence {
+		ranking,
+		edge_strategies,
+		branches,
+	})
+}
+
 pub(super) fn recognized_star_order_outcome(
 	probe: String,
 	dimensions: Vec<JoinOrderDimEvidence>,
@@ -547,6 +717,29 @@ pub(super) fn recognized_star_order_outcome(
 	strategy: StarOrderStrategy,
 	confidence: JoinOrderEstimateConfidence,
 ) -> StarOrderOutcome {
+	let ranking = rank_star_order(probe, dimensions, confidence);
+	let applied_order = applied_order_override.unwrap_or_else(|| ranking.declared_order.clone());
+
+	StarOrderOutcome::Recognized(StarOrderEvidence {
+		probe: ranking.probe,
+		dimensions: ranking.dimensions,
+		declared_order: ranking.declared_order,
+		cost_preferred_order: ranking.cost_preferred_order,
+		applied_order,
+		strategy,
+		declared_cost: ranking.declared_cost,
+		preferred_cost: ranking.preferred_cost,
+		orders_agree: ranking.orders_agree,
+		action: ranking.action,
+		confidence: ranking.confidence,
+	})
+}
+
+pub(super) fn rank_star_order(
+	probe: String,
+	dimensions: Vec<JoinOrderDimEvidence>,
+	confidence: JoinOrderEstimateConfidence,
+) -> StarOrderRanking {
 	let declared_order = dimensions
 		.iter()
 		.map(|dim| dim.dimension.clone())
@@ -566,21 +759,17 @@ pub(super) fn recognized_star_order_outcome(
 	let orders_agree = declared_order == cost_preferred_order;
 	let action =
 		classify_star_order_action(declared_cost, preferred_cost, orders_agree, confidence);
-	let applied_order = applied_order_override.unwrap_or_else(|| declared_order.clone());
-
-	StarOrderOutcome::Recognized(StarOrderEvidence {
+	StarOrderRanking {
 		probe,
 		dimensions,
 		declared_order,
 		cost_preferred_order,
-		applied_order,
-		strategy,
 		declared_cost,
 		preferred_cost,
 		orders_agree,
 		action,
 		confidence,
-	})
+	}
 }
 
 pub(super) fn measured_star_order_verdict(
