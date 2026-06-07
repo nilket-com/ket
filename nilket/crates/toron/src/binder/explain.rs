@@ -280,7 +280,20 @@ fn optimizer_analyze_rows(
 	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
 ) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
 	if let Some(evidence) = render_trace.snowflake_order.as_ref() {
-		return Ok(vec![optimizer_analyze_snowflake_order_row(evidence)]);
+		let mut rows = vec![optimizer_analyze_snowflake_order_row(evidence)];
+		let dimensions = flatten_snowflake_dimensions(evidence);
+		for edge in &render_trace.join_order_edges {
+			let Some(dimension) = edge.dimension.as_deref() else {
+				continue;
+			};
+			let Some((probe, dimension)) = dimensions.get(dimension) else {
+				continue;
+			};
+			rows.push(optimizer_analyze_snowflake_runtime_row(
+				probe, edge, dimension, summaries,
+			)?);
+		}
+		return Ok(rows);
 	}
 	let Some(StarOrderOutcome::Recognized(evidence)) = render_trace.join_order.as_ref() else {
 		return Ok(Vec::new());
@@ -319,45 +332,151 @@ fn optimizer_analyze_join_order_row(
 	dimension: &JoinOrderDimEvidence,
 	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
 ) -> Result<Vec<ScalarValue>, BindingError> {
-	let replay_id = join_replay_id_for_trace_target(edge.target)?;
-	let observed_summary = summaries.get(&replay_id).copied();
-	let summary = observed_summary.unwrap_or_default();
+	let measurement = join_order_runtime_measurement(edge, dimension.estimated_rows, summaries)?;
 	let estimated_rows = dimension.estimated_rows;
-	let actual_rows = observed_summary.map(|summary| summary.output_rows);
-	let ratio = actual_rows.and_then(|actual| {
-		(estimated_rows.get() > 0).then_some(actual.get() as f64 / estimated_rows.get() as f64)
-	});
 	Ok(vec![
 		ScalarValue::Utf8(Some("join_order_runtime".to_string())),
 		ScalarValue::Utf8(Some(format!(
 			"join[{}] dimension={}",
-			replay_id.0, dimension.dimension
+			measurement.replay_id.0, dimension.dimension
 		))),
 		ScalarValue::Utf8(Some("measured".to_string())),
 		ScalarValue::Utf8(Some(format!(
 			"estimated={}; actual={}; ratio={}; source={}; build_rows={}; probe_rows={}",
 			estimated_rows.get(),
-			actual_rows.map(RowCount::get).unwrap_or(0),
-			ratio
+			measurement.actual_rows.map(RowCount::get).unwrap_or(0),
+			measurement
+				.ratio
 				.map(|value| format!("{value:.6}"))
 				.unwrap_or_else(|| "missing".to_string()),
 			join_order_estimate_source_label(dimension.estimate_source),
-			summary.build_rows.get(),
-			summary.probe_rows.get()
+			measurement.summary.build_rows.get(),
+			measurement.summary.probe_rows.get()
 		))),
 		ScalarValue::Int64(Some(row_count_to_i64(estimated_rows, "estimated_rows")?)),
 		ScalarValue::Int64(
-			actual_rows
+			measurement
+				.actual_rows
 				.map(|rows| row_count_to_i64(rows, "actual_rows"))
 				.transpose()?,
 		),
-		ScalarValue::Float64(ratio),
+		ScalarValue::Float64(measurement.ratio),
 		ScalarValue::Utf8(Some(
 			join_order_estimate_source_label(dimension.estimate_source).to_string(),
 		)),
-		ScalarValue::Int64(Some(row_count_to_i64(summary.build_rows, "build_rows")?)),
-		ScalarValue::Int64(Some(row_count_to_i64(summary.probe_rows, "probe_rows")?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.build_rows,
+			"build_rows",
+		)?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.probe_rows,
+			"probe_rows",
+		)?)),
 	])
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JoinOrderRuntimeMeasurement {
+	replay_id: JoinReplayId,
+	summary: JoinRuntimeObservationSummary,
+	actual_rows: Option<RowCount>,
+	ratio: Option<f64>,
+}
+
+fn join_order_runtime_measurement(
+	edge: &JoinOrderEdgeEvidence,
+	estimated_rows: RowCount,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<JoinOrderRuntimeMeasurement, BindingError> {
+	let replay_id = join_replay_id_for_trace_target(edge.target)?;
+	let observed_summary = summaries.get(&replay_id).copied();
+	let summary = observed_summary.unwrap_or_default();
+	let actual_rows = observed_summary.map(|summary| summary.output_rows);
+	let ratio = actual_rows.and_then(|actual| {
+		(estimated_rows.get() > 0).then_some(actual.get() as f64 / estimated_rows.get() as f64)
+	});
+	Ok(JoinOrderRuntimeMeasurement {
+		replay_id,
+		summary,
+		actual_rows,
+		ratio,
+	})
+}
+
+fn optimizer_analyze_snowflake_runtime_row(
+	probe: &str,
+	edge: &JoinOrderEdgeEvidence,
+	dimension: &JoinOrderDimEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let measurement = join_order_runtime_measurement(edge, dimension.estimated_rows, summaries)?;
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_snowflake_runtime".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"join[{}] level={} dimension={}",
+			measurement.replay_id.0, probe, dimension.dimension
+		))),
+		ScalarValue::Utf8(Some("measured".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"level={}; dimension={}; estimated={}; actual={}; ratio={}; source={}; build_rows={}; probe_rows={}",
+			probe,
+			dimension.dimension,
+			dimension.estimated_rows.get(),
+			measurement.actual_rows.map(RowCount::get).unwrap_or(0),
+			measurement
+				.ratio
+				.map(|value| format!("{value:.6}"))
+				.unwrap_or_else(|| "missing".to_string()),
+			join_order_estimate_source_label(dimension.estimate_source),
+			measurement.summary.build_rows.get(),
+			measurement.summary.probe_rows.get()
+		))),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			dimension.estimated_rows,
+			"estimated_rows",
+		)?)),
+		ScalarValue::Int64(
+			measurement
+				.actual_rows
+				.map(|rows| row_count_to_i64(rows, "actual_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Float64(measurement.ratio),
+		ScalarValue::Utf8(Some(
+			join_order_estimate_source_label(dimension.estimate_source).to_string(),
+		)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.build_rows,
+			"build_rows",
+		)?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.probe_rows,
+			"probe_rows",
+		)?)),
+	])
+}
+
+fn flatten_snowflake_dimensions(
+	evidence: &SnowflakeOrderEvidence,
+) -> BTreeMap<String, (String, JoinOrderDimEvidence)> {
+	let mut dimensions = BTreeMap::new();
+	collect_snowflake_dimensions(evidence, &mut dimensions);
+	dimensions
+}
+
+fn collect_snowflake_dimensions(
+	evidence: &SnowflakeOrderEvidence,
+	dimensions: &mut BTreeMap<String, (String, JoinOrderDimEvidence)>,
+) {
+	for dimension in &evidence.ranking.dimensions {
+		dimensions.insert(
+			dimension.dimension.clone(),
+			(evidence.ranking.probe.clone(), dimension.clone()),
+		);
+	}
+	for branch in &evidence.branches {
+		collect_snowflake_dimensions(&branch.evidence, dimensions);
+	}
 }
 
 fn optimizer_analyze_join_order_verdict_row(

@@ -26,6 +26,13 @@ const STAR_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
 	INNER JOIN products p ON o.product_id = p.id \
 	INNER JOIN stores s ON o.store_id = s.id";
 
+const SNOWFLAKE_SQL: &str = "SELECT o.id, c.id, r.id, g.id, s.id \
+	FROM orders o \
+	INNER JOIN customers c ON o.customer_id = c.id \
+	INNER JOIN regions r ON c.region_id = r.id \
+	INNER JOIN segments g ON c.segment_id = g.id \
+	INNER JOIN stores s ON o.store_id = s.id";
+
 #[derive(Debug, Clone, Copy)]
 struct StarFactRows {
 	customers: u64,
@@ -89,6 +96,152 @@ async fn explain_analyze_runs_and_captures_star_join_actuals() {
 		"fixture should expose a measured estimate miss: estimated={estimated:?} actual={actual:?}",
 	);
 	assert!(details.iter().all(|detail| detail.contains("source=")));
+}
+
+#[tokio::test]
+async fn snowflake_runtime_evidence_reports_measured_edge_cardinalities_by_level() {
+	let batch = analyze_snowflake_batch().await;
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_snowflake_runtime");
+	let targets = string_values_for_rows(&batch, 1, &runtime_rows);
+	let actual = int64_values_for_rows(&batch, 5, &runtime_rows);
+	let build_rows = int64_values_for_rows(&batch, 8, &runtime_rows);
+	let probe_rows = int64_values_for_rows(&batch, 9, &runtime_rows);
+
+	assert_eq!(
+		row_indices_for_kind(&batch, "join_order_snowflake").len(),
+		1
+	);
+	assert_eq!(runtime_rows.len(), 4);
+	assert!(
+		targets
+			.iter()
+			.any(|target| target.contains("level=o dimension=c"))
+	);
+	assert!(
+		targets
+			.iter()
+			.any(|target| target.contains("level=o dimension=s"))
+	);
+	assert!(
+		targets
+			.iter()
+			.any(|target| target.contains("level=c dimension=r"))
+	);
+	assert!(
+		targets
+			.iter()
+			.any(|target| target.contains("level=c dimension=g"))
+	);
+	assert_eq!(actual, vec![5, 4, 3, 2]);
+	assert!(build_rows.iter().all(|rows| *rows > 0));
+	assert!(probe_rows.iter().all(|rows| *rows > 0));
+}
+
+#[tokio::test]
+async fn snowflake_runtime_evidence_covers_root_and_branch() {
+	let batch = analyze_snowflake_batch().await;
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_snowflake_runtime");
+	let targets = string_values_for_rows(&batch, 1, &runtime_rows);
+
+	assert!(
+		targets
+			.iter()
+			.any(|target| target.contains("level=o dimension=c")),
+		"root-level snowflake edge should be measured: {targets:?}"
+	);
+	assert!(
+		targets
+			.iter()
+			.any(|target| target.contains("level=c dimension=r")),
+		"branch-level snowflake edge should be measured: {targets:?}"
+	);
+}
+
+#[tokio::test]
+async fn snowflake_runtime_rows_correlate_by_replay_id() {
+	let batch = analyze_snowflake_batch().await;
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_snowflake_runtime");
+	let targets = string_values_for_rows(&batch, 1, &runtime_rows);
+	let actual = int64_values_for_rows(&batch, 5, &runtime_rows);
+	let observed = targets
+		.iter()
+		.zip(actual.iter().copied())
+		.collect::<BTreeMap<_, _>>();
+
+	assert_eq!(
+		observed.get(&"join[0] level=o dimension=c".to_string()),
+		Some(&5)
+	);
+	assert_eq!(
+		observed.get(&"join[1] level=c dimension=r".to_string()),
+		Some(&4)
+	);
+	assert_eq!(
+		observed.get(&"join[2] level=c dimension=g".to_string()),
+		Some(&3)
+	);
+	assert_eq!(
+		observed.get(&"join[3] level=o dimension=s".to_string()),
+		Some(&2)
+	);
+}
+
+#[tokio::test]
+async fn snowflake_explain_analyze_shows_runtime_without_verdict() {
+	let batch = analyze_snowflake_batch().await;
+
+	assert_eq!(
+		row_indices_for_kind(&batch, "join_order_snowflake").len(),
+		1
+	);
+	assert_eq!(
+		row_indices_for_kind(&batch, "join_order_snowflake_runtime").len(),
+		4
+	);
+	assert!(row_indices_for_kind(&batch, "join_order_verdict").is_empty());
+	assert!(row_indices_for_kind(&batch, "join_order_runtime").is_empty());
+}
+
+#[tokio::test]
+async fn snowflake_runtime_evidence_is_observational() {
+	let (catalog, storage) = snowflake_fixture().await;
+	let coordinator = coordinator_with_config(
+		catalog,
+		storage,
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(1)),
+			..PlannerConfig::default()
+		},
+	);
+	let planner = SqlPlanner::new();
+	let query = planner.plan(SNOWFLAKE_SQL).expect("plan snowflake query");
+	let analyze = planner
+		.plan(&format!("EXPLAIN ANALYZE {SNOWFLAKE_SQL}"))
+		.expect("plan snowflake analyze");
+
+	let before = execute_single_batch(&coordinator, &query).await;
+	let analysis = execute_single_batch(&coordinator, &analyze).await;
+	let after = execute_single_batch(&coordinator, &query).await;
+
+	assert_eq!(
+		row_indices_for_kind(&analysis, "join_order_snowflake_runtime").len(),
+		4
+	);
+	assert_eq!(
+		format!("{:?}", before.schema()),
+		format!("{:?}", after.schema())
+	);
+	assert_eq!(int64_values(&before, 0), int64_values(&after, 0));
+	assert_eq!(int64_values(&before, 0), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn star_runtime_evidence_unchanged() {
+	let batch = analyze_star_batch().await;
+
+	assert_eq!(row_indices_for_kind(&batch, "join_order_runtime").len(), 3);
+	assert_eq!(row_indices_for_kind(&batch, "join_order_verdict").len(), 1);
+	assert!(row_indices_for_kind(&batch, "join_order_snowflake_runtime").is_empty());
 }
 
 #[tokio::test]
@@ -433,6 +586,24 @@ async fn analyze_star_batch_with(facts: StarFactRows, data_shape: StarDataShape)
 	execute_single_batch(&coordinator, &logical).await
 }
 
+async fn analyze_snowflake_batch() -> RecordBatch {
+	let (catalog, storage) = snowflake_fixture().await;
+	let coordinator = coordinator_with_config(
+		catalog,
+		storage,
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(1)),
+			..PlannerConfig::default()
+		},
+	);
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN ANALYZE {SNOWFLAKE_SQL}"))
+		.expect("plan snowflake EXPLAIN ANALYZE");
+
+	assert!(matches!(logical, LogicalPlan::ExplainAnalyze { .. }));
+	execute_single_batch(&coordinator, &logical).await
+}
+
 #[tokio::test]
 async fn hash_star_measured_verdict_extends() {
 	let (catalog, storage) = star_fixture().await;
@@ -588,6 +759,135 @@ async fn star_fixture_with(
 	.await;
 
 	(Arc::new(catalog), storage)
+}
+
+async fn snowflake_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
+	let mut catalog = MockCatalog::new();
+	let storage = Arc::new(InMemoryTableStorage::new());
+
+	let orders = descriptor(
+		31,
+		"orders",
+		Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+			Field::new("store_id", DataType::Int64, false),
+		])),
+		"id",
+	);
+	let customers = descriptor(
+		32,
+		"customers",
+		Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region_id", DataType::Int64, false),
+			Field::new("segment_id", DataType::Int64, false),
+		])),
+		"id",
+	);
+	let regions = single_id_descriptor(33, "regions");
+	let segments = single_id_descriptor(34, "segments");
+	let stores = single_id_descriptor(35, "stores");
+
+	for (table_id, descriptor) in [
+		(TableId(31), &orders),
+		(TableId(32), &customers),
+		(TableId(33), &regions),
+		(TableId(34), &segments),
+		(TableId(35), &stores),
+	] {
+		catalog
+			.register_descriptor(table_id, descriptor.clone())
+			.expect("register snowflake descriptor");
+	}
+	seed_snowflake_facts(&mut catalog);
+
+	write_table(
+		storage.as_ref(),
+		TableId(31),
+		&orders,
+		record_batch(
+			orders.arrow_schema().expect("orders schema").into(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+				Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+				Arc::new(Int64Array::from(vec![1000, 1000, 2000, 3000, 4000])),
+			],
+		),
+	)
+	.await;
+	write_table(
+		storage.as_ref(),
+		TableId(32),
+		&customers,
+		record_batch(
+			customers.arrow_schema().expect("customers schema").into(),
+			vec![
+				Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+				Arc::new(Int64Array::from(vec![100, 200, 100, 300, 400])),
+				Arc::new(Int64Array::from(vec![10000, 10000, 20000, 30000, 40000])),
+			],
+		),
+	)
+	.await;
+	write_table(
+		storage.as_ref(),
+		TableId(33),
+		&regions,
+		id_batch(
+			regions.arrow_schema().expect("regions schema").into(),
+			&[100, 200, 300],
+		),
+	)
+	.await;
+	write_table(
+		storage.as_ref(),
+		TableId(34),
+		&segments,
+		id_batch(
+			segments.arrow_schema().expect("segments schema").into(),
+			&[10000, 20000],
+		),
+	)
+	.await;
+	write_table(
+		storage.as_ref(),
+		TableId(35),
+		&stores,
+		id_batch(
+			stores.arrow_schema().expect("stores schema").into(),
+			&[1000],
+		),
+	)
+	.await;
+
+	(Arc::new(catalog), storage)
+}
+
+fn seed_snowflake_facts(catalog: &mut MockCatalog) {
+	for (table, rows, ndv) in [
+		("orders", 100_000, vec![(1, 100), (2, 100)]),
+		("customers", 10_000, vec![(0, 100), (1, 100), (2, 100)]),
+		("regions", 1_000, vec![(0, 100)]),
+		("segments", 500, vec![(0, 100)]),
+		("stores", 100, vec![(0, 100)]),
+	] {
+		catalog
+			.seed_optimizer_facts(
+				&TableRef::new(table),
+				TableOptimizerFacts {
+					row_upper_bound: Some(RowCount::new(rows)),
+					column_ndv: ndv
+						.into_iter()
+						.map(|(ordinal, distinct)| {
+							(ColumnOrdinal(ordinal), DistinctCountFact::Exact(distinct))
+						})
+						.collect::<BTreeMap<_, _>>(),
+					..TableOptimizerFacts::default()
+				},
+			)
+			.expect("seed snowflake optimizer facts");
+	}
 }
 
 fn seed_star_facts(catalog: &mut MockCatalog, facts: StarFactRows) {

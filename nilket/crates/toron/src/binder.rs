@@ -214,13 +214,16 @@ pub(crate) fn render_explain_analyze(
 	optimizer_analyze_plan(binding.trace, binding.render_trace, observations)
 }
 
+// Join-order EXPLAIN ANALYZE evidence uses the same replay-id capture for flat stars and
+// recognized snowflakes. Non-star/non-snowflake plans keep the allowlist empty.
 fn star_order_runtime_replay_ids(
 	render_trace: &OptimizerExplainRenderTrace,
 ) -> Result<BTreeSet<JoinReplayId>, BindingError> {
 	if !matches!(
 		render_trace.join_order,
 		Some(StarOrderOutcome::Recognized(_))
-	) {
+	) && render_trace.snowflake_order.is_none()
+	{
 		return Ok(BTreeSet::new());
 	}
 	render_trace

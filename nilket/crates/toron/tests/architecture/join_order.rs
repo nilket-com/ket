@@ -269,14 +269,16 @@ pub(crate) fn adr179_actual_correlates_via_replay_id() {
 	let task = source("src/distributed/task.rs");
 	let exec = source("src/exec.rs");
 	let render = first_block(&binder, "fn optimizer_analyze_join_order_row");
+	let measurement = first_block(&binder, "fn join_order_runtime_measurement");
 	let replay_ids = first_block(&binder, "fn star_order_runtime_replay_ids");
 	let execute_hash_join = first_block(&exec, "async fn execute_hash_join");
 
 	assert!(task.contains("pub replay_id: JoinReplayId"));
 	assert!(replay_ids.contains("edge.target.join_index"));
 	assert!(replay_ids.contains(".map(JoinReplayId)"));
-	assert!(render.contains("join_replay_id_for_trace_target(edge.target)?"));
-	assert!(render.contains("summaries.get(&replay_id)"));
+	assert!(render.contains("join_order_runtime_measurement(edge"));
+	assert!(measurement.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(measurement.contains("summaries.get(&replay_id)"));
 	assert!(execute_hash_join.contains("JoinRuntimeObservation {\n\t\t\t\t\treplay_id,"));
 	assert!(execute_hash_join.contains("output_rows: RowCount::new(record_batch_row_count"));
 }
@@ -514,11 +516,13 @@ pub(crate) fn adr180_runtime_correlation_remains_replay_id_keyed() {
 	let explain = source("src/binder/explain.rs");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 	let runtime_row = first_block(&explain, "fn optimizer_analyze_join_order_row");
+	let measurement = first_block(&explain, "fn join_order_runtime_measurement");
 
 	assert!(analyze_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
 	assert!(analyze_rows.contains("summaries.get(&replay_id)"));
-	assert!(runtime_row.contains("join_replay_id_for_trace_target(edge.target)?"));
-	assert!(runtime_row.contains("summaries.get(&replay_id)"));
+	assert!(runtime_row.contains("join_order_runtime_measurement(edge"));
+	assert!(measurement.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(measurement.contains("summaries.get(&replay_id)"));
 }
 
 #[test]
@@ -699,13 +703,15 @@ pub(crate) fn adr181_reuses_178_restore_and_179_180_net() {
 	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 	let runtime_row = first_block(&explain, "fn optimizer_analyze_join_order_row");
+	let measurement = first_block(&explain, "fn join_order_runtime_measurement");
 	let verdict_row = first_block(&explain, "fn optimizer_analyze_join_order_verdict_row");
 	let verdict = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
 
 	assert!(actuator.contains("restore_declared_star_order_project("));
 	assert!(join.contains("pub(super) fn restore_declared_star_order_project"));
 	assert!(analyze_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
-	assert!(runtime_row.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(runtime_row.contains("join_order_runtime_measurement(edge"));
+	assert!(measurement.contains("join_replay_id_for_trace_target(edge.target)?"));
 	assert!(
 		verdict_row.contains("measured_star_order_verdict(evidence, measured_rows_by_dimension)")
 	);
@@ -744,7 +750,6 @@ pub(crate) fn adr182_snowflake_recognition_is_observational() {
 	let bind_join = first_block(&binder, "async fn bind_join");
 	let bind_scoped_join = first_block(&binder, "fn bind_scoped_join");
 	let choose = first_block(&binder, "fn choose_join_strategy");
-	let runtime = first_block(&binder, "fn star_order_runtime_replay_ids");
 	let analyzer = first_block(&join_order, "pub(super) fn analyze_snowflake");
 	let extract = first_block(&join_order, "pub(super) fn extract_star_join_candidate");
 
@@ -756,7 +761,6 @@ pub(crate) fn adr182_snowflake_recognition_is_observational() {
 	assert!(!bind_join.contains("snowflake_order"));
 	assert!(!bind_scoped_join.contains("snowflake_order"));
 	assert!(!choose.contains("snowflake_order"));
-	assert!(!runtime.contains("snowflake_order"));
 	assert!(!extract.contains("snowflake_order"));
 	for forbidden in [
 		"ExecutionPlan::",
@@ -851,10 +855,143 @@ pub(crate) fn adr182_snowflake_supersedes_decline_without_gating_runtime() {
 	assert!(bind_with_explain_trace.contains("render_trace.snowflake_order ="));
 	assert!(bind_with_explain_trace.contains("render_trace.join_order = None"));
 	assert!(runtime.contains("render_trace.join_order"));
-	assert!(!runtime.contains("snowflake_order"));
+	assert!(runtime.contains("render_trace.snowflake_order.is_none()"));
 	assert!(analyze_rows.contains("render_trace.snowflake_order.as_ref()"));
 	assert!(analyze_rows.contains("optimizer_analyze_snowflake_order_row(evidence)"));
+	assert!(analyze_rows.contains("optimizer_analyze_snowflake_runtime_row"));
 	assert!(explain.contains("\"join_order_snowflake\""));
+}
+
+#[test]
+pub(crate) fn adr183_snowflake_runtime_reuses_179_measurement() {
+	let explain = source("src/binder/explain.rs");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let runtime_row = first_block(&explain, "fn optimizer_analyze_snowflake_runtime_row");
+	let measurement = first_block(&explain, "fn join_order_runtime_measurement");
+
+	assert!(analyze_rows.contains("optimizer_analyze_snowflake_runtime_row"));
+	assert!(runtime_row.contains("join_order_runtime_measurement(edge"));
+	assert!(runtime_row.contains("JoinRuntimeObservationSummary"));
+	assert!(measurement.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(measurement.contains("summary.output_rows"));
+	assert!(!explain.contains("SnowflakeRuntimeObservation"));
+	assert!(!explain.contains("SnowflakeOptimizerFact"));
+}
+
+#[test]
+pub(crate) fn adr183_snowflake_runtime_replay_ids_from_edges() {
+	let binder = binder_source();
+	let join_order = source("src/binder/join_order.rs");
+	let runtime = first_block(&binder, "fn star_order_runtime_replay_ids");
+	let edge_strategy = first_block(&join_order, "pub(super) struct SnowflakeEdgeStrategy");
+
+	assert!(runtime.contains("render_trace.snowflake_order.is_none()"));
+	assert!(runtime.contains("render_trace.join_order"));
+	assert!(runtime.contains("render_trace\n\t\t.join_order_edges"));
+	assert!(runtime.contains("edge.target.join_index"));
+	assert!(!edge_strategy.contains("target:"));
+}
+
+#[test]
+pub(crate) fn adr183_snowflake_runtime_emits_no_verdict() {
+	let explain = source("src/binder/explain.rs");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let runtime_row = first_block(&explain, "fn optimizer_analyze_snowflake_runtime_row");
+	let snowflake_branch = analyze_rows
+		.split("let Some(StarOrderOutcome::Recognized")
+		.next()
+		.expect("snowflake analyze branch");
+
+	assert!(snowflake_branch.contains("optimizer_analyze_snowflake_order_row(evidence)"));
+	assert!(snowflake_branch.contains("optimizer_analyze_snowflake_runtime_row"));
+	assert!(!snowflake_branch.contains("optimizer_analyze_join_order_verdict_row"));
+	assert!(!snowflake_branch.contains("measured_star_order_verdict"));
+	assert!(!runtime_row.contains("join_order_verdict"));
+	assert!(!runtime_row.contains("measured_star_order_verdict"));
+}
+
+#[test]
+pub(crate) fn adr183_snowflake_runtime_is_observational() {
+	let binder = binder_source();
+	let explain = source("src/binder/explain.rs");
+	let bind_join = first_block(&binder, "async fn bind_join");
+	let choose = first_block(&binder, "fn choose_join_strategy");
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let runtime_row = first_block(&explain, "fn optimizer_analyze_snowflake_runtime_row");
+
+	assert!(!bind_join.contains("join_order_snowflake_runtime"));
+	assert!(!choose.contains("join_order_snowflake_runtime"));
+	assert!(!actuator.contains("join_order_snowflake_runtime"));
+	for forbidden in [
+		"choose_join_strategy",
+		"try_bind_star_order_actuation",
+		"bind_star_order_sequence",
+		"broadcast_cap_replay_trigger",
+		"STAR_ORDER_SOFT_MARGIN",
+		"seed_optimizer_facts",
+	] {
+		assert!(!analyze_rows.contains(forbidden));
+		assert!(!runtime_row.contains(forbidden));
+	}
+}
+
+#[test]
+pub(crate) fn adr183_no_executor_fragment_costmodel_or_wendelon_change() {
+	let manifest = manifest_dir();
+	let markers = [
+		"join_order_snowflake_runtime",
+		"optimizer_analyze_snowflake_runtime",
+		"flatten_snowflake_dimensions",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/catalog.rs"),
+		manifest.join("src/coordinator.rs"),
+		manifest.join("src/sql_planner.rs"),
+		manifest.join("src/distributed"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR183 snowflake runtime evidence leaked below binder/explain:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr183_no_optimizer_shell_or_planproperties_contract() {
+	adr179_no_optimizer_shell();
+}
+
+#[test]
+pub(crate) fn adr183_cockpit_is_frontend_shared() {
+	let binder = binder_source();
+	let explain = source("src/binder/explain.rs");
+	let rune = source("src/rune_engine.rs");
+	let render_explain_analyze = first_block(&binder, "pub(crate) fn render_explain_analyze");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+
+	assert!(render_explain_analyze.contains("optimizer_analyze_plan"));
+	assert!(analyze_rows.contains("optimizer_analyze_snowflake_runtime_row"));
+	assert!(explain.contains("join_order_snowflake_runtime"));
+	assert!(rune.contains("LogicalPlan::ExplainAnalyze"));
+	assert!(rune.contains("pub fn analyze"));
+	assert!(!rune.contains("join_order_snowflake_runtime"));
+	assert!(!rune.contains("SnowflakeOrderEvidence"));
 }
 
 #[test]

@@ -8924,7 +8924,7 @@ async fn snowflake_order_evidence_is_explain_gated() {
 }
 
 #[tokio::test]
-async fn snowflake_explain_analyze_shows_plan_evidence_without_runtime_or_verdict() {
+async fn snowflake_explain_analyze_shows_runtime_without_verdict() {
 	let catalog = snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(non_optimal_snowflake_order_sql())
@@ -8932,9 +8932,20 @@ async fn snowflake_explain_analyze_shows_plan_evidence_without_runtime_or_verdic
 	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(1))
 		.await
 		.expect("bind snowflake analyze");
-	assert!(binding.replay_ids.is_empty());
+	assert_eq!(binding.replay_ids.len(), 4);
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(u64::from(replay_id.0) + 10),
+			probe_rows: RowCount::new(u64::from(replay_id.0) + 20),
+			output_rows: RowCount::new(u64::from(replay_id.0) + 30),
+		})
+		.collect::<Vec<_>>();
 
-	let plan = render_explain_analyze(binding, &[]).expect("render snowflake analyze");
+	let plan = render_explain_analyze(binding, &observations).expect("render snowflake analyze");
 	let ExecutionPlan::SystemTable { rows, .. } = plan else {
 		panic!("expected analyze system table");
 	};
@@ -8943,6 +8954,28 @@ async fn snowflake_explain_analyze_shows_plan_evidence_without_runtime_or_verdic
 		rows.iter()
 			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string())) })
 	);
+	let runtime_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order_snowflake_runtime".to_string())))
+		.collect::<Vec<_>>();
+	assert_eq!(runtime_rows.len(), 4);
+	assert!(runtime_rows.iter().any(|row| {
+		row[1] == ScalarValue::Utf8(Some("join[0] level=o dimension=c".to_string()))
+	}));
+	assert!(runtime_rows.iter().any(|row| {
+		row[1] == ScalarValue::Utf8(Some("join[1] level=c dimension=r".to_string()))
+	}));
+	for row in runtime_rows {
+		let ScalarValue::Utf8(Some(target)) = &row[1] else {
+			panic!("runtime row target")
+		};
+		let close = target.find(']').expect("target carries join id");
+		let replay_id = target[5..close].parse::<u32>().expect("replay id");
+		assert_eq!(row[5], ScalarValue::Int64(Some(i64::from(replay_id) + 30)));
+		assert_eq!(row[8], ScalarValue::Int64(Some(i64::from(replay_id) + 10)));
+		assert_eq!(row[9], ScalarValue::Int64(Some(i64::from(replay_id) + 20)));
+		assert_utf8_contains(&row[3], "source=single_key_ndv_containment");
+	}
 	assert!(
 		!rows
 			.iter()
@@ -8953,6 +8986,36 @@ async fn snowflake_explain_analyze_shows_plan_evidence_without_runtime_or_verdic
 			.iter()
 			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_verdict".to_string())) })
 	);
+}
+
+#[tokio::test]
+async fn snowflake_runtime_replay_ids_collected_from_edges() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(non_optimal_snowflake_order_sql())
+		.expect("plan snowflake SQL");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(1))
+		.await
+		.expect("bind snowflake analyze");
+	let expected = binding
+		.render_trace
+		.join_order_edges
+		.iter()
+		.map(|edge| JoinReplayId(edge.target.join_index as u32))
+		.collect::<BTreeSet<_>>();
+
+	assert!(binding.render_trace.snowflake_order.is_some());
+	assert_eq!(binding.replay_ids, expected);
+	assert_eq!(binding.replay_ids.len(), 4);
+
+	let non_star = SqlPlanner::new()
+		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+		.expect("plan non-star SQL");
+	let binding = bind_explain_analyze(&non_star, &catalog, &auto_broadcast_config(1))
+		.await
+		.expect("bind non-star analyze");
+
+	assert!(binding.replay_ids.is_empty());
 }
 
 #[tokio::test]
@@ -9335,6 +9398,76 @@ async fn rune_analyze_renders_star_order_verdict() {
 		ScalarValue::Utf8(Some("over_eager".to_string()))
 	);
 	assert_utf8_contains(&verdict[3], "recommendation=WOULD_KEEP_DECLARED");
+}
+
+#[tokio::test]
+async fn rune_analyze_shows_snowflake_runtime_evidence() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o")
+               .auto_join(
+                   ctx.table("customers").alias("c"),
+                   qcol("o", "customer_id").eq(qcol("c", "id"))
+               )
+               .auto_join(
+                   ctx.table("regions").alias("r"),
+                   qcol("c", "region_id").eq(qcol("r", "id"))
+               )
+               .auto_join(
+                   ctx.table("segments").alias("g"),
+                   qcol("c", "segment_id").eq(qcol("g", "id"))
+               )
+               .auto_join(
+                   ctx.table("stores").alias("s"),
+                   qcol("o", "store_id").eq(qcol("s", "id"))
+               )
+               .analyze()
+        }
+	"#,
+	)
+	.await;
+	let LogicalPlan::ExplainAnalyze { input } = logical else {
+		panic!("expected Rune analyze logical plan");
+	};
+	let binding = bind_explain_analyze(&input, &catalog, &auto_broadcast_config(1))
+		.await
+		.expect("bind Rune analyze snowflake");
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(5),
+			output_rows: RowCount::new(7),
+		})
+		.collect::<Vec<_>>();
+
+	let plan = render_explain_analyze(binding, &observations).expect("render Rune analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+
+	assert!(
+		rows.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string())))
+	);
+	assert_eq!(
+		rows.iter()
+			.filter(
+				|row| row[0] == ScalarValue::Utf8(Some("join_order_snowflake_runtime".to_string()))
+			)
+			.count(),
+		4
+	);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_verdict".to_string())))
+	);
 }
 
 #[tokio::test]
