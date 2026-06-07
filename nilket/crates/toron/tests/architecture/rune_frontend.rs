@@ -2027,15 +2027,15 @@ pub(crate) fn adr129_auto_resolves_only_in_binder() {
 #[test]
 pub(crate) fn adr129_strategy_decision_is_single_helper() {
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 	let choose_join_strategy = source_block(&binder, "fn choose_join_strategy");
 	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
 
 	assert_eq!(binder.matches("fn choose_join_strategy(").count(), 1);
-	assert!(bind_join.contains("choose_join_strategy("));
-	assert!(bind_join.contains("match decision.strategy"));
-	assert!(!bind_join.contains("byte_upper_bound"));
-	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
+	assert!(bind_scoped_join.contains("choose_join_strategy("));
+	assert!(bind_scoped_join.contains("match decision.strategy"));
+	assert!(!bind_scoped_join.contains("byte_upper_bound"));
+	assert!(!bind_scoped_join.contains("auto_broadcast_max_build_bytes"));
 	assert!(choose_join_strategy.contains("JoinStrategyIntent::Pinned { strategy, .. }"));
 	assert!(choose_join_strategy.contains("JoinStrategyIntent::Auto"));
 	assert!(choose_auto.contains("JoinStrategy::Broadcast"));
@@ -2060,13 +2060,13 @@ pub(crate) fn adr129_exchange_insertion_split_is_temporary() {
 	let binder = binder_source();
 	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
 	let build_auto_join_plan = source_block(&planner, "pub(crate) fn build_auto_join_plan");
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
 	assert!(build_join_plan.contains("JoinStrategyIntent::Pinned { strategy, source }"));
 	assert!(build_auto_join_plan.contains("JoinStrategyIntent::Auto"));
-	assert!(bind_join.contains("exchange_for_join_keys"));
-	assert!(bind_join.contains("JoinStrategy::HashPartitioned"));
-	assert!(bind_join.contains("JoinStrategy::Broadcast"));
+	assert!(bind_scoped_join.contains("exchange_for_join_keys"));
+	assert!(bind_scoped_join.contains("JoinStrategy::HashPartitioned"));
+	assert!(bind_scoped_join.contains("JoinStrategy::Broadcast"));
 }
 
 #[test]
@@ -2151,17 +2151,18 @@ pub(crate) fn adr130_right_build_is_binder_physical_rewrite_not_new_strategy() {
 	let ir = ir_source();
 	let execution =
 		std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs")).expect("read exec IR");
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 	let join_strategy = source_block(&ir, "pub enum JoinStrategy");
 	let execution_plan = source_block(&execution, "pub enum ExecutionPlan");
 
 	assert!(binder.contains("enum JoinPhysicalPlacement"));
 	assert!(binder.contains("SwappedRightBuild"));
 	assert!(binder.contains("enum BroadcastBuildSide"));
-	assert!(bind_join.contains("std::mem::swap(&mut left_plan, &mut right_plan)"));
-	assert!(bind_join.contains("std::mem::swap(&mut left_keys, &mut right_keys)"));
+	assert!(bind_scoped_join.contains("std::mem::swap(&mut left_plan, &mut right_plan)"));
+	assert!(bind_scoped_join.contains("std::mem::swap(&mut left_keys, &mut right_keys)"));
 	assert!(
-		bind_join.contains("std::mem::swap(&mut left_resolved_keys, &mut right_resolved_keys)")
+		bind_scoped_join
+			.contains("std::mem::swap(&mut left_resolved_keys, &mut right_resolved_keys)")
 	);
 	assert!(join_strategy.contains("HashPartitioned"));
 	assert!(join_strategy.contains("Broadcast"));
@@ -2175,12 +2176,12 @@ pub(crate) fn adr130_right_build_is_binder_physical_rewrite_not_new_strategy() {
 #[test]
 pub(crate) fn adr130_right_build_wraps_restoring_projection() {
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 	let restore = source_block(&binder, "fn restore_declared_join_order_project");
 
-	assert!(bind_join.contains("declared_output_schema"));
-	assert!(bind_join.contains("declared_scope"));
-	assert!(bind_join.contains("restore_declared_join_order_project("));
+	assert!(bind_scoped_join.contains("declared_output_schema"));
+	assert!(bind_scoped_join.contains("declared_scope"));
+	assert!(bind_scoped_join.contains("restore_declared_join_order_project("));
 	assert!(restore.contains("declared_right_width..declared_right_width + declared_left_width"));
 	assert!(restore.contains("chain(0..declared_right_width)"));
 	assert!(restore.contains("BoundExprProgramBuilder::new()"));
@@ -2194,14 +2195,14 @@ pub(crate) fn adr130_right_build_wraps_restoring_projection() {
 #[test]
 pub(crate) fn adr130_decision_helper_single_seam() {
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 	let choose_join_strategy = source_block(&binder, "fn choose_join_strategy");
 	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
 
 	assert_eq!(binder.matches("fn choose_join_strategy(").count(), 1);
-	assert!(bind_join.contains("choose_join_strategy("));
-	assert!(!bind_join.contains("byte_upper_bound"));
-	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
+	assert!(bind_scoped_join.contains("choose_join_strategy("));
+	assert!(!bind_scoped_join.contains("byte_upper_bound"));
+	assert!(!bind_scoped_join.contains("auto_broadcast_max_build_bytes"));
 	assert!(choose_join_strategy.contains("left_input: JoinInputOptimization"));
 	assert!(choose_join_strategy.contains("right_input: JoinInputOptimization"));
 	assert!(
@@ -2272,25 +2273,25 @@ pub(crate) fn adr131_scan_linear_excludes_global_repartition_and_non_star_shapes
 #[test]
 pub(crate) fn adr131_strategy_decision_remains_single_helper() {
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 	let choose_join_strategy = source_block(&binder, "fn choose_join_strategy");
 	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
 
 	assert_eq!(binder.matches("fn choose_join_strategy(").count(), 1);
-	assert!(bind_join.contains("JoinInputOptimization"));
+	assert!(bind_scoped_join.contains("JoinInputOptimization"));
 	assert!(
-		bind_join.contains(
+		bind_scoped_join.contains(
 			"let left_probe_scan_linear = broadcast_probe_is_scan_linear(&left_plan.plan);"
 		)
 	);
-	assert!(bind_join.contains(
+	assert!(bind_scoped_join.contains(
 		"let right_probe_scan_linear = broadcast_probe_is_scan_linear(&right_plan.plan);"
 	));
-	assert!(bind_join.contains("probe_scan_linear: left_probe_scan_linear"));
-	assert!(bind_join.contains("probe_scan_linear: right_probe_scan_linear"));
-	assert!(bind_join.contains("choose_join_strategy("));
-	assert!(!bind_join.contains("byte_upper_bound"));
-	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
+	assert!(bind_scoped_join.contains("probe_scan_linear: left_probe_scan_linear"));
+	assert!(bind_scoped_join.contains("probe_scan_linear: right_probe_scan_linear"));
+	assert!(bind_scoped_join.contains("choose_join_strategy("));
+	assert!(!bind_scoped_join.contains("byte_upper_bound"));
+	assert!(!bind_scoped_join.contains("auto_broadcast_max_build_bytes"));
 	assert!(choose_join_strategy.contains("JoinStrategyIntent::Pinned { strategy, .. }"));
 	assert!(choose_join_strategy.contains("JoinStrategyIntent::Auto"));
 	assert!(choose_auto.contains("ProbeNotScanLinear"));

@@ -221,13 +221,12 @@ pub(crate) fn adr175_render_trace_is_explain_only() {
 	assert!(binder.contains("struct OptimizerExplainRenderTrace"));
 	assert!(binder.contains("struct ScanFilterRenderReceipt"));
 	assert!(bind_with_trace.contains("let mut render_trace = None;"));
-	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace, &mut render_trace)"));
+	assert!(bind_with_trace.contains("bind_plan_with_trace("));
+	assert!(bind_with_trace.contains("JoinOrderSourceCapture::Off"));
 	assert!(!bind_with_trace.contains("OptimizerExplainRenderTrace::default"));
 	assert!(bind_with_explain_trace.contains("Some(OptimizerExplainRenderTrace::default())"));
-	assert!(
-		bind_with_explain_trace
-			.contains("bind_plan_with_trace(plan, &mut trace, &mut render_trace)")
-	);
+	assert!(bind_with_explain_trace.contains("bind_plan_with_trace("));
+	assert!(bind_with_explain_trace.contains("JoinOrderSourceCapture::On"));
 	assert!(
 		bind_explain.contains("bind_with_explain_trace(input, self.catalog, self.config).await?")
 	);

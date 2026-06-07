@@ -666,6 +666,106 @@ pub(super) fn restore_declared_join_order_project(
 	})
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StarOutputSegment {
+	pub(super) label: String,
+	pub(super) width: usize,
+}
+
+pub(super) fn restore_declared_star_order_project(
+	input: ExecutionPlan,
+	physical_output_schema: &SchemaRef,
+	declared_output_schema: SchemaRef,
+	physical_segments: &[StarOutputSegment],
+	declared_segments: &[StarOutputSegment],
+) -> Result<ExecutionPlan, BindingError> {
+	let physical_width = physical_output_schema.fields().len();
+	let declared_width = declared_output_schema.fields().len();
+	let physical_segment_width = physical_segments
+		.iter()
+		.try_fold(0_usize, |acc, segment| acc.checked_add(segment.width))
+		.ok_or_else(|| BindingError::UnsupportedExpression {
+			message: "star join projection physical arity overflow".to_string(),
+		})?;
+	let declared_segment_width = declared_segments
+		.iter()
+		.try_fold(0_usize, |acc, segment| acc.checked_add(segment.width))
+		.ok_or_else(|| BindingError::UnsupportedExpression {
+			message: "star join projection declared arity overflow".to_string(),
+		})?;
+	if physical_width != physical_segment_width
+		|| declared_width != declared_segment_width
+		|| physical_width != declared_width
+	{
+		return Err(BindingError::UnsupportedExpression {
+			message: "star join order projection arity mismatch".to_string(),
+		});
+	}
+
+	let mut physical_starts = BTreeMap::new();
+	let mut start = 0_usize;
+	for segment in physical_segments {
+		if physical_starts
+			.insert(segment.label.clone(), (start, segment.width))
+			.is_some()
+		{
+			return Err(BindingError::UnsupportedExpression {
+				message: "star join order projection has duplicate physical segment".to_string(),
+			});
+		}
+		start += segment.width;
+	}
+
+	let mut builder = BoundExprProgramBuilder::new();
+	for segment in declared_segments {
+		let Some((physical_start, physical_width)) = physical_starts.get(&segment.label).copied()
+		else {
+			return Err(BindingError::UnsupportedExpression {
+				message: "star join order projection is missing a declared segment".to_string(),
+			});
+		};
+		if physical_width != segment.width {
+			return Err(BindingError::UnsupportedExpression {
+				message: "star join order projection segment width mismatch".to_string(),
+			});
+		}
+		for physical_ordinal in physical_start..physical_start + segment.width {
+			let field = physical_output_schema.field(physical_ordinal);
+			let logical_type = decode_column_logical_type(field).map_err(|error| {
+				BindingError::UnsupportedExpression {
+					message: error.to_string(),
+				}
+			})?;
+			let node = builder.append_column(ResolvedColumn {
+				name: ColumnName(field.name().clone()),
+				ordinal: ColumnOrdinal(
+					u32::try_from(physical_ordinal).expect("column ordinal overflow"),
+				),
+				data_type: field.data_type().clone(),
+				nullable: field.is_nullable(),
+				pbc_eligible: is_pbc_eligible_type(field.data_type()),
+			});
+			if !builder.set_node_logical_type(node, logical_type) {
+				return Err(BindingError::UnsupportedExpression {
+					message: "star join order projection target is malformed".to_string(),
+				});
+			}
+			builder.push_root(node);
+		}
+	}
+	let exprs = builder.build();
+	exprs
+		.validate()
+		.map_err(|error| BindingError::UnsupportedExpression {
+			message: format!("{error:?}"),
+		})?;
+	Ok(ExecutionPlan::Project {
+		input: Box::new(input),
+		exprs,
+		output_schema: declared_output_schema,
+	})
+}
+
 pub(super) fn exchange_for_join_keys(
 	input: ExecutionPlan,
 	keys: &[ResolvedJoinKey],

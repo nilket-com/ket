@@ -2,10 +2,20 @@ use super::*;
 
 pub(super) type JoinOrderSourceMap = BTreeMap<String, JoinOrderRelationFacts>;
 
+pub(super) const STAR_ORDER_SOFT_MARGIN_NUMERATOR: u128 = 4;
+pub(super) const STAR_ORDER_SOFT_MARGIN_DENOMINATOR: u128 = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct JoinOrderRelationFacts {
 	pub(super) rows: Option<RowCount>,
+	pub(super) row_confidence: JoinOrderEstimateConfidence,
 	pub(super) column_ndv: HashMap<String, DistinctCountFact>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JoinOrderEstimateConfidence {
+	Hard,
+	Soft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +43,14 @@ pub(super) struct JoinOrderDimEvidence {
 	pub(super) declared_position: usize,
 	pub(super) estimated_rows: RowCount,
 	pub(super) estimate_source: JoinOrderEstimateSource,
+	pub(super) confidence: JoinOrderEstimateConfidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StarOrderAction {
+	Reordered,
+	KeptAlreadyOptimal,
+	KeptInsufficientMargin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,13 +59,17 @@ pub(super) struct StarOrderEvidence {
 	pub(super) dimensions: Vec<JoinOrderDimEvidence>,
 	pub(super) declared_order: Vec<String>,
 	pub(super) cost_preferred_order: Vec<String>,
+	pub(super) applied_order: Vec<String>,
 	pub(super) declared_cost: u128,
 	pub(super) preferred_cost: u128,
 	pub(super) orders_agree: bool,
+	pub(super) action: StarOrderAction,
+	pub(super) confidence: JoinOrderEstimateConfidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StarOrderDeclineReason {
+	NotBroadcastStar,
 	NonInnerEquiJoin,
 	MissingRelationLabel,
 	MultipleProbeRelations,
@@ -66,6 +88,93 @@ pub(super) struct StarOrderDecline {
 pub(super) enum StarOrderOutcome {
 	Recognized(StarOrderEvidence),
 	Declined(StarOrderDecline),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JoinOrderSourceCapture {
+	Off,
+	On,
+}
+
+impl JoinOrderSourceCapture {
+	pub(super) fn enabled(self) -> bool {
+		matches!(self, Self::On)
+	}
+}
+
+pub(super) struct StarJoinCandidate<'a> {
+	pub(super) probe: &'a LogicalPlan,
+	pub(super) dimensions: Vec<StarJoinDimension<'a>>,
+}
+
+pub(super) struct StarJoinDimension<'a> {
+	pub(super) input: &'a LogicalPlan,
+	pub(super) on: &'a [(Expr, Expr)],
+	pub(super) strategy_intent: JoinStrategyIntent,
+	pub(super) declared_position: usize,
+}
+
+pub(super) fn extract_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoinCandidate<'_>> {
+	let mut current = plan;
+	let mut dimensions = Vec::new();
+	loop {
+		match current {
+			LogicalPlan::Join {
+				left,
+				right,
+				kind,
+				on,
+				strategy_intent,
+			} if *kind == JoinKind::Inner
+				&& *strategy_intent == JoinStrategyIntent::Auto
+				&& !logical_plan_contains_join(right) =>
+			{
+				dimensions.push(StarJoinDimension {
+					input: right,
+					on,
+					strategy_intent: *strategy_intent,
+					declared_position: 0,
+				});
+				current = left;
+			}
+			_ => break,
+		}
+	}
+	if dimensions.len() < 2 || logical_plan_contains_join(current) {
+		return None;
+	}
+	dimensions.reverse();
+	for (declared_position, dimension) in dimensions.iter_mut().enumerate() {
+		dimension.declared_position = declared_position;
+	}
+	Some(StarJoinCandidate {
+		probe: current,
+		dimensions,
+	})
+}
+
+fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
+	match plan {
+		LogicalPlan::Join { .. } => true,
+		LogicalPlan::Alias { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. }
+		| LogicalPlan::Explain { input }
+		| LogicalPlan::CreateTableAsSelect { source: input, .. }
+		| LogicalPlan::InsertSelect { source: input, .. } => logical_plan_contains_join(input),
+		LogicalPlan::Scan { .. }
+		| LogicalPlan::ScanNamed { .. }
+		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
+		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
+		| LogicalPlan::Insert { .. } => false,
+	}
 }
 
 pub(super) fn relation_key_label(table: &TableRef) -> String {
@@ -93,9 +202,18 @@ pub(super) fn join_order_sources_for_scan(
 		}
 	}
 	let rows = estimate_row_source(facts.row_upper_bound, None);
+	let row_confidence = if facts.row_upper_bound.is_some() {
+		JoinOrderEstimateConfidence::Hard
+	} else {
+		JoinOrderEstimateConfidence::Soft
+	};
 	BTreeMap::from([(
 		relation_key_label(qualifier),
-		JoinOrderRelationFacts { rows, column_ndv },
+		JoinOrderRelationFacts {
+			rows,
+			row_confidence,
+			column_ndv,
+		},
 	)])
 }
 
@@ -119,6 +237,9 @@ pub(super) fn update_single_source_join_order_rows(
 	let mut sources = sources?;
 	let label = scope.unique_source_label()?;
 	if let Some(facts) = sources.get_mut(&label) {
+		if facts.rows.is_none() && rows.is_some() {
+			facts.row_confidence = JoinOrderEstimateConfidence::Soft;
+		}
 		facts.rows = rows.or(facts.rows);
 	}
 	Some(sources)
@@ -207,6 +328,60 @@ pub(super) fn join_order_edge_estimate(
 		Some(estimated_rows),
 		join_order_estimate_source(left_keys, right_keys, Some(estimated_rows)),
 	)
+}
+
+pub(super) fn join_order_estimate_confidence(
+	left_sources: Option<&JoinOrderSourceMap>,
+	right_sources: Option<&JoinOrderSourceMap>,
+	probe: Option<&str>,
+	dimension: Option<&str>,
+	left_keys: &[ResolvedJoinKey],
+	right_keys: &[ResolvedJoinKey],
+) -> JoinOrderEstimateConfidence {
+	let Some(probe) = probe else {
+		return JoinOrderEstimateConfidence::Soft;
+	};
+	let Some(dimension) = dimension else {
+		return JoinOrderEstimateConfidence::Soft;
+	};
+	let Some(left_facts) = left_sources.and_then(|sources| sources.get(probe)) else {
+		return JoinOrderEstimateConfidence::Soft;
+	};
+	let Some(right_facts) = right_sources.and_then(|sources| sources.get(dimension)) else {
+		return JoinOrderEstimateConfidence::Soft;
+	};
+	if left_facts.row_confidence != JoinOrderEstimateConfidence::Hard
+		|| right_facts.row_confidence != JoinOrderEstimateConfidence::Hard
+	{
+		return JoinOrderEstimateConfidence::Soft;
+	}
+	for (left_key, right_key) in left_keys.iter().zip(right_keys) {
+		let Some(left_ndv) = left_facts.column_ndv.get(&left_key.column.name.0) else {
+			return JoinOrderEstimateConfidence::Soft;
+		};
+		let Some(right_ndv) = right_facts.column_ndv.get(&right_key.column.name.0) else {
+			return JoinOrderEstimateConfidence::Soft;
+		};
+		if !matches!(left_ndv, DistinctCountFact::Exact(_))
+			|| !matches!(right_ndv, DistinctCountFact::Exact(_))
+		{
+			return JoinOrderEstimateConfidence::Soft;
+		}
+	}
+	JoinOrderEstimateConfidence::Hard
+}
+
+pub(super) fn join_order_overall_confidence(
+	dimensions: &[JoinOrderDimEvidence],
+) -> JoinOrderEstimateConfidence {
+	if dimensions
+		.iter()
+		.all(|dim| dim.confidence == JoinOrderEstimateConfidence::Hard)
+	{
+		JoinOrderEstimateConfidence::Hard
+	} else {
+		JoinOrderEstimateConfidence::Soft
+	}
 }
 
 fn estimate_join_order_edge_from_sources(
@@ -311,9 +486,24 @@ pub(super) fn analyze(edges: &[JoinOrderEdgeEvidence]) -> Option<StarOrderOutcom
 			declared_position: edge.declared_position,
 			estimated_rows,
 			estimate_source: edge.estimate_source,
+			confidence: JoinOrderEstimateConfidence::Soft,
 		});
 	}
 
+	Some(recognized_star_order_outcome(
+		first_probe.clone(),
+		dimensions,
+		None,
+		JoinOrderEstimateConfidence::Soft,
+	))
+}
+
+pub(super) fn recognized_star_order_outcome(
+	probe: String,
+	dimensions: Vec<JoinOrderDimEvidence>,
+	applied_order_override: Option<Vec<String>>,
+	confidence: JoinOrderEstimateConfidence,
+) -> StarOrderOutcome {
 	let declared_order = dimensions
 		.iter()
 		.map(|dim| dim.dimension.clone())
@@ -331,19 +521,48 @@ pub(super) fn analyze(edges: &[JoinOrderEdgeEvidence]) -> Option<StarOrderOutcom
 	let declared_cost = order_cost(&dimensions);
 	let preferred_cost = order_cost(&preferred_dims);
 	let orders_agree = declared_order == cost_preferred_order;
+	let action =
+		classify_star_order_action(declared_cost, preferred_cost, orders_agree, confidence);
+	let applied_order = applied_order_override.unwrap_or_else(|| declared_order.clone());
 
-	Some(StarOrderOutcome::Recognized(StarOrderEvidence {
-		probe: first_probe.clone(),
+	StarOrderOutcome::Recognized(StarOrderEvidence {
+		probe,
 		dimensions,
 		declared_order,
 		cost_preferred_order,
+		applied_order,
 		declared_cost,
 		preferred_cost,
 		orders_agree,
-	}))
+		action,
+		confidence,
+	})
 }
 
-fn order_cost(dimensions: &[JoinOrderDimEvidence]) -> u128 {
+pub(super) fn classify_star_order_action(
+	declared_cost: u128,
+	preferred_cost: u128,
+	orders_agree: bool,
+	confidence: JoinOrderEstimateConfidence,
+) -> StarOrderAction {
+	if orders_agree {
+		return StarOrderAction::KeptAlreadyOptimal;
+	}
+	match confidence {
+		JoinOrderEstimateConfidence::Hard => StarOrderAction::Reordered,
+		JoinOrderEstimateConfidence::Soft => {
+			if preferred_cost.saturating_mul(STAR_ORDER_SOFT_MARGIN_DENOMINATOR)
+				<= declared_cost.saturating_mul(STAR_ORDER_SOFT_MARGIN_NUMERATOR)
+			{
+				StarOrderAction::Reordered
+			} else {
+				StarOrderAction::KeptInsufficientMargin
+			}
+		}
+	}
+}
+
+pub(super) fn order_cost(dimensions: &[JoinOrderDimEvidence]) -> u128 {
 	let len = dimensions.len();
 	dimensions
 		.iter()

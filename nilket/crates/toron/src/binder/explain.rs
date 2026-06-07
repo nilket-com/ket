@@ -418,16 +418,15 @@ pub(super) fn join_order_target_label(outcome: &StarOrderOutcome) -> Result<Stri
 
 pub(super) fn join_order_outcome_label(outcome: &StarOrderOutcome) -> &'static str {
 	match outcome {
-		StarOrderOutcome::Recognized(evidence) if evidence.orders_agree => "orders_agree",
-		StarOrderOutcome::Recognized(_) => "orders_differ",
-		StarOrderOutcome::Declined(_) => "declined",
+		StarOrderOutcome::Recognized(evidence) => star_order_action_label(evidence.action),
+		StarOrderOutcome::Declined(decline) => star_order_decline_outcome_label(decline.reason),
 	}
 }
 
 pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 	match outcome {
 		StarOrderOutcome::Recognized(evidence) => format!(
-			"dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; declared_cost={}; preferred_cost={}; estimates=[{}]",
+			"dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; applied_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}/{}; estimates=[{}]",
 			evidence
 				.dimensions
 				.iter()
@@ -436,16 +435,21 @@ pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 				.join(","),
 			evidence.declared_order.join(","),
 			evidence.cost_preferred_order.join(","),
+			evidence.applied_order.join(","),
 			evidence.declared_cost,
 			evidence.preferred_cost,
+			join_order_estimate_confidence_label(evidence.confidence),
+			STAR_ORDER_SOFT_MARGIN_NUMERATOR,
+			STAR_ORDER_SOFT_MARGIN_DENOMINATOR,
 			evidence
 				.dimensions
 				.iter()
 				.map(|dim| format!(
-					"{}:{}:{}",
+					"{}:{}:{}:{}",
 					dim.dimension,
 					dim.estimated_rows.get(),
-					join_order_estimate_source_label(dim.estimate_source)
+					join_order_estimate_source_label(dim.estimate_source),
+					join_order_estimate_confidence_label(dim.confidence)
 				))
 				.collect::<Vec<_>>()
 				.join(",")
@@ -460,6 +464,35 @@ pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 	}
 }
 
+pub(super) fn star_order_action_label(action: StarOrderAction) -> &'static str {
+	match action {
+		StarOrderAction::Reordered => "reordered",
+		StarOrderAction::KeptAlreadyOptimal => "kept_already_optimal",
+		StarOrderAction::KeptInsufficientMargin => "kept_insufficient_margin",
+	}
+}
+
+pub(super) fn star_order_decline_outcome_label(reason: StarOrderDeclineReason) -> &'static str {
+	match reason {
+		StarOrderDeclineReason::NotBroadcastStar => "declined_not_broadcast_star",
+		StarOrderDeclineReason::NonInnerEquiJoin => "declined_non_inner_equi_join",
+		StarOrderDeclineReason::MissingRelationLabel => "declined_missing_relation_label",
+		StarOrderDeclineReason::MultipleProbeRelations => "declined_multiple_probe_relations",
+		StarOrderDeclineReason::DuplicateDimension => "declined_duplicate_dimension",
+		StarOrderDeclineReason::MissingEstimate => "declined_missing_estimate",
+		StarOrderDeclineReason::ProbeNotScanLinear => "declined_probe_not_scan_linear",
+	}
+}
+
+pub(super) fn join_order_estimate_confidence_label(
+	confidence: JoinOrderEstimateConfidence,
+) -> &'static str {
+	match confidence {
+		JoinOrderEstimateConfidence::Hard => "hard",
+		JoinOrderEstimateConfidence::Soft => "soft",
+	}
+}
+
 pub(super) fn join_order_estimate_source_label(source: JoinOrderEstimateSource) -> &'static str {
 	match source {
 		JoinOrderEstimateSource::SingleKeyNdvContainment => "single_key_ndv_containment",
@@ -470,6 +503,7 @@ pub(super) fn join_order_estimate_source_label(source: JoinOrderEstimateSource) 
 
 pub(super) fn star_order_decline_reason_label(reason: StarOrderDeclineReason) -> &'static str {
 	match reason {
+		StarOrderDeclineReason::NotBroadcastStar => "not_broadcast_star",
 		StarOrderDeclineReason::NonInnerEquiJoin => "non_inner_equi_join",
 		StarOrderDeclineReason::MissingRelationLabel => "missing_relation_label",
 		StarOrderDeclineReason::MultipleProbeRelations => "multiple_probe_relations",

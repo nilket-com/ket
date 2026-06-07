@@ -44,11 +44,12 @@ fn source_block(source: &str, marker: &str) -> String {
 #[test]
 pub(crate) fn adr160_join_cardinality_is_estimate_channel_only() {
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
+	let estimate_helper = source_block(&binder, "fn join_estimated_row_count_for_keys");
 	let facts = source_block(&binder, "fn composite_with_join_estimate");
 
-	assert!(bind_join.contains("join_output_ndv_containment_estimate"));
-	assert!(bind_join.contains("PlanOptimizerFacts::composite_with_join_estimate"));
+	assert!(estimate_helper.contains("join_output_ndv_containment_estimate"));
+	assert!(bind_scoped_join.contains("PlanOptimizerFacts::composite_with_join_estimate"));
 	assert!(facts.contains("origin: PlanOrigin::Composite"));
 	assert!(facts.contains("byte_upper_bound: None"));
 	assert!(facts.contains("row_upper_bound: None"));
@@ -159,11 +160,12 @@ pub(crate) fn adr161_range_overlap_validates_fact_tag_against_key_type() {
 pub(crate) fn adr161_range_overlap_spends_existing_composite_estimated_wire() {
 	let binder = binder_source();
 	let lib = lib_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
+	let estimate_helper = source_block(&binder, "fn join_estimated_row_count_for_keys");
 	let facts = source_block(&binder, "fn composite_with_join_estimate");
 
-	assert!(bind_join.contains("join_output_ndv_containment_estimate"));
-	assert!(bind_join.contains("PlanOptimizerFacts::composite_with_join_estimate"));
+	assert!(estimate_helper.contains("join_output_ndv_containment_estimate"));
+	assert!(bind_scoped_join.contains("PlanOptimizerFacts::composite_with_join_estimate"));
 	assert!(facts.contains("estimated_row_count"));
 	assert!(facts.contains("estimated_byte_size"));
 	assert!(facts.contains("estimate_materialized_byte_size"));
@@ -262,13 +264,15 @@ pub(crate) fn adr162_join_skew_keeps_160_161_prior_floor() {
 #[test]
 pub(crate) fn adr163_multi_key_denominator_is_product() {
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let estimate_helper = source_block(&binder, "fn join_estimated_row_count_for_keys");
 	let estimate = source_block(&binder, "fn multi_key_join_cardinality");
 	let denominator = source_block(&binder, "fn ndv_containment_join_rows_from_denominator");
 	let multiply = source_block(&binder, "fn multiply_denominator_capped_at_numerator");
 
-	assert!(bind_join.contains("left_keys.len() == right_keys.len() && left_keys.len() >= 2"));
-	assert!(bind_join.contains("multi_key_join_cardinality"));
+	assert!(
+		estimate_helper.contains("left_keys.len() == right_keys.len() && left_keys.len() >= 2")
+	);
+	assert!(estimate_helper.contains("multi_key_join_cardinality"));
 	assert!(estimate.contains("left_keys.len() < 2"));
 	assert!(estimate.contains("left_ndv.max(right_ndv)"));
 	assert!(estimate.contains("multiply_denominator_capped_at_numerator"));

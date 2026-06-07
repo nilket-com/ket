@@ -225,15 +225,14 @@ pub(crate) fn adr133_optimizer_trace_is_binder_local() {
 	let binder_root = manifest_dir.join("src").join("binder.rs");
 	let binder_dir = manifest_dir.join("src/binder");
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
 	assert!(binder.contains("pub(crate) struct JoinTraceTarget"));
 	assert!(binder.contains("pub(crate) struct DecisionReceipt"));
 	assert!(binder.contains("pub(crate) struct OptimizerTrace"));
-	assert!(bind_join.contains("trace.join_decisions.push(DecisionReceipt"));
-	assert!(bind_join.contains("target: JoinTraceTarget { join_index }"));
-	assert!(bind_join.contains("reason: decision.reason"));
-
+	assert!(bind_scoped_join.contains("trace.join_decisions.push(DecisionReceipt"));
+	assert!(bind_scoped_join.contains("target: JoinTraceTarget { join_index }"));
+	assert!(bind_scoped_join.contains("reason: decision.reason"));
 	let markers = ["OptimizerTrace", "DecisionReceipt", "JoinTraceTarget"];
 	let offenders = source_lines(&manifest_dir.join("src"))
 		.into_iter()
@@ -295,7 +294,8 @@ pub(crate) fn adr133_bind_is_wrapper_over_bind_with_trace() {
 	assert!(!bind_entry.contains("Binder { catalog, config }"));
 	assert!(!bind_entry.contains("bind_plan_with_trace"));
 	assert!(bind_with_trace.contains("let mut trace = OptimizerTrace::default()"));
-	assert!(bind_with_trace.contains("bind_plan_with_trace(plan, &mut trace, &mut render_trace)"));
+	assert!(bind_with_trace.contains("bind_plan_with_trace("));
+	assert!(bind_with_trace.contains("JoinOrderSourceCapture::Off"));
 	assert!(bind_with_trace.contains("let logical_types = catalog.logical_type_registry()"));
 	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan, &logical_types)?"));
 	assert!(bind_with_trace.contains("Ok((plan, trace))"));
@@ -1276,7 +1276,7 @@ pub(crate) fn adr139_streaming_replay_requires_no_batch_sent() {
 pub(crate) fn adr139_replay_mode_demotes_auto_and_sql_broadcasts_only() {
 	let binder = binder_source();
 	let choose = source_block(&binder, "fn choose_join_strategy");
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
 	assert!(choose.contains("replay_id: JoinReplayId"));
 	assert!(choose.contains("force_hash_join_ids.contains(&replay_id)"));
@@ -1284,19 +1284,19 @@ pub(crate) fn adr139_replay_mode_demotes_auto_and_sql_broadcasts_only() {
 	assert!(choose.contains("source: JoinStrategyPinSource::SqlHint"));
 	assert!(choose.contains("HashAfterBroadcastCap"));
 	assert!(choose.contains("JoinStrategyIntent::Pinned { strategy, .. }"));
-	assert!(bind_join.contains("force_demoted_sql_broadcast"));
-	assert!(bind_join.contains("strip_root_exchange(left_plan.plan)"));
+	assert!(bind_scoped_join.contains("force_demoted_sql_broadcast"));
+	assert!(bind_scoped_join.contains("strip_root_exchange(left_plan.plan)"));
 	assert!(binder.contains("force_hash_join_ids_demotes_auto_and_sql_broadcast_only"));
 }
 
 #[test]
 pub(crate) fn adr139_replay_mode_installs_hash_exchanges_for_demoted_pins() {
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
-	assert!(bind_join.contains("force_demoted_sql_broadcast"));
-	assert!(bind_join.contains("strip_root_exchange(left_plan.plan)"));
-	assert!(bind_join.contains("exchange_for_join_keys("));
+	assert!(bind_scoped_join.contains("force_demoted_sql_broadcast"));
+	assert!(bind_scoped_join.contains("strip_root_exchange(left_plan.plan)"));
+	assert!(bind_scoped_join.contains("exchange_for_join_keys("));
 	assert!(binder.contains("terminal_exchange(&left)"));
 	assert!(binder.contains("terminal_exchange(&right)"));
 	assert!(binder.contains("DEFAULT_AUTO_JOIN_PARTITION_COUNT"));
@@ -1400,13 +1400,13 @@ pub(crate) fn adr140_execution_join_carries_stable_replay_id_and_replay_eligibil
 #[test]
 pub(crate) fn adr140_join_replay_id_is_trace_join_index_deterministic() {
 	let binder = binder_source();
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
-	assert!(bind_join.contains("let join_index = trace.join_decisions.len()"));
-	assert!(bind_join.contains("let replay_id = JoinReplayId(join_index as u32)"));
-	assert!(bind_join.contains("choose_join_strategy("));
-	assert!(bind_join.contains("replay_id,"));
-	assert!(bind_join.contains("target: JoinTraceTarget { join_index }"));
+	assert!(bind_scoped_join.contains("let join_index = trace.join_decisions.len()"));
+	assert!(bind_scoped_join.contains("let replay_id = JoinReplayId(join_index as u32)"));
+	assert!(bind_scoped_join.contains("choose_join_strategy("));
+	assert!(bind_scoped_join.contains("replay_id,"));
+	assert!(bind_scoped_join.contains("target: JoinTraceTarget { join_index }"));
 	assert!(binder.contains("join_replay_id_deterministic_across_rebind"));
 }
 
@@ -1414,12 +1414,12 @@ pub(crate) fn adr140_join_replay_id_is_trace_join_index_deterministic() {
 pub(crate) fn adr140_optimizer_receipt_target_uses_join_replay_id() {
 	let binder = binder_source();
 	let target = source_block(&binder, "struct JoinTraceTarget");
-	let bind_join = source_block(&binder, "async fn bind_join");
+	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
 	assert!(target.contains("join_index: usize"));
 	assert!(!target.contains("TableId"));
-	assert!(bind_join.contains("let replay_id = JoinReplayId(join_index as u32)"));
-	assert!(bind_join.contains("target: JoinTraceTarget { join_index }"));
+	assert!(bind_scoped_join.contains("let replay_id = JoinReplayId(join_index as u32)"));
+	assert!(bind_scoped_join.contains("target: JoinTraceTarget { join_index }"));
 }
 
 #[test]

@@ -582,7 +582,11 @@ pub(crate) fn adr032_binder_enforces_source_target_arity() {
 
 	assert!(bind_insert_select.contains("resolve_insert_target_columns(&schema, columns)?"));
 	assert!(bind_insert_select.contains("validate_omitted_insert_target_columns"));
-	assert!(bind_insert_select.contains("bind_plan_with_trace(source, trace, render_trace)"));
+	assert!(
+		bind_insert_select.contains(
+			"bind_plan_with_trace(source, trace, render_trace, join_order_source_capture)"
+		)
+	);
 	assert!(bind_insert_select.contains("source_schema.fields().len() != target_columns.len()"));
 	assert!(bind_insert_select.contains("is_insert_select_coercible"));
 	assert!(bind_insert_select.contains("ExecutionPlan::InsertSelect"));

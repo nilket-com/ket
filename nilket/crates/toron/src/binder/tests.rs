@@ -8535,16 +8535,18 @@ async fn star_order_evidence_reports_declared_vs_preferred() {
 
 	assert_eq!(row[0], ScalarValue::Utf8(Some("join_order".to_string())));
 	assert_eq!(row[1], ScalarValue::Utf8(Some("star[probe=o]".to_string())));
-	assert_eq!(row[2], ScalarValue::Utf8(Some("orders_differ".to_string())));
+	assert_eq!(row[2], ScalarValue::Utf8(Some("reordered".to_string())));
 	assert_utf8_contains(&row[3], "declared_order=[c,p,s]");
 	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
-	assert_utf8_contains(&row[3], "c:5000000:single_key_ndv_containment");
-	assert_utf8_contains(&row[3], "p:1000000:single_key_ndv_containment");
-	assert_utf8_contains(&row[3], "s:100000:single_key_ndv_containment");
+	assert_utf8_contains(&row[3], "applied_order=[s,p,c]");
+	assert_utf8_contains(&row[3], "confidence=hard");
+	assert_utf8_contains(&row[3], "c:5000000:single_key_ndv_containment:hard");
+	assert_utf8_contains(&row[3], "p:1000000:single_key_ndv_containment:hard");
+	assert_utf8_contains(&row[3], "s:100000:single_key_ndv_containment:hard");
 }
 
 #[tokio::test]
-async fn star_order_evidence_is_observational() {
+async fn star_order_actuation_reorders_non_optimal_broadcast_star() {
 	let catalog = star_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&non_optimal_star_order_sql())
@@ -8561,10 +8563,15 @@ async fn star_order_evidence_is_observational() {
 
 	assert_eq!(plain_trace, explain_trace);
 	assert_eq!(format!("{plain_plan:?}"), format!("{explain_plan:?}"));
+	assert!(matches!(plain_plan, ExecutionPlan::Project { .. }));
+	assert_eq!(
+		broadcast_build_scan_ids_in_applied_order(&plain_plan),
+		vec![TableId(24), TableId(23), TableId(22)]
+	);
 	assert!(matches!(
 		render_trace.join_order,
 		Some(StarOrderOutcome::Recognized(StarOrderEvidence {
-			orders_agree: false,
+			action: StarOrderAction::Reordered,
 			..
 		}))
 	));
@@ -8582,7 +8589,10 @@ async fn non_star_join_declines_with_reason() {
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 	let row = join_order_row(&rows);
 
-	assert_eq!(row[2], ScalarValue::Utf8(Some("declined".to_string())));
+	assert_eq!(
+		row[2],
+		ScalarValue::Utf8(Some("declined_probe_not_scan_linear".to_string()))
+	);
 	assert_utf8_contains(&row[3], "reason=probe_not_scan_linear");
 }
 
@@ -8601,14 +8611,66 @@ async fn star_order_evidence_agrees_when_declared_is_optimal() {
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
 	let row = join_order_row(&rows);
 
-	assert_eq!(row[2], ScalarValue::Utf8(Some("orders_agree".to_string())));
+	assert_eq!(
+		row[2],
+		ScalarValue::Utf8(Some("kept_already_optimal".to_string()))
+	);
 	assert_utf8_contains(&row[3], "declared_order=[s,p,c]");
 	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
+	assert_utf8_contains(&row[3], "applied_order=[s,p,c]");
+}
+
+#[tokio::test]
+async fn star_order_keeps_declared_when_soft_margin_is_thin() {
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_100, 1_000);
+	let sql = "SELECT * FROM orders o \
+			   INNER JOIN customers c ON o.customer_id = c.id \
+			   INNER JOIN products p ON o.product_id = p.id";
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {sql}"))
+		.expect("plan thin-margin star EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(
+		row[2],
+		ScalarValue::Utf8(Some("kept_insufficient_margin".to_string()))
+	);
+	assert_utf8_contains(&row[3], "declared_order=[c,p]");
+	assert_utf8_contains(&row[3], "cost_preferred_order=[p,c]");
+	assert_utf8_contains(&row[3], "applied_order=[c,p]");
+	assert_utf8_contains(&row[3], "confidence=soft");
+}
+
+#[tokio::test]
+async fn star_order_declines_missing_facts() {
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_100, 1_000);
+	seed_table_optimizer_facts(&mut catalog, "products", None, Some(1_000), Vec::new());
+	let sql = "SELECT * FROM orders o \
+			   INNER JOIN customers c ON o.customer_id = c.id \
+			   INNER JOIN products p ON o.product_id = p.id";
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {sql}"))
+		.expect("plan missing-fact star EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(
+		row[2],
+		ScalarValue::Utf8(Some("declined_missing_estimate".to_string()))
+	);
+	assert_utf8_contains(&row[3], "reason=missing_estimate");
 }
 
 #[tokio::test]
 async fn star_order_evidence_estimates_match_join_estimates() {
-	let mut catalog = star_join_order_catalog();
+	let catalog = star_join_order_catalog();
 	let single_edge = SqlPlanner::new()
 		.plan(
 			"SELECT * FROM orders o \
@@ -8633,19 +8695,8 @@ async fn star_order_evidence_estimates_match_join_estimates() {
 	let (_schema, rows) =
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
 	let row = join_order_row(&rows);
-	assert_utf8_contains(&row[3], "c:5000000:single_key_ndv_containment");
-
-	seed_table_optimizer_facts(&mut catalog, "stores", None, Some(100), Vec::new());
-	let missing_estimate = SqlPlanner::new()
-		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
-		.expect("plan missing-estimate star EXPLAIN");
-	let (_schema, rows) = bind_explain_rows(
-		&missing_estimate,
-		&catalog,
-		&auto_broadcast_config(64 * 1024 * 1024),
-	)
-	.await;
-	assert_utf8_contains(&join_order_row(&rows)[3], "reason=missing_estimate");
+	assert_utf8_contains(&row[3], "c:5000000:single_key_ndv_containment:hard");
+	assert_utf8_contains(&row[3], "applied_order=[s,p,c]");
 }
 
 #[tokio::test]
@@ -8661,6 +8712,61 @@ async fn star_recognition_respects_scan_linear_probe_fence() {
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 
 	assert_utf8_contains(&join_order_row(&rows)[3], "reason=probe_not_scan_linear");
+}
+
+#[tokio::test]
+async fn star_order_replay_ids_and_receipts_follow_applied_sequence() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+
+	let (plan, trace) =
+		bind_with_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind non-optimal star");
+
+	assert_eq!(
+		trace
+			.join_decisions
+			.iter()
+			.map(|receipt| receipt.target.join_index)
+			.collect::<Vec<_>>(),
+		vec![0, 1, 2]
+	);
+	assert!(trace.join_decisions.iter().all(|receipt| {
+		receipt.strategy == JoinStrategy::Broadcast
+			&& receipt.placement == JoinPhysicalPlacement::SwappedRightBuild
+	}));
+	assert_eq!(
+		broadcast_build_scan_ids_in_applied_order(&plan),
+		vec![TableId(24), TableId(23), TableId(22)]
+	);
+}
+
+#[tokio::test]
+async fn projected_star_reorder_restores_downstream_ordinals() {
+	let catalog = star_join_order_catalog();
+	let sql = "SELECT c.id, p.id, s.id FROM orders o \
+			   INNER JOIN customers c ON o.customer_id = c.id \
+			   INNER JOIN products p ON o.product_id = p.id \
+			   INNER JOIN stores s ON o.store_id = s.id";
+	let logical = SqlPlanner::new()
+		.plan(sql)
+		.expect("plan projected non-optimal star");
+
+	let scoped = Binder {
+		catalog: &catalog,
+		config: &auto_broadcast_config(64 * 1024 * 1024),
+	}
+	.bind_plan(&logical)
+	.await
+	.expect("bind projected star");
+
+	assert_eq!(
+		root_project_column_ordinals(&scoped.plan),
+		vec![ColumnOrdinal(4), ColumnOrdinal(5), ColumnOrdinal(6)]
+	);
 }
 
 #[tokio::test]
@@ -8716,8 +8822,9 @@ async fn rune_explain_shows_star_order_evidence() {
 	let row = join_order_row(&rows);
 
 	assert_eq!(row[0], ScalarValue::Utf8(Some("join_order".to_string())));
-	assert_eq!(row[2], ScalarValue::Utf8(Some("orders_differ".to_string())));
+	assert_eq!(row[2], ScalarValue::Utf8(Some("reordered".to_string())));
 	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
+	assert_utf8_contains(&row[3], "applied_order=[s,p,c]");
 }
 
 #[tokio::test]
@@ -10365,6 +10472,60 @@ fn join_order_row(rows: &[Vec<ScalarValue>]) -> &[ScalarValue] {
 		.expect("join_order evidence row")
 }
 
+fn broadcast_build_scan_ids_in_applied_order(plan: &ExecutionPlan) -> Vec<TableId> {
+	let mut top_down_build_ids = Vec::new();
+	collect_broadcast_build_scan_ids_top_down(plan, &mut top_down_build_ids);
+	top_down_build_ids.reverse();
+	top_down_build_ids
+}
+
+fn collect_broadcast_build_scan_ids_top_down(plan: &ExecutionPlan, build_ids: &mut Vec<TableId>) {
+	match plan {
+		ExecutionPlan::Project { input, .. } => {
+			collect_broadcast_build_scan_ids_top_down(input, build_ids);
+		}
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			strategy,
+			..
+		} if *kind == JoinKind::Inner && *strategy == JoinStrategy::Broadcast => {
+			if let Some(table_id) = single_scan_table_id(left) {
+				build_ids.push(table_id);
+			}
+			collect_broadcast_build_scan_ids_top_down(right, build_ids);
+		}
+		_ => {}
+	}
+}
+
+fn single_scan_table_id(plan: &ExecutionPlan) -> Option<TableId> {
+	match plan {
+		ExecutionPlan::Scan {
+			legacy_table_id, ..
+		} => Some(*legacy_table_id),
+		ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. } => single_scan_table_id(input),
+		_ => None,
+	}
+}
+
+fn root_project_column_ordinals(plan: &ExecutionPlan) -> Vec<ColumnOrdinal> {
+	let ExecutionPlan::Project { exprs, .. } = plan else {
+		panic!("expected root project, got {plan:?}");
+	};
+	exprs
+		.roots
+		.iter()
+		.map(|root| match exprs.node(*root) {
+			Some(BoundExprNode::Column(column)) => column.ordinal,
+			other => panic!("expected projected column, got {other:?}"),
+		})
+		.collect()
+}
+
 fn join_input(facts: PlanOptimizerFacts) -> JoinInputOptimization {
 	JoinInputOptimization {
 		facts,
@@ -10624,6 +10785,61 @@ fn star_join_order_catalog() -> MockCatalog {
 		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
 	);
 	catalog
+}
+
+fn seed_soft_star_join_order_facts(
+	catalog: &mut MockCatalog,
+	customer_rows: u64,
+	product_rows: u64,
+) {
+	seed_table_optimizer_facts(
+		catalog,
+		"orders",
+		None,
+		Some(100_000),
+		vec![
+			(
+				ColumnOrdinal(1),
+				DistinctCountFact::Approx {
+					estimate: 100_000,
+					rel_err_ppm: 10_000,
+				},
+			),
+			(
+				ColumnOrdinal(2),
+				DistinctCountFact::Approx {
+					estimate: 100_000,
+					rel_err_ppm: 10_000,
+				},
+			),
+		],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"customers",
+		None,
+		Some(customer_rows),
+		vec![(
+			ColumnOrdinal(0),
+			DistinctCountFact::Approx {
+				estimate: 100_000,
+				rel_err_ppm: 10_000,
+			},
+		)],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"products",
+		None,
+		Some(product_rows),
+		vec![(
+			ColumnOrdinal(0),
+			DistinctCountFact::Approx {
+				estimate: 100_000,
+				rel_err_ppm: 10_000,
+			},
+		)],
+	);
 }
 
 fn non_optimal_star_order_sql() -> String {
