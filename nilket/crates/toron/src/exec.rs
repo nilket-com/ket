@@ -3,18 +3,20 @@ use crate::aggregate_kernel;
 use crate::coordinator::{materialize_scan_stream, materialize_scan_stream_bounded};
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use crate::distributed::cancellation::DownstreamCancellationContext;
-use crate::distributed::task::TaskTelemetry;
+use crate::distributed::task::{
+	JoinRuntimeObservation, JoinRuntimeObservationMode, RowCount, TaskTelemetry,
+};
 use crate::error::ExecutionError;
+#[cfg(test)]
+use crate::ir::BroadcastReplayEligibility;
 #[cfg(test)]
 use crate::ir::arithmetic_output_type;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
-	MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId, TemporalExtractField,
-	TemporalTruncField, nanos_per_timestamp_unit,
+	JoinReplayId, JoinStrategy, MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId,
+	TableId, TemporalExtractField, TemporalTruncField, nanos_per_timestamp_unit,
 };
-#[cfg(test)]
-use crate::ir::{BroadcastReplayEligibility, JoinReplayId, JoinStrategy};
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
 use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
@@ -102,6 +104,7 @@ pub struct ExecutionContext {
 	pub legacy_table_pins: HashMap<TableId, ScanTablePin>,
 	pub task_budget: TaskBudget,
 	pub task_telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	pub join_runtime_observation_mode: JoinRuntimeObservationMode,
 	pub runtime_filter: Option<RuntimeFilterDescriptor>,
 	pub downstream_cancellation: Option<DownstreamCancellationContext>,
 	join_spill_file_ops: Arc<dyn AsyncFileOps>,
@@ -119,6 +122,10 @@ impl fmt::Debug for ExecutionContext {
 			.field("trace_context", &self.trace_context)
 			.field("legacy_table_pins", &self.legacy_table_pins)
 			.field("task_budget", &self.task_budget)
+			.field(
+				"join_runtime_observation_mode",
+				&self.join_runtime_observation_mode,
+			)
 			.field("runtime_filter", &self.runtime_filter)
 			.field(
 				"downstream_cancellation",
@@ -146,6 +153,7 @@ impl ExecutionContext {
 			legacy_table_pins: HashMap::new(),
 			task_budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			task_telemetry: None,
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			runtime_filter: None,
 			downstream_cancellation: None,
 			join_spill_file_ops: Arc::new(BlockingFileOps),
@@ -160,6 +168,11 @@ impl ExecutionContext {
 
 	pub fn with_task_telemetry(mut self, telemetry: Arc<Mutex<TaskTelemetry>>) -> Self {
 		self.task_telemetry = Some(telemetry);
+		self
+	}
+
+	pub fn with_join_runtime_observation_mode(mut self, mode: JoinRuntimeObservationMode) -> Self {
+		self.join_runtime_observation_mode = mode;
 		self
 	}
 
@@ -632,6 +645,9 @@ impl Executor {
 				LogicalPlan::Explain { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound EXPLAIN execution",
 				}),
+				LogicalPlan::ExplainAnalyze { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound EXPLAIN ANALYZE execution",
+				}),
 				LogicalPlan::CreateTable { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound CREATE TABLE execution",
 				}),
@@ -796,11 +812,13 @@ impl Executor {
 					Ok(take_batches(input_batches, *limit))
 				}
 				ExecutionPlan::Join {
+					replay_id,
 					left,
 					right,
 					kind,
 					left_keys,
 					right_keys,
+					strategy,
 					output_schema,
 					..
 				} => {
@@ -814,9 +832,12 @@ impl Executor {
 						*kind,
 						left_keys,
 						right_keys,
+						*replay_id,
+						*strategy,
 						output_schema,
 						self.context.task_budget,
 						self.context.task_telemetry.clone(),
+						self.context.join_runtime_observation_mode.clone(),
 						self.context.join_spill_file_ops.clone(),
 						self.context.join_spill_dir.clone(),
 					)
@@ -1827,7 +1848,7 @@ fn timestamp_literal_array(value: &Option<i64>, unit: TimeUnit, num_rows: usize)
 	}
 }
 
-fn materialize_scalar_rows(
+pub(crate) fn materialize_scalar_rows(
 	schema: &SchemaRef,
 	rows: &[Vec<ScalarValue>],
 ) -> Result<RecordBatch, ExecutionError> {
@@ -2420,6 +2441,26 @@ fn record_task_telemetry(
 	}
 }
 
+fn record_join_runtime_observation(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	mode: &JoinRuntimeObservationMode,
+	observation: JoinRuntimeObservation,
+) {
+	if !mode.measures(observation.replay_id) {
+		return;
+	}
+	record_task_telemetry(telemetry, |task| {
+		task.join_observations.push(observation);
+	});
+}
+
+fn record_batch_row_count(batches: &[RecordBatch]) -> u64 {
+	batches
+		.iter()
+		.map(|batch| batch.num_rows() as u64)
+		.sum::<u64>()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_hash_join(
 	left_schema: arrow::datatypes::SchemaRef,
@@ -2429,9 +2470,12 @@ async fn execute_hash_join(
 	kind: JoinKind,
 	left_keys: &[crate::ir::ColumnOrdinal],
 	right_keys: &[crate::ir::ColumnOrdinal],
+	replay_id: JoinReplayId,
+	strategy: JoinStrategy,
 	output_schema: &arrow::datatypes::SchemaRef,
 	task_budget: TaskBudget,
 	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	join_runtime_observation_mode: JoinRuntimeObservationMode,
 	spill_file_ops: Arc<dyn AsyncFileOps>,
 	spill_dir: PathBuf,
 ) -> Result<Vec<RecordBatch>, ExecutionError> {
@@ -2459,7 +2503,7 @@ async fn execute_hash_join(
 	if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
 		> task_budget.memory.get()
 	{
-		return execute_spilled_hash_join(
+		let result = execute_spilled_hash_join(
 			kind,
 			&left_batch,
 			&right_batch,
@@ -2467,11 +2511,25 @@ async fn execute_hash_join(
 			&right_key_arrays,
 			output_schema,
 			task_budget,
-			telemetry,
+			telemetry.clone(),
 			spill_file_ops,
 			spill_dir,
 		)
 		.await;
+		if let Ok(batches) = &result {
+			record_join_runtime_observation(
+				&telemetry,
+				&join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id,
+					strategy,
+					build_rows: RowCount::new(left_batch.num_rows() as u64),
+					probe_rows: RowCount::new(right_batch.num_rows() as u64),
+					output_rows: RowCount::new(record_batch_row_count(batches)),
+				},
+			);
+		}
+		return result;
 	}
 
 	let join_key_plan = JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays);
@@ -2484,7 +2542,7 @@ async fn execute_hash_join(
 		task_budget.memory.get(),
 	)?
 	else {
-		return execute_spilled_hash_join(
+		let result = execute_spilled_hash_join(
 			kind,
 			&left_batch,
 			&right_batch,
@@ -2492,11 +2550,25 @@ async fn execute_hash_join(
 			&right_key_arrays,
 			output_schema,
 			task_budget,
-			telemetry,
+			telemetry.clone(),
 			spill_file_ops,
 			spill_dir,
 		)
 		.await;
+		if let Ok(batches) = &result {
+			record_join_runtime_observation(
+				&telemetry,
+				&join_runtime_observation_mode,
+				JoinRuntimeObservation {
+					replay_id,
+					strategy,
+					build_rows: RowCount::new(left_batch.num_rows() as u64),
+					probe_rows: RowCount::new(right_batch.num_rows() as u64),
+					output_rows: RowCount::new(record_batch_row_count(batches)),
+				},
+			);
+		}
+		return result;
 	};
 	record_task_telemetry(&telemetry, |task| {
 		task.phases.build_micros = task
@@ -2525,13 +2597,25 @@ async fn execute_hash_join(
 			.saturating_add(selection.len() as u64);
 	});
 
-	Ok(vec![materialize_join_selection(
+	let output = vec![materialize_join_selection(
 		kind,
 		&left_batch,
 		&right_batch,
 		&selection,
 		output_schema,
-	)?])
+	)?];
+	record_join_runtime_observation(
+		&telemetry,
+		&join_runtime_observation_mode,
+		JoinRuntimeObservation {
+			replay_id,
+			strategy,
+			build_rows: RowCount::new(left_batch.num_rows() as u64),
+			probe_rows: RowCount::new(right_batch.num_rows() as u64),
+			output_rows: RowCount::new(record_batch_row_count(&output)),
+		},
+	);
+	Ok(output)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

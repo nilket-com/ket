@@ -56,6 +56,9 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 use wendelon::schema::RuntimeFilterDescriptor;
 
+#[cfg(test)]
+use crate::distributed::task::JoinRuntimeObservationMode;
+
 pub struct ToronWorker {
 	storage: Arc<dyn StorageScan>,
 	memory: Arc<MemoryManager>,
@@ -195,6 +198,7 @@ impl ToronWorker {
 			)
 			.with_task_budget(spec.budget)
 			.with_task_telemetry(telemetry.clone())
+			.with_join_runtime_observation_mode(spec.join_runtime_observation_mode.clone())
 			.with_runtime_filter(scan_runtime_filter(spec))
 			.with_downstream_cancellation(downstream_cancellation);
 			task_context.trace_context = if crate::telemetry::enabled() {
@@ -1455,6 +1459,7 @@ mod tests {
 			),
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan,
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1519,6 +1524,7 @@ mod tests {
 			),
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Join {
 				replay_id: JoinReplayId::SYNTHETIC,
 				replay_eligibility: BroadcastReplayEligibility::Terminal,
@@ -1611,6 +1617,7 @@ mod tests {
 			),
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1686,6 +1693,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1765,6 +1773,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1851,6 +1860,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1920,6 +1930,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -1988,6 +1999,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -2055,6 +2067,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -2149,6 +2162,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -2351,6 +2365,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -2448,6 +2463,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: scan(TableId(1), 1),
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -2593,6 +2609,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Exchange {
 				input: Box::new(scan(TableId(1), 1)),
 				partition_count: 1,
@@ -2676,6 +2693,7 @@ mod tests {
 			),
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Exchange {
 				input: Box::new(scan(TableId(1), 1)),
 				partition_count: 1,
@@ -2745,6 +2763,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Exchange {
 				input: Box::new(scan(TableId(1), 1)),
 				partition_count: 1,
@@ -2837,6 +2856,7 @@ mod tests {
 			identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Exchange {
 				input: Box::new(scan(TableId(1), 1)),
 				partition_count: 1,
@@ -2962,6 +2982,7 @@ mod tests {
 			),
 			partition: Some(PartitionId::new(0)),
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Take {
 				input: Box::new(scan),
 				limit: 1,
@@ -3125,6 +3146,7 @@ mod tests {
 			),
 			partition: Some(PartitionId::new(0)),
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Join {
 				replay_id: JoinReplayId::SYNTHETIC,
 				replay_eligibility: BroadcastReplayEligibility::Terminal,
@@ -3274,6 +3296,7 @@ mod tests {
 			identity: producer_identity,
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Exchange {
 				input: Box::new(scan(TableId(1), 3)),
 				partition_count: 1,
@@ -3323,6 +3346,7 @@ mod tests {
 			),
 			partition: Some(PartitionId::new(0)),
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Take {
 				input: Box::new(scan),
 				limit: 1,

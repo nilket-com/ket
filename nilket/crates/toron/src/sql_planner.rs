@@ -2215,9 +2215,6 @@ impl SqlPlanner {
 				"DESC and DESCRIBE aliases are not supported for EXPLAIN",
 			));
 		}
-		if analyze {
-			return Err(unsupported("EXPLAIN ANALYZE is not supported"));
-		}
 		if verbose {
 			return Err(unsupported("EXPLAIN VERBOSE is not supported"));
 		}
@@ -2235,9 +2232,14 @@ impl SqlPlanner {
 		}
 
 		match statement {
-			Statement::Query(query) => Ok(LogicalPlan::Explain {
-				input: Box::new(self.lower_query(query)?),
-			}),
+			Statement::Query(query) => {
+				let input = Box::new(self.lower_query(query)?);
+				if analyze {
+					Ok(LogicalPlan::ExplainAnalyze { input })
+				} else {
+					Ok(LogicalPlan::Explain { input })
+				}
+			}
 			Statement::Explain { .. } | Statement::ExplainTable { .. } => {
 				Err(unsupported("nested EXPLAIN is not supported"))
 			}
@@ -6926,6 +6928,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 		} => true,
 		LogicalPlan::CreateTable { .. }
 		| LogicalPlan::Explain { .. }
+		| LogicalPlan::ExplainAnalyze { .. }
 		| LogicalPlan::CreateLogicalType { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
 		| LogicalPlan::DropTable { .. }
@@ -7384,6 +7387,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		},
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::Explain { .. }
+		| LogicalPlan::ExplainAnalyze { .. }
 		| LogicalPlan::CreateTable { .. }
 		| LogicalPlan::CreateLogicalType { .. }
 		| LogicalPlan::CreateTableAsSelect { .. }
@@ -8236,7 +8240,8 @@ mod tests {
 			| LogicalPlan::Exchange { input, .. }
 			| LogicalPlan::Sort { input, .. }
 			| LogicalPlan::Take { input, .. }
-			| LogicalPlan::Explain { input } => filter_count(input),
+			| LogicalPlan::Explain { input }
+			| LogicalPlan::ExplainAnalyze { input } => filter_count(input),
 			LogicalPlan::Join { left, right, .. } => filter_count(left) + filter_count(right),
 			LogicalPlan::CreateTableAsSelect { source, .. } => filter_count(source),
 			LogicalPlan::Scan { .. }

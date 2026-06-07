@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -7,6 +7,7 @@ use arrow::record_batch::RecordBatch;
 use toron::binder::join_schema;
 use toron::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
+use toron::distributed::task::{JoinRuntimeObservationMode, TaskTelemetry};
 use toron::error::StorageError;
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
@@ -254,7 +255,109 @@ async fn spilled_hash_join_matches_in_memory_digest_for_all_kinds() {
 	}
 }
 
+#[tokio::test]
+async fn ordinary_execution_captures_nothing() {
+	let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let _batch = run_join_with_context(
+		JoinKind::Inner,
+		ExecutionContext::local_test().with_task_telemetry(telemetry.clone()),
+	)
+	.await;
+
+	assert!(
+		telemetry
+			.lock()
+			.expect("telemetry")
+			.join_observations
+			.is_empty(),
+		"task telemetry alone must not enable join runtime observations"
+	);
+}
+
+#[tokio::test]
+async fn join_runtime_observation_respects_replay_id_allowlist() {
+	let missed = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let _batch = run_join_with_context(
+		JoinKind::Inner,
+		ExecutionContext::local_test()
+			.with_task_telemetry(missed.clone())
+			.with_join_runtime_observation_mode(JoinRuntimeObservationMode::MeasureJoins {
+				replay_ids: BTreeSet::from([JoinReplayId(7)]),
+			}),
+	)
+	.await;
+	assert!(
+		missed
+			.lock()
+			.expect("telemetry")
+			.join_observations
+			.is_empty(),
+		"non-allowlisted replay id must not be captured"
+	);
+
+	let captured = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let _batch = run_join_with_context(
+		JoinKind::Inner,
+		ExecutionContext::local_test()
+			.with_task_telemetry(captured.clone())
+			.with_join_runtime_observation_mode(JoinRuntimeObservationMode::MeasureJoins {
+				replay_ids: BTreeSet::from([JoinReplayId::SYNTHETIC]),
+			}),
+	)
+	.await;
+	let observations = captured
+		.lock()
+		.expect("telemetry")
+		.join_observations
+		.clone();
+	assert_eq!(observations.len(), 1);
+	assert_eq!(observations[0].replay_id, JoinReplayId::SYNTHETIC);
+	assert_eq!(observations[0].strategy, JoinStrategy::HashPartitioned);
+	assert_eq!(observations[0].build_rows.get(), 5);
+	assert_eq!(observations[0].probe_rows.get(), 5);
+	assert_eq!(observations[0].output_rows.get(), 5);
+}
+
+#[tokio::test]
+async fn spilled_join_records_runtime_observation_when_analyze_enabled() {
+	let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+	let budget = TaskBudget {
+		memory: ByteCount::new(80 * 1024),
+		spill_bytes: ByteCount::new(2 * 1024 * 1024),
+		..TaskBudget::from_query_budget(QueryBudget::test_default())
+	};
+	let batch = run_large_join_with_context(
+		JoinKind::Inner,
+		ExecutionContext::local_test()
+			.with_task_budget(budget)
+			.with_task_telemetry(telemetry.clone())
+			.with_join_runtime_observation_mode(JoinRuntimeObservationMode::MeasureJoins {
+				replay_ids: BTreeSet::from([JoinReplayId::SYNTHETIC]),
+			}),
+	)
+	.await;
+	let observations = telemetry
+		.lock()
+		.expect("telemetry")
+		.join_observations
+		.clone();
+
+	assert_eq!(observations.len(), 1);
+	assert_eq!(observations[0].replay_id, JoinReplayId::SYNTHETIC);
+	assert_eq!(observations[0].build_rows.get(), 2_000);
+	assert_eq!(observations[0].probe_rows.get(), 32);
+	assert_eq!(observations[0].output_rows.get(), batch.num_rows() as u64);
+}
+
 async fn run_join(kind: JoinKind, budget: TaskBudget) -> RecordBatch {
+	run_join_with_context(
+		kind,
+		ExecutionContext::local_test().with_task_budget(budget),
+	)
+	.await
+}
+
+async fn run_join_with_context(kind: JoinKind, context: ExecutionContext) -> RecordBatch {
 	let left_schema = left_schema();
 	let right_schema = right_schema();
 	let plan = join_plan(
@@ -271,7 +374,7 @@ async fn run_join(kind: JoinKind, budget: TaskBudget) -> RecordBatch {
 				(TableId(2), right_batch(right_schema)),
 			]),
 		}),
-		ExecutionContext::local_test().with_task_budget(budget),
+		context,
 	);
 	let results = executor.execute_bound(&plan, None).await.expect("join");
 
@@ -280,6 +383,14 @@ async fn run_join(kind: JoinKind, budget: TaskBudget) -> RecordBatch {
 }
 
 async fn run_large_join(kind: JoinKind, budget: TaskBudget) -> RecordBatch {
+	run_large_join_with_context(
+		kind,
+		ExecutionContext::local_test().with_task_budget(budget),
+	)
+	.await
+}
+
+async fn run_large_join_with_context(kind: JoinKind, context: ExecutionContext) -> RecordBatch {
 	let left_schema = Arc::new(Schema::new(vec![
 		Field::new("pk", DataType::Int64, false),
 		Field::new("id", DataType::Int64, true),
@@ -338,7 +449,7 @@ async fn run_large_join(kind: JoinKind, budget: TaskBudget) -> RecordBatch {
 		Arc::new(MultiTableScan {
 			batches: HashMap::from([(TableId(1), left_batch), (TableId(2), right_batch)]),
 		}),
-		ExecutionContext::local_test().with_task_budget(budget),
+		context,
 	);
 
 	executor

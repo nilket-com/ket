@@ -982,6 +982,9 @@ pub enum LogicalPlan {
 	Explain {
 		input: Box<LogicalPlan>,
 	},
+	ExplainAnalyze {
+		input: Box<LogicalPlan>,
+	},
 	CreateTable {
 		name: TableRef,
 		schema: CreateTableSchema,

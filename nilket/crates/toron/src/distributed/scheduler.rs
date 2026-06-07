@@ -1270,6 +1270,8 @@ mod tests {
 			),
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode:
+				crate::distributed::task::JoinRuntimeObservationMode::Disabled,
 			plan: ExecutionPlan::Scan {
 				legacy_table_id: crate::ir::TableId(1),
 				table: TableObjectId::new([1; 16]),

@@ -131,6 +131,22 @@ async fn ctx_sql_explain_is_read_only_relation() {
 }
 
 #[tokio::test]
+async fn ctx_sql_explain_analyze_is_read_only_relation() {
+	let plan = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("EXPLAIN ANALYZE SELECT * FROM sales")
+        }
+    "#,
+	)
+	.await
+	.expect("ctx.sql EXPLAIN ANALYZE SELECT");
+
+	assert!(matches!(plan, LogicalPlan::ExplainAnalyze { .. }));
+	assert!(!is_terminal_plan(&plan));
+}
+
+#[tokio::test]
 async fn ctx_sql_explain_rejects_mutation_explain() {
 	let error = rune_plan(
 		r#"
@@ -494,6 +510,23 @@ async fn rune_explain_broadcast_join_yields_decision_rows() {
 		string_column_rows(&batches, 3),
 		vec![Some("natural:pinned_by_author".to_string())]
 	);
+}
+
+#[tokio::test]
+async fn rune_analyze_lowers_to_explain_analyze() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").analyze()
+        }
+    "#,
+	)
+	.await
+	.expect("Rune analyze");
+
+	let LogicalPlan::ExplainAnalyze { .. } = logical else {
+		panic!("expected Rune analyze plan, got {logical:?}");
+	};
 }
 
 #[tokio::test]

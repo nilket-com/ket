@@ -205,7 +205,7 @@ pub(crate) fn adr178_cockpit_is_frontend_shared() {
 	let binder = binder_source();
 	let rune = source("src/rune_engine.rs");
 	let explain_plan = first_block(&binder, "fn optimizer_explain_plan");
-	let bind_explain = first_block(&binder, "async fn bind_explain");
+	let bind_explain = first_block(&binder, "async fn bind_explain(&self");
 	let rune_explain = first_block(&rune, "pub fn explain");
 
 	assert!(explain_plan.contains("optimizer_explain_join_order_row"));
@@ -214,4 +214,227 @@ pub(crate) fn adr178_cockpit_is_frontend_shared() {
 	assert!(!rune.contains("JoinOrderEdgeEvidence"));
 	assert!(!rune.contains("StarOrderOutcome"));
 	assert!(!rune.contains("join_order_edges"));
+}
+
+#[test]
+pub(crate) fn adr179_explain_analyze_is_implemented_not_rejected() {
+	let planner = source("src/sql_planner.rs");
+	let coordinator = source("src/coordinator.rs");
+	let exec = source("src/exec.rs");
+	let lower_explain = first_block(&planner, "fn lower_explain_statement");
+	let local = first_block(&coordinator, "async fn execute_explain_analyze(");
+	let distributed = first_block(&coordinator, "async fn execute_explain_analyze_distributed");
+
+	assert!(lower_explain.contains("LogicalPlan::ExplainAnalyze"));
+	assert!(!planner.contains("EXPLAIN ANALYZE is not supported"));
+	assert!(local.contains("bind_explain_analyze(input, catalog, &self.config).await?"));
+	assert!(distributed.contains("bind_explain_analyze(input, catalog, planner_config).await?"));
+	assert!(exec.contains("unbound EXPLAIN ANALYZE execution"));
+}
+
+#[test]
+pub(crate) fn adr179_runtime_evidence_is_observational() {
+	let exec = source("src/exec.rs");
+	let coordinator = source("src/coordinator.rs");
+	let recorder = first_block(&exec, "fn record_join_runtime_observation");
+	let local = first_block(&coordinator, "async fn execute_explain_analyze(");
+
+	assert!(recorder.contains("if !mode.measures(observation.replay_id)"));
+	assert!(recorder.contains("task.join_observations.push(observation)"));
+	assert!(!recorder.contains("JoinStrategy::"));
+	assert!(!recorder.contains("ExecutionPlan::"));
+	assert!(local.contains("let _results = executor"));
+	assert!(local.contains("render_explain_analyze(binding, &observations)?"));
+}
+
+#[test]
+pub(crate) fn adr179_measures_does_not_act() {
+	let binder = binder_source();
+	let exec = source("src/exec.rs");
+	let chooser = first_block(&binder, "fn choose_join_strategy");
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+
+	assert!(!binder.contains("JoinRuntimeObservationMode"));
+	assert!(!chooser.contains("JoinRuntimeObservation"));
+	assert!(!actuator.contains("JoinRuntimeObservation"));
+	assert!(exec.contains("JoinRuntimeObservation"));
+	assert!(!exec.contains("choose_join_strategy"));
+	assert!(!exec.contains("try_bind_star_order_actuation"));
+}
+
+#[test]
+pub(crate) fn adr179_actual_correlates_via_replay_id() {
+	let binder = binder_source();
+	let task = source("src/distributed/task.rs");
+	let exec = source("src/exec.rs");
+	let render = first_block(&binder, "fn optimizer_analyze_join_order_row");
+	let replay_ids = first_block(&binder, "fn star_order_runtime_replay_ids");
+	let execute_hash_join = first_block(&exec, "async fn execute_hash_join");
+
+	assert!(task.contains("pub replay_id: JoinReplayId"));
+	assert!(replay_ids.contains("edge.target.join_index"));
+	assert!(replay_ids.contains(".map(JoinReplayId)"));
+	assert!(render.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(render.contains("summaries.get(&replay_id)"));
+	assert!(execute_hash_join.contains("JoinRuntimeObservation {\n\t\t\t\t\treplay_id,"));
+	assert!(execute_hash_join.contains("output_rows: RowCount::new(record_batch_row_count"));
+}
+
+#[test]
+pub(crate) fn adr179_reuses_178_estimate_no_second_estimator() {
+	let binder = binder_source();
+	let analyze_plan = first_block(&binder, "fn optimizer_analyze_plan");
+	let analyze_rows = first_block(&binder, "fn optimizer_analyze_rows");
+	let analyze_row = first_block(&binder, "fn optimizer_analyze_join_order_row");
+
+	assert!(analyze_row.contains("let estimated_rows = dimension.estimated_rows;"));
+	assert!(analyze_row.contains("dimension.estimate_source"));
+	for forbidden in [
+		"join_output_ndv_containment_estimate",
+		"multi_key_join_cardinality",
+		"join_estimated_row_count_for_keys",
+		"estimate_join_order_edge_from_sources",
+		"join_order_edge_estimate",
+	] {
+		assert!(!analyze_plan.contains(forbidden));
+		assert!(!analyze_rows.contains(forbidden));
+		assert!(!analyze_row.contains(forbidden));
+	}
+}
+
+#[test]
+pub(crate) fn adr179_capture_is_cheap_and_analyze_gated() {
+	let exec = source("src/exec.rs");
+	let coordinator = source("src/coordinator.rs");
+	let context_new = first_block(&exec, "pub fn new(");
+	let recorder = first_block(&exec, "fn record_join_runtime_observation");
+	let local = first_block(&coordinator, "async fn execute_explain_analyze(");
+	let distributed = first_block(&coordinator, "async fn execute_explain_analyze_distributed");
+
+	assert!(context_new.contains("JoinRuntimeObservationMode::Disabled"));
+	assert!(
+		recorder.find("mode.measures").expect("measure gate")
+			< recorder
+				.find("record_task_telemetry")
+				.expect("telemetry lock path")
+	);
+	assert!(local.contains(".with_join_runtime_observation_mode(analyze_observation_mode("));
+	assert!(distributed.contains(".with_join_runtime_observation_mode(analyze_observation_mode("));
+}
+
+#[test]
+pub(crate) fn adr179_capture_allowlist_is_replay_id_only() {
+	let task = source("src/distributed/task.rs");
+	let mode = first_block(&task, "pub enum JoinRuntimeObservationMode");
+	let measures = first_block(&task, "impl JoinRuntimeObservationMode");
+
+	assert!(mode.contains("MeasureJoins"));
+	assert!(mode.contains("replay_ids: BTreeSet<JoinReplayId>"));
+	assert!(measures.contains("replay_ids.contains(&replay_id)"));
+	for forbidden in ["table", "dimension", "predicate", "column", "relation"] {
+		assert!(
+			!mode.contains(forbidden),
+			"runtime capture allowlist must remain replay-id-only: {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr179_no_star_order_vocabulary_in_exec() {
+	let manifest = manifest_dir();
+	let markers = [
+		"JoinOrderEdgeEvidence",
+		"StarOrderOutcome",
+		"StarOrderEvidence",
+		"StarOrderAction",
+		"join_order_runtime",
+		"dimension=",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/distributed/task.rs"),
+		manifest.join("src/distributed/fragment.rs"),
+		manifest.join("src/distributed/scheduler.rs"),
+		manifest.join("src/server/mod.rs"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR179 leaked star-order vocabulary below binder/explain:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr179_no_fragment_or_wendelon_storage_pbc_change() {
+	let manifest = manifest_dir();
+	let fragment = source("src/distributed/fragment.rs");
+	let markers = [
+		"JoinRuntimeObservation",
+		"JoinRuntimeObservationMode",
+		"join_runtime_observation",
+		"join_observations",
+		"join_order_runtime",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/catalog.rs"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(fragment.contains("join_runtime_observation_mode"));
+	assert!(!fragment.contains("JoinOrderEdgeEvidence"));
+	assert!(!fragment.contains("StarOrderOutcome"));
+	assert!(
+		offenders.is_empty(),
+		"ADR179 runtime evidence changed storage/PBC/Wendelon surfaces:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr179_no_optimizer_shell() {
+	let manifest = manifest_dir();
+	assert!(!manifest.join("src/optimizer.rs").exists());
+	assert!(!manifest.join("src/optimizer").exists());
+
+	let src = source_lines(&manifest.join("src"));
+	let offenders = src
+		.into_iter()
+		.filter(|(_, _, line)| {
+			let trimmed = line.trim_start();
+			trimmed.starts_with("struct Optimizer ")
+				|| trimmed.starts_with("pub struct Optimizer ")
+				|| trimmed.starts_with("enum Optimizer ")
+				|| trimmed.starts_with("pub enum Optimizer ")
+				|| line.contains("PlanProperties")
+				|| line.contains("Cascades")
+				|| trimmed.starts_with("struct Memo ")
+				|| trimmed.starts_with("struct Memo{")
+				|| trimmed.starts_with("pub struct Memo ")
+				|| trimmed.starts_with("pub struct Memo{")
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR179 introduced an optimizer shell/property contract:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
 }

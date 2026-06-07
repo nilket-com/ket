@@ -18,7 +18,7 @@ use crate::catalog::{
 	DistinctCountFact, RangeFact, TableBinding, TableOptimizerFacts, TableRef, TableRowIdentity,
 };
 use crate::distributed::budget::{ByteCount, QueryBudget};
-use crate::distributed::task::RowCount;
+use crate::distributed::task::{JoinRuntimeObservation, RowCount};
 use crate::error::BindingError;
 use crate::exec::Executor;
 use crate::ir::{
@@ -179,6 +179,57 @@ async fn bind_with_explain_trace(
 		render_trace.join_order = analyze(&render_trace.join_order_edges);
 	}
 	Ok((plan, trace, render_trace))
+}
+
+pub(crate) struct ExplainAnalyzeBinding {
+	pub(crate) plan: ExecutionPlan,
+	pub(crate) replay_ids: BTreeSet<JoinReplayId>,
+	trace: OptimizerTrace,
+	render_trace: OptimizerExplainRenderTrace,
+}
+
+pub(crate) async fn bind_explain_analyze(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Result<ExplainAnalyzeBinding, BindingError> {
+	let (plan, trace, render_trace) = bind_with_explain_trace(plan, catalog, config).await?;
+	let replay_ids = star_order_runtime_replay_ids(&render_trace)?;
+	Ok(ExplainAnalyzeBinding {
+		plan,
+		replay_ids,
+		trace,
+		render_trace,
+	})
+}
+
+pub(crate) fn render_explain_analyze(
+	binding: ExplainAnalyzeBinding,
+	observations: &[JoinRuntimeObservation],
+) -> Result<ExecutionPlan, BindingError> {
+	optimizer_analyze_plan(binding.trace, binding.render_trace, observations)
+}
+
+fn star_order_runtime_replay_ids(
+	render_trace: &OptimizerExplainRenderTrace,
+) -> Result<BTreeSet<JoinReplayId>, BindingError> {
+	if !matches!(
+		render_trace.join_order,
+		Some(StarOrderOutcome::Recognized(_))
+	) {
+		return Ok(BTreeSet::new());
+	}
+	render_trace
+		.join_order_edges
+		.iter()
+		.map(|edge| {
+			u32::try_from(edge.target.join_index)
+				.map(JoinReplayId)
+				.map_err(|_| BindingError::UnsupportedExpression {
+					message: "EXPLAIN ANALYZE join replay id exceeds u32".to_string(),
+				})
+		})
+		.collect()
 }
 
 struct Binder<'a> {
@@ -973,6 +1024,10 @@ impl<'a> Binder<'a> {
 					let plan = self.bind_explain(input).await?;
 					Ok(ScopedExecutionPlan::empty_scope(plan))
 				}
+				LogicalPlan::ExplainAnalyze { .. } => Err(BindingError::UnsupportedExpression {
+					message: "EXPLAIN ANALYZE must execute through the query coordinator"
+						.to_string(),
+				}),
 				LogicalPlan::CreateTable {
 					name,
 					schema,

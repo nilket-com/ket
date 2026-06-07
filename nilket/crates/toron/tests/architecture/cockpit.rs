@@ -199,7 +199,7 @@ pub(crate) fn adr174_no_runtime_storage_or_producer_surface() {
 pub(crate) fn adr174_cockpit_is_frontend_shared() {
 	let binder = binder_source();
 	let rune = source("src/rune_engine.rs");
-	let bind_explain = first_block(&binder, "async fn bind_explain");
+	let bind_explain = first_block(&binder, "async fn bind_explain(&self");
 	let rune_explain = first_block(&rune, "pub fn explain");
 
 	assert!(
@@ -216,7 +216,7 @@ pub(crate) fn adr175_render_trace_is_explain_only() {
 	let binder = binder_source();
 	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
 	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
-	let bind_explain = first_block(&binder, "async fn bind_explain");
+	let bind_explain = first_block(&binder, "async fn bind_explain(&self");
 
 	assert!(binder.contains("struct OptimizerExplainRenderTrace"));
 	assert!(binder.contains("struct ScanFilterRenderReceipt"));
@@ -331,7 +331,7 @@ pub(crate) fn adr175_no_table_name_reverse_lookup_claim() {
 pub(crate) fn adr175_cockpit_is_frontend_shared() {
 	let binder = binder_source();
 	let rune = source("src/rune_engine.rs");
-	let bind_explain = first_block(&binder, "async fn bind_explain");
+	let bind_explain = first_block(&binder, "async fn bind_explain(&self");
 	let rune_explain = first_block(&rune, "pub fn explain");
 
 	assert!(

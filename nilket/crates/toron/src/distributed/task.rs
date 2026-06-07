@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::distributed::budget::{ByteCount, TaskBudget};
@@ -6,7 +8,7 @@ use crate::distributed::identity::{
 	AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId, TaskIdentity, WorkerId,
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
-use crate::ir::{BoundExprProgram, ExecutionPlan, TableId};
+use crate::ir::{BoundExprProgram, ExecutionPlan, JoinReplayId, JoinStrategy, TableId};
 use crate::server::spill::SpillId;
 use wendelon::schema::{RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind};
 
@@ -78,6 +80,38 @@ pub struct TaskTelemetry {
 	pub labels: TaskTelemetryLabels,
 	pub counters: TaskTelemetryCounters,
 	pub phases: TaskTelemetryPhases,
+	pub join_observations: Vec<JoinRuntimeObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRuntimeObservation {
+	pub replay_id: JoinReplayId,
+	pub strategy: JoinStrategy,
+	pub build_rows: RowCount,
+	pub probe_rows: RowCount,
+	pub output_rows: RowCount,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinRuntimeObservationMode {
+	#[default]
+	Disabled,
+	MeasureJoins {
+		replay_ids: BTreeSet<JoinReplayId>,
+	},
+}
+
+impl JoinRuntimeObservationMode {
+	pub fn measures(&self, replay_id: JoinReplayId) -> bool {
+		match self {
+			Self::Disabled => false,
+			Self::MeasureJoins { replay_ids } => replay_ids.contains(&replay_id),
+		}
+	}
+
+	pub fn is_disabled(&self) -> bool {
+		matches!(self, Self::Disabled)
+	}
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +164,7 @@ pub struct TaskSpec {
 	pub identity: TaskIdentity,
 	pub partition: Option<PartitionId>,
 	pub context: TaskExecutionContext,
+	pub join_runtime_observation_mode: JoinRuntimeObservationMode,
 	pub plan: ExecutionPlan,
 	pub inputs: Vec<TaskInputBinding>,
 	pub output: TaskOutputBinding,

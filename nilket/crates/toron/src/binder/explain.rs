@@ -206,6 +206,149 @@ pub(super) fn optimizer_explain_plan(
 	)
 }
 
+pub(super) fn optimizer_analyze_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("target", DataType::Utf8, false),
+		Field::new("outcome", DataType::Utf8, false),
+		Field::new("detail", DataType::Utf8, true),
+		Field::new("estimated_rows", DataType::Int64, true),
+		Field::new("actual_rows", DataType::Int64, true),
+		Field::new("ratio", DataType::Float64, true),
+		Field::new("estimate_source", DataType::Utf8, true),
+		Field::new("build_rows", DataType::Int64, true),
+		Field::new("probe_rows", DataType::Int64, true),
+	]))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct JoinRuntimeObservationSummary {
+	build_rows: RowCount,
+	probe_rows: RowCount,
+	output_rows: RowCount,
+}
+
+pub(super) fn optimizer_analyze_plan(
+	_trace: OptimizerTrace,
+	render_trace: OptimizerExplainRenderTrace,
+	observations: &[JoinRuntimeObservation],
+) -> Result<ExecutionPlan, BindingError> {
+	let summaries = summarize_join_runtime_observations(observations);
+	let rows = optimizer_analyze_rows(&render_trace, &summaries)?;
+	system_table_plan(
+		SystemTableKind::OptimizerExplain,
+		optimizer_analyze_schema(),
+		rows,
+		None,
+	)
+}
+
+fn summarize_join_runtime_observations(
+	observations: &[JoinRuntimeObservation],
+) -> BTreeMap<JoinReplayId, JoinRuntimeObservationSummary> {
+	let mut summaries = BTreeMap::<JoinReplayId, JoinRuntimeObservationSummary>::new();
+	for observation in observations {
+		let summary = summaries.entry(observation.replay_id).or_default();
+		summary.build_rows = RowCount::new(
+			summary
+				.build_rows
+				.get()
+				.saturating_add(observation.build_rows.get()),
+		);
+		summary.probe_rows = RowCount::new(
+			summary
+				.probe_rows
+				.get()
+				.saturating_add(observation.probe_rows.get()),
+		);
+		summary.output_rows = RowCount::new(
+			summary
+				.output_rows
+				.get()
+				.saturating_add(observation.output_rows.get()),
+		);
+	}
+	summaries
+}
+
+fn optimizer_analyze_rows(
+	render_trace: &OptimizerExplainRenderTrace,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let Some(StarOrderOutcome::Recognized(evidence)) = render_trace.join_order.as_ref() else {
+		return Ok(Vec::new());
+	};
+	let dimensions = evidence
+		.dimensions
+		.iter()
+		.map(|dimension| (dimension.dimension.as_str(), dimension))
+		.collect::<BTreeMap<_, _>>();
+	render_trace
+		.join_order_edges
+		.iter()
+		.filter_map(|edge| {
+			let dimension = edge.dimension.as_deref()?;
+			let dimension = dimensions.get(dimension)?;
+			Some((edge, *dimension))
+		})
+		.map(|(edge, dimension)| optimizer_analyze_join_order_row(edge, dimension, summaries))
+		.collect()
+}
+
+fn optimizer_analyze_join_order_row(
+	edge: &JoinOrderEdgeEvidence,
+	dimension: &JoinOrderDimEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let replay_id = join_replay_id_for_trace_target(edge.target)?;
+	let observed_summary = summaries.get(&replay_id).copied();
+	let summary = observed_summary.unwrap_or_default();
+	let estimated_rows = dimension.estimated_rows;
+	let actual_rows = observed_summary.map(|summary| summary.output_rows);
+	let ratio = actual_rows.and_then(|actual| {
+		(estimated_rows.get() > 0).then_some(actual.get() as f64 / estimated_rows.get() as f64)
+	});
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_runtime".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"join[{}] dimension={}",
+			replay_id.0, dimension.dimension
+		))),
+		ScalarValue::Utf8(Some("measured".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"estimated={}; actual={}; ratio={}; source={}; build_rows={}; probe_rows={}",
+			estimated_rows.get(),
+			actual_rows.map(RowCount::get).unwrap_or(0),
+			ratio
+				.map(|value| format!("{value:.6}"))
+				.unwrap_or_else(|| "missing".to_string()),
+			join_order_estimate_source_label(dimension.estimate_source),
+			summary.build_rows.get(),
+			summary.probe_rows.get()
+		))),
+		ScalarValue::Int64(Some(row_count_to_i64(estimated_rows, "estimated_rows")?)),
+		ScalarValue::Int64(
+			actual_rows
+				.map(|rows| row_count_to_i64(rows, "actual_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Float64(ratio),
+		ScalarValue::Utf8(Some(
+			join_order_estimate_source_label(dimension.estimate_source).to_string(),
+		)),
+		ScalarValue::Int64(Some(row_count_to_i64(summary.build_rows, "build_rows")?)),
+		ScalarValue::Int64(Some(row_count_to_i64(summary.probe_rows, "probe_rows")?)),
+	])
+}
+
+fn join_replay_id_for_trace_target(target: JoinTraceTarget) -> Result<JoinReplayId, BindingError> {
+	u32::try_from(target.join_index)
+		.map(JoinReplayId)
+		.map_err(|_| BindingError::UnsupportedExpression {
+			message: "optimizer analyze join replay id exceeds u32".to_string(),
+		})
+}
+
 pub(super) fn optimizer_explain_row(
 	receipt: &DecisionReceipt,
 ) -> Result<Vec<ScalarValue>, BindingError> {

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use futures::{StreamExt, TryStreamExt};
 mod delete;
 mod write;
 
-use crate::binder::{PlannerConfig, bind};
+use crate::binder::{PlannerConfig, bind, bind_explain_analyze, render_explain_analyze};
 use crate::catalog::{Catalog, InvalidatedDescriptor};
 use crate::distributed::budget::{
 	AdmissionAttempt, AdmissionPolicy, AdmissionReservation, AdmissionResource, BudgetDimension,
@@ -27,12 +27,13 @@ use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use crate::distributed::identity::QueryId;
 use crate::distributed::scheduler::{DistributedScheduler, SchedulerError, StagePlan};
+use crate::distributed::task::{JoinRuntimeObservation, JoinRuntimeObservationMode, TaskTelemetry};
 use crate::distributed::task_state::TaskKey;
 use crate::distributed::worker_registry::WorkerRegistry;
 use crate::error::{
 	CatalogError, ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind,
 };
-use crate::exec::{ExecutionContext, Executor};
+use crate::exec::{ExecutionContext, Executor, materialize_scalar_rows};
 use crate::ir::{
 	BoundReturningProjection, BroadcastReplayEligibility, ColumnOrdinal, CreateTableRowIdentity,
 	ExecutionPlan, FilterDisposition, JoinReplayId, JoinStrategy, LogicalPlan, MorselId, TableId,
@@ -56,6 +57,11 @@ const DISTRIBUTED_RESULT_STREAM_DEPTH: usize = 16;
 
 type RemoteCancelSpawner =
 	Arc<dyn Fn(CancellationTrigger, Vec<RemoteTaskCancellation>) + Send + Sync>;
+
+struct DistributedAttemptOutput {
+	final_results: Vec<RecordBatch>,
+	task_telemetry: Vec<TaskTelemetry>,
+}
 
 pub(crate) async fn materialize_scan_stream(
 	stream: ScanStream,
@@ -711,6 +717,36 @@ where
 		})
 	}
 
+	async fn execute_explain_analyze_distributed(
+		&self,
+		catalog: &dyn Catalog,
+		input: &LogicalPlan,
+		context: &ExecutionContext,
+		query_budget: QueryBudget,
+		active_query: Option<ActiveQueryHandle>,
+		planner_config: &PlannerConfig,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		let binding = bind_explain_analyze(input, catalog, planner_config).await?;
+		let context = context
+			.clone()
+			.with_join_runtime_observation_mode(analyze_observation_mode(
+				binding.replay_ids.clone(),
+			));
+		let output = self
+			.execute_bound_distributed_attempt_with_telemetry(
+				binding.plan.clone(),
+				&context,
+				query_budget,
+				active_query,
+				0,
+			)
+			.await
+			.map_err(DistributedAttemptError::into_query_error)?;
+		let observations = join_observations_from_task_telemetry(&output.task_telemetry);
+		let analyze_plan = render_explain_analyze(binding, &observations)?;
+		materialize_system_table_plan(analyze_plan)
+	}
+
 	async fn execute_query_with_admission(
 		&self,
 		plan: &LogicalPlan,
@@ -719,6 +755,18 @@ where
 		active_query: Option<ActiveQueryHandle>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
+		if let LogicalPlan::ExplainAnalyze { input } = plan {
+			return self
+				.execute_explain_analyze_distributed(
+					catalog.as_ref(),
+					input,
+					&context,
+					query_budget,
+					active_query,
+					&self.config,
+				)
+				.await;
+		}
 		if matches!(
 			plan,
 			LogicalPlan::CreateTable { .. }
@@ -864,6 +912,18 @@ where
 		planner_config: PlannerConfig,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
+		if let LogicalPlan::ExplainAnalyze { input } = plan {
+			return self
+				.execute_explain_analyze_distributed(
+					catalog.as_ref(),
+					input,
+					&context,
+					query_budget,
+					active_query,
+					&planner_config,
+				)
+				.await;
+		}
 		if matches!(
 			plan,
 			LogicalPlan::CreateTable { .. }
@@ -1109,6 +1169,26 @@ where
 		active_query: Option<ActiveQueryHandle>,
 		fragment_id_namespace: u32,
 	) -> Result<Vec<RecordBatch>, DistributedAttemptError> {
+		Ok(self
+			.execute_bound_distributed_attempt_with_telemetry(
+				bound,
+				context,
+				query_budget,
+				active_query,
+				fragment_id_namespace,
+			)
+			.await?
+			.final_results)
+	}
+
+	async fn execute_bound_distributed_attempt_with_telemetry(
+		&self,
+		bound: ExecutionPlan,
+		context: &ExecutionContext,
+		query_budget: QueryBudget,
+		active_query: Option<ActiveQueryHandle>,
+		fragment_id_namespace: u32,
+	) -> Result<DistributedAttemptOutput, DistributedAttemptError> {
 		let stages = fragment_plan(
 			bound,
 			self.fragment_config(context, query_budget)
@@ -1132,7 +1212,10 @@ where
 				return Err(DistributedAttemptError::Scheduler { error, stages });
 			}
 		};
-		Ok(run.final_results)
+		Ok(DistributedAttemptOutput {
+			final_results: run.final_results,
+			task_telemetry: run.telemetry.task_telemetry,
+		})
 	}
 
 	fn spawn_remote_cancel_fanout(
@@ -1162,6 +1245,7 @@ where
 			TaskBudget::from_query_budget(query_budget),
 		)
 		.with_task_context(TaskExecutionContext::from_execution_context(context))
+		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
 	}
 }
 
@@ -1201,6 +1285,7 @@ where
 				TaskBudget::from_query_budget(query_budget),
 			)
 			.with_task_context(TaskExecutionContext::from_execution_context(&context))
+			.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
 			.with_id_namespace(fragment_id_namespace),
 		)
 		.map_err(fragment_error)?;
@@ -1344,7 +1429,41 @@ fn logical_plan_is_distributed_read(plan: &LogicalPlan) -> bool {
 			| LogicalPlan::CreateTableAsSelect { .. }
 			| LogicalPlan::Delete { .. }
 			| LogicalPlan::Update { .. }
+			| LogicalPlan::ExplainAnalyze { .. }
 	)
+}
+
+fn analyze_observation_mode(replay_ids: BTreeSet<JoinReplayId>) -> JoinRuntimeObservationMode {
+	JoinRuntimeObservationMode::MeasureJoins { replay_ids }
+}
+
+fn join_observations_from_task_telemetry(
+	task_telemetry: &[TaskTelemetry],
+) -> Vec<JoinRuntimeObservation> {
+	task_telemetry
+		.iter()
+		.flat_map(|telemetry| telemetry.join_observations.iter().cloned())
+		.collect()
+}
+
+fn join_observations_from_local_telemetry(
+	telemetry: &Arc<Mutex<TaskTelemetry>>,
+) -> Vec<JoinRuntimeObservation> {
+	telemetry
+		.lock()
+		.map(|telemetry| telemetry.join_observations.clone())
+		.unwrap_or_default()
+}
+
+fn materialize_system_table_plan(plan: ExecutionPlan) -> Result<Vec<RecordBatch>, QueryError> {
+	let ExecutionPlan::SystemTable { schema, rows, .. } = plan else {
+		return Err(QueryError::Internal {
+			message: format!("expected EXPLAIN ANALYZE system table, got {plan:?}"),
+		});
+	};
+	Ok(vec![
+		materialize_scalar_rows(&schema, &rows).map_err(QueryError::Execution)?,
+	])
 }
 
 pub(crate) fn broadcast_cap_replay_trigger(
@@ -2196,6 +2315,11 @@ impl QueryCoordinator {
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let catalog = Arc::clone(&self.catalog).scoped(self.executor.context().tenant_id);
+		if let LogicalPlan::ExplainAnalyze { input } = plan {
+			return self
+				.execute_explain_analyze(catalog.as_ref(), input, morsel)
+				.await;
+		}
 		if matches!(
 			plan,
 			LogicalPlan::CreateTable { .. }
@@ -2275,6 +2399,32 @@ impl QueryCoordinator {
 			invalidate_descriptor_evolution_on_error(catalog, error).await?;
 		}
 		result
+	}
+
+	async fn execute_explain_analyze(
+		&self,
+		catalog: &dyn Catalog,
+		input: &LogicalPlan,
+		morsel: Option<(MorselId, u32)>,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		let binding = bind_explain_analyze(input, catalog, &self.config).await?;
+		let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+		let context = self
+			.executor
+			.context()
+			.clone()
+			.with_task_telemetry(telemetry.clone())
+			.with_join_runtime_observation_mode(analyze_observation_mode(
+				binding.replay_ids.clone(),
+			));
+		let executor = Executor::with_context(self.executor.storage_arc(), context);
+		let _results = executor
+			.execute_bound(&binding.plan, morsel)
+			.await
+			.map_err(QueryError::Execution)?;
+		let observations = join_observations_from_local_telemetry(&telemetry);
+		let analyze_plan = render_explain_analyze(binding, &observations)?;
+		materialize_system_table_plan(analyze_plan)
 	}
 }
 

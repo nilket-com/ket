@@ -1893,7 +1893,7 @@ mod tests {
 			query_id,
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		);
-		let stages0 = fragment_plan(bound.clone(), config).expect("fragment attempt 0");
+		let stages0 = fragment_plan(bound.clone(), config.clone()).expect("fragment attempt 0");
 		let stages1 = fragment_plan(bound, config.with_id_namespace(1)).expect("fragment replay");
 
 		assert!(
@@ -4997,6 +4997,8 @@ mod tests {
 			),
 			partition: None,
 			context: crate::distributed::context::TaskExecutionContext::local_test(),
+			join_runtime_observation_mode:
+				crate::distributed::task::JoinRuntimeObservationMode::Disabled,
 			plan,
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,

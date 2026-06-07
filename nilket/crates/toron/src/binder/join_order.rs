@@ -164,6 +164,7 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Sort { input, .. }
 		| LogicalPlan::Take { input, .. }
 		| LogicalPlan::Explain { input }
+		| LogicalPlan::ExplainAnalyze { input }
 		| LogicalPlan::CreateTableAsSelect { source: input, .. }
 		| LogicalPlan::InsertSelect { source: input, .. } => logical_plan_contains_join(input),
 		LogicalPlan::Scan { .. }

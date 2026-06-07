@@ -411,7 +411,7 @@ pub(crate) fn adr134_sql_lowers_explain_to_logical_node() {
 	assert!(lower_statement.contains("self.lower_explain_statement"));
 	assert!(lower_explain.contains("Statement::Query(query)"));
 	assert!(lower_explain.contains("LogicalPlan::Explain"));
-	assert!(lower_explain.contains("input: Box::new(self.lower_query(query)?)"));
+	assert!(lower_explain.contains("let input = Box::new(self.lower_query(query)?);"));
 	assert!(!lower_explain.contains("bind_with_trace"));
 	assert!(!lower_explain.contains("OptimizerTrace"));
 }
@@ -433,7 +433,7 @@ pub(crate) fn adr134_rune_dataframe_explain_wraps_logical_node() {
 pub(crate) fn adr134_explain_binds_via_bind_with_trace_not_execute() {
 	let binder = binder_source();
 	let bind_plan = source_block(&binder, "fn bind_plan_with_trace");
-	let bind_explain = source_block(&binder, "async fn bind_explain");
+	let bind_explain = source_block(&binder, "async fn bind_explain(&self");
 
 	assert!(bind_plan.contains("LogicalPlan::Explain { input }"));
 	assert!(bind_plan.contains("self.bind_explain(input).await?"));
@@ -471,7 +471,6 @@ pub(crate) fn adr134_sql_explain_accepts_only_default_query_form() {
 
 	for required in [
 		"describe_alias != DescribeAlias::Explain",
-		"EXPLAIN ANALYZE is not supported",
 		"EXPLAIN VERBOSE is not supported",
 		"EXPLAIN QUERY PLAN is not supported",
 		"EXPLAIN ESTIMATE is not supported",
@@ -486,6 +485,7 @@ pub(crate) fn adr134_sql_explain_accepts_only_default_query_form() {
 			"EXPLAIN default-only guard missing {required}"
 		);
 	}
+	assert!(lower_explain.contains("LogicalPlan::ExplainAnalyze"));
 }
 
 #[test]
@@ -551,12 +551,8 @@ pub(crate) fn adr134_join_trace_target_remains_index_only() {
 #[test]
 pub(crate) fn adr134_explain_is_join_decision_only_not_plan_tree_or_analyze() {
 	let binder = binder_source();
-	let planner = planner_source();
 	let schema = source_block(&binder, "fn optimizer_explain_schema");
-	let lower_explain = source_block(&planner, "fn lower_explain_statement");
 
-	assert!(lower_explain.contains("EXPLAIN ANALYZE is not supported"));
-	assert!(lower_explain.contains("EXPLAIN QUERY PLAN is not supported"));
 	for forbidden in [
 		"operator",
 		"node",

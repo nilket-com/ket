@@ -163,9 +163,26 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 		.filter_map(|line| line.get(3..))
 		.map(|path| path.split(" -> ").last().unwrap_or(path))
 		.filter(|path| {
+			let adr179_runtime_evidence_surface = [
+				"crates/toron/src/audit.rs",
+				"crates/toron/src/coordinator.rs",
+				"crates/toron/src/distributed/fragment.rs",
+				"crates/toron/src/distributed/scheduler.rs",
+				"crates/toron/src/distributed/task.rs",
+				"crates/toron/src/exec.rs",
+				"crates/toron/src/ir.rs",
+				"crates/toron/src/lib.rs",
+				"crates/toron/src/rune_engine.rs",
+				"crates/toron/src/server/mod.rs",
+				"crates/toron/src/sql_planner.rs",
+				"crates/toron/tests/explain_analyze_test.rs",
+				"crates/toron/tests/hash_join_kinds_test.rs",
+				"crates/toron/tests/rune_relation_handles_test.rs",
+			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")
 				&& !path.starts_with("crates/toron/tests/architecture/")
+				&& !adr179_runtime_evidence_surface.contains(path)
 		})
 		.map(ToOwned::to_owned)
 		.collect::<Vec<_>>();

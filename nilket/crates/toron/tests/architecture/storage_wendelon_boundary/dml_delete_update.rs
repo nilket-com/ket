@@ -421,9 +421,10 @@ pub(crate) fn adr032_logical_plan_retains_insert_select_variant() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 19);
+	assert_eq!(enum_variant_count(logical_plan), 20);
 	assert!(logical_plan.contains("InsertSelect {"));
 	assert!(logical_plan.contains("Explain {"));
+	assert!(logical_plan.contains("ExplainAnalyze {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));
 	assert!(logical_plan.contains("DropTable {"));
 	assert!(logical_plan.contains("Update {"));
@@ -918,9 +919,10 @@ pub(crate) fn adr036_logical_variant_count_is_15() {
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 
-	assert_eq!(enum_variant_count(logical_plan), 19);
+	assert_eq!(enum_variant_count(logical_plan), 20);
 	assert!(logical_plan.contains("Delete {"));
 	assert!(logical_plan.contains("Explain {"));
+	assert!(logical_plan.contains("ExplainAnalyze {"));
 	assert!(logical_plan.contains("CreateLogicalType {"));
 	assert!(logical_plan.contains("Update {"));
 	assert!(logical_plan.contains("table: TableRef,"));

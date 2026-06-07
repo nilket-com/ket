@@ -307,7 +307,8 @@ impl StatementClass {
 			| LogicalPlan::Sort { .. }
 			| LogicalPlan::Take { .. }
 			| LogicalPlan::Join { .. }
-			| LogicalPlan::Explain { .. } => Self::Select,
+			| LogicalPlan::Explain { .. }
+			| LogicalPlan::ExplainAnalyze { .. } => Self::Select,
 		}
 	}
 

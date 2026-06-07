@@ -9,8 +9,8 @@ use crate::distributed::identity::{
 };
 use crate::distributed::scheduler::{StagePlan, TaskPlan};
 use crate::distributed::task::{
-	PartitionCount, ScanShare, TaskInputBinding, TaskOutputBinding, TaskSpec,
-	shuffle_input_table_id,
+	JoinRuntimeObservationMode, PartitionCount, ScanShare, TaskInputBinding, TaskOutputBinding,
+	TaskSpec, shuffle_input_table_id,
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
@@ -18,44 +18,51 @@ use crate::ir::{
 	FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, QueryProfileHint,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentPlanConfig {
 	pub query_id: QueryId,
 	pub task_context: TaskExecutionContext,
 	pub task_budget: TaskBudget,
 	pub worker_count: u32,
 	pub runtime_filters_enabled: bool,
+	pub join_runtime_observation_mode: JoinRuntimeObservationMode,
 	pub id_namespace: u32,
 }
 
 impl FragmentPlanConfig {
-	pub const fn new(query_id: QueryId, task_budget: TaskBudget) -> Self {
+	pub fn new(query_id: QueryId, task_budget: TaskBudget) -> Self {
 		Self {
 			query_id,
 			task_context: TaskExecutionContext::local_test(),
 			task_budget,
 			worker_count: 1,
 			runtime_filters_enabled: true,
+			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			id_namespace: 0,
 		}
 	}
 
-	pub const fn with_task_context(mut self, task_context: TaskExecutionContext) -> Self {
+	pub fn with_task_context(mut self, task_context: TaskExecutionContext) -> Self {
 		self.task_context = task_context;
 		self
 	}
 
-	pub const fn with_worker_count(mut self, worker_count: u32) -> Self {
+	pub fn with_worker_count(mut self, worker_count: u32) -> Self {
 		self.worker_count = worker_count;
 		self
 	}
 
-	pub const fn with_runtime_filters_enabled(mut self, enabled: bool) -> Self {
+	pub fn with_runtime_filters_enabled(mut self, enabled: bool) -> Self {
 		self.runtime_filters_enabled = enabled;
 		self
 	}
 
-	pub const fn with_id_namespace(mut self, id_namespace: u32) -> Self {
+	pub fn with_join_runtime_observation_mode(mut self, mode: JoinRuntimeObservationMode) -> Self {
+		self.join_runtime_observation_mode = mode;
+		self
+	}
+
+	pub fn with_id_namespace(mut self, id_namespace: u32) -> Self {
 		self.id_namespace = id_namespace;
 		self
 	}
@@ -241,7 +248,7 @@ fn fragment_execution_plan(
 				partition_key: BoundExprProgram::empty(),
 			},
 			allocator,
-			config,
+			config.clone(),
 		)?;
 		let sort_stage_id = allocator.alloc_stage();
 		stages.push(global_sort_barrier_stage(
@@ -303,6 +310,7 @@ fn fragment_base_plan(
 		),
 		partition: None,
 		context: config.task_context,
+		join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
 		plan: ExecutionPlan::Exchange {
 			input: Box::new(boundary.input),
 			partition_count: boundary.partition_count,
@@ -333,6 +341,7 @@ fn fragment_base_plan(
 				),
 				partition: Some(partition_id),
 				context: config.task_context,
+				join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
 				plan: consumer_plan.clone(),
 				inputs: vec![TaskInputBinding::ShuffleConsumer {
 					exchange_id,
@@ -441,6 +450,7 @@ fn fragment_hash_join_plan(
 				),
 				partition: Some(partition_id),
 				context: config.task_context,
+				join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
 				plan: consumer_plan.clone(),
 				inputs: vec![
 					TaskInputBinding::ShuffleConsumer {
@@ -468,7 +478,7 @@ fn fragment_hash_join_plan(
 			stage_id: left_stage_id,
 			upstream_stages: vec![],
 			tasks: vec![producer_task(
-				config,
+				config.clone(),
 				left_stage_id,
 				left_exchange_id,
 				left_boundary,
@@ -482,7 +492,7 @@ fn fragment_hash_join_plan(
 				vec![]
 			},
 			tasks: vec![producer_task(
-				config,
+				config.clone(),
 				right_stage_id,
 				right_exchange_id,
 				right_boundary,
@@ -548,6 +558,7 @@ fn fragment_broadcast_join_plan(
 				),
 				partition: None,
 				context: config.task_context,
+				join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
 				plan: consumer_plan.clone(),
 				inputs,
 				output: consumer_output.clone(),
@@ -565,7 +576,7 @@ fn fragment_broadcast_join_plan(
 			stage_id: build.stage_id,
 			upstream_stages: vec![],
 			tasks: vec![producer_task(
-				config,
+				config.clone(),
 				build.stage_id,
 				build.exchange_id,
 				build.boundary,
@@ -696,6 +707,7 @@ fn producer_task(
 		),
 		partition: None,
 		context: config.task_context,
+		join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
 		plan: ExecutionPlan::Exchange {
 			input: Box::new(boundary.input),
 			partition_count: boundary.partition_count,
@@ -734,6 +746,7 @@ fn single_task_stage(
 			),
 			partition: None,
 			context: config.task_context,
+			join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
 			plan,
 			inputs: vec![TaskInputBinding::Scan {
 				share: None,
@@ -920,6 +933,7 @@ fn global_sort_barrier_stage(
 			),
 			partition: Some(PartitionId::new(0)),
 			context: config.task_context,
+			join_runtime_observation_mode: config.join_runtime_observation_mode.clone(),
 			plan,
 			inputs: vec![TaskInputBinding::ShuffleConsumer {
 				exchange_id,

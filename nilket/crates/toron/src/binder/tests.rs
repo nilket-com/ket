@@ -9056,6 +9056,15 @@ fn ctx_sql_explain_is_read_only_relation() {
 }
 
 #[test]
+fn ctx_sql_explain_analyze_is_read_only_relation() {
+	let logical = SqlPlanner::new()
+		.plan_relation("EXPLAIN ANALYZE SELECT * FROM orders")
+		.expect("ctx.sql accepts read-only EXPLAIN ANALYZE");
+
+	assert!(matches!(logical, LogicalPlan::ExplainAnalyze { .. }));
+}
+
+#[test]
 fn ctx_sql_explain_rejects_mutation_explain() {
 	let error = SqlPlanner::new()
 		.plan_relation("EXPLAIN INSERT INTO orders (id, customer_id) VALUES (1, 2)")
@@ -9075,7 +9084,6 @@ fn sql_explain_accepts_only_default_query_form() {
 	for sql in [
 		"DESC SELECT * FROM orders",
 		"DESCRIBE SELECT * FROM orders",
-		"EXPLAIN ANALYZE SELECT * FROM orders",
 		"EXPLAIN VERBOSE SELECT * FROM orders",
 		"EXPLAIN QUERY PLAN SELECT * FROM orders",
 		"EXPLAIN ESTIMATE SELECT * FROM orders",
@@ -9088,6 +9096,10 @@ fn sql_explain_accepts_only_default_query_form() {
 		assert!(planner.plan(sql).is_err(), "{sql} must be rejected");
 	}
 	assert!(planner.plan("EXPLAIN SELECT * FROM orders").is_ok());
+	assert!(matches!(
+		planner.plan("EXPLAIN ANALYZE SELECT * FROM orders"),
+		Ok(LogicalPlan::ExplainAnalyze { .. })
+	));
 }
 
 #[test]
