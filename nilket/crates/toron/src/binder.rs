@@ -1718,6 +1718,14 @@ impl<'a> Binder<'a> {
 			);
 			return Ok(None);
 		};
+		if !broadcast_probe_is_scan_linear(&probe_plan.plan) {
+			self.record_star_order_decline(
+				render_trace,
+				StarOrderDeclineReason::ProbeNotScanLinear,
+				candidate.dimensions.len(),
+			);
+			return Ok(None);
+		}
 
 		let mut dimensions = Vec::with_capacity(candidate.dimensions.len());
 		let mut seen_dimensions = BTreeSet::new();
@@ -1834,6 +1842,7 @@ impl<'a> Binder<'a> {
 			probe_label.clone(),
 			evidence_dimensions.clone(),
 			None,
+			StarOrderStrategy::Broadcast,
 			confidence,
 		);
 		let StarOrderOutcome::Recognized(evidence) = &recognized else {
@@ -1856,32 +1865,46 @@ impl<'a> Binder<'a> {
 		let selected_indices = if evidence.action == StarOrderAction::Reordered {
 			preferred_indices
 		} else {
-			declared_indices
+			declared_indices.clone()
 		};
 
-		let mut preflight_trace = trace.clone();
-		let preflight_join_start = preflight_trace.join_decisions.len();
-		let mut no_render_trace = None;
-		let _ = self.bind_star_order_sequence(
+		let Some(declared_strategy) = self.preflight_star_order_strategy(
+			probe_plan.clone(),
+			&dimensions,
+			&declared_indices,
+			trace,
+		)?
+		else {
+			self.record_star_order_decline(
+				render_trace,
+				StarOrderDeclineReason::MixedStrategyStar,
+				candidate.dimensions.len(),
+			);
+			return Ok(None);
+		};
+		let Some(selected_strategy) = self.preflight_star_order_strategy(
 			probe_plan.clone(),
 			&dimensions,
 			&selected_indices,
-			&mut preflight_trace,
-			&mut no_render_trace,
-		)?;
-		let preflight_decisions = &preflight_trace.join_decisions[preflight_join_start..];
-		if preflight_decisions.len() != selected_indices.len()
-			|| preflight_decisions.iter().any(|decision| {
-				decision.strategy != JoinStrategy::Broadcast
-					|| decision.placement != JoinPhysicalPlacement::SwappedRightBuild
-			}) {
+			trace,
+		)?
+		else {
 			self.record_star_order_decline(
 				render_trace,
-				StarOrderDeclineReason::NotBroadcastStar,
+				StarOrderDeclineReason::MixedStrategyStar,
+				candidate.dimensions.len(),
+			);
+			return Ok(None);
+		};
+		if declared_strategy != selected_strategy {
+			self.record_star_order_decline(
+				render_trace,
+				StarOrderDeclineReason::MixedStrategyStar,
 				candidate.dimensions.len(),
 			);
 			return Ok(None);
 		}
+		let star_order_strategy = selected_strategy;
 
 		let real_probe_plan = self
 			.bind_plan_with_trace(
@@ -1961,10 +1984,35 @@ impl<'a> Binder<'a> {
 				probe_label,
 				evidence_dimensions,
 				Some(applied_order),
+				star_order_strategy,
 				confidence,
 			));
 		}
 		Ok(Some(output))
+	}
+
+	fn preflight_star_order_strategy<'b>(
+		&self,
+		probe_plan: ScopedExecutionPlan,
+		dimensions: &[BoundStarDimension<'b>],
+		order: &[usize],
+		base_trace: &OptimizerTrace,
+	) -> Result<Option<StarOrderStrategy>, BindingError> {
+		let mut preflight_trace = base_trace.clone();
+		let preflight_join_start = preflight_trace.join_decisions.len();
+		let mut no_render_trace = None;
+		let _ = self.bind_star_order_sequence(
+			probe_plan,
+			dimensions,
+			order,
+			&mut preflight_trace,
+			&mut no_render_trace,
+		)?;
+		let preflight_decisions = &preflight_trace.join_decisions[preflight_join_start..];
+		if preflight_decisions.len() != order.len() {
+			return Ok(None);
+		}
+		Ok(uniform_star_order_strategy(preflight_decisions))
 	}
 
 	fn bind_star_order_sequence<'b>(

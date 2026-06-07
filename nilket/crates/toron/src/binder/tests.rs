@@ -4,9 +4,11 @@ use crate::catalog::{
 	DescriptorOptimizerFacts, MockCatalog, RangeDistributionBucket, RangeFact, WendelonCatalog,
 };
 use crate::distributed::arrow_ipc::encode_record_batch;
-use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, TableId};
+use crate::distributed::identity::QueryId;
+use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, SessionId, TableId};
 use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 use crate::sql_planner::SqlPlanner;
+use crate::storage::{InMemoryTableStorage, StorageWrite, TenantId, WriteRequest};
 use arrow::array::{
 	ArrayRef, BinaryArray, Date32Array, DurationNanosecondArray, Int32Array, Int64Array,
 	LargeStringArray, StringArray, TimestampMillisecondArray,
@@ -8572,9 +8574,145 @@ async fn star_order_actuation_reorders_non_optimal_broadcast_star() {
 		render_trace.join_order,
 		Some(StarOrderOutcome::Recognized(StarOrderEvidence {
 			action: StarOrderAction::Reordered,
+			strategy: StarOrderStrategy::Broadcast,
 			..
 		}))
 	));
+}
+
+#[tokio::test]
+async fn uniform_hash_star_reorders_on_robust_win() {
+	let catalog = hash_star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
+		.expect("plan non-optimal hash star EXPLAIN");
+
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &auto_broadcast_config(1)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(row[0], ScalarValue::Utf8(Some("join_order".to_string())));
+	assert_eq!(row[2], ScalarValue::Utf8(Some("reordered".to_string())));
+	assert_utf8_contains(&row[3], "strategy=hash_partitioned");
+	assert_utf8_contains(&row[3], "declared_order=[c,p,s]");
+	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
+	assert_utf8_contains(&row[3], "applied_order=[s,p,c]");
+}
+
+#[tokio::test]
+async fn hash_star_reorder_preserves_hash_strategy() {
+	let catalog = hash_star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal hash star");
+
+	let (plan, trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(1))
+			.await
+			.expect("bind hash star with trace");
+
+	assert_eq!(trace.join_decisions.len(), 3);
+	assert!(trace.join_decisions.iter().all(|receipt| {
+		receipt.strategy == JoinStrategy::HashPartitioned
+			&& receipt.placement == JoinPhysicalPlacement::Natural
+	}));
+	assert_join_strategy_count(&plan, JoinStrategy::HashPartitioned, 3);
+	assert!(matches!(
+		render_trace.join_order,
+		Some(StarOrderOutcome::Recognized(StarOrderEvidence {
+			action: StarOrderAction::Reordered,
+			strategy: StarOrderStrategy::HashPartitioned,
+			..
+		}))
+	));
+}
+
+#[tokio::test]
+async fn hash_star_reorder_is_results_identical() {
+	let (catalog, storage) = star_order_execution_fixture().await;
+	let config = auto_broadcast_config(1);
+	let (reordered_schema, reordered_rows) = execute_star_order_query(
+		&catalog,
+		storage.clone(),
+		non_optimal_star_order_project_sql(),
+		&config,
+	)
+	.await;
+	let (declared_schema, declared_rows) = execute_star_order_query(
+		&catalog,
+		storage,
+		preferred_star_order_project_sql(),
+		&config,
+	)
+	.await;
+
+	assert_eq!(
+		schema_signature(&reordered_schema),
+		schema_signature(&declared_schema)
+	);
+	assert_eq!(reordered_rows, declared_rows);
+}
+
+#[tokio::test]
+async fn mixed_strategy_star_declines() {
+	let catalog = mixed_strategy_star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
+		.expect("plan mixed strategy star EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(
+		row[2],
+		ScalarValue::Utf8(Some("declined_mixed_strategy_star".to_string()))
+	);
+	assert_utf8_contains(&row[3], "reason=mixed_strategy_star");
+}
+
+#[tokio::test]
+async fn declared_and_selected_preflights_share_uniform_strategy() {
+	let catalog = mixed_strategy_star_join_order_catalog();
+	let non_optimal = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
+		.expect("plan mixed declared star EXPLAIN");
+	let preferred = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", preferred_star_order_sql()))
+		.expect("plan hash preferred star EXPLAIN");
+
+	let (_schema, non_optimal_rows) =
+		bind_explain_rows(&non_optimal, &catalog, &auto_broadcast_config(4_096)).await;
+	let (_schema, preferred_rows) =
+		bind_explain_rows(&preferred, &catalog, &auto_broadcast_config(4_096)).await;
+	let non_optimal_row = join_order_row(&non_optimal_rows);
+	let preferred_row = join_order_row(&preferred_rows);
+
+	assert_eq!(
+		non_optimal_row[2],
+		ScalarValue::Utf8(Some("declined_mixed_strategy_star".to_string()))
+	);
+	assert_eq!(
+		preferred_row[2],
+		ScalarValue::Utf8(Some("kept_already_optimal".to_string()))
+	);
+	assert_utf8_contains(&preferred_row[3], "strategy=hash_partitioned");
+	assert_utf8_contains(&preferred_row[3], "declared_order=[s,p,c]");
+}
+
+#[tokio::test]
+async fn broadcast_star_order_unchanged_from_178() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
+		.expect("plan non-optimal broadcast star EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(row[2], ScalarValue::Utf8(Some("reordered".to_string())));
+	assert_utf8_contains(&row[3], "strategy=broadcast");
+	assert_utf8_contains(&row[3], "applied_order=[s,p,c]");
 }
 
 #[tokio::test]
@@ -8813,6 +8951,7 @@ fn verdict_indeterminate_on_missing_actuals() {
 			},
 		],
 		Some(vec!["p".to_string(), "c".to_string()]),
+		StarOrderStrategy::Broadcast,
 		JoinOrderEstimateConfidence::Hard,
 	);
 	let StarOrderOutcome::Recognized(evidence) = evidence else {
@@ -10907,6 +11046,228 @@ fn star_join_order_catalog() -> MockCatalog {
 	catalog
 }
 
+fn hash_star_join_order_catalog() -> MockCatalog {
+	let mut catalog = star_join_order_catalog();
+	seed_star_join_order_facts_with_bytes(&mut catalog, 8_192, 8_192, 8_192);
+	catalog
+}
+
+fn mixed_strategy_star_join_order_catalog() -> MockCatalog {
+	let mut catalog = star_join_order_catalog();
+	seed_star_join_order_facts_with_bytes(&mut catalog, 1_024, 8_192, 8_192);
+	catalog
+}
+
+fn seed_star_join_order_facts_with_bytes(
+	catalog: &mut MockCatalog,
+	customer_bytes: u64,
+	product_bytes: u64,
+	store_bytes: u64,
+) {
+	seed_table_optimizer_facts(
+		catalog,
+		"orders",
+		Some(64 * 1024 * 1024),
+		Some(100_000),
+		vec![
+			(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(3), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"customers",
+		Some(customer_bytes),
+		Some(5_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"products",
+		Some(product_bytes),
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		catalog,
+		"stores",
+		Some(store_bytes),
+		Some(100),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+}
+
+async fn star_order_execution_fixture() -> (MockCatalog, Arc<InMemoryTableStorage>) {
+	let catalog = hash_star_join_order_catalog();
+	let storage = Arc::new(InMemoryTableStorage::new());
+	for (table_id, descriptor, batch) in star_order_storage_batches() {
+		write_star_order_table(storage.as_ref(), table_id, &descriptor, batch).await;
+	}
+	(catalog, storage)
+}
+
+fn star_order_storage_batches() -> Vec<(TableId, TableSchemaDescriptor, RecordBatch)> {
+	let orders = named_descriptor(
+		21,
+		"orders",
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+			Field::new("product_id", DataType::Int64, false),
+			Field::new("store_id", DataType::Int64, false),
+		]),
+	);
+	let customers = named_descriptor(
+		22,
+		"customers",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	let products = named_descriptor(
+		23,
+		"products",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	let stores = named_descriptor(
+		24,
+		"stores",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	vec![
+		(
+			TableId(21),
+			orders.clone(),
+			record_batch_i64(
+				orders.arrow_schema().expect("orders schema").into(),
+				vec![
+					vec![1, 2, 3, 4],
+					vec![10, 20, 10, 30],
+					vec![100, 100, 200, 300],
+					vec![1000, 2000, 1000, 3000],
+				],
+			),
+		),
+		(
+			TableId(22),
+			customers.clone(),
+			record_batch_i64(
+				customers.arrow_schema().expect("customers schema").into(),
+				vec![vec![10, 20, 30]],
+			),
+		),
+		(
+			TableId(23),
+			products.clone(),
+			record_batch_i64(
+				products.arrow_schema().expect("products schema").into(),
+				vec![vec![100, 200, 300]],
+			),
+		),
+		(
+			TableId(24),
+			stores.clone(),
+			record_batch_i64(
+				stores.arrow_schema().expect("stores schema").into(),
+				vec![vec![1000, 2000, 3000]],
+			),
+		),
+	]
+}
+
+fn record_batch_i64(schema: SchemaRef, columns: Vec<Vec<i64>>) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		columns
+			.into_iter()
+			.map(|values| Arc::new(Int64Array::from(values)) as ArrayRef)
+			.collect(),
+	)
+	.expect("record batch")
+}
+
+async fn write_star_order_table(
+	storage: &InMemoryTableStorage,
+	table_id: TableId,
+	descriptor: &TableSchemaDescriptor,
+	payload: RecordBatch,
+) {
+	storage
+		.write(WriteRequest {
+			session_id: SessionId(181),
+			query_id: QueryId::from_u128(181),
+			tenant_id: TenantId(1),
+			table_id,
+			table_object_id: descriptor.table_object_id,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			payload,
+			profile_hint: Some(QueryProfileHint::Scan),
+			trace_context: None,
+		})
+		.await
+		.expect("write star order fixture");
+}
+
+async fn execute_star_order_query(
+	catalog: &MockCatalog,
+	storage: Arc<InMemoryTableStorage>,
+	sql: &str,
+	config: &PlannerConfig,
+) -> (SchemaRef, Vec<Vec<Option<i64>>>) {
+	let logical = SqlPlanner::new().plan(sql).expect("plan star order SQL");
+	let bound = Binder { catalog, config }
+		.bind_plan(&logical)
+		.await
+		.expect("bind star order SQL");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound.plan, None)
+		.await
+		.expect("execute star order SQL");
+	let schema = batches
+		.first()
+		.map(RecordBatch::schema)
+		.unwrap_or_else(|| bound.plan.schema());
+	(schema, normalized_i64_rows(&batches))
+}
+
+fn normalized_i64_rows(batches: &[RecordBatch]) -> Vec<Vec<Option<i64>>> {
+	let mut rows = Vec::new();
+	for batch in batches {
+		let columns = (0..batch.num_columns())
+			.map(|idx| {
+				batch
+					.column(idx)
+					.as_any()
+					.downcast_ref::<Int64Array>()
+					.unwrap_or_else(|| panic!("expected Int64 column {idx}"))
+			})
+			.collect::<Vec<_>>();
+		for row_idx in 0..batch.num_rows() {
+			rows.push(
+				columns
+					.iter()
+					.map(|column| {
+						if column.is_null(row_idx) {
+							None
+						} else {
+							Some(column.value(row_idx))
+						}
+					})
+					.collect::<Vec<_>>(),
+			);
+		}
+	}
+	rows.sort();
+	rows
+}
+
+fn schema_signature(schema: &SchemaRef) -> Vec<(String, DataType)> {
+	schema
+		.fields()
+		.iter()
+		.map(|field| (field.name().clone(), field.data_type().clone()))
+		.collect()
+}
+
 fn seed_soft_star_join_order_facts(
 	catalog: &mut MockCatalog,
 	customer_rows: u64,
@@ -10968,6 +11329,27 @@ fn non_optimal_star_order_sql() -> String {
 	 INNER JOIN products p ON o.product_id = p.id \
 	 INNER JOIN stores s ON o.store_id = s.id"
 		.to_string()
+}
+
+fn non_optimal_star_order_project_sql() -> &'static str {
+	"SELECT o.id, c.id, p.id, s.id FROM orders o \
+	 INNER JOIN customers c ON o.customer_id = c.id \
+	 INNER JOIN products p ON o.product_id = p.id \
+	 INNER JOIN stores s ON o.store_id = s.id"
+}
+
+fn preferred_star_order_sql() -> &'static str {
+	"SELECT * FROM orders o \
+	 INNER JOIN stores s ON o.store_id = s.id \
+	 INNER JOIN products p ON o.product_id = p.id \
+	 INNER JOIN customers c ON o.customer_id = c.id"
+}
+
+fn preferred_star_order_project_sql() -> &'static str {
+	"SELECT o.id, c.id, p.id, s.id FROM orders o \
+	 INNER JOIN stores s ON o.store_id = s.id \
+	 INNER JOIN products p ON o.product_id = p.id \
+	 INNER JOIN customers c ON o.customer_id = c.id"
 }
 
 fn join_cardinality_catalog() -> MockCatalog {

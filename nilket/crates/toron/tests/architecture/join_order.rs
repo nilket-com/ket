@@ -90,8 +90,9 @@ pub(crate) fn adr178_broadcast_star_only_respects_scan_linear_probe_fence() {
 		)
 	);
 	assert!(bind_scoped_join.contains("probe_scan_linear: left_probe_scan_linear"));
-	assert!(actuator.contains("JoinPhysicalPlacement::SwappedRightBuild"));
-	assert!(join_order.contains("NotBroadcastStar"));
+	assert!(actuator.contains("broadcast_probe_is_scan_linear(&probe_plan.plan)"));
+	assert!(join_order.contains("JoinPhysicalPlacement::SwappedRightBuild"));
+	assert!(join_order.contains("MixedStrategyStar"));
 	assert!(join_order.contains("edge.probe_scan_linear"));
 	assert!(join_order.contains("StarOrderDeclineReason::ProbeNotScanLinear"));
 }
@@ -576,6 +577,163 @@ pub(crate) fn adr180_rune_and_sql_share_analyze_renderer() {
 
 #[test]
 pub(crate) fn adr180_no_optimizer_shell() {
+	adr179_no_optimizer_shell();
+}
+
+#[test]
+pub(crate) fn adr181_uniform_strategy_recognizer() {
+	let join_order = source("src/binder/join_order.rs");
+	let strategy = first_block(&join_order, "pub(super) enum StarOrderStrategy");
+	let decline = first_block(&join_order, "pub(super) enum StarOrderDeclineReason");
+	let evidence = first_block(&join_order, "pub(super) struct StarOrderEvidence");
+	let uniform = first_block(&join_order, "pub(super) fn uniform_star_order_strategy");
+
+	assert_eq!(enum_variant_count(&strategy), 2);
+	assert!(strategy.contains("Broadcast"));
+	assert!(strategy.contains("HashPartitioned"));
+	assert!(evidence.contains("pub(super) strategy: StarOrderStrategy"));
+	assert!(decline.contains("MixedStrategyStar"));
+	assert!(!decline.contains("NotBroadcastStar"));
+	assert!(uniform.contains("decisions.is_empty()"));
+	assert!(uniform.contains("JoinStrategy::Broadcast"));
+	assert!(uniform.contains("JoinPhysicalPlacement::SwappedRightBuild"));
+	assert!(uniform.contains("StarOrderStrategy::Broadcast"));
+	assert!(uniform.contains("JoinStrategy::HashPartitioned"));
+	assert!(uniform.contains("JoinPhysicalPlacement::Natural"));
+	assert!(uniform.contains("StarOrderStrategy::HashPartitioned"));
+}
+
+#[test]
+pub(crate) fn adr181_uniform_strategy_preflights_declared_and_selected() {
+	let binder = binder_source();
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let preflight = first_block(&binder, "fn preflight_star_order_strategy");
+
+	assert!(actuator.contains("let Some(declared_strategy)"));
+	assert!(actuator.contains("preflight_star_order_strategy("));
+	assert!(actuator.contains("&declared_indices"));
+	assert!(actuator.contains("let Some(selected_strategy)"));
+	assert!(actuator.contains("&selected_indices"));
+	assert!(actuator.contains("if declared_strategy != selected_strategy"));
+	assert!(actuator.contains("StarOrderDeclineReason::MixedStrategyStar"));
+	assert!(actuator.contains("let star_order_strategy = selected_strategy;"));
+	assert!(preflight.contains("let mut preflight_trace = base_trace.clone();"));
+	assert!(preflight.contains("let preflight_join_start = preflight_trace.join_decisions.len();"));
+	assert!(preflight.contains("let mut no_render_trace = None;"));
+	assert!(preflight.contains("self.bind_star_order_sequence("));
+	assert!(preflight.contains("if preflight_decisions.len() != order.len()"));
+	assert!(preflight.contains("uniform_star_order_strategy(preflight_decisions)"));
+}
+
+#[test]
+pub(crate) fn adr181_reorder_is_strategy_invariant() {
+	let binder = binder_source();
+	let join_order = source("src/binder/join_order.rs");
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let recognized = first_block(&join_order, "pub(super) fn recognized_star_order_outcome");
+	let order_cost = first_block(&join_order, "pub(super) fn order_cost");
+	let classify = first_block(&join_order, "pub(super) fn classify_star_order_action");
+
+	assert!(actuator.contains("preferred_indices.sort_by"));
+	assert!(actuator.contains("restore_declared_star_order_project("));
+	assert!(actuator.contains("star_output_segments_for_order("));
+	assert!(actuator.contains("recognized_star_order_outcome("));
+	assert!(actuator.contains("star_order_strategy,"));
+	assert!(recognized.contains("strategy: StarOrderStrategy"));
+	assert!(recognized.contains("strategy,"));
+	assert!(recognized.contains("classify_star_order_action("));
+	assert!(!order_cost.contains("StarOrderStrategy"));
+	assert!(!order_cost.contains("JoinStrategy::"));
+	assert!(!classify.contains("StarOrderStrategy"));
+	assert!(!classify.contains("JoinStrategy::"));
+}
+
+#[test]
+pub(crate) fn adr181_hash_star_order_is_binder_only() {
+	let manifest = manifest_dir();
+	let markers = [
+		"StarOrderStrategy",
+		"MixedStrategyStar",
+		"uniform_star_order_strategy",
+		"preflight_star_order_strategy",
+		"strategy=hash_partitioned",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/catalog.rs"),
+		manifest.join("src/coordinator.rs"),
+		manifest.join("src/sql_planner.rs"),
+		manifest.join("src/distributed"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR181 hash-star order vocabulary leaked outside binder/explain:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr181_reuses_178_restore_and_179_180_net() {
+	let binder = binder_source();
+	let explain = source("src/binder/explain.rs");
+	let join = source("src/binder/join.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let runtime_row = first_block(&explain, "fn optimizer_analyze_join_order_row");
+	let verdict_row = first_block(&explain, "fn optimizer_analyze_join_order_verdict_row");
+	let verdict = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+
+	assert!(actuator.contains("restore_declared_star_order_project("));
+	assert!(join.contains("pub(super) fn restore_declared_star_order_project"));
+	assert!(analyze_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(runtime_row.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(
+		verdict_row.contains("measured_star_order_verdict(evidence, measured_rows_by_dimension)")
+	);
+	assert!(verdict.contains("evidence.strategy"));
+	assert!(explain.contains("strategy={}; applied_order"));
+	assert!(explain.contains("strategy={}; dimensions"));
+	assert!(!binder.contains("HashStarRuntimeObservation"));
+	assert!(!join_order.contains("HashStarRuntimeObservation"));
+	for forbidden in [
+		"join_output_ndv_containment_estimate",
+		"multi_key_join_cardinality",
+		"join_estimated_row_count_for_keys",
+		"estimate_join_order_edge_from_sources",
+		"join_order_edge_estimate",
+	] {
+		assert!(!verdict.contains(forbidden));
+		assert!(!verdict_row.contains(forbidden));
+	}
+}
+
+#[test]
+pub(crate) fn adr181_strict_star_leaf_shape_still_defers_snowflake_and_bushy_ordering() {
+	let join_order = source("src/binder/join_order.rs");
+	let extract = first_block(&join_order, "pub(super) fn extract_star_join_candidate");
+
+	assert!(extract.contains("&& !logical_plan_contains_join(right)"));
+	assert!(extract.contains("dimensions.len() < 2 || logical_plan_contains_join(current)"));
+	assert!(join_order.contains("fn logical_plan_contains_join"));
+}
+
+#[test]
+pub(crate) fn adr181_no_optimizer_shell() {
 	adr179_no_optimizer_shell();
 }
 

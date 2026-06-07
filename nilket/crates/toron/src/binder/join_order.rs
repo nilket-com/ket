@@ -53,6 +53,12 @@ pub(super) enum StarOrderAction {
 	KeptInsufficientMargin,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StarOrderStrategy {
+	Broadcast,
+	HashPartitioned,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StarOrderEvidence {
 	pub(super) probe: String,
@@ -60,6 +66,7 @@ pub(super) struct StarOrderEvidence {
 	pub(super) declared_order: Vec<String>,
 	pub(super) cost_preferred_order: Vec<String>,
 	pub(super) applied_order: Vec<String>,
+	pub(super) strategy: StarOrderStrategy,
 	pub(super) declared_cost: u128,
 	pub(super) preferred_cost: u128,
 	pub(super) orders_agree: bool,
@@ -69,7 +76,7 @@ pub(super) struct StarOrderEvidence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StarOrderDeclineReason {
-	NotBroadcastStar,
+	MixedStrategyStar,
 	NonInnerEquiJoin,
 	MissingRelationLabel,
 	MultipleProbeRelations,
@@ -528,6 +535,7 @@ pub(super) fn analyze(edges: &[JoinOrderEdgeEvidence]) -> Option<StarOrderOutcom
 		first_probe.clone(),
 		dimensions,
 		None,
+		StarOrderStrategy::Broadcast,
 		JoinOrderEstimateConfidence::Soft,
 	))
 }
@@ -536,6 +544,7 @@ pub(super) fn recognized_star_order_outcome(
 	probe: String,
 	dimensions: Vec<JoinOrderDimEvidence>,
 	applied_order_override: Option<Vec<String>>,
+	strategy: StarOrderStrategy,
 	confidence: JoinOrderEstimateConfidence,
 ) -> StarOrderOutcome {
 	let declared_order = dimensions
@@ -565,6 +574,7 @@ pub(super) fn recognized_star_order_outcome(
 		declared_order,
 		cost_preferred_order,
 		applied_order,
+		strategy,
 		declared_cost,
 		preferred_cost,
 		orders_agree,
@@ -615,6 +625,7 @@ pub(super) fn measured_star_order_verdict(
 		evidence.probe.clone(),
 		measured_dimensions.clone(),
 		None,
+		evidence.strategy,
 		evidence.confidence,
 	);
 	let StarOrderOutcome::Recognized(measured) = measured else {
@@ -625,6 +636,7 @@ pub(super) fn measured_star_order_verdict(
 		evidence.probe.clone(),
 		measured_dimensions,
 		Some(measured_applied_order.clone()),
+		evidence.strategy,
 		evidence.confidence,
 	);
 	let StarOrderOutcome::Recognized(measured) = measured else {
@@ -668,6 +680,27 @@ fn applied_order_for_action(evidence: &StarOrderEvidence) -> Vec<String> {
 	} else {
 		evidence.declared_order.clone()
 	}
+}
+
+pub(super) fn uniform_star_order_strategy(
+	decisions: &[DecisionReceipt],
+) -> Option<StarOrderStrategy> {
+	if decisions.is_empty() {
+		return None;
+	}
+	if decisions.iter().all(|decision| {
+		decision.strategy == JoinStrategy::Broadcast
+			&& decision.placement == JoinPhysicalPlacement::SwappedRightBuild
+	}) {
+		return Some(StarOrderStrategy::Broadcast);
+	}
+	if decisions.iter().all(|decision| {
+		decision.strategy == JoinStrategy::HashPartitioned
+			&& decision.placement == JoinPhysicalPlacement::Natural
+	}) {
+		return Some(StarOrderStrategy::HashPartitioned);
+	}
+	None
 }
 
 pub(super) fn classify_star_order_action(

@@ -600,7 +600,8 @@ pub(super) fn join_order_outcome_label(outcome: &StarOrderOutcome) -> &'static s
 pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 	match outcome {
 		StarOrderOutcome::Recognized(evidence) => format!(
-			"dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; applied_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}/{}; estimates=[{}]",
+			"strategy={}; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; applied_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}/{}; estimates=[{}]",
+			star_order_strategy_label(evidence.strategy),
 			evidence
 				.dimensions
 				.iter()
@@ -635,6 +636,13 @@ pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 				decline.edge_count
 			)
 		}
+	}
+}
+
+pub(super) fn star_order_strategy_label(strategy: StarOrderStrategy) -> &'static str {
+	match strategy {
+		StarOrderStrategy::Broadcast => "broadcast",
+		StarOrderStrategy::HashPartitioned => "hash_partitioned",
 	}
 }
 
@@ -682,7 +690,8 @@ fn star_order_verdict_detail_label(
 		.map(|evidence| evidence.preferred_cost.to_string())
 		.unwrap_or_else(|| "missing".to_string());
 	format!(
-		"applied_order=[{}]; measured_applied_order=[{}]; original_action={}; measured_action={}; recommendation={}; original_declared_cost={}; original_preferred_cost={}; measured_declared_cost={}; measured_preferred_cost={}; accuracy=[{}]",
+		"strategy={}; applied_order=[{}]; measured_applied_order=[{}]; original_action={}; measured_action={}; recommendation={}; original_declared_cost={}; original_preferred_cost={}; measured_declared_cost={}; measured_preferred_cost={}; accuracy=[{}]",
+		star_order_strategy_label(evidence.strategy),
 		evidence.applied_order.join(","),
 		verdict.measured_applied_order.join(","),
 		star_order_action_label(evidence.action),
@@ -739,7 +748,7 @@ fn star_order_dim_accuracy_kind_label(accuracy: &StarOrderDimAccuracy) -> &'stat
 
 pub(super) fn star_order_decline_outcome_label(reason: StarOrderDeclineReason) -> &'static str {
 	match reason {
-		StarOrderDeclineReason::NotBroadcastStar => "declined_not_broadcast_star",
+		StarOrderDeclineReason::MixedStrategyStar => "declined_mixed_strategy_star",
 		StarOrderDeclineReason::NonInnerEquiJoin => "declined_non_inner_equi_join",
 		StarOrderDeclineReason::MissingRelationLabel => "declined_missing_relation_label",
 		StarOrderDeclineReason::MultipleProbeRelations => "declined_multiple_probe_relations",
@@ -768,7 +777,7 @@ pub(super) fn join_order_estimate_source_label(source: JoinOrderEstimateSource) 
 
 pub(super) fn star_order_decline_reason_label(reason: StarOrderDeclineReason) -> &'static str {
 	match reason {
-		StarOrderDeclineReason::NotBroadcastStar => "not_broadcast_star",
+		StarOrderDeclineReason::MixedStrategyStar => "mixed_strategy_star",
 		StarOrderDeclineReason::NonInnerEquiJoin => "non_inner_equi_join",
 		StarOrderDeclineReason::MissingRelationLabel => "missing_relation_label",
 		StarOrderDeclineReason::MultipleProbeRelations => "multiple_probe_relations",

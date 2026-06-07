@@ -433,6 +433,35 @@ async fn analyze_star_batch_with(facts: StarFactRows, data_shape: StarDataShape)
 	execute_single_batch(&coordinator, &logical).await
 }
 
+#[tokio::test]
+async fn hash_star_measured_verdict_extends() {
+	let (catalog, storage) = star_fixture().await;
+	let coordinator = coordinator_with_config(
+		catalog,
+		storage,
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(1)),
+			..PlannerConfig::default()
+		},
+	);
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN ANALYZE {STAR_SQL}"))
+		.expect("plan hash star EXPLAIN ANALYZE");
+
+	let batch = execute_single_batch(&coordinator, &logical).await;
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_runtime");
+	let verdict_row = join_order_verdict_row(&batch);
+	let verdict_detail = string_value_at(&batch, 3, verdict_row);
+
+	assert_eq!(runtime_rows.len(), 3);
+	assert_eq!(
+		string_value_at(&batch, 0, verdict_row),
+		"join_order_verdict"
+	);
+	assert_eq!(string_value_at(&batch, 2, verdict_row), "over_eager");
+	assert!(verdict_detail.contains("strategy=hash_partitioned"));
+}
+
 async fn execute_single_batch(coordinator: &QueryCoordinator, plan: &LogicalPlan) -> RecordBatch {
 	let batches = coordinator
 		.execute_query(plan, None)
@@ -446,6 +475,21 @@ async fn execute_single_batch(coordinator: &QueryCoordinator, plan: &LogicalPlan
 }
 
 fn coordinator(catalog: Arc<MockCatalog>, storage: Arc<InMemoryTableStorage>) -> QueryCoordinator {
+	coordinator_with_config(
+		catalog,
+		storage,
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(64 * 1024 * 1024)),
+			..PlannerConfig::default()
+		},
+	)
+}
+
+fn coordinator_with_config(
+	catalog: Arc<MockCatalog>,
+	storage: Arc<InMemoryTableStorage>,
+	config: PlannerConfig,
+) -> QueryCoordinator {
 	QueryCoordinator::new(
 		catalog,
 		Executor::with_context(
@@ -457,10 +501,7 @@ fn coordinator(catalog: Arc<MockCatalog>, storage: Arc<InMemoryTableStorage>) ->
 				HlcBound(1),
 			),
 		),
-		PlannerConfig {
-			auto_broadcast_max_build_bytes: Some(ByteCount::new(64 * 1024 * 1024)),
-			..PlannerConfig::default()
-		},
+		config,
 	)
 }
 
