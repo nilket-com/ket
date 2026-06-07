@@ -187,7 +187,7 @@ async fn snowflake_runtime_rows_correlate_by_replay_id() {
 }
 
 #[tokio::test]
-async fn snowflake_explain_analyze_shows_runtime_without_verdict() {
+async fn snowflake_explain_analyze_emits_plan_runtime_and_verdict() {
 	let batch = analyze_snowflake_batch().await;
 
 	assert_eq!(
@@ -198,8 +198,103 @@ async fn snowflake_explain_analyze_shows_runtime_without_verdict() {
 		row_indices_for_kind(&batch, "join_order_snowflake_runtime").len(),
 		4
 	);
+	assert_eq!(
+		row_indices_for_kind(&batch, "join_order_snowflake_verdict").len(),
+		3
+	);
 	assert!(row_indices_for_kind(&batch, "join_order_verdict").is_empty());
 	assert!(row_indices_for_kind(&batch, "join_order_runtime").is_empty());
+}
+
+#[tokio::test]
+async fn snowflake_verdict_reports_per_level_and_aggregate() {
+	let batch = analyze_snowflake_batch().await;
+	let root = row_index_for_kind_and_target(&batch, "join_order_snowflake_verdict", "level=o");
+	let branch = row_index_for_kind_and_target(&batch, "join_order_snowflake_verdict", "level=c");
+	let aggregate =
+		row_index_for_kind_and_target(&batch, "join_order_snowflake_verdict", "snowflake");
+
+	assert_eq!(string_value_at(&batch, 2, root), "missed_win");
+	assert_eq!(string_value_at(&batch, 2, branch), "vindicated");
+	assert_eq!(string_value_at(&batch, 2, aggregate), "missed_win");
+	let aggregate_detail = string_value_at(&batch, 3, aggregate);
+	assert!(
+		aggregate_detail.contains("levels=[o:missed_win,c:vindicated]"),
+		"{aggregate_detail}"
+	);
+}
+
+#[tokio::test]
+async fn snowflake_level_estimate_wanted_reorder_judges_against_declared() {
+	let batch = analyze_snowflake_batch().await;
+	let root = row_index_for_kind_and_target(&batch, "join_order_snowflake_verdict", "level=o");
+	let branch = row_index_for_kind_and_target(&batch, "join_order_snowflake_verdict", "level=c");
+	let root_detail = string_value_at(&batch, 3, root);
+	let branch_detail = string_value_at(&batch, 3, branch);
+
+	assert!(
+		root_detail.contains("estimated_action=reordered"),
+		"{root_detail}"
+	);
+	assert!(
+		root_detail.contains("measured_action=reordered"),
+		"{root_detail}"
+	);
+	assert_eq!(string_value_at(&batch, 2, root), "missed_win");
+	assert!(
+		branch_detail.contains("estimated_action=reordered"),
+		"{branch_detail}"
+	);
+	assert!(
+		branch_detail.contains("measured_action=kept_insufficient_margin"),
+		"{branch_detail}"
+	);
+	assert_eq!(string_value_at(&batch, 2, branch), "vindicated");
+	for row in row_indices_for_kind(&batch, "join_order_snowflake_verdict") {
+		let outcome = string_value_at(&batch, 2, row);
+		assert_ne!(outcome, "mis_ranked");
+		assert_ne!(outcome, "over_eager");
+	}
+}
+
+#[tokio::test]
+async fn snowflake_verdict_detail_keeps_estimate_and_measurement_separate() {
+	let batch = analyze_snowflake_batch().await;
+	let root = row_index_for_kind_and_target(&batch, "join_order_snowflake_verdict", "level=o");
+	let detail = string_value_at(&batch, 3, root);
+
+	assert!(detail.contains("estimated_action=reordered"), "{detail}");
+	assert!(detail.contains("measured_action=reordered"), "{detail}");
+	assert!(detail.contains("declared_order=[c,s]"), "{detail}");
+	assert!(
+		detail.contains("estimated_preferred_order=[s,c]"),
+		"{detail}"
+	);
+	assert!(detail.contains("measured_applied_order=[s,c]"), "{detail}");
+	assert!(detail.contains("strategies=["), "{detail}");
+	assert!(detail.contains("c:hash_partitioned/natural"), "{detail}");
+	assert!(detail.contains("s:hash_partitioned/natural"), "{detail}");
+}
+
+#[tokio::test]
+async fn snowflake_verdict_missed_win_recommends_would_reorder() {
+	let batch = analyze_snowflake_batch().await;
+	let root = row_index_for_kind_and_target(&batch, "join_order_snowflake_verdict", "level=o");
+	let aggregate =
+		row_index_for_kind_and_target(&batch, "join_order_snowflake_verdict", "snowflake");
+
+	assert_eq!(string_value_at(&batch, 2, root), "missed_win");
+	assert!(
+		string_value_at(&batch, 3, root).contains("recommendation=WOULD_REORDER"),
+		"{}",
+		string_value_at(&batch, 3, root)
+	);
+	assert_eq!(string_value_at(&batch, 2, aggregate), "missed_win");
+	assert!(
+		string_value_at(&batch, 3, aggregate).contains("recommendation=WOULD_REORDER"),
+		"{}",
+		string_value_at(&batch, 3, aggregate)
+	);
 }
 
 #[tokio::test]
@@ -228,6 +323,10 @@ async fn snowflake_runtime_evidence_is_observational() {
 		4
 	);
 	assert_eq!(
+		row_indices_for_kind(&analysis, "join_order_snowflake_verdict").len(),
+		3
+	);
+	assert_eq!(
 		format!("{:?}", before.schema()),
 		format!("{:?}", after.schema())
 	);
@@ -242,6 +341,7 @@ async fn star_runtime_evidence_unchanged() {
 	assert_eq!(row_indices_for_kind(&batch, "join_order_runtime").len(), 3);
 	assert_eq!(row_indices_for_kind(&batch, "join_order_verdict").len(), 1);
 	assert!(row_indices_for_kind(&batch, "join_order_snowflake_runtime").is_empty());
+	assert!(row_indices_for_kind(&batch, "join_order_snowflake_verdict").is_empty());
 }
 
 #[tokio::test]
@@ -1078,6 +1178,32 @@ fn row_indices_for_kind(batch: &RecordBatch, expected_kind: &str) -> Vec<usize> 
 	(0..batch.num_rows())
 		.filter(|row| kinds.value(*row) == expected_kind)
 		.collect()
+}
+
+fn row_index_for_kind_and_target(
+	batch: &RecordBatch,
+	expected_kind: &str,
+	expected_target: &str,
+) -> usize {
+	let kinds = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("decision_kind string array");
+	let targets = batch
+		.column(1)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("target string array");
+	let rows = (0..batch.num_rows())
+		.filter(|row| kinds.value(*row) == expected_kind && targets.value(*row) == expected_target)
+		.collect::<Vec<_>>();
+	assert_eq!(
+		rows.len(),
+		1,
+		"expected one {expected_kind}/{expected_target} row"
+	);
+	rows[0]
 }
 
 fn join_order_verdict_row(batch: &RecordBatch) -> usize {

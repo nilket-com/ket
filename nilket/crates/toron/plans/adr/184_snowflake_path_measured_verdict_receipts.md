@@ -95,8 +95,9 @@ Cascades, or broad `PlanProperties` contract.
 - `snowflake_verdict_reports_per_level_and_aggregate` - a snowflake whose branch has a
   measured reorder opportunity emits a branch `MissedWin`, a root `Vindicated`, and an
   aggregate `MissedWin`.
-- `snowflake_verdict_vindicates_measured_declared_order` - when measured rows keep declared
-  order at every level, all per-level rows and the aggregate are `Vindicated`.
+- `measured_snowflake_order_verdict_aggregates_worst_case` - the aggregation unit test: all
+  measured-keep levels roll up to `Vindicated`, any measured-reorder level to `MissedWin`, any
+  missing measurement to `Indeterminate` (with the matching recommendation each time).
 - `snowflake_verdict_type_excludes_star_actuation_only_outcomes` - snowflake verdict code has
   no `MisRanked` or `OverEager` state to emit.
 
@@ -110,14 +111,14 @@ Cascades, or broad `PlanProperties` contract.
   measured applied order.
 - `snowflake_verdict_missed_win_recommends_would_reorder` - a missed-win level and aggregate
   carry `WOULD_REORDER`.
-- `snowflake_verdict_indeterminate_on_missing_measurement` - missing one measured edge makes
-  the owning level and aggregate `Indeterminate`.
 - `snowflake_explain_analyze_emits_plan_runtime_and_verdict` - snowflake analyze output
   contains `join_order_snowflake`, `join_order_snowflake_runtime`, and
-  `join_order_snowflake_verdict`.
-- `snowflake_analyze_emits_no_flat_star_verdict` - snowflake analyze still emits no
-  `join_order_verdict` row.
-- `star_verdict_unchanged` - flat-star `join_order_verdict` rows remain byte-identical.
+  `join_order_snowflake_verdict`, and emits **no** flat `join_order_verdict`/`join_order_runtime`
+  rows (the no-flat-star-verdict boundary).
+- the ADR 180 star verdict suite (`verdict_vindicated_when_measured`,
+  `verdict_overeager_when_measurement_would_keep_declared`, `verdict_misranked_when_reorder_picks_wrong`,
+  `verdict_missed_win_when_margin_declined_a_real_win`, `verdict_indeterminate_on_missing_actuals`)
+  stays green after the shared-rerank extraction (flat-star verdicts unchanged).
 - `rune_analyze_shows_snowflake_verdict` - Rune parity through the shared renderer.
 
 ## Architecture Guards

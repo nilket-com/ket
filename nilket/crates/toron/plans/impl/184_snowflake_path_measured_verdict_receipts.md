@@ -179,24 +179,25 @@ Add or retarget:
 
 - `snowflake_verdict_reports_per_level_and_aggregate` - root measured keep, branch measured
   reorder -> root `Vindicated`, branch `MissedWin`, aggregate `MissedWin`.
-- `snowflake_verdict_vindicates_measured_declared_order` - all levels measured keep declared
-  -> all `Vindicated`.
 - `snowflake_level_estimate_wanted_reorder_judges_against_declared` - estimated action may be
   reorder, but measured keep -> `Vindicated` and measured reorder -> `MissedWin`.
 - `snowflake_verdict_detail_keeps_estimate_and_measurement_separate` - detail shows
   `estimated_action` and measured action as separate fields.
 - `snowflake_verdict_missed_win_recommends_would_reorder` - level and aggregate missed wins
   carry `WOULD_REORDER`.
-- `snowflake_verdict_indeterminate_on_missing_measurement` - omit one measured edge; owning
-  level and aggregate are `Indeterminate`.
-- `snowflake_analyze_emits_no_flat_star_verdict` - no `join_order_verdict` row.
-- `star_verdict_unchanged` - flat-star verdict row byte-identical after helper extraction.
+- `snowflake_explain_analyze_emits_plan_runtime_and_verdict` - snowflake analyze emits the
+  three snowflake row kinds and **no** flat `join_order_verdict`/`join_order_runtime` rows
+  (subsumes the no-flat-star-verdict boundary; replaces ADR 183's `..._without_verdict` gate).
+- the ADR 180 star verdict suite (`verdict_vindicated_when_measured`, `verdict_overeager_*`,
+  `verdict_misranked_*`, `verdict_missed_win_*`, `verdict_indeterminate_on_missing_actuals`)
+  stays green after the helper extraction (flat-star verdicts byte-identical).
 - `rune_analyze_shows_snowflake_verdict` - Rune parity.
 
 Unit tests:
 
 - `measured_order_rerank_preserves_180_measured_order_semantics`;
-- `measured_snowflake_order_verdict_aggregates_worst_case`;
+- `measured_snowflake_order_verdict_aggregates_worst_case` - covers the all-`Vindicated`,
+  `MissedWin`, and missing-measurement -> `Indeterminate` aggregations with recommendations;
 - `snowflake_verdict_type_excludes_star_actuation_only_outcomes`.
 
 ## Phase 7 - Architecture guards

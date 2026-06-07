@@ -297,7 +297,7 @@ async fn computed_projection_stays_naked() {
 		&LogicalPlan::Filter {
 			input: Box::new(project_sales(
 				vec![
-					add_zero(Expr::column("customer_id")),
+					cast_add_zero(Expr::column("customer_id")),
 					Expr::column("raw_id"),
 				],
 				vec![Some("cid_value"), None],
@@ -314,7 +314,7 @@ async fn computed_projection_stays_naked() {
 	.expect("computed projection is naked and can compare to naked raw id");
 
 	let schema = bound_schema(project_sales(
-		vec![add_zero(Expr::column("customer_id"))],
+		vec![cast_add_zero(Expr::column("customer_id"))],
 		vec![Some("cid_value")],
 	))
 	.await;
@@ -325,7 +325,7 @@ async fn computed_projection_stays_naked() {
 async fn explicit_ascribed_computed_projection_carries_identity() {
 	let schema = bound_schema(project_sales(
 		vec![ascribe(
-			add_zero(Expr::column("customer_id")),
+			cast_add_zero(Expr::column("customer_id")),
 			CUSTOMER_ID_LOGICAL_TYPE,
 		)],
 		vec![Some("cid_value")],
@@ -338,7 +338,7 @@ async fn explicit_ascribed_computed_projection_carries_identity() {
 			input: Box::new(project_sales(
 				vec![
 					ascribe(
-						add_zero(Expr::column("customer_id")),
+						cast_add_zero(Expr::column("customer_id")),
 						CUSTOMER_ID_LOGICAL_TYPE,
 					),
 					Expr::column("alt_customer_id"),
@@ -434,10 +434,10 @@ async fn aggregate_sum_count_avg_stay_naked() {
 		input: Box::new(scan("sales")),
 		group_expr: vec![],
 		aggr_expr: vec![
-			(AggregateFunction::Sum, vec![Expr::column("customer_id")]),
+			(AggregateFunction::Sum, vec![Expr::column("raw_id")]),
 			(AggregateFunction::Count, vec![Expr::column("customer_id")]),
 			(AggregateFunction::CountAll, vec![]),
-			(AggregateFunction::Avg, vec![Expr::column("customer_id")]),
+			(AggregateFunction::Avg, vec![Expr::column("raw_id")]),
 		],
 	})
 	.await;
@@ -456,7 +456,7 @@ async fn aggregate_min_of_computed_or_cast_or_naked_input_stays_naked() {
 			(AggregateFunction::Min, vec![Expr::column("raw_id")]),
 			(
 				AggregateFunction::Min,
-				vec![add_zero(Expr::column("customer_id"))],
+				vec![cast_add_zero(Expr::column("customer_id"))],
 			),
 			(
 				AggregateFunction::Min,
@@ -482,7 +482,7 @@ async fn aggregate_min_of_ascribed_computed_preserves_logical_identity() {
 		aggr_expr: vec![(
 			AggregateFunction::Min,
 			vec![ascribe(
-				add_zero(Expr::column("customer_id")),
+				cast_add_zero(Expr::column("customer_id")),
 				CUSTOMER_ID_LOGICAL_TYPE,
 			)],
 		)],
@@ -600,7 +600,7 @@ async fn ctas_direct_projection_materializes_identity_in_descriptor() {
 #[tokio::test]
 async fn ctas_computed_projection_stays_naked_in_descriptor() {
 	let schema = bound_ctas_schema(project_sales(
-		vec![add_zero(Expr::column("customer_id"))],
+		vec![cast_add_zero(Expr::column("customer_id"))],
 		vec![Some("cid_value")],
 	))
 	.await;
@@ -722,9 +722,9 @@ fn ascribe(expr: Expr, logical_type: LogicalTypeId) -> Expr {
 	}
 }
 
-fn add_zero(expr: Expr) -> Expr {
+fn cast_add_zero(expr: Expr) -> Expr {
 	Expr::Add(
-		Box::new(expr),
+		Box::new(Expr::Cast(Box::new(expr), DataType::Int64)),
 		Box::new(Expr::Literal(ScalarValue::Int64(Some(0)))),
 	)
 }

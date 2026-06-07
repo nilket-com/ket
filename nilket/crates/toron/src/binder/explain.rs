@@ -282,6 +282,7 @@ fn optimizer_analyze_rows(
 	if let Some(evidence) = render_trace.snowflake_order.as_ref() {
 		let mut rows = vec![optimizer_analyze_snowflake_order_row(evidence)];
 		let dimensions = flatten_snowflake_dimensions(evidence);
+		let mut measured_rows_by_dimension = BTreeMap::new();
 		for edge in &render_trace.join_order_edges {
 			let Some(dimension) = edge.dimension.as_deref() else {
 				continue;
@@ -289,10 +290,19 @@ fn optimizer_analyze_rows(
 			let Some((probe, dimension)) = dimensions.get(dimension) else {
 				continue;
 			};
+			let replay_id = join_replay_id_for_trace_target(edge.target)?;
+			if let Some(summary) = summaries.get(&replay_id) {
+				measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
+			}
 			rows.push(optimizer_analyze_snowflake_runtime_row(
 				probe, edge, dimension, summaries,
 			)?);
 		}
+		let verdict = measured_snowflake_order_verdict(evidence, &measured_rows_by_dimension);
+		for level in &verdict.levels {
+			rows.push(optimizer_analyze_snowflake_verdict_row(level));
+		}
+		rows.push(optimizer_analyze_snowflake_aggregate_verdict_row(&verdict));
 		return Ok(rows);
 	}
 	let Some(StarOrderOutcome::Recognized(evidence)) = render_trace.join_order.as_ref() else {
@@ -496,6 +506,44 @@ fn optimizer_analyze_join_order_verdict_row(
 		ScalarValue::Int64(None),
 		ScalarValue::Int64(None),
 	])
+}
+
+fn optimizer_analyze_snowflake_verdict_row(level: &SnowflakeLevelVerdict) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_snowflake_verdict".to_string())),
+		ScalarValue::Utf8(Some(format!("level={}", level.probe))),
+		ScalarValue::Utf8(Some(
+			snowflake_order_verdict_label(level.verdict).to_string(),
+		)),
+		ScalarValue::Utf8(Some(snowflake_order_verdict_detail_label(level))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+fn optimizer_analyze_snowflake_aggregate_verdict_row(
+	verdict: &SnowflakeOrderVerdict,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_snowflake_verdict".to_string())),
+		ScalarValue::Utf8(Some("snowflake".to_string())),
+		ScalarValue::Utf8(Some(
+			snowflake_order_verdict_label(verdict.aggregate).to_string(),
+		)),
+		ScalarValue::Utf8(Some(snowflake_order_aggregate_verdict_detail_label(
+			verdict,
+		))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
 }
 
 fn join_replay_id_for_trace_target(target: JoinTraceTarget) -> Result<JoinReplayId, BindingError> {
@@ -893,6 +941,80 @@ fn snowflake_order_action_label(action: StarOrderAction) -> &'static str {
 			"would_keep_declared"
 		}
 	}
+}
+
+fn snowflake_order_verdict_label(verdict: SnowflakeOrderVerdictKind) -> &'static str {
+	match verdict {
+		SnowflakeOrderVerdictKind::Vindicated => "vindicated",
+		SnowflakeOrderVerdictKind::MissedWin => "missed_win",
+		SnowflakeOrderVerdictKind::Indeterminate => "indeterminate",
+	}
+}
+
+fn snowflake_order_recommendation_label(
+	recommendation: SnowflakeOrderRecommendation,
+) -> &'static str {
+	match recommendation {
+		SnowflakeOrderRecommendation::KeepDeclared => "KEEP_DECLARED",
+		SnowflakeOrderRecommendation::WouldReorder => "WOULD_REORDER",
+		SnowflakeOrderRecommendation::NoRecommendation => "NO_RECOMMENDATION",
+	}
+}
+
+fn snowflake_order_verdict_detail_label(level: &SnowflakeLevelVerdict) -> String {
+	let measured = level.rerank.measured_ranking.as_ref();
+	let measured_action = measured
+		.map(|ranking| star_order_action_label(ranking.action))
+		.unwrap_or("missing");
+	let measured_declared_cost = measured
+		.map(|ranking| ranking.declared_cost.to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	let measured_preferred_cost = measured
+		.map(|ranking| ranking.preferred_cost.to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	format!(
+		"estimated_action={}; measured_action={}; recommendation={}; declared_order=[{}]; estimated_preferred_order=[{}]; measured_applied_order=[{}]; estimated_declared_cost={}; estimated_preferred_cost={}; measured_declared_cost={}; measured_preferred_cost={}; accuracy=[{}]; strategies=[{}]",
+		star_order_action_label(level.estimated_ranking.action),
+		measured_action,
+		snowflake_order_recommendation_label(level.recommendation),
+		level.estimated_ranking.declared_order.join(","),
+		level.estimated_ranking.cost_preferred_order.join(","),
+		level.rerank.measured_applied_order.join(","),
+		level.estimated_ranking.declared_cost,
+		level.estimated_ranking.preferred_cost,
+		measured_declared_cost,
+		measured_preferred_cost,
+		level
+			.rerank
+			.accuracy
+			.iter()
+			.map(star_order_dim_accuracy_label)
+			.collect::<Vec<_>>()
+			.join(","),
+		level
+			.strategies
+			.iter()
+			.map(snowflake_edge_strategy_label)
+			.collect::<Vec<_>>()
+			.join(",")
+	)
+}
+
+fn snowflake_order_aggregate_verdict_detail_label(verdict: &SnowflakeOrderVerdict) -> String {
+	format!(
+		"recommendation={}; levels=[{}]",
+		snowflake_order_recommendation_label(verdict.recommendation),
+		verdict
+			.levels
+			.iter()
+			.map(|level| format!(
+				"{}:{}",
+				level.probe,
+				snowflake_order_verdict_label(level.verdict)
+			))
+			.collect::<Vec<_>>()
+			.join(",")
+	)
 }
 
 pub(super) fn star_order_strategy_label(strategy: StarOrderStrategy) -> &'static str {

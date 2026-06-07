@@ -164,6 +164,44 @@ pub(super) struct StarOrderVerdictReceipt {
 	pub(super) measured_evidence: Option<StarOrderEvidence>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MeasuredOrderRerank {
+	pub(super) measured_applied_order: Vec<String>,
+	pub(super) accuracy: Vec<StarOrderDimAccuracy>,
+	pub(super) measured_ranking: Option<StarOrderRanking>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnowflakeOrderVerdictKind {
+	Vindicated,
+	MissedWin,
+	Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnowflakeOrderRecommendation {
+	KeepDeclared,
+	WouldReorder,
+	NoRecommendation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SnowflakeOrderVerdict {
+	pub(super) levels: Vec<SnowflakeLevelVerdict>,
+	pub(super) aggregate: SnowflakeOrderVerdictKind,
+	pub(super) recommendation: SnowflakeOrderRecommendation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SnowflakeLevelVerdict {
+	pub(super) probe: String,
+	pub(super) estimated_ranking: StarOrderRanking,
+	pub(super) strategies: Vec<SnowflakeEdgeStrategy>,
+	pub(super) rerank: MeasuredOrderRerank,
+	pub(super) verdict: SnowflakeOrderVerdictKind,
+	pub(super) recommendation: SnowflakeOrderRecommendation,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JoinOrderSourceCapture {
 	Off,
@@ -776,61 +814,35 @@ pub(super) fn measured_star_order_verdict(
 	evidence: &StarOrderEvidence,
 	measured_rows_by_dimension: &BTreeMap<String, RowCount>,
 ) -> StarOrderVerdictReceipt {
-	let mut measured_dimensions = Vec::with_capacity(evidence.dimensions.len());
-	let mut accuracy = Vec::with_capacity(evidence.dimensions.len());
-	let mut missing_measurement = false;
-	for dimension in &evidence.dimensions {
-		let actual_rows = measured_rows_by_dimension
-			.get(&dimension.dimension)
-			.copied();
-		accuracy.push(StarOrderDimAccuracy {
-			dimension: dimension.dimension.clone(),
-			estimated_rows: dimension.estimated_rows,
-			actual_rows,
-		});
-		let Some(actual_rows) = actual_rows else {
-			missing_measurement = true;
-			continue;
-		};
-		measured_dimensions.push(JoinOrderDimEvidence {
-			dimension: dimension.dimension.clone(),
-			declared_position: dimension.declared_position,
-			estimated_rows: actual_rows,
-			estimate_source: dimension.estimate_source,
-			confidence: dimension.confidence,
-		});
-	}
-	if missing_measurement || measured_dimensions.len() != evidence.dimensions.len() {
+	let rerank = measured_order_rerank(
+		&StarOrderRanking {
+			probe: evidence.probe.clone(),
+			dimensions: evidence.dimensions.clone(),
+			declared_order: evidence.declared_order.clone(),
+			cost_preferred_order: evidence.cost_preferred_order.clone(),
+			declared_cost: evidence.declared_cost,
+			preferred_cost: evidence.preferred_cost,
+			orders_agree: evidence.orders_agree,
+			action: evidence.action,
+			confidence: evidence.confidence,
+		},
+		measured_rows_by_dimension,
+	);
+	let Some(measured_ranking) = rerank.measured_ranking.as_ref() else {
 		return StarOrderVerdictReceipt {
 			measured_applied_order: Vec::new(),
 			verdict: StarOrderVerdict::Indeterminate,
 			recommendation: StarOrderVerdictRecommendation::NoRecommendation,
-			accuracy,
+			accuracy: rerank.accuracy,
 			measured_evidence: None,
 		};
-	}
+	};
 
-	let measured = recognized_star_order_outcome(
-		evidence.probe.clone(),
-		measured_dimensions.clone(),
-		None,
+	let measured = star_order_evidence_from_ranking(
+		measured_ranking.clone(),
+		rerank.measured_applied_order.clone(),
 		evidence.strategy,
-		evidence.confidence,
 	);
-	let StarOrderOutcome::Recognized(measured) = measured else {
-		unreachable!("recognized_star_order_outcome always recognizes");
-	};
-	let measured_applied_order = applied_order_for_action(&measured);
-	let measured = recognized_star_order_outcome(
-		evidence.probe.clone(),
-		measured_dimensions,
-		Some(measured_applied_order.clone()),
-		evidence.strategy,
-		evidence.confidence,
-	);
-	let StarOrderOutcome::Recognized(measured) = measured else {
-		unreachable!("recognized_star_order_outcome always recognizes");
-	};
 
 	let verdict = if evidence.applied_order == measured.applied_order {
 		StarOrderVerdict::Vindicated
@@ -855,19 +867,156 @@ pub(super) fn measured_star_order_verdict(
 	};
 
 	StarOrderVerdictReceipt {
-		measured_applied_order,
+		measured_applied_order: rerank.measured_applied_order,
 		verdict,
 		recommendation,
-		accuracy,
+		accuracy: rerank.accuracy,
 		measured_evidence: Some(measured),
 	}
 }
 
-fn applied_order_for_action(evidence: &StarOrderEvidence) -> Vec<String> {
-	if evidence.action == StarOrderAction::Reordered {
-		evidence.cost_preferred_order.clone()
+pub(super) fn measured_order_rerank(
+	ranking: &StarOrderRanking,
+	measured_rows_by_dimension: &BTreeMap<String, RowCount>,
+) -> MeasuredOrderRerank {
+	let mut measured_dimensions = Vec::with_capacity(ranking.dimensions.len());
+	let mut accuracy = Vec::with_capacity(ranking.dimensions.len());
+	let mut missing_measurement = false;
+	for dimension in &ranking.dimensions {
+		let actual_rows = measured_rows_by_dimension
+			.get(&dimension.dimension)
+			.copied();
+		accuracy.push(StarOrderDimAccuracy {
+			dimension: dimension.dimension.clone(),
+			estimated_rows: dimension.estimated_rows,
+			actual_rows,
+		});
+		let Some(actual_rows) = actual_rows else {
+			missing_measurement = true;
+			continue;
+		};
+		measured_dimensions.push(JoinOrderDimEvidence {
+			dimension: dimension.dimension.clone(),
+			declared_position: dimension.declared_position,
+			estimated_rows: actual_rows,
+			estimate_source: dimension.estimate_source,
+			confidence: dimension.confidence,
+		});
+	}
+	if missing_measurement || measured_dimensions.len() != ranking.dimensions.len() {
+		return MeasuredOrderRerank {
+			measured_applied_order: Vec::new(),
+			accuracy,
+			measured_ranking: None,
+		};
+	}
+
+	let measured_ranking = rank_star_order(
+		ranking.probe.clone(),
+		measured_dimensions,
+		ranking.confidence,
+	);
+	let measured_applied_order = applied_order_for_ranking(&measured_ranking);
+	MeasuredOrderRerank {
+		measured_applied_order,
+		accuracy,
+		measured_ranking: Some(measured_ranking),
+	}
+}
+
+pub(super) fn measured_snowflake_order_verdict(
+	evidence: &SnowflakeOrderEvidence,
+	measured_rows_by_dimension: &BTreeMap<String, RowCount>,
+) -> SnowflakeOrderVerdict {
+	let mut levels = Vec::new();
+	collect_snowflake_order_verdicts(evidence, measured_rows_by_dimension, &mut levels);
+	let aggregate = if levels
+		.iter()
+		.any(|level| level.verdict == SnowflakeOrderVerdictKind::Indeterminate)
+	{
+		SnowflakeOrderVerdictKind::Indeterminate
+	} else if levels
+		.iter()
+		.any(|level| level.verdict == SnowflakeOrderVerdictKind::MissedWin)
+	{
+		SnowflakeOrderVerdictKind::MissedWin
 	} else {
-		evidence.declared_order.clone()
+		SnowflakeOrderVerdictKind::Vindicated
+	};
+	let recommendation = snowflake_recommendation_for_verdict(aggregate);
+	SnowflakeOrderVerdict {
+		levels,
+		aggregate,
+		recommendation,
+	}
+}
+
+fn collect_snowflake_order_verdicts(
+	evidence: &SnowflakeOrderEvidence,
+	measured_rows_by_dimension: &BTreeMap<String, RowCount>,
+	levels: &mut Vec<SnowflakeLevelVerdict>,
+) {
+	let rerank = measured_order_rerank(&evidence.ranking, measured_rows_by_dimension);
+	let verdict = match rerank
+		.measured_ranking
+		.as_ref()
+		.map(|ranking| ranking.action)
+	{
+		None => SnowflakeOrderVerdictKind::Indeterminate,
+		Some(StarOrderAction::Reordered) => SnowflakeOrderVerdictKind::MissedWin,
+		Some(StarOrderAction::KeptAlreadyOptimal | StarOrderAction::KeptInsufficientMargin) => {
+			SnowflakeOrderVerdictKind::Vindicated
+		}
+	};
+	let recommendation = snowflake_recommendation_for_verdict(verdict);
+	levels.push(SnowflakeLevelVerdict {
+		probe: evidence.ranking.probe.clone(),
+		estimated_ranking: evidence.ranking.clone(),
+		strategies: evidence.edge_strategies.clone(),
+		rerank,
+		verdict,
+		recommendation,
+	});
+	for branch in &evidence.branches {
+		collect_snowflake_order_verdicts(&branch.evidence, measured_rows_by_dimension, levels);
+	}
+}
+
+fn snowflake_recommendation_for_verdict(
+	verdict: SnowflakeOrderVerdictKind,
+) -> SnowflakeOrderRecommendation {
+	match verdict {
+		SnowflakeOrderVerdictKind::Vindicated => SnowflakeOrderRecommendation::KeepDeclared,
+		SnowflakeOrderVerdictKind::MissedWin => SnowflakeOrderRecommendation::WouldReorder,
+		SnowflakeOrderVerdictKind::Indeterminate => SnowflakeOrderRecommendation::NoRecommendation,
+	}
+}
+
+fn star_order_evidence_from_ranking(
+	ranking: StarOrderRanking,
+	applied_order: Vec<String>,
+	strategy: StarOrderStrategy,
+) -> StarOrderEvidence {
+	StarOrderEvidence {
+		probe: ranking.probe,
+		dimensions: ranking.dimensions,
+		declared_order: ranking.declared_order,
+		cost_preferred_order: ranking.cost_preferred_order,
+		applied_order,
+		strategy,
+		declared_cost: ranking.declared_cost,
+		preferred_cost: ranking.preferred_cost,
+		orders_agree: ranking.orders_agree,
+		action: ranking.action,
+		confidence: ranking.confidence,
+	}
+}
+
+fn applied_order_for_ranking(ranking: &StarOrderRanking) -> Vec<String> {
+	if ranking.action == StarOrderAction::Reordered {
+		ranking.cost_preferred_order.clone()
+	} else {
+		ranking.declared_order.clone()
 	}
 }
 

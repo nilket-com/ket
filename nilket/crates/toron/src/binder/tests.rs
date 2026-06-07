@@ -8924,7 +8924,7 @@ async fn snowflake_order_evidence_is_explain_gated() {
 }
 
 #[tokio::test]
-async fn snowflake_explain_analyze_shows_runtime_without_verdict() {
+async fn snowflake_explain_analyze_emits_plan_runtime_and_verdict() {
 	let catalog = snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(non_optimal_snowflake_order_sql())
@@ -8959,6 +8959,26 @@ async fn snowflake_explain_analyze_shows_runtime_without_verdict() {
 		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order_snowflake_runtime".to_string())))
 		.collect::<Vec<_>>();
 	assert_eq!(runtime_rows.len(), 4);
+	let verdict_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order_snowflake_verdict".to_string())))
+		.collect::<Vec<_>>();
+	assert_eq!(verdict_rows.len(), 3);
+	assert!(
+		verdict_rows
+			.iter()
+			.any(|row| { row[1] == ScalarValue::Utf8(Some("level=o".to_string())) })
+	);
+	assert!(
+		verdict_rows
+			.iter()
+			.any(|row| { row[1] == ScalarValue::Utf8(Some("level=c".to_string())) })
+	);
+	assert!(
+		verdict_rows
+			.iter()
+			.any(|row| { row[1] == ScalarValue::Utf8(Some("snowflake".to_string())) })
+	);
 	assert!(runtime_rows.iter().any(|row| {
 		row[1] == ScalarValue::Utf8(Some("join[0] level=o dimension=c".to_string()))
 	}));
@@ -9265,6 +9285,122 @@ fn verdict_indeterminate_on_missing_actuals() {
 	);
 }
 
+#[test]
+fn measured_order_rerank_preserves_180_measured_order_semantics() {
+	let ranking = rank_star_order(
+		"o".to_string(),
+		vec![
+			snowflake_verdict_dim("c", 0, 100),
+			snowflake_verdict_dim("s", 1, 10),
+		],
+		JoinOrderEstimateConfidence::Hard,
+	);
+	let rerank = measured_order_rerank(
+		&ranking,
+		&BTreeMap::from([
+			("c".to_string(), RowCount::new(100)),
+			("s".to_string(), RowCount::new(1)),
+		]),
+	);
+
+	let measured = rerank.measured_ranking.expect("complete measurement");
+	assert_eq!(measured.action, StarOrderAction::Reordered);
+	assert_eq!(rerank.measured_applied_order, vec!["s", "c"]);
+	assert_eq!(
+		rerank
+			.accuracy
+			.iter()
+			.map(|accuracy| (
+				accuracy.dimension.as_str(),
+				accuracy.actual_rows.map(RowCount::get)
+			))
+			.collect::<Vec<_>>(),
+		vec![("c", Some(100)), ("s", Some(1))]
+	);
+}
+
+#[test]
+fn measured_snowflake_order_verdict_aggregates_worst_case() {
+	let evidence = snowflake_verdict_fixture();
+	let missed_branch = measured_snowflake_order_verdict(
+		&evidence,
+		&BTreeMap::from([
+			("c".to_string(), RowCount::new(1)),
+			("s".to_string(), RowCount::new(100)),
+			("r".to_string(), RowCount::new(100)),
+			("g".to_string(), RowCount::new(1)),
+		]),
+	);
+
+	assert_eq!(missed_branch.levels.len(), 2);
+	assert_eq!(missed_branch.levels[0].probe, "o");
+	assert_eq!(
+		missed_branch.levels[0].verdict,
+		SnowflakeOrderVerdictKind::Vindicated
+	);
+	assert_eq!(missed_branch.levels[1].probe, "c");
+	assert_eq!(
+		missed_branch.levels[1].verdict,
+		SnowflakeOrderVerdictKind::MissedWin
+	);
+	assert_eq!(
+		missed_branch.aggregate,
+		SnowflakeOrderVerdictKind::MissedWin
+	);
+	assert_eq!(
+		missed_branch.recommendation,
+		SnowflakeOrderRecommendation::WouldReorder
+	);
+
+	let all_vindicated = measured_snowflake_order_verdict(
+		&evidence,
+		&BTreeMap::from([
+			("c".to_string(), RowCount::new(1)),
+			("s".to_string(), RowCount::new(100)),
+			("r".to_string(), RowCount::new(1)),
+			("g".to_string(), RowCount::new(100)),
+		]),
+	);
+	assert_eq!(
+		all_vindicated.aggregate,
+		SnowflakeOrderVerdictKind::Vindicated
+	);
+	assert_eq!(
+		all_vindicated.recommendation,
+		SnowflakeOrderRecommendation::KeepDeclared
+	);
+
+	let missing = measured_snowflake_order_verdict(
+		&evidence,
+		&BTreeMap::from([
+			("c".to_string(), RowCount::new(1)),
+			("s".to_string(), RowCount::new(100)),
+			("r".to_string(), RowCount::new(1)),
+		]),
+	);
+	assert_eq!(missing.aggregate, SnowflakeOrderVerdictKind::Indeterminate);
+	assert_eq!(
+		missing.recommendation,
+		SnowflakeOrderRecommendation::NoRecommendation
+	);
+}
+
+#[test]
+fn snowflake_verdict_type_excludes_star_actuation_only_outcomes() {
+	let labels = [
+		SnowflakeOrderVerdictKind::Vindicated,
+		SnowflakeOrderVerdictKind::MissedWin,
+		SnowflakeOrderVerdictKind::Indeterminate,
+	]
+	.iter()
+	.map(|verdict| format!("{verdict:?}"))
+	.collect::<Vec<_>>();
+
+	assert_eq!(labels, vec!["Vindicated", "MissedWin", "Indeterminate"]);
+	assert!(!labels.iter().any(|label| label == "MisRanked"));
+	assert!(!labels.iter().any(|label| label == "OverEager"));
+}
+
 #[tokio::test]
 async fn rune_explain_shows_star_order_evidence() {
 	let catalog = star_join_order_catalog();
@@ -9401,7 +9537,7 @@ async fn rune_analyze_renders_star_order_verdict() {
 }
 
 #[tokio::test]
-async fn rune_analyze_shows_snowflake_runtime_evidence() {
+async fn rune_analyze_shows_snowflake_verdict() {
 	let catalog = snowflake_join_order_catalog();
 	let logical = rune_plan(
 		r#"
@@ -9462,6 +9598,14 @@ async fn rune_analyze_shows_snowflake_runtime_evidence() {
 			)
 			.count(),
 		4
+	);
+	assert_eq!(
+		rows.iter()
+			.filter(
+				|row| row[0] == ScalarValue::Utf8(Some("join_order_snowflake_verdict".to_string()))
+			)
+			.count(),
+		3
 	);
 	assert!(
 		!rows
@@ -12038,6 +12182,64 @@ fn snowflake_test_decision(
 		strategy,
 		placement,
 		reason: JoinStrategyDecisionReason::PinnedByAuthor,
+	}
+}
+
+fn snowflake_verdict_fixture() -> SnowflakeOrderEvidence {
+	SnowflakeOrderEvidence {
+		ranking: rank_star_order(
+			"o".to_string(),
+			vec![
+				snowflake_verdict_dim("c", 0, 100),
+				snowflake_verdict_dim("s", 1, 10),
+			],
+			JoinOrderEstimateConfidence::Hard,
+		),
+		edge_strategies: vec![
+			snowflake_verdict_strategy("c"),
+			snowflake_verdict_strategy("s"),
+		],
+		branches: vec![SnowflakeBranch {
+			dimension: "c".to_string(),
+			evidence: SnowflakeOrderEvidence {
+				ranking: rank_star_order(
+					"c".to_string(),
+					vec![
+						snowflake_verdict_dim("r", 0, 100),
+						snowflake_verdict_dim("g", 1, 10),
+					],
+					JoinOrderEstimateConfidence::Hard,
+				),
+				edge_strategies: vec![
+					snowflake_verdict_strategy("r"),
+					snowflake_verdict_strategy("g"),
+				],
+				branches: Vec::new(),
+			},
+		}],
+	}
+}
+
+fn snowflake_verdict_dim(
+	dimension: &str,
+	declared_position: usize,
+	estimated_rows: u64,
+) -> JoinOrderDimEvidence {
+	JoinOrderDimEvidence {
+		dimension: dimension.to_string(),
+		declared_position,
+		estimated_rows: RowCount::new(estimated_rows),
+		estimate_source: JoinOrderEstimateSource::SingleKeyNdvContainment,
+		confidence: JoinOrderEstimateConfidence::Hard,
+	}
+}
+
+fn snowflake_verdict_strategy(dimension: &str) -> SnowflakeEdgeStrategy {
+	SnowflakeEdgeStrategy {
+		dimension: dimension.to_string(),
+		strategy: JoinStrategy::HashPartitioned,
+		placement: JoinPhysicalPlacement::Natural,
+		probe_scan_linear: true,
 	}
 }
 

@@ -416,10 +416,12 @@ pub(crate) fn adr179_no_fragment_or_wendelon_storage_pbc_change() {
 pub(crate) fn adr180_verdict_reuses_178_order_model_no_second_estimator() {
 	let join_order = source("src/binder/join_order.rs");
 	let helper = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+	let rerank = first_block(&join_order, "pub(super) fn measured_order_rerank");
 
 	assert!(join_order.contains("pub(super) fn order_cost"));
-	assert!(helper.contains("recognized_star_order_outcome("));
-	assert!(helper.contains("evidence.confidence"));
+	assert!(helper.contains("measured_order_rerank("));
+	assert!(rerank.contains("rank_star_order("));
+	assert!(rerank.contains("ranking.confidence"));
 	for forbidden in [
 		"join_output_ndv_containment_estimate",
 		"multi_key_join_cardinality",
@@ -432,6 +434,10 @@ pub(crate) fn adr180_verdict_reuses_178_order_model_no_second_estimator() {
 			!helper.contains(forbidden),
 			"ADR180 measured verdict must not call estimator {forbidden}"
 		);
+		assert!(
+			!rerank.contains(forbidden),
+			"ADR180 measured rerank must not call estimator {forbidden}"
+		);
 	}
 }
 
@@ -439,12 +445,14 @@ pub(crate) fn adr180_verdict_reuses_178_order_model_no_second_estimator() {
 pub(crate) fn adr180_measured_helper_sets_applied_order_override() {
 	let join_order = source("src/binder/join_order.rs");
 	let helper = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+	let rerank = first_block(&join_order, "pub(super) fn measured_order_rerank");
 	let recognized = first_block(&join_order, "pub(super) fn recognized_star_order_outcome");
 
 	assert!(recognized.contains("unwrap_or_else(|| ranking.declared_order.clone())"));
-	assert!(helper.contains("let measured_applied_order = applied_order_for_action(&measured);"));
-	assert!(helper.contains("Some(measured_applied_order.clone())"));
-	assert!(helper.contains("measured_applied_order,"));
+	assert!(rerank.contains("let measured_applied_order = applied_order_for_ranking"));
+	assert!(helper.contains("star_order_evidence_from_ranking("));
+	assert!(helper.contains("rerank.measured_applied_order.clone()"));
+	assert!(helper.contains("measured_applied_order: rerank.measured_applied_order"));
 }
 
 #[test]
@@ -893,7 +901,7 @@ pub(crate) fn adr183_snowflake_runtime_replay_ids_from_edges() {
 }
 
 #[test]
-pub(crate) fn adr183_snowflake_runtime_emits_no_verdict() {
+pub(crate) fn adr183_snowflake_runtime_emits_no_flat_star_verdict() {
 	let explain = source("src/binder/explain.rs");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 	let runtime_row = first_block(&explain, "fn optimizer_analyze_snowflake_runtime_row");
@@ -905,7 +913,6 @@ pub(crate) fn adr183_snowflake_runtime_emits_no_verdict() {
 	assert!(snowflake_branch.contains("optimizer_analyze_snowflake_order_row(evidence)"));
 	assert!(snowflake_branch.contains("optimizer_analyze_snowflake_runtime_row"));
 	assert!(!snowflake_branch.contains("optimizer_analyze_join_order_verdict_row"));
-	assert!(!snowflake_branch.contains("measured_star_order_verdict"));
 	assert!(!runtime_row.contains("join_order_verdict"));
 	assert!(!runtime_row.contains("measured_star_order_verdict"));
 }
@@ -992,6 +999,179 @@ pub(crate) fn adr183_cockpit_is_frontend_shared() {
 	assert!(rune.contains("pub fn analyze"));
 	assert!(!rune.contains("join_order_snowflake_runtime"));
 	assert!(!rune.contains("SnowflakeOrderEvidence"));
+}
+
+#[test]
+pub(crate) fn adr184_measured_rerank_is_shared_but_classifiers_are_separate() {
+	let join_order = source("src/binder/join_order.rs");
+	let star = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+	let snowflake = first_block(
+		&join_order,
+		"pub(super) fn measured_snowflake_order_verdict",
+	);
+	let collect = first_block(&join_order, "fn collect_snowflake_order_verdicts");
+
+	assert!(join_order.contains("pub(super) fn measured_order_rerank"));
+	assert!(star.contains("measured_order_rerank("));
+	assert!(collect.contains("measured_order_rerank(&evidence.ranking"));
+	assert!(!snowflake.contains("measured_star_order_verdict"));
+	assert!(!collect.contains("measured_star_order_verdict"));
+	assert!(star.contains("StarOrderVerdict::MisRanked"));
+	assert!(star.contains("StarOrderVerdict::OverEager"));
+	assert!(!collect.contains("StarOrderVerdict::MisRanked"));
+	assert!(!collect.contains("StarOrderVerdict::OverEager"));
+}
+
+#[test]
+pub(crate) fn adr184_snowflake_verdict_enum_has_only_observe_outcomes() {
+	let join_order = source("src/binder/join_order.rs");
+	let verdict = first_block(&join_order, "pub(super) enum SnowflakeOrderVerdictKind");
+
+	assert!(verdict.contains("Vindicated"));
+	assert!(verdict.contains("MissedWin"));
+	assert!(verdict.contains("Indeterminate"));
+	assert!(!verdict.contains("MisRanked"));
+	assert!(!verdict.contains("OverEager"));
+}
+
+#[test]
+pub(crate) fn adr184_snowflake_verdict_uses_183_output_rows() {
+	let explain = source("src/binder/explain.rs");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let snowflake_branch = analyze_rows
+		.split("let Some(StarOrderOutcome::Recognized")
+		.next()
+		.expect("snowflake analyze branch");
+
+	assert!(snowflake_branch.contains("measured_rows_by_dimension"));
+	assert!(snowflake_branch.contains("summary.output_rows"));
+	assert!(!snowflake_branch.contains("summary.build_rows"));
+	assert!(!snowflake_branch.contains("summary.probe_rows"));
+	assert!(snowflake_branch.contains("measured_snowflake_order_verdict"));
+}
+
+#[test]
+pub(crate) fn adr184_snowflake_verdict_reuses_182_tree() {
+	let join_order = source("src/binder/join_order.rs");
+	let helper = first_block(&join_order, "fn collect_snowflake_order_verdicts");
+
+	assert!(helper.contains("for branch in &evidence.branches"));
+	assert!(helper.contains("collect_snowflake_order_verdicts(&branch.evidence"));
+	assert!(!helper.contains("analyze_snowflake"));
+}
+
+#[test]
+pub(crate) fn adr184_snowflake_verdict_detail_renders_real_evidence() {
+	let explain = source("src/binder/explain.rs");
+	let row = first_block(&explain, "fn optimizer_analyze_snowflake_verdict_row");
+	let detail = first_block(&explain, "fn snowflake_order_verdict_detail_label");
+
+	assert!(row.contains("snowflake_order_verdict_detail_label(level)"));
+	assert!(!row.contains("star_order_verdict_detail_label"));
+	assert!(detail.contains("estimated_action="));
+	assert!(detail.contains("level.estimated_ranking.action"));
+	assert!(detail.contains(".strategies"));
+	assert!(detail.contains("snowflake_edge_strategy_label"));
+}
+
+#[test]
+pub(crate) fn adr184_snowflake_verdict_is_observational() {
+	let join_order = source("src/binder/join_order.rs");
+	let explain = source("src/binder/explain.rs");
+	let verdict = first_block(
+		&join_order,
+		"pub(super) fn measured_snowflake_order_verdict",
+	);
+	let collect = first_block(&join_order, "fn collect_snowflake_order_verdicts");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let row = first_block(&explain, "fn optimizer_analyze_snowflake_verdict_row");
+	let aggregate = first_block(
+		&explain,
+		"fn optimizer_analyze_snowflake_aggregate_verdict_row",
+	);
+
+	for forbidden in [
+		"try_bind_star_order_actuation",
+		"bind_star_order_sequence",
+		"choose_join_strategy",
+		"broadcast_cap_replay_trigger",
+		"PlannerConfig",
+		"ExecutionPlan",
+	] {
+		assert!(
+			!verdict.contains(forbidden),
+			"verdict acted via {forbidden}"
+		);
+		assert!(
+			!collect.contains(forbidden),
+			"collector acted via {forbidden}"
+		);
+		assert!(!row.contains(forbidden), "row acted via {forbidden}");
+		assert!(
+			!aggregate.contains(forbidden),
+			"aggregate acted via {forbidden}"
+		);
+	}
+	assert!(analyze_rows.contains("measured_snowflake_order_verdict"));
+}
+
+#[test]
+pub(crate) fn adr184_no_executor_fragment_costmodel_or_wendelon_change() {
+	let manifest = manifest_dir();
+	let markers = [
+		"join_order_snowflake_verdict",
+		"SnowflakeOrderVerdict",
+		"measured_snowflake_order_verdict",
+		"MeasuredOrderRerank",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/catalog.rs"),
+		manifest.join("src/coordinator.rs"),
+		manifest.join("src/sql_planner.rs"),
+		manifest.join("src/distributed"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR184 snowflake verdict leaked below binder/explain:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr184_no_optimizer_shell_or_planproperties_contract() {
+	adr179_no_optimizer_shell();
+}
+
+#[test]
+pub(crate) fn adr184_cockpit_is_frontend_shared() {
+	let binder = binder_source();
+	let explain = source("src/binder/explain.rs");
+	let rune = source("src/rune_engine.rs");
+	let render_explain_analyze = first_block(&binder, "pub(crate) fn render_explain_analyze");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+
+	assert!(render_explain_analyze.contains("optimizer_analyze_plan"));
+	assert!(analyze_rows.contains("optimizer_analyze_snowflake_verdict_row"));
+	assert!(explain.contains("join_order_snowflake_verdict"));
+	assert!(rune.contains("LogicalPlan::ExplainAnalyze"));
+	assert!(rune.contains("pub fn analyze"));
+	assert!(!rune.contains("join_order_snowflake_verdict"));
+	assert!(!rune.contains("SnowflakeOrderVerdict"));
 }
 
 #[test]
