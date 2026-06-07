@@ -283,7 +283,8 @@ fn optimizer_analyze_rows(
 		.iter()
 		.map(|dimension| (dimension.dimension.as_str(), dimension))
 		.collect::<BTreeMap<_, _>>();
-	render_trace
+	let mut measured_rows_by_dimension = BTreeMap::new();
+	let mut rows = render_trace
 		.join_order_edges
 		.iter()
 		.filter_map(|edge| {
@@ -291,8 +292,19 @@ fn optimizer_analyze_rows(
 			let dimension = dimensions.get(dimension)?;
 			Some((edge, *dimension))
 		})
-		.map(|(edge, dimension)| optimizer_analyze_join_order_row(edge, dimension, summaries))
-		.collect()
+		.map(|(edge, dimension)| {
+			let replay_id = join_replay_id_for_trace_target(edge.target)?;
+			if let Some(summary) = summaries.get(&replay_id) {
+				measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
+			}
+			optimizer_analyze_join_order_row(edge, dimension, summaries)
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	rows.push(optimizer_analyze_join_order_verdict_row(
+		evidence,
+		&measured_rows_by_dimension,
+	)?);
+	Ok(rows)
 }
 
 fn optimizer_analyze_join_order_row(
@@ -338,6 +350,25 @@ fn optimizer_analyze_join_order_row(
 		)),
 		ScalarValue::Int64(Some(row_count_to_i64(summary.build_rows, "build_rows")?)),
 		ScalarValue::Int64(Some(row_count_to_i64(summary.probe_rows, "probe_rows")?)),
+	])
+}
+
+fn optimizer_analyze_join_order_verdict_row(
+	evidence: &StarOrderEvidence,
+	measured_rows_by_dimension: &BTreeMap<String, RowCount>,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let verdict = measured_star_order_verdict(evidence, measured_rows_by_dimension);
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_verdict".to_string())),
+		ScalarValue::Utf8(Some("star_path".to_string())),
+		ScalarValue::Utf8(Some(star_order_verdict_label(verdict.verdict).to_string())),
+		ScalarValue::Utf8(Some(star_order_verdict_detail_label(evidence, &verdict))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
 	])
 }
 
@@ -612,6 +643,97 @@ pub(super) fn star_order_action_label(action: StarOrderAction) -> &'static str {
 		StarOrderAction::Reordered => "reordered",
 		StarOrderAction::KeptAlreadyOptimal => "kept_already_optimal",
 		StarOrderAction::KeptInsufficientMargin => "kept_insufficient_margin",
+	}
+}
+
+pub(super) fn star_order_verdict_label(verdict: StarOrderVerdict) -> &'static str {
+	match verdict {
+		StarOrderVerdict::Vindicated => "vindicated",
+		StarOrderVerdict::MisRanked => "mis_ranked",
+		StarOrderVerdict::MissedWin => "missed_win",
+		StarOrderVerdict::OverEager => "over_eager",
+		StarOrderVerdict::Indeterminate => "indeterminate",
+	}
+}
+
+pub(super) fn star_order_verdict_recommendation_label(
+	recommendation: StarOrderVerdictRecommendation,
+) -> &'static str {
+	match recommendation {
+		StarOrderVerdictRecommendation::KeepApplied => "KEEP_APPLIED",
+		StarOrderVerdictRecommendation::WouldReorder => "WOULD_REORDER",
+		StarOrderVerdictRecommendation::WouldKeepDeclared => "WOULD_KEEP_DECLARED",
+		StarOrderVerdictRecommendation::NoRecommendation => "NO_RECOMMENDATION",
+	}
+}
+
+fn star_order_verdict_detail_label(
+	evidence: &StarOrderEvidence,
+	verdict: &StarOrderVerdictReceipt,
+) -> String {
+	let measured = verdict.measured_evidence.as_ref();
+	let measured_action = measured
+		.map(|evidence| star_order_action_label(evidence.action))
+		.unwrap_or("missing");
+	let measured_declared_cost = measured
+		.map(|evidence| evidence.declared_cost.to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	let measured_preferred_cost = measured
+		.map(|evidence| evidence.preferred_cost.to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	format!(
+		"applied_order=[{}]; measured_applied_order=[{}]; original_action={}; measured_action={}; recommendation={}; original_declared_cost={}; original_preferred_cost={}; measured_declared_cost={}; measured_preferred_cost={}; accuracy=[{}]",
+		evidence.applied_order.join(","),
+		verdict.measured_applied_order.join(","),
+		star_order_action_label(evidence.action),
+		measured_action,
+		star_order_verdict_recommendation_label(verdict.recommendation),
+		evidence.declared_cost,
+		evidence.preferred_cost,
+		measured_declared_cost,
+		measured_preferred_cost,
+		verdict
+			.accuracy
+			.iter()
+			.map(star_order_dim_accuracy_label)
+			.collect::<Vec<_>>()
+			.join(",")
+	)
+}
+
+fn star_order_dim_accuracy_label(accuracy: &StarOrderDimAccuracy) -> String {
+	let actual = accuracy
+		.actual_rows
+		.map(|rows| rows.get().to_string())
+		.unwrap_or_else(|| "missing".to_string());
+	let ratio = accuracy
+		.actual_rows
+		.and_then(|actual| {
+			(accuracy.estimated_rows.get() > 0)
+				.then_some(actual.get() as f64 / accuracy.estimated_rows.get() as f64)
+		})
+		.map(|value| format!("{value:.6}"))
+		.unwrap_or_else(|| "missing".to_string());
+	format!(
+		"{}:estimated={}:actual={}:ratio={}:accuracy={}",
+		accuracy.dimension,
+		accuracy.estimated_rows.get(),
+		actual,
+		ratio,
+		star_order_dim_accuracy_kind_label(accuracy)
+	)
+}
+
+fn star_order_dim_accuracy_kind_label(accuracy: &StarOrderDimAccuracy) -> &'static str {
+	let Some(actual_rows) = accuracy.actual_rows else {
+		return "missing";
+	};
+	if actual_rows == accuracy.estimated_rows {
+		"accurate"
+	} else if actual_rows.get() > accuracy.estimated_rows.get() {
+		"under_estimate"
+	} else {
+		"over_estimate"
 	}
 }
 

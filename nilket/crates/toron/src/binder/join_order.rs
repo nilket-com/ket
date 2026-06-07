@@ -91,6 +91,39 @@ pub(super) enum StarOrderOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StarOrderVerdict {
+	Vindicated,
+	MisRanked,
+	MissedWin,
+	OverEager,
+	Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StarOrderVerdictRecommendation {
+	KeepApplied,
+	WouldReorder,
+	WouldKeepDeclared,
+	NoRecommendation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StarOrderDimAccuracy {
+	pub(super) dimension: String,
+	pub(super) estimated_rows: RowCount,
+	pub(super) actual_rows: Option<RowCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StarOrderVerdictReceipt {
+	pub(super) measured_applied_order: Vec<String>,
+	pub(super) verdict: StarOrderVerdict,
+	pub(super) recommendation: StarOrderVerdictRecommendation,
+	pub(super) accuracy: Vec<StarOrderDimAccuracy>,
+	pub(super) measured_evidence: Option<StarOrderEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JoinOrderSourceCapture {
 	Off,
 	On,
@@ -538,6 +571,103 @@ pub(super) fn recognized_star_order_outcome(
 		action,
 		confidence,
 	})
+}
+
+pub(super) fn measured_star_order_verdict(
+	evidence: &StarOrderEvidence,
+	measured_rows_by_dimension: &BTreeMap<String, RowCount>,
+) -> StarOrderVerdictReceipt {
+	let mut measured_dimensions = Vec::with_capacity(evidence.dimensions.len());
+	let mut accuracy = Vec::with_capacity(evidence.dimensions.len());
+	let mut missing_measurement = false;
+	for dimension in &evidence.dimensions {
+		let actual_rows = measured_rows_by_dimension
+			.get(&dimension.dimension)
+			.copied();
+		accuracy.push(StarOrderDimAccuracy {
+			dimension: dimension.dimension.clone(),
+			estimated_rows: dimension.estimated_rows,
+			actual_rows,
+		});
+		let Some(actual_rows) = actual_rows else {
+			missing_measurement = true;
+			continue;
+		};
+		measured_dimensions.push(JoinOrderDimEvidence {
+			dimension: dimension.dimension.clone(),
+			declared_position: dimension.declared_position,
+			estimated_rows: actual_rows,
+			estimate_source: dimension.estimate_source,
+			confidence: dimension.confidence,
+		});
+	}
+	if missing_measurement || measured_dimensions.len() != evidence.dimensions.len() {
+		return StarOrderVerdictReceipt {
+			measured_applied_order: Vec::new(),
+			verdict: StarOrderVerdict::Indeterminate,
+			recommendation: StarOrderVerdictRecommendation::NoRecommendation,
+			accuracy,
+			measured_evidence: None,
+		};
+	}
+
+	let measured = recognized_star_order_outcome(
+		evidence.probe.clone(),
+		measured_dimensions.clone(),
+		None,
+		evidence.confidence,
+	);
+	let StarOrderOutcome::Recognized(measured) = measured else {
+		unreachable!("recognized_star_order_outcome always recognizes");
+	};
+	let measured_applied_order = applied_order_for_action(&measured);
+	let measured = recognized_star_order_outcome(
+		evidence.probe.clone(),
+		measured_dimensions,
+		Some(measured_applied_order.clone()),
+		evidence.confidence,
+	);
+	let StarOrderOutcome::Recognized(measured) = measured else {
+		unreachable!("recognized_star_order_outcome always recognizes");
+	};
+
+	let verdict = if evidence.applied_order == measured.applied_order {
+		StarOrderVerdict::Vindicated
+	} else if evidence.action == StarOrderAction::Reordered
+		&& measured.action == StarOrderAction::Reordered
+	{
+		StarOrderVerdict::MisRanked
+	} else if evidence.action == StarOrderAction::Reordered {
+		StarOrderVerdict::OverEager
+	} else if measured.action == StarOrderAction::Reordered {
+		StarOrderVerdict::MissedWin
+	} else {
+		StarOrderVerdict::Indeterminate
+	};
+	let recommendation = match verdict {
+		StarOrderVerdict::Vindicated => StarOrderVerdictRecommendation::KeepApplied,
+		StarOrderVerdict::MisRanked | StarOrderVerdict::MissedWin => {
+			StarOrderVerdictRecommendation::WouldReorder
+		}
+		StarOrderVerdict::OverEager => StarOrderVerdictRecommendation::WouldKeepDeclared,
+		StarOrderVerdict::Indeterminate => StarOrderVerdictRecommendation::NoRecommendation,
+	};
+
+	StarOrderVerdictReceipt {
+		measured_applied_order,
+		verdict,
+		recommendation,
+		accuracy,
+		measured_evidence: Some(measured),
+	}
+}
+
+fn applied_order_for_action(evidence: &StarOrderEvidence) -> Vec<String> {
+	if evidence.action == StarOrderAction::Reordered {
+		evidence.cost_preferred_order.clone()
+	} else {
+		evidence.declared_order.clone()
+	}
 }
 
 pub(super) fn classify_star_order_action(

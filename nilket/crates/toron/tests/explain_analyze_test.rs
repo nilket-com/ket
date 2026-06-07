@@ -26,6 +26,38 @@ const STAR_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
 	INNER JOIN products p ON o.product_id = p.id \
 	INNER JOIN stores s ON o.store_id = s.id";
 
+#[derive(Debug, Clone, Copy)]
+struct StarFactRows {
+	customers: u64,
+	products: u64,
+	stores: u64,
+}
+
+const DEFAULT_STAR_FACTS: StarFactRows = StarFactRows {
+	customers: 5_000,
+	products: 1_000,
+	stores: 100,
+};
+
+const EQUAL_STAR_FACTS: StarFactRows = StarFactRows {
+	customers: 1_000,
+	products: 1_000,
+	stores: 1_000,
+};
+
+const PRODUCT_FIRST_STAR_FACTS: StarFactRows = StarFactRows {
+	customers: 5_000,
+	products: 100,
+	stores: 1_000,
+};
+
+#[derive(Debug, Clone, Copy)]
+enum StarDataShape {
+	AllMatch,
+	DeclaredThenProductSelective,
+	ProductFirstThenStoreThenCustomerSelective,
+}
+
 #[tokio::test]
 async fn explain_analyze_runs_and_captures_star_join_actuals() {
 	let batch = analyze_star_batch().await;
@@ -36,13 +68,15 @@ async fn explain_analyze_runs_and_captures_star_join_actuals() {
 	assert_eq!(batch.schema().field(6).name(), "ratio");
 
 	let kinds = string_values(&batch, 0);
-	let targets = string_values(&batch, 1);
-	let details = string_values(&batch, 3);
-	let estimated = int64_values(&batch, 4);
-	let actual = int64_values(&batch, 5);
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_runtime");
+	let targets = string_values_for_rows(&batch, 1, &runtime_rows);
+	let details = string_values_for_rows(&batch, 3, &runtime_rows);
+	let estimated = int64_values_for_rows(&batch, 4, &runtime_rows);
+	let actual = int64_values_for_rows(&batch, 5, &runtime_rows);
 
-	assert_eq!(batch.num_rows(), 3);
-	assert!(kinds.iter().all(|kind| kind == "join_order_runtime"));
+	assert_eq!(runtime_rows.len(), 3);
+	assert_eq!(row_indices_for_kind(&batch, "join_order_verdict").len(), 1);
+	assert!(kinds.iter().any(|kind| kind == "join_order_verdict"));
 	assert!(targets.iter().any(|target| target.contains("dimension=c")));
 	assert!(targets.iter().any(|target| target.contains("dimension=p")));
 	assert!(targets.iter().any(|target| target.contains("dimension=s")));
@@ -60,23 +94,24 @@ async fn explain_analyze_runs_and_captures_star_join_actuals() {
 #[tokio::test]
 async fn measured_vs_estimated_record_carries_both_sides() {
 	let batch = analyze_star_batch().await;
-	let estimated = int64_values(&batch, 4);
-	let actual = int64_values(&batch, 5);
-	let ratio = float64_values(&batch, 6);
-	let sources = string_values(&batch, 7);
-	let build_rows = int64_values(&batch, 8);
-	let probe_rows = int64_values(&batch, 9);
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_runtime");
+	let estimated = int64_values_for_rows(&batch, 4, &runtime_rows);
+	let actual = int64_values_for_rows(&batch, 5, &runtime_rows);
+	let ratio = float64_values_for_rows(&batch, 6, &runtime_rows);
+	let sources = string_values_for_rows(&batch, 7, &runtime_rows);
+	let build_rows = int64_values_for_rows(&batch, 8, &runtime_rows);
+	let probe_rows = int64_values_for_rows(&batch, 9, &runtime_rows);
 
-	assert_eq!(batch.num_rows(), 3);
-	for row in 0..batch.num_rows() {
-		assert!(estimated[row] > 0);
-		assert!(actual[row] > 0);
-		assert!(build_rows[row] > 0);
-		assert!(probe_rows[row] > 0);
-		assert!(!sources[row].is_empty());
+	assert_eq!(runtime_rows.len(), 3);
+	for idx in 0..runtime_rows.len() {
+		assert!(estimated[idx] > 0);
+		assert!(actual[idx] > 0);
+		assert!(build_rows[idx] > 0);
+		assert!(probe_rows[idx] > 0);
+		assert!(!sources[idx].is_empty());
 		assert!(
-			(ratio[row] - (actual[row] as f64 / estimated[row] as f64)).abs() < f64::EPSILON,
-			"ratio should be actual/estimated at row {row}"
+			(ratio[idx] - (actual[idx] as f64 / estimated[idx] as f64)).abs() < f64::EPSILON,
+			"ratio should be actual/estimated at runtime row {idx}"
 		);
 	}
 }
@@ -84,8 +119,9 @@ async fn measured_vs_estimated_record_carries_both_sides() {
 #[tokio::test]
 async fn known_miss_star_runtime_evidence_shows_divergence() {
 	let batch = analyze_star_batch().await;
-	let estimated = int64_values(&batch, 4);
-	let actual = int64_values(&batch, 5);
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_runtime");
+	let estimated = int64_values_for_rows(&batch, 4, &runtime_rows);
+	let actual = int64_values_for_rows(&batch, 5, &runtime_rows);
 
 	assert!(
 		estimated
@@ -99,7 +135,8 @@ async fn known_miss_star_runtime_evidence_shows_divergence() {
 #[tokio::test]
 async fn measured_record_correlates_by_replay_id() {
 	let batch = analyze_star_batch().await;
-	let targets = string_values(&batch, 1);
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_runtime");
+	let targets = string_values_for_rows(&batch, 1, &runtime_rows);
 	let dimensions = targets
 		.iter()
 		.map(|target| {
@@ -119,7 +156,7 @@ async fn measured_record_correlates_by_replay_id() {
 		})
 		.collect::<BTreeSet<_>>();
 
-	assert_eq!(batch.num_rows(), 3);
+	assert_eq!(runtime_rows.len(), 3);
 	assert_eq!(
 		dimensions,
 		BTreeSet::from(["c".to_string(), "p".to_string(), "s".to_string()])
@@ -133,7 +170,8 @@ async fn cockpit_renders_estimated_vs_actual() {
 	let schema = batch.schema();
 	let fields = schema.fields();
 	let field_names = fields.iter().map(|field| field.name()).collect::<Vec<_>>();
-	let details = string_values(&batch, 3);
+	let runtime_rows = row_indices_for_kind(&batch, "join_order_runtime");
+	let details = string_values_for_rows(&batch, 3, &runtime_rows);
 
 	assert_eq!(
 		field_names,
@@ -158,6 +196,181 @@ async fn cockpit_renders_estimated_vs_actual() {
 			&& detail.contains("build_rows=")
 			&& detail.contains("probe_rows=")
 	}));
+}
+
+#[tokio::test]
+async fn verdict_vindicated_when_measured_178_would_apply_same_order() {
+	let batch = analyze_star_batch_with(EQUAL_STAR_FACTS, StarDataShape::AllMatch).await;
+	let row = join_order_verdict_row(&batch);
+
+	assert_eq!(string_value_at(&batch, 2, row), "vindicated");
+	let detail = string_value_at(&batch, 3, row);
+	assert!(detail.contains("recommendation=KEEP_APPLIED"), "{detail}");
+	assert!(
+		detail.contains("measured_action=kept_already_optimal"),
+		"{detail}"
+	);
+	assert!(
+		detail.contains("applied_order=[c,p,s]; measured_applied_order=[c,p,s]"),
+		"{detail}"
+	);
+}
+
+#[tokio::test]
+async fn verdict_misranked_when_reorder_picks_wrong() {
+	let batch = analyze_star_batch_with(
+		PRODUCT_FIRST_STAR_FACTS,
+		StarDataShape::ProductFirstThenStoreThenCustomerSelective,
+	)
+	.await;
+	let row = join_order_verdict_row(&batch);
+
+	assert_eq!(string_value_at(&batch, 2, row), "mis_ranked");
+	let detail = string_value_at(&batch, 3, row);
+	assert!(detail.contains("recommendation=WOULD_REORDER"), "{detail}");
+	assert!(
+		detail.contains("applied_order=[p,s,c]; measured_applied_order=[c,s,p]"),
+		"{detail}"
+	);
+}
+
+#[tokio::test]
+async fn verdict_missed_win_when_margin_declined_a_real_win() {
+	let batch = analyze_star_batch_with(
+		EQUAL_STAR_FACTS,
+		StarDataShape::DeclaredThenProductSelective,
+	)
+	.await;
+	let row = join_order_verdict_row(&batch);
+
+	assert_eq!(string_value_at(&batch, 2, row), "missed_win");
+	let detail = string_value_at(&batch, 3, row);
+	assert!(detail.contains("recommendation=WOULD_REORDER"), "{detail}");
+	assert!(
+		detail.contains("applied_order=[c,p,s]; measured_applied_order=[p,s,c]"),
+		"{detail}"
+	);
+}
+
+#[tokio::test]
+async fn verdict_overeager_when_measurement_would_keep_declared() {
+	let batch = analyze_star_batch().await;
+	let row = join_order_verdict_row(&batch);
+
+	assert_eq!(string_value_at(&batch, 2, row), "over_eager");
+	let detail = string_value_at(&batch, 3, row);
+	assert!(
+		detail.contains("recommendation=WOULD_KEEP_DECLARED"),
+		"{detail}"
+	);
+	assert!(
+		detail.contains("applied_order=[s,p,c]; measured_applied_order=[c,p,s]"),
+		"{detail}"
+	);
+}
+
+#[tokio::test]
+async fn verdict_reports_per_dim_estimate_accuracy() {
+	let batch = analyze_star_batch().await;
+	let detail = string_value_at(&batch, 3, join_order_verdict_row(&batch));
+
+	assert!(detail.contains("accuracy=["), "{detail}");
+	for dimension in ["c", "p", "s"] {
+		assert!(
+			detail.contains(&format!("{dimension}:estimated=")),
+			"{detail}"
+		);
+		assert!(detail.contains(":actual=4:"), "{detail}");
+		assert!(detail.contains(":ratio="), "{detail}");
+		assert!(detail.contains(":accuracy=over_estimate"), "{detail}");
+	}
+}
+
+#[tokio::test]
+async fn verdict_uses_output_rows_not_build_or_probe_rows() {
+	let batch = analyze_star_batch().await;
+	let detail = string_value_at(&batch, 3, join_order_verdict_row(&batch));
+
+	assert!(detail.contains(":actual=4:"), "{detail}");
+	assert!(!detail.contains("build_rows"), "{detail}");
+	assert!(!detail.contains("probe_rows"), "{detail}");
+}
+
+#[tokio::test]
+async fn verdict_is_interpretation_only() {
+	let (catalog, storage) = star_fixture().await;
+	let coordinator = coordinator(catalog, storage);
+	let planner = SqlPlanner::new();
+	let query = planner.plan(STAR_SQL).expect("plan star query");
+	let analyze = planner
+		.plan(&format!("EXPLAIN ANALYZE {STAR_SQL}"))
+		.expect("plan star analyze");
+
+	let before = execute_single_batch(&coordinator, &query).await;
+	let analysis = execute_single_batch(&coordinator, &analyze).await;
+	let after = execute_single_batch(&coordinator, &query).await;
+
+	assert_eq!(
+		string_value_at(&analysis, 0, join_order_verdict_row(&analysis)),
+		"join_order_verdict"
+	);
+	assert_eq!(
+		format!("{:?}", before.schema()),
+		format!("{:?}", after.schema())
+	);
+	assert_eq!(int64_values(&before, 0), int64_values(&after, 0));
+}
+
+#[tokio::test]
+async fn verdict_does_not_act() {
+	let (catalog, storage) = star_fixture().await;
+	let coordinator = coordinator(catalog, storage);
+	let planner = SqlPlanner::new();
+	let explain = planner
+		.plan(&format!("EXPLAIN {STAR_SQL}"))
+		.expect("plan star explain");
+	let analyze = planner
+		.plan(&format!("EXPLAIN ANALYZE {STAR_SQL}"))
+		.expect("plan star analyze");
+
+	let before = execute_single_batch(&coordinator, &explain).await;
+	let _analysis = execute_single_batch(&coordinator, &analyze).await;
+	let after = execute_single_batch(&coordinator, &explain).await;
+
+	assert_eq!(string_values(&before, 3), string_values(&after, 3));
+	assert!(
+		string_values(&after, 3)
+			.iter()
+			.any(|detail| detail.contains("applied_order=[s,p,c]")),
+		"EXPLAIN should still report the original ADR178 applied order"
+	);
+}
+
+#[tokio::test]
+async fn ordinary_explain_has_no_runtime_verdict() {
+	let (catalog, storage) = star_fixture().await;
+	let coordinator = coordinator(catalog, storage);
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {STAR_SQL}"))
+		.expect("plan star EXPLAIN");
+	let batch = execute_single_batch(&coordinator, &logical).await;
+
+	assert!(row_indices_for_kind(&batch, "join_order_verdict").is_empty());
+	assert_eq!(row_indices_for_kind(&batch, "join_order").len(), 1);
+}
+
+#[tokio::test]
+async fn cockpit_renders_verdict() {
+	let batch = analyze_star_batch().await;
+	let row = join_order_verdict_row(&batch);
+
+	assert_eq!(string_value_at(&batch, 0, row), "join_order_verdict");
+	assert_eq!(string_value_at(&batch, 1, row), "star_path");
+	let detail = string_value_at(&batch, 3, row);
+	assert!(detail.contains("measured_applied_order="), "{detail}");
+	assert!(detail.contains("measured_action="), "{detail}");
+	assert!(detail.contains("recommendation="), "{detail}");
+	assert!(detail.contains("accuracy=["), "{detail}");
 }
 
 #[tokio::test]
@@ -206,7 +419,11 @@ async fn explain_analyze_was_previously_rejected_now_implemented() {
 }
 
 async fn analyze_star_batch() -> RecordBatch {
-	let (catalog, storage) = star_fixture().await;
+	analyze_star_batch_with(DEFAULT_STAR_FACTS, StarDataShape::AllMatch).await
+}
+
+async fn analyze_star_batch_with(facts: StarFactRows, data_shape: StarDataShape) -> RecordBatch {
+	let (catalog, storage) = star_fixture_with(facts, data_shape).await;
 	let coordinator = coordinator(catalog, storage);
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN ANALYZE {STAR_SQL}"))
@@ -248,6 +465,13 @@ fn coordinator(catalog: Arc<MockCatalog>, storage: Arc<InMemoryTableStorage>) ->
 }
 
 async fn star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
+	star_fixture_with(DEFAULT_STAR_FACTS, StarDataShape::AllMatch).await
+}
+
+async fn star_fixture_with(
+	facts: StarFactRows,
+	data_shape: StarDataShape,
+) -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
 	let mut catalog = MockCatalog::new();
 	let storage = Arc::new(InMemoryTableStorage::new());
 
@@ -279,20 +503,15 @@ async fn star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
 		.register_descriptor(TableId(24), stores.clone())
 		.expect("register stores");
 
-	seed_star_facts(&mut catalog);
+	seed_star_facts(&mut catalog, facts);
 
 	write_table(
 		storage.as_ref(),
 		TableId(21),
 		&orders,
-		record_batch(
+		orders_batch(
 			orders.arrow_schema().expect("orders schema").into(),
-			vec![
-				Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-				Arc::new(Int64Array::from(vec![10, 20, 10, 30])),
-				Arc::new(Int64Array::from(vec![100, 100, 200, 300])),
-				Arc::new(Int64Array::from(vec![1000, 2000, 1000, 3000])),
-			],
+			data_shape,
 		),
 	)
 	.await;
@@ -302,7 +521,7 @@ async fn star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
 		&customers,
 		id_batch(
 			customers.arrow_schema().expect("customers schema").into(),
-			&[10, 20, 30],
+			customer_ids(data_shape),
 		),
 	)
 	.await;
@@ -312,7 +531,7 @@ async fn star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
 		&products,
 		id_batch(
 			products.arrow_schema().expect("products schema").into(),
-			&[100, 200, 300],
+			product_ids(data_shape),
 		),
 	)
 	.await;
@@ -322,7 +541,7 @@ async fn star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
 		&stores,
 		id_batch(
 			stores.arrow_schema().expect("stores schema").into(),
-			&[1000, 2000, 3000],
+			store_ids(data_shape),
 		),
 	)
 	.await;
@@ -330,12 +549,12 @@ async fn star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
 	(Arc::new(catalog), storage)
 }
 
-fn seed_star_facts(catalog: &mut MockCatalog) {
+fn seed_star_facts(catalog: &mut MockCatalog, facts: StarFactRows) {
 	for (table, rows, ndv) in [
 		("orders", 100_000, vec![(1, 100), (2, 100), (3, 100)]),
-		("customers", 5_000, vec![(0, 100)]),
-		("products", 1_000, vec![(0, 100)]),
-		("stores", 100, vec![(0, 100)]),
+		("customers", facts.customers, vec![(0, 100)]),
+		("products", facts.products, vec![(0, 100)]),
+		("stores", facts.stores, vec![(0, 100)]),
 	] {
 		catalog
 			.seed_optimizer_facts(
@@ -352,6 +571,54 @@ fn seed_star_facts(catalog: &mut MockCatalog) {
 				},
 			)
 			.expect("seed optimizer facts");
+	}
+}
+
+fn orders_batch(schema: SchemaRef, data_shape: StarDataShape) -> RecordBatch {
+	match data_shape {
+		StarDataShape::AllMatch => record_batch(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+				Arc::new(Int64Array::from(vec![10, 20, 10, 30])),
+				Arc::new(Int64Array::from(vec![100, 100, 200, 300])),
+				Arc::new(Int64Array::from(vec![1000, 2000, 1000, 3000])),
+			],
+		),
+		StarDataShape::DeclaredThenProductSelective
+		| StarDataShape::ProductFirstThenStoreThenCustomerSelective => record_batch(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+				Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+				Arc::new(Int64Array::from(vec![100, 200, 100, 300])),
+				Arc::new(Int64Array::from(vec![1000, 1000, 2000, 3000])),
+			],
+		),
+	}
+}
+
+fn customer_ids(data_shape: StarDataShape) -> &'static [i64] {
+	match data_shape {
+		StarDataShape::AllMatch | StarDataShape::DeclaredThenProductSelective => &[10, 20, 30, 40],
+		StarDataShape::ProductFirstThenStoreThenCustomerSelective => &[10],
+	}
+}
+
+fn product_ids(data_shape: StarDataShape) -> &'static [i64] {
+	match data_shape {
+		StarDataShape::AllMatch | StarDataShape::ProductFirstThenStoreThenCustomerSelective => {
+			&[100, 200, 300]
+		}
+		StarDataShape::DeclaredThenProductSelective => &[100],
+	}
+}
+
+fn store_ids(data_shape: StarDataShape) -> &'static [i64] {
+	match data_shape {
+		StarDataShape::AllMatch => &[1000, 2000, 3000],
+		StarDataShape::DeclaredThenProductSelective
+		| StarDataShape::ProductFirstThenStoreThenCustomerSelective => &[1000, 2000],
 	}
 }
 
@@ -419,6 +686,21 @@ fn string_values(batch: &RecordBatch, column: usize) -> Vec<String> {
 		.collect()
 }
 
+fn string_values_for_rows(batch: &RecordBatch, column: usize, rows: &[usize]) -> Vec<String> {
+	rows.iter()
+		.map(|row| string_value_at(batch, column, *row))
+		.collect()
+}
+
+fn string_value_at(batch: &RecordBatch, column: usize, row: usize) -> String {
+	let array = batch
+		.column(column)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("string array");
+	array.value(row).to_string()
+}
+
 fn int64_values(batch: &RecordBatch, column: usize) -> Vec<i64> {
 	let array = batch
 		.column(column)
@@ -428,11 +710,37 @@ fn int64_values(batch: &RecordBatch, column: usize) -> Vec<i64> {
 	(0..array.len()).map(|row| array.value(row)).collect()
 }
 
-fn float64_values(batch: &RecordBatch, column: usize) -> Vec<f64> {
+fn int64_values_for_rows(batch: &RecordBatch, column: usize, rows: &[usize]) -> Vec<i64> {
+	let array = batch
+		.column(column)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("int64 array");
+	rows.iter().map(|row| array.value(*row)).collect()
+}
+
+fn float64_values_for_rows(batch: &RecordBatch, column: usize, rows: &[usize]) -> Vec<f64> {
 	let array = batch
 		.column(column)
 		.as_any()
 		.downcast_ref::<arrow::array::Float64Array>()
 		.expect("float64 array");
-	(0..array.len()).map(|row| array.value(row)).collect()
+	rows.iter().map(|row| array.value(*row)).collect()
+}
+
+fn row_indices_for_kind(batch: &RecordBatch, expected_kind: &str) -> Vec<usize> {
+	let kinds = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("decision_kind string array");
+	(0..batch.num_rows())
+		.filter(|row| kinds.value(*row) == expected_kind)
+		.collect()
+}
+
+fn join_order_verdict_row(batch: &RecordBatch) -> usize {
+	let rows = row_indices_for_kind(batch, "join_order_verdict");
+	assert_eq!(rows.len(), 1, "expected one join_order_verdict row");
+	rows[0]
 }

@@ -410,6 +410,176 @@ pub(crate) fn adr179_no_fragment_or_wendelon_storage_pbc_change() {
 }
 
 #[test]
+pub(crate) fn adr180_verdict_reuses_178_order_model_no_second_estimator() {
+	let join_order = source("src/binder/join_order.rs");
+	let helper = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+
+	assert!(join_order.contains("pub(super) fn order_cost"));
+	assert!(helper.contains("recognized_star_order_outcome("));
+	assert!(helper.contains("evidence.confidence"));
+	for forbidden in [
+		"join_output_ndv_containment_estimate",
+		"multi_key_join_cardinality",
+		"join_estimated_row_count_for_keys",
+		"estimate_join_order_edge_from_sources",
+		"join_order_edge_estimate",
+		"filter_range_selectivity_estimated_row_count",
+	] {
+		assert!(
+			!helper.contains(forbidden),
+			"ADR180 measured verdict must not call estimator {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr180_measured_helper_sets_applied_order_override() {
+	let join_order = source("src/binder/join_order.rs");
+	let helper = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+	let recognized = first_block(&join_order, "pub(super) fn recognized_star_order_outcome");
+
+	assert!(recognized.contains("unwrap_or_else(|| declared_order.clone())"));
+	assert!(helper.contains("let measured_applied_order = applied_order_for_action(&measured);"));
+	assert!(helper.contains("Some(measured_applied_order.clone())"));
+	assert!(helper.contains("measured_applied_order,"));
+}
+
+#[test]
+pub(crate) fn adr180_verdict_compares_star_evidence_applied_order() {
+	let join_order = source("src/binder/join_order.rs");
+	let helper = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+
+	assert!(helper.contains("evidence.applied_order == measured.applied_order"));
+	assert!(helper.contains("StarOrderVerdict::Vindicated"));
+	assert!(helper.contains("StarOrderVerdict::MisRanked"));
+	assert!(helper.contains("StarOrderVerdict::MissedWin"));
+	assert!(helper.contains("StarOrderVerdict::OverEager"));
+}
+
+#[test]
+pub(crate) fn adr180_verdict_uses_runtime_output_rows() {
+	let explain = source("src/binder/explain.rs");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let verdict_row = first_block(&explain, "fn optimizer_analyze_join_order_verdict_row");
+
+	assert!(analyze_rows.contains("summary.output_rows"));
+	assert!(!analyze_rows.contains("summary.build_rows"));
+	assert!(!analyze_rows.contains("summary.probe_rows"));
+	assert!(
+		verdict_row.contains("measured_star_order_verdict(evidence, measured_rows_by_dimension)")
+	);
+}
+
+#[test]
+pub(crate) fn adr180_verdict_is_interpretation_only() {
+	let explain = source("src/binder/explain.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let verdict_row = first_block(&explain, "fn optimizer_analyze_join_order_verdict_row");
+	let helper = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+
+	assert!(verdict_row.contains("join_order_verdict"));
+	assert!(verdict_row.contains("ScalarValue::Int64(None)"));
+	assert!(!verdict_row.contains("ExecutionPlan::"));
+	assert!(!verdict_row.contains("PlannerConfig"));
+	assert!(!helper.contains("ExecutionPlan::"));
+	assert!(!helper.contains("PlannerConfig"));
+	assert!(!helper.contains("JoinRuntimeObservationMode"));
+}
+
+#[test]
+pub(crate) fn adr180_verdict_does_not_act() {
+	let coordinator = source("src/coordinator.rs");
+	let explain = source("src/binder/explain.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let render = first_block(&explain, "fn optimizer_analyze_join_order_verdict_row");
+	let helper = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
+
+	for forbidden in [
+		"force_hash_join_ids",
+		"PlannerConfig",
+		"broadcast_cap_replay_trigger",
+		"force_declared_join_order",
+		"spill_replay_trigger",
+	] {
+		assert!(!render.contains(forbidden), "render acted via {forbidden}");
+		assert!(!helper.contains(forbidden), "helper acted via {forbidden}");
+	}
+	assert!(coordinator.contains("broadcast_cap_replay_trigger"));
+	assert!(!explain.contains("broadcast_cap_replay_trigger"));
+}
+
+#[test]
+pub(crate) fn adr180_runtime_correlation_remains_replay_id_keyed() {
+	let explain = source("src/binder/explain.rs");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let runtime_row = first_block(&explain, "fn optimizer_analyze_join_order_row");
+
+	assert!(analyze_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(analyze_rows.contains("summaries.get(&replay_id)"));
+	assert!(runtime_row.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(runtime_row.contains("summaries.get(&replay_id)"));
+}
+
+#[test]
+pub(crate) fn adr180_no_exec_or_fragment_change() {
+	let manifest = manifest_dir();
+	let markers = [
+		"join_order_verdict",
+		"StarOrderVerdict",
+		"StarOrderVerdictReceipt",
+		"StarOrderDimAccuracy",
+		"MeasuredOrderDiffers",
+		"MissedWin",
+		"OverEager",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/distributed/task.rs"),
+		manifest.join("src/distributed/fragment.rs"),
+		manifest.join("src/distributed/scheduler.rs"),
+		manifest.join("src/server/mod.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/catalog.rs"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR180 verdict vocabulary leaked below binder/explain or across storage boundary:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr180_rune_and_sql_share_analyze_renderer() {
+	let binder = binder_source();
+	let rune = source("src/rune_engine.rs");
+	let render_explain_analyze = first_block(&binder, "pub(crate) fn render_explain_analyze");
+
+	assert!(render_explain_analyze.contains("optimizer_analyze_plan"));
+	assert!(rune.contains("LogicalPlan::ExplainAnalyze"));
+	assert!(rune.contains("pub fn analyze"));
+	assert!(!rune.contains("join_order_verdict"));
+	assert!(!rune.contains("StarOrderVerdict"));
+}
+
+#[test]
+pub(crate) fn adr180_no_optimizer_shell() {
+	adr179_no_optimizer_shell();
+}
+
+#[test]
 pub(crate) fn adr179_no_optimizer_shell() {
 	let manifest = manifest_dir();
 	assert!(!manifest.join("src/optimizer.rs").exists());

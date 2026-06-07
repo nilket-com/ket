@@ -8792,6 +8792,56 @@ async fn star_order_evidence_is_explain_gated() {
 	assert!(render_trace.join_order.is_some());
 }
 
+#[test]
+fn verdict_indeterminate_on_missing_actuals() {
+	let evidence = recognized_star_order_outcome(
+		"o".to_string(),
+		vec![
+			JoinOrderDimEvidence {
+				dimension: "c".to_string(),
+				declared_position: 0,
+				estimated_rows: RowCount::new(1_000),
+				estimate_source: JoinOrderEstimateSource::SingleKeyNdvContainment,
+				confidence: JoinOrderEstimateConfidence::Hard,
+			},
+			JoinOrderDimEvidence {
+				dimension: "p".to_string(),
+				declared_position: 1,
+				estimated_rows: RowCount::new(100),
+				estimate_source: JoinOrderEstimateSource::SingleKeyNdvContainment,
+				confidence: JoinOrderEstimateConfidence::Hard,
+			},
+		],
+		Some(vec!["p".to_string(), "c".to_string()]),
+		JoinOrderEstimateConfidence::Hard,
+	);
+	let StarOrderOutcome::Recognized(evidence) = evidence else {
+		panic!("recognized fixture");
+	};
+
+	let verdict = measured_star_order_verdict(
+		&evidence,
+		&BTreeMap::from([("c".to_string(), RowCount::new(10))]),
+	);
+
+	assert_eq!(verdict.verdict, StarOrderVerdict::Indeterminate);
+	assert_eq!(
+		verdict.recommendation,
+		StarOrderVerdictRecommendation::NoRecommendation
+	);
+	assert!(verdict.measured_evidence.is_none());
+	assert!(verdict.measured_applied_order.is_empty());
+	assert_eq!(
+		verdict
+			.accuracy
+			.iter()
+			.filter(|accuracy| accuracy.actual_rows.is_none())
+			.map(|accuracy| accuracy.dimension.as_str())
+			.collect::<Vec<_>>(),
+		vec!["p"]
+	);
+}
+
 #[tokio::test]
 async fn rune_explain_shows_star_order_evidence() {
 	let catalog = star_join_order_catalog();
@@ -8825,6 +8875,64 @@ async fn rune_explain_shows_star_order_evidence() {
 	assert_eq!(row[2], ScalarValue::Utf8(Some("reordered".to_string())));
 	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
 	assert_utf8_contains(&row[3], "applied_order=[s,p,c]");
+}
+
+#[tokio::test]
+async fn rune_analyze_renders_star_order_verdict() {
+	let catalog = star_join_order_catalog();
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o")
+               .auto_join(
+                   ctx.table("customers").alias("c"),
+                   qcol("o", "customer_id").eq(qcol("c", "id"))
+               )
+               .auto_join(
+                   ctx.table("products").alias("p"),
+                   qcol("o", "product_id").eq(qcol("p", "id"))
+               )
+               .auto_join(
+                   ctx.table("stores").alias("s"),
+                   qcol("o", "store_id").eq(qcol("s", "id"))
+               )
+               .analyze()
+        }
+	"#,
+	)
+	.await;
+	let LogicalPlan::ExplainAnalyze { input } = logical else {
+		panic!("expected Rune analyze logical plan");
+	};
+	let binding = bind_explain_analyze(&input, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+		.await
+		.expect("bind Rune analyze star");
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::Broadcast,
+			build_rows: RowCount::new(4),
+			probe_rows: RowCount::new(4),
+			output_rows: RowCount::new(4),
+		})
+		.collect::<Vec<_>>();
+
+	let plan = render_explain_analyze(binding, &observations).expect("render Rune analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+	let verdict = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_verdict".to_string())))
+		.expect("Rune analyze verdict row");
+
+	assert_eq!(
+		verdict[2],
+		ScalarValue::Utf8(Some("over_eager".to_string()))
+	);
+	assert_utf8_contains(&verdict[3], "recommendation=WOULD_KEEP_DECLARED");
 }
 
 #[tokio::test]
