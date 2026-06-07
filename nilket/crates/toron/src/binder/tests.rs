@@ -8403,16 +8403,22 @@ async fn explain_probe_not_scan_linear_reports_hash_reason_detail() {
 
 	let (_schema, rows) =
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let join_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join".to_string())))
+		.collect::<Vec<_>>();
 
-	assert_eq!(rows.len(), 2);
-	assert_eq!(rows[1][0], ScalarValue::Utf8(Some("join".to_string())));
-	assert_eq!(rows[1][1], ScalarValue::Utf8(Some("join[1]".to_string())));
+	assert_eq!(join_rows.len(), 2);
 	assert_eq!(
-		rows[1][2],
+		join_rows[1][1],
+		ScalarValue::Utf8(Some("join[1]".to_string()))
+	);
+	assert_eq!(
+		join_rows[1][2],
 		ScalarValue::Utf8(Some("hash_partitioned".to_string()))
 	);
 	assert_eq!(
-		rows[1][3],
+		join_rows[1][3],
 		ScalarValue::Utf8(Some(
 			"natural:hash_by_default:probe_not_scan_linear".to_string()
 		))
@@ -8434,17 +8440,23 @@ async fn explain_broadcast_star_emits_one_receipt_per_link() {
 
 	let (_schema, rows) =
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let join_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join".to_string())))
+		.collect::<Vec<_>>();
 
-	assert_eq!(rows.len(), 2);
+	assert_eq!(join_rows.len(), 2);
 	assert_eq!(
-		rows.iter().map(|row| row[1].clone()).collect::<Vec<_>>(),
+		join_rows
+			.iter()
+			.map(|row| row[1].clone())
+			.collect::<Vec<_>>(),
 		vec![
 			ScalarValue::Utf8(Some("join[0]".to_string())),
 			ScalarValue::Utf8(Some("join[1]".to_string()))
 		]
 	);
-	for row in rows {
-		assert_eq!(row[0], ScalarValue::Utf8(Some("join".to_string())));
+	for row in join_rows {
 		assert_eq!(row[2], ScalarValue::Utf8(Some("broadcast".to_string())));
 		assert_eq!(
 			row[3],
@@ -8493,14 +8505,219 @@ async fn explain_emits_one_row_per_join_in_index_order() {
 
 	let (_schema, rows) =
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let join_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join".to_string())))
+		.collect::<Vec<_>>();
 
 	assert_eq!(
-		rows.iter().map(|row| row[1].clone()).collect::<Vec<_>>(),
+		join_rows
+			.iter()
+			.map(|row| row[1].clone())
+			.collect::<Vec<_>>(),
 		vec![
 			ScalarValue::Utf8(Some("join[0]".to_string())),
 			ScalarValue::Utf8(Some("join[1]".to_string()))
 		]
 	);
+}
+
+#[tokio::test]
+async fn star_order_evidence_reports_declared_vs_preferred() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
+		.expect("plan non-optimal star EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(row[0], ScalarValue::Utf8(Some("join_order".to_string())));
+	assert_eq!(row[1], ScalarValue::Utf8(Some("star[probe=o]".to_string())));
+	assert_eq!(row[2], ScalarValue::Utf8(Some("orders_differ".to_string())));
+	assert_utf8_contains(&row[3], "declared_order=[c,p,s]");
+	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
+	assert_utf8_contains(&row[3], "c:5000000:single_key_ndv_containment");
+	assert_utf8_contains(&row[3], "p:1000000:single_key_ndv_containment");
+	assert_utf8_contains(&row[3], "s:100000:single_key_ndv_containment");
+}
+
+#[tokio::test]
+async fn star_order_evidence_is_observational() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+
+	let (plain_plan, plain_trace) =
+		bind_with_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind without render trace");
+	let (explain_plan, explain_trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind with render trace");
+
+	assert_eq!(plain_trace, explain_trace);
+	assert_eq!(format!("{plain_plan:?}"), format!("{explain_plan:?}"));
+	assert!(matches!(
+		render_trace.join_order,
+		Some(StarOrderOutcome::Recognized(StarOrderEvidence {
+			orders_agree: false,
+			..
+		}))
+	));
+}
+
+#[tokio::test]
+async fn non_star_join_declines_with_reason() {
+	let mut catalog = star_join_order_catalog();
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	let logical = LogicalPlan::Explain {
+		input: Box::new(nested_hash_probe_with_tiny_right()),
+	};
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(row[2], ScalarValue::Utf8(Some("declined".to_string())));
+	assert_utf8_contains(&row[3], "reason=probe_not_scan_linear");
+}
+
+#[tokio::test]
+async fn star_order_evidence_agrees_when_declared_is_optimal() {
+	let catalog = star_join_order_catalog();
+	let sql = "SELECT * FROM orders o \
+			   INNER JOIN stores s ON o.store_id = s.id \
+			   INNER JOIN products p ON o.product_id = p.id \
+			   INNER JOIN customers c ON o.customer_id = c.id";
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {sql}"))
+		.expect("plan optimal star EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(row[2], ScalarValue::Utf8(Some("orders_agree".to_string())));
+	assert_utf8_contains(&row[3], "declared_order=[s,p,c]");
+	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
+}
+
+#[tokio::test]
+async fn star_order_evidence_estimates_match_join_estimates() {
+	let mut catalog = star_join_order_catalog();
+	let single_edge = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o \
+			 INNER JOIN customers c ON o.customer_id = c.id",
+		)
+		.expect("plan first star edge");
+	let scoped = Binder {
+		catalog: &catalog,
+		config: &auto_broadcast_config(64 * 1024 * 1024),
+	}
+	.bind_plan(&single_edge)
+	.await
+	.expect("bind first star edge");
+	assert_eq!(
+		scoped.facts.estimated_row_count,
+		Some(RowCount::new(5_000_000))
+	);
+
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
+		.expect("plan star EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let row = join_order_row(&rows);
+	assert_utf8_contains(&row[3], "c:5000000:single_key_ndv_containment");
+
+	seed_table_optimizer_facts(&mut catalog, "stores", None, Some(100), Vec::new());
+	let missing_estimate = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_star_order_sql()))
+		.expect("plan missing-estimate star EXPLAIN");
+	let (_schema, rows) = bind_explain_rows(
+		&missing_estimate,
+		&catalog,
+		&auto_broadcast_config(64 * 1024 * 1024),
+	)
+	.await;
+	assert_utf8_contains(&join_order_row(&rows)[3], "reason=missing_estimate");
+}
+
+#[tokio::test]
+async fn star_recognition_respects_scan_linear_probe_fence() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	let logical = LogicalPlan::Explain {
+		input: Box::new(nested_hash_probe_with_tiny_right()),
+	};
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+
+	assert_utf8_contains(&join_order_row(&rows)[3], "reason=probe_not_scan_linear");
+}
+
+#[tokio::test]
+async fn star_order_evidence_is_explain_gated() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan star SQL");
+
+	let (_plan, trace) =
+		bind_with_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind normal trace");
+	let trace_debug = format!("{trace:?}");
+	assert!(!trace_debug.contains("JoinOrderEdgeEvidence"));
+	assert!(!trace_debug.contains("StarOrderOutcome"));
+
+	let (_plan, _trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind explain trace");
+	assert_eq!(render_trace.join_order_edges.len(), 3);
+	assert!(render_trace.join_order.is_some());
+}
+
+#[tokio::test]
+async fn rune_explain_shows_star_order_evidence() {
+	let catalog = star_join_order_catalog();
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o")
+               .auto_join(
+                   ctx.table("customers").alias("c"),
+                   qcol("o", "customer_id").eq(qcol("c", "id"))
+               )
+               .auto_join(
+                   ctx.table("products").alias("p"),
+                   qcol("o", "product_id").eq(qcol("p", "id"))
+               )
+               .auto_join(
+                   ctx.table("stores").alias("s"),
+                   qcol("o", "store_id").eq(qcol("s", "id"))
+               )
+               .explain()
+        }
+    "#,
+	)
+	.await;
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let row = join_order_row(&rows);
+
+	assert_eq!(row[0], ScalarValue::Utf8(Some("join_order".to_string())));
+	assert_eq!(row[2], ScalarValue::Utf8(Some("orders_differ".to_string())));
+	assert_utf8_contains(&row[3], "cost_preferred_order=[s,p,c]");
 }
 
 #[tokio::test]
@@ -10141,6 +10358,13 @@ fn assert_utf8_contains(value: &ScalarValue, expected: &str) {
 	);
 }
 
+fn join_order_row(rows: &[Vec<ScalarValue>]) -> &[ScalarValue] {
+	rows.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order".to_string())))
+		.map(Vec::as_slice)
+		.expect("join_order evidence row")
+}
+
 fn join_input(facts: PlanOptimizerFacts) -> JoinInputOptimization {
 	JoinInputOptimization {
 		facts,
@@ -10317,6 +10541,97 @@ fn join_catalog() -> MockCatalog {
 		)
 		.expect("register customers");
 	catalog
+}
+
+fn star_join_order_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(21),
+			named_descriptor(
+				21,
+				"orders",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("customer_id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+					Field::new("store_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register star orders");
+	catalog
+		.register_descriptor(
+			TableId(22),
+			named_descriptor(
+				22,
+				"customers",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register star customers");
+	catalog
+		.register_descriptor(
+			TableId(23),
+			named_descriptor(
+				23,
+				"products",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register star products");
+	catalog
+		.register_descriptor(
+			TableId(24),
+			named_descriptor(
+				24,
+				"stores",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register star stores");
+
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"orders",
+		None,
+		Some(100_000),
+		vec![
+			(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(3), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"customers",
+		None,
+		Some(5_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"products",
+		None,
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"stores",
+		None,
+		Some(100),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	catalog
+}
+
+fn non_optimal_star_order_sql() -> String {
+	"SELECT * FROM orders o \
+	 INNER JOIN customers c ON o.customer_id = c.id \
+	 INNER JOIN products p ON o.product_id = p.id \
+	 INNER JOIN stores s ON o.store_id = s.id"
+		.to_string()
 }
 
 fn join_cardinality_catalog() -> MockCatalog {

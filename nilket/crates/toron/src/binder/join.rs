@@ -247,6 +247,33 @@ impl RelationScope {
 			.iter()
 			.any(|entry| &entry.qualifier == qualifier)
 	}
+
+	pub(super) fn source_label_for_ordinal(&self, ordinal: ColumnOrdinal) -> Option<String> {
+		let labels = self
+			.entries
+			.iter()
+			.filter(|entry| entry.ordinal == ordinal)
+			.map(|entry| relation_key_label(&entry.qualifier))
+			.collect::<BTreeSet<_>>();
+		if labels.len() == 1 {
+			labels.into_iter().next()
+		} else {
+			None
+		}
+	}
+
+	pub(super) fn unique_source_label(&self) -> Option<String> {
+		let labels = self
+			.entries
+			.iter()
+			.map(|entry| relation_key_label(&entry.qualifier))
+			.collect::<BTreeSet<_>>();
+		if labels.len() == 1 {
+			labels.into_iter().next()
+		} else {
+			None
+		}
+	}
 }
 
 pub(super) fn resolve_qualified_column(

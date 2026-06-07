@@ -72,6 +72,8 @@ pub(crate) struct OptimizerTrace {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct OptimizerExplainRenderTrace {
 	pub(super) scan_filters: Vec<ScanFilterRenderReceipt>,
+	pub(super) join_order_edges: Vec<JoinOrderEdgeEvidence>,
+	pub(super) join_order: Option<StarOrderOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +195,9 @@ pub(super) fn optimizer_explain_plan(
 			})
 			.collect::<Result<Vec<_>, _>>()?,
 	);
+	if let Some(outcome) = render_trace.and_then(|trace| trace.join_order.as_ref()) {
+		rows.push(optimizer_explain_join_order_row(outcome)?);
+	}
 	system_table_plan(
 		SystemTableKind::OptimizerExplain,
 		optimizer_explain_schema(),
@@ -222,6 +227,28 @@ pub(super) fn optimizer_explain_row(
 		ScalarValue::Int64(build_bytes),
 		ScalarValue::Int64(threshold_bytes),
 		ScalarValue::Int64(rejected_side_bytes),
+	])
+}
+
+pub(super) fn optimizer_explain_join_order_row(
+	outcome: &StarOrderOutcome,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order".to_string())),
+		ScalarValue::Utf8(Some(join_order_target_label(outcome)?)),
+		ScalarValue::Utf8(Some(join_order_outcome_label(outcome).to_string())),
+		ScalarValue::Utf8(Some(join_order_detail_label(outcome))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
 	])
 }
 
@@ -376,6 +403,79 @@ pub(super) fn hash_by_default_reason_label(reason: HashByDefaultReason) -> &'sta
 			"build_byte_upper_bound_above_threshold"
 		}
 		HashByDefaultReason::HashAfterBroadcastCap => "hash_after_broadcast_cap",
+	}
+}
+
+pub(super) fn join_order_target_label(outcome: &StarOrderOutcome) -> Result<String, BindingError> {
+	Ok(match outcome {
+		StarOrderOutcome::Recognized(evidence) => format!("star[probe={}]", evidence.probe),
+		StarOrderOutcome::Declined(decline) => format!(
+			"star_candidate[edges={}]",
+			usize_to_i64(decline.edge_count, "join_order_edge_count")?
+		),
+	})
+}
+
+pub(super) fn join_order_outcome_label(outcome: &StarOrderOutcome) -> &'static str {
+	match outcome {
+		StarOrderOutcome::Recognized(evidence) if evidence.orders_agree => "orders_agree",
+		StarOrderOutcome::Recognized(_) => "orders_differ",
+		StarOrderOutcome::Declined(_) => "declined",
+	}
+}
+
+pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
+	match outcome {
+		StarOrderOutcome::Recognized(evidence) => format!(
+			"dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; declared_cost={}; preferred_cost={}; estimates=[{}]",
+			evidence
+				.dimensions
+				.iter()
+				.map(|dim| dim.dimension.as_str())
+				.collect::<Vec<_>>()
+				.join(","),
+			evidence.declared_order.join(","),
+			evidence.cost_preferred_order.join(","),
+			evidence.declared_cost,
+			evidence.preferred_cost,
+			evidence
+				.dimensions
+				.iter()
+				.map(|dim| format!(
+					"{}:{}:{}",
+					dim.dimension,
+					dim.estimated_rows.get(),
+					join_order_estimate_source_label(dim.estimate_source)
+				))
+				.collect::<Vec<_>>()
+				.join(",")
+		),
+		StarOrderOutcome::Declined(decline) => {
+			format!(
+				"reason={}; edges={}",
+				star_order_decline_reason_label(decline.reason),
+				decline.edge_count
+			)
+		}
+	}
+}
+
+pub(super) fn join_order_estimate_source_label(source: JoinOrderEstimateSource) -> &'static str {
+	match source {
+		JoinOrderEstimateSource::SingleKeyNdvContainment => "single_key_ndv_containment",
+		JoinOrderEstimateSource::MultiKeyNdvContainment => "multi_key_ndv_containment",
+		JoinOrderEstimateSource::Missing => "missing",
+	}
+}
+
+pub(super) fn star_order_decline_reason_label(reason: StarOrderDeclineReason) -> &'static str {
+	match reason {
+		StarOrderDeclineReason::NonInnerEquiJoin => "non_inner_equi_join",
+		StarOrderDeclineReason::MissingRelationLabel => "missing_relation_label",
+		StarOrderDeclineReason::MultipleProbeRelations => "multiple_probe_relations",
+		StarOrderDeclineReason::DuplicateDimension => "duplicate_dimension",
+		StarOrderDeclineReason::MissingEstimate => "missing_estimate",
+		StarOrderDeclineReason::ProbeNotScanLinear => "probe_not_scan_linear",
 	}
 }
 

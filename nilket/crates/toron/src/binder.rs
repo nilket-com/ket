@@ -56,6 +56,7 @@ mod aggregate;
 mod arithmetic;
 mod explain;
 mod join;
+mod join_order;
 mod pushdown;
 mod selectivity;
 
@@ -63,6 +64,7 @@ use self::aggregate::*;
 use self::arithmetic::*;
 use self::explain::*;
 use self::join::*;
+use self::join_order::*;
 use self::pushdown::*;
 use self::selectivity::*;
 
@@ -162,7 +164,8 @@ async fn bind_with_explain_trace(
 		.await?;
 	let logical_types = catalog.logical_type_registry();
 	let plan = push_down_scan_projection(plan.plan, &logical_types)?;
-	let render_trace = render_trace.expect("render trace remains present");
+	let mut render_trace = render_trace.expect("render trace remains present");
+	render_trace.join_order = analyze(&render_trace.join_order_edges);
 	Ok((plan, trace, render_trace))
 }
 
@@ -175,6 +178,7 @@ struct ScopedExecutionPlan {
 	plan: ExecutionPlan,
 	scope: RelationScope,
 	facts: PlanOptimizerFacts,
+	join_order_sources: Option<JoinOrderSourceMap>,
 }
 
 impl ScopedExecutionPlan {
@@ -183,6 +187,7 @@ impl ScopedExecutionPlan {
 			plan,
 			scope,
 			facts: PlanOptimizerFacts::default(),
+			join_order_sources: None,
 		}
 	}
 
@@ -191,7 +196,26 @@ impl ScopedExecutionPlan {
 		scope: RelationScope,
 		facts: PlanOptimizerFacts,
 	) -> Self {
-		Self { plan, scope, facts }
+		Self {
+			plan,
+			scope,
+			facts,
+			join_order_sources: None,
+		}
+	}
+
+	fn new_with_facts_and_join_order_sources(
+		plan: ExecutionPlan,
+		scope: RelationScope,
+		facts: PlanOptimizerFacts,
+		join_order_sources: Option<JoinOrderSourceMap>,
+	) -> Self {
+		Self {
+			plan,
+			scope,
+			facts,
+			join_order_sources,
+		}
 	}
 
 	fn empty_scope(plan: ExecutionPlan) -> Self {
@@ -200,6 +224,7 @@ impl ScopedExecutionPlan {
 			plan,
 			scope,
 			facts: PlanOptimizerFacts::default(),
+			join_order_sources: None,
 		}
 	}
 
@@ -544,11 +569,24 @@ impl<'a> Binder<'a> {
 						})
 						.transpose()?;
 
+					let join_order_sources = render_trace.is_some().then(|| {
+						join_order_sources_for_scan(
+							table,
+							&binding.schema,
+							projection.as_deref(),
+							&optimizer_facts,
+						)
+					});
 					let plan = scan_plan(binding, projection);
 					let facts = PlanOptimizerFacts::from_table(optimizer_facts)
 						.derive_estimated_byte_size(plan.schema().as_ref());
 					let scope = RelationScope::scan(table.clone(), &plan.schema());
-					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
+						plan,
+						scope,
+						facts,
+						join_order_sources,
+					))
 				}
 				LogicalPlan::Alias {
 					input,
@@ -559,9 +597,16 @@ impl<'a> Binder<'a> {
 						.bind_plan_with_trace(input, trace, render_trace)
 						.await?;
 					let facts = input.facts;
+					let join_order_sources =
+						alias_join_order_sources(input.join_order_sources.clone(), alias);
 					let plan = bind_alias_column_rename(input.plan, columns)?;
 					let scope = RelationScope::alias(alias.clone(), &plan.schema());
-					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
+						plan,
+						scope,
+						facts,
+						join_order_sources,
+					))
 				}
 				LogicalPlan::Filter { input, predicate } => {
 					let input = self
@@ -578,6 +623,7 @@ impl<'a> Binder<'a> {
 					require_single_boolean_root(&bound_predicate, "WHERE")?;
 					let logical_types = self.catalog.logical_type_registry();
 					let input_scope = input.scope.clone();
+					let input_join_order_sources = input.join_order_sources;
 					let has_pk_row_cap =
 						filter_includes_primary_key_row_cap(&bound_predicate, &input.plan);
 					let ndv_estimate_evidence = filter_equality_ndv_estimate_evidence(
@@ -673,7 +719,17 @@ impl<'a> Binder<'a> {
 						facts
 					}
 					.derive_estimated_byte_size(plan.schema().as_ref());
-					Ok(ScopedExecutionPlan::new_with_facts(plan, scope, facts))
+					let join_order_sources = update_single_source_join_order_rows(
+						input_join_order_sources,
+						&input_scope,
+						estimate_row_source(facts.row_upper_bound, facts.estimated_row_count),
+					);
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
+						plan,
+						scope,
+						facts,
+						join_order_sources,
+					))
 				}
 				LogicalPlan::Project {
 					input,
@@ -694,9 +750,10 @@ impl<'a> Binder<'a> {
 						.await?;
 					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
 					let facts = input.facts.preserve_through_project(&exprs, &output_schema);
+					let join_order_sources = input.join_order_sources.clone();
 					let scope = input.scope.project(&exprs, &output_schema);
 
-					Ok(ScopedExecutionPlan::new_with_facts(
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
 						ExecutionPlan::Project {
 							input: Box::new(input.plan),
 							exprs,
@@ -704,6 +761,7 @@ impl<'a> Binder<'a> {
 						},
 						scope,
 						facts,
+						join_order_sources,
 					))
 				}
 				LogicalPlan::Aggregate {
@@ -760,8 +818,9 @@ impl<'a> Binder<'a> {
 						.bind_expr_program_scoped(key, &input_schema, &input.scope)
 						.await?;
 					let scope = input.scope.with_schema(input_schema);
+					let join_order_sources = input.join_order_sources.clone();
 
-					Ok(ScopedExecutionPlan::new_with_facts(
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
 						ExecutionPlan::Exchange {
 							input: Box::new(input.plan),
 							partition_count: *partition_count,
@@ -769,6 +828,7 @@ impl<'a> Binder<'a> {
 						},
 						scope,
 						facts,
+						join_order_sources,
 					))
 				}
 				LogicalPlan::Sort {
@@ -784,8 +844,9 @@ impl<'a> Binder<'a> {
 					let output_schema = input.schema();
 					let order_by = bind_sort_keys(order_by, &output_schema, &input.scope)?;
 					let scope = input.scope.with_schema(output_schema.clone());
+					let join_order_sources = input.join_order_sources.clone();
 
-					Ok(ScopedExecutionPlan::new_with_facts(
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
 						ExecutionPlan::Sort {
 							input: Box::new(input.plan),
 							order_by,
@@ -795,6 +856,7 @@ impl<'a> Binder<'a> {
 						},
 						scope,
 						facts,
+						join_order_sources,
 					))
 				}
 				LogicalPlan::Take { input, limit } => {
@@ -804,7 +866,8 @@ impl<'a> Binder<'a> {
 					let facts = input.facts.take(*limit);
 					let output_schema = input.schema();
 					let scope = input.scope.with_schema(output_schema.clone());
-					Ok(ScopedExecutionPlan::new_with_facts(
+					let join_order_sources = input.join_order_sources.clone();
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
 						ExecutionPlan::Take {
 							input: Box::new(input.plan),
 							limit: *limit,
@@ -812,6 +875,7 @@ impl<'a> Binder<'a> {
 						},
 						scope,
 						facts,
+						join_order_sources,
 					))
 				}
 				LogicalPlan::Join {
@@ -1555,17 +1619,42 @@ impl<'a> Binder<'a> {
 
 		let join_index = trace.join_decisions.len();
 		let replay_id = JoinReplayId(join_index as u32);
+		let left_probe_scan_linear = broadcast_probe_is_scan_linear(&left_plan.plan);
+		let right_probe_scan_linear = broadcast_probe_is_scan_linear(&right_plan.plan);
+		if let Some(render_trace) = render_trace.as_mut() {
+			let probe = relation_label_for_join_keys(&left_plan.scope, &left_resolved_keys);
+			let dimension = relation_label_for_join_keys(&right_plan.scope, &right_resolved_keys);
+			let (estimated_rows, estimate_source) = join_order_edge_estimate(
+				left_plan.join_order_sources.as_ref(),
+				right_plan.join_order_sources.as_ref(),
+				probe.as_deref(),
+				dimension.as_deref(),
+				&left_resolved_keys,
+				&right_resolved_keys,
+				join_estimated_row_count,
+			);
+			render_trace.join_order_edges.push(JoinOrderEdgeEvidence {
+				target: JoinTraceTarget { join_index },
+				probe,
+				dimension,
+				declared_position: join_index,
+				estimated_rows,
+				estimate_source,
+				inner_equi: kind == JoinKind::Inner && !left_resolved_keys.is_empty(),
+				probe_scan_linear: left_probe_scan_linear,
+			});
+		}
 		let decision = choose_join_strategy(
 			replay_id,
 			strategy_intent,
 			kind,
 			JoinInputOptimization {
 				facts: left_plan.facts,
-				probe_scan_linear: broadcast_probe_is_scan_linear(&left_plan.plan),
+				probe_scan_linear: left_probe_scan_linear,
 			},
 			JoinInputOptimization {
 				facts: right_plan.facts,
-				probe_scan_linear: broadcast_probe_is_scan_linear(&right_plan.plan),
+				probe_scan_linear: right_probe_scan_linear,
 			},
 			self.config,
 		);
@@ -1640,6 +1729,10 @@ impl<'a> Binder<'a> {
 			join_estimated_row_count,
 			declared_output_schema.as_ref(),
 		);
+		let join_order_sources = merge_join_order_sources(
+			left_plan.join_order_sources.clone(),
+			right_plan.join_order_sources.clone(),
+		);
 		let plan = match decision.placement {
 			JoinPhysicalPlacement::Natural => join_plan,
 			JoinPhysicalPlacement::SwappedRightBuild => restore_declared_join_order_project(
@@ -1651,10 +1744,11 @@ impl<'a> Binder<'a> {
 			)?,
 		};
 
-		Ok(ScopedExecutionPlan::new_with_facts(
+		Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
 			plan,
 			declared_scope,
 			output_facts,
+			join_order_sources,
 		))
 	}
 

@@ -2279,11 +2279,15 @@ pub(crate) fn adr131_strategy_decision_remains_single_helper() {
 	assert_eq!(binder.matches("fn choose_join_strategy(").count(), 1);
 	assert!(bind_join.contains("JoinInputOptimization"));
 	assert!(
-		bind_join.contains("probe_scan_linear: broadcast_probe_is_scan_linear(&left_plan.plan)")
+		bind_join.contains(
+			"let left_probe_scan_linear = broadcast_probe_is_scan_linear(&left_plan.plan);"
+		)
 	);
-	assert!(
-		bind_join.contains("probe_scan_linear: broadcast_probe_is_scan_linear(&right_plan.plan)")
-	);
+	assert!(bind_join.contains(
+		"let right_probe_scan_linear = broadcast_probe_is_scan_linear(&right_plan.plan);"
+	));
+	assert!(bind_join.contains("probe_scan_linear: left_probe_scan_linear"));
+	assert!(bind_join.contains("probe_scan_linear: right_probe_scan_linear"));
 	assert!(bind_join.contains("choose_join_strategy("));
 	assert!(!bind_join.contains("byte_upper_bound"));
 	assert!(!bind_join.contains("auto_broadcast_max_build_bytes"));
