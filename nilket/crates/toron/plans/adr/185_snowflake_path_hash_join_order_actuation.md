@@ -109,8 +109,10 @@ guard.
 
 ## Supporting Gates
 
-- `hash_snowflake_root_keeps_declared_when_thin_or_optimal` - already-optimal / thin-margin
-  root keeps declared order (reuses 181's gate).
+- already-optimal / thin-margin roots keep declared order: 185 reuses
+  `classify_star_order_action`, so 181's `star_order_evidence_agrees_when_declared_is_optimal`
+  and `star_order_keeps_declared_when_soft_margin_is_thin` gates cover the kept-declared case
+  unchanged.
 - `mixed_or_broadcast_snowflake_root_declines_actuation` - a mixed/broadcast root declines and
   keeps the 182–184 observational path (no reorder).
 - `deep_snowflake_declines_actuation` - a branch member with its own members declines (shallow
@@ -118,8 +120,10 @@ guard.
 - `actuated_hash_snowflake_root_uses_star_verdict` - under `EXPLAIN ANALYZE` the actuated root
   yields a 5-variant star `join_order_verdict` (can be `OverEager`/`MisRanked`), not a 3-variant
   snowflake verdict, and emits no `join_order_snowflake` row.
-- `unactuated_snowflake_observational_path_unchanged` - a declined snowflake still emits
-  `join_order_snowflake` + `..._runtime` + `..._verdict` rows byte-identically.
+- the 182–184 snowflake observational suite (`snowflake_order_evidence_is_observational`,
+  `snowflake_runtime_evidence_is_observational`, and the `snowflake_verdict_*` tests) stays
+  green: a declined snowflake still emits its `join_order_snowflake` + `..._runtime` +
+  `..._verdict` rows byte-identically.
 - `rune_hash_snowflake_root_reorders_same_as_sql` - Rune parity.
 
 ## Architecture Guards

@@ -1175,6 +1175,128 @@ pub(crate) fn adr184_cockpit_is_frontend_shared() {
 }
 
 #[test]
+pub(crate) fn adr185_snowflake_root_actuation_reuses_181_machinery() {
+	let binder = binder_source();
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+
+	assert!(actuator.contains("preflight_star_order_strategy("));
+	assert!(actuator.contains("bind_star_order_sequence("));
+	assert!(actuator.contains("restore_declared_star_order_project("));
+	assert!(actuator.contains("star_output_segments_for_order("));
+	assert!(actuator.contains("recognized_star_order_outcome("));
+	assert!(!binder.contains("fn restore_declared_snowflake_order_project"));
+	assert!(!binder.contains("fn bind_snowflake_order_sequence"));
+}
+
+#[test]
+pub(crate) fn adr185_branch_fold_at_relation_label_boundary() {
+	let binder = binder_source();
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+
+	assert!(binder.contains("struct StarRootDimension"));
+	assert!(actuator.contains("let mut root_dimensions = Vec::<StarRootDimension<'_>>::new();"));
+	assert!(actuator.contains("member_indices: Vec::new()"));
+	assert!(actuator.contains("root_dimensions[root_index]"));
+	assert!(actuator.contains(".member_indices"));
+	assert!(actuator.contains(".push(dimension_index)"));
+	assert!(actuator.contains("self.try_resolve_star_dimension_edge("));
+	assert!(actuator.contains("parent_plan,"));
+	assert!(actuator.contains("StarOrderDeclineReason::MissingRelationLabel"));
+}
+
+#[test]
+pub(crate) fn adr185_branch_built_declared_without_actuator() {
+	let binder = binder_source();
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let helper = first_block(&binder, "fn bind_declared_star_branch_dimension");
+
+	assert!(actuator.contains("bind_declared_star_branch_dimension("));
+	assert!(helper.contains("let mut no_render_trace = None;"));
+	assert!(helper.contains("self.bind_scoped_join("));
+	assert!(helper.contains("member.declared_position"));
+	assert!(!helper.contains("bind_plan_with_trace"));
+	assert!(!helper.contains("try_bind_star_order_actuation"));
+	assert!(!helper.contains("recognized_star_order_outcome"));
+}
+
+#[test]
+pub(crate) fn adr185_actuated_root_reports_as_star() {
+	let binder = binder_source();
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+
+	assert!(bind_with_explain_trace.contains("Some(StarOrderOutcome::Recognized(_))"));
+	assert!(
+		bind_with_explain_trace
+			.contains("analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions)")
+	);
+	assert!(bind_with_explain_trace.contains("render_trace.join_order = None"));
+	assert!(actuator.contains("render_trace.join_order = Some(recognized_star_order_outcome("));
+	assert!(actuator.contains("StarOrderStrategy::HashPartitioned"));
+}
+
+#[test]
+pub(crate) fn adr185_no_executor_fragment_costmodel_or_wendelon_change() {
+	let manifest = manifest_dir();
+	let markers = [
+		"StarRootDimension",
+		"bind_declared_star_branch_dimension",
+		"hash_snowflake",
+		"preferred_hash_snowflake",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/catalog.rs"),
+		manifest.join("src/coordinator.rs"),
+		manifest.join("src/sql_planner.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("src/distributed/fragment.rs"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+	assert!(
+		offenders.is_empty(),
+		"ADR185 hash-snowflake actuation leaked below binder/explain:\n{}",
+		format_offenders(&workspace_root_dir(), &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr185_no_optimizer_shell_or_planproperties_contract() {
+	adr179_no_optimizer_shell();
+}
+
+#[test]
+pub(crate) fn adr185_cockpit_is_frontend_shared() {
+	let binder = binder_source();
+	let explain = source("src/binder/explain.rs");
+	let rune = source("src/rune_engine.rs");
+	let bind_explain = first_block(&binder, "async fn bind_explain(&self");
+	let render_explain_analyze = first_block(&binder, "pub(crate) fn render_explain_analyze");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+
+	assert!(bind_explain.contains("optimizer_explain_plan(trace, Some(render_trace))"));
+	assert!(render_explain_analyze.contains("optimizer_analyze_plan"));
+	assert!(analyze_rows.contains("optimizer_analyze_join_order_row"));
+	assert!(rune.contains("LogicalPlan::Explain"));
+	assert!(rune.contains("LogicalPlan::ExplainAnalyze"));
+	assert!(!rune.contains("StarRootDimension"));
+	assert!(!rune.contains("bind_declared_star_branch_dimension"));
+}
+
+#[test]
 pub(crate) fn adr182_no_executor_fragment_costmodel_or_wendelon_change() {
 	let manifest = manifest_dir();
 	let markers = [

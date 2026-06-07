@@ -175,12 +175,17 @@ async fn bind_with_explain_trace(
 	let logical_types = catalog.logical_type_registry();
 	let plan = push_down_scan_projection(plan.plan, &logical_types)?;
 	let mut render_trace = render_trace.expect("render trace remains present");
-	render_trace.snowflake_order =
-		analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions);
-	if render_trace.snowflake_order.is_some() {
-		render_trace.join_order = None;
-	} else if render_trace.join_order.is_none() {
-		render_trace.join_order = analyze(&render_trace.join_order_edges);
+	if !matches!(
+		render_trace.join_order,
+		Some(StarOrderOutcome::Recognized(_))
+	) {
+		render_trace.snowflake_order =
+			analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions);
+		if render_trace.snowflake_order.is_some() {
+			render_trace.join_order = None;
+		} else if render_trace.join_order.is_none() {
+			render_trace.join_order = analyze(&render_trace.join_order_edges);
+		}
 	}
 	Ok((plan, trace, render_trace))
 }
@@ -311,6 +316,24 @@ struct BoundStarDimension<'a> {
 	strategy_intent: JoinStrategyIntent,
 	label: String,
 	evidence: JoinOrderDimEvidence,
+}
+
+#[derive(Debug, Clone)]
+struct StarRootDimension<'a> {
+	base_index: usize,
+	member_indices: Vec<usize>,
+	on: &'a [(Expr, Expr)],
+	strategy_intent: JoinStrategyIntent,
+	label: String,
+	declared_position: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StarDimensionJoinEdge {
+	left_resolved_keys: Vec<ResolvedJoinKey>,
+	right_resolved_keys: Vec<ResolvedJoinKey>,
+	left_label: Option<String>,
+	right_label: Option<String>,
 }
 
 fn star_output_segments(
@@ -1734,8 +1757,7 @@ impl<'a> Binder<'a> {
 			return Ok(None);
 		}
 
-		let mut dimensions = Vec::with_capacity(candidate.dimensions.len());
-		let mut seen_dimensions = BTreeSet::new();
+		let mut dimension_inputs = Vec::with_capacity(candidate.dimensions.len());
 		for dimension in &candidate.dimensions {
 			let dimension_plan = self
 				.bind_plan_with_trace(
@@ -1745,15 +1767,60 @@ impl<'a> Binder<'a> {
 					JoinOrderSourceCapture::On,
 				)
 				.await?;
-			let mut left_resolved_keys = Vec::new();
-			let mut right_resolved_keys = Vec::new();
-			for (left_expr, right_expr) in dimension.on {
-				let Ok((left_key, right_key)) = bind_join_key_pair(
-					left_expr,
-					right_expr,
-					&probe_plan.scope,
-					&dimension_plan.scope,
-				) else {
+			dimension_inputs.push(dimension_plan);
+		}
+
+		let mut root_dimensions = Vec::<StarRootDimension<'_>>::new();
+		let mut seen_dimensions = BTreeSet::new();
+		for (dimension_index, dimension) in candidate.dimensions.iter().enumerate() {
+			let dimension_plan = &dimension_inputs[dimension_index];
+			if let Some(edge) =
+				self.try_resolve_star_dimension_edge(&probe_plan, dimension_plan, dimension.on)?
+			{
+				if edge.left_label.as_deref() == Some(probe_label.as_str()) {
+					let Some(dimension_label) = edge.right_label else {
+						self.record_star_order_decline(
+							render_trace,
+							StarOrderDeclineReason::MissingRelationLabel,
+							candidate.dimensions.len(),
+						);
+						return Ok(None);
+					};
+					if !seen_dimensions.insert(dimension_label.clone()) {
+						self.record_star_order_decline(
+							render_trace,
+							StarOrderDeclineReason::DuplicateDimension,
+							candidate.dimensions.len(),
+						);
+						return Ok(None);
+					}
+					root_dimensions.push(StarRootDimension {
+						base_index: dimension_index,
+						member_indices: Vec::new(),
+						on: dimension.on,
+						strategy_intent: dimension.strategy_intent,
+						label: dimension_label,
+						declared_position: dimension.declared_position,
+					});
+					continue;
+				}
+			}
+
+			let mut matched_branch = None;
+			for (root_index, root_dimension) in root_dimensions.iter().enumerate() {
+				let parent_plan = &dimension_inputs[root_dimension.base_index];
+				let Some(edge) = self.try_resolve_star_dimension_edge(
+					parent_plan,
+					dimension_plan,
+					dimension.on,
+				)?
+				else {
+					continue;
+				};
+				if edge.left_label.as_deref() != Some(root_dimension.label.as_str()) {
+					continue;
+				}
+				let Some(member_label) = edge.right_label else {
 					self.record_star_order_decline(
 						render_trace,
 						StarOrderDeclineReason::MissingRelationLabel,
@@ -1761,30 +1828,19 @@ impl<'a> Binder<'a> {
 					);
 					return Ok(None);
 				};
-				if validate_join_key_types(&left_key, &right_key).is_err() {
-					self.record_star_order_decline(
-						render_trace,
-						StarOrderDeclineReason::NonInnerEquiJoin,
-						candidate.dimensions.len(),
-					);
-					return Ok(None);
-				}
-				left_resolved_keys.push(left_key);
-				right_resolved_keys.push(right_key);
+				matched_branch = Some((root_index, member_label));
+				break;
 			}
-			let probe = relation_label_for_join_keys(&probe_plan.scope, &left_resolved_keys);
-			let dimension_label =
-				relation_label_for_join_keys(&dimension_plan.scope, &right_resolved_keys);
-			if probe.as_deref() != Some(probe_label.as_str()) || dimension_label.is_none() {
+
+			let Some((root_index, member_label)) = matched_branch else {
 				self.record_star_order_decline(
 					render_trace,
 					StarOrderDeclineReason::MissingRelationLabel,
 					candidate.dimensions.len(),
 				);
 				return Ok(None);
-			}
-			let dimension_label = dimension_label.expect("checked above");
-			if !seen_dimensions.insert(dimension_label.clone()) {
+			};
+			if !seen_dimensions.insert(member_label) {
 				self.record_star_order_decline(
 					render_trace,
 					StarOrderDeclineReason::DuplicateDimension,
@@ -1792,21 +1848,68 @@ impl<'a> Binder<'a> {
 				);
 				return Ok(None);
 			}
+			root_dimensions[root_index]
+				.member_indices
+				.push(dimension_index);
+		}
 
+		if root_dimensions.len() < 2 {
+			self.record_star_order_decline(
+				render_trace,
+				StarOrderDeclineReason::MissingRelationLabel,
+				candidate.dimensions.len(),
+			);
+			return Ok(None);
+		}
+
+		let has_branch_dimensions = root_dimensions
+			.iter()
+			.any(|dimension| !dimension.member_indices.is_empty());
+		let mut dimensions = Vec::with_capacity(root_dimensions.len());
+		for root_dimension in &root_dimensions {
+			let dimension_plan = self.bind_declared_star_branch_dimension(
+				root_dimension,
+				&candidate.dimensions,
+				&dimension_inputs,
+				&mut scratch_trace,
+			)?;
+			let Some(edge) = self.try_resolve_star_dimension_edge(
+				&probe_plan,
+				&dimension_plan,
+				root_dimension.on,
+			)?
+			else {
+				self.record_star_order_decline(
+					render_trace,
+					StarOrderDeclineReason::MissingRelationLabel,
+					candidate.dimensions.len(),
+				);
+				return Ok(None);
+			};
+			if edge.left_label.as_deref() != Some(probe_label.as_str())
+				|| edge.right_label.as_deref() != Some(root_dimension.label.as_str())
+			{
+				self.record_star_order_decline(
+					render_trace,
+					StarOrderDeclineReason::MissingRelationLabel,
+					candidate.dimensions.len(),
+				);
+				return Ok(None);
+			}
 			let join_estimated_row_count = Self::join_estimated_row_count_for_keys(
 				JoinKind::Inner,
 				&probe_plan,
 				&dimension_plan,
-				&left_resolved_keys,
-				&right_resolved_keys,
+				&edge.left_resolved_keys,
+				&edge.right_resolved_keys,
 			);
 			let (estimated_rows, estimate_source) = join_order_edge_estimate(
 				probe_plan.join_order_sources.as_ref(),
 				dimension_plan.join_order_sources.as_ref(),
 				Some(probe_label.as_str()),
-				Some(dimension_label.as_str()),
-				&left_resolved_keys,
-				&right_resolved_keys,
+				Some(root_dimension.label.as_str()),
+				&edge.left_resolved_keys,
+				&edge.right_resolved_keys,
 				join_estimated_row_count,
 			);
 			let Some(estimated_rows) = estimated_rows else {
@@ -1821,18 +1924,18 @@ impl<'a> Binder<'a> {
 				probe_plan.join_order_sources.as_ref(),
 				dimension_plan.join_order_sources.as_ref(),
 				Some(probe_label.as_str()),
-				Some(dimension_label.as_str()),
-				&left_resolved_keys,
-				&right_resolved_keys,
+				Some(root_dimension.label.as_str()),
+				&edge.left_resolved_keys,
+				&edge.right_resolved_keys,
 			);
 			dimensions.push(BoundStarDimension {
 				plan: dimension_plan,
-				on: dimension.on,
-				strategy_intent: dimension.strategy_intent,
-				label: dimension_label.clone(),
+				on: root_dimension.on,
+				strategy_intent: root_dimension.strategy_intent,
+				label: root_dimension.label.clone(),
 				evidence: JoinOrderDimEvidence {
-					dimension: dimension_label,
-					declared_position: dimension.declared_position,
+					dimension: root_dimension.label.clone(),
+					declared_position: root_dimension.declared_position,
 					estimated_rows,
 					estimate_source,
 					confidence,
@@ -1911,6 +2014,14 @@ impl<'a> Binder<'a> {
 			);
 			return Ok(None);
 		}
+		if has_branch_dimensions && selected_strategy != StarOrderStrategy::HashPartitioned {
+			self.record_star_order_decline(
+				render_trace,
+				StarOrderDeclineReason::MixedStrategyStar,
+				candidate.dimensions.len(),
+			);
+			return Ok(None);
+		}
 		let star_order_strategy = selected_strategy;
 
 		let real_probe_plan = self
@@ -1921,8 +2032,8 @@ impl<'a> Binder<'a> {
 				JoinOrderSourceCapture::On,
 			)
 			.await?;
-		let mut real_dimensions = Vec::with_capacity(dimensions.len());
-		for (dimension, bound_dimension) in candidate.dimensions.iter().zip(&dimensions) {
+		let mut real_dimension_inputs = Vec::with_capacity(candidate.dimensions.len());
+		for dimension in &candidate.dimensions {
 			let plan = self
 				.bind_plan_with_trace(
 					dimension.input,
@@ -1931,10 +2042,21 @@ impl<'a> Binder<'a> {
 					JoinOrderSourceCapture::On,
 				)
 				.await?;
+			real_dimension_inputs.push(plan);
+		}
+
+		let mut real_dimensions = Vec::with_capacity(dimensions.len());
+		for (root_dimension, bound_dimension) in root_dimensions.iter().zip(&dimensions) {
+			let plan = self.bind_declared_star_branch_dimension(
+				root_dimension,
+				&candidate.dimensions,
+				&real_dimension_inputs,
+				trace,
+			)?;
 			real_dimensions.push(BoundStarDimension {
 				plan,
-				on: dimension.on,
-				strategy_intent: dimension.strategy_intent,
+				on: root_dimension.on,
+				strategy_intent: root_dimension.strategy_intent,
 				label: bound_dimension.label.clone(),
 				evidence: bound_dimension.evidence.clone(),
 			});
@@ -1996,6 +2118,59 @@ impl<'a> Binder<'a> {
 			));
 		}
 		Ok(Some(output))
+	}
+
+	fn try_resolve_star_dimension_edge(
+		&self,
+		left_plan: &ScopedExecutionPlan,
+		right_plan: &ScopedExecutionPlan,
+		on: &[(Expr, Expr)],
+	) -> Result<Option<StarDimensionJoinEdge>, BindingError> {
+		let mut left_resolved_keys = Vec::new();
+		let mut right_resolved_keys = Vec::new();
+		for (left_expr, right_expr) in on {
+			let Ok((left_key, right_key)) =
+				bind_join_key_pair(left_expr, right_expr, &left_plan.scope, &right_plan.scope)
+			else {
+				return Ok(None);
+			};
+			validate_join_key_types(&left_key, &right_key)?;
+			left_resolved_keys.push(left_key);
+			right_resolved_keys.push(right_key);
+		}
+		let left_label = relation_label_for_join_keys(&left_plan.scope, &left_resolved_keys);
+		let right_label = relation_label_for_join_keys(&right_plan.scope, &right_resolved_keys);
+		Ok(Some(StarDimensionJoinEdge {
+			left_resolved_keys,
+			right_resolved_keys,
+			left_label,
+			right_label,
+		}))
+	}
+
+	fn bind_declared_star_branch_dimension<'b>(
+		&self,
+		root_dimension: &StarRootDimension<'b>,
+		candidate_dimensions: &[StarJoinDimension<'b>],
+		bound_inputs: &[ScopedExecutionPlan],
+		trace: &mut OptimizerTrace,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		let mut branch_plan = bound_inputs[root_dimension.base_index].clone();
+		let mut no_render_trace = None;
+		for member_index in &root_dimension.member_indices {
+			let member = &candidate_dimensions[*member_index];
+			branch_plan = self.bind_scoped_join(
+				branch_plan,
+				bound_inputs[*member_index].clone(),
+				JoinKind::Inner,
+				member.on,
+				member.strategy_intent,
+				trace,
+				&mut no_render_trace,
+				member.declared_position,
+			)?;
+		}
+		Ok(branch_plan)
 	}
 
 	fn preflight_star_order_strategy<'b>(

@@ -88,7 +88,7 @@ A declined snowflake leaves `join_order` as `Some(Declined)` or `None`, so it st
 
 ## Phase 5 - Behavioral tests (`binder/tests.rs`, `tests/explain_analyze_test.rs`)
 
-Fixture: `hash_snowflake_actuation_catalog` — `orders` fact, `customers→regions` branch,
+Fixture: `hash_snowflake_join_order_catalog` — `orders` fact, `customers→regions` branch,
 `stores` leaf, large dims (uniform hash), facts making the root declared order non-optimal.
 
 - `hash_snowflake_root_reorders_on_robust_win` - root binds preferred; star `join_order`
@@ -98,13 +98,16 @@ Fixture: `hash_snowflake_actuation_catalog` — `orders` fact, `customers→regi
 - `hash_snowflake_branch_built_declared_order` - branch bound in declared internal order and not
   self-actuated even when the branch would independently qualify as a flat-star reorder
   candidate; branch segment restored intact.
-- `hash_snowflake_root_keeps_declared_when_thin_or_optimal` - 181 gate behavior.
+- kept-declared case covered by reuse of `classify_star_order_action`: 181's
+  `star_order_evidence_agrees_when_declared_is_optimal` /
+  `star_order_keeps_declared_when_soft_margin_is_thin` stay green.
 - `mixed_or_broadcast_snowflake_root_declines_actuation` - declines; 182–184 path intact.
 - `deep_snowflake_declines_actuation` - branch-of-branch declines (shallow scope).
 - `actuated_hash_snowflake_root_uses_star_verdict` - EXPLAIN ANALYZE → 5-variant star
   `join_order_verdict`; no `join_order_snowflake` row for the actuated root.
-- `unactuated_snowflake_observational_path_unchanged` - declined snowflake emits the three
-  `join_order_snowflake*` rows byte-identically.
+- declined-snowflake observational path covered by the 182–184 suite staying green
+  (`snowflake_order_evidence_is_observational`, `snowflake_runtime_evidence_is_observational`,
+  `snowflake_verdict_*`): the three `join_order_snowflake*` rows remain byte-identical.
 - `rune_hash_snowflake_root_reorders_same_as_sql` - Rune parity.
 
 ## Phase 6 - Architecture guards (`tests/architecture/join_order.rs`)
@@ -156,7 +159,7 @@ git diff --check
 - **Branch estimate fidelity.** Missing fact↔branch estimate → conservative root decline, never
   a wrong order. No new estimator.
 - **Star/observational paths unchanged.** 181 flat-star + 182–184 snowflake observational must
-  stay byte-identical. Pin with green `star_order` + `unactuated_snowflake_observational_path_unchanged`.
+  stay byte-identical. Pin with green `star_order` + the `snowflake` observational suite.
 
 ## Deferred
 

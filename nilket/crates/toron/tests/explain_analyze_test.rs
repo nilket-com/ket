@@ -272,8 +272,14 @@ async fn snowflake_verdict_detail_keeps_estimate_and_measurement_separate() {
 	);
 	assert!(detail.contains("measured_applied_order=[s,c]"), "{detail}");
 	assert!(detail.contains("strategies=["), "{detail}");
-	assert!(detail.contains("c:hash_partitioned/natural"), "{detail}");
-	assert!(detail.contains("s:hash_partitioned/natural"), "{detail}");
+	assert!(
+		detail.contains("c:broadcast/swapped_right_build"),
+		"{detail}"
+	);
+	assert!(
+		detail.contains("s:broadcast/swapped_right_build"),
+		"{detail}"
+	);
 }
 
 #[tokio::test]
@@ -304,7 +310,7 @@ async fn snowflake_runtime_evidence_is_observational() {
 		catalog,
 		storage,
 		PlannerConfig {
-			auto_broadcast_max_build_bytes: Some(ByteCount::new(1)),
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(64 * 1024 * 1024)),
 			..PlannerConfig::default()
 		},
 	);
@@ -692,7 +698,7 @@ async fn analyze_snowflake_batch() -> RecordBatch {
 		catalog,
 		storage,
 		PlannerConfig {
-			auto_broadcast_max_build_bytes: Some(ByteCount::new(1)),
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(64 * 1024 * 1024)),
 			..PlannerConfig::default()
 		},
 	);
