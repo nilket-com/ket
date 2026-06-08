@@ -1,63 +1,92 @@
-# ADR 192: Broadcast-Snowflake Actuation Baseline
+# ADR 192: Broadcast-Snowflake Uniformity Across Composite-Build Placement
 
 **Status:** Promoted. **Migration:** `plans/impl/192_broadcast_snowflake_actuation_baseline.md`.
 
-ADR 181 climbed the ordered star to execution; 185/186 made the **hash** snowflake actuatable (binder-only — the executor already shuffles multi-level shapes). Every ADR from 181 to 191 deferred the same named item: the **broadcast-snowflake execution cliff**. ADR 192 climbs that rung — the *minimal executable* broadcast snowflake, as 181 was the minimal executable ordered star. Recognition, ordering, evidence, and the margin machinery (182-191) are untouched; this ADR makes a shape the binder already recognizes actually run.
+ADR 181 made ordered flat stars executable. ADRs 185/186 made hash snowflakes executable. The next rung is still the broadcast snowflake, but the diagnostic trace changed the mechanism: this is not a fragmenter rewrite, and not merely the old `force_hash_root` authorization gate. The blocking surface is ADR 181's local star uniformity preflight when one "dimension" is already a composite branch build.
 
-## The cliff is a binder authorization cliff, not a fragmenter cliff
+## Grounding
 
-The arc named this deferral as "relax the fragmenter" (`rewrite_broadcast_star_probe` scan-build → published-sub-plan build). Grounding the premise corrects it: **the fragmenter already publishes a composite (join-tree) build as a single-partition producer.** `broadcast_composite_build_fragments_to_single_build_producer` (`fragment.rs:1698`) fragments a broadcast join whose build side is an `Exchange(partition_count=1)` over a *join* into two stages — a producer stage that **contains the join** and a probe consumer whose `upstream_stages` is that producer. `first_scan_metadata` recurses through joins (`fragment.rs:1154`) and the consumer binds the published input by a synthetic exchange-id table id (`shuffle_input_table_id(e) = TableId(u64::MAX - e)`, `task.rs:190`), not by re-reading a catalog table — so the build's internal shape is already irrelevant to publication.
+The fragmenter already publishes composite broadcast builds. `broadcast_composite_build_fragments_to_single_build_producer` fragments a broadcast join whose build side is an `Exchange(partition_count=1)` over a join tree into a single producer stage consumed by the root probe stage. The published input is identified by exchange id, not by re-reading a base table. So the distributed primitive exists.
 
-The real blocker is upstream, in the binder:
+The canonical multi-child snowflake still declines before authorization becomes relevant:
 
-- `force_hash_root = tree.has_branch_dimensions()` (`join_order.rs:1513`), then `if force_hash && selected_strategy != HashPartitioned { Declined(MixedStrategyStar) }` (`join_order.rs:~2004`). Any branchy snowflake whose edges resolve to broadcast is forced to hash or declined; the binder **never emits a broadcast-snowflake plan** for the fragmenter to handle.
-- `mixed_or_broadcast_snowflake_root_declines_actuation` pins today's state: an all-broadcast branchy snowflake is *observed* (a `join_order_snowflake` row) but never *actuated* as a root `join_order` receipt.
+```sql
+orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN regions r ON c.region_id = r.id
+JOIN segments g ON c.segment_id = g.id
+JOIN stores s ON o.store_id = s.id
+```
 
-So this is a **binder authorization cut**, gated by an end-to-end execution proof that the already-recognized shape truly executes. The executor needs no new primitive; the fragmenter is changed only if — and exactly as much as — the execution proof demands.
+with `customers` as the multi-child branch and all dimension sides under the broadcast cap.
+
+The traced decline chain is:
+
+- Gate 1: placement strictness. The root preflight sees all broadcast edges, but placements differ: `(Broadcast, Natural)` for the composite branch build and `(Broadcast, SwappedRightBuild)` for the leaf build. ADR 181's `uniform_star_order_strategy` only accepts flat-star broadcast as all `SwappedRightBuild`, so it returns `None`.
+- Gate 2: order-variant strategy drift. If Gate 1 is experimentally relaxed, the declared order preflights as `HashPartitioned` while the selected order preflights as `Broadcast`, so `declared_strategy != selected_strategy` still declines as `MixedStrategyStar`.
+
+The old `force_hash_root` boolean still deserves cleanup because it mixed strategy authorization with render-state suppression, but replacing it alone is regression-neutral. ADR 192's behavioral cut is the fenced snowflake uniformity rule plus the selected-broadcast upgrade, not the typed authorization by itself.
 
 ## Decision
 
-Unlock the **uniform broadcast snowflake root** by replacing the hash-forcing boolean with typed authorization, lifting the root gate for the strategy-invariant all-broadcast shape, and proving it executes distributed. Keep multi-child branches conservative.
+Unlock the first broadcast snowflake root whose selected plan is structurally a broadcast-uniform composite-build plan. Keep flat-star ADR 181 invariants unchanged.
 
-**D1 — Typed strategy authorization replaces `force_hash: bool`.** Add a typed local-actuation authorization in `binder/join_order.rs`:
+**D1 - Keep flat-star uniformity strict.** `uniform_star_order_strategy` remains the flat-star recognizer. It continues to require broadcast flat stars to be all `(Broadcast, SwappedRightBuild)` and hash flat stars to be all `(HashPartitioned, Natural)`. No flat-star behavior is relaxed.
 
-```rust
-pub(crate) enum StarOrderStrategyAuthorization {
-    AnyUniform,
-    HashOnlyCompositeProbe,
-}
-```
+**D2 - Add fenced snowflake uniformity.** Add a snowflake-specific preflight helper, e.g. `uniform_snowflake_order_strategy`, used only by snowflake root actuation. It may classify a plan as broadcast only when every decision is `JoinStrategy::Broadcast` and each placement is one of:
 
-The boolean goes; the call site declares whether all uniform strategies are allowed or a composite probe must force hash. `bind_local_star_actuation` and `try_bind_star_order_actuation` consume the type. Keep the existing `MixedStrategyStar` decline label for 192 unless the implementation deliberately updates the explain labels, decision-log mapping, and guards as a separate user-surface choice; the behavioral cut is authorization, not new receipt vocabulary.
+- `SwappedRightBuild` for normal leaf broadcast builds;
+- `Natural` for authenticated composite branch builds that are already published as a single build side.
 
-**D2 — Root broadcast snowflakes actuate only when strategy-invariant.** For the snowflake root, preflight declared and selected order exactly as today; the root may actuate as broadcast only when **both** resolve to `Some(StarOrderStrategy::Broadcast)` (reuse `uniform_star_order_strategy`). Hash snowflakes continue through the 185/186 path. `None` or mismatched strategies still decline `MixedStrategyStar`. Strategy uniformity, not depth, is the deferral seam: "should this edge be broadcast or hash?" is a cost-model question (191-adjacent, separate); "can a recognized all-broadcast snowflake run?" is this rung.
+Any hash/broadcast mixture, unknown placement, non-composite `Natural` broadcast, or unauthenticated shape still returns `None`.
 
-The old `force_hash_root` also suppresses flat-star render declines for snowflake-root scratch failures (`if !force_hash_root`). That is a separate render-state behavior, not part of strategy authorization. Preserve it with an explicit `root_is_snowflake` / render-suppression predicate so lifting broadcast authorization does not reintroduce duplicate `join_order` decline rows beside an observed or actuated snowflake.
+**D3 - Selected broadcast may upgrade declared hash only inside the snowflake fence.** ADR 181's declared-vs-selected equality rule stays for flat stars. For snowflake roots, a selected plan that passes D2 as broadcast may actuate even when the declared preflight is `HashPartitioned` or `None`, because the selected plan is the executable broadcast shape being proven. This is not a blanket "selected wins" rule: if the selected snowflake preflight is not authenticated broadcast-uniform, decline.
 
-**D3 — Branch policy stays conservative.** ADR 192's user-visible unlock is the **root fact-probe** broadcast snowflake. Recursive multi-child branch stars keep `HashOnlyCompositeProbe`: a branch acts as a nested probe for its own children, and the fragmenter's `rewrite_broadcast_star_probe` rejects nested broadcast probes (`BroadcastProbeNotStarLinear`). Keeping branches hash-built (then published once as a composite build) keeps the first broadcast unlock inside the fragmenter's proven safe shape. All-broadcast multi-child branches are deferred until an execution proof requires and validates a broader stage traversal.
+**D4 - Typed strategy authorization remains substrate.** Replace `force_hash: bool` with `StarOrderStrategyAuthorization::{AnyUniform, HashOnlyCompositeProbe}`. The root uses `AnyUniform`; branch-local composite probes remain fenced by the same structural checks. Keep render-decline suppression separate as `root_is_snowflake` so the old boolean's render behavior is not inferred from strategy authorization.
 
-**D4 — The execution proof drives fragmenter scope.** Start the implementation with a discriminating *distributed* execution fixture (Phase 0). If typed binder authorization alone yields a broadcast snowflake that fragments and executes correctly over multiple workers, 192 stays **binder-only** (plus tests/guards). If the fixture shows the fragmenter needs new nested-producer dependency traversal, add the **smallest worklist-based** change. `broadcast_composite_build_fragments_to_single_build_producer` is a fragment-*shape* proof, not an end-to-end *result* proof — so the fixture, not the assumption, decides.
+**D5 - Preserve probe-linearity and fragmenter scope.** `BroadcastProbeNotStarLinear` remains. ADR 192 authorizes a root probe over published composite build sides; it does not authorize arbitrary nested broadcast probes or a general broadcast DAG. If the headline distributed fixture proves the existing composite-build publication works, do not change `fragment.rs`. If it fails for dependency traversal, add only an explicit worklist/`VecDeque` stage traversal, not recursive fragmenter descent.
 
-**D5 — Probe linearity is preserved.** `BroadcastProbeNotStarLinear` and the nested-probe rejection remain. 192 authorizes composite *build* sides, not arbitrary bushy broadcast *probes*.
+**D6 - Result identity is the safety fence.** The headline gate must fail on pre-192 code, actuate after the fenced uniformity change, execute distributed over multiple workers, and match the hash or declared-order baseline by schema and row digest.
 
-**D6 — Reuse composite build publication; no new surface.** 192 reuses the existing single-partition `ShuffleProducer` / partition-0 `ShuffleConsumer` shape. No new task-input variant, control protocol, catalog, storage, Wendelon, or wire surface. The published-build identity is the exchange id; the branch's joins (with their `replay_id` / `replay_eligibility`, ADR 188) live in the **producer sub-stage**, so the parent consumer sees a replay-neutral shuffle input — replay stays deterministic, no collision, no new replay surface.
+## Recursion vs. Worklist
 
-**D7 — Honest actuation, locked by distributed execution.** The headline gate executes a uniform broadcast snowflake across a multi-worker cluster and asserts (a) a root `join_order` actuation receipt (not merely an observed snowflake row), (b) the selected root strategy is broadcast, (c) distributed execution succeeds, (d) the result digest matches the hash / declared-order baseline. It must **fail on pre-192 code** (root is observation-only / hash-forced). Fragmentation success ≠ correctness — a fragment-only assertion would pass for the wrong reason.
+Existing binder recursion over `SnowflakeStarTree` is acceptable because the input is a tree and ADR 192 is still a local actuation cut. New stage/dependency traversal is different: any new fragmenter traversal must be a queue/worklist with explicit upstream stage ids. ADR 192 should not add recursive graph traversal.
 
-## On recursion vs. worklist traversal
+## Headline Gate
 
-Queue/worklist traversal is the right long-run shape for stage graphs: galaxy, bridge, multi-fact, cycles, and memo all become graph/DAG traversal, where a queue plus visited-set generalizes and recursive tree-walking does not. But 192 should not churn every recursive helper. The binder snowflake code is tree-local and already recursive over an *already-built* `SnowflakeStarTree`; rewriting it during an authorization cut would be infrastructure with no independent behavior. The rule for 192:
+`broadcast_snowflake_root_actuates_and_executes_distributed`
 
-- keep existing binder recursion when the cut only changes authorization over the built tree;
-- do **not** add new recursive fragmenter/stage traversal;
-- if (and only if) D4's execution proof shows the fragmenter needs new dependency traversal, implement it as an explicit worklist/`VecDeque`, never another recursive descent, with a guard that producers precede consumers via explicit upstream stage ids.
+- canonical multi-child branch snowflake: `orders` root probe, `customers` composite branch, `regions` and `segments` branch children, `stores` root leaf child;
+- on main: root declines before authorization through ADR 181 preflight gates;
+- after ADR 192: selected root preflight authenticates broadcast-uniform composite-build placement, emits a root `join_order` receipt, and records broadcast strategy;
+- distributed execution succeeds without replay and digest-matches the hash baseline.
 
-So recursion is acceptable as a *reused, tree-local* implementation detail; a worklist is *mandatory* for any newly-created stage/dependency traversal.
+## Supporting Gates
+
+- `snowflake_uniformity_accepts_composite_build_natural_broadcast`;
+- `flat_star_uniformity_remains_strict_swapped_right_build`;
+- `snowflake_selected_broadcast_upgrade_is_fenced`;
+- `snowflake_non_composite_natural_broadcast_declines`;
+- `mixed_strategy_snowflake_still_declines_actuation`;
+- `nested_broadcast_probe_still_rejects_fragmentation`;
+- `broadcast_snowflake_receipts_are_edge_owned`;
+- `broadcast_snowflake_root_decline_render_state_stays_exclusive`.
+
+## Architecture Guards
+
+- `adr192_snowflake_uniformity_is_isolated_from_flat_star`;
+- `adr192_selected_broadcast_upgrade_is_snowflake_specific`;
+- `adr192_composite_natural_broadcast_is_authenticated`;
+- `adr192_no_raw_force_hash_boolean`;
+- `adr192_root_authorization_does_not_own_render_suppression`;
+- `adr192_fragmenter_probe_linearity_is_preserved`;
+- `adr192_no_storage_wendelon_or_wire_surface`;
+- `adr192_no_memo_cascades_or_cost_model`.
 
 ## Forward Arc
 
-`186 hash-snowflake actuation → 192 uniform broadcast-snowflake baseline (this) → mixed-strategy snowflake (strategy-aware cost model) → galaxy / bridge → memo (only when receipts show local decisions fighting)`. 192 is the last cheap rung *inside* the broadcast snowflake shape: it reuses recognition (182-186), the broadcast-star fragmenter, and every execution primitive — lifting one binder gate behind a typed authorization, behind an execution proof. The worklist question becomes load-bearing only when topology stops being a tree; 192 must not pretend that future has arrived, but must not add recursion to the stage-graph side either.
+`186 hash-snowflake actuation -> 192 broadcast-snowflake composite-build uniformity -> mixed-strategy snowflake cost model -> galaxy / bridge -> memo when receipts show local decisions fighting`.
 
-## Deferred (named)
+## Deferred
 
-Mixed-strategy snowflake (broadcast + hash edges — strategy-aware cost model); all-broadcast multi-child branch stars (until proven by execution); broadcast/hash placement *choice* tuning (191-adjacent); full stage-graph worklist if D4 doesn't require it now; galaxy / bridge / multi-fact topology; measured-cardinality → optimizer-facts feedback; outer-join order; binder join-depth recursion (pre-existing, all-joins); memo / Cascades.
+Mixed broadcast/hash snowflakes; cost-based broadcast/hash placement choice; all arbitrary nested broadcast probes; galaxy/bridge topology; outer joins; full stage-graph worklist unless execution proves it is required here; memo/Cascades.

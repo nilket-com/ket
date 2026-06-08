@@ -630,12 +630,14 @@ pub(crate) fn adr181_uniform_strategy_preflights_declared_and_selected() {
 	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 	let preflight = first_block(&binder, "fn preflight_star_order_strategy");
 
-	assert!(local_actuator.contains("let Some(declared_strategy)"));
-	assert!(local_actuator.contains("preflight_star_order_strategy("));
+	// ADR 192 preflights both orders; declared is now an `Option` (the snowflake broadcast upgrade
+	// tolerates a hash/None declared), selected must resolve.
+	assert!(local_actuator.contains("let declared_strategy = self.preflight_star_order_strategy("));
 	assert!(local_actuator.contains("&declared_indices"));
 	assert!(local_actuator.contains("let Some(selected_strategy)"));
 	assert!(local_actuator.contains("&selected_indices"));
-	assert!(local_actuator.contains("if declared_strategy != selected_strategy"));
+	// The strict declared == selected invariant survives for flat stars (AnyUniform).
+	assert!(local_actuator.contains("declared_strategy == Some(selected_strategy)"));
 	assert!(local_actuator.contains("StarOrderDeclineReason::MixedStrategyStar"));
 	assert!(local_actuator.contains("selected_strategy,"));
 	assert!(preflight.contains("let mut preflight_trace = base_trace.clone();"));
@@ -643,6 +645,7 @@ pub(crate) fn adr181_uniform_strategy_preflights_declared_and_selected() {
 	assert!(preflight.contains("let mut no_render_trace = None;"));
 	assert!(preflight.contains("self.bind_star_order_sequence("));
 	assert!(preflight.contains("if preflight_decisions.len() != order.len()"));
+	// Flat-star preflight still uses the strict uniformity rule.
 	assert!(preflight.contains("uniform_star_order_strategy(preflight_decisions)"));
 }
 
@@ -1352,15 +1355,13 @@ pub(crate) fn adr186_root_hash_gate_commits_or_discards_branch_receipts() {
 	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
 	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 
-	assert!(actuator.contains("let force_hash_root = tree.has_branch_dimensions();"));
-	assert!(actuator.contains("force_hash_root,"));
-	assert!(actuator.contains("if !force_hash_root"));
+	assert!(actuator.contains("let root_is_snowflake = tree.has_branch_dimensions();"));
+	assert!(actuator.contains("StarOrderStrategyAuthorization::AnyUniform"));
+	assert!(actuator.contains("if !root_is_snowflake"));
 	assert!(actuator.contains("return Ok(StarOrderActuationResult::Declined);"));
 	assert!(actuator.contains("render_trace.set_star_receipts(receipts)"));
-	assert!(
-		local_actuator
-			.contains("if force_hash && selected_strategy != StarOrderStrategy::HashPartitioned")
-	);
+	assert!(!local_actuator.contains("force_hash: bool"));
+	assert!(local_actuator.contains("StarOrderStrategyAuthorization::HashOnlyCompositeProbe"));
 	assert!(local_actuator.contains("LocalStarActuationAttempt::Declined"));
 }
 
@@ -1470,6 +1471,108 @@ pub(crate) fn adr179_no_optimizer_shell() {
 	assert!(
 		offenders.is_empty(),
 		"ADR179 introduced an optimizer shell/property contract:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr192_snowflake_uniformity_is_isolated_from_flat_star() {
+	let binder = binder_source();
+	let flat = first_block(&binder, "pub(super) fn uniform_star_order_strategy");
+	let snow = first_block(&binder, "pub(super) fn uniform_snowflake_order_strategy");
+
+	// The flat-star rule stays strict: Broadcast requires SwappedRightBuild placement.
+	assert!(flat.contains("JoinPhysicalPlacement::SwappedRightBuild"));
+	// The snowflake rule is a separate function that accepts `Natural` placement only for an
+	// authenticated composite-build position — flat stars never see this relaxation.
+	assert!(binder.contains("fn uniform_snowflake_order_strategy"));
+	assert!(snow.contains("decision.strategy != JoinStrategy::Broadcast"));
+	assert!(snow.contains("decisions.iter().enumerate()"));
+	assert!(snow.contains(
+		"JoinPhysicalPlacement::Natural => composite_build_positions.contains(&position)"
+	));
+	assert!(!flat.contains("composite_build_positions"));
+}
+
+#[test]
+pub(crate) fn adr192_composite_natural_broadcast_is_authenticated() {
+	let binder = binder_source();
+	let snow = first_block(&binder, "pub(super) fn uniform_snowflake_order_strategy");
+	let branch_builder = first_block(&binder, "fn bind_snowflake_dimension");
+	let bound_dimension = first_block(&binder, "fn bound_star_dimension");
+	let preflight = first_block(&binder, "fn preflight_star_order_strategy");
+
+	assert!(binder.contains("composite_build: bool"));
+	assert!(branch_builder.contains("composite_build: !child_dimensions.is_empty()"));
+	assert!(bound_dimension.contains("composite_build: dimension.composite_build"));
+	assert!(preflight.contains("let composite_build_positions = order"));
+	assert!(preflight.contains("dimensions[*dimension_index]"));
+	assert!(preflight.contains(".composite_build"));
+	assert!(preflight.contains("then_some(position)"));
+	assert!(preflight.contains("&composite_build_positions"));
+	assert!(snow.contains("composite_build_positions.contains(&position)"));
+}
+
+#[test]
+pub(crate) fn adr192_selected_broadcast_upgrade_is_snowflake_specific() {
+	let binder = binder_source();
+	let local = first_block(&binder, "fn bind_local_star_actuation");
+
+	// The broadcast upgrade (selected Broadcast accepted even if declared differs) is gated on the
+	// snowflake-root authorization only; the flat-star arm requires declared == selected.
+	assert!(local.contains("StarOrderStrategyAuthorization::CompositeBuildSnowflakeRoot =>"));
+	assert!(local.contains("selected_strategy == StarOrderStrategy::Broadcast"));
+	assert!(local.contains("StarOrderStrategyAuthorization::AnyUniform =>"));
+	assert!(local.contains("declared_strategy == Some(selected_strategy)"));
+}
+
+#[test]
+pub(crate) fn adr192_no_raw_force_hash_boolean() {
+	let binder = binder_source();
+	let local = first_block(&binder, "fn bind_local_star_actuation");
+	assert!(!local.contains("force_hash: bool"));
+	assert!(binder.contains("enum StarOrderStrategyAuthorization"));
+	assert!(binder.contains("CompositeBuildSnowflakeRoot"));
+}
+
+#[test]
+pub(crate) fn adr192_root_authorization_does_not_own_render_suppression() {
+	let binder = binder_source();
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+
+	// Render-decline suppression keys on `root_is_snowflake`, not on the strategy authorization.
+	assert!(actuator.contains("let root_is_snowflake = tree.has_branch_dimensions();"));
+	assert!(actuator.contains("if !root_is_snowflake"));
+}
+
+#[test]
+pub(crate) fn adr192_fragmenter_probe_linearity_is_preserved() {
+	let fragment = source("src/distributed/fragment.rs");
+	assert!(fragment.contains("BroadcastProbeNotStarLinear"));
+}
+
+#[test]
+pub(crate) fn adr192_no_storage_wendelon_or_wire_surface() {
+	let manifest = manifest_dir();
+	let markers = [
+		"uniform_snowflake_order_strategy",
+		"CompositeBuildSnowflakeRoot",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/storage.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR192 snowflake uniformity leaked outside the binder surface:\n{}",
 		format_offenders(&manifest, &offenders)
 	);
 }

@@ -8658,13 +8658,13 @@ async fn non_star_join_declines_with_reason() {
 
 #[tokio::test]
 async fn snowflake_order_evidence_reports_nested_declared_vs_preferred() {
-	let catalog = snowflake_join_order_catalog();
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
 		.expect("plan snowflake EXPLAIN");
 
 	let (_schema, rows) =
-		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 	let row = join_order_snowflake_row(&rows);
 
 	assert_eq!(
@@ -8865,14 +8865,14 @@ async fn optimizer_decisions_record_committed_not_scratch() {
 }
 
 #[tokio::test]
-async fn mixed_or_broadcast_snowflake_root_declines_actuation() {
-	let catalog = hash_snowflake_join_order_catalog();
+async fn mixed_strategy_snowflake_still_declines_actuation() {
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
-		.expect("plan broadcast-declined snowflake EXPLAIN");
+		.expect("plan mixed-strategy snowflake EXPLAIN");
 
 	let (_schema, rows) =
-		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 	let row = join_order_snowflake_row(&rows);
 
 	assert_eq!(
@@ -8883,6 +8883,56 @@ async fn mixed_or_broadcast_snowflake_root_declines_actuation() {
 		!rows
 			.iter()
 			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order".to_string())) })
+	);
+}
+
+// ADR 192 headline: a canonical multi-child broadcast snowflake (customers is a multi-child branch
+// with regions + segments) actuates a broadcast root and executes correctly. On pre-192 code the
+// composite branch build's `(Broadcast, Natural)` placement fails ADR-181 uniformity, so the root
+// declines (observed only). The fenced snowflake uniformity + broadcast upgrade unlock it. Execution
+// correctness is locked against the hash baseline.
+#[tokio::test]
+async fn broadcast_snowflake_root_actuates_and_executes_distributed() {
+	let (catalog, storage) = snowflake_order_execution_fixture().await;
+
+	// Actuation: EXPLAIN shows an actuated broadcast `join_order` root receipt (not observed-only).
+	let explain = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
+		.expect("plan broadcast snowflake EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&explain, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let join_order_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order".to_string())))
+		.collect::<Vec<_>>();
+	assert_eq!(
+		join_order_rows.len(),
+		1,
+		"broadcast snowflake root must actuate a join_order receipt"
+	);
+	assert_utf8_contains(&join_order_rows[0][3], "strategy=broadcast");
+
+	// Correctness: the actuated broadcast plan executes and matches the hash baseline (cap=1).
+	let sql = non_optimal_snowflake_order_project_sql();
+	let (hash_schema, mut hash_rows) =
+		execute_star_order_query(&catalog, storage.clone(), sql, &auto_broadcast_config(1)).await;
+	let (broadcast_schema, mut broadcast_rows) = execute_star_order_query(
+		&catalog,
+		storage,
+		sql,
+		&auto_broadcast_config(64 * 1024 * 1024),
+	)
+	.await;
+	assert_eq!(broadcast_schema, hash_schema);
+	assert!(
+		!broadcast_rows.is_empty(),
+		"broadcast snowflake produced rows"
+	);
+	hash_rows.sort();
+	broadcast_rows.sort();
+	assert_eq!(
+		broadcast_rows, hash_rows,
+		"broadcast snowflake result must match the hash baseline"
 	);
 }
 
@@ -8984,8 +9034,8 @@ async fn actuated_hash_snowflake_root_uses_star_verdict() {
 
 #[tokio::test]
 async fn snowflake_order_evidence_is_observational() {
-	let (catalog, storage) = snowflake_order_execution_fixture().await;
-	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let (catalog, storage) = mixed_strategy_snowflake_execution_fixture().await;
+	let config = auto_broadcast_config(4_096);
 	let logical = SqlPlanner::new()
 		.plan(non_optimal_snowflake_order_project_sql())
 		.expect("plan snowflake SQL");
@@ -9024,13 +9074,13 @@ async fn snowflake_order_evidence_is_observational() {
 
 #[tokio::test]
 async fn snowflake_recognized_supersedes_flat_missing_relation_decline() {
-	let catalog = snowflake_join_order_catalog();
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
 		.expect("plan snowflake EXPLAIN");
 
 	let (_schema, rows) =
-		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 
 	assert!(
 		rows.iter()
@@ -9044,13 +9094,13 @@ async fn snowflake_recognized_supersedes_flat_missing_relation_decline() {
 
 #[tokio::test]
 async fn snowflake_branch_links_outer_dimension_to_inner_probe() {
-	let catalog = snowflake_join_order_catalog();
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(non_optimal_snowflake_order_sql())
 		.expect("plan snowflake SQL");
 
 	let (_plan, _trace, render_trace) =
-		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(4_096))
 			.await
 			.expect("bind snowflake render trace");
 	let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order else {
@@ -9106,6 +9156,30 @@ fn galaxy_or_shared_dimension_declines_snowflake() {
 	assert!(analyze_snowflake(&edges, &decisions, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP).is_none());
 }
 
+#[test]
+fn snowflake_uniformity_accepts_only_authenticated_composite_natural_broadcast() {
+	let decisions = vec![
+		snowflake_test_decision(0, JoinStrategy::Broadcast, JoinPhysicalPlacement::Natural),
+		snowflake_test_decision(
+			1,
+			JoinStrategy::Broadcast,
+			JoinPhysicalPlacement::SwappedRightBuild,
+		),
+	];
+	let composite_build_positions = std::collections::BTreeSet::from([0usize]);
+	let no_composite_build_positions = std::collections::BTreeSet::new();
+
+	assert_eq!(
+		uniform_snowflake_order_strategy(&decisions, &composite_build_positions),
+		Some(StarOrderStrategy::Broadcast)
+	);
+	assert_eq!(
+		uniform_snowflake_order_strategy(&decisions, &no_composite_build_positions),
+		None
+	);
+	assert_eq!(uniform_star_order_strategy(&decisions), None);
+}
+
 #[tokio::test]
 async fn snowflake_evidence_records_per_edge_strategy_without_gating() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
@@ -9153,21 +9227,20 @@ async fn root_decline_keeps_observed_snowflake_state() {
 
 #[tokio::test]
 async fn snowflake_order_evidence_is_explain_gated() {
-	let catalog = snowflake_join_order_catalog();
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(non_optimal_snowflake_order_sql())
 		.expect("plan snowflake SQL");
 
-	let (_plan, trace) =
-		bind_with_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
-			.await
-			.expect("bind normal snowflake trace");
+	let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind normal snowflake trace");
 	let trace_debug = format!("{trace:?}");
 	assert!(!trace_debug.contains("JoinOrderEdgeEvidence"));
 	assert!(!trace_debug.contains("SnowflakeOrderEvidence"));
 
 	let (_plan, _trace, render_trace) =
-		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(4_096))
 			.await
 			.expect("bind snowflake explain trace");
 	assert!(matches!(
@@ -9178,14 +9251,13 @@ async fn snowflake_order_evidence_is_explain_gated() {
 
 #[tokio::test]
 async fn snowflake_explain_analyze_emits_plan_runtime_and_verdict() {
-	let catalog = snowflake_join_order_catalog();
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(non_optimal_snowflake_order_sql())
 		.expect("plan snowflake SQL");
-	let binding =
-		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
-			.await
-			.expect("bind snowflake analyze");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind snowflake analyze");
 	assert_eq!(binding.replay_ids.len(), 4);
 	let observations = binding
 		.replay_ids
@@ -9264,14 +9336,13 @@ async fn snowflake_explain_analyze_emits_plan_runtime_and_verdict() {
 
 #[tokio::test]
 async fn snowflake_runtime_replay_ids_collected_from_edges() {
-	let catalog = snowflake_join_order_catalog();
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(non_optimal_snowflake_order_sql())
 		.expect("plan snowflake SQL");
-	let binding =
-		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
-			.await
-			.expect("bind snowflake analyze");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind snowflake analyze");
 	let expected = binding
 		.render_trace
 		.join_order_edges
@@ -10907,7 +10978,7 @@ async fn rune_explain_shows_star_order_evidence() {
 
 #[tokio::test]
 async fn rune_explain_shows_snowflake_order_evidence() {
-	let catalog = snowflake_join_order_catalog();
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
@@ -10935,7 +11006,7 @@ async fn rune_explain_shows_snowflake_order_evidence() {
 	.await;
 
 	let (_schema, rows) =
-		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 	let row = join_order_snowflake_row(&rows);
 
 	assert_eq!(
@@ -11048,7 +11119,7 @@ async fn rune_analyze_renders_star_order_verdict() {
 
 #[tokio::test]
 async fn rune_analyze_shows_snowflake_verdict() {
-	let catalog = snowflake_join_order_catalog();
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
@@ -11077,7 +11148,7 @@ async fn rune_analyze_shows_snowflake_verdict() {
 	let LogicalPlan::ExplainAnalyze { input } = logical else {
 		panic!("expected Rune analyze logical plan");
 	};
-	let binding = bind_explain_analyze(&input, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+	let binding = bind_explain_analyze(&input, &catalog, &auto_broadcast_config(4_096))
 		.await
 		.expect("bind Rune analyze snowflake");
 	let observations = binding
@@ -13459,6 +13530,18 @@ async fn snowflake_order_execution_fixture() -> (MockCatalog, Arc<InMemoryTableS
 		Some(8_192),
 		Some(8_192),
 	);
+	let storage = Arc::new(InMemoryTableStorage::new());
+	for (table_id, descriptor, batch) in snowflake_order_storage_batches() {
+		write_star_order_table(storage.as_ref(), table_id, &descriptor, batch).await;
+	}
+	(catalog, storage)
+}
+
+async fn mixed_strategy_snowflake_execution_fixture() -> (MockCatalog, Arc<InMemoryTableStorage>) {
+	// ADR 192: a genuinely mixed snowflake (segments broadcast-eligible, the rest over the 4_096
+	// cap) so the root stays observed (mixed strategy), exercising 182-186 observation on a
+	// non-actuating snowflake. Same storage/data as the all-broadcast fixture.
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let storage = Arc::new(InMemoryTableStorage::new());
 	for (table_id, descriptor, batch) in snowflake_order_storage_batches() {
 		write_star_order_table(storage.as_ref(), table_id, &descriptor, batch).await;

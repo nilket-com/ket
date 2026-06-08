@@ -272,14 +272,10 @@ async fn snowflake_verdict_detail_keeps_estimate_and_measurement_separate() {
 	);
 	assert!(detail.contains("measured_applied_order=[s,c]"), "{detail}");
 	assert!(detail.contains("strategies=["), "{detail}");
-	assert!(
-		detail.contains("c:broadcast/swapped_right_build"),
-		"{detail}"
-	);
-	assert!(
-		detail.contains("s:broadcast/swapped_right_build"),
-		"{detail}"
-	);
+	// ADR 192: the observed (non-actuating) snowflake is genuinely mixed under the test cap — the
+	// root edges resolve to hash, which is what keeps it observed rather than broadcast-actuated.
+	assert!(detail.contains("c:hash_partitioned/natural"), "{detail}");
+	assert!(detail.contains("s:hash_partitioned/natural"), "{detail}");
 }
 
 #[tokio::test]
@@ -310,7 +306,8 @@ async fn snowflake_runtime_evidence_is_observational() {
 		catalog,
 		storage,
 		PlannerConfig {
-			auto_broadcast_max_build_bytes: Some(ByteCount::new(64 * 1024 * 1024)),
+			// ADR 192: keep the snowflake mixed/observed (see analyze_snowflake_batch).
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(65_536)),
 			..PlannerConfig::default()
 		},
 	);
@@ -698,7 +695,10 @@ async fn analyze_snowflake_batch() -> RecordBatch {
 		catalog,
 		storage,
 		PlannerConfig {
-			auto_broadcast_max_build_bytes: Some(ByteCount::new(64 * 1024 * 1024)),
+			// ADR 192: a cap that leaves the customers branch (10_000 rows) hash but the small dims
+			// broadcast keeps the snowflake genuinely mixed, so it stays observed (these tests
+			// exercise the 182-188 observation/verdict machinery on a non-actuating snowflake).
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(65_536)),
 			..PlannerConfig::default()
 		},
 	);

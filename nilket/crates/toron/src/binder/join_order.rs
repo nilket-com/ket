@@ -271,6 +271,22 @@ pub(super) enum StarOrderStrategy {
 	HashPartitioned,
 }
 
+// ADR 192: typed authorization for a local star actuation, replacing the old `force_hash: bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StarOrderStrategyAuthorization {
+	// Flat-star root: strict ADR-181 uniformity (`uniform_star_order_strategy`); declared and
+	// selected orders must resolve to the same strategy.
+	AnyUniform,
+	// Snowflake root with composite branch builds: fenced uniformity
+	// (`uniform_snowflake_order_strategy`, which accepts `Natural` placement for a composite build)
+	// plus the broadcast-upgrade relaxation — a clean selected-order Broadcast actuates even when the
+	// declared order preflights to hash, because composite-build strategy is order-variant.
+	CompositeBuildSnowflakeRoot,
+	// Branch star folded into a composite build: hash-only, so the fragmenter never sees a nested
+	// broadcast probe (BroadcastProbeNotStarLinear).
+	HashOnlyCompositeProbe,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StarOrderRanking {
 	pub(super) probe: String,
@@ -1276,6 +1292,38 @@ pub(super) fn uniform_star_order_strategy(
 	None
 }
 
+// ADR 192: the snowflake-fenced uniformity rule. A snowflake root's composite branch build resolves
+// to `(Broadcast, Natural)` while leaf-scan dimensions resolve to `(Broadcast, SwappedRightBuild)`;
+// both are valid single-partition broadcast builds, so an all-broadcast snowflake root is uniform
+// even with mixed placement. The flat-star rule (`uniform_star_order_strategy`) stays strict — this
+// is a separate function so flat stars never see the relaxed placement.
+pub(super) fn uniform_snowflake_order_strategy(
+	decisions: &[DecisionReceipt],
+	composite_build_positions: &BTreeSet<usize>,
+) -> Option<StarOrderStrategy> {
+	if decisions.is_empty() {
+		return None;
+	}
+	if decisions.iter().enumerate().all(|(position, decision)| {
+		if decision.strategy != JoinStrategy::Broadcast {
+			return false;
+		}
+		match decision.placement {
+			JoinPhysicalPlacement::SwappedRightBuild => true,
+			JoinPhysicalPlacement::Natural => composite_build_positions.contains(&position),
+		}
+	}) {
+		return Some(StarOrderStrategy::Broadcast);
+	}
+	if decisions.iter().all(|decision| {
+		decision.strategy == JoinStrategy::HashPartitioned
+			&& decision.placement == JoinPhysicalPlacement::Natural
+	}) {
+		return Some(StarOrderStrategy::HashPartitioned);
+	}
+	None
+}
+
 pub(super) fn classify_star_order_action(
 	declared_cost: u128,
 	preferred_cost: u128,
@@ -1320,6 +1368,7 @@ struct StarChildDimension<'a> {
 	strategy_intent: JoinStrategyIntent,
 	label: String,
 	declared_position: usize,
+	composite_build: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1328,6 +1377,7 @@ struct BoundStarDimension<'a> {
 	on: &'a [(Expr, Expr)],
 	strategy_intent: JoinStrategyIntent,
 	label: String,
+	composite_build: bool,
 	evidence: JoinOrderDimEvidence,
 }
 
@@ -1510,7 +1560,17 @@ impl<'a> Binder<'a> {
 			return Ok(StarOrderActuationResult::Declined);
 		}
 
-		let force_hash_root = tree.has_branch_dimensions();
+		// ADR 192: the old `force_hash_root` boolean did double duty — strategy authorization AND
+		// render-decline suppression. Split them. `root_is_snowflake` keeps the render behavior
+		// (suppress the flat-star decline row for a snowflake root, whose snowflake render is owned
+		// elsewhere); a snowflake root actuates under the composite-build-fenced uniformity rule,
+		// while a flat-star root keeps the strict ADR-181 rule.
+		let root_is_snowflake = tree.has_branch_dimensions();
+		let root_authorization = if root_is_snowflake {
+			StarOrderStrategyAuthorization::CompositeBuildSnowflakeRoot
+		} else {
+			StarOrderStrategyAuthorization::AnyUniform
+		};
 		let Some((scratch_root_dimensions, _scratch_branch_receipts)) = self
 			.bind_snowflake_root_dimensions(
 				&probe_plan,
@@ -1526,7 +1586,7 @@ impl<'a> Binder<'a> {
 				root_decision_kind(&tree),
 				StarOrderDeclineReason::MissingEstimate,
 			);
-			if !force_hash_root {
+			if !root_is_snowflake {
 				self.record_star_order_decline(
 					render_trace,
 					StarOrderDeclineReason::MissingEstimate,
@@ -1539,14 +1599,14 @@ impl<'a> Binder<'a> {
 			probe_plan.clone(),
 			probe_label.clone(),
 			&scratch_root_dimensions,
-			force_hash_root,
+			root_authorization,
 			candidate.dimensions.len(),
 			&mut scratch_trace,
 			&mut scratch_render_trace,
 		)?;
 		if let LocalStarActuationAttempt::Declined(reason) = scratch_root_attempt {
 			self.record_optimizer_star_order_decline(trace, root_decision_kind(&tree), reason);
-			if !force_hash_root {
+			if !root_is_snowflake {
 				self.record_star_order_decline(render_trace, reason, candidate.dimensions.len());
 			}
 			return Ok(StarOrderActuationResult::Declined);
@@ -1588,7 +1648,7 @@ impl<'a> Binder<'a> {
 			real_probe_plan,
 			probe_label,
 			&real_root_dimensions,
-			force_hash_root,
+			root_authorization,
 			candidate.dimensions.len(),
 			trace,
 			render_trace,
@@ -1806,11 +1866,16 @@ impl<'a> Binder<'a> {
 				}
 			}
 			if complete {
+				let branch_authorization = if broadcast_probe_is_scan_linear(&base_plan.plan) {
+					StarOrderStrategyAuthorization::AnyUniform
+				} else {
+					StarOrderStrategyAuthorization::HashOnlyCompositeProbe
+				};
 				match self.bind_local_star_actuation(
 					base_plan.clone(),
 					node.label.clone(),
 					&bound_children,
-					true,
+					branch_authorization,
 					child_dimensions.len(),
 					trace,
 					render_trace,
@@ -1842,6 +1907,7 @@ impl<'a> Binder<'a> {
 				strategy_intent: node.strategy_intent,
 				label: node.label.clone(),
 				declared_position: node.declared_position,
+				composite_build: !child_dimensions.is_empty(),
 			},
 			receipts,
 		})
@@ -1918,6 +1984,7 @@ impl<'a> Binder<'a> {
 			on: dimension.on,
 			strategy_intent: dimension.strategy_intent,
 			label: dimension.label.clone(),
+			composite_build: dimension.composite_build,
 			evidence: JoinOrderDimEvidence {
 				dimension: dimension.label.clone(),
 				declared_position: dimension.declared_position,
@@ -1933,7 +2000,7 @@ impl<'a> Binder<'a> {
 		probe_plan: ScopedExecutionPlan,
 		probe_label: String,
 		dimensions: &[BoundStarDimension<'b>],
-		force_hash: bool,
+		authorization: StarOrderStrategyAuthorization,
 		edge_count: usize,
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
@@ -1974,21 +2041,24 @@ impl<'a> Binder<'a> {
 			declared_indices.clone()
 		};
 
-		let Some(declared_strategy) = self.preflight_star_order_strategy(
+		// ADR 192: a snowflake root uses the composite-build-fenced uniformity rule (accepts `Natural`
+		// placement for the composite build); flat stars and branches keep the strict ADR-181 rule.
+		let composite_builds = matches!(
+			authorization,
+			StarOrderStrategyAuthorization::CompositeBuildSnowflakeRoot
+		);
+		let declared_strategy = self.preflight_star_order_strategy(
 			probe_plan.clone(),
 			dimensions,
 			&declared_indices,
+			composite_builds,
 			trace,
-		)?
-		else {
-			return Ok(LocalStarActuationAttempt::Declined(
-				StarOrderDeclineReason::MixedStrategyStar,
-			));
-		};
+		)?;
 		let Some(selected_strategy) = self.preflight_star_order_strategy(
 			probe_plan.clone(),
 			dimensions,
 			&selected_indices,
+			composite_builds,
 			trace,
 		)?
 		else {
@@ -1996,12 +2066,26 @@ impl<'a> Binder<'a> {
 				StarOrderDeclineReason::MixedStrategyStar,
 			));
 		};
-		if declared_strategy != selected_strategy {
-			return Ok(LocalStarActuationAttempt::Declined(
-				StarOrderDeclineReason::MixedStrategyStar,
-			));
-		}
-		if force_hash && selected_strategy != StarOrderStrategy::HashPartitioned {
+		// ADR 192: typed authorization decides what is actuatable.
+		// - `AnyUniform` (flat star): strict — declared and selected must resolve to the same strategy.
+		// - `CompositeBuildSnowflakeRoot`: broadcast upgrade — a clean selected-order Broadcast
+		//   actuates even when the declared order preflights to hash/None (composite-build strategy is
+		//   order-variant); a hash selection stays strict.
+		// - `HashOnlyCompositeProbe` (branch): hash-only, strict.
+		let strategy_authorized = match authorization {
+			StarOrderStrategyAuthorization::AnyUniform => {
+				declared_strategy == Some(selected_strategy)
+			}
+			StarOrderStrategyAuthorization::CompositeBuildSnowflakeRoot => {
+				selected_strategy == StarOrderStrategy::Broadcast
+					|| declared_strategy == Some(selected_strategy)
+			}
+			StarOrderStrategyAuthorization::HashOnlyCompositeProbe => {
+				selected_strategy == StarOrderStrategy::HashPartitioned
+					&& declared_strategy == Some(selected_strategy)
+			}
+		};
+		if !strategy_authorized {
 			return Ok(LocalStarActuationAttempt::Declined(
 				StarOrderDeclineReason::MixedStrategyStar,
 			));
@@ -2119,6 +2203,7 @@ impl<'a> Binder<'a> {
 		probe_plan: ScopedExecutionPlan,
 		dimensions: &[BoundStarDimension<'b>],
 		order: &[usize],
+		composite_builds: bool,
 		base_trace: &OptimizerTrace,
 	) -> Result<Option<StarOrderStrategy>, BindingError> {
 		let mut preflight_trace = base_trace.clone();
@@ -2135,7 +2220,25 @@ impl<'a> Binder<'a> {
 		if preflight_decisions.len() != order.len() {
 			return Ok(None);
 		}
-		Ok(uniform_star_order_strategy(preflight_decisions))
+		// ADR 192: snowflake roots (composite builds) use the fenced uniformity rule that accepts
+		// `Natural` placement for the composite build; flat stars keep the strict ADR-181 rule.
+		if composite_builds {
+			let composite_build_positions = order
+				.iter()
+				.enumerate()
+				.filter_map(|(position, dimension_index)| {
+					dimensions[*dimension_index]
+						.composite_build
+						.then_some(position)
+				})
+				.collect::<BTreeSet<_>>();
+			Ok(uniform_snowflake_order_strategy(
+				preflight_decisions,
+				&composite_build_positions,
+			))
+		} else {
+			Ok(uniform_star_order_strategy(preflight_decisions))
+		}
 	}
 
 	fn bind_star_order_sequence<'b>(
