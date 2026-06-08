@@ -54,6 +54,7 @@ use wendelon_client::{
 
 mod aggregate;
 mod arithmetic;
+mod decision_log;
 mod explain;
 mod join;
 mod join_order;
@@ -62,12 +63,14 @@ mod selectivity;
 
 use self::aggregate::*;
 use self::arithmetic::*;
+use self::decision_log::*;
 use self::explain::*;
 use self::join::*;
 use self::join_order::*;
 use self::pushdown::*;
 use self::selectivity::*;
 
+pub use self::decision_log::OptimizerDecisionLog;
 pub use self::join::join_schema;
 pub(crate) use self::join::{BroadcastBuildSide, JoinStrategyDecisionReason};
 
@@ -85,10 +88,12 @@ const INFORMATION_SCHEMA_LOGICAL_TYPES: &str = "information_schema.logical_types
 const INFORMATION_SCHEMA_TABLES: &str = "information_schema.tables";
 const INFORMATION_SCHEMA_COLUMNS: &str = "information_schema.columns";
 const INFORMATION_SCHEMA_SCHEMATA: &str = "information_schema.schemata";
+const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS: &str = "information_schema.optimizer_decisions";
 const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
 const INFORMATION_SCHEMA_TABLES_TABLE: &str = "tables";
 const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = "columns";
 const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
+const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS_TABLE: &str = "optimizer_decisions";
 const ARROW_BUFFER_ALIGNMENT_BYTES: u64 = 64;
 const DEFAULT_UTF8_BINARY_PAYLOAD_BYTES: u64 = 256;
 const DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES: u64 = 1024;
@@ -100,6 +105,7 @@ pub struct PlannerConfig {
 	pub auto_broadcast_max_build_bytes: Option<ByteCount>,
 	pub force_hash_join_ids: BTreeSet<JoinReplayId>,
 	pub session_timezone: String,
+	pub decision_log: Arc<OptimizerDecisionLog>,
 }
 
 impl Default for PlannerConfig {
@@ -109,6 +115,7 @@ impl Default for PlannerConfig {
 			auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
 			force_hash_join_ids: BTreeSet::new(),
 			session_timezone: "UTC".to_string(),
+			decision_log: Arc::new(OptimizerDecisionLog::default()),
 		}
 	}
 }
@@ -989,11 +996,30 @@ impl<'a> Binder<'a> {
 					on,
 					strategy_intent,
 				} => {
-					if let Some(plan) = self
+					match self
 						.try_bind_star_order_actuation(plan, trace, render_trace)
 						.await?
 					{
-						return Ok(plan);
+						StarOrderActuationResult::Actuated(plan) => return Ok(plan),
+						StarOrderActuationResult::NotCandidate => {}
+						StarOrderActuationResult::Declined => {
+							let previous = trace.record_optimizer_decisions;
+							trace.record_optimizer_decisions = false;
+							let result = self
+								.bind_join(
+									left,
+									right,
+									*kind,
+									on,
+									*strategy_intent,
+									trace,
+									render_trace,
+									join_order_source_capture,
+								)
+								.await;
+							trace.record_optimizer_decisions = previous;
+							return result;
+						}
 					}
 					self.bind_join(
 						left,
@@ -1669,9 +1695,20 @@ impl<'a> Binder<'a> {
 				projection,
 			);
 		}
+		if table
+			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_DECISIONS_TABLE)
+		{
+			return system_table_plan(
+				SystemTableKind::InformationSchemaOptimizerDecisions,
+				information_schema_optimizer_decisions_schema(),
+				information_schema_optimizer_decision_rows(&self.config.decision_log.snapshot())?,
+				projection,
+			);
+		}
 		Err(BindingError::UnsupportedExpression {
 			message: format!(
-				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}",
+				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}",
 				table_name(table)
 			),
 		})

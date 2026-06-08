@@ -1,8 +1,9 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 7] = [
+const BINDER_MODULES: [&str; 8] = [
 	"aggregate",
 	"arithmetic",
+	"decision_log",
 	"explain",
 	"join",
 	"join_order",
@@ -17,6 +18,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder.rs",
 		"src/binder/aggregate.rs",
 		"src/binder/arithmetic.rs",
+		"src/binder/decision_log.rs",
 		"src/binder/explain.rs",
 		"src/binder/join.rs",
 		"src/binder/join_order.rs",
@@ -170,6 +172,7 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/distributed/scheduler.rs",
 				"crates/toron/src/distributed/task.rs",
 				"crates/toron/src/exec.rs",
+				"crates/toron/src/ir/execution.rs",
 				"crates/toron/src/ir.rs",
 				"crates/toron/src/lib.rs",
 				"crates/toron/src/rune_engine.rs",

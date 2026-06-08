@@ -63,10 +63,21 @@ pub(super) struct ScanFilterPushdownEvidence {
 	pub(super) table_id: Option<TableId>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OptimizerTrace {
 	pub(crate) join_decisions: Vec<DecisionReceipt>,
 	pub(crate) scan_filter_decisions: Vec<ScanFilterReceipt>,
+	pub(super) record_optimizer_decisions: bool,
+}
+
+impl Default for OptimizerTrace {
+	fn default() -> Self {
+		Self {
+			join_decisions: Vec::new(),
+			scan_filter_decisions: Vec::new(),
+			record_optimizer_decisions: true,
+		}
+	}
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -194,6 +205,48 @@ pub(super) fn information_schema_schemata_schema() -> SchemaRef {
 		DataType::Utf8,
 		false,
 	)]))
+}
+
+pub(super) fn information_schema_optimizer_decisions_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("outcome", DataType::Utf8, false),
+		Field::new("decline_reason", DataType::Utf8, true),
+		Field::new("count", DataType::Int64, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_decision_rows(
+	decisions: &[OptimizerDecisionRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	decisions
+		.iter()
+		.map(|decision| {
+			Ok(vec![
+				ScalarValue::Utf8(Some(
+					optimizer_decision_kind_label(decision.kind).to_string(),
+				)),
+				ScalarValue::Utf8(Some(
+					optimizer_decision_outcome_label(decision.outcome).to_string(),
+				)),
+				ScalarValue::Utf8(match decision.outcome {
+					OptimizerDecisionOutcome::Declined(reason) => {
+						Some(optimizer_decision_decline_reason_label(reason).to_string())
+					}
+					OptimizerDecisionOutcome::Reordered
+					| OptimizerDecisionOutcome::KeptOptimal
+					| OptimizerDecisionOutcome::KeptThinMargin
+					| OptimizerDecisionOutcome::Overflow => None,
+				}),
+				ScalarValue::Int64(Some(i64::try_from(decision.count).map_err(|_| {
+					BindingError::UnsupportedExpression {
+						message: "optimizer explain optimizer_decision_count exceeds i64::MAX"
+							.to_string(),
+					}
+				})?)),
+			])
+		})
+		.collect()
 }
 
 pub(super) fn optimizer_explain_schema() -> SchemaRef {

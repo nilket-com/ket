@@ -8587,6 +8587,119 @@ async fn star_order_actuation_reorders_non_optimal_broadcast_star() {
 }
 
 #[tokio::test]
+async fn optimizer_decision_accrual_is_always_on() {
+	let catalog = star_join_order_catalog();
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+
+	let _plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind normal star query");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(&rows, "flat_star", "reordered", None),
+		1
+	);
+}
+
+#[tokio::test]
+async fn optimizer_decisions_accrue_across_queries() {
+	let config = auto_broadcast_config(4_096);
+	let star_catalog = star_join_order_catalog();
+	let mixed_snowflake_catalog = mixed_strategy_snowflake_join_order_catalog();
+	let reordered = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan reordered star");
+	let kept = SqlPlanner::new()
+		.plan(preferred_star_order_sql())
+		.expect("plan kept star");
+	let declined = SqlPlanner::new()
+		.plan(mixed_strategy_snowflake_order_sql())
+		.expect("plan declined snowflake");
+
+	let _ = bind(&reordered, &star_catalog, &config)
+		.await
+		.expect("bind reordered star");
+	let _ = bind(&kept, &star_catalog, &config)
+		.await
+		.expect("bind kept star");
+	let _ = bind(&declined, &mixed_snowflake_catalog, &config)
+		.await
+		.expect("bind declined snowflake");
+	let rows = optimizer_decision_rows(&star_catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(&rows, "flat_star", "reordered", None),
+		1
+	);
+	assert_eq!(
+		optimizer_decision_count(&rows, "flat_star", "kept_optimal", None),
+		1
+	);
+	assert_eq!(
+		optimizer_decision_count(
+			&rows,
+			"snowflake_root",
+			"declined",
+			Some("mixed_strategy_star")
+		),
+		1
+	);
+}
+
+#[tokio::test]
+async fn optimizer_decisions_report_aggregates_by_kind_and_outcome() {
+	let catalog = star_join_order_catalog();
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+
+	for _ in 0..2 {
+		let _ = bind(&logical, &catalog, &config)
+			.await
+			.expect("bind repeated star");
+	}
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		rows.iter()
+			.filter(|row| {
+				row[0] == ScalarValue::Utf8(Some("flat_star".to_string()))
+					&& row[1] == ScalarValue::Utf8(Some("reordered".to_string()))
+			})
+			.count(),
+		1
+	);
+	assert_eq!(
+		optimizer_decision_count(&rows, "flat_star", "reordered", None),
+		2
+	);
+}
+
+#[tokio::test]
+async fn optimizer_decisions_records_decline_reasons() {
+	let catalog = mixed_strategy_star_join_order_catalog();
+	let config = auto_broadcast_config(4_096);
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan mixed strategy star");
+
+	let _ = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind mixed strategy star");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(&rows, "flat_star", "declined", Some("mixed_strategy_star")),
+		1
+	);
+}
+
+#[tokio::test]
 async fn uniform_hash_star_reorders_on_robust_win() {
 	let catalog = hash_star_join_order_catalog();
 	let logical = SqlPlanner::new()
@@ -8882,6 +8995,76 @@ async fn hash_snowflake_branch_emits_edge_owned_star_receipt() {
 	assert_eq!(branch_evidence.declared_order, vec!["r", "g"]);
 	assert_eq!(branch_evidence.applied_order, vec!["g", "r"]);
 	assert_eq!(branch_evidence.strategy, StarOrderStrategy::HashPartitioned);
+}
+
+#[tokio::test]
+async fn optimizer_decisions_records_per_level_for_recursive_snowflake() {
+	let catalog = hash_snowflake_join_order_catalog();
+	let config = auto_broadcast_config(1);
+	let logical = SqlPlanner::new()
+		.plan(non_optimal_snowflake_order_sql())
+		.expect("plan hash snowflake");
+
+	let _ = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind hash snowflake");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(&rows, "snowflake_root", "reordered", None),
+		1
+	);
+	assert_eq!(
+		optimizer_decision_count(&rows, "snowflake_branch", "reordered", None),
+		1
+	);
+}
+
+#[tokio::test]
+async fn optimizer_decisions_record_committed_not_scratch() {
+	let committed_catalog = hash_snowflake_join_order_catalog();
+	let committed_config = auto_broadcast_config(1);
+	let committed = SqlPlanner::new()
+		.plan(non_optimal_snowflake_order_sql())
+		.expect("plan committed snowflake");
+	let _ = bind(&committed, &committed_catalog, &committed_config)
+		.await
+		.expect("bind committed snowflake");
+	let committed_rows = optimizer_decision_rows(&committed_catalog, &committed_config).await;
+	assert_eq!(
+		optimizer_decision_count(&committed_rows, "snowflake_root", "reordered", None),
+		1
+	);
+	assert_eq!(
+		optimizer_decision_count(&committed_rows, "snowflake_branch", "reordered", None),
+		1
+	);
+
+	let declined_catalog = mixed_strategy_snowflake_join_order_catalog();
+	let declined_config = auto_broadcast_config(4_096);
+	let declined = SqlPlanner::new()
+		.plan(mixed_strategy_snowflake_order_sql())
+		.expect("plan declined snowflake");
+	let _ = bind(&declined, &declined_catalog, &declined_config)
+		.await
+		.expect("bind declined snowflake");
+	let declined_rows = optimizer_decision_rows(&declined_catalog, &declined_config).await;
+
+	assert_eq!(
+		optimizer_decision_count(
+			&declined_rows,
+			"snowflake_root",
+			"declined",
+			Some("mixed_strategy_star")
+		),
+		1
+	);
+	assert!(
+		!declined_rows
+			.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("snowflake_branch".to_string()))),
+		"declined root must discard scratch branch decisions: {declined_rows:?}"
+	);
 }
 
 #[tokio::test]
@@ -9432,6 +9615,183 @@ async fn star_recognition_respects_scan_linear_probe_fence() {
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 
 	assert_utf8_contains(&join_order_row(&rows)[3], "reason=probe_not_scan_linear");
+}
+
+#[tokio::test]
+async fn optimizer_decisions_records_unclassified_candidate_declines() {
+	let catalog = star_join_order_catalog();
+	let config = auto_broadcast_config(4_096);
+	let limited_orders = LogicalPlan::Take {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("orders"),
+			projection: None,
+		}),
+		limit: 1,
+	};
+	let logical = LogicalPlan::Join {
+		left: Box::new(LogicalPlan::Join {
+			left: Box::new(limited_orders),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("products"),
+			projection: None,
+		}),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("orders"), "product_id"),
+			Expr::qualified_column(TableRef::new("products"), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+
+	let _plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind non-scan-linear probe star candidate");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(
+			&rows,
+			"star_candidate",
+			"declined",
+			Some("probe_not_scan_linear")
+		),
+		1
+	);
+	assert!(
+		!rows.iter().any(|row| {
+			(row[0] == ScalarValue::Utf8(Some("flat_star".to_string()))
+				|| row[0] == ScalarValue::Utf8(Some("snowflake_root".to_string())))
+				&& row[1] == ScalarValue::Utf8(Some("declined".to_string()))
+		}),
+		"pre-tree decline must not invent a flat/root classification: {rows:?}"
+	);
+}
+
+#[tokio::test]
+async fn optimizer_decision_accrual_is_side_effect_only() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let quiet_config = auto_broadcast_config(64 * 1024 * 1024);
+	let noisy_log = Arc::new(OptimizerDecisionLog::default());
+	noisy_log.record(
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MixedStrategyStar),
+	);
+	let noisy_config = PlannerConfig {
+		decision_log: noisy_log,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+
+	let quiet_plan = bind(&logical, &catalog, &quiet_config)
+		.await
+		.expect("bind quiet plan");
+	let noisy_plan = bind(&logical, &catalog, &noisy_config)
+		.await
+		.expect("bind noisy plan");
+
+	assert_eq!(format!("{quiet_plan:?}"), format!("{noisy_plan:?}"));
+}
+
+#[tokio::test]
+async fn optimizer_decisions_log_is_bounded() {
+	let catalog = MockCatalog::new();
+	let decision_log = Arc::new(OptimizerDecisionLog::with_max_keys(1));
+	decision_log.record(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+	);
+	decision_log.record(
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionOutcome::Reordered,
+	);
+	let config = PlannerConfig {
+		decision_log,
+		..PlannerConfig::default()
+	};
+
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count(&rows, "flat_star", "reordered", None),
+		1
+	);
+	assert_eq!(
+		optimizer_decision_count(&rows, "overflow", "overflow", None),
+		1
+	);
+	assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+async fn optimizer_decisions_report_projects_like_information_schema() {
+	let catalog = star_join_order_catalog();
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let _ = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind star query");
+
+	let report = LogicalPlan::ScanNamed {
+		table: TableRef::with_schema("information_schema", "optimizer_decisions"),
+		projection: Some(vec!["decision_kind".to_string(), "count".to_string()]),
+	};
+	let plan = bind(&report, &catalog, &config)
+		.await
+		.expect("bind projected optimizer decisions");
+	let ExecutionPlan::SystemTable { schema, rows, .. } = plan else {
+		panic!("expected projected system table");
+	};
+
+	assert_eq!(field_names(&schema), vec!["decision_kind", "count"]);
+	assert_eq!(rows.len(), 1);
+	assert_eq!(rows[0][0], ScalarValue::Utf8(Some("flat_star".to_string())));
+	assert_eq!(rows[0][1], ScalarValue::Int64(Some(1)));
+}
+
+#[tokio::test]
+async fn rune_queries_optimizer_decisions() {
+	let catalog = star_join_order_catalog();
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	config.decision_log.record(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+	);
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM information_schema.optimizer_decisions")
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer decisions report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer decisions system table");
+	};
+
+	assert_eq!(kind, SystemTableKind::InformationSchemaOptimizerDecisions);
+	assert_eq!(
+		optimizer_decision_count(&rows, "flat_star", "reordered", None),
+		1
+	);
 }
 
 #[tokio::test]
@@ -11574,6 +11934,48 @@ async fn bind_explain_rows(
 	};
 	assert_eq!(kind, SystemTableKind::OptimizerExplain);
 	(schema, rows)
+}
+
+async fn optimizer_decision_rows(
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Vec<Vec<ScalarValue>> {
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_decisions")
+		.expect("plan optimizer decisions report");
+	let plan = bind(&logical, catalog, config)
+		.await
+		.expect("bind optimizer decisions report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected optimizer decisions system table, got {plan:?}");
+	};
+	assert_eq!(kind, SystemTableKind::InformationSchemaOptimizerDecisions);
+	rows
+}
+
+fn optimizer_decision_count(
+	rows: &[Vec<ScalarValue>],
+	kind: &str,
+	outcome: &str,
+	decline_reason: Option<&str>,
+) -> i64 {
+	let row = rows
+		.iter()
+		.find(|row| {
+			row[0] == ScalarValue::Utf8(Some(kind.to_string()))
+				&& row[1] == ScalarValue::Utf8(Some(outcome.to_string()))
+				&& row[2]
+					== ScalarValue::Utf8(decline_reason.map(std::string::ToString::to_string))
+		})
+		.unwrap_or_else(|| {
+			panic!(
+				"missing optimizer decision row kind={kind} outcome={outcome} reason={decline_reason:?}: {rows:?}"
+			)
+		});
+	let ScalarValue::Int64(Some(count)) = row[3] else {
+		panic!("expected optimizer decision count, got {:?}", row[3]);
+	};
+	count
 }
 
 fn assert_utf8_contains(value: &ScalarValue, expected: &str) {

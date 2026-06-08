@@ -215,6 +215,7 @@ pub enum SystemTableKind {
 	InformationSchemaTables,
 	InformationSchemaColumns,
 	InformationSchemaSchemata,
+	InformationSchemaOptimizerDecisions,
 	OptimizerExplain,
 }
 

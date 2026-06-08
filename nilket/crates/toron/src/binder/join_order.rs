@@ -1130,6 +1130,13 @@ struct LocalStarActuation {
 }
 
 #[derive(Debug, Clone)]
+pub(super) enum StarOrderActuationResult {
+	NotCandidate,
+	Actuated(ScopedExecutionPlan),
+	Declined,
+}
+
+#[derive(Debug, Clone)]
 enum LocalStarActuationAttempt {
 	Actuated(LocalStarActuation),
 	Declined(StarOrderDeclineReason),
@@ -1187,9 +1194,9 @@ impl<'a> Binder<'a> {
 		plan: &LogicalPlan,
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
-	) -> Result<Option<ScopedExecutionPlan>, BindingError> {
+	) -> Result<StarOrderActuationResult, BindingError> {
 		let Some(candidate) = extract_star_join_candidate(plan) else {
-			return Ok(None);
+			return Ok(StarOrderActuationResult::NotCandidate);
 		};
 
 		let mut scratch_trace = trace.clone();
@@ -1203,20 +1210,30 @@ impl<'a> Binder<'a> {
 			)
 			.await?;
 		let Some(probe_label) = probe_plan.scope.unique_source_label() else {
+			self.record_optimizer_star_order_decline(
+				trace,
+				OptimizerDecisionKind::StarCandidate,
+				StarOrderDeclineReason::MissingRelationLabel,
+			);
 			self.record_star_order_decline(
 				render_trace,
 				StarOrderDeclineReason::MissingRelationLabel,
 				candidate.dimensions.len(),
 			);
-			return Ok(None);
+			return Ok(StarOrderActuationResult::Declined);
 		};
 		if !broadcast_probe_is_scan_linear(&probe_plan.plan) {
+			self.record_optimizer_star_order_decline(
+				trace,
+				OptimizerDecisionKind::StarCandidate,
+				StarOrderDeclineReason::ProbeNotScanLinear,
+			);
 			self.record_star_order_decline(
 				render_trace,
 				StarOrderDeclineReason::ProbeNotScanLinear,
 				candidate.dimensions.len(),
 			);
-			return Ok(None);
+			return Ok(StarOrderActuationResult::Declined);
 		}
 
 		let mut dimension_inputs = Vec::with_capacity(candidate.dimensions.len());
@@ -1237,18 +1254,24 @@ impl<'a> Binder<'a> {
 			&probe_label,
 			&candidate.dimensions,
 			&dimension_inputs,
+			trace,
 			render_trace,
 		)?
 		else {
-			return Ok(None);
+			return Ok(StarOrderActuationResult::Declined);
 		};
 		if tree.root_children.len() < 2 {
+			self.record_optimizer_star_order_decline(
+				trace,
+				root_decision_kind(&tree),
+				StarOrderDeclineReason::MissingRelationLabel,
+			);
 			self.record_star_order_decline(
 				render_trace,
 				StarOrderDeclineReason::MissingRelationLabel,
 				candidate.dimensions.len(),
 			);
-			return Ok(None);
+			return Ok(StarOrderActuationResult::Declined);
 		}
 
 		let force_hash_root = tree.has_branch_dimensions();
@@ -1262,6 +1285,11 @@ impl<'a> Binder<'a> {
 				&dimension_inputs,
 			)?
 		else {
+			self.record_optimizer_star_order_decline(
+				trace,
+				root_decision_kind(&tree),
+				StarOrderDeclineReason::MissingEstimate,
+			);
 			if !force_hash_root {
 				self.record_star_order_decline(
 					render_trace,
@@ -1269,7 +1297,7 @@ impl<'a> Binder<'a> {
 					candidate.dimensions.len(),
 				);
 			}
-			return Ok(None);
+			return Ok(StarOrderActuationResult::Declined);
 		};
 		let scratch_root_attempt = self.bind_local_star_actuation(
 			probe_plan.clone(),
@@ -1281,10 +1309,11 @@ impl<'a> Binder<'a> {
 			&mut scratch_render_trace,
 		)?;
 		if let LocalStarActuationAttempt::Declined(reason) = scratch_root_attempt {
+			self.record_optimizer_star_order_decline(trace, root_decision_kind(&tree), reason);
 			if !force_hash_root {
 				self.record_star_order_decline(render_trace, reason, candidate.dimensions.len());
 			}
-			return Ok(None);
+			return Ok(StarOrderActuationResult::Declined);
 		}
 
 		let real_probe_plan = self
@@ -1317,7 +1346,7 @@ impl<'a> Binder<'a> {
 			&real_dimension_inputs,
 		)?
 		else {
-			return Ok(None);
+			return Ok(StarOrderActuationResult::Declined);
 		};
 		let real_root_attempt = self.bind_local_star_actuation(
 			real_probe_plan,
@@ -1329,8 +1358,24 @@ impl<'a> Binder<'a> {
 			render_trace,
 		)?;
 		let LocalStarActuationAttempt::Actuated(real_root) = real_root_attempt else {
-			return Ok(None);
+			if let LocalStarActuationAttempt::Declined(reason) = real_root_attempt {
+				self.record_optimizer_star_order_decline(trace, root_decision_kind(&tree), reason);
+			}
+			return Ok(StarOrderActuationResult::Declined);
 		};
+
+		self.record_optimizer_star_order_receipt(
+			trace,
+			root_decision_kind(&tree),
+			&real_root.receipt,
+		);
+		for branch_receipt in &branch_receipts {
+			self.record_optimizer_star_order_receipt(
+				trace,
+				OptimizerDecisionKind::SnowflakeBranch,
+				branch_receipt,
+			);
+		}
 
 		if let Some(render_trace) = render_trace.as_mut() {
 			let mut receipts = Vec::with_capacity(branch_receipts.len() + 1);
@@ -1338,7 +1383,7 @@ impl<'a> Binder<'a> {
 			receipts.extend(branch_receipts);
 			render_trace.set_star_receipts(receipts);
 		}
-		Ok(Some(real_root.plan))
+		Ok(StarOrderActuationResult::Actuated(real_root.plan))
 	}
 
 	fn classify_snowflake_star_tree<'b>(
@@ -1347,6 +1392,7 @@ impl<'a> Binder<'a> {
 		probe_label: &str,
 		candidate_dimensions: &[StarJoinDimension<'b>],
 		dimension_inputs: &[ScopedExecutionPlan],
+		trace: &OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 	) -> Result<Option<SnowflakeStarTree<'b>>, BindingError> {
 		let mut root_children = Vec::new();
@@ -1360,6 +1406,11 @@ impl<'a> Binder<'a> {
 			{
 				if edge.left_label.as_deref() == Some(probe_label) {
 					let Some(dimension_label) = edge.right_label else {
+						self.record_optimizer_star_order_decline(
+							trace,
+							OptimizerDecisionKind::StarCandidate,
+							StarOrderDeclineReason::MissingRelationLabel,
+						);
 						self.record_star_order_decline(
 							render_trace,
 							StarOrderDeclineReason::MissingRelationLabel,
@@ -1386,6 +1437,11 @@ impl<'a> Binder<'a> {
 						continue;
 					}
 					let Some(dimension_label) = edge.right_label else {
+						self.record_optimizer_star_order_decline(
+							trace,
+							OptimizerDecisionKind::StarCandidate,
+							StarOrderDeclineReason::MissingRelationLabel,
+						);
 						self.record_star_order_decline(
 							render_trace,
 							StarOrderDeclineReason::MissingRelationLabel,
@@ -1399,6 +1455,11 @@ impl<'a> Binder<'a> {
 			}
 
 			let Some((parent_index, dimension_label)) = matched_parent else {
+				self.record_optimizer_star_order_decline(
+					trace,
+					OptimizerDecisionKind::StarCandidate,
+					StarOrderDeclineReason::MissingRelationLabel,
+				);
 				self.record_star_order_decline(
 					render_trace,
 					StarOrderDeclineReason::MissingRelationLabel,
@@ -1407,6 +1468,11 @@ impl<'a> Binder<'a> {
 				return Ok(None);
 			};
 			if !seen_labels.insert(dimension_label.clone()) {
+				self.record_optimizer_star_order_decline(
+					trace,
+					OptimizerDecisionKind::StarCandidate,
+					StarOrderDeclineReason::DuplicateDimension,
+				);
 				self.record_star_order_decline(
 					render_trace,
 					StarOrderDeclineReason::DuplicateDimension,
@@ -1872,6 +1938,79 @@ impl<'a> Binder<'a> {
 				outcome,
 				edge_targets: Vec::new(),
 			});
+		}
+	}
+
+	fn record_optimizer_star_order_receipt(
+		&self,
+		trace: &OptimizerTrace,
+		kind: OptimizerDecisionKind,
+		receipt: &StarOrderRenderReceipt,
+	) {
+		if !trace.record_optimizer_decisions {
+			return;
+		}
+		if let StarOrderOutcome::Recognized(evidence) = &receipt.outcome {
+			self.config
+				.decision_log
+				.record(kind, optimizer_decision_outcome_for_action(evidence.action));
+		}
+	}
+
+	fn record_optimizer_star_order_decline(
+		&self,
+		trace: &OptimizerTrace,
+		kind: OptimizerDecisionKind,
+		reason: StarOrderDeclineReason,
+	) {
+		if !trace.record_optimizer_decisions {
+			return;
+		}
+		self.config.decision_log.record(
+			kind,
+			OptimizerDecisionOutcome::Declined(optimizer_decision_decline_reason(reason)),
+		);
+	}
+}
+
+fn root_decision_kind(tree: &SnowflakeStarTree<'_>) -> OptimizerDecisionKind {
+	if tree.has_branch_dimensions() {
+		OptimizerDecisionKind::SnowflakeRoot
+	} else {
+		OptimizerDecisionKind::FlatStar
+	}
+}
+
+fn optimizer_decision_outcome_for_action(action: StarOrderAction) -> OptimizerDecisionOutcome {
+	match action {
+		StarOrderAction::Reordered => OptimizerDecisionOutcome::Reordered,
+		StarOrderAction::KeptAlreadyOptimal => OptimizerDecisionOutcome::KeptOptimal,
+		StarOrderAction::KeptInsufficientMargin => OptimizerDecisionOutcome::KeptThinMargin,
+	}
+}
+
+fn optimizer_decision_decline_reason(
+	reason: StarOrderDeclineReason,
+) -> OptimizerDecisionDeclineReason {
+	match reason {
+		StarOrderDeclineReason::MixedStrategyStar => {
+			OptimizerDecisionDeclineReason::MixedStrategyStar
+		}
+		StarOrderDeclineReason::NonInnerEquiJoin => {
+			OptimizerDecisionDeclineReason::NonInnerEquiJoin
+		}
+		StarOrderDeclineReason::MissingRelationLabel => {
+			OptimizerDecisionDeclineReason::MissingRelationLabel
+		}
+		StarOrderDeclineReason::MultipleProbeRelations => {
+			OptimizerDecisionDeclineReason::MultipleProbeRelations
+		}
+		StarOrderDeclineReason::DuplicateDimension => {
+			OptimizerDecisionDeclineReason::DuplicateDimension
+		}
+		StarOrderDeclineReason::MissingEstimate => OptimizerDecisionDeclineReason::MissingEstimate,
+		StarOrderDeclineReason::ProbeNotScanLinear => {
+			OptimizerDecisionDeclineReason::ProbeNotScanLinear
 		}
 	}
 }

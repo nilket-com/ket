@@ -1350,7 +1350,7 @@ pub(crate) fn adr186_root_hash_gate_commits_or_discards_branch_receipts() {
 	assert!(actuator.contains("let force_hash_root = tree.has_branch_dimensions();"));
 	assert!(actuator.contains("force_hash_root,"));
 	assert!(actuator.contains("if !force_hash_root"));
-	assert!(actuator.contains("return Ok(None);"));
+	assert!(actuator.contains("return Ok(StarOrderActuationResult::Declined);"));
 	assert!(actuator.contains("render_trace.set_star_receipts(receipts)"));
 	assert!(
 		local_actuator

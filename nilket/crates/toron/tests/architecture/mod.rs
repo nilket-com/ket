@@ -12,6 +12,7 @@ pub(crate) mod null_semantics;
 pub(crate) mod observability_audit;
 pub(crate) mod observability_telemetry;
 pub(crate) mod optimizer;
+pub(crate) mod optimizer_accrual;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod qualified_resolution;
 pub(crate) mod range_distribution;
