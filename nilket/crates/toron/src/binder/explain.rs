@@ -291,12 +291,19 @@ pub(super) fn information_schema_optimizer_margin_advisory_schema() -> SchemaRef
 		Field::new("mis_ranked", DataType::Int64, false),
 		Field::new("indeterminate", DataType::Int64, false),
 		Field::new("sample_size", DataType::Int64, false),
+		// ADR 191: appended at the tail so existing column indexes stay stable. `application_mode`
+		// reports Manual vs ApplyAdvisory; `applied_margin` is the effective step actually used by
+		// this bind. `current_margin`/`recommended_margin` keep their ADR 189/190 meaning (the
+		// configured base and the recommendation from that base) so the report never double-steps.
+		Field::new("application_mode", DataType::Utf8, false),
+		Field::new("applied_margin", DataType::Utf8, false),
 	]))
 }
 
 pub(super) fn information_schema_optimizer_margin_advisory_rows(
-	advisory: MarginAdvisory,
+	report: &MarginAdvisoryReport,
 ) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let advisory = report.advisory;
 	Ok(vec![vec![
 		ScalarValue::Utf8(Some(advisory.current.label())),
 		ScalarValue::Utf8(Some(advisory.recommended.label())),
@@ -327,6 +334,10 @@ pub(super) fn information_schema_optimizer_margin_advisory_rows(
 			advisory.sample_size,
 			"optimizer margin advisory sample_size",
 		)?)),
+		ScalarValue::Utf8(Some(
+			join_order_soft_margin_application_label(report.application).to_string(),
+		)),
+		ScalarValue::Utf8(Some(report.applied_step.margin().label())),
 	]])
 }
 

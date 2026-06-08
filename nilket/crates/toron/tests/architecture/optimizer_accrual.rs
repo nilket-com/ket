@@ -280,8 +280,21 @@ pub(crate) fn adr188_measured_accrual_is_side_effect_only() {
 	assert!(decision_log.contains("pub(crate) fn verdict_snapshot"));
 	assert!(coordinator.contains(".record_verdict("));
 	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
+
+	// ADR 191: the join-order planning helpers still must not read verdict accrual. The only
+	// sanctioned readers are the opt-in margin resolver and the read-only advisory report, which
+	// run once at bind entry — never inside the actuation/observation decision path. Carve those
+	// two helpers out before sweeping the file so the planning-path invariant stays exact.
+	let resolver = first_block(
+		&join_order,
+		"pub(crate) fn effective_join_order_soft_margin_step",
+	);
+	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+	assert!(report.contains("verdict_snapshot()"));
+	let join_order_planning = join_order.replace(&resolver, "").replace(&report, "");
+
 	for (name, source) in [
-		("join_order", join_order.as_str()),
+		("join_order", join_order_planning.as_str()),
 		("selectivity", selectivity.as_str()),
 		("pushdown", pushdown.as_str()),
 		("fragment", fragment.as_str()),
@@ -396,6 +409,8 @@ pub(crate) fn adr189_advisory_is_read_only() {
 	let recommend = first_block(&join_order, "pub(crate) fn recommend_soft_margin");
 	let classify = first_block(&join_order, "pub(super) fn classify_star_order_action");
 	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+	// ADR 191: the advisory is invoked read-only through the report helper, not inline.
+	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 
 	assert!(recommend.contains("snapshot: &[OptimizerRuntimeVerdictRow]"));
 	assert!(recommend.contains("current: SoftMarginLadderStep"));
@@ -403,7 +418,8 @@ pub(crate) fn adr189_advisory_is_read_only() {
 	assert!(!recommend.contains(".record("));
 	assert!(!recommend.contains("record_verdict"));
 	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
-	assert!(bind_relation.contains("recommend_soft_margin("));
+	assert!(bind_relation.contains("margin_advisory_report("));
+	assert!(advisory_report.contains("recommend_soft_margin("));
 	assert!(!classify.contains("recommend_soft_margin"));
 	assert!(!classify.contains("verdict_snapshot"));
 	assert!(!decision_log.contains("recommend_soft_margin"));
@@ -433,11 +449,15 @@ pub(crate) fn adr189_advisory_reuses_188_verdict_log() {
 	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
 	let log_struct = first_block(&decision_log, "pub struct OptimizerDecisionLog");
 	let with_max_keys = first_block(&decision_log, "pub(crate) fn with_max_keys");
+	// ADR 191: the advisory report path is the indirection that reuses the 188 verdict log.
+	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 
 	assert!(decision_log.contains("pub(crate) fn verdict_snapshot"));
 	assert!(join_order.contains("snapshot: &[OptimizerRuntimeVerdictRow]"));
 	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
-	assert!(bind_relation.contains("recommend_soft_margin("));
+	assert!(bind_relation.contains("margin_advisory_report("));
+	assert!(advisory_report.contains("recommend_soft_margin("));
+	assert!(advisory_report.contains("decision_log.verdict_snapshot()"));
 	assert!(
 		log_struct.contains("verdict_counts: Mutex<BTreeMap<OptimizerRuntimeVerdictKey, u64>>")
 	);
@@ -577,25 +597,44 @@ pub(crate) fn adr190_applied_margin_recorded_in_ranking_and_evidence() {
 pub(crate) fn adr190_observed_paths_receive_configured_margin() {
 	let binder = binder_root_source();
 	let bind_explain = first_block(&binder, "async fn bind_with_explain_trace");
+	let default = first_block(&binder, "impl Default for PlannerConfig");
 
-	assert!(bind_explain.contains("analyze_snowflake("));
-	assert!(bind_explain.contains("analyze("));
-	assert_eq!(
+	// ADR 191: observed paths receive the resolved effective step captured once at bind entry, not
+	// a fresh `config` read. Default Manual makes that resolved step equal to the configured step,
+	// preserving the ADR 190 behavior.
+	assert!(bind_explain.contains("let binder = Binder::new(catalog, config)"));
+	assert!(
 		bind_explain
-			.matches("config.join_order_soft_margin_step")
-			.count(),
-		2,
-		"both observed analyze paths must receive the configured margin step"
+			.contains("let join_order_soft_margin_step = binder.join_order_soft_margin_step")
+	);
+	// Structural, format-insensitive check: rustfmt may render either observed call inline or
+	// multi-line (dropping/keeping a trailing comma), so match the argument structure with
+	// whitespace removed rather than counting commas. Both observed calls must pass the resolved
+	// step as their last argument.
+	let compact: String = bind_explain
+		.chars()
+		.filter(|c| !c.is_whitespace())
+		.collect();
+	assert!(compact.contains(
+		"analyze_snowflake(&render_trace.join_order_edges,&trace.join_decisions,join_order_soft_margin_step"
+	));
+	assert!(compact.contains("analyze(&render_trace.join_order_edges,join_order_soft_margin_step"));
+	assert!(!bind_explain.contains("config.join_order_soft_margin_step"));
+	assert!(
+		default
+			.contains("join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual")
 	);
 }
 
 #[test]
 pub(crate) fn adr190_advisory_current_is_configured_margin() {
-	let binder = binder_root_source();
-	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+	let join_order = source("src/binder/join_order.rs");
+	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 
-	assert!(bind_relation.contains("recommend_soft_margin("));
-	assert!(bind_relation.contains("self.config.join_order_soft_margin_step"));
+	// ADR 191: the advisory input is still the operator-configured base step, fed to the 189
+	// policy by the report helper — never the already-applied step (that would double-step).
+	assert!(advisory_report.contains("recommend_soft_margin("));
+	assert!(advisory_report.contains("config.join_order_soft_margin_step,"));
 }
 
 #[test]
@@ -655,5 +694,155 @@ pub(crate) fn adr190_no_executor_storage_or_wendelon_change() {
 
 #[test]
 pub(crate) fn adr190_no_optimizer_shell_or_planproperties_contract() {
+	adr189_no_optimizer_shell_or_planproperties_contract();
+}
+
+#[test]
+pub(crate) fn adr191_margin_application_mode_is_typed() {
+	let binder = binder_root_source();
+	let config = first_block(&binder, "pub struct PlannerConfig");
+	let default = first_block(&binder, "impl Default for PlannerConfig");
+
+	assert!(binder.contains("pub enum JoinOrderSoftMarginApplication {"));
+	assert!(
+		config.contains("pub join_order_soft_margin_application: JoinOrderSoftMarginApplication")
+	);
+	assert!(
+		default
+			.contains("join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual")
+	);
+	// No bool auto-tune shape anywhere in the binder.
+	assert!(!binder.contains("join_order_margin_auto_tune"));
+}
+
+#[test]
+pub(crate) fn adr191_effective_margin_resolved_once_at_bind_entry() {
+	let binder = binder_root_source();
+	let join_order = source("src/binder/join_order.rs");
+	let binder_struct = first_block(&binder, "struct Binder<'a>");
+	let binder_new = first_block(
+		&binder,
+		"fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self",
+	);
+	let analyze = first_block(&join_order, "pub(super) fn analyze");
+	let analyze_snowflake = first_block(&join_order, "pub(super) fn analyze_snowflake");
+
+	// The resolved step lives on the binder and is set once via the resolver at construction.
+	assert!(binder_struct.contains("join_order_soft_margin_step: SoftMarginLadderStep"));
+	assert!(binder_new.contains("effective_join_order_soft_margin_step(config)"));
+	// Star actuation reads the resolved field, never a fresh config/log read.
+	assert!(join_order.contains("self.join_order_soft_margin_step.margin()"));
+	assert!(!join_order.contains("self.config.join_order_soft_margin_step"));
+	// Low-level star/snowflake helpers never re-snapshot the verdict log mid-bind.
+	assert!(!analyze.contains("verdict_snapshot"));
+	assert!(!analyze_snowflake.contains("verdict_snapshot"));
+}
+
+#[test]
+pub(crate) fn adr191_auto_apply_reuses_189_policy_only() {
+	let join_order = source("src/binder/join_order.rs");
+	let resolver = first_block(
+		&join_order,
+		"pub(crate) fn effective_join_order_soft_margin_step",
+	);
+
+	// The opt-in path returns exactly the 189 recommendation; it owns no policy of its own.
+	assert!(resolver.contains("recommend_soft_margin("));
+	assert!(resolver.contains(".recommended_step"));
+	assert!(!resolver.contains("looser"));
+	assert!(!resolver.contains("tighter"));
+	assert!(!resolver.contains("for "));
+	assert!(!resolver.contains("while "));
+	assert!(!resolver.contains("MIN_SAMPLE"));
+	assert!(!resolver.contains("HYSTERESIS"));
+}
+
+#[test]
+pub(crate) fn adr191_report_preserves_configured_recommended_and_applied_margins() {
+	let explain = source("src/binder/explain.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_margin_advisory_schema",
+	);
+	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+
+	assert!(schema.contains("\"current_margin\""));
+	assert!(schema.contains("\"recommended_margin\""));
+	assert!(schema.contains("\"application_mode\""));
+	assert!(schema.contains("\"applied_margin\""));
+	// New columns are appended at the tail so existing indexes stay stable.
+	let sample_idx = schema.find("\"sample_size\"").expect("sample_size column");
+	let app_idx = schema
+		.find("\"application_mode\"")
+		.expect("application_mode column");
+	let applied_idx = schema
+		.find("\"applied_margin\"")
+		.expect("applied_margin column");
+	assert!(sample_idx < app_idx && app_idx < applied_idx);
+	// The report still feeds the configured base step into the advisory.
+	assert!(report.contains("config.join_order_soft_margin_step,"));
+}
+
+#[test]
+pub(crate) fn adr191_retargets_190_operator_applied_not_auto() {
+	let manifest = manifest_dir();
+	let assignments = source_lines(&manifest.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains(".join_order_soft_margin_step ="))
+		.collect::<Vec<_>>();
+	assert!(
+		assignments.is_empty(),
+		"join_order_soft_margin_step must never be reassigned; the only derived path is the opt-in resolver:\n{}",
+		format_offenders(&manifest, &assignments)
+	);
+	let decision_log = source("src/binder/decision_log.rs");
+	assert!(!decision_log.contains("join_order_soft_margin_step"));
+	assert!(!decision_log.contains("join_order_soft_margin_application"));
+}
+
+#[test]
+pub(crate) fn adr191_default_manual_preserves_190() {
+	let binder = binder_root_source();
+	let default = first_block(&binder, "impl Default for PlannerConfig");
+
+	assert!(
+		default
+			.contains("join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual")
+	);
+	assert!(default.contains("join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP"));
+}
+
+#[test]
+pub(crate) fn adr191_no_executor_fragmenter_storage_or_wendelon_change() {
+	let manifest = manifest_dir();
+	let markers = [
+		"JoinOrderSoftMarginApplication",
+		"effective_join_order_soft_margin_step",
+		"applied_margin",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR191 opt-in auto-apply leaked outside the binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr191_no_optimizer_shell_or_planproperties_contract() {
 	adr189_no_optimizer_shell_or_planproperties_contract();
 }

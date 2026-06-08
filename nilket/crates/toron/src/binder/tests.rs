@@ -1475,13 +1475,10 @@ async fn pk_filtered_string_dim_broadcasts_by_estimate() {
 			Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
 		),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered_customers)
-	.await
-	.expect("bind PK-filtered string dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind PK-filtered string dimension");
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(scoped.facts.byte_upper_bound, None);
 	assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(1)));
@@ -1539,13 +1536,10 @@ async fn direct_equality_filtered_dim_with_ndv_infers_broadcast_by_estimate() {
 			Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
 		),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered_customers)
-	.await
-	.expect("bind NDV-filtered dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind NDV-filtered dimension");
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(scoped.facts.byte_upper_bound, None);
 	assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
@@ -2597,13 +2591,10 @@ async fn missing_ndv_keeps_137_138_behavior() {
 			Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
 		),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered_customers)
-	.await
-	.expect("bind filtered dimension without NDV");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind filtered dimension without NDV");
 	assert_eq!(scoped.facts.estimated_row_count, None);
 
 	let logical = LogicalPlan::Join {
@@ -2651,13 +2642,10 @@ async fn ndv_selectivity_writes_estimated_row_count_not_hard_bound() {
 			Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
 		),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered_customers)
-	.await
-	.expect("bind NDV-filtered dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind NDV-filtered dimension");
 
 	assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
 	assert_eq!(scoped.facts.byte_upper_bound, None);
@@ -2683,13 +2671,10 @@ async fn exact_ndv_still_uses_estimate_channel() {
 			Box::new(Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))),
 		),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered_customers)
-	.await
-	.expect("bind exact-NDV filtered dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind exact-NDV filtered dimension");
 
 	assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(20_000)));
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(2)));
@@ -2768,13 +2753,10 @@ async fn date32_comparisons_coerce_bare_string_literals_only_against_date32() {
 		"SELECT * FROM customers WHERE signup_date IN ('2024-01-01', DATE '2024-01-02', NULL)",
 	] {
 		let logical = SqlPlanner::new().plan(sql).expect("plan Date32 SQL");
-		Binder {
-			catalog: &catalog,
-			config: &PlannerConfig::default(),
-		}
-		.bind_plan(&logical)
-		.await
-		.expect("bind Date32 string coercion");
+		Binder::new(&catalog, &PlannerConfig::default())
+			.bind_plan(&logical)
+			.await
+			.expect("bind Date32 string coercion");
 	}
 
 	for (sql, diagnostic) in [
@@ -2792,12 +2774,9 @@ async fn date32_comparisons_coerce_bare_string_literals_only_against_date32() {
 		),
 	] {
 		let logical = SqlPlanner::new().plan(sql).expect("plan Date32 SQL");
-		let err = Binder {
-			catalog: &catalog,
-			config: &PlannerConfig::default(),
-		}
-		.bind_plan(&logical)
-		.await;
+		let err = Binder::new(&catalog, &PlannerConfig::default())
+			.bind_plan(&logical)
+			.await;
 		let Err(err) = err else {
 			panic!("invalid Date32 comparison should reject");
 		};
@@ -3368,25 +3347,19 @@ async fn pure_subset_project_shrinks_estimated_byte_size() {
 		}),
 		predicate: customer_amount_between(10, 19),
 	};
-	let filtered = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered_customers)
-	.await
-	.expect("bind full-width filtered customers");
+	let filtered = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind full-width filtered customers");
 	let projected_customers = LogicalPlan::Project {
 		input: Box::new(filtered_customers),
 		exprs: vec![customer_column("id"), customer_column("amount")],
 		output_names: vec![Some("id".to_string()), Some("amount".to_string())],
 	};
-	let projected = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&projected_customers)
-	.await
-	.expect("bind projected filtered customers");
+	let projected = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&projected_customers)
+		.await
+		.expect("bind projected filtered customers");
 
 	assert_eq!(filtered.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(projected.facts.origin, PlanOrigin::SingleBaseRelation);
@@ -3450,13 +3423,10 @@ async fn expression_project_keeps_byte_estimate_none() {
 		],
 		output_names: vec![Some("id".to_string()), Some("next_amount".to_string())],
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&projected_customers)
-	.await
-	.expect("bind expression project over filtered customers");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&projected_customers)
+		.await
+		.expect("bind expression project over filtered customers");
 
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(scoped.facts.row_upper_bound, None);
@@ -5002,13 +4972,10 @@ async fn and_filter_uses_single_equality_not_independence_product() {
 			)),
 		),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered_customers)
-	.await
-	.expect("bind AND-filtered dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind AND-filtered dimension");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(100)));
 	assert_ne!(scoped.facts.estimated_row_count, Some(RowCount::new(1)));
@@ -5055,13 +5022,10 @@ async fn join_output_containment_estimate_matches_formula() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan containment-estimated join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind containment-estimated join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind containment-estimated join");
 
 	let expected_rows = RowCount::new(50_000);
 	let expected_bytes = estimate_materialized_byte_size(expected_rows, scoped.schema().as_ref())
@@ -5094,13 +5058,10 @@ async fn join_output_containment_zero_rows_estimates_zero_without_empty_relation
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan zero-row containment join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind zero-row containment join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind zero-row containment join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
 	assert!(!matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
@@ -5127,13 +5088,10 @@ async fn join_output_containment_positive_inputs_floor_to_one() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan positive-floor containment join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind positive-floor containment join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind positive-floor containment join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(1)));
 }
@@ -5153,13 +5111,10 @@ async fn join_output_containment_fails_open_without_ndv() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan missing-NDV containment join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind missing-NDV containment join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind missing-NDV containment join");
 
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.estimated_row_count, None);
@@ -5187,13 +5142,10 @@ async fn join_output_containment_rejects_zero_ndv() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan zero-NDV containment join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind zero-NDV containment join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind zero-NDV containment join");
 
 	assert_eq!(scoped.facts.estimated_row_count, None);
 }
@@ -5225,13 +5177,10 @@ async fn join_output_containment_skips_filtered_input_ndv() {
 		)
 		.expect("plan filtered-input containment join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind filtered-input containment join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind filtered-input containment join");
 
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.estimated_row_count, None);
@@ -5358,13 +5307,10 @@ async fn disjoint_join_key_ranges_estimate_empty_not_containment_product() {
 		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
 		vec![(ColumnOrdinal(0), range_fact_i64(100, 200, 5_000))],
 	);
-	let ranged = Binder {
-		catalog: &ranged_catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&SqlPlanner::new().plan(sql).expect("plan ranged join"))
-	.await
-	.expect("bind ranged join");
+	let ranged = Binder::new(&ranged_catalog, &PlannerConfig::default())
+		.bind_plan(&SqlPlanner::new().plan(sql).expect("plan ranged join"))
+		.await
+		.expect("bind ranged join");
 
 	let mut base_catalog = join_catalog();
 	seed_table_optimizer_facts(
@@ -5381,13 +5327,10 @@ async fn disjoint_join_key_ranges_estimate_empty_not_containment_product() {
 		Some(5_000),
 		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(500))],
 	);
-	let base = Binder {
-		catalog: &base_catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&SqlPlanner::new().plan(sql).expect("plan base join"))
-	.await
-	.expect("bind base join");
+	let base = Binder::new(&base_catalog, &PlannerConfig::default())
+		.bind_plan(&SqlPlanner::new().plan(sql).expect("plan base join"))
+		.await
+		.expect("bind base join");
 
 	assert_eq!(base.facts.estimated_row_count, Some(RowCount::new(50_000)));
 	assert_eq!(ranged.facts.estimated_row_count, Some(RowCount::new(0)));
@@ -5419,13 +5362,10 @@ async fn partial_overlap_join_scales_containment_down() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan partial-overlap join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind partial-overlap join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind partial-overlap join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
 }
@@ -5484,13 +5424,10 @@ async fn join_range_overlap_fails_open_without_range_fact() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan one-sided range join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind one-sided range join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind one-sided range join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -5521,13 +5458,10 @@ async fn join_range_overlap_fails_open_on_fact_tag_type_mismatch() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan mismatched range-tag join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind mismatched range-tag join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind mismatched range-tag join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -5609,13 +5543,10 @@ async fn join_range_overlap_skips_filtered_input() {
 		)
 		.expect("plan filtered-input range-overlap join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind filtered-input range-overlap join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind filtered-input range-overlap join");
 
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.estimated_row_count, None);
@@ -5644,13 +5575,10 @@ async fn join_range_overlap_is_estimate_channel_not_emptyrelation() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan disjoint estimate-channel join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind disjoint estimate-channel join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind disjoint estimate-channel join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
 	assert_eq!(scoped.facts.row_upper_bound, None);
@@ -5776,17 +5704,14 @@ async fn no_shared_hot_keys_falls_back_to_161_containment() {
 		Vec::new(),
 		vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(8, 5_000)]))],
 	);
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(
-		&SqlPlanner::new()
-			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
-			.expect("plan no-shared-hot join"),
-	)
-	.await
-	.expect("bind no-shared-hot join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan no-shared-hot join"),
+		)
+		.await
+		.expect("bind no-shared-hot join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -5815,17 +5740,14 @@ async fn residual_excludes_hot_both_rows_and_keys_no_double_count() {
 		vec![(ColumnOrdinal(0), range_fact_i64(50, 149, 1_000))],
 		vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(50, 100)]))],
 	);
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(
-		&SqlPlanner::new()
-			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
-			.expect("plan residual hot-both join"),
-	)
-	.await
-	.expect("bind residual hot-both join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan residual hot-both join"),
+		)
+		.await
+		.expect("bind residual hot-both join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -5854,17 +5776,14 @@ async fn single_key_join_unchanged_byte_identical_to_162() {
 		vec![(ColumnOrdinal(0), range_fact_i64(50, 149, 1_000))],
 		vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(50, 100)]))],
 	);
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(
-		&SqlPlanner::new()
-			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
-			.expect("plan single-key 162 regression join"),
-	)
-	.await
-	.expect("bind single-key 162 regression join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan single-key 162 regression join"),
+		)
+		.await
+		.expect("bind single-key 162 regression join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -5893,17 +5812,14 @@ async fn disjoint_range_zero_dominates_stale_shared_hot_key() {
 		vec![(ColumnOrdinal(0), range_fact_i64(100, 200, 1_000))],
 		vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 500)]))],
 	);
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(
-		&SqlPlanner::new()
-			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
-			.expect("plan disjoint stale-HH join"),
-	)
-	.await
-	.expect("bind disjoint stale-HH join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan disjoint stale-HH join"),
+		)
+		.await
+		.expect("bind disjoint stale-HH join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
 }
@@ -5929,17 +5845,14 @@ async fn join_skew_never_lowers_161_prior() {
 		Vec::new(),
 		vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 100)]))],
 	);
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(
-		&SqlPlanner::new()
-			.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
-			.expect("plan prior-floor join"),
-	)
-	.await
-	.expect("bind prior-floor join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+				.expect("plan prior-floor join"),
+		)
+		.await
+		.expect("bind prior-floor join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -5973,17 +5886,14 @@ async fn join_skew_fails_open_on_key_type_mismatch_or_invalid_frequency() {
 			Vec::new(),
 			vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 500)]))],
 		);
-		let scoped = Binder {
-			catalog: &catalog,
-			config: &PlannerConfig::default(),
-		}
-		.bind_plan(
-			&SqlPlanner::new()
-				.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
-				.expect("plan invalid-HH join"),
-		)
-		.await
-		.expect("bind invalid-HH join");
+		let scoped = Binder::new(&catalog, &PlannerConfig::default())
+			.bind_plan(
+				&SqlPlanner::new()
+					.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
+					.expect("plan invalid-HH join"),
+			)
+			.await
+			.expect("bind invalid-HH join");
 
 		assert_eq!(
 			scoped.facts.estimated_row_count,
@@ -6016,20 +5926,17 @@ async fn join_skew_skips_filtered_input() {
 		Vec::new(),
 		vec![(ColumnOrdinal(0), int64_heavy_hitter_fact(&[(7, 5_000)]))],
 	);
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(
-		&SqlPlanner::new()
-			.plan(
-				"SELECT * FROM orders o INNER JOIN customers c \
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(
+			&SqlPlanner::new()
+				.plan(
+					"SELECT * FROM orders o INNER JOIN customers c \
 					 ON o.customer_id = c.id WHERE c.region = 'north'",
-			)
-			.expect("plan filtered HH join"),
-	)
-	.await
-	.expect("bind filtered HH join");
+				)
+				.expect("plan filtered HH join"),
+		)
+		.await
+		.expect("bind filtered HH join");
 
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.estimated_row_count, None);
@@ -6059,13 +5966,10 @@ async fn multi_key_denominator_is_product_of_per_key_max_ndv() {
 		],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind multi-key product denominator join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key product denominator join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
 	assert_eq!(scoped.facts.row_upper_bound, None);
@@ -6102,13 +6006,10 @@ async fn multi_key_group_ndv_caps_product_denominator() {
 		)],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind multi-key group NDV join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key group NDV join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6144,13 +6045,10 @@ async fn multi_key_group_ndv_requires_both_sides() {
 		],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind one-sided group NDV join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind one-sided group NDV join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
 }
@@ -6178,13 +6076,10 @@ async fn multi_key_group_ndv_never_lowers_163_prior() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind oversized group NDV join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind oversized group NDV join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
 }
@@ -6210,13 +6105,10 @@ async fn multi_key_fails_open_when_any_key_lacks_ndv() {
 		vec![(ColumnOrdinal(1), DistinctCountFact::Exact(500))],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind missing multi-key NDV join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind missing multi-key NDV join");
 
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.estimated_row_count, None);
@@ -6250,13 +6142,10 @@ async fn multi_key_range_overlap_folds_per_key() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind multi-key range fold join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key range fold join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(500)));
 }
@@ -6293,13 +6182,10 @@ async fn multi_key_range_malformed_key_keeps_multi_key_ndv_estimate() {
 		],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind multi-key malformed range join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key malformed range join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(5_000)));
 }
@@ -6338,15 +6224,12 @@ async fn multi_key_three_key_join_does_not_spuriously_zero() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&[
-		"order_id", "line_no", "shard_id",
-	]))
-	.await
-	.expect("bind three-key no-spurious-zero join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&[
+			"order_id", "line_no", "shard_id",
+		]))
+		.await
+		.expect("bind three-key no-spurious-zero join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(1)));
 }
@@ -6373,15 +6256,12 @@ async fn multi_key_three_key_disjoint_estimates_zero() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&[
-		"order_id", "line_no", "shard_id",
-	]))
-	.await
-	.expect("bind three-key disjoint join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&[
+			"order_id", "line_no", "shard_id",
+		]))
+		.await
+		.expect("bind three-key disjoint join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
 }
@@ -6404,13 +6284,10 @@ async fn multi_key_does_not_apply_heavy_hitter() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind multi-key HH-deferred join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key HH-deferred join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6454,13 +6331,10 @@ async fn absent_column_group_top_k_falls_back_to_163_byte_identical() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind absent group top-k join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind absent group top-k join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6487,13 +6361,10 @@ async fn absent_column_group_ndv_falls_back_to_164_byte_identical() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind absent group NDV join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind absent group NDV join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6520,13 +6391,10 @@ async fn consumer_uses_exact_hot_floor_not_fake_residual() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind group top-k exact floor join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind group top-k exact floor join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6564,13 +6432,10 @@ async fn multi_key_skew_never_lowers_163_prior() {
 		)],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind group top-k prior floor join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind group top-k prior floor join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6618,13 +6483,10 @@ async fn hot_plus_cold_no_double_counts_hot_tuples() {
 		)],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind hot+cold no-double-count join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind hot+cold no-double-count join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6659,13 +6521,10 @@ async fn cold_ndv_uses_effective_composite_not_independence_proxy_or_raw_overcou
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind effective composite denominator join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind effective composite denominator join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6713,13 +6572,10 @@ async fn hot_plus_cold_never_lowers_post_165() {
 		)],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind hot+cold prior floor join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind hot+cold prior floor join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6745,13 +6601,10 @@ async fn only_one_group_fact_present_is_byte_identical_to_post_165() {
 			)],
 		);
 	}
-	let top_k_scoped = Binder {
-		catalog: &top_k_only,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind top-k-only post-165 join");
+	let top_k_scoped = Binder::new(&top_k_only, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind top-k-only post-165 join");
 
 	assert_eq!(
 		top_k_scoped.facts.estimated_row_count,
@@ -6785,13 +6638,10 @@ async fn only_one_group_fact_present_is_byte_identical_to_post_165() {
 			DistinctCountFact::Exact(100),
 		)],
 	);
-	let group_ndv_scoped = Binder {
-		catalog: &group_ndv_only,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind group-NDV-only post-165 join");
+	let group_ndv_scoped = Binder::new(&group_ndv_only, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind group-NDV-only post-165 join");
 
 	assert_eq!(
 		group_ndv_scoped.facts.estimated_row_count,
@@ -6815,13 +6665,10 @@ async fn hot_plus_cold_fails_open_without_either_group_fact() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind no-group-facts join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind no-group-facts join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6853,13 +6700,10 @@ async fn cold_residual_zero_when_all_tuples_hot() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind all-hot cold residual join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind all-hot cold residual join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6891,13 +6735,10 @@ async fn cold_ndv_zero_with_cold_rows_declines_to_post_165() {
 		);
 	}
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind zero cold NDV with cold rows join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind zero cold NDV with cold rows join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -6951,13 +6792,10 @@ async fn cold_residual_applies_range_overlap() {
 		)],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind cold range-overlap join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind cold range-overlap join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -7011,13 +6849,10 @@ async fn disjoint_join_short_circuits_before_hot_plus_cold() {
 		)],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind disjoint stale hot+cold join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind disjoint stale hot+cold join");
 
 	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(0)));
 }
@@ -7052,13 +6887,10 @@ async fn column_group_top_k_normalizes_group_order_to_join_key_order() {
 		)],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind reordered group top-k join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind reordered group top-k join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -7096,13 +6928,10 @@ async fn group_must_match_full_join_key_set() {
 		)],
 	);
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind partial/overgrouped top-k join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind partial/overgrouped top-k join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -7178,13 +7007,10 @@ async fn join_output_containment_skips_non_inner_join() {
 		strategy_intent: JoinStrategyIntent::Auto,
 	};
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind non-inner containment join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind non-inner containment join");
 
 	assert_eq!(scoped.facts.estimated_row_count, None);
 }
@@ -7307,13 +7133,10 @@ async fn join_output_containment_estimate_channel_not_hard_bound() {
 		.plan("SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id")
 		.expect("plan estimate-channel containment join");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind estimate-channel containment join");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind estimate-channel containment join");
 
 	assert_eq!(
 		scoped.facts.estimated_row_count,
@@ -7391,13 +7214,10 @@ async fn hard_row_bound_anchors_scan_byte_estimate() {
 		projection: None,
 	};
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind hard-row scan");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind hard-row scan");
 
 	assert!(matches!(&scoped.plan, ExecutionPlan::Scan { .. }));
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
@@ -7417,13 +7237,10 @@ async fn row_zero_fact_does_not_elide_scan() {
 		projection: None,
 	};
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind zero-row scan");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&logical)
+		.await
+		.expect("bind zero-row scan");
 
 	assert!(matches!(&scoped.plan, ExecutionPlan::Scan { .. }));
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
@@ -7493,13 +7310,10 @@ async fn narrowing_project_tiny_dim_infers_broadcast() {
 		],
 		output_names: vec![Some("id".to_string()), Some("region".to_string())],
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&projected_customers)
-	.await
-	.expect("bind projected tiny dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&projected_customers)
+		.await
+		.expect("bind projected tiny dimension");
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(scoped.facts.byte_upper_bound, Some(ByteCount::new(1_024)));
 
@@ -7541,13 +7355,10 @@ async fn expression_project_drops_byte_bound_and_hashes() {
 		],
 		output_names: vec![Some("id".to_string()), Some("next_id".to_string())],
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&expression_customers)
-	.await
-	.expect("bind expression projected tiny dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&expression_customers)
+		.await
+		.expect("bind expression projected tiny dimension");
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(scoped.facts.byte_upper_bound, None);
 	assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(12)));
@@ -7588,13 +7399,10 @@ async fn duplicate_project_drops_byte_bound() {
 		output_names: vec![Some("id".to_string()), Some("id_again".to_string())],
 	};
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&duplicate_customers)
-	.await
-	.expect("bind duplicate projected tiny dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&duplicate_customers)
+		.await
+		.expect("bind duplicate projected tiny dimension");
 
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(scoped.facts.byte_upper_bound, None);
@@ -7615,13 +7423,10 @@ async fn pk_filtered_large_table_caps_rows_but_still_hashes() {
 			Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
 		),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered_customers)
-	.await
-	.expect("bind PK-filtered large table");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered_customers)
+		.await
+		.expect("bind PK-filtered large table");
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(
 		scoped.facts.byte_upper_bound,
@@ -7690,13 +7495,10 @@ async fn composite_pk_single_column_filter_does_not_cap_rows() {
 		),
 	};
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&filtered)
-	.await
-	.expect("bind composite-PK component filter");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&filtered)
+		.await
+		.expect("bind composite-PK component filter");
 
 	assert_eq!(scoped.facts.origin, PlanOrigin::SingleBaseRelation);
 	assert_eq!(scoped.facts.byte_upper_bound, Some(ByteCount::new(1_024)));
@@ -7714,13 +7516,10 @@ async fn aggregate_or_expanding_project_stays_composite() {
 		group_expr: vec![Expr::qualified_column(TableRef::new("customers"), "region")],
 		aggr_expr: Vec::new(),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&aggregate_customers)
-	.await
-	.expect("bind aggregate tiny dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&aggregate_customers)
+		.await
+		.expect("bind aggregate tiny dimension");
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.byte_upper_bound, None);
 	assert_eq!(scoped.facts.row_upper_bound, None);
@@ -7730,13 +7529,10 @@ async fn aggregate_or_expanding_project_stays_composite() {
 		exprs: vec![Expr::column("region")],
 		output_names: vec![Some("region".to_string())],
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&project_over_aggregate)
-	.await
-	.expect("bind project over aggregate tiny dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&project_over_aggregate)
+		.await
+		.expect("bind project over aggregate tiny dimension");
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.byte_upper_bound, None);
 }
@@ -9600,20 +9396,350 @@ async fn operator_margin_changes_bound_plan() {
 			   INNER JOIN products p ON o.product_id = p.id";
 	let logical = SqlPlanner::new().plan(sql).expect("plan star");
 
-	let (tight_plan, _) =
-		bind_with_trace(&logical, &catalog, &margin_config(SoftMarginLadderStep::Tightest))
-			.await
-			.expect("bind under tightest margin");
-	let (loose_plan, _) =
-		bind_with_trace(&logical, &catalog, &margin_config(SoftMarginLadderStep::Loosest))
-			.await
-			.expect("bind under loosest margin");
+	let (tight_plan, _) = bind_with_trace(
+		&logical,
+		&catalog,
+		&margin_config(SoftMarginLadderStep::Tightest),
+	)
+	.await
+	.expect("bind under tightest margin");
+	let (loose_plan, _) = bind_with_trace(
+		&logical,
+		&catalog,
+		&margin_config(SoftMarginLadderStep::Loosest),
+	)
+	.await
+	.expect("bind under loosest margin");
 
 	assert_ne!(
 		format!("{tight_plan:?}"),
 		format!("{loose_plan:?}"),
 		"operator margin must change the bound plan: tight keeps declared, loose reorders"
 	);
+}
+
+// ADR 191: an opt-in ApplyAdvisory config seeded with verdicts that drive the ADR 189 advisory.
+// `Manual` ignores the verdicts (base step is effective); `ApplyAdvisory` resolves the effective
+// step from `recommend_soft_margin(...).recommended_step` once at bind entry.
+fn auto_applied_margin_config(
+	base_step: SoftMarginLadderStep,
+	verdicts: &[(OptimizerDecisionKind, OptimizerRuntimeVerdictClass, u64)],
+) -> PlannerConfig {
+	let config = PlannerConfig {
+		join_order_soft_margin_step: base_step,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	for (kind, verdict, count) in verdicts {
+		record_verdicts(config.decision_log.as_ref(), *kind, *verdict, *count);
+	}
+	config
+}
+
+// A clean "loosen" signal from the ADR 189 policy: pure MissedWin at the min sample loosens one
+// rung from any base step.
+const LOOSEN_VERDICTS: &[(OptimizerDecisionKind, OptimizerRuntimeVerdictClass, u64)] = &[(
+	OptimizerDecisionKind::FlatStar,
+	OptimizerRuntimeVerdictClass::MissedWin,
+	25,
+)];
+
+#[tokio::test]
+async fn auto_applied_margin_uses_advisory_recommendation() {
+	// Base Baseline (4/5) + a loosen signal: the ADR 189 advisory recommends 9/10, and under
+	// ApplyAdvisory that recommended step is the margin the star receipt renders. The same query,
+	// same verdicts, under Manual keeps the configured base (4/5) — the application mode, not the
+	// verdict log alone, is what changes the applied margin.
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_100, 1_000);
+	let sql = "SELECT * FROM orders o \
+			   INNER JOIN customers c ON o.customer_id = c.id \
+			   INNER JOIN products p ON o.product_id = p.id";
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {sql}"))
+		.expect("plan star EXPLAIN");
+
+	let auto = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &auto).await;
+	assert_utf8_contains(&join_order_row(&rows)[3], "soft_margin=9/10");
+
+	let (_schema, manual_rows) = bind_explain_rows(
+		&logical,
+		&catalog,
+		&margin_config(SoftMarginLadderStep::Baseline),
+	)
+	.await;
+	assert_utf8_contains(&join_order_row(&manual_rows)[3], "soft_margin=4/5");
+}
+
+#[tokio::test]
+async fn auto_application_reorders_bound_plan_one_step() {
+	// End-to-end plan diff. The soft star win is ~0.92, so it only reorders at the loosest rung
+	// (19/20); estimates are NDV-dominated, so no fixture in this family flips at an intermediate
+	// rung (see the 190 plan-diff which also used Tightest-vs-Loosest). Base Loose + a loosen
+	// signal resolves one rung up to Loosest, which reorders the bound plan; Manual at the same
+	// base keeps it. ApplyAdvisory moves exactly one rung — it equals Manual(Loosest), never beyond.
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_000, 850);
+	let sql = "SELECT * FROM orders o \
+			   INNER JOIN customers c ON o.customer_id = c.id \
+			   INNER JOIN products p ON o.product_id = p.id";
+	let logical = SqlPlanner::new().plan(sql).expect("plan star");
+
+	let auto = auto_applied_margin_config(SoftMarginLadderStep::Loose, LOOSEN_VERDICTS);
+	let (auto_plan, _) = bind_with_trace(&logical, &catalog, &auto)
+		.await
+		.expect("bind under auto-applied margin");
+	let (manual_loose, _) = bind_with_trace(
+		&logical,
+		&catalog,
+		&margin_config(SoftMarginLadderStep::Loose),
+	)
+	.await
+	.expect("bind under manual loose");
+	let (manual_loosest, _) = bind_with_trace(
+		&logical,
+		&catalog,
+		&margin_config(SoftMarginLadderStep::Loosest),
+	)
+	.await
+	.expect("bind under manual loosest");
+
+	assert_ne!(
+		format!("{auto_plan:?}"),
+		format!("{manual_loose:?}"),
+		"auto application must move off the configured base and reorder the bound plan"
+	);
+	assert_eq!(
+		format!("{auto_plan:?}"),
+		format!("{manual_loosest:?}"),
+		"auto application applies exactly the one-rung recommendation, not a double step"
+	);
+}
+
+#[tokio::test]
+async fn manual_application_mode_is_190_byte_identical() {
+	// Manual ignores seeded verdicts: a Manual bind with a loosen-signalling log produces the same
+	// bound plan as the plain ADR 190 configured-margin path with an empty log.
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_000, 850);
+	let sql = "SELECT * FROM orders o \
+			   INNER JOIN customers c ON o.customer_id = c.id \
+			   INNER JOIN products p ON o.product_id = p.id";
+	let logical = SqlPlanner::new().plan(sql).expect("plan star");
+
+	let manual_with_verdicts = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	record_verdicts(
+		manual_with_verdicts.decision_log.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		25,
+	);
+	let (with_verdicts, _) = bind_with_trace(&logical, &catalog, &manual_with_verdicts)
+		.await
+		.expect("bind manual with verdicts");
+	let (baseline_190, _) = bind_with_trace(
+		&logical,
+		&catalog,
+		&margin_config(SoftMarginLadderStep::Baseline),
+	)
+	.await
+	.expect("bind 190 baseline");
+
+	assert_eq!(
+		format!("{with_verdicts:?}"),
+		format!("{baseline_190:?}"),
+		"manual mode must be byte-identical to ADR 190 regardless of verdict accrual"
+	);
+}
+
+#[tokio::test]
+async fn advisory_report_does_not_double_step_auto_application() {
+	// The report keeps the configured base and the recommendation-from-base distinct from the
+	// applied step. With base 4/5 and a loosen signal: current=4/5, recommended=9/10, applied=9/10
+	// (NOT 19/20 — the advisory is never recomputed from the already-applied margin).
+	let catalog = star_join_order_catalog();
+	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+	assert_eq!(rows.len(), 1);
+	assert_eq!(margin_advisory_utf8(&rows[0], 0), "4/5");
+	assert_eq!(margin_advisory_utf8(&rows[0], 1), "9/10");
+	assert_eq!(margin_advisory_utf8(&rows[0], 2), "loosen");
+	assert_eq!(margin_advisory_utf8(&rows[0], 9), "apply_advisory");
+	assert_eq!(margin_advisory_utf8(&rows[0], 10), "9/10");
+}
+
+#[test]
+fn auto_application_insufficient_evidence_uses_configured_margin() {
+	// MisRanked never enters the sample, so the advisory has insufficient evidence and the applied
+	// step stays at the configured base.
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictClass::MisRanked,
+			25,
+		)],
+	);
+	assert_eq!(
+		effective_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Baseline
+	);
+	let report = margin_advisory_report(&config);
+	assert_eq!(report.applied_step, SoftMarginLadderStep::Baseline);
+	assert_eq!(
+		report.advisory.recommendation,
+		MarginRecommendation::InsufficientEvidence
+	);
+}
+
+#[test]
+fn auto_application_hysteresis_keep_uses_configured_margin() {
+	// Net signal inside the hysteresis band recommends Keep, so the applied step stays at the base.
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[
+			(
+				OptimizerDecisionKind::FlatStar,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				11,
+			),
+			(
+				OptimizerDecisionKind::FlatStar,
+				OptimizerRuntimeVerdictClass::OverEager,
+				9,
+			),
+		],
+	);
+	assert_eq!(
+		effective_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		margin_advisory_report(&config).applied_step,
+		SoftMarginLadderStep::Baseline
+	);
+}
+
+#[test]
+fn auto_application_tightens_on_overeager() {
+	// A clean over-eager signal tightens one rung: Baseline (4/5) -> Tight (7/10).
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictClass::OverEager,
+			25,
+		)],
+	);
+	assert_eq!(
+		effective_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Tight
+	);
+	assert_eq!(
+		margin_advisory_report(&config)
+			.applied_step
+			.margin()
+			.label(),
+		"7/10"
+	);
+}
+
+#[test]
+fn auto_application_is_bounded_to_one_step() {
+	// Extreme signals still move exactly one rung from the base, never two.
+	let loosen = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			10_000,
+		)],
+	);
+	assert_eq!(
+		effective_join_order_soft_margin_step(&loosen),
+		SoftMarginLadderStep::Loose
+	);
+	let tighten = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictClass::OverEager,
+			10_000,
+		)],
+	);
+	assert_eq!(
+		effective_join_order_soft_margin_step(&tighten),
+		SoftMarginLadderStep::Tight
+	);
+}
+
+#[test]
+fn auto_application_does_not_mutate_config_or_log() {
+	// Resolving the effective step and building the report are pure: the configured base step is
+	// unchanged and the verdict snapshot is identical before and after.
+	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+	let before = config.decision_log.verdict_snapshot();
+	let _ = effective_join_order_soft_margin_step(&config);
+	let _ = margin_advisory_report(&config);
+	assert_eq!(
+		config.join_order_soft_margin_step,
+		SoftMarginLadderStep::Baseline
+	);
+	let after = config.decision_log.verdict_snapshot();
+	let total =
+		|snapshot: &[OptimizerRuntimeVerdictRow]| snapshot.iter().map(|row| row.count).sum::<u64>();
+	assert_eq!(before.len(), after.len());
+	assert_eq!(total(&before), total(&after));
+}
+
+#[tokio::test]
+async fn observed_snowflake_uses_auto_applied_margin() {
+	// EXPLAIN-only snowflake observation renders on the auto-applied step: base Baseline + a loosen
+	// signal makes the observed snowflake receipt show soft_margin=9/10.
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", mixed_strategy_snowflake_order_sql()))
+		.expect("plan mixed-strategy snowflake EXPLAIN");
+
+	let config = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+		..auto_broadcast_config(4_096)
+	};
+	record_verdicts(
+		config.decision_log.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		25,
+	);
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &config).await;
+	let row = join_order_snowflake_row(&rows);
+	assert_utf8_contains(&row[3], "soft_margin=9/10");
+}
+
+#[tokio::test]
+async fn rune_respects_auto_applied_margin() {
+	// Rune is the primary interface: a Rune-authored EXPLAIN sees the same auto-applied effective
+	// margin (9/10) as the SQL path.
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_100, 1_000);
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("EXPLAIN SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id INNER JOIN products p ON o.product_id = p.id")
+        }
+    "#,
+	)
+	.await;
+
+	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &config).await;
+	assert_utf8_contains(&join_order_row(&rows)[3], "soft_margin=9/10");
 }
 
 #[test]
@@ -9705,13 +9831,10 @@ async fn star_order_evidence_estimates_match_join_estimates() {
 			 INNER JOIN customers c ON o.customer_id = c.id",
 		)
 		.expect("plan first star edge");
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &auto_broadcast_config(64 * 1024 * 1024),
-	}
-	.bind_plan(&single_edge)
-	.await
-	.expect("bind first star edge");
+	let scoped = Binder::new(&catalog, &auto_broadcast_config(64 * 1024 * 1024))
+		.bind_plan(&single_edge)
+		.await
+		.expect("bind first star edge");
 	assert_eq!(
 		scoped.facts.estimated_row_count,
 		Some(RowCount::new(5_000_000))
@@ -10541,13 +10664,10 @@ async fn projected_star_reorder_restores_downstream_ordinals() {
 		.plan(sql)
 		.expect("plan projected non-optimal star");
 
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &auto_broadcast_config(64 * 1024 * 1024),
-	}
-	.bind_plan(&logical)
-	.await
-	.expect("bind projected star");
+	let scoped = Binder::new(&catalog, &auto_broadcast_config(64 * 1024 * 1024))
+		.bind_plan(&logical)
+		.await
+		.expect("bind projected star");
 
 	assert_eq!(
 		root_project_column_ordinals(&scoped.plan),
@@ -11511,13 +11631,10 @@ async fn take_limited_dim_still_hashes() {
 		}),
 		limit: 1,
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&taken_customers)
-	.await
-	.expect("bind limited dimension");
+	let scoped = Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&taken_customers)
+		.await
+		.expect("bind limited dimension");
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.byte_upper_bound, None);
 	assert_eq!(scoped.facts.estimated_byte_size, None);
@@ -11555,13 +11672,10 @@ async fn take_or_empty_relation_seeds_row_bound_without_dispatch_change() {
 		}),
 		limit: 0,
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &config,
-	}
-	.bind_plan(&take)
-	.await
-	.expect("bind take");
+	let scoped = Binder::new(&catalog, &config)
+		.bind_plan(&take)
+		.await
+		.expect("bind take");
 	assert_eq!(scoped.facts.origin, PlanOrigin::Composite);
 	assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(0)));
 
@@ -11572,13 +11686,10 @@ async fn take_or_empty_relation_seeds_row_bound_without_dispatch_change() {
 		}),
 		predicate: Expr::Literal(ScalarValue::Boolean(Some(false))),
 	};
-	let scoped = Binder {
-		catalog: &catalog,
-		config: &config,
-	}
-	.bind_plan(&empty)
-	.await
-	.expect("bind empty");
+	let scoped = Binder::new(&catalog, &config)
+		.bind_plan(&empty)
+		.await
+		.expect("bind empty");
 	assert!(matches!(scoped.plan, ExecutionPlan::EmptyRelation { .. }));
 	assert_eq!(scoped.facts.byte_upper_bound, Some(ByteCount::ZERO));
 	assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(0)));
@@ -11595,13 +11706,10 @@ fn catalog() -> MockCatalog {
 async fn bind_sql_scoped(catalog: &dyn Catalog, sql: &str) -> ScopedExecutionPlan {
 	let logical = SqlPlanner::new().plan(sql).expect("plan SQL");
 	let config = PlannerConfig::default();
-	Binder {
-		catalog,
-		config: &config,
-	}
-	.bind_plan(&logical)
-	.await
-	.expect(sql)
+	Binder::new(catalog, &config)
+		.bind_plan(&logical)
+		.await
+		.expect(sql)
 }
 
 fn converted_unit_catalog(seed_range: bool) -> MockCatalog {
@@ -12558,12 +12666,9 @@ async fn bind_filtered_customers_with_config(
 		}),
 		predicate,
 	};
-	Binder {
-		catalog,
-		config: &config,
-	}
-	.bind_plan(&filtered_customers)
-	.await
+	Binder::new(catalog, &config)
+		.bind_plan(&filtered_customers)
+		.await
 }
 
 async fn rune_plan(script: &str) -> LogicalPlan {
@@ -13546,7 +13651,7 @@ async fn execute_star_order_query(
 	config: &PlannerConfig,
 ) -> (SchemaRef, Vec<Vec<Option<i64>>>) {
 	let logical = SqlPlanner::new().plan(sql).expect("plan star order SQL");
-	let bound = Binder { catalog, config }
+	let bound = Binder::new(catalog, config)
 		.bind_plan(&logical)
 		.await
 		.expect("bind star order SQL");
@@ -13995,13 +14100,10 @@ async fn bind_multi_key_disjoint_join() -> ScopedExecutionPlan {
 		],
 	);
 
-	Binder {
-		catalog: &catalog,
-		config: &PlannerConfig::default(),
-	}
-	.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
-	.await
-	.expect("bind multi-key disjoint range join")
+	Binder::new(&catalog, &PlannerConfig::default())
+		.bind_plan(&multi_key_join_logical(&["order_id", "line_no"]))
+		.await
+		.expect("bind multi-key disjoint range join")
 }
 
 fn float_join_catalog() -> MockCatalog {

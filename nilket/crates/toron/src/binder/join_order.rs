@@ -87,6 +87,8 @@ pub(crate) enum MarginRecommendation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MarginAdvisory {
+	pub(crate) current_step: SoftMarginLadderStep,
+	pub(crate) recommended_step: SoftMarginLadderStep,
 	pub(crate) current: SoftMargin,
 	pub(crate) recommended: SoftMargin,
 	pub(crate) recommendation: MarginRecommendation,
@@ -148,6 +150,8 @@ pub(crate) fn recommend_soft_margin(
 		}
 	};
 	MarginAdvisory {
+		current_step: current,
+		recommended_step,
 		current: current.margin(),
 		recommended: recommended_step.margin(),
 		recommendation,
@@ -166,6 +170,50 @@ pub(crate) fn margin_recommendation_label(recommendation: MarginRecommendation) 
 		MarginRecommendation::Tighten => "tighten",
 		MarginRecommendation::Keep => "keep",
 		MarginRecommendation::InsufficientEvidence => "insufficient_evidence",
+	}
+}
+
+// ADR 191: the single opt-in derivation of the effective soft-margin step. `Manual` returns the
+// ADR 190 configured base unchanged; `ApplyAdvisory` returns exactly the ADR 189 advisory's
+// `recommended_step` (bounded to one ladder rung from the base). Resolved once at bind entry, never
+// inside low-level star/snowflake helpers, and never mutating config or the decision log.
+pub(crate) fn effective_join_order_soft_margin_step(
+	config: &PlannerConfig,
+) -> SoftMarginLadderStep {
+	match config.join_order_soft_margin_application {
+		JoinOrderSoftMarginApplication::Manual => config.join_order_soft_margin_step,
+		JoinOrderSoftMarginApplication::ApplyAdvisory => {
+			recommend_soft_margin(
+				&config.decision_log.verdict_snapshot(),
+				config.join_order_soft_margin_step,
+			)
+			.recommended_step
+		}
+	}
+}
+
+// ADR 191: report view that keeps the configured base, the ADR 189 recommendation from that base,
+// the application mode, and the applied step together so the advisory table never recomputes from
+// an already-applied margin (the Baseline -> Loose -> Loosest double-step trap).
+pub(crate) struct MarginAdvisoryReport {
+	pub(crate) advisory: MarginAdvisory,
+	pub(crate) application: JoinOrderSoftMarginApplication,
+	pub(crate) applied_step: SoftMarginLadderStep,
+}
+
+pub(crate) fn margin_advisory_report(config: &PlannerConfig) -> MarginAdvisoryReport {
+	let advisory = recommend_soft_margin(
+		&config.decision_log.verdict_snapshot(),
+		config.join_order_soft_margin_step,
+	);
+	let applied_step = match config.join_order_soft_margin_application {
+		JoinOrderSoftMarginApplication::Manual => config.join_order_soft_margin_step,
+		JoinOrderSoftMarginApplication::ApplyAdvisory => advisory.recommended_step,
+	};
+	MarginAdvisoryReport {
+		advisory,
+		application: config.join_order_soft_margin_application,
+		applied_step,
 	}
 }
 
@@ -1901,7 +1949,7 @@ impl<'a> Binder<'a> {
 			None,
 			StarOrderStrategy::Broadcast,
 			confidence,
-			self.config.join_order_soft_margin_step.margin(),
+			self.join_order_soft_margin_step.margin(),
 		);
 		let StarOrderOutcome::Recognized(evidence) = &recognized else {
 			unreachable!("recognized_star_order_outcome always recognizes");
@@ -2014,7 +2062,7 @@ impl<'a> Binder<'a> {
 			Some(applied_order),
 			selected_strategy,
 			confidence,
-			self.config.join_order_soft_margin_step.margin(),
+			self.join_order_soft_margin_step.margin(),
 		);
 		let edge_targets = render_trace
 			.as_ref()

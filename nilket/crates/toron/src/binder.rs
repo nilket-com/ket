@@ -107,6 +107,26 @@ const DEFAULT_UTF8_BINARY_PAYLOAD_BYTES: u64 = 256;
 const DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES: u64 = 1024;
 const RECORD_BATCH_IPC_FRAMING_OVERHEAD_BYTES: u64 = 16 * 1024;
 
+// ADR 191: how the configured join-order soft-margin step is applied to a bind. `Manual` keeps the
+// ADR 190 operator-configured step as the effective step (default, byte-identical to 190).
+// `ApplyAdvisory` opts in to the ADR 189 advisory: the effective step becomes the advisory's
+// `recommended_step` (at most one ladder rung from the configured base). Typed, not a bool, so the
+// surface stays extensible without another flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinOrderSoftMarginApplication {
+	Manual,
+	ApplyAdvisory,
+}
+
+pub(crate) fn join_order_soft_margin_application_label(
+	application: JoinOrderSoftMarginApplication,
+) -> &'static str {
+	match application {
+		JoinOrderSoftMarginApplication::Manual => "manual",
+		JoinOrderSoftMarginApplication::ApplyAdvisory => "apply_advisory",
+	}
+}
+
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
 	pub allow_experimental_kernels: bool,
@@ -117,6 +137,7 @@ pub struct PlannerConfig {
 	pub measured_accrual_sample_rate: u32,
 	pub measured_accrual_counter: Arc<AtomicU64>,
 	pub join_order_soft_margin_step: SoftMarginLadderStep,
+	pub join_order_soft_margin_application: JoinOrderSoftMarginApplication,
 }
 
 impl Default for PlannerConfig {
@@ -130,6 +151,7 @@ impl Default for PlannerConfig {
 			measured_accrual_sample_rate: 0,
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
+			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
 		}
 	}
 }
@@ -165,7 +187,7 @@ pub(crate) async fn bind_with_trace(
 ) -> Result<(ExecutionPlan, OptimizerTrace), BindingError> {
 	let mut trace = OptimizerTrace::default();
 	let mut render_trace = None;
-	let plan = Binder { catalog, config }
+	let plan = Binder::new(catalog, config)
 		.bind_plan_with_trace(
 			plan,
 			&mut trace,
@@ -185,7 +207,11 @@ async fn bind_with_explain_trace(
 ) -> Result<(ExecutionPlan, OptimizerTrace, OptimizerExplainRenderTrace), BindingError> {
 	let mut trace = OptimizerTrace::default();
 	let mut render_trace = Some(OptimizerExplainRenderTrace::default());
-	let plan = Binder { catalog, config }
+	let binder = Binder::new(catalog, config);
+	// ADR 191: capture the bind-entry effective step before the binder is consumed so observed
+	// star/snowflake receipts render on the same margin that actuation used earlier in this bind.
+	let join_order_soft_margin_step = binder.join_order_soft_margin_step;
+	let plan = binder
 		.bind_plan_with_trace(
 			plan,
 			&mut trace,
@@ -200,14 +226,13 @@ async fn bind_with_explain_trace(
 		if let Some(snowflake_order) = analyze_snowflake(
 			&render_trace.join_order_edges,
 			&trace.join_decisions,
-			config.join_order_soft_margin_step,
+			join_order_soft_margin_step,
 		) {
 			render_trace.set_observed_snowflake(snowflake_order);
 		} else if matches!(render_trace.join_order, JoinOrderRenderState::None) {
-			if let Some(outcome) = analyze(
-				&render_trace.join_order_edges,
-				config.join_order_soft_margin_step,
-			) {
+			if let Some(outcome) =
+				analyze(&render_trace.join_order_edges, join_order_soft_margin_step)
+			{
 				let edge_targets = render_trace
 					.join_order_edges
 					.iter()
@@ -302,6 +327,20 @@ fn star_order_probe_label(outcome: &StarOrderOutcome) -> String {
 struct Binder<'a> {
 	catalog: &'a dyn Catalog,
 	config: &'a PlannerConfig,
+	// ADR 191: the effective soft-margin step resolved once at bind entry from `config`. Every
+	// join-order decision point in this bind (star actuation, observed star/snowflake receipts)
+	// reads this single value rather than re-snapshotting the shared decision log mid-bind.
+	join_order_soft_margin_step: SoftMarginLadderStep,
+}
+
+impl<'a> Binder<'a> {
+	fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self {
+		Self {
+			catalog,
+			config,
+			join_order_soft_margin_step: effective_join_order_soft_margin_step(config),
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -1749,14 +1788,11 @@ impl<'a> Binder<'a> {
 			.table
 			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE)
 		{
-			let advisory = recommend_soft_margin(
-				&self.config.decision_log.verdict_snapshot(),
-				self.config.join_order_soft_margin_step,
-			);
+			let report = margin_advisory_report(self.config);
 			return system_table_plan(
 				SystemTableKind::InformationSchemaOptimizerMarginAdvisory,
 				information_schema_optimizer_margin_advisory_schema(),
-				information_schema_optimizer_margin_advisory_rows(advisory)?,
+				information_schema_optimizer_margin_advisory_rows(&report)?,
 				projection,
 			);
 		}
