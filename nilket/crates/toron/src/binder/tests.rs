@@ -10091,6 +10091,268 @@ async fn rune_queries_optimizer_runtime_verdicts() {
 	);
 }
 
+#[test]
+fn margin_advisory_recommends_looser_on_missed_wins() {
+	let snapshot = verdict_snapshot(&[(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	)]);
+
+	let advisory = recommend_soft_margin(&snapshot, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP);
+
+	assert_eq!(advisory.recommendation, MarginRecommendation::Loosen);
+	assert_eq!(advisory.current.label(), "4/5");
+	assert_eq!(advisory.recommended.label(), "9/10");
+	assert_eq!(advisory.sample_size, JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE);
+}
+
+#[test]
+fn margin_advisory_recommends_tighter_on_overeager() {
+	let snapshot = verdict_snapshot(&[(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	)]);
+
+	let advisory = recommend_soft_margin(&snapshot, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP);
+
+	assert_eq!(advisory.recommendation, MarginRecommendation::Tighten);
+	assert_eq!(advisory.current.label(), "4/5");
+	assert_eq!(advisory.recommended.label(), "7/10");
+}
+
+#[test]
+fn margin_advisory_keeps_when_well_calibrated() {
+	let snapshot = verdict_snapshot(&[
+		(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			10,
+		),
+		(
+			OptimizerDecisionKind::SnowflakeRoot,
+			OptimizerRuntimeVerdictClass::OverEager,
+			10,
+		),
+		(
+			OptimizerDecisionKind::SnowflakeBranch,
+			OptimizerRuntimeVerdictClass::Vindicated,
+			20,
+		),
+	]);
+
+	let advisory = recommend_soft_margin(&snapshot, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP);
+
+	assert_eq!(advisory.recommendation, MarginRecommendation::Keep);
+	assert_eq!(advisory.current.label(), "4/5");
+	assert_eq!(advisory.recommended.label(), "4/5");
+	assert_eq!(advisory.sample_size, 40);
+}
+
+#[test]
+fn margin_advisory_insufficient_evidence_below_min_sample() {
+	let snapshot = verdict_snapshot(&[(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE - 1,
+	)]);
+
+	let advisory = recommend_soft_margin(&snapshot, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP);
+
+	assert_eq!(
+		advisory.recommendation,
+		MarginRecommendation::InsufficientEvidence
+	);
+	assert_eq!(advisory.current.label(), "4/5");
+	assert_eq!(advisory.recommended.label(), "4/5");
+}
+
+#[tokio::test]
+async fn margin_advisory_excludes_misranked_and_indeterminate() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.decision_log.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MisRanked,
+		25,
+	);
+	record_verdicts(
+		config.decision_log.as_ref(),
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerRuntimeVerdictClass::Indeterminate,
+		30,
+	);
+
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+
+	assert_eq!(rows.len(), 1);
+	assert_eq!(margin_advisory_utf8(&rows[0], 2), "insufficient_evidence");
+	assert_eq!(margin_advisory_i64(&rows[0], 6), 25);
+	assert_eq!(margin_advisory_i64(&rows[0], 7), 30);
+	assert_eq!(margin_advisory_i64(&rows[0], 8), 0);
+}
+
+#[test]
+fn margin_advisory_clamps_to_safe_range() {
+	let missed = verdict_snapshot(&[(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	)]);
+	let over_eager = verdict_snapshot(&[(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	)]);
+
+	let loosest = recommend_soft_margin(&missed, SoftMarginLadderStep::Loosest);
+	let tightest = recommend_soft_margin(&over_eager, SoftMarginLadderStep::Tightest);
+
+	assert_eq!(loosest.recommendation, MarginRecommendation::Loosen);
+	assert_eq!(loosest.current.label(), "19/20");
+	assert_eq!(loosest.recommended.label(), "19/20");
+	assert_eq!(tightest.recommendation, MarginRecommendation::Tighten);
+	assert_eq!(tightest.current.label(), "3/5");
+	assert_eq!(tightest.recommended.label(), "3/5");
+}
+
+#[test]
+fn margin_advisory_has_hysteresis() {
+	let snapshot = verdict_snapshot(&[
+		(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			11,
+		),
+		(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictClass::OverEager,
+			9,
+		),
+	]);
+
+	let advisory = recommend_soft_margin(&snapshot, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP);
+
+	assert_eq!(advisory.recommendation, MarginRecommendation::Keep);
+	assert_eq!(advisory.current.label(), "4/5");
+	assert_eq!(advisory.recommended.label(), "4/5");
+}
+
+#[tokio::test]
+async fn margin_advisory_is_read_only_no_plan_change() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let quiet_config = auto_broadcast_config(64 * 1024 * 1024);
+	let noisy_config = PlannerConfig {
+		decision_log: Arc::new(OptimizerDecisionLog::default()),
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	record_verdicts(
+		noisy_config.decision_log.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let (quiet_plan, quiet_trace) = bind_with_trace(&logical, &catalog, &quiet_config)
+		.await
+		.expect("bind quiet plan");
+	let (noisy_plan, noisy_trace) = bind_with_trace(&logical, &catalog, &noisy_config)
+		.await
+		.expect("bind noisy plan");
+
+	assert_eq!(format!("{quiet_plan:?}"), format!("{noisy_plan:?}"));
+	assert_eq!(quiet_trace.join_decisions, noisy_trace.join_decisions);
+	assert_eq!(
+		quiet_trace.scan_filter_decisions,
+		noisy_trace.scan_filter_decisions
+	);
+}
+
+#[tokio::test]
+async fn margin_advisory_report_projects_like_information_schema() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.decision_log.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let report = LogicalPlan::ScanNamed {
+		table: TableRef::with_schema("information_schema", "optimizer_margin_advisory"),
+		projection: Some(vec![
+			"recommendation".to_string(),
+			"recommended_margin".to_string(),
+			"sample_size".to_string(),
+		]),
+	};
+	let plan = bind(&report, &catalog, &config)
+		.await
+		.expect("bind projected optimizer margin advisory");
+	let ExecutionPlan::SystemTable { kind, schema, rows } = plan else {
+		panic!("expected projected system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerMarginAdvisory
+	);
+	assert_eq!(
+		field_names(&schema),
+		vec!["recommendation", "recommended_margin", "sample_size"]
+	);
+	assert_eq!(rows.len(), 1);
+	assert_eq!(rows[0][0], ScalarValue::Utf8(Some("loosen".to_string())));
+	assert_eq!(rows[0][1], ScalarValue::Utf8(Some("9/10".to_string())));
+	assert_eq!(
+		rows[0][2],
+		ScalarValue::Int64(Some(
+			i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
+		))
+	);
+}
+
+#[tokio::test]
+async fn rune_queries_margin_advisory() {
+	let catalog = star_join_order_catalog();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.decision_log.as_ref(),
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM information_schema.optimizer_margin_advisory")
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer margin advisory report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer margin advisory system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerMarginAdvisory
+	);
+	assert_eq!(rows.len(), 1);
+	assert_eq!(margin_advisory_utf8(&rows[0], 2), "tighten");
+	assert_eq!(margin_advisory_utf8(&rows[0], 1), "7/10");
+}
+
 #[tokio::test]
 async fn star_order_replay_ids_and_receipts_follow_applied_sequence() {
 	let catalog = star_join_order_catalog();
@@ -12270,6 +12532,26 @@ async fn optimizer_runtime_verdict_rows(
 	rows
 }
 
+async fn optimizer_margin_advisory_rows(
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Vec<Vec<ScalarValue>> {
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_margin_advisory")
+		.expect("plan optimizer margin advisory report");
+	let plan = bind(&logical, catalog, config)
+		.await
+		.expect("bind optimizer margin advisory report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected optimizer margin advisory system table, got {plan:?}");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerMarginAdvisory
+	);
+	rows
+}
+
 fn optimizer_decision_count(
 	rows: &[Vec<ScalarValue>],
 	kind: &str,
@@ -12321,6 +12603,49 @@ fn optimizer_runtime_verdict_kind_count(rows: &[Vec<ScalarValue>], kind: &str) -
 			count
 		})
 		.sum()
+}
+
+fn verdict_snapshot(
+	rows: &[(OptimizerDecisionKind, OptimizerRuntimeVerdictClass, u64)],
+) -> Vec<OptimizerRuntimeVerdictRow> {
+	rows.iter()
+		.map(|(kind, verdict, count)| OptimizerRuntimeVerdictRow {
+			kind: *kind,
+			verdict: *verdict,
+			count: *count,
+		})
+		.collect()
+}
+
+fn record_verdicts(
+	log: &OptimizerDecisionLog,
+	kind: OptimizerDecisionKind,
+	verdict: OptimizerRuntimeVerdictClass,
+	count: u64,
+) {
+	for _ in 0..count {
+		log.record_verdict(kind, verdict);
+	}
+}
+
+fn margin_advisory_utf8(row: &[ScalarValue], index: usize) -> &str {
+	let ScalarValue::Utf8(Some(value)) = &row[index] else {
+		panic!(
+			"expected margin advisory Utf8 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value.as_str()
+}
+
+fn margin_advisory_i64(row: &[ScalarValue], index: usize) -> i64 {
+	let ScalarValue::Int64(Some(value)) = row[index] else {
+		panic!(
+			"expected margin advisory Int64 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value
 }
 
 fn assert_utf8_contains(value: &ScalarValue, expected: &str) {

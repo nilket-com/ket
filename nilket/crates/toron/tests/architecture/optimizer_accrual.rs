@@ -387,3 +387,160 @@ pub(crate) fn adr188_no_optimizer_shell_or_planproperties_contract() {
 		format_offenders(&manifest, &offenders)
 	);
 }
+
+#[test]
+pub(crate) fn adr189_advisory_is_read_only() {
+	let binder = binder_root_source();
+	let join_order = source("src/binder/join_order.rs");
+	let decision_log = source("src/binder/decision_log.rs");
+	let recommend = first_block(&join_order, "pub(crate) fn recommend_soft_margin");
+	let classify = first_block(&join_order, "pub(super) fn classify_star_order_action");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+
+	assert!(recommend.contains("snapshot: &[OptimizerRuntimeVerdictRow]"));
+	assert!(recommend.contains("current: SoftMarginLadderStep"));
+	assert!(!recommend.contains("decision_log"));
+	assert!(!recommend.contains(".record("));
+	assert!(!recommend.contains("record_verdict"));
+	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
+	assert!(bind_relation.contains("recommend_soft_margin("));
+	assert!(!classify.contains("recommend_soft_margin"));
+	assert!(!classify.contains("verdict_snapshot"));
+	assert!(!decision_log.contains("recommend_soft_margin"));
+	assert!(!decision_log.contains("MarginAdvisory"));
+}
+
+#[test]
+pub(crate) fn adr189_advisory_does_not_change_margin_or_decision() {
+	let join_order = source("src/binder/join_order.rs");
+	let classify = first_block(&join_order, "pub(super) fn classify_star_order_action");
+
+	assert!(join_order.contains("pub(super) const STAR_ORDER_SOFT_MARGIN_NUMERATOR: u128 = 4;"));
+	assert!(join_order.contains("pub(super) const STAR_ORDER_SOFT_MARGIN_DENOMINATOR: u128 = 5;"));
+	assert!(classify.contains("JoinOrderEstimateConfidence::Hard => StarOrderAction::Reordered"));
+	assert!(classify.contains("preferred_cost.saturating_mul(STAR_ORDER_SOFT_MARGIN_DENOMINATOR)"));
+	assert!(classify.contains("declared_cost.saturating_mul(STAR_ORDER_SOFT_MARGIN_NUMERATOR)"));
+	assert!(!classify.contains("SoftMargin"));
+	assert!(!classify.contains("MarginAdvisory"));
+	assert!(!classify.contains("OptimizerRuntimeVerdict"));
+}
+
+#[test]
+pub(crate) fn adr189_advisory_reuses_188_verdict_log() {
+	let binder = binder_root_source();
+	let decision_log = source("src/binder/decision_log.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+	let log_struct = first_block(&decision_log, "pub struct OptimizerDecisionLog");
+	let with_max_keys = first_block(&decision_log, "pub(crate) fn with_max_keys");
+
+	assert!(decision_log.contains("pub(crate) fn verdict_snapshot"));
+	assert!(join_order.contains("snapshot: &[OptimizerRuntimeVerdictRow]"));
+	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
+	assert!(bind_relation.contains("recommend_soft_margin("));
+	assert!(
+		log_struct.contains("verdict_counts: Mutex<BTreeMap<OptimizerRuntimeVerdictKey, u64>>")
+	);
+	assert!(with_max_keys.contains("verdict_counts: Mutex::new(BTreeMap::new())"));
+	assert_eq!(
+		decision_log.matches("pub(crate) fn record_verdict").count(),
+		1
+	);
+}
+
+#[test]
+pub(crate) fn adr189_advisory_excludes_misranked_indeterminate() {
+	let join_order = source("src/binder/join_order.rs");
+	let recommend = first_block(&join_order, "pub(crate) fn recommend_soft_margin");
+	let rows = source("src/binder/explain.rs");
+	let advisory_rows = first_block(
+		&rows,
+		"pub(super) fn information_schema_optimizer_margin_advisory_rows",
+	);
+
+	assert!(recommend.contains("OptimizerRuntimeVerdictClass::MisRanked"));
+	assert!(recommend.contains("mis_ranked = mis_ranked.saturating_add(row.count);"));
+	assert!(recommend.contains("OptimizerRuntimeVerdictClass::Indeterminate"));
+	assert!(recommend.contains("indeterminate = indeterminate.saturating_add(row.count);"));
+	assert!(recommend.contains("let sample_size = missed_win"));
+	assert!(recommend.contains(".saturating_add(over_eager)"));
+	assert!(recommend.contains(".saturating_add(vindicated)"));
+	assert!(!recommend.contains(".saturating_add(mis_ranked)"));
+	assert!(!recommend.contains(".saturating_add(indeterminate)"));
+	assert!(advisory_rows.contains("advisory.mis_ranked"));
+	assert!(advisory_rows.contains("advisory.indeterminate"));
+}
+
+#[test]
+pub(crate) fn adr189_report_reuses_information_schema_path() {
+	let binder = binder_root_source();
+	let execution = source("src/ir/execution.rs");
+	let explain = source("src/binder/explain.rs");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+
+	assert!(binder.contains("INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE"));
+	assert!(execution.contains("InformationSchemaOptimizerMarginAdvisory"));
+	assert!(bind_relation.contains("INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE"));
+	assert!(bind_relation.contains("SystemTableKind::InformationSchemaOptimizerMarginAdvisory"));
+	assert!(bind_relation.contains("system_table_plan("));
+	assert!(bind_relation.contains("information_schema_optimizer_margin_advisory_schema"));
+	assert!(bind_relation.contains("information_schema_optimizer_margin_advisory_rows"));
+	assert!(explain.contains("information_schema_optimizer_margin_advisory_schema"));
+}
+
+#[test]
+pub(crate) fn adr189_no_executor_fragmenter_storage_or_wendelon_change() {
+	let manifest = manifest_dir();
+	let markers = [
+		"InformationSchemaOptimizerMarginAdvisory",
+		"optimizer_margin_advisory",
+		"MarginAdvisory",
+		"recommend_soft_margin",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR189 margin advisory leaked outside binder/report surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr189_no_optimizer_shell_or_planproperties_contract() {
+	let manifest = manifest_dir();
+	assert!(!manifest.join("src/optimizer.rs").exists());
+	assert!(!manifest.join("src/optimizer").exists());
+
+	let offenders = source_lines(&manifest.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			let trimmed = line.trim_start();
+			trimmed.starts_with("struct Optimizer ")
+				|| trimmed.starts_with("pub struct Optimizer ")
+				|| trimmed.starts_with("enum Optimizer ")
+				|| trimmed.starts_with("pub enum Optimizer ")
+				|| line.contains("PlanProperties")
+				|| line.contains("Cascades")
+				|| trimmed.starts_with("struct Memo ")
+				|| trimmed.starts_with("pub struct Memo ")
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR189 introduced optimizer shell/property contract:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}

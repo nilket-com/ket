@@ -280,6 +280,56 @@ pub(super) fn information_schema_optimizer_runtime_verdict_rows(
 		.collect()
 }
 
+pub(super) fn information_schema_optimizer_margin_advisory_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("current_margin", DataType::Utf8, false),
+		Field::new("recommended_margin", DataType::Utf8, false),
+		Field::new("recommendation", DataType::Utf8, false),
+		Field::new("missed_win", DataType::Int64, false),
+		Field::new("over_eager", DataType::Int64, false),
+		Field::new("vindicated", DataType::Int64, false),
+		Field::new("mis_ranked", DataType::Int64, false),
+		Field::new("indeterminate", DataType::Int64, false),
+		Field::new("sample_size", DataType::Int64, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_margin_advisory_rows(
+	advisory: MarginAdvisory,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	Ok(vec![vec![
+		ScalarValue::Utf8(Some(advisory.current.label())),
+		ScalarValue::Utf8(Some(advisory.recommended.label())),
+		ScalarValue::Utf8(Some(
+			margin_recommendation_label(advisory.recommendation).to_string(),
+		)),
+		ScalarValue::Int64(Some(u64_to_i64(
+			advisory.missed_win,
+			"optimizer margin advisory missed_win",
+		)?)),
+		ScalarValue::Int64(Some(u64_to_i64(
+			advisory.over_eager,
+			"optimizer margin advisory over_eager",
+		)?)),
+		ScalarValue::Int64(Some(u64_to_i64(
+			advisory.vindicated,
+			"optimizer margin advisory vindicated",
+		)?)),
+		ScalarValue::Int64(Some(u64_to_i64(
+			advisory.mis_ranked,
+			"optimizer margin advisory mis_ranked",
+		)?)),
+		ScalarValue::Int64(Some(u64_to_i64(
+			advisory.indeterminate,
+			"optimizer margin advisory indeterminate",
+		)?)),
+		ScalarValue::Int64(Some(u64_to_i64(
+			advisory.sample_size,
+			"optimizer margin advisory sample_size",
+		)?)),
+	]])
+}
+
 pub(super) fn optimizer_explain_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("decision_kind", DataType::Utf8, false),
@@ -1507,6 +1557,12 @@ pub(super) fn byte_count_to_i64(
 }
 
 pub(super) fn usize_to_i64(value: usize, column: &'static str) -> Result<i64, BindingError> {
+	i64::try_from(value).map_err(|_| BindingError::UnsupportedExpression {
+		message: format!("optimizer explain {column} exceeds i64::MAX"),
+	})
+}
+
+pub(super) fn u64_to_i64(value: u64, column: &'static str) -> Result<i64, BindingError> {
 	i64::try_from(value).map_err(|_| BindingError::UnsupportedExpression {
 		message: format!("optimizer explain {column} exceeds i64::MAX"),
 	})

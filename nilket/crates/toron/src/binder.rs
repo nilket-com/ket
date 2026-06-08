@@ -92,12 +92,15 @@ const INFORMATION_SCHEMA_SCHEMATA: &str = "information_schema.schemata";
 const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS: &str = "information_schema.optimizer_decisions";
 const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS: &str =
 	"information_schema.optimizer_runtime_verdicts";
+const INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY: &str =
+	"information_schema.optimizer_margin_advisory";
 const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
 const INFORMATION_SCHEMA_TABLES_TABLE: &str = "tables";
 const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = "columns";
 const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
 const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS_TABLE: &str = "optimizer_decisions";
 const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE: &str = "optimizer_runtime_verdicts";
+const INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE: &str = "optimizer_margin_advisory";
 const ARROW_BUFFER_ALIGNMENT_BYTES: u64 = 64;
 const DEFAULT_UTF8_BINARY_PAYLOAD_BYTES: u64 = 256;
 const DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES: u64 = 1024;
@@ -1734,9 +1737,24 @@ impl<'a> Binder<'a> {
 				projection,
 			);
 		}
+		if table
+			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE)
+		{
+			let advisory = recommend_soft_margin(
+				&self.config.decision_log.verdict_snapshot(),
+				CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
+			);
+			return system_table_plan(
+				SystemTableKind::InformationSchemaOptimizerMarginAdvisory,
+				information_schema_optimizer_margin_advisory_schema(),
+				information_schema_optimizer_margin_advisory_rows(advisory)?,
+				projection,
+			);
+		}
 		Err(BindingError::UnsupportedExpression {
 			message: format!(
-				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}",
+				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY}",
 				table_name(table)
 			),
 		})

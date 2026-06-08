@@ -4,6 +4,170 @@ pub(super) type JoinOrderSourceMap = BTreeMap<String, JoinOrderRelationFacts>;
 
 pub(super) const STAR_ORDER_SOFT_MARGIN_NUMERATOR: u128 = 4;
 pub(super) const STAR_ORDER_SOFT_MARGIN_DENOMINATOR: u128 = 5;
+pub(crate) const JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE: u64 = 20;
+pub(crate) const JOIN_ORDER_MARGIN_ADVISORY_HYSTERESIS_NUMERATOR: u64 = 1;
+pub(crate) const JOIN_ORDER_MARGIN_ADVISORY_HYSTERESIS_DENOMINATOR: u64 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SoftMarginLadderStep {
+	Tightest,
+	Tight,
+	Baseline,
+	Loose,
+	Loosest,
+}
+
+impl SoftMarginLadderStep {
+	fn tighter(self) -> Self {
+		match self {
+			Self::Tightest => Self::Tightest,
+			Self::Tight => Self::Tightest,
+			Self::Baseline => Self::Tight,
+			Self::Loose => Self::Baseline,
+			Self::Loosest => Self::Loose,
+		}
+	}
+
+	fn looser(self) -> Self {
+		match self {
+			Self::Tightest => Self::Tight,
+			Self::Tight => Self::Baseline,
+			Self::Baseline => Self::Loose,
+			Self::Loose => Self::Loosest,
+			Self::Loosest => Self::Loosest,
+		}
+	}
+
+	fn margin(self) -> SoftMargin {
+		match self {
+			Self::Tightest => SoftMargin::new(3, 5),
+			Self::Tight => SoftMargin::new(7, 10),
+			Self::Baseline => SoftMargin::new(
+				STAR_ORDER_SOFT_MARGIN_NUMERATOR,
+				STAR_ORDER_SOFT_MARGIN_DENOMINATOR,
+			),
+			Self::Loose => SoftMargin::new(9, 10),
+			Self::Loosest => SoftMargin::new(19, 20),
+		}
+	}
+}
+
+pub(crate) const CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP: SoftMarginLadderStep =
+	SoftMarginLadderStep::Baseline;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SoftMargin {
+	numerator: u128,
+	denominator: u128,
+}
+
+impl SoftMargin {
+	const fn new(numerator: u128, denominator: u128) -> Self {
+		assert!(numerator > 0);
+		assert!(denominator > 0);
+		assert!(numerator <= denominator);
+		Self {
+			numerator,
+			denominator,
+		}
+	}
+
+	pub(crate) fn label(self) -> String {
+		format!("{}/{}", self.numerator, self.denominator)
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarginRecommendation {
+	Loosen,
+	Tighten,
+	Keep,
+	InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarginAdvisory {
+	pub(crate) current: SoftMargin,
+	pub(crate) recommended: SoftMargin,
+	pub(crate) recommendation: MarginRecommendation,
+	pub(crate) missed_win: u64,
+	pub(crate) over_eager: u64,
+	pub(crate) vindicated: u64,
+	pub(crate) mis_ranked: u64,
+	pub(crate) indeterminate: u64,
+	pub(crate) sample_size: u64,
+}
+
+pub(crate) fn recommend_soft_margin(
+	snapshot: &[OptimizerRuntimeVerdictRow],
+	current: SoftMarginLadderStep,
+) -> MarginAdvisory {
+	let mut missed_win = 0_u64;
+	let mut over_eager = 0_u64;
+	let mut vindicated = 0_u64;
+	let mut mis_ranked = 0_u64;
+	let mut indeterminate = 0_u64;
+	for row in snapshot {
+		match row.verdict {
+			OptimizerRuntimeVerdictClass::MissedWin => {
+				missed_win = missed_win.saturating_add(row.count);
+			}
+			OptimizerRuntimeVerdictClass::OverEager => {
+				over_eager = over_eager.saturating_add(row.count);
+			}
+			OptimizerRuntimeVerdictClass::Vindicated => {
+				vindicated = vindicated.saturating_add(row.count);
+			}
+			OptimizerRuntimeVerdictClass::MisRanked => {
+				mis_ranked = mis_ranked.saturating_add(row.count);
+			}
+			OptimizerRuntimeVerdictClass::Indeterminate => {
+				indeterminate = indeterminate.saturating_add(row.count);
+			}
+		}
+	}
+	let sample_size = missed_win
+		.saturating_add(over_eager)
+		.saturating_add(vindicated);
+	let (recommendation, recommended_step) = if sample_size < JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
+	{
+		(MarginRecommendation::InsufficientEvidence, current)
+	} else {
+		let net = i128::from(missed_win) - i128::from(over_eager);
+		let threshold = i128::from(sample_size)
+			.saturating_mul(i128::from(JOIN_ORDER_MARGIN_ADVISORY_HYSTERESIS_NUMERATOR));
+		let scaled_net = net.saturating_mul(i128::from(
+			JOIN_ORDER_MARGIN_ADVISORY_HYSTERESIS_DENOMINATOR,
+		));
+		if scaled_net > threshold {
+			(MarginRecommendation::Loosen, current.looser())
+		} else if scaled_net < threshold.saturating_neg() {
+			(MarginRecommendation::Tighten, current.tighter())
+		} else {
+			(MarginRecommendation::Keep, current)
+		}
+	};
+	MarginAdvisory {
+		current: current.margin(),
+		recommended: recommended_step.margin(),
+		recommendation,
+		missed_win,
+		over_eager,
+		vindicated,
+		mis_ranked,
+		indeterminate,
+		sample_size,
+	}
+}
+
+pub(crate) fn margin_recommendation_label(recommendation: MarginRecommendation) -> &'static str {
+	match recommendation {
+		MarginRecommendation::Loosen => "loosen",
+		MarginRecommendation::Tighten => "tighten",
+		MarginRecommendation::Keep => "keep",
+		MarginRecommendation::InsufficientEvidence => "insufficient_evidence",
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct JoinOrderRelationFacts {
