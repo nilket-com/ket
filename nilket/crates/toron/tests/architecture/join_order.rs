@@ -31,21 +31,25 @@ pub(crate) fn adr178_star_order_actuation_is_planning_time_not_explain_rendered(
 	let bind_plan = first_block(&binder, "fn bind_plan_with_trace");
 	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
 	let join_order = source("src/binder/join_order.rs");
+	let join_order_model = join_order
+		.split("impl<'a> Binder<'a>")
+		.next()
+		.expect("join-order model section");
 
 	assert!(bind_plan.contains("try_bind_star_order_actuation(plan, trace, render_trace)"));
 	assert!(actuator.contains("extract_star_join_candidate(plan)"));
 	assert!(!actuator.contains("analyze("));
 	assert!(join_order.contains("pub(super) fn extract_star_join_candidate"));
-	assert!(bind_with_explain_trace.contains("if render_trace.join_order.is_none()"));
-	assert!(!join_order.contains("ExecutionPlan::"));
-	assert!(!join_order.contains("restore_declared_star_order_project"));
+	assert!(bind_with_explain_trace.contains("if !render_trace.has_recognized_star_order()"));
+	assert!(!join_order_model.contains("ExecutionPlan::"));
+	assert!(!join_order_model.contains("restore_declared_star_order_project"));
 }
 
 #[test]
 pub(crate) fn adr178_join_order_scoring_stays_in_join_order_model() {
 	let binder = binder_source();
 	let bind_scoped_join = first_block(&binder, "fn bind_scoped_join");
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 	let join_order = source("src/binder/join_order.rs");
 
 	assert!(join_order.contains("pub(super) fn analyze"));
@@ -55,7 +59,7 @@ pub(crate) fn adr178_join_order_scoring_stays_in_join_order_model() {
 	assert!(join_order.contains("STAR_ORDER_SOFT_MARGIN_DENOMINATOR"));
 	assert!(join_order.contains("StarOrderOutcome::Recognized"));
 	assert!(join_order.contains("StarOrderOutcome::Declined"));
-	assert!(actuator.contains("recognized_star_order_outcome("));
+	assert!(local_actuator.contains("recognized_star_order_outcome("));
 	assert!(!bind_scoped_join.contains("order_cost("));
 	assert!(!bind_scoped_join.contains("cost_preferred_order"));
 }
@@ -64,13 +68,14 @@ pub(crate) fn adr178_join_order_scoring_stays_in_join_order_model() {
 pub(crate) fn adr178_actuation_reuses_existing_join_estimate_channels() {
 	let binder = binder_source();
 	let bind_scoped_join = first_block(&binder, "fn bind_scoped_join");
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
 	let estimate_helper = first_block(&binder, "fn join_estimated_row_count_for_keys");
 	let join_order = source("src/binder/join_order.rs");
 
 	assert!(bind_scoped_join.contains("Self::join_estimated_row_count_for_keys("));
-	assert!(actuator.contains("Self::join_estimated_row_count_for_keys("));
-	assert!(actuator.contains("join_order_edge_estimate("));
+	let bound_dimension = first_block(&binder, "fn bound_star_dimension");
+
+	assert!(bound_dimension.contains("Self::join_estimated_row_count_for_keys("));
+	assert!(bound_dimension.contains("join_order_edge_estimate("));
 	assert!(estimate_helper.contains("join_output_ndv_containment_estimate("));
 	assert!(estimate_helper.contains("multi_key_join_cardinality("));
 	assert!(join_order.contains("actual_join_estimate"));
@@ -103,7 +108,6 @@ pub(crate) fn adr178_source_capture_is_split_from_explain_rendering() {
 	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
 	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
 	let bind_scoped_join = first_block(&binder, "fn bind_scoped_join");
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
 
 	assert!(bind_with_trace.contains("let mut render_trace = None;"));
 	assert!(bind_with_trace.contains("JoinOrderSourceCapture::Off"));
@@ -113,22 +117,23 @@ pub(crate) fn adr178_source_capture_is_split_from_explain_rendering() {
 	assert!(binder.contains("JoinOrderSourceCapture::On"));
 	assert!(bind_scoped_join.contains("if let Some(render_trace) = render_trace.as_mut()"));
 	assert!(bind_scoped_join.contains("render_trace.join_order_edges.push(JoinOrderEdgeEvidence"));
-	assert!(actuator.contains("render_trace.join_order = Some("));
+	assert!(binder.contains("render_trace.set_star_receipt("));
+	assert!(binder.contains("render_trace.set_star_receipts(receipts)"));
 }
 
 #[test]
 pub(crate) fn adr178_reuses_join_constructor_and_restores_declared_output_shape() {
 	let binder = binder_source();
 	let join = source("src/binder/join.rs");
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 	let sequence = first_block(&binder, "fn bind_star_order_sequence");
 	let bind_join = first_block(&binder, "async fn bind_join");
 	let bind_scoped_join = first_block(&binder, "fn bind_scoped_join");
 
 	assert!(bind_join.contains("self.bind_scoped_join("));
 	assert!(sequence.contains("self.bind_scoped_join("));
-	assert!(actuator.contains("restore_declared_star_order_project("));
-	assert!(actuator.contains("star_output_segments_for_order("));
+	assert!(local_actuator.contains("restore_declared_star_order_project("));
+	assert!(local_actuator.contains("star_output_segments_for_order("));
 	assert!(join.contains("pub(super) struct StarOutputSegment"));
 	assert!(join.contains("pub(super) fn restore_declared_star_order_project"));
 	assert!(join.contains("decode_column_logical_type(field)"));
@@ -274,7 +279,7 @@ pub(crate) fn adr179_actual_correlates_via_replay_id() {
 	let execute_hash_join = first_block(&exec, "async fn execute_hash_join");
 
 	assert!(task.contains("pub replay_id: JoinReplayId"));
-	assert!(replay_ids.contains("edge.target.join_index"));
+	assert!(replay_ids.contains("target.join_index"));
 	assert!(replay_ids.contains(".map(JoinReplayId)"));
 	assert!(render.contains("join_order_runtime_measurement(edge"));
 	assert!(measurement.contains("join_replay_id_for_trace_target(edge.target)?"));
@@ -618,17 +623,17 @@ pub(crate) fn adr181_uniform_strategy_recognizer() {
 #[test]
 pub(crate) fn adr181_uniform_strategy_preflights_declared_and_selected() {
 	let binder = binder_source();
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 	let preflight = first_block(&binder, "fn preflight_star_order_strategy");
 
-	assert!(actuator.contains("let Some(declared_strategy)"));
-	assert!(actuator.contains("preflight_star_order_strategy("));
-	assert!(actuator.contains("&declared_indices"));
-	assert!(actuator.contains("let Some(selected_strategy)"));
-	assert!(actuator.contains("&selected_indices"));
-	assert!(actuator.contains("if declared_strategy != selected_strategy"));
-	assert!(actuator.contains("StarOrderDeclineReason::MixedStrategyStar"));
-	assert!(actuator.contains("let star_order_strategy = selected_strategy;"));
+	assert!(local_actuator.contains("let Some(declared_strategy)"));
+	assert!(local_actuator.contains("preflight_star_order_strategy("));
+	assert!(local_actuator.contains("&declared_indices"));
+	assert!(local_actuator.contains("let Some(selected_strategy)"));
+	assert!(local_actuator.contains("&selected_indices"));
+	assert!(local_actuator.contains("if declared_strategy != selected_strategy"));
+	assert!(local_actuator.contains("StarOrderDeclineReason::MixedStrategyStar"));
+	assert!(local_actuator.contains("selected_strategy,"));
 	assert!(preflight.contains("let mut preflight_trace = base_trace.clone();"));
 	assert!(preflight.contains("let preflight_join_start = preflight_trace.join_decisions.len();"));
 	assert!(preflight.contains("let mut no_render_trace = None;"));
@@ -641,17 +646,17 @@ pub(crate) fn adr181_uniform_strategy_preflights_declared_and_selected() {
 pub(crate) fn adr181_reorder_is_strategy_invariant() {
 	let binder = binder_source();
 	let join_order = source("src/binder/join_order.rs");
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 	let recognized = first_block(&join_order, "pub(super) fn recognized_star_order_outcome");
 	let ranking = first_block(&join_order, "pub(super) fn rank_star_order");
 	let order_cost = first_block(&join_order, "pub(super) fn order_cost");
 	let classify = first_block(&join_order, "pub(super) fn classify_star_order_action");
 
-	assert!(actuator.contains("preferred_indices.sort_by"));
-	assert!(actuator.contains("restore_declared_star_order_project("));
-	assert!(actuator.contains("star_output_segments_for_order("));
-	assert!(actuator.contains("recognized_star_order_outcome("));
-	assert!(actuator.contains("star_order_strategy,"));
+	assert!(local_actuator.contains("preferred_indices.sort_by"));
+	assert!(local_actuator.contains("restore_declared_star_order_project("));
+	assert!(local_actuator.contains("star_output_segments_for_order("));
+	assert!(local_actuator.contains("recognized_star_order_outcome("));
+	assert!(local_actuator.contains("selected_strategy,"));
 	assert!(recognized.contains("strategy: StarOrderStrategy"));
 	assert!(recognized.contains("strategy,"));
 	assert!(recognized.contains("rank_star_order("));
@@ -708,14 +713,14 @@ pub(crate) fn adr181_reuses_178_restore_and_179_180_net() {
 	let explain = source("src/binder/explain.rs");
 	let join = source("src/binder/join.rs");
 	let join_order = source("src/binder/join_order.rs");
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 	let runtime_row = first_block(&explain, "fn optimizer_analyze_join_order_row");
 	let measurement = first_block(&explain, "fn join_order_runtime_measurement");
 	let verdict_row = first_block(&explain, "fn optimizer_analyze_join_order_verdict_row");
 	let verdict = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
 
-	assert!(actuator.contains("restore_declared_star_order_project("));
+	assert!(local_actuator.contains("restore_declared_star_order_project("));
 	assert!(join.contains("pub(super) fn restore_declared_star_order_project"));
 	assert!(analyze_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
 	assert!(runtime_row.contains("join_order_runtime_measurement(edge"));
@@ -765,7 +770,9 @@ pub(crate) fn adr182_snowflake_recognition_is_observational() {
 		bind_with_explain_trace
 			.contains("analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions)")
 	);
-	assert!(bind_with_explain_trace.contains("render_trace.join_order = None"));
+	assert!(
+		bind_with_explain_trace.contains("render_trace.set_observed_snowflake(snowflake_order)")
+	);
 	assert!(!bind_join.contains("snowflake_order"));
 	assert!(!bind_scoped_join.contains("snowflake_order"));
 	assert!(!choose.contains("snowflake_order"));
@@ -860,11 +867,13 @@ pub(crate) fn adr182_snowflake_supersedes_decline_without_gating_runtime() {
 	let runtime = first_block(&binder, "fn star_order_runtime_replay_ids");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 
-	assert!(bind_with_explain_trace.contains("render_trace.snowflake_order ="));
-	assert!(bind_with_explain_trace.contains("render_trace.join_order = None"));
-	assert!(runtime.contains("render_trace.join_order"));
-	assert!(runtime.contains("render_trace.snowflake_order.is_none()"));
-	assert!(analyze_rows.contains("render_trace.snowflake_order.as_ref()"));
+	assert!(
+		bind_with_explain_trace.contains("render_trace.set_observed_snowflake(snowflake_order)")
+	);
+	assert!(bind_with_explain_trace.contains("if !render_trace.has_recognized_star_order()"));
+	assert!(runtime.contains("JoinOrderRenderState::ObservedSnowflake(_)"));
+	assert!(runtime.contains("JoinOrderRenderState::StarReceipts(receipts)"));
+	assert!(analyze_rows.contains("JoinOrderRenderState::ObservedSnowflake(evidence)"));
 	assert!(analyze_rows.contains("optimizer_analyze_snowflake_order_row(evidence)"));
 	assert!(analyze_rows.contains("optimizer_analyze_snowflake_runtime_row"));
 	assert!(explain.contains("\"join_order_snowflake\""));
@@ -893,10 +902,10 @@ pub(crate) fn adr183_snowflake_runtime_replay_ids_from_edges() {
 	let runtime = first_block(&binder, "fn star_order_runtime_replay_ids");
 	let edge_strategy = first_block(&join_order, "pub(super) struct SnowflakeEdgeStrategy");
 
-	assert!(runtime.contains("render_trace.snowflake_order.is_none()"));
-	assert!(runtime.contains("render_trace.join_order"));
-	assert!(runtime.contains("render_trace\n\t\t.join_order_edges"));
-	assert!(runtime.contains("edge.target.join_index"));
+	assert!(runtime.contains("JoinOrderRenderState::ObservedSnowflake(_)"));
+	assert!(runtime.contains("JoinOrderRenderState::StarReceipts(receipts)"));
+	assert!(runtime.contains("render_trace.join_order_edges.iter().map(|edge| edge.target)"));
+	assert!(runtime.contains("target.join_index"));
 	assert!(!edge_strategy.contains("target:"));
 }
 
@@ -905,14 +914,14 @@ pub(crate) fn adr183_snowflake_runtime_emits_no_flat_star_verdict() {
 	let explain = source("src/binder/explain.rs");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 	let runtime_row = first_block(&explain, "fn optimizer_analyze_snowflake_runtime_row");
-	let snowflake_branch = analyze_rows
-		.split("let Some(StarOrderOutcome::Recognized")
+	let observed_snowflake_branch = analyze_rows
+		.split("return Ok(rows);")
 		.next()
 		.expect("snowflake analyze branch");
 
-	assert!(snowflake_branch.contains("optimizer_analyze_snowflake_order_row(evidence)"));
-	assert!(snowflake_branch.contains("optimizer_analyze_snowflake_runtime_row"));
-	assert!(!snowflake_branch.contains("optimizer_analyze_join_order_verdict_row"));
+	assert!(observed_snowflake_branch.contains("optimizer_analyze_snowflake_order_row(evidence)"));
+	assert!(observed_snowflake_branch.contains("optimizer_analyze_snowflake_runtime_row"));
+	assert!(!observed_snowflake_branch.contains("optimizer_analyze_join_order_verdict_row"));
 	assert!(!runtime_row.contains("join_order_verdict"));
 	assert!(!runtime_row.contains("measured_star_order_verdict"));
 }
@@ -1177,13 +1186,13 @@ pub(crate) fn adr184_cockpit_is_frontend_shared() {
 #[test]
 pub(crate) fn adr185_snowflake_root_actuation_reuses_181_machinery() {
 	let binder = binder_source();
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 
-	assert!(actuator.contains("preflight_star_order_strategy("));
-	assert!(actuator.contains("bind_star_order_sequence("));
-	assert!(actuator.contains("restore_declared_star_order_project("));
-	assert!(actuator.contains("star_output_segments_for_order("));
-	assert!(actuator.contains("recognized_star_order_outcome("));
+	assert!(local_actuator.contains("preflight_star_order_strategy("));
+	assert!(local_actuator.contains("bind_star_order_sequence("));
+	assert!(local_actuator.contains("restore_declared_star_order_project("));
+	assert!(local_actuator.contains("star_output_segments_for_order("));
+	assert!(local_actuator.contains("recognized_star_order_outcome("));
 	assert!(!binder.contains("fn restore_declared_snowflake_order_project"));
 	assert!(!binder.contains("fn bind_snowflake_order_sequence"));
 }
@@ -1191,32 +1200,30 @@ pub(crate) fn adr185_snowflake_root_actuation_reuses_181_machinery() {
 #[test]
 pub(crate) fn adr185_branch_fold_at_relation_label_boundary() {
 	let binder = binder_source();
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let classifier = first_block(&binder, "fn classify_snowflake_star_tree");
 
-	assert!(binder.contains("struct StarRootDimension"));
-	assert!(actuator.contains("let mut root_dimensions = Vec::<StarRootDimension<'_>>::new();"));
-	assert!(actuator.contains("member_indices: Vec::new()"));
-	assert!(actuator.contains("root_dimensions[root_index]"));
-	assert!(actuator.contains(".member_indices"));
-	assert!(actuator.contains(".push(dimension_index)"));
-	assert!(actuator.contains("self.try_resolve_star_dimension_edge("));
-	assert!(actuator.contains("parent_plan,"));
-	assert!(actuator.contains("StarOrderDeclineReason::MissingRelationLabel"));
+	assert!(binder.contains("struct SnowflakeStarTree"));
+	assert!(binder.contains("struct SnowflakeStarNode"));
+	assert!(classifier.contains("let mut root_children = Vec::new();"));
+	assert!(classifier.contains("nodes[parent_index].children.push(node_index)"));
+	assert!(classifier.contains("seen_labels.insert"));
+	assert!(classifier.contains("self.try_resolve_star_dimension_edge("));
+	assert!(classifier.contains("parent_plan,"));
+	assert!(classifier.contains("StarOrderDeclineReason::MissingRelationLabel"));
 }
 
 #[test]
 pub(crate) fn adr185_branch_built_declared_without_actuator() {
 	let binder = binder_source();
-	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
-	let helper = first_block(&binder, "fn bind_declared_star_branch_dimension");
+	let branch_builder = first_block(&binder, "fn bind_snowflake_dimension");
+	let declared_helper = first_block(&binder, "fn bind_declared_star_children");
 
-	assert!(actuator.contains("bind_declared_star_branch_dimension("));
-	assert!(helper.contains("let mut no_render_trace = None;"));
-	assert!(helper.contains("self.bind_scoped_join("));
-	assert!(helper.contains("member.declared_position"));
-	assert!(!helper.contains("bind_plan_with_trace"));
-	assert!(!helper.contains("try_bind_star_order_actuation"));
-	assert!(!helper.contains("recognized_star_order_outcome"));
+	assert!(branch_builder.contains("self.bind_declared_star_children("));
+	assert!(declared_helper.contains("self.bind_scoped_join("));
+	assert!(declared_helper.contains("dimension.declared_position"));
+	assert!(!declared_helper.contains("bind_plan_with_trace"));
+	assert!(!declared_helper.contains("try_bind_star_order_actuation"));
+	assert!(!declared_helper.contains("recognized_star_order_outcome"));
 }
 
 #[test]
@@ -1224,23 +1231,24 @@ pub(crate) fn adr185_actuated_root_reports_as_star() {
 	let binder = binder_source();
 	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
 	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 
-	assert!(bind_with_explain_trace.contains("Some(StarOrderOutcome::Recognized(_))"));
+	assert!(bind_with_explain_trace.contains("render_trace.has_recognized_star_order()"));
 	assert!(
 		bind_with_explain_trace
 			.contains("analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions)")
 	);
-	assert!(bind_with_explain_trace.contains("render_trace.join_order = None"));
-	assert!(actuator.contains("render_trace.join_order = Some(recognized_star_order_outcome("));
-	assert!(actuator.contains("StarOrderStrategy::HashPartitioned"));
+	assert!(actuator.contains("render_trace.set_star_receipts(receipts)"));
+	assert!(local_actuator.contains("StarOrderStrategy::HashPartitioned"));
 }
 
 #[test]
 pub(crate) fn adr185_no_executor_fragment_costmodel_or_wendelon_change() {
 	let manifest = manifest_dir();
 	let markers = [
-		"StarRootDimension",
-		"bind_declared_star_branch_dimension",
+		"SnowflakeStarTree",
+		"bind_snowflake_dimension",
+		"bind_local_star_actuation",
 		"hash_snowflake",
 		"preferred_hash_snowflake",
 	];
@@ -1292,8 +1300,78 @@ pub(crate) fn adr185_cockpit_is_frontend_shared() {
 	assert!(analyze_rows.contains("optimizer_analyze_join_order_row"));
 	assert!(rune.contains("LogicalPlan::Explain"));
 	assert!(rune.contains("LogicalPlan::ExplainAnalyze"));
-	assert!(!rune.contains("StarRootDimension"));
-	assert!(!rune.contains("bind_declared_star_branch_dimension"));
+	assert!(!rune.contains("SnowflakeStarTree"));
+	assert!(!rune.contains("bind_snowflake_dimension"));
+	assert!(!rune.contains("bind_local_star_actuation"));
+}
+
+#[test]
+pub(crate) fn adr186_join_order_render_state_is_exclusive() {
+	let explain = source("src/binder/explain.rs");
+	let trace = first_block(&explain, "pub(super) struct OptimizerExplainRenderTrace");
+	let state = first_block(&explain, "pub(super) enum JoinOrderRenderState");
+	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+
+	assert!(trace.contains("join_order: JoinOrderRenderState"));
+	assert!(!trace.contains("join_order: Option"));
+	assert!(!trace.contains("snowflake_order"));
+	assert!(state.contains("None"));
+	assert!(state.contains("StarReceipts(Vec<StarOrderRenderReceipt>)"));
+	assert!(state.contains("ObservedSnowflake(SnowflakeOrderEvidence)"));
+	assert!(analyze_rows.contains("JoinOrderRenderState::ObservedSnowflake(evidence)"));
+	assert!(analyze_rows.contains("render_trace.star_order_receipts()"));
+}
+
+#[test]
+pub(crate) fn adr186_recursive_branch_actuation_is_bottom_up_and_edge_owned() {
+	let binder = binder_source();
+	let root_builder = first_block(&binder, "fn bind_snowflake_root_dimensions");
+	let branch_builder = first_block(&binder, "fn bind_snowflake_dimension");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+
+	assert!(root_builder.contains("for node_index in &tree.root_children"));
+	assert!(root_builder.contains("self.bind_snowflake_dimension("));
+	assert!(branch_builder.contains("for child_index in &node.children"));
+	assert!(branch_builder.contains("self.bind_snowflake_dimension("));
+	assert!(branch_builder.contains("receipts.push(local.receipt)"));
+	assert!(local_actuator.contains("let local_edge_start = render_trace"));
+	assert!(local_actuator.contains("edge_targets"));
+	assert!(actuator.contains("receipts.push(real_root.receipt.clone())"));
+	assert!(actuator.contains("receipts.extend(branch_receipts)"));
+}
+
+#[test]
+pub(crate) fn adr186_root_hash_gate_commits_or_discards_branch_receipts() {
+	let binder = binder_source();
+	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
+	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
+
+	assert!(actuator.contains("let force_hash_root = tree.has_branch_dimensions();"));
+	assert!(actuator.contains("force_hash_root,"));
+	assert!(actuator.contains("if !force_hash_root"));
+	assert!(actuator.contains("return Ok(None);"));
+	assert!(actuator.contains("render_trace.set_star_receipts(receipts)"));
+	assert!(
+		local_actuator
+			.contains("if force_hash && selected_strategy != StarOrderStrategy::HashPartitioned")
+	);
+	assert!(local_actuator.contains("LocalStarActuationAttempt::Declined"));
+}
+
+#[test]
+pub(crate) fn adr186_branch_helpers_do_not_rebind_synthesized_logical_joins() {
+	let binder = binder_source();
+	let root_builder = first_block(&binder, "fn bind_snowflake_root_dimensions");
+	let branch_builder = first_block(&binder, "fn bind_snowflake_dimension");
+	let declared_helper = first_block(&binder, "fn bind_declared_star_children");
+
+	for helper in [root_builder, branch_builder, declared_helper] {
+		assert!(!helper.contains("bind_plan_with_trace"));
+		assert!(!helper.contains("LogicalPlan::Join"));
+		assert!(!helper.contains("extract_star_join_candidate"));
+	}
+	assert!(binder.contains("self.bind_scoped_join("));
 }
 
 #[test]

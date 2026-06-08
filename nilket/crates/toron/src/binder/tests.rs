@@ -8570,13 +8570,19 @@ async fn star_order_actuation_reorders_non_optimal_broadcast_star() {
 		broadcast_build_scan_ids_in_applied_order(&plain_plan),
 		vec![TableId(24), TableId(23), TableId(22)]
 	);
+	let JoinOrderRenderState::StarReceipts(receipts) = &render_trace.join_order else {
+		panic!("expected star-order receipt");
+	};
 	assert!(matches!(
-		render_trace.join_order,
-		Some(StarOrderOutcome::Recognized(StarOrderEvidence {
-			action: StarOrderAction::Reordered,
-			strategy: StarOrderStrategy::Broadcast,
+		receipts.as_slice(),
+		[StarOrderRenderReceipt {
+			outcome: StarOrderOutcome::Recognized(StarOrderEvidence {
+				action: StarOrderAction::Reordered,
+				strategy: StarOrderStrategy::Broadcast,
+				..
+			}),
 			..
-		}))
+		}]
 	));
 }
 
@@ -8616,13 +8622,19 @@ async fn hash_star_reorder_preserves_hash_strategy() {
 			&& receipt.placement == JoinPhysicalPlacement::Natural
 	}));
 	assert_join_strategy_count(&plan, JoinStrategy::HashPartitioned, 3);
+	let JoinOrderRenderState::StarReceipts(receipts) = &render_trace.join_order else {
+		panic!("expected star-order receipt");
+	};
 	assert!(matches!(
-		render_trace.join_order,
-		Some(StarOrderOutcome::Recognized(StarOrderEvidence {
-			action: StarOrderAction::Reordered,
-			strategy: StarOrderStrategy::HashPartitioned,
+		receipts.as_slice(),
+		[StarOrderRenderReceipt {
+			outcome: StarOrderOutcome::Recognized(StarOrderEvidence {
+				action: StarOrderAction::Reordered,
+				strategy: StarOrderStrategy::HashPartitioned,
+				..
+			}),
 			..
-		}))
+		}]
 	));
 }
 
@@ -8819,36 +8831,57 @@ async fn hash_snowflake_reorder_is_results_identical() {
 }
 
 #[tokio::test]
-async fn hash_snowflake_branch_built_declared_order() {
+async fn hash_snowflake_branch_emits_edge_owned_star_receipt() {
 	let catalog = hash_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(non_optimal_snowflake_order_sql())
 		.expect("plan hash snowflake SQL");
 
-	let (plan, trace, render_trace) =
+	let (_plan, trace, render_trace) =
 		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(1))
 			.await
 			.expect("bind hash snowflake");
 
 	assert_eq!(trace.join_decisions.len(), 4);
-	assert_eq!(render_trace.join_order_edges.len(), 2);
-	assert!(render_trace.join_order_edges.iter().all(|edge| {
-		edge.dimension.as_deref() == Some("c") || edge.dimension.as_deref() == Some("s")
-	}));
-	let mut right_scan_ids = Vec::new();
-	collect_join_right_single_scan_ids(&plan, &mut right_scan_ids);
-	let region_pos = right_scan_ids
-		.iter()
-		.position(|table_id| *table_id == TableId(33))
-		.expect("regions join appears");
-	let segment_pos = right_scan_ids
-		.iter()
-		.position(|table_id| *table_id == TableId(34))
-		.expect("segments join appears");
-	assert!(
-		region_pos < segment_pos,
-		"branch must stay declared r->g, got {right_scan_ids:?}"
+	assert_eq!(render_trace.join_order_edges.len(), 4);
+	let JoinOrderRenderState::StarReceipts(receipts) = &render_trace.join_order else {
+		panic!("expected recursive star receipts");
+	};
+	assert_eq!(receipts.len(), 2);
+
+	let root_receipt = &receipts[0];
+	let branch_receipt = &receipts[1];
+	assert_eq!(root_receipt.probe_label, "o");
+	assert_eq!(branch_receipt.probe_label, "c");
+	assert_eq!(
+		root_receipt
+			.edge_targets
+			.iter()
+			.map(|target| target.join_index)
+			.collect::<Vec<_>>(),
+		vec![2, 3]
 	);
+	assert_eq!(
+		branch_receipt
+			.edge_targets
+			.iter()
+			.map(|target| target.join_index)
+			.collect::<Vec<_>>(),
+		vec![0, 1]
+	);
+
+	let StarOrderOutcome::Recognized(root_evidence) = &root_receipt.outcome else {
+		panic!("expected root receipt");
+	};
+	assert_eq!(root_evidence.applied_order, vec!["s", "c"]);
+	assert_eq!(root_evidence.strategy, StarOrderStrategy::HashPartitioned);
+
+	let StarOrderOutcome::Recognized(branch_evidence) = &branch_receipt.outcome else {
+		panic!("expected branch receipt");
+	};
+	assert_eq!(branch_evidence.declared_order, vec!["r", "g"]);
+	assert_eq!(branch_evidence.applied_order, vec!["g", "r"]);
+	assert_eq!(branch_evidence.strategy, StarOrderStrategy::HashPartitioned);
 }
 
 #[tokio::test]
@@ -8874,7 +8907,7 @@ async fn mixed_or_broadcast_snowflake_root_declines_actuation() {
 }
 
 #[tokio::test]
-async fn deep_snowflake_declines_actuation() {
+async fn deep_snowflake_actuates_root_and_keeps_unary_branches_receiptless() {
 	let catalog = hash_snowflake_join_order_catalog();
 	let sql = "SELECT * FROM orders o \
 			   INNER JOIN customers c ON o.customer_id = c.id \
@@ -8887,14 +8920,20 @@ async fn deep_snowflake_declines_actuation() {
 
 	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &auto_broadcast_config(1)).await;
 
-	assert!(
-		rows.iter()
-			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string())) })
+	let join_order_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order".to_string())))
+		.collect::<Vec<_>>();
+	assert_eq!(join_order_rows.len(), 1);
+	assert_eq!(
+		join_order_rows[0][1],
+		ScalarValue::Utf8(Some("star[probe=o]".to_string()))
 	);
+	assert_utf8_contains(&join_order_rows[0][3], "applied_order=[s,c]");
 	assert!(
 		!rows
 			.iter()
-			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order".to_string())) })
+			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string())) })
 	);
 }
 
@@ -8907,7 +8946,7 @@ async fn actuated_hash_snowflake_root_uses_star_verdict() {
 	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(1))
 		.await
 		.expect("bind hash snowflake analyze");
-	assert_eq!(binding.replay_ids.len(), 2);
+	assert_eq!(binding.replay_ids.len(), 4);
 	let observations = binding
 		.replay_ids
 		.iter()
@@ -8929,11 +8968,29 @@ async fn actuated_hash_snowflake_root_uses_star_verdict() {
 		rows.iter()
 			.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order_runtime".to_string())))
 			.count(),
-		2
+		4
+	);
+	let verdict_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order_verdict".to_string())))
+		.collect::<Vec<_>>();
+	assert_eq!(verdict_rows.len(), 2);
+	let verdict_details = verdict_rows
+		.iter()
+		.map(|row| match &row[3] {
+			ScalarValue::Utf8(Some(detail)) => detail.as_str(),
+			_ => "",
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		verdict_details
+			.iter()
+			.any(|detail| detail.contains("applied_order=[s,c]"))
 	);
 	assert!(
-		rows.iter()
-			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order_verdict".to_string())) })
+		verdict_details
+			.iter()
+			.any(|detail| detail.contains("applied_order=[g,r]"))
 	);
 	assert!(
 		!rows
@@ -8963,8 +9020,10 @@ async fn snowflake_order_evidence_is_observational() {
 
 	assert_eq!(plain_trace, explain_trace);
 	assert_eq!(format!("{plain_plan:?}"), format!("{explain_plan:?}"));
-	assert!(render_trace.snowflake_order.is_some());
-	assert!(render_trace.join_order.is_none());
+	assert!(matches!(
+		render_trace.join_order,
+		JoinOrderRenderState::ObservedSnowflake(_)
+	));
 
 	let (_schema, rows) = execute_star_order_query(
 		&catalog,
@@ -9014,10 +9073,9 @@ async fn snowflake_branch_links_outer_dimension_to_inner_probe() {
 		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
 			.await
 			.expect("bind snowflake render trace");
-	let evidence = render_trace
-		.snowflake_order
-		.as_ref()
-		.expect("snowflake evidence");
+	let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order else {
+		panic!("snowflake evidence");
+	};
 
 	assert_eq!(evidence.ranking.probe, "o");
 	assert_eq!(evidence.branches.len(), 1);
@@ -9084,6 +9142,36 @@ async fn snowflake_evidence_records_per_edge_strategy_without_gating() {
 }
 
 #[tokio::test]
+async fn root_decline_keeps_observed_snowflake_state() {
+	// Commit-discard atomicity: a mixed-strategy root (stores broadcast, customers hash)
+	// declines actuation. Even though the `customers -> {regions, segments}` branch is bushy
+	// and could reorder locally, the root-gate throws the branch receipts away with the root
+	// and falls back to the 182-184 observe-only path. The render state must be
+	// ObservedSnowflake, never a committed StarReceipts tree.
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(mixed_strategy_snowflake_order_sql())
+		.expect("plan mixed-strategy snowflake");
+
+	let (_plan, _trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind mixed-strategy snowflake explain trace");
+
+	let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order else {
+		panic!("root decline must keep observed snowflake state, not commit star receipts");
+	};
+	// The discarded branch was bushy (>=2 children) — a would-be local actuation thrown away
+	// atomically with the declining root, not committed independently.
+	let bushy_branch = evidence
+		.branches
+		.iter()
+		.find(|branch| branch.evidence.ranking.dimensions.len() >= 2)
+		.expect("mixed-strategy snowflake has a bushy customers branch");
+	assert_eq!(bushy_branch.dimension, "c");
+}
+
+#[tokio::test]
 async fn snowflake_order_evidence_is_explain_gated() {
 	let catalog = snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
@@ -9102,7 +9190,10 @@ async fn snowflake_order_evidence_is_explain_gated() {
 		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
 			.await
 			.expect("bind snowflake explain trace");
-	assert!(render_trace.snowflake_order.is_some());
+	assert!(matches!(
+		render_trace.join_order,
+		JoinOrderRenderState::ObservedSnowflake(_)
+	));
 }
 
 #[tokio::test]
@@ -9208,7 +9299,10 @@ async fn snowflake_runtime_replay_ids_collected_from_edges() {
 		.map(|edge| JoinReplayId(edge.target.join_index as u32))
 		.collect::<BTreeSet<_>>();
 
-	assert!(binding.render_trace.snowflake_order.is_some());
+	assert!(matches!(
+		binding.render_trace.join_order,
+		JoinOrderRenderState::ObservedSnowflake(_)
+	));
 	assert_eq!(binding.replay_ids, expected);
 	assert_eq!(binding.replay_ids.len(), 4);
 
@@ -9415,7 +9509,10 @@ async fn star_order_evidence_is_explain_gated() {
 			.await
 			.expect("bind explain trace");
 	assert_eq!(render_trace.join_order_edges.len(), 3);
-	assert!(render_trace.join_order.is_some());
+	assert!(matches!(
+		render_trace.join_order,
+		JoinOrderRenderState::StarReceipts(_)
+	));
 }
 
 #[test]
@@ -11601,35 +11698,6 @@ fn collect_join_strategies(plan: &ExecutionPlan, strategies: &mut Vec<JoinStrate
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Take { input, .. } => collect_join_strategies(input, strategies),
-		ExecutionPlan::EmptyRelation { .. }
-		| ExecutionPlan::SystemTable { .. }
-		| ExecutionPlan::Scan { .. }
-		| ExecutionPlan::CreateTable { .. }
-		| ExecutionPlan::CreateLogicalType { .. }
-		| ExecutionPlan::CreateTableAsSelect { .. }
-		| ExecutionPlan::DropTable { .. }
-		| ExecutionPlan::Delete { .. }
-		| ExecutionPlan::Update { .. }
-		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. } => {}
-	}
-}
-
-fn collect_join_right_single_scan_ids(plan: &ExecutionPlan, ids: &mut Vec<TableId>) {
-	match plan {
-		ExecutionPlan::Join { left, right, .. } => {
-			collect_join_right_single_scan_ids(left, ids);
-			if let Some(table_id) = single_scan_table_id(right) {
-				ids.push(table_id);
-			}
-			collect_join_right_single_scan_ids(right, ids);
-		}
-		ExecutionPlan::Filter { input, .. }
-		| ExecutionPlan::Project { input, .. }
-		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Sort { input, .. }
-		| ExecutionPlan::Take { input, .. } => collect_join_right_single_scan_ids(input, ids),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }

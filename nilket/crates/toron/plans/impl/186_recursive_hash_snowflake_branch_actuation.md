@@ -199,37 +199,42 @@ Fixtures:
 - broadcast/mixed root fixture for observe-only fallback;
 - branch-local decline fixture with hash-safe root.
 
-Tests:
+Tests (as shipped — the plan's many gates consolidated):
 
-- `recursive_hash_snowflake_actuates_root_and_bushy_branch`.
-- `recursive_hash_snowflake_nested_restores_preserve_results`.
-- `recursive_branch_receipts_are_edge_owned`.
-- `root_decline_keeps_observed_snowflake_state`.
-- `join_order_render_state_excludes_star_plus_observed_snowflake`.
-- `chain_snowflake_emits_single_root_receipt`.
-- `branch_decline_keeps_branch_declared_but_root_can_actuate`.
-- `flat_star_receipt_shape_is_byte_identical`.
-- `hash_snowflake_root_receipt_shape_is_byte_identical`.
-- `declined_snowflake_observational_suite_stays_green`.
-- `rune_recursive_hash_snowflake_reorders_same_as_sql`.
+- `hash_snowflake_branch_emits_edge_owned_star_receipt` - root + bushy branch both reorder; two
+  `StarReceipts` with disjoint `edge_targets` (branch `[0,1]` bottom-up, root `[2,3]`), applied
+  orders `[g,r]` / `[s,c]` (subsumes actuates-root-and-bushy-branch + receipts-are-edge-owned).
+- `hash_snowflake_reorder_is_results_identical` - now executes the bushy
+  `non_optimal_snowflake_order_project_sql`; composed-restore correctness hinge (subsumes
+  nested-restores-preserve-results).
+- `root_decline_keeps_observed_snowflake_state` - mixed/broadcast root discards the bushy branch
+  receipts with the root and keeps the 182-184 `ObservedSnowflake` path.
+- `deep_snowflake_actuates_root_and_keeps_unary_branches_receiptless` - chain/unary branches
+  actuate only the root; no local branch receipt (subsumes chain-single-root-receipt).
+- exclusivity, flat-star/root-receipt byte-identity, and the observe-only fallback are covered
+  by the `adr186_join_order_render_state_is_exclusive` guard plus the 177-181 `star_order`, 185
+  `hash_snowflake`, and 182-184 `snowflake` suites staying green.
+- `rune_hash_snowflake_root_reorders_same_as_sql` exercises the shared Rune path; a
+  recursive-specific Rune gate is deferred.
 
-Retarget 185's `deep_snowflake_declines_actuation` to the positive recursive bushy/deeper case
-where hash-safe, and keep a negative non-tree/cycle/shared-parent decline test.
+## Phase 8 - Architecture guards (`tests/architecture/join_order.rs`) — four shipped
 
-## Phase 8 - Architecture guards (`tests/architecture/join_order.rs`)
+- `adr186_join_order_render_state_is_exclusive` - one `JoinOrderRenderState`; star receipts and
+  observed-snowflake evidence cannot coexist.
+- `adr186_recursive_branch_actuation_is_bottom_up_and_edge_owned` - bottom-up recursion, plural
+  edge-owned receipts, analyze spends only receipt-owned edges (subsumes
+  star-receipts-plural-and-edge-owned + analyze-spends-only-owned-edges).
+- `adr186_root_hash_gate_commits_or_discards_branch_receipts` - D6 commit-or-discard atomicity.
+- `adr186_branch_helpers_do_not_rebind_synthesized_logical_joins` - private local-star helpers
+  over already-bound inputs reusing 181 preflight/sequence/restore (no nested-restore helper),
+  not synthesized `LogicalPlan::Join`s (subsumes local-actuator-reuses-181,
+  restores-compose-without-nested-helper, private-helpers-not-synthesized-binder).
 
-- `adr186_join_order_render_state_is_exclusive`.
-- `adr186_star_receipts_are_plural_and_edge_owned`.
-- `adr186_local_star_actuator_reuses_181_machinery`.
-- `adr186_analyze_spends_only_receipt_owned_edges`.
-- `adr186_restores_compose_without_nested_helper`.
-- `adr186_branch_recursion_uses_private_helpers_not_synthesized_top_level_binder`.
-- `adr186_hash_only_no_broadcast_fragment_change`.
-- `adr186_no_optimizer_shell_or_planproperties_contract`.
-- `adr186_cockpit_is_frontend_shared`.
-
-Retarget affected 177-185 guards that source-match `join_order: Option<StarOrderOutcome>` or
-assume only one star receipt.
+The binder/explain-only scope (no executor / `fragment.rs` / `rewrite_broadcast_star_probe` /
+cost-model / Wendelon / shell change) holds by the diff touching only `binder.rs`,
+`binder/explain.rs`, `binder/join_order.rs`, and tests — no dedicated `adr186_` no-change guard.
+Affected 177-185 guards that source-matched `join_order: Option<StarOrderOutcome>` were
+retargeted to the `JoinOrderRenderState` enum.
 
 ## Verification
 
@@ -249,9 +254,10 @@ git diff --check
 ## Risks
 
 - **Invalid cockpit state.** Separate star/snowflake fields can both be populated. Pin with the
-  exclusive enum and `join_order_render_state_excludes_star_plus_observed_snowflake`.
+  exclusive `JoinOrderRenderState` enum + `adr186_join_order_render_state_is_exclusive`.
 - **Receipt ambiguity.** Recursive behavior without edge-owned receipts makes verdicts
-  ambiguous. Pin with `recursive_branch_receipts_are_edge_owned`.
+  ambiguous. Pin with the disjoint `edge_targets` asserted in
+  `hash_snowflake_branch_emits_edge_owned_star_receipt`.
 - **Synthetic-plan recursion.** Re-entering the top-level binder on synthesized branches risks
   double receipts and scratch leaks. Pin with the private-helper architecture guard.
 - **Branch-only actuation on root decline.** Pin with `root_decline_keeps_observed_snowflake_state`.

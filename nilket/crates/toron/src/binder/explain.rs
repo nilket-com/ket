@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct JoinTraceTarget {
 	pub(crate) join_index: usize,
 }
@@ -73,8 +73,22 @@ pub(crate) struct OptimizerTrace {
 pub(super) struct OptimizerExplainRenderTrace {
 	pub(super) scan_filters: Vec<ScanFilterRenderReceipt>,
 	pub(super) join_order_edges: Vec<JoinOrderEdgeEvidence>,
-	pub(super) join_order: Option<StarOrderOutcome>,
-	pub(super) snowflake_order: Option<SnowflakeOrderEvidence>,
+	pub(super) join_order: JoinOrderRenderState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StarOrderRenderReceipt {
+	pub(super) probe_label: String,
+	pub(super) outcome: StarOrderOutcome,
+	pub(super) edge_targets: Vec<JoinTraceTarget>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum JoinOrderRenderState {
+	#[default]
+	None,
+	StarReceipts(Vec<StarOrderRenderReceipt>),
+	ObservedSnowflake(SnowflakeOrderEvidence),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +105,34 @@ impl OptimizerExplainRenderTrace {
 		self.scan_filters
 			.iter()
 			.find(|receipt| receipt.target == target)
+	}
+
+	pub(super) fn has_recognized_star_order(&self) -> bool {
+		match &self.join_order {
+			JoinOrderRenderState::StarReceipts(receipts) => receipts
+				.iter()
+				.any(|receipt| matches!(receipt.outcome, StarOrderOutcome::Recognized(_))),
+			JoinOrderRenderState::None | JoinOrderRenderState::ObservedSnowflake(_) => false,
+		}
+	}
+
+	pub(super) fn star_order_receipts(&self) -> &[StarOrderRenderReceipt] {
+		match &self.join_order {
+			JoinOrderRenderState::StarReceipts(receipts) => receipts,
+			JoinOrderRenderState::None | JoinOrderRenderState::ObservedSnowflake(_) => &[],
+		}
+	}
+
+	pub(super) fn set_observed_snowflake(&mut self, evidence: SnowflakeOrderEvidence) {
+		self.join_order = JoinOrderRenderState::ObservedSnowflake(evidence);
+	}
+
+	pub(super) fn set_star_receipt(&mut self, receipt: StarOrderRenderReceipt) {
+		self.join_order = JoinOrderRenderState::StarReceipts(vec![receipt]);
+	}
+
+	pub(super) fn set_star_receipts(&mut self, receipts: Vec<StarOrderRenderReceipt>) {
+		self.join_order = JoinOrderRenderState::StarReceipts(receipts);
 	}
 }
 
@@ -196,11 +238,18 @@ pub(super) fn optimizer_explain_plan(
 			})
 			.collect::<Result<Vec<_>, _>>()?,
 	);
-	if let Some(evidence) = render_trace.and_then(|trace| trace.snowflake_order.as_ref()) {
-		rows.push(optimizer_explain_snowflake_order_row(evidence)?);
-	}
-	if let Some(outcome) = render_trace.and_then(|trace| trace.join_order.as_ref()) {
-		rows.push(optimizer_explain_join_order_row(outcome)?);
+	if let Some(render_trace) = render_trace {
+		match &render_trace.join_order {
+			JoinOrderRenderState::None => {}
+			JoinOrderRenderState::ObservedSnowflake(evidence) => {
+				rows.push(optimizer_explain_snowflake_order_row(evidence)?);
+			}
+			JoinOrderRenderState::StarReceipts(receipts) => {
+				for receipt in receipts {
+					rows.push(optimizer_explain_join_order_row(&receipt.outcome)?);
+				}
+			}
+		}
 	}
 	system_table_plan(
 		SystemTableKind::OptimizerExplain,
@@ -279,7 +328,7 @@ fn optimizer_analyze_rows(
 	render_trace: &OptimizerExplainRenderTrace,
 	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
 ) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
-	if let Some(evidence) = render_trace.snowflake_order.as_ref() {
+	if let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order {
 		let mut rows = vec![optimizer_analyze_snowflake_order_row(evidence)];
 		let dimensions = flatten_snowflake_dimensions(evidence);
 		let mut measured_rows_by_dimension = BTreeMap::new();
@@ -305,35 +354,46 @@ fn optimizer_analyze_rows(
 		rows.push(optimizer_analyze_snowflake_aggregate_verdict_row(&verdict));
 		return Ok(rows);
 	}
-	let Some(StarOrderOutcome::Recognized(evidence)) = render_trace.join_order.as_ref() else {
-		return Ok(Vec::new());
-	};
-	let dimensions = evidence
-		.dimensions
-		.iter()
-		.map(|dimension| (dimension.dimension.as_str(), dimension))
-		.collect::<BTreeMap<_, _>>();
-	let mut measured_rows_by_dimension = BTreeMap::new();
-	let mut rows = render_trace
-		.join_order_edges
-		.iter()
-		.filter_map(|edge| {
-			let dimension = edge.dimension.as_deref()?;
-			let dimension = dimensions.get(dimension)?;
-			Some((edge, *dimension))
-		})
-		.map(|(edge, dimension)| {
+
+	let mut rows = Vec::new();
+	for receipt in render_trace.star_order_receipts() {
+		let StarOrderOutcome::Recognized(evidence) = &receipt.outcome else {
+			continue;
+		};
+		let edge_targets = receipt
+			.edge_targets
+			.iter()
+			.copied()
+			.collect::<BTreeSet<_>>();
+		let dimensions = evidence
+			.dimensions
+			.iter()
+			.map(|dimension| (dimension.dimension.as_str(), dimension))
+			.collect::<BTreeMap<_, _>>();
+		let mut measured_rows_by_dimension = BTreeMap::new();
+		for edge in &render_trace.join_order_edges {
+			if !edge_targets.contains(&edge.target) {
+				continue;
+			}
+			let Some(dimension) = edge.dimension.as_deref() else {
+				continue;
+			};
+			let Some(dimension) = dimensions.get(dimension) else {
+				continue;
+			};
 			let replay_id = join_replay_id_for_trace_target(edge.target)?;
 			if let Some(summary) = summaries.get(&replay_id) {
 				measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
 			}
-			optimizer_analyze_join_order_row(edge, dimension, summaries)
-		})
-		.collect::<Result<Vec<_>, _>>()?;
-	rows.push(optimizer_analyze_join_order_verdict_row(
-		evidence,
-		&measured_rows_by_dimension,
-	)?);
+			rows.push(optimizer_analyze_join_order_row(
+				edge, dimension, summaries,
+			)?);
+		}
+		rows.push(optimizer_analyze_join_order_verdict_row(
+			evidence,
+			&measured_rows_by_dimension,
+		)?);
+	}
 	Ok(rows)
 }
 

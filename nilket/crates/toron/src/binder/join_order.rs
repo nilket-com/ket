@@ -1076,3 +1076,802 @@ pub(super) fn order_cost(dimensions: &[JoinOrderDimEvidence]) -> u128 {
 		})
 		.sum()
 }
+
+#[derive(Debug, Clone)]
+struct StarChildDimension<'a> {
+	plan: ScopedExecutionPlan,
+	on: &'a [(Expr, Expr)],
+	strategy_intent: JoinStrategyIntent,
+	label: String,
+	declared_position: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BoundStarDimension<'a> {
+	plan: ScopedExecutionPlan,
+	on: &'a [(Expr, Expr)],
+	strategy_intent: JoinStrategyIntent,
+	label: String,
+	evidence: JoinOrderDimEvidence,
+}
+
+#[derive(Debug, Clone)]
+struct SnowflakeStarNode<'a> {
+	dimension_index: usize,
+	children: Vec<usize>,
+	on: &'a [(Expr, Expr)],
+	strategy_intent: JoinStrategyIntent,
+	label: String,
+	declared_position: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SnowflakeStarTree<'a> {
+	root_children: Vec<usize>,
+	nodes: Vec<SnowflakeStarNode<'a>>,
+}
+
+impl SnowflakeStarTree<'_> {
+	fn has_branch_dimensions(&self) -> bool {
+		self.nodes.iter().any(|node| !node.children.is_empty())
+	}
+}
+
+#[derive(Debug, Clone)]
+struct BuiltSnowflakeDimension<'a> {
+	dimension: StarChildDimension<'a>,
+	receipts: Vec<StarOrderRenderReceipt>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalStarActuation {
+	plan: ScopedExecutionPlan,
+	receipt: StarOrderRenderReceipt,
+}
+
+#[derive(Debug, Clone)]
+enum LocalStarActuationAttempt {
+	Actuated(LocalStarActuation),
+	Declined(StarOrderDeclineReason),
+}
+
+#[derive(Debug, Clone)]
+struct StarDimensionJoinEdge {
+	left_resolved_keys: Vec<ResolvedJoinKey>,
+	right_resolved_keys: Vec<ResolvedJoinKey>,
+	left_label: Option<String>,
+	right_label: Option<String>,
+}
+
+fn star_output_segments(
+	probe_label: &str,
+	probe_plan: &ScopedExecutionPlan,
+	dimensions: &[BoundStarDimension<'_>],
+) -> Vec<StarOutputSegment> {
+	let mut segments = Vec::with_capacity(dimensions.len() + 1);
+	segments.push(StarOutputSegment {
+		label: probe_label.to_string(),
+		width: probe_plan.schema().fields().len(),
+	});
+	segments.extend(dimensions.iter().map(|dimension| StarOutputSegment {
+		label: dimension.label.clone(),
+		width: dimension.plan.schema().fields().len(),
+	}));
+	segments
+}
+
+fn star_output_segments_for_order(
+	probe_label: &str,
+	probe_plan: &ScopedExecutionPlan,
+	dimensions: &[BoundStarDimension<'_>],
+	order: &[usize],
+) -> Vec<StarOutputSegment> {
+	let mut segments = Vec::with_capacity(order.len() + 1);
+	segments.push(StarOutputSegment {
+		label: probe_label.to_string(),
+		width: probe_plan.schema().fields().len(),
+	});
+	segments.extend(order.iter().map(|idx| {
+		let dimension = &dimensions[*idx];
+		StarOutputSegment {
+			label: dimension.label.clone(),
+			width: dimension.plan.schema().fields().len(),
+		}
+	}));
+	segments
+}
+
+impl<'a> Binder<'a> {
+	pub(super) async fn try_bind_star_order_actuation(
+		&self,
+		plan: &LogicalPlan,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<Option<ScopedExecutionPlan>, BindingError> {
+		let Some(candidate) = extract_star_join_candidate(plan) else {
+			return Ok(None);
+		};
+
+		let mut scratch_trace = trace.clone();
+		let mut scratch_render_trace = render_trace.clone();
+		let probe_plan = self
+			.bind_plan_with_trace(
+				candidate.probe,
+				&mut scratch_trace,
+				&mut scratch_render_trace,
+				JoinOrderSourceCapture::On,
+			)
+			.await?;
+		let Some(probe_label) = probe_plan.scope.unique_source_label() else {
+			self.record_star_order_decline(
+				render_trace,
+				StarOrderDeclineReason::MissingRelationLabel,
+				candidate.dimensions.len(),
+			);
+			return Ok(None);
+		};
+		if !broadcast_probe_is_scan_linear(&probe_plan.plan) {
+			self.record_star_order_decline(
+				render_trace,
+				StarOrderDeclineReason::ProbeNotScanLinear,
+				candidate.dimensions.len(),
+			);
+			return Ok(None);
+		}
+
+		let mut dimension_inputs = Vec::with_capacity(candidate.dimensions.len());
+		for dimension in &candidate.dimensions {
+			let dimension_plan = self
+				.bind_plan_with_trace(
+					dimension.input,
+					&mut scratch_trace,
+					&mut scratch_render_trace,
+					JoinOrderSourceCapture::On,
+				)
+				.await?;
+			dimension_inputs.push(dimension_plan);
+		}
+
+		let Some(tree) = self.classify_snowflake_star_tree(
+			&probe_plan,
+			&probe_label,
+			&candidate.dimensions,
+			&dimension_inputs,
+			render_trace,
+		)?
+		else {
+			return Ok(None);
+		};
+		if tree.root_children.len() < 2 {
+			self.record_star_order_decline(
+				render_trace,
+				StarOrderDeclineReason::MissingRelationLabel,
+				candidate.dimensions.len(),
+			);
+			return Ok(None);
+		}
+
+		let force_hash_root = tree.has_branch_dimensions();
+		let Some((scratch_root_dimensions, _scratch_branch_receipts)) = self
+			.bind_snowflake_root_dimensions(
+				&probe_plan,
+				&probe_label,
+				&tree,
+				&mut scratch_trace,
+				&mut scratch_render_trace,
+				&dimension_inputs,
+			)?
+		else {
+			if !force_hash_root {
+				self.record_star_order_decline(
+					render_trace,
+					StarOrderDeclineReason::MissingEstimate,
+					candidate.dimensions.len(),
+				);
+			}
+			return Ok(None);
+		};
+		let scratch_root_attempt = self.bind_local_star_actuation(
+			probe_plan.clone(),
+			probe_label.clone(),
+			&scratch_root_dimensions,
+			force_hash_root,
+			candidate.dimensions.len(),
+			&mut scratch_trace,
+			&mut scratch_render_trace,
+		)?;
+		if let LocalStarActuationAttempt::Declined(reason) = scratch_root_attempt {
+			if !force_hash_root {
+				self.record_star_order_decline(render_trace, reason, candidate.dimensions.len());
+			}
+			return Ok(None);
+		}
+
+		let real_probe_plan = self
+			.bind_plan_with_trace(
+				candidate.probe,
+				trace,
+				render_trace,
+				JoinOrderSourceCapture::On,
+			)
+			.await?;
+		let mut real_dimension_inputs = Vec::with_capacity(candidate.dimensions.len());
+		for dimension in &candidate.dimensions {
+			let plan = self
+				.bind_plan_with_trace(
+					dimension.input,
+					trace,
+					render_trace,
+					JoinOrderSourceCapture::On,
+				)
+				.await?;
+			real_dimension_inputs.push(plan);
+		}
+
+		let Some((real_root_dimensions, branch_receipts)) = self.bind_snowflake_root_dimensions(
+			&real_probe_plan,
+			&probe_label,
+			&tree,
+			trace,
+			render_trace,
+			&real_dimension_inputs,
+		)?
+		else {
+			return Ok(None);
+		};
+		let real_root_attempt = self.bind_local_star_actuation(
+			real_probe_plan,
+			probe_label,
+			&real_root_dimensions,
+			force_hash_root,
+			candidate.dimensions.len(),
+			trace,
+			render_trace,
+		)?;
+		let LocalStarActuationAttempt::Actuated(real_root) = real_root_attempt else {
+			return Ok(None);
+		};
+
+		if let Some(render_trace) = render_trace.as_mut() {
+			let mut receipts = Vec::with_capacity(branch_receipts.len() + 1);
+			receipts.push(real_root.receipt.clone());
+			receipts.extend(branch_receipts);
+			render_trace.set_star_receipts(receipts);
+		}
+		Ok(Some(real_root.plan))
+	}
+
+	fn classify_snowflake_star_tree<'b>(
+		&self,
+		probe_plan: &ScopedExecutionPlan,
+		probe_label: &str,
+		candidate_dimensions: &[StarJoinDimension<'b>],
+		dimension_inputs: &[ScopedExecutionPlan],
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<Option<SnowflakeStarTree<'b>>, BindingError> {
+		let mut root_children = Vec::new();
+		let mut nodes = Vec::<SnowflakeStarNode<'b>>::with_capacity(candidate_dimensions.len());
+		let mut seen_labels = BTreeSet::new();
+		for (dimension_index, dimension) in candidate_dimensions.iter().enumerate() {
+			let dimension_plan = &dimension_inputs[dimension_index];
+			let mut matched_parent = None;
+			if let Some(edge) =
+				self.try_resolve_star_dimension_edge(probe_plan, dimension_plan, dimension.on)?
+			{
+				if edge.left_label.as_deref() == Some(probe_label) {
+					let Some(dimension_label) = edge.right_label else {
+						self.record_star_order_decline(
+							render_trace,
+							StarOrderDeclineReason::MissingRelationLabel,
+							candidate_dimensions.len(),
+						);
+						return Ok(None);
+					};
+					matched_parent = Some((None, dimension_label));
+				}
+			}
+
+			if matched_parent.is_none() {
+				for (parent_index, parent_node) in nodes.iter().enumerate() {
+					let parent_plan = &dimension_inputs[parent_node.dimension_index];
+					let Some(edge) = self.try_resolve_star_dimension_edge(
+						parent_plan,
+						dimension_plan,
+						dimension.on,
+					)?
+					else {
+						continue;
+					};
+					if edge.left_label.as_deref() != Some(parent_node.label.as_str()) {
+						continue;
+					}
+					let Some(dimension_label) = edge.right_label else {
+						self.record_star_order_decline(
+							render_trace,
+							StarOrderDeclineReason::MissingRelationLabel,
+							candidate_dimensions.len(),
+						);
+						return Ok(None);
+					};
+					matched_parent = Some((Some(parent_index), dimension_label));
+					break;
+				}
+			}
+
+			let Some((parent_index, dimension_label)) = matched_parent else {
+				self.record_star_order_decline(
+					render_trace,
+					StarOrderDeclineReason::MissingRelationLabel,
+					candidate_dimensions.len(),
+				);
+				return Ok(None);
+			};
+			if !seen_labels.insert(dimension_label.clone()) {
+				self.record_star_order_decline(
+					render_trace,
+					StarOrderDeclineReason::DuplicateDimension,
+					candidate_dimensions.len(),
+				);
+				return Ok(None);
+			}
+			let node_index = nodes.len();
+			nodes.push(SnowflakeStarNode {
+				dimension_index,
+				children: Vec::new(),
+				on: dimension.on,
+				strategy_intent: dimension.strategy_intent,
+				label: dimension_label,
+				declared_position: dimension.declared_position,
+			});
+			if let Some(parent_index) = parent_index {
+				nodes[parent_index].children.push(node_index);
+			} else {
+				root_children.push(node_index);
+			}
+		}
+
+		Ok(Some(SnowflakeStarTree {
+			root_children,
+			nodes,
+		}))
+	}
+
+	fn bind_snowflake_root_dimensions<'b>(
+		&self,
+		probe_plan: &ScopedExecutionPlan,
+		probe_label: &str,
+		tree: &SnowflakeStarTree<'b>,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+		bound_inputs: &[ScopedExecutionPlan],
+	) -> Result<Option<(Vec<BoundStarDimension<'b>>, Vec<StarOrderRenderReceipt>)>, BindingError> {
+		let mut dimensions = Vec::with_capacity(tree.root_children.len());
+		let mut receipts = Vec::new();
+		for node_index in &tree.root_children {
+			let built = self.bind_snowflake_dimension(
+				*node_index,
+				tree,
+				trace,
+				render_trace,
+				bound_inputs,
+			)?;
+			receipts.extend(built.receipts);
+			let Some(dimension) =
+				self.bound_star_dimension(probe_plan, probe_label, &built.dimension)?
+			else {
+				return Ok(None);
+			};
+			dimensions.push(dimension);
+		}
+		Ok(Some((dimensions, receipts)))
+	}
+
+	fn bind_snowflake_dimension<'b>(
+		&self,
+		node_index: usize,
+		tree: &SnowflakeStarTree<'b>,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+		bound_inputs: &[ScopedExecutionPlan],
+	) -> Result<BuiltSnowflakeDimension<'b>, BindingError> {
+		let node = &tree.nodes[node_index];
+		let base_plan = bound_inputs[node.dimension_index].clone();
+		let mut child_dimensions = Vec::with_capacity(node.children.len());
+		let mut receipts = Vec::new();
+		for child_index in &node.children {
+			let child = self.bind_snowflake_dimension(
+				*child_index,
+				tree,
+				trace,
+				render_trace,
+				bound_inputs,
+			)?;
+			receipts.extend(child.receipts);
+			child_dimensions.push(child.dimension);
+		}
+
+		let plan = if child_dimensions.len() >= 2 {
+			let mut bound_children = Vec::with_capacity(child_dimensions.len());
+			let mut complete = true;
+			for child in &child_dimensions {
+				if let Some(bound_child) =
+					self.bound_star_dimension(&base_plan, &node.label, child)?
+				{
+					bound_children.push(bound_child);
+				} else {
+					complete = false;
+					break;
+				}
+			}
+			if complete {
+				match self.bind_local_star_actuation(
+					base_plan.clone(),
+					node.label.clone(),
+					&bound_children,
+					true,
+					child_dimensions.len(),
+					trace,
+					render_trace,
+				)? {
+					LocalStarActuationAttempt::Actuated(local) => {
+						receipts.push(local.receipt);
+						local.plan
+					}
+					LocalStarActuationAttempt::Declined(_) => self.bind_declared_star_children(
+						base_plan,
+						&child_dimensions,
+						trace,
+						render_trace,
+					)?,
+				}
+			} else {
+				self.bind_declared_star_children(base_plan, &child_dimensions, trace, render_trace)?
+			}
+		} else if child_dimensions.is_empty() {
+			base_plan
+		} else {
+			self.bind_declared_star_children(base_plan, &child_dimensions, trace, render_trace)?
+		};
+
+		Ok(BuiltSnowflakeDimension {
+			dimension: StarChildDimension {
+				plan,
+				on: node.on,
+				strategy_intent: node.strategy_intent,
+				label: node.label.clone(),
+				declared_position: node.declared_position,
+			},
+			receipts,
+		})
+	}
+
+	fn bind_declared_star_children<'b>(
+		&self,
+		base_plan: ScopedExecutionPlan,
+		dimensions: &[StarChildDimension<'b>],
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		let mut current = base_plan;
+		for dimension in dimensions {
+			current = self.bind_scoped_join(
+				current,
+				dimension.plan.clone(),
+				JoinKind::Inner,
+				dimension.on,
+				dimension.strategy_intent,
+				trace,
+				render_trace,
+				dimension.declared_position,
+			)?;
+		}
+		Ok(current)
+	}
+
+	fn bound_star_dimension<'b>(
+		&self,
+		probe_plan: &ScopedExecutionPlan,
+		probe_label: &str,
+		dimension: &StarChildDimension<'b>,
+	) -> Result<Option<BoundStarDimension<'b>>, BindingError> {
+		let Some(edge) =
+			self.try_resolve_star_dimension_edge(probe_plan, &dimension.plan, dimension.on)?
+		else {
+			return Ok(None);
+		};
+		if edge.left_label.as_deref() != Some(probe_label)
+			|| edge.right_label.as_deref() != Some(dimension.label.as_str())
+		{
+			return Ok(None);
+		}
+		let join_estimated_row_count = Self::join_estimated_row_count_for_keys(
+			JoinKind::Inner,
+			probe_plan,
+			&dimension.plan,
+			&edge.left_resolved_keys,
+			&edge.right_resolved_keys,
+		);
+		let (estimated_rows, estimate_source) = join_order_edge_estimate(
+			probe_plan.join_order_sources.as_ref(),
+			dimension.plan.join_order_sources.as_ref(),
+			Some(probe_label),
+			Some(dimension.label.as_str()),
+			&edge.left_resolved_keys,
+			&edge.right_resolved_keys,
+			join_estimated_row_count,
+		);
+		let Some(estimated_rows) = estimated_rows else {
+			return Ok(None);
+		};
+		let confidence = join_order_estimate_confidence(
+			probe_plan.join_order_sources.as_ref(),
+			dimension.plan.join_order_sources.as_ref(),
+			Some(probe_label),
+			Some(dimension.label.as_str()),
+			&edge.left_resolved_keys,
+			&edge.right_resolved_keys,
+		);
+		Ok(Some(BoundStarDimension {
+			plan: dimension.plan.clone(),
+			on: dimension.on,
+			strategy_intent: dimension.strategy_intent,
+			label: dimension.label.clone(),
+			evidence: JoinOrderDimEvidence {
+				dimension: dimension.label.clone(),
+				declared_position: dimension.declared_position,
+				estimated_rows,
+				estimate_source,
+				confidence,
+			},
+		}))
+	}
+
+	fn bind_local_star_actuation<'b>(
+		&self,
+		probe_plan: ScopedExecutionPlan,
+		probe_label: String,
+		dimensions: &[BoundStarDimension<'b>],
+		force_hash: bool,
+		edge_count: usize,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<LocalStarActuationAttempt, BindingError> {
+		let evidence_dimensions = dimensions
+			.iter()
+			.map(|dimension| dimension.evidence.clone())
+			.collect::<Vec<_>>();
+		let confidence = join_order_overall_confidence(&evidence_dimensions);
+		let recognized = recognized_star_order_outcome(
+			probe_label.clone(),
+			evidence_dimensions.clone(),
+			None,
+			StarOrderStrategy::Broadcast,
+			confidence,
+		);
+		let StarOrderOutcome::Recognized(evidence) = &recognized else {
+			unreachable!("recognized_star_order_outcome always recognizes");
+		};
+		let mut preferred_indices = (0..dimensions.len()).collect::<Vec<_>>();
+		preferred_indices.sort_by(|left, right| {
+			dimensions[*left]
+				.evidence
+				.estimated_rows
+				.cmp(&dimensions[*right].evidence.estimated_rows)
+				.then(
+					dimensions[*left]
+						.evidence
+						.declared_position
+						.cmp(&dimensions[*right].evidence.declared_position),
+				)
+		});
+		let declared_indices = (0..dimensions.len()).collect::<Vec<_>>();
+		let selected_indices = if evidence.action == StarOrderAction::Reordered {
+			preferred_indices
+		} else {
+			declared_indices.clone()
+		};
+
+		let Some(declared_strategy) = self.preflight_star_order_strategy(
+			probe_plan.clone(),
+			dimensions,
+			&declared_indices,
+			trace,
+		)?
+		else {
+			return Ok(LocalStarActuationAttempt::Declined(
+				StarOrderDeclineReason::MixedStrategyStar,
+			));
+		};
+		let Some(selected_strategy) = self.preflight_star_order_strategy(
+			probe_plan.clone(),
+			dimensions,
+			&selected_indices,
+			trace,
+		)?
+		else {
+			return Ok(LocalStarActuationAttempt::Declined(
+				StarOrderDeclineReason::MixedStrategyStar,
+			));
+		};
+		if declared_strategy != selected_strategy {
+			return Ok(LocalStarActuationAttempt::Declined(
+				StarOrderDeclineReason::MixedStrategyStar,
+			));
+		}
+		if force_hash && selected_strategy != StarOrderStrategy::HashPartitioned {
+			return Ok(LocalStarActuationAttempt::Declined(
+				StarOrderDeclineReason::MixedStrategyStar,
+			));
+		}
+
+		let declared_segments = star_output_segments(&probe_label, &probe_plan, dimensions);
+		let mut declared_output_schema = probe_plan.schema();
+		let mut declared_scope = probe_plan.scope.clone();
+		for dimension in dimensions {
+			declared_output_schema = join_schema(
+				JoinKind::Inner,
+				&declared_output_schema,
+				&dimension.plan.schema(),
+			);
+			declared_scope = RelationScope::join(
+				JoinKind::Inner,
+				&declared_scope,
+				&dimension.plan.scope,
+				&declared_output_schema,
+			);
+		}
+		let applied_order = selected_indices
+			.iter()
+			.map(|idx| dimensions[*idx].label.clone())
+			.collect::<Vec<_>>();
+		let physical_segments = star_output_segments_for_order(
+			&probe_label,
+			&probe_plan,
+			dimensions,
+			&selected_indices,
+		);
+		let local_edge_start = render_trace
+			.as_ref()
+			.map(|trace| trace.join_order_edges.len())
+			.unwrap_or(0);
+		let mut output = self.bind_star_order_sequence(
+			probe_plan,
+			dimensions,
+			&selected_indices,
+			trace,
+			render_trace,
+		)?;
+		if evidence.action == StarOrderAction::Reordered {
+			let physical_output_schema = output.schema();
+			output.plan = restore_declared_star_order_project(
+				output.plan,
+				&physical_output_schema,
+				declared_output_schema,
+				&physical_segments,
+				&declared_segments,
+			)?;
+			output.scope = declared_scope;
+		}
+
+		let outcome = recognized_star_order_outcome(
+			probe_label.clone(),
+			evidence_dimensions,
+			Some(applied_order),
+			selected_strategy,
+			confidence,
+		);
+		let edge_targets = render_trace
+			.as_ref()
+			.map(|trace| {
+				trace.join_order_edges[local_edge_start..]
+					.iter()
+					.map(|edge| edge.target)
+					.collect::<Vec<_>>()
+			})
+			.unwrap_or_else(|| {
+				(0..edge_count)
+					.map(|join_index| JoinTraceTarget { join_index })
+					.collect::<Vec<_>>()
+			});
+		Ok(LocalStarActuationAttempt::Actuated(LocalStarActuation {
+			plan: output,
+			receipt: StarOrderRenderReceipt {
+				probe_label,
+				outcome,
+				edge_targets,
+			},
+		}))
+	}
+
+	fn try_resolve_star_dimension_edge(
+		&self,
+		left_plan: &ScopedExecutionPlan,
+		right_plan: &ScopedExecutionPlan,
+		on: &[(Expr, Expr)],
+	) -> Result<Option<StarDimensionJoinEdge>, BindingError> {
+		let mut left_resolved_keys = Vec::new();
+		let mut right_resolved_keys = Vec::new();
+		for (left_expr, right_expr) in on {
+			let Ok((left_key, right_key)) =
+				bind_join_key_pair(left_expr, right_expr, &left_plan.scope, &right_plan.scope)
+			else {
+				return Ok(None);
+			};
+			validate_join_key_types(&left_key, &right_key)?;
+			left_resolved_keys.push(left_key);
+			right_resolved_keys.push(right_key);
+		}
+		let left_label = relation_label_for_join_keys(&left_plan.scope, &left_resolved_keys);
+		let right_label = relation_label_for_join_keys(&right_plan.scope, &right_resolved_keys);
+		Ok(Some(StarDimensionJoinEdge {
+			left_resolved_keys,
+			right_resolved_keys,
+			left_label,
+			right_label,
+		}))
+	}
+	fn preflight_star_order_strategy<'b>(
+		&self,
+		probe_plan: ScopedExecutionPlan,
+		dimensions: &[BoundStarDimension<'b>],
+		order: &[usize],
+		base_trace: &OptimizerTrace,
+	) -> Result<Option<StarOrderStrategy>, BindingError> {
+		let mut preflight_trace = base_trace.clone();
+		let preflight_join_start = preflight_trace.join_decisions.len();
+		let mut no_render_trace = None;
+		let _ = self.bind_star_order_sequence(
+			probe_plan,
+			dimensions,
+			order,
+			&mut preflight_trace,
+			&mut no_render_trace,
+		)?;
+		let preflight_decisions = &preflight_trace.join_decisions[preflight_join_start..];
+		if preflight_decisions.len() != order.len() {
+			return Ok(None);
+		}
+		Ok(uniform_star_order_strategy(preflight_decisions))
+	}
+
+	fn bind_star_order_sequence<'b>(
+		&self,
+		probe_plan: ScopedExecutionPlan,
+		dimensions: &[BoundStarDimension<'b>],
+		order: &[usize],
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		let mut current = probe_plan;
+		for idx in order {
+			let dimension = &dimensions[*idx];
+			current = self.bind_scoped_join(
+				current,
+				dimension.plan.clone(),
+				JoinKind::Inner,
+				dimension.on,
+				dimension.strategy_intent,
+				trace,
+				render_trace,
+				dimension.evidence.declared_position,
+			)?;
+		}
+		Ok(current)
+	}
+
+	fn record_star_order_decline(
+		&self,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+		reason: StarOrderDeclineReason,
+		edge_count: usize,
+	) {
+		if let Some(render_trace) = render_trace.as_mut() {
+			let outcome = StarOrderOutcome::Declined(StarOrderDecline { reason, edge_count });
+			render_trace.set_star_receipt(StarOrderRenderReceipt {
+				probe_label: star_order_probe_label(&outcome),
+				outcome,
+				edge_targets: Vec::new(),
+			});
+		}
+	}
+}

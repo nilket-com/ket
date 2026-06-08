@@ -127,56 +127,56 @@ storage, Wendelon, catalog, cost model, optimizer shell, memo, Cascades, or broa
 
 ## Headline Gates
 
-- `recursive_hash_snowflake_actuates_root_and_bushy_branch` - a snowflake with
-  `orders -> {customers -> {regions, segments}, stores}` has robust wins at branch and root;
-  both levels reorder and emit separate `join_order` rows.
-- `recursive_hash_snowflake_nested_restores_preserve_results` - the recursively actuated query
-  returns the declared schema, declared column order, and ordered row output matching the
-  declared-order baseline.
-- `recursive_branch_receipts_are_edge_owned` - root and branch `EXPLAIN ANALYZE` rows spend
-  disjoint replay IDs from their own `edge_targets`; no branch edge appears in the root
-  verdict and no root edge appears in the branch verdict.
-- `root_decline_keeps_observed_snowflake_state` - with a broadcast/mixed/missing-estimate root,
-  branch recursion is discarded and the output remains the 182-184 `join_order_snowflake*`
-  family.
-- `join_order_render_state_excludes_star_plus_observed_snowflake` - impossible-state proof:
-  no trace can carry both star receipts and observed snowflake evidence.
+- `hash_snowflake_branch_emits_edge_owned_star_receipt` - a snowflake with
+  `orders -> {customers -> {regions, segments}, stores}` reorders both the bushy `customers`
+  branch and the root, emitting two edge-owned `StarReceipts` with disjoint `edge_targets`
+  (branch `[0,1]` bound bottom-up, root `[2,3]`) and applied orders `[g,r]` / `[s,c]` — the
+  edge-ownership and bottom-up recursion proof.
+- `hash_snowflake_reorder_is_results_identical` - the recursively actuated bushy snowflake
+  (`non_optimal_snowflake_order_project_sql`) returns the declared schema/column order and the
+  same row multiset as the declared-order baseline, executed via `execute_hash_join` — the
+  composed-restore correctness hinge.
+- `root_decline_keeps_observed_snowflake_state` - a mixed/broadcast root discards the bushy
+  `customers` branch receipts with the root and falls back to the 182-184 `ObservedSnowflake`
+  path (no committed `StarReceipts`).
 
 ## Supporting Gates
 
-- `chain_snowflake_emits_single_root_receipt` - a one-child branch has no local star receipt;
-  185 behavior is preserved.
-- `branch_decline_keeps_branch_declared_but_root_can_actuate` - a committed hash root can still
-  act when one bushy branch locally declines and binds declared.
-- `flat_star_receipt_shape_is_byte_identical` - flat-star explain output remains one
-  `join_order` row with the same target/outcome/detail.
-- `hash_snowflake_root_receipt_shape_is_byte_identical` - 185's one-level root actuation stays
-  one `join_order` row with no observed snowflake rows.
-- `declined_snowflake_observational_suite_stays_green` - 182-184 observe-only snowflake tests
-  remain byte-identical when the root declines.
-- `rune_recursive_hash_snowflake_reorders_same_as_sql` - Rune receives the same recursive
-  actuation and receipt rows through the shared binder/explain path.
+- `deep_snowflake_actuates_root_and_keeps_unary_branches_receiptless` - a chain snowflake
+  (one-child branches) actuates only the root; unary branches emit no local receipt (185
+  behavior preserved).
+- the 177-181 `star_order` suite stays green: a flat star remains one `StarReceipts` entry with
+  byte-identical target/outcome/detail.
+- the 185 `hash_snowflake` suite stays green: one-level root actuation stays one receipt with no
+  observed-snowflake rows.
+- the 182-184 `snowflake` observational suite stays green when the root declines.
+- `rune_hash_snowflake_root_reorders_same_as_sql` - Rune shares the binder/explain receipt path
+  (recursive-specific Rune coverage deferred; the shared path is exercised by the SQL gates).
 
 ## Architecture Guards
 
-- `adr186_join_order_render_state_is_exclusive` - render trace has one enum state, not
-  independent star and snowflake options.
-- `adr186_star_receipts_are_plural_and_edge_owned` - receipts are a `Vec` and carry
-  `Vec<JoinTraceTarget>`.
-- `adr186_local_star_actuator_reuses_181_machinery` - the helper calls the existing strategy
-  preflight, sequence binder, and declared-order restore; no snowflake-specific reorder/restore.
-- `adr186_analyze_spends_only_receipt_owned_edges` - star runtime/verdict rendering filters by
-  receipt-owned targets rather than all global edges.
-- `adr186_restores_compose_without_nested_helper` - no `restore_declared_snowflake_order_project`
-  or nested restore function exists.
-- `adr186_branch_recursion_uses_private_helpers_not_synthesized_top_level_binder` - recursive
-  branch building does not pass synthesized branch `LogicalPlan::Join`s through
-  `bind_plan_with_trace`.
-- `adr186_hash_only_no_broadcast_fragment_change` - no `rewrite_broadcast_star_probe`,
-  executor, fragment, PBC, storage, Wendelon, or cost-model change.
-- `adr186_no_optimizer_shell_or_planproperties_contract` - the 177/185 no-shell invariant
-  still holds.
-- `adr186_cockpit_is_frontend_shared` - SQL and Rune share the explain/analyze render path.
+The four shipped guards consolidate the planned set:
+
+- `adr186_join_order_render_state_is_exclusive` - the render trace carries one
+  `JoinOrderRenderState` (`None` / `StarReceipts` / `ObservedSnowflake`); star receipts and
+  observed-snowflake evidence cannot coexist (subsumes the impossible-state proof).
+- `adr186_recursive_branch_actuation_is_bottom_up_and_edge_owned` - branches actuate bottom-up
+  and each `StarOrderRenderReceipt` is plural and owns its `Vec<JoinTraceTarget>`; runtime/verdict
+  rendering spends only receipt-owned edges, not all global edges (subsumes
+  star-receipts-are-plural-and-edge-owned + analyze-spends-only-owned-edges).
+- `adr186_root_hash_gate_commits_or_discards_branch_receipts` - a recognized hash root commits
+  root + branch receipts; a declining root discards branch receipts and returns to the
+  observe-only path (D6 atomicity).
+- `adr186_branch_helpers_do_not_rebind_synthesized_logical_joins` - recursive branch building
+  uses private local-star helpers over already-bound inputs (reusing the 181 strategy preflight,
+  sequence binder, and declared-order restore — no nested-restore helper), not synthesized
+  `LogicalPlan::Join`s through `bind_plan_with_trace` (subsumes local-actuator-reuses-181,
+  restores-compose-without-nested-helper, and private-helpers-not-synthesized-binder).
+
+D10's binder/explain-only scope (no executor / `fragment.rs` / `rewrite_broadcast_star_probe` /
+cost-model / Wendelon / optimizer-shell change) is enforced by the cut touching only
+`binder.rs`, `binder/explain.rs`, `binder/join_order.rs`, and tests — verifiable in the staged
+diff — rather than a dedicated `adr186_` no-change guard.
 
 ## Rejected Alternatives
 
