@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use crate::date32::parse_date_ymd;
 use arrow::array::{Array, BooleanArray};
@@ -89,11 +90,14 @@ const INFORMATION_SCHEMA_TABLES: &str = "information_schema.tables";
 const INFORMATION_SCHEMA_COLUMNS: &str = "information_schema.columns";
 const INFORMATION_SCHEMA_SCHEMATA: &str = "information_schema.schemata";
 const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS: &str = "information_schema.optimizer_decisions";
+const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS: &str =
+	"information_schema.optimizer_runtime_verdicts";
 const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
 const INFORMATION_SCHEMA_TABLES_TABLE: &str = "tables";
 const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = "columns";
 const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
 const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS_TABLE: &str = "optimizer_decisions";
+const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE: &str = "optimizer_runtime_verdicts";
 const ARROW_BUFFER_ALIGNMENT_BYTES: u64 = 64;
 const DEFAULT_UTF8_BINARY_PAYLOAD_BYTES: u64 = 256;
 const DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES: u64 = 1024;
@@ -106,6 +110,8 @@ pub struct PlannerConfig {
 	pub force_hash_join_ids: BTreeSet<JoinReplayId>,
 	pub session_timezone: String,
 	pub decision_log: Arc<OptimizerDecisionLog>,
+	pub measured_accrual_sample_rate: u32,
+	pub measured_accrual_counter: Arc<AtomicU64>,
 }
 
 impl Default for PlannerConfig {
@@ -116,6 +122,8 @@ impl Default for PlannerConfig {
 			force_hash_join_ids: BTreeSet::new(),
 			session_timezone: "UTC".to_string(),
 			decision_log: Arc::new(OptimizerDecisionLog::default()),
+			measured_accrual_sample_rate: 0,
+			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
 		}
 	}
 }
@@ -233,6 +241,13 @@ pub(crate) fn render_explain_analyze(
 	observations: &[JoinRuntimeObservation],
 ) -> Result<ExecutionPlan, BindingError> {
 	optimizer_analyze_plan(binding.trace, binding.render_trace, observations)
+}
+
+pub(crate) fn measured_explain_analyze_verdicts(
+	binding: &ExplainAnalyzeBinding,
+	observations: &[JoinRuntimeObservation],
+) -> Result<Vec<MeasuredLevelVerdict>, BindingError> {
+	measured_verdicts(&binding.render_trace, observations)
 }
 
 // Join-order EXPLAIN ANALYZE evidence uses the same replay-id capture for flat stars and
@@ -1706,9 +1721,22 @@ impl<'a> Binder<'a> {
 				projection,
 			);
 		}
+		if table
+			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE)
+		{
+			return system_table_plan(
+				SystemTableKind::InformationSchemaOptimizerRuntimeVerdicts,
+				information_schema_optimizer_runtime_verdicts_schema(),
+				information_schema_optimizer_runtime_verdict_rows(
+					&self.config.decision_log.verdict_snapshot(),
+				)?,
+				projection,
+			);
+		}
 		Err(BindingError::UnsupportedExpression {
 			message: format!(
-				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}",
+				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}",
 				table_name(table)
 			),
 		})

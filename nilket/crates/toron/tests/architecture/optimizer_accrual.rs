@@ -205,3 +205,185 @@ pub(crate) fn adr187_no_optimizer_shell_or_planproperties_contract() {
 		format_offenders(&manifest, &offenders)
 	);
 }
+
+#[test]
+pub(crate) fn adr188_measured_accrual_reuses_capture_and_verdict() {
+	let binder = binder_root_source();
+	let coordinator = source("src/coordinator.rs");
+	let explain = source("src/binder/explain.rs");
+	let task = source("src/distributed/task.rs");
+	let sampled = first_block(&coordinator, "async fn run_streaming_read_driver");
+	let measured = first_block(&explain, "pub(crate) fn measured_verdicts");
+
+	assert!(task.contains("MeasureJoins"));
+	assert!(binder.contains("pub(crate) async fn bind_explain_analyze"));
+	assert!(binder.contains("pub(crate) fn measured_explain_analyze_verdicts"));
+	assert!(sampled.contains("bind_explain_analyze"));
+	assert!(sampled.contains("analyze_observation_mode"));
+	assert!(sampled.contains("measured_explain_analyze_verdicts"));
+	assert!(measured.contains("measured_verdicts_from_summaries"));
+	assert!(explain.contains("measured_star_order_verdict"));
+	assert!(explain.contains("measured_snowflake_order_verdict"));
+	assert!(!task.contains("AlwaysMeasure"));
+	assert!(!explain.contains("fn measured_runtime_verdict_classifier"));
+}
+
+#[test]
+pub(crate) fn adr188_no_executor_capture_change() {
+	let exec = source("src/exec.rs");
+	let fragment = source("src/distributed/fragment.rs");
+	let task = source("src/distributed/task.rs");
+	let mode = first_block(&task, "pub enum JoinRuntimeObservationMode");
+
+	assert!(mode.contains("Disabled"));
+	assert!(mode.contains("MeasureJoins"));
+	assert!(!mode.contains("RuntimeVerdict"));
+	assert!(!exec.contains("OptimizerRuntimeVerdict"));
+	assert!(!exec.contains("record_verdict"));
+	assert!(!fragment.contains("OptimizerRuntimeVerdict"));
+	assert!(!fragment.contains("record_verdict"));
+}
+
+#[test]
+pub(crate) fn adr188_sampled_path_returns_user_data() {
+	let coordinator = source("src/coordinator.rs");
+	let streaming = first_block(&coordinator, "async fn run_streaming_read_driver");
+	let local = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
+		.into_iter()
+		.map(|(_, block)| block)
+		.find(|block| block.contains("self.executor.execute_bound"))
+		.expect("local QueryCoordinator execute_query block");
+
+	assert!(streaming.contains("with_final_result_sender"));
+	assert!(streaming.contains("record_verdict"));
+	assert!(streaming.contains("return Ok(())"));
+	assert!(!streaming.contains("render_explain_analyze"));
+	assert!(!streaming.contains("materialize_system_table_plan"));
+	assert!(local.contains("record_verdict"));
+	assert!(local.contains("return Ok(results)"));
+	assert!(!local.contains("render_explain_analyze"));
+	assert!(!local.contains("materialize_system_table_plan"));
+}
+
+#[test]
+pub(crate) fn adr188_measured_accrual_is_side_effect_only() {
+	let binder = binder_root_source();
+	let coordinator = source("src/coordinator.rs");
+	let decision_log = source("src/binder/decision_log.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let selectivity = source("src/binder/selectivity.rs");
+	let pushdown = source("src/binder/pushdown.rs");
+	let fragment = source("src/distributed/fragment.rs");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+
+	assert!(decision_log.contains("pub(crate) fn record_verdict"));
+	assert!(decision_log.contains("pub(crate) fn verdict_snapshot"));
+	assert!(coordinator.contains(".record_verdict("));
+	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
+	for (name, source) in [
+		("join_order", join_order.as_str()),
+		("selectivity", selectivity.as_str()),
+		("pushdown", pushdown.as_str()),
+		("fragment", fragment.as_str()),
+	] {
+		assert!(
+			!source.contains("verdict_snapshot()"),
+			"{name} reads runtime verdict accrual during planning"
+		);
+		assert!(
+			!source.contains("record_verdict"),
+			"{name} writes runtime verdict accrual outside execution"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr188_default_off_zero_overhead() {
+	let binder = binder_root_source();
+	let coordinator = source("src/coordinator.rs");
+	let config = first_block(&binder, "pub struct PlannerConfig");
+	let default = first_block(&binder, "impl Default for PlannerConfig");
+	let gate = first_block(&coordinator, "fn should_measure_runtime_verdict");
+	let streaming = first_block(&coordinator, "async fn run_streaming_read_driver");
+
+	assert!(config.contains("measured_accrual_sample_rate: u32"));
+	assert!(config.contains("measured_accrual_counter: Arc<AtomicU64>"));
+	assert!(default.contains("measured_accrual_sample_rate: 0"));
+	assert!(default.contains("measured_accrual_counter: Arc::new(AtomicU64::new(0))"));
+	assert!(gate.contains("if rate == 0"));
+	assert!(gate.contains("return false"));
+	assert!(gate.contains("fetch_add(1, Ordering::Relaxed).saturating_add(1)"));
+	assert!(streaming.contains("if measure_runtime_verdict"));
+	assert!(streaming.contains("None => bind(&plan"));
+}
+
+#[test]
+pub(crate) fn adr188_report_reuses_information_schema_path() {
+	let binder = binder_root_source();
+	let execution = source("src/ir/execution.rs");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+
+	assert!(binder.contains("INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE"));
+	assert!(execution.contains("InformationSchemaOptimizerRuntimeVerdicts"));
+	assert!(bind_relation.contains("INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE"));
+	assert!(bind_relation.contains("SystemTableKind::InformationSchemaOptimizerRuntimeVerdicts"));
+	assert!(bind_relation.contains("system_table_plan("));
+	assert!(bind_relation.contains("information_schema_optimizer_runtime_verdict_rows"));
+}
+
+#[test]
+pub(crate) fn adr188_no_storage_or_wendelon_change() {
+	let manifest = manifest_dir();
+	let markers = [
+		"OptimizerRuntimeVerdict",
+		"InformationSchemaOptimizerRuntimeVerdicts",
+		"optimizer_runtime_verdicts",
+		"measured_accrual_sample_rate",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR188 runtime verdict accrual leaked outside binder/coordinator/report surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr188_no_optimizer_shell_or_planproperties_contract() {
+	let manifest = manifest_dir();
+	assert!(!manifest.join("src/optimizer.rs").exists());
+	assert!(!manifest.join("src/optimizer").exists());
+
+	let offenders = source_lines(&manifest.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			let trimmed = line.trim_start();
+			trimmed.starts_with("struct Optimizer ")
+				|| trimmed.starts_with("pub struct Optimizer ")
+				|| trimmed.starts_with("enum Optimizer ")
+				|| trimmed.starts_with("pub enum Optimizer ")
+				|| line.contains("PlanProperties")
+				|| line.contains("Cascades")
+				|| trimmed.starts_with("struct Memo ")
+				|| trimmed.starts_with("pub struct Memo ")
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR188 introduced optimizer shell/property contract:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}

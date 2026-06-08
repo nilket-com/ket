@@ -3,6 +3,7 @@ use crate::catalog::{
 	DescriptorColumnNdvFact, DescriptorColumnRangeDistributionFact, DescriptorColumnRangeFact,
 	DescriptorOptimizerFacts, MockCatalog, RangeDistributionBucket, RangeFact, WendelonCatalog,
 };
+use crate::coordinator::QueryCoordinator;
 use crate::distributed::arrow_ipc::encode_record_batch;
 use crate::distributed::identity::QueryId;
 use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, SessionId, TableId};
@@ -9795,6 +9796,302 @@ async fn rune_queries_optimizer_decisions() {
 }
 
 #[tokio::test]
+async fn measured_verdicts_accrue_for_sampled_queries() {
+	let (catalog, storage) = star_order_execution_fixture().await;
+	let catalog = Arc::new(catalog);
+	let config = PlannerConfig {
+		measured_accrual_sample_rate: 1,
+		..auto_broadcast_config(1)
+	};
+
+	let (_schema, rows) = execute_star_order_query_with_coordinator(
+		catalog.clone(),
+		storage.clone(),
+		non_optimal_star_order_project_sql(),
+		config.clone(),
+	)
+	.await;
+	assert!(!rows.is_empty());
+	let verdict_rows = optimizer_runtime_verdict_rows(catalog.as_ref(), &config).await;
+	assert_eq!(
+		optimizer_runtime_verdict_count(&verdict_rows, "flat_star", "over_eager"),
+		1
+	);
+
+	let (_schema, rows) = execute_star_order_query_with_coordinator(
+		catalog.clone(),
+		storage,
+		preferred_star_order_project_sql(),
+		config.clone(),
+	)
+	.await;
+	assert!(!rows.is_empty());
+	let verdict_rows = optimizer_runtime_verdict_rows(catalog.as_ref(), &config).await;
+	assert_eq!(
+		optimizer_runtime_verdict_count(&verdict_rows, "flat_star", "vindicated"),
+		1
+	);
+}
+
+#[tokio::test]
+async fn measured_accrual_off_by_default_is_zero_overhead() {
+	let (catalog, storage) = star_order_execution_fixture().await;
+	let catalog = Arc::new(catalog);
+	let config = auto_broadcast_config(1);
+	let (expected_schema, expected_rows) = execute_star_order_query(
+		catalog.as_ref(),
+		storage.clone(),
+		non_optimal_star_order_project_sql(),
+		&config,
+	)
+	.await;
+	let (actual_schema, actual_rows) = execute_star_order_query_with_coordinator(
+		catalog.clone(),
+		storage,
+		non_optimal_star_order_project_sql(),
+		config.clone(),
+	)
+	.await;
+
+	assert_eq!(
+		schema_signature(&actual_schema),
+		schema_signature(&expected_schema)
+	);
+	assert_eq!(actual_rows, expected_rows);
+	assert!(
+		optimizer_runtime_verdict_rows(catalog.as_ref(), &config)
+			.await
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn sampled_query_returns_user_data_not_analyze_table() {
+	let (catalog, storage) = star_order_execution_fixture().await;
+	let catalog = Arc::new(catalog);
+	let expected_config = auto_broadcast_config(1);
+	let sampled_config = PlannerConfig {
+		measured_accrual_sample_rate: 1,
+		..auto_broadcast_config(1)
+	};
+	let (expected_schema, expected_rows) = execute_star_order_query(
+		catalog.as_ref(),
+		storage.clone(),
+		non_optimal_star_order_project_sql(),
+		&expected_config,
+	)
+	.await;
+	let (sampled_schema, sampled_rows) = execute_star_order_query_with_coordinator(
+		catalog,
+		storage,
+		non_optimal_star_order_project_sql(),
+		sampled_config,
+	)
+	.await;
+
+	assert_eq!(
+		schema_signature(&sampled_schema),
+		schema_signature(&expected_schema)
+	);
+	assert_eq!(sampled_rows, expected_rows);
+	assert_eq!(
+		field_names(&sampled_schema),
+		vec!["id", "id", "id", "id"],
+		"sampled query must return user rows, not optimizer analyze rows"
+	);
+}
+
+#[tokio::test]
+async fn measured_accrual_samples_every_nth_query() {
+	let (catalog, storage) = star_order_execution_fixture().await;
+	let catalog = Arc::new(catalog);
+	let config = PlannerConfig {
+		measured_accrual_sample_rate: 3,
+		..auto_broadcast_config(1)
+	};
+
+	for _ in 0..4 {
+		let (_schema, rows) = execute_star_order_query_with_coordinator(
+			catalog.clone(),
+			storage.clone(),
+			non_optimal_star_order_project_sql(),
+			config.clone(),
+		)
+		.await;
+		assert!(!rows.is_empty());
+	}
+
+	let verdict_rows = optimizer_runtime_verdict_rows(catalog.as_ref(), &config).await;
+	assert_eq!(
+		optimizer_runtime_verdict_count(&verdict_rows, "flat_star", "over_eager"),
+		1
+	);
+}
+
+#[tokio::test]
+async fn measured_verdict_reuses_180_184_computation() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let binding =
+		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind star analyze");
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::Broadcast,
+			build_rows: RowCount::new(4),
+			probe_rows: RowCount::new(4),
+			output_rows: RowCount::new(4),
+		})
+		.collect::<Vec<_>>();
+
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure verdicts");
+	let plan = render_explain_analyze(binding, &observations).expect("render analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze rows");
+	};
+	let rendered_verdict = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_verdict".to_string())))
+		.expect("rendered verdict");
+
+	assert_eq!(verdicts.len(), 1);
+	assert_eq!(verdicts[0].kind, OptimizerDecisionKind::FlatStar);
+	assert_eq!(verdicts[0].verdict, OptimizerRuntimeVerdictClass::OverEager);
+	assert_eq!(
+		rendered_verdict[2],
+		ScalarValue::Utf8(Some("over_eager".to_string()))
+	);
+}
+
+#[tokio::test]
+async fn measured_verdicts_record_per_level_for_recursive_snowflake() {
+	let catalog = hash_snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(non_optimal_snowflake_order_sql())
+		.expect("plan hash snowflake");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(1))
+		.await
+		.expect("bind hash snowflake analyze");
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(10),
+			probe_rows: RowCount::new(20),
+			output_rows: RowCount::new(30),
+		})
+		.collect::<Vec<_>>();
+
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure verdicts");
+
+	assert_eq!(
+		verdicts
+			.iter()
+			.map(|verdict| verdict.kind)
+			.collect::<Vec<_>>(),
+		vec![
+			OptimizerDecisionKind::SnowflakeRoot,
+			OptimizerDecisionKind::SnowflakeBranch
+		]
+	);
+}
+
+#[tokio::test]
+async fn sampled_runtime_verdicts_record_per_level_for_recursive_snowflake() {
+	let (catalog, storage) = snowflake_order_execution_fixture().await;
+	let catalog = Arc::new(catalog);
+	let config = PlannerConfig {
+		measured_accrual_sample_rate: 1,
+		..auto_broadcast_config(1)
+	};
+
+	let (_schema, rows) = execute_star_order_query_with_coordinator(
+		catalog.clone(),
+		storage,
+		non_optimal_snowflake_order_project_sql(),
+		config.clone(),
+	)
+	.await;
+	assert!(!rows.is_empty());
+	let verdict_rows = optimizer_runtime_verdict_rows(catalog.as_ref(), &config).await;
+
+	assert_eq!(
+		optimizer_runtime_verdict_kind_count(&verdict_rows, "snowflake_root"),
+		1
+	);
+	assert_eq!(
+		optimizer_runtime_verdict_kind_count(&verdict_rows, "snowflake_branch"),
+		1
+	);
+}
+
+#[tokio::test]
+async fn optimizer_runtime_verdicts_report_aggregates_by_kind_and_class() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	config.decision_log.record_verdict(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+	);
+	config.decision_log.record_verdict(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+	);
+
+	let rows = optimizer_runtime_verdict_rows(&catalog, &config).await;
+
+	assert_eq!(rows.len(), 1);
+	assert_eq!(
+		optimizer_runtime_verdict_count(&rows, "flat_star", "missed_win"),
+		2
+	);
+}
+
+#[tokio::test]
+async fn rune_queries_optimizer_runtime_verdicts() {
+	let catalog = star_join_order_catalog();
+	let config = PlannerConfig::default();
+	config.decision_log.record_verdict(
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerRuntimeVerdictClass::Vindicated,
+	);
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM information_schema.optimizer_runtime_verdicts")
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer runtime verdict report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer runtime verdict system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerRuntimeVerdicts
+	);
+	assert_eq!(
+		optimizer_runtime_verdict_count(&rows, "snowflake_root", "vindicated"),
+		1
+	);
+}
+
+#[tokio::test]
 async fn star_order_replay_ids_and_receipts_follow_applied_sequence() {
 	let catalog = star_join_order_catalog();
 	let logical = SqlPlanner::new()
@@ -11953,6 +12250,26 @@ async fn optimizer_decision_rows(
 	rows
 }
 
+async fn optimizer_runtime_verdict_rows(
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Vec<Vec<ScalarValue>> {
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_runtime_verdicts")
+		.expect("plan optimizer runtime verdict report");
+	let plan = bind(&logical, catalog, config)
+		.await
+		.expect("bind optimizer runtime verdict report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected optimizer runtime verdict system table, got {plan:?}");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerRuntimeVerdicts
+	);
+	rows
+}
+
 fn optimizer_decision_count(
 	rows: &[Vec<ScalarValue>],
 	kind: &str,
@@ -11976,6 +12293,34 @@ fn optimizer_decision_count(
 		panic!("expected optimizer decision count, got {:?}", row[3]);
 	};
 	count
+}
+
+fn optimizer_runtime_verdict_count(rows: &[Vec<ScalarValue>], kind: &str, verdict: &str) -> i64 {
+	let row = rows
+		.iter()
+		.find(|row| {
+			row[0] == ScalarValue::Utf8(Some(kind.to_string()))
+				&& row[1] == ScalarValue::Utf8(Some(verdict.to_string()))
+		})
+		.unwrap_or_else(|| {
+			panic!("missing optimizer runtime verdict row kind={kind} verdict={verdict}: {rows:?}")
+		});
+	let ScalarValue::Int64(Some(count)) = row[2] else {
+		panic!("expected optimizer runtime verdict count, got {:?}", row[2]);
+	};
+	count
+}
+
+fn optimizer_runtime_verdict_kind_count(rows: &[Vec<ScalarValue>], kind: &str) -> i64 {
+	rows.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some(kind.to_string())))
+		.map(|row| {
+			let ScalarValue::Int64(Some(count)) = row[2] else {
+				panic!("expected optimizer runtime verdict count, got {:?}", row[2]);
+			};
+			count
+		})
+		.sum()
 }
 
 fn assert_utf8_contains(value: &ScalarValue, expected: &str) {
@@ -12739,6 +13084,25 @@ async fn execute_star_order_query(
 		.first()
 		.map(RecordBatch::schema)
 		.unwrap_or_else(|| bound.plan.schema());
+	(schema, normalized_i64_rows(&batches))
+}
+
+async fn execute_star_order_query_with_coordinator(
+	catalog: Arc<MockCatalog>,
+	storage: Arc<InMemoryTableStorage>,
+	sql: &str,
+	config: PlannerConfig,
+) -> (SchemaRef, Vec<Vec<Option<i64>>>) {
+	let logical = SqlPlanner::new().plan(sql).expect("plan star order SQL");
+	let coordinator = QueryCoordinator::new(catalog, Executor::new(storage), config);
+	let batches = coordinator
+		.execute_query(&logical, None)
+		.await
+		.expect("execute star order SQL through coordinator");
+	let schema = batches
+		.first()
+		.map(RecordBatch::schema)
+		.expect("star order query returns at least one batch");
 	(schema, normalized_i64_rows(&batches))
 }
 

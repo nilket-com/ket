@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -11,7 +11,10 @@ use futures::{StreamExt, TryStreamExt};
 mod delete;
 mod write;
 
-use crate::binder::{PlannerConfig, bind, bind_explain_analyze, render_explain_analyze};
+use crate::binder::{
+	PlannerConfig, bind, bind_explain_analyze, measured_explain_analyze_verdicts,
+	render_explain_analyze,
+};
 use crate::catalog::{Catalog, InvalidatedDescriptor};
 use crate::distributed::budget::{
 	AdmissionAttempt, AdmissionPolicy, AdmissionReservation, AdmissionResource, BudgetDimension,
@@ -1267,25 +1270,55 @@ where
 	Transport: ToronTransport + ?Sized + 'static,
 {
 	let mut config = config;
+	let measure_runtime_verdict = should_measure_runtime_verdict(
+		config.measured_accrual_sample_rate,
+		&config.measured_accrual_counter,
+	);
 	let mut retried_broadcast_replay = false;
 	let mut fragment_id_namespace = 0;
 	let mut retried_descriptor_evolution = false;
 	let mut invalidated = Vec::new();
 	loop {
-		let bound = bind(&plan, catalog.as_ref(), &config)
-			.await
-			.map_err(QueryError::Binding)?;
+		let measured_binding = if measure_runtime_verdict {
+			Some(
+				bind_explain_analyze(&plan, catalog.as_ref(), &config)
+					.await
+					.map_err(QueryError::Binding)?,
+			)
+		} else {
+			None
+		};
+		let bound = match &measured_binding {
+			Some(binding) => binding.plan.clone(),
+			None => bind(&plan, catalog.as_ref(), &config)
+				.await
+				.map_err(QueryError::Binding)?,
+		};
 		if !invalidated.is_empty() {
 			reject_replacement_object(catalog.as_ref(), &invalidated).await?;
 		}
+		let execution_context = match &measured_binding {
+			Some(binding) => {
+				context
+					.clone()
+					.with_join_runtime_observation_mode(analyze_observation_mode(
+						binding.replay_ids.clone(),
+					))
+			}
+			None => context.clone(),
+		};
 		let stages = fragment_plan(
 			bound,
 			FragmentPlanConfig::new(
-				context.query_id,
+				execution_context.query_id,
 				TaskBudget::from_query_budget(query_budget),
 			)
-			.with_task_context(TaskExecutionContext::from_execution_context(&context))
-			.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
+			.with_task_context(TaskExecutionContext::from_execution_context(
+				&execution_context,
+			))
+			.with_join_runtime_observation_mode(
+				execution_context.join_runtime_observation_mode.clone(),
+			)
 			.with_id_namespace(fragment_id_namespace),
 		)
 		.map_err(fragment_error)?;
@@ -1295,10 +1328,23 @@ where
 			.with_active_query(Some(active_query.clone()))
 			.with_final_result_sender(Some(sender.clone()), Some(batch_sent.clone()));
 		match scheduler.dispatch_loop(&stages, &dispatcher).await {
-			Ok(_) => return Ok(()),
+			Ok(run) => {
+				if let Some(binding) = measured_binding.as_ref() {
+					let observations =
+						join_observations_from_task_telemetry(&run.telemetry.task_telemetry);
+					for verdict in measured_explain_analyze_verdicts(binding, &observations)
+						.map_err(QueryError::Binding)?
+					{
+						config
+							.decision_log
+							.record_verdict(verdict.kind, verdict.verdict);
+					}
+				}
+				return Ok(());
+			}
 			Err(error) => {
 				if active_query.is_cancelled() {
-					scheduler.cancel_query(context.query_id);
+					scheduler.cancel_query(execution_context.query_id);
 				}
 				if !retried_broadcast_replay && !batch_sent.load(Ordering::SeqCst) {
 					if let Some(force_hash_join_ids) = broadcast_cap_replay_trigger(&error, &stages)
@@ -1435,6 +1481,14 @@ fn logical_plan_is_distributed_read(plan: &LogicalPlan) -> bool {
 
 fn analyze_observation_mode(replay_ids: BTreeSet<JoinReplayId>) -> JoinRuntimeObservationMode {
 	JoinRuntimeObservationMode::MeasureJoins { replay_ids }
+}
+
+fn should_measure_runtime_verdict(rate: u32, counter: &AtomicU64) -> bool {
+	if rate == 0 {
+		return false;
+	}
+	let ordinal = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+	ordinal % u64::from(rate) == 0
 }
 
 fn join_observations_from_task_telemetry(
@@ -2347,15 +2401,57 @@ impl QueryCoordinator {
 			return self.execute_write_plan(catalog.as_ref(), &bound).await;
 		}
 
+		let measure_runtime_verdict = should_measure_runtime_verdict(
+			self.config.measured_accrual_sample_rate,
+			&self.config.measured_accrual_counter,
+		);
 		let mut retried_descriptor_evolution = false;
 		let mut invalidated = Vec::new();
 		loop {
-			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			let measured_binding = if measure_runtime_verdict {
+				Some(bind_explain_analyze(plan, catalog.as_ref(), &self.config).await?)
+			} else {
+				None
+			};
+			let bound = match &measured_binding {
+				Some(binding) => binding.plan.clone(),
+				None => bind(plan, catalog.as_ref(), &self.config).await?,
+			};
 			if !invalidated.is_empty() {
 				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
 			}
-			match self.executor.execute_bound(&bound, morsel).await {
-				Ok(results) => return Ok(results),
+			let telemetry = measured_binding
+				.as_ref()
+				.map(|_| Arc::new(Mutex::new(TaskTelemetry::default())));
+			let result = if let Some(binding) = measured_binding.as_ref() {
+				let context = self
+					.executor
+					.context()
+					.clone()
+					.with_task_telemetry(telemetry.as_ref().expect("telemetry").clone())
+					.with_join_runtime_observation_mode(analyze_observation_mode(
+						binding.replay_ids.clone(),
+					));
+				Executor::with_context(self.executor.storage_arc(), context)
+					.execute_bound(&bound, morsel)
+					.await
+			} else {
+				self.executor.execute_bound(&bound, morsel).await
+			};
+			match result {
+				Ok(results) => {
+					if let Some(binding) = measured_binding.as_ref() {
+						let observations = join_observations_from_local_telemetry(
+							telemetry.as_ref().expect("telemetry"),
+						);
+						for verdict in measured_explain_analyze_verdicts(binding, &observations)? {
+							self.config
+								.decision_log
+								.record_verdict(verdict.kind, verdict.verdict);
+						}
+					}
+					return Ok(results);
+				}
 				Err(ExecutionError::Storage(StorageError::DescriptorEvolved { table_id }))
 					if !retried_descriptor_evolution =>
 				{

@@ -86,5 +86,10 @@ pub(crate) fn adr029_select_retry_loop_is_preserved() {
 		.and_then(|rest| rest.split("match self.executor.execute_bound").next())
 		.expect("descriptor-evolution retry loop body");
 
-	assert!(loop_body.contains("let bound = bind(plan, catalog.as_ref(), &self.config).await?"));
+	assert!(loop_body.contains("let measured_binding = if measure_runtime_verdict"));
+	assert!(
+		loop_body
+			.contains("Some(bind_explain_analyze(plan, catalog.as_ref(), &self.config).await?)")
+	);
+	assert!(loop_body.contains("None => bind(plan, catalog.as_ref(), &self.config).await?"));
 }

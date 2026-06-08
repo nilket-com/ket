@@ -34,9 +34,24 @@ pub(crate) enum OptimizerDecisionOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OptimizerRuntimeVerdictClass {
+	Vindicated,
+	MissedWin,
+	OverEager,
+	MisRanked,
+	Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OptimizerDecisionKey {
 	pub(crate) kind: OptimizerDecisionKind,
 	pub(crate) outcome: OptimizerDecisionOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OptimizerRuntimeVerdictKey {
+	pub(crate) kind: OptimizerDecisionKind,
+	pub(crate) verdict: OptimizerRuntimeVerdictClass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +61,17 @@ pub(crate) struct OptimizerDecisionRow {
 	pub(crate) count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptimizerRuntimeVerdictRow {
+	pub(crate) kind: OptimizerDecisionKind,
+	pub(crate) verdict: OptimizerRuntimeVerdictClass,
+	pub(crate) count: u64,
+}
+
 #[derive(Debug)]
 pub struct OptimizerDecisionLog {
 	counts: Mutex<BTreeMap<OptimizerDecisionKey, u64>>,
+	verdict_counts: Mutex<BTreeMap<OptimizerRuntimeVerdictKey, u64>>,
 	overflow_count: AtomicU64,
 	max_keys: usize,
 }
@@ -63,6 +86,7 @@ impl OptimizerDecisionLog {
 	pub(crate) fn with_max_keys(max_keys: usize) -> Self {
 		Self {
 			counts: Mutex::new(BTreeMap::new()),
+			verdict_counts: Mutex::new(BTreeMap::new()),
 			overflow_count: AtomicU64::new(0),
 			max_keys,
 		}
@@ -77,6 +101,20 @@ impl OptimizerDecisionLog {
 		}
 		if counts.len() >= self.max_keys {
 			self.overflow_count.fetch_add(1, Ordering::Relaxed);
+			return;
+		}
+		counts.insert(key, 1);
+	}
+
+	pub(crate) fn record_verdict(
+		&self,
+		kind: OptimizerDecisionKind,
+		verdict: OptimizerRuntimeVerdictClass,
+	) {
+		let key = OptimizerRuntimeVerdictKey { kind, verdict };
+		let mut counts = self.verdict_counts.lock().expect("optimizer verdict log");
+		if let Some(count) = counts.get_mut(&key) {
+			*count = count.saturating_add(1);
 			return;
 		}
 		counts.insert(key, 1);
@@ -103,6 +141,18 @@ impl OptimizerDecisionLog {
 			});
 		}
 		rows
+	}
+
+	pub(crate) fn verdict_snapshot(&self) -> Vec<OptimizerRuntimeVerdictRow> {
+		let counts = self.verdict_counts.lock().expect("optimizer verdict log");
+		counts
+			.iter()
+			.map(|(key, count)| OptimizerRuntimeVerdictRow {
+				kind: key.kind,
+				verdict: key.verdict,
+				count: *count,
+			})
+			.collect()
 	}
 }
 
@@ -137,5 +187,17 @@ pub(crate) fn optimizer_decision_decline_reason_label(
 		OptimizerDecisionDeclineReason::DuplicateDimension => "duplicate_dimension",
 		OptimizerDecisionDeclineReason::MissingEstimate => "missing_estimate",
 		OptimizerDecisionDeclineReason::ProbeNotScanLinear => "probe_not_scan_linear",
+	}
+}
+
+pub(crate) fn optimizer_runtime_verdict_label(
+	verdict: OptimizerRuntimeVerdictClass,
+) -> &'static str {
+	match verdict {
+		OptimizerRuntimeVerdictClass::Vindicated => "vindicated",
+		OptimizerRuntimeVerdictClass::MissedWin => "missed_win",
+		OptimizerRuntimeVerdictClass::OverEager => "over_eager",
+		OptimizerRuntimeVerdictClass::MisRanked => "mis_ranked",
+		OptimizerRuntimeVerdictClass::Indeterminate => "indeterminate",
 	}
 }

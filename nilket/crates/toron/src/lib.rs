@@ -619,6 +619,31 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn sampled_distributed_read_returns_user_rows_when_no_join_order_verdict() {
+		let config = PlannerConfig {
+			measured_accrual_sample_rate: 1,
+			..PlannerConfig::default()
+		};
+		let results = run_distributed_join_query_with_catalog_config(
+			sql_fact_dim_join_plan(),
+			3,
+			join_catalog(),
+			config.clone(),
+		)
+		.await;
+
+		assert!(!results.is_empty());
+		assert_eq!(
+			field_names(results[0].schema().as_ref()),
+			vec!["id", "customer_id", "id", "region"]
+		);
+		assert!(
+			config.decision_log.verdict_snapshot().is_empty(),
+			"sampled non-star reads should not invent a runtime verdict"
+		);
+	}
+
+	#[tokio::test]
 	async fn distributed_broadcast_join_over_cap_fails_terminally_over_tcp() {
 		let mut query_budget = QueryBudget::test_default();
 		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);

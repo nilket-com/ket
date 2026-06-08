@@ -476,11 +476,13 @@ pub(crate) fn adr180_verdict_compares_star_evidence_applied_order() {
 pub(crate) fn adr180_verdict_uses_runtime_output_rows() {
 	let explain = source("src/binder/explain.rs");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let measured_rows = first_block(&explain, "fn star_measured_rows_by_dimension");
 	let verdict_row = first_block(&explain, "fn optimizer_analyze_join_order_verdict_row");
 
-	assert!(analyze_rows.contains("summary.output_rows"));
-	assert!(!analyze_rows.contains("summary.build_rows"));
-	assert!(!analyze_rows.contains("summary.probe_rows"));
+	assert!(analyze_rows.contains("star_measured_rows_by_dimension"));
+	assert!(measured_rows.contains("summary.output_rows"));
+	assert!(!measured_rows.contains("summary.build_rows"));
+	assert!(!measured_rows.contains("summary.probe_rows"));
 	assert!(
 		verdict_row.contains("measured_star_order_verdict(evidence, measured_rows_by_dimension)")
 	);
@@ -530,9 +532,11 @@ pub(crate) fn adr180_runtime_correlation_remains_replay_id_keyed() {
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 	let runtime_row = first_block(&explain, "fn optimizer_analyze_join_order_row");
 	let measurement = first_block(&explain, "fn join_order_runtime_measurement");
+	let measured_rows = first_block(&explain, "fn star_measured_rows_by_dimension");
 
-	assert!(analyze_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
-	assert!(analyze_rows.contains("summaries.get(&replay_id)"));
+	assert!(analyze_rows.contains("star_measured_rows_by_dimension"));
+	assert!(measured_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(measured_rows.contains("summaries.get(&replay_id)"));
 	assert!(runtime_row.contains("join_order_runtime_measurement(edge"));
 	assert!(measurement.contains("join_replay_id_for_trace_target(edge.target)?"));
 	assert!(measurement.contains("summaries.get(&replay_id)"));
@@ -717,12 +721,14 @@ pub(crate) fn adr181_reuses_178_restore_and_179_180_net() {
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 	let runtime_row = first_block(&explain, "fn optimizer_analyze_join_order_row");
 	let measurement = first_block(&explain, "fn join_order_runtime_measurement");
+	let measured_rows = first_block(&explain, "fn star_measured_rows_by_dimension");
 	let verdict_row = first_block(&explain, "fn optimizer_analyze_join_order_verdict_row");
 	let verdict = first_block(&join_order, "pub(super) fn measured_star_order_verdict");
 
 	assert!(local_actuator.contains("restore_declared_star_order_project("));
 	assert!(join.contains("pub(super) fn restore_declared_star_order_project"));
-	assert!(analyze_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
+	assert!(analyze_rows.contains("star_measured_rows_by_dimension"));
+	assert!(measured_rows.contains("join_replay_id_for_trace_target(edge.target)?"));
 	assert!(runtime_row.contains("join_order_runtime_measurement(edge"));
 	assert!(measurement.contains("join_replay_id_for_trace_target(edge.target)?"));
 	assert!(
@@ -1047,15 +1053,17 @@ pub(crate) fn adr184_snowflake_verdict_enum_has_only_observe_outcomes() {
 pub(crate) fn adr184_snowflake_verdict_uses_183_output_rows() {
 	let explain = source("src/binder/explain.rs");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
+	let measured_rows = first_block(&explain, "fn snowflake_measured_rows_by_dimension");
 	let snowflake_branch = analyze_rows
 		.split("let Some(StarOrderOutcome::Recognized")
 		.next()
 		.expect("snowflake analyze branch");
 
 	assert!(snowflake_branch.contains("measured_rows_by_dimension"));
-	assert!(snowflake_branch.contains("summary.output_rows"));
-	assert!(!snowflake_branch.contains("summary.build_rows"));
-	assert!(!snowflake_branch.contains("summary.probe_rows"));
+	assert!(snowflake_branch.contains("snowflake_measured_rows_by_dimension"));
+	assert!(measured_rows.contains("summary.output_rows"));
+	assert!(!measured_rows.contains("summary.build_rows"));
+	assert!(!measured_rows.contains("summary.probe_rows"));
 	assert!(snowflake_branch.contains("measured_snowflake_order_verdict"));
 }
 

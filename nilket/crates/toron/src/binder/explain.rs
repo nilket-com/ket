@@ -249,6 +249,37 @@ pub(super) fn information_schema_optimizer_decision_rows(
 		.collect()
 }
 
+pub(super) fn information_schema_optimizer_runtime_verdicts_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("verdict", DataType::Utf8, false),
+		Field::new("count", DataType::Int64, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_runtime_verdict_rows(
+	verdicts: &[OptimizerRuntimeVerdictRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	verdicts
+		.iter()
+		.map(|verdict| {
+			Ok(vec![
+				ScalarValue::Utf8(Some(
+					optimizer_decision_kind_label(verdict.kind).to_string(),
+				)),
+				ScalarValue::Utf8(Some(
+					optimizer_runtime_verdict_label(verdict.verdict).to_string(),
+				)),
+				ScalarValue::Int64(Some(i64::try_from(verdict.count).map_err(|_| {
+					BindingError::UnsupportedExpression {
+						message: "optimizer runtime verdict count exceeds i64::MAX".to_string(),
+					}
+				})?)),
+			])
+		})
+		.collect()
+}
+
 pub(super) fn optimizer_explain_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("decision_kind", DataType::Utf8, false),
@@ -334,6 +365,12 @@ struct JoinRuntimeObservationSummary {
 	output_rows: RowCount,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MeasuredLevelVerdict {
+	pub(crate) kind: OptimizerDecisionKind,
+	pub(crate) verdict: OptimizerRuntimeVerdictClass,
+}
+
 pub(super) fn optimizer_analyze_plan(
 	_trace: OptimizerTrace,
 	render_trace: OptimizerExplainRenderTrace,
@@ -377,6 +414,63 @@ fn summarize_join_runtime_observations(
 	summaries
 }
 
+pub(crate) fn measured_verdicts(
+	render_trace: &OptimizerExplainRenderTrace,
+	observations: &[JoinRuntimeObservation],
+) -> Result<Vec<MeasuredLevelVerdict>, BindingError> {
+	let summaries = summarize_join_runtime_observations(observations);
+	measured_verdicts_from_summaries(render_trace, &summaries)
+}
+
+fn measured_verdicts_from_summaries(
+	render_trace: &OptimizerExplainRenderTrace,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<MeasuredLevelVerdict>, BindingError> {
+	if let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order {
+		let measured_rows_by_dimension =
+			snowflake_measured_rows_by_dimension(render_trace, evidence, summaries)?;
+		let verdict = measured_snowflake_order_verdict(evidence, &measured_rows_by_dimension);
+		return Ok(verdict
+			.levels
+			.iter()
+			.enumerate()
+			.map(|(index, level)| MeasuredLevelVerdict {
+				kind: if index == 0 {
+					OptimizerDecisionKind::SnowflakeRoot
+				} else {
+					OptimizerDecisionKind::SnowflakeBranch
+				},
+				verdict: runtime_verdict_class_from_snowflake(level.verdict),
+			})
+			.collect());
+	}
+
+	let receipts = render_trace.star_order_receipts();
+	let root_kind = if receipts.len() > 1 {
+		OptimizerDecisionKind::SnowflakeRoot
+	} else {
+		OptimizerDecisionKind::FlatStar
+	};
+	let mut verdicts = Vec::new();
+	for (index, receipt) in receipts.iter().enumerate() {
+		let StarOrderOutcome::Recognized(evidence) = &receipt.outcome else {
+			continue;
+		};
+		let measured_rows_by_dimension =
+			star_measured_rows_by_dimension(render_trace, receipt, evidence, summaries)?;
+		let verdict = measured_star_order_verdict(evidence, &measured_rows_by_dimension);
+		verdicts.push(MeasuredLevelVerdict {
+			kind: if index == 0 {
+				root_kind
+			} else {
+				OptimizerDecisionKind::SnowflakeBranch
+			},
+			verdict: runtime_verdict_class_from_star(verdict.verdict),
+		});
+	}
+	Ok(verdicts)
+}
+
 fn optimizer_analyze_rows(
 	render_trace: &OptimizerExplainRenderTrace,
 	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
@@ -384,7 +478,6 @@ fn optimizer_analyze_rows(
 	if let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order {
 		let mut rows = vec![optimizer_analyze_snowflake_order_row(evidence)];
 		let dimensions = flatten_snowflake_dimensions(evidence);
-		let mut measured_rows_by_dimension = BTreeMap::new();
 		for edge in &render_trace.join_order_edges {
 			let Some(dimension) = edge.dimension.as_deref() else {
 				continue;
@@ -392,14 +485,12 @@ fn optimizer_analyze_rows(
 			let Some((probe, dimension)) = dimensions.get(dimension) else {
 				continue;
 			};
-			let replay_id = join_replay_id_for_trace_target(edge.target)?;
-			if let Some(summary) = summaries.get(&replay_id) {
-				measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
-			}
 			rows.push(optimizer_analyze_snowflake_runtime_row(
 				probe, edge, dimension, summaries,
 			)?);
 		}
+		let measured_rows_by_dimension =
+			snowflake_measured_rows_by_dimension(render_trace, evidence, summaries)?;
 		let verdict = measured_snowflake_order_verdict(evidence, &measured_rows_by_dimension);
 		for level in &verdict.levels {
 			rows.push(optimizer_analyze_snowflake_verdict_row(level));
@@ -423,7 +514,6 @@ fn optimizer_analyze_rows(
 			.iter()
 			.map(|dimension| (dimension.dimension.as_str(), dimension))
 			.collect::<BTreeMap<_, _>>();
-		let mut measured_rows_by_dimension = BTreeMap::new();
 		for edge in &render_trace.join_order_edges {
 			if !edge_targets.contains(&edge.target) {
 				continue;
@@ -434,20 +524,95 @@ fn optimizer_analyze_rows(
 			let Some(dimension) = dimensions.get(dimension) else {
 				continue;
 			};
-			let replay_id = join_replay_id_for_trace_target(edge.target)?;
-			if let Some(summary) = summaries.get(&replay_id) {
-				measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
-			}
 			rows.push(optimizer_analyze_join_order_row(
 				edge, dimension, summaries,
 			)?);
 		}
+		let measured_rows_by_dimension =
+			star_measured_rows_by_dimension(render_trace, receipt, evidence, summaries)?;
 		rows.push(optimizer_analyze_join_order_verdict_row(
 			evidence,
 			&measured_rows_by_dimension,
 		)?);
 	}
 	Ok(rows)
+}
+
+fn snowflake_measured_rows_by_dimension(
+	render_trace: &OptimizerExplainRenderTrace,
+	evidence: &SnowflakeOrderEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<BTreeMap<String, RowCount>, BindingError> {
+	let dimensions = flatten_snowflake_dimensions(evidence);
+	let mut measured_rows_by_dimension = BTreeMap::new();
+	for edge in &render_trace.join_order_edges {
+		let Some(dimension) = edge.dimension.as_deref() else {
+			continue;
+		};
+		let Some((_probe, dimension)) = dimensions.get(dimension) else {
+			continue;
+		};
+		let replay_id = join_replay_id_for_trace_target(edge.target)?;
+		if let Some(summary) = summaries.get(&replay_id) {
+			measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
+		}
+	}
+	Ok(measured_rows_by_dimension)
+}
+
+fn star_measured_rows_by_dimension(
+	render_trace: &OptimizerExplainRenderTrace,
+	receipt: &StarOrderRenderReceipt,
+	evidence: &StarOrderEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<BTreeMap<String, RowCount>, BindingError> {
+	let edge_targets = receipt
+		.edge_targets
+		.iter()
+		.copied()
+		.collect::<BTreeSet<_>>();
+	let dimensions = evidence
+		.dimensions
+		.iter()
+		.map(|dimension| (dimension.dimension.as_str(), dimension))
+		.collect::<BTreeMap<_, _>>();
+	let mut measured_rows_by_dimension = BTreeMap::new();
+	for edge in &render_trace.join_order_edges {
+		if !edge_targets.contains(&edge.target) {
+			continue;
+		}
+		let Some(dimension) = edge.dimension.as_deref() else {
+			continue;
+		};
+		let Some(dimension) = dimensions.get(dimension) else {
+			continue;
+		};
+		let replay_id = join_replay_id_for_trace_target(edge.target)?;
+		if let Some(summary) = summaries.get(&replay_id) {
+			measured_rows_by_dimension.insert(dimension.dimension.clone(), summary.output_rows);
+		}
+	}
+	Ok(measured_rows_by_dimension)
+}
+
+fn runtime_verdict_class_from_star(verdict: StarOrderVerdict) -> OptimizerRuntimeVerdictClass {
+	match verdict {
+		StarOrderVerdict::Vindicated => OptimizerRuntimeVerdictClass::Vindicated,
+		StarOrderVerdict::MisRanked => OptimizerRuntimeVerdictClass::MisRanked,
+		StarOrderVerdict::MissedWin => OptimizerRuntimeVerdictClass::MissedWin,
+		StarOrderVerdict::OverEager => OptimizerRuntimeVerdictClass::OverEager,
+		StarOrderVerdict::Indeterminate => OptimizerRuntimeVerdictClass::Indeterminate,
+	}
+}
+
+fn runtime_verdict_class_from_snowflake(
+	verdict: SnowflakeOrderVerdictKind,
+) -> OptimizerRuntimeVerdictClass {
+	match verdict {
+		SnowflakeOrderVerdictKind::Vindicated => OptimizerRuntimeVerdictClass::Vindicated,
+		SnowflakeOrderVerdictKind::MissedWin => OptimizerRuntimeVerdictClass::MissedWin,
+		SnowflakeOrderVerdictKind::Indeterminate => OptimizerRuntimeVerdictClass::Indeterminate,
+	}
 }
 
 fn optimizer_analyze_join_order_row(
