@@ -1139,7 +1139,7 @@ pub(super) fn join_order_outcome_label(outcome: &StarOrderOutcome) -> &'static s
 pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 	match outcome {
 		StarOrderOutcome::Recognized(evidence) => format!(
-			"strategy={}; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; applied_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}/{}; estimates=[{}]",
+			"strategy={}; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; applied_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}; estimates=[{}]",
 			star_order_strategy_label(evidence.strategy),
 			evidence
 				.dimensions
@@ -1153,8 +1153,7 @@ pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 			evidence.declared_cost,
 			evidence.preferred_cost,
 			join_order_estimate_confidence_label(evidence.confidence),
-			STAR_ORDER_SOFT_MARGIN_NUMERATOR,
-			STAR_ORDER_SOFT_MARGIN_DENOMINATOR,
+			evidence.applied_margin.label(),
 			evidence
 				.dimensions
 				.iter()
@@ -1205,7 +1204,7 @@ pub(super) fn snowflake_order_detail_label(evidence: &SnowflakeOrderEvidence) ->
 fn snowflake_order_level_detail_label(evidence: &SnowflakeOrderEvidence) -> String {
 	let ranking = &evidence.ranking;
 	format!(
-		"root={}; action={}; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}/{}; estimates=[{}]; strategies=[{}]; branches=[{}]",
+		"root={}; action={}; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}; estimates=[{}]; strategies=[{}]; branches=[{}]",
 		ranking.probe,
 		snowflake_order_action_label(ranking.action),
 		ranking
@@ -1219,8 +1218,7 @@ fn snowflake_order_level_detail_label(evidence: &SnowflakeOrderEvidence) -> Stri
 		ranking.declared_cost,
 		ranking.preferred_cost,
 		join_order_estimate_confidence_label(ranking.confidence),
-		STAR_ORDER_SOFT_MARGIN_NUMERATOR,
-		STAR_ORDER_SOFT_MARGIN_DENOMINATOR,
+		ranking.applied_margin.label(),
 		ranking
 			.dimensions
 			.iter()

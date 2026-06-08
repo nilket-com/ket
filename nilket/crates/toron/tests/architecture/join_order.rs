@@ -772,10 +772,9 @@ pub(crate) fn adr182_snowflake_recognition_is_observational() {
 	let analyzer = first_block(&join_order, "pub(super) fn analyze_snowflake");
 	let extract = first_block(&join_order, "pub(super) fn extract_star_join_candidate");
 
-	assert!(
-		bind_with_explain_trace
-			.contains("analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions)")
-	);
+	assert!(bind_with_explain_trace.contains("analyze_snowflake("));
+	assert!(bind_with_explain_trace.contains("&render_trace.join_order_edges"));
+	assert!(bind_with_explain_trace.contains("&trace.join_decisions"));
 	assert!(
 		bind_with_explain_trace.contains("render_trace.set_observed_snowflake(snowflake_order)")
 	);
@@ -1242,10 +1241,8 @@ pub(crate) fn adr185_actuated_root_reports_as_star() {
 	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 
 	assert!(bind_with_explain_trace.contains("render_trace.has_recognized_star_order()"));
-	assert!(
-		bind_with_explain_trace
-			.contains("analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions)")
-	);
+	assert!(bind_with_explain_trace.contains("analyze_snowflake("));
+	assert!(bind_with_explain_trace.contains("&trace.join_decisions"));
 	assert!(actuator.contains("render_trace.set_star_receipts(receipts)"));
 	assert!(local_actuator.contains("StarOrderStrategy::HashPartitioned"));
 }

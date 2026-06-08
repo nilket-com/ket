@@ -74,6 +74,7 @@ use self::selectivity::*;
 pub use self::decision_log::OptimizerDecisionLog;
 pub use self::join::join_schema;
 pub(crate) use self::join::{BroadcastBuildSide, JoinStrategyDecisionReason};
+pub use self::join_order::SoftMarginLadderStep;
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
 const DEFAULT_AUTO_JOIN_PARTITION_COUNT: u32 = 4;
@@ -115,6 +116,7 @@ pub struct PlannerConfig {
 	pub decision_log: Arc<OptimizerDecisionLog>,
 	pub measured_accrual_sample_rate: u32,
 	pub measured_accrual_counter: Arc<AtomicU64>,
+	pub join_order_soft_margin_step: SoftMarginLadderStep,
 }
 
 impl Default for PlannerConfig {
@@ -127,6 +129,7 @@ impl Default for PlannerConfig {
 			decision_log: Arc::new(OptimizerDecisionLog::default()),
 			measured_accrual_sample_rate: 0,
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
+			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
 		}
 	}
 }
@@ -194,12 +197,17 @@ async fn bind_with_explain_trace(
 	let plan = push_down_scan_projection(plan.plan, &logical_types)?;
 	let mut render_trace = render_trace.expect("render trace remains present");
 	if !render_trace.has_recognized_star_order() {
-		if let Some(snowflake_order) =
-			analyze_snowflake(&render_trace.join_order_edges, &trace.join_decisions)
-		{
+		if let Some(snowflake_order) = analyze_snowflake(
+			&render_trace.join_order_edges,
+			&trace.join_decisions,
+			config.join_order_soft_margin_step,
+		) {
 			render_trace.set_observed_snowflake(snowflake_order);
 		} else if matches!(render_trace.join_order, JoinOrderRenderState::None) {
-			if let Some(outcome) = analyze(&render_trace.join_order_edges) {
+			if let Some(outcome) = analyze(
+				&render_trace.join_order_edges,
+				config.join_order_soft_margin_step,
+			) {
 				let edge_targets = render_trace
 					.join_order_edges
 					.iter()
@@ -1743,7 +1751,7 @@ impl<'a> Binder<'a> {
 		{
 			let advisory = recommend_soft_margin(
 				&self.config.decision_log.verdict_snapshot(),
-				CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
+				self.config.join_order_soft_margin_step,
 			);
 			return system_table_plan(
 				SystemTableKind::InformationSchemaOptimizerMarginAdvisory,

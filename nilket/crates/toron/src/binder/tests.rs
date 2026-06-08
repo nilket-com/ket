@@ -9307,7 +9307,7 @@ fn galaxy_or_shared_dimension_declines_snowflake() {
 		),
 	];
 
-	assert!(analyze_snowflake(&edges, &decisions).is_none());
+	assert!(analyze_snowflake(&edges, &decisions, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP).is_none());
 }
 
 #[tokio::test]
@@ -9547,6 +9547,130 @@ async fn star_order_keeps_declared_when_soft_margin_is_thin() {
 	assert_utf8_contains(&row[3], "cost_preferred_order=[p,c]");
 	assert_utf8_contains(&row[3], "applied_order=[c,p]");
 	assert_utf8_contains(&row[3], "confidence=soft");
+}
+
+fn margin_config(step: SoftMarginLadderStep) -> PlannerConfig {
+	PlannerConfig {
+		join_order_soft_margin_step: step,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	}
+}
+
+#[test]
+fn operator_set_margin_changes_reorder_threshold() {
+	// declared=100, preferred=85 (a 15% soft win): kept under the default 4/5 and the tightest
+	// 3/5, reordered only once the operator loosens to 9/10. The configured margin is the gate.
+	let declared = 100;
+	let preferred = 85;
+	let classify = |step: SoftMarginLadderStep| {
+		classify_star_order_action(
+			declared,
+			preferred,
+			false,
+			JoinOrderEstimateConfidence::Soft,
+			step.margin(),
+		)
+	};
+	assert_eq!(
+		classify(SoftMarginLadderStep::Tightest),
+		StarOrderAction::KeptInsufficientMargin
+	);
+	assert_eq!(
+		classify(SoftMarginLadderStep::Baseline),
+		StarOrderAction::KeptInsufficientMargin
+	);
+	assert_eq!(
+		classify(SoftMarginLadderStep::Loose),
+		StarOrderAction::Reordered
+	);
+}
+
+#[tokio::test]
+async fn operator_margin_changes_bound_plan() {
+	// End-to-end proof: the same query produces a different *bound* ExecutionPlan under a tight
+	// vs a loose operator margin — the configured threshold actually reorders the plan, not just
+	// the receipt. The thin soft win is kept under the tightest step and reordered under the
+	// loosest.
+	let mut catalog = star_join_order_catalog();
+	// A soft win that the tightest step keeps and the loosest step reorders (a clean hash-star
+	// reorder, not a strategy decline).
+	seed_soft_star_join_order_facts(&mut catalog, 1_000, 850);
+	let sql = "SELECT * FROM orders o \
+			   INNER JOIN customers c ON o.customer_id = c.id \
+			   INNER JOIN products p ON o.product_id = p.id";
+	let logical = SqlPlanner::new().plan(sql).expect("plan star");
+
+	let (tight_plan, _) =
+		bind_with_trace(&logical, &catalog, &margin_config(SoftMarginLadderStep::Tightest))
+			.await
+			.expect("bind under tightest margin");
+	let (loose_plan, _) =
+		bind_with_trace(&logical, &catalog, &margin_config(SoftMarginLadderStep::Loosest))
+			.await
+			.expect("bind under loosest margin");
+
+	assert_ne!(
+		format!("{tight_plan:?}"),
+		format!("{loose_plan:?}"),
+		"operator margin must change the bound plan: tight keeps declared, loose reorders"
+	);
+}
+
+#[test]
+fn default_margin_is_behavior_neutral() {
+	// The default config step resolves to the pre-190 const margin (4/5), so default plans are
+	// byte-identical (the 177-189 suites prove plan identity end-to-end).
+	assert_eq!(
+		PlannerConfig::default().join_order_soft_margin_step,
+		CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP
+	);
+	assert_eq!(CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP.margin().label(), "4/5");
+}
+
+#[tokio::test]
+async fn applied_margin_recorded_and_displayed() {
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_100, 1_000);
+	let sql = "SELECT * FROM orders o \
+			   INNER JOIN customers c ON o.customer_id = c.id \
+			   INNER JOIN products p ON o.product_id = p.id";
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {sql}"))
+		.expect("plan star EXPLAIN");
+
+	let (_schema, rows) = bind_explain_rows(
+		&logical,
+		&catalog,
+		&margin_config(SoftMarginLadderStep::Loose),
+	)
+	.await;
+	let row = join_order_row(&rows);
+	assert_utf8_contains(&row[3], "soft_margin=9/10");
+}
+
+#[tokio::test]
+async fn advisory_current_is_applied_margin() {
+	let catalog = star_join_order_catalog();
+	let rows =
+		optimizer_margin_advisory_rows(&catalog, &margin_config(SoftMarginLadderStep::Loose)).await;
+	assert_eq!(rows.len(), 1);
+	assert_eq!(margin_advisory_utf8(&rows[0], 0), "9/10");
+}
+
+#[tokio::test]
+async fn observed_snowflake_uses_configured_margin() {
+	let catalog = mixed_strategy_snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", mixed_strategy_snowflake_order_sql()))
+		.expect("plan mixed-strategy snowflake EXPLAIN");
+
+	let config = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Loose,
+		..auto_broadcast_config(4_096)
+	};
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &config).await;
+	let row = join_order_snowflake_row(&rows);
+	assert_utf8_contains(&row[3], "soft_margin=9/10");
 }
 
 #[tokio::test]
@@ -10354,6 +10478,29 @@ async fn rune_queries_margin_advisory() {
 }
 
 #[tokio::test]
+async fn rune_respects_operator_margin() {
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 1_100, 1_000);
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("EXPLAIN SELECT * FROM orders o INNER JOIN customers c ON o.customer_id = c.id INNER JOIN products p ON o.product_id = p.id")
+        }
+    "#,
+	)
+	.await;
+
+	let (_schema, rows) = bind_explain_rows(
+		&logical,
+		&catalog,
+		&margin_config(SoftMarginLadderStep::Loose),
+	)
+	.await;
+	let row = join_order_row(&rows);
+	assert_utf8_contains(&row[3], "soft_margin=9/10");
+}
+
+#[tokio::test]
 async fn star_order_replay_ids_and_receipts_follow_applied_sequence() {
 	let catalog = star_join_order_catalog();
 	let logical = SqlPlanner::new()
@@ -10457,6 +10604,7 @@ fn verdict_indeterminate_on_missing_actuals() {
 		Some(vec!["p".to_string(), "c".to_string()]),
 		StarOrderStrategy::Broadcast,
 		JoinOrderEstimateConfidence::Hard,
+		CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP.margin(),
 	);
 	let StarOrderOutcome::Recognized(evidence) = evidence else {
 		panic!("recognized fixture");
@@ -10494,6 +10642,7 @@ fn measured_order_rerank_preserves_180_measured_order_semantics() {
 			snowflake_verdict_dim("s", 1, 10),
 		],
 		JoinOrderEstimateConfidence::Hard,
+		CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP.margin(),
 	);
 	let rerank = measured_order_rerank(
 		&ranking,
@@ -13628,6 +13777,7 @@ fn snowflake_verdict_fixture() -> SnowflakeOrderEvidence {
 				snowflake_verdict_dim("s", 1, 10),
 			],
 			JoinOrderEstimateConfidence::Hard,
+			CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP.margin(),
 		),
 		edge_strategies: vec![
 			snowflake_verdict_strategy("c"),
@@ -13643,6 +13793,7 @@ fn snowflake_verdict_fixture() -> SnowflakeOrderEvidence {
 						snowflake_verdict_dim("g", 1, 10),
 					],
 					JoinOrderEstimateConfidence::Hard,
+					CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP.margin(),
 				),
 				edge_strategies: vec![
 					snowflake_verdict_strategy("r"),

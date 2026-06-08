@@ -9,7 +9,7 @@ pub(crate) const JOIN_ORDER_MARGIN_ADVISORY_HYSTERESIS_NUMERATOR: u64 = 1;
 pub(crate) const JOIN_ORDER_MARGIN_ADVISORY_HYSTERESIS_DENOMINATOR: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SoftMarginLadderStep {
+pub enum SoftMarginLadderStep {
 	Tightest,
 	Tight,
 	Baseline,
@@ -38,7 +38,7 @@ impl SoftMarginLadderStep {
 		}
 	}
 
-	fn margin(self) -> SoftMargin {
+	pub(crate) fn margin(self) -> SoftMargin {
 		match self {
 			Self::Tightest => SoftMargin::new(3, 5),
 			Self::Tight => SoftMargin::new(7, 10),
@@ -234,6 +234,7 @@ pub(super) struct StarOrderRanking {
 	pub(super) orders_agree: bool,
 	pub(super) action: StarOrderAction,
 	pub(super) confidence: JoinOrderEstimateConfidence,
+	pub(super) applied_margin: SoftMargin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +250,7 @@ pub(super) struct StarOrderEvidence {
 	pub(super) orders_agree: bool,
 	pub(super) action: StarOrderAction,
 	pub(super) confidence: JoinOrderEstimateConfidence,
+	pub(super) applied_margin: SoftMargin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,7 +706,10 @@ fn estimate_join_order_edge_from_sources(
 	ndv_containment_join_rows_from_denominator(left_rows, right_rows, denominator)
 }
 
-pub(super) fn analyze(edges: &[JoinOrderEdgeEvidence]) -> Option<StarOrderOutcome> {
+pub(super) fn analyze(
+	edges: &[JoinOrderEdgeEvidence],
+	margin_step: SoftMarginLadderStep,
+) -> Option<StarOrderOutcome> {
 	if edges.len() < 2 {
 		return None;
 	}
@@ -773,12 +778,14 @@ pub(super) fn analyze(edges: &[JoinOrderEdgeEvidence]) -> Option<StarOrderOutcom
 		None,
 		StarOrderStrategy::Broadcast,
 		JoinOrderEstimateConfidence::Soft,
+		margin_step.margin(),
 	))
 }
 
 pub(super) fn analyze_snowflake(
 	edges: &[JoinOrderEdgeEvidence],
 	decisions: &[DecisionReceipt],
+	margin_step: SoftMarginLadderStep,
 ) -> Option<SnowflakeOrderEvidence> {
 	if edges.len() < 2 {
 		return None;
@@ -836,6 +843,7 @@ pub(super) fn analyze_snowflake(
 		&adjacency,
 		&mut visited_nodes,
 		&mut visited_edges,
+		margin_step,
 	)?;
 	if visited_edges.len() != edges.len() {
 		return None;
@@ -850,6 +858,7 @@ fn snowflake_order_level(
 	adjacency: &BTreeMap<String, Vec<usize>>,
 	visited_nodes: &mut BTreeSet<String>,
 	visited_edges: &mut BTreeSet<usize>,
+	margin_step: SoftMarginLadderStep,
 ) -> Option<SnowflakeOrderEvidence> {
 	if !visited_nodes.insert(probe.to_string()) {
 		return None;
@@ -886,6 +895,7 @@ fn snowflake_order_level(
 		probe.to_string(),
 		dimensions,
 		JoinOrderEstimateConfidence::Soft,
+		margin_step.margin(),
 	);
 	let mut branches = Vec::new();
 	for edge_index in direct_edges.iter().copied() {
@@ -900,6 +910,7 @@ fn snowflake_order_level(
 					adjacency,
 					visited_nodes,
 					visited_edges,
+					margin_step,
 				)?,
 			});
 		}
@@ -918,8 +929,9 @@ pub(super) fn recognized_star_order_outcome(
 	applied_order_override: Option<Vec<String>>,
 	strategy: StarOrderStrategy,
 	confidence: JoinOrderEstimateConfidence,
+	margin: SoftMargin,
 ) -> StarOrderOutcome {
-	let ranking = rank_star_order(probe, dimensions, confidence);
+	let ranking = rank_star_order(probe, dimensions, confidence, margin);
 	let applied_order = applied_order_override.unwrap_or_else(|| ranking.declared_order.clone());
 
 	StarOrderOutcome::Recognized(StarOrderEvidence {
@@ -934,6 +946,7 @@ pub(super) fn recognized_star_order_outcome(
 		orders_agree: ranking.orders_agree,
 		action: ranking.action,
 		confidence: ranking.confidence,
+		applied_margin: ranking.applied_margin,
 	})
 }
 
@@ -941,6 +954,7 @@ pub(super) fn rank_star_order(
 	probe: String,
 	dimensions: Vec<JoinOrderDimEvidence>,
 	confidence: JoinOrderEstimateConfidence,
+	margin: SoftMargin,
 ) -> StarOrderRanking {
 	let declared_order = dimensions
 		.iter()
@@ -959,8 +973,13 @@ pub(super) fn rank_star_order(
 	let declared_cost = order_cost(&dimensions);
 	let preferred_cost = order_cost(&preferred_dims);
 	let orders_agree = declared_order == cost_preferred_order;
-	let action =
-		classify_star_order_action(declared_cost, preferred_cost, orders_agree, confidence);
+	let action = classify_star_order_action(
+		declared_cost,
+		preferred_cost,
+		orders_agree,
+		confidence,
+		margin,
+	);
 	StarOrderRanking {
 		probe,
 		dimensions,
@@ -971,6 +990,7 @@ pub(super) fn rank_star_order(
 		orders_agree,
 		action,
 		confidence,
+		applied_margin: margin,
 	}
 }
 
@@ -989,6 +1009,7 @@ pub(super) fn measured_star_order_verdict(
 			orders_agree: evidence.orders_agree,
 			action: evidence.action,
 			confidence: evidence.confidence,
+			applied_margin: evidence.applied_margin,
 		},
 		measured_rows_by_dimension,
 	);
@@ -1079,6 +1100,7 @@ pub(super) fn measured_order_rerank(
 		ranking.probe.clone(),
 		measured_dimensions,
 		ranking.confidence,
+		ranking.applied_margin,
 	);
 	let measured_applied_order = applied_order_for_ranking(&measured_ranking);
 	MeasuredOrderRerank {
@@ -1173,6 +1195,7 @@ fn star_order_evidence_from_ranking(
 		orders_agree: ranking.orders_agree,
 		action: ranking.action,
 		confidence: ranking.confidence,
+		applied_margin: ranking.applied_margin,
 	}
 }
 
@@ -1210,6 +1233,7 @@ pub(super) fn classify_star_order_action(
 	preferred_cost: u128,
 	orders_agree: bool,
 	confidence: JoinOrderEstimateConfidence,
+	margin: SoftMargin,
 ) -> StarOrderAction {
 	if orders_agree {
 		return StarOrderAction::KeptAlreadyOptimal;
@@ -1217,8 +1241,8 @@ pub(super) fn classify_star_order_action(
 	match confidence {
 		JoinOrderEstimateConfidence::Hard => StarOrderAction::Reordered,
 		JoinOrderEstimateConfidence::Soft => {
-			if preferred_cost.saturating_mul(STAR_ORDER_SOFT_MARGIN_DENOMINATOR)
-				<= declared_cost.saturating_mul(STAR_ORDER_SOFT_MARGIN_NUMERATOR)
+			if preferred_cost.saturating_mul(margin.denominator)
+				<= declared_cost.saturating_mul(margin.numerator)
 			{
 				StarOrderAction::Reordered
 			} else {
@@ -1877,6 +1901,7 @@ impl<'a> Binder<'a> {
 			None,
 			StarOrderStrategy::Broadcast,
 			confidence,
+			self.config.join_order_soft_margin_step.margin(),
 		);
 		let StarOrderOutcome::Recognized(evidence) = &recognized else {
 			unreachable!("recognized_star_order_outcome always recognizes");
@@ -1989,6 +2014,7 @@ impl<'a> Binder<'a> {
 			Some(applied_order),
 			selected_strategy,
 			confidence,
+			self.config.join_order_soft_margin_step.margin(),
 		);
 		let edge_targets = render_trace
 			.as_ref()

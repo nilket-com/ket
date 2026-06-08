@@ -415,14 +415,14 @@ pub(crate) fn adr189_advisory_does_not_change_margin_or_decision() {
 	let join_order = source("src/binder/join_order.rs");
 	let classify = first_block(&join_order, "pub(super) fn classify_star_order_action");
 
-	assert!(join_order.contains("pub(super) const STAR_ORDER_SOFT_MARGIN_NUMERATOR: u128 = 4;"));
-	assert!(join_order.contains("pub(super) const STAR_ORDER_SOFT_MARGIN_DENOMINATOR: u128 = 5;"));
+	// Retargeted for ADR 190: the margin is now a `SoftMargin` parameter, not a const read in the
+	// classifier. The surviving 189 invariant is that the decision path never consults the advisory
+	// or the accrued verdicts — the advisory remains read-only and one-directional.
 	assert!(classify.contains("JoinOrderEstimateConfidence::Hard => StarOrderAction::Reordered"));
-	assert!(classify.contains("preferred_cost.saturating_mul(STAR_ORDER_SOFT_MARGIN_DENOMINATOR)"));
-	assert!(classify.contains("declared_cost.saturating_mul(STAR_ORDER_SOFT_MARGIN_NUMERATOR)"));
-	assert!(!classify.contains("SoftMargin"));
 	assert!(!classify.contains("MarginAdvisory"));
+	assert!(!classify.contains("recommend_soft_margin"));
 	assert!(!classify.contains("OptimizerRuntimeVerdict"));
+	assert!(!classify.contains("verdict_snapshot"));
 }
 
 #[test]
@@ -543,4 +543,117 @@ pub(crate) fn adr189_no_optimizer_shell_or_planproperties_contract() {
 		"ADR189 introduced optimizer shell/property contract:\n{}",
 		format_offenders(&manifest, &offenders)
 	);
+}
+
+#[test]
+pub(crate) fn adr190_margin_is_config_not_const() {
+	let join_order = source("src/binder/join_order.rs");
+	let classify = first_block(&join_order, "pub(super) fn classify_star_order_action");
+	let rank = first_block(&join_order, "pub(super) fn rank_star_order");
+
+	assert!(classify.contains("margin: SoftMargin"));
+	assert!(classify.contains("margin.denominator"));
+	assert!(classify.contains("margin.numerator"));
+	assert!(!classify.contains("STAR_ORDER_SOFT_MARGIN"));
+	assert!(rank.contains("margin: SoftMargin"));
+}
+
+#[test]
+pub(crate) fn adr190_applied_margin_recorded_in_ranking_and_evidence() {
+	let join_order = source("src/binder/join_order.rs");
+	let explain = source("src/binder/explain.rs");
+	let ranking = first_block(&join_order, "pub(super) struct StarOrderRanking");
+	let evidence = first_block(&join_order, "pub(super) struct StarOrderEvidence");
+	let rerank = first_block(&join_order, "pub(super) fn measured_order_rerank");
+
+	assert!(ranking.contains("applied_margin: SoftMargin"));
+	assert!(evidence.contains("applied_margin: SoftMargin"));
+	assert!(rerank.contains("ranking.applied_margin"));
+	assert!(explain.contains("evidence.applied_margin.label()"));
+	assert!(explain.contains("ranking.applied_margin.label()"));
+}
+
+#[test]
+pub(crate) fn adr190_observed_paths_receive_configured_margin() {
+	let binder = binder_root_source();
+	let bind_explain = first_block(&binder, "async fn bind_with_explain_trace");
+
+	assert!(bind_explain.contains("analyze_snowflake("));
+	assert!(bind_explain.contains("analyze("));
+	assert_eq!(
+		bind_explain
+			.matches("config.join_order_soft_margin_step")
+			.count(),
+		2,
+		"both observed analyze paths must receive the configured margin step"
+	);
+}
+
+#[test]
+pub(crate) fn adr190_advisory_current_is_configured_margin() {
+	let binder = binder_root_source();
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+
+	assert!(bind_relation.contains("recommend_soft_margin("));
+	assert!(bind_relation.contains("self.config.join_order_soft_margin_step"));
+}
+
+#[test]
+pub(crate) fn adr190_margin_bounded_to_ladder() {
+	let binder = binder_root_source();
+	let join_order = source("src/binder/join_order.rs");
+	let soft_margin = first_block(&join_order, "pub(crate) struct SoftMargin");
+
+	assert!(binder.contains("pub join_order_soft_margin_step: SoftMarginLadderStep"));
+	// Raw ratio fields stay private; the operator selects a bounded ladder step only.
+	assert!(!soft_margin.contains("pub numerator"));
+	assert!(!soft_margin.contains("pub denominator"));
+	assert!(!soft_margin.contains("pub(crate) numerator"));
+}
+
+#[test]
+pub(crate) fn adr190_operator_applied_not_auto() {
+	let manifest = manifest_dir();
+	// The margin step is set only at config construction, never mutated and never written from
+	// the accrual/verdict path.
+	let assignments = source_lines(&manifest.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains(".join_order_soft_margin_step ="))
+		.collect::<Vec<_>>();
+	assert!(
+		assignments.is_empty(),
+		"join_order_soft_margin_step must not be reassigned (operator-applied, not auto):\n{}",
+		format_offenders(&manifest, &assignments)
+	);
+	assert!(!source("src/binder/decision_log.rs").contains("join_order_soft_margin_step"));
+}
+
+#[test]
+pub(crate) fn adr190_no_executor_storage_or_wendelon_change() {
+	let manifest = manifest_dir();
+	let markers = ["join_order_soft_margin_step", "SoftMarginLadderStep"];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR190 margin config leaked outside binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr190_no_optimizer_shell_or_planproperties_contract() {
+	adr189_no_optimizer_shell_or_planproperties_contract();
 }
