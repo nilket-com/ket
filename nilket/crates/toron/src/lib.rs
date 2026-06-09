@@ -832,6 +832,61 @@ mod tests {
 		);
 	}
 
+	// ADR 193: a flat mixed-strategy star (big dim hashes, small dim broadcasts) actuates and
+	// executes distributed, digest-matching the all-hash baseline. The discriminating check is that
+	// the plan is genuinely mixed (one hash edge, one broadcast edge), then that it runs correctly.
+	#[tokio::test]
+	async fn mixed_strategy_star_actuates_and_executes_distributed() {
+		let plan = mixed_star_plan();
+		let storage = mixed_star_storage();
+		let catalog = mixed_star_catalog();
+		let mixed_config = PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+			..PlannerConfig::default()
+		};
+
+		let (_bound, trace) = bind_with_trace(&plan, catalog.as_ref(), &mixed_config)
+			.await
+			.expect("bind mixed star");
+		let strategies: Vec<_> = trace.join_decisions.iter().map(|d| d.strategy).collect();
+		assert!(
+			strategies.contains(&JoinStrategy::Broadcast)
+				&& strategies.contains(&JoinStrategy::HashPartitioned),
+			"expected a genuinely mixed plan, got {strategies:?}"
+		);
+
+		let hash = run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+			plan.clone(),
+			mixed_star_catalog(),
+			PlannerConfig {
+				force_hash_join_ids: BTreeSet::from([JoinReplayId(0), JoinReplayId(1)]),
+				..PlannerConfig::default()
+			},
+			QueryBudget::test_default(),
+			storage.clone(),
+		)
+		.await
+		.expect("execute hash baseline");
+
+		let mixed =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				plan,
+				catalog,
+				mixed_config,
+				QueryBudget::test_default(),
+				storage,
+			)
+			.await
+			.expect("execute mixed star");
+
+		assert!(!mixed.results.is_empty(), "mixed star produced rows");
+		assert_eq!(
+			canonical_arrow_ipc_digest(&mixed.results, SortPolicy::FullRowLex)
+				.expect("mixed digest"),
+			canonical_arrow_ipc_digest(&hash.results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
 	#[tokio::test]
 	async fn broadcast_star_over_cap_replays_all_task_local_dims_and_succeeds() {
 		let logical = sql_fact_two_dim_join_plan();
@@ -2601,6 +2656,120 @@ mod tests {
 				.expect("seed optimizer facts");
 		}
 		Arc::new(catalog)
+	}
+
+	// ADR 193: a flat mixed-strategy star — orders ⋈ big (hash) ⋈ small (broadcast). `big` is over the
+	// broadcast cap; `small` under it. TableIds 1=orders 2=big 3=small, matching mixed_star_storage().
+	fn mixed_star_catalog() -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"orders",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("big_id", DataType::Int64, false),
+						Field::new("small_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"big",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(3),
+				named_descriptor(
+					3,
+					"small",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.unwrap();
+		for (table, bytes, rows, ndv) in [
+			// orders carries the FK NDVs: big_id (col 1) is high-cardinality, small_id (col 2) low.
+			(
+				"orders",
+				64 * 1024 * 1024_u64,
+				100_000_u64,
+				vec![(1, 10_000_u64), (2, 10_u64)],
+			),
+			("big", 8_192_u64, 10_000_u64, vec![(0, 10_000_u64)]),
+			("small", 512_u64, 10_u64, vec![(0, 10_u64)]),
+		] {
+			catalog
+				.seed_optimizer_facts(
+					&crate::catalog::TableRef::new(table),
+					TableOptimizerFacts {
+						byte_upper_bound: Some(ByteCount::new(bytes)),
+						row_upper_bound: Some(RowCount::new(rows)),
+						column_ndv: ndv
+							.into_iter()
+							.map(|(col, distinct)| {
+								(ColumnOrdinal(col), DistinctCountFact::Exact(distinct))
+							})
+							.collect(),
+						column_range: Default::default(),
+						column_range_distributions: Default::default(),
+						column_heavy_hitters: Default::default(),
+						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
+					},
+				)
+				.expect("seed mixed-star byte facts");
+		}
+		Arc::new(catalog)
+	}
+
+	fn mixed_star_storage() -> Arc<MultiTableStorageScan> {
+		let orders = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("big_id", DataType::Int64, false),
+				Field::new("small_id", DataType::Int64, false),
+			])),
+			vec![
+				Arc::new(Int64Array::from(vec![1000, 1001, 1002, 1003])),
+				Arc::new(Int64Array::from(vec![10, 20, 10, 30])),
+				Arc::new(Int64Array::from(vec![1, 2, 1, 2])),
+			],
+		)
+		.unwrap();
+		let big = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
+		)
+		.unwrap();
+		let small = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![1, 2]))],
+		)
+		.unwrap();
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([(TableId(1), orders), (TableId(2), big), (TableId(3), small)]),
+		})
+	}
+
+	fn mixed_star_plan() -> LogicalPlan {
+		crate::sql_planner::SqlPlanner::new()
+			.plan(
+				// Broadcast-first: `small` (under cap, scan-linear probe) broadcasts, `big` (over cap)
+				// hashes — a genuinely mixed left-deep star that fragments + executes distributed.
+				"SELECT * FROM orders o \
+				 INNER JOIN small s ON o.small_id = s.id \
+				 INNER JOIN big b ON o.big_id = b.id",
+			)
+			.expect("mixed-star SQL plan")
 	}
 
 	fn join_catalog_with_customers_row_upper_bound(

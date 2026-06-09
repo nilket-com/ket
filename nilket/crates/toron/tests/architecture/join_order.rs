@@ -609,9 +609,11 @@ pub(crate) fn adr181_uniform_strategy_recognizer() {
 	let evidence = first_block(&join_order, "pub(super) struct StarOrderEvidence");
 	let uniform = first_block(&join_order, "pub(super) fn uniform_star_order_strategy");
 
-	assert_eq!(enum_variant_count(&strategy), 2);
+	// ADR 193 added the `Mixed` summary variant alongside the two uniform recognizers.
+	assert_eq!(enum_variant_count(&strategy), 3);
 	assert!(strategy.contains("Broadcast"));
 	assert!(strategy.contains("HashPartitioned"));
+	assert!(strategy.contains("Mixed"));
 	assert!(evidence.contains("pub(super) strategy: StarOrderStrategy"));
 	assert!(decline.contains("MixedStrategyStar"));
 	assert!(!decline.contains("NotBroadcastStar"));
@@ -630,14 +632,19 @@ pub(crate) fn adr181_uniform_strategy_preflights_declared_and_selected() {
 	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 	let preflight = first_block(&binder, "fn preflight_star_order_strategy");
 
-	// ADR 192 preflights both orders; declared is now an `Option` (the snowflake broadcast upgrade
-	// tolerates a hash/None declared), selected must resolve.
-	assert!(local_actuator.contains("let declared_strategy = self.preflight_star_order_strategy("));
+	// ADR 192/193 preflight both orders into a `PreflightStrategy { summary, fingerprint }`. Declared
+	// is an `Option` (the snowflake broadcast upgrade tolerates a hash/None declared); selected must
+	// resolve or the actuation declines.
+	assert!(local_actuator.contains("let declared = self.preflight_star_order_strategy("));
 	assert!(local_actuator.contains("&declared_indices"));
-	assert!(local_actuator.contains("let Some(selected_strategy)"));
+	assert!(local_actuator.contains("let Some(selected) = self.preflight_star_order_strategy("));
 	assert!(local_actuator.contains("&selected_indices"));
-	// The strict declared == selected invariant survives for flat stars (AnyUniform).
-	assert!(local_actuator.contains("declared_strategy == Some(selected_strategy)"));
+	// The uniform declared == selected invariant survives as the per-dimension fingerprint match.
+	// ADR 193 adds a selected-Mixed exception separately.
+	assert!(
+		local_actuator
+			.contains("declared.as_ref().map(|d| &d.fingerprint) == Some(&selected.fingerprint)")
+	);
 	assert!(local_actuator.contains("StarOrderDeclineReason::MixedStrategyStar"));
 	assert!(local_actuator.contains("selected_strategy,"));
 	assert!(preflight.contains("let mut preflight_trace = base_trace.clone();"));
@@ -739,7 +746,8 @@ pub(crate) fn adr181_reuses_178_restore_and_179_180_net() {
 	);
 	assert!(verdict.contains("evidence.strategy"));
 	assert!(explain.contains("strategy={}; applied_order"));
-	assert!(explain.contains("strategy={}; dimensions"));
+	// ADR 193 inserted the per-edge `strategies=[{}]` detail between the summary and the dimensions.
+	assert!(explain.contains("strategy={}; strategies=[{}]; dimensions"));
 	assert!(!binder.contains("HashStarRuntimeObservation"));
 	assert!(!join_order.contains("HashStarRuntimeObservation"));
 	for forbidden in [
@@ -1505,7 +1513,9 @@ pub(crate) fn adr192_composite_natural_broadcast_is_authenticated() {
 	assert!(binder.contains("composite_build: bool"));
 	assert!(branch_builder.contains("composite_build: !child_dimensions.is_empty()"));
 	assert!(bound_dimension.contains("composite_build: dimension.composite_build"));
-	assert!(preflight.contains("let composite_build_positions = order"));
+	// ADR 193 wrapped the position set in an `if composite_builds` guard, but it is still derived
+	// from each dimension's `composite_build` flag and threaded into the fingerprint/uniformity rules.
+	assert!(preflight.contains("let composite_build_positions = if composite_builds"));
 	assert!(preflight.contains("dimensions[*dimension_index]"));
 	assert!(preflight.contains(".composite_build"));
 	assert!(preflight.contains("then_some(position)"));
@@ -1519,11 +1529,13 @@ pub(crate) fn adr192_selected_broadcast_upgrade_is_snowflake_specific() {
 	let local = first_block(&binder, "fn bind_local_star_actuation");
 
 	// The broadcast upgrade (selected Broadcast accepted even if declared differs) is gated on the
-	// snowflake-root authorization only; the flat-star arm requires declared == selected.
+	// snowflake-root authorization only; the flat-star arm never accepts a bare selected Broadcast —
+	// only a fingerprint match (or, post-193, a clean selected Mixed). ADR 193 renamed the locals to
+	// `selected.summary` / `fingerprint_match`, but the snowflake-specificity is unchanged.
 	assert!(local.contains("StarOrderStrategyAuthorization::CompositeBuildSnowflakeRoot =>"));
-	assert!(local.contains("selected_strategy == StarOrderStrategy::Broadcast"));
+	assert!(local.contains("selected.summary == StarOrderStrategy::Broadcast"));
 	assert!(local.contains("StarOrderStrategyAuthorization::AnyUniform =>"));
-	assert!(local.contains("declared_strategy == Some(selected_strategy)"));
+	assert!(local.contains("selected.summary == StarOrderStrategy::Mixed || fingerprint_match"));
 }
 
 #[test]
@@ -1575,4 +1587,79 @@ pub(crate) fn adr192_no_storage_wendelon_or_wire_surface() {
 		"ADR192 snowflake uniformity leaked outside the binder surface:\n{}",
 		format_offenders(&manifest, &offenders)
 	);
+}
+
+#[test]
+pub(crate) fn adr193_selected_preflight_is_the_authorization_gate() {
+	let binder = binder_source();
+	let local = first_block(&binder, "fn bind_local_star_actuation");
+
+	// ADR 193: the SELECTED physical order is authoritative. Its own preflight is the safety gate —
+	// an invalid selected preflight (placement violation) declines before any tier is considered.
+	assert!(local.contains("let Some(selected) = self.preflight_star_order_strategy"));
+	assert!(local.contains("StarOrderDeclineReason::MixedStrategyStar"));
+	// A clean selected `Mixed` actuates; the fingerprint is a soft disjunct (receipt honesty), never a
+	// hard precondition — `Mixed || fingerprint_match` proves Mixed actuates without a matching print.
+	assert!(local.contains("selected.summary == StarOrderStrategy::Mixed || fingerprint_match"));
+	assert!(local.contains("let fingerprint_match"));
+}
+
+#[test]
+pub(crate) fn adr193_mixed_classification_is_binder_only_no_fragmenter_change() {
+	// ADR 193 is a binder-only cut: the cost-ordered mixed plan is broadcast-first/hash-last and
+	// fragments through the existing flat path. The fragmenter never learned about the Mixed variant.
+	let fragment = source("src/distributed/fragment.rs");
+	assert!(!fragment.contains("StarOrderStrategy"));
+	assert!(!fragment.contains("Mixed"));
+	// The binder owns the Mixed classification.
+	let join_order = source("src/binder/join_order.rs");
+	assert!(join_order.contains("StarOrderStrategy::Mixed"));
+}
+
+#[test]
+pub(crate) fn adr193_reorder_cost_stays_row_only() {
+	let binder = binder_source();
+	let cost = first_block(&binder, "pub(super) fn order_cost");
+
+	// Row-only ordering remains the preserved first invariant: the cost weighs only `estimated_rows`,
+	// never strategy, placement, or byte size (cf. adr181_reorder_is_strategy_invariant).
+	assert!(cost.contains("dim.estimated_rows.get()"));
+	assert!(!cost.contains("JoinStrategy"));
+	assert!(!cost.contains("Broadcast"));
+	assert!(!cost.contains("placement"));
+	assert!(!cost.contains("byte"));
+}
+
+#[test]
+pub(crate) fn adr193_branch_mixed_stays_declined() {
+	let binder = binder_source();
+	let local = first_block(&binder, "fn bind_local_star_actuation");
+
+	// A branch (HashOnlyCompositeProbe) is hash-only — a mixed branch never actuates. The arm accepts
+	// neither Broadcast nor Mixed; it requires a uniform hash with a matching fingerprint.
+	assert!(local.contains("StarOrderStrategyAuthorization::HashOnlyCompositeProbe =>"));
+	assert!(
+		local.contains(
+			"selected.summary == StarOrderStrategy::HashPartitioned && fingerprint_match"
+		)
+	);
+}
+
+#[test]
+pub(crate) fn adr193_receipt_carries_per_edge_strategy_detail() {
+	let binder = binder_source();
+	let join_order = source("src/binder/join_order.rs");
+	let explain = source("src/binder/explain.rs");
+	let local = first_block(&binder, "fn bind_local_star_actuation");
+
+	// The actuated receipt carries a generic (not snowflake-named) per-edge strategy/placement list,
+	// populated from the selected fingerprint in applied order — `strategy=mixed` is not honest alone.
+	assert!(join_order.contains(
+		"pub(super) edge_strategies: Vec<(String, JoinStrategy, JoinPhysicalPlacement)>,"
+	));
+	assert!(local.contains("let edge_strategies = applied_order"));
+	assert!(local.contains(".fingerprint"));
+	assert!(local.contains("expect(\"selected preflight fingerprint covers applied order\")"));
+	// Explain renders it behind the summary as `strategy={}; strategies=[{}]`.
+	assert!(explain.contains("strategy={}; strategies=[{}]"));
 }

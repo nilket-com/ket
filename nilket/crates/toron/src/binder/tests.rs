@@ -8413,9 +8413,9 @@ async fn optimizer_decisions_accrue_across_queries() {
 	let kept = SqlPlanner::new()
 		.plan(preferred_star_order_sql())
 		.expect("plan kept star");
-	let declined = SqlPlanner::new()
+	let actuated = SqlPlanner::new()
 		.plan(mixed_strategy_snowflake_order_sql())
-		.expect("plan declined snowflake");
+		.expect("plan actuated snowflake");
 
 	let _ = bind(&reordered, &star_catalog, &config)
 		.await
@@ -8423,9 +8423,9 @@ async fn optimizer_decisions_accrue_across_queries() {
 	let _ = bind(&kept, &star_catalog, &config)
 		.await
 		.expect("bind kept star");
-	let _ = bind(&declined, &mixed_snowflake_catalog, &config)
+	let _ = bind(&actuated, &mixed_snowflake_catalog, &config)
 		.await
-		.expect("bind declined snowflake");
+		.expect("bind actuated snowflake");
 	let rows = optimizer_decision_rows(&star_catalog, &config).await;
 
 	assert_eq!(
@@ -8436,13 +8436,15 @@ async fn optimizer_decisions_accrue_across_queries() {
 		optimizer_decision_count(&rows, "flat_star", "kept_optimal", None),
 		1
 	);
+	// ADR 193: the mixed-strategy snowflake root now actuates (it no longer declines as
+	// `mixed_strategy_star`). The broadcast-first declared order is already optimal at the root, and
+	// the bushy `customers` branch reorders — both decisions accrue alongside the flat-star ones.
 	assert_eq!(
-		optimizer_decision_count(
-			&rows,
-			"snowflake_root",
-			"declined",
-			Some("mixed_strategy_star")
-		),
+		optimizer_decision_count(&rows, "snowflake_root", "kept_optimal", None),
+		1
+	);
+	assert_eq!(
+		optimizer_decision_count(&rows, "snowflake_branch", "reordered", None),
 		1
 	);
 }
@@ -8660,7 +8662,7 @@ async fn non_star_join_declines_with_reason() {
 async fn snowflake_order_evidence_reports_nested_declared_vs_preferred() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
+		.plan(&format!("EXPLAIN {}", observed_snowflake_order_sql()))
 		.expect("plan snowflake EXPLAIN");
 
 	let (_schema, rows) =
@@ -8837,35 +8839,39 @@ async fn optimizer_decisions_record_committed_not_scratch() {
 		1
 	);
 
+	// ADR 193: the mixed-strategy root now actuates, so the declined-root case is a non-scan-linear
+	// probe (outside the actuator's authorized domain). It declines before any branch is bound, so the
+	// decision log carries no snowflake_branch decisions — the same commit-discard guarantee at the
+	// decision-log level that `root_decline_keeps_observed_snowflake_state` proves at the render level.
 	let declined_catalog = mixed_strategy_snowflake_join_order_catalog();
 	let declined_config = auto_broadcast_config(4_096);
 	let declined = SqlPlanner::new()
-		.plan(mixed_strategy_snowflake_order_sql())
+		.plan(observed_snowflake_order_sql())
 		.expect("plan declined snowflake");
 	let _ = bind(&declined, &declined_catalog, &declined_config)
 		.await
 		.expect("bind declined snowflake");
 	let declined_rows = optimizer_decision_rows(&declined_catalog, &declined_config).await;
 
-	assert_eq!(
-		optimizer_decision_count(
-			&declined_rows,
-			"snowflake_root",
-			"declined",
-			Some("mixed_strategy_star")
-		),
-		1
-	);
 	assert!(
 		!declined_rows
 			.iter()
 			.any(|row| row[0] == ScalarValue::Utf8(Some("snowflake_branch".to_string()))),
 		"declined root must discard scratch branch decisions: {declined_rows:?}"
 	);
+	assert!(
+		!declined_rows.iter().any(|row| row[0]
+			== ScalarValue::Utf8(Some("snowflake_root".to_string()))
+			&& row[1] == ScalarValue::Utf8(Some("reordered".to_string()))),
+		"non-actuating snowflake commits no snowflake_root reorder: {declined_rows:?}"
+	);
 }
 
+// ADR 193: the mixed-strategy snowflake root (stores broadcast, customers-composite hash) now
+// ACTUATES — the selected order is authoritative. The receipt is honestly mixed: a `strategy=mixed`
+// summary plus a per-edge `strategies=[...]` detail with both a broadcast and a hash edge.
 #[tokio::test]
-async fn mixed_strategy_snowflake_still_declines_actuation() {
+async fn mixed_strategy_snowflake_root_actuates_with_mixed_receipt() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
@@ -8873,16 +8879,22 @@ async fn mixed_strategy_snowflake_still_declines_actuation() {
 
 	let (_schema, rows) =
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
-	let row = join_order_snowflake_row(&rows);
-
-	assert_eq!(
-		row[0],
-		ScalarValue::Utf8(Some("join_order_snowflake".to_string()))
-	);
+	let mixed_row = rows
+		.iter()
+		.find(|row| {
+			row[0] == ScalarValue::Utf8(Some("join_order".to_string()))
+				&& matches!(&row[3], ScalarValue::Utf8(Some(detail)) if detail.contains("strategy=mixed"))
+		})
+		.expect("mixed snowflake root actuates with a strategy=mixed receipt");
+	assert_utf8_contains(&mixed_row[3], "strategy=mixed");
+	assert_utf8_contains(&mixed_row[3], "broadcast");
+	assert_utf8_contains(&mixed_row[3], "hash_partitioned");
+	// The snowflake no longer reports an observed-only verdict once its root actuates.
 	assert!(
 		!rows
 			.iter()
-			.any(|row| { row[0] == ScalarValue::Utf8(Some("join_order".to_string())) })
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_snowflake".to_string()))),
+		"actuated mixed snowflake emits no observed-only verdict"
 	);
 }
 
@@ -9037,7 +9049,7 @@ async fn snowflake_order_evidence_is_observational() {
 	let (catalog, storage) = mixed_strategy_snowflake_execution_fixture().await;
 	let config = auto_broadcast_config(4_096);
 	let logical = SqlPlanner::new()
-		.plan(non_optimal_snowflake_order_project_sql())
+		.plan(observed_snowflake_order_project_sql())
 		.expect("plan snowflake SQL");
 
 	let (plain_plan, plain_trace) = bind_with_trace(&logical, &catalog, &config)
@@ -9058,7 +9070,7 @@ async fn snowflake_order_evidence_is_observational() {
 	let (_schema, rows) = execute_star_order_query(
 		&catalog,
 		storage,
-		non_optimal_snowflake_order_project_sql(),
+		observed_snowflake_order_project_sql(),
 		&config,
 	)
 	.await;
@@ -9076,7 +9088,7 @@ async fn snowflake_order_evidence_is_observational() {
 async fn snowflake_recognized_supersedes_flat_missing_relation_decline() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(&format!("EXPLAIN {}", non_optimal_snowflake_order_sql()))
+		.plan(&format!("EXPLAIN {}", observed_snowflake_order_sql()))
 		.expect("plan snowflake EXPLAIN");
 
 	let (_schema, rows) =
@@ -9096,7 +9108,7 @@ async fn snowflake_recognized_supersedes_flat_missing_relation_decline() {
 async fn snowflake_branch_links_outer_dimension_to_inner_probe() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(non_optimal_snowflake_order_sql())
+		.plan(observed_snowflake_order_sql())
 		.expect("plan snowflake SQL");
 
 	let (_plan, _trace, render_trace) =
@@ -9180,31 +9192,39 @@ fn snowflake_uniformity_accepts_only_authenticated_composite_natural_broadcast()
 	assert_eq!(uniform_star_order_strategy(&decisions), None);
 }
 
+// ADR 193: the observed snowflake evidence still records each edge's resolved strategy/placement,
+// but those strategies do not gate anything on the observe-only path — they are reported, not
+// authorized against. A non-scan-linear probe forces every edge to hash (broadcast needs a
+// scan-linear probe), and the evidence records that honestly with `scan_linear=false`. The broadcast
+// edge in a *mixed* receipt is proven on the actuated path by
+// `mixed_strategy_snowflake_root_actuates_with_mixed_receipt`.
 #[tokio::test]
 async fn snowflake_evidence_records_per_edge_strategy_without_gating() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(&format!("EXPLAIN {}", mixed_strategy_snowflake_order_sql()))
+		.plan(&format!("EXPLAIN {}", observed_snowflake_order_sql()))
 		.expect("plan mixed-strategy snowflake EXPLAIN");
 
 	let (_schema, rows) =
 		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
 	let row = join_order_snowflake_row(&rows);
 
-	assert_utf8_contains(&row[3], "s:broadcast/swapped_right_build");
 	assert_utf8_contains(&row[3], "c:hash_partitioned/natural");
+	assert_utf8_contains(&row[3], "s:hash_partitioned/natural");
+	assert_utf8_contains(&row[3], "scan_linear=false");
 }
 
 #[tokio::test]
 async fn root_decline_keeps_observed_snowflake_state() {
-	// Commit-discard atomicity: a mixed-strategy root (stores broadcast, customers hash)
-	// declines actuation. Even though the `customers -> {regions, segments}` branch is bushy
-	// and could reorder locally, the root-gate throws the branch receipts away with the root
-	// and falls back to the 182-184 observe-only path. The render state must be
-	// ObservedSnowflake, never a committed StarReceipts tree.
+	// ADR 193: commit-discard atomicity. The root declines actuation because its probe is
+	// non-scan-linear (outside the actuator's authorized domain), not because it is mixed — mixed
+	// roots now actuate. Even though the `customers -> {regions, segments}` branch is bushy and
+	// could reorder locally, the root-gate throws the branch receipts away with the root and falls
+	// back to the 182-184 observe-only path. The render state must be ObservedSnowflake, never a
+	// committed StarReceipts tree.
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(mixed_strategy_snowflake_order_sql())
+		.plan(observed_snowflake_order_sql())
 		.expect("plan mixed-strategy snowflake");
 
 	let (_plan, _trace, render_trace) =
@@ -9229,7 +9249,7 @@ async fn root_decline_keeps_observed_snowflake_state() {
 async fn snowflake_order_evidence_is_explain_gated() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(non_optimal_snowflake_order_sql())
+		.plan(observed_snowflake_order_sql())
 		.expect("plan snowflake SQL");
 
 	let (_plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
@@ -9253,7 +9273,7 @@ async fn snowflake_order_evidence_is_explain_gated() {
 async fn snowflake_explain_analyze_emits_plan_runtime_and_verdict() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(non_optimal_snowflake_order_sql())
+		.plan(observed_snowflake_order_sql())
 		.expect("plan snowflake SQL");
 	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
 		.await
@@ -9338,7 +9358,7 @@ async fn snowflake_explain_analyze_emits_plan_runtime_and_verdict() {
 async fn snowflake_runtime_replay_ids_collected_from_edges() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(non_optimal_snowflake_order_sql())
+		.plan(observed_snowflake_order_sql())
 		.expect("plan snowflake SQL");
 	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
 		.await
@@ -9774,7 +9794,7 @@ async fn observed_snowflake_uses_auto_applied_margin() {
 	// signal makes the observed snowflake receipt show soft_margin=9/10.
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(&format!("EXPLAIN {}", mixed_strategy_snowflake_order_sql()))
+		.plan(&format!("EXPLAIN {}", observed_snowflake_order_sql()))
 		.expect("plan mixed-strategy snowflake EXPLAIN");
 
 	let config = PlannerConfig {
@@ -9858,7 +9878,7 @@ async fn advisory_current_is_applied_margin() {
 async fn observed_snowflake_uses_configured_margin() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(&format!("EXPLAIN {}", mixed_strategy_snowflake_order_sql()))
+		.plan(&format!("EXPLAIN {}", observed_snowflake_order_sql()))
 		.expect("plan mixed-strategy snowflake EXPLAIN");
 
 	let config = PlannerConfig {
@@ -10794,6 +10814,7 @@ fn verdict_indeterminate_on_missing_actuals() {
 		],
 		Some(vec!["p".to_string(), "c".to_string()]),
 		StarOrderStrategy::Broadcast,
+		Vec::new(),
 		JoinOrderEstimateConfidence::Hard,
 		CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP.margin(),
 	);
@@ -10979,10 +11000,12 @@ async fn rune_explain_shows_star_order_evidence() {
 #[tokio::test]
 async fn rune_explain_shows_snowflake_order_evidence() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
+	// ADR 193: a non-scan-linear Rune probe (`.sort(...)` on the fact table) keeps the snowflake on
+	// the observe-only path — Rune is the primary surface for the observed-snowflake evidence.
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
-            ctx.table("orders").alias("o")
+            ctx.table("orders").alias("o").sort([qcol("o", "id").asc()])
                .auto_join(
                    ctx.table("customers").alias("c"),
                    qcol("o", "customer_id").eq(qcol("c", "id"))
@@ -11120,10 +11143,11 @@ async fn rune_analyze_renders_star_order_verdict() {
 #[tokio::test]
 async fn rune_analyze_shows_snowflake_verdict() {
 	let catalog = mixed_strategy_snowflake_join_order_catalog();
+	// ADR 193: a non-scan-linear Rune probe (`.sort(...)`) keeps the snowflake observed, not actuated.
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
-            ctx.table("orders").alias("o")
+            ctx.table("orders").alias("o").sort([qcol("o", "id").asc()])
                .auto_join(
                    ctx.table("customers").alias("c"),
                    qcol("o", "customer_id").eq(qcol("c", "id"))
@@ -13895,6 +13919,30 @@ fn mixed_strategy_snowflake_order_sql() -> &'static str {
 
 fn non_optimal_snowflake_order_project_sql() -> &'static str {
 	"SELECT o.id, c.id, r.id, g.id, s.id FROM orders o \
+	 INNER JOIN customers c ON o.customer_id = c.id \
+	 INNER JOIN regions r ON c.region_id = r.id \
+	 INNER JOIN segments g ON c.segment_id = g.id \
+	 INNER JOIN stores s ON o.store_id = s.id"
+}
+
+// ADR 193: after the mixed-strategy root actuates, a recognized snowflake reaches the
+// observe-only path only when its shape is outside the root actuator's authorized domain. A
+// non-scan-linear probe (the fact table arrives via a `LIMIT` subplan) is such a shape: the root
+// actuator requires a scan-linear probe to guarantee a fragmentable left-deep plan, so it declines
+// with `ProbeNotScanLinear`, while `analyze_snowflake` still recognizes the full
+// orders -> {customers -> {regions, segments}, stores} tree. This is the post-193 evidence path the
+// observation machinery is exercised against. The `LIMIT` is wider than the fixture's row count, so
+// rows and order are preserved.
+fn observed_snowflake_order_sql() -> &'static str {
+	"SELECT * FROM (SELECT * FROM orders LIMIT 1000000) o \
+	 INNER JOIN customers c ON o.customer_id = c.id \
+	 INNER JOIN regions r ON c.region_id = r.id \
+	 INNER JOIN segments g ON c.segment_id = g.id \
+	 INNER JOIN stores s ON o.store_id = s.id"
+}
+
+fn observed_snowflake_order_project_sql() -> &'static str {
+	"SELECT o.id, c.id, r.id, g.id, s.id FROM (SELECT * FROM orders LIMIT 1000000) o \
 	 INNER JOIN customers c ON o.customer_id = c.id \
 	 INNER JOIN regions r ON c.region_id = r.id \
 	 INNER JOIN segments g ON c.segment_id = g.id \

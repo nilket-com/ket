@@ -2,98 +2,76 @@
 
 Pairs with `plans/adr/193_mixed_strategy_star_snowflake_join_order.md`.
 
-Make a mixed broadcast+hash root star/snowflake actuate **and execute distributed**. The binder gate relaxation, the `Mixed` summary, and the per-edge receipt are thin; the load-bearing work is the distributed fragmenter learning to stage a heterogeneous plan. Ordering/cost is untouched: row-only ranking remains ADR 181's preserved invariant, not a new claim that mixed network cost is solved. Execution-proof-driven: write the failing distributed test first; it fixes the exact fragmenter scope.
+Make a mixed broadcast+hash root star/snowflake actuate **and execute distributed**. As built, the entire cut is **binder-only**: the `Mixed` classification, the selected-preflight gate relaxation, and the per-edge receipt. Implementation **falsified the planned fragmenter work** — the binder's cost-optimal order is broadcast-first/hash-last, a left-deep shape the existing `fragment_join_plan` already stages, so the distributed headline passes with zero fragmenter change. Ordering/cost is untouched: row-only ranking remains ADR 181's preserved invariant, not a new claim that mixed network cost is solved.
 
 ## Anchors (verified)
 
 | Concern | Anchor |
 |---|---|
-| Fragmenter dispatch on single topmost strategy | `fragment_join_plan` — `distributed/fragment.rs:374` |
-| Hash path needs bare `Exchange(scan)` inputs | `fragment_hash_join_plan` `:401`; `extract_exchange` `:1028` → `JoinInputNotExchanged` |
-| Broadcast probe-chain must be all-broadcast | `rewrite_broadcast_star_probe` `:603-655` → `BroadcastProbeNotStarLinear` `:623` |
-| Single-stage assumption | `MultipleExchangeBoundaries` `:286` |
-| Uniformity gate + decline | `uniform_star_order_strategy`/`uniform_snowflake_order_strategy` `join_order.rs:1274/1300`; `MixedStrategyStar` decline `:322`, `:2066`, `:2090` |
-| Strategy summary enum | `StarOrderStrategy` `join_order.rs:269` |
-| Per-edge strategy carrier (already exists) | `SnowflakeEdgeStrategy {strategy, placement, ..}` `:356`; `SnowflakeOrderEvidence.edge_strategies` `:346` |
-| Acted receipt strategy (single → +Mixed/per-edge) | `StarOrderEvidence.strategy` `:311`; render `binder/explain.rs:~1464` |
-| Row-only ordering invariant (KEEP) | `order_cost` `:1351`; `rank_star_order` `:1017`; guard `adr181_reorder_is_strategy_invariant` `tests/architecture/join_order.rs:653` |
-| Per-edge strategy choice (unchanged) | `choose_auto_join_strategy` `binder/join.rs:430` |
-| Mixed-declines tests to retarget | `mixed_strategy_star_declines` `tests.rs:8578` (`declined_mixed_strategy_star`); snowflake mixed `:8409` |
-| Distributed digest baseline (template) | `three_way_broadcast_star_digest_matches_hash_over_tcp` `lib.rs:809` |
+| Per-edge strategy choice (unchanged) | `choose_auto_join_strategy` `binder/join.rs:430` — broadcast requires a scan-linear probe (`right_viable = … filter(\|_\| left_input.probe_scan_linear)`) |
+| Existing fragmenter (reused unchanged) | `fragment_join_plan` `distributed/fragment.rs`; broadcast-first/hash-last fragments through the existing flat path |
+| Uniformity gate + decline | `uniform_star_order_strategy`/`uniform_snowflake_order_strategy`; `MixedStrategyStar` decline |
+| Strategy summary enum (+`Mixed`) | `StarOrderStrategy` `join_order.rs:269` |
+| Acted receipt per-edge carrier (new) | `StarOrderEvidence.edge_strategies` `join_order.rs:319`; render `binder/explain.rs:1153` |
+| Selected-preflight gate | `bind_local_star_actuation` `join_order.rs:2052`; `preflight_star_order_strategy` `:2278`; `order_strategy_fingerprint` `:1356` |
+| Row-only ordering invariant (KEEP) | `order_cost`; `rank_star_order`; guard `adr181_reorder_is_strategy_invariant` |
+| Distributed digest baseline (template) | `three_way_broadcast_star_digest_matches_hash_over_tcp` `lib.rs` |
 
 ## Phase 0 — Discriminating distributed fixture first
 
-Add `mixed_strategy_snowflake_root_actuates_and_executes_distributed` and confirm it **fails on `main`**. Minimal shape: one over-cap dimension (→ hash) and small dims (→ broadcast), e.g. the canonical snowflake with `customers` (or a fat dim) over the broadcast cap and `regions`/`segments`/`stores` under it. Run distributed, digest-match the all-hash baseline. **Confirm the failing signal:** today the binder-built mixed plan reaches distributed `fragment_plan` and crashes (`BroadcastProbeNotStarLinear` / `JoinInputNotExchanged` / `MultipleExchangeBoundaries`) — the over-cap→hash *demotion* keeps single-broadcast plans uniform but does not rescue a genuinely mixed plan. Capture the exact crash to scope Phase 3.
+`mixed_strategy_star_actuates_and_executes_distributed` (`lib.rs`): a flat mixed star — `orders ⋈ small` (under-cap → broadcast) and `orders ⋈ big` (over-cap → hash), broadcast-first declared order. Run distributed, digest-match the all-hash baseline (built with `force_hash_join_ids`). **The failing-on-`main` signal is a decline, not a crash:** pre-193 the actuator collapses the per-edge strategies and returns `Declined(MixedStrategyStar)` — it never reaches the fragmenter. (The promoted plan predicted a `fragment_plan` crash; implementation falsified that — see Phase 3.)
 
-## Phase 1 — Mixed classification + gate relaxation (binder, small)
+## Phase 1 — Mixed classification + selected-preflight gate (binder; the load-bearing cut)
 
-In `join_order.rs`, add a classifier that runs **after** the strict `uniform_*_order_strategy` fast paths over the preflight `DecisionReceipt` vector:
-- all-broadcast valid placements → `Broadcast`; all-hash → `HashPartitioned`; valid hash/broadcast mixture → `Mixed`; else decline.
-- snowflake-root `Broadcast + Natural` still requires `composite_build_positions` authentication (192 fence).
+In `join_order.rs`:
+- Add `StarOrderStrategy::Mixed`.
+- `preflight_star_order_strategy` returns `PreflightStrategy { summary, fingerprint }`. `order_strategy_fingerprint` validates placements (`(Broadcast, SwappedRightBuild)` valid; `(Broadcast, Natural)` valid only at an authenticated composite position; `(HashPartitioned, Natural)` valid; else `None` → decline). The strict `uniform_*_order_strategy` recognizers stay the fast path; a valid non-uniform set is `.unwrap_or(StarOrderStrategy::Mixed)`.
+- In `bind_local_star_actuation`, **the selected physical order is authoritative.** Typed authorization:
+  - `AnyUniform` (flat-star root): `selected.summary == Mixed || fingerprint_match`.
+  - `CompositeBuildSnowflakeRoot` (snowflake root): `selected.summary == Broadcast || selected.summary == Mixed || fingerprint_match`.
+  - `HashOnlyCompositeProbe` (branch): `selected.summary == HashPartitioned && fingerprint_match` — branch-local mixed stays declined.
 
-Return a preflight result that includes both the summary and a per-dimension strategy fingerprint:
+  The fingerprint is **not** an authorization gate. The cost reorder legitimately flips a dim's strategy (hash→broadcast once it moves ahead of the hash join), so a declared==selected match would block exactly this reorder. `fingerprint_match` is demoted to a soft disjunct (uniform stability) and to receipt honesty. An invalid selected placement (`order_strategy_fingerprint` → `None`) still declines `MixedStrategyStar` before any tier.
 
-```rust
-struct StarOrderPreflight {
-    strategy: StarOrderStrategy,
-    edges: Vec<JoinOrderEdgeStrategy>,
-}
-```
+Ordering (`selected_indices` by `estimated_rows`) and `order_cost` unchanged.
 
-The fingerprint must be keyed by dimension label, not only by preflight position, so reordered plans can prove that the same logical edge stayed hash or broadcast. Add `Mixed` to the strategy summary (`StarOrderStrategy::Mixed` or an equivalent local summary). In `bind_local_star_actuation` (`:2057-2092`), stop returning `Declined(MixedStrategyStar)` when the classifier yields an authorized `Mixed`; authorize mixed actuation only when **declared and selected both classify as `Mixed` and their per-dimension strategy fingerprints match**. Placement may differ only where the ADR 192 composite-build fence authenticates `Broadcast + Natural`. Keep 192's `CompositeBuildSnowflakeRoot` selected-broadcast upgrade broadcast-specific. Ordering (`selected_indices` by `estimated_rows`) and `order_cost` unchanged.
+## Phase 2 — Per-edge `Mixed` receipt (binder/render)
 
-Branch authorization (`HashOnlyCompositeProbe`) is unchanged — branch-local mixed stays declined.
+Add a generic `edge_strategies: Vec<(String, JoinStrategy, JoinPhysicalPlacement)>` to `StarOrderEvidence` (not snowflake-named). `bind_local_star_actuation` populates it from the selected fingerprint in applied order; threaded through `recognized_star_order_outcome`. EXPLAIN renders `strategy=mixed; strategies=[c:hash_partitioned/natural,s:broadcast/swapped_right_build]` (`binder/explain.rs`). Render/telemetry only.
 
-## Phase 2 — Per-edge `Mixed` receipt (binder/render, small)
+## Phase 3 — Fragmenter: reused unchanged (planned cliff falsified)
 
-Carry the per-edge strategy/placement list on the acted `StarOrderEvidence`. Prefer a generic carrier such as `JoinOrderEdgeStrategy`; do not make acted star evidence depend on a snowflake-only type name just because `SnowflakeOrderEvidence.edge_strategies` already exists. EXPLAIN renders `strategy=mixed` + `strategies=[…]`. Update `binder/explain.rs` labels; leave `decision_log` unchanged unless implementation actually adds strategy labels to accumulated decision rows. Render/telemetry only — no executor/storage surface.
+The promoted plan scoped heterogeneous fragmenter staging as "the ADR." Implementation proved it unnecessary:
+- `choose_auto_join_strategy` only broadcasts a scan-linear probe, so a hash join earlier in the order forces later edges to hash. The row-only cost optimum therefore emits **broadcast-first / hash-last** — `Join(Hash, probe=Join(Broadcast, …, scan))` — a clean left-deep shape.
+- That shape is exactly what `fragment_join_plan` already stages: the broadcast-first probe subtree fragments through the existing broadcast path, leaving the topmost hash join with bare `Exchange(scan)` inputs.
+- An exploratory fragmenter change broke `overestimated_inner_join_broadcast_over_cap_replays_as_hash_and_matches_digest` (a nested broadcast-in-hash-input already runs flat with replay) and was reverted. `distributed/fragment.rs` is **unchanged**.
 
-## Phase 3 — Fragmenter heterogeneous staging (the ADR; worklist; driven by Phase 0)
+Guard pins it: `adr193_mixed_classification_is_binder_only_no_fragmenter_change` asserts `fragment.rs` never learns `StarOrderStrategy`/`Mixed`. A heterogeneous-stage fragmenter is deferred until a discriminating execution fixture forces it.
 
-Run Phase 0 after Phases 1-2.
+## Phase 4 — Tests (as built)
 
-- **If the minimal mixed plan already fragments+executes:** 193 is binder+receipt only; add guards proving the fragmenter shape was reused. (Unlikely per grounding.)
-- **If it crashes (expected):** generalize fragmentation so a stage input may be a **fragmented upstream subtree**, not only a bare `Exchange(scan)`:
-  - when a hash join's input is itself a `Join`, fragment it into its own stage and consume its published output (relax `extract_exchange`/`JoinInputNotExchanged` for that case);
-  - when a broadcast probe-chain input is a hash-shuffled subtree, fragment it as an upstream stage instead of `BroadcastProbeNotStarLinear`;
-  - lift `MultipleExchangeBoundaries` for the mixed shape;
-  - implement the new stage-dependency traversal as an explicit **worklist/`VecDeque`**, never recursive descent; guard that each upstream producer precedes its consumer via `upstream_stages`;
-  - preserve uniform hash and uniform broadcast fragmentation **byte-identically** — the mixed path is strictly additive.
+- `mixed_strategy_star_actuates_and_executes_distributed` (`lib.rs`) — Phase 0 headline; declines on `main`; root `join_order` receipt `strategy=mixed`; trace carries both Broadcast and HashPartitioned; distributed digest-matches the `force_hash_join_ids` baseline.
+- `mixed_strategy_snowflake_root_actuates_with_mixed_receipt` (`tests.rs`, inverted from `mixed_strategy_snowflake_still_declines_actuation`) — the reordering mixed snowflake root actuates; `strategy=mixed` + per-edge `strategies=[…]` with a broadcast and a hash edge; no observe-only verdict. This is the case where selected ≠ declared, so **selected-preflight authority** (not fingerprint match) is what authorizes it.
+- Observe-only retargets: every valid scan-linear root now actuates, so the 13 observation tests (`snowflake_order_evidence_is_observational`, `…_is_explain_gated`, `root_decline_keeps_observed_snowflake_state`, the margin/Rune/runtime/verdict tests, etc.) were retargeted to a **non-scan-linear probe** (`observed_snowflake_order_sql` — fact table via `LIMIT`; Rune via `.sort(...)`). A non-scan-linear probe forces all edges to hash, so `snowflake_evidence_records_per_edge_strategy_without_gating` asserts the observed all-hash recording with `scan_linear=false` (the broadcast-edge receipt is proven on the actuated path).
+- Decision-log retargets: `optimizer_decisions_accrue_across_queries` and `optimizer_decisions_record_committed_not_scratch` updated — the mixed snowflake actuates (`snowflake_root/kept_optimal` + `snowflake_branch/reordered`); the declined-root case is the non-scan-linear probe (commit-discard atomicity at the decision-log level).
 
-Scope to the **minimal** shape the headline needs; defer arbitrary bushy mixed plans. No executor-kernel change (the in-process executor already evaluates nested mixed trees).
+## Phase 5 — Architecture guards (as built)
 
-## Phase 4 — Tests
-
-- `mixed_strategy_snowflake_root_actuates_and_executes_distributed` — Phase 0 headline; fails on `main`; root `join_order` receipt `strategy=mixed`; digest-matches all-hash baseline.
-- `mixed_strategy_flat_star_actuates_and_executes_distributed` — flat star, one over-cap + one under-cap dim; mixed receipt + distributed digest match. (Support if the snowflake headline already forces the full fragmenter scope.)
-- Retarget `mixed_strategy_star_declines` (`tests.rs:8578`) and the snowflake mixed decline (`:8409`): the baseline mixed case **actuates**; keep a still-deferred shape (branch-local mixed / bushy / non-scan-linear) that **still declines** (`MixedStrategyStar`), pinning the baseline boundary.
-- `mixed_strategy_receipt_renders_per_edge_strategies`; `mixed_strategy_keeps_row_only_ordering`; `mixed_strategy_declared_selected_must_both_be_mixed`; `mixed_strategy_requires_declared_selected_edge_fingerprint_match`; `mixed_branch_still_declines_or_binds_declared`.
-- `mixed_snowflake_fragment_producers_precede_consumers` — worklist stage-ordering assertion.
-- Regression (byte-identical): `uniform_hash_star_unchanged`, `uniform_broadcast_star_unchanged`, `broadcast_snowflake_root_actuates_and_executes_distributed` still passes, `nested_broadcast_probe_still_rejects_unsupported_shape`.
-- `rune_mixed_strategy_snowflake_matches_sql` — Rune parity (primary interface).
-
-## Phase 5 — Architecture guards
-
-- `adr193_strategy_summary_has_mixed_state` — acted receipts can represent `Mixed`.
-- `adr193_receipt_carries_per_edge_strategies` — acted star evidence owns per-edge strategy/placement.
-- `adr193_ordering_remains_row_only` — `order_cost`/`rank_star_order`/`classify_star_order_action` still don't read `JoinStrategy` (preserves `adr181_reorder_is_strategy_invariant`, does not invert it).
-- `adr193_mixed_classification_uses_preflight_decisions` — mixed is derived from the preflight decisions that prove executability.
-- `adr193_mixed_authorization_uses_edge_strategy_fingerprint` — mixed root authorization compares declared/selected per-dimension strategy fingerprints, not only the `Mixed` summary.
-- `adr193_snowflake_mixed_preserves_composite_authentication` — snowflake-root mixed still checks `composite_build_positions`.
-- `adr193_branch_mixed_strategy_stays_declined` — branch composites remain hash-only.
-- `adr193_fragmenter_mixed_subtree_staging_is_worklist_driven` — new mixed-stage traversal uses a `VecDeque`/worklist + explicit `upstream_stages`, no new recursive fragmenter descent.
-- `adr193_uniform_fragmentation_paths_preserved` — uniform hash/broadcast fragmentation unchanged.
-- `adr193_no_topology_memo_or_planproperties`; `adr193_no_storage_wendelon_pbc_wire_or_executor_kernel_change`.
+- `adr193_selected_preflight_is_the_authorization_gate` — selected-Mixed actuates; fingerprint is a soft disjunct (`Mixed || fingerprint_match`), not a precondition; invalid selected placement declines.
+- `adr193_mixed_classification_is_binder_only_no_fragmenter_change` — `distributed/fragment.rs` never learns `StarOrderStrategy`/`Mixed`; the binder owns `StarOrderStrategy::Mixed`.
+- `adr193_reorder_cost_stays_row_only` — `order_cost` weighs only `estimated_rows`; no strategy/placement/byte terms.
+- `adr193_branch_mixed_stays_declined` — `HashOnlyCompositeProbe` requires uniform hash; no Broadcast/Mixed acceptance.
+- `adr193_receipt_carries_per_edge_strategy_detail` — generic `edge_strategies` carrier; explain renders `strategy={}; strategies=[{}]`.
+- Refactor-travels updates: `adr181_uniform_strategy_recognizer` (now 3 variants, +`Mixed`), `adr181_uniform_strategy_preflights_declared_and_selected` (renamed `declared`/`selected` locals, fingerprint-match expresses the strict flat-star equality), `adr181_reuses_178_restore_and_179_180_net` (format string gained `strategies=[{}]`), `adr192_composite_natural_broadcast_is_authenticated` + `adr192_selected_broadcast_upgrade_is_snowflake_specific` (post-refactor strings; snowflake-specificity preserved).
 
 ## Verification
 
 ```sh
 scripts/cargo-cgroup check -p toron --all-targets
-scripts/cargo-cgroup test -p toron --lib mixed_strategy_snowflake_root_actuates_and_executes_distributed
-scripts/cargo-cgroup test -p toron --lib mixed_strategy_flat_star_actuates_and_executes_distributed
-scripts/cargo-cgroup test -p toron --lib mixed_strategy
+scripts/cargo-cgroup test -p toron --lib mixed_strategy_star_actuates_and_executes_distributed
+scripts/cargo-cgroup test -p toron --lib mixed
 scripts/cargo-cgroup test -p toron --lib snowflake
-scripts/cargo-cgroup test -p toron --lib broadcast
+scripts/cargo-cgroup test -p toron --lib optimizer_decisions
 scripts/cargo-cgroup test -p toron --test explain_analyze_test
 scripts/cargo-cgroup test -p toron --test architecture_test adr181
 scripts/cargo-cgroup test -p toron --test architecture_test adr192
@@ -105,14 +83,13 @@ git diff --check
 
 Use one test filter per command.
 
-## Risks
+## Risks (as resolved)
 
-- **Binder-only regresses.** Relaxing the gate without the fragmenter turns a clean decline into actuate-then-crash. Phases 1-2 must not ship without the Phase 3 capability proven by the headline.
-- **Fragmenter blast radius.** The mixed path must be strictly additive — uniform broadcast/hash fragmentation byte-identical. Pin with the two byte-identical regressions.
-- **181 invariant inversion.** Do not let `order_cost`/ranking read strategy; the `adr181_reorder_is_strategy_invariant` guard must stay green.
-- **Demotion masking.** If a mixed plan ever demotes to all-hash, the headline must assert the broadcast edges survive (per-edge receipt + no all-hash replay), else it passes for the wrong reason.
-- **Recursive debt.** New stage traversal is a worklist (galaxy/bridge inherits it).
+- **Binder-only regresses.** *Falsified.* The binder emits broadcast-first/hash-last, which fragments through the existing path — no actuate-then-crash. Proven by the passing distributed headline.
+- **181 invariant inversion.** `order_cost`/ranking never read strategy; `adr181_reorder_is_strategy_invariant` + `adr193_reorder_cost_stays_row_only` stay green.
+- **Demotion masking.** The headline asserts both Broadcast and HashPartitioned survive in the trace and digest-matches the all-hash baseline, so it cannot pass on an all-hash demotion.
+- **Observe-only collapse.** Post-193 every valid scan-linear root actuates; the observe-only path is genuinely reachable only for shapes outside the actuator's domain (non-scan-linear probe, branch-local mixed, bushy), and is pinned by the non-scan-linear-probe fixtures.
 
 ## Deferred
 
-Strategy-aware cost model; cost-based strategy choice; branch-local mixed actuation; arbitrary bushy mixed plans; galaxy/bridge topology; outer joins; memo/Cascades; durable/persisted optimizer evidence.
+Strategy-aware cost model; cost-based strategy choice; branch-local mixed actuation; arbitrary bushy mixed plans; heterogeneous-stage fragmenter; galaxy/bridge topology; outer joins; memo/Cascades; durable/persisted optimizer evidence.

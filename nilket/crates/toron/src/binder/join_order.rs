@@ -269,6 +269,10 @@ pub(super) enum StarOrderAction {
 pub(super) enum StarOrderStrategy {
 	Broadcast,
 	HashPartitioned,
+	// ADR 193: a valid hash/broadcast mixture at one local-star level (some edges hash, some
+	// broadcast). Authorized only at root levels when the selected physical order's own preflight
+	// proves a valid mixed placement set.
+	Mixed,
 }
 
 // ADR 192: typed authorization for a local star actuation, replacing the old `force_hash: bool`.
@@ -309,6 +313,10 @@ pub(super) struct StarOrderEvidence {
 	pub(super) cost_preferred_order: Vec<String>,
 	pub(super) applied_order: Vec<String>,
 	pub(super) strategy: StarOrderStrategy,
+	// ADR 193: per-dimension applied strategy/placement, in applied order. Renders the honest
+	// `strategies=[d:hash_partitioned/natural,...]` detail behind a `strategy=mixed` summary (and is
+	// equally available for uniform receipts). Generic, not snowflake-named.
+	pub(super) edge_strategies: Vec<(String, JoinStrategy, JoinPhysicalPlacement)>,
 	pub(super) declared_cost: u128,
 	pub(super) preferred_cost: u128,
 	pub(super) orders_agree: bool,
@@ -841,6 +849,7 @@ pub(super) fn analyze(
 		dimensions,
 		None,
 		StarOrderStrategy::Broadcast,
+		Vec::new(),
 		JoinOrderEstimateConfidence::Soft,
 		margin_step.margin(),
 	))
@@ -992,6 +1001,7 @@ pub(super) fn recognized_star_order_outcome(
 	dimensions: Vec<JoinOrderDimEvidence>,
 	applied_order_override: Option<Vec<String>>,
 	strategy: StarOrderStrategy,
+	edge_strategies: Vec<(String, JoinStrategy, JoinPhysicalPlacement)>,
 	confidence: JoinOrderEstimateConfidence,
 	margin: SoftMargin,
 ) -> StarOrderOutcome {
@@ -1005,6 +1015,7 @@ pub(super) fn recognized_star_order_outcome(
 		cost_preferred_order: ranking.cost_preferred_order,
 		applied_order,
 		strategy,
+		edge_strategies,
 		declared_cost: ranking.declared_cost,
 		preferred_cost: ranking.preferred_cost,
 		orders_agree: ranking.orders_agree,
@@ -1254,6 +1265,7 @@ fn star_order_evidence_from_ranking(
 		cost_preferred_order: ranking.cost_preferred_order,
 		applied_order,
 		strategy,
+		edge_strategies: Vec::new(),
 		declared_cost: ranking.declared_cost,
 		preferred_cost: ranking.preferred_cost,
 		orders_agree: ranking.orders_agree,
@@ -1322,6 +1334,48 @@ pub(super) fn uniform_snowflake_order_strategy(
 		return Some(StarOrderStrategy::HashPartitioned);
 	}
 	None
+}
+
+// ADR 193: a per-dimension strategy fingerprint — the `(JoinStrategy, JoinPhysicalPlacement)` each
+// dimension label resolves to in a given order. Mixed authorization uses the selected preflight;
+// the fingerprint remains the uniform-stability check and the source of honest per-edge receipts.
+type StrategyFingerprint = BTreeMap<String, (JoinStrategy, JoinPhysicalPlacement)>;
+
+// ADR 193: the preflight result — a `Mixed`-capable strategy summary plus the per-dimension
+// fingerprint. The uniform recognizers above stay the strict ADR-181/192 fast path; this only adds
+// the mixed tier and the fingerprint.
+struct PreflightStrategy {
+	summary: StarOrderStrategy,
+	fingerprint: StrategyFingerprint,
+}
+
+// ADR 193: validate each edge's placement (same rules the uniform recognizers enforce — broadcast
+// needs SwappedRightBuild, or Natural only at an authenticated composite-build position; hash needs
+// Natural) and build the per-dimension fingerprint. `None` if any edge is an invalid combination, so
+// an unauthenticated `Broadcast + Natural` still declines rather than entering the mixed tier.
+fn order_strategy_fingerprint(
+	decisions: &[DecisionReceipt],
+	order: &[usize],
+	dimensions: &[BoundStarDimension<'_>],
+	composite_build_positions: &BTreeSet<usize>,
+) -> Option<StrategyFingerprint> {
+	let mut fingerprint = StrategyFingerprint::new();
+	for (position, decision) in decisions.iter().enumerate() {
+		let valid = match (decision.strategy, decision.placement) {
+			(JoinStrategy::Broadcast, JoinPhysicalPlacement::SwappedRightBuild) => true,
+			(JoinStrategy::Broadcast, JoinPhysicalPlacement::Natural) => {
+				composite_build_positions.contains(&position)
+			}
+			(JoinStrategy::HashPartitioned, JoinPhysicalPlacement::Natural) => true,
+			_ => false,
+		};
+		if !valid {
+			return None;
+		}
+		let label = dimensions[order[position]].label.clone();
+		fingerprint.insert(label, (decision.strategy, decision.placement));
+	}
+	Some(fingerprint)
 }
 
 pub(super) fn classify_star_order_action(
@@ -2015,6 +2069,7 @@ impl<'a> Binder<'a> {
 			evidence_dimensions.clone(),
 			None,
 			StarOrderStrategy::Broadcast,
+			Vec::new(),
 			confidence,
 			self.join_order_soft_margin_step.margin(),
 		);
@@ -2047,14 +2102,14 @@ impl<'a> Binder<'a> {
 			authorization,
 			StarOrderStrategyAuthorization::CompositeBuildSnowflakeRoot
 		);
-		let declared_strategy = self.preflight_star_order_strategy(
+		let declared = self.preflight_star_order_strategy(
 			probe_plan.clone(),
 			dimensions,
 			&declared_indices,
 			composite_builds,
 			trace,
 		)?;
-		let Some(selected_strategy) = self.preflight_star_order_strategy(
+		let Some(selected) = self.preflight_star_order_strategy(
 			probe_plan.clone(),
 			dimensions,
 			&selected_indices,
@@ -2066,23 +2121,32 @@ impl<'a> Binder<'a> {
 				StarOrderDeclineReason::MixedStrategyStar,
 			));
 		};
-		// ADR 192: typed authorization decides what is actuatable.
-		// - `AnyUniform` (flat star): strict — declared and selected must resolve to the same strategy.
-		// - `CompositeBuildSnowflakeRoot`: broadcast upgrade — a clean selected-order Broadcast
-		//   actuates even when the declared order preflights to hash/None (composite-build strategy is
-		//   order-variant); a hash selection stays strict.
-		// - `HashOnlyCompositeProbe` (branch): hash-only, strict.
+		// ADR 193: the SELECTED physical order is authoritative. Mixed strategy is order-variant —
+		// `choose_auto_join_strategy` only broadcasts a dimension when its probe is scan-linear, so a
+		// hash join earlier in the order forces later dimensions to hash. The cost-optimal order puts
+		// broadcasts first and hashes last (a valid, fragmentable left-deep shape), even when the
+		// declared order preflighted to all-hash. So a clean selected-order `Mixed` actuates, just like
+		// ADR 192's selected-order `Broadcast` upgrade. The fingerprint is no longer an authorization
+		// gate (it would block exactly this reorder); it is retained for receipt honesty.
+		let fingerprint_match =
+			declared.as_ref().map(|d| &d.fingerprint) == Some(&selected.fingerprint);
+		// Typed authorization decides what is actuatable:
+		// - `AnyUniform` (flat-star root): uniform (order-invariant, fingerprint matches) OR a clean
+		//   selected `Mixed`.
+		// - `CompositeBuildSnowflakeRoot` (snowflake root): ADR 192's selected `Broadcast` upgrade, OR
+		//   a clean selected `Mixed`, OR a fingerprint-stable hash.
+		// - `HashOnlyCompositeProbe` (branch): hash-only — mixed stays declined at branch level.
 		let strategy_authorized = match authorization {
 			StarOrderStrategyAuthorization::AnyUniform => {
-				declared_strategy == Some(selected_strategy)
+				selected.summary == StarOrderStrategy::Mixed || fingerprint_match
 			}
 			StarOrderStrategyAuthorization::CompositeBuildSnowflakeRoot => {
-				selected_strategy == StarOrderStrategy::Broadcast
-					|| declared_strategy == Some(selected_strategy)
+				selected.summary == StarOrderStrategy::Broadcast
+					|| selected.summary == StarOrderStrategy::Mixed
+					|| fingerprint_match
 			}
 			StarOrderStrategyAuthorization::HashOnlyCompositeProbe => {
-				selected_strategy == StarOrderStrategy::HashPartitioned
-					&& declared_strategy == Some(selected_strategy)
+				selected.summary == StarOrderStrategy::HashPartitioned && fingerprint_match
 			}
 		};
 		if !strategy_authorized {
@@ -2090,6 +2154,7 @@ impl<'a> Binder<'a> {
 				StarOrderDeclineReason::MixedStrategyStar,
 			));
 		}
+		let selected_strategy = selected.summary;
 
 		let declared_segments = star_output_segments(&probe_label, &probe_plan, dimensions);
 		let mut declared_output_schema = probe_plan.schema();
@@ -2140,11 +2205,24 @@ impl<'a> Binder<'a> {
 			output.scope = declared_scope;
 		}
 
+		// ADR 193: per-dimension applied strategy/placement in applied order, for an honest mixed
+		// (and uniform) receipt.
+		let edge_strategies = applied_order
+			.iter()
+			.map(|label| {
+				let (strategy, placement) = selected
+					.fingerprint
+					.get(label)
+					.expect("selected preflight fingerprint covers applied order");
+				(label.clone(), *strategy, *placement)
+			})
+			.collect::<Vec<_>>();
 		let outcome = recognized_star_order_outcome(
 			probe_label.clone(),
 			evidence_dimensions,
 			Some(applied_order),
 			selected_strategy,
+			edge_strategies,
 			confidence,
 			self.join_order_soft_margin_step.margin(),
 		);
@@ -2205,7 +2283,7 @@ impl<'a> Binder<'a> {
 		order: &[usize],
 		composite_builds: bool,
 		base_trace: &OptimizerTrace,
-	) -> Result<Option<StarOrderStrategy>, BindingError> {
+	) -> Result<Option<PreflightStrategy>, BindingError> {
 		let mut preflight_trace = base_trace.clone();
 		let preflight_join_start = preflight_trace.join_decisions.len();
 		let mut no_render_trace = None;
@@ -2220,10 +2298,10 @@ impl<'a> Binder<'a> {
 		if preflight_decisions.len() != order.len() {
 			return Ok(None);
 		}
-		// ADR 192: snowflake roots (composite builds) use the fenced uniformity rule that accepts
-		// `Natural` placement for the composite build; flat stars keep the strict ADR-181 rule.
-		if composite_builds {
-			let composite_build_positions = order
+		// ADR 192: snowflake roots (composite builds) authenticate `Natural`-placement broadcast at
+		// composite-build positions; flat stars keep the strict ADR-181 placement.
+		let composite_build_positions = if composite_builds {
+			order
 				.iter()
 				.enumerate()
 				.filter_map(|(position, dimension_index)| {
@@ -2231,14 +2309,32 @@ impl<'a> Binder<'a> {
 						.composite_build
 						.then_some(position)
 				})
-				.collect::<BTreeSet<_>>();
-			Ok(uniform_snowflake_order_strategy(
-				preflight_decisions,
-				&composite_build_positions,
-			))
+				.collect::<BTreeSet<_>>()
 		} else {
-			Ok(uniform_star_order_strategy(preflight_decisions))
+			BTreeSet::new()
+		};
+		// ADR 193: validate placements + build the per-dimension fingerprint. `None` = an invalid
+		// edge (e.g. unauthenticated `Broadcast + Natural`) → decline, never enter the mixed tier.
+		let Some(fingerprint) = order_strategy_fingerprint(
+			preflight_decisions,
+			order,
+			dimensions,
+			&composite_build_positions,
+		) else {
+			return Ok(None);
+		};
+		// The strict ADR-181/192 uniform recognizers stay the fast path; a valid non-uniform set is
+		// classified `Mixed` (ADR 193).
+		let summary = if composite_builds {
+			uniform_snowflake_order_strategy(preflight_decisions, &composite_build_positions)
+		} else {
+			uniform_star_order_strategy(preflight_decisions)
 		}
+		.unwrap_or(StarOrderStrategy::Mixed);
+		Ok(Some(PreflightStrategy {
+			summary,
+			fingerprint,
+		}))
 	}
 
 	fn bind_star_order_sequence<'b>(

@@ -26,8 +26,13 @@ const STAR_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
 	INNER JOIN products p ON o.product_id = p.id \
 	INNER JOIN stores s ON o.store_id = s.id";
 
+// ADR 193: after the mixed-strategy root actuates, a recognized snowflake stays on the observe-only
+// path only when its shape is outside the root actuator's authorized domain. A non-scan-linear probe
+// (the fact table arrives via a `LIMIT` subplan, wider than the row count so rows/order are preserved)
+// declines actuation with `ProbeNotScanLinear` while `analyze_snowflake` still recognizes the full
+// tree — the post-193 evidence path these observation/verdict tests exercise.
 const SNOWFLAKE_SQL: &str = "SELECT o.id, c.id, r.id, g.id, s.id \
-	FROM orders o \
+	FROM (SELECT * FROM orders LIMIT 1000000) o \
 	INNER JOIN customers c ON o.customer_id = c.id \
 	INNER JOIN regions r ON c.region_id = r.id \
 	INNER JOIN segments g ON c.segment_id = g.id \

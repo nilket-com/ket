@@ -1150,8 +1150,18 @@ pub(super) fn join_order_outcome_label(outcome: &StarOrderOutcome) -> &'static s
 pub(super) fn join_order_detail_label(outcome: &StarOrderOutcome) -> String {
 	match outcome {
 		StarOrderOutcome::Recognized(evidence) => format!(
-			"strategy={}; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; applied_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}; estimates=[{}]",
+			"strategy={}; strategies=[{}]; dimensions=[{}]; declared_order=[{}]; cost_preferred_order=[{}]; applied_order=[{}]; declared_cost={}; preferred_cost={}; confidence={}; soft_margin={}; estimates=[{}]",
 			star_order_strategy_label(evidence.strategy),
+			evidence
+				.edge_strategies
+				.iter()
+				.map(|(label, strategy, placement)| format!(
+					"{label}:{}/{}",
+					join_strategy_label(*strategy),
+					join_physical_placement_label(*placement)
+				))
+				.collect::<Vec<_>>()
+				.join(","),
 			evidence
 				.dimensions
 				.iter()
@@ -1358,6 +1368,7 @@ pub(super) fn star_order_strategy_label(strategy: StarOrderStrategy) -> &'static
 	match strategy {
 		StarOrderStrategy::Broadcast => "broadcast",
 		StarOrderStrategy::HashPartitioned => "hash_partitioned",
+		StarOrderStrategy::Mixed => "mixed",
 	}
 }
 
