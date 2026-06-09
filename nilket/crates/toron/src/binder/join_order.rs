@@ -2160,11 +2160,11 @@ impl<'a> Binder<'a> {
 			)
 			.await?;
 		let Some(probe_label) = probe_plan.scope.unique_source_label() else {
-			self.record_optimizer_star_order_decline(
+			self.accrue_star_order_decline(
 				OptimizerDecisionKind::StarCandidate,
 				StarOrderDeclineReason::MissingRelationLabel,
 			);
-			self.record_star_order_decline(
+			self.render_star_order_decline(
 				render_trace,
 				StarOrderDeclineReason::MissingRelationLabel,
 				candidate.dimensions.len(),
@@ -2172,11 +2172,11 @@ impl<'a> Binder<'a> {
 			return Ok(StarOrderActuationResult::Declined);
 		};
 		if !broadcast_probe_is_scan_linear(&probe_plan.plan) {
-			self.record_optimizer_star_order_decline(
+			self.accrue_star_order_decline(
 				OptimizerDecisionKind::StarCandidate,
 				StarOrderDeclineReason::ProbeNotScanLinear,
 			);
-			self.record_star_order_decline(
+			self.render_star_order_decline(
 				render_trace,
 				StarOrderDeclineReason::ProbeNotScanLinear,
 				candidate.dimensions.len(),
@@ -2208,11 +2208,11 @@ impl<'a> Binder<'a> {
 			return Ok(StarOrderActuationResult::Declined);
 		};
 		if tree.root_children.len() < 2 {
-			self.record_optimizer_star_order_decline(
+			self.accrue_star_order_decline(
 				root_decision_kind(&tree),
 				StarOrderDeclineReason::MissingRelationLabel,
 			);
-			self.record_star_order_decline(
+			self.render_star_order_decline(
 				render_trace,
 				StarOrderDeclineReason::MissingRelationLabel,
 				candidate.dimensions.len(),
@@ -2241,12 +2241,12 @@ impl<'a> Binder<'a> {
 				&dimension_inputs,
 			)?
 		else {
-			self.record_optimizer_star_order_decline(
+			self.accrue_star_order_decline(
 				root_decision_kind(&tree),
 				StarOrderDeclineReason::MissingEstimate,
 			);
 			if !root_is_snowflake {
-				self.record_star_order_decline(
+				self.render_star_order_decline(
 					render_trace,
 					StarOrderDeclineReason::MissingEstimate,
 					candidate.dimensions.len(),
@@ -2264,9 +2264,9 @@ impl<'a> Binder<'a> {
 			&mut scratch_render_trace,
 		)?;
 		if let LocalStarActuationAttempt::Declined(reason) = scratch_root_attempt {
-			self.record_optimizer_star_order_decline(root_decision_kind(&tree), reason);
+			self.accrue_star_order_decline(root_decision_kind(&tree), reason);
 			if !root_is_snowflake {
-				self.record_star_order_decline(render_trace, reason, candidate.dimensions.len());
+				self.render_star_order_decline(render_trace, reason, candidate.dimensions.len());
 			}
 			return Ok(StarOrderActuationResult::Declined);
 		}
@@ -2314,17 +2314,14 @@ impl<'a> Binder<'a> {
 		)?;
 		let LocalStarActuationAttempt::Actuated(real_root) = real_root_attempt else {
 			if let LocalStarActuationAttempt::Declined(reason) = real_root_attempt {
-				self.record_optimizer_star_order_decline(root_decision_kind(&tree), reason);
+				self.accrue_star_order_decline(root_decision_kind(&tree), reason);
 			}
 			return Ok(StarOrderActuationResult::Declined);
 		};
 
-		self.record_optimizer_star_order_receipt(root_decision_kind(&tree), &real_root.receipt);
+		self.accrue_star_order_receipt(root_decision_kind(&tree), &real_root.receipt);
 		for branch_receipt in &branch_receipts {
-			self.record_optimizer_star_order_receipt(
-				OptimizerDecisionKind::SnowflakeBranch,
-				branch_receipt,
-			);
+			self.accrue_star_order_receipt(OptimizerDecisionKind::SnowflakeBranch, branch_receipt);
 		}
 
 		if let Some(render_trace) = render_trace.as_mut() {
@@ -2355,11 +2352,11 @@ impl<'a> Binder<'a> {
 			{
 				if edge.left_label.as_deref() == Some(probe_label) {
 					let Some(dimension_label) = edge.right_label else {
-						self.record_optimizer_star_order_decline(
+						self.accrue_star_order_decline(
 							OptimizerDecisionKind::StarCandidate,
 							StarOrderDeclineReason::MissingRelationLabel,
 						);
-						self.record_star_order_decline(
+						self.render_star_order_decline(
 							render_trace,
 							StarOrderDeclineReason::MissingRelationLabel,
 							candidate_dimensions.len(),
@@ -2385,11 +2382,11 @@ impl<'a> Binder<'a> {
 						continue;
 					}
 					let Some(dimension_label) = edge.right_label else {
-						self.record_optimizer_star_order_decline(
+						self.accrue_star_order_decline(
 							OptimizerDecisionKind::StarCandidate,
 							StarOrderDeclineReason::MissingRelationLabel,
 						);
-						self.record_star_order_decline(
+						self.render_star_order_decline(
 							render_trace,
 							StarOrderDeclineReason::MissingRelationLabel,
 							candidate_dimensions.len(),
@@ -2402,11 +2399,11 @@ impl<'a> Binder<'a> {
 			}
 
 			let Some((parent_index, dimension_label)) = matched_parent else {
-				self.record_optimizer_star_order_decline(
+				self.accrue_star_order_decline(
 					OptimizerDecisionKind::StarCandidate,
 					StarOrderDeclineReason::MissingRelationLabel,
 				);
-				self.record_star_order_decline(
+				self.render_star_order_decline(
 					render_trace,
 					StarOrderDeclineReason::MissingRelationLabel,
 					candidate_dimensions.len(),
@@ -2414,11 +2411,11 @@ impl<'a> Binder<'a> {
 				return Ok(None);
 			};
 			if !seen_labels.insert(dimension_label.clone()) {
-				self.record_optimizer_star_order_decline(
+				self.accrue_star_order_decline(
 					OptimizerDecisionKind::StarCandidate,
 					StarOrderDeclineReason::DuplicateDimension,
 				);
-				self.record_star_order_decline(
+				self.render_star_order_decline(
 					render_trace,
 					StarOrderDeclineReason::DuplicateDimension,
 					candidate_dimensions.len(),
@@ -2957,7 +2954,7 @@ impl<'a> Binder<'a> {
 		Ok(current)
 	}
 
-	fn record_star_order_decline(
+	fn render_star_order_decline(
 		&self,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 		reason: StarOrderDeclineReason,
@@ -2973,7 +2970,7 @@ impl<'a> Binder<'a> {
 		}
 	}
 
-	fn record_optimizer_star_order_receipt(
+	fn accrue_star_order_receipt(
 		&self,
 		kind: OptimizerDecisionKind,
 		receipt: &StarOrderRenderReceipt,
@@ -2984,7 +2981,7 @@ impl<'a> Binder<'a> {
 		}
 	}
 
-	fn record_optimizer_star_order_decline(
+	fn accrue_star_order_decline(
 		&self,
 		kind: OptimizerDecisionKind,
 		reason: StarOrderDeclineReason,

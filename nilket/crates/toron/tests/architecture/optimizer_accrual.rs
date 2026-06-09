@@ -42,8 +42,8 @@ pub(crate) fn adr187_decision_log_is_coordinator_scoped_shared() {
 #[test]
 pub(crate) fn adr187_accrual_recording_is_always_on_not_explain_gated() {
 	let join_order = source("src/binder/join_order.rs");
-	let decline = first_block(&join_order, "fn record_optimizer_star_order_decline");
-	let receipt = first_block(&join_order, "fn record_optimizer_star_order_receipt");
+	let decline = first_block(&join_order, "fn accrue_star_order_decline");
+	let receipt = first_block(&join_order, "fn accrue_star_order_receipt");
 
 	for block in [&decline, &receipt] {
 		assert!(block.contains("decision_recorder"));
@@ -67,15 +67,15 @@ pub(crate) fn adr187_accrual_records_committed_not_scratch() {
 
 	assert!(join_order.contains("pub(super) enum StarOrderActuationResult"));
 	assert!(try_actuate.contains("StarOrderActuationResult::Declined"));
-	assert!(try_actuate.contains("record_optimizer_star_order_receipt("));
-	assert!(try_actuate.contains("record_optimizer_star_order_decline("));
+	assert!(try_actuate.contains("accrue_star_order_receipt("));
+	assert!(try_actuate.contains("accrue_star_order_decline("));
 	assert!(bind_plan.contains("StarOrderActuationResult::Declined"));
 	// The declined fall-back re-binds on a binder carrying the zero-size no-op recorder, so the
 	// receipt is not recorded twice — a fact about the recorder's type, not a runtime toggle.
 	assert!(bind_plan.contains(".without_decision_recording()"));
 	for block in [preflight, sequence, local, root_dimensions] {
 		assert!(!block.contains("decision_log"));
-		assert!(!block.contains("record_optimizer_star_order"));
+		assert!(!block.contains("accrue_star_order"));
 	}
 }
 
