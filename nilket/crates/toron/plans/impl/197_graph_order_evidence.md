@@ -47,8 +47,8 @@ fn galaxy_order_recommendation(galaxy) -> Option<GraphOrderRecommendation>:
 
 fn bridge_order_recommendation(bridge) -> Option<GraphOrderRecommendation>:
     link = bridge.links.first()?
-    // candidate cost: fan-out-first (fact->bridge->dim) vs filter-first; cost from link.bridge_rows /
-    // fact_rows + the dim edge estimate. preferred = the cheaper; declared = the FROM (fan-out-first).
+    // candidate cost: fan-out-first (fact->bridge->dim) vs filter-first; the first cut is the row
+    // proxy from bridge_rows vs fact_rows. preferred = the cheaper; declared = the FROM (fan-out-first).
 ```
 
 `edge_estimate_between(edges, a, b)` returns the `estimated_rows` of the `GalaxyEdgeEvidence` whose

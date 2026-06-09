@@ -871,7 +871,92 @@ fn galaxy_analyze_rows(
 			conformed,
 		)?);
 	}
+	// ADR 197: the measured graph order verdict — judges the FROM order against the cost model's
+	// preference using the measured fact-to-pivot cardinalities.
+	if let Some(rec) = galaxy_order_recommendation(galaxy) {
+		let measured = rec
+			.costs
+			.iter()
+			.map(|(fact, _)| {
+				(
+					fact.clone(),
+					galaxy_measured_fact_cost(galaxy, fact, &rec.pivot, summaries),
+				)
+			})
+			.collect::<Vec<_>>();
+		rows.push(graph_order_verdict_row(&rec, &measured));
+	}
 	Ok(rows)
+}
+
+// Measured fact-to-pivot output rows, via the galaxy edge connecting `fact` and `pivot`.
+fn galaxy_measured_fact_cost(
+	galaxy: &GalaxyOrderEvidence,
+	fact: &str,
+	pivot: &str,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Option<u128> {
+	let edge = galaxy.edges.iter().find(|edge| {
+		(edge.left_label == fact && edge.right_label == pivot)
+			|| (edge.left_label == pivot && edge.right_label == fact)
+	})?;
+	let replay_id = join_replay_id_for_trace_target(edge.target).ok()?;
+	summaries
+		.get(&replay_id)
+		.map(|summary| u128::from(summary.output_rows.get()))
+}
+
+// ADR 197: unified `join_order_graph_verdict` row — reuses the 180/184 `StarOrderVerdict` vocabulary.
+// `Vindicated` when the FROM order is the measured-optimal root, `MissedWin` when a reorder would have
+// won, `Indeterminate` when any candidate measurement is absent.
+fn graph_order_verdict_row(
+	rec: &GraphOrderRecommendation,
+	measured: &[(String, Option<u128>)],
+) -> Vec<ScalarValue> {
+	let verdict = if measured.iter().any(|(_, cost)| cost.is_none()) {
+		StarOrderVerdict::Indeterminate
+	} else {
+		let measured_optimal = measured
+			.iter()
+			.min_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
+			.map(|(label, _)| label.clone())
+			.unwrap_or_default();
+		if rec.declared_root == measured_optimal {
+			StarOrderVerdict::Vindicated
+		} else {
+			StarOrderVerdict::MissedWin
+		}
+	};
+	let recommendation = match rec.action {
+		StarOrderAction::Reordered => "WOULD_REORDER_ROOT_FACT",
+		_ => "KEEP_DECLARED",
+	};
+	let measured_label = measured
+		.iter()
+		.map(|(label, cost)| {
+			format!(
+				"{label}:{}",
+				cost.map(|value| value.to_string())
+					.unwrap_or_else(|| "missing".to_string())
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(",");
+	vec![
+		ScalarValue::Utf8(Some("join_order_graph_verdict".to_string())),
+		ScalarValue::Utf8(Some(format!("pivot={}", rec.pivot))),
+		ScalarValue::Utf8(Some(star_order_verdict_label(verdict).to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"declared_root={}; preferred_root={}; recommendation={recommendation}; measured=[{measured_label}]",
+			rec.declared_root, rec.preferred_root
+		))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
 }
 
 fn optimizer_analyze_galaxy_order_row(evidence: &GalaxyOrderEvidence) -> Vec<ScalarValue> {
@@ -923,6 +1008,26 @@ fn bridge_analyze_rows(
 				estimated,
 				&measurement,
 			)?);
+		}
+	}
+	// ADR 197: the bridge measured verdict. The candidate that actually ran is `fan_out_first`, so its
+	// measured cost is the incoming edge's measured output (the materialized M:N fan-out); `filter_first`
+	// is the estimate floor (`fact_rows`) — the un-run counterfactual cannot be measured. A measured
+	// fan-out above that floor reorders (`MissedWin`).
+	if let Some(rec) = bridge_order_recommendation(bridge) {
+		if let Some(link) = bridge.links.first() {
+			let measured_fan_out = join_replay_id_for_trace_target(link.incoming_target)
+				.ok()
+				.and_then(|replay_id| summaries.get(&replay_id))
+				.map(|summary| u128::from(summary.output_rows.get()));
+			let measured = vec![
+				("fan_out_first".to_string(), measured_fan_out),
+				(
+					"filter_first".to_string(),
+					Some(u128::from(link.fact_rows.get())),
+				),
+			];
+			rows.push(graph_order_verdict_row(&rec, &measured));
 		}
 	}
 	Ok(rows)
@@ -1271,7 +1376,7 @@ pub(super) fn bridge_order_target_label(evidence: &BridgeOrderEvidence) -> Strin
 }
 
 pub(super) fn bridge_order_detail_label(evidence: &BridgeOrderEvidence) -> String {
-	evidence
+	let links = evidence
 		.links
 		.iter()
 		.map(|link| {
@@ -1286,7 +1391,13 @@ pub(super) fn bridge_order_detail_label(evidence: &BridgeOrderEvidence) -> Strin
 			)
 		})
 		.collect::<Vec<_>>()
-		.join("; ")
+		.join("; ");
+	format!(
+		"{links}{}",
+		bridge_order_recommendation(evidence)
+			.map(|rec| graph_order_recommendation_label(&rec))
+			.unwrap_or_default(),
+	)
 }
 
 pub(super) fn galaxy_order_target_label(evidence: &GalaxyOrderEvidence) -> String {
@@ -1338,8 +1449,28 @@ pub(super) fn galaxy_order_detail_label(evidence: &GalaxyOrderEvidence) -> Strin
 		.collect::<Vec<_>>()
 		.join(", ");
 	format!(
-		"conformed=[{conformed}]; components={}; edges=[{edges}]",
-		evidence.component_count
+		"conformed=[{conformed}]; components={}; edges=[{edges}]{}",
+		evidence.component_count,
+		galaxy_order_recommendation(evidence)
+			.map(|rec| graph_order_recommendation_label(&rec))
+			.unwrap_or_default(),
+	)
+}
+
+// ADR 197: the observe-only order recommendation appended to a graph evidence detail. It says what the
+// cost model would prefer; it never rewrites the plan.
+pub(super) fn graph_order_recommendation_label(rec: &GraphOrderRecommendation) -> String {
+	let costs = rec
+		.costs
+		.iter()
+		.map(|(label, cost)| format!("{label}:{cost}"))
+		.collect::<Vec<_>>()
+		.join(",");
+	format!(
+		"; declared_root={}; preferred_root={}; action={}; costs=[{costs}]",
+		rec.declared_root,
+		rec.preferred_root,
+		star_order_action_label(rec.action),
 	)
 }
 

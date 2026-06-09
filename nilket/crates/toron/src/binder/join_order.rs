@@ -1281,6 +1281,100 @@ pub(super) fn analyze_bridge(
 	}
 }
 
+// ADR 197: the graph order scorer is NEW — it does not call the star cost functions
+// (`order_cost`/`rank_star_order`); it costs the small candidate set the recognized graph shape admits
+// directly from the captured edge estimates. Only the verdict vocabulary (`StarOrderAction`) and, at
+// render time, the measured-verdict shape are reused. Row-only (cf. ADR 181); observe-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GraphOrderRecommendation {
+	pub(super) pivot: String,
+	pub(super) declared_root: String,
+	pub(super) preferred_root: String,
+	pub(super) costs: Vec<(String, u128)>,
+	pub(super) action: StarOrderAction,
+}
+
+// The row estimate of the edge connecting relations `a` and `b` (undirected), as a row-only cost.
+fn edge_estimate_between(edges: &[GalaxyEdgeEvidence], a: &str, b: &str) -> Option<u128> {
+	edges
+		.iter()
+		.find(|edge| {
+			(edge.left_label == a && edge.right_label == b)
+				|| (edge.left_label == b && edge.right_label == a)
+		})
+		.and_then(|edge| edge.estimated_rows)
+		.map(|rows| u128::from(rows.get()))
+}
+
+// Galaxy order cost: root the fact whose join to the conformed dimension is smallest. `declared_root`
+// is the fact never built as a dimension (the FROM root); `preferred_root` is the argmin.
+pub(super) fn galaxy_order_recommendation(
+	galaxy: &GalaxyOrderEvidence,
+) -> Option<GraphOrderRecommendation> {
+	let dim = galaxy.conformed.first()?;
+	let facts = &dim.incident_relations;
+	if facts.len() < 2 {
+		return None;
+	}
+	let mut costs = Vec::with_capacity(facts.len());
+	for fact in facts {
+		costs.push((
+			fact.clone(),
+			edge_estimate_between(&galaxy.edges, fact, &dim.label)?,
+		));
+	}
+	let preferred_root = costs
+		.iter()
+		.min_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
+		.map(|(fact, _)| fact.clone())?;
+	let declared_root = facts
+		.iter()
+		.find(|fact| galaxy.edges.iter().all(|edge| &edge.right_label != *fact))?
+		.clone();
+	let action = if declared_root == preferred_root {
+		StarOrderAction::KeptAlreadyOptimal
+	} else {
+		StarOrderAction::Reordered
+	};
+	Some(GraphOrderRecommendation {
+		pivot: dim.label.clone(),
+		declared_root,
+		preferred_root,
+		costs,
+		action,
+	})
+}
+
+// Bridge order cost: a many-to-many bridge fans out (`bridge_rows >= fact_rows` by the ADR 196 gate).
+// When the fan-out is real (`bridge_rows > fact_rows`), prefer delaying the bridge expansion until the
+// selective dimension is applied (`filter_first`) over materializing it early (`fan_out_first`).
+pub(super) fn bridge_order_recommendation(
+	bridge: &BridgeOrderEvidence,
+) -> Option<GraphOrderRecommendation> {
+	let link = bridge.links.first()?;
+	let fan_out_cost = u128::from(link.bridge_rows.get());
+	let filter_cost = u128::from(link.fact_rows.get());
+	let action = if link.bridge_rows > link.fact_rows {
+		StarOrderAction::Reordered
+	} else {
+		StarOrderAction::KeptAlreadyOptimal
+	};
+	let preferred_root = match action {
+		StarOrderAction::Reordered => "filter_first".to_string(),
+		_ => "fan_out_first".to_string(),
+	};
+	Some(GraphOrderRecommendation {
+		pivot: link.bridge.clone(),
+		declared_root: "fan_out_first".to_string(),
+		preferred_root,
+		costs: vec![
+			("fan_out_first".to_string(), fan_out_cost),
+			("filter_first".to_string(), filter_cost),
+		],
+		action,
+	})
+}
+
 fn snowflake_order_level(
 	probe: &str,
 	edges: &[JoinOrderEdgeEvidence],

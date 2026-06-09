@@ -32,10 +32,10 @@ analog of the row-based star ordering heuristic (ADR 177/181), applied to the sh
 First cut: the reachable 2-fact galaxy.
 
 **D2 — Bridge order cost = don't materialize the M:N fan-out before the selective dimension.** For
-`F ⋈ B ⋈ D`, the bridge candidate compares early bridge fan-out (196) against delaying the many-to-many
-expansion until the selective `D` has been applied; the cost model prefers the order that avoids
-materializing the fan-out early. The candidate set is the small shape-implied set in the bridge
-receipt, not a search. First cut: the single 3-relation bridge.
+`F ⋈ B ⋈ D`, the first cut uses the row proxy already exposed by the bridge evidence: compare
+`bridge_rows` against `fact_rows` to distinguish fan-out-first from filter-first. The cost model
+prefers the order that avoids materializing the fan-out early. The candidate set is the small
+shape-implied set in the bridge receipt, not a search. First cut: the single 3-relation bridge.
 
 **D3 — Order evidence row (observe-only).** Extend the `join_order_galaxy` / `join_order_bridge` cockpit
 rows with `declared_order`, `preferred_order`, per-candidate `estimated_cost`, and a non-acting

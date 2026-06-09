@@ -9176,6 +9176,166 @@ async fn conformed_two_fact_query_emits_galaxy_evidence() {
 	}));
 }
 
+// ADR 197 headline: the cost model recommends rooting the cheaper fact. The FROM order roots `sales`
+// (sales→product = 100000), but `returns→product` = 5000 is the smaller join, so the galaxy order
+// receipt recommends `preferred_root=returns` with `action=reordered`. Plan/results byte-identical.
+#[tokio::test]
+async fn galaxy_order_evidence_recommends_cheaper_root() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", galaxy_conformed_order_sql()))
+		.expect("plan galaxy EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let galaxy_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("galaxy row");
+	assert_utf8_contains(&galaxy_row[3], "declared_root=sales");
+	assert_utf8_contains(&galaxy_row[3], "preferred_root=returns");
+	assert_utf8_contains(&galaxy_row[3], "action=reordered");
+	assert_utf8_contains(&galaxy_row[3], "costs=[");
+}
+
+// ADR 197: the model is not a constant — when the FROM root IS the smallest fact-to-dimension join,
+// it keeps the declared order.
+#[tokio::test]
+async fn galaxy_already_optimal_order_kept() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", galaxy_optimal_order_sql()))
+		.expect("plan optimal galaxy EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let galaxy_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("galaxy row");
+	assert_utf8_contains(&galaxy_row[3], "declared_root=returns");
+	assert_utf8_contains(&galaxy_row[3], "preferred_root=returns");
+	assert_utf8_contains(&galaxy_row[3], "action=kept_already_optimal");
+}
+
+// ADR 197: the measured order verdict judges the FROM order against the measured fact-to-pivot
+// cardinalities. With `returns` measured cheaper than `sales` but `sales` the declared root, the run
+// missed a win.
+#[tokio::test]
+async fn galaxy_verdict_recommends_reordering_suboptimal_root_fact() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_conformed_order_sql())
+		.expect("plan galaxy");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind galaxy analyze");
+	// edge 0 = sales→product, edge 1 = product→returns. Measure sales' join large, returns' join small.
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(5),
+			output_rows: if replay_id.0 == 0 {
+				RowCount::new(100)
+			} else {
+				RowCount::new(10)
+			},
+		})
+		.collect::<Vec<_>>();
+	let plan = render_explain_analyze(binding, &observations).expect("render galaxy analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+	let verdict = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_graph_verdict".to_string())))
+		.expect("graph verdict row");
+	assert_eq!(
+		verdict[2],
+		ScalarValue::Utf8(Some("missed_win".to_string()))
+	);
+	assert_utf8_contains(&verdict[3], "WOULD_REORDER_ROOT_FACT");
+}
+
+// ADR 197: no verdict without measurement — absent runtime rows yield Indeterminate, never a
+// fabricated judgment.
+#[tokio::test]
+async fn graph_verdict_indeterminate_on_missing_measurement() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_conformed_order_sql())
+		.expect("plan galaxy");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind galaxy analyze");
+	let plan = render_explain_analyze(binding, &[]).expect("render galaxy analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+	let verdict = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_graph_verdict".to_string())))
+		.expect("graph verdict row");
+	assert_eq!(
+		verdict[2],
+		ScalarValue::Utf8(Some("indeterminate".to_string()))
+	);
+}
+
+// ADR 197: the bridge cost model prefers delaying the M:N fan-out past the selective dimension, and
+// the measured verdict confirms the run paid a fan-out above the filter-first floor.
+#[tokio::test]
+async fn bridge_order_evidence_recommends_delaying_massive_fanout() {
+	let catalog = bridge_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", bridge_chain_order_sql()))
+		.expect("plan bridge EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let bridge_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge".to_string())))
+		.expect("bridge row");
+	assert_utf8_contains(&bridge_row[3], "preferred_root=filter_first");
+	assert_utf8_contains(&bridge_row[3], "action=reordered");
+
+	let analyze_logical = SqlPlanner::new()
+		.plan(bridge_chain_order_sql())
+		.expect("plan bridge");
+	let binding = bind_explain_analyze(
+		&analyze_logical,
+		&catalog,
+		&auto_broadcast_config(64 * 1024 * 1024),
+	)
+	.await
+	.expect("bind bridge analyze");
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(1_000),
+			output_rows: RowCount::new(5_000),
+		})
+		.collect::<Vec<_>>();
+	let plan = render_explain_analyze(binding, &observations).expect("render bridge analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+	let verdict = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_graph_verdict".to_string())))
+		.expect("graph verdict row");
+	assert_eq!(
+		verdict[2],
+		ScalarValue::Utf8(Some("missed_win".to_string()))
+	);
+}
+
 // ADR 194 / D6 — the truthful boundary (was `galaxy_or_shared_dimension_declines_snowflake`): the
 // synthetic multi-root edge stream is a cartesian the binder cannot emit and is a galaxy of neither
 // recognizer, while the *reachable* conformed two-fact query is recognized by the role-neutral
@@ -13927,6 +14087,14 @@ fn galaxy_conformed_order_sql() -> &'static str {
 	"SELECT sales.id, product.id, returns.id FROM sales \
 	 JOIN product ON sales.product_id = product.id \
 	 JOIN returns ON returns.product_id = product.id"
+}
+
+// ADR 197: the same galaxy graph with `returns` written first in FROM. Now the FROM root (`returns`,
+// the smaller fact-to-`product` join) IS the cost-optimal root → `kept_already_optimal`.
+fn galaxy_optimal_order_sql() -> &'static str {
+	"SELECT returns.id, product.id, sales.id FROM returns \
+	 JOIN product ON returns.product_id = product.id \
+	 JOIN sales ON sales.product_id = product.id"
 }
 
 // ADR 196: a many-to-many bridge — `orders`(fact, 1_000) ⋈ `order_items`(junction, 10_000) ⋈

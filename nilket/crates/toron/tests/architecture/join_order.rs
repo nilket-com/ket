@@ -1955,3 +1955,92 @@ pub(crate) fn adr196_no_fragmenter_executor_or_actuation_and_binder_only() {
 		format_offenders(&manifest, &offenders)
 	);
 }
+
+#[test]
+pub(crate) fn adr197_graph_order_cost_is_row_only() {
+	let join_order = source("src/binder/join_order.rs");
+	let galaxy = first_block(&join_order, "pub(super) fn galaxy_order_recommendation");
+	let bridge = first_block(&join_order, "pub(super) fn bridge_order_recommendation");
+	let edge_cost = first_block(&join_order, "fn edge_estimate_between");
+
+	// The graph scorer costs only row estimates — never strategy or bytes (preserves ADR 181).
+	for block in [&galaxy, &bridge, &edge_cost] {
+		assert!(!block.contains("JoinStrategy"));
+		assert!(!block.contains("byte"));
+		assert!(!block.contains("placement"));
+	}
+	assert!(galaxy.contains("edge_estimate_between"));
+	assert!(edge_cost.contains("estimated_rows"));
+}
+
+#[test]
+pub(crate) fn adr197_graph_scorer_is_shape_aware_not_generic_memo() {
+	let join_order = source("src/binder/join_order.rs");
+	let galaxy = first_block(&join_order, "pub(super) fn galaxy_order_recommendation");
+
+	// Shape-aware: enumerates the recognized galaxy's incident facts; not a general search / memo.
+	assert!(galaxy.contains("conformed.first()"));
+	assert!(galaxy.contains("incident_relations"));
+	assert!(!join_order.contains("Cascades"));
+	assert!(!join_order.contains("fn memo"));
+	let galaxy_struct = first_block(&join_order, "pub(super) struct GraphOrderRecommendation");
+	assert!(!galaxy_struct.contains("permutation"));
+}
+
+#[test]
+pub(crate) fn adr197_graph_order_is_observe_only() {
+	let join_order = source("src/binder/join_order.rs");
+	let galaxy = first_block(&join_order, "pub(super) fn galaxy_order_recommendation");
+	let bridge = first_block(&join_order, "pub(super) fn bridge_order_recommendation");
+
+	// The scorer never actuates; it only computes a recommendation over the evidence.
+	assert!(!galaxy.contains("bind_local_star_actuation"));
+	assert!(!bridge.contains("bind_local_star_actuation"));
+	// The verdict is render-time only (under ANALYZE), built from the recommendation + summaries.
+	let explain = source("src/binder/explain.rs");
+	assert!(explain.contains("fn graph_order_verdict_row"));
+}
+
+#[test]
+pub(crate) fn adr197_verdicts_reuse_180_184_vocabulary() {
+	let explain = source("src/binder/explain.rs");
+	let verdict_row = first_block(&explain, "fn graph_order_verdict_row");
+
+	// One unified verdict row kind, reusing the existing `StarOrderVerdict` vocabulary — no parallel
+	// verdict enum.
+	assert!(explain.contains("join_order_graph_verdict"));
+	assert!(verdict_row.contains("StarOrderVerdict::"));
+	assert!(verdict_row.contains("star_order_verdict_label"));
+	assert!(!explain.contains("enum GraphOrderVerdict"));
+}
+
+#[test]
+pub(crate) fn adr197_graph_order_is_binder_only() {
+	let manifest = manifest_dir();
+	let markers = [
+		"GraphOrderRecommendation",
+		"galaxy_order_recommendation",
+		"bridge_order_recommendation",
+		"join_order_graph_verdict",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/distributed/fragment.rs"),
+		manifest.join("src/exec.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR197 graph order evidence leaked outside the binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
