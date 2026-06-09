@@ -1663,3 +1663,114 @@ pub(crate) fn adr193_receipt_carries_per_edge_strategy_detail() {
 	// Explain renders it behind the summary as `strategy={}; strategies=[{}]`.
 	assert!(explain.contains("strategy={}; strategies=[{}]"));
 }
+
+#[test]
+pub(crate) fn adr194_edge_substrate_is_role_neutral() {
+	let join_order = source("src/binder/join_order.rs");
+	let binder = binder_source();
+	let edge = first_block(&join_order, "pub(super) struct JoinOrderEdgeEvidence");
+
+	// The edge carries role-neutral key signatures alongside the directed `probe`/`dimension` roles.
+	assert!(edge.contains("pub(super) left_key_signature: Vec<String>"));
+	assert!(edge.contains("pub(super) right_key_signature: Vec<String>"));
+	assert!(edge.contains("pub(super) probe: Option<String>"));
+	assert!(edge.contains("pub(super) dimension: Option<String>"));
+	// The capture site populates the signatures from the resolved keys.
+	assert!(binder.contains("key_signature_for_join_keys(&left_plan.scope"));
+	assert!(binder.contains("key_signature_for_join_keys(&right_plan.scope"));
+	// Endpoint rows come from `join_order_sources` keyed by key-source label, NOT `*_plan.facts`
+	// (which on a composite input describe the built-up side, not the key-owning relation).
+	let endpoint_fn = first_block(&join_order, "pub(super) fn join_order_endpoint_rows");
+	assert!(endpoint_fn.contains("sources?.get(label?)"));
+	assert!(!binder.contains("left_endpoint_rows: left_plan.facts"));
+	assert!(!binder.contains("right_endpoint_rows: right_plan.facts"));
+}
+
+#[test]
+pub(crate) fn adr194_galaxy_is_separate_type_from_snowflake() {
+	let join_order = source("src/binder/join_order.rs");
+	let explain = source("src/binder/explain.rs");
+	let galaxy = first_block(&join_order, "pub(super) struct GalaxyOrderEvidence");
+
+	// Galaxy evidence is its own type, not an alias/extension of the snowflake evidence.
+	assert!(join_order.contains("pub(super) struct GalaxyOrderEvidence"));
+	assert!(!galaxy.contains("SnowflakeOrderEvidence"));
+	// It rides a sibling render field, not a `JoinOrderRenderState` variant — so the tree-receipt
+	// match arms (`has_recognized_star_order`, etc.) stay untouched.
+	assert!(explain.contains("pub(super) galaxy_order: Option<GalaxyOrderEvidence>"));
+	let render_state = first_block(&explain, "pub(super) enum JoinOrderRenderState");
+	assert!(!render_state.contains("Galaxy"));
+}
+
+#[test]
+pub(crate) fn adr194_galaxy_is_observe_only() {
+	let join_order = source("src/binder/join_order.rs");
+	let analyze_galaxy = first_block(&join_order, "pub(super) fn analyze_galaxy");
+	let galaxy = first_block(&join_order, "pub(super) struct GalaxyOrderEvidence");
+
+	// The recognizer never reaches an actuator or a star receipt.
+	assert!(!analyze_galaxy.contains("bind_local_star_actuation"));
+	assert!(!analyze_galaxy.contains("StarReceipts"));
+	assert!(!analyze_galaxy.contains("recognized_star_order_outcome"));
+	// Galaxy evidence carries no chosen order or verdict — a gauge, not a steer.
+	assert!(!galaxy.contains("applied_order"));
+	assert!(!galaxy.contains("verdict"));
+}
+
+#[test]
+pub(crate) fn adr194_tree_roles_derived_not_rewritten() {
+	let join_order = source("src/binder/join_order.rs");
+	let analyze_snowflake = first_block(&join_order, "pub(super) fn analyze_snowflake");
+	let analyze_galaxy = first_block(&join_order, "pub(super) fn analyze_galaxy");
+
+	// The tree recognizers keep consuming the derived `probe`/`dimension` roles unchanged; the galaxy
+	// recognizer is the only consumer of the role-neutral key signatures. The substrate is additive.
+	assert!(analyze_snowflake.contains(".probe"));
+	assert!(analyze_snowflake.contains(".dimension"));
+	assert!(!analyze_snowflake.contains("key_signature"));
+	assert!(analyze_galaxy.contains("left_key_signature"));
+}
+
+#[test]
+pub(crate) fn adr194_no_fragmenter_executor_or_runtime_galaxy() {
+	let fragment = source("src/distributed/fragment.rs");
+	let exec = source("src/exec.rs");
+	let explain = source("src/binder/explain.rs");
+
+	// Galaxy evidence is binder/explain-only: the fragmenter and executor never learn about it.
+	assert!(!fragment.contains("Galaxy"));
+	assert!(!fragment.contains("analyze_galaxy"));
+	assert!(!exec.contains("GalaxyOrderEvidence"));
+	// No runtime/verdict galaxy rows in 194 (deferred).
+	assert!(!explain.contains("join_order_galaxy_runtime"));
+	assert!(!explain.contains("join_order_galaxy_verdict"));
+}
+
+#[test]
+pub(crate) fn adr194_galaxy_substrate_is_binder_only() {
+	let manifest = manifest_dir();
+	let markers = [
+		"GalaxyOrderEvidence",
+		"analyze_galaxy",
+		"join_order_galaxy",
+		"key_signature_for_join_keys",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/storage.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR194 galaxy substrate leaked outside the binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}

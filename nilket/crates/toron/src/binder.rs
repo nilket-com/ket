@@ -247,6 +247,12 @@ async fn bind_with_explain_trace(
 			}
 		}
 	}
+	// ADR 194: galaxy evidence is additive — it rides a sibling field and coexists with whatever
+	// star/snowflake receipt the tree recognizer produced (the conformed two-fact query is observed as
+	// a snowflake AND carries a galaxy row), so it runs regardless of the recognized-star state.
+	if let Some(galaxy) = analyze_galaxy(&render_trace.join_order_edges, &trace.join_decisions) {
+		render_trace.set_observed_galaxy(galaxy);
+	}
 	Ok((plan, trace, render_trace))
 }
 
@@ -1919,6 +1925,20 @@ impl<'a> Binder<'a> {
 				&right_resolved_keys,
 				join_estimated_row_count,
 			);
+			// ADR 194: role-neutral graph endpoints. The key signatures identify the join-key columns
+			// on each side; the endpoint rows come from `join_order_sources` keyed by the key-source
+			// label (the relation that owns the key), not `*_plan.facts` (which on a composite input
+			// describes the whole built-up side, not the key-owning relation).
+			let left_key_signature =
+				key_signature_for_join_keys(&left_plan.scope, &left_resolved_keys);
+			let right_key_signature =
+				key_signature_for_join_keys(&right_plan.scope, &right_resolved_keys);
+			let left_endpoint_rows =
+				join_order_endpoint_rows(left_plan.join_order_sources.as_ref(), probe.as_deref());
+			let right_endpoint_rows = join_order_endpoint_rows(
+				right_plan.join_order_sources.as_ref(),
+				dimension.as_deref(),
+			);
 			render_trace.join_order_edges.push(JoinOrderEdgeEvidence {
 				target: JoinTraceTarget { join_index },
 				probe,
@@ -1928,6 +1948,10 @@ impl<'a> Binder<'a> {
 				estimate_source,
 				inner_equi: kind == JoinKind::Inner && !left_resolved_keys.is_empty(),
 				probe_scan_linear: left_probe_scan_linear,
+				left_key_signature,
+				right_key_signature,
+				left_endpoint_rows,
+				right_endpoint_rows,
 			});
 		}
 		let decision = choose_join_strategy(

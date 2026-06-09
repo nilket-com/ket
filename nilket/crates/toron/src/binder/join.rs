@@ -262,6 +262,23 @@ impl RelationScope {
 		}
 	}
 
+	// ADR 194: the role-neutral identity of a join-key column — `"relation.column"`. Stable whether the
+	// relation is the freshly-joined right input or already built into the left tree, so two edges that
+	// touch the same conformed-dimension column produce the same signature.
+	pub(super) fn key_signature_for_ordinal(&self, ordinal: ColumnOrdinal) -> Option<String> {
+		let signatures = self
+			.entries
+			.iter()
+			.filter(|entry| entry.ordinal == ordinal)
+			.map(|entry| format!("{}.{}", relation_key_label(&entry.qualifier), entry.column))
+			.collect::<BTreeSet<_>>();
+		if signatures.len() == 1 {
+			signatures.into_iter().next()
+		} else {
+			None
+		}
+	}
+
 	pub(super) fn unique_source_label(&self) -> Option<String> {
 		let labels = self
 			.entries

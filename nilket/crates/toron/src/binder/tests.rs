@@ -9146,9 +9146,45 @@ async fn flat_star_emits_no_snowflake_row() {
 	);
 }
 
-#[test]
-fn galaxy_or_shared_dimension_declines_snowflake() {
-	let edges = vec![
+// ADR 194 headline: the reachable conformed two-fact query emits galaxy evidence from the
+// role-neutral substrate, additive to the snowflake-shaped tree receipt it still records.
+#[tokio::test]
+async fn conformed_two_fact_query_emits_galaxy_evidence() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", galaxy_conformed_order_sql()))
+		.expect("plan conformed galaxy EXPLAIN");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+
+	let galaxy_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("conformed two-fact query emits a join_order_galaxy row");
+	assert_utf8_contains(&galaxy_row[1], "conformed=product");
+	assert_utf8_contains(&galaxy_row[1], "relations=[returns,sales]");
+	assert_eq!(
+		galaxy_row[2],
+		ScalarValue::Utf8(Some("observed".to_string()))
+	);
+	assert_utf8_contains(&galaxy_row[3], "product.id");
+	// Additive: the tree receipt (snowflake or actuated star) still renders alongside the galaxy row.
+	assert!(rows.iter().any(|row| {
+		matches!(&row[0], ScalarValue::Utf8(Some(kind))
+			if kind == "join_order" || kind == "join_order_snowflake")
+	}));
+}
+
+// ADR 194 / D6 — the truthful boundary (was `galaxy_or_shared_dimension_declines_snowflake`): the
+// synthetic multi-root edge stream is a cartesian the binder cannot emit and is a galaxy of neither
+// recognizer, while the *reachable* conformed two-fact query is recognized by the role-neutral
+// substrate.
+#[tokio::test]
+async fn role_neutral_substrate_recognizes_reachable_galaxy_not_synthetic() {
+	// (a) The hand-built disjoint multi-root stream shares no conformed dimension — a cartesian, not a
+	//     galaxy. Both the snowflake recognizer and the galaxy recognizer decline it.
+	let synthetic = vec![
 		snowflake_test_edge(0, "orders", "customers", 0, 1_000, true),
 		snowflake_test_edge(1, "invoices", "regions", 1, 100, true),
 	];
@@ -9164,8 +9200,134 @@ fn galaxy_or_shared_dimension_declines_snowflake() {
 			JoinPhysicalPlacement::Natural,
 		),
 	];
+	assert!(
+		analyze_snowflake(&synthetic, &decisions, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP).is_none()
+	);
+	assert!(analyze_galaxy(&synthetic, &decisions).is_none());
 
-	assert!(analyze_snowflake(&edges, &decisions, CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP).is_none());
+	// (b) The frontend cannot emit a multi-root stream: cross and comma joins are rejected at planning.
+	assert!(
+		SqlPlanner::new()
+			.plan("SELECT * FROM sales s CROSS JOIN returns r")
+			.is_err()
+	);
+	assert!(
+		SqlPlanner::new()
+			.plan("SELECT * FROM sales s, returns r")
+			.is_err()
+	);
+
+	// (c) The reachable conformed two-fact query binds and the role-neutral substrate recognizes
+	//     `product` as the conformed dimension shared by both facts.
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_conformed_order_sql())
+		.expect("plan conformed galaxy");
+	let (_plan, trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind conformed galaxy");
+	let galaxy = analyze_galaxy(&render_trace.join_order_edges, &trace.join_decisions)
+		.expect("conformed query is recognized as a galaxy");
+	assert_eq!(galaxy.conformed.len(), 1);
+	assert_eq!(galaxy.conformed[0].label, "product");
+	assert_eq!(
+		galaxy.conformed[0].key_signature,
+		vec!["product.id".to_string()]
+	);
+	assert_eq!(
+		galaxy.conformed[0].incident_relations,
+		vec!["returns".to_string(), "sales".to_string()]
+	);
+	// The edge list carries role-neutral endpoints (labels + key signatures), the substrate the
+	// directed trace role alone could not.
+	assert!(galaxy.edges.iter().any(|edge| edge.left_key_signature
+		== vec!["product.id".to_string()]
+		|| edge.right_key_signature == vec!["product.id".to_string()]));
+}
+
+// ADR 194: Rune is the primary interface — the conformed two-fact graph authored in Rune emits the
+// same galaxy evidence as the SQL path.
+#[tokio::test]
+async fn rune_conformed_two_fact_matches_sql() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .auto_join(
+                   ctx.table("product"),
+                   qcol("sales", "product_id").eq(qcol("product", "id"))
+               )
+               .auto_join(
+                   ctx.table("returns"),
+                   qcol("returns", "product_id").eq(qcol("product", "id"))
+               )
+               .explain()
+        }
+    "#,
+	)
+	.await;
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let galaxy_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("Rune conformed two-fact query emits a join_order_galaxy row");
+	assert_utf8_contains(&galaxy_row[1], "conformed=product");
+	assert_utf8_contains(&galaxy_row[1], "relations=[returns,sales]");
+}
+
+// ADR 194 anti-poaching: a normal snowflake fans out on the branch's *own* foreign keys
+// (`customers.region_id`, `customers.segment_id`), never conforming on a shared key signature — so it
+// produces no galaxy row, and the tree receipts stay byte-identical.
+#[tokio::test]
+async fn galaxy_recognizer_declines_single_fact_snowflake_and_star() {
+	for (catalog, sql) in [
+		(
+			mixed_strategy_snowflake_join_order_catalog(),
+			non_optimal_snowflake_order_sql().to_string(),
+		),
+		(star_join_order_catalog(), non_optimal_star_order_sql()),
+	] {
+		let logical = SqlPlanner::new()
+			.plan(&format!("EXPLAIN {sql}"))
+			.expect("plan single-fact EXPLAIN");
+		let (_schema, rows) =
+			bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+		assert!(
+			!rows
+				.iter()
+				.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string()))),
+			"single-fact star/snowflake must not emit a galaxy row: {rows:?}"
+		);
+	}
+}
+
+// ADR 194 (F1 regression): a single fact joined to two aliases of the same dimension on its OWN
+// foreign key is a duplicate-dimension star, not a galaxy. `orders.customer_id` is incident to both
+// `c1` and `c2` on the same signature, so the candidate detector flags `orders` — but `orders`
+// (100_000 rows) is larger than its `customers` aliases (5_000), so the dimension-like row gate
+// rejects it. No galaxy row.
+#[tokio::test]
+async fn galaxy_recognizer_declines_single_fact_same_key_alias_star() {
+	let catalog = snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"EXPLAIN SELECT o.id, c1.id, c2.id FROM orders o \
+			 INNER JOIN customers c1 ON o.customer_id = c1.id \
+			 INNER JOIN customers c2 ON o.customer_id = c2.id",
+		)
+		.expect("plan alias-star EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	assert!(
+		!rows
+			.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string()))),
+		"duplicate-dimension alias star must not emit a galaxy row: {rows:?}"
+	);
 }
 
 #[test]
@@ -13368,6 +13530,77 @@ fn hash_snowflake_join_order_catalog() -> MockCatalog {
 	catalog
 }
 
+// ADR 194: two fact tables (`sales`, `returns`) sharing a conformed dimension `product` on its
+// primary key. A reachable single-query join graph that binds as a single-root snowflake but whose
+// role-neutral key signatures reveal `product.id` referenced by both facts.
+fn galaxy_join_order_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(41),
+			named_descriptor(
+				41,
+				"product",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register galaxy product");
+	catalog
+		.register_descriptor(
+			TableId(42),
+			named_descriptor(
+				42,
+				"sales",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register galaxy sales");
+	catalog
+		.register_descriptor(
+			TableId(43),
+			named_descriptor(
+				43,
+				"returns",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register galaxy returns");
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"product",
+		Some(512),
+		Some(100),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"sales",
+		Some(64 * 1024 * 1024),
+		Some(100_000),
+		vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"returns",
+		Some(8_192),
+		Some(5_000),
+		vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+	);
+	catalog
+}
+
+fn galaxy_conformed_order_sql() -> &'static str {
+	"SELECT sales.id, product.id, returns.id FROM sales \
+	 JOIN product ON sales.product_id = product.id \
+	 JOIN returns ON returns.product_id = product.id"
+}
+
 fn mixed_strategy_snowflake_join_order_catalog() -> MockCatalog {
 	let mut catalog = MockCatalog::new();
 	register_snowflake_join_order_tables(&mut catalog);
@@ -13988,6 +14221,10 @@ fn snowflake_test_edge(
 		estimate_source: JoinOrderEstimateSource::SingleKeyNdvContainment,
 		inner_equi: true,
 		probe_scan_linear,
+		left_key_signature: vec![format!("{probe}.k")],
+		right_key_signature: vec![format!("{dimension}.id")],
+		left_endpoint_rows: None,
+		right_endpoint_rows: None,
 	}
 }
 

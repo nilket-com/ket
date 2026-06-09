@@ -85,6 +85,9 @@ pub(super) struct OptimizerExplainRenderTrace {
 	pub(super) scan_filters: Vec<ScanFilterRenderReceipt>,
 	pub(super) join_order_edges: Vec<JoinOrderEdgeEvidence>,
 	pub(super) join_order: JoinOrderRenderState,
+	// ADR 194: galaxy graph evidence rides a sibling field, additive to the `join_order` tree receipt
+	// — it never changes the star/snowflake render state, so existing arms and behavior stay untouched.
+	pub(super) galaxy_order: Option<GalaxyOrderEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +139,10 @@ impl OptimizerExplainRenderTrace {
 
 	pub(super) fn set_observed_snowflake(&mut self, evidence: SnowflakeOrderEvidence) {
 		self.join_order = JoinOrderRenderState::ObservedSnowflake(evidence);
+	}
+
+	pub(super) fn set_observed_galaxy(&mut self, evidence: GalaxyOrderEvidence) {
+		self.galaxy_order = Some(evidence);
 	}
 
 	pub(super) fn set_star_receipt(&mut self, receipt: StarOrderRenderReceipt) {
@@ -394,6 +401,11 @@ pub(super) fn optimizer_explain_plan(
 					rows.push(optimizer_explain_join_order_row(&receipt.outcome)?);
 				}
 			}
+		}
+		// ADR 194: galaxy evidence is additive — it renders alongside whatever tree
+		// receipt the query produced, never in place of it.
+		if let Some(galaxy) = &render_trace.galaxy_order {
+			rows.push(optimizer_explain_galaxy_order_row(galaxy));
 		}
 	}
 	system_table_plan(
@@ -959,6 +971,85 @@ pub(super) fn optimizer_explain_snowflake_order_row(
 		ScalarValue::Int64(None),
 		ScalarValue::Int64(None),
 	])
+}
+
+// ADR 194: the galaxy graph evidence row — a gauge, not a steer. It names the conformed dimension(s),
+// the incident relations, the component count, and the role-neutral edge list. `outcome=observed`
+// because 194 recognizes the graph without ordering or actuating it.
+pub(super) fn optimizer_explain_galaxy_order_row(
+	evidence: &GalaxyOrderEvidence,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_galaxy".to_string())),
+		ScalarValue::Utf8(Some(galaxy_order_target_label(evidence))),
+		ScalarValue::Utf8(Some("observed".to_string())),
+		ScalarValue::Utf8(Some(galaxy_order_detail_label(evidence))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+pub(super) fn galaxy_order_target_label(evidence: &GalaxyOrderEvidence) -> String {
+	let conformed = evidence
+		.conformed
+		.iter()
+		.map(|dim| dim.label.clone())
+		.collect::<Vec<_>>()
+		.join(",");
+	let facts = evidence
+		.conformed
+		.iter()
+		.flat_map(|dim| dim.incident_relations.iter().cloned())
+		.collect::<std::collections::BTreeSet<_>>()
+		.into_iter()
+		.collect::<Vec<_>>()
+		.join(",");
+	format!("galaxy[conformed={conformed}; relations=[{facts}]]")
+}
+
+pub(super) fn galaxy_order_detail_label(evidence: &GalaxyOrderEvidence) -> String {
+	let conformed = evidence
+		.conformed
+		.iter()
+		.map(|dim| {
+			format!(
+				"{}:{}->[{}]",
+				dim.label,
+				dim.key_signature.join("+"),
+				dim.incident_relations.join(",")
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("; ");
+	let edges = evidence
+		.edges
+		.iter()
+		.map(|edge| {
+			format!(
+				"{}->{} on {}={} {}/{}",
+				edge.left_label,
+				edge.right_label,
+				edge.left_key_signature.join("+"),
+				edge.right_key_signature.join("+"),
+				join_strategy_label(edge.strategy),
+				join_physical_placement_label(edge.placement),
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(", ");
+	format!(
+		"conformed=[{conformed}]; components={}; edges=[{edges}]",
+		evidence.component_count
+	)
 }
 
 fn optimizer_analyze_snowflake_order_row(evidence: &SnowflakeOrderEvidence) -> Vec<ScalarValue> {

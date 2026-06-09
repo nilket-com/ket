@@ -247,6 +247,17 @@ pub(super) struct JoinOrderEdgeEvidence {
 	pub(super) estimate_source: JoinOrderEstimateSource,
 	pub(super) inner_equi: bool,
 	pub(super) probe_scan_linear: bool,
+	// ADR 194: role-neutral graph endpoints. `probe`/`dimension` above are the left/right key-source
+	// labels (the relation that owns the resolved join key on each side) — they are the directed trace
+	// role. The key signatures below identify *which column* of each key-source relation the edge
+	// touches (`["product.id"]`), so a galaxy recognizer can see that two edges conform on the same
+	// dimension column. Endpoint rows are the per-key-source relation row estimate from
+	// `join_order_sources` (NOT `plan.facts`, which on a composite input describes the whole built-up
+	// side, not the relation that owns the key).
+	pub(super) left_key_signature: Vec<String>,
+	pub(super) right_key_signature: Vec<String>,
+	pub(super) left_endpoint_rows: Option<RowCount>,
+	pub(super) right_endpoint_rows: Option<RowCount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +378,38 @@ pub(super) struct SnowflakeEdgeStrategy {
 	pub(super) strategy: JoinStrategy,
 	pub(super) placement: JoinPhysicalPlacement,
 	pub(super) probe_scan_linear: bool,
+}
+
+// ADR 194: galaxy graph evidence is a sibling of `SnowflakeOrderEvidence`, not an extension — a
+// snowflake is a single-root tree; a galaxy is a multi-fact graph linked by a conformed dimension.
+// This is observe-only: it never carries a chosen order, verdict, or actuation receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GalaxyOrderEvidence {
+	pub(super) conformed: Vec<ConformedDimension>,
+	pub(super) edges: Vec<GalaxyEdgeEvidence>,
+	pub(super) component_count: usize,
+}
+
+// A relation joined by two or more distinct relations on the *same* key-source column signature. This
+// is a trace-level role-neutral observation ("`product.id` is referenced by `sales` and `returns`"),
+// not a catalog-owned fact/dimension classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ConformedDimension {
+	pub(super) label: String,
+	pub(super) key_signature: Vec<String>,
+	pub(super) incident_relations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GalaxyEdgeEvidence {
+	pub(super) target: JoinTraceTarget,
+	pub(super) left_label: String,
+	pub(super) right_label: String,
+	pub(super) left_key_signature: Vec<String>,
+	pub(super) right_key_signature: Vec<String>,
+	pub(super) estimated_rows: Option<RowCount>,
+	pub(super) strategy: JoinStrategy,
+	pub(super) placement: JoinPhysicalPlacement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -628,6 +671,34 @@ pub(super) fn relation_label_for_join_keys(
 	} else {
 		None
 	}
+}
+
+// ADR 194: the role-neutral key signature for one side of a join — the sorted, de-duplicated
+// `"relation.column"` identities the resolved keys touch. Empty if any key column cannot be resolved
+// to a single source, so the galaxy recognizer never conforms on an ambiguous endpoint.
+pub(super) fn key_signature_for_join_keys(
+	scope: &RelationScope,
+	keys: &[ResolvedJoinKey],
+) -> Vec<String> {
+	let mut signature = BTreeSet::new();
+	for key in keys {
+		match scope.key_signature_for_ordinal(key.column.ordinal) {
+			Some(label) => {
+				signature.insert(label);
+			}
+			None => return Vec::new(),
+		}
+	}
+	signature.into_iter().collect()
+}
+
+// ADR 194: the row estimate of the relation that owns a join key, looked up by its key-source label.
+// Used to attach honest per-endpoint facts to a role-neutral edge.
+pub(super) fn join_order_endpoint_rows(
+	sources: Option<&JoinOrderSourceMap>,
+	label: Option<&str>,
+) -> Option<RowCount> {
+	sources?.get(label?).and_then(|facts| facts.rows)
 }
 
 pub(super) fn join_order_estimate_source(
@@ -922,6 +993,160 @@ pub(super) fn analyze_snowflake(
 		return None;
 	}
 	Some(evidence)
+}
+
+// ADR 194: recognize a galaxy — a multi-fact graph linked by a conformed dimension — over the
+// role-neutral edge endpoints. The directed trace records `sales ⋈ product ⋈ returns` as a snowflake
+// (`product→returns`), but the role-neutral key signatures reveal that `product` is joined by both
+// `sales` and `returns` on its *same* column (`product.id`). A snowflake branch, by contrast, fans out
+// on its *own* differing foreign keys (`customers.region_id`, `customers.segment_id`), so it never
+// conforms. Observe-only: no order, no verdict, no actuation.
+pub(super) fn analyze_galaxy(
+	edges: &[JoinOrderEdgeEvidence],
+	decisions: &[DecisionReceipt],
+) -> Option<GalaxyOrderEvidence> {
+	if edges.len() < 2 {
+		return None;
+	}
+
+	// Validate every edge and build the role-neutral galaxy edge list.
+	let mut galaxy_edges = Vec::with_capacity(edges.len());
+	for edge in edges {
+		if !edge.inner_equi {
+			return None;
+		}
+		let left_label = edge.probe.clone()?;
+		let right_label = edge.dimension.clone()?;
+		if left_label == right_label || edge.estimated_rows.is_none() {
+			return None;
+		}
+		if edge.left_key_signature.is_empty() || edge.right_key_signature.is_empty() {
+			return None;
+		}
+		let decision = decisions.get(edge.target.join_index)?;
+		if decision.target != edge.target {
+			return None;
+		}
+		galaxy_edges.push(GalaxyEdgeEvidence {
+			target: edge.target,
+			left_label,
+			right_label,
+			left_key_signature: edge.left_key_signature.clone(),
+			right_key_signature: edge.right_key_signature.clone(),
+			estimated_rows: edge.estimated_rows,
+			strategy: decision.strategy,
+			placement: decision.placement,
+		});
+	}
+
+	// For each relation, group the *other* endpoints by the key signature on this relation's side. A
+	// signature shared by >= 2 distinct other relations is a conformed-dimension *candidate*.
+	let mut by_relation: BTreeMap<String, BTreeMap<Vec<String>, BTreeSet<String>>> =
+		BTreeMap::new();
+	for edge in &galaxy_edges {
+		by_relation
+			.entry(edge.left_label.clone())
+			.or_default()
+			.entry(edge.left_key_signature.clone())
+			.or_default()
+			.insert(edge.right_label.clone());
+		by_relation
+			.entry(edge.right_label.clone())
+			.or_default()
+			.entry(edge.right_key_signature.clone())
+			.or_default()
+			.insert(edge.left_label.clone());
+	}
+
+	// The per-relation row estimate, role-neutral (from `join_order_sources`, by key-source label).
+	let mut rows_by_relation: BTreeMap<String, RowCount> = BTreeMap::new();
+	for edge in edges {
+		if let (Some(label), Some(rows)) = (edge.probe.as_ref(), edge.left_endpoint_rows) {
+			rows_by_relation.entry(label.clone()).or_insert(rows);
+		}
+		if let (Some(label), Some(rows)) = (edge.dimension.as_ref(), edge.right_endpoint_rows) {
+			rows_by_relation.entry(label.clone()).or_insert(rows);
+		}
+	}
+
+	let mut conformed = Vec::new();
+	for (relation, by_signature) in &by_relation {
+		for (signature, incident) in by_signature {
+			if incident.len() < 2 {
+				continue;
+			}
+			// ADR 194 (F1): the candidate must be *dimension-like* — its row estimate no larger than
+			// every incident relation it is shared by. A single fact joined to several aliases of one
+			// dimension on its OWN foreign key (a duplicate-dimension star, e.g. `orders` joined to
+			// `customers c1`/`customers c2` on `orders.customer_id`) makes the fact look conformed; the
+			// row gate rejects it because the fact is larger than its dimensions. Conservative: a
+			// candidate with missing row estimates is not claimed as conformed.
+			let Some(candidate_rows) = rows_by_relation.get(relation) else {
+				continue;
+			};
+			let dimension_like = incident.iter().all(|incident_relation| {
+				rows_by_relation
+					.get(incident_relation)
+					.is_some_and(|incident_rows| candidate_rows <= incident_rows)
+			});
+			if !dimension_like {
+				continue;
+			}
+			conformed.push(ConformedDimension {
+				label: relation.clone(),
+				key_signature: signature.clone(),
+				incident_relations: incident.iter().cloned().collect(),
+			});
+		}
+	}
+	if conformed.is_empty() {
+		// No conformed dimension links two facts — a plain star/snowflake, not a galaxy.
+		return None;
+	}
+
+	let component_count = galaxy_component_count(&galaxy_edges);
+	Some(GalaxyOrderEvidence {
+		conformed,
+		edges: galaxy_edges,
+		component_count,
+	})
+}
+
+// Connected-component count over the undirected relation graph (union-find by edge endpoints).
+fn galaxy_component_count(edges: &[GalaxyEdgeEvidence]) -> usize {
+	let mut parent: BTreeMap<String, String> = BTreeMap::new();
+	fn find(parent: &mut BTreeMap<String, String>, node: &str) -> String {
+		let mut current = node.to_string();
+		loop {
+			let next = parent
+				.get(&current)
+				.cloned()
+				.unwrap_or_else(|| current.clone());
+			if next == current {
+				return current;
+			}
+			current = next;
+		}
+	}
+	for edge in edges {
+		parent
+			.entry(edge.left_label.clone())
+			.or_insert_with(|| edge.left_label.clone());
+		parent
+			.entry(edge.right_label.clone())
+			.or_insert_with(|| edge.right_label.clone());
+		let left_root = find(&mut parent, &edge.left_label);
+		let right_root = find(&mut parent, &edge.right_label);
+		if left_root != right_root {
+			parent.insert(left_root, right_root);
+		}
+	}
+	let nodes = parent.keys().cloned().collect::<Vec<_>>();
+	nodes
+		.iter()
+		.map(|node| find(&mut parent, node))
+		.collect::<BTreeSet<_>>()
+		.len()
 }
 
 fn snowflake_order_level(
