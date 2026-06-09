@@ -1860,3 +1860,98 @@ pub(crate) fn adr195_galaxy_runtime_is_binder_only() {
 		format_offenders(&manifest, &offenders)
 	);
 }
+
+#[test]
+pub(crate) fn adr196_bridge_is_separate_type_from_galaxy() {
+	let join_order = source("src/binder/join_order.rs");
+	let explain = source("src/binder/explain.rs");
+	let bridge = first_block(&join_order, "pub(super) struct BridgeOrderEvidence");
+
+	assert!(join_order.contains("pub(super) struct BridgeOrderEvidence"));
+	assert!(join_order.contains("pub(super) struct BridgeLink"));
+	assert!(!bridge.contains("GalaxyOrderEvidence"));
+	// Sibling render field, not a `JoinOrderRenderState` variant.
+	assert!(explain.contains("pub(super) bridge_order: Option<BridgeOrderEvidence>"));
+	let render_state = first_block(&explain, "pub(super) enum JoinOrderRenderState");
+	assert!(!render_state.contains("Bridge"));
+}
+
+#[test]
+pub(crate) fn adr196_bridge_recognizer_uses_inverse_f1_gate() {
+	let join_order = source("src/binder/join_order.rs");
+	let analyze_bridge = first_block(&join_order, "pub(super) fn analyze_bridge");
+
+	// The bridge is the intermediary that is NOT dimension-like: its rows >= its fact-side probe's.
+	assert!(analyze_bridge.contains("bridge_rows < fact_rows"));
+	assert!(analyze_bridge.contains("fact_rows.get() == 0"));
+	// Equal signatures route to galaxy, not bridge.
+	assert!(analyze_bridge.contains("b_in_signature == b_out_signature"));
+}
+
+#[test]
+pub(crate) fn adr196_bridge_is_observe_only() {
+	let join_order = source("src/binder/join_order.rs");
+	let explain = source("src/binder/explain.rs");
+	let analyze_bridge = first_block(&join_order, "pub(super) fn analyze_bridge");
+	let bridge_evidence = first_block(&join_order, "pub(super) struct BridgeOrderEvidence");
+
+	assert!(!analyze_bridge.contains("bind_local_star_actuation"));
+	assert!(!analyze_bridge.contains("StarReceipts"));
+	assert!(!bridge_evidence.contains("verdict"));
+	assert!(!explain.contains("join_order_bridge_verdict"));
+}
+
+#[test]
+pub(crate) fn adr196_bridge_runtime_reuses_195_measurement() {
+	let explain = source("src/binder/explain.rs");
+	let bridge_rows = first_block(&explain, "fn bridge_analyze_rows");
+
+	assert!(bridge_rows.contains("join_order_runtime_measurement"));
+	assert!(explain.contains("fn join_replay_id_for_trace_target"));
+	// Fan-out is computed from the observation summary's probe/output rows.
+	let runtime_row = first_block(&explain, "fn optimizer_analyze_bridge_runtime_row");
+	assert!(runtime_row.contains("summary.probe_rows.get()"));
+	assert!(runtime_row.contains("summary.output_rows.get()"));
+	assert!(runtime_row.contains("probe_rows > 0"));
+}
+
+#[test]
+pub(crate) fn adr196_bridge_telemetry_unions_edge_targets() {
+	let binder = binder_source();
+	let collect = first_block(&binder, "fn star_order_runtime_replay_ids");
+
+	assert!(collect.contains("render_trace.bridge_order"));
+	assert!(collect.contains("link.incoming_target"));
+	assert!(collect.contains("link.outgoing_target"));
+}
+
+#[test]
+pub(crate) fn adr196_no_fragmenter_executor_or_actuation_and_binder_only() {
+	let manifest = manifest_dir();
+	let fragment = source("src/distributed/fragment.rs");
+	let exec = source("src/exec.rs");
+
+	assert!(!fragment.contains("analyze_bridge"));
+	assert!(!fragment.contains("join_order_bridge"));
+	assert!(!exec.contains("BridgeOrderEvidence"));
+
+	let markers = ["BridgeOrderEvidence", "analyze_bridge", "join_order_bridge"];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/storage.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR196 bridge evidence leaked outside the binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}

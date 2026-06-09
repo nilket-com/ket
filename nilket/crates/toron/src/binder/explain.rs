@@ -88,6 +88,8 @@ pub(super) struct OptimizerExplainRenderTrace {
 	// ADR 194: galaxy graph evidence rides a sibling field, additive to the `join_order` tree receipt
 	// — it never changes the star/snowflake render state, so existing arms and behavior stay untouched.
 	pub(super) galaxy_order: Option<GalaxyOrderEvidence>,
+	// ADR 196: bridge (many-to-many junction) evidence — a sibling to galaxy, equally additive.
+	pub(super) bridge_order: Option<BridgeOrderEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +145,10 @@ impl OptimizerExplainRenderTrace {
 
 	pub(super) fn set_observed_galaxy(&mut self, evidence: GalaxyOrderEvidence) {
 		self.galaxy_order = Some(evidence);
+	}
+
+	pub(super) fn set_observed_bridge(&mut self, evidence: BridgeOrderEvidence) {
+		self.bridge_order = Some(evidence);
 	}
 
 	pub(super) fn set_star_receipt(&mut self, receipt: StarOrderRenderReceipt) {
@@ -407,6 +413,10 @@ pub(super) fn optimizer_explain_plan(
 		if let Some(galaxy) = &render_trace.galaxy_order {
 			rows.push(optimizer_explain_galaxy_order_row(galaxy));
 		}
+		// ADR 196: bridge evidence is the same additive sibling, alongside galaxy + tree receipts.
+		if let Some(bridge) = &render_trace.bridge_order {
+			rows.push(optimizer_explain_bridge_order_row(bridge));
+		}
 	}
 	system_table_plan(
 		SystemTableKind::OptimizerExplain,
@@ -570,6 +580,7 @@ fn optimizer_analyze_rows(
 		}
 		rows.push(optimizer_analyze_snowflake_aggregate_verdict_row(&verdict));
 		rows.extend(galaxy_analyze_rows(render_trace, summaries)?);
+		rows.extend(bridge_analyze_rows(render_trace, summaries)?);
 		return Ok(rows);
 	}
 
@@ -610,6 +621,7 @@ fn optimizer_analyze_rows(
 		)?);
 	}
 	rows.extend(galaxy_analyze_rows(render_trace, summaries)?);
+	rows.extend(bridge_analyze_rows(render_trace, summaries)?);
 	Ok(rows)
 }
 
@@ -877,6 +889,111 @@ fn optimizer_analyze_galaxy_order_row(evidence: &GalaxyOrderEvidence) -> Vec<Sca
 	]
 }
 
+// ADR 196: bridge runtime rows — the M:N fan-out made real. The fan-out ratio is `output_rows /
+// probe_rows` at each bridge-incident edge (distinct from 195's estimate-accuracy ratio), skipped when
+// `probe_rows == 0`. Reuses 195's per-replay-id measurement machinery.
+fn bridge_analyze_rows(
+	render_trace: &OptimizerExplainRenderTrace,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let Some(bridge) = &render_trace.bridge_order else {
+		return Ok(Vec::new());
+	};
+	let mut rows = vec![optimizer_analyze_bridge_order_row(bridge)];
+	for link in &bridge.links {
+		for (target, role) in [
+			(link.incoming_target, "fact_to_bridge"),
+			(link.outgoing_target, "bridge_to_dim"),
+		] {
+			let Some(edge) = render_trace
+				.join_order_edges
+				.iter()
+				.find(|edge| edge.target == target)
+			else {
+				continue;
+			};
+			let Some(estimated) = edge.estimated_rows else {
+				continue;
+			};
+			let measurement = join_order_runtime_measurement(edge, estimated, summaries)?;
+			rows.push(optimizer_analyze_bridge_runtime_row(
+				link,
+				edge,
+				role,
+				estimated,
+				&measurement,
+			)?);
+		}
+	}
+	Ok(rows)
+}
+
+fn optimizer_analyze_bridge_order_row(evidence: &BridgeOrderEvidence) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_bridge".to_string())),
+		ScalarValue::Utf8(Some(bridge_order_target_label(evidence))),
+		ScalarValue::Utf8(Some("observed".to_string())),
+		ScalarValue::Utf8(Some(bridge_order_detail_label(evidence))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+fn optimizer_analyze_bridge_runtime_row(
+	link: &BridgeLink,
+	edge: &JoinOrderEdgeEvidence,
+	role: &str,
+	estimated_rows: RowCount,
+	measurement: &JoinOrderRuntimeMeasurement,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let probe_rows = measurement.summary.probe_rows.get();
+	let output_rows = measurement.summary.output_rows.get();
+	// Fan-out is the M:N explosion: skipped when there is no probe-side denominator.
+	let fan_out = (probe_rows > 0).then(|| output_rows as f64 / probe_rows as f64);
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_bridge_runtime".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"join[{}] {}->{}",
+			measurement.replay_id.0,
+			edge.probe.as_deref().unwrap_or("?"),
+			edge.dimension.as_deref().unwrap_or("?"),
+		))),
+		ScalarValue::Utf8(Some("measured".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"bridge={}; role={}; output_rows={}; probe_rows={}; build_rows={}; fan_out={}",
+			link.bridge,
+			role,
+			output_rows,
+			probe_rows,
+			measurement.summary.build_rows.get(),
+			fan_out
+				.map(|value| format!("{value:.6}"))
+				.unwrap_or_else(|| "missing".to_string()),
+		))),
+		ScalarValue::Int64(Some(row_count_to_i64(estimated_rows, "estimated_rows")?)),
+		ScalarValue::Int64(
+			measurement
+				.actual_rows
+				.map(|rows| row_count_to_i64(rows, "actual_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Float64(fan_out),
+		ScalarValue::Utf8(Some(role.to_string())),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.build_rows,
+			"build_rows",
+		)?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.probe_rows,
+			"probe_rows",
+		)?)),
+	])
+}
+
 fn optimizer_analyze_galaxy_runtime_row(
 	edge: &GalaxyEdgeEvidence,
 	estimated_rows: RowCount,
@@ -1112,6 +1229,64 @@ pub(super) fn optimizer_explain_galaxy_order_row(
 		ScalarValue::Int64(None),
 		ScalarValue::Int64(None),
 	]
+}
+
+// ADR 196: the bridge graph evidence row — a gauge naming each many-to-many junction and its estimated
+// fan-out. `outcome=observed`; 196 recognizes the junction without ordering or actuating it.
+pub(super) fn optimizer_explain_bridge_order_row(
+	evidence: &BridgeOrderEvidence,
+) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_bridge".to_string())),
+		ScalarValue::Utf8(Some(bridge_order_target_label(evidence))),
+		ScalarValue::Utf8(Some("observed".to_string())),
+		ScalarValue::Utf8(Some(bridge_order_detail_label(evidence))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+pub(super) fn bridge_fan_out_ratio(link: &BridgeLink) -> f64 {
+	// `fact_rows > 0` is guaranteed by the recognizer's zero-denominator decline.
+	link.bridge_rows.get() as f64 / link.fact_rows.get() as f64
+}
+
+pub(super) fn bridge_order_target_label(evidence: &BridgeOrderEvidence) -> String {
+	let links = evidence
+		.links
+		.iter()
+		.map(|link| format!("{}->{}->{}", link.fact, link.bridge, link.dim))
+		.collect::<Vec<_>>()
+		.join(",");
+	format!("bridge[{links}]")
+}
+
+pub(super) fn bridge_order_detail_label(evidence: &BridgeOrderEvidence) -> String {
+	evidence
+		.links
+		.iter()
+		.map(|link| {
+			format!(
+				"{} on {}={} and {}={}; fan_out={:.6}",
+				link.bridge,
+				link.b_in_signature.join("+"),
+				link.fact,
+				link.b_out_signature.join("+"),
+				link.dim,
+				bridge_fan_out_ratio(link),
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("; ")
 }
 
 pub(super) fn galaxy_order_target_label(evidence: &GalaxyOrderEvidence) -> String {

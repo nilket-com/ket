@@ -412,6 +412,31 @@ pub(super) struct GalaxyEdgeEvidence {
 	pub(super) placement: JoinPhysicalPlacement,
 }
 
+// ADR 196: bridge graph evidence is a sibling of `GalaxyOrderEvidence` — a bridge is a many-to-many
+// junction (`Fact ⋈ Bridge ⋈ Dim`), structurally identical in the trace to a 1:N snowflake branch and
+// separated from it only by a conservative, fixture-grounded inverse-F1 cardinality gate (the junction
+// is not dimension-like relative to its fact-side probe). Observe-only: no order, verdict, or actuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BridgeOrderEvidence {
+	pub(super) links: Vec<BridgeLink>,
+}
+
+// Carries the row components rather than a precomputed `f64` so the evidence stays `Eq`; the float
+// fan-out ratio is computed at render time (`bridge_rows / fact_rows`, with `fact_rows > 0` guaranteed
+// by the recognizer's zero-denominator decline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BridgeLink {
+	pub(super) fact: String,
+	pub(super) bridge: String,
+	pub(super) dim: String,
+	pub(super) b_in_signature: Vec<String>,
+	pub(super) b_out_signature: Vec<String>,
+	pub(super) bridge_rows: RowCount,
+	pub(super) fact_rows: RowCount,
+	pub(super) incoming_target: JoinTraceTarget,
+	pub(super) outgoing_target: JoinTraceTarget,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StarOrderVerdict {
 	Vindicated,
@@ -1147,6 +1172,113 @@ fn galaxy_component_count(edges: &[GalaxyEdgeEvidence]) -> usize {
 		.map(|node| find(&mut parent, node))
 		.collect::<BTreeSet<_>>()
 		.len()
+}
+
+// ADR 196: recognize a bridge — a many-to-many junction `Fact ⋈ Bridge ⋈ Dim`. The bridge node `B` is
+// the `dimension` of one edge (built onto a fact `F`) and the `probe` of another (joining out to a dim
+// `D`), on two distinct signatures. Structurally this is identical to a 1:N snowflake branch; the only
+// role-neutral separator is cardinality, so `B` is a bridge only when it is NOT dimension-like relative
+// to its fact-side probe (a conservative, fixture-grounded inverse of ADR 194's F1 gate). Observe-only.
+pub(super) fn analyze_bridge(
+	edges: &[JoinOrderEdgeEvidence],
+	decisions: &[DecisionReceipt],
+) -> Option<BridgeOrderEvidence> {
+	if edges.len() < 2 {
+		return None;
+	}
+	for edge in edges {
+		if !edge.inner_equi {
+			return None;
+		}
+		edge.probe.as_ref()?;
+		edge.dimension.as_ref()?;
+		let decision = decisions.get(edge.target.join_index)?;
+		if decision.target != edge.target {
+			return None;
+		}
+	}
+
+	// Per-relation row estimate (consistent across edges; role-neutral, from `join_order_sources`).
+	let mut rows_by_relation: BTreeMap<String, RowCount> = BTreeMap::new();
+	for edge in edges {
+		if let (Some(label), Some(rows)) = (edge.probe.as_ref(), edge.left_endpoint_rows) {
+			rows_by_relation.entry(label.clone()).or_insert(rows);
+		}
+		if let (Some(label), Some(rows)) = (edge.dimension.as_ref(), edge.right_endpoint_rows) {
+			rows_by_relation.entry(label.clone()).or_insert(rows);
+		}
+	}
+
+	let mut relations = BTreeSet::new();
+	for edge in edges {
+		if let Some(probe) = edge.probe.as_deref() {
+			relations.insert(probe);
+		}
+		if let Some(dimension) = edge.dimension.as_deref() {
+			relations.insert(dimension);
+		}
+	}
+
+	let mut links = Vec::new();
+	for bridge in &relations {
+		// Incoming: bridge is built onto a fact. Outgoing: bridge joins out to a dimension.
+		let Some(incoming) = edges
+			.iter()
+			.find(|edge| edge.dimension.as_deref() == Some(*bridge))
+		else {
+			continue;
+		};
+		let Some(outgoing) = edges
+			.iter()
+			.find(|edge| edge.probe.as_deref() == Some(*bridge))
+		else {
+			continue;
+		};
+		let (Some(fact), Some(dim)) = (incoming.probe.as_deref(), outgoing.dimension.as_deref())
+		else {
+			continue;
+		};
+		// Reject cycles / degenerate junctions.
+		if fact == *bridge || dim == *bridge || fact == dim {
+			continue;
+		}
+		let b_in_signature = &incoming.right_key_signature;
+		let b_out_signature = &outgoing.left_key_signature;
+		if b_in_signature.is_empty() || b_out_signature.is_empty() {
+			continue;
+		}
+		// Equal signatures = a conformed dimension; ADR 194's galaxy recognizer owns that.
+		if b_in_signature == b_out_signature {
+			continue;
+		}
+		let (Some(bridge_rows), Some(fact_rows)) = (
+			rows_by_relation.get(*bridge).copied(),
+			rows_by_relation.get(fact).copied(),
+		) else {
+			continue;
+		};
+		// Zero denominator → no fan-out claim. Conservative inverse-F1: a bridge is NOT dimension-like.
+		if fact_rows.get() == 0 || bridge_rows < fact_rows {
+			continue;
+		}
+		links.push(BridgeLink {
+			fact: fact.to_string(),
+			bridge: (*bridge).to_string(),
+			dim: dim.to_string(),
+			b_in_signature: b_in_signature.clone(),
+			b_out_signature: b_out_signature.clone(),
+			bridge_rows,
+			fact_rows,
+			incoming_target: incoming.target,
+			outgoing_target: outgoing.target,
+		});
+	}
+
+	if links.is_empty() {
+		None
+	} else {
+		Some(BridgeOrderEvidence { links })
+	}
 }
 
 fn snowflake_order_level(

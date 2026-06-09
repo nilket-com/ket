@@ -253,6 +253,10 @@ async fn bind_with_explain_trace(
 	if let Some(galaxy) = analyze_galaxy(&render_trace.join_order_edges, &trace.join_decisions) {
 		render_trace.set_observed_galaxy(galaxy);
 	}
+	// ADR 196: bridge evidence is an additive sibling, recognized over the same role-neutral edges.
+	if let Some(bridge) = analyze_bridge(&render_trace.join_order_edges, &trace.join_decisions) {
+		render_trace.set_observed_bridge(bridge);
+	}
 	Ok((plan, trace, render_trace))
 }
 
@@ -317,6 +321,15 @@ fn star_order_runtime_replay_ids(
 	// the source of truth for which observations to collect, independent of the join_order state.
 	if let Some(galaxy) = &render_trace.galaxy_order {
 		targets.extend(galaxy.edges.iter().map(|edge| edge.target));
+	}
+	// ADR 196: bridge measurement is gathered from the bridge substrate's edge targets, the 195 pattern.
+	if let Some(bridge) = &render_trace.bridge_order {
+		targets.extend(
+			bridge
+				.links
+				.iter()
+				.flat_map(|link| [link.incoming_target, link.outgoing_target]),
+		);
 	}
 	targets
 		.into_iter()

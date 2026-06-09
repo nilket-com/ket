@@ -9468,6 +9468,196 @@ async fn galaxy_runtime_keys_by_replay_id_and_declines_non_galaxy() {
 	);
 }
 
+// ADR 196 headline: a many-to-many bridge emits a `join_order_bridge` plan row, and under
+// EXPLAIN ANALYZE a `join_order_bridge_runtime` row whose measured fan-out ratio (output/probe) > 1 —
+// the M:N explosion made real. Additive: the snowflake tree receipt still renders.
+#[tokio::test]
+async fn bridge_evidence_measures_many_to_many_fanout() {
+	let catalog = bridge_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", bridge_chain_order_sql()))
+		.expect("plan bridge EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let bridge_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge".to_string())))
+		.expect("bridge plan row");
+	assert_utf8_contains(&bridge_row[1], "orders->order_items->products");
+	assert_utf8_contains(&bridge_row[3], "fan_out=");
+	// Additive: a tree receipt (snowflake or actuated star) renders alongside the bridge row.
+	assert!(rows.iter().any(|row| {
+		matches!(&row[0], ScalarValue::Utf8(Some(kind))
+			if kind == "join_order" || kind == "join_order_snowflake")
+	}));
+
+	let analyze_logical = SqlPlanner::new()
+		.plan(bridge_chain_order_sql())
+		.expect("plan bridge");
+	let binding = bind_explain_analyze(
+		&analyze_logical,
+		&catalog,
+		&auto_broadcast_config(64 * 1024 * 1024),
+	)
+	.await
+	.expect("bind bridge analyze");
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(1_000),
+			output_rows: RowCount::new(2_500),
+		})
+		.collect::<Vec<_>>();
+	let plan = render_explain_analyze(binding, &observations).expect("render bridge analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+	let runtime_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge_runtime".to_string())))
+		.collect::<Vec<_>>();
+	assert!(!runtime_rows.is_empty(), "bridge runtime rows present");
+	assert!(
+		runtime_rows
+			.iter()
+			.any(|row| matches!(&row[6], ScalarValue::Float64(Some(ratio)) if *ratio > 1.0)),
+		"measured many-to-many fan-out > 1: {runtime_rows:?}"
+	);
+}
+
+// ADR 196 / the load-bearing partner: cardinality, not structure, decides. The bridge fixture
+// (junction NOT dimension-like) is recognized; the structurally identical snowflake branch
+// (dimension-like intermediary) is not.
+#[tokio::test]
+async fn bridge_recognizer_distinguishes_bridge_from_snowflake_branch() {
+	let bridge_catalog = bridge_join_order_catalog();
+	let bridge_logical = SqlPlanner::new()
+		.plan(bridge_chain_order_sql())
+		.expect("plan bridge");
+	let (_p, bridge_trace, bridge_rt) = bind_with_explain_trace(
+		&bridge_logical,
+		&bridge_catalog,
+		&auto_broadcast_config(64 * 1024 * 1024),
+	)
+	.await
+	.expect("bind bridge");
+	let bridge = analyze_bridge(&bridge_rt.join_order_edges, &bridge_trace.join_decisions)
+		.expect("junction not dimension-like → bridge");
+	assert_eq!(bridge.links.len(), 1);
+	assert_eq!(bridge.links[0].bridge, "order_items");
+	assert_eq!(bridge.links[0].fact, "orders");
+	assert_eq!(bridge.links[0].dim, "products");
+
+	let branch_catalog = snowflake_join_order_catalog();
+	let branch_logical = SqlPlanner::new()
+		.plan("SELECT o.id, c.id, r.id FROM orders o INNER JOIN customers c ON o.customer_id = c.id INNER JOIN regions r ON c.region_id = r.id")
+		.expect("plan branch");
+	let (_p2, branch_trace, branch_rt) = bind_with_explain_trace(
+		&branch_logical,
+		&branch_catalog,
+		&auto_broadcast_config(64 * 1024 * 1024),
+	)
+	.await
+	.expect("bind branch");
+	assert!(
+		analyze_bridge(&branch_rt.join_order_edges, &branch_trace.join_decisions).is_none(),
+		"dimension-like snowflake branch is not a bridge"
+	);
+}
+
+// ADR 196: a conformed dimension (equal signatures) routes to galaxy, never bridge.
+#[tokio::test]
+async fn bridge_recognizer_declines_conformed_dimension() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_conformed_order_sql())
+		.expect("plan galaxy");
+	let (_p, trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind galaxy");
+	assert!(
+		analyze_bridge(&render_trace.join_order_edges, &trace.join_decisions).is_none(),
+		"conformed dimension is not a bridge"
+	);
+}
+
+// ADR 196: Rune is the primary interface — the bridge graph authored in Rune emits the same evidence.
+#[tokio::test]
+async fn rune_bridge_matches_sql() {
+	let catalog = bridge_join_order_catalog();
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders")
+               .auto_join(
+                   ctx.table("order_items"),
+                   qcol("orders", "id").eq(qcol("order_items", "order_id"))
+               )
+               .auto_join(
+                   ctx.table("products"),
+                   qcol("order_items", "product_id").eq(qcol("products", "id"))
+               )
+               .explain()
+        }
+    "#,
+	)
+	.await;
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let bridge_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge".to_string())))
+		.expect("Rune bridge query emits a join_order_bridge row");
+	assert_utf8_contains(&bridge_row[1], "orders->order_items->products");
+}
+
+// ADR 196: a degenerate junction whose fact and dimension collapse to the same relation is a cycle,
+// not a bridge — the recognizer rejects it.
+#[test]
+fn bridge_recognizer_rejects_cyclic_joins() {
+	let edges = vec![
+		bridge_test_edge(
+			0,
+			"orders",
+			"order_items",
+			"orders.id",
+			"order_items.order_id",
+			1_000,
+			10_000,
+		),
+		bridge_test_edge(
+			1,
+			"order_items",
+			"orders",
+			"order_items.ref_id",
+			"orders.id",
+			10_000,
+			1_000,
+		),
+	];
+	let decisions = vec![
+		snowflake_test_decision(
+			0,
+			JoinStrategy::HashPartitioned,
+			JoinPhysicalPlacement::Natural,
+		),
+		snowflake_test_decision(
+			1,
+			JoinStrategy::HashPartitioned,
+			JoinPhysicalPlacement::Natural,
+		),
+	];
+	assert!(
+		analyze_bridge(&edges, &decisions).is_none(),
+		"a fact==dim cycle is not a bridge"
+	);
+}
+
 #[test]
 fn snowflake_uniformity_accepts_only_authenticated_composite_natural_broadcast() {
 	let decisions = vec![
@@ -13739,6 +13929,79 @@ fn galaxy_conformed_order_sql() -> &'static str {
 	 JOIN returns ON returns.product_id = product.id"
 }
 
+// ADR 196: a many-to-many bridge — `orders`(fact, 1_000) ⋈ `order_items`(junction, 10_000) ⋈
+// `products`(dim, 100). The junction is NOT dimension-like relative to its fact-side probe
+// (10_000 >= 1_000), so the inverse-F1 gate recognizes a bridge. Contrast the snowflake branch
+// `customers`(5_000) < `orders`(100_000), which stays dimension-like.
+fn bridge_join_order_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(51),
+			named_descriptor(
+				51,
+				"orders",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register bridge orders");
+	catalog
+		.register_descriptor(
+			TableId(52),
+			named_descriptor(
+				52,
+				"order_items",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("order_id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register bridge order_items");
+	catalog
+		.register_descriptor(
+			TableId(53),
+			named_descriptor(
+				53,
+				"products",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register bridge products");
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"orders",
+		Some(8_192),
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(1_000))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"order_items",
+		Some(64 * 1024 * 1024),
+		Some(10_000),
+		vec![
+			(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"products",
+		Some(512),
+		Some(100),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	catalog
+}
+
+fn bridge_chain_order_sql() -> &'static str {
+	"SELECT orders.id, order_items.order_id, products.id FROM orders \
+	 JOIN order_items ON orders.id = order_items.order_id \
+	 JOIN products ON order_items.product_id = products.id"
+}
+
 fn mixed_strategy_snowflake_join_order_catalog() -> MockCatalog {
 	let mut catalog = MockCatalog::new();
 	register_snowflake_join_order_tables(&mut catalog);
@@ -14363,6 +14626,34 @@ fn snowflake_test_edge(
 		right_key_signature: vec![format!("{dimension}.id")],
 		left_endpoint_rows: None,
 		right_endpoint_rows: None,
+	}
+}
+
+// ADR 196: a synthetic edge with explicit key signatures and per-side endpoint rows, for unit-testing
+// `analyze_bridge` decline paths (cycles, etc.) without a full catalog.
+#[allow(clippy::too_many_arguments)]
+fn bridge_test_edge(
+	join_index: usize,
+	probe: &str,
+	dimension: &str,
+	left_signature: &str,
+	right_signature: &str,
+	left_rows: u64,
+	right_rows: u64,
+) -> JoinOrderEdgeEvidence {
+	JoinOrderEdgeEvidence {
+		target: JoinTraceTarget { join_index },
+		probe: Some(probe.to_string()),
+		dimension: Some(dimension.to_string()),
+		declared_position: join_index,
+		estimated_rows: Some(RowCount::new(right_rows)),
+		estimate_source: JoinOrderEstimateSource::SingleKeyNdvContainment,
+		inner_equi: true,
+		probe_scan_linear: true,
+		left_key_signature: vec![left_signature.to_string()],
+		right_key_signature: vec![right_signature.to_string()],
+		left_endpoint_rows: Some(RowCount::new(left_rows)),
+		right_endpoint_rows: Some(RowCount::new(right_rows)),
 	}
 }
 
