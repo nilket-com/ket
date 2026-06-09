@@ -90,6 +90,9 @@ pub(super) struct OptimizerExplainRenderTrace {
 	pub(super) galaxy_order: Option<GalaxyOrderEvidence>,
 	// ADR 196: bridge (many-to-many junction) evidence — a sibling to galaxy, equally additive.
 	pub(super) bridge_order: Option<BridgeOrderEvidence>,
+	// ADR 198: when galaxy root-swap actuation fires, the applied root fact. The receipt then shows
+	// `action=reordered; applied_root={fact}` instead of the re-rooted galaxy's intrinsic recommendation.
+	pub(super) applied_galaxy_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +152,10 @@ impl OptimizerExplainRenderTrace {
 
 	pub(super) fn set_observed_bridge(&mut self, evidence: BridgeOrderEvidence) {
 		self.bridge_order = Some(evidence);
+	}
+
+	pub(super) fn set_applied_galaxy_root(&mut self, root: String) {
+		self.applied_galaxy_root = Some(root);
 	}
 
 	pub(super) fn set_star_receipt(&mut self, receipt: StarOrderRenderReceipt) {
@@ -411,7 +418,10 @@ pub(super) fn optimizer_explain_plan(
 		// ADR 194: galaxy evidence is additive — it renders alongside whatever tree
 		// receipt the query produced, never in place of it.
 		if let Some(galaxy) = &render_trace.galaxy_order {
-			rows.push(optimizer_explain_galaxy_order_row(galaxy));
+			rows.push(optimizer_explain_galaxy_order_row(
+				galaxy,
+				render_trace.applied_galaxy_root.as_deref(),
+			));
 		}
 		// ADR 196: bridge evidence is the same additive sibling, alongside galaxy + tree receipts.
 		if let Some(bridge) = &render_trace.bridge_order {
@@ -841,7 +851,10 @@ fn galaxy_analyze_rows(
 	let Some(galaxy) = &render_trace.galaxy_order else {
 		return Ok(Vec::new());
 	};
-	let mut rows = vec![optimizer_analyze_galaxy_order_row(galaxy)];
+	let mut rows = vec![optimizer_analyze_galaxy_order_row(
+		galaxy,
+		render_trace.applied_galaxy_root.as_deref(),
+	)];
 	let by_target = galaxy
 		.edges
 		.iter()
@@ -959,12 +972,22 @@ fn graph_order_verdict_row(
 	]
 }
 
-fn optimizer_analyze_galaxy_order_row(evidence: &GalaxyOrderEvidence) -> Vec<ScalarValue> {
+fn optimizer_analyze_galaxy_order_row(
+	evidence: &GalaxyOrderEvidence,
+	applied_root: Option<&str>,
+) -> Vec<ScalarValue> {
 	vec![
 		ScalarValue::Utf8(Some("join_order_galaxy".to_string())),
 		ScalarValue::Utf8(Some(galaxy_order_target_label(evidence))),
-		ScalarValue::Utf8(Some("observed".to_string())),
-		ScalarValue::Utf8(Some(galaxy_order_detail_label(evidence))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(galaxy_order_detail_label(evidence, applied_root))),
 		ScalarValue::Int64(None),
 		ScalarValue::Int64(None),
 		ScalarValue::Float64(None),
@@ -1316,12 +1339,20 @@ pub(super) fn optimizer_explain_snowflake_order_row(
 // because 194 recognizes the graph without ordering or actuating it.
 pub(super) fn optimizer_explain_galaxy_order_row(
 	evidence: &GalaxyOrderEvidence,
+	applied_root: Option<&str>,
 ) -> Vec<ScalarValue> {
 	vec![
 		ScalarValue::Utf8(Some("join_order_galaxy".to_string())),
 		ScalarValue::Utf8(Some(galaxy_order_target_label(evidence))),
-		ScalarValue::Utf8(Some("observed".to_string())),
-		ScalarValue::Utf8(Some(galaxy_order_detail_label(evidence))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(galaxy_order_detail_label(evidence, applied_root))),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),
@@ -1418,7 +1449,10 @@ pub(super) fn galaxy_order_target_label(evidence: &GalaxyOrderEvidence) -> Strin
 	format!("galaxy[conformed={conformed}; relations=[{facts}]]")
 }
 
-pub(super) fn galaxy_order_detail_label(evidence: &GalaxyOrderEvidence) -> String {
+pub(super) fn galaxy_order_detail_label(
+	evidence: &GalaxyOrderEvidence,
+	applied_root: Option<&str>,
+) -> String {
 	let conformed = evidence
 		.conformed
 		.iter()
@@ -1448,12 +1482,28 @@ pub(super) fn galaxy_order_detail_label(evidence: &GalaxyOrderEvidence) -> Strin
 		})
 		.collect::<Vec<_>>()
 		.join(", ");
-	format!(
-		"conformed=[{conformed}]; components={}; edges=[{edges}]{}",
-		evidence.component_count,
-		galaxy_order_recommendation(evidence)
+	let order = match applied_root {
+		// ADR 198: actuation fired — the receipt shows the applied re-root, not the re-rooted galaxy's
+		// intrinsic (now kept-optimal) recommendation.
+		Some(root) => {
+			let costs = galaxy_order_recommendation(evidence)
+				.map(|rec| {
+					rec.costs
+						.iter()
+						.map(|(label, cost)| format!("{label}:{cost}"))
+						.collect::<Vec<_>>()
+						.join(",")
+				})
+				.unwrap_or_default();
+			format!("; action=reordered; applied_root={root}; costs=[{costs}]")
+		}
+		None => galaxy_order_recommendation(evidence)
 			.map(|rec| graph_order_recommendation_label(&rec))
 			.unwrap_or_default(),
+	};
+	format!(
+		"conformed=[{conformed}]; components={}; edges=[{edges}]{order}",
+		evidence.component_count,
 	)
 }
 

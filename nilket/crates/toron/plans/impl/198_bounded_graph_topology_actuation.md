@@ -45,8 +45,8 @@ A sibling of `try_bind_star_order_actuation`, invoked at the same join-order dec
 - recognize the galaxy (`analyze_galaxy`) and compute `galaxy_order_recommendation`;
 - if `action == Reordered` AND the preferred-vs-declared cost clears the soft margin (190/191):
   - `reroot_galaxy_join_tree` → the re-rooted logical plan;
-  - bind it through the **existing** snowflake actuation path (`try_bind_star_order_actuation` over the
-    re-rooted tree) so it stages via the existing fragmenter;
+  - bind it through the **existing** binder/staging path on the re-rooted tree so it stages via the
+    existing fragmenter;
   - **preflight gate (193):** if the re-rooted plan's own preflight is invalid or it would not fragment,
     **decline** → AST order;
   - restore output ordinals to the AST schema (`restore_declared_star_order_project`);

@@ -2772,6 +2772,171 @@ mod tests {
 			.expect("mixed-star SQL plan")
 	}
 
+	// ADR 198 Phase 0: a conformed 2-fact galaxy execution fixture — `sales` (large) and `returns`
+	// (small) share `product`. Cost-optimal root is `returns`; the FROM order roots `sales`.
+	fn galaxy_exec_catalog() -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"sales",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("product_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"product",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(3),
+				named_descriptor(
+					3,
+					"returns",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("product_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		for (table, bytes, rows, ndv) in [
+			(
+				"sales",
+				64 * 1024 * 1024_u64,
+				100_000_u64,
+				vec![(1, 100_u64)],
+			),
+			("product", 512_u64, 100_u64, vec![(0, 100_u64)]),
+			("returns", 8_192_u64, 5_000_u64, vec![(1, 100_u64)]),
+		] {
+			catalog
+				.seed_optimizer_facts(
+					&crate::catalog::TableRef::new(table),
+					TableOptimizerFacts {
+						byte_upper_bound: Some(ByteCount::new(bytes)),
+						row_upper_bound: Some(RowCount::new(rows)),
+						column_ndv: ndv
+							.into_iter()
+							.map(|(col, distinct)| {
+								(ColumnOrdinal(col), DistinctCountFact::Exact(distinct))
+							})
+							.collect(),
+						column_range: Default::default(),
+						column_range_distributions: Default::default(),
+						column_heavy_hitters: Default::default(),
+						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
+					},
+				)
+				.expect("seed galaxy facts");
+		}
+		Arc::new(catalog)
+	}
+
+	fn galaxy_exec_storage() -> Arc<MultiTableStorageScan> {
+		let sales = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("product_id", DataType::Int64, false),
+			])),
+			vec![
+				Arc::new(Int64Array::from(vec![1000, 1001, 1002, 1003])),
+				Arc::new(Int64Array::from(vec![1, 2, 1, 3])),
+			],
+		)
+		.unwrap();
+		let product = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+		)
+		.unwrap();
+		let returns = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("product_id", DataType::Int64, false),
+			])),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])),
+				Arc::new(Int64Array::from(vec![1, 2])),
+			],
+		)
+		.unwrap();
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([
+				(TableId(1), sales),
+				(TableId(2), product),
+				(TableId(3), returns),
+			]),
+		})
+	}
+
+	// ADR 198 Phase 0 (THE GATE, independent of actuation): the hand-written re-rooted query
+	// (`FROM returns …`, projecting the AST column order) executes distributed and digest-matches the
+	// AST-order baseline (`FROM sales …`). This proves the re-rooted plan is correct + fragmentable
+	// today as a plain snowflake — before any actuation code exists. If this fails, ADR 198 is a
+	// fragmenter cut, not a binder reorder.
+	#[tokio::test]
+	async fn galaxy_reroot_query_digest_matches_ast_order_distributed() {
+		let ast = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT sales.id, product.id, returns.id FROM sales \
+				 INNER JOIN product ON sales.product_id = product.id \
+				 INNER JOIN returns ON returns.product_id = product.id",
+			)
+			.expect("plan AST-order galaxy");
+		// Re-rooted FROM (returns-first), SAME projection / column order as the AST query.
+		let rerooted = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT sales.id, product.id, returns.id FROM returns \
+				 INNER JOIN product ON returns.product_id = product.id \
+				 INNER JOIN sales ON sales.product_id = product.id",
+			)
+			.expect("plan re-rooted galaxy");
+
+		let ast_result =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				ast,
+				galaxy_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				galaxy_exec_storage(),
+			)
+			.await
+			.expect("execute AST-order galaxy");
+		let rerooted_result =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				rerooted,
+				galaxy_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				galaxy_exec_storage(),
+			)
+			.await
+			.expect("execute re-rooted galaxy");
+
+		assert!(!ast_result.results.is_empty(), "galaxy produced rows");
+		assert_eq!(
+			canonical_arrow_ipc_digest(&rerooted_result.results, SortPolicy::FullRowLex)
+				.expect("re-rooted digest"),
+			canonical_arrow_ipc_digest(&ast_result.results, SortPolicy::FullRowLex)
+				.expect("AST digest"),
+			"re-rooted galaxy must digest-match the AST-order baseline"
+		);
+	}
+
 	fn join_catalog_with_customers_row_upper_bound(
 		customers_row_upper_bound: u64,
 	) -> Arc<MockCatalog> {

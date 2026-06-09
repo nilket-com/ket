@@ -9164,9 +9164,10 @@ async fn conformed_two_fact_query_emits_galaxy_evidence() {
 		.expect("conformed two-fact query emits a join_order_galaxy row");
 	assert_utf8_contains(&galaxy_row[1], "conformed=product");
 	assert_utf8_contains(&galaxy_row[1], "relations=[returns,sales]");
+	// ADR 198: this galaxy's cost-optimal root differs from FROM, so it actuates (outcome `reordered`).
 	assert_eq!(
 		galaxy_row[2],
-		ScalarValue::Utf8(Some("observed".to_string()))
+		ScalarValue::Utf8(Some("reordered".to_string()))
 	);
 	assert_utf8_contains(&galaxy_row[3], "product.id");
 	// Additive: the tree receipt (snowflake or actuated star) still renders alongside the galaxy row.
@@ -9176,11 +9177,11 @@ async fn conformed_two_fact_query_emits_galaxy_evidence() {
 	}));
 }
 
-// ADR 197 headline: the cost model recommends rooting the cheaper fact. The FROM order roots `sales`
-// (sales→product = 100000), but `returns→product` = 5000 is the smaller join, so the galaxy order
-// receipt recommends `preferred_root=returns` with `action=reordered`. Plan/results byte-identical.
+// ADR 198: the galaxy ACTUATES — the FROM order roots `sales` (sales→product = 100000), but
+// `returns→product` = 5000 is cheaper, so the binder re-roots to `returns` and the EXPLAIN receipt
+// shows the applied re-root (`action=reordered; applied_root=returns`).
 #[tokio::test]
-async fn galaxy_order_evidence_recommends_cheaper_root() {
+async fn galaxy_actuates_to_cheaper_root() {
 	let catalog = galaxy_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", galaxy_conformed_order_sql()))
@@ -9191,9 +9192,12 @@ async fn galaxy_order_evidence_recommends_cheaper_root() {
 		.iter()
 		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
 		.expect("galaxy row");
-	assert_utf8_contains(&galaxy_row[3], "declared_root=sales");
-	assert_utf8_contains(&galaxy_row[3], "preferred_root=returns");
+	assert_eq!(
+		galaxy_row[2],
+		ScalarValue::Utf8(Some("reordered".to_string()))
+	);
 	assert_utf8_contains(&galaxy_row[3], "action=reordered");
+	assert_utf8_contains(&galaxy_row[3], "applied_root=returns");
 	assert_utf8_contains(&galaxy_row[3], "costs=[");
 }
 
@@ -9216,11 +9220,10 @@ async fn galaxy_already_optimal_order_kept() {
 	assert_utf8_contains(&galaxy_row[3], "action=kept_already_optimal");
 }
 
-// ADR 197: the measured order verdict judges the FROM order against the measured fact-to-pivot
-// cardinalities. With `returns` measured cheaper than `sales` but `sales` the declared root, the run
-// missed a win.
+// ADR 198: after actuation the measured verdict judges the APPLIED (returns-rooted) order. With
+// `returns` measured cheaper than `sales`, the applied re-root is vindicated.
 #[tokio::test]
-async fn galaxy_verdict_recommends_reordering_suboptimal_root_fact() {
+async fn galaxy_actuated_verdict_vindicates_applied_root() {
 	let catalog = galaxy_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(galaxy_conformed_order_sql())
@@ -9228,7 +9231,7 @@ async fn galaxy_verdict_recommends_reordering_suboptimal_root_fact() {
 	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
 		.await
 		.expect("bind galaxy analyze");
-	// edge 0 = sales→product, edge 1 = product→returns. Measure sales' join large, returns' join small.
+	// After re-root: replay 0 = returns→product, replay 1 = product→sales. Make returns cheaper.
 	let observations = binding
 		.replay_ids
 		.iter()
@@ -9238,9 +9241,9 @@ async fn galaxy_verdict_recommends_reordering_suboptimal_root_fact() {
 			build_rows: RowCount::new(3),
 			probe_rows: RowCount::new(5),
 			output_rows: if replay_id.0 == 0 {
-				RowCount::new(100)
-			} else {
 				RowCount::new(10)
+			} else {
+				RowCount::new(100)
 			},
 		})
 		.collect::<Vec<_>>();
@@ -9254,9 +9257,8 @@ async fn galaxy_verdict_recommends_reordering_suboptimal_root_fact() {
 		.expect("graph verdict row");
 	assert_eq!(
 		verdict[2],
-		ScalarValue::Utf8(Some("missed_win".to_string()))
+		ScalarValue::Utf8(Some("vindicated".to_string()))
 	);
-	assert_utf8_contains(&verdict[3], "WOULD_REORDER_ROOT_FACT");
 }
 
 // ADR 197: no verdict without measurement — absent runtime rows yield Indeterminate, never a

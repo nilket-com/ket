@@ -14,9 +14,9 @@ digest-proven. The first time graph evidence changes the executed plan. Delibera
 - **A re-rooted galaxy is a snowflake — so we reuse the engine, not rebuild it.** `sales ⋈ product ⋈
   returns` rooted at `returns` is `(returns ⋈ product) ⋈ sales` — a snowflake (returns root, product
   composite-build branch, sales leaf). 197 already proves the FROM-`returns` form
-  (`galaxy_optimal_order_sql`) is a valid snowflake today. The actuated shape is one the snowflake
-  actuator (192/193) and the existing fragmenter already stage — mirroring how 193's mixed star reused
-  the fragmenter rather than extending it.
+  (`galaxy_optimal_order_sql`) is a valid snowflake today. The actuated shape is one the existing
+  binder/staging path and fragmenter already stage — mirroring how 193's mixed star reused the
+  fragmenter rather than extending it.
 - **The new capability is a bounded logical re-root.** The actuator's reorder today is *within a star
   level* (`bind_star_order_sequence` over `selected_indices`); the root is FROM-fixed
   (`extract_star_join_candidate`, `join_order.rs:535`). Re-rooting a 2-fact galaxy is a single, bounded
@@ -38,11 +38,11 @@ preferred root beats the declared root by the soft margin (reuse the 190/191 dis
 a thin win). First cut: the reachable 2-fact galaxy only. Bridge actuation, n-fact galaxies, multi-hop:
 deferred.
 
-**D2 — Re-root by reassociation, then bind through the existing snowflake path.** A new
+**D2 — Re-root by reassociation, then bind through the existing staging path.** A new
 `try_bind_galaxy_actuation` (sibling of `try_bind_star_order_actuation`): on a recognized galaxy whose
 preferred root differs, reassociate the inner-join tree to lead with the preferred fact and bind it
-through the **existing** snowflake actuator + fragmenter. No new fragmenter, no executor change — the
-re-rooted snowflake is staged by the path 192/193 built.
+through the **existing** binder/staging path, which already feeds the fragmenter. No new fragmenter, no
+executor change — the re-rooted snowflake is staged by the path 192/193 built.
 
 **D3 — Restore the AST-declared schema.** Re-rooting shuffles output ordinals; reuse
 `restore_declared_star_order_project` (178/186) so the output columns line up with the AST schema again.

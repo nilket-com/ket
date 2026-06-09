@@ -571,6 +571,63 @@ pub(super) fn extract_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoin
 	})
 }
 
+// ADR 198: re-root a 2-fact galaxy `Join(Join(F1, D), F2)` to `Join(Join(F2, D), F1)` by inner-join
+// reassociation — promoting the trailing fact `F2` to the root. Semantically safe (inner joins are
+// commutative/associative); the `on` column refs are logical (re-resolved at bind time), so swapping
+// the pair sides keeps each condition valid in its new position. Returns `None` for any shape that is
+// not the exact 2-fact galaxy (two nested inner joins over leaf relations) → decline, AST order.
+pub(super) fn reroot_galaxy_join_tree(plan: &LogicalPlan) -> Option<LogicalPlan> {
+	let LogicalPlan::Join {
+		left: outer_left,
+		right: f2,
+		kind: outer_kind,
+		on: outer_on,
+		strategy_intent: outer_intent,
+	} = plan
+	else {
+		return None;
+	};
+	if *outer_kind != JoinKind::Inner || logical_plan_contains_join(f2) {
+		return None;
+	}
+	let LogicalPlan::Join {
+		left: f1,
+		right: dim,
+		kind: inner_kind,
+		on: inner_on,
+		strategy_intent: inner_intent,
+	} = outer_left.as_ref()
+	else {
+		return None;
+	};
+	if *inner_kind != JoinKind::Inner
+		|| logical_plan_contains_join(f1)
+		|| logical_plan_contains_join(dim)
+	{
+		return None;
+	}
+	let new_inner = LogicalPlan::Join {
+		left: f2.clone(),
+		right: dim.clone(),
+		kind: *inner_kind,
+		on: outer_on
+			.iter()
+			.map(|(left, right)| (right.clone(), left.clone()))
+			.collect(),
+		strategy_intent: *inner_intent,
+	};
+	Some(LogicalPlan::Join {
+		left: Box::new(new_inner),
+		right: f1.clone(),
+		kind: *outer_kind,
+		on: inner_on
+			.iter()
+			.map(|(left, right)| (right.clone(), left.clone()))
+			.collect(),
+		strategy_intent: *outer_intent,
+	})
+}
+
 fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 	match plan {
 		LogicalPlan::Join { .. } => true,
@@ -1928,6 +1985,12 @@ pub(super) enum StarOrderActuationResult {
 }
 
 #[derive(Debug, Clone)]
+pub(super) enum GalaxyActuationResult {
+	NotCandidate,
+	Actuated(ScopedExecutionPlan),
+}
+
+#[derive(Debug, Clone)]
 enum LocalStarActuationAttempt {
 	Actuated(LocalStarActuation),
 	Declined(StarOrderDeclineReason),
@@ -1980,6 +2043,98 @@ fn star_output_segments_for_order(
 }
 
 impl<'a> Binder<'a> {
+	// ADR 198: bounded 2-fact galaxy root-swap actuation. Scratch-recognize the galaxy, and if its
+	// cost-optimal root differs from the FROM root by the soft margin, re-root the join tree and bind
+	// the re-rooted plan — which is a snowflake the existing actuator + fragmenter already stage
+	// (proven by the distributed digest fixture). Otherwise observe-only (exactly ADR 197).
+	pub(super) async fn try_bind_galaxy_actuation(
+		&self,
+		plan: &LogicalPlan,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<GalaxyActuationResult, BindingError> {
+		let LogicalPlan::Join {
+			left,
+			right,
+			kind,
+			on,
+			strategy_intent,
+		} = plan
+		else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+
+		// Scratch-recognize the galaxy via the actuation-free `bind_join` (not the actuation-carrying
+		// `bind_plan_with_trace`): `bind_join` never re-enters galaxy actuation on this node, and the
+		// galaxy's left subtree is a single-fact star (fewer than two edges, so not a galaxy itself), so
+		// recognition cannot recurse — no runtime re-entry flag needed. Decision-log recording is
+		// suppressed so the scratch bind never double-counts.
+		let mut scratch_trace = trace.clone();
+		scratch_trace.record_optimizer_decisions = false;
+		let mut scratch_render = Some(OptimizerExplainRenderTrace::default());
+		let _ = self
+			.bind_join(
+				left,
+				right,
+				*kind,
+				on,
+				*strategy_intent,
+				&mut scratch_trace,
+				&mut scratch_render,
+				JoinOrderSourceCapture::On,
+			)
+			.await?;
+		let scratch_render = scratch_render.expect("galaxy scratch render trace present");
+		let Some(galaxy) = analyze_galaxy(
+			&scratch_render.join_order_edges,
+			&scratch_trace.join_decisions,
+		) else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+		let Some(recommendation) = galaxy_order_recommendation(&galaxy) else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+		// FROM root already cost-optimal → observe-only (no re-root).
+		if recommendation.action != StarOrderAction::Reordered {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		}
+		// Soft-margin gate (190/191): only re-root on a clear win, never a thin one.
+		let cost_of = |root: &str| {
+			recommendation
+				.costs
+				.iter()
+				.find(|(label, _)| label == root)
+				.map(|(_, cost)| *cost)
+		};
+		let (Some(declared_cost), Some(preferred_cost)) = (
+			cost_of(&recommendation.declared_root),
+			cost_of(&recommendation.preferred_root),
+		) else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+		let margin = self.join_order_soft_margin_step.margin();
+		if preferred_cost.saturating_mul(margin.denominator)
+			> declared_cost.saturating_mul(margin.numerator)
+		{
+			return Ok(GalaxyActuationResult::NotCandidate);
+		}
+
+		// Re-root the join tree and bind the re-rooted plan (a snowflake) on the real trace. Its own
+		// galaxy check sees `KeptAlreadyOptimal` (FROM root now == preferred), so no further re-root.
+		let Some(rerooted) = reroot_galaxy_join_tree(plan) else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+		let preferred_root = recommendation.preferred_root.clone();
+		let bound = self
+			.bind_plan_with_trace(&rerooted, trace, render_trace, JoinOrderSourceCapture::On)
+			.await?;
+		// The receipt reflects the applied re-root, not the re-rooted galaxy's intrinsic recommendation.
+		if let Some(render_trace) = render_trace.as_mut() {
+			render_trace.set_applied_galaxy_root(preferred_root);
+		}
+		Ok(GalaxyActuationResult::Actuated(bound))
+	}
+
 	pub(super) async fn try_bind_star_order_actuation(
 		&self,
 		plan: &LogicalPlan,
