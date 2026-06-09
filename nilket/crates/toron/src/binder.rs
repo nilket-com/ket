@@ -1088,7 +1088,7 @@ impl<'a> Binder<'a> {
 					strategy_intent,
 				} => {
 					// ADR 198: try the bounded galaxy root-swap first. If it actuates, the re-rooted
-					// snowflake is already bound (through the star actuator) and we return it.
+					// snowflake is already bound through the existing bind path, so we return it.
 					if let GalaxyActuationResult::Actuated(plan) = self
 						.try_bind_galaxy_actuation(plan, trace, render_trace)
 						.await?

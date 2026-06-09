@@ -76,7 +76,7 @@ exercising `OverEager` / `MisRanked` (the run reordered; the measurement vindica
 ## Phase 5 — Architecture guards
 
 - `adr198_galaxy_actuation_reuses_snowflake_machinery` — no new fragmenter; `distributed/fragment.rs`
-  unchanged; the re-rooted plan binds through `try_bind_star_order_actuation`.
+  unchanged; the re-rooted plan binds through the existing binder/staging path.
 - `adr198_galaxy_reroot_is_bounded_two_fact` — `reroot_galaxy_join_tree` handles only the 2-fact galaxy;
   returns `None` otherwise (no general search / memo / Cascades).
 - `adr198_galaxy_actuation_gated_on_preflight` — re-root actuates only when its own preflight proves a
