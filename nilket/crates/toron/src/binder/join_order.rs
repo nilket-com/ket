@@ -2067,12 +2067,12 @@ impl<'a> Binder<'a> {
 		// Scratch-recognize the galaxy via the actuation-free `bind_join` (not the actuation-carrying
 		// `bind_plan_with_trace`): `bind_join` never re-enters galaxy actuation on this node, and the
 		// galaxy's left subtree is a single-fact star (fewer than two edges, so not a galaxy itself), so
-		// recognition cannot recurse — no runtime re-entry flag needed. Decision-log recording is
-		// suppressed so the scratch bind never double-counts.
+		// recognition cannot recurse — no runtime re-entry flag needed. The bind runs on a binder that
+		// discards decisions, so the scratch can never pollute the shared decision log.
 		let mut scratch_trace = trace.clone();
-		scratch_trace.record_optimizer_decisions = false;
 		let mut scratch_render = Some(OptimizerExplainRenderTrace::default());
 		let _ = self
+			.without_decision_recording()
 			.bind_join(
 				left,
 				right,
@@ -2147,7 +2147,11 @@ impl<'a> Binder<'a> {
 
 		let mut scratch_trace = trace.clone();
 		let mut scratch_render_trace = render_trace.clone();
-		let probe_plan = self
+		// Scratch recognition must stay invisible to the shared decision log: bind probe/dimensions on a
+		// no-op-recorder binder so a nested actuation inside them records only on the committed real pass
+		// below — never twice. The galaxy scratch path suppresses its bind the same way.
+		let scratch_binder = self.without_decision_recording();
+		let probe_plan = scratch_binder
 			.bind_plan_with_trace(
 				candidate.probe,
 				&mut scratch_trace,
@@ -2157,7 +2161,6 @@ impl<'a> Binder<'a> {
 			.await?;
 		let Some(probe_label) = probe_plan.scope.unique_source_label() else {
 			self.record_optimizer_star_order_decline(
-				trace,
 				OptimizerDecisionKind::StarCandidate,
 				StarOrderDeclineReason::MissingRelationLabel,
 			);
@@ -2170,7 +2173,6 @@ impl<'a> Binder<'a> {
 		};
 		if !broadcast_probe_is_scan_linear(&probe_plan.plan) {
 			self.record_optimizer_star_order_decline(
-				trace,
 				OptimizerDecisionKind::StarCandidate,
 				StarOrderDeclineReason::ProbeNotScanLinear,
 			);
@@ -2184,7 +2186,7 @@ impl<'a> Binder<'a> {
 
 		let mut dimension_inputs = Vec::with_capacity(candidate.dimensions.len());
 		for dimension in &candidate.dimensions {
-			let dimension_plan = self
+			let dimension_plan = scratch_binder
 				.bind_plan_with_trace(
 					dimension.input,
 					&mut scratch_trace,
@@ -2200,7 +2202,6 @@ impl<'a> Binder<'a> {
 			&probe_label,
 			&candidate.dimensions,
 			&dimension_inputs,
-			trace,
 			render_trace,
 		)?
 		else {
@@ -2208,7 +2209,6 @@ impl<'a> Binder<'a> {
 		};
 		if tree.root_children.len() < 2 {
 			self.record_optimizer_star_order_decline(
-				trace,
 				root_decision_kind(&tree),
 				StarOrderDeclineReason::MissingRelationLabel,
 			);
@@ -2242,7 +2242,6 @@ impl<'a> Binder<'a> {
 			)?
 		else {
 			self.record_optimizer_star_order_decline(
-				trace,
 				root_decision_kind(&tree),
 				StarOrderDeclineReason::MissingEstimate,
 			);
@@ -2265,7 +2264,7 @@ impl<'a> Binder<'a> {
 			&mut scratch_render_trace,
 		)?;
 		if let LocalStarActuationAttempt::Declined(reason) = scratch_root_attempt {
-			self.record_optimizer_star_order_decline(trace, root_decision_kind(&tree), reason);
+			self.record_optimizer_star_order_decline(root_decision_kind(&tree), reason);
 			if !root_is_snowflake {
 				self.record_star_order_decline(render_trace, reason, candidate.dimensions.len());
 			}
@@ -2315,19 +2314,14 @@ impl<'a> Binder<'a> {
 		)?;
 		let LocalStarActuationAttempt::Actuated(real_root) = real_root_attempt else {
 			if let LocalStarActuationAttempt::Declined(reason) = real_root_attempt {
-				self.record_optimizer_star_order_decline(trace, root_decision_kind(&tree), reason);
+				self.record_optimizer_star_order_decline(root_decision_kind(&tree), reason);
 			}
 			return Ok(StarOrderActuationResult::Declined);
 		};
 
-		self.record_optimizer_star_order_receipt(
-			trace,
-			root_decision_kind(&tree),
-			&real_root.receipt,
-		);
+		self.record_optimizer_star_order_receipt(root_decision_kind(&tree), &real_root.receipt);
 		for branch_receipt in &branch_receipts {
 			self.record_optimizer_star_order_receipt(
-				trace,
 				OptimizerDecisionKind::SnowflakeBranch,
 				branch_receipt,
 			);
@@ -2348,7 +2342,6 @@ impl<'a> Binder<'a> {
 		probe_label: &str,
 		candidate_dimensions: &[StarJoinDimension<'b>],
 		dimension_inputs: &[ScopedExecutionPlan],
-		trace: &OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 	) -> Result<Option<SnowflakeStarTree<'b>>, BindingError> {
 		let mut root_children = Vec::new();
@@ -2363,7 +2356,6 @@ impl<'a> Binder<'a> {
 				if edge.left_label.as_deref() == Some(probe_label) {
 					let Some(dimension_label) = edge.right_label else {
 						self.record_optimizer_star_order_decline(
-							trace,
 							OptimizerDecisionKind::StarCandidate,
 							StarOrderDeclineReason::MissingRelationLabel,
 						);
@@ -2394,7 +2386,6 @@ impl<'a> Binder<'a> {
 					}
 					let Some(dimension_label) = edge.right_label else {
 						self.record_optimizer_star_order_decline(
-							trace,
 							OptimizerDecisionKind::StarCandidate,
 							StarOrderDeclineReason::MissingRelationLabel,
 						);
@@ -2412,7 +2403,6 @@ impl<'a> Binder<'a> {
 
 			let Some((parent_index, dimension_label)) = matched_parent else {
 				self.record_optimizer_star_order_decline(
-					trace,
 					OptimizerDecisionKind::StarCandidate,
 					StarOrderDeclineReason::MissingRelationLabel,
 				);
@@ -2425,7 +2415,6 @@ impl<'a> Binder<'a> {
 			};
 			if !seen_labels.insert(dimension_label.clone()) {
 				self.record_optimizer_star_order_decline(
-					trace,
 					OptimizerDecisionKind::StarCandidate,
 					StarOrderDeclineReason::DuplicateDimension,
 				);
@@ -2986,30 +2975,21 @@ impl<'a> Binder<'a> {
 
 	fn record_optimizer_star_order_receipt(
 		&self,
-		trace: &OptimizerTrace,
 		kind: OptimizerDecisionKind,
 		receipt: &StarOrderRenderReceipt,
 	) {
-		if !trace.record_optimizer_decisions {
-			return;
-		}
 		if let StarOrderOutcome::Recognized(evidence) = &receipt.outcome {
-			self.config
-				.decision_log
+			self.decision_recorder
 				.record(kind, optimizer_decision_outcome_for_action(evidence.action));
 		}
 	}
 
 	fn record_optimizer_star_order_decline(
 		&self,
-		trace: &OptimizerTrace,
 		kind: OptimizerDecisionKind,
 		reason: StarOrderDeclineReason,
 	) {
-		if !trace.record_optimizer_decisions {
-			return;
-		}
-		self.config.decision_log.record(
+		self.decision_recorder.record(
 			kind,
 			OptimizerDecisionOutcome::Declined(optimizer_decision_decline_reason(reason)),
 		);

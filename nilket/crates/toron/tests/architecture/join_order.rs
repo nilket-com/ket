@@ -2129,3 +2129,17 @@ pub(crate) fn adr198_galaxy_actuation_is_binder_only() {
 		format_offenders(&manifest, &offenders)
 	);
 }
+
+// Refactor (post-198): optimizer-decision recording is gated by a type, not a runtime bool. A bind
+// that must not pollute the shared log carries a zero-size `NoOpDecisionRecorder`, so "do not record"
+// is a fact about the binder's recorder, not a flag a caller can forget to set.
+#[test]
+pub(crate) fn optimizer_decision_recording_is_type_gated_not_bool() {
+	let binder = binder_source();
+	assert!(!binder.contains("record_optimizer_decisions"));
+	assert!(binder.contains("trait OptimizerDecisionRecorder"));
+	assert!(binder.contains("struct NoOpDecisionRecorder"));
+	// Suppression is structural: scratch / declined binds run on a no-recording binder.
+	assert!(binder.contains("fn without_decision_recording"));
+	assert!(binder.contains(".without_decision_recording()"));
+}

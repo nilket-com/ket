@@ -156,6 +156,28 @@ impl OptimizerDecisionLog {
 	}
 }
 
+// A sink for optimizer decisions. The live `OptimizerDecisionLog` records; the zero-size
+// `NoOpDecisionRecorder` discards. A bind that must not pollute the shared log — a scratch recognition
+// bind, or a declined-actuation re-bind — is handed the ZST, so "do not record" is a fact about the
+// type the binder carries, not a runtime flag a caller can forget to set (which is how a scratch bind
+// once double-counted into the shared log).
+pub(crate) trait OptimizerDecisionRecorder {
+	fn record(&self, kind: OptimizerDecisionKind, outcome: OptimizerDecisionOutcome);
+}
+
+impl OptimizerDecisionRecorder for OptimizerDecisionLog {
+	fn record(&self, kind: OptimizerDecisionKind, outcome: OptimizerDecisionOutcome) {
+		OptimizerDecisionLog::record(self, kind, outcome);
+	}
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NoOpDecisionRecorder;
+
+impl OptimizerDecisionRecorder for NoOpDecisionRecorder {
+	fn record(&self, _kind: OptimizerDecisionKind, _outcome: OptimizerDecisionOutcome) {}
+}
+
 pub(crate) fn optimizer_decision_kind_label(kind: OptimizerDecisionKind) -> &'static str {
 	match kind {
 		OptimizerDecisionKind::StarCandidate => "star_candidate",

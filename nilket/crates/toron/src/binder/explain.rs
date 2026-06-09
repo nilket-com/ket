@@ -63,21 +63,10 @@ pub(super) struct ScanFilterPushdownEvidence {
 	pub(super) table_id: Option<TableId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OptimizerTrace {
 	pub(crate) join_decisions: Vec<DecisionReceipt>,
 	pub(crate) scan_filter_decisions: Vec<ScanFilterReceipt>,
-	pub(super) record_optimizer_decisions: bool,
-}
-
-impl Default for OptimizerTrace {
-	fn default() -> Self {
-		Self {
-			join_decisions: Vec::new(),
-			scan_filter_decisions: Vec::new(),
-			record_optimizer_decisions: true,
-		}
-	}
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

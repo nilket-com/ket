@@ -46,7 +46,7 @@ pub(crate) fn adr187_accrual_recording_is_always_on_not_explain_gated() {
 	let receipt = first_block(&join_order, "fn record_optimizer_star_order_receipt");
 
 	for block in [&decline, &receipt] {
-		assert!(block.contains("decision_log"));
+		assert!(block.contains("decision_recorder"));
 		assert!(block.contains(".record("));
 		assert!(!block.contains("render_trace"));
 		assert!(!block.contains("OptimizerExplainRenderTrace"));
@@ -70,8 +70,9 @@ pub(crate) fn adr187_accrual_records_committed_not_scratch() {
 	assert!(try_actuate.contains("record_optimizer_star_order_receipt("));
 	assert!(try_actuate.contains("record_optimizer_star_order_decline("));
 	assert!(bind_plan.contains("StarOrderActuationResult::Declined"));
-	assert!(bind_plan.contains("trace.record_optimizer_decisions = false;"));
-	assert!(bind_plan.contains("trace.record_optimizer_decisions = previous;"));
+	// The declined fall-back re-binds on a binder carrying the zero-size no-op recorder, so the
+	// receipt is not recorded twice — a fact about the recorder's type, not a runtime toggle.
+	assert!(bind_plan.contains(".without_decision_recording()"));
 	for block in [preflight, sequence, local, root_dimensions] {
 		assert!(!block.contains("decision_log"));
 		assert!(!block.contains("record_optimizer_star_order"));

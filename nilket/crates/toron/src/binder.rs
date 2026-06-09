@@ -357,6 +357,10 @@ struct Binder<'a> {
 	// join-order decision point in this bind (star actuation, observed star/snowflake receipts)
 	// reads this single value rather than re-snapshotting the shared decision log mid-bind.
 	join_order_soft_margin_step: SoftMarginLadderStep,
+	// The sink for optimizer decisions. Normally the shared `config.decision_log`; a scratch recognition
+	// bind / declined-actuation re-bind carries a zero-size `NoOpDecisionRecorder` instead, so it cannot
+	// pollute the shared log — a structural fact, not a runtime flag.
+	decision_recorder: &'a (dyn OptimizerDecisionRecorder + Send + Sync),
 }
 
 impl<'a> Binder<'a> {
@@ -365,6 +369,18 @@ impl<'a> Binder<'a> {
 			catalog,
 			config,
 			join_order_soft_margin_step: effective_join_order_soft_margin_step(config),
+			decision_recorder: config.decision_log.as_ref(),
+		}
+	}
+
+	// A binder that discards optimizer decisions — for binds whose decisions must not reach the shared
+	// log (scratch recognition, declined-actuation re-bind).
+	fn without_decision_recording(&self) -> Binder<'a> {
+		Binder {
+			catalog: self.catalog,
+			config: self.config,
+			join_order_soft_margin_step: self.join_order_soft_margin_step,
+			decision_recorder: &NoOpDecisionRecorder,
 		}
 	}
 }
@@ -1102,9 +1118,10 @@ impl<'a> Binder<'a> {
 						StarOrderActuationResult::Actuated(plan) => return Ok(plan),
 						StarOrderActuationResult::NotCandidate => {}
 						StarOrderActuationResult::Declined => {
-							let previous = trace.record_optimizer_decisions;
-							trace.record_optimizer_decisions = false;
-							let result = self
+							// The declined-actuation fall-back re-binds the same joins; bind on a binder
+							// that discards decisions so the receipt is not recorded twice.
+							return self
+								.without_decision_recording()
 								.bind_join(
 									left,
 									right,
@@ -1116,8 +1133,6 @@ impl<'a> Binder<'a> {
 									join_order_source_capture,
 								)
 								.await;
-							trace.record_optimizer_decisions = previous;
-							return result;
 						}
 					}
 					self.bind_join(
