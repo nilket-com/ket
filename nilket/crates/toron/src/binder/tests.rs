@@ -9330,6 +9330,144 @@ async fn galaxy_recognizer_declines_single_fact_same_key_alias_star() {
 	);
 }
 
+// ADR 195 headline: EXPLAIN ANALYZE surfaces measured fan-out drift on the conformed galaxy graph —
+// per-edge `join_order_galaxy_runtime` rows whose actual rows differ from the estimate, with a ratio
+// gauge. No order verdict (galaxy has no chosen order to judge).
+#[tokio::test]
+async fn conformed_galaxy_runtime_surfaces_measured_fanout_drift() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_conformed_order_sql())
+		.expect("plan galaxy ANALYZE");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind galaxy analyze");
+	// Every galaxy edge is observed (the replay-id union gathers galaxy targets explicitly).
+	assert_eq!(binding.replay_ids.len(), 2);
+	// Observations whose output_rows deliberately contradict the estimate → drift.
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(7),
+			probe_rows: RowCount::new(11),
+			output_rows: RowCount::new(1),
+		})
+		.collect::<Vec<_>>();
+
+	let plan = render_explain_analyze(binding, &observations).expect("render galaxy analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+
+	let runtime_rows = rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy_runtime".to_string())))
+		.collect::<Vec<_>>();
+	assert_eq!(runtime_rows.len(), 2, "one runtime row per galaxy edge");
+	// Drift visible: estimated (col 4) != actual (col 5) on at least one edge; actual is the seeded 1.
+	let drift = runtime_rows.iter().any(|row| {
+		matches!((&row[4], &row[5]),
+			(ScalarValue::Int64(Some(estimated)), ScalarValue::Int64(Some(actual))) if estimated != actual)
+	});
+	assert!(drift, "measured fan-out drift surfaces: {runtime_rows:?}");
+	assert!(
+		runtime_rows
+			.iter()
+			.all(|row| row[5] == ScalarValue::Int64(Some(1)))
+	);
+	assert_utf8_contains(&runtime_rows[0][3], "ratio=");
+	assert_utf8_contains(&runtime_rows[0][3], "conformed=");
+	// No order verdict for galaxies in this cut.
+	assert!(
+		!rows
+			.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy_verdict".to_string()))),
+		"galaxy runtime emits no order verdict"
+	);
+	// Additive: the conformed query still emits its snowflake runtime rows.
+	assert!(rows.iter().any(|row| {
+		row[0] == ScalarValue::Utf8(Some("join_order_snowflake_runtime".to_string()))
+	}));
+}
+
+// ADR 195: galaxy runtime rows correlate to galaxy edges by replay id (the `join[N]` target), and a
+// single-fact query emits none — the galaxy path never pollutes a non-galaxy ANALYZE.
+#[tokio::test]
+async fn galaxy_runtime_keys_by_replay_id_and_declines_non_galaxy() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_conformed_order_sql())
+		.expect("plan galaxy ANALYZE");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind galaxy analyze");
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(5),
+			output_rows: RowCount::new(2),
+		})
+		.collect::<Vec<_>>();
+	let plan = render_explain_analyze(binding, &observations).expect("render galaxy analyze");
+	let ExecutionPlan::SystemTable { rows, .. } = plan else {
+		panic!("expected analyze system table");
+	};
+	for row in rows
+		.iter()
+		.filter(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy_runtime".to_string())))
+	{
+		let ScalarValue::Utf8(Some(target)) = &row[1] else {
+			panic!("galaxy runtime target");
+		};
+		assert!(
+			target.starts_with("join["),
+			"runtime row keyed by replay id: {target}"
+		);
+	}
+
+	// A single-fact snowflake ANALYZE emits no galaxy runtime rows.
+	let snow_catalog = mixed_strategy_snowflake_join_order_catalog();
+	let snow_logical = SqlPlanner::new()
+		.plan(observed_snowflake_order_sql())
+		.expect("plan snowflake ANALYZE");
+	let snow_binding =
+		bind_explain_analyze(&snow_logical, &snow_catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind snowflake analyze");
+	let snow_observations = snow_binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(5),
+			output_rows: RowCount::new(2),
+		})
+		.collect::<Vec<_>>();
+	let snow_plan =
+		render_explain_analyze(snow_binding, &snow_observations).expect("render snowflake analyze");
+	let ExecutionPlan::SystemTable {
+		rows: snow_rows, ..
+	} = snow_plan
+	else {
+		panic!("expected analyze system table");
+	};
+	assert!(
+		!snow_rows.iter().any(|row| {
+			matches!(&row[0], ScalarValue::Utf8(Some(kind)) if kind.starts_with("join_order_galaxy"))
+		}),
+		"non-galaxy ANALYZE emits no galaxy rows"
+	);
+}
+
 #[test]
 fn snowflake_uniformity_accepts_only_authenticated_composite_natural_broadcast() {
 	let decisions = vec![

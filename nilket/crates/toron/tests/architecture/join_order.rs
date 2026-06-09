@@ -1741,8 +1741,8 @@ pub(crate) fn adr194_no_fragmenter_executor_or_runtime_galaxy() {
 	assert!(!fragment.contains("Galaxy"));
 	assert!(!fragment.contains("analyze_galaxy"));
 	assert!(!exec.contains("GalaxyOrderEvidence"));
-	// No runtime/verdict galaxy rows in 194 (deferred).
-	assert!(!explain.contains("join_order_galaxy_runtime"));
+	// ADR 195 added galaxy *runtime* rows (owned by `adr195_galaxy_verdict_is_deferred`); the galaxy
+	// *order verdict* remains deferred here and there.
 	assert!(!explain.contains("join_order_galaxy_verdict"));
 }
 
@@ -1771,6 +1771,92 @@ pub(crate) fn adr194_galaxy_substrate_is_binder_only() {
 	assert!(
 		offenders.is_empty(),
 		"ADR194 galaxy substrate leaked outside the binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr195_galaxy_runtime_reuses_galaxy_order() {
+	let explain = source("src/binder/explain.rs");
+	let galaxy_rows = first_block(&explain, "fn galaxy_analyze_rows");
+
+	// Runtime rows are a view over 194's `galaxy_order` sibling + the observation summaries — no new
+	// render-trace field and no second measured type.
+	assert!(galaxy_rows.contains("render_trace.galaxy_order"));
+	assert!(galaxy_rows.contains("summaries"));
+	assert!(!explain.contains("GalaxyRuntimeEvidence"));
+	let render_trace = first_block(&explain, "pub(super) struct OptimizerExplainRenderTrace");
+	assert!(!render_trace.contains("galaxy_runtime"));
+}
+
+#[test]
+pub(crate) fn adr195_galaxy_verdict_is_deferred() {
+	let explain = source("src/binder/explain.rs");
+
+	// A galaxy has no chosen order to judge — 195 emits a measured runtime row but no verdict/reorder.
+	assert!(explain.contains("join_order_galaxy_runtime"));
+	assert!(!explain.contains("join_order_galaxy_verdict"));
+	assert!(!explain.contains("optimizer_analyze_galaxy_verdict_row"));
+	let galaxy_runtime = first_block(&explain, "fn optimizer_analyze_galaxy_runtime_row");
+	assert!(!galaxy_runtime.contains("would_reorder"));
+	assert!(!galaxy_runtime.contains("vindicated"));
+}
+
+#[test]
+pub(crate) fn adr195_galaxy_measurement_reuses_179_replay_correlation() {
+	let explain = source("src/binder/explain.rs");
+	let galaxy_rows = first_block(&explain, "fn galaxy_analyze_rows");
+
+	// The measurement reuses the existing replay-id correlation, not a parallel impl.
+	assert!(galaxy_rows.contains("join_order_runtime_measurement"));
+	assert!(explain.contains("fn join_replay_id_for_trace_target"));
+}
+
+#[test]
+pub(crate) fn adr195_galaxy_telemetry_unions_edge_targets() {
+	let binder = binder_source();
+	let collect = first_block(&binder, "fn star_order_runtime_replay_ids");
+
+	// The replay-id allowlist explicitly unions the galaxy substrate's edge targets — galaxy
+	// measurement is gathered from the galaxy graph, not inherited from the tree receipt.
+	assert!(collect.contains("render_trace.galaxy_order"));
+	assert!(collect.contains("galaxy.edges.iter().map(|edge| edge.target)"));
+}
+
+#[test]
+pub(crate) fn adr195_no_fragmenter_executor_or_actuation() {
+	let fragment = source("src/distributed/fragment.rs");
+	let exec = source("src/exec.rs");
+	let explain = source("src/binder/explain.rs");
+	let galaxy_rows = first_block(&explain, "fn galaxy_analyze_rows");
+
+	assert!(!fragment.contains("galaxy_analyze_rows"));
+	assert!(!fragment.contains("join_order_galaxy_runtime"));
+	assert!(!exec.contains("join_order_galaxy_runtime"));
+	// The galaxy runtime path never actuates.
+	assert!(!galaxy_rows.contains("bind_local_star_actuation"));
+}
+
+#[test]
+pub(crate) fn adr195_galaxy_runtime_is_binder_only() {
+	let manifest = manifest_dir();
+	let markers = ["join_order_galaxy_runtime", "galaxy_analyze_rows"];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/storage.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR195 galaxy runtime leaked outside the binder surface:\n{}",
 		format_offenders(&manifest, &offenders)
 	);
 }

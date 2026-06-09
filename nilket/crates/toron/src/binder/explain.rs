@@ -569,6 +569,7 @@ fn optimizer_analyze_rows(
 			rows.push(optimizer_analyze_snowflake_verdict_row(level));
 		}
 		rows.push(optimizer_analyze_snowflake_aggregate_verdict_row(&verdict));
+		rows.extend(galaxy_analyze_rows(render_trace, summaries)?);
 		return Ok(rows);
 	}
 
@@ -608,6 +609,7 @@ fn optimizer_analyze_rows(
 			&measured_rows_by_dimension,
 		)?);
 	}
+	rows.extend(galaxy_analyze_rows(render_trace, summaries)?);
 	Ok(rows)
 }
 
@@ -805,6 +807,120 @@ fn optimizer_analyze_snowflake_runtime_row(
 		ScalarValue::Float64(measurement.ratio),
 		ScalarValue::Utf8(Some(
 			join_order_estimate_source_label(dimension.estimate_source).to_string(),
+		)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.build_rows,
+			"build_rows",
+		)?)),
+		ScalarValue::Int64(Some(row_count_to_i64(
+			measurement.summary.probe_rows,
+			"probe_rows",
+		)?)),
+	])
+}
+
+// ADR 195: galaxy runtime rows are built at render time from 194's `galaxy_order` evidence plus the
+// observations already on the ANALYZE path — a view over the graph identity, not a second
+// representation. Additive: appended alongside whatever tree-receipt runtime rows the query produced.
+fn galaxy_analyze_rows(
+	render_trace: &OptimizerExplainRenderTrace,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let Some(galaxy) = &render_trace.galaxy_order else {
+		return Ok(Vec::new());
+	};
+	let mut rows = vec![optimizer_analyze_galaxy_order_row(galaxy)];
+	let by_target = galaxy
+		.edges
+		.iter()
+		.map(|edge| (edge.target, edge))
+		.collect::<BTreeMap<_, _>>();
+	let conformed_labels = galaxy
+		.conformed
+		.iter()
+		.map(|dim| dim.label.as_str())
+		.collect::<BTreeSet<_>>();
+	// Galaxy edges ARE `join_order_edges` by target, so the measurement reuses the snowflake machinery.
+	for edge in &render_trace.join_order_edges {
+		let Some(galaxy_edge) = by_target.get(&edge.target) else {
+			continue;
+		};
+		let Some(estimated) = edge.estimated_rows else {
+			continue;
+		};
+		let measurement = join_order_runtime_measurement(edge, estimated, summaries)?;
+		let conformed = conformed_labels.contains(galaxy_edge.left_label.as_str())
+			|| conformed_labels.contains(galaxy_edge.right_label.as_str());
+		rows.push(optimizer_analyze_galaxy_runtime_row(
+			galaxy_edge,
+			estimated,
+			edge.estimate_source,
+			&measurement,
+			conformed,
+		)?);
+	}
+	Ok(rows)
+}
+
+fn optimizer_analyze_galaxy_order_row(evidence: &GalaxyOrderEvidence) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_galaxy".to_string())),
+		ScalarValue::Utf8(Some(galaxy_order_target_label(evidence))),
+		ScalarValue::Utf8(Some("observed".to_string())),
+		ScalarValue::Utf8(Some(galaxy_order_detail_label(evidence))),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Float64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
+}
+
+fn optimizer_analyze_galaxy_runtime_row(
+	edge: &GalaxyEdgeEvidence,
+	estimated_rows: RowCount,
+	estimate_source: JoinOrderEstimateSource,
+	measurement: &JoinOrderRuntimeMeasurement,
+	conformed: bool,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	let left_sig = edge.left_key_signature.join("+");
+	let right_sig = edge.right_key_signature.join("+");
+	Ok(vec![
+		ScalarValue::Utf8(Some("join_order_galaxy_runtime".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"join[{}] {}->{}",
+			measurement.replay_id.0, edge.left_label, edge.right_label
+		))),
+		ScalarValue::Utf8(Some("measured".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"{}->{} on {}={}; estimated={}; actual={}; ratio={}; build_rows={}; probe_rows={}; strategy={}; placement={}; conformed={}",
+			edge.left_label,
+			edge.right_label,
+			left_sig,
+			right_sig,
+			estimated_rows.get(),
+			measurement.actual_rows.map(RowCount::get).unwrap_or(0),
+			measurement
+				.ratio
+				.map(|value| format!("{value:.6}"))
+				.unwrap_or_else(|| "missing".to_string()),
+			measurement.summary.build_rows.get(),
+			measurement.summary.probe_rows.get(),
+			join_strategy_label(edge.strategy),
+			join_physical_placement_label(edge.placement),
+			conformed,
+		))),
+		ScalarValue::Int64(Some(row_count_to_i64(estimated_rows, "estimated_rows")?)),
+		ScalarValue::Int64(
+			measurement
+				.actual_rows
+				.map(|rows| row_count_to_i64(rows, "actual_rows"))
+				.transpose()?,
+		),
+		ScalarValue::Float64(measurement.ratio),
+		ScalarValue::Utf8(Some(
+			join_order_estimate_source_label(estimate_source).to_string(),
 		)),
 		ScalarValue::Int64(Some(row_count_to_i64(
 			measurement.summary.build_rows,

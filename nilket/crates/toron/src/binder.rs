@@ -311,6 +311,13 @@ fn star_order_runtime_replay_ids(
 		}
 		JoinOrderRenderState::None => {}
 	}
+	// ADR 195: galaxy runtime measurement is gathered explicitly from the galaxy substrate, never by
+	// inheriting the tree allowlist. The reachable galaxy still rides a snowflake-shaped tree today, so
+	// this is BTreeSet-deduped in that case — but the union is load-bearing: it makes the galaxy edges
+	// the source of truth for which observations to collect, independent of the join_order state.
+	if let Some(galaxy) = &render_trace.galaxy_order {
+		targets.extend(galaxy.edges.iter().map(|edge| edge.target));
+	}
 	targets
 		.into_iter()
 		.map(|target| {
