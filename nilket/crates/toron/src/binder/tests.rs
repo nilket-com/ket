@@ -9286,10 +9286,13 @@ async fn graph_verdict_indeterminate_on_missing_measurement() {
 	);
 }
 
-// ADR 197: the bridge cost model prefers delaying the M:N fan-out past the selective dimension, and
-// the measured verdict confirms the run paid a fan-out above the filter-first floor.
+// ADR 199 discriminator: the clean FK bridge fans out (`bridge_rows 10000 > fact_rows 1000`, so the
+// pre-199 endpoint-row proxy would have rerooted to `filter_first`), but with no predicate on the
+// dimension both incident edges estimate to the bridge's row count (`F⋈B ≈ D⋈B ≈ 10000`), so the
+// relation-rooted cost correctly KEEPS the FROM order — rerooting a clean FK bridge buys nothing. This
+// fails under the old fan-out proxy and passes only with the edge-estimate cost, locking D1.
 #[tokio::test]
-async fn bridge_order_evidence_recommends_delaying_massive_fanout() {
+async fn bridge_fans_out_but_dimension_not_selective_is_kept() {
 	let catalog = bridge_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", bridge_chain_order_sql()))
@@ -9300,8 +9303,9 @@ async fn bridge_order_evidence_recommends_delaying_massive_fanout() {
 		.iter()
 		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge".to_string())))
 		.expect("bridge row");
-	assert_utf8_contains(&bridge_row[3], "preferred_root=filter_first");
-	assert_utf8_contains(&bridge_row[3], "action=reordered");
+	assert_utf8_contains(&bridge_row[3], "action=kept_already_optimal");
+	assert_utf8_contains(&bridge_row[3], "preferred_root=orders");
+	assert_utf8_contains(&bridge_row[3], "costs=[orders:10000,products:10000]");
 
 	let analyze_logical = SqlPlanner::new()
 		.plan(bridge_chain_order_sql())
@@ -9332,9 +9336,10 @@ async fn bridge_order_evidence_recommends_delaying_massive_fanout() {
 		.iter()
 		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_graph_verdict".to_string())))
 		.expect("graph verdict row");
+	// The kept FROM order (orders root) measured cheaper than the products-root estimate → vindicated.
 	assert_eq!(
 		verdict[2],
-		ScalarValue::Utf8(Some("missed_win".to_string()))
+		ScalarValue::Utf8(Some("vindicated".to_string()))
 	);
 }
 
@@ -14170,6 +14175,144 @@ fn bridge_chain_order_sql() -> &'static str {
 	"SELECT orders.id, order_items.order_id, products.id FROM orders \
 	 JOIN order_items ON orders.id = order_items.order_id \
 	 JOIN products ON order_items.product_id = products.id"
+}
+
+// ADR 199: a bridge whose dimension carries a filterable `category` column (ndv 10). A selective
+// `WHERE products.category = N` shrinks the products source rows ~10x, so the `B⋈D` outgoing edge
+// estimate drops below the `F⋈B` incoming edge — the relation-rooted cost then prefers rooting the
+// dimension (filter-first), unlike the clean FK bridge above.
+fn selective_bridge_join_order_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(51),
+			named_descriptor(
+				51,
+				"orders",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register bridge orders");
+	catalog
+		.register_descriptor(
+			TableId(52),
+			named_descriptor(
+				52,
+				"order_items",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("order_id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register bridge order_items");
+	catalog
+		.register_descriptor(
+			TableId(53),
+			named_descriptor(
+				53,
+				"products",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("category", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register bridge products");
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"orders",
+		Some(8_192),
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(1_000))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"order_items",
+		Some(64 * 1024 * 1024),
+		Some(10_000),
+		vec![
+			(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"products",
+		Some(512),
+		Some(100),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(10)),
+		],
+	);
+	catalog
+}
+
+fn selective_bridge_order_sql() -> &'static str {
+	"SELECT orders.id, order_items.order_id, products.id FROM orders \
+	 JOIN order_items ON orders.id = order_items.order_id \
+	 JOIN products ON order_items.product_id = products.id \
+	 WHERE products.category = 5"
+}
+
+// ADR 199 positive gate (binder level): a bridge with a selective predicate on the dimension reroots
+// to the dimension. The EXPLAIN bridge receipt flips to `action=reordered; applied_root=products`, and
+// the recursion terminates (the re-rooted bridge is not re-rooted again).
+#[tokio::test]
+async fn bridge_reroots_to_selective_dimension() {
+	let catalog = selective_bridge_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", selective_bridge_order_sql()))
+		.expect("plan selective bridge EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let bridge_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge".to_string())))
+		.expect("bridge row");
+	assert_eq!(
+		bridge_row[2],
+		ScalarValue::Utf8(Some("reordered".to_string()))
+	);
+	assert_utf8_contains(&bridge_row[3], "action=reordered");
+	assert_utf8_contains(&bridge_row[3], "applied_root=products");
+}
+
+// ADR 199: the Rune frontend (primary interface) actuates the selective bridge identically to SQL — the
+// same `action=reordered; applied_root=products` receipt from a Rune-planned filtered bridge.
+#[tokio::test]
+async fn rune_bridge_reorder_matches_sql() {
+	let catalog = selective_bridge_join_order_catalog();
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders")
+               .auto_join(
+                   ctx.table("order_items"),
+                   qcol("orders", "id").eq(qcol("order_items", "order_id"))
+               )
+               .auto_join(
+                   ctx.table("products").filter(qcol("products", "category").eq(lit_i64(5))),
+                   qcol("order_items", "product_id").eq(qcol("products", "id"))
+               )
+               .explain()
+        }
+    "#,
+	)
+	.await;
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let bridge_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge".to_string())))
+		.expect("Rune bridge query emits a join_order_bridge row");
+	assert_eq!(
+		bridge_row[2],
+		ScalarValue::Utf8(Some("reordered".to_string()))
+	);
+	assert_utf8_contains(&bridge_row[3], "applied_root=products");
 }
 
 fn mixed_strategy_snowflake_join_order_catalog() -> MockCatalog {

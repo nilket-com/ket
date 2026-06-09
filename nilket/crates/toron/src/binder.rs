@@ -1111,6 +1111,14 @@ impl<'a> Binder<'a> {
 					{
 						return Ok(plan);
 					}
+					// ADR 199: then the bounded bridge root-swap (a query is a galaxy XOR a bridge —
+					// conformed vs distinct junction signatures — so these never both fire).
+					if let GalaxyActuationResult::Actuated(plan) = self
+						.try_bind_bridge_actuation(plan, trace, render_trace)
+						.await?
+					{
+						return Ok(plan);
+					}
 					match self
 						.try_bind_star_order_actuation(plan, trace, render_trace)
 						.await?

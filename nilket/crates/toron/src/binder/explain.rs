@@ -82,6 +82,9 @@ pub(super) struct OptimizerExplainRenderTrace {
 	// ADR 198: when galaxy root-swap actuation fires, the applied root fact. The receipt then shows
 	// `action=reordered; applied_root={fact}` instead of the re-rooted galaxy's intrinsic recommendation.
 	pub(super) applied_galaxy_root: Option<String>,
+	// ADR 199: when bridge actuation fires, the applied dimension root. The bridge receipt then shows
+	// `action=reordered; applied_root={dim}` instead of the re-rooted bridge's intrinsic recommendation.
+	pub(super) applied_bridge_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +148,10 @@ impl OptimizerExplainRenderTrace {
 
 	pub(super) fn set_applied_galaxy_root(&mut self, root: String) {
 		self.applied_galaxy_root = Some(root);
+	}
+
+	pub(super) fn set_applied_bridge_root(&mut self, root: String) {
+		self.applied_bridge_root = Some(root);
 	}
 
 	pub(super) fn set_star_receipt(&mut self, receipt: StarOrderRenderReceipt) {
@@ -414,7 +421,10 @@ pub(super) fn optimizer_explain_plan(
 		}
 		// ADR 196: bridge evidence is the same additive sibling, alongside galaxy + tree receipts.
 		if let Some(bridge) = &render_trace.bridge_order {
-			rows.push(optimizer_explain_bridge_order_row(bridge));
+			rows.push(optimizer_explain_bridge_order_row(
+				bridge,
+				render_trace.applied_bridge_root.as_deref(),
+			));
 		}
 	}
 	system_table_plan(
@@ -996,7 +1006,10 @@ fn bridge_analyze_rows(
 	let Some(bridge) = &render_trace.bridge_order else {
 		return Ok(Vec::new());
 	};
-	let mut rows = vec![optimizer_analyze_bridge_order_row(bridge)];
+	let mut rows = vec![optimizer_analyze_bridge_order_row(
+		bridge,
+		render_trace.applied_bridge_root.as_deref(),
+	)];
 	for link in &bridge.links {
 		for (target, role) in [
 			(link.incoming_target, "fact_to_bridge"),
@@ -1022,10 +1035,10 @@ fn bridge_analyze_rows(
 			)?);
 		}
 	}
-	// ADR 197: the bridge measured verdict. The candidate that actually ran is `fan_out_first`, so its
-	// measured cost is the incoming edge's measured output (the materialized M:N fan-out); `filter_first`
-	// is the estimate floor (`fact_rows`) — the un-run counterfactual cannot be measured. A measured
-	// fan-out above that floor reorders (`MissedWin`).
+	// ADR 197/199: the bridge measured verdict, keyed by relation root (ADR 199). The candidate that
+	// actually ran is the fact root `F`, so its measured cost is the incoming edge's measured output (the
+	// materialized `F⋈B` fan-out); the dimension root `D` is the un-run counterfactual, costed by the
+	// `B⋈D` outgoing edge estimate. A measured fan-out above the `D`-root estimate reorders (`MissedWin`).
 	if let Some(rec) = bridge_order_recommendation(bridge) {
 		if let Some(link) = bridge.links.first() {
 			let measured_fan_out = join_replay_id_for_trace_target(link.incoming_target)
@@ -1033,10 +1046,10 @@ fn bridge_analyze_rows(
 				.and_then(|replay_id| summaries.get(&replay_id))
 				.map(|summary| u128::from(summary.output_rows.get()));
 			let measured = vec![
-				("fan_out_first".to_string(), measured_fan_out),
+				(link.fact.clone(), measured_fan_out),
 				(
-					"filter_first".to_string(),
-					Some(u128::from(link.fact_rows.get())),
+					link.dim.clone(),
+					link.outgoing_edge_rows.map(|rows| u128::from(rows.get())),
 				),
 			];
 			rows.push(graph_order_verdict_row(&rec, &measured));
@@ -1045,12 +1058,22 @@ fn bridge_analyze_rows(
 	Ok(rows)
 }
 
-fn optimizer_analyze_bridge_order_row(evidence: &BridgeOrderEvidence) -> Vec<ScalarValue> {
+fn optimizer_analyze_bridge_order_row(
+	evidence: &BridgeOrderEvidence,
+	applied_root: Option<&str>,
+) -> Vec<ScalarValue> {
 	vec![
 		ScalarValue::Utf8(Some("join_order_bridge".to_string())),
 		ScalarValue::Utf8(Some(bridge_order_target_label(evidence))),
-		ScalarValue::Utf8(Some("observed".to_string())),
-		ScalarValue::Utf8(Some(bridge_order_detail_label(evidence))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(bridge_order_detail_label(evidence, applied_root))),
 		ScalarValue::Int64(None),
 		ScalarValue::Int64(None),
 		ScalarValue::Float64(None),
@@ -1360,12 +1383,20 @@ pub(super) fn optimizer_explain_galaxy_order_row(
 // fan-out. `outcome=observed`; 196 recognizes the junction without ordering or actuating it.
 pub(super) fn optimizer_explain_bridge_order_row(
 	evidence: &BridgeOrderEvidence,
+	applied_root: Option<&str>,
 ) -> Vec<ScalarValue> {
 	vec![
 		ScalarValue::Utf8(Some("join_order_bridge".to_string())),
 		ScalarValue::Utf8(Some(bridge_order_target_label(evidence))),
-		ScalarValue::Utf8(Some("observed".to_string())),
-		ScalarValue::Utf8(Some(bridge_order_detail_label(evidence))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(bridge_order_detail_label(evidence, applied_root))),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),
@@ -1395,7 +1426,10 @@ pub(super) fn bridge_order_target_label(evidence: &BridgeOrderEvidence) -> Strin
 	format!("bridge[{links}]")
 }
 
-pub(super) fn bridge_order_detail_label(evidence: &BridgeOrderEvidence) -> String {
+pub(super) fn bridge_order_detail_label(
+	evidence: &BridgeOrderEvidence,
+	applied_root: Option<&str>,
+) -> String {
 	let links = evidence
 		.links
 		.iter()
@@ -1412,12 +1446,26 @@ pub(super) fn bridge_order_detail_label(evidence: &BridgeOrderEvidence) -> Strin
 		})
 		.collect::<Vec<_>>()
 		.join("; ");
-	format!(
-		"{links}{}",
-		bridge_order_recommendation(evidence)
+	let order = match applied_root {
+		// ADR 199: actuation fired — the receipt shows the applied re-root, not the re-rooted bridge's
+		// intrinsic (now kept-optimal) recommendation.
+		Some(root) => {
+			let costs = bridge_order_recommendation(evidence)
+				.map(|rec| {
+					rec.costs
+						.iter()
+						.map(|(label, cost)| format!("{label}:{cost}"))
+						.collect::<Vec<_>>()
+						.join(",")
+				})
+				.unwrap_or_default();
+			format!("; action=reordered; applied_root={root}; costs=[{costs}]")
+		}
+		None => bridge_order_recommendation(evidence)
 			.map(|rec| graph_order_recommendation_label(&rec))
 			.unwrap_or_default(),
-	)
+	};
+	format!("{links}{order}")
 }
 
 pub(super) fn galaxy_order_target_label(evidence: &GalaxyOrderEvidence) -> String {

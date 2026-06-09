@@ -2937,6 +2937,241 @@ mod tests {
 		);
 	}
 
+	// ADR 199 bridge actuation fixture: `orders` (F) — `order_items` (B, the M:N junction that fans
+	// out) — `products` (D). Catalog facts make `order_items` larger than `orders` so the inverse-F1
+	// recognizer (196) classifies it as a bridge; storage is FK-complete so the AST and re-rooted join
+	// orders produce identical rows.
+	fn bridge_exec_catalog() -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"orders",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"order_items",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("order_id", DataType::Int64, false),
+						Field::new("product_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(3),
+				named_descriptor(
+					3,
+					"products",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("category", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		// `products.category` ndv 10 → `WHERE products.category = N` is ~10x selective, shrinking the
+		// `B⋈D` edge below `F⋈B` so the bridge actuator roots the dimension (ADR 199).
+		for (table, bytes, rows, ndv) in [
+			("orders", 8_192_u64, 1_000_u64, vec![(0, 1_000_u64)]),
+			(
+				"order_items",
+				64 * 1024 * 1024_u64,
+				10_000_u64,
+				vec![(1, 1_000_u64), (2, 100_u64)],
+			),
+			(
+				"products",
+				512_u64,
+				100_u64,
+				vec![(0, 100_u64), (1, 10_u64)],
+			),
+		] {
+			catalog
+				.seed_optimizer_facts(
+					&crate::catalog::TableRef::new(table),
+					TableOptimizerFacts {
+						byte_upper_bound: Some(ByteCount::new(bytes)),
+						row_upper_bound: Some(RowCount::new(rows)),
+						column_ndv: ndv
+							.into_iter()
+							.map(|(col, distinct)| {
+								(ColumnOrdinal(col), DistinctCountFact::Exact(distinct))
+							})
+							.collect(),
+						column_range: Default::default(),
+						column_range_distributions: Default::default(),
+						column_heavy_hitters: Default::default(),
+						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
+					},
+				)
+				.expect("seed bridge facts");
+		}
+		Arc::new(catalog)
+	}
+
+	fn bridge_exec_storage() -> Arc<MultiTableStorageScan> {
+		let orders = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![10, 11, 12]))],
+		)
+		.unwrap();
+		let order_items = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("order_id", DataType::Int64, false),
+				Field::new("product_id", DataType::Int64, false),
+			])),
+			vec![
+				Arc::new(Int64Array::from(vec![100, 101, 102, 103, 104])),
+				Arc::new(Int64Array::from(vec![10, 10, 11, 11, 12])),
+				Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2])),
+			],
+		)
+		.unwrap();
+		let products = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("category", DataType::Int64, false),
+			])),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3])),
+				Arc::new(Int64Array::from(vec![5, 5, 7])),
+			],
+		)
+		.unwrap();
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([
+				(TableId(1), orders),
+				(TableId(2), order_items),
+				(TableId(3), products),
+			]),
+		})
+	}
+
+	// ADR 199 Phase 0 (THE GATE, independent of actuation): the hand-written re-rooted bridge query
+	// (`FROM products …`, projecting the AST column order) executes distributed and digest-matches the
+	// AST-order baseline (`FROM orders …`). `reroot_galaxy_join_tree` maps `Join(Join(F,B),D)` to
+	// `Join(Join(D,B),F)`, which is exactly this `FROM products INNER JOIN order_items INNER JOIN orders`
+	// shape — a plain snowflake the existing staging path already fragments. If this fails, ADR 199 is a
+	// fragmenter cut, not a binder reorder.
+	#[tokio::test]
+	async fn bridge_reroot_query_digest_matches_ast_order_distributed() {
+		let ast = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT orders.id, order_items.order_id, products.id FROM orders \
+				 INNER JOIN order_items ON orders.id = order_items.order_id \
+				 INNER JOIN products ON order_items.product_id = products.id",
+			)
+			.expect("plan AST-order bridge");
+		// Re-rooted FROM (products-first), SAME projection / column order as the AST query.
+		let rerooted = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT orders.id, order_items.order_id, products.id FROM products \
+				 INNER JOIN order_items ON order_items.product_id = products.id \
+				 INNER JOIN orders ON orders.id = order_items.order_id",
+			)
+			.expect("plan re-rooted bridge");
+
+		let ast_result =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				ast,
+				bridge_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				bridge_exec_storage(),
+			)
+			.await
+			.expect("execute AST-order bridge");
+		let rerooted_result =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				rerooted,
+				bridge_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				bridge_exec_storage(),
+			)
+			.await
+			.expect("execute re-rooted bridge");
+
+		assert!(!ast_result.results.is_empty(), "bridge produced rows");
+		assert_eq!(
+			canonical_arrow_ipc_digest(&rerooted_result.results, SortPolicy::FullRowLex)
+				.expect("re-rooted digest"),
+			canonical_arrow_ipc_digest(&ast_result.results, SortPolicy::FullRowLex)
+				.expect("AST digest"),
+			"re-rooted bridge must digest-match the AST-order baseline"
+		);
+	}
+
+	// ADR 199 headline: a bridge with a selective predicate on the dimension ACTUATES — the binder
+	// re-roots the AST-order `FROM orders …` query to drive the dimension, executes distributed, and
+	// digest-matches the hand-written re-rooted baseline. The actuated AST query and the explicit
+	// re-rooted query must agree byte-for-byte; both apply the same `products.category` filter.
+	#[tokio::test]
+	async fn bridge_reroots_to_selective_dimension_and_executes_distributed() {
+		let predicate = "WHERE products.category = 5";
+		let ast = crate::sql_planner::SqlPlanner::new()
+			.plan(&format!(
+				"SELECT orders.id, order_items.order_id, products.id FROM orders \
+				 INNER JOIN order_items ON orders.id = order_items.order_id \
+				 INNER JOIN products ON order_items.product_id = products.id {predicate}"
+			))
+			.expect("plan selective AST-order bridge");
+		// Hand-written re-rooted baseline (products-first), same projection / filter.
+		let rerooted = crate::sql_planner::SqlPlanner::new()
+			.plan(&format!(
+				"SELECT orders.id, order_items.order_id, products.id FROM products \
+				 INNER JOIN order_items ON order_items.product_id = products.id \
+				 INNER JOIN orders ON orders.id = order_items.order_id {predicate}"
+			))
+			.expect("plan re-rooted baseline");
+
+		let actuated =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				ast,
+				bridge_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				bridge_exec_storage(),
+			)
+			.await
+			.expect("execute actuated bridge");
+		let baseline =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				rerooted,
+				bridge_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				bridge_exec_storage(),
+			)
+			.await
+			.expect("execute re-rooted baseline");
+
+		assert!(
+			!actuated.results.is_empty(),
+			"selective bridge produced rows"
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&actuated.results, SortPolicy::FullRowLex)
+				.expect("actuated digest"),
+			canonical_arrow_ipc_digest(&baseline.results, SortPolicy::FullRowLex)
+				.expect("baseline digest"),
+			"actuated bridge must digest-match the re-rooted baseline"
+		);
+	}
+
 	fn join_catalog_with_customers_row_upper_bound(
 		customers_row_upper_bound: u64,
 	) -> Arc<MockCatalog> {

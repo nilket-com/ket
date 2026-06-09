@@ -433,6 +433,11 @@ pub(super) struct BridgeLink {
 	pub(super) b_out_signature: Vec<String>,
 	pub(super) bridge_rows: RowCount,
 	pub(super) fact_rows: RowCount,
+	// ADR 199: the per-edge join-result estimates (`F⋈B` incoming, `B⋈D` outgoing) — the actuation cost
+	// basis. `bridge_rows`/`fact_rows` above are the 196 endpoint-row recognition gate (is `B` a
+	// bridge?); these edge estimates answer the distinct ordering question (which root is cheaper?).
+	pub(super) incoming_edge_rows: Option<RowCount>,
+	pub(super) outgoing_edge_rows: Option<RowCount>,
 	pub(super) incoming_target: JoinTraceTarget,
 	pub(super) outgoing_target: JoinTraceTarget,
 }
@@ -1326,6 +1331,8 @@ pub(super) fn analyze_bridge(
 			b_out_signature: b_out_signature.clone(),
 			bridge_rows,
 			fact_rows,
+			incoming_edge_rows: incoming.estimated_rows,
+			outgoing_edge_rows: outgoing.estimated_rows,
 			incoming_target: incoming.target,
 			outgoing_target: outgoing.target,
 		});
@@ -1402,31 +1409,36 @@ pub(super) fn galaxy_order_recommendation(
 	})
 }
 
-// Bridge order cost: a many-to-many bridge fans out (`bridge_rows >= fact_rows` by the ADR 196 gate).
-// When the fan-out is real (`bridge_rows > fact_rows`), prefer delaying the bridge expansion until the
-// selective dimension is applied (`filter_first`) over materializing it early (`fan_out_first`).
+// Bridge order cost (ADR 199): root the relation whose join *into the bridge* is the smaller build.
+// The FROM order roots the fact `F`, materializing `F⋈B` (the incoming edge) before the dimension
+// filters; rooting the dimension `D` instead materializes `D⋈B` (the outgoing edge) first. Prefer `D`
+// iff `D⋈B` is cheaper than `F⋈B` — a relation-rooted edge-estimate decision, the galaxy's
+// `edge_estimate_between` discipline applied to the bridge's two incident edges (not the endpoint-row
+// `bridge_rows`/`fact_rows`, which is the 196 *recognition* gate and is blind to the dimension's
+// selectivity). Conservative: a missing edge estimate yields no recommendation — never actuate on an
+// unknown cost.
 pub(super) fn bridge_order_recommendation(
 	bridge: &BridgeOrderEvidence,
 ) -> Option<GraphOrderRecommendation> {
 	let link = bridge.links.first()?;
-	let fan_out_cost = u128::from(link.bridge_rows.get());
-	let filter_cost = u128::from(link.fact_rows.get());
-	let action = if link.bridge_rows > link.fact_rows {
+	let fact_root_cost = u128::from(link.incoming_edge_rows?.get());
+	let dim_root_cost = u128::from(link.outgoing_edge_rows?.get());
+	let action = if dim_root_cost < fact_root_cost {
 		StarOrderAction::Reordered
 	} else {
 		StarOrderAction::KeptAlreadyOptimal
 	};
 	let preferred_root = match action {
-		StarOrderAction::Reordered => "filter_first".to_string(),
-		_ => "fan_out_first".to_string(),
+		StarOrderAction::Reordered => link.dim.clone(),
+		_ => link.fact.clone(),
 	};
 	Some(GraphOrderRecommendation {
 		pivot: link.bridge.clone(),
-		declared_root: "fan_out_first".to_string(),
+		declared_root: link.fact.clone(),
 		preferred_root,
 		costs: vec![
-			("fan_out_first".to_string(), fan_out_cost),
-			("filter_first".to_string(), filter_cost),
+			(link.fact.clone(), fact_root_cost),
+			(link.dim.clone(), dim_root_cost),
 		],
 		action,
 	})
@@ -2131,6 +2143,97 @@ impl<'a> Binder<'a> {
 		// The receipt reflects the applied re-root, not the re-rooted galaxy's intrinsic recommendation.
 		if let Some(render_trace) = render_trace.as_mut() {
 			render_trace.set_applied_galaxy_root(preferred_root);
+		}
+		Ok(GalaxyActuationResult::Actuated(bound))
+	}
+
+	// ADR 199: bounded bridge actuation, sibling of `try_bind_galaxy_actuation`. Scratch-recognize the
+	// bridge, and if rooting the selective dimension beats the FROM root by the soft margin, re-root the
+	// join tree and bind the re-rooted plan — `Join(Join(F,B),D) → Join(Join(D,B),F)` is a snowflake the
+	// existing actuator + fragmenter already stage (proven by the distributed digest fixture). Otherwise
+	// observe-only (exactly ADR 197). Recursion terminates naturally: after re-rooting, the new root `D`
+	// owns the smaller fact-edge, so the re-rooted bridge's own recommendation is `KeptAlreadyOptimal`.
+	pub(super) async fn try_bind_bridge_actuation(
+		&self,
+		plan: &LogicalPlan,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<GalaxyActuationResult, BindingError> {
+		let LogicalPlan::Join {
+			left,
+			right,
+			kind,
+			on,
+			strategy_intent,
+		} = plan
+		else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+
+		// Scratch-recognize the bridge via the actuation-free `bind_join` on a no-op-recorder binder:
+		// recognition cannot recurse into actuation and never pollutes the shared decision log.
+		let mut scratch_trace = trace.clone();
+		let mut scratch_render = Some(OptimizerExplainRenderTrace::default());
+		let _ = self
+			.without_decision_recording()
+			.bind_join(
+				left,
+				right,
+				*kind,
+				on,
+				*strategy_intent,
+				&mut scratch_trace,
+				&mut scratch_render,
+				JoinOrderSourceCapture::On,
+			)
+			.await?;
+		let scratch_render = scratch_render.expect("bridge scratch render trace present");
+		let Some(bridge) = analyze_bridge(
+			&scratch_render.join_order_edges,
+			&scratch_trace.join_decisions,
+		) else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+		let Some(recommendation) = bridge_order_recommendation(&bridge) else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+		// FROM root already cost-optimal (clean FK bridge / non-selective dimension) → observe-only.
+		if recommendation.action != StarOrderAction::Reordered {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		}
+		// Soft-margin gate (190/191): only re-root on a clear win, never a thin one.
+		let cost_of = |root: &str| {
+			recommendation
+				.costs
+				.iter()
+				.find(|(label, _)| label == root)
+				.map(|(_, cost)| *cost)
+		};
+		let (Some(declared_cost), Some(preferred_cost)) = (
+			cost_of(&recommendation.declared_root),
+			cost_of(&recommendation.preferred_root),
+		) else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+		let margin = self.join_order_soft_margin_step.margin();
+		if preferred_cost.saturating_mul(margin.denominator)
+			> declared_cost.saturating_mul(margin.numerator)
+		{
+			return Ok(GalaxyActuationResult::NotCandidate);
+		}
+
+		// Re-root the bridge tree via the role-neutral 198 reassociation and bind it on the real trace.
+		// Binding through the existing staging path inherits the 193/198 selected-preflight discipline: a
+		// re-rooted snowflake that cannot stage simply binds in its valid re-rooted order (digest-proven).
+		let Some(rerooted) = reroot_galaxy_join_tree(plan) else {
+			return Ok(GalaxyActuationResult::NotCandidate);
+		};
+		let preferred_root = recommendation.preferred_root.clone();
+		let bound = self
+			.bind_plan_with_trace(&rerooted, trace, render_trace, JoinOrderSourceCapture::On)
+			.await?;
+		if let Some(render_trace) = render_trace.as_mut() {
+			render_trace.set_applied_bridge_root(preferred_root);
 		}
 		Ok(GalaxyActuationResult::Actuated(bound))
 	}
