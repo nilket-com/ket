@@ -10,6 +10,9 @@ pub(crate) enum OptimizerDecisionKind {
 	FlatStar,
 	SnowflakeRoot,
 	SnowflakeBranch,
+	// ADR 200: graph (non-tree) actuation provenance — a galaxy / bridge root-swap decision.
+	GalaxyRoot,
+	BridgeRoot,
 	Overflow,
 }
 
@@ -184,6 +187,8 @@ pub(crate) fn optimizer_decision_kind_label(kind: OptimizerDecisionKind) -> &'st
 		OptimizerDecisionKind::FlatStar => "flat_star",
 		OptimizerDecisionKind::SnowflakeRoot => "snowflake_root",
 		OptimizerDecisionKind::SnowflakeBranch => "snowflake_branch",
+		OptimizerDecisionKind::GalaxyRoot => "galaxy_root",
+		OptimizerDecisionKind::BridgeRoot => "bridge_root",
 		OptimizerDecisionKind::Overflow => "overflow",
 	}
 }

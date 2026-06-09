@@ -1103,21 +1103,40 @@ impl<'a> Binder<'a> {
 					on,
 					strategy_intent,
 				} => {
-					// ADR 198: try the bounded galaxy root-swap first. If it actuates, the re-rooted
-					// snowflake is already bound through the existing bind path, so we return it.
-					if let GalaxyActuationResult::Actuated(plan) = self
-						.try_bind_galaxy_actuation(plan, trace, render_trace)
-						.await?
-					{
-						return Ok(plan);
-					}
-					// ADR 199: then the bounded bridge root-swap (a query is a galaxy XOR a bridge —
-					// conformed vs distinct junction signatures — so these never both fire).
-					if let GalaxyActuationResult::Actuated(plan) = self
-						.try_bind_bridge_actuation(plan, trace, render_trace)
-						.await?
-					{
-						return Ok(plan);
+					// ADR 200: the unified bounded graph root-swap, galaxy then bridge. A query is a
+					// galaxy XOR a bridge (conformed vs distinct junction signatures), so the arms never
+					// both fire. The committed decision is accrued here (one per recognized graph); on the
+					// no-op recorder of a re-rooted re-bind it is discarded, so no phantom doubles it. If
+					// either actuates, the re-rooted snowflake is already bound, so we return it.
+					for shape in [GraphShape::Galaxy, GraphShape::Bridge] {
+						let result = self
+							.try_bind_graph_actuation(plan, trace, render_trace, shape)
+							.await?;
+						match &result {
+							GraphActuationResult::NotCandidate => {}
+							GraphActuationResult::Actuated(_) => self.accrue_graph_order_decision(
+								shape,
+								OptimizerDecisionOutcome::Reordered,
+							),
+							GraphActuationResult::KeptAlreadyOptimal => self
+								.accrue_graph_order_decision(
+									shape,
+									OptimizerDecisionOutcome::KeptOptimal,
+								),
+							GraphActuationResult::KeptThinMargin => self
+								.accrue_graph_order_decision(
+									shape,
+									OptimizerDecisionOutcome::KeptThinMargin,
+								),
+							GraphActuationResult::Declined(reason) => self
+								.accrue_graph_order_decision(
+									shape,
+									OptimizerDecisionOutcome::Declined(*reason),
+								),
+						}
+						if let GraphActuationResult::Actuated(plan) = result {
+							return Ok(plan);
+						}
 					}
 					match self
 						.try_bind_star_order_actuation(plan, trace, render_trace)

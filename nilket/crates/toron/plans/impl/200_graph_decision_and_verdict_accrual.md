@@ -1,15 +1,20 @@
 # Impl Plan — ADR 200: Graph Decision & Verdict Accrual
 
 Pairs with `plans/adr/200_graph_decision_and_verdict_accrual.md`. Side-effect-only: execution plans +
-EXPLAIN receipts stay byte-identical to `main`. All anchors verified against the tree.
+EXPLAIN receipts stay byte-identical to `main`.
 
-## Anchors (verified)
+## Anchors
 
-| Concern | Anchor |
+The anchor table is reconciled to the **as-built** tree (post-implementation): the two pre-200 actuators
+`try_bind_galaxy_actuation` / `try_bind_bridge_actuation` and `GalaxyActuationResult` were the *inputs*
+to D1's unify and **no longer exist** — they are replaced by the unified symbols below. (Phase 1 prose
+still names the pre-200 functions to describe the deletion they undergo.)
+
+| Concern | Anchor (as built) |
 |---|---|
-| The two duplicate actuators | `try_bind_galaxy_actuation` (join_order.rs:2062), `try_bind_bridge_actuation` (~:2150) |
-| Shared result / reroot / recommendation | `GalaxyActuationResult` (:2000), `reroot_galaxy_join_tree` (:579), `GraphOrderRecommendation` |
-| Actuator wiring | `binder.rs` Join arm (~:1106–1135, the two `if let …Actuated` blocks) |
+| Unified graph actuator (replaced the two pre-200 actuators) | `try_bind_graph_actuation` + `enum GraphShape` (join_order.rs:~2116/2024) |
+| Result enum / reroot / recommendation | `GraphActuationResult` (join_order.rs:2004), `reroot_galaxy_join_tree` (:579), `GraphOrderRecommendation` |
+| Actuator wiring + decision accrual | `binder.rs` Join arm loop over `[GraphShape::Galaxy, Bridge]` → match → `accrue_graph_order_decision` |
 | Decision-accrual mirror | `accrue_star_order_receipt` (:3076) / `accrue_star_order_decline` (:3087) → `decision_recorder.record` |
 | Decision taxonomy | `OptimizerDecisionKind` + `optimizer_decision_kind_label` (decision_log.rs:8/181) |
 | Sampled verdict seam | `measured_verdicts_from_summaries` (explain.rs ~:512), `MeasuredLevelVerdict` (:461), `runtime_verdict_class_from_star` (:694) |

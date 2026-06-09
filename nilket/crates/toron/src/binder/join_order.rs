@@ -1996,10 +1996,60 @@ pub(super) enum StarOrderActuationResult {
 	Declined,
 }
 
+// ADR 200: the committed outcome of a graph actuation attempt. Unlike a two-way candidate/actuated
+// enum, the keep and decline cases are explicit so accrual records the *committed* decision faithfully
+// (a soft-margin keep is `KeptThinMargin`, a can't-evaluate is `Declined`) rather than inferring it from
+// a collapsed `NotCandidate`.
 #[derive(Debug, Clone)]
-pub(super) enum GalaxyActuationResult {
+pub(super) enum GraphActuationResult {
+	// The node is not a graph of this shape — no decision, no accrual.
 	NotCandidate,
 	Actuated(ScopedExecutionPlan),
+	// Recognized; the FROM root is already cost-optimal.
+	KeptAlreadyOptimal,
+	// Recognized; a cheaper root exists but does not clear the soft margin.
+	KeptThinMargin,
+	// Recognized; could not be costed (missing estimate) or could not re-root.
+	Declined(OptimizerDecisionDeclineReason),
+}
+
+// ADR 200: the graph shape the unified actuator dispatches over. A query is a galaxy XOR a bridge
+// (conformed vs distinct junction signatures), so the two arms are mutually exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GraphShape {
+	Galaxy,
+	Bridge,
+}
+
+impl GraphShape {
+	fn decision_kind(self) -> OptimizerDecisionKind {
+		match self {
+			GraphShape::Galaxy => OptimizerDecisionKind::GalaxyRoot,
+			GraphShape::Bridge => OptimizerDecisionKind::BridgeRoot,
+		}
+	}
+
+	// Recognize the shape over the scratch trace. `None` → not this shape (NotCandidate); `Some(None)` →
+	// recognized but not costable (Declined); `Some(Some(rec))` → recognized with a recommendation.
+	fn recommend(
+		self,
+		render: &OptimizerExplainRenderTrace,
+		trace: &OptimizerTrace,
+	) -> Option<Option<GraphOrderRecommendation>> {
+		match self {
+			GraphShape::Galaxy => analyze_galaxy(&render.join_order_edges, &trace.join_decisions)
+				.map(|galaxy| galaxy_order_recommendation(&galaxy)),
+			GraphShape::Bridge => analyze_bridge(&render.join_order_edges, &trace.join_decisions)
+				.map(|bridge| bridge_order_recommendation(&bridge)),
+		}
+	}
+
+	fn set_applied_root(self, render: &mut OptimizerExplainRenderTrace, root: String) {
+		match self {
+			GraphShape::Galaxy => render.set_applied_galaxy_root(root),
+			GraphShape::Bridge => render.set_applied_bridge_root(root),
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -2055,16 +2105,21 @@ fn star_output_segments_for_order(
 }
 
 impl<'a> Binder<'a> {
-	// ADR 198: bounded 2-fact galaxy root-swap actuation. Scratch-recognize the galaxy, and if its
-	// cost-optimal root differs from the FROM root by the soft margin, re-root the join tree and bind
-	// the re-rooted plan — which is a snowflake the existing actuator + fragmenter already stage
-	// (proven by the distributed digest fixture). Otherwise observe-only (exactly ADR 197).
-	pub(super) async fn try_bind_galaxy_actuation(
+	// ADR 198/199, unified in ADR 200: bounded graph root-swap actuation for galaxies and bridges.
+	// Scratch-recognize the graph of `shape`, and if its cost-optimal root differs from the FROM root by
+	// the soft margin, re-root the join tree and bind the re-rooted plan — a snowflake the existing
+	// actuator + fragmenter already stage (proven by the distributed digest fixtures). Otherwise
+	// observe-only (exactly ADR 197). The scratch recognition binds via the actuation-free `bind_join` on
+	// a no-op-recorder binder, so it can neither recurse into actuation nor pollute the shared decision
+	// log. Recursion terminates naturally: after re-rooting, the new root owns the smaller fact-edge, so
+	// the re-rooted graph's own recommendation is `KeptAlreadyOptimal`.
+	pub(super) async fn try_bind_graph_actuation(
 		&self,
 		plan: &LogicalPlan,
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
-	) -> Result<GalaxyActuationResult, BindingError> {
+		shape: GraphShape,
+	) -> Result<GraphActuationResult, BindingError> {
 		let LogicalPlan::Join {
 			left,
 			right,
@@ -2073,14 +2128,9 @@ impl<'a> Binder<'a> {
 			strategy_intent,
 		} = plan
 		else {
-			return Ok(GalaxyActuationResult::NotCandidate);
+			return Ok(GraphActuationResult::NotCandidate);
 		};
 
-		// Scratch-recognize the galaxy via the actuation-free `bind_join` (not the actuation-carrying
-		// `bind_plan_with_trace`): `bind_join` never re-enters galaxy actuation on this node, and the
-		// galaxy's left subtree is a single-fact star (fewer than two edges, so not a galaxy itself), so
-		// recognition cannot recurse — no runtime re-entry flag needed. The bind runs on a binder that
-		// discards decisions, so the scratch can never pollute the shared decision log.
 		let mut scratch_trace = trace.clone();
 		let mut scratch_render = Some(OptimizerExplainRenderTrace::default());
 		let _ = self
@@ -2096,19 +2146,20 @@ impl<'a> Binder<'a> {
 				JoinOrderSourceCapture::On,
 			)
 			.await?;
-		let scratch_render = scratch_render.expect("galaxy scratch render trace present");
-		let Some(galaxy) = analyze_galaxy(
-			&scratch_render.join_order_edges,
-			&scratch_trace.join_decisions,
-		) else {
-			return Ok(GalaxyActuationResult::NotCandidate);
+		let scratch_render = scratch_render.expect("graph scratch render trace present");
+		let Some(maybe_recommendation) = shape.recommend(&scratch_render, &scratch_trace) else {
+			// Not a graph of this shape — no decision to record.
+			return Ok(GraphActuationResult::NotCandidate);
 		};
-		let Some(recommendation) = galaxy_order_recommendation(&galaxy) else {
-			return Ok(GalaxyActuationResult::NotCandidate);
+		let Some(recommendation) = maybe_recommendation else {
+			// Recognized, but the order could not be costed (a missing edge estimate).
+			return Ok(GraphActuationResult::Declined(
+				OptimizerDecisionDeclineReason::MissingEstimate,
+			));
 		};
 		// FROM root already cost-optimal → observe-only (no re-root).
 		if recommendation.action != StarOrderAction::Reordered {
-			return Ok(GalaxyActuationResult::NotCandidate);
+			return Ok(GraphActuationResult::KeptAlreadyOptimal);
 		}
 		// Soft-margin gate (190/191): only re-root on a clear win, never a thin one.
 		let cost_of = |root: &str| {
@@ -2122,120 +2173,36 @@ impl<'a> Binder<'a> {
 			cost_of(&recommendation.declared_root),
 			cost_of(&recommendation.preferred_root),
 		) else {
-			return Ok(GalaxyActuationResult::NotCandidate);
+			return Ok(GraphActuationResult::Declined(
+				OptimizerDecisionDeclineReason::MissingEstimate,
+			));
 		};
 		let margin = self.join_order_soft_margin_step.margin();
 		if preferred_cost.saturating_mul(margin.denominator)
 			> declared_cost.saturating_mul(margin.numerator)
 		{
-			return Ok(GalaxyActuationResult::NotCandidate);
+			return Ok(GraphActuationResult::KeptThinMargin);
 		}
 
-		// Re-root the join tree and bind the re-rooted plan (a snowflake) on the real trace. Its own
-		// galaxy check sees `KeptAlreadyOptimal` (FROM root now == preferred), so no further re-root.
+		// Re-root the join tree and bind the re-rooted plan (a snowflake). The re-bind runs on a
+		// no-op-recorder binder: the committed graph decision is accrued once by the caller, so the
+		// re-rooted plan's own re-recognition (a phantom `KeptAlreadyOptimal`) is discarded. Plan and
+		// render are unaffected — only the decision sink differs.
 		let Some(rerooted) = reroot_galaxy_join_tree(plan) else {
-			return Ok(GalaxyActuationResult::NotCandidate);
+			return Ok(GraphActuationResult::Declined(
+				OptimizerDecisionDeclineReason::MissingEstimate,
+			));
 		};
 		let preferred_root = recommendation.preferred_root.clone();
 		let bound = self
-			.bind_plan_with_trace(&rerooted, trace, render_trace, JoinOrderSourceCapture::On)
-			.await?;
-		// The receipt reflects the applied re-root, not the re-rooted galaxy's intrinsic recommendation.
-		if let Some(render_trace) = render_trace.as_mut() {
-			render_trace.set_applied_galaxy_root(preferred_root);
-		}
-		Ok(GalaxyActuationResult::Actuated(bound))
-	}
-
-	// ADR 199: bounded bridge actuation, sibling of `try_bind_galaxy_actuation`. Scratch-recognize the
-	// bridge, and if rooting the selective dimension beats the FROM root by the soft margin, re-root the
-	// join tree and bind the re-rooted plan — `Join(Join(F,B),D) → Join(Join(D,B),F)` is a snowflake the
-	// existing actuator + fragmenter already stage (proven by the distributed digest fixture). Otherwise
-	// observe-only (exactly ADR 197). Recursion terminates naturally: after re-rooting, the new root `D`
-	// owns the smaller fact-edge, so the re-rooted bridge's own recommendation is `KeptAlreadyOptimal`.
-	pub(super) async fn try_bind_bridge_actuation(
-		&self,
-		plan: &LogicalPlan,
-		trace: &mut OptimizerTrace,
-		render_trace: &mut Option<OptimizerExplainRenderTrace>,
-	) -> Result<GalaxyActuationResult, BindingError> {
-		let LogicalPlan::Join {
-			left,
-			right,
-			kind,
-			on,
-			strategy_intent,
-		} = plan
-		else {
-			return Ok(GalaxyActuationResult::NotCandidate);
-		};
-
-		// Scratch-recognize the bridge via the actuation-free `bind_join` on a no-op-recorder binder:
-		// recognition cannot recurse into actuation and never pollutes the shared decision log.
-		let mut scratch_trace = trace.clone();
-		let mut scratch_render = Some(OptimizerExplainRenderTrace::default());
-		let _ = self
 			.without_decision_recording()
-			.bind_join(
-				left,
-				right,
-				*kind,
-				on,
-				*strategy_intent,
-				&mut scratch_trace,
-				&mut scratch_render,
-				JoinOrderSourceCapture::On,
-			)
-			.await?;
-		let scratch_render = scratch_render.expect("bridge scratch render trace present");
-		let Some(bridge) = analyze_bridge(
-			&scratch_render.join_order_edges,
-			&scratch_trace.join_decisions,
-		) else {
-			return Ok(GalaxyActuationResult::NotCandidate);
-		};
-		let Some(recommendation) = bridge_order_recommendation(&bridge) else {
-			return Ok(GalaxyActuationResult::NotCandidate);
-		};
-		// FROM root already cost-optimal (clean FK bridge / non-selective dimension) → observe-only.
-		if recommendation.action != StarOrderAction::Reordered {
-			return Ok(GalaxyActuationResult::NotCandidate);
-		}
-		// Soft-margin gate (190/191): only re-root on a clear win, never a thin one.
-		let cost_of = |root: &str| {
-			recommendation
-				.costs
-				.iter()
-				.find(|(label, _)| label == root)
-				.map(|(_, cost)| *cost)
-		};
-		let (Some(declared_cost), Some(preferred_cost)) = (
-			cost_of(&recommendation.declared_root),
-			cost_of(&recommendation.preferred_root),
-		) else {
-			return Ok(GalaxyActuationResult::NotCandidate);
-		};
-		let margin = self.join_order_soft_margin_step.margin();
-		if preferred_cost.saturating_mul(margin.denominator)
-			> declared_cost.saturating_mul(margin.numerator)
-		{
-			return Ok(GalaxyActuationResult::NotCandidate);
-		}
-
-		// Re-root the bridge tree via the role-neutral 198 reassociation and bind it on the real trace.
-		// Binding through the existing staging path inherits the 193/198 selected-preflight discipline: a
-		// re-rooted snowflake that cannot stage simply binds in its valid re-rooted order (digest-proven).
-		let Some(rerooted) = reroot_galaxy_join_tree(plan) else {
-			return Ok(GalaxyActuationResult::NotCandidate);
-		};
-		let preferred_root = recommendation.preferred_root.clone();
-		let bound = self
 			.bind_plan_with_trace(&rerooted, trace, render_trace, JoinOrderSourceCapture::On)
 			.await?;
+		// The receipt reflects the applied re-root, not the re-rooted graph's intrinsic recommendation.
 		if let Some(render_trace) = render_trace.as_mut() {
-			render_trace.set_applied_bridge_root(preferred_root);
+			shape.set_applied_root(render_trace, preferred_root);
 		}
-		Ok(GalaxyActuationResult::Actuated(bound))
+		Ok(GraphActuationResult::Actuated(bound))
 	}
 
 	pub(super) async fn try_bind_star_order_actuation(
@@ -3093,6 +3060,19 @@ impl<'a> Binder<'a> {
 			kind,
 			OptimizerDecisionOutcome::Declined(optimizer_decision_decline_reason(reason)),
 		);
+	}
+
+	// ADR 200: record the committed graph-actuation decision (one per recognized galaxy/bridge) into the
+	// shared decision log, under the shape's `GalaxyRoot`/`BridgeRoot` kind. The caller maps the
+	// `GraphActuationResult` to the outcome so the decline reason is preserved. This runs on `self`; a
+	// no-op-recorder binder discards it (the re-rooted re-bind, whose decision the outer call committed).
+	pub(super) fn accrue_graph_order_decision(
+		&self,
+		shape: GraphShape,
+		outcome: OptimizerDecisionOutcome,
+	) {
+		self.decision_recorder
+			.record(shape.decision_kind(), outcome);
 	}
 }
 

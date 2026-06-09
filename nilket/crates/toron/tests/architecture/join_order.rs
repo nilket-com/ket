@@ -2066,55 +2066,91 @@ pub(crate) fn adr198_galaxy_reroot_is_bounded_two_fact() {
 	assert!(!join_order.contains("Cascades"));
 }
 
+// ADR 200 retargets the 198/199 per-shape actuation guards onto the unified `try_bind_graph_actuation`.
 #[test]
-pub(crate) fn adr198_galaxy_actuation_reuses_snowflake_machinery() {
+pub(crate) fn adr200_unified_actuator_reuses_snowflake_machinery() {
 	let join_order = source("src/binder/join_order.rs");
-	let actuation = first_block(&join_order, "pub(super) async fn try_bind_galaxy_actuation");
+	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
 
-	// The re-rooted plan binds through the normal path (`bind_plan_with_trace` → the star actuator +
-	// existing fragmenter); galaxy actuation adds no new fragmenter.
+	// The re-rooted graph binds through the normal path (the existing staging + fragmenter) and reuses
+	// the 198 role-neutral reroot — graph actuation defines no new reassociation and no new fragmenter.
 	assert!(actuation.contains("reroot_galaxy_join_tree"));
 	assert!(actuation.contains("bind_plan_with_trace"));
+	assert!(!join_order.contains("fn reroot_bridge"));
 	let fragment = source("src/distributed/fragment.rs");
 	assert!(!fragment.contains("reroot_galaxy_join_tree"));
-	assert!(!fragment.contains("try_bind_galaxy_actuation"));
+	assert!(!fragment.contains("try_bind_graph_actuation"));
 }
 
 #[test]
-pub(crate) fn adr198_galaxy_actuation_respects_soft_margin() {
+pub(crate) fn adr200_unified_actuator_respects_soft_margin() {
 	let join_order = source("src/binder/join_order.rs");
-	let actuation = first_block(&join_order, "pub(super) async fn try_bind_galaxy_actuation");
+	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
 
 	// Re-root only on a clear win: action must be `Reordered` and the preferred cost must beat the
-	// declared cost by the soft margin.
+	// declared cost by the soft margin (else `KeptThinMargin`).
 	assert!(actuation.contains("StarOrderAction::Reordered"));
 	assert!(actuation.contains("join_order_soft_margin_step.margin()"));
 	assert!(actuation.contains("saturating_mul(margin.denominator)"));
+	assert!(actuation.contains("GraphActuationResult::KeptThinMargin"));
 }
 
 #[test]
-pub(crate) fn adr198_galaxy_actuation_recognition_is_recursion_free() {
+pub(crate) fn adr200_unified_actuator_recognition_is_recursion_free() {
 	let join_order = source("src/binder/join_order.rs");
-	let explain = source("src/binder/explain.rs");
-	let actuation = first_block(&join_order, "pub(super) async fn try_bind_galaxy_actuation");
+	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
 
-	// The scratch recognition binds via the actuation-free `bind_join`, so recognition cannot recurse
-	// into galaxy actuation — no runtime re-entry flag (a structural guarantee, not a `bool`).
+	// Recognition binds via the actuation-free `bind_join` on a no-op-recorder binder — structurally
+	// cannot recurse into actuation, no runtime re-entry flag — and the receipt reflects the applied
+	// re-root for either shape.
 	assert!(actuation.contains(".bind_join("));
-	assert!(!explain.contains("in_galaxy_scratch"));
+	assert!(actuation.contains("without_decision_recording"));
 	assert!(!join_order.contains("in_galaxy_scratch"));
-	// The receipt reflects the applied re-root.
-	assert!(actuation.contains("set_applied_galaxy_root"));
+	assert!(!join_order.contains("in_bridge_scratch"));
+	assert!(actuation.contains("shape.set_applied_root"));
 }
 
 #[test]
-pub(crate) fn adr198_galaxy_actuation_is_binder_only() {
+pub(crate) fn adr200_unified_actuator_replaces_duplicates() {
+	let join_order = source("src/binder/join_order.rs");
+	let binder = binder_source();
+
+	// The two per-shape actuators are gone; one shape-parameterized actuator remains.
+	assert!(join_order.contains("async fn try_bind_graph_actuation"));
+	assert!(join_order.contains("enum GraphShape"));
+	assert!(!join_order.contains("fn try_bind_galaxy_actuation"));
+	assert!(!join_order.contains("fn try_bind_bridge_actuation"));
+	assert!(!binder.contains("try_bind_galaxy_actuation"));
+	assert!(!binder.contains("try_bind_bridge_actuation"));
+}
+
+#[test]
+pub(crate) fn adr200_graph_decisions_accrue_to_shared_log() {
+	let binder = binder_source();
+	let join_order = source("src/binder/join_order.rs");
+	let decision_log = source("src/binder/decision_log.rs");
+
+	// The caller maps the committed `GraphActuationResult` to the decision-log outcome (preserving the
+	// decline reason) and records it under a graph kind via the typed recorder.
+	assert!(binder.contains("accrue_graph_order_decision"));
+	assert!(binder.contains("GraphActuationResult::Declined(reason)"));
+	assert!(join_order.contains("fn accrue_graph_order_decision"));
+	assert!(decision_log.contains("GalaxyRoot"));
+	assert!(decision_log.contains("BridgeRoot"));
+	assert!(decision_log.contains("\"galaxy_root\""));
+	assert!(decision_log.contains("\"bridge_root\""));
+}
+
+#[test]
+pub(crate) fn adr200_graph_actuation_is_binder_only() {
 	let manifest = manifest_dir();
 	let markers = [
 		"reroot_galaxy_join_tree",
-		"try_bind_galaxy_actuation",
-		"GalaxyActuationResult",
+		"try_bind_graph_actuation",
+		"GraphActuationResult",
+		"accrue_graph_order_decision",
 		"applied_galaxy_root",
+		"applied_bridge_root",
 	];
 	let mut offenders = Vec::new();
 	for path in [
@@ -2133,46 +2169,9 @@ pub(crate) fn adr198_galaxy_actuation_is_binder_only() {
 	}
 	assert!(
 		offenders.is_empty(),
-		"ADR198 galaxy actuation leaked outside the binder surface:\n{}",
+		"ADR200 graph actuation/accrual leaked outside the binder surface:\n{}",
 		format_offenders(&manifest, &offenders)
 	);
-}
-
-#[test]
-pub(crate) fn adr199_bridge_actuation_reuses_snowflake_machinery() {
-	let join_order = source("src/binder/join_order.rs");
-	let actuation = first_block(&join_order, "pub(super) async fn try_bind_bridge_actuation");
-
-	// The re-rooted bridge binds through the normal path (the existing staging + fragmenter), and reuses
-	// the 198 role-neutral reroot — bridge actuation defines no new reassociation and no new fragmenter.
-	assert!(actuation.contains("reroot_galaxy_join_tree"));
-	assert!(actuation.contains("bind_plan_with_trace"));
-	assert!(!join_order.contains("fn reroot_bridge"));
-	let fragment = source("src/distributed/fragment.rs");
-	assert!(!fragment.contains("try_bind_bridge_actuation"));
-}
-
-#[test]
-pub(crate) fn adr199_bridge_actuation_respects_soft_margin() {
-	let join_order = source("src/binder/join_order.rs");
-	let actuation = first_block(&join_order, "pub(super) async fn try_bind_bridge_actuation");
-
-	assert!(actuation.contains("StarOrderAction::Reordered"));
-	assert!(actuation.contains("join_order_soft_margin_step.margin()"));
-	assert!(actuation.contains("saturating_mul(margin.denominator)"));
-}
-
-#[test]
-pub(crate) fn adr199_bridge_actuation_recognition_is_recursion_free() {
-	let join_order = source("src/binder/join_order.rs");
-	let actuation = first_block(&join_order, "pub(super) async fn try_bind_bridge_actuation");
-
-	// Recognition binds via the actuation-free `bind_join` on a no-op-recorder binder — structurally
-	// cannot recurse into actuation, no runtime re-entry flag.
-	assert!(actuation.contains(".bind_join("));
-	assert!(actuation.contains("without_decision_recording"));
-	assert!(!join_order.contains("in_bridge_scratch"));
-	assert!(actuation.contains("set_applied_bridge_root"));
 }
 
 #[test]
@@ -2186,32 +2185,6 @@ pub(crate) fn adr199_bridge_recommendation_sharpens_beyond_fanout_proxy() {
 	assert!(recommendation.contains("outgoing_edge_rows"));
 	assert!(!recommendation.contains("bridge_rows"));
 	assert!(!recommendation.contains("fact_rows"));
-}
-
-#[test]
-pub(crate) fn adr199_bridge_actuation_is_binder_only() {
-	let manifest = manifest_dir();
-	let markers = ["try_bind_bridge_actuation", "applied_bridge_root"];
-	let mut offenders = Vec::new();
-	for path in [
-		manifest.join("src/distributed/fragment.rs"),
-		manifest.join("src/exec.rs"),
-		manifest.join("src/storage.rs"),
-		manifest.join("src/pbc.rs"),
-		manifest.join("src/wire.rs"),
-		manifest.join("../wendelon/src"),
-	] {
-		offenders.extend(
-			source_lines_for_path(&path)
-				.into_iter()
-				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
-		);
-	}
-	assert!(
-		offenders.is_empty(),
-		"ADR199 bridge actuation leaked outside the binder surface:\n{}",
-		format_offenders(&manifest, &offenders)
-	);
 }
 
 // Refactor (post-198): optimizer-decision recording is gated by a type, not a runtime bool. A bind

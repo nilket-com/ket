@@ -9220,6 +9220,99 @@ async fn galaxy_already_optimal_order_kept() {
 	assert_utf8_contains(&galaxy_row[3], "action=kept_already_optimal");
 }
 
+// ADR 200: a reordering galaxy and bridge each accrue exactly one committed graph decision
+// (`galaxy_root`/`bridge_root`, `reordered`) into the shared decision log — invisible on `main`. The
+// re-rooted re-bind runs on the no-op recorder, so no phantom `kept_optimal` is double-recorded.
+#[tokio::test]
+async fn graph_actuation_accrues_committed_decision() {
+	let catalog = galaxy_join_order_catalog();
+	let config = auto_broadcast_config(4_096);
+	let _ = bind(
+		&SqlPlanner::new()
+			.plan(galaxy_conformed_order_sql())
+			.expect("plan galaxy"),
+		&catalog,
+		&config,
+	)
+	.await
+	.expect("bind galaxy");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+	assert_eq!(
+		optimizer_decision_count(&rows, "galaxy_root", "reordered", None),
+		1
+	);
+	assert!(
+		!rows.iter().any(
+			|row| row[0] == ScalarValue::Utf8(Some("galaxy_root".to_string()))
+				&& row[1] == ScalarValue::Utf8(Some("kept_optimal".to_string()))
+		),
+		"actuated galaxy must not double-record a phantom kept_optimal: {rows:?}"
+	);
+
+	let bridge_catalog = selective_bridge_join_order_catalog();
+	let bridge_config = auto_broadcast_config(64 * 1024 * 1024);
+	let _ = bind(
+		&SqlPlanner::new()
+			.plan(selective_bridge_order_sql())
+			.expect("plan bridge"),
+		&bridge_catalog,
+		&bridge_config,
+	)
+	.await
+	.expect("bind bridge");
+	let bridge_rows = optimizer_decision_rows(&bridge_catalog, &bridge_config).await;
+	assert_eq!(
+		optimizer_decision_count(&bridge_rows, "bridge_root", "reordered", None),
+		1
+	);
+}
+
+// ADR 200 discriminator: an already-optimal galaxy and a clean-FK (non-selective) bridge accrue a
+// *kept* decision, not reordered — proving accrual records the committed decision, not actuation-fired.
+#[tokio::test]
+async fn kept_graph_accrues_kept_not_reordered() {
+	let catalog = galaxy_join_order_catalog();
+	let config = auto_broadcast_config(4_096);
+	let _ = bind(
+		&SqlPlanner::new()
+			.plan(galaxy_optimal_order_sql())
+			.expect("plan optimal galaxy"),
+		&catalog,
+		&config,
+	)
+	.await
+	.expect("bind optimal galaxy");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+	assert_eq!(
+		optimizer_decision_count(&rows, "galaxy_root", "kept_optimal", None),
+		1
+	);
+	assert!(
+		!rows.iter().any(
+			|row| row[0] == ScalarValue::Utf8(Some("galaxy_root".to_string()))
+				&& row[1] == ScalarValue::Utf8(Some("reordered".to_string()))
+		),
+		"already-optimal galaxy must not record reordered: {rows:?}"
+	);
+
+	let bridge_catalog = bridge_join_order_catalog();
+	let bridge_config = auto_broadcast_config(64 * 1024 * 1024);
+	let _ = bind(
+		&SqlPlanner::new()
+			.plan(bridge_chain_order_sql())
+			.expect("plan clean bridge"),
+		&bridge_catalog,
+		&bridge_config,
+	)
+	.await
+	.expect("bind clean bridge");
+	let bridge_rows = optimizer_decision_rows(&bridge_catalog, &bridge_config).await;
+	assert_eq!(
+		optimizer_decision_count(&bridge_rows, "bridge_root", "kept_optimal", None),
+		1
+	);
+}
+
 // ADR 198: after actuation the measured verdict judges the APPLIED (returns-rooted) order. With
 // `returns` measured cheaper than `sales`, the applied re-root is vindicated.
 #[tokio::test]

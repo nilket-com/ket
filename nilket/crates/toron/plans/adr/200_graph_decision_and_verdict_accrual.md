@@ -9,10 +9,14 @@ order arc's last telemetry gap: wire graph decisions + verdicts into that loop, 
 **unified graph actuator** that also pays down the duplication 199 left. Side-effect-only — plans and
 EXPLAIN receipts stay byte-identical.
 
-## Grounding (verified against the code)
+## Grounding (verified against the pre-200 code)
 
-- **The gap is exact.** `try_bind_galaxy_actuation` / `try_bind_bridge_actuation` contain **0** `accrue_*`
-  calls; `try_bind_star_order_actuation` contains **8**. Graph decisions never reach the decision log.
+This grounding describes the **pre-200** state that motivates the cut. D1 then unifies the two actuators
+named below into `try_bind_graph_actuation`, so post-implementation `try_bind_galaxy_actuation` /
+`try_bind_bridge_actuation` no longer exist (see the impl plan's as-built anchor table).
+
+- **The gap is exact.** Pre-200, `try_bind_galaxy_actuation` / `try_bind_bridge_actuation` contain **0**
+  `accrue_*` calls; `try_bind_star_order_actuation` contains **8**. Graph decisions never reach the log.
 - **The duplication 199 left.** The two actuators are ~87 lines and differ **only** in the function name
   and three references — `analyze_galaxy`/`analyze_bridge`, `galaxy_order_recommendation`/
   `bridge_order_recommendation`, `set_applied_galaxy_root`/`set_applied_bridge_root`. The scratch-bind,
