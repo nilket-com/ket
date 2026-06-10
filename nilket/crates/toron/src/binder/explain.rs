@@ -167,6 +167,16 @@ impl OptimizerExplainRenderTrace {
 		self.applied_bridge_chain_root = Some(root);
 	}
 
+	// ADR 206: the applied root of whichever graph shape actuated, partition-complete over the 3-way
+	// galaxy / bridge / chain partition. Exhaustive by construction — a new graph shape adds one arm here, so
+	// the `graph_actuated` boundary can never silently miss a shape (205's chain bug).
+	pub(super) fn applied_graph_root(&self) -> Option<&str> {
+		self.applied_galaxy_root
+			.as_deref()
+			.or(self.applied_bridge_root.as_deref())
+			.or(self.applied_bridge_chain_root.as_deref())
+	}
+
 	pub(super) fn set_star_receipt(&mut self, receipt: StarOrderRenderReceipt) {
 		self.join_order = JoinOrderRenderState::StarReceipts(vec![receipt]);
 	}
@@ -543,11 +553,10 @@ fn measured_verdicts_from_summaries(
 
 	// ADR 201: when a graph actuated, its re-rooted tree was bound on the no-op recorder, so the tree
 	// decisions were never accrued (ADR 200) — a tree verdict here would be an orphan with no matching
-	// decision. Galaxy and bridge are XOR shapes in the current binder, so this single gate is the right
-	// asymmetry discriminator: suppress tree verdicts for an actuated graph, but keep them for a kept
-	// graph (whose FROM tree really executed and whose tree decisions did accrue).
-	let graph_actuated =
-		render_trace.applied_galaxy_root.is_some() || render_trace.applied_bridge_root.is_some();
+	// decision. Suppress tree verdicts for an actuated graph, but keep them for a kept graph (whose FROM
+	// tree really executed and whose tree decisions did accrue). ADR 206: partition-complete over galaxy /
+	// bridge / chain — an actuated chain (205) leaked orphan tree verdicts under the old galaxy/bridge-only OR.
+	let graph_actuated = render_trace.applied_graph_root().is_some();
 
 	if !graph_actuated {
 		if let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order {
@@ -621,14 +630,19 @@ fn measured_verdicts_from_summaries(
 			}
 		}
 	}
-	// ADR 203: judge the recognized bridge chain's recommended path order against the measured per-hop
-	// fan-out. ADR 205: only for a NON-actuated (observed) chain — an actuated chain reversed its execution,
-	// whose measured costs key to reversed-plan targets the recognized (AST) evidence cannot supply, so the
-	// actuated-order verdict is deferred.
+	// ADR 203: judge the recognized bridge chain's path order against the measured per-hop fan-out. ADR 206:
+	// an ACTUATED chain reversed its execution, so judge the reversed (applied) order — `reverse_chain_
+	// evidence` re-keys the measured costs to the reversed plan's targets (the AST evidence stays on
+	// `render_trace` for the receipt label). A kept chain judges its AST order (204).
 	if let Some(chain) = &render_trace.bridge_chain_order {
-		if render_trace.applied_bridge_chain_root.is_none() {
-			if let Some(rec) = bridge_chain_order_recommendation(chain) {
-				if let Some(measured) = bridge_chain_measured_costs(chain, summaries) {
+		let judged = if render_trace.applied_bridge_chain_root.is_some() {
+			reverse_chain_evidence(chain, &render_trace.join_order_edges)
+		} else {
+			Some(chain.clone())
+		};
+		if let Some(chain) = judged {
+			if let Some(rec) = bridge_chain_order_recommendation(&chain) {
+				if let Some(measured) = bridge_chain_measured_costs(&chain, summaries) {
 					verdicts.push(MeasuredLevelVerdict {
 						kind: OptimizerDecisionKind::BridgeChainRoot,
 						verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
@@ -1220,12 +1234,17 @@ fn bridge_analyze_rows(
 		}
 	}
 	// ADR 203: the chain measured verdict — the compounded path scorer fed the measured per-hop fan-out.
-	// ADR 205: only for a NON-actuated (observed) chain (the actuated-order verdict is deferred; see
-	// `measured_verdicts_from_summaries`). Additive beside the per-junction bridge verdict above.
+	// ADR 206: an actuated chain judges the reversed (applied) order via `reverse_chain_evidence`; a kept
+	// chain judges its AST order. Additive beside the per-junction bridge verdict above.
 	if let Some(chain) = &render_trace.bridge_chain_order {
-		if render_trace.applied_bridge_chain_root.is_none() {
-			if let Some(rec) = bridge_chain_order_recommendation(chain) {
-				if let Some(measured) = bridge_chain_measured_costs(chain, summaries) {
+		let judged = if render_trace.applied_bridge_chain_root.is_some() {
+			reverse_chain_evidence(chain, &render_trace.join_order_edges)
+		} else {
+			Some(chain.clone())
+		};
+		if let Some(chain) = judged {
+			if let Some(rec) = bridge_chain_order_recommendation(&chain) {
+				if let Some(measured) = bridge_chain_measured_costs(&chain, summaries) {
 					rows.push(graph_order_verdict_row(&rec, &measured));
 				}
 			}

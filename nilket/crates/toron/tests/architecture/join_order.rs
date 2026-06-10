@@ -2263,6 +2263,45 @@ pub(crate) fn adr205_chain_actuation_is_binder_only() {
 	);
 }
 
+// ADR 206: the 201 `graph_actuated` boundary is partition-complete (galaxy / bridge / chain) via a single
+// exhaustive accessor — an actuated chain no longer leaks orphan tree verdicts.
+#[test]
+pub(crate) fn adr206_graph_actuated_is_partition_complete() {
+	let explain = source("src/binder/explain.rs");
+	let accessor = first_block(&explain, "pub(super) fn applied_graph_root");
+	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
+
+	// The accessor reads all three applied-root fields; the gate uses it (not a galaxy/bridge-only OR).
+	assert!(accessor.contains("applied_galaxy_root"));
+	assert!(accessor.contains("applied_bridge_root"));
+	assert!(accessor.contains("applied_bridge_chain_root"));
+	assert!(verdicts.contains("render_trace.applied_graph_root().is_some()"));
+	assert!(
+		!verdicts.contains("applied_galaxy_root.is_some() || render_trace.applied_bridge_root")
+	);
+}
+
+#[test]
+pub(crate) fn adr206_actuated_chain_verdict_uses_reversed_evidence() {
+	let join_order = source("src/binder/join_order.rs");
+	let explain = source("src/binder/explain.rs");
+	let reverse = first_block(&join_order, "pub(super) fn reverse_chain_evidence");
+
+	// The reversed evidence re-resolves targets against the reversed plan's edges by relation label.
+	assert!(join_order.contains("pub(super) fn reverse_chain_evidence"));
+	assert!(reverse.contains("reversed_edges"));
+	assert!(reverse.contains("incoming_target: incoming.target"));
+	assert!(reverse.contains("chain.hops.iter().rev()"));
+	// Both chain verdict arms judge the reversed order for an actuated chain.
+	assert_eq!(
+		explain
+			.matches("reverse_chain_evidence(chain, &render_trace.join_order_edges)")
+			.count(),
+		2,
+		"both the sampled verdict + the EXPLAIN ANALYZE row use reversed evidence when actuated"
+	);
+}
+
 #[test]
 pub(crate) fn adr203_chain_recognition_runs_at_bind_time() {
 	let binder = binder_source();
@@ -2284,9 +2323,10 @@ pub(crate) fn adr203_bridge_chain_verdict_reuses_graph_machinery() {
 	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
 
 	// The chain arm of the real 201 sampled-verdict seam reuses the shared graph scorer and measured-cost
-	// vocabulary — no bespoke `compute_join_order_verdicts`, which does not exist.
-	assert!(verdicts.contains("bridge_chain_order_recommendation(chain)"));
-	assert!(verdicts.contains("bridge_chain_measured_costs(chain, summaries)"));
+	// vocabulary — no bespoke `compute_join_order_verdicts`, which does not exist. (ADR 206: the arm judges
+	// an owned chain — the reversed evidence when actuated, else the AST clone.)
+	assert!(verdicts.contains("bridge_chain_order_recommendation(&chain)"));
+	assert!(verdicts.contains("bridge_chain_measured_costs(&chain, summaries)"));
 	assert!(verdicts.contains("measured_graph_order_verdict"));
 	assert!(verdicts.contains("OptimizerDecisionKind::BridgeChainRoot"));
 	assert!(!explain.contains("compute_join_order_verdicts"));

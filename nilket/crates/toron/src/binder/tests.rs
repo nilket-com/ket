@@ -14946,6 +14946,137 @@ async fn chain_verdict_log_has_no_partial_bridge_verdict() {
 	);
 }
 
+// ADR 206: an ACTUATED chain is now judged (205 deferred this). The selective chain reverses to drive from
+// `promotions`; under EXPLAIN ANALYZE its `BridgeChainRoot` verdict is emitted, keyed to the REVERSED plan's
+// measured costs (via `reverse_chain_evidence`), and is determinate. Must fail on `main` (205 suppresses it).
+#[tokio::test]
+async fn actuated_chain_verdict_vindicates_applied_root() {
+	let catalog = bridge_chain_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(selective_two_hop_bridge_chain_sql())
+		.expect("plan selective chain");
+	let binding =
+		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind selective chain analyze");
+	let observations = uniform_observations(&binding);
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure chain verdicts");
+	let chain_verdict = verdicts
+		.iter()
+		.find(|verdict| verdict.kind == OptimizerDecisionKind::BridgeChainRoot)
+		.expect("actuated chain accrues a bridge_chain_root verdict");
+	assert_ne!(
+		chain_verdict.verdict,
+		OptimizerRuntimeVerdictClass::Indeterminate,
+		"the actuated chain verdict keys to the reversed plan's measured costs: {verdicts:?}"
+	);
+}
+
+// ADR 206 D1: the partition-complete `graph_actuated` gate. An actuated chain suppresses its orphan tree
+// verdicts (its re-rooted FROM tree never accrued), emitting only its authoritative `BridgeChainRoot` — no
+// `SnowflakeRoot`/`SnowflakeBranch`, no partial `BridgeRoot`. Fails under the stale galaxy/bridge-only gate.
+#[tokio::test]
+async fn actuated_chain_emits_no_orphan_tree_verdict() {
+	let catalog = bridge_chain_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(selective_two_hop_bridge_chain_sql())
+		.expect("plan selective chain");
+	let binding =
+		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind selective chain analyze");
+	let observations = uniform_observations(&binding);
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure chain verdicts");
+	let kinds = verdict_kinds(&verdicts);
+	assert!(
+		kinds.contains(&OptimizerDecisionKind::BridgeChainRoot),
+		"an actuated chain emits its own verdict: {kinds:?}"
+	);
+	assert!(
+		!has_tree_verdict(&kinds),
+		"an actuated chain emits no orphan tree verdict: {kinds:?}"
+	);
+	assert!(
+		!kinds.contains(&OptimizerDecisionKind::BridgeRoot),
+		"an actuated chain emits no partial bridge verdict: {kinds:?}"
+	);
+}
+
+// ADR 206: the actuated chain verdict is built from REVERSED evidence whose targets resolve against the
+// REVERSED plan's executed joins (not the AST evidence's). Two checks: (1) every reversed-evidence target
+// is a real executed replay id (the re-matching is sound, not garbage), and (2) exploding the reversed
+// declared-end's entry faults the reversal — the verdict reads the reversed declared cost, so a broken
+// `reverse_chain_evidence` (unresolved targets → Indeterminate) fails this.
+#[tokio::test]
+async fn actuated_chain_verdict_uses_reversed_plan_targets() {
+	let catalog = bridge_chain_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(selective_two_hop_bridge_chain_sql())
+		.expect("plan selective chain");
+	let binding =
+		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind selective chain analyze");
+	let ast_chain = binding
+		.render_trace
+		.bridge_chain_order
+		.as_ref()
+		.expect("chain recognized");
+	let reversed = reverse_chain_evidence(ast_chain, &binding.render_trace.join_order_edges)
+		.expect("reversed evidence resolves against the reversed plan's edges");
+	// (1) every reversed target is a real executed join.
+	for hop in &reversed.hops {
+		for target in [hop.incoming_target, hop.outgoing_target] {
+			assert!(
+				binding
+					.replay_ids
+					.iter()
+					.any(|id| id.0 as usize == target.join_index),
+				"reversed target {target:?} must be an executed reversed-plan join: {:?}",
+				binding.replay_ids
+			);
+		}
+	}
+	// (2) exploding the reversed declared-end's entry faults the reversal (reads reversed declared cost).
+	let reversed_entry = reversed
+		.hops
+		.first()
+		.expect("reversed head")
+		.incoming_target
+		.join_index as u32;
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(3),
+			output_rows: if replay_id.0 == reversed_entry {
+				RowCount::new(10_000_000)
+			} else {
+				RowCount::new(3)
+			},
+		})
+		.collect::<Vec<_>>();
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure chain verdicts");
+	let chain_verdict = verdicts
+		.iter()
+		.find(|verdict| verdict.kind == OptimizerDecisionKind::BridgeChainRoot)
+		.expect("actuated chain verdict");
+	assert!(
+		matches!(
+			chain_verdict.verdict,
+			OptimizerRuntimeVerdictClass::MissedWin | OptimizerRuntimeVerdictClass::OverEager
+		),
+		"exploding the reversed declared-end faults the reversal: {:?}",
+		chain_verdict.verdict
+	);
+}
+
 // ADR 203 F1 lock: the middle hop is FOLDED into the compounded chain verdict, not ignored. Only the
 // middle hop `B1⋈B2` (`head.outgoing_target`) explodes (10M rows) while both entry hops stay small (10).
 // The declared `orders`-end's compounded cost is the PEAK over its measured path = the 10M middle, which

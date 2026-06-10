@@ -878,11 +878,15 @@ pub(crate) fn adr201_actuated_graph_suppresses_orphan_tree_verdict() {
 	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
 
 	// Tree verdicts are gated on the actuated-graph check (the no-op-rebind suppressed their decisions),
-	// so an actuated graph emits no orphan tree verdict.
+	// so an actuated graph emits no orphan tree verdict. ADR 206: the check is partition-complete via the
+	// `applied_graph_root()` accessor (galaxy / bridge / chain), so an actuated chain is suppressed too.
+	let accessor = first_block(&explain, "pub(super) fn applied_graph_root");
 	assert!(verdicts.contains("let graph_actuated"));
-	assert!(verdicts.contains("render_trace.applied_galaxy_root.is_some()"));
-	assert!(verdicts.contains("render_trace.applied_bridge_root.is_some()"));
+	assert!(verdicts.contains("render_trace.applied_graph_root().is_some()"));
 	assert!(verdicts.contains("if !graph_actuated"));
+	assert!(accessor.contains("applied_galaxy_root"));
+	assert!(accessor.contains("applied_bridge_root"));
+	assert!(accessor.contains("applied_bridge_chain_root"));
 }
 
 #[test]

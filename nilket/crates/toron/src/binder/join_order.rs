@@ -767,6 +767,50 @@ pub(super) fn reverse_bridge_chain_join_tree(
 	})
 }
 
+// ADR 206: build the REVERSED chain evidence for an actuated chain's verdict. The reversed plan does not
+// re-recognize (`analyze_bridge_chain` declines — interior junctions fail inverse-F1 in reverse), so we
+// reverse the recognized AST `chain` structurally (reverse hop order, swap each hop's `fact↔dim` +
+// `in↔out` signature) and re-resolve `incoming_target`/`outgoing_target` + edge-row estimates against the
+// REVERSED plan's `reversed_edges` (matched by relation label), so the verdict keys its measured costs to
+// the joins that actually ran. `None` if any reversed edge can't be matched. Used only for the verdict —
+// the receipt keeps the AST evidence so the `chain[F->…->D]` path label is unchanged.
+pub(super) fn reverse_chain_evidence(
+	chain: &BridgeChainEvidence,
+	reversed_edges: &[JoinOrderEdgeEvidence],
+) -> Option<BridgeChainEvidence> {
+	let edge_between = |a: &str, b: &str| -> Option<&JoinOrderEdgeEvidence> {
+		reversed_edges.iter().find(|edge| {
+			match (edge.probe.as_deref(), edge.dimension.as_deref()) {
+				(Some(p), Some(d)) => (p == a && d == b) || (p == b && d == a),
+				_ => false,
+			}
+		})
+	};
+	let mut hops = Vec::with_capacity(chain.hops.len());
+	for ast in chain.hops.iter().rev() {
+		// Reversed direction: the AST `dim` is now the fact end, the AST `fact` is now the dim end.
+		let fact = ast.dim.clone();
+		let bridge = ast.bridge.clone();
+		let dim = ast.fact.clone();
+		let incoming = edge_between(&fact, &bridge)?;
+		let outgoing = edge_between(&bridge, &dim)?;
+		hops.push(BridgeLink {
+			fact,
+			bridge,
+			dim,
+			b_in_signature: ast.b_out_signature.clone(),
+			b_out_signature: ast.b_in_signature.clone(),
+			bridge_rows: ast.bridge_rows,
+			fact_rows: ast.fact_rows,
+			incoming_edge_rows: incoming.estimated_rows,
+			outgoing_edge_rows: outgoing.estimated_rows,
+			incoming_target: incoming.target,
+			outgoing_target: outgoing.target,
+		});
+	}
+	Some(BridgeChainEvidence { hops })
+}
+
 fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 	match plan {
 		LogicalPlan::Join { .. } => true,
