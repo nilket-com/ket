@@ -2937,6 +2937,165 @@ mod tests {
 		);
 	}
 
+	// ADR 202: a 3-fact galaxy — sales/returns/shipments all conformed on `product`. `shipments` is the
+	// smallest fact (cost-optimal root); the FROM root `sales` is the largest. Used to prove the n-fact
+	// re-root fragments + digest-matches before any actuation code exists (Phase 0 gate).
+	fn three_fact_galaxy_exec_catalog() -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		let fact_descriptor = |id: u8, name: &str| {
+			named_descriptor(
+				id,
+				name,
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+				]),
+			)
+		};
+		catalog
+			.register_descriptor(TableId(1), fact_descriptor(1, "sales"))
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"product",
+					Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(TableId(3), fact_descriptor(3, "returns"))
+			.unwrap();
+		catalog
+			.register_descriptor(TableId(4), fact_descriptor(4, "shipments"))
+			.unwrap();
+		for (table, bytes, rows, ndv) in [
+			(
+				"sales",
+				64 * 1024 * 1024_u64,
+				100_000_u64,
+				vec![(1, 100_u64)],
+			),
+			("product", 512_u64, 100_u64, vec![(0, 100_u64)]),
+			("returns", 8_192_u64, 5_000_u64, vec![(1, 100_u64)]),
+			("shipments", 2_048_u64, 1_000_u64, vec![(1, 100_u64)]),
+		] {
+			catalog
+				.seed_optimizer_facts(
+					&crate::catalog::TableRef::new(table),
+					TableOptimizerFacts {
+						byte_upper_bound: Some(ByteCount::new(bytes)),
+						row_upper_bound: Some(RowCount::new(rows)),
+						column_ndv: ndv
+							.into_iter()
+							.map(|(col, distinct)| {
+								(ColumnOrdinal(col), DistinctCountFact::Exact(distinct))
+							})
+							.collect(),
+						column_range: Default::default(),
+						column_range_distributions: Default::default(),
+						column_heavy_hitters: Default::default(),
+						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
+					},
+				)
+				.expect("seed 3-fact galaxy facts");
+		}
+		Arc::new(catalog)
+	}
+
+	fn three_fact_galaxy_exec_storage() -> Arc<MultiTableStorageScan> {
+		let two_col = |ids: Vec<i64>, product_ids: Vec<i64>| {
+			RecordBatch::try_new(
+				Arc::new(Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+				])),
+				vec![
+					Arc::new(Int64Array::from(ids)),
+					Arc::new(Int64Array::from(product_ids)),
+				],
+			)
+			.unwrap()
+		};
+		let product = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+		)
+		.unwrap();
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([
+				(
+					TableId(1),
+					two_col(vec![1000, 1001, 1002, 1003], vec![1, 2, 1, 3]),
+				),
+				(TableId(2), product),
+				(TableId(3), two_col(vec![1, 2, 3], vec![1, 2, 3])),
+				(TableId(4), two_col(vec![1, 2, 3], vec![1, 2, 3])),
+			]),
+		})
+	}
+
+	// ADR 202 Phase 0 (THE GATE): the hand-written re-rooted 3-fact galaxy (`FROM shipments …`, the
+	// cost-optimal root, projecting the AST column order) executes distributed and digest-matches the
+	// AST-order baseline (`FROM sales …`). This proves the n-fact re-root is correct + fragmentable as a
+	// deeper snowflake before any actuation code — if it fails, ADR 202 is a fragmenter cut.
+	#[tokio::test]
+	async fn three_fact_galaxy_reroot_digest_matches_ast_order_distributed() {
+		let ast = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT sales.id, product.id, returns.id, shipments.id FROM sales \
+				 INNER JOIN product ON sales.product_id = product.id \
+				 INNER JOIN returns ON returns.product_id = product.id \
+				 INNER JOIN shipments ON shipments.product_id = product.id",
+			)
+			.expect("plan AST-order 3-fact galaxy");
+		// Re-rooted FROM (shipments-first), remaining facts in original order, SAME projection.
+		let rerooted = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT sales.id, product.id, returns.id, shipments.id FROM shipments \
+				 INNER JOIN product ON shipments.product_id = product.id \
+				 INNER JOIN sales ON sales.product_id = product.id \
+				 INNER JOIN returns ON returns.product_id = product.id",
+			)
+			.expect("plan re-rooted 3-fact galaxy");
+
+		let ast_result =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				ast,
+				three_fact_galaxy_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				three_fact_galaxy_exec_storage(),
+			)
+			.await
+			.expect("execute AST-order 3-fact galaxy");
+		let rerooted_result =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				rerooted,
+				three_fact_galaxy_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				three_fact_galaxy_exec_storage(),
+			)
+			.await
+			.expect("execute re-rooted 3-fact galaxy");
+
+		assert!(
+			!ast_result.results.is_empty(),
+			"3-fact galaxy produced rows"
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&rerooted_result.results, SortPolicy::FullRowLex)
+				.expect("re-rooted digest"),
+			canonical_arrow_ipc_digest(&ast_result.results, SortPolicy::FullRowLex)
+				.expect("AST digest"),
+			"re-rooted 3-fact galaxy must digest-match the AST-order baseline"
+		);
+	}
+
 	// ADR 199 bridge actuation fixture: `orders` (F) — `order_items` (B, the M:N junction that fans
 	// out) — `products` (D). Catalog facts make `order_items` larger than `orders` so the inverse-F1
 	// recognizer (196) classifies it as a bridge; storage is FK-complete so the AST and re-rooted join

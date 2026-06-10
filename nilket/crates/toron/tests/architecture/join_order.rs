@@ -2056,17 +2056,60 @@ pub(crate) fn adr197_graph_order_is_binder_only() {
 	);
 }
 
+// ADR 202 retargets the 198 bound: the re-root now handles a left-deep conformed-galaxy chain of any n
+// (the 2-fact galaxy / 3-relation bridge are the n=2 instance), but only that — a left-deep all-leaf
+// inner-join chain on the single conformed `pivot`. Any other shape returns `None` → decline. Still no
+// general permutation / search / memo.
 #[test]
-pub(crate) fn adr198_galaxy_reroot_is_bounded_two_fact() {
+pub(crate) fn adr202_galaxy_reroot_is_bounded_n_fact() {
 	let join_order = source("src/binder/join_order.rs");
 	let reroot = first_block(&join_order, "pub(super) fn reroot_galaxy_join_tree");
 
-	// The re-root handles only the exact 2-fact galaxy shape (two nested inner joins over leaf
-	// relations); any other shape returns `None` → decline, AST order. No general permutation / memo.
 	assert!(reroot.contains("JoinKind::Inner"));
 	assert!(reroot.contains("logical_plan_contains_join"));
 	assert!(reroot.contains("return None"));
+	assert!(reroot.contains("pivot"));
+	assert!(reroot.contains("preferred_root"));
 	assert!(!join_order.contains("Cascades"));
+	assert!(!join_order.contains("fn memo"));
+}
+
+#[test]
+pub(crate) fn adr202_n_fact_reroot_reuses_gated_seam() {
+	let join_order = source("src/binder/join_order.rs");
+	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
+
+	// The generalized re-root is driven by the existing gated actuator with the recommendation's
+	// pivot + preferred_root — no new actuator, decision kind, or verdict surface.
+	assert!(actuation.contains("reroot_galaxy_join_tree("));
+	assert!(actuation.contains("recommendation.pivot"));
+	assert!(actuation.contains("recommendation.preferred_root"));
+}
+
+#[test]
+pub(crate) fn adr202_galaxy_actuation_is_binder_only() {
+	let manifest = manifest_dir();
+	let markers = ["reroot_galaxy_join_tree", "galaxy_leaf_label"];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/distributed/fragment.rs"),
+		manifest.join("src/exec.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR202 galaxy re-root leaked outside the binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
 }
 
 // ADR 200 retargets the 198/199 per-shape actuation guards onto the unified `try_bind_graph_actuation`.

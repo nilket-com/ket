@@ -14317,6 +14317,202 @@ fn galaxy_conformed_order_sql() -> &'static str {
 	 JOIN returns ON returns.product_id = product.id"
 }
 
+// ADR 202: a 3-fact galaxy — sales / returns / shipments all conformed on `product`. `shipments` (1k) is
+// the smallest fact (cost-optimal root); the FROM root `sales` (100k) is the largest.
+fn three_fact_galaxy_join_order_catalog() -> MockCatalog {
+	let mut catalog = galaxy_join_order_catalog();
+	catalog
+		.register_descriptor(
+			TableId(44),
+			named_descriptor(
+				44,
+				"shipments",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register galaxy shipments");
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"shipments",
+		Some(2_048),
+		Some(1_000),
+		vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+	);
+	catalog
+}
+
+fn three_fact_galaxy_conformed_order_sql() -> &'static str {
+	"SELECT sales.id, product.id, returns.id, shipments.id FROM sales \
+	 JOIN product ON sales.product_id = product.id \
+	 JOIN returns ON returns.product_id = product.id \
+	 JOIN shipments ON shipments.product_id = product.id"
+}
+
+fn three_fact_galaxy_optimal_order_sql() -> &'static str {
+	"SELECT sales.id, product.id, returns.id, shipments.id FROM shipments \
+	 JOIN product ON shipments.product_id = product.id \
+	 JOIN sales ON sales.product_id = product.id \
+	 JOIN returns ON returns.product_id = product.id"
+}
+
+// ADR 202 headline (binder): the 3-fact galaxy actuates — the actuator re-roots the FROM-`sales` order to
+// the cost-optimal `shipments`, emitting `action=reordered; applied_root=shipments`. Fails on `main`
+// (the 2-fact-only re-root declines an n>2 chain → observe-only).
+#[tokio::test]
+async fn three_fact_galaxy_reroots_to_cheapest_root() {
+	let catalog = three_fact_galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!(
+			"EXPLAIN {}",
+			three_fact_galaxy_conformed_order_sql()
+		))
+		.expect("plan 3-fact galaxy EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let galaxy_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("galaxy row");
+	assert_eq!(
+		galaxy_row[2],
+		ScalarValue::Utf8(Some("reordered".to_string()))
+	);
+	assert_utf8_contains(&galaxy_row[3], "action=reordered");
+	assert_utf8_contains(&galaxy_row[3], "applied_root=shipments");
+}
+
+// ADR 202 discriminator: the same 3-fact galaxy written FROM the cheapest fact (`shipments`) is kept —
+// proving the generalized re-root decides from cost, not a constant, and the already-optimal path holds.
+#[tokio::test]
+async fn three_fact_galaxy_already_optimal_kept() {
+	let catalog = three_fact_galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!(
+			"EXPLAIN {}",
+			three_fact_galaxy_optimal_order_sql()
+		))
+		.expect("plan optimal 3-fact galaxy EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(4_096)).await;
+	let galaxy_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("galaxy row");
+	assert_utf8_contains(&galaxy_row[3], "action=kept_already_optimal");
+}
+
+// ADR 202: an n-fact galaxy reorder accrues a `galaxy_root` reordered decision through the unchanged
+// 200/201 telemetry path — no new decision kind.
+#[tokio::test]
+async fn three_fact_galaxy_accrues_galaxy_root_reorder() {
+	let catalog = three_fact_galaxy_join_order_catalog();
+	let config = auto_broadcast_config(4_096);
+	let _ = bind(
+		&SqlPlanner::new()
+			.plan(three_fact_galaxy_conformed_order_sql())
+			.expect("plan 3-fact galaxy"),
+		&catalog,
+		&config,
+	)
+	.await
+	.expect("bind 3-fact galaxy");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+	assert_eq!(
+		optimizer_decision_count(&rows, "galaxy_root", "reordered", None),
+		1
+	);
+}
+
+// ADR 202 (F1 regression): the generalized re-root must carry each fact's join `strategy_intent` with
+// the fact, not the rebuilt position. Here the `returns` join is pinned Broadcast; the rest are Auto.
+// Re-rooting to `shipments` (a non-leftmost fact) must leave the pin on `returns`'s edge — under a
+// position-indexed rebuild it shifts onto `sales`. (`choose_join_strategy` / broadcast eligibility
+// branch on `strategy_intent`, so a shifted pin replans a different join physically.)
+#[test]
+fn n_fact_galaxy_reroot_carries_strategy_intent_by_fact() {
+	let scan = |name: &str| LogicalPlan::ScanNamed {
+		table: TableRef::new(name),
+		projection: None,
+	};
+	let pinned = JoinStrategyIntent::Pinned {
+		strategy: JoinStrategy::Broadcast,
+		source: JoinStrategyPinSource::Direct,
+	};
+	// `((sales ⋈ product) ⋈ returns[pinned]) ⋈ shipments`, all conformed on `product`.
+	let inner = LogicalPlan::Join {
+		left: Box::new(scan("sales")),
+		right: Box::new(scan("product")),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("sales"), "product_id"),
+			Expr::qualified_column(TableRef::new("product"), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let with_returns = LogicalPlan::Join {
+		left: Box::new(inner),
+		right: Box::new(scan("returns")),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("product"), "id"),
+			Expr::qualified_column(TableRef::new("returns"), "product_id"),
+		)],
+		strategy_intent: pinned.clone(),
+	};
+	let galaxy = LogicalPlan::Join {
+		left: Box::new(with_returns),
+		right: Box::new(scan("shipments")),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("product"), "id"),
+			Expr::qualified_column(TableRef::new("shipments"), "product_id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+
+	let rerooted =
+		reroot_galaxy_join_tree(&galaxy, "product", "shipments").expect("3-fact galaxy re-roots");
+
+	// Collect each fact's edge intent: the right leaf of every non-base join, and the left leaf of the
+	// base join (`Join(Fk, D)`).
+	let leaf_name = |plan: &LogicalPlan| match plan {
+		LogicalPlan::ScanNamed { table, .. } => table.table.clone(),
+		_ => panic!("expected a leaf scan"),
+	};
+	let mut by_fact: std::collections::BTreeMap<String, JoinStrategyIntent> = Default::default();
+	let mut node = &rerooted;
+	loop {
+		let LogicalPlan::Join {
+			left,
+			right,
+			strategy_intent,
+			..
+		} = node
+		else {
+			panic!("expected a join chain");
+		};
+		if matches!(left.as_ref(), LogicalPlan::Join { .. }) {
+			by_fact.insert(leaf_name(right), strategy_intent.clone());
+			node = left.as_ref();
+		} else {
+			// base `Join(Fk, D)` — the fact is the left leaf.
+			by_fact.insert(leaf_name(left), strategy_intent.clone());
+			break;
+		}
+	}
+
+	assert_eq!(
+		by_fact.get("returns"),
+		Some(&pinned),
+		"the pin must stay on the returns edge: {by_fact:?}"
+	);
+	assert_eq!(by_fact.get("sales"), Some(&JoinStrategyIntent::Auto));
+	assert_eq!(by_fact.get("shipments"), Some(&JoinStrategyIntent::Auto));
+}
+
 // ADR 197: the same galaxy graph with `returns` written first in FROM. Now the FROM root (`returns`,
 // the smaller fact-to-`product` join) IS the cost-optimal root → `kept_already_optimal`.
 fn galaxy_optimal_order_sql() -> &'static str {

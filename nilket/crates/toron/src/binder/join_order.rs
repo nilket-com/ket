@@ -576,61 +576,121 @@ pub(super) fn extract_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoin
 	})
 }
 
-// ADR 198: re-root a 2-fact galaxy `Join(Join(F1, D), F2)` to `Join(Join(F2, D), F1)` by inner-join
-// reassociation — promoting the trailing fact `F2` to the root. Semantically safe (inner joins are
-// commutative/associative); the `on` column refs are logical (re-resolved at bind time), so swapping
-// the pair sides keeps each condition valid in its new position. Returns `None` for any shape that is
-// not the exact 2-fact galaxy (two nested inner joins over leaf relations) → decline, AST order.
-pub(super) fn reroot_galaxy_join_tree(plan: &LogicalPlan) -> Option<LogicalPlan> {
-	let LogicalPlan::Join {
-		left: outer_left,
-		right: f2,
-		kind: outer_kind,
-		on: outer_on,
-		strategy_intent: outer_intent,
-	} = plan
-	else {
-		return None;
-	};
-	if *outer_kind != JoinKind::Inner || logical_plan_contains_join(f2) {
+// The relation label of a galaxy leaf (a `FROM`-clause scan, possibly aliased, and possibly wrapped in a
+// pushed `Filter`/`Project` — e.g. a selective-dimension bridge re-root). Recurse through the
+// volume-preserving wrappers to the relation, but stop at an `Alias` (it renames the relation). `None`
+// for a non-leaf or unnameable node → the re-root declines.
+fn galaxy_leaf_label(plan: &LogicalPlan) -> Option<String> {
+	match plan {
+		LogicalPlan::ScanNamed { table, .. } => Some(relation_key_label(table)),
+		LogicalPlan::Alias { alias, .. } => Some(relation_key_label(alias)),
+		LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+			galaxy_leaf_label(input)
+		}
+		_ => None,
+	}
+}
+
+// ADR 198/202: re-root a left-deep conformed galaxy chain `Join(Join(…Join(F1,D),F2)…,Fn)` to lead with
+// `preferred_root` (the cost-optimal fact), keeping the conformed dimension `D = pivot` as the pivot.
+// Every fact joins only `D`, so the chain reassociates: collect each fact leaf with its canonical
+// `(fact_key, dim_key)` join condition (and each join's kind/strategy by position), then rebuild
+// left-deep with the preferred fact as the base driver — each `on` re-oriented for its new left/right
+// position (the column refs are logical and re-resolved at bind, as in 198). The 2-fact galaxy and the
+// 3-relation bridge are the `n=2` instance and produce byte-identical output. Returns `None` for any
+// shape that is not a left-deep all-leaf inner-join chain on `pivot` → decline, AST order.
+pub(super) fn reroot_galaxy_join_tree(
+	plan: &LogicalPlan,
+	pivot: &str,
+	preferred_root: &str,
+) -> Option<LogicalPlan> {
+	// Walk the chain outermost → innermost. Each outer `Join(composite, Fi)` contributes the fact `Fi`
+	// (D sits in the left composite, so canonical `(fact, dim) = (on.right, on.left)`); the innermost
+	// `Join(F1, D)` contributes the base fact `F1` (`(on.left, on.right)`) and the dimension `D`.
+	let mut fact_leaves: Vec<LogicalPlan> = Vec::new();
+	let mut fact_on: Vec<Vec<(Expr, Expr)>> = Vec::new();
+	let mut join_meta: Vec<(JoinKind, JoinStrategyIntent)> = Vec::new();
+	let mut node = plan;
+	let dim_leaf;
+	loop {
+		let LogicalPlan::Join {
+			left,
+			right,
+			kind,
+			on,
+			strategy_intent,
+		} = node
+		else {
+			return None;
+		};
+		if *kind != JoinKind::Inner || logical_plan_contains_join(right) {
+			return None;
+		}
+		join_meta.push((*kind, *strategy_intent));
+		if matches!(left.as_ref(), LogicalPlan::Join { .. }) {
+			fact_leaves.push((**right).clone());
+			fact_on.push(
+				on.iter()
+					.map(|(left, right)| (right.clone(), left.clone()))
+					.collect(),
+			);
+			node = left.as_ref();
+		} else {
+			if logical_plan_contains_join(left) {
+				return None;
+			}
+			fact_leaves.push((**left).clone());
+			fact_on.push(
+				on.iter()
+					.map(|(left, right)| (left.clone(), right.clone()))
+					.collect(),
+			);
+			dim_leaf = (**right).clone();
+			break;
+		}
+	}
+	// The conformed dimension must be the recommended pivot.
+	if galaxy_leaf_label(&dim_leaf).as_deref() != Some(pivot) {
 		return None;
 	}
-	let LogicalPlan::Join {
-		left: f1,
-		right: dim,
-		kind: inner_kind,
-		on: inner_on,
-		strategy_intent: inner_intent,
-	} = outer_left.as_ref()
-	else {
-		return None;
+	// Reverse to innermost-first (FROM order); join_meta is positional (innermost join first).
+	fact_leaves.reverse();
+	fact_on.reverse();
+	join_meta.reverse();
+	// Order: preferred root first, then the remaining facts in their FROM order.
+	let preferred_index = fact_leaves
+		.iter()
+		.position(|leaf| galaxy_leaf_label(leaf).as_deref() == Some(preferred_root))?;
+	let mut order = Vec::with_capacity(fact_leaves.len());
+	order.push(preferred_index);
+	order.extend((0..fact_leaves.len()).filter(|&i| i != preferred_index));
+	// Rebuild left-deep. Each join's kind/strategy travels with the fact whose original join step it
+	// belonged to (`join_meta[idx]`, aligned with `fact_leaves[idx]`), NOT the rebuilt position — so a
+	// pinned/mixed `strategy_intent` stays on its own fact edge after the re-root.
+	let base_idx = order[0];
+	let (base_kind, base_intent) = join_meta[base_idx];
+	let mut composite = LogicalPlan::Join {
+		left: Box::new(fact_leaves[base_idx].clone()),
+		right: Box::new(dim_leaf.clone()),
+		kind: base_kind,
+		on: fact_on[base_idx].clone(),
+		strategy_intent: base_intent,
 	};
-	if *inner_kind != JoinKind::Inner
-		|| logical_plan_contains_join(f1)
-		|| logical_plan_contains_join(dim)
-	{
-		return None;
+	for &idx in order.iter().skip(1) {
+		let (kind, intent) = join_meta[idx];
+		composite = LogicalPlan::Join {
+			left: Box::new(composite),
+			right: Box::new(fact_leaves[idx].clone()),
+			kind,
+			// D now sits in the left composite, so the fact joins from the right: `(dim, fact)`.
+			on: fact_on[idx]
+				.iter()
+				.map(|(fact, dim)| (dim.clone(), fact.clone()))
+				.collect(),
+			strategy_intent: intent,
+		};
 	}
-	let new_inner = LogicalPlan::Join {
-		left: f2.clone(),
-		right: dim.clone(),
-		kind: *inner_kind,
-		on: outer_on
-			.iter()
-			.map(|(left, right)| (right.clone(), left.clone()))
-			.collect(),
-		strategy_intent: *inner_intent,
-	};
-	Some(LogicalPlan::Join {
-		left: Box::new(new_inner),
-		right: f1.clone(),
-		kind: *outer_kind,
-		on: inner_on
-			.iter()
-			.map(|(left, right)| (right.clone(), left.clone()))
-			.collect(),
-		strategy_intent: *outer_intent,
-	})
+	Some(composite)
 }
 
 fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
@@ -2188,7 +2248,9 @@ impl<'a> Binder<'a> {
 		// no-op-recorder binder: the committed graph decision is accrued once by the caller, so the
 		// re-rooted plan's own re-recognition (a phantom `KeptAlreadyOptimal`) is discarded. Plan and
 		// render are unaffected — only the decision sink differs.
-		let Some(rerooted) = reroot_galaxy_join_tree(plan) else {
+		let Some(rerooted) =
+			reroot_galaxy_join_tree(plan, &recommendation.pivot, &recommendation.preferred_root)
+		else {
 			return Ok(GraphActuationResult::Declined(
 				OptimizerDecisionDeclineReason::MissingEstimate,
 			));
