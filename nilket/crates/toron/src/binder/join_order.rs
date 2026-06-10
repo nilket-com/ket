@@ -1405,8 +1405,15 @@ pub(super) fn analyze_bridge(
 	}
 }
 
-// ADR 203: a recognized 2-hop bridge chain `F ⋈ B1 ⋈ B2 ⋈ D` — the ordered path as its constituent
-// bridge links (`hops[0] = F→B1→B2`, `hops[1] = B1→B2→D`). Sibling of `BridgeOrderEvidence`; observe-only.
+// ADR 204: the supported breadth for the bounded chain recognizer — the cut vouches for the compounded
+// cost model only this deep, declining deeper chains rather than emitting an unvalidated verdict. This does
+// NOT make the walk finite: the walk consumes distinct relations and declines on repeats, so it is
+// intrinsically `O(links)`. The cap is the claim boundary, not the termination bound.
+const MAX_BRIDGE_CHAIN_HOPS: usize = 4;
+
+// ADR 203/204: a recognized bounded N-hop bridge chain `F ⋈ B1 ⋈ … ⋈ Bk ⋈ D` — the ordered path as its
+// constituent bridge links (`hops[0] = F→B1→B2`, …, `hops[k-1] = B_{k-1}→Bk→D`). Sibling of
+// `BridgeOrderEvidence`; observe-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BridgeChainEvidence {
 	pub(super) hops: Vec<BridgeLink>,
@@ -1424,32 +1431,54 @@ pub(super) fn analyze_bridge_chain(
 	decisions: &[DecisionReceipt],
 ) -> Option<BridgeChainEvidence> {
 	let links = analyze_bridge(edges, decisions)?.links;
-	// Bounded to exactly two junctions (one 2-hop chain).
-	if links.len() != 2 {
+	// Bounded: at least two junctions (a single junction is a 199 bridge), at most the supported breadth.
+	if links.len() < 2 || links.len() > MAX_BRIDGE_CHAIN_HOPS {
 		return None;
 	}
+	// Index links by their probed `fact` for O(1) successor lookup. A reused `fact` is a branch → decline.
+	let mut by_fact: BTreeMap<&str, usize> = BTreeMap::new();
+	for (i, link) in links.iter().enumerate() {
+		if by_fact.insert(link.fact.as_str(), i).is_some() {
+			return None;
+		}
+	}
+	// The head is the unique link whose `fact` is no junction's `bridge` (the free fact end `F`).
 	let bridges: BTreeSet<&str> = links.iter().map(|link| link.bridge.as_str()).collect();
-	// Exactly one head: the link whose fact is not any junction's bridge.
 	let mut head_indices = (0..links.len()).filter(|&i| !bridges.contains(links[i].fact.as_str()));
 	let head_idx = head_indices.next()?;
 	if head_indices.next().is_some() {
 		return None;
 	}
-	let head = &links[head_idx];
-	let next = &links[1 - head_idx];
-	// The path must stitch (`next.fact == head.bridge`) and be contiguous (`head.dim == next.bridge`).
-	if next.fact != head.bridge || head.dim != next.bridge {
+	// Walk the single connected path from the head, stitching `next.fact == current.bridge` (guaranteed by
+	// the `by_fact` lookup) and contiguous via `current.dim == next.bridge`, until no successor. The walk
+	// must consume EVERY link — a leftover is a disconnected second component (a chain co-occurring with an
+	// unrelated bridge) and declines. Termination is structural: relations are distinct, so it cannot loop.
+	let mut order = vec![head_idx];
+	let mut current = &links[head_idx];
+	while let Some(&next_idx) = by_fact.get(current.bridge.as_str()) {
+		let next = &links[next_idx];
+		if current.dim != next.bridge {
+			return None;
+		}
+		order.push(next_idx);
+		current = next;
+	}
+	if order.len() != links.len() {
 		return None;
 	}
-	// Four distinct relations: F, B1, B2, D.
-	let path: BTreeSet<&String> = [&head.fact, &head.bridge, &next.bridge, &next.dim]
-		.into_iter()
-		.collect();
-	if path.len() != 4 {
+	// All `k + 2` relations distinct (no cycle): the head fact, every bridge, the tail dim.
+	let tail = &links[*order.last()?];
+	let mut relations: BTreeSet<&str> = BTreeSet::new();
+	relations.insert(links[head_idx].fact.as_str());
+	relations.insert(tail.dim.as_str());
+	for &i in &order {
+		relations.insert(links[i].bridge.as_str());
+	}
+	if relations.len() != order.len() + 2 {
 		return None;
 	}
 	Some(BridgeChainEvidence {
-		hops: vec![head.clone(), next.clone()],
+		hops: order.iter().map(|&i| links[i].clone()).collect(),
 	})
 }
 

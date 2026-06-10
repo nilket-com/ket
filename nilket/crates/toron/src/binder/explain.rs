@@ -1008,23 +1008,23 @@ fn bridge_measured_costs(
 	])
 }
 
-// ADR 203: the bridge chain *compounded* measured costs — the path verdict, not an endcap verdict.
+// ADR 203/204: the bridge chain *compounded* measured costs — the path verdict, not an endcap verdict.
 //
 // The recommendation is a cheap entry-hop direction heuristic (drive from the cheaper end), deliberately
-// BLIND to the middle hop `B1⋈B2` — which is the common term that does not discriminate direction. The
-// verdict's whole job (D3) is to falsify that heuristic against realized cost, so it must fold the middle
-// in: the heuristic's blind spot is exactly where a chain explodes.
+// BLIND to the inter-bridge middles — the common terms that do not discriminate direction. The verdict's
+// whole job (D3) is to falsify that heuristic against realized cost, so it folds EVERY middle in: the
+// heuristic's blind spot is exactly where a chain explodes, and at N hops the explosion can sit in any
+// interior middle, not just the head's.
 //
-// The declared `F`-end RAN (the AST left-deep order drives from `F`), so its compounded cost is the PEAK
-// materialization along the executed path — the entry hop `F⋈B1` (`head.incoming_target`) and the middle
-// hop `F⋈B1⋈B2` (`head.outgoing_target`), both MEASURED. A middle that explodes past its estimate lifts
-// this peak above the counterfactual and flips the verdict to `MissedWin` — which an endcap-only cost
-// (entry alone) would miss. Both must be measured: a chain cannot be judged without its middle.
-//
-// The `D`-end did NOT run (`D` joins last; there is no standalone `B2⋈D` to measure), so its compounded
-// cost is the ESTIMATED peak of the `B2⋈D` entry (`tail.outgoing_edge_rows`) and the `B1⋈B2` middle
-// (`head.outgoing_edge_rows`) — the un-run alternative, mirroring the single-bridge measured-vs-estimated
-// comparison in `bridge_measured_costs`. `None` when the chain has no hops.
+// The verdict stays a 2-way `F`-vs-`D` decision: this returns exactly TWO labelled costs for any N — the
+// middles compound into the two end costs, never into new ends. The declared `F`-end RAN (the AST left-deep
+// order drives from `F`), so its cost is the PEAK over the measured `F`-entry (`head.incoming_target`) and
+// every measured inter-bridge middle (each non-tail hop's `outgoing_target`). A measured explosion in ANY
+// interior middle lifts this peak above the counterfactual → `MissedWin`, which an endcap (or head-only)
+// cost would miss. The `D`-end did NOT run, so its cost is the ESTIMATED peak over the `D`-entry
+// (`tail.outgoing_edge_rows`) and every estimated middle — the single-bridge measured-vs-estimated shape of
+// `bridge_measured_costs`. `peak_all` is `None` if any term is unmeasured (no judging a chain without all
+// its middles). `None` when the chain has no hops.
 fn bridge_chain_measured_costs(
 	chain: &BridgeChainEvidence,
 	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
@@ -1038,23 +1038,24 @@ fn bridge_chain_measured_costs(
 			.map(|summary| u128::from(summary.output_rows.get()))
 	};
 	let estimated = |rows: Option<RowCount>| rows.map(|rows| u128::from(rows.get()));
-	let peak = |entry: Option<u128>, middle: Option<u128>| match (entry, middle) {
-		(Some(entry), Some(middle)) => Some(entry.max(middle)),
-		_ => None,
+	// Fold entry + all middles to the largest materialization (`max`, the 203 combinator); `None` if any
+	// term is unmeasured.
+	let peak_all = |terms: &[Option<u128>]| -> Option<u128> {
+		terms
+			.iter()
+			.copied()
+			.try_fold(0u128, |acc, term| Some(acc.max(term?)))
 	};
-	// Declared end (ran): measured entry compounded with the measured middle.
-	let fact_compound = peak(
-		measured(head.incoming_target),
-		measured(head.outgoing_target),
-	);
-	// Counterfactual end (un-run): estimated entry compounded with the estimated middle.
-	let dim_compound = peak(
-		estimated(tail.outgoing_edge_rows),
-		estimated(head.outgoing_edge_rows),
-	);
+	// The inter-bridge middles are every NON-TAIL hop's outgoing edge (`Bi⋈B_{i+1}`); the tail's outgoing is
+	// the `D`-entry. `hops.len() >= 2` is guaranteed by the recognizer, so `middles` is non-empty.
+	let middles = &chain.hops[..chain.hops.len() - 1];
+	let mut fact_terms = vec![measured(head.incoming_target)];
+	fact_terms.extend(middles.iter().map(|hop| measured(hop.outgoing_target)));
+	let mut dim_terms = vec![estimated(tail.outgoing_edge_rows)];
+	dim_terms.extend(middles.iter().map(|hop| estimated(hop.outgoing_edge_rows)));
 	Some(vec![
-		(head.fact.clone(), fact_compound),
-		(tail.dim.clone(), dim_compound),
+		(head.fact.clone(), peak_all(&fact_terms)),
+		(tail.dim.clone(), peak_all(&dim_terms)),
 	])
 }
 
@@ -1564,15 +1565,16 @@ pub(super) fn bridge_fan_out_ratio(link: &BridgeLink) -> f64 {
 	link.bridge_rows.get() as f64 / link.fact_rows.get() as f64
 }
 
-// ADR 203: the bridge chain path label, `chain[F->B1->B2->D]`.
+// ADR 203/204: the bridge chain path label, `chain[F->B1->…->Bk->D]` — the head fact, every hop's bridge,
+// then the tail dim. (203 hardcoded the 2-hop shape and dropped interior bridges.)
 pub(super) fn bridge_chain_order_target_label(chain: &BridgeChainEvidence) -> String {
-	match (chain.hops.first(), chain.hops.last()) {
-		(Some(head), Some(tail)) => format!(
-			"chain[{}->{}->{}->{}]",
-			head.fact, head.bridge, tail.bridge, tail.dim
-		),
-		_ => "chain[]".to_string(),
-	}
+	let (Some(head), Some(tail)) = (chain.hops.first(), chain.hops.last()) else {
+		return "chain[]".to_string();
+	};
+	let mut path = vec![head.fact.as_str()];
+	path.extend(chain.hops.iter().map(|hop| hop.bridge.as_str()));
+	path.push(tail.dim.as_str());
+	format!("chain[{}]", path.join("->"))
 }
 
 // ADR 203: the per-hop signatures + the observe-only path-ordering recommendation (declared/preferred

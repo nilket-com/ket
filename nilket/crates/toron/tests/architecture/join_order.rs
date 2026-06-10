@@ -2135,19 +2135,44 @@ pub(crate) fn adr203_bridge_chain_is_observe_only() {
 	assert!(!join_order.contains("BridgeChainRoot, OptimizerDecisionOutcome"));
 }
 
+// ADR 204 retargets the 203 bounded-two-hop guard to the bounded N-hop walk (continuous refactoring travels
+// with the surface this cut owns).
 #[test]
-pub(crate) fn adr203_bridge_chain_recognizer_is_bounded_two_hop() {
+pub(crate) fn adr204_bridge_chain_recognizer_is_bounded_n_hop() {
 	let join_order = source("src/binder/join_order.rs");
 	let recognizer = first_block(&join_order, "pub(super) fn analyze_bridge_chain");
 
-	// Composes — does not modify — `analyze_bridge`, and bounds to exactly one linear 2-hop chain.
+	// Composes — does not modify — `analyze_bridge`, and is a single connected walk, not a links-count
+	// recognizer (the 203 `links.len() != 2` exact bound is gone).
 	assert!(recognizer.contains("analyze_bridge("));
-	assert!(recognizer.contains("links.len() != 2"));
-	// Stitched on path order (relation-set order is not path order): `next.fact == head.bridge`,
-	// contiguous via `head.dim == next.bridge`, over four distinct relations.
-	assert!(recognizer.contains("next.fact != head.bridge"));
-	assert!(recognizer.contains("head.dim != next.bridge"));
-	assert!(recognizer.contains("path.len() != 4"));
+	assert!(!recognizer.contains("links.len() != 2"));
+	// Termination is STRUCTURAL (distinct relations, branching/cycle/disconnected decline) — separate from
+	// the supported-breadth CLAIM cap. Both are present as distinct facts.
+	assert!(recognizer.contains("MAX_BRIDGE_CHAIN_HOPS")); // the claim cap
+	assert!(join_order.contains("const MAX_BRIDGE_CHAIN_HOPS: usize"));
+	assert!(recognizer.contains("links.len() < 2 || links.len() > MAX_BRIDGE_CHAIN_HOPS"));
+	assert!(recognizer.contains("by_fact.insert")); // branching (reused fact) declines
+	assert!(recognizer.contains("order.len() != links.len()")); // disconnected component declines
+	assert!(recognizer.contains("current.dim != next.bridge")); // contiguity stitch
+	// No unbounded join-order search.
+	assert!(!join_order.contains("Cascades"));
+	assert!(!join_order.contains("fn memo"));
+}
+
+#[test]
+pub(crate) fn adr204_chain_verdict_folds_all_middles() {
+	let explain = source("src/binder/explain.rs");
+	let costs = first_block(&explain, "fn bridge_chain_measured_costs");
+
+	// The compounded cost folds EVERY non-tail middle (not just the head's), with the `max`/peak combinator,
+	// and still returns a 2-entry end vector so the verdict stays a 2-way `F`-vs-`D` argmin.
+	assert!(costs.contains("chain.hops[..chain.hops.len() - 1]")); // all non-tail middles
+	assert!(costs.contains("hop.outgoing_target")); // measured middle per hop
+	assert!(costs.contains("hop.outgoing_edge_rows")); // estimated middle per hop
+	assert!(costs.contains("peak_all"));
+	assert!(costs.contains(".max("));
+	assert!(costs.contains("head.fact.clone()"));
+	assert!(costs.contains("tail.dim.clone()"));
 }
 
 #[test]

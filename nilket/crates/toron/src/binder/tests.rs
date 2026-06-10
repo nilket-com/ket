@@ -14625,6 +14625,173 @@ fn two_hop_bridge_chain_sql() -> &'static str {
 	 JOIN promotions ON line_promotions.promo_id = promotions.id"
 }
 
+// ADR 204: a reachable 3-hop chain `orders ⋈ order_lines ⋈ line_promotions ⋈ promo_tiers ⋈ promotions`
+// (5 relations, 3 junctions). Cardinalities strictly increasing along `F→B1→B2→B3` so the inverse-F1 gate
+// (`bridge_rows >= fact_rows`) recognizes each junction as a bridge; `analyze_bridge` yields 3 stitching
+// links. Each junction has distinct in/out keys (in/out signatures differ), mirroring the 2-hop fixture.
+fn three_hop_bridge_chain_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(71),
+			named_descriptor(
+				71,
+				"orders",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register 3hop orders");
+	catalog
+		.register_descriptor(
+			TableId(72),
+			named_descriptor(
+				72,
+				"order_lines",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("order_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register 3hop order_lines");
+	catalog
+		.register_descriptor(
+			TableId(73),
+			named_descriptor(
+				73,
+				"line_promotions",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("line_id", DataType::Int64, false),
+					Field::new("tier_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register 3hop line_promotions");
+	catalog
+		.register_descriptor(
+			TableId(74),
+			named_descriptor(
+				74,
+				"promo_tiers",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("promotion_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register 3hop promo_tiers");
+	catalog
+		.register_descriptor(
+			TableId(75),
+			named_descriptor(
+				75,
+				"promotions",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register 3hop promotions");
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"orders",
+		Some(8_192),
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(1_000))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"order_lines",
+		Some(64 * 1024),
+		Some(5_000),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(5_000)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"line_promotions",
+		Some(64 * 1024 * 1024),
+		Some(20_000),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(20_000)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(5_000)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(20_000)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"promo_tiers",
+		Some(256 * 1024 * 1024),
+		Some(80_000),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(80_000)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"promotions",
+		Some(512),
+		Some(100),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	catalog
+}
+
+fn three_hop_bridge_chain_sql() -> &'static str {
+	"SELECT orders.id, promotions.id FROM orders \
+	 JOIN order_lines ON orders.id = order_lines.order_id \
+	 JOIN line_promotions ON order_lines.id = line_promotions.line_id \
+	 JOIN promo_tiers ON line_promotions.tier_id = promo_tiers.id \
+	 JOIN promotions ON promo_tiers.promotion_id = promotions.id"
+}
+
+// ADR 204: a generated linear bridge chain of `hops` junctions (`hops + 2` relations
+// `rel0 ⋈ rel1 ⋈ … ⋈ rel{hops+1}`). Each junction `rel_i` has a `back` FK (its in-signature) and its `id`
+// PK (its out-signature) — distinct — and geometric-growing cardinality (`1000 << i`) so the inverse-F1
+// gate recognizes every junction as a bridge. Used to exercise the supported-breadth cap at the boundary.
+fn linear_bridge_chain(hops: usize) -> (MockCatalog, String) {
+	let mut catalog = MockCatalog::new();
+	let n = hops + 2;
+	for i in 0..n {
+		let id: u8 = 80 + i as u8;
+		let name = format!("rel{i}");
+		let fields = if i == 0 {
+			vec![Field::new("id", DataType::Int64, false)]
+		} else {
+			vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("back", DataType::Int64, false),
+			]
+		};
+		catalog
+			.register_descriptor(
+				TableId(u64::from(id)),
+				named_descriptor(id, &name, Schema::new(fields)),
+			)
+			.expect("register chain rel");
+		let rows = 1_000u64 << i;
+		let mut facts = vec![(ColumnOrdinal(0), DistinctCountFact::Exact(rows))];
+		if i > 0 {
+			// `back` FK → the previous relation's rows (a clean FK).
+			facts.push((
+				ColumnOrdinal(1),
+				DistinctCountFact::Exact(1_000u64 << (i - 1)),
+			));
+		}
+		seed_table_optimizer_facts(&mut catalog, &name, Some(8_192u64 << i), Some(rows), facts);
+	}
+	let mut sql = String::from("SELECT rel0.id FROM rel0");
+	for i in 1..n {
+		sql.push_str(&format!(
+			" JOIN rel{i} ON rel{prev}.id = rel{i}.back",
+			prev = i - 1
+		));
+	}
+	(catalog, sql)
+}
+
 // Same chain, but a highly selective predicate on the `D`-end (`promotions.tier`, ndv 100) shrinks the
 // `B2⋈D` entry hop below the `F⋈B1` entry hop — so the cheaper driver-end flips to `promotions`.
 fn selective_two_hop_bridge_chain_sql() -> &'static str {
@@ -14768,6 +14935,172 @@ async fn chain_verdict_folds_middle_hop_explosion() {
 		chain_verdict.verdict,
 		OptimizerRuntimeVerdictClass::MissedWin,
 		"an exploding middle hop must fold into the compounded verdict: {verdicts:?}"
+	);
+}
+
+// ADR 204: a reachable 3-hop chain is recognized as one path and emits an observe-only
+// `join_order_bridge_chain` row naming all five relations. Must FAIL under the 203 recognizer (`len()!=2` →
+// no chain row for a 3-hop query). The clean FK chain drives cheapest from the `orders` end (kept).
+#[tokio::test]
+async fn three_hop_chain_is_recognized() {
+	let catalog = three_hop_bridge_chain_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", three_hop_bridge_chain_sql()))
+		.expect("plan 3-hop chain EXPLAIN");
+	let (_schema, rows) = bind_explain_rows(
+		&logical,
+		&catalog,
+		&auto_broadcast_config(256 * 1024 * 1024),
+	)
+	.await;
+	let chain_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge_chain".to_string())))
+		.expect("bridge chain row");
+	assert_utf8_contains(
+		&chain_row[1],
+		"chain[orders->order_lines->line_promotions->promo_tiers->promotions]",
+	);
+	assert_eq!(
+		chain_row[2],
+		ScalarValue::Utf8(Some("observed".to_string()))
+	);
+	assert_utf8_contains(&chain_row[3], "action=kept_already_optimal");
+	assert_utf8_contains(&chain_row[3], "preferred_root=orders");
+}
+
+// ADR 204 headline: the compounded verdict folds EVERY middle, not just the head's. Only the *interior*
+// middle `line_promotions⋈promo_tiers` (`hops[1].outgoing`) explodes; both entry hops + the head middle
+// stay small. The declared `orders`-end's peak is lifted by the 10M interior middle above the `D`-end
+// estimate → `MissedWin`. Fails two ways on the rejected alternatives: the 2-hop recognizer (no chain row
+// for a 3-hop query) AND the 2-hop cost model (peaks only `head.outgoing` → misses the interior →
+// `Vindicated`).
+#[tokio::test]
+async fn three_hop_chain_interior_middle_explosion_is_missed_win() {
+	let catalog = three_hop_bridge_chain_catalog();
+	let logical = SqlPlanner::new()
+		.plan(three_hop_bridge_chain_sql())
+		.expect("plan 3-hop chain");
+	let binding = bind_explain_analyze(
+		&logical,
+		&catalog,
+		&auto_broadcast_config(256 * 1024 * 1024),
+	)
+	.await
+	.expect("bind 3-hop chain analyze");
+	let chain = binding
+		.render_trace
+		.bridge_chain_order
+		.as_ref()
+		.expect("3-hop chain recognized at bind time");
+	assert_eq!(chain.hops.len(), 3, "a 3-hop chain has three links");
+	// The interior middle is the second hop's outgoing edge (`line_promotions⋈promo_tiers`), NOT the head's.
+	let interior_replay = chain.hops[1].outgoing_target.join_index as u32;
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(3),
+			output_rows: if replay_id.0 == interior_replay {
+				RowCount::new(10_000_000)
+			} else {
+				RowCount::new(10)
+			},
+		})
+		.collect::<Vec<_>>();
+	let verdicts = measured_explain_analyze_verdicts(&binding, &observations)
+		.expect("measure 3-hop chain verdicts");
+	let chain_verdict = verdicts
+		.iter()
+		.find(|verdict| verdict.kind == OptimizerDecisionKind::BridgeChainRoot)
+		.expect("chain accrues a bridge_chain_root verdict");
+	assert_eq!(
+		chain_verdict.verdict,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		"an exploding INTERIOR middle must fold into the compounded verdict: {verdicts:?}"
+	);
+}
+
+// ADR 204: the supported-breadth cap. A chain of exactly `MAX_BRIDGE_CHAIN_HOPS` (4) junctions is
+// recognized; one junction deeper declines (no chain row) rather than emitting an unvalidated verdict.
+// Locks the cap boundary (off-by-one) — fails under an uncapped walk (which would emit a row at k=5).
+#[tokio::test]
+async fn chain_supported_breadth_cap_declines_past_boundary() {
+	let chain_row = |rows: &[Vec<ScalarValue>]| {
+		rows.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge_chain".to_string())))
+	};
+	// k = 4 (== cap): recognized.
+	let (at_cap_catalog, at_cap_sql) = linear_bridge_chain(4);
+	let at_cap = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {at_cap_sql}"))
+		.expect("plan at-cap chain");
+	let (_schema, at_cap_rows) =
+		bind_explain_rows(&at_cap, &at_cap_catalog, &auto_broadcast_config(1 << 30)).await;
+	assert!(
+		chain_row(&at_cap_rows),
+		"a chain at the supported breadth (k=4) is recognized: {at_cap_rows:?}"
+	);
+	// k = 5 (> cap): declined.
+	let (over_catalog, over_sql) = linear_bridge_chain(5);
+	let over = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {over_sql}"))
+		.expect("plan over-cap chain");
+	let (_schema, over_rows) =
+		bind_explain_rows(&over, &over_catalog, &auto_broadcast_config(1 << 30)).await;
+	assert!(
+		!chain_row(&over_rows),
+		"a chain past the supported breadth (k=5) declines: {over_rows:?}"
+	);
+}
+
+// ADR 204: a branch declines. `rel0` is the fact of TWO bridges (`rel1→rel3` and `rel2→rel4`), so the two
+// links share a `fact` — the recognizer's `by_fact` collision rejects it. Two links are present, so a mere
+// links-count recognizer would wrongly emit a chain row; the structural walk declines (`None`).
+#[tokio::test]
+async fn branching_bridge_chain_is_declined() {
+	let mut catalog = MockCatalog::new();
+	for (id, name, fields, rows) in [
+		(90u8, "rel0", vec!["id"], 1_000u64),
+		(91, "rel1", vec!["id", "back"], 5_000),
+		(92, "rel2", vec!["id", "back"], 5_000),
+		(93, "rel3", vec!["id", "back"], 100),
+		(94, "rel4", vec!["id", "back"], 100),
+	] {
+		let schema = Schema::new(
+			fields
+				.iter()
+				.map(|f| Field::new(*f, DataType::Int64, false))
+				.collect::<Vec<_>>(),
+		);
+		catalog
+			.register_descriptor(TableId(u64::from(id)), named_descriptor(id, name, schema))
+			.expect("register branch rel");
+		let mut facts = vec![(ColumnOrdinal(0), DistinctCountFact::Exact(rows))];
+		if fields.len() > 1 {
+			facts.push((ColumnOrdinal(1), DistinctCountFact::Exact(1_000)));
+		}
+		seed_table_optimizer_facts(&mut catalog, name, Some(8_192), Some(rows), facts);
+	}
+	// rel0 forks into two bridges: rel1→rel3 and rel2→rel4.
+	let sql = "SELECT rel0.id FROM rel0 \
+		 JOIN rel1 ON rel0.id = rel1.back \
+		 JOIN rel3 ON rel1.id = rel3.back \
+		 JOIN rel2 ON rel0.id = rel2.back \
+		 JOIN rel4 ON rel2.id = rel4.back";
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {sql}"))
+		.expect("plan branching shape");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(1 << 30)).await;
+	assert!(
+		!rows
+			.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge_chain".to_string()))),
+		"a branch (shared fact) must decline, not be mis-stitched into a chain: {rows:?}"
 	);
 }
 
