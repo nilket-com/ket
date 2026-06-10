@@ -1405,6 +1405,54 @@ pub(super) fn analyze_bridge(
 	}
 }
 
+// ADR 203: a recognized 2-hop bridge chain `F ⋈ B1 ⋈ B2 ⋈ D` — the ordered path as its constituent
+// bridge links (`hops[0] = F→B1→B2`, `hops[1] = B1→B2→D`). Sibling of `BridgeOrderEvidence`; observe-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BridgeChainEvidence {
+	pub(super) hops: Vec<BridgeLink>,
+}
+
+// ADR 203: recognize a bounded 2-hop bridge chain by composing `analyze_bridge`'s links into an ordered
+// path. `analyze_bridge` returns links in **relation-set order, not path order** (its loop walks a
+// `BTreeSet` of relation names), so they must be stitched: the chain head is the link whose `fact` is no
+// link's `bridge` (the free fact end `F`), and the successor stitches on `next.fact == head.bridge`,
+// contiguous via `head.dim == next.bridge`. Accept exactly one linear 2-hop chain over four distinct
+// relations; `None` for a single junction, branching, a cycle, or longer/bushier shapes (the chain
+// re-root and longer chains are deferred). Recognition only — no ordering, no actuation.
+pub(super) fn analyze_bridge_chain(
+	edges: &[JoinOrderEdgeEvidence],
+	decisions: &[DecisionReceipt],
+) -> Option<BridgeChainEvidence> {
+	let links = analyze_bridge(edges, decisions)?.links;
+	// Bounded to exactly two junctions (one 2-hop chain).
+	if links.len() != 2 {
+		return None;
+	}
+	let bridges: BTreeSet<&str> = links.iter().map(|link| link.bridge.as_str()).collect();
+	// Exactly one head: the link whose fact is not any junction's bridge.
+	let mut head_indices = (0..links.len()).filter(|&i| !bridges.contains(links[i].fact.as_str()));
+	let head_idx = head_indices.next()?;
+	if head_indices.next().is_some() {
+		return None;
+	}
+	let head = &links[head_idx];
+	let next = &links[1 - head_idx];
+	// The path must stitch (`next.fact == head.bridge`) and be contiguous (`head.dim == next.bridge`).
+	if next.fact != head.bridge || head.dim != next.bridge {
+		return None;
+	}
+	// Four distinct relations: F, B1, B2, D.
+	let path: BTreeSet<&String> = [&head.fact, &head.bridge, &next.bridge, &next.dim]
+		.into_iter()
+		.collect();
+	if path.len() != 4 {
+		return None;
+	}
+	Some(BridgeChainEvidence {
+		hops: vec![head.clone(), next.clone()],
+	})
+}
+
 // ADR 197: the graph order scorer is NEW — it does not call the star cost functions
 // (`order_cost`/`rank_star_order`); it costs the small candidate set the recognized graph shape admits
 // directly from the captured edge estimates. Only the verdict vocabulary (`StarOrderAction`) and, at
@@ -1499,6 +1547,45 @@ pub(super) fn bridge_order_recommendation(
 		costs: vec![
 			(link.fact.clone(), fact_root_cost),
 			(link.dim.clone(), dim_root_cost),
+		],
+		action,
+	})
+}
+
+// ADR 203: path ordering for a 2-hop bridge chain `F ⋈ B1 ⋈ B2 ⋈ D` — drive from the cheaper end.
+// `declared_root` is the AST `F` end; the candidates are the two chain ends, costed by their *entry*
+// hop: `F`-end = `F⋈B1` (head incoming edge), `D`-end = `B2⋈D` (tail outgoing edge). This generalizes the
+// single-bridge filter-first rule (drive the selective end) to the path; it is a deliberate heuristic
+// over the compounded fan-out, *tested* by the measured chain verdict (D3), not claimed optimal.
+// Conservative: a missing edge estimate yields no recommendation.
+pub(super) fn bridge_chain_order_recommendation(
+	chain: &BridgeChainEvidence,
+) -> Option<GraphOrderRecommendation> {
+	let head = chain.hops.first()?;
+	let tail = chain.hops.last()?;
+	let fact_end_cost = u128::from(head.incoming_edge_rows?.get());
+	let dim_end_cost = u128::from(tail.outgoing_edge_rows?.get());
+	let action = if dim_end_cost < fact_end_cost {
+		StarOrderAction::Reordered
+	} else {
+		StarOrderAction::KeptAlreadyOptimal
+	};
+	let preferred_root = match action {
+		StarOrderAction::Reordered => tail.dim.clone(),
+		_ => head.fact.clone(),
+	};
+	Some(GraphOrderRecommendation {
+		pivot: chain
+			.hops
+			.iter()
+			.map(|hop| hop.bridge.clone())
+			.collect::<Vec<_>>()
+			.join("->"),
+		declared_root: head.fact.clone(),
+		preferred_root,
+		costs: vec![
+			(head.fact.clone(), fact_end_cost),
+			(tail.dim.clone(), dim_end_cost),
 		],
 		action,
 	})

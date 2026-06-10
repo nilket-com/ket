@@ -257,6 +257,12 @@ async fn bind_with_explain_trace(
 	if let Some(bridge) = analyze_bridge(&render_trace.join_order_edges, &trace.join_decisions) {
 		render_trace.set_observed_bridge(bridge);
 	}
+	// ADR 203: a 2-hop bridge chain is recognized at bind time (so the 188/201 sampled verdict can judge
+	// it without EXPLAIN), additive alongside the per-junction bridge rows. Observe-only.
+	if let Some(chain) = analyze_bridge_chain(&render_trace.join_order_edges, &trace.join_decisions)
+	{
+		render_trace.set_observed_bridge_chain(chain);
+	}
 	Ok((plan, trace, render_trace))
 }
 
@@ -329,6 +335,15 @@ fn star_order_runtime_replay_ids(
 				.links
 				.iter()
 				.flat_map(|link| [link.incoming_target, link.outgoing_target]),
+		);
+	}
+	// ADR 203: gather the chain's per-hop edge targets so the sampled path measures the whole path.
+	if let Some(chain) = &render_trace.bridge_chain_order {
+		targets.extend(
+			chain
+				.hops
+				.iter()
+				.flat_map(|hop| [hop.incoming_target, hop.outgoing_target]),
 		);
 	}
 	targets

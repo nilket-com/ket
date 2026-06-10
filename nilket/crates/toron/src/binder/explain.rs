@@ -79,6 +79,8 @@ pub(super) struct OptimizerExplainRenderTrace {
 	pub(super) galaxy_order: Option<GalaxyOrderEvidence>,
 	// ADR 196: bridge (many-to-many junction) evidence — a sibling to galaxy, equally additive.
 	pub(super) bridge_order: Option<BridgeOrderEvidence>,
+	// ADR 203: a recognized 2-hop bridge chain `F ⋈ B1 ⋈ B2 ⋈ D` — an additive observe-only sibling.
+	pub(super) bridge_chain_order: Option<BridgeChainEvidence>,
 	// ADR 198: when galaxy root-swap actuation fires, the applied root fact. The receipt then shows
 	// `action=reordered; applied_root={fact}` instead of the re-rooted galaxy's intrinsic recommendation.
 	pub(super) applied_galaxy_root: Option<String>,
@@ -144,6 +146,10 @@ impl OptimizerExplainRenderTrace {
 
 	pub(super) fn set_observed_bridge(&mut self, evidence: BridgeOrderEvidence) {
 		self.bridge_order = Some(evidence);
+	}
+
+	pub(super) fn set_observed_bridge_chain(&mut self, evidence: BridgeChainEvidence) {
+		self.bridge_chain_order = Some(evidence);
 	}
 
 	pub(super) fn set_applied_galaxy_root(&mut self, root: String) {
@@ -426,6 +432,11 @@ pub(super) fn optimizer_explain_plan(
 				render_trace.applied_bridge_root.as_deref(),
 			));
 		}
+		// ADR 203: a recognized bridge chain renders an additional observe-only path row, after its
+		// per-junction bridge rows.
+		if let Some(chain) = &render_trace.bridge_chain_order {
+			rows.push(optimizer_explain_bridge_chain_row(chain));
+		}
 	}
 	system_table_plan(
 		SystemTableKind::OptimizerExplain,
@@ -587,6 +598,20 @@ fn measured_verdicts_from_summaries(
 			if let Some(measured) = bridge_measured_costs(bridge, summaries) {
 				verdicts.push(MeasuredLevelVerdict {
 					kind: OptimizerDecisionKind::BridgeRoot,
+					verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
+						&rec, &measured,
+					)),
+				});
+			}
+		}
+	}
+	// ADR 203: judge the recognized bridge chain's recommended path order against the measured per-hop
+	// fan-out. Verdict-only (no decision-log accrual; the chain is observe-only).
+	if let Some(chain) = &render_trace.bridge_chain_order {
+		if let Some(rec) = bridge_chain_order_recommendation(chain) {
+			if let Some(measured) = bridge_chain_measured_costs(chain, summaries) {
+				verdicts.push(MeasuredLevelVerdict {
+					kind: OptimizerDecisionKind::BridgeChainRoot,
 					verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
 						&rec, &measured,
 					)),
@@ -983,6 +1008,56 @@ fn bridge_measured_costs(
 	])
 }
 
+// ADR 203: the bridge chain *compounded* measured costs — the path verdict, not an endcap verdict.
+//
+// The recommendation is a cheap entry-hop direction heuristic (drive from the cheaper end), deliberately
+// BLIND to the middle hop `B1⋈B2` — which is the common term that does not discriminate direction. The
+// verdict's whole job (D3) is to falsify that heuristic against realized cost, so it must fold the middle
+// in: the heuristic's blind spot is exactly where a chain explodes.
+//
+// The declared `F`-end RAN (the AST left-deep order drives from `F`), so its compounded cost is the PEAK
+// materialization along the executed path — the entry hop `F⋈B1` (`head.incoming_target`) and the middle
+// hop `F⋈B1⋈B2` (`head.outgoing_target`), both MEASURED. A middle that explodes past its estimate lifts
+// this peak above the counterfactual and flips the verdict to `MissedWin` — which an endcap-only cost
+// (entry alone) would miss. Both must be measured: a chain cannot be judged without its middle.
+//
+// The `D`-end did NOT run (`D` joins last; there is no standalone `B2⋈D` to measure), so its compounded
+// cost is the ESTIMATED peak of the `B2⋈D` entry (`tail.outgoing_edge_rows`) and the `B1⋈B2` middle
+// (`head.outgoing_edge_rows`) — the un-run alternative, mirroring the single-bridge measured-vs-estimated
+// comparison in `bridge_measured_costs`. `None` when the chain has no hops.
+fn bridge_chain_measured_costs(
+	chain: &BridgeChainEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Option<Vec<(String, Option<u128>)>> {
+	let head = chain.hops.first()?;
+	let tail = chain.hops.last()?;
+	let measured = |target| {
+		join_replay_id_for_trace_target(target)
+			.ok()
+			.and_then(|replay_id| summaries.get(&replay_id))
+			.map(|summary| u128::from(summary.output_rows.get()))
+	};
+	let estimated = |rows: Option<RowCount>| rows.map(|rows| u128::from(rows.get()));
+	let peak = |entry: Option<u128>, middle: Option<u128>| match (entry, middle) {
+		(Some(entry), Some(middle)) => Some(entry.max(middle)),
+		_ => None,
+	};
+	// Declared end (ran): measured entry compounded with the measured middle.
+	let fact_compound = peak(
+		measured(head.incoming_target),
+		measured(head.outgoing_target),
+	);
+	// Counterfactual end (un-run): estimated entry compounded with the estimated middle.
+	let dim_compound = peak(
+		estimated(tail.outgoing_edge_rows),
+		estimated(head.outgoing_edge_rows),
+	);
+	Some(vec![
+		(head.fact.clone(), fact_compound),
+		(tail.dim.clone(), dim_compound),
+	])
+}
+
 // ADR 197: unified `join_order_graph_verdict` row — reuses the 180/184 `StarOrderVerdict` vocabulary.
 // `Vindicated` when the FROM order is the measured-optimal root, `MissedWin` when a reorder would have
 // won, `Indeterminate` when any candidate measurement is absent.
@@ -1117,6 +1192,15 @@ fn bridge_analyze_rows(
 	if let Some(rec) = bridge_order_recommendation(bridge) {
 		if let Some(measured) = bridge_measured_costs(bridge, summaries) {
 			rows.push(graph_order_verdict_row(&rec, &measured));
+		}
+	}
+	// ADR 203: the chain measured verdict — the compounded path scorer fed the measured per-hop fan-out.
+	// Observe-only (a verdict row, never a re-root). Additive beside the per-junction bridge verdict above.
+	if let Some(chain) = &render_trace.bridge_chain_order {
+		if let Some(rec) = bridge_chain_order_recommendation(chain) {
+			if let Some(measured) = bridge_chain_measured_costs(chain, summaries) {
+				rows.push(graph_order_verdict_row(&rec, &measured));
+			}
 		}
 	}
 	Ok(rows)
@@ -1478,6 +1562,62 @@ pub(super) fn optimizer_explain_bridge_order_row(
 pub(super) fn bridge_fan_out_ratio(link: &BridgeLink) -> f64 {
 	// `fact_rows > 0` is guaranteed by the recognizer's zero-denominator decline.
 	link.bridge_rows.get() as f64 / link.fact_rows.get() as f64
+}
+
+// ADR 203: the bridge chain path label, `chain[F->B1->B2->D]`.
+pub(super) fn bridge_chain_order_target_label(chain: &BridgeChainEvidence) -> String {
+	match (chain.hops.first(), chain.hops.last()) {
+		(Some(head), Some(tail)) => format!(
+			"chain[{}->{}->{}->{}]",
+			head.fact, head.bridge, tail.bridge, tail.dim
+		),
+		_ => "chain[]".to_string(),
+	}
+}
+
+// ADR 203: the per-hop signatures + the observe-only path-ordering recommendation (declared/preferred
+// end, action, per-end costs).
+pub(super) fn bridge_chain_order_detail_label(chain: &BridgeChainEvidence) -> String {
+	let hops = chain
+		.hops
+		.iter()
+		.map(|hop| {
+			format!(
+				"{} on {}={} and {}={}",
+				hop.bridge,
+				hop.b_in_signature.join("+"),
+				hop.fact,
+				hop.b_out_signature.join("+"),
+				hop.dim,
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("; ");
+	let order = bridge_chain_order_recommendation(chain)
+		.map(|rec| graph_order_recommendation_label(&rec))
+		.unwrap_or_default();
+	format!("{hops}{order}")
+}
+
+// ADR 203: the observe-only bridge chain cockpit row (`outcome=observed`; the chain is never actuated).
+pub(super) fn optimizer_explain_bridge_chain_row(chain: &BridgeChainEvidence) -> Vec<ScalarValue> {
+	vec![
+		ScalarValue::Utf8(Some("join_order_bridge_chain".to_string())),
+		ScalarValue::Utf8(Some(bridge_chain_order_target_label(chain))),
+		ScalarValue::Utf8(Some("observed".to_string())),
+		ScalarValue::Utf8(Some(bridge_chain_order_detail_label(chain))),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	]
 }
 
 pub(super) fn bridge_order_target_label(evidence: &BridgeOrderEvidence) -> String {

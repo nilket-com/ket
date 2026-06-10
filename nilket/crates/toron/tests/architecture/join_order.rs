@@ -2112,6 +2112,76 @@ pub(crate) fn adr202_galaxy_actuation_is_binder_only() {
 	);
 }
 
+// ADR 203: the bridge chain is observe-only — recognize, recommend, measure a verdict, never re-root.
+#[test]
+pub(crate) fn adr203_bridge_chain_is_observe_only() {
+	let join_order = source("src/binder/join_order.rs");
+	let recognizer = first_block(&join_order, "pub(super) fn analyze_bridge_chain");
+	let recommendation = first_block(
+		&join_order,
+		"pub(super) fn bridge_chain_order_recommendation",
+	);
+	let evidence = first_block(&join_order, "pub(super) struct BridgeChainEvidence");
+
+	// No actuation: the recognizer and recommendation never re-root, stage, or carry an applied root.
+	for block in [&recognizer, &recommendation, &evidence] {
+		assert!(!block.contains("reroot_galaxy_join_tree"));
+		assert!(!block.contains("try_bind_graph_actuation"));
+		assert!(!block.contains("set_applied_root"));
+		assert!(!block.contains("applied_root"));
+	}
+	// The chain rides the existing graph recommendation vocabulary, never a new decision-log accrual.
+	assert!(!join_order.contains("accrue_bridge_chain"));
+	assert!(!join_order.contains("BridgeChainRoot, OptimizerDecisionOutcome"));
+}
+
+#[test]
+pub(crate) fn adr203_bridge_chain_recognizer_is_bounded_two_hop() {
+	let join_order = source("src/binder/join_order.rs");
+	let recognizer = first_block(&join_order, "pub(super) fn analyze_bridge_chain");
+
+	// Composes — does not modify — `analyze_bridge`, and bounds to exactly one linear 2-hop chain.
+	assert!(recognizer.contains("analyze_bridge("));
+	assert!(recognizer.contains("links.len() != 2"));
+	// Stitched on path order (relation-set order is not path order): `next.fact == head.bridge`,
+	// contiguous via `head.dim == next.bridge`, over four distinct relations.
+	assert!(recognizer.contains("next.fact != head.bridge"));
+	assert!(recognizer.contains("head.dim != next.bridge"));
+	assert!(recognizer.contains("path.len() != 4"));
+}
+
+#[test]
+pub(crate) fn adr203_chain_recognition_runs_at_bind_time() {
+	let binder = binder_source();
+
+	// Recognized at bind time (beside the single-bridge hook) so the 188/201 sampled path can judge it
+	// without EXPLAIN, and the telemetry union gathers the chain's per-hop edge targets.
+	assert!(binder.contains("analyze_bridge_chain(&render_trace.join_order_edges"));
+	assert!(binder.contains("render_trace.set_observed_bridge_chain(chain)"));
+	let collect = first_block(&binder, "fn star_order_runtime_replay_ids");
+	assert!(collect.contains("render_trace.bridge_chain_order"));
+	assert!(collect.contains("hop.incoming_target"));
+	assert!(collect.contains("hop.outgoing_target"));
+}
+
+#[test]
+pub(crate) fn adr203_bridge_chain_verdict_reuses_graph_machinery() {
+	let explain = source("src/binder/explain.rs");
+	let decision_log = source("src/binder/decision_log.rs");
+	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
+
+	// The chain arm of the real 201 sampled-verdict seam reuses the shared graph scorer and measured-cost
+	// vocabulary — no bespoke `compute_join_order_verdicts`, which does not exist.
+	assert!(verdicts.contains("bridge_chain_order_recommendation(chain)"));
+	assert!(verdicts.contains("bridge_chain_measured_costs(chain, summaries)"));
+	assert!(verdicts.contains("measured_graph_order_verdict"));
+	assert!(verdicts.contains("OptimizerDecisionKind::BridgeChainRoot"));
+	assert!(!explain.contains("compute_join_order_verdicts"));
+	// The chain verdict kind exists and is labelled — accrued through the existing verdict log.
+	assert!(decision_log.contains("BridgeChainRoot"));
+	assert!(decision_log.contains("\"bridge_chain_root\""));
+}
+
 // ADR 200 retargets the 198/199 per-shape actuation guards onto the unified `try_bind_graph_actuation`.
 #[test]
 pub(crate) fn adr200_unified_actuator_reuses_snowflake_machinery() {

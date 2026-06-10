@@ -13,6 +13,8 @@ pub(crate) enum OptimizerDecisionKind {
 	// ADR 200: graph (non-tree) actuation provenance — a galaxy / bridge root-swap decision.
 	GalaxyRoot,
 	BridgeRoot,
+	// ADR 203: observe-only multi-hop bridge chain path-order verdict provenance (no actuation).
+	BridgeChainRoot,
 	Overflow,
 }
 
@@ -189,6 +191,7 @@ pub(crate) fn optimizer_decision_kind_label(kind: OptimizerDecisionKind) -> &'st
 		OptimizerDecisionKind::SnowflakeBranch => "snowflake_branch",
 		OptimizerDecisionKind::GalaxyRoot => "galaxy_root",
 		OptimizerDecisionKind::BridgeRoot => "bridge_root",
+		OptimizerDecisionKind::BridgeChainRoot => "bridge_chain_root",
 		OptimizerDecisionKind::Overflow => "overflow",
 	}
 }

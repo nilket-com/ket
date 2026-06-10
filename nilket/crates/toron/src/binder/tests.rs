@@ -14521,6 +14521,279 @@ fn galaxy_optimal_order_sql() -> &'static str {
 	 JOIN sales ON sales.product_id = product.id"
 }
 
+// ADR 203: a 2-hop bridge chain — `orders`(F, 1_000) ⋈ `order_lines`(B1, 5_000) ⋈
+// `line_promotions`(B2, 20_000) ⋈ `promotions`(D, 100). Each junction fans out vs its fact-side
+// predecessor (inverse-F1: 5_000 >= 1_000 at B1, 20_000 >= 5_000 at B2), so `analyze_bridge` yields two
+// links that `analyze_bridge_chain` stitches into one path.
+fn bridge_chain_join_order_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(61),
+			named_descriptor(
+				61,
+				"orders",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register chain orders");
+	catalog
+		.register_descriptor(
+			TableId(62),
+			named_descriptor(
+				62,
+				"order_lines",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("order_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register chain order_lines");
+	catalog
+		.register_descriptor(
+			TableId(63),
+			named_descriptor(
+				63,
+				"line_promotions",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("line_id", DataType::Int64, false),
+					Field::new("promo_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register chain line_promotions");
+	catalog
+		.register_descriptor(
+			TableId(64),
+			named_descriptor(
+				64,
+				"promotions",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("tier", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register chain promotions");
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"orders",
+		Some(8_192),
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(1_000))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"order_lines",
+		Some(64 * 1024),
+		Some(5_000),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(5_000)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(1_000)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"line_promotions",
+		Some(64 * 1024 * 1024),
+		Some(20_000),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(20_000)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(5_000)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"promotions",
+		Some(512),
+		Some(100),
+		vec![
+			(ColumnOrdinal(0), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+		],
+	);
+	catalog
+}
+
+fn two_hop_bridge_chain_sql() -> &'static str {
+	"SELECT orders.id, promotions.id FROM orders \
+	 JOIN order_lines ON orders.id = order_lines.order_id \
+	 JOIN line_promotions ON order_lines.id = line_promotions.line_id \
+	 JOIN promotions ON line_promotions.promo_id = promotions.id"
+}
+
+// Same chain, but a highly selective predicate on the `D`-end (`promotions.tier`, ndv 100) shrinks the
+// `B2⋈D` entry hop below the `F⋈B1` entry hop — so the cheaper driver-end flips to `promotions`.
+fn selective_two_hop_bridge_chain_sql() -> &'static str {
+	"SELECT orders.id, promotions.id FROM orders \
+	 JOIN order_lines ON orders.id = order_lines.order_id \
+	 JOIN line_promotions ON order_lines.id = line_promotions.line_id \
+	 JOIN promotions ON line_promotions.promo_id = promotions.id \
+	 WHERE promotions.tier = 7"
+}
+
+// ADR 203: a reachable 2-hop chain is recognized as a single path and emits an observe-only
+// `join_order_bridge_chain` cockpit row naming both hops. Must fail on `main` (no chain recognizer).
+#[tokio::test]
+async fn two_hop_bridge_chain_is_recognized() {
+	let catalog = bridge_chain_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", two_hop_bridge_chain_sql()))
+		.expect("plan chain EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let chain_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge_chain".to_string())))
+		.expect("bridge chain row");
+	assert_utf8_contains(
+		&chain_row[1],
+		"chain[orders->order_lines->line_promotions->promotions]",
+	);
+	assert_eq!(
+		chain_row[2],
+		ScalarValue::Utf8(Some("observed".to_string()))
+	);
+	// Clean FK chain: the F-end `orders` (entry 5_000) is the cheaper driver vs the D-end
+	// (`line_promotions⋈promotions`, 20_000) — the path cost was evaluated and the AST end kept.
+	assert_utf8_contains(&chain_row[3], "action=kept_already_optimal");
+	assert_utf8_contains(&chain_row[3], "preferred_root=orders");
+}
+
+// ADR 203 honesty gate: a reachable chain whose AST driver-end is not the cheaper one emits a
+// `join_order_bridge_chain` row naming both hops and the preferred end. A selective predicate on the
+// `D`-end (`promotions.tier = 7`) makes `B2⋈D` the cheaper entry hop, flipping the recommendation to
+// drive from `promotions`. Must fail on `main` (no chain recognizer); plan + results byte-identical.
+#[tokio::test]
+async fn two_hop_bridge_chain_recommends_cheaper_driver_end() {
+	let catalog = bridge_chain_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", selective_two_hop_bridge_chain_sql()))
+		.expect("plan selective chain EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	let chain_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge_chain".to_string())))
+		.expect("bridge chain row");
+	assert_utf8_contains(
+		&chain_row[1],
+		"chain[orders->order_lines->line_promotions->promotions]",
+	);
+	assert_eq!(
+		chain_row[2],
+		ScalarValue::Utf8(Some("observed".to_string()))
+	);
+	assert_utf8_contains(&chain_row[3], "action=reordered");
+	assert_utf8_contains(&chain_row[3], "preferred_root=promotions");
+}
+
+// ADR 203 D3 proof: under the sampled verdict path, the recognized chain accrues a `bridge_chain_root`
+// runtime verdict — the measured per-hop fan-out feeds the path scorer through the existing 201
+// `measured_verdicts_from_summaries` seam, with a determinate verdict once both ends are measured. This
+// is the reality check that gates the (deferred) chain re-root.
+#[tokio::test]
+async fn chain_verdict_vindicates_or_faults_recommended_order() {
+	let catalog = bridge_chain_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(selective_two_hop_bridge_chain_sql())
+		.expect("plan selective chain");
+	let binding =
+		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind chain analyze");
+	let observations = uniform_observations(&binding);
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure chain verdicts");
+	let chain_verdict = verdicts
+		.iter()
+		.find(|verdict| verdict.kind == OptimizerDecisionKind::BridgeChainRoot)
+		.expect("chain accrues a bridge_chain_root verdict");
+	// Both ends measured → a determinate verdict (vindicated or a fault), never Indeterminate.
+	assert_ne!(
+		chain_verdict.verdict,
+		OptimizerRuntimeVerdictClass::Indeterminate,
+		"a measured chain yields a determinate verdict: {verdicts:?}"
+	);
+}
+
+// ADR 203 F1 lock: the middle hop is FOLDED into the compounded chain verdict, not ignored. Only the
+// middle hop `B1⋈B2` (`head.outgoing_target`) explodes (10M rows) while both entry hops stay small (10).
+// The declared `orders`-end's compounded cost is the PEAK over its measured path = the 10M middle, which
+// exceeds the `D`-end estimate → `MissedWin`. The rejected endcap-only model (declared cost = entry hop =
+// 10) would call this `Vindicated`, so this test FAILS under the two-endcap alternative — locking the
+// fold. The middle hop is the recommendation heuristic's blind spot; this is the verdict that catches it.
+#[tokio::test]
+async fn chain_verdict_folds_middle_hop_explosion() {
+	let catalog = bridge_chain_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(two_hop_bridge_chain_sql())
+		.expect("plan chain");
+	let binding =
+		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind chain analyze");
+	let chain = binding
+		.render_trace
+		.bridge_chain_order
+		.as_ref()
+		.expect("chain recognized at bind time");
+	// The middle hop is the head's outgoing edge (`B1⋈B2`); make ONLY it explode.
+	let middle_replay = chain.hops[0].outgoing_target.join_index as u32;
+	let observations = binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(3),
+			output_rows: if replay_id.0 == middle_replay {
+				RowCount::new(10_000_000)
+			} else {
+				RowCount::new(10)
+			},
+		})
+		.collect::<Vec<_>>();
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure chain verdicts");
+	let chain_verdict = verdicts
+		.iter()
+		.find(|verdict| verdict.kind == OptimizerDecisionKind::BridgeChainRoot)
+		.expect("chain accrues a bridge_chain_root verdict");
+	assert_eq!(
+		chain_verdict.verdict,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		"an exploding middle hop must fold into the compounded verdict: {verdicts:?}"
+	);
+}
+
+// ADR 203 load-bearing discriminator: a plain single bridge `orders ⋈ order_items ⋈ products` emits the
+// 199 `join_order_bridge` row but NO chain row — proving the path-stitch decides, not "two links present."
+#[tokio::test]
+async fn bridge_chain_recognizer_distinguishes_chain_from_single_junction() {
+	let catalog = bridge_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", bridge_chain_order_sql()))
+		.expect("plan single bridge EXPLAIN");
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024)).await;
+	assert!(
+		rows.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge".to_string()))),
+		"single bridge still emits its 199 bridge row"
+	);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge_chain".to_string()))),
+		"a single junction must not be recognized as a chain: {rows:?}"
+	);
+}
+
 // ADR 196: a many-to-many bridge — `orders`(fact, 1_000) ⋈ `order_items`(junction, 10_000) ⋈
 // `products`(dim, 100). The junction is NOT dimension-like relative to its fact-side probe
 // (10_000 >= 1_000), so the inverse-F1 gate recognizes a bridge. Contrast the snowflake branch
