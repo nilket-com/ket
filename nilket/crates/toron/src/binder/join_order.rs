@@ -693,6 +693,80 @@ pub(super) fn reroot_galaxy_join_tree(
 	Some(composite)
 }
 
+// ADR 205: reverse a left-deep bridge chain `Join(…Join(Join(F,B1),B2)…,D)` to drive from the `D` end:
+// `Join(…Join(Join(D,Bk),B_{k-1})…,F)`. Unlike `reroot_galaxy_join_tree` (a star rotation around one
+// `pivot`), a chain is a PATH with no pivot, so this is a full reversal — every edge's `on` is swapped for
+// its flipped left/right position. Collect the chain's leaves (outermost-first `[D, Bk, …, B1]`), per-edge
+// `on`, and per-join `(kind, strategy_intent)` by walking the left spine, then rebuild left-deep from the
+// `D` leaf, carrying each `(kind, intent)` WITH its original edge (never by rebuilt position — the 202 F1
+// trap). `None` for any shape that is not a left-deep all-leaf inner chain whose `D` end is `preferred_root`.
+pub(super) fn reverse_bridge_chain_join_tree(
+	plan: &LogicalPlan,
+	preferred_root: &str,
+) -> Option<LogicalPlan> {
+	let mut leaves: Vec<LogicalPlan> = Vec::new();
+	let mut conds: Vec<Vec<(Expr, Expr)>> = Vec::new();
+	let mut join_meta: Vec<(JoinKind, JoinStrategyIntent)> = Vec::new();
+	let mut node = plan;
+	let base_leaf;
+	loop {
+		let LogicalPlan::Join {
+			left,
+			right,
+			kind,
+			on,
+			strategy_intent,
+		} = node
+		else {
+			return None;
+		};
+		if *kind != JoinKind::Inner || logical_plan_contains_join(right) {
+			return None;
+		}
+		join_meta.push((*kind, *strategy_intent));
+		leaves.push((**right).clone());
+		conds.push(on.clone());
+		if matches!(left.as_ref(), LogicalPlan::Join { .. }) {
+			node = left.as_ref();
+		} else {
+			if logical_plan_contains_join(left) {
+				return None;
+			}
+			base_leaf = (**left).clone(); // the fact end `F`
+			break;
+		}
+	}
+	// `leaves[0]` is the outermost right leaf — the `D` end the recommendation drives from.
+	if galaxy_leaf_label(&leaves[0]).as_deref() != Some(preferred_root) {
+		return None;
+	}
+	// Each edge's `on` swaps (its two relations flip left/right in the reversal).
+	let swap = |on: &[(Expr, Expr)]| -> Vec<(Expr, Expr)> {
+		on.iter().map(|(l, r)| (r.clone(), l.clone())).collect()
+	};
+	// Rebuild left-deep from `D`: attach the bridges `Bk…B1` (leaves[1..]) via their own edges, then the
+	// base fact `F` via the innermost edge. `(kind, intent)` travels with each edge index.
+	let mut composite = leaves[0].clone();
+	for i in 1..leaves.len() {
+		let (kind, intent) = join_meta[i - 1];
+		composite = LogicalPlan::Join {
+			left: Box::new(composite),
+			right: Box::new(leaves[i].clone()),
+			kind,
+			on: swap(&conds[i - 1]),
+			strategy_intent: intent,
+		};
+	}
+	let (kind, intent) = *join_meta.last()?;
+	Some(LogicalPlan::Join {
+		left: Box::new(composite),
+		right: Box::new(base_leaf),
+		kind,
+		on: swap(conds.last()?),
+		strategy_intent: intent,
+	})
+}
+
 fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 	match plan {
 		LogicalPlan::Join { .. } => true,
@@ -2189,12 +2263,14 @@ pub(super) enum GraphActuationResult {
 	Declined(OptimizerDecisionDeclineReason),
 }
 
-// ADR 200: the graph shape the unified actuator dispatches over. A query is a galaxy XOR a bridge
-// (conformed vs distinct junction signatures), so the two arms are mutually exclusive.
+// ADR 200/205: the graph shape the unified actuator dispatches over. A query is a galaxy, a single-junction
+// bridge, or a multi-junction chain — a 3-way partition (ADR 205 gates Bridge to one junction so a chain is
+// Chain's exclusively), so the arms are mutually exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GraphShape {
 	Galaxy,
 	Bridge,
+	Chain,
 }
 
 impl GraphShape {
@@ -2202,6 +2278,7 @@ impl GraphShape {
 		match self {
 			GraphShape::Galaxy => OptimizerDecisionKind::GalaxyRoot,
 			GraphShape::Bridge => OptimizerDecisionKind::BridgeRoot,
+			GraphShape::Chain => OptimizerDecisionKind::BridgeChainRoot,
 		}
 	}
 
@@ -2215,8 +2292,26 @@ impl GraphShape {
 		match self {
 			GraphShape::Galaxy => analyze_galaxy(&render.join_order_edges, &trace.join_decisions)
 				.map(|galaxy| galaxy_order_recommendation(&galaxy)),
+			// ADR 205: Bridge actuation is a SINGLE junction only — a multi-junction chain is Chain's, not a
+			// partial re-root around the first junction (`bridge_order_recommendation` reads `links.first()`).
 			GraphShape::Bridge => analyze_bridge(&render.join_order_edges, &trace.join_decisions)
+				.filter(|bridge| bridge.links.len() == 1)
 				.map(|bridge| bridge_order_recommendation(&bridge)),
+			GraphShape::Chain => {
+				analyze_bridge_chain(&render.join_order_edges, &trace.join_decisions)
+					.map(|chain| bridge_chain_order_recommendation(&chain))
+			}
+		}
+	}
+
+	// ADR 205: re-root the recognized graph. Galaxy/Bridge rotate around the pivot; a chain has no pivot, so
+	// it is a path reversal (drive from `D`).
+	fn reroot(self, plan: &LogicalPlan, rec: &GraphOrderRecommendation) -> Option<LogicalPlan> {
+		match self {
+			GraphShape::Galaxy | GraphShape::Bridge => {
+				reroot_galaxy_join_tree(plan, &rec.pivot, &rec.preferred_root)
+			}
+			GraphShape::Chain => reverse_bridge_chain_join_tree(plan, &rec.preferred_root),
 		}
 	}
 
@@ -2224,6 +2319,7 @@ impl GraphShape {
 		match self {
 			GraphShape::Galaxy => render.set_applied_galaxy_root(root),
 			GraphShape::Bridge => render.set_applied_bridge_root(root),
+			GraphShape::Chain => render.set_applied_bridge_chain_root(root),
 		}
 	}
 }
@@ -2364,14 +2460,21 @@ impl<'a> Binder<'a> {
 		// no-op-recorder binder: the committed graph decision is accrued once by the caller, so the
 		// re-rooted plan's own re-recognition (a phantom `KeptAlreadyOptimal`) is discarded. Plan and
 		// render are unaffected — only the decision sink differs.
-		let Some(rerooted) =
-			reroot_galaxy_join_tree(plan, &recommendation.pivot, &recommendation.preferred_root)
-		else {
+		let Some(rerooted) = shape.reroot(plan, &recommendation) else {
 			return Ok(GraphActuationResult::Declined(
 				OptimizerDecisionDeclineReason::MissingEstimate,
 			));
 		};
 		let preferred_root = recommendation.preferred_root.clone();
+		// ADR 205: the reversed chain is ASYMMETRIC — interior junctions fail the inverse-F1 gate in reverse
+		// (a bridge becomes dimension-like), so the reversed plan does NOT re-recognize as a chain (unlike
+		// the symmetric galaxy/bridge re-root). Re-derive the recognized chain from the scratch edges (the
+		// scratch bind populates edges but not the observe-hook field) so the receipt can render the actuated
+		// path even though re-recognition yields nothing.
+		let scratch_chain = analyze_bridge_chain(
+			&scratch_render.join_order_edges,
+			&scratch_trace.join_decisions,
+		);
 		let bound = self
 			.without_decision_recording()
 			.bind_plan_with_trace(&rerooted, trace, render_trace, JoinOrderSourceCapture::On)
@@ -2379,6 +2482,15 @@ impl<'a> Binder<'a> {
 		// The receipt reflects the applied re-root, not the re-rooted graph's intrinsic recommendation.
 		if let Some(render_trace) = render_trace.as_mut() {
 			shape.set_applied_root(render_trace, preferred_root);
+			// ADR 205: restore the recognized chain for the receipt (the reversed plan did not re-recognize).
+			// The actuated-order *verdict* is deferred — judging the reversed execution needs reversed-plan
+			// edge targets that only re-recognition supplies; the 204 observe verdict still judges non-
+			// actuated chains.
+			if shape == GraphShape::Chain && render_trace.bridge_chain_order.is_none() {
+				if let Some(chain) = scratch_chain {
+					render_trace.set_observed_bridge_chain(chain);
+				}
+			}
 		}
 		Ok(GraphActuationResult::Actuated(bound))
 	}

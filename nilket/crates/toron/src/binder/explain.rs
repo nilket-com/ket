@@ -87,6 +87,9 @@ pub(super) struct OptimizerExplainRenderTrace {
 	// ADR 199: when bridge actuation fires, the applied dimension root. The bridge receipt then shows
 	// `action=reordered; applied_root={dim}` instead of the re-rooted bridge's intrinsic recommendation.
 	pub(super) applied_bridge_root: Option<String>,
+	// ADR 205: when chain actuation fires, the applied `D` driver-end. The chain row then shows
+	// `reordered; applied_root={D}` instead of the observe-only `observed`.
+	pub(super) applied_bridge_chain_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +161,10 @@ impl OptimizerExplainRenderTrace {
 
 	pub(super) fn set_applied_bridge_root(&mut self, root: String) {
 		self.applied_bridge_root = Some(root);
+	}
+
+	pub(super) fn set_applied_bridge_chain_root(&mut self, root: String) {
+		self.applied_bridge_chain_root = Some(root);
 	}
 
 	pub(super) fn set_star_receipt(&mut self, receipt: StarOrderRenderReceipt) {
@@ -435,7 +442,10 @@ pub(super) fn optimizer_explain_plan(
 		// ADR 203: a recognized bridge chain renders an additional observe-only path row, after its
 		// per-junction bridge rows.
 		if let Some(chain) = &render_trace.bridge_chain_order {
-			rows.push(optimizer_explain_bridge_chain_row(chain));
+			rows.push(optimizer_explain_bridge_chain_row(
+				chain,
+				render_trace.applied_bridge_chain_root.as_deref(),
+			));
 		}
 	}
 	system_table_plan(
@@ -593,29 +603,39 @@ fn measured_verdicts_from_summaries(
 			});
 		}
 	}
-	if let Some(bridge) = &render_trace.bridge_order {
-		if let Some(rec) = bridge_order_recommendation(bridge) {
-			if let Some(measured) = bridge_measured_costs(bridge, summaries) {
-				verdicts.push(MeasuredLevelVerdict {
-					kind: OptimizerDecisionKind::BridgeRoot,
-					verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
-						&rec, &measured,
-					)),
-				});
+	// ADR 205: the 3-way partition extends to the verdict log — a chain query also carries `bridge_order`
+	// (additive per-junction evidence, judged only at `links.first()`), so without this gate the sampled
+	// verdict log would double-count a partial first-junction `BridgeRoot` alongside the authoritative
+	// `BridgeChainRoot`. The chain verdict is authoritative; the partial single-bridge verdict is suppressed.
+	if render_trace.bridge_chain_order.is_none() {
+		if let Some(bridge) = &render_trace.bridge_order {
+			if let Some(rec) = bridge_order_recommendation(bridge) {
+				if let Some(measured) = bridge_measured_costs(bridge, summaries) {
+					verdicts.push(MeasuredLevelVerdict {
+						kind: OptimizerDecisionKind::BridgeRoot,
+						verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
+							&rec, &measured,
+						)),
+					});
+				}
 			}
 		}
 	}
 	// ADR 203: judge the recognized bridge chain's recommended path order against the measured per-hop
-	// fan-out. Verdict-only (no decision-log accrual; the chain is observe-only).
+	// fan-out. ADR 205: only for a NON-actuated (observed) chain — an actuated chain reversed its execution,
+	// whose measured costs key to reversed-plan targets the recognized (AST) evidence cannot supply, so the
+	// actuated-order verdict is deferred.
 	if let Some(chain) = &render_trace.bridge_chain_order {
-		if let Some(rec) = bridge_chain_order_recommendation(chain) {
-			if let Some(measured) = bridge_chain_measured_costs(chain, summaries) {
-				verdicts.push(MeasuredLevelVerdict {
-					kind: OptimizerDecisionKind::BridgeChainRoot,
-					verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
-						&rec, &measured,
-					)),
-				});
+		if render_trace.applied_bridge_chain_root.is_none() {
+			if let Some(rec) = bridge_chain_order_recommendation(chain) {
+				if let Some(measured) = bridge_chain_measured_costs(chain, summaries) {
+					verdicts.push(MeasuredLevelVerdict {
+						kind: OptimizerDecisionKind::BridgeChainRoot,
+						verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
+							&rec, &measured,
+						)),
+					});
+				}
 			}
 		}
 	}
@@ -1190,17 +1210,24 @@ fn bridge_analyze_rows(
 	// actually ran is the fact root `F`, so its measured cost is the incoming edge's measured output (the
 	// materialized `F⋈B` fan-out); the dimension root `D` is the un-run counterfactual, costed by the
 	// `B⋈D` outgoing edge estimate. A measured fan-out above the `D`-root estimate reorders (`MissedWin`).
-	if let Some(rec) = bridge_order_recommendation(bridge) {
-		if let Some(measured) = bridge_measured_costs(bridge, summaries) {
-			rows.push(graph_order_verdict_row(&rec, &measured));
+	// ADR 205: suppressed for a chain — its authoritative chain verdict replaces the partial first-junction
+	// bridge verdict (the 3-way partition on the verdict surface). Per-junction runtime rows above remain.
+	if render_trace.bridge_chain_order.is_none() {
+		if let Some(rec) = bridge_order_recommendation(bridge) {
+			if let Some(measured) = bridge_measured_costs(bridge, summaries) {
+				rows.push(graph_order_verdict_row(&rec, &measured));
+			}
 		}
 	}
 	// ADR 203: the chain measured verdict — the compounded path scorer fed the measured per-hop fan-out.
-	// Observe-only (a verdict row, never a re-root). Additive beside the per-junction bridge verdict above.
+	// ADR 205: only for a NON-actuated (observed) chain (the actuated-order verdict is deferred; see
+	// `measured_verdicts_from_summaries`). Additive beside the per-junction bridge verdict above.
 	if let Some(chain) = &render_trace.bridge_chain_order {
-		if let Some(rec) = bridge_chain_order_recommendation(chain) {
-			if let Some(measured) = bridge_chain_measured_costs(chain, summaries) {
-				rows.push(graph_order_verdict_row(&rec, &measured));
+		if render_trace.applied_bridge_chain_root.is_none() {
+			if let Some(rec) = bridge_chain_order_recommendation(chain) {
+				if let Some(measured) = bridge_chain_measured_costs(chain, summaries) {
+					rows.push(graph_order_verdict_row(&rec, &measured));
+				}
 			}
 		}
 	}
@@ -1577,9 +1604,12 @@ pub(super) fn bridge_chain_order_target_label(chain: &BridgeChainEvidence) -> St
 	format!("chain[{}]", path.join("->"))
 }
 
-// ADR 203: the per-hop signatures + the observe-only path-ordering recommendation (declared/preferred
-// end, action, per-end costs).
-pub(super) fn bridge_chain_order_detail_label(chain: &BridgeChainEvidence) -> String {
+// ADR 203/205: the per-hop signatures + the path-ordering recommendation (declared/preferred end, action,
+// per-end costs). When `applied_root` is set (ADR 205 actuation), the receipt shows the applied reversal.
+pub(super) fn bridge_chain_order_detail_label(
+	chain: &BridgeChainEvidence,
+	applied_root: Option<&str>,
+) -> String {
 	let hops = chain
 		.hops
 		.iter()
@@ -1595,19 +1625,45 @@ pub(super) fn bridge_chain_order_detail_label(chain: &BridgeChainEvidence) -> St
 		})
 		.collect::<Vec<_>>()
 		.join("; ");
-	let order = bridge_chain_order_recommendation(chain)
-		.map(|rec| graph_order_recommendation_label(&rec))
-		.unwrap_or_default();
+	let order = match applied_root {
+		// ADR 205: actuation fired — the receipt shows the applied reversal, not the reversed chain's
+		// intrinsic (now kept-optimal) recommendation.
+		Some(root) => {
+			let costs = bridge_chain_order_recommendation(chain)
+				.map(|rec| {
+					rec.costs
+						.iter()
+						.map(|(label, cost)| format!("{label}:{cost}"))
+						.collect::<Vec<_>>()
+						.join(",")
+				})
+				.unwrap_or_default();
+			format!("; action=reordered; applied_root={root}; costs=[{costs}]")
+		}
+		None => bridge_chain_order_recommendation(chain)
+			.map(|rec| graph_order_recommendation_label(&rec))
+			.unwrap_or_default(),
+	};
 	format!("{hops}{order}")
 }
 
-// ADR 203: the observe-only bridge chain cockpit row (`outcome=observed`; the chain is never actuated).
-pub(super) fn optimizer_explain_bridge_chain_row(chain: &BridgeChainEvidence) -> Vec<ScalarValue> {
+// ADR 203/205: the bridge chain cockpit row — `observed` until actuation fires, then `reordered`.
+pub(super) fn optimizer_explain_bridge_chain_row(
+	chain: &BridgeChainEvidence,
+	applied_root: Option<&str>,
+) -> Vec<ScalarValue> {
 	vec![
 		ScalarValue::Utf8(Some("join_order_bridge_chain".to_string())),
 		ScalarValue::Utf8(Some(bridge_chain_order_target_label(chain))),
-		ScalarValue::Utf8(Some("observed".to_string())),
-		ScalarValue::Utf8(Some(bridge_chain_order_detail_label(chain))),
+		ScalarValue::Utf8(Some(
+			if applied_root.is_some() {
+				"reordered"
+			} else {
+				"observed"
+			}
+			.to_string(),
+		)),
+		ScalarValue::Utf8(Some(bridge_chain_order_detail_label(chain, applied_root))),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),

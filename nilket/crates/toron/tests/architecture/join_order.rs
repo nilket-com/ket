@@ -2079,11 +2079,12 @@ pub(crate) fn adr202_n_fact_reroot_reuses_gated_seam() {
 	let join_order = source("src/binder/join_order.rs");
 	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
 
-	// The generalized re-root is driven by the existing gated actuator with the recommendation's
-	// pivot + preferred_root — no new actuator, decision kind, or verdict surface.
-	assert!(actuation.contains("reroot_galaxy_join_tree("));
-	assert!(actuation.contains("recommendation.pivot"));
-	assert!(actuation.contains("recommendation.preferred_root"));
+	// The generalized re-root is driven by the existing gated actuator with the recommendation (ADR 205
+	// dispatches the reroot through `shape.reroot`; the galaxy/bridge arm still reads `pivot` +
+	// `preferred_root` inside `GraphShape::reroot`) — no new actuator, decision kind, or verdict surface.
+	let reroot = first_block(&join_order, "fn reroot(self");
+	assert!(actuation.contains("shape.reroot(plan, &recommendation)"));
+	assert!(reroot.contains("reroot_galaxy_join_tree(plan, &rec.pivot, &rec.preferred_root)"));
 }
 
 #[test]
@@ -2175,6 +2176,93 @@ pub(crate) fn adr204_chain_verdict_folds_all_middles() {
 	assert!(costs.contains("tail.dim.clone()"));
 }
 
+// ADR 205: chain actuation reuses the unified actuator + gating; the reroot is dispatched, not hardcoded.
+#[test]
+pub(crate) fn adr205_chain_actuation_reuses_unified_gating() {
+	let join_order = source("src/binder/join_order.rs");
+	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
+	let binder = binder_source();
+
+	// The reroot is dispatched through the shape (no hardcoded galaxy reroot in the actuator), and the
+	// 190/191 soft margin + no-op-recorder scratch + decision accrual are reused — no new actuator.
+	assert!(actuation.contains("shape.reroot("));
+	assert!(!actuation.contains("reroot_galaxy_join_tree(plan"));
+	assert!(actuation.contains("join_order_soft_margin_step.margin()"));
+	assert!(actuation.contains("without_decision_recording"));
+	assert!(binder.contains("accrue_graph_order_decision"));
+	assert!(binder.contains("GraphShape::Chain"));
+}
+
+#[test]
+pub(crate) fn adr205_chain_reroot_is_path_reversal_not_star() {
+	let join_order = source("src/binder/join_order.rs");
+	let reverse = first_block(&join_order, "pub(super) fn reverse_bridge_chain_join_tree");
+	let reroot = first_block(&join_order, "fn reroot(self");
+
+	// A dedicated path-reversal reassociation (NOT the star-pivot galaxy reroot), carrying join meta by
+	// original edge index (the 202 F1 trap), dispatched for `Chain`.
+	assert!(join_order.contains("pub(super) fn reverse_bridge_chain_join_tree"));
+	assert!(reverse.contains("join_meta[i - 1]")); // meta by original edge index, not rebuilt position
+	assert!(reroot.contains("GraphShape::Chain => reverse_bridge_chain_join_tree"));
+	assert!(reroot.contains("reroot_galaxy_join_tree")); // galaxy/bridge still rotate around the pivot
+}
+
+#[test]
+pub(crate) fn adr205_bridge_arm_is_single_junction() {
+	let join_order = source("src/binder/join_order.rs");
+	let recommend = first_block(&join_order, "fn recommend(");
+
+	// ADR 205: the Bridge actuation arm is gated to ONE junction so a multi-junction chain is Chain's
+	// exclusively (the 3-way partition) — never a partial re-root around the first junction.
+	assert!(recommend.contains("bridge.links.len() == 1"));
+	assert!(recommend.contains("analyze_bridge_chain"));
+}
+
+// ADR 205: the 3-way partition extends to the VERDICT surface — a chain carries per-junction `bridge_order`
+// too, so the bridge verdict (judged at `links.first()`) is suppressed when a chain is recognized, leaving
+// only the authoritative `BridgeChainRoot`. Without this the verdict log double-counts.
+#[test]
+pub(crate) fn adr205_chain_suppresses_partial_bridge_verdict() {
+	let explain = source("src/binder/explain.rs");
+	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
+	let analyze = first_block(&explain, "fn bridge_analyze_rows");
+
+	// Both the sampled verdict log and the EXPLAIN ANALYZE verdict row gate the bridge arm on the absence
+	// of a chain, so a chain query never emits a partial first-junction `BridgeRoot` verdict.
+	assert!(verdicts.contains("if render_trace.bridge_chain_order.is_none()"));
+	assert!(analyze.contains("if render_trace.bridge_chain_order.is_none()"));
+}
+
+#[test]
+pub(crate) fn adr205_chain_actuation_is_binder_only() {
+	let manifest = manifest_dir();
+	let markers = [
+		"reverse_bridge_chain_join_tree",
+		"applied_bridge_chain_root",
+		"set_applied_bridge_chain_root",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/distributed/fragment.rs"),
+		manifest.join("src/exec.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR205 chain actuation leaked outside the binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
 #[test]
 pub(crate) fn adr203_chain_recognition_runs_at_bind_time() {
 	let binder = binder_source();
@@ -2213,9 +2301,11 @@ pub(crate) fn adr200_unified_actuator_reuses_snowflake_machinery() {
 	let join_order = source("src/binder/join_order.rs");
 	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
 
-	// The re-rooted graph binds through the normal path (the existing staging + fragmenter) and reuses
-	// the 198 role-neutral reroot — graph actuation defines no new reassociation and no new fragmenter.
-	assert!(actuation.contains("reroot_galaxy_join_tree"));
+	// The re-rooted graph binds through the normal path (the existing staging + fragmenter); galaxy/bridge
+	// reuse the 198 role-neutral reroot (ADR 205 dispatches it via `shape.reroot`) — no new reassociation
+	// for the star shapes, no new fragmenter, and no per-shape `reroot_bridge`.
+	assert!(actuation.contains("shape.reroot("));
+	assert!(join_order.contains("reroot_galaxy_join_tree"));
 	assert!(actuation.contains("bind_plan_with_trace"));
 	assert!(!join_order.contains("fn reroot_bridge"));
 	let fragment = source("src/distributed/fragment.rs");

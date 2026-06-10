@@ -14830,12 +14830,12 @@ async fn two_hop_bridge_chain_is_recognized() {
 	assert_utf8_contains(&chain_row[3], "preferred_root=orders");
 }
 
-// ADR 203 honesty gate: a reachable chain whose AST driver-end is not the cheaper one emits a
-// `join_order_bridge_chain` row naming both hops and the preferred end. A selective predicate on the
-// `D`-end (`promotions.tier = 7`) makes `B2⋈D` the cheaper entry hop, flipping the recommendation to
-// drive from `promotions`. Must fail on `main` (no chain recognizer); plan + results byte-identical.
+// ADR 205: a reachable chain whose AST driver-end is not the cheaper one now ACTUATES (204 only observed
+// it). A selective predicate on the `D`-end (`promotions.tier = 7`) makes `B2⋈D` the cheaper entry hop, so
+// the chain reverses to drive from `promotions`: the `join_order_bridge_chain` row flips to `reordered`
+// with `applied_root=promotions`. Must fail on `main` (204 is observe-only — no chain in the actuation loop).
 #[tokio::test]
-async fn two_hop_bridge_chain_recommends_cheaper_driver_end() {
+async fn two_hop_bridge_chain_reroots_to_cheaper_driver_end() {
 	let catalog = bridge_chain_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", selective_two_hop_bridge_chain_sql()))
@@ -14852,22 +14852,53 @@ async fn two_hop_bridge_chain_recommends_cheaper_driver_end() {
 	);
 	assert_eq!(
 		chain_row[2],
-		ScalarValue::Utf8(Some("observed".to_string()))
+		ScalarValue::Utf8(Some("reordered".to_string()))
 	);
-	assert_utf8_contains(&chain_row[3], "action=reordered");
-	assert_utf8_contains(&chain_row[3], "preferred_root=promotions");
+	assert_utf8_contains(&chain_row[3], "applied_root=promotions");
 }
 
-// ADR 203 D3 proof: under the sampled verdict path, the recognized chain accrues a `bridge_chain_root`
-// runtime verdict — the measured per-hop fan-out feeds the path scorer through the existing 201
-// `measured_verdicts_from_summaries` seam, with a determinate verdict once both ends are measured. This
-// is the reality check that gates the (deferred) chain re-root.
+// ADR 205 load-bearing discriminator (the 3-way partition): a multi-junction chain actuates as a CHAIN,
+// never as a partial single-bridge re-root around its first junction. The selective chain accrues a
+// `bridge_chain_root, reordered` decision and NO `bridge_root, reordered` decision — proving the Bridge
+// actuation arm is gated to one junction. Fails under the ungated Bridge arm (`links.first()`).
+#[tokio::test]
+async fn chain_query_does_not_trigger_single_bridge_actuation() {
+	let catalog = bridge_chain_join_order_catalog();
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let _ = bind(
+		&SqlPlanner::new()
+			.plan(selective_two_hop_bridge_chain_sql())
+			.expect("plan selective chain"),
+		&catalog,
+		&config,
+	)
+	.await
+	.expect("bind selective chain");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+	assert_eq!(
+		optimizer_decision_count(&rows, "bridge_chain_root", "reordered", None),
+		1,
+		"a multi-junction chain actuates as a chain: {rows:?}"
+	);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| row[0] == ScalarValue::Utf8(Some("bridge_root".to_string()))),
+		"the single-bridge arm must NOT fire on a chain: {rows:?}"
+	);
+}
+
+// ADR 203 D3 proof (ADR 205: an OBSERVED chain): under the sampled verdict path, a recognized non-actuated
+// chain accrues a `bridge_chain_root` runtime verdict — the measured per-hop fan-out feeds the path scorer
+// through the existing 201 `measured_verdicts_from_summaries` seam, with a determinate verdict once both
+// ends are measured. (The clean FK chain keeps its AST order, so it stays observed; an actuated chain's
+// verdict is deferred — 205.)
 #[tokio::test]
 async fn chain_verdict_vindicates_or_faults_recommended_order() {
 	let catalog = bridge_chain_join_order_catalog();
 	let logical = SqlPlanner::new()
-		.plan(selective_two_hop_bridge_chain_sql())
-		.expect("plan selective chain");
+		.plan(two_hop_bridge_chain_sql())
+		.expect("plan clean chain");
 	let binding =
 		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
 			.await
@@ -14884,6 +14915,34 @@ async fn chain_verdict_vindicates_or_faults_recommended_order() {
 		chain_verdict.verdict,
 		OptimizerRuntimeVerdictClass::Indeterminate,
 		"a measured chain yields a determinate verdict: {verdicts:?}"
+	);
+}
+
+// ADR 205 F1: the 3-way partition holds on the VERDICT log. A chain query also carries per-junction bridge
+// evidence (`bridge_order`), but the sampled verdict log emits only the authoritative `BridgeChainRoot` —
+// never a partial first-junction `BridgeRoot` (judged at `links.first()` alone). Fails under an ungated
+// bridge verdict arm (which would double-count both kinds for one chain query).
+#[tokio::test]
+async fn chain_verdict_log_has_no_partial_bridge_verdict() {
+	let catalog = bridge_chain_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(two_hop_bridge_chain_sql())
+		.expect("plan clean chain");
+	let binding =
+		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind chain analyze");
+	let observations = uniform_observations(&binding);
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure chain verdicts");
+	let kinds = verdict_kinds(&verdicts);
+	assert!(
+		kinds.contains(&OptimizerDecisionKind::BridgeChainRoot),
+		"a chain emits its authoritative chain verdict: {kinds:?}"
+	);
+	assert!(
+		!kinds.contains(&OptimizerDecisionKind::BridgeRoot),
+		"a chain must NOT emit a partial first-junction bridge verdict: {kinds:?}"
 	);
 }
 

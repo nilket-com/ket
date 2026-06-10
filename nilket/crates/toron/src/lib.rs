@@ -2937,6 +2937,169 @@ mod tests {
 		);
 	}
 
+	// ADR 205: the bridge-chain exec fixture — a reachable 3-hop chain
+	// `orders ⋈ order_lines ⋈ line_promotions ⋈ promo_tiers ⋈ promotions` with real joinable rows.
+	fn chain_exec_catalog() -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		let register = |catalog: &mut MockCatalog, id: u8, name: &str, cols: &[&str]| {
+			let schema = Schema::new(
+				cols.iter()
+					.map(|c| Field::new(*c, DataType::Int64, false))
+					.collect::<Vec<_>>(),
+			);
+			catalog
+				.register_descriptor(TableId(u64::from(id)), named_descriptor(id, name, schema))
+				.unwrap();
+		};
+		register(&mut catalog, 1, "orders", &["id"]);
+		register(&mut catalog, 2, "order_lines", &["id", "order_id"]);
+		register(
+			&mut catalog,
+			3,
+			"line_promotions",
+			&["id", "line_id", "tier_id"],
+		);
+		register(&mut catalog, 4, "promo_tiers", &["id", "promotion_id"]);
+		register(&mut catalog, 5, "promotions", &["id"]);
+		for (table, bytes, rows, ndv) in [
+			("orders", 512_u64, 2_u64, vec![(0, 2_u64)]),
+			(
+				"order_lines",
+				1_024_u64,
+				3_u64,
+				vec![(0, 3_u64), (1, 2_u64)],
+			),
+			(
+				"line_promotions",
+				2_048_u64,
+				3_u64,
+				vec![(0, 3_u64), (1, 3_u64), (2, 2_u64)],
+			),
+			(
+				"promo_tiers",
+				1_024_u64,
+				2_u64,
+				vec![(0, 2_u64), (1, 2_u64)],
+			),
+			("promotions", 512_u64, 2_u64, vec![(0, 2_u64)]),
+		] {
+			catalog
+				.seed_optimizer_facts(
+					&crate::catalog::TableRef::new(table),
+					TableOptimizerFacts {
+						byte_upper_bound: Some(ByteCount::new(bytes)),
+						row_upper_bound: Some(RowCount::new(rows)),
+						column_ndv: ndv
+							.into_iter()
+							.map(|(col, distinct)| {
+								(ColumnOrdinal(col), DistinctCountFact::Exact(distinct))
+							})
+							.collect(),
+						column_range: Default::default(),
+						column_range_distributions: Default::default(),
+						column_heavy_hitters: Default::default(),
+						column_group_top_k: Default::default(),
+						column_group_ndv: Default::default(),
+					},
+				)
+				.expect("seed chain facts");
+		}
+		Arc::new(catalog)
+	}
+
+	fn chain_exec_storage() -> Arc<MultiTableStorageScan> {
+		let batch = |cols: Vec<(&str, Vec<i64>)>| {
+			let fields = cols
+				.iter()
+				.map(|(name, _)| Field::new(*name, DataType::Int64, false))
+				.collect::<Vec<_>>();
+			let arrays: Vec<arrow::array::ArrayRef> = cols
+				.into_iter()
+				.map(|(_, vals)| Arc::new(Int64Array::from(vals)) as arrow::array::ArrayRef)
+				.collect();
+			RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+		};
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([
+				(TableId(1), batch(vec![("id", vec![1, 2])])),
+				(
+					TableId(2),
+					batch(vec![("id", vec![10, 11, 12]), ("order_id", vec![1, 1, 2])]),
+				),
+				(
+					TableId(3),
+					batch(vec![
+						("id", vec![100, 101, 102]),
+						("line_id", vec![10, 11, 12]),
+						("tier_id", vec![1000, 1001, 1000]),
+					]),
+				),
+				(
+					TableId(4),
+					batch(vec![("id", vec![1000, 1001]), ("promotion_id", vec![5, 6])]),
+				),
+				(TableId(5), batch(vec![("id", vec![5, 6])])),
+			]),
+		})
+	}
+
+	// ADR 205 Phase 0 (THE GATE, independent of actuation): the hand-written REVERSED chain (`FROM
+	// promotions …`, projecting the AST column order) executes distributed and digest-matches the AST-order
+	// baseline (`FROM orders …`). This proves the reversed chain is correct + fragmentable today as a plain
+	// left-deep inner chain — before any actuation code exists. If this fails, ADR 205 is a fragmenter cut.
+	#[tokio::test]
+	async fn three_hop_chain_reverse_digest_matches_ast_order_distributed() {
+		let ast = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT orders.id, promotions.id FROM orders \
+				 INNER JOIN order_lines ON orders.id = order_lines.order_id \
+				 INNER JOIN line_promotions ON order_lines.id = line_promotions.line_id \
+				 INNER JOIN promo_tiers ON line_promotions.tier_id = promo_tiers.id \
+				 INNER JOIN promotions ON promo_tiers.promotion_id = promotions.id",
+			)
+			.expect("plan AST-order chain");
+		// Reversed FROM (promotions-first), SAME projection / column order as the AST query.
+		let reversed = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT orders.id, promotions.id FROM promotions \
+				 INNER JOIN promo_tiers ON promo_tiers.promotion_id = promotions.id \
+				 INNER JOIN line_promotions ON line_promotions.tier_id = promo_tiers.id \
+				 INNER JOIN order_lines ON order_lines.id = line_promotions.line_id \
+				 INNER JOIN orders ON orders.id = order_lines.order_id",
+			)
+			.expect("plan reversed chain");
+
+		let ast_result =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				ast,
+				chain_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				chain_exec_storage(),
+			)
+			.await
+			.expect("execute AST-order chain");
+		let reversed_result =
+			run_distributed_join_query_with_catalog_config_budget_storage_and_replay_signal(
+				reversed,
+				chain_exec_catalog(),
+				PlannerConfig::default(),
+				QueryBudget::test_default(),
+				chain_exec_storage(),
+			)
+			.await
+			.expect("execute reversed chain");
+
+		assert!(!ast_result.results.is_empty(), "chain produced rows");
+		assert_eq!(
+			canonical_arrow_ipc_digest(&reversed_result.results, SortPolicy::FullRowLex)
+				.expect("reversed digest"),
+			canonical_arrow_ipc_digest(&ast_result.results, SortPolicy::FullRowLex)
+				.expect("AST digest"),
+			"reversed chain must digest-match the AST-order baseline"
+		);
+	}
+
 	// ADR 202: a 3-fact galaxy — sales/returns/shipments all conformed on `product`. `shipments` is the
 	// smallest fact (cost-optimal root); the FROM root `sales` is the largest. Used to prove the n-fact
 	// re-root fragments + digest-matches before any actuation code exists (Phase 0 gate).

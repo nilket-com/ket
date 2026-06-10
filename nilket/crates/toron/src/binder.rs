@@ -1123,7 +1123,7 @@ impl<'a> Binder<'a> {
 					// both fire. The committed decision is accrued here (one per recognized graph); on the
 					// no-op recorder of a re-rooted re-bind it is discarded, so no phantom doubles it. If
 					// either actuates, the re-rooted snowflake is already bound, so we return it.
-					for shape in [GraphShape::Galaxy, GraphShape::Bridge] {
+					for shape in [GraphShape::Galaxy, GraphShape::Bridge, GraphShape::Chain] {
 						let result = self
 							.try_bind_graph_actuation(plan, trace, render_trace, shape)
 							.await?;
