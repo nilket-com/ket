@@ -1,17 +1,21 @@
 # Impl Plan — ADR 201: Graph Verdict Accrual
 
 Pairs with `plans/adr/201_graph_verdict_accrual.md`. Side-effect-only: execution plans + EXPLAIN
-receipts stay byte-identical to `main`. All anchors verified against the tree.
+receipts stay byte-identical to `main`.
 
-## Anchors (verified)
+## Anchors
 
-| Concern | Anchor |
+The measured-cost rows are reconciled to the **as-built** tree: D1/D2 factored the per-shape assemblies
+into the shared helpers below (the pre-201 galaxy `galaxy_measured_fact_cost` and the inline
+`bridge_analyze_rows` vec were the *inputs* to that extraction).
+
+| Concern | Anchor (as built) |
 |---|---|
-| Sampled verdict producer (add arms here) | `measured_verdicts_from_summaries` (explain.rs:517) — `ObservedSnowflake` arm + `StarReceipts` loop |
+| Sampled verdict producer (arms added here) | `measured_verdicts_from_summaries` (explain.rs:517) — `ObservedSnowflake` arm + `StarReceipts` loop |
 | Verdict carrier / class map | `MeasuredLevelVerdict` (:461), `runtime_verdict_class_from_star` (:694) |
-| Render-time verdict to extract from | `graph_order_verdict_row` (explain.rs) — inline Vindicated/MissedWin/Indeterminate |
-| Galaxy measured-cost assembly | `galaxy_measured_fact_cost` (explain.rs ~:905) + `galaxy_order_recommendation` |
-| Bridge measured-cost assembly | the `bridge_analyze_rows` measured `vec` (fact = measured incoming `output_rows`; dim = `outgoing_edge_rows`) |
+| Shared verdict classifier (extracted) | `measured_graph_order_verdict` (explain.rs) — called by render `graph_order_verdict_row` + the accrual arms |
+| Galaxy measured-cost assembly | `galaxy_measured_costs` (explain.rs:949) wrapping `galaxy_measured_fact_cost` |
+| Bridge measured-cost assembly | `bridge_measured_costs` (explain.rs:968) — fact = measured incoming `output_rows`; dim = `outgoing_edge_rows` |
 | Actuation marker (NOT on evidence) | `render_trace.applied_galaxy_root` / `applied_bridge_root` (explain.rs:84/87) — render-trace fields |
 | Observations already collected | `star_order_runtime_replay_ids` (binder.rs:301) unions galaxy + bridge targets |
 | Sampled → verdict log (no change needed) | `coordinator.rs:1335` / `:2447` loop `measured_explain_analyze_verdicts` → `record_verdict(kind, verdict)` |
@@ -46,9 +50,7 @@ if !graph_actuated {
 // D2: graph verdict — emitted whenever a graph is recognized (kept or actuated).
 if let Some(galaxy) = &render_trace.galaxy_order {
     if let Some(rec) = galaxy_order_recommendation(galaxy) {
-        let measured = rec.costs.iter()
-            .map(|(fact, _)| (fact.clone(), galaxy_measured_fact_cost(galaxy, fact, &rec.pivot, summaries)))
-            .collect::<Vec<_>>();
+        let measured = galaxy_measured_costs(galaxy, &rec, summaries);
         verdicts.push(MeasuredLevelVerdict {
             kind: OptimizerDecisionKind::GalaxyRoot,
             verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(&rec, &measured)),
@@ -57,20 +59,20 @@ if let Some(galaxy) = &render_trace.galaxy_order {
 }
 if let Some(bridge) = &render_trace.bridge_order {
     if let Some(rec) = bridge_order_recommendation(bridge) {
-        // reuse the bridge_analyze_rows measured assembly: fact = measured incoming output_rows,
-        // dim = outgoing_edge_rows estimate (factor it into a shared helper to avoid drift).
-        verdicts.push(MeasuredLevelVerdict {
-            kind: OptimizerDecisionKind::BridgeRoot,
-            verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(&rec, &measured)),
-        });
+        if let Some(measured) = bridge_measured_costs(bridge, summaries) {
+            verdicts.push(MeasuredLevelVerdict {
+                kind: OptimizerDecisionKind::BridgeRoot,
+                verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(&rec, &measured)),
+            });
+        }
     }
 }
 Ok(verdicts)
 ```
 
 Convert the `ObservedSnowflake` early `return` into a push into `verdicts` (inside the `!graph_actuated`
-block). Factor the bridge measured assembly out of `bridge_analyze_rows` into a shared helper so render
-and accrual cannot drift (mirror D1).
+block). The per-shape measured assemblies are extracted into `galaxy_measured_costs` / `bridge_measured_costs`
+(used by both render `*_analyze_rows` and the accrual arms) so render and accrual cannot drift (mirror D1).
 
 ## Phase 3 — guards + tests
 
@@ -115,5 +117,5 @@ cargo fmt -p toron -- --check ; git diff --check
   for an actuated graph) and the kept-graph discriminator (both verdicts coexist).
 - **Render drift (D1).** Mitigated by the Phase-1 checkpoint: 197/200 ANALYZE verdict rows byte-identical
   after the extraction.
-- **Bridge measured assembly drift.** Factor it out of `bridge_analyze_rows` into one helper used by both
-  render and accrual.
+- **Bridge measured assembly drift.** Extracted into `bridge_measured_costs` (and `galaxy_measured_costs`),
+  the single helper used by both render `*_analyze_rows` and the accrual arms.

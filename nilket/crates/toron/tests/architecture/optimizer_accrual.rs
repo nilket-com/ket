@@ -847,3 +847,69 @@ pub(crate) fn adr191_no_executor_fragmenter_storage_or_wendelon_change() {
 pub(crate) fn adr191_no_optimizer_shell_or_planproperties_contract() {
 	adr189_no_optimizer_shell_or_planproperties_contract();
 }
+
+#[test]
+pub(crate) fn adr201_graph_verdicts_accrue_to_sampled_runtime_log() {
+	let explain = source("src/binder/explain.rs");
+	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
+
+	// The sampled verdict producer emits graph verdicts from the recognized galaxy/bridge evidence.
+	assert!(verdicts.contains("render_trace.galaxy_order"));
+	assert!(verdicts.contains("render_trace.bridge_order"));
+	assert!(verdicts.contains("OptimizerDecisionKind::GalaxyRoot"));
+	assert!(verdicts.contains("OptimizerDecisionKind::BridgeRoot"));
+}
+
+#[test]
+pub(crate) fn adr201_verdict_computation_is_shared_between_render_and_accrual() {
+	let explain = source("src/binder/explain.rs");
+	let render_row = first_block(&explain, "fn graph_order_verdict_row");
+	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
+
+	// One authoritative classifier — render row and sampled accrual both call it.
+	assert!(explain.contains("fn measured_graph_order_verdict"));
+	assert!(render_row.contains("measured_graph_order_verdict"));
+	assert!(verdicts.contains("measured_graph_order_verdict"));
+}
+
+#[test]
+pub(crate) fn adr201_actuated_graph_suppresses_orphan_tree_verdict() {
+	let explain = source("src/binder/explain.rs");
+	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
+
+	// Tree verdicts are gated on the actuated-graph check (the no-op-rebind suppressed their decisions),
+	// so an actuated graph emits no orphan tree verdict.
+	assert!(verdicts.contains("let graph_actuated"));
+	assert!(verdicts.contains("render_trace.applied_galaxy_root.is_some()"));
+	assert!(verdicts.contains("render_trace.applied_bridge_root.is_some()"));
+	assert!(verdicts.contains("if !graph_actuated"));
+}
+
+#[test]
+pub(crate) fn adr201_verdict_accrual_is_side_effect_only() {
+	let manifest = manifest_dir();
+	let markers = [
+		"measured_graph_order_verdict",
+		"galaxy_measured_costs",
+		"bridge_measured_costs",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR201 graph verdict accrual leaked outside the binder surface:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}

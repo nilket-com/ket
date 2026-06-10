@@ -9313,6 +9313,134 @@ async fn kept_graph_accrues_kept_not_reordered() {
 	);
 }
 
+fn uniform_observations(binding: &ExplainAnalyzeBinding) -> Vec<JoinRuntimeObservation> {
+	binding
+		.replay_ids
+		.iter()
+		.map(|replay_id| JoinRuntimeObservation {
+			replay_id: *replay_id,
+			strategy: JoinStrategy::HashPartitioned,
+			build_rows: RowCount::new(3),
+			probe_rows: RowCount::new(3),
+			output_rows: RowCount::new(3),
+		})
+		.collect()
+}
+
+fn verdict_kinds(verdicts: &[MeasuredLevelVerdict]) -> Vec<OptimizerDecisionKind> {
+	verdicts.iter().map(|verdict| verdict.kind).collect()
+}
+
+fn has_tree_verdict(kinds: &[OptimizerDecisionKind]) -> bool {
+	kinds.iter().any(|kind| {
+		matches!(
+			kind,
+			OptimizerDecisionKind::SnowflakeRoot
+				| OptimizerDecisionKind::SnowflakeBranch
+				| OptimizerDecisionKind::FlatStar
+		)
+	})
+}
+
+// ADR 201 headline: under the sampled verdict path, a reordered galaxy and a reordered bridge each accrue
+// their graph-root runtime verdict, and the executed re-rooted plan emits NO orphan tree verdict (its
+// re-rooted tree decisions were never accrued by ADR 200).
+#[tokio::test]
+async fn graph_actuation_accrues_runtime_verdict() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_conformed_order_sql())
+		.expect("plan galaxy");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind galaxy analyze");
+	let observations = uniform_observations(&binding);
+	let verdicts = measured_explain_analyze_verdicts(&binding, &observations)
+		.expect("measure galaxy verdicts");
+	let kinds = verdict_kinds(&verdicts);
+	assert!(
+		kinds.contains(&OptimizerDecisionKind::GalaxyRoot),
+		"actuated galaxy accrues a galaxy_root verdict: {kinds:?}"
+	);
+	assert!(
+		!has_tree_verdict(&kinds),
+		"actuated galaxy emits no orphan tree verdict: {kinds:?}"
+	);
+
+	let bridge_catalog = selective_bridge_join_order_catalog();
+	let bridge_logical = SqlPlanner::new()
+		.plan(selective_bridge_order_sql())
+		.expect("plan bridge");
+	let bridge_binding = bind_explain_analyze(
+		&bridge_logical,
+		&bridge_catalog,
+		&auto_broadcast_config(64 * 1024 * 1024),
+	)
+	.await
+	.expect("bind bridge analyze");
+	let bridge_observations = uniform_observations(&bridge_binding);
+	let bridge_verdicts = measured_explain_analyze_verdicts(&bridge_binding, &bridge_observations)
+		.expect("measure bridge verdicts");
+	let bridge_kinds = verdict_kinds(&bridge_verdicts);
+	assert!(
+		bridge_kinds.contains(&OptimizerDecisionKind::BridgeRoot),
+		"actuated bridge accrues a bridge_root verdict: {bridge_kinds:?}"
+	);
+	assert!(
+		!has_tree_verdict(&bridge_kinds),
+		"actuated bridge emits no orphan tree verdict: {bridge_kinds:?}"
+	);
+}
+
+// ADR 201 discriminator: a kept (already-optimal) galaxy emits BOTH its graph verdict AND its FROM tree's
+// verdict — both have matching decisions. Fails under a blanket suppression; passes only with the
+// actuated-vs-kept asymmetry.
+#[tokio::test]
+async fn kept_graph_emits_both_graph_and_tree_verdict() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_optimal_order_sql())
+		.expect("plan optimal galaxy");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind optimal galaxy analyze");
+	let observations = uniform_observations(&binding);
+	let verdicts =
+		measured_explain_analyze_verdicts(&binding, &observations).expect("measure kept verdicts");
+	let kinds = verdict_kinds(&verdicts);
+	assert!(
+		kinds.contains(&OptimizerDecisionKind::GalaxyRoot),
+		"kept galaxy still accrues a graph verdict: {kinds:?}"
+	);
+	assert!(
+		has_tree_verdict(&kinds),
+		"kept galaxy's FROM tree verdict coexists: {kinds:?}"
+	);
+}
+
+// ADR 201: an accrued graph verdict with no runtime measurement is Indeterminate (no verdict without
+// measurement) — the accrual path shares the render classifier.
+#[tokio::test]
+async fn graph_runtime_verdict_indeterminate_without_measurement() {
+	let catalog = galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(galaxy_conformed_order_sql())
+		.expect("plan galaxy");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind galaxy analyze");
+	// No observations → no measured costs → Indeterminate.
+	let verdicts = measured_explain_analyze_verdicts(&binding, &[]).expect("measure verdicts");
+	let galaxy_verdict = verdicts
+		.iter()
+		.find(|verdict| verdict.kind == OptimizerDecisionKind::GalaxyRoot)
+		.expect("galaxy verdict present");
+	assert_eq!(
+		galaxy_verdict.verdict,
+		OptimizerRuntimeVerdictClass::Indeterminate
+	);
+}
+
 // ADR 198: after actuation the measured verdict judges the APPLIED (returns-rooted) order. With
 // `returns` measured cheaper than `sales`, the applied re-root is vindicated.
 #[tokio::test]

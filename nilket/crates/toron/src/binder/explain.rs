@@ -518,47 +518,81 @@ fn measured_verdicts_from_summaries(
 	render_trace: &OptimizerExplainRenderTrace,
 	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
 ) -> Result<Vec<MeasuredLevelVerdict>, BindingError> {
-	if let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order {
-		let measured_rows_by_dimension =
-			snowflake_measured_rows_by_dimension(render_trace, evidence, summaries)?;
-		let verdict = measured_snowflake_order_verdict(evidence, &measured_rows_by_dimension);
-		return Ok(verdict
-			.levels
-			.iter()
-			.enumerate()
-			.map(|(index, level)| MeasuredLevelVerdict {
-				kind: if index == 0 {
-					OptimizerDecisionKind::SnowflakeRoot
-				} else {
-					OptimizerDecisionKind::SnowflakeBranch
-				},
-				verdict: runtime_verdict_class_from_snowflake(level.verdict),
-			})
-			.collect());
+	let mut verdicts = Vec::new();
+
+	// ADR 201: when a graph actuated, its re-rooted tree was bound on the no-op recorder, so the tree
+	// decisions were never accrued (ADR 200) — a tree verdict here would be an orphan with no matching
+	// decision. Galaxy and bridge are XOR shapes in the current binder, so this single gate is the right
+	// asymmetry discriminator: suppress tree verdicts for an actuated graph, but keep them for a kept
+	// graph (whose FROM tree really executed and whose tree decisions did accrue).
+	let graph_actuated =
+		render_trace.applied_galaxy_root.is_some() || render_trace.applied_bridge_root.is_some();
+
+	if !graph_actuated {
+		if let JoinOrderRenderState::ObservedSnowflake(evidence) = &render_trace.join_order {
+			let measured_rows_by_dimension =
+				snowflake_measured_rows_by_dimension(render_trace, evidence, summaries)?;
+			let verdict = measured_snowflake_order_verdict(evidence, &measured_rows_by_dimension);
+			verdicts.extend(verdict.levels.iter().enumerate().map(|(index, level)| {
+				MeasuredLevelVerdict {
+					kind: if index == 0 {
+						OptimizerDecisionKind::SnowflakeRoot
+					} else {
+						OptimizerDecisionKind::SnowflakeBranch
+					},
+					verdict: runtime_verdict_class_from_snowflake(level.verdict),
+				}
+			}));
+		} else {
+			let receipts = render_trace.star_order_receipts();
+			let root_kind = if receipts.len() > 1 {
+				OptimizerDecisionKind::SnowflakeRoot
+			} else {
+				OptimizerDecisionKind::FlatStar
+			};
+			for (index, receipt) in receipts.iter().enumerate() {
+				let StarOrderOutcome::Recognized(evidence) = &receipt.outcome else {
+					continue;
+				};
+				let measured_rows_by_dimension =
+					star_measured_rows_by_dimension(render_trace, receipt, evidence, summaries)?;
+				let verdict = measured_star_order_verdict(evidence, &measured_rows_by_dimension);
+				verdicts.push(MeasuredLevelVerdict {
+					kind: if index == 0 {
+						root_kind
+					} else {
+						OptimizerDecisionKind::SnowflakeBranch
+					},
+					verdict: runtime_verdict_class_from_star(verdict.verdict),
+				});
+			}
+		}
 	}
 
-	let receipts = render_trace.star_order_receipts();
-	let root_kind = if receipts.len() > 1 {
-		OptimizerDecisionKind::SnowflakeRoot
-	} else {
-		OptimizerDecisionKind::FlatStar
-	};
-	let mut verdicts = Vec::new();
-	for (index, receipt) in receipts.iter().enumerate() {
-		let StarOrderOutcome::Recognized(evidence) = &receipt.outcome else {
-			continue;
-		};
-		let measured_rows_by_dimension =
-			star_measured_rows_by_dimension(render_trace, receipt, evidence, summaries)?;
-		let verdict = measured_star_order_verdict(evidence, &measured_rows_by_dimension);
-		verdicts.push(MeasuredLevelVerdict {
-			kind: if index == 0 {
-				root_kind
-			} else {
-				OptimizerDecisionKind::SnowflakeBranch
-			},
-			verdict: runtime_verdict_class_from_star(verdict.verdict),
-		});
+	// ADR 201: the graph order verdict — emitted whenever a galaxy/bridge is recognized (kept or
+	// actuated), judging the root choice. Shares the render-path classifier + measured-cost assembly.
+	if let Some(galaxy) = &render_trace.galaxy_order {
+		if let Some(rec) = galaxy_order_recommendation(galaxy) {
+			let measured = galaxy_measured_costs(galaxy, &rec, summaries);
+			verdicts.push(MeasuredLevelVerdict {
+				kind: OptimizerDecisionKind::GalaxyRoot,
+				verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
+					&rec, &measured,
+				)),
+			});
+		}
+	}
+	if let Some(bridge) = &render_trace.bridge_order {
+		if let Some(rec) = bridge_order_recommendation(bridge) {
+			if let Some(measured) = bridge_measured_costs(bridge, summaries) {
+				verdicts.push(MeasuredLevelVerdict {
+					kind: OptimizerDecisionKind::BridgeRoot,
+					verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
+						&rec, &measured,
+					)),
+				});
+			}
+		}
 	}
 	Ok(verdicts)
 }
@@ -886,16 +920,7 @@ fn galaxy_analyze_rows(
 	// ADR 197: the measured graph order verdict — judges the FROM order against the cost model's
 	// preference using the measured fact-to-pivot cardinalities.
 	if let Some(rec) = galaxy_order_recommendation(galaxy) {
-		let measured = rec
-			.costs
-			.iter()
-			.map(|(fact, _)| {
-				(
-					fact.clone(),
-					galaxy_measured_fact_cost(galaxy, fact, &rec.pivot, summaries),
-				)
-			})
-			.collect::<Vec<_>>();
+		let measured = galaxy_measured_costs(galaxy, &rec, summaries);
 		rows.push(graph_order_verdict_row(&rec, &measured));
 	}
 	Ok(rows)
@@ -918,27 +943,77 @@ fn galaxy_measured_fact_cost(
 		.map(|summary| u128::from(summary.output_rows.get()))
 }
 
+// ADR 201: the per-fact measured costs that feed the galaxy order verdict — one `(fact, measured)` pair
+// per candidate root, the measured fact-to-pivot output rows. Shared by the EXPLAIN ANALYZE render row
+// and the sampled accrual path so they cannot drift.
+fn galaxy_measured_costs(
+	galaxy: &GalaxyOrderEvidence,
+	rec: &GraphOrderRecommendation,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Vec<(String, Option<u128>)> {
+	rec.costs
+		.iter()
+		.map(|(fact, _)| {
+			(
+				fact.clone(),
+				galaxy_measured_fact_cost(galaxy, fact, &rec.pivot, summaries),
+			)
+		})
+		.collect()
+}
+
+// ADR 201: the bridge measured costs — fact root = measured incoming `F⋈B` output rows (the candidate
+// that ran), dim root = the `B⋈D` outgoing edge estimate (the un-run counterfactual). Shared by render
+// and accrual. `None` when the bridge has no link.
+fn bridge_measured_costs(
+	bridge: &BridgeOrderEvidence,
+	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
+) -> Option<Vec<(String, Option<u128>)>> {
+	let link = bridge.links.first()?;
+	let measured_fan_out = join_replay_id_for_trace_target(link.incoming_target)
+		.ok()
+		.and_then(|replay_id| summaries.get(&replay_id))
+		.map(|summary| u128::from(summary.output_rows.get()));
+	Some(vec![
+		(link.fact.clone(), measured_fan_out),
+		(
+			link.dim.clone(),
+			link.outgoing_edge_rows.map(|rows| u128::from(rows.get())),
+		),
+	])
+}
+
 // ADR 197: unified `join_order_graph_verdict` row — reuses the 180/184 `StarOrderVerdict` vocabulary.
 // `Vindicated` when the FROM order is the measured-optimal root, `MissedWin` when a reorder would have
 // won, `Indeterminate` when any candidate measurement is absent.
+// ADR 201: the authoritative graph order verdict classification, shared by the EXPLAIN ANALYZE render
+// row (`graph_order_verdict_row`) and the sampled accrual path (`measured_verdicts_from_summaries`).
+// `Indeterminate` when any candidate cost is unmeasured; else `Vindicated` iff the declared (FROM/applied)
+// root is the measured-optimal one, else `MissedWin`.
+pub(super) fn measured_graph_order_verdict(
+	rec: &GraphOrderRecommendation,
+	measured: &[(String, Option<u128>)],
+) -> StarOrderVerdict {
+	if measured.iter().any(|(_, cost)| cost.is_none()) {
+		return StarOrderVerdict::Indeterminate;
+	}
+	let measured_optimal = measured
+		.iter()
+		.min_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
+		.map(|(label, _)| label.clone())
+		.unwrap_or_default();
+	if rec.declared_root == measured_optimal {
+		StarOrderVerdict::Vindicated
+	} else {
+		StarOrderVerdict::MissedWin
+	}
+}
+
 fn graph_order_verdict_row(
 	rec: &GraphOrderRecommendation,
 	measured: &[(String, Option<u128>)],
 ) -> Vec<ScalarValue> {
-	let verdict = if measured.iter().any(|(_, cost)| cost.is_none()) {
-		StarOrderVerdict::Indeterminate
-	} else {
-		let measured_optimal = measured
-			.iter()
-			.min_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
-			.map(|(label, _)| label.clone())
-			.unwrap_or_default();
-		if rec.declared_root == measured_optimal {
-			StarOrderVerdict::Vindicated
-		} else {
-			StarOrderVerdict::MissedWin
-		}
-	};
+	let verdict = measured_graph_order_verdict(rec, measured);
 	let recommendation = match rec.action {
 		StarOrderAction::Reordered => "WOULD_REORDER_ROOT_FACT",
 		_ => "KEEP_DECLARED",
@@ -1040,18 +1115,7 @@ fn bridge_analyze_rows(
 	// materialized `F⋈B` fan-out); the dimension root `D` is the un-run counterfactual, costed by the
 	// `B⋈D` outgoing edge estimate. A measured fan-out above the `D`-root estimate reorders (`MissedWin`).
 	if let Some(rec) = bridge_order_recommendation(bridge) {
-		if let Some(link) = bridge.links.first() {
-			let measured_fan_out = join_replay_id_for_trace_target(link.incoming_target)
-				.ok()
-				.and_then(|replay_id| summaries.get(&replay_id))
-				.map(|summary| u128::from(summary.output_rows.get()));
-			let measured = vec![
-				(link.fact.clone(), measured_fan_out),
-				(
-					link.dim.clone(),
-					link.outgoing_edge_rows.map(|rows| u128::from(rows.get())),
-				),
-			];
+		if let Some(measured) = bridge_measured_costs(bridge, summaries) {
 			rows.push(graph_order_verdict_row(&rec, &measured));
 		}
 	}

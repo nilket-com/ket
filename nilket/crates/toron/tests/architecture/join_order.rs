@@ -2013,11 +2013,14 @@ pub(crate) fn adr197_graph_order_is_observe_only() {
 pub(crate) fn adr197_verdicts_reuse_180_184_vocabulary() {
 	let explain = source("src/binder/explain.rs");
 	let verdict_row = first_block(&explain, "fn graph_order_verdict_row");
+	// ADR 201 extracted the classification into `measured_graph_order_verdict`; the `StarOrderVerdict`
+	// vocabulary now lives in that shared helper (still no parallel verdict enum).
+	let classifier = first_block(&explain, "fn measured_graph_order_verdict");
 
 	// One unified verdict row kind, reusing the existing `StarOrderVerdict` vocabulary — no parallel
 	// verdict enum.
 	assert!(explain.contains("join_order_graph_verdict"));
-	assert!(verdict_row.contains("StarOrderVerdict::"));
+	assert!(classifier.contains("StarOrderVerdict::"));
 	assert!(verdict_row.contains("star_order_verdict_label"));
 	assert!(!explain.contains("enum GraphOrderVerdict"));
 }
