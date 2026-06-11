@@ -30,6 +30,17 @@ fn hex(bytes: &[u8; 32]) -> String {
 	out
 }
 
+// These goldens are the wire-stability tripwire for the descriptor fingerprint
+// preimages. The preimage components are postcard-encoded, and postcard is
+// POSITIONAL: appending a field to a preimage-feeding type (even
+// `#[serde(default)]`, even left empty) re-encodes every value and shifts the
+// fingerprint of EVERY descriptor — `#[serde(default)]` only relaxes decode of
+// self-describing formats, it does not make the encoding stable. The rule:
+// a cut that changes any preimage input type must EITHER re-pin the physical
+// golden here in the same cut (accepting that previously persisted
+// fingerprints no longer validate), OR bump `PHYSICAL_DESCRIPTOR_DOMAIN` to a
+// new version when old durable descriptors must stay valid. A silent break is
+// never acceptable — that is exactly what this test exists to catch.
 #[test]
 fn golden_vectors_are_pinned() {
 	let descriptor = descriptor(0x51, "descriptor_fingerprint");
@@ -37,9 +48,16 @@ fn golden_vectors_are_pinned() {
 		hex(descriptor.logical_schema_fingerprint.as_bytes()),
 		"f74744e3383e722e352f6f76536f357ee33bc99b2af9ae2355228de24d1c712c"
 	);
+	// Re-pinned after ADRs 156/159/164/165 appended four `ColumnStatsPolicyV1`
+	// fields (heavy_hitters / range_distributions / column_group_top_k /
+	// column_group_ndv) without re-pinning: the stats-policy postcard encoding
+	// grew from three empty vecs to seven, shifting the physical fingerprint of
+	// every descriptor. Verified by reproducing the OLD golden (824e1e09…913b)
+	// byte-for-byte from the pre-ADR-156 three-vec encoding — the drift is
+	// exactly those fields, nothing else.
 	assert_eq!(
 		hex(descriptor.physical_descriptor_fingerprint.as_bytes()),
-		"824e1e0938925b2e498aa29776177bb11466e956e81a0bab2f3a63c73fe7913b"
+		"07ca6eea0ec4b5fe95f1abbb07835a44b5f3a915e12ebdb29d5f8fadbb11e78b"
 	);
 }
 
