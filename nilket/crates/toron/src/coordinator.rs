@@ -1332,13 +1332,17 @@ where
 				if let Some(binding) = measured_binding.as_ref() {
 					let observations =
 						join_observations_from_task_telemetry(&run.telemetry.task_telemetry);
+					let mut touched = Vec::new();
 					for verdict in measured_explain_analyze_verdicts(binding, &observations)
 						.map_err(QueryError::Binding)?
 					{
-						config
-							.decision_log
-							.record_verdict(verdict.kind, verdict.verdict);
+						touched.push(
+							config
+								.runtime_evidence
+								.record_verdict(verdict.kind, verdict.verdict),
+						);
 					}
+					config.runtime_evidence.flush_keys(touched).await;
 				}
 				return Ok(());
 			}
@@ -2444,11 +2448,15 @@ impl QueryCoordinator {
 						let observations = join_observations_from_local_telemetry(
 							telemetry.as_ref().expect("telemetry"),
 						);
+						let mut touched = Vec::new();
 						for verdict in measured_explain_analyze_verdicts(binding, &observations)? {
-							self.config
-								.decision_log
-								.record_verdict(verdict.kind, verdict.verdict);
+							touched.push(
+								self.config
+									.runtime_evidence
+									.record_verdict(verdict.kind, verdict.verdict),
+							);
 						}
+						self.config.runtime_evidence.flush_keys(touched).await;
 					}
 					return Ok(results);
 				}

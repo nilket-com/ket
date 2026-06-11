@@ -10400,7 +10400,7 @@ fn auto_applied_margin_config(
 		..auto_broadcast_config(64 * 1024 * 1024)
 	};
 	for (kind, verdict, count) in verdicts {
-		record_verdicts(config.decision_log.as_ref(), *kind, *verdict, *count);
+		record_verdicts(config.runtime_evidence.as_ref(), *kind, *verdict, *count);
 	}
 	config
 }
@@ -10503,7 +10503,7 @@ async fn manual_application_mode_is_190_byte_identical() {
 		..auto_broadcast_config(64 * 1024 * 1024)
 	};
 	record_verdicts(
-		manual_with_verdicts.decision_log.as_ref(),
+		manual_with_verdicts.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
 		25,
@@ -10652,14 +10652,14 @@ fn auto_application_does_not_mutate_config_or_log() {
 	// Resolving the effective step and building the report are pure: the configured base step is
 	// unchanged and the verdict snapshot is identical before and after.
 	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
-	let before = config.decision_log.verdict_snapshot();
+	let before = config.runtime_evidence.verdict_snapshot();
 	let _ = effective_join_order_soft_margin_step(&config);
 	let _ = margin_advisory_report(&config);
 	assert_eq!(
 		config.join_order_soft_margin_step,
 		SoftMarginLadderStep::Baseline
 	);
-	let after = config.decision_log.verdict_snapshot();
+	let after = config.runtime_evidence.verdict_snapshot();
 	let total =
 		|snapshot: &[OptimizerRuntimeVerdictRow]| snapshot.iter().map(|row| row.count).sum::<u64>();
 	assert_eq!(before.len(), after.len());
@@ -10681,7 +10681,7 @@ async fn observed_snowflake_uses_auto_applied_margin() {
 		..auto_broadcast_config(4_096)
 	};
 	record_verdicts(
-		config.decision_log.as_ref(),
+		config.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
 		25,
@@ -11255,11 +11255,11 @@ async fn sampled_runtime_verdicts_record_per_level_for_recursive_snowflake() {
 async fn optimizer_runtime_verdicts_report_aggregates_by_kind_and_class() {
 	let catalog = MockCatalog::new();
 	let config = PlannerConfig::default();
-	config.decision_log.record_verdict(
+	config.runtime_evidence.record_verdict(
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
 	);
-	config.decision_log.record_verdict(
+	config.runtime_evidence.record_verdict(
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
 	);
@@ -11277,7 +11277,7 @@ async fn optimizer_runtime_verdicts_report_aggregates_by_kind_and_class() {
 async fn rune_queries_optimizer_runtime_verdicts() {
 	let catalog = star_join_order_catalog();
 	let config = PlannerConfig::default();
-	config.decision_log.record_verdict(
+	config.runtime_evidence.record_verdict(
 		OptimizerDecisionKind::SnowflakeRoot,
 		OptimizerRuntimeVerdictClass::Vindicated,
 	);
@@ -11304,6 +11304,72 @@ async fn rune_queries_optimizer_runtime_verdicts() {
 	assert_eq!(
 		optimizer_runtime_verdict_count(&rows, "snowflake_root", "vindicated"),
 		1
+	);
+}
+
+#[tokio::test]
+async fn optimizer_evidence_status_reports_local_pending() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	config.runtime_evidence.record_verdict(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+	);
+
+	let rows = optimizer_evidence_status_rows(&catalog, &config).await;
+
+	assert_eq!(rows.len(), 1);
+	assert_eq!(
+		rows[0][0],
+		ScalarValue::Utf8(Some("local_only".to_string()))
+	);
+	assert_eq!(rows[0][1], ScalarValue::Utf8(Some("ok".to_string())));
+	assert_eq!(rows[0][2], ScalarValue::Int64(Some(1)));
+	assert_eq!(rows[0][3], ScalarValue::Int64(Some(0)));
+	assert_eq!(rows[0][4], ScalarValue::Int64(Some(0)));
+	assert_eq!(rows[0][5], ScalarValue::Int64(Some(0)));
+	assert_eq!(rows[0][6], ScalarValue::Utf8(None));
+}
+
+#[tokio::test]
+async fn optimizer_evidence_status_query_is_read_only() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+
+	let _ = optimizer_evidence_status_rows(&catalog, &config).await;
+
+	assert!(config.decision_log.snapshot().is_empty());
+	assert!(config.runtime_evidence.verdict_snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn rune_queries_optimizer_evidence_status() {
+	let catalog = star_join_order_catalog();
+	let config = PlannerConfig::default();
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM information_schema.optimizer_evidence_status")
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer evidence status report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer evidence status system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerEvidenceStatus
+	);
+	assert_eq!(rows.len(), 1);
+	assert_eq!(
+		rows[0][0],
+		ScalarValue::Utf8(Some("local_only".to_string()))
 	);
 }
 
@@ -11389,13 +11455,13 @@ async fn margin_advisory_excludes_misranked_and_indeterminate() {
 	let catalog = MockCatalog::new();
 	let config = PlannerConfig::default();
 	record_verdicts(
-		config.decision_log.as_ref(),
+		config.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MisRanked,
 		25,
 	);
 	record_verdicts(
-		config.decision_log.as_ref(),
+		config.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::SnowflakeRoot,
 		OptimizerRuntimeVerdictClass::Indeterminate,
 		30,
@@ -11468,7 +11534,7 @@ async fn margin_advisory_is_read_only_no_plan_change() {
 		..auto_broadcast_config(64 * 1024 * 1024)
 	};
 	record_verdicts(
-		noisy_config.decision_log.as_ref(),
+		noisy_config.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
 		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
@@ -11494,7 +11560,7 @@ async fn margin_advisory_report_projects_like_information_schema() {
 	let catalog = MockCatalog::new();
 	let config = PlannerConfig::default();
 	record_verdicts(
-		config.decision_log.as_ref(),
+		config.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
 		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
@@ -11539,7 +11605,7 @@ async fn rune_queries_margin_advisory() {
 	let catalog = star_join_order_catalog();
 	let config = PlannerConfig::default();
 	record_verdicts(
-		config.decision_log.as_ref(),
+		config.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::SnowflakeRoot,
 		OptimizerRuntimeVerdictClass::OverEager,
 		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
@@ -13759,6 +13825,26 @@ async fn optimizer_runtime_verdict_rows(
 	rows
 }
 
+async fn optimizer_evidence_status_rows(
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Vec<Vec<ScalarValue>> {
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_evidence_status")
+		.expect("plan optimizer evidence status report");
+	let plan = bind(&logical, catalog, config)
+		.await
+		.expect("bind optimizer evidence status report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected optimizer evidence status system table, got {plan:?}");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerEvidenceStatus
+	);
+	rows
+}
+
 async fn optimizer_margin_advisory_rows(
 	catalog: &dyn Catalog,
 	config: &PlannerConfig,
@@ -13845,13 +13931,13 @@ fn verdict_snapshot(
 }
 
 fn record_verdicts(
-	log: &OptimizerDecisionLog,
+	evidence: &OptimizerRuntimeEvidence,
 	kind: OptimizerDecisionKind,
 	verdict: OptimizerRuntimeVerdictClass,
 	count: u64,
 ) {
 	for _ in 0..count {
-		log.record_verdict(kind, verdict);
+		evidence.record_verdict(kind, verdict);
 	}
 }
 

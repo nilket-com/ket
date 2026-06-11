@@ -76,7 +76,6 @@ pub(crate) struct OptimizerRuntimeVerdictRow {
 #[derive(Debug)]
 pub struct OptimizerDecisionLog {
 	counts: Mutex<BTreeMap<OptimizerDecisionKey, u64>>,
-	verdict_counts: Mutex<BTreeMap<OptimizerRuntimeVerdictKey, u64>>,
 	overflow_count: AtomicU64,
 	max_keys: usize,
 }
@@ -91,7 +90,6 @@ impl OptimizerDecisionLog {
 	pub(crate) fn with_max_keys(max_keys: usize) -> Self {
 		Self {
 			counts: Mutex::new(BTreeMap::new()),
-			verdict_counts: Mutex::new(BTreeMap::new()),
 			overflow_count: AtomicU64::new(0),
 			max_keys,
 		}
@@ -106,20 +104,6 @@ impl OptimizerDecisionLog {
 		}
 		if counts.len() >= self.max_keys {
 			self.overflow_count.fetch_add(1, Ordering::Relaxed);
-			return;
-		}
-		counts.insert(key, 1);
-	}
-
-	pub(crate) fn record_verdict(
-		&self,
-		kind: OptimizerDecisionKind,
-		verdict: OptimizerRuntimeVerdictClass,
-	) {
-		let key = OptimizerRuntimeVerdictKey { kind, verdict };
-		let mut counts = self.verdict_counts.lock().expect("optimizer verdict log");
-		if let Some(count) = counts.get_mut(&key) {
-			*count = count.saturating_add(1);
 			return;
 		}
 		counts.insert(key, 1);
@@ -146,18 +130,6 @@ impl OptimizerDecisionLog {
 			});
 		}
 		rows
-	}
-
-	pub(crate) fn verdict_snapshot(&self) -> Vec<OptimizerRuntimeVerdictRow> {
-		let counts = self.verdict_counts.lock().expect("optimizer verdict log");
-		counts
-			.iter()
-			.map(|(key, count)| OptimizerRuntimeVerdictRow {
-				kind: key.kind,
-				verdict: key.verdict,
-				count: *count,
-			})
-			.collect()
 	}
 }
 

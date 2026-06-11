@@ -21,6 +21,7 @@ use toron::audit::{
 	AuditSinksConfig, ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics,
 	ToronAuditOutputKind, ToronAuditSecurityEventUnrecordedReason,
 };
+use toron::binder::OptimizerRuntimeEvidence;
 use toron::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use toron::config::{
 	AuditConfig, AuditEnabledConfig, CoordinatorConfig, LISTENER_BIND_COLLISION_DIAGNOSTIC,
@@ -107,6 +108,7 @@ fn sample_resource_metrics_body() -> String {
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		audit_metrics: None,
+		runtime_evidence: None,
 		tenant_admission,
 		admission_rejections,
 	});
@@ -128,6 +130,7 @@ fn request_ingress_metrics_use_bounded_reasons_and_omit_sql_text() {
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		audit_metrics: None,
+		runtime_evidence: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -160,6 +163,43 @@ fn audit_metrics_are_disabled_until_audit_config_is_enabled() {
 }
 
 #[test]
+fn metrics_render_optimizer_evidence_status() {
+	let policy = TenantBudgetPolicy::omitted_config(ByteCount::new(1024));
+	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy.clone(),
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
+		sql_connection_limiter: None,
+		audit_metrics: None,
+		runtime_evidence: Some(Arc::new(OptimizerRuntimeEvidence::local_only())),
+		tenant_admission,
+		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
+	});
+
+	let body = metrics.render_text(&ready_snapshot());
+
+	for expected in [
+		"# TYPE optimizer_evidence_pending_deltas gauge\n",
+		"optimizer_evidence_pending_deltas 0\n",
+		"# TYPE optimizer_evidence_dropped_deltas_total counter\n",
+		"optimizer_evidence_dropped_deltas_total 0\n",
+		"# TYPE optimizer_evidence_ambiguous_deltas_total counter\n",
+		"optimizer_evidence_ambiguous_deltas_total 0\n",
+		"# TYPE optimizer_evidence_refresh_failures_total counter\n",
+		"optimizer_evidence_refresh_failures_total 0\n",
+		"# TYPE optimizer_evidence_durable_enabled gauge\n",
+		"optimizer_evidence_durable_enabled{state=\"ok\"} 0\n",
+	] {
+		assert!(body.contains(expected), "missing {expected} in {body}");
+	}
+}
+
+#[test]
 fn audit_metrics_are_aggregate_only() {
 	let policy = TenantBudgetPolicy::omitted_config(ByteCount::new(1024));
 	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
@@ -181,6 +221,7 @@ fn audit_metrics_are_aggregate_only() {
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		audit_metrics: Some(audit_metrics),
+		runtime_evidence: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -222,6 +263,7 @@ fn cancellation_metrics_are_aggregate_trigger_outcome_only() {
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		audit_metrics: None,
+		runtime_evidence: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -280,6 +322,7 @@ fn downstream_cancellation_metrics_are_aggregate_trigger_outcome_only() {
 		downstream_cancellation_metrics: downstream_metrics,
 		sql_connection_limiter: None,
 		audit_metrics: None,
+		runtime_evidence: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -992,6 +1035,7 @@ fn sql_connection_metrics_are_configured_plus_other() {
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: Some(limiter),
 		audit_metrics: None,
+		runtime_evidence: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
 	});
@@ -1084,6 +1128,7 @@ fn queue_and_borrow_metrics_are_configured_plus_other_no_table_labels() {
 		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
 		sql_connection_limiter: None,
 		audit_metrics: None,
+		runtime_evidence: None,
 		tenant_admission,
 		admission_rejections: TenantAdmissionRejectionCounters::new(&TenantBudgetPolicy::new(
 			TenantBudget::new(ByteCount::new(8), ByteCount::new(8)),

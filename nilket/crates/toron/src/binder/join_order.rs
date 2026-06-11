@@ -184,7 +184,7 @@ pub(crate) fn effective_join_order_soft_margin_step(
 		JoinOrderSoftMarginApplication::Manual => config.join_order_soft_margin_step,
 		JoinOrderSoftMarginApplication::ApplyAdvisory => {
 			recommend_soft_margin(
-				&config.decision_log.verdict_snapshot(),
+				&config.runtime_evidence.verdict_snapshot(),
 				config.join_order_soft_margin_step,
 			)
 			.recommended_step
@@ -203,7 +203,7 @@ pub(crate) struct MarginAdvisoryReport {
 
 pub(crate) fn margin_advisory_report(config: &PlannerConfig) -> MarginAdvisoryReport {
 	let advisory = recommend_soft_margin(
-		&config.decision_log.verdict_snapshot(),
+		&config.runtime_evidence.verdict_snapshot(),
 		config.join_order_soft_margin_step,
 	);
 	let applied_step = match config.join_order_soft_margin_application {

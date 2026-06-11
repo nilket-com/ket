@@ -15,6 +15,7 @@ use crate::audit::{
 	ToronAuditEvent, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOperation,
 	ToronAuditOutputKind, ToronAuditSecurityEventUnrecordedReason,
 };
+use crate::binder::OptimizerRuntimeEvidence;
 use crate::catalog::{DescriptorRefreshMetrics, DescriptorSyncMetrics};
 use crate::config::ObservabilityListeners;
 use crate::distributed::budget::{
@@ -177,6 +178,7 @@ pub struct MetricsRegistry {
 	downstream_cancellation_metrics: Arc<DownstreamCancellationMetrics>,
 	sql_connection_limiter: Option<SqlConnectionLimiter>,
 	audit_metrics: Option<Arc<ToronAuditMetrics>>,
+	runtime_evidence: Option<Arc<OptimizerRuntimeEvidence>>,
 	resource_metrics: ResourceMetrics,
 }
 
@@ -190,6 +192,7 @@ pub struct MetricsRegistryConfig {
 	pub downstream_cancellation_metrics: Arc<DownstreamCancellationMetrics>,
 	pub sql_connection_limiter: Option<SqlConnectionLimiter>,
 	pub audit_metrics: Option<Arc<ToronAuditMetrics>>,
+	pub runtime_evidence: Option<Arc<OptimizerRuntimeEvidence>>,
 	pub tenant_admission: TenantAdmissionController,
 	pub admission_rejections: TenantAdmissionRejectionCounters,
 }
@@ -210,6 +213,7 @@ impl MetricsRegistry {
 			downstream_cancellation_metrics: config.downstream_cancellation_metrics,
 			sql_connection_limiter: config.sql_connection_limiter,
 			audit_metrics: config.audit_metrics,
+			runtime_evidence: config.runtime_evidence,
 			resource_metrics: ResourceMetrics {
 				tenant_budgets: config.tenant_budgets,
 				tenant_admission: config.tenant_admission,
@@ -290,6 +294,7 @@ impl MetricsRegistry {
 		self.render_cancellation_metrics(&mut out);
 		self.render_downstream_cancellation_metrics(&mut out);
 		self.render_telemetry_metrics(&mut out);
+		self.render_optimizer_evidence_metrics(&mut out);
 		self.render_sql_connection_metrics(&mut out);
 		self.render_audit_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
@@ -358,6 +363,40 @@ impl MetricsRegistry {
 		out.push_str(&format!(
 			"toron_otlp_spans_dropped_total {}\n",
 			self.otlp_spans_dropped_total.load(Ordering::Relaxed)
+		));
+	}
+
+	fn render_optimizer_evidence_metrics(&self, out: &mut String) {
+		let Some(runtime_evidence) = &self.runtime_evidence else {
+			return;
+		};
+		let status = runtime_evidence.status_snapshot();
+		out.push_str("# TYPE optimizer_evidence_pending_deltas gauge\n");
+		out.push_str(&format!(
+			"optimizer_evidence_pending_deltas {}\n",
+			status.pending_deltas
+		));
+		out.push_str("# TYPE optimizer_evidence_dropped_deltas_total counter\n");
+		out.push_str(&format!(
+			"optimizer_evidence_dropped_deltas_total {}\n",
+			status.dropped_deltas
+		));
+		out.push_str("# TYPE optimizer_evidence_ambiguous_deltas_total counter\n");
+		out.push_str(&format!(
+			"optimizer_evidence_ambiguous_deltas_total {}\n",
+			status.ambiguous_deltas
+		));
+		out.push_str("# TYPE optimizer_evidence_refresh_failures_total counter\n");
+		out.push_str(&format!(
+			"optimizer_evidence_refresh_failures_total {}\n",
+			status.refresh_failures
+		));
+		out.push_str("# TYPE optimizer_evidence_durable_enabled gauge\n");
+		let enabled = u8::from(status.mode.as_str() == "durable" && status.state.as_str() == "ok");
+		out.push_str(&format!(
+			"optimizer_evidence_durable_enabled{{state=\"{}\"}} {}\n",
+			status.state.as_str(),
+			enabled
 		));
 	}
 

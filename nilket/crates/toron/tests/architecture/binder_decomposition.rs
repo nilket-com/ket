@@ -1,6 +1,6 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 8] = [
+const BINDER_MODULES: [&str; 9] = [
 	"aggregate",
 	"arithmetic",
 	"decision_log",
@@ -8,6 +8,7 @@ const BINDER_MODULES: [&str; 8] = [
 	"join",
 	"join_order",
 	"pushdown",
+	"runtime_evidence",
 	"selectivity",
 ];
 
@@ -23,6 +24,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/join.rs",
 		"src/binder/join_order.rs",
 		"src/binder/pushdown.rs",
+		"src/binder/runtime_evidence.rs",
 		"src/binder/selectivity.rs",
 		"src/binder/tests.rs",
 	];
@@ -168,6 +170,7 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 			let later_adr_test_and_runtime_surfaces = [
 				"crates/toron/src/audit.rs",
 				"crates/toron/src/coordinator.rs",
+				"crates/toron/src/daemon.rs",
 				"crates/toron/src/distributed/fragment.rs",
 				"crates/toron/src/distributed/scheduler.rs",
 				"crates/toron/src/distributed/task.rs",
@@ -175,13 +178,16 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/ir/execution.rs",
 				"crates/toron/src/ir.rs",
 				"crates/toron/src/lib.rs",
+				"crates/toron/src/network/observability.rs",
 				"crates/toron/src/rune_engine.rs",
 				"crates/toron/src/server/mod.rs",
 				"crates/toron/src/sql_planner.rs",
 				"crates/toron/tests/catalog_logical_identity_test.rs",
 				"crates/toron/tests/explain_analyze_test.rs",
 				"crates/toron/tests/hash_join_kinds_test.rs",
+				"crates/toron/tests/observability_listener_test.rs",
 				"crates/toron/tests/rune_relation_handles_test.rs",
+				"crates/toron/tests/wendelon_storage_execution_test.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

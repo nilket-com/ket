@@ -319,6 +319,48 @@ pub(super) fn information_schema_optimizer_runtime_verdict_rows(
 		.collect()
 }
 
+pub(super) fn information_schema_optimizer_evidence_status_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("mode", DataType::Utf8, false),
+		Field::new("state", DataType::Utf8, false),
+		Field::new("pending_deltas", DataType::Int64, false),
+		Field::new("dropped_deltas", DataType::Int64, false),
+		Field::new("ambiguous_deltas", DataType::Int64, false),
+		Field::new("refresh_failures", DataType::Int64, false),
+		Field::new("last_error", DataType::Utf8, true),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_evidence_status_rows(
+	status: &OptimizerEvidenceStatusSnapshot,
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	Ok(vec![vec![
+		ScalarValue::Utf8(Some(status.mode.as_str().to_string())),
+		ScalarValue::Utf8(Some(status.state.as_str().to_string())),
+		ScalarValue::Int64(Some(i64::try_from(status.pending_deltas).map_err(
+			|_| BindingError::UnsupportedExpression {
+				message: "optimizer evidence pending_deltas exceeds i64::MAX".to_string(),
+			},
+		)?)),
+		ScalarValue::Int64(Some(i64::try_from(status.dropped_deltas).map_err(
+			|_| BindingError::UnsupportedExpression {
+				message: "optimizer evidence dropped_deltas exceeds i64::MAX".to_string(),
+			},
+		)?)),
+		ScalarValue::Int64(Some(i64::try_from(status.ambiguous_deltas).map_err(
+			|_| BindingError::UnsupportedExpression {
+				message: "optimizer evidence ambiguous_deltas exceeds i64::MAX".to_string(),
+			},
+		)?)),
+		ScalarValue::Int64(Some(i64::try_from(status.refresh_failures).map_err(
+			|_| BindingError::UnsupportedExpression {
+				message: "optimizer evidence refresh_failures exceeds i64::MAX".to_string(),
+			},
+		)?)),
+		ScalarValue::Utf8(status.last_error.clone()),
+	]])
+}
+
 pub(super) fn information_schema_optimizer_margin_advisory_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("current_margin", DataType::Utf8, false),

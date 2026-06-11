@@ -1,0 +1,571 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use wendelon::schema::{TenantId, WriteStatus};
+use wendelon_client::{Client, ClientError, WriteOptions};
+
+use super::decision_log::{
+	OptimizerDecisionKind, OptimizerRuntimeVerdictClass, OptimizerRuntimeVerdictKey,
+	OptimizerRuntimeVerdictRow, optimizer_decision_kind_label, optimizer_runtime_verdict_label,
+};
+
+pub const OPTIMIZER_EVIDENCE_KEY_PREFIX: &str = "optimizer_evidence/verdict/";
+const UNAVAILABLE_CIRCUIT_BREAKER_FAILURES: u64 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimizerEvidenceMode {
+	LocalOnly,
+	Durable,
+	Degraded,
+}
+
+impl OptimizerEvidenceMode {
+	pub(crate) fn as_str(self) -> &'static str {
+		match self {
+			Self::LocalOnly => "local_only",
+			Self::Durable => "durable",
+			Self::Degraded => "degraded",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimizerEvidenceState {
+	Ok,
+	Stale,
+	ReplicationUnsupported,
+	Unavailable,
+}
+
+impl OptimizerEvidenceState {
+	pub(crate) fn as_str(self) -> &'static str {
+		match self {
+			Self::Ok => "ok",
+			Self::Stale => "stale",
+			Self::ReplicationUnsupported => "replication_unsupported",
+			Self::Unavailable => "unavailable",
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizerEvidenceStatusSnapshot {
+	pub mode: OptimizerEvidenceMode,
+	pub state: OptimizerEvidenceState,
+	pub pending_deltas: u64,
+	pub dropped_deltas: u64,
+	pub ambiguous_deltas: u64,
+	pub refresh_failures: u64,
+	pub last_error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct DurableEvidenceBinding {
+	client: Arc<Client>,
+	tenant_id: TenantId,
+	flush_timeout: Duration,
+}
+
+impl DurableEvidenceBinding {
+	pub fn new(client: Arc<Client>, tenant_id: TenantId, flush_timeout: Duration) -> Self {
+		Self {
+			client,
+			tenant_id,
+			flush_timeout,
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizerEvidenceRefreshReport {
+	pub refreshed_keys: usize,
+	pub failed: bool,
+}
+
+pub struct OptimizerRuntimeEvidence {
+	state: Mutex<RuntimeEvidenceState>,
+	binding: Option<DurableEvidenceBinding>,
+}
+
+impl fmt::Debug for OptimizerRuntimeEvidence {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("OptimizerRuntimeEvidence")
+			.field("has_binding", &self.binding.is_some())
+			.field("status", &self.status_snapshot())
+			.finish()
+	}
+}
+
+#[derive(Debug)]
+struct RuntimeEvidenceState {
+	pending: BTreeMap<OptimizerRuntimeVerdictKey, u64>,
+	in_flight: BTreeMap<OptimizerRuntimeVerdictKey, u64>,
+	durable_cache: BTreeMap<OptimizerRuntimeVerdictKey, u64>,
+	mode: OptimizerEvidenceMode,
+	state: OptimizerEvidenceState,
+	dropped_deltas: u64,
+	ambiguous_deltas: u64,
+	refresh_failures: u64,
+	consecutive_unavailable_failures: u64,
+	circuit_open: bool,
+	replication_unsupported: bool,
+	last_error: Option<String>,
+}
+
+impl Default for RuntimeEvidenceState {
+	fn default() -> Self {
+		Self {
+			pending: BTreeMap::new(),
+			in_flight: BTreeMap::new(),
+			durable_cache: BTreeMap::new(),
+			mode: OptimizerEvidenceMode::LocalOnly,
+			state: OptimizerEvidenceState::Ok,
+			dropped_deltas: 0,
+			ambiguous_deltas: 0,
+			refresh_failures: 0,
+			consecutive_unavailable_failures: 0,
+			circuit_open: false,
+			replication_unsupported: false,
+			last_error: None,
+		}
+	}
+}
+
+impl OptimizerRuntimeEvidence {
+	pub fn local_only() -> Self {
+		Self {
+			state: Mutex::new(RuntimeEvidenceState::default()),
+			binding: None,
+		}
+	}
+
+	pub fn with_wendelon(binding: DurableEvidenceBinding) -> Arc<Self> {
+		Arc::new(Self {
+			state: Mutex::new(RuntimeEvidenceState {
+				mode: OptimizerEvidenceMode::Durable,
+				..RuntimeEvidenceState::default()
+			}),
+			binding: Some(binding),
+		})
+	}
+
+	pub(crate) fn record_verdict(
+		&self,
+		kind: OptimizerDecisionKind,
+		verdict: OptimizerRuntimeVerdictClass,
+	) -> OptimizerRuntimeVerdictKey {
+		let key = OptimizerRuntimeVerdictKey { kind, verdict };
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		let count = state.pending.entry(key).or_insert(0);
+		*count = count.saturating_add(1);
+		key
+	}
+
+	pub(crate) fn verdict_snapshot(&self) -> Vec<OptimizerRuntimeVerdictRow> {
+		let state = self.state.lock().expect("optimizer runtime evidence");
+		let mut counts = state.durable_cache.clone();
+		for (key, count) in state.pending.iter().chain(state.in_flight.iter()) {
+			let entry = counts.entry(*key).or_insert(0);
+			*entry = entry.saturating_add(*count);
+		}
+		counts
+			.into_iter()
+			.filter_map(|(key, count)| {
+				(count > 0).then_some(OptimizerRuntimeVerdictRow {
+					kind: key.kind,
+					verdict: key.verdict,
+					count,
+				})
+			})
+			.collect()
+	}
+
+	pub(crate) fn status_snapshot(&self) -> OptimizerEvidenceStatusSnapshot {
+		let state = self.state.lock().expect("optimizer runtime evidence");
+		OptimizerEvidenceStatusSnapshot {
+			mode: state.mode,
+			state: state.state,
+			pending_deltas: sum_counts(&state.pending).saturating_add(sum_counts(&state.in_flight)),
+			dropped_deltas: state.dropped_deltas,
+			ambiguous_deltas: state.ambiguous_deltas,
+			refresh_failures: state.refresh_failures,
+			last_error: state.last_error.clone(),
+		}
+	}
+
+	pub(crate) async fn flush_keys(
+		&self,
+		keys: impl IntoIterator<Item = OptimizerRuntimeVerdictKey>,
+	) {
+		let Some(binding) = self.binding.clone() else {
+			return;
+		};
+		let keys = keys.into_iter().collect::<BTreeSet<_>>();
+		for key in keys {
+			let Some(delta) = self.take_pending_for_flush(key) else {
+				continue;
+			};
+			let key_bytes = verdict_counter_key(key.kind, key.verdict);
+			let result = tokio::time::timeout(
+				binding.flush_timeout,
+				binding.client.counter_fetch_add(
+					binding.tenant_id,
+					&key_bytes,
+					delta,
+					WriteOptions::default(),
+				),
+			)
+			.await;
+			match result {
+				Ok(Ok(receipt)) => self.ack_flush(key, receipt.current_value),
+				Ok(Err(ClientError::WriteFailed { status }))
+					if status == WriteStatus::COUNTER_REPLICATION_UNSUPPORTED =>
+				{
+					self.latch_replication_unsupported(
+						key,
+						delta,
+						format!("counter fetch-add failed with status {}", status.as_str()),
+					);
+				}
+				Ok(Err(error)) => self.drop_ambiguous_in_flight(key, delta, error.to_string()),
+				Err(_) => self.drop_ambiguous_in_flight(
+					key,
+					delta,
+					"counter fetch-add timed out".to_string(),
+				),
+			}
+		}
+	}
+
+	pub async fn refresh_durable_cache(&self) -> OptimizerEvidenceRefreshReport {
+		let Some(binding) = self.binding.clone() else {
+			return OptimizerEvidenceRefreshReport {
+				refreshed_keys: 0,
+				failed: false,
+			};
+		};
+		if self.is_replication_unsupported() {
+			return OptimizerEvidenceRefreshReport {
+				refreshed_keys: 0,
+				failed: true,
+			};
+		}
+		let mut refreshed = BTreeMap::new();
+		for (key, key_bytes) in all_verdict_counter_keys() {
+			match binding
+				.client
+				.counter_read(binding.tenant_id, &key_bytes)
+				.await
+			{
+				Ok(value) => {
+					refreshed.insert(key, value.unwrap_or(0));
+				}
+				Err(error) => {
+					self.mark_refresh_failed(error.to_string());
+					return OptimizerEvidenceRefreshReport {
+						refreshed_keys: refreshed.len(),
+						failed: true,
+					};
+				}
+			}
+		}
+		let refreshed_keys = refreshed.len();
+		self.merge_refresh(refreshed);
+		OptimizerEvidenceRefreshReport {
+			refreshed_keys,
+			failed: false,
+		}
+	}
+
+	fn take_pending_for_flush(&self, key: OptimizerRuntimeVerdictKey) -> Option<u64> {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		if self.binding.is_none()
+			|| state.replication_unsupported
+			|| state.circuit_open
+			|| state.in_flight.get(&key).copied().unwrap_or(0) > 0
+		{
+			return None;
+		}
+		let delta = state.pending.remove(&key).unwrap_or(0);
+		if delta == 0 {
+			return None;
+		}
+		state.in_flight.insert(key, delta);
+		Some(delta)
+	}
+
+	fn ack_flush(&self, key: OptimizerRuntimeVerdictKey, current_value: u64) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.in_flight.remove(&key);
+		let cached = state.durable_cache.entry(key).or_insert(0);
+		*cached = (*cached).max(current_value);
+		if !state.replication_unsupported {
+			state.consecutive_unavailable_failures = 0;
+			state.circuit_open = false;
+			state.mode = OptimizerEvidenceMode::Durable;
+			state.state = OptimizerEvidenceState::Ok;
+			state.last_error = None;
+		}
+	}
+
+	fn drop_ambiguous_in_flight(&self, key: OptimizerRuntimeVerdictKey, delta: u64, error: String) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.in_flight.remove(&key);
+		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
+		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
+		state.consecutive_unavailable_failures =
+			state.consecutive_unavailable_failures.saturating_add(1);
+		if state.consecutive_unavailable_failures >= UNAVAILABLE_CIRCUIT_BREAKER_FAILURES {
+			state.circuit_open = true;
+			state.mode = OptimizerEvidenceMode::Degraded;
+		}
+		state.state = OptimizerEvidenceState::Unavailable;
+		state.last_error = Some(error);
+	}
+
+	fn latch_replication_unsupported(
+		&self,
+		key: OptimizerRuntimeVerdictKey,
+		delta: u64,
+		error: String,
+	) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.in_flight.remove(&key);
+		state.dropped_deltas = state.dropped_deltas.saturating_add(delta);
+		state.ambiguous_deltas = state.ambiguous_deltas.saturating_add(delta);
+		state.replication_unsupported = true;
+		state.circuit_open = true;
+		state.mode = OptimizerEvidenceMode::Degraded;
+		state.state = OptimizerEvidenceState::ReplicationUnsupported;
+		state.last_error = Some(error);
+	}
+
+	fn is_replication_unsupported(&self) -> bool {
+		let state = self.state.lock().expect("optimizer runtime evidence");
+		state.replication_unsupported
+	}
+
+	fn mark_refresh_failed(&self, error: String) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		state.refresh_failures = state.refresh_failures.saturating_add(1);
+		if !state.replication_unsupported {
+			state.state = OptimizerEvidenceState::Stale;
+		}
+		state.last_error = Some(error);
+	}
+
+	fn merge_refresh(&self, refreshed: BTreeMap<OptimizerRuntimeVerdictKey, u64>) {
+		let mut state = self.state.lock().expect("optimizer runtime evidence");
+		for (key, value) in refreshed {
+			let cached = state.durable_cache.entry(key).or_insert(0);
+			*cached = (*cached).max(value);
+		}
+		if !state.replication_unsupported {
+			state.consecutive_unavailable_failures = 0;
+			state.circuit_open = false;
+			state.mode = OptimizerEvidenceMode::Durable;
+			state.state = OptimizerEvidenceState::Ok;
+			state.last_error = None;
+		}
+	}
+}
+
+pub(crate) fn verdict_counter_key(
+	kind: OptimizerDecisionKind,
+	verdict: OptimizerRuntimeVerdictClass,
+) -> Vec<u8> {
+	format!(
+		"{OPTIMIZER_EVIDENCE_KEY_PREFIX}{}/{}",
+		optimizer_decision_kind_label(kind),
+		optimizer_runtime_verdict_label(verdict)
+	)
+	.into_bytes()
+}
+
+pub(crate) fn all_verdict_counter_keys() -> Vec<(OptimizerRuntimeVerdictKey, Vec<u8>)> {
+	let mut keys =
+		Vec::with_capacity(runtime_evidence_decision_kinds().len() * verdict_classes().len());
+	for kind in runtime_evidence_decision_kinds() {
+		for verdict in verdict_classes() {
+			let key = OptimizerRuntimeVerdictKey { kind, verdict };
+			keys.push((key, verdict_counter_key(kind, verdict)));
+		}
+	}
+	keys
+}
+
+fn runtime_evidence_decision_kinds() -> [OptimizerDecisionKind; 7] {
+	[
+		OptimizerDecisionKind::StarCandidate,
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionKind::SnowflakeBranch,
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionKind::BridgeChainRoot,
+	]
+}
+
+fn verdict_classes() -> [OptimizerRuntimeVerdictClass; 5] {
+	[
+		OptimizerRuntimeVerdictClass::Vindicated,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		OptimizerRuntimeVerdictClass::OverEager,
+		OptimizerRuntimeVerdictClass::MisRanked,
+		OptimizerRuntimeVerdictClass::Indeterminate,
+	]
+}
+
+fn sum_counts(counts: &BTreeMap<OptimizerRuntimeVerdictKey, u64>) -> u64 {
+	counts
+		.values()
+		.fold(0u64, |acc, count| acc.saturating_add(*count))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::BTreeSet;
+
+	use super::*;
+
+	fn star_missed() -> OptimizerRuntimeVerdictKey {
+		OptimizerRuntimeVerdictKey {
+			kind: OptimizerDecisionKind::StarCandidate,
+			verdict: OptimizerRuntimeVerdictClass::MissedWin,
+		}
+	}
+
+	#[test]
+	fn runtime_evidence_keys_are_fixed_35_key_matrix() {
+		let keys = all_verdict_counter_keys();
+		assert_eq!(keys.len(), 35);
+		let unique = keys
+			.iter()
+			.map(|(_, key)| key.clone())
+			.collect::<BTreeSet<_>>();
+		assert_eq!(unique.len(), 35);
+		assert!(
+			keys.iter()
+				.all(|(key, _)| key.kind != OptimizerDecisionKind::Overflow)
+		);
+		assert!(
+			keys.iter()
+				.any(|(_, key)| key == b"optimizer_evidence/verdict/star_candidate/missed_win")
+		);
+		assert!(
+			keys.iter()
+				.any(|(_, key)| key == b"optimizer_evidence/verdict/bridge_chain_root/vindicated")
+		);
+	}
+
+	#[test]
+	fn runtime_evidence_local_only_snapshot_unchanged() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		evidence.record_verdict(
+			OptimizerDecisionKind::StarCandidate,
+			OptimizerRuntimeVerdictClass::MissedWin,
+		);
+		evidence.record_verdict(
+			OptimizerDecisionKind::StarCandidate,
+			OptimizerRuntimeVerdictClass::MissedWin,
+		);
+		assert_eq!(
+			evidence.verdict_snapshot(),
+			vec![OptimizerRuntimeVerdictRow {
+				kind: OptimizerDecisionKind::StarCandidate,
+				verdict: OptimizerRuntimeVerdictClass::MissedWin,
+				count: 2,
+			}]
+		);
+	}
+
+	#[test]
+	fn runtime_evidence_cache_plus_pending_counts_once() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		let key = star_missed();
+		{
+			let mut state = evidence.state.lock().expect("optimizer runtime evidence");
+			state.durable_cache.insert(key, 3);
+		}
+		evidence.record_verdict(key.kind, key.verdict);
+		assert_eq!(evidence.verdict_snapshot()[0].count, 4);
+	}
+
+	#[test]
+	fn runtime_evidence_in_flight_delta_visible_once() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		let key = star_missed();
+		{
+			let mut state = evidence.state.lock().expect("optimizer runtime evidence");
+			state.durable_cache.insert(key, 10);
+			state.in_flight.insert(key, 2);
+		}
+		assert_eq!(evidence.verdict_snapshot()[0].count, 12);
+	}
+
+	#[test]
+	fn runtime_evidence_flush_ack_does_not_double_count() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		let key = star_missed();
+		{
+			let mut state = evidence.state.lock().expect("optimizer runtime evidence");
+			state.in_flight.insert(key, 1);
+		}
+		evidence.ack_flush(key, 1);
+		assert_eq!(evidence.verdict_snapshot()[0].count, 1);
+	}
+
+	#[test]
+	fn runtime_evidence_ack_larger_wins() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		let key = star_missed();
+		{
+			let mut state = evidence.state.lock().expect("optimizer runtime evidence");
+			state.durable_cache.insert(key, 7);
+			state.in_flight.insert(key, 1);
+		}
+		evidence.ack_flush(key, 5);
+		assert_eq!(evidence.verdict_snapshot()[0].count, 7);
+	}
+
+	#[test]
+	fn runtime_evidence_ack_after_replication_latch_keeps_degraded_status() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		let key = star_missed();
+		{
+			let mut state = evidence.state.lock().expect("optimizer runtime evidence");
+			state.in_flight.insert(key, 1);
+		}
+		evidence.latch_replication_unsupported(key, 1, "unsupported".to_string());
+		{
+			let mut state = evidence.state.lock().expect("optimizer runtime evidence");
+			state.in_flight.insert(key, 1);
+		}
+
+		evidence.ack_flush(key, 2);
+
+		let status = evidence.status_snapshot();
+		assert_eq!(status.mode, OptimizerEvidenceMode::Degraded);
+		assert_eq!(status.state, OptimizerEvidenceState::ReplicationUnsupported);
+		assert_eq!(status.last_error.as_deref(), Some("unsupported"));
+		assert_eq!(evidence.verdict_snapshot()[0].count, 2);
+	}
+
+	#[test]
+	fn runtime_evidence_ambiguous_flush_drops_without_retry() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		let key = star_missed();
+		{
+			let mut state = evidence.state.lock().expect("optimizer runtime evidence");
+			state.in_flight.insert(key, 2);
+		}
+		evidence.drop_ambiguous_in_flight(key, 2, "timeout".to_string());
+		let status = evidence.status_snapshot();
+		assert_eq!(status.pending_deltas, 0);
+		assert_eq!(status.dropped_deltas, 2);
+		assert_eq!(status.ambiguous_deltas, 2);
+		assert_eq!(status.state, OptimizerEvidenceState::Unavailable);
+	}
+}

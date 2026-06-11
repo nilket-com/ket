@@ -271,16 +271,19 @@ pub(crate) fn adr188_measured_accrual_is_side_effect_only() {
 	let binder = binder_root_source();
 	let coordinator = source("src/coordinator.rs");
 	let decision_log = source("src/binder/decision_log.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
 	let join_order = source("src/binder/join_order.rs");
 	let selectivity = source("src/binder/selectivity.rs");
 	let pushdown = source("src/binder/pushdown.rs");
 	let fragment = source("src/distributed/fragment.rs");
 	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
 
-	assert!(decision_log.contains("pub(crate) fn record_verdict"));
-	assert!(decision_log.contains("pub(crate) fn verdict_snapshot"));
+	assert!(!decision_log.contains("pub(crate) fn record_verdict"));
+	assert!(!decision_log.contains("pub(crate) fn verdict_snapshot"));
+	assert!(runtime_evidence.contains("pub(crate) fn record_verdict"));
+	assert!(runtime_evidence.contains("pub(crate) fn verdict_snapshot"));
 	assert!(coordinator.contains(".record_verdict("));
-	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
+	assert!(bind_relation.contains("runtime_evidence.verdict_snapshot()"));
 
 	// ADR 191: the join-order planning helpers still must not read verdict accrual. The only
 	// sanctioned readers are the opt-in margin resolver and the read-only advisory report, which
@@ -418,7 +421,7 @@ pub(crate) fn adr189_advisory_is_read_only() {
 	assert!(!recommend.contains("decision_log"));
 	assert!(!recommend.contains(".record("));
 	assert!(!recommend.contains("record_verdict"));
-	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
+	assert!(bind_relation.contains("runtime_evidence.verdict_snapshot()"));
 	assert!(bind_relation.contains("margin_advisory_report("));
 	assert!(advisory_report.contains("recommend_soft_margin("));
 	assert!(!classify.contains("recommend_soft_margin"));
@@ -446,25 +449,28 @@ pub(crate) fn adr189_advisory_does_not_change_margin_or_decision() {
 pub(crate) fn adr189_advisory_reuses_188_verdict_log() {
 	let binder = binder_root_source();
 	let decision_log = source("src/binder/decision_log.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
 	let join_order = source("src/binder/join_order.rs");
 	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
-	let log_struct = first_block(&decision_log, "pub struct OptimizerDecisionLog");
-	let with_max_keys = first_block(&decision_log, "pub(crate) fn with_max_keys");
+	let evidence_struct = first_block(&runtime_evidence, "pub struct OptimizerRuntimeEvidence");
+	let evidence_state = first_block(&runtime_evidence, "struct RuntimeEvidenceState");
 	// ADR 191: the advisory report path is the indirection that reuses the 188 verdict log.
 	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 
-	assert!(decision_log.contains("pub(crate) fn verdict_snapshot"));
+	assert!(!decision_log.contains("pub(crate) fn verdict_snapshot"));
+	assert!(runtime_evidence.contains("pub(crate) fn verdict_snapshot"));
 	assert!(join_order.contains("snapshot: &[OptimizerRuntimeVerdictRow]"));
-	assert!(bind_relation.contains("decision_log.verdict_snapshot()"));
+	assert!(bind_relation.contains("runtime_evidence.verdict_snapshot()"));
 	assert!(bind_relation.contains("margin_advisory_report("));
 	assert!(advisory_report.contains("recommend_soft_margin("));
-	assert!(advisory_report.contains("decision_log.verdict_snapshot()"));
-	assert!(
-		log_struct.contains("verdict_counts: Mutex<BTreeMap<OptimizerRuntimeVerdictKey, u64>>")
-	);
-	assert!(with_max_keys.contains("verdict_counts: Mutex::new(BTreeMap::new())"));
+	assert!(advisory_report.contains("runtime_evidence.verdict_snapshot()"));
+	assert!(evidence_struct.contains("state: Mutex<RuntimeEvidenceState>"));
+	assert!(evidence_state.contains("pending: BTreeMap<OptimizerRuntimeVerdictKey, u64>"));
+	assert!(evidence_state.contains("durable_cache: BTreeMap<OptimizerRuntimeVerdictKey, u64>"));
 	assert_eq!(
-		decision_log.matches("pub(crate) fn record_verdict").count(),
+		runtime_evidence
+			.matches("pub(crate) fn record_verdict")
+			.count(),
 		1
 	);
 }
@@ -846,6 +852,329 @@ pub(crate) fn adr191_no_executor_fragmenter_storage_or_wendelon_change() {
 #[test]
 pub(crate) fn adr191_no_optimizer_shell_or_planproperties_contract() {
 	adr189_no_optimizer_shell_or_planproperties_contract();
+}
+
+#[test]
+pub(crate) fn adr207_runtime_evidence_is_extracted_fixed_matrix() {
+	let binder = binder_root_source();
+	let decision_log = source("src/binder/decision_log.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let kinds = first_block(&runtime_evidence, "fn runtime_evidence_decision_kinds");
+	let classes = first_block(&runtime_evidence, "fn verdict_classes");
+	let all_keys = first_block(&runtime_evidence, "pub(crate) fn all_verdict_counter_keys");
+
+	assert!(binder.contains("mod runtime_evidence;"));
+	assert!(binder.contains("pub runtime_evidence: Arc<OptimizerRuntimeEvidence>"));
+	assert!(binder.contains("runtime_evidence: Arc::new(OptimizerRuntimeEvidence::local_only())"));
+	assert!(!decision_log.contains("verdict_counts"));
+	assert!(!decision_log.contains("pub(crate) fn record_verdict"));
+	assert!(!decision_log.contains("pub(crate) fn verdict_snapshot"));
+	assert!(runtime_evidence.contains("OPTIMIZER_EVIDENCE_KEY_PREFIX"));
+	for kind in [
+		"StarCandidate",
+		"FlatStar",
+		"SnowflakeRoot",
+		"SnowflakeBranch",
+		"GalaxyRoot",
+		"BridgeRoot",
+		"BridgeChainRoot",
+	] {
+		assert!(
+			kinds.contains(kind),
+			"fixed evidence matrix is missing {kind}"
+		);
+	}
+	assert!(!kinds.contains("Overflow"));
+	for class in [
+		"Vindicated",
+		"MissedWin",
+		"OverEager",
+		"MisRanked",
+		"Indeterminate",
+	] {
+		assert!(
+			classes.contains(class),
+			"fixed evidence matrix is missing {class}"
+		);
+	}
+	assert!(all_keys.contains("runtime_evidence_decision_kinds().len() * verdict_classes().len()"));
+	assert!(!runtime_evidence.contains("prefix_scan"));
+	assert!(!runtime_evidence.contains("SystemTableRegistry"));
+}
+
+#[test]
+pub(crate) fn adr207_snapshot_merges_durable_pending_and_in_flight() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
+	let flush = first_block(&runtime_evidence, "fn take_pending_for_flush");
+	let ack = first_block(&runtime_evidence, "fn ack_flush");
+	let refresh = first_block(&runtime_evidence, "pub async fn refresh_durable_cache");
+
+	assert!(snapshot.contains("state.durable_cache.clone()"));
+	assert!(snapshot.contains("state.pending.iter().chain(state.in_flight.iter())"));
+	assert!(snapshot.contains("count > 0"));
+	assert!(flush.contains("state.in_flight.get(&key)"));
+	assert!(flush.contains("state.in_flight.insert(key, delta)"));
+	assert!(ack.contains(".max(current_value)"));
+	assert!(refresh.contains("value.unwrap_or(0)"));
+}
+
+#[test]
+pub(crate) fn adr207_flush_is_awaited_post_success_not_background_queue() {
+	let coordinator = source("src/coordinator.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let streaming = first_block(&coordinator, "async fn run_streaming_read_driver");
+	let local = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
+		.into_iter()
+		.map(|(_, block)| block)
+		.find(|block| block.contains("self.executor.execute_bound"))
+		.expect("local QueryCoordinator execute_query block");
+
+	for block in [&streaming, &local] {
+		assert!(block.contains(".record_verdict("));
+		assert!(block.contains(".flush_keys(touched).await"));
+	}
+	assert!(!runtime_evidence.contains("mpsc"));
+	assert!(!runtime_evidence.contains("tokio::spawn"));
+}
+
+#[test]
+pub(crate) fn adr207_uses_counter_facade_and_never_retries_ambiguous_delta() {
+	let manifest = manifest_dir();
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let flush = first_block(&runtime_evidence, "pub(crate) async fn flush_keys");
+	let drop_ambiguous = first_block(&runtime_evidence, "fn drop_ambiguous_in_flight");
+	let unsupported = first_block(&runtime_evidence, "fn latch_replication_unsupported");
+
+	assert!(runtime_evidence.contains(".counter_fetch_add("));
+	assert!(runtime_evidence.contains(".counter_read("));
+	assert_eq!(flush.matches("counter_fetch_add").count(), 1);
+	assert!(flush.contains("COUNTER_REPLICATION_UNSUPPORTED"));
+	assert!(flush.contains("drop_ambiguous_in_flight"));
+	assert!(!drop_ambiguous.contains("counter_fetch_add"));
+	assert!(unsupported.contains("ReplicationUnsupported"));
+
+	let raw_counter_offenders = source_lines(&manifest.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("CounterAddRequest")
+				|| line.contains("CounterAddRequestMeta")
+				|| line.contains("COUNTER_ADD_REQ")
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		raw_counter_offenders.is_empty(),
+		"ADR207 must use the Wendelon counter facade, not raw counter frames:\n{}",
+		format_offenders(&manifest, &raw_counter_offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr207_bind_path_never_awaits_storage_for_evidence() {
+	let binder = binder_root_source();
+	let join_order = source("src/binder/join_order.rs");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+	let resolver = first_block(
+		&join_order,
+		"pub(crate) fn effective_join_order_soft_margin_step",
+	);
+	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+
+	for block in [&bind_relation, &resolver, &report] {
+		assert!(block.contains("runtime_evidence"));
+		assert!(!block.contains("counter_read"));
+		assert!(!block.contains("counter_fetch_add"));
+		assert!(!block.contains("refresh_durable_cache"));
+	}
+	assert!(!resolver.contains(".await"));
+	assert!(!report.contains(".await"));
+}
+
+#[test]
+pub(crate) fn adr207_status_surface_and_metrics_report_sink_health() {
+	let binder = binder_root_source();
+	let execution = source("src/ir/execution.rs");
+	let explain = source("src/binder/explain.rs");
+	let observability = source("src/network/observability.rs");
+	let daemon = source("src/daemon.rs");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+	let status_schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_evidence_status_schema",
+	);
+	let status_rows = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_evidence_status_rows",
+	);
+	let metrics = first_block(&observability, "fn render_optimizer_evidence_metrics");
+
+	assert!(binder.contains("INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS_TABLE"));
+	assert!(execution.contains("InformationSchemaOptimizerEvidenceStatus"));
+	assert!(bind_relation.contains("INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS_TABLE"));
+	assert!(bind_relation.contains("runtime_evidence.status_snapshot()"));
+	for column in [
+		"mode",
+		"state",
+		"pending_deltas",
+		"dropped_deltas",
+		"ambiguous_deltas",
+		"refresh_failures",
+		"last_error",
+	] {
+		assert!(
+			status_schema.contains(column),
+			"status schema is missing {column}"
+		);
+		assert!(
+			status_rows.contains(column),
+			"status rows are missing {column}"
+		);
+	}
+	for metric in [
+		"optimizer_evidence_pending_deltas",
+		"optimizer_evidence_dropped_deltas_total",
+		"optimizer_evidence_ambiguous_deltas_total",
+		"optimizer_evidence_refresh_failures_total",
+		"optimizer_evidence_durable_enabled",
+	] {
+		assert!(
+			metrics.contains(metric),
+			"metrics output is missing {metric}"
+		);
+	}
+	assert!(daemon.contains("refresh_durable_cache().await"));
+	assert!(daemon.contains("OPTIMIZER_EVIDENCE_REFRESH_INTERVAL"));
+	assert!(daemon.contains("runtime_evidence: Some(Arc::clone(&runtime_evidence))"));
+}
+
+#[test]
+pub(crate) fn adr207_no_wendelon_production_or_optimizer_shell_change() {
+	let manifest = manifest_dir();
+	let offenders = source_lines(&manifest.join("../wendelon/src"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("optimizer_evidence"))
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR207 optimizer evidence leaked into Wendelon production crate:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+
+	adr191_no_optimizer_shell_or_planproperties_contract();
+}
+
+#[test]
+pub(crate) fn adr207_verdict_evidence_keys_are_fixed_matrix_no_registry() {
+	adr207_runtime_evidence_is_extracted_fixed_matrix();
+}
+
+#[test]
+pub(crate) fn adr207_counter_absent_maps_to_zero_in_consumer() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let refresh = first_block(&runtime_evidence, "pub async fn refresh_durable_cache");
+	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
+
+	assert!(refresh.contains("value.unwrap_or(0)"));
+	assert!(snapshot.contains("count > 0"));
+}
+
+#[test]
+pub(crate) fn adr207_snapshot_is_durable_cache_plus_pending_not_local_plus_durable() {
+	adr207_snapshot_merges_durable_pending_and_in_flight();
+}
+
+#[test]
+pub(crate) fn adr207_in_flight_deltas_are_not_reissued_or_hidden() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
+	let flush = first_block(&runtime_evidence, "fn take_pending_for_flush");
+	let drop_ambiguous = first_block(&runtime_evidence, "fn drop_ambiguous_in_flight");
+
+	assert!(snapshot.contains("state.in_flight.iter()"));
+	assert!(flush.contains("state.in_flight.get(&key)"));
+	assert!(drop_ambiguous.contains("state.in_flight.remove(&key)"));
+	assert!(!drop_ambiguous.contains("state.pending"));
+}
+
+#[test]
+pub(crate) fn adr207_ack_flush_uses_larger_wins_cache_update() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let ack = first_block(&runtime_evidence, "fn ack_flush");
+
+	assert!(ack.contains(".max(current_value)"));
+}
+
+#[test]
+pub(crate) fn adr207_no_fresh_write_id_after_ambiguous_flush() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let flush = first_block(&runtime_evidence, "pub(crate) async fn flush_keys");
+	let drop_ambiguous = first_block(&runtime_evidence, "fn drop_ambiguous_in_flight");
+
+	assert_eq!(flush.matches("counter_fetch_add").count(), 1);
+	assert!(!drop_ambiguous.contains("counter_fetch_add"));
+	assert!(!drop_ambiguous.contains("pending"));
+}
+
+#[test]
+pub(crate) fn adr207_uses_counter_fetch_add_facade_not_raw_counter_frames() {
+	adr207_uses_counter_facade_and_never_retries_ambiguous_delta();
+}
+
+#[test]
+pub(crate) fn adr207_decision_lane_stays_local() {
+	let decision_log = source("src/binder/decision_log.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+
+	assert!(decision_log.contains("pub(crate) fn record("));
+	assert!(decision_log.contains("pub(crate) fn snapshot("));
+	assert!(!decision_log.contains("verdict_counts"));
+	assert!(!decision_log.contains("pub(crate) fn record_verdict"));
+	assert!(!decision_log.contains("pub(crate) fn verdict_snapshot"));
+	assert!(runtime_evidence.contains("pub(crate) fn record_verdict"));
+	assert!(runtime_evidence.contains("pub(crate) fn verdict_snapshot"));
+}
+
+#[test]
+pub(crate) fn adr207_replication_unsupported_latches_degraded() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let flush = first_block(&runtime_evidence, "pub(crate) async fn flush_keys");
+	let unsupported = first_block(&runtime_evidence, "fn latch_replication_unsupported");
+
+	assert!(flush.contains("COUNTER_REPLICATION_UNSUPPORTED"));
+	assert!(unsupported.contains("replication_unsupported = true"));
+	assert!(unsupported.contains("circuit_open = true"));
+	assert!(unsupported.contains("OptimizerEvidenceMode::Degraded"));
+	assert!(unsupported.contains("OptimizerEvidenceState::ReplicationUnsupported"));
+}
+
+#[test]
+pub(crate) fn adr207_no_otlp_optimizer_metric_expansion() {
+	let telemetry = source("src/telemetry.rs");
+
+	assert!(!telemetry.contains("optimizer_evidence"));
+	assert!(!telemetry.contains("OptimizerRuntimeEvidence"));
+}
+
+#[test]
+pub(crate) fn adr207_no_wendelon_production_change() {
+	adr207_no_wendelon_production_or_optimizer_shell_change();
+}
+
+#[test]
+pub(crate) fn adr207_evidence_failure_never_fails_queries() {
+	let coordinator = source("src/coordinator.rs");
+	let streaming = first_block(&coordinator, "async fn run_streaming_read_driver");
+	let local = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
+		.into_iter()
+		.map(|(_, block)| block)
+		.find(|block| block.contains("self.executor.execute_bound"))
+		.expect("local QueryCoordinator execute_query block");
+
+	for block in [&streaming, &local] {
+		assert!(block.contains(".flush_keys(touched).await;"));
+		assert!(!block.contains(".flush_keys(touched).await?"));
+		assert!(!block.contains(".flush_keys(touched).await.map_err"));
+	}
 }
 
 #[test]

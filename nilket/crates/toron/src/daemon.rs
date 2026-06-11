@@ -4,6 +4,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{
 	ArrayRef, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -17,7 +18,7 @@ use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
-use tokio::time::timeout;
+use tokio::time::{interval, timeout};
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
@@ -67,6 +68,9 @@ use crate::storage::{
 	HlcBound, StorageScan, TenantId, WendelonStorageAdmin, WendelonStorageDeleteRows,
 	WendelonStorageScan, WendelonStorageWrite,
 };
+
+const OPTIMIZER_EVIDENCE_FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
+const OPTIMIZER_EVIDENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum ToronDaemonError {
@@ -262,13 +266,25 @@ impl ToronDaemon {
 		let coordinator_deleter: Arc<dyn crate::storage::StorageDeleteRows> = deleter.clone();
 		let coordinator_admin: Arc<dyn crate::storage::StorageAdmin> = admin.clone();
 		let cancellation_metrics = Arc::new(CancellationMetrics::default());
+		let runtime_evidence = crate::binder::OptimizerRuntimeEvidence::with_wendelon(
+			crate::binder::DurableEvidenceBinding::new(
+				Arc::clone(&client),
+				wendelon::schema::TenantId::new(tenant_id.0),
+				OPTIMIZER_EVIDENCE_FLUSH_TIMEOUT,
+			),
+		);
+		let _ = runtime_evidence.refresh_durable_cache().await;
+		let planner_config = crate::binder::PlannerConfig {
+			runtime_evidence: Arc::clone(&runtime_evidence),
+			..crate::binder::PlannerConfig::default()
+		};
 		let coordinator = Arc::new(
 			DistributedQueryCoordinator::with_writer_deleter_and_admin(
 				coordinator_catalog,
 				worker_registry,
 				Arc::clone(&memory),
 				transport,
-				crate::binder::PlannerConfig::default(),
+				planner_config,
 				QueryBudget::default(),
 				coordinator_writer,
 				coordinator_deleter,
@@ -283,6 +299,21 @@ impl ToronDaemon {
 		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
 		let mut shutdown_txs = Vec::new();
 		let mut listener_tasks = Vec::new();
+		let (evidence_refresh_shutdown_tx, mut evidence_refresh_shutdown_rx) = oneshot::channel();
+		shutdown_txs.push(evidence_refresh_shutdown_tx);
+		let refresh_runtime_evidence = Arc::clone(&runtime_evidence);
+		listener_tasks.push(tokio::spawn(async move {
+			let mut refresh_interval = interval(OPTIMIZER_EVIDENCE_REFRESH_INTERVAL);
+			refresh_interval.tick().await;
+			loop {
+				tokio::select! {
+					_ = &mut evidence_refresh_shutdown_rx => break,
+					_ = refresh_interval.tick() => {
+						let _ = refresh_runtime_evidence.refresh_durable_cache().await;
+					}
+				}
+			}
+		}));
 		let sql_connection_limiter = config.sql.as_ref().map(|sql| {
 			SqlConnectionLimiter::new(
 				sql.max_concurrent_connections,
@@ -303,6 +334,7 @@ impl ToronDaemon {
 			downstream_cancellation_metrics,
 			sql_connection_limiter: sql_connection_limiter.clone(),
 			audit_metrics: audit_metrics.clone(),
+			runtime_evidence: Some(Arc::clone(&runtime_evidence)),
 			tenant_admission: coordinator.tenant_admission_controller(),
 			admission_rejections: coordinator.admission_rejection_counters(),
 		}));

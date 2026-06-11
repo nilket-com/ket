@@ -60,6 +60,7 @@ mod explain;
 mod join;
 mod join_order;
 mod pushdown;
+mod runtime_evidence;
 mod selectivity;
 
 use self::aggregate::*;
@@ -75,6 +76,8 @@ pub use self::decision_log::OptimizerDecisionLog;
 pub use self::join::join_schema;
 pub(crate) use self::join::{BroadcastBuildSide, JoinStrategyDecisionReason};
 pub use self::join_order::SoftMarginLadderStep;
+pub(crate) use self::runtime_evidence::OptimizerEvidenceStatusSnapshot;
+pub use self::runtime_evidence::{DurableEvidenceBinding, OptimizerRuntimeEvidence};
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
 const DEFAULT_AUTO_JOIN_PARTITION_COUNT: u32 = 4;
@@ -95,6 +98,8 @@ const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS: &str =
 	"information_schema.optimizer_runtime_verdicts";
 const INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY: &str =
 	"information_schema.optimizer_margin_advisory";
+const INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS: &str =
+	"information_schema.optimizer_evidence_status";
 const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
 const INFORMATION_SCHEMA_TABLES_TABLE: &str = "tables";
 const INFORMATION_SCHEMA_COLUMNS_TABLE: &str = "columns";
@@ -102,6 +107,7 @@ const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
 const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS_TABLE: &str = "optimizer_decisions";
 const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE: &str = "optimizer_runtime_verdicts";
 const INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE: &str = "optimizer_margin_advisory";
+const INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS_TABLE: &str = "optimizer_evidence_status";
 const ARROW_BUFFER_ALIGNMENT_BYTES: u64 = 64;
 const DEFAULT_UTF8_BINARY_PAYLOAD_BYTES: u64 = 256;
 const DEFAULT_LARGE_UTF8_BINARY_PAYLOAD_BYTES: u64 = 1024;
@@ -134,6 +140,7 @@ pub struct PlannerConfig {
 	pub force_hash_join_ids: BTreeSet<JoinReplayId>,
 	pub session_timezone: String,
 	pub decision_log: Arc<OptimizerDecisionLog>,
+	pub runtime_evidence: Arc<OptimizerRuntimeEvidence>,
 	pub measured_accrual_sample_rate: u32,
 	pub measured_accrual_counter: Arc<AtomicU64>,
 	pub join_order_soft_margin_step: SoftMarginLadderStep,
@@ -148,6 +155,7 @@ impl Default for PlannerConfig {
 			force_hash_join_ids: BTreeSet::new(),
 			session_timezone: "UTC".to_string(),
 			decision_log: Arc::new(OptimizerDecisionLog::default()),
+			runtime_evidence: Arc::new(OptimizerRuntimeEvidence::local_only()),
 			measured_accrual_sample_rate: 0,
 			measured_accrual_counter: Arc::new(AtomicU64::new(0)),
 			join_order_soft_margin_step: CURRENT_JOIN_ORDER_SOFT_MARGIN_STEP,
@@ -1870,7 +1878,7 @@ impl<'a> Binder<'a> {
 				SystemTableKind::InformationSchemaOptimizerRuntimeVerdicts,
 				information_schema_optimizer_runtime_verdicts_schema(),
 				information_schema_optimizer_runtime_verdict_rows(
-					&self.config.decision_log.verdict_snapshot(),
+					&self.config.runtime_evidence.verdict_snapshot(),
 				)?,
 				projection,
 			);
@@ -1887,9 +1895,22 @@ impl<'a> Binder<'a> {
 				projection,
 			);
 		}
+		if table
+			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS_TABLE)
+		{
+			return system_table_plan(
+				SystemTableKind::InformationSchemaOptimizerEvidenceStatus,
+				information_schema_optimizer_evidence_status_schema(),
+				information_schema_optimizer_evidence_status_rows(
+					&self.config.runtime_evidence.status_snapshot(),
+				)?,
+				projection,
+			);
+		}
 		Err(BindingError::UnsupportedExpression {
 			message: format!(
-				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY}",
+				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY}, {INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS}",
 				table_name(table)
 			),
 		})

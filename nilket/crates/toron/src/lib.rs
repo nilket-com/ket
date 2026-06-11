@@ -638,7 +638,7 @@ mod tests {
 			vec!["id", "customer_id", "id", "region"]
 		);
 		assert!(
-			config.decision_log.verdict_snapshot().is_empty(),
+			config.runtime_evidence.verdict_snapshot().is_empty(),
 			"sampled non-star reads should not invent a runtime verdict"
 		);
 	}

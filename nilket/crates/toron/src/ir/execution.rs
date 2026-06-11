@@ -218,6 +218,7 @@ pub enum SystemTableKind {
 	InformationSchemaOptimizerDecisions,
 	InformationSchemaOptimizerRuntimeVerdicts,
 	InformationSchemaOptimizerMarginAdvisory,
+	InformationSchemaOptimizerEvidenceStatus,
 	OptimizerExplain,
 }
 

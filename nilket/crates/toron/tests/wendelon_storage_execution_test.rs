@@ -1,27 +1,29 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use toron::binder::{PlannerConfig, bind};
+use toron::binder::{DurableEvidenceBinding, OptimizerRuntimeEvidence, PlannerConfig, bind};
 use toron::catalog::{
-	Catalog, MockCatalog, TableBinding, TableRef, TableRowIdentity, WendelonCatalog,
-	WendelonDescriptorRegistry,
+	Catalog, DistinctCountFact, MockCatalog, TableBinding, TableOptimizerFacts, TableRef,
+	TableRowIdentity, WendelonCatalog, WendelonDescriptorRegistry,
 };
 use toron::coordinator::QueryCoordinator;
+use toron::distributed::budget::ByteCount;
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
+use toron::distributed::task::RowCount;
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	AggregateFunction, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, QueryId, ScalarValue,
-	SessionId, TableId,
+	AggregateFunction, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, QueryId,
+	QueryProfileHint, ScalarValue, SessionId, TableId,
 };
 use toron::storage::{
-	HlcBound, InMemoryStorageScan, TenantId as ToronTenantId, WendelonStorageScan,
-	WendelonStorageWrite,
+	HlcBound, InMemoryStorageScan, InMemoryTableStorage, StorageWrite, TenantId as ToronTenantId,
+	WendelonStorageScan, WendelonStorageWrite, WriteRequest,
 };
 use wendelon::client::{ClusterPeerWire, ClusterStatusWire, StaticTopologySource};
 use wendelon::consensus::WendelonRequest;
@@ -684,6 +686,336 @@ async fn wendelon_grouped_aggregate_matches_in_memory_baseline() {
 
 	fixture.node.handles.abort();
 	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn durable_runtime_verdict_counters_survive_coordinator_restart() {
+	let fixture = LiveWendelonFixture::start(122).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let coordinator = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		Arc::clone(&runtime_evidence),
+		1,
+	);
+
+	execute_star_query(&coordinator).await;
+	assert_eq!(
+		optimizer_runtime_verdict_count(&coordinator).await,
+		1,
+		"recording coordinator should see the flushed durable verdict"
+	);
+
+	drop(coordinator);
+	drop(runtime_evidence);
+	let restarted_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let restarted_coordinator =
+		durable_star_coordinator(catalog, storage, Arc::clone(&restarted_runtime_evidence), 0);
+
+	assert_eq!(
+		optimizer_runtime_verdict_count(&restarted_coordinator).await,
+		1,
+		"fresh coordinator/evidence handle should read the prior durable verdict"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn cross_coordinator_verdicts_are_shared() {
+	let fixture = LiveWendelonFixture::start(123).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let writer_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let writer = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		writer_runtime_evidence,
+		1,
+	);
+	let reader_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let reader =
+		durable_star_coordinator(catalog, storage, Arc::clone(&reader_runtime_evidence), 0);
+
+	execute_star_query(&writer).await;
+	reader_runtime_evidence.refresh_durable_cache().await;
+
+	assert_eq!(
+		optimizer_runtime_verdict_count(&reader).await,
+		1,
+		"second coordinator should see verdicts it did not record"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+const DURABLE_STAR_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
+	FROM orders o \
+	INNER JOIN customers c ON o.customer_id = c.id \
+	INNER JOIN products p ON o.product_id = p.id \
+	INNER JOIN stores s ON o.store_id = s.id";
+
+async fn durable_optimizer_runtime_evidence(
+	fixture: &LiveWendelonFixture,
+) -> Arc<OptimizerRuntimeEvidence> {
+	let evidence = OptimizerRuntimeEvidence::with_wendelon(DurableEvidenceBinding::new(
+		Arc::clone(&fixture.client),
+		LIVE_TENANT,
+		Duration::from_secs(1),
+	));
+	let report = evidence.refresh_durable_cache().await;
+	assert!(
+		!report.failed,
+		"initial durable evidence refresh should succeed"
+	);
+	evidence
+}
+
+fn durable_star_coordinator(
+	catalog: Arc<MockCatalog>,
+	storage: Arc<InMemoryTableStorage>,
+	runtime_evidence: Arc<OptimizerRuntimeEvidence>,
+	measured_accrual_sample_rate: u32,
+) -> QueryCoordinator {
+	QueryCoordinator::new(
+		catalog,
+		Executor::with_context(
+			storage,
+			ExecutionContext::new(
+				SessionId(1),
+				QueryId::from_u128(207),
+				ToronTenantId(1),
+				HlcBound(1),
+			),
+		),
+		PlannerConfig {
+			auto_broadcast_max_build_bytes: Some(ByteCount::new(64 * 1024 * 1024)),
+			measured_accrual_sample_rate,
+			runtime_evidence,
+			..PlannerConfig::default()
+		},
+	)
+}
+
+async fn execute_star_query(coordinator: &QueryCoordinator) -> RecordBatch {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan(DURABLE_STAR_SQL)
+		.expect("plan durable star query");
+	execute_single_coordinator_batch(coordinator, &plan).await
+}
+
+async fn optimizer_runtime_verdict_count(coordinator: &QueryCoordinator) -> i64 {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_runtime_verdicts")
+		.expect("plan optimizer runtime verdicts query");
+	let batch = execute_single_coordinator_batch(coordinator, &plan).await;
+	let kinds = string_column_values(&batch, 0);
+	let verdicts = string_column_values(&batch, 1);
+	let counts = int64_column_values(&batch, 2);
+	kinds
+		.iter()
+		.zip(verdicts.iter())
+		.zip(counts.iter())
+		.find_map(|((kind, verdict), count)| {
+			(kind == "flat_star" && verdict == "over_eager").then_some(*count)
+		})
+		.unwrap_or(0)
+}
+
+async fn execute_single_coordinator_batch(
+	coordinator: &QueryCoordinator,
+	plan: &LogicalPlan,
+) -> RecordBatch {
+	let batches = coordinator
+		.execute_query(plan, None)
+		.await
+		.expect("execute coordinator query");
+	concat_batches_for_assertion(&batches)
+}
+
+async fn durable_star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>) {
+	let mut catalog = MockCatalog::new();
+	let storage = Arc::new(InMemoryTableStorage::new());
+
+	let orders = durable_star_descriptor(
+		221,
+		"orders",
+		Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+			Field::new("product_id", DataType::Int64, false),
+			Field::new("store_id", DataType::Int64, false),
+		])),
+		"id",
+	);
+	let customers = durable_star_id_descriptor(222, "customers");
+	let products = durable_star_id_descriptor(223, "products");
+	let stores = durable_star_id_descriptor(224, "stores");
+
+	for (table_id, descriptor) in [
+		(TableId(221), &orders),
+		(TableId(222), &customers),
+		(TableId(223), &products),
+		(TableId(224), &stores),
+	] {
+		catalog
+			.register_descriptor(table_id, descriptor.clone())
+			.expect("register durable star descriptor");
+	}
+	seed_durable_star_facts(&mut catalog);
+
+	write_durable_star_table(
+		storage.as_ref(),
+		TableId(221),
+		&orders,
+		durable_star_record_batch(
+			orders.arrow_schema().expect("orders schema").into(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+				Arc::new(Int64Array::from(vec![10, 20, 10, 30])) as ArrayRef,
+				Arc::new(Int64Array::from(vec![100, 100, 200, 300])) as ArrayRef,
+				Arc::new(Int64Array::from(vec![1000, 2000, 1000, 3000])) as ArrayRef,
+			],
+		),
+	)
+	.await;
+	write_durable_star_table(
+		storage.as_ref(),
+		TableId(222),
+		&customers,
+		durable_star_id_batch(
+			customers.arrow_schema().expect("customers schema").into(),
+			&[10, 20, 30, 40],
+		),
+	)
+	.await;
+	write_durable_star_table(
+		storage.as_ref(),
+		TableId(223),
+		&products,
+		durable_star_id_batch(
+			products.arrow_schema().expect("products schema").into(),
+			&[100, 200, 300],
+		),
+	)
+	.await;
+	write_durable_star_table(
+		storage.as_ref(),
+		TableId(224),
+		&stores,
+		durable_star_id_batch(
+			stores.arrow_schema().expect("stores schema").into(),
+			&[1000, 2000, 3000],
+		),
+	)
+	.await;
+
+	(Arc::new(catalog), storage)
+}
+
+fn seed_durable_star_facts(catalog: &mut MockCatalog) {
+	for (table, rows, ndv) in [
+		("orders", 100_000, vec![(1, 100), (2, 100), (3, 100)]),
+		("customers", 5_000, vec![(0, 100)]),
+		("products", 1_000, vec![(0, 100)]),
+		("stores", 100, vec![(0, 100)]),
+	] {
+		catalog
+			.seed_optimizer_facts(
+				&TableRef::new(table),
+				TableOptimizerFacts {
+					row_upper_bound: Some(RowCount::new(rows)),
+					column_ndv: ndv
+						.into_iter()
+						.map(|(ordinal, distinct)| {
+							(ColumnOrdinal(ordinal), DistinctCountFact::Exact(distinct))
+						})
+						.collect::<BTreeMap<_, _>>(),
+					..TableOptimizerFacts::default()
+				},
+			)
+			.expect("seed durable optimizer facts");
+	}
+}
+
+async fn write_durable_star_table(
+	storage: &InMemoryTableStorage,
+	table_id: TableId,
+	descriptor: &TableSchemaDescriptor,
+	payload: RecordBatch,
+) {
+	storage
+		.write(WriteRequest {
+			session_id: SessionId(1),
+			query_id: QueryId::from_u128(207),
+			tenant_id: ToronTenantId(1),
+			table_id,
+			table_object_id: descriptor.table_object_id,
+			physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			payload,
+			profile_hint: Some(QueryProfileHint::Scan),
+			trace_context: None,
+		})
+		.await
+		.expect("write durable star table");
+}
+
+fn durable_star_id_descriptor(id: u8, name: &str) -> TableSchemaDescriptor {
+	durable_star_descriptor(
+		id,
+		name,
+		Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+		"id",
+	)
+}
+
+fn durable_star_descriptor(
+	id: u8,
+	name: &str,
+	schema: SchemaRef,
+	primary_key: &str,
+) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new(
+		TableObjectId::new([id; 16]),
+		1,
+		"default",
+		name,
+		schema.as_ref(),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(primary_key)),
+		LocalityPolicy::default_table_spread(),
+		SchemaEvolutionPolicyV1::AdditiveOnly,
+	)
+	.expect("durable star descriptor")
+}
+
+fn durable_star_id_batch(schema: SchemaRef, values: &[i64]) -> RecordBatch {
+	durable_star_record_batch(schema, vec![Arc::new(Int64Array::from(values.to_vec()))])
+}
+
+fn durable_star_record_batch(schema: SchemaRef, columns: Vec<ArrayRef>) -> RecordBatch {
+	RecordBatch::try_new(schema, columns).expect("durable star record batch")
+}
+
+fn string_column_values(batch: &RecordBatch, column: usize) -> Vec<String> {
+	let array = batch
+		.column(column)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("string array");
+	(0..array.len())
+		.map(|row| array.value(row).to_string())
+		.collect()
+}
+
+fn int64_column_values(batch: &RecordBatch, column: usize) -> Vec<i64> {
+	let array = batch
+		.column(column)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("int64 array");
+	(0..array.len()).map(|row| array.value(row)).collect()
 }
 
 async fn query_ids_gt(
