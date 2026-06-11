@@ -57,14 +57,14 @@ use crate::schema::{
 	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, ColumnGroupNdvFact,
 	ColumnGroupTopKEntry, ColumnGroupTopKFact, ColumnHeavyHitterEntry, ColumnHeavyHitterFact,
 	ColumnNdvFact, ColumnRangeDistributionFact, ColumnRangeFact, CompactionJobId,
-	CompactionLevelIndex, EncodingPageByteOffset, HllPrecision, HybridTimestamp,
-	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
-	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
-	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
-	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
-	SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader, SupersessionMetadata,
-	TableLifecycleCatalog, TableOptimizerFacts, TenantId, TenantKekId, TombstoneMetadata,
-	WriterNodeId, range_fact_tag_supported,
+	CompactionLevelIndex, CounterCommitFrame, CounterTentativeFrame, EncodingPageByteOffset,
+	HllPrecision, HybridTimestamp, INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity,
+	IdentityPrefix, IndexObjectId, IpcBufferIndex, IpcColumnOrdinal, Locality,
+	LogicalSchemaFingerprint, ManifestEpoch, NdvFact, RecordBodyByteLen, RecordBodyByteOffset,
+	RecordRowIndex, RowCount, RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor,
+	SecondaryIndexState, SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader,
+	SupersessionMetadata, TableLifecycleCatalog, TableOptimizerFacts, TenantId, TenantKekId,
+	TombstoneMetadata, WriterNodeId, range_fact_tag_supported,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnOrdinalSet, ColumnarFallbackReason,
@@ -1780,6 +1780,81 @@ impl SlabManager {
 			.get(&(tenant_id, key_identity))
 			.map(|entry| *entry.value())
 			.unwrap_or_else(|| Locality::from(key_identity))
+	}
+
+	// ============================================================
+	//  ADR 075 counter frames (counter-shaped, fenced)
+	//
+	//  These are deliberately NOT a general "append any record_class
+	//  without indexing" API — each method fixes its own counter
+	//  `record_class` internally and applies counter-specific index
+	//  semantics, so ordinary append/index/LWW behaviour is untouched
+	//  and no second generic append path exists.
+	// ============================================================
+
+	/// Append a tentative counter value to the active slab and index it live in
+	/// the authoritative `key_index`. The record class is fixed
+	/// `COUNTER_TENTATIVE`; recovery indexes it only if a matching commit marker
+	/// is found, so an un-committed tentative does not survive restart.
+	pub async fn counter_append_tentative(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		value: u64,
+	) -> std::io::Result<RecordLocation> {
+		let slab = self.target_for_append().await?;
+		let frame = CounterTentativeFrame { value };
+		let location = slab
+			.write_framed(
+				tenant_id,
+				key_identity,
+				hlc,
+				crate::schema::record_class::COUNTER_TENTATIVE,
+				bytemuck::bytes_of(&frame),
+			)
+			.await?;
+		self.index_appended_location(tenant_id, key_identity, location);
+		Ok(location)
+	}
+
+	/// Append a durable commit marker for `tentative_op_id` (the tentative's slab
+	/// offset) to the active slab and flush. The record class is fixed
+	/// `COUNTER_COMMIT`; the marker is NOT a version, so it is not indexed. The
+	/// tentative and its marker must be co-located in one slab — true within a
+	/// single add (no rotation between the two writes); cross-slab pairing under
+	/// rotation is a follow-on for the compaction path.
+	pub async fn counter_append_commit_marker(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		tentative_op_id: u64,
+	) -> std::io::Result<()> {
+		let slab = self.target_for_append().await?;
+		let marker = CounterCommitFrame { tentative_op_id };
+		slab.write_framed(
+			tenant_id,
+			key_identity,
+			hlc,
+			crate::schema::record_class::COUNTER_COMMIT,
+			bytemuck::bytes_of(&marker),
+		)
+		.await?;
+		slab.wait_durable_commit().await?;
+		Ok(())
+	}
+
+	/// Remove a tentative counter version from the live `key_index` (rollback).
+	/// No durable abort marker — recovery skips the orphan (it has no commit
+	/// marker). Counter-shaped wrapper over the in-memory version removal.
+	pub fn counter_unindex_tentative(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) {
+		self.rollback_indexed_location(tenant_id, key_identity, location);
 	}
 
 	/// Strict lookup for admission paths that must inherit an
@@ -18222,6 +18297,318 @@ mod tests {
 			.await
 			.unwrap(),
 		)
+	}
+
+	// ============================================================
+	//  ADR 075 cut-3a: SlabManager-backed counter store + recovery
+	//  (storage-only; COUNTER_ADD_REQ still dark)
+	// ============================================================
+
+	use crate::storage::counter::{CounterKey, SlabCounterStore, counter_identity};
+
+	fn ckey(b: &[u8]) -> CounterKey {
+		CounterKey(b.to_vec())
+	}
+
+	// Acceptance: a manager-backed tentative append indexes live but does NOT
+	// survive restart without a commit marker (recovery skips the orphan).
+	#[tokio::test]
+	async fn counter_tentative_without_marker_does_not_survive_restart() {
+		let dir = fresh_dir("adr075-counter-orphan");
+		let crypto = test_crypto();
+		let k = ckey(b"verdict");
+		{
+			let mgr =
+				open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone())
+					.await;
+			let store = SlabCounterStore::new(mgr.clone(), tenant());
+			store.tentative_append(&k, 5, hlc(1)).await.unwrap();
+			assert_eq!(
+				store.read_committed(&k).await.unwrap(),
+				Some(5),
+				"tentative is live-indexed in the manager"
+			);
+			mgr.fsync_all_local_slabs().await.unwrap();
+		}
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+		let store = SlabCounterStore::new(mgr, tenant());
+		assert_eq!(
+			store.read_committed(&k).await.unwrap(),
+			None,
+			"un-committed tentative was skipped by recovery"
+		);
+	}
+
+	// Acceptance (the headline #6): a manager-backed commit marker makes the
+	// tentative survive restart, and the production recovery path through
+	// SlabManager::open lands the committed counter in the manager's
+	// AUTHORITATIVE key_index (proven by a direct lookup).
+	#[tokio::test]
+	async fn counter_commit_marker_survives_restart_into_manager_index() {
+		let dir = fresh_dir("adr075-counter-commit");
+		let crypto = test_crypto();
+		let k = ckey(b"verdict");
+		{
+			let mgr =
+				open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone())
+					.await;
+			let store = SlabCounterStore::new(mgr.clone(), tenant());
+			let t = store.tentative_append(&k, 5, hlc(1)).await.unwrap();
+			store.commit_tentative(t).await.unwrap();
+			mgr.fsync_all_local_slabs().await.unwrap();
+		}
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+		// Direct proof: the committed counter is in the manager's key_index.
+		assert!(
+			mgr.lookup(tenant(), counter_identity(&k)).is_some(),
+			"committed counter landed in the manager's authoritative index after open"
+		);
+		let store = SlabCounterStore::new(mgr, tenant());
+		assert_eq!(store.read_committed(&k).await.unwrap(), Some(5));
+	}
+
+	// Acceptance: manager rollback removes the live tentative index entry only
+	// (no durable abort marker, no effect on prior committed state).
+	#[tokio::test]
+	async fn counter_manager_rollback_removes_live_tentative_only() {
+		let dir = fresh_dir("adr075-counter-rollback");
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), test_crypto()).await;
+		let store = SlabCounterStore::new(mgr, tenant());
+		let k = ckey(b"verdict");
+		let t = store.tentative_append(&k, 5, hlc(1)).await.unwrap();
+		assert_eq!(store.read_committed(&k).await.unwrap(), Some(5));
+		store.rollback_tentative(t);
+		assert_eq!(
+			store.read_committed(&k).await.unwrap(),
+			None,
+			"rollback removed the live tentative from the manager index"
+		);
+	}
+
+	// Acceptance: a marker-write failure rolls back the live tentative (caller
+	// decides) and recovery skips the orphan; a prior committed value survives.
+	#[tokio::test]
+	async fn counter_manager_marker_failure_rolls_back_and_recovery_skips_orphan() {
+		let dir = fresh_dir("adr075-counter-markerfail");
+		let crypto = test_crypto();
+		let k = ckey(b"verdict");
+		{
+			let mgr =
+				open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone())
+					.await;
+			let store = SlabCounterStore::new(mgr.clone(), tenant());
+			let t1 = store.tentative_append(&k, 3, hlc(1)).await.unwrap();
+			store.commit_tentative(t1).await.unwrap();
+			let t2 = store.tentative_append(&k, 50, hlc(2)).await.unwrap();
+			assert_eq!(store.read_committed(&k).await.unwrap(), Some(50));
+			store.arm_commit_marker_failure();
+			assert!(store.commit_tentative(t2).await.is_err());
+			store.rollback_tentative(t2); // terminal caller aborts
+			assert_eq!(store.read_committed(&k).await.unwrap(), Some(3));
+			mgr.fsync_all_local_slabs().await.unwrap();
+		}
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+		let store = SlabCounterStore::new(mgr, tenant());
+		assert_eq!(
+			store.read_committed(&k).await.unwrap(),
+			Some(3),
+			"the marker-failed orphan (50) did not resurrect; committed (3) survived"
+		);
+	}
+
+	// Acceptance: ordinary blob writes/recovery are unchanged when counters share
+	// the manager — the blob round-trips and the counter recovers, independently.
+	#[tokio::test]
+	async fn counter_and_blob_coexist_blob_recovery_unchanged() {
+		let dir = fresh_dir("adr075-counter-blob");
+		let crypto = test_crypto();
+		let blob_id = Identity::new([0xBB; 32]);
+		let blob_value = b"ordinary-blob-value".to_vec();
+		let k = ckey(b"verdict");
+		{
+			let mgr =
+				open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone())
+					.await;
+			mgr.append_durable(tenant(), blob_id, hlc(1), &blob_value)
+				.await
+				.unwrap();
+			let store = SlabCounterStore::new(mgr.clone(), tenant());
+			let t = store.tentative_append(&k, 7, hlc(2)).await.unwrap();
+			store.commit_tentative(t).await.unwrap();
+			mgr.fsync_all_local_slabs().await.unwrap();
+		}
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+		// Ordinary blob recovers and reads back byte-identical.
+		let loc = mgr
+			.lookup(tenant(), blob_id)
+			.expect("blob must be re-indexed");
+		assert_eq!(mgr.read(loc).await.unwrap(), blob_value);
+		// The counter recovers independently.
+		let store = SlabCounterStore::new(mgr, tenant());
+		assert_eq!(store.read_committed(&k).await.unwrap(), Some(7));
+	}
+
+	// ----- cut-3b: the identity-based server replica (CounterReplicaService) -----
+
+	use crate::storage::counter::CounterReplicaService;
+
+	// 3b acceptance: handler-level replicate creates a live tentative; restart
+	// skips it without a commit marker.
+	#[tokio::test]
+	async fn counter_replica_service_replicate_live_then_restart_skips_without_marker() {
+		let dir = fresh_dir("adr075-replica-svc-orphan");
+		let crypto = test_crypto();
+		let id = counter_identity(&ckey(b"verdict"));
+		{
+			let mgr =
+				open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone())
+					.await;
+			let svc = CounterReplicaService::new(mgr.clone());
+			svc.replicate_tentative(1, tenant(), id, 5, hlc(1))
+				.await
+				.unwrap();
+			assert_eq!(
+				svc.read_committed(tenant(), id).await.unwrap(),
+				Some(5),
+				"replicate created a live tentative"
+			);
+			mgr.fsync_all_local_slabs().await.unwrap();
+		}
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+		let svc = CounterReplicaService::new(mgr);
+		assert_eq!(
+			svc.read_committed(tenant(), id).await.unwrap(),
+			None,
+			"un-committed tentative skipped on restart"
+		);
+	}
+
+	// 3b acceptance: handler-level rollback removes only the matching tentative
+	// op and is idempotent.
+	#[tokio::test]
+	async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
+		let dir = fresh_dir("adr075-replica-svc-rollback");
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), test_crypto()).await;
+		let svc = CounterReplicaService::new(mgr);
+		let id = counter_identity(&ckey(b"verdict"));
+		svc.replicate_tentative(1, tenant(), id, 5, hlc(1))
+			.await
+			.unwrap();
+		svc.replicate_tentative(2, tenant(), id, 9, hlc(2))
+			.await
+			.unwrap();
+		assert_eq!(svc.pending_count(), 2);
+		svc.rollback(1);
+		assert_eq!(svc.pending_count(), 1, "only op 1 removed");
+		// op 2's tentative (value 9, higher HLC) remains the live latest.
+		assert_eq!(svc.read_committed(tenant(), id).await.unwrap(), Some(9));
+		// Idempotent: rolling back op 1 again is a harmless no-op.
+		svc.rollback(1);
+		assert_eq!(svc.pending_count(), 1);
+	}
+
+	// 3b: the COMMIT phase writes the marker so the replicated value survives
+	// restart (the positive twin).
+	#[tokio::test]
+	async fn counter_replica_service_commit_makes_value_survive_restart() {
+		let dir = fresh_dir("adr075-replica-svc-commit");
+		let crypto = test_crypto();
+		let id = counter_identity(&ckey(b"verdict"));
+		{
+			let mgr =
+				open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone())
+					.await;
+			let svc = CounterReplicaService::new(mgr.clone());
+			svc.replicate_tentative(7, tenant(), id, 42, hlc(1))
+				.await
+				.unwrap();
+			svc.commit(7).await.unwrap();
+			assert_eq!(svc.pending_count(), 0, "committed op left the pending set");
+			mgr.fsync_all_local_slabs().await.unwrap();
+		}
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
+		let svc = CounterReplicaService::new(mgr);
+		assert_eq!(svc.read_committed(tenant(), id).await.unwrap(), Some(42));
+	}
+
+	// ----- cut-3: the leader drives the production participant set
+	// (CounterParticipantKind) over the REAL CounterReplicaService -----
+
+	use crate::storage::counter::{
+		CounterAddOutcome, CounterAddResult, CounterLeader, CounterParticipantKind,
+		CounterWriteKey, DurableCounterWitnessStore, LocalCounterParticipant,
+	};
+
+	/// Canonical write-key fixture: the test's small id, LE-embedded in 24 bytes.
+	fn wkey(n: u64) -> CounterWriteKey {
+		let mut key = [0u8; 24];
+		key[..8].copy_from_slice(&n.to_le_bytes());
+		key
+	}
+
+	// cut-3 acceptance: a `CounterLeader` over the production `CounterParticipantKind`
+	// — whose sole wired arm is the leader's own `LocalCounterParticipant` over a REAL
+	// `CounterReplicaService` — applies an add, and the committed value is visible
+	// through the service's read path at the EXACT (tenant, counter_identity) the
+	// adapter is required to derive. The assertion reads the service INDEPENDENTLY of
+	// the adapter (the test derives the identity + names the tenant itself), so a
+	// broken `counter_identity(key)` derivation or a tenant mismatch in
+	// `LocalCounterParticipant` would land the value under different coordinates and
+	// this read would see `None`.
+	#[tokio::test]
+	async fn leader_over_real_replica_service_commits_value_visible_through_service() {
+		let dir = fresh_dir("adr075-leader-real-svc");
+		let wdir = fresh_dir("adr075-leader-real-svc-witness");
+		let mgr = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), test_crypto()).await;
+		let service = Arc::new(CounterReplicaService::new(mgr));
+
+		// The production participant set: the leader's own local arm over the real
+		// service, pinned to `tenant()`. Quorum 1 = the lone local arm.
+		let local = LocalCounterParticipant::new(service.clone(), tenant());
+		let leader = CounterLeader::new(
+			vec![CounterParticipantKind::Local(local)],
+			1,
+			true,
+			DurableCounterWitnessStore::open(&wdir).unwrap(),
+		);
+
+		let k = ckey(b"verdict");
+		let out = leader.fetch_add(wkey(1), &k, 7).await.unwrap();
+		assert_eq!(
+			out,
+			CounterAddResult::Applied(CounterAddOutcome {
+				previous: 0,
+				current: 7
+			})
+		);
+		// Independent of the adapter's own derivation: read the real service at the
+		// coordinates the adapter was REQUIRED to write to.
+		assert_eq!(
+			service
+				.read_committed(tenant(), counter_identity(&k))
+				.await
+				.unwrap(),
+			Some(7),
+			"the committed add is visible through the real service at the derived identity+tenant"
+		);
+
+		// A second add accumulates on the same key through the same path (proves the
+		// leader's committed base read also routes through the adapter's derivation).
+		let out2 = leader.fetch_add(wkey(2), &k, 4).await.unwrap();
+		assert_eq!(
+			out2,
+			CounterAddResult::Applied(CounterAddOutcome {
+				previous: 7,
+				current: 11
+			})
+		);
+		assert_eq!(
+			service
+				.read_committed(tenant(), counter_identity(&k))
+				.await
+				.unwrap(),
+			Some(11),
+		);
 	}
 
 	async fn force_seal_active(manager: &Arc<SlabManager>) -> SlabId {

@@ -3,6 +3,7 @@ pub mod cdc;
 pub mod columnar;
 pub mod content_hash;
 pub mod core;
+pub mod counter;
 pub mod encoding;
 pub mod file_ops;
 mod index;

@@ -14,9 +14,9 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 use wendelon::client::{
-	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, DATA_RETRY_BUDGET, ReadRequest,
-	TableDeleteRowsRequest, TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient,
-	WendelonClientConfig, WriteRequest,
+	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, CounterAddRequest,
+	CounterReadRequest, DATA_RETRY_BUDGET, ReadRequest, TableDeleteRowsRequest, TableQueryRequest,
+	TableWriteRequest, WendelonClient as InnerClient, WendelonClientConfig, WriteRequest,
 };
 use wendelon::network::control_server::{
 	CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire, TableSchemaDropResponseWire,
@@ -34,14 +34,15 @@ use wendelon::network::transport::{
 };
 use wendelon::network::wire;
 use wendelon::schema::{
-	ClientWriteId, FinalizationMarker, FrameHeader, HybridTimestamp, Identity, MsgType, NodeId,
-	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus,
-	TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED, TableDeleteRowsRequestMeta,
-	TableQueryCancelResponseMeta, TableQueryRequestId, TableQueryRequestMeta,
-	TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
+	ClientWriteId, CounterAddRequestMeta, CounterReadRequestMeta, FinalizationMarker, FrameHeader,
+	HybridTimestamp, Identity, MsgType, NodeId, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
+	ReadRequestMeta, ReadStatus, TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED,
+	TableDeleteRowsRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
+	TableQueryRequestMeta, TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
 	encode_table_schema_descriptor_v1, encode_table_write_row_count, read_key_schema,
 	write_payload_schema,
 };
+use wendelon::storage::counter::{CounterKey, counter_identity};
 
 pub use wendelon::client::{
 	CdcFrame, CdcSubscription, QueryLocalityRange, RowIdentityProjection, StreamingQueryResult,
@@ -222,6 +223,17 @@ pub struct WriteReceipt {
 	pub epoch: u64,
 	pub commit_hlc: HybridTimestamp,
 	pub finalization: Option<FinalizationMarker>,
+}
+
+/// Outcome of an idempotent atomic `counter_fetch_add` (ADR 075). `duplicate`
+/// marks a replayed `write_id` (the values are the original add's, not re-applied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CounterAddReceipt {
+	pub identity: Identity,
+	pub previous_value: u64,
+	pub current_value: u64,
+	pub duplicate: bool,
+	pub requested_durability: DurabilityClass,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -863,6 +875,99 @@ impl Client {
 			}
 			s if s == WriteStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
 			status => Err(ClientError::WriteFailed { status }),
+		}
+	}
+
+	/// The domain-separated counter identity for `key` (ADR 075 D7) — distinct from
+	/// the blob [`identity_for_key`](Self::identity_for_key) so a counter and a blob
+	/// under the same caller bytes can never collide.
+	pub fn counter_identity_for_key(key: &[u8]) -> Identity {
+		counter_identity(&CounterKey(key.to_vec()))
+	}
+
+	/// Idempotent atomic fetch-add on a durable counter key (ADR 075). Bases an
+	/// absent counter at `0` and creates it; a retried `write_id` replays the
+	/// original `previous`/`current` without re-applying. `delta == 0` and overflow
+	/// fail closed.
+	pub async fn counter_fetch_add(
+		&self,
+		tenant_id: TenantId,
+		key: &[u8],
+		delta: u64,
+		options: WriteOptions,
+	) -> Result<CounterAddReceipt, ClientError> {
+		let identity = Self::counter_identity_for_key(key);
+		let request = CounterAddRequest {
+			meta: CounterAddRequestMeta {
+				write_id: ClientWriteId {
+					client_uuid: self.client_uuid,
+					sequence_no: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+					idempotency_ttl_ms: 60_000,
+					_pad: 0,
+				},
+				client_hlc: options.client_hlc.unwrap_or_else(default_client_hlc),
+				expected_epoch: self.inner.epoch(),
+				tenant_id,
+				proxy_hop: 0,
+				durability: options.durability,
+				await_finalization: u8::from(options.await_finalization),
+				_pad1: [0; 5],
+				proxy_source: zero_node(),
+				key_identity: identity,
+				key_len: key.len() as u32,
+				_pad2: [0; 4],
+				delta,
+			},
+			payload: key_batch(key)?,
+		};
+		let result = self.inner.counter_add(request).await?;
+		match result.response.status {
+			s if s == WriteStatus::OK || s == WriteStatus::DUPLICATE => Ok(CounterAddReceipt {
+				identity,
+				previous_value: result.response.previous_value,
+				current_value: result.response.current_value,
+				duplicate: result.response.status == WriteStatus::DUPLICATE,
+				requested_durability: options.durability,
+			}),
+			s if s == WriteStatus::QUOTA_EXCEEDED => Err(ClientError::QuotaExceeded { tenant_id }),
+			s if s == WriteStatus::TENANT_SUSPENDED => {
+				Err(ClientError::TenantSuspended { tenant_id })
+			}
+			s if s == WriteStatus::TENANT_UNAVAILABLE => {
+				Err(ClientError::TenantUnavailable { tenant_id })
+			}
+			s if s == WriteStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
+			// Counter rejects (COUNTER_ZERO_DELTA / COUNTER_OVERFLOW, D5) surface via
+			// the carried status; no Toron-visible enum growth (D9 producer-only).
+			status => Err(ClientError::WriteFailed { status }),
+		}
+	}
+
+	/// Point-read a counter (ADR 075 D6/D8). An absent counter returns `None` — the
+	/// API tells the truth about existence and never fabricates `0` (consumers that
+	/// want a default map `None -> 0` themselves).
+	pub async fn counter_read(
+		&self,
+		tenant_id: TenantId,
+		key: &[u8],
+	) -> Result<Option<u64>, ClientError> {
+		let identity = Self::counter_identity_for_key(key);
+		let request = CounterReadRequest {
+			meta: CounterReadRequestMeta {
+				expected_epoch: self.inner.epoch(),
+				tenant_id,
+				key_identity: identity,
+			},
+		};
+		let result = self.inner.counter_read(request).await?;
+		match result.response.status {
+			s if s == ReadStatus::OK => Ok(Some(result.response.value)),
+			s if s == ReadStatus::KEY_NOT_FOUND => Ok(None),
+			s if s == ReadStatus::TENANT_UNAVAILABLE => {
+				Err(ClientError::TenantUnavailable { tenant_id })
+			}
+			s if s == ReadStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
+			status => Err(ClientError::ReadFailed { status }),
 		}
 	}
 

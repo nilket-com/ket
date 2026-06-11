@@ -54,8 +54,8 @@
 
 use crate::metrics::global as metrics;
 use crate::schema::{
-	HybridTimestamp, Identity, Locality, RecordRowIndex, STORAGE_ROW_HLC_COLUMN,
-	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	CounterCommitFrame, CounterTentativeFrame, HybridTimestamp, Identity, Locality, RecordRowIndex,
+	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, SlabRecordHeader,
 	TenantId,
 };
@@ -427,19 +427,23 @@ impl LocalSlabStore {
 			.or_insert_with(|| vec![location]);
 	}
 
-	#[cfg(test)]
-	pub(crate) fn fdatasync_call_count(&self) -> u64 {
-		self.fdatasync_calls.load(Ordering::Relaxed)
-	}
-}
-
-#[async_trait]
-impl StorageEngine for LocalSlabStore {
-	async fn append(
+	/// Write a framed record of `record_class` at a freshly reserved,
+	/// page-aligned offset and return its on-disk location **without** touching
+	/// the in-memory index.
+	///
+	/// Ordinary [`append`](StorageEngine::append) layers an immediate
+	/// [`index_location`](Self::index_location) on top of this with
+	/// `record_class == STANDARD`, so blob/Arrow records are written and
+	/// indexed exactly as before. ADR 075 counter tentatives instead stay
+	/// unindexed until their commit marker lands — so an uncommitted add is
+	/// invisible to reads with no finalization-aware read path, and recovery
+	/// applies the same committed-only rule.
+	pub(crate) async fn write_framed(
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
 		hlc: HybridTimestamp,
+		record_class: u32,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
 		let header_size = std::mem::size_of::<SlabRecordHeader>();
@@ -453,20 +457,16 @@ impl StorageEngine for LocalSlabStore {
 			.next_offset
 			.fetch_add(padded_size as u64, Ordering::AcqRel);
 
-		// Build the payload. `AlignedBuf::new` zero-initialises, so
-		// the trailing pad is already correct.
+		// Build the payload: header (checksum=0) || frame, then patch the
+		// checksum over (header-with-zero-checksum || frame). `record_class`
+		// occupies the slot that was `_pad_align` zero-fill, so a STANDARD
+		// record is byte-for-byte identical to a pre-ADR-075 record.
 		let mut buf = AlignedBuf::new(padded_size);
 		{
 			let dst = buf.as_mut_slice();
-			// Write header first with checksum=0, then write the
-			// frame bytes, then compute the checksum over
-			// (header-with-zero-checksum || frame) and patch it
-			// back into the header region. This keeps the
-			// "checksum excludes itself" convention honest without
-			// a second buffer.
 			let mut header = SlabRecordHeader {
 				magic: SLAB_RECORD_MAGIC,
-				_pad_align: 0,
+				record_class,
 				tenant_id,
 				key_identity,
 				hlc,
@@ -489,22 +489,45 @@ impl StorageEngine for LocalSlabStore {
 			));
 		}
 
-		let location = RecordLocation {
+		Ok(RecordLocation {
 			slab_id: self.slab_id,
 			offset,
 			length: payload_size as u32,
 			hlc,
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
-		};
-		// DashMap's `entry` API gives us an atomic read-modify-write
-		// on the per-key version chain, so concurrent appends on
-		// different HLCs for the same key cannot interleave their
-		// insertions.
-		self.index
-			.entry((tenant_id, key_identity))
-			.and_modify(|versions| insert_version_sorted(versions, location))
-			.or_insert_with(|| vec![location]);
+		})
+	}
+
+	#[cfg(test)]
+	pub(crate) fn fdatasync_call_count(&self) -> u64 {
+		self.fdatasync_calls.load(Ordering::Relaxed)
+	}
+}
+
+#[async_trait]
+impl StorageEngine for LocalSlabStore {
+	async fn append(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+		frame: &[u8],
+	) -> std::io::Result<RecordLocation> {
+		// Ordinary blob/Arrow record: write a STANDARD frame, then index it
+		// immediately. `index_location` is the same atomic per-key
+		// read-modify-write on the version chain as before, so concurrent
+		// appends on different HLCs for the same key cannot interleave.
+		let location = self
+			.write_framed(
+				tenant_id,
+				key_identity,
+				hlc,
+				crate::schema::record_class::STANDARD,
+				frame,
+			)
+			.await?;
+		self.index_location(tenant_id, key_identity, location);
 		Ok(location)
 	}
 
@@ -681,6 +704,15 @@ fn recover_slab(
 	let index: DashMap<TenantKey, Vec<RecordLocation>> = DashMap::new();
 	let recovered_localities: DashMap<TenantKey, Locality> = DashMap::new();
 	let mut recovered_versions = HashMap::new();
+	// ADR 075 counter recovery accumulators. Counter frames are NOT indexed
+	// inline: a tentative value becomes visible only if a commit marker for
+	// its op-id (its durable offset) is also present in the slab. We collect
+	// both during the scan, then index committed tentatives after it — so an
+	// orphan tentative (rolled back, or crashed before its marker) is never
+	// resurrected. This is the in-process twin of the pure `recover_counter_index`
+	// rule the storage `counter` module proves.
+	let mut counter_tentatives: Vec<(TenantId, Identity, RecordLocation)> = Vec::new();
+	let mut committed_counter_ops: HashMap<(TenantId, Identity, u64), ()> = HashMap::new();
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	// One page is enough for the header probe — every record
 	// starts on a page boundary and the header occupies only the
@@ -739,18 +771,65 @@ fn recover_slab(
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
 		};
-		for entry in recover_entries_for_record(&header, base_location, &frame_bytes)? {
-			observe_recovered_row_version(&mut recovered_versions, &entry);
-			index
-				.entry((entry.tenant_id, entry.key_identity))
-				.and_modify(|versions| insert_version_sorted(versions, entry.location))
-				.or_insert_with(|| vec![entry.location]);
-			recovered_localities.insert(
-				(entry.tenant_id, entry.key_identity),
-				entry.routing_locality,
-			);
+		match header.record_class {
+			crate::schema::record_class::STANDARD => {
+				for entry in recover_entries_for_record(&header, base_location, &frame_bytes)? {
+					observe_recovered_row_version(&mut recovered_versions, &entry);
+					index
+						.entry((entry.tenant_id, entry.key_identity))
+						.and_modify(|versions| insert_version_sorted(versions, entry.location))
+						.or_insert_with(|| vec![entry.location]);
+					recovered_localities.insert(
+						(entry.tenant_id, entry.key_identity),
+						entry.routing_locality,
+					);
+				}
+			}
+			crate::schema::record_class::COUNTER_TENTATIVE => {
+				// op-id is the record's own offset. The value lives in the
+				// frame and is read on demand; here we only need length
+				// validation and the location to (maybe) index below.
+				if frame_bytes.len() < std::mem::size_of::<CounterTentativeFrame>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"counter tentative frame shorter than its fixed value",
+					));
+				}
+				counter_tentatives.push((header.tenant_id, header.key_identity, base_location));
+			}
+			crate::schema::record_class::COUNTER_COMMIT => {
+				if frame_bytes.len() < std::mem::size_of::<CounterCommitFrame>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"counter commit marker shorter than its fixed op-id",
+					));
+				}
+				let op_id = u64::from_le_bytes(frame_bytes[..8].try_into().map_err(|_| {
+					Error::new(ErrorKind::InvalidData, "counter commit marker op-id slice")
+				})?);
+				committed_counter_ops.insert((header.tenant_id, header.key_identity, op_id), ());
+			}
+			other => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!("slab record carries unknown record_class {other}"),
+				));
+			}
 		}
 		cursor += padded;
+	}
+
+	// ADR 075 recovery rule: index a counter tentative only if a commit marker
+	// for its op-id (offset) was also recovered. Orphans are skipped — never
+	// resurrected. Later committed values supersede earlier ones by HLC.
+	for (tenant_id, key_identity, location) in counter_tentatives {
+		if committed_counter_ops.contains_key(&(tenant_id, key_identity, location.offset)) {
+			index
+				.entry((tenant_id, key_identity))
+				.and_modify(|versions| insert_version_sorted(versions, location))
+				.or_insert_with(|| vec![location]);
+			recovered_localities.insert((tenant_id, key_identity), Locality::from(key_identity));
+		}
 	}
 
 	validate_recovered_row_tombstone_chains(&recovered_versions)?;
@@ -796,6 +875,17 @@ pub(crate) fn recover_slab_entries_from_blob(
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
 		};
+		// ADR 075: the blob-tier recovery path does not (yet) apply the
+		// counter tentative/commit rule — counters are not tiered in this cut.
+		// Fail closed rather than mis-index a counter frame as a blob (which
+		// would resurrect an orphan tentative). Tiering of counter slabs is a
+		// later integration that must port the committed-only rule here.
+		if header.record_class != crate::schema::record_class::STANDARD {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"counter record encountered on the blob-tier recovery path (unsupported in this cut)",
+			));
+		}
 		for entry in recover_entries_for_record(&header, base_location, frame)? {
 			observe_recovered_row_version(&mut recovered_versions, &entry);
 			entries.push(entry);

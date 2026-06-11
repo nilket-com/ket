@@ -7699,3 +7699,249 @@ fn adr074_prior_wendelon_telemetry_and_table_query_guards_continue_to_pass() {
 		);
 	}
 }
+
+// ============================================================
+//  ADR 075 — Idempotent Atomic Counter Fetch-Add (10 guards)
+// ============================================================
+
+fn adr075_counter_handler_region(server: &str) -> &str {
+	source_region(
+		server,
+		"async fn handle_counter_add",
+		"async fn handle_table_replicate",
+	)
+}
+
+#[test]
+fn adr075_counter_add_is_first_class_operation_not_blob_write() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	// Its own wire op + fixed metas, distinct from the blob write surface.
+	assert!(schema.contains("pub const COUNTER_ADD_REQ: Self = Self(0x4C);"));
+	assert!(schema.contains("pub const COUNTER_ADD_RESP: Self = Self(0x4D);"));
+	assert!(schema.contains("pub struct CounterAddRequestMeta"));
+	assert!(schema.contains("pub struct CounterAddResponseMeta"));
+	// A counter add carries an additive delta, never an Arrow value section.
+	assert!(schema.contains("pub delta: u64"));
+	// Dispatched as its own match arm + handler, not folded into WRITE_REQ.
+	assert!(server.contains("MsgType::COUNTER_ADD_REQ => {"));
+	assert!(server.contains("async fn handle_counter_add"));
+}
+
+#[test]
+fn adr075_counter_add_has_per_key_read_modify_write_serialization() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	// The leader holds a per-key mutation lock...
+	assert!(counter.contains("locks: DashMap<CounterKey, Arc<Mutex<()>>>"));
+	// ...acquired across the WHOLE read -> checked_add -> append unit (D2).
+	let fetch_add = source_region(
+		&counter,
+		"pub async fn fetch_add(",
+		"self.idempotency.insert(write_key, outcome);",
+	);
+	assert!(fetch_add.contains("self.locks.entry(key.clone()).or_default().clone()"));
+	assert!(fetch_add.contains("let _guard = lock.lock().await;"));
+	// The base read and the overflow-checked add both happen under the guard.
+	assert!(fetch_add.contains("read_committed(key)"));
+	assert!(fetch_add.contains("checked_add(delta)"));
+}
+
+#[test]
+fn adr075_counter_add_reuses_client_write_id_idempotency() {
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	// D4 public idempotency is keyed by the canonical ClientWriteId bytes (the
+	// same derivation as the blob-write cache) and lives in the MUTATION layer:
+	// the handler passes the canonical key into the leader, whose dedup record
+	// is durable with the witness/applied log (replay survives restart).
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("meta.write_id.canonical_idempotency_bytes()"));
+	assert!(handler.contains("leader.fetch_add(write_key, &key, meta.delta)"));
+	assert!(counter.contains("idempotency: DashMap<CounterWriteKey, CounterAddOutcome>"));
+	// Never a hashed/narrowed handle — collisions would break exactly-once.
+	assert!(counter.contains("pub type CounterWriteKey = [u8; 24];"));
+	// The durable witness carries the dedup identity, and a resolved witness is
+	// compacted into the applied log BEFORE pruning (no dedup window).
+	assert!(counter.contains("write_key: CounterWriteKey,"));
+	assert!(counter.contains("fn append_applied"));
+	assert!(counter.contains("fn load_applied"));
+}
+
+#[test]
+fn adr075_duplicate_counter_add_replays_without_mutating() {
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	// The duplicate replay short-circuits inside the leader BEFORE any mutation
+	// (both the unlocked fast path and the under-lock recheck return `Replayed`),
+	// so a retry never re-applies the delta (D4)...
+	let fetch_add = source_region(
+		&counter,
+		"pub async fn fetch_add(",
+		"self.idempotency.insert(write_key, outcome);",
+	);
+	let replay = fetch_add
+		.find("CounterAddResult::Replayed")
+		.expect("the leader must replay duplicates");
+	let mutate = fetch_add
+		.find("replicate_tentative")
+		.expect("the leader must fan out the tentative");
+	assert!(
+		replay < mutate,
+		"duplicate replay must short-circuit before the tentative fan-out"
+	);
+	// ...and the server answers a replay as DUPLICATE (never a second OK).
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("result.is_replay()"));
+	assert!(handler.contains("WriteStatus::DUPLICATE"));
+}
+
+#[test]
+fn adr075_counter_add_goes_through_finalization_not_metric_side_channel() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	assert!(counter.contains("struct CounterFinalizationWitness"));
+	let fetch_add = source_region(
+		&counter,
+		"pub async fn fetch_add(",
+		"self.idempotency.insert(write_key, outcome);",
+	);
+	// The durable finalization witness is persisted before the commit fan-out...
+	assert!(fetch_add.contains("self.witness_store.write(&witness)"));
+	// ...and the add is NOT a metrics counter / in-memory side channel (D3).
+	assert!(!fetch_add.contains("metrics()"));
+}
+
+#[test]
+fn adr075_counter_blob_type_safety_is_structural() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	// Counter identity is domain-separated (blake3_keyed in a reserved domain),
+	// not the blob tenant-scoped identity — the collision is unrepresentable.
+	assert!(counter.contains("b\"wendelon::adr075::counter-domain\""));
+	assert!(counter.contains("Identity::blake3_keyed(COUNTER_DOMAIN, &key.0)"));
+	// The server re-derives and verifies it; it never trusts the wire identity.
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("counter_identity(&key) != meta.key_identity"));
+}
+
+#[test]
+fn adr075_no_prefix_scan_registry_or_node_keys() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	for forbidden in [
+		"scan_prefix",
+		"prefix_scan",
+		"list_counters",
+		"counter_registry",
+	] {
+		assert!(
+			!counter.contains(forbidden),
+			"counter substrate must stay point-addressed (no `{forbidden}`)"
+		);
+	}
+}
+
+#[test]
+fn adr075_existing_blob_point_write_stays_last_writer_wins() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	// The blob write meta is untouched by counters (no delta/counter contamination).
+	let write_meta = source_region(
+		&schema,
+		"pub struct WriteRequestMeta {",
+		"WRITE RESPONSE METADATA",
+	);
+	for forbidden in ["delta", "counter", "previous_value"] {
+		assert!(
+			!write_meta.contains(forbidden),
+			"WriteRequestMeta must stay a plain LWW blob write (no `{forbidden}`)"
+		);
+	}
+	// The blob write path still routes through its own handler, separate from counters.
+	assert!(server.contains("MsgType::WRITE_REQ => {"));
+	assert!(server.contains("self.handle_write(&context.actor, frame)"));
+}
+
+#[test]
+fn adr075_counter_surface_is_brand_clean_no_v1_suffix() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let combined = format!("{schema}\n{server}");
+	let identifiers = rust_identifiers_from_source("adr075 counter surface", &combined);
+	for required in ["CounterAddRequestMeta", "CounterAddResponseMeta"] {
+		assert!(
+			has_rust_identifier(&identifiers, required),
+			"missing counter-add type {required}"
+		);
+	}
+	for forbidden in [
+		"CounterAddRequestMetaV1",
+		"CounterAddResponseMetaV1",
+		"CounterAddRequestV1",
+		"WendelonCounterAddRequest",
+		"WendelonCounterAddResponse",
+	] {
+		assert!(
+			!has_rust_identifier(&identifiers, forbidden),
+			"counter-add surface must stay brand-clean and no-V1; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+fn adr075_no_toron_production_change() {
+	// Producer-only (D9): no Toron production source consumes the counter-add
+	// surface yet (Toron ADR 207 stays stashed until this contract is fixed).
+	let toron_src = workspace_root().join("crates/toron/src");
+	let mut offenders = Vec::new();
+	walk_dir(&toron_src, &mut |path| {
+		if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+			let body = fs::read_to_string(path).unwrap_or_default();
+			if body.contains("counter_fetch_add") || body.contains("COUNTER_ADD_REQ") {
+				offenders.push(path.display().to_string());
+			}
+		}
+	});
+	assert!(
+		offenders.is_empty(),
+		"ADR 075 is producer-only; Toron production must not consume the counter-add surface: {offenders:?}"
+	);
+}
+
+#[test]
+fn adr075_counter_add_fails_closed_under_replication() {
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	// The fail-closed status exists (cut-4's leader is single-node only; multi-node
+	// replication — ring-driven participants + peer-identity witness — is cut-8b).
+	assert!(schema.contains("pub const COUNTER_REPLICATION_UNSUPPORTED: Self = Self(17);"));
+	// handle_counter_add rejects rf > 1 BEFORE any mutation, so a counter add never
+	// lands primary-only-durable under replication (D3 fail-closed).
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("self.router.replication_factor() > 1"));
+	assert!(handler.contains("WriteStatus::COUNTER_REPLICATION_UNSUPPORTED"));
+	let rf_check = handler
+		.find("replication_factor() > 1")
+		.expect("counter add must gate on replication factor");
+	let mutate = handler
+		.find("self.counter_leader_for(meta.tenant_id)")
+		.expect("counter add must drive the leader");
+	assert!(
+		rf_check < mutate,
+		"the rf > 1 reject must fail closed before the leader mutation"
+	);
+}
+
+#[test]
+fn adr075_prior_wendelon_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr074_prior_wendelon_telemetry_and_table_query_guards_continue_to_pass",
+		"fn adr073_prior_wendelon_protocol_and_architecture_guards_continue_to_pass",
+		"fn adr072_prior_adr_guards_continue_to_pass",
+		"fn adr071_wendelon_inspect_branch_exists",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior Wendelon guard {required}"
+		);
+	}
+}

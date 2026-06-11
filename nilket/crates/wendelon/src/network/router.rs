@@ -167,7 +167,11 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::TABLE_DELETE_REQ.0
 				|| x == MsgType::TABLE_DELETE_RESP.0
 				|| x == MsgType::AGG_REQ.0
-				|| x == MsgType::AGG_RESP.0 =>
+				|| x == MsgType::AGG_RESP.0
+				|| x == MsgType::COUNTER_ADD_REQ.0
+				|| x == MsgType::COUNTER_ADD_RESP.0
+				|| x == MsgType::COUNTER_READ_REQ.0
+				|| x == MsgType::COUNTER_READ_RESP.0 =>
 			{
 				match &self.data {
 					Some(h) => h.handle_data_frame(context, frame).await,

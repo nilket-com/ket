@@ -82,10 +82,12 @@ use crate::schema::{
 	COLUMN_PROJECTION_RANGE_ARC_BUDGET, CdcCheckpointMeta, CdcCursor, CdcDigestDomain,
 	CdcFrameMeta, CdcFrameSource, CdcRejectCode, CdcRejectMeta, CdcSubscribeBound,
 	CdcSubscribeRequestMeta, CdcSubscriptionId, ColumnProjectionRangePruning, Consistency,
-	DurabilityLevel, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp,
-	Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicy, LocalityRange,
-	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType,
-	MultiRowLayoutDescriptor, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
+	CounterAddRequestMeta, CounterAddResponseMeta, CounterReadRequestMeta, CounterReadResponseMeta,
+	CounterReplicaAck, CounterReplicaPhase, CounterReplicaStatus, CounterReplicateRequestMeta,
+	CounterRollbackRequestMeta, DurabilityLevel, FRAME_FLAG_STREAM_END, FinalizationMarker,
+	FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicy,
+	LocalityRange, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
+	MsgType, MultiRowLayoutDescriptor, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
 	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
 	ReadRequestMeta, ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 	RecordRowIndex, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
@@ -276,6 +278,68 @@ impl CachedWriteOutcome {
 
 	fn outcome(self) -> WriteOutcome {
 		self.outcome
+	}
+}
+
+/// ADR 075 cut-8: the network side of [`CounterReplicaTransport`] — drives the
+/// counter replicate/rollback wire to a peer for a leader's remote participant.
+/// Holds only the transport factory + buffer pool (the send functions are static).
+#[allow(dead_code)] // constructed by the production remote-participant wiring (cut-8b, Fork-2)
+struct CounterReplicaNetworkTransport {
+	factory: Arc<TransportProviderFactory>,
+	pool: Arc<BufPool>,
+}
+
+impl crate::storage::counter::CounterReplicaTransport for CounterReplicaNetworkTransport {
+	fn replicate(
+		&self,
+		peer: NodeId,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		op_id: u64,
+		value: u64,
+		commit_hlc: HybridTimestamp,
+		epoch: u64,
+		phase: CounterReplicaPhase,
+	) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ()>> + Send + '_>> {
+		let factory = self.factory.clone();
+		let pool = self.pool.clone();
+		Box::pin(async move {
+			let meta = CounterReplicateRequestMeta {
+				commit_hlc,
+				op_id,
+				value,
+				epoch,
+				tenant_id,
+				key_identity,
+				phase,
+				_pad: [0; 7],
+			};
+			match WendelonDataServer::replicate_counter_to_remote(factory, pool, peer, meta).await {
+				Ok(ack) if ack.status == CounterReplicaStatus::OK => Ok(()),
+				_ => Err(()),
+			}
+		})
+	}
+	fn rollback(
+		&self,
+		peer: NodeId,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		op_id: u64,
+		epoch: u64,
+	) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+		let factory = self.factory.clone();
+		let pool = self.pool.clone();
+		Box::pin(async move {
+			let meta = CounterRollbackRequestMeta {
+				key_identity,
+				op_id,
+				epoch,
+				tenant_id,
+			};
+			let _ = WendelonDataServer::rollback_counter_to_remote(factory, pool, peer, meta).await;
+		})
 	}
 }
 
@@ -829,6 +893,35 @@ pub struct WendelonDataServer {
 	/// quorum but still need their control-branch finalization
 	/// committed through Raft.
 	pending_finalizations: Arc<PendingFinalizationStore>,
+	/// ADR 075 server-side counter replica. Identity-based, over the same
+	/// `SlabManager`; drives counter tentative/commit/rollback for incoming
+	/// `COUNTER_REPLICATE_REQ` / `COUNTER_ROLLBACK_REQ`. It intentionally never
+	/// touches `pending_finalizations` (a counter tentative carries no witness).
+	counter_replica: Arc<crate::storage::counter::CounterReplicaService>,
+	/// ADR 075 cut-4: per-tenant counter leaders over the production participant
+	/// set. Each leader's sole wired arm today is the node's own
+	/// `LocalCounterParticipant` over `counter_replica` (single-node, quorum 1); the
+	/// remote arm + quorum > 1 land when cut-3b's transport surfaces a
+	/// `CounterParticipant`. Built lazily per tenant (the leader holds per-key locks,
+	/// D4 op state, and the durable finalization witness).
+	counter_leaders: Arc<
+		DashMap<
+			TenantId,
+			Arc<
+				crate::storage::counter::CounterLeader<
+					crate::storage::counter::CounterParticipantKind,
+				>,
+			>,
+		>,
+	>,
+	/// ADR 075: per-tenant counter-leader init gate. Lazy leader construction is
+	/// RECOVERY (file I/O: applied-log + witness load, then reconcile), so
+	/// concurrent first requests for a tenant must build exactly one leader —
+	/// and never hold a `counter_leaders` entry lock across an await. D4 public
+	/// idempotency itself lives in the leader (keyed by the canonical
+	/// `ClientWriteId` bytes, durable with the witness/applied log), NOT in a
+	/// server-side cache that dies with the process.
+	counter_leader_init: Arc<DashMap<TenantId, Arc<tokio::sync::Mutex<()>>>>,
 	/// In-memory claim set that ensures only one task at a time can
 	/// drive a given persisted pending finalization through Raft.
 	pending_finalization_claims: PendingFinalizationClaims,
@@ -1227,6 +1320,9 @@ impl Clone for WendelonDataServer {
 			table_delete_idempotency: self.table_delete_idempotency.clone(),
 			content_hash_admission_locks: self.content_hash_admission_locks.clone(),
 			pending_finalizations: self.pending_finalizations.clone(),
+			counter_replica: self.counter_replica.clone(),
+			counter_leaders: self.counter_leaders.clone(),
+			counter_leader_init: self.counter_leader_init.clone(),
 			pending_finalization_claims: self.pending_finalization_claims.clone(),
 			pending_finalization_wakeup: self.pending_finalization_wakeup.clone(),
 			orphan_witness_recovery_stamp: self.orphan_witness_recovery_stamp.clone(),
@@ -1969,6 +2065,9 @@ impl WendelonDataServer {
 		let pending_finalizations =
 			PendingFinalizationStore::open(pending_finalizations_path(slab.data_dir()))?;
 		let admission_snapshot_rx = state_machine.subscribe_admission_snapshot();
+		let counter_replica = Arc::new(crate::storage::counter::CounterReplicaService::new(
+			slab.clone(),
+		));
 		let local_persistence_distrust_path = local_persistence_distrust_path(slab.data_dir());
 		let local_persistence_distrust_reason = if local_persistence_distrust_path.exists() {
 			Some(LOCAL_PERSISTENCE_DISTRUST_REASON.to_string())
@@ -1992,6 +2091,9 @@ impl WendelonDataServer {
 			table_delete_idempotency: Arc::new(DashMap::new()),
 			content_hash_admission_locks: Arc::new(DashMap::new()),
 			pending_finalizations,
+			counter_replica,
+			counter_leaders: Arc::new(DashMap::new()),
+			counter_leader_init: Arc::new(DashMap::new()),
 			pending_finalization_claims: PendingFinalizationClaims::default(),
 			pending_finalization_wakeup: Arc::new(Notify::new()),
 			orphan_witness_recovery_stamp: Arc::new(RwLock::new(None)),
@@ -3750,6 +3852,100 @@ impl WendelonDataServer {
 			));
 		}
 		Ok(ack.ack_level)
+	}
+
+	/// ADR 075: ship a `COUNTER_REPLICATE_REQ` (tentative or commit phase) to one
+	/// peer and return its `CounterReplicaAck`. Constructs ONLY counter frames and
+	/// validates ONLY the counter response meta — it never rides ordinary
+	/// `REPLICATE_REQ`. The caller treats the peer as accepted iff
+	/// `ack.status == CounterReplicaStatus::OK`.
+	#[allow(dead_code)] // reachable via CounterReplicaNetworkTransport (constructed in cut-8b)
+	async fn replicate_counter_to_remote(
+		factory: Arc<TransportProviderFactory>,
+		pool: Arc<BufPool>,
+		target: NodeId,
+		meta: CounterReplicateRequestMeta,
+	) -> std::io::Result<CounterReplicaAck> {
+		Self::counter_round_trip(
+			factory,
+			pool,
+			target,
+			MsgType::COUNTER_REPLICATE_REQ.0,
+			bytemuck::bytes_of(&meta),
+			MsgType::COUNTER_REPLICATE_RESP.0,
+		)
+		.await
+	}
+
+	/// ADR 075: ship a `COUNTER_ROLLBACK_REQ` to one peer and return its ack.
+	/// Counter frames only.
+	#[allow(dead_code)] // reachable via CounterReplicaNetworkTransport (constructed in cut-8b)
+	async fn rollback_counter_to_remote(
+		factory: Arc<TransportProviderFactory>,
+		pool: Arc<BufPool>,
+		target: NodeId,
+		meta: CounterRollbackRequestMeta,
+	) -> std::io::Result<CounterReplicaAck> {
+		Self::counter_round_trip(
+			factory,
+			pool,
+			target,
+			MsgType::COUNTER_ROLLBACK_REQ.0,
+			bytemuck::bytes_of(&meta),
+			MsgType::COUNTER_ROLLBACK_RESP.0,
+		)
+		.await
+	}
+
+	/// Shared one-shot counter request/response over a bidi stream: send a fixed
+	/// counter request meta (no arrow payload — the value rides in the meta),
+	/// await the matching counter response, and decode the fixed `CounterReplicaAck`.
+	#[allow(dead_code)] // reachable via CounterReplicaNetworkTransport (constructed in cut-8b)
+	async fn counter_round_trip(
+		factory: Arc<TransportProviderFactory>,
+		pool: Arc<BufPool>,
+		target: NodeId,
+		req_msg_type: u8,
+		meta_bytes: &[u8],
+		resp_msg_type: u8,
+	) -> std::io::Result<CounterReplicaAck> {
+		let conn = factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: req_msg_type,
+			flags: 0,
+			stream_id: 0,
+			meta_len: meta_bytes.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, meta_bytes, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+
+		let resp = read_frame(&mut *stream, &pool).await?;
+		if resp.header.msg_type != resp_msg_type {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"expected counter resp 0x{resp_msg_type:02x}, got msg_type=0x{:02x}",
+					resp.header.msg_type
+				),
+			));
+		}
+		if resp.meta.len() < std::mem::size_of::<CounterReplicaAck>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"counter response meta too small",
+			));
+		}
+		Ok(*bytemuck::from_bytes::<CounterReplicaAck>(
+			&resp.meta[..std::mem::size_of::<CounterReplicaAck>()],
+		))
 	}
 
 	async fn replicate_table_batch_to_remote(
@@ -7281,6 +7477,423 @@ impl WendelonDataServer {
 		})
 	}
 
+	/// Encode a fixed `CounterReplicaAck` reply frame (shared by the counter
+	/// replicate / rollback handlers).
+	fn counter_ack_frame(
+		&self,
+		stream_id: u32,
+		resp_msg_type: u8,
+		status: CounterReplicaStatus,
+		op_id: u64,
+	) -> HrftFrame {
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&CounterReplicaAck {
+				status,
+				_pad: [0; 7],
+				op_id,
+			}));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: resp_msg_type,
+				flags: 0,
+				stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: body,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
+	/// ADR 075 `COUNTER_REPLICATE_REQ` handler. Thin: decode the fixed meta, call
+	/// `CounterReplicaService`, encode the fixed ack. The counter value rides in
+	/// the meta (no arrow payload). NO leader orchestration, NO
+	/// pending-finalization witness — a counter tentative does not ride ordinary
+	/// replication semantics.
+	async fn handle_counter_replicate(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		let meta: CounterReplicateRequestMeta = *bytemuck::from_bytes(
+			&frame.meta[..std::mem::size_of::<CounterReplicateRequestMeta>()],
+		);
+		let status = if self.degraded_reason().is_some() {
+			CounterReplicaStatus::INTERNAL_ERROR
+		} else {
+			let result = if meta.phase == CounterReplicaPhase::TENTATIVE {
+				self.counter_replica
+					.replicate_tentative(
+						meta.op_id,
+						meta.tenant_id,
+						meta.key_identity,
+						meta.value,
+						meta.commit_hlc,
+					)
+					.await
+			} else if meta.phase == CounterReplicaPhase::COMMIT {
+				self.counter_replica.commit(meta.op_id).await
+			} else {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"COUNTER_REPLICATE_REQ unknown phase",
+				));
+			};
+			match result {
+				Ok(()) => CounterReplicaStatus::OK,
+				Err(_) => CounterReplicaStatus::INTERNAL_ERROR,
+			}
+		};
+		Ok(self.counter_ack_frame(
+			frame.header.stream_id,
+			MsgType::COUNTER_REPLICATE_RESP.0,
+			status,
+			meta.op_id,
+		))
+	}
+
+	/// ADR 075 `COUNTER_ROLLBACK_REQ` handler. Removes only the matching
+	/// tentative op (idempotent) and acks.
+	async fn handle_counter_rollback(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		let meta: CounterRollbackRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CounterRollbackRequestMeta>()]);
+		self.counter_replica.rollback(meta.op_id);
+		Ok(self.counter_ack_frame(
+			frame.header.stream_id,
+			MsgType::COUNTER_ROLLBACK_RESP.0,
+			CounterReplicaStatus::OK,
+			meta.op_id,
+		))
+	}
+
+	/// ADR 075 cut-4: the per-tenant counter leader, built lazily — by RECOVERY,
+	/// not fresh construction: it loads the tenant's durable counter state (the
+	/// applied D4 dedup log + any pending finalization witnesses) and reconciles
+	/// partial commits BEFORE serving, so a duplicate `ClientWriteId` retry after
+	/// a node restart replays `DUPLICATE` instead of re-adding, and a
+	/// witnessed-but-unmarked add becomes readable again. Its sole wired
+	/// participant is this node's own `LocalCounterParticipant` over
+	/// `counter_replica` (single-node, quorum 1). The per-tenant init gate makes
+	/// concurrent first requests recover exactly once (recovery does file I/O —
+	/// never under a DashMap entry lock across await).
+	async fn counter_leader_for(
+		&self,
+		tenant_id: TenantId,
+	) -> std::io::Result<
+		Arc<
+			crate::storage::counter::CounterLeader<crate::storage::counter::CounterParticipantKind>,
+		>,
+	> {
+		use crate::storage::counter::{
+			CounterLeader, CounterParticipantKind, DurableCounterWitnessStore,
+			LocalCounterParticipant,
+		};
+		if let Some(existing) = self.counter_leaders.get(&tenant_id) {
+			return Ok(existing.clone());
+		}
+		let init_gate = self
+			.counter_leader_init
+			.entry(tenant_id)
+			.or_default()
+			.clone();
+		let _init_guard = init_gate.lock().await;
+		if let Some(existing) = self.counter_leaders.get(&tenant_id) {
+			return Ok(existing.clone());
+		}
+		let participant = CounterParticipantKind::Local(LocalCounterParticipant::new(
+			self.counter_replica.clone(),
+			tenant_id,
+		));
+		let witness_dir = self
+			.slab
+			.data_dir()
+			.join("counter-witness")
+			.join(format!("tenant-{}", tenant_id.get()));
+		std::fs::create_dir_all(&witness_dir)?;
+		let witness_store = DurableCounterWitnessStore::open(witness_dir)?;
+		// Single-node: this node is the primary for its own keys, so quorum 1
+		// over the local arm. Multi-node routing + remote participants + quorum
+		// > 1 are the follow-on once cut-3b's transport surfaces a participant.
+		let leader = Arc::new(CounterLeader::recover(
+			vec![participant],
+			1,
+			true,
+			witness_store,
+		)?);
+		// Finish any partial commit fan-out (idempotent) before first service.
+		leader.reconcile().await;
+		self.counter_leaders.insert(tenant_id, leader.clone());
+		Ok(leader)
+	}
+
+	/// Zero HLC placeholder for counter responses. Authoritative `commit_hlc`
+	/// plumbing from the leader is a cut-4b follow-on (the load coordinates the
+	/// client needs today are `previous_value` / `current_value`).
+	fn zero_counter_hlc() -> HybridTimestamp {
+		HybridTimestamp {
+			physical_ms: 0,
+			logical: 0,
+			node_id: 0,
+		}
+	}
+
+	fn counter_add_response(
+		&self,
+		meta: &CounterAddRequestMeta,
+		status: WriteStatus,
+		previous_value: u64,
+		current_value: u64,
+		commit_hlc: HybridTimestamp,
+	) -> CounterAddResponseMeta {
+		CounterAddResponseMeta {
+			status,
+			_pad1: [0; 7],
+			log_index: 0,
+			term: 0,
+			epoch: meta.expected_epoch,
+			commit_hlc,
+			leader_hint: self.local_node,
+			echoed_write_id: meta.write_id,
+			previous_value,
+			current_value,
+			has_finalization: 0,
+			_pad2: [0; 7],
+		}
+	}
+
+	fn build_counter_add_response_frame(
+		&self,
+		stream_id: u32,
+		resp: CounterAddResponseMeta,
+	) -> HrftFrame {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&resp));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::COUNTER_ADD_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
+	/// ADR 075 cut-4: the public `COUNTER_ADD_REQ` handler. Extracts + structurally
+	/// verifies the counter key (D7), replays a duplicate `ClientWriteId` from the
+	/// server-side D4 cache, else drives the per-tenant `CounterLeader` and caches
+	/// the accepted outcome. Single-node (quorum 1) for now.
+	async fn handle_counter_add(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		use crate::storage::counter::{CounterKey, CounterLeaderError, counter_identity};
+		if frame.meta.len() < std::mem::size_of::<CounterAddRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"COUNTER_ADD_REQ meta too small",
+			));
+		}
+		let meta: CounterAddRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CounterAddRequestMeta>()]);
+		let stream_id = frame.header.stream_id;
+
+		// A degraded node fails closed — no mutation.
+		if self.degraded_reason().is_some() {
+			return Ok(self.build_counter_add_response_frame(
+				stream_id,
+				self.counter_add_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					0,
+					0,
+					Self::zero_counter_hlc(),
+				),
+			));
+		}
+
+		// Fail closed under replication. cut-4's leader is single-node (quorum 1,
+		// local arm only); under rf > 1 a counter add would be durable ONLY on the
+		// primary and never replicate to the key's other replicas — silently
+		// violating D3's durable-quorum. Reject until cut-8b wires ring-driven
+		// multi-node replication (peer-identity witness + reconcile to recorded
+		// peers). `rf = 1` (the default, and any single-data-node cluster) is
+		// unaffected — `replication_factor()` is `rf.min(data_count)`.
+		if self.router.replication_factor() > 1 {
+			return Ok(self.build_counter_add_response_frame(
+				stream_id,
+				self.counter_add_response(
+					&meta,
+					WriteStatus::COUNTER_REPLICATION_UNSUPPORTED,
+					0,
+					0,
+					Self::zero_counter_hlc(),
+				),
+			));
+		}
+
+		// Extract the counter key from the Arrow payload and structurally verify its
+		// domain-separated identity (D7). The server never trusts the wire identity.
+		let payload_bytes = frame.arrow_payload.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"COUNTER_ADD_REQ missing Arrow payload",
+			)
+		})?;
+		let batch = decode_batch(payload_bytes)?;
+		let key_bytes = extract_first_binary(&batch, "key")?;
+		if key_bytes.len() as u32 != meta.key_len {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"COUNTER_ADD_REQ key_len mismatch",
+			));
+		}
+		let key = CounterKey(key_bytes.to_vec());
+		if counter_identity(&key) != meta.key_identity {
+			// D7 structural: the derived counter-domain identity must match the wire.
+			return Ok(self.build_counter_add_response_frame(
+				stream_id,
+				self.counter_add_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					0,
+					0,
+					Self::zero_counter_hlc(),
+				),
+			));
+		}
+
+		// D4 public idempotency lives in the MUTATION layer: the leader keys its
+		// durable dedup record by the canonical `ClientWriteId` bytes (never a
+		// hashed/narrowed handle), serializes concurrent duplicates on its
+		// per-key lock, and persists the record with the finalization witness —
+		// so a duplicate replays the original previous/current without
+		// re-applying whether it arrives concurrently, later in-process, or
+		// after a node restart (`counter_leader_for` recovers the record).
+		let leader = self.counter_leader_for(meta.tenant_id).await?;
+		let write_key = meta.write_id.canonical_idempotency_bytes();
+		let resp = match leader.fetch_add(write_key, &key, meta.delta).await {
+			Ok(result) => {
+				let outcome = result.outcome();
+				let status = if result.is_replay() {
+					WriteStatus::DUPLICATE
+				} else {
+					WriteStatus::OK
+				};
+				self.counter_add_response(
+					&meta,
+					status,
+					outcome.previous,
+					outcome.current,
+					Self::zero_counter_hlc(),
+				)
+			}
+			// All rejects fail closed — the leader mutated nothing (D5/D6).
+			Err(err) => {
+				let status = match err {
+					CounterLeaderError::NotLeader => WriteStatus::NOT_LEADER,
+					CounterLeaderError::ZeroDelta => WriteStatus::COUNTER_ZERO_DELTA,
+					CounterLeaderError::Overflow => WriteStatus::COUNTER_OVERFLOW,
+					CounterLeaderError::QuorumFailed | CounterLeaderError::Internal => {
+						WriteStatus::INTERNAL_ERROR
+					}
+				};
+				self.counter_add_response(&meta, status, 0, 0, Self::zero_counter_hlc())
+			}
+		};
+		Ok(self.build_counter_add_response_frame(stream_id, resp))
+	}
+
+	fn counter_read_response(
+		&self,
+		status: ReadStatus,
+		value: u64,
+		epoch: u64,
+	) -> CounterReadResponseMeta {
+		CounterReadResponseMeta {
+			status,
+			_pad1: [0; 7],
+			value,
+			epoch,
+			leader_hint: self.local_node,
+		}
+	}
+
+	fn build_counter_read_response_frame(
+		&self,
+		stream_id: u32,
+		resp: CounterReadResponseMeta,
+	) -> HrftFrame {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&resp));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::COUNTER_READ_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
+	/// ADR 075 cut-5b: the public `COUNTER_READ_REQ` handler — a point read over the
+	/// counter-aware reader (counters store framed `u64`s, not Arrow value batches,
+	/// so the blob read path cannot serve them). An absent counter returns
+	/// `KEY_NOT_FOUND` (D6 — absence is absence, never a fabricated 0).
+	async fn handle_counter_read(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.meta.len() < std::mem::size_of::<CounterReadRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"COUNTER_READ_REQ meta too small",
+			));
+		}
+		let meta: CounterReadRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CounterReadRequestMeta>()]);
+		let stream_id = frame.header.stream_id;
+		let current_epoch = self.admission_snapshot().current_epoch;
+		if meta.expected_epoch < current_epoch {
+			return Ok(self.build_counter_read_response_frame(
+				stream_id,
+				self.counter_read_response(ReadStatus::EPOCH_STALE, 0, current_epoch),
+			));
+		}
+		if let Err(status) = self.enforce_read_policy(meta.tenant_id).await {
+			return Ok(self.build_counter_read_response_frame(
+				stream_id,
+				self.counter_read_response(status, 0, current_epoch),
+			));
+		}
+		// Ensure the tenant's counter leader has RECOVERED before the first read
+		// after a restart: a crash between the durable witness and the commit
+		// marker leaves the committed-by-contract value invisible until the
+		// reconciler re-drives the marker — which leader recovery runs.
+		let _ = self.counter_leader_for(meta.tenant_id).await?;
+		let value = self
+			.counter_replica
+			.read_committed(meta.tenant_id, meta.key_identity)
+			.await?;
+		let resp = match value {
+			Some(v) => self.counter_read_response(ReadStatus::OK, v, current_epoch),
+			None => self.counter_read_response(ReadStatus::KEY_NOT_FOUND, 0, current_epoch),
+		};
+		Ok(self.build_counter_read_response_frame(stream_id, resp))
+	}
+
 	async fn handle_table_replicate(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
 		if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
 			return Err(Error::new(
@@ -7725,6 +8338,148 @@ impl DataRingServer for WendelonDataServer {
 					));
 				}
 				self.handle_replicate(frame).await.map(Some)
+			}
+			MsgType::COUNTER_REPLICATE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<CounterReplicateRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"COUNTER_REPLICATE_REQ meta too small",
+					));
+				}
+				let meta: CounterReplicateRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<CounterReplicateRequestMeta>()],
+				);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Replicate,
+					)
+					.is_err()
+				{
+					return Ok(Some(self.counter_ack_frame(
+						frame.header.stream_id,
+						MsgType::COUNTER_REPLICATE_RESP.0,
+						CounterReplicaStatus::NOT_AUTHORIZED,
+						meta.op_id,
+					)));
+				}
+				self.handle_counter_replicate(frame).await.map(Some)
+			}
+			MsgType::COUNTER_ROLLBACK_REQ => {
+				if frame.meta.len() < std::mem::size_of::<CounterRollbackRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"COUNTER_ROLLBACK_REQ meta too small",
+					));
+				}
+				let meta: CounterRollbackRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<CounterRollbackRequestMeta>()],
+				);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Replicate,
+					)
+					.is_err()
+				{
+					return Ok(Some(self.counter_ack_frame(
+						frame.header.stream_id,
+						MsgType::COUNTER_ROLLBACK_RESP.0,
+						CounterReplicaStatus::NOT_AUTHORIZED,
+						meta.op_id,
+					)));
+				}
+				self.handle_counter_rollback(frame).await.map(Some)
+			}
+			MsgType::COUNTER_ADD_REQ => {
+				if frame.meta.len() < std::mem::size_of::<CounterAddRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"COUNTER_ADD_REQ meta too small",
+					));
+				}
+				let meta: CounterAddRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<CounterAddRequestMeta>()],
+				);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Write,
+					)
+					.is_err()
+				{
+					return Ok(Some(self.build_counter_add_response_frame(
+						frame.header.stream_id,
+						self.counter_add_response(
+							&meta,
+							WriteStatus::AUTHORIZATION_FAILED,
+							0,
+							0,
+							Self::zero_counter_hlc(),
+						),
+					)));
+				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Write,
+				)? {
+					Ok(admission) => admission,
+					Err(_scope) => {
+						return Ok(Some(self.build_counter_add_response_frame(
+							frame.header.stream_id,
+							self.counter_add_response(
+								&meta,
+								WriteStatus::BACKPRESSURED,
+								0,
+								0,
+								Self::zero_counter_hlc(),
+							),
+						)));
+					}
+				};
+				self.handle_counter_add(frame).await.map(Some)
+			}
+			MsgType::COUNTER_READ_REQ => {
+				if frame.meta.len() < std::mem::size_of::<CounterReadRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"COUNTER_READ_REQ meta too small",
+					));
+				}
+				let meta: CounterReadRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<CounterReadRequestMeta>()],
+				);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Read,
+					)
+					.is_err()
+				{
+					return Ok(Some(self.build_counter_read_response_frame(
+						frame.header.stream_id,
+						self.counter_read_response(ReadStatus::AUTHORIZATION_FAILED, 0, 0),
+					)));
+				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Read,
+				)? {
+					Ok(admission) => admission,
+					Err(_scope) => {
+						return Ok(Some(self.build_counter_read_response_frame(
+							frame.header.stream_id,
+							self.counter_read_response(ReadStatus::BACKPRESSURED, 0, 0),
+						)));
+					}
+				};
+				self.handle_counter_read(frame).await.map(Some)
 			}
 			MsgType::QUERY_REQ => {
 				if frame.meta.len() < std::mem::size_of::<QueryRequestMeta>() {
@@ -22019,7 +22774,9 @@ mod tests {
 		let header = bytemuck::pod_read_unaligned::<SlabRecordHeader>(&header_bytes);
 
 		assert_eq!(std::mem::size_of::<SlabRecordHeader>(), 72);
-		assert_eq!(header._pad_align, 0);
+		// ADR 075: an ordinary table-row write stays class STANDARD (the old
+		// `_pad_align` zero-fill slot), i.e. byte-identical to pre-075.
+		assert_eq!(header.record_class, crate::schema::record_class::STANDARD);
 		assert_eq!(header.tenant_id, tenant());
 		assert_eq!(header.key_identity, key_identity);
 
@@ -27687,6 +28444,632 @@ mod tests {
 		let meta: WriteResponseMeta =
 			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<WriteResponseMeta>()]);
 		assert_eq!(meta.status, WriteStatus::AUTHORIZATION_FAILED);
+
+		node.handles.abort();
+	}
+
+	// ADR 075 cut-3b: COUNTER_REPLICATE_REQ dispatch appends a tentative AND
+	// leaves NO pending-finalization witness (the no-witness behavioral guard —
+	// it must not ride ordinary replication semantics). Restart-skips-orphan is
+	// proven at the service level (CounterReplicaService tests).
+	#[tokio::test]
+	async fn counter_replicate_dispatch_appends_tentative_with_no_witness() {
+		let dir = bootstrap_tempdir("counter-replicate");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			31,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"evidence".to_vec()),
+		);
+		let meta = CounterReplicateRequestMeta {
+			commit_hlc: HybridTimestamp {
+				physical_ms: 1,
+				logical: 0,
+				node_id: 0,
+			},
+			op_id: 1,
+			value: 5,
+			epoch: 0,
+			tenant_id: TenantId::new(7),
+			key_identity,
+			phase: CounterReplicaPhase::TENTATIVE,
+			_pad: [0; 7],
+		};
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::COUNTER_REPLICATE_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		};
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: ActorIdentity::data_node(node.local_node),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		assert_eq!(resp.header.msg_type, MsgType::COUNTER_REPLICATE_RESP.0);
+		let ack: CounterReplicaAck =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<CounterReplicaAck>()]);
+		assert_eq!(ack.status, CounterReplicaStatus::OK);
+		assert_eq!(ack.op_id, 1);
+		// The no-witness guard: a counter replicate creates NO finalization
+		// witness (an ordinary REPLICATE_REQ would).
+		assert_eq!(
+			node.data_server.pending_finalization_count_for_test().await,
+			0,
+			"counter replicate must not create a pending-finalization witness"
+		);
+
+		node.handles.abort();
+	}
+
+	// ADR 075 cut-3b: COUNTER_ROLLBACK_REQ dispatch acks OK; rollback of an
+	// unknown op is an idempotent no-op OK (and creates no witness).
+	#[tokio::test]
+	async fn counter_rollback_dispatch_acks_and_is_idempotent() {
+		let dir = bootstrap_tempdir("counter-rollback");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			32,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let meta = CounterRollbackRequestMeta {
+			key_identity: crate::storage::counter::counter_identity(
+				&crate::storage::counter::CounterKey(b"evidence".to_vec()),
+			),
+			op_id: 99,
+			epoch: 0,
+			tenant_id: TenantId::new(7),
+		};
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::COUNTER_ROLLBACK_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		};
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: ActorIdentity::data_node(node.local_node),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		assert_eq!(resp.header.msg_type, MsgType::COUNTER_ROLLBACK_RESP.0);
+		let ack: CounterReplicaAck =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<CounterReplicaAck>()]);
+		assert_eq!(
+			ack.status,
+			CounterReplicaStatus::OK,
+			"rollback of an unknown op is an idempotent OK"
+		);
+		assert_eq!(
+			node.data_server.pending_finalization_count_for_test().await,
+			0
+		);
+
+		node.handles.abort();
+	}
+
+	/// Build + dispatch one `COUNTER_ADD_REQ` (key `b"k"`, `seq`/`delta`) and return
+	/// the parsed response meta.
+	async fn dispatch_counter_add(
+		node: &WendelonNode,
+		seq: u64,
+		delta: u64,
+		key_identity: Identity,
+	) -> CounterAddResponseMeta {
+		let payload = encode_batch(&single_key_batch()).unwrap();
+		let meta = CounterAddRequestMeta {
+			write_id: ClientWriteId {
+				client_uuid: [7u8; 16],
+				sequence_no: seq,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			client_hlc: hlc(10, 0, 0),
+			expected_epoch: 0,
+			tenant_id: tenant(),
+			proxy_hop: 0,
+			durability: DurabilityLevel::QUORUM,
+			await_finalization: 0,
+			_pad1: [0; 5],
+			proxy_source: NodeId {
+				id: 0,
+				_reserved: 0,
+			},
+			key_identity,
+			key_len: 1,
+			_pad2: [0; 4],
+			delta,
+		};
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&payload);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::COUNTER_ADD_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		assert_eq!(resp.header.msg_type, MsgType::COUNTER_ADD_RESP.0);
+		*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<CounterAddResponseMeta>()])
+	}
+
+	// ADR 075 cut-4: the public COUNTER_ADD_REQ path end-to-end on a single node.
+	// The dispatch drives the per-tenant CounterLeader over the real local replica;
+	// a distinct write_id accumulates, and a duplicate write_id replays the original
+	// previous/current WITHOUT re-applying (D4 — public idempotency on the server).
+	#[tokio::test]
+	async fn counter_add_dispatch_applies_accumulates_and_replays_idempotently() {
+		let dir = bootstrap_tempdir("counter-add");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			33,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+
+		// First add on an absent counter: 0 -> 5 (D6 bases at 0, creates it).
+		let r1 = dispatch_counter_add(&node, 1, 5, key_identity).await;
+		assert_eq!(r1.status, WriteStatus::OK);
+		assert_eq!((r1.previous_value, r1.current_value), (0, 5));
+
+		// A distinct write_id accumulates on the same key: 5 -> 8.
+		let r2 = dispatch_counter_add(&node, 2, 3, key_identity).await;
+		assert_eq!(r2.status, WriteStatus::OK);
+		assert_eq!((r2.previous_value, r2.current_value), (5, 8));
+
+		// A duplicate of the FIRST write_id replays the original (0 -> 5) as DUPLICATE.
+		let dup = dispatch_counter_add(&node, 1, 5, key_identity).await;
+		assert_eq!(dup.status, WriteStatus::DUPLICATE);
+		assert_eq!((dup.previous_value, dup.current_value), (0, 5));
+
+		// ...and it did NOT re-apply: a fresh add still sees base 8 (not 13).
+		let r3 = dispatch_counter_add(&node, 3, 1, key_identity).await;
+		assert_eq!(r3.status, WriteStatus::OK);
+		assert_eq!(
+			(r3.previous_value, r3.current_value),
+			(8, 9),
+			"the duplicate replayed without re-applying its delta"
+		);
+
+		node.handles.abort();
+	}
+
+	// ADR 075 cut-4b / D5: a zero-delta COUNTER_ADD is rejected and mutates nothing
+	// (the counter stays absent, so a later real add still bases at 0).
+	#[tokio::test]
+	async fn counter_add_zero_delta_rejects_without_creating() {
+		let dir = bootstrap_tempdir("counter-add-zero");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			34,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+
+		let zd = dispatch_counter_add(&node, 1, 0, key_identity).await;
+		assert_eq!(zd.status, WriteStatus::COUNTER_ZERO_DELTA);
+
+		// The counter was never created — a real add still bases at 0.
+		let ok = dispatch_counter_add(&node, 2, 7, key_identity).await;
+		assert_eq!(ok.status, WriteStatus::OK);
+		assert_eq!(
+			(ok.previous_value, ok.current_value),
+			(0, 7),
+			"the zero-delta reject created nothing"
+		);
+
+		node.handles.abort();
+	}
+
+	// ADR 075 cut-4b / D5: an overflowing COUNTER_ADD is rejected WITHOUT mutating —
+	// no wrap, no saturate. Proven by a following non-overflowing add that still sees
+	// the pre-overflow base (10), not a wrapped value.
+	#[tokio::test]
+	async fn counter_add_overflow_rejects_without_mutating() {
+		let dir = bootstrap_tempdir("counter-add-overflow");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			35,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+
+		let base = dispatch_counter_add(&node, 1, 10, key_identity).await;
+		assert_eq!((base.previous_value, base.current_value), (0, 10));
+
+		// 10 + u64::MAX overflows -> reject, no mutation.
+		let ovf = dispatch_counter_add(&node, 2, u64::MAX, key_identity).await;
+		assert_eq!(ovf.status, WriteStatus::COUNTER_OVERFLOW);
+
+		// The base is intact at 10 (not wrapped/saturated): 10 + 5 = 15.
+		let after = dispatch_counter_add(&node, 3, 5, key_identity).await;
+		assert_eq!(after.status, WriteStatus::OK);
+		assert_eq!(
+			(after.previous_value, after.current_value),
+			(10, 15),
+			"the overflow reject left the counter unmutated"
+		);
+
+		node.handles.abort();
+	}
+
+	/// Build one `COUNTER_ADD_REQ` frame (key `b"k"`) without dispatching it — for
+	/// the concurrent fixtures that fan many frames out at once. Takes the pool
+	/// directly so a spawned (`'static`) task can rebuild a frame on retry.
+	fn counter_add_frame(
+		pool: &Arc<BufPool>,
+		seq: u64,
+		delta: u64,
+		key_identity: Identity,
+	) -> HrftFrame {
+		let payload = encode_batch(&single_key_batch()).unwrap();
+		let meta = CounterAddRequestMeta {
+			write_id: ClientWriteId {
+				client_uuid: [7u8; 16],
+				sequence_no: seq,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			client_hlc: hlc(10, 0, 0),
+			expected_epoch: 0,
+			tenant_id: tenant(),
+			proxy_hop: 0,
+			durability: DurabilityLevel::QUORUM,
+			await_finalization: 0,
+			_pad1: [0; 5],
+			proxy_source: NodeId {
+				id: 0,
+				_reserved: 0,
+			},
+			key_identity,
+			key_len: 1,
+			_pad2: [0; 4],
+			delta,
+		};
+		let mut meta_buf = pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&payload);
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::COUNTER_ADD_REQ.0,
+				flags: 0,
+				stream_id: seq as u32,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		}
+	}
+
+	/// Dispatch a `COUNTER_ADD` (key `b"k"`, `seq`/`delta`) against a shared server,
+	/// retrying on transient `BACKPRESSURED` admission (pre-handler, never applied —
+	/// so a retry with the same idempotent `write_id` lands the add exactly once).
+	async fn dispatch_counter_add_shared(
+		server: Arc<WendelonDataServer>,
+		pool: Arc<BufPool>,
+		local: NodeId,
+		seq: u64,
+		delta: u64,
+		key_identity: Identity,
+	) -> CounterAddResponseMeta {
+		loop {
+			let frame = counter_add_frame(&pool, seq, delta, key_identity);
+			let resp = DataRingServer::handle_data_frame(
+				server.as_ref(),
+				RequestContext {
+					remote: local,
+					actor: actor(ActorRole::Operator, None),
+				},
+				frame,
+			)
+			.await
+			.unwrap()
+			.unwrap();
+			let meta: CounterAddResponseMeta =
+				*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<CounterAddResponseMeta>()]);
+			if meta.status == WriteStatus::BACKPRESSURED {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+				continue;
+			}
+			break meta;
+		}
+	}
+
+	// ADR 075 HEADLINE fixture (D2): N concurrent unique-write_id `+1` adds to one
+	// absent counter sum to EXACTLY N. The leader's per-key read-modify-write
+	// critical section is what makes this hold — a racing read-compute-append
+	// without it would lose increments and the final `previous` would be < N.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn counter_add_concurrent_unique_writers_sum_exactly() {
+		let dir = bootstrap_tempdir("counter-add-concurrent");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			36,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+
+		const N: u64 = 64;
+		let mut handles = Vec::new();
+		for seq in 1..=N {
+			handles.push(tokio::spawn(dispatch_counter_add_shared(
+				node.data_server.clone(),
+				node.pool.clone(),
+				node.local_node,
+				seq,
+				1,
+				key_identity,
+			)));
+		}
+		for handle in handles {
+			let status = handle.await.unwrap().status;
+			assert!(
+				status == WriteStatus::OK || status == WriteStatus::DUPLICATE,
+				"each unique-writer add must land (got {status:?})"
+			);
+		}
+
+		// A final add observes previous == N: every concurrent +1 landed, none lost.
+		let final_add = dispatch_counter_add(&node, N + 1, 1, key_identity).await;
+		assert_eq!(final_add.status, WriteStatus::OK);
+		assert_eq!(
+			final_add.previous_value, N,
+			"all concurrent unique-writer +1 adds summed exactly (no lost increment)"
+		);
+
+		node.handles.abort();
+	}
+
+	// ADR 075 D4 (concurrency): N concurrent adds carrying the SAME canonical
+	// `ClientWriteId` apply the delta EXACTLY ONCE. The cache check in
+	// `handle_counter_add` is check-then-act; without the per-write-id in-flight gate
+	// two concurrent duplicates both miss the cache, mint distinct internal op-ids,
+	// and double-apply. Exactly one response is OK, the rest replay DUPLICATE, and a
+	// later fresh add bases at the single applied value (delta), not N*delta.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn counter_add_concurrent_same_write_id_applies_exactly_once() {
+		let dir = bootstrap_tempdir("counter-add-dup-concurrent");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			38,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+
+		const N: u64 = 32;
+		const DELTA: u64 = 5;
+		// Every task shares seq == 1, hence the same canonical write_id.
+		let mut handles = Vec::new();
+		for _ in 0..N {
+			handles.push(tokio::spawn(dispatch_counter_add_shared(
+				node.data_server.clone(),
+				node.pool.clone(),
+				node.local_node,
+				1,
+				DELTA,
+				key_identity,
+			)));
+		}
+		let mut ok_count = 0u64;
+		for handle in handles {
+			let meta = handle.await.unwrap();
+			assert!(
+				meta.status == WriteStatus::OK || meta.status == WriteStatus::DUPLICATE,
+				"a same-write_id add must apply or replay (got {:?})",
+				meta.status
+			);
+			assert_eq!(
+				(meta.previous_value, meta.current_value),
+				(0, DELTA),
+				"every same-write_id response carries the single applied outcome 0->{DELTA}"
+			);
+			if meta.status == WriteStatus::OK {
+				ok_count += 1;
+			}
+		}
+		assert_eq!(
+			ok_count, 1,
+			"exactly one of the {N} duplicate adds applied; the rest replayed DUPLICATE"
+		);
+
+		// A fresh add bases at DELTA — the delta applied once, not N times.
+		let fresh = dispatch_counter_add(&node, 2, 1, key_identity).await;
+		assert_eq!(fresh.status, WriteStatus::OK);
+		assert_eq!(
+			(fresh.previous_value, fresh.current_value),
+			(DELTA, DELTA + 1),
+			"the duplicate adds applied the delta exactly once"
+		);
+
+		node.handles.abort();
+	}
+
+	// ADR 075 D4 (across restart): a duplicate `ClientWriteId` retry that lands
+	// AFTER a node restart replays `DUPLICATE` with the original outcome instead
+	// of re-adding against the recovered committed counter. Discriminating: with
+	// the dedup record held only in a process-lifetime map (no durable applied
+	// log, no leader recovery in `counter_leader_for`), the retry would re-apply
+	// (status OK, 5 → 10) — exactly-once would silently become at-least-once on
+	// every node restart.
+	#[tokio::test]
+	async fn counter_add_duplicate_replays_across_server_restart() {
+		let dir = bootstrap_tempdir("counter-add-server-restart");
+		let cfg = NodeBootstrapConfig::dev(39, dir, "127.0.0.1:0".into());
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+		{
+			let node = WendelonNode::bootstrap_single_node(cfg.clone())
+				.await
+				.unwrap();
+			let r1 = dispatch_counter_add(&node, 1, 5, key_identity).await;
+			assert_eq!(r1.status, WriteStatus::OK);
+			assert_eq!((r1.previous_value, r1.current_value), (0, 5));
+			node.handles.abort();
+		}
+		tokio::time::sleep(Duration::from_millis(25)).await;
+
+		let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		// The committed value survived; the duplicate retry replays, not re-adds.
+		let dup = dispatch_counter_add(&recovered, 1, 5, key_identity).await;
+		assert_eq!(
+			dup.status,
+			WriteStatus::DUPLICATE,
+			"a post-restart duplicate must replay (got {:?})",
+			dup.status
+		);
+		assert_eq!(
+			(dup.previous_value, dup.current_value),
+			(0, 5),
+			"the replay carries the ORIGINAL outcome"
+		);
+		// A fresh add bases at the recovered 5 — the retry did not re-apply.
+		let fresh = dispatch_counter_add(&recovered, 2, 1, key_identity).await;
+		assert_eq!(fresh.status, WriteStatus::OK);
+		assert_eq!(
+			(fresh.previous_value, fresh.current_value),
+			(5, 6),
+			"exactly-once held across the restart (5, not 10)"
+		);
+
+		recovered.handles.abort();
+	}
+
+	// ADR 075 fixture (D2 critical-section proof): two concurrent adders to an absent
+	// key observe (0->1) and (1->2) in SOME order — never both (0->1). A shared
+	// `previous` would be the lost-update bug this ADR exists to prevent.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn counter_add_two_racing_adders_do_not_share_previous() {
+		let dir = bootstrap_tempdir("counter-add-racing");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			37,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+
+		let mut handles = Vec::new();
+		for seq in 1..=2u64 {
+			handles.push(tokio::spawn(dispatch_counter_add_shared(
+				node.data_server.clone(),
+				node.pool.clone(),
+				node.local_node,
+				seq,
+				1,
+				key_identity,
+			)));
+		}
+		let mut pairs = Vec::new();
+		for handle in handles {
+			let meta = handle.await.unwrap();
+			pairs.push((meta.previous_value, meta.current_value));
+		}
+		pairs.sort();
+		assert_eq!(
+			pairs,
+			vec![(0, 1), (1, 2)],
+			"racing adders observed DISTINCT previous values (no shared-previous lost update)"
+		);
 
 		node.handles.abort();
 	}

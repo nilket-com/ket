@@ -680,6 +680,37 @@ impl MsgType {
 	pub const CDC_FRAME: Self = Self(0x37);
 	pub const CDC_CHECKPOINT: Self = Self(0x38);
 	pub const CDC_REJECT: Self = Self(0x39);
+	// Idempotent atomic counter fetch-add (ADR 075). Kept out of the legacy
+	// WRITE_REQ shape so existing KV clients retain their fixed `WriteRequestMeta`
+	// contract. NOTE: 0x3A/0x3B (the slots after CDC_REJECT) are taken by
+	// SCHEMA_DROP_REQ/RESP in the control-ring block below — cut-1 missed that and
+	// shipped a dark collision, caught by the global MsgType uniqueness guard. The
+	// counter kinds use the free slots after the current max.
+	pub const COUNTER_ADD_REQ: Self = Self(0x4C);
+	pub const COUNTER_ADD_RESP: Self = Self(0x4D);
+	// ADR 075 cut-5b: the public counter point-read. A counter value is stored as a
+	// framed `CounterTentativeFrame` (record class COUNTER_TENTATIVE), NOT an Arrow
+	// value batch, so the blob READ_REQ path (which decodes the body as an Arrow
+	// batch) cannot read it — counters need their own point-read op over the
+	// counter-aware reader. Free slots after the current max (0x4D).
+	pub const COUNTER_READ_REQ: Self = Self(0x4E);
+	pub const COUNTER_READ_RESP: Self = Self(0x4F);
+	// Internal leader→replica counter-replication protocol (ADR 075 cut-2).
+	// NOT a public client surface: a counter add's primary fans the tentative
+	// out over COUNTER_REPLICATE_REQ (phase tentative), then drives the
+	// accepted participants with COUNTER_REPLICATE_REQ (phase commit) on quorum
+	// success or COUNTER_ROLLBACK_REQ on failure. Distinct from REPLICATE_REQ
+	// because a counter replica must NOT emit a pending-finalization witness on
+	// append (the reconciler finalizes witnesses; a witnessed-but-unquorumed
+	// add would be wrongly committed).
+	// Opcodes 0x3C-0x3F are taken by the TABLE_DESCRIPTOR_GET / TABLE_QUERY_CANCEL
+	// kinds below; the counter replicate/rollback kinds use the next free slots
+	// after the current max (0x47). (COUNTER_ADD_REQ/RESP at 0x3A/0x3B predate the
+	// TABLE_* block and are unique.)
+	pub const COUNTER_REPLICATE_REQ: Self = Self(0x48);
+	pub const COUNTER_REPLICATE_RESP: Self = Self(0x49);
+	pub const COUNTER_ROLLBACK_REQ: Self = Self(0x4A);
+	pub const COUNTER_ROLLBACK_RESP: Self = Self(0x4B);
 
 	// control ring
 	pub const TRANSFER_REQ: Self = Self(0x10);
@@ -724,7 +755,117 @@ impl MsgType {
 	pub const INSTALL_SNAPSHOT_RESP: Self = Self(0x23);
 	pub const VOTE_REQ: Self = Self(0x24);
 	pub const VOTE_RESP: Self = Self(0x25);
+
+	/// EVERY Data/Control Ring opcode. New `MsgType` consts MUST be added here —
+	/// the compile-time uniqueness guard below relies on this list to make an
+	/// opcode collision a build error. (An aliased opcode silently routes one
+	/// kind's frames to another kind's handler; ADR 075 cut-3b hit exactly that
+	/// when the counter replicate/rollback kinds aliased the TABLE_* block.)
+	pub const ALL: &'static [MsgType] = &[
+		Self::WRITE_REQ,
+		Self::WRITE_RESP,
+		Self::READ_REQ,
+		Self::READ_RESP,
+		Self::BULK_WRITE_REQ,
+		Self::BULK_WRITE_RESP,
+		Self::STREAM_FIN_REQ,
+		Self::STREAM_FIN_EVT,
+		Self::REPLICATE_REQ,
+		Self::REPLICATE_RESP,
+		Self::QUERY_REQ,
+		Self::QUERY_RESP,
+		Self::MIGRATE_REQ,
+		Self::MIGRATE_RESP,
+		Self::PENDING_WITNESS_REQ,
+		Self::PENDING_WITNESS_RESP,
+		Self::TABLE_WRITE_REQ,
+		Self::TABLE_WRITE_RESP,
+		Self::TABLE_REPLICATE_REQ,
+		Self::TABLE_REPLICATE_RESP,
+		Self::TABLE_QUERY_REQ,
+		Self::TABLE_QUERY_RESP,
+		Self::AGG_REQ,
+		Self::AGG_RESP,
+		Self::TABLE_DELETE_REQ,
+		Self::TABLE_DELETE_RESP,
+		Self::CDC_SUBSCRIBE_REQ,
+		Self::CDC_FRAME,
+		Self::CDC_CHECKPOINT,
+		Self::CDC_REJECT,
+		Self::COUNTER_ADD_REQ,
+		Self::COUNTER_ADD_RESP,
+		Self::COUNTER_READ_REQ,
+		Self::COUNTER_READ_RESP,
+		Self::COUNTER_REPLICATE_REQ,
+		Self::COUNTER_REPLICATE_RESP,
+		Self::COUNTER_ROLLBACK_REQ,
+		Self::COUNTER_ROLLBACK_RESP,
+		Self::TRANSFER_REQ,
+		Self::TRANSFER_RESP,
+		Self::LEASE_REQ,
+		Self::LEASE_RESP,
+		Self::EPOCH_ADV_REQ,
+		Self::EPOCH_ADV_RESP,
+		Self::STATUS_REQ,
+		Self::STATUS_RESP,
+		Self::JOIN_REQ,
+		Self::JOIN_RESP,
+		Self::LEASE_RELEASE_REQ,
+		Self::LEASE_RELEASE_RESP,
+		Self::TENANT_ADMIN_REQ,
+		Self::TENANT_ADMIN_RESP,
+		Self::AUDIT_CHAIN_HEAD_REQ,
+		Self::AUDIT_CHAIN_HEAD_RESP,
+		Self::SCHEMA_UPDATE_REQ,
+		Self::SCHEMA_UPDATE_RESP,
+		Self::REVOCATION_ADMIN_REQ,
+		Self::REVOCATION_ADMIN_RESP,
+		Self::SCHEMA_DROP_REQ,
+		Self::SCHEMA_DROP_RESP,
+		Self::TABLE_DESCRIPTOR_GET_REQ,
+		Self::TABLE_DESCRIPTOR_GET_RESP,
+		Self::TABLE_QUERY_CANCEL_REQ,
+		Self::TABLE_QUERY_CANCEL_RESP,
+		Self::LOGICAL_TYPE_GET_REQ,
+		Self::LOGICAL_TYPE_GET_RESP,
+		Self::LOGICAL_TYPE_LIST_REQ,
+		Self::LOGICAL_TYPE_LIST_RESP,
+		Self::TABLE_DESCRIPTOR_LIST_REQ,
+		Self::TABLE_DESCRIPTOR_LIST_RESP,
+		Self::TABLE_OPTIMIZER_FACTS_GET_REQ,
+		Self::TABLE_OPTIMIZER_FACTS_GET_RESP,
+		Self::APPEND_ENTRIES_REQ,
+		Self::APPEND_ENTRIES_RESP,
+		Self::INSTALL_SNAPSHOT_REQ,
+		Self::INSTALL_SNAPSHOT_RESP,
+		Self::VOTE_REQ,
+		Self::VOTE_RESP,
+	];
 }
+
+/// Compile-time global uniqueness of every Data/Control Ring opcode. An aliased
+/// opcode routes one kind's frames to another handler — invisible until both
+/// kinds dispatch (ADR 075 cut-3b). O(n²) over a fixed ~76-element list at build
+/// time.
+const fn msg_types_globally_unique(all: &[MsgType]) -> bool {
+	let mut i = 0;
+	while i < all.len() {
+		let mut j = i + 1;
+		while j < all.len() {
+			if all[i].0 == all[j].0 {
+				return false;
+			}
+			j += 1;
+		}
+		i += 1;
+	}
+	true
+}
+
+const _: () = assert!(
+	msg_types_globally_unique(MsgType::ALL),
+	"MsgType opcodes must be globally unique — an aliased opcode collides on the wire"
+);
 
 // ============================================================
 //  WRITE REQUEST METADATA — 120 bytes, fixed
@@ -830,6 +971,21 @@ impl WriteStatus {
 	/// control before the data path began durable work. Retrying
 	/// after a short backoff is allowed.
 	pub const BACKPRESSURED: Self = Self(14);
+	/// ADR 075 D5: a `COUNTER_ADD` with `delta == 0` (a mutation must
+	/// move the counter; explicit point reads observe the value). No
+	/// mutation occurred. Not retryable as-is.
+	pub const COUNTER_ZERO_DELTA: Self = Self(15);
+	/// ADR 075 D5: a `COUNTER_ADD` whose `previous + delta` would
+	/// overflow `u64`. Rejected WITHOUT mutating — no wrap, no
+	/// saturate. Not retryable as-is.
+	pub const COUNTER_OVERFLOW: Self = Self(16);
+	/// ADR 075: a `COUNTER_ADD` was rejected because the cluster runs
+	/// with replication factor > 1 but multi-node counter replication
+	/// (ring-driven participant set + peer-identity witness, cut-8b) is
+	/// not yet wired. Fail-closed: the add would otherwise be durable
+	/// only on the primary, silently violating D3's durable-quorum.
+	/// `rf = 1` (the default) is unaffected.
+	pub const COUNTER_REPLICATION_UNSUPPORTED: Self = Self(17);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -848,6 +1004,9 @@ impl WriteStatus {
 			Self::AUTHORIZATION_FAILED => "authorization_failed",
 			Self::FINALIZATION_PENDING => "finalization_pending",
 			Self::BACKPRESSURED => "backpressured",
+			Self::COUNTER_ZERO_DELTA => "counter_zero_delta",
+			Self::COUNTER_OVERFLOW => "counter_overflow",
+			Self::COUNTER_REPLICATION_UNSUPPORTED => "counter_replication_unsupported",
 			_ => "unknown",
 		}
 	}
@@ -871,6 +1030,198 @@ pub struct WriteResponseMeta {
 	/// 1 if a FinalizationMarker follows this frame; 0 otherwise
 	pub has_finalization: u8, //  1 byte
 	pub _pad2: [u8; 7],      //  7 bytes
+}
+
+// ============================================================
+//  COUNTER ADD REQUEST METADATA — 128 bytes, fixed (ADR 075)
+//
+//  Idempotent atomic fetch-add on a counter key. Mirrors
+//  `WriteRequestMeta` but carries an additive `delta` instead of a
+//  value payload — a counter add has no Arrow value section, only
+//  the `u64` delta. Routed to the key's primary owner, applied under
+//  a per-key read-modify-write critical section.
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterAddRequestMeta {
+	/// REQUIRED — exactly-once idempotency key
+	pub write_id: ClientWriteId, // 32 bytes
+	/// Client's current HLC; leader merges max(leader_hlc, client_hlc)+1
+	pub client_hlc: HybridTimestamp, // 16 bytes
+	/// Client's believed epoch; leader rejects with EPOCH_STALE on mismatch
+	pub expected_epoch: u64, //  8 bytes
+	/// Tenant the counter belongs to.
+	pub tenant_id: TenantId, //  8 bytes
+	/// 0 = direct to leader; incremented by each proxy; max 2
+	pub proxy_hop: u8, //  1 byte
+	/// Durability level: 0=QUORUM, 1=LEADER, 2=NONE
+	pub durability: DurabilityLevel, //  1 byte
+	/// If 1, leader streams back FinalizationMarker in the response
+	pub await_finalization: u8, //  1 byte
+	pub _pad1: [u8; 5], //  5 bytes alignment
+	/// Set by proxy follower for response routing; zeroed on direct adds
+	pub proxy_source: NodeId, //  8 bytes
+	/// Stable 256-bit identity of the counter key (server-verified,
+	/// derived from the reserved counter key-domain `(tenant_id, key)`).
+	pub key_identity: Identity, // 32 bytes
+	/// Key length in the Arrow payload (for fast routing without Arrow parse)
+	pub key_len: u32, //  4 bytes
+	pub _pad2: [u8; 4], //  4 bytes alignment
+	/// Additive delta. `0` is rejected (a mutation, not a read).
+	pub delta: u64, //  8 bytes
+}
+
+// ============================================================
+//  COUNTER ADD RESPONSE METADATA — 112 bytes, fixed (ADR 075)
+//
+//  Mirrors `WriteResponseMeta` plus the pre/post counter values so a
+//  duplicate `write_id` replay returns the original `previous_value`
+//  / `current_value` without re-applying the delta.
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterAddResponseMeta {
+	pub status: WriteStatus, //  1 byte
+	pub _pad1: [u8; 7],      //  7 bytes
+	/// Raft log index of committed entry (0 on error)
+	pub log_index: u64, //  8 bytes
+	pub term: u64,           //  8 bytes
+	pub epoch: u64,          //  8 bytes
+	/// Authoritative HLC of the commit
+	pub commit_hlc: HybridTimestamp, // 16 bytes
+	/// Populated on NOT_LEADER / EPOCH_STALE for client redirect
+	pub leader_hint: NodeId, //  8 bytes
+	/// Echoed back for client correlation
+	pub echoed_write_id: ClientWriteId, // 32 bytes
+	/// Counter value BEFORE this add (0 if the counter was absent).
+	pub previous_value: u64, //  8 bytes
+	/// Counter value AFTER this add (`previous_value + delta`).
+	pub current_value: u64, //  8 bytes
+	/// 1 if a FinalizationMarker follows this frame; 0 otherwise
+	pub has_finalization: u8, //  1 byte
+	pub _pad2: [u8; 7],      //  7 bytes
+}
+
+// ============================================================
+//  COUNTER READ REQUEST / RESPONSE METADATA — 48 / 32 bytes (ADR 075 cut-5b)
+//
+//  A point read of a counter key. No Arrow payload: the server-verified
+//  domain-separated `key_identity` is sufficient (the read is non-mutating, so it
+//  routes/looks up by identity exactly like a point read but returns the framed
+//  `u64` rather than an Arrow value batch).
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterReadRequestMeta {
+	/// Client's believed epoch; the server rejects with `EPOCH_STALE` on mismatch.
+	pub expected_epoch: u64, //  8 bytes
+	/// Tenant the counter belongs to.
+	pub tenant_id: TenantId, //  8 bytes
+	/// Domain-separated counter identity (the same derivation the add verifies).
+	pub key_identity: Identity, // 32 bytes
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterReadResponseMeta {
+	/// `OK` with a present value, `KEY_NOT_FOUND` for an absent counter (D6 —
+	/// absence is absence, never a fabricated 0), or a redirect/stale status.
+	pub status: ReadStatus, //  1 byte
+	pub _pad1: [u8; 7], //  7 bytes
+	/// The committed counter value (meaningful only when `status == OK`).
+	pub value: u64, //  8 bytes
+	pub epoch: u64,     //  8 bytes
+	/// Populated on `NOT_LEADER` / `EPOCH_STALE` for client redirect.
+	pub leader_hint: NodeId, //  8 bytes
+}
+
+// ============================================================
+//  COUNTER REPLICATE / ROLLBACK METADATA (ADR 075 cut-2)
+//
+//  Internal leader→replica frames. A counter add's primary fans the
+//  tentative out with `CounterReplicaPhase::TENTATIVE`, gathers the
+//  exact set of participants that acked tentative success, then on
+//  quorum success drives that set with `CounterReplicaPhase::COMMIT`
+//  (write the durable commit marker) or on failure with a
+//  `CounterRollbackRequestMeta` (drop the live tentative; recovery
+//  skips the orphan). `op_id` is the leader-assigned, cross-node
+//  stable handle for one counter add; the on-disk tentative/commit
+//  pairing on each replica uses that replica's local record offset.
+// ============================================================
+
+/// Phase of a [`CounterReplicateRequestMeta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterReplicaPhase(pub u8);
+
+impl CounterReplicaPhase {
+	/// Durably append the tentative counter value and index it live — NO commit
+	/// marker, NO pending-finalization witness.
+	pub const TENTATIVE: Self = Self(0);
+	/// Write the durable commit marker for a previously-replicated tentative —
+	/// the only path that makes a replica's counter value survive restart.
+	pub const COMMIT: Self = Self(1);
+}
+
+/// Acknowledgement status from a counter replica.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterReplicaStatus(pub u8);
+
+impl CounterReplicaStatus {
+	pub const OK: Self = Self(0);
+	pub const EPOCH_STALE: Self = Self(1);
+	pub const NOT_AUTHORIZED: Self = Self(2);
+	pub const INTERNAL_ERROR: Self = Self(3);
+}
+
+/// Leader→replica counter-replication request — 88 bytes, fixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterReplicateRequestMeta {
+	/// HLC chosen by the leader so replicas index the tentative under a
+	/// consistent cross-node timestamp.
+	pub commit_hlc: HybridTimestamp, // 16 bytes
+	/// Leader-assigned stable handle for this counter add (the key the leader's
+	/// commit/rollback step references; replica maps it to a local tentative).
+	pub op_id: u64, //  8 bytes
+	/// Tentative counter value (`previous + delta`) on `TENTATIVE`; ignored on
+	/// `COMMIT`.
+	pub value: u64, //  8 bytes
+	/// Originating leader epoch — replicas reject on mismatch.
+	pub epoch: u64, //  8 bytes
+	/// Tenant the counter belongs to.
+	pub tenant_id: TenantId, //  8 bytes
+	/// Server-verified counter key identity (reserved counter key-domain).
+	pub key_identity: Identity, // 32 bytes
+	/// `TENTATIVE` or `COMMIT`.
+	pub phase: CounterReplicaPhase, //  1 byte
+	pub _pad: [u8; 7], //  7 bytes
+}
+
+/// Leader→replica counter rollback request — 56 bytes, fixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterRollbackRequestMeta {
+	/// Server-verified counter key identity.
+	pub key_identity: Identity, // 32 bytes
+	/// The leader-assigned op handle to abort.
+	pub op_id: u64, //  8 bytes
+	/// Originating leader epoch.
+	pub epoch: u64, //  8 bytes
+	/// Tenant the counter belongs to.
+	pub tenant_id: TenantId, //  8 bytes
+}
+
+/// Replica acknowledgement for a counter replicate/rollback — 16 bytes, fixed.
+/// Shared by `COUNTER_REPLICATE_RESP` and `COUNTER_ROLLBACK_RESP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterReplicaAck {
+	pub status: CounterReplicaStatus, //  1 byte
+	pub _pad: [u8; 7],                //  7 bytes
+	/// Echoed leader-assigned op handle for correlation.
+	pub op_id: u64, //  8 bytes
 }
 
 // ============================================================
@@ -1350,8 +1701,15 @@ impl MigrateStatus {
 #[derive(Clone, Copy, Debug, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct SlabRecordHeader {
-	pub magic: u32,             // 0x534C4142 ("SLAB")
-	pub _pad_align: u32,        // 4 bytes padding for u64 alignment
+	pub magic: u32, // 0x534C4142 ("SLAB")
+	/// Record class (ADR 075). `0` = ordinary blob/Arrow record. Every
+	/// record written before ADR 075, and every non-counter record, carries
+	/// `0` in this slot (it was the `_pad_align` zero-fill), so their
+	/// recovery is unchanged and byte-identical. Counter frames carry a
+	/// non-zero [`record_class`] so the recovery scan applies the
+	/// counter-specific tentative/commit rule without sniffing opaque frame
+	/// bytes. Covered by [`checksum`](Self::checksum) like every other field.
+	pub record_class: u32,
 	pub tenant_id: TenantId,    // durable tenant scope for this record
 	pub key_identity: Identity, // The stable 256-bit identity of the key
 	pub hlc: HybridTimestamp,   // 16 bytes: the timestamp of the write
@@ -1362,6 +1720,44 @@ pub struct SlabRecordHeader {
 	/// torn writes that reach the disk with a valid-looking header
 	/// but a truncated frame.
 	pub checksum: u32,
+}
+
+/// [`SlabRecordHeader::record_class`] values (ADR 075).
+///
+/// `STANDARD` is the zero default carried by every blob/Arrow record (and
+/// every record written before ADR 075), so its recovery path is unchanged.
+/// The two counter classes mark the ADR 075 durable counter frames so the
+/// recovery scan can apply the tentative/commit-marker rule.
+pub mod record_class {
+	/// Ordinary blob / Arrow record — recovered exactly as before ADR 075.
+	pub const STANDARD: u32 = 0;
+	/// A counter tentative-value frame ([`super::CounterTentativeFrame`]). Its
+	/// op-id is its durable record offset; recovery indexes it only if a
+	/// matching commit marker exists.
+	pub const COUNTER_TENTATIVE: u32 = 1;
+	/// A counter commit-marker frame ([`super::CounterCommitFrame`]) naming the
+	/// tentative op-id (offset) that is now committed.
+	pub const COUNTER_COMMIT: u32 = 2;
+}
+
+/// ADR 075 counter tentative-value frame: the durable little-endian `u64`
+/// counter value. The op-id is the record's durable offset (unique, never
+/// reused — the write cursor resumes past it on restart), so the frame itself
+/// carries only the value; the paired [`CounterCommitFrame`] references that
+/// offset. A point read of a committed counter reads exactly these 8 bytes.
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterTentativeFrame {
+	pub value: u64,
+}
+
+/// ADR 075 counter commit-marker frame: references the tentative record's
+/// op-id (its durable offset). Recovery indexes a tentative value only if a
+/// commit marker for its offset exists; orphan tentatives are skipped.
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct CounterCommitFrame {
+	pub tentative_op_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable, Serialize, Deserialize)]
@@ -1604,6 +2000,16 @@ const _: () = assert!(std::mem::size_of::<FrameHeader>() == 24);
 const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 120);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 144);
+const _: () = assert!(std::mem::size_of::<CounterAddRequestMeta>() == 128);
+const _: () = assert!(std::mem::size_of::<CounterAddResponseMeta>() == 112);
+const _: () = assert!(std::mem::size_of::<CounterReadRequestMeta>() == 48);
+const _: () = assert!(std::mem::size_of::<CounterReadResponseMeta>() == 32);
+const _: () = assert!(std::mem::size_of::<CounterReplicateRequestMeta>() == 88);
+const _: () = assert!(std::mem::size_of::<CounterRollbackRequestMeta>() == 56);
+const _: () = assert!(std::mem::size_of::<CounterReplicaAck>() == 16);
+
+// (Counter-opcode collisions are now covered by the global MsgType uniqueness
+// guard next to the `MsgType::ALL` list above.)
 const _: () = assert!(std::mem::size_of::<ReplicaAckLevel>() == 1);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteRespMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<PendingWitnessPullRequestMeta>() == 16);
@@ -1618,6 +2024,8 @@ const _: () = assert!(std::mem::size_of::<MigrateResponseMeta>() == 88);
 const _: () = assert!(std::mem::size_of::<MigrateRequestKind>() == 1);
 const _: () = assert!(std::mem::size_of::<MigrateStatus>() == 1);
 const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 72);
+const _: () = assert!(std::mem::size_of::<CounterTentativeFrame>() == 8);
+const _: () = assert!(std::mem::size_of::<CounterCommitFrame>() == 8);
 const _: () = assert!(std::mem::size_of::<SlabManifest>() == 160);
 const _: () = assert!(std::mem::size_of::<RaftEpochEntryFixed>() == 216);
 const _: () = assert!(std::mem::size_of::<LogEntryKind>() == 1);

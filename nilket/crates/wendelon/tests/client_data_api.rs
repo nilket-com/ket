@@ -5,17 +5,19 @@ use arrow::array::{LargeBinaryArray, LargeBinaryBuilder};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use wendelon::client::{
-	ClusterPeerWire, ClusterStatusWire, ReadRequest, ReadResult, WendelonClient, WriteRequest,
+	ClusterPeerWire, ClusterStatusWire, CounterAddRequest, CounterReadRequest, ReadRequest,
+	ReadResult, WendelonClient, WriteRequest,
 };
 use wendelon::network::control_server::{AdvanceEpochResponseWire, CONTROL_REASON_GRANTED};
 use wendelon::network::server::HrftService;
 use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
 use wendelon::network::wire;
 use wendelon::schema::{
-	ClientWriteId, Consistency, DurabilityLevel, HybridTimestamp, Identity, Locality, MsgType,
-	NodeId, ReadRequestMeta, ReadStatus, TenantId, WriteRequestMeta, WriteStatus, read_key_schema,
-	write_payload_schema,
+	ClientWriteId, Consistency, CounterAddRequestMeta, CounterReadRequestMeta, DurabilityLevel,
+	HybridTimestamp, Identity, Locality, MsgType, NodeId, ReadRequestMeta, ReadStatus, TenantId,
+	WriteRequestMeta, WriteStatus, read_key_schema, write_payload_schema,
 };
+use wendelon::storage::counter::{CounterKey, counter_identity};
 
 fn tenant() -> TenantId {
 	TenantId::ZERO
@@ -242,6 +244,158 @@ async fn client_write_and_read_round_trip_over_hrft() {
 		.unwrap();
 	assert_eq!(read.response.status, ReadStatus::OK);
 	assert_eq!(extract_value(&read), value);
+
+	support::abort_node(&node);
+}
+
+// ADR 075 cut-5: the high-level COUNTER_ADD client path end-to-end over HRFT —
+// apply, accumulate on a distinct write_id, and replay a duplicate write_id
+// (the server's D4 cache) without re-applying.
+#[tokio::test]
+async fn client_counter_fetch_add_round_trip_over_hrft() {
+	let node = support::bootstrap_node("client-counter-add", 1).await;
+	refresh_leases(&node).await;
+
+	let service: Arc<dyn HrftService> = node.router.clone();
+	let bootstrap = snapshot(1, Some(1), &[(1, "loopback://node-1")]);
+	let client = WendelonClient::new(support::loopback_client_config(
+		node.local_node,
+		service,
+		bootstrap,
+	));
+
+	let key = b"client-counter";
+	let identity = counter_identity(&CounterKey(key.to_vec()));
+	let add = |seq: u64, delta: u64| CounterAddRequest {
+		meta: CounterAddRequestMeta {
+			write_id: ClientWriteId {
+				client_uuid: [9u8; 16],
+				sequence_no: seq,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			client_hlc: hlc(10, 0, 0),
+			expected_epoch: 1,
+			tenant_id: tenant(),
+			proxy_hop: 0,
+			durability: DurabilityLevel::QUORUM,
+			await_finalization: 0,
+			_pad1: [0; 5],
+			proxy_source: NodeId {
+				id: 0,
+				_reserved: 0,
+			},
+			key_identity: identity,
+			key_len: key.len() as u32,
+			_pad2: [0; 4],
+			delta,
+		},
+		payload: key_batch(key),
+	};
+
+	let r1 = client.counter_add(add(1, 5)).await.unwrap();
+	assert_eq!(r1.response.status, WriteStatus::OK);
+	assert_eq!(
+		(r1.response.previous_value, r1.response.current_value),
+		(0, 5)
+	);
+
+	let r2 = client.counter_add(add(2, 3)).await.unwrap();
+	assert_eq!(r2.response.status, WriteStatus::OK);
+	assert_eq!(
+		(r2.response.previous_value, r2.response.current_value),
+		(5, 8)
+	);
+
+	// A duplicate write_id replays the original values without re-applying.
+	let dup = client.counter_add(add(1, 5)).await.unwrap();
+	assert_eq!(dup.response.status, WriteStatus::DUPLICATE);
+	assert_eq!(
+		(dup.response.previous_value, dup.response.current_value),
+		(0, 5)
+	);
+
+	support::abort_node(&node);
+}
+
+// ADR 075 cut-5b / D6: the COUNTER_READ point-read path end-to-end. A read after
+// adds returns the committed value; a read of a never-written key returns
+// KEY_NOT_FOUND (absence is absence — the read never fabricates 0).
+#[tokio::test]
+async fn client_counter_read_round_trip_and_absent_over_hrft() {
+	let node = support::bootstrap_node("client-counter-read", 1).await;
+	refresh_leases(&node).await;
+
+	let service: Arc<dyn HrftService> = node.router.clone();
+	let bootstrap = snapshot(1, Some(1), &[(1, "loopback://node-1")]);
+	let client = WendelonClient::new(support::loopback_client_config(
+		node.local_node,
+		service,
+		bootstrap,
+	));
+
+	let key = b"client-counter-read";
+	let identity = counter_identity(&CounterKey(key.to_vec()));
+	for (seq, delta) in [(1u64, 5u64), (2, 3)] {
+		let add = client
+			.counter_add(CounterAddRequest {
+				meta: CounterAddRequestMeta {
+					write_id: ClientWriteId {
+						client_uuid: [9u8; 16],
+						sequence_no: seq,
+						idempotency_ttl_ms: 60_000,
+						_pad: 0,
+					},
+					client_hlc: hlc(10, 0, 0),
+					expected_epoch: 1,
+					tenant_id: tenant(),
+					proxy_hop: 0,
+					durability: DurabilityLevel::QUORUM,
+					await_finalization: 0,
+					_pad1: [0; 5],
+					proxy_source: NodeId {
+						id: 0,
+						_reserved: 0,
+					},
+					key_identity: identity,
+					key_len: key.len() as u32,
+					_pad2: [0; 4],
+					delta,
+				},
+				payload: key_batch(key),
+			})
+			.await
+			.unwrap();
+		assert_eq!(add.response.status, WriteStatus::OK);
+	}
+
+	// Point read returns the committed sum (5 + 3 = 8).
+	let read = client
+		.counter_read(CounterReadRequest {
+			meta: CounterReadRequestMeta {
+				expected_epoch: 1,
+				tenant_id: tenant(),
+				key_identity: identity,
+			},
+		})
+		.await
+		.unwrap();
+	assert_eq!(read.response.status, ReadStatus::OK);
+	assert_eq!(read.response.value, 8);
+
+	// A never-written counter is absent (D6) — KEY_NOT_FOUND, not a fabricated 0.
+	let absent_identity = counter_identity(&CounterKey(b"client-counter-absent".to_vec()));
+	let absent = client
+		.counter_read(CounterReadRequest {
+			meta: CounterReadRequestMeta {
+				expected_epoch: 1,
+				tenant_id: tenant(),
+				key_identity: absent_identity,
+			},
+		})
+		.await
+		.unwrap();
+	assert_eq!(absent.response.status, ReadStatus::KEY_NOT_FOUND);
 
 	support::abort_node(&node);
 }

@@ -60,15 +60,17 @@ use crate::schema::table::decode_table_schema_descriptors;
 use crate::schema::table::encode_descriptor_wire_name;
 use crate::schema::{
 	CdcCheckpointMeta, CdcCursor, CdcDecodeError, CdcFrameMeta, CdcRejectMeta, CdcSubscribeBound,
-	CdcSubscribeRequestMeta, Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader,
-	HybridTimestamp, Identity, Locality, LogicalSchemaFingerprint, LogicalTypeGetRequestMeta,
-	LogicalTypeGetResponseMeta, LogicalTypeListRequestMeta, LogicalTypeListResponseMeta, MsgType,
-	NodeId, PbcRejectCode, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta,
-	QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor,
-	STORAGE_ROW_KEY_ID_COLUMN, StateDigest, TableDeleteRowsRequestMeta,
-	TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
-	TableDescriptorListRequestMeta, TableDescriptorListResponseMeta, TableObjectId,
-	TableOptimizerFacts, TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
+	CdcSubscribeRequestMeta, Consistency, CounterAddRequestMeta, CounterAddResponseMeta,
+	CounterReadRequestMeta, CounterReadResponseMeta, FRAME_FLAG_STREAM_END, FinalizationMarker,
+	FrameHeader, HybridTimestamp, Identity, Locality, LogicalSchemaFingerprint,
+	LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta, LogicalTypeListRequestMeta,
+	LogicalTypeListResponseMeta, MsgType, NodeId, PbcRejectCode,
+	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
+	ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN, StateDigest,
+	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta,
+	TableDescriptorGetResponseMeta, TableDescriptorListRequestMeta,
+	TableDescriptorListResponseMeta, TableObjectId, TableOptimizerFacts,
+	TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
 	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
 	TableQueryRequestMeta, TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta,
 	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
@@ -301,6 +303,35 @@ pub struct WriteRequest {
 pub struct WriteResult {
 	pub response: WriteResponseMeta,
 	pub finalization: Option<FinalizationMarker>,
+}
+
+/// Client-visible `COUNTER_ADD` request (ADR 075). The key rides the Arrow payload
+/// (a single `key` binary column) exactly like a point read; the additive delta is
+/// in `meta`. The `key_identity` must be the domain-separated counter identity.
+#[derive(Clone, Debug)]
+pub struct CounterAddRequest {
+	pub meta: CounterAddRequestMeta,
+	pub payload: RecordBatch,
+}
+
+/// Result of a `COUNTER_ADD` — the response carries the pre/post counter values.
+#[derive(Clone, Debug)]
+pub struct CounterAddResult {
+	pub response: CounterAddResponseMeta,
+}
+
+/// Client-visible `COUNTER_READ` request (ADR 075 cut-5b). Point read of a counter
+/// key by its domain-separated identity — no Arrow payload.
+#[derive(Clone, Debug)]
+pub struct CounterReadRequest {
+	pub meta: CounterReadRequestMeta,
+}
+
+/// Result of a `COUNTER_READ` — `status == OK` carries the committed value;
+/// `KEY_NOT_FOUND` means absent (D6).
+#[derive(Clone, Debug)]
+pub struct CounterReadResult {
+	pub response: CounterReadResponseMeta,
 }
 
 /// Client-visible typed table write request for ADR 037.
@@ -1253,6 +1284,122 @@ impl WendelonClient {
 		decode_write_response_frame(frame, MsgType::WRITE_RESP)
 	}
 
+	/// Issue one idempotent atomic `COUNTER_ADD` over HRFT (ADR 075). Routes to the
+	/// counter key's primary owner and retries the same `write_id` on transient
+	/// redirect / backpressure — exactly-once is preserved by the server's D4 cache.
+	pub async fn counter_add(
+		&self,
+		request: CounterAddRequest,
+	) -> std::io::Result<CounterAddResult> {
+		let key_locality = Locality::from(request.meta.key_identity);
+		let mut preferred_target = None;
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
+			let result = self.counter_add_once(target, &request).await?;
+			let Some(retry) = retry_counter_add_response(&result.response) else {
+				return Ok(result);
+			};
+			if attempt + 1 == DATA_RETRY_BUDGET {
+				return Ok(result);
+			}
+			self.prepare_retry(Some(key_locality), retry).await?;
+			preferred_target = retry.preferred_target;
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	async fn counter_add_once(
+		&self,
+		target: NodeId,
+		request: &CounterAddRequest,
+	) -> std::io::Result<CounterAddResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let arrow = encode_batch(&request.payload)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::COUNTER_ADD_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<CounterAddRequestMeta>() as u32,
+			arrow_len: arrow.len() as u32,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(&request.meta),
+			Some(&arrow),
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_counter_add_response_frame(frame)
+	}
+
+	/// Point-read a counter over HRFT (ADR 075 cut-5b). Routes to the counter key's
+	/// owner and retries redirect/backpressure; `KEY_NOT_FOUND` is an absent counter.
+	pub async fn counter_read(
+		&self,
+		request: CounterReadRequest,
+	) -> std::io::Result<CounterReadResult> {
+		let key_locality = Locality::from(request.meta.key_identity);
+		let mut preferred_target = None;
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
+			let result = self.counter_read_once(target, &request).await?;
+			let Some(retry) =
+				retry_read_status(result.response.status, result.response.leader_hint)
+			else {
+				return Ok(result);
+			};
+			if attempt + 1 == DATA_RETRY_BUDGET {
+				return Ok(result);
+			}
+			self.prepare_retry(Some(key_locality), retry).await?;
+			preferred_target = retry.preferred_target;
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	async fn counter_read_once(
+		&self,
+		target: NodeId,
+		request: &CounterReadRequest,
+	) -> std::io::Result<CounterReadResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::COUNTER_READ_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<CounterReadRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(&request.meta),
+			None,
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_counter_read_response_frame(frame)
+	}
+
 	async fn table_write_once(
 		&self,
 		target: NodeId,
@@ -2164,6 +2311,24 @@ fn retry_write_response(response: &WriteResponseMeta) -> Option<RetryDirective> 
 	}
 }
 
+fn retry_counter_add_response(response: &CounterAddResponseMeta) -> Option<RetryDirective> {
+	match response.status {
+		s if s == WriteStatus::NOT_LEADER || s == WriteStatus::EPOCH_STALE => Some(
+			RetryDirective::redirect(nonzero_node_id(response.leader_hint)),
+		),
+		s if s == WriteStatus::LEASE_EXPIRED || s == WriteStatus::INVALID_LEASE_SIGNATURE => Some(
+			RetryDirective::lease_refresh(nonzero_node_id(response.leader_hint)),
+		),
+		s if s == WriteStatus::FINALIZATION_PENDING => Some(RetryDirective::finalization_pending(
+			nonzero_node_id(response.leader_hint),
+		)),
+		s if s == WriteStatus::BACKPRESSURED => Some(RetryDirective::backpressure(
+			nonzero_node_id(response.leader_hint),
+		)),
+		_ => None,
+	}
+}
+
 fn retry_read_response(response: &ReadResponseMeta) -> Option<RetryDirective> {
 	retry_read_status(response.status, response.leader_hint)
 }
@@ -2409,6 +2574,66 @@ fn table_query_route_locality(
 
 fn nonzero_node_id(node: NodeId) -> Option<NodeId> {
 	(node.id != 0).then_some(node)
+}
+
+fn decode_counter_add_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<CounterAddResult> {
+	if frame.header.msg_type != MsgType::COUNTER_ADD_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected msg_type=0x{:02x}, got msg_type=0x{:02x}",
+				MsgType::COUNTER_ADD_RESP.0,
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() < std::mem::size_of::<CounterAddResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"COUNTER_ADD_RESP meta too small",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"COUNTER_ADD_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: CounterAddResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CounterAddResponseMeta>()]);
+	Ok(CounterAddResult { response })
+}
+
+fn decode_counter_read_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<CounterReadResult> {
+	if frame.header.msg_type != MsgType::COUNTER_READ_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected msg_type=0x{:02x}, got msg_type=0x{:02x}",
+				MsgType::COUNTER_READ_RESP.0,
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() < std::mem::size_of::<CounterReadResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"COUNTER_READ_RESP meta too small",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"COUNTER_READ_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: CounterReadResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CounterReadResponseMeta>()]);
+	Ok(CounterReadResult { response })
 }
 
 fn decode_write_response_frame(
