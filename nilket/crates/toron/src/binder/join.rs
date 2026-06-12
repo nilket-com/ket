@@ -19,6 +19,14 @@ pub(crate) enum BroadcastBuildSide {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BroadcastPlacementRule {
+	SmallerBuild,
+	NaturalLeftBuild,
+	SwappedRightBuild,
+	Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JoinStrategyDecisionReason {
 	PinnedByAuthor,
 	BroadcastInferred {
@@ -70,7 +78,7 @@ pub(super) struct BuildByteCandidate {
 
 #[derive(Debug, Clone)]
 pub(super) struct RelationScope {
-	schema: SchemaRef,
+	pub(super) schema: SchemaRef,
 	entries: Vec<RelationScopeEntry>,
 	next_source_id: usize,
 }
@@ -453,7 +461,8 @@ pub(super) fn choose_auto_join_strategy(
 	let Some(threshold) = effective_auto_broadcast_threshold(config) else {
 		return hash_join_decision(HashByDefaultReason::AutoBroadcastDisabled);
 	};
-	if kind != JoinKind::Inner {
+	let placement_rule = broadcast_physical_placement(kind);
+	if placement_rule == BroadcastPlacementRule::Never {
 		return hash_join_decision(HashByDefaultReason::NonInnerJoin);
 	}
 
@@ -462,34 +471,55 @@ pub(super) fn choose_auto_join_strategy(
 
 	let left_viable = left_build_candidate.filter(|_| right_input.probe_scan_linear);
 	let right_viable = right_build_candidate.filter(|_| left_input.probe_scan_linear);
-	let chosen = match (left_viable, right_viable) {
-		(Some(left), Some(right)) if right_build_materially_smaller(left.bytes, right.bytes) => {
-			Some((
+	let chosen = match placement_rule {
+		BroadcastPlacementRule::SmallerBuild => match (left_viable, right_viable) {
+			(Some(left), Some(right))
+				if right_build_materially_smaller(left.bytes, right.bytes) =>
+			{
+				Some((
+					BroadcastBuildSide::Right,
+					JoinPhysicalPlacement::SwappedRightBuild,
+					right,
+					Some(left.bytes),
+				))
+			}
+			(Some(left), Some(right)) => Some((
+				BroadcastBuildSide::Left,
+				JoinPhysicalPlacement::Natural,
+				left,
+				Some(right.bytes),
+			)),
+			(Some(left), None) => Some((
+				BroadcastBuildSide::Left,
+				JoinPhysicalPlacement::Natural,
+				left,
+				None,
+			)),
+			(None, Some(right)) => Some((
 				BroadcastBuildSide::Right,
 				JoinPhysicalPlacement::SwappedRightBuild,
 				right,
-				Some(left.bytes),
-			))
-		}
-		(Some(left), Some(right)) => Some((
-			BroadcastBuildSide::Left,
-			JoinPhysicalPlacement::Natural,
-			left,
-			Some(right.bytes),
-		)),
-		(Some(left), None) => Some((
-			BroadcastBuildSide::Left,
-			JoinPhysicalPlacement::Natural,
-			left,
-			None,
-		)),
-		(None, Some(right)) => Some((
-			BroadcastBuildSide::Right,
-			JoinPhysicalPlacement::SwappedRightBuild,
-			right,
-			None,
-		)),
-		(None, None) => None,
+				None,
+			)),
+			(None, None) => None,
+		},
+		BroadcastPlacementRule::NaturalLeftBuild => left_viable.map(|left| {
+			(
+				BroadcastBuildSide::Left,
+				JoinPhysicalPlacement::Natural,
+				left,
+				right_build_candidate.map(|right| right.bytes),
+			)
+		}),
+		BroadcastPlacementRule::SwappedRightBuild => right_viable.map(|right| {
+			(
+				BroadcastBuildSide::Right,
+				JoinPhysicalPlacement::SwappedRightBuild,
+				right,
+				left_build_candidate.map(|left| left.bytes),
+			)
+		}),
+		BroadcastPlacementRule::Never => None,
 	};
 	if let Some((build_side, placement, candidate, rejected_side_bytes)) = chosen {
 		let reason = match candidate.source {
@@ -525,6 +555,38 @@ pub(super) fn choose_auto_join_strategy(
 		return hash_join_decision(HashByDefaultReason::MissingBuildByteUpperBound);
 	}
 	hash_join_decision(HashByDefaultReason::BuildByteUpperBoundAboveThreshold)
+}
+
+pub(super) fn broadcast_physical_placement(kind: JoinKind) -> BroadcastPlacementRule {
+	match kind {
+		JoinKind::Inner => BroadcastPlacementRule::SmallerBuild,
+		JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => {
+			BroadcastPlacementRule::NaturalLeftBuild
+		}
+		JoinKind::LeftOuter | JoinKind::LeftSemi | JoinKind::LeftAnti => {
+			BroadcastPlacementRule::SwappedRightBuild
+		}
+		JoinKind::FullOuter => BroadcastPlacementRule::Never,
+	}
+}
+
+pub(super) fn safe_broadcast_physical_kind(kind: JoinKind) -> bool {
+	matches!(
+		kind,
+		JoinKind::Inner | JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti
+	)
+}
+
+pub(super) fn mirrored_broadcast_physical_kind(
+	declared_kind: JoinKind,
+	placement: JoinPhysicalPlacement,
+) -> JoinKind {
+	match (declared_kind, placement) {
+		(JoinKind::LeftOuter, JoinPhysicalPlacement::SwappedRightBuild) => JoinKind::RightOuter,
+		(JoinKind::LeftSemi, JoinPhysicalPlacement::SwappedRightBuild) => JoinKind::RightSemi,
+		(JoinKind::LeftAnti, JoinPhysicalPlacement::SwappedRightBuild) => JoinKind::RightAnti,
+		_ => declared_kind,
+	}
 }
 
 pub(super) const AUTO_BROADCAST_RIGHT_DOMINANCE_FACTOR: u64 = 2;
@@ -941,9 +1003,9 @@ pub(super) fn validate_strategy_shape(
 			}
 		}
 		JoinStrategy::Broadcast => {
-			if kind != JoinKind::Inner {
+			if !safe_broadcast_physical_kind(kind) {
 				return Err(BindingError::UnsupportedExpression {
-					message: "broadcast join is only supported for INNER joins".to_string(),
+					message: "broadcast join requires a preserved-probe shape".to_string(),
 				});
 			}
 			let Some((left_count, _)) = terminal_exchange(left) else {

@@ -1424,7 +1424,7 @@ pub(crate) fn adr140_fragment_rewrites_preserve_join_replay_metadata() {
 		.expect("read fragment source");
 	let join_boundary = source_block(&fragment, "struct JoinBoundary");
 	let hash_fragment = source_block(&fragment, "fn fragment_hash_join_plan");
-	let star_rewrite = source_block(&fragment, "fn rewrite_broadcast_star_probe");
+	let star_rewrite = source_block(&fragment, "fn rewrite_broadcast_star_probe_inner");
 	let replace_exchange = source_block(&fragment, "fn replace_exchange_with_scan");
 
 	assert!(join_boundary.contains("replay_id: JoinReplayId"));

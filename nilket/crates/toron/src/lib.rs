@@ -806,6 +806,26 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn non_inner_broadcast_distributed_result_matches_hash_for_safe_kinds() {
+		for kind in [JoinKind::LeftOuter, JoinKind::LeftSemi, JoinKind::LeftAnti] {
+			let hash_results =
+				run_distributed_join_query(non_inner_fact_dim_join_plan(kind), 16).await;
+			let broadcast_results = run_distributed_join_query_with_catalog_config(
+				non_inner_fact_dim_join_plan(kind),
+				3,
+				join_catalog_with_optimizer_facts(64 * 1024 * 1024, 1_024),
+				PlannerConfig {
+					auto_broadcast_max_build_bytes: Some(ByteCount::new(4_096)),
+					..PlannerConfig::default()
+				},
+			)
+			.await;
+
+			assert_join_results_match_digest(kind, &hash_results, &broadcast_results);
+		}
+	}
+
+	#[tokio::test]
 	async fn three_way_broadcast_star_digest_matches_hash_over_tcp() {
 		let logical = sql_fact_two_dim_join_plan();
 		let hash_results = run_distributed_join_query(logical.clone(), 16).await;
@@ -5064,6 +5084,25 @@ mod tests {
 			.expect("SQL fact-dim join plan")
 	}
 
+	fn non_inner_fact_dim_join_plan(kind: JoinKind) -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: crate::catalog::TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: crate::catalog::TableRef::new("customers"),
+				projection: None,
+			}),
+			kind,
+			on: vec![(
+				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}
+	}
+
 	fn ndv_filtered_fact_dim_join_plan() -> LogicalPlan {
 		LogicalPlan::Join {
 			left: Box::new(LogicalPlan::ScanNamed {
@@ -5530,6 +5569,27 @@ mod tests {
 			canonical_arrow_ipc_digest(broadcast_results, SortPolicy::FullRowLex)
 				.expect("right-build broadcast digest"),
 			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	fn assert_join_results_match_digest(
+		kind: JoinKind,
+		hash_results: &[RecordBatch],
+		broadcast_results: &[RecordBatch],
+	) {
+		assert!(!hash_results.is_empty(), "{kind:?}");
+		assert!(!broadcast_results.is_empty(), "{kind:?}");
+		assert_eq!(
+			broadcast_results[0].schema(),
+			hash_results[0].schema(),
+			"{kind:?}"
+		);
+		assert_eq!(
+			canonical_arrow_ipc_digest(broadcast_results, SortPolicy::FullRowLex)
+				.unwrap_or_else(|error| panic!("{kind:?} broadcast digest: {error}")),
+			canonical_arrow_ipc_digest(hash_results, SortPolicy::FullRowLex)
+				.unwrap_or_else(|error| panic!("{kind:?} hash digest: {error}")),
+			"{kind:?}"
 		);
 	}
 

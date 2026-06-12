@@ -514,7 +514,7 @@ fn fragment_broadcast_join_plan(
 	allocator: &mut FragmentIdAllocator,
 	config: FragmentPlanConfig,
 ) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
-	if join.kind != JoinKind::Inner {
+	if !safe_broadcast_physical_join_kind(join.kind) {
 		return Err(FragmentError::BroadcastNonInner { kind: join.kind });
 	}
 	reject_sort_barrier_inside_join_inputs(&join)?;
@@ -605,6 +605,15 @@ fn rewrite_broadcast_star_probe(
 	allocator: &mut FragmentIdAllocator,
 	builds: &mut Vec<BroadcastStarBuild>,
 ) -> Result<ExecutionPlan, FragmentError> {
+	rewrite_broadcast_star_probe_inner(plan, allocator, builds, true)
+}
+
+fn rewrite_broadcast_star_probe_inner(
+	plan: ExecutionPlan,
+	allocator: &mut FragmentIdAllocator,
+	builds: &mut Vec<BroadcastStarBuild>,
+	root: bool,
+) -> Result<ExecutionPlan, FragmentError> {
 	match plan {
 		ExecutionPlan::Join {
 			replay_id,
@@ -617,7 +626,11 @@ fn rewrite_broadcast_star_probe(
 			strategy,
 			output_schema,
 		} => {
-			if kind != JoinKind::Inner {
+			if root {
+				if !safe_broadcast_physical_join_kind(kind) {
+					return Err(FragmentError::BroadcastNonInner { kind });
+				}
+			} else if kind != JoinKind::Inner {
 				return Err(FragmentError::BroadcastNonInner { kind });
 			}
 			if strategy != JoinStrategy::Broadcast {
@@ -645,7 +658,9 @@ fn rewrite_broadcast_star_probe(
 				replay_id,
 				replay_eligibility,
 				left: Box::new(build_scan),
-				right: Box::new(rewrite_broadcast_star_probe(*right, allocator, builds)?),
+				right: Box::new(rewrite_broadcast_star_probe_inner(
+					*right, allocator, builds, false,
+				)?),
 				kind,
 				left_keys,
 				right_keys,
@@ -658,7 +673,9 @@ fn rewrite_broadcast_star_probe(
 			predicate,
 			disposition,
 		} => Ok(ExecutionPlan::Filter {
-			input: Box::new(rewrite_broadcast_star_probe(*input, allocator, builds)?),
+			input: Box::new(rewrite_broadcast_star_probe_inner(
+				*input, allocator, builds, root,
+			)?),
 			predicate,
 			disposition,
 		}),
@@ -667,7 +684,9 @@ fn rewrite_broadcast_star_probe(
 			exprs,
 			output_schema,
 		} => Ok(ExecutionPlan::Project {
-			input: Box::new(rewrite_broadcast_star_probe(*input, allocator, builds)?),
+			input: Box::new(rewrite_broadcast_star_probe_inner(
+				*input, allocator, builds, root,
+			)?),
 			exprs,
 			output_schema,
 		}),
@@ -690,6 +709,13 @@ fn rewrite_broadcast_star_probe(
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. } => Err(FragmentError::BroadcastProbeNotStarLinear),
 	}
+}
+
+fn safe_broadcast_physical_join_kind(kind: JoinKind) -> bool {
+	matches!(
+		kind,
+		JoinKind::Inner | JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti
+	)
 }
 
 fn producer_task(
@@ -1806,6 +1832,53 @@ mod tests {
 		assert_eq!(
 			fragment_plan(plan, config().with_worker_count(3)).expect_err("reject nested probe"),
 			FragmentError::BroadcastProbeNotStarLinear
+		);
+	}
+
+	#[test]
+	fn broadcast_safe_non_inner_physical_roots_fragment() {
+		for kind in [
+			JoinKind::RightOuter,
+			JoinKind::RightSemi,
+			JoinKind::RightAnti,
+		] {
+			let plan = join_plan_with_kind(
+				exchanged_scan(TableId(1), 1),
+				scan_plan_with_table(TableId(2), 2),
+				JoinStrategy::Broadcast,
+				kind,
+			);
+
+			let stages = fragment_plan(plan, config().with_worker_count(3))
+				.unwrap_or_else(|error| panic!("safe {kind:?} should fragment: {error:?}"));
+
+			assert_eq!(stages.len(), 2, "{kind:?}");
+			assert_eq!(stages[1].tasks.len(), 3, "{kind:?}");
+			assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)], "{kind:?}");
+		}
+	}
+
+	#[test]
+	fn broadcast_non_inner_star_child_remains_rejected_by_fragmenter() {
+		let unsafe_child = join_plan_with_kind(
+			exchanged_scan(TableId(1), 1),
+			scan_plan_with_table(TableId(2), 2),
+			JoinStrategy::Broadcast,
+			JoinKind::RightOuter,
+		);
+		let root = join_plan_with_kind(
+			exchanged_scan(TableId(3), 1),
+			unsafe_child,
+			JoinStrategy::Broadcast,
+			JoinKind::RightOuter,
+		);
+
+		assert_eq!(
+			fragment_plan(root, config().with_worker_count(3))
+				.expect_err("non-inner broadcast child remains outside broadcast-star recursion"),
+			FragmentError::BroadcastNonInner {
+				kind: JoinKind::RightOuter
+			}
 		);
 	}
 

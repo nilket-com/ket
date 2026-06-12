@@ -18,8 +18,8 @@ use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::task::RowCount;
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	AggregateFunction, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, QueryId,
-	QueryProfileHint, ScalarValue, SessionId, TableId,
+	AggregateFunction, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, JoinKind,
+	JoinStrategyIntent, LogicalPlan, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
 };
 use toron::storage::{
 	HlcBound, InMemoryStorageScan, InMemoryTableStorage, StorageWrite, TenantId as ToronTenantId,
@@ -751,6 +751,45 @@ async fn cross_coordinator_verdicts_are_shared() {
 	let _ = std::fs::remove_dir_all(fixture.data_dir);
 }
 
+#[tokio::test]
+async fn demoted_join_verdict_reaches_durable_lane() {
+	let fixture = LiveWendelonFixture::start(124).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let coordinator = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		Arc::clone(&runtime_evidence),
+		1,
+	);
+
+	let batch = execute_demoted_star_query(&coordinator).await;
+	assert!(
+		batch.num_rows() > 0,
+		"demoted star query should return user rows"
+	);
+	assert_eq!(
+		optimizer_runtime_flat_star_verdict_count(&coordinator).await,
+		1,
+		"demoted star query should flush a durable flat-star verdict"
+	);
+
+	drop(coordinator);
+	drop(runtime_evidence);
+	let restarted_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let restarted_coordinator =
+		durable_star_coordinator(catalog, storage, Arc::clone(&restarted_runtime_evidence), 0);
+
+	assert_eq!(
+		optimizer_runtime_flat_star_verdict_count(&restarted_coordinator).await,
+		1,
+		"fresh coordinator/evidence handle should read the demoted query verdict"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
 const DURABLE_STAR_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
 	FROM orders o \
 	INNER JOIN customers c ON o.customer_id = c.id \
@@ -806,6 +845,83 @@ async fn execute_star_query(coordinator: &QueryCoordinator) -> RecordBatch {
 	execute_single_coordinator_batch(coordinator, &plan).await
 }
 
+async fn execute_demoted_star_query(coordinator: &QueryCoordinator) -> RecordBatch {
+	let plan = demoted_durable_star_plan();
+	execute_single_coordinator_batch(coordinator, &plan).await
+}
+
+fn demoted_durable_star_plan() -> LogicalPlan {
+	let orders = TableRef::new("orders");
+	let customers = TableRef::new("customers");
+	let products = TableRef::new("products");
+	let stores = TableRef::new("stores");
+
+	let filtered_outer_join = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: orders.clone(),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: customers.clone(),
+				projection: None,
+			}),
+			kind: JoinKind::LeftOuter,
+			on: vec![(
+				Expr::qualified_column(orders.clone(), "customer_id"),
+				Expr::qualified_column(customers.clone(), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::Gt(
+			Box::new(Expr::qualified_column(customers.clone(), "tier")),
+			Box::new(Expr::Literal(ScalarValue::Int64(Some(0)))),
+		),
+	};
+	let with_products = LogicalPlan::Join {
+		left: Box::new(filtered_outer_join),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: products.clone(),
+			projection: None,
+		}),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(orders.clone(), "product_id"),
+			Expr::qualified_column(products.clone(), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let with_stores = LogicalPlan::Join {
+		left: Box::new(with_products),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: stores.clone(),
+			projection: None,
+		}),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(orders.clone(), "store_id"),
+			Expr::qualified_column(stores.clone(), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+
+	LogicalPlan::Project {
+		input: Box::new(with_stores),
+		exprs: vec![
+			Expr::qualified_column(orders, "id"),
+			Expr::qualified_column(customers, "id"),
+			Expr::qualified_column(products, "id"),
+			Expr::qualified_column(stores, "id"),
+		],
+		output_names: vec![
+			Some("order_id".to_string()),
+			Some("customer_id".to_string()),
+			Some("product_id".to_string()),
+			Some("store_id".to_string()),
+		],
+	}
+}
+
 async fn optimizer_runtime_verdict_count(coordinator: &QueryCoordinator) -> i64 {
 	let plan = toron::sql_planner::SqlPlanner::new()
 		.plan("SELECT * FROM information_schema.optimizer_runtime_verdicts")
@@ -822,6 +938,20 @@ async fn optimizer_runtime_verdict_count(coordinator: &QueryCoordinator) -> i64 
 			(kind == "flat_star" && verdict == "over_eager").then_some(*count)
 		})
 		.unwrap_or(0)
+}
+
+async fn optimizer_runtime_flat_star_verdict_count(coordinator: &QueryCoordinator) -> i64 {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_runtime_verdicts")
+		.expect("plan optimizer runtime verdicts query");
+	let batch = execute_single_coordinator_batch(coordinator, &plan).await;
+	let kinds = string_column_values(&batch, 0);
+	let counts = int64_column_values(&batch, 2);
+	kinds
+		.iter()
+		.zip(counts.iter())
+		.filter_map(|(kind, count)| (kind == "flat_star").then_some(*count))
+		.sum()
 }
 
 async fn execute_single_coordinator_batch(
@@ -850,7 +980,15 @@ async fn durable_star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>)
 		])),
 		"id",
 	);
-	let customers = durable_star_id_descriptor(222, "customers");
+	let customers = durable_star_descriptor(
+		222,
+		"customers",
+		Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("tier", DataType::Int64, false),
+		])),
+		"id",
+	);
 	let products = durable_star_id_descriptor(223, "products");
 	let stores = durable_star_id_descriptor(224, "stores");
 
@@ -885,9 +1023,12 @@ async fn durable_star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>)
 		storage.as_ref(),
 		TableId(222),
 		&customers,
-		durable_star_id_batch(
+		durable_star_record_batch(
 			customers.arrow_schema().expect("customers schema").into(),
-			&[10, 20, 30, 40],
+			vec![
+				Arc::new(Int64Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+				Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+			],
 		),
 	)
 	.await;
@@ -918,7 +1059,7 @@ async fn durable_star_fixture() -> (Arc<MockCatalog>, Arc<InMemoryTableStorage>)
 fn seed_durable_star_facts(catalog: &mut MockCatalog) {
 	for (table, rows, ndv) in [
 		("orders", 100_000, vec![(1, 100), (2, 100), (3, 100)]),
-		("customers", 5_000, vec![(0, 100)]),
+		("customers", 5_000, vec![(0, 100), (1, 4)]),
 		("products", 1_000, vec![(0, 100)]),
 		("stores", 100, vec![(0, 100)]),
 	] {

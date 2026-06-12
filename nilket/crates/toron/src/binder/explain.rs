@@ -72,6 +72,7 @@ pub(crate) struct OptimizerTrace {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct OptimizerExplainRenderTrace {
 	pub(super) scan_filters: Vec<ScanFilterRenderReceipt>,
+	pub(super) outer_join_demotions: Vec<OuterJoinDemotionReceipt>,
 	pub(super) join_order_edges: Vec<JoinOrderEdgeEvidence>,
 	pub(super) join_order: JoinOrderRenderState,
 	// ADR 194: galaxy graph evidence rides a sibling field, additive to the `join_order` tree receipt
@@ -472,6 +473,13 @@ pub(super) fn optimizer_explain_plan(
 			.collect::<Result<Vec<_>, _>>()?,
 	);
 	if let Some(render_trace) = render_trace {
+		rows.extend(
+			render_trace
+				.outer_join_demotions
+				.iter()
+				.map(optimizer_explain_outer_join_demotion_row)
+				.collect::<Result<Vec<_>, _>>()?,
+		);
 		match &render_trace.join_order {
 			JoinOrderRenderState::None => {}
 			JoinOrderRenderState::ObservedSnowflake(evidence) => {
@@ -1544,6 +1552,48 @@ pub(super) fn optimizer_explain_row(
 		ScalarValue::Int64(threshold_bytes),
 		ScalarValue::Int64(rejected_side_bytes),
 	])
+}
+
+pub(super) fn optimizer_explain_outer_join_demotion_row(
+	receipt: &OuterJoinDemotionReceipt,
+) -> Result<Vec<ScalarValue>, BindingError> {
+	Ok(vec![
+		ScalarValue::Utf8(Some("outer_join_demotion".to_string())),
+		ScalarValue::Utf8(Some("prebind".to_string())),
+		ScalarValue::Utf8(Some(format!(
+			"{}->{}",
+			join_kind_label(receipt.from_kind),
+			join_kind_label(receipt.to_kind)
+		))),
+		ScalarValue::Utf8(Some(format!(
+			"null_rejecting_filter:{}",
+			receipt.conjunct_text
+		))),
+		ScalarValue::Utf8(Some(receipt.conjunct_text.clone())),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Utf8(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+		ScalarValue::Int64(None),
+	])
+}
+
+pub(super) fn join_kind_label(kind: JoinKind) -> &'static str {
+	match kind {
+		JoinKind::Inner => "inner",
+		JoinKind::LeftOuter => "left_outer",
+		JoinKind::RightOuter => "right_outer",
+		JoinKind::FullOuter => "full_outer",
+		JoinKind::LeftSemi => "left_semi",
+		JoinKind::RightSemi => "right_semi",
+		JoinKind::LeftAnti => "left_anti",
+		JoinKind::RightAnti => "right_anti",
+	}
 }
 
 pub(super) fn optimizer_explain_join_order_row(

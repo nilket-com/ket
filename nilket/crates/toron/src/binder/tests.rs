@@ -932,6 +932,477 @@ async fn auto_broadcast_sql_unhinted_tiny_left_join_infers_broadcast() {
 }
 
 #[tokio::test]
+async fn left_outer_null_rejecting_right_filter_binds_inner_and_broadcasts_filtered_dim() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o LEFT JOIN customers c \
+			 ON o.customer_id = c.id WHERE c.region = 'north'",
+		)
+		.expect("plan null-rejected outer join");
+
+	let (plan, trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind demoted outer join");
+
+	assert_eq!(render_trace.outer_join_demotions.len(), 1);
+	assert_eq!(
+		render_trace.outer_join_demotions[0].from_kind,
+		JoinKind::LeftOuter
+	);
+	assert_eq!(
+		render_trace.outer_join_demotions[0].to_kind,
+		JoinKind::Inner
+	);
+	assert_eq!(trace.join_decisions.len(), 1);
+	assert_eq!(trace.join_decisions[0].strategy, JoinStrategy::Broadcast);
+	assert_eq!(
+		trace.join_decisions[0].placement,
+		JoinPhysicalPlacement::SwappedRightBuild
+	);
+	let ExecutionPlan::Join {
+		kind,
+		strategy,
+		left,
+		..
+	} = first_join_plan(&plan)
+	else {
+		panic!("demoted plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::Inner);
+	assert_eq!(*strategy, JoinStrategy::Broadcast);
+	assert!(
+		first_filter_scan_state(left).is_some(),
+		"demotion-owned predicate should move to the broadcast build input"
+	);
+}
+
+#[tokio::test]
+async fn rune_filter_after_left_join_gets_same_demotion_as_sql() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	let sql = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o LEFT JOIN customers c \
+			 ON o.customer_id = c.id WHERE c.region = 'north'",
+		)
+		.expect("plan SQL null-rejected outer join");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o")
+                .left_join(
+                    ctx.table("customers").alias("c"),
+                    qcol("o", "customer_id").eq(qcol("c", "id"))
+                )
+                .filter(qcol("c", "region").eq(lit_str("north")))
+        }
+    "#,
+	)
+	.await;
+
+	let mut observed = Vec::new();
+	for (source, logical) in [("sql", sql), ("rune", rune)] {
+		let (plan, _trace, render_trace) =
+			bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+				.await
+				.unwrap_or_else(|err| panic!("{source} demoted outer join should bind: {err}"));
+
+		assert_eq!(
+			render_trace.outer_join_demotions.len(),
+			1,
+			"{source} should emit one demotion receipt"
+		);
+		assert_eq!(
+			render_trace.outer_join_demotions[0].from_kind,
+			JoinKind::LeftOuter,
+			"{source} should demote a left outer join"
+		);
+		assert_eq!(
+			render_trace.outer_join_demotions[0].to_kind,
+			JoinKind::Inner,
+			"{source} should demote to inner"
+		);
+		let ExecutionPlan::Join { kind, .. } = first_join_plan(&plan) else {
+			panic!("{source} demoted plan should contain a join");
+		};
+		assert_eq!(*kind, JoinKind::Inner, "{source} effective join kind");
+		observed.push((
+			render_trace.outer_join_demotions[0].from_kind,
+			render_trace.outer_join_demotions[0].to_kind,
+			*kind,
+		));
+	}
+	assert_eq!(
+		observed[0], observed[1],
+		"Rune should preserve SQL demotion receipt and effective join kind"
+	);
+}
+
+#[tokio::test]
+async fn is_null_on_null_supplied_side_does_not_demote() {
+	let catalog = join_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o LEFT JOIN customers c \
+			 ON o.customer_id = c.id WHERE c.region IS NULL",
+		)
+		.expect("plan IS NULL outer join filter");
+
+	let (plan, trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind non-demoted outer join");
+
+	assert!(render_trace.outer_join_demotions.is_empty());
+	assert_eq!(trace.join_decisions.len(), 1);
+	let ExecutionPlan::Join { kind, strategy, .. } = first_join_plan(&plan) else {
+		panic!("plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::LeftOuter);
+	assert_eq!(*strategy, JoinStrategy::HashPartitioned);
+}
+
+#[tokio::test]
+async fn full_outer_one_side_null_rejection_demotes_stepwise() {
+	let catalog = join_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o FULL OUTER JOIN customers c \
+			 ON o.customer_id = c.id WHERE o.id IS NOT NULL",
+		)
+		.expect("plan full outer stepwise demotion");
+
+	let (plan, trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind stepwise demoted full outer join");
+
+	assert_eq!(render_trace.outer_join_demotions.len(), 1);
+	assert_eq!(
+		render_trace.outer_join_demotions[0].from_kind,
+		JoinKind::FullOuter
+	);
+	assert_eq!(
+		render_trace.outer_join_demotions[0].to_kind,
+		JoinKind::LeftOuter
+	);
+	assert_eq!(
+		trace.join_decisions[0].strategy,
+		JoinStrategy::HashPartitioned
+	);
+	let ExecutionPlan::Join { kind, .. } = first_join_plan(&plan) else {
+		panic!("plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::LeftOuter);
+}
+
+#[tokio::test]
+async fn full_outer_both_sides_null_rejection_demotes_to_inner() {
+	let catalog = join_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o FULL OUTER JOIN customers c \
+			 ON o.customer_id = c.id WHERE o.id IS NOT NULL AND c.id IS NOT NULL",
+		)
+		.expect("plan full outer both-side demotion");
+
+	let (plan, _trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind inner-demoted full outer join");
+
+	assert_eq!(render_trace.outer_join_demotions.len(), 1);
+	assert_eq!(
+		render_trace.outer_join_demotions[0].from_kind,
+		JoinKind::FullOuter
+	);
+	assert_eq!(
+		render_trace.outer_join_demotions[0].to_kind,
+		JoinKind::Inner
+	);
+	let ExecutionPlan::Join { kind, .. } = first_join_plan(&plan) else {
+		panic!("plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::Inner);
+}
+
+#[tokio::test]
+async fn full_outer_without_demote_stays_hash_non_inner() {
+	let catalog = join_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o FULL OUTER JOIN customers c \
+			 ON o.customer_id = c.id",
+		)
+		.expect("plan full outer without null rejection");
+
+	let (plan, trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind non-demoted full outer join");
+
+	assert!(render_trace.outer_join_demotions.is_empty());
+	assert_eq!(
+		trace.join_decisions[0].strategy,
+		JoinStrategy::HashPartitioned
+	);
+	let ExecutionPlan::Join { kind, .. } = first_join_plan(&plan) else {
+		panic!("plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::FullOuter);
+}
+
+#[tokio::test]
+async fn positive_in_demotes_negated_in_does_not() {
+	let catalog = join_catalog();
+	let join = LogicalPlan::Join {
+		left: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("orders"),
+			projection: None,
+		}),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("customers"),
+			projection: None,
+		}),
+		kind: JoinKind::LeftOuter,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			Expr::qualified_column(TableRef::new("customers"), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	let positive = LogicalPlan::Filter {
+		input: Box::new(join.clone()),
+		predicate: Expr::InList {
+			expr: Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+			list: vec![Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))],
+			negated: false,
+		},
+	};
+	let negated = LogicalPlan::Filter {
+		input: Box::new(join),
+		predicate: Expr::InList {
+			expr: Box::new(Expr::qualified_column(TableRef::new("customers"), "region")),
+			list: vec![Expr::Literal(ScalarValue::Utf8(Some("north".to_string())))],
+			negated: true,
+		},
+	};
+
+	let (positive_plan, _, positive_render) =
+		bind_with_explain_trace(&positive, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind positive IN demotion");
+	assert_eq!(positive_render.outer_join_demotions.len(), 1);
+	let ExecutionPlan::Join { kind, .. } = first_join_plan(&positive_plan) else {
+		panic!("positive IN plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::Inner);
+
+	let (negated_plan, _, negated_render) =
+		bind_with_explain_trace(&negated, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind negated IN without demotion");
+	assert!(negated_render.outer_join_demotions.is_empty());
+	let ExecutionPlan::Join { kind, .. } = first_join_plan(&negated_plan) else {
+		panic!("negated IN plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::LeftOuter);
+}
+
+#[tokio::test]
+async fn positive_like_demotes_negated_like_does_not() {
+	let catalog = join_catalog();
+	let positive = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o LEFT JOIN customers c \
+			 ON o.customer_id = c.id WHERE c.region LIKE 'nor%'",
+		)
+		.expect("plan LIKE demotion");
+	let negated = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o LEFT JOIN customers c \
+			 ON o.customer_id = c.id WHERE c.region NOT LIKE 'nor%'",
+		)
+		.expect("plan NOT LIKE no-demotion");
+
+	let (positive_plan, _, positive_render) =
+		bind_with_explain_trace(&positive, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind positive LIKE demotion");
+	assert_eq!(positive_render.outer_join_demotions.len(), 1);
+	let ExecutionPlan::Join { kind, .. } = first_join_plan(&positive_plan) else {
+		panic!("positive LIKE plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::Inner);
+
+	let (negated_plan, _, negated_render) =
+		bind_with_explain_trace(&negated, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind negated LIKE without demotion");
+	assert!(negated_render.outer_join_demotions.is_empty());
+	let ExecutionPlan::Join { kind, .. } = first_join_plan(&negated_plan) else {
+		panic!("negated LIKE plan should contain a join");
+	};
+	assert_eq!(*kind, JoinKind::LeftOuter);
+}
+
+#[tokio::test]
+async fn left_outer_right_build_auto_broadcast_executes_as_physical_right_outer() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	let logical = LogicalPlan::Join {
+		left: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("orders"),
+			projection: None,
+		}),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("customers"),
+			projection: None,
+		}),
+		kind: JoinKind::LeftOuter,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			Expr::qualified_column(TableRef::new("customers"), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+
+	let plan = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind safe left outer broadcast");
+	let output_schema = plan.schema();
+	assert_eq!(
+		field_names(&output_schema),
+		vec!["id", "customer_id", "id", "region"]
+	);
+	let ExecutionPlan::Join { kind, strategy, .. } = first_join_plan(&plan) else {
+		panic!("plan should contain broadcast join");
+	};
+	assert_eq!(*kind, JoinKind::RightOuter);
+	assert_eq!(*strategy, JoinStrategy::Broadcast);
+}
+
+#[tokio::test]
+async fn right_outer_natural_left_build_auto_broadcast_keeps_physical_right_outer() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	let logical = LogicalPlan::Join {
+		left: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("customers"),
+			projection: None,
+		}),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("orders"),
+			projection: None,
+		}),
+		kind: JoinKind::RightOuter,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("customers"), "id"),
+			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+
+	let (plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect("bind right outer preserved-probe broadcast");
+	assert_eq!(
+		trace.join_decisions[0].placement,
+		JoinPhysicalPlacement::Natural
+	);
+	let ExecutionPlan::Join { kind, strategy, .. } = first_join_plan(&plan) else {
+		panic!("plan should contain broadcast join");
+	};
+	assert_eq!(*kind, JoinKind::RightOuter);
+	assert_eq!(*strategy, JoinStrategy::Broadcast);
+}
+
+#[tokio::test]
+async fn left_semi_and_left_anti_auto_broadcast_build_right_without_restore_projection() {
+	let mut catalog = join_catalog();
+	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
+	seed_byte_upper_bound(&mut catalog, "customers", 1_024);
+
+	for (declared, physical) in [
+		(JoinKind::LeftSemi, JoinKind::RightSemi),
+		(JoinKind::LeftAnti, JoinKind::RightAnti),
+	] {
+		let logical = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			kind: declared,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy_intent: JoinStrategyIntent::Auto,
+		};
+
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind one-sided safe broadcast");
+		assert_eq!(trace.join_decisions[0].strategy, JoinStrategy::Broadcast);
+		assert_eq!(
+			trace.join_decisions[0].placement,
+			JoinPhysicalPlacement::SwappedRightBuild
+		);
+		assert!(
+			!matches!(plan, ExecutionPlan::Project { .. }),
+			"one-sided broadcast must not use the two-sided restore projection"
+		);
+		let output_schema = plan.schema();
+		assert_eq!(field_names(&output_schema), vec!["id", "customer_id"]);
+		let ExecutionPlan::Join { kind, .. } = first_join_plan(&plan) else {
+			panic!("plan should contain broadcast join");
+		};
+		assert_eq!(*kind, physical);
+	}
+}
+
+#[tokio::test]
+async fn direct_non_inner_broadcast_pin_stays_rejected() {
+	let catalog = join_catalog();
+	let logical = LogicalPlan::Join {
+		left: Box::new(exchanged_named_scan("customers", "id", 1)),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("orders"),
+			projection: None,
+		}),
+		kind: JoinKind::RightOuter,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("customers"), "id"),
+			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::Direct,
+		},
+	};
+
+	let err = bind(&logical, &catalog, &auto_broadcast_config(4_096))
+		.await
+		.expect_err("direct non-inner broadcast remains an authoring error");
+	assert!(
+		err.to_string()
+			.contains("broadcast join is only supported for INNER joins"),
+		"{err}"
+	);
+}
+
+#[tokio::test]
 async fn sql_unhinted_unknown_and_large_joins_stay_hash() {
 	let logical = SqlPlanner::new()
 		.plan("SELECT * FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
@@ -12364,6 +12835,34 @@ async fn explain_result_schema_is_stable() {
 			("rejected_side_bytes", &DataType::Int64, true),
 		]
 	);
+}
+
+#[tokio::test]
+async fn explain_reports_null_rejected_outer_join_demotion() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"EXPLAIN SELECT * FROM orders o LEFT JOIN customers c \
+			 ON o.customer_id = c.id WHERE c.region = 'north'",
+		)
+		.expect("plan EXPLAIN demoted outer join");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &join_catalog(), &PlannerConfig::default()).await;
+	let row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("outer_join_demotion".to_string())))
+		.expect("outer join demotion receipt row");
+
+	assert_eq!(row[1], ScalarValue::Utf8(Some("prebind".to_string())));
+	assert_eq!(
+		row[2],
+		ScalarValue::Utf8(Some("left_outer->inner".to_string()))
+	);
+	assert_utf8_contains(&row[3], "null_rejecting_filter:");
+	assert_utf8_contains(&row[3], "region");
+	assert_utf8_contains(&row[4], "region");
+	assert_eq!(row[5], ScalarValue::Utf8(None));
+	assert_eq!(row[6], ScalarValue::Utf8(None));
 }
 
 #[tokio::test]

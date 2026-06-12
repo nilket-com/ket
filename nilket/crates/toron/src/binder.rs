@@ -59,6 +59,7 @@ mod decision_log;
 mod explain;
 mod join;
 mod join_order;
+mod outer_join_demotion;
 mod pushdown;
 mod runtime_evidence;
 mod selectivity;
@@ -69,6 +70,7 @@ use self::decision_log::*;
 use self::explain::*;
 use self::join::*;
 use self::join_order::*;
+use self::outer_join_demotion::*;
 use self::pushdown::*;
 use self::selectivity::*;
 
@@ -195,9 +197,14 @@ pub(crate) async fn bind_with_trace(
 ) -> Result<(ExecutionPlan, OptimizerTrace), BindingError> {
 	let mut trace = OptimizerTrace::default();
 	let mut render_trace = None;
-	let plan = Binder::new(catalog, config)
+	let binder = Binder::new(catalog, config);
+	let normalized_plan = match plan {
+		LogicalPlan::Explain { .. } => plan.clone(),
+		_ => binder.demote_null_rejected_outer_joins(plan).await?.0,
+	};
+	let plan = binder
 		.bind_plan_with_trace(
-			plan,
+			&normalized_plan,
 			&mut trace,
 			&mut render_trace,
 			JoinOrderSourceCapture::Off,
@@ -219,9 +226,16 @@ async fn bind_with_explain_trace(
 	// ADR 208: capture the bind-entry tree step before the binder is consumed so observed
 	// star/snowflake receipts render on the same margin that actuation used earlier in this bind.
 	let tree_join_order_soft_margin_step = binder.tree_join_order_soft_margin_step;
+	let (normalized_plan, outer_join_demotions) =
+		binder.demote_null_rejected_outer_joins(plan).await?;
+	if let Some(render_trace) = render_trace.as_mut() {
+		render_trace
+			.outer_join_demotions
+			.extend(outer_join_demotions);
+	}
 	let plan = binder
 		.bind_plan_with_trace(
-			plan,
+			&normalized_plan,
 			&mut trace,
 			&mut render_trace,
 			JoinOrderSourceCapture::On,
@@ -2022,6 +2036,18 @@ impl<'a> Binder<'a> {
 
 		let join_index = trace.join_decisions.len();
 		let replay_id = JoinReplayId(join_index as u32);
+		if matches!(
+			strategy_intent,
+			JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				..
+			}
+		) && kind != JoinKind::Inner
+		{
+			return Err(BindingError::UnsupportedExpression {
+				message: "broadcast join is only supported for INNER joins".to_string(),
+			});
+		}
 		let left_probe_scan_linear = broadcast_probe_is_scan_linear(&left_plan.plan);
 		let right_probe_scan_linear = broadcast_probe_is_scan_linear(&right_plan.plan);
 		if let Some(render_trace) = render_trace.as_mut() {
@@ -2127,20 +2153,22 @@ impl<'a> Binder<'a> {
 		}
 
 		validate_strategy_shape(
-			kind,
+			mirrored_broadcast_physical_kind(kind, decision.placement),
 			decision.strategy,
 			&left_plan.plan,
 			&right_plan.plan,
 			&left_keys,
 			&right_keys,
 		)?;
-		let physical_output_schema = join_schema(kind, &left_plan.schema(), &right_plan.schema());
+		let physical_kind = mirrored_broadcast_physical_kind(kind, decision.placement);
+		let physical_output_schema =
+			join_schema(physical_kind, &left_plan.schema(), &right_plan.schema());
 		let join_plan = ExecutionPlan::Join {
 			replay_id,
 			replay_eligibility: broadcast_replay_eligibility(strategy_intent),
 			left: Box::new(left_plan.plan),
 			right: Box::new(right_plan.plan),
-			kind,
+			kind: physical_kind,
 			left_keys,
 			right_keys,
 			strategy: decision.strategy,
@@ -2156,6 +2184,16 @@ impl<'a> Binder<'a> {
 		);
 		let plan = match decision.placement {
 			JoinPhysicalPlacement::Natural => join_plan,
+			JoinPhysicalPlacement::SwappedRightBuild
+				if matches!(kind, JoinKind::LeftSemi | JoinKind::LeftAnti) =>
+			{
+				if physical_output_schema.as_ref() != declared_output_schema.as_ref() {
+					return Err(BindingError::UnsupportedExpression {
+						message: "right-build one-sided broadcast join schema mismatch".to_string(),
+					});
+				}
+				join_plan
+			}
 			JoinPhysicalPlacement::SwappedRightBuild => restore_declared_join_order_project(
 				join_plan,
 				&physical_output_schema,

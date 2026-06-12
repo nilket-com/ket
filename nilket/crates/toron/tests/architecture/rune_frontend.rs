@@ -2047,7 +2047,8 @@ pub(crate) fn adr129_tiny_broadcast_requires_hard_byte_upper_bound() {
 	let binder = binder_source();
 	let choose_auto = source_block(&binder, "fn choose_auto_join_strategy");
 
-	assert!(choose_auto.contains("kind != JoinKind::Inner"));
+	assert!(choose_auto.contains("let placement_rule = broadcast_physical_placement(kind)"));
+	assert!(choose_auto.contains("BroadcastPlacementRule::Never"));
 	assert!(choose_auto.contains("MissingBuildByteUpperBound"));
 	assert!(choose_auto.contains("effective_auto_broadcast_threshold"));
 	assert!(choose_auto.contains("BuildByteUpperBoundAboveThreshold"));

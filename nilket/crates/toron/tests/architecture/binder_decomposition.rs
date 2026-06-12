@@ -1,12 +1,13 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 9] = [
+const BINDER_MODULES: [&str; 10] = [
 	"aggregate",
 	"arithmetic",
 	"decision_log",
 	"explain",
 	"join",
 	"join_order",
+	"outer_join_demotion",
 	"pushdown",
 	"runtime_evidence",
 	"selectivity",
@@ -23,6 +24,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/explain.rs",
 		"src/binder/join.rs",
 		"src/binder/join_order.rs",
+		"src/binder/outer_join_demotion.rs",
 		"src/binder/pushdown.rs",
 		"src/binder/runtime_evidence.rs",
 		"src/binder/selectivity.rs",
@@ -56,6 +58,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"pub(super) fn table_name",
 		"pub(super) fn choose_join_strategy",
 		"pub(super) fn analyze",
+		"pub(super) fn demote_null_rejected_outer_joins",
 		"pub(super) fn predicate_pushdown_plan",
 		"pub(super) fn predicate_includes_primary_key_equality",
 		"fn binder_resolves_columns_to_ordinals",
