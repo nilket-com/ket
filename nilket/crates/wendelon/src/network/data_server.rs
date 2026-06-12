@@ -13624,16 +13624,16 @@ fn slab_stats_query_outcome(
 
 fn encoded_stats_predicate(
 	data_type: &DataType,
-	predicate: &pbc::ColumnPredicateV1,
+	predicate: &pbc::ColumnPredicate,
 ) -> std::io::Result<Option<EncodedStatsPredicate>> {
 	match predicate.comparison {
-		pbc::ColumnPredicateComparisonV1::Eq => {
+		pbc::ColumnPredicateComparison::Eq => {
 			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
 				return Ok(None);
 			};
 			Ok(Some(EncodedStatsPredicate::AnyOf(vec![value])))
 		}
-		pbc::ColumnPredicateComparisonV1::Gt | pbc::ColumnPredicateComparisonV1::Gte => {
+		pbc::ColumnPredicateComparison::Gt | pbc::ColumnPredicateComparison::Gte => {
 			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
 				return Ok(None);
 			};
@@ -13642,7 +13642,7 @@ fn encoded_stats_predicate(
 				upper: None,
 			}))
 		}
-		pbc::ColumnPredicateComparisonV1::Lt | pbc::ColumnPredicateComparisonV1::Lte => {
+		pbc::ColumnPredicateComparison::Lt | pbc::ColumnPredicateComparison::Lte => {
 			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
 				return Ok(None);
 			};
@@ -13651,8 +13651,8 @@ fn encoded_stats_predicate(
 				upper: Some(value),
 			}))
 		}
-		pbc::ColumnPredicateComparisonV1::InList => {
-			let pbc::ColumnPredicateLiteralV1::List(literals) = &predicate.literal else {
+		pbc::ColumnPredicateComparison::InList => {
+			let pbc::ColumnPredicateLiteral::List(literals) = &predicate.literal else {
 				return Ok(None);
 			};
 			let mut encoded = Vec::with_capacity(literals.len());
@@ -13669,27 +13669,26 @@ fn encoded_stats_predicate(
 
 fn encode_stats_literal(
 	data_type: &DataType,
-	literal: &pbc::ColumnPredicateLiteralV1,
+	literal: &pbc::ColumnPredicateLiteral,
 ) -> std::io::Result<Option<Vec<u8>>> {
 	match (data_type, literal) {
-		(DataType::Int64, pbc::ColumnPredicateLiteralV1::Int(value))
-		| (DataType::Int64, pbc::ColumnPredicateLiteralV1::Ts(value))
+		(DataType::Int64, pbc::ColumnPredicateLiteral::Int(value))
+		| (DataType::Int64, pbc::ColumnPredicateLiteral::Ts(value))
 		| (
 			DataType::Timestamp(TimeUnit::Millisecond, _),
-			pbc::ColumnPredicateLiteralV1::Int(value),
+			pbc::ColumnPredicateLiteral::Int(value),
 		)
-		| (
-			DataType::Timestamp(TimeUnit::Millisecond, _),
-			pbc::ColumnPredicateLiteralV1::Ts(value),
-		) => encode_signed_stat_value(*value, 8).map(Some),
-		(DataType::Int32, pbc::ColumnPredicateLiteralV1::Int(value))
-		| (DataType::Int32, pbc::ColumnPredicateLiteralV1::Ts(value)) => {
+		| (DataType::Timestamp(TimeUnit::Millisecond, _), pbc::ColumnPredicateLiteral::Ts(value)) => {
+			encode_signed_stat_value(*value, 8).map(Some)
+		}
+		(DataType::Int32, pbc::ColumnPredicateLiteral::Int(value))
+		| (DataType::Int32, pbc::ColumnPredicateLiteral::Ts(value)) => {
 			let Ok(value) = i32::try_from(*value) else {
 				return Ok(None);
 			};
 			encode_signed_stat_value(i64::from(value), 4).map(Some)
 		}
-		(DataType::Utf8 | DataType::LargeUtf8, pbc::ColumnPredicateLiteralV1::Str(bytes)) => {
+		(DataType::Utf8 | DataType::LargeUtf8, pbc::ColumnPredicateLiteral::Str(bytes)) => {
 			if std::str::from_utf8(bytes).is_err() {
 				return Ok(None);
 			}
@@ -17358,7 +17357,7 @@ mod tests {
 	use crate::crypto::CryptoManager;
 	use crate::integration::compute::{
 		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
-		SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+		SchemaMutationKind, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::pbc::{
@@ -17367,14 +17366,14 @@ mod tests {
 	use crate::schema::{
 		AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 		AggregateRequest, AggregateRequestId, AggregateResponse, AggregateStatus, ByteCount,
-		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, DurationMillis, IndexArrowTypeTag,
+		ClusteringColumnSpec, ColumnLocalityDescriptor, DurationMillis, IndexArrowTypeTag,
 		IndexKeyEncoding, IndexObjectId, LocalityPolicy, LocalityRange, LocationCount,
-		MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptorV1, ProjectionFunctionV1,
+		MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptor, ProjectionFunction,
 		RecordLayoutPolicy, RetentionWindowMillis, RowCount, RowIdentityPolicy,
 		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-		SchemaEvolutionPolicyV1, SecondaryIndexDescriptor, SecondaryIndexKeyDescriptor,
+		SchemaEvolutionPolicy, SecondaryIndexDescriptor, SecondaryIndexKeyDescriptor,
 		SecondaryIndexLifecycleComplete, SlabRecordHeader, TableObjectId, TableRetentionPolicy,
-		TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1, column_projection_prefix_ranges,
+		TableSchemaCatalog, TableSpreadLocalityDescriptor, column_projection_prefix_ranges,
 		encode_secondary_index_descriptor, encode_secondary_index_lifecycle_complete,
 		encode_table_schema_descriptor_v1, encode_table_write_row_count, table_row_identity,
 		table_spread_prefix_ranges, write_payload_schema,
@@ -17565,9 +17564,9 @@ mod tests {
 			"analytics",
 			"events",
 			&typed_table_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -17575,7 +17574,7 @@ mod tests {
 	fn multirow_typed_table_descriptor() -> TableSchemaDescriptor {
 		let mut descriptor = typed_table_descriptor();
 		descriptor.locality_policy =
-			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptor {
 				spread_factor: 1,
 				prefix_bits: 63,
 			});
@@ -17598,7 +17597,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -17613,7 +17612,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnlyContentHash,
 			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -17625,9 +17624,9 @@ mod tests {
 			"analytics",
 			"identity_events",
 			&typed_table_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::IdentityProjection,
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -17639,18 +17638,18 @@ mod tests {
 			"analytics",
 			"events",
 			&typed_table_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
-				columns: vec![ClusteringColumnSpecV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
+				columns: vec![ClusteringColumnSpec {
 					name: "id".to_owned(),
 					width_bits: 16,
 					string_prefix_bytes: None,
 				}],
-				projection: ProjectionFunctionV1::ZOrder,
+				projection: ProjectionFunction::ZOrder,
 				spread_factor: 4,
 				prefix_bits: 16,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -17739,11 +17738,11 @@ mod tests {
 
 	fn typed_table_schema_update(descriptor: &TableSchemaDescriptor) -> Vec<u8> {
 		let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
-		let envelope = SchemaUpdateEnvelopeV1 {
+		let envelope = SchemaUpdateEnvelope {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 			origin: SchemaIntentOrigin::ComputeClient,
 			tenant_id: tenant(),
-			object: SchemaObjectRefV1 {
+			object: SchemaObjectRef {
 				kind: SchemaObjectKind::Table,
 				namespace: descriptor.namespace.clone(),
 				name: descriptor.table_name.clone(),
@@ -17751,7 +17750,7 @@ mod tests {
 			expected_generation: SchemaGeneration::ZERO,
 			requested_generation: SchemaGeneration::new(descriptor.schema_generation),
 			intent_id: SchemaIntentId::new([0x37; 16]),
-			mutation: SchemaMutationKindV1::Create,
+			mutation: SchemaMutationKind::Create,
 			payload,
 		};
 		encode_schema_update_envelope_v1(&envelope).unwrap()
@@ -17778,11 +17777,11 @@ mod tests {
 
 	fn secondary_index_schema_update(descriptor: &SecondaryIndexDescriptor) -> Vec<u8> {
 		let payload = encode_secondary_index_descriptor(descriptor).unwrap();
-		let envelope = SchemaUpdateEnvelopeV1 {
+		let envelope = SchemaUpdateEnvelope {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 			origin: SchemaIntentOrigin::ComputeClient,
 			tenant_id: tenant(),
-			object: SchemaObjectRefV1 {
+			object: SchemaObjectRef {
 				kind: SchemaObjectKind::Index,
 				namespace: descriptor.namespace.clone(),
 				name: descriptor.index_name.clone(),
@@ -17790,7 +17789,7 @@ mod tests {
 			expected_generation: SchemaGeneration::ZERO,
 			requested_generation: SchemaGeneration::new(1),
 			intent_id: SchemaIntentId::new([0x52; 16]),
-			mutation: SchemaMutationKindV1::Create,
+			mutation: SchemaMutationKind::Create,
 			payload,
 		};
 		encode_schema_update_envelope_v1(&envelope).unwrap()
@@ -17805,11 +17804,11 @@ mod tests {
 			replica_id,
 		})
 		.unwrap();
-		let envelope = SchemaUpdateEnvelopeV1 {
+		let envelope = SchemaUpdateEnvelope {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 			origin: SchemaIntentOrigin::WendelonOperator,
 			tenant_id: tenant(),
-			object: SchemaObjectRefV1 {
+			object: SchemaObjectRef {
 				kind: SchemaObjectKind::Index,
 				namespace: descriptor.namespace.clone(),
 				name: descriptor.index_name.clone(),
@@ -17817,7 +17816,7 @@ mod tests {
 			expected_generation: SchemaGeneration::new(1),
 			requested_generation: SchemaGeneration::new(2),
 			intent_id: SchemaIntentId::new([0x53; 16]),
-			mutation: SchemaMutationKindV1::IndexBackfillComplete,
+			mutation: SchemaMutationKind::IndexBackfillComplete,
 			payload,
 		};
 		encode_schema_update_envelope_v1(&envelope).unwrap()
@@ -19362,7 +19361,7 @@ mod tests {
 	) -> SlabId {
 		let slab_id = mgr.force_seal_active_for_test().await;
 		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant(), descriptor.clone()).unwrap();
 		let encrypted = mgr
 			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
@@ -19412,7 +19411,7 @@ mod tests {
 		let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
 
 		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant(), descriptor.clone()).unwrap();
 		let encrypted = mgr
 			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
@@ -19448,7 +19447,7 @@ mod tests {
 		let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
 
 		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant(), descriptor.clone()).unwrap();
 		let encrypted = mgr
 			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
@@ -21270,13 +21269,13 @@ mod tests {
 	#[test]
 	fn table_query_scan_ranges_accepts_column_projection_prefixes() {
 		let tenant_id = tenant();
-		let projection = ColumnLocalityDescriptorV1 {
-			columns: vec![ClusteringColumnSpecV1 {
+		let projection = ColumnLocalityDescriptor {
+			columns: vec![ClusteringColumnSpec {
 				name: "id".to_owned(),
 				width_bits: 16,
 				string_prefix_bytes: None,
 			}],
-			projection: ProjectionFunctionV1::ZOrder,
+			projection: ProjectionFunction::ZOrder,
 			spread_factor: 4,
 			prefix_bits: 12,
 		};
@@ -21286,9 +21285,9 @@ mod tests {
 			"analytics",
 			"events",
 			&typed_table_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::ColumnProjection(projection.clone()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let ranges = table_query_scan_ranges(tenant_id, &descriptor, None).unwrap();
@@ -21306,13 +21305,13 @@ mod tests {
 	#[test]
 	fn table_query_scan_ranges_prune_column_projection_from_pbc() {
 		let tenant_id = tenant();
-		let projection = ColumnLocalityDescriptorV1 {
-			columns: vec![ClusteringColumnSpecV1 {
+		let projection = ColumnLocalityDescriptor {
+			columns: vec![ClusteringColumnSpec {
 				name: "id".to_owned(),
 				width_bits: 16,
 				string_prefix_bytes: None,
 			}],
-			projection: ProjectionFunctionV1::ZOrder,
+			projection: ProjectionFunction::ZOrder,
 			spread_factor: 4,
 			prefix_bits: 12,
 		};
@@ -21322,9 +21321,9 @@ mod tests {
 			"analytics",
 			"events",
 			&typed_table_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::ColumnProjection(projection.clone()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let mut bytecode = vec![OP_PUSH_COL];
@@ -21381,7 +21380,7 @@ mod tests {
 
 		let slab_id = mgr.force_seal_active_for_test().await;
 		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant(), descriptor.clone()).unwrap();
 		let encrypted = mgr
 			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
@@ -21583,7 +21582,7 @@ mod tests {
 		let descriptor = typed_table_descriptor();
 		let slab_id = append_typed_table_rows(&mgr, &descriptor, vec![1, 2]).await;
 		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant(), descriptor.clone()).unwrap();
 		let encrypted = mgr
 			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
@@ -21672,7 +21671,7 @@ mod tests {
 		let descriptor = typed_table_descriptor();
 		let slab_id = append_typed_table_rows(&mgr, &descriptor, vec![1, 2]).await;
 		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant(), descriptor.clone()).unwrap();
 		let encrypted = mgr
 			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
@@ -21795,7 +21794,7 @@ mod tests {
 		let mgr = make_manager_with_l2_encoded_compute(l2.clone()).await;
 		let mut descriptor = typed_table_descriptor();
 		descriptor.locality_policy =
-			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptor {
 				spread_factor: 1,
 				prefix_bits: 63,
 			});
@@ -24594,9 +24593,9 @@ mod tests {
 			"analytics",
 			"full_scan",
 			&typed_table_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::IdentityProjection,
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		node.raft
@@ -25504,7 +25503,7 @@ mod tests {
 		.unwrap();
 		let replacement_slab_id = mgr.force_seal_active_for_test().await;
 		let raw = mgr.read_sealed_raw(replacement_slab_id).await.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant(), descriptor.clone()).unwrap();
 		let encrypted = mgr
 			.encrypt_tiered_object_blob_with_table_stats(replacement_slab_id, &raw, &catalog)
@@ -30290,7 +30289,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let _ = TenantId::new(7);
@@ -30315,10 +30314,10 @@ mod tests {
 				arrow::datatypes::Field::new("id", arrow::datatypes::DataType::LargeBinary, false),
 				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
 			]),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let req = ColumnFetchRequirement::default();
@@ -30343,9 +30342,9 @@ mod tests {
 				arrow::datatypes::Field::new("id", arrow::datatypes::DataType::LargeBinary, false),
 				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
 			]),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let req = ColumnFetchRequirement::default();
@@ -30381,7 +30380,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let batch = arrow::record_batch::RecordBatch::try_new(
@@ -30421,7 +30420,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		// Stored row's table_object_id stamped from a *different*
@@ -30475,10 +30474,10 @@ mod tests {
 			"analytics",
 			"events_pk",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		// Row stamped with a sibling PK descriptor's table_object_id.
@@ -30535,7 +30534,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let stored_id = [0x45_u8; 16];

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use wendelon::crypto::TieredPlaintextRange;
 use wendelon::schema::{
 	HybridTimestamp, Identity, IpcColumnOrdinal, Locality, LocalityPolicy,
-	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptor, RecordBodyByteLen, RecordBodyByteOffset,
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex, RowGroupRowCount,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId,
+	RowIdentityPolicy, SchemaEvolutionPolicy, SlabId, TableObjectId,
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
@@ -25,12 +25,12 @@ fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
 		"test",
 		"encoding_planner",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(1024, 1024, 8 * 1024 * 1024).unwrap(),
 		),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }

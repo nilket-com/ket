@@ -1,4 +1,4 @@
-use crate::schema::pbc::ColumnPredicateLiteralV1;
+use crate::schema::pbc::ColumnPredicateLiteral;
 use crate::schema::{RecordRowIndex, RowCount};
 use crate::storage::encoding::EncodingPageStats;
 use crate::storage::encoding::compute::EncodedRowMask;
@@ -181,48 +181,42 @@ fn classify_value_page(
 
 fn literal_to_canonical_bytes(
 	data_type: &DataType,
-	literal: &ColumnPredicateLiteralV1,
+	literal: &ColumnPredicateLiteral,
 ) -> Option<Vec<u8>> {
 	match (data_type, literal) {
-		(DataType::Int8, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Int8, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 1).ok()
 		}
-		(DataType::Int16, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Int16, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 2).ok()
 		}
-		(DataType::Int32, ColumnPredicateLiteralV1::Int(value))
-		| (DataType::Date32, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Int32, ColumnPredicateLiteral::Int(value))
+		| (DataType::Date32, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 4).ok()
 		}
-		(DataType::Int64, ColumnPredicateLiteralV1::Int(value))
-		| (DataType::Date64, ColumnPredicateLiteralV1::Int(value))
-		| (
-			DataType::Timestamp(TimeUnit::Millisecond, None),
-			ColumnPredicateLiteralV1::Int(value),
-		)
-		| (
-			DataType::Timestamp(TimeUnit::Microsecond, None),
-			ColumnPredicateLiteralV1::Int(value),
-		)
-		| (DataType::Timestamp(TimeUnit::Nanosecond, None), ColumnPredicateLiteralV1::Int(value))
-		| (DataType::Timestamp(TimeUnit::Millisecond, None), ColumnPredicateLiteralV1::Ts(value))
-		| (DataType::Timestamp(TimeUnit::Microsecond, None), ColumnPredicateLiteralV1::Ts(value))
-		| (DataType::Timestamp(TimeUnit::Nanosecond, None), ColumnPredicateLiteralV1::Ts(value)) => {
+		(DataType::Int64, ColumnPredicateLiteral::Int(value))
+		| (DataType::Date64, ColumnPredicateLiteral::Int(value))
+		| (DataType::Timestamp(TimeUnit::Millisecond, None), ColumnPredicateLiteral::Int(value))
+		| (DataType::Timestamp(TimeUnit::Microsecond, None), ColumnPredicateLiteral::Int(value))
+		| (DataType::Timestamp(TimeUnit::Nanosecond, None), ColumnPredicateLiteral::Int(value))
+		| (DataType::Timestamp(TimeUnit::Millisecond, None), ColumnPredicateLiteral::Ts(value))
+		| (DataType::Timestamp(TimeUnit::Microsecond, None), ColumnPredicateLiteral::Ts(value))
+		| (DataType::Timestamp(TimeUnit::Nanosecond, None), ColumnPredicateLiteral::Ts(value)) => {
 			encode_signed_stat_value(*value, 8).ok()
 		}
-		(DataType::UInt8, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::UInt8, ColumnPredicateLiteral::Int(value)) => {
 			encode_unsigned_stat_value(u64::try_from(*value).ok()?, 1).ok()
 		}
-		(DataType::UInt16, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::UInt16, ColumnPredicateLiteral::Int(value)) => {
 			encode_unsigned_stat_value(u64::try_from(*value).ok()?, 2).ok()
 		}
-		(DataType::UInt32, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::UInt32, ColumnPredicateLiteral::Int(value)) => {
 			encode_unsigned_stat_value(u64::try_from(*value).ok()?, 4).ok()
 		}
-		(DataType::UInt64, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::UInt64, ColumnPredicateLiteral::Int(value)) => {
 			encode_unsigned_stat_value(u64::try_from(*value).ok()?, 8).ok()
 		}
-		(DataType::Boolean, ColumnPredicateLiteralV1::Int(value)) => match *value {
+		(DataType::Boolean, ColumnPredicateLiteral::Int(value)) => match *value {
 			0 => Some(encode_bool_stat_value(false).to_vec()),
 			1 => Some(encode_bool_stat_value(true).to_vec()),
 			_ => None,
@@ -279,7 +273,7 @@ mod tests {
 	fn atom(op: PredicateAtomOp, value: i64) -> PredicateAtom {
 		PredicateAtom {
 			op,
-			literal: Some(ColumnPredicateLiteralV1::Int(value)),
+			literal: Some(ColumnPredicateLiteral::Int(value)),
 		}
 	}
 

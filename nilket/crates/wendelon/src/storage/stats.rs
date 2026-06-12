@@ -1,7 +1,7 @@
 use crate::schema::table::{
 	COLUMN_STATS_CSB_AEAD_TAG_BYTES, COLUMN_STATS_HLL_MAX_PRECISION,
-	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnGroupNdvSpec, ColumnGroupTopKSpec,
-	ColumnHeavyHitterSpec, ColumnHllSpecV1, ColumnRangeDistributionSpec, ColumnSmallSetSpecV1,
+	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpec, ColumnGroupNdvSpec, ColumnGroupTopKSpec,
+	ColumnHeavyHitterSpec, ColumnHllSpec, ColumnRangeDistributionSpec, ColumnSmallSetSpec,
 	TableObjectId, TableSchemaDescriptor, max_column_stats_block_ciphertext_bytes_for_slab_payload,
 };
 pub use crate::schema::{
@@ -1493,9 +1493,9 @@ fn build_pending_column_stats_entry(
 	field: &Field,
 	array: &dyn Array,
 	prefix_cap: usize,
-	bloom_spec: Option<&ColumnBloomSpecV1>,
-	hll_spec: Option<&ColumnHllSpecV1>,
-	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+	bloom_spec: Option<&ColumnBloomSpec>,
+	hll_spec: Option<&ColumnHllSpec>,
+	small_set_spec: Option<&ColumnSmallSetSpec>,
 	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
 	range_distribution_spec: Option<&ColumnRangeDistributionSpec>,
 	select_all_opt_ins: bool,
@@ -1590,9 +1590,9 @@ fn collect_column_stats_in_one_pass(
 	array: &dyn Array,
 	arrow_type_tag: u8,
 	prefix_cap: usize,
-	bloom_spec: Option<&ColumnBloomSpecV1>,
-	hll_spec: Option<&ColumnHllSpecV1>,
-	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+	bloom_spec: Option<&ColumnBloomSpec>,
+	hll_spec: Option<&ColumnHllSpec>,
+	small_set_spec: Option<&ColumnSmallSetSpec>,
 	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
 	range_distribution_spec: Option<&ColumnRangeDistributionSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
@@ -1733,9 +1733,9 @@ fn collect_float32_column_stats(
 	array: &dyn Array,
 	null_count: u64,
 	non_null_count: u64,
-	bloom_spec: Option<&ColumnBloomSpecV1>,
-	hll_spec: Option<&ColumnHllSpecV1>,
-	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+	bloom_spec: Option<&ColumnBloomSpec>,
+	hll_spec: Option<&ColumnHllSpec>,
+	small_set_spec: Option<&ColumnSmallSetSpec>,
 	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
 	range_distribution_spec: Option<&ColumnRangeDistributionSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
@@ -1826,9 +1826,9 @@ fn collect_float64_column_stats(
 	array: &dyn Array,
 	null_count: u64,
 	non_null_count: u64,
-	bloom_spec: Option<&ColumnBloomSpecV1>,
-	hll_spec: Option<&ColumnHllSpecV1>,
-	small_set_spec: Option<&ColumnSmallSetSpecV1>,
+	bloom_spec: Option<&ColumnBloomSpec>,
+	hll_spec: Option<&ColumnHllSpec>,
+	small_set_spec: Option<&ColumnSmallSetSpec>,
 	heavy_hitter_spec: Option<&ColumnHeavyHitterSpec>,
 	range_distribution_spec: Option<&ColumnRangeDistributionSpec>,
 ) -> std::io::Result<CollectedColumnStats> {
@@ -2710,7 +2710,7 @@ struct SmallSetCollector {
 }
 
 impl SmallSetCollector {
-	fn new(spec: &ColumnSmallSetSpecV1) -> Self {
+	fn new(spec: &ColumnSmallSetSpec) -> Self {
 		Self {
 			values: BTreeSet::new(),
 			encoded_bytes: 4,
@@ -3549,9 +3549,9 @@ fn read_u64_be(bytes: &[u8], cursor: &mut usize, field: &str) -> std::io::Result
 mod tests {
 	use super::*;
 	use crate::schema::table::{
-		BloomBitsPerRow, ColumnGroupTopKSpec, ColumnHeavyHitterSpec, ColumnHllSpecV1,
-		ColumnRangeDistributionSpec, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, HllPrecision,
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		BloomBitsPerRow, ColumnGroupTopKSpec, ColumnHeavyHitterSpec, ColumnHllSpec,
+		ColumnRangeDistributionSpec, ColumnSmallSetSpec, ColumnStatsPolicy, HllPrecision,
+		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
 		SmallSetByteCap, SmallSetValueCap,
 	};
 	use arrow::array::{Float32Array, Float64Array, Int64Array, LargeStringArray, StringArray};
@@ -3565,9 +3565,9 @@ mod tests {
 			"analytics",
 			"events",
 			schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -3936,13 +3936,13 @@ mod tests {
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
-			small_sets: vec![ColumnSmallSetSpecV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
+			small_sets: vec![ColumnSmallSetSpec {
 				column_name: "region".to_owned(),
 				max_distinct_values: SmallSetValueCap::new(4).unwrap(),
 				max_bytes: SmallSetByteCap::new(128).unwrap(),
 			}],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -3980,12 +3980,12 @@ mod tests {
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
-			bloom_filters: vec![ColumnBloomSpecV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
+			bloom_filters: vec![ColumnBloomSpec {
 				column_name: "region".to_owned(),
 				bits_per_row: BloomBitsPerRow::new(16).unwrap(),
 			}],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -4044,12 +4044,12 @@ mod tests {
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
-			bloom_filters: vec![ColumnBloomSpecV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
+			bloom_filters: vec![ColumnBloomSpec {
 				column_name: "region".to_owned(),
 				bits_per_row: BloomBitsPerRow::new(5).unwrap(),
 			}],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -4093,12 +4093,12 @@ mod tests {
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
-			hll_distincts: vec![ColumnHllSpecV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
+			hll_distincts: vec![ColumnHllSpec {
 				column_name: "id".to_owned(),
 				precision: HllPrecision::new(COLUMN_STATS_HLL_MIN_PRECISION).unwrap(),
 			}],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -4153,10 +4153,10 @@ mod tests {
 	fn hll_writer_estimate_tracks_distinct_non_null_values_coarsely() {
 		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
 		let mut descriptor = stats_descriptor(&schema);
-		let hll_spec = ColumnHllSpecV1::new("id");
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
+		let hll_spec = ColumnHllSpec::new("id");
+		descriptor.stats_policy = ColumnStatsPolicy {
 			hll_distincts: vec![hll_spec.clone()],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let mut values = (0..100).map(Some).collect::<Vec<Option<i64>>>();
@@ -4201,13 +4201,13 @@ mod tests {
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
-			bloom_filters: vec![ColumnBloomSpecV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
+			bloom_filters: vec![ColumnBloomSpec {
 				column_name: "region".to_owned(),
 				bits_per_row: BloomBitsPerRow::new(16).unwrap(),
 			}],
-			hll_distincts: vec![ColumnHllSpecV1::new("region")],
-			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			hll_distincts: vec![ColumnHllSpec::new("region")],
+			small_sets: vec![ColumnSmallSetSpec::new("region")],
 			heavy_hitters: Vec::new(),
 			range_distributions: Vec::new(),
 			column_group_top_k: Vec::new(),
@@ -4308,13 +4308,13 @@ mod tests {
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
-			bloom_filters: vec![ColumnBloomSpecV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
+			bloom_filters: vec![ColumnBloomSpec {
 				column_name: "region".to_owned(),
 				bits_per_row: BloomBitsPerRow::new(16).unwrap(),
 			}],
-			hll_distincts: vec![ColumnHllSpecV1::new("region")],
-			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			hll_distincts: vec![ColumnHllSpec::new("region")],
+			small_sets: vec![ColumnSmallSetSpec::new("region")],
 			heavy_hitters: Vec::new(),
 			range_distributions: Vec::new(),
 			column_group_top_k: Vec::new(),
@@ -4373,9 +4373,9 @@ mod tests {
 			Field::new("amount", DataType::Int64, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
 			range_distributions: vec![ColumnRangeDistributionSpec::with_k("amount", 100).unwrap()],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -4870,13 +4870,13 @@ mod tests {
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
-			small_sets: vec![ColumnSmallSetSpecV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
+			small_sets: vec![ColumnSmallSetSpec {
 				column_name: "region".to_owned(),
 				max_distinct_values: SmallSetValueCap::new(4).unwrap(),
 				max_bytes: SmallSetByteCap::new(64).unwrap(),
 			}],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -4922,13 +4922,13 @@ mod tests {
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
-			small_sets: vec![ColumnSmallSetSpecV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
+			small_sets: vec![ColumnSmallSetSpec {
 				column_name: "region".to_owned(),
 				max_distinct_values: SmallSetValueCap::new(1).unwrap(),
 				max_bytes: SmallSetByteCap::new(64).unwrap(),
 			}],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -4958,9 +4958,9 @@ mod tests {
 			Field::new("region", DataType::Utf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
 			heavy_hitters: vec![ColumnHeavyHitterSpec::with_caps("region", 4, 128).unwrap()],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -5011,9 +5011,9 @@ mod tests {
 			Field::new("amount", DataType::Int64, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
 			range_distributions: vec![ColumnRangeDistributionSpec::with_k("amount", 100).unwrap()],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -5068,7 +5068,7 @@ mod tests {
 			Field::new("region_id", DataType::Int64, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
 			column_group_top_k: vec![
 				ColumnGroupTopKSpec::with_caps(
 					vec!["customer_id".to_string(), "region_id".to_string()],
@@ -5077,7 +5077,7 @@ mod tests {
 				)
 				.unwrap(),
 			],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -5126,7 +5126,7 @@ mod tests {
 			Field::new("region_id", DataType::Int64, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
 			column_group_ndv: vec![
 				ColumnGroupNdvSpec::with_caps(
 					vec!["customer_id".to_string(), "region_id".to_string()],
@@ -5136,7 +5136,7 @@ mod tests {
 				)
 				.unwrap(),
 			],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -5182,9 +5182,9 @@ mod tests {
 			Field::new("region", DataType::Utf8, true),
 		]);
 		let mut descriptor = stats_descriptor(&schema);
-		descriptor.stats_policy = ColumnStatsPolicyV1 {
+		descriptor.stats_policy = ColumnStatsPolicy {
 			heavy_hitters: vec![ColumnHeavyHitterSpec::with_caps("region", 1, 128).unwrap()],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
@@ -5208,9 +5208,9 @@ mod tests {
 		assert!(!heavy_hitters.complete);
 
 		let mut byte_capped = descriptor.clone();
-		byte_capped.stats_policy = ColumnStatsPolicyV1 {
+		byte_capped.stats_policy = ColumnStatsPolicy {
 			heavy_hitters: vec![ColumnHeavyHitterSpec::with_caps("region", 4, 5).unwrap()],
-			..ColumnStatsPolicyV1::default()
+			..ColumnStatsPolicy::default()
 		};
 		byte_capped.refresh_descriptor_fingerprints().unwrap();
 		let encoded = build_always_on_column_stats_block(&byte_capped, &batch).unwrap();

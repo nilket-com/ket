@@ -47,7 +47,7 @@ pub const SLAB_NONCE_BYTES: usize = 12;
 pub const SLAB_NONCE_VERSION: u32 = 0;
 pub const SLAB_ENVELOPE_FORMAT_VERSION: u32 = 1;
 pub const SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS: u32 = 2;
-pub const SLAB_STATS_FORMAT_VERSION_ADR039_V1: u16 = 1;
+pub const SLAB_STATS_FORMAT_VERSION_ADR039: u16 = 1;
 pub const DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES: usize = 2048;
 pub const DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES: usize = 10_000;
 pub const HAS_ROW_TOMBSTONE_RECORDS_BIT: u8 = 1 << 0;
@@ -2609,7 +2609,7 @@ fn encode_stats_aad(
 	aad[..16].copy_from_slice(&encode_u64_aad_field(tenant_id.get()));
 	aad[16..32].copy_from_slice(&encode_u64_aad_field(slab_id.get()));
 	aad[32..36].copy_from_slice(&SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS.to_be_bytes());
-	aad[36..38].copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039_V1.to_be_bytes());
+	aad[36..38].copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039.to_be_bytes());
 	aad[38] = cipher_id.to_wire();
 	aad[40..48].copy_from_slice(&schema_generation.to_be_bytes());
 	// Bytes 48..64 stay reserved-zero in V1. The locator hash is checked
@@ -3820,7 +3820,7 @@ fn stats_locator_for_block(
 	let mut stats_block_hash128 = [0_u8; 16];
 	stats_block_hash128.copy_from_slice(&stats_ciphertext_hash128(ciphertext));
 	Ok(TieredStatsBlockLocator {
-		stats_format_version: SLAB_STATS_FORMAT_VERSION_ADR039_V1,
+		stats_format_version: SLAB_STATS_FORMAT_VERSION_ADR039,
 		stats_flags,
 		stats_block_len,
 		stats_plaintext_len: block.plaintext_len()?,
@@ -3910,7 +3910,7 @@ fn parse_adr039_stats_locator(
 		}
 		return Ok(None);
 	}
-	if stats_format_version != SLAB_STATS_FORMAT_VERSION_ADR039_V1 {
+	if stats_format_version != SLAB_STATS_FORMAT_VERSION_ADR039 {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!("unsupported ADR 039 stats format version {stats_format_version}"),
@@ -6446,7 +6446,7 @@ mod tests {
 		let locator = encrypted.stats_locator.expect("stats locator");
 		assert_eq!(
 			locator.stats_format_version,
-			SLAB_STATS_FORMAT_VERSION_ADR039_V1
+			SLAB_STATS_FORMAT_VERSION_ADR039
 		);
 		assert_eq!(
 			locator.stats_flags,
@@ -6559,7 +6559,7 @@ mod tests {
 		let suffix = footer_stats_locator_suffix(&encrypted.bytes);
 		assert_eq!(
 			u16::from_be_bytes(suffix[0..2].try_into().unwrap()),
-			SLAB_STATS_FORMAT_VERSION_ADR039_V1
+			SLAB_STATS_FORMAT_VERSION_ADR039
 		);
 		assert_eq!(
 			u16::from_be_bytes(suffix[2..4].try_into().unwrap()),
@@ -6589,7 +6589,7 @@ mod tests {
 		let valid_flags = ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED
 			| ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED;
 		let mut suffix = [0_u8; ADR039_STATS_LOCATOR_BYTES];
-		suffix[0..2].copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039_V1.to_be_bytes());
+		suffix[0..2].copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039.to_be_bytes());
 		suffix[2..4].copy_from_slice(&valid_flags.to_be_bytes());
 		suffix[4..8].copy_from_slice(&1_u32.to_be_bytes());
 		assert!(
@@ -6732,7 +6732,7 @@ mod tests {
 		let valid_flags = ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED
 			| ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED;
 		lazily_attached[locator_start..locator_start + 2]
-			.copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039_V1.to_be_bytes());
+			.copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039.to_be_bytes());
 		lazily_attached[locator_start + 2..locator_start + 4]
 			.copy_from_slice(&valid_flags.to_be_bytes());
 		lazily_attached[locator_start + 4..locator_start + 8]
@@ -6937,7 +6937,7 @@ mod tests {
 	#[test]
 	fn adr039_arrow_csb_plaintext_roundtrips_through_stats_envelope() {
 		use crate::schema::table::{
-			LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+			LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
 			TableObjectId, TableSchemaDescriptor,
 		};
 		use crate::storage::stats::{
@@ -6960,9 +6960,9 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let batch = RecordBatch::try_new(

@@ -13,9 +13,9 @@ use wendelon::schema::pbc::{
 use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, Consistency, DurabilityLevel, HybridTimestamp,
-	LocalityPolicy, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta,
+	LocalityPolicy, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptor,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicy,
+	TableObjectId, TableSchemaDescriptor, TableSpreadLocalityDescriptor, TableWriteRequestMeta,
 	TenantId, WriterNodeId, encode_table_write_row_count,
 };
 use wendelon::storage::{
@@ -557,12 +557,12 @@ fn bench_descriptor_with_policy(
 		"analytics",
 		"events",
 		&bench_schema(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+		LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptor {
 			spread_factor: 1,
 			prefix_bits: 63,
 		}),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?;
 	descriptor.record_layout_policy = record_layout_policy;
 	descriptor.record_body_compression_policy = compression_policy;

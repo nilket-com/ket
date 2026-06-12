@@ -284,8 +284,8 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::path::{Path, PathBuf};
 	use wendelon::schema::{
-		LocalityPolicy, PbcRejectCode, PrimaryKeyDescriptorV1, ReadStatus, RowIdentityPolicy,
-		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId,
+		LocalityPolicy, PbcRejectCode, PrimaryKeyDescriptor, ReadStatus, RowIdentityPolicy,
+		SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor, TenantId,
 	};
 	use wendelon_client::ClientError;
 
@@ -353,9 +353,9 @@ mod tests {
 			"local",
 			"errors",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor")
 		.physical_descriptor_fingerprint

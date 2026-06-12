@@ -1,6 +1,6 @@
 use crate::schema::{
-	ColumnStatsPolicyV1, LocalityPolicy, RecordBodyCompressionPolicy, RecordLayoutPolicy,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
+	ColumnStatsPolicy, LocalityPolicy, RecordBodyCompressionPolicy, RecordLayoutPolicy,
+	RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -65,7 +65,7 @@ pub(crate) fn compute_logical_schema_fingerprint(
 	table_name: &str,
 	arrow_schema_ipc: &[u8],
 	row_identity_policy: &RowIdentityPolicy,
-	evolution_policy: &SchemaEvolutionPolicyV1,
+	evolution_policy: &SchemaEvolutionPolicy,
 ) -> std::io::Result<LogicalSchemaFingerprint> {
 	let mut hasher = blake3::Hasher::new();
 	hasher.update(LOGICAL_SCHEMA_DOMAIN);
@@ -83,7 +83,7 @@ pub(crate) fn compute_physical_descriptor_fingerprint(
 	locality_policy: &LocalityPolicy,
 	record_layout_policy: &RecordLayoutPolicy,
 	record_body_compression_policy: &RecordBodyCompressionPolicy,
-	stats_policy: &ColumnStatsPolicyV1,
+	stats_policy: &ColumnStatsPolicy,
 ) -> std::io::Result<PhysicalDescriptorFingerprint> {
 	let mut hasher = blake3::Hasher::new();
 	hasher.update(PHYSICAL_DESCRIPTOR_DOMAIN);

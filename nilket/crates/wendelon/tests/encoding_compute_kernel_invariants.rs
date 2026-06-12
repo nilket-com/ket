@@ -1,14 +1,14 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use std::fs;
 use std::path::Path;
-use wendelon::schema::pbc::ColumnPredicateLiteralV1;
+use wendelon::schema::pbc::ColumnPredicateLiteral;
 use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, BaseValue, BitsPerValue, BufferValueCount, Consistency,
 	DictValueCount, EncodingCascadeIndex, HybridTimestamp, IpcBufferIndex, IpcColumnOrdinal,
-	Locality, LocalityPolicy, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+	Locality, LocalityPolicy, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptor,
 	RecordBodyByteLen, RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex,
-	RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount, TableObjectId,
+	RowIdentityPolicy, RunCount, SchemaEvolutionPolicy, SimdPageValueCount, TableObjectId,
 	TableSchemaDescriptor, TenantId,
 };
 use wendelon::storage::encoding::cascade::{EncodedBuffer, encode_buffer};
@@ -31,7 +31,7 @@ fn decode_scalar_oracle_matches_current_dispatch_for_native_cascade_matrix() {
 		DataType::UInt32,
 		&u32_bytes(&[0, 1, 2, 5, 5, 7, 9, 15]),
 		PredicateAtomOp::Eq,
-		ColumnPredicateLiteralV1::Int(5),
+		ColumnPredicateLiteral::Int(5),
 	);
 	assert_oracle_matches_dispatch(
 		EncodingCascade::Rle {
@@ -41,7 +41,7 @@ fn decode_scalar_oracle_matches_current_dispatch_for_native_cascade_matrix() {
 		DataType::UInt8,
 		&[1, 1, 1, 2, 2, 7, 7, 9],
 		PredicateAtomOp::Gte,
-		ColumnPredicateLiteralV1::Int(7),
+		ColumnPredicateLiteral::Int(7),
 	);
 	assert_oracle_matches_dispatch(
 		EncodingCascade::Dictionary {
@@ -52,9 +52,9 @@ fn decode_scalar_oracle_matches_current_dispatch_for_native_cascade_matrix() {
 		DataType::UInt32,
 		&u32_bytes(&[3, 3, 5, 7, 5, 11, 7, 3]),
 		PredicateAtomOp::InList,
-		ColumnPredicateLiteralV1::List(vec![
-			ColumnPredicateLiteralV1::Int(5),
-			ColumnPredicateLiteralV1::Int(11),
+		ColumnPredicateLiteral::List(vec![
+			ColumnPredicateLiteral::Int(5),
+			ColumnPredicateLiteral::Int(11),
 		]),
 	);
 	assert_oracle_matches_dispatch(
@@ -69,7 +69,7 @@ fn decode_scalar_oracle_matches_current_dispatch_for_native_cascade_matrix() {
 		DataType::UInt32,
 		&u32_bytes(&[3, 3, 5, 7, 5, 11, 7, 3]),
 		PredicateAtomOp::Lt,
-		ColumnPredicateLiteralV1::Int(7),
+		ColumnPredicateLiteral::Int(7),
 	);
 	assert_oracle_matches_dispatch(
 		EncodingCascade::Delta {
@@ -79,7 +79,7 @@ fn decode_scalar_oracle_matches_current_dispatch_for_native_cascade_matrix() {
 		DataType::Int64,
 		&i64_bytes(&[10, 13, 12, 20, 20, 31, 29, 35]),
 		PredicateAtomOp::Gte,
-		ColumnPredicateLiteralV1::Int(20),
+		ColumnPredicateLiteral::Int(20),
 	);
 }
 
@@ -87,14 +87,14 @@ fn decode_scalar_oracle_matches_current_dispatch_for_native_cascade_matrix() {
 fn bitpacked_native_predicate_matches_decode_scalar_for_ops_and_base_offsets() {
 	let unsigned_values = u32_bytes(&[0, 1, 2, 5, 5, 7, 9, 15]);
 	for (op, literal) in [
-		(PredicateAtomOp::Eq, ColumnPredicateLiteralV1::Int(5)),
-		(PredicateAtomOp::Neq, ColumnPredicateLiteralV1::Int(5)),
-		(PredicateAtomOp::Gt, ColumnPredicateLiteralV1::Int(5)),
-		(PredicateAtomOp::Gte, ColumnPredicateLiteralV1::Int(5)),
-		(PredicateAtomOp::Lt, ColumnPredicateLiteralV1::Int(5)),
-		(PredicateAtomOp::Lte, ColumnPredicateLiteralV1::Int(5)),
-		(PredicateAtomOp::Eq, ColumnPredicateLiteralV1::Int(99)),
-		(PredicateAtomOp::Neq, ColumnPredicateLiteralV1::Int(99)),
+		(PredicateAtomOp::Eq, ColumnPredicateLiteral::Int(5)),
+		(PredicateAtomOp::Neq, ColumnPredicateLiteral::Int(5)),
+		(PredicateAtomOp::Gt, ColumnPredicateLiteral::Int(5)),
+		(PredicateAtomOp::Gte, ColumnPredicateLiteral::Int(5)),
+		(PredicateAtomOp::Lt, ColumnPredicateLiteral::Int(5)),
+		(PredicateAtomOp::Lte, ColumnPredicateLiteral::Int(5)),
+		(PredicateAtomOp::Eq, ColumnPredicateLiteral::Int(99)),
+		(PredicateAtomOp::Neq, ColumnPredicateLiteral::Int(99)),
 	] {
 		assert_oracle_matches_dispatch(
 			EncodingCascade::BitPacked {
@@ -115,9 +115,9 @@ fn bitpacked_native_predicate_matches_decode_scalar_for_ops_and_base_offsets() {
 		DataType::UInt32,
 		&unsigned_values,
 		PredicateAtomOp::InList,
-		ColumnPredicateLiteralV1::List(vec![
-			ColumnPredicateLiteralV1::Int(2),
-			ColumnPredicateLiteralV1::Int(9),
+		ColumnPredicateLiteral::List(vec![
+			ColumnPredicateLiteral::Int(2),
+			ColumnPredicateLiteral::Int(9),
 		]),
 	);
 
@@ -129,7 +129,7 @@ fn bitpacked_native_predicate_matches_decode_scalar_for_ops_and_base_offsets() {
 		DataType::UInt32,
 		&u32_bytes(&[10, 11, 12, 14, 15, 15]),
 		PredicateAtomOp::Gte,
-		ColumnPredicateLiteralV1::Int(14),
+		ColumnPredicateLiteral::Int(14),
 	);
 	assert_oracle_matches_dispatch(
 		EncodingCascade::BitPacked {
@@ -139,7 +139,7 @@ fn bitpacked_native_predicate_matches_decode_scalar_for_ops_and_base_offsets() {
 		DataType::Int8,
 		&i8_bytes(&[-2, -1, 0, 1, 5, 7]),
 		PredicateAtomOp::Gt,
-		ColumnPredicateLiteralV1::Int(-1),
+		ColumnPredicateLiteral::Int(-1),
 	);
 }
 
@@ -154,10 +154,10 @@ fn dictionary_native_predicate_matches_decode_scalar_for_plain_and_bitpacked_ind
 		},
 	] {
 		for (op, literal) in [
-			(PredicateAtomOp::Eq, ColumnPredicateLiteralV1::Int(5)),
-			(PredicateAtomOp::Neq, ColumnPredicateLiteralV1::Int(5)),
-			(PredicateAtomOp::Gt, ColumnPredicateLiteralV1::Int(5)),
-			(PredicateAtomOp::Lte, ColumnPredicateLiteralV1::Int(7)),
+			(PredicateAtomOp::Eq, ColumnPredicateLiteral::Int(5)),
+			(PredicateAtomOp::Neq, ColumnPredicateLiteral::Int(5)),
+			(PredicateAtomOp::Gt, ColumnPredicateLiteral::Int(5)),
+			(PredicateAtomOp::Lte, ColumnPredicateLiteral::Int(7)),
 		] {
 			assert_oracle_matches_dispatch(
 				EncodingCascade::Dictionary {
@@ -180,9 +180,9 @@ fn dictionary_native_predicate_matches_decode_scalar_for_plain_and_bitpacked_ind
 			DataType::UInt32,
 			&decoded,
 			PredicateAtomOp::InList,
-			ColumnPredicateLiteralV1::List(vec![
-				ColumnPredicateLiteralV1::Int(3),
-				ColumnPredicateLiteralV1::Int(11),
+			ColumnPredicateLiteral::List(vec![
+				ColumnPredicateLiteral::Int(3),
+				ColumnPredicateLiteral::Int(11),
 			]),
 		);
 	}
@@ -192,10 +192,10 @@ fn dictionary_native_predicate_matches_decode_scalar_for_plain_and_bitpacked_ind
 fn delta_native_predicate_matches_decode_scalar_for_prefix_sum_walk() {
 	let decoded = i64_bytes(&[10, 13, 12, 20, 20, 31, 29, 35]);
 	for (op, literal) in [
-		(PredicateAtomOp::Eq, ColumnPredicateLiteralV1::Int(20)),
-		(PredicateAtomOp::Neq, ColumnPredicateLiteralV1::Int(20)),
-		(PredicateAtomOp::Gt, ColumnPredicateLiteralV1::Int(20)),
-		(PredicateAtomOp::Lte, ColumnPredicateLiteralV1::Int(20)),
+		(PredicateAtomOp::Eq, ColumnPredicateLiteral::Int(20)),
+		(PredicateAtomOp::Neq, ColumnPredicateLiteral::Int(20)),
+		(PredicateAtomOp::Gt, ColumnPredicateLiteral::Int(20)),
+		(PredicateAtomOp::Lte, ColumnPredicateLiteral::Int(20)),
 	] {
 		assert_oracle_matches_dispatch(
 			EncodingCascade::Delta {
@@ -221,10 +221,10 @@ fn rle_native_predicate_matches_decode_scalar_for_byte_runs() {
 		},
 	] {
 		for (op, literal) in [
-			(PredicateAtomOp::Eq, ColumnPredicateLiteralV1::Int(7)),
-			(PredicateAtomOp::Neq, ColumnPredicateLiteralV1::Int(7)),
-			(PredicateAtomOp::Gte, ColumnPredicateLiteralV1::Int(7)),
-			(PredicateAtomOp::Lt, ColumnPredicateLiteralV1::Int(3)),
+			(PredicateAtomOp::Eq, ColumnPredicateLiteral::Int(7)),
+			(PredicateAtomOp::Neq, ColumnPredicateLiteral::Int(7)),
+			(PredicateAtomOp::Gte, ColumnPredicateLiteral::Int(7)),
+			(PredicateAtomOp::Lt, ColumnPredicateLiteral::Int(3)),
 		] {
 			assert_oracle_matches_dispatch(
 				EncodingCascade::Rle {
@@ -245,9 +245,9 @@ fn rle_native_predicate_matches_decode_scalar_for_byte_runs() {
 			DataType::UInt8,
 			&decoded,
 			PredicateAtomOp::InList,
-			ColumnPredicateLiteralV1::List(vec![
-				ColumnPredicateLiteralV1::Int(1),
-				ColumnPredicateLiteralV1::Int(9),
+			ColumnPredicateLiteral::List(vec![
+				ColumnPredicateLiteral::Int(1),
+				ColumnPredicateLiteral::Int(9),
 			]),
 		);
 	}
@@ -515,7 +515,7 @@ fn assert_oracle_matches_dispatch(
 	data_type: DataType,
 	decoded: &[u8],
 	op: PredicateAtomOp,
-	literal: ColumnPredicateLiteralV1,
+	literal: ColumnPredicateLiteral,
 ) {
 	let rows = match data_type {
 		DataType::Int8 => decoded.len(),
@@ -662,10 +662,10 @@ fn logical_fingerprint() -> wendelon::schema::LogicalSchemaFingerprint {
 		"test",
 		"encoding_compute_kernel_invariants",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 	.logical_schema_fingerprint

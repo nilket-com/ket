@@ -38,7 +38,7 @@ use wendelon::client::{ClusterPeerWire, ClusterStatusWire, StaticTopologySource}
 use wendelon::consensus::WendelonRequest;
 use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
-	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+	SchemaMutationKind, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
 	encode_schema_update_envelope_v1,
 };
 use wendelon::network::pool::BufPool;
@@ -47,9 +47,8 @@ use wendelon::network::transport::{
 };
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
-	encode_table_schema_descriptor_v1,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor, TenantId as WendelonTenantId, encode_table_schema_descriptor_v1,
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
 use wendelon_client::{Client, WriteOptions};
@@ -1361,11 +1360,11 @@ async fn install_schema(
 fn schema_update(tenant: WendelonTenantId, descriptor: &TableSchemaDescriptor) -> Vec<u8> {
 	let payload = encode_table_schema_descriptor_v1(descriptor).expect("encode descriptor");
 	let intent_byte = tenant.get() as u8;
-	let envelope = SchemaUpdateEnvelopeV1 {
+	let envelope = SchemaUpdateEnvelope {
 		contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 		origin: SchemaIntentOrigin::ComputeClient,
 		tenant_id: tenant,
-		object: SchemaObjectRefV1 {
+		object: SchemaObjectRef {
 			kind: SchemaObjectKind::Table,
 			namespace: descriptor.namespace.clone(),
 			name: descriptor.table_name.clone(),
@@ -1373,7 +1372,7 @@ fn schema_update(tenant: WendelonTenantId, descriptor: &TableSchemaDescriptor) -
 		expected_generation: SchemaGeneration::ZERO,
 		requested_generation: SchemaGeneration::new(descriptor.schema_generation),
 		intent_id: SchemaIntentId::new([intent_byte; 16]),
-		mutation: SchemaMutationKindV1::Create,
+		mutation: SchemaMutationKind::Create,
 		payload,
 	};
 	encode_schema_update_envelope_v1(&envelope).expect("encode schema update")
@@ -1409,9 +1408,9 @@ fn descriptor() -> TableSchemaDescriptor {
 		"bench",
 		"storage_execution",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

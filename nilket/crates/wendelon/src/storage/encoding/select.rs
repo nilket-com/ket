@@ -1486,7 +1486,7 @@ mod tests {
 	}
 
 	fn assert_estimator_matches_exact_predicate_masks_on_warehouse_winners(rows: usize) {
-		use crate::schema::pbc::ColumnPredicateLiteralV1;
+		use crate::schema::pbc::ColumnPredicateLiteral;
 		use crate::schema::{
 			EncodingCascadeIndex, EncodingPageByteOffset, IpcBufferIndex, RowGroupIndex,
 		};
@@ -1553,7 +1553,7 @@ mod tests {
 				page_stats: Vec::new(),
 			};
 
-			let literal = ColumnPredicateLiteralV1::Str(literal_bytes.to_vec());
+			let literal = ColumnPredicateLiteral::Str(literal_bytes.to_vec());
 			let atom = PredicateAtom {
 				op: PredicateAtomOp::Eq,
 				literal: Some(literal.clone()),

@@ -1,5 +1,5 @@
 use crate::schema::pbc::{
-	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, ColumnPredicateV1, Program,
+	ColumnPredicate, ColumnPredicateComparison, ColumnPredicateLiteral, Program,
 };
 use crate::schema::table::TableSchemaDescriptor;
 use crate::schema::{
@@ -210,7 +210,7 @@ impl TableLookupByIndexRequest {
 
 pub fn secondary_index_predicate_from_pbc(
 	descriptor: &SecondaryIndexDescriptor,
-	predicates: &[ColumnPredicateV1],
+	predicates: &[ColumnPredicate],
 ) -> std::io::Result<Option<SecondaryIndexScanPredicate>> {
 	let column_ordinal = descriptor.key.column_ordinal as usize;
 	let mut equal = None;
@@ -223,7 +223,7 @@ pub fn secondary_index_predicate_from_pbc(
 		.filter(|predicate| predicate.column_index == column_ordinal)
 	{
 		match predicate.comparison {
-			ColumnPredicateComparisonV1::Eq => {
+			ColumnPredicateComparison::Eq => {
 				let Some(encoded) = encode_secondary_index_literal(
 					descriptor.key.arrow_type_tag,
 					&predicate.literal,
@@ -233,8 +233,8 @@ pub fn secondary_index_predicate_from_pbc(
 				};
 				equal.get_or_insert(encoded);
 			}
-			ColumnPredicateComparisonV1::InList => {
-				let ColumnPredicateLiteralV1::List(items) = &predicate.literal else {
+			ColumnPredicateComparison::InList => {
+				let ColumnPredicateLiteral::List(items) = &predicate.literal else {
 					return Ok(None);
 				};
 				let mut encoded_items = Vec::with_capacity(items.len());
@@ -250,7 +250,7 @@ pub fn secondary_index_predicate_from_pbc(
 				encoded_items.dedup();
 				in_list.get_or_insert(encoded_items);
 			}
-			ColumnPredicateComparisonV1::Gt | ColumnPredicateComparisonV1::Gte => {
+			ColumnPredicateComparison::Gt | ColumnPredicateComparison::Gte => {
 				let Some(encoded) = encode_secondary_index_literal(
 					descriptor.key.arrow_type_tag,
 					&predicate.literal,
@@ -260,7 +260,7 @@ pub fn secondary_index_predicate_from_pbc(
 				};
 				let bound = SecondaryIndexRangeBound {
 					encoded_key: encoded,
-					inclusive: predicate.comparison == ColumnPredicateComparisonV1::Gte,
+					inclusive: predicate.comparison == ColumnPredicateComparison::Gte,
 				};
 				if lower
 					.as_ref()
@@ -269,7 +269,7 @@ pub fn secondary_index_predicate_from_pbc(
 					lower = Some(bound);
 				}
 			}
-			ColumnPredicateComparisonV1::Lt | ColumnPredicateComparisonV1::Lte => {
+			ColumnPredicateComparison::Lt | ColumnPredicateComparison::Lte => {
 				let Some(encoded) = encode_secondary_index_literal(
 					descriptor.key.arrow_type_tag,
 					&predicate.literal,
@@ -279,7 +279,7 @@ pub fn secondary_index_predicate_from_pbc(
 				};
 				let bound = SecondaryIndexRangeBound {
 					encoded_key: encoded,
-					inclusive: predicate.comparison == ColumnPredicateComparisonV1::Lte,
+					inclusive: predicate.comparison == ColumnPredicateComparison::Lte,
 				};
 				if upper
 					.as_ref()
@@ -305,7 +305,7 @@ pub fn secondary_index_predicate_from_pbc(
 
 pub fn secondary_index_query_from_pbc(
 	descriptor: &SecondaryIndexDescriptor,
-	predicates: &[ColumnPredicateV1],
+	predicates: &[ColumnPredicate],
 ) -> std::io::Result<Option<IndexQuery>> {
 	secondary_index_predicate_from_pbc(descriptor, predicates)
 		.map(|predicate| predicate.map(Into::into))
@@ -327,7 +327,7 @@ pub fn secondary_index_access_plan_from_predicates(
 	catalog: &SecondaryIndexCatalog,
 	tenant_id: TenantId,
 	table: &TableSchemaDescriptor,
-	predicates: &[ColumnPredicateV1],
+	predicates: &[ColumnPredicate],
 ) -> std::io::Result<Option<SecondaryIndexAccessPlan>> {
 	for row in catalog.for_table(tenant_id, table.table_object_id) {
 		if row.state != SecondaryIndexState::Ready {
@@ -722,42 +722,42 @@ fn encode_signed<T: 'static>(
 
 fn encode_secondary_index_literal(
 	tag: IndexArrowTypeTag,
-	literal: &ColumnPredicateLiteralV1,
+	literal: &ColumnPredicateLiteral,
 ) -> std::io::Result<Option<Vec<u8>>> {
 	match (tag, literal) {
-		(IndexArrowTypeTag::Int8, ColumnPredicateLiteralV1::Int(value)) => {
+		(IndexArrowTypeTag::Int8, ColumnPredicateLiteral::Int(value)) => {
 			Ok((*value >= i8::MIN as i64 && *value <= i8::MAX as i64)
 				.then(|| encode_signed_value(*value, 1))
 				.transpose()?)
 		}
-		(IndexArrowTypeTag::Int16, ColumnPredicateLiteralV1::Int(value)) => {
+		(IndexArrowTypeTag::Int16, ColumnPredicateLiteral::Int(value)) => {
 			Ok((*value >= i16::MIN as i64 && *value <= i16::MAX as i64)
 				.then(|| encode_signed_value(*value, 2))
 				.transpose()?)
 		}
 		(
 			IndexArrowTypeTag::Int32 | IndexArrowTypeTag::Date32,
-			ColumnPredicateLiteralV1::Int(value),
+			ColumnPredicateLiteral::Int(value),
 		) => Ok((*value >= i32::MIN as i64 && *value <= i32::MAX as i64)
 			.then(|| encode_signed_value(*value, 4))
 			.transpose()?),
 		(
 			IndexArrowTypeTag::Int64 | IndexArrowTypeTag::Date64,
-			ColumnPredicateLiteralV1::Int(value),
+			ColumnPredicateLiteral::Int(value),
 		) => Ok(Some(encode_signed_value(*value, 8)?)),
-		(IndexArrowTypeTag::UInt8, ColumnPredicateLiteralV1::Int(value)) => Ok((*value >= 0
+		(IndexArrowTypeTag::UInt8, ColumnPredicateLiteral::Int(value)) => Ok((*value >= 0
 			&& *value <= u8::MAX as i64)
 			.then(|| encode_unsigned_value(*value as u64, 1))
 			.transpose()?),
-		(IndexArrowTypeTag::UInt16, ColumnPredicateLiteralV1::Int(value)) => Ok((*value >= 0
+		(IndexArrowTypeTag::UInt16, ColumnPredicateLiteral::Int(value)) => Ok((*value >= 0
 			&& *value <= u16::MAX as i64)
 			.then(|| encode_unsigned_value(*value as u64, 2))
 			.transpose()?),
-		(IndexArrowTypeTag::UInt32, ColumnPredicateLiteralV1::Int(value)) => Ok((*value >= 0
+		(IndexArrowTypeTag::UInt32, ColumnPredicateLiteral::Int(value)) => Ok((*value >= 0
 			&& *value <= u32::MAX as i64)
 			.then(|| encode_unsigned_value(*value as u64, 4))
 			.transpose()?),
-		(IndexArrowTypeTag::UInt64, ColumnPredicateLiteralV1::Int(value)) => Ok((*value >= 0)
+		(IndexArrowTypeTag::UInt64, ColumnPredicateLiteral::Int(value)) => Ok((*value >= 0)
 			.then(|| encode_unsigned_value(*value as u64, 8))
 			.transpose()?),
 		(
@@ -765,14 +765,14 @@ fn encode_secondary_index_literal(
 			| IndexArrowTypeTag::TimestampMillisecond
 			| IndexArrowTypeTag::TimestampMicrosecond
 			| IndexArrowTypeTag::TimestampNanosecond,
-			ColumnPredicateLiteralV1::Ts(value),
+			ColumnPredicateLiteral::Ts(value),
 		) => Ok(Some(encode_signed_value(*value, 8)?)),
 		(
 			IndexArrowTypeTag::Utf8
 			| IndexArrowTypeTag::LargeUtf8
 			| IndexArrowTypeTag::Binary
 			| IndexArrowTypeTag::LargeBinary,
-			ColumnPredicateLiteralV1::Str(value),
+			ColumnPredicateLiteral::Str(value),
 		) => Ok(Some(value.clone())),
 		_ => Ok(None),
 	}
@@ -850,13 +850,13 @@ fn encoded_key_satisfies_upper(encoded_key: &[u8], upper: Option<&IndexBound>) -
 mod tests {
 	use super::*;
 	use crate::schema::pbc::{
-		ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, ColumnPredicateV1, OP_EQ,
-		OP_PUSH_COL, OP_PUSH_INT, Program,
+		ColumnPredicate, ColumnPredicateComparison, ColumnPredicateLiteral, OP_EQ, OP_PUSH_COL,
+		OP_PUSH_INT, Program,
 	};
 	use crate::schema::{
-		IndexArrowTypeTag, IndexKeyEncoding, Locality, LocalityPolicy, PrimaryKeyDescriptorV1,
-		RecordRowIndex, RowIdentityPolicy, SchemaEvolutionPolicyV1, SecondaryIndexKeyDescriptor,
-		TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptor, TableWriteAdmission,
+		IndexArrowTypeTag, IndexKeyEncoding, Locality, LocalityPolicy, PrimaryKeyDescriptor,
+		RecordRowIndex, RowIdentityPolicy, SchemaEvolutionPolicy, SecondaryIndexKeyDescriptor,
+		TableObjectId, TableSchemaCatalog, TableSchemaDescriptor, TableWriteAdmission,
 	};
 	use crate::storage::append_storage_synthetic_columns;
 	use arrow::array::{Int32Array, Int64Array, UInt64Array};
@@ -881,9 +881,9 @@ mod tests {
 				Field::new("id", DataType::Int64, false),
 				Field::new("age", DataType::Int64, true),
 			]),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -1026,10 +1026,10 @@ mod tests {
 		let descriptor = descriptor();
 		let plan = secondary_index_predicate_from_pbc(
 			&descriptor,
-			&[ColumnPredicateV1 {
+			&[ColumnPredicate {
 				column_index: 1,
-				comparison: ColumnPredicateComparisonV1::Eq,
-				literal: ColumnPredicateLiteralV1::Int(42),
+				comparison: ColumnPredicateComparison::Eq,
+				literal: ColumnPredicateLiteral::Int(42),
 			}],
 		)
 		.unwrap();
@@ -1049,15 +1049,15 @@ mod tests {
 		let plan = secondary_index_predicate_from_pbc(
 			&descriptor,
 			&[
-				ColumnPredicateV1 {
+				ColumnPredicate {
 					column_index: 1,
-					comparison: ColumnPredicateComparisonV1::Gte,
-					literal: ColumnPredicateLiteralV1::Int(10),
+					comparison: ColumnPredicateComparison::Gte,
+					literal: ColumnPredicateLiteral::Int(10),
 				},
-				ColumnPredicateV1 {
+				ColumnPredicate {
 					column_index: 1,
-					comparison: ColumnPredicateComparisonV1::Lt,
-					literal: ColumnPredicateLiteralV1::Int(20),
+					comparison: ColumnPredicateComparison::Lt,
+					literal: ColumnPredicateLiteral::Int(20),
 				},
 			],
 		)
@@ -1087,13 +1087,13 @@ mod tests {
 		descriptor.key.arrow_type_tag = IndexArrowTypeTag::Utf8;
 		let plan = secondary_index_predicate_from_pbc(
 			&descriptor,
-			&[ColumnPredicateV1 {
+			&[ColumnPredicate {
 				column_index: 1,
-				comparison: ColumnPredicateComparisonV1::InList,
-				literal: ColumnPredicateLiteralV1::List(vec![
-					ColumnPredicateLiteralV1::Str(b"beta".to_vec()),
-					ColumnPredicateLiteralV1::Str(b"alpha".to_vec()),
-					ColumnPredicateLiteralV1::Str(b"alpha".to_vec()),
+				comparison: ColumnPredicateComparison::InList,
+				literal: ColumnPredicateLiteral::List(vec![
+					ColumnPredicateLiteral::Str(b"beta".to_vec()),
+					ColumnPredicateLiteral::Str(b"alpha".to_vec()),
+					ColumnPredicateLiteral::Str(b"alpha".to_vec()),
 				]),
 			}],
 		)
@@ -1112,7 +1112,7 @@ mod tests {
 		let tenant_id = TenantId::new(7);
 		let table = table();
 		let descriptor = descriptor_for_table(&table);
-		let mut tables = TableSchemaCatalogV1::default();
+		let mut tables = TableSchemaCatalog::default();
 		tables.upsert(tenant_id, table.clone()).unwrap();
 		let mut catalog = SecondaryIndexCatalog::default();
 		catalog
@@ -1146,7 +1146,7 @@ mod tests {
 		let tenant_id = TenantId::new(7);
 		let table = table();
 		let descriptor = descriptor_for_table(&table);
-		let mut tables = TableSchemaCatalogV1::default();
+		let mut tables = TableSchemaCatalog::default();
 		tables.upsert(tenant_id, table.clone()).unwrap();
 		let mut catalog = SecondaryIndexCatalog::default();
 		catalog
@@ -1230,10 +1230,10 @@ mod tests {
 		let descriptor = descriptor();
 		let plan = secondary_index_predicate_from_pbc(
 			&descriptor,
-			&[ColumnPredicateV1 {
+			&[ColumnPredicate {
 				column_index: 1,
-				comparison: ColumnPredicateComparisonV1::Eq,
-				literal: ColumnPredicateLiteralV1::Float(42.0),
+				comparison: ColumnPredicateComparison::Eq,
+				literal: ColumnPredicateLiteral::Float(42.0),
 			}],
 		)
 		.unwrap();

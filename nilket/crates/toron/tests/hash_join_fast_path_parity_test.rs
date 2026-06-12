@@ -12,8 +12,8 @@ use toron::ir::{
 };
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 
 #[tokio::test]
@@ -311,9 +311,9 @@ fn scan_plan(table_id: TableId, schema: SchemaRef, object_byte: u8) -> Execution
 		"default",
 		"join_test",
 		schema.as_ref(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("pk")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("pk")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor");
 

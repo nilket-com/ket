@@ -912,7 +912,7 @@ pub(crate) fn adr062_fixture_worker_source_unchanged() {
 	for forbidden in [
 		"CreateTableRowIdentity",
 		"TableRowIdentity",
-		"PrimaryKeyDescriptorV1",
+		"PrimaryKeyDescriptor",
 		"PRIMARY KEY",
 	] {
 		assert!(

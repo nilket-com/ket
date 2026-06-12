@@ -669,9 +669,9 @@ where
 mod tests {
 	use super::*;
 	use crate::schema::{
-		ColumnBloomSpecV1, ColumnStatsPolicyV1, DurabilityLevel, HybridTimestamp, LocalityPolicy,
+		ColumnBloomSpec, ColumnStatsPolicy, DurabilityLevel, HybridTimestamp, LocalityPolicy,
 		MultiRowLayoutDescriptor, NodeId, RecordLayoutPolicy, RowIdentityPolicy,
-		SchemaEvolutionPolicyV1, encode_table_write_row_count,
+		SchemaEvolutionPolicy, encode_table_write_row_count,
 	};
 	use arrow::array::{
 		ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int64Array, LargeBinaryArray,
@@ -690,7 +690,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnlyContentHash,
 			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -818,9 +818,9 @@ mod tests {
 		let descriptor = descriptor(&schema);
 		let mut retuned = descriptor.clone();
 		retuned.schema_generation = 2;
-		retuned.stats_policy = ColumnStatsPolicyV1 {
-			bloom_filters: vec![ColumnBloomSpecV1::new("event_id")],
-			..ColumnStatsPolicyV1::default()
+		retuned.stats_policy = ColumnStatsPolicy {
+			bloom_filters: vec![ColumnBloomSpec::new("event_id")],
+			..ColumnStatsPolicy::default()
 		};
 		retuned.refresh_descriptor_fingerprints().unwrap();
 		retuned.validate().unwrap();

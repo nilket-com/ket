@@ -75,7 +75,7 @@ mod tests {
 	};
 	use crate::storage::{InMemoryStorageScan, ScanRequest, ScanStream, StorageScan};
 	use wendelon::schema::{
-		KllK, LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		KllK, LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
 		TableObjectId, TableSchemaDescriptor,
 	};
 	use wendelon::storage::file_ops::BlockingFileOps;
@@ -2644,9 +2644,9 @@ mod tests {
 			"default",
 			"sales",
 			schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(primary_key)),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(primary_key)),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -3760,9 +3760,9 @@ mod tests {
 			"default",
 			table,
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}

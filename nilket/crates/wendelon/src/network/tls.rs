@@ -913,7 +913,7 @@ fn verify_chain_against_roots(
 /// the field. This keeps the external claim surface stable without
 /// forcing cert-fixture churn for a new version field.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ActorClaimsV1 {
+pub(crate) struct ActorClaims {
 	pub(crate) role: ActorRole,
 	pub(crate) scopes: Vec<String>,
 	pub(crate) tenant_id: Option<String>,
@@ -1179,7 +1179,7 @@ fn decode_subject_attribute_value(tag: u8, value: &[u8]) -> std::io::Result<Stri
 	}
 }
 
-fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<ActorClaimsV1> {
+fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<ActorClaims> {
 	let mut cert = DerReader::new(cert_der);
 	let certificate = cert.read_tlv(0x30, "certificate")?;
 	let mut certificate = DerReader::new(certificate);
@@ -1213,7 +1213,7 @@ fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<ActorClaimsV1> {
 	let mut extensions = DerReader::new(extensions);
 	let extensions = extensions.read_tlv(0x30, "extensions sequence")?;
 	let mut extensions = DerReader::new(extensions);
-	let mut claims: Option<ActorClaimsV1> = None;
+	let mut claims: Option<ActorClaims> = None;
 
 	while !extensions.is_empty() {
 		let extension = extensions.read_tlv(0x30, "extension")?;
@@ -1255,7 +1255,7 @@ fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<ActorClaimsV1> {
 	})
 }
 
-pub(crate) fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<ActorClaimsV1> {
+pub(crate) fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<ActorClaims> {
 	let mut reader = CborReader::new(bytes);
 	let field_count = reader.read_len_for_major(5, "actor claims map")?;
 	if field_count != ACTOR_CLAIMS_V1_FIELD_COUNT {
@@ -1335,7 +1335,7 @@ pub(crate) fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<ActorClai
 			"actor-claims extension contains trailing CBOR bytes",
 		));
 	}
-	let claims = ActorClaimsV1 {
+	let claims = ActorClaims {
 		role: role.ok_or_else(|| {
 			Error::new(
 				ErrorKind::PermissionDenied,
@@ -1598,7 +1598,7 @@ impl<'a> CborReader<'a> {
 mod tests {
 	use super::{
 		ACTOR_CLAIMS_KEY_ID_FIELD, ACTOR_CLAIMS_ROLE_FIELD, ACTOR_CLAIMS_SCOPES_FIELD,
-		ACTOR_CLAIMS_TENANT_ID_FIELD, ActorClaimsV1, ActorRole, parse_actor_claims_cbor,
+		ACTOR_CLAIMS_TENANT_ID_FIELD, ActorClaims, ActorRole, parse_actor_claims_cbor,
 	};
 
 	#[test]
@@ -1618,7 +1618,7 @@ mod tests {
 		.unwrap();
 		assert_eq!(
 			claims,
-			ActorClaimsV1 {
+			ActorClaims {
 				role: ActorRole::ClusterAdmin,
 				scopes: vec!["cluster".to_string(), "ops".to_string()],
 				tenant_id: None,
@@ -1641,7 +1641,7 @@ mod tests {
 		.unwrap();
 		assert_eq!(
 			claims,
-			ActorClaimsV1 {
+			ActorClaims {
 				role: ActorRole::BackupAdmin,
 				scopes: vec!["tenant".to_string()],
 				tenant_id: Some("42".to_string()),

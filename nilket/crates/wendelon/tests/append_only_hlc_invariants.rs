@@ -22,7 +22,7 @@ use wendelon::schema::table::{
 };
 use wendelon::schema::{
 	HybridTimestamp, IntraBatchIndex, LocalityPolicy, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TenantId, WriterNodeId,
+	SchemaEvolutionPolicy, TableObjectId, TenantId, WriterNodeId,
 };
 use wendelon::storage::multirow::{
 	decode_batch, pack_record_batch_by_bucket, storage_row_table_object_id_at,
@@ -47,7 +47,7 @@ fn append_only_descriptor() -> TableSchemaDescriptor {
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }
@@ -374,7 +374,7 @@ fn append_only_matcher_isolates_distinct_descriptors_with_same_user_schema() {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	};
@@ -397,7 +397,7 @@ fn append_only_matcher_isolates_distinct_descriptors_with_same_user_schema() {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	};

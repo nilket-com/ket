@@ -19,9 +19,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wendelon::schema::{
 	HybridTimestamp, Identity, IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, Locality,
-	LocalityPolicy, PrimaryKeyDescriptorV1, RecordRowIndex, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, SecondaryIndexDescriptor, SecondaryIndexKeyDescriptor, SlabId,
-	TableObjectId, TableSchemaDescriptor, TableWriteAdmission, TenantId,
+	LocalityPolicy, PrimaryKeyDescriptor, RecordRowIndex, RowIdentityPolicy, SchemaEvolutionPolicy,
+	SecondaryIndexDescriptor, SecondaryIndexKeyDescriptor, SlabId, TableObjectId,
+	TableSchemaDescriptor, TableWriteAdmission, TenantId,
 };
 use wendelon::storage::{
 	IndexBound, IndexQuery, RecordLocation, SecondaryIndexCandidateValidation,
@@ -236,9 +236,9 @@ fn table_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error::Error
 			Field::new("id", DataType::UInt64, false),
 			Field::new("age", DataType::Int64, true),
 		]),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?)
 }
 

@@ -1,12 +1,12 @@
 use std::time::Duration;
 use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
-	ComputeTraceContextV1, LOGICAL_TYPE_INTERNAL_NAMESPACE, LOGICAL_TYPE_RESERVED_STATIC_MAX_ID,
+	ComputeTraceContext, LOGICAL_TYPE_INTERNAL_NAMESPACE, LOGICAL_TYPE_RESERVED_STATIC_MAX_ID,
 	LogicalTypeCatalog, LogicalTypeDefinitionCreate, LogicalTypePhysical,
 	LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate, LogicalTypeRefinementValue,
 	LogicalTypeUnit, SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES, SchemaGeneration, SchemaIntentId,
-	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
-	StorageQuotaMetadataV1, StorageStatusKind, UnitOffset, UnitQuantityKind, UnitScale,
+	SchemaMutationKind, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
+	StorageQuotaMetadata, StorageStatusKind, UnitOffset, UnitQuantityKind, UnitScale,
 	decode_logical_type_definition_create, decode_logical_type_definitions,
 	decode_schema_update_envelope_v1, encode_logical_type_definition_create,
 	encode_logical_type_definitions, encode_schema_update_envelope_v1, map_read_status_for_compute,
@@ -66,9 +66,9 @@ fn mock_compute_client_gets_tenant_bound_query_session_handoff() {
 
 #[test]
 fn compute_schema_intent_roundtrips_as_versioned_storage_envelope() {
-	let envelope = SchemaUpdateEnvelopeV1::compute_client_intent(
+	let envelope = SchemaUpdateEnvelope::compute_client_intent(
 		TenantId::new(42),
-		SchemaObjectRefV1 {
+		SchemaObjectRef {
 			kind: SchemaObjectKind::Table,
 			namespace: "analytics".to_string(),
 			name: "events".to_string(),
@@ -76,7 +76,7 @@ fn compute_schema_intent_roundtrips_as_versioned_storage_envelope() {
 		SchemaGeneration::new(7),
 		SchemaGeneration::new(8),
 		SchemaIntentId::new([0xA5; 16]),
-		SchemaMutationKindV1::Alter,
+		SchemaMutationKind::Alter,
 		br#"{"columns":["tenant_id","event_time","payload"]}"#.to_vec(),
 	);
 
@@ -90,9 +90,9 @@ fn compute_schema_intent_roundtrips_as_versioned_storage_envelope() {
 
 #[test]
 fn schema_envelope_rejects_bad_versions_and_oversized_payloads() {
-	let mut envelope = SchemaUpdateEnvelopeV1::compute_client_intent(
+	let mut envelope = SchemaUpdateEnvelope::compute_client_intent(
 		TenantId::new(42),
-		SchemaObjectRefV1 {
+		SchemaObjectRef {
 			kind: SchemaObjectKind::Table,
 			namespace: "analytics".to_string(),
 			name: "events".to_string(),
@@ -100,7 +100,7 @@ fn schema_envelope_rejects_bad_versions_and_oversized_payloads() {
 		SchemaGeneration::new(7),
 		SchemaGeneration::new(8),
 		SchemaIntentId::new([0xA5; 16]),
-		SchemaMutationKindV1::Alter,
+		SchemaMutationKind::Alter,
 		vec![b'x'; SCHEMA_UPDATE_ENVELOPE_V1_MAX_PAYLOAD_BYTES + 1],
 	);
 	assert!(encode_schema_update_envelope_v1(&envelope).is_err());
@@ -127,9 +127,9 @@ fn logical_type_definition_payload_roundtrips_and_uses_schema_object_kind() {
 		unit: None,
 	};
 	let payload = encode_logical_type_definition_create(&create).unwrap();
-	let envelope = SchemaUpdateEnvelopeV1::compute_client_intent(
+	let envelope = SchemaUpdateEnvelope::compute_client_intent(
 		TenantId::new(42),
-		SchemaObjectRefV1 {
+		SchemaObjectRef {
 			kind: SchemaObjectKind::LogicalType,
 			namespace: LOGICAL_TYPE_INTERNAL_NAMESPACE.to_string(),
 			name: "CustomerId".to_string(),
@@ -137,7 +137,7 @@ fn logical_type_definition_payload_roundtrips_and_uses_schema_object_kind() {
 		SchemaGeneration::ZERO,
 		SchemaGeneration::new(1),
 		SchemaIntentId::new([0x90; 16]),
-		SchemaMutationKindV1::Create,
+		SchemaMutationKind::Create,
 		payload.clone(),
 	);
 
@@ -583,13 +583,13 @@ fn storage_status_mapping_keeps_quota_and_retry_semantics_distinct() {
 
 #[test]
 fn compute_trace_context_must_be_valid_w3c_traceparent() {
-	let context = ComputeTraceContextV1 {
+	let context = ComputeTraceContext {
 		traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
 		tracestate: Some("vendor=value".to_string()),
 	};
 	assert!(context.validate().is_ok());
 
-	let invalid = ComputeTraceContextV1 {
+	let invalid = ComputeTraceContext {
 		traceparent: "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01".to_string(),
 		tracestate: None,
 	};
@@ -598,7 +598,7 @@ fn compute_trace_context_must_be_valid_w3c_traceparent() {
 
 #[test]
 fn storage_quota_metadata_validates_tenant_and_usage_bounds() {
-	let metadata = StorageQuotaMetadataV1 {
+	let metadata = StorageQuotaMetadata {
 		tenant_id: TenantId::new(42),
 		epoch: 9,
 		quota_bytes: Some(100),
@@ -608,7 +608,7 @@ fn storage_quota_metadata_validates_tenant_and_usage_bounds() {
 	assert!(metadata.validate_for_tenant(TenantId::new(42)).is_ok());
 	assert!(metadata.validate_for_tenant(TenantId::new(43)).is_err());
 
-	let over = StorageQuotaMetadataV1 {
+	let over = StorageQuotaMetadata {
 		used_bytes: Some(101),
 		..metadata
 	};

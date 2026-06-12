@@ -24,7 +24,7 @@ use toron::sql_planner::SqlPlanner;
 use toron::storage::{HlcBound, InMemoryStorageScan, InMemoryTableStorage, TenantId};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 };
 
 #[test]
@@ -918,7 +918,7 @@ fn mock_descriptor(
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

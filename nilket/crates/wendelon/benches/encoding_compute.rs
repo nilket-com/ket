@@ -32,15 +32,15 @@ use wendelon::crypto::TieredPlaintextRange;
 use wendelon::schema::aggregate::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 };
-use wendelon::schema::pbc::ColumnPredicateLiteralV1;
+use wendelon::schema::pbc::ColumnPredicateLiteral;
 use wendelon::schema::{
 	AggregateRequest, AggregateRequestId, BaseValue, BitsPerValue, BufferValueCount, Consistency,
 	DictValueCount, EncodingCascadeIndex, HybridTimestamp, Identity, IpcBufferIndex,
 	IpcColumnOrdinal, Locality, LocalityPolicy, LogicalSchemaFingerprint, MultiRowLayoutDescriptor,
-	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
+	PrimaryKeyDescriptor, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
 	RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex, RowGroupRowCount,
-	RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId,
-	TableObjectId, TableSchemaDescriptor, TenantId,
+	RowIdentityPolicy, RunCount, SchemaEvolutionPolicy, SimdPageValueCount, SlabId, TableObjectId,
+	TableSchemaDescriptor, TenantId,
 };
 use wendelon::storage::encoding::cascade::{
 	decode_buffer, decode_page, encode_buffer, encode_buffer_with_value_offsets,
@@ -613,24 +613,24 @@ fn encoding_for(
 fn int_atom(op: PredicateAtomOp, literal: i64) -> PredicateAtom {
 	PredicateAtom {
 		op,
-		literal: Some(ColumnPredicateLiteralV1::Int(literal)),
+		literal: Some(ColumnPredicateLiteral::Int(literal)),
 	}
 }
 
 fn string_atom(op: PredicateAtomOp, literal: &[u8]) -> PredicateAtom {
 	PredicateAtom {
 		op,
-		literal: Some(ColumnPredicateLiteralV1::Str(literal.to_vec())),
+		literal: Some(ColumnPredicateLiteral::Str(literal.to_vec())),
 	}
 }
 
 fn string_list_atom(op: PredicateAtomOp, literals: &[Vec<u8>]) -> PredicateAtom {
 	PredicateAtom {
 		op,
-		literal: Some(ColumnPredicateLiteralV1::List(
+		literal: Some(ColumnPredicateLiteral::List(
 			literals
 				.iter()
-				.map(|literal| ColumnPredicateLiteralV1::Str(literal.clone()))
+				.map(|literal| ColumnPredicateLiteral::Str(literal.clone()))
 				.collect(),
 		)),
 	}
@@ -1073,11 +1073,11 @@ fn fsst_row_safe_frame_lengths(
 
 fn fsst_literal_slices(atom: &PredicateAtom) -> Vec<&[u8]> {
 	match atom.literal.as_ref().expect("FSST atom literal") {
-		ColumnPredicateLiteralV1::Str(value) => vec![value.as_slice()],
-		ColumnPredicateLiteralV1::List(values) => values
+		ColumnPredicateLiteral::Str(value) => vec![value.as_slice()],
+		ColumnPredicateLiteral::List(values) => values
 			.iter()
 			.map(|value| match value {
-				ColumnPredicateLiteralV1::Str(value) => value.as_slice(),
+				ColumnPredicateLiteral::Str(value) => value.as_slice(),
 				_ => panic!("FSST bench supports string list literals only"),
 			})
 			.collect(),
@@ -1366,7 +1366,7 @@ fn bench_fsst_row_safe_declined_paths(config: &BenchConfig, rows: usize) -> std:
 		.as_ref()
 		.expect("bench RowSafe literal")
 	{
-		ColumnPredicateLiteralV1::Str(value) => value.clone(),
+		ColumnPredicateLiteral::Str(value) => value.clone(),
 		_ => unreachable!("RowSafe fixture uses string literal"),
 	};
 	let cases = [
@@ -2005,13 +2005,13 @@ fn writer_column_cache_string_descriptor(
 		"bench",
 		"encoding_compute_writer_column_cache",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(1024, 1024, 8 * 1024 * 1024)
 				.expect("bench multi-row layout"),
 		),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
@@ -2087,7 +2087,7 @@ fn bench_fsst_declined_paths(config: &BenchConfig, rows: usize) -> std::io::Resu
 	let fixture = fsst_repeated_prefix_fixture(rows)?;
 	let iterations = config.iterations.max(200);
 	let target_literal = match fixture.atom.literal.as_ref().expect("bench FSST literal") {
-		ColumnPredicateLiteralV1::Str(value) => value.clone(),
+		ColumnPredicateLiteral::Str(value) => value.clone(),
 		_ => unreachable!("FSST fixture uses string literal"),
 	};
 	let cases = [
@@ -2979,7 +2979,7 @@ fn scalar_compare(
 	_coercion: &wendelon::storage::encoding::compute::LiteralCoercion,
 ) -> Vec<bool> {
 	let literal = match atom.literal.as_ref().expect("atom literal") {
-		ColumnPredicateLiteralV1::Int(value) => *value,
+		ColumnPredicateLiteral::Int(value) => *value,
 		_ => panic!("dense baseline supports integer literals only"),
 	};
 	let width = value_byte_width(data_type);
@@ -3004,11 +3004,11 @@ fn scalar_compare(
 fn fsst_dense_string_compare(decoded: &[u8], offsets: &[i32], atom: &PredicateAtom) -> Vec<bool> {
 	let literal = atom.literal.as_ref().expect("FSST atom literal");
 	let literal_values = match literal {
-		ColumnPredicateLiteralV1::Str(value) => vec![value.as_slice()],
-		ColumnPredicateLiteralV1::List(values) => values
+		ColumnPredicateLiteral::Str(value) => vec![value.as_slice()],
+		ColumnPredicateLiteral::List(values) => values
 			.iter()
 			.map(|value| match value {
-				ColumnPredicateLiteralV1::Str(value) => value.as_slice(),
+				ColumnPredicateLiteral::Str(value) => value.as_slice(),
 				_ => panic!("FSST dense baseline supports string lists only"),
 			})
 			.collect::<Vec<_>>(),
@@ -3249,13 +3249,13 @@ fn build_pipeline_fixture_shape(
 		"bench",
 		"encoding_compute_pipeline",
 		schema.as_ref(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(1024, 1024, 8 * 1024 * 1024)
 				.expect("bench multi-row layout"),
 		),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 	let source: Vec<MultiRowSourceRow> = (0..rows)

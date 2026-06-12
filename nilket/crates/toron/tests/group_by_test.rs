@@ -20,8 +20,8 @@ use toron::ir::{
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 
 #[test]
@@ -4192,9 +4192,9 @@ fn descriptor(
 		"default",
 		table,
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(primary_key)),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(primary_key)),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

@@ -18,8 +18,8 @@ pub(crate) use toron::network::tls::{
 };
 pub(crate) use toron::storage::{ScanRequest, ScanStream, StorageScan, TenantId};
 pub(crate) use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 
 pub(crate) fn enum_variant_count(enum_body: &str) -> usize {
@@ -380,9 +380,9 @@ pub(crate) fn descriptor() -> TableSchemaDescriptor {
 		"architecture",
 		"sales",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

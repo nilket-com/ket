@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use wendelon::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, DictValueCount, ExceptionCount, Exponent, Factor,
 	HybridTimestamp, Identity, Locality, LocalityPolicy, MultiRowLayoutDescriptor,
-	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
+	PrimaryKeyDescriptor, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
 	RecordLayoutPolicy, RowCount, RowGroupRowCount, RowIdentityPolicy, RunCount, SampleRowCount,
-	SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId, TableObjectId,
+	SchemaEvolutionPolicy, SimdPageValueCount, SlabId, TableObjectId,
 };
 use wendelon::storage::encoding::cascade::{
 	decode_buffer, decode_page, encode_buffer, encode_buffer_with_value_offsets,
@@ -110,7 +110,7 @@ fn descriptor(
 		"bench",
 		"encoding",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("c0")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("c0")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(4_096, 4_096, 8 * 1024 * 1024).map_err(|err| {
@@ -120,7 +120,7 @@ fn descriptor(
 				)
 			})?,
 		),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.map_err(|err| {
 		Error::new(

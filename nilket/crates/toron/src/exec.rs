@@ -51,8 +51,8 @@ use std::time::Instant;
 use tracing::Instrument;
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, RuntimeFilterDescriptor,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 };
 #[cfg(test)]
 use wendelon::storage::sketch::KllSketch;
@@ -4906,9 +4906,9 @@ fn local_scan_table_pin(table: TableId) -> ScanTablePin {
 		"local",
 		"legacy",
 		&arrow_schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("local scan descriptor must be valid");
 	ScanTablePin {
@@ -6269,8 +6269,8 @@ mod tests {
 	use std::hash::{DefaultHasher, Hash, Hasher};
 	use std::sync::Mutex;
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterBloom,
-		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicyV1,
+		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, RuntimeFilterBloom,
+		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicy,
 		TableObjectId, TableSchemaDescriptor,
 	};
 
@@ -7420,9 +7420,9 @@ mod tests {
 			"default",
 			"sales",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor")
 	}
@@ -7434,9 +7434,9 @@ mod tests {
 			"default",
 			"sales",
 			schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor")
 	}
@@ -7448,9 +7448,9 @@ mod tests {
 			"default",
 			"join_test",
 			schema.as_ref(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("pk")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("pk")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor");
 		ExecutionPlan::Scan {

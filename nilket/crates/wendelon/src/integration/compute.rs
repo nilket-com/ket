@@ -83,7 +83,7 @@ pub enum SchemaObjectKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SchemaObjectRefV1 {
+pub struct SchemaObjectRef {
 	pub kind: SchemaObjectKind,
 	pub namespace: String,
 	pub name: String,
@@ -91,7 +91,7 @@ pub struct SchemaObjectRefV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SchemaMutationKindV1 {
+pub enum SchemaMutationKind {
 	Create,
 	Alter,
 	Drop,
@@ -220,27 +220,27 @@ impl From<SchemaIntentId> for [u8; 16] {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SchemaUpdateEnvelopeV1 {
+pub struct SchemaUpdateEnvelope {
 	pub contract_version: u16,
 	pub origin: SchemaIntentOrigin,
 	pub tenant_id: TenantId,
-	pub object: SchemaObjectRefV1,
+	pub object: SchemaObjectRef,
 	pub expected_generation: SchemaGeneration,
 	pub requested_generation: SchemaGeneration,
 	pub intent_id: SchemaIntentId,
-	pub mutation: SchemaMutationKindV1,
+	pub mutation: SchemaMutationKind,
 	#[serde(with = "serde_bytes")]
 	pub payload: Vec<u8>,
 }
 
-impl SchemaUpdateEnvelopeV1 {
+impl SchemaUpdateEnvelope {
 	pub fn compute_client_intent(
 		tenant_id: TenantId,
-		object: SchemaObjectRefV1,
+		object: SchemaObjectRef,
 		expected_generation: SchemaGeneration,
 		requested_generation: SchemaGeneration,
 		intent_id: SchemaIntentId,
-		mutation: SchemaMutationKindV1,
+		mutation: SchemaMutationKind,
 		payload: Vec<u8>,
 	) -> Self {
 		Self {
@@ -288,7 +288,7 @@ impl SchemaUpdateEnvelopeV1 {
 }
 
 pub fn encode_schema_update_envelope_v1(
-	envelope: &SchemaUpdateEnvelopeV1,
+	envelope: &SchemaUpdateEnvelope,
 ) -> std::io::Result<Vec<u8>> {
 	envelope.validate()?;
 	postcard::to_allocvec(envelope).map_err(|err| {
@@ -299,8 +299,8 @@ pub fn encode_schema_update_envelope_v1(
 	})
 }
 
-pub fn decode_schema_update_envelope_v1(bytes: &[u8]) -> std::io::Result<SchemaUpdateEnvelopeV1> {
-	let envelope: SchemaUpdateEnvelopeV1 = postcard::from_bytes(bytes).map_err(|err| {
+pub fn decode_schema_update_envelope_v1(bytes: &[u8]) -> std::io::Result<SchemaUpdateEnvelope> {
+	let envelope: SchemaUpdateEnvelope = postcard::from_bytes(bytes).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
 			format!("failed to decode schema update envelope: {err}"),
@@ -1014,7 +1014,7 @@ pub fn map_read_status_for_compute(status: ReadStatus) -> StorageStatusKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageQuotaMetadataV1 {
+pub struct StorageQuotaMetadata {
 	pub tenant_id: TenantId,
 	pub epoch: u64,
 	pub quota_bytes: Option<u64>,
@@ -1022,7 +1022,7 @@ pub struct StorageQuotaMetadataV1 {
 	pub charged_bytes: Option<u64>,
 }
 
-impl StorageQuotaMetadataV1 {
+impl StorageQuotaMetadata {
 	pub fn validate_for_tenant(&self, tenant_id: TenantId) -> std::io::Result<()> {
 		if self.tenant_id != tenant_id {
 			return Err(Error::new(
@@ -1043,12 +1043,12 @@ impl StorageQuotaMetadataV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ComputeTraceContextV1 {
+pub struct ComputeTraceContext {
 	pub traceparent: String,
 	pub tracestate: Option<String>,
 }
 
-impl ComputeTraceContextV1 {
+impl ComputeTraceContext {
 	pub fn validate(&self) -> std::io::Result<()> {
 		shared_telemetry::TraceContext {
 			traceparent: self.traceparent.clone(),
@@ -1115,9 +1115,9 @@ mod tests {
 
 	#[test]
 	fn schema_envelope_roundtrips_and_rejects_stale_generation() {
-		let envelope = SchemaUpdateEnvelopeV1::compute_client_intent(
+		let envelope = SchemaUpdateEnvelope::compute_client_intent(
 			TenantId::new(7),
-			SchemaObjectRefV1 {
+			SchemaObjectRef {
 				kind: SchemaObjectKind::Table,
 				namespace: "analytics".to_string(),
 				name: "events".to_string(),
@@ -1125,7 +1125,7 @@ mod tests {
 			1.into(),
 			2.into(),
 			SchemaIntentId::new([9; 16]),
-			SchemaMutationKindV1::Alter,
+			SchemaMutationKind::Alter,
 			b"arrow-schema-v2".to_vec(),
 		);
 		let encoded = encode_schema_update_envelope_v1(&envelope).unwrap();

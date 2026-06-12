@@ -473,7 +473,7 @@ mod tests {
 	use arrow::datatypes::{Field, Schema, TimeUnit};
 	use std::sync::Arc;
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
 		TableObjectId, TableSchemaDescriptor,
 	};
 
@@ -790,9 +790,9 @@ mod tests {
 			"default",
 			"runtime_filter_test",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor")
 		.physical_descriptor_fingerprint

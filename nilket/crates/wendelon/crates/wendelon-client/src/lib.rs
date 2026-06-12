@@ -50,12 +50,12 @@ pub use wendelon::client::{
 };
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
-	ComputeTraceContextV1, DropOperationId, LOGICAL_TYPE_INTERNAL_NAMESPACE,
+	ComputeTraceContext, DropOperationId, LOGICAL_TYPE_INTERNAL_NAMESPACE,
 	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinition, LogicalTypeDefinitionCreate,
 	LogicalTypePhysical, LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate,
 	LogicalTypeRefinementValue, LogicalTypeUnit, SchemaGeneration, SchemaIntentId,
-	SchemaIntentOrigin, SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1,
-	SchemaUpdateEnvelopeV1, StorageQuotaMetadataV1, StorageStatusKind, TableSchemaDropFields,
+	SchemaIntentOrigin, SchemaMutationKind, SchemaObjectKind, SchemaObjectRef,
+	SchemaUpdateEnvelope, StorageQuotaMetadata, StorageStatusKind, TableSchemaDropFields,
 	TableSchemaDropRequest, UnitOffset, UnitQuantityKind, UnitScale, WendelonAdminError,
 	decode_logical_type_definition, decode_logical_type_definitions,
 	decode_schema_update_envelope_v1, encode_logical_type_definition_create,
@@ -75,10 +75,10 @@ pub use wendelon::schema::{
 	ColumnHeavyHitterEntry, ColumnHeavyHitterFact, ColumnNdvFact, ColumnRangeDistributionFact,
 	ColumnRangeFact, Consistency as ReadConsistency, DurabilityLevel as DurabilityClass,
 	IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint, NdvFact, PbcRejectCode,
-	PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1,
-	RangeDistributionBucket, RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicyV1,
+	PhysicalDescriptorFingerprint, PrimaryKeyDescriptor, PrimaryKeyEncoding,
+	RangeDistributionBucket, RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicy,
 	StateDigest, TableObjectId, TableOptimizerFacts, TableSchemaDescriptor,
-	TableSpreadLocalityDescriptorV1, decode_float32_optimizer_fact_scalar,
+	TableSpreadLocalityDescriptor, decode_float32_optimizer_fact_scalar,
 	decode_float64_optimizer_fact_scalar, decode_signed_optimizer_fact_scalar,
 	encode_float32_optimizer_fact_scalar, encode_float64_optimizer_fact_scalar,
 	encode_signed_optimizer_fact_scalar,
@@ -272,7 +272,7 @@ pub struct TableSchemaUpdateRequest {
 	pub tenant_id: TenantId,
 	pub descriptor: TableSchemaDescriptor,
 	pub expected_generation: SchemaGeneration,
-	pub mutation: SchemaMutationKindV1,
+	pub mutation: SchemaMutationKind,
 	pub intent_id: SchemaIntentId,
 }
 
@@ -286,7 +286,7 @@ impl TableSchemaUpdateRequest {
 			tenant_id,
 			descriptor,
 			expected_generation: SchemaGeneration::ZERO,
-			mutation: SchemaMutationKindV1::Create,
+			mutation: SchemaMutationKind::Create,
 			intent_id,
 		}
 	}
@@ -301,22 +301,22 @@ impl TableSchemaUpdateRequest {
 			tenant_id,
 			descriptor,
 			expected_generation: expected_generation.into(),
-			mutation: SchemaMutationKindV1::Alter,
+			mutation: SchemaMutationKind::Alter,
 			intent_id,
 		}
 	}
 
-	pub fn envelope(&self) -> std::io::Result<SchemaUpdateEnvelopeV1> {
-		if self.mutation == SchemaMutationKindV1::Drop {
+	pub fn envelope(&self) -> std::io::Result<SchemaUpdateEnvelope> {
+		if self.mutation == SchemaMutationKind::Drop {
 			return Err(std::io::Error::new(
 				std::io::ErrorKind::InvalidInput,
 				"table schema drops require a rewrite migration and are not supported by this helper",
 			));
 		}
 		let payload = encode_table_schema_descriptor_v1(&self.descriptor)?;
-		Ok(SchemaUpdateEnvelopeV1::compute_client_intent(
+		Ok(SchemaUpdateEnvelope::compute_client_intent(
 			self.tenant_id,
-			SchemaObjectRefV1 {
+			SchemaObjectRef {
 				kind: SchemaObjectKind::Table,
 				namespace: self.descriptor.namespace.clone(),
 				name: self.descriptor.table_name.clone(),
@@ -396,16 +396,16 @@ impl LogicalTypeDefinitionCreateRequest {
 		}
 	}
 
-	pub fn envelope(&self) -> std::io::Result<SchemaUpdateEnvelopeV1> {
+	pub fn envelope(&self) -> std::io::Result<SchemaUpdateEnvelope> {
 		let payload = encode_logical_type_definition_create(&LogicalTypeDefinitionCreate {
 			name: self.name.clone(),
 			physical: self.physical,
 			refinement: self.refinement.clone(),
 			unit: self.unit.clone(),
 		})?;
-		Ok(SchemaUpdateEnvelopeV1::compute_client_intent(
+		Ok(SchemaUpdateEnvelope::compute_client_intent(
 			self.tenant_id,
-			SchemaObjectRefV1 {
+			SchemaObjectRef {
 				kind: SchemaObjectKind::LogicalType,
 				namespace: LOGICAL_TYPE_INTERNAL_NAMESPACE.to_string(),
 				name: self.name.clone(),
@@ -413,7 +413,7 @@ impl LogicalTypeDefinitionCreateRequest {
 			SchemaGeneration::ZERO,
 			SchemaGeneration::new(1),
 			self.intent_id,
-			SchemaMutationKindV1::Create,
+			SchemaMutationKind::Create,
 			payload,
 		))
 	}
@@ -630,7 +630,7 @@ impl Client {
 		tenant_id: TenantId,
 		descriptor: TableSchemaDescriptor,
 		expected_generation: impl Into<SchemaGeneration>,
-		mutation: SchemaMutationKindV1,
+		mutation: SchemaMutationKind,
 		intent_id: SchemaIntentId,
 	) -> TableSchemaUpdateRequest {
 		TableSchemaUpdateRequest {
@@ -1656,9 +1656,9 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -1680,7 +1680,7 @@ mod tests {
 		assert_eq!(envelope.object.name, "events");
 		assert_eq!(envelope.expected_generation, SchemaGeneration::ZERO);
 		assert_eq!(envelope.requested_generation, SchemaGeneration::new(1));
-		assert_eq!(envelope.mutation, SchemaMutationKindV1::Create);
+		assert_eq!(envelope.mutation, SchemaMutationKind::Create);
 		assert_eq!(
 			decode_table_schema_descriptor_v1(&envelope.payload).unwrap(),
 			descriptor
@@ -1693,7 +1693,7 @@ mod tests {
 			tenant_id: TenantId::new(7),
 			descriptor: table_descriptor(2),
 			expected_generation: SchemaGeneration::new(1),
-			mutation: SchemaMutationKindV1::Drop,
+			mutation: SchemaMutationKind::Drop,
 			intent_id: SchemaIntentId::new([0xCD; 16]),
 		};
 

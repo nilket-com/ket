@@ -4,9 +4,9 @@ use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use wendelon::schema::{
 	HybridTimestamp, Identity, IpcColumnOrdinal, Locality, LocalityPolicy,
-	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptor, RecordBodyByteLen, RecordBodyByteOffset,
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex,
-	RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId,
+	RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicy, SlabId, TableObjectId,
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
@@ -24,10 +24,10 @@ fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
 		"test",
 		"row_group_fetch_plan",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }

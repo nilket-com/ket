@@ -1,4 +1,4 @@
-use crate::schema::pbc::ColumnPredicateLiteralV1;
+use crate::schema::pbc::ColumnPredicateLiteral;
 use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -19,11 +19,11 @@ pub enum LiteralValue {
 }
 
 pub fn coerce_literal(
-	literal: Option<&ColumnPredicateLiteralV1>,
+	literal: Option<&ColumnPredicateLiteral>,
 	data_type: &DataType,
 ) -> Option<LiteralCoercion> {
 	let literal = match literal {
-		Some(ColumnPredicateLiteralV1::List(values)) => {
+		Some(ColumnPredicateLiteral::List(values)) => {
 			let values = values
 				.iter()
 				.map(|value| coerce_scalar_literal(value, data_type))
@@ -40,55 +40,53 @@ pub fn coerce_literal(
 }
 
 fn coerce_scalar_literal(
-	literal: &ColumnPredicateLiteralV1,
+	literal: &ColumnPredicateLiteral,
 	data_type: &DataType,
 ) -> Option<LiteralValue> {
 	match (literal, data_type) {
-		(ColumnPredicateLiteralV1::Int(value), DataType::Int8)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Int16)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Int32)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Int64)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Date32)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Date64)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Time32(_))
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Time64(_))
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Duration(_)) => {
+		(ColumnPredicateLiteral::Int(value), DataType::Int8)
+		| (ColumnPredicateLiteral::Int(value), DataType::Int16)
+		| (ColumnPredicateLiteral::Int(value), DataType::Int32)
+		| (ColumnPredicateLiteral::Int(value), DataType::Int64)
+		| (ColumnPredicateLiteral::Int(value), DataType::Date32)
+		| (ColumnPredicateLiteral::Int(value), DataType::Date64)
+		| (ColumnPredicateLiteral::Int(value), DataType::Time32(_))
+		| (ColumnPredicateLiteral::Int(value), DataType::Time64(_))
+		| (ColumnPredicateLiteral::Int(value), DataType::Duration(_)) => {
 			Some(LiteralValue::Signed(i128::from(*value)))
 		}
-		(ColumnPredicateLiteralV1::Ts(value), DataType::Timestamp(_, _)) => {
+		(ColumnPredicateLiteral::Ts(value), DataType::Timestamp(_, _)) => {
 			Some(LiteralValue::Signed(i128::from(*value)))
 		}
-		(ColumnPredicateLiteralV1::Int(value), DataType::Timestamp(_, _)) => {
+		(ColumnPredicateLiteral::Int(value), DataType::Timestamp(_, _)) => {
 			Some(LiteralValue::Signed(i128::from(*value)))
 		}
-		(ColumnPredicateLiteralV1::Int(value), DataType::UInt8)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::UInt16)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::UInt32)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::UInt64) => {
+		(ColumnPredicateLiteral::Int(value), DataType::UInt8)
+		| (ColumnPredicateLiteral::Int(value), DataType::UInt16)
+		| (ColumnPredicateLiteral::Int(value), DataType::UInt32)
+		| (ColumnPredicateLiteral::Int(value), DataType::UInt64) => {
 			u128::try_from(*value).ok().map(LiteralValue::Unsigned)
 		}
-		(ColumnPredicateLiteralV1::Int(value), DataType::Boolean) => match *value {
+		(ColumnPredicateLiteral::Int(value), DataType::Boolean) => match *value {
 			0 => Some(LiteralValue::Boolean(false)),
 			1 => Some(LiteralValue::Boolean(true)),
 			_ => None,
 		},
-		(ColumnPredicateLiteralV1::Float(value), DataType::Float32)
-		| (ColumnPredicateLiteralV1::Float(value), DataType::Float64) => {
-			Some(LiteralValue::Float(*value))
-		}
-		(ColumnPredicateLiteralV1::Int(value), DataType::Float32)
-		| (ColumnPredicateLiteralV1::Int(value), DataType::Float64) => {
+		(ColumnPredicateLiteral::Float(value), DataType::Float32)
+		| (ColumnPredicateLiteral::Float(value), DataType::Float64) => Some(LiteralValue::Float(*value)),
+		(ColumnPredicateLiteral::Int(value), DataType::Float32)
+		| (ColumnPredicateLiteral::Int(value), DataType::Float64) => {
 			Some(LiteralValue::Float(*value as f64))
 		}
-		(ColumnPredicateLiteralV1::Str(value), DataType::Utf8)
-		| (ColumnPredicateLiteralV1::Str(value), DataType::LargeUtf8)
-		| (ColumnPredicateLiteralV1::Str(value), DataType::Utf8View)
-		| (ColumnPredicateLiteralV1::Str(value), DataType::Binary)
-		| (ColumnPredicateLiteralV1::Str(value), DataType::LargeBinary)
-		| (ColumnPredicateLiteralV1::Str(value), DataType::BinaryView) => {
+		(ColumnPredicateLiteral::Str(value), DataType::Utf8)
+		| (ColumnPredicateLiteral::Str(value), DataType::LargeUtf8)
+		| (ColumnPredicateLiteral::Str(value), DataType::Utf8View)
+		| (ColumnPredicateLiteral::Str(value), DataType::Binary)
+		| (ColumnPredicateLiteral::Str(value), DataType::LargeBinary)
+		| (ColumnPredicateLiteral::Str(value), DataType::BinaryView) => {
 			Some(LiteralValue::Bytes(value.clone()))
 		}
-		(ColumnPredicateLiteralV1::Str(value), DataType::FixedSizeBinary(_)) => {
+		(ColumnPredicateLiteral::Str(value), DataType::FixedSizeBinary(_)) => {
 			Some(LiteralValue::Bytes(value.clone()))
 		}
 		_ => None,

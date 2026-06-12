@@ -1,5 +1,5 @@
 use crate::schema::pbc::{
-	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, PredicateTreeV1, Program as PbcProgram,
+	ColumnPredicateComparison, ColumnPredicateLiteral, PredicateTree, Program as PbcProgram,
 };
 use crate::schema::{
 	EncryptedChunkCount, IpcBufferIndex, IpcBufferLength, IpcBufferOffset, IpcColumnOrdinal,
@@ -1402,11 +1402,11 @@ pub fn project_record_batch_for_requirement(
 }
 
 fn predicate_tree_to_row_group_kind(
-	predicate: PredicateTreeV1,
+	predicate: PredicateTree,
 	schema: &Schema,
 ) -> RowGroupPredicateKind {
 	match predicate {
-		PredicateTreeV1::Comparison(predicate) => {
+		PredicateTree::Comparison(predicate) => {
 			let Some(field) = schema.fields().get(predicate.column_index) else {
 				return RowGroupPredicateKind::Unsupported;
 			};
@@ -1415,83 +1415,81 @@ fn predicate_tree_to_row_group_kind(
 			};
 			let col = IpcColumnOrdinal::new(predicate.column_index as u32);
 			match predicate.comparison {
-				ColumnPredicateComparisonV1::Eq => RowGroupPredicateKind::Equality { col, value },
-				ColumnPredicateComparisonV1::Gt => RowGroupPredicateKind::RangeGt { col, value },
-				ColumnPredicateComparisonV1::Gte => RowGroupPredicateKind::RangeGe { col, value },
-				ColumnPredicateComparisonV1::Lt => RowGroupPredicateKind::RangeLt { col, value },
-				ColumnPredicateComparisonV1::Lte => RowGroupPredicateKind::RangeLe { col, value },
-				ColumnPredicateComparisonV1::InList => RowGroupPredicateKind::Unsupported,
+				ColumnPredicateComparison::Eq => RowGroupPredicateKind::Equality { col, value },
+				ColumnPredicateComparison::Gt => RowGroupPredicateKind::RangeGt { col, value },
+				ColumnPredicateComparison::Gte => RowGroupPredicateKind::RangeGe { col, value },
+				ColumnPredicateComparison::Lt => RowGroupPredicateKind::RangeLt { col, value },
+				ColumnPredicateComparison::Lte => RowGroupPredicateKind::RangeLe { col, value },
+				ColumnPredicateComparison::InList => RowGroupPredicateKind::Unsupported,
 			}
 		}
-		PredicateTreeV1::IsNull { column_index } => RowGroupPredicateKind::IsNull {
+		PredicateTree::IsNull { column_index } => RowGroupPredicateKind::IsNull {
 			col: IpcColumnOrdinal::new(column_index as u32),
 		},
-		PredicateTreeV1::IsNotNull { column_index } => RowGroupPredicateKind::IsNotNull {
+		PredicateTree::IsNotNull { column_index } => RowGroupPredicateKind::IsNotNull {
 			col: IpcColumnOrdinal::new(column_index as u32),
 		},
-		PredicateTreeV1::And(branches) => RowGroupPredicateKind::And(
+		PredicateTree::And(branches) => RowGroupPredicateKind::And(
 			branches
 				.into_iter()
 				.map(|branch| predicate_tree_to_row_group_kind(branch, schema))
 				.collect(),
 		),
-		PredicateTreeV1::Or(branches) => RowGroupPredicateKind::Or(
+		PredicateTree::Or(branches) => RowGroupPredicateKind::Or(
 			branches
 				.into_iter()
 				.map(|branch| predicate_tree_to_row_group_kind(branch, schema))
 				.collect(),
 		),
-		PredicateTreeV1::AlwaysTrue => RowGroupPredicateKind::AlwaysTrue,
-		PredicateTreeV1::Unsupported => RowGroupPredicateKind::Unsupported,
+		PredicateTree::AlwaysTrue => RowGroupPredicateKind::AlwaysTrue,
+		PredicateTree::Unsupported => RowGroupPredicateKind::Unsupported,
 	}
 }
 
 fn literal_to_canonical(
 	data_type: &DataType,
-	literal: &ColumnPredicateLiteralV1,
+	literal: &ColumnPredicateLiteral,
 ) -> Option<CanonicalScalar> {
 	let tag = arrow_stats_type_tag(data_type)?;
 	let bytes = match (data_type, literal) {
-		(DataType::Int8, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Int8, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 1).ok()?
 		}
-		(DataType::Int16, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Int16, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 2).ok()?
 		}
-		(DataType::Int32, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Int32, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 4).ok()?
 		}
-		(DataType::Int64, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Int64, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 8).ok()?
 		}
-		(DataType::UInt8, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::UInt8, ColumnPredicateLiteral::Int(value)) => {
 			encode_unsigned_stat_value(u64::try_from(*value).ok()?, 1).ok()?
 		}
-		(DataType::UInt16, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::UInt16, ColumnPredicateLiteral::Int(value)) => {
 			encode_unsigned_stat_value(u64::try_from(*value).ok()?, 2).ok()?
 		}
-		(DataType::UInt32, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::UInt32, ColumnPredicateLiteral::Int(value)) => {
 			encode_unsigned_stat_value(u64::try_from(*value).ok()?, 4).ok()?
 		}
-		(DataType::UInt64, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::UInt64, ColumnPredicateLiteral::Int(value)) => {
 			encode_unsigned_stat_value(u64::try_from(*value).ok()?, 8).ok()?
 		}
-		(DataType::Date32, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Date32, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 4).ok()?
 		}
-		(DataType::Date64, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Date64, ColumnPredicateLiteral::Int(value)) => {
 			encode_signed_stat_value(*value, 8).ok()?
 		}
-		(DataType::Timestamp(TimeUnit::Millisecond, _), ColumnPredicateLiteralV1::Ts(value))
-		| (DataType::Timestamp(TimeUnit::Microsecond, _), ColumnPredicateLiteralV1::Ts(value))
-		| (DataType::Timestamp(TimeUnit::Nanosecond, _), ColumnPredicateLiteralV1::Ts(value)) => {
+		(DataType::Timestamp(TimeUnit::Millisecond, _), ColumnPredicateLiteral::Ts(value))
+		| (DataType::Timestamp(TimeUnit::Microsecond, _), ColumnPredicateLiteral::Ts(value))
+		| (DataType::Timestamp(TimeUnit::Nanosecond, _), ColumnPredicateLiteral::Ts(value)) => {
 			encode_signed_stat_value(*value, 8).ok()?
 		}
-		(DataType::Utf8 | DataType::LargeUtf8, ColumnPredicateLiteralV1::Str(bytes))
-		| (DataType::Binary | DataType::LargeBinary, ColumnPredicateLiteralV1::Str(bytes)) => {
-			bytes.clone()
-		}
-		(DataType::Boolean, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Utf8 | DataType::LargeUtf8, ColumnPredicateLiteral::Str(bytes))
+		| (DataType::Binary | DataType::LargeBinary, ColumnPredicateLiteral::Str(bytes)) => bytes.clone(),
+		(DataType::Boolean, ColumnPredicateLiteral::Int(value)) => {
 			encode_bool_stat_value(*value != 0).to_vec()
 		}
 		_ => return None,

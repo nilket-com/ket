@@ -1,6 +1,5 @@
 use crate::schema::pbc::{
-	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, ColumnPredicateV1, PredicateTreeV1,
-	Program,
+	ColumnPredicate, ColumnPredicateComparison, ColumnPredicateLiteral, PredicateTree, Program,
 };
 use std::sync::Arc;
 
@@ -54,7 +53,7 @@ pub struct EncodedInList {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PredicateAtom {
 	pub op: PredicateAtomOp,
-	pub literal: Option<ColumnPredicateLiteralV1>,
+	pub literal: Option<ColumnPredicateLiteral>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -71,7 +70,7 @@ pub enum PredicateAtomOp {
 }
 
 impl PredicateAtom {
-	pub fn from_column_predicate(predicate: &ColumnPredicateV1) -> Self {
+	pub fn from_column_predicate(predicate: &ColumnPredicate) -> Self {
 		Self {
 			op: PredicateAtomOp::from(predicate.comparison),
 			literal: Some(predicate.literal.clone()),
@@ -93,9 +92,9 @@ impl PredicateAtom {
 	}
 }
 
-pub fn encoded_predicate_node_from_tree(tree: &PredicateTreeV1) -> Option<EncodedPredicateNode> {
+pub fn encoded_predicate_node_from_tree(tree: &PredicateTree) -> Option<EncodedPredicateNode> {
 	match tree {
-		PredicateTreeV1::Comparison(predicate) => {
+		PredicateTree::Comparison(predicate) => {
 			let column = EncodedColumnRef {
 				column_index: predicate.column_index,
 			};
@@ -109,39 +108,39 @@ pub fn encoded_predicate_node_from_tree(tree: &PredicateTreeV1) -> Option<Encode
 				}))
 			}
 		}
-		PredicateTreeV1::IsNull { column_index } => {
+		PredicateTree::IsNull { column_index } => {
 			Some(EncodedPredicateNode::IsNull(EncodedColumnRef {
 				column_index: *column_index,
 			}))
 		}
-		PredicateTreeV1::IsNotNull { column_index } => {
+		PredicateTree::IsNotNull { column_index } => {
 			Some(EncodedPredicateNode::IsNotNull(EncodedColumnRef {
 				column_index: *column_index,
 			}))
 		}
-		PredicateTreeV1::And(branches) => branches
+		PredicateTree::And(branches) => branches
 			.iter()
 			.map(encoded_predicate_node_from_tree)
 			.collect::<Option<Vec<_>>>()
 			.map(EncodedPredicateNode::And),
-		PredicateTreeV1::Or(branches) => branches
+		PredicateTree::Or(branches) => branches
 			.iter()
 			.map(encoded_predicate_node_from_tree)
 			.collect::<Option<Vec<_>>>()
 			.map(EncodedPredicateNode::Or),
-		PredicateTreeV1::AlwaysTrue | PredicateTreeV1::Unsupported => None,
+		PredicateTree::AlwaysTrue | PredicateTree::Unsupported => None,
 	}
 }
 
-impl From<ColumnPredicateComparisonV1> for PredicateAtomOp {
-	fn from(value: ColumnPredicateComparisonV1) -> Self {
+impl From<ColumnPredicateComparison> for PredicateAtomOp {
+	fn from(value: ColumnPredicateComparison) -> Self {
 		match value {
-			ColumnPredicateComparisonV1::Eq => Self::Eq,
-			ColumnPredicateComparisonV1::Gt => Self::Gt,
-			ColumnPredicateComparisonV1::Gte => Self::Gte,
-			ColumnPredicateComparisonV1::Lt => Self::Lt,
-			ColumnPredicateComparisonV1::Lte => Self::Lte,
-			ColumnPredicateComparisonV1::InList => Self::InList,
+			ColumnPredicateComparison::Eq => Self::Eq,
+			ColumnPredicateComparison::Gt => Self::Gt,
+			ColumnPredicateComparison::Gte => Self::Gte,
+			ColumnPredicateComparison::Lt => Self::Lt,
+			ColumnPredicateComparison::Lte => Self::Lte,
+			ColumnPredicateComparison::InList => Self::InList,
 		}
 	}
 }

@@ -104,3 +104,29 @@ in [no-premature-backward-compat.md](no-premature-backward-compat.md).
 - When *reviewing* a diff, flag suffix-versioned new types and
   ask whether the suffix is load-bearing or cosmetic. Cosmetic
   suffixes should be removed before merge.
+
+## The 2026-06 purge (executed; the rule is now also a guard)
+
+The legacy `*V1` identifier population was mechanically de-versioned
+in one behavior-neutral chore (23 schema/descriptor type families
+across both crates) after the operator retired the "V1 milestone"
+concept entirely — including the `prioritization.md` north-star
+language ("first query with integrity") that the suffixes implicitly
+referenced. The survivors are the load-bearing exceptions that prove
+the rule, each with a real coexisting V2:
+
+- `TIERED_SLABS_TABLE_V1` / `RECORD_VALUE_LEN_V1` (storage/index.rs)
+  — genuine on-disk record-format versions with a live v1→v2
+  migration;
+- `WDV1` (encoding/cascade) — a magic byte-tag in persisted data,
+  beside `WVB2`/`WVL2`;
+- hash-domain strings (`b"toron.trace.v1"`, audit chain tags,
+  `wendelon.default.v1`) — domain-separation inputs whose bytes are
+  load-bearing.
+
+**Prose rule (same class as the adr043 substring discipline):** the
+"v1" *idiom* ("the v1 scope", "in v1") is banned from code, error
+messages, and council docs — write "this cut's scope" / "first cut" /
+"deferred". An architecture guard
+(`no_new_v1_suffixed_identifiers`) pins the identifier rule with the
+surviving exceptions as its explicit allowlist.

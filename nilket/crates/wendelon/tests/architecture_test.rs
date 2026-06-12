@@ -7105,7 +7105,7 @@ fn adr074_table_query_meta_widens_tail_without_extension_or_v1_sidecar() {
 	for forbidden in [
 		"TableQueryRequestMetaV1",
 		"TableQueryRequestMetaExtension",
-		"ComputeTraceContextV1",
+		"ComputeTraceContext",
 	] {
 		assert!(
 			!schema.contains(forbidden),
@@ -7359,8 +7359,8 @@ fn adr074_carrier_does_not_transmit_compute_trace_context_v1() {
 		"pub struct TableQueryOptions",
 		"pub struct WriteReceipt",
 	);
-	assert!(!schema.contains("ComputeTraceContextV1"));
-	assert!(!options_region.contains("ComputeTraceContextV1"));
+	assert!(!schema.contains("ComputeTraceContext"));
+	assert!(!options_region.contains("ComputeTraceContext"));
 }
 
 #[test]

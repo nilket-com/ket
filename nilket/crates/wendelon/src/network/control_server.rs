@@ -18,7 +18,7 @@ use crate::consensus::{
 use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
 use crate::integration::compute::{
-	SchemaMutationKindV1, TableSchemaDropRequest, WendelonAdminError,
+	SchemaMutationKind, TableSchemaDropRequest, WendelonAdminError,
 	decode_schema_update_envelope_v1, encode_logical_type_definition,
 	encode_logical_type_definitions,
 };
@@ -1286,7 +1286,7 @@ impl WendelonControlServer {
 			== crate::integration::compute::SchemaObjectKind::Table
 			&& matches!(
 				envelope.mutation,
-				SchemaMutationKindV1::Create | SchemaMutationKindV1::Alter
+				SchemaMutationKind::Create | SchemaMutationKind::Alter
 			) {
 			match decode_table_schema_descriptor_v1(&envelope.payload) {
 				Ok(descriptor) => {
@@ -4335,8 +4335,8 @@ mod tests {
 	use crate::network::transport::{TransportTier, TransportTierSet};
 	use crate::schema::table::{decode_descriptor_wire_name, encode_descriptor_wire_name};
 	use crate::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RetentionWindowMillis,
-		RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableSchemaCatalogV1,
+		LocalityPolicy, PrimaryKeyDescriptor, RecordBodyCompressionPolicy, RetentionWindowMillis,
+		RowIdentityPolicy, SchemaEvolutionPolicy, SlabId, TableSchemaCatalog,
 		decode_table_schema_descriptor_v1, encode_table_schema_descriptor_v1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
@@ -4369,9 +4369,9 @@ mod tests {
 			namespace,
 			table_name,
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -4400,7 +4400,7 @@ mod tests {
 		let table_object_id = TableObjectId::new([0x72; 16]);
 		let v1 = descriptor_for_get(table_object_id, 1, "analytics", "events");
 		let v2 = descriptor_for_get(table_object_id, 2, "analytics", "events");
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant_id, v1).unwrap();
 		catalog.upsert(tenant_id, v2.clone()).unwrap();
 
@@ -4416,7 +4416,7 @@ mod tests {
 		let table_object_id = TableObjectId::new([0x73; 16]);
 		let old = descriptor_for_get(table_object_id, 1, "analytics", "events");
 		let latest = descriptor_for_get(table_object_id, 3, "analytics", "events");
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant_id, old.clone()).unwrap();
 		catalog.upsert(tenant_id, latest.clone()).unwrap();
 
@@ -4453,7 +4453,7 @@ mod tests {
 		let tenant_id = TenantId::new(7);
 		let table_object_id = TableObjectId::new([0x74; 16]);
 		let descriptor = descriptor_for_get(table_object_id, 1, "analytics", "events");
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant_id, descriptor).unwrap();
 
 		assert!(
@@ -4568,7 +4568,7 @@ mod tests {
 		let tenant_id = TenantId::new(7);
 		let descriptor =
 			descriptor_for_get(TableObjectId::new([0x75; 16]), 4, "analytics", "events");
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant_id, descriptor.clone()).unwrap();
 
 		let latest = catalog
@@ -4679,9 +4679,9 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		assert_eq!(
@@ -4709,9 +4709,9 @@ mod tests {
 			"analytics",
 			"events",
 			&evolved_schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		assert_eq!(

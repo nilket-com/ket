@@ -5,13 +5,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use wendelon::consensus::{SetTableRetentionPolicy, WendelonRequest, WendelonResponse};
 use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
-	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+	SchemaMutationKind, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
 	encode_schema_update_envelope_v1,
 };
 use wendelon::schema::{
 	HybridTimestamp, LocalityPolicy, MultiRowLayoutDescriptor, PolicyGeneration,
-	PrimaryKeyDescriptorV1, RecordLayoutPolicy, RetentionRejectCode, RetentionWindowMillis,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableRetentionPolicy,
+	PrimaryKeyDescriptor, RecordLayoutPolicy, RetentionRejectCode, RetentionWindowMillis,
+	RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId, TableRetentionPolicy,
 	TableSchemaDescriptor, TenantId, encode_table_schema_descriptor_v1,
 };
 
@@ -32,7 +32,7 @@ fn append_only_descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescripto
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }
@@ -44,20 +44,20 @@ fn pk_descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptor {
 		"analytics",
 		table_name,
 		&table_schema(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }
 
 fn schema_update(descriptor: &TableSchemaDescriptor, intent_byte: u8) -> Vec<u8> {
 	let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
-	let envelope = SchemaUpdateEnvelopeV1 {
+	let envelope = SchemaUpdateEnvelope {
 		contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 		origin: SchemaIntentOrigin::ComputeClient,
 		tenant_id: TenantId::ZERO,
-		object: SchemaObjectRefV1 {
+		object: SchemaObjectRef {
 			kind: SchemaObjectKind::Table,
 			namespace: descriptor.namespace.clone(),
 			name: descriptor.table_name.clone(),
@@ -65,7 +65,7 @@ fn schema_update(descriptor: &TableSchemaDescriptor, intent_byte: u8) -> Vec<u8>
 		expected_generation: SchemaGeneration::ZERO,
 		requested_generation: SchemaGeneration::new(descriptor.schema_generation),
 		intent_id: SchemaIntentId::new([intent_byte; 16]),
-		mutation: SchemaMutationKindV1::Create,
+		mutation: SchemaMutationKind::Create,
 		payload,
 	};
 	encode_schema_update_envelope_v1(&envelope).unwrap()

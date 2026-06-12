@@ -19,9 +19,9 @@ use crate::ir::{
 use crate::storage::TenantId;
 use wendelon::integration::compute::SchemaIntentId;
 use wendelon::schema::{
-	LocalityPolicy, MultiRowLayoutDescriptor, PhysicalDescriptorFingerprint,
-	PrimaryKeyDescriptorV1, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
+	LocalityPolicy, MultiRowLayoutDescriptor, PhysicalDescriptorFingerprint, PrimaryKeyDescriptor,
+	RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor, TenantId as WendelonTenantId,
 };
 use wendelon_client::{
 	Client, ClientError, DropOperationId, LogicalTypeDefinition, NdvFact as StorageNdvFact,
@@ -2961,7 +2961,7 @@ impl Catalog for WendelonCatalog {
 			row_identity_policy,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.map_err(|error| CatalogError::FingerprintResolution {
 			message: error.to_string(),
@@ -3179,7 +3179,7 @@ fn create_table_descriptor(
 		row_identity_policy,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.map_err(|error| CatalogError::FingerprintResolution {
 		message: error.to_string(),
@@ -3199,9 +3199,9 @@ fn create_table_row_identity_policy(
 				.map_err(|_| CatalogError::SchemaMismatch {
 					table: table_name(table),
 				})?;
-			Ok(RowIdentityPolicy::PrimaryKey(
-				PrimaryKeyDescriptorV1::single(column.as_str()),
-			))
+			Ok(RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(
+				column.as_str(),
+			)))
 		}
 	}
 }
@@ -3316,7 +3316,7 @@ mod tests {
 	use std::time::Duration;
 	use tokio::time::{sleep, timeout};
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
 		TableObjectId, TableSchemaDescriptor,
 	};
 	use wendelon_client::LogicalTypePhysical;
@@ -5347,9 +5347,9 @@ mod tests {
 			"bench",
 			"orders",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor")
 	}
@@ -5400,9 +5400,9 @@ mod tests {
 			namespace,
 			table_name,
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor")
 	}

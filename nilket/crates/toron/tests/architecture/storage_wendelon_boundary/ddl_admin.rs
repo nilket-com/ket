@@ -369,7 +369,7 @@ pub(crate) fn adr033_planner_rejects_ctas_column_list_while_allowing_if_not_exis
 	assert!(lower_ctas.contains("if_not_exists: *if_not_exists"));
 	assert!(!lower_ctas.contains("CTAS does not support IF NOT EXISTS in v1"));
 	assert!(lower_ctas.contains("if !columns.is_empty()"));
-	assert!(lower_ctas.contains("CTAS does not support explicit column lists in v1"));
+	assert!(lower_ctas.contains("CTAS does not support explicit column lists"));
 }
 
 #[test]

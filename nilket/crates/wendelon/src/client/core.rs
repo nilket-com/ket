@@ -3528,9 +3528,9 @@ mod tests {
 		TransportConnection, TransportProvider, TransportStream, TransportTier,
 	};
 	use crate::schema::{
-		ClientWriteId, ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicy, NdvFact,
-		PrimaryKeyDescriptorV1, ProjectionFunctionV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableOptimizerFacts, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
+		ClientWriteId, ClusteringColumnSpec, ColumnLocalityDescriptor, LocalityPolicy, NdvFact,
+		PrimaryKeyDescriptor, ProjectionFunction, RowIdentityPolicy, SchemaEvolutionPolicy,
+		TableObjectId, TableOptimizerFacts, TableSchemaDescriptor, TableSpreadLocalityDescriptor,
 		encode_table_optimizer_facts, encode_table_schema_descriptor_v1,
 		encode_table_schema_descriptors,
 	};
@@ -3765,9 +3765,9 @@ mod tests {
 			"client",
 			"items",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			locality_policy,
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -4201,7 +4201,7 @@ mod tests {
 	#[test]
 	fn table_query_route_uses_first_table_spread_prefix() {
 		let tenant_id = TenantId::new(9);
-		let spread = TableSpreadLocalityDescriptorV1 {
+		let spread = TableSpreadLocalityDescriptor {
 			spread_factor: 4,
 			prefix_bits: 12,
 		};
@@ -4218,13 +4218,13 @@ mod tests {
 	#[test]
 	fn table_query_route_uses_first_column_projection_prefix() {
 		let tenant_id = TenantId::new(9);
-		let projection = ColumnLocalityDescriptorV1 {
-			columns: vec![ClusteringColumnSpecV1 {
+		let projection = ColumnLocalityDescriptor {
+			columns: vec![ClusteringColumnSpec {
 				name: "id".to_owned(),
 				width_bits: 16,
 				string_prefix_bytes: None,
 			}],
-			projection: ProjectionFunctionV1::ZOrder,
+			projection: ProjectionFunction::ZOrder,
 			spread_factor: 4,
 			prefix_bits: 12,
 		};

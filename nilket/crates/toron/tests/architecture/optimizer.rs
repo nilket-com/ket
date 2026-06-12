@@ -1745,7 +1745,7 @@ pub(crate) fn adr142_default_stats_policy_stays_empty() {
 	assert!(
 		table.contains("#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]")
 	);
-	assert!(table.contains("stats_policy: ColumnStatsPolicyV1::default()"));
+	assert!(table.contains("stats_policy: ColumnStatsPolicy::default()"));
 }
 
 #[test]
@@ -1782,7 +1782,7 @@ pub(crate) fn adr144_default_stats_policy_remains_empty() {
 	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
 		.expect("read Wendelon slab manager");
 
-	assert!(table.contains("stats_policy: ColumnStatsPolicyV1::default()"));
+	assert!(table.contains("stats_policy: ColumnStatsPolicy::default()"));
 	assert!(manager.contains("range_fact_with_empty_stats_policy_is_produced_from_min_max"));
 }
 

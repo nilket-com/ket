@@ -30,8 +30,8 @@ use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
 use toron::sql_planner::SqlPlanner;
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 
 struct FixtureWorkerProcess {
@@ -1776,9 +1776,9 @@ fn test_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 		"default",
 		"fixture",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("val")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("val")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }
@@ -1790,9 +1790,9 @@ fn named_descriptor(id_byte: u8, table: &str, schema: Schema) -> TableSchemaDesc
 		"default",
 		table,
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

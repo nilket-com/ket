@@ -1,6 +1,6 @@
 use arrow::datatypes::DataType;
 use wendelon::schema::PageNullCount;
-use wendelon::schema::pbc::ColumnPredicateLiteralV1;
+use wendelon::schema::pbc::ColumnPredicateLiteral;
 use wendelon::storage::encoding::predicate_page_fetch::{
 	PagePredicateClassification, classify_page_stats_for_atom,
 };
@@ -26,7 +26,7 @@ fn int64_stat(min: i64, max: i64, nulls: u32) -> EncodingPageStats {
 fn int64_atom(op: PredicateAtomOp, value: i64) -> PredicateAtom {
 	PredicateAtom {
 		op,
-		literal: Some(ColumnPredicateLiteralV1::Int(value)),
+		literal: Some(ColumnPredicateLiteral::Int(value)),
 	}
 }
 

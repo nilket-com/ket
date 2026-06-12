@@ -533,7 +533,7 @@ pub(crate) fn adr062_wendelon_catalog_maps_primary_key_descriptor() {
 		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
 
 	assert!(catalog.contains("CreateTableRowIdentity::PrimaryKey"));
-	assert!(catalog.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single"));
+	assert!(catalog.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single"));
 	assert!(catalog.contains("RowIdentityPolicy::AppendOnly"));
 }
 
@@ -620,7 +620,7 @@ pub(crate) fn adr038_wendelon_create_row_identity_policy_is_create_request_drive
 	assert!(catalog.contains("CreateTableRowIdentity::AppendOnly"));
 	assert!(catalog.contains("CreateTableRowIdentity::PrimaryKey"));
 	assert!(catalog.contains("RowIdentityPolicy::AppendOnly"));
-	assert!(catalog.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single"));
+	assert!(catalog.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single"));
 	assert!(!catalog.contains("RowIdentityPolicy::ByOrdinal"));
 }
 

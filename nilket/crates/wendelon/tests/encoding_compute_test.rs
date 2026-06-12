@@ -2,15 +2,15 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::time::Duration;
 use wendelon::metrics::MetricsRegistry;
 use wendelon::schema::pbc::{
-	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, ColumnPredicateV1, PredicateTreeV1,
+	ColumnPredicate, ColumnPredicateComparison, ColumnPredicateLiteral, PredicateTree,
 };
 use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, AggregateState, BaseValue, BitsPerValue,
 	BufferValueCount, Consistency, EncodingCascadeIndex, EncodingPageByteOffset, HybridTimestamp,
 	IpcBufferIndex, IpcColumnOrdinal, Locality, LocalityPolicy, LocalityRange,
-	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordLayoutPolicy,
-	RowCount, RowGroupIndex, RowIdentityPolicy, SchemaEvolutionPolicyV1, SimdPageValueCount,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptor, RecordBodyByteLen, RecordLayoutPolicy,
+	RowCount, RowGroupIndex, RowIdentityPolicy, SchemaEvolutionPolicy, SimdPageValueCount,
 	TableObjectId, TableSchemaDescriptor, TenantId, encode_aggregate_state,
 };
 use wendelon::schema::{DictValueCount, RunCount};
@@ -307,7 +307,7 @@ fn bitpacked_predicate_evaluator_matches_decoded_values() {
 		page_stats: Vec::new(),
 	};
 
-	let literal = ColumnPredicateLiteralV1::Int(5);
+	let literal = ColumnPredicateLiteral::Int(5);
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(literal.clone()),
@@ -319,9 +319,9 @@ fn bitpacked_predicate_evaluator_matches_decoded_values() {
 		vec![false, false, false, true, true, false, false, false]
 	);
 
-	let literal = ColumnPredicateLiteralV1::List(vec![
-		ColumnPredicateLiteralV1::Int(1),
-		ColumnPredicateLiteralV1::Int(7),
+	let literal = ColumnPredicateLiteral::List(vec![
+		ColumnPredicateLiteral::Int(1),
+		ColumnPredicateLiteral::Int(7),
 	]);
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::InList,
@@ -372,7 +372,7 @@ fn fsst_predicate_evaluator_matches_decoded_string_oracle() {
 	};
 	let offset_bytes = offsets_i32_bytes(&offsets);
 
-	let eq_literal = ColumnPredicateLiteralV1::Str(b"/checkout/confirm".to_vec());
+	let eq_literal = ColumnPredicateLiteral::Str(b"/checkout/confirm".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(eq_literal.clone()),
@@ -421,9 +421,9 @@ fn fsst_predicate_evaluator_matches_decoded_string_oracle() {
 			.collect::<Vec<_>>()
 	);
 
-	let list_literal = ColumnPredicateLiteralV1::List(vec![
-		ColumnPredicateLiteralV1::Str(b"/cart/view".to_vec()),
-		ColumnPredicateLiteralV1::Str(Vec::new()),
+	let list_literal = ColumnPredicateLiteral::List(vec![
+		ColumnPredicateLiteral::Str(b"/cart/view".to_vec()),
+		ColumnPredicateLiteral::Str(Vec::new()),
 	]);
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::InList,
@@ -478,7 +478,7 @@ fn fsst_length_prefilter_records_zero_byte_comparisons_for_disjoint_lengths() {
 		page_end_offsets: encoded.page_end_offsets.clone(),
 		page_stats: Vec::new(),
 	};
-	let literal = ColumnPredicateLiteralV1::Str(b"x".to_vec());
+	let literal = ColumnPredicateLiteral::Str(b"x".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(literal.clone()),
@@ -536,7 +536,7 @@ fn fsst_streaming_reader_handles_symbol_crossing_row_boundary() {
 		page_end_offsets: encoded.page_end_offsets.clone(),
 		page_stats: Vec::new(),
 	};
-	let literal = ColumnPredicateLiteralV1::Str(b"B".to_vec());
+	let literal = ColumnPredicateLiteral::Str(b"B".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(literal.clone()),
@@ -588,7 +588,7 @@ fn fsst_offset_corruption_fails_closed() {
 		page_stats: Vec::new(),
 	};
 	offsets[2] = 1;
-	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
+	let literal = ColumnPredicateLiteral::Str(b"alpha".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(literal.clone()),
@@ -613,7 +613,7 @@ fn fsst_offset_corruption_fails_closed() {
 #[test]
 fn fsst_malformed_frames_fail_closed() {
 	let data_type = DataType::Utf8;
-	let literal = ColumnPredicateLiteralV1::Str(b"A".to_vec());
+	let literal = ColumnPredicateLiteral::Str(b"A".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(literal.clone()),
@@ -648,7 +648,7 @@ fn fsst_malformed_frames_fail_closed() {
 fn fsst_large_and_binary_types_match_decoded_oracle() {
 	let values: &[&[u8]] = &[b"alpha", b"beta", b"alpha", b"", b"\xff-bin"];
 	let (decoded, offsets) = variable_width_payload(values);
-	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
+	let literal = ColumnPredicateLiteral::Str(b"alpha".to_vec());
 	for data_type in [DataType::LargeUtf8, DataType::Binary, DataType::LargeBinary] {
 		let cascade = EncodingCascade::FsstWholeBuffer {
 			symbol_table_byte_len: RecordBodyByteLen::ZERO,
@@ -737,7 +737,7 @@ fn fsst_decodes_encoded_offsets_buffer() {
 		page_end_offsets: encoded_offsets.page_end_offsets.clone(),
 		page_stats: Vec::new(),
 	};
-	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
+	let literal = ColumnPredicateLiteral::Str(b"alpha".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(literal.clone()),
@@ -785,7 +785,7 @@ fn fsst_row_safe_predicate_evaluator_matches_encoded_literal_oracle() {
 	let encoding = fsst_test_encoding(decoded.len(), values.len(), encoded.bytes.len());
 	let offset_bytes = offsets_i32_bytes(&offsets);
 
-	let eq_literal = ColumnPredicateLiteralV1::Str(b"/checkout/confirm".to_vec());
+	let eq_literal = ColumnPredicateLiteral::Str(b"/checkout/confirm".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(eq_literal.clone()),
@@ -834,10 +834,10 @@ fn fsst_row_safe_predicate_evaluator_matches_encoded_literal_oracle() {
 			.collect::<Vec<_>>()
 	);
 
-	let list_literal = ColumnPredicateLiteralV1::List(vec![
-		ColumnPredicateLiteralV1::Str(b"/cart/view".to_vec()),
-		ColumnPredicateLiteralV1::Str(Vec::new()),
-		ColumnPredicateLiteralV1::Str(b"\xff-bin".to_vec()),
+	let list_literal = ColumnPredicateLiteral::List(vec![
+		ColumnPredicateLiteral::Str(b"/cart/view".to_vec()),
+		ColumnPredicateLiteral::Str(Vec::new()),
+		ColumnPredicateLiteral::Str(b"\xff-bin".to_vec()),
 	]);
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::InList,
@@ -883,7 +883,7 @@ fn fsst_row_safe_length_prefilter_records_zero_encoded_comparisons() {
 	)
 	.unwrap();
 	let encoding = fsst_test_encoding(decoded.len(), values.len(), encoded.bytes.len());
-	let literal = ColumnPredicateLiteralV1::Str(b"x".to_vec());
+	let literal = ColumnPredicateLiteral::Str(b"x".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(literal.clone()),
@@ -930,7 +930,7 @@ fn fsst_row_safe_corrupt_metadata_fails_closed() {
 	let first_offset = 5 + symbol_count * 2 + 4;
 	corrupt[first_offset] = 1;
 	let encoding = fsst_test_encoding(decoded.len(), values.len(), corrupt.len());
-	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
+	let literal = ColumnPredicateLiteral::Str(b"alpha".to_vec());
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
 		literal: Some(literal.clone()),
@@ -1012,20 +1012,20 @@ fn value_dispatch_rejects_null_atoms_without_validity_bitmap() {
 
 #[test]
 fn predicate_tree_conversion_preserves_boolean_shape() {
-	let tree = PredicateTreeV1::And(vec![
-		PredicateTreeV1::Comparison(ColumnPredicateV1 {
+	let tree = PredicateTree::And(vec![
+		PredicateTree::Comparison(ColumnPredicate {
 			column_index: 0,
-			comparison: ColumnPredicateComparisonV1::Eq,
-			literal: ColumnPredicateLiteralV1::Int(7),
+			comparison: ColumnPredicateComparison::Eq,
+			literal: ColumnPredicateLiteral::Int(7),
 		}),
-		PredicateTreeV1::Or(vec![
-			PredicateTreeV1::IsNotNull { column_index: 1 },
-			PredicateTreeV1::Comparison(ColumnPredicateV1 {
+		PredicateTree::Or(vec![
+			PredicateTree::IsNotNull { column_index: 1 },
+			PredicateTree::Comparison(ColumnPredicate {
 				column_index: 2,
-				comparison: ColumnPredicateComparisonV1::InList,
-				literal: ColumnPredicateLiteralV1::List(vec![
-					ColumnPredicateLiteralV1::Int(1),
-					ColumnPredicateLiteralV1::Int(2),
+				comparison: ColumnPredicateComparison::InList,
+				literal: ColumnPredicateLiteral::List(vec![
+					ColumnPredicateLiteral::Int(1),
+					ColumnPredicateLiteral::Int(2),
 				]),
 			}),
 		]),
@@ -1042,7 +1042,7 @@ fn predicate_tree_conversion_preserves_boolean_shape() {
 	};
 	assert!(matches!(or_branches[0], EncodedPredicateNode::IsNotNull(_)));
 	assert!(matches!(or_branches[1], EncodedPredicateNode::InList(_)));
-	assert!(encoded_predicate_node_from_tree(&PredicateTreeV1::Unsupported).is_none());
+	assert!(encoded_predicate_node_from_tree(&PredicateTree::Unsupported).is_none());
 }
 
 #[test]
@@ -1420,10 +1420,10 @@ fn logical_fingerprint() -> wendelon::schema::LogicalSchemaFingerprint {
 		"test",
 		"encoding_compute",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 	.logical_schema_fingerprint

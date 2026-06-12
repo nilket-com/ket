@@ -3,9 +3,9 @@ use wendelon::crypto::{SLAB_ENCRYPTION_CHUNK_SIZES, SLAB_ENCRYPTION_DEFAULT_CHUN
 use wendelon::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, ChunkSizeBytes, DictValueCount,
 	EncodingCascadeIndex, EncodingPageByteOffset, IpcBufferIndex, IpcColumnOrdinal, LocalityPolicy,
-	LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen,
+	LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PrimaryKeyDescriptor, RecordBodyByteLen,
 	RecordBodyByteOffset, RecordLayoutPolicy, RowCount, RowGroupIndex, RowIdentityPolicy, RunCount,
-	SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId, TableObjectId,
+	SchemaEvolutionPolicy, SimdPageValueCount, SlabId, TableObjectId,
 };
 use wendelon::storage::{
 	BufferEncoding, EncodedBufferByteRange, EncodingCascade, EncodingDirectory,
@@ -22,10 +22,10 @@ fn logical_fingerprint() -> LogicalSchemaFingerprint {
 		"test",
 		"encoding_chunk_layout",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 	.logical_schema_fingerprint

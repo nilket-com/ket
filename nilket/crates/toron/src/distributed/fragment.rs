@@ -1395,7 +1395,7 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Arc;
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
 		TableSchemaDescriptor,
 	};
 
@@ -2050,9 +2050,9 @@ mod tests {
 			"default",
 			"fragment_test",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("key")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("key")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor")
 	}

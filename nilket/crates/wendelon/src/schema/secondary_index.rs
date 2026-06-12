@@ -1,7 +1,7 @@
 use crate::schema::table::{
-	PrimaryKeyDescriptorV1, RowIdentityPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
+	PrimaryKeyDescriptor, RowIdentityPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
 	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
-	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptor,
+	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaCatalog, TableSchemaDescriptor,
 };
 use crate::schema::{LogicalSchemaFingerprint, NodeId, TenantId};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -271,7 +271,7 @@ impl SecondaryIndexCatalog {
 		&mut self,
 		tenant_id: TenantId,
 		descriptor: SecondaryIndexDescriptor,
-		tables: &TableSchemaCatalogV1,
+		tables: &TableSchemaCatalog,
 	) -> std::io::Result<()> {
 		let table = tables
 			.latest_by_id(tenant_id, descriptor.table_object_id)
@@ -604,7 +604,7 @@ struct SecondaryIndexTableKey {
 fn is_primary_key_column(policy: &RowIdentityPolicy, column_name: &str) -> bool {
 	matches!(
 		policy.primary_key(),
-		Some(PrimaryKeyDescriptorV1 { columns, .. })
+		Some(PrimaryKeyDescriptor { columns, .. })
 			if columns.first().is_some_and(|column| column == column_name)
 	)
 }
@@ -624,7 +624,7 @@ pub fn is_storage_synthetic_column(column_name: &str) -> bool {
 mod tests {
 	use super::*;
 	use crate::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId,
+		LocalityPolicy, PrimaryKeyDescriptor, SchemaEvolutionPolicy, TableObjectId,
 		TableSchemaDescriptor,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
@@ -640,9 +640,9 @@ mod tests {
 				Field::new("customer_id", DataType::UInt64, true),
 				Field::new("payload", DataType::Float64, true),
 			]),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -707,7 +707,7 @@ mod tests {
 	fn catalog_lifecycle_is_linear_and_drop_waits_for_all_voters() {
 		let tenant = TenantId::new(7);
 		let table = table();
-		let mut tables = TableSchemaCatalogV1::default();
+		let mut tables = TableSchemaCatalog::default();
 		tables.upsert(tenant, table.clone()).unwrap();
 		let mut catalog = SecondaryIndexCatalog::default();
 		let descriptor = descriptor("customer_id", 1, IndexArrowTypeTag::UInt64);
@@ -759,7 +759,7 @@ mod tests {
 	fn catalog_uniqueness_rejects_use_schema_update_taxonomy() {
 		let tenant = TenantId::new(7);
 		let table = table();
-		let mut tables = TableSchemaCatalogV1::default();
+		let mut tables = TableSchemaCatalog::default();
 		tables.upsert(tenant, table).unwrap();
 		let descriptor = descriptor("customer_id", 1, IndexArrowTypeTag::UInt64);
 		let mut catalog = SecondaryIndexCatalog::default();

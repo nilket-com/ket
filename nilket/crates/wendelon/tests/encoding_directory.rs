@@ -6,8 +6,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use std::sync::Arc;
 use wendelon::schema::{
 	HybridTimestamp, Identity, Locality, LocalityPolicy, MultiRowLayoutDescriptor,
-	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
-	RecordLayoutPolicy, RowCount, RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+	PrimaryKeyDescriptor, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
+	RecordLayoutPolicy, RowCount, RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicy,
 	SlabId, TableObjectId, TableSchemaDescriptor,
 };
 use wendelon::storage::encoding::directory::{
@@ -33,12 +33,12 @@ fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
 		"test",
 		"encoding_directory",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(12, 12, 8 * 1024 * 1024).unwrap(),
 		),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }
@@ -231,12 +231,12 @@ fn large_descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor 
 		"test",
 		"encoding_directory_large",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(1024, 4096, 8 * 1024 * 1024).unwrap(),
 		),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }

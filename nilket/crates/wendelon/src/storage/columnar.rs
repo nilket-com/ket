@@ -2099,9 +2099,9 @@ mod tests {
 	use crate::schema::pbc::{OP_GTE, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT, Program};
 	use crate::schema::{
 		AggregateExpression, AggregateFunctionTag, EncryptedChunkIndex, HybridTimestamp,
-		IdentityPrefix, LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+		IdentityPrefix, LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptor,
 		RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, RowIdentityPolicy,
-		SchemaEvolutionPolicyV1, TableObjectId, TenantId,
+		SchemaEvolutionPolicy, TableObjectId, TenantId,
 	};
 	use crate::storage::ipc::encode_record_batch_bytes;
 	use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, Int64Array, StringArray, UInt64Array};
@@ -2115,9 +2115,9 @@ mod tests {
 			"test",
 			"columnar",
 			schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::IdentityProjection,
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -2129,12 +2129,12 @@ mod tests {
 			"test",
 			"columnar",
 			schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(
 				MultiRowLayoutDescriptor::new(2, 64, 8 * 1024 * 1024).unwrap(),
 			),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}

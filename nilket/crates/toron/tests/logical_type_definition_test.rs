@@ -19,8 +19,8 @@ use toron::storage::{
 };
 use wendelon::integration::compute::LogicalTypeCatalog;
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 use wendelon_client::{LogicalTypeDefinition, LogicalTypePhysical};
 
@@ -327,9 +327,9 @@ fn descriptor_with_logical_id(logical_type: LogicalTypeId) -> TableSchemaDescrip
 		"default",
 		"people",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("person_id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("person_id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

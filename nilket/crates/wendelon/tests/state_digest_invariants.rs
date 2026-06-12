@@ -12,7 +12,7 @@ use wendelon::hash::state_digest::{
 use wendelon::schema::{
 	DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, Locality, LocalityPolicy,
 	MultiRowLayoutDescriptor, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TableWriteRequestMeta, TenantId,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor, TableWriteRequestMeta, TenantId,
 	WriterNodeId, encode_table_write_row_count, synthesize_append_only_row_id,
 };
 use wendelon::storage::{
@@ -693,7 +693,7 @@ fn append_only_descriptor(
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(layout),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }

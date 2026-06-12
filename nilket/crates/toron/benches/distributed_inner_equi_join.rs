@@ -36,8 +36,8 @@ use toron::server::{
 };
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, RuntimeFilterDescriptor,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 	build_runtime_filter_mask_for_batch,
 };
 
@@ -1036,9 +1036,9 @@ fn descriptor(id_byte: u8, table: &str, schema: &Schema) -> TableSchemaDescripto
 		"default",
 		table,
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

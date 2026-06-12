@@ -26,8 +26,8 @@ use toron::ir::{
 };
 use toron::storage::{RowIdentityProjection, ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 
 const DEFAULT_ROWS: &[usize] = &[8_192, 65_536];
@@ -511,9 +511,9 @@ fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
 		"bench",
 		"storage_execution",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?;
 	Ok(Fixture { batch, descriptor })
 }

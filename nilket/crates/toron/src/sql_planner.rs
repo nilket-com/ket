@@ -2943,7 +2943,7 @@ impl SqlPlanner {
 		}
 		if !columns.is_empty() {
 			return Err(unsupported(
-				"CTAS does not support explicit column lists in v1; use SELECT aliases for column names",
+				"CTAS does not support explicit column lists; use SELECT aliases for column names",
 			));
 		}
 		if *temporary {

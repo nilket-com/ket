@@ -60,9 +60,8 @@ use crate::consensus::{
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::integration::compute::{
-	LOGICAL_TYPE_INTERNAL_NAMESPACE, LogicalTypeCatalog, SchemaMutationKindV1, SchemaObjectKind,
-	SchemaUpdateEnvelopeV1, decode_logical_type_definition_create,
-	decode_schema_update_envelope_v1,
+	LOGICAL_TYPE_INTERNAL_NAMESPACE, LogicalTypeCatalog, SchemaMutationKind, SchemaObjectKind,
+	SchemaUpdateEnvelope, decode_logical_type_definition_create, decode_schema_update_envelope_v1,
 };
 use crate::metrics::global as metrics;
 use crate::network::tls::ActorTrustDomain;
@@ -71,7 +70,7 @@ use crate::schema::{
 	NodeId as SchemaNodeId, RaftLogEntryFixed, RowIdentityPolicy,
 	SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SecondaryIndexCatalog, SecondaryIndexDescriptor,
 	SecondaryIndexState, SlabId, SnapshotHeader, TableDropFenceCatalog, TableLifecycleCatalog,
-	TableRetentionPolicy, TableSchemaCatalogV1, TableSchemaDescriptor, TenantId, TenantKekId,
+	TableRetentionPolicy, TableSchemaCatalog, TableSchemaDescriptor, TenantId, TenantKekId,
 	WALRecordHeader, decode_secondary_index_descriptor, decode_secondary_index_drop_request,
 	decode_secondary_index_lifecycle_complete, decode_table_schema_descriptor_v1,
 	validate_table_schema_evolution,
@@ -1533,7 +1532,7 @@ pub struct SmState {
 	/// object id and schema generation. Legacy KV traffic can still use
 	/// the default descriptor without needing this map populated.
 	#[serde(default)]
-	pub table_schemas: TableSchemaCatalogV1,
+	pub table_schemas: TableSchemaCatalog,
 	/// ADR 090 tenant logical type definitions. The ids in table descriptor
 	/// field metadata are honest only if this durable registry travels with
 	/// the descriptors that reference them.
@@ -2773,14 +2772,14 @@ struct RetentionAuditContext {
 
 #[derive(Clone, Debug)]
 struct SchemaAuditContext {
-	envelope: SchemaUpdateEnvelopeV1,
+	envelope: SchemaUpdateEnvelope,
 	descriptor: TableSchemaDescriptor,
 	previous_descriptor: Option<TableSchemaDescriptor>,
 }
 
 #[derive(Clone, Debug)]
 struct IndexSchemaAuditContext {
-	envelope: SchemaUpdateEnvelopeV1,
+	envelope: SchemaUpdateEnvelope,
 	index_object_id: IndexObjectId,
 	descriptor: Option<SecondaryIndexDescriptor>,
 	previous_descriptor: Option<SecondaryIndexDescriptor>,
@@ -2840,7 +2839,7 @@ fn schema_audit_context(
 	if envelope.object.kind != SchemaObjectKind::Table
 		|| !matches!(
 			envelope.mutation,
-			SchemaMutationKindV1::Create | SchemaMutationKindV1::Alter
+			SchemaMutationKind::Create | SchemaMutationKind::Alter
 		) {
 		return None;
 	}
@@ -2872,19 +2871,19 @@ fn index_schema_audit_context(
 		return None;
 	}
 	let (index_object_id, descriptor, replica_id) = match envelope.mutation {
-		SchemaMutationKindV1::Create => {
+		SchemaMutationKind::Create => {
 			let descriptor = decode_secondary_index_descriptor(&envelope.payload).ok()?;
 			(descriptor.index_object_id, Some(descriptor), None)
 		}
-		SchemaMutationKindV1::Drop => {
+		SchemaMutationKind::Drop => {
 			let request = decode_secondary_index_drop_request(&envelope.payload).ok()?;
 			(request.index_object_id, None, None)
 		}
-		SchemaMutationKindV1::IndexBackfillComplete | SchemaMutationKindV1::IndexDropGcComplete => {
+		SchemaMutationKind::IndexBackfillComplete | SchemaMutationKind::IndexDropGcComplete => {
 			let complete = decode_secondary_index_lifecycle_complete(&envelope.payload).ok()?;
 			(complete.index_object_id, None, Some(complete.replica_id))
 		}
-		SchemaMutationKindV1::Alter => return None,
+		SchemaMutationKind::Alter => return None,
 	};
 	let previous = state
 		.secondary_indexes
@@ -3637,13 +3636,13 @@ fn audit_outcome_parameters(resp: &WendelonResponse) -> Vec<(&'static str, serde
 	}
 }
 
-fn schema_mutation_label(mutation: SchemaMutationKindV1) -> &'static str {
+fn schema_mutation_label(mutation: SchemaMutationKind) -> &'static str {
 	match mutation {
-		SchemaMutationKindV1::Create => "create",
-		SchemaMutationKindV1::Alter => "alter",
-		SchemaMutationKindV1::Drop => "drop",
-		SchemaMutationKindV1::IndexBackfillComplete => "index_backfill_complete",
-		SchemaMutationKindV1::IndexDropGcComplete => "index_drop_gc_complete",
+		SchemaMutationKind::Create => "create",
+		SchemaMutationKind::Alter => "alter",
+		SchemaMutationKind::Drop => "drop",
+		SchemaMutationKind::IndexBackfillComplete => "index_backfill_complete",
+		SchemaMutationKind::IndexDropGcComplete => "index_drop_gc_complete",
 	}
 }
 
@@ -4071,10 +4070,10 @@ fn apply_schema_update(state: &mut SmState, bytes: &[u8]) -> Result<(), String> 
 
 fn apply_logical_type_schema_update(
 	state: &mut SmState,
-	envelope: SchemaUpdateEnvelopeV1,
+	envelope: SchemaUpdateEnvelope,
 ) -> Result<(), String> {
 	match envelope.mutation {
-		SchemaMutationKindV1::Create => {
+		SchemaMutationKind::Create => {
 			if envelope.object.namespace != LOGICAL_TYPE_INTERNAL_NAMESPACE {
 				return Err("logical type definitions must use the reserved namespace".to_owned());
 			}
@@ -4097,10 +4096,10 @@ fn apply_logical_type_schema_update(
 				.map(|_| ())
 				.map_err(|err| err.to_string())
 		}
-		SchemaMutationKindV1::Alter | SchemaMutationKindV1::Drop => {
+		SchemaMutationKind::Alter | SchemaMutationKind::Drop => {
 			Err("logical type ALTER/DROP is not supported".to_owned())
 		}
-		SchemaMutationKindV1::IndexBackfillComplete | SchemaMutationKindV1::IndexDropGcComplete => {
+		SchemaMutationKind::IndexBackfillComplete | SchemaMutationKind::IndexDropGcComplete => {
 			Err("logical types do not support secondary-index lifecycle mutations".to_owned())
 		}
 	}
@@ -4108,10 +4107,10 @@ fn apply_logical_type_schema_update(
 
 fn apply_table_schema_update(
 	state: &mut SmState,
-	envelope: SchemaUpdateEnvelopeV1,
+	envelope: SchemaUpdateEnvelope,
 ) -> Result<(), String> {
 	match envelope.mutation {
-		SchemaMutationKindV1::Create | SchemaMutationKindV1::Alter => {
+		SchemaMutationKind::Create | SchemaMutationKind::Alter => {
 			let descriptor = decode_table_schema_descriptor_v1(&envelope.payload)
 				.map_err(|err| err.to_string())?;
 			let current_descriptor = state
@@ -4142,10 +4141,10 @@ fn apply_table_schema_update(
 					current_generation
 				));
 			}
-			if envelope.mutation == SchemaMutationKindV1::Create && current_generation != 0 {
+			if envelope.mutation == SchemaMutationKind::Create && current_generation != 0 {
 				return Err("table schema create cannot replace an existing table".to_owned());
 			}
-			if envelope.mutation == SchemaMutationKindV1::Create
+			if envelope.mutation == SchemaMutationKind::Create
 				&& state
 					.table_schemas
 					.latest_by_id(envelope.tenant_id, descriptor.table_object_id)
@@ -4155,10 +4154,10 @@ fn apply_table_schema_update(
 					"table schema create cannot reuse an existing table_object_id".to_owned(),
 				);
 			}
-			if envelope.mutation == SchemaMutationKindV1::Alter && current_generation == 0 {
+			if envelope.mutation == SchemaMutationKind::Alter && current_generation == 0 {
 				return Err("table schema alter requires an existing table".to_owned());
 			}
-			if let (SchemaMutationKindV1::Alter, Some(previous)) =
+			if let (SchemaMutationKind::Alter, Some(previous)) =
 				(envelope.mutation, current_descriptor.as_ref())
 			{
 				validate_table_schema_evolution(previous, &descriptor)
@@ -4183,7 +4182,7 @@ fn apply_table_schema_update(
 				.table_schemas
 				.upsert(envelope.tenant_id, descriptor)
 				.map_err(|err| err.to_string())?;
-			if envelope.mutation == SchemaMutationKindV1::Create {
+			if envelope.mutation == SchemaMutationKind::Create {
 				state.table_lifecycle.ensure_inherit_cluster(
 					envelope.tenant_id,
 					table_object_id,
@@ -4197,10 +4196,10 @@ fn apply_table_schema_update(
 			}
 			Ok(())
 		}
-		SchemaMutationKindV1::Drop => {
+		SchemaMutationKind::Drop => {
 			Err("table schema drops require an explicit data-rewrite migration".to_owned())
 		}
-		SchemaMutationKindV1::IndexBackfillComplete | SchemaMutationKindV1::IndexDropGcComplete => {
+		SchemaMutationKind::IndexBackfillComplete | SchemaMutationKind::IndexDropGcComplete => {
 			Err("table schema does not support secondary-index lifecycle mutations".to_owned())
 		}
 	}
@@ -4343,10 +4342,10 @@ fn apply_table_drop_finalize(
 
 fn apply_index_schema_update(
 	state: &mut SmState,
-	envelope: SchemaUpdateEnvelopeV1,
+	envelope: SchemaUpdateEnvelope,
 ) -> Result<(), String> {
 	match envelope.mutation {
-		SchemaMutationKindV1::Create => {
+		SchemaMutationKind::Create => {
 			let descriptor = decode_secondary_index_descriptor(&envelope.payload)
 				.map_err(|err| err.to_string())?;
 			if state
@@ -4375,8 +4374,8 @@ fn apply_index_schema_update(
 			);
 			Ok(())
 		}
-		SchemaMutationKindV1::Alter => Err(SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED.to_owned()),
-		SchemaMutationKindV1::Drop => {
+		SchemaMutationKind::Alter => Err(SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED.to_owned()),
+		SchemaMutationKind::Drop => {
 			let request = decode_secondary_index_drop_request(&envelope.payload)
 				.map_err(|err| err.to_string())?;
 			let existing = state
@@ -4412,7 +4411,7 @@ fn apply_index_schema_update(
 			}
 			Ok(())
 		}
-		SchemaMutationKindV1::IndexBackfillComplete => {
+		SchemaMutationKind::IndexBackfillComplete => {
 			let complete = decode_secondary_index_lifecycle_complete(&envelope.payload)
 				.map_err(|err| err.to_string())?;
 			let before = state
@@ -4446,7 +4445,7 @@ fn apply_index_schema_update(
 			}
 			Ok(())
 		}
-		SchemaMutationKindV1::IndexDropGcComplete => {
+		SchemaMutationKind::IndexDropGcComplete => {
 			let complete = decode_secondary_index_lifecycle_complete(&envelope.payload)
 				.map_err(|err| err.to_string())?;
 			let voters = current_voter_ids(state, complete.replica_id.id);
@@ -6004,19 +6003,18 @@ mod schema_state_tests {
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::integration::compute::{
 		COMPUTE_STORAGE_CONTRACT_VERSION, DropOperationId, SchemaGeneration, SchemaIntentId,
-		SchemaIntentOrigin, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+		SchemaIntentOrigin, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
 		IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, LocalityPolicy,
-		LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PolicyGeneration,
-		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy,
-		RetentionRejectCode, RetentionWindowMillis, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		SecondaryIndexDescriptor, SecondaryIndexDropRequest, SecondaryIndexKeyDescriptor,
-		SecondaryIndexLifecycleComplete, SecondaryIndexState, TableObjectId, TableRetentionPolicy,
-		TableSchemaDescriptor, TenantKekId, encode_secondary_index_descriptor,
-		encode_secondary_index_drop_request, encode_secondary_index_lifecycle_complete,
-		encode_table_schema_descriptor_v1,
+		LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptor,
+		RecordBodyCompressionPolicy, RecordLayoutPolicy, RetentionRejectCode,
+		RetentionWindowMillis, RowIdentityPolicy, SchemaEvolutionPolicy, SecondaryIndexDescriptor,
+		SecondaryIndexDropRequest, SecondaryIndexKeyDescriptor, SecondaryIndexLifecycleComplete,
+		SecondaryIndexState, TableObjectId, TableRetentionPolicy, TableSchemaDescriptor,
+		TenantKekId, encode_secondary_index_descriptor, encode_secondary_index_drop_request,
+		encode_secondary_index_lifecycle_complete, encode_table_schema_descriptor_v1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -6034,9 +6032,9 @@ mod schema_state_tests {
 			"analytics",
 			"events",
 			schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -6055,7 +6053,7 @@ mod schema_state_tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -6090,7 +6088,7 @@ mod schema_state_tests {
 				descriptor,
 				0,
 				descriptor.schema_generation,
-				SchemaMutationKindV1::Create,
+				SchemaMutationKind::Create,
 			),
 		)
 		.unwrap();
@@ -6101,7 +6099,7 @@ mod schema_state_tests {
 		descriptor: &TableSchemaDescriptor,
 		expected_generation: u64,
 		requested_generation: u64,
-		mutation: SchemaMutationKindV1,
+		mutation: SchemaMutationKind,
 	) -> Vec<u8> {
 		schema_envelope_for_kind(
 			descriptor,
@@ -6116,15 +6114,15 @@ mod schema_state_tests {
 		descriptor: &TableSchemaDescriptor,
 		expected_generation: u64,
 		requested_generation: u64,
-		mutation: SchemaMutationKindV1,
+		mutation: SchemaMutationKind,
 		kind: SchemaObjectKind,
 	) -> Vec<u8> {
 		let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
-		let envelope = SchemaUpdateEnvelopeV1 {
+		let envelope = SchemaUpdateEnvelope {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 			origin: SchemaIntentOrigin::ComputeClient,
 			tenant_id: TenantId::new(7),
-			object: SchemaObjectRefV1 {
+			object: SchemaObjectRef {
 				kind,
 				namespace: descriptor.namespace.clone(),
 				name: descriptor.table_name.clone(),
@@ -6159,14 +6157,14 @@ mod schema_state_tests {
 		descriptor: &SecondaryIndexDescriptor,
 		expected_generation: u64,
 		requested_generation: u64,
-		mutation: SchemaMutationKindV1,
+		mutation: SchemaMutationKind,
 		payload: Vec<u8>,
 	) -> Vec<u8> {
-		let envelope = SchemaUpdateEnvelopeV1 {
+		let envelope = SchemaUpdateEnvelope {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 			origin: SchemaIntentOrigin::WendelonOperator,
 			tenant_id: TenantId::new(7),
-			object: SchemaObjectRefV1 {
+			object: SchemaObjectRef {
 				kind: SchemaObjectKind::Index,
 				namespace: descriptor.namespace.clone(),
 				name: descriptor.index_name.clone(),
@@ -6183,7 +6181,7 @@ mod schema_state_tests {
 	#[test]
 	fn schema_update_applies_table_descriptor_to_state() {
 		let descriptor = table_descriptor(1);
-		let bytes = schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create);
+		let bytes = schema_envelope(&descriptor, 0, 1, SchemaMutationKind::Create);
 		let mut state = SmState::default();
 		apply_schema_update(&mut state, &bytes).unwrap();
 		assert_eq!(
@@ -6382,7 +6380,7 @@ mod schema_state_tests {
 				&descriptor,
 				0,
 				1,
-				SchemaMutationKindV1::Create,
+				SchemaMutationKind::Create,
 			))),
 		};
 		let state = SmState::default();
@@ -6463,7 +6461,7 @@ mod schema_state_tests {
 		let mut state = SmState::default();
 		apply_schema_update(
 			&mut state,
-			&schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create),
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKind::Create),
 		)
 		.unwrap();
 		let mut retuned = descriptor.clone();
@@ -6484,7 +6482,7 @@ mod schema_state_tests {
 				&retuned,
 				1,
 				2,
-				SchemaMutationKindV1::Alter,
+				SchemaMutationKind::Alter,
 			))),
 		};
 		let context = schema_audit_context(&state, &entry).expect("schema audit context");
@@ -6557,7 +6555,7 @@ mod schema_state_tests {
 			&descriptor,
 			0,
 			1,
-			SchemaMutationKindV1::Create,
+			SchemaMutationKind::Create,
 			encode_secondary_index_descriptor(&descriptor).unwrap(),
 		);
 		let entry = Entry {
@@ -6716,7 +6714,7 @@ mod schema_state_tests {
 	#[test]
 	fn schema_update_rejects_descriptor_generation_mismatch() {
 		let descriptor = table_descriptor(2);
-		let bytes = schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create);
+		let bytes = schema_envelope(&descriptor, 0, 1, SchemaMutationKind::Create);
 		let mut state = SmState::default();
 		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
 		assert!(err.contains("does not match requested generation"));
@@ -6729,14 +6727,14 @@ mod schema_state_tests {
 		let mut state = SmState::default();
 		apply_schema_update(
 			&mut state,
-			&schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create),
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKind::Create),
 		)
 		.unwrap();
 
 		let next_descriptor = table_descriptor(2);
 		let err = apply_schema_update(
 			&mut state,
-			&schema_envelope(&next_descriptor, 0, 2, SchemaMutationKindV1::Alter),
+			&schema_envelope(&next_descriptor, 0, 2, SchemaMutationKind::Alter),
 		)
 		.unwrap_err();
 		assert!(err.contains("expected_generation"));
@@ -6754,7 +6752,7 @@ mod schema_state_tests {
 		let mut state = SmState::default();
 		apply_schema_update(
 			&mut state,
-			&schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create),
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKind::Create),
 		)
 		.unwrap();
 
@@ -6765,7 +6763,7 @@ mod schema_state_tests {
 		let changed_type = table_descriptor_for_schema(2, &changed_type_schema);
 		let err = apply_schema_update(
 			&mut state,
-			&schema_envelope(&changed_type, 1, 2, SchemaMutationKindV1::Alter),
+			&schema_envelope(&changed_type, 1, 2, SchemaMutationKind::Alter),
 		)
 		.unwrap_err();
 		assert!(err.contains("change type"));
@@ -6789,7 +6787,7 @@ mod schema_state_tests {
 		let mut state = SmState::default();
 		apply_schema_update(
 			&mut state,
-			&schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create),
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKind::Create),
 		)
 		.unwrap();
 
@@ -6799,14 +6797,14 @@ mod schema_state_tests {
 			"analytics",
 			"events_copy",
 			&table_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let err = apply_schema_update(
 			&mut state,
-			&schema_envelope(&conflicting, 0, 1, SchemaMutationKindV1::Create),
+			&schema_envelope(&conflicting, 0, 1, SchemaMutationKind::Create),
 		)
 		.unwrap_err();
 		assert!(err.contains("reuse an existing table_object_id"));
@@ -6831,11 +6829,11 @@ mod schema_state_tests {
 		fingerprint[0] ^= 0xff;
 		descriptor.logical_schema_fingerprint = LogicalSchemaFingerprint::from_bytes(fingerprint);
 		let payload = postcard::to_allocvec(&descriptor).unwrap();
-		let envelope = SchemaUpdateEnvelopeV1 {
+		let envelope = SchemaUpdateEnvelope {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 			origin: SchemaIntentOrigin::ComputeClient,
 			tenant_id: TenantId::new(7),
-			object: SchemaObjectRefV1 {
+			object: SchemaObjectRef {
 				kind: SchemaObjectKind::Table,
 				namespace: descriptor.namespace.clone(),
 				name: descriptor.table_name.clone(),
@@ -6843,7 +6841,7 @@ mod schema_state_tests {
 			expected_generation: SchemaGeneration::ZERO,
 			requested_generation: SchemaGeneration::new(descriptor.schema_generation),
 			intent_id: SchemaIntentId::new([9; 16]),
-			mutation: SchemaMutationKindV1::Create,
+			mutation: SchemaMutationKind::Create,
 			payload,
 		};
 		let bytes = encode_schema_update_envelope_v1(&envelope).unwrap();
@@ -6857,11 +6855,11 @@ mod schema_state_tests {
 	fn schema_update_rejects_descriptor_envelope_object_mismatch() {
 		let descriptor = table_descriptor(1);
 		let payload = encode_table_schema_descriptor_v1(&descriptor).unwrap();
-		let envelope = SchemaUpdateEnvelopeV1 {
+		let envelope = SchemaUpdateEnvelope {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 			origin: SchemaIntentOrigin::ComputeClient,
 			tenant_id: TenantId::new(7),
-			object: SchemaObjectRefV1 {
+			object: SchemaObjectRef {
 				kind: SchemaObjectKind::Table,
 				namespace: "analytics".to_owned(),
 				name: "events_shadow".to_owned(),
@@ -6869,7 +6867,7 @@ mod schema_state_tests {
 			expected_generation: SchemaGeneration::ZERO,
 			requested_generation: SchemaGeneration::new(descriptor.schema_generation),
 			intent_id: SchemaIntentId::new([9; 16]),
-			mutation: SchemaMutationKindV1::Create,
+			mutation: SchemaMutationKind::Create,
 			payload,
 		};
 		let bytes = encode_schema_update_envelope_v1(&envelope).unwrap();
@@ -6882,7 +6880,7 @@ mod schema_state_tests {
 	#[test]
 	fn schema_update_rejects_drop() {
 		let descriptor = table_descriptor(1);
-		let bytes = schema_envelope(&descriptor, 1, 2, SchemaMutationKindV1::Drop);
+		let bytes = schema_envelope(&descriptor, 1, 2, SchemaMutationKind::Drop);
 		let mut state = SmState::default();
 		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
 		assert!(err.contains("drops require"));
@@ -7028,7 +7026,7 @@ mod schema_state_tests {
 		retuned.refresh_descriptor_fingerprints().unwrap();
 		let err = apply_schema_update(
 			&mut state,
-			&schema_envelope(&retuned, 1, 2, SchemaMutationKindV1::Alter),
+			&schema_envelope(&retuned, 1, 2, SchemaMutationKind::Alter),
 		)
 		.unwrap_err();
 		assert!(err.contains("drop is in progress"));
@@ -7048,7 +7046,7 @@ mod schema_state_tests {
 				&index,
 				0,
 				1,
-				SchemaMutationKindV1::Create,
+				SchemaMutationKind::Create,
 				encode_secondary_index_descriptor(&index).unwrap(),
 			),
 		)
@@ -7085,7 +7083,7 @@ mod schema_state_tests {
 			&descriptor,
 			0,
 			1,
-			SchemaMutationKindV1::Create,
+			SchemaMutationKind::Create,
 			SchemaObjectKind::View,
 		);
 		let mut state = SmState::default();
@@ -7103,7 +7101,7 @@ mod schema_state_tests {
 			&descriptor,
 			0,
 			1,
-			SchemaMutationKindV1::Create,
+			SchemaMutationKind::Create,
 			encode_secondary_index_descriptor(&descriptor).unwrap(),
 		);
 
@@ -7134,7 +7132,7 @@ mod schema_state_tests {
 				&descriptor,
 				0,
 				1,
-				SchemaMutationKindV1::Create,
+				SchemaMutationKind::Create,
 				encode_secondary_index_descriptor(&descriptor).unwrap(),
 			),
 		)
@@ -7150,7 +7148,7 @@ mod schema_state_tests {
 			&descriptor,
 			1,
 			2,
-			SchemaMutationKindV1::IndexBackfillComplete,
+			SchemaMutationKind::IndexBackfillComplete,
 			encode_secondary_index_lifecycle_complete(&complete).unwrap(),
 		);
 		apply_schema_update(&mut state, &complete_bytes).unwrap();
@@ -7173,7 +7171,7 @@ mod schema_state_tests {
 				&descriptor,
 				2,
 				3,
-				SchemaMutationKindV1::Drop,
+				SchemaMutationKind::Drop,
 				encode_secondary_index_drop_request(&drop).unwrap(),
 			),
 		)
@@ -7192,7 +7190,7 @@ mod schema_state_tests {
 				&descriptor,
 				3,
 				4,
-				SchemaMutationKindV1::IndexDropGcComplete,
+				SchemaMutationKind::IndexDropGcComplete,
 				encode_secondary_index_lifecycle_complete(&complete).unwrap(),
 			),
 		)
@@ -7216,7 +7214,7 @@ mod schema_state_tests {
 				&descriptor,
 				0,
 				1,
-				SchemaMutationKindV1::Alter,
+				SchemaMutationKind::Alter,
 				encode_secondary_index_descriptor(&descriptor).unwrap(),
 			),
 		)
@@ -7234,12 +7232,12 @@ mod recovery_tests {
 	use super::*;
 	use crate::integration::compute::{
 		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
-		SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+		SchemaMutationKind, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
 		FinalizationMarker, LeaseDescriptor, LocalityPolicy, NodeId as SchemaNodeId,
-		PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
+		PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 		TableSchemaDescriptor, TenantId, encode_table_schema_descriptor_v1,
 	};
 	use crate::storage::{
@@ -7365,9 +7363,9 @@ mod recovery_tests {
 			"analytics",
 			"events",
 			&recovery_table_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -7377,14 +7375,14 @@ mod recovery_tests {
 		descriptor: &TableSchemaDescriptor,
 		expected_generation: u64,
 		requested_generation: u64,
-		mutation: SchemaMutationKindV1,
+		mutation: SchemaMutationKind,
 	) -> Entry<WendelonTypeConfig> {
 		let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
-		let envelope = SchemaUpdateEnvelopeV1 {
+		let envelope = SchemaUpdateEnvelope {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 			origin: SchemaIntentOrigin::ComputeClient,
 			tenant_id: TenantId::new(7),
-			object: SchemaObjectRefV1 {
+			object: SchemaObjectRef {
 				kind: SchemaObjectKind::Table,
 				namespace: descriptor.namespace.clone(),
 				name: descriptor.table_name.clone(),
@@ -8057,7 +8055,7 @@ mod recovery_tests {
 		append_and_apply(
 			&mut source_store,
 			&mut source_sm,
-			schema_update_entry(1, &descriptor, 0, 1, SchemaMutationKindV1::Create),
+			schema_update_entry(1, &descriptor, 0, 1, SchemaMutationKind::Create),
 		)
 		.await;
 

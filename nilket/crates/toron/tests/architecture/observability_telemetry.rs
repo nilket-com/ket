@@ -181,8 +181,8 @@ pub(crate) fn adr067_compute_trace_context_v1_is_preserved_as_compatibility_surf
 	let compute =
 		std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
 			.expect("read Wendelon compute integration");
-	assert!(compute.contains("pub struct ComputeTraceContextV1"));
-	assert!(compute.contains("impl ComputeTraceContextV1"));
+	assert!(compute.contains("pub struct ComputeTraceContext"));
+	assert!(compute.contains("impl ComputeTraceContext"));
 	assert!(compute.contains("shared_telemetry::TraceContext"));
 	assert!(
 		compute.contains("pub const TRACEPARENT_LEN: usize = shared_telemetry::TRACEPARENT_LEN;")
@@ -393,7 +393,7 @@ pub(crate) fn adr067_wendelon_v1_trace_context_suffix_is_compatibility_scoped() 
 		std::fs::read_to_string(wendelon_manifest_dir().join("src/integration/compute.rs"))
 			.expect("read Wendelon compute integration");
 	assert!(!shared.contains("V1"));
-	assert!(compute.contains("pub struct ComputeTraceContextV1"));
+	assert!(compute.contains("pub struct ComputeTraceContext"));
 	assert!(compute.contains("shared_telemetry::TraceContext"));
 }
 
@@ -926,7 +926,7 @@ pub(crate) fn adr069_no_traceparent_compute_trace_context_v1_or_taskspec_trace()
 	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
 		.expect("read storage source");
 	let production = storage.split("#[cfg(test)]").next().unwrap_or(&storage);
-	for forbidden in ["traceparent", "ComputeTraceContextV1", "TaskSpec.trace"] {
+	for forbidden in ["traceparent", "ComputeTraceContext", "TaskSpec.trace"] {
 		assert!(
 			!production.contains(forbidden),
 			"ADR 069 must use the Wendelon table-query carrier directly; found {forbidden}"

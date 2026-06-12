@@ -12,15 +12,18 @@ each ADR's **"Forward arc"** and **"Deferred (named)"** sections. iter-0 seeds i
 menu by grounding the *latest* ADR's deferred/forward-arc against the current code — not
 by reading an aggregate that's stale the moment it's written.
 
-## North star (V1 target)
+## Standing invariants (what every cut preserves)
 
-"First Query with Integrity" + "Distributed Execution Correctness": correct analytical
-results against a Wendelon-native cluster with pushdown maximized, identity flow real,
-stream-shaped storage boundary, multi-process coordinator/worker mechanics surviving a
-worker SIGKILL with byte-identical normalized output, and the first two-input relational
-operator working across hash-partitioned and bounded broadcast strategies. Multi-tenant
-governance, executor-model upgrade, sort-merge, output-side join streaming, and full
-end-to-end natural backpressure remain post-V1.
+There is no milestone target; milestone language ("V1", "first query with integrity") was
+retired in June 2026 after losing semantic precision — selection works from the latest ADR's
+forward arc + the disciplines below, not from a destination. What stands instead are the
+invariants every cut must preserve: correct analytical results against a Wendelon-native
+cluster; pushdown maximized; identity flow real; the stream-shaped storage boundary;
+coordinator/worker mechanics that survive process loss with byte-identical normalized output;
+and evidence-driven optimization (decisions earn receipts, receipts gate machinery). Named
+not-yet threads (multi-tenant governance depth, executor-model upgrade, sort-merge,
+output-side join streaming, end-to-end natural backpressure) are candidates like any others —
+selected by demand signals, never by a version number.
 
 ## Prioritization philosophy
 

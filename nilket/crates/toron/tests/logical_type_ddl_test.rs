@@ -28,7 +28,7 @@ use toron::storage::{
 use wendelon::integration::compute::LogicalTypeCatalog;
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptor,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaCatalog, TableSchemaDescriptor,
 	TenantId as WendelonTenantId,
 };
 use wendelon_client::{
@@ -3875,7 +3875,7 @@ async fn information_schema_schemata_is_tenant_scoped() {
 
 #[tokio::test]
 async fn information_schema_schemata_is_latest_only() {
-	let mut source = TableSchemaCatalogV1::default();
+	let mut source = TableSchemaCatalog::default();
 	let tenant = WendelonTenantId::new(1);
 	source
 		.upsert(
@@ -4217,7 +4217,7 @@ async fn information_schema_descriptor_listing_failure_fails_query_without_stale
 
 #[tokio::test]
 async fn information_schema_tables_columns_are_latest_only() {
-	let mut source = TableSchemaCatalogV1::default();
+	let mut source = TableSchemaCatalog::default();
 	let tenant = WendelonTenantId::new(1);
 	source
 		.upsert(
@@ -4894,7 +4894,7 @@ fn descriptor_from_schema_with_identity(
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

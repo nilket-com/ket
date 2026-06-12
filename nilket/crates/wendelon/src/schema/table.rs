@@ -3,7 +3,7 @@ use crate::hash::descriptor_fingerprint::{
 };
 use crate::schema::aggregate::{AGG_KLL_DEFAULT_K, AGG_KLL_MAX_K, AGG_KLL_MIN_K, validate_kll_k};
 use crate::schema::pbc::{
-	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, Program as PbcProgram,
+	ColumnPredicateComparison, ColumnPredicateLiteral, Program as PbcProgram,
 };
 use crate::schema::{
 	ByteCount, ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, KllK,
@@ -920,7 +920,7 @@ pub fn append_only_request_locality(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
 	parent_write_id: ClientWriteId,
-	spread: TableSpreadLocalityDescriptorV1,
+	spread: TableSpreadLocalityDescriptor,
 ) -> std::io::Result<Locality> {
 	validate_table_spread(spread)?;
 	let mut hasher = blake3::Hasher::new();
@@ -1016,12 +1016,12 @@ pub struct TableSchemaDescriptor {
 	pub arrow_schema_ipc: Vec<u8>,
 	pub row_identity_policy: RowIdentityPolicy,
 	pub locality_policy: LocalityPolicy,
-	pub stats_policy: ColumnStatsPolicyV1,
+	pub stats_policy: ColumnStatsPolicy,
 	pub record_layout_policy: RecordLayoutPolicy,
 	pub record_body_compression_policy: RecordBodyCompressionPolicy,
 	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
 	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
-	pub evolution_policy: SchemaEvolutionPolicyV1,
+	pub evolution_policy: SchemaEvolutionPolicy,
 }
 
 impl TableSchemaDescriptor {
@@ -1033,7 +1033,7 @@ impl TableSchemaDescriptor {
 		arrow_schema: &Schema,
 		row_identity_policy: RowIdentityPolicy,
 		locality_policy: LocalityPolicy,
-		evolution_policy: SchemaEvolutionPolicyV1,
+		evolution_policy: SchemaEvolutionPolicy,
 	) -> std::io::Result<Self> {
 		Self::new_with_layout(
 			table_object_id,
@@ -1057,7 +1057,7 @@ impl TableSchemaDescriptor {
 		row_identity_policy: RowIdentityPolicy,
 		locality_policy: LocalityPolicy,
 		record_layout_policy: RecordLayoutPolicy,
-		evolution_policy: SchemaEvolutionPolicyV1,
+		evolution_policy: SchemaEvolutionPolicy,
 	) -> std::io::Result<Self> {
 		let record_body_compression_policy =
 			RecordBodyCompressionPolicy::default_for_layout(&record_layout_policy);
@@ -1070,7 +1070,7 @@ impl TableSchemaDescriptor {
 			arrow_schema_ipc: encode_arrow_schema_ipc(arrow_schema)?,
 			row_identity_policy,
 			locality_policy,
-			stats_policy: ColumnStatsPolicyV1::default(),
+			stats_policy: ColumnStatsPolicy::default(),
 			record_layout_policy,
 			record_body_compression_policy,
 			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([0; 32]),
@@ -1086,10 +1086,10 @@ impl TableSchemaDescriptor {
 		decode_arrow_schema_ipc(&self.arrow_schema_ipc)
 	}
 
-	/// Read-only access to the embedded `PrimaryKeyDescriptorV1`
+	/// Read-only access to the embedded `PrimaryKeyDescriptor`
 	/// when the policy is PK-keyed; returns `None` for
 	/// append-only tables.
-	pub fn primary_key_descriptor(&self) -> Option<&PrimaryKeyDescriptorV1> {
+	pub fn primary_key_descriptor(&self) -> Option<&PrimaryKeyDescriptor> {
 		self.row_identity_policy.primary_key()
 	}
 
@@ -1178,24 +1178,24 @@ impl TableSchemaDescriptor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PrimaryKeyDescriptorV1 {
+pub struct PrimaryKeyDescriptor {
 	pub columns: Vec<String>,
-	pub canonical_encoding: PrimaryKeyEncodingV1,
+	pub canonical_encoding: PrimaryKeyEncoding,
 }
 
-impl PrimaryKeyDescriptorV1 {
+impl PrimaryKeyDescriptor {
 	pub fn single(column: impl Into<String>) -> Self {
 		Self {
 			columns: vec![column.into()],
-			canonical_encoding: PrimaryKeyEncodingV1::ArrowV1,
+			canonical_encoding: PrimaryKeyEncoding::Arrow,
 		}
 	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PrimaryKeyEncodingV1 {
-	ArrowV1,
+pub enum PrimaryKeyEncoding {
+	Arrow,
 }
 
 /// ADR 045 row identity policy.
@@ -1209,7 +1209,7 @@ pub enum PrimaryKeyEncodingV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowIdentityPolicy {
-	PrimaryKey(PrimaryKeyDescriptorV1),
+	PrimaryKey(PrimaryKeyDescriptor),
 	AppendOnly,
 	AppendOnlyContentHash,
 }
@@ -1230,7 +1230,7 @@ impl RowIdentityPolicy {
 		)
 	}
 
-	pub const fn primary_key(&self) -> Option<&PrimaryKeyDescriptorV1> {
+	pub const fn primary_key(&self) -> Option<&PrimaryKeyDescriptor> {
 		match self {
 			Self::PrimaryKey(descriptor) => Some(descriptor),
 			Self::AppendOnly | Self::AppendOnlyContentHash => None,
@@ -1296,14 +1296,14 @@ pub fn synthesize_append_only_row_id(
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalityPolicy {
-	TableSpreadProjection(TableSpreadLocalityDescriptorV1),
+	TableSpreadProjection(TableSpreadLocalityDescriptor),
 	IdentityProjection,
-	ColumnProjection(ColumnLocalityDescriptorV1),
+	ColumnProjection(ColumnLocalityDescriptor),
 }
 
 impl LocalityPolicy {
 	pub const fn default_table_spread() -> Self {
-		Self::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+		Self::TableSpreadProjection(TableSpreadLocalityDescriptor {
 			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 			prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 		})
@@ -1311,31 +1311,31 @@ impl LocalityPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TableSpreadLocalityDescriptorV1 {
+pub struct TableSpreadLocalityDescriptor {
 	pub spread_factor: u16,
 	pub prefix_bits: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnLocalityDescriptorV1 {
-	pub columns: Vec<ClusteringColumnSpecV1>,
-	pub projection: ProjectionFunctionV1,
+pub struct ColumnLocalityDescriptor {
+	pub columns: Vec<ClusteringColumnSpec>,
+	pub projection: ProjectionFunction,
 	pub spread_factor: u16,
 	pub prefix_bits: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusteringColumnSpecV1 {
+pub struct ClusteringColumnSpec {
 	pub name: String,
 	pub width_bits: u8,
 	pub string_prefix_bytes: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnStatsPolicyV1 {
-	pub bloom_filters: Vec<ColumnBloomSpecV1>,
-	pub hll_distincts: Vec<ColumnHllSpecV1>,
-	pub small_sets: Vec<ColumnSmallSetSpecV1>,
+pub struct ColumnStatsPolicy {
+	pub bloom_filters: Vec<ColumnBloomSpec>,
+	pub hll_distincts: Vec<ColumnHllSpec>,
+	pub small_sets: Vec<ColumnSmallSetSpec>,
 	#[serde(default)]
 	pub heavy_hitters: Vec<ColumnHeavyHitterSpec>,
 	#[serde(default)]
@@ -1347,12 +1347,12 @@ pub struct ColumnStatsPolicyV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnBloomSpecV1 {
+pub struct ColumnBloomSpec {
 	pub column_name: String,
 	pub bits_per_row: BloomBitsPerRow,
 }
 
-impl ColumnBloomSpecV1 {
+impl ColumnBloomSpec {
 	pub fn new(column_name: impl Into<String>) -> Self {
 		Self {
 			column_name: column_name.into(),
@@ -1372,12 +1372,12 @@ impl ColumnBloomSpecV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnHllSpecV1 {
+pub struct ColumnHllSpec {
 	pub column_name: String,
 	pub precision: HllPrecision,
 }
 
-impl ColumnHllSpecV1 {
+impl ColumnHllSpec {
 	pub fn new(column_name: impl Into<String>) -> Self {
 		Self {
 			column_name: column_name.into(),
@@ -1394,13 +1394,13 @@ impl ColumnHllSpecV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnSmallSetSpecV1 {
+pub struct ColumnSmallSetSpec {
 	pub column_name: String,
 	pub max_distinct_values: SmallSetValueCap,
 	pub max_bytes: SmallSetByteCap,
 }
 
-impl ColumnSmallSetSpecV1 {
+impl ColumnSmallSetSpec {
 	pub fn new(column_name: impl Into<String>) -> Self {
 		Self {
 			column_name: column_name.into(),
@@ -1723,7 +1723,7 @@ impl From<SmallSetByteCap> for u32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProjectionFunctionV1 {
+pub enum ProjectionFunction {
 	RandomHash,
 	ZOrder,
 	Hilbert,
@@ -1731,7 +1731,7 @@ pub enum ProjectionFunctionV1 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SchemaEvolutionPolicyV1 {
+pub enum SchemaEvolutionPolicy {
 	AdditiveOnly,
 }
 
@@ -1742,9 +1742,9 @@ pub fn default_kv_table_descriptor_v1() -> std::io::Result<TableSchemaDescriptor
 		"default",
 		"kv",
 		&write_payload_schema(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("key")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("key")),
 		LocalityPolicy::IdentityProjection,
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 }
 
@@ -2067,7 +2067,7 @@ pub fn table_spread_locality(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
 	key_identity: Identity,
-	spread: TableSpreadLocalityDescriptorV1,
+	spread: TableSpreadLocalityDescriptor,
 ) -> std::io::Result<Locality> {
 	validate_table_spread(spread)?;
 	let bucket = jump_consistent_hash(identity_u64(key_identity), spread.spread_factor);
@@ -2082,7 +2082,7 @@ pub fn table_spread_locality(
 pub fn table_spread_prefix_ranges(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
-	spread: TableSpreadLocalityDescriptorV1,
+	spread: TableSpreadLocalityDescriptor,
 ) -> std::io::Result<Vec<(Locality, Locality)>> {
 	validate_table_spread(spread)?;
 	let (prefix_mask, suffix_mask) = locality_masks(spread.prefix_bits)?;
@@ -2099,12 +2099,12 @@ pub fn table_spread_prefix_ranges(
 pub fn column_projection_prefix_ranges(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
-	projection: &ColumnLocalityDescriptorV1,
+	projection: &ColumnLocalityDescriptor,
 ) -> std::io::Result<Vec<(Locality, Locality)>> {
 	table_spread_prefix_ranges(
 		tenant_id,
 		table_object_id,
-		TableSpreadLocalityDescriptorV1 {
+		TableSpreadLocalityDescriptor {
 			spread_factor: projection.spread_factor,
 			prefix_bits: projection.prefix_bits,
 		},
@@ -2115,12 +2115,12 @@ pub fn column_projection_predicate_ranges(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
 	schema: &Schema,
-	projection: &ColumnLocalityDescriptorV1,
+	projection: &ColumnLocalityDescriptor,
 	program: &PbcProgram,
 	arc_budget: usize,
 ) -> std::io::Result<ColumnProjectionRangePruning> {
 	validate_column_projection(schema, projection)?;
-	if projection.projection != ProjectionFunctionV1::ZOrder {
+	if projection.projection != ProjectionFunction::ZOrder {
 		return Ok(ColumnProjectionRangePruning::Fallback);
 	}
 	let Some(predicates) = program.conjunctive_column_predicates() else {
@@ -2131,7 +2131,7 @@ pub fn column_projection_predicate_ranges(
 		.iter()
 		.map(|column| column.width_bits)
 		.collect();
-	let clustering_columns: Vec<(usize, &ClusteringColumnSpecV1, usize)> = projection
+	let clustering_columns: Vec<(usize, &ClusteringColumnSpec, usize)> = projection
 		.columns
 		.iter()
 		.enumerate()
@@ -2160,7 +2160,7 @@ pub fn column_projection_predicate_ranges(
 			}
 			let field = schema.field(*column_index);
 			match predicate.comparison {
-				ColumnPredicateComparisonV1::Eq => {
+				ColumnPredicateComparison::Eq => {
 					let Some(value) =
 						normalize_clustering_literal(field.data_type(), &predicate.literal, column)
 					else {
@@ -2173,7 +2173,7 @@ pub fn column_projection_predicate_ranges(
 					values.insert(value);
 					restrict_allowed_values(&mut allowed_values[*dim], values);
 				}
-				ColumnPredicateComparisonV1::Gt | ColumnPredicateComparisonV1::Gte => {
+				ColumnPredicateComparison::Gt | ColumnPredicateComparison::Gte => {
 					let Some(value) =
 						normalize_clustering_literal(field.data_type(), &predicate.literal, column)
 					else {
@@ -2182,7 +2182,7 @@ pub fn column_projection_predicate_ranges(
 					constrained = true;
 					lower[*dim] = lower[*dim].max(value);
 				}
-				ColumnPredicateComparisonV1::Lt | ColumnPredicateComparisonV1::Lte => {
+				ColumnPredicateComparison::Lt | ColumnPredicateComparison::Lte => {
 					let Some(value) =
 						normalize_clustering_literal(field.data_type(), &predicate.literal, column)
 					else {
@@ -2191,8 +2191,8 @@ pub fn column_projection_predicate_ranges(
 					constrained = true;
 					upper[*dim] = upper[*dim].min(value);
 				}
-				ColumnPredicateComparisonV1::InList => {
-					let ColumnPredicateLiteralV1::List(literals) = &predicate.literal else {
+				ColumnPredicateComparison::InList => {
+					let ColumnPredicateLiteral::List(literals) = &predicate.literal else {
 						return Ok(ColumnProjectionRangePruning::Fallback);
 					};
 					constrained = true;
@@ -2271,14 +2271,14 @@ fn restrict_allowed_values(slot: &mut Option<BTreeSet<u64>>, values: BTreeSet<u6
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TableSchemaCatalogV1 {
+pub struct TableSchemaCatalog {
 	#[serde(default)]
 	by_id: BTreeMap<TableSchemaCatalogKey, TableSchemaDescriptor>,
 	#[serde(default)]
 	latest_by_name: BTreeMap<TableNameCatalogKey, TableSchemaCatalogKey>,
 }
 
-impl TableSchemaCatalogV1 {
+impl TableSchemaCatalog {
 	pub fn upsert(
 		&mut self,
 		tenant_id: TenantId,
@@ -2653,7 +2653,7 @@ fn validate_content_hash(
 
 fn validate_primary_key(
 	schema: &Schema,
-	primary_key: &PrimaryKeyDescriptorV1,
+	primary_key: &PrimaryKeyDescriptor,
 ) -> std::io::Result<()> {
 	if primary_key.columns.len() != 1 {
 		return Err(Error::new(
@@ -2692,7 +2692,7 @@ fn validate_locality_policy(schema: &Schema, policy: &LocalityPolicy) -> std::io
 		LocalityPolicy::TableSpreadProjection(spread) => validate_table_spread(*spread),
 		LocalityPolicy::IdentityProjection => Ok(()),
 		LocalityPolicy::ColumnProjection(projection) => {
-			validate_table_spread(TableSpreadLocalityDescriptorV1 {
+			validate_table_spread(TableSpreadLocalityDescriptor {
 				spread_factor: projection.spread_factor,
 				prefix_bits: projection.prefix_bits,
 			})?;
@@ -2703,11 +2703,11 @@ fn validate_locality_policy(schema: &Schema, policy: &LocalityPolicy) -> std::io
 
 fn validate_column_projection(
 	schema: &Schema,
-	projection: &ColumnLocalityDescriptorV1,
+	projection: &ColumnLocalityDescriptor,
 ) -> std::io::Result<()> {
 	match projection.projection {
-		ProjectionFunctionV1::RandomHash | ProjectionFunctionV1::ZOrder => {}
-		ProjectionFunctionV1::Hilbert => {
+		ProjectionFunction::RandomHash | ProjectionFunction::ZOrder => {}
+		ProjectionFunction::Hilbert => {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				format!(
@@ -2795,7 +2795,7 @@ fn validate_column_projection(
 	Ok(())
 }
 
-fn validate_stats_policy(schema: &Schema, policy: &ColumnStatsPolicyV1) -> std::io::Result<()> {
+fn validate_stats_policy(schema: &Schema, policy: &ColumnStatsPolicy) -> std::io::Result<()> {
 	validate_bloom_stats_policy(schema, &policy.bloom_filters)?;
 	validate_hll_stats_policy(schema, &policy.hll_distincts)?;
 	validate_small_set_stats_policy(schema, &policy.small_sets)?;
@@ -2815,7 +2815,7 @@ pub const fn max_column_stats_block_ciphertext_bytes_for_slab_payload(
 
 fn validate_stats_policy_budget(
 	schema: &Schema,
-	policy: &ColumnStatsPolicyV1,
+	policy: &ColumnStatsPolicy,
 ) -> std::io::Result<()> {
 	let budget = max_column_stats_block_ciphertext_bytes_for_slab_payload(
 		COLUMN_STATS_DESCRIPTOR_SLAB_PAYLOAD_BYTES,
@@ -2836,7 +2836,7 @@ fn validate_stats_policy_budget(
 
 fn estimate_stats_policy_csb_ciphertext_bytes(
 	schema: &Schema,
-	policy: &ColumnStatsPolicyV1,
+	policy: &ColumnStatsPolicy,
 	row_capacity: u64,
 ) -> std::io::Result<u64> {
 	let column_count = u64::try_from(schema.fields().len()).map_err(|_| {
@@ -2960,10 +2960,7 @@ fn estimated_canonical_stats_value_bytes(data_type: &DataType) -> Option<u64> {
 	}
 }
 
-fn validate_bloom_stats_policy(
-	schema: &Schema,
-	specs: &[ColumnBloomSpecV1],
-) -> std::io::Result<()> {
+fn validate_bloom_stats_policy(schema: &Schema, specs: &[ColumnBloomSpec]) -> std::io::Result<()> {
 	let mut seen = BTreeSet::new();
 	for spec in specs {
 		validate_descriptor_name("stats bloom column", &spec.column_name)?;
@@ -2993,7 +2990,7 @@ fn validate_bloom_stats_policy(
 	Ok(())
 }
 
-fn validate_hll_stats_policy(schema: &Schema, specs: &[ColumnHllSpecV1]) -> std::io::Result<()> {
+fn validate_hll_stats_policy(schema: &Schema, specs: &[ColumnHllSpec]) -> std::io::Result<()> {
 	let mut seen = BTreeSet::new();
 	for spec in specs {
 		validate_descriptor_name("stats HLL column", &spec.column_name)?;
@@ -3025,7 +3022,7 @@ fn validate_hll_stats_policy(schema: &Schema, specs: &[ColumnHllSpecV1]) -> std:
 
 fn validate_small_set_stats_policy(
 	schema: &Schema,
-	specs: &[ColumnSmallSetSpecV1],
+	specs: &[ColumnSmallSetSpec],
 ) -> std::io::Result<()> {
 	let mut seen = BTreeSet::new();
 	for spec in specs {
@@ -3468,7 +3465,7 @@ fn estimated_range_distribution_value_bytes(data_type: &DataType) -> Option<u64>
 
 fn validate_clustering_type_and_width(
 	data_type: &DataType,
-	column: &ClusteringColumnSpecV1,
+	column: &ClusteringColumnSpec,
 ) -> std::io::Result<()> {
 	match data_type {
 		DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
@@ -3548,7 +3545,7 @@ fn validate_clustering_type_and_width(
 	}
 }
 
-fn validate_table_spread(spread: TableSpreadLocalityDescriptorV1) -> std::io::Result<()> {
+fn validate_table_spread(spread: TableSpreadLocalityDescriptor) -> std::io::Result<()> {
 	if spread.spread_factor == 0 || spread.spread_factor > TABLE_SPREAD_MAX_FACTOR {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -3599,7 +3596,7 @@ fn canonicalize_primary_key_column(
 			"append-only descriptors do not have a primary key column to canonicalize",
 		)
 	})?;
-	if primary_key.canonical_encoding != PrimaryKeyEncodingV1::ArrowV1 {
+	if primary_key.canonical_encoding != PrimaryKeyEncoding::Arrow {
 		return Err(TableWriteValidationError::new(
 			PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 			"unsupported primary key canonical encoding",
@@ -3755,7 +3752,7 @@ fn column_projection_locality(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
 	key_identity: Identity,
-	projection: &ColumnLocalityDescriptorV1,
+	projection: &ColumnLocalityDescriptor,
 	batch: &RecordBatch,
 	row: usize,
 ) -> Result<Locality, TableWriteValidationError> {
@@ -3767,9 +3764,9 @@ fn column_projection_locality(
 		.collect();
 	let suffix_width = clustering_suffix_width(&widths);
 	let z_suffix = match projection.projection {
-		ProjectionFunctionV1::ZOrder => z_order_encode(&coords, &widths),
-		ProjectionFunctionV1::RandomHash => random_hash_suffix(&coords, &widths, suffix_width),
-		ProjectionFunctionV1::Hilbert => {
+		ProjectionFunction::ZOrder => z_order_encode(&coords, &widths),
+		ProjectionFunction::RandomHash => random_hash_suffix(&coords, &widths, suffix_width),
+		ProjectionFunction::Hilbert => {
 			return Err(TableWriteValidationError::new(
 				PbcRejectCode::PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED,
 				"Hilbert column locality is reserved for a future ADR",
@@ -3788,9 +3785,9 @@ fn column_projection_locality(
 fn column_projection_table_prefixes(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
-	projection: &ColumnLocalityDescriptorV1,
+	projection: &ColumnLocalityDescriptor,
 ) -> std::io::Result<Vec<u64>> {
-	validate_table_spread(TableSpreadLocalityDescriptorV1 {
+	validate_table_spread(TableSpreadLocalityDescriptor {
 		spread_factor: projection.spread_factor,
 		prefix_bits: projection.prefix_bits,
 	})?;
@@ -3804,7 +3801,7 @@ fn column_projection_table_prefixes(
 
 fn normalize_clustering_row(
 	batch: &RecordBatch,
-	projection: &ColumnLocalityDescriptorV1,
+	projection: &ColumnLocalityDescriptor,
 	row: usize,
 ) -> Result<Vec<u64>, TableWriteValidationError> {
 	let mut coords = Vec::with_capacity(projection.columns.len());
@@ -3829,7 +3826,7 @@ fn normalize_clustering_row(
 fn normalize_clustering_value(
 	array: &dyn Array,
 	row: usize,
-	column: &ClusteringColumnSpecV1,
+	column: &ClusteringColumnSpec,
 ) -> Result<u64, TableWriteValidationError> {
 	macro_rules! signed_width {
 		($array:expr, $ty:ty, $bits:expr) => {{
@@ -3949,51 +3946,51 @@ fn normalize_clustering_value(
 
 fn normalize_clustering_literal(
 	data_type: &DataType,
-	literal: &ColumnPredicateLiteralV1,
-	column: &ClusteringColumnSpecV1,
+	literal: &ColumnPredicateLiteral,
+	column: &ClusteringColumnSpec,
 ) -> Option<u64> {
 	match (data_type, literal) {
-		(DataType::Int8, ColumnPredicateLiteralV1::Int(value))
+		(DataType::Int8, ColumnPredicateLiteral::Int(value))
 			if (i8::MIN as i64..=i8::MAX as i64).contains(value) =>
 		{
 			Some(normalize_signed_int(*value, 8, column.width_bits))
 		}
-		(DataType::Int16, ColumnPredicateLiteralV1::Int(value))
+		(DataType::Int16, ColumnPredicateLiteral::Int(value))
 			if (i16::MIN as i64..=i16::MAX as i64).contains(value) =>
 		{
 			Some(normalize_signed_int(*value, 16, column.width_bits))
 		}
-		(DataType::Int32, ColumnPredicateLiteralV1::Int(value))
+		(DataType::Int32, ColumnPredicateLiteral::Int(value))
 			if (i32::MIN as i64..=i32::MAX as i64).contains(value) =>
 		{
 			Some(normalize_signed_int(*value, 32, column.width_bits))
 		}
-		(DataType::Int64, ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Int64, ColumnPredicateLiteral::Int(value)) => {
 			Some(normalize_signed_int(*value, 64, column.width_bits))
 		}
-		(DataType::UInt8, ColumnPredicateLiteralV1::Int(value))
+		(DataType::UInt8, ColumnPredicateLiteral::Int(value))
 			if (0..=u8::MAX as i64).contains(value) =>
 		{
 			Some(take_high_bits(*value as u64, 8, column.width_bits))
 		}
-		(DataType::UInt16, ColumnPredicateLiteralV1::Int(value))
+		(DataType::UInt16, ColumnPredicateLiteral::Int(value))
 			if (0..=u16::MAX as i64).contains(value) =>
 		{
 			Some(take_high_bits(*value as u64, 16, column.width_bits))
 		}
-		(DataType::UInt32, ColumnPredicateLiteralV1::Int(value))
+		(DataType::UInt32, ColumnPredicateLiteral::Int(value))
 			if (0..=u32::MAX as i64).contains(value) =>
 		{
 			Some(take_high_bits(*value as u64, 32, column.width_bits))
 		}
-		(DataType::UInt64, ColumnPredicateLiteralV1::Int(value)) if *value >= 0 => {
+		(DataType::UInt64, ColumnPredicateLiteral::Int(value)) if *value >= 0 => {
 			Some(take_high_bits(*value as u64, 64, column.width_bits))
 		}
-		(DataType::Timestamp(TimeUnit::Millisecond, _), ColumnPredicateLiteralV1::Ts(value))
-		| (DataType::Timestamp(TimeUnit::Millisecond, _), ColumnPredicateLiteralV1::Int(value)) => {
+		(DataType::Timestamp(TimeUnit::Millisecond, _), ColumnPredicateLiteral::Ts(value))
+		| (DataType::Timestamp(TimeUnit::Millisecond, _), ColumnPredicateLiteral::Int(value)) => {
 			Some(normalize_signed_int(*value, 64, column.width_bits))
 		}
-		(DataType::Utf8 | DataType::LargeUtf8, ColumnPredicateLiteralV1::Str(bytes)) => Some(
+		(DataType::Utf8 | DataType::LargeUtf8, ColumnPredicateLiteral::Str(bytes)) => Some(
 			normalize_prefix_bytes(bytes, column.string_prefix_bytes.unwrap_or(0)),
 		),
 		_ => None,
@@ -4466,9 +4463,9 @@ mod tests {
 			"analytics",
 			"events",
 			schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -4479,7 +4476,7 @@ mod tests {
 
 	fn descriptor_with_stats(
 		schema: &Schema,
-		stats_policy: ColumnStatsPolicyV1,
+		stats_policy: ColumnStatsPolicy,
 	) -> std::io::Result<TableSchemaDescriptor> {
 		let mut descriptor = descriptor_for(schema);
 		descriptor.stats_policy = stats_policy;
@@ -4488,16 +4485,16 @@ mod tests {
 		Ok(descriptor)
 	}
 
-	fn cluster_column(name: &str, width_bits: u8) -> ClusteringColumnSpecV1 {
-		ClusteringColumnSpecV1 {
+	fn cluster_column(name: &str, width_bits: u8) -> ClusteringColumnSpec {
+		ClusteringColumnSpec {
 			name: name.to_owned(),
 			width_bits,
 			string_prefix_bytes: None,
 		}
 	}
 
-	fn cluster_string_column(name: &str, string_prefix_bytes: u8) -> ClusteringColumnSpecV1 {
-		ClusteringColumnSpecV1 {
+	fn cluster_string_column(name: &str, string_prefix_bytes: u8) -> ClusteringColumnSpec {
+		ClusteringColumnSpec {
 			name: name.to_owned(),
 			width_bits: string_prefix_bytes * 8,
 			string_prefix_bytes: Some(string_prefix_bytes),
@@ -4534,8 +4531,8 @@ mod tests {
 	}
 
 	fn clustered_descriptor(
-		projection: ProjectionFunctionV1,
-		columns: Vec<ClusteringColumnSpecV1>,
+		projection: ProjectionFunction,
+		columns: Vec<ClusteringColumnSpec>,
 	) -> TableSchemaDescriptor {
 		TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
@@ -4543,14 +4540,14 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns,
 				projection,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}
@@ -4613,7 +4610,7 @@ mod tests {
 		assert_eq!(descriptor.arrow_schema().unwrap(), write_payload_schema());
 		assert_eq!(
 			descriptor.row_identity_policy,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("key"))
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("key"))
 		);
 		assert_eq!(
 			descriptor.locality_policy,
@@ -4722,10 +4719,10 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		assert_eq!(
@@ -4838,7 +4835,7 @@ mod tests {
 	#[test]
 	fn stats_policy_defaults_empty_and_roundtrips_in_fingerprint() {
 		let descriptor = descriptor_for(&table_schema(DataType::Int64, false));
-		assert_eq!(descriptor.stats_policy, ColumnStatsPolicyV1::default());
+		assert_eq!(descriptor.stats_policy, ColumnStatsPolicy::default());
 
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
@@ -4847,10 +4844,10 @@ mod tests {
 		]);
 		let descriptor = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
-				bloom_filters: vec![ColumnBloomSpecV1::new("region")],
-				hll_distincts: vec![ColumnHllSpecV1::new("id")],
-				small_sets: vec![ColumnSmallSetSpecV1::new("active")],
+			ColumnStatsPolicy {
+				bloom_filters: vec![ColumnBloomSpec::new("region")],
+				hll_distincts: vec![ColumnHllSpec::new("id")],
+				small_sets: vec![ColumnSmallSetSpec::new("active")],
 				heavy_hitters: vec![ColumnHeavyHitterSpec::new("active")],
 				range_distributions: Vec::new(),
 				column_group_top_k: vec![ColumnGroupTopKSpec::new(vec![
@@ -4875,9 +4872,9 @@ mod tests {
 
 		let duplicate = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
-				bloom_filters: vec![ColumnBloomSpecV1::new("id"), ColumnBloomSpecV1::new("id")],
-				..ColumnStatsPolicyV1::default()
+			ColumnStatsPolicy {
+				bloom_filters: vec![ColumnBloomSpec::new("id"), ColumnBloomSpec::new("id")],
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -4889,9 +4886,9 @@ mod tests {
 
 		let unknown = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
-				hll_distincts: vec![ColumnHllSpecV1::new("missing")],
-				..ColumnStatsPolicyV1::default()
+			ColumnStatsPolicy {
+				hll_distincts: vec![ColumnHllSpec::new("missing")],
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -4903,9 +4900,9 @@ mod tests {
 
 		let unsupported = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
-				small_sets: vec![ColumnSmallSetSpecV1::new("score")],
-				..ColumnStatsPolicyV1::default()
+			ColumnStatsPolicy {
+				small_sets: vec![ColumnSmallSetSpec::new("score")],
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -4917,12 +4914,12 @@ mod tests {
 
 		let invalid_bits = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
-				bloom_filters: vec![ColumnBloomSpecV1 {
+			ColumnStatsPolicy {
+				bloom_filters: vec![ColumnBloomSpec {
 					column_name: "id".into(),
 					bits_per_row: BloomBitsPerRow(0),
 				}],
-				..ColumnStatsPolicyV1::default()
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -4934,12 +4931,12 @@ mod tests {
 
 		let invalid_precision = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
-				hll_distincts: vec![ColumnHllSpecV1 {
+			ColumnStatsPolicy {
+				hll_distincts: vec![ColumnHllSpec {
 					column_name: "id".into(),
 					precision: HllPrecision(COLUMN_STATS_HLL_MIN_PRECISION - 1),
 				}],
-				..ColumnStatsPolicyV1::default()
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -4951,13 +4948,13 @@ mod tests {
 
 		let invalid_small_set = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
-				small_sets: vec![ColumnSmallSetSpecV1 {
+			ColumnStatsPolicy {
+				small_sets: vec![ColumnSmallSetSpec {
 					column_name: "id".into(),
 					max_distinct_values: SmallSetValueCap(0),
 					max_bytes: SmallSetByteCap::DEFAULT,
 				}],
-				..ColumnStatsPolicyV1::default()
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -4969,13 +4966,13 @@ mod tests {
 
 		let invalid_heavy_hitter = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
+			ColumnStatsPolicy {
 				heavy_hitters: vec![ColumnHeavyHitterSpec {
 					column_name: "id".into(),
 					max_entries: 0,
 					max_bytes: COLUMN_STATS_HEAVY_HITTER_DEFAULT_MAX_BYTES,
 				}],
-				..ColumnStatsPolicyV1::default()
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -4987,9 +4984,9 @@ mod tests {
 
 		let invalid_group_top_k = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
+			ColumnStatsPolicy {
 				column_group_top_k: vec![ColumnGroupTopKSpec::new(vec!["id".to_string()])],
-				..ColumnStatsPolicyV1::default()
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -5001,12 +4998,12 @@ mod tests {
 
 		let duplicate_group_top_k_column = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
+			ColumnStatsPolicy {
 				column_group_top_k: vec![ColumnGroupTopKSpec::new(vec![
 					"id".to_string(),
 					"id".to_string(),
 				])],
-				..ColumnStatsPolicyV1::default()
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -5018,13 +5015,13 @@ mod tests {
 
 		let budget = descriptor_with_stats(
 			&schema,
-			ColumnStatsPolicyV1 {
-				bloom_filters: vec![ColumnBloomSpecV1 {
+			ColumnStatsPolicy {
+				bloom_filters: vec![ColumnBloomSpec {
 					column_name: "id".into(),
 					bits_per_row: BloomBitsPerRow::new(COLUMN_STATS_BLOOM_MAX_BITS_PER_ROW)
 						.unwrap(),
 				}],
-				..ColumnStatsPolicyV1::default()
+				..ColumnStatsPolicy::default()
 			},
 		)
 		.unwrap_err();
@@ -5116,9 +5113,9 @@ mod tests {
 			Field::new("event_hour", DataType::UInt32, false),
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
-		let locality = LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+		let locality = LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 			columns: vec![cluster_column("event_hour", 16)],
-			projection: ProjectionFunctionV1::ZOrder,
+			projection: ProjectionFunction::ZOrder,
 			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 			prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 		});
@@ -5128,9 +5125,9 @@ mod tests {
 			"analytics",
 			"events",
 			&previous_schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			locality.clone(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let next = TableSchemaDescriptor::new(
@@ -5139,9 +5136,9 @@ mod tests {
 			"analytics",
 			"events",
 			&next_schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			locality,
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		validate_table_schema_evolution(&previous, &next).unwrap();
@@ -5152,14 +5149,14 @@ mod tests {
 			"analytics",
 			"events",
 			&next_schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns: vec![cluster_column("event_hour", 20)],
-				projection: ProjectionFunctionV1::ZOrder,
+				projection: ProjectionFunction::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let err = validate_table_schema_evolution(&previous, &changed_locality).unwrap_err();
@@ -5226,9 +5223,9 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, true),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		);
 		assert!(nullable.is_err());
 
@@ -5238,9 +5235,9 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Float64, false),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		);
 		assert!(float_pk.is_err());
 	}
@@ -5253,12 +5250,12 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, false),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor {
 				columns: vec!["id".to_owned(), "name".to_owned()],
-				canonical_encoding: PrimaryKeyEncodingV1::ArrowV1,
+				canonical_encoding: PrimaryKeyEncoding::Arrow,
 			}),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		);
 		assert!(descriptor.is_err());
 	}
@@ -5276,7 +5273,7 @@ mod tests {
 	fn table_spread_ranges_and_locality_share_prefix() {
 		let tenant = TenantId::new(9);
 		let table = TableObjectId::new([3; 16]);
-		let spread = TableSpreadLocalityDescriptorV1 {
+		let spread = TableSpreadLocalityDescriptor {
 			spread_factor: 4,
 			prefix_bits: 16,
 		};
@@ -5301,14 +5298,14 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns: vec![],
-				projection: ProjectionFunctionV1::ZOrder,
+				projection: ProjectionFunction::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap_err();
 		assert!(empty.to_string().contains("PBC_REJECT_CLUSTERING_EMPTY"));
@@ -5319,8 +5316,8 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns: vec![
 					cluster_column("id", 1),
 					cluster_column("event_hour", 1),
@@ -5330,11 +5327,11 @@ mod tests {
 					cluster_column("event_hour", 1),
 					cluster_column("customer_id", 1),
 				],
-				projection: ProjectionFunctionV1::ZOrder,
+				projection: ProjectionFunction::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap_err();
 		assert!(
@@ -5349,17 +5346,17 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns: vec![
 					cluster_column("event_hour", 4),
 					cluster_column("event_hour", 4),
 				],
-				projection: ProjectionFunctionV1::ZOrder,
+				projection: ProjectionFunction::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap_err();
 		assert!(
@@ -5374,14 +5371,14 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, false),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns: vec![cluster_string_column("name", 2)],
-				projection: ProjectionFunctionV1::ZOrder,
+				projection: ProjectionFunction::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap_err();
 		assert!(
@@ -5396,14 +5393,14 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns: vec![cluster_column("event_hour", 16)],
-				projection: ProjectionFunctionV1::Hilbert,
+				projection: ProjectionFunction::Hilbert,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap_err();
 		assert!(
@@ -5418,14 +5415,14 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns: vec![cluster_column("id", 64)],
-				projection: ProjectionFunctionV1::ZOrder,
+				projection: ProjectionFunction::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap_err();
 		assert!(
@@ -5440,14 +5437,14 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::UInt8, false),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 				columns: vec![cluster_column("id", 16)],
-				projection: ProjectionFunctionV1::ZOrder,
+				projection: ProjectionFunction::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap_err();
 		assert!(
@@ -5467,14 +5464,14 @@ mod tests {
 				"analytics",
 				"events",
 				&schema_with_clustering_candidate(data_type),
-				RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-				LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
+				RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+				LocalityPolicy::ColumnProjection(ColumnLocalityDescriptor {
 					columns: vec![cluster_column("candidate", 8)],
-					projection: ProjectionFunctionV1::ZOrder,
+					projection: ProjectionFunction::ZOrder,
 					spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 					prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 				}),
-				SchemaEvolutionPolicyV1::AdditiveOnly,
+				SchemaEvolutionPolicy::AdditiveOnly,
 			)
 			.unwrap_err();
 			assert!(
@@ -5489,7 +5486,7 @@ mod tests {
 	fn column_projection_ranges_reuse_table_spread_shape() {
 		let tenant = TenantId::new(9);
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::ZOrder,
+			ProjectionFunction::ZOrder,
 			vec![
 				cluster_column("event_hour", 24),
 				cluster_column("customer_id", 20),
@@ -5508,9 +5505,9 @@ mod tests {
 
 	#[test]
 	fn string_prefix_clustering_uses_lexicographic_bytes() {
-		let projection = ColumnLocalityDescriptorV1 {
+		let projection = ColumnLocalityDescriptor {
 			columns: vec![cluster_string_column("region", 1)],
-			projection: ProjectionFunctionV1::ZOrder,
+			projection: ProjectionFunction::ZOrder,
 			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 			prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 		};
@@ -5532,7 +5529,7 @@ mod tests {
 	fn column_projection_predicate_ranges_prune_z_suffix() {
 		let tenant = TenantId::new(9);
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::ZOrder,
+			ProjectionFunction::ZOrder,
 			vec![cluster_column("event_hour", 4)],
 		);
 		let projection = match &descriptor.locality_policy {
@@ -5574,7 +5571,7 @@ mod tests {
 	fn column_projection_predicate_ranges_prune_in_list_values() {
 		let tenant = TenantId::new(9);
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::ZOrder,
+			ProjectionFunction::ZOrder,
 			vec![cluster_string_column("region", 1)],
 		);
 		let projection = match &descriptor.locality_policy {
@@ -5616,7 +5613,7 @@ mod tests {
 	#[test]
 	fn column_projection_predicate_ranges_return_empty_for_unsatisfiable_bounds() {
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::ZOrder,
+			ProjectionFunction::ZOrder,
 			vec![cluster_column("event_hour", 4)],
 		);
 		let projection = match &descriptor.locality_policy {
@@ -5650,7 +5647,7 @@ mod tests {
 	#[test]
 	fn column_projection_predicate_ranges_fall_back_for_disjunctions() {
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::ZOrder,
+			ProjectionFunction::ZOrder,
 			vec![cluster_column("event_hour", 4)],
 		);
 		let projection = match &descriptor.locality_policy {
@@ -5684,7 +5681,7 @@ mod tests {
 	#[test]
 	fn column_projection_predicate_ranges_fall_back_when_arc_budget_overflows() {
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::ZOrder,
+			ProjectionFunction::ZOrder,
 			vec![cluster_column("event_hour", 4)],
 		);
 		let projection = match &descriptor.locality_policy {
@@ -5718,7 +5715,7 @@ mod tests {
 	#[test]
 	fn column_projection_predicate_ranges_overflow_realistic_sparse_z_slice() {
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::ZOrder,
+			ProjectionFunction::ZOrder,
 			vec![
 				cluster_column("event_hour", 16),
 				cluster_column("customer_id", 16),
@@ -5797,7 +5794,7 @@ mod tests {
 		let descriptor = descriptor_for(&table_schema(DataType::Int64, false));
 		let table_object_id = descriptor.table_object_id;
 		let generation = descriptor.schema_generation;
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant, descriptor.clone()).unwrap();
 		assert_eq!(
 			catalog.get(tenant, table_object_id, generation),
@@ -5825,12 +5822,12 @@ mod tests {
 			"analytics",
 			"events_copy",
 			&table_schema(DataType::Int64, false),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant, descriptor.clone()).unwrap();
 		let err = catalog.upsert(tenant, conflicting).unwrap_err();
 		assert!(err.to_string().contains("table_object_id"));
@@ -5845,7 +5842,7 @@ mod tests {
 		let tenant = TenantId::new(9);
 		let newest = descriptor_for_generation(&table_schema(DataType::Int64, false), 2);
 		let stale = descriptor_for_generation(&table_schema(DataType::Int64, false), 1);
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant, newest.clone()).unwrap();
 		let err = catalog.upsert(tenant, stale).unwrap_err();
 		assert!(err.to_string().contains("regress schema_generation"));
@@ -5866,9 +5863,9 @@ mod tests {
 			"analytics",
 			"customers",
 			&table_schema(DataType::Int64, false),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let tenant_two = TableSchemaDescriptor::new(
@@ -5877,12 +5874,12 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, false),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
-		let mut catalog = TableSchemaCatalogV1::default();
+		let mut catalog = TableSchemaCatalog::default();
 		catalog.upsert(tenant, old).unwrap();
 		catalog.upsert(tenant, latest.clone()).unwrap();
 		catalog.upsert(tenant, other.clone()).unwrap();
@@ -5905,9 +5902,9 @@ mod tests {
 			"analytics",
 			"customers",
 			&table_schema(DataType::Int64, false),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 
@@ -6011,7 +6008,7 @@ mod tests {
 	#[test]
 	fn table_write_validation_accepts_column_projection_zorder() {
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::ZOrder,
+			ProjectionFunction::ZOrder,
 			vec![
 				cluster_string_column("region", 1),
 				cluster_column("event_hour", 20),
@@ -6046,9 +6043,9 @@ mod tests {
 
 	#[test]
 	fn clustering_row_normalization_rejects_null_value() {
-		let projection = ColumnLocalityDescriptorV1 {
+		let projection = ColumnLocalityDescriptor {
 			columns: vec![cluster_column("event_hour", 4)],
-			projection: ProjectionFunctionV1::ZOrder,
+			projection: ProjectionFunction::ZOrder,
 			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 			prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 		};
@@ -6074,7 +6071,7 @@ mod tests {
 	#[test]
 	fn table_write_validation_accepts_column_projection_random_hash() {
 		let descriptor = clustered_descriptor(
-			ProjectionFunctionV1::RandomHash,
+			ProjectionFunction::RandomHash,
 			vec![
 				cluster_column("event_hour", 24),
 				cluster_column("customer_id", 20),
@@ -6121,7 +6118,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			locality,
 			layout,
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 	}
 
@@ -6162,8 +6159,8 @@ mod tests {
 	fn append_only_descriptor_rejects_column_projection() {
 		// ADR 045 §4a: ColumnProjection retry-stable semantics under
 		// HLC-derived identity are out of scope for V1.
-		let projection = ColumnLocalityDescriptorV1 {
-			projection: ProjectionFunctionV1::RandomHash,
+		let projection = ColumnLocalityDescriptor {
+			projection: ProjectionFunction::RandomHash,
 			columns: vec![cluster_column("event_time", 32)],
 			spread_factor: 4,
 			prefix_bits: 16,
@@ -6211,7 +6208,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect_err("user column shadowing __row_hlc__ must reject");
 		assert!(
@@ -6239,7 +6236,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect_err("user column shadowing __row_tombstone__ must reject");
 		assert!(
@@ -6263,10 +6260,10 @@ mod tests {
 					false,
 				),
 			]),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		let append_only_descriptor = append_only_descriptor_with(
@@ -6313,7 +6310,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnlyContentHash,
 			locality,
 			layout,
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 	}
 
@@ -6352,8 +6349,8 @@ mod tests {
 
 	#[test]
 	fn content_hash_descriptor_rejects_column_projection_and_singlerow() {
-		let projection = ColumnLocalityDescriptorV1 {
-			projection: ProjectionFunctionV1::RandomHash,
+		let projection = ColumnLocalityDescriptor {
+			projection: ProjectionFunction::RandomHash,
 			columns: vec![cluster_column("event_time", 32)],
 			spread_factor: 4,
 			prefix_bits: 16,
@@ -6405,10 +6402,10 @@ mod tests {
 					false,
 				),
 			]),
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("event_id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("event_id")),
 			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		assert_ne!(

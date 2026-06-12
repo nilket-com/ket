@@ -114,14 +114,14 @@ pub struct Program {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ColumnPredicateV1 {
+pub struct ColumnPredicate {
 	pub column_index: usize,
-	pub comparison: ColumnPredicateComparisonV1,
-	pub literal: ColumnPredicateLiteralV1,
+	pub comparison: ColumnPredicateComparison,
+	pub literal: ColumnPredicateLiteral,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColumnPredicateComparisonV1 {
+pub enum ColumnPredicateComparison {
 	Eq,
 	Gt,
 	Gte,
@@ -131,21 +131,21 @@ pub enum ColumnPredicateComparisonV1 {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum ColumnPredicateLiteralV1 {
+pub enum ColumnPredicateLiteral {
 	Int(i64),
 	Str(Vec<u8>),
 	Float(f64),
 	Ts(i64),
-	List(Vec<ColumnPredicateLiteralV1>),
+	List(Vec<ColumnPredicateLiteral>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum PredicateTreeV1 {
-	Comparison(ColumnPredicateV1),
+pub enum PredicateTree {
+	Comparison(ColumnPredicate),
 	IsNull { column_index: usize },
 	IsNotNull { column_index: usize },
-	And(Vec<PredicateTreeV1>),
-	Or(Vec<PredicateTreeV1>),
+	And(Vec<PredicateTree>),
+	Or(Vec<PredicateTree>),
 	AlwaysTrue,
 	Unsupported,
 }
@@ -246,11 +246,11 @@ impl Program {
 		Ok(program)
 	}
 
-	pub fn conjunctive_column_predicates(&self) -> Option<Vec<ColumnPredicateV1>> {
+	pub fn conjunctive_column_predicates(&self) -> Option<Vec<ColumnPredicate>> {
 		extract_conjunctive_column_predicates(&self.ops)
 	}
 
-	pub fn predicate_tree(&self) -> PredicateTreeV1 {
+	pub fn predicate_tree(&self) -> PredicateTree {
 		extract_predicate_tree(&self.ops)
 	}
 }
@@ -275,8 +275,8 @@ fn remap_project_columns(
 #[derive(Clone, Debug)]
 enum PredicateExpr {
 	Column(usize),
-	Literal(ColumnPredicateLiteralV1),
-	Predicates(Vec<ColumnPredicateV1>),
+	Literal(ColumnPredicateLiteral),
+	Predicates(Vec<ColumnPredicate>),
 	True,
 	Unsupported,
 }
@@ -284,25 +284,25 @@ enum PredicateExpr {
 #[derive(Clone, Debug)]
 enum PredicateTreeExpr {
 	Column(usize),
-	Literal(ColumnPredicateLiteralV1),
-	Predicate(PredicateTreeV1),
+	Literal(ColumnPredicateLiteral),
+	Predicate(PredicateTree),
 	AlwaysTrue,
 	Unsupported,
 }
 
-fn extract_predicate_tree(ops: &[Op]) -> PredicateTreeV1 {
+fn extract_predicate_tree(ops: &[Op]) -> PredicateTree {
 	if ops.is_empty() {
-		return PredicateTreeV1::AlwaysTrue;
+		return PredicateTree::AlwaysTrue;
 	}
 	let mut stack = Vec::with_capacity(STACK_DEPTH_LIMIT);
 	for op in ops {
 		match op {
 			Op::PushCol(column) => stack.push(PredicateTreeExpr::Column(*column as usize)),
 			Op::PushInt(value) => stack.push(PredicateTreeExpr::Literal(
-				ColumnPredicateLiteralV1::Int(*value),
+				ColumnPredicateLiteral::Int(*value),
 			)),
 			Op::PushStr(bytes) => stack.push(PredicateTreeExpr::Literal(
-				ColumnPredicateLiteralV1::Str(bytes.clone()),
+				ColumnPredicateLiteral::Str(bytes.clone()),
 			)),
 			Op::PushBool(value) => {
 				if *value {
@@ -312,23 +312,23 @@ fn extract_predicate_tree(ops: &[Op]) -> PredicateTreeV1 {
 				}
 			}
 			Op::PushFloat(value) => stack.push(PredicateTreeExpr::Literal(
-				ColumnPredicateLiteralV1::Float(*value),
+				ColumnPredicateLiteral::Float(*value),
 			)),
 			Op::PushTs(value) => stack.push(PredicateTreeExpr::Literal(
-				ColumnPredicateLiteralV1::Ts(*value),
+				ColumnPredicateLiteral::Ts(*value),
 			)),
 			Op::Eq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
 				let Some(rhs) = stack.pop() else {
-					return PredicateTreeV1::Unsupported;
+					return PredicateTree::Unsupported;
 				};
 				let Some(lhs) = stack.pop() else {
-					return PredicateTreeV1::Unsupported;
+					return PredicateTree::Unsupported;
 				};
 				stack.push(predicate_tree_from_comparison(lhs, rhs, op));
 			}
 			Op::IsNull | Op::IsNotNull => {
 				let Some(value) = stack.pop() else {
-					return PredicateTreeV1::Unsupported;
+					return PredicateTree::Unsupported;
 				};
 				stack.push(predicate_tree_from_null_check(
 					value,
@@ -337,29 +337,29 @@ fn extract_predicate_tree(ops: &[Op]) -> PredicateTreeV1 {
 			}
 			Op::And | Op::Or => {
 				let Some(rhs) = stack.pop() else {
-					return PredicateTreeV1::Unsupported;
+					return PredicateTree::Unsupported;
 				};
 				let Some(lhs) = stack.pop() else {
-					return PredicateTreeV1::Unsupported;
+					return PredicateTree::Unsupported;
 				};
 				stack.push(predicate_tree_from_logical(lhs, rhs, matches!(op, Op::Or)));
 			}
 			Op::Neq => {
 				if stack.pop().is_none() || stack.pop().is_none() {
-					return PredicateTreeV1::Unsupported;
+					return PredicateTree::Unsupported;
 				}
 				stack.push(PredicateTreeExpr::Unsupported);
 			}
 			Op::Not => {
 				if stack.pop().is_none() {
-					return PredicateTreeV1::Unsupported;
+					return PredicateTree::Unsupported;
 				}
 				stack.push(PredicateTreeExpr::Unsupported);
 			}
 			Op::InList(count) => {
 				let count = *count as usize;
 				if stack.len() < count + 1 {
-					return PredicateTreeV1::Unsupported;
+					return PredicateTree::Unsupported;
 				}
 				let split = stack.len() - count;
 				stack.drain(split..);
@@ -368,13 +368,13 @@ fn extract_predicate_tree(ops: &[Op]) -> PredicateTreeV1 {
 			}
 		}
 		if stack.len() > STACK_DEPTH_LIMIT {
-			return PredicateTreeV1::Unsupported;
+			return PredicateTree::Unsupported;
 		}
 	}
 	match stack.as_slice() {
 		[PredicateTreeExpr::Predicate(predicate)] => predicate.clone(),
-		[PredicateTreeExpr::AlwaysTrue] => PredicateTreeV1::AlwaysTrue,
-		_ => PredicateTreeV1::Unsupported,
+		[PredicateTreeExpr::AlwaysTrue] => PredicateTree::AlwaysTrue,
+		_ => PredicateTree::Unsupported,
 	}
 }
 
@@ -385,14 +385,14 @@ fn predicate_tree_from_comparison(
 ) -> PredicateTreeExpr {
 	let predicate = match (lhs, rhs) {
 		(PredicateTreeExpr::Column(column_index), PredicateTreeExpr::Literal(literal)) => {
-			predicate_comparison(op).map(|comparison| ColumnPredicateV1 {
+			predicate_comparison(op).map(|comparison| ColumnPredicate {
 				column_index,
 				comparison,
 				literal,
 			})
 		}
 		(PredicateTreeExpr::Literal(literal), PredicateTreeExpr::Column(column_index)) => {
-			predicate_comparison_reversed(op).map(|comparison| ColumnPredicateV1 {
+			predicate_comparison_reversed(op).map(|comparison| ColumnPredicate {
 				column_index,
 				comparison,
 				literal,
@@ -401,7 +401,7 @@ fn predicate_tree_from_comparison(
 		_ => None,
 	};
 	predicate
-		.map(PredicateTreeV1::Comparison)
+		.map(PredicateTree::Comparison)
 		.map(PredicateTreeExpr::Predicate)
 		.unwrap_or(PredicateTreeExpr::Unsupported)
 }
@@ -412,10 +412,10 @@ fn predicate_tree_from_null_check(
 ) -> PredicateTreeExpr {
 	match value {
 		PredicateTreeExpr::Column(column_index) if is_not_null => {
-			PredicateTreeExpr::Predicate(PredicateTreeV1::IsNotNull { column_index })
+			PredicateTreeExpr::Predicate(PredicateTree::IsNotNull { column_index })
 		}
 		PredicateTreeExpr::Column(column_index) => {
-			PredicateTreeExpr::Predicate(PredicateTreeV1::IsNull { column_index })
+			PredicateTreeExpr::Predicate(PredicateTree::IsNull { column_index })
 		}
 		_ => PredicateTreeExpr::Unsupported,
 	}
@@ -429,57 +429,51 @@ fn predicate_tree_from_logical(
 	let left = predicate_tree_expr_to_predicate(lhs);
 	let right = predicate_tree_expr_to_predicate(rhs);
 	let predicate = if is_or {
-		PredicateTreeV1::Or(flatten_predicate_tree_or(left, right))
+		PredicateTree::Or(flatten_predicate_tree_or(left, right))
 	} else {
-		PredicateTreeV1::And(flatten_predicate_tree_and(left, right))
+		PredicateTree::And(flatten_predicate_tree_and(left, right))
 	};
 	PredicateTreeExpr::Predicate(predicate)
 }
 
-fn predicate_tree_expr_to_predicate(expr: PredicateTreeExpr) -> PredicateTreeV1 {
+fn predicate_tree_expr_to_predicate(expr: PredicateTreeExpr) -> PredicateTree {
 	match expr {
 		PredicateTreeExpr::Predicate(predicate) => predicate,
-		PredicateTreeExpr::AlwaysTrue => PredicateTreeV1::AlwaysTrue,
-		_ => PredicateTreeV1::Unsupported,
+		PredicateTreeExpr::AlwaysTrue => PredicateTree::AlwaysTrue,
+		_ => PredicateTree::Unsupported,
 	}
 }
 
-fn flatten_predicate_tree_and(
-	left: PredicateTreeV1,
-	right: PredicateTreeV1,
-) -> Vec<PredicateTreeV1> {
+fn flatten_predicate_tree_and(left: PredicateTree, right: PredicateTree) -> Vec<PredicateTree> {
 	let mut out = Vec::new();
 	push_and_branch(&mut out, left);
 	push_and_branch(&mut out, right);
 	out
 }
 
-fn flatten_predicate_tree_or(
-	left: PredicateTreeV1,
-	right: PredicateTreeV1,
-) -> Vec<PredicateTreeV1> {
+fn flatten_predicate_tree_or(left: PredicateTree, right: PredicateTree) -> Vec<PredicateTree> {
 	let mut out = Vec::new();
 	push_or_branch(&mut out, left);
 	push_or_branch(&mut out, right);
 	out
 }
 
-fn push_and_branch(out: &mut Vec<PredicateTreeV1>, predicate: PredicateTreeV1) {
+fn push_and_branch(out: &mut Vec<PredicateTree>, predicate: PredicateTree) {
 	match predicate {
-		PredicateTreeV1::And(branches) => out.extend(branches),
-		PredicateTreeV1::AlwaysTrue => {}
+		PredicateTree::And(branches) => out.extend(branches),
+		PredicateTree::AlwaysTrue => {}
 		other => out.push(other),
 	}
 }
 
-fn push_or_branch(out: &mut Vec<PredicateTreeV1>, predicate: PredicateTreeV1) {
+fn push_or_branch(out: &mut Vec<PredicateTree>, predicate: PredicateTree) {
 	match predicate {
-		PredicateTreeV1::Or(branches) => out.extend(branches),
+		PredicateTree::Or(branches) => out.extend(branches),
 		other => out.push(other),
 	}
 }
 
-fn extract_conjunctive_column_predicates(ops: &[Op]) -> Option<Vec<ColumnPredicateV1>> {
+fn extract_conjunctive_column_predicates(ops: &[Op]) -> Option<Vec<ColumnPredicate>> {
 	if ops.is_empty() {
 		return Some(Vec::new());
 	}
@@ -487,12 +481,12 @@ fn extract_conjunctive_column_predicates(ops: &[Op]) -> Option<Vec<ColumnPredica
 	for op in ops {
 		match op {
 			Op::PushCol(column) => stack.push(PredicateExpr::Column(*column as usize)),
-			Op::PushInt(value) => stack.push(PredicateExpr::Literal(
-				ColumnPredicateLiteralV1::Int(*value),
-			)),
-			Op::PushStr(bytes) => stack.push(PredicateExpr::Literal(
-				ColumnPredicateLiteralV1::Str(bytes.clone()),
-			)),
+			Op::PushInt(value) => {
+				stack.push(PredicateExpr::Literal(ColumnPredicateLiteral::Int(*value)))
+			}
+			Op::PushStr(bytes) => stack.push(PredicateExpr::Literal(ColumnPredicateLiteral::Str(
+				bytes.clone(),
+			))),
 			Op::PushBool(value) => {
 				if *value {
 					stack.push(PredicateExpr::True);
@@ -501,10 +495,10 @@ fn extract_conjunctive_column_predicates(ops: &[Op]) -> Option<Vec<ColumnPredica
 				}
 			}
 			Op::PushFloat(value) => stack.push(PredicateExpr::Literal(
-				ColumnPredicateLiteralV1::Float(*value),
+				ColumnPredicateLiteral::Float(*value),
 			)),
 			Op::PushTs(value) => {
-				stack.push(PredicateExpr::Literal(ColumnPredicateLiteralV1::Ts(*value)))
+				stack.push(PredicateExpr::Literal(ColumnPredicateLiteral::Ts(*value)))
 			}
 			Op::Eq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
 				let rhs = stack.pop()?;
@@ -555,10 +549,10 @@ fn predicate_from_in_list(
 			_ => return None,
 		}
 	}
-	Some(PredicateExpr::Predicates(vec![ColumnPredicateV1 {
+	Some(PredicateExpr::Predicates(vec![ColumnPredicate {
 		column_index,
-		comparison: ColumnPredicateComparisonV1::InList,
-		literal: ColumnPredicateLiteralV1::List(literals),
+		comparison: ColumnPredicateComparison::InList,
+		literal: ColumnPredicateLiteral::List(literals),
 	}]))
 }
 
@@ -569,14 +563,14 @@ fn predicate_from_comparison(
 ) -> Option<PredicateExpr> {
 	match (lhs, rhs) {
 		(PredicateExpr::Column(column_index), PredicateExpr::Literal(literal)) => {
-			Some(PredicateExpr::Predicates(vec![ColumnPredicateV1 {
+			Some(PredicateExpr::Predicates(vec![ColumnPredicate {
 				column_index,
 				comparison: predicate_comparison(op)?,
 				literal,
 			}]))
 		}
 		(PredicateExpr::Literal(literal), PredicateExpr::Column(column_index)) => {
-			Some(PredicateExpr::Predicates(vec![ColumnPredicateV1 {
+			Some(PredicateExpr::Predicates(vec![ColumnPredicate {
 				column_index,
 				comparison: predicate_comparison_reversed(op)?,
 				literal,
@@ -601,24 +595,24 @@ fn predicate_and(lhs: PredicateExpr, rhs: PredicateExpr) -> Option<PredicateExpr
 	}
 }
 
-fn predicate_comparison(op: &Op) -> Option<ColumnPredicateComparisonV1> {
+fn predicate_comparison(op: &Op) -> Option<ColumnPredicateComparison> {
 	match op {
-		Op::Eq => Some(ColumnPredicateComparisonV1::Eq),
-		Op::Gt => Some(ColumnPredicateComparisonV1::Gt),
-		Op::Gte => Some(ColumnPredicateComparisonV1::Gte),
-		Op::Lt => Some(ColumnPredicateComparisonV1::Lt),
-		Op::Lte => Some(ColumnPredicateComparisonV1::Lte),
+		Op::Eq => Some(ColumnPredicateComparison::Eq),
+		Op::Gt => Some(ColumnPredicateComparison::Gt),
+		Op::Gte => Some(ColumnPredicateComparison::Gte),
+		Op::Lt => Some(ColumnPredicateComparison::Lt),
+		Op::Lte => Some(ColumnPredicateComparison::Lte),
 		_ => None,
 	}
 }
 
-fn predicate_comparison_reversed(op: &Op) -> Option<ColumnPredicateComparisonV1> {
+fn predicate_comparison_reversed(op: &Op) -> Option<ColumnPredicateComparison> {
 	match op {
-		Op::Eq => Some(ColumnPredicateComparisonV1::Eq),
-		Op::Gt => Some(ColumnPredicateComparisonV1::Lt),
-		Op::Gte => Some(ColumnPredicateComparisonV1::Lte),
-		Op::Lt => Some(ColumnPredicateComparisonV1::Gt),
-		Op::Lte => Some(ColumnPredicateComparisonV1::Gte),
+		Op::Eq => Some(ColumnPredicateComparison::Eq),
+		Op::Gt => Some(ColumnPredicateComparison::Lt),
+		Op::Gte => Some(ColumnPredicateComparison::Lte),
+		Op::Lt => Some(ColumnPredicateComparison::Gt),
+		Op::Lte => Some(ColumnPredicateComparison::Gte),
 		_ => None,
 	}
 }

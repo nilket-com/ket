@@ -1332,7 +1332,7 @@ pub struct PendingWitnessPullRequestMeta {
 	/// Node performing the recovery sweep.
 	pub requester: NodeId, //  8 bytes
 	/// Membership epoch the requester believes it is recovering
-	/// for. Carried for tracing and future tightening; v1 peers
+	/// for. Carried for tracing and future tightening; peers today
 	/// serve unresolved witnesses regardless of the epoch value.
 	pub request_epoch: u64, //  8 bytes
 }

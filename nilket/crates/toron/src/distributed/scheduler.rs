@@ -1221,8 +1221,8 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use tokio::sync::Notify;
 	use wendelon::schema::{
-		LocalityPolicy, PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, RowIdentityPolicy,
-		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+		LocalityPolicy, PhysicalDescriptorFingerprint, PrimaryKeyDescriptor, RowIdentityPolicy,
+		SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 	};
 
 	fn worker_entry(worker_id: WorkerId, active_tasks: ActiveTaskCount) -> WorkerEntry {
@@ -1308,9 +1308,9 @@ mod tests {
 			"default",
 			"scheduler_test",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor")
 		.physical_descriptor_fingerprint

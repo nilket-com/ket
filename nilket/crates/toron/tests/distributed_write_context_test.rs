@@ -23,8 +23,8 @@ use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{HlcBound, InMemoryTableStorage, StorageWrite, TenantId, WriteRequest};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 
 #[tokio::test]
@@ -310,9 +310,9 @@ fn table_descriptor(id: u64, table: &str, schema: Schema) -> (TableId, TableSche
 		"default",
 		table,
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor");
 	(table_id, descriptor)

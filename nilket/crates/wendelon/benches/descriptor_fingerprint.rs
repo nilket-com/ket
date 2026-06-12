@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use wendelon::schema::{
-	ColumnBloomSpecV1, ColumnHllSpecV1, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicy,
-	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	ColumnBloomSpec, ColumnHllSpec, ColumnSmallSetSpec, ColumnStatsPolicy, LocalityPolicy,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 };
 
 const DEFAULT_ITERS: usize = 100_000;
@@ -125,9 +125,9 @@ fn pk_descriptor(
 		"bench",
 		"descriptor_fingerprint",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?)
 }
 
@@ -149,7 +149,7 @@ fn append_only_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error:
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?)
 }
 
@@ -167,7 +167,7 @@ fn content_hash_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error
 		RowIdentityPolicy::AppendOnlyContentHash,
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?)
 }
 
@@ -183,14 +183,14 @@ fn stats_policy_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error
 		"bench",
 		"descriptor_fingerprint_stats",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?;
-	descriptor.stats_policy = ColumnStatsPolicyV1 {
-		bloom_filters: vec![ColumnBloomSpecV1::new("region")],
-		hll_distincts: vec![ColumnHllSpecV1::new("region")],
-		small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+	descriptor.stats_policy = ColumnStatsPolicy {
+		bloom_filters: vec![ColumnBloomSpec::new("region")],
+		hll_distincts: vec![ColumnHllSpec::new("region")],
+		small_sets: vec![ColumnSmallSetSpec::new("region")],
 		heavy_hitters: Vec::new(),
 		range_distributions: Vec::new(),
 		column_group_top_k: Vec::new(),

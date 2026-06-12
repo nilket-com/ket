@@ -1,10 +1,10 @@
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use wendelon::schema::{
-	LocalityPolicy, MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptorV1,
+	LocalityPolicy, MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptor,
 	RecordLayoutPolicy, RetentionRejectCode, RetentionWindowMillis, RowIdentityPolicy,
 	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1,
-	TableObjectId, TableRetentionPolicy, TableSchemaCatalogV1, TableSchemaDescriptor, TenantId,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicy,
+	TableObjectId, TableRetentionPolicy, TableSchemaCatalog, TableSchemaDescriptor, TenantId,
 };
 
 fn base_schema() -> Schema {
@@ -30,9 +30,9 @@ fn pk_descriptor(id_byte: u8, generation: u64, name: &str) -> TableSchemaDescrip
 		"analytics",
 		name,
 		&base_schema(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }
@@ -57,7 +57,7 @@ fn append_only_and_content_hash_descriptors_require_multirow_layout() {
 		&base_schema(),
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap_err();
 	assert!(
@@ -75,7 +75,7 @@ fn append_only_and_content_hash_descriptors_require_multirow_layout() {
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		multirow(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap();
 	assert!(append_multi.is_append_only());
@@ -89,7 +89,7 @@ fn append_only_and_content_hash_descriptors_require_multirow_layout() {
 		&base_schema(),
 		RowIdentityPolicy::AppendOnlyContentHash,
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap_err();
 	assert!(
@@ -108,9 +108,9 @@ fn descriptor_validation_rejects_invalid_primary_keys() {
 		"analytics",
 		"nullable_pk",
 		&nullable_pk,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap_err();
 	assert!(nullable.to_string().contains("must be non-nullable"));
@@ -122,9 +122,9 @@ fn descriptor_validation_rejects_invalid_primary_keys() {
 		"analytics",
 		"unsupported_pk",
 		&unsupported_pk,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap_err();
 	assert!(unsupported.to_string().contains("unsupported V1 type"));
@@ -135,9 +135,9 @@ fn descriptor_validation_rejects_invalid_primary_keys() {
 		"analytics",
 		"missing_pk",
 		&base_schema(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("missing")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("missing")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap_err();
 	assert!(
@@ -166,9 +166,9 @@ fn descriptor_validation_reserves_storage_synthetic_columns() {
 			"analytics",
 			"reserved_column",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap_err();
 		assert!(
@@ -186,7 +186,7 @@ fn schema_catalog_rejects_name_and_object_identity_conflicts() {
 	let conflicting_object = pk_descriptor(0x59, 1, "cataloged");
 	let conflicting_name = pk_descriptor(0x58, 3, "renamed");
 
-	let mut catalog = TableSchemaCatalogV1::default();
+	let mut catalog = TableSchemaCatalog::default();
 	catalog.upsert(tenant, first.clone()).unwrap();
 	catalog.upsert(tenant, newer_generation.clone()).unwrap();
 	assert_eq!(

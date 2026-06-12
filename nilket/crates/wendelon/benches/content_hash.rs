@@ -13,8 +13,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wendelon::schema::{
 	ClientWriteId, DurabilityLevel, HybridTimestamp, LocalityPolicy, MultiRowLayoutDescriptor,
-	NodeId, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
-	TableSchemaDescriptor, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta, TenantId,
+	NodeId, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor, TableSpreadLocalityDescriptor, TableWriteRequestMeta, TenantId,
 	WriterNodeId, encode_table_write_row_count, validate_table_write_request_batch,
 };
 use wendelon::storage::content_hash::encode_row_canonical;
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let config = BenchConfig::parse();
 	let identity_descriptor = descriptor(LocalityPolicy::IdentityProjection)?;
 	let spread_descriptor = descriptor(LocalityPolicy::TableSpreadProjection(
-		TableSpreadLocalityDescriptorV1 {
+		TableSpreadLocalityDescriptor {
 			spread_factor: 4,
 			prefix_bits: 16,
 		},
@@ -133,7 +133,7 @@ fn descriptor(
 		RowIdentityPolicy::AppendOnlyContentHash,
 		locality,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?)
 }
 

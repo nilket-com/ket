@@ -16,8 +16,8 @@ use toron::ir::{ColumnOrdinal, LogicalPlan, QueryProfileHint, SessionId, TableId
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{HlcBound, InMemoryTableStorage, StorageWrite, TenantId, WriteRequest};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 
 const STAR_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
@@ -1112,9 +1112,9 @@ fn descriptor(id: u8, name: &str, schema: SchemaRef, primary_key: &str) -> Table
 		"default",
 		name,
 		schema.as_ref(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(primary_key)),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(primary_key)),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

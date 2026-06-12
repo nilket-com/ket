@@ -22,10 +22,10 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wendelon::schema::{
 	ClientWriteId, DurabilityLevel, HybridTimestamp, IntraBatchIndex, LocalityPolicy,
-	MultiRowLayoutDescriptor, NodeId, PrimaryKeyDescriptorV1, RecordLayoutPolicy,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
-	TableWriteRequestMeta, TenantId, WriterNodeId, encode_table_write_row_count,
-	synthesize_append_only_row_id, validate_table_write_request_batch,
+	MultiRowLayoutDescriptor, NodeId, PrimaryKeyDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor, TableWriteRequestMeta, TenantId,
+	WriterNodeId, encode_table_write_row_count, synthesize_append_only_row_id,
+	validate_table_write_request_batch,
 };
 use wendelon::storage::pack_record_batch_by_bucket;
 
@@ -183,7 +183,7 @@ fn append_only_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error:
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?)
 }
 
@@ -198,10 +198,10 @@ fn pk_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> 
 		"bench",
 		"events_pk",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)?)
 }
 

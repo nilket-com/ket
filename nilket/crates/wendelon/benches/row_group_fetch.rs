@@ -27,14 +27,14 @@ use wendelon::crypto::{
 	SLAB_AEAD_TAG_BYTES, SLAB_ENCRYPTION_CHUNK_SIZES, TieredOffsetIndexEntry, TieredPlaintextRange,
 	TieredSlabObjectMetadata, test_support::seeded_dev_crypto_manager,
 };
-use wendelon::schema::pbc::{ColumnPredicateLiteralV1, OP_GT, OP_PUSH_COL, OP_PUSH_INT, Program};
+use wendelon::schema::pbc::{ColumnPredicateLiteral, OP_GT, OP_PUSH_COL, OP_PUSH_INT, Program};
 use wendelon::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, ChunkSizeBytes, DictValueCount,
 	EncodingCascadeIndex, HybridTimestamp, Identity, IdentityPrefix, IpcBufferIndex,
-	IpcColumnOrdinal, Locality, LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+	IpcColumnOrdinal, Locality, LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptor,
 	RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordLayoutPolicy,
-	RowCount, RowGroupIndex, RowGroupRowCount, RowIdentityPolicy, RunCount,
-	SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId, TableObjectId, TenantId,
+	RowCount, RowGroupIndex, RowGroupRowCount, RowIdentityPolicy, RunCount, SchemaEvolutionPolicy,
+	SimdPageValueCount, SlabId, TableObjectId, TenantId,
 };
 use wendelon::storage::encoding::cascade::{encode_buffer, encode_buffer_with_value_offsets};
 use wendelon::storage::encoding::compute::{
@@ -219,7 +219,7 @@ fn descriptor(
 		"bench",
 		"row_group_fetch",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("c0")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("c0")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(4_096, 4_096, 8 * 1024 * 1024).map_err(|err| {
@@ -229,7 +229,7 @@ fn descriptor(
 				)
 			})?,
 		),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.map_err(|err| {
 		Error::new(
@@ -1139,7 +1139,7 @@ fn sparse_projection_descriptor(
 		"bench",
 		"sparse_projection_fetch",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("c0")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("c0")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(4_096, 4_096, 8 * 1024 * 1024).map_err(|err| {
@@ -1149,7 +1149,7 @@ fn sparse_projection_descriptor(
 				)
 			})?,
 		),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.map_err(|err| {
 		Error::new(
@@ -5171,7 +5171,7 @@ fn adr066_fsst_predicate_fixture(rows: usize) -> std::io::Result<Adr066FsstPredi
 	};
 	let atom = PredicateAtom {
 		op: PredicateAtomOp::Eq,
-		literal: Some(ColumnPredicateLiteralV1::Str(target.as_bytes().to_vec())),
+		literal: Some(ColumnPredicateLiteral::Str(target.as_bytes().to_vec())),
 	};
 	Ok(Adr066FsstPredicateFixture {
 		values,
@@ -5242,7 +5242,7 @@ fn adr066_measure_fsst_predicate(
 		let mut all_selected = Vec::new();
 		for fixture in fixtures {
 			let target = match fixture.atom.literal.as_ref() {
-				Some(ColumnPredicateLiteralV1::Str(bytes)) => bytes.as_slice(),
+				Some(ColumnPredicateLiteral::Str(bytes)) => bytes.as_slice(),
 				_ => panic!("ADR 066 fixture literal is pinned to string bytes"),
 			};
 			all_selected.extend(
@@ -5425,7 +5425,7 @@ fn adr067_measure_fsst_row_safe_predicate(
 		let mut all_selected = Vec::new();
 		for fixture in fixtures {
 			let target = match fixture.atom.literal.as_ref() {
-				Some(ColumnPredicateLiteralV1::Str(bytes)) => bytes.as_slice(),
+				Some(ColumnPredicateLiteral::Str(bytes)) => bytes.as_slice(),
 				_ => panic!("ADR 067 fixture literal is pinned to string bytes"),
 			};
 			all_selected.extend(
@@ -6648,7 +6648,7 @@ fn bench_adr063_predicate_selectivity_matrix() -> std::io::Result<()> {
 			let fixture = adr063_fixture(rows, 1, distribution, selectivity, profile, true)?;
 			let atom = PredicateAtom {
 				op: PredicateAtomOp::Eq,
-				literal: Some(ColumnPredicateLiteralV1::Int(1)),
+				literal: Some(ColumnPredicateLiteral::Int(1)),
 			};
 			let analysis = adr063_analyze_predicate_pages(&fixture.directory, &atom)?;
 			adr063_print_predicate_analysis(
@@ -6666,14 +6666,14 @@ fn bench_adr063_predicate_selectivity_matrix() -> std::io::Result<()> {
 				Adr063Distribution::AllDisjoint,
 				PredicateAtom {
 					op: PredicateAtomOp::Eq,
-					literal: Some(ColumnPredicateLiteralV1::Int(1)),
+					literal: Some(ColumnPredicateLiteral::Int(1)),
 				},
 			),
 			(
 				Adr063Distribution::AllExact,
 				PredicateAtom {
 					op: PredicateAtomOp::Eq,
-					literal: Some(ColumnPredicateLiteralV1::Int(1)),
+					literal: Some(ColumnPredicateLiteral::Int(1)),
 				},
 			),
 		] {

@@ -2223,3 +2223,38 @@ pub(crate) fn adr107_schemata_is_descriptor_derived_not_a_registry() {
 	assert!(!binder.contains("CREATE SCHEMA"));
 	assert!(!binder.contains("SystemTableRegistry"));
 }
+
+#[test]
+pub(crate) fn no_new_v1_suffixed_identifiers() {
+	// conventions/no-version-suffixes.md, 2026-06 purge: cosmetic `*V1` identifier
+	// suffixes are banned repo-wide. The allowlist is the load-bearing survivors —
+	// real on-disk format versions with a live V2 beside them — not naming.
+	let manifest = manifest_dir();
+	let allowed = ["TIERED_SLABS_TABLE_V1", "RECORD_VALUE_LEN_V1", "WDV1"];
+	let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+	let mut offenders = Vec::new();
+	for root in ["src", "../wendelon/src"] {
+		for (path, line_no, line) in source_lines(&manifest.join(root)) {
+			let mut scrubbed = line.clone();
+			for token in allowed {
+				scrubbed = scrubbed.replace(token, "");
+			}
+			let bytes: Vec<char> = scrubbed.chars().collect();
+			for i in 0..bytes.len().saturating_sub(1) {
+				if bytes[i] == 'V'
+					&& bytes[i + 1] == '1'
+					&& i > 0 && is_ident(bytes[i - 1])
+					&& bytes.get(i + 2).is_none_or(|c| !is_ident(*c))
+				{
+					offenders.push((path.clone(), line_no, line.clone()));
+					break;
+				}
+			}
+		}
+	}
+	assert!(
+		offenders.is_empty(),
+		"cosmetic V1-suffixed identifiers are banned (no-version-suffixes.md):\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}

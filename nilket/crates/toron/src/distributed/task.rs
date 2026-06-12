@@ -368,8 +368,8 @@ mod tests {
 	use super::*;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterBloom,
-		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, RuntimeFilterBloom,
+		SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 	};
 
 	#[test]
@@ -450,9 +450,9 @@ mod tests {
 			"default",
 			"runtime_filter_test",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.expect("descriptor");
 		RuntimeFilterDescriptor {

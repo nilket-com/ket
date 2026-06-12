@@ -29,7 +29,7 @@ use wendelon::client::{ClusterPeerWire, ClusterStatusWire, StaticTopologySource}
 use wendelon::consensus::WendelonRequest;
 use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
-	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+	SchemaMutationKind, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
 	encode_schema_update_envelope_v1,
 };
 use wendelon::network::pool::BufPool;
@@ -38,10 +38,10 @@ use wendelon::network::transport::{
 };
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RUNTIME_FILTER_HASH_SEED,
+	LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptor, RUNTIME_FILTER_HASH_SEED,
 	RUNTIME_FILTER_KEY_ENCODING_VERSION, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 	RowIdentityPolicy, RuntimeFilterBloom, RuntimeFilterDescriptor, RuntimeFilterKeyType,
-	RuntimeFilterKind, STORAGE_ROW_KEY_ID_COLUMN, SchemaEvolutionPolicyV1, TableObjectId,
+	RuntimeFilterKind, STORAGE_ROW_KEY_ID_COLUMN, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor, TenantId as WendelonTenantId, encode_runtime_filter_key,
 	encode_table_schema_descriptor_v1, insert_runtime_filter_encoded_key,
 	pbc::{OP_GT, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT},
@@ -1197,9 +1197,9 @@ fn durable_star_descriptor(
 		"default",
 		name,
 		schema.as_ref(),
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(primary_key)),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(primary_key)),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("durable star descriptor")
 }
@@ -1767,11 +1767,11 @@ async fn install_schema(
 fn schema_update(tenant: WendelonTenantId, descriptor: &TableSchemaDescriptor) -> Vec<u8> {
 	let payload = encode_table_schema_descriptor_v1(descriptor).expect("encode descriptor");
 	let intent_byte = tenant.get() as u8;
-	let envelope = SchemaUpdateEnvelopeV1 {
+	let envelope = SchemaUpdateEnvelope {
 		contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
 		origin: SchemaIntentOrigin::ComputeClient,
 		tenant_id: tenant,
-		object: SchemaObjectRefV1 {
+		object: SchemaObjectRef {
 			kind: SchemaObjectKind::Table,
 			namespace: descriptor.namespace.clone(),
 			name: descriptor.table_name.clone(),
@@ -1779,7 +1779,7 @@ fn schema_update(tenant: WendelonTenantId, descriptor: &TableSchemaDescriptor) -
 		expected_generation: SchemaGeneration::ZERO,
 		requested_generation: SchemaGeneration::new(descriptor.schema_generation),
 		intent_id: SchemaIntentId::new([intent_byte; 16]),
-		mutation: SchemaMutationKindV1::Create,
+		mutation: SchemaMutationKind::Create,
 		payload,
 	};
 	encode_schema_update_envelope_v1(&envelope).expect("encode schema update")
@@ -1815,9 +1815,9 @@ fn descriptor() -> TableSchemaDescriptor {
 		"bench",
 		"storage_execution",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }
@@ -1828,7 +1828,7 @@ fn descriptor_from_sql_created_binding(
 ) -> TableSchemaDescriptor {
 	let row_identity = match &binding.row_identity {
 		TableRowIdentity::PrimaryKey { column, .. } => {
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(column.as_str()))
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single(column.as_str()))
 		}
 		TableRowIdentity::AppendOnly => RowIdentityPolicy::AppendOnly,
 		TableRowIdentity::Unsupported => panic!("SQL-created descriptor has unsupported identity"),
@@ -1843,7 +1843,7 @@ fn descriptor_from_sql_created_binding(
 		row_identity,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor from SQL-created binding")
 }

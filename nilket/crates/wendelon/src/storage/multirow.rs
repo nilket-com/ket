@@ -1537,10 +1537,9 @@ fn table_pack_error(message: impl Into<String>) -> TableWriteValidationError {
 mod tests {
 	use super::*;
 	use crate::schema::{
-		LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-		RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
-		SchemaEvolutionPolicyV1, TableObjectId, TableSpreadLocalityDescriptorV1, TenantId,
-		encode_table_write_row_count,
+		LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptor,
+		RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicy,
+		TableObjectId, TableSpreadLocalityDescriptor, TenantId, encode_table_write_row_count,
 	};
 	use arrow::array::{Int64Array, LargeStringArray};
 	use std::sync::Arc;
@@ -1561,12 +1560,12 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptor {
 				spread_factor: 1,
 				prefix_bits: 1,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		descriptor.record_layout_policy =
@@ -1622,12 +1621,12 @@ mod tests {
 			"analytics",
 			"strings",
 			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptor {
 				spread_factor: 1,
 				prefix_bits: 1,
 			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap();
 		descriptor.record_layout_policy = RecordLayoutPolicy::MultiRow(
@@ -1867,7 +1866,7 @@ mod tests {
 			RowIdentityPolicy::AppendOnly,
 			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+			SchemaEvolutionPolicy::AdditiveOnly,
 		)
 		.unwrap()
 	}

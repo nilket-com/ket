@@ -1,7 +1,7 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RecordBodyCompressionPolicy, RowIdentityPolicy,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 };
 
 fn descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptor {
@@ -15,9 +15,9 @@ fn descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptor {
 		"tests",
 		table_name,
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }
@@ -48,7 +48,7 @@ fn golden_vectors_are_pinned() {
 		hex(descriptor.logical_schema_fingerprint.as_bytes()),
 		"f74744e3383e722e352f6f76536f357ee33bc99b2af9ae2355228de24d1c712c"
 	);
-	// Re-pinned after ADRs 156/159/164/165 appended four `ColumnStatsPolicyV1`
+	// Re-pinned after ADRs 156/159/164/165 appended four `ColumnStatsPolicy`
 	// fields (heavy_hitters / range_distributions / column_group_top_k /
 	// column_group_ndv) without re-pinning: the stats-policy postcard encoding
 	// grew from three empty vecs to seven, shifting the physical fingerprint of

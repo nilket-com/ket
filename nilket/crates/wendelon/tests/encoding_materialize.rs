@@ -2,8 +2,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use wendelon::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, EncodingCascadeIndex, EncodingPageByteOffset,
 	IpcBufferIndex, IpcColumnOrdinal, LocalityPolicy, MultiRowLayoutDescriptor,
-	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordLayoutPolicy, RowCount,
-	RowGroupIndex, RowIdentityPolicy, SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId,
+	PrimaryKeyDescriptor, RecordBodyByteLen, RecordBodyByteOffset, RecordLayoutPolicy, RowCount,
+	RowGroupIndex, RowIdentityPolicy, SchemaEvolutionPolicy, SimdPageValueCount, SlabId,
 	TableObjectId,
 };
 use wendelon::storage::encoding::cascade::encode_buffer;
@@ -20,10 +20,10 @@ fn logical_fingerprint() -> wendelon::schema::LogicalSchemaFingerprint {
 		"test",
 		"encoding_materialize",
 		&schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 	.logical_schema_fingerprint

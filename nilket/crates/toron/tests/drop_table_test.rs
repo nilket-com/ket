@@ -25,7 +25,7 @@ use toron::storage::{
 use wendelon::integration::compute::{DropOperationId, SchemaGeneration};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
 };
 
 #[test]
@@ -622,7 +622,7 @@ fn wendelon_create_row_identity_policy_is_request_driven_after_adr062() {
 	assert!(source.contains("CreateTableRowIdentity::AppendOnly"));
 	assert!(source.contains("CreateTableRowIdentity::PrimaryKey"));
 	assert!(source.contains("RowIdentityPolicy::AppendOnly"));
-	assert!(source.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single"));
+	assert!(source.contains("RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single"));
 	assert!(!source.contains("RowIdentityPolicy::ByOrdinal"));
 }
 
@@ -921,7 +921,7 @@ fn mock_descriptor(
 		RowIdentityPolicy::AppendOnly,
 		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }

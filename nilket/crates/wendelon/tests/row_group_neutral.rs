@@ -5,8 +5,8 @@ use std::sync::Arc;
 use wendelon::schema::pbc::{OP_GT, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT, Program};
 use wendelon::schema::{
 	HybridTimestamp, Identity, Locality, LocalityPolicy, MultiRowLayoutDescriptor,
-	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyCompressionPolicy, RecordLayoutPolicy,
-	RowCount, RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
+	PrimaryKeyDescriptor, RecordBodyByteLen, RecordBodyCompressionPolicy, RecordLayoutPolicy,
+	RowCount, RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
@@ -20,10 +20,10 @@ fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
 		"test",
 		"row_group_neutral",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
 		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.unwrap()
 }

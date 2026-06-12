@@ -31,8 +31,8 @@ use toron::server::{
 };
 use toron::storage::InMemoryStorageScan;
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor,
 };
 
 const DEFAULT_WORKERS: &[usize] = &[2, 4, 8];
@@ -394,9 +394,9 @@ fn test_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 		"default",
 		"distributed_runtime",
 		schema,
-		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("val")),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("val")),
 		LocalityPolicy::default_table_spread(),
-		SchemaEvolutionPolicyV1::AdditiveOnly,
+		SchemaEvolutionPolicy::AdditiveOnly,
 	)
 	.expect("descriptor")
 }
