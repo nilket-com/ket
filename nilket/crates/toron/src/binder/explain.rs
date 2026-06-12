@@ -1562,7 +1562,7 @@ pub(super) fn optimizer_explain_outer_join_demotion_row(
 		let path = receipt
 			.propagation_path
 			.iter()
-			.map(|step| step.as_str())
+			.map(JoinSideStep::label)
 			.collect::<Vec<_>>()
 			.join(".");
 		detail.push_str(";propagated_path:");

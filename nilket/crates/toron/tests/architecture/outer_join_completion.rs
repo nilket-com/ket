@@ -31,6 +31,10 @@ fn source(relative: &str) -> String {
 		.unwrap_or_else(|err| panic!("read {relative}: {err}"))
 }
 
+fn outer_join_route_source(demotion: &str) -> String {
+	source_block(demotion, "fn route_filter_routed_conjuncts")
+}
+
 #[test]
 pub(crate) fn adr209_null_rejection_classifier_is_default_deny_allowlist() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
@@ -43,6 +47,8 @@ pub(crate) fn adr209_null_rejection_classifier_is_default_deny_allowlist() {
 		"Expr::Like {\n\t\t\texpr,\n\t\t\tnegated: false",
 		"Expr::InList {\n\t\t\texpr,\n\t\t\tlist,\n\t\t\tnegated: false",
 		"list.iter().all(non_null_literal)",
+		"Expr::Or(left, right)",
+		".intersect(null_rejecting_sides(right, left_scope, right_scope))",
 	] {
 		assert!(
 			classifier.contains(allowed),
@@ -50,7 +56,6 @@ pub(crate) fn adr209_null_rejection_classifier_is_default_deny_allowlist() {
 		);
 	}
 	for denied in [
-		"Expr::Or(_, _)",
 		"Expr::Not(_)",
 		"Expr::Cast(_, _)",
 		"Expr::TryCast(_, _)",
@@ -69,6 +74,9 @@ pub(crate) fn adr209_null_rejection_classifier_is_default_deny_allowlist() {
 		"is_null_on_null_supplied_side_does_not_demote",
 		"positive_in_demotes_negated_in_does_not",
 		"positive_like_demotes_negated_like_does_not",
+		"or_both_branches_null_rejecting_demotes_left_join",
+		"or_one_branch_is_null_does_not_demote",
+		"or_branches_reject_different_sides_do_not_demote",
 	] {
 		assert!(
 			tests.contains(gate),
@@ -133,16 +141,24 @@ pub(crate) fn adr209_demoted_predicates_push_to_owning_side_only() {
 		.nth(1)
 		.and_then(|rest| rest.split("LogicalPlan::Alias").next())
 		.expect("outer demotion filter arm");
-	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let route = outer_join_route_source(&demotion);
 
 	assert!(filter_arm.contains("split_logical_and_conjuncts(predicate)"));
 	assert!(filter_arm.contains("route_filter_conjuncts(input, conjuncts, Vec::new())"));
 	assert!(filter_arm.contains("wrap_residual_filter(routed.input, routed.residual)"));
-	assert!(route.contains("conjunct_sides.push(sides)"));
+	assert!(route.contains("proof_sides.push(sides)"));
+	assert!(route.contains("ownership_sides.push(conjunct_column_sides("));
 	assert!(route.contains("demotion_owned_sides(kind, to_kind, rejected)"));
-	assert!(route.contains("demotion_sides.left && sides.left && !sides.right"));
-	assert!(route.contains("demotion_sides.right && sides.right && !sides.left"));
-	assert!(route.contains("residual.push(conjunct)"));
+	assert!(route.contains("demotion_sides.left"));
+	assert!(route.contains("proof.left"));
+	assert!(route.contains("ownership.left"));
+	assert!(route.contains("!ownership.right"));
+	assert!(route.contains("!ownership.ambiguous"));
+	assert!(route.contains("demotion_sides.right"));
+	assert!(route.contains("proof.right"));
+	assert!(route.contains("ownership.right"));
+	assert!(route.contains("!ownership.left"));
+	assert!(route.contains("residual.push(conjunct.original)"));
 	assert!(route.contains("push_logical_filter_conjuncts(*left, left_push)"));
 	assert!(route.contains("push_logical_filter_conjuncts(*right, right_push)"));
 	assert!(binder_source().contains(
@@ -319,16 +335,16 @@ pub(crate) fn adr209_demoted_join_reaches_durable_verdict_lane() {
 #[test]
 pub(crate) fn adr210_descent_reuses_209_classifier_and_demotion_table() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
-	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let route = outer_join_route_source(&demotion);
 	let tests = binder_source();
 
 	assert_eq!(demotion.matches("fn null_rejecting_sides").count(), 1);
 	assert_eq!(demotion.matches("fn demoted_join_kind").count(), 1);
 	assert_eq!(demotion.matches("fn demotion_owned_sides").count(), 1);
-	assert!(route.contains("null_rejecting_sides(conjunct, &left_scope, &right_scope)"));
+	assert!(route.contains("null_rejecting_sides(&conjunct.routed, &left_scope, &right_scope)"));
 	assert!(route.contains("demoted_join_kind(kind, rejected)"));
 	assert!(route.contains("demotion_owned_sides(kind, to_kind, rejected)"));
-	assert!(route.contains("conjunct_column_sides(&conjunct, &left_scope, &right_scope)"));
+	assert!(route.contains("conjunct_column_sides(&conjunct.routed, &left_scope, &right_scope)"));
 	assert!(!demotion.contains("path_null_reject"));
 	assert!(!demotion.contains("propagated_null_reject"));
 	assert!(tests.contains("is_null_and_negated_in_remain_non_demoting_inside_mixed_chain"));
@@ -343,7 +359,7 @@ pub(crate) fn adr210_filter_router_subsumes_depth_zero_demotion() {
 		.nth(1)
 		.and_then(|rest| rest.split("LogicalPlan::Alias").next())
 		.expect("outer demotion filter arm");
-	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let route = outer_join_route_source(&demotion);
 	let tests = binder_source();
 
 	assert!(filter_arm.contains("split_logical_and_conjuncts(predicate)"));
@@ -362,7 +378,7 @@ pub(crate) fn adr210_filter_router_subsumes_depth_zero_demotion() {
 #[test]
 pub(crate) fn adr210_motion_set_is_inner_exchange_and_pure_sort_only() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
-	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let route = outer_join_route_source(&demotion);
 	let ownership = source_block(&demotion, "fn conjunct_column_sides");
 	let tests = binder_source();
 
@@ -373,8 +389,10 @@ pub(crate) fn adr210_motion_set_is_inner_exchange_and_pure_sort_only() {
 	assert!(route.contains("LogicalPlan::Sort"));
 	assert!(route.contains("limit: None"));
 	assert!(route.contains("offset: 0"));
-	assert!(route.contains("LogicalPlan::Alias { .. }"));
-	assert!(route.contains("LogicalPlan::Project { .. }"));
+	assert!(route.contains("LogicalPlan::Alias {"));
+	assert!(route.contains("remap_expr_through_alias"));
+	assert!(route.contains("LogicalPlan::Project {"));
+	assert!(route.contains("project_passthrough_map"));
 	assert!(route.contains("LogicalPlan::Aggregate { .. }"));
 	assert!(ownership.contains("Expr::Column(column_ref)"));
 	assert!(ownership.contains("column_side(column_ref, left_scope, right_scope)"));
@@ -385,14 +403,14 @@ pub(crate) fn adr210_motion_set_is_inner_exchange_and_pure_sort_only() {
 #[test]
 pub(crate) fn adr210_topn_sort_and_take_are_motion_boundaries() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
-	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let route = outer_join_route_source(&demotion);
 	let tests = binder_source();
 
 	assert!(route.contains("limit: None"));
 	assert!(route.contains("offset: 0"));
 	assert!(route.contains("LogicalPlan::Sort { .. }"));
 	assert!(route.contains("LogicalPlan::Take { .. }"));
-	assert!(route.contains("residual: conjuncts"));
+	assert!(route.contains("residual: routed_originals(conjuncts)"));
 	assert!(tests.contains("filter_does_not_move_below_take_limit"));
 	assert!(tests.contains("filter_does_not_move_below_sort_limit_or_offset"));
 }
@@ -400,13 +418,13 @@ pub(crate) fn adr210_topn_sort_and_take_are_motion_boundaries() {
 #[test]
 pub(crate) fn adr210_conjuncts_move_only_on_demotion_success() {
 	let demotion = source("src/binder/outer_join_demotion.rs");
-	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let route = outer_join_route_source(&demotion);
 	let tests = binder_source();
 	let wendelon = source("tests/wendelon_storage_execution_test.rs");
 
 	assert!(route.contains("let Some(to_kind) = demoted_join_kind(kind, rejected) else"));
-	assert!(route.contains("residual: conjuncts"));
-	assert!(route.contains("residual.push(conjunct)"));
+	assert!(route.contains("residual: routed_originals(conjuncts)"));
+	assert!(route.contains("residual.push(conjunct.original)"));
 	assert!(route.contains("residual.extend(left.residual)"));
 	assert!(route.contains("residual.extend(right.residual)"));
 	assert!(route.contains("push_logical_filter_conjuncts(*left, left_push)"));
@@ -433,7 +451,7 @@ pub(crate) fn adr210_propagation_extends_existing_outer_join_demotion_receipt() 
 	assert!(receipt.contains("conjunct_text: String"));
 	assert!(receipt.contains("propagation_path: Vec<JoinSideStep>"));
 	assert!(demotion.contains("pub(super) enum JoinSideStep"));
-	assert!(demotion.contains("fn as_str"));
+	assert!(demotion.contains("fn label"));
 	assert!(row.contains("\"outer_join_demotion\""));
 	assert!(row.contains("\"prebind\""));
 	assert!(row.contains("propagated_path:"));
@@ -643,6 +661,220 @@ pub(crate) fn adr211_no_fragmenter_executor_wire_runtime_filter_or_recognizer_wi
 	assert!(
 		offenders.is_empty(),
 		"ADR211 broadcast authoring leaked into execution/wire/recognizer/Wendelon source:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr212_or_null_rejection_uses_intersection() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let classifier = source_block(&demotion, "fn null_rejecting_sides");
+	let sides = source_block(&demotion, "impl NullRejectedSides");
+	let tests = binder_source();
+
+	assert!(sides.contains("fn intersect"));
+	assert!(sides.contains("left: self.left && other.left"));
+	assert!(sides.contains("right: self.right && other.right"));
+	assert!(classifier.contains("Expr::Or(left, right)"));
+	assert!(classifier.contains(
+		"null_rejecting_sides(left, left_scope, right_scope)\n\t\t\t.intersect(null_rejecting_sides(right, left_scope, right_scope))"
+	));
+	assert!(!classifier.contains("Expr::Or(_, _)"));
+	for gate in [
+		"or_both_branches_null_rejecting_demotes_left_join",
+		"or_one_branch_is_null_does_not_demote",
+		"or_branches_reject_different_sides_do_not_demote",
+	] {
+		assert!(tests.contains(gate), "missing ADR212 OR gate {gate}");
+	}
+}
+
+#[test]
+pub(crate) fn adr212_demoting_cross_side_or_keeps_conjunct_residual() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = outer_join_route_source(&demotion);
+	let tests = binder_source();
+
+	assert!(route.contains("let mut proof_sides = Vec::with_capacity(conjuncts.len())"));
+	assert!(route.contains("let mut ownership_sides = Vec::with_capacity(conjuncts.len())"));
+	assert!(route.contains("proof_sides.push(sides)"));
+	assert!(route.contains("ownership_sides.push(conjunct_column_sides("));
+	assert!(route.contains("proof.intersect(demotion_sides)"));
+	assert!(route.contains("left_push.push(conjunct.routed)"));
+	assert!(route.contains("right_push.push(conjunct.routed)"));
+	assert!(route.contains("residual.push(conjunct.original)"));
+	assert!(tests.contains("or_cross_side_conjunct_demotes_without_moving"));
+}
+
+#[test]
+pub(crate) fn adr212_alias_descent_requires_identity_remap_unique_resolution() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = outer_join_route_source(&demotion);
+	let alias = source_block(&demotion, "fn remap_expr_through_alias");
+	let ordinal = source_block(&demotion, "fn alias_output_ordinal");
+	let tests = binder_source();
+
+	assert!(route.contains("LogicalPlan::Alias {"));
+	assert!(route.contains("alias_schema_for_outer_demotion(&input_scope.schema, &columns)?"));
+	assert!(route.contains("RelationScope::alias(alias.clone(), &alias_schema)"));
+	assert!(route.contains("remap_expr_through_alias("));
+	assert!(route.contains("JoinSideStep::Alias(alias.clone())"));
+	assert!(alias.contains("resolve_join_column(&remapped, \"alias input\")"));
+	assert!(ordinal.contains("unique_schema_ordinal("));
+	assert!(ordinal.contains("&alias_scope.schema"));
+	assert!(ordinal.contains("qualifier != alias"));
+	for gate in [
+		"alias_wrapped_left_join_filter_reaches_demotion",
+		"alias_empty_columns_qualifier_only_remap_reaches_demotion",
+		"alias_remap_ambiguous_resolution_stops",
+	] {
+		assert!(tests.contains(gate), "missing ADR212 alias gate {gate}");
+	}
+}
+
+#[test]
+pub(crate) fn adr212_project_descent_requires_direct_column_passthrough() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = outer_join_route_source(&demotion);
+	let map = source_block(&demotion, "fn project_passthrough_map");
+	let remap = source_block(&demotion, "fn remap_expr_through_project");
+	let tests = binder_source();
+
+	assert!(route.contains("LogicalPlan::Project {"));
+	assert!(route.contains("project_passthrough_map(&exprs, &output_names, &input_scope)?"));
+	assert!(route.contains("remap_expr_through_project("));
+	assert!(route.contains("JoinSideStep::Project"));
+	assert!(map.contains("Some(Expr::Column(column_ref))"));
+	assert!(map.contains("output_name.clone()"));
+	assert!(map.contains("map.insert(output_name.clone(), None)"));
+	assert!(remap.contains("if column_ref.qualifier.is_some()"));
+	assert!(remap.contains("let Some(Some(remapped)) = map.get(&column_ref.name.0)"));
+	for gate in [
+		"project_passthrough_filter_reaches_demotion",
+		"computed_project_column_stops_motion",
+		"duplicate_or_missing_project_output_name_stops_motion",
+	] {
+		assert!(tests.contains(gate), "missing ADR212 project gate {gate}");
+	}
+}
+
+#[test]
+pub(crate) fn adr212_residuals_preserve_original_form() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = outer_join_route_source(&demotion);
+	let routed = source_block(&demotion, "struct RoutedExpr");
+	let originals = source_block(&demotion, "fn routed_originals");
+	let tests = binder_source();
+
+	assert!(routed.contains("original: Expr"));
+	assert!(routed.contains("routed: Expr"));
+	assert!(route.contains("original: conjunct.original"));
+	assert!(route.contains("routed,"));
+	assert!(route.contains("residual.push(conjunct.original)"));
+	assert!(originals.contains("map(|conjunct| conjunct.original)"));
+	assert!(tests.contains("alias_project_residuals_preserve_original_filter_shape"));
+	assert!(tests.contains("remapped_conjunct_results_match_unwrapped_query"));
+}
+
+#[test]
+pub(crate) fn adr212_receipt_path_names_wrapper_steps() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let path = source_block(&demotion, "pub(super) enum JoinSideStep");
+	let label = source_block(&demotion, "impl JoinSideStep");
+	let explain = source("src/binder/explain.rs");
+	let row = source_block(
+		&explain,
+		"pub(super) fn optimizer_explain_outer_join_demotion_row",
+	);
+	let tests = binder_source();
+
+	assert!(path.contains("Alias(TableRef)"));
+	assert!(path.contains("Project"));
+	assert!(label.contains("format!(\"alias({})\", relation_key_label(alias))"));
+	assert!(label.contains("\"project\".to_string()"));
+	assert!(row.contains(".map(JoinSideStep::label)"));
+	assert!(tests.contains("propagation_receipt_reports_alias_and_project_steps"));
+}
+
+#[test]
+pub(crate) fn adr212_motion_fences_remain_closed() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = outer_join_route_source(&demotion);
+	let tests = binder_source();
+
+	assert!(route.contains("limit: None"));
+	assert!(route.contains("offset: 0"));
+	assert!(route.contains("LogicalPlan::Sort { .. }"));
+	assert!(route.contains("LogicalPlan::Take { .. }"));
+	assert!(route.contains("LogicalPlan::Aggregate { .. }"));
+	assert!(route.contains("residual: routed_originals(conjuncts)"));
+	assert!(tests.contains("filter_does_not_move_below_take_limit"));
+	assert!(tests.contains("filter_does_not_move_below_sort_limit_or_offset"));
+	assert!(tests.contains("computed_project_column_stops_motion"));
+}
+
+#[test]
+pub(crate) fn adr212_rune_and_sql_share_outer_join_demotion_entry() {
+	let binder_root = binder_root_source();
+	let planner = planner_source();
+	let rune = rune_source();
+	let tests = binder_source();
+
+	assert!(binder_root.contains("mod outer_join_demotion;"));
+	assert!(binder_root.contains("demote_null_rejected_outer_joins(plan)"));
+	assert!(!planner.contains("demote_null_rejected_outer_joins"));
+	assert!(!rune.contains("demote_null_rejected_outer_joins"));
+	assert!(tests.contains("rune_or_filter_and_alias_descent_match_sql"));
+}
+
+#[test]
+pub(crate) fn adr212_no_executor_fragmenter_wire_runtime_filter_strategy_or_wendelon_change() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"remap_expr_through_alias",
+		"remap_expr_through_project",
+		"project_passthrough_map",
+		"JoinSideStep::Alias",
+		"JoinSideStep::Project",
+		"or_cross_side_conjunct_demotes_without_moving",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/ir/execution.rs"),
+		manifest_dir.join("src/distributed"),
+		manifest_dir.join("src/server"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("src/binder/join_order.rs"),
+		manifest_dir.join("src/binder/selectivity.rs"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+
+	assert!(
+		offenders.is_empty(),
+		"ADR212 demotion reach leaked outside binder/explain surfaces:\n{}",
 		format_offenders(&manifest_dir, &offenders)
 	);
 }

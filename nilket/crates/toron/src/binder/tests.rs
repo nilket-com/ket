@@ -1591,6 +1591,492 @@ async fn multi_conjuncts_can_demote_two_edges_in_one_pass() {
 }
 
 #[tokio::test]
+async fn or_both_branches_null_rejecting_demotes_left_join() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(orders_customers_left_join()),
+		predicate: Expr::Or(
+			Box::new(customers_region_is_north()),
+			Box::new(Expr::Eq(
+				Box::new(qcol("customers", "region")),
+				Box::new(utf8_literal("south")),
+			)),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(receipts[0].from_kind, JoinKind::LeftOuter);
+	assert_eq!(receipts[0].to_kind, JoinKind::Inner);
+	assert_eq!(logical_join_kinds(&normalized), vec![JoinKind::Inner]);
+}
+
+#[tokio::test]
+async fn or_one_branch_is_null_does_not_demote() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(orders_customers_left_join()),
+		predicate: Expr::Or(
+			Box::new(customers_region_is_north()),
+			Box::new(Expr::IsNull(Box::new(qcol("customers", "region")))),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert!(receipts.is_empty());
+	assert!(
+		logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+		"IS NULL branch should keep the left join outer: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn or_branches_reject_different_sides_do_not_demote() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(orders_customers_left_join()),
+		predicate: Expr::Or(
+			Box::new(Expr::Eq(
+				Box::new(qcol("orders", "id")),
+				Box::new(int64_literal(1)),
+			)),
+			Box::new(customers_region_is_north()),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert!(receipts.is_empty());
+	assert!(
+		logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+		"different-side OR branches should not demote: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn or_cross_side_conjunct_demotes_without_moving() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(orders_customers_left_join()),
+		predicate: Expr::Or(
+			Box::new(customers_region_is_north()),
+			Box::new(Expr::And(
+				Box::new(Expr::Eq(
+					Box::new(qcol("customers", "region")),
+					Box::new(utf8_literal("south")),
+				)),
+				Box::new(Expr::Eq(
+					Box::new(qcol("orders", "id")),
+					Box::new(int64_literal(10)),
+				)),
+			)),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(receipts[0].from_kind, JoinKind::LeftOuter);
+	assert_eq!(receipts[0].to_kind, JoinKind::Inner);
+	let LogicalPlan::Filter { predicate, input } = normalized else {
+		panic!("cross-side OR should stay as a residual root filter");
+	};
+	let predicate_text = format!("{predicate:?}");
+	assert!(predicate_text.contains("orders"), "{predicate_text}");
+	assert!(predicate_text.contains("customers"), "{predicate_text}");
+	assert_eq!(logical_join_kinds(&input), vec![JoinKind::Inner]);
+}
+
+#[tokio::test]
+async fn alias_wrapped_left_join_filter_reaches_demotion() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Alias {
+			input: Box::new(orders_customers_left_join()),
+			alias: TableRef::new("oc"),
+			columns: vec![
+				"order_id".to_string(),
+				"order_customer_id".to_string(),
+				"order_product_id".to_string(),
+				"order_store_id".to_string(),
+				"customer_id".to_string(),
+				"customer_region".to_string(),
+			],
+		}),
+		predicate: Expr::Eq(
+			Box::new(qcol("oc", "customer_region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(
+		receipts[0].propagation_path,
+		vec![JoinSideStep::Alias(TableRef::new("oc"))]
+	);
+	assert_eq!(logical_join_kinds(&normalized), vec![JoinKind::Inner]);
+}
+
+#[tokio::test]
+async fn alias_empty_columns_qualifier_only_remap_reaches_demotion() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Alias {
+			input: Box::new(orders_customers_left_join()),
+			alias: TableRef::new("oc"),
+			columns: Vec::new(),
+		}),
+		predicate: Expr::Eq(
+			Box::new(qcol("oc", "region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(
+		receipts[0].propagation_path,
+		vec![JoinSideStep::Alias(TableRef::new("oc"))]
+	);
+	assert_eq!(logical_join_kinds(&normalized), vec![JoinKind::Inner]);
+}
+
+#[tokio::test]
+async fn alias_remap_ambiguous_resolution_stops() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Alias {
+			input: Box::new(orders_customers_left_join()),
+			alias: TableRef::new("oc"),
+			columns: Vec::new(),
+		}),
+		predicate: Expr::Eq(Box::new(qcol("oc", "id")), Box::new(int64_literal(1))),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert!(receipts.is_empty());
+	assert!(
+		logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+		"ambiguous alias output should stop motion: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn project_passthrough_filter_reaches_demotion() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(orders_customers_left_join()),
+			exprs: vec![qcol("orders", "id"), qcol("customers", "region")],
+			output_names: vec![
+				Some("order_id".to_string()),
+				Some("customer_region".to_string()),
+			],
+		}),
+		predicate: Expr::Eq(
+			Box::new(Expr::column("customer_region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(receipts[0].propagation_path, vec![JoinSideStep::Project]);
+	assert_eq!(logical_join_kinds(&normalized), vec![JoinKind::Inner]);
+}
+
+#[tokio::test]
+async fn computed_project_column_stops_motion() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(orders_customers_left_join()),
+			exprs: vec![Expr::Add(
+				Box::new(qcol("customers", "id")),
+				Box::new(int64_literal(1)),
+			)],
+			output_names: vec![Some("customer_id_plus".to_string())],
+		}),
+		predicate: Expr::Gt(
+			Box::new(Expr::column("customer_id_plus")),
+			Box::new(int64_literal(1)),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert!(receipts.is_empty());
+	assert!(matches!(normalized, LogicalPlan::Filter { .. }));
+	assert!(
+		logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+		"computed projection should stop motion: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn duplicate_or_missing_project_output_name_stops_motion() {
+	let catalog = mixed_outer_join_catalog();
+	let duplicate = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(orders_customers_left_join()),
+			exprs: vec![qcol("orders", "id"), qcol("customers", "region")],
+			output_names: vec![
+				Some("customer_region".to_string()),
+				Some("customer_region".to_string()),
+			],
+		}),
+		predicate: Expr::Eq(
+			Box::new(Expr::column("customer_region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+	let missing = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(orders_customers_left_join()),
+			exprs: vec![qcol("customers", "region")],
+			output_names: vec![None],
+		}),
+		predicate: Expr::Eq(
+			Box::new(Expr::column("region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+
+	for (name, logical) in [("duplicate", duplicate), ("missing", missing)] {
+		let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+		assert!(receipts.is_empty(), "{name}");
+		assert!(
+			logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+			"{name} project output should stop motion: {normalized:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn alias_project_residuals_preserve_original_filter_shape() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Alias {
+			input: Box::new(LogicalPlan::Take {
+				input: Box::new(orders_customers_left_join()),
+				limit: 1,
+			}),
+			alias: TableRef::new("oc"),
+			columns: vec![
+				"order_id".to_string(),
+				"order_customer_id".to_string(),
+				"order_product_id".to_string(),
+				"order_store_id".to_string(),
+				"customer_id".to_string(),
+				"customer_region".to_string(),
+			],
+		}),
+		predicate: Expr::Eq(
+			Box::new(qcol("oc", "customer_region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert!(receipts.is_empty());
+	let LogicalPlan::Filter { predicate, .. } = normalized else {
+		panic!("stopped wrapper descent should preserve the root filter");
+	};
+	let predicate_text = format!("{predicate:?}");
+	assert!(predicate_text.contains("oc"), "{predicate_text}");
+	assert!(
+		predicate_text.contains("customer_region"),
+		"{predicate_text}"
+	);
+
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(LogicalPlan::Take {
+				input: Box::new(orders_customers_left_join()),
+				limit: 1,
+			}),
+			exprs: vec![qcol("orders", "id"), qcol("customers", "region")],
+			output_names: vec![
+				Some("order_id".to_string()),
+				Some("customer_region".to_string()),
+			],
+		}),
+		predicate: Expr::Eq(
+			Box::new(Expr::column("customer_region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert!(receipts.is_empty());
+	let LogicalPlan::Filter { predicate, .. } = normalized else {
+		panic!("stopped project descent should preserve the root filter");
+	};
+	let predicate_text = format!("{predicate:?}");
+	assert!(
+		predicate_text.contains("customer_region"),
+		"{predicate_text}"
+	);
+}
+
+#[tokio::test]
+async fn remapped_conjunct_results_match_unwrapped_query() {
+	let catalog = mixed_outer_join_catalog();
+	let unwrapped = LogicalPlan::Filter {
+		input: Box::new(orders_customers_left_join()),
+		predicate: customers_region_is_north(),
+	};
+	let alias_wrapped = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Alias {
+			input: Box::new(orders_customers_left_join()),
+			alias: TableRef::new("oc"),
+			columns: Vec::new(),
+		}),
+		predicate: Expr::Eq(
+			Box::new(qcol("oc", "region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+	let project_wrapped = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(orders_customers_left_join()),
+			exprs: vec![qcol("orders", "id"), qcol("customers", "region")],
+			output_names: vec![
+				Some("order_id".to_string()),
+				Some("customer_region".to_string()),
+			],
+		}),
+		predicate: Expr::Eq(
+			Box::new(Expr::column("customer_region")),
+			Box::new(utf8_literal("north")),
+		),
+	};
+
+	let (unwrapped, unwrapped_receipts) = demote_outer_join_plan(&unwrapped, &catalog).await;
+	let (alias_wrapped, alias_receipts) = demote_outer_join_plan(&alias_wrapped, &catalog).await;
+	let (project_wrapped, project_receipts) =
+		demote_outer_join_plan(&project_wrapped, &catalog).await;
+
+	for (name, normalized, receipts) in [
+		("unwrapped", unwrapped, unwrapped_receipts),
+		("alias", alias_wrapped, alias_receipts),
+		("project", project_wrapped, project_receipts),
+	] {
+		assert_eq!(receipts.len(), 1, "{name} should demote once");
+		assert_eq!(receipts[0].to_kind, JoinKind::Inner, "{name}");
+		assert_eq!(
+			logical_join_kinds(&normalized),
+			vec![JoinKind::Inner],
+			"{name}: {normalized:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn rune_or_filter_and_alias_descent_match_sql() {
+	let catalog = mixed_outer_join_catalog();
+	let sql_or = LogicalPlan::Filter {
+		input: Box::new(orders_customers_left_join()),
+		predicate: Expr::Or(
+			Box::new(customers_region_is_north()),
+			Box::new(Expr::Eq(
+				Box::new(qcol("customers", "region")),
+				Box::new(utf8_literal("south")),
+			)),
+		),
+	};
+	let rune_or = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders")
+                .left_join(
+                    ctx.table("customers"),
+                    qcol("orders", "customer_id").eq(qcol("customers", "id"))
+                )
+                .filter(
+                    qcol("customers", "region").eq(lit_str("north"))
+                        .or(qcol("customers", "region").eq(lit_str("south")))
+                )
+        }
+    "#,
+	)
+	.await;
+	let rune_alias = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders")
+                .left_join(
+                    ctx.table("customers"),
+                    qcol("orders", "customer_id").eq(qcol("customers", "id"))
+                )
+                .alias("oc")
+                .filter(qcol("oc", "region").eq(lit_str("north")))
+        }
+    "#,
+	)
+	.await;
+
+	for (name, logical) in [
+		("sql_or", sql_or),
+		("rune_or", rune_or),
+		("rune_alias", rune_alias),
+	] {
+		let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+		assert_eq!(receipts.len(), 1, "{name} should demote once");
+		assert_eq!(receipts[0].to_kind, JoinKind::Inner, "{name}");
+		assert_eq!(
+			logical_join_kinds(&normalized),
+			vec![JoinKind::Inner],
+			"{name}: {normalized:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn propagation_receipt_reports_alias_and_project_steps() {
+	let logical = LogicalPlan::Explain {
+		input: Box::new(LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::Project {
+				input: Box::new(orders_customers_left_join()),
+				exprs: vec![qcol("orders", "id"), qcol("customers", "region")],
+				output_names: vec![
+					Some("order_id".to_string()),
+					Some("customer_region".to_string()),
+				],
+			}),
+			predicate: Expr::Eq(
+				Box::new(Expr::column("customer_region")),
+				Box::new(utf8_literal("north")),
+			),
+		}),
+	};
+
+	let (_schema, rows) = bind_explain_rows(
+		&logical,
+		&mixed_outer_join_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await;
+	let row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("outer_join_demotion".to_string())))
+		.expect("outer join demotion receipt row");
+
+	assert_utf8_contains(&row[3], "propagated_path:project");
+	assert_utf8_contains(&row[4], "customer_region");
+}
+
+#[tokio::test]
 async fn left_outer_right_build_auto_broadcast_executes_as_physical_right_outer() {
 	let mut catalog = join_catalog();
 	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
