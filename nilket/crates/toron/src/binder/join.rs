@@ -13,12 +13,6 @@ pub(crate) enum JoinPhysicalPlacement {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BroadcastBuildSide {
-	Left,
-	Right,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BroadcastPlacementRule {
 	SmallerBuild,
 	NaturalLeftBuild,
@@ -419,6 +413,7 @@ pub(super) fn broadcast_replay_eligibility(
 		| JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::SqlHint,
+			..
 		} => BroadcastReplayEligibility::Replayable,
 		JoinStrategyIntent::Pinned { .. } => BroadcastReplayEligibility::Terminal,
 	}
@@ -431,24 +426,95 @@ pub(super) fn choose_join_strategy(
 	left_input: JoinInputOptimization,
 	right_input: JoinInputOptimization,
 	config: &PlannerConfig,
-) -> JoinStrategyDecision {
+) -> Result<JoinStrategyDecision, BindingError> {
 	let force_hash = config.force_hash_join_ids.contains(&replay_id);
 	match intent {
-		JoinStrategyIntent::Auto if force_hash => {
-			hash_join_decision(HashByDefaultReason::HashAfterBroadcastCap)
-		}
+		JoinStrategyIntent::Auto if force_hash => Ok(hash_join_decision(
+			HashByDefaultReason::HashAfterBroadcastCap,
+		)),
 		JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
-			source: JoinStrategyPinSource::SqlHint,
-		} if force_hash => hash_join_decision(HashByDefaultReason::HashAfterBroadcastCap),
-		JoinStrategyIntent::Pinned { strategy, .. } => JoinStrategyDecision {
+			source,
+			build_side,
+		} => {
+			let build_side = build_side.ok_or_else(|| BindingError::UnsupportedExpression {
+				message: "pinned broadcast join requires an explicit build side".to_string(),
+			})?;
+			let placement = pinned_broadcast_placement(kind, build_side)?;
+			if force_hash && source == JoinStrategyPinSource::SqlHint {
+				return Ok(hash_join_decision(
+					HashByDefaultReason::HashAfterBroadcastCap,
+				));
+			}
+			Ok(JoinStrategyDecision {
+				strategy: JoinStrategy::Broadcast,
+				placement,
+				reason: JoinStrategyDecisionReason::PinnedByAuthor,
+			})
+		}
+		JoinStrategyIntent::Pinned {
+			strategy: _,
+			build_side: Some(_),
+			..
+		} => Err(BindingError::UnsupportedExpression {
+			message: "pinned hash join must not carry a broadcast build side".to_string(),
+		}),
+		JoinStrategyIntent::Pinned { strategy, .. } => Ok(JoinStrategyDecision {
 			strategy,
 			placement: JoinPhysicalPlacement::Natural,
 			reason: JoinStrategyDecisionReason::PinnedByAuthor,
-		},
-		JoinStrategyIntent::Auto => {
-			choose_auto_join_strategy(kind, left_input, right_input, config)
+		}),
+		JoinStrategyIntent::Auto => Ok(choose_auto_join_strategy(
+			kind,
+			left_input,
+			right_input,
+			config,
+		)),
+	}
+}
+
+pub(super) fn pinned_broadcast_placement(
+	kind: JoinKind,
+	build_side: BroadcastBuildSide,
+) -> Result<JoinPhysicalPlacement, BindingError> {
+	match (broadcast_physical_placement(kind), build_side) {
+		(BroadcastPlacementRule::SmallerBuild, BroadcastBuildSide::Left)
+		| (BroadcastPlacementRule::NaturalLeftBuild, BroadcastBuildSide::Left) => {
+			Ok(JoinPhysicalPlacement::Natural)
 		}
+		(BroadcastPlacementRule::SmallerBuild, BroadcastBuildSide::Right)
+		| (BroadcastPlacementRule::SwappedRightBuild, BroadcastBuildSide::Right) => {
+			Ok(JoinPhysicalPlacement::SwappedRightBuild)
+		}
+		(BroadcastPlacementRule::NaturalLeftBuild, BroadcastBuildSide::Right)
+		| (BroadcastPlacementRule::SwappedRightBuild, BroadcastBuildSide::Left) => {
+			Err(unsupported_pinned_broadcast_side(kind, build_side))
+		}
+		(BroadcastPlacementRule::Never, _) => Err(BindingError::UnsupportedExpression {
+			message: format!(
+				"pinned broadcast join cannot build the {} side for {kind:?}; FullOuter requires demotion before broadcast can be pinned",
+				broadcast_build_side_name(build_side)
+			),
+		}),
+	}
+}
+
+fn unsupported_pinned_broadcast_side(
+	kind: JoinKind,
+	build_side: BroadcastBuildSide,
+) -> BindingError {
+	BindingError::UnsupportedExpression {
+		message: format!(
+			"pinned broadcast join cannot build the {} side for {kind:?}; target the null-supplied side or drop the hint",
+			broadcast_build_side_name(build_side)
+		),
+	}
+}
+
+fn broadcast_build_side_name(side: BroadcastBuildSide) -> &'static str {
+	match side {
+		BroadcastBuildSide::Left => "left",
+		BroadcastBuildSide::Right => "right",
 	}
 }
 
@@ -855,13 +921,6 @@ pub(super) fn exchange_for_join_keys(
 		partition_count,
 		key: join_key_program(keys)?,
 	})
-}
-
-pub(super) fn strip_root_exchange(input: ExecutionPlan) -> ExecutionPlan {
-	match input {
-		ExecutionPlan::Exchange { input, .. } => *input,
-		other => other,
-	}
 }
 
 pub(super) fn join_key_program(keys: &[ResolvedJoinKey]) -> Result<BoundExprProgram, BindingError> {

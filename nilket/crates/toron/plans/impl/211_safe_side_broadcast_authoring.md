@@ -192,6 +192,24 @@ git diff --check
 If a live distributed/hash A/B fixture is added outside `--lib`, run that named integration test explicitly
 and include it in the evidence.
 
+## Post-Implementation Evidence Notes
+
+Promoted gate names that landed under consolidated implementation names:
+
+| Promoted behavior | Implemented proof |
+|---|---|
+| `force_hash_join_ids_still_demotes_sql_hint_without_frontend_exchange_strip` | `force_hash_join_ids_demotes_auto_and_sql_broadcast_only`, plus terminal-exchange assertions in the same test proving the post-D2 shape |
+| `rune_post_join_broadcast_pin_matches_sql_hint` | `rune_post_join_broadcast_pin_matches_sql_hint_and_rejects_preserved_side` |
+| `rune_preserved_side_broadcast_rejects_like_sql` | `rune_post_join_broadcast_pin_matches_sql_hint_and_rejects_preserved_side` |
+
+The inner either-side rule is covered compositionally rather than by a single end-to-end gate:
+
+- SQL resolver proof: `sql_broadcast_hint_targeting_probe_rejects` was retargeted to prove
+  `BROADCAST(o)` on the right side of an inner join lowers to `build_side: Some(Right)`.
+- Binder matrix proof: `bind_join_applies_broadcast_side_matrix_for_non_inner_kind` and
+  `direct_pinned_non_inner_safe_side_binds` prove side-sensitive admission/physicalization through the
+  binder's table. Together with the SQL resolver proof, this covers inner either-side authoring.
+
 ## Hygiene
 
 - No new fragmenter, executor, wire, runtime-filter, telemetry, or recognizer behavior.

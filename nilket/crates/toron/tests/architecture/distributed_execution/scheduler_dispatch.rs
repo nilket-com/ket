@@ -81,7 +81,7 @@ pub(crate) fn g17_join_ir_surface_has_single_join_variant_and_two_strategies() {
 	let join_strategy = logical_source
 		.split("pub enum JoinStrategy")
 		.nth(1)
-		.and_then(|rest| rest.split("pub enum InsertLiteral").next())
+		.and_then(|rest| rest.split("pub enum BroadcastBuildSide").next())
 		.expect("JoinStrategy block");
 	let logical_plan = logical_source
 		.split("pub enum LogicalPlan")

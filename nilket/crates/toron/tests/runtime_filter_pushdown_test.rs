@@ -271,6 +271,7 @@ fn join_plan() -> LogicalPlan {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	}
 }

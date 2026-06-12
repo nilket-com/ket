@@ -3,10 +3,10 @@ use crate::catalog::TableRef;
 use crate::date32::parse_date_ymd;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, CreateTableColumn, CreateTableColumnType, CreateTableRowIdentity,
-	CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy, JoinStrategyIntent,
-	JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue, SortExpr,
-	TemporalExtractField, TemporalTruncField, data_type_to_logical_type_physical,
+	AggregateFunction, BroadcastBuildSide, CreateTableColumn, CreateTableColumnType,
+	CreateTableRowIdentity, CreateTableSchema, Expr, InsertLiteral, JoinKind, JoinStrategy,
+	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, ReturningProjection, ScalarValue,
+	SortExpr, TemporalExtractField, TemporalTruncField, data_type_to_logical_type_physical,
 };
 use crate::timestamp::{parse_explicit_timestamptz, utc_timestamp_data_type};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -3467,12 +3467,14 @@ impl SqlPlanner {
 				)?;
 			}
 			let strategy_intent =
-				join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right, kind)?;
+				join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right)?;
 			plan = match strategy_intent {
 				JoinStrategyIntent::Auto => build_auto_join_plan(plan, right, kind, on),
-				JoinStrategyIntent::Pinned { strategy, source } => {
-					build_join_plan(plan, right, kind, on, strategy, source)?
-				}
+				JoinStrategyIntent::Pinned {
+					strategy,
+					source,
+					build_side,
+				} => build_join_plan(plan, right, kind, on, strategy, source, build_side)?,
 			};
 		}
 		reject_unused_broadcast_hint(&broadcast_hint)?;
@@ -4504,6 +4506,7 @@ impl SqlPlanner {
 			on,
 			JoinStrategy::HashPartitioned,
 			JoinStrategyPinSource::Direct,
+			None,
 		)
 	}
 
@@ -5066,9 +5069,13 @@ pub(crate) fn build_join_plan(
 	on: Vec<(Expr, Expr)>,
 	strategy: JoinStrategy,
 	source: JoinStrategyPinSource,
+	build_side: Option<BroadcastBuildSide>,
 ) -> Result<LogicalPlan, FrontendError> {
 	let (left_keys, right_keys) = derive_join_exchange_keys(&on, &left, &right)?;
 	match strategy {
+		JoinStrategy::HashPartitioned if build_side.is_some() => Err(unsupported(
+			"hash join pins must not carry a broadcast build side",
+		)),
 		JoinStrategy::HashPartitioned => Ok(LogicalPlan::Join {
 			left: Box::new(LogicalPlan::Exchange {
 				input: Box::new(left),
@@ -5082,24 +5089,28 @@ pub(crate) fn build_join_plan(
 			}),
 			kind,
 			on,
-			strategy_intent: JoinStrategyIntent::Pinned { strategy, source },
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy,
+				source,
+				build_side: None,
+			},
 		}),
 		JoinStrategy::Broadcast => {
-			if kind != JoinKind::Inner {
+			let Some(build_side) = build_side else {
 				return Err(unsupported(
-					"broadcast join is only supported for INNER joins",
+					"broadcast join pins require an explicit build side",
 				));
-			}
+			};
 			Ok(LogicalPlan::Join {
-				left: Box::new(LogicalPlan::Exchange {
-					input: Box::new(left),
-					partition_count: 1,
-					key: left_keys,
-				}),
+				left: Box::new(left),
 				right: Box::new(right),
 				kind,
 				on,
-				strategy_intent: JoinStrategyIntent::Pinned { strategy, source },
+				strategy_intent: JoinStrategyIntent::Pinned {
+					strategy,
+					source,
+					build_side: Some(build_side),
+				},
 			})
 		}
 	}
@@ -7417,7 +7428,6 @@ fn join_strategy_intent_for_hint(
 	broadcast_hint: &mut Option<BroadcastJoinHint>,
 	left: &LogicalPlan,
 	right: &LogicalPlan,
-	kind: JoinKind,
 ) -> Result<JoinStrategyIntent, FrontendError> {
 	let Some(hint) = broadcast_hint.as_mut() else {
 		return Ok(JoinStrategyIntent::Auto);
@@ -7437,12 +7447,6 @@ fn join_strategy_intent_for_hint(
 			hint.target.table
 		)));
 	}
-	if right_matches > 0 {
-		return Err(unsupported(format!(
-			"broadcast hint target `{}` must be the left/build side of the join",
-			hint.target.table
-		)));
-	}
 	if left_matches > 0 {
 		if left_qualifiers.len() != 1 {
 			return Err(unsupported(format!(
@@ -7450,15 +7454,25 @@ fn join_strategy_intent_for_hint(
 				hint.target.table
 			)));
 		}
-		if kind != JoinKind::Inner {
-			return Err(unsupported(
-				"broadcast join is only supported for INNER joins",
-			));
+		hint.consumed = true;
+		return Ok(JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::SqlHint,
+			build_side: Some(BroadcastBuildSide::Left),
+		});
+	}
+	if right_matches > 0 {
+		if right_qualifiers.len() != 1 {
+			return Err(unsupported(format!(
+				"broadcast hint target `{}` is inside a composite right join input",
+				hint.target.table
+			)));
 		}
 		hint.consumed = true;
 		return Ok(JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::SqlHint,
+			build_side: Some(BroadcastBuildSide::Right),
 		});
 	}
 
@@ -7934,27 +7948,18 @@ mod tests {
 					strategy_intent,
 					JoinStrategyIntent::Pinned {
 						strategy: JoinStrategy::Broadcast,
-						source: JoinStrategyPinSource::SqlHint
+						source: JoinStrategyPinSource::SqlHint,
+						build_side: Some(BroadcastBuildSide::Left),
 					}
 				);
 				assert_eq!(on.len(), 1);
-				match *left {
-					LogicalPlan::Exchange {
-						partition_count,
-						input,
+				assert!(matches!(
+					*left,
+					LogicalPlan::Alias {
+						ref alias,
 						..
-					} => {
-						assert_eq!(partition_count, 1);
-						assert!(matches!(
-							*input,
-							LogicalPlan::Alias {
-								ref alias,
-								..
-							} if alias == &TableRef::new("c")
-						));
-					}
-					other => panic!("expected broadcast build exchange, got {other:?}"),
-				}
+					} if alias == &TableRef::new("c")
+				));
 				assert!(matches!(
 					*right,
 					LogicalPlan::Alias {
@@ -7989,15 +7994,15 @@ mod tests {
 					strategy_intent,
 					JoinStrategyIntent::Pinned {
 						strategy: JoinStrategy::Broadcast,
-						source: JoinStrategyPinSource::SqlHint
+						source: JoinStrategyPinSource::SqlHint,
+						build_side: Some(BroadcastBuildSide::Left),
 					}
 				);
 				match *left {
-					LogicalPlan::Exchange { input, .. } => {
-						let predicate = assert_filter_on_alias(&input, "c");
+					LogicalPlan::Filter { ref predicate, .. } => {
 						assert_expr_references(predicate, "c", "region");
 					}
-					other => panic!("expected broadcast exchange, got {other:?}"),
+					other => panic!("expected pushed filter, got {other:?}"),
 				}
 			}
 			other => panic!("expected hinted join plan, got {other:?}"),
@@ -8006,17 +8011,50 @@ mod tests {
 
 	#[test]
 	fn sql_broadcast_hint_targeting_probe_rejects() {
-		assert_plan_rejects(
-			"SELECT /*+ BROADCAST(o) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
-			"left/build side",
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(o) */ * FROM customers c INNER JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("right-side inner broadcast hint should plan");
+		let LogicalPlan::Join {
+			strategy_intent, ..
+		} = plan
+		else {
+			panic!("expected hinted join");
+		};
+		assert_eq!(
+			strategy_intent,
+			JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::SqlHint,
+				build_side: Some(BroadcastBuildSide::Right),
+			}
 		);
 	}
 
 	#[test]
-	fn sql_broadcast_hint_non_inner_rejects() {
-		assert_plan_rejects(
-			"SELECT /*+ BROADCAST(c) */ * FROM customers c LEFT JOIN orders o ON c.id = o.customer_id",
-			"broadcast join is only supported for INNER joins",
+	fn sql_broadcast_hint_non_inner_resolves_side_before_binder_validation() {
+		let plan = SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM customers c LEFT JOIN orders o ON c.id = o.customer_id",
+			)
+			.expect("frontend should resolve side before binder validates kind");
+		let LogicalPlan::Join {
+			kind,
+			strategy_intent,
+			..
+		} = plan
+		else {
+			panic!("expected hinted join");
+		};
+		assert_eq!(kind, JoinKind::LeftOuter);
+		assert_eq!(
+			strategy_intent,
+			JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::SqlHint,
+				build_side: Some(BroadcastBuildSide::Left),
+			}
 		);
 	}
 
@@ -8063,6 +8101,7 @@ mod tests {
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
 				source: JoinStrategyPinSource::Direct,
+				build_side: None,
 			},
 		};
 		let right = LogicalPlan::ScanNamed {
@@ -8074,15 +8113,15 @@ mod tests {
 			consumed: false,
 		});
 
-		let err = join_strategy_intent_for_hint(&mut hint, &left, &right, JoinKind::Inner)
+		let err = join_strategy_intent_for_hint(&mut hint, &left, &right)
 			.expect_err("composite left broadcast should reject");
 
 		assert!(err.to_string().contains("composite left"), "{err}");
 	}
 
 	#[test]
-	fn build_join_plan_rejects_broadcast_non_inner_at_frontend() {
-		let err = build_join_plan(
+	fn build_join_plan_accepts_broadcast_non_inner_without_frontend_exchange() {
+		let plan = build_join_plan(
 			LogicalPlan::ScanNamed {
 				table: TableRef::new("customers"),
 				projection: None,
@@ -8098,13 +8137,30 @@ mod tests {
 			)],
 			JoinStrategy::Broadcast,
 			JoinStrategyPinSource::Direct,
+			Some(BroadcastBuildSide::Right),
 		)
-		.expect_err("non-INNER broadcast join must reject");
+		.expect("frontend should leave non-inner broadcast validation to binder");
 
-		assert!(
-			err.to_string()
-				.contains("broadcast join is only supported for INNER joins"),
-			"{err}"
+		let LogicalPlan::Join {
+			left,
+			right,
+			kind,
+			strategy_intent,
+			..
+		} = plan
+		else {
+			panic!("expected logical join");
+		};
+		assert_eq!(kind, JoinKind::LeftOuter);
+		assert!(matches!(*left, LogicalPlan::ScanNamed { .. }));
+		assert!(matches!(*right, LogicalPlan::ScanNamed { .. }));
+		assert_eq!(
+			strategy_intent,
+			JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Direct,
+				build_side: Some(BroadcastBuildSide::Right),
+			}
 		);
 	}
 

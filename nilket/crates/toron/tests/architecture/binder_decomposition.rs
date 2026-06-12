@@ -171,6 +171,7 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 		.map(|path| path.split(" -> ").last().unwrap_or(path))
 		.filter(|path| {
 			let later_adr_test_and_runtime_surfaces = [
+				"crates/toron/benches/distributed_inner_equi_join.rs",
 				"crates/toron/src/audit.rs",
 				"crates/toron/src/coordinator.rs",
 				"crates/toron/src/daemon.rs",
@@ -186,10 +187,14 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/server/mod.rs",
 				"crates/toron/src/sql_planner.rs",
 				"crates/toron/tests/catalog_logical_identity_test.rs",
+				"crates/toron/tests/distributed_process_test.rs",
 				"crates/toron/tests/explain_analyze_test.rs",
 				"crates/toron/tests/hash_join_kinds_test.rs",
+				"crates/toron/tests/join_kind_test.rs",
 				"crates/toron/tests/observability_listener_test.rs",
+				"crates/toron/tests/qualified_resolution_test.rs",
 				"crates/toron/tests/rune_relation_handles_test.rs",
+				"crates/toron/tests/runtime_filter_pushdown_test.rs",
 				"crates/toron/tests/wendelon_storage_execution_test.rs",
 			];
 			*path != "crates/toron/src/binder.rs"

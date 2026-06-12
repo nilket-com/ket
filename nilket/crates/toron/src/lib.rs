@@ -33,9 +33,7 @@ mod tests {
 	use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 	use std::sync::Arc;
 
-	use crate::binder::{
-		BroadcastBuildSide, JoinStrategyDecisionReason, PlannerConfig, bind, bind_with_trace,
-	};
+	use crate::binder::{JoinStrategyDecisionReason, PlannerConfig, bind, bind_with_trace};
 	use crate::catalog::{
 		Catalog, ColumnHeavyHitterFact, ColumnRangeDistributionFact, DistinctCountFact,
 		MockCatalog, RangeDistributionBucket, RangeFact, TableOptimizerFacts, WendelonCatalog,
@@ -66,9 +64,9 @@ mod tests {
 	use crate::error::{QueryError, RuntimeError, StorageError, TaskFailureKind};
 	use crate::exec::Executor;
 	use crate::ir::{
-		AggregateFunction, BoundExprProgram, ColumnOrdinal, ExecutionPlan, Expr, JoinKind,
-		JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
-		MorselId, ScalarLiteralKey, ScalarValue, SortExpr, StageId, TableId,
+		AggregateFunction, BoundExprProgram, BroadcastBuildSide, ColumnOrdinal, ExecutionPlan,
+		Expr, JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource,
+		LogicalPlan, MorselId, ScalarLiteralKey, ScalarValue, SortExpr, StageId, TableId,
 	};
 	use crate::rune_engine::{RuneEngine, RuneSandboxConfig};
 	use crate::server::{
@@ -589,6 +587,7 @@ mod tests {
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
 				source: JoinStrategyPinSource::Direct,
+				build_side: None,
 			},
 		};
 
@@ -823,6 +822,20 @@ mod tests {
 
 			assert_join_results_match_digest(kind, &hash_results, &broadcast_results);
 		}
+	}
+
+	#[tokio::test]
+	async fn safe_side_hinted_outer_join_distributed_result_matches_hash() {
+		let hash_results =
+			run_distributed_join_query(non_inner_fact_dim_join_plan(JoinKind::LeftOuter), 16).await;
+		let hinted = crate::sql_planner::SqlPlanner::new()
+			.plan(
+				"SELECT /*+ BROADCAST(c) */ * FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
+			)
+			.expect("SQL safe-side outer broadcast hint plan");
+		let broadcast_results = run_distributed_join_query(hinted, 3).await;
+
+		assert_join_results_match_digest(JoinKind::LeftOuter, &hash_results, &broadcast_results);
 	}
 
 	#[tokio::test]
@@ -5032,6 +5045,7 @@ mod tests {
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::Broadcast,
 				source: JoinStrategyPinSource::Direct,
+				build_side: Some(BroadcastBuildSide::Left),
 			},
 		}
 	}
@@ -5068,6 +5082,7 @@ mod tests {
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
 				source: JoinStrategyPinSource::Direct,
+				build_side: None,
 			},
 		}
 	}
@@ -5887,6 +5902,7 @@ mod tests {
 					JoinStrategyIntent::Pinned {
 						strategy: JoinStrategy::Broadcast,
 						source,
+						..
 					},
 				..
 			} => assert_eq!(*source, expected),

@@ -28,7 +28,8 @@ use toron::distributed::worker_registry::{
 };
 use toron::error::StorageError;
 use toron::ir::{
-	Expr, JoinKind, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, TableId,
+	BroadcastBuildSide, Expr, JoinKind, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource,
+	LogicalPlan, TableId,
 };
 use toron::server::{
 	NetworkTaskDispatcher, ToronWorker, memory::MemoryManager, transport::TcpTransport,
@@ -93,6 +94,13 @@ impl BenchStrategy {
 		match self {
 			Self::HashPartitioned => JoinStrategy::HashPartitioned,
 			Self::Broadcast => JoinStrategy::Broadcast,
+		}
+	}
+
+	fn build_side(self) -> Option<BroadcastBuildSide> {
+		match self {
+			Self::HashPartitioned => None,
+			Self::Broadcast => Some(BroadcastBuildSide::Left),
 		}
 	}
 }
@@ -951,6 +959,7 @@ fn join_plan(
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: strategy.join_strategy(),
 			source: JoinStrategyPinSource::Direct,
+			build_side: strategy.build_side(),
 		},
 	}
 }

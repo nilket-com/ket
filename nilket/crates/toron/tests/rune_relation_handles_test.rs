@@ -15,10 +15,10 @@ use toron::distributed::identity::QueryId;
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	BoundBinaryOp, BoundExprNode, CUSTOMER_ID_LOGICAL_TYPE, DURABLE_LOGICAL_TYPE_MIN_ID,
-	ExecutionPlan, Expr, FilterDisposition, JoinKind, JoinStrategy, JoinStrategyIntent,
-	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, ScalarValue, SystemTableKind, TableId,
-	decode_column_logical_type, field_with_logical_type_metadata,
+	BoundBinaryOp, BoundExprNode, BroadcastBuildSide, CUSTOMER_ID_LOGICAL_TYPE,
+	DURABLE_LOGICAL_TYPE_MIN_ID, ExecutionPlan, Expr, FilterDisposition, JoinKind, JoinStrategy,
+	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId, ScalarValue,
+	SystemTableKind, TableId, decode_column_logical_type, field_with_logical_type_metadata,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -393,7 +393,8 @@ async fn rune_join_wraps_both_inputs_in_hash_exchanges() {
 		strategy_intent,
 		JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
-			source: JoinStrategyPinSource::Rune
+			source: JoinStrategyPinSource::Rune,
+			build_side: None,
 		}
 	);
 	assert_eq!(on.len(), 1);
@@ -440,26 +441,20 @@ async fn rune_authored_broadcast_join_constructs_validated_broadcast_plan() {
 		strategy_intent,
 		JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
-			source: JoinStrategyPinSource::Rune
+			source: JoinStrategyPinSource::Rune,
+			build_side: Some(BroadcastBuildSide::Left),
 		}
 	);
 	assert_eq!(on.len(), 1);
 	assert_qualified_column(&on[0].0, "r", "region");
 	assert_qualified_column(&on[0].1, "s", "region");
 
-	let LogicalPlan::Exchange {
-		input,
-		partition_count,
-		key,
-	} = left.as_ref()
-	else {
-		panic!("expected broadcast build exchange on left, got {left:?}");
-	};
-	assert_eq!(*partition_count, 1);
-	assert_eq!(key.len(), 1);
-	assert_qualified_column(&key[0], "r", "region");
 	assert!(
-		contains_scan_named(input, "regions"),
+		!matches!(left.as_ref(), LogicalPlan::Exchange { .. }),
+		"broadcast build side must remain logical until bind"
+	);
+	assert!(
+		contains_scan_named(left.as_ref(), "regions"),
 		"receiver/build side must contain regions scan"
 	);
 	assert!(
@@ -670,14 +665,16 @@ async fn broadcast_join_qualifier_resolution_matches_hash() {
 		hash_strategy,
 		JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
-			source: JoinStrategyPinSource::Rune
+			source: JoinStrategyPinSource::Rune,
+			build_side: None,
 		}
 	);
 	assert_eq!(
 		broadcast_strategy,
 		JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
-			source: JoinStrategyPinSource::Rune
+			source: JoinStrategyPinSource::Rune,
+			build_side: Some(BroadcastBuildSide::Left),
 		}
 	);
 
@@ -701,16 +698,13 @@ async fn broadcast_join_qualifier_resolution_matches_hash() {
 	else {
 		panic!("expected hash right exchange");
 	};
-	let LogicalPlan::Exchange {
-		key: broadcast_left_key,
-		..
-	} = broadcast_left.as_ref()
-	else {
-		panic!("expected broadcast left exchange");
-	};
 	assert_qualified_column(&hash_left_key[0], "s", "region");
 	assert_qualified_column(&hash_right_key[0], "r", "region");
-	assert_qualified_column(&broadcast_left_key[0], "s", "region");
+	assert!(
+		!matches!(broadcast_left.as_ref(), LogicalPlan::Exchange { .. }),
+		"Rune broadcast join should leave exchange insertion to the binder"
+	);
+	assert!(contains_scan_named(broadcast_left.as_ref(), "sales"));
 }
 
 #[tokio::test]
@@ -791,7 +785,8 @@ async fn rune_join_named_methods_lower_to_existing_join_kinds() {
 			strategy_intent,
 			JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
-				source: JoinStrategyPinSource::Rune
+				source: JoinStrategyPinSource::Rune,
+				build_side: None,
 			},
 			"{method}"
 		);

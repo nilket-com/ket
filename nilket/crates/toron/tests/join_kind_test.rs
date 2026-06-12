@@ -5,7 +5,7 @@ use toron::binder::{PlannerConfig, bind, join_schema};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::error::BindingError;
 use toron::ir::{
-	CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
+	BroadcastBuildSide, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
 	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, TableId,
 };
 use toron::sql_planner::SqlPlanner;
@@ -78,23 +78,74 @@ fn output_schema_nullability_table_for_each_kind() {
 }
 
 #[tokio::test]
-async fn bind_join_rejects_broadcast_for_every_non_inner_kind() {
-	for kind in all_join_kinds()
-		.into_iter()
-		.filter(|kind| *kind != JoinKind::Inner)
-	{
-		let err = bind(
-			&broadcast_join_plan(kind),
-			&catalog(),
+async fn bind_join_applies_broadcast_side_matrix_for_non_inner_kind() {
+	let catalog = catalog();
+	for (kind, safe_side, rejected_side) in [
+		(
+			JoinKind::LeftOuter,
+			BroadcastBuildSide::Right,
+			BroadcastBuildSide::Left,
+		),
+		(
+			JoinKind::LeftSemi,
+			BroadcastBuildSide::Right,
+			BroadcastBuildSide::Left,
+		),
+		(
+			JoinKind::LeftAnti,
+			BroadcastBuildSide::Right,
+			BroadcastBuildSide::Left,
+		),
+		(
+			JoinKind::RightOuter,
+			BroadcastBuildSide::Left,
+			BroadcastBuildSide::Right,
+		),
+		(
+			JoinKind::RightSemi,
+			BroadcastBuildSide::Left,
+			BroadcastBuildSide::Right,
+		),
+		(
+			JoinKind::RightAnti,
+			BroadcastBuildSide::Left,
+			BroadcastBuildSide::Right,
+		),
+	] {
+		bind(
+			&broadcast_join_plan(kind, safe_side),
+			&catalog,
 			&PlannerConfig::default(),
 		)
 		.await
-		.expect_err("non-inner broadcast must fail");
+		.unwrap_or_else(|error| panic!("{kind:?} safe-side broadcast should bind: {error}"));
 
+		let err = bind(
+			&broadcast_join_plan(kind, rejected_side),
+			&catalog,
+			&PlannerConfig::default(),
+		)
+		.await
+		.expect_err("preserved-side broadcast must fail");
 		assert!(matches!(
 			err,
 			BindingError::UnsupportedExpression { message }
-				if message.contains("broadcast join is only supported for INNER joins")
+				if message.contains("target the null-supplied side or drop the hint")
+		));
+	}
+
+	for side in [BroadcastBuildSide::Left, BroadcastBuildSide::Right] {
+		let err = bind(
+			&broadcast_join_plan(JoinKind::FullOuter, side),
+			&catalog,
+			&PlannerConfig::default(),
+		)
+		.await
+		.expect_err("full outer broadcast must fail without demotion");
+		assert!(matches!(
+			err,
+			BindingError::UnsupportedExpression { message }
+				if message.contains("FullOuter requires demotion before broadcast can be pinned")
 		));
 	}
 }
@@ -239,6 +290,7 @@ fn nominal_join_plan(left_logical: LogicalTypeId, right_logical: LogicalTypeId) 
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	}
 }
@@ -269,19 +321,16 @@ fn hash_join_plan(kind: JoinKind) -> LogicalPlan {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	}
 }
 
-fn broadcast_join_plan(kind: JoinKind) -> LogicalPlan {
+fn broadcast_join_plan(kind: JoinKind, build_side: BroadcastBuildSide) -> LogicalPlan {
 	LogicalPlan::Join {
-		left: Box::new(LogicalPlan::Exchange {
-			input: Box::new(LogicalPlan::ScanNamed {
-				table: TableRef::new("left_t"),
-				projection: None,
-			}),
-			partition_count: 1,
-			key: vec![Expr::qualified_column(TableRef::new("left_t"), "id")],
+		left: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("left_t"),
+			projection: None,
 		}),
 		right: Box::new(LogicalPlan::ScanNamed {
 			table: TableRef::new("right_t"),
@@ -295,6 +344,7 @@ fn broadcast_join_plan(kind: JoinKind) -> LogicalPlan {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
+			build_side: Some(build_side),
 		},
 	}
 }

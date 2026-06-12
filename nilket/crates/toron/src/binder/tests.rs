@@ -530,6 +530,7 @@ async fn bind_hash_join_resolves_qualified_keys_and_duplicate_output_names() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 
@@ -568,6 +569,7 @@ async fn bind_hash_join_auto_swaps_reversed_on_pair() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 
@@ -599,6 +601,7 @@ async fn bind_join_rejects_ambiguous_unqualified_column() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 
@@ -623,6 +626,7 @@ async fn bind_join_rejects_unknown_qualifier() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 
@@ -656,6 +660,7 @@ async fn bind_join_rejects_non_equi_and_computed_keys() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 	let computed = LogicalPlan::Join {
@@ -669,6 +674,7 @@ async fn bind_join_rejects_non_equi_and_computed_keys() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 
@@ -700,6 +706,7 @@ async fn bind_join_rejects_key_type_mismatch_and_float_keys() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 
@@ -722,6 +729,7 @@ async fn bind_join_rejects_key_type_mismatch_and_float_keys() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 
@@ -747,6 +755,7 @@ async fn bind_join_rejects_exchange_partition_and_key_shape_mismatches() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 	let key_mismatch = LogicalPlan::Join {
@@ -760,6 +769,7 @@ async fn bind_join_rejects_exchange_partition_and_key_shape_mismatches() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 
@@ -778,64 +788,9 @@ async fn bind_join_rejects_exchange_partition_and_key_shape_mismatches() {
 }
 
 #[tokio::test]
-async fn bind_broadcast_join_enforces_left_single_partition_build() {
+async fn bind_pinned_broadcast_physicalizes_left_build() {
 	let catalog = join_catalog();
 	let plan = LogicalPlan::Join {
-		left: Box::new(exchanged_named_scan("customers", "id", 1)),
-		right: Box::new(LogicalPlan::ScanNamed {
-			table: TableRef::new("orders"),
-			projection: None,
-		}),
-		kind: JoinKind::Inner,
-		on: vec![(
-			Expr::qualified_column(TableRef::new("customers"), "id"),
-			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
-		)],
-		strategy_intent: JoinStrategyIntent::Pinned {
-			strategy: JoinStrategy::Broadcast,
-			source: JoinStrategyPinSource::Direct,
-		},
-	};
-
-	assert!(matches!(
-		bind(&plan, &catalog, &PlannerConfig::default())
-			.await
-			.expect("bind broadcast"),
-		ExecutionPlan::Join {
-			strategy: JoinStrategy::Broadcast,
-			..
-		}
-	));
-
-	let wrong_side = LogicalPlan::Join {
-		left: Box::new(LogicalPlan::ScanNamed {
-			table: TableRef::new("orders"),
-			projection: None,
-		}),
-		right: Box::new(exchanged_named_scan("customers", "id", 1)),
-		kind: JoinKind::Inner,
-		on: vec![(
-			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
-			Expr::qualified_column(TableRef::new("customers"), "id"),
-		)],
-		strategy_intent: JoinStrategyIntent::Pinned {
-			strategy: JoinStrategy::Broadcast,
-			source: JoinStrategyPinSource::Direct,
-		},
-	};
-
-	assert!(matches!(
-		bind(&wrong_side, &catalog, &PlannerConfig::default())
-			.await
-			.expect_err("right-side publish must fail"),
-		BindingError::BroadcastBuildSidePlacement
-	));
-}
-
-#[tokio::test]
-async fn bind_broadcast_join_rejects_all_malformed_publish_shapes() {
-	let catalog = join_catalog();
-	let missing_left_publish = LogicalPlan::Join {
 		left: Box::new(LogicalPlan::ScanNamed {
 			table: TableRef::new("customers"),
 			projection: None,
@@ -852,26 +807,35 @@ async fn bind_broadcast_join_rejects_all_malformed_publish_shapes() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
+			build_side: Some(BroadcastBuildSide::Left),
 		},
 	};
-	let wrong_left_partition_count = LogicalPlan::Join {
-		left: Box::new(exchanged_named_scan("customers", "id", 4)),
-		right: Box::new(LogicalPlan::ScanNamed {
-			table: TableRef::new("orders"),
+
+	let bound = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind pinned broadcast");
+	let ExecutionPlan::Join {
+		left,
+		right,
+		strategy,
+		..
+	} = bound
+	else {
+		panic!("expected broadcast join");
+	};
+	assert_eq!(strategy, JoinStrategy::Broadcast);
+	assert!(matches!(terminal_exchange(&left), Some((1, _))));
+	assert!(terminal_exchange(&right).is_none());
+}
+
+#[tokio::test]
+async fn bind_pinned_broadcast_rejects_preshaped_probe_exchange() {
+	let catalog = join_catalog();
+	let prepublished_probe = LogicalPlan::Join {
+		left: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("customers"),
 			projection: None,
 		}),
-		kind: JoinKind::Inner,
-		on: vec![(
-			Expr::qualified_column(TableRef::new("customers"), "id"),
-			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
-		)],
-		strategy_intent: JoinStrategyIntent::Pinned {
-			strategy: JoinStrategy::Broadcast,
-			source: JoinStrategyPinSource::Direct,
-		},
-	};
-	let both_sides_published = LogicalPlan::Join {
-		left: Box::new(exchanged_named_scan("customers", "id", 1)),
 		right: Box::new(exchanged_named_scan("orders", "customer_id", 1)),
 		kind: JoinKind::Inner,
 		on: vec![(
@@ -881,21 +845,16 @@ async fn bind_broadcast_join_rejects_all_malformed_publish_shapes() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
+			build_side: Some(BroadcastBuildSide::Left),
 		},
 	};
 
-	for plan in [
-		missing_left_publish,
-		wrong_left_partition_count,
-		both_sides_published,
-	] {
-		assert!(matches!(
-			bind(&plan, &catalog, &PlannerConfig::default())
-				.await
-				.expect_err("malformed broadcast shape must fail"),
-			BindingError::BroadcastBuildSidePlacement
-		));
-	}
+	assert!(matches!(
+		bind(&prepublished_probe, &catalog, &PlannerConfig::default())
+			.await
+			.expect_err("probe-side publish must fail"),
+		BindingError::BroadcastBuildSidePlacement
+	));
 }
 
 #[tokio::test]
@@ -1753,7 +1712,7 @@ async fn left_semi_and_left_anti_auto_broadcast_build_right_without_restore_proj
 }
 
 #[tokio::test]
-async fn direct_non_inner_broadcast_pin_stays_rejected() {
+async fn direct_non_inner_preserved_side_broadcast_pin_stays_rejected() {
 	let catalog = join_catalog();
 	let logical = LogicalPlan::Join {
 		left: Box::new(exchanged_named_scan("customers", "id", 1)),
@@ -1769,15 +1728,16 @@ async fn direct_non_inner_broadcast_pin_stays_rejected() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
+			build_side: Some(BroadcastBuildSide::Right),
 		},
 	};
 
 	let err = bind(&logical, &catalog, &auto_broadcast_config(4_096))
 		.await
-		.expect_err("direct non-inner broadcast remains an authoring error");
+		.expect_err("direct non-inner preserved-side broadcast remains an authoring error");
 	assert!(
 		err.to_string()
-			.contains("broadcast join is only supported for INNER joins"),
+			.contains("target the null-supplied side or drop the hint"),
 		"{err}"
 	);
 }
@@ -1971,7 +1931,8 @@ async fn both_sides_eligible_right_materially_smaller_prefers_right_build() {
 			row_upper_bound: None,
 		}),
 		&auto_broadcast_config(4_096),
-	);
+	)
+	.expect("choose join strategy");
 	assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
 	assert_eq!(
 		decision.reason,
@@ -2092,7 +2053,8 @@ async fn both_sides_tiny_equal_keeps_left_build() {
 			row_upper_bound: None,
 		}),
 		&auto_broadcast_config(4_096),
-	);
+	)
+	.expect("choose join strategy");
 	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
 	assert_eq!(
 		decision.reason,
@@ -2127,7 +2089,8 @@ fn both_sides_eligible_near_tie_keeps_left_build() {
 			row_upper_bound: None,
 		}),
 		&config,
-	);
+	)
+	.expect("choose join strategy");
 
 	assert_eq!(decision.strategy, JoinStrategy::Broadcast);
 	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
@@ -7887,7 +7850,8 @@ fn composite_hard_bound_build_side_still_rejected() {
 			row_upper_bound: None,
 		}),
 		&auto_broadcast_config(4_096),
-	);
+	)
+	.expect("choose join strategy");
 
 	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
 	assert_eq!(
@@ -7919,7 +7883,8 @@ fn composite_estimate_channel_broadcasts_without_hard_bound_authority() {
 			row_upper_bound: None,
 		}),
 		&auto_broadcast_config(4_096),
-	);
+	)
+	.expect("choose join strategy");
 
 	assert_eq!(decision.strategy, JoinStrategy::Broadcast);
 	assert_eq!(
@@ -8662,7 +8627,8 @@ async fn sql_broadcast_hint_binds_pinned_by_author() {
 		LogicalPlan::Join {
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::Broadcast,
-				source: JoinStrategyPinSource::SqlHint
+				source: JoinStrategyPinSource::SqlHint,
+				build_side: Some(BroadcastBuildSide::Left),
 			},
 			..
 		}
@@ -8673,14 +8639,237 @@ async fn sql_broadcast_hint_binds_pinned_by_author() {
 		.expect("pinned broadcast binds without auto config");
 	assert_join_strategy(&plan, JoinStrategy::Broadcast);
 
-	let err = SqlPlanner::new()
+	let preserved_side_pin = SqlPlanner::new()
 		.plan(
 			"SELECT /*+ BROADCAST(c) */ * FROM customers c LEFT JOIN orders o ON c.id = o.customer_id",
 		)
-		.expect_err("non-inner broadcast hint fails before inference");
+		.expect("frontend records preserved-side pin");
+	let err = bind(
+		&preserved_side_pin,
+		&join_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("preserved-side broadcast pin must fail");
 	assert!(
 		err.to_string()
-			.contains("broadcast join is only supported for INNER joins"),
+			.contains("target the null-supplied side or drop the hint"),
+		"{err}"
+	);
+}
+
+#[tokio::test]
+async fn sql_left_outer_broadcast_hint_on_null_supplied_side_binds_preserved_probe_broadcast() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT /*+ BROADCAST(c) */ * FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
+		)
+		.expect("plan left outer safe-side broadcast hint");
+	let (_plan, trace) = bind_with_trace(&logical, &join_catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind left outer safe-side broadcast");
+
+	assert_eq!(trace.join_decisions.len(), 1);
+	assert_eq!(trace.join_decisions[0].strategy, JoinStrategy::Broadcast);
+	assert_eq!(
+		trace.join_decisions[0].placement,
+		JoinPhysicalPlacement::SwappedRightBuild
+	);
+	assert_eq!(
+		trace.join_decisions[0].reason,
+		JoinStrategyDecisionReason::PinnedByAuthor
+	);
+}
+
+#[tokio::test]
+async fn sql_right_outer_broadcast_hint_on_null_supplied_side_binds_preserved_probe_broadcast() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT /*+ BROADCAST(o) */ * FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id",
+		)
+		.expect("plan right outer safe-side broadcast hint");
+	let (_plan, trace) = bind_with_trace(&logical, &join_catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind right outer safe-side broadcast");
+
+	assert_eq!(trace.join_decisions.len(), 1);
+	assert_eq!(trace.join_decisions[0].strategy, JoinStrategy::Broadcast);
+	assert_eq!(
+		trace.join_decisions[0].placement,
+		JoinPhysicalPlacement::Natural
+	);
+	assert_eq!(
+		trace.join_decisions[0].reason,
+		JoinStrategyDecisionReason::PinnedByAuthor
+	);
+}
+
+#[tokio::test]
+async fn sql_full_outer_broadcast_hint_rejects_without_demotion() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT /*+ BROADCAST(c) */ * FROM orders o FULL OUTER JOIN customers c ON o.customer_id = c.id",
+		)
+		.expect("plan full outer broadcast hint");
+	let err = bind(&logical, &join_catalog(), &PlannerConfig::default())
+		.await
+		.expect_err("true full outer broadcast pin must fail");
+	assert!(
+		err.to_string()
+			.contains("FullOuter requires demotion before broadcast can be pinned"),
+		"{err}"
+	);
+}
+
+#[tokio::test]
+async fn sql_full_outer_broadcast_hint_is_honored_after_both_sides_null_rejecting_demote() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT /*+ BROADCAST(c) */ * FROM orders o FULL OUTER JOIN customers c \
+			 ON o.customer_id = c.id WHERE o.id IS NOT NULL AND c.id IS NOT NULL",
+		)
+		.expect("plan demoted full outer broadcast hint");
+	let (_plan, trace, render_trace) =
+		bind_with_explain_trace(&logical, &join_catalog(), &PlannerConfig::default())
+			.await
+			.expect("bind demoted full outer broadcast hint");
+
+	assert_eq!(render_trace.outer_join_demotions.len(), 1);
+	assert_eq!(
+		render_trace.outer_join_demotions[0].from_kind,
+		JoinKind::FullOuter
+	);
+	assert_eq!(
+		render_trace.outer_join_demotions[0].to_kind,
+		JoinKind::Inner
+	);
+	assert_eq!(trace.join_decisions.len(), 1);
+	assert_eq!(trace.join_decisions[0].strategy, JoinStrategy::Broadcast);
+	assert_eq!(
+		trace.join_decisions[0].placement,
+		JoinPhysicalPlacement::SwappedRightBuild
+	);
+	assert_eq!(
+		trace.join_decisions[0].reason,
+		JoinStrategyDecisionReason::PinnedByAuthor
+	);
+}
+
+fn direct_left_outer_broadcast_pin(build_side: BroadcastBuildSide) -> LogicalPlan {
+	LogicalPlan::Join {
+		left: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("orders"),
+			projection: None,
+		}),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("customers"),
+			projection: None,
+		}),
+		kind: JoinKind::LeftOuter,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			Expr::qualified_column(TableRef::new("customers"), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			source: JoinStrategyPinSource::Direct,
+			build_side: Some(build_side),
+		},
+	}
+}
+
+#[tokio::test]
+async fn direct_pinned_non_inner_safe_side_binds() {
+	let catalog = join_catalog();
+	let (_plan, trace) = bind_with_trace(
+		&direct_left_outer_broadcast_pin(BroadcastBuildSide::Right),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("safe-side direct pin binds");
+	assert_eq!(trace.join_decisions[0].strategy, JoinStrategy::Broadcast);
+	assert_eq!(
+		trace.join_decisions[0].placement,
+		JoinPhysicalPlacement::SwappedRightBuild
+	);
+}
+
+#[tokio::test]
+async fn direct_pinned_non_inner_wrong_side_rejects() {
+	let catalog = join_catalog();
+	let err = bind(
+		&direct_left_outer_broadcast_pin(BroadcastBuildSide::Left),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("preserved-side direct pin rejects");
+	assert!(
+		err.to_string()
+			.contains("target the null-supplied side or drop the hint"),
+		"{err}"
+	);
+}
+
+#[tokio::test]
+async fn rune_post_join_broadcast_pin_matches_sql_hint_and_rejects_preserved_side() {
+	let catalog = join_catalog();
+	let sql = SqlPlanner::new()
+		.plan(
+			"SELECT /*+ BROADCAST(c) */ * FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
+		)
+		.expect("plan SQL safe-side hint");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o")
+                .left_join(
+                    ctx.table("customers").alias("c"),
+                    qcol("o", "customer_id").eq(qcol("c", "id"))
+                )
+                .broadcast_build("right")
+        }
+    "#,
+	)
+	.await;
+
+	for (source, logical) in [("sql", sql), ("rune", rune)] {
+		let (_plan, trace) = bind_with_trace(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|error| panic!("{source} safe-side broadcast should bind: {error}"));
+		assert_eq!(trace.join_decisions[0].strategy, JoinStrategy::Broadcast);
+		assert_eq!(
+			trace.join_decisions[0].placement,
+			JoinPhysicalPlacement::SwappedRightBuild,
+			"{source}"
+		);
+		assert_eq!(
+			trace.join_decisions[0].reason,
+			JoinStrategyDecisionReason::PinnedByAuthor,
+			"{source}"
+		);
+	}
+
+	let bad_rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o")
+                .left_join(
+                    ctx.table("customers").alias("c"),
+                    qcol("o", "customer_id").eq(qcol("c", "id"))
+                )
+                .broadcast_build("left")
+        }
+    "#,
+	)
+	.await;
+	let err = bind(&bad_rune, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("Rune preserved-side broadcast pin rejects like SQL");
+	assert!(
+		err.to_string()
+			.contains("target the null-supplied side or drop the hint"),
 		"{err}"
 	);
 }
@@ -8756,6 +8945,7 @@ async fn force_hash_join_ids_demotes_auto_and_sql_broadcast_only() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
+			build_side: Some(BroadcastBuildSide::Left),
 		},
 	};
 	let direct_plan = bind(&direct, &catalog, &force_hash)
@@ -8797,6 +8987,7 @@ async fn mixed_sql_and_rune_broadcast_plan_replays_sql_preserves_rune() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Rune,
+			build_side: Some(BroadcastBuildSide::Left),
 		},
 	};
 	let config = PlannerConfig {
@@ -8843,6 +9034,7 @@ async fn pinned_author_choice_not_downgraded_or_upgraded_by_inference() {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	};
 	let plan = bind(&pinned_hash, &catalog, &auto_broadcast_config(4_096))
@@ -9138,6 +9330,29 @@ async fn explain_pinned_broadcast_reports_pinned_by_author() {
 	);
 	assert_eq!(rows[0][7], ScalarValue::Int64(None));
 	assert_eq!(rows[0][11], ScalarValue::Utf8(Some("left".to_string())));
+}
+
+#[tokio::test]
+async fn hinted_safe_side_outer_join_explain_reports_pinned_by_author() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"EXPLAIN SELECT /*+ BROADCAST(c) */ * \
+				 FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
+		)
+		.expect("plan EXPLAIN hinted safe-side broadcast");
+
+	let (_schema, rows) =
+		bind_explain_rows(&logical, &join_catalog(), &PlannerConfig::default()).await;
+
+	assert_eq!(rows.len(), 1);
+	assert_eq!(rows[0][0], ScalarValue::Utf8(Some("join".to_string())));
+	assert_eq!(rows[0][1], ScalarValue::Utf8(Some("join[0]".to_string())));
+	assert_eq!(rows[0][2], ScalarValue::Utf8(Some("broadcast".to_string())));
+	assert_eq!(
+		rows[0][3],
+		ScalarValue::Utf8(Some("swapped_right_build:pinned_by_author".to_string()))
+	);
+	assert_eq!(rows[0][11], ScalarValue::Utf8(Some("right".to_string())));
 }
 
 #[tokio::test]
@@ -13502,7 +13717,8 @@ fn inferred_broadcast_carries_reason_receipt() {
 			row_upper_bound: None,
 		}),
 		&config,
-	);
+	)
+	.expect("choose join strategy");
 
 	assert_eq!(decision.strategy, JoinStrategy::Broadcast);
 	assert_eq!(decision.placement, JoinPhysicalPlacement::Natural);
@@ -13535,7 +13751,8 @@ fn inferred_broadcast_carries_reason_receipt() {
 			row_upper_bound: None,
 		}),
 		&config,
-	);
+	)
+	.expect("choose join strategy");
 	assert_eq!(decision.strategy, JoinStrategy::Broadcast);
 	assert_eq!(decision.placement, JoinPhysicalPlacement::SwappedRightBuild);
 	assert_eq!(
@@ -13585,7 +13802,8 @@ fn sole_eligible_side_reports_no_rejected_bytes() {
 				row_upper_bound: None,
 			}),
 			&config,
-		);
+		)
+		.expect("choose join strategy");
 
 		assert_eq!(decision.strategy, JoinStrategy::Broadcast);
 		assert_eq!(decision.placement, expected_placement);
@@ -13628,7 +13846,8 @@ fn hard_byte_bound_still_wins_over_estimate() {
 			row_upper_bound: None,
 		}),
 		&config,
-	);
+	)
+	.expect("choose join strategy");
 
 	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
 	assert_eq!(
@@ -13657,7 +13876,8 @@ fn hard_byte_bound_still_wins_over_estimate() {
 			row_upper_bound: None,
 		}),
 		&config,
-	);
+	)
+	.expect("choose join strategy");
 	assert_eq!(
 		decision.reason,
 		JoinStrategyDecisionReason::BroadcastInferred {
@@ -13691,7 +13911,8 @@ fn estimate_above_effective_threshold_hashes() {
 			row_upper_bound: Some(RowCount::new(100)),
 		}),
 		&config,
-	);
+	)
+	.expect("choose join strategy");
 
 	assert_eq!(decision.strategy, JoinStrategy::HashPartitioned);
 	assert_eq!(
@@ -15819,6 +16040,7 @@ fn n_fact_galaxy_reroot_carries_strategy_intent_by_fact() {
 	let pinned = JoinStrategyIntent::Pinned {
 		strategy: JoinStrategy::Broadcast,
 		source: JoinStrategyPinSource::Direct,
+		build_side: Some(BroadcastBuildSide::Left),
 	};
 	// `((sales ⋈ product) ⋈ returns[pinned]) ⋈ shipments`, all conformed on `product`.
 	let inner = LogicalPlan::Join {
@@ -17892,6 +18114,7 @@ fn nested_hash_probe_with_tiny_right() -> LogicalPlan {
 			strategy_intent: JoinStrategyIntent::Pinned {
 				strategy: JoinStrategy::HashPartitioned,
 				source: JoinStrategyPinSource::Direct,
+				build_side: None,
 			},
 		}),
 		right: Box::new(aliased_named_scan("customers", "c2")),

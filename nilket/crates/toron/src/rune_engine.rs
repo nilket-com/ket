@@ -2,9 +2,9 @@ use crate::catalog::TableRef;
 use crate::date32::parse_date_ymd;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
-	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE, ScalarValue,
-	SortExpr, TemporalExtractField, TemporalTruncField,
+	AggregateFunction, BroadcastBuildSide, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy,
+	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE,
+	ScalarValue, SortExpr, TemporalExtractField, TemporalTruncField,
 };
 use crate::sql_planner::{SqlPlanner, build_join_plan, expr_to_join_keys};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -261,7 +261,20 @@ impl RuneDataFrame {
 			JoinKind::Inner,
 			on,
 			JoinStrategy::Broadcast,
+			Some(BroadcastBuildSide::Left),
 		)
+	}
+
+	pub fn broadcast_build(self, side: String) -> VmResult<Self> {
+		let Some(build_side) = parse_broadcast_build_side(&side) else {
+			return VmResult::panic(
+				"broadcast_build expects build side `left` or `right`".to_string(),
+			);
+		};
+		match pin_broadcast_build(self.plan, build_side) {
+			Ok(plan) => VmResult::Ok(Self { plan }),
+			Err(error) => VmResult::panic(error),
+		}
 	}
 
 	pub fn explain(self) -> Self {
@@ -453,7 +466,7 @@ fn join_with_kind(
 	kind: JoinKind,
 	on: RuneExpr,
 ) -> VmResult<RuneDataFrame> {
-	join_with_strategy(left, right, kind, on, JoinStrategy::HashPartitioned)
+	join_with_strategy(left, right, kind, on, JoinStrategy::HashPartitioned, None)
 }
 
 fn join_with_strategy(
@@ -462,6 +475,7 @@ fn join_with_strategy(
 	kind: JoinKind,
 	on: RuneExpr,
 	strategy: JoinStrategy,
+	build_side: Option<BroadcastBuildSide>,
 ) -> VmResult<RuneDataFrame> {
 	let pairs = match expr_to_join_keys(&on.expr) {
 		Ok(pairs) => pairs,
@@ -474,9 +488,79 @@ fn join_with_strategy(
 		pairs,
 		strategy,
 		JoinStrategyPinSource::Rune,
+		build_side,
 	) {
 		Ok(plan) => VmResult::Ok(RuneDataFrame { plan }),
 		Err(error) => VmResult::panic(error.to_string()),
+	}
+}
+
+fn parse_broadcast_build_side(side: &str) -> Option<BroadcastBuildSide> {
+	if side.eq_ignore_ascii_case("left") {
+		Some(BroadcastBuildSide::Left)
+	} else if side.eq_ignore_ascii_case("right") {
+		Some(BroadcastBuildSide::Right)
+	} else {
+		None
+	}
+}
+
+fn pin_broadcast_build(
+	plan: LogicalPlan,
+	build_side: BroadcastBuildSide,
+) -> Result<LogicalPlan, String> {
+	let LogicalPlan::Join {
+		left,
+		right,
+		kind,
+		on,
+		strategy_intent,
+	} = plan
+	else {
+		return Err("broadcast_build can only annotate a join".to_string());
+	};
+
+	match strategy_intent {
+		JoinStrategyIntent::Auto => Ok(LogicalPlan::Join {
+			left,
+			right,
+			kind,
+			on,
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Rune,
+				build_side: Some(build_side),
+			},
+		}),
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::HashPartitioned,
+			source: JoinStrategyPinSource::Rune,
+			build_side: None,
+		} => Ok(LogicalPlan::Join {
+			left: strip_logical_root_exchange(left),
+			right: strip_logical_root_exchange(right),
+			kind,
+			on,
+			strategy_intent: JoinStrategyIntent::Pinned {
+				strategy: JoinStrategy::Broadcast,
+				source: JoinStrategyPinSource::Rune,
+				build_side: Some(build_side),
+			},
+		}),
+		JoinStrategyIntent::Pinned {
+			strategy: JoinStrategy::Broadcast,
+			..
+		} => Err("broadcast_build cannot annotate an already broadcast-pinned join".to_string()),
+		JoinStrategyIntent::Pinned { .. } => {
+			Err("broadcast_build can only annotate a Rune-authored hash or auto join".to_string())
+		}
+	}
+}
+
+fn strip_logical_root_exchange(input: Box<LogicalPlan>) -> Box<LogicalPlan> {
+	match *input {
+		LogicalPlan::Exchange { input, .. } => input,
+		other => Box::new(other),
 	}
 }
 
@@ -1102,6 +1186,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("inner_join", RuneDataFrame::inner_join)?;
 	m.associated_function("auto_join", RuneDataFrame::auto_join)?;
 	m.associated_function("broadcast_join", RuneDataFrame::broadcast_join)?;
+	m.associated_function("broadcast_build", RuneDataFrame::broadcast_build)?;
 	m.associated_function("explain", RuneDataFrame::explain)?;
 	m.associated_function("analyze", RuneDataFrame::analyze)?;
 	m.associated_function("left_join", RuneDataFrame::left_join)?;

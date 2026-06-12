@@ -10,7 +10,8 @@ use toron::catalog::{MockCatalog, TableRef};
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	Expr, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, TableId,
+	BroadcastBuildSide, Expr, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
+	TableId,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -267,6 +268,7 @@ fn duplicate_alias_join_plan() -> LogicalPlan {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
+			build_side: Some(BroadcastBuildSide::Left),
 		},
 	}
 }

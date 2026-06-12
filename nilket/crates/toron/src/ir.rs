@@ -885,11 +885,18 @@ pub enum JoinStrategy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BroadcastBuildSide {
+	Left,
+	Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinStrategyIntent {
 	Auto,
 	Pinned {
 		strategy: JoinStrategy,
 		source: JoinStrategyPinSource,
+		build_side: Option<BroadcastBuildSide>,
 	},
 }
 

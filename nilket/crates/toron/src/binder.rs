@@ -25,13 +25,13 @@ use crate::exec::Executor;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp,
-	BroadcastReplayEligibility, ColumnName, ColumnOrdinal, ColumnRef, CreateTableColumnType,
-	CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral,
-	JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan,
-	LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram,
-	QueryProfileHint, ResolvedColumn, ReturningProjection, ScalarLiteralKey,
-	ScalarLiteralKeyClassification, ScalarValue, SortExpr, SystemTableKind, TableId,
-	TemporalExtractField, TemporalTruncField, arithmetic_output_type,
+	BroadcastBuildSide, BroadcastReplayEligibility, ColumnName, ColumnOrdinal, ColumnRef,
+	CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
+	FilterDisposition, InsertLiteral, JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent,
+	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver,
+	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
+	ScalarLiteralKey, ScalarLiteralKeyClassification, ScalarValue, SortExpr, SystemTableKind,
+	TableId, TemporalExtractField, TemporalTruncField, arithmetic_output_type,
 	calendar_month_interval_data_type, decode_column_logical_type,
 	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
 	logical_type_name, logical_type_spec, nanos_per_timestamp_unit, scalar_literal_key,
@@ -75,8 +75,8 @@ use self::pushdown::*;
 use self::selectivity::*;
 
 pub use self::decision_log::OptimizerDecisionLog;
+pub(crate) use self::join::JoinStrategyDecisionReason;
 pub use self::join::join_schema;
-pub(crate) use self::join::{BroadcastBuildSide, JoinStrategyDecisionReason};
 pub use self::join_order::SoftMarginLadderStep;
 pub(crate) use self::runtime_evidence::OptimizerEvidenceStatusSnapshot;
 pub use self::runtime_evidence::{DurableEvidenceBinding, OptimizerRuntimeEvidence};
@@ -2036,18 +2036,6 @@ impl<'a> Binder<'a> {
 
 		let join_index = trace.join_decisions.len();
 		let replay_id = JoinReplayId(join_index as u32);
-		if matches!(
-			strategy_intent,
-			JoinStrategyIntent::Pinned {
-				strategy: JoinStrategy::Broadcast,
-				..
-			}
-		) && kind != JoinKind::Inner
-		{
-			return Err(BindingError::UnsupportedExpression {
-				message: "broadcast join is only supported for INNER joins".to_string(),
-			});
-		}
 		let left_probe_scan_linear = broadcast_probe_is_scan_linear(&left_plan.plan);
 		let right_probe_scan_linear = broadcast_probe_is_scan_linear(&right_plan.plan);
 		if let Some(render_trace) = render_trace.as_mut() {
@@ -2104,25 +2092,22 @@ impl<'a> Binder<'a> {
 				probe_scan_linear: right_probe_scan_linear,
 			},
 			self.config,
-		);
+		)?;
 		trace.join_decisions.push(DecisionReceipt {
 			target: JoinTraceTarget { join_index },
 			strategy: decision.strategy,
 			placement: decision.placement,
 			reason: decision.reason,
 		});
-		let force_demoted_sql_broadcast = matches!(
-			strategy_intent,
-			JoinStrategyIntent::Pinned {
-				strategy: JoinStrategy::Broadcast,
-				source: JoinStrategyPinSource::SqlHint,
-			}
-		) && self.config.force_hash_join_ids.contains(&replay_id)
-			&& decision.strategy == JoinStrategy::HashPartitioned;
-		if force_demoted_sql_broadcast {
-			left_plan.plan = strip_root_exchange(left_plan.plan);
-		}
-		if matches!(strategy_intent, JoinStrategyIntent::Auto) || force_demoted_sql_broadcast {
+		let binder_physicalizes_join = matches!(strategy_intent, JoinStrategyIntent::Auto)
+			|| matches!(
+				strategy_intent,
+				JoinStrategyIntent::Pinned {
+					strategy: JoinStrategy::Broadcast,
+					..
+				}
+			);
+		if binder_physicalizes_join {
 			match decision.strategy {
 				JoinStrategy::HashPartitioned => {
 					left_plan.plan = exchange_for_join_keys(

@@ -258,7 +258,6 @@ pub(crate) fn adr133_trace_types_are_crate_private_not_public() {
 		"pub(crate) struct DecisionReceipt",
 		"pub(crate) struct OptimizerTrace",
 		"pub(crate) enum JoinPhysicalPlacement",
-		"pub(crate) enum BroadcastBuildSide",
 		"pub(crate) enum JoinStrategyDecisionReason",
 		"pub(crate) enum HashByDefaultReason",
 	] {
@@ -273,7 +272,6 @@ pub(crate) fn adr133_trace_types_are_crate_private_not_public() {
 		"pub struct DecisionReceipt",
 		"pub struct OptimizerTrace",
 		"pub enum JoinPhysicalPlacement",
-		"pub enum BroadcastBuildSide",
 		"pub enum JoinStrategyDecisionReason",
 		"pub enum HashByDefaultReason",
 	] {
@@ -1277,11 +1275,14 @@ pub(crate) fn adr139_replay_mode_demotes_auto_and_sql_broadcasts_only() {
 	assert!(choose.contains("replay_id: JoinReplayId"));
 	assert!(choose.contains("force_hash_join_ids.contains(&replay_id)"));
 	assert!(choose.contains("JoinStrategyIntent::Auto if force_hash"));
-	assert!(choose.contains("source: JoinStrategyPinSource::SqlHint"));
+	assert!(choose.contains("source,"));
+	assert!(choose.contains("source == JoinStrategyPinSource::SqlHint"));
+	assert!(choose.contains("pinned_broadcast_placement(kind, build_side)?"));
 	assert!(choose.contains("HashAfterBroadcastCap"));
-	assert!(choose.contains("JoinStrategyIntent::Pinned { strategy, .. }"));
-	assert!(bind_scoped_join.contains("force_demoted_sql_broadcast"));
-	assert!(bind_scoped_join.contains("strip_root_exchange(left_plan.plan)"));
+	assert!(choose.contains("strategy: _,"));
+	assert!(bind_scoped_join.contains("binder_physicalizes_join"));
+	assert!(!bind_scoped_join.contains("force_demoted_sql_broadcast"));
+	assert!(!bind_scoped_join.contains("strip_root_exchange(left_plan.plan)"));
 	assert!(binder.contains("force_hash_join_ids_demotes_auto_and_sql_broadcast_only"));
 }
 
@@ -1290,8 +1291,8 @@ pub(crate) fn adr139_replay_mode_installs_hash_exchanges_for_demoted_pins() {
 	let binder = binder_source();
 	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
-	assert!(bind_scoped_join.contains("force_demoted_sql_broadcast"));
-	assert!(bind_scoped_join.contains("strip_root_exchange(left_plan.plan)"));
+	assert!(bind_scoped_join.contains("binder_physicalizes_join"));
+	assert!(bind_scoped_join.contains("JoinStrategy::HashPartitioned =>"));
 	assert!(bind_scoped_join.contains("exchange_for_join_keys("));
 	assert!(binder.contains("terminal_exchange(&left)"));
 	assert!(binder.contains("terminal_exchange(&right)"));
@@ -2337,9 +2338,7 @@ pub(crate) fn adr145_broadcast_hints_resolve_derived_aliases() {
 	let planner = planner_source();
 
 	assert!(binder.contains("sql_broadcast_hint_targets_derived_alias"));
-	assert!(
-		planner.contains("join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right, kind)")
-	);
+	assert!(planner.contains("join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right)?"));
 }
 
 #[test]

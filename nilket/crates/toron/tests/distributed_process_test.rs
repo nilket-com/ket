@@ -23,8 +23,8 @@ use toron::distributed::worker_registry::{
 	WorkerEntry, WorkerLease, WorkerRegistry, WorkerResourceState, WorkerStatus,
 };
 use toron::ir::{
-	AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, JoinStrategyIntent,
-	JoinStrategyPinSource, LogicalPlan, SortExpr, TableId,
+	AggregateFunction, BroadcastBuildSide, ExecutionPlan, Expr, JoinKind, JoinStrategy,
+	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, SortExpr, TableId,
 };
 use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
@@ -1598,6 +1598,7 @@ fn hash_join_plan_with_partitions_and_kind(partition_count: u32, kind: JoinKind)
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::HashPartitioned,
 			source: JoinStrategyPinSource::Direct,
+			build_side: None,
 		},
 	}
 }
@@ -1624,6 +1625,7 @@ fn broadcast_join_plan() -> LogicalPlan {
 		strategy_intent: JoinStrategyIntent::Pinned {
 			strategy: JoinStrategy::Broadcast,
 			source: JoinStrategyPinSource::Direct,
+			build_side: Some(BroadcastBuildSide::Left),
 		},
 	}
 }

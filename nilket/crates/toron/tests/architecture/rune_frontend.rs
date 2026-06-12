@@ -46,13 +46,6 @@ fn source_block(source: &str, marker: &str) -> String {
 		.1
 }
 
-fn broadcast_strategy_arm(builder: &str) -> &str {
-	builder
-		.split("JoinStrategy::Broadcast =>")
-		.nth(1)
-		.expect("missing Broadcast strategy arm")
-}
-
 fn registered_rune_function_names(module: &str) -> Vec<String> {
 	let mut names = Vec::new();
 	for line in module.lines() {
@@ -1732,12 +1725,14 @@ pub(crate) fn adr122_join_builder_is_pair_shaped_and_shared() {
 	assert!(builder.contains("LogicalPlan::Join"));
 	assert!(builder.contains("JoinStrategy::HashPartitioned"));
 	assert!(builder.contains("JoinStrategy::Broadcast"));
-	assert!(planner.contains("build_join_plan(plan, right, kind, on, strategy, source)?"));
+	assert!(
+		planner.contains("build_join_plan(plan, right, kind, on, strategy, source, build_side)?")
+	);
 	assert!(lower_exists.contains("build_join_plan("));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
-	assert!(
-		rune.contains("join_with_strategy(left, right, kind, on, JoinStrategy::HashPartitioned)")
-	);
+	assert!(rune.contains(
+		"join_with_strategy(left, right, kind, on, JoinStrategy::HashPartitioned, None)"
+	));
 	assert!(rune.contains("build_join_plan(") && rune.contains("JoinStrategyPinSource::Rune"));
 	assert!(!planner.contains("fn build_hash_join_plan"));
 }
@@ -1779,7 +1774,7 @@ pub(crate) fn adr122_join_builder_inserts_terminal_hash_exchanges() {
 }
 
 #[test]
-pub(crate) fn adr125_rune_exposes_single_broadcast_join_authoring_method() {
+pub(crate) fn adr125_rune_broadcast_authoring_stays_narrow_after_adr211() {
 	let rune = rune_engine_source();
 	let module = source_block(&rune, "pub fn create_toron_module");
 	let names = registered_rune_function_names(&module);
@@ -1791,6 +1786,14 @@ pub(crate) fn adr125_rune_exposes_single_broadcast_join_authoring_method() {
 	assert!(
 		names.iter().any(|name| name == "broadcast_join"),
 		"Rune module did not register broadcast_join: {names:?}"
+	);
+	assert!(
+		rune.contains("pub fn broadcast_build(self, side: String)"),
+		"RuneDataFrame missing ADR211 post-join broadcast_build surface"
+	);
+	assert!(
+		names.iter().any(|name| name == "broadcast_build"),
+		"Rune module did not register broadcast_build: {names:?}"
 	);
 	assert!(rune.contains("JoinStrategy::Broadcast"));
 	for method in [
@@ -1822,29 +1825,6 @@ pub(crate) fn adr125_strategy_aware_join_builder_is_single_helper() {
 	assert!(planner.contains("JoinStrategy::HashPartitioned"));
 	assert!(rune.contains("JoinStrategy::HashPartitioned"));
 	assert!(rune.contains("JoinStrategy::Broadcast"));
-}
-
-#[test]
-pub(crate) fn adr125_frontend_rejects_broadcast_non_inner() {
-	let planner = sql_planner_source();
-	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
-	let broadcast_arm = broadcast_strategy_arm(&builder);
-
-	assert!(broadcast_arm.contains("kind != JoinKind::Inner"));
-	assert!(broadcast_arm.contains("broadcast join is only supported for INNER joins"));
-}
-
-#[test]
-pub(crate) fn adr125_broadcast_authoring_builds_left_exchange_one_and_bare_right() {
-	let planner = sql_planner_source();
-	let builder = source_block(&planner, "pub(crate) fn build_join_plan");
-	let broadcast_arm = broadcast_strategy_arm(&builder);
-
-	assert_eq!(broadcast_arm.matches("LogicalPlan::Exchange").count(), 1);
-	assert!(broadcast_arm.contains("partition_count: 1"));
-	assert!(broadcast_arm.contains("key: left_keys"));
-	assert!(broadcast_arm.contains("right: Box::new(right)"));
-	assert!(!broadcast_arm.contains("DEFAULT_JOIN_PARTITION_COUNT"));
 }
 
 #[test]
@@ -1897,7 +1877,10 @@ pub(crate) fn adr128_sql_broadcast_hint_authoring_is_narrow() {
 	assert!(lower_select.contains("parse_broadcast_join_hint(optimizer_hints)?"));
 	assert!(lower_select.contains("join_strategy_intent_for_hint"));
 	assert!(lower_select.contains("build_auto_join_plan(plan, right, kind, on)"));
-	assert!(lower_select.contains("build_join_plan(plan, right, kind, on, strategy, source)?"));
+	assert!(
+		lower_select
+			.contains("build_join_plan(plan, right, kind, on, strategy, source, build_side)?")
+	);
 	assert!(planner.contains("JoinStrategy::Broadcast"));
 	assert!(lower_exists.contains("JoinStrategy::HashPartitioned"));
 	assert!(!lower_exists.contains("JoinStrategy::Broadcast"));
@@ -2063,7 +2046,9 @@ pub(crate) fn adr129_exchange_insertion_split_is_temporary() {
 	let build_auto_join_plan = source_block(&planner, "pub(crate) fn build_auto_join_plan");
 	let bind_scoped_join = source_block(&binder, "fn bind_scoped_join");
 
-	assert!(build_join_plan.contains("JoinStrategyIntent::Pinned { strategy, source }"));
+	assert!(build_join_plan.contains("JoinStrategyIntent::Pinned {"));
+	assert!(build_join_plan.contains("build_side: None"));
+	assert!(build_join_plan.contains("build_side: Some(build_side)"));
 	assert!(build_auto_join_plan.contains("JoinStrategyIntent::Auto"));
 	assert!(bind_scoped_join.contains("exchange_for_join_keys"));
 	assert!(bind_scoped_join.contains("JoinStrategy::HashPartitioned"));
@@ -2158,7 +2143,7 @@ pub(crate) fn adr130_right_build_is_binder_physical_rewrite_not_new_strategy() {
 
 	assert!(binder.contains("enum JoinPhysicalPlacement"));
 	assert!(binder.contains("SwappedRightBuild"));
-	assert!(binder.contains("enum BroadcastBuildSide"));
+	assert!(ir.contains("pub enum BroadcastBuildSide"));
 	assert!(bind_scoped_join.contains("std::mem::swap(&mut left_plan, &mut right_plan)"));
 	assert!(bind_scoped_join.contains("std::mem::swap(&mut left_keys, &mut right_keys)"));
 	assert!(
@@ -2206,9 +2191,8 @@ pub(crate) fn adr130_decision_helper_single_seam() {
 	assert!(!bind_scoped_join.contains("auto_broadcast_max_build_bytes"));
 	assert!(choose_join_strategy.contains("left_input: JoinInputOptimization"));
 	assert!(choose_join_strategy.contains("right_input: JoinInputOptimization"));
-	assert!(
-		choose_join_strategy.contains("choose_auto_join_strategy(kind, left_input, right_input")
-	);
+	assert!(choose_join_strategy.contains("choose_auto_join_strategy("));
+	assert!(choose_join_strategy.contains("kind,"));
 	assert!(choose_auto.contains("let left_build_candidate"));
 	assert!(choose_auto.contains("let right_build_candidate"));
 	assert!(choose_auto.contains("right_input.probe_scan_linear"));

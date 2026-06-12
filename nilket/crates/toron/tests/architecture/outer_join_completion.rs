@@ -207,19 +207,36 @@ pub(crate) fn adr209_swapped_sided_broadcast_uses_mirrored_physical_kind() {
 }
 
 #[test]
-pub(crate) fn adr209_author_pinned_non_inner_broadcast_remains_rejected() {
+pub(crate) fn adr211_binder_validates_author_pins_through_209_placement_table() {
 	let binder_root = binder_root_source();
 	let binder = binder_source();
 	let planner = planner_source();
 	let bind_scoped_join = source_block(&binder_root, "fn bind_scoped_join");
+	let placement = source_block(&binder, "fn pinned_broadcast_placement");
 	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
 
-	assert!(bind_scoped_join.contains("JoinStrategyIntent::Pinned"));
+	assert!(bind_scoped_join.contains("choose_join_strategy("));
+	assert!(bind_scoped_join.contains("binder_physicalizes_join"));
 	assert!(bind_scoped_join.contains("strategy: JoinStrategy::Broadcast"));
-	assert!(bind_scoped_join.contains("&& kind != JoinKind::Inner"));
-	assert!(bind_scoped_join.contains("broadcast join is only supported for INNER joins"));
-	assert!(build_join_plan.contains("kind != JoinKind::Inner"));
-	assert!(binder.contains("direct_non_inner_broadcast_pin_stays_rejected"));
+	assert!(!bind_scoped_join.contains("&& kind != JoinKind::Inner"));
+	assert!(!build_join_plan.contains("kind != JoinKind::Inner"));
+	assert!(placement.contains("broadcast_physical_placement(kind)"));
+	assert!(
+		placement.contains("(BroadcastPlacementRule::NaturalLeftBuild, BroadcastBuildSide::Left)")
+	);
+	assert!(
+		placement
+			.contains("(BroadcastPlacementRule::SwappedRightBuild, BroadcastBuildSide::Right)")
+	);
+	assert!(
+		placement.contains("(BroadcastPlacementRule::NaturalLeftBuild, BroadcastBuildSide::Right)")
+	);
+	assert!(
+		placement.contains("(BroadcastPlacementRule::SwappedRightBuild, BroadcastBuildSide::Left)")
+	);
+	assert!(placement.contains("BroadcastPlacementRule::Never"));
+	assert!(binder.contains("direct_pinned_non_inner_safe_side_binds"));
+	assert!(binder.contains("direct_pinned_non_inner_wrong_side_rejects"));
 }
 
 #[test]
@@ -470,6 +487,163 @@ pub(crate) fn adr210_no_recognizer_pushdown_strategy_executor_or_wire_widening()
 	assert!(
 		binder_source()
 			.contains("recognizers_still_decline_true_outer_join_after_non_demoting_filter")
+	);
+}
+
+#[test]
+pub(crate) fn adr211_pinned_broadcast_intent_carries_build_side() {
+	let ir = ir_source();
+	let planner = planner_source();
+	let binder = binder_source();
+	let join_intent = source_block(&ir, "pub enum JoinStrategyIntent");
+	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
+	let choose = source_block(&binder, "fn choose_join_strategy");
+
+	assert!(ir.contains("pub enum BroadcastBuildSide"));
+	assert!(ir.contains("Left"));
+	assert!(ir.contains("Right"));
+	assert!(join_intent.contains("build_side: Option<BroadcastBuildSide>"));
+	assert!(build_join_plan.contains("HashPartitioned if build_side.is_some()"));
+	assert!(build_join_plan.contains("build_side: None"));
+	assert!(build_join_plan.contains("let Some(build_side) = build_side"));
+	assert!(build_join_plan.contains("build_side: Some(build_side)"));
+	assert!(choose.contains("build_side,"));
+	assert!(choose.contains("build_side.ok_or_else"));
+	assert!(choose.contains("pinned_broadcast_placement(kind, build_side)?"));
+}
+
+#[test]
+pub(crate) fn adr211_frontends_do_not_preshape_pinned_broadcast() {
+	let planner = planner_source();
+	let binder_root = binder_root_source();
+	let build_join_plan = source_block(&planner, "pub(crate) fn build_join_plan");
+	let broadcast_arm = build_join_plan
+		.split("JoinStrategy::Broadcast =>")
+		.nth(1)
+		.expect("Broadcast arm");
+	let bind_scoped_join = source_block(&binder_root, "fn bind_scoped_join");
+
+	assert!(!broadcast_arm.contains("LogicalPlan::Exchange"));
+	assert!(!broadcast_arm.contains("partition_count: 1"));
+	assert!(broadcast_arm.contains("LogicalPlan::Join"));
+	assert!(bind_scoped_join.contains("binder_physicalizes_join"));
+	assert!(bind_scoped_join.contains("JoinStrategyIntent::Auto"));
+	assert!(bind_scoped_join.contains("strategy: JoinStrategy::Broadcast"));
+	assert!(bind_scoped_join.contains("exchange_for_join_keys"));
+	assert!(!bind_scoped_join.contains("force_demoted_sql_broadcast"));
+	assert!(!bind_scoped_join.contains("strip_root_exchange"));
+}
+
+#[test]
+pub(crate) fn adr211_sql_hint_resolves_immediate_safe_side() {
+	let planner = planner_source();
+	let binder = binder_source();
+	let hint = source_block(&planner, "fn join_strategy_intent_for_hint");
+	let lower_select = source_block(&planner, "fn lower_select");
+
+	assert!(!hint.contains("kind: JoinKind"));
+	assert!(hint.contains("plan_qualifiers(left)"));
+	assert!(hint.contains("plan_qualifiers(right)"));
+	assert!(hint.contains("left_matches + right_matches > 1"));
+	assert!(hint.contains("composite left join input"));
+	assert!(hint.contains("composite right join input"));
+	assert!(hint.contains("build_side: Some(BroadcastBuildSide::Left)"));
+	assert!(hint.contains("build_side: Some(BroadcastBuildSide::Right)"));
+	assert!(
+		lower_select.contains("join_strategy_intent_for_hint(&mut broadcast_hint, &plan, &right)?")
+	);
+	assert!(binder.contains(
+		"sql_left_outer_broadcast_hint_on_null_supplied_side_binds_preserved_probe_broadcast"
+	));
+	assert!(binder.contains(
+		"sql_right_outer_broadcast_hint_on_null_supplied_side_binds_preserved_probe_broadcast"
+	));
+}
+
+#[test]
+pub(crate) fn adr211_preserved_side_and_full_outer_pins_reject_loudly() {
+	let binder = binder_source();
+	let placement = source_block(&binder, "fn pinned_broadcast_placement");
+	let unsupported = source_block(&binder, "fn unsupported_pinned_broadcast_side");
+
+	assert!(placement.contains("BroadcastPlacementRule::Never"));
+	assert!(placement.contains("FullOuter requires demotion before broadcast can be pinned"));
+	assert!(unsupported.contains("target the null-supplied side or drop the hint"));
+	assert!(binder.contains("sql_full_outer_broadcast_hint_rejects_without_demotion"));
+	assert!(binder.contains(
+		"sql_full_outer_broadcast_hint_is_honored_after_both_sides_null_rejecting_demote"
+	));
+	assert!(binder.contains("direct_pinned_non_inner_wrong_side_rejects"));
+}
+
+#[test]
+pub(crate) fn adr211_rune_post_join_pin_shares_sql_admission_path() {
+	let rune = rune_source();
+	let binder = binder_source();
+	let module = source_block(&rune, "pub fn create_toron_module");
+	let pin = source_block(&rune, "fn pin_broadcast_build");
+
+	assert!(rune.contains("pub fn broadcast_build(self, side: String)"));
+	assert!(rune.contains("fn parse_broadcast_build_side"));
+	assert!(module.contains("associated_function(\"broadcast_build\""));
+	assert!(pin.contains("LogicalPlan::Join"));
+	assert!(pin.contains("JoinStrategyIntent::Auto"));
+	assert!(pin.contains("strategy: JoinStrategy::Broadcast"));
+	assert!(pin.contains("source: JoinStrategyPinSource::Rune"));
+	assert!(pin.contains("build_side: Some(build_side)"));
+	assert!(
+		binder.contains("rune_post_join_broadcast_pin_matches_sql_hint_and_rejects_preserved_side")
+	);
+}
+
+#[test]
+pub(crate) fn adr211_no_fragmenter_executor_wire_runtime_filter_or_recognizer_widening() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"BroadcastBuildSide",
+		"pinned_broadcast_placement",
+		"unsupported_pinned_broadcast_side",
+		"pub fn broadcast_build",
+		"associated_function(\"broadcast_build\"",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/ir/execution.rs"),
+		manifest_dir.join("src/distributed"),
+		manifest_dir.join("src/server"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+		manifest_dir.join("src/binder/join_order.rs"),
+		manifest_dir.join("src/binder/selectivity.rs"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+	offenders.extend(
+		source_lines(&wendelon_manifest_dir().join("src"))
+			.into_iter()
+			.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+	);
+
+	assert!(
+		offenders.is_empty(),
+		"ADR211 broadcast authoring leaked into execution/wire/recognizer/Wendelon source:\n{}",
+		format_offenders(&manifest_dir, &offenders)
 	);
 }
 
