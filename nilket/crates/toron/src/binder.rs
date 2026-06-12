@@ -216,9 +216,9 @@ async fn bind_with_explain_trace(
 	let mut trace = OptimizerTrace::default();
 	let mut render_trace = Some(OptimizerExplainRenderTrace::default());
 	let binder = Binder::new(catalog, config);
-	// ADR 191: capture the bind-entry effective step before the binder is consumed so observed
+	// ADR 208: capture the bind-entry tree step before the binder is consumed so observed
 	// star/snowflake receipts render on the same margin that actuation used earlier in this bind.
-	let join_order_soft_margin_step = binder.join_order_soft_margin_step;
+	let tree_join_order_soft_margin_step = binder.tree_join_order_soft_margin_step;
 	let plan = binder
 		.bind_plan_with_trace(
 			plan,
@@ -234,13 +234,14 @@ async fn bind_with_explain_trace(
 		if let Some(snowflake_order) = analyze_snowflake(
 			&render_trace.join_order_edges,
 			&trace.join_decisions,
-			join_order_soft_margin_step,
+			tree_join_order_soft_margin_step,
 		) {
 			render_trace.set_observed_snowflake(snowflake_order);
 		} else if matches!(render_trace.join_order, JoinOrderRenderState::None) {
-			if let Some(outcome) =
-				analyze(&render_trace.join_order_edges, join_order_soft_margin_step)
-			{
+			if let Some(outcome) = analyze(
+				&render_trace.join_order_edges,
+				tree_join_order_soft_margin_step,
+			) {
 				let edge_targets = render_trace
 					.join_order_edges
 					.iter()
@@ -376,10 +377,12 @@ fn star_order_probe_label(outcome: &StarOrderOutcome) -> String {
 struct Binder<'a> {
 	catalog: &'a dyn Catalog,
 	config: &'a PlannerConfig,
-	// ADR 191: the effective soft-margin step resolved once at bind entry from `config`. Every
-	// join-order decision point in this bind (star actuation, observed star/snowflake receipts)
-	// reads this single value rather than re-snapshotting the shared decision log mid-bind.
-	join_order_soft_margin_step: SoftMarginLadderStep,
+	// ADR 208: the tree soft-margin step resolved once at bind entry from tree-scoped evidence.
+	// Star/snowflake paths read this field rather than re-snapshotting runtime evidence mid-bind.
+	tree_join_order_soft_margin_step: SoftMarginLadderStep,
+	// ADR 208: graph actuation is not advisory-tunable yet. Its soft-margin gate reads the
+	// configured base step under both Manual and ApplyAdvisory until a graph-family advisory lands.
+	graph_join_order_soft_margin_step: SoftMarginLadderStep,
 	// The sink for optimizer decisions. Normally the shared `config.decision_log`; a scratch recognition
 	// bind / declined-actuation re-bind carries a zero-size `NoOpDecisionRecorder` instead, so it cannot
 	// pollute the shared log — a structural fact, not a runtime flag.
@@ -391,7 +394,8 @@ impl<'a> Binder<'a> {
 		Self {
 			catalog,
 			config,
-			join_order_soft_margin_step: effective_join_order_soft_margin_step(config),
+			tree_join_order_soft_margin_step: effective_tree_join_order_soft_margin_step(config),
+			graph_join_order_soft_margin_step: graph_join_order_soft_margin_step(config),
 			decision_recorder: config.decision_log.as_ref(),
 		}
 	}
@@ -402,7 +406,8 @@ impl<'a> Binder<'a> {
 		Binder {
 			catalog: self.catalog,
 			config: self.config,
-			join_order_soft_margin_step: self.join_order_soft_margin_step,
+			tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step,
+			graph_join_order_soft_margin_step: self.graph_join_order_soft_margin_step,
 			decision_recorder: &NoOpDecisionRecorder,
 		}
 	}

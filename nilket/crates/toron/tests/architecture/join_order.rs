@@ -2187,7 +2187,7 @@ pub(crate) fn adr205_chain_actuation_reuses_unified_gating() {
 	// 190/191 soft margin + no-op-recorder scratch + decision accrual are reused — no new actuator.
 	assert!(actuation.contains("shape.reroot("));
 	assert!(!actuation.contains("reroot_galaxy_join_tree(plan"));
-	assert!(actuation.contains("join_order_soft_margin_step.margin()"));
+	assert!(actuation.contains("graph_join_order_soft_margin_step.margin()"));
 	assert!(actuation.contains("without_decision_recording"));
 	assert!(binder.contains("accrue_graph_order_decision"));
 	assert!(binder.contains("GraphShape::Chain"));
@@ -2361,7 +2361,7 @@ pub(crate) fn adr200_unified_actuator_respects_soft_margin() {
 	// Re-root only on a clear win: action must be `Reordered` and the preferred cost must beat the
 	// declared cost by the soft margin (else `KeptThinMargin`).
 	assert!(actuation.contains("StarOrderAction::Reordered"));
-	assert!(actuation.contains("join_order_soft_margin_step.margin()"));
+	assert!(actuation.contains("graph_join_order_soft_margin_step.margin()"));
 	assert!(actuation.contains("saturating_mul(margin.denominator)"));
 	assert!(actuation.contains("GraphActuationResult::KeptThinMargin"));
 }

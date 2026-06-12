@@ -173,39 +173,79 @@ pub(crate) fn margin_recommendation_label(recommendation: MarginRecommendation) 
 	}
 }
 
-// ADR 191: the single opt-in derivation of the effective soft-margin step. `Manual` returns the
+pub(crate) fn is_tree_margin_advisory_kind(kind: OptimizerDecisionKind) -> bool {
+	match kind {
+		OptimizerDecisionKind::StarCandidate
+		| OptimizerDecisionKind::FlatStar
+		| OptimizerDecisionKind::SnowflakeRoot
+		| OptimizerDecisionKind::SnowflakeBranch => true,
+		OptimizerDecisionKind::GalaxyRoot
+		| OptimizerDecisionKind::BridgeRoot
+		| OptimizerDecisionKind::BridgeChainRoot
+		| OptimizerDecisionKind::Overflow => false,
+	}
+}
+
+struct TreeMarginAdvisoryInput {
+	rows: Vec<OptimizerRuntimeVerdictRow>,
+	excluded_sample_size: u64,
+}
+
+fn tree_margin_advisory_input(snapshot: &[OptimizerRuntimeVerdictRow]) -> TreeMarginAdvisoryInput {
+	let mut rows = Vec::new();
+	let mut excluded_sample_size = 0_u64;
+	for row in snapshot {
+		if is_tree_margin_advisory_kind(row.kind) {
+			rows.push(row.clone());
+		} else if matches!(
+			row.verdict,
+			OptimizerRuntimeVerdictClass::MissedWin
+				| OptimizerRuntimeVerdictClass::OverEager
+				| OptimizerRuntimeVerdictClass::Vindicated
+		) {
+			excluded_sample_size = excluded_sample_size.saturating_add(row.count);
+		}
+	}
+	TreeMarginAdvisoryInput {
+		rows,
+		excluded_sample_size,
+	}
+}
+
+// ADR 208: the tree-only opt-in derivation of the effective soft-margin step. `Manual` returns the
 // ADR 190 configured base unchanged; `ApplyAdvisory` returns exactly the ADR 189 advisory's
-// `recommended_step` (bounded to one ladder rung from the base). Resolved once at bind entry, never
-// inside low-level star/snowflake helpers, and never mutating config or the decision log.
-pub(crate) fn effective_join_order_soft_margin_step(
+// `recommended_step` from tree-scoped evidence. Resolved once at bind entry, never inside low-level
+// star/snowflake helpers, and never mutating config or runtime evidence.
+pub(crate) fn effective_tree_join_order_soft_margin_step(
 	config: &PlannerConfig,
 ) -> SoftMarginLadderStep {
 	match config.join_order_soft_margin_application {
 		JoinOrderSoftMarginApplication::Manual => config.join_order_soft_margin_step,
 		JoinOrderSoftMarginApplication::ApplyAdvisory => {
-			recommend_soft_margin(
-				&config.runtime_evidence.verdict_snapshot(),
-				config.join_order_soft_margin_step,
-			)
-			.recommended_step
+			let input = tree_margin_advisory_input(&config.runtime_evidence.verdict_snapshot());
+			recommend_soft_margin(&input.rows, config.join_order_soft_margin_step).recommended_step
 		}
 	}
 }
 
-// ADR 191: report view that keeps the configured base, the ADR 189 recommendation from that base,
-// the application mode, and the applied step together so the advisory table never recomputes from
-// an already-applied margin (the Baseline -> Loose -> Loosest double-step trap).
+pub(crate) fn graph_join_order_soft_margin_step(config: &PlannerConfig) -> SoftMarginLadderStep {
+	config.join_order_soft_margin_step
+}
+
+// ADR 208: report view that keeps the configured base, the tree-scoped ADR 189 recommendation from that
+// base, the application mode, and the tree-applied step together so the advisory table never recomputes
+// from an already-applied margin (the Baseline -> Loose -> Loosest double-step trap).
 pub(crate) struct MarginAdvisoryReport {
 	pub(crate) advisory: MarginAdvisory,
 	pub(crate) application: JoinOrderSoftMarginApplication,
 	pub(crate) applied_step: SoftMarginLadderStep,
+	pub(crate) evidence_scope: &'static str,
+	pub(crate) excluded_sample_size: u64,
 }
 
 pub(crate) fn margin_advisory_report(config: &PlannerConfig) -> MarginAdvisoryReport {
-	let advisory = recommend_soft_margin(
-		&config.runtime_evidence.verdict_snapshot(),
-		config.join_order_soft_margin_step,
-	);
+	let input = tree_margin_advisory_input(&config.runtime_evidence.verdict_snapshot());
+	let advisory = recommend_soft_margin(&input.rows, config.join_order_soft_margin_step);
 	let applied_step = match config.join_order_soft_margin_application {
 		JoinOrderSoftMarginApplication::Manual => config.join_order_soft_margin_step,
 		JoinOrderSoftMarginApplication::ApplyAdvisory => advisory.recommended_step,
@@ -214,6 +254,8 @@ pub(crate) fn margin_advisory_report(config: &PlannerConfig) -> MarginAdvisoryRe
 		advisory,
 		application: config.join_order_soft_margin_application,
 		applied_step,
+		evidence_scope: "tree_join_order",
+		excluded_sample_size: input.excluded_sample_size,
 	}
 }
 
@@ -2493,7 +2535,7 @@ impl<'a> Binder<'a> {
 				OptimizerDecisionDeclineReason::MissingEstimate,
 			));
 		};
-		let margin = self.join_order_soft_margin_step.margin();
+		let margin = self.graph_join_order_soft_margin_step.margin();
 		if preferred_cost.saturating_mul(margin.denominator)
 			> declared_cost.saturating_mul(margin.numerator)
 		{
@@ -3067,7 +3109,7 @@ impl<'a> Binder<'a> {
 			StarOrderStrategy::Broadcast,
 			Vec::new(),
 			confidence,
-			self.join_order_soft_margin_step.margin(),
+			self.tree_join_order_soft_margin_step.margin(),
 		);
 		let StarOrderOutcome::Recognized(evidence) = &recognized else {
 			unreachable!("recognized_star_order_outcome always recognizes");
@@ -3220,7 +3262,7 @@ impl<'a> Binder<'a> {
 			selected_strategy,
 			edge_strategies,
 			confidence,
-			self.join_order_soft_margin_step.margin(),
+			self.tree_join_order_soft_margin_step.margin(),
 		);
 		let edge_targets = render_trace
 			.as_ref()

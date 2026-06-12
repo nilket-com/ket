@@ -10387,8 +10387,8 @@ async fn operator_margin_changes_bound_plan() {
 	);
 }
 
-// ADR 191: an opt-in ApplyAdvisory config seeded with verdicts that drive the ADR 189 advisory.
-// `Manual` ignores the verdicts (base step is effective); `ApplyAdvisory` resolves the effective
+// ADR 208: an opt-in ApplyAdvisory config seeded with verdicts that drive the tree-scoped ADR 189
+// advisory. `Manual` ignores the verdicts (base step is effective); `ApplyAdvisory` resolves the tree
 // step from `recommend_soft_margin(...).recommended_step` once at bind entry.
 fn auto_applied_margin_config(
 	base_step: SoftMarginLadderStep,
@@ -10540,6 +10540,8 @@ async fn advisory_report_does_not_double_step_auto_application() {
 	assert_eq!(margin_advisory_utf8(&rows[0], 2), "loosen");
 	assert_eq!(margin_advisory_utf8(&rows[0], 9), "apply_advisory");
 	assert_eq!(margin_advisory_utf8(&rows[0], 10), "9/10");
+	assert_eq!(margin_advisory_utf8(&rows[0], 11), "tree_join_order");
+	assert_eq!(margin_advisory_i64(&rows[0], 12), 0);
 }
 
 #[test]
@@ -10555,7 +10557,7 @@ fn auto_application_insufficient_evidence_uses_configured_margin() {
 		)],
 	);
 	assert_eq!(
-		effective_join_order_soft_margin_step(&config),
+		effective_tree_join_order_soft_margin_step(&config),
 		SoftMarginLadderStep::Baseline
 	);
 	let report = margin_advisory_report(&config);
@@ -10585,7 +10587,7 @@ fn auto_application_hysteresis_keep_uses_configured_margin() {
 		],
 	);
 	assert_eq!(
-		effective_join_order_soft_margin_step(&config),
+		effective_tree_join_order_soft_margin_step(&config),
 		SoftMarginLadderStep::Baseline
 	);
 	assert_eq!(
@@ -10606,7 +10608,7 @@ fn auto_application_tightens_on_overeager() {
 		)],
 	);
 	assert_eq!(
-		effective_join_order_soft_margin_step(&config),
+		effective_tree_join_order_soft_margin_step(&config),
 		SoftMarginLadderStep::Tight
 	);
 	assert_eq!(
@@ -10630,7 +10632,7 @@ fn auto_application_is_bounded_to_one_step() {
 		)],
 	);
 	assert_eq!(
-		effective_join_order_soft_margin_step(&loosen),
+		effective_tree_join_order_soft_margin_step(&loosen),
 		SoftMarginLadderStep::Loose
 	);
 	let tighten = auto_applied_margin_config(
@@ -10642,9 +10644,116 @@ fn auto_application_is_bounded_to_one_step() {
 		)],
 	);
 	assert_eq!(
-		effective_join_order_soft_margin_step(&tighten),
+		effective_tree_join_order_soft_margin_step(&tighten),
 		SoftMarginLadderStep::Tight
 	);
+}
+
+#[test]
+fn tree_margin_advisory_scope_accepts_only_tree_kinds() {
+	assert!(is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::StarCandidate
+	));
+	assert!(is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::FlatStar
+	));
+	assert!(is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::SnowflakeRoot
+	));
+	assert!(is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::SnowflakeBranch
+	));
+	assert!(!is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::GalaxyRoot
+	));
+	assert!(!is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::BridgeRoot
+	));
+	assert!(!is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::BridgeChainRoot
+	));
+	assert!(!is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::Overflow
+	));
+}
+
+#[test]
+fn tree_verdicts_still_drive_soft_margin_advisory() {
+	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+
+	assert_eq!(
+		effective_tree_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Loose
+	);
+	assert_eq!(
+		margin_advisory_report(&config).advisory.recommendation,
+		MarginRecommendation::Loosen
+	);
+}
+
+#[test]
+fn graph_or_chain_verdicts_do_not_drive_soft_margin_advisory() {
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[
+			(
+				OptimizerDecisionKind::GalaxyRoot,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			),
+			(
+				OptimizerDecisionKind::BridgeChainRoot,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			),
+		],
+	);
+
+	assert_eq!(
+		effective_tree_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Baseline
+	);
+	let report = margin_advisory_report(&config);
+	assert_eq!(
+		report.advisory.recommendation,
+		MarginRecommendation::InsufficientEvidence
+	);
+	assert_eq!(report.advisory.sample_size, 0);
+	assert_eq!(
+		report.excluded_sample_size,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE.saturating_mul(2)
+	);
+}
+
+#[tokio::test]
+async fn apply_advisory_does_not_steer_graph_actuation() {
+	let catalog = margin_boundary_galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&format!("EXPLAIN {}", galaxy_conformed_order_sql()))
+		.expect("plan margin-boundary galaxy EXPLAIN");
+	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+
+	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &config).await;
+	let galaxy_row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("galaxy row");
+
+	assert_eq!(
+		effective_tree_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Loose
+	);
+	assert_eq!(
+		galaxy_row[2],
+		ScalarValue::Utf8(Some("observed".to_string()))
+	);
+	assert_utf8_contains(&galaxy_row[3], "declared_root=sales");
+	assert_utf8_contains(&galaxy_row[3], "preferred_root=returns");
+	assert_utf8_contains(&galaxy_row[3], "action=reordered");
+	assert_utf8_contains(&galaxy_row[3], "costs=[returns:85000,sales:100000]");
+	if let ScalarValue::Utf8(Some(detail)) = &galaxy_row[3] {
+		assert!(!detail.contains("applied_root="));
+	}
 }
 
 #[test]
@@ -10653,7 +10762,7 @@ fn auto_application_does_not_mutate_config_or_log() {
 	// unchanged and the verdict snapshot is identical before and after.
 	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
 	let before = config.runtime_evidence.verdict_snapshot();
-	let _ = effective_join_order_soft_margin_step(&config);
+	let _ = effective_tree_join_order_soft_margin_step(&config);
 	let _ = margin_advisory_report(&config);
 	assert_eq!(
 		config.join_order_soft_margin_step,
@@ -11572,6 +11681,8 @@ async fn margin_advisory_report_projects_like_information_schema() {
 			"recommendation".to_string(),
 			"recommended_margin".to_string(),
 			"sample_size".to_string(),
+			"evidence_scope".to_string(),
+			"excluded_sample_size".to_string(),
 		]),
 	};
 	let plan = bind(&report, &catalog, &config)
@@ -11587,7 +11698,13 @@ async fn margin_advisory_report_projects_like_information_schema() {
 	);
 	assert_eq!(
 		field_names(&schema),
-		vec!["recommendation", "recommended_margin", "sample_size"]
+		vec![
+			"recommendation",
+			"recommended_margin",
+			"sample_size",
+			"evidence_scope",
+			"excluded_sample_size"
+		]
 	);
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0][0], ScalarValue::Utf8(Some("loosen".to_string())));
@@ -11598,6 +11715,52 @@ async fn margin_advisory_report_projects_like_information_schema() {
 			i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
 		))
 	);
+	assert_eq!(
+		rows[0][3],
+		ScalarValue::Utf8(Some("tree_join_order".to_string()))
+	);
+	assert_eq!(rows[0][4], ScalarValue::Int64(Some(0)));
+}
+
+#[tokio::test]
+async fn optimizer_margin_advisory_reports_scope_and_exclusions() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		7,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictClass::OverEager,
+		5,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeChainRoot,
+		OptimizerRuntimeVerdictClass::MisRanked,
+		13,
+	);
+
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+
+	assert_eq!(rows.len(), 1);
+	assert_eq!(margin_advisory_utf8(&rows[0], 2), "loosen");
+	assert_eq!(
+		margin_advisory_i64(&rows[0], 8),
+		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
+	);
+	assert_eq!(margin_advisory_utf8(&rows[0], 11), "tree_join_order");
+	assert_eq!(margin_advisory_i64(&rows[0], 12), 12);
 }
 
 #[tokio::test]
@@ -14392,6 +14555,18 @@ fn galaxy_join_order_catalog() -> MockCatalog {
 		"returns",
 		Some(8_192),
 		Some(5_000),
+		vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
+	);
+	catalog
+}
+
+fn margin_boundary_galaxy_join_order_catalog() -> MockCatalog {
+	let mut catalog = galaxy_join_order_catalog();
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"returns",
+		Some(8_192),
+		Some(85_000),
 		vec![(ColumnOrdinal(1), DistinctCountFact::Exact(100))],
 	);
 	catalog

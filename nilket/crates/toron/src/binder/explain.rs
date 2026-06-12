@@ -372,12 +372,14 @@ pub(super) fn information_schema_optimizer_margin_advisory_schema() -> SchemaRef
 		Field::new("mis_ranked", DataType::Int64, false),
 		Field::new("indeterminate", DataType::Int64, false),
 		Field::new("sample_size", DataType::Int64, false),
-		// ADR 191: appended at the tail so existing column indexes stay stable. `application_mode`
-		// reports Manual vs ApplyAdvisory; `applied_margin` is the effective step actually used by
-		// this bind. `current_margin`/`recommended_margin` keep their ADR 189/190 meaning (the
-		// configured base and the recommendation from that base) so the report never double-steps.
+		// ADR 191/208: appended at the tail so existing column indexes stay stable.
+		// `application_mode` reports Manual vs ApplyAdvisory; `applied_margin` is the tree advisory
+		// step. `current_margin`/`recommended_margin` keep their ADR 189/190 meaning (the configured
+		// base and the recommendation from that base) so the report never double-steps.
 		Field::new("application_mode", DataType::Utf8, false),
 		Field::new("applied_margin", DataType::Utf8, false),
+		Field::new("evidence_scope", DataType::Utf8, false),
+		Field::new("excluded_sample_size", DataType::Int64, false),
 	]))
 }
 
@@ -419,6 +421,11 @@ pub(super) fn information_schema_optimizer_margin_advisory_rows(
 			join_order_soft_margin_application_label(report.application).to_string(),
 		)),
 		ScalarValue::Utf8(Some(report.applied_step.margin().label())),
+		ScalarValue::Utf8(Some(report.evidence_scope.to_string())),
+		ScalarValue::Int64(Some(u64_to_i64(
+			report.excluded_sample_size,
+			"optimizer margin advisory excluded_sample_size",
+		)?)),
 	]])
 }
 
