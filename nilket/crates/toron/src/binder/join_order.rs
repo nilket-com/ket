@@ -186,30 +186,103 @@ pub(crate) fn is_tree_margin_advisory_kind(kind: OptimizerDecisionKind) -> bool 
 	}
 }
 
-struct TreeMarginAdvisoryInput {
+pub(crate) fn is_graph_margin_advisory_kind(kind: OptimizerDecisionKind) -> bool {
+	match kind {
+		OptimizerDecisionKind::GalaxyRoot
+		| OptimizerDecisionKind::BridgeRoot
+		| OptimizerDecisionKind::BridgeChainRoot => true,
+		OptimizerDecisionKind::StarCandidate
+		| OptimizerDecisionKind::FlatStar
+		| OptimizerDecisionKind::SnowflakeRoot
+		| OptimizerDecisionKind::SnowflakeBranch
+		| OptimizerDecisionKind::Overflow => false,
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarginAdvisoryRowKind {
+	KnobAdvisory,
+	KindDetail,
+}
+
+pub(crate) fn margin_advisory_row_kind_label(kind: MarginAdvisoryRowKind) -> &'static str {
+	match kind {
+		MarginAdvisoryRowKind::KnobAdvisory => "knob_advisory",
+		MarginAdvisoryRowKind::KindDetail => "kind_detail",
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarginAdvisoryScope {
+	TreeFamily,
+	GraphFamily,
+	GraphKind(OptimizerDecisionKind),
+}
+
+impl MarginAdvisoryScope {
+	fn label(self) -> &'static str {
+		match self {
+			Self::TreeFamily => "tree_join_order",
+			Self::GraphFamily => "graph_join_order",
+			Self::GraphKind(kind) => optimizer_decision_kind_label(kind),
+		}
+	}
+
+	fn row_kind(self) -> MarginAdvisoryRowKind {
+		match self {
+			Self::TreeFamily | Self::GraphFamily => MarginAdvisoryRowKind::KnobAdvisory,
+			Self::GraphKind(_) => MarginAdvisoryRowKind::KindDetail,
+		}
+	}
+
+	fn includes(self, kind: OptimizerDecisionKind) -> bool {
+		match self {
+			Self::TreeFamily => is_tree_margin_advisory_kind(kind),
+			Self::GraphFamily => is_graph_margin_advisory_kind(kind),
+			Self::GraphKind(scope_kind) => kind == scope_kind,
+		}
+	}
+
+	fn is_actionable_tree_knob(self) -> bool {
+		matches!(self, Self::TreeFamily)
+	}
+}
+
+struct MarginAdvisoryInput {
 	rows: Vec<OptimizerRuntimeVerdictRow>,
 	excluded_sample_size: u64,
 }
 
-fn tree_margin_advisory_input(snapshot: &[OptimizerRuntimeVerdictRow]) -> TreeMarginAdvisoryInput {
+fn is_margin_advisory_sampled_verdict(verdict: OptimizerRuntimeVerdictClass) -> bool {
+	matches!(
+		verdict,
+		OptimizerRuntimeVerdictClass::MissedWin
+			| OptimizerRuntimeVerdictClass::OverEager
+			| OptimizerRuntimeVerdictClass::Vindicated
+	)
+}
+
+fn margin_advisory_input(
+	snapshot: &[OptimizerRuntimeVerdictRow],
+	scope: MarginAdvisoryScope,
+) -> MarginAdvisoryInput {
 	let mut rows = Vec::new();
 	let mut excluded_sample_size = 0_u64;
 	for row in snapshot {
-		if is_tree_margin_advisory_kind(row.kind) {
+		if scope.includes(row.kind) {
 			rows.push(row.clone());
-		} else if matches!(
-			row.verdict,
-			OptimizerRuntimeVerdictClass::MissedWin
-				| OptimizerRuntimeVerdictClass::OverEager
-				| OptimizerRuntimeVerdictClass::Vindicated
-		) {
+		} else if is_margin_advisory_sampled_verdict(row.verdict) {
 			excluded_sample_size = excluded_sample_size.saturating_add(row.count);
 		}
 	}
-	TreeMarginAdvisoryInput {
+	MarginAdvisoryInput {
 		rows,
 		excluded_sample_size,
 	}
+}
+
+fn tree_margin_advisory_input(snapshot: &[OptimizerRuntimeVerdictRow]) -> MarginAdvisoryInput {
+	margin_advisory_input(snapshot, MarginAdvisoryScope::TreeFamily)
 }
 
 // ADR 208: the tree-only opt-in derivation of the effective soft-margin step. `Manual` returns the
@@ -241,22 +314,59 @@ pub(crate) struct MarginAdvisoryReport {
 	pub(crate) applied_step: SoftMarginLadderStep,
 	pub(crate) evidence_scope: &'static str,
 	pub(crate) excluded_sample_size: u64,
+	pub(crate) row_kind: MarginAdvisoryRowKind,
 }
 
-pub(crate) fn margin_advisory_report(config: &PlannerConfig) -> MarginAdvisoryReport {
-	let input = tree_margin_advisory_input(&config.runtime_evidence.verdict_snapshot());
-	let advisory = recommend_soft_margin(&input.rows, config.join_order_soft_margin_step);
-	let applied_step = match config.join_order_soft_margin_application {
-		JoinOrderSoftMarginApplication::Manual => config.join_order_soft_margin_step,
+fn margin_advisory_report_for_scope(
+	snapshot: &[OptimizerRuntimeVerdictRow],
+	config: &PlannerConfig,
+	scope: MarginAdvisoryScope,
+) -> MarginAdvisoryReport {
+	let input = margin_advisory_input(snapshot, scope);
+	let current_step = match scope {
+		MarginAdvisoryScope::TreeFamily => config.join_order_soft_margin_step,
+		MarginAdvisoryScope::GraphFamily | MarginAdvisoryScope::GraphKind(_) => {
+			graph_join_order_soft_margin_step(config)
+		}
+	};
+	let advisory = recommend_soft_margin(&input.rows, current_step);
+	let application = if scope.is_actionable_tree_knob() {
+		config.join_order_soft_margin_application
+	} else {
+		JoinOrderSoftMarginApplication::Manual
+	};
+	let applied_step = match application {
+		JoinOrderSoftMarginApplication::Manual => current_step,
 		JoinOrderSoftMarginApplication::ApplyAdvisory => advisory.recommended_step,
 	};
 	MarginAdvisoryReport {
 		advisory,
-		application: config.join_order_soft_margin_application,
+		application,
 		applied_step,
-		evidence_scope: "tree_join_order",
+		evidence_scope: scope.label(),
 		excluded_sample_size: input.excluded_sample_size,
+		row_kind: scope.row_kind(),
 	}
+}
+
+#[cfg(test)]
+pub(crate) fn margin_advisory_report(config: &PlannerConfig) -> MarginAdvisoryReport {
+	let snapshot = config.runtime_evidence.verdict_snapshot();
+	margin_advisory_report_for_scope(&snapshot, config, MarginAdvisoryScope::TreeFamily)
+}
+
+pub(crate) fn margin_advisory_report_rows(config: &PlannerConfig) -> Vec<MarginAdvisoryReport> {
+	let snapshot = config.runtime_evidence.verdict_snapshot();
+	[
+		MarginAdvisoryScope::TreeFamily,
+		MarginAdvisoryScope::GraphFamily,
+		MarginAdvisoryScope::GraphKind(OptimizerDecisionKind::GalaxyRoot),
+		MarginAdvisoryScope::GraphKind(OptimizerDecisionKind::BridgeRoot),
+		MarginAdvisoryScope::GraphKind(OptimizerDecisionKind::BridgeChainRoot),
+	]
+	.into_iter()
+	.map(|scope| margin_advisory_report_for_scope(&snapshot, config, scope))
+	.collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

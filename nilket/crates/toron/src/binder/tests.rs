@@ -12086,14 +12086,75 @@ async fn advisory_report_does_not_double_step_auto_application() {
 	let catalog = star_join_order_catalog();
 	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
 	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
-	assert_eq!(rows.len(), 1);
-	assert_eq!(margin_advisory_utf8(&rows[0], 0), "4/5");
-	assert_eq!(margin_advisory_utf8(&rows[0], 1), "9/10");
-	assert_eq!(margin_advisory_utf8(&rows[0], 2), "loosen");
-	assert_eq!(margin_advisory_utf8(&rows[0], 9), "apply_advisory");
-	assert_eq!(margin_advisory_utf8(&rows[0], 10), "9/10");
-	assert_eq!(margin_advisory_utf8(&rows[0], 11), "tree_join_order");
-	assert_eq!(margin_advisory_i64(&rows[0], 12), 0);
+	assert_margin_advisory_scope_order(&rows);
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	assert_eq!(margin_advisory_utf8(tree, 0), "4/5");
+	assert_eq!(margin_advisory_utf8(tree, 1), "9/10");
+	assert_eq!(margin_advisory_utf8(tree, 2), "loosen");
+	assert_eq!(margin_advisory_utf8(tree, 9), "apply_advisory");
+	assert_eq!(margin_advisory_utf8(tree, 10), "9/10");
+	assert_eq!(margin_advisory_utf8(tree, 11), "tree_join_order");
+	assert_eq!(margin_advisory_i64(tree, 12), 0);
+	assert_eq!(margin_advisory_utf8(tree, 13), "knob_advisory");
+}
+
+#[tokio::test]
+async fn tree_row_selected_by_scope_matches_208_contract() {
+	let catalog = star_join_order_catalog();
+	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+	let report = margin_advisory_report(&config);
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+
+	assert_eq!(
+		margin_advisory_utf8(tree, 0),
+		report.advisory.current.label()
+	);
+	assert_eq!(
+		margin_advisory_utf8(tree, 1),
+		report.advisory.recommended.label()
+	);
+	assert_eq!(
+		margin_advisory_utf8(tree, 2),
+		margin_recommendation_label(report.advisory.recommendation)
+	);
+	assert_eq!(
+		margin_advisory_i64(tree, 3),
+		i64::try_from(report.advisory.missed_win).unwrap()
+	);
+	assert_eq!(
+		margin_advisory_i64(tree, 4),
+		i64::try_from(report.advisory.over_eager).unwrap()
+	);
+	assert_eq!(
+		margin_advisory_i64(tree, 5),
+		i64::try_from(report.advisory.vindicated).unwrap()
+	);
+	assert_eq!(
+		margin_advisory_i64(tree, 6),
+		i64::try_from(report.advisory.mis_ranked).unwrap()
+	);
+	assert_eq!(
+		margin_advisory_i64(tree, 7),
+		i64::try_from(report.advisory.indeterminate).unwrap()
+	);
+	assert_eq!(
+		margin_advisory_i64(tree, 8),
+		i64::try_from(report.advisory.sample_size).unwrap()
+	);
+	assert_eq!(
+		margin_advisory_utf8(tree, 9),
+		join_order_soft_margin_application_label(report.application)
+	);
+	assert_eq!(
+		margin_advisory_utf8(tree, 10),
+		report.applied_step.margin().label()
+	);
+	assert_eq!(margin_advisory_utf8(tree, 11), report.evidence_scope);
+	assert_eq!(
+		margin_advisory_i64(tree, 12),
+		i64::try_from(report.excluded_sample_size).unwrap()
+	);
 }
 
 #[test]
@@ -12230,6 +12291,33 @@ fn tree_margin_advisory_scope_accepts_only_tree_kinds() {
 }
 
 #[test]
+fn graph_margin_advisory_scope_accepts_only_graph_kinds() {
+	for kind in [
+		OptimizerDecisionKind::StarCandidate,
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionKind::SnowflakeBranch,
+	] {
+		assert!(is_tree_margin_advisory_kind(kind));
+		assert!(!is_graph_margin_advisory_kind(kind));
+	}
+	for kind in [
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionKind::BridgeChainRoot,
+	] {
+		assert!(!is_tree_margin_advisory_kind(kind));
+		assert!(is_graph_margin_advisory_kind(kind));
+	}
+	assert!(!is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::Overflow
+	));
+	assert!(!is_graph_margin_advisory_kind(
+		OptimizerDecisionKind::Overflow
+	));
+}
+
+#[test]
 fn tree_verdicts_still_drive_soft_margin_advisory() {
 	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
 
@@ -12278,12 +12366,182 @@ fn graph_or_chain_verdicts_do_not_drive_soft_margin_advisory() {
 }
 
 #[tokio::test]
+async fn graph_margin_advisory_reports_graph_scope() {
+	let catalog = MockCatalog::new();
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[(
+			OptimizerDecisionKind::GalaxyRoot,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		)],
+	);
+
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+
+	assert_margin_advisory_scope_order(&rows);
+	let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
+	assert_eq!(margin_advisory_utf8(graph, 0), "4/5");
+	assert_eq!(margin_advisory_utf8(graph, 1), "9/10");
+	assert_eq!(margin_advisory_utf8(graph, 2), "loosen");
+	assert_eq!(
+		margin_advisory_i64(graph, 8),
+		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
+	);
+	assert_eq!(margin_advisory_utf8(graph, 9), "manual");
+	assert_eq!(margin_advisory_utf8(graph, 10), "4/5");
+	assert_eq!(margin_advisory_utf8(graph, 11), "graph_join_order");
+	assert_eq!(margin_advisory_i64(graph, 12), 0);
+	assert_eq!(margin_advisory_utf8(graph, 13), "knob_advisory");
+
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	assert_eq!(
+		margin_advisory_utf8(tree, 2),
+		"insufficient_evidence",
+		"graph verdicts must not enter the tree advisory row"
+	);
+	assert_eq!(margin_advisory_i64(tree, 8), 0);
+	assert_eq!(
+		margin_advisory_i64(tree, 12),
+		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
+	);
+}
+
+#[tokio::test]
+async fn per_kind_detail_rows_aggregate_independently() {
+	let catalog = MockCatalog::new();
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[
+			(
+				OptimizerDecisionKind::GalaxyRoot,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			),
+			(
+				OptimizerDecisionKind::BridgeChainRoot,
+				OptimizerRuntimeVerdictClass::OverEager,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			),
+		],
+	);
+
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+
+	let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
+	assert_eq!(margin_advisory_utf8(graph, 2), "keep");
+	assert_eq!(
+		margin_advisory_i64(graph, 8),
+		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE * 2).unwrap()
+	);
+
+	let galaxy = margin_advisory_row_by_scope(&rows, "galaxy_root");
+	assert_eq!(margin_advisory_utf8(galaxy, 2), "loosen");
+	assert_eq!(margin_advisory_utf8(galaxy, 13), "kind_detail");
+	assert_eq!(
+		margin_advisory_i64(galaxy, 12),
+		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
+	);
+
+	let bridge = margin_advisory_row_by_scope(&rows, "bridge_root");
+	assert_eq!(margin_advisory_utf8(bridge, 2), "insufficient_evidence");
+	assert_eq!(margin_advisory_i64(bridge, 8), 0);
+	assert_eq!(
+		margin_advisory_i64(bridge, 12),
+		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE * 2).unwrap()
+	);
+
+	let chain = margin_advisory_row_by_scope(&rows, "bridge_chain_root");
+	assert_eq!(margin_advisory_utf8(chain, 2), "tighten");
+	assert_eq!(margin_advisory_utf8(chain, 13), "kind_detail");
+}
+
+#[tokio::test]
+async fn graph_margin_advisory_ignores_tree_verdicts() {
+	let catalog = MockCatalog::new();
+	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+
+	let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
+	assert_eq!(margin_advisory_utf8(graph, 2), "insufficient_evidence");
+	assert_eq!(margin_advisory_i64(graph, 8), 0);
+	assert_eq!(
+		margin_advisory_i64(graph, 12),
+		i64::try_from(LOOSEN_VERDICTS[0].2).unwrap()
+	);
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	assert_eq!(margin_advisory_utf8(tree, 2), "loosen");
+}
+
+#[tokio::test]
+async fn kind_detail_rows_are_not_actionable() {
+	let catalog = MockCatalog::new();
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[(
+			OptimizerDecisionKind::GalaxyRoot,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		)],
+	);
+
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+
+	for scope in ["galaxy_root", "bridge_root", "bridge_chain_root"] {
+		let row = margin_advisory_row_by_scope(&rows, scope);
+		assert_eq!(margin_advisory_utf8(row, 9), "manual");
+		assert_eq!(margin_advisory_utf8(row, 10), "4/5");
+		assert_eq!(margin_advisory_utf8(row, 13), "kind_detail");
+	}
+	let galaxy = margin_advisory_row_by_scope(&rows, "galaxy_root");
+	assert_eq!(margin_advisory_utf8(galaxy, 2), "loosen");
+	assert_eq!(margin_advisory_utf8(galaxy, 1), "9/10");
+}
+
+#[tokio::test]
+async fn insufficient_evidence_renders_per_scope() {
+	let catalog = MockCatalog::new();
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[
+			(
+				OptimizerDecisionKind::FlatStar,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			),
+			(
+				OptimizerDecisionKind::GalaxyRoot,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE - 1,
+			),
+		],
+	);
+
+	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	assert_eq!(margin_advisory_utf8(tree, 2), "loosen");
+	let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
+	assert_eq!(margin_advisory_utf8(graph, 2), "insufficient_evidence");
+	let galaxy = margin_advisory_row_by_scope(&rows, "galaxy_root");
+	assert_eq!(margin_advisory_utf8(galaxy, 2), "insufficient_evidence");
+	assert_eq!(margin_advisory_i64(galaxy, 8), 19);
+}
+
+#[tokio::test]
 async fn apply_advisory_does_not_steer_graph_actuation() {
 	let catalog = margin_boundary_galaxy_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", galaxy_conformed_order_sql()))
 		.expect("plan margin-boundary galaxy EXPLAIN");
 	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
 
 	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &config).await;
 	let galaxy_row = rows
@@ -12305,6 +12563,56 @@ async fn apply_advisory_does_not_steer_graph_actuation() {
 	assert_utf8_contains(&galaxy_row[3], "costs=[returns:85000,sales:100000]");
 	if let ScalarValue::Utf8(Some(detail)) = &galaxy_row[3] {
 		assert!(!detail.contains("applied_root="));
+	}
+}
+
+#[tokio::test]
+async fn graph_readout_is_read_only_no_plan_change() {
+	let catalog = margin_boundary_galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&galaxy_conformed_order_sql())
+		.expect("plan margin-boundary galaxy");
+
+	for application in [
+		JoinOrderSoftMarginApplication::Manual,
+		JoinOrderSoftMarginApplication::ApplyAdvisory,
+	] {
+		let quiet = PlannerConfig {
+			join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+			join_order_soft_margin_application: application,
+			..auto_broadcast_config(64 * 1024 * 1024)
+		};
+		let noisy = PlannerConfig {
+			join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+			join_order_soft_margin_application: application,
+			..auto_broadcast_config(64 * 1024 * 1024)
+		};
+		record_verdicts(
+			noisy.runtime_evidence.as_ref(),
+			OptimizerDecisionKind::GalaxyRoot,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		);
+
+		let (quiet_plan, quiet_trace) = bind_with_trace(&logical, &catalog, &quiet)
+			.await
+			.expect("bind quiet graph plan");
+		let (noisy_plan, noisy_trace) = bind_with_trace(&logical, &catalog, &noisy)
+			.await
+			.expect("bind graph plan with readout evidence");
+
+		assert_eq!(
+			format!("{quiet_plan:?}"),
+			format!("{noisy_plan:?}"),
+			"graph advisory evidence must not alter graph planning under {application:?}"
+		);
+		assert_eq!(quiet_trace.join_decisions, noisy_trace.join_decisions);
+
+		let rows = optimizer_margin_advisory_rows(&catalog, &noisy).await;
+		let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
+		assert_eq!(margin_advisory_utf8(graph, 2), "loosen");
+		assert_eq!(margin_advisory_utf8(graph, 9), "manual");
+		assert_eq!(margin_advisory_utf8(graph, 10), "4/5");
 	}
 }
 
@@ -12409,8 +12717,9 @@ async fn advisory_current_is_applied_margin() {
 	let catalog = star_join_order_catalog();
 	let rows =
 		optimizer_margin_advisory_rows(&catalog, &margin_config(SoftMarginLadderStep::Loose)).await;
-	assert_eq!(rows.len(), 1);
-	assert_eq!(margin_advisory_utf8(&rows[0], 0), "9/10");
+	assert_margin_advisory_scope_order(&rows);
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	assert_eq!(margin_advisory_utf8(tree, 0), "9/10");
 }
 
 #[tokio::test]
@@ -13130,11 +13439,12 @@ async fn margin_advisory_excludes_misranked_and_indeterminate() {
 
 	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
 
-	assert_eq!(rows.len(), 1);
-	assert_eq!(margin_advisory_utf8(&rows[0], 2), "insufficient_evidence");
-	assert_eq!(margin_advisory_i64(&rows[0], 6), 25);
-	assert_eq!(margin_advisory_i64(&rows[0], 7), 30);
-	assert_eq!(margin_advisory_i64(&rows[0], 8), 0);
+	assert_margin_advisory_scope_order(&rows);
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	assert_eq!(margin_advisory_utf8(tree, 2), "insufficient_evidence");
+	assert_eq!(margin_advisory_i64(tree, 6), 25);
+	assert_eq!(margin_advisory_i64(tree, 7), 30);
+	assert_eq!(margin_advisory_i64(tree, 8), 0);
 }
 
 #[test]
@@ -13258,20 +13568,24 @@ async fn margin_advisory_report_projects_like_information_schema() {
 			"excluded_sample_size"
 		]
 	);
-	assert_eq!(rows.len(), 1);
-	assert_eq!(rows[0][0], ScalarValue::Utf8(Some("loosen".to_string())));
-	assert_eq!(rows[0][1], ScalarValue::Utf8(Some("9/10".to_string())));
+	assert_eq!(rows.len(), 5);
+	let tree = rows
+		.iter()
+		.find(|row| row[3] == ScalarValue::Utf8(Some("tree_join_order".to_string())))
+		.expect("tree margin advisory row");
+	assert_eq!(tree[0], ScalarValue::Utf8(Some("loosen".to_string())));
+	assert_eq!(tree[1], ScalarValue::Utf8(Some("9/10".to_string())));
 	assert_eq!(
-		rows[0][2],
+		tree[2],
 		ScalarValue::Int64(Some(
 			i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
 		))
 	);
 	assert_eq!(
-		rows[0][3],
+		tree[3],
 		ScalarValue::Utf8(Some("tree_join_order".to_string()))
 	);
-	assert_eq!(rows[0][4], ScalarValue::Int64(Some(0)));
+	assert_eq!(tree[4], ScalarValue::Int64(Some(0)));
 }
 
 #[tokio::test]
@@ -13305,24 +13619,46 @@ async fn optimizer_margin_advisory_reports_scope_and_exclusions() {
 
 	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
 
-	assert_eq!(rows.len(), 1);
-	assert_eq!(margin_advisory_utf8(&rows[0], 2), "loosen");
+	assert_margin_advisory_scope_order(&rows);
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	assert_eq!(margin_advisory_utf8(tree, 2), "loosen");
 	assert_eq!(
-		margin_advisory_i64(&rows[0], 8),
+		margin_advisory_i64(tree, 8),
 		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
 	);
-	assert_eq!(margin_advisory_utf8(&rows[0], 11), "tree_join_order");
-	assert_eq!(margin_advisory_i64(&rows[0], 12), 12);
+	assert_eq!(margin_advisory_utf8(tree, 11), "tree_join_order");
+	assert_eq!(margin_advisory_i64(tree, 12), 12);
+	assert_eq!(margin_advisory_utf8(tree, 13), "knob_advisory");
+
+	let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
+	assert_eq!(margin_advisory_utf8(graph, 2), "insufficient_evidence");
+	assert_eq!(margin_advisory_i64(graph, 3), 7);
+	assert_eq!(margin_advisory_i64(graph, 4), 5);
+	assert_eq!(margin_advisory_i64(graph, 6), 13);
+	assert_eq!(margin_advisory_i64(graph, 8), 12);
+	assert_eq!(margin_advisory_i64(graph, 12), 20);
+	assert_eq!(margin_advisory_utf8(graph, 13), "knob_advisory");
+
+	let galaxy = margin_advisory_row_by_scope(&rows, "galaxy_root");
+	assert_eq!(margin_advisory_i64(galaxy, 3), 7);
+	assert_eq!(margin_advisory_i64(galaxy, 12), 25);
+	assert_eq!(margin_advisory_utf8(galaxy, 13), "kind_detail");
 }
 
 #[tokio::test]
-async fn rune_queries_margin_advisory() {
+async fn rune_queries_graph_margin_advisory() {
 	let catalog = star_join_order_catalog();
 	let config = PlannerConfig::default();
 	record_verdicts(
 		config.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::SnowflakeRoot,
 		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
 		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
 	);
 	let logical = rune_plan(
@@ -13345,9 +13681,13 @@ async fn rune_queries_margin_advisory() {
 		kind,
 		SystemTableKind::InformationSchemaOptimizerMarginAdvisory
 	);
-	assert_eq!(rows.len(), 1);
-	assert_eq!(margin_advisory_utf8(&rows[0], 2), "tighten");
-	assert_eq!(margin_advisory_utf8(&rows[0], 1), "7/10");
+	assert_margin_advisory_scope_order(&rows);
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	assert_eq!(margin_advisory_utf8(tree, 2), "tighten");
+	assert_eq!(margin_advisory_utf8(tree, 1), "7/10");
+	let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
+	assert_eq!(margin_advisory_utf8(graph, 2), "loosen");
+	assert_eq!(margin_advisory_utf8(graph, 1), "9/10");
 }
 
 #[tokio::test]
@@ -15704,6 +16044,32 @@ fn record_verdicts(
 	for _ in 0..count {
 		evidence.record_verdict(kind, verdict);
 	}
+}
+
+fn margin_advisory_row_by_scope<'a>(
+	rows: &'a [Vec<ScalarValue>],
+	scope: &str,
+) -> &'a [ScalarValue] {
+	rows.iter()
+		.find(|row| row[11] == ScalarValue::Utf8(Some(scope.to_string())))
+		.unwrap_or_else(|| panic!("missing optimizer margin advisory scope={scope}: {rows:?}"))
+}
+
+fn assert_margin_advisory_scope_order(rows: &[Vec<ScalarValue>]) {
+	let scopes = rows
+		.iter()
+		.map(|row| margin_advisory_utf8(row, 11))
+		.collect::<Vec<_>>();
+	assert_eq!(
+		scopes,
+		vec![
+			"tree_join_order",
+			"graph_join_order",
+			"galaxy_root",
+			"bridge_root",
+			"bridge_chain_root",
+		]
+	);
 }
 
 fn margin_advisory_utf8(row: &[ScalarValue], index: usize) -> &str {

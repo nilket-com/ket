@@ -294,8 +294,13 @@ pub(crate) fn adr188_measured_accrual_is_side_effect_only() {
 		"pub(crate) fn effective_tree_join_order_soft_margin_step",
 	);
 	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
 	assert!(report.contains("verdict_snapshot()"));
-	let join_order_planning = join_order.replace(&resolver, "").replace(&report, "");
+	assert!(report_rows.contains("verdict_snapshot()"));
+	let join_order_planning = join_order
+		.replace(&resolver, "")
+		.replace(&report, "")
+		.replace(&report_rows, "");
 
 	for (name, source) in [
 		("join_order", join_order_planning.as_str()),
@@ -414,7 +419,8 @@ pub(crate) fn adr189_advisory_is_read_only() {
 	let classify = first_block(&join_order, "pub(super) fn classify_star_order_action");
 	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
 	// ADR 191: the advisory is invoked read-only through the report helper, not inline.
-	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
+	let advisory_row = first_block(&join_order, "fn margin_advisory_report_for_scope");
 
 	assert!(recommend.contains("snapshot: &[OptimizerRuntimeVerdictRow]"));
 	assert!(recommend.contains("current: SoftMarginLadderStep"));
@@ -422,8 +428,9 @@ pub(crate) fn adr189_advisory_is_read_only() {
 	assert!(!recommend.contains(".record("));
 	assert!(!recommend.contains("record_verdict"));
 	assert!(bind_relation.contains("runtime_evidence.verdict_snapshot()"));
-	assert!(bind_relation.contains("margin_advisory_report("));
-	assert!(advisory_report.contains("recommend_soft_margin("));
+	assert!(bind_relation.contains("margin_advisory_report_rows("));
+	assert!(advisory_report.contains("margin_advisory_report_for_scope(&snapshot"));
+	assert!(advisory_row.contains("recommend_soft_margin("));
 	assert!(!classify.contains("recommend_soft_margin"));
 	assert!(!classify.contains("verdict_snapshot"));
 	assert!(!decision_log.contains("recommend_soft_margin"));
@@ -455,14 +462,16 @@ pub(crate) fn adr189_advisory_reuses_188_verdict_log() {
 	let evidence_struct = first_block(&runtime_evidence, "pub struct OptimizerRuntimeEvidence");
 	let evidence_state = first_block(&runtime_evidence, "struct RuntimeEvidenceState");
 	// ADR 191: the advisory report path is the indirection that reuses the 188 verdict log.
-	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
+	let advisory_row = first_block(&join_order, "fn margin_advisory_report_for_scope");
 
 	assert!(!decision_log.contains("pub(crate) fn verdict_snapshot"));
 	assert!(runtime_evidence.contains("pub(crate) fn verdict_snapshot"));
 	assert!(join_order.contains("snapshot: &[OptimizerRuntimeVerdictRow]"));
 	assert!(bind_relation.contains("runtime_evidence.verdict_snapshot()"));
-	assert!(bind_relation.contains("margin_advisory_report("));
-	assert!(advisory_report.contains("recommend_soft_margin("));
+	assert!(bind_relation.contains("margin_advisory_report_rows("));
+	assert!(advisory_report.contains("margin_advisory_report_for_scope(&snapshot"));
+	assert!(advisory_row.contains("recommend_soft_margin("));
 	assert!(advisory_report.contains("runtime_evidence.verdict_snapshot()"));
 	assert!(evidence_struct.contains("state: Mutex<RuntimeEvidenceState>"));
 	assert!(evidence_state.contains("pending: BTreeMap<OptimizerRuntimeVerdictKey, u64>"));
@@ -637,12 +646,13 @@ pub(crate) fn adr190_observed_paths_receive_configured_margin() {
 #[test]
 pub(crate) fn adr190_advisory_current_is_configured_margin() {
 	let join_order = source("src/binder/join_order.rs");
-	let advisory_report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+	let advisory_report = first_block(&join_order, "fn margin_advisory_report_for_scope");
 
 	// ADR 191: the advisory input is still the operator-configured base step, fed to the 189
 	// policy by the report helper — never the already-applied step (that would double-step).
 	assert!(advisory_report.contains("recommend_soft_margin("));
-	assert!(advisory_report.contains("config.join_order_soft_margin_step,"));
+	assert!(advisory_report.contains("config.join_order_soft_margin_step"));
+	assert!(advisory_report.contains("current_step"));
 }
 
 #[test]
@@ -781,6 +791,7 @@ pub(crate) fn adr191_report_preserves_configured_recommended_and_applied_margins
 	assert!(schema.contains("\"applied_margin\""));
 	assert!(schema.contains("\"evidence_scope\""));
 	assert!(schema.contains("\"excluded_sample_size\""));
+	assert!(schema.contains("\"row_kind\""));
 	// New columns are appended at the tail so existing indexes stay stable.
 	let sample_idx = schema.find("\"sample_size\"").expect("sample_size column");
 	let app_idx = schema
@@ -795,10 +806,11 @@ pub(crate) fn adr191_report_preserves_configured_recommended_and_applied_margins
 	let excluded_idx = schema
 		.find("\"excluded_sample_size\"")
 		.expect("excluded_sample_size column");
+	let row_kind_idx = schema.find("\"row_kind\"").expect("row_kind column");
 	assert!(sample_idx < app_idx && app_idx < applied_idx && applied_idx < scope_idx);
-	assert!(scope_idx < excluded_idx);
+	assert!(scope_idx < excluded_idx && excluded_idx < row_kind_idx);
 	// The report still feeds the configured base step into the advisory.
-	assert!(report.contains("config.join_order_soft_margin_step,"));
+	assert!(report.contains("MarginAdvisoryScope::TreeFamily"));
 }
 
 #[test]
@@ -868,7 +880,9 @@ pub(crate) fn adr191_no_optimizer_shell_or_planproperties_contract() {
 pub(crate) fn adr208_soft_margin_advisory_filters_to_tree_verdict_kinds() {
 	let join_order = source("src/binder/join_order.rs");
 	let predicate = first_block(&join_order, "pub(crate) fn is_tree_margin_advisory_kind");
-	let input = first_block(&join_order, "fn tree_margin_advisory_input");
+	let input = first_block(&join_order, "fn margin_advisory_input");
+	let sampled_verdict = first_block(&join_order, "fn is_margin_advisory_sampled_verdict");
+	let tree_input = first_block(&join_order, "fn tree_margin_advisory_input");
 	let resolver = first_block(
 		&join_order,
 		"pub(crate) fn effective_tree_join_order_soft_margin_step",
@@ -890,16 +904,17 @@ pub(crate) fn adr208_soft_margin_advisory_filters_to_tree_verdict_kinds() {
 			"scope predicate must classify {kind}"
 		);
 	}
-	assert!(input.contains("is_tree_margin_advisory_kind(row.kind)"));
+	assert!(input.contains("scope.includes(row.kind)"));
 	assert!(input.contains("excluded_sample_size"));
-	assert!(input.contains("OptimizerRuntimeVerdictClass::MissedWin"));
-	assert!(input.contains("OptimizerRuntimeVerdictClass::OverEager"));
-	assert!(input.contains("OptimizerRuntimeVerdictClass::Vindicated"));
+	assert!(input.contains("is_margin_advisory_sampled_verdict(row.verdict)"));
+	assert!(sampled_verdict.contains("OptimizerRuntimeVerdictClass::MissedWin"));
+	assert!(sampled_verdict.contains("OptimizerRuntimeVerdictClass::OverEager"));
+	assert!(sampled_verdict.contains("OptimizerRuntimeVerdictClass::Vindicated"));
+	assert!(tree_input.contains("MarginAdvisoryScope::TreeFamily"));
 	assert!(resolver.contains("tree_margin_advisory_input"));
 	assert!(resolver.contains("recommend_soft_margin("));
 	assert!(resolver.contains("&input.rows"));
-	assert!(report.contains("tree_margin_advisory_input"));
-	assert!(report.contains("excluded_sample_size: input.excluded_sample_size"));
+	assert!(report.contains("MarginAdvisoryScope::TreeFamily"));
 }
 
 #[test]
@@ -980,7 +995,7 @@ pub(crate) fn adr208_margin_advisory_report_appends_scope_columns() {
 		&explain,
 		"pub(super) fn information_schema_optimizer_margin_advisory_rows",
 	);
-	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
 
 	let applied_idx = schema
 		.find("\"applied_margin\"")
@@ -991,10 +1006,13 @@ pub(crate) fn adr208_margin_advisory_report_appends_scope_columns() {
 	let excluded_idx = schema
 		.find("\"excluded_sample_size\"")
 		.expect("excluded_sample_size column");
-	assert!(applied_idx < scope_idx && scope_idx < excluded_idx);
+	let row_kind_idx = schema.find("\"row_kind\"").expect("row_kind column");
+	assert!(applied_idx < scope_idx && scope_idx < excluded_idx && excluded_idx < row_kind_idx);
 	assert!(rows.contains("report.evidence_scope"));
 	assert!(rows.contains("report.excluded_sample_size"));
-	assert!(report.contains("evidence_scope: \"tree_join_order\""));
+	assert!(rows.contains("report.row_kind"));
+	assert!(report_rows.contains("MarginAdvisoryScope::TreeFamily"));
+	assert!(report_rows.contains("MarginAdvisoryScope::GraphFamily"));
 }
 
 #[test]
@@ -1024,6 +1042,202 @@ pub(crate) fn adr208_apply_advisory_remains_resolve_once_no_storage_await() {
 		assert!(!block.contains("counter_fetch_add"));
 		assert!(!block.contains("refresh_durable_cache"));
 	}
+}
+
+#[test]
+pub(crate) fn adr213_graph_advisory_scope_accepts_only_graph_kinds() {
+	let join_order = source("src/binder/join_order.rs");
+	let tree_predicate = first_block(&join_order, "pub(crate) fn is_tree_margin_advisory_kind");
+	let graph_predicate = first_block(&join_order, "pub(crate) fn is_graph_margin_advisory_kind");
+	let scope_impl = first_block(&join_order, "impl MarginAdvisoryScope");
+
+	for kind in [
+		"GalaxyRoot",
+		"BridgeRoot",
+		"BridgeChainRoot",
+		"StarCandidate",
+		"FlatStar",
+		"SnowflakeRoot",
+		"SnowflakeBranch",
+		"Overflow",
+	] {
+		assert!(
+			graph_predicate.contains(kind),
+			"graph predicate must classify {kind}"
+		);
+		assert!(
+			tree_predicate.contains(kind),
+			"tree predicate must classify {kind}"
+		);
+	}
+	assert!(scope_impl.contains("Self::TreeFamily => is_tree_margin_advisory_kind(kind)"));
+	assert!(scope_impl.contains("Self::GraphFamily => is_graph_margin_advisory_kind(kind)"));
+	assert!(scope_impl.contains("Self::GraphKind(scope_kind) => kind == scope_kind"));
+	assert!(scope_impl.contains("Self::GraphFamily => \"graph_join_order\""));
+	assert!(scope_impl.contains("optimizer_decision_kind_label(kind)"));
+}
+
+#[test]
+pub(crate) fn adr213_margin_advisory_reads_evidence_snapshot_once() {
+	let join_order = source("src/binder/join_order.rs");
+	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
+	let row_helper = first_block(&join_order, "fn margin_advisory_report_for_scope");
+	let input_helper = first_block(&join_order, "fn margin_advisory_input");
+
+	assert_eq!(
+		report_rows.matches("verdict_snapshot()").count(),
+		1,
+		"scoped margin advisory rows must share one evidence snapshot"
+	);
+	assert!(report_rows.contains("let snapshot = config.runtime_evidence.verdict_snapshot();"));
+	assert!(report_rows.contains("margin_advisory_report_for_scope(&snapshot"));
+	assert!(!row_helper.contains("verdict_snapshot"));
+	assert!(!input_helper.contains("verdict_snapshot"));
+}
+
+#[test]
+pub(crate) fn adr213_margin_advisory_report_is_scope_keyed_knob_and_detail_rows() {
+	let explain = source("src/binder/explain.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_margin_advisory_schema",
+	);
+	let rows = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_margin_advisory_rows",
+	);
+	let report_struct = first_block(&join_order, "pub(crate) struct MarginAdvisoryReport");
+	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
+	let scope_impl = first_block(&join_order, "impl MarginAdvisoryScope");
+
+	let excluded_idx = schema
+		.find("\"excluded_sample_size\"")
+		.expect("excluded_sample_size column");
+	let row_kind_idx = schema.find("\"row_kind\"").expect("row_kind column");
+	assert!(
+		excluded_idx < row_kind_idx,
+		"row_kind must be appended at the tail"
+	);
+
+	for label in [
+		"tree_join_order",
+		"graph_join_order",
+		"galaxy_root",
+		"bridge_root",
+		"bridge_chain_root",
+		"knob_advisory",
+		"kind_detail",
+	] {
+		assert!(
+			join_order.contains(label) || rows.contains(label),
+			"missing advisory report label {label}"
+		);
+	}
+	assert!(report_struct.contains("row_kind: MarginAdvisoryRowKind"));
+	assert!(rows.contains("margin_advisory_row_kind_label(report.row_kind)"));
+	assert!(scope_impl.contains("Self::TreeFamily | Self::GraphFamily"));
+	assert!(scope_impl.contains("Self::GraphKind(_) => MarginAdvisoryRowKind::KindDetail"));
+
+	let tree_idx = report_rows
+		.find("MarginAdvisoryScope::TreeFamily")
+		.expect("tree row scope");
+	let graph_idx = report_rows
+		.find("MarginAdvisoryScope::GraphFamily")
+		.expect("graph row scope");
+	let galaxy_idx = report_rows
+		.find("OptimizerDecisionKind::GalaxyRoot")
+		.expect("galaxy detail row");
+	let bridge_idx = report_rows
+		.find("OptimizerDecisionKind::BridgeRoot")
+		.expect("bridge detail row");
+	let chain_idx = report_rows
+		.find("OptimizerDecisionKind::BridgeChainRoot")
+		.expect("bridge-chain detail row");
+	assert!(tree_idx < graph_idx && graph_idx < galaxy_idx);
+	assert!(galaxy_idx < bridge_idx && bridge_idx < chain_idx);
+}
+
+#[test]
+pub(crate) fn adr213_graph_advisory_reuses_family_agnostic_margin_math() {
+	let join_order = source("src/binder/join_order.rs");
+	let recommend = first_block(&join_order, "pub(crate) fn recommend_soft_margin");
+	let input = first_block(&join_order, "fn margin_advisory_input");
+	let row_helper = first_block(&join_order, "fn margin_advisory_report_for_scope");
+	let graph_predicate = first_block(&join_order, "pub(crate) fn is_graph_margin_advisory_kind");
+
+	assert!(recommend.contains("snapshot: &[OptimizerRuntimeVerdictRow]"));
+	assert!(!recommend.contains("MarginAdvisoryScope"));
+	assert!(!recommend.contains("is_tree_margin_advisory_kind"));
+	assert!(!recommend.contains("is_graph_margin_advisory_kind"));
+	assert!(input.contains("scope.includes(row.kind)"));
+	assert!(row_helper.contains("recommend_soft_margin(&input.rows, current_step)"));
+	assert!(!graph_predicate.contains("recommend_soft_margin"));
+}
+
+#[test]
+pub(crate) fn adr213_graph_readout_does_not_drive_graph_gate() {
+	let join_order = source("src/binder/join_order.rs");
+	let graph_step = first_block(
+		&join_order,
+		"pub(crate) fn graph_join_order_soft_margin_step",
+	);
+	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
+	let row_helper = first_block(&join_order, "fn margin_advisory_report_for_scope");
+
+	assert!(graph_step.contains("config.join_order_soft_margin_step"));
+	assert!(!graph_step.contains("recommend_soft_margin"));
+	assert!(!graph_step.contains("verdict_snapshot"));
+	assert!(actuation.contains("self.graph_join_order_soft_margin_step.margin()"));
+	assert!(!actuation.contains("recommend_soft_margin"));
+	assert!(!actuation.contains("margin_advisory"));
+	assert!(row_helper.contains("JoinOrderSoftMarginApplication::Manual"));
+	assert!(row_helper.contains("scope.is_actionable_tree_knob()"));
+}
+
+#[test]
+pub(crate) fn adr213_runtime_verdict_report_remains_complete() {
+	adr208_runtime_verdict_report_remains_complete();
+
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let keys = first_block(&runtime_evidence, "fn runtime_evidence_decision_kinds");
+	assert_eq!(keys.matches("OptimizerDecisionKind::").count(), 7);
+	assert!(runtime_evidence.contains(
+		"Vec::with_capacity(runtime_evidence_decision_kinds().len() * verdict_classes().len())"
+	));
+}
+
+#[test]
+pub(crate) fn adr213_no_executor_fragmenter_storage_wire_wendelon_or_outer_join_surface() {
+	let manifest = manifest_dir();
+	let markers = [
+		"MarginAdvisoryScope",
+		"MarginAdvisoryRowKind",
+		"margin_advisory_report_rows",
+		"optimizer_margin_advisory",
+		"graph_join_order",
+		"row_kind",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("src/binder/outer_join_demotion.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR213 graph margin advisory readout leaked outside binder/reporting surfaces:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
 }
 
 #[test]
@@ -1173,8 +1387,9 @@ pub(crate) fn adr207_bind_path_never_awaits_storage_for_evidence() {
 		"pub(crate) fn effective_tree_join_order_soft_margin_step",
 	);
 	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
+	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
 
-	for block in [&bind_relation, &resolver, &report] {
+	for block in [&bind_relation, &resolver, &report, &report_rows] {
 		assert!(block.contains("runtime_evidence"));
 		assert!(!block.contains("counter_read"));
 		assert!(!block.contains("counter_fetch_add"));

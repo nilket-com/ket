@@ -381,53 +381,61 @@ pub(super) fn information_schema_optimizer_margin_advisory_schema() -> SchemaRef
 		Field::new("applied_margin", DataType::Utf8, false),
 		Field::new("evidence_scope", DataType::Utf8, false),
 		Field::new("excluded_sample_size", DataType::Int64, false),
+		Field::new("row_kind", DataType::Utf8, false),
 	]))
 }
 
 pub(super) fn information_schema_optimizer_margin_advisory_rows(
-	report: &MarginAdvisoryReport,
+	reports: &[MarginAdvisoryReport],
 ) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
-	let advisory = report.advisory;
-	Ok(vec![vec![
-		ScalarValue::Utf8(Some(advisory.current.label())),
-		ScalarValue::Utf8(Some(advisory.recommended.label())),
-		ScalarValue::Utf8(Some(
-			margin_recommendation_label(advisory.recommendation).to_string(),
-		)),
-		ScalarValue::Int64(Some(u64_to_i64(
-			advisory.missed_win,
-			"optimizer margin advisory missed_win",
-		)?)),
-		ScalarValue::Int64(Some(u64_to_i64(
-			advisory.over_eager,
-			"optimizer margin advisory over_eager",
-		)?)),
-		ScalarValue::Int64(Some(u64_to_i64(
-			advisory.vindicated,
-			"optimizer margin advisory vindicated",
-		)?)),
-		ScalarValue::Int64(Some(u64_to_i64(
-			advisory.mis_ranked,
-			"optimizer margin advisory mis_ranked",
-		)?)),
-		ScalarValue::Int64(Some(u64_to_i64(
-			advisory.indeterminate,
-			"optimizer margin advisory indeterminate",
-		)?)),
-		ScalarValue::Int64(Some(u64_to_i64(
-			advisory.sample_size,
-			"optimizer margin advisory sample_size",
-		)?)),
-		ScalarValue::Utf8(Some(
-			join_order_soft_margin_application_label(report.application).to_string(),
-		)),
-		ScalarValue::Utf8(Some(report.applied_step.margin().label())),
-		ScalarValue::Utf8(Some(report.evidence_scope.to_string())),
-		ScalarValue::Int64(Some(u64_to_i64(
-			report.excluded_sample_size,
-			"optimizer margin advisory excluded_sample_size",
-		)?)),
-	]])
+	let mut rows = Vec::with_capacity(reports.len());
+	for report in reports {
+		let advisory = report.advisory;
+		rows.push(vec![
+			ScalarValue::Utf8(Some(advisory.current.label())),
+			ScalarValue::Utf8(Some(advisory.recommended.label())),
+			ScalarValue::Utf8(Some(
+				margin_recommendation_label(advisory.recommendation).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.missed_win,
+				"optimizer margin advisory missed_win",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.over_eager,
+				"optimizer margin advisory over_eager",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.vindicated,
+				"optimizer margin advisory vindicated",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.mis_ranked,
+				"optimizer margin advisory mis_ranked",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.indeterminate,
+				"optimizer margin advisory indeterminate",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				advisory.sample_size,
+				"optimizer margin advisory sample_size",
+			)?)),
+			ScalarValue::Utf8(Some(
+				join_order_soft_margin_application_label(report.application).to_string(),
+			)),
+			ScalarValue::Utf8(Some(report.applied_step.margin().label())),
+			ScalarValue::Utf8(Some(report.evidence_scope.to_string())),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.excluded_sample_size,
+				"optimizer margin advisory excluded_sample_size",
+			)?)),
+			ScalarValue::Utf8(Some(
+				margin_advisory_row_kind_label(report.row_kind).to_string(),
+			)),
+		]);
+	}
+	Ok(rows)
 }
 
 pub(super) fn optimizer_explain_schema() -> SchemaRef {

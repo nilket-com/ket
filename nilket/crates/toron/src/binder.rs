@@ -1906,11 +1906,11 @@ impl<'a> Binder<'a> {
 			.table
 			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE)
 		{
-			let report = margin_advisory_report(self.config);
+			let reports = margin_advisory_report_rows(self.config);
 			return system_table_plan(
 				SystemTableKind::InformationSchemaOptimizerMarginAdvisory,
 				information_schema_optimizer_margin_advisory_schema(),
-				information_schema_optimizer_margin_advisory_rows(&report)?,
+				information_schema_optimizer_margin_advisory_rows(&reports)?,
 				projection,
 			);
 		}

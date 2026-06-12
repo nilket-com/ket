@@ -77,7 +77,9 @@ extension dividend, verified not assumed). Keep the ADR 191 resolve-once guard g
 1. Drop the graph kind filter (scope → all kinds): `graph_margin_advisory_ignores_tree_verdicts` must
    fail.
 2. Wire the graph knob to the graph recommendation (the accidental-application edit):
-   `graph_readout_is_read_only_no_plan_change` AND the re-pinned 208 continuity gate must both fail.
+   `graph_readout_is_read_only_no_plan_change` must fail; the re-pinned
+   `apply_advisory_does_not_steer_graph_actuation` fixture also seeds graph evidence so it independently
+   catches the same accidental application while retaining the tree-evidence continuity assertion.
 3. Collapse `row_kind` (emit all rows as `knob_advisory`): `kind_detail_rows_are_not_actionable` must
    fail.
 4. Move `runtime_evidence.verdict_snapshot()` into a per-row helper:
