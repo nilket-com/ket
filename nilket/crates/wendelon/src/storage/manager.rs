@@ -18536,7 +18536,8 @@ mod tests {
 
 	use crate::storage::counter::{
 		CounterAddOutcome, CounterAddResult, CounterLeader, CounterParticipantKind,
-		CounterWriteKey, DurableCounterWitnessStore, LocalCounterParticipant,
+		CounterParticipantPlan, CounterWriteKey, DurableCounterWitnessStore,
+		LocalCounterParticipant,
 	};
 
 	/// Canonical write-key fixture: the test's small id, LE-embedded in 24 bytes.
@@ -18564,16 +18565,22 @@ mod tests {
 
 		// The production participant set: the leader's own local arm over the real
 		// service, pinned to `tenant()`. Quorum 1 = the lone local arm.
-		let local = LocalCounterParticipant::new(service.clone(), tenant());
+		let local_id = NodeId {
+			id: 1,
+			_reserved: 0,
+		};
+		let local =
+			CounterParticipantKind::Local(LocalCounterParticipant::new(service.clone(), tenant()));
 		let leader = CounterLeader::new(
-			vec![CounterParticipantKind::Local(local)],
-			1,
+			local_id,
+			local.clone(),
 			true,
 			DurableCounterWitnessStore::open(&wdir).unwrap(),
 		);
+		let plan = || CounterParticipantPlan::new(vec![(local_id, local.clone())], 1);
 
 		let k = ckey(b"verdict");
-		let out = leader.fetch_add(wkey(1), &k, 7).await.unwrap();
+		let out = leader.fetch_add(plan(), wkey(1), &k, 7).await.unwrap();
 		assert_eq!(
 			out,
 			CounterAddResult::Applied(CounterAddOutcome {
@@ -18594,7 +18601,7 @@ mod tests {
 
 		// A second add accumulates on the same key through the same path (proves the
 		// leader's committed base read also routes through the adapter's derivation).
-		let out2 = leader.fetch_add(wkey(2), &k, 4).await.unwrap();
+		let out2 = leader.fetch_add(plan(), wkey(2), &k, 4).await.unwrap();
 		assert_eq!(
 			out2,
 			CounterAddResult::Applied(CounterAddOutcome {

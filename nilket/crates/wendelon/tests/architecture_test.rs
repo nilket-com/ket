@@ -7756,7 +7756,7 @@ fn adr075_counter_add_reuses_client_write_id_idempotency() {
 	// is durable with the witness/applied log (replay survives restart).
 	let handler = adr075_counter_handler_region(&server);
 	assert!(handler.contains("meta.write_id.canonical_idempotency_bytes()"));
-	assert!(handler.contains("leader.fetch_add(write_key, &key, meta.delta)"));
+	assert!(handler.contains("leader.fetch_add(plan, write_key, &key, meta.delta)"));
 	assert!(counter.contains("idempotency: DashMap<CounterWriteKey, CounterAddOutcome>"));
 	// Never a hashed/narrowed handle — collisions would break exactly-once.
 	assert!(counter.contains("pub type CounterWriteKey = [u8; 24];"));
@@ -7888,21 +7888,29 @@ fn adr075_counter_surface_is_brand_clean_no_v1_suffix() {
 
 #[test]
 fn adr075_no_toron_production_change() {
-	// Producer-only (D9): no Toron production source consumes the counter-add
-	// surface yet (Toron ADR 207 stays stashed until this contract is fixed).
+	// Retargeted after Toron ADR 207: runtime evidence is the one promoted
+	// consumer of the counter-add surface. ADR 075 still forbids incidental Toron
+	// production drift outside that named later-ADR integration.
 	let toron_src = workspace_root().join("crates/toron/src");
+	let allowed = ["crates/toron/src/binder/runtime_evidence.rs"];
 	let mut offenders = Vec::new();
 	walk_dir(&toron_src, &mut |path| {
 		if path.extension().and_then(|e| e.to_str()) == Some("rs") {
 			let body = fs::read_to_string(path).unwrap_or_default();
 			if body.contains("counter_fetch_add") || body.contains("COUNTER_ADD_REQ") {
-				offenders.push(path.display().to_string());
+				let rel = path
+					.strip_prefix(workspace_root())
+					.unwrap_or(path)
+					.to_string_lossy();
+				if !allowed.iter().any(|allowed| *allowed == rel.as_ref()) {
+					offenders.push(rel.to_string());
+				}
 			}
 		}
 	});
 	assert!(
 		offenders.is_empty(),
-		"ADR 075 is producer-only; Toron production must not consume the counter-add surface: {offenders:?}"
+		"ADR 075 allows only the ADR 207 runtime-evidence Toron consumer: {offenders:?}"
 	);
 }
 
@@ -7910,24 +7918,210 @@ fn adr075_no_toron_production_change() {
 fn adr075_counter_add_fails_closed_under_replication() {
 	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
 	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
-	// The fail-closed status exists (cut-4's leader is single-node only; multi-node
-	// replication — ring-driven participants + peer-identity witness — is cut-8b).
+	// Retargeted by ADR 076: the wire status remains for decoding compatibility,
+	// but a healthy rf>1 add now builds the replicated participant set instead of
+	// failing closed before mutation.
 	assert!(schema.contains("pub const COUNTER_REPLICATION_UNSUPPORTED: Self = Self(17);"));
-	// handle_counter_add rejects rf > 1 BEFORE any mutation, so a counter add never
-	// lands primary-only-durable under replication (D3 fail-closed).
 	let handler = adr075_counter_handler_region(&server);
-	assert!(handler.contains("self.router.replication_factor() > 1"));
-	assert!(handler.contains("WriteStatus::COUNTER_REPLICATION_UNSUPPORTED"));
-	let rf_check = handler
-		.find("replication_factor() > 1")
-		.expect("counter add must gate on replication factor");
+	assert!(!handler.contains("WriteStatus::COUNTER_REPLICATION_UNSUPPORTED"));
+	assert!(!handler.contains("replication_factor() > 1"));
+	assert!(
+		handler.contains("let replicas = self\n\t\t\t.router\n\t\t\t.replicas_for_locality(Locality::from(meta.key_identity));")
+	);
+	assert!(handler.contains("let Some(owner) = replicas.first().copied()"));
+	assert!(handler.contains("WriteStatus::NOT_LEADER"));
+	assert!(handler.contains("CounterParticipantPlan::new"));
+	assert!(handler.contains("let quorum = (replicas.len() / 2) + 1;"));
+	let route = handler
+		.find("replicas_for_locality")
+		.expect("counter add must derive fresh participants from the ring");
 	let mutate = handler
 		.find("self.counter_leader_for(meta.tenant_id)")
 		.expect("counter add must drive the leader");
 	assert!(
-		rf_check < mutate,
-		"the rf > 1 reject must fail closed before the leader mutation"
+		route < mutate,
+		"counter add must derive replicated participants before leader mutation"
 	);
+}
+
+#[test]
+fn adr076_witness_records_peer_identities_not_indices() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let witness = source_region(
+		&counter,
+		"struct CounterFinalizationWitness {",
+		"struct AppliedCounterAdd",
+	);
+	assert!(witness.contains("accepted: Vec<NodeId>"));
+	assert!(witness.contains("committed: HashSet<NodeId>"));
+	assert!(!witness.contains("Vec<usize>"));
+	assert!(!witness.contains("HashSet<usize>"));
+}
+
+#[test]
+fn adr076_witness_format_is_flattened() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	assert!(counter.contains("pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self>"));
+	assert!(!counter.contains("V1"));
+	assert!(!counter.contains("COUNTER_WITNESS_V1_PREFIX"));
+	assert!(!counter.contains("migrate_v0_witness"));
+	assert!(!counter.contains("_local_node"));
+}
+
+#[test]
+fn adr076_fresh_and_recorded_resolution_are_distinct_routes() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	assert!(counter.contains("pub struct CounterParticipantPlan<P>"));
+	assert!(counter.contains("pub trait CounterParticipantResolver<P: CounterParticipant>"));
+	assert!(counter.contains("fn resolve_recorded(&self, id: NodeId) -> Option<P>;"));
+	assert!(counter.contains("self.drive_commits(op_id, &resolver).await;"));
+	assert!(counter.contains("pub async fn reconcile<R>(&self, resolver: &R)"));
+	assert!(server.contains("impl\n\tcrate::storage::counter::CounterParticipantResolver"));
+	assert!(server.contains("Some(self.participant_for(id))"));
+}
+
+#[test]
+fn adr076_counter_leader_has_explicit_local_arm() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	assert!(counter.contains("local_id: NodeId"));
+	assert!(counter.contains("local: P"));
+	assert!(counter.contains("plan.get(self.local_id).is_none()"));
+	assert!(counter.contains("self.local\n\t\t\t.read_committed(key)"));
+	assert!(!counter.contains("participants[0]"));
+}
+
+#[test]
+fn adr076_fresh_counter_participants_are_ring_derived() {
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("let replicas = self\n\t\t\t.router\n\t\t\t.replicas_for_locality(Locality::from(meta.key_identity));"));
+	assert!(handler.contains("let Some(owner) = replicas.first().copied()"));
+	assert!(handler.contains("if owner.id != self.local_node.id"));
+	assert!(handler.contains("self.counter_add_response_with_hint("));
+	assert!(handler.contains("participant_factory.participant_for(*peer)"));
+}
+
+#[test]
+fn adr076_counter_quorum_uses_majority_floor() {
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let handler = adr075_counter_handler_region(&server);
+	assert!(handler.contains("let quorum = (replicas.len() / 2) + 1;"));
+	assert!(handler.contains("CounterParticipantPlan::new"));
+	assert!(!handler.contains("quorum = 1"));
+}
+
+#[test]
+fn adr076_commit_completion_covers_full_accepted_set() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let commit = source_region(
+		&counter,
+		"async fn drive_commits<R>(&self, op_id: u64, resolver: &R)",
+		"/// The counter-specific reconciler",
+	);
+	assert!(commit.contains("witness.accepted.clone()"));
+	assert!(commit.contains("for i in accepted"));
+	assert!(commit.contains("witness.committed.insert(i);"));
+	assert!(commit.contains("let complete = witness\n\t\t\t\t.accepted\n\t\t\t\t.iter()\n\t\t\t\t.all(|i| witness.committed.contains(i));"));
+}
+
+#[test]
+fn adr076_pending_witness_never_expires_on_peer_loss() {
+	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
+	let commit = source_region(
+		&counter,
+		"async fn drive_commits<R>(&self, op_id: u64, resolver: &R)",
+		"/// The counter-specific reconciler",
+	);
+	assert!(commit.contains("let Some(participant) = resolver.resolve_recorded(i) else"));
+	assert!(commit.contains("continue;"));
+	assert!(
+		commit.contains(".is_ok() && participant.commit(op_id).await.is_ok()"),
+		"commit failures must leave the witness pending for a later reconcile"
+	);
+	assert!(!commit.contains("expire"));
+	assert!(!commit.contains("deadline"));
+}
+
+#[test]
+fn adr076_replication_unsupported_not_on_healthy_path() {
+	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let handler = adr075_counter_handler_region(&server);
+	assert!(!handler.contains("COUNTER_REPLICATION_UNSUPPORTED"));
+	assert!(!handler.contains("replication_factor() > 1"));
+}
+
+#[test]
+fn adr076_no_new_wire_operations() {
+	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	for required in [
+		"pub const COUNTER_ADD_REQ: Self = Self(0x4C);",
+		"pub const COUNTER_ADD_RESP: Self = Self(0x4D);",
+		"pub const COUNTER_READ_REQ: Self = Self(0x4E);",
+		"pub const COUNTER_READ_RESP: Self = Self(0x4F);",
+		"pub const COUNTER_REPLICATE_REQ: Self = Self(0x48);",
+		"pub const COUNTER_REPLICATE_RESP: Self = Self(0x49);",
+		"pub const COUNTER_ROLLBACK_REQ: Self = Self(0x4A);",
+		"pub const COUNTER_ROLLBACK_RESP: Self = Self(0x4B);",
+	] {
+		assert!(
+			schema.contains(required),
+			"missing existing counter wire op {required}"
+		);
+	}
+	for forbidden in [
+		"COUNTER_FETCH_ADD_REQ",
+		"COUNTER_FETCH_ADD_RESP",
+		"COUNTER_REPLICATED_ADD_REQ",
+		"COUNTER_FINALIZE_REQ",
+	] {
+		assert!(
+			!schema.contains(forbidden),
+			"ADR 076 must reuse the ADR 075 counter wire surface; found {forbidden}"
+		);
+	}
+	for routed in [
+		"MsgType::COUNTER_REPLICATE_REQ.0",
+		"MsgType::COUNTER_REPLICATE_RESP.0",
+		"MsgType::COUNTER_ROLLBACK_REQ.0",
+		"MsgType::COUNTER_ROLLBACK_RESP.0",
+	] {
+		assert!(
+			router.contains(routed),
+			"existing counter replica wire op must route through the Data Ring: {routed}"
+		);
+	}
+}
+
+#[test]
+fn adr076_no_toron_production_change() {
+	let output = std::process::Command::new("git")
+		.args(["status", "--short", "--", "crates/toron/src"])
+		.current_dir(workspace_root())
+		.output()
+		.expect("git status should run");
+	assert!(output.status.success(), "git status failed");
+	let stdout = String::from_utf8(output.stdout).expect("git status should be utf8");
+	assert!(
+		stdout.trim().is_empty(),
+		"ADR 076 is Wendelon-only; Toron production files are staged/dirty:\n{stdout}"
+	);
+}
+
+#[test]
+fn adr076_prior_wendelon_guards_continue_to_pass() {
+	let architecture = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	for required in [
+		"fn adr075_prior_wendelon_guards_continue_to_pass",
+		"fn adr075_counter_add_fails_closed_under_replication",
+		"fn adr074_prior_wendelon_telemetry_and_table_query_guards_continue_to_pass",
+	] {
+		assert!(
+			architecture.contains(required),
+			"missing prior Wendelon guard {required}"
+		);
+	}
 }
 
 #[test]

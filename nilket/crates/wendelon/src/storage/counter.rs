@@ -264,13 +264,11 @@ impl<B: CounterBackend> CounterCore<B> {
 // ============================================================
 //
 // `CounterCore` above proves the lifecycle logic against an in-memory backend.
-// `SlabCounterStore` is the REAL local substrate the data-server cut will drive:
-// durable counter frames on a [`LocalSlabStore`], recovered through the
-// production `recover_slab` rule (`record_class` discriminant + committed-only
-// indexing). Still **no network, no dispatch, no idempotency** — `COUNTER_ADD_REQ`
-// stays dark. This cut proves only that the local storage substrate is
-// trustworthy: a committed value survives restart, a rolled-back or
-// marker-failed tentative does not, and ordinary blob recovery is untouched.
+// `SlabCounterStore` is the REAL local substrate: durable counter frames on a
+// [`LocalSlabStore`], recovered through the production `recover_slab` rule
+// (`record_class` discriminant + committed-only indexing). This section stays
+// local-only: a committed value survives restart, a rolled-back or marker-failed
+// tentative does not, and ordinary blob recovery is untouched.
 //
 // Lifecycle (the operator's model): a tentative append **indexes** the counter
 // version for the live view (the per-key lock in the consumer serializes the
@@ -819,6 +817,7 @@ impl CounterReplicaService {
 /// `CounterKey`; this adapter derives the domain-separated identity ([D7]) and
 /// forwards to the identity-based service. The remote participant (transport) is
 /// the data-server's enum variant; together they are the leader's participant set.
+#[derive(Clone)]
 pub struct LocalCounterParticipant {
 	service: Arc<CounterReplicaService>,
 	tenant_id: TenantId,
@@ -900,6 +899,7 @@ pub trait CounterReplicaTransport: Send + Sync {
 /// drives the replicate/commit/rollback wire to one peer via a
 /// [`CounterReplicaTransport`]. Pinned to a tenant + epoch; derives the
 /// domain-separated identity from the leader's `CounterKey` like the local arm.
+#[derive(Clone)]
 pub struct RemoteCounterParticipant {
 	transport: Arc<dyn CounterReplicaTransport>,
 	peer: NodeId,
@@ -982,8 +982,8 @@ impl CounterParticipant for RemoteCounterParticipant {
 			.await;
 	}
 	async fn read_committed(&self, _key: &CounterKey) -> Result<Option<u64>, ParticipantError> {
-		// The leader reads the committed base ONLY from the local participant
-		// (index 0); a remote replica is never asked for it.
+		// The leader reads the committed base ONLY from its explicit local arm; a
+		// remote replica is never asked for it.
 		Err(ParticipantError::Unavailable)
 	}
 }
@@ -994,6 +994,7 @@ impl CounterParticipant for RemoteCounterParticipant {
 /// per peer replica. The enum keeps the leader monomorphic over one concrete `P`
 /// while letting the participant set mix arms — no `dyn` on the hot
 /// `CounterParticipant` path (its `impl Future` returns are not dyn-compatible).
+#[derive(Clone)]
 pub enum CounterParticipantKind {
 	/// The leader's own in-process replica over the local [`CounterReplicaService`].
 	Local(LocalCounterParticipant),
@@ -1038,11 +1039,10 @@ impl CounterParticipant for CounterParticipantKind {
 //  ADR 075 cut-2b: leader orchestration + counter finalization
 // ============================================================
 //
-// `CounterLeader` is the primary-side orchestration over a set of
-// [`CounterParticipant`]s (participant 0 is the local primary store; 1.. are
-// remote replicas). It is the brain behind a future public `COUNTER_ADD_REQ`,
-// but it is **still dark**: no data-server dispatch wires to it yet. The five
-// boundaries it pins:
+// `CounterLeader` is the primary-side orchestration over a per-add
+// [`CounterParticipantPlan`]. The data-server derives that plan from the key's
+// current replica set; recovery uses recorded peer identities from the durable
+// witness. The five boundaries it pins:
 //
 //  1. **Accepted set is authoritative.** Commit and rollback iterate ONLY the
 //     exact set of participants that acked tentative-append success (local
@@ -1107,6 +1107,74 @@ pub trait CounterParticipant {
 	) -> impl std::future::Future<Output = Result<Option<u64>, ParticipantError>> + Send;
 }
 
+/// The fresh participant set for one counter add. It is derived from the
+/// current ring by the data-server and passed into the leader for this single
+/// operation. Durable witnesses never store positions into this vector; they
+/// store the peer identities below.
+pub struct CounterParticipantPlan<P> {
+	participants: Vec<(NodeId, P)>,
+	/// Acks required for quorum (counts local + remotes).
+	quorum: usize,
+}
+
+impl<P> CounterParticipantPlan<P> {
+	pub fn new(participants: Vec<(NodeId, P)>, quorum: usize) -> Self {
+		Self {
+			participants,
+			quorum,
+		}
+	}
+
+	pub fn quorum(&self) -> usize {
+		self.quorum
+	}
+
+	pub fn len(&self) -> usize {
+		self.participants.len()
+	}
+
+	fn get(&self, id: NodeId) -> Option<&P> {
+		self.participants
+			.iter()
+			.find_map(|(candidate, participant)| (*candidate == id).then_some(participant))
+	}
+
+	fn iter(&self) -> impl Iterator<Item = (NodeId, &P)> {
+		self.participants
+			.iter()
+			.map(|(id, participant)| (*id, participant))
+	}
+}
+
+/// Resolves participants recorded in a durable witness. This is deliberately
+/// separate from fresh ring routing: reconciliation finishes the peers named by
+/// the witness, not whatever the current ring would choose for a new op.
+pub trait CounterParticipantResolver<P: CounterParticipant> {
+	fn resolve_recorded(&self, id: NodeId) -> Option<P>;
+}
+
+/// A resolver over a static vector, used by unit tests and same-call commit
+/// completion where the accepted peers are already known.
+pub struct StaticCounterParticipantResolver<P> {
+	participants: Vec<(NodeId, P)>,
+}
+
+impl<P> StaticCounterParticipantResolver<P> {
+	pub fn new(participants: Vec<(NodeId, P)>) -> Self {
+		Self { participants }
+	}
+}
+
+impl<P: CounterParticipant + Clone> CounterParticipantResolver<P>
+	for StaticCounterParticipantResolver<P>
+{
+	fn resolve_recorded(&self, id: NodeId) -> Option<P> {
+		self.participants
+			.iter()
+			.find_map(|(candidate, participant)| (*candidate == id).then(|| participant.clone()))
+	}
+}
+
 /// Why a leader `fetch_add` was rejected. A successful return (including a
 /// recoverable-pending partial commit) carries the [`CounterAddOutcome`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1146,10 +1214,10 @@ struct CounterFinalizationWitness {
 	/// replayable outcome.
 	previous: u64,
 	commit_hlc: HybridTimestamp,
-	/// The exact accepted set (participant indices).
-	accepted: Vec<usize>,
+	/// The exact accepted set (peer identities).
+	accepted: Vec<NodeId>,
 	/// Accepted participants whose commit marker is confirmed written.
-	committed: HashSet<usize>,
+	committed: HashSet<NodeId>,
 }
 
 /// The durable D4 dedup record a resolved witness compacts into: enough to
@@ -1231,7 +1299,7 @@ impl DurableCounterWitnessStore {
 	/// in that case (pruning happens after), so nothing is lost.
 	/// Unbounded growth note: one ~44-byte frame per resolved add, never
 	/// compacted — TTL-based pruning (the wire's `idempotency_ttl_ms`) is an
-	/// explicit follow-on with cut-8b.
+	/// explicit follow-on.
 	fn append_applied(&self, applied: &AppliedCounterAdd) -> std::io::Result<()> {
 		let bytes = postcard::to_allocvec(applied)
 			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1272,11 +1340,12 @@ impl DurableCounterWitnessStore {
 	}
 }
 
-/// The primary-side counter orchestrator over `participants` (index 0 = local).
+/// The primary-side counter orchestrator. Durable state is per tenant; the
+/// participant set for a fresh add is supplied per operation from the current
+/// ring, while reconciliation resolves the identities recorded in each witness.
 pub struct CounterLeader<P> {
-	participants: Vec<P>,
-	/// Acks required for quorum (counts local + remotes).
-	quorum: usize,
+	local_id: NodeId,
+	local: P,
 	/// Primary-only gate. A non-primary redirects rather than replaying.
 	is_primary: bool,
 	/// Per-key D2 critical section, held across the whole fan-out.
@@ -1295,16 +1364,16 @@ pub struct CounterLeader<P> {
 	op_seq: AtomicU64,
 }
 
-impl<P: CounterParticipant> CounterLeader<P> {
+impl<P: CounterParticipant + Clone> CounterLeader<P> {
 	pub fn new(
-		participants: Vec<P>,
-		quorum: usize,
+		local_id: NodeId,
+		local: P,
 		is_primary: bool,
 		witness_store: DurableCounterWitnessStore,
 	) -> Self {
 		Self {
-			participants,
-			quorum,
+			local_id,
+			local,
 			is_primary,
 			locks: DashMap::new(),
 			idempotency: DashMap::new(),
@@ -1325,14 +1394,14 @@ impl<P: CounterParticipant> CounterLeader<P> {
 	/// the stale-reconcile protection and any as-of/version semantics). Run
 	/// [`reconcile`](Self::reconcile) after to finish any partial commits.
 	pub fn recover(
-		participants: Vec<P>,
-		quorum: usize,
+		local_id: NodeId,
+		local: P,
 		is_primary: bool,
 		witness_store: DurableCounterWitnessStore,
 	) -> std::io::Result<Self> {
 		let applied = witness_store.load_applied()?;
 		let pending = witness_store.load_all()?;
-		let leader = Self::new(participants, quorum, is_primary, witness_store);
+		let leader = Self::new(local_id, local, is_primary, witness_store);
 		let mut max_op = 0;
 		for record in applied {
 			max_op = max_op.max(record.op_id);
@@ -1375,6 +1444,7 @@ impl<P: CounterParticipant> CounterLeader<P> {
 	/// is durable with the witness/applied log, so replay survives restart.
 	pub async fn fetch_add(
 		&self,
+		plan: CounterParticipantPlan<P>,
 		write_key: CounterWriteKey,
 		key: &CounterKey,
 		delta: u64,
@@ -1401,7 +1471,12 @@ impl<P: CounterParticipant> CounterLeader<P> {
 			return Ok(CounterAddResult::Replayed(*cached.value()));
 		}
 
-		let previous = self.participants[0]
+		if plan.len() == 0 || plan.quorum() == 0 || plan.get(self.local_id).is_none() {
+			return Err(CounterLeaderError::Internal);
+		}
+
+		let previous = self
+			.local
 			.read_committed(key)
 			.await
 			.map_err(|_| CounterLeaderError::Internal)?
@@ -1411,26 +1486,28 @@ impl<P: CounterParticipant> CounterLeader<P> {
 			.ok_or(CounterLeaderError::Overflow)?;
 
 		// Fan out the tentative to ALL participants at the op's `commit_hlc`; the
-		// accepted set is EXACTLY those that ack success (local iff index 0 acked).
+		// accepted set is EXACTLY those peer identities that ack success.
 		let op_id = self.op_seq.fetch_add(1, Ordering::Relaxed);
 		let commit_hlc = Self::commit_hlc_for(op_id);
 		let mut accepted = Vec::new();
-		for (i, participant) in self.participants.iter().enumerate() {
+		for (id, participant) in plan.iter() {
 			if participant
 				.replicate_tentative(op_id, key, current, commit_hlc)
 				.await
 				.is_ok()
 			{
-				accepted.push(i);
+				accepted.push(id);
 			}
 		}
 
 		// (1) Quorum over the EXACT accepted set.
-		if accepted.len() < self.quorum {
+		if accepted.len() < plan.quorum() {
 			// Roll back EVERY accepted participant — not the full set, not a
 			// quorum subset — so no failed add stays visible on any future primary.
-			for &i in &accepted {
-				self.participants[i].rollback(op_id).await;
+			for &id in &accepted {
+				if let Some(participant) = plan.get(id) {
+					participant.rollback(op_id).await;
+				}
 			}
 			return Err(CounterLeaderError::QuorumFailed);
 		}
@@ -1449,15 +1526,22 @@ impl<P: CounterParticipant> CounterLeader<P> {
 			committed: HashSet::new(),
 		};
 		if self.witness_store.write(&witness).is_err() {
-			for &i in &accepted {
-				self.participants[i].rollback(op_id).await;
+			for &id in &accepted {
+				if let Some(participant) = plan.get(id) {
+					participant.rollback(op_id).await;
+				}
 			}
 			return Err(CounterLeaderError::Internal);
 		}
 		self.witnesses.insert(op_id, witness);
 		// (4/5) Drive commit markers across the accepted set; partial failures
 		// stay pending in the durable witness for the reconciler, never rolled back.
-		self.drive_commits(op_id).await;
+		let resolver = StaticCounterParticipantResolver::new(
+			plan.iter()
+				.map(|(id, participant)| (id, participant.clone()))
+				.collect(),
+		);
+		self.drive_commits(op_id, &resolver).await;
 
 		// (3/4) Record the typed idempotency outcome. The value reached quorum
 		// and is either fully committed or recoverable-pending (the durable
@@ -1473,7 +1557,10 @@ impl<P: CounterParticipant> CounterLeader<P> {
 	/// marking each committed (and re-persisting the witness) on success.
 	/// Resolves the witness — in memory AND on disk — only once EVERY accepted
 	/// participant is committed. Idempotent and re-runnable (the reconciler).
-	async fn drive_commits(&self, op_id: u64) {
+	async fn drive_commits<R>(&self, op_id: u64, resolver: &R)
+	where
+		R: CounterParticipantResolver<P>,
+	{
 		let (key, value, commit_hlc, accepted) = match self.witnesses.get(&op_id) {
 			Some(witness) => (
 				witness.key.clone(),
@@ -1497,7 +1584,9 @@ impl<P: CounterParticipant> CounterLeader<P> {
 			// before committing, so reconciliation survives a participant that
 			// lost its in-flight pending entry. `commit` is idempotent and the
 			// value is the absolute `current`, so re-driving never double-adds.
-			let participant = &self.participants[i];
+			let Some(participant) = resolver.resolve_recorded(i) else {
+				continue;
+			};
 			if participant
 				.replicate_tentative(op_id, &key, value, commit_hlc)
 				.await
@@ -1541,16 +1630,19 @@ impl<P: CounterParticipant> CounterLeader<P> {
 	/// write finalization — it completes per-participant commit markers, it does
 	/// not merely record a marker. Idempotent: already-committed participants are
 	/// skipped and `commit` is itself idempotent, so no double-add.
-	pub async fn reconcile(&self) {
+	pub async fn reconcile<R>(&self, resolver: &R)
+	where
+		R: CounterParticipantResolver<P>,
+	{
 		let pending: Vec<u64> = self.witnesses.iter().map(|entry| *entry.key()).collect();
 		for op_id in pending {
-			self.drive_commits(op_id).await;
+			self.drive_commits(op_id, resolver).await;
 		}
 	}
 
 	/// Point read of the committed counter from the local primary store.
 	pub async fn read(&self, key: &CounterKey) -> Result<Option<u64>, CounterLeaderError> {
-		self.participants[0]
+		self.local
 			.read_committed(key)
 			.await
 			.map_err(|_| CounterLeaderError::Internal)
@@ -1909,7 +2001,7 @@ mod tests {
 mod slab_store_tests {
 	//! ADR 075 cut-2 substrate proofs: the REAL `SlabCounterStore` over a real
 	//! `LocalSlabStore`, exercising the production `recover_slab` rule across an
-	//! actual close/reopen. `COUNTER_ADD_REQ` stays dark — no dispatch here.
+	//! actual close/reopen. `COUNTER_ADD_REQ` dispatch is not exercised here.
 
 	use super::*;
 	use crate::schema::{HybridTimestamp, SlabId, SlabRecordHeader, TenantId};
@@ -1923,6 +2015,7 @@ mod slab_store_tests {
 			node_id: 0,
 		}
 	}
+
 	use crate::storage::core::{GroupCommitConfig, LocalSlabStore};
 	use crate::storage::{BlockingFileOps, StorageEngine};
 	use std::io::{Read, Seek, SeekFrom};
@@ -2401,7 +2494,8 @@ mod leader_tests {
 	//! `LocalSlabStore`). The two failure-injection fixtures the leader boundary
 	//! turns on — "remote accepts, leader fails before quorum" and "commit
 	//! succeeds on some, fails on others" — are expressible here precisely
-	//! because the harness is deterministic. `COUNTER_ADD_REQ` is still dark.
+	//! because the harness is deterministic. Data-server `COUNTER_ADD_REQ`
+	//! dispatch is covered in the network tests.
 
 	use super::*;
 	use crate::schema::{HybridTimestamp, SlabId, TenantId};
@@ -2426,6 +2520,13 @@ mod leader_tests {
 			physical_ms: ms,
 			logical: 0,
 			node_id: 0,
+		}
+	}
+
+	fn node_id(index: usize) -> NodeId {
+		NodeId {
+			id: (index as u32) + 1,
+			_reserved: 0,
 		}
 	}
 
@@ -2464,16 +2565,20 @@ mod leader_tests {
 	}
 
 	/// A participant over a real store, with deterministic fault injection.
+	#[derive(Clone)]
 	struct TestParticipant {
-		replica: CounterReplica<LocalSlabStore>,
-		fail_tentative: AtomicBool,
+		replica: Arc<CounterReplica<LocalSlabStore>>,
+		fail_tentative: Arc<AtomicBool>,
 	}
 
 	impl TestParticipant {
 		fn over(store: Arc<LocalSlabStore>) -> Self {
 			Self {
-				replica: CounterReplica::new(SlabCounterStore::new(store, TenantId::new(7))),
-				fail_tentative: AtomicBool::new(false),
+				replica: Arc::new(CounterReplica::new(SlabCounterStore::new(
+					store,
+					TenantId::new(7),
+				))),
+				fail_tentative: Arc::new(AtomicBool::new(false)),
 			}
 		}
 		/// The next `replicate_tentative` fails (excluded from the accepted set).
@@ -2519,18 +2624,103 @@ mod leader_tests {
 		}
 	}
 
-	impl CounterLeader<TestParticipant> {
+	struct LeaderHarness {
+		leader: CounterLeader<TestParticipant>,
+		participants: Vec<(NodeId, TestParticipant)>,
+		quorum: usize,
+	}
+
+	impl LeaderHarness {
+		fn new(
+			participants: Vec<TestParticipant>,
+			quorum: usize,
+			is_primary: bool,
+			witness_store: DurableCounterWitnessStore,
+		) -> Self {
+			let participants: Vec<_> = participants
+				.into_iter()
+				.enumerate()
+				.map(|(i, participant)| (node_id(i), participant))
+				.collect();
+			let local = participants
+				.first()
+				.expect("test leader needs a local participant")
+				.1
+				.clone();
+			let leader = CounterLeader::new(node_id(0), local, is_primary, witness_store);
+			Self {
+				leader,
+				participants,
+				quorum,
+			}
+		}
+
+		fn recover(
+			participants: Vec<TestParticipant>,
+			quorum: usize,
+			is_primary: bool,
+			witness_store: DurableCounterWitnessStore,
+		) -> std::io::Result<Self> {
+			let participants: Vec<_> = participants
+				.into_iter()
+				.enumerate()
+				.map(|(i, participant)| (node_id(i), participant))
+				.collect();
+			let local = participants
+				.first()
+				.expect("test leader needs a local participant")
+				.1
+				.clone();
+			let leader = CounterLeader::recover(node_id(0), local, is_primary, witness_store)?;
+			Ok(Self {
+				leader,
+				participants,
+				quorum,
+			})
+		}
+
+		fn plan(&self) -> CounterParticipantPlan<TestParticipant> {
+			CounterParticipantPlan::new(self.participants.clone(), self.quorum)
+		}
+
+		fn resolver(&self) -> StaticCounterParticipantResolver<TestParticipant> {
+			StaticCounterParticipantResolver::new(self.participants.clone())
+		}
+
+		async fn fetch_add(
+			&self,
+			write_key: CounterWriteKey,
+			key: &CounterKey,
+			delta: u64,
+		) -> Result<CounterAddResult, CounterLeaderError> {
+			self.leader
+				.fetch_add(self.plan(), write_key, key, delta)
+				.await
+		}
+
+		async fn reconcile(&self) {
+			self.leader.reconcile(&self.resolver()).await;
+		}
+
+		async fn read(&self, key: &CounterKey) -> Result<Option<u64>, CounterLeaderError> {
+			self.leader.read(key).await
+		}
+
+		fn pending_witnesses(&self) -> usize {
+			self.leader.pending_witnesses()
+		}
+
 		/// Read a specific participant's committed value (test inspection).
 		async fn participant_read(&self, i: usize, key: &CounterKey) -> Option<u64> {
-			self.participants[i].read_committed(key).await.unwrap()
+			self.participants[i].1.read_committed(key).await.unwrap()
 		}
 		/// Arm a participant's next commit to fail.
 		fn arm_participant_commit_failure(&self, i: usize) {
-			self.participants[i].arm_commit_failure();
+			self.participants[i].1.arm_commit_failure();
 		}
 		/// Arm a participant's next tentative to fail.
 		fn arm_participant_tentative_failure(&self, i: usize) {
-			self.participants[i].arm_tentative_failure();
+			self.participants[i].1.arm_tentative_failure();
 		}
 	}
 
@@ -2639,7 +2829,7 @@ mod leader_tests {
 	async fn fetch_add_commits_all_accepted_and_resolves_witness() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 3).await;
-		let leader = CounterLeader::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore());
 		let k = ckey(b"verdict");
 		let out = leader.fetch_add(wk(1), &k, 5).await.unwrap();
 		assert_eq!(
@@ -2666,7 +2856,7 @@ mod leader_tests {
 	async fn duplicate_write_id_replays_without_readding() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 3).await;
-		let leader = CounterLeader::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore());
 		let k = ckey(b"verdict");
 		let first = leader.fetch_add(wk(1), &k, 5).await.unwrap();
 		let replay = leader.fetch_add(wk(1), &k, 5).await.unwrap();
@@ -2696,7 +2886,7 @@ mod leader_tests {
 	async fn non_primary_redirects_not_replays() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 1).await;
-		let leader = CounterLeader::new(ps, 1, false, wstore());
+		let leader = LeaderHarness::new(ps, 1, false, wstore());
 		let k = ckey(b"verdict");
 		assert_eq!(
 			leader.fetch_add(wk(1), &k, 5).await,
@@ -2711,7 +2901,7 @@ mod leader_tests {
 	async fn quorum_failure_rolls_back_every_accepted_participant() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 3).await;
-		let leader = CounterLeader::new(ps, 3, true, wstore()); // need all 3
+		let leader = LeaderHarness::new(ps, 3, true, wstore()); // need all 3
 		let k = ckey(b"verdict");
 		leader.arm_participant_tentative_failure(2); // participant 2 will NOT accept
 		assert_eq!(
@@ -2751,7 +2941,7 @@ mod leader_tests {
 	async fn commit_reaches_every_accepted_participant_beyond_quorum() {
 		let dir = slab_dir();
 		let (ps, paths) = participants(&dir, 3).await;
-		let leader = CounterLeader::new(ps, 2, true, wstore()); // quorum 2 of 3, all accept
+		let leader = LeaderHarness::new(ps, 2, true, wstore()); // quorum 2 of 3, all accept
 		let k = ckey(b"verdict");
 		leader.fetch_add(wk(1), &k, 5).await.unwrap();
 		assert_eq!(leader.pending_witnesses(), 0);
@@ -2787,7 +2977,7 @@ mod leader_tests {
 		}
 		// A becomes the primary after restart and takes the next add.
 		let store_a2 = open_store(&path_a).await;
-		let leader = CounterLeader::new(vec![TestParticipant::over(store_a2)], 1, true, wstore());
+		let leader = LeaderHarness::new(vec![TestParticipant::over(store_a2)], 1, true, wstore());
 		let out = leader.fetch_add(wk(2), &k, 1).await.unwrap().outcome();
 		assert_eq!(
 			out.previous, 0,
@@ -2803,7 +2993,7 @@ mod leader_tests {
 	async fn partial_commit_reconciles_to_completion_no_double_add_no_loss() {
 		let dir = slab_dir();
 		let (ps, paths) = participants(&dir, 3).await;
-		let leader = CounterLeader::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore());
 		let k = ckey(b"verdict");
 		leader.arm_participant_commit_failure(2); // participant 2's commit marker fails once
 		let out = leader.fetch_add(wk(1), &k, 5).await.unwrap();
@@ -2850,6 +3040,81 @@ mod leader_tests {
 		}
 	}
 
+	// ADR 076 D3 discriminator: pending witnesses re-drive the recorded peer
+	// identities, while a later fresh add can use a different current-ring
+	// participant set. A positional re-drive would commit the old witness on the
+	// new peer (2) instead of the recorded peer (1).
+	#[tokio::test]
+	async fn recorded_redrive_and_fresh_routing_are_distinct_after_ring_shift() {
+		let dir = slab_dir();
+		let (ps, paths) = participants(&dir, 3).await;
+		let leader = LeaderHarness::new(ps, 2, true, wstore());
+		let k = ckey(b"verdict");
+		let p0 = leader.participants.first().unwrap().clone();
+		let p1 = leader.participants.get(1).unwrap().clone();
+		let p2 = leader.participants.get(2).unwrap().clone();
+
+		let old_recorded_plan = CounterParticipantPlan::new(vec![p0.clone(), p1.clone()], 2);
+		leader.arm_participant_commit_failure(1);
+		assert_eq!(
+			leader
+				.leader
+				.fetch_add(old_recorded_plan, wk(1), &k, 5)
+				.await
+				.unwrap(),
+			CounterAddResult::Applied(CounterAddOutcome {
+				previous: 0,
+				current: 5,
+			})
+		);
+		assert_eq!(
+			leader.pending_witnesses(),
+			1,
+			"recorded peer 1 still owes the old commit marker"
+		);
+
+		let recorded_resolver = StaticCounterParticipantResolver::new(vec![p0.clone(), p1.clone()]);
+		leader.leader.reconcile(&recorded_resolver).await;
+		assert_eq!(
+			leader.pending_witnesses(),
+			0,
+			"old witness resolved through the recorded resolver"
+		);
+		assert_eq!(
+			read_after_restart(&paths[1], &k).await,
+			Some(5),
+			"recorded peer 1 received the owed commit marker"
+		);
+		assert_eq!(
+			read_after_restart(&paths[2], &k).await,
+			None,
+			"new-ring peer 2 was not guessed from the old recorded witness"
+		);
+
+		let new_ring_plan = CounterParticipantPlan::new(vec![p0, p2], 2);
+		assert_eq!(
+			leader
+				.leader
+				.fetch_add(new_ring_plan, wk(2), &k, 3)
+				.await
+				.unwrap(),
+			CounterAddResult::Applied(CounterAddOutcome {
+				previous: 5,
+				current: 8,
+			})
+		);
+		assert_eq!(
+			read_after_restart(&paths[2], &k).await,
+			Some(8),
+			"fresh add used the new current-ring peer 2"
+		);
+		assert_eq!(
+			read_after_restart(&paths[1], &k).await,
+			Some(5),
+			"fresh add did not keep targeting the old recorded-only peer"
+		);
+	}
+
 	// Acceptance: a LEADER restart with a partial commit loads the durable
 	// witness and reconciles markers to every accepted participant. The witness
 	// is removed only after all are committed.
@@ -2868,7 +3133,7 @@ mod leader_tests {
 				ps.push(TestParticipant::over(s.clone()));
 				stores.push(s);
 			}
-			let leader = CounterLeader::new(
+			let leader = LeaderHarness::new(
 				ps,
 				2,
 				true,
@@ -2898,7 +3163,7 @@ mod leader_tests {
 		for path in &paths {
 			ps2.push(TestParticipant::over(open_store(path).await));
 		}
-		let leader2 = CounterLeader::recover(
+		let leader2 = LeaderHarness::recover(
 			ps2,
 			2,
 			true,
@@ -2947,7 +3212,7 @@ mod leader_tests {
 	async fn duplicate_retry_during_pending_replays_and_does_not_readd() {
 		let dir = slab_dir();
 		let (ps, _paths) = participants(&dir, 3).await;
-		let leader = CounterLeader::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore());
 		let k = ckey(b"verdict");
 		leader.arm_participant_commit_failure(2); // leave the witness pending
 		let first = leader.fetch_add(wk(1), &k, 5).await.unwrap();
@@ -2973,7 +3238,7 @@ mod leader_tests {
 	async fn repeated_reconcile_is_idempotent() {
 		let dir = slab_dir();
 		let (ps, paths) = participants(&dir, 3).await;
-		let leader = CounterLeader::new(ps, 2, true, wstore());
+		let leader = LeaderHarness::new(ps, 2, true, wstore());
 		let k = ckey(b"verdict");
 		leader.arm_participant_commit_failure(2);
 		leader.fetch_add(wk(1), &k, 5).await.unwrap();
@@ -3009,7 +3274,7 @@ mod leader_tests {
 				ps.push(TestParticipant::over(s.clone()));
 				stores.push(s);
 			}
-			let leader = CounterLeader::new(
+			let leader = LeaderHarness::new(
 				ps,
 				1,
 				true,
@@ -3052,7 +3317,7 @@ mod leader_tests {
 		for path in &paths {
 			ps2.push(TestParticipant::over(open_store(path).await));
 		}
-		let leader2 = CounterLeader::recover(
+		let leader2 = LeaderHarness::recover(
 			ps2,
 			1,
 			true,
@@ -3083,7 +3348,7 @@ mod leader_tests {
 		let k = ckey(b"verdict");
 		{
 			let store = open_store(&path).await;
-			let leader = CounterLeader::new(
+			let leader = LeaderHarness::new(
 				vec![TestParticipant::over(store.clone())],
 				1,
 				true,
@@ -3105,7 +3370,7 @@ mod leader_tests {
 			store.fsync().await.unwrap();
 		}
 		// Restart: recover from the same dirs.
-		let leader2 = CounterLeader::recover(
+		let leader2 = LeaderHarness::recover(
 			vec![TestParticipant::over(open_store(&path).await)],
 			1,
 			true,
@@ -3155,7 +3420,7 @@ mod leader_tests {
 		let hlc_before;
 		{
 			let store = open_store(&path).await;
-			let leader = CounterLeader::new(
+			let leader = LeaderHarness::new(
 				vec![TestParticipant::over(store.clone())],
 				1,
 				true,
@@ -3171,7 +3436,7 @@ mod leader_tests {
 		}
 		// Clean restart — recovery must seed op_seq past the applied op-ids.
 		let store2 = open_store(&path).await;
-		let leader2 = CounterLeader::recover(
+		let leader2 = LeaderHarness::recover(
 			vec![TestParticipant::over(store2.clone())],
 			1,
 			true,

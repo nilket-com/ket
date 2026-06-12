@@ -171,7 +171,11 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::COUNTER_ADD_REQ.0
 				|| x == MsgType::COUNTER_ADD_RESP.0
 				|| x == MsgType::COUNTER_READ_REQ.0
-				|| x == MsgType::COUNTER_READ_RESP.0 =>
+				|| x == MsgType::COUNTER_READ_RESP.0
+				|| x == MsgType::COUNTER_REPLICATE_REQ.0
+				|| x == MsgType::COUNTER_REPLICATE_RESP.0
+				|| x == MsgType::COUNTER_ROLLBACK_REQ.0
+				|| x == MsgType::COUNTER_ROLLBACK_RESP.0 =>
 			{
 				match &self.data {
 					Some(h) => h.handle_data_frame(context, frame).await,

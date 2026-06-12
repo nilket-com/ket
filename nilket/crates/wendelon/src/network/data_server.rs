@@ -284,7 +284,6 @@ impl CachedWriteOutcome {
 /// ADR 075 cut-8: the network side of [`CounterReplicaTransport`] — drives the
 /// counter replicate/rollback wire to a peer for a leader's remote participant.
 /// Holds only the transport factory + buffer pool (the send functions are static).
-#[allow(dead_code)] // constructed by the production remote-participant wiring (cut-8b, Fork-2)
 struct CounterReplicaNetworkTransport {
 	factory: Arc<TransportProviderFactory>,
 	pool: Arc<BufPool>,
@@ -340,6 +339,49 @@ impl crate::storage::counter::CounterReplicaTransport for CounterReplicaNetworkT
 			};
 			let _ = WendelonDataServer::rollback_counter_to_remote(factory, pool, peer, meta).await;
 		})
+	}
+}
+
+#[derive(Clone)]
+struct CounterParticipantFactory {
+	local_node: NodeId,
+	tenant_id: TenantId,
+	epoch: u64,
+	local: Arc<crate::storage::counter::CounterReplicaService>,
+	transport: Arc<dyn crate::storage::counter::CounterReplicaTransport>,
+}
+
+impl CounterParticipantFactory {
+	fn participant_for(&self, peer: NodeId) -> crate::storage::counter::CounterParticipantKind {
+		use crate::storage::counter::{
+			CounterParticipantKind, LocalCounterParticipant, RemoteCounterParticipant,
+		};
+		if peer.id == self.local_node.id {
+			CounterParticipantKind::Local(LocalCounterParticipant::new(
+				self.local.clone(),
+				self.tenant_id,
+			))
+		} else {
+			CounterParticipantKind::Remote(RemoteCounterParticipant::new(
+				self.transport.clone(),
+				peer,
+				self.tenant_id,
+				self.epoch,
+			))
+		}
+	}
+}
+
+impl
+	crate::storage::counter::CounterParticipantResolver<
+		crate::storage::counter::CounterParticipantKind,
+	> for CounterParticipantFactory
+{
+	fn resolve_recorded(
+		&self,
+		id: NodeId,
+	) -> Option<crate::storage::counter::CounterParticipantKind> {
+		Some(self.participant_for(id))
 	}
 }
 
@@ -898,12 +940,9 @@ pub struct WendelonDataServer {
 	/// `COUNTER_REPLICATE_REQ` / `COUNTER_ROLLBACK_REQ`. It intentionally never
 	/// touches `pending_finalizations` (a counter tentative carries no witness).
 	counter_replica: Arc<crate::storage::counter::CounterReplicaService>,
-	/// ADR 075 cut-4: per-tenant counter leaders over the production participant
-	/// set. Each leader's sole wired arm today is the node's own
-	/// `LocalCounterParticipant` over `counter_replica` (single-node, quorum 1); the
-	/// remote arm + quorum > 1 land when cut-3b's transport surfaces a
-	/// `CounterParticipant`. Built lazily per tenant (the leader holds per-key locks,
-	/// D4 op state, and the durable finalization witness).
+	/// ADR 075/076: per-tenant counter leaders over production participants.
+	/// Fresh per-key routing is derived by the data-server for each add; durable
+	/// witnesses keep peer identities so recovery can reconcile the recorded set.
 	counter_leaders: Arc<
 		DashMap<
 			TenantId,
@@ -3859,7 +3898,6 @@ impl WendelonDataServer {
 	/// validates ONLY the counter response meta — it never rides ordinary
 	/// `REPLICATE_REQ`. The caller treats the peer as accepted iff
 	/// `ack.status == CounterReplicaStatus::OK`.
-	#[allow(dead_code)] // reachable via CounterReplicaNetworkTransport (constructed in cut-8b)
 	async fn replicate_counter_to_remote(
 		factory: Arc<TransportProviderFactory>,
 		pool: Arc<BufPool>,
@@ -3879,7 +3917,6 @@ impl WendelonDataServer {
 
 	/// ADR 075: ship a `COUNTER_ROLLBACK_REQ` to one peer and return its ack.
 	/// Counter frames only.
-	#[allow(dead_code)] // reachable via CounterReplicaNetworkTransport (constructed in cut-8b)
 	async fn rollback_counter_to_remote(
 		factory: Arc<TransportProviderFactory>,
 		pool: Arc<BufPool>,
@@ -3900,7 +3937,6 @@ impl WendelonDataServer {
 	/// Shared one-shot counter request/response over a bidi stream: send a fixed
 	/// counter request meta (no arrow payload — the value rides in the meta),
 	/// await the matching counter response, and decode the fixed `CounterReplicaAck`.
-	#[allow(dead_code)] // reachable via CounterReplicaNetworkTransport (constructed in cut-8b)
 	async fn counter_round_trip(
 		factory: Arc<TransportProviderFactory>,
 		pool: Arc<BufPool>,
@@ -7567,16 +7603,16 @@ impl WendelonDataServer {
 		))
 	}
 
-	/// ADR 075 cut-4: the per-tenant counter leader, built lazily — by RECOVERY,
+	/// ADR 075/076: the per-tenant counter leader, built lazily — by RECOVERY,
 	/// not fresh construction: it loads the tenant's durable counter state (the
 	/// applied D4 dedup log + any pending finalization witnesses) and reconciles
 	/// partial commits BEFORE serving, so a duplicate `ClientWriteId` retry after
 	/// a node restart replays `DUPLICATE` instead of re-adding, and a
-	/// witnessed-but-unmarked add becomes readable again. Its sole wired
-	/// participant is this node's own `LocalCounterParticipant` over
-	/// `counter_replica` (single-node, quorum 1). The per-tenant init gate makes
-	/// concurrent first requests recover exactly once (recovery does file I/O —
-	/// never under a DashMap entry lock across await).
+	/// witnessed-but-unmarked add becomes readable again. Fresh counter adds pass
+	/// a per-key participant plan; recovery resolves the peer identities recorded
+	/// in the witness separately from fresh routing. The per-tenant init gate
+	/// makes concurrent first requests recover exactly once (recovery does file
+	/// I/O — never under a DashMap entry lock across await).
 	async fn counter_leader_for(
 		&self,
 		tenant_id: TenantId,
@@ -7612,19 +7648,35 @@ impl WendelonDataServer {
 			.join(format!("tenant-{}", tenant_id.get()));
 		std::fs::create_dir_all(&witness_dir)?;
 		let witness_store = DurableCounterWitnessStore::open(witness_dir)?;
-		// Single-node: this node is the primary for its own keys, so quorum 1
-		// over the local arm. Multi-node routing + remote participants + quorum
-		// > 1 are the follow-on once cut-3b's transport surfaces a participant.
 		let leader = Arc::new(CounterLeader::recover(
-			vec![participant],
-			1,
+			self.local_node,
+			participant,
 			true,
 			witness_store,
 		)?);
 		// Finish any partial commit fan-out (idempotent) before first service.
-		leader.reconcile().await;
+		let resolver =
+			self.counter_participant_factory(tenant_id, self.admission_snapshot().current_epoch);
+		leader.reconcile(&resolver).await;
 		self.counter_leaders.insert(tenant_id, leader.clone());
 		Ok(leader)
+	}
+
+	fn counter_participant_factory(
+		&self,
+		tenant_id: TenantId,
+		epoch: u64,
+	) -> CounterParticipantFactory {
+		CounterParticipantFactory {
+			local_node: self.local_node,
+			tenant_id,
+			epoch,
+			local: self.counter_replica.clone(),
+			transport: Arc::new(CounterReplicaNetworkTransport {
+				factory: self.factory.clone(),
+				pool: self.pool.clone(),
+			}),
+		}
 	}
 
 	/// Zero HLC placeholder for counter responses. Authoritative `commit_hlc`
@@ -7646,6 +7698,25 @@ impl WendelonDataServer {
 		current_value: u64,
 		commit_hlc: HybridTimestamp,
 	) -> CounterAddResponseMeta {
+		self.counter_add_response_with_hint(
+			meta,
+			status,
+			previous_value,
+			current_value,
+			commit_hlc,
+			self.local_node,
+		)
+	}
+
+	fn counter_add_response_with_hint(
+		&self,
+		meta: &CounterAddRequestMeta,
+		status: WriteStatus,
+		previous_value: u64,
+		current_value: u64,
+		commit_hlc: HybridTimestamp,
+		leader_hint: NodeId,
+	) -> CounterAddResponseMeta {
 		CounterAddResponseMeta {
 			status,
 			_pad1: [0; 7],
@@ -7653,7 +7724,7 @@ impl WendelonDataServer {
 			term: 0,
 			epoch: meta.expected_epoch,
 			commit_hlc,
-			leader_hint: self.local_node,
+			leader_hint,
 			echoed_write_id: meta.write_id,
 			previous_value,
 			current_value,
@@ -7691,9 +7762,12 @@ impl WendelonDataServer {
 	/// ADR 075 cut-4: the public `COUNTER_ADD_REQ` handler. Extracts + structurally
 	/// verifies the counter key (D7), replays a duplicate `ClientWriteId` from the
 	/// server-side D4 cache, else drives the per-tenant `CounterLeader` and caches
-	/// the accepted outcome. Single-node (quorum 1) for now.
+	/// the accepted outcome. ADR 076 derives the participant set from the key's
+	/// current replica set and reaches majority quorum under replication.
 	async fn handle_counter_add(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
-		use crate::storage::counter::{CounterKey, CounterLeaderError, counter_identity};
+		use crate::storage::counter::{
+			CounterKey, CounterLeaderError, CounterParticipantPlan, counter_identity,
+		};
 		if frame.meta.len() < std::mem::size_of::<CounterAddRequestMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -7711,26 +7785,6 @@ impl WendelonDataServer {
 				self.counter_add_response(
 					&meta,
 					WriteStatus::INTERNAL_ERROR,
-					0,
-					0,
-					Self::zero_counter_hlc(),
-				),
-			));
-		}
-
-		// Fail closed under replication. cut-4's leader is single-node (quorum 1,
-		// local arm only); under rf > 1 a counter add would be durable ONLY on the
-		// primary and never replicate to the key's other replicas — silently
-		// violating D3's durable-quorum. Reject until cut-8b wires ring-driven
-		// multi-node replication (peer-identity witness + reconcile to recorded
-		// peers). `rf = 1` (the default, and any single-data-node cluster) is
-		// unaffected — `replication_factor()` is `rf.min(data_count)`.
-		if self.router.replication_factor() > 1 {
-			return Ok(self.build_counter_add_response_frame(
-				stream_id,
-				self.counter_add_response(
-					&meta,
-					WriteStatus::COUNTER_REPLICATION_UNSUPPORTED,
 					0,
 					0,
 					Self::zero_counter_hlc(),
@@ -7769,6 +7823,45 @@ impl WendelonDataServer {
 			));
 		}
 
+		let replicas = self
+			.router
+			.replicas_for_locality(Locality::from(meta.key_identity));
+		let Some(owner) = replicas.first().copied() else {
+			return Ok(self.build_counter_add_response_frame(
+				stream_id,
+				self.counter_add_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					0,
+					0,
+					Self::zero_counter_hlc(),
+				),
+			));
+		};
+		if owner.id != self.local_node.id {
+			return Ok(self.build_counter_add_response_frame(
+				stream_id,
+				self.counter_add_response_with_hint(
+					&meta,
+					WriteStatus::NOT_LEADER,
+					0,
+					0,
+					Self::zero_counter_hlc(),
+					owner,
+				),
+			));
+		}
+		let participant_factory =
+			self.counter_participant_factory(meta.tenant_id, meta.expected_epoch);
+		let quorum = (replicas.len() / 2) + 1;
+		let plan = CounterParticipantPlan::new(
+			replicas
+				.iter()
+				.map(|peer| (*peer, participant_factory.participant_for(*peer)))
+				.collect(),
+			quorum,
+		);
+
 		// D4 public idempotency lives in the MUTATION layer: the leader keys its
 		// durable dedup record by the canonical `ClientWriteId` bytes (never a
 		// hashed/narrowed handle), serializes concurrent duplicates on its
@@ -7778,7 +7871,7 @@ impl WendelonDataServer {
 		// after a node restart (`counter_leader_for` recovers the record).
 		let leader = self.counter_leader_for(meta.tenant_id).await?;
 		let write_key = meta.write_id.canonical_idempotency_bytes();
-		let resp = match leader.fetch_add(write_key, &key, meta.delta).await {
+		let resp = match leader.fetch_add(plan, write_key, &key, meta.delta).await {
 			Ok(result) => {
 				let outcome = result.outcome();
 				let status = if result.is_replay() {
@@ -28861,6 +28954,356 @@ mod tests {
 			}
 			break meta;
 		}
+	}
+
+	struct CounterReplicationFixture {
+		leader_node: WendelonNode,
+		follower_node: WendelonNode,
+		leader: Arc<WendelonDataServer>,
+		follower: Arc<WendelonDataServer>,
+	}
+
+	async fn build_counter_replication_fixture(
+		tag: &str,
+		key_identity: Identity,
+	) -> CounterReplicationFixture {
+		build_counter_replication_fixture_with_remote_registration(tag, key_identity, true).await
+	}
+
+	async fn build_counter_replication_fixture_with_remote_registration(
+		tag: &str,
+		key_identity: Identity,
+		register_follower: bool,
+	) -> CounterReplicationFixture {
+		let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			43,
+			bootstrap_tempdir(&format!("{tag}-leader")),
+			"loopback://43".into(),
+		))
+		.await
+		.unwrap();
+		let follower_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			44,
+			bootstrap_tempdir(&format!("{tag}-follower")),
+			"loopback://44".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if leader_node.raft.current_leader().await == Some(leader_node.local_node.id)
+				&& follower_node.raft.current_leader().await == Some(follower_node.local_node.id)
+			{
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leaders"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+
+		let pool = leader_node.pool.clone();
+		let handlers = LoopbackHandlers::new(pool.clone());
+		let loopback_provider: Arc<dyn TransportProvider> = Arc::new(LoopbackProvider {
+			handlers: handlers.clone(),
+			tier: TransportTier::QuicIoUring,
+		});
+		let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = StdHashMap::new();
+		for (node_id, address) in [
+			(leader_node.local_node, "loopback://43"),
+			(follower_node.local_node, "loopback://44"),
+		] {
+			peers.insert(
+				node_id,
+				PeerCapabilities {
+					address: address.into(),
+					tiers,
+					roles,
+					capabilities: crate::network::transport::NodeCapabilitySet::empty(),
+				},
+			);
+		}
+		let epoch = MembershipEpoch { epoch: 0, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let build_factory = || {
+			let mut providers: StdHashMap<TransportTier, Arc<dyn TransportProvider>> =
+				StdHashMap::new();
+			providers.insert(TransportTier::QuicIoUring, loopback_provider.clone());
+			TransportProviderFactory::new(tiers, providers, resolver.clone(), epoch_rx.clone())
+		};
+		let route = vec![leader_node.local_node, follower_node.local_node];
+		let router: Arc<dyn ReplicaRouter> = Arc::new(
+			FixedReplicaRouter::new(route.clone()).with_route(Locality::from(key_identity), route),
+		);
+
+		let leader = Arc::new(
+			WendelonDataServer::new(
+				leader_node.slab.clone(),
+				leader_node.raft.clone(),
+				leader_node.log_store.clone(),
+				leader_node.state_machine.clone(),
+				leader_node.local_node,
+				leader_node.clock.clone(),
+				router.clone(),
+				build_factory(),
+				pool.clone(),
+			)
+			.unwrap(),
+		);
+		let follower = Arc::new(
+			WendelonDataServer::new(
+				follower_node.slab.clone(),
+				follower_node.raft.clone(),
+				follower_node.log_store.clone(),
+				follower_node.state_machine.clone(),
+				follower_node.local_node,
+				follower_node.clock.clone(),
+				router,
+				build_factory(),
+				follower_node.pool.clone(),
+			)
+			.unwrap(),
+		);
+		if register_follower {
+			handlers.register(
+				follower_node.local_node,
+				Arc::new(
+					MsgRouter::builder()
+						.with_data_ring(follower.clone())
+						.build(),
+				),
+			);
+		}
+
+		CounterReplicationFixture {
+			leader_node,
+			follower_node,
+			leader,
+			follower,
+		}
+	}
+
+	// ADR 076: a healthy replicated COUNTER_ADD uses the key's current replica
+	// set, explicitly treats the local primary as the local arm, and sends the
+	// remote arm over the counter-specific replicate/commit wire. This is the
+	// regression guard for retiring the old rf>1 unsupported gate.
+	#[tokio::test]
+	async fn counter_add_primary_replicates_to_remote_participant() {
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+		let fx =
+			build_counter_replication_fixture("counter-replicated-primary", key_identity).await;
+
+		let resp = dispatch_counter_add_shared(
+			fx.leader.clone(),
+			fx.leader_node.pool.clone(),
+			fx.leader_node.local_node,
+			1,
+			5,
+			key_identity,
+		)
+		.await;
+		assert_eq!(resp.status, WriteStatus::OK, "got resp={resp:?}");
+		assert_eq!((resp.previous_value, resp.current_value), (0, 5));
+		assert_eq!(
+			fx.leader
+				.counter_replica
+				.read_committed(tenant(), key_identity)
+				.await
+				.unwrap(),
+			Some(5),
+			"primary local arm committed the add"
+		);
+		assert_eq!(
+			fx.follower
+				.counter_replica
+				.read_committed(tenant(), key_identity)
+				.await
+				.unwrap(),
+			Some(5),
+			"remote participant received the counter commit marker"
+		);
+
+		fx.leader_node.handles.abort();
+		fx.follower_node.handles.abort();
+	}
+
+	// ADR 076 required fixture: rf=2 must not return primary-only success. If
+	// the remote participant cannot be reached, the local tentative is rolled
+	// back and the client observes a closed failure rather than OK.
+	#[tokio::test]
+	async fn no_primary_only_success_under_replication() {
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+		let fx = build_counter_replication_fixture_with_remote_registration(
+			"counter-replicated-primary-only",
+			key_identity,
+			false,
+		)
+		.await;
+
+		let resp = dispatch_counter_add_shared(
+			fx.leader.clone(),
+			fx.leader_node.pool.clone(),
+			fx.leader_node.local_node,
+			1,
+			5,
+			key_identity,
+		)
+		.await;
+		assert_eq!(
+			resp.status,
+			WriteStatus::INTERNAL_ERROR,
+			"got resp={resp:?}"
+		);
+		assert_eq!(
+			(resp.previous_value, resp.current_value),
+			(0, 0),
+			"failed replicated counter add must not report an applied outcome"
+		);
+		assert_eq!(
+			fx.leader
+				.counter_replica
+				.read_committed(tenant(), key_identity)
+				.await
+				.unwrap(),
+			None,
+			"primary-only tentative was rolled back instead of becoming committed"
+		);
+		assert_eq!(
+			fx.follower
+				.counter_replica
+				.read_committed(tenant(), key_identity)
+				.await
+				.unwrap(),
+			None,
+			"unreachable remote did not receive a committed counter value"
+		);
+
+		fx.leader_node.handles.abort();
+		fx.follower_node.handles.abort();
+	}
+
+	// ADR 076 headline: rf=2 over two live data services, with the remote arm
+	// reached through the counter-specific HRFT loopback transport. Concurrent
+	// unique write ids sum exactly; a duplicate write id replays the original
+	// previous/current instead of adding again.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn replicated_counter_fetch_add_concurrent_adds_sum_exactly() {
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+		let fx =
+			build_counter_replication_fixture("counter-replicated-concurrent", key_identity).await;
+
+		const N: u64 = 16;
+		let mut handles = Vec::new();
+		for seq in 1..=N {
+			handles.push(tokio::spawn(dispatch_counter_add_shared(
+				fx.leader.clone(),
+				fx.leader_node.pool.clone(),
+				fx.leader_node.local_node,
+				seq,
+				1,
+				key_identity,
+			)));
+		}
+		let mut seq1 = None;
+		for (idx, handle) in handles.into_iter().enumerate() {
+			let meta = handle.await.unwrap();
+			assert_eq!(meta.status, WriteStatus::OK, "got resp={meta:?}");
+			if idx == 0 {
+				seq1 = Some(meta);
+			}
+		}
+
+		let duplicate = dispatch_counter_add_shared(
+			fx.leader.clone(),
+			fx.leader_node.pool.clone(),
+			fx.leader_node.local_node,
+			1,
+			1,
+			key_identity,
+		)
+		.await;
+		let seq1 = seq1.expect("seq 1 response captured");
+		assert_eq!(duplicate.status, WriteStatus::DUPLICATE);
+		assert_eq!(
+			(duplicate.previous_value, duplicate.current_value),
+			(seq1.previous_value, seq1.current_value),
+			"duplicate write id replayed the original rf=2 outcome"
+		);
+
+		let final_add = dispatch_counter_add_shared(
+			fx.leader.clone(),
+			fx.leader_node.pool.clone(),
+			fx.leader_node.local_node,
+			N + 1,
+			1,
+			key_identity,
+		)
+		.await;
+		assert_eq!(final_add.status, WriteStatus::OK);
+		assert_eq!(
+			(final_add.previous_value, final_add.current_value),
+			(N, N + 1),
+			"concurrent rf=2 adds summed exactly"
+		);
+		assert_eq!(
+			fx.follower
+				.counter_replica
+				.read_committed(tenant(), key_identity)
+				.await
+				.unwrap(),
+			Some(N + 1),
+			"remote replica committed the final counter value"
+		);
+
+		fx.leader_node.handles.abort();
+		fx.follower_node.handles.abort();
+	}
+
+	// ADR 076: a non-primary server does not mutate, even when it is in the
+	// replica set. It returns NOT_LEADER with the ring primary as the owner hint.
+	#[tokio::test]
+	async fn counter_add_non_primary_returns_owner_hint_without_mutating() {
+		let key_identity = crate::storage::counter::counter_identity(
+			&crate::storage::counter::CounterKey(b"k".to_vec()),
+		);
+		let fx =
+			build_counter_replication_fixture("counter-replicated-nonprimary", key_identity).await;
+
+		let resp = dispatch_counter_add_shared(
+			fx.follower.clone(),
+			fx.follower_node.pool.clone(),
+			fx.follower_node.local_node,
+			1,
+			5,
+			key_identity,
+		)
+		.await;
+		assert_eq!(resp.status, WriteStatus::NOT_LEADER, "got resp={resp:?}");
+		assert_eq!(resp.leader_hint, fx.leader_node.local_node);
+		assert_eq!(
+			fx.follower
+				.counter_replica
+				.read_committed(tenant(), key_identity)
+				.await
+				.unwrap(),
+			None,
+			"non-primary counter add returned before any local mutation"
+		);
+
+		fx.leader_node.handles.abort();
+		fx.follower_node.handles.abort();
 	}
 
 	// ADR 075 HEADLINE fixture (D2): N concurrent unique-write_id `+1` adds to one

@@ -22,16 +22,16 @@ reject — the headline fixture flips from red to green on exactly that deletion
 | Two-node epoch helpers | `advance_to_two_node_epoch` tests/client_data_api.rs, tests/data_ring_wire.rs (control-plane/ring shape only; headline replication still needs two live data services) |
 | Guard to retarget | `adr075_counter_add_fails_closed_under_replication` (tests/architecture_test.rs) |
 
-## Phase 1 — Versioned identity witness + total migration (counter.rs; rf=1 net stays green)
+## Phase 1 — Flat identity witness (counter.rs; rf=1 net stays green)
 
-- `CounterFinalizationWitness` v1: `accepted: Vec<NodeId>`, `committed: HashSet<NodeId>`, explicit
-  leading version tag in the file envelope (not postcard field-appending, not `serde(default)`).
-- `DurableCounterWitnessStore` opens with the local `NodeId`; `load_all` dispatches on version:
-  v1 → decode; untagged v0 → **total migration** (`accepted == [0]`, `committed ⊆ {0}` → local identity);
-  any other v0 index → hard error naming the file (D6).
+- `CounterFinalizationWitness`: `accepted: Vec<NodeId>`, `committed: HashSet<NodeId>`, written directly
+  as the durable postcard witness record.
+- No `V1`/`V2` type names, no version-prefix envelope, and no legacy positional-witness decoder. This is a
+  clean pre-launch format break per `plans/conventions/no-version-suffixes.md` and
+  `plans/conventions/no-premature-backward-compat.md`.
 - `AppliedCounterAdd` log untouched (identity-free).
-- Unit net: v1 round-trip; v0 `[0]` migration (both committed variants); v0 `[1]` refusal;
-  mixed-directory load.
+- Unit net: identity-witness round-trip through the existing pending/reconcile fixtures; source guards pin
+  the absence of version suffixes and migration shims.
 
 ## Phase 2 — Leader rework: explicit local arm + two-route resolution (counter.rs)
 
@@ -61,7 +61,7 @@ reject — the headline fixture flips from red to green on exactly that deletion
   `replicas_for_locality(locality_of(counter_identity))`, self as the explicit local arm, remotes as
   `Remote(peer)`; quorum = the majority floor (share the :10246 rule via a helper, or pin equality with a
   cross-reference test).
-- Witness store opens with the local `NodeId` (Phase 1 input).
+- Witness store opens without a local-node migration parameter.
 - Add counter handler primary enforcement before mutation: derive the current replica list, require
   the first replica's `NodeId` to equal `self.local_node`, and return `NOT_LEADER` with the first replica as
   the hint otherwise. The current 075 counter path does not have this gate; do not describe it as unchanged.
@@ -86,7 +86,7 @@ deletion.
 | `failed_quorum_rolls_back_all_accepted_rf2` | no-poison, now unconditional | tentative leak |
 | `commit_fanout_completes_beyond_quorum_rf3` | D5 completion ≠ quorum | quorum-set-only fan-out |
 | `no_primary_only_success_under_replication` | the 075 guard's purpose, pinned positively | primary-only durability |
-| `v0_local_witness_migrates_v0_remote_index_fails_closed` | D6 totality | identity-guessing |
+| `witness_format_is_flattened_and_identity_only` | D2/D6 convention guard | version suffix / compat shim drift |
 
 Plus the Phase 1/2 unit nets. The headline and remote-path tests must use two live data services over
 simulated transport or an equivalent multi-service loopback; a single-node harness with only a synthetic
@@ -121,10 +121,10 @@ architecture-test stem trap has bitten before on the Toron side.)
 ## Hygiene
 
 - No m-word in src/tests; counter values "strictly increase".
-- The witness envelope is this cut's ONE deliberate durable-format change (version-tagged by design);
-  any other golden/preimage shift is a finding, not a re-pin.
-- No Toron files (guard-pinned); no new wire MsgTypes (guard-pinned); the witness *format version* is
-  data, not a type-name suffix; all cargo via `scripts/cargo-cgroup`.
+- The witness shape is this cut's ONE deliberate durable-format change: flat postcard with peer identities,
+  no version suffixes and no pre-deployment compatibility decoder.
+- No Toron files (guard-pinned); no new wire MsgTypes (guard-pinned); all cargo via
+  `scripts/cargo-cgroup`.
 
 ## Open for the implementing session
 

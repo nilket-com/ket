@@ -48,8 +48,9 @@ this — counter replicate/rollback frames, the network bridge — landed dark i
   3. `CounterLeader::read` resolves local storage as `self.participants[0]` (:1551-1556) — a hidden
      local-is-index-0 convention.
 - The witness is **durable postcard** (`counter-witness-*.pw`, atomic temp+rename, :1191-1198): the
-  index→identity change is a durable-format change, and `#[serde(default)]` does not stabilize postcard
-  encodings — evolution must be explicit.
+  index→identity change is a clean pre-launch format break. Per
+  `plans/conventions/no-premature-backward-compat.md`, this cut carries no legacy decoder or migration
+  shim for the old positional shape.
 - Discovery exists: `replicas_for_locality(locality) -> Vec<NodeId>` (ring.rs:148/:355, trait at
   data_server.rs:786); `owner_of_identity` (:199) expresses the same first-replica primary rule that this
   cut must enforce inside the counter handler.
@@ -66,11 +67,11 @@ this — counter replicate/rollback frames, the network bridge — landed dark i
 `COUNTER_REPLICATE_REQ/RESP`, `COUNTER_ROLLBACK_REQ/RESP`. No new opcodes, no registry, no blob-write
 variant, no client-facade signature change, no Toron-facing API change.
 
-**D2 — Peer-identity witness, version-tagged.** `CounterFinalizationWitness` records participant
-**identities** — `accepted: Vec<NodeId>`, `committed: HashSet<NodeId>` — inside an explicitly
-version-tagged durable envelope. The local arm is recorded by this node's `NodeId`, never index 0. This is
-the load-bearing correctness boundary: a recovered witness stays meaningful after the ring's replica order
-changes. Postcard/serde defaults are never load-bearing for format evolution again.
+**D2 — Peer-identity witness, flattened.** `CounterFinalizationWitness` records participant
+**identities** — `accepted: Vec<NodeId>`, `committed: HashSet<NodeId>` — directly in the durable postcard
+record. The local arm is recorded by this node's `NodeId`, never index 0. This is the load-bearing
+correctness boundary: a recovered witness stays meaningful after the ring's replica order changes. The
+format is intentionally flat and unversioned until there is real deployed state to preserve.
 
 **D3 — Fresh routing and recorded-peer reconciliation are distinct routes; the local arm is explicit.**
 The leader stops holding a fixed `Vec<P>`. Two resolution routes that cannot be cross-called: *fresh add* →
@@ -91,11 +92,11 @@ the length of the key's current replica list (`rf.min(data_count)` discipline pr
 reached and the witness is durable, rollback is no longer legal and the commit fan-out (plus reconcile)
 must finish markers for *every* recorded accepted peer, including acceptors beyond the quorum count.
 
-**D6 — v0 witness migration: total, versioned, hostile to impossible shapes.** Unversioned (v0) witnesses
-can exist only from the rf=1 implementation, where the only valid shape is `accepted == [0]` with
-`committed` empty or `{0}`. On load: that shape migrates to the local node's identity. **Any v0 witness
-containing a non-zero participant index fails closed as invalid/corrupt** — refused with the file named,
-never guessed into a peer identity.
+**D6 — No positional-witness compatibility shim before deployment.** ADR 076 is the clean format break
+from positional witnesses to identity witnesses. The implementation does not carry a `V1` envelope, v0
+decoder, or migration path for `accepted == [0]` positional witnesses; those would be premature
+backward-compat scaffolding under Wendelon's convention docs. Old positional bytes are not a supported
+input to this cut.
 
 **D7 — Post-quorum recorded-peer unavailability stays pending.** After quorum + witness persistence the add
 is accepted; an unreachable recorded peer's commit marker is a pending completion — patient bounded-backoff
@@ -133,12 +134,13 @@ machinery is explicitly not part of this cut.
   quorum two, the slow third still receives its marker; the witness resolves only at full completion.
 - **`no_primary_only_success_under_replication`** — no path returns OK for rf>1 with only the local arm
   accepted (the exact failure 075's fail-closed guard existed to prevent, now pinned positively).
-- **`v0_local_witness_migrates_v0_remote_index_fails_closed`** — D6's totality, both halves.
+- **`witness_format_is_flattened_and_identity_only`** — D2/D6's convention guard: no version suffixes,
+  no legacy decoder, no positional witness fields.
 
 ## Architecture Guards (promotion-locked)
 
 - `adr076_witness_records_peer_identities_not_indices`
-- `adr076_witness_format_is_versioned`
+- `adr076_witness_format_is_flattened`
 - `adr076_fresh_and_recorded_resolution_are_distinct_routes`
 - `adr076_counter_leader_has_explicit_local_arm`
 - `adr076_fresh_counter_participants_are_ring_derived`
@@ -168,11 +170,12 @@ Cross-ring cycle drafted under the ADR 209 thread, relocated here at promotion. 
 table-stakes steer re-priced 075's "when a deployment needs it" deferral and re-ordered the arc (208
 guardrail first, this amplifier immediately after, no Toron optimizer work in between — locked in 208's
 forward arc). Claude iter-0 decomposed the 075 cut-8b objective into the design questions and found the
-durable-postcard witness constraint; Codex iter-1 contributed the typed two-route resolution boundary, the
-migration totality rules (v0 `[0]`-only; non-zero index fails closed), and the majority-floor-vs-full-
-completion distinction; Claude iter-1 added the third positional assumption (read-path `participants[0]`)
-and merged the D-set; Codex iter-2 added primary-routing continuity (`NOT_LEADER` + owner hint) and the
-status-constant-stays-for-decoding detail; Gemini iter-3 affirmed the full spine and the relocation.
+durable-postcard witness constraint; Codex iter-1 contributed the typed two-route resolution boundary and
+the majority-floor-vs-full-completion distinction; Claude iter-1 added the third positional assumption
+(read-path `participants[0]`) and merged the D-set; Codex iter-2 added primary-routing continuity
+(`NOT_LEADER` + owner hint) and the status-constant-stays-for-decoding detail; Gemini's implementation
+review applied the workspace conventions by flattening the witness format and removing the premature v0
+compatibility shim.
 **One divergence resolved by grounding:** Gemini's final draft described coordinators "seamlessly"
 leaving the degraded latch — contradicted by 207's promoted design (the latch is deliberately
 process-sticky; its R1 review fix prevents acks from clearing it). D9 carries the grounded 2-of-3:
@@ -182,6 +185,6 @@ recovery is a rolling restart, documented, not engineered around.
 
 ADR 076 finishes what 075 started: fetch-add becomes a real replicated storage-ring primitive —
 ring-derived participants, majority durable quorum, peer-identity witnesses that survive ring changes,
-full accepted-set completion, total v0 migration — and the fail-closed guard retires from the healthy
-path. The day it lands, every rf=3 cluster's Toron coordinators light up 207's durable evidence lane with
-a rolling restart and zero code changes.
+full accepted-set completion, and a clean pre-launch format break away from positional witnesses — and the
+fail-closed guard retires from the healthy path. The day it lands, every rf=3 cluster's Toron coordinators
+light up 207's durable evidence lane with a rolling restart and zero code changes.
