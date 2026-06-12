@@ -5,12 +5,73 @@ pub(super) struct OuterJoinDemotionReceipt {
 	pub(super) from_kind: JoinKind,
 	pub(super) to_kind: JoinKind,
 	pub(super) conjunct_text: String,
+	pub(super) propagation_path: Vec<JoinSideStep>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JoinSideStep {
+	Left,
+	Right,
+}
+
+impl JoinSideStep {
+	pub(super) fn as_str(self) -> &'static str {
+		match self {
+			Self::Left => "left",
+			Self::Right => "right",
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct NullRejectedSides {
 	left: bool,
 	right: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConjunctColumnSides {
+	left: bool,
+	right: bool,
+	ambiguous: bool,
+}
+
+impl ConjunctColumnSides {
+	fn side(side: LogicalJoinSide) -> Self {
+		match side {
+			LogicalJoinSide::Left => Self {
+				left: true,
+				right: false,
+				ambiguous: false,
+			},
+			LogicalJoinSide::Right => Self {
+				left: false,
+				right: true,
+				ambiguous: false,
+			},
+		}
+	}
+
+	fn ambiguous() -> Self {
+		Self {
+			left: false,
+			right: false,
+			ambiguous: true,
+		}
+	}
+
+	fn merge(&mut self, other: Self) {
+		self.left |= other.left;
+		self.right |= other.right;
+		self.ambiguous |= other.ambiguous;
+	}
+}
+
+#[derive(Debug, Clone)]
+struct RoutedConjuncts {
+	input: LogicalPlan,
+	residual: Vec<Expr>,
+	receipts: Vec<OuterJoinDemotionReceipt>,
 }
 
 impl NullRejectedSides {
@@ -76,96 +137,12 @@ impl<'a> Binder<'a> {
 					let input = self
 						.demote_null_rejected_outer_joins_inner(input, receipts)
 						.await?;
-					let LogicalPlan::Join {
-						left,
-						right,
-						kind,
-						on,
-						strategy_intent,
-					} = input
-					else {
-						return Ok(LogicalPlan::Filter {
-							input: Box::new(input),
-							predicate: predicate.clone(),
-						});
-					};
-					let Some(left_scope) = self.logical_scope_for_outer_demotion(&left).await?
-					else {
-						return Ok(LogicalPlan::Filter {
-							input: Box::new(LogicalPlan::Join {
-								left,
-								right,
-								kind,
-								on,
-								strategy_intent,
-							}),
-							predicate: predicate.clone(),
-						});
-					};
-					let Some(right_scope) = self.logical_scope_for_outer_demotion(&right).await?
-					else {
-						return Ok(LogicalPlan::Filter {
-							input: Box::new(LogicalPlan::Join {
-								left,
-								right,
-								kind,
-								on,
-								strategy_intent,
-							}),
-							predicate: predicate.clone(),
-						});
-					};
 					let conjuncts = split_logical_and_conjuncts(predicate);
-					let mut rejected = NullRejectedSides::default();
-					let mut conjunct_sides = Vec::with_capacity(conjuncts.len());
-					for conjunct in &conjuncts {
-						let sides = null_rejecting_sides(conjunct, &left_scope, &right_scope);
-						rejected = rejected.union(sides);
-						conjunct_sides.push(sides);
-					}
-					let Some(to_kind) = demoted_join_kind(kind, rejected) else {
-						return Ok(LogicalPlan::Filter {
-							input: Box::new(LogicalPlan::Join {
-								left,
-								right,
-								kind,
-								on,
-								strategy_intent,
-							}),
-							predicate: predicate.clone(),
-						});
-					};
-					let demotion_sides = demotion_owned_sides(kind, to_kind, rejected);
-					let mut left_push = Vec::new();
-					let mut right_push = Vec::new();
-					let mut residual = Vec::new();
-					let mut receipt_text = Vec::new();
-					for (conjunct, sides) in conjuncts.into_iter().zip(conjunct_sides) {
-						if demotion_sides.left && sides.left && !sides.right {
-							receipt_text.push(format!("{conjunct:?}"));
-							left_push.push(conjunct);
-						} else if demotion_sides.right && sides.right && !sides.left {
-							receipt_text.push(format!("{conjunct:?}"));
-							right_push.push(conjunct);
-						} else {
-							residual.push(conjunct);
-						}
-					}
-					let left = push_logical_filter_conjuncts(*left, left_push);
-					let right = push_logical_filter_conjuncts(*right, right_push);
-					receipts.push(OuterJoinDemotionReceipt {
-						from_kind: kind,
-						to_kind,
-						conjunct_text: receipt_text.join(" AND "),
-					});
-					let join = LogicalPlan::Join {
-						left: Box::new(left),
-						right: Box::new(right),
-						kind: to_kind,
-						on,
-						strategy_intent,
-					};
-					Ok(wrap_residual_filter(join, residual))
+					let routed = self
+						.route_filter_conjuncts(input, conjuncts, Vec::new())
+						.await?;
+					receipts.extend(routed.receipts);
+					Ok(wrap_residual_filter(routed.input, routed.residual))
 				}
 				LogicalPlan::Alias {
 					input,
@@ -367,6 +344,245 @@ impl<'a> Binder<'a> {
 			}
 		})
 	}
+
+	fn route_filter_conjuncts<'b>(
+		&'b self,
+		input: LogicalPlan,
+		conjuncts: Vec<Expr>,
+		path: Vec<JoinSideStep>,
+	) -> Pin<Box<dyn Future<Output = Result<RoutedConjuncts, BindingError>> + Send + 'b>> {
+		Box::pin(async move {
+			if conjuncts.is_empty() {
+				return Ok(RoutedConjuncts {
+					input,
+					residual: Vec::new(),
+					receipts: Vec::new(),
+				});
+			}
+			match input {
+				LogicalPlan::Join {
+					left,
+					right,
+					kind: JoinKind::Inner,
+					on,
+					strategy_intent,
+				} => {
+					let Some(left_scope) = self.logical_scope_for_outer_demotion(&left).await?
+					else {
+						return Ok(RoutedConjuncts {
+							input: LogicalPlan::Join {
+								left,
+								right,
+								kind: JoinKind::Inner,
+								on,
+								strategy_intent,
+							},
+							residual: conjuncts,
+							receipts: Vec::new(),
+						});
+					};
+					let Some(right_scope) = self.logical_scope_for_outer_demotion(&right).await?
+					else {
+						return Ok(RoutedConjuncts {
+							input: LogicalPlan::Join {
+								left,
+								right,
+								kind: JoinKind::Inner,
+								on,
+								strategy_intent,
+							},
+							residual: conjuncts,
+							receipts: Vec::new(),
+						});
+					};
+					let mut left_conjuncts = Vec::new();
+					let mut right_conjuncts = Vec::new();
+					let mut residual = Vec::new();
+					for conjunct in conjuncts {
+						let sides = conjunct_column_sides(&conjunct, &left_scope, &right_scope);
+						if sides.left && !sides.right && !sides.ambiguous {
+							left_conjuncts.push(conjunct);
+						} else if sides.right && !sides.left && !sides.ambiguous {
+							right_conjuncts.push(conjunct);
+						} else {
+							residual.push(conjunct);
+						}
+					}
+					let mut left_path = path.clone();
+					left_path.push(JoinSideStep::Left);
+					let left = self
+						.route_filter_conjuncts(*left, left_conjuncts, left_path)
+						.await?;
+					let mut right_path = path;
+					right_path.push(JoinSideStep::Right);
+					let right = self
+						.route_filter_conjuncts(*right, right_conjuncts, right_path)
+						.await?;
+					residual.extend(left.residual);
+					residual.extend(right.residual);
+					let mut receipts = left.receipts;
+					receipts.extend(right.receipts);
+					Ok(RoutedConjuncts {
+						input: LogicalPlan::Join {
+							left: Box::new(left.input),
+							right: Box::new(right.input),
+							kind: JoinKind::Inner,
+							on,
+							strategy_intent,
+						},
+						residual,
+						receipts,
+					})
+				}
+				LogicalPlan::Join {
+					left,
+					right,
+					kind,
+					on,
+					strategy_intent,
+				} => {
+					let Some(left_scope) = self.logical_scope_for_outer_demotion(&left).await?
+					else {
+						return Ok(RoutedConjuncts {
+							input: LogicalPlan::Join {
+								left,
+								right,
+								kind,
+								on,
+								strategy_intent,
+							},
+							residual: conjuncts,
+							receipts: Vec::new(),
+						});
+					};
+					let Some(right_scope) = self.logical_scope_for_outer_demotion(&right).await?
+					else {
+						return Ok(RoutedConjuncts {
+							input: LogicalPlan::Join {
+								left,
+								right,
+								kind,
+								on,
+								strategy_intent,
+							},
+							residual: conjuncts,
+							receipts: Vec::new(),
+						});
+					};
+					let mut rejected = NullRejectedSides::default();
+					let mut conjunct_sides = Vec::with_capacity(conjuncts.len());
+					for conjunct in &conjuncts {
+						let sides = null_rejecting_sides(conjunct, &left_scope, &right_scope);
+						rejected = rejected.union(sides);
+						conjunct_sides.push(sides);
+					}
+					let Some(to_kind) = demoted_join_kind(kind, rejected) else {
+						return Ok(RoutedConjuncts {
+							input: LogicalPlan::Join {
+								left,
+								right,
+								kind,
+								on,
+								strategy_intent,
+							},
+							residual: conjuncts,
+							receipts: Vec::new(),
+						});
+					};
+					let demotion_sides = demotion_owned_sides(kind, to_kind, rejected);
+					let mut left_push = Vec::new();
+					let mut right_push = Vec::new();
+					let mut residual = Vec::new();
+					let mut receipt_text = Vec::new();
+					for (conjunct, sides) in conjuncts.into_iter().zip(conjunct_sides) {
+						if demotion_sides.left && sides.left && !sides.right {
+							receipt_text.push(format!("{conjunct:?}"));
+							left_push.push(conjunct);
+						} else if demotion_sides.right && sides.right && !sides.left {
+							receipt_text.push(format!("{conjunct:?}"));
+							right_push.push(conjunct);
+						} else {
+							residual.push(conjunct);
+						}
+					}
+					let left = push_logical_filter_conjuncts(*left, left_push);
+					let right = push_logical_filter_conjuncts(*right, right_push);
+					Ok(RoutedConjuncts {
+						input: LogicalPlan::Join {
+							left: Box::new(left),
+							right: Box::new(right),
+							kind: to_kind,
+							on,
+							strategy_intent,
+						},
+						residual,
+						receipts: vec![OuterJoinDemotionReceipt {
+							from_kind: kind,
+							to_kind,
+							conjunct_text: receipt_text.join(" AND "),
+							propagation_path: path,
+						}],
+					})
+				}
+				LogicalPlan::Exchange {
+					input,
+					partition_count,
+					key,
+				} => {
+					let routed = self.route_filter_conjuncts(*input, conjuncts, path).await?;
+					Ok(RoutedConjuncts {
+						input: LogicalPlan::Exchange {
+							input: Box::new(routed.input),
+							partition_count,
+							key,
+						},
+						residual: routed.residual,
+						receipts: routed.receipts,
+					})
+				}
+				LogicalPlan::Sort {
+					input,
+					order_by,
+					limit: None,
+					offset: 0,
+				} => {
+					let routed = self.route_filter_conjuncts(*input, conjuncts, path).await?;
+					Ok(RoutedConjuncts {
+						input: LogicalPlan::Sort {
+							input: Box::new(routed.input),
+							order_by,
+							limit: None,
+							offset: 0,
+						},
+						residual: routed.residual,
+						receipts: routed.receipts,
+					})
+				}
+				stopped @ (LogicalPlan::Scan { .. }
+				| LogicalPlan::ScanNamed { .. }
+				| LogicalPlan::Alias { .. }
+				| LogicalPlan::Filter { .. }
+				| LogicalPlan::Project { .. }
+				| LogicalPlan::Aggregate { .. }
+				| LogicalPlan::Sort { .. }
+				| LogicalPlan::Take { .. }
+				| LogicalPlan::Explain { .. }
+				| LogicalPlan::ExplainAnalyze { .. }
+				| LogicalPlan::CreateTable { .. }
+				| LogicalPlan::CreateLogicalType { .. }
+				| LogicalPlan::CreateTableAsSelect { .. }
+				| LogicalPlan::DropTable { .. }
+				| LogicalPlan::Delete { .. }
+				| LogicalPlan::Update { .. }
+				| LogicalPlan::Insert { .. }
+				| LogicalPlan::InsertSelect { .. }) => Ok(RoutedConjuncts {
+					input: stopped,
+					residual: conjuncts,
+					receipts: Vec::new(),
+				}),
+			}
+		})
+	}
 }
 
 fn split_logical_and_conjuncts(expr: &Expr) -> Vec<Expr> {
@@ -538,6 +754,70 @@ fn column_side(
 		(Some(_), None) => Some(LogicalJoinSide::Left),
 		(None, Some(_)) => Some(LogicalJoinSide::Right),
 		(Some(_), Some(_)) | (None, None) => None,
+	}
+}
+
+fn conjunct_column_sides(
+	expr: &Expr,
+	left_scope: &RelationScope,
+	right_scope: &RelationScope,
+) -> ConjunctColumnSides {
+	match expr {
+		Expr::Column(column_ref) => match column_side(column_ref, left_scope, right_scope) {
+			Some(side) => ConjunctColumnSides::side(side),
+			None => ConjunctColumnSides::ambiguous(),
+		},
+		Expr::Literal(_) | Expr::UntypedNull => ConjunctColumnSides::default(),
+		Expr::LogicalAscription { expr, .. }
+		| Expr::SqlLogicalCast { expr, .. }
+		| Expr::SqlConvert { expr, .. } => conjunct_column_sides(expr, left_scope, right_scope),
+		Expr::Cast(inner, _)
+		| Expr::TryCast(inner, _)
+		| Expr::Not(inner)
+		| Expr::IsNull(inner)
+		| Expr::IsNotNull(inner)
+		| Expr::TimeBucket(_, inner)
+		| Expr::AtTimeZone(inner, _)
+		| Expr::Extract(_, inner)
+		| Expr::DateTrunc(_, inner) => conjunct_column_sides(inner, left_scope, right_scope),
+		Expr::Add(left, right)
+		| Expr::Sub(left, right)
+		| Expr::Mul(left, right)
+		| Expr::Div(left, right)
+		| Expr::Eq(left, right)
+		| Expr::Neq(left, right)
+		| Expr::Lt(left, right)
+		| Expr::Lte(left, right)
+		| Expr::Gt(left, right)
+		| Expr::Gte(left, right)
+		| Expr::And(left, right)
+		| Expr::Or(left, right) => {
+			let mut sides = conjunct_column_sides(left, left_scope, right_scope);
+			sides.merge(conjunct_column_sides(right, left_scope, right_scope));
+			sides
+		}
+		Expr::InList { expr, list, .. } => {
+			let mut sides = conjunct_column_sides(expr, left_scope, right_scope);
+			for item in list {
+				sides.merge(conjunct_column_sides(item, left_scope, right_scope));
+			}
+			sides
+		}
+		Expr::Like { expr, .. } => conjunct_column_sides(expr, left_scope, right_scope),
+		Expr::Case {
+			when_then,
+			else_expr,
+		} => {
+			let mut sides = ConjunctColumnSides::default();
+			for (when_expr, then_expr) in when_then {
+				sides.merge(conjunct_column_sides(when_expr, left_scope, right_scope));
+				sides.merge(conjunct_column_sides(then_expr, left_scope, right_scope));
+			}
+			if let Some(else_expr) = else_expr {
+				sides.merge(conjunct_column_sides(else_expr, left_scope, right_scope));
+			}
+			sides
+		}
 	}
 }
 

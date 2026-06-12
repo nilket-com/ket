@@ -133,16 +133,18 @@ pub(crate) fn adr209_demoted_predicates_push_to_owning_side_only() {
 		.nth(1)
 		.and_then(|rest| rest.split("LogicalPlan::Alias").next())
 		.expect("outer demotion filter arm");
+	let route = source_block(&demotion, "fn route_filter_conjuncts");
 
 	assert!(filter_arm.contains("split_logical_and_conjuncts(predicate)"));
-	assert!(filter_arm.contains("conjunct_sides.push(sides)"));
-	assert!(filter_arm.contains("demotion_owned_sides(kind, to_kind, rejected)"));
-	assert!(filter_arm.contains("demotion_sides.left && sides.left && !sides.right"));
-	assert!(filter_arm.contains("demotion_sides.right && sides.right && !sides.left"));
-	assert!(filter_arm.contains("residual.push(conjunct)"));
-	assert!(filter_arm.contains("push_logical_filter_conjuncts(*left, left_push)"));
-	assert!(filter_arm.contains("push_logical_filter_conjuncts(*right, right_push)"));
-	assert!(filter_arm.contains("wrap_residual_filter(join, residual)"));
+	assert!(filter_arm.contains("route_filter_conjuncts(input, conjuncts, Vec::new())"));
+	assert!(filter_arm.contains("wrap_residual_filter(routed.input, routed.residual)"));
+	assert!(route.contains("conjunct_sides.push(sides)"));
+	assert!(route.contains("demotion_owned_sides(kind, to_kind, rejected)"));
+	assert!(route.contains("demotion_sides.left && sides.left && !sides.right"));
+	assert!(route.contains("demotion_sides.right && sides.right && !sides.left"));
+	assert!(route.contains("residual.push(conjunct)"));
+	assert!(route.contains("push_logical_filter_conjuncts(*left, left_push)"));
+	assert!(route.contains("push_logical_filter_conjuncts(*right, right_push)"));
 	assert!(binder_source().contains(
 		"left_outer_null_rejecting_right_filter_binds_inner_and_broadcasts_filtered_dim"
 	));
@@ -295,6 +297,180 @@ pub(crate) fn adr209_demoted_join_reaches_durable_verdict_lane() {
 	assert!(wendelon.contains("JoinKind::Inner"));
 	assert!(wendelon.contains("durable_optimizer_runtime_evidence"));
 	assert!(wendelon.contains("measured_accrual_sample_rate"));
+}
+
+#[test]
+pub(crate) fn adr210_descent_reuses_209_classifier_and_demotion_table() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let tests = binder_source();
+
+	assert_eq!(demotion.matches("fn null_rejecting_sides").count(), 1);
+	assert_eq!(demotion.matches("fn demoted_join_kind").count(), 1);
+	assert_eq!(demotion.matches("fn demotion_owned_sides").count(), 1);
+	assert!(route.contains("null_rejecting_sides(conjunct, &left_scope, &right_scope)"));
+	assert!(route.contains("demoted_join_kind(kind, rejected)"));
+	assert!(route.contains("demotion_owned_sides(kind, to_kind, rejected)"));
+	assert!(route.contains("conjunct_column_sides(&conjunct, &left_scope, &right_scope)"));
+	assert!(!demotion.contains("path_null_reject"));
+	assert!(!demotion.contains("propagated_null_reject"));
+	assert!(tests.contains("is_null_and_negated_in_remain_non_demoting_inside_mixed_chain"));
+	assert!(tests.contains("full_outer_stepwise_demotes_via_propagation"));
+}
+
+#[test]
+pub(crate) fn adr210_filter_router_subsumes_depth_zero_demotion() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let filter_arm = demotion
+		.split("LogicalPlan::Filter { input, predicate } => {")
+		.nth(1)
+		.and_then(|rest| rest.split("LogicalPlan::Alias").next())
+		.expect("outer demotion filter arm");
+	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let tests = binder_source();
+
+	assert!(filter_arm.contains("split_logical_and_conjuncts(predicate)"));
+	assert!(filter_arm.contains("route_filter_conjuncts(input, conjuncts, Vec::new())"));
+	assert!(filter_arm.contains("receipts.extend(routed.receipts)"));
+	assert!(filter_arm.contains("wrap_residual_filter(routed.input, routed.residual)"));
+	assert!(route.contains("LogicalPlan::Join {"));
+	assert!(route.contains("kind: JoinKind::Inner"));
+	assert!(route.contains("let Some(to_kind) = demoted_join_kind(kind, rejected)"));
+	assert!(tests.contains(
+		"left_outer_null_rejecting_right_filter_binds_inner_and_broadcasts_filtered_dim"
+	));
+	assert!(tests.contains("path_scoped_filter_demotes_nested_left_join_through_inner_chain"));
+}
+
+#[test]
+pub(crate) fn adr210_motion_set_is_inner_exchange_and_pure_sort_only() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let ownership = source_block(&demotion, "fn conjunct_column_sides");
+	let tests = binder_source();
+
+	assert!(route.contains("kind: JoinKind::Inner"));
+	assert!(route.contains("sides.left && !sides.right && !sides.ambiguous"));
+	assert!(route.contains("sides.right && !sides.left && !sides.ambiguous"));
+	assert!(route.contains("LogicalPlan::Exchange"));
+	assert!(route.contains("LogicalPlan::Sort"));
+	assert!(route.contains("limit: None"));
+	assert!(route.contains("offset: 0"));
+	assert!(route.contains("LogicalPlan::Alias { .. }"));
+	assert!(route.contains("LogicalPlan::Project { .. }"));
+	assert!(route.contains("LogicalPlan::Aggregate { .. }"));
+	assert!(ownership.contains("Expr::Column(column_ref)"));
+	assert!(ownership.contains("column_side(column_ref, left_scope, right_scope)"));
+	assert!(tests.contains("exchange_allows_path_scoped_demote"));
+	assert!(tests.contains("pure_sort_allows_path_scoped_demote_with_results_match"));
+}
+
+#[test]
+pub(crate) fn adr210_topn_sort_and_take_are_motion_boundaries() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let tests = binder_source();
+
+	assert!(route.contains("limit: None"));
+	assert!(route.contains("offset: 0"));
+	assert!(route.contains("LogicalPlan::Sort { .. }"));
+	assert!(route.contains("LogicalPlan::Take { .. }"));
+	assert!(route.contains("residual: conjuncts"));
+	assert!(tests.contains("filter_does_not_move_below_take_limit"));
+	assert!(tests.contains("filter_does_not_move_below_sort_limit_or_offset"));
+}
+
+#[test]
+pub(crate) fn adr210_conjuncts_move_only_on_demotion_success() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let route = source_block(&demotion, "fn route_filter_conjuncts");
+	let tests = binder_source();
+	let wendelon = source("tests/wendelon_storage_execution_test.rs");
+
+	assert!(route.contains("let Some(to_kind) = demoted_join_kind(kind, rejected) else"));
+	assert!(route.contains("residual: conjuncts"));
+	assert!(route.contains("residual.push(conjunct)"));
+	assert!(route.contains("residual.extend(left.residual)"));
+	assert!(route.contains("residual.extend(right.residual)"));
+	assert!(route.contains("push_logical_filter_conjuncts(*left, left_push)"));
+	assert!(route.contains("push_logical_filter_conjuncts(*right, right_push)"));
+	assert!(tests.contains("cross_side_conjunct_stays_residual_above_original_filter"));
+	assert!(tests.contains("predicate_does_not_cross_outer_boundary_to_reach_deeper_edge"));
+	assert!(tests.contains("multi_conjuncts_can_demote_two_edges_in_one_pass"));
+	assert!(wendelon.contains("mixed_chain_demoted_results_match_undemoted"));
+}
+
+#[test]
+pub(crate) fn adr210_propagation_extends_existing_outer_join_demotion_receipt() {
+	let demotion = source("src/binder/outer_join_demotion.rs");
+	let receipt = source_block(&demotion, "pub(super) struct OuterJoinDemotionReceipt");
+	let explain = source("src/binder/explain.rs");
+	let row = source_block(
+		&explain,
+		"pub(super) fn optimizer_explain_outer_join_demotion_row",
+	);
+	let tests = binder_source();
+
+	assert!(receipt.contains("from_kind: JoinKind"));
+	assert!(receipt.contains("to_kind: JoinKind"));
+	assert!(receipt.contains("conjunct_text: String"));
+	assert!(receipt.contains("propagation_path: Vec<JoinSideStep>"));
+	assert!(demotion.contains("pub(super) enum JoinSideStep"));
+	assert!(demotion.contains("fn as_str"));
+	assert!(row.contains("\"outer_join_demotion\""));
+	assert!(row.contains("\"prebind\""));
+	assert!(row.contains("propagated_path:"));
+	assert!(tests.contains("propagation_receipt_reports_descent_path"));
+}
+
+#[test]
+pub(crate) fn adr210_no_recognizer_pushdown_strategy_executor_or_wire_widening() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		"route_filter_conjuncts",
+		"JoinSideStep",
+		"propagation_path",
+		"propagated_path",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest_dir.join("src/sql_planner.rs"),
+		manifest_dir.join("src/rune_engine.rs"),
+		manifest_dir.join("src/binder/join_order.rs"),
+		manifest_dir.join("src/distributed"),
+		manifest_dir.join("src/exec.rs"),
+		manifest_dir.join("src/ir/execution.rs"),
+		manifest_dir.join("src/server"),
+		manifest_dir.join("src/wire.rs"),
+		manifest_dir.join("src/sql_wire.rs"),
+	] {
+		if path.is_dir() {
+			offenders.extend(
+				source_lines(&path)
+					.into_iter()
+					.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+			);
+		} else {
+			let source = std::fs::read_to_string(&path).expect("read Toron source");
+			offenders.extend(
+				source
+					.lines()
+					.enumerate()
+					.filter(|(_, line)| markers.iter().any(|marker| line.contains(marker)))
+					.map(|(idx, line)| (path.clone(), idx + 1, line.to_string())),
+			);
+		}
+	}
+
+	assert!(
+		offenders.is_empty(),
+		"ADR210 propagation leaked outside binder/explain surfaces:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+	assert!(
+		binder_source()
+			.contains("recognizers_still_decline_true_outer_join_after_non_demoting_filter")
+	);
 }
 
 #[test]

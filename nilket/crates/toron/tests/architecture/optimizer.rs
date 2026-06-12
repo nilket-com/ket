@@ -2215,6 +2215,8 @@ pub(crate) fn adr143_behavior_gates_cover_planner_binder_and_runtime() {
 		"sql_equality_filtered_dim_with_wendelon_ndv_infers_broadcast_by_estimate",
 		"sql_inner_join_pushes_leftmost_local_conjunct_to_left_input",
 		"sql_multi_dim_star_each_filtered_dim_broadcasts",
+		"path_scoped_filter_demotes_nested_left_join_through_inner_chain",
+		"cross_side_conjunct_stays_residual_above_original_filter",
 	] {
 		assert!(binder.contains(gate), "missing ADR143 binder gate {gate}");
 	}

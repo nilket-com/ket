@@ -1252,6 +1252,386 @@ async fn positive_like_demotes_negated_like_does_not() {
 }
 
 #[tokio::test]
+async fn path_scoped_filter_demotes_nested_left_join_through_inner_chain() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT o.id, c.id, p.id, s.id \
+			 FROM orders o \
+			 LEFT JOIN customers c ON o.customer_id = c.id \
+			 INNER JOIN products p ON o.product_id = p.id \
+			 INNER JOIN stores s ON o.store_id = s.id \
+			 WHERE c.region = 'north'",
+		)
+		.expect("plan mixed-chain SQL");
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(receipts[0].from_kind, JoinKind::LeftOuter);
+	assert_eq!(receipts[0].to_kind, JoinKind::Inner);
+	assert_eq!(
+		receipts[0].propagation_path,
+		vec![JoinSideStep::Left, JoinSideStep::Left]
+	);
+	assert!(
+		logical_join_kinds(&normalized)
+			.into_iter()
+			.all(|kind| kind == JoinKind::Inner),
+		"all joins should be inner after nested demotion: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn filter_does_not_move_below_take_limit() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Take {
+			input: Box::new(mixed_chain_one_inner_hop()),
+			limit: 1,
+		}),
+		predicate: customers_region_is_north(),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert!(receipts.is_empty());
+	assert!(matches!(normalized, LogicalPlan::Filter { .. }));
+	assert!(
+		logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+		"Take must keep the nested outer join intact: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn filter_does_not_move_below_sort_limit_or_offset() {
+	let catalog = mixed_outer_join_catalog();
+	for (name, limit, offset) in [("top_n", Some(1), 0), ("offset", None, 1)] {
+		let logical = LogicalPlan::Filter {
+			input: Box::new(LogicalPlan::Sort {
+				input: Box::new(mixed_chain_one_inner_hop()),
+				order_by: vec![orders_id_sort_key()],
+				limit,
+				offset,
+			}),
+			predicate: customers_region_is_north(),
+		};
+
+		let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+		assert!(receipts.is_empty(), "{name} sort must stop propagation");
+		assert!(
+			matches!(normalized, LogicalPlan::Filter { .. }),
+			"{name} sort should leave the original filter in place"
+		);
+		assert!(
+			logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+			"{name} sort must keep the nested outer join intact: {normalized:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn pure_sort_allows_path_scoped_demote_with_results_match() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Sort {
+			input: Box::new(mixed_chain_one_inner_hop()),
+			order_by: vec![orders_id_sort_key()],
+			limit: None,
+			offset: 0,
+		}),
+		predicate: customers_region_is_north(),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(receipts[0].propagation_path, vec![JoinSideStep::Left]);
+	assert!(
+		logical_join_kinds(&normalized)
+			.into_iter()
+			.all(|kind| kind == JoinKind::Inner),
+		"pure sort should allow the nested edge to demote: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn exchange_allows_path_scoped_demote() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(mixed_chain_one_inner_hop()),
+			partition_count: 4,
+			key: vec![qcol("orders", "id")],
+		}),
+		predicate: customers_region_is_north(),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(receipts[0].propagation_path, vec![JoinSideStep::Left]);
+	assert!(
+		logical_join_kinds(&normalized)
+			.into_iter()
+			.all(|kind| kind == JoinKind::Inner),
+		"exchange should allow the nested edge to demote: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn predicate_does_not_cross_outer_boundary_to_reach_deeper_edge() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(orders_customers_left_join()),
+			right: Box::new(named_scan("products")),
+			kind: JoinKind::LeftOuter,
+			on: vec![(qcol("orders", "product_id"), qcol("products", "id"))],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: customers_region_is_north(),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert!(receipts.is_empty());
+	assert_eq!(
+		logical_join_kinds(&normalized)
+			.into_iter()
+			.filter(|kind| *kind == JoinKind::LeftOuter)
+			.count(),
+		2,
+		"the first outer boundary should stop descent: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn cross_side_conjunct_stays_residual_above_original_filter() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(mixed_chain_one_inner_hop()),
+		predicate: Expr::And(
+			Box::new(customers_region_is_north()),
+			Box::new(Expr::Eq(
+				Box::new(qcol("products", "id")),
+				Box::new(int64_literal(100)),
+			)),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	let LogicalPlan::Filter { predicate, .. } = normalized else {
+		panic!("cross-side residual should keep a root filter");
+	};
+	let predicate_text = format!("{predicate:?}");
+	assert!(
+		predicate_text.contains("products"),
+		"product-side predicate should remain residual: {predicate_text}"
+	);
+	assert!(
+		!predicate_text.contains("region"),
+		"demotion-owned predicate should not remain residual: {predicate_text}"
+	);
+}
+
+#[tokio::test]
+async fn is_null_and_negated_in_remain_non_demoting_inside_mixed_chain() {
+	let catalog = mixed_outer_join_catalog();
+	for (name, predicate) in [
+		(
+			"is_null",
+			Expr::IsNull(Box::new(qcol("customers", "region"))),
+		),
+		(
+			"negated_in",
+			Expr::InList {
+				expr: Box::new(qcol("customers", "region")),
+				list: vec![utf8_literal("north")],
+				negated: true,
+			},
+		),
+	] {
+		let logical = LogicalPlan::Filter {
+			input: Box::new(mixed_chain_one_inner_hop()),
+			predicate,
+		};
+
+		let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+		assert!(receipts.is_empty(), "{name} must not demote");
+		assert!(
+			logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+			"{name} should leave the nested outer join intact: {normalized:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn rune_mixed_chain_null_rejection_matches_sql() {
+	let catalog = mixed_outer_join_catalog();
+	let sql = SqlPlanner::new()
+		.plan(
+			"SELECT o.id, c.id, p.id \
+			 FROM orders o \
+			 LEFT JOIN customers c ON o.customer_id = c.id \
+			 INNER JOIN products p ON o.product_id = p.id \
+			 WHERE c.region = 'north'",
+		)
+		.expect("plan SQL mixed chain");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("orders").alias("o")
+                .left_join(
+                    ctx.table("customers").alias("c"),
+                    qcol("o", "customer_id").eq(qcol("c", "id"))
+                )
+                .inner_join(
+                    ctx.table("products").alias("p"),
+                    qcol("o", "product_id").eq(qcol("p", "id"))
+                )
+                .filter(qcol("c", "region").eq(lit_str("north")))
+        }
+    "#,
+	)
+	.await;
+
+	let (_, sql_receipts) = demote_outer_join_plan(&sql, &catalog).await;
+	let (_, rune_receipts) = demote_outer_join_plan(&rune, &catalog).await;
+
+	assert_eq!(sql_receipts.len(), 1);
+	assert_eq!(rune_receipts.len(), 1);
+	assert_eq!(sql_receipts[0].from_kind, rune_receipts[0].from_kind);
+	assert_eq!(sql_receipts[0].to_kind, rune_receipts[0].to_kind);
+	assert_eq!(
+		sql_receipts[0].propagation_path,
+		rune_receipts[0].propagation_path
+	);
+}
+
+#[tokio::test]
+async fn propagation_receipt_reports_descent_path() {
+	let logical = SqlPlanner::new()
+		.plan(
+			"EXPLAIN SELECT o.id, c.id, p.id \
+			 FROM orders o \
+			 LEFT JOIN customers c ON o.customer_id = c.id \
+			 INNER JOIN products p ON o.product_id = p.id \
+			 WHERE c.region = 'north'",
+		)
+		.expect("plan EXPLAIN mixed chain");
+
+	let (_schema, rows) = bind_explain_rows(
+		&logical,
+		&mixed_outer_join_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await;
+	let row = rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("outer_join_demotion".to_string())))
+		.expect("outer join demotion receipt row");
+
+	assert_eq!(row[1], ScalarValue::Utf8(Some("prebind".to_string())));
+	assert_eq!(
+		row[2],
+		ScalarValue::Utf8(Some("left_outer->inner".to_string()))
+	);
+	assert_utf8_contains(&row[3], "null_rejecting_filter:");
+	assert_utf8_contains(&row[3], "propagated_path:left");
+	assert_utf8_contains(&row[4], "region");
+}
+
+#[tokio::test]
+async fn recognizers_still_decline_true_outer_join_after_non_demoting_filter() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT o.id, c.id, p.id \
+			 FROM orders o \
+			 LEFT JOIN customers c ON o.customer_id = c.id \
+			 INNER JOIN products p ON o.product_id = p.id \
+			 WHERE c.region IS NULL",
+		)
+		.expect("plan true-outer mixed chain");
+
+	let (plan, _trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &auto_broadcast_config(4_096))
+			.await
+			.expect("bind true-outer mixed chain");
+
+	assert!(render_trace.outer_join_demotions.is_empty());
+	assert!(!render_trace.has_recognized_star_order());
+	assert!(
+		execution_join_kinds(&plan).contains(&JoinKind::LeftOuter),
+		"true outer join should remain a recognizer fence: {plan:?}"
+	);
+}
+
+#[tokio::test]
+async fn full_outer_stepwise_demotes_via_propagation() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(orders_customers_full_join()),
+			right: Box::new(named_scan("products")),
+			kind: JoinKind::Inner,
+			on: vec![(qcol("orders", "product_id"), qcol("products", "id"))],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::IsNotNull(Box::new(qcol("orders", "id"))),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 1);
+	assert_eq!(receipts[0].from_kind, JoinKind::FullOuter);
+	assert_eq!(receipts[0].to_kind, JoinKind::LeftOuter);
+	assert_eq!(receipts[0].propagation_path, vec![JoinSideStep::Left]);
+	assert!(
+		logical_join_kinds(&normalized).contains(&JoinKind::LeftOuter),
+		"full outer should demote stepwise through propagation: {normalized:?}"
+	);
+}
+
+#[tokio::test]
+async fn multi_conjuncts_can_demote_two_edges_in_one_pass() {
+	let catalog = mixed_outer_join_catalog();
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Join {
+			left: Box::new(orders_customers_left_join()),
+			right: Box::new(products_stores_left_join()),
+			kind: JoinKind::Inner,
+			on: vec![(qcol("orders", "product_id"), qcol("products", "id"))],
+			strategy_intent: JoinStrategyIntent::Auto,
+		}),
+		predicate: Expr::And(
+			Box::new(customers_region_is_north()),
+			Box::new(Expr::Gt(
+				Box::new(qcol("stores", "id")),
+				Box::new(int64_literal(0)),
+			)),
+		),
+	};
+
+	let (normalized, receipts) = demote_outer_join_plan(&logical, &catalog).await;
+
+	assert_eq!(receipts.len(), 2);
+	assert_eq!(receipts[0].propagation_path, vec![JoinSideStep::Left]);
+	assert_eq!(receipts[1].propagation_path, vec![JoinSideStep::Right]);
+	assert!(
+		logical_join_kinds(&normalized)
+			.into_iter()
+			.all(|kind| kind == JoinKind::Inner),
+		"both nested outer edges should demote: {normalized:?}"
+	);
+}
+
+#[tokio::test]
 async fn left_outer_right_build_auto_broadcast_executes_as_physical_right_outer() {
 	let mut catalog = join_catalog();
 	seed_byte_upper_bound(&mut catalog, "orders", 64 * 1024 * 1024);
@@ -14310,6 +14690,10 @@ fn utf8_literal(value: &str) -> Expr {
 	Expr::Literal(ScalarValue::Utf8(Some(value.to_string())))
 }
 
+fn int64_literal(value: i64) -> Expr {
+	Expr::Literal(ScalarValue::Int64(Some(value)))
+}
+
 fn date32_literal(value: i32) -> Expr {
 	Expr::Literal(ScalarValue::Date32(Some(value)))
 }
@@ -14448,6 +14832,18 @@ async fn bind_explain_rows(
 	};
 	assert_eq!(kind, SystemTableKind::OptimizerExplain);
 	(schema, rows)
+}
+
+async fn demote_outer_join_plan(
+	logical: &LogicalPlan,
+	catalog: &dyn Catalog,
+) -> (LogicalPlan, Vec<OuterJoinDemotionReceipt>) {
+	let config = PlannerConfig::default();
+	let binder = Binder::new(catalog, &config);
+	binder
+		.demote_null_rejected_outer_joins(logical)
+		.await
+		.expect("demote outer joins")
 }
 
 async fn optimizer_decision_rows(
@@ -14759,6 +15155,41 @@ fn collect_join_strategies(plan: &ExecutionPlan, strategies: &mut Vec<JoinStrate
 	}
 }
 
+fn execution_join_kinds(plan: &ExecutionPlan) -> Vec<JoinKind> {
+	let mut kinds = Vec::new();
+	collect_execution_join_kinds(plan, &mut kinds);
+	kinds
+}
+
+fn collect_execution_join_kinds(plan: &ExecutionPlan, kinds: &mut Vec<JoinKind>) {
+	match plan {
+		ExecutionPlan::Join {
+			left, right, kind, ..
+		} => {
+			kinds.push(*kind);
+			collect_execution_join_kinds(left, kinds);
+			collect_execution_join_kinds(right, kinds);
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Take { input, .. } => collect_execution_join_kinds(input, kinds),
+		ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => {}
+	}
+}
+
 fn collect_join_replay_ids(plan: &ExecutionPlan, ids: &mut Vec<JoinReplayId>) {
 	match plan {
 		ExecutionPlan::Join {
@@ -14840,6 +15271,43 @@ fn first_join_plan(plan: &ExecutionPlan) -> &ExecutionPlan {
 	}
 }
 
+fn logical_join_kinds(plan: &LogicalPlan) -> Vec<JoinKind> {
+	let mut kinds = Vec::new();
+	collect_logical_join_kinds(plan, &mut kinds);
+	kinds
+}
+
+fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
+	match plan {
+		LogicalPlan::Join {
+			left, right, kind, ..
+		} => {
+			kinds.push(*kind);
+			collect_logical_join_kinds(left, kinds);
+			collect_logical_join_kinds(right, kinds);
+		}
+		LogicalPlan::Alias { input, .. }
+		| LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Sort { input, .. }
+		| LogicalPlan::Take { input, .. }
+		| LogicalPlan::Explain { input }
+		| LogicalPlan::ExplainAnalyze { input } => collect_logical_join_kinds(input, kinds),
+		LogicalPlan::CreateTableAsSelect { source, .. }
+		| LogicalPlan::InsertSelect { source, .. } => collect_logical_join_kinds(source, kinds),
+		LogicalPlan::Scan { .. }
+		| LogicalPlan::ScanNamed { .. }
+		| LogicalPlan::CreateTable { .. }
+		| LogicalPlan::CreateLogicalType { .. }
+		| LogicalPlan::DropTable { .. }
+		| LogicalPlan::Delete { .. }
+		| LogicalPlan::Update { .. }
+		| LogicalPlan::Insert { .. } => {}
+	}
+}
+
 fn field_names(schema: &SchemaRef) -> Vec<&str> {
 	schema
 		.fields()
@@ -14877,6 +15345,157 @@ fn join_catalog() -> MockCatalog {
 		)
 		.expect("register customers");
 	catalog
+}
+
+fn mixed_outer_join_catalog() -> MockCatalog {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(11),
+			named_descriptor(
+				11,
+				"orders",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("customer_id", DataType::Int64, false),
+					Field::new("product_id", DataType::Int64, false),
+					Field::new("store_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register mixed orders");
+	catalog
+		.register_descriptor(
+			TableId(12),
+			named_descriptor(
+				12,
+				"customers",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("region", DataType::Utf8, true),
+				]),
+			),
+		)
+		.expect("register mixed customers");
+	catalog
+		.register_descriptor(
+			TableId(13),
+			named_descriptor(
+				13,
+				"products",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register mixed products");
+	catalog
+		.register_descriptor(
+			TableId(14),
+			named_descriptor(
+				14,
+				"stores",
+				Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			),
+		)
+		.expect("register mixed stores");
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"orders",
+		None,
+		Some(100_000),
+		vec![
+			(ColumnOrdinal(1), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(2), DistinctCountFact::Exact(100)),
+			(ColumnOrdinal(3), DistinctCountFact::Exact(100)),
+		],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"customers",
+		None,
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"products",
+		None,
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	seed_table_optimizer_facts(
+		&mut catalog,
+		"stores",
+		None,
+		Some(1_000),
+		vec![(ColumnOrdinal(0), DistinctCountFact::Exact(100))],
+	);
+	catalog
+}
+
+fn named_scan(table: &str) -> LogicalPlan {
+	LogicalPlan::ScanNamed {
+		table: TableRef::new(table),
+		projection: None,
+	}
+}
+
+fn qcol(table: &str, column: &str) -> Expr {
+	Expr::qualified_column(TableRef::new(table), column)
+}
+
+fn orders_customers_left_join() -> LogicalPlan {
+	LogicalPlan::Join {
+		left: Box::new(named_scan("orders")),
+		right: Box::new(named_scan("customers")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("orders", "customer_id"), qcol("customers", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn orders_customers_full_join() -> LogicalPlan {
+	LogicalPlan::Join {
+		left: Box::new(named_scan("orders")),
+		right: Box::new(named_scan("customers")),
+		kind: JoinKind::FullOuter,
+		on: vec![(qcol("orders", "customer_id"), qcol("customers", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn products_stores_left_join() -> LogicalPlan {
+	LogicalPlan::Join {
+		left: Box::new(named_scan("products")),
+		right: Box::new(named_scan("stores")),
+		kind: JoinKind::LeftOuter,
+		on: vec![(qcol("products", "id"), qcol("stores", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn mixed_chain_one_inner_hop() -> LogicalPlan {
+	LogicalPlan::Join {
+		left: Box::new(orders_customers_left_join()),
+		right: Box::new(named_scan("products")),
+		kind: JoinKind::Inner,
+		on: vec![(qcol("orders", "product_id"), qcol("products", "id"))],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
+}
+
+fn customers_region_is_north() -> Expr {
+	Expr::Eq(
+		Box::new(qcol("customers", "region")),
+		Box::new(utf8_literal("north")),
+	)
+}
+
+fn orders_id_sort_key() -> SortExpr {
+	SortExpr {
+		expr: qcol("orders", "id"),
+		descending: false,
+		nulls_first: false,
+	}
 }
 
 fn star_join_order_catalog() -> MockCatalog {

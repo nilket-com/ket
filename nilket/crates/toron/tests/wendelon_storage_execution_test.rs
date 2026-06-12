@@ -790,11 +790,80 @@ async fn demoted_join_verdict_reaches_durable_lane() {
 	let _ = std::fs::remove_dir_all(fixture.data_dir);
 }
 
+#[tokio::test]
+async fn sql_mixed_chain_null_rejection_demotes_nested_left_join_and_reaches_durable_verdict() {
+	let fixture = LiveWendelonFixture::start(125).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let coordinator = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		Arc::clone(&runtime_evidence),
+		1,
+	);
+
+	let batch = execute_durable_sql(&coordinator, DURABLE_MIXED_STAR_SQL).await;
+	assert!(
+		batch.num_rows() > 0,
+		"natural mixed-chain SQL should return user rows"
+	);
+	assert_eq!(
+		optimizer_runtime_flat_star_verdict_count(&coordinator).await,
+		1,
+		"natural mixed-chain SQL should flush a durable flat-star verdict"
+	);
+
+	drop(coordinator);
+	drop(runtime_evidence);
+	let restarted_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let restarted_coordinator =
+		durable_star_coordinator(catalog, storage, Arc::clone(&restarted_runtime_evidence), 0);
+
+	assert_eq!(
+		optimizer_runtime_flat_star_verdict_count(&restarted_coordinator).await,
+		1,
+		"fresh coordinator/evidence handle should read the mixed-chain verdict"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn mixed_chain_demoted_results_match_undemoted() {
+	let fixture = LiveWendelonFixture::start(126).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let coordinator = durable_star_coordinator(catalog, storage, runtime_evidence, 0);
+
+	let demoted = execute_durable_sql(&coordinator, DURABLE_MIXED_STAR_SQL).await;
+	let undemoted = execute_durable_sql(&coordinator, DURABLE_MIXED_STAR_CASE_WRAPPED_SQL).await;
+
+	assert_eq!(int64_quad_rows(&demoted), int64_quad_rows(&undemoted));
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
 const DURABLE_STAR_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
 	FROM orders o \
 	INNER JOIN customers c ON o.customer_id = c.id \
 	INNER JOIN products p ON o.product_id = p.id \
 	INNER JOIN stores s ON o.store_id = s.id";
+
+const DURABLE_MIXED_STAR_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
+	FROM orders o \
+	LEFT JOIN customers c ON o.customer_id = c.id \
+	INNER JOIN products p ON o.product_id = p.id \
+	INNER JOIN stores s ON o.store_id = s.id \
+	WHERE c.tier > 0";
+
+const DURABLE_MIXED_STAR_CASE_WRAPPED_SQL: &str = "SELECT o.id, c.id, p.id, s.id \
+	FROM orders o \
+	LEFT JOIN customers c ON o.customer_id = c.id \
+	INNER JOIN products p ON o.product_id = p.id \
+	INNER JOIN stores s ON o.store_id = s.id \
+	WHERE CASE WHEN c.tier > 0 THEN true ELSE false END";
 
 async fn durable_optimizer_runtime_evidence(
 	fixture: &LiveWendelonFixture,
@@ -839,9 +908,13 @@ fn durable_star_coordinator(
 }
 
 async fn execute_star_query(coordinator: &QueryCoordinator) -> RecordBatch {
+	execute_durable_sql(coordinator, DURABLE_STAR_SQL).await
+}
+
+async fn execute_durable_sql(coordinator: &QueryCoordinator, sql: &str) -> RecordBatch {
 	let plan = toron::sql_planner::SqlPlanner::new()
-		.plan(DURABLE_STAR_SQL)
-		.expect("plan durable star query");
+		.plan(sql)
+		.expect("plan durable SQL query");
 	execute_single_coordinator_batch(coordinator, &plan).await
 }
 
@@ -1157,6 +1230,22 @@ fn int64_column_values(batch: &RecordBatch, column: usize) -> Vec<i64> {
 		.downcast_ref::<Int64Array>()
 		.expect("int64 array");
 	(0..array.len()).map(|row| array.value(row)).collect()
+}
+
+fn int64_quad_rows(batch: &RecordBatch) -> Vec<(i64, i64, i64, i64)> {
+	let first = int64_column_values(batch, 0);
+	let second = int64_column_values(batch, 1);
+	let third = int64_column_values(batch, 2);
+	let fourth = int64_column_values(batch, 3);
+	let mut rows = first
+		.into_iter()
+		.zip(second)
+		.zip(third)
+		.zip(fourth)
+		.map(|(((first, second), third), fourth)| (first, second, third, fourth))
+		.collect::<Vec<_>>();
+	rows.sort_unstable();
+	rows
 }
 
 async fn query_ids_gt(

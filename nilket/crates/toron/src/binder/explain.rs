@@ -1557,6 +1557,17 @@ pub(super) fn optimizer_explain_row(
 pub(super) fn optimizer_explain_outer_join_demotion_row(
 	receipt: &OuterJoinDemotionReceipt,
 ) -> Result<Vec<ScalarValue>, BindingError> {
+	let mut detail = format!("null_rejecting_filter:{}", receipt.conjunct_text);
+	if !receipt.propagation_path.is_empty() {
+		let path = receipt
+			.propagation_path
+			.iter()
+			.map(|step| step.as_str())
+			.collect::<Vec<_>>()
+			.join(".");
+		detail.push_str(";propagated_path:");
+		detail.push_str(&path);
+	}
 	Ok(vec![
 		ScalarValue::Utf8(Some("outer_join_demotion".to_string())),
 		ScalarValue::Utf8(Some("prebind".to_string())),
@@ -1565,10 +1576,7 @@ pub(super) fn optimizer_explain_outer_join_demotion_row(
 			join_kind_label(receipt.from_kind),
 			join_kind_label(receipt.to_kind)
 		))),
-		ScalarValue::Utf8(Some(format!(
-			"null_rejecting_filter:{}",
-			receipt.conjunct_text
-		))),
+		ScalarValue::Utf8(Some(detail)),
 		ScalarValue::Utf8(Some(receipt.conjunct_text.clone())),
 		ScalarValue::Utf8(None),
 		ScalarValue::Utf8(None),
