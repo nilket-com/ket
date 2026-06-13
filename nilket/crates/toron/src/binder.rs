@@ -78,8 +78,10 @@ pub use self::decision_log::OptimizerDecisionLog;
 pub(crate) use self::join::JoinStrategyDecisionReason;
 pub use self::join::join_schema;
 pub use self::join_order::SoftMarginLadderStep;
-pub(crate) use self::runtime_evidence::OptimizerEvidenceStatusSnapshot;
 pub use self::runtime_evidence::{DurableEvidenceBinding, OptimizerRuntimeEvidence};
+pub(crate) use self::runtime_evidence::{
+	OptimizerEvidenceStatusSnapshot, OptimizerRuntimeDecisionRecorder,
+};
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
 const DEFAULT_AUTO_JOIN_PARTITION_COUNT: u32 = 4;
@@ -198,10 +200,12 @@ pub(crate) async fn bind_with_trace(
 	let mut trace = OptimizerTrace::default();
 	let mut render_trace = None;
 	let binder = Binder::new(catalog, config);
-	let normalized_plan = match plan {
-		LogicalPlan::Explain { .. } => plan.clone(),
-		_ => binder.demote_null_rejected_outer_joins(plan).await?.0,
+	let (normalized_plan, outer_join_demotions) = match plan {
+		LogicalPlan::Explain { .. } => (plan.clone(), Vec::new()),
+		_ => binder.demote_null_rejected_outer_joins(plan).await?,
 	};
+	let decision_provenance = decision_provenance_for_outer_join_demotions(&outer_join_demotions);
+	let binder = binder.with_decision_provenance(decision_provenance);
 	let plan = binder
 		.bind_plan_with_trace(
 			&normalized_plan,
@@ -228,11 +232,13 @@ async fn bind_with_explain_trace(
 	let tree_join_order_soft_margin_step = binder.tree_join_order_soft_margin_step;
 	let (normalized_plan, outer_join_demotions) =
 		binder.demote_null_rejected_outer_joins(plan).await?;
+	let decision_provenance = decision_provenance_for_outer_join_demotions(&outer_join_demotions);
 	if let Some(render_trace) = render_trace.as_mut() {
 		render_trace
 			.outer_join_demotions
 			.extend(outer_join_demotions);
 	}
+	let binder = binder.with_decision_provenance(decision_provenance);
 	let plan = binder
 		.bind_plan_with_trace(
 			&normalized_plan,
@@ -446,21 +452,52 @@ struct Binder<'a> {
 	// Tree and graph paths read these fields rather than re-snapshotting runtime evidence mid-bind.
 	tree_join_order_soft_margin_step: SoftMarginLadderStep,
 	graph_join_order_soft_margin_step: SoftMarginLadderStep,
-	// The sink for optimizer decisions. Normally the shared `config.decision_log`; a scratch recognition
+	// The sink for optimizer decisions. Normally a runtime-evidence recorder; a scratch recognition
 	// bind / declined-actuation re-bind carries a zero-size `NoOpDecisionRecorder` instead, so it cannot
 	// pollute the shared log — a structural fact, not a runtime flag.
-	decision_recorder: &'a (dyn OptimizerDecisionRecorder + Send + Sync),
+	decision_recorder: Arc<dyn OptimizerDecisionRecorder + Send + Sync>,
 }
 
 impl<'a> Binder<'a> {
 	fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self {
+		Self::new_with_decision_provenance(
+			catalog,
+			config,
+			OptimizerRuntimeVerdictProvenance::Native,
+		)
+	}
+
+	fn new_with_decision_provenance(
+		catalog: &'a dyn Catalog,
+		config: &'a PlannerConfig,
+		decision_provenance: OptimizerRuntimeVerdictProvenance,
+	) -> Self {
 		let join_order_soft_margin_steps = effective_join_order_soft_margin_steps(config);
 		Self {
 			catalog,
 			config,
 			tree_join_order_soft_margin_step: join_order_soft_margin_steps.tree,
 			graph_join_order_soft_margin_step: join_order_soft_margin_steps.graph,
-			decision_recorder: config.decision_log.as_ref(),
+			decision_recorder: Arc::new(OptimizerRuntimeDecisionRecorder::new(
+				Arc::clone(&config.runtime_evidence),
+				decision_provenance,
+			)),
+		}
+	}
+
+	fn with_decision_provenance(
+		&self,
+		decision_provenance: OptimizerRuntimeVerdictProvenance,
+	) -> Binder<'a> {
+		Binder {
+			catalog: self.catalog,
+			config: self.config,
+			tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step,
+			graph_join_order_soft_margin_step: self.graph_join_order_soft_margin_step,
+			decision_recorder: Arc::new(OptimizerRuntimeDecisionRecorder::new(
+				Arc::clone(&self.config.runtime_evidence),
+				decision_provenance,
+			)),
 		}
 	}
 
@@ -472,8 +509,18 @@ impl<'a> Binder<'a> {
 			config: self.config,
 			tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step,
 			graph_join_order_soft_margin_step: self.graph_join_order_soft_margin_step,
-			decision_recorder: &NoOpDecisionRecorder,
+			decision_recorder: Arc::new(NoOpDecisionRecorder),
 		}
+	}
+}
+
+fn decision_provenance_for_outer_join_demotions(
+	outer_join_demotions: &[OuterJoinDemotionReceipt],
+) -> OptimizerRuntimeVerdictProvenance {
+	if outer_join_demotions.is_empty() {
+		OptimizerRuntimeVerdictProvenance::Native
+	} else {
+		OptimizerRuntimeVerdictProvenance::Demoted
 	}
 }
 
@@ -1935,7 +1982,9 @@ impl<'a> Binder<'a> {
 			return system_table_plan(
 				SystemTableKind::InformationSchemaOptimizerDecisions,
 				information_schema_optimizer_decisions_schema(),
-				information_schema_optimizer_decision_rows(&self.config.decision_log.snapshot())?,
+				information_schema_optimizer_decision_rows(
+					&self.config.runtime_evidence.decision_snapshot(),
+				)?,
 				projection,
 			);
 		}

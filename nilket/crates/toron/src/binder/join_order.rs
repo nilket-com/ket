@@ -182,8 +182,7 @@ pub(crate) fn is_tree_margin_advisory_kind(kind: OptimizerDecisionKind) -> bool 
 		OptimizerDecisionKind::GalaxyRoot
 		| OptimizerDecisionKind::BridgeRoot
 		| OptimizerDecisionKind::BridgeChainRoot
-		| OptimizerDecisionKind::PreservedOuterOrder
-		| OptimizerDecisionKind::Overflow => false,
+		| OptimizerDecisionKind::PreservedOuterOrder => false,
 	}
 }
 
@@ -196,8 +195,7 @@ pub(crate) fn is_graph_margin_advisory_kind(kind: OptimizerDecisionKind) -> bool
 		| OptimizerDecisionKind::FlatStar
 		| OptimizerDecisionKind::SnowflakeRoot
 		| OptimizerDecisionKind::SnowflakeBranch
-		| OptimizerDecisionKind::PreservedOuterOrder
-		| OptimizerDecisionKind::Overflow => false,
+		| OptimizerDecisionKind::PreservedOuterOrder => false,
 	}
 }
 

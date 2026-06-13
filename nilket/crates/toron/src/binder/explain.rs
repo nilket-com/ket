@@ -265,6 +265,7 @@ pub(super) fn information_schema_optimizer_decisions_schema() -> SchemaRef {
 		Field::new("outcome", DataType::Utf8, false),
 		Field::new("decline_reason", DataType::Utf8, true),
 		Field::new("count", DataType::Int64, false),
+		Field::new("provenance", DataType::Utf8, false),
 	]))
 }
 
@@ -287,8 +288,7 @@ pub(super) fn information_schema_optimizer_decision_rows(
 					}
 					OptimizerDecisionOutcome::Reordered
 					| OptimizerDecisionOutcome::KeptOptimal
-					| OptimizerDecisionOutcome::KeptThinMargin
-					| OptimizerDecisionOutcome::Overflow => None,
+					| OptimizerDecisionOutcome::KeptThinMargin => None,
 				}),
 				ScalarValue::Int64(Some(i64::try_from(decision.count).map_err(|_| {
 					BindingError::UnsupportedExpression {
@@ -296,6 +296,9 @@ pub(super) fn information_schema_optimizer_decision_rows(
 							.to_string(),
 					}
 				})?)),
+				ScalarValue::Utf8(Some(
+					optimizer_runtime_verdict_provenance_label(decision.provenance).to_string(),
+				)),
 			])
 		})
 		.collect()

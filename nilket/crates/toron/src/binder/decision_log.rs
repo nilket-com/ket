@@ -1,9 +1,3 @@
-use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-pub(crate) const DEFAULT_OPTIMIZER_DECISION_LOG_MAX_KEYS: usize = 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum OptimizerDecisionKind {
 	StarCandidate,
@@ -17,7 +11,6 @@ pub(crate) enum OptimizerDecisionKind {
 	BridgeChainRoot,
 	// ADR 214: observe-only preserved-outer ordering opportunity evidence. No actuation.
 	PreservedOuterOrder,
-	Overflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,7 +30,6 @@ pub(crate) enum OptimizerDecisionOutcome {
 	KeptOptimal,
 	KeptThinMargin,
 	Declined(OptimizerDecisionDeclineReason),
-	Overflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -62,15 +54,16 @@ pub(crate) enum OptimizerRuntimeEvidenceLane {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct OptimizerDecisionKey {
-	pub(crate) kind: OptimizerDecisionKind,
-	pub(crate) outcome: OptimizerDecisionOutcome,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OptimizerRuntimeVerdictKey {
 	pub(crate) kind: OptimizerDecisionKind,
 	pub(crate) verdict: OptimizerRuntimeVerdictClass,
+	pub(crate) lane: OptimizerRuntimeEvidenceLane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OptimizerRuntimeDecisionKey {
+	pub(crate) kind: OptimizerDecisionKind,
+	pub(crate) outcome: OptimizerDecisionOutcome,
 	pub(crate) lane: OptimizerRuntimeEvidenceLane,
 }
 
@@ -78,6 +71,7 @@ pub(crate) struct OptimizerRuntimeVerdictKey {
 pub(crate) struct OptimizerDecisionRow {
 	pub(crate) kind: OptimizerDecisionKind,
 	pub(crate) outcome: OptimizerDecisionOutcome,
+	pub(crate) provenance: OptimizerRuntimeVerdictProvenance,
 	pub(crate) count: u64,
 }
 
@@ -89,71 +83,18 @@ pub(crate) struct OptimizerRuntimeVerdictRow {
 	pub(crate) count: u64,
 }
 
-#[derive(Debug)]
-pub struct OptimizerDecisionLog {
-	counts: Mutex<BTreeMap<OptimizerDecisionKey, u64>>,
-	overflow_count: AtomicU64,
-	max_keys: usize,
-}
-
-impl Default for OptimizerDecisionLog {
-	fn default() -> Self {
-		Self::with_max_keys(DEFAULT_OPTIMIZER_DECISION_LOG_MAX_KEYS)
-	}
-}
+#[derive(Debug, Default)]
+pub struct OptimizerDecisionLog;
 
 impl OptimizerDecisionLog {
-	pub(crate) fn with_max_keys(max_keys: usize) -> Self {
-		Self {
-			counts: Mutex::new(BTreeMap::new()),
-			overflow_count: AtomicU64::new(0),
-			max_keys,
-		}
-	}
-
-	pub(crate) fn record(&self, kind: OptimizerDecisionKind, outcome: OptimizerDecisionOutcome) {
-		let key = OptimizerDecisionKey { kind, outcome };
-		let mut counts = self.counts.lock().expect("optimizer decision log");
-		if let Some(count) = counts.get_mut(&key) {
-			*count = count.saturating_add(1);
-			return;
-		}
-		if counts.len() >= self.max_keys {
-			self.overflow_count.fetch_add(1, Ordering::Relaxed);
-			return;
-		}
-		counts.insert(key, 1);
-	}
-
-	pub(crate) fn snapshot(&self) -> Vec<OptimizerDecisionRow> {
-		let mut rows = {
-			let counts = self.counts.lock().expect("optimizer decision log");
-			counts
-				.iter()
-				.map(|(key, count)| OptimizerDecisionRow {
-					kind: key.kind,
-					outcome: key.outcome,
-					count: *count,
-				})
-				.collect::<Vec<_>>()
-		};
-		let overflow_count = self.overflow_count.load(Ordering::Relaxed);
-		if overflow_count > 0 {
-			rows.push(OptimizerDecisionRow {
-				kind: OptimizerDecisionKind::Overflow,
-				outcome: OptimizerDecisionOutcome::Overflow,
-				count: overflow_count,
-			});
-		}
-		rows
-	}
+	pub(crate) fn record(&self, _kind: OptimizerDecisionKind, _outcome: OptimizerDecisionOutcome) {}
 }
 
-// A sink for optimizer decisions. The live `OptimizerDecisionLog` records; the zero-size
-// `NoOpDecisionRecorder` discards. A bind that must not pollute the shared log — a scratch recognition
-// bind, or a declined-actuation re-bind — is handed the ZST, so "do not record" is a fact about the
-// type the binder carries, not a runtime flag a caller can forget to set (which is how a scratch bind
-// once double-counted into the shared log).
+// A sink for optimizer decisions. Committed binds carry a runtime-evidence recorder; the
+// `OptimizerDecisionLog` ZST is retained as a no-op compatibility shell for old config construction.
+// A bind that must not pollute the shared log — a scratch recognition bind, or a declined-actuation
+// re-bind — is handed the `NoOpDecisionRecorder`, so "do not record" is a fact about the type the
+// binder carries, not a runtime flag a caller can forget to set.
 pub(crate) trait OptimizerDecisionRecorder {
 	fn record(&self, kind: OptimizerDecisionKind, outcome: OptimizerDecisionOutcome);
 }
@@ -181,7 +122,6 @@ pub(crate) fn optimizer_decision_kind_label(kind: OptimizerDecisionKind) -> &'st
 		OptimizerDecisionKind::BridgeRoot => "bridge_root",
 		OptimizerDecisionKind::BridgeChainRoot => "bridge_chain_root",
 		OptimizerDecisionKind::PreservedOuterOrder => "preserved_outer_order",
-		OptimizerDecisionKind::Overflow => "overflow",
 	}
 }
 
@@ -191,7 +131,6 @@ pub(crate) fn optimizer_decision_outcome_label(outcome: OptimizerDecisionOutcome
 		OptimizerDecisionOutcome::KeptOptimal => "kept_optimal",
 		OptimizerDecisionOutcome::KeptThinMargin => "kept_thin_margin",
 		OptimizerDecisionOutcome::Declined(_) => "declined",
-		OptimizerDecisionOutcome::Overflow => "overflow",
 	}
 }
 
@@ -207,6 +146,33 @@ pub(crate) fn optimizer_decision_decline_reason_label(
 		OptimizerDecisionDeclineReason::MissingEstimate => "missing_estimate",
 		OptimizerDecisionDeclineReason::ProbeNotScanLinear => "probe_not_scan_linear",
 	}
+}
+
+pub(crate) fn decision_recording_kinds() -> [OptimizerDecisionKind; 7] {
+	[
+		OptimizerDecisionKind::StarCandidate,
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionKind::SnowflakeBranch,
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionKind::BridgeChainRoot,
+	]
+}
+
+pub(crate) fn optimizer_decision_outcomes() -> [OptimizerDecisionOutcome; 10] {
+	[
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerDecisionOutcome::KeptOptimal,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MixedStrategyStar),
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::NonInnerEquiJoin),
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MissingRelationLabel),
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MultipleProbeRelations),
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::DuplicateDimension),
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MissingEstimate),
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::ProbeNotScanLinear),
+	]
 }
 
 pub(crate) fn optimizer_runtime_verdict_label(

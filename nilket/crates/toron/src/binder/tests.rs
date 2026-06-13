@@ -10372,7 +10372,7 @@ async fn optimizer_decisions_records_per_level_for_recursive_snowflake() {
 }
 
 #[tokio::test]
-async fn optimizer_decisions_record_committed_not_scratch() {
+async fn scratch_bind_decisions_do_not_reach_durable_lane() {
 	let committed_catalog = hash_snowflake_join_order_catalog();
 	let committed_config = auto_broadcast_config(1);
 	let committed = SqlPlanner::new()
@@ -12324,9 +12324,6 @@ fn tree_margin_advisory_scope_accepts_only_tree_kinds() {
 		OptimizerDecisionKind::BridgeChainRoot
 	));
 	assert!(!is_tree_margin_advisory_kind(
-		OptimizerDecisionKind::Overflow
-	));
-	assert!(!is_tree_margin_advisory_kind(
 		OptimizerDecisionKind::PreservedOuterOrder
 	));
 }
@@ -12350,12 +12347,6 @@ fn graph_margin_advisory_scope_accepts_only_graph_kinds() {
 		assert!(!is_tree_margin_advisory_kind(kind));
 		assert!(is_graph_margin_advisory_kind(kind));
 	}
-	assert!(!is_tree_margin_advisory_kind(
-		OptimizerDecisionKind::Overflow
-	));
-	assert!(!is_graph_margin_advisory_kind(
-		OptimizerDecisionKind::Overflow
-	));
 	assert!(!is_tree_margin_advisory_kind(
 		OptimizerDecisionKind::PreservedOuterOrder
 	));
@@ -13032,48 +13023,44 @@ async fn optimizer_decisions_records_unclassified_candidate_declines() {
 }
 
 #[tokio::test]
-async fn optimizer_decision_accrual_is_side_effect_only() {
+async fn manual_planning_byte_identical_with_durable_decision_telemetry() {
 	let catalog = star_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&non_optimal_star_order_sql())
 		.expect("plan non-optimal star");
 	let quiet_config = auto_broadcast_config(64 * 1024 * 1024);
-	let noisy_log = Arc::new(OptimizerDecisionLog::default());
-	noisy_log.record(
+	let noisy_config = auto_broadcast_config(64 * 1024 * 1024);
+	noisy_config.runtime_evidence.record_decision(
 		OptimizerDecisionKind::SnowflakeRoot,
 		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MixedStrategyStar),
+		OptimizerRuntimeVerdictProvenance::Native,
 	);
-	let noisy_config = PlannerConfig {
-		decision_log: noisy_log,
-		..auto_broadcast_config(64 * 1024 * 1024)
-	};
 
-	let quiet_plan = bind(&logical, &catalog, &quiet_config)
+	let (quiet_plan, quiet_trace) = bind_with_trace(&logical, &catalog, &quiet_config)
 		.await
 		.expect("bind quiet plan");
-	let noisy_plan = bind(&logical, &catalog, &noisy_config)
+	let (noisy_plan, noisy_trace) = bind_with_trace(&logical, &catalog, &noisy_config)
 		.await
 		.expect("bind noisy plan");
 
 	assert_eq!(format!("{quiet_plan:?}"), format!("{noisy_plan:?}"));
+	assert_eq!(quiet_trace, noisy_trace);
 }
 
 #[tokio::test]
-async fn optimizer_decisions_log_is_bounded() {
+async fn optimizer_decisions_durable_matrix_excludes_overflow() {
 	let catalog = MockCatalog::new();
-	let decision_log = Arc::new(OptimizerDecisionLog::with_max_keys(1));
-	decision_log.record(
+	let config = PlannerConfig::default();
+	config.runtime_evidence.record_decision(
 		OptimizerDecisionKind::FlatStar,
 		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
 	);
-	decision_log.record(
-		OptimizerDecisionKind::SnowflakeRoot,
+	config.runtime_evidence.record_decision(
+		OptimizerDecisionKind::PreservedOuterOrder,
 		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
 	);
-	let config = PlannerConfig {
-		decision_log,
-		..PlannerConfig::default()
-	};
 
 	let rows = optimizer_decision_rows(&catalog, &config).await;
 
@@ -13082,10 +13069,20 @@ async fn optimizer_decisions_log_is_bounded() {
 		1
 	);
 	assert_eq!(
-		optimizer_decision_count(&rows, "overflow", "overflow", None),
-		1
+		rows.iter()
+			.filter(|row| row[0] == ScalarValue::Utf8(Some("overflow".to_string())))
+			.count(),
+		0
 	);
-	assert_eq!(rows.len(), 2);
+	assert_eq!(
+		rows.iter()
+			.filter(|row| {
+				row[0] == ScalarValue::Utf8(Some("preserved_outer_order".to_string()))
+			})
+			.count(),
+		0
+	);
+	assert_eq!(rows.len(), 1);
 }
 
 #[tokio::test]
@@ -13117,12 +13114,47 @@ async fn optimizer_decisions_report_projects_like_information_schema() {
 }
 
 #[tokio::test]
+async fn optimizer_decisions_table_appends_provenance_only() {
+	let catalog = star_join_order_catalog();
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let _ = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind star query");
+	let report = LogicalPlan::ScanNamed {
+		table: TableRef::with_schema("information_schema", "optimizer_decisions"),
+		projection: None,
+	};
+	let plan = bind(&report, &catalog, &config)
+		.await
+		.expect("bind optimizer decisions report");
+	let ExecutionPlan::SystemTable { schema, rows, .. } = plan else {
+		panic!("expected optimizer decisions system table");
+	};
+
+	assert_eq!(
+		field_names(&schema),
+		vec![
+			"decision_kind",
+			"outcome",
+			"decline_reason",
+			"count",
+			"provenance"
+		]
+	);
+	assert_eq!(rows[0][4], ScalarValue::Utf8(Some("native".to_string())));
+}
+
+#[tokio::test]
 async fn rune_queries_optimizer_decisions() {
 	let catalog = star_join_order_catalog();
 	let config = auto_broadcast_config(64 * 1024 * 1024);
-	config.decision_log.record(
+	config.runtime_evidence.record_decision(
 		OptimizerDecisionKind::FlatStar,
 		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
 	);
 	let logical = rune_plan(
 		r#"
@@ -13144,6 +13176,35 @@ async fn rune_queries_optimizer_decisions() {
 	assert_eq!(
 		optimizer_decision_count(&rows, "flat_star", "reordered", None),
 		1
+	);
+}
+
+#[tokio::test]
+async fn demoted_decision_dual_writes_total_and_demoted_sibling() {
+	let catalog = star_join_order_catalog();
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT * FROM orders o \
+			 LEFT JOIN customers c ON o.customer_id = c.id \
+			 INNER JOIN products p ON o.product_id = p.id \
+			 INNER JOIN stores s ON o.store_id = s.id \
+			 WHERE c.id IS NOT NULL",
+		)
+		.expect("plan demoted outer star");
+
+	let _ = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind demoted star query");
+	let rows = optimizer_decision_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_decision_count_by_provenance(&rows, "flat_star", "reordered", None, "demoted"),
+		1
+	);
+	assert_eq!(
+		optimizer_decision_count_by_provenance(&rows, "flat_star", "reordered", None, "native"),
+		0
 	);
 }
 
@@ -13448,7 +13509,7 @@ async fn counterfactual_bind_is_scratch_and_byte_identical() {
 		.plan(preserved_outer_star_sql())
 		.expect("plan preserved outer star");
 	let config = auto_broadcast_config(64 * 1024 * 1024);
-	let before_log = config.decision_log.snapshot();
+	let before_decisions = config.runtime_evidence.decision_snapshot();
 
 	let (plain_plan, plain_trace) = bind_with_trace(&logical, &catalog, &config)
 		.await
@@ -13460,7 +13521,10 @@ async fn counterfactual_bind_is_scratch_and_byte_identical() {
 
 	assert_eq!(plain_trace, explain_trace);
 	assert_eq!(format!("{plain_plan:?}"), format!("{explain_plan:?}"));
-	assert_eq!(before_log, config.decision_log.snapshot());
+	assert_eq!(
+		before_decisions,
+		config.runtime_evidence.decision_snapshot()
+	);
 	assert_eq!(
 		render_trace.preserved_outer_order.len(),
 		1,
@@ -13715,7 +13779,7 @@ async fn optimizer_evidence_status_query_is_read_only() {
 
 	let _ = optimizer_evidence_status_rows(&catalog, &config).await;
 
-	assert!(config.decision_log.snapshot().is_empty());
+	assert!(config.runtime_evidence.decision_snapshot().is_empty());
 	assert!(config.runtime_evidence.verdict_snapshot().is_empty());
 }
 
@@ -16400,6 +16464,30 @@ fn optimizer_decision_count(
 		panic!("expected optimizer decision count, got {:?}", row[3]);
 	};
 	count
+}
+
+fn optimizer_decision_count_by_provenance(
+	rows: &[Vec<ScalarValue>],
+	kind: &str,
+	outcome: &str,
+	decline_reason: Option<&str>,
+	provenance: &str,
+) -> i64 {
+	rows.iter()
+		.find_map(|row| {
+			(row[0] == ScalarValue::Utf8(Some(kind.to_string()))
+				&& row[1] == ScalarValue::Utf8(Some(outcome.to_string()))
+				&& row[2]
+					== ScalarValue::Utf8(decline_reason.map(std::string::ToString::to_string))
+				&& row[4] == ScalarValue::Utf8(Some(provenance.to_string())))
+			.then(|| {
+				let ScalarValue::Int64(Some(count)) = row[3] else {
+					panic!("expected optimizer decision count, got {:?}", row[3]);
+				};
+				count
+			})
+		})
+		.unwrap_or(0)
 }
 
 fn optimizer_runtime_verdict_count(rows: &[Vec<ScalarValue>], kind: &str, verdict: &str) -> i64 {

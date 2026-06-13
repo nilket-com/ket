@@ -88,7 +88,7 @@ pub(crate) fn adr187_accrual_is_side_effect_only() {
 	let fragment = source("src/distributed/fragment.rs");
 	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
 
-	assert!(bind_relation.contains("decision_log.snapshot()"));
+	assert!(bind_relation.contains("runtime_evidence.decision_snapshot()"));
 	for (name, source) in [
 		("join_order", join_order.as_str()),
 		("selectivity", selectivity.as_str()),
@@ -96,7 +96,7 @@ pub(crate) fn adr187_accrual_is_side_effect_only() {
 		("fragment", fragment.as_str()),
 	] {
 		assert!(
-			!source.contains("decision_log.snapshot()"),
+			!source.contains("decision_snapshot()"),
 			"{name} reads optimizer decision accrual during planning"
 		);
 	}
@@ -138,17 +138,23 @@ pub(crate) fn adr187_decisions_only_no_runtime_capture() {
 #[test]
 pub(crate) fn adr187_decision_log_is_bounded() {
 	let decision_log = source("src/binder/decision_log.rs");
-	let log_struct = first_block(&decision_log, "pub struct OptimizerDecisionLog");
-	let record = first_block(&decision_log, "pub(crate) fn record");
-	let snapshot = first_block(&decision_log, "pub(crate) fn snapshot");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let recording_kinds = first_block(&decision_log, "pub(crate) fn decision_recording_kinds");
+	let outcomes = first_block(&decision_log, "pub(crate) fn optimizer_decision_outcomes");
+	let all_keys = first_block(&runtime_evidence, "pub(crate) fn all_decision_counter_keys");
 
-	assert!(decision_log.contains("DEFAULT_OPTIMIZER_DECISION_LOG_MAX_KEYS"));
-	assert!(log_struct.contains("overflow_count: AtomicU64"));
-	assert!(log_struct.contains("max_keys: usize"));
-	assert!(record.contains("counts.len() >= self.max_keys"));
-	assert!(record.contains("overflow_count.fetch_add"));
-	assert!(snapshot.contains("OptimizerDecisionKind::Overflow"));
-	assert!(snapshot.contains("OptimizerDecisionOutcome::Overflow"));
+	assert!(decision_log.contains("pub struct OptimizerDecisionLog;"));
+	assert!(!decision_log.contains("DEFAULT_OPTIMIZER_DECISION_LOG_MAX_KEYS"));
+	assert!(!decision_log.contains("overflow_count"));
+	assert!(!decision_log.contains("max_keys"));
+	assert_eq!(
+		recording_kinds.matches("OptimizerDecisionKind::").count(),
+		7
+	);
+	assert_eq!(outcomes.matches("OptimizerDecisionOutcome::").count(), 10);
+	assert!(all_keys.contains("decision_recording_kinds().len()"));
+	assert!(all_keys.contains("* optimizer_decision_outcomes().len()"));
+	assert!(all_keys.contains("* runtime_evidence_lanes().len()"));
 }
 
 #[test]
@@ -203,6 +209,227 @@ pub(crate) fn adr187_no_optimizer_shell_or_planproperties_contract() {
 	assert!(
 		offenders.is_empty(),
 		"ADR187 introduced optimizer shell/property contract:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr216_decision_telemetry_uses_existing_optimizer_decisions_table() {
+	let binder = binder_root_source();
+	let execution = source("src/ir/execution.rs");
+	let explain = source("src/binder/explain.rs");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+	let schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_decisions_schema",
+	);
+	let rows = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_decision_rows",
+	);
+
+	assert!(binder.contains("INFORMATION_SCHEMA_OPTIMIZER_DECISIONS_TABLE"));
+	assert!(execution.contains("InformationSchemaOptimizerDecisions"));
+	assert!(!execution.contains("InformationSchemaOptimizerRuntimeDecisions"));
+	assert!(bind_relation.contains("SystemTableKind::InformationSchemaOptimizerDecisions"));
+	assert!(bind_relation.contains("runtime_evidence.decision_snapshot()"));
+	assert!(schema.contains("\"decision_kind\""));
+	assert!(schema.contains("\"outcome\""));
+	assert!(schema.contains("\"decline_reason\""));
+	assert!(schema.contains("\"count\""));
+	assert!(schema.contains("\"provenance\""));
+	assert!(rows.contains("optimizer_runtime_verdict_provenance_label(decision.provenance)"));
+}
+
+#[test]
+pub(crate) fn adr216_decision_keys_are_structured_not_strings() {
+	let decision_log = source("src/binder/decision_log.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let key = first_block(
+		&decision_log,
+		"pub(crate) struct OptimizerRuntimeDecisionKey",
+	);
+	let state = first_block(&runtime_evidence, "struct RuntimeEvidenceState");
+	let counter_key = first_block(&runtime_evidence, "pub(crate) fn decision_counter_key");
+
+	assert!(key.contains("kind: OptimizerDecisionKind"));
+	assert!(key.contains("outcome: OptimizerDecisionOutcome"));
+	assert!(key.contains("lane: OptimizerRuntimeEvidenceLane"));
+	assert!(state.contains("decision_pending: BTreeMap<OptimizerRuntimeDecisionKey, u64>"));
+	assert!(state.contains("decision_in_flight: BTreeMap<OptimizerRuntimeDecisionKey, u64>"));
+	assert!(state.contains("decision_durable_cache: BTreeMap<OptimizerRuntimeDecisionKey, u64>"));
+	assert!(counter_key.contains("optimizer_decision_kind_label(key.kind)"));
+	assert!(counter_key.contains("decision_outcome_key_label(key.outcome)"));
+	assert!(!state.contains("BTreeMap<String, u64>"));
+}
+
+#[test]
+pub(crate) fn adr216_decision_matrix_is_140_keys_and_evidence_matrix_220() {
+	let decision_log = source("src/binder/decision_log.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let recording_kinds = first_block(&decision_log, "pub(crate) fn decision_recording_kinds");
+	let outcomes = first_block(&decision_log, "pub(crate) fn optimizer_decision_outcomes");
+	let lanes = first_block(&runtime_evidence, "fn runtime_evidence_lanes");
+	let all_decision = first_block(&runtime_evidence, "pub(crate) fn all_decision_counter_keys");
+	let all_verdict = first_block(&runtime_evidence, "pub(crate) fn all_verdict_counter_keys");
+	let tests = source("src/binder/runtime_evidence.rs");
+
+	assert_eq!(
+		recording_kinds.matches("OptimizerDecisionKind::").count(),
+		7
+	);
+	for kind in [
+		"StarCandidate",
+		"FlatStar",
+		"SnowflakeRoot",
+		"SnowflakeBranch",
+		"GalaxyRoot",
+		"BridgeRoot",
+		"BridgeChainRoot",
+	] {
+		assert!(
+			recording_kinds.contains(kind),
+			"decision recording matrix is missing {kind}"
+		);
+	}
+	assert!(!recording_kinds.contains("PreservedOuterOrder"));
+	assert!(!decision_log.contains("Overflow"));
+	assert_eq!(outcomes.matches("OptimizerDecisionOutcome::").count(), 10);
+	assert_eq!(lanes.matches("OptimizerRuntimeEvidenceLane::").count(), 2);
+	assert!(all_decision.contains("decision_recording_kinds().len()"));
+	assert!(all_decision.contains("* optimizer_decision_outcomes().len()"));
+	assert!(all_decision.contains("* runtime_evidence_lanes().len()"));
+	assert!(all_verdict.contains("runtime_evidence_decision_kinds().len()"));
+	assert!(tests.contains("assert_eq!(decision_keys.len(), 140)"));
+	assert!(tests.contains("assert_eq!(decision_keys.len() + verdict_keys.len(), 220)"));
+}
+
+#[test]
+pub(crate) fn adr216_decision_flush_is_periodic_not_per_query() {
+	let binder = binder_root_source();
+	let coordinator = source("src/coordinator.rs");
+	let daemon = source("src/daemon.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let flush = first_block(&runtime_evidence, "pub async fn flush_decision_deltas");
+	let streaming = first_block(&coordinator, "async fn run_streaming_read_driver");
+	let local = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
+		.into_iter()
+		.map(|(_, block)| block)
+		.find(|block| block.contains("self.executor.execute_bound"))
+		.expect("local QueryCoordinator execute_query block");
+
+	assert!(daemon.contains("flush_decision_deltas().await"));
+	assert!(daemon.contains("refresh_durable_cache().await"));
+	assert!(flush.contains("counter_fetch_add"));
+	assert_eq!(flush.matches("counter_fetch_add").count(), 1);
+	for block in [&streaming, &local] {
+		assert!(!block.contains("flush_decision_deltas"));
+		assert!(!block.contains("record_decision"));
+	}
+	assert!(!binder.contains("flush_decision_deltas"));
+}
+
+#[test]
+pub(crate) fn decision_record_is_latency_identical_no_per_query_flush() {
+	adr216_decision_flush_is_periodic_not_per_query();
+}
+
+#[test]
+pub(crate) fn adr216_decision_provenance_is_bind_entry_not_posthoc() {
+	let binder = binder_root_source();
+	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let provenance = first_block(&binder, "fn decision_provenance_for_outer_join_demotions");
+	let runtime_recorder = source("src/binder/runtime_evidence.rs");
+	let recorder = first_block(&runtime_recorder, "impl OptimizerRuntimeDecisionRecorder");
+
+	for block in [&bind_with_trace, &bind_with_explain_trace] {
+		let demote = block
+			.find("demote_null_rejected_outer_joins")
+			.expect("bind entry demotes outer joins");
+		let select = block
+			.find("decision_provenance_for_outer_join_demotions(&outer_join_demotions)")
+			.expect("bind entry selects decision provenance from demotion receipts");
+		let recorder = block
+			.find("with_decision_provenance(decision_provenance)")
+			.expect("bind entry installs provenance-bearing recorder");
+		let bind = block
+			.find("bind_plan_with_trace")
+			.expect("binds normalized plan");
+		assert!(demote < select);
+		assert!(select < recorder);
+		assert!(recorder < bind);
+	}
+	assert!(provenance.contains("outer_join_demotions.is_empty()"));
+	assert!(provenance.contains("OptimizerRuntimeVerdictProvenance::Native"));
+	assert!(provenance.contains("OptimizerRuntimeVerdictProvenance::Demoted"));
+	assert!(recorder.contains("provenance: OptimizerRuntimeVerdictProvenance"));
+	assert!(!recorder.contains("render_trace"));
+}
+
+#[test]
+pub(crate) fn adr216_noop_recorder_still_gates_scratch_decisions() {
+	let binder = binder_root_source();
+	let decision_log = source("src/binder/decision_log.rs");
+	let without = first_block(&binder, "fn without_decision_recording");
+
+	assert!(decision_log.contains("trait OptimizerDecisionRecorder"));
+	assert!(decision_log.contains("struct NoOpDecisionRecorder"));
+	assert!(without.contains("Arc::new(NoOpDecisionRecorder)"));
+	assert!(binder.contains(".without_decision_recording()"));
+	assert!(!binder.contains("record_optimizer_decisions"));
+}
+
+#[test]
+pub(crate) fn adr216_decision_telemetry_is_read_only_no_policy_consumers() {
+	let manifest = manifest_dir();
+	let allowed = [
+		manifest.join("src").join("binder.rs"),
+		manifest.join("src/binder/runtime_evidence.rs"),
+		manifest.join("src/binder/tests.rs"),
+	];
+	let offenders = source_lines(&manifest.join("src"))
+		.into_iter()
+		.filter(|(path, _, line)| {
+			line.contains("decision_snapshot()")
+				&& !allowed
+					.iter()
+					.any(|allowed_path| path.as_path() == allowed_path.as_path())
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"decision telemetry gained a policy/report consumer outside information_schema:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr216_no_executor_fragmenter_storage_wire_or_wendelon_surface() {
+	let manifest = manifest_dir();
+	let markers = [
+		"OptimizerRuntimeDecisionKey",
+		"flush_decision_deltas",
+		"optimizer_evidence/decision",
+		"decision_snapshot",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR216 decision telemetry leaked outside binder/daemon/test surfaces:\n{}",
 		format_offenders(&manifest, &offenders)
 	);
 }
@@ -739,10 +966,7 @@ pub(crate) fn adr191_effective_margin_resolved_once_at_bind_entry() {
 	let binder = binder_root_source();
 	let join_order = source("src/binder/join_order.rs");
 	let binder_struct = first_block(&binder, "struct Binder<'a>");
-	let binder_new = first_block(
-		&binder,
-		"fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self",
-	);
+	let binder_new = first_block(&binder, "fn new_with_decision_provenance");
 	let analyze = first_block(&join_order, "pub(super) fn analyze");
 	let analyze_snowflake = first_block(&join_order, "pub(super) fn analyze_snowflake");
 
@@ -904,7 +1128,6 @@ pub(crate) fn adr208_soft_margin_advisory_filters_to_tree_verdict_kinds() {
 		"GalaxyRoot",
 		"BridgeRoot",
 		"BridgeChainRoot",
-		"Overflow",
 	] {
 		assert!(
 			predicate.contains(kind),
@@ -928,10 +1151,7 @@ pub(crate) fn adr208_soft_margin_advisory_filters_to_tree_verdict_kinds() {
 pub(crate) fn adr208_tree_and_graph_margin_steps_are_separate() {
 	let binder = binder_root_source();
 	let binder_struct = first_block(&binder, "struct Binder<'a>");
-	let binder_new = first_block(
-		&binder,
-		"fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self",
-	);
+	let binder_new = first_block(&binder, "fn new_with_decision_provenance");
 	let no_recording = first_block(&binder, "fn without_decision_recording");
 
 	assert!(binder_struct.contains("tree_join_order_soft_margin_step: SoftMarginLadderStep"));
@@ -1034,10 +1254,7 @@ pub(crate) fn adr208_margin_advisory_report_appends_scope_columns() {
 pub(crate) fn adr208_apply_advisory_remains_resolve_once_no_storage_await() {
 	let binder = binder_root_source();
 	let join_order = source("src/binder/join_order.rs");
-	let binder_new = first_block(
-		&binder,
-		"fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self",
-	);
+	let binder_new = first_block(&binder, "fn new_with_decision_provenance");
 	let resolver = first_block(
 		&join_order,
 		"pub(crate) fn effective_join_order_soft_margin_steps",
@@ -1075,7 +1292,6 @@ pub(crate) fn adr213_graph_advisory_scope_accepts_only_graph_kinds() {
 		"SnowflakeRoot",
 		"SnowflakeBranch",
 		"PreservedOuterOrder",
-		"Overflow",
 	] {
 		assert!(
 			graph_predicate.contains(kind),
@@ -1435,10 +1651,7 @@ pub(crate) fn adr215_graph_application_shares_apply_advisory_mode_no_new_mode() 
 pub(crate) fn adr215_bind_margin_steps_share_one_snapshot() {
 	let binder = binder_root_source();
 	let join_order = source("src/binder/join_order.rs");
-	let binder_new = first_block(
-		&binder,
-		"fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self",
-	);
+	let binder_new = first_block(&binder, "fn new_with_decision_provenance");
 	let resolver = first_block(
 		&join_order,
 		"pub(crate) fn effective_join_order_soft_margin_steps",
@@ -1483,7 +1696,6 @@ pub(crate) fn adr215_graph_resolver_is_scope_pure() {
 		"SnowflakeRoot",
 		"SnowflakeBranch",
 		"PreservedOuterOrder",
-		"Overflow",
 	] {
 		assert!(
 			graph_predicate.contains(kind),
@@ -1645,7 +1857,6 @@ pub(crate) fn adr207_runtime_evidence_is_extracted_fixed_matrix() {
 			"fixed evidence matrix is missing {kind}"
 		);
 	}
-	assert!(!kinds.contains("Overflow"));
 	for class in [
 		"Vindicated",
 		"MissedWin",
@@ -1896,12 +2107,14 @@ pub(crate) fn adr207_decision_lane_stays_local() {
 	let runtime_evidence = source("src/binder/runtime_evidence.rs");
 
 	assert!(decision_log.contains("pub(crate) fn record("));
-	assert!(decision_log.contains("pub(crate) fn snapshot("));
+	assert!(!decision_log.contains("pub(crate) fn snapshot("));
 	assert!(!decision_log.contains("verdict_counts"));
 	assert!(!decision_log.contains("pub(crate) fn record_verdict"));
 	assert!(!decision_log.contains("pub(crate) fn verdict_snapshot"));
 	assert!(runtime_evidence.contains("pub(crate) fn record_verdict"));
 	assert!(runtime_evidence.contains("pub(crate) fn verdict_snapshot"));
+	assert!(runtime_evidence.contains("pub(crate) fn record_decision"));
+	assert!(runtime_evidence.contains("pub(crate) fn decision_snapshot"));
 }
 
 #[test]

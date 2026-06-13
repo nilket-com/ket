@@ -752,6 +752,98 @@ async fn cross_coordinator_verdicts_are_shared() {
 }
 
 #[tokio::test]
+async fn durable_optimizer_decisions_survive_coordinator_restart() {
+	let fixture = LiveWendelonFixture::start(127).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let coordinator = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		Arc::clone(&runtime_evidence),
+		0,
+	);
+
+	execute_star_query(&coordinator).await;
+	runtime_evidence.flush_decision_deltas().await;
+	assert_eq!(
+		optimizer_decision_count(&coordinator).await,
+		1,
+		"recording coordinator should see the flushed durable decision"
+	);
+
+	drop(coordinator);
+	drop(runtime_evidence);
+	let restarted_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let restarted_coordinator =
+		durable_star_coordinator(catalog, storage, Arc::clone(&restarted_runtime_evidence), 0);
+
+	assert_eq!(
+		optimizer_decision_count(&restarted_coordinator).await,
+		1,
+		"fresh coordinator/evidence handle should read the prior durable decision"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn cross_coordinator_decisions_are_shared_after_refresh() {
+	let fixture = LiveWendelonFixture::start(128).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let writer_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let writer = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		Arc::clone(&writer_runtime_evidence),
+		0,
+	);
+	let reader_runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let reader =
+		durable_star_coordinator(catalog, storage, Arc::clone(&reader_runtime_evidence), 0);
+
+	execute_star_query(&writer).await;
+	writer_runtime_evidence.flush_decision_deltas().await;
+	reader_runtime_evidence.refresh_durable_cache().await;
+
+	assert_eq!(
+		optimizer_decision_count(&reader).await,
+		1,
+		"second coordinator should see decisions it did not record"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn decision_telemetry_survives_durable_refresh() {
+	let fixture = LiveWendelonFixture::start(129).await;
+	let (catalog, storage) = durable_star_fixture().await;
+	let runtime_evidence = durable_optimizer_runtime_evidence(&fixture).await;
+	let coordinator = durable_star_coordinator(
+		Arc::clone(&catalog),
+		Arc::clone(&storage),
+		Arc::clone(&runtime_evidence),
+		0,
+	);
+
+	execute_star_query(&coordinator).await;
+	runtime_evidence.flush_decision_deltas().await;
+	let report = runtime_evidence.refresh_durable_cache().await;
+
+	assert!(!report.failed, "durable decision refresh should succeed");
+	assert_eq!(
+		optimizer_decision_count(&coordinator).await,
+		1,
+		"coordinator should still see flushed decisions after durable refresh"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
 async fn demoted_join_verdict_reaches_durable_lane() {
 	let fixture = LiveWendelonFixture::start(124).await;
 	let (catalog, storage) = durable_star_fixture().await;
@@ -1057,6 +1149,27 @@ async fn optimizer_runtime_flat_star_verdict_count_by_provenance(
 			(kind == "flat_star" && row_provenance == provenance).then_some(*count)
 		})
 		.sum()
+}
+
+async fn optimizer_decision_count(coordinator: &QueryCoordinator) -> i64 {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_decisions")
+		.expect("plan optimizer decisions query");
+	let batch = execute_single_coordinator_batch(coordinator, &plan).await;
+	let kinds = string_column_values(&batch, 0);
+	let outcomes = string_column_values(&batch, 1);
+	let provenances = string_column_values(&batch, 4);
+	let counts = int64_column_values(&batch, 3);
+	kinds
+		.iter()
+		.zip(outcomes.iter())
+		.zip(provenances.iter())
+		.zip(counts.iter())
+		.find_map(|(((kind, outcome), provenance), count)| {
+			(kind == "flat_star" && outcome == "reordered" && provenance == "native")
+				.then_some(*count)
+		})
+		.unwrap_or(0)
 }
 
 async fn execute_single_coordinator_batch(

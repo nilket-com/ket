@@ -124,7 +124,7 @@ pub(crate) fn adr209_demotion_is_frontend_neutral_prebind_normalization() {
 
 	assert!(binder_root.contains("mod outer_join_demotion;"));
 	assert!(binder_root.contains("use self::outer_join_demotion::*;"));
-	assert!(binder_root.contains("LogicalPlan::Explain { .. } => plan.clone()"));
+	assert!(binder_root.contains("LogicalPlan::Explain { .. } => (plan.clone(), Vec::new())"));
 	assert!(demotion.contains("pub(super) fn demote_null_rejected_outer_joins"));
 	assert!(!planner.contains("outer_join_demotion"));
 	assert!(!planner.contains("demote_null_rejected_outer_joins"));
