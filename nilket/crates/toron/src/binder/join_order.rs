@@ -511,21 +511,41 @@ pub(crate) struct PreservedOuterOrderingGate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DecisionConflictGateSignal {
-	kind: OptimizerDecisionKind,
-	provenance: OptimizerRuntimeVerdictProvenance,
-	reordered: u64,
-	blocked_or_near_miss: u64,
+pub(crate) enum DecisionConflictStatus {
+	Cold,
+	Inactive,
+	OneSidedReordered,
+	OneSidedBlocked,
+	Conflicted,
 }
 
-impl DecisionConflictGateSignal {
-	fn sample_count(self) -> u64 {
-		self.reordered.saturating_add(self.blocked_or_near_miss)
+pub(crate) fn decision_conflict_status_label(status: DecisionConflictStatus) -> &'static str {
+	match status {
+		DecisionConflictStatus::Cold => "cold",
+		DecisionConflictStatus::Inactive => "inactive",
+		DecisionConflictStatus::OneSidedReordered => "one_sided_reordered",
+		DecisionConflictStatus::OneSidedBlocked => "one_sided_blocked",
+		DecisionConflictStatus::Conflicted => "conflicted",
 	}
+}
 
-	fn conflict_strength(self) -> u64 {
-		self.reordered.min(self.blocked_or_near_miss)
-	}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecisionConflictReport {
+	pub(crate) kind: OptimizerDecisionKind,
+	pub(crate) provenance: OptimizerRuntimeVerdictProvenance,
+	pub(crate) status: DecisionConflictStatus,
+	pub(crate) reordered_count: u64,
+	pub(crate) kept_optimal_count: u64,
+	pub(crate) kept_thin_margin_count: u64,
+	pub(crate) declined_count: u64,
+	pub(crate) blocked_or_near_miss_count: u64,
+	pub(crate) total_count: u64,
+	pub(crate) conflict_strength: u64,
+	pub(crate) top_decline_reason: Option<OptimizerDecisionDeclineReason>,
+	pub(crate) top_decline_count: u64,
+	pub(crate) evidence_health: String,
+	pub(crate) reason: String,
+	pub(crate) next_cut: &'static str,
 }
 
 pub(crate) fn optimizer_receipt_gate_rows(config: &PlannerConfig) -> Vec<OptimizerReceiptGateRow> {
@@ -716,30 +736,27 @@ fn preserved_outer_ordering_gate_row(
 fn decision_conflict_pressure_gate(
 	snapshot: &OptimizerReceiptGateSnapshot,
 ) -> OptimizerReceiptGateRow {
-	let strongest = strongest_decision_conflict_signal(&snapshot.decisions);
-	let actionable = strongest.filter(|signal| {
-		signal.reordered >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
-			&& signal.blocked_or_near_miss >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
-	});
-	let selected = actionable.or(strongest);
-	let status = if actionable.is_some() {
-		OptimizerReceiptGateStatus::Actionable
-	} else {
-		OptimizerReceiptGateStatus::InsufficientEvidence
+	let reports = decision_conflict_reports(snapshot);
+	let selected = strongest_decision_conflict_report(&reports);
+	let status = match selected {
+		Some(report) if report.status == DecisionConflictStatus::Conflicted => {
+			OptimizerReceiptGateStatus::Actionable
+		}
+		Some(_) | None => OptimizerReceiptGateStatus::InsufficientEvidence,
 	};
 	let (sample_count, primary_signal, secondary_signal) = match selected {
-		Some(signal) => (
-			signal.sample_count(),
+		Some(report) => (
+			report
+				.reordered_count
+				.saturating_add(report.blocked_or_near_miss_count),
 			format!(
 				"kind={},provenance={}",
-				optimizer_decision_kind_label(signal.kind),
-				optimizer_runtime_verdict_provenance_label(signal.provenance)
+				optimizer_decision_kind_label(report.kind),
+				optimizer_runtime_verdict_provenance_label(report.provenance)
 			),
 			format!(
 				"reordered={},blocked_or_near_miss={},evidence_health={}",
-				signal.reordered,
-				signal.blocked_or_near_miss,
-				evidence_health_label(&snapshot.health)
+				report.reordered_count, report.blocked_or_near_miss_count, report.evidence_health
 			),
 		),
 		None => (
@@ -758,55 +775,177 @@ fn decision_conflict_pressure_gate(
 		sample_count,
 		primary_signal,
 		secondary_signal,
-		reason: if actionable.is_some() {
-			"reordered_and_blocked_ready".to_string()
-		} else {
-			"requires_ready_reordered_and_blocked_decision_rows".to_string()
-		},
+		reason: selected.map_or_else(
+			|| "requires_ready_reordered_and_blocked_decision_rows".to_string(),
+			|report| match report.status {
+				DecisionConflictStatus::Conflicted => "reordered_and_blocked_ready".to_string(),
+				_ => "requires_ready_reordered_and_blocked_decision_rows".to_string(),
+			},
+		),
 		next_cut: "memo_conflict_readout",
 	}
 }
 
-fn strongest_decision_conflict_signal(
-	decisions: &[OptimizerDecisionRow],
-) -> Option<DecisionConflictGateSignal> {
+pub(crate) fn optimizer_decision_conflict_rows(
+	config: &PlannerConfig,
+) -> Vec<DecisionConflictReport> {
+	let snapshot = config.runtime_evidence.receipt_gate_snapshot();
+	decision_conflict_reports(&snapshot)
+}
+
+pub(crate) fn decision_conflict_reports(
+	snapshot: &OptimizerReceiptGateSnapshot,
+) -> Vec<DecisionConflictReport> {
+	#[derive(Default)]
+	struct DecisionConflictAccumulator {
+		reordered_count: u64,
+		kept_optimal_count: u64,
+		kept_thin_margin_count: u64,
+		decline_counts: BTreeMap<OptimizerDecisionDeclineReason, u64>,
+	}
+
 	let mut grouped: BTreeMap<
 		(OptimizerDecisionKind, OptimizerRuntimeVerdictProvenance),
-		DecisionConflictGateSignal,
+		DecisionConflictAccumulator,
 	> = BTreeMap::new();
-	for row in decisions {
-		let entry =
-			grouped
-				.entry((row.kind, row.provenance))
-				.or_insert(DecisionConflictGateSignal {
-					kind: row.kind,
-					provenance: row.provenance,
-					reordered: 0,
-					blocked_or_near_miss: 0,
-				});
+	for kind in decision_recording_kinds() {
+		for provenance in [
+			OptimizerRuntimeVerdictProvenance::Native,
+			OptimizerRuntimeVerdictProvenance::Demoted,
+		] {
+			grouped.insert((kind, provenance), DecisionConflictAccumulator::default());
+		}
+	}
+	debug_assert_eq!(grouped.len(), 14);
+
+	for row in &snapshot.decisions {
+		if !decision_recording_kinds().contains(&row.kind) {
+			continue;
+		}
+		let Some(entry) = grouped.get_mut(&(row.kind, row.provenance)) else {
+			continue;
+		};
 		match row.outcome {
 			OptimizerDecisionOutcome::Reordered => {
-				entry.reordered = entry.reordered.saturating_add(row.count);
+				entry.reordered_count = entry.reordered_count.saturating_add(row.count);
 			}
-			OptimizerDecisionOutcome::KeptThinMargin | OptimizerDecisionOutcome::Declined(_) => {
-				entry.blocked_or_near_miss = entry.blocked_or_near_miss.saturating_add(row.count);
+			OptimizerDecisionOutcome::KeptOptimal => {
+				entry.kept_optimal_count = entry.kept_optimal_count.saturating_add(row.count);
 			}
-			OptimizerDecisionOutcome::KeptOptimal => {}
+			OptimizerDecisionOutcome::KeptThinMargin => {
+				entry.kept_thin_margin_count =
+					entry.kept_thin_margin_count.saturating_add(row.count);
+			}
+			OptimizerDecisionOutcome::Declined(reason) => {
+				let count = entry.decline_counts.entry(reason).or_insert(0);
+				*count = count.saturating_add(row.count);
+			}
 		}
 	}
 	grouped
-		.into_values()
-		.filter(|signal| signal.sample_count() > 0)
-		.max_by(|left, right| compare_decision_conflict_signal(*left, *right))
+		.into_iter()
+		.map(|((kind, provenance), accumulator)| {
+			let declined_count = accumulator
+				.decline_counts
+				.values()
+				.fold(0_u64, |acc, count| acc.saturating_add(*count));
+			let (top_decline_reason, top_decline_count) =
+				top_decision_conflict_decline(&accumulator.decline_counts);
+			let blocked_or_near_miss_count = accumulator
+				.kept_thin_margin_count
+				.saturating_add(declined_count);
+			let total_count = accumulator
+				.reordered_count
+				.saturating_add(accumulator.kept_optimal_count)
+				.saturating_add(accumulator.kept_thin_margin_count)
+				.saturating_add(declined_count);
+			let conflict_strength = accumulator.reordered_count.min(blocked_or_near_miss_count);
+			let status = decision_conflict_status(
+				total_count,
+				accumulator.reordered_count,
+				blocked_or_near_miss_count,
+			);
+			DecisionConflictReport {
+				kind,
+				provenance,
+				status,
+				reordered_count: accumulator.reordered_count,
+				kept_optimal_count: accumulator.kept_optimal_count,
+				kept_thin_margin_count: accumulator.kept_thin_margin_count,
+				declined_count,
+				blocked_or_near_miss_count,
+				total_count,
+				conflict_strength,
+				top_decline_reason,
+				top_decline_count,
+				evidence_health: evidence_health_label(&snapshot.health),
+				reason: decision_conflict_reason(status).to_string(),
+				next_cut: "memo",
+			}
+		})
+		.collect()
 }
 
-fn compare_decision_conflict_signal(
-	left: DecisionConflictGateSignal,
-	right: DecisionConflictGateSignal,
+fn top_decision_conflict_decline(
+	decline_counts: &BTreeMap<OptimizerDecisionDeclineReason, u64>,
+) -> (Option<OptimizerDecisionDeclineReason>, u64) {
+	let mut top = None;
+	let mut top_count = 0_u64;
+	for (reason, count) in decline_counts {
+		if *count > top_count {
+			top = Some(*reason);
+			top_count = *count;
+		}
+	}
+	(top, top_count)
+}
+
+fn decision_conflict_status(
+	total_count: u64,
+	reordered_count: u64,
+	blocked_or_near_miss_count: u64,
+) -> DecisionConflictStatus {
+	if total_count == 0 {
+		DecisionConflictStatus::Cold
+	} else if reordered_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
+		&& blocked_or_near_miss_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
+	{
+		DecisionConflictStatus::Conflicted
+	} else if reordered_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE {
+		DecisionConflictStatus::OneSidedReordered
+	} else if blocked_or_near_miss_count >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE {
+		DecisionConflictStatus::OneSidedBlocked
+	} else {
+		DecisionConflictStatus::Inactive
+	}
+}
+
+fn decision_conflict_reason(status: DecisionConflictStatus) -> &'static str {
+	match status {
+		DecisionConflictStatus::Cold => "no_decision_rows",
+		DecisionConflictStatus::Inactive => "requires_ready_reordered_and_blocked_decision_rows",
+		DecisionConflictStatus::OneSidedReordered => "reordered_ready_blocked_not_ready",
+		DecisionConflictStatus::OneSidedBlocked => "blocked_ready_reordered_not_ready",
+		DecisionConflictStatus::Conflicted => "reordered_and_blocked_ready",
+	}
+}
+
+fn strongest_decision_conflict_report(
+	reports: &[DecisionConflictReport],
+) -> Option<&DecisionConflictReport> {
+	reports
+		.iter()
+		.filter(|report| report.total_count > 0)
+		.max_by(|left, right| compare_decision_conflict_report(left, right))
+}
+
+fn compare_decision_conflict_report(
+	left: &DecisionConflictReport,
+	right: &DecisionConflictReport,
 ) -> Ordering {
-	left.conflict_strength()
-		.cmp(&right.conflict_strength())
-		.then_with(|| left.sample_count().cmp(&right.sample_count()))
+	left.conflict_strength
+		.cmp(&right.conflict_strength)
+		.then_with(|| left.total_count.cmp(&right.total_count))
 		.then_with(|| right.kind.cmp(&left.kind))
 		.then_with(|| right.provenance.cmp(&left.provenance))
 }

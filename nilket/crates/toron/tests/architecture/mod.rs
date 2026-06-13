@@ -13,6 +13,7 @@ pub(crate) mod observability_audit;
 pub(crate) mod observability_telemetry;
 pub(crate) mod optimizer;
 pub(crate) mod optimizer_accrual;
+pub(crate) mod optimizer_decision_conflicts;
 pub(crate) mod optimizer_rotation;
 pub(crate) mod outer_join_completion;
 pub(crate) mod predicate_pushdown;

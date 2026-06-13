@@ -421,3 +421,32 @@ pub(crate) fn adr219_decision_conflict_gate_remains_non_consumer() {
 	assert!(!graph.contains("decision_conflict"));
 	assert!(!outer.contains("decision_conflict"));
 }
+
+#[test]
+pub(crate) fn adr220_decision_conflict_readout_is_read_only_no_policy_consumers() {
+	let join_order = source("src/binder/join_order.rs");
+	let binder = binder_root_source();
+	let resolver = first_block(&join_order, "pub(crate) fn effective_join_order_policy");
+	let graph = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
+	let outer = first_block(
+		&join_order,
+		"pub(super) async fn try_bind_preserved_outer_star_actuation",
+	);
+	let readout = first_block(
+		&join_order,
+		"pub(crate) fn optimizer_decision_conflict_rows",
+	);
+	let gate = first_block(&join_order, "fn decision_conflict_pressure_gate");
+
+	assert!(binder.contains("INFORMATION_SCHEMA_OPTIMIZER_DECISION_CONFLICTS_TABLE"));
+	assert!(readout.contains("decision_conflict_reports(&snapshot)"));
+	assert!(gate.contains("decision_conflict_reports(snapshot)"));
+	for policy in [resolver, graph, outer] {
+		assert!(!policy.contains("optimizer_decision_conflict_rows"));
+		assert!(!policy.contains("decision_conflict_reports"));
+		assert!(!policy.contains("decision_conflict_pressure"));
+		assert!(!policy.contains("DecisionConflictReport"));
+		assert!(!policy.contains("memo"));
+		assert!(!policy.contains("Cascades"));
+	}
+}

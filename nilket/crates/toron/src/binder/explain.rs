@@ -304,6 +304,84 @@ pub(super) fn information_schema_optimizer_decision_rows(
 		.collect()
 }
 
+pub(super) fn information_schema_optimizer_decision_conflicts_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("decision_kind", DataType::Utf8, false),
+		Field::new("provenance", DataType::Utf8, false),
+		Field::new("status", DataType::Utf8, false),
+		Field::new("reordered_count", DataType::Int64, false),
+		Field::new("kept_optimal_count", DataType::Int64, false),
+		Field::new("kept_thin_margin_count", DataType::Int64, false),
+		Field::new("declined_count", DataType::Int64, false),
+		Field::new("blocked_or_near_miss_count", DataType::Int64, false),
+		Field::new("total_count", DataType::Int64, false),
+		Field::new("conflict_strength", DataType::Int64, false),
+		Field::new("top_decline_reason", DataType::Utf8, true),
+		Field::new("top_decline_count", DataType::Int64, false),
+		Field::new("evidence_health", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("next_cut", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_decision_conflict_rows(
+	reports: &[DecisionConflictReport],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rows = Vec::with_capacity(reports.len());
+	for report in reports {
+		rows.push(vec![
+			ScalarValue::Utf8(Some(optimizer_decision_kind_label(report.kind).to_string())),
+			ScalarValue::Utf8(Some(
+				optimizer_runtime_verdict_provenance_label(report.provenance).to_string(),
+			)),
+			ScalarValue::Utf8(Some(
+				decision_conflict_status_label(report.status).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.reordered_count,
+				"optimizer decision conflict reordered_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.kept_optimal_count,
+				"optimizer decision conflict kept_optimal_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.kept_thin_margin_count,
+				"optimizer decision conflict kept_thin_margin_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.declined_count,
+				"optimizer decision conflict declined_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.blocked_or_near_miss_count,
+				"optimizer decision conflict blocked_or_near_miss_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.total_count,
+				"optimizer decision conflict total_count",
+			)?)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.conflict_strength,
+				"optimizer decision conflict conflict_strength",
+			)?)),
+			ScalarValue::Utf8(
+				report
+					.top_decline_reason
+					.map(|reason| optimizer_decision_decline_reason_label(reason).to_string()),
+			),
+			ScalarValue::Int64(Some(u64_to_i64(
+				report.top_decline_count,
+				"optimizer decision conflict top_decline_count",
+			)?)),
+			ScalarValue::Utf8(Some(report.evidence_health.clone())),
+			ScalarValue::Utf8(Some(report.reason.clone())),
+			ScalarValue::Utf8(Some(report.next_cut.to_string())),
+		]);
+	}
+	Ok(rows)
+}
+
 pub(super) fn information_schema_optimizer_runtime_verdicts_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("decision_kind", DataType::Utf8, false),

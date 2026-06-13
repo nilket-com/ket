@@ -14915,6 +14915,395 @@ async fn decision_conflict_pressure_uses_durable_decision_rows() {
 }
 
 #[tokio::test]
+async fn optimizer_decision_conflicts_projects_static_14_rows() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	let rows = optimizer_decision_conflict_table_rows(&catalog, &config).await;
+
+	assert_decision_conflict_order(&rows);
+	assert_eq!(rows.len(), 14);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| decision_conflict_utf8(row, 0) == "preserved_outer_order")
+	);
+	assert!(
+		rows.iter()
+			.all(|row| decision_conflict_utf8(row, 2) == "cold")
+	);
+	assert!(rows.iter().all(|row| {
+		(3..=11)
+			.filter(|index| *index != 10)
+			.all(|index| decision_conflict_i64(row, index) == 0)
+	}));
+
+	let projected = LogicalPlan::ScanNamed {
+		table: TableRef::with_schema("information_schema", "optimizer_decision_conflicts"),
+		projection: Some(vec![
+			"decision_kind".to_string(),
+			"provenance".to_string(),
+			"status".to_string(),
+			"next_cut".to_string(),
+		]),
+	};
+	let plan = bind(&projected, &catalog, &config)
+		.await
+		.expect("bind projected optimizer decision conflicts");
+	let ExecutionPlan::SystemTable { kind, schema, rows } = plan else {
+		panic!("expected projected optimizer decision conflicts system table");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerDecisionConflicts
+	);
+	assert_eq!(
+		field_names(&schema),
+		vec!["decision_kind", "provenance", "status", "next_cut"]
+	);
+	assert_eq!(rows.len(), 14);
+}
+
+#[tokio::test]
+async fn decision_conflict_detail_is_interpretation_not_decision_count_reprojection() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_decision_conflicts")
+		.expect("plan optimizer decision conflicts");
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind optimizer decision conflicts");
+	let ExecutionPlan::SystemTable { schema, rows, .. } = plan else {
+		panic!("expected optimizer decision conflicts system table");
+	};
+	assert_eq!(
+		field_names(&schema),
+		vec![
+			"decision_kind",
+			"provenance",
+			"status",
+			"reordered_count",
+			"kept_optimal_count",
+			"kept_thin_margin_count",
+			"declined_count",
+			"blocked_or_near_miss_count",
+			"total_count",
+			"conflict_strength",
+			"top_decline_reason",
+			"top_decline_count",
+			"evidence_health",
+			"reason",
+			"next_cut",
+		]
+	);
+	assert_eq!(rows[0].len(), 15);
+}
+
+#[tokio::test]
+async fn decision_conflict_detail_marks_conflicted_only_when_both_sides_ready() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::StarCandidate,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::StarCandidate,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE - 1,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_decision_conflict_table_rows(&catalog, &config).await;
+	let one_sided = decision_conflict_row(&rows, "star_candidate", "native");
+	assert_eq!(decision_conflict_utf8(one_sided, 2), "one_sided_reordered");
+	assert_eq!(decision_conflict_i64(one_sided, 7), 19);
+	assert_eq!(decision_conflict_i64(one_sided, 9), 19);
+
+	let conflicted = decision_conflict_row(&rows, "flat_star", "native");
+	assert_eq!(decision_conflict_utf8(conflicted, 2), "conflicted");
+	assert_eq!(decision_conflict_i64(conflicted, 3), 20);
+	assert_eq!(decision_conflict_i64(conflicted, 7), 20);
+	assert_eq!(decision_conflict_i64(conflicted, 9), 20);
+}
+
+#[tokio::test]
+async fn decision_conflict_keptoptimal_is_neutral_not_blocked() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::KeptOptimal,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_decision_conflict_table_rows(&catalog, &config).await;
+	let row = decision_conflict_row(&rows, "flat_star", "native");
+	assert_eq!(decision_conflict_utf8(row, 2), "one_sided_reordered");
+	assert_eq!(decision_conflict_i64(row, 4), 20);
+	assert_eq!(decision_conflict_i64(row, 7), 0);
+	assert_eq!(decision_conflict_i64(row, 9), 0);
+}
+
+#[tokio::test]
+async fn decision_conflict_detail_preserves_top_decline_reason() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MissingEstimate),
+		OptimizerRuntimeVerdictProvenance::Demoted,
+		7,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::DuplicateDimension),
+		OptimizerRuntimeVerdictProvenance::Demoted,
+		11,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::SnowflakeRoot,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+		2,
+	);
+
+	let rows = optimizer_decision_conflict_table_rows(&catalog, &config).await;
+	let row = decision_conflict_row(&rows, "snowflake_root", "demoted");
+	assert_eq!(decision_conflict_utf8(row, 2), "conflicted");
+	assert_eq!(decision_conflict_i64(row, 6), 18);
+	assert_eq!(decision_conflict_i64(row, 7), 20);
+	assert_eq!(
+		decision_conflict_nullable_utf8(row, 10),
+		Some("duplicate_dimension")
+	);
+	assert_eq!(decision_conflict_i64(row, 11), 11);
+}
+
+#[tokio::test]
+async fn decision_conflict_gate_and_detail_share_strongest_report() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		20,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		20,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+		30,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+		25,
+	);
+
+	let detail_rows = optimizer_decision_conflict_table_rows(&catalog, &config).await;
+	let strongest = decision_conflict_row(&detail_rows, "bridge_root", "demoted");
+	assert_eq!(decision_conflict_utf8(strongest, 2), "conflicted");
+	assert_eq!(decision_conflict_i64(strongest, 9), 25);
+
+	let gate_rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let conflict = receipt_gate_row_by_name(&gate_rows, "decision_conflict_pressure");
+	assert_eq!(receipt_gate_utf8(conflict, 2), "actionable");
+	assert_eq!(receipt_gate_i64(conflict, 3), 55);
+	assert_eq!(
+		receipt_gate_utf8(conflict, 4),
+		"kind=bridge_root,provenance=demoted"
+	);
+	assert!(receipt_gate_utf8(conflict, 5).contains("reordered=30,blocked_or_near_miss=25"));
+}
+
+#[tokio::test]
+async fn decision_conflict_detail_ignores_verdict_rows() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_decision_conflict_table_rows(&catalog, &config).await;
+	assert!(
+		rows.iter()
+			.all(|row| decision_conflict_utf8(row, 2) == "cold")
+	);
+	assert!(rows.iter().all(|row| decision_conflict_i64(row, 8) == 0));
+}
+
+#[tokio::test]
+async fn preserved_outer_order_absent_from_decision_conflict_detail() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::PreservedOuterOrder,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_decision_conflict_table_rows(&catalog, &config).await;
+	assert_eq!(rows.len(), 14);
+	assert!(
+		!rows
+			.iter()
+			.any(|row| decision_conflict_utf8(row, 0) == "preserved_outer_order")
+	);
+	assert!(
+		rows.iter()
+			.all(|row| decision_conflict_utf8(row, 2) == "cold")
+	);
+}
+
+#[tokio::test]
+async fn decision_conflict_readout_is_read_only_no_plan_change() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let quiet_config = auto_broadcast_config(64 * 1024 * 1024);
+	let noisy_config = PlannerConfig {
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	record_decisions(
+		noisy_config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		noisy_config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	let before = noisy_config.runtime_evidence.receipt_gate_snapshot();
+	let _ = optimizer_decision_conflict_table_rows(&catalog, &noisy_config).await;
+	let after = noisy_config.runtime_evidence.receipt_gate_snapshot();
+	assert_eq!(before, after);
+
+	let (quiet_plan, quiet_trace) = bind_with_trace(&logical, &catalog, &quiet_config)
+		.await
+		.expect("bind quiet plan");
+	let (noisy_plan, noisy_trace) = bind_with_trace(&logical, &catalog, &noisy_config)
+		.await
+		.expect("bind noisy plan");
+
+	assert_eq!(format!("{quiet_plan:?}"), format!("{noisy_plan:?}"));
+	assert_eq!(quiet_trace.join_decisions, noisy_trace.join_decisions);
+	assert_eq!(
+		quiet_trace.scan_filter_decisions,
+		noisy_trace.scan_filter_decisions
+	);
+}
+
+#[tokio::test]
+async fn rune_queries_optimizer_decision_conflicts() {
+	let catalog = star_join_order_catalog();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	let sql_rows = optimizer_decision_conflict_table_rows(&catalog, &config).await;
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM information_schema.optimizer_decision_conflicts")
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer decision conflict report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer decision conflicts system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerDecisionConflicts
+	);
+	assert_eq!(rows, sql_rows);
+}
+
+#[tokio::test]
 async fn windowing_and_counter_handoff_never_actionable() {
 	let catalog = MockCatalog::new();
 	let config = PlannerConfig::default();
@@ -17379,6 +17768,26 @@ async fn optimizer_receipt_gate_table_rows(
 	rows
 }
 
+async fn optimizer_decision_conflict_table_rows(
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Vec<Vec<ScalarValue>> {
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_decision_conflicts")
+		.expect("plan optimizer decision conflicts report");
+	let plan = bind(&logical, catalog, config)
+		.await
+		.expect("bind optimizer decision conflicts report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected optimizer decision conflicts system table, got {plan:?}");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerDecisionConflicts
+	);
+	rows
+}
+
 fn optimizer_decision_count(
 	rows: &[Vec<ScalarValue>],
 	kind: &str,
@@ -17568,6 +17977,47 @@ fn assert_receipt_gate_order(rows: &[Vec<ScalarValue>]) {
 	);
 }
 
+fn decision_conflict_row<'a>(
+	rows: &'a [Vec<ScalarValue>],
+	kind: &str,
+	provenance: &str,
+) -> &'a [ScalarValue] {
+	rows.iter()
+		.find(|row| {
+			row[0] == ScalarValue::Utf8(Some(kind.to_string()))
+				&& row[1] == ScalarValue::Utf8(Some(provenance.to_string()))
+		})
+		.unwrap_or_else(|| {
+			panic!(
+				"missing optimizer decision conflict kind={kind} provenance={provenance}: {rows:?}"
+			)
+		})
+}
+
+fn assert_decision_conflict_order(rows: &[Vec<ScalarValue>]) {
+	let expected = decision_recording_kinds()
+		.into_iter()
+		.flat_map(|kind| {
+			["native", "demoted"].into_iter().map(move |provenance| {
+				(
+					optimizer_decision_kind_label(kind).to_string(),
+					provenance.to_string(),
+				)
+			})
+		})
+		.collect::<Vec<_>>();
+	let actual = rows
+		.iter()
+		.map(|row| {
+			(
+				decision_conflict_utf8(row, 0).to_string(),
+				decision_conflict_utf8(row, 1).to_string(),
+			)
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(actual, expected);
+}
+
 fn margin_advisory_utf8(row: &[ScalarValue], index: usize) -> &str {
 	let ScalarValue::Utf8(Some(value)) = &row[index] else {
 		panic!(
@@ -17602,6 +18052,36 @@ fn receipt_gate_i64(row: &[ScalarValue], index: usize) -> i64 {
 	let ScalarValue::Int64(Some(value)) = row[index] else {
 		panic!(
 			"expected receipt gate Int64 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value
+}
+
+fn decision_conflict_utf8(row: &[ScalarValue], index: usize) -> &str {
+	let ScalarValue::Utf8(Some(value)) = &row[index] else {
+		panic!(
+			"expected decision conflict Utf8 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value.as_str()
+}
+
+fn decision_conflict_nullable_utf8(row: &[ScalarValue], index: usize) -> Option<&str> {
+	let ScalarValue::Utf8(value) = &row[index] else {
+		panic!(
+			"expected decision conflict nullable Utf8 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value.as_deref()
+}
+
+fn decision_conflict_i64(row: &[ScalarValue], index: usize) -> i64 {
+	let ScalarValue::Int64(Some(value)) = row[index] else {
+		panic!(
+			"expected decision conflict Int64 at {index}, got {:?}",
 			row[index]
 		);
 	};

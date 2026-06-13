@@ -2160,20 +2160,25 @@ pub(crate) fn adr217_preserved_outer_gate_is_separate_loosen_only_signal() {
 pub(crate) fn adr217_decision_conflict_gate_uses_durable_decision_rows() {
 	let join_order = source("src/binder/join_order.rs");
 	let gate = first_block(&join_order, "fn decision_conflict_pressure_gate");
-	let strongest = first_block(&join_order, "fn strongest_decision_conflict_signal");
-	let compare = first_block(&join_order, "fn compare_decision_conflict_signal");
+	let reports = first_block(&join_order, "pub(crate) fn decision_conflict_reports");
+	let strongest = first_block(&join_order, "fn strongest_decision_conflict_report");
+	let compare = first_block(&join_order, "fn compare_decision_conflict_report");
 
-	assert!(gate.contains("JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
-	assert!(gate.contains("signal.reordered"));
-	assert!(gate.contains("signal.blocked_or_near_miss"));
+	assert!(gate.contains("decision_conflict_reports(snapshot)"));
+	assert!(gate.contains("strongest_decision_conflict_report(&reports)"));
+	assert!(gate.contains("DecisionConflictStatus::Conflicted"));
 	assert!(gate.contains("reordered_and_blocked_ready"));
-	assert!(strongest.contains("OptimizerDecisionOutcome::Reordered"));
-	assert!(strongest.contains("OptimizerDecisionOutcome::KeptThinMargin"));
-	assert!(strongest.contains("OptimizerDecisionOutcome::Declined(_)"));
-	assert!(strongest.contains("OptimizerDecisionOutcome::KeptOptimal => {}"));
-	assert!(strongest.contains("row.provenance"));
+	assert!(join_order.contains("fn decision_conflict_status("));
+	assert!(join_order.contains("JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
+	assert!(reports.contains("snapshot.decisions"));
+	assert!(reports.contains("OptimizerDecisionOutcome::Reordered"));
+	assert!(reports.contains("OptimizerDecisionOutcome::KeptThinMargin"));
+	assert!(reports.contains("OptimizerDecisionOutcome::Declined(reason)"));
+	assert!(reports.contains("OptimizerDecisionOutcome::KeptOptimal"));
+	assert!(reports.contains("row.provenance"));
+	assert!(strongest.contains("report.total_count > 0"));
 	assert!(compare.contains("conflict_strength"));
-	assert!(compare.contains("sample_count"));
+	assert!(compare.contains("total_count"));
 }
 
 #[test]
