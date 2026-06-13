@@ -972,6 +972,7 @@ pub(crate) fn adr208_runtime_verdict_report_remains_complete() {
 		"GalaxyRoot",
 		"BridgeRoot",
 		"BridgeChainRoot",
+		"PreservedOuterOrder",
 	] {
 		assert!(
 			kinds.contains(kind),
@@ -981,6 +982,12 @@ pub(crate) fn adr208_runtime_verdict_report_remains_complete() {
 	assert!(bind_relation.contains("INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE"));
 	assert!(bind_relation.contains("runtime_evidence.verdict_snapshot()"));
 	assert!(bind_relation.contains("information_schema_optimizer_runtime_verdict_rows"));
+	let explain = source("src/binder/explain.rs");
+	let schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_runtime_verdicts_schema",
+	);
+	assert!(schema.contains("\"provenance\""));
 }
 
 #[test]
@@ -1059,6 +1066,7 @@ pub(crate) fn adr213_graph_advisory_scope_accepts_only_graph_kinds() {
 		"FlatStar",
 		"SnowflakeRoot",
 		"SnowflakeBranch",
+		"PreservedOuterOrder",
 		"Overflow",
 	] {
 		assert!(
@@ -1201,10 +1209,11 @@ pub(crate) fn adr213_runtime_verdict_report_remains_complete() {
 
 	let runtime_evidence = source("src/binder/runtime_evidence.rs");
 	let keys = first_block(&runtime_evidence, "fn runtime_evidence_decision_kinds");
-	assert_eq!(keys.matches("OptimizerDecisionKind::").count(), 7);
-	assert!(runtime_evidence.contains(
-		"Vec::with_capacity(runtime_evidence_decision_kinds().len() * verdict_classes().len())"
-	));
+	let all_keys = first_block(&runtime_evidence, "pub(crate) fn all_verdict_counter_keys");
+	assert_eq!(keys.matches("OptimizerDecisionKind::").count(), 8);
+	assert!(all_keys.contains("runtime_evidence_decision_kinds().len()"));
+	assert!(all_keys.contains("* verdict_classes().len()"));
+	assert!(all_keys.contains("* runtime_evidence_lanes().len()"));
 }
 
 #[test]
@@ -1236,6 +1245,161 @@ pub(crate) fn adr213_no_executor_fragmenter_storage_wire_wendelon_or_outer_join_
 	assert!(
 		offenders.is_empty(),
 		"ADR213 graph margin advisory readout leaked outside binder/reporting surfaces:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
+pub(crate) fn adr214_outer_kind_vocabulary_is_exactly_preserved_outer_order() {
+	let decision_log = source("src/binder/decision_log.rs");
+	let kinds = first_block(&decision_log, "pub(crate) enum OptimizerDecisionKind");
+	let labels = first_block(&decision_log, "pub(crate) fn optimizer_decision_kind_label");
+
+	assert!(kinds.contains("PreservedOuterOrder"));
+	assert!(labels.contains("PreservedOuterOrder => \"preserved_outer_order\""));
+	for forbidden in ["DemotedOuter", "OuterStar", "OuterJoinOrder"] {
+		assert!(
+			!decision_log.contains(forbidden),
+			"ADR214 admits one outer-ordering kind; found {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr214_provenance_is_dual_write_totals_unchanged() {
+	let decision_log = source("src/binder/decision_log.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let explain = source("src/binder/explain.rs");
+	let key = first_block(
+		&decision_log,
+		"pub(crate) struct OptimizerRuntimeVerdictKey",
+	);
+	let row = first_block(
+		&decision_log,
+		"pub(crate) struct OptimizerRuntimeVerdictRow",
+	);
+	let record = first_block(&runtime_evidence, "pub(crate) fn record_verdict");
+	let codec = first_block(&runtime_evidence, "pub(crate) fn verdict_counter_key");
+	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
+	let schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_runtime_verdicts_schema",
+	);
+
+	assert!(decision_log.contains("enum OptimizerRuntimeVerdictProvenance"));
+	assert!(decision_log.contains("enum OptimizerRuntimeEvidenceLane"));
+	assert!(key.contains("lane: OptimizerRuntimeEvidenceLane"));
+	assert!(row.contains("provenance: OptimizerRuntimeVerdictProvenance"));
+	assert!(record.contains("lane: OptimizerRuntimeEvidenceLane::Total"));
+	assert!(record.contains("if provenance == OptimizerRuntimeVerdictProvenance::Demoted"));
+	assert!(record.contains("lane: OptimizerRuntimeEvidenceLane::Demoted"));
+	assert!(codec.contains("OptimizerRuntimeEvidenceLane::Total"));
+	assert!(codec.contains("\"{}/{}\""));
+	assert!(codec.contains("OptimizerRuntimeEvidenceLane::Demoted"));
+	assert!(codec.contains("\"{}/demoted/{}\""));
+	assert!(snapshot.contains("let native = total.saturating_sub(demoted)"));
+	assert!(snapshot.contains("OptimizerRuntimeVerdictProvenance::Native"));
+	assert!(snapshot.contains("OptimizerRuntimeVerdictProvenance::Demoted"));
+	assert!(schema.contains("\"provenance\""));
+}
+
+#[test]
+pub(crate) fn adr214_counterfactual_uses_noop_recorder_scratch_bind() {
+	let binder = binder_root_source();
+	let explain = source("src/binder/explain.rs");
+	let trace = first_block(&explain, "pub(super) struct OptimizerExplainRenderTrace");
+	let helper = first_block(&binder, "fn preserved_outer_order_receipt");
+	let collect = first_block(&binder, "fn star_order_runtime_replay_ids");
+
+	// ADR214 uses the allowed contained edge-vector helper: cloned trace edges answer the
+	// inner-equivalent question and map back to real executed join targets; no shared recorder is touched.
+	assert!(trace.contains("preserved_outer_order: Vec<PreservedOuterOrderReceipt>"));
+	assert!(helper.contains("let mut counterfactual_edges = edges.to_vec()"));
+	assert!(helper.contains("is_preserved_outer_equi_edge"));
+	assert!(helper.contains("edge.inner_equi = true"));
+	assert!(helper.contains("edge.probe_scan_linear = true"));
+	assert!(helper.contains("analyze(&counterfactual_edges"));
+	assert!(!helper.contains(".record("));
+	assert!(!helper.contains("decision_recorder"));
+	assert!(!helper.contains("bind_plan"));
+	assert!(collect.contains("render_trace.preserved_outer_order"));
+	assert!(collect.contains("receipt.receipt.edge_targets"));
+}
+
+#[test]
+pub(crate) fn adr214_outer_verdicts_are_opportunity_classes() {
+	let explain = source("src/binder/explain.rs");
+	let verdicts = first_block(&explain, "fn measured_verdicts_from_summaries");
+	let outer = first_block(&explain, "fn runtime_verdict_class_from_preserved_outer");
+
+	assert!(verdicts.contains("OptimizerDecisionKind::PreservedOuterOrder"));
+	assert!(verdicts.contains("runtime_verdict_class_from_preserved_outer"));
+	assert!(outer.contains("StarOrderVerdict::MissedWin | StarOrderVerdict::MisRanked"));
+	assert!(outer.contains("OptimizerRuntimeVerdictClass::MissedWin"));
+	assert!(outer.contains("StarOrderVerdict::Vindicated | StarOrderVerdict::OverEager"));
+	assert!(outer.contains("OptimizerRuntimeVerdictClass::Vindicated"));
+	assert!(outer.contains("StarOrderVerdict::Indeterminate"));
+	assert!(outer.contains("OptimizerRuntimeVerdictClass::Indeterminate"));
+}
+
+#[test]
+pub(crate) fn adr214_runtime_evidence_matrix_is_80_keys_enumerable() {
+	adr207_runtime_evidence_is_extracted_fixed_matrix();
+
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let kinds = first_block(&runtime_evidence, "fn runtime_evidence_decision_kinds");
+	let lanes = first_block(&runtime_evidence, "fn runtime_evidence_lanes");
+	let all_keys = first_block(&runtime_evidence, "pub(crate) fn all_verdict_counter_keys");
+
+	assert_eq!(kinds.matches("OptimizerDecisionKind::").count(), 8);
+	assert_eq!(lanes.matches("OptimizerRuntimeEvidenceLane::").count(), 2);
+	assert!(all_keys.contains("* runtime_evidence_lanes().len()"));
+}
+
+#[test]
+pub(crate) fn adr214_outer_family_has_no_advisory_knob() {
+	let join_order = source("src/binder/join_order.rs");
+	let tree_predicate = first_block(&join_order, "pub(crate) fn is_tree_margin_advisory_kind");
+	let graph_predicate = first_block(&join_order, "pub(crate) fn is_graph_margin_advisory_kind");
+	let input = first_block(&join_order, "fn margin_advisory_input");
+	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
+
+	assert!(tree_predicate.contains("PreservedOuterOrder"));
+	assert!(graph_predicate.contains("PreservedOuterOrder"));
+	assert!(input.contains("if scope.includes(row.kind)"));
+	assert!(input.contains("excluded_sample_size"));
+	assert!(report_rows.contains("MarginAdvisoryScope::TreeFamily"));
+	assert!(report_rows.contains("MarginAdvisoryScope::GraphFamily"));
+	assert!(!report_rows.contains("PreservedOuterOrder"));
+}
+
+#[test]
+pub(crate) fn adr214_no_executor_fragmenter_storage_wire_or_wendelon_change() {
+	let manifest = manifest_dir();
+	let markers = [
+		"PreservedOuterOrder",
+		"OptimizerRuntimeVerdictProvenance",
+		"OptimizerRuntimeEvidenceLane",
+		"preserved_outer_order",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/wire.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR214 outer-ordering evidence leaked outside binder/reporting/coordinator surfaces:\n{}",
 		format_offenders(&manifest, &offenders)
 	);
 }
@@ -1286,6 +1450,7 @@ pub(crate) fn adr207_runtime_evidence_is_extracted_fixed_matrix() {
 		"GalaxyRoot",
 		"BridgeRoot",
 		"BridgeChainRoot",
+		"PreservedOuterOrder",
 	] {
 		assert!(
 			kinds.contains(kind),
@@ -1305,7 +1470,13 @@ pub(crate) fn adr207_runtime_evidence_is_extracted_fixed_matrix() {
 			"fixed evidence matrix is missing {class}"
 		);
 	}
-	assert!(all_keys.contains("runtime_evidence_decision_kinds().len() * verdict_classes().len()"));
+	assert!(all_keys.contains("runtime_evidence_decision_kinds().len()"));
+	assert!(all_keys.contains("* verdict_classes().len()"));
+	assert!(all_keys.contains("* runtime_evidence_lanes().len()"));
+	assert!(runtime_evidence.contains("OptimizerRuntimeEvidenceLane::Total"));
+	assert!(runtime_evidence.contains("OptimizerRuntimeEvidenceLane::Demoted"));
+	assert!(runtime_evidence.contains("\"{}/{}\""));
+	assert!(runtime_evidence.contains("\"{}/demoted/{}\""));
 	assert!(!runtime_evidence.contains("prefix_scan"));
 	assert!(!runtime_evidence.contains("SystemTableRegistry"));
 }
@@ -1320,7 +1491,8 @@ pub(crate) fn adr207_snapshot_merges_durable_pending_and_in_flight() {
 
 	assert!(snapshot.contains("state.durable_cache.clone()"));
 	assert!(snapshot.contains("state.pending.iter().chain(state.in_flight.iter())"));
-	assert!(snapshot.contains("count > 0"));
+	assert!(snapshot.contains("native > 0"));
+	assert!(snapshot.contains("demoted > 0"));
 	assert!(flush.contains("state.in_flight.get(&key)"));
 	assert!(flush.contains("state.in_flight.insert(key, delta)"));
 	assert!(ack.contains(".max(current_value)"));
@@ -1484,7 +1656,8 @@ pub(crate) fn adr207_counter_absent_maps_to_zero_in_consumer() {
 	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
 
 	assert!(refresh.contains("value.unwrap_or(0)"));
-	assert!(snapshot.contains("count > 0"));
+	assert!(snapshot.contains("native > 0"));
+	assert!(snapshot.contains("demoted > 0"));
 }
 
 #[test]

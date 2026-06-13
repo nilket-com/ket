@@ -15,6 +15,8 @@ pub(crate) enum OptimizerDecisionKind {
 	BridgeRoot,
 	// ADR 203: observe-only multi-hop bridge chain path-order verdict provenance (no actuation).
 	BridgeChainRoot,
+	// ADR 214: observe-only preserved-outer ordering opportunity evidence. No actuation.
+	PreservedOuterOrder,
 	Overflow,
 }
 
@@ -48,6 +50,18 @@ pub(crate) enum OptimizerRuntimeVerdictClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OptimizerRuntimeVerdictProvenance {
+	Native,
+	Demoted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OptimizerRuntimeEvidenceLane {
+	Total,
+	Demoted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OptimizerDecisionKey {
 	pub(crate) kind: OptimizerDecisionKind,
 	pub(crate) outcome: OptimizerDecisionOutcome,
@@ -57,6 +71,7 @@ pub(crate) struct OptimizerDecisionKey {
 pub(crate) struct OptimizerRuntimeVerdictKey {
 	pub(crate) kind: OptimizerDecisionKind,
 	pub(crate) verdict: OptimizerRuntimeVerdictClass,
+	pub(crate) lane: OptimizerRuntimeEvidenceLane,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +85,7 @@ pub(crate) struct OptimizerDecisionRow {
 pub(crate) struct OptimizerRuntimeVerdictRow {
 	pub(crate) kind: OptimizerDecisionKind,
 	pub(crate) verdict: OptimizerRuntimeVerdictClass,
+	pub(crate) provenance: OptimizerRuntimeVerdictProvenance,
 	pub(crate) count: u64,
 }
 
@@ -164,6 +180,7 @@ pub(crate) fn optimizer_decision_kind_label(kind: OptimizerDecisionKind) -> &'st
 		OptimizerDecisionKind::GalaxyRoot => "galaxy_root",
 		OptimizerDecisionKind::BridgeRoot => "bridge_root",
 		OptimizerDecisionKind::BridgeChainRoot => "bridge_chain_root",
+		OptimizerDecisionKind::PreservedOuterOrder => "preserved_outer_order",
 		OptimizerDecisionKind::Overflow => "overflow",
 	}
 }
@@ -201,5 +218,14 @@ pub(crate) fn optimizer_runtime_verdict_label(
 		OptimizerRuntimeVerdictClass::OverEager => "over_eager",
 		OptimizerRuntimeVerdictClass::MisRanked => "mis_ranked",
 		OptimizerRuntimeVerdictClass::Indeterminate => "indeterminate",
+	}
+}
+
+pub(crate) fn optimizer_runtime_verdict_provenance_label(
+	provenance: OptimizerRuntimeVerdictProvenance,
+) -> &'static str {
+	match provenance {
+		OptimizerRuntimeVerdictProvenance::Native => "native",
+		OptimizerRuntimeVerdictProvenance::Demoted => "demoted",
 	}
 }

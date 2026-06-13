@@ -10879,8 +10879,40 @@ fn uniform_observations(binding: &ExplainAnalyzeBinding) -> Vec<JoinRuntimeObser
 		.collect()
 }
 
+fn descending_observations(binding: &ExplainAnalyzeBinding) -> Vec<JoinRuntimeObservation> {
+	let count = u64::try_from(binding.replay_ids.len()).expect("test replay id count fits in u64");
+	binding
+		.replay_ids
+		.iter()
+		.enumerate()
+		.map(|(index, replay_id)| {
+			let rank = u64::try_from(index).expect("test replay id index fits in u64");
+			JoinRuntimeObservation {
+				replay_id: *replay_id,
+				strategy: JoinStrategy::HashPartitioned,
+				build_rows: RowCount::new(3),
+				probe_rows: RowCount::new(3),
+				output_rows: RowCount::new((count - rank) * 10),
+			}
+		})
+		.collect()
+}
+
 fn verdict_kinds(verdicts: &[MeasuredLevelVerdict]) -> Vec<OptimizerDecisionKind> {
 	verdicts.iter().map(|verdict| verdict.kind).collect()
+}
+
+fn measured_verdict_signature(
+	verdicts: &[MeasuredLevelVerdict],
+) -> Vec<(
+	OptimizerDecisionKind,
+	OptimizerRuntimeVerdictClass,
+	OptimizerRuntimeVerdictProvenance,
+)> {
+	verdicts
+		.iter()
+		.map(|verdict| (verdict.kind, verdict.verdict, verdict.provenance))
+		.collect()
 }
 
 fn has_tree_verdict(kinds: &[OptimizerDecisionKind]) -> bool {
@@ -12288,6 +12320,9 @@ fn tree_margin_advisory_scope_accepts_only_tree_kinds() {
 	assert!(!is_tree_margin_advisory_kind(
 		OptimizerDecisionKind::Overflow
 	));
+	assert!(!is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::PreservedOuterOrder
+	));
 }
 
 #[test]
@@ -12314,6 +12349,12 @@ fn graph_margin_advisory_scope_accepts_only_graph_kinds() {
 	));
 	assert!(!is_graph_margin_advisory_kind(
 		OptimizerDecisionKind::Overflow
+	));
+	assert!(!is_tree_margin_advisory_kind(
+		OptimizerDecisionKind::PreservedOuterOrder
+	));
+	assert!(!is_graph_margin_advisory_kind(
+		OptimizerDecisionKind::PreservedOuterOrder
 	));
 }
 
@@ -12362,6 +12403,45 @@ fn graph_or_chain_verdicts_do_not_drive_soft_margin_advisory() {
 	assert_eq!(
 		report.excluded_sample_size,
 		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE.saturating_mul(2)
+	);
+}
+
+#[tokio::test]
+async fn preserved_outer_verdicts_do_not_drive_margin_advisories() {
+	let config = auto_applied_margin_config(
+		SoftMarginLadderStep::Baseline,
+		&[(
+			OptimizerDecisionKind::PreservedOuterOrder,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		)],
+	);
+
+	assert_eq!(
+		effective_tree_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Baseline
+	);
+	let report = margin_advisory_report(&config);
+	assert_eq!(
+		report.advisory.recommendation,
+		MarginRecommendation::InsufficientEvidence
+	);
+	assert_eq!(report.advisory.sample_size, 0);
+	assert_eq!(
+		report.excluded_sample_size,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
+	);
+
+	let rows = optimizer_margin_advisory_rows(&MockCatalog::new(), &config).await;
+	let tree = margin_advisory_row_by_scope(&rows, "tree_join_order");
+	let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
+	assert_eq!(
+		margin_advisory_i64(tree, 12),
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE as i64
+	);
+	assert_eq!(
+		margin_advisory_i64(graph, 12),
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE as i64
 	);
 }
 
@@ -13157,6 +13237,216 @@ async fn measured_verdict_reuses_180_184_computation() {
 }
 
 #[tokio::test]
+async fn outer_ordering_receipts_distinguish_demoted_inner_from_true_outer() {
+	let catalog = star_join_order_catalog();
+	let demoted_sql = "SELECT * FROM orders o \
+		LEFT JOIN customers c ON o.customer_id = c.id \
+		INNER JOIN products p ON o.product_id = p.id \
+		INNER JOIN stores s ON o.store_id = s.id \
+		WHERE c.id IS NOT NULL";
+	let demoted = SqlPlanner::new()
+		.plan(demoted_sql)
+		.expect("plan demoted outer star");
+	let demoted_binding =
+		bind_explain_analyze(&demoted, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind demoted outer star analyze");
+	let demoted_verdicts = measured_explain_analyze_verdicts(
+		&demoted_binding,
+		&uniform_observations(&demoted_binding),
+	)
+	.expect("measure demoted outer star verdicts");
+	assert!(
+		demoted_verdicts.iter().any(|verdict| {
+			verdict.kind == OptimizerDecisionKind::FlatStar
+				&& verdict.provenance == OptimizerRuntimeVerdictProvenance::Demoted
+		}),
+		"fully demoted outer joins keep their tree kind and carry demoted provenance: {demoted_verdicts:?}"
+	);
+	assert!(
+		!demoted_verdicts
+			.iter()
+			.any(|verdict| verdict.kind == OptimizerDecisionKind::PreservedOuterOrder),
+		"fully demoted joins must not enter the preserved-outer lane: {demoted_verdicts:?}"
+	);
+
+	let preserved = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan preserved outer star");
+	let preserved_binding = bind_explain_analyze(
+		&preserved,
+		&catalog,
+		&auto_broadcast_config(64 * 1024 * 1024),
+	)
+	.await
+	.expect("bind preserved outer star analyze");
+	assert_eq!(
+		preserved_binding.replay_ids.len(),
+		3,
+		"preserved outer counterfactual targets must map back to real join replay ids"
+	);
+	let preserved_verdicts = measured_explain_analyze_verdicts(
+		&preserved_binding,
+		&descending_observations(&preserved_binding),
+	)
+	.expect("measure preserved outer star verdicts");
+	assert!(
+		preserved_verdicts.iter().any(|verdict| {
+			verdict.kind == OptimizerDecisionKind::PreservedOuterOrder
+				&& verdict.provenance == OptimizerRuntimeVerdictProvenance::Native
+				&& verdict.verdict == OptimizerRuntimeVerdictClass::MissedWin
+		}),
+		"true preserved outers accrue the outer opportunity lane: {preserved_verdicts:?}"
+	);
+	assert!(
+		!has_tree_verdict(&verdict_kinds(&preserved_verdicts)),
+		"true preserved outers must not masquerade as tree verdicts: {preserved_verdicts:?}"
+	);
+}
+
+#[tokio::test]
+async fn rune_outer_ordering_receipts_match_sql() {
+	let catalog = star_join_order_catalog();
+	let sql = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan SQL preserved outer star");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM orders o LEFT JOIN customers c ON o.customer_id = c.id LEFT JOIN products p ON o.product_id = p.id LEFT JOIN stores s ON o.store_id = s.id")
+        }
+    "#,
+	)
+	.await;
+
+	let (_sql_plan, _sql_trace, sql_render) =
+		bind_with_explain_trace(&sql, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind SQL preserved outer trace");
+	let (_rune_plan, _rune_trace, rune_render) =
+		bind_with_explain_trace(&rune, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind Rune preserved outer trace");
+
+	assert_eq!(
+		sql_render.preserved_outer_order, rune_render.preserved_outer_order,
+		"Rune and SQL must expose the same preserved-outer receipt"
+	);
+
+	let sql_binding =
+		bind_explain_analyze(&sql, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind SQL preserved outer analyze");
+	let rune_binding =
+		bind_explain_analyze(&rune, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind Rune preserved outer analyze");
+	assert_eq!(sql_binding.replay_ids, rune_binding.replay_ids);
+
+	let sql_verdicts =
+		measured_explain_analyze_verdicts(&sql_binding, &descending_observations(&sql_binding))
+			.expect("measure SQL preserved outer verdicts");
+	let rune_verdicts =
+		measured_explain_analyze_verdicts(&rune_binding, &descending_observations(&rune_binding))
+			.expect("measure Rune preserved outer verdicts");
+	assert_eq!(
+		measured_verdict_signature(&sql_verdicts),
+		measured_verdict_signature(&rune_verdicts)
+	);
+}
+
+#[tokio::test]
+async fn counterfactual_bind_is_scratch_and_byte_identical() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan preserved outer star");
+	let config = auto_broadcast_config(64 * 1024 * 1024);
+	let before_log = config.decision_log.snapshot();
+
+	let (plain_plan, plain_trace) = bind_with_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind preserved outer without render trace");
+	let (explain_plan, explain_trace, render_trace) =
+		bind_with_explain_trace(&logical, &catalog, &config)
+			.await
+			.expect("bind preserved outer with render trace");
+
+	assert_eq!(plain_trace, explain_trace);
+	assert_eq!(format!("{plain_plan:?}"), format!("{explain_plan:?}"));
+	assert_eq!(before_log, config.decision_log.snapshot());
+	assert_eq!(
+		render_trace.preserved_outer_order.len(),
+		1,
+		"the scratch counterfactual receipt exists without mutating the live bind"
+	);
+}
+
+#[tokio::test]
+async fn mixed_binding_provenance_is_binding_level_and_documented() {
+	let catalog = hash_snowflake_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(mixed_demoted_snowflake_order_sql())
+		.expect("plan mixed demoted snowflake");
+	let binding = bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(1))
+		.await
+		.expect("bind mixed demoted snowflake analyze");
+	let verdicts = measured_explain_analyze_verdicts(&binding, &uniform_observations(&binding))
+		.expect("measure mixed demoted snowflake verdicts");
+
+	assert!(
+		verdicts
+			.iter()
+			.any(|verdict| verdict.kind == OptimizerDecisionKind::SnowflakeRoot),
+		"fixture must include the root star verdict: {verdicts:?}"
+	);
+	assert!(
+		verdicts
+			.iter()
+			.any(|verdict| verdict.kind == OptimizerDecisionKind::SnowflakeBranch),
+		"fixture must include the demoted branch verdict: {verdicts:?}"
+	);
+	assert!(
+		verdicts
+			.iter()
+			.all(|verdict| verdict.provenance == OptimizerRuntimeVerdictProvenance::Demoted),
+		"ADR214 D3 is binding-level: one demotion marks all measured verdicts in the binding: {verdicts:?}"
+	);
+}
+
+#[tokio::test]
+async fn preserved_outer_verdicts_are_opportunity_classes_only() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan preserved outer star");
+	let binding =
+		bind_explain_analyze(&logical, &catalog, &auto_broadcast_config(64 * 1024 * 1024))
+			.await
+			.expect("bind preserved outer star analyze");
+	let verdicts = measured_explain_analyze_verdicts(&binding, &descending_observations(&binding))
+		.expect("measure preserved outer verdicts");
+	let preserved = verdicts
+		.iter()
+		.find(|verdict| verdict.kind == OptimizerDecisionKind::PreservedOuterOrder)
+		.expect("preserved outer verdict");
+
+	assert_eq!(preserved.verdict, OptimizerRuntimeVerdictClass::MissedWin);
+	assert!(
+		verdicts
+			.iter()
+			.filter(|verdict| verdict.kind == OptimizerDecisionKind::PreservedOuterOrder)
+			.all(|verdict| matches!(
+				verdict.verdict,
+				OptimizerRuntimeVerdictClass::MissedWin
+					| OptimizerRuntimeVerdictClass::Vindicated
+					| OptimizerRuntimeVerdictClass::Indeterminate
+			)),
+		"preserved outer verdicts expose opportunity classes only: {verdicts:?}"
+	);
+}
+
+#[tokio::test]
 async fn measured_verdicts_record_per_level_for_recursive_snowflake() {
 	let catalog = hash_snowflake_join_order_catalog();
 	let logical = SqlPlanner::new()
@@ -13228,10 +13518,12 @@ async fn optimizer_runtime_verdicts_report_aggregates_by_kind_and_class() {
 	config.runtime_evidence.record_verdict(
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
+		OptimizerRuntimeVerdictProvenance::Native,
 	);
 	config.runtime_evidence.record_verdict(
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
+		OptimizerRuntimeVerdictProvenance::Native,
 	);
 
 	let rows = optimizer_runtime_verdict_rows(&catalog, &config).await;
@@ -13244,12 +13536,40 @@ async fn optimizer_runtime_verdicts_report_aggregates_by_kind_and_class() {
 }
 
 #[tokio::test]
+async fn optimizer_runtime_verdicts_split_native_and_demoted_provenance() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	config.runtime_evidence.record_verdict(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		OptimizerRuntimeVerdictProvenance::Native,
+	);
+	config.runtime_evidence.record_verdict(
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		OptimizerRuntimeVerdictProvenance::Demoted,
+	);
+
+	let rows = optimizer_runtime_verdict_rows(&catalog, &config).await;
+
+	assert_eq!(
+		optimizer_runtime_verdict_count_by_provenance(&rows, "flat_star", "missed_win", "native",),
+		1
+	);
+	assert_eq!(
+		optimizer_runtime_verdict_count_by_provenance(&rows, "flat_star", "missed_win", "demoted",),
+		1
+	);
+}
+
+#[tokio::test]
 async fn rune_queries_optimizer_runtime_verdicts() {
 	let catalog = star_join_order_catalog();
 	let config = PlannerConfig::default();
 	config.runtime_evidence.record_verdict(
 		OptimizerDecisionKind::SnowflakeRoot,
 		OptimizerRuntimeVerdictClass::Vindicated,
+		OptimizerRuntimeVerdictProvenance::Native,
 	);
 	let logical = rune_plan(
 		r#"
@@ -13284,6 +13604,7 @@ async fn optimizer_evidence_status_reports_local_pending() {
 	config.runtime_evidence.record_verdict(
 		OptimizerDecisionKind::FlatStar,
 		OptimizerRuntimeVerdictClass::MissedWin,
+		OptimizerRuntimeVerdictProvenance::Native,
 	);
 
 	let rows = optimizer_evidence_status_rows(&catalog, &config).await;
@@ -16011,6 +16332,30 @@ fn optimizer_runtime_verdict_count(rows: &[Vec<ScalarValue>], kind: &str, verdic
 	count
 }
 
+fn optimizer_runtime_verdict_count_by_provenance(
+	rows: &[Vec<ScalarValue>],
+	kind: &str,
+	verdict: &str,
+	provenance: &str,
+) -> i64 {
+	let row = rows
+		.iter()
+		.find(|row| {
+			row[0] == ScalarValue::Utf8(Some(kind.to_string()))
+				&& row[1] == ScalarValue::Utf8(Some(verdict.to_string()))
+				&& row[3] == ScalarValue::Utf8(Some(provenance.to_string()))
+		})
+		.unwrap_or_else(|| {
+			panic!(
+				"missing optimizer runtime verdict row kind={kind} verdict={verdict} provenance={provenance}: {rows:?}"
+			)
+		});
+	let ScalarValue::Int64(Some(count)) = row[2] else {
+		panic!("expected optimizer runtime verdict count, got {:?}", row[2]);
+	};
+	count
+}
+
 fn optimizer_runtime_verdict_kind_count(rows: &[Vec<ScalarValue>], kind: &str) -> i64 {
 	rows.iter()
 		.filter(|row| row[0] == ScalarValue::Utf8(Some(kind.to_string())))
@@ -16030,6 +16375,7 @@ fn verdict_snapshot(
 		.map(|(kind, verdict, count)| OptimizerRuntimeVerdictRow {
 			kind: *kind,
 			verdict: *verdict,
+			provenance: OptimizerRuntimeVerdictProvenance::Native,
 			count: *count,
 		})
 		.collect()
@@ -16042,7 +16388,7 @@ fn record_verdicts(
 	count: u64,
 ) {
 	for _ in 0..count {
-		evidence.record_verdict(kind, verdict);
+		evidence.record_verdict(kind, verdict, OptimizerRuntimeVerdictProvenance::Native);
 	}
 }
 
@@ -18522,6 +18868,22 @@ fn non_optimal_snowflake_order_sql() -> &'static str {
 	 INNER JOIN stores s ON o.store_id = s.id"
 }
 
+fn mixed_demoted_snowflake_order_sql() -> &'static str {
+	"SELECT * FROM orders o \
+	 INNER JOIN customers c ON o.customer_id = c.id \
+	 LEFT JOIN regions r ON c.region_id = r.id \
+	 INNER JOIN segments g ON c.segment_id = g.id \
+	 INNER JOIN stores s ON o.store_id = s.id \
+	 WHERE r.id IS NOT NULL"
+}
+
+fn preserved_outer_star_sql() -> &'static str {
+	"SELECT * FROM orders o \
+	 LEFT JOIN customers c ON o.customer_id = c.id \
+	 LEFT JOIN products p ON o.product_id = p.id \
+	 LEFT JOIN stores s ON o.store_id = s.id"
+}
+
 fn mixed_strategy_snowflake_order_sql() -> &'static str {
 	"SELECT * FROM orders o \
 	 INNER JOIN stores s ON o.store_id = s.id \
@@ -18594,6 +18956,7 @@ fn snowflake_test_edge(
 ) -> JoinOrderEdgeEvidence {
 	JoinOrderEdgeEvidence {
 		target: JoinTraceTarget { join_index },
+		join_kind: JoinKind::Inner,
 		probe: Some(probe.to_string()),
 		dimension: Some(dimension.to_string()),
 		declared_position,
@@ -18622,6 +18985,7 @@ fn bridge_test_edge(
 ) -> JoinOrderEdgeEvidence {
 	JoinOrderEdgeEvidence {
 		target: JoinTraceTarget { join_index },
+		join_kind: JoinKind::Inner,
 		probe: Some(probe.to_string()),
 		dimension: Some(dimension.to_string()),
 		declared_position: join_index,

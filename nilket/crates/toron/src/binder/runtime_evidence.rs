@@ -7,8 +7,9 @@ use wendelon::schema::{TenantId, WriteStatus};
 use wendelon_client::{Client, ClientError, WriteOptions};
 
 use super::decision_log::{
-	OptimizerDecisionKind, OptimizerRuntimeVerdictClass, OptimizerRuntimeVerdictKey,
-	OptimizerRuntimeVerdictRow, optimizer_decision_kind_label, optimizer_runtime_verdict_label,
+	OptimizerDecisionKind, OptimizerRuntimeEvidenceLane, OptimizerRuntimeVerdictClass,
+	OptimizerRuntimeVerdictKey, OptimizerRuntimeVerdictProvenance, OptimizerRuntimeVerdictRow,
+	optimizer_decision_kind_label, optimizer_runtime_verdict_label,
 };
 
 pub const OPTIMIZER_EVIDENCE_KEY_PREFIX: &str = "optimizer_evidence/verdict/";
@@ -155,12 +156,27 @@ impl OptimizerRuntimeEvidence {
 		&self,
 		kind: OptimizerDecisionKind,
 		verdict: OptimizerRuntimeVerdictClass,
-	) -> OptimizerRuntimeVerdictKey {
-		let key = OptimizerRuntimeVerdictKey { kind, verdict };
+		provenance: OptimizerRuntimeVerdictProvenance,
+	) -> Vec<OptimizerRuntimeVerdictKey> {
+		let mut keys = Vec::with_capacity(2);
 		let mut state = self.state.lock().expect("optimizer runtime evidence");
-		let count = state.pending.entry(key).or_insert(0);
-		*count = count.saturating_add(1);
-		key
+		let total = OptimizerRuntimeVerdictKey {
+			kind,
+			verdict,
+			lane: OptimizerRuntimeEvidenceLane::Total,
+		};
+		increment_count(&mut state.pending, total);
+		keys.push(total);
+		if provenance == OptimizerRuntimeVerdictProvenance::Demoted {
+			let demoted = OptimizerRuntimeVerdictKey {
+				kind,
+				verdict,
+				lane: OptimizerRuntimeEvidenceLane::Demoted,
+			};
+			increment_count(&mut state.pending, demoted);
+			keys.push(demoted);
+		}
+		keys
 	}
 
 	pub(crate) fn verdict_snapshot(&self) -> Vec<OptimizerRuntimeVerdictRow> {
@@ -170,16 +186,45 @@ impl OptimizerRuntimeEvidence {
 			let entry = counts.entry(*key).or_insert(0);
 			*entry = entry.saturating_add(*count);
 		}
-		counts
-			.into_iter()
-			.filter_map(|(key, count)| {
-				(count > 0).then_some(OptimizerRuntimeVerdictRow {
-					kind: key.kind,
-					verdict: key.verdict,
-					count,
-				})
-			})
-			.collect()
+		let mut rows = Vec::new();
+		for kind in runtime_evidence_decision_kinds() {
+			for verdict in verdict_classes() {
+				let total = counts
+					.get(&OptimizerRuntimeVerdictKey {
+						kind,
+						verdict,
+						lane: OptimizerRuntimeEvidenceLane::Total,
+					})
+					.copied()
+					.unwrap_or(0);
+				let demoted = counts
+					.get(&OptimizerRuntimeVerdictKey {
+						kind,
+						verdict,
+						lane: OptimizerRuntimeEvidenceLane::Demoted,
+					})
+					.copied()
+					.unwrap_or(0);
+				let native = total.saturating_sub(demoted);
+				if native > 0 {
+					rows.push(OptimizerRuntimeVerdictRow {
+						kind,
+						verdict,
+						provenance: OptimizerRuntimeVerdictProvenance::Native,
+						count: native,
+					});
+				}
+				if demoted > 0 {
+					rows.push(OptimizerRuntimeVerdictRow {
+						kind,
+						verdict,
+						provenance: OptimizerRuntimeVerdictProvenance::Demoted,
+						count: demoted,
+					});
+				}
+			}
+		}
+		rows
 	}
 
 	pub(crate) fn status_snapshot(&self) -> OptimizerEvidenceStatusSnapshot {
@@ -207,7 +252,7 @@ impl OptimizerRuntimeEvidence {
 			let Some(delta) = self.take_pending_for_flush(key) else {
 				continue;
 			};
-			let key_bytes = verdict_counter_key(key.kind, key.verdict);
+			let key_bytes = verdict_counter_key(key);
 			let result = tokio::time::timeout(
 				binding.flush_timeout,
 				binding.client.counter_fetch_add(
@@ -372,31 +417,44 @@ impl OptimizerRuntimeEvidence {
 	}
 }
 
-pub(crate) fn verdict_counter_key(
-	kind: OptimizerDecisionKind,
-	verdict: OptimizerRuntimeVerdictClass,
-) -> Vec<u8> {
-	format!(
-		"{OPTIMIZER_EVIDENCE_KEY_PREFIX}{}/{}",
-		optimizer_decision_kind_label(kind),
-		optimizer_runtime_verdict_label(verdict)
-	)
-	.into_bytes()
+pub(crate) fn verdict_counter_key(key: OptimizerRuntimeVerdictKey) -> Vec<u8> {
+	let suffix = match key.lane {
+		OptimizerRuntimeEvidenceLane::Total => format!(
+			"{}/{}",
+			optimizer_decision_kind_label(key.kind),
+			optimizer_runtime_verdict_label(key.verdict)
+		),
+		OptimizerRuntimeEvidenceLane::Demoted => format!(
+			"{}/demoted/{}",
+			optimizer_decision_kind_label(key.kind),
+			optimizer_runtime_verdict_label(key.verdict)
+		),
+	};
+	format!("{OPTIMIZER_EVIDENCE_KEY_PREFIX}{suffix}").into_bytes()
 }
 
 pub(crate) fn all_verdict_counter_keys() -> Vec<(OptimizerRuntimeVerdictKey, Vec<u8>)> {
-	let mut keys =
-		Vec::with_capacity(runtime_evidence_decision_kinds().len() * verdict_classes().len());
+	let mut keys = Vec::with_capacity(
+		runtime_evidence_decision_kinds().len()
+			* verdict_classes().len()
+			* runtime_evidence_lanes().len(),
+	);
 	for kind in runtime_evidence_decision_kinds() {
 		for verdict in verdict_classes() {
-			let key = OptimizerRuntimeVerdictKey { kind, verdict };
-			keys.push((key, verdict_counter_key(kind, verdict)));
+			for lane in runtime_evidence_lanes() {
+				let key = OptimizerRuntimeVerdictKey {
+					kind,
+					verdict,
+					lane,
+				};
+				keys.push((key, verdict_counter_key(key)));
+			}
 		}
 	}
 	keys
 }
 
-fn runtime_evidence_decision_kinds() -> [OptimizerDecisionKind; 7] {
+fn runtime_evidence_decision_kinds() -> [OptimizerDecisionKind; 8] {
 	[
 		OptimizerDecisionKind::StarCandidate,
 		OptimizerDecisionKind::FlatStar,
@@ -405,6 +463,14 @@ fn runtime_evidence_decision_kinds() -> [OptimizerDecisionKind; 7] {
 		OptimizerDecisionKind::GalaxyRoot,
 		OptimizerDecisionKind::BridgeRoot,
 		OptimizerDecisionKind::BridgeChainRoot,
+		OptimizerDecisionKind::PreservedOuterOrder,
+	]
+}
+
+fn runtime_evidence_lanes() -> [OptimizerRuntimeEvidenceLane; 2] {
+	[
+		OptimizerRuntimeEvidenceLane::Total,
+		OptimizerRuntimeEvidenceLane::Demoted,
 	]
 }
 
@@ -424,6 +490,14 @@ fn sum_counts(counts: &BTreeMap<OptimizerRuntimeVerdictKey, u64>) -> u64 {
 		.fold(0u64, |acc, count| acc.saturating_add(*count))
 }
 
+fn increment_count(
+	counts: &mut BTreeMap<OptimizerRuntimeVerdictKey, u64>,
+	key: OptimizerRuntimeVerdictKey,
+) {
+	let count = counts.entry(key).or_insert(0);
+	*count = count.saturating_add(1);
+}
+
 #[cfg(test)]
 mod tests {
 	use std::collections::BTreeSet;
@@ -434,18 +508,19 @@ mod tests {
 		OptimizerRuntimeVerdictKey {
 			kind: OptimizerDecisionKind::StarCandidate,
 			verdict: OptimizerRuntimeVerdictClass::MissedWin,
+			lane: OptimizerRuntimeEvidenceLane::Total,
 		}
 	}
 
 	#[test]
-	fn runtime_evidence_keys_are_fixed_35_key_matrix() {
+	fn runtime_evidence_keys_are_fixed_80_key_matrix() {
 		let keys = all_verdict_counter_keys();
-		assert_eq!(keys.len(), 35);
+		assert_eq!(keys.len(), 80);
 		let unique = keys
 			.iter()
 			.map(|(_, key)| key.clone())
 			.collect::<BTreeSet<_>>();
-		assert_eq!(unique.len(), 35);
+		assert_eq!(unique.len(), 80);
 		assert!(
 			keys.iter()
 				.all(|(key, _)| key.kind != OptimizerDecisionKind::Overflow)
@@ -458,6 +533,14 @@ mod tests {
 			keys.iter()
 				.any(|(_, key)| key == b"optimizer_evidence/verdict/bridge_chain_root/vindicated")
 		);
+		assert!(
+			keys.iter()
+				.any(|(_, key)| key
+					== b"optimizer_evidence/verdict/star_candidate/demoted/missed_win")
+		);
+		assert!(keys.iter().any(
+			|(_, key)| key == b"optimizer_evidence/verdict/preserved_outer_order/indeterminate"
+		));
 	}
 
 	#[test]
@@ -466,17 +549,54 @@ mod tests {
 		evidence.record_verdict(
 			OptimizerDecisionKind::StarCandidate,
 			OptimizerRuntimeVerdictClass::MissedWin,
+			OptimizerRuntimeVerdictProvenance::Native,
 		);
 		evidence.record_verdict(
 			OptimizerDecisionKind::StarCandidate,
 			OptimizerRuntimeVerdictClass::MissedWin,
+			OptimizerRuntimeVerdictProvenance::Native,
 		);
 		assert_eq!(
 			evidence.verdict_snapshot(),
 			vec![OptimizerRuntimeVerdictRow {
 				kind: OptimizerDecisionKind::StarCandidate,
 				verdict: OptimizerRuntimeVerdictClass::MissedWin,
+				provenance: OptimizerRuntimeVerdictProvenance::Native,
 				count: 2,
+			}]
+		);
+	}
+
+	#[test]
+	fn runtime_evidence_demoted_verdict_dual_writes_total_and_sibling() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		let touched = evidence.record_verdict(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerRuntimeVerdictClass::Vindicated,
+			OptimizerRuntimeVerdictProvenance::Demoted,
+		);
+		assert_eq!(
+			touched,
+			vec![
+				OptimizerRuntimeVerdictKey {
+					kind: OptimizerDecisionKind::FlatStar,
+					verdict: OptimizerRuntimeVerdictClass::Vindicated,
+					lane: OptimizerRuntimeEvidenceLane::Total,
+				},
+				OptimizerRuntimeVerdictKey {
+					kind: OptimizerDecisionKind::FlatStar,
+					verdict: OptimizerRuntimeVerdictClass::Vindicated,
+					lane: OptimizerRuntimeEvidenceLane::Demoted,
+				},
+			]
+		);
+		assert_eq!(
+			evidence.verdict_snapshot(),
+			vec![OptimizerRuntimeVerdictRow {
+				kind: OptimizerDecisionKind::FlatStar,
+				verdict: OptimizerRuntimeVerdictClass::Vindicated,
+				provenance: OptimizerRuntimeVerdictProvenance::Demoted,
+				count: 1,
 			}]
 		);
 	}
@@ -489,7 +609,11 @@ mod tests {
 			let mut state = evidence.state.lock().expect("optimizer runtime evidence");
 			state.durable_cache.insert(key, 3);
 		}
-		evidence.record_verdict(key.kind, key.verdict);
+		evidence.record_verdict(
+			key.kind,
+			key.verdict,
+			OptimizerRuntimeVerdictProvenance::Native,
+		);
 		assert_eq!(evidence.verdict_snapshot()[0].count, 4);
 	}
 

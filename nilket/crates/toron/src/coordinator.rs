@@ -1336,11 +1336,11 @@ where
 					for verdict in measured_explain_analyze_verdicts(binding, &observations)
 						.map_err(QueryError::Binding)?
 					{
-						touched.push(
-							config
-								.runtime_evidence
-								.record_verdict(verdict.kind, verdict.verdict),
-						);
+						touched.extend(config.runtime_evidence.record_verdict(
+							verdict.kind,
+							verdict.verdict,
+							verdict.provenance,
+						));
 					}
 					config.runtime_evidence.flush_keys(touched).await;
 				}
@@ -2450,11 +2450,11 @@ impl QueryCoordinator {
 						);
 						let mut touched = Vec::new();
 						for verdict in measured_explain_analyze_verdicts(binding, &observations)? {
-							touched.push(
-								self.config
-									.runtime_evidence
-									.record_verdict(verdict.kind, verdict.verdict),
-							);
+							touched.extend(self.config.runtime_evidence.record_verdict(
+								verdict.kind,
+								verdict.verdict,
+								verdict.provenance,
+							));
 						}
 						self.config.runtime_evidence.flush_keys(touched).await;
 					}

@@ -182,6 +182,7 @@ pub(crate) fn is_tree_margin_advisory_kind(kind: OptimizerDecisionKind) -> bool 
 		OptimizerDecisionKind::GalaxyRoot
 		| OptimizerDecisionKind::BridgeRoot
 		| OptimizerDecisionKind::BridgeChainRoot
+		| OptimizerDecisionKind::PreservedOuterOrder
 		| OptimizerDecisionKind::Overflow => false,
 	}
 }
@@ -195,6 +196,7 @@ pub(crate) fn is_graph_margin_advisory_kind(kind: OptimizerDecisionKind) -> bool
 		| OptimizerDecisionKind::FlatStar
 		| OptimizerDecisionKind::SnowflakeRoot
 		| OptimizerDecisionKind::SnowflakeBranch
+		| OptimizerDecisionKind::PreservedOuterOrder
 		| OptimizerDecisionKind::Overflow => false,
 	}
 }
@@ -392,6 +394,7 @@ pub(super) enum JoinOrderEstimateSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct JoinOrderEdgeEvidence {
 	pub(super) target: JoinTraceTarget,
+	pub(super) join_kind: JoinKind,
 	pub(super) probe: Option<String>,
 	pub(super) dimension: Option<String>,
 	pub(super) declared_position: usize,

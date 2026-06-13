@@ -773,6 +773,11 @@ async fn demoted_join_verdict_reaches_durable_lane() {
 		1,
 		"demoted star query should flush a durable flat-star verdict"
 	);
+	assert_eq!(
+		optimizer_runtime_flat_star_verdict_count_by_provenance(&coordinator, "demoted").await,
+		1,
+		"demoted star query should flush the durable demoted sibling"
+	);
 
 	drop(coordinator);
 	drop(runtime_evidence);
@@ -784,6 +789,12 @@ async fn demoted_join_verdict_reaches_durable_lane() {
 		optimizer_runtime_flat_star_verdict_count(&restarted_coordinator).await,
 		1,
 		"fresh coordinator/evidence handle should read the demoted query verdict"
+	);
+	assert_eq!(
+		optimizer_runtime_flat_star_verdict_count_by_provenance(&restarted_coordinator, "demoted")
+			.await,
+		1,
+		"fresh coordinator/evidence handle should read the demoted sibling"
 	);
 
 	fixture.node.handles.abort();
@@ -1024,6 +1035,27 @@ async fn optimizer_runtime_flat_star_verdict_count(coordinator: &QueryCoordinato
 		.iter()
 		.zip(counts.iter())
 		.filter_map(|(kind, count)| (kind == "flat_star").then_some(*count))
+		.sum()
+}
+
+async fn optimizer_runtime_flat_star_verdict_count_by_provenance(
+	coordinator: &QueryCoordinator,
+	provenance: &str,
+) -> i64 {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_runtime_verdicts")
+		.expect("plan optimizer runtime verdicts query");
+	let batch = execute_single_coordinator_batch(coordinator, &plan).await;
+	let kinds = string_column_values(&batch, 0);
+	let provenances = string_column_values(&batch, 3);
+	let counts = int64_column_values(&batch, 2);
+	kinds
+		.iter()
+		.zip(provenances.iter())
+		.zip(counts.iter())
+		.filter_map(|((kind, row_provenance), count)| {
+			(kind == "flat_star" && row_provenance == provenance).then_some(*count)
+		})
 		.sum()
 }
 

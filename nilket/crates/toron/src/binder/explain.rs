@@ -75,6 +75,9 @@ pub(super) struct OptimizerExplainRenderTrace {
 	pub(super) outer_join_demotions: Vec<OuterJoinDemotionReceipt>,
 	pub(super) join_order_edges: Vec<JoinOrderEdgeEvidence>,
 	pub(super) join_order: JoinOrderRenderState,
+	// ADR 214: a true outer join remains fenced from tree/graph actuation. This sibling receipt records
+	// the inner-equivalent ordering opportunity without changing the live join-order receipt.
+	pub(super) preserved_outer_order: Vec<PreservedOuterOrderReceipt>,
 	// ADR 194: galaxy graph evidence rides a sibling field, additive to the `join_order` tree receipt
 	// — it never changes the star/snowflake render state, so existing arms and behavior stay untouched.
 	pub(super) galaxy_order: Option<GalaxyOrderEvidence>,
@@ -98,6 +101,11 @@ pub(super) struct StarOrderRenderReceipt {
 	pub(super) probe_label: String,
 	pub(super) outcome: StarOrderOutcome,
 	pub(super) edge_targets: Vec<JoinTraceTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PreservedOuterOrderReceipt {
+	pub(super) receipt: StarOrderRenderReceipt,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -154,6 +162,10 @@ impl OptimizerExplainRenderTrace {
 
 	pub(super) fn set_observed_bridge_chain(&mut self, evidence: BridgeChainEvidence) {
 		self.bridge_chain_order = Some(evidence);
+	}
+
+	pub(super) fn set_preserved_outer_order(&mut self, receipts: Vec<PreservedOuterOrderReceipt>) {
+		self.preserved_outer_order = receipts;
 	}
 
 	pub(super) fn set_applied_galaxy_root(&mut self, root: String) {
@@ -294,6 +306,7 @@ pub(super) fn information_schema_optimizer_runtime_verdicts_schema() -> SchemaRe
 		Field::new("decision_kind", DataType::Utf8, false),
 		Field::new("verdict", DataType::Utf8, false),
 		Field::new("count", DataType::Int64, false),
+		Field::new("provenance", DataType::Utf8, false),
 	]))
 }
 
@@ -315,6 +328,9 @@ pub(super) fn information_schema_optimizer_runtime_verdict_rows(
 						message: "optimizer runtime verdict count exceeds i64::MAX".to_string(),
 					}
 				})?)),
+				ScalarValue::Utf8(Some(
+					optimizer_runtime_verdict_provenance_label(verdict.provenance).to_string(),
+				)),
 			])
 		})
 		.collect()
@@ -557,6 +573,7 @@ struct JoinRuntimeObservationSummary {
 pub(crate) struct MeasuredLevelVerdict {
 	pub(crate) kind: OptimizerDecisionKind,
 	pub(crate) verdict: OptimizerRuntimeVerdictClass,
+	pub(crate) provenance: OptimizerRuntimeVerdictProvenance,
 }
 
 pub(super) fn optimizer_analyze_plan(
@@ -615,6 +632,11 @@ fn measured_verdicts_from_summaries(
 	summaries: &BTreeMap<JoinReplayId, JoinRuntimeObservationSummary>,
 ) -> Result<Vec<MeasuredLevelVerdict>, BindingError> {
 	let mut verdicts = Vec::new();
+	let provenance = if render_trace.outer_join_demotions.is_empty() {
+		OptimizerRuntimeVerdictProvenance::Native
+	} else {
+		OptimizerRuntimeVerdictProvenance::Demoted
+	};
 
 	// ADR 201: when a graph actuated, its re-rooted tree was bound on the no-op recorder, so the tree
 	// decisions were never accrued (ADR 200) — a tree verdict here would be an orphan with no matching
@@ -636,6 +658,7 @@ fn measured_verdicts_from_summaries(
 						OptimizerDecisionKind::SnowflakeBranch
 					},
 					verdict: runtime_verdict_class_from_snowflake(level.verdict),
+					provenance,
 				}
 			}));
 		} else {
@@ -659,9 +682,24 @@ fn measured_verdicts_from_summaries(
 						OptimizerDecisionKind::SnowflakeBranch
 					},
 					verdict: runtime_verdict_class_from_star(verdict.verdict),
+					provenance,
 				});
 			}
 		}
+	}
+
+	for preserved in &render_trace.preserved_outer_order {
+		let StarOrderOutcome::Recognized(evidence) = &preserved.receipt.outcome else {
+			continue;
+		};
+		let measured_rows_by_dimension =
+			star_measured_rows_by_dimension(render_trace, &preserved.receipt, evidence, summaries)?;
+		let verdict = measured_star_order_verdict(evidence, &measured_rows_by_dimension);
+		verdicts.push(MeasuredLevelVerdict {
+			kind: OptimizerDecisionKind::PreservedOuterOrder,
+			verdict: runtime_verdict_class_from_preserved_outer(verdict.verdict),
+			provenance,
+		});
 	}
 
 	// ADR 201: the graph order verdict — emitted whenever a galaxy/bridge is recognized (kept or
@@ -674,6 +712,7 @@ fn measured_verdicts_from_summaries(
 				verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
 					&rec, &measured,
 				)),
+				provenance,
 			});
 		}
 	}
@@ -690,6 +729,7 @@ fn measured_verdicts_from_summaries(
 						verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
 							&rec, &measured,
 						)),
+						provenance,
 					});
 				}
 			}
@@ -713,6 +753,7 @@ fn measured_verdicts_from_summaries(
 						verdict: runtime_verdict_class_from_star(measured_graph_order_verdict(
 							&rec, &measured,
 						)),
+						provenance,
 					});
 				}
 			}
@@ -855,6 +896,20 @@ fn runtime_verdict_class_from_star(verdict: StarOrderVerdict) -> OptimizerRuntim
 		StarOrderVerdict::MisRanked => OptimizerRuntimeVerdictClass::MisRanked,
 		StarOrderVerdict::MissedWin => OptimizerRuntimeVerdictClass::MissedWin,
 		StarOrderVerdict::OverEager => OptimizerRuntimeVerdictClass::OverEager,
+		StarOrderVerdict::Indeterminate => OptimizerRuntimeVerdictClass::Indeterminate,
+	}
+}
+
+fn runtime_verdict_class_from_preserved_outer(
+	verdict: StarOrderVerdict,
+) -> OptimizerRuntimeVerdictClass {
+	match verdict {
+		StarOrderVerdict::Vindicated | StarOrderVerdict::OverEager => {
+			OptimizerRuntimeVerdictClass::Vindicated
+		}
+		StarOrderVerdict::MissedWin | StarOrderVerdict::MisRanked => {
+			OptimizerRuntimeVerdictClass::MissedWin
+		}
 		StarOrderVerdict::Indeterminate => OptimizerRuntimeVerdictClass::Indeterminate,
 	}
 }

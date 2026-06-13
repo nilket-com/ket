@@ -286,6 +286,12 @@ async fn bind_with_explain_trace(
 	{
 		render_trace.set_observed_bridge_chain(chain);
 	}
+	if let Some(receipt) = preserved_outer_order_receipt(
+		&render_trace.join_order_edges,
+		tree_join_order_soft_margin_step,
+	) {
+		render_trace.set_preserved_outer_order(vec![receipt]);
+	}
 	Ok((plan, trace, render_trace))
 }
 
@@ -369,6 +375,9 @@ fn star_order_runtime_replay_ids(
 				.flat_map(|hop| [hop.incoming_target, hop.outgoing_target]),
 		);
 	}
+	for receipt in &render_trace.preserved_outer_order {
+		targets.extend(receipt.receipt.edge_targets.iter().copied());
+	}
 	targets
 		.into_iter()
 		.map(|target| {
@@ -386,6 +395,48 @@ fn star_order_probe_label(outcome: &StarOrderOutcome) -> String {
 		StarOrderOutcome::Recognized(evidence) => evidence.probe.clone(),
 		StarOrderOutcome::Declined(_) => "star_candidate".to_string(),
 	}
+}
+
+fn preserved_outer_order_receipt(
+	edges: &[JoinOrderEdgeEvidence],
+	margin_step: SoftMarginLadderStep,
+) -> Option<PreservedOuterOrderReceipt> {
+	if !edges.iter().any(is_preserved_outer_equi_edge) {
+		return None;
+	}
+	let mut counterfactual_edges = edges.to_vec();
+	for edge in &mut counterfactual_edges {
+		if is_preserved_outer_equi_edge(edge) {
+			edge.inner_equi = true;
+		}
+		if edge.inner_equi {
+			edge.probe_scan_linear = true;
+		}
+	}
+	let outcome = analyze(&counterfactual_edges, margin_step)?;
+	if !matches!(outcome, StarOrderOutcome::Recognized(_)) {
+		return None;
+	}
+	let edge_targets = counterfactual_edges
+		.iter()
+		.map(|edge| edge.target)
+		.collect::<Vec<_>>();
+	Some(PreservedOuterOrderReceipt {
+		receipt: StarOrderRenderReceipt {
+			probe_label: star_order_probe_label(&outcome),
+			outcome,
+			edge_targets,
+		},
+	})
+}
+
+fn is_preserved_outer_equi_edge(edge: &JoinOrderEdgeEvidence) -> bool {
+	matches!(
+		edge.join_kind,
+		JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter
+	) && !edge.inner_equi
+		&& !edge.left_key_signature.is_empty()
+		&& !edge.right_key_signature.is_empty()
 }
 
 struct Binder<'a> {
@@ -2066,6 +2117,7 @@ impl<'a> Binder<'a> {
 			);
 			render_trace.join_order_edges.push(JoinOrderEdgeEvidence {
 				target: JoinTraceTarget { join_index },
+				join_kind: kind,
 				probe,
 				dimension,
 				declared_position,
