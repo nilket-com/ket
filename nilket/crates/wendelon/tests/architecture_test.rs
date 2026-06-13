@@ -40,6 +40,49 @@ fn has_rust_identifier(identifiers: &[String], ident: &str) -> bool {
 	identifiers.iter().any(|candidate| candidate == ident)
 }
 
+/// ADR 077: the data server became `network/data_server/{mod.rs + domain modules}`.
+/// Architecture guards that used to read the flat `data_server.rs` now read the
+/// concatenation of every module under that directory, so a symbol moved into a
+/// child module is still found by source-scanning guards.
+fn data_server_source_files(manifest_dir: &Path) -> Vec<PathBuf> {
+	// ADR 077: the module root stays `network/data_server.rs` (mod.rs files are
+	// manifests-only in this crate); carved handler families live under
+	// `network/data_server/`. Production source-scanning guards read the root
+	// plus every NON-TEST submodule, so a symbol moved into a child module is
+	// still found, while `tests.rs` is excluded (it is not production source —
+	// the old single-file scans stripped the inline `mod tests` for the same
+	// reason). The root is listed first; submodules are sorted among themselves
+	// (a global sort would order the `data_server/` directory component ahead of
+	// the `data_server.rs` file and put test/handler modules before the root).
+	let mut files = Vec::new();
+	let root = manifest_dir.join("src/network/data_server.rs");
+	if root.is_file() {
+		files.push(root);
+	}
+	let dir = manifest_dir.join("src/network/data_server");
+	if dir.is_dir() {
+		let mut submodules = Vec::new();
+		walk_dir(&dir, &mut |path| {
+			let is_rs = path.extension().and_then(|s| s.to_str()) == Some("rs");
+			let is_tests = path.file_name().and_then(|s| s.to_str()) == Some("tests.rs");
+			if is_rs && !is_tests {
+				submodules.push(path.to_path_buf());
+			}
+		});
+		submodules.sort();
+		files.extend(submodules);
+	}
+	files
+}
+
+fn data_server_source(manifest_dir: &Path) -> String {
+	data_server_source_files(manifest_dir)
+		.iter()
+		.map(|path| fs::read_to_string(path).unwrap())
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
 #[test]
 fn test_adr039_wendelon_drop_migration_substrate_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -49,7 +92,7 @@ fn test_adr039_wendelon_drop_migration_substrate_guards() {
 		fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
 	let control_server =
 		fs::read_to_string(manifest_dir.join("src/network/control_server.rs")).unwrap();
-	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
 	let storage_manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
 	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
 	let table_schema = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
@@ -848,8 +891,7 @@ fn test_adr048_retention_policy_surface_stays_typed_and_brand_clean() {
 		"ADR 048 must not introduce a retention-specific digest element helper"
 	);
 
-	let data_server_source =
-		fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data_server_source = data_server_source(manifest_dir.as_ref());
 	assert!(
 		data_server_source.contains("aggregate_csb_retention_decision"),
 		"ADR 048 aggregate CSB path must gate retention-active direct answers by slab row-HLC bounds"
@@ -1273,7 +1315,12 @@ fn test_adr045_append_only_invariants() {
 			let is_matcher_file = path
 				.file_name()
 				.and_then(|name| name.to_str())
-				.is_some_and(|name| name == "data_server.rs" || name == "manager.rs");
+				.is_some_and(|name| name == "manager.rs")
+				|| path
+					.parent()
+					.and_then(|parent| parent.file_name())
+					.and_then(|name| name.to_str())
+					== Some("data_server");
 			if is_matcher_file
 				&& content.contains("RowIdentityPolicy::AppendOnly => {")
 				&& !content.contains("descriptor.table_object_id")
@@ -1578,8 +1625,7 @@ fn test_adr049_content_hash_identity_boundaries() {
 		);
 	}
 
-	let data_server_source =
-		fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data_server_source = data_server_source(manifest_dir.as_ref());
 	if !data_server_source.contains("bifurcate_content_hash_table_write")
 		|| !data_server_source.contains("content_hash_admission_guard")
 		|| !data_server_source.contains("observe_storage_content_hash_duplicate_absorption")
@@ -1700,8 +1746,7 @@ fn test_adr050_pk_delete_supersession_boundaries() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let mut violations = Vec::new();
 
-	let data_server_source =
-		fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data_server_source = data_server_source(manifest_dir.as_ref());
 	for needle in [
 		"admit_pk_write_row",
 		"admit_pk_delete_row",
@@ -2421,11 +2466,10 @@ fn test_adr053_wire_ipc_compression_architecture_guards() {
 		);
 	}
 
-	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
-	let production_data_server = data_server
-		.split("\n#[cfg(test)]\nmod tests")
-		.next()
-		.unwrap_or(data_server.as_str());
+	let data_server = data_server_source(manifest_dir.as_ref());
+	// ADR 077: data_server_source() already excludes tests.rs, so the source is
+	// production-only; no inline `mod tests` boundary remains to split on.
+	let production_data_server = data_server.as_str();
 	if production_data_server.contains("StreamWriter::try_new(") {
 		violations.push(
 			"src/network/data_server.rs: migration writer must not use bare StreamWriter::try_new"
@@ -2753,7 +2797,7 @@ fn adr054_cdc_subscription_substrate_contract() {
 		}
 	}
 
-	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
 	for required in [
 		"MsgType::CDC_SUBSCRIBE_REQ",
 		"handle_cdc_subscribe_stream",
@@ -3175,7 +3219,7 @@ fn test_adr056_row_group_fetch_guards() {
 	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
 	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
-	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
 	let cargo = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
 	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
@@ -3553,7 +3597,7 @@ fn test_adr057_encoding_guards() {
 	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
 	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
-	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
 	let cargo = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
 	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
@@ -3981,7 +4025,7 @@ fn test_adr058_encoding_compute_guards() {
 	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
 	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
-	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data_server = data_server_source(manifest_dir.as_ref());
 	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
 	let cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
@@ -6006,6 +6050,14 @@ fn read_workspace(path: &str) -> String {
 	})
 }
 
+/// ADR 077: production data-server source via the workspace root (the
+/// `read_workspace` style). Concatenates `network/data_server.rs` plus every
+/// non-test submodule, so guards that scan handler code keep working after the
+/// monolith was split into domain modules. Mirrors `data_server_source`.
+fn data_server_workspace_source() -> String {
+	data_server_source(&workspace_root().join("crates/wendelon"))
+}
+
 fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 	source
 		.split_once(start)
@@ -6468,7 +6520,7 @@ fn adr072_metrics_track_descriptor_get_outcomes() {
 
 #[test]
 fn adr072_no_data_ring_or_bulk_or_object_id_descriptor_lookup() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
 	let handler = adr072_control_descriptor_get_handler_region(&control);
 	assert!(!data_server.contains("TABLE_DESCRIPTOR_GET"));
@@ -6484,7 +6536,7 @@ fn adr102_descriptor_list_surface_is_latest_only_metadata() {
 	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
 	let client = read_workspace("crates/wendelon/src/client/core.rs");
 	let router = read_workspace("crates/wendelon/src/network/router.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let handler = adr102_control_descriptor_list_handler_region(&control);
 
 	assert!(schema_core.contains("pub struct TableDescriptorListRequestMeta"));
@@ -6630,7 +6682,7 @@ fn adr073_plan_region(data_server: &str) -> &str {
 #[test]
 fn adr073_table_query_cancel_is_wendelon_home_producer_only() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let adr060 =
 		read_workspace("crates/toron/plans/adr/060_wendelon_table_query_cancellation_consumer.md");
 	assert!(schema.contains("pub struct TableQueryRequestId"));
@@ -6689,7 +6741,7 @@ fn adr073_table_query_request_id_is_wendelon_owned_not_toron() {
 fn adr073_table_query_request_id_is_required_fixed_meta() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
 	let client = read_workspace("crates/wendelon/src/client/core.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let meta = source_region(
 		&schema,
 		"pub struct TableQueryRequestMeta",
@@ -6705,7 +6757,7 @@ fn adr073_table_query_request_id_is_required_fixed_meta() {
 #[test]
 fn adr073_no_table_query_meta_extension_or_compat_path() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	assert!(!schema.contains("TableQueryRequestMetaExtension"));
 	assert!(!schema.contains("TableQueryRequestMetaV1"));
 	assert!(!data_server.contains("TABLE_QUERY_META_EXTENSION"));
@@ -6729,7 +6781,7 @@ fn adr073_table_query_cancel_msg_types_are_3e_3f_not_1f() {
 #[test]
 fn adr073_cancel_wire_uses_data_ring_bidi_not_control_plane() {
 	let router = read_workspace("crates/wendelon/src/network/router.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
 	assert!(router.contains("MsgType::TABLE_QUERY_CANCEL_REQ.0"));
 	assert!(router.contains("Some(h) => h.handle_data_frame(context, frame).await"));
@@ -6742,7 +6794,7 @@ fn adr073_cancel_wire_uses_data_ring_bidi_not_control_plane() {
 fn adr073_no_uni_stream_sidecar_listener_or_transport_redesign() {
 	let combined = format!(
 		"{}\n{}",
-		read_workspace("crates/wendelon/src/network/data_server.rs"),
+		data_server_workspace_source(),
 		read_workspace("crates/wendelon/src/network/router.rs")
 	);
 	for forbidden in [
@@ -6761,7 +6813,7 @@ fn adr073_no_uni_stream_sidecar_listener_or_transport_redesign() {
 
 #[test]
 fn adr073_active_table_query_registry_is_tenant_scoped_raii_removed() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let registry = adr073_active_registry_region(&data_server);
 	assert!(
 		data_server.contains("type TableQueryCancellationKey = (TenantId, TableQueryRequestId);")
@@ -6775,7 +6827,7 @@ fn adr073_active_table_query_registry_is_tenant_scoped_raii_removed() {
 
 #[test]
 fn adr073_cancel_before_register_tombstone_is_bounded_and_consumed() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let registry = adr073_active_registry_region(&data_server);
 	assert!(registry.contains("TABLE_QUERY_CANCEL_TOMBSTONE_TTL"));
 	assert!(registry.contains("TABLE_QUERY_CANCEL_TOMBSTONE_CAP"));
@@ -6788,7 +6840,7 @@ fn adr073_cancel_before_register_tombstone_is_bounded_and_consumed() {
 #[test]
 fn adr073_cancellation_signal_uses_cancellation_token() {
 	let cargo = read_workspace("crates/wendelon/Cargo.toml");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let registry = adr073_active_registry_region(&data_server);
 	assert!(cargo.contains("tokio-util = \"0.7\""));
 	assert!(data_server.contains("use tokio_util::sync::CancellationToken;"));
@@ -6800,7 +6852,7 @@ fn adr073_cancellation_signal_uses_cancellation_token() {
 
 #[test]
 fn adr073_cancel_is_idempotent_for_terminal_and_missing_requests() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let registry = adr073_active_registry_region(&data_server);
 	let cancel = source_region(registry, "fn cancel(", "fn finish(");
 	assert!(cancel.contains("state.active.get(&key)"));
@@ -6813,7 +6865,7 @@ fn adr073_cancel_is_idempotent_for_terminal_and_missing_requests() {
 
 #[test]
 fn adr073_cancel_response_is_oracle_safe() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let handler = adr073_cancel_handler_region(&data_server);
 	assert!(handler.contains("TableQueryCancelStatus::TERMINAL"));
 	assert!(handler.contains("authorize_actor_for_data"));
@@ -6825,7 +6877,7 @@ fn adr073_cancel_response_is_oracle_safe() {
 
 #[test]
 fn adr073_table_query_checks_cancel_at_execution_boundaries() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let plan = adr073_plan_region(&data_server);
 	let ranged = source_region(
 		&data_server,
@@ -6845,7 +6897,7 @@ fn adr073_table_query_checks_cancel_at_execution_boundaries() {
 fn adr073_cancelled_table_query_has_stable_read_status() {
 	let core = read_workspace("crates/wendelon/src/schema/core.rs");
 	let client = read_workspace("crates/wendelon/src/client/core.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	assert!(core.contains("pub const QUERY_CANCELLED: Self = Self(15);"));
 	assert!(core.contains("Self::QUERY_CANCELLED => \"query_cancelled\""));
 	assert!(client.contains("Wendelon query failed: QUERY_CANCELLED"));
@@ -6858,7 +6910,7 @@ fn adr073_cancelled_table_query_has_stable_read_status() {
 #[test]
 fn adr073_stream_drop_is_fallback_not_primary_mechanism() {
 	let router = read_workspace("crates/wendelon/src/network/router.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	assert!(router.contains("observe_table_query_cancellation(\"stream_dropped\")"));
 	assert!(router.contains("resp.header.msg_type == MsgType::TABLE_QUERY_RESP.0"));
 	assert!(data_server.contains("TABLE_QUERY_CANCEL_REQ"));
@@ -6867,7 +6919,7 @@ fn adr073_stream_drop_is_fallback_not_primary_mechanism() {
 
 #[test]
 fn adr073_cancel_releases_admission_buffers_and_scratch() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let handler = adr073_table_query_handler_region(&data_server);
 	let registry = adr073_active_registry_region(&data_server);
 	assert!(handler.contains("let active_query = match"));
@@ -6912,7 +6964,7 @@ fn adr073_metrics_are_aggregate_only() {
 #[test]
 fn adr073_no_writes_cdc_admin_agg_or_legacy_query_scope() {
 	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	assert!(!schema.contains("WRITE_CANCEL"));
 	assert!(!schema.contains("AGG_CANCEL"));
 	assert!(!schema.contains("CDC_CANCEL"));
@@ -6978,7 +7030,7 @@ fn adr073_new_surface_is_brand_clean_and_has_no_v1_suffix() {
 		read_workspace("crates/wendelon/src/schema/table.rs"),
 		read_workspace("crates/wendelon/src/schema/core.rs"),
 		read_workspace("crates/wendelon/src/client/core.rs"),
-		read_workspace("crates/wendelon/src/network/data_server.rs")
+		data_server_workspace_source()
 	);
 	let identifiers = rust_identifiers_from_source("adr073 combined surface", &combined);
 	for required in [
@@ -7132,7 +7184,7 @@ fn adr074_trace_meta_offsets_are_pinned() {
 
 #[test]
 fn adr074_wendelon_span_id_is_derived_nonzero_from_request_attempt() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let region = adr074_trace_carrier_region(&data_server);
 	assert!(region.contains("TABLE_QUERY_LINKED_SPAN_DOMAIN"));
 	assert!(region.contains("b\"wendelon.table_query.span.v1\""));
@@ -7145,7 +7197,7 @@ fn adr074_wendelon_span_id_is_derived_nonzero_from_request_attempt() {
 
 #[test]
 fn adr074_linked_span_uses_explicit_otel_context_fields() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let linked = adr074_linked_span_region(&data_server);
 	for required in [
 		"\"wendelon.table.query\"",
@@ -7163,7 +7215,7 @@ fn adr074_linked_span_uses_explicit_otel_context_fields() {
 
 #[test]
 fn adr074_unsampled_carrier_bypasses_root_sampling() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let region = adr074_trace_carrier_region(&data_server);
 	assert!(region.contains("TableQueryTraceCarrier::Unsampled"));
 	assert!(region.contains("otel.sampled = false"));
@@ -7172,7 +7224,7 @@ fn adr074_unsampled_carrier_bypasses_root_sampling() {
 
 #[test]
 fn adr074_sampled_emits_sanitized_linked_span_local_raw_span_preserved() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let handler = adr074_trace_handler_region(&data_server);
 	assert!(handler.contains("let linked_span = linked_table_query_span(&meta, trace_carrier);"));
 	assert!(data_server.contains("\"wendelon.table.query\""));
@@ -7181,7 +7233,7 @@ fn adr074_sampled_emits_sanitized_linked_span_local_raw_span_preserved() {
 
 #[test]
 fn adr074_local_raw_span_is_never_nested_under_linked_span() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let handler = adr074_trace_handler_region(&data_server);
 	assert!(handler.contains("let linked_span = linked_table_query_span(&meta, trace_carrier);"));
 	assert!(handler.contains(
@@ -7194,7 +7246,7 @@ fn adr074_local_raw_span_is_never_nested_under_linked_span() {
 
 #[test]
 fn adr074_linked_span_has_no_tenant_table_request_descriptor_query_attrs() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let linked = adr074_linked_span_region(&data_server);
 	for forbidden in [
 		"tenant_id",
@@ -7215,7 +7267,7 @@ fn adr074_linked_span_has_no_tenant_table_request_descriptor_query_attrs() {
 
 #[test]
 fn adr074_malformed_trace_carrier_is_fail_open_unsampled() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let region = adr074_trace_carrier_region(&data_server);
 	assert!(region.contains("flags & !TABLE_QUERY_TRACE_FLAG_KNOWN_MASK"));
 	assert!(region.contains("flags & TABLE_QUERY_TRACE_FLAG_PRESENT == 0"));
@@ -7229,7 +7281,7 @@ fn adr074_malformed_trace_carrier_is_fail_open_unsampled() {
 
 #[test]
 fn adr074_no_new_shared_observability_telemetry_seam() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
 	assert!(!data_server.contains("observability::telemetry::"));
 	assert!(!client.contains("observability::telemetry::"));
@@ -7263,7 +7315,7 @@ fn adr074_no_toron_production_change() {
 	);
 
 	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	assert!(client.contains("pub enum TableQueryTraceContext"));
 	assert!(data_server.contains("fn decode_table_query_trace_carrier"));
 
@@ -7319,7 +7371,7 @@ fn adr074_toron_consumer_population_is_owned_by_adr069() {
 #[test]
 fn adr074_no_control_ring_sql_wire_audit_cancellation_or_non_table_query_drift() {
 	let core = read_workspace("crates/wendelon/src/schema/core.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let control = read_workspace("crates/wendelon/src/network/control_server.rs");
 	assert!(!core.contains("TRACE_REQ"));
 	assert!(!control.contains("TableQueryTrace"));
@@ -7334,7 +7386,7 @@ fn adr074_new_trace_surface_is_brand_clean_no_v1_suffix() {
 		"{}\n{}\n{}",
 		read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs"),
 		read_workspace("crates/wendelon/src/schema/table.rs"),
-		read_workspace("crates/wendelon/src/network/data_server.rs")
+		data_server_workspace_source()
 	);
 	let identifiers = rust_identifiers_from_source("adr074 combined surface", &combined);
 	assert!(has_rust_identifier(&identifiers, "TableQueryTraceContext"));
@@ -7367,7 +7419,7 @@ fn adr074_carrier_does_not_transmit_compute_trace_context_v1() {
 fn adr116_table_query_row_limit_is_fixed_meta_not_sidecar_budget() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
 	let client = read_workspace("crates/wendelon/crates/wendelon-client/src/lib.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let options_region = source_region(
 		&client,
 		"pub struct TableQueryOptions",
@@ -7396,7 +7448,7 @@ fn adr116_table_query_row_limit_is_fixed_meta_not_sidecar_budget() {
 #[test]
 fn adr118_table_query_resp_has_terminal_metadata_contract() {
 	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let router = read_workspace("crates/wendelon/src/network/router.rs");
 
 	assert!(schema.contains("size_of::<QueryResponseMeta>() == 56"));
@@ -7437,7 +7489,7 @@ fn adr118_streaming_query_result_terminal_mode_is_opt_in() {
 
 #[test]
 fn adr118_table_query_production_streams_batches_without_boundary_concat() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let stream_handler = source_region(
 		&data_server,
 		"async fn handle_table_query_stream",
@@ -7457,7 +7509,7 @@ fn adr118_table_query_production_streams_batches_without_boundary_concat() {
 
 #[test]
 fn adr118_wendelon_table_query_checks_cancellation_during_production() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let producer = source_region(
 		&data_server,
 		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
@@ -7490,7 +7542,7 @@ fn adr118_wendelon_table_query_checks_cancellation_during_production() {
 
 #[test]
 fn adr118_table_query_req_uses_stream_handler() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	assert!(
 		data_server.contains("self.handle_table_query_stream("),
 		"a TABLE_QUERY_REQ dispatch arm must call the streaming handler"
@@ -7532,7 +7584,7 @@ fn adr118_query_response_meta_not_widened() {
 
 #[test]
 fn adr118_secondary_index_table_query_streams() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	// D7: the secondary-index table-query path uses the same streaming
 	// producer contract as the full scan — it threads the stream writer
 	// so the cost bound is access-path-independent.
@@ -7553,7 +7605,7 @@ fn adr118_secondary_index_table_query_streams() {
 
 #[test]
 fn adr120_whole_record_table_query_emits_per_location() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let producer = source_region(
 		&data_server,
 		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
@@ -7586,7 +7638,7 @@ fn adr120_whole_record_table_query_emits_per_location() {
 
 #[test]
 fn adr120_rebatch_groups_post_scan_emit_is_gone_for_descriptor_backed_queries() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let producer = source_region(
 		&data_server,
 		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
@@ -7614,7 +7666,7 @@ fn adr120_rebatch_groups_post_scan_emit_is_gone_for_descriptor_backed_queries() 
 
 #[test]
 fn adr120_cost_bound_is_access_path_independent_for_descriptor_backed_queries() {
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let full_scan = source_region(
 		&data_server,
 		"async fn plan_query_execution_for_ranges_with_program_maybe_cancelled",
@@ -7664,7 +7716,7 @@ fn adr120_cost_bound_is_access_path_independent_for_descriptor_backed_queries() 
 #[test]
 fn adr120_no_wendelon_protocol_widening() {
 	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
-	let data_server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let data_server = data_server_workspace_source();
 	let meta = source_region(&schema, "pub struct QueryResponseMeta", "}");
 
 	assert!(schema.contains("size_of::<QueryResponseMeta>() == 56"));
@@ -7705,17 +7757,21 @@ fn adr074_prior_wendelon_telemetry_and_table_query_guards_continue_to_pass() {
 // ============================================================
 
 fn adr075_counter_handler_region(server: &str) -> &str {
+	// ADR 077: counter handlers live in `network/data_server/counter.rs` in the
+	// order replicate, rollback, add, read; `handle_counter_add`'s body is bounded
+	// by the next counter handler, `handle_counter_read` (was `handle_table_replicate`,
+	// the next handler when all handlers shared one file).
 	source_region(
 		server,
 		"async fn handle_counter_add",
-		"async fn handle_table_replicate",
+		"async fn handle_counter_read",
 	)
 }
 
 #[test]
 fn adr075_counter_add_is_first_class_operation_not_blob_write() {
 	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	// Its own wire op + fixed metas, distinct from the blob write surface.
 	assert!(schema.contains("pub const COUNTER_ADD_REQ: Self = Self(0x4C);"));
 	assert!(schema.contains("pub const COUNTER_ADD_RESP: Self = Self(0x4D);"));
@@ -7748,7 +7804,7 @@ fn adr075_counter_add_has_per_key_read_modify_write_serialization() {
 
 #[test]
 fn adr075_counter_add_reuses_client_write_id_idempotency() {
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
 	// D4 public idempotency is keyed by the canonical ClientWriteId bytes (the
 	// same derivation as the blob-write cache) and lives in the MUTATION layer:
@@ -7769,7 +7825,7 @@ fn adr075_counter_add_reuses_client_write_id_idempotency() {
 
 #[test]
 fn adr075_duplicate_counter_add_replays_without_mutating() {
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
 	// The duplicate replay short-circuits inside the leader BEFORE any mutation
 	// (both the unlocked fast path and the under-lock recheck return `Replayed`),
@@ -7813,7 +7869,7 @@ fn adr075_counter_add_goes_through_finalization_not_metric_side_channel() {
 #[test]
 fn adr075_counter_blob_type_safety_is_structural() {
 	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	// Counter identity is domain-separated (blake3_keyed in a reserved domain),
 	// not the blob tenant-scoped identity — the collision is unrepresentable.
 	assert!(counter.contains("b\"wendelon::adr075::counter-domain\""));
@@ -7842,7 +7898,7 @@ fn adr075_no_prefix_scan_registry_or_node_keys() {
 #[test]
 fn adr075_existing_blob_point_write_stays_last_writer_wins() {
 	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	// The blob write meta is untouched by counters (no delta/counter contamination).
 	let write_meta = source_region(
 		&schema,
@@ -7863,7 +7919,7 @@ fn adr075_existing_blob_point_write_stays_last_writer_wins() {
 #[test]
 fn adr075_counter_surface_is_brand_clean_no_v1_suffix() {
 	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	let combined = format!("{schema}\n{server}");
 	let identifiers = rust_identifiers_from_source("adr075 counter surface", &combined);
 	for required in ["CounterAddRequestMeta", "CounterAddResponseMeta"] {
@@ -7916,7 +7972,7 @@ fn adr075_no_toron_production_change() {
 
 #[test]
 fn adr075_counter_add_fails_closed_under_replication() {
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	let schema = read_workspace("crates/wendelon/src/schema/core.rs");
 	// Retargeted by ADR 076: the wire status remains for decoding compatibility,
 	// but a healthy rf>1 add now builds the replicated participant set instead of
@@ -7971,7 +8027,7 @@ fn adr076_witness_format_is_flattened() {
 #[test]
 fn adr076_fresh_and_recorded_resolution_are_distinct_routes() {
 	let counter = read_workspace("crates/wendelon/src/storage/counter.rs");
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	assert!(counter.contains("pub struct CounterParticipantPlan<P>"));
 	assert!(counter.contains("pub trait CounterParticipantResolver<P: CounterParticipant>"));
 	assert!(counter.contains("fn resolve_recorded(&self, id: NodeId) -> Option<P>;"));
@@ -7993,7 +8049,7 @@ fn adr076_counter_leader_has_explicit_local_arm() {
 
 #[test]
 fn adr076_fresh_counter_participants_are_ring_derived() {
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	let handler = adr075_counter_handler_region(&server);
 	assert!(handler.contains("let replicas = self\n\t\t\t.router\n\t\t\t.replicas_for_locality(Locality::from(meta.key_identity));"));
 	assert!(handler.contains("let Some(owner) = replicas.first().copied()"));
@@ -8004,7 +8060,7 @@ fn adr076_fresh_counter_participants_are_ring_derived() {
 
 #[test]
 fn adr076_counter_quorum_uses_majority_floor() {
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	let handler = adr075_counter_handler_region(&server);
 	assert!(handler.contains("let quorum = (replicas.len() / 2) + 1;"));
 	assert!(handler.contains("CounterParticipantPlan::new"));
@@ -8045,7 +8101,7 @@ fn adr076_pending_witness_never_expires_on_peer_loss() {
 
 #[test]
 fn adr076_replication_unsupported_not_on_healthy_path() {
-	let server = read_workspace("crates/wendelon/src/network/data_server.rs");
+	let server = data_server_workspace_source();
 	let handler = adr075_counter_handler_region(&server);
 	assert!(!handler.contains("COUNTER_REPLICATION_UNSUPPORTED"));
 	assert!(!handler.contains("replication_factor() > 1"));
@@ -8138,4 +8194,186 @@ fn adr075_prior_wendelon_guards_continue_to_pass() {
 			"missing prior Wendelon guard {required}"
 		);
 	}
+}
+
+// ============================================================
+//  ADR 077 — data server module decomposition
+// ============================================================
+
+/// The production source-scan surface is the root plus exactly the carved
+/// domain submodules (sorted), `tests.rs` excluded. Pins the file manifest so a
+/// new module is a deliberate edit here, and proves the concatenation actually
+/// spans modules (symbols from three different domain files are all present).
+#[test]
+fn adr077_data_server_source_concatenates_submodules() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let basenames: Vec<String> = data_server_source_files(manifest_dir)
+		.iter()
+		.map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+		.collect();
+	assert_eq!(
+		basenames,
+		vec![
+			"data_server.rs",
+			"counter.rs",
+			"descriptor_migration.rs",
+			"replica_routing.rs",
+			"streaming.rs",
+			"table_query.rs",
+			"write_replication.rs",
+		],
+		"ADR 077 production source manifest changed; update this guard deliberately \
+		 (tests.rs is excluded — it is not production source)"
+	);
+	let source = data_server_source(manifest_dir);
+	for symbol in [
+		"struct CounterParticipantFactory", // counter.rs
+		"struct DurableQuorumTracker",      // write_replication.rs
+		"enum QueryProjectedExecution",     // table_query.rs
+	] {
+		assert!(
+			source.contains(symbol),
+			"data_server_source concatenation is missing a carved symbol: {symbol}"
+		);
+	}
+	// Every prior data-server source-scan guard must route through this helper,
+	// not a raw read of the (now-decomposed) flat file.
+	let arch = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	assert!(
+		arch.contains("data_server_source(") || arch.contains("data_server_workspace_source("),
+		"source-scan guards must read the data server via the concatenation helper"
+	);
+}
+
+/// Each named domain module exists as a file and is declared in the root.
+#[test]
+fn adr077_semantic_modules_exist() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	for module in [
+		"counter",
+		"table_query",
+		"write_replication",
+		"descriptor_migration",
+		"streaming",
+		"replica_routing",
+	] {
+		let path = manifest_dir.join(format!("src/network/data_server/{module}.rs"));
+		assert!(path.is_file(), "ADR 077 domain module missing: {module}.rs");
+		assert!(
+			root.contains(&format!("mod {module};")),
+			"ADR 077 domain module not declared in root: mod {module};"
+		);
+	}
+}
+
+/// The struct definition and `MsgType` dispatch stay in the root; carved handler
+/// *definitions* do not (their call sites in dispatch legitimately remain).
+#[test]
+fn adr077_dispatch_and_struct_stay_in_root() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	assert!(
+		root.contains("struct WendelonDataServer"),
+		"WendelonDataServer struct must stay in the root module"
+	);
+	assert!(
+		root.contains("MsgType::"),
+		"MsgType dispatch routing must stay in the root module"
+	);
+	assert!(
+		!root.contains("async fn handle_counter_add"),
+		"carved handler definition leaked back into the root (handle_counter_add)"
+	);
+	let source = data_server_source(manifest_dir);
+	assert!(
+		source.contains("async fn handle_counter_add"),
+		"carved handler definition not found anywhere in the decomposition"
+	);
+}
+
+/// The root is bounded. Set from the post-carve size plus modest headroom;
+/// ratchet DOWN as domain helper methods are relocated in follow-on cuts
+/// (see plans/conventions/module-decomposition.md). It must never regrow toward
+/// the pre-carve monolith.
+#[test]
+fn adr077_root_is_bounded() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let lines = root.lines().count();
+	assert!(
+		lines <= 15_200,
+		"data_server.rs root is {lines} lines (cap 15_200); carve more or justify a deliberate cap bump"
+	);
+}
+
+/// The inline `#[cfg(test)] mod tests` block was extracted to its own file.
+#[test]
+fn adr077_tests_extracted() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	assert!(
+		root.contains("#[cfg(test)]\nmod tests;"),
+		"root must declare the extracted tests module, not inline it"
+	);
+	let tests = manifest_dir.join("src/network/data_server/tests.rs");
+	assert!(tests.is_file(), "data_server/tests.rs must exist");
+	let body = fs::read_to_string(&tests).unwrap();
+	assert!(
+		body.contains("use super::*;") && body.contains("async fn"),
+		"tests.rs must be the extracted test body (use super::*; + test fns)"
+	);
+}
+
+/// Cardinal-risk guard: this is a move-only decomposition. While the cut is in
+/// flight, no production source file *outside* `network/data_server/**` may be
+/// dirty — no wire type, `MsgType`, protocol schema, or other production edit
+/// rides this cut. (Clean tree after commit: passes, as with the ADR 076
+/// precedent — a development-time tripwire.)
+#[test]
+fn adr077_no_wire_or_runtime_surface_change() {
+	let output = std::process::Command::new("git")
+		.args(["status", "--short"])
+		.current_dir(workspace_root())
+		.output()
+		.expect("git status should run");
+	assert!(output.status.success(), "git status failed");
+	let stdout = String::from_utf8(output.stdout).expect("git status should be utf8");
+	for line in stdout.lines() {
+		if line.len() < 4 {
+			continue;
+		}
+		let path = line[3..].rsplit(" -> ").next().unwrap_or(&line[3..]).trim();
+		let is_production_source =
+			path.starts_with("crates/") && path.contains("/src/") && path.ends_with(".rs");
+		if is_production_source {
+			assert!(
+				path.starts_with("crates/wendelon/src/network/data_server"),
+				"ADR 077 is move-only; a production source file outside \
+				 network/data_server/** is dirty: {path}"
+			);
+		}
+	}
+}
+
+/// The de-versioned doc heading stays renamed (doc-prose variant of the
+/// repo-wide no-V1 discipline): no `## V1 scope` heading, no `V1 fallback` prose.
+#[test]
+fn adr077_no_v1_scope_heading() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = data_server_source(manifest_dir);
+	assert!(
+		!source.contains("## V1 scope"),
+		"the `## V1 scope` heading must stay renamed"
+	);
+	assert!(
+		!source.contains("V1 fallback"),
+		"the `V1 fallback` prose must stay renamed"
+	);
+	assert!(
+		fs::read_to_string(manifest_dir.join("src/network/data_server.rs"))
+			.unwrap()
+			.contains("## Scope and simplifications"),
+		"the renamed scope heading must be present in the root"
+	);
 }
