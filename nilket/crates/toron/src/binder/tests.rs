@@ -11997,6 +11997,12 @@ const LOOSEN_VERDICTS: &[(OptimizerDecisionKind, OptimizerRuntimeVerdictClass, u
 	25,
 )];
 
+const GRAPH_LOOSEN_VERDICTS: &[(OptimizerDecisionKind, OptimizerRuntimeVerdictClass, u64)] = &[(
+	OptimizerDecisionKind::GalaxyRoot,
+	OptimizerRuntimeVerdictClass::MissedWin,
+	JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+)];
+
 #[tokio::test]
 async fn auto_applied_margin_uses_advisory_recommendation() {
 	// Base Baseline (4/5) + a loosen signal: the ADR 189 advisory recommends 9/10, and under
@@ -12373,6 +12379,29 @@ fn tree_verdicts_still_drive_soft_margin_advisory() {
 }
 
 #[test]
+fn tree_and_graph_evidence_do_not_cross_steer() {
+	let tree = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+	assert_eq!(
+		effective_tree_join_order_soft_margin_step(&tree),
+		SoftMarginLadderStep::Loose
+	);
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&tree),
+		SoftMarginLadderStep::Baseline
+	);
+
+	let graph = auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_LOOSEN_VERDICTS);
+	assert_eq!(
+		effective_tree_join_order_soft_margin_step(&graph),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&graph),
+		SoftMarginLadderStep::Loose
+	);
+}
+
+#[test]
 fn graph_or_chain_verdicts_do_not_drive_soft_margin_advisory() {
 	let config = auto_applied_margin_config(
 		SoftMarginLadderStep::Baseline,
@@ -12407,7 +12436,7 @@ fn graph_or_chain_verdicts_do_not_drive_soft_margin_advisory() {
 }
 
 #[tokio::test]
-async fn preserved_outer_verdicts_do_not_drive_margin_advisories() {
+async fn preserved_outer_evidence_steers_neither_family() {
 	let config = auto_applied_margin_config(
 		SoftMarginLadderStep::Baseline,
 		&[(
@@ -12419,6 +12448,10 @@ async fn preserved_outer_verdicts_do_not_drive_margin_advisories() {
 
 	assert_eq!(
 		effective_tree_join_order_soft_margin_step(&config),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&config),
 		SoftMarginLadderStep::Baseline
 	);
 	let report = margin_advisory_report(&config);
@@ -12446,16 +12479,9 @@ async fn preserved_outer_verdicts_do_not_drive_margin_advisories() {
 }
 
 #[tokio::test]
-async fn graph_margin_advisory_reports_graph_scope() {
+async fn graph_knob_row_renders_row_effective_application() {
 	let catalog = MockCatalog::new();
-	let config = auto_applied_margin_config(
-		SoftMarginLadderStep::Baseline,
-		&[(
-			OptimizerDecisionKind::GalaxyRoot,
-			OptimizerRuntimeVerdictClass::MissedWin,
-			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
-		)],
-	);
+	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_LOOSEN_VERDICTS);
 
 	let rows = optimizer_margin_advisory_rows(&catalog, &config).await;
 
@@ -12468,8 +12494,8 @@ async fn graph_margin_advisory_reports_graph_scope() {
 		margin_advisory_i64(graph, 8),
 		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
 	);
-	assert_eq!(margin_advisory_utf8(graph, 9), "manual");
-	assert_eq!(margin_advisory_utf8(graph, 10), "4/5");
+	assert_eq!(margin_advisory_utf8(graph, 9), "apply_advisory");
+	assert_eq!(margin_advisory_utf8(graph, 10), "9/10");
 	assert_eq!(margin_advisory_utf8(graph, 11), "graph_join_order");
 	assert_eq!(margin_advisory_i64(graph, 12), 0);
 	assert_eq!(margin_advisory_utf8(graph, 13), "knob_advisory");
@@ -12610,90 +12636,150 @@ async fn insufficient_evidence_renders_per_scope() {
 }
 
 #[tokio::test]
-async fn apply_advisory_does_not_steer_graph_actuation() {
+async fn graph_evidence_changes_near_margin_graph_decision_while_tree_evidence_does_not() {
 	let catalog = margin_boundary_galaxy_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&format!("EXPLAIN {}", galaxy_conformed_order_sql()))
 		.expect("plan margin-boundary galaxy EXPLAIN");
-	let config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
-	record_verdicts(
-		config.runtime_evidence.as_ref(),
-		OptimizerDecisionKind::GalaxyRoot,
-		OptimizerRuntimeVerdictClass::MissedWin,
-		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
-	);
+	let tree_config = auto_applied_margin_config(SoftMarginLadderStep::Baseline, LOOSEN_VERDICTS);
+	let graph_config =
+		auto_applied_margin_config(SoftMarginLadderStep::Baseline, GRAPH_LOOSEN_VERDICTS);
 
-	let (_schema, rows) = bind_explain_rows(&logical, &catalog, &config).await;
-	let galaxy_row = rows
+	let (_schema, tree_rows) = bind_explain_rows(&logical, &catalog, &tree_config).await;
+	let tree_galaxy = tree_rows
 		.iter()
 		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
 		.expect("galaxy row");
-
 	assert_eq!(
-		effective_tree_join_order_soft_margin_step(&config),
+		effective_tree_join_order_soft_margin_step(&tree_config),
 		SoftMarginLadderStep::Loose
 	);
 	assert_eq!(
-		galaxy_row[2],
+		effective_graph_join_order_soft_margin_step(&tree_config),
+		SoftMarginLadderStep::Baseline
+	);
+	assert_eq!(
+		tree_galaxy[2],
 		ScalarValue::Utf8(Some("observed".to_string()))
 	);
-	assert_utf8_contains(&galaxy_row[3], "declared_root=sales");
-	assert_utf8_contains(&galaxy_row[3], "preferred_root=returns");
-	assert_utf8_contains(&galaxy_row[3], "action=reordered");
-	assert_utf8_contains(&galaxy_row[3], "costs=[returns:85000,sales:100000]");
-	if let ScalarValue::Utf8(Some(detail)) = &galaxy_row[3] {
+	if let ScalarValue::Utf8(Some(detail)) = &tree_galaxy[3] {
 		assert!(!detail.contains("applied_root="));
 	}
+
+	assert_eq!(
+		effective_graph_join_order_soft_margin_step(&graph_config),
+		SoftMarginLadderStep::Loose
+	);
+	let (_schema, graph_rows) = bind_explain_rows(&logical, &catalog, &graph_config).await;
+	let graph_galaxy = graph_rows
+		.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some("join_order_galaxy".to_string())))
+		.expect("galaxy row");
+	assert_eq!(
+		graph_galaxy[2],
+		ScalarValue::Utf8(Some("reordered".to_string()))
+	);
+	assert_utf8_contains(&graph_galaxy[3], "action=reordered");
+	assert_utf8_contains(&graph_galaxy[3], "applied_root=returns");
+	assert_utf8_contains(&graph_galaxy[3], "costs=[returns:85000,sales:100000]");
 }
 
 #[tokio::test]
-async fn graph_readout_is_read_only_no_plan_change() {
+async fn apply_advisory_with_insufficient_graph_evidence_binds_byte_identical() {
 	let catalog = margin_boundary_galaxy_join_order_catalog();
 	let logical = SqlPlanner::new()
 		.plan(&galaxy_conformed_order_sql())
 		.expect("plan margin-boundary galaxy");
 
-	for application in [
-		JoinOrderSoftMarginApplication::Manual,
-		JoinOrderSoftMarginApplication::ApplyAdvisory,
-	] {
-		let quiet = PlannerConfig {
-			join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
-			join_order_soft_margin_application: application,
-			..auto_broadcast_config(64 * 1024 * 1024)
-		};
-		let noisy = PlannerConfig {
-			join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
-			join_order_soft_margin_application: application,
-			..auto_broadcast_config(64 * 1024 * 1024)
-		};
-		record_verdicts(
-			noisy.runtime_evidence.as_ref(),
+	for verdicts in [
+		&[(
 			OptimizerDecisionKind::GalaxyRoot,
 			OptimizerRuntimeVerdictClass::MissedWin,
-			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
-		);
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE - 1,
+		)][..],
+		&[
+			(
+				OptimizerDecisionKind::GalaxyRoot,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				11,
+			),
+			(
+				OptimizerDecisionKind::GalaxyRoot,
+				OptimizerRuntimeVerdictClass::OverEager,
+				9,
+			),
+		][..],
+	] {
+		let manual = PlannerConfig {
+			join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+			join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
+			..auto_broadcast_config(64 * 1024 * 1024)
+		};
+		let auto = PlannerConfig {
+			join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+			join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+			..auto_broadcast_config(64 * 1024 * 1024)
+		};
+		for (kind, verdict, count) in verdicts {
+			record_verdicts(manual.runtime_evidence.as_ref(), *kind, *verdict, *count);
+			record_verdicts(auto.runtime_evidence.as_ref(), *kind, *verdict, *count);
+		}
 
-		let (quiet_plan, quiet_trace) = bind_with_trace(&logical, &catalog, &quiet)
+		let (manual_plan, manual_trace) = bind_with_trace(&logical, &catalog, &manual)
 			.await
-			.expect("bind quiet graph plan");
-		let (noisy_plan, noisy_trace) = bind_with_trace(&logical, &catalog, &noisy)
+			.expect("bind manual graph plan");
+		let (auto_plan, auto_trace) = bind_with_trace(&logical, &catalog, &auto)
 			.await
-			.expect("bind graph plan with readout evidence");
+			.expect("bind auto graph plan with insufficient evidence");
 
 		assert_eq!(
-			format!("{quiet_plan:?}"),
-			format!("{noisy_plan:?}"),
-			"graph advisory evidence must not alter graph planning under {application:?}"
+			format!("{manual_plan:?}"),
+			format!("{auto_plan:?}"),
+			"insufficient graph evidence must not alter graph planning: {verdicts:?}"
 		);
-		assert_eq!(quiet_trace.join_decisions, noisy_trace.join_decisions);
-
-		let rows = optimizer_margin_advisory_rows(&catalog, &noisy).await;
-		let graph = margin_advisory_row_by_scope(&rows, "graph_join_order");
-		assert_eq!(margin_advisory_utf8(graph, 2), "loosen");
-		assert_eq!(margin_advisory_utf8(graph, 9), "manual");
-		assert_eq!(margin_advisory_utf8(graph, 10), "4/5");
+		assert_eq!(manual_trace.join_decisions, auto_trace.join_decisions);
+		assert_eq!(
+			effective_graph_join_order_soft_margin_step(&auto),
+			SoftMarginLadderStep::Baseline
+		);
 	}
+}
+
+#[tokio::test]
+async fn manual_mode_byte_identical_for_both_families() {
+	let catalog = margin_boundary_galaxy_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&galaxy_conformed_order_sql())
+		.expect("plan margin-boundary galaxy");
+
+	let manual = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	record_verdicts(
+		manual.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_verdicts(
+		manual.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	let baseline = margin_config(SoftMarginLadderStep::Baseline);
+
+	let (manual_plan, manual_trace) = bind_with_trace(&logical, &catalog, &manual)
+		.await
+		.expect("bind manual graph plan");
+	let (baseline_plan, baseline_trace) = bind_with_trace(&logical, &catalog, &baseline)
+		.await
+		.expect("bind baseline graph plan");
+
+	assert_eq!(format!("{manual_plan:?}"), format!("{baseline_plan:?}"));
+	assert_eq!(manual_trace.join_decisions, baseline_trace.join_decisions);
 }
 
 #[test]

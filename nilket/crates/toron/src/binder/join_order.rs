@@ -245,8 +245,8 @@ impl MarginAdvisoryScope {
 		}
 	}
 
-	fn is_actionable_tree_knob(self) -> bool {
-		matches!(self, Self::TreeFamily)
+	fn is_actionable_knob(self) -> bool {
+		matches!(self, Self::TreeFamily | Self::GraphFamily)
 	}
 }
 
@@ -287,29 +287,59 @@ fn tree_margin_advisory_input(snapshot: &[OptimizerRuntimeVerdictRow]) -> Margin
 	margin_advisory_input(snapshot, MarginAdvisoryScope::TreeFamily)
 }
 
-// ADR 208: the tree-only opt-in derivation of the effective soft-margin step. `Manual` returns the
-// ADR 190 configured base unchanged; `ApplyAdvisory` returns exactly the ADR 189 advisory's
-// `recommended_step` from tree-scoped evidence. Resolved once at bind entry, never inside low-level
-// star/snowflake helpers, and never mutating config or runtime evidence.
-pub(crate) fn effective_tree_join_order_soft_margin_step(
+fn graph_margin_advisory_input(snapshot: &[OptimizerRuntimeVerdictRow]) -> MarginAdvisoryInput {
+	margin_advisory_input(snapshot, MarginAdvisoryScope::GraphFamily)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EffectiveJoinOrderSoftMarginSteps {
+	pub(crate) tree: SoftMarginLadderStep,
+	pub(crate) graph: SoftMarginLadderStep,
+}
+
+// ADR 215: the opt-in derivation of both family soft-margin steps. `Manual` returns the ADR 190
+// configured base unchanged for both families. `ApplyAdvisory` reads one snapshot, then derives the
+// tree and graph recommendations from their own scoped evidence. Binder construction calls this once;
+// low-level star/snowflake/graph helpers read the resolved fields and never re-snapshot evidence.
+pub(crate) fn effective_join_order_soft_margin_steps(
 	config: &PlannerConfig,
-) -> SoftMarginLadderStep {
+) -> EffectiveJoinOrderSoftMarginSteps {
 	match config.join_order_soft_margin_application {
-		JoinOrderSoftMarginApplication::Manual => config.join_order_soft_margin_step,
+		JoinOrderSoftMarginApplication::Manual => EffectiveJoinOrderSoftMarginSteps {
+			tree: config.join_order_soft_margin_step,
+			graph: config.join_order_soft_margin_step,
+		},
 		JoinOrderSoftMarginApplication::ApplyAdvisory => {
-			let input = tree_margin_advisory_input(&config.runtime_evidence.verdict_snapshot());
-			recommend_soft_margin(&input.rows, config.join_order_soft_margin_step).recommended_step
+			let snapshot = config.runtime_evidence.verdict_snapshot();
+			let tree_input = tree_margin_advisory_input(&snapshot);
+			let graph_input = graph_margin_advisory_input(&snapshot);
+			EffectiveJoinOrderSoftMarginSteps {
+				tree: recommend_soft_margin(&tree_input.rows, config.join_order_soft_margin_step)
+					.recommended_step,
+				graph: recommend_soft_margin(&graph_input.rows, config.join_order_soft_margin_step)
+					.recommended_step,
+			}
 		}
 	}
 }
 
-pub(crate) fn graph_join_order_soft_margin_step(config: &PlannerConfig) -> SoftMarginLadderStep {
-	config.join_order_soft_margin_step
+#[cfg(test)]
+pub(crate) fn effective_tree_join_order_soft_margin_step(
+	config: &PlannerConfig,
+) -> SoftMarginLadderStep {
+	effective_join_order_soft_margin_steps(config).tree
 }
 
-// ADR 208: report view that keeps the configured base, the tree-scoped ADR 189 recommendation from that
-// base, the application mode, and the tree-applied step together so the advisory table never recomputes
-// from an already-applied margin (the Baseline -> Loose -> Loosest double-step trap).
+#[cfg(test)]
+pub(crate) fn effective_graph_join_order_soft_margin_step(
+	config: &PlannerConfig,
+) -> SoftMarginLadderStep {
+	effective_join_order_soft_margin_steps(config).graph
+}
+
+// ADRs 208/213/215: report rows keep the configured base, scoped recommendation, application
+// mode, and row-effective step together so the advisory table never recomputes from an
+// already-applied margin (the Baseline -> Loose -> Loosest double-step trap).
 pub(crate) struct MarginAdvisoryReport {
 	pub(crate) advisory: MarginAdvisory,
 	pub(crate) application: JoinOrderSoftMarginApplication,
@@ -325,14 +355,9 @@ fn margin_advisory_report_for_scope(
 	scope: MarginAdvisoryScope,
 ) -> MarginAdvisoryReport {
 	let input = margin_advisory_input(snapshot, scope);
-	let current_step = match scope {
-		MarginAdvisoryScope::TreeFamily => config.join_order_soft_margin_step,
-		MarginAdvisoryScope::GraphFamily | MarginAdvisoryScope::GraphKind(_) => {
-			graph_join_order_soft_margin_step(config)
-		}
-	};
+	let current_step = config.join_order_soft_margin_step;
 	let advisory = recommend_soft_margin(&input.rows, current_step);
-	let application = if scope.is_actionable_tree_knob() {
+	let application = if scope.is_actionable_knob() {
 		config.join_order_soft_margin_application
 	} else {
 		JoinOrderSoftMarginApplication::Manual

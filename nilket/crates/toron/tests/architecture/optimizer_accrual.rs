@@ -285,16 +285,17 @@ pub(crate) fn adr188_measured_accrual_is_side_effect_only() {
 	assert!(coordinator.contains(".record_verdict("));
 	assert!(bind_relation.contains("runtime_evidence.verdict_snapshot()"));
 
-	// ADR 191: the join-order planning helpers still must not read verdict accrual. The only
-	// sanctioned readers are the opt-in margin resolver and the read-only advisory report, which
-	// run once at bind entry — never inside the actuation/observation decision path. Carve those
-	// two helpers out before sweeping the file so the planning-path invariant stays exact.
+	// ADRs 191/215: the join-order planning helpers still must not read verdict accrual. The only
+	// sanctioned readers are the opt-in shared margin resolver and the read-only advisory report,
+	// which run once at bind entry — never inside the actuation/observation decision path. Carve
+	// those helpers out before sweeping the file so the planning-path invariant stays exact.
 	let resolver = first_block(
 		&join_order,
-		"pub(crate) fn effective_tree_join_order_soft_margin_step",
+		"pub(crate) fn effective_join_order_soft_margin_steps",
 	);
 	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");
+	assert_eq!(resolver.matches("verdict_snapshot()").count(), 1);
 	assert!(report.contains("verdict_snapshot()"));
 	assert!(report_rows.contains("verdict_snapshot()"));
 	let join_order_planning = join_order
@@ -747,7 +748,13 @@ pub(crate) fn adr191_effective_margin_resolved_once_at_bind_entry() {
 
 	// The resolved tree step lives on the binder and is set once via the resolver at construction.
 	assert!(binder_struct.contains("tree_join_order_soft_margin_step: SoftMarginLadderStep"));
-	assert!(binder_new.contains("effective_tree_join_order_soft_margin_step(config)"));
+	assert!(binder_new.contains("effective_join_order_soft_margin_steps(config)"));
+	assert_eq!(
+		binder_new
+			.matches("effective_join_order_soft_margin_steps(config)")
+			.count(),
+		1
+	);
 	// Star actuation reads the resolved tree field, never a fresh config/log read.
 	assert!(join_order.contains("self.tree_join_order_soft_margin_step.margin()"));
 	assert!(!join_order.contains("self.config.join_order_soft_margin_step"));
@@ -761,7 +768,7 @@ pub(crate) fn adr191_auto_apply_reuses_189_policy_only() {
 	let join_order = source("src/binder/join_order.rs");
 	let resolver = first_block(
 		&join_order,
-		"pub(crate) fn effective_tree_join_order_soft_margin_step",
+		"pub(crate) fn effective_join_order_soft_margin_steps",
 	);
 
 	// The opt-in path returns exactly the 189 recommendation; it owns no policy of its own.
@@ -885,7 +892,7 @@ pub(crate) fn adr208_soft_margin_advisory_filters_to_tree_verdict_kinds() {
 	let tree_input = first_block(&join_order, "fn tree_margin_advisory_input");
 	let resolver = first_block(
 		&join_order,
-		"pub(crate) fn effective_tree_join_order_soft_margin_step",
+		"pub(crate) fn effective_join_order_soft_margin_steps",
 	);
 	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 
@@ -913,7 +920,7 @@ pub(crate) fn adr208_soft_margin_advisory_filters_to_tree_verdict_kinds() {
 	assert!(tree_input.contains("MarginAdvisoryScope::TreeFamily"));
 	assert!(resolver.contains("tree_margin_advisory_input"));
 	assert!(resolver.contains("recommend_soft_margin("));
-	assert!(resolver.contains("&input.rows"));
+	assert!(resolver.contains("&tree_input.rows"));
 	assert!(report.contains("MarginAdvisoryScope::TreeFamily"));
 }
 
@@ -929,8 +936,9 @@ pub(crate) fn adr208_tree_and_graph_margin_steps_are_separate() {
 
 	assert!(binder_struct.contains("tree_join_order_soft_margin_step: SoftMarginLadderStep"));
 	assert!(binder_struct.contains("graph_join_order_soft_margin_step: SoftMarginLadderStep"));
-	assert!(binder_new.contains("effective_tree_join_order_soft_margin_step(config)"));
-	assert!(binder_new.contains("graph_join_order_soft_margin_step(config)"));
+	assert!(binder_new.contains("effective_join_order_soft_margin_steps(config)"));
+	assert!(binder_new.contains("join_order_soft_margin_steps.tree"));
+	assert!(binder_new.contains("join_order_soft_margin_steps.graph"));
 	assert!(
 		no_recording
 			.contains("tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step")
@@ -942,16 +950,16 @@ pub(crate) fn adr208_tree_and_graph_margin_steps_are_separate() {
 }
 
 #[test]
-pub(crate) fn adr208_graph_margin_gate_reads_base_step_under_apply_advisory() {
+pub(crate) fn adr208_graph_margin_gate_reads_separate_graph_step_under_apply_advisory() {
 	let join_order = source("src/binder/join_order.rs");
 	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
-	let graph_step = first_block(
+	let resolver = first_block(
 		&join_order,
-		"pub(crate) fn graph_join_order_soft_margin_step",
+		"pub(crate) fn effective_join_order_soft_margin_steps",
 	);
 
-	assert!(graph_step.contains("config.join_order_soft_margin_step"));
-	assert!(!graph_step.contains("JoinOrderSoftMarginApplication::ApplyAdvisory"));
+	assert!(resolver.contains("graph:"));
+	assert!(resolver.contains("graph_margin_advisory_input"));
 	assert!(actuation.contains("self.graph_join_order_soft_margin_step.margin()"));
 	assert!(!actuation.contains("self.tree_join_order_soft_margin_step.margin()"));
 	assert!(actuation.contains("GraphActuationResult::KeptThinMargin"));
@@ -1032,13 +1040,13 @@ pub(crate) fn adr208_apply_advisory_remains_resolve_once_no_storage_await() {
 	);
 	let resolver = first_block(
 		&join_order,
-		"pub(crate) fn effective_tree_join_order_soft_margin_step",
+		"pub(crate) fn effective_join_order_soft_margin_steps",
 	);
 	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 
 	assert_eq!(
 		binder_new
-			.matches("effective_tree_join_order_soft_margin_step(config)")
+			.matches("effective_join_order_soft_margin_steps(config)")
 			.count(),
 		1
 	);
@@ -1184,23 +1192,24 @@ pub(crate) fn adr213_graph_advisory_reuses_family_agnostic_margin_math() {
 }
 
 #[test]
-pub(crate) fn adr213_graph_readout_does_not_drive_graph_gate() {
+pub(crate) fn adr213_graph_readout_drives_graph_gate_only_through_apply_advisory() {
 	let join_order = source("src/binder/join_order.rs");
-	let graph_step = first_block(
+	let resolver = first_block(
 		&join_order,
-		"pub(crate) fn graph_join_order_soft_margin_step",
+		"pub(crate) fn effective_join_order_soft_margin_steps",
 	);
 	let actuation = first_block(&join_order, "pub(super) async fn try_bind_graph_actuation");
 	let row_helper = first_block(&join_order, "fn margin_advisory_report_for_scope");
 
-	assert!(graph_step.contains("config.join_order_soft_margin_step"));
-	assert!(!graph_step.contains("recommend_soft_margin"));
-	assert!(!graph_step.contains("verdict_snapshot"));
+	assert!(resolver.contains("JoinOrderSoftMarginApplication::Manual"));
+	assert!(resolver.contains("JoinOrderSoftMarginApplication::ApplyAdvisory"));
+	assert!(resolver.contains("let snapshot = config.runtime_evidence.verdict_snapshot();"));
+	assert!(resolver.contains("graph_margin_advisory_input(&snapshot)"));
+	assert!(resolver.contains("recommend_soft_margin(&graph_input.rows"));
 	assert!(actuation.contains("self.graph_join_order_soft_margin_step.margin()"));
 	assert!(!actuation.contains("recommend_soft_margin"));
 	assert!(!actuation.contains("margin_advisory"));
-	assert!(row_helper.contains("JoinOrderSoftMarginApplication::Manual"));
-	assert!(row_helper.contains("scope.is_actionable_tree_knob()"));
+	assert!(row_helper.contains("scope.is_actionable_knob()"));
 }
 
 #[test]
@@ -1405,6 +1414,185 @@ pub(crate) fn adr214_no_executor_fragmenter_storage_wire_or_wendelon_change() {
 }
 
 #[test]
+pub(crate) fn adr215_graph_application_shares_apply_advisory_mode_no_new_mode() {
+	let binder = binder_root_source();
+	let config = first_block(&binder, "pub struct PlannerConfig");
+	let application = first_block(&binder, "pub enum JoinOrderSoftMarginApplication");
+	let default = first_block(&binder, "impl Default for PlannerConfig");
+
+	assert!(application.contains("Manual"));
+	assert!(application.contains("ApplyAdvisory"));
+	assert_eq!(application.matches("ApplyAdvisory").count(), 1);
+	assert!(config.contains("join_order_soft_margin_application: JoinOrderSoftMarginApplication"));
+	assert!(!config.contains("graph_join_order_soft_margin_application"));
+	assert!(!config.contains("graph_join_order_soft_margin_step"));
+	assert!(default.contains("JoinOrderSoftMarginApplication::Manual"));
+	assert!(!binder.contains("GraphJoinOrderSoftMarginApplication"));
+	assert!(!binder.contains("graph_margin_auto"));
+}
+
+#[test]
+pub(crate) fn adr215_bind_margin_steps_share_one_snapshot() {
+	let binder = binder_root_source();
+	let join_order = source("src/binder/join_order.rs");
+	let binder_new = first_block(
+		&binder,
+		"fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self",
+	);
+	let resolver = first_block(
+		&join_order,
+		"pub(crate) fn effective_join_order_soft_margin_steps",
+	);
+
+	assert_eq!(
+		binder_new
+			.matches("effective_join_order_soft_margin_steps(config)")
+			.count(),
+		1
+	);
+	assert!(!binder_new.contains("effective_tree_join_order_soft_margin_step(config)"));
+	assert!(!binder_new.contains("effective_graph_join_order_soft_margin_step(config)"));
+	assert_eq!(resolver.matches("verdict_snapshot()").count(), 1);
+	assert!(resolver.contains("let snapshot = config.runtime_evidence.verdict_snapshot();"));
+	assert!(resolver.contains("let tree_input = tree_margin_advisory_input(&snapshot);"));
+	assert!(resolver.contains("let graph_input = graph_margin_advisory_input(&snapshot);"));
+}
+
+#[test]
+pub(crate) fn adr215_graph_resolver_is_scope_pure() {
+	let join_order = source("src/binder/join_order.rs");
+	let graph_predicate = first_block(&join_order, "pub(crate) fn is_graph_margin_advisory_kind");
+	let graph_input = first_block(&join_order, "fn graph_margin_advisory_input");
+	let resolver = first_block(
+		&join_order,
+		"pub(crate) fn effective_join_order_soft_margin_steps",
+	);
+
+	assert!(graph_input.contains("MarginAdvisoryScope::GraphFamily"));
+	assert!(resolver.contains("graph_margin_advisory_input(&snapshot)"));
+	assert!(resolver.contains("recommend_soft_margin(&graph_input.rows"));
+	for kind in ["GalaxyRoot", "BridgeRoot", "BridgeChainRoot"] {
+		assert!(
+			graph_predicate.contains(kind),
+			"graph resolver must accept {kind}"
+		);
+	}
+	for kind in [
+		"StarCandidate",
+		"FlatStar",
+		"SnowflakeRoot",
+		"SnowflakeBranch",
+		"PreservedOuterOrder",
+		"Overflow",
+	] {
+		assert!(
+			graph_predicate.contains(kind),
+			"graph resolver must classify {kind}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr215_insufficient_graph_evidence_is_byte_identical() {
+	let tests = source("src/binder/tests.rs");
+	let test = first_block(
+		&tests,
+		"async fn apply_advisory_with_insufficient_graph_evidence_binds_byte_identical",
+	);
+	let recommend = first_block(
+		&source("src/binder/join_order.rs"),
+		"pub(crate) fn recommend_soft_margin",
+	);
+
+	assert!(test.contains("JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE - 1"));
+	assert!(test.contains("OptimizerRuntimeVerdictClass::MissedWin"));
+	assert!(test.contains("OptimizerRuntimeVerdictClass::OverEager"));
+	assert!(test.contains("format!(\"{manual_plan:?}\")"));
+	assert!(test.contains("format!(\"{auto_plan:?}\")"));
+	assert!(test.contains("effective_graph_join_order_soft_margin_step(&auto)"));
+	assert!(recommend.contains("sample_size < JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
+	assert!(recommend.contains("MarginRecommendation::InsufficientEvidence"));
+	assert!(recommend.contains("MarginRecommendation::Keep"));
+}
+
+#[test]
+pub(crate) fn adr215_kind_detail_rows_remain_non_actionable() {
+	let join_order = source("src/binder/join_order.rs");
+	let scope_impl = first_block(&join_order, "impl MarginAdvisoryScope");
+	let row_helper = first_block(&join_order, "fn margin_advisory_report_for_scope");
+
+	assert!(scope_impl.contains("Self::TreeFamily | Self::GraphFamily"));
+	assert!(scope_impl.contains("Self::GraphKind(_) => MarginAdvisoryRowKind::KindDetail"));
+	assert!(scope_impl.contains("fn is_actionable_knob"));
+	assert!(scope_impl.contains("matches!(self, Self::TreeFamily | Self::GraphFamily)"));
+	assert!(row_helper.contains("if scope.is_actionable_knob()"));
+	assert!(row_helper.contains("JoinOrderSoftMarginApplication::Manual"));
+}
+
+#[test]
+pub(crate) fn adr215_no_outer_family_application() {
+	let join_order = source("src/binder/join_order.rs");
+	let tests = source("src/binder/tests.rs");
+	let tree_predicate = first_block(&join_order, "pub(crate) fn is_tree_margin_advisory_kind");
+	let graph_predicate = first_block(&join_order, "pub(crate) fn is_graph_margin_advisory_kind");
+	let outer_gate = first_block(
+		&tests,
+		"async fn preserved_outer_evidence_steers_neither_family",
+	);
+
+	assert!(tree_predicate.contains("PreservedOuterOrder"));
+	assert!(graph_predicate.contains("PreservedOuterOrder"));
+	assert!(outer_gate.contains("OptimizerDecisionKind::PreservedOuterOrder"));
+	assert!(outer_gate.contains("effective_tree_join_order_soft_margin_step(&config)"));
+	assert!(outer_gate.contains("effective_graph_join_order_soft_margin_step(&config)"));
+	assert!(outer_gate.contains("SoftMarginLadderStep::Baseline"));
+}
+
+#[test]
+pub(crate) fn adr215_no_new_keys_tables_or_config() {
+	let binder = binder_root_source();
+	let execution = source("src/ir/execution.rs");
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let manifest = manifest_dir();
+	let config = first_block(&binder, "pub struct PlannerConfig");
+	let system_table_kind = first_block(&execution, "pub enum SystemTableKind");
+
+	assert!(!config.contains("graph_join_order_soft_margin_application"));
+	assert!(!config.contains("graph_join_order_soft_margin_step"));
+	assert_eq!(
+		system_table_kind.matches("OptimizerMarginAdvisory").count(),
+		1
+	);
+	assert!(runtime_evidence.contains("all_verdict_counter_keys"));
+	assert!(!runtime_evidence.contains("GraphFamilyMargin"));
+
+	let markers = [
+		"effective_join_order_soft_margin_steps",
+		"effective_graph_join_order_soft_margin_step",
+		"graph_margin_advisory_input",
+	];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR215 graph margin application leaked outside binder policy/reporting surfaces:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+}
+
+#[test]
 pub(crate) fn adr208_no_wendelon_counter_replication_claim() {
 	let manifest = manifest_dir();
 	let markers = [
@@ -1556,7 +1744,7 @@ pub(crate) fn adr207_bind_path_never_awaits_storage_for_evidence() {
 	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
 	let resolver = first_block(
 		&join_order,
-		"pub(crate) fn effective_tree_join_order_soft_margin_step",
+		"pub(crate) fn effective_join_order_soft_margin_steps",
 	);
 	let report = first_block(&join_order, "pub(crate) fn margin_advisory_report");
 	let report_rows = first_block(&join_order, "pub(crate) fn margin_advisory_report_rows");

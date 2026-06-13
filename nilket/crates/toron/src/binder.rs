@@ -442,11 +442,9 @@ fn is_preserved_outer_equi_edge(edge: &JoinOrderEdgeEvidence) -> bool {
 struct Binder<'a> {
 	catalog: &'a dyn Catalog,
 	config: &'a PlannerConfig,
-	// ADR 208: the tree soft-margin step resolved once at bind entry from tree-scoped evidence.
-	// Star/snowflake paths read this field rather than re-snapshotting runtime evidence mid-bind.
+	// ADR 215: family soft-margin steps resolved once at bind entry from one evidence snapshot.
+	// Tree and graph paths read these fields rather than re-snapshotting runtime evidence mid-bind.
 	tree_join_order_soft_margin_step: SoftMarginLadderStep,
-	// ADR 208: graph actuation is not advisory-tunable yet. Its soft-margin gate reads the
-	// configured base step under both Manual and ApplyAdvisory until a graph-family advisory lands.
 	graph_join_order_soft_margin_step: SoftMarginLadderStep,
 	// The sink for optimizer decisions. Normally the shared `config.decision_log`; a scratch recognition
 	// bind / declined-actuation re-bind carries a zero-size `NoOpDecisionRecorder` instead, so it cannot
@@ -456,11 +454,12 @@ struct Binder<'a> {
 
 impl<'a> Binder<'a> {
 	fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self {
+		let join_order_soft_margin_steps = effective_join_order_soft_margin_steps(config);
 		Self {
 			catalog,
 			config,
-			tree_join_order_soft_margin_step: effective_tree_join_order_soft_margin_step(config),
-			graph_join_order_soft_margin_step: graph_join_order_soft_margin_step(config),
+			tree_join_order_soft_margin_step: join_order_soft_margin_steps.tree,
+			graph_join_order_soft_margin_step: join_order_soft_margin_steps.graph,
 			decision_recorder: config.decision_log.as_ref(),
 		}
 	}
