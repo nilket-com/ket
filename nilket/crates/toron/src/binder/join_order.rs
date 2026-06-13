@@ -290,9 +290,10 @@ fn graph_margin_advisory_input(snapshot: &[OptimizerRuntimeVerdictRow]) -> Margi
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EffectiveJoinOrderSoftMarginSteps {
-	pub(crate) tree: SoftMarginLadderStep,
-	pub(crate) graph: EffectiveGraphJoinOrderSoftMarginSteps,
+pub(crate) struct EffectiveJoinOrderPolicy {
+	pub(crate) tree_step: SoftMarginLadderStep,
+	pub(crate) graph_steps: EffectiveGraphJoinOrderSoftMarginSteps,
+	pub(crate) preserved_outer_gate: PreservedOuterOrderingGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,19 +330,21 @@ impl EffectiveGraphJoinOrderSoftMarginSteps {
 	}
 }
 
-// ADRs 215/218: the opt-in derivation of tree and graph soft-margin steps. `Manual` returns
-// the ADR 190 configured base unchanged. `ApplyAdvisory` reads one snapshot, derives the tree
-// family and graph family recommendations, then arms graph-kind steps only when the ADR 217
-// graph divergence gate is actionable.
-pub(crate) fn effective_join_order_soft_margin_steps(
-	config: &PlannerConfig,
-) -> EffectiveJoinOrderSoftMarginSteps {
+// ADRs 215/218/219: the opt-in derivation of tree, graph, and preserved-outer
+// policy. `Manual` returns the configured base without reading evidence. `ApplyAdvisory`
+// reads one receipt-gate snapshot, derives every policy field from it, then threads the
+// result through the binder.
+pub(crate) fn effective_join_order_policy(config: &PlannerConfig) -> EffectiveJoinOrderPolicy {
 	match config.join_order_soft_margin_application {
-		JoinOrderSoftMarginApplication::Manual => EffectiveJoinOrderSoftMarginSteps {
-			tree: config.join_order_soft_margin_step,
-			graph: EffectiveGraphJoinOrderSoftMarginSteps::uniform(
+		JoinOrderSoftMarginApplication::Manual => EffectiveJoinOrderPolicy {
+			tree_step: config.join_order_soft_margin_step,
+			graph_steps: EffectiveGraphJoinOrderSoftMarginSteps::uniform(
 				config.join_order_soft_margin_step,
 			),
+			preserved_outer_gate: PreservedOuterOrderingGate {
+				status: OptimizerReceiptGateStatus::InsufficientEvidence,
+				advisory: recommend_soft_margin(&[], config.join_order_soft_margin_step),
+			},
 		},
 		JoinOrderSoftMarginApplication::ApplyAdvisory => {
 			let snapshot = config.runtime_evidence.receipt_gate_snapshot();
@@ -351,10 +354,15 @@ pub(crate) fn effective_join_order_soft_margin_steps(
 				recommend_soft_margin(&graph_input.rows, config.join_order_soft_margin_step)
 					.recommended_step;
 			let graph_gate = graph_margin_divergence_gate(&snapshot, config);
-			EffectiveJoinOrderSoftMarginSteps {
-				tree: recommend_soft_margin(&tree_input.rows, config.join_order_soft_margin_step)
-					.recommended_step,
-				graph: graph_kind_steps_from_gate(graph_family, &graph_gate),
+			let preserved_outer_gate = preserved_outer_ordering_gate(&snapshot, config);
+			EffectiveJoinOrderPolicy {
+				tree_step: recommend_soft_margin(
+					&tree_input.rows,
+					config.join_order_soft_margin_step,
+				)
+				.recommended_step,
+				graph_steps: graph_kind_steps_from_gate(graph_family, &graph_gate),
+				preserved_outer_gate,
 			}
 		}
 	}
@@ -364,14 +372,14 @@ pub(crate) fn effective_join_order_soft_margin_steps(
 pub(crate) fn effective_tree_join_order_soft_margin_step(
 	config: &PlannerConfig,
 ) -> SoftMarginLadderStep {
-	effective_join_order_soft_margin_steps(config).tree
+	effective_join_order_policy(config).tree_step
 }
 
 #[cfg(test)]
 pub(crate) fn effective_graph_join_order_soft_margin_step(
 	config: &PlannerConfig,
 ) -> SoftMarginLadderStep {
-	effective_join_order_soft_margin_steps(config).graph.family
+	effective_join_order_policy(config).graph_steps.family
 }
 
 #[cfg(test)]
@@ -379,8 +387,8 @@ pub(crate) fn effective_graph_kind_join_order_soft_margin_step(
 	config: &PlannerConfig,
 	kind: OptimizerDecisionKind,
 ) -> SoftMarginLadderStep {
-	effective_join_order_soft_margin_steps(config)
-		.graph
+	effective_join_order_policy(config)
+		.graph_steps
 		.step_for(kind)
 }
 
@@ -497,6 +505,12 @@ impl GraphMarginDivergenceGate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreservedOuterOrderingGate {
+	pub(crate) status: OptimizerReceiptGateStatus,
+	pub(crate) advisory: MarginAdvisory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DecisionConflictGateSignal {
 	kind: OptimizerDecisionKind,
 	provenance: OptimizerRuntimeVerdictProvenance,
@@ -518,7 +532,7 @@ pub(crate) fn optimizer_receipt_gate_rows(config: &PlannerConfig) -> Vec<Optimiz
 	let snapshot = config.runtime_evidence.receipt_gate_snapshot();
 	vec![
 		graph_margin_divergence_gate_row(&snapshot, config),
-		preserved_outer_ordering_gate(&snapshot, config),
+		preserved_outer_ordering_gate_row(&snapshot, config),
 		decision_conflict_pressure_gate(&snapshot),
 		windowing_decay_pressure_gate(&snapshot),
 		counter_handoff_readiness_gate(&snapshot),
@@ -643,10 +657,10 @@ fn graph_kind_signal_label(
 	parts.join(",")
 }
 
-fn preserved_outer_ordering_gate(
+pub(crate) fn preserved_outer_ordering_gate(
 	snapshot: &OptimizerReceiptGateSnapshot,
 	config: &PlannerConfig,
-) -> OptimizerReceiptGateRow {
+) -> PreservedOuterOrderingGate {
 	let report = margin_advisory_report_for_scope(
 		&snapshot.verdicts,
 		config,
@@ -659,7 +673,18 @@ fn preserved_outer_ordering_gate(
 	} else {
 		OptimizerReceiptGateStatus::Inactive
 	};
-	let reason = match status {
+	PreservedOuterOrderingGate {
+		status,
+		advisory: report.advisory,
+	}
+}
+
+fn preserved_outer_ordering_gate_row(
+	snapshot: &OptimizerReceiptGateSnapshot,
+	config: &PlannerConfig,
+) -> OptimizerReceiptGateRow {
+	let gate = preserved_outer_ordering_gate(snapshot, config);
+	let reason = match gate.status {
 		OptimizerReceiptGateStatus::InsufficientEvidence => {
 			"requires_ready_preserved_outer_ordering_samples"
 		}
@@ -670,17 +695,17 @@ fn preserved_outer_ordering_gate(
 	OptimizerReceiptGateRow {
 		gate_name: "preserved_outer_ordering",
 		gate_family: "preserved_outer_join_order",
-		status,
-		sample_count: report.advisory.sample_size,
+		status: gate.status,
+		sample_count: gate.advisory.sample_size,
 		primary_signal: format!(
 			"recommendation={}",
-			margin_recommendation_label(report.advisory.recommendation)
+			margin_recommendation_label(gate.advisory.recommendation)
 		),
 		secondary_signal: format!(
 			"missed_win={},over_eager={},vindicated={},evidence_health={}",
-			report.advisory.missed_win,
-			report.advisory.over_eager,
-			report.advisory.vindicated,
+			gate.advisory.missed_win,
+			gate.advisory.over_eager,
+			gate.advisory.vindicated,
 			evidence_health_label(&snapshot.health)
 		),
 		reason: reason.to_string(),
@@ -1189,6 +1214,57 @@ pub(super) fn extract_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoin
 		probe: current,
 		dimensions,
 	})
+}
+
+fn extract_left_outer_star_join_candidate(plan: &LogicalPlan) -> Option<StarJoinCandidate<'_>> {
+	let mut current = plan;
+	let mut dimensions = Vec::new();
+	loop {
+		match current {
+			LogicalPlan::Join {
+				left,
+				right,
+				kind,
+				on,
+				strategy_intent,
+			} if *kind == JoinKind::LeftOuter
+				&& *strategy_intent == JoinStrategyIntent::Auto
+				&& left_outer_star_base_leaf_label(right).is_some() =>
+			{
+				dimensions.push(StarJoinDimension {
+					input: right,
+					on,
+					strategy_intent: *strategy_intent,
+					declared_position: 0,
+				});
+				current = left;
+			}
+			_ => break,
+		}
+	}
+	if dimensions.len() < 2 || left_outer_star_base_leaf_label(current).is_none() {
+		return None;
+	}
+	dimensions.reverse();
+	for (declared_position, dimension) in dimensions.iter_mut().enumerate() {
+		dimension.declared_position = declared_position;
+	}
+	Some(StarJoinCandidate {
+		probe: current,
+		dimensions,
+	})
+}
+
+fn left_outer_star_base_leaf_label(plan: &LogicalPlan) -> Option<String> {
+	match plan {
+		LogicalPlan::ScanNamed { table, .. } => Some(relation_key_label(table)),
+		LogicalPlan::Alias { alias, input, .. }
+			if left_outer_star_base_leaf_label(input).is_some() =>
+		{
+			Some(relation_key_label(alias))
+		}
+		_ => None,
+	}
 }
 
 // The relation label of a galaxy leaf (a `FROM`-clause scan, possibly aliased, and possibly wrapped in a
@@ -2983,6 +3059,23 @@ impl GraphShape {
 	}
 }
 
+fn sorted_star_order_indices(dimensions: &[BoundStarDimension<'_>]) -> Vec<usize> {
+	let mut preferred_indices = (0..dimensions.len()).collect::<Vec<_>>();
+	preferred_indices.sort_by(|left, right| {
+		dimensions[*left]
+			.evidence
+			.estimated_rows
+			.cmp(&dimensions[*right].evidence.estimated_rows)
+			.then(
+				dimensions[*left]
+					.evidence
+					.declared_position
+					.cmp(&dimensions[*right].evidence.declared_position),
+			)
+	});
+	preferred_indices
+}
+
 #[derive(Debug, Clone)]
 enum LocalStarActuationAttempt {
 	Actuated(LocalStarActuation),
@@ -3036,6 +3129,190 @@ fn star_output_segments_for_order(
 }
 
 impl<'a> Binder<'a> {
+	pub(super) async fn try_bind_preserved_outer_star_actuation(
+		&self,
+		plan: &LogicalPlan,
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<StarOrderActuationResult, BindingError> {
+		let gate = self.join_order_policy.preserved_outer_gate;
+		if gate.status != OptimizerReceiptGateStatus::Actionable {
+			return Ok(StarOrderActuationResult::NotCandidate);
+		}
+		let Some(candidate) = extract_left_outer_star_join_candidate(plan) else {
+			return Ok(StarOrderActuationResult::NotCandidate);
+		};
+
+		let mut scratch_trace = trace.clone();
+		let mut scratch_render_trace = None;
+		let scratch_binder = self.without_decision_recording();
+		let probe_plan = scratch_binder
+			.bind_plan_with_trace(
+				candidate.probe,
+				&mut scratch_trace,
+				&mut scratch_render_trace,
+				JoinOrderSourceCapture::On,
+			)
+			.await?;
+		let Some(probe_label) = probe_plan.scope.unique_source_label() else {
+			return Ok(StarOrderActuationResult::NotCandidate);
+		};
+
+		let mut scratch_dimensions = Vec::with_capacity(candidate.dimensions.len());
+		for dimension in &candidate.dimensions {
+			let dimension_plan = scratch_binder
+				.bind_plan_with_trace(
+					dimension.input,
+					&mut scratch_trace,
+					&mut scratch_render_trace,
+					JoinOrderSourceCapture::On,
+				)
+				.await?;
+			let Some(label) = dimension_plan.scope.unique_source_label() else {
+				return Ok(StarOrderActuationResult::NotCandidate);
+			};
+			let child = StarChildDimension {
+				plan: dimension_plan,
+				on: dimension.on,
+				strategy_intent: dimension.strategy_intent,
+				label,
+				declared_position: dimension.declared_position,
+				composite_build: false,
+			};
+			let Some(bound) =
+				self.bound_left_outer_star_dimension(&probe_plan, &probe_label, &child)?
+			else {
+				return Ok(StarOrderActuationResult::NotCandidate);
+			};
+			scratch_dimensions.push(bound);
+		}
+
+		let evidence_dimensions = scratch_dimensions
+			.iter()
+			.map(|dimension| dimension.evidence.clone())
+			.collect::<Vec<_>>();
+		let confidence = join_order_overall_confidence(&evidence_dimensions);
+		let recognized = recognized_star_order_outcome(
+			probe_label.clone(),
+			evidence_dimensions,
+			None,
+			StarOrderStrategy::Broadcast,
+			Vec::new(),
+			confidence,
+			gate.advisory.recommended_step.margin(),
+		);
+		let StarOrderOutcome::Recognized(evidence) = &recognized else {
+			return Ok(StarOrderActuationResult::NotCandidate);
+		};
+		if evidence.action != StarOrderAction::Reordered {
+			return Ok(StarOrderActuationResult::NotCandidate);
+		}
+
+		let declared_indices = (0..scratch_dimensions.len()).collect::<Vec<_>>();
+		let selected_indices = sorted_star_order_indices(&scratch_dimensions);
+		let declared = self.preflight_left_outer_star_order_strategy(
+			probe_plan.clone(),
+			&scratch_dimensions,
+			&declared_indices,
+			&scratch_trace,
+		)?;
+		let Some(selected) = self.preflight_left_outer_star_order_strategy(
+			probe_plan,
+			&scratch_dimensions,
+			&selected_indices,
+			&scratch_trace,
+		)?
+		else {
+			return Ok(StarOrderActuationResult::NotCandidate);
+		};
+		let fingerprint_match =
+			declared.as_ref().map(|d| &d.fingerprint) == Some(&selected.fingerprint);
+		if selected.summary != StarOrderStrategy::Mixed && !fingerprint_match {
+			return Ok(StarOrderActuationResult::NotCandidate);
+		}
+
+		let real_probe_plan = self
+			.bind_plan_with_trace(
+				candidate.probe,
+				trace,
+				render_trace,
+				JoinOrderSourceCapture::On,
+			)
+			.await?;
+		let Some(real_probe_label) = real_probe_plan.scope.unique_source_label() else {
+			return Ok(StarOrderActuationResult::NotCandidate);
+		};
+		let mut real_dimensions = Vec::with_capacity(candidate.dimensions.len());
+		for dimension in &candidate.dimensions {
+			let dimension_plan = self
+				.bind_plan_with_trace(
+					dimension.input,
+					trace,
+					render_trace,
+					JoinOrderSourceCapture::On,
+				)
+				.await?;
+			let Some(label) = dimension_plan.scope.unique_source_label() else {
+				return Ok(StarOrderActuationResult::NotCandidate);
+			};
+			let child = StarChildDimension {
+				plan: dimension_plan,
+				on: dimension.on,
+				strategy_intent: dimension.strategy_intent,
+				label,
+				declared_position: dimension.declared_position,
+				composite_build: false,
+			};
+			let Some(bound) =
+				self.bound_left_outer_star_dimension(&real_probe_plan, &real_probe_label, &child)?
+			else {
+				return Ok(StarOrderActuationResult::NotCandidate);
+			};
+			real_dimensions.push(bound);
+		}
+
+		let declared_segments =
+			star_output_segments(&real_probe_label, &real_probe_plan, &real_dimensions);
+		let mut declared_output_schema = real_probe_plan.schema();
+		let mut declared_scope = real_probe_plan.scope.clone();
+		for dimension in &real_dimensions {
+			declared_output_schema = join_schema(
+				JoinKind::LeftOuter,
+				&declared_output_schema,
+				&dimension.plan.schema(),
+			);
+			declared_scope = RelationScope::join(
+				JoinKind::LeftOuter,
+				&declared_scope,
+				&dimension.plan.scope,
+				&declared_output_schema,
+			);
+		}
+		let physical_segments = star_output_segments_for_order(
+			&real_probe_label,
+			&real_probe_plan,
+			&real_dimensions,
+			&selected_indices,
+		);
+		let mut output = self.bind_left_outer_star_order_sequence(
+			real_probe_plan,
+			&real_dimensions,
+			&selected_indices,
+			trace,
+			render_trace,
+		)?;
+		let physical_output_schema = output.schema();
+		output.plan = restore_declared_star_order_project(
+			output.plan,
+			&physical_output_schema,
+			declared_output_schema,
+			&physical_segments,
+			&declared_segments,
+		)?;
+		output.scope = declared_scope;
+		Ok(StarOrderActuationResult::Actuated(output))
+	}
+
 	// ADR 198/199, unified in ADR 200: bounded graph root-swap actuation for galaxies and bridges.
 	// Scratch-recognize the graph of `shape`, and if its cost-optimal root differs from the FROM root by
 	// the soft margin, re-root the join tree and bind the re-rooted plan — a snowflake the existing
@@ -3109,7 +3386,8 @@ impl<'a> Binder<'a> {
 			));
 		};
 		let margin = self
-			.graph_join_order_soft_margin_steps
+			.join_order_policy
+			.graph_steps
 			.step_for(shape.decision_kind())
 			.margin();
 		if preferred_cost.saturating_mul(margin.denominator)
@@ -3663,6 +3941,68 @@ impl<'a> Binder<'a> {
 		}))
 	}
 
+	fn bound_left_outer_star_dimension<'b>(
+		&self,
+		probe_plan: &ScopedExecutionPlan,
+		probe_label: &str,
+		dimension: &StarChildDimension<'b>,
+	) -> Result<Option<BoundStarDimension<'b>>, BindingError> {
+		if dimension.composite_build {
+			return Ok(None);
+		}
+		let Some(edge) =
+			self.try_resolve_star_dimension_edge(probe_plan, &dimension.plan, dimension.on)?
+		else {
+			return Ok(None);
+		};
+		if edge.left_label.as_deref() != Some(probe_label)
+			|| edge.right_label.as_deref() != Some(dimension.label.as_str())
+		{
+			return Ok(None);
+		}
+		let join_estimated_row_count = Self::join_estimated_row_count_for_keys(
+			JoinKind::LeftOuter,
+			probe_plan,
+			&dimension.plan,
+			&edge.left_resolved_keys,
+			&edge.right_resolved_keys,
+		);
+		let (estimated_rows, estimate_source) = join_order_edge_estimate(
+			probe_plan.join_order_sources.as_ref(),
+			dimension.plan.join_order_sources.as_ref(),
+			Some(probe_label),
+			Some(dimension.label.as_str()),
+			&edge.left_resolved_keys,
+			&edge.right_resolved_keys,
+			join_estimated_row_count,
+		);
+		let Some(estimated_rows) = estimated_rows else {
+			return Ok(None);
+		};
+		let confidence = join_order_estimate_confidence(
+			probe_plan.join_order_sources.as_ref(),
+			dimension.plan.join_order_sources.as_ref(),
+			Some(probe_label),
+			Some(dimension.label.as_str()),
+			&edge.left_resolved_keys,
+			&edge.right_resolved_keys,
+		);
+		Ok(Some(BoundStarDimension {
+			plan: dimension.plan.clone(),
+			on: dimension.on,
+			strategy_intent: dimension.strategy_intent,
+			label: dimension.label.clone(),
+			composite_build: false,
+			evidence: JoinOrderDimEvidence {
+				dimension: dimension.label.clone(),
+				declared_position: dimension.declared_position,
+				estimated_rows,
+				estimate_source,
+				confidence,
+			},
+		}))
+	}
+
 	fn bind_local_star_actuation<'b>(
 		&self,
 		probe_plan: ScopedExecutionPlan,
@@ -3685,24 +4025,12 @@ impl<'a> Binder<'a> {
 			StarOrderStrategy::Broadcast,
 			Vec::new(),
 			confidence,
-			self.tree_join_order_soft_margin_step.margin(),
+			self.join_order_policy.tree_step.margin(),
 		);
 		let StarOrderOutcome::Recognized(evidence) = &recognized else {
 			unreachable!("recognized_star_order_outcome always recognizes");
 		};
-		let mut preferred_indices = (0..dimensions.len()).collect::<Vec<_>>();
-		preferred_indices.sort_by(|left, right| {
-			dimensions[*left]
-				.evidence
-				.estimated_rows
-				.cmp(&dimensions[*right].evidence.estimated_rows)
-				.then(
-					dimensions[*left]
-						.evidence
-						.declared_position
-						.cmp(&dimensions[*right].evidence.declared_position),
-				)
-		});
+		let preferred_indices = sorted_star_order_indices(dimensions);
 		let declared_indices = (0..dimensions.len()).collect::<Vec<_>>();
 		let selected_indices = if evidence.action == StarOrderAction::Reordered {
 			preferred_indices
@@ -3838,7 +4166,7 @@ impl<'a> Binder<'a> {
 			selected_strategy,
 			edge_strategies,
 			confidence,
-			self.tree_join_order_soft_margin_step.margin(),
+			self.join_order_policy.tree_step.margin(),
 		);
 		let edge_targets = render_trace
 			.as_ref()
@@ -3951,6 +4279,40 @@ impl<'a> Binder<'a> {
 		}))
 	}
 
+	fn preflight_left_outer_star_order_strategy<'b>(
+		&self,
+		probe_plan: ScopedExecutionPlan,
+		dimensions: &[BoundStarDimension<'b>],
+		order: &[usize],
+		base_trace: &OptimizerTrace,
+	) -> Result<Option<PreflightStrategy>, BindingError> {
+		let mut preflight_trace = base_trace.clone();
+		let preflight_join_start = preflight_trace.join_decisions.len();
+		let mut no_render_trace = None;
+		let _ = self.bind_left_outer_star_order_sequence(
+			probe_plan,
+			dimensions,
+			order,
+			&mut preflight_trace,
+			&mut no_render_trace,
+		)?;
+		let preflight_decisions = &preflight_trace.join_decisions[preflight_join_start..];
+		if preflight_decisions.len() != order.len() {
+			return Ok(None);
+		}
+		let Some(fingerprint) =
+			order_strategy_fingerprint(preflight_decisions, order, dimensions, &BTreeSet::new())
+		else {
+			return Ok(None);
+		};
+		let summary =
+			uniform_star_order_strategy(preflight_decisions).unwrap_or(StarOrderStrategy::Mixed);
+		Ok(Some(PreflightStrategy {
+			summary,
+			fingerprint,
+		}))
+	}
+
 	fn bind_star_order_sequence<'b>(
 		&self,
 		probe_plan: ScopedExecutionPlan,
@@ -3966,6 +4328,31 @@ impl<'a> Binder<'a> {
 				current,
 				dimension.plan.clone(),
 				JoinKind::Inner,
+				dimension.on,
+				dimension.strategy_intent,
+				trace,
+				render_trace,
+				dimension.evidence.declared_position,
+			)?;
+		}
+		Ok(current)
+	}
+
+	fn bind_left_outer_star_order_sequence<'b>(
+		&self,
+		probe_plan: ScopedExecutionPlan,
+		dimensions: &[BoundStarDimension<'b>],
+		order: &[usize],
+		trace: &mut OptimizerTrace,
+		render_trace: &mut Option<OptimizerExplainRenderTrace>,
+	) -> Result<ScopedExecutionPlan, BindingError> {
+		let mut current = probe_plan;
+		for idx in order {
+			let dimension = &dimensions[*idx];
+			current = self.bind_scoped_join(
+				current,
+				dimension.plan.clone(),
+				JoinKind::LeftOuter,
 				dimension.on,
 				dimension.strategy_intent,
 				trace,

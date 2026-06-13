@@ -12016,6 +12016,17 @@ const GRAPH_DIVERGENT_VERDICTS: &[(OptimizerDecisionKind, OptimizerRuntimeVerdic
 	),
 ];
 
+fn preserved_outer_actionable_config(base_step: SoftMarginLadderStep) -> PlannerConfig {
+	auto_applied_margin_config(
+		base_step,
+		&[(
+			OptimizerDecisionKind::PreservedOuterOrder,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+		)],
+	)
+}
+
 #[tokio::test]
 async fn auto_applied_margin_uses_advisory_recommendation() {
 	// Base Baseline (4/5) + a loosen signal: the ADR 189 advisory recommends 9/10, and under
@@ -13782,6 +13793,330 @@ async fn rune_outer_ordering_receipts_match_sql() {
 	assert_eq!(
 		measured_verdict_signature(&sql_verdicts),
 		measured_verdict_signature(&rune_verdicts)
+	);
+}
+
+#[tokio::test]
+async fn safe_side_left_outer_star_preserves_rows_and_schema() {
+	let (catalog, storage) = outer_star_order_execution_fixture().await;
+	let declared_config = auto_broadcast_config(64 * 1024 * 1024);
+	let armed_config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let (declared_schema, declared_rows) = execute_star_order_query(
+		&catalog,
+		storage.clone(),
+		preserved_outer_star_project_sql(),
+		&declared_config,
+	)
+	.await;
+	let (armed_schema, armed_rows) = execute_star_order_query(
+		&catalog,
+		storage,
+		preserved_outer_star_project_sql(),
+		&armed_config,
+	)
+	.await;
+
+	assert_eq!(
+		schema_signature(&armed_schema),
+		schema_signature(&declared_schema)
+	);
+	assert_eq!(armed_rows, declared_rows);
+	assert!(
+		armed_rows.iter().any(|row| row.iter().any(Option::is_none)),
+		"fixture must include null-supplied misses: {armed_rows:?}"
+	);
+	assert!(
+		armed_rows.len() > 4,
+		"fixture must include multi-match dimensions, got {armed_rows:?}"
+	);
+}
+
+#[tokio::test]
+async fn safe_side_left_outer_star_reorders_when_gate_actionable() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan preserved outer star");
+	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let (_plan, _trace, render) = bind_with_explain_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind actionable preserved outer star");
+
+	assert_eq!(
+		join_order_edge_dimensions(&render),
+		vec!["s".to_string(), "p".to_string(), "c".to_string()]
+	);
+	assert!(
+		render
+			.join_order_edges
+			.iter()
+			.all(|edge| edge.join_kind == JoinKind::LeftOuter),
+		"outer actuation must build real left-outer edges: {:?}",
+		render.join_order_edges
+	);
+}
+
+#[tokio::test]
+async fn preserved_outer_ordering_inert_until_gate_actionable() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan preserved outer star");
+	let baseline = auto_broadcast_config(64 * 1024 * 1024);
+	let cases = [
+		PlannerConfig {
+			join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+			join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+			..auto_broadcast_config(64 * 1024 * 1024)
+		},
+		auto_applied_margin_config(
+			SoftMarginLadderStep::Baseline,
+			&[(
+				OptimizerDecisionKind::PreservedOuterOrder,
+				OptimizerRuntimeVerdictClass::MissedWin,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE - 1,
+			)],
+		),
+		auto_applied_margin_config(
+			SoftMarginLadderStep::Baseline,
+			&[
+				(
+					OptimizerDecisionKind::PreservedOuterOrder,
+					OptimizerRuntimeVerdictClass::MissedWin,
+					11,
+				),
+				(
+					OptimizerDecisionKind::PreservedOuterOrder,
+					OptimizerRuntimeVerdictClass::OverEager,
+					9,
+				),
+			],
+		),
+		auto_applied_margin_config(
+			SoftMarginLadderStep::Baseline,
+			&[(
+				OptimizerDecisionKind::PreservedOuterOrder,
+				OptimizerRuntimeVerdictClass::OverEager,
+				JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+			)],
+		),
+	];
+	let (baseline_plan, baseline_trace, baseline_render) =
+		bind_with_explain_trace(&logical, &catalog, &baseline)
+			.await
+			.expect("bind baseline preserved outer star");
+
+	for config in cases {
+		let (plan, trace, render) = bind_with_explain_trace(&logical, &catalog, &config)
+			.await
+			.expect("bind inert preserved outer star");
+		assert_eq!(format!("{plan:?}"), format!("{baseline_plan:?}"));
+		assert_eq!(trace.join_decisions, baseline_trace.join_decisions);
+		assert_eq!(
+			join_order_edge_dimensions(&render),
+			join_order_edge_dimensions(&baseline_render)
+		);
+	}
+}
+
+#[tokio::test]
+async fn manual_ignores_preserved_outer_ordering_gate() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan preserved outer star");
+	let manual = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::Manual,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	record_verdicts(
+		manual.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::PreservedOuterOrder,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	let baseline = auto_broadcast_config(64 * 1024 * 1024);
+
+	let (manual_plan, manual_trace, manual_render) =
+		bind_with_explain_trace(&logical, &catalog, &manual)
+			.await
+			.expect("bind manual preserved outer star");
+	let (baseline_plan, baseline_trace, baseline_render) =
+		bind_with_explain_trace(&logical, &catalog, &baseline)
+			.await
+			.expect("bind baseline preserved outer star");
+
+	assert_eq!(format!("{manual_plan:?}"), format!("{baseline_plan:?}"));
+	assert_eq!(manual_trace.join_decisions, baseline_trace.join_decisions);
+	assert_eq!(
+		join_order_edge_dimensions(&manual_render),
+		join_order_edge_dimensions(&baseline_render)
+	);
+}
+
+#[tokio::test]
+async fn selected_order_uses_left_outer_preflight_not_inner_receipt_targets() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan preserved outer star");
+	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let (plan, _trace, render) = bind_with_explain_trace(&logical, &catalog, &config)
+		.await
+		.expect("bind actionable preserved outer star");
+
+	assert_eq!(
+		join_order_edge_dimensions(&render),
+		vec!["s".to_string(), "p".to_string(), "c".to_string()]
+	);
+	assert!(
+		!execution_join_kinds(&plan).contains(&JoinKind::Inner),
+		"live transform must not actuate the inner counterfactual targets: {plan:?}"
+	);
+	assert!(
+		render
+			.preserved_outer_order
+			.iter()
+			.flat_map(|receipt| receipt.receipt.edge_targets.iter())
+			.all(
+				|target| render.join_order_edges[target.join_index as usize].join_kind
+					== JoinKind::LeftOuter
+			)
+	);
+}
+
+#[tokio::test]
+async fn preserved_outer_full_right_cross_and_residual_shapes_stay_fenced() {
+	let catalog = star_join_order_catalog();
+	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+	let baseline = auto_broadcast_config(64 * 1024 * 1024);
+	for sql in [
+		"SELECT * FROM orders o \
+		 RIGHT JOIN customers c ON o.customer_id = c.id \
+		 RIGHT JOIN products p ON o.product_id = p.id",
+		"SELECT * FROM orders o \
+		 FULL OUTER JOIN customers c ON o.customer_id = c.id \
+		 FULL OUTER JOIN products p ON o.product_id = p.id",
+		"SELECT * FROM orders o \
+		 LEFT JOIN customers c ON o.customer_id = c.id \
+		 LEFT JOIN products p ON c.id = p.id",
+	] {
+		let logical = SqlPlanner::new().plan(sql).expect("plan fenced outer SQL");
+		let (plan, trace) = bind_with_trace(&logical, &catalog, &config)
+			.await
+			.expect("bind armed fenced outer SQL");
+		let (baseline_plan, baseline_trace) = bind_with_trace(&logical, &catalog, &baseline)
+			.await
+			.expect("bind baseline fenced outer SQL");
+		assert_eq!(format!("{plan:?}"), format!("{baseline_plan:?}"), "{sql}");
+		assert_eq!(trace.join_decisions, baseline_trace.join_decisions, "{sql}");
+	}
+
+	let residual = projected_dimension_preserved_outer_plan();
+	let (plan, trace) = bind_with_trace(&residual, &catalog, &config)
+		.await
+		.expect("bind armed projected-dimension outer plan");
+	let (baseline_plan, baseline_trace) = bind_with_trace(&residual, &catalog, &baseline)
+		.await
+		.expect("bind baseline projected-dimension outer plan");
+	assert_eq!(format!("{plan:?}"), format!("{baseline_plan:?}"));
+	assert_eq!(trace.join_decisions, baseline_trace.join_decisions);
+}
+
+#[tokio::test]
+async fn preserved_outer_actuator_and_receipt_table_share_gate_result() {
+	let catalog = star_join_order_catalog();
+	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+	let snapshot = config.runtime_evidence.receipt_gate_snapshot();
+	let gate = preserved_outer_ordering_gate(&snapshot, &config);
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let row = receipt_gate_row_by_name(&rows, "preserved_outer_ordering");
+
+	assert_eq!(gate.status, OptimizerReceiptGateStatus::Actionable);
+	assert_eq!(receipt_gate_utf8(row, 2), "actionable");
+	assert_eq!(
+		receipt_gate_i64(row, 3),
+		i64::try_from(gate.advisory.sample_size).unwrap()
+	);
+	assert_eq!(
+		effective_join_order_policy(&config).preserved_outer_gate,
+		gate
+	);
+}
+
+#[tokio::test]
+async fn preserved_outer_policy_uses_gate_recommended_step() {
+	let mut catalog = star_join_order_catalog();
+	seed_soft_star_join_order_facts(&mut catalog, 140_000, 100_000);
+	let logical = SqlPlanner::new()
+		.plan(preserved_outer_two_dim_sql())
+		.expect("plan margin-boundary preserved outer star");
+	let baseline = PlannerConfig {
+		join_order_soft_margin_step: SoftMarginLadderStep::Baseline,
+		join_order_soft_margin_application: JoinOrderSoftMarginApplication::ApplyAdvisory,
+		..auto_broadcast_config(64 * 1024 * 1024)
+	};
+	let armed = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let (_baseline_plan, _baseline_trace, baseline_render) =
+		bind_with_explain_trace(&logical, &catalog, &baseline)
+			.await
+			.expect("bind baseline boundary preserved outer");
+	let (_armed_plan, _armed_trace, armed_render) =
+		bind_with_explain_trace(&logical, &catalog, &armed)
+			.await
+			.expect("bind armed boundary preserved outer");
+
+	assert_eq!(
+		effective_join_order_policy(&armed)
+			.preserved_outer_gate
+			.advisory
+			.recommended_step,
+		SoftMarginLadderStep::Loose
+	);
+	assert_eq!(
+		join_order_edge_dimensions(&baseline_render),
+		vec!["c".to_string(), "p".to_string()]
+	);
+	assert_eq!(
+		join_order_edge_dimensions(&armed_render),
+		vec!["p".to_string(), "c".to_string()],
+		"using the base Baseline margin would keep declared; the gate recommended Loose step reorders"
+	);
+}
+
+#[tokio::test]
+async fn rune_preserved_outer_ordering_matches_sql() {
+	let catalog = star_join_order_catalog();
+	let sql = SqlPlanner::new()
+		.plan(preserved_outer_star_sql())
+		.expect("plan SQL preserved outer star");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM orders o LEFT JOIN customers c ON o.customer_id = c.id LEFT JOIN products p ON o.product_id = p.id LEFT JOIN stores s ON o.store_id = s.id")
+        }
+    "#,
+	)
+	.await;
+	let config = preserved_outer_actionable_config(SoftMarginLadderStep::Baseline);
+
+	let (sql_plan, sql_trace, sql_render) = bind_with_explain_trace(&sql, &catalog, &config)
+		.await
+		.expect("bind SQL actionable preserved outer");
+	let (rune_plan, rune_trace, rune_render) = bind_with_explain_trace(&rune, &catalog, &config)
+		.await
+		.expect("bind Rune actionable preserved outer");
+
+	assert_eq!(format!("{sql_plan:?}"), format!("{rune_plan:?}"));
+	assert_eq!(sql_trace.join_decisions, rune_trace.join_decisions);
+	assert_eq!(
+		join_order_edge_dimensions(&sql_render),
+		join_order_edge_dimensions(&rune_render)
 	);
 }
 
@@ -17297,6 +17632,14 @@ fn join_order_snowflake_row(rows: &[Vec<ScalarValue>]) -> &[ScalarValue] {
 		.expect("join_order_snowflake evidence row")
 }
 
+fn join_order_edge_dimensions(render: &OptimizerExplainRenderTrace) -> Vec<String> {
+	render
+		.join_order_edges
+		.iter()
+		.filter_map(|edge| edge.dimension.clone())
+		.collect()
+}
+
 fn broadcast_build_scan_ids_in_applied_order(plan: &ExecutionPlan) -> Vec<TableId> {
 	let mut top_down_build_ids = Vec::new();
 	collect_broadcast_build_scan_ids_top_down(plan, &mut top_down_build_ids);
@@ -19338,6 +19681,15 @@ async fn star_order_execution_fixture() -> (MockCatalog, Arc<InMemoryTableStorag
 	(catalog, storage)
 }
 
+async fn outer_star_order_execution_fixture() -> (MockCatalog, Arc<InMemoryTableStorage>) {
+	let catalog = hash_star_join_order_catalog();
+	let storage = Arc::new(InMemoryTableStorage::new());
+	for (table_id, descriptor, batch) in outer_star_order_storage_batches() {
+		write_star_order_table(storage.as_ref(), table_id, &descriptor, batch).await;
+	}
+	(catalog, storage)
+}
+
 async fn snowflake_order_execution_fixture() -> (MockCatalog, Arc<InMemoryTableStorage>) {
 	let mut catalog = snowflake_join_order_catalog();
 	seed_snowflake_join_order_facts(
@@ -19429,6 +19781,73 @@ fn star_order_storage_batches() -> Vec<(TableId, TableSchemaDescriptor, RecordBa
 			record_batch_i64(
 				stores.arrow_schema().expect("stores schema").into(),
 				vec![vec![1000, 2000, 3000]],
+			),
+		),
+	]
+}
+
+fn outer_star_order_storage_batches() -> Vec<(TableId, TableSchemaDescriptor, RecordBatch)> {
+	let orders = named_descriptor(
+		21,
+		"orders",
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+			Field::new("product_id", DataType::Int64, false),
+			Field::new("store_id", DataType::Int64, false),
+		]),
+	);
+	let customers = named_descriptor(
+		22,
+		"customers",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	let products = named_descriptor(
+		23,
+		"products",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	let stores = named_descriptor(
+		24,
+		"stores",
+		Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+	);
+	vec![
+		(
+			TableId(21),
+			orders.clone(),
+			record_batch_i64(
+				orders.arrow_schema().expect("orders schema").into(),
+				vec![
+					vec![1, 2, 3, 4],
+					vec![10, 99, 10, 30],
+					vec![100, 100, 999, 100],
+					vec![1000, 1000, 1000, 9999],
+				],
+			),
+		),
+		(
+			TableId(22),
+			customers.clone(),
+			record_batch_i64(
+				customers.arrow_schema().expect("customers schema").into(),
+				vec![vec![10, 10, 30]],
+			),
+		),
+		(
+			TableId(23),
+			products.clone(),
+			record_batch_i64(
+				products.arrow_schema().expect("products schema").into(),
+				vec![vec![100]],
+			),
+		),
+		(
+			TableId(24),
+			stores.clone(),
+			record_batch_i64(
+				stores.arrow_schema().expect("stores schema").into(),
+				vec![vec![1000, 1000]],
 			),
 		),
 	]
@@ -19717,6 +20136,58 @@ fn preserved_outer_star_sql() -> &'static str {
 	 LEFT JOIN customers c ON o.customer_id = c.id \
 	 LEFT JOIN products p ON o.product_id = p.id \
 	 LEFT JOIN stores s ON o.store_id = s.id"
+}
+
+fn preserved_outer_star_project_sql() -> &'static str {
+	"SELECT o.id, c.id, p.id, s.id FROM orders o \
+	 LEFT JOIN customers c ON o.customer_id = c.id \
+	 LEFT JOIN products p ON o.product_id = p.id \
+	 LEFT JOIN stores s ON o.store_id = s.id"
+}
+
+fn preserved_outer_two_dim_sql() -> &'static str {
+	"SELECT * FROM orders o \
+	 LEFT JOIN customers c ON o.customer_id = c.id \
+	 LEFT JOIN products p ON o.product_id = p.id"
+}
+
+fn projected_dimension_preserved_outer_plan() -> LogicalPlan {
+	let orders = LogicalPlan::ScanNamed {
+		table: TableRef::new("orders"),
+		projection: None,
+	};
+	let projected_customers = LogicalPlan::Project {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("customers"),
+			projection: None,
+		}),
+		exprs: vec![Expr::column("id")],
+		output_names: vec![None],
+	};
+	let products = LogicalPlan::ScanNamed {
+		table: TableRef::new("products"),
+		projection: None,
+	};
+	let orders_customers = LogicalPlan::Join {
+		left: Box::new(orders),
+		right: Box::new(projected_customers),
+		kind: JoinKind::LeftOuter,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			Expr::qualified_column(TableRef::new("customers"), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	LogicalPlan::Join {
+		left: Box::new(orders_customers),
+		right: Box::new(products),
+		kind: JoinKind::LeftOuter,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("orders"), "product_id"),
+			Expr::qualified_column(TableRef::new("products"), "id"),
+		)],
+		strategy_intent: JoinStrategyIntent::Auto,
+	}
 }
 
 fn mixed_strategy_snowflake_order_sql() -> &'static str {

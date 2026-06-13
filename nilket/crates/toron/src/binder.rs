@@ -232,7 +232,7 @@ async fn bind_with_explain_trace(
 	let binder = Binder::new(catalog, config);
 	// ADR 208: capture the bind-entry tree step before the binder is consumed so observed
 	// star/snowflake receipts render on the same margin that actuation used earlier in this bind.
-	let tree_join_order_soft_margin_step = binder.tree_join_order_soft_margin_step;
+	let tree_join_order_soft_margin_step = binder.join_order_policy.tree_step;
 	let (normalized_plan, outer_join_demotions) =
 		binder.demote_null_rejected_outer_joins(plan).await?;
 	let decision_provenance = decision_provenance_for_outer_join_demotions(&outer_join_demotions);
@@ -451,10 +451,10 @@ fn is_preserved_outer_equi_edge(edge: &JoinOrderEdgeEvidence) -> bool {
 struct Binder<'a> {
 	catalog: &'a dyn Catalog,
 	config: &'a PlannerConfig,
-	// ADR 215: family soft-margin steps resolved once at bind entry from one evidence snapshot.
-	// Tree and graph paths read these fields rather than re-snapshotting runtime evidence mid-bind.
-	tree_join_order_soft_margin_step: SoftMarginLadderStep,
-	graph_join_order_soft_margin_steps: EffectiveGraphJoinOrderSoftMarginSteps,
+	// ADR 219: all join-order policy is resolved once at bind entry. Manual mode uses the
+	// configured base without reading evidence; ApplyAdvisory derives every field from one
+	// receipt-gate snapshot.
+	join_order_policy: EffectiveJoinOrderPolicy,
 	// The sink for optimizer decisions. Normally a runtime-evidence recorder; a scratch recognition
 	// bind / declined-actuation re-bind carries a zero-size `NoOpDecisionRecorder` instead, so it cannot
 	// pollute the shared log — a structural fact, not a runtime flag.
@@ -475,12 +475,11 @@ impl<'a> Binder<'a> {
 		config: &'a PlannerConfig,
 		decision_provenance: OptimizerRuntimeVerdictProvenance,
 	) -> Self {
-		let join_order_soft_margin_steps = effective_join_order_soft_margin_steps(config);
+		let join_order_policy = effective_join_order_policy(config);
 		Self {
 			catalog,
 			config,
-			tree_join_order_soft_margin_step: join_order_soft_margin_steps.tree,
-			graph_join_order_soft_margin_steps: join_order_soft_margin_steps.graph,
+			join_order_policy,
 			decision_recorder: Arc::new(OptimizerRuntimeDecisionRecorder::new(
 				Arc::clone(&config.runtime_evidence),
 				decision_provenance,
@@ -495,8 +494,7 @@ impl<'a> Binder<'a> {
 		Binder {
 			catalog: self.catalog,
 			config: self.config,
-			tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step,
-			graph_join_order_soft_margin_steps: self.graph_join_order_soft_margin_steps,
+			join_order_policy: self.join_order_policy,
 			decision_recorder: Arc::new(OptimizerRuntimeDecisionRecorder::new(
 				Arc::clone(&self.config.runtime_evidence),
 				decision_provenance,
@@ -510,8 +508,7 @@ impl<'a> Binder<'a> {
 		Binder {
 			catalog: self.catalog,
 			config: self.config,
-			tree_join_order_soft_margin_step: self.tree_join_order_soft_margin_step,
-			graph_join_order_soft_margin_steps: self.graph_join_order_soft_margin_steps,
+			join_order_policy: self.join_order_policy,
 			decision_recorder: Arc::new(NoOpDecisionRecorder),
 		}
 	}
@@ -1279,6 +1276,16 @@ impl<'a> Binder<'a> {
 						if let GraphActuationResult::Actuated(plan) = result {
 							return Ok(plan);
 						}
+					}
+					match self
+						.try_bind_preserved_outer_star_actuation(plan, trace, render_trace)
+						.await?
+					{
+						StarOrderActuationResult::Actuated(plan) => return Ok(plan),
+						StarOrderActuationResult::NotCandidate => {}
+						StarOrderActuationResult::Declined => unreachable!(
+							"preserved-outer star actuation is verdict-only and does not decline"
+						),
 					}
 					match self
 						.try_bind_star_order_actuation(plan, trace, render_trace)
