@@ -4,8 +4,42 @@ use std::str::FromStr;
 
 use proc_macro2::{TokenStream, TokenTree};
 
-fn rust_identifiers(root: &Path, relative: &str) -> Vec<String> {
-	let source = fs::read_to_string(root.join(relative)).unwrap();
+fn read_module_concat(path: impl AsRef<std::path::Path>, include_tests: bool) -> String {
+	let path = path.as_ref();
+	let mut source = std::fs::read_to_string(path).unwrap();
+	// ADR 078: storage/manager.rs is now a module dir. Production guards exclude
+	// tests.rs; behavior-coverage guards opt into it explicitly.
+	if path.file_name().and_then(|s| s.to_str()) == Some("manager.rs")
+		&& path
+			.parent()
+			.and_then(|p| p.file_name())
+			.and_then(|s| s.to_str())
+			== Some("storage")
+	{
+		let dir = path.with_extension("");
+		if dir.is_dir() {
+			let mut subs: Vec<_> = std::fs::read_dir(&dir)
+				.unwrap()
+				.flatten()
+				.map(|e| e.path())
+				.filter(|p| {
+					p.extension().and_then(|s| s.to_str()) == Some("rs")
+						&& (include_tests
+							|| p.file_name().and_then(|s| s.to_str()) != Some("tests.rs"))
+				})
+				.collect();
+			subs.sort();
+			for p in subs {
+				source.push('\n');
+				source.push_str(&std::fs::read_to_string(p).unwrap());
+			}
+		}
+	}
+	source
+}
+
+fn rust_identifiers(root: &Path, relative: &str, include_tests: bool) -> Vec<String> {
+	let source = read_module_concat(root.join(relative), include_tests);
 	let tokens = TokenStream::from_str(&source).unwrap_or_else(|err| {
 		panic!("{relative}: Rust tokenization failed: {err}");
 	});
@@ -31,9 +65,10 @@ fn has_identifier(identifiers: &[String], ident: &str) -> bool {
 #[test]
 fn secondary_index_path_uses_encoding_page_fast_path_before_row_take() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-	let manager = rust_identifiers(root, "src/storage/manager.rs");
-	let page_materialize = rust_identifiers(root, "src/storage/encoding/page_materialize.rs");
-	let row_group = rust_identifiers(root, "src/storage/row_group.rs");
+	let manager = rust_identifiers(root, "src/storage/manager.rs", false);
+	let page_materialize =
+		rust_identifiers(root, "src/storage/encoding/page_materialize.rs", false);
+	let row_group = rust_identifiers(root, "src/storage/row_group.rs", false);
 
 	for token in [
 		"try_read_encoding_indexed_pages_from_l2",
@@ -62,11 +97,18 @@ fn secondary_index_path_uses_encoding_page_fast_path_before_row_take() {
 #[test]
 fn secondary_index_adr066_fsst_confirm_step_status_is_explicit() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-	let manager = rust_identifiers(root, "src/storage/manager.rs");
+	let manager = rust_identifiers(root, "src/storage/manager.rs", false);
+	let manager_with_tests = rust_identifiers(root, "src/storage/manager.rs", true);
 	let impl_plan = fs::read_to_string(root.join("plans/impl/066_fsst_evaluator.md")).unwrap();
 
+	assert!(
+		has_identifier(
+			&manager_with_tests,
+			"fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap"
+		),
+		"missing ADR 066 FSST confirm-step behavior test"
+	);
 	for token in [
-		"fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap",
 		"read_projected_record_from_l2",
 		"EncodingComputeEvaluatorKind",
 		"FsstWholeBuffer",

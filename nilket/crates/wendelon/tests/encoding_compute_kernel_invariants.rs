@@ -471,7 +471,7 @@ fn fsst_kernel_invariants_are_locked_to_streaming_multi_buffer_shape() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let fsst_kernel =
 		fs::read_to_string(root.join("src/storage/encoding/compute/kernels/fsst.rs")).unwrap();
-	let manager = fs::read_to_string(root.join("src/storage/manager.rs")).unwrap();
+	let manager = read_module_concat(root.join("src/storage/manager.rs"));
 	for required in [
 		"FsstDecodedByteReader",
 		"reader.skip(row_len)?",
@@ -690,4 +690,36 @@ fn i8_bytes(values: &[i8]) -> Vec<u8> {
 		.iter()
 		.flat_map(|value| value.to_le_bytes())
 		.collect()
+}
+
+fn read_module_concat(path: impl AsRef<std::path::Path>) -> String {
+	let path = path.as_ref();
+	let mut source = std::fs::read_to_string(path).unwrap();
+	// ADR 078: storage/manager.rs is now a module dir; scan root + non-test submodules.
+	if path.file_name().and_then(|s| s.to_str()) == Some("manager.rs")
+		&& path
+			.parent()
+			.and_then(|p| p.file_name())
+			.and_then(|s| s.to_str())
+			== Some("storage")
+	{
+		let dir = path.with_extension("");
+		if dir.is_dir() {
+			let mut subs: Vec<_> = std::fs::read_dir(&dir)
+				.unwrap()
+				.flatten()
+				.map(|e| e.path())
+				.filter(|p| {
+					p.extension().and_then(|s| s.to_str()) == Some("rs")
+						&& p.file_name().and_then(|s| s.to_str()) != Some("tests.rs")
+				})
+				.collect();
+			subs.sort();
+			for p in subs {
+				source.push('\n');
+				source.push_str(&std::fs::read_to_string(p).unwrap());
+			}
+		}
+	}
+	source
 }

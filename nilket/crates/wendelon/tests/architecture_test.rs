@@ -83,6 +83,39 @@ fn data_server_source(manifest_dir: &Path) -> String {
 		.join("\n")
 }
 
+/// ADR 078: storage/manager.rs decomposed into storage/manager/{islands + tests.rs}.
+/// Production source-scan guards read the root plus every NON-TEST submodule (tests.rs
+/// excluded — not production source), mirroring data_server_source_files().
+fn manager_source_files(manifest_dir: &Path) -> Vec<PathBuf> {
+	let mut files = Vec::new();
+	let root = manifest_dir.join("src/storage/manager.rs");
+	if root.is_file() {
+		files.push(root);
+	}
+	let dir = manifest_dir.join("src/storage/manager");
+	if dir.is_dir() {
+		let mut submodules = Vec::new();
+		walk_dir(&dir, &mut |path| {
+			let is_rs = path.extension().and_then(|s| s.to_str()) == Some("rs");
+			let is_tests = path.file_name().and_then(|s| s.to_str()) == Some("tests.rs");
+			if is_rs && !is_tests {
+				submodules.push(path.to_path_buf());
+			}
+		});
+		submodules.sort();
+		files.extend(submodules);
+	}
+	files
+}
+
+fn manager_source(manifest_dir: &Path) -> String {
+	manager_source_files(manifest_dir)
+		.iter()
+		.map(|path| fs::read_to_string(path).unwrap())
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
 #[test]
 fn test_adr039_wendelon_drop_migration_substrate_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -93,7 +126,7 @@ fn test_adr039_wendelon_drop_migration_substrate_guards() {
 	let control_server =
 		fs::read_to_string(manifest_dir.join("src/network/control_server.rs")).unwrap();
 	let data_server = data_server_source(manifest_dir.as_ref());
-	let storage_manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let storage_manager = manager_source(manifest_dir);
 	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
 	let table_schema = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
 	let lifecycle = fs::read_to_string(manifest_dir.join("src/schema/lifecycle.rs")).unwrap();
@@ -169,7 +202,7 @@ fn test_adr055_lsm_compaction_substrate_guards() {
 		fs::read_to_string(manifest_dir.join("src/storage/manifest.rs")).unwrap();
 	let storage_worker =
 		fs::read_to_string(manifest_dir.join("src/storage/lsm_worker.rs")).unwrap();
-	let storage_manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let storage_manager = manager_source(manifest_dir);
 	let storage_index = fs::read_to_string(manifest_dir.join("src/storage/index.rs")).unwrap();
 	let slab_pins = fs::read_to_string(manifest_dir.join("src/storage/slab_pins.rs")).unwrap();
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
@@ -985,7 +1018,7 @@ fn test_adr043_storage_compression_surfaces_are_centralized() {
 	assert!(dump_slab_record.contains("strip_storage_synthetic_columns"));
 	assert!(dump_slab_record.contains("user_visible_preview"));
 
-	let storage_manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let storage_manager = manager_source(manifest_dir);
 	assert!(
 		storage_manager.contains(
 			"pub(crate) async fn refresh_storage_compression_uncompressed_resident_bytes"
@@ -1189,11 +1222,7 @@ fn test_adr045_append_only_invariants() {
 	let mut violations = Vec::new();
 
 	// Compactor source must not call the append-only identity helper.
-	let compactor_paths = [
-		"src/storage/sweeper.rs",
-		"src/storage/multirow.rs",
-		"src/storage/manager.rs",
-	];
+	let compactor_paths = ["src/storage/sweeper.rs", "src/storage/multirow.rs"];
 	for relative in compactor_paths {
 		let path = manifest_dir.join(relative);
 		let content = match fs::read_to_string(&path) {
@@ -1206,6 +1235,15 @@ fn test_adr045_append_only_invariants() {
 				identities for existing rows"
 			));
 		}
+	}
+	// ADR 078: the manager compactor code is now spread across storage/manager/**;
+	// scan the whole decomposed manager source, not just the root file.
+	if manager_source(manifest_dir).contains("synthesize_append_only_row_id") {
+		violations.push(
+			"src/storage/manager.rs: compactor / multirow source must not synthesize \
+			append-only identities for existing rows"
+				.to_string(),
+		);
 	}
 
 	// Retracted V1 counter symbols must not appear anywhere.
@@ -1312,15 +1350,16 @@ fn test_adr045_append_only_invariants() {
 			// `stored_table_object_id == Some(descriptor.table_object_id)`.
 			// Re-introducing the schema-only acceptance regresses
 			// to that bug.
+			let parent_dir = path
+				.parent()
+				.and_then(|parent| parent.file_name())
+				.and_then(|name| name.to_str());
 			let is_matcher_file = path
 				.file_name()
 				.and_then(|name| name.to_str())
 				.is_some_and(|name| name == "manager.rs")
-				|| path
-					.parent()
-					.and_then(|parent| parent.file_name())
-					.and_then(|name| name.to_str())
-					== Some("data_server");
+				|| parent_dir == Some("data_server")
+				|| parent_dir == Some("manager");
 			if is_matcher_file
 				&& content.contains("RowIdentityPolicy::AppendOnly => {")
 				&& !content.contains("descriptor.table_object_id")
@@ -1815,7 +1854,7 @@ fn test_adr050_pk_delete_supersession_boundaries() {
 		);
 	}
 
-	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager_source = manager_source(manifest_dir);
 	for needle in [
 		"row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref()",
 		"tombstone_metadata: merge_row_tombstone_metadata(",
@@ -2002,15 +2041,18 @@ fn test_adr051_descriptor_fingerprint_split_boundaries() {
 		);
 	}
 
-	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager_source = manager_source(manifest_dir);
 	let tiered_stats_cache_key_block = manager_source
 		.split_once("struct TieredStatsCacheKey {")
 		.and_then(|(_, rest)| rest.split_once("\n}"))
 		.map(|(block, _)| block)
 		.unwrap_or("");
+	// ADR 078: tiered_stats_cache_key moved to the stats_facts island; end the region
+	// at the function's own closing brace, not a downstream derive marker whose position
+	// shifted under module concatenation.
 	let tiered_stats_cache_key_builder = manager_source
 		.split_once("fn tiered_stats_cache_key(")
-		.and_then(|(_, rest)| rest.split_once("\n#[derive(Clone, Debug, Default, PartialEq, Eq)]"))
+		.and_then(|(_, rest)| rest.split_once("\n}"))
 		.map(|(block, _)| block)
 		.unwrap_or("");
 	let tiered_stats_cache_key_surface =
@@ -2357,7 +2399,7 @@ fn test_adr052_secondary_index_architecture_guards() {
 		}
 	}
 
-	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager_source = manager_source(manifest_dir);
 	for required in [
 		"gc_secondary_index_segments_for_dropping_index",
 		"CorruptSegment",
@@ -3216,7 +3258,7 @@ fn test_adr056_row_group_fetch_guards() {
 	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
 	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
 	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
 	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
 	let data_server = data_server_source(manifest_dir.as_ref());
@@ -3592,7 +3634,7 @@ fn test_adr057_encoding_guards() {
 	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
 	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
 	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
 	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
@@ -4022,7 +4064,7 @@ fn test_adr058_encoding_compute_guards() {
 	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
 	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
 	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
 	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
 	let data_server = data_server_source(manifest_dir.as_ref());
@@ -4340,7 +4382,7 @@ fn test_adr059_native_cocd_kernel_guards() {
 			.unwrap();
 	let mask =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/mask.rs")).unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let bench = fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
 	let bench_artifact = fs::read_to_string(
 		manifest_dir.join("plans/impl/059_native_cocd_kernels_bench_results.md"),
@@ -4581,7 +4623,7 @@ fn test_adr066_fsst_evaluator_guards() {
 	let fsst_kernel =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/fsst.rs"))
 			.unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
 	let encoding_types =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
@@ -4697,7 +4739,7 @@ fn test_adr067_row_safe_fsst_guards() {
 	let fsst_kernel =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/fsst.rs"))
 			.unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
 	let encoding_compute_bench =
 		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
@@ -5070,7 +5112,7 @@ fn test_adr069_encoded_validity_sparse_projection_guards() {
 	let sparse_projection =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/sparse_projection_fetch.rs"))
 			.unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
 	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
@@ -5354,7 +5396,7 @@ fn test_adr070_all_null_page_skip_sparse_projection_guards() {
 			.unwrap();
 	let page_materialize =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/page_materialize.rs")).unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let row_group_bench =
 		fs::read_to_string(manifest_dir.join("benches/row_group_fetch.rs")).unwrap();
 	let encoding_types =
@@ -5544,7 +5586,7 @@ fn test_adr060_sparse_projection_fetch_guards() {
 	let sparse_projection =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/sparse_projection_fetch.rs"))
 			.unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
 	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
 	let encoding_types =
@@ -5715,7 +5757,7 @@ fn test_adr061_authenticated_chunk_layout_guards() {
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/chunk_layout.rs")).unwrap();
 	let directory =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
 	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
 	let macro_block_test =
@@ -5888,7 +5930,7 @@ fn test_adr063_page_level_predicate_stats_guards() {
 	let predicate_page_fetch =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/predicate_page_fetch.rs"))
 			.unwrap();
-	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let manager = manager_source(manifest_dir);
 
 	for required in [
 		"impl_unit!(PageNullCount, u32)",
@@ -8375,5 +8417,212 @@ fn adr077_no_v1_scope_heading() {
 			.unwrap()
 			.contains("## Scope and simplifications"),
 		"the renamed scope heading must be present in the root"
+	);
+}
+
+// ============================================================
+//  ADR 078 — slab-manager module decomposition
+// ============================================================
+
+/// The production source-scan surface is the root plus exactly the carved
+/// subsystem islands (sorted), `tests.rs` excluded. Pins the file manifest and
+/// proves the concatenation spans islands (symbols from three different islands
+/// are all present).
+#[test]
+fn adr078_manager_source_concatenates_submodules() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let basenames: Vec<String> = manager_source_files(manifest_dir)
+		.iter()
+		.map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+		.collect();
+	assert_eq!(
+		basenames,
+		vec![
+			"manager.rs",
+			"compaction.rs",
+			"encoding_compute.rs",
+			"lsm_driver.rs",
+			"retention_reclaim.rs",
+			"secondary_index_segments.rs",
+			"stats_facts.rs",
+			"tiered_io.rs",
+		],
+		"ADR 078 production source manifest changed; update this guard deliberately \
+		 (tests.rs is excluded — it is not production source)"
+	);
+	let source = manager_source(manifest_dir);
+	for symbol in [
+		"enum TieredStatsContributor",      // stats_facts.rs
+		"struct EncodingComputePhaseBPlan", // encoding_compute.rs
+		"struct CompactionRecord",          // compaction.rs
+	] {
+		assert!(
+			source.contains(symbol),
+			"manager_source concatenation is missing a carved symbol: {symbol}"
+		);
+	}
+	let arch = read_workspace("crates/wendelon/tests/architecture_test.rs");
+	assert!(
+		arch.contains("manager_source("),
+		"source-scan guards must read the manager via the concatenation helper"
+	);
+}
+
+/// Each named subsystem island exists as a file and is declared in the root.
+#[test]
+fn adr078_semantic_modules_exist() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	for module in [
+		"stats_facts",
+		"encoding_compute",
+		"tiered_io",
+		"lsm_driver",
+		"compaction",
+		"retention_reclaim",
+		"secondary_index_segments",
+	] {
+		let path = manifest_dir.join(format!("src/storage/manager/{module}.rs"));
+		assert!(path.is_file(), "ADR 078 island missing: {module}.rs");
+		assert!(
+			root.contains(&format!("mod {module};")),
+			"ADR 078 island not declared in root: mod {module};"
+		);
+	}
+}
+
+/// The `SlabManager` struct, its public config/report surface, and construction
+/// stay in the root; carved subsystem method *definitions* do not.
+#[test]
+fn adr078_slab_manager_public_surface_stays_in_root() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	assert!(
+		root.contains("pub struct SlabManager {"),
+		"the SlabManager struct must stay in the root module"
+	);
+	for surface in [
+		"pub struct SlabManagerConfig",
+		"pub struct TombstoneCompactionReport",
+		"pub struct RetentionPruningReport",
+	] {
+		assert!(
+			root.contains(surface),
+			"the public surface type must stay in the root: {surface}"
+		);
+	}
+	assert!(
+		root.contains("pub use secondary_index_segments::SecondaryIndexSegmentInfo;"),
+		"moved public island type must preserve the pre-split manager::SecondaryIndexSegmentInfo path"
+	);
+	for crate_visible in [
+		"EncodedAggregateL2RecordRead",
+		"EncodingMaterializeAuditSample",
+		"ProjectedL2RecordRead",
+	] {
+		assert!(
+			root.contains(crate_visible) && root.contains("pub(crate) use encoding_compute::{"),
+			"moved crate-visible encoding type must preserve the pre-split manager::{crate_visible} path"
+		);
+	}
+	assert!(
+		root.contains("async fn open("),
+		"construction (open) must stay in the root module"
+	);
+	assert!(
+		!root.contains("fn compact_one_sealed_slab"),
+		"a carved subsystem method definition leaked back into the root"
+	);
+	let source = manager_source(manifest_dir);
+	assert!(
+		source.contains("fn compact_one_sealed_slab"),
+		"carved subsystem method not found anywhere in the decomposition"
+	);
+}
+
+/// The root is bounded. Set from the post-carve size plus modest headroom;
+/// ratchet DOWN in the deferred deeper-helper-relocation follow-on (ADR 078 D5).
+#[test]
+fn adr078_root_is_bounded() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let lines = root.lines().count();
+	assert!(
+		lines <= 4_500,
+		"manager.rs root is {lines} lines (cap 4_500); carve more or justify a deliberate cap bump"
+	);
+}
+
+/// The inline `#[cfg(test)] mod tests` block was extracted to its own file.
+#[test]
+fn adr078_tests_extracted() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	assert!(
+		root.contains("#[cfg(test)]\nmod tests;"),
+		"root must declare the extracted tests module, not inline it"
+	);
+	let tests = manifest_dir.join("src/storage/manager/tests.rs");
+	assert!(tests.is_file(), "manager/tests.rs must exist");
+	let body = fs::read_to_string(&tests).unwrap();
+	assert!(
+		body.contains("use super::*;") && body.contains("async fn"),
+		"tests.rs must be the extracted test body (use super::*; + test fns)"
+	);
+	assert!(
+		!body.contains("V1 sparse projection"),
+		"retired milestone prose must not reappear in the extracted tests"
+	);
+	assert!(
+		body.contains("Sparse projection fetch consumes"),
+		"the de-versioned sparse projection comment must remain referent-named"
+	);
+}
+
+/// Cardinal-risk guard: this is a move-only decomposition. While the cut is in
+/// flight, no production source file *outside* `storage/manager/**` may be dirty
+/// — no on-disk slab/manifest format, encoding, crypto, wire, or other
+/// production edit rides this cut. (Clean tree after commit: passes, as with the
+/// ADR 076/077 precedent — a development-time tripwire.)
+#[test]
+fn adr078_no_storage_wire_or_runtime_surface_change() {
+	let output = std::process::Command::new("git")
+		.args(["status", "--short"])
+		.current_dir(workspace_root())
+		.output()
+		.expect("git status should run");
+	assert!(output.status.success(), "git status failed");
+	let stdout = String::from_utf8(output.stdout).expect("git status should be utf8");
+	for line in stdout.lines() {
+		if line.len() < 4 {
+			continue;
+		}
+		let path = line[3..].rsplit(" -> ").next().unwrap_or(&line[3..]).trim();
+		let is_production_source =
+			path.starts_with("crates/") && path.contains("/src/") && path.ends_with(".rs");
+		let is_manager_decomposition_source = path == "crates/wendelon/src/storage/manager.rs"
+			|| path.starts_with("crates/wendelon/src/storage/manager/");
+		if is_production_source {
+			assert!(
+				is_manager_decomposition_source,
+				"ADR 078 is move-only; a production source file outside \
+				 storage/manager/** is dirty: {path}"
+			);
+		}
+	}
+}
+
+/// The module root is a sibling file `storage/manager.rs`, never
+/// `storage/manager/mod.rs` (mod.rs is manifests-only in this crate).
+#[test]
+fn adr078_no_mod_rs_root() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	assert!(
+		manifest_dir.join("src/storage/manager.rs").is_file(),
+		"the module root must be the sibling file storage/manager.rs"
+	);
+	assert!(
+		!manifest_dir.join("src/storage/manager/mod.rs").exists(),
+		"storage/manager/mod.rs must not exist (mod.rs is manifests-only)"
 	);
 }

@@ -1,11 +1,42 @@
-use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 
 use proc_macro2::{TokenStream, TokenTree};
 
+fn read_module_concat(path: impl AsRef<std::path::Path>) -> String {
+	let path = path.as_ref();
+	let mut source = std::fs::read_to_string(path).unwrap();
+	// ADR 078: storage/manager.rs is now a module dir; scan root + non-test submodules.
+	if path.file_name().and_then(|s| s.to_str()) == Some("manager.rs")
+		&& path
+			.parent()
+			.and_then(|p| p.file_name())
+			.and_then(|s| s.to_str())
+			== Some("storage")
+	{
+		let dir = path.with_extension("");
+		if dir.is_dir() {
+			let mut subs: Vec<_> = std::fs::read_dir(&dir)
+				.unwrap()
+				.flatten()
+				.map(|e| e.path())
+				.filter(|p| {
+					p.extension().and_then(|s| s.to_str()) == Some("rs")
+						&& p.file_name().and_then(|s| s.to_str()) != Some("tests.rs")
+				})
+				.collect();
+			subs.sort();
+			for p in subs {
+				source.push('\n');
+				source.push_str(&std::fs::read_to_string(p).unwrap());
+			}
+		}
+	}
+	source
+}
+
 fn rust_identifiers(root: &Path, relative: &str) -> Vec<String> {
-	let source = fs::read_to_string(root.join(relative)).unwrap();
+	let source = read_module_concat(root.join(relative));
 	let tokens = TokenStream::from_str(&source).unwrap_or_else(|err| {
 		panic!("{relative}: Rust tokenization failed: {err}");
 	});

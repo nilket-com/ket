@@ -1,14 +1,54 @@
 use std::collections::BTreeSet;
-use std::fs;
 use syn::{ImplItem, Item};
 
-fn parse_rust_file(path: &str) -> syn::File {
-	let source = fs::read_to_string(path).unwrap();
+fn read_module_concat(path: impl AsRef<std::path::Path>, include_tests: bool) -> String {
+	let path = path.as_ref();
+	let mut source = std::fs::read_to_string(path).unwrap();
+	// ADR 078: storage/manager.rs is now a module dir. Production guards exclude
+	// tests.rs; behavior-coverage guards opt into it explicitly.
+	if path.file_name().and_then(|s| s.to_str()) == Some("manager.rs")
+		&& path
+			.parent()
+			.and_then(|p| p.file_name())
+			.and_then(|s| s.to_str())
+			== Some("storage")
+	{
+		let dir = path.with_extension("");
+		if dir.is_dir() {
+			let mut subs: Vec<_> = std::fs::read_dir(&dir)
+				.unwrap()
+				.flatten()
+				.map(|e| e.path())
+				.filter(|p| {
+					p.extension().and_then(|s| s.to_str()) == Some("rs")
+						&& (include_tests
+							|| p.file_name().and_then(|s| s.to_str()) != Some("tests.rs"))
+				})
+				.collect();
+			subs.sort();
+			for p in subs {
+				source.push('\n');
+				source.push_str(&std::fs::read_to_string(p).unwrap());
+			}
+		}
+	}
+	source
+}
+
+fn parse_rust_file(path: &str, include_tests: bool) -> syn::File {
+	let source = read_module_concat(path, include_tests);
 	syn::parse_file(&source).unwrap_or_else(|err| panic!("failed to parse {path}: {err}"))
 }
 
 fn function_names(path: &str) -> BTreeSet<String> {
-	let file = parse_rust_file(path);
+	let file = parse_rust_file(path, false);
+	let mut names = BTreeSet::new();
+	collect_function_names(&file.items, &mut names);
+	names
+}
+
+fn function_names_with_tests(path: &str) -> BTreeSet<String> {
+	let file = parse_rust_file(path, true);
 	let mut names = BTreeSet::new();
 	collect_function_names(&file.items, &mut names);
 	names
@@ -38,7 +78,7 @@ fn collect_function_names(items: &[Item], names: &mut BTreeSet<String>) {
 }
 
 fn enum_variants(path: &str, enum_name: &str) -> BTreeSet<String> {
-	let file = parse_rust_file(path);
+	let file = parse_rust_file(path, false);
 	let mut variants = BTreeSet::new();
 	collect_enum_variants(&file.items, enum_name, &mut variants);
 	variants
@@ -65,6 +105,7 @@ fn collect_enum_variants(items: &[Item], enum_name: &str, variants: &mut BTreeSe
 #[test]
 fn lsm_secondary_index_compaction_path_has_behavioral_guards() {
 	let manager_functions = function_names("src/storage/manager.rs");
+	let manager_functions_with_tests = function_names_with_tests("src/storage/manager.rs");
 
 	for required in [
 		"prepare_lsm_secondary_index_segments_for_compaction",
@@ -83,7 +124,7 @@ fn lsm_secondary_index_compaction_path_has_behavioral_guards() {
 		"lsm_compaction_rejects_secondary_index_sidecar_without_catalog_context",
 	] {
 		assert!(
-			manager_functions.contains(required),
+			manager_functions_with_tests.contains(required),
 			"src/storage/manager.rs missing secondary-index behavior test {required}"
 		);
 	}
