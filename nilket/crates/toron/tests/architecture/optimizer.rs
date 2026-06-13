@@ -1779,8 +1779,7 @@ pub(crate) fn adr144_range_facts_are_descriptor_sidecars() {
 pub(crate) fn adr144_default_stats_policy_remains_empty() {
 	let table = std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/table.rs"))
 		.expect("read Wendelon table schema");
-	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read Wendelon slab manager");
+	let manager = wendelon_storage_manager_source();
 
 	assert!(table.contains("stats_policy: ColumnStatsPolicy::default()"));
 	assert!(manager.contains("range_fact_with_empty_stats_policy_is_produced_from_min_max"));
@@ -1911,8 +1910,7 @@ pub(crate) fn adr144_no_kll_quantile_optimizer_fact() {
 
 #[test]
 pub(crate) fn adr144_range_producer_reuses_full_coverage_and_truncation_fence() {
-	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read Wendelon slab manager");
+	let manager = wendelon_storage_manager_source();
 	let table_facts = source_block(&manager, "pub async fn table_optimizer_facts");
 	let range_fact = source_block(&manager, "fn range_fact_for_column");
 
@@ -1938,8 +1936,7 @@ pub(crate) fn adr147_float_range_facts_are_finite_and_estimate_channel_only() {
 	let storage_stats =
 		std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/stats.rs"))
 			.expect("read Wendelon storage stats");
-	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read Wendelon slab manager");
+	let manager = wendelon_storage_manager_source();
 	let client = std::fs::read_to_string(
 		wendelon_manifest_dir()
 			.join("crates")
@@ -2079,8 +2076,7 @@ pub(crate) fn adr148_in_list_ndv_selectivity_is_consumer_only_and_estimate_chann
 
 #[test]
 pub(crate) fn adr142_ndv_requires_full_contributor_coverage() {
-	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read Wendelon slab manager");
+	let manager = wendelon_storage_manager_source();
 	let facts = source_block(&manager, "pub async fn table_optimizer_facts");
 	let local = source_block(&manager, "async fn has_uncovered_local_rows_for_descriptor");
 	let tiered = source_block(&manager, "async fn load_tiered_optimizer_stats_contributor");
@@ -2094,8 +2090,7 @@ pub(crate) fn adr142_ndv_requires_full_contributor_coverage() {
 
 #[test]
 pub(crate) fn adr142_hll_merge_uses_registers_not_estimate_scalars() {
-	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read Wendelon slab manager");
+	let manager = wendelon_storage_manager_source();
 	let helper = source_block(&manager, "fn ndv_fact_for_column");
 
 	assert!(helper.contains("HllRegisters::from_registers"));
@@ -2411,8 +2406,7 @@ pub(crate) fn adr146_hard_row_bounds_are_optimizer_facts_not_descriptor_metadata
 
 #[test]
 pub(crate) fn adr146_row_bound_producer_is_coverage_proven_and_candidate_independent() {
-	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read Wendelon slab manager");
+	let manager = wendelon_storage_manager_source();
 	let table_facts = source_block(&manager, "pub async fn table_optimizer_facts");
 
 	assert!(table_facts.contains("has_uncovered_local_rows_for_descriptor"));
@@ -2463,8 +2457,7 @@ pub(crate) fn adr146_hard_row_bound_drives_estimates_without_scan_elision() {
 
 #[test]
 pub(crate) fn adr146_no_compressed_bytes_or_descriptor_counts_as_hard_fact_source() {
-	let manager = std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read Wendelon slab manager");
+	let manager = wendelon_storage_manager_source();
 	let wendelon_facts = std::fs::read_to_string(
 		wendelon_manifest_dir()
 			.join("src")

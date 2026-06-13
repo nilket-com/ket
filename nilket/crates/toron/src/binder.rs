@@ -80,7 +80,7 @@ pub use self::join::join_schema;
 pub use self::join_order::SoftMarginLadderStep;
 pub use self::runtime_evidence::{DurableEvidenceBinding, OptimizerRuntimeEvidence};
 pub(crate) use self::runtime_evidence::{
-	OptimizerEvidenceStatusSnapshot, OptimizerRuntimeDecisionRecorder,
+	OptimizerEvidenceStatusSnapshot, OptimizerReceiptGateSnapshot, OptimizerRuntimeDecisionRecorder,
 };
 
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
@@ -102,6 +102,8 @@ const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS: &str =
 	"information_schema.optimizer_runtime_verdicts";
 const INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY: &str =
 	"information_schema.optimizer_margin_advisory";
+const INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES: &str =
+	"information_schema.optimizer_receipt_gates";
 const INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS: &str =
 	"information_schema.optimizer_evidence_status";
 const INFORMATION_SCHEMA_LOGICAL_TYPES_TABLE: &str = "logical_types";
@@ -111,6 +113,7 @@ const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "schemata";
 const INFORMATION_SCHEMA_OPTIMIZER_DECISIONS_TABLE: &str = "optimizer_decisions";
 const INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS_TABLE: &str = "optimizer_runtime_verdicts";
 const INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY_TABLE: &str = "optimizer_margin_advisory";
+const INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES_TABLE: &str = "optimizer_receipt_gates";
 const INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS_TABLE: &str = "optimizer_evidence_status";
 const ARROW_BUFFER_ALIGNMENT_BYTES: u64 = 64;
 const DEFAULT_UTF8_BINARY_PAYLOAD_BYTES: u64 = 256;
@@ -2015,6 +2018,18 @@ impl<'a> Binder<'a> {
 		}
 		if table
 			.table
+			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES_TABLE)
+		{
+			let rows = optimizer_receipt_gate_rows(self.config);
+			return system_table_plan(
+				SystemTableKind::InformationSchemaOptimizerReceiptGates,
+				information_schema_optimizer_receipt_gates_schema(),
+				information_schema_optimizer_receipt_gate_rows(&rows)?,
+				projection,
+			);
+		}
+		if table
+			.table
 			.eq_ignore_ascii_case(INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS_TABLE)
 		{
 			return system_table_plan(
@@ -2028,7 +2043,7 @@ impl<'a> Binder<'a> {
 		}
 		Err(BindingError::UnsupportedExpression {
 			message: format!(
-				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY}, {INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS}",
+				"unknown information_schema relation: {}; supported relations are {INFORMATION_SCHEMA_LOGICAL_TYPES}, {INFORMATION_SCHEMA_TABLES}, {INFORMATION_SCHEMA_COLUMNS}, {INFORMATION_SCHEMA_SCHEMATA}, {INFORMATION_SCHEMA_OPTIMIZER_DECISIONS}, {INFORMATION_SCHEMA_OPTIMIZER_RUNTIME_VERDICTS}, {INFORMATION_SCHEMA_OPTIMIZER_MARGIN_ADVISORY}, {INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES}, {INFORMATION_SCHEMA_OPTIMIZER_EVIDENCE_STATUS}",
 				table_name(table)
 			),
 		})

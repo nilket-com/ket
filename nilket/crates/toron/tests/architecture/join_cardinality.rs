@@ -24,8 +24,7 @@ fn wendelon_schema_table_source() -> String {
 }
 
 fn wendelon_storage_manager_source() -> String {
-	std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read wendelon storage manager source")
+	super::support::wendelon_storage_manager_source()
 }
 
 fn wendelon_storage_stats_source() -> String {

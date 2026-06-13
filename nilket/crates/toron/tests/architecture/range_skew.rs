@@ -19,8 +19,7 @@ fn wendelon_optimizer_facts_source() -> String {
 }
 
 fn wendelon_manager_source() -> String {
-	std::fs::read_to_string(wendelon_manifest_dir().join("src/storage/manager.rs"))
-		.expect("read Wendelon storage manager source")
+	wendelon_storage_manager_source()
 }
 
 fn wendelon_sketch_source() -> String {

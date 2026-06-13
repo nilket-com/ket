@@ -66,6 +66,13 @@ pub struct OptimizerEvidenceStatusSnapshot {
 	pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptimizerReceiptGateSnapshot {
+	pub(crate) verdicts: Vec<OptimizerRuntimeVerdictRow>,
+	pub(crate) decisions: Vec<OptimizerDecisionRow>,
+	pub(crate) health: OptimizerEvidenceStatusSnapshot,
+}
+
 #[derive(Clone)]
 pub struct DurableEvidenceBinding {
 	client: Arc<Client>,
@@ -221,117 +228,25 @@ impl OptimizerRuntimeEvidence {
 
 	pub(crate) fn verdict_snapshot(&self) -> Vec<OptimizerRuntimeVerdictRow> {
 		let state = self.state.lock().expect("optimizer runtime evidence");
-		let mut counts = state.durable_cache.clone();
-		for (key, count) in state.pending.iter().chain(state.in_flight.iter()) {
-			let entry = counts.entry(*key).or_insert(0);
-			*entry = entry.saturating_add(*count);
-		}
-		let mut rows = Vec::new();
-		for kind in runtime_evidence_decision_kinds() {
-			for verdict in verdict_classes() {
-				let total = counts
-					.get(&OptimizerRuntimeVerdictKey {
-						kind,
-						verdict,
-						lane: OptimizerRuntimeEvidenceLane::Total,
-					})
-					.copied()
-					.unwrap_or(0);
-				let demoted = counts
-					.get(&OptimizerRuntimeVerdictKey {
-						kind,
-						verdict,
-						lane: OptimizerRuntimeEvidenceLane::Demoted,
-					})
-					.copied()
-					.unwrap_or(0);
-				let native = total.saturating_sub(demoted);
-				if native > 0 {
-					rows.push(OptimizerRuntimeVerdictRow {
-						kind,
-						verdict,
-						provenance: OptimizerRuntimeVerdictProvenance::Native,
-						count: native,
-					});
-				}
-				if demoted > 0 {
-					rows.push(OptimizerRuntimeVerdictRow {
-						kind,
-						verdict,
-						provenance: OptimizerRuntimeVerdictProvenance::Demoted,
-						count: demoted,
-					});
-				}
-			}
-		}
-		rows
+		verdict_rows_from_state(&state)
 	}
 
 	pub(crate) fn decision_snapshot(&self) -> Vec<OptimizerDecisionRow> {
 		let state = self.state.lock().expect("optimizer runtime evidence");
-		let mut counts = state.decision_durable_cache.clone();
-		for (key, count) in state
-			.decision_pending
-			.iter()
-			.chain(state.decision_in_flight.iter())
-		{
-			let entry = counts.entry(*key).or_insert(0);
-			*entry = entry.saturating_add(*count);
-		}
-		let mut rows = Vec::new();
-		for kind in decision_recording_kinds() {
-			for outcome in optimizer_decision_outcomes() {
-				let total = counts
-					.get(&OptimizerRuntimeDecisionKey {
-						kind,
-						outcome,
-						lane: OptimizerRuntimeEvidenceLane::Total,
-					})
-					.copied()
-					.unwrap_or(0);
-				let demoted = counts
-					.get(&OptimizerRuntimeDecisionKey {
-						kind,
-						outcome,
-						lane: OptimizerRuntimeEvidenceLane::Demoted,
-					})
-					.copied()
-					.unwrap_or(0);
-				let native = total.saturating_sub(demoted);
-				if native > 0 {
-					rows.push(OptimizerDecisionRow {
-						kind,
-						outcome,
-						provenance: OptimizerRuntimeVerdictProvenance::Native,
-						count: native,
-					});
-				}
-				if demoted > 0 {
-					rows.push(OptimizerDecisionRow {
-						kind,
-						outcome,
-						provenance: OptimizerRuntimeVerdictProvenance::Demoted,
-						count: demoted,
-					});
-				}
-			}
-		}
-		rows
+		decision_rows_from_state(&state)
 	}
 
 	pub(crate) fn status_snapshot(&self) -> OptimizerEvidenceStatusSnapshot {
 		let state = self.state.lock().expect("optimizer runtime evidence");
-		OptimizerEvidenceStatusSnapshot {
-			mode: state.mode,
-			state: state.state,
-			pending_deltas: sum_counts(&state.pending)
-				.saturating_add(sum_counts(&state.in_flight))
-				.saturating_add(sum_counts(&state.decision_pending))
-				.saturating_add(sum_counts(&state.decision_in_flight)),
-			dropped_deltas: state.dropped_deltas,
-			ambiguous_deltas: state.ambiguous_deltas,
-			refresh_failures: state.refresh_failures,
-			last_error: state.last_error.clone(),
+		status_snapshot_from_state(&state)
+	}
+
+	pub(crate) fn receipt_gate_snapshot(&self) -> OptimizerReceiptGateSnapshot {
+		let state = self.state.lock().expect("optimizer runtime evidence");
+		OptimizerReceiptGateSnapshot {
+			verdicts: verdict_rows_from_state(&state),
+			decisions: decision_rows_from_state(&state),
+			health: status_snapshot_from_state(&state),
 		}
 	}
 
@@ -754,6 +669,119 @@ pub(crate) fn all_decision_counter_keys() -> Vec<(OptimizerRuntimeDecisionKey, V
 	keys
 }
 
+fn verdict_rows_from_state(state: &RuntimeEvidenceState) -> Vec<OptimizerRuntimeVerdictRow> {
+	let mut counts = state.durable_cache.clone();
+	for (key, count) in state.pending.iter().chain(state.in_flight.iter()) {
+		let entry = counts.entry(*key).or_insert(0);
+		*entry = entry.saturating_add(*count);
+	}
+	let mut rows = Vec::new();
+	for kind in runtime_evidence_decision_kinds() {
+		for verdict in verdict_classes() {
+			let total = counts
+				.get(&OptimizerRuntimeVerdictKey {
+					kind,
+					verdict,
+					lane: OptimizerRuntimeEvidenceLane::Total,
+				})
+				.copied()
+				.unwrap_or(0);
+			let demoted = counts
+				.get(&OptimizerRuntimeVerdictKey {
+					kind,
+					verdict,
+					lane: OptimizerRuntimeEvidenceLane::Demoted,
+				})
+				.copied()
+				.unwrap_or(0);
+			let native = total.saturating_sub(demoted);
+			if native > 0 {
+				rows.push(OptimizerRuntimeVerdictRow {
+					kind,
+					verdict,
+					provenance: OptimizerRuntimeVerdictProvenance::Native,
+					count: native,
+				});
+			}
+			if demoted > 0 {
+				rows.push(OptimizerRuntimeVerdictRow {
+					kind,
+					verdict,
+					provenance: OptimizerRuntimeVerdictProvenance::Demoted,
+					count: demoted,
+				});
+			}
+		}
+	}
+	rows
+}
+
+fn decision_rows_from_state(state: &RuntimeEvidenceState) -> Vec<OptimizerDecisionRow> {
+	let mut counts = state.decision_durable_cache.clone();
+	for (key, count) in state
+		.decision_pending
+		.iter()
+		.chain(state.decision_in_flight.iter())
+	{
+		let entry = counts.entry(*key).or_insert(0);
+		*entry = entry.saturating_add(*count);
+	}
+	let mut rows = Vec::new();
+	for kind in decision_recording_kinds() {
+		for outcome in optimizer_decision_outcomes() {
+			let total = counts
+				.get(&OptimizerRuntimeDecisionKey {
+					kind,
+					outcome,
+					lane: OptimizerRuntimeEvidenceLane::Total,
+				})
+				.copied()
+				.unwrap_or(0);
+			let demoted = counts
+				.get(&OptimizerRuntimeDecisionKey {
+					kind,
+					outcome,
+					lane: OptimizerRuntimeEvidenceLane::Demoted,
+				})
+				.copied()
+				.unwrap_or(0);
+			let native = total.saturating_sub(demoted);
+			if native > 0 {
+				rows.push(OptimizerDecisionRow {
+					kind,
+					outcome,
+					provenance: OptimizerRuntimeVerdictProvenance::Native,
+					count: native,
+				});
+			}
+			if demoted > 0 {
+				rows.push(OptimizerDecisionRow {
+					kind,
+					outcome,
+					provenance: OptimizerRuntimeVerdictProvenance::Demoted,
+					count: demoted,
+				});
+			}
+		}
+	}
+	rows
+}
+
+fn status_snapshot_from_state(state: &RuntimeEvidenceState) -> OptimizerEvidenceStatusSnapshot {
+	OptimizerEvidenceStatusSnapshot {
+		mode: state.mode,
+		state: state.state,
+		pending_deltas: sum_counts(&state.pending)
+			.saturating_add(sum_counts(&state.in_flight))
+			.saturating_add(sum_counts(&state.decision_pending))
+			.saturating_add(sum_counts(&state.decision_in_flight)),
+		dropped_deltas: state.dropped_deltas,
+		ambiguous_deltas: state.ambiguous_deltas,
+		refresh_failures: state.refresh_failures,
+		last_error: state.last_error.clone(),
+	}
+}
+
 fn decision_outcome_key_label(outcome: OptimizerDecisionOutcome) -> String {
 	match outcome {
 		OptimizerDecisionOutcome::Declined(reason) => {
@@ -977,6 +1005,43 @@ mod tests {
 				},
 			]
 		);
+	}
+
+	#[test]
+	fn receipt_gate_snapshot_reads_verdicts_decisions_and_health() {
+		let evidence = OptimizerRuntimeEvidence::local_only();
+		evidence.record_verdict(
+			OptimizerDecisionKind::GalaxyRoot,
+			OptimizerRuntimeVerdictClass::MissedWin,
+			OptimizerRuntimeVerdictProvenance::Native,
+		);
+		evidence.record_decision(
+			OptimizerDecisionKind::FlatStar,
+			OptimizerDecisionOutcome::KeptThinMargin,
+			OptimizerRuntimeVerdictProvenance::Native,
+		);
+
+		let snapshot = evidence.receipt_gate_snapshot();
+
+		assert_eq!(
+			snapshot.verdicts,
+			vec![OptimizerRuntimeVerdictRow {
+				kind: OptimizerDecisionKind::GalaxyRoot,
+				verdict: OptimizerRuntimeVerdictClass::MissedWin,
+				provenance: OptimizerRuntimeVerdictProvenance::Native,
+				count: 1,
+			}]
+		);
+		assert_eq!(
+			snapshot.decisions,
+			vec![OptimizerDecisionRow {
+				kind: OptimizerDecisionKind::FlatStar,
+				outcome: OptimizerDecisionOutcome::KeptThinMargin,
+				provenance: OptimizerRuntimeVerdictProvenance::Native,
+				count: 1,
+			}]
+		);
+		assert_eq!(snapshot.health.pending_deltas, 2);
 	}
 
 	#[test]

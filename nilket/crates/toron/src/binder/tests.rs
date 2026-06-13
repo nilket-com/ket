@@ -14117,6 +14117,306 @@ async fn optimizer_margin_advisory_reports_scope_and_exclusions() {
 }
 
 #[tokio::test]
+async fn optimizer_receipt_gates_projects_five_static_rows() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+
+	assert_receipt_gate_order(&rows);
+	assert_eq!(rows.len(), 5);
+
+	let projected = LogicalPlan::ScanNamed {
+		table: TableRef::with_schema("information_schema", "optimizer_receipt_gates"),
+		projection: Some(vec![
+			"gate_name".to_string(),
+			"status".to_string(),
+			"next_cut".to_string(),
+		]),
+	};
+	let plan = bind(&projected, &catalog, &config)
+		.await
+		.expect("bind projected optimizer receipt gates");
+	let ExecutionPlan::SystemTable { kind, schema, rows } = plan else {
+		panic!("expected projected optimizer receipt gates system table");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerReceiptGates
+	);
+	assert_eq!(
+		field_names(&schema),
+		vec!["gate_name", "status", "next_cut"]
+	);
+	assert_eq!(rows.len(), 5);
+}
+
+#[tokio::test]
+async fn receipt_gates_render_insufficient_evidence_on_cold_ledger() {
+	let rows =
+		optimizer_receipt_gate_table_rows(&MockCatalog::new(), &PlannerConfig::default()).await;
+
+	let graph = receipt_gate_row_by_name(&rows, "graph_margin_divergence");
+	assert_eq!(receipt_gate_utf8(graph, 2), "insufficient_evidence");
+	assert_eq!(receipt_gate_i64(graph, 3), 0);
+	assert_eq!(
+		receipt_gate_utf8(graph, 6),
+		"requires_two_ready_graph_kind_rows"
+	);
+
+	let preserved = receipt_gate_row_by_name(&rows, "preserved_outer_ordering");
+	assert_eq!(receipt_gate_utf8(preserved, 2), "insufficient_evidence");
+	assert_eq!(receipt_gate_i64(preserved, 3), 0);
+
+	let conflict = receipt_gate_row_by_name(&rows, "decision_conflict_pressure");
+	assert_eq!(receipt_gate_utf8(conflict, 2), "insufficient_evidence");
+	assert_eq!(receipt_gate_utf8(conflict, 4), "no_decision_rows");
+
+	assert_eq!(
+		receipt_gate_utf8(
+			receipt_gate_row_by_name(&rows, "windowing_decay_pressure"),
+			2
+		),
+		"inactive"
+	);
+	assert_eq!(
+		receipt_gate_utf8(
+			receipt_gate_row_by_name(&rows, "counter_handoff_readiness"),
+			2
+		),
+		"blocked_external_signal"
+	);
+}
+
+#[tokio::test]
+async fn graph_kind_divergence_row_requires_two_ready_distinct_recommendations() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeChainRoot,
+		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let graph = receipt_gate_row_by_name(&rows, "graph_margin_divergence");
+
+	assert_eq!(receipt_gate_utf8(graph, 2), "actionable");
+	assert_eq!(
+		receipt_gate_i64(graph, 3),
+		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE * 2).unwrap()
+	);
+	assert_eq!(receipt_gate_utf8(graph, 4), "ready_kind_count=2");
+	assert!(receipt_gate_utf8(graph, 5).contains("galaxy_root=loosen:9/10"));
+	assert!(receipt_gate_utf8(graph, 5).contains("bridge_chain_root=tighten:7/10"));
+}
+
+#[tokio::test]
+async fn preserved_outer_missed_win_row_is_separate_from_margin_families() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::PreservedOuterOrder,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let receipt_rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let preserved = receipt_gate_row_by_name(&receipt_rows, "preserved_outer_ordering");
+	assert_eq!(
+		receipt_gate_utf8(preserved, 1),
+		"preserved_outer_join_order"
+	);
+	assert_eq!(receipt_gate_utf8(preserved, 2), "actionable");
+	assert_eq!(receipt_gate_utf8(preserved, 4), "recommendation=loosen");
+	assert_eq!(
+		receipt_gate_i64(preserved, 3),
+		i64::try_from(JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).unwrap()
+	);
+
+	let advisory_rows = optimizer_margin_advisory_rows(&catalog, &config).await;
+	assert_eq!(
+		margin_advisory_utf8(
+			margin_advisory_row_by_scope(&advisory_rows, "tree_join_order"),
+			2
+		),
+		"insufficient_evidence"
+	);
+	assert_eq!(
+		margin_advisory_utf8(
+			margin_advisory_row_by_scope(&advisory_rows, "graph_join_order"),
+			2
+		),
+		"insufficient_evidence"
+	);
+}
+
+#[tokio::test]
+async fn decision_conflict_pressure_uses_durable_decision_rows() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::KeptThinMargin,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE / 2,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Declined(OptimizerDecisionDeclineReason::MissingEstimate),
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE / 2,
+	);
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let conflict = receipt_gate_row_by_name(&rows, "decision_conflict_pressure");
+
+	assert_eq!(receipt_gate_utf8(conflict, 2), "actionable");
+	assert_eq!(receipt_gate_i64(conflict, 3), 40);
+	assert_eq!(
+		receipt_gate_utf8(conflict, 4),
+		"kind=flat_star,provenance=native"
+	);
+	assert!(receipt_gate_utf8(conflict, 5).contains("reordered=20,blocked_or_near_miss=20"));
+}
+
+#[tokio::test]
+async fn windowing_and_counter_handoff_never_actionable() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+
+	let rows = optimizer_receipt_gate_table_rows(&catalog, &config).await;
+	let windowing = receipt_gate_row_by_name(&rows, "windowing_decay_pressure");
+	assert_eq!(receipt_gate_utf8(windowing, 2), "inactive");
+	assert_eq!(
+		receipt_gate_utf8(windowing, 6),
+		"windowing_decay_substrate_unbuilt"
+	);
+	assert_eq!(receipt_gate_i64(windowing, 3), 40);
+
+	let counter = receipt_gate_row_by_name(&rows, "counter_handoff_readiness");
+	assert_eq!(receipt_gate_utf8(counter, 2), "blocked_external_signal");
+	assert_eq!(receipt_gate_i64(counter, 3), 0);
+	assert_eq!(receipt_gate_utf8(counter, 6), "elasticity_signal_unbuilt");
+}
+
+#[tokio::test]
+async fn receipt_gate_readout_is_read_only_no_plan_change() {
+	let catalog = star_join_order_catalog();
+	let logical = SqlPlanner::new()
+		.plan(&non_optimal_star_order_sql())
+		.expect("plan non-optimal star");
+	let quiet_config = auto_broadcast_config(64 * 1024 * 1024);
+	let noisy_config = auto_broadcast_config(64 * 1024 * 1024);
+	record_verdicts(
+		noisy_config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_decisions(
+		noisy_config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::FlatStar,
+		OptimizerDecisionOutcome::Reordered,
+		OptimizerRuntimeVerdictProvenance::Native,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	let before = noisy_config.runtime_evidence.receipt_gate_snapshot();
+	let _ = optimizer_receipt_gate_table_rows(&catalog, &noisy_config).await;
+	let after = noisy_config.runtime_evidence.receipt_gate_snapshot();
+	assert_eq!(before, after);
+
+	let (quiet_plan, quiet_trace) = bind_with_trace(&logical, &catalog, &quiet_config)
+		.await
+		.expect("bind quiet plan");
+	let (noisy_plan, noisy_trace) = bind_with_trace(&logical, &catalog, &noisy_config)
+		.await
+		.expect("bind noisy plan");
+
+	assert_eq!(format!("{quiet_plan:?}"), format!("{noisy_plan:?}"));
+	assert_eq!(quiet_trace.join_decisions, noisy_trace.join_decisions);
+	assert_eq!(
+		quiet_trace.scan_filter_decisions,
+		noisy_trace.scan_filter_decisions
+	);
+}
+
+#[tokio::test]
+async fn rune_queries_optimizer_receipt_gates() {
+	let catalog = star_join_order_catalog();
+	let config = PlannerConfig::default();
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerRuntimeVerdictClass::MissedWin,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	record_verdicts(
+		config.runtime_evidence.as_ref(),
+		OptimizerDecisionKind::BridgeChainRoot,
+		OptimizerRuntimeVerdictClass::OverEager,
+		JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE,
+	);
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.sql("SELECT * FROM information_schema.optimizer_receipt_gates")
+        }
+    "#,
+	)
+	.await;
+
+	let plan = bind(&logical, &catalog, &config)
+		.await
+		.expect("bind Rune optimizer receipt gate report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected Rune optimizer receipt gates system table");
+	};
+
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerReceiptGates
+	);
+	assert_receipt_gate_order(&rows);
+	assert_eq!(
+		receipt_gate_utf8(
+			receipt_gate_row_by_name(&rows, "graph_margin_divergence"),
+			2
+		),
+		"actionable"
+	);
+}
+
+#[tokio::test]
 async fn rune_queries_graph_margin_advisory() {
 	let catalog = star_join_order_catalog();
 	let config = PlannerConfig::default();
@@ -16441,6 +16741,26 @@ async fn optimizer_margin_advisory_rows(
 	rows
 }
 
+async fn optimizer_receipt_gate_table_rows(
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+) -> Vec<Vec<ScalarValue>> {
+	let logical = SqlPlanner::new()
+		.plan("SELECT * FROM information_schema.optimizer_receipt_gates")
+		.expect("plan optimizer receipt gates report");
+	let plan = bind(&logical, catalog, config)
+		.await
+		.expect("bind optimizer receipt gates report");
+	let ExecutionPlan::SystemTable { kind, rows, .. } = plan else {
+		panic!("expected optimizer receipt gates system table, got {plan:?}");
+	};
+	assert_eq!(
+		kind,
+		SystemTableKind::InformationSchemaOptimizerReceiptGates
+	);
+	rows
+}
+
 fn optimizer_decision_count(
 	rows: &[Vec<ScalarValue>],
 	kind: &str,
@@ -16566,6 +16886,18 @@ fn record_verdicts(
 	}
 }
 
+fn record_decisions(
+	evidence: &OptimizerRuntimeEvidence,
+	kind: OptimizerDecisionKind,
+	outcome: OptimizerDecisionOutcome,
+	provenance: OptimizerRuntimeVerdictProvenance,
+	count: u64,
+) {
+	for _ in 0..count {
+		evidence.record_decision(kind, outcome, provenance);
+	}
+}
+
 fn margin_advisory_row_by_scope<'a>(
 	rows: &'a [Vec<ScalarValue>],
 	scope: &str,
@@ -16592,6 +16924,32 @@ fn assert_margin_advisory_scope_order(rows: &[Vec<ScalarValue>]) {
 	);
 }
 
+fn receipt_gate_row_by_name<'a>(
+	rows: &'a [Vec<ScalarValue>],
+	gate_name: &str,
+) -> &'a [ScalarValue] {
+	rows.iter()
+		.find(|row| row[0] == ScalarValue::Utf8(Some(gate_name.to_string())))
+		.unwrap_or_else(|| panic!("missing optimizer receipt gate name={gate_name}: {rows:?}"))
+}
+
+fn assert_receipt_gate_order(rows: &[Vec<ScalarValue>]) {
+	let gates = rows
+		.iter()
+		.map(|row| receipt_gate_utf8(row, 0))
+		.collect::<Vec<_>>();
+	assert_eq!(
+		gates,
+		vec![
+			"graph_margin_divergence",
+			"preserved_outer_ordering",
+			"decision_conflict_pressure",
+			"windowing_decay_pressure",
+			"counter_handoff_readiness",
+		]
+	);
+}
+
 fn margin_advisory_utf8(row: &[ScalarValue], index: usize) -> &str {
 	let ScalarValue::Utf8(Some(value)) = &row[index] else {
 		panic!(
@@ -16606,6 +16964,26 @@ fn margin_advisory_i64(row: &[ScalarValue], index: usize) -> i64 {
 	let ScalarValue::Int64(Some(value)) = row[index] else {
 		panic!(
 			"expected margin advisory Int64 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value
+}
+
+fn receipt_gate_utf8(row: &[ScalarValue], index: usize) -> &str {
+	let ScalarValue::Utf8(Some(value)) = &row[index] else {
+		panic!(
+			"expected receipt gate Utf8 at {index}, got {:?}",
+			row[index]
+		);
+	};
+	value.as_str()
+}
+
+fn receipt_gate_i64(row: &[ScalarValue], index: usize) -> i64 {
+	let ScalarValue::Int64(Some(value)) = row[index] else {
+		panic!(
+			"expected receipt gate Int64 at {index}, got {:?}",
 			row[index]
 		);
 	};

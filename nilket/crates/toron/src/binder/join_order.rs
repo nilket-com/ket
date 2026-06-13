@@ -394,6 +394,349 @@ pub(crate) fn margin_advisory_report_rows(config: &PlannerConfig) -> Vec<MarginA
 	.collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OptimizerReceiptGateStatus {
+	InsufficientEvidence,
+	Inactive,
+	Actionable,
+	BlockedExternalSignal,
+}
+
+pub(crate) fn optimizer_receipt_gate_status_label(
+	status: OptimizerReceiptGateStatus,
+) -> &'static str {
+	match status {
+		OptimizerReceiptGateStatus::InsufficientEvidence => "insufficient_evidence",
+		OptimizerReceiptGateStatus::Inactive => "inactive",
+		OptimizerReceiptGateStatus::Actionable => "actionable",
+		OptimizerReceiptGateStatus::BlockedExternalSignal => "blocked_external_signal",
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptimizerReceiptGateRow {
+	pub(crate) gate_name: &'static str,
+	pub(crate) gate_family: &'static str,
+	pub(crate) status: OptimizerReceiptGateStatus,
+	pub(crate) sample_count: u64,
+	pub(crate) primary_signal: String,
+	pub(crate) secondary_signal: String,
+	pub(crate) reason: String,
+	pub(crate) next_cut: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraphKindGateSignal {
+	kind: OptimizerDecisionKind,
+	recommendation: MarginRecommendation,
+	recommended_step: SoftMarginLadderStep,
+	sample_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecisionConflictGateSignal {
+	kind: OptimizerDecisionKind,
+	provenance: OptimizerRuntimeVerdictProvenance,
+	reordered: u64,
+	blocked_or_near_miss: u64,
+}
+
+impl DecisionConflictGateSignal {
+	fn sample_count(self) -> u64 {
+		self.reordered.saturating_add(self.blocked_or_near_miss)
+	}
+
+	fn conflict_strength(self) -> u64 {
+		self.reordered.min(self.blocked_or_near_miss)
+	}
+}
+
+pub(crate) fn optimizer_receipt_gate_rows(config: &PlannerConfig) -> Vec<OptimizerReceiptGateRow> {
+	let snapshot = config.runtime_evidence.receipt_gate_snapshot();
+	vec![
+		graph_margin_divergence_gate(&snapshot, config),
+		preserved_outer_ordering_gate(&snapshot, config),
+		decision_conflict_pressure_gate(&snapshot),
+		windowing_decay_pressure_gate(&snapshot),
+		counter_handoff_readiness_gate(&snapshot),
+	]
+}
+
+fn graph_margin_divergence_gate(
+	snapshot: &OptimizerReceiptGateSnapshot,
+	config: &PlannerConfig,
+) -> OptimizerReceiptGateRow {
+	let ready = graph_kind_gate_signals(&snapshot.verdicts, config);
+	let sample_count = ready
+		.iter()
+		.fold(0_u64, |acc, signal| acc.saturating_add(signal.sample_size));
+	let has_divergence = ready.iter().any(|left| {
+		ready.iter().any(|right| {
+			left.kind != right.kind
+				&& (left.recommendation != right.recommendation
+					|| left.recommended_step != right.recommended_step)
+		})
+	});
+	let status = if ready.len() < 2 {
+		OptimizerReceiptGateStatus::InsufficientEvidence
+	} else if has_divergence {
+		OptimizerReceiptGateStatus::Actionable
+	} else {
+		OptimizerReceiptGateStatus::Inactive
+	};
+	let reason = match status {
+		OptimizerReceiptGateStatus::InsufficientEvidence => "requires_two_ready_graph_kind_rows",
+		OptimizerReceiptGateStatus::Actionable => "graph_kind_recommendations_diverge",
+		OptimizerReceiptGateStatus::Inactive => "graph_kind_recommendations_converge",
+		OptimizerReceiptGateStatus::BlockedExternalSignal => unreachable!(),
+	};
+	OptimizerReceiptGateRow {
+		gate_name: "graph_margin_divergence",
+		gate_family: "graph_join_order",
+		status,
+		sample_count,
+		primary_signal: format!("ready_kind_count={}", ready.len()),
+		secondary_signal: graph_kind_signal_label(&ready, &snapshot.health),
+		reason: reason.to_string(),
+		next_cut: "per_kind_graph_margin",
+	}
+}
+
+fn graph_kind_gate_signals(
+	verdicts: &[OptimizerRuntimeVerdictRow],
+	config: &PlannerConfig,
+) -> Vec<GraphKindGateSignal> {
+	[
+		OptimizerDecisionKind::GalaxyRoot,
+		OptimizerDecisionKind::BridgeRoot,
+		OptimizerDecisionKind::BridgeChainRoot,
+	]
+	.into_iter()
+	.filter_map(|kind| {
+		let report = margin_advisory_report_for_scope(
+			verdicts,
+			config,
+			MarginAdvisoryScope::GraphKind(kind),
+		);
+		(report.advisory.sample_size >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE).then_some(
+			GraphKindGateSignal {
+				kind,
+				recommendation: report.advisory.recommendation,
+				recommended_step: report.advisory.recommended_step,
+				sample_size: report.advisory.sample_size,
+			},
+		)
+	})
+	.collect()
+}
+
+fn graph_kind_signal_label(
+	signals: &[GraphKindGateSignal],
+	health: &OptimizerEvidenceStatusSnapshot,
+) -> String {
+	let mut parts = signals
+		.iter()
+		.map(|signal| {
+			format!(
+				"{}={}:{}",
+				optimizer_decision_kind_label(signal.kind),
+				margin_recommendation_label(signal.recommendation),
+				signal.recommended_step.margin().label()
+			)
+		})
+		.collect::<Vec<_>>();
+	parts.push(format!("evidence_health={}", evidence_health_label(health)));
+	parts.join(",")
+}
+
+fn preserved_outer_ordering_gate(
+	snapshot: &OptimizerReceiptGateSnapshot,
+	config: &PlannerConfig,
+) -> OptimizerReceiptGateRow {
+	let report = margin_advisory_report_for_scope(
+		&snapshot.verdicts,
+		config,
+		MarginAdvisoryScope::GraphKind(OptimizerDecisionKind::PreservedOuterOrder),
+	);
+	let status = if report.advisory.sample_size < JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE {
+		OptimizerReceiptGateStatus::InsufficientEvidence
+	} else if report.advisory.recommendation == MarginRecommendation::Loosen {
+		OptimizerReceiptGateStatus::Actionable
+	} else {
+		OptimizerReceiptGateStatus::Inactive
+	};
+	let reason = match status {
+		OptimizerReceiptGateStatus::InsufficientEvidence => {
+			"requires_ready_preserved_outer_ordering_samples"
+		}
+		OptimizerReceiptGateStatus::Actionable => "preserved_outer_missed_win_ready",
+		OptimizerReceiptGateStatus::Inactive => "preserved_outer_recommendation_not_loosen",
+		OptimizerReceiptGateStatus::BlockedExternalSignal => unreachable!(),
+	};
+	OptimizerReceiptGateRow {
+		gate_name: "preserved_outer_ordering",
+		gate_family: "preserved_outer_join_order",
+		status,
+		sample_count: report.advisory.sample_size,
+		primary_signal: format!(
+			"recommendation={}",
+			margin_recommendation_label(report.advisory.recommendation)
+		),
+		secondary_signal: format!(
+			"missed_win={},over_eager={},vindicated={},evidence_health={}",
+			report.advisory.missed_win,
+			report.advisory.over_eager,
+			report.advisory.vindicated,
+			evidence_health_label(&snapshot.health)
+		),
+		reason: reason.to_string(),
+		next_cut: "safe_side_outer_ordering",
+	}
+}
+
+fn decision_conflict_pressure_gate(
+	snapshot: &OptimizerReceiptGateSnapshot,
+) -> OptimizerReceiptGateRow {
+	let strongest = strongest_decision_conflict_signal(&snapshot.decisions);
+	let actionable = strongest.filter(|signal| {
+		signal.reordered >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
+			&& signal.blocked_or_near_miss >= JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE
+	});
+	let selected = actionable.or(strongest);
+	let status = if actionable.is_some() {
+		OptimizerReceiptGateStatus::Actionable
+	} else {
+		OptimizerReceiptGateStatus::InsufficientEvidence
+	};
+	let (sample_count, primary_signal, secondary_signal) = match selected {
+		Some(signal) => (
+			signal.sample_count(),
+			format!(
+				"kind={},provenance={}",
+				optimizer_decision_kind_label(signal.kind),
+				optimizer_runtime_verdict_provenance_label(signal.provenance)
+			),
+			format!(
+				"reordered={},blocked_or_near_miss={},evidence_health={}",
+				signal.reordered,
+				signal.blocked_or_near_miss,
+				evidence_health_label(&snapshot.health)
+			),
+		),
+		None => (
+			0,
+			"no_decision_rows".to_string(),
+			format!(
+				"evidence_health={}",
+				evidence_health_label(&snapshot.health)
+			),
+		),
+	};
+	OptimizerReceiptGateRow {
+		gate_name: "decision_conflict_pressure",
+		gate_family: "join_order_decisions",
+		status,
+		sample_count,
+		primary_signal,
+		secondary_signal,
+		reason: if actionable.is_some() {
+			"reordered_and_blocked_ready".to_string()
+		} else {
+			"requires_ready_reordered_and_blocked_decision_rows".to_string()
+		},
+		next_cut: "memo_conflict_readout",
+	}
+}
+
+fn strongest_decision_conflict_signal(
+	decisions: &[OptimizerDecisionRow],
+) -> Option<DecisionConflictGateSignal> {
+	let mut grouped: BTreeMap<
+		(OptimizerDecisionKind, OptimizerRuntimeVerdictProvenance),
+		DecisionConflictGateSignal,
+	> = BTreeMap::new();
+	for row in decisions {
+		let entry =
+			grouped
+				.entry((row.kind, row.provenance))
+				.or_insert(DecisionConflictGateSignal {
+					kind: row.kind,
+					provenance: row.provenance,
+					reordered: 0,
+					blocked_or_near_miss: 0,
+				});
+		match row.outcome {
+			OptimizerDecisionOutcome::Reordered => {
+				entry.reordered = entry.reordered.saturating_add(row.count);
+			}
+			OptimizerDecisionOutcome::KeptThinMargin | OptimizerDecisionOutcome::Declined(_) => {
+				entry.blocked_or_near_miss = entry.blocked_or_near_miss.saturating_add(row.count);
+			}
+			OptimizerDecisionOutcome::KeptOptimal => {}
+		}
+	}
+	grouped
+		.into_values()
+		.filter(|signal| signal.sample_count() > 0)
+		.max_by(|left, right| compare_decision_conflict_signal(*left, *right))
+}
+
+fn compare_decision_conflict_signal(
+	left: DecisionConflictGateSignal,
+	right: DecisionConflictGateSignal,
+) -> Ordering {
+	left.conflict_strength()
+		.cmp(&right.conflict_strength())
+		.then_with(|| left.sample_count().cmp(&right.sample_count()))
+		.then_with(|| right.kind.cmp(&left.kind))
+		.then_with(|| right.provenance.cmp(&left.provenance))
+}
+
+fn windowing_decay_pressure_gate(
+	snapshot: &OptimizerReceiptGateSnapshot,
+) -> OptimizerReceiptGateRow {
+	OptimizerReceiptGateRow {
+		gate_name: "windowing_decay_pressure",
+		gate_family: "evidence_windowing",
+		status: OptimizerReceiptGateStatus::Inactive,
+		sample_count: snapshot
+			.verdicts
+			.iter()
+			.map(|row| row.count)
+			.chain(snapshot.decisions.iter().map(|row| row.count))
+			.fold(0_u64, |acc, count| acc.saturating_add(count)),
+		primary_signal: "windowing_substrate=unbuilt".to_string(),
+		secondary_signal: format!(
+			"evidence_health={}",
+			evidence_health_label(&snapshot.health)
+		),
+		reason: "windowing_decay_substrate_unbuilt".to_string(),
+		next_cut: "windowing_decay_substrate",
+	}
+}
+
+fn counter_handoff_readiness_gate(
+	snapshot: &OptimizerReceiptGateSnapshot,
+) -> OptimizerReceiptGateRow {
+	OptimizerReceiptGateRow {
+		gate_name: "counter_handoff_readiness",
+		gate_family: "counter_handoff",
+		status: OptimizerReceiptGateStatus::BlockedExternalSignal,
+		sample_count: 0,
+		primary_signal: "elasticity_signal=missing".to_string(),
+		secondary_signal: format!(
+			"evidence_health={}",
+			evidence_health_label(&snapshot.health)
+		),
+		reason: "elasticity_signal_unbuilt".to_string(),
+		next_cut: "counter_handoff_elasticity_signal",
+	}
+}
+
+fn evidence_health_label(health: &OptimizerEvidenceStatusSnapshot) -> String {
+	format!("{}/{}", health.mode.as_str(), health.state.as_str())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct JoinOrderRelationFacts {
 	pub(super) rows: Option<RowCount>,

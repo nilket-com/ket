@@ -457,6 +457,43 @@ pub(super) fn information_schema_optimizer_margin_advisory_rows(
 	Ok(rows)
 }
 
+pub(super) fn information_schema_optimizer_receipt_gates_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("gate_name", DataType::Utf8, false),
+		Field::new("gate_family", DataType::Utf8, false),
+		Field::new("status", DataType::Utf8, false),
+		Field::new("sample_count", DataType::Int64, false),
+		Field::new("primary_signal", DataType::Utf8, false),
+		Field::new("secondary_signal", DataType::Utf8, false),
+		Field::new("reason", DataType::Utf8, false),
+		Field::new("next_cut", DataType::Utf8, false),
+	]))
+}
+
+pub(super) fn information_schema_optimizer_receipt_gate_rows(
+	gates: &[OptimizerReceiptGateRow],
+) -> Result<Vec<Vec<ScalarValue>>, BindingError> {
+	let mut rows = Vec::with_capacity(gates.len());
+	for gate in gates {
+		rows.push(vec![
+			ScalarValue::Utf8(Some(gate.gate_name.to_string())),
+			ScalarValue::Utf8(Some(gate.gate_family.to_string())),
+			ScalarValue::Utf8(Some(
+				optimizer_receipt_gate_status_label(gate.status).to_string(),
+			)),
+			ScalarValue::Int64(Some(u64_to_i64(
+				gate.sample_count,
+				"optimizer receipt gate sample_count",
+			)?)),
+			ScalarValue::Utf8(Some(gate.primary_signal.clone())),
+			ScalarValue::Utf8(Some(gate.secondary_signal.clone())),
+			ScalarValue::Utf8(Some(gate.reason.clone())),
+			ScalarValue::Utf8(Some(gate.next_cut.to_string())),
+		]);
+	}
+	Ok(rows)
+}
+
 pub(super) fn optimizer_explain_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("decision_kind", DataType::Utf8, false),

@@ -1506,6 +1506,7 @@ pub(crate) fn adr214_provenance_is_dual_write_totals_unchanged() {
 	let record = first_block(&runtime_evidence, "pub(crate) fn record_verdict");
 	let codec = first_block(&runtime_evidence, "pub(crate) fn verdict_counter_key");
 	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
+	let snapshot_rows = first_block(&runtime_evidence, "fn verdict_rows_from_state");
 	let schema = first_block(
 		&explain,
 		"pub(super) fn information_schema_optimizer_runtime_verdicts_schema",
@@ -1522,9 +1523,10 @@ pub(crate) fn adr214_provenance_is_dual_write_totals_unchanged() {
 	assert!(codec.contains("\"{}/{}\""));
 	assert!(codec.contains("OptimizerRuntimeEvidenceLane::Demoted"));
 	assert!(codec.contains("\"{}/demoted/{}\""));
-	assert!(snapshot.contains("let native = total.saturating_sub(demoted)"));
-	assert!(snapshot.contains("OptimizerRuntimeVerdictProvenance::Native"));
-	assert!(snapshot.contains("OptimizerRuntimeVerdictProvenance::Demoted"));
+	assert!(snapshot.contains("verdict_rows_from_state(&state)"));
+	assert!(snapshot_rows.contains("let native = total.saturating_sub(demoted)"));
+	assert!(snapshot_rows.contains("OptimizerRuntimeVerdictProvenance::Native"));
+	assert!(snapshot_rows.contains("OptimizerRuntimeVerdictProvenance::Demoted"));
 	assert!(schema.contains("\"provenance\""));
 }
 
@@ -1884,14 +1886,16 @@ pub(crate) fn adr207_runtime_evidence_is_extracted_fixed_matrix() {
 pub(crate) fn adr207_snapshot_merges_durable_pending_and_in_flight() {
 	let runtime_evidence = source("src/binder/runtime_evidence.rs");
 	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
+	let snapshot_rows = first_block(&runtime_evidence, "fn verdict_rows_from_state");
 	let flush = first_block(&runtime_evidence, "fn take_pending_for_flush");
 	let ack = first_block(&runtime_evidence, "fn ack_flush");
 	let refresh = first_block(&runtime_evidence, "pub async fn refresh_durable_cache");
 
-	assert!(snapshot.contains("state.durable_cache.clone()"));
-	assert!(snapshot.contains("state.pending.iter().chain(state.in_flight.iter())"));
-	assert!(snapshot.contains("native > 0"));
-	assert!(snapshot.contains("demoted > 0"));
+	assert!(snapshot.contains("verdict_rows_from_state(&state)"));
+	assert!(snapshot_rows.contains("state.durable_cache.clone()"));
+	assert!(snapshot_rows.contains("state.pending.iter().chain(state.in_flight.iter())"));
+	assert!(snapshot_rows.contains("native > 0"));
+	assert!(snapshot_rows.contains("demoted > 0"));
 	assert!(flush.contains("state.in_flight.get(&key)"));
 	assert!(flush.contains("state.in_flight.insert(key, delta)"));
 	assert!(ack.contains(".max(current_value)"));
@@ -2044,6 +2048,227 @@ pub(crate) fn adr207_no_wendelon_production_or_optimizer_shell_change() {
 }
 
 #[test]
+pub(crate) fn adr217_receipt_gates_are_explicit_five_row_system_table() {
+	let binder = binder_root_source();
+	let execution = source("src/ir/execution.rs");
+	let explain = source("src/binder/explain.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let bind_relation = first_block(&binder, "async fn bind_information_schema_relation");
+	let schema = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_receipt_gates_schema",
+	);
+	let rows = first_block(
+		&explain,
+		"pub(super) fn information_schema_optimizer_receipt_gate_rows",
+	);
+	let report = first_block(&join_order, "pub(crate) fn optimizer_receipt_gate_rows");
+
+	assert!(binder.contains("INFORMATION_SCHEMA_OPTIMIZER_RECEIPT_GATES_TABLE"));
+	assert!(binder.contains("information_schema.optimizer_receipt_gates"));
+	assert!(execution.contains("InformationSchemaOptimizerReceiptGates"));
+	assert!(bind_relation.contains("SystemTableKind::InformationSchemaOptimizerReceiptGates"));
+	assert!(bind_relation.contains("optimizer_receipt_gate_rows(self.config)"));
+	assert!(bind_relation.contains("information_schema_optimizer_receipt_gates_schema"));
+	assert!(bind_relation.contains("information_schema_optimizer_receipt_gate_rows"));
+	for column in [
+		"gate_name",
+		"gate_family",
+		"status",
+		"sample_count",
+		"primary_signal",
+		"secondary_signal",
+		"reason",
+		"next_cut",
+	] {
+		assert!(schema.contains(column), "schema is missing {column}");
+		assert!(rows.contains(column), "row projection is missing {column}");
+	}
+	assert!(report.contains("graph_margin_divergence_gate(&snapshot, config)"));
+	assert!(report.contains("preserved_outer_ordering_gate(&snapshot, config)"));
+	assert!(report.contains("decision_conflict_pressure_gate(&snapshot)"));
+	assert!(report.contains("windowing_decay_pressure_gate(&snapshot)"));
+	assert!(report.contains("counter_handoff_readiness_gate(&snapshot)"));
+	for gate in [
+		"graph_margin_divergence",
+		"preserved_outer_ordering",
+		"decision_conflict_pressure",
+		"windowing_decay_pressure",
+		"counter_handoff_readiness",
+	] {
+		assert!(join_order.contains(gate), "missing receipt gate {gate}");
+	}
+}
+
+#[test]
+pub(crate) fn adr217_receipt_gate_status_vocabulary_is_closed() {
+	let join_order = source("src/binder/join_order.rs");
+	let status = first_block(&join_order, "pub(crate) enum OptimizerReceiptGateStatus");
+	let label = first_block(
+		&join_order,
+		"pub(crate) fn optimizer_receipt_gate_status_label",
+	);
+
+	assert_eq!(enum_variant_count(&status), 4);
+	for token in [
+		"InsufficientEvidence",
+		"Inactive",
+		"Actionable",
+		"BlockedExternalSignal",
+		"insufficient_evidence",
+		"inactive",
+		"actionable",
+		"blocked_external_signal",
+	] {
+		assert!(
+			status.contains(token) || label.contains(token),
+			"missing receipt gate status token {token}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr217_receipt_gate_snapshot_is_single_locked_snapshot() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let join_order = source("src/binder/join_order.rs");
+	let snapshot = first_block(&runtime_evidence, "pub(crate) fn receipt_gate_snapshot");
+	let report = first_block(&join_order, "pub(crate) fn optimizer_receipt_gate_rows");
+
+	assert!(runtime_evidence.contains("pub(crate) struct OptimizerReceiptGateSnapshot"));
+	assert!(snapshot.matches("self.state.lock()").count() == 1);
+	assert!(snapshot.contains("verdict_rows_from_state(&state)"));
+	assert!(snapshot.contains("decision_rows_from_state(&state)"));
+	assert!(snapshot.contains("status_snapshot_from_state(&state)"));
+	assert!(report.contains("receipt_gate_snapshot()"));
+	assert!(!report.contains("verdict_snapshot()"));
+	assert!(!report.contains("decision_snapshot()"));
+	assert!(!report.contains("status_snapshot()"));
+}
+
+#[test]
+pub(crate) fn adr217_graph_gate_uses_ready_kind_divergence_not_family_rollup() {
+	let join_order = source("src/binder/join_order.rs");
+	let graph = first_block(&join_order, "fn graph_margin_divergence_gate");
+	let signals = first_block(&join_order, "fn graph_kind_gate_signals");
+
+	assert!(graph.contains("ready.len() < 2"));
+	assert!(graph.contains("left.recommendation != right.recommendation"));
+	assert!(graph.contains("left.recommended_step != right.recommended_step"));
+	assert!(graph.contains("OptimizerReceiptGateStatus::Actionable"));
+	assert!(graph.contains("graph_kind_recommendations_diverge"));
+	assert!(signals.contains("MarginAdvisoryScope::GraphKind(kind)"));
+	assert!(signals.contains("JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
+	for kind in ["GalaxyRoot", "BridgeRoot", "BridgeChainRoot"] {
+		assert!(signals.contains(kind), "graph gate missing {kind}");
+	}
+}
+
+#[test]
+pub(crate) fn adr217_preserved_outer_gate_is_separate_loosen_only_signal() {
+	let join_order = source("src/binder/join_order.rs");
+	let preserved = first_block(&join_order, "fn preserved_outer_ordering_gate");
+
+	assert!(preserved.contains("OptimizerDecisionKind::PreservedOuterOrder"));
+	assert!(preserved.contains("MarginAdvisoryScope::GraphKind"));
+	assert!(preserved.contains("JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
+	assert!(preserved.contains("report.advisory.recommendation == MarginRecommendation::Loosen"));
+	assert!(preserved.contains("preserved_outer_missed_win_ready"));
+	assert!(preserved.contains("preserved_outer_join_order"));
+}
+
+#[test]
+pub(crate) fn adr217_decision_conflict_gate_uses_durable_decision_rows() {
+	let join_order = source("src/binder/join_order.rs");
+	let gate = first_block(&join_order, "fn decision_conflict_pressure_gate");
+	let strongest = first_block(&join_order, "fn strongest_decision_conflict_signal");
+	let compare = first_block(&join_order, "fn compare_decision_conflict_signal");
+
+	assert!(gate.contains("JOIN_ORDER_MARGIN_ADVISORY_MIN_SAMPLE"));
+	assert!(gate.contains("signal.reordered"));
+	assert!(gate.contains("signal.blocked_or_near_miss"));
+	assert!(gate.contains("reordered_and_blocked_ready"));
+	assert!(strongest.contains("OptimizerDecisionOutcome::Reordered"));
+	assert!(strongest.contains("OptimizerDecisionOutcome::KeptThinMargin"));
+	assert!(strongest.contains("OptimizerDecisionOutcome::Declined(_)"));
+	assert!(strongest.contains("OptimizerDecisionOutcome::KeptOptimal => {}"));
+	assert!(strongest.contains("row.provenance"));
+	assert!(compare.contains("conflict_strength"));
+	assert!(compare.contains("sample_count"));
+}
+
+#[test]
+pub(crate) fn adr217_blocked_placeholders_cannot_render_actionable() {
+	let join_order = source("src/binder/join_order.rs");
+	let windowing = first_block(&join_order, "fn windowing_decay_pressure_gate");
+	let counter = first_block(&join_order, "fn counter_handoff_readiness_gate");
+
+	assert!(windowing.contains("OptimizerReceiptGateStatus::Inactive"));
+	assert!(!windowing.contains("OptimizerReceiptGateStatus::Actionable"));
+	assert!(windowing.contains("windowing_decay_substrate_unbuilt"));
+	assert!(counter.contains("OptimizerReceiptGateStatus::BlockedExternalSignal"));
+	assert!(!counter.contains("OptimizerReceiptGateStatus::Actionable"));
+	assert!(counter.contains("elasticity_signal_unbuilt"));
+}
+
+#[test]
+pub(crate) fn adr217_readout_has_no_policy_consumers_or_storage_surface() {
+	let manifest = manifest_dir();
+	let markers = ["optimizer_receipt_gate", "optimizer_receipt_gates"];
+	let mut offenders = Vec::new();
+	for path in [
+		manifest.join("src/exec.rs"),
+		manifest.join("src/pbc.rs"),
+		manifest.join("src/storage.rs"),
+		manifest.join("src/distributed"),
+		manifest.join("src/coordinator.rs"),
+		manifest.join("src/daemon.rs"),
+		manifest.join("../wendelon/src"),
+	] {
+		offenders.extend(
+			source_lines_for_path(&path)
+				.into_iter()
+				.filter(|(_, _, line)| markers.iter().any(|marker| line.contains(marker))),
+		);
+	}
+	assert!(
+		offenders.is_empty(),
+		"ADR217 receipt gate readout leaked outside binder/report/tests:\n{}",
+		format_offenders(&manifest, &offenders)
+	);
+
+	let join_order = source("src/binder/join_order.rs");
+	let report = first_block(&join_order, "pub(crate) fn optimizer_receipt_gate_rows");
+	for forbidden in [
+		"effective_join_order_soft_margin_steps",
+		"try_bind_star_order_actuation",
+		"bind_galaxy_order",
+		"counter_fetch_add",
+		"refresh_durable_cache",
+	] {
+		assert!(
+			!report.contains(forbidden),
+			"receipt gate readout gained policy/storage edge {forbidden}"
+		);
+	}
+}
+
+#[test]
+pub(crate) fn adr217_no_new_durable_counter_keys_or_flush_path() {
+	let runtime_evidence = source("src/binder/runtime_evidence.rs");
+	let keys = first_block(&runtime_evidence, "pub(crate) fn all_verdict_counter_keys");
+	let decision_keys = first_block(&runtime_evidence, "pub(crate) fn all_decision_counter_keys");
+	let flush = first_block(&runtime_evidence, "pub(crate) async fn flush_keys");
+	let decision_flush = first_block(&runtime_evidence, "pub async fn flush_decision_deltas");
+
+	assert!(!runtime_evidence.contains("optimizer_evidence/receipt"));
+	assert!(!runtime_evidence.contains("optimizer_receipt_gates"));
+	assert!(!keys.contains("receipt"));
+	assert!(!decision_keys.contains("receipt"));
+	assert_eq!(flush.matches("counter_fetch_add").count(), 1);
+	assert_eq!(decision_flush.matches("counter_fetch_add").count(), 1);
+}
+
+#[test]
 pub(crate) fn adr207_verdict_evidence_keys_are_fixed_matrix_no_registry() {
 	adr207_runtime_evidence_is_extracted_fixed_matrix();
 }
@@ -2052,11 +2277,11 @@ pub(crate) fn adr207_verdict_evidence_keys_are_fixed_matrix_no_registry() {
 pub(crate) fn adr207_counter_absent_maps_to_zero_in_consumer() {
 	let runtime_evidence = source("src/binder/runtime_evidence.rs");
 	let refresh = first_block(&runtime_evidence, "pub async fn refresh_durable_cache");
-	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
+	let snapshot_rows = first_block(&runtime_evidence, "fn verdict_rows_from_state");
 
 	assert!(refresh.contains("value.unwrap_or(0)"));
-	assert!(snapshot.contains("native > 0"));
-	assert!(snapshot.contains("demoted > 0"));
+	assert!(snapshot_rows.contains("native > 0"));
+	assert!(snapshot_rows.contains("demoted > 0"));
 }
 
 #[test]
@@ -2067,11 +2292,11 @@ pub(crate) fn adr207_snapshot_is_durable_cache_plus_pending_not_local_plus_durab
 #[test]
 pub(crate) fn adr207_in_flight_deltas_are_not_reissued_or_hidden() {
 	let runtime_evidence = source("src/binder/runtime_evidence.rs");
-	let snapshot = first_block(&runtime_evidence, "pub(crate) fn verdict_snapshot");
+	let snapshot_rows = first_block(&runtime_evidence, "fn verdict_rows_from_state");
 	let flush = first_block(&runtime_evidence, "fn take_pending_for_flush");
 	let drop_ambiguous = first_block(&runtime_evidence, "fn drop_ambiguous_in_flight");
 
-	assert!(snapshot.contains("state.in_flight.iter()"));
+	assert!(snapshot_rows.contains("state.in_flight.iter()"));
 	assert!(flush.contains("state.in_flight.get(&key)"));
 	assert!(drop_ambiguous.contains("state.in_flight.remove(&key)"));
 	assert!(!drop_ambiguous.contains("state.pending"));
